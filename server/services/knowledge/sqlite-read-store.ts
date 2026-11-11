@@ -50,9 +50,9 @@ import {
 	knowledgeTagTypes,
 	users,
 } from "../../db/schema";
+import { readQuery } from "../../db/worker-read";
 import type {
 	AclEventReadRow,
-	KeywordInjectionCandidateRow,
 	KnowledgeEntryLinkRow,
 	KnowledgeEntryListFilter,
 	KnowledgeEntryListOrder,
@@ -796,30 +796,82 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 		return rows as AclEventReadRow[];
 	},
 
-	async listPersonalKeywordInjectionCandidates(opts) {
+	async getInjectionEvidence(opts) {
+		const ids = [...new Set(opts.ids)].slice(0, 100);
+		if (ids.length === 0) return [];
+		if (opts.scope === "personal") {
+			if (!opts.userId) return [];
+			return db
+				.select({
+					id: knowledgeDrafts.id,
+					collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`,
+					title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`,
+					currentRevisionId: sql<null>`null`,
+					tagsJson: sql<null>`null`,
+					keywordsJson: knowledgeDrafts.keywordsJson,
+					updatedAt: knowledgeDrafts.updatedAt,
+					snippet: sql<string>`substr(${knowledgeDrafts.content}, 1, 1536)`,
+				})
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						personalInjectionWhere({ ...opts, userId: opts.userId }),
+						inArray(knowledgeDrafts.id, ids),
+					),
+				);
+		}
 		return db
 			.select({
-				id: knowledgeDrafts.id,
-				collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`,
-				title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`,
-				currentRevisionId: sql<null>`null`,
-				tagsJson: sql<null>`null`,
-				keywordsJson: knowledgeDrafts.keywordsJson,
-				updatedAt: knowledgeDrafts.updatedAt,
+				id: knowledgeEntries.id,
+				collectionId: knowledgeEntries.collectionId,
+				title: knowledgeEntries.title,
+				currentRevisionId: knowledgeEntries.currentRevisionId,
+				tagsJson: knowledgeEntries.tagsJson,
+				keywordsJson: knowledgeEntries.keywordsJson,
+				updatedAt: knowledgeEntries.updatedAt,
+				snippet: sql<string>`substr(coalesce(${knowledgeEntries.currentContent}, ${knowledgeEntries.title}), 1, 1536)`,
 			})
-			.from(knowledgeDrafts)
-			.where(personalInjectionWhere(opts))
-			.orderBy(desc(knowledgeDrafts.updatedAt), knowledgeDrafts.id)
-			.limit(opts.limit);
+			.from(knowledgeEntries)
+			.where(
+				and(
+					inArray(knowledgeEntries.id, ids),
+					eq(knowledgeEntries.status, "active"),
+					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+					projectScopeClause(opts.projectId),
+				),
+			);
+	},
+	async listPersonalKeywordInjectionCandidates(opts) {
+		const limit = Math.min(5000, Math.max(0, opts.limit));
+		return readQuery(
+			db
+				.select({
+					id: knowledgeDrafts.id,
+					collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`,
+					title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`,
+					currentRevisionId: sql<null>`null`,
+					tagsJson: sql<null>`null`,
+					keywordsJson: knowledgeDrafts.keywordsJson,
+					updatedAt: knowledgeDrafts.updatedAt,
+				})
+				.from(knowledgeDrafts)
+				.where(personalInjectionWhere(opts))
+				.orderBy(desc(knowledgeDrafts.updatedAt), knowledgeDrafts.id)
+				.limit(limit),
+			{ signal: opts.signal, timeoutMs: 750, maxRows: limit, inlineFallback: false },
+		);
 	},
 	async personalKeywordInjectionSignature(opts) {
-		const rows = await db
-			.select({
-				cnt: sql<number>`count(*)`,
-				maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
-			})
-			.from(knowledgeDrafts)
-			.where(personalInjectionWhere(opts));
+		const rows = await readQuery(
+			db
+				.select({
+					cnt: sql<number>`count(*)`,
+					maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
+				})
+				.from(knowledgeDrafts)
+				.where(personalInjectionWhere(opts)),
+			{ signal: opts.signal, timeoutMs: 750, maxRows: 1, inlineFallback: false },
+		);
 		return `${Number(rows[0]?.cnt ?? 0)}:${rows[0]?.maxUpdated ?? ""}`;
 	},
 	async personalInjectionSnippets(userId, ids, maxChars) {
@@ -841,45 +893,51 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 	},
 
 	async listKeywordInjectionCandidates(opts) {
-		const rows = await db
-			.select({
-				id: knowledgeEntries.id,
-				collectionId: knowledgeEntries.collectionId,
-				title: knowledgeEntries.title,
-				currentRevisionId: knowledgeEntries.currentRevisionId,
-				tagsJson: knowledgeEntries.tagsJson,
-				keywordsJson: knowledgeEntries.keywordsJson,
-				updatedAt: knowledgeEntries.updatedAt,
-			})
-			.from(knowledgeEntries)
-			.where(
-				and(
-					eq(knowledgeEntries.status, "active"),
-					isNotNull(knowledgeEntries.currentKeywords),
-					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-					projectScopeClause(opts.projectId),
-				),
-			)
-			.orderBy(desc(knowledgeEntries.updatedAt))
-			.limit(opts.limit);
-		return rows as KeywordInjectionCandidateRow[];
+		const limit = Math.min(5000, Math.max(0, opts.limit));
+		return readQuery(
+			db
+				.select({
+					id: knowledgeEntries.id,
+					collectionId: knowledgeEntries.collectionId,
+					title: knowledgeEntries.title,
+					currentRevisionId: knowledgeEntries.currentRevisionId,
+					tagsJson: knowledgeEntries.tagsJson,
+					keywordsJson: knowledgeEntries.keywordsJson,
+					updatedAt: knowledgeEntries.updatedAt,
+				})
+				.from(knowledgeEntries)
+				.where(
+					and(
+						eq(knowledgeEntries.status, "active"),
+						isNotNull(knowledgeEntries.currentKeywords),
+						opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+						projectScopeClause(opts.projectId),
+					),
+				)
+				.orderBy(desc(knowledgeEntries.updatedAt), knowledgeEntries.id)
+				.limit(limit),
+			{ signal: opts.signal, timeoutMs: 750, maxRows: limit, inlineFallback: false },
+		);
 	},
 
 	async keywordInjectionCandidatesSignature(opts) {
-		const rows = await db
-			.select({
-				cnt: sql<number>`count(*)`,
-				maxUpdated: sql<string>`coalesce(max(${knowledgeEntries.updatedAt}), '')`,
-			})
-			.from(knowledgeEntries)
-			.where(
-				and(
-					eq(knowledgeEntries.status, "active"),
-					isNotNull(knowledgeEntries.currentKeywords),
-					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-					projectScopeClause(opts.projectId),
+		const rows = await readQuery(
+			db
+				.select({
+					cnt: sql<number>`count(*)`,
+					maxUpdated: sql<string>`coalesce(max(${knowledgeEntries.updatedAt}), '')`,
+				})
+				.from(knowledgeEntries)
+				.where(
+					and(
+						eq(knowledgeEntries.status, "active"),
+						isNotNull(knowledgeEntries.currentKeywords),
+						opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+						projectScopeClause(opts.projectId),
+					),
 				),
-			);
+			{ signal: opts.signal, timeoutMs: 750, maxRows: 1, inlineFallback: false },
+		);
 		const row = rows[0];
 		return `${Number(row?.cnt ?? 0)}:${row?.maxUpdated ?? ""}`;
 	},

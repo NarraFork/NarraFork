@@ -49,6 +49,157 @@ async function narrator() {
 }
 
 describe("shared prefix request preparation", () => {
+	for (const epochs of [false, true]) {
+		test(`shared evidence budget preserves fixed context and tool history (${epochs ? "epoch" : "standalone"})`, async () => {
+			const narratorId = await narrator();
+			const cap = 256;
+			const oldBudget = settings.agent.contextEvidenceBudgetBytes;
+			settings.agent.contextEvidenceBudgetBytes = cap;
+			const knowledge = "知".repeat(40);
+			await narratorPersistence.persistSystemMessage(narratorId, knowledge, [
+				{ type: "knowledge_hint", modelText: knowledge, entries: [], source: "user_message" },
+			]);
+			await narratorPersistence.persistSystemMessage(narratorId, "TASK_STATE_MUST_SURVIVE");
+			const before = await narratorService.getModelHistorySinceLastCompact(narratorId);
+			let offered = -1;
+			try {
+				const prepared = await preparation.preparePrefixRequest({
+					narratorId,
+					locale: "en",
+					getModel: () => "claude-sonnet-4",
+					getProvider: () => provider,
+					...(epochs
+						? {
+								getToolLoading: () => ({
+									managed: new Set<string>(),
+									current: new Set<string>(),
+									candidates: [tool],
+								}),
+							}
+						: {}),
+					buildPrefixPrompt: async () => ({
+						contract: "FIXED_RULES_MUST_SURVIVE",
+						parts: [],
+						compactMessageId: null,
+					}),
+					getRequestContext: async (budget) => {
+						offered = budget?.byteBudget ?? -1;
+						// A producer that ignores its allowance must not bypass the final check.
+						return "溢".repeat(cap);
+					},
+				});
+				expect(prepared.systemPrompt).toContain("FIXED_RULES_MUST_SURVIVE");
+				expect(prepared.systemPrompt).not.toContain("溢");
+				if (epochs) expect(prepared.systemPrompt).toContain("PreparedPrefixRead");
+				expect(offered).toBeGreaterThan(0);
+				expect(offered).toBeLessThan(cap - Buffer.byteLength(knowledge));
+				expect(JSON.stringify(prepared.sourceMessages)).toContain("TASK_STATE_MUST_SURVIVE");
+				expect(JSON.stringify(prepared.sourceMessages)).toContain(knowledge);
+				const after = await narratorService.getModelHistorySinceLastCompact(narratorId);
+				for (const row of before) expect(after.find((next) => next.id === row.id)).toEqual(row);
+			} finally {
+				settings.agent.contextEvidenceBudgetBytes = oldBudget;
+			}
+		});
+	}
+
+	test("zero optional evidence budget skips recall and drops only knowledge projections", async () => {
+		const narratorId = await narrator();
+		const oldBudget = settings.agent.contextEvidenceBudgetBytes;
+		settings.agent.contextEvidenceBudgetBytes = 0;
+		try {
+			await narratorPersistence.persistSystemMessage(narratorId, "PRIVATE_KNOWLEDGE", [
+				{ type: "knowledge_hint", modelText: "PRIVATE_KNOWLEDGE", entries: [] },
+			]);
+			await narratorPersistence.persistSystemMessage(narratorId, "REQUIRED_TASK_STATE");
+			let recalls = 0;
+			const prepared = await preparation.preparePrefixRequest({
+				narratorId,
+				locale: "en",
+				getModel: () => "claude-sonnet-4",
+				getProvider: () => provider,
+				buildPrefixPrompt: async () => ({ contract: "FIXED_RULES", parts: [] }),
+				getRequestContext: async () => {
+					recalls++;
+					return "PRIVATE_MEMORY";
+				},
+			});
+			expect(recalls).toBe(0);
+			expect(prepared.systemPrompt).toBe("FIXED_RULES");
+			expect(JSON.stringify(prepared.sourceMessages)).not.toContain("PRIVATE_KNOWLEDGE");
+			expect(prepared.omittedOptionalMessageIds).toHaveLength(1);
+			const hooks = buildContextManagementHooks({
+				narratorId,
+				locale: "en",
+				getModel: () => "claude-sonnet-4",
+				getProvider: () => provider,
+			});
+			const rebuilt = await hooks.rebuildRequestHistory();
+			expect(rebuilt.omittedOptionalMessageIds).toEqual(prepared.omittedOptionalMessageIds);
+			expect(rebuilt.replayedInjectionMessageIds).not.toContain(
+				prepared.omittedOptionalMessageIds[0],
+			);
+			expect(JSON.stringify(prepared.sourceMessages)).toContain("REQUIRED_TASK_STATE");
+			expect(
+				JSON.stringify(await narratorService.getModelHistorySinceLastCompact(narratorId)),
+			).toContain("PRIVATE_KNOWLEDGE");
+		} finally {
+			settings.agent.contextEvidenceBudgetBytes = oldBudget;
+		}
+	});
+
+	test("request-local observations refresh without entering the immutable prefix or replay history", async () => {
+		const narratorId = await narrator();
+		let current = "PRIVATE_MEMORY_V1";
+		let reads = 0;
+		const writeText = snapshots.putPrefixText;
+		const writes: string[] = [];
+		const snapshot = spyOn(snapshots, "putPrefixText").mockImplementation(async (text, signal) => {
+			writes.push(text);
+			return writeText(text, signal);
+		});
+		const common = {
+			narratorId,
+			locale: "en" as const,
+			getModel: () => "claude-sonnet-4",
+			getProvider: () => provider,
+			getToolLoading: () => ({
+				managed: new Set<string>(),
+				current: new Set<string>(),
+				candidates: [tool],
+			}),
+			buildPrefixPrompt: async () => ({
+				contract: "Fixed rules",
+				parts: [],
+				compactMessageId: null,
+			}),
+			getRequestContext: async () => {
+				reads++;
+				return current;
+			},
+		};
+		try {
+			const first = await preparation.preparePrefixRequest(common);
+			expect(first.systemPrompt).toContain("PRIVATE_MEMORY_V1");
+			expect(first.reconciled?.systemPrompt).not.toContain("PRIVATE_MEMORY");
+			current = "PRIVATE_MEMORY_V2";
+			const hooks = buildContextManagementHooks(common);
+			const updated = await hooks.rebuildRequestHistory();
+			expect(updated.systemPrompt).toContain("PRIVATE_MEMORY_V2");
+			expect(updated.systemPrompt).not.toContain("PRIVATE_MEMORY_V1");
+			current = "";
+			const revoked = await hooks.rebuildRequestHistory();
+			expect(revoked.systemPrompt).toBe(first.reconciled?.systemPrompt);
+			expect(reads).toBe(3);
+			expect(writes.join("\n")).not.toContain("PRIVATE_MEMORY");
+			const history = await narratorService.getModelHistorySinceLastCompact(narratorId);
+			expect(JSON.stringify(history)).not.toContain("PRIVATE_MEMORY");
+		} finally {
+			snapshot.mockRestore();
+			await snapshots.closePrefixSnapshotStore();
+		}
+	});
+
 	test("real snapshot work exceeding ten seconds prepares first and later requests without losing summary metadata", async () => {
 		const narratorId = await narrator();
 		const controller = new AbortController();

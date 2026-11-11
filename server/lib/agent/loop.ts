@@ -9,7 +9,12 @@ import {
 	type StreamingEditOrigin,
 	validateStreamingEditOrigin,
 } from "@shared/streaming-edit-origin";
-import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
+import { ContextEvidenceBudget } from "../../services/context-evidence-budget";
+import {
+	injectionKey,
+	MAX_KNOWLEDGE_EVIDENCE_BYTES,
+	scanToolOutputForKnowledgeDetailed,
+} from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
@@ -2843,6 +2848,9 @@ async function* agentLoopInMetadataSnapshot(
 	// and point B (tool output) de-dup together and the set survives across loop passes until
 	// a compact boundary clears it. Falls back to a local set for standalone/test callers.
 	const knowledgeInjectedEntryIds = config.knowledgeInjectedEntryIds ?? new Set<string>();
+	const evidenceBudget =
+		config.evidenceBudget ??
+		new ContextEvidenceBudget(() => settings.agent.contextEvidenceBudgetBytes);
 
 	/**
 	 * Reminders the loop itself raised, awaiting delivery at the turn boundary.
@@ -3013,50 +3021,60 @@ async function* agentLoopInMetadataSnapshot(
 				toolUseId: tu.toolUseId,
 			});
 		}
-		// Point B: scan this tool's output for relevant knowledge and inject a reminder.
-		// Skip the knowledge and outline tools themselves to avoid self-amplification.
+		// Point B shares the request allowance with memory and point A. Reserve before
+		// awaiting a scan so concurrent results cannot each spend the same remaining bytes.
 		if (
 			!tu.name.startsWith("Knowledge") &&
 			!isOutlineTool(tu.name) &&
 			typeof result.output === "string" &&
-			result.output.length > 0
+			result.output.length > 0 &&
+			evidenceBudget.remaining > 0
 		) {
+			const reservation = evidenceBudget.reserve("knowledge", MAX_KNOWLEDGE_EVIDENCE_BYTES);
 			try {
 				const scan = await scanToolOutputForKnowledgeDetailed(
 					config.userId,
 					result.output,
-					knowledgeInjectedEntryIds,
+					new Set(knowledgeInjectedEntryIds),
 					{
 						projectId: config.projectId ?? undefined,
+						signal: config.signal,
+						byteBudget: reservation.byteBudget,
 					},
 				);
-				if (scan) {
-					queueLoopInjection({
-						source: "knowledge_base_hint",
-						// `scan.content` is the same text this body renders to (asserted in
-						// sidecar-body.test.ts against formatInjectionsBare), so the body is
-						// the authority and the text is derived from it — not both kept.
-						...sideCarBodyWithText(
-							"knowledge_base_hint",
-							{
-								kind: "knowledge",
-								hits: scan.hits.map((hit) => ({
-									scope: hit.scope,
-									entryId: hit.entryId,
-									title: hit.title,
-									summary: hit.summary,
-								})),
-							},
-							locale,
-						),
-						toolUseId: tu.toolUseId,
-						knowledgeInjection: {
-							narratorId: config.narratorId,
-							compactSeq: config.knowledgeInjectionCompactSeq ?? -1,
-							triggerToolCallId: tu.toolUseId,
-							hits: scan.hits,
+				config.signal.throwIfAborted();
+				// Another concurrent scan may have won. Recheck before committing either
+				// the bytes or the de-dup ids; rejected evidence must remain eligible later.
+				const hits =
+					scan?.hits.filter((hit) => !knowledgeInjectedEntryIds.has(injectionKey(hit))) ?? [];
+				if (hits.length > 0) {
+					const rendered = sideCarBodyWithText(
+						"knowledge_base_hint",
+						{
+							kind: "knowledge",
+							hits: hits.map(({ scope, entryId, title, summary }) => ({
+								scope,
+								entryId,
+								title,
+								summary,
+							})),
 						},
-					});
+						locale,
+					);
+					if (reservation.commit(rendered.content)) {
+						for (const hit of hits) knowledgeInjectedEntryIds.add(injectionKey(hit));
+						queueLoopInjection({
+							source: "knowledge_base_hint",
+							...rendered,
+							toolUseId: tu.toolUseId,
+							knowledgeInjection: {
+								narratorId: config.narratorId,
+								compactSeq: config.knowledgeInjectionCompactSeq ?? -1,
+								triggerToolCallId: tu.toolUseId,
+								hits,
+							},
+						});
+					}
 				}
 			} catch (err) {
 				logger.warn("Knowledge injection (tool output) failed", {
@@ -3064,6 +3082,8 @@ async function* agentLoopInMetadataSnapshot(
 					toolUseId: tu.toolUseId,
 					error: String(err),
 				});
+			} finally {
+				reservation.release();
 			}
 		}
 		completedToolCount++;
@@ -3085,6 +3105,7 @@ async function* agentLoopInMetadataSnapshot(
 	 */
 	const pendingInputParts: AgentInputPart[] = [];
 	let replayedInjectionMessageIds = new Set<string>();
+	let omittedOptionalMessageIds = new Set<string>();
 	const pendingInputConsumptions: Array<() => void> = [];
 	async function collectAfterToolsInjections(): Promise<void> {
 		if (!config.getAfterToolsInjections) return;
@@ -3160,7 +3181,12 @@ async function* agentLoopInMetadataSnapshot(
 
 	function pendingInputText(parts: readonly AgentInputPart[]): string {
 		return parts
-			.filter((part) => !part.messageId || !replayedInjectionMessageIds.has(part.messageId))
+			.filter(
+				(part) =>
+					!part.messageId ||
+					(!replayedInjectionMessageIds.has(part.messageId) &&
+						!omittedOptionalMessageIds.has(part.messageId)),
+			)
 			.map((part) => part.text)
 			.join("\n\n")
 			.trim();
@@ -3203,6 +3229,15 @@ async function* agentLoopInMetadataSnapshot(
 		// The builder's array is the receipt identity; the system prompt goes into a copy.
 		sourceInputHistory = replacement.history;
 		replayedInjectionMessageIds = new Set(replacement.replayedInjectionMessageIds ?? []);
+		const omitted = new Set(replacement.omittedOptionalMessageIds ?? []);
+		if (
+			omitted.size !== omittedOptionalMessageIds.size ||
+			[...omitted].some((id) => !omittedOptionalMessageIds.has(id))
+		) {
+			// A stateful provider must not retain optional rows removed from this projection.
+			resetUpstreamSessionOnNextRequest = true;
+		}
+		omittedOptionalMessageIds = omitted;
 		if (replacement.systemPrompt != null) {
 			config.systemPrompt = replacement.systemPrompt;
 		}

@@ -21,6 +21,7 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
  */
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
+import type { KeywordMatcherTask } from "../../services/knowledge/keyword-matcher";
 import type {
 	BlockBackfillSliceParams,
 	BlockIndexQueueSliceParams,
@@ -35,6 +36,7 @@ import type {
 
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
+	| "knowledgeKeywordMatcher"
 	| "storageScanContext"
 	| "storageScanTables"
 	| "storageScanSerial"
@@ -247,6 +249,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| KeywordMatcherTask
 	| BlockBackfillSliceParams
 	| BlockVerifySliceParams
 	| BlockReindexSliceParams

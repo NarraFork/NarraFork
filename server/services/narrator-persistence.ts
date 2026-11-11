@@ -9,6 +9,11 @@ import {
 	startCompactAttempt,
 	truncateCompactError,
 } from "@shared/compact-message";
+import {
+	type ContextWorkState,
+	parseContextWorkState,
+	renderContextWorkState,
+} from "@shared/context-work-state";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
 import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
@@ -2141,12 +2146,26 @@ const sqliteNarratorPersistence = {
 			expectedCompactBoundaryMessageId?: string | null;
 			expectedAttempt?: number;
 			expectedSeq?: number;
+			/** Host observations only; never used to restore execution authority. */
+			workState?: ContextWorkState;
+			workStateLocale?: string;
 			/** What the epoch this compact opens froze (§7.7); recorded on success. */
 			epoch?: EpochRecord;
 		},
 	) {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
+		const workState =
+			options?.workState === undefined ? null : parseContextWorkState(options.workState);
+		if (status === "compacted") {
+			if (!summary.trim())
+				throw new ValidationError("Cannot finalize compact with an empty summary");
+			if (options?.workState !== undefined && (!workState || workState.narratorId !== narratorId)) {
+				throw new ValidationError("Invalid or mismatched context work-state snapshot");
+			}
+			if (workState)
+				summary = `${summary}\n\n${renderContextWorkState(workState, options?.workStateLocale ?? "en")}`;
+		}
 
 		return db.transaction((tx) => {
 			// The ref is the authorization and ownership boundary. The message row may
@@ -2223,6 +2242,7 @@ const sqliteNarratorPersistence = {
 				...finished,
 				...(status === "compacted" ? { summary, contextPercentAfter: contextPercent } : {}),
 				...(status === "compacted" && options?.epoch ? { epoch: options.epoch } : {}),
+				...(status === "compacted" && workState ? { workState } : {}),
 			};
 			const failureText = truncateCompactError(options?.error ?? "Compact failed");
 			const contentText =
@@ -4698,49 +4718,62 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		summary: string,
 		contextPercent?: number,
-		options?: { status?: "compacted" | "failed"; error?: string },
+		options?: {
+			status?: "compacted" | "failed";
+			error?: string;
+			workState?: ContextWorkState;
+			workStateLocale?: string;
+		},
 	) {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
-
-		const [countRow] = await db
-			.select({ cnt: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.segmentCompactId, messageId),
-				),
-			);
-		const messageCount = countRow?.cnt ?? 0;
-
-		const block: Record<string, unknown> = {
-			type: "segment_compact",
-			status,
-			summary,
-			messageCount,
-		};
-		if (status === "failed" && options?.error) {
-			block.error = options.error;
+		const workState =
+			options?.workState === undefined ? null : parseContextWorkState(options.workState);
+		if (status === "compacted") {
+			if (!summary.trim())
+				throw new ValidationError("Cannot finalize compact with an empty summary");
+			if (options?.workState !== undefined && (!workState || workState.narratorId !== narratorId)) {
+				throw new ValidationError("Invalid or mismatched context work-state snapshot");
+			}
+			if (workState)
+				summary = `${summary}\n\n${renderContextWorkState(workState, options?.workStateLocale ?? "en")}`;
 		}
 
-		const prefix = status === "failed" ? "[Segment Compact Failed]" : "[Segment Compact]";
-
 		return db.transaction((tx) => {
-			const written = writeEnvelopeBody(tx, messageId, [block], {
-				set: {
-					contextCharsJson: measureMessageCharacters("user", [block]),
-					contentText: `${prefix}\n${summary}`,
-					contextPercent: contextPercent ?? null,
-				},
-				where: eq(narratorMessages.narratorId, narratorId),
-			});
-			const updated = written ? readEnvelope(tx, messageId) : undefined;
-			if (!updated) return null;
-
-			if (status === "failed") {
+			// Reference ownership, pending state and hidden membership are one atomic decision.
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+					columns: { seq: true },
+				})
+				.sync();
+			if (!ref) return null;
+			const body = readEnvelopeBody(tx, messageId);
+			const previous = Array.isArray(body)
+				? body.find((block) => block.type === "segment_compact")
+				: undefined;
+			if (!previous) throw new ValidationError("Message is not a segment compact message");
+			if (previous.status !== "compacting") return null;
+			const countRow = tx
+				.select({ cnt: sql<number>`count(*)` })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.segmentCompactId, messageId),
+					),
+				)
+				.get();
+			const messageCount = countRow?.cnt ?? 0;
+			if (status === "compacted" && (messageCount === 0 || messageCount !== previous.messageCount))
+				return null;
+			const copied = copyMessageForNarratorTx(tx, narratorId, messageId);
+			if (copied.messageId !== messageId) {
 				tx.update(narratorMessageRefs)
-					.set({ segmentCompactId: null })
+					.set({ segmentCompactId: copied.messageId })
 					.where(
 						and(
 							eq(narratorMessageRefs.narratorId, narratorId),
@@ -4749,7 +4782,40 @@ const sqliteNarratorPersistence = {
 					)
 					.run();
 			}
-
+			const block: Record<string, unknown> = {
+				type: "segment_compact",
+				status,
+				summary,
+				messageCount,
+				...(status === "compacted" && workState ? { workState } : {}),
+				...(status === "failed" && options?.error ? { error: options.error } : {}),
+			};
+			const prefix = status === "failed" ? "[Segment Compact Failed]" : "[Segment Compact]";
+			const written = writeEnvelopeBody(tx, copied.messageId, [block], {
+				set: {
+					contextCharsJson: measureMessageCharacters("user", [block]),
+					contentText: `${prefix}\n${summary}`,
+					contextPercent: status === "compacted" ? (contextPercent ?? null) : null,
+				},
+			});
+			const updated = written ? readEnvelope(tx, copied.messageId) : undefined;
+			if (!updated)
+				throw new AppError(
+					"Segment compact marker changed before finalize",
+					409,
+					"COMPACT_FINALIZE_CONFLICT",
+				);
+			if (status === "failed") {
+				tx.update(narratorMessageRefs)
+					.set({ segmentCompactId: null })
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.segmentCompactId, copied.messageId),
+						),
+					)
+					.run();
+			}
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -4759,18 +4825,7 @@ const sqliteNarratorPersistence = {
 				})
 				.where(eq(narrators.id, narratorId))
 				.run();
-
-			const ref = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.messageId, messageId),
-						eq(narratorMessageRefs.narratorId, narratorId),
-					),
-					columns: { seq: true },
-				})
-				.sync();
-
-			return { ...updated, seq: ref?.seq };
+			return { ...updated, seq: ref.seq };
 		});
 	},
 

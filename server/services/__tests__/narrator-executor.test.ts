@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentConfig, AgentEvent } from "../../lib/agent/types";
+import { ContinuationProgressTracker } from "../continuation-progress";
 import { CriticalEventPersistenceError, type EventHandlerContext } from "../narrator-event-handler";
 import { executeAgentLoop } from "../narrator-executor";
 
@@ -743,5 +744,152 @@ describe("executeAgentLoop abort draining", () => {
 		expect(processed).toEqual(["block_complete", "error:Aborted"]);
 		expect(result.aborted).toBe(true);
 		expect(result.hasError).toBe(false);
+	});
+});
+
+describe("bounded continuation evidence", () => {
+	async function receiptPass(
+		input: Record<string, unknown>,
+		output: string,
+		options: {
+			id?: string;
+			isError?: boolean;
+			missing?: boolean;
+			persistFailure?: boolean;
+			images?: Array<{ format: string; base64: string }>;
+		} = {},
+	) {
+		const id = options.id ?? "receipt";
+		const events: AgentEvent[] = [
+			{ type: "assistant_message", text: "", toolUses: [{ toolUseId: id, name: "Read", input }] },
+		];
+		if (!options.missing)
+			events.push({
+				type: "tool_result",
+				toolUseId: id,
+				toolName: "Read",
+				input,
+				output,
+				isError: options.isError ?? false,
+				images: options.images,
+			});
+		events.push({ type: "done" });
+		return executeAgentLoop(
+			{
+				config: makeConfig(new AbortController().signal),
+				userText: "",
+				history: { rows: [] },
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource(events),
+				processEventFn: async (event) => {
+					if (options.persistFailure && event.type === "tool_result")
+						throw new Error("receipt was not persisted");
+					return null;
+				},
+			},
+		);
+	}
+
+	test("identical settled evidence has one fingerprint despite new ids and key order", async () => {
+		const first = await receiptPass({ path: "PRIVATE_FILE", limit: 20 }, "PRIVATE_RESULT", {
+			id: "a",
+		});
+		const second = await receiptPass({ limit: 20, path: "PRIVATE_FILE" }, "PRIVATE_RESULT", {
+			id: "b",
+		});
+		expect(first.toolProgressFingerprint).toBeDefined();
+		expect(first.toolProgressFingerprint).toMatch(/^[a-f0-9]{64}$/);
+		expect(first.toolProgressFingerprint).toBe(second.toolProgressFingerprint);
+	});
+
+	test("different input, output or failure state is new evidence", async () => {
+		const results = await Promise.all([
+			receiptPass({ path: "a" }, "same"),
+			receiptPass({ path: "b" }, "same"),
+			receiptPass({ path: "a" }, "changed"),
+			receiptPass({ path: "a" }, "same", { isError: true }),
+		]);
+		expect(results.every((result) => !!result.toolProgressFingerprint)).toBe(true);
+		expect(new Set(results.map((result) => result.toolProgressFingerprint)).size).toBe(4);
+	});
+
+	test("missing, unpersisted, oversized or unmeasured image receipts are not claimed as equal evidence", async () => {
+		const cycle: Record<string, unknown> = {};
+		cycle.self = cycle;
+		for (const result of await Promise.all([
+			receiptPass({}, "", { missing: true }),
+			receiptPass({}, "same", { persistFailure: true }),
+			receiptPass({ huge: "x".repeat(128 * 1024) }, "same"),
+			receiptPass({}, "x".repeat(128 * 1024)),
+			receiptPass(cycle, "same"),
+			receiptPass({}, "same", { images: [{ format: "png", base64: "image" }] }),
+		]))
+			expect(result.toolProgressFingerprint).toBeUndefined();
+	});
+});
+
+describe("continuation sampling resource limits", () => {
+	function sample(
+		tracker: ContinuationProgressTracker,
+		id: string,
+		input: Record<string, unknown> = {},
+		output = "ok",
+	) {
+		tracker.observe({
+			type: "assistant_message",
+			text: "",
+			toolUses: [{ toolUseId: id, name: "Read", input }],
+		});
+		tracker.observe({
+			type: "tool_result",
+			toolUseId: id,
+			toolName: "Read",
+			input,
+			output,
+			isError: false,
+		});
+	}
+	test("call and aggregate byte ceilings abandon equality rather than compare partial samples", () => {
+		const calls = new ContinuationProgressTracker();
+		for (let index = 0; index < 128; index++) sample(calls, String(index));
+		expect(calls.fingerprint()).toBeDefined();
+		sample(calls, "overflow");
+		expect(calls.fingerprint()).toBeUndefined();
+		const bytes = new ContinuationProgressTracker();
+		for (let index = 0; index < 3; index++) sample(bytes, String(index), {}, "a".repeat(32 * 1024));
+		expect(bytes.fingerprint()).toBeDefined();
+		sample(bytes, "overflow", {}, "a".repeat(32 * 1024));
+		expect(bytes.fingerprint()).toBeUndefined();
+	});
+
+	test("Unicode bytes, wide objects and getters cannot bypass the input budget", () => {
+		let getterCalls = 0;
+		for (const input of [
+			{ text: "中".repeat(3000) },
+			Object.fromEntries(Array.from({ length: 65 }, (_, index) => [String(index), 1])),
+			Object.defineProperty({}, "unsafe", {
+				enumerable: true,
+				get: () => {
+					getterCalls++;
+					return "value";
+				},
+			}),
+		]) {
+			const tracker = new ContinuationProgressTracker();
+			sample(tracker, "one", input);
+			expect(tracker.fingerprint()).toBeUndefined();
+		}
+		expect(getterCalls).toBe(0);
+	});
+
+	test("duplicate observations do not masquerade as fresh evidence", () => {
+		const one = new ContinuationProgressTracker();
+		const duplicate = new ContinuationProgressTracker();
+		sample(one, "one");
+		sample(duplicate, "first");
+		sample(duplicate, "second");
+		expect(duplicate.fingerprint()).toBe(one.fingerprint());
 	});
 });

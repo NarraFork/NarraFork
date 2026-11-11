@@ -11,9 +11,11 @@
  * own transcript: the rows the fake builder receives are exactly what the model reads.
  */
 
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { isBrokenToolOutput, outputToText } from "@shared/agent-protocol/tool-output";
 import { z } from "zod/v4";
+import { ContextEvidenceBudget } from "../../../services/context-evidence-budget";
+import * as knowledge from "../../../services/knowledge-injection";
 import type { ChatParams, DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
@@ -21,7 +23,9 @@ import type { AgentConfig, AgentEvent } from "../types";
 const TOOL = "LoopNoticeTool";
 
 let script: (request: number) => Array<Record<string, unknown>> = () => [{ text: "done" }];
-const requests: Array<Pick<ChatParams, "content" | "toolResults"> & { rows: DbMessage[] }> = [];
+const requests: Array<
+	Pick<ChatParams, "content" | "toolResults" | "resetUpstreamSession"> & { rows: DbMessage[] }
+> = [];
 let projectedRows: DbMessage[] = [];
 
 const provider: ProviderAdapter = {
@@ -35,6 +39,7 @@ const provider: ProviderAdapter = {
 		requests.push({
 			content: params.content,
 			toolResults: structuredClone(params.toolResults),
+			resetUpstreamSession: params.resetUpstreamSession,
 			rows: projectedRows,
 		});
 		params.onRequestStart?.();
@@ -185,4 +190,109 @@ describe("broken call", () => {
 			`Your previous ${TOOL} call(s) had invalid or missing input`,
 		);
 	});
+});
+
+describe("tool-output shared evidence budget", () => {
+	for (const cap of [0, 64]) {
+		test(`rejects oversized knowledge without losing results or required notices (${cap} bytes)`, async () => {
+			const budget = new ContextEvidenceBudget(() => cap);
+			const already = new Set<string>();
+			const scan = spyOn(knowledge, "scanToolOutputForKnowledgeDetailed").mockResolvedValue({
+				hits: [{ entryId: "overflow", title: "OVERFLOW", summary: "文".repeat(500) }],
+				content: "unused projection",
+			});
+			const delivered: Array<{ source: string; content: string }> = [];
+			script = (request) =>
+				request < 2 ? [toolCall(request, { value: `v${request}` })] : [{ text: "done" }];
+			try {
+				await run(
+					config({
+						maxTurns: 3,
+						evidenceBudget: budget,
+						knowledgeInjectedEntryIds: already,
+						deliverInjectionRow: (injection) => {
+							delivered.push(injection);
+							return { text: injection.content, messageId: `budget-row-${delivered.length}` };
+						},
+					}),
+				);
+				expect(delivered.filter((item) => item.source === "knowledge_base_hint")).toEqual([]);
+				expect(resultOutputs()).toContain("ran:v0");
+				expect(resultOutputs()).toContain("ran:v1");
+				expect(budget.remaining).toBe(cap);
+				expect(already.size).toBe(0);
+				if (cap === 0) expect(scan).not.toHaveBeenCalled();
+			} finally {
+				scan.mockRestore();
+			}
+		});
+	}
+
+	test("charges rendered knowledge after memory and deduplicates across tool turns", async () => {
+		const budget = new ContextEvidenceBudget(() => 1024);
+		budget.reserve("memory", 300).commit("m".repeat(300));
+		const already = new Set<string>();
+		const scan = spyOn(knowledge, "scanToolOutputForKnowledgeDetailed").mockImplementation(
+			async (_user, _output, local, options) => {
+				expect(options?.byteBudget).toBeLessThanOrEqual(724);
+				expect(local).not.toBe(already);
+				local.add("global:one");
+				return {
+					hits: [{ entryId: "one", title: "Advice", summary: "Check the logs" }],
+					content: "unused projection",
+				};
+			},
+		);
+		const delivered: Array<{ source: string; content: string }> = [];
+		script = (request) =>
+			request < 2 ? [toolCall(request, { value: `v${request}` })] : [{ text: "done" }];
+		try {
+			await run(
+				config({
+					evidenceBudget: budget,
+					knowledgeInjectedEntryIds: already,
+					deliverInjectionRow: (injection) => {
+						delivered.push(injection);
+						return { text: injection.content, messageId: `budget-row-${delivered.length}` };
+					},
+				}),
+			);
+			const hints = delivered.filter((item) => item.source === "knowledge_base_hint");
+			expect(hints).toHaveLength(1);
+			expect(budget.remaining).toBe(724 - Buffer.byteLength(hints[0]?.content ?? ""));
+			expect(already.has("global:one")).toBe(true);
+		} finally {
+			scan.mockRestore();
+		}
+	});
+});
+
+test("a budget-omitted durable hint is not reintroduced from the pending-input queue", async () => {
+	script = (request) =>
+		request === 0 ? [toolCall(request, { value: "once" })] : [{ text: "done" }];
+	let drained = false;
+	await run(
+		config({
+			evidenceBudget: new ContextEvidenceBudget(() => 0),
+			rebuildRequestHistory: async () => ({
+				history: [],
+				rows: [],
+				omittedOptionalMessageIds: requests.length === 0 ? [] : ["omitted-hint"],
+			}),
+			getAfterToolsInjections: () => {
+				if (drained) return { text: "" };
+				drained = true;
+				return {
+					text: "OPTIONAL_OMITTED\n\nREQUIRED_NOTICE",
+					parts: [
+						{ messageId: "omitted-hint", text: "OPTIONAL_OMITTED" },
+						{ messageId: "required-notice", text: "REQUIRED_NOTICE" },
+					],
+				};
+			},
+		}),
+	);
+	expect(JSON.stringify(requests[1])).toContain("REQUIRED_NOTICE");
+	expect(JSON.stringify(requests[1])).not.toContain("OPTIONAL_OMITTED");
+	expect(requests[1]?.resetUpstreamSession).toBe(true);
 });

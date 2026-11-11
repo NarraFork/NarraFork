@@ -62,6 +62,10 @@ export interface InstanceSettingsState {
 	promptOptimizeModel: string;
 	promptOptimizeContextMaxMessages: number;
 	maxTurns: number;
+	contextEvidenceBudgetBytes: number;
+	knowledgeInjectMode: "summary" | "off";
+	knowledgeRetrievalMode: "keywords" | "hybrid";
+	knowledgeScanToolOutput: boolean;
 	subagentExploreModel: string;
 	subagentPlanModel: string;
 	subagentSearchModel: string;
@@ -245,6 +249,10 @@ function makeDefaults(): InstanceSettingsState {
 		promptOptimizeModel: "__summary__",
 		promptOptimizeContextMaxMessages: 3,
 		maxTurns: 1000,
+		contextEvidenceBudgetBytes: 16384,
+		knowledgeInjectMode: "summary",
+		knowledgeRetrievalMode: "keywords",
+		knowledgeScanToolOutput: true,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
 		subagentSearchModel: "",
@@ -344,6 +352,10 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
 				promptOptimizeContextMaxMessages: settings.agent?.promptOptimizeContextMaxMessages ?? 3,
 				maxTurns: settings.agent?.maxTurns ?? 1000,
+				contextEvidenceBudgetBytes: settings.agent?.contextEvidenceBudgetBytes ?? 16384,
+				knowledgeInjectMode: settings.knowledge?.injectMode ?? "summary",
+				knowledgeRetrievalMode: settings.knowledge?.retrievalMode ?? "keywords",
+				knowledgeScanToolOutput: settings.knowledge?.scanToolOutput ?? true,
 				subagentAllowedModels: {
 					explore: settings.agent?.subagentAllowedModels?.explore ?? [],
 					plan: settings.agent?.subagentAllowedModels?.plan ?? [],
@@ -453,7 +465,13 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					name: state.brandName.trim(),
 					iconColor: state.brandIconColor === DEFAULT_BRAND_ICON_COLOR ? "" : state.brandIconColor,
 				},
+				knowledge: {
+					injectMode: state.knowledgeInjectMode,
+					retrievalMode: state.knowledgeRetrievalMode,
+					scanToolOutput: state.knowledgeScanToolOutput,
+				},
 				agent: {
+					contextEvidenceBudgetBytes: state.contextEvidenceBudgetBytes,
 					defaultModel: state.defaultModel,
 					defaultPermissionMode: state.permissionMode,
 					summaryModel: state.summaryModel,

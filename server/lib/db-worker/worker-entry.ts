@@ -16,6 +16,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { compileMatcher } from "../../services/knowledge/keyword-matcher";
 import {
 	collectSessionAggregateStats,
 	loadScanContext,
@@ -202,6 +203,15 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	activeTasks.set(message.requestId, controller);
 	try {
 		const params = message.params;
+		if (params.kind === "knowledgeKeywordMatcher") {
+			post({
+				type: "result",
+				requestId: message.requestId,
+				result: compileMatcher(params.candidates),
+				durationMs: Date.now() - startedAt,
+			});
+			return;
+		}
 		const result =
 			params.kind === "displayPageMessagesPostgres"
 				? await runPostgresDisplayPageQuery(

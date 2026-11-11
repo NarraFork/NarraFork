@@ -3,6 +3,7 @@ import { createFileRoute, useRouterState } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { AgentSection } from "../../components/settings/AgentSection";
+import { ContextEvidenceSettings } from "../../components/settings/ContextEvidenceSettings";
 import { TraitLayerEditor } from "../../components/settings/TraitLayerEditor";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
@@ -33,6 +34,7 @@ function SettingsAgentPage() {
 	return (
 		<Stack>
 			<Title order={3}>{t("agentSection")}</Title>
+			<ContextEvidenceSettings />
 			<AgentSection
 				isAdmin={currentUser?.role === "admin"}
 				permissionRuleAutoApprove={is.permissionRuleAutoApprove}

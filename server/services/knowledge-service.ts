@@ -1160,6 +1160,7 @@ async function getRevision(revisionId: string, principal: Principal) {
 function mapRow(row: KnowledgeSearchRow) {
 	return {
 		id: row.id,
+		...(row.entryRevisionId !== undefined ? { entryRevisionId: row.entryRevisionId } : {}),
 		...(row.personalEntryId ? { personalEntryId: row.personalEntryId } : {}),
 		collectionId: row.collectionId,
 		title: row.title,
@@ -1516,7 +1517,12 @@ async function filterReadable<T extends { id: string; collectionId?: string | nu
  * read binding and are usable on both engines. */
 export const knowledgeInjectionReads = {
 	async listKeywordInjectionCandidates(
-		opts: { collectionId?: string; projectId?: string; userId?: string | null } = {},
+		opts: {
+			collectionId?: string;
+			projectId?: string;
+			userId?: string | null;
+			signal?: AbortSignal;
+		} = {},
 	) {
 		const globalRows = await knowledgeReadStore.listKeywordInjectionCandidates({
 			...opts,
@@ -1549,7 +1555,12 @@ export const knowledgeInjectionReads = {
 			.filter((row) => row.keywords.length > 0);
 	},
 	async keywordInjectionCandidatesSignature(
-		opts: { collectionId?: string; projectId?: string; userId?: string | null } = {},
+		opts: {
+			collectionId?: string;
+			projectId?: string;
+			userId?: string | null;
+			signal?: AbortSignal;
+		} = {},
 	) {
 		const global = await knowledgeReadStore.keywordInjectionCandidatesSignature(opts);
 		const personal = opts.userId

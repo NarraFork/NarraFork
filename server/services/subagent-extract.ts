@@ -140,7 +140,9 @@ export async function extractSubagentToPrimary(
 	let contextSummary: string | null = null;
 	if (inheritMode === "compressed") {
 		const { narratorContext } = await import("./narrator-context");
-		contextSummary = await narratorContext.generateContextSummary(sourceId, locale);
+		contextSummary = await narratorContext.generateContextSummary(sourceId, locale, {
+			throwOnFailure: true,
+		});
 	}
 
 	// Load source messages in ref-seq order for full materialization.

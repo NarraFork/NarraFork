@@ -109,6 +109,29 @@ afterAll(() => {
 });
 
 describe("extractSubagentToPrimary", () => {
+	for (const inheritMode of ["compressed", "full"] as const) {
+		test(`${inheritMode} extraction refuses failed compressed context without creating a session`, async () => {
+			seedSubagent("sub");
+			seedSourceMessage("evidence", "sub", 0, "must not lose this");
+			const { narratorContext } = await import("../narrator-context");
+			const summarize = spyOn(narratorContext, "generateContextSummary").mockImplementation(
+				async (_id, _locale, options) => {
+					if (options?.throwOnFailure) throw new Error("summary unavailable");
+					return "";
+				},
+			);
+			const before = await db.select({ id: narrators.id }).from(narrators);
+			try {
+				await expect(
+					extractSubagentToPrimary("sub", { inheritMode, maxFullMessages: 0 }),
+				).rejects.toThrow("summary unavailable");
+				expect(await db.select({ id: narrators.id }).from(narrators)).toEqual(before);
+				expect(summarize.mock.calls[0]?.[2]).toMatchObject({ throwOnFailure: true });
+			} finally {
+				summarize.mockRestore();
+			}
+		});
+	}
 	test("materializes a following child's current model before dropping the parent", async () => {
 		seedSubagent("following-sub");
 		await db

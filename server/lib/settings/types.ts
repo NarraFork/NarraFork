@@ -618,6 +618,8 @@ export interface NarraForkSettings {
 	knowledge: {
 		/** "summary" = inject matched entry summaries; "off" = disable passive injection. */
 		injectMode: "summary" | "off";
+		/** Keyword-only by default; hybrid also considers bounded full-text evidence. */
+		retrievalMode: "keywords" | "hybrid";
 		/** Max entries auto-injected per turn (caps context growth). */
 		maxInjectedEntries: number;
 		/** Minimum keyword length to attempt a match (aligns with trigram >= 3). */
@@ -654,6 +656,8 @@ export interface NarraForkSettings {
 		enabled: boolean;
 	};
 	agent: {
+		/** Shared UTF-8 bytes for optional memory and knowledge; 0 disables both, max 64 KiB. */
+		contextEvidenceBudgetBytes?: number;
 		defaultModel: string;
 		defaultPermissionMode: PermissionMode;
 		/** Creation default only; auto makes project-page sessions project-visible, others private. */

@@ -517,6 +517,84 @@ describe("subagent signed source projection", () => {
 });
 
 describe("real shared orchestrator profile contract", () => {
+	for (const cap of [0, 256]) {
+		test(`user-message knowledge respects the shared evidence allowance (${cap} bytes)`, async () => {
+			const { knowledgeInjection } = await import("../knowledge-injection");
+			const oldBudget = settings.agent.contextEvidenceBudgetBytes;
+			settings.agent.contextEvidenceBudgetBytes = cap;
+			const resolve = spyOn(knowledgeInjection, "resolveInjections").mockResolvedValue([
+				{ entryId: "too-large", title: "OVER_BUDGET_KNOWLEDGE", summary: "摘要".repeat(256) },
+			]);
+			let checked = false;
+			spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.config.evidenceBudget?.remaining).toBe(cap);
+				expect(JSON.stringify(options.history)).not.toContain("OVER_BUDGET_KNOWLEDGE");
+				const budget = options.config.evidenceBudget;
+				budget?.reserve("knowledge", cap).commit("x".repeat(cap));
+				await options.config.rebuildRequestHistory?.();
+				expect(options.config.evidenceBudget).toBe(budget);
+				expect(budget?.remaining).toBe(cap);
+				checked = true;
+				return finished;
+			});
+			try {
+				const handle = await startNarratorRun({
+					narratorId: "contract-primary",
+					locale: "en",
+					text: "knowledge budget",
+					principal: "principal-a",
+					deliver: false,
+				});
+				expect((await handle.terminal).hasError).toBe(false);
+				expect(checked).toBe(true);
+				if (cap === 0) expect(resolve).not.toHaveBeenCalled();
+				else expect(resolve.mock.calls[0]?.[2]?.byteBudget).toBeLessThanOrEqual(cap);
+				expect(
+					db
+						.select()
+						.from(narratorMessages)
+						.all()
+						.some((message) => message.contentText?.includes("OVER_BUDGET_KNOWLEDGE")),
+				).toBe(false);
+			} finally {
+				settings.agent.contextEvidenceBudgetBytes = oldBudget;
+			}
+		});
+	}
+
+	test("the real run recalls the acting user's memory and rechecks it before the next request", async () => {
+		const { contextMemoryService } = await import("../context-memory-service");
+		const actor = { userId: "principal-a", isAdmin: false, kind: "user" as const };
+		db.update(narrators)
+			.set({ ownerUserId: actor.userId, visibility: "private", writeAudience: "owner" })
+			.where(eq(narrators.id, "contract-primary"))
+			.run();
+		const memory = await contextMemoryService.propose(
+			{ scope: { kind: "user" }, key: "tests", content: "PRIVATE_RUNTIME_MEMORY" },
+			actor,
+		);
+		await contextMemoryService.decide(memory.id, { action: "confirm", expectedVersion: 1 }, actor);
+		const prompts: string[] = [];
+		const pass = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+			prompts.push(options.config.systemPrompt ?? "");
+			await contextMemoryService.forget(memory.id, 2, actor);
+			const next = await options.config.rebuildRequestHistory?.();
+			prompts.push(next?.systemPrompt ?? "");
+			return finished;
+		});
+		const handle = await startNarratorRun({
+			narratorId: "contract-primary",
+			locale: "en",
+			text: "remember tests",
+			principal: actor.userId,
+			deliver: false,
+		});
+		expect((await handle.terminal).hasError).toBe(false);
+		expect(pass).toHaveBeenCalledTimes(1);
+		expect(prompts[0]).toContain("PRIVATE_RUNTIME_MEMORY");
+		expect(prompts[1]).not.toContain("PRIVATE_RUNTIME_MEMORY");
+	});
+
 	for (const kind of ["references", "bash", "official-references"] as const) {
 		test(`primary: spilled ${kind} survive materialization and start the next pass`, async () => {
 			const oldHome = process.env.NARRAFORK_HOME;
@@ -1291,6 +1369,32 @@ describe("real shared orchestrator profile contract", () => {
 		expect(JSON.stringify(stream[1][1])).not.toContain("subagentToolUseId");
 	});
 
+	test("primary stops unchanged tool-evidence continuations without completing its task", async () => {
+		const { writeSpecFile, readSpecFile } = await import("../spec-vfs-service");
+		await db
+			.update(narrators)
+			.set({ autoContinuationOverride: "always" })
+			.where(eq(narrators.id, "contract-primary"));
+		await writeSpecFile(
+			"contract-primary",
+			"spec://tasks.json",
+			JSON.stringify({ tasks: [{ text: "finite evidence fixture", status: "doing" }] }),
+		);
+		const h = fixture(
+			profiles[0],
+			Array.from({ length: 5 }, () => ({
+				...finished,
+				hadToolUses: true,
+				toolProgressFingerprint: "same-settled-evidence",
+			})),
+		);
+		expect((await h.run()).hasError).toBe(false);
+		expect(h.calls).toHaveLength(5);
+		expect((await readSpecFile("contract-primary", "spec://tasks.json"))?.content).toContain(
+			'"doing"',
+		);
+	});
+
 	test("child doing Spec work exhausts the real per-run continuation budget without changing task status", async () => {
 		const { writeSpecFile, readSpecFile } = await import("../spec-vfs-service");
 		const { resolveNarratorRuntimePolicy } = await import("../trait-layer-service");
@@ -1537,6 +1641,8 @@ describe("real shared orchestrator profile contract", () => {
 for (const profile of profiles) {
 	test(`${profile.kind}: real keyword knowledge hit has the same system sender live and in history`, async () => {
 		const { knowledgeService } = await import("../knowledge-service");
+		const { knowledgeInjection } = await import("../knowledge-injection");
+		const knowledgeScan = spyOn(knowledgeInjection, "resolveInjections");
 		const { narratorPersistence } = await import("../narrator-persistence");
 		const { buildRuntimeHistory } = await import("../agent-runtime/history");
 		const { projectMessageSenderText } = await import("../../lib/agent/sender-projection");
@@ -1588,6 +1694,8 @@ for (const profile of profiles) {
 			expect(input).toContain(projected);
 			expect(input.match(/<sender kind="system"/g)).toHaveLength(1);
 			expect(knowledge.contentText).not.toContain("<sender ");
+			expect(knowledgeScan).toHaveBeenCalled();
+			expect(knowledgeScan.mock.calls[0]?.[2]?.signal).toBe(h.session.abortController.signal);
 			const rebuilt = await buildRuntimeHistory({
 				narratorId: h.session.narratorId,
 				model: MODEL,

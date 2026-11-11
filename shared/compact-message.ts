@@ -1,3 +1,4 @@
+import type { ContextWorkState } from "./context-work-state";
 import type { ProgressPhase } from "./progress-phase";
 
 export const MAX_COMPACT_ATTEMPTS = 10;
@@ -35,6 +36,8 @@ export interface CompactMessageBlock {
 	mode?: CompactMessageMode;
 	trigger?: CompactMessageTrigger | string;
 	summary?: string;
+	/** Historical observation only; consumers must validate before using it. */
+	workState?: ContextWorkState;
 	error?: string;
 	contextPercentBefore?: number;
 	contextPercentAfter?: number;

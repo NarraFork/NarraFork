@@ -2,6 +2,7 @@ import { type AgentConfig, type AgentLoopHistory, agentLoop } from "../lib/agent
 import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { ContinuationProgressTracker } from "./continuation-progress";
 import { getAgentFileReferenceContext } from "./file-reference-context";
 import {
 	CriticalEventPersistenceError,
@@ -75,6 +76,8 @@ export interface ExecuteLoopResult {
 	aborted?: boolean;
 	/** Whether the completed turn included any tool call. */
 	hadToolUses?: boolean;
+	/** Bounded equality evidence from settled receipts; never authority to replay a tool. */
+	toolProgressFingerprint?: string;
 	/** Stable fingerprint(s) for protected-task mutations rejected by taskReflection this pass. */
 	taskReflectionDenialFingerprint?: string;
 	/** Whether at least one provider assistant turn completed before this pass ended. */
@@ -168,6 +171,7 @@ export async function executeAgentLoop(
 	let completedNaturally = false;
 	let reasoningOnlyIdle = false;
 	const taskReflectionDenialFingerprints = new Set<string>();
+	const toolProgress = new ContinuationProgressTracker();
 
 	try {
 		for await (const event of eventSource) {
@@ -193,6 +197,7 @@ export async function executeAgentLoop(
 
 			try {
 				const result = await processEventFn(event, eventContext, hooks);
+				toolProgress.observe(event);
 				if (result?.titleUpdate !== undefined) {
 					shouldUpdateTitle = result.titleUpdate;
 				}
@@ -213,6 +218,7 @@ export async function executeAgentLoop(
 				}
 				// For tool-result events, notify frontend about persistence issues.
 				if (event.type === "tool_result") {
+					toolProgress.invalidate();
 					broadcastToNarrator(config.narratorId, {
 						type: "warning",
 						narratorId: config.narratorId,
@@ -354,6 +360,7 @@ export async function executeAgentLoop(
 		silentDisconnect,
 		aborted,
 		hadToolUses,
+		toolProgressFingerprint: aborted ? undefined : toolProgress.fingerprint(),
 		taskReflectionDenialFingerprint:
 			taskReflectionDenialFingerprints.size > 0
 				? [...taskReflectionDenialFingerprints].sort().join("\n")

@@ -154,6 +154,7 @@ import {
 } from "./agent-runtime/ownership";
 import type { RuntimePolicy } from "./agent-runtime/policy";
 import {
+	type PreparePrefixRequestOptions,
 	preparePrefixRequest,
 	type RequestModelIdentity,
 } from "./agent-runtime/prepare-prefix-request";
@@ -2719,6 +2720,9 @@ export interface ContextManagementOptions {
 		parts: import("../../shared/prefix-context").PromptPart[];
 		compactMessageId?: string | null;
 	}>;
+	/** Fresh, revocable context that must not be persisted in the prefix. */
+	getRequestContext?: PreparePrefixRequestOptions["getRequestContext"];
+	evidenceBudget?: PreparePrefixRequestOptions["evidenceBudget"];
 	/** Compatibility path for callers not yet supplying named prompt parts. */
 	rebuildSystemPrompt?: () => Promise<string | null>;
 }
@@ -2787,9 +2791,11 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			getToolLoading: opts.getToolLoading,
 			refreshToolLoading: opts.refreshToolLoading,
 			buildPrefixPrompt: opts.buildPrefixPrompt,
+			getRequestContext: opts.getRequestContext,
+			evidenceBudget: opts.evidenceBudget,
 		});
 		const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
-		let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
+		let systemPrompt = preparedPrefix.systemPrompt;
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
@@ -2813,6 +2819,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			history: result.history,
 			rows: result.modelMessages,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+			omittedOptionalMessageIds: preparedPrefix.omittedOptionalMessageIds,
 			...(result.toolLoading
 				? {
 						toolLoading: result.toolLoading,

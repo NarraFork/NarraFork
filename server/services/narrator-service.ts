@@ -1527,9 +1527,9 @@ export async function narratorCreationWorkspaceTarget(
 				.get()
 		: undefined;
 	const cwd = resolveNarratorSessionCwd(row.cwd, project?.path, getHome());
-	const deviceId = !localPathSemantics.isAbsolute(cwd)
-		? (row.defaultDeviceId ?? row.workspaceContext?.deviceId ?? "local")
-		: "local";
+	// A workspace cwd belongs to its execution device, unlike a tool's explicit host path.
+	// Reinterpreting an absolute remote cwd with host semantics corrupts inherited context.
+	const deviceId = row.defaultDeviceId ?? row.workspaceContext?.deviceId ?? "local";
 	const target = await canonicalWorkspaceAdmissionTarget({
 		deviceId,
 		// Match the trusted local backend's lexical base for old relative cwd rows.
@@ -2549,6 +2549,7 @@ export const narratorService = {
 				const locale = (opts?.locale ?? "en") as import("../lib/prompt-i18n").Locale;
 				contextSummary = await narratorContext.generateContextSummary(parentNarratorId, locale, {
 					userId: opts?.userId,
+					throwOnFailure: true,
 				});
 				if (contextSummary && parent.systemPrompt) {
 					systemPrompt = `${parent.systemPrompt}\n\n## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;
