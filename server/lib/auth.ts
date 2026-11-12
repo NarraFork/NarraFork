@@ -480,6 +480,10 @@ export async function loginUser(
 			password,
 			user?.passwordHash ?? INVALID_LOGIN_PADDING_HASH,
 		);
+		// The bcrypt slot bounds hashing CPU, not the attempt. Free it before the directory
+		// fallback waits on the network, so slow or unreachable LDAP cannot hold every slot
+		// and answer all other logins (the local administrator's included) with AUTH_BUSY.
+		attempt.releaseHashSlot();
 
 		if (valid && user) {
 			attempt.success();
@@ -489,7 +493,31 @@ export async function loginUser(
 
 		// Local password did not match (or no such local account). Try the directory —
 		// one credential, two verifiers, a single failure budget for the whole attempt.
-		const directoryUserId = await tryDirectoryLogin(username, password, sourceIp);
+		let directoryUserId: string | null;
+		try {
+			directoryUserId = await tryDirectoryLogin(username, password, sourceIp);
+		} catch (error) {
+			if (error instanceof AppError && error.code === "LDAP_UNAVAILABLE") {
+				// The local verifier has already rejected this password, so the guess is spent
+				// whatever the directory's state. Refunding it on an outage would let anyone
+				// guess local passwords — the administrator's included — without a budget for
+				// as long as the directory is down: 503 means "wrong", 200 means "right".
+				const after = attempt.failure();
+				attemptCompleted = true;
+				logger.warn("Failed password login attempt", {
+					userId: user?.id,
+					accountFingerprint: fingerprintAuthIdentifier(username),
+					sourceIp,
+					remaining: after.remaining,
+					locked: after.locked,
+					reason: "directory_unavailable",
+				});
+				if (after.locked) {
+					throw new RateLimitError("LOGIN_THROTTLED", after.retryAfterMs);
+				}
+			}
+			throw error;
+		}
 		if (directoryUserId) {
 			attempt.success();
 			attemptCompleted = true;

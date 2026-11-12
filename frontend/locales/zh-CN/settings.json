@@ -681,7 +681,7 @@
 	"ldapStage_ok": "连接成功",
 	"ldapPolicyTitle": "本地账户如何处理",
 	"ldapPolicyBound": "已绑定该目录身份的账户以其自身身份登录。",
-	"ldapPolicySameName": "若本地存在同名账户，则把该账户绑定到目录身份并保留其现有角色——包括管理员。",
+	"ldapPolicySameName": "若本地存在名称完全相同的普通账户，则把该账户绑定到目录身份并保留其现有角色。管理员账户不会以这种方式自动绑定，仍需使用本地密码登录。",
 	"ldapPolicyCreate": "否则，当用户页的「开放注册」开启时，当场创建一个普通用户账户。",
 	"ldapPolicyClosed": "注册已关闭且没有同名账户时，登录被拒绝，并提示对方联系管理员建号。",
 	"ldapValidationUrl": "服务器地址必须以 ldap:// 或 ldaps:// 开头。",

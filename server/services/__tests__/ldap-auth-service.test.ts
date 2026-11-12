@@ -3,7 +3,8 @@
  *
  * The account policy is the interesting part and is what most of this file pins down:
  * an already-bound identity signs in regardless of the registration switch, a same-name
- * local account gets bound (and keeps its role), and an unknown name is either
+ * regular local account gets bound (and keeps its role), a same-name administrator is
+ * never bound implicitly, and an unknown name is either
  * provisioned as an ordinary `user` or refused outright.
  */
 import { afterEach, describe, expect, test } from "bun:test";
@@ -22,6 +23,7 @@ import { settings } from "../../lib/settings";
 import {
 	authenticate,
 	isLdapEnabled,
+	LDAP_MAX_CONCURRENT_AUTHENTICATIONS,
 	probe,
 	resolveLocalUser,
 	setLdapClientFactoryForTests,
@@ -151,6 +153,40 @@ describe("authenticate", () => {
 		});
 	});
 
+	test("refuses beyond the concurrency cap without dialing out", async () => {
+		useDirectoryConfig();
+		let calls = 0;
+		const releases: Array<() => void> = [];
+		setLdapClientFactoryForTests(
+			(): LdapAuthClient => ({
+				async authenticate() {
+					calls += 1;
+					await new Promise<void>((resolve) => releases.push(resolve));
+					return { kind: "invalid" };
+				},
+				async probe() {
+					return { stage: "ok", ok: true, message: "ok" };
+				},
+				async close() {},
+			}),
+		);
+
+		const pending = Array.from({ length: LDAP_MAX_CONCURRENT_AUTHENTICATIONS }, () =>
+			authenticate("slow", "pw"),
+		);
+		expect(await authenticate("one-too-many", "pw")).toEqual({
+			kind: "unavailable",
+			reason: "LDAP_BUSY",
+		});
+		expect(calls).toBe(LDAP_MAX_CONCURRENT_AUTHENTICATIONS);
+
+		for (const release of releases) release();
+		await Promise.all(pending);
+		// Slots are returned once the checks settle.
+		useFakeClient({ kind: "invalid" });
+		expect(await authenticate("after", "pw")).toEqual({ kind: "invalid" });
+	});
+
 	test("is unavailable (not invalid) when LDAP is off", async () => {
 		settings.auth.ldap = undefined;
 		useFakeClient({ kind: "ok", entry: { dn: "uid=a", id: "a" } });
@@ -197,16 +233,46 @@ describe("resolveLocalUser", () => {
 
 	test("binds a same-name local account instead of creating a duplicate", async () => {
 		useDirectoryConfig();
-		const userId = await makeUser("alice", "admin");
+		const userId = await makeUser("alice");
 
 		const resolved = await resolveLocalUser({ dn: "uid=alice,dc=example,dc=com", id: "alice" });
 		expect(resolved).toEqual({ userId, outcome: "linked_existing_account" });
 
 		// The account keeps its role; only the credential source was added.
 		const user = await db.query.users.findFirst({ where: eq(users.id, userId) });
-		expect(user?.role).toBe("admin");
+		expect(user?.role).toBe("user");
 		const identity = await findIdentity("alice");
 		expect(identity?.userId).toBe(userId);
+	});
+
+	test("never binds a same-name administrator implicitly", async () => {
+		useDirectoryConfig();
+		settings.auth.registrationOpen = true;
+		const adminId = await makeUser("ldap-root", "admin");
+
+		await expect(resolveLocalUser({ dn: "uid=ldap-root", id: "ldap-root" })).rejects.toMatchObject({
+			statusCode: 403,
+			code: "LDAP_ADMIN_LINK_REFUSED",
+		});
+		expect(await findIdentity("ldap-root")).toBeUndefined();
+		const admin = await db.query.users.findFirst({ where: eq(users.id, adminId) });
+		expect(admin?.role).toBe("admin");
+	});
+
+	test("a name that only collapses onto a local account after sanitizing is not bound to it", async () => {
+		useDirectoryConfig();
+		settings.auth.registrationOpen = true;
+		const adminId = await makeUser("rootadm", "admin");
+
+		// `root.adm` sanitizes to `rootadm`; it must get an account of its own, not the admin's.
+		const resolved = await resolveLocalUser({ dn: "uid=root.adm", id: "root.adm" });
+		createdUserIds.push(resolved.userId);
+		expect(resolved.outcome).toBe("created");
+		expect(resolved.userId).not.toBe(adminId);
+		const created = await db.query.users.findFirst({ where: eq(users.id, resolved.userId) });
+		expect(created?.role).toBe("user");
+		expect(created?.username).not.toBe("rootadm");
+		expect((await findIdentity("root.adm"))?.userId).toBe(resolved.userId);
 	});
 
 	test("matches a same-name account regardless of case", async () => {

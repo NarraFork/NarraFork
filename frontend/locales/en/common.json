@@ -150,6 +150,7 @@
 	"ssoDomainDenied": "Your email domain is not allowed to sign in via SSO.",
 	"ssoSignupDisabled": "No account is linked to this identity. Ask an administrator to enable signup or link your account first.",
 	"ldapUnavailable": "The directory server is unavailable right now. Try again shortly, or contact your administrator.",
+	"ldapAdminLinkRefused": "The directory confirmed your password, but the local account with this name is an administrator and is not linked to the directory automatically. Sign in with the local password.",
 	"ldapAccountRequired": "The directory confirmed your password, but this instance has no account for you and registration is closed. Ask an administrator to create one.",
 	"or": "or",
 	"adminPanel": "Admin Panel",

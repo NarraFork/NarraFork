@@ -681,7 +681,7 @@
 	"ldapStage_ok": "Connection succeeded",
 	"ldapPolicyTitle": "What happens to the local account",
 	"ldapPolicyBound": "An account already linked to this directory identity signs in as itself.",
-	"ldapPolicySameName": "If an account with the same name exists locally, that account is linked to the directory identity and keeps its existing role — including administrator.",
+	"ldapPolicySameName": "If a regular account with exactly the same name exists locally, that account is linked to the directory identity and keeps its existing role. Administrator accounts are never linked this way; they keep signing in with their local password.",
 	"ldapPolicyCreate": "Otherwise, while the registration switch on the users page is open, a regular user account is created on the spot.",
 	"ldapPolicyClosed": "With registration closed and no account of that name, sign-in is refused and the person is told to ask an administrator for an account.",
 	"ldapValidationUrl": "The server URL must start with ldap:// or ldaps://.",

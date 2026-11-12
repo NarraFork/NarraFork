@@ -12,6 +12,7 @@ import { Hono } from "hono";
 import { db } from "../../db";
 import { users } from "../../db/schema";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
+import { loginUser } from "../../lib/auth";
 import { authAttemptLimiter } from "../../lib/auth-attempt-limiter";
 import { generateId } from "../../lib/id";
 import type { LdapAuthClient, LdapAuthOutcome } from "../../lib/ldap/client";
@@ -289,17 +290,67 @@ describe("POST /api/auth/login with LDAP configured", () => {
 		expect(statuses).toEqual([401, 401, 401, 401, 429]);
 	});
 
-	test("directory outages do not spend the failure budget", async () => {
+	test("a directory outage still spends the budget of a locally rejected password", async () => {
 		enableDirectory();
 		useDirectory({ kind: "unavailable", reason: "connect: Connection timeout" });
+		installSessionStore({
+			credential: { id: LOCAL_USER_ID, passwordHash: localPasswordHash, mfaEnabled: false },
+			profiles: { [LOCAL_USER_ID]: profile(LOCAL_USER_ID, "alice") },
+		});
 
-		for (let i = 0; i < 4; i++) {
-			expect((await login("outage-user", "pw")).status).toBe(503);
-		}
-		// One real failure after four outages: if the outages had counted, the budget
-		// would now be exhausted and this would be a 429.
-		useDirectory({ kind: "invalid" });
-		expect((await login("outage-user", "pw")).status).toBe(401);
-		expect((await login("outage-user", "pw")).status).toBe(401);
+		// The local verifier already said "wrong", so an outage must not refund the guess:
+		// otherwise local passwords could be guessed without limit while the directory is
+		// down (503 = wrong, 200 = right).
+		const statuses: number[] = [];
+		for (let i = 0; i < 5; i++) statuses.push((await login("alice", `guess-${i}`)).status);
+		expect(statuses).toEqual([503, 503, 503, 503, 429]);
+		// Even the right password is throttled now.
+		expect((await login("alice", LOCAL_PASSWORD)).status).toBe(429);
+	});
+
+	test("a slow directory does not hold the bcrypt slots other logins need", async () => {
+		enableDirectory();
+		const releases: Array<() => void> = [];
+		setLdapClientFactoryForTests(
+			(): LdapAuthClient => ({
+				async authenticate() {
+					await new Promise<void>((resolve) => releases.push(resolve));
+					return { kind: "invalid" };
+				},
+				async probe() {
+					return { stage: "ok", ok: true, message: "ok" };
+				},
+				async close() {},
+			}),
+		);
+		installSessionStore({
+			credential: { id: LOCAL_USER_ID, passwordHash: localPasswordHash, mfaEnabled: false },
+			profiles: { [LOCAL_USER_ID]: profile(LOCAL_USER_ID, "alice") },
+		});
+
+		// More stalled directory checks than there are hash slots (4). Distinct accounts and
+		// sources, so only the shared hash slots — not a per-source in-flight cap — are in play.
+		// Started in waves: attempts that *start* together legitimately contend for the slots
+		// while they hash; what matters is that a check parked on the network holds none.
+		const settle = (i: number) =>
+			loginUser(`stalled-${i}`, "wrong", `198.51.100.${i + 1}`).then(
+				() => "ok",
+				(error: { code?: string }) => error.code,
+			);
+		const waitForStalled = async (count: number) => {
+			const deadline = Date.now() + 2_000;
+			while (releases.length < count && Date.now() < deadline) await Bun.sleep(5);
+			expect(releases.length).toBe(count);
+		};
+		const stalled = [0, 1, 2, 3].map(settle);
+		await waitForStalled(4);
+		stalled.push(settle(4), settle(5));
+		await waitForStalled(6);
+
+		// The local password still answers instead of AUTH_BUSY.
+		expect((await login("alice", LOCAL_PASSWORD)).status).toBe(200);
+
+		for (const release of releases) release();
+		expect(await Promise.all(stalled)).toEqual(Array(6).fill("INVALID_CREDENTIALS"));
 	});
 });

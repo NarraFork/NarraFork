@@ -64,6 +64,8 @@ function mapAuthErrorCode(e: ApiError): string | null {
 		LDAP_ACCOUNT_REQUIRED: "ldapAccountRequired",
 		// An outage, not a wrong password.
 		LDAP_UNAVAILABLE: "ldapUnavailable",
+		// A same-named administrator is never bound to a directory entry implicitly.
+		LDAP_ADMIN_LINK_REFUSED: "ldapAdminLinkRefused",
 		REGISTRATION_CLOSED: "registrationClosedError",
 		REGISTRATION_THROTTLED: retryAfter ? "registrationThrottledRetry" : "registrationThrottled",
 		USERNAME_TAKEN: "usernameTaken",

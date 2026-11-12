@@ -9,7 +9,8 @@
  *
  * Account policy after the directory accepts the password (see `resolveLocalUser`):
  *  1. a bound identity (`user_identities.provider = "ldap:default"`) → sign in;
- *  2. no binding but a local account of the same name → bind it, and log the link;
+ *  2. no binding but a local non-admin account of exactly the same name → bind it, and
+ *     log the link (a same-named administrator is refused with `LDAP_ADMIN_LINK_REFUSED`);
  *  3. otherwise only `settings.auth.registrationOpen` decides: create an ordinary
  *     `user` account, or refuse with `LDAP_ACCOUNT_REQUIRED`.
  *
@@ -40,6 +41,18 @@ import { and, eq, sql } from "drizzle-orm";
 import { type ExternalLoginOutcome, ssoService } from "./sso-service";
 
 let clientFactory: LdapClientFactory = createLdapClient;
+
+/**
+ * Upper bound on directory checks in flight at once (login + step-up).
+ *
+ * Each check may wait on the network for several configured timeouts. Without a cap, a
+ * slow or unreachable directory would let a burst of wrong passwords pile up sockets and
+ * pending promises without limit; with it, the excess answers `unavailable` immediately.
+ * The login route counts that as a failed attempt, so saturating the cap buys an attacker
+ * nothing.
+ */
+export const LDAP_MAX_CONCURRENT_AUTHENTICATIONS = 8;
+let authenticationsInFlight = 0;
 
 /** Tests only: swap the directory client (pass undefined to restore the real one). */
 export function setLdapClientFactoryForTests(factory: LdapClientFactory | undefined): void {
@@ -82,6 +95,11 @@ export async function authenticate(
 	const username = normalizeLdapUsername(rawUsername);
 	if (!username || !password) return { kind: "invalid" };
 
+	if (authenticationsInFlight >= LDAP_MAX_CONCURRENT_AUTHENTICATIONS) {
+		return { kind: "unavailable", reason: "LDAP_BUSY" };
+	}
+	authenticationsInFlight += 1;
+
 	let client: LdapAuthClient | undefined;
 	try {
 		client = clientFactory(config);
@@ -89,6 +107,7 @@ export async function authenticate(
 	} catch (error) {
 		return { kind: "unavailable", reason: error instanceof Error ? error.message : String(error) };
 	} finally {
+		authenticationsInFlight -= 1;
 		try {
 			await client?.close();
 		} catch {
@@ -98,11 +117,13 @@ export async function authenticate(
 }
 
 /** Find a local account whose username matches a directory name, ignoring case. */
-async function findLocalUserByName(name: string): Promise<{ id: string } | undefined> {
+async function findLocalUserByName(
+	name: string,
+): Promise<{ id: string; role: string } | undefined> {
 	const lower = name.trim().toLowerCase();
 	if (!lower) return undefined;
 	const rows = await db
-		.select({ id: users.id })
+		.select({ id: users.id, role: users.role })
 		.from(users)
 		.where(sql`lower(${users.username}) = ${lower}`)
 		.limit(1);
@@ -127,13 +148,28 @@ export async function resolveLocalUser(
 		displayName: entry.displayName ?? null,
 		preferredUsername: derived,
 		chooseAccount: async () => {
-			// Nobody is bound to this directory subject yet. A local account carrying the
-			// same name IS this person's account, so bind it rather than creating a
-			// duplicate; the caller logs the link so the privilege that implies stays
-			// auditable.
-			for (const name of [...new Set([derived, entry.id])]) {
-				const matched = await findLocalUserByName(name);
-				if (matched) return matched.id;
+			// Nobody is bound to this directory subject yet. A local account carrying
+			// exactly the same name IS this person's account, so bind it rather than
+			// creating a duplicate; the caller logs the link so it stays auditable.
+			//
+			// Only the directory's own name is compared — never the sanitized `derived`
+			// form. Sanitizing drops characters (`a.dmin` → `admin`), so matching on it
+			// would hand a local account to a directory user whose name merely collapses
+			// onto it.
+			const matched = await findLocalUserByName(entry.id);
+			if (matched) {
+				// An administrator account is never bound implicitly: a same-named
+				// directory entry is not proof that it belongs to the same person, and the
+				// binding would grant full control of the instance. The administrator keeps
+				// signing in with the local password.
+				if (matched.role === "admin") {
+					throw new AppError(
+						"The directory accepted these credentials, but the local account with this name is an administrator and is not linked to the directory automatically. Sign in with the local password instead.",
+						403,
+						"LDAP_ADMIN_LINK_REFUSED",
+					);
+				}
+				return matched.id;
 			}
 			if (!settings.auth.registrationOpen) {
 				throw new AppError(
