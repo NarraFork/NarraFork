@@ -85,7 +85,7 @@ describe("data portability · Dynamic Spec 导入状态", () => {
 		expect(tables.map((t) => t.name)).not.toContain("outline_spec_imports");
 	});
 
-	test("覆盖会话：删掉它的状态行（task_backend 随会话行替换），缓存也不再报旧状态", async () => {
+	test("覆盖会话且 task_backend 变了：删掉它的状态行，缓存也不再报旧状态", async () => {
 		insertNarrator("n-over", "spec");
 		const zip = await exportZip();
 		// Locally the session was imported and later moved back.
@@ -99,6 +99,21 @@ describe("data portability · Dynamic Spec 导入状态", () => {
 		expect(await readSpecImportState("n-over")).toBeNull();
 		// The incoming row brought `spec`; the backend cache was dropped with it.
 		expect(await readTaskBackend("n-over")).toBe("spec");
+	});
+
+	test("覆盖会话但 task_backend 不变：管理员的退回决定保留（评审 NIT）", async () => {
+		insertNarrator("n-keep-revert", "spec");
+		const zip = await exportZip();
+		await writeSpecImportState("n-keep-revert", {
+			status: "reverted",
+			switchCount: 1,
+			revertCount: 1,
+		});
+		const preview = await previewImport(zip, "export.zip");
+		const result = await applyImport(preview.token, { conflictDefault: "overwrite" });
+		expect(result.sessionsOverwritten).toBe(1);
+		expect(stateRows()).toBe(1);
+		expect((await readSpecImportState("n-keep-revert"))?.status).toBe("reverted");
 	});
 
 	test("跳过会话：本地状态行保留", async () => {

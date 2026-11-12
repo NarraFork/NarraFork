@@ -278,6 +278,26 @@ describe("moving a session back", () => {
 		expect(await refusal(revertSpecImport(id, admin))).toBe("SPEC_IMPORT_NOT_REVERTIBLE");
 	});
 
+	test("a move back the process stopped in the middle of is offered again and completes (review NIT)", async () => {
+		const { id, admin } = await imported();
+		// `reverted` was recorded, the column not changed yet.
+		const { writeSpecImportState } = await import("../state");
+		await writeSpecImportState(id, { status: "reverted", revertCount: 1 });
+		resetSpecImportRecords();
+		expect(await backendOf(id)).toBe("outline");
+		const page = await specImportAdminPage({ state: "reverted", limit: 50 });
+		expect(page.items.find((item) => item.narratorId === id)).toMatchObject({
+			taskBackend: "outline",
+			canRevert: true,
+			canReimport: false,
+		});
+		const result = await revertSpecImport(id, admin);
+		expect(result.reverted).toBe(true);
+		expect(await backendOf(id)).toBe("spec");
+		expect(await readSpecImportState(id)).toMatchObject({ status: "reverted", revertCount: 1 });
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe(FENCE);
+	});
+
 	test("no automatic trigger and no owner's button imports it; across a restart too", async () => {
 		const { id, admin } = await imported();
 		await revertSpecImport(id, admin);

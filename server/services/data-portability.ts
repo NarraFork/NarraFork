@@ -17,7 +17,7 @@
  * - 新增 NOT NULL 且无默认值的列会让旧快照导入缺列（列交集只能拷贝双方都有的列），
  *   需要补默认值或拒绝旧版本；
  * - 新增需要「清空」的数据需在 `clearData` 对应分支处理；
- * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话时删掉它的行，清空会话时一起清；
+ * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话改了 task_backend 时删掉它的行，清空会话时一起清；
  * - 改完跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
  * 详见 docs/DATA_PORTABILITY.md。
  */
@@ -1156,11 +1156,21 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					}
 					// 覆盖只更新会话行本身：删掉本地 refs/tool_calls 会级联抹掉其它表对它们的引用，
 					// 也会丢掉导出之后本地新增的历史。合并语义不删除本地数据。
+					const backendBefore = (
+						sqlite.prepare(`SELECT task_backend FROM main.narrators WHERE id = ?`).get(id) as
+							| { task_backend: string | null }
+							| undefined
+					)?.task_backend;
 					sqlite.run(`UPDATE main.narrators SET ${columnAssignments} WHERE id = ?`, [id]);
 					// The Dynamic Spec import's state (outline P2 PR 12b2) is not exported: it relates
-					// this machine's spec rows to its outline content, and the incoming row may bring
-					// another task backend. Dropped, it is derived again by the next attempt.
-					sqlite.run(`DELETE FROM main.outline_spec_imports WHERE narrator_id = ?`, [id]);
+					// this machine's spec rows to its outline content. Kept while the incoming row keeps
+					// the session's task backend (an administrator's move back stays decided); dropped
+					// when it brings another one, derived again by the next attempt.
+					sqlite.run(
+						`DELETE FROM main.outline_spec_imports WHERE narrator_id = ?
+						AND (SELECT task_backend FROM main.narrators WHERE id = ?) IS NOT ?`,
+						[id, id, backendBefore ?? null],
+					);
 					// Workspaces are local UI state, not snapshot tables. Imported session titles
 					// still invalidate any candidate generated from their previous metadata.
 					sqlite.run(

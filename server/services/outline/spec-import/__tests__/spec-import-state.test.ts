@@ -185,6 +185,27 @@ describe("what an attempt leaves in the table", () => {
 	});
 });
 
+describe("the idle job (review NIT)", () => {
+	test("imports at most so many sessions a pass, sessions in use before archived ones", async () => {
+		const archived = await makeSession({ archived: true });
+		await writeTasks(archived.id, [{ text: "old" }]);
+		const live = await makeSession();
+		await writeTasks(live.id, [{ text: "now" }]);
+		// One import a pass: every session in use is met before any archived one.
+		let passes = 0;
+		while ((await backendOf(live.id)) !== "outline" && passes < 50) {
+			const pass = await runSpecImportPass({ pauseMs: 0, maxImports: 1 });
+			passes++;
+			expect(pass.imported + pass.givenUp + pass.left).toBeGreaterThan(0);
+			if ((await backendOf(live.id)) !== "outline") expect(pass.left).toBeGreaterThan(0);
+		}
+		expect(await backendOf(live.id)).toBe("outline");
+		expect(await backendOf(archived.id)).toBe("spec");
+		await runSpecImportPass({ pauseMs: 0 });
+		expect(await backendOf(archived.id)).toBe("outline");
+	}, 60_000);
+});
+
 describe("the store", () => {
 	test("bounds the stored detail, and serializes the writes of one session", async () => {
 		const { id } = await makeSession();

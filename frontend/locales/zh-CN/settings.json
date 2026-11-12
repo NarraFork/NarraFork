@@ -2923,6 +2923,7 @@
 	"specImportAdminTitle": "Dynamic Spec 导入",
 	"specImportAdminDescription": "还在用 Dynamic Spec 记任务的会话会导入大纲。这里可以看每个会话导入得怎样，重新导入，或者把被导入搬过去的会话退回 Dynamic Spec。两种操作都不删除任何内容。",
 	"specImportAdminOutlineOff": "大纲已关闭，不会导入。",
+	"specImportAdminKeptBlocksHelp": "退回后重新导入如果因为「保留了块」而需要处理，说明有人在大纲里改过之前导入的任务或页。打开会话的大纲空间，把要留下的内容移出那些块（或者删掉那些块），再重新导入；也可以让会话继续留在 Dynamic Spec。",
 	"specImportAdminMode": {
 		"auto": "自动导入：小会话在下一次开始运行前导入，其余在会话空闲时由后台导入。",
 		"manual": "只在有人点会话 Spec 面板上的「现在导入」，或在这里重新导入时导入。",
@@ -2951,7 +2952,8 @@
 	"specImportAdminReimported": "已开始导入。",
 	"specImportAdminRevert": "退回 Dynamic Spec",
 	"specImportAdminRevertTitle": "把这个会话退回 Dynamic Spec？",
-	"specImportAdminRevertConfirm": "会话重新用 Dynamic Spec 记任务，回到导入时的样子，旧的行为护栏也恢复。大纲和 Dynamic Spec 里都不删除任何内容：大纲保留现有内容，并在任务页和行为边界页顶上加一条说明。之后只有管理员能再导入。",
+	"specImportAdminRevertConfirm": "会话重新用 Dynamic Spec 记任务，从导入时的 tasks.json 接着做，旧的行为护栏也恢复。导入以后在大纲里做的事不会带回去：任务进度，以及行为边界页上规则和插件 SOP 的改动。大纲和 Dynamic Spec 里都不删除任何内容：大纲保留现有内容，在任务页和行为边界页顶上加一条说明，会话正在做的任务重新开放。之后只有管理员能再导入。",
 	"specImportAdminReverted": "会话已退回 Dynamic Spec。",
-	"specImportAdminRevertedUnmarked": "会话已退回 Dynamic Spec；没能在它的大纲页上加说明。"
+	"specImportAdminRevertedUnmarked": "会话已退回 Dynamic Spec；没能在它的大纲页上加说明。",
+	"specImportAdminFenceNotRestored": "会话已退回，但旧的行为护栏没能恢复：它现在没有之前的规则。请在它的 Spec 面板里检查护栏。"
 }

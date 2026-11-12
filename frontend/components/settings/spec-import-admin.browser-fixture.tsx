@@ -225,9 +225,12 @@ export async function mount(options: {
 	lang: "en" | "zh-CN";
 	scheme: "light" | "dark";
 	switched?: boolean;
+	/** What the move back answers about the old fence. */
+	fenceRestored?: boolean;
 }): Promise<void> {
 	root?.unmount();
 	seed();
+	revertFenceRestored = options.fenceRestored ?? true;
 	moved = options.switched ?? true;
 	const i18n = createInstance();
 	await i18n.init({

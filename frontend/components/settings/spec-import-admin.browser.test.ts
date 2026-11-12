@@ -129,7 +129,14 @@ test("the admin view: counts, a state's sessions a page at a time, move back and
 		[360, "light"],
 		[1280, "dark"],
 	] as const) {
-		const { page, errors } = await open(width, { view: "admin", lang: "en", scheme });
+		// At the desktop width the old fence could not be written back: the page warns.
+		const fenceRestored = width !== 1280;
+		const { page, errors } = await open(width, {
+			view: "admin",
+			lang: "en",
+			scheme,
+			fenceRestored,
+		});
 		await page.waitForSelector('[data-testid="spec-import-admin-row"]');
 		expect(await page.$eval('[data-testid="spec-import-admin-mode"]', (el) => el.textContent)).toBe(
 			en.specImportAdminMode.auto,
@@ -170,6 +177,8 @@ test("the admin view: counts, a state's sessions a page at a time, move back and
 		const dialog = await page.$eval('[role="dialog"]', (el) => el.textContent ?? "");
 		expect(dialog).toContain(en.specImportAdminRevertTitle);
 		expect(dialog).toContain("Nothing in the outline or in Dynamic Spec is deleted");
+		// What is not carried back is said before the move.
+		expect(dialog).toContain("is not carried back: task progress");
 		await noSidewaysScroll(page);
 		await shot(page, `admin-confirm-${width}-${scheme}`);
 		const buttons = await page.$$('[role="dialog"] button');
@@ -185,6 +194,10 @@ test("the admin view: counts, a state's sessions a page at a time, move back and
 		expect(await page.evaluate(() => (window as unknown as FixtureWindow).fixture.calls)).toEqual([
 			`revert:${first}`,
 		]);
+		const warning = en.specImportAdminFenceNotRestored;
+		if (!fenceRestored)
+			await page.waitForFunction((text) => document.body.textContent?.includes(text), {}, warning);
+		else expect(await page.evaluate(() => document.body.textContent)).not.toContain(warning);
 		await page.waitForFunction(
 			(label) =>
 				document.querySelector('[data-testid="spec-import-state-reverted"]')?.textContent === label,

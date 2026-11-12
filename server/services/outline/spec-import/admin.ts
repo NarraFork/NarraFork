@@ -99,11 +99,20 @@ function decodeCursor(cursor: string | null | undefined): SpecImportStateCursor 
 	return null;
 }
 
+/**
+ * Whether an administrator may move the session back: it is an outline session an import moved,
+ * or one a move back did not finish (`reverted` recorded, the process stopped before the column
+ * changed: the move back is offered again and completes it).
+ */
 function revertible(
 	state: Pick<SpecImportState, "status" | "switchCount">,
 	backend: string | null,
 ) {
-	return backend === "outline" && state.status === "imported" && state.switchCount > 0;
+	return (
+		backend === "outline" &&
+		state.switchCount > 0 &&
+		(state.status === "imported" || state.status === "reverted")
+	);
 }
 
 /**
@@ -240,7 +249,8 @@ async function revertHeld(
 	const now = new Date().toISOString();
 	await writeSpecImportState(narratorId, {
 		status: "reverted",
-		revertCount: before.revertCount + 1,
+		// An unfinished move back completed now counts once.
+		revertCount: before.status === "reverted" ? before.revertCount : before.revertCount + 1,
 		revertedAt: now,
 		revertedBy: adminUserId,
 		lastActor: adminUserId,

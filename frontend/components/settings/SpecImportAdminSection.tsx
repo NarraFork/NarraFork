@@ -72,6 +72,9 @@ export function SpecImportAdminSection() {
 				<Text size="sm" c="dimmed">
 					{t("specImportAdminDescription")}
 				</Text>
+				<Text size="sm" c="dimmed" data-testid="spec-import-admin-kept-help">
+					{t("specImportAdminKeptBlocksHelp")}
+				</Text>
 				{first && (
 					<Text size="sm" data-testid="spec-import-admin-mode">
 						{t(`specImportAdminMode.${first.mode}`)}
@@ -168,6 +171,14 @@ function SpecImportAdminRow({
 					? t("specImportAdminReverted")
 					: t("specImportAdminRevertedUnmarked"),
 			});
+			// The old fence could not be written back: the session runs without its old rules.
+			if (!result.fenceRestored)
+				notifications.show({
+					color: "yellow",
+					autoClose: false,
+					message: t("specImportAdminFenceNotRestored"),
+					"data-testid": "spec-import-admin-fence-warning",
+				} as Parameters<typeof notifications.show>[0]);
 			onChanged();
 		},
 		onError: failed,

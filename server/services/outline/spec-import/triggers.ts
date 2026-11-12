@@ -9,8 +9,9 @@
  *      and once per process: anything else is left to the idle job, and this run goes on as a
  *      Dynamic Spec run.
  *   2. THE IDLE JOB ({@link startSpecImportJob}): a while after the server started, and then at
- *      intervals, the spec namespaces are walked page by page on their primary key, one session
- *      at a time with a pause between them. A session is taken without interrupting it (the
+ *      intervals, the spec namespaces are walked page by page on their primary key, sessions in
+ *      use first and archived ones after them, one session at a time with a pause between them,
+ *      at most {@link SPEC_IMPORT_JOB.importsPerPass} imports a pass. A session is taken without interrupting it (the
  *      admission a file revert takes, which also covers its subagents): a busy one is skipped and
  *      met again on the next pass. The admission holds the session's messages, so an import holds
  *      it at most {@link SPEC_IMPORT_JOB.budgetMs} and gives way at once when a message for it
@@ -65,6 +66,11 @@ export const SPEC_IMPORT_JOB = {
 	firstPassMs: 60_000,
 	/** Between sessions of a pass. */
 	pauseMs: 200,
+	/**
+	 * Imports one pass tries at most (sessions in use before archived ones); past it the pass
+	 * ends and the next comes after `retryPassMs`.
+	 */
+	importsPerPass: 50,
 	/** After a pass that left sessions behind (busy, failed). */
 	retryPassMs: 10 * 60_000,
 	/** After a pass that left none: new spec sessions are rare (a plugin's recruits, forks). */
@@ -420,32 +426,43 @@ const job: {
  * session in hand.
  */
 export async function runSpecImportPass(
-	options: { stop?: () => boolean; pauseMs?: number } = {},
+	options: { stop?: () => boolean; pauseMs?: number; maxImports?: number } = {},
 ): Promise<SpecImportPass> {
 	const pass: SpecImportPass = { seen: 0, imported: 0, left: 0, givenUp: 0 };
-	let cursor: string | null = null;
-	for (;;) {
-		if (options.stop?.() || specImportMode() !== "auto") break;
-		const page = await readSpecNamespacePage(cursor);
-		for (const session of page.sessions) {
-			if (options.stop?.()) break;
-			if (specImportSkipReason(session) !== null) continue;
-			pass.seen++;
-			if (leftAlone(await readSpecImportState(session.narratorId))) {
-				pass.givenUp++;
-				continue;
+	const maxImports = options.maxImports ?? SPEC_IMPORT_JOB.importsPerPass;
+	let attempts = 0;
+	// Sessions in use first, archived ones after them (review NIT): two walks over the same pages.
+	for (const archived of [false, true]) {
+		let cursor: string | null = null;
+		for (;;) {
+			if (options.stop?.() || specImportMode() !== "auto") return pass;
+			const page = await readSpecNamespacePage(cursor);
+			for (const session of page.sessions) {
+				if (options.stop?.()) return pass;
+				if (session.archived !== archived || specImportSkipReason(session) !== null) continue;
+				pass.seen++;
+				if (leftAlone(await readSpecImportState(session.narratorId))) {
+					pass.givenUp++;
+					continue;
+				}
+				// At most so many imports a pass: the rest is met by the next one, sooner.
+				if (attempts >= maxImports) {
+					pass.left++;
+					return pass;
+				}
+				attempts++;
+				const outcome = await importSpecSessionIdle(session.narratorId, "sweep");
+				if (outcome.status === "imported") pass.imported++;
+				else if (outcome.status === "failed" && outcome.attention) pass.givenUp++;
+				else if (outcome.status !== "skipped") pass.left++;
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, options.pauseMs ?? SPEC_IMPORT_JOB.pauseMs);
+					timer.unref?.();
+				});
 			}
-			const outcome = await importSpecSessionIdle(session.narratorId, "sweep");
-			if (outcome.status === "imported") pass.imported++;
-			else if (outcome.status === "failed" && outcome.attention) pass.givenUp++;
-			else if (outcome.status !== "skipped") pass.left++;
-			await new Promise<void>((resolve) => {
-				const timer = setTimeout(resolve, options.pauseMs ?? SPEC_IMPORT_JOB.pauseMs);
-				timer.unref?.();
-			});
+			if (page.next === null) break;
+			cursor = page.next;
 		}
-		if (page.next === null) break;
-		cursor = page.next;
 	}
 	return pass;
 }
