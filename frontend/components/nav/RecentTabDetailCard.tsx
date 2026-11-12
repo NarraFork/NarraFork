@@ -3,9 +3,9 @@
  * live counts and who else is watching.
  *
  * Rows are one line (status bubble + title). The rest is here, in two places:
- *   - `RecentTabDetailCard`: a hover card next to the row, for mouse users;
- *   - `RecentTabDetails` at the top of the row menu, for touch users, who have no hover
- *     and reach the menu with a left swipe.
+ *   - `RecentTabDetailCard`: a hover card next to the row, for wide mouse viewports;
+ *   - `RecentTabDetails` at the top of the row menu, for narrow/touch viewports.
+ *     Touch users reach the menu with a left swipe.
  */
 
 import {
@@ -13,6 +13,7 @@ import {
 	type RecentTab,
 	type RecentTabViewer,
 } from "@frontend/hooks/recent-tabs-utils";
+import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { getEffectiveNarratorDisplay, statusRegistry } from "@frontend/lib/status-registry";
 import { Z } from "@frontend/lib/z-index";
 import { ActionIcon, Avatar, Box, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
@@ -173,6 +174,19 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 			)}
 		</Stack>
 	);
+}
+
+/** Enable row hover and its card together; compact/touch layouts use the explicit menu. */
+export function useRecentTabHoverEnabled(store: RecentTabHoverStore, isTouch: boolean): boolean {
+	const isMobile = useMobileViewport();
+	const enabled = !isTouch && !isMobile;
+	useLayoutEffect(() => {
+		// Cancel both visible cards and pending timers before paint. Returning to desktop
+		// must wait for a fresh pointer entry instead of reviving the old card.
+		if (!enabled) store.hide();
+		return () => store.hide();
+	}, [enabled, store]);
+	return enabled;
 }
 
 /**
