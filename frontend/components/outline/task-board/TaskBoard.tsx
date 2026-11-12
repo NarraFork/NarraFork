@@ -107,6 +107,7 @@ const HAND_OUT_REFUSALS = new Set([
 	"cannot_write_project",
 	"finished",
 	"planning",
+	"locked",
 	"held",
 	"changed",
 	"original_not_updated",

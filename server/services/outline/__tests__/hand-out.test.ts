@@ -39,7 +39,7 @@ import {
 	OutlineHandOutError,
 } from "../hand-out";
 import { OUTLINE_TASKS_PAGE_ALIAS } from "../model";
-import { changePersonTask } from "../person-tasks";
+import { addPersonTask, changePersonTask } from "../person-tasks";
 import { clearOutlineReads } from "../read-ledger";
 import { invalidateSessionReadScopes } from "../session-scope";
 import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
@@ -483,6 +483,27 @@ describe("handing a task out to the team", () => {
 			),
 		).toBe("planning");
 
+		// A goal its person locked: theirs to hand out, not the session's.
+		const goal = await addPersonTask({
+			narratorId: main,
+			userId: owner.id,
+			text: "Ship the release",
+			lock: true,
+		});
+		expect(
+			await refusal(() =>
+				handOutTask({
+					taskId: goal.blockId,
+					by: {
+						kind: "session",
+						narratorId: main,
+						principal: { userId: owner.id, isAdmin: false },
+					},
+					target: { kind: "team" },
+				}),
+			),
+		).toBe("locked");
+
 		// A person doing it.
 		const theirs = await writeOutline({
 			spaceId: sessionSpace.id,
@@ -758,7 +779,7 @@ describe("an agent's write", () => {
 			assignee: null,
 		});
 
-		const { main, sessionSpace } = await world();
+		const { main, other: other2, sessionSpace } = await world();
 		const owner2 = (await db.query.narrators.findFirst({ where: (n, { eq }) => eq(n.id, main) }))
 			?.ownerUserId as string;
 		const c2 = ctx(main, owner2);
@@ -774,6 +795,22 @@ describe("an agent's write", () => {
 		);
 		expect(cannot.isError).toBe(true);
 		expect(cannot.output).toContain(`No one named ${mate.username} can work on this task`);
+		// A goal its person locked: refused before anything is written, the person's to hand out.
+		const goal = await addPersonTask({
+			narratorId: main,
+			userId: owner2,
+			text: "Locked goal",
+			lock: true,
+		});
+		const goalSid = (await outlineStore.getBlock(goal.blockId))?.sid as string;
+		await outlineReadTool.execute({ address: goalSid, view: "all" }, c2);
+		const locked = await outlineEditTool.execute(
+			{ edits: [{ set: goalSid, assignee: `@agent:${other2}` }] },
+			c2,
+		);
+		expect(locked.isError).toBe(true);
+		expect(locked.output).toContain("a plan a person locked");
+		expect((await outlineStore.getBlock(goal.blockId))?.taskJson?.depends).toBeUndefined();
 		expect(
 			(await outlineStore.getBlockMetas(sessionSpace.id, { sids: [parser2] }))[0]?.taskJson
 				?.assignee,

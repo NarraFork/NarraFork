@@ -632,6 +632,7 @@
 				"cannot_write_project": "You cannot write the project's tasks, where the copy would go.",
 				"finished": "The task is finished already.",
 				"planning": "The task is part of a plan that is not approved yet.",
+				"locked": "The task is in a plan a person locked.",
 				"held": "Someone else is doing the task.",
 				"changed": "The task changed meanwhile; the board was reloaded.",
 				"original_not_updated": "The copy was made, but this task could not be set to wait for it. A note under the copy says so."

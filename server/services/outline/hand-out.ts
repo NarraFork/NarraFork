@@ -146,6 +146,7 @@ const REFUSAL_TEXT: Record<OutlineHandOutRefusal, string> = {
 	cannot_write_project: "You cannot write the project's space, where the copy would go",
 	finished: "The task is finished already",
 	planning: "The task is part of a plan that is not approved yet",
+	locked: "The task is in a plan a person locked; only a person hands it out",
 	held: "Someone other than the session is doing the task",
 	changed: "The task changed since it was read",
 	original_not_updated:
@@ -159,6 +160,7 @@ const REFUSAL_STATUS: Record<OutlineHandOutRefusal, number> = {
 	cannot_write_project: 403,
 	finished: 409,
 	planning: 409,
+	locked: 409,
 	held: 409,
 	changed: 409,
 	original_not_updated: 500,
@@ -537,6 +539,14 @@ async function handOutOne(args: Parameters<typeof handOutTask>[0]): Promise<Outl
 	if (args.baseVersionSeq !== undefined && args.baseVersionSeq !== original.versionSeq)
 		throw new OutlineHandOutError("changed");
 	if (isFinishedTask(task)) throw new OutlineHandOutError("finished");
+	const above = await readSubtree(original.id, { store });
+	if (!above) throw new OutlineHandOutError("changed");
+	const chain = [above.root, ...above.path];
+	if (chain.some((node) => isPlanningRoot(node.task))) throw new OutlineHandOutError("planning");
+	// A tree a person locked is theirs to give away: an agent's hand-out would change its plan
+	// (the prerequisite) without asking them.
+	if (args.by.kind === "session" && chain.some((node) => !!node.task?.lock))
+		throw new OutlineHandOutError("locked");
 	await checkHandOutTarget(args.target, place, { store });
 
 	// Already handed out and the copy still open: the copy is the answer.
@@ -575,10 +585,6 @@ async function handOutOne(args: Parameters<typeof handOutTask>[0]): Promise<Outl
 	let copy = await store.getBlock(copyId);
 	let omitted = 0;
 	if (!copy || copy.deleted) {
-		const subtree = await readSubtree(original.id, { store });
-		if (!subtree) throw new OutlineHandOutError("changed");
-		if ([subtree.root, ...subtree.path].some((node) => isPlanningRoot(node.task)))
-			throw new OutlineHandOutError("planning");
 		const projectSpace = place.projectSpace.id.startsWith("pending:")
 			? await store.ensureSpace({ kind: "project", projectId: place.projectId }, nowIso)
 			: place.projectSpace;
@@ -771,6 +777,18 @@ export async function planAgentHandOuts(args: {
 			target = await handOutPersonTarget(assignee.slice("human:".length));
 		}
 		if (!target) continue;
+		// An existing task in a plan being planned or a tree a person locked is not handed out
+		// by an agent: refused before anything is written.
+		if (op.op === "setTask" && "id" in op.block) {
+			const chain = await readSubtree(op.block.id, { store: args.store });
+			const nodes = chain ? [chain.root, ...chain.path] : [];
+			const refusal = nodes.some((node) => isPlanningRoot(node.task))
+				? "planning"
+				: nodes.some((node) => !!node.task?.lock)
+					? "locked"
+					: null;
+			if (refusal) return { refused: [handOutRefusalText(new OutlineHandOutError(refusal))] };
+		}
 		found.push({ opIndex, target });
 	}
 	if (found.length === 0) return { handOuts: [] };
