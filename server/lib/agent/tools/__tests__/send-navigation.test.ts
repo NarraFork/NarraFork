@@ -124,7 +124,12 @@ test("raw and Zod schemas agree on optional boolean display intent", () => {
 		);
 	const description = (raw?.properties as Record<string, { description: string }>).show_to_user
 		.description;
-	expect(description).toContain("default false");
+	// States WHEN to set it, in terms the sender can judge, and that it is display only.
+	expect(description).toContain("Set true when");
+	expect(description).toContain("a finding, a conclusion, a decision, a blocker");
 	expect(description).toContain("expandable");
-	expect(description).toContain("not a privacy or permission flag");
+	expect(description).toContain("delivery, permissions");
+	// The tool description itself names the flag, so it is seen without opening the schema.
+	expect(sendTool.description).toContain("show_to_user: true");
+	expect(sendTool.description).toContain("ContextAsk");
 });

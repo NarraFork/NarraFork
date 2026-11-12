@@ -418,6 +418,8 @@ export function report() {
 			return {
 				kind: item.spec.kind,
 				key: item.spec.key,
+				// The cross-level pairing identity the LOD morph resolves nodes by.
+				unitId: item.spec.unitId ?? null,
 				measured: item.measured.height,
 				painted: rect?.height ?? 0,
 				width: paper?.clientWidth ?? 0,
@@ -437,6 +439,8 @@ export function report() {
 						const box = node?.getBoundingClientRect();
 						return {
 							key: row.key,
+							// Read from the PAINTED attribute: that is what the morph queries.
+							unitId: node?.getAttribute("data-nf-unit") ?? null,
 							cardKind: row.cardKind,
 							expanded: row.expanded,
 							measured: row.blockHeight,
