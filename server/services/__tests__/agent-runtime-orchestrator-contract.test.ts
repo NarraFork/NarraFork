@@ -485,6 +485,67 @@ describe("outline task leases", () => {
 	});
 });
 
+describe("a session the Dynamic Spec import moved (outline P2 PR 12b2)", () => {
+	/** One run of the primary session; what its pass's config says about a spec:// call. */
+	async function onePass(moved: boolean) {
+		const { invalidateTaskBackend } = await import("../task-source/backend");
+		const { resetSpecImportStateCache, writeSpecImportState } = await import(
+			"../outline/spec-import/state"
+		);
+		const { getOutlineSpecRejection } = await import("../../lib/agent/tool-executor");
+		const enabled = settings.outline.enabled;
+		const mode = settings.outline.specImport;
+		settings.outline.enabled = true;
+		settings.outline.specImport = "manual";
+		db.update(narrators)
+			.set({ taskBackend: "outline" })
+			.where(eq(narrators.id, "contract-primary"))
+			.run();
+		invalidateTaskBackend();
+		resetSpecImportStateCache();
+		// Moved by the import (and told already).
+		if (moved)
+			await writeSpecImportState("contract-primary", {
+				status: "imported",
+				switchCount: 1,
+				noticeSwitch: 1,
+			});
+		const read = { toolUseId: "r1", name: "Read", input: { file_path: "spec://tasks.json" } };
+		const seen: Array<{ specImported?: boolean; output?: string }> = [];
+		try {
+			await fixture(profiles[0], [
+				async (options) => {
+					seen.push({
+						specImported: options.config.specImported,
+						output: getOutlineSpecRejection(read, options.config)?.output,
+					});
+					return { ...finished };
+				},
+			]).run();
+		} finally {
+			settings.outline.enabled = enabled;
+			settings.outline.specImport = mode;
+			invalidateTaskBackend();
+			resetSpecImportStateCache();
+		}
+		return seen;
+	}
+
+	test("the pass's config of a moved session carries it: a spec:// call is told where the files went", async () => {
+		const seen = await onePass(true);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.specImported).toBe(true);
+		expect(seen[0]?.output).toContain("was moved into the outline");
+	});
+
+	test("a session created in the outline keeps the general hint", async () => {
+		const seen = await onePass(false);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.specImported).toBe(false);
+		expect(seen[0]?.output).toContain("spec:// is not available in this session");
+	});
+});
+
 describe("subagent signed source projection", () => {
 	function seed() {
 		// cleanDb deletes fixture data, including the installation marker, but not shipped triggers.
