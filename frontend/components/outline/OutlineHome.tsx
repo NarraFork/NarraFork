@@ -1,97 +1,28 @@
 /**
- * Outline home: search across every readable space, the pages visited recently in this
- * browser, and the spaces the reader can open. The reader's personal space is created on the
- * first visit. Router-free: links go through the host's renderer (`outline-nav.tsx`), so the
+ * Outline home: search across every readable space, then the whole outline as one connected tree
+ * (`tree/OutlineTree.tsx`): the pages visited recently in this browser, my space, the projects
+ * and their sessions, each opened in place. The reader's personal space is created on the first
+ * visit. Router-free: links go through the host's renderer (`outline-nav.tsx`), so the
  * outline route and a dock panel show the same home.
  */
-import {
-	Alert,
-	Badge,
-	Box,
-	Button,
-	Group,
-	Loader,
-	SimpleGrid,
-	Stack,
-	Text,
-	TextInput,
-	Title,
-} from "@mantine/core";
+import { Alert, Badge, Box, Group, Loader, Stack, Text, TextInput, Title } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
-import type { OutlineSpaceKind, OutlineSpaceSummary } from "@shared/outline-api";
-import { IconFolder, IconMessages, IconSearch, IconUser } from "@tabler/icons-react";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { IconSearch } from "@tabler/icons-react";
+import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	useEnsurePersonalOutlineSpace,
-	useOutlineSearch,
-	useOutlineSpaces,
-} from "../../hooks/useOutline";
-import { formatSmartTime } from "../../lib/format";
-import { readOutlineRecents } from "../../lib/outline-recents";
-import { reportLineDisplay } from "../../lib/outline-report-line";
+import { useOutlineSearch } from "../../hooks/useOutline";
 import classes from "./Outline.module.css";
-import { useOutlineSpaceName } from "./OutlineSpaceName";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
+import { OutlineTree } from "./tree/OutlineTree";
 
-const KIND_ORDER: Record<OutlineSpaceKind, number> = { personal: 0, project: 1, session: 2 };
-const KIND_ICON = { personal: IconUser, project: IconFolder, session: IconMessages } as const;
-
-function SpaceCard({ space }: { space: OutlineSpaceSummary }) {
-	const { t } = useTranslation("outline");
-	const spaceName = useOutlineSpaceName();
-	const Icon = KIND_ICON[space.kind];
-	return (
-		<OutlineLink
-			to={{ kind: "space", spaceId: space.id }}
-			className={classes.listItem}
-			style={{ border: "1px solid var(--mantine-color-default-border)" }}
-		>
-			<Group gap="xs" wrap="nowrap">
-				<Icon size={16} style={{ flexShrink: 0 }} />
-				<Text size="sm" fw={500} className={classes.ellipsis}>
-					{spaceName(space)}
-				</Text>
-			</Group>
-			<Group gap={6} mt={4}>
-				<Badge size="xs" variant="light" color="gray" tt="none">
-					{t(`space.kind.${space.kind}`)}
-				</Badge>
-				{space.orphaned && (
-					<Badge size="xs" variant="light" color="orange" tt="none">
-						{t("space.orphaned")}
-					</Badge>
-				)}
-				<Text size="xs" c="dimmed">
-					{t("space.commits", { count: space.lastSeq })}
-				</Text>
-			</Group>
-		</OutlineLink>
-	);
-}
+const TREE_ROOT = { kind: "all" } as const;
 
 /** `header`: the host's entry above the title (the outline route's reports entry). */
 export function OutlineHome({ header }: { header?: ReactNode } = {}) {
-	const { t, i18n } = useTranslation("outline");
-	const { mutate: ensurePersonal } = useEnsurePersonalOutlineSpace();
-	const ensured = useRef(false);
-	useEffect(() => {
-		if (ensured.current) return;
-		ensured.current = true;
-		ensurePersonal();
-	}, [ensurePersonal]);
-	const spaces = useOutlineSpaces(true);
+	const { t } = useTranslation("outline");
 	const [query, setQuery] = useState("");
 	const [debounced] = useDebouncedValue(query, 250);
 	const search = useOutlineSearch(debounced, null, true);
-	const recents = useMemo(() => readOutlineRecents(), []);
-	const sorted = useMemo(
-		() =>
-			(spaces.data?.pages.flatMap((page) => page.spaces) ?? []).sort(
-				(a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind],
-			),
-		[spaces.data],
-	);
 
 	return (
 		<Stack gap="lg">
@@ -156,63 +87,8 @@ export function OutlineHome({ header }: { header?: ReactNode } = {}) {
 				)}
 			</Box>
 
-			<Stack gap="xs">
-				<Title order={4}>{t("home.recent")}</Title>
-				{recents.length === 0 ? (
-					<Text size="sm" c="dimmed">
-						{t("home.noRecent")}
-					</Text>
-				) : (
-					<Stack gap={2}>
-						{recents.map((recent) => (
-							<OutlineLink
-								key={recent.blockId}
-								to={outlineBlockTarget(recent.spaceId, recent.blockId)}
-								className={classes.listItem}
-							>
-								<Group justify="space-between" wrap="nowrap" gap="xs">
-									<Text size="sm" className={classes.ellipsis}>
-										{/* Stored as written; a report container's line is decoded when shown. */}
-										{reportLineDisplay(recent.title, { t, locale: i18n?.language }) ?? recent.title}
-									</Text>
-									<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-										{formatSmartTime(new Date(recent.visitedAt).toISOString())}
-									</Text>
-								</Group>
-							</OutlineLink>
-						))}
-					</Stack>
-				)}
-			</Stack>
-
-			<Stack gap="xs">
-				<Title order={4}>{t("home.spaces")}</Title>
-				{spaces.isLoading && <Loader size="sm" />}
-				{spaces.isError && (
-					<Alert color="red" variant="light">
-						{t("loadFailed")}
-					</Alert>
-				)}
-				{spaces.isSuccess && sorted.length === 0 && (
-					<Text size="sm" c="dimmed">
-						{t("home.noSpaces")}
-					</Text>
-				)}
-				<SimpleGrid cols={{ base: 1, sm: 2, md: 3 }} spacing="xs">
-					{sorted.map((space) => (
-						<SpaceCard key={space.id} space={space} />
-					))}
-				</SimpleGrid>
-				{spaces.hasNextPage && (
-					<Button
-						variant="light"
-						loading={spaces.isFetchingNextPage}
-						onClick={() => void spaces.fetchNextPage()}
-					>
-						{t("loadMore")}
-					</Button>
-				)}
-			</Stack>
+			{/* The whole outline as one tree (readability E): my space, projects, their sessions. */}
+			<OutlineTree root={TREE_ROOT} />
 		</Stack>
 	);
 }

@@ -132,6 +132,9 @@ export function foldPreviewLabel(
 interface RowProps {
 	block: OutlineViewBlock;
 	depth: number;
+	/** Pixels per level, and the depth past which indentation stops growing. */
+	indentStep: number;
+	indentMax: number;
 	hasChildren: boolean;
 	open: boolean;
 	/** The row's preview line, flattened so an unchanged row is not rendered again. */
@@ -154,6 +157,8 @@ interface RowProps {
 const OutlineRow = memo(function OutlineRow({
 	block,
 	depth,
+	indentStep,
+	indentMax,
 	hasChildren,
 	open,
 	previewKind,
@@ -219,7 +224,7 @@ const OutlineRow = memo(function OutlineRow({
 				more: previewMore,
 			})
 		: null;
-	const indent = Math.min(depth, MAX_INDENT_DEPTH) * INDENT_PX;
+	const indent = Math.min(depth, indentMax) * indentStep;
 	return (
 		<>
 			<div
@@ -547,6 +552,11 @@ export interface OutlineBlockTreeProps {
 	 * under, whose page holds its answer form).
 	 */
 	onOpenQuestions?: (ids: string[], under: string | null) => void;
+	/**
+	 * Indentation: pixels per level and the depth past which it stops growing. A page opened
+	 * inside the connected outline (`tree/OutlineTree.tsx`) is already indented by the tree.
+	 */
+	indent?: { step: number; max: number };
 }
 
 /**
@@ -559,7 +569,10 @@ export function OutlineBlockTree({
 	search,
 	onFold,
 	onOpenQuestions,
+	indent,
 }: OutlineBlockTreeProps) {
+	const indentStep = indent?.step ?? INDENT_PX;
+	const indentMax = indent?.max ?? MAX_INDENT_DEPTH;
 	const { t } = useTranslation("outline");
 	const byId = useMemo(() => new Map(view.blocks.map((b) => [b.id, b])), [view]);
 	const source = useMemo(() => viewFoldSource(view), [view]);
@@ -617,6 +630,8 @@ export function OutlineBlockTree({
 						key={block.id}
 						block={block}
 						depth={row.depth}
+						indentStep={indentStep}
+						indentMax={indentMax}
 						hasChildren={row.node.kids.length > 0}
 						open={row.node.open}
 						previewKind={preview?.kind ?? null}

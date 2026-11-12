@@ -51,6 +51,8 @@ export const outlineKeys = {
 	pending: (pendingId: string) => ["outline", "pending-detail", pendingId] as const,
 	questions: (blockId: string) => ["outline", "questions", blockId] as const,
 	digest: () => ["outline", "digest"] as const,
+	tree: () => ["outline", "tree"] as const,
+	treeSpaces: (group: string) => ["outline", "tree", group] as const,
 };
 
 export function useOutlineSpaces(enabled: boolean) {
@@ -64,13 +66,48 @@ export function useOutlineSpaces(enabled: boolean) {
 	});
 }
 
+/**
+ * The connected outline's root (`/outline/tree`): my space and the project spaces, a page at a
+ * time. Not refreshed by commits: the tree does not reorder while it is read (design §4.2).
+ */
+export function useOutlineTree(enabled = true) {
+	return useInfiniteQuery({
+		queryKey: outlineKeys.tree(),
+		queryFn: ({ pageParam }) => api.getOutlineTree({ cursor: pageParam }),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor,
+		enabled,
+		retry: false,
+	});
+}
+
+/** A group of the connected outline (a project's sessions, the loose ones, the orphaned). */
+export function useOutlineTreeSpaces(
+	group: { kind: "project"; projectId: string } | { kind: "loose" | "orphaned" },
+	enabled: boolean,
+) {
+	return useInfiniteQuery({
+		queryKey: outlineKeys.treeSpaces(
+			group.kind === "project" ? `project:${group.projectId}` : group.kind,
+		),
+		queryFn: ({ pageParam }) => api.listOutlineTreeSpaces(group, { cursor: pageParam }),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor,
+		enabled,
+		retry: false,
+	});
+}
+
 /** Creates the caller's personal space on first use; idempotent. */
 export function useEnsurePersonalOutlineSpace() {
 	const queryClient = useQueryClient();
 	return useMutation({
 		mutationFn: () => api.ensurePersonalOutlineSpace(),
 		onSuccess: (result) => {
-			if (result.created) void queryClient.invalidateQueries({ queryKey: outlineKeys.spaces() });
+			if (result.created) {
+				void queryClient.invalidateQueries({ queryKey: outlineKeys.spaces() });
+				void queryClient.invalidateQueries({ queryKey: outlineKeys.tree() });
+			}
 		},
 	});
 }
@@ -107,6 +144,8 @@ export function useOutlineBlock(
 		view: OutlineViewMode;
 		/** Block budget: the live editor shows the blocks itself and reads only the root. */
 		blocks?: number;
+		/** Byte budget (the server's default when absent). */
+		bytes?: number;
 		enabled?: boolean;
 		/**
 		 * Keep showing the previous read of the same space while another block loads: the live
@@ -115,10 +154,14 @@ export function useOutlineBlock(
 		keepSpace?: boolean;
 	},
 ) {
-	const { asOf, view, blocks, keepSpace } = options;
+	const { asOf, view, blocks, bytes, keepSpace } = options;
 	return useQuery({
-		queryKey: [...outlineKeys.block(spaceId, blockId, asOf ?? null, view), blocks ?? null],
-		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks }),
+		queryKey: [
+			...outlineKeys.block(spaceId, blockId, asOf ?? null, view),
+			blocks ?? null,
+			...(bytes !== undefined ? [bytes] : []),
+		],
+		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks, bytes }),
 		enabled: options.enabled ?? true,
 		retry: false,
 		// A view as of a commit never changes; the current one is refreshed by the subscription.

@@ -688,5 +688,23 @@
 				"unreadable": "The new session could not read this project's outline, so it was not given the task. Check the project's and the sessions' visibility settings."
 			}
 		}
+	},
+	"tree": {
+		"hint": "Open anything in place to read it; open a page's title to edit it.",
+		"collapseAll": "Collapse all",
+		"recent": "Recently visited ({{count}})",
+		"sessions": "Sessions ({{count}})",
+		"sessionsUncounted": "Sessions",
+		"loose": "Sessions outside projects ({{count}})",
+		"orphaned": "Spaces without an owner ({{count}})",
+		"noSessions": "No sessions you can read.",
+		"noPages": "No pages yet.",
+		"moreSpaces_one": "{{count}} more ▸",
+		"moreSpaces_other": "{{count}} more ▸",
+		"moreProjects": "More projects ▸",
+		"gone": "No longer available.",
+		"partial_one": "Showing the first {{count}} block of this page here.",
+		"partial_other": "Showing the first {{count}} blocks of this page here.",
+		"openPage": "Open the page"
 	}
 }
