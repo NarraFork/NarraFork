@@ -21,13 +21,16 @@ import { db } from "../../../../db";
 import { outlineSpecImports, specFileRevisions, specNamespaces } from "../../../../db/schema";
 import { AppError } from "../../../../lib/errors";
 import { settings } from "../../../../lib/settings";
-import { TEAM_SOP_CLOSE, TEAM_SOP_OPEN } from "../../../behavior-fence-sop";
+import { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, TEAM_SOP_PLUGIN_ID } from "../../../behavior-fence-sop";
 import { acquireNarratorRevertAdmission, readSpecTasksForPlugin } from "../../../narrator-session";
 import { readSpecFile, writeSpecFile } from "../../../spec-vfs-service";
 import { invalidateTaskBackend } from "../../../task-source";
 import { beginSpecImport } from "../../../task-source/backend";
 import { resetOutlineBehaviorImport } from "../../../task-source/outline-behavior";
-import { resetOutlineFenceSopMove } from "../../../task-source/outline-plugin-rules";
+import {
+	pluginRulesSid,
+	resetOutlineFenceSopMove,
+} from "../../../task-source/outline-plugin-rules";
 import { stopEditTextWorker } from "../../edit-text-runner";
 import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_TASKS_PAGE_ALIAS } from "../../model";
 import { outlineStore } from "../../store";
@@ -386,6 +389,57 @@ describe("an administrator's re-import", () => {
 		expect(state?.reason?.code).toBe("kept_blocks");
 		// Its finished task is still there.
 		expect((await taskPage(other.id)).map((task) => task.status)).toContain("done");
+	});
+
+	test("a plugin SOP changed while it was moved back replaces the plugin's block (S3)", async () => {
+		const { id, admin } = await imported();
+		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
+		const rulesText = async () => {
+			const [rules] = await outlineStore.getBlockMetas(space?.id as string, {
+				sids: [pluginRulesSid(TEAM_SOP_PLUGIN_ID)],
+			});
+			const blocks = rules
+				? await outlineStore.listChildren(space?.id as string, rules.id, 500)
+				: [];
+			return blocks.map((block) => block.content).join("\n");
+		};
+		expect(await rulesText()).toContain("Team SOP: report daily.");
+		await revertSpecImport(id, admin);
+		// The plugin updates its SOP in the old fence while the session is in Dynamic Spec.
+		const updated = `Always run the tests.\n\n${TEAM_SOP_OPEN}\nTeam SOP: report every hour.\n${TEAM_SOP_CLOSE}\n`;
+		await writeSpecFile(id, "spec://behavior_fence", updated, {
+			actor: "system",
+			createdBy: "system",
+			pluginSop: true,
+		});
+		await reimportSpecSession(id, admin);
+		await settleSpecImportRequests();
+		expect(await backendOf(id)).toBe("outline");
+		const text = await rulesText();
+		expect(text).toContain("Team SOP: report every hour.");
+		expect(text).not.toContain("report daily");
+		// The fence gave up its SOP only because the block holds the new one.
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).not.toContain("every hour");
+	});
+
+	test("a changed SOP too large for the block whole needs attention; the fence keeps it (S3)", async () => {
+		const { id, admin } = await imported();
+		await revertSpecImport(id, admin);
+		// More paragraphs than one rules block holds (12b's case).
+		const huge = Array.from({ length: 260 }, (_, i) => `Paragraph ${i}.`).join("\n\n");
+		const fence = `Always run the tests.\n\n${TEAM_SOP_OPEN}\n${huge}\n${TEAM_SOP_CLOSE}\n`;
+		await writeSpecFile(id, "spec://behavior_fence", fence, {
+			actor: "system",
+			createdBy: "system",
+			pluginSop: true,
+		});
+		await reimportSpecSession(id, admin);
+		await settleSpecImportRequests();
+		expect(await backendOf(id)).toBe("spec");
+		const state = await readSpecImportState(id);
+		expect(state?.status).toBe("attention");
+		expect(state?.reason?.code).toBe("sop_too_large");
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe(fence);
 	});
 
 	test("clears attention and the failed attempts first; refused with imports off or for an outline session", async () => {

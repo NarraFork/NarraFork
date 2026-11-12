@@ -511,6 +511,11 @@ interface Context {
 	signal: AbortSignal | undefined;
 	pause: AbortSignal | undefined;
 	commits: number;
+	/**
+	 * The session was moved back to Dynamic Spec since its last switch (12b2 review S3): its
+	 * fence's plugin SOP may have changed there, so it replaces the plugin's block on the page.
+	 */
+	afterRevert: boolean;
 }
 
 /** What the steps before the move leave for it. */
@@ -578,7 +583,16 @@ async function run(
 				{ kind: "session", narratorId },
 				new Date().toISOString(),
 			);
-			ctx = { session, space, locale, signal: options.signal, pause: options.pause, commits: 0 };
+			ctx = {
+				session,
+				space,
+				locale,
+				signal: options.signal,
+				pause: options.pause,
+				commits: 0,
+				afterRevert:
+					previous?.status === "reverted" || (previous?.revertSourceKey ?? null) !== null,
+			};
 			written = await writeEverything(ctx, files);
 		}
 	}
@@ -985,6 +999,9 @@ async function writeEverything(
 			await writeImportedFenceSop(
 				{ narratorId, ownerUserId: session.ownerUserId, locale },
 				fence.sop,
+				// After a move back the fence's SOP is the current one (a plugin wrote it there
+				// meanwhile): it replaces the block, whole, or the import needs attention.
+				{ replace: ctx.afterRevert },
 			);
 		} catch (error) {
 			if (error instanceof PluginTaskError && error.publicCode === "PAYLOAD_TOO_LARGE")
