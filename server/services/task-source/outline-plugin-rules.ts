@@ -22,7 +22,9 @@
  * plugin's markers (`behavior-fence-sop.ts`), and PR 4's import left it there. Any rules write
  * takes it out of the fence afterwards (the fence keeps the rest, which PR 4's import moves). When
  * the plugin writing is not the one the markers name, the SOP is first moved into that plugin's
- * block (unless it has one already): nothing written by another plugin is lost. The old command
+ * block (unless it has one already), whole: when that block cannot hold it all, the fence keeps
+ * it untouched and only the writing plugin's block is written; nothing written by another plugin
+ * is lost or cut. The old command
  * replaces the SOP section whoever calls it, so its conversion supersedes the SOP. A session
  * that starts a run moves an SOP still in its fence into the marked plugin's block
  * ({@link moveOutlineFenceSop}), once per process.
@@ -96,12 +98,19 @@ export interface OutlinePluginRulesWritten {
 }
 
 /** The rules as blocks: notes only, within one commit (see the module header). */
-async function rulesBlocks(text: string, locale: Locale): Promise<ReportBlock[]> {
+async function rulesBlocks(text: string, locale: Locale, whole: boolean): Promise<ReportBlock[]> {
 	const converted = await processEditText({
 		kind: "report",
 		text,
 		continued: DELEGATION_BLOCK_TEXT[locale].continued,
 	});
+	// An SOP moved out of the old fence is dropped from there once the block holds it: it is
+	// written whole or not at all (a block holds what one commit may carry).
+	if (whole && converted.omittedBytes > 0)
+		throw new PluginTaskError(
+			"PAYLOAD_TOO_LARGE",
+			"The plugin's SOP in the old fence is larger than its block on the behavior page holds",
+		);
 	return converted.blocks;
 }
 
@@ -113,7 +122,7 @@ async function writeRulesBlock(
 	session: PluginTaskSession,
 	pluginId: string,
 	text: string | null,
-	options: { store: OutlineStore; summary?: string },
+	options: { store: OutlineStore; summary?: string; whole?: boolean },
 ): Promise<OutlinePluginRulesWritten> {
 	const { store } = options;
 	const sid = pluginRulesSid(pluginId);
@@ -139,7 +148,7 @@ async function writeRulesBlock(
 			return { blockId: null, changed: false, space, seq: latestSeq(space) };
 		push({ op: "delete", block: { id: block.id } });
 	} else {
-		const blocks = await rulesBlocks(text, session.locale);
+		const blocks = await rulesBlocks(text, session.locale, options.whole === true);
 		// The same rules where they belong: nothing to write (a plugin may send them on every
 		// dispatch; each would otherwise be a commit on the session's timeline).
 		if (
@@ -308,16 +317,29 @@ export async function setOutlinePluginRules(args: {
 	const session = await resolvePluginTaskSession(args.narratorId);
 	return await oneAtATime(`rules:${session.narratorId}`, async () => {
 		const fence = await oldFenceOrNull(session.narratorId);
-		// An SOP another plugin left in the fence is kept, in that plugin's block.
+		// An SOP another plugin left in the fence is kept, in that plugin's block: whole, as
+		// `moveOutlineFenceSop` writes it. When the block cannot hold it all (or the write fails),
+		// the fence keeps it untouched and only the calling plugin's own block is written.
+		let keepFence = false;
 		if (fence?.sop && !args.compat && args.pluginId !== TEAM_SOP_PLUGIN_ID) {
 			const space = await store.findSpace({ kind: "session", narratorId: session.narratorId });
 			const sid = pluginRulesSid(TEAM_SOP_PLUGIN_ID);
 			const [held] = space ? await store.getBlockMetas(space.id, { sids: [sid] }) : [];
-			if (!held)
-				await writeRulesBlock(session, TEAM_SOP_PLUGIN_ID, fence.sop, {
-					store,
-					summary: OUTLINE_TEXT.pluginSopMoved(TEAM_SOP_PLUGIN_ID),
-				});
+			if (!held) {
+				try {
+					await writeRulesBlock(session, TEAM_SOP_PLUGIN_ID, fence.sop, {
+						store,
+						summary: OUTLINE_TEXT.pluginSopMoved(TEAM_SOP_PLUGIN_ID),
+						whole: true,
+					});
+				} catch (error) {
+					keepFence = true;
+					logger.warn("Kept a plugin's SOP in the old fence: its block could not take it whole", {
+						narratorId: session.narratorId,
+						error: String(error),
+					});
+				}
+			}
 		}
 		const written = await writeRulesBlock(
 			session,
@@ -325,8 +347,39 @@ export async function setOutlinePluginRules(args: {
 			args.mode === "clear" || !text ? null : text,
 			{ store },
 		);
-		if (fence?.sopSections) await dropFenceSop(session.narratorId);
+		if (fence?.sopSections && !keepFence) await dropFenceSop(session.narratorId);
 		return written;
+	});
+}
+
+/**
+ * Write the SOP `sop` of a session's old fence as the marked plugin's block on its behavior page,
+ * unless that plugin has a block there already (then the fence's copy is stale). For the import of
+ * a whole Dynamic Spec session (outline P2 PR 12b), which calls it before the session is an
+ * outline one and reads the fence through its own port; the fence is not touched. Written whole,
+ * never cut (rejects when the block cannot hold it all). Returns whether a block was written.
+ */
+export async function writeImportedFenceSop(
+	session: PluginTaskSession,
+	sop: string,
+	options: { store?: OutlineStore } = {},
+): Promise<boolean> {
+	const store = options.store ?? outlineStore;
+	if (!sop.trim()) return false;
+	return await oneAtATime(`rules:${session.narratorId}`, async () => {
+		const space = await store.findSpace({ kind: "session", narratorId: session.narratorId });
+		const sid = pluginRulesSid(TEAM_SOP_PLUGIN_ID);
+		const [held] = space ? await store.getBlockMetas(space.id, { sids: [sid] }) : [];
+		if (held) return false;
+		// Whole, as `moveOutlineFenceSop` writes it: the session's first run as an outline session
+		// drops the SOP from the fence once this block holds it, so nothing may be cut here (the
+		// old command's limit is for what a plugin writes from now on).
+		await writeRulesBlock(session, TEAM_SOP_PLUGIN_ID, sop, {
+			store,
+			summary: OUTLINE_TEXT.pluginSopMoved(TEAM_SOP_PLUGIN_ID),
+			whole: true,
+		});
+		return true;
 	});
 }
 
@@ -364,9 +417,11 @@ export async function moveOutlineFenceSop(
 			const [held] = space ? await store.getBlockMetas(space.id, { sids: [sid] }) : [];
 			let outcome: "moved" | "dropped" = "dropped";
 			if (!held && current.sop) {
+				// Whole or not at all: the fence keeps an SOP its block could not hold.
 				await writeRulesBlock(session, TEAM_SOP_PLUGIN_ID, current.sop, {
 					store,
 					summary: OUTLINE_TEXT.pluginSopMoved(TEAM_SOP_PLUGIN_ID),
+					whole: true,
 				});
 				outcome = "moved";
 			}
