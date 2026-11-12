@@ -663,4 +663,87 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			expect(await drainPendingInjections(PARENT)).toEqual([]);
 		});
 	});
+
+	describe.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
+		"durable service restart recovery",
+		() => {
+			async function createService(id: string) {
+				await backgroundTaskService.createBashTask({
+					id,
+					parentNarratorId: PARENT,
+					command: "fixture-service",
+					backgroundKind: "service",
+				});
+			}
+			async function spawnRealService(id: string, command: string) {
+				const durable = await import("../../lib/agent/execution/durable-service");
+				const handle = await durable.spawnDurableService({
+					taskId: id,
+					command,
+					cwd: testEnvironment.isolatedHome,
+					env: { PATH: process.env.PATH, HOME: testEnvironment.isolatedHome },
+					shellPath: "/bin/sh",
+					login: false,
+				});
+				// The previous server process stops watching without touching the service.
+				(handle as InstanceType<typeof durable.DurableServiceHandle>).detach();
+				return { durable, handle };
+			}
+			async function waitFor(check: () => boolean, ms = 5_000) {
+				const deadline = Date.now() + ms;
+				while (!check() && Date.now() < deadline) await Bun.sleep(50);
+			}
+
+			test("a still-running service is re-attached and keeps running", async () => {
+				await createService("svc-live");
+				const { durable, handle } = await spawnRealService("svc-live", "echo started; sleep 30");
+				try {
+					expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
+					expect(taskRow()).toMatchObject({ status: "running", backgroundKind: "service" });
+					await waitFor(() =>
+						(backgroundTaskService.getOutputBuffer("svc-live") ?? "").includes("started"),
+					);
+					expect(backgroundTaskService.getOutputBuffer("svc-live")).toContain("re-attached");
+					// Stop goes through the adopted handle and ends the real process group.
+					expect(await backgroundTaskService.cancel("svc-live")).toBe(true);
+					expect(taskRow().status).toBe("cancelled");
+					await waitFor(() => {
+						try {
+							process.kill(handle.pid as number, 0);
+							return false;
+						} catch {
+							return true;
+						}
+					});
+					expect(() => process.kill(handle.pid as number, 0)).toThrow();
+				} finally {
+					await handle.kill();
+					await durable.removeServiceArtifacts("svc-live");
+				}
+			});
+
+			test("a service that exited during the restart is settled with its real exit code", async () => {
+				await createService("svc-dead");
+				const { durable } = await spawnRealService("svc-dead", "echo last-words; exit 4");
+				await waitFor(() => false, 300);
+				expect((await durable.readOrphanedServiceOutcome("svc-dead")).exitCode).toBe(4);
+				expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
+				const row = taskRow();
+				expect(row.status).toBe("failed");
+				expect(row.exitCode).toBe(4);
+				expect(row.output).toContain("last-words");
+				expect(row.output).toContain("exited while NarraFork was restarting");
+				expect((await durable.readOrphanedServiceOutcome("svc-dead")).hasManifest).toBe(false);
+			});
+
+			test("a service without a manifest still reports an unknown outcome", async () => {
+				await createService("svc-legacy");
+				expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
+				expect(taskRow()).toMatchObject({
+					status: "failed",
+					output: "Execution outcome unknown after restart; the command was not rerun.",
+				});
+			});
+		},
+	);
 }

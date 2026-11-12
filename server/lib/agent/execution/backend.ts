@@ -259,6 +259,12 @@ export interface ExecParams {
 	/** Environment overrides merged over the backend's base env. */
 	env?: Record<string, string | undefined>;
 	signal?: AbortSignal;
+	/**
+	 * Run as a durable background service that may outlive this server process: output goes
+	 * to a log file instead of pipes and a manifest allows a restarted server to re-attach.
+	 * Only the local Unix backend honours it; other backends ignore it and run normally.
+	 */
+	durableService?: { taskId: string; timeoutMs?: number };
 }
 
 /**
