@@ -11,7 +11,9 @@
  *   2. THE IDLE JOB ({@link startSpecImportJob}): a while after the server started, and then at
  *      intervals, the spec namespaces are walked page by page on their primary key, sessions in
  *      use first and archived ones after them, one session at a time with a pause between them,
- *      at most {@link SPEC_IMPORT_JOB.importsPerPass} imports a pass. A session is taken without interrupting it (the
+ *      at most {@link SPEC_IMPORT_JOB.importsPerPass} imports a pass; a pass cut short by that
+ *      limit (or stopped) leaves where it was, and the next goes on from there, wrapping to the
+ *      start after the end, so sessions that stay busy cannot keep later ones from being reached. A session is taken without interrupting it (the
  *      admission a file revert takes, which also covers its subagents): a busy one is skipped and
  *      met again on the next pass. The admission holds the session's messages, so an import holds
  *      it at most {@link SPEC_IMPORT_JOB.budgetMs} and gives way at once when a message for it
@@ -431,40 +433,68 @@ export async function runSpecImportPass(
 	const pass: SpecImportPass = { seen: 0, imported: 0, left: 0, givenUp: 0 };
 	const maxImports = options.maxImports ?? SPEC_IMPORT_JOB.importsPerPass;
 	let attempts = 0;
+	// Where the last pass stopped (round 2 review): sessions that stay busy early in the order
+	// cannot keep later ones from being reached. The end of the walk wraps to its start.
+	const from = { ...passPosition };
 	// Sessions in use first, archived ones after them (review NIT): two walks over the same pages.
 	for (const archived of [false, true]) {
-		let cursor: string | null = null;
+		if (from.archived && !archived) continue;
+		let cursor: string | null = from.archived === archived ? from.after : null;
+		/** The namespace before the session in hand: a pass cut short resumes at that session. */
+		let before = cursor;
+		const stopAt = (): SpecImportPass => {
+			passPosition.archived = archived;
+			passPosition.after = before;
+			return pass;
+		};
 		for (;;) {
-			if (options.stop?.() || specImportMode() !== "auto") return pass;
+			if (options.stop?.() || specImportMode() !== "auto") return stopAt();
 			const page = await readSpecNamespacePage(cursor);
 			for (const session of page.sessions) {
-				if (options.stop?.()) return pass;
-				if (session.archived !== archived || specImportSkipReason(session) !== null) continue;
-				pass.seen++;
-				if (leftAlone(await readSpecImportState(session.narratorId))) {
-					pass.givenUp++;
-					continue;
+				if (options.stop?.()) return stopAt();
+				const skip = session.archived !== archived || specImportSkipReason(session) !== null;
+				if (!skip) {
+					pass.seen++;
+					if (leftAlone(await readSpecImportState(session.narratorId))) pass.givenUp++;
+					else {
+						// At most so many imports a pass: the next one goes on from this session.
+						if (attempts >= maxImports) {
+							pass.left++;
+							return stopAt();
+						}
+						attempts++;
+						const outcome = await importSpecSessionIdle(session.narratorId, "sweep");
+						if (outcome.status === "imported") pass.imported++;
+						else if (outcome.status === "failed" && outcome.attention) pass.givenUp++;
+						else if (outcome.status !== "skipped") pass.left++;
+						await new Promise<void>((resolve) => {
+							const timer = setTimeout(resolve, options.pauseMs ?? SPEC_IMPORT_JOB.pauseMs);
+							timer.unref?.();
+						});
+					}
 				}
-				// At most so many imports a pass: the rest is met by the next one, sooner.
-				if (attempts >= maxImports) {
-					pass.left++;
-					return pass;
-				}
-				attempts++;
-				const outcome = await importSpecSessionIdle(session.narratorId, "sweep");
-				if (outcome.status === "imported") pass.imported++;
-				else if (outcome.status === "failed" && outcome.attention) pass.givenUp++;
-				else if (outcome.status !== "skipped") pass.left++;
-				await new Promise<void>((resolve) => {
-					const timer = setTimeout(resolve, options.pauseMs ?? SPEC_IMPORT_JOB.pauseMs);
-					timer.unref?.();
-				});
+				before = session.namespaceId;
 			}
 			if (page.next === null) break;
 			cursor = page.next;
 		}
 	}
+	// The whole walk done: the next pass starts over.
+	passPosition.archived = false;
+	passPosition.after = null;
 	return pass;
+}
+
+/** Where the idle job's next pass starts (in memory: a restart starts over). */
+const passPosition = hotSafe("narrafork.outline.specImport.passPosition", () => ({
+	archived: false,
+	after: null as string | null,
+}));
+
+/** Start the next pass at the beginning (tests). */
+export function resetSpecImportPassPosition(): void {
+	passPosition.archived = false;
+	passPosition.after = null;
 }
 
 function schedule(ms: number): void {

@@ -33,6 +33,7 @@ import { OUTLINE_SPEC_IMPORT_ACTOR } from "../plan";
 import {
 	importSpecAtRunStart,
 	requestSpecImport,
+	resetSpecImportPassPosition,
 	resetSpecImportRunTries,
 	runSpecImportPass,
 	settleSpecImportRequests,
@@ -46,6 +47,7 @@ beforeEach(() => {
 	invalidateTaskBackend();
 	resetSpecImportRecords();
 	resetSpecImportRunTries();
+	resetSpecImportPassPosition();
 	resetOutlineBehaviorImport();
 	resetOutlineFenceSopMove();
 });

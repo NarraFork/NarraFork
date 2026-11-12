@@ -23,6 +23,7 @@ import {
 import {
 	importSpecAtRunStart,
 	requestSpecImport,
+	resetSpecImportPassPosition,
 	resetSpecImportRunTries,
 	runSpecImportPass,
 	SPEC_IMPORT_JOB,
@@ -37,6 +38,7 @@ beforeEach(() => {
 	invalidateTaskBackend();
 	resetSpecImportRecords();
 	resetSpecImportRunTries();
+	resetSpecImportPassPosition();
 });
 afterAll(async () => {
 	await settleSpecImportRequests();
@@ -204,6 +206,44 @@ describe("the idle job (review NIT)", () => {
 		await runSpecImportPass({ pauseMs: 0 });
 		expect(await backendOf(archived.id)).toBe("outline");
 	}, 60_000);
+});
+
+describe("the idle job's position (round 2)", () => {
+	test("sessions that stay busy early in the order cannot keep a later one from being reached", async () => {
+		const { specNamespaces } = await import("../../../../db/schema");
+		const { acquireNarratorRevertAdmission } = await import("../../../narrator-session");
+		/** A session whose namespace id sorts where it is wanted. */
+		const session = async (namespaceId: string) => {
+			const { id } = await makeSession();
+			const now = "2026-11-12T00:00:00.000Z";
+			await db
+				.insert(specNamespaces)
+				.values({ id: namespaceId, narratorId: id, createdAt: now, updatedAt: now });
+			await writeTasks(id, [{ text: `task of ${namespaceId}` }]);
+			return id;
+		};
+		// First in the walk, and busy throughout: each holds its admission (a run, say).
+		const busy = [await session("--0-busy-a"), await session("--0-busy-b")];
+		const held = await Promise.all(
+			busy.map((id) =>
+				acquireNarratorRevertAdmission(id, {
+					signal: new AbortController().signal,
+					interrupt: false,
+				}),
+			),
+		);
+		// Last in the walk.
+		const last = await session("~~last");
+		try {
+			// Two imports a pass, both spent on the busy sessions if every pass started over.
+			for (let i = 0; i < 40 && (await backendOf(last)) !== "outline"; i++)
+				await runSpecImportPass({ pauseMs: 0, maxImports: 2 });
+			expect(await backendOf(last)).toBe("outline");
+			for (const id of busy) expect(await backendOf(id)).toBe("spec");
+		} finally {
+			for (const release of held) release();
+		}
+	}, 120_000);
 });
 
 describe("the store", () => {

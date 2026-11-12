@@ -43,6 +43,7 @@ import { readSpecImportState } from "../state";
 import {
 	importSpecAtRunStart,
 	requestSpecImport,
+	resetSpecImportPassPosition,
 	resetSpecImportRunTries,
 	runSpecImportPass,
 	settleSpecImportRequests,
@@ -64,6 +65,7 @@ beforeEach(() => {
 	invalidateTaskBackend();
 	resetSpecImportRecords();
 	resetSpecImportRunTries();
+	resetSpecImportPassPosition();
 	resetOutlineBehaviorImport();
 	resetOutlineFenceSopMove();
 });
