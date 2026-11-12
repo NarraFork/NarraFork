@@ -251,6 +251,27 @@ describe("moving a session back", () => {
 		expect((await outlineStore.getTaskClaims([shared]))[0]?.expiresAt).toBe(before);
 	});
 
+	test("the daily report does not list the move back under other (round 2)", async () => {
+		const { id, admin } = await imported();
+		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
+		if (!space) throw new Error("no space");
+		const from = (await outlineStore.getSpace(space.id))?.nextSeq ?? 1;
+		const result = await revertSpecImport(id, admin);
+		expect(result.released).toBe(1);
+		expect(result.marked).toBe(true);
+		const to = ((await outlineStore.getSpace(space.id))?.nextSeq ?? 1) - 1;
+		expect(to).toBeGreaterThanOrEqual(from + 1);
+		const { OUTLINE_DIGEST_LIMITS, summarizeSpaceWindow } = await import("../../digest");
+		const summary = await summarizeSpaceWindow(
+			outlineStore,
+			space,
+			from - 1,
+			to,
+			OUTLINE_DIGEST_LIMITS,
+		);
+		expect(summary.other).toEqual([]);
+	});
+
 	test("only a session an import moved, once per move, while idle and with no import running", async () => {
 		const admin = await makeUser();
 		const native = await makeSession({ backend: "outline" });
@@ -440,6 +461,60 @@ describe("an administrator's re-import", () => {
 		expect(text).not.toContain("report daily");
 		// The fence gave up its SOP only because the block holds the new one.
 		expect((await readSpecFile(id, "spec://behavior_fence")).content).not.toContain("every hour");
+	});
+
+	test("an SOP unchanged across the move back writes nothing to the plugin's block (S3, round 2)", async () => {
+		const { id, admin } = await imported();
+		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
+		const block = async () =>
+			(
+				await outlineStore.getBlockMetas(space?.id as string, {
+					sids: [pluginRulesSid(TEAM_SOP_PLUGIN_ID)],
+				})
+			)[0];
+		const before = await block();
+		expect(before?.deleted).toBe(false);
+		await revertSpecImport(id, admin);
+		// The session changes its tasks in Dynamic Spec, not its SOP: a real import, not a move forward.
+		await writeTasks(id, [{ text: "first" }, { text: "second" }, { text: "third" }]);
+		await reimportSpecSession(id, admin);
+		await settleSpecImportRequests();
+		expect(await backendOf(id)).toBe("outline");
+		expect((await readSpecImportState(id))?.switchCount).toBe(2);
+		const after = await block();
+		expect(after?.id).toBe(before?.id);
+		expect(after?.versionSeq).toBe(before?.versionSeq);
+		const children = await outlineStore.listChildren(space?.id as string, after?.id as string, 50);
+		expect(children.map((child) => child.content).join("\n")).toContain("Team SOP: report daily.");
+	});
+
+	test("a plugin's block someone deleted stays deleted, whatever SOP the fence holds (S3, round 2)", async () => {
+		const { id, admin } = await imported();
+		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
+		const [held] = await outlineStore.getBlockMetas(space?.id as string, {
+			sids: [pluginRulesSid(TEAM_SOP_PLUGIN_ID)],
+		});
+		await writeOutline({
+			spaceId: space?.id as string,
+			ops: [{ op: "delete", block: { id: held?.id as string } }],
+			actor: { kind: "human", id: admin },
+			responsibleUserId: admin,
+		});
+		await revertSpecImport(id, admin);
+		const updated = `Always run the tests.\n\n${TEAM_SOP_OPEN}\nTeam SOP: report every hour.\n${TEAM_SOP_CLOSE}\n`;
+		await writeSpecFile(id, "spec://behavior_fence", updated, {
+			actor: "system",
+			createdBy: "system",
+			pluginSop: true,
+		});
+		await reimportSpecSession(id, admin);
+		await settleSpecImportRequests();
+		expect(await backendOf(id)).toBe("outline");
+		const [after] = await outlineStore.getBlockMetas(space?.id as string, {
+			sids: [pluginRulesSid(TEAM_SOP_PLUGIN_ID)],
+		});
+		expect(after?.id).toBe(held?.id);
+		expect(after?.deleted).toBe(true);
 	});
 
 	test("a changed SOP too large for the block whole needs attention; the fence keeps it (S3)", async () => {
