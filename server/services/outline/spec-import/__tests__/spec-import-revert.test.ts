@@ -129,7 +129,7 @@ describe("moving a session back", () => {
 		const tasksBefore = (await taskPage(id)).map((task) => task.text);
 		const revisionsBefore = await revisions(id);
 		const result = await revertSpecImport(id, admin);
-		expect(result).toEqual({ reverted: true, marked: true, fenceRestored: true });
+		expect(result).toEqual({ reverted: true, marked: true, fenceRestored: true, released: 1 });
 		expect(await backendOf(id)).toBe("spec");
 		const state = await readSpecImportState(id);
 		expect(state).toMatchObject({
@@ -143,6 +143,14 @@ describe("moving a session back", () => {
 		expect(state?.revertNoteIds).toHaveLength(2);
 		// The outline keeps everything; the markers sit on top.
 		const tasksAfter = await taskPage(id);
+		// The task it was doing is open again, with a note why (S2).
+		expect(tasksAfter.find((task) => task.text === "second")).toMatchObject({
+			status: "todo",
+			holder: null,
+		});
+		expect(tasksAfter.find((task) => task.text === "second")?.children.at(-1)).toContain(
+			"moved the previous executor's session back to Dynamic Spec",
+		);
 		expect(tasksAfter.map((task) => task.text)).toEqual([
 			expect.stringContaining("moved this session back to Dynamic Spec"),
 			...tasksBefore,
@@ -167,6 +175,77 @@ describe("moving a session back", () => {
 		// No notice for it, and the Spec panel says it was moved back.
 		expect(await deliverSpecImportNotice(id)).toBe("none");
 		expect(await specImportStatus(id)).toMatchObject({ state: "reverted", importable: true });
+	});
+
+	test("what it holds in other spaces is let go too, with a note in the owner's language; nothing renews a claim later (S2)", async () => {
+		const owner = await makeUser("zh-CN");
+		const { id } = await makeSession({ owner });
+		await writeTasks(id, [{ text: "doing", status: "doing" }]);
+		expect((await importSpecSession(id, { trigger: "manual" })).status).toBe("imported");
+		const { projects } = await import("../../../../db/schema");
+		const { generateId } = await import("../../../../lib/id");
+		const { ensureProjectSpace } = await import("../../spaces");
+		const projectId = generateId();
+		await db.insert(projects).values({
+			id: projectId,
+			name: `P ${projectId.slice(0, 6)}`,
+			gitPath: "/srv/p",
+			ownerUserId: owner,
+			visibility: "private",
+			createdAt: "2026-11-12T00:00:00.000Z",
+			updatedAt: "2026-11-12T00:00:00.000Z",
+		});
+		const project = await ensureProjectSpace(projectId);
+		const written = await writeOutline({
+			spaceId: project.id,
+			ops: [
+				{ op: "insert", tempId: "p", parent: null, content: "Tasks" },
+				{
+					op: "insert",
+					tempId: "t",
+					parent: { tempId: "p" },
+					content: "shared",
+					task: { status: "todo" },
+				},
+			],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const shared = written.results[1]?.blockId as string;
+		const startShared = () =>
+			writeOutline({
+				spaceId: project.id,
+				ops: [{ op: "setTask", block: { id: shared }, task: { status: "doing" } }],
+				actor: { kind: "agent", id },
+				narratorId: id,
+				responsibleUserId: owner,
+			});
+		await startShared();
+		const [own] = (await taskPage(id)).filter((task) => task.text === "doing");
+		expect(own?.holder).toBe(id);
+		expect((await outlineStore.getTaskClaims([shared]))[0]?.holderNarratorId).toBe(id);
+
+		const result = await revertSpecImport(id, await makeUser());
+		expect(result.released).toBe(2);
+		expect((await taskPage(id)).find((task) => task.text === "doing")).toMatchObject({
+			status: "todo",
+			holder: null,
+		});
+		const sharedBlock = await outlineStore.getBlock(shared);
+		expect(sharedBlock?.taskJson?.status).toBe("todo");
+		expect((await outlineStore.getTaskClaims([shared]))[0]?.holderNarratorId ?? null).toBeNull();
+		const notes = await outlineStore.listChildren(project.id, shared, 5);
+		expect(notes.at(-1)?.content).toContain("管理员把之前执行它的会话退回了 Dynamic Spec");
+
+		// A claim that slipped through afterwards is neither renewed by its runs nor kept idle.
+		await startShared();
+		const before = (await outlineStore.getTaskClaims([shared]))[0]?.expiresAt;
+		const { keepOutlineTaskLeases, outlineRunEndsSettled } = await import("../../lease-keeper");
+		const keeper = keepOutlineTaskLeases(id, { intervalMs: 0, now: () => Date.now() + 60_000 });
+		await keeper.touch();
+		await keeper.stop();
+		await outlineRunEndsSettled(id);
+		expect((await outlineStore.getTaskClaims([shared]))[0]?.expiresAt).toBe(before);
 	});
 
 	test("only a session an import moved, once per move, while idle and with no import running", async () => {

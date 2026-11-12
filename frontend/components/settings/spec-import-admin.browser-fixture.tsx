@@ -46,6 +46,11 @@ const NOW = "2026-11-12T08:00:00.000Z";
 
 /** The admin page's sessions, by id. */
 let sessions = new Map<string, OutlineSpecImportAdminItem>();
+/** What the next move back answers about the old fence (the page warns when false). */
+let revertFenceRestored = true;
+export function setRevertFenceRestored(value: boolean): void {
+	revertFenceRestored = value;
+}
 /** What the page asked the server to do. */
 export const calls: string[] = [];
 let root: Root | null = null;
@@ -127,7 +132,7 @@ api.revertSpecImport = async (narratorId) => {
 			revertCount: entry.revertCount + 1,
 			updatedAt: new Date().toISOString(),
 		});
-	return { reverted: true, marked: true, fenceRestored: true };
+	return { reverted: true, marked: true, fenceRestored: revertFenceRestored, released: 1 };
 };
 
 api.reimportSpecSession = async (narratorId) => {

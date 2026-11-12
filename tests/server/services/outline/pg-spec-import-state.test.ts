@@ -263,8 +263,13 @@ describe("PostgreSQL Dynamic Spec import state", () => {
 			expect(outcome.brokenRow?.lastErrorDetail?.length).toBe(300);
 			expect(outcome.counts).toMatchObject({ imported: 1, attention: 1, reverted: 0 });
 			expect(outcome.page as unknown[]).toEqual([[outcome.main, "spec import", true]]);
-			// PostgreSQL: no session runtime, the old fence never emptied there.
-			expect(outcome.reverted).toEqual({ reverted: true, marked: true, fenceRestored: false });
+			// PostgreSQL: no session runtime, the old fence never emptied there; the claim let go.
+			expect(outcome.reverted).toEqual({
+				reverted: true,
+				marked: true,
+				fenceRestored: true,
+				released: 1,
+			});
 			expect(outcome.afterRevert?.backend).toBe("spec");
 			expect(outcome.afterRevert?.row).toMatchObject({ status: "reverted", revertCount: 1 });
 			expect(outcome.afterRevert?.row?.revertSourceKey).toMatch(/^[0-9a-f]{64}$/);

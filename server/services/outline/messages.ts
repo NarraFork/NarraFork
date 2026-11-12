@@ -86,8 +86,8 @@ export const OUTLINE_TEXT = {
 		tail: "); the task is open again.",
 	},
 	/** Summary of the commit that reopens the tasks of a session archived or deleted. */
-	sessionEndedSummary: (reason: "archived" | "deleted", n: number) =>
-		`session ${reason}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
+	sessionEndedSummary: (reason: "archived" | "deleted" | "reverted", n: number) =>
+		`${reason === "reverted" ? "session moved back to Dynamic Spec" : `session ${reason}`}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
 
 	/** A question block given a checkbox, or a task given a question. */
 	questionNotTask: (address: string) =>

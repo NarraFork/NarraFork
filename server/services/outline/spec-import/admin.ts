@@ -18,10 +18,11 @@
  *   4. SQLite: the old behavior fence, which the switch emptied (its text went to the behavior
  *      page, its SOP to the plugin's block), is written back as the revision the import read, a
  *      new revision; nothing of Dynamic Spec is deleted;
- *   5. a marker block at the top of the task page and of the behavior page says the session was
- *      moved back and no longer reads them; nothing in the outline is deleted or changed. The
- *      session's claims are left: the lease keeper renews no Dynamic Spec session's claims, so
- *      they run out and the expiry job reopens those tasks, as for any import's leftover;
+ *   5. what the session holds in the outline (its own space and any other) is let go at once:
+ *      each task back to do with a note, as for an archived session (the lease keeper renews
+ *      nothing for a moved-back session should one slip through); a marker block at the top of
+ *      the task page and of the behavior page says the session was moved back and no longer
+ *      reads them; nothing in the outline is deleted;
  *   6. a digest of the session's Dynamic Spec file pointers (after step 4) is kept: an
  *      administrator's re-import while it is unchanged moves the session forward again without
  *      writing (`importer.ts`), its markers removed.
@@ -279,6 +280,7 @@ async function revertHeld(
 	const locale: Locale = session.ownerUserId
 		? await getUserLanguage(session.ownerUserId).catch(() => "en" as const)
 		: "en";
+	const released = await releaseClaims(narratorId, locale);
 	const fenceRestored = await restoreFence(narratorId, before.fenceRevisionId);
 	const noteIds = await writeRevertNotes(session, locale, now);
 	try {
@@ -298,29 +300,64 @@ async function revertHeld(
 	logger.info("An administrator moved a session back to Dynamic Spec", {
 		narratorId,
 		adminUserId,
+		released,
 		fenceRestored,
 		marked: noteIds.length,
 	});
-	return { reverted: true, marked: noteIds.length > 0, fenceRestored };
+	return { reverted: true, marked: noteIds.length > 0, fenceRestored, released };
+}
+
+/**
+ * Let go of what the session holds in the outline, in any space (12b2 review S2): a Dynamic Spec
+ * session works on none of it, so each task is open again at once with a note saying why, as for
+ * an archived session. Never rejects; the count reopened (what could not be is left to the
+ * expiry job; the lease keeper renews nothing for a moved-back session).
+ */
+async function releaseClaims(narratorId: string, locale: Locale): Promise<number> {
+	try {
+		const { releaseOutlineSessionTaskClaims } = await import("../tasks");
+		// Written as the move back's own system actor: the import counts those commits as its own,
+		// so they keep no stale imported task from being cleared by a later re-import.
+		return (
+			await releaseOutlineSessionTaskClaims(narratorId, "reverted", {
+				locale,
+				actor: OUTLINE_SPEC_REVERT_ACTOR,
+			})
+		).reopened;
+	} catch (error) {
+		logger.warn("Could not let go of the tasks of a session moved back to Dynamic Spec", {
+			narratorId,
+			error: String(error),
+		});
+		return 0;
+	}
 }
 
 /**
  * Write the old fence back as the revision the import read (SQLite: Dynamic Spec is written
  * through that handle; on PostgreSQL the import never emptied it). Nothing when it holds that
- * already. Never rejects; true when a revision was written.
+ * already, or when the import read none. Never rejects; false only when the fence should have
+ * been written back and was not (its revision is gone, or the write failed): the admin page
+ * warns then.
  */
 async function restoreFence(narratorId: string, revisionId: string | null): Promise<boolean> {
-	if (!revisionId || outlineAccessBackend() !== "sqlite") return false;
+	if (!revisionId || outlineAccessBackend() !== "sqlite") return true;
 	try {
 		const old = (await readSpecRevisionContents([revisionId])).get(revisionId);
-		if (old === undefined) return false;
+		if (old === undefined) {
+			logger.warn("The old behavior fence of a session moved back is gone; not restored", {
+				narratorId,
+				revisionId,
+			});
+			return false;
+		}
 		const [{ readSpecFileContentIfExists, writeSpecFile }, { BEHAVIOR_FENCE_URI }] =
 			await Promise.all([
 				import("../../spec-vfs-service"),
 				import("../../task-source/outline-behavior"),
 			]);
 		const current = (await readSpecFileContentIfExists(narratorId, BEHAVIOR_FENCE_URI)) ?? "";
-		if (current === old) return false;
+		if (current === old) return true;
 		// The fence's system channel: the guard this move back holds lets it through.
 		await writeSpecFile(narratorId, BEHAVIOR_FENCE_URI, old, {
 			actor: "system",

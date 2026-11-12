@@ -122,6 +122,11 @@ export interface OutlineSpecImportRevertResult {
 	reverted: true;
 	/** The markers were written on the task and behavior pages. */
 	marked: boolean;
-	/** The old behavior fence was restored to the version the import read. */
+	/**
+	 * The old behavior fence holds the version the import read again (written back, or held
+	 * already). False when it should have been written back and was not: the page warns.
+	 */
 	fenceRestored: boolean;
+	/** Tasks the session held in the outline, reopened at once. */
+	released: number;
 }
