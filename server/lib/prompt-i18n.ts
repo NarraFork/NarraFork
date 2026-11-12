@@ -46,6 +46,7 @@ export type {
 	OutlineTeamUnblockedEntry,
 	OutlineViewAgent,
 	OutlineViewTask,
+	SpecImportNoticePage,
 } from "./prompts/outline-tasks";
 export {
 	getOutlineBehaviorFenceTruncated,
@@ -62,6 +63,7 @@ export {
 	getOutlineCompactTaskLine,
 	getOutlineContinuationPrompt,
 	getOutlineInterruptNote,
+	getOutlineSpecMovedHint,
 	getOutlineSpecUnavailableHint,
 	getOutlineTaskEditNote,
 	getOutlineTaskFinishedNote,
@@ -73,6 +75,7 @@ export {
 	getOutlineTurnEndNote,
 	getOutlineViewDelegatedLine,
 	getOutlineViewTaskLine,
+	getSpecImportNotice,
 } from "./prompts/outline-tasks";
 export type {
 	SetupAuthorization,

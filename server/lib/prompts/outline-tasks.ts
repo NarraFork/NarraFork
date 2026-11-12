@@ -468,6 +468,58 @@ export function getOutlineSpecUnavailableHint(locale: Locale): string {
 	return pickLocalizedValue(specUnavailable, locale);
 }
 
+const specMoved: LocalizedValue<string> = {
+	en: "spec:// no longer applies in this session: its Dynamic Spec was moved into the outline. Its tasks are on the task page session/tasks, its old spec:// files are outline pages in session/ (titled by their file name), and its behavior boundary is the behavior page session/behavior. Read with OutlineRead or OutlineSearch and write with OutlineEdit. Nothing was read or written.",
+	"zh-CN":
+		"本会话不再使用 spec://：它的 Dynamic Spec 已搬进大纲。任务在任务页 session/tasks，原来的 spec:// 文件是 session/ 里的大纲页（以文件名为标题），行为边界是行为边界页 session/behavior。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写。本次没有读写任何内容。",
+};
+
+/**
+ * What a tool call naming a `spec://` path gets in a session the import moved into the outline
+ * (outline P2 PR 12b2): where each kind of its old content is now.
+ */
+export function getOutlineSpecMovedHint(locale: Locale): string {
+	return pickLocalizedValue(specMoved, locale);
+}
+
+// ─── The Dynamic Spec import's notice to the model (outline P2 PR 12b2) ───
+
+/** One page an import wrote from a Dynamic Spec file. */
+export interface SpecImportNoticePage {
+	/** The file it came from (its page title). */
+	title: string;
+	/** `session/<sid>`. */
+	address: string;
+}
+
+/**
+ * The one history row a session gets after the import moved it into the outline: where its
+ * tasks, notes and behavior boundary are now, and that `spec://` no longer applies. At most
+ * `pages.length` page lines (the caller bounds them); `morePages` counts the rest.
+ */
+export function getSpecImportNotice(
+	input: { tasks: number; pages: readonly SpecImportNoticePage[]; morePages: number },
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const lines = input.pages.map((page) => `- spec://${page.title} → ${page.address}`);
+	if (input.morePages > 0)
+		lines.push(
+			zh
+				? `- 另有 ${input.morePages} 页，用 OutlineRead 读 session/ 查看`
+				: `- ${input.morePages} more pages; read session/ with OutlineRead`,
+		);
+	const notes =
+		lines.length > 0
+			? zh
+				? `\n\n原来的 spec:// 文件现在是这些大纲页：\n${lines.join("\n")}`
+				: `\n\nThe old spec:// files are now these outline pages:\n${lines.join("\n")}`
+			: "";
+	return zh
+		? `系统通知（不是用户发言）：本会话的 Dynamic Spec 已搬进大纲。任务现在在任务页 session/tasks（导入了 ${input.tasks} 个），行为边界是行为边界页 session/behavior，系统会把当前任务和行为边界放在你的上下文里。${notes}\n\n本会话不再使用 spec://：读用 OutlineRead 或 OutlineSearch，写用 OutlineEdit（任务是带复选框的块）。旧的 Dynamic Spec 文件保留，只读，不再更新。`
+		: `System notice (not the user speaking): this session's Dynamic Spec was moved into the outline. Its tasks are now on the task page session/tasks (${input.tasks} imported), and its behavior boundary is the behavior page session/behavior; the system keeps the current tasks and the behavior boundary in your context.${notes}\n\nspec:// no longer applies in this session: read with OutlineRead or OutlineSearch, write with OutlineEdit (a task is a checkbox block). The old Dynamic Spec files are kept read-only and are no longer updated.`;
+}
+
 // ─── People's changes to the session's tasks (outline P2 PR 5) ───
 
 /** One change a person made to a task of the session (the board, the outline editor). */
