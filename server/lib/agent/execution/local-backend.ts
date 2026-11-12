@@ -47,6 +47,7 @@ import type {
 	WriteBytesOptions,
 } from "./backend";
 import { LOCAL_DEVICE_ID } from "./backend";
+import { isDurableServiceSupported, spawnDurableService } from "./durable-service";
 import {
 	exclusiveCreateOptions,
 	exclusiveLocalIo,
@@ -720,6 +721,19 @@ export class LocalBackend implements ExecutionBackend {
 			}
 		}
 		if (params.env) env = { ...env, ...params.env };
+
+		if (params.durableService && !shellInfo.loginWrap && isDurableServiceSupported()) {
+			return spawnDurableService({
+				taskId: params.durableService.taskId,
+				timeoutMs: params.durableService.timeoutMs,
+				command: params.command,
+				cwd: params.cwd,
+				env,
+				shellPath: shellInfo.path,
+				login: freshEnv,
+				signal: params.signal,
+			});
+		}
 
 		let spawnArgs: [string, string[], object];
 		// windowsHide：Windows 上不隐藏会让每次 Bash 工具调用都弹出控制台窗口。
