@@ -3799,7 +3799,13 @@ async function feedMessageUnlocked(
 			prePromptBashCommand: input.prePromptBashCommand,
 			media,
 			recoveryStart,
-			initiatedBy: "person",
+			// A person's message, or Continue a person asked for. The system resuming after a
+			// restart or an update (`recovered`, a planned update's token) sends its own "continue"
+			// through here: not a person's, unless it adopts a message a person queued.
+			initiatedBy:
+				(internalOptions?.run?.recovered || recoveryStart) && !internalOptions?.bufferedId
+					? "system"
+					: "person",
 		});
 		terminal.catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
@@ -6328,7 +6334,10 @@ async function continueNarratorUnlocked(
 		...run,
 		...(userId !== undefined ? { principal: userId } : {}),
 		recoveryStart,
-		initiatedBy: "person",
+		// Continue or Resume a person asked for is theirs; the system resuming a run after a
+		// restart, an update or a subagent's recovery (`recovered`, a planned update's token) is
+		// not.
+		initiatedBy: run?.recovered || recoveryStart ? "system" : "person",
 	});
 	terminal.catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });

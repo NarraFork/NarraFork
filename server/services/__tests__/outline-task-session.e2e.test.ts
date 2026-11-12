@@ -1529,6 +1529,30 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 		expect(await handoffsUnder(task.id)).toHaveLength(2);
 	});
 
+	test("the system resuming a run (a restart's or an update's recovery, `recovered`) is the system's", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const { body } = await open(alice, task);
+		const id = body.narratorId;
+		await idle(id, 1);
+		onTurn = async () => {
+			if ((await stateOf(task.id)).holder === id) return;
+			await asSession(p.space.id, id, alice, [
+				{ op: "setTask", block: { id: task.id }, task: { status: "doing" } },
+			]);
+		};
+		let resumed = false;
+		for (const deadline = Date.now() + 5_000; !resumed && Date.now() < deadline; ) {
+			resumed = (await continueNarrator(id, "en", false, undefined, { recovered: true })).ok;
+			if (!resumed) await Bun.sleep(5);
+		}
+		expect(resumed).toBe(true);
+		await idle(id, 2);
+		expect(await stateOf(task.id)).toMatchObject({ status: "todo", holder: null, epoch: 2 });
+		expect(await handoffsUnder(task.id)).toHaveLength(2);
+	});
+
 	test("a start nobody asked for (a plugin's, `explicitStart: false`) is the system's: an unfinished team task goes back at once", async () => {
 		settings.agent.autoContinuationMode = "protectedOnly";
 		const alice = await person("alice");
