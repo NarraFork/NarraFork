@@ -151,7 +151,7 @@
 		"sessionUnavailable": "你无法打开写入它的会话。"
 	},
 	"editor": {
-		"questionMark": "问人的提问：在收件箱里回答。删除它就是撤回提问。",
+		"questionMark": "打开提问即可回答；删除即撤回。",
 		"questionsWithdrawn_one": "删除撤回了一条问人的提问；撤销即可重新提问。",
 		"questionsWithdrawn_other": "删除撤回了 {{count}} 条问人的提问；撤销即可重新提问。",
 		"changeStatus": "切换状态",
@@ -159,6 +159,10 @@
 		"rootKept": "正在聚焦的块不能在这里删除；退到上一层再删。",
 		"peerEditing": "{{name}} 正在编辑",
 		"peerViewing": "{{name}} 正在查看",
+		"agentWorking": "会话「{{name}}」正在处理",
+		"agentWorkingIn": "会话「{{session}}」的「{{name}}」正在处理",
+		"agentHidden": "一个 agent 正在处理",
+		"untitledSession": "未命名会话",
 		"someone": "有人",
 		"readOnly": "只读",
 		"connecting": "正在连接…",
@@ -246,14 +250,54 @@
 	"workspace": {
 		"addTitle": "添加大纲页"
 	},
+	"crumbs": {
+		"label": "这一页的位置",
+		"more_one": "还有 {{count}} 层",
+		"more_other": "还有 {{count}} 层"
+	},
+	"reportLine": {
+		"title": "子代理报告",
+		"lateEnded": "迟到的子代理报告（派出后任务已被结束）",
+		"lateReopened": "迟到的子代理报告（派出后任务已退回待办）",
+		"lateTakenOver": "迟到的子代理报告（派出后任务已转手）",
+		"from": "来自 {{name}}",
+		"timedOut": "未完成：超时",
+		"failed": "未完成：出错",
+		"interrupted": "未完成：被中断",
+		"empty": "没有输出"
+	},
+	"fold": {
+		"expandAll": "全部展开",
+		"collapseAll": "全部收起",
+		"collapseAllHint": "回到默认视图",
+		"altHint": "Alt+点击：展开或收起其中全部",
+		"subtree": "展开/收起「{{title}}」里的全部",
+		"subtreeExpand": "展开其中全部",
+		"subtreeCollapse": "收起其中全部",
+		"more_one": "还有 {{count}} 条 ▸",
+		"more_other": "还有 {{count}} 条 ▸",
+		"open": "展开 ▸",
+		"reportAll_one": "展开全文（{{count}} 块）▸",
+		"reportAll_other": "展开全文（{{count}} 块）▸",
+		"showInside": "展开这一项里的全部",
+		"untitled": "没有标题的块",
+		"hiddenQuestion_one": "收起的内容里有 {{count}} 个提问等回答",
+		"hiddenQuestion_other": "收起的内容里有 {{count}} 个提问等回答",
+		"hiddenPending_one": "收起的内容里有 {{count}} 处改动等确认",
+		"hiddenPending_other": "收起的内容里有 {{count}} 处改动等确认",
+		"hiddenLocked_one": "收起的内容里有 {{count}} 个锁定的任务",
+		"hiddenLocked_other": "收起的内容里有 {{count}} 个锁定的任务",
+		"hiddenFresh_one": "收起的内容里有 {{count}} 个新完成的任务",
+		"hiddenFresh_other": "收起的内容里有 {{count}} 个新完成的任务"
+	},
 	"lock": {
 		"badge": "已锁定 · {{name}}",
 		"someone": "某人",
 		"section": "锁定",
 		"lockedBy": "{{name}} 锁定",
 		"delegate": "{{name}} 可以代锁定人确认",
-		"explainLocked": "agent 对这个计划的改动（步骤、目标和验收）要等确认才生效。人照常编辑。",
-		"explainUnlocked": "锁定这个计划：之后 agent 改它的步骤、目标和验收，都要等你确认。",
+		"explainLocked": "agent 对这个计划的改动（背景、步骤和它们的细节）要等确认才生效。人照常编辑。",
+		"explainUnlocked": "锁定这个计划：之后 agent 改它的背景、步骤和细节，都要等你确认。",
 		"delegateLabel": "代你确认的会话（可选）",
 		"delegatePlaceholder": "不指定：由你确认",
 		"lock": "锁定",
@@ -323,10 +367,9 @@
 		"answeredRelayedVia": "{{name}} 在对话里回答（经 {{via}}）：{{choice}}",
 		"withdrawn": "已撤回",
 		"waitingFor": "等 {{name}} 回答",
-		"notePlaceholder": "补充说明，或用自己的话回答",
+		"notePlaceholder": "或直接写下你的回答",
 		"answerPlaceholder": "你的回答",
-		"adoptAll": "全部采纳建议（{{count}}）",
-		"submit": "回答",
+		"submit": "提交回答",
 		"nothingToSend": "先选一个选项或写下回答",
 		"answered": "已回答 {{count}} 条提问，已通知 agent",
 		"answerFailed": "回答没有保存",
@@ -521,6 +564,7 @@
 		"thisSession": "本会话",
 		"untitledSession": "未命名会话",
 		"nobody": "未指派",
+		"readyToStart": "待开工",
 		"agent": "agent {{name}}",
 		"you": "{{name}}（你）",
 		"status": {
@@ -565,12 +609,31 @@
 			"assignMe": "交给我",
 			"assignUser": "交给其他人…",
 			"assignSession": "交回本会话",
+			"transferSession": "转交给会话…",
 			"usernamePlaceholder": "用户名",
 			"assign": "转交",
 			"open": "在大纲里打开",
 			"failed": "修改任务失败",
 			"conflict": "任务刚被改过，看板已重新加载。",
 			"updated": "任务已更新"
+		},
+		"transfer": {
+			"note": "旧会话带着以前的上下文；一般让新会话做更合适。",
+			"only": "转交",
+			"andStart": "转交并开始",
+			"empty": "这个项目里没有能接手的会话。",
+			"failed": "读取会话列表失败",
+			"more": "只列出前 {{n}} 个会话。",
+			"untitled": "未命名会话",
+			"started": "已转交，会话已开始做。",
+			"notStarted": {
+				"finished": "已转交。任务已经结束，没有启动会话。",
+				"busy": "已转交。会话正在运行，没有另外启动；它会读到这次转交。",
+				"plan_mode": "已转交。会话在计划模式，没有启动。",
+				"continuation_off": "已转交。会话关了续跑，没有启动。",
+				"continuation_mode": "已转交。按会话的续跑设置，它不会接着做这个任务，没有启动。",
+				"not_started": "已转交，但会话没有启动。"
+			}
 		},
 		"completion": {
 			"asks": "agent 把它标为{{status}}：等你确认",
@@ -592,6 +655,38 @@
 			"awaitingYou": "{{count}} 个目标等你确认",
 			"awaitingFrom": "{{count}} 个目标等 {{names}} 确认",
 			"awaitingOthers": "{{count}} 个目标等人确认"
+		},
+		"openSession": {
+			"button": "开新会话做这个",
+			"options": "开新会话做这个…",
+			"doing": "会话「{{title}}」在做",
+			"doingUntitled": "有会话在做",
+			"hint": "在这个项目里开一个新会话，领取这个任务并开始做；开工说明由系统从大纲整理。每开一个会话，至少花一轮请求。",
+			"model": "模型",
+			"cwd": "工作目录",
+			"cwdPlaceholder": "项目目录",
+			"note": "补充说明",
+			"notePlaceholder": "可选：原样写进会话的开工说明",
+			"submit": "开会话",
+			"failed": "没能开会话",
+			"error": {
+				"finished": "任务已经结束。",
+				"planning": "任务在一份还没批准的计划里。",
+				"prerequisites": "任务在等前置任务。",
+				"people": "任务在等它下面一个提问的回答。",
+				"confirmation": "任务在等一处改动的确认。",
+				"assigned_to_person": "任务已指派给人。",
+				"unavailable": "这个部署上不能为任务开会话。",
+				"not_project_task": "只有项目空间里的任务能开新会话来做。",
+				"no_directory": "项目没有工作目录（或给的目录不存在）。请在「开新会话做这个…」里选一个。",
+				"in_progress": "任务已经在进行中。",
+				"claimed": "已经有人在做这个任务。",
+				"claimedBy": "{{name}} 已经在做这个任务。",
+				"changed": "任务刚被改过，看板已重新加载。",
+				"start_failed": "会话没能启动，任务已放回待办，请再试一次。",
+				"forbidden": "你不能为这个项目的任务开会话。",
+				"unreadable": "新会话读不到这个项目的大纲，所以没有把任务交给它。请检查项目和会话的可见范围设置。"
+			}
 		}
 	}
 }

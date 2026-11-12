@@ -58,6 +58,11 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import type { PlanTreeAction } from "@shared/outline-plan-tree";
+import {
+	coerceInjectionTarget,
+	type InjectionTarget,
+} from "@shared/pretext-layout/injection-target";
 import {
 	CARD_SHIMMER_CLASS,
 	resolveToolShimmerFlash,
@@ -151,6 +156,7 @@ import { categoryIcon } from "./category-icons";
 import { DiffStatsText, type DiffStatsValue } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { FragmentGap, LineFragments } from "./line-fragments";
+import { PlanTreeBody, type PlanTreeLabels } from "./PlanTreeBody";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
@@ -163,6 +169,8 @@ import { readExactDisplayBox, VListImage } from "./vlist-image";
 // i18n-facing labels, injected by the dispatch/registry layer (no i18n import
 // across the vlist edge). Sensible English fallbacks keep this self-contained.
 // ─────────────────────────────────────────────────────────────────────────────
+export type ContentTargetResolver = (target: InjectionTarget) => (() => void) | undefined;
+
 export interface ToolCallLabels {
 	/** Detail "Input" section label (generic / capped-with-label). */
 	input?: string;
@@ -205,6 +213,8 @@ export interface ToolCallLabels {
 	permission?: InlinePermissionLabels;
 	/** Reflection-notice labels forwarded to RenderReflectionNotice. */
 	reflection?: ReflectionNoticeLabels;
+	/** An outline plan's tree (toolbar, folds, clamped text): render-only words. */
+	planTree?: PlanTreeLabels;
 }
 
 const DEFAULT_LABELS: Required<
@@ -361,6 +371,7 @@ function InlineLines({
 	unlinkedColor,
 	leadingSlot,
 	href: rawHref,
+	onOpen,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
@@ -379,6 +390,7 @@ function InlineLines({
 	 * session instead, and is plain text where nothing can open it.
 	 */
 	href?: string | null;
+	onOpen?: () => void;
 }) {
 	const lines = useInlineLines(block, availableWidth);
 	const outlineLink = useOutlineLinkProps(rawHref);
@@ -394,7 +406,28 @@ function InlineLines({
 				height: frame.height,
 			}}
 		>
-			{href ? (
+			{onOpen ? (
+				<button
+					type="button"
+					aria-label={lines
+						.flatMap((line) => line.fragments.map((fragment) => fragment.text))
+						.join("")}
+					onClick={(event) => {
+						event.stopPropagation();
+						onOpen();
+					}}
+					style={{
+						position: "absolute",
+						inset: 0,
+						zIndex: 1,
+						padding: 0,
+						border: 0,
+						background: "transparent",
+						cursor: "pointer",
+					}}
+				/>
+			) : null}
+			{!onOpen && href ? (
 				<a
 					href={href}
 					{...(outlineLink
@@ -474,6 +507,8 @@ function InlineLines({
 // Header row.
 // ─────────────────────────────────────────────────────────────────────────────
 interface ToolHeaderRowProps {
+	/** A notice has no execution status; do not invent a success glyph for it. */
+	hideStatus?: boolean;
 	queuedBehindUpstream?: boolean;
 	reflectionStatus?: string | null;
 	toolName: string;
@@ -512,6 +547,7 @@ interface ToolHeaderRowProps {
 }
 
 function ToolHeaderRow({
+	hideStatus = false,
 	queuedBehindUpstream,
 	reflectionStatus,
 	toolName,
@@ -675,20 +711,22 @@ function ToolHeaderRow({
 						{takenOverLabel}
 					</Badge>
 				) : null}
-				<span
-					style={{
-						display: "inline-flex",
-						alignItems: "center",
-						color: cssColor(statusColor, 6),
-						flexShrink: 0,
-					}}
-				>
-					{statusMark != null ? (
-						<TraceRowStatusGlyph mark={statusMark} />
-					) : (
-						<StatusGlyph status={status} color={statusColor} />
-					)}
-				</span>
+				{!hideStatus && (
+					<span
+						style={{
+							display: "inline-flex",
+							alignItems: "center",
+							color: cssColor(statusColor, 6),
+							flexShrink: 0,
+						}}
+					>
+						{statusMark != null ? (
+							<TraceRowStatusGlyph mark={statusMark} />
+						) : (
+							<StatusGlyph status={status} color={statusColor} />
+						)}
+					</span>
+				)}
 				{/* Timing lives INSIDE the existing single header row (height-neutral):
 			    a live elapsed counter while running, else the final duration. The
 			    breakdown popover and the timeout editor are portaled, so neither can
@@ -1490,7 +1528,7 @@ type DetailLabels = Required<
 		ToolCallLabels,
 		"input" | "output" | "planSource" | "download" | "copy" | "copied" | "tasksEmpty"
 	>
-> & { sections?: Partial<Record<ToolSectionLabel, string>> };
+> & { sections?: Partial<Record<ToolSectionLabel, string>>; planTree?: PlanTreeLabels };
 
 /** Localized section-label text (injected bundle wins over the English default). */
 function sectionLabelText(labels: DetailLabels, label: ToolSectionLabel): string {
@@ -1629,6 +1667,7 @@ function DetailBlocks({
 	labels,
 	narratorId,
 	openSession,
+	resolveTargetOpener,
 	specTasksLive,
 }: {
 	kind: MeasuredToolBody["kind"];
@@ -1645,6 +1684,7 @@ function DetailBlocks({
 	 * chips) — each is the row that names the session being opened.
 	 */
 	openSession?: { onOpen: () => void; label: string };
+	resolveTargetOpener?: ContentTargetResolver;
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
 }) {
@@ -1715,6 +1755,8 @@ function DetailBlocks({
 					// A row/entry whose text is a link paints an anchor overlay so the
 					// measured line geometry stays authoritative.
 					const href = typeof data.href === "string" ? data.href : null;
+					const target = coerceInjectionTarget(data.target);
+					const onOpen = target ? resolveTargetOpener?.(target) : undefined;
 					const dimmed = data.dimmed === true;
 					// A warning-toned error line is a DENIED PLAN's reviewer feedback: the
 					// user's own note back to the model, not a tool failure. The chunked
@@ -1731,10 +1773,11 @@ function DetailBlocks({
 							block={block}
 							frame={bf}
 							availableWidth={availableWidth}
-							color={href ? "var(--mantine-color-teal-text)" : lineColor}
+							color={href || onOpen ? "var(--mantine-color-teal-text)" : lineColor}
 							unlinkedColor={lineColor}
 							leadingSlot={iconSlot}
 							href={href}
+							onOpen={onOpen}
 						/>
 					);
 				}
@@ -2002,10 +2045,12 @@ function DetailRegion({
 	labels,
 	narratorId,
 	openSession,
+	resolveTargetOpener,
 	viewTargets,
 	viewControls,
 	specTasksLive,
 	onToggleRaw,
+	onPlanTree,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -2013,11 +2058,14 @@ function DetailRegion({
 	narratorId?: string;
 	/** "Open full session" affordance for an Await-agent card's identity row. */
 	openSession?: { onOpen: () => void; label: string };
+	resolveTargetOpener?: ContentTargetResolver;
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
 	/** The fold under an outline card's change list (raw input, model result). */
 	onToggleRaw?: () => void;
+	/** An outline plan's tree: open or fold a node, a text, or everything. */
+	onPlanTree?: (action: PlanTreeAction) => void;
 }) {
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
@@ -2062,7 +2110,9 @@ function DetailRegion({
 								}
 								viewControls={viewControls}
 								specTasksLive={specTasksLive}
+								resolveTargetOpener={resolveTargetOpener}
 								onToggleRaw={onToggleRaw}
+								onPlanTree={onPlanTree}
 							/>
 						</div>
 					</Fragment>
@@ -2078,21 +2128,26 @@ export function RenderToolBody({
 	labels = DEFAULT_LABELS,
 	narratorId,
 	openSession,
+	resolveTargetOpener,
 	viewTarget,
 	viewControls,
 	specTasksLive,
 	onToggleRaw,
+	onPlanTree,
 }: {
 	measured: MeasuredToolBody;
 	labels?: DetailLabels;
 	narratorId?: string;
 	/** "Open full session" affordance for an Await-agent card's identity row. */
 	openSession?: { onOpen: () => void; label: string };
+	resolveTargetOpener?: ContentTargetResolver;
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
 	/** The fold under an outline card's change list (raw input, model result). */
 	onToggleRaw?: () => void;
+	/** An outline plan's tree: open or fold a node, a text, or everything. */
+	onPlanTree?: (action: PlanTreeAction) => void;
 }) {
 	const { model, blocks, frame, contentWidth, height, appliedCap } = measured;
 	// The content-view host can update independently of the body. Keep its
@@ -2143,6 +2198,18 @@ export function RenderToolBody({
 				onToggleRaw={onToggleRaw}
 			/>
 		);
+	if (model.kind === "plan-tree")
+		return (
+			<PlanTreeBody
+				bodyId={`plan-tree:${model.markdown.id}`}
+				blocks={blocks}
+				frames={frame.blocks}
+				availableWidth={contentWidth}
+				height={height}
+				labels={labels.planTree}
+				onPlanTree={onPlanTree}
+			/>
+		);
 	if (model.kind === "ask")
 		return (
 			<AskDetailBlocks
@@ -2163,6 +2230,7 @@ export function RenderToolBody({
 				labels={labels}
 				openSession={openSession}
 				specTasksLive={specTasksLive}
+				resolveTargetOpener={resolveTargetOpener}
 			/>
 		);
 	if (model.format === "media") {
@@ -2326,12 +2394,15 @@ export interface RenderToolCallProps {
 	 * an outline card's raw input and model result under its change list.
 	 */
 	onTogglePrompt?: () => void;
+	/** An outline plan card's tree: open or fold a node, a text, or everything. */
+	onPlanTree?: (action: PlanTreeAction) => void;
 	/**
 	 * Open the full session of the subagent this call waits on (an Await-agent
 	 * card whose target resolved, or a single-target Send). Same affordance as
 	 * the subagent card's in-card button; absent → no button.
 	 */
 	onOpenSession?: () => void;
+	resolveTargetOpener?: ContentTargetResolver;
 	/**
 	 * Terminate the running tool. Supplied by the integration layer for bash / MCP
 	 * cards (the chunked header's InlineTerminateControl equivalent).
@@ -2353,6 +2424,8 @@ export interface RenderToolCallProps {
 	 * copy; its height is corrected after paint via the shell's onUnknownHeight.
 	 */
 	permissionSlot?: ReactNode;
+	/** Current Outline questions; unlike permissions, hidden when the card folds. */
+	outlineAskSlot?: ReactNode;
 	/**
 	 * Report the live form's painted OUTER height (its own top margin included).
 	 *
@@ -2539,11 +2612,13 @@ export function RenderToolCall({
 	narratorId,
 	onToggle,
 	onOpenSession,
+	resolveTargetOpener,
 	onTerminate,
 	onUpdateTimeout,
 	onPermissionAllow,
 	onPermissionDeny,
 	permissionSlot,
+	outlineAskSlot,
 	onPermissionFormHeight,
 	onReflectionTakeOver,
 	reflectionTakingOver,
@@ -2551,6 +2626,7 @@ export function RenderToolCall({
 	viewControls,
 	specTasksLive,
 	onTogglePrompt,
+	onPlanTree,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2625,6 +2701,7 @@ export function RenderToolCall({
 	const body = (
 		<>
 			<ToolHeaderRow
+				hideStatus={measured.contentRole === "auxiliary" && measured.sourceStatus == null}
 				queuedBehindUpstream={queuedBehindUpstream}
 				reflectionStatus={reflection?.status}
 				toolName={measured.toolName}
@@ -2648,7 +2725,9 @@ export function RenderToolCall({
 				onTerminate={onTerminate}
 				terminateLabel={merged.terminate}
 			/>
-			{effectiveOpened && detail ? (
+			{effectiveOpened && outlineAskSlot != null ? (
+				<Box mt={DETAIL_TOP_MARGIN}>{outlineAskSlot}</Box>
+			) : effectiveOpened && detail ? (
 				<Box mt={DETAIL_TOP_MARGIN} style={{ position: "relative" }}>
 					{/* The detail region's own top block already carries the mt gap,
 					    so we render it flush and let its frame own the spacing. */}
@@ -2666,7 +2745,9 @@ export function RenderToolCall({
 							viewTargets={viewTargets}
 							viewControls={viewControls}
 							specTasksLive={specTasksLive}
+							resolveTargetOpener={resolveTargetOpener}
 							onToggleRaw={onTogglePrompt}
+							onPlanTree={onPlanTree}
 						/>
 					</div>
 				</Box>
@@ -2679,12 +2760,15 @@ export function RenderToolCall({
 		</>
 	);
 	const quoteFile = quoteFilePath(measured.detail);
-	const quoteSource = {
-		[QUOTE_TOOL_ATTR]: measured.toolName,
-		[QUOTE_TOOL_SUMMARY_ATTR]: measured.summary,
-		...(quoteFile ? { [QUOTE_FILE_ATTR]: quoteFile } : {}),
-		...(measured.toolUseId ? { [QUOTE_TOOL_ID_ATTR]: measured.toolUseId } : {}),
-	};
+	const quoteSource =
+		measured.contentRole === "auxiliary"
+			? {}
+			: {
+					[QUOTE_TOOL_ATTR]: measured.toolName,
+					[QUOTE_TOOL_SUMMARY_ATTR]: measured.summary,
+					...(quoteFile ? { [QUOTE_FILE_ATTR]: quoteFile } : {}),
+					...(measured.toolUseId ? { [QUOTE_TOOL_ID_ATTR]: measured.toolUseId } : {}),
+				};
 
 	// In a run: no border, a trailing divider unless last. The shimmer overlay
 	// sits on the inner padded box (not the outer wrapper) so the divider stays

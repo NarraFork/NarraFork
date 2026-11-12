@@ -309,6 +309,8 @@ export interface MeasureMediaOpts {
 export interface MeasuredImageGeneration extends MeasuredElement {
 	inRun: boolean;
 	isLast: boolean;
+	/** Exactly the same activity predicate drives reserved and painted loader space. */
+	generating: boolean;
 }
 
 interface ImageMetrics {
@@ -332,7 +334,7 @@ function getImageMetrics(data: MeasureImageGenerationInput): ImageMetrics | null
 }
 
 function isGeneratingStatus(status: string | undefined): boolean {
-	return !!status && status !== "completed";
+	return status === "in_progress" || status === "generating";
 }
 
 /** Build the header rich-inline flow (status text + optional revisedPrompt). */
@@ -503,6 +505,7 @@ export function measureImageGeneration(
 	return {
 		inRun,
 		isLast,
+		generating,
 		height,
 		blocks,
 		frame,

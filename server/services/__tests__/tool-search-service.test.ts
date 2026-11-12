@@ -1,7 +1,7 @@
 import { afterAll, afterEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import { narratorMessages, narrators, users } from "../../db/schema";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
@@ -103,9 +103,9 @@ function context(narratorId: string): ToolContext {
 	};
 }
 async function notices(id: string) {
-	return (
-		await db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, id))
-	).filter((row) => JSON.stringify(row.contentJson).includes('"type":"tool_loaded"'));
+	return (await db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, id)))
+		.map((row) => ({ ...row, contentJson: readTestMessageContent(sqlite, row.id) }))
+		.filter((row) => JSON.stringify(row.contentJson).includes('"type":"tool_loaded"'));
 }
 async function openPrefixEpoch(
 	id: string,

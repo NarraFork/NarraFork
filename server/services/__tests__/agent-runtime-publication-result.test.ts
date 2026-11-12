@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages as mailbox,
 	narratorMessages as messages,
@@ -193,7 +193,7 @@ test("snapshot requires committed terminal proof and remains readable after cons
 	);
 	expect(service.readAgentTerminalResult(run)).toEqual({ output: "IMMUTABLE RUN RESULT" });
 	const id = `publication-result:${run.logicalRunId}`;
-	const original = db.select().from(messages).where(eq(messages.id, id)).get()?.contentJson;
+	const original = readTestMessageContent(sqlite, id);
 	db.update(messages)
 		.set({
 			originalContentJson: original,
@@ -239,15 +239,11 @@ test("foreground deferred getter → consume → late commit preserves the actua
 	service.consumeAwaitedTerminal(run, { sourceResultRef: "message:future-source" }); // first receipt wins
 	expect(service.readAgentTerminalResult(run)?.sourceResultRef).toBe("message:foreground-source");
 	snapshot(run, text);
-	const stored = db
-		.select()
-		.from(messages)
-		.where(eq(messages.id, `publication-result:${run.logicalRunId}`))
-		.get();
-	const body = stored?.contentJson as
-		| Array<{ publicationResult?: { sourceResultRef?: string } }>
-		| undefined;
-	const block = body?.[0];
+	const body = readTestMessageContent<{ publicationResult?: { sourceResultRef?: string } }>(
+		sqlite,
+		`publication-result:${run.logicalRunId}`,
+	);
+	const block = body[0];
 	expect(block?.publicationResult?.sourceResultRef).toBe("message:foreground-source");
 	expect(service.readAgentTerminalResult(run)?.output).toContain("Output truncated.");
 });

@@ -6,6 +6,7 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../tests/setup";
+import { bodySql, readBodies } from "../lib/narrator-bodies";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../db")) };
@@ -95,13 +96,16 @@ const rowOf = (messageId: string, kind: string) =>
 		.prepare("SELECT id FROM narrator_blocks WHERE message_id = ? AND kind = ? ORDER BY ordinal")
 		.get(messageId, kind) as { id: string } | null;
 
+/** Protocol emitters receive the logical body, not a rows-only envelope's empty projection. */
 function messageRow(messageId: string) {
 	const row = sqlite
 		.prepare(
-			"SELECT id, narrator_id AS narratorId, role, content_json AS contentJson FROM narrator_messages WHERE id = ?",
+			`SELECT m.id, m.narrator_id AS narratorId, m.role, ${bodySql("m", true)} AS body
+			 FROM narrator_messages m WHERE m.id = ?`,
 		)
-		.get(messageId) as { id: string; narratorId: string; role: string; contentJson: string };
-	return { ...row, contentJson: JSON.parse(row.contentJson) };
+		.get(messageId) as { id: string; narratorId: string; role: string; body: string | null };
+	const { body: _body, ...envelope } = row;
+	return { ...envelope, contentJson: readBodies(sqlite, [row]).get(messageId) };
 }
 
 describe("block ids of streaming items", () => {
@@ -274,17 +278,64 @@ describe("every subscriber gets the block-keyed protocol", () => {
 		}
 	});
 
+	test("real rows-only checkpoints publish the current body under the streamed block id", async () => {
+		const { ws, sent } = openWs();
+		await subscribe(ws, 2);
+		sent.length = 0;
+		broadcastToNarrator("n1", delta("att-ws:0", "Hel"));
+		const opened = sent.find((frame) => frame.type === "block_opened");
+		expect(opened).toMatchObject({ kind: "output", elementId: "att-ws:0" });
+		const blockId = opened?.blockId;
+		expect(blockId).toBeString();
+		if (typeof blockId !== "string") throw new Error("The stream did not open its block");
+
+		const step = await narratorStore.openStep("n1", { uuid: "u", session_id: "s" });
+		for (const revision of [1, 2]) {
+			const item = {
+				type: "text" as const,
+				id: "att-ws:0",
+				text: revision === 1 ? "Hel" : "Hello",
+				revision,
+				completed: revision === 2,
+				outputIndex: 0,
+			};
+			sent.length = 0;
+			await narratorStore.writeStepItem(step.id, "n1", item);
+			expect(
+				sqlite
+					.prepare(
+						"SELECT body_format AS format, body_rows_only AS rowsOnly, content_json AS content FROM narrator_messages WHERE id = ?",
+					)
+					.get(step.id),
+			).toEqual({ format: 2, rowsOnly: 1, content: "[]" });
+			expect(rowOf(step.id, "output")?.id).toBe(blockId);
+			const published = sent.findLast(
+				(frame) => frame.type === "message_upserted" && frame.cause === "message_updated",
+			);
+			if (!published) throw new Error("The real checkpoint did not publish its message");
+			const decoded = withBodies(decodeBlockFrame(published));
+			expect(published).toMatchObject({
+				messages: [expect.objectContaining({ id: step.id, blockIds: [blockId] })],
+				blocks: [expect.objectContaining({ id: blockId, kind: "output", elements: [item] })],
+			});
+			expect(decoded).toMatchObject([
+				{ type: "message_updated", message: { id: step.id, contentJson: [item] } },
+			]);
+		}
+	});
+
 	test("a frame that cannot be built asks the client to reload", async () => {
 		const { ws, sent } = openWs();
 		await subscribe(ws);
 		const input = await narratorStore.appendInput("n1", "hi");
+		const message = messageRow(input.id);
 		sent.length = 0;
 		sqlite.run("ALTER TABLE narrator_blocks RENAME TO narrator_blocks_moved");
 		try {
 			broadcastToNarrator("n1", {
 				type: "message_updated",
 				narratorId: "n1",
-				message: messageRow(input.id),
+				message,
 			});
 		} finally {
 			sqlite.run("ALTER TABLE narrator_blocks_moved RENAME TO narrator_blocks");

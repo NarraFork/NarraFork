@@ -84,6 +84,7 @@ import {
 	requestEvidenceFromLegacyAgent,
 	saveSettings,
 	settings,
+	storageRetentionPatchSchema,
 	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
@@ -107,6 +108,7 @@ import { speechSettingsPatchSchema } from "../lib/validators/speech";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
+import { isApikeyQuotaCapabilityEnabled } from "../services/apikey-quota-plugin-engine";
 import {
 	CodexImageGenerationFixError,
 	disableCodexImageGenerationForPrefix,
@@ -184,6 +186,9 @@ const customApiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
+	quotaSiteUrl: z.string().max(2048).optional(),
+	quotaAccessToken: z.string().max(4096).optional(),
+	quotaUserId: z.string().max(128).optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -622,6 +627,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		storageRetention: storageRetentionPatchSchema.optional(),
 		workspace: z.object({ treeSnapshotsEnabled: z.boolean() }).partial().optional(),
 		outline: z.object({ enabled: z.boolean() }).partial().optional(),
 		narratorBlocks: z
@@ -949,6 +955,9 @@ async function buildSettingsResponse(
 		tokendance: getTokenDanceConnection(),
 		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		providerBalanceGenerations: getProviderBalanceGenerations(),
+		// The capability itself is owned by the apikey-quota plugin, so the provider page needs to
+		// know whether it is on before rendering the site-quota inputs and the balance row.
+		providerBalanceCapability: { enabled: await isApikeyQuotaCapabilityEnabled() },
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -964,6 +973,7 @@ async function buildSettingsResponse(
 		customApiProviders: (source.customApiProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+			quotaAccessToken: p.quotaAccessToken ? maskApiKey(p.quotaAccessToken) : "",
 		})),
 		openaiProviders: (source.openaiProviders ?? []).map((p) => ({
 			...p,
@@ -1663,6 +1673,13 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				if (p.apiKey?.startsWith("*")) {
 					p.apiKey = findExistingCustomApiKey(p.id);
 				}
+				// The site access token is a credential of its own: a masked display value must
+				// keep the stored token instead of overwriting it with the mask.
+				if (p.quotaAccessToken?.startsWith("*")) {
+					p.quotaAccessToken =
+						currentCustomApiProviders.find((candidate) => candidate.id === p.id)
+							?.quotaAccessToken ?? "";
+				}
 			}
 			validated.customApiProviders = normalizedCustomApiProviders;
 			validated.openaiProviders = customApiProvidersToOpenAI(normalizedCustomApiProviders);
@@ -1757,6 +1774,18 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				// Array — replace entirely, don't merge
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				(merged as any)[key] = val;
+			} else if (key === "storageRetention") {
+				const patch = validated.storageRetention;
+				merged.storageRetention = {
+					toolCallPayloads: {
+						...current.storageRetention.toolCallPayloads,
+						...patch?.toolCallPayloads,
+					},
+					messageHistory: {
+						...current.storageRetention.messageHistory,
+						...patch?.messageHistory,
+					},
+				};
 			} else if (key === "speech") {
 				merged.speech = mergeSpeechSettingsPatch(current.speech, val);
 			} else if (key === "proxy") {

@@ -277,8 +277,12 @@ export async function openHost(
 		touch?: boolean;
 		userId?: string;
 		lens?: "facts" | "all";
-		/** No measuring Worker (node sizes measured on the spot). */
+		/** No measuring Worker; uncached nodes keep provisional geometry. */
 		noWorker?: boolean;
+		lang?: "en" | "zh-CN";
+		scheme?: "light" | "dark";
+		/** Page host: open the page as of a commit (the read-only tree). */
+		asOf?: number;
 	} = {},
 ): Promise<MapEditor> {
 	const userId = options.userId ?? h.owner;
@@ -292,6 +296,9 @@ export async function openHost(
 		spaceId: h.space.id,
 		blockId,
 		lens: options.lens ?? "all",
+		...(options.lang ? { lang: options.lang } : {}),
+		...(options.scheme ? { scheme: options.scheme } : {}),
+		...(options.asOf !== undefined ? { asOf: options.asOf } : {}),
 	});
 	if (host === "panel") {
 		await page.waitForFunction(
@@ -302,7 +309,10 @@ export async function openHost(
 		);
 	}
 	const editor = editorOf(page, userId, errors, host);
-	await waitLive(editor);
+	// A page as of a commit is the read-only tree: no live surface to wait for.
+	if (options.asOf !== undefined)
+		await page.waitForSelector("[data-testid=outline-block-tree]", { timeout: 15_000 });
+	else await waitLive(editor);
 	h.mapPages.push(page);
 	return editor;
 }

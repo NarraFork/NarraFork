@@ -148,6 +148,9 @@ function ProjectPage() {
 									view: "all",
 								})
 							}
+							onOpenSession={(narratorId) =>
+								void navigate({ to: "/narrators/$narratorId", params: { narratorId } })
+							}
 						/>
 					</Suspense>
 				</ProjectToolsBoundary>

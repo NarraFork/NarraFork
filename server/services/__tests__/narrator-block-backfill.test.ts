@@ -20,16 +20,24 @@ const { settings } = await import("../../lib/settings");
 const blockSync = await import("../narrator-block-sync");
 const backfill = await import("../narrator-block-backfill");
 const blockIndex = await import("../narrator-block-index");
-const { runBlockBackfillSlice, runBlockVerifySlice, runBlockReindexSlice } = await import(
-	"../../lib/db-worker/block-backfill-query"
-);
+const workerPool = await import("../../lib/db-worker/pool");
+const workerCore = await import("../../lib/db-worker/block-backfill-query");
+const { logger } = await import("../../lib/logger");
+const {
+	runBlockBackfillSlice,
+	runBlockVerifySlice,
+	runBlockReindexSlice,
+	runBlockIndexQueueSlice,
+} = await import("../../lib/db-worker/block-backfill-query");
+const readIndex: import("../narrator-block-index").IndexQueueReader = async (params) =>
+	runBlockIndexQueueSlice(sqlite, params);
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
 const { ensureFts } = await import("../../db/fts");
 ensureFts(sqlite, { wasClean: true });
 
-/** Read slices on the test connection, as the inline fallback does. */
+/** Explicit unit-test reader on the fixture connection; production only uses workers. */
 const inline = {
 	backfill: async (params: Parameters<typeof runBlockBackfillSlice>[1]) =>
 		runBlockBackfillSlice(sqlite, params),
@@ -41,10 +49,10 @@ const inline = {
 
 /** Run the jobs to the end, then write the search text the store and the jobs queued. */
 async function drain(): Promise<number> {
-	await blockIndex.drainBlockIndexQueue();
+	await blockIndex.drainBlockIndexQueue(readIndex);
 	let slices = 0;
 	while (await backfill.runBlockJobSlice(inline)) slices++;
-	await blockIndex.drainBlockIndexQueue();
+	await blockIndex.drainBlockIndexQueue(readIndex);
 	return slices;
 }
 
@@ -93,6 +101,8 @@ const historyRevision = () =>
 	).n;
 
 beforeEach(() => {
+	// Backfill assertions intentionally compare the legacy compatibility projection.
+	settings.narratorBlocks.compactJson = false;
 	cleanDb(sqlite);
 	sqlite.run("INSERT INTO narrators (id, title, created_at, updated_at) VALUES ('n1', 'N', ?, ?)", [
 		NOW,
@@ -371,7 +381,7 @@ describe("block reindex", () => {
 			toolCallId,
 		);
 		// The store queues the search text; the index job writes it.
-		await blockIndex.drainBlockIndexQueue();
+		await blockIndex.drainBlockIndexQueue(readIndex);
 		return step.id;
 	}
 
@@ -501,7 +511,7 @@ describe("block reindex", () => {
 			},
 		};
 		while (await backfill.runBlockJobSlice(racing));
-		await blockIndex.drainBlockIndexQueue();
+		await blockIndex.drainBlockIndexQueue(readIndex);
 		expect(indexed("persimmons")).toHaveLength(1);
 		expect(indexed("cellar")).toEqual([]);
 		expect(indexed("quince")).toHaveLength(1);
@@ -529,7 +539,7 @@ describe("block reindex", () => {
 			},
 		};
 		while (await backfill.runBlockJobSlice(racing));
-		await blockIndex.drainBlockIndexQueue();
+		await blockIndex.drainBlockIndexQueue(readIndex);
 		expect(indexed("medlar")).toHaveLength(1);
 		expect(indexed("jam/quince")).toEqual([]);
 	});
@@ -658,5 +668,148 @@ describe("block reindex", () => {
 			resync: true,
 			blocks: [],
 		});
+	});
+});
+
+const workerFailures: Array<[string, Error]> = [
+	["disabled", new workerPool.WorkersUnavailableError("disabled_by_env")],
+	["zero concurrency", new workerPool.WorkersUnavailableError("concurrency_zero")],
+	["creation failure", new workerPool.WorkersUnavailableError("worker_spawn_failed")],
+	["ready failure", new workerPool.WorkersUnavailableError("worker_unavailable")],
+	["exit", new Error("database worker closed")],
+	["timeout", new workerPool.DbReadTaskTimeoutError("database read task timed out")],
+	["cancel", new Error("database read task aborted")],
+	["pool shutdown", new workerPool.WorkersUnavailableError("pool_shutdown")],
+];
+
+/** No failure category authorizes decoding a slice on the service thread. */
+describe("production block readers fail closed", () => {
+	for (const [job, kind, core] of [
+		["convert", "blockBackfillSlice", "runBlockBackfillSlice"],
+		["verify", "blockVerifySlice", "runBlockVerifySlice"],
+		["reindex", "blockReindexSlice", "runBlockReindexSlice"],
+	] as const) {
+		for (const [failure, error] of workerFailures) {
+			test(`${job}: ${failure} preserves the durable cursor without inline decoding`, async () => {
+				for (const name of ["convert", "verify", "reindex"])
+					sqlite.run(
+						`INSERT INTO narrator_block_backfill (job, cursor, processed, complete, updated_at)
+						 VALUES (?, 17, 3, ?, ?)`,
+						[name, name === job ? 0 : 1, NOW],
+					);
+				sqlite.run(
+					`INSERT INTO narrator_messages
+					 (rowid, id, narrator_id, role, content_json, body_format, created_at)
+					 VALUES (100, 'pending', 'n1', 'user', ?, ?, ?)`,
+					[
+						JSON.stringify([{ type: "text", text: "pending content" }]),
+						job === "convert" ? 1 : 2,
+						NOW,
+					],
+				);
+				const before = sqlite.query("SELECT * FROM narrator_messages WHERE id = 'pending'").get();
+				const read = spyOn(workerPool, "runReadTask").mockRejectedValue(error);
+				const decode = spyOn(workerCore, core);
+				const transactions = spyOn(sqlite, "transaction");
+				try {
+					await expect(backfill.runBlockJobSlice()).rejects.toBe(error);
+					expect(read).toHaveBeenCalledTimes(1);
+					expect(read.mock.calls[0]?.[1]).toMatchObject({ kind, afterRowid: 17 });
+					expect(decode).not.toHaveBeenCalled();
+					expect(transactions).not.toHaveBeenCalled();
+					expect(backfill.blockBackfillStatus()[job]).toMatchObject({
+						cursor: 17,
+						processed: 3,
+						complete: false,
+					});
+					expect(
+						sqlite.query("SELECT * FROM narrator_messages WHERE id = 'pending'").get(),
+					).toEqual(before);
+				} finally {
+					read.mockRestore();
+					decode.mockRestore();
+					transactions.mockRestore();
+				}
+			});
+		}
+	}
+
+	for (const [failure, error] of workerFailures) {
+		test(`index: ${failure} keeps queued work without inline decoding`, async () => {
+			await narratorStore.appendInput("n1", "queued index text");
+			const before = sqlite
+				.query("SELECT * FROM narrator_block_index_queue ORDER BY block_id")
+				.all();
+			expect(before.length).toBeGreaterThan(0);
+			const read = spyOn(workerPool, "runReadTask").mockRejectedValue(error);
+			const decode = spyOn(workerCore, "runBlockIndexQueueSlice");
+			const transactions = spyOn(sqlite, "transaction");
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				await blockIndex.runBlockIndex();
+				expect(read).toHaveBeenCalledTimes(1);
+				expect(read.mock.calls[0]?.[1]).toMatchObject({ kind: "blockIndexQueueSlice" });
+				expect(decode).not.toHaveBeenCalled();
+				expect(transactions).not.toHaveBeenCalled();
+				expect(
+					sqlite.query("SELECT * FROM narrator_block_index_queue ORDER BY block_id").all(),
+				).toEqual(before);
+			} finally {
+				read.mockRestore();
+				decode.mockRestore();
+				transactions.mockRestore();
+				warn.mockRestore();
+				blockIndex.resetBlockIndexForTests();
+			}
+		});
+	}
+
+	test("a failed index slice schedules only a bounded delayed retry", async () => {
+		await narratorStore.appendInput("n1", "retryable index text");
+		const read = spyOn(workerPool, "runReadTask").mockRejectedValue(
+			new workerPool.WorkersUnavailableError("disabled_by_env"),
+		);
+		const timers = spyOn(globalThis, "setTimeout");
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		blockIndex.setBlockIndexAutoRunForTests(true);
+		try {
+			await blockIndex.runBlockIndex();
+			expect(read).toHaveBeenCalledTimes(1);
+			expect(owedForRetry()).toBeGreaterThan(0);
+			expect(timers.mock.calls).toHaveLength(1);
+			expect(timers.mock.calls[0]?.[1]).toBe(30_000);
+		} finally {
+			blockIndex.setBlockIndexAutoRunForTests(false);
+			read.mockRestore();
+			timers.mockRestore();
+			warn.mockRestore();
+			blockIndex.resetBlockIndexForTests();
+		}
+	});
+
+	function owedForRetry(): number {
+		return sqlite.query("SELECT block_id FROM narrator_block_index_queue").all().length;
+	}
+
+	test("the background backfill stops on worker failure with its cursor intact", async () => {
+		const error = new workerPool.WorkersUnavailableError("disabled_by_env");
+		const read = spyOn(workerPool, "runReadTask").mockRejectedValue(error);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			backfill.startBlockBackfill();
+			const deadline = Date.now() + 2_000;
+			while (backfill.blockBackfillStatus().running && Date.now() < deadline) await Bun.sleep(1);
+			expect(backfill.blockBackfillStatus()).toMatchObject({
+				running: false,
+				convert: { cursor: 0, processed: 0, complete: false },
+			});
+			expect(read).toHaveBeenCalledTimes(1);
+			expect(warn).toHaveBeenCalledWith("Block backfill stopped; it resumes at the next start", {
+				error: String(error),
+			});
+		} finally {
+			read.mockRestore();
+			warn.mockRestore();
+		}
 	});
 });

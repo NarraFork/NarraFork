@@ -11,6 +11,7 @@ import { MantineProvider } from "@mantine/core";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
+import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ImageViewerProvider } from "../../../common/ImageViewerProvider";
 import { segmentMessages } from "../../message/message-segments";
@@ -73,13 +74,19 @@ function toolMessage(
 	) as unknown as NarratorMsg;
 }
 
-function renderCard(message: NarratorMsg, withOpener: boolean): Element {
+function renderCard(
+	message: NarratorMsg,
+	withOpener: boolean,
+	options: { outlineAskSlot?: ReactNode; context?: AdapterContext } = {},
+): Element {
 	const segments = segmentMessages([message]) as unknown as AdapterSegment[];
-	const specs = adaptSegments(segments, CTX);
+	const context = options.context ?? CTX;
+	const specs = adaptSegments(segments, context);
 	const spec = specs.find((s) => s.kind === "tool-call" || s.kind === "tool-call-group");
 	if (!spec) throw new Error(`no tool-call spec, got: ${specs.map((s) => s.kind).join(",")}`);
-	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, 800, 5, spec.opts);
+	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, 800, context.lod, spec.opts);
 	const extra = resolveRenderExtra(spec);
+	extra.outlineAskSlot = options.outlineAskSlot;
 	extra.narratorId = "n1";
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
 	const html = renderToStaticMarkup(
@@ -153,6 +160,29 @@ const asked = toolMessage(
 );
 
 describe("the Ask card", () => {
+	it("keeps question calls standalone and open at every LOD, with an effective reader fold", () => {
+		for (const lod of [1, 2, 3, 4, 5] as const) {
+			const context = { ...CTX, lod };
+			const specs = adaptSegments(segmentMessages([asked]) as unknown as AdapterSegment[], context);
+			expect(specs.filter((spec) => spec.kind === "tool-call")).toHaveLength(1);
+			expect(
+				specs.some((spec) => spec.kind === "tool-call-group" || spec.kind === "activity-trace"),
+			).toBe(false);
+			const options = {
+				context,
+				outlineAskSlot: <div data-live-outline-ask>Current question form</div>,
+			};
+			const open = renderCard(asked, true, options);
+			expect(open.querySelectorAll("[data-live-outline-ask]")).toHaveLength(1);
+			// The static question snapshot is REPLACED, not added above the live form.
+			expect(open.textContent).not.toContain("Which format first?");
+			const folded = renderCard(asked, true, {
+				...options,
+				context: { ...context, isExpanded: () => false },
+			});
+			expect(folded.querySelector("[data-live-outline-ask]")).toBeNull();
+		}
+	});
 	it("links each question and the block they are under (whose side panel answers them)", () => {
 		mountAt("https://nf.example.com/nf/");
 		const root = renderCard(asked, true);

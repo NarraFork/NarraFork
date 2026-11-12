@@ -409,7 +409,7 @@ function RenderMeasuredToolRun({
 }: RenderToolRunProps & { bodyHeightReporters?: ReadonlyMap<string, (height: number) => void> }) {
 	if (measured.itemCount === 0) return null;
 	const { header, toggle, rows, variant } = measured;
-	const headerColor = variantHeaderColor(variant);
+	const headerColor = header.failureCount ? "red" : variantHeaderColor(variant);
 
 	return (
 		<div style={{ position: "relative", width: measured.contentWidth, height: measured.height }}>
@@ -493,6 +493,11 @@ function RenderMeasuredToolRun({
 						{toggle.showEarlier
 							? (labels.hideEarlier ?? "Hide earlier")
 							: (labels.showEarlier?.(toggle.hiddenCount) ?? `Show ${toggle.hiddenCount} earlier`)}
+						{!toggle.showEarlier && toggle.failureCount ? (
+							<span style={{ color: "var(--mantine-color-red-text)" }}>
+								{` · ${toggle.failureCount} ${labels.statusMark?.failed ?? "failed"}`}
+							</span>
+						) : null}
 					</p>
 				</div>
 			) : null}
@@ -1038,7 +1043,11 @@ function TraceRowView({
 				<CategoryChip
 					data-trace-row-chip
 					size={TRACE_ROW_ICON}
-					color={row.iconColor ?? categoryColor(row.category)}
+					color={
+						row.cardKind === "auxiliary-content"
+							? categoryColor(row.category)
+							: (row.iconColor ?? categoryColor(row.category))
+					}
 				>
 					{icon}
 				</CategoryChip>

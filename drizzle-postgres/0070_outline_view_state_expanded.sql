@@ -1,0 +1,1 @@
+ALTER TABLE "outline_view_state" ADD COLUMN "expanded_json" text;

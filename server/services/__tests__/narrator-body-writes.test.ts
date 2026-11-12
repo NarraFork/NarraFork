@@ -24,7 +24,9 @@ const session = await import("../narrator-session");
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
+const { settings } = await import("../../lib/settings");
 beforeEach(() => {
+	settings.narratorBlocks.compactJson = false;
 	cleanDb(sqlite);
 	for (const id of ["n1", "n2"])
 		sqlite.run("INSERT INTO narrators (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)", [

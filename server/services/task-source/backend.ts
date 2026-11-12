@@ -94,14 +94,61 @@ export async function readTaskBackend(narratorId: string): Promise<TaskBackend> 
 	return (await readTaskSession(narratorId))?.backend ?? "spec";
 }
 
+/** Sessions whose Dynamic Spec is being imported into the outline right now, and when it ends. */
+const specImports = hotSafe(
+	"narrafork.taskBackend.specImports",
+	() => new Map<string, Promise<void>>(),
+);
+
+/**
+ * Mark a session as being imported (outline P2 PR 12b, `outline/spec-import`): until the returned
+ * function is called, Dynamic Spec writes to it are refused (`SPEC_IMPORT_IN_PROGRESS`), and a
+ * plugin's command waits for the end ({@link waitForSpecImport}). One import per session at a
+ * time: the importer does not start a second.
+ */
+export function beginSpecImport(narratorId: string): () => void {
+	let end: () => void = () => {};
+	const done = new Promise<void>((resolve) => {
+		end = resolve;
+	});
+	specImports.set(narratorId, done);
+	return () => {
+		if (specImports.get(narratorId) === done) specImports.delete(narratorId);
+		end();
+	};
+}
+
+export function isSpecImporting(narratorId: string): boolean {
+	return specImports.has(narratorId);
+}
+
+/**
+ * Wait until the session's import ended, at most `maxMs`: a plugin's command then goes where the
+ * session's tasks are by then (Dynamic Spec still, or the outline). Returns at once when none runs.
+ */
+export async function waitForSpecImport(narratorId: string, maxMs = 10_000): Promise<void> {
+	const running = specImports.get(narratorId);
+	if (!running) return;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	await Promise.race([
+		running,
+		new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, maxMs);
+			timer.unref?.();
+		}),
+	]);
+	if (timer) clearTimeout(timer);
+}
+
 /**
  * Refuse a Dynamic Spec write for an outline session: it would land where neither the session
  * nor its continuation look. An outline session's behavior boundary is the behavior page of its
  * session space (outline plan PR 4), so its old `behavior_fence` takes one writer only: the
- * plugin-SOP channel (`pluginSop`: a plugin's SOP command, or the import that moved the rest of
- * the fence into the page), until plugins write blocks (plan PR 12). The person (the Spec panel)
- * and the agent are refused like any other spec write. `path` is the normalized spec path
- * (`tasks.json`, `index.md`, …; empty for the whole namespace).
+ * plugin-SOP channel (`pluginSop`: a plugin's SOP command on a subagent's own fence, the import
+ * that moved the rest of the fence into the page, and the move of an old SOP to the plugin's block
+ * on the page, outline P2 PR 12a). The person (the Spec panel) and the agent are refused like any
+ * other spec write. `path` is the normalized spec path (`tasks.json`, `index.md`, …; empty for
+ * the whole namespace).
  */
 export async function assertSpecWritable(
 	narratorId: string,
@@ -109,6 +156,9 @@ export async function assertSpecWritable(
 	options: { pluginSop?: boolean } = {},
 ): Promise<void> {
 	if (path === "behavior_fence" && options.pluginSop === true) return;
+	// The import reads the session's Dynamic Spec and moves the session only when what it read is
+	// still what is there: a write in between would be left behind (outline P2 PR 12b).
+	if (specImports.has(narratorId)) throw catalogError("SPEC_IMPORT_IN_PROGRESS");
 	await assertSpecTasksUsed(narratorId);
 }
 

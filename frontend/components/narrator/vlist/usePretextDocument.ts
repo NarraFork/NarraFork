@@ -1,5 +1,6 @@
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { narratorLoadingMetrics } from "@frontend/lib/narrator-loading-metrics";
+import type { PlanTreeView } from "@shared/outline-plan-tree";
 import type {
 	PretextLayoutAnchor,
 	PretextLayoutIndex,
@@ -44,11 +45,14 @@ export interface PretextDocumentView {
 }
 
 export interface UsePretextDocumentOptions {
+	compactAuxiliaryContent?: boolean;
 	enabled?: boolean;
 	/** DOM readiness is separate from coordinator lifetime: parked panes keep their input. */
 	layoutReady?: boolean;
 	/** Keep the trailing empty reasoning live while the narrator is active. */
 	keepEmptyReasoningLive?: boolean;
+	/** Whether the latest tasks.json call may be pinned (see `buildPretextDocumentLayout`). */
+	pinLatestSpecTasks?: boolean;
 	/**
 	 * A subagent page treats its own (parent-pointing) messages as top-level, which
 	 * decides whether an arriving child message may be appended locally.
@@ -90,6 +94,8 @@ export interface UsePretextDocumentOptions {
 	isPromptOpen?: (key: string) => boolean;
 	/** Reader expanded a subagent card's file-change list (its own fold). */
 	isFileChangesOpen?: (key: string) => boolean;
+	/** The reader's view of an outline plan card's tree (undefined: the overview). */
+	planTreeView?: (key: string) => PlanTreeView | undefined;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;
@@ -117,6 +123,7 @@ export interface UsePretextDocumentOptions {
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
 	/**
 	 * First-frame layout / painted height of a live InlinePermission form. Both
 	 * change identity when their inputs do (a request arriving, a form reporting a new
@@ -389,6 +396,7 @@ export function usePretextDocument(
 	const buildOptions = useMemo<PretextLayoutBuildOptions>(
 		() => ({
 			lod: options.lod,
+			compactAuxiliaryContent: options.compactAuxiliaryContent,
 			keepEmptyReasoningLive: options.keepEmptyReasoningLive,
 			isSubagent: options.isSubagent,
 			widthBucket: options.widthBucket,
@@ -407,6 +415,7 @@ export function usePretextDocument(
 			showOriginal: options.showOriginal,
 			isPromptOpen: options.isPromptOpen,
 			isFileChangesOpen: options.isFileChangesOpen,
+			planTreeView: options.planTreeView,
 			recentMessageIds: options.recentMessageIds,
 			resolveRecentMessageIds: options.resolveRecentMessageIds,
 			labels: options.labels,
@@ -418,8 +427,10 @@ export function usePretextDocument(
 			canOfferProviderFix: options.canOfferProviderFix,
 			canOfferModelTest: options.canOfferModelTest,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
+			resolveQuestionStatus: options.resolveQuestionStatus,
 			resolvePermissionFormPrediction: options.resolvePermissionFormPrediction,
 			resolvePermissionFormHeight: options.resolvePermissionFormHeight,
+			pinLatestSpecTasks: options.pinLatestSpecTasks,
 			// ⚠️ No `latestSpecTasksToolUseId` here, deliberately. The pinned tasks card
 			// is resolved by `buildPretextDocumentLayout` from the exact message list it
 			// lays out, so it needs no build option and cannot go stale: every event that
@@ -435,11 +446,14 @@ export function usePretextDocument(
 		}),
 		[
 			options.keepEmptyReasoningLive,
+			// An outline session's backend arriving unpins its old tasks card: a structural change.
+			options.pinLatestSpecTasks,
 			options.isSubagent,
 			options.bottomPadding,
 			// The preference changes the item list. The breakpoint here is already
 			// settled; its live value belongs to the bounded preview, not this build.
 			options.showTokenUsage,
+			options.compactAuxiliaryContent,
 			options.compactUsageLines,
 			options.formatUsageNumber,
 			options.contentWidth,
@@ -472,6 +486,7 @@ export function usePretextDocument(
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,
+			options.resolveQuestionStatus,
 			// The live form's reserve: a new request (prediction) and a new painted height
 			// both change a card's height, so each must rebuild the document.
 			options.resolvePermissionFormPrediction,
@@ -503,6 +518,8 @@ export function usePretextDocument(
 			// Same contract: expanding a file list draws more rows, so the resolver
 			// identity must move with the set or the list never expands.
 			options.isFileChangesOpen,
+			// Opening a node of an outline plan card draws more rows: same contract.
+			options.planTreeView,
 			options.topPadding,
 			options.viewportHeight,
 			options.widthBucket,

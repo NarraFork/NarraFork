@@ -19,6 +19,7 @@ export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
 export type {
 	OutlinePlanPromptReview,
 	OutlinePlanPromptRoot,
+	OutlinePlanStructureProblem,
 	OutlinePlanSubmitProblem,
 } from "./prompts/outline-plan";
 export {
@@ -41,6 +42,8 @@ export type {
 	OutlineTaskPromptTask,
 	OutlineTasksViewSection,
 	OutlineTaskWaitText,
+	OutlineTeamAssignedEntry,
+	OutlineTeamUnblockedEntry,
 	OutlineViewAgent,
 	OutlineViewTask,
 } from "./prompts/outline-tasks";
@@ -66,6 +69,7 @@ export {
 	getOutlineTasksViewHeading,
 	getOutlineTasksViewMore,
 	getOutlineTasksViewSection,
+	getOutlineTeamEventsNote,
 	getOutlineTurnEndNote,
 	getOutlineViewDelegatedLine,
 	getOutlineViewTaskLine,

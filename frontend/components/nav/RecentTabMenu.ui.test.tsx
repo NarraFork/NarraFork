@@ -6,6 +6,8 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import { MantineProvider } from "@mantine/core";
 import {
 	defaultScheduler,
@@ -15,12 +17,16 @@ import {
 } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
-import { act, type ReactNode } from "react";
+import { act, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import commonEn from "../../locales/en/common.json";
 import navEn from "../../locales/en/nav.json";
-import { type RecentTabCardActions, RecentTabDetailCard } from "./RecentTabDetailCard";
+import {
+	type RecentTabCardActions,
+	RecentTabDetailCard,
+	useRecentTabHoverEnabled,
+} from "./RecentTabDetailCard";
 import { RecentTabPinDivider, TabContextMenu, type TabContextMenuProps } from "./RecentTabMenu";
 import { createRecentTabHoverStore, RECENT_TAB_HOVER_SHOW_DELAY_MS } from "./recent-tab-hover";
 
@@ -52,21 +58,49 @@ let root: Root | null = null;
 let container: HTMLElement | null = null;
 let client: QueryClient;
 const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
+const mediaQueries = new Map<
+	string,
+	{ matches: boolean; listeners: Set<(event: { matches: boolean }) => void> }
+>();
+
+function setMediaMatches(query: string, matches: boolean) {
+	let media = mediaQueries.get(query);
+	if (!media) {
+		media = { matches, listeners: new Set() };
+		mediaQueries.set(query, media);
+	}
+	media.matches = matches;
+	for (const listener of media.listeners) listener({ matches });
+}
 
 beforeEach(() => {
 	const previous = new Map(
 		DOM_KEYS.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
 	);
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	mediaQueries.clear();
 	Object.assign(window, {
 		innerWidth: 1200,
 		innerHeight: 800,
-		matchMedia: (query: string) => ({
-			matches: false,
-			media: query,
-			addEventListener() {},
-			removeEventListener() {},
-		}),
+		matchMedia: (query: string) => {
+			let media = mediaQueries.get(query);
+			if (!media) {
+				media = { matches: false, listeners: new Set() };
+				mediaQueries.set(query, media);
+			}
+			return {
+				get matches() {
+					return media.matches;
+				},
+				media: query,
+				addEventListener(_name: string, listener: (event: { matches: boolean }) => void) {
+					media.listeners.add(listener);
+				},
+				removeEventListener(_name: string, listener: (event: { matches: boolean }) => void) {
+					media.listeners.delete(listener);
+				},
+			};
+		},
 	});
 	const values: Record<string, unknown> = {
 		window,
@@ -196,6 +230,139 @@ function menuProps(overrides: Partial<TabContextMenuProps> = {}): TabContextMenu
 		...overrides,
 	};
 }
+
+// Exercise the same responsive gate used by RecentTabList without mounting its
+// unrelated router, drag/drop, pagination and websocket dependencies.
+function ResponsiveHover({ store }: { store: ReturnType<typeof createRecentTabHoverStore> }) {
+	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
+	const enabled = useRecentTabHoverEnabled(store, isTouch);
+	const hover = enabled ? store : null;
+	const [menuOpen, setMenuOpen] = useState(false);
+	return (
+		<>
+			<button
+				type="button"
+				data-hover-row
+				onPointerEnter={(event) => {
+					if (event.pointerType === "mouse") {
+						hover?.enter("narrator:n1", () => ({ top: 0, bottom: 20, left: 0, right: 200 }));
+					}
+				}}
+				onContextMenu={(event) => {
+					event.preventDefault();
+					store.hide();
+					setMenuOpen(true);
+				}}
+			>
+				{tab.title}
+			</button>
+			{enabled && <RecentTabDetailCard store={store} tabs={[tab]} />}
+			{menuOpen && <TabContextMenu {...menuProps({ detailsTab: enabled ? null : tab })} />}
+		</>
+	);
+}
+
+function hoverFixture() {
+	let id = 0;
+	const timers = new Map<number, () => void>();
+	const store = createRecentTabHoverStore({
+		setTimeout(callback) {
+			const timer = ++id;
+			timers.set(timer, callback);
+			return timer;
+		},
+		clearTimeout(handle) {
+			timers.delete(handle as number);
+		},
+	});
+	return {
+		store,
+		timers,
+		flush() {
+			for (const [timer, callback] of [...timers]) {
+				timers.delete(timer);
+				callback();
+			}
+		},
+	};
+}
+
+async function enterMouseRow() {
+	await act(async () => {
+		const event = new Event("pointerover", { bubbles: true });
+		Object.assign(event, { pointerType: "mouse" });
+		container?.querySelector("[data-hover-row]")?.dispatchEvent(event);
+	});
+}
+
+function visibleDetails() {
+	return container?.ownerDocument.querySelector('[data-recent-tab-details="narrator:n1"]');
+}
+
+describe("responsive recent-tab hover gate", () => {
+	test("wide mouse viewports still show the hover details", async () => {
+		const hover = hoverFixture();
+		await render(<ResponsiveHover store={hover.store} />);
+		await enterMouseRow();
+		expect(hover.timers.size).toBe(1);
+		await act(async () => hover.flush());
+		expect(visibleDetails()).not.toBeNull();
+	});
+
+	test("narrow mouse viewports skip hover but keep details in the explicit row menu", async () => {
+		setMediaMatches(MOBILE_VIEWPORT_MEDIA_QUERY, true);
+		const hover = hoverFixture();
+		await render(<ResponsiveHover store={hover.store} />);
+		await enterMouseRow();
+		expect(hover.timers.size).toBe(0);
+		expect(hover.store.getSnapshot()).toBeNull();
+		expect(visibleDetails()).toBeNull();
+		await act(async () => {
+			container
+				?.querySelector("[data-hover-row]")
+				?.dispatchEvent(new Event("contextmenu", { bubbles: true }));
+		});
+		expect(visibleDetails()?.textContent).toContain(tab.subtitle);
+	});
+
+	test("shrinking hides an open card immediately and widening does not revive it", async () => {
+		const hover = hoverFixture();
+		await render(<ResponsiveHover store={hover.store} />);
+		await enterMouseRow();
+		await act(async () => hover.flush());
+		expect(visibleDetails()).not.toBeNull();
+		await act(async () => setMediaMatches(MOBILE_VIEWPORT_MEDIA_QUERY, true));
+		expect(visibleDetails()).toBeNull();
+		expect(hover.store.getSnapshot()).toBeNull();
+		await act(async () => setMediaMatches(MOBILE_VIEWPORT_MEDIA_QUERY, false));
+		expect(visibleDetails()).toBeNull();
+		await enterMouseRow();
+		await act(async () => hover.flush());
+		expect(visibleDetails()).not.toBeNull();
+	});
+
+	test("shrinking cancels a pending show timer even if widened before it would fire", async () => {
+		const hover = hoverFixture();
+		await render(<ResponsiveHover store={hover.store} />);
+		await enterMouseRow();
+		expect(hover.timers.size).toBe(1);
+		await act(async () => setMediaMatches(MOBILE_VIEWPORT_MEDIA_QUERY, true));
+		expect(hover.timers.size).toBe(0);
+		await act(async () => setMediaMatches(MOBILE_VIEWPORT_MEDIA_QUERY, false));
+		await act(async () => hover.flush());
+		expect(hover.store.getSnapshot()).toBeNull();
+		expect(visibleDetails()).toBeNull();
+	});
+
+	test("touch stays hover-free even in a wide viewport with a mouse event", async () => {
+		setMediaMatches(TOUCH_POINTER_MEDIA_QUERY, true);
+		const hover = hoverFixture();
+		await render(<ResponsiveHover store={hover.store} />);
+		await enterMouseRow();
+		expect(hover.timers.size).toBe(0);
+		expect(visibleDetails()).toBeNull();
+	});
+});
 
 describe("touch access to the details a row no longer shows", () => {
 	test("the touch menu starts with the full path, counts and viewers", async () => {

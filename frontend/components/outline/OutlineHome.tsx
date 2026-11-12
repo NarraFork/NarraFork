@@ -29,6 +29,7 @@ import {
 } from "../../hooks/useOutline";
 import { formatSmartTime } from "../../lib/format";
 import { readOutlineRecents } from "../../lib/outline-recents";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
@@ -71,7 +72,7 @@ function SpaceCard({ space }: { space: OutlineSpaceSummary }) {
 
 /** `header`: the host's entry above the title (the outline route's reports entry). */
 export function OutlineHome({ header }: { header?: ReactNode } = {}) {
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const { mutate: ensurePersonal } = useEnsurePersonalOutlineSpace();
 	const ensured = useRef(false);
 	useEffect(() => {
@@ -171,7 +172,8 @@ export function OutlineHome({ header }: { header?: ReactNode } = {}) {
 							>
 								<Group justify="space-between" wrap="nowrap" gap="xs">
 									<Text size="sm" className={classes.ellipsis}>
-										{recent.title}
+										{/* Stored as written; a report container's line is decoded when shown. */}
+										{reportLineDisplay(recent.title, { t, locale: i18n?.language }) ?? recent.title}
 									</Text>
 									<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 										{formatSmartTime(new Date(recent.visitedAt).toISOString())}

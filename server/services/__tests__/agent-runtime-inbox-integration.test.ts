@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import { eq } from "drizzle-orm";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
@@ -228,7 +228,15 @@ function state(id: string) {
 		.get();
 }
 function childMessages() {
-	return db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, "child")).all();
+	return db
+		.select()
+		.from(narratorMessages)
+		.where(eq(narratorMessages.narratorId, "child"))
+		.all()
+		.map((message) => ({
+			...message,
+			contentJson: readTestMessageContent(sqlite, message.id),
+		}));
 }
 
 test("consumes a pre-media positional projection from a persisted user queue", async () => {
@@ -1029,6 +1037,7 @@ for (const narratorId of ["parent", "child"] as const) {
 					.where(eq(narratorMessages.id, required(part.messageId)))
 					.get(),
 			);
+			message.contentJson = readTestMessageContent(sqlite, message.id);
 			expect(message.narratorId).toBe(narratorId);
 			expect(message.parentToolUseId).toBe(subagent?.parentToolUseId ?? null);
 			expect(part.text).toBe(projectMessageSenderText(message, message.contentText ?? ""));

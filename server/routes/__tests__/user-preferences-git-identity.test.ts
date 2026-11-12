@@ -119,6 +119,60 @@ describe("git identity visibility preferences", () => {
 	});
 });
 
+describe("recent tabs directory visibility preferences", () => {
+	beforeEach(() => {
+		cleanDb(sqlite);
+		seedUsers();
+		actingUserId = "user-a";
+	});
+
+	afterEach(() => {
+		cleanDb(sqlite);
+	});
+
+	it("没有偏好行及首次写入无关字段时默认关闭", async () => {
+		expect((await getPrefs()).recentTabsShowDirectory).toBe(false);
+		expect((await patchPrefs({ language: "en" })).recentTabsShowDirectory).toBe(false);
+		expect((await getPrefs()).recentTabsShowDirectory).toBe(false);
+	});
+
+	it("首次写入 true、无关 PATCH 保留、显式 false 均持久化", async () => {
+		expect((await patchPrefs({ recentTabsShowDirectory: true })).recentTabsShowDirectory).toBe(
+			true,
+		);
+		expect((await getPrefs()).recentTabsShowDirectory).toBe(true);
+		expect((await patchPrefs({ language: "zh-CN" })).recentTabsShowDirectory).toBe(true);
+		expect((await getPrefs()).recentTabsShowDirectory).toBe(true);
+		expect((await patchPrefs({ recentTabsShowDirectory: false })).recentTabsShowDirectory).toBe(
+			false,
+		);
+		expect((await getPrefs()).recentTabsShowDirectory).toBe(false);
+	});
+
+	it("不同账号的开关互相隔离", async () => {
+		await patchPrefs({ recentTabsShowDirectory: true });
+		actingUserId = "user-b";
+		expect((await getPrefs()).recentTabsShowDirectory).toBe(false);
+		await patchPrefs({ recentTabsShowDirectory: false });
+		actingUserId = "user-a";
+		expect((await getPrefs()).recentTabsShowDirectory).toBe(true);
+		expect(db.select().from(userPreferences).all()).toHaveLength(2);
+	});
+
+	it.each(
+		["true", 1, null, [], {}].map((value) => ({ value })),
+	)("拒绝非布尔值 %j 且保留原值", async ({ value }) => {
+		await patchPrefs({ recentTabsShowDirectory: true });
+		const response = await app.request("/user-preferences", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ recentTabsShowDirectory: value }),
+		});
+		expect(response.status).toBe(400);
+		expect((await getPrefs()).recentTabsShowDirectory).toBe(true);
+	});
+});
+
 describe("folder git identity endpoints", () => {
 	beforeEach(() => {
 		cleanDb(sqlite);

@@ -332,6 +332,7 @@ export const settingsApi = {
 			replyInUserLanguage: boolean;
 			showTokenUsage: boolean;
 			showOutputStats: boolean;
+			compactAuxiliaryContent: boolean;
 			terminalTheme: string;
 			terminalFontSize: number;
 			/** Narrator transcript typography, as percentages of the built-in defaults. */
@@ -344,6 +345,7 @@ export const settingsApi = {
 			 */
 			narratorLineHeightV2Percent: number;
 			narratorParagraphScalePercent: number;
+			recentTabsShowDirectory: boolean;
 			addSubagentToRecentTabs: boolean;
 			// Notification preferences
 			notifyOnDone: boolean;
@@ -411,12 +413,14 @@ export const settingsApi = {
 		replyInUserLanguage?: boolean;
 		showTokenUsage?: boolean;
 		showOutputStats?: boolean;
+		compactAuxiliaryContent?: boolean;
 		terminalTheme?: string;
 		terminalFontSize?: number;
 		narratorFontScalePercent?: number;
 		narratorLetterSpacingPercent?: number;
 		narratorLineHeightV2Percent?: number;
 		narratorParagraphScalePercent?: number;
+		recentTabsShowDirectory?: boolean;
 		addSubagentToRecentTabs?: boolean;
 		// Notification preferences
 		notifyOnDone?: boolean;

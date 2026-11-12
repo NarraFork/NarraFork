@@ -48,6 +48,7 @@ test("unported methods still fail closed once the PG port is bound", async () =>
 		copyRefs: unavailable,
 		page: unavailable,
 		creator: unavailable,
+		lastServedProvider: unavailable,
 	};
 	bindNarratorMessageRefs({ backend: "postgres", port });
 	await expect(narratorPersistence.isMessageSharedByMultipleNarrators("any")).rejects.toThrow(

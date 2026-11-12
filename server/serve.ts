@@ -15,7 +15,7 @@ import { logger } from "./lib/logger";
 import { resolveManagerListenHost } from "./lib/manager-control-server";
 import { readManagerToken } from "./lib/manager-token";
 import { resolveListenHost } from "./lib/net/listen-host";
-import { isCompiledRuntime } from "./lib/runtime-target";
+import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "./lib/runtime-target";
 import {
 	closeStartupStatus,
 	expectStartupViewer,
@@ -61,12 +61,13 @@ export async function serve(): Promise<void> {
  * Starting the app a second time is how people get back to it, so when the instance holding the
  * lock answers on the configured address, open that instead of reporting a conflict.
  *
- * Only for the compiled app run by a person: someone running from source wants to know a second
- * server did not start, and the Windows manager handles a lock conflict itself (it waits for the
+ * Only for the released compiled app: source and locally compiled launches must
+ * report that the new version did not start. The Windows manager handles a conflict (it waits for the
  * holder to exit, then retries), which needs the conflict reported, not a quiet exit 0.
  */
 async function openRunning(settings: Settings, statusPageListening: boolean): Promise<boolean> {
-	if (!isCompiledRuntime() || process.env.NARRAFORK_MANAGER_MANAGED === "1") return false;
+	if (!isCompiledRuntime() || IS_LOCAL_RUNTIME || process.env.NARRAFORK_MANAGER_MANAGED === "1")
+		return false;
 	// Our own status page holds the configured address, so the holder is elsewhere. Keep the page:
 	// it is where an open browser reads why this start failed.
 	if (statusPageListening) return false;

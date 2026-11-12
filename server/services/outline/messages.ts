@@ -133,6 +133,17 @@ export const OUTLINE_TEXT = {
 	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",
 	/** Summary of the commit that copies the behavior page into a fork. */
 	behaviorForkSummary: (from: string) => `copied the behavior page from session ${from}`,
+	/** Summaries of a plugin's commits for a session (`plugin-tasks.ts`, outline P2 PR 12a). */
+	pluginTaskAdded: (pluginId: string) => `plugin ${pluginId} added a task`,
+	pluginTaskStatus: (pluginId: string, address: string, status: string) =>
+		`plugin ${pluginId} set ${address} to ${status}`,
+	pluginTasksWritten: (pluginId: string) =>
+		`plugin ${pluginId} wrote its task list (spec://tasks.json)`,
+	pluginIndexWritten: (pluginId: string) => `plugin ${pluginId} wrote index.md (spec://index.md)`,
+	pluginRulesSet: (pluginId: string) => `plugin ${pluginId} updated its rules on this page`,
+	pluginRulesCleared: (pluginId: string) => `plugin ${pluginId} cleared its rules on this page`,
+	pluginSopMoved: (pluginId: string) =>
+		`moved plugin ${pluginId}'s rules from the old behavior fence (spec://behavior_fence) into this page`,
 } as const;
 
 export type OutlineRevertSkipReason = keyof typeof OUTLINE_TEXT.revertSkipped;
@@ -287,6 +298,15 @@ export const OUTLINE_TOOL_TEXT = {
 			`${n} more link targets were kept as written without resolving them`,
 		tooManyAliases: (prefix: string) =>
 			`the space has too many aliases starting with ${prefix} to number the next one; give the alias explicitly`,
+		/** An agent's hand-over ended the work on a task in progress (`write.ts`, `handed-over`). */
+		handedOver: (address: string) =>
+			`${address} was in progress and got a new assignee: it is back to to-do, so whoever takes it up claims it afresh`,
+		/** `@agent:name` names no session: written as a name, nobody is told. */
+		assigneeUnknown: (name: string) =>
+			`no session has the id or handle ${quoted(name)}: @agent:${name} was written as a label only. Nobody is told and nothing changes hands: a task of yours that is in progress is still in progress and still yours`,
+		/** `@agent:name` names a session that could not do the task. */
+		assigneeCannotWork: (name: string) =>
+			`the session @agent:${name} names cannot work in this space (it is archived, or the person it works for may not write here); nothing was written`,
 		taskPropsIgnored: (n: number) =>
 			`edit ${n}: depends:: and due:: belong to tasks and were left out on a block without a checkbox`,
 		samePageTitle: (title: string, addresses: readonly string[]) =>
@@ -357,6 +377,41 @@ export const OUTLINE_TOOL_TEXT = {
 		set: (sid: string, parts: readonly string[]) => `set [${sid}]: ${parts.join(", ")}`,
 		notesHeader: "Notes:",
 		hintsHeader: "Hints:",
+		/**
+		 * The note rules (`@shared/outline-note-structure`): what a call writes under a task. A
+		 * block is named `[id]` once written, and by its edit and first words when nothing was.
+		 */
+		noteRules: {
+			warnHeader:
+				"Note format: written, but under a task write conclusion → evidence → detail (a task folds to its title and one line). Restructure these with OutlineEdit:",
+			refusedHeader:
+				"Nothing was written: what this call writes under a task is far over the note limits. Under a task write conclusion → evidence → detail (a task folds to its title and one line):",
+			written: (id: string) => `[${id}]`,
+			unwritten: (n: number, excerpt: string) => `edit ${n}, the block starting «${excerpt}»`,
+			longTitle: (at: string, chars: number, lines: number, limit: number) =>
+				`${at} (a task's title) has ${chars} characters${lines > 1 ? ` on ${lines} lines` : ""}: a title is one line (at most ${limit} characters) saying what done means; put the rest in blocks under it.`,
+			longNote: (at: string, chars: number, limit: number) =>
+				`${at} has ${chars} characters directly under a task: a block there is read as one line (at most ${limit} characters) — a conclusion, or what a description or a brief opens with. Keep that line as the block's text and put the rest (the evidence, the details, the body of the brief) in blocks under it (indented items).`,
+			longDetail: (at: string, chars: number, limit: number) =>
+				`${at} has ${chars} characters: evidence or a detail is at most ${limit} characters; split it into several blocks, or put the finer parts under it.`,
+			flat: (at: string, children: number, limit: number, task: boolean) =>
+				`${at} gets ${children} blocks directly under it in this call: at most ${limit} on one level; ${task ? "group them under a few conclusions (subtasks under phases)" : "group them"}.`,
+			heading: (at: string) =>
+				`${at} is a heading under a task: make it a one-line conclusion (no #) and indent what follows under it; under a task the levels are the indentation.`,
+			more: (n: number) => `${n} more like these.`,
+			/** The refusal's last line: what happened to the rest, and what to do. */
+			refusedRecover:
+				"Send the call again with those blocks restructured; nothing of the call was written, and the rest of it was not checked further.",
+			/** A task ticked done or cancelled with no note under it. */
+			noResult: (id: string, cancelled: boolean, before: string | null, heading: string | null) =>
+				`[${id}] is ${cancelled ? "cancelled" : "done"} with ${heading ? `a heading ([${heading}]) where its result should be, so folded it shows that label` : "no result under it, so folded it shows only its title"}: add one line saying ${cancelled ? "why it was cancelled" : "what came of it"} as its first block ({ add: "${id}", markdown: "- …"${before ? `, before: "${before}"` : ""} }).`,
+			tidyLong: (id: string, blocks: readonly string[], more: number, limit: number) =>
+				`under the finished task [${id}], ${blocks.join(", ")}${more > 0 ? ` and ${more} more` : ""} ${blocks.length + more === 1 ? "is" : "are"} longer than a conclusion (at most ${limit} characters): compress each into one line with its evidence in blocks under it, and delete what only records the process.`,
+			tidyBlock: (id: string, chars: number | null) =>
+				chars === null ? `[${id}]` : `[${id}] (${chars} characters)`,
+			tidyFlat: (id: string, notes: number, more: boolean, limit: number) =>
+				`the finished task [${id}] has ${more ? `more than ${notes}` : notes} notes directly under it (at most ${limit} on one level): gather them under a few conclusions, the result first.`,
+		},
 		/** An edit some of whose operations were held for confirmation. */
 		heldEdit: (n: number, what: string, all: boolean) =>
 			`${n}. ${all ? "held for confirmation" : "held in part for confirmation"}: ${what}`,

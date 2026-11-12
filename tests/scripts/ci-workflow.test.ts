@@ -152,6 +152,35 @@ describe("generic CI workflow", () => {
 		}
 	});
 
+	test("keeps local mirror selection in Bun config rather than lockfile tarball URLs", () => {
+		for (const directory of ["", "vscode-extension"]) {
+			const config = Bun.TOML.parse(
+				readFileSync(join(repository, directory, "bunfig.toml"), "utf8"),
+			) as { install: { registry: string } };
+			expect(config.install.registry).toBe("https://registry.npmmirror.com");
+			expect(readFileSync(join(repository, directory, "bun.lock"), "utf8")).not.toMatch(
+				/https:\/\/registry\.(?:npmmirror\.com|npmjs\.org)\//,
+			);
+		}
+	});
+
+	test("uses the official registry for every GitHub Bun install step", () => {
+		for (const file of new Bun.Glob(".github/workflows/*.yml").scanSync({ cwd: repository })) {
+			const value = Bun.YAML.parse(readFileSync(join(repository, file), "utf8")) as Workflow;
+			for (const [id, job] of Object.entries(value.jobs)) {
+				for (const step of job.steps ?? []) {
+					if (!/\bbun install\b/.test(step.run ?? "")) continue;
+					expect(
+						step.env?.BUN_CONFIG_REGISTRY ??
+							job.env?.BUN_CONFIG_REGISTRY ??
+							value.env?.BUN_CONFIG_REGISTRY,
+						`${file}:${id}:${step.name ?? step.run}`,
+					).toBe("https://registry.npmjs.org");
+				}
+			}
+		}
+	});
+
 	test("installs the packageManager Bun version with the frozen lockfile before any check", () => {
 		expect(packageManager).toBe("bun@1.4.3");
 		for (const id of ["static-checks", "build", "tests"]) {
@@ -370,6 +399,38 @@ describe("generic CI workflow", () => {
 		expect(job("tests").steps.indexOf(download)).toBeLessThan(
 			job("tests").steps.indexOf(verifyDownload),
 		);
+	});
+
+	test("uses an independently hosted signed Ubuntu mirror before installing test dependencies", () => {
+		const dependencies = step("tests", (value) => !!value.run?.includes("apt-get install"));
+		const script = dependencies.run ?? "";
+		const updateOffset = script.indexOf("sudo apt-get update");
+		expect(updateOffset).toBeGreaterThan(0);
+		const root = mkdtempSync(join(tmpdir(), "ci-apt-sources-"));
+		roots.push(root);
+		const path = join(root, "ubuntu.sources");
+		const sources = [
+			"Types: deb",
+			"URIs: mirror+file:/etc/apt/apt-mirrors.txt",
+			"Suites: noble noble-updates noble-backports noble-security",
+			"Components: main universe restricted multiverse",
+			"Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg",
+			"",
+		].join("\n");
+		writeFileSync(path, sources);
+		const prepare = script
+			.slice(0, updateOffset)
+			.replaceAll("/etc/apt/sources.list.d/ubuntu.sources", path);
+		const result = shell(`sudo() { "$@"; }\n${prepare}`);
+		expect(result.status).toBe(0);
+		expect(readFileSync(path, "utf8")).toBe(
+			sources.replace(
+				"mirror+file:/etc/apt/apt-mirrors.txt",
+				"https://mirrors.edge.kernel.org/ubuntu/",
+			),
+		);
+		expect(script).not.toMatch(/allow-unauthenticated|trusted=yes|Check-Valid-Until=false/);
+		expect(updateOffset).toBeLessThan(script.indexOf("sudo apt-get install"));
 	});
 
 	test("prepares real system dependencies and PostgreSQL in the harness's rootless storage", () => {

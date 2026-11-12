@@ -14,6 +14,7 @@ import type {
 	OutlinePlanDecisionResponse,
 	OutlinePlanDiffResponse,
 	OutlineQuestionGroupResponse,
+	OutlineReportAuthorsResponse,
 	OutlineResolveResponse,
 	OutlineRevertResponse,
 	OutlineSearchResponse,
@@ -32,15 +33,19 @@ import type {
 	OutlineDigestNowResponse,
 	OutlineDigestUndoResponse,
 } from "@shared/outline-digest";
+import type { OutlineSpecImportStatus } from "@shared/outline-spec-import";
 import type {
 	NarratorCurrentTaskResponse,
 	OutlineBoardAddRequest,
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardOpenSessionRequest,
+	OutlineBoardOpenSessionResponse,
 	OutlineBoardSeenRequest,
 	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
 	OutlineBoardTaskUpdateResponse,
+	OutlineBoardTransferSessionsResponse,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { request } from "./client";
@@ -122,6 +127,11 @@ export const outlineApi = {
 		request<OutlineRevertResponse>(`/outline/commits/${enc(commitId)}/revert`, {
 			method: "POST",
 		}),
+	/** Who wrote the subagent reports with these container ids (the names the caller may see). */
+	getOutlineReportAuthors: (spaceId: string, ids: readonly string[]) =>
+		request<OutlineReportAuthorsResponse>(
+			`/outline/spaces/${enc(spaceId)}/report-authors${query({ ids: ids.join(",") })}`,
+		),
 	/** What waits for confirmation on a page, and its locked tasks. */
 	getOutlinePagePending: (spaceId: string, pageId: string) =>
 		request<OutlinePagePendingResponse>(
@@ -219,6 +229,14 @@ export const outlineApi = {
 		request<OutlineBoardFinishedResponse>(
 			`/outline/spaces/${enc(spaceId)}/tasks/finished${query({ cursor })}`,
 		),
+	/** Whether a session's Dynamic Spec is to be imported into the outline, and how that went. */
+	getSpecImportStatus: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`),
+	/** Start the import of a session's Dynamic Spec now. */
+	startSpecImport: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`, {
+			method: "POST",
+		}),
 	/** A person adds a task to a session. */
 	addBoardTask: (narratorId: string, body: OutlineBoardAddRequest) =>
 		request<OutlineBoardAddResponse>(`/outline/narrators/${enc(narratorId)}/tasks`, {
@@ -229,6 +247,17 @@ export const outlineApi = {
 	updateBoardTask: (blockId: string, body: OutlineBoardTaskUpdateRequest) =>
 		request<OutlineBoardTaskUpdateResponse>(`/outline/tasks/${enc(blockId)}`, {
 			method: "PATCH",
+			body: JSON.stringify(body),
+		}),
+	/** The sessions a task may be handed to on the board (「转交给会话…」). */
+	getTransferSessions: (blockId: string) =>
+		request<OutlineBoardTransferSessionsResponse>(
+			`/outline/tasks/${enc(blockId)}/transfer-sessions`,
+		),
+	/** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
+	openTaskSession: (blockId: string, body: OutlineBoardOpenSessionRequest) =>
+		request<OutlineBoardOpenSessionResponse>(`/outline/tasks/${enc(blockId)}/open-session`, {
+			method: "POST",
 			body: JSON.stringify(body),
 		}),
 	/**

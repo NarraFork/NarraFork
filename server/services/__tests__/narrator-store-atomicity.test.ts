@@ -8,7 +8,7 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -37,10 +37,7 @@ function failInserts(table: string, when: string) {
 }
 
 function contentOf(messageId: string): unknown[] {
-	const row = sqlite
-		.prepare("SELECT content_json FROM narrator_messages WHERE id = ?")
-		.get(messageId) as { content_json: string } | null;
-	return row ? (JSON.parse(row.content_json) as unknown[]) : [];
+	return readTestMessageContent(sqlite, messageId);
 }
 
 function count(sql: string, ...params: string[]): number {

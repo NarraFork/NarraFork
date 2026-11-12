@@ -77,6 +77,70 @@ afterEach(async () => {
 	}
 });
 
+describe("retained tool input tombstones", () => {
+	test("retiring an older attempt does not revoke a newer attempt's live source", async () => {
+		const { service, refs } = await fixture("old original");
+		const newer = service.create(
+			{
+				narratorId: "reader-with-ref",
+				toolUseId: identity.toolUseId,
+				field: "content",
+				...reference,
+				executionAttempt: reference.executionAttempt + 1,
+			},
+			"newer-epoch",
+		);
+		refs.push(newer.id);
+		await service.append(newer.id, "new attempt source", 0, true);
+		await service.clearRetainedToolPayload(reference);
+		expect((await service.getTextDocumentRange("reader-with-ref", newer.id, 0, 32)).text).toBe(
+			"new attempt source",
+		);
+	});
+	test("revokes old in-memory/spilled references and refuses subsequent range reads", async () => {
+		const raw = "old private Write payload".repeat(200);
+		const { service, refs, databasePath } = await fixture(raw);
+		const ref = await service.ensureWriteDocumentSource(
+			"reader-with-ref",
+			identity.toolUseId,
+			reference,
+		);
+		refs.push(ref.id);
+		const db = new Database(databasePath);
+		db.run("UPDATE bodies SET input_json = NULL WHERE id = ?", [identity.toolCallId]);
+		db.close();
+		const removal = service.clearRetainedToolPayload(reference);
+		await expect(
+			service.getTextDocumentRange("reader-with-ref", ref.id, 0, 32),
+		).rejects.toMatchObject({ code: "TEXT_DOCUMENT_NOT_FOUND" });
+		await removal;
+		expect(() => service.append(ref.id, "late secret")).toThrow("Text document source unavailable");
+		await expect(
+			service.ensureWriteDocumentSource("reader-with-ref", identity.toolUseId, reference),
+		).rejects.toThrow();
+	});
+
+	test("a late original-input handoff consults the durable marker before publishing a new alias", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "nf-source-retention-test-"));
+		const service = new ToolInputStreamSourceService({
+			directory,
+			isPayloadCleared: async () => true,
+		});
+		const ref = service.create(
+			{ narratorId: "reader", toolUseId: identity.toolUseId, field: "content" },
+			"old-epoch",
+		);
+		resources.push({ directory, service, refs: [ref.id] });
+		await service.append(ref.id, "late original", 0);
+		await expect(service.handoff(ref.id, reference, "late original".length)).rejects.toMatchObject({
+			code: "TEXT_DOCUMENT_HISTORY_CLEARED",
+		});
+		await expect(service.getTextDocumentRange("reader", ref.id, 0, 32)).rejects.toMatchObject({
+			code: "TEXT_DOCUMENT_NOT_FOUND",
+		});
+	});
+});
+
 describe("historical Write regeneration", () => {
 	test("readonly Worker selects only input_json, parses once and preserves raw UTF16 across bounded pages", async () => {
 		const raw = "首\r\n\ud800\ud83d\ude00尾".repeat(30000);

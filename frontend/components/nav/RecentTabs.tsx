@@ -1,5 +1,6 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
+import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import {
@@ -63,12 +64,17 @@ import {
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
+import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import { CreateNarratorLazyModal } from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
-import { type RecentTabCardActions, RecentTabDetailCard } from "./RecentTabDetailCard";
+import {
+	type RecentTabCardActions,
+	RecentTabDetailCard,
+	useRecentTabHoverEnabled,
+} from "./RecentTabDetailCard";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import { RecentTabFolderEditModal } from "./RecentTabFolderEditModal";
 import {
@@ -118,8 +124,8 @@ const RecentTabsDragContext = React.createContext<
 >({ pending: false, consumeClick: () => false });
 
 /**
- * The list's hover-card store; null on touch, where rows report no hover and the
- * details are shown at the top of the row menu instead.
+ * The list's hover-card store; null on touch or narrow viewports, where rows report
+ * no hover and the details are shown at the top of the row menu instead.
  */
 const RecentTabHoverContext = React.createContext<RecentTabHoverStore | null>(null);
 
@@ -466,6 +472,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const { removeTab, moveTab, pinTab, updateFolder, dissolveFolder, clearTabs } = recentTabs;
 	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	const [hoverStore] = useState(createRecentTabHoverStore);
+	const hoverEnabled = useRecentTabHoverEnabled(hoverStore, isTouch);
 	const sectionState = filter === "project" ? recentTabs.projects : recentTabs.work;
 	const tabs = sectionState.tabs;
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -1185,7 +1192,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			})()
 		: [...pinnedRows, ...unpinnedRows].findIndex((row) => tabSortId(row.tab) === ctxUnitKey) === 0;
 	return (
-		<RecentTabHoverContext.Provider value={isTouch ? null : hoverStore}>
+		<RecentTabHoverContext.Provider value={hoverEnabled ? hoverStore : null}>
 			<RecentTabsDragContext.Provider value={dragInteraction}>
 				<DndContext
 					sensors={drag.sensors}
@@ -1293,7 +1300,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								onLeaveFolder={ctxInFolder ? handleLeaveFolder : null}
 								gitIdentityNarratorId={ctxTab.type === "narrator" ? ctxTab.id : null}
 								gitIdentityFolderId={ctxIsFolder ? ctxTab.id : null}
-								detailsTab={isTouch && !ctxIsFolder ? ctxTab : null}
+								detailsTab={!hoverEnabled && !ctxIsFolder ? ctxTab : null}
 								t={t}
 							/>
 						)}
@@ -1364,7 +1371,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 					</DragOverlay>
 				</DndContext>
 			</RecentTabsDragContext.Provider>
-			{!isTouch && (
+			{hoverEnabled && (
 				<RecentTabDetailCard store={hoverStore} tabs={tabs} actions={cardActions} t={t} />
 			)}
 		</RecentTabHoverContext.Provider>
@@ -1503,12 +1510,19 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 	);
 }
 
-/** A row's only text: its title on one line. Everything else is in the details card. */
+/** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
 function RecentTabTitle({ tab }: { tab: RecentTab }) {
+	const { data: userPrefs } = useUserPreferences();
+	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
 	return (
-		<Text size="sm" truncate>
-			{tab.title}
-		</Text>
+		<Stack gap={0} style={{ minWidth: 0 }}>
+			<Text size="sm" truncate>
+				{tab.title}
+			</Text>
+			{showDirectory && hasDirectorySubtitle(tab) && tab.subtitle && (
+				<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
+			)}
+		</Stack>
 	);
 }
 

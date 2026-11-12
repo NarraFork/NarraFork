@@ -456,6 +456,48 @@
 			"when": 1794138790612,
 			"tag": "0064_recent-tab-archive-marks",
 			"breakpoints": true
+		},
+		{
+			"idx": 65,
+			"version": "7",
+			"when": 1794149533236,
+			"tag": "0065_workspace-auto-title",
+			"breakpoints": true
+		},
+		{
+			"idx": 66,
+			"version": "7",
+			"when": 1794151608019,
+			"tag": "0066_workspace-outline-title-invalidation",
+			"breakpoints": true
+		},
+		{
+			"idx": 67,
+			"version": "7",
+			"when": 1794283712715,
+			"tag": "0067_recent_tabs_show_directory",
+			"breakpoints": true
+		},
+		{
+			"idx": 68,
+			"version": "7",
+			"when": 1794325379040,
+			"tag": "0068_narrator_status_and_list_indexes",
+			"breakpoints": true
+		},
+		{
+			"idx": 69,
+			"version": "7",
+			"when": 1794332183087,
+			"tag": "0069_compact_auxiliary_content",
+			"breakpoints": true
+		},
+		{
+			"idx": 70,
+			"version": "7",
+			"when": 1794365828817,
+			"tag": "0070_outline_view_state_expanded",
+			"breakpoints": true
 		}
   ]
 }

@@ -128,6 +128,7 @@ export const updateUserPreferencesSchema = z.object({
 	replyInUserLanguage: z.boolean().optional(),
 	showTokenUsage: z.boolean().optional(),
 	showOutputStats: z.boolean().optional(),
+	compactAuxiliaryContent: z.boolean().optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
 	// Narrator transcript typography (percentages). Bounds are taken FROM the shared
@@ -224,6 +225,7 @@ export const updateUserPreferencesSchema = z.object({
 	gitIdentityContextMenu: z.boolean().optional(),
 	gitIdentityCreateModal: z.boolean().optional(),
 	gitIdentityFolderContextMenu: z.boolean().optional(),
+	recentTabsShowDirectory: z.boolean().optional(),
 });
 
 /**

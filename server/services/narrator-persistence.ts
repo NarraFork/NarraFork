@@ -10,6 +10,7 @@ import {
 	truncateCompactError,
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
+import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
 import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -62,6 +63,7 @@ import { getExecutionOwner, preserveHeldSubstatus } from "./agent-runtime/owners
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import {
+	CLEARED_TOOL_OUTPUT_SQL,
 	contentByAttempt,
 	flushQueuedSince,
 	newEnvelopeColumns,
@@ -524,6 +526,26 @@ export function cowEnvelopeTx(
 	},
 ): string {
 	const { original, ref } = input;
+	if (
+		isHistoryProtectedContent(original.contentJson) &&
+		input.changes?.editedAt &&
+		Array.isArray(input.changes.contentJson) &&
+		input.changes.contentJson[0]
+	) {
+		const {
+			historyClearVersion: _version,
+			historyClearedAt: _at,
+			...first
+		} = input.changes.contentJson[0];
+		input.changes = {
+			...input.changes,
+			originalContentJson: null,
+			contentJson: [
+				{ historyToolsSuppressed: true, ...first },
+				...input.changes.contentJson.slice(1),
+			],
+		};
+	}
 	const id = generateId();
 	const now = new Date().toISOString();
 	const copy = {
@@ -894,6 +916,12 @@ function overwriteToolInputTx(
 	toolUseId: string,
 	input: Record<string, unknown>,
 ): Record<string, unknown> {
+	if (
+		sqlite
+			.query(`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`)
+			.get(toolCallId)
+	)
+		return {};
 	const existing = tx
 		.select({
 			messageId: narratorToolCalls.messageId,
@@ -2522,10 +2550,16 @@ const sqliteNarratorPersistence = {
 			| {
 					type: "image_generation";
 					id: string;
+					status?: string;
+					error?: string;
+					errorCode?: string;
 					revisedPrompt?: string;
 					outputIndex?: number;
 					savedPath?: string;
 					result?: string;
+					partialSavedPath?: string;
+					partialImageIndex?: number;
+					partialImageB64?: string;
 					width?: number;
 					height?: number;
 			  },
@@ -2562,6 +2596,18 @@ const sqliteNarratorPersistence = {
 								.sync(),
 						);
 						if (!existing) throw new NotFoundError("Assistant message", messageId);
+						if (isHistoryProtectedContent(existing.contentJson)) return undefined;
+						if (block.type === "tool_use") {
+							const adopted = sqlite
+								.query<
+									{ cleared: number },
+									[string, string]
+								>(`SELECT (${CLEARED_TOOL_OUTPUT_SQL}) AS cleared
+								FROM narrator_tool_calls WHERE message_id = ? AND tool_use_id = ?
+								ORDER BY execution_attempt DESC, created_at DESC, id DESC LIMIT 1`)
+								.get(messageId, block.id);
+							if (adopted?.cleared) return undefined;
+						}
 
 						type StoredAssistantBlock =
 							| {
@@ -4081,6 +4127,12 @@ const sqliteNarratorPersistence = {
 		const affectedToolCalls = db.transaction(
 			(tx) => {
 				const queueMark = syncQueueMark();
+				if (
+					sqlite
+						.query(`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`)
+						.get(exactId)
+				)
+					return [];
 				const updated = tx
 					.update(narratorToolCalls)
 					.set({
@@ -4350,7 +4402,7 @@ const sqliteNarratorPersistence = {
 			};
 			const updateOriginal = () => {
 				if (overrides && Object.keys(overrides).length > 0) {
-					updateEnvelope(tx, messageId, overrides);
+					updateEnvelope(tx, messageId, overrides, { allowHistoryRewrite: !!overrides.editedAt });
 					if (semanticEdit)
 						updateRecipientMessageRef(tx, narratorId, currentRef.id, {
 							kind: "semantic_edit",
@@ -4970,6 +5022,7 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 		db.transaction((tx) => {
 			writeEnvelopeBody(tx, messageId, [newBlock], {
+				allowHistoryRewrite: true,
 				set: {
 					contextCharsJson: measureMessageCharacters("user", [newBlock]),
 					contentText: `[Segment Compact]\n${summary}`,

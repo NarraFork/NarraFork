@@ -1154,6 +1154,13 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					// 覆盖只更新会话行本身：删掉本地 refs/tool_calls 会级联抹掉其它表对它们的引用，
 					// 也会丢掉导出之后本地新增的历史。合并语义不删除本地数据。
 					sqlite.run(`UPDATE main.narrators SET ${columnAssignments} WHERE id = ?`, [id]);
+					// Workspaces are local UI state, not snapshot tables. Imported session titles
+					// still invalidate any candidate generated from their previous metadata.
+					sqlite.run(
+						`UPDATE main.workspaces SET title_revision = title_revision + 1
+						WHERE id IN (SELECT workspace_id FROM main.workspace_panels WHERE narrator_id = ?)`,
+						[id],
+					);
 					counts.sessionsOverwritten += 1;
 				}
 				counts.sessionsRejected = rejected.length;
@@ -1722,6 +1729,9 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				const before = sqlite.prepare(`SELECT COUNT(*) AS n FROM narrators`).get() as {
 					n: number;
 				};
+				// FK-cascaded panel removal must invalidate previously generated title candidates.
+				sqlite.run(`UPDATE workspaces SET title_revision = title_revision + 1
+					WHERE id IN (SELECT workspace_id FROM workspace_panels WHERE narrator_id IS NOT NULL)`);
 				// 顺序：先断开其它表的会话引用（保留请求历史等），再删依赖表与会话本体。
 				sqlite.run(`UPDATE terminals SET narrator_id = NULL WHERE narrator_id IS NOT NULL`);
 				sqlite.run(

@@ -17,6 +17,7 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own people and
  * spaces, and the job's memory is reset before each.
  */
+
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { OutlineResolveResponse } from "@shared/outline-api";
 import type {
@@ -60,6 +61,7 @@ import { revertCommit } from "../revert";
 import { outlineStore } from "../store";
 import type { OutlineDigestRow } from "../store/digest-port";
 import type { OutlineSpaceRow } from "../store/port";
+import { OUTLINE_TASK_OPEN_ACTOR } from "../task-session";
 import { type OutlineOp, writeOutline } from "../write";
 
 const SETUP = "2026-11-01T00:00:00.000Z";
@@ -534,7 +536,13 @@ describe("reports: the acceptance", () => {
 		await expectLinksResolve(alice.id, a);
 		// Nothing of the next day, nothing of text in the stored items.
 		const stored = JSON.stringify(aliceDay.items);
-		for (const text of ["Shanghai's midnight", "BOM", "Formats we read", "Which format"])
+		// Use real phrases, not "BOM": opaque random IDs can legitimately contain that trigram.
+		for (const text of [
+			"Shanghai's midnight",
+			"The parser handles a BOM",
+			"Formats we read",
+			"Which format",
+		])
 			expect(stored).not.toContain(text);
 
 		// Bob's 11-04 (New York): the page and its facts as alice made them (the tasks are not
@@ -1007,6 +1015,74 @@ describe("reports: delegation (outline P2 PR 9)", () => {
 		// The report's blocks sit under a task: process, not knowledge.
 		expect(d.knowledge.flatMap((k) => k.blocks.map((b) => b.title))).toEqual([]);
 		await expectLinksResolve(mia.id, d);
+	}, 60_000);
+});
+
+describe("reports: a session opened for a task (outline P2 PR 10c-1)", () => {
+	test("its claim and a claim given back are bookkeeping, not listed under 其他; another system actor still is", async () => {
+		const ned = await person("ned", { timeZone: "UTC" });
+		const opened = await narrator(ned.id);
+		const p = await project(ned.id);
+		const made = await write(
+			p.space,
+			{ kind: "human", id: ned.id },
+			ned.id,
+			"2026-12-05T08:00:00.000Z",
+			[
+				{ op: "insert", tempId: "page", parent: null, content: "Pool" },
+				{
+					op: "insert",
+					parent: { tempId: "page" },
+					content: "Pool task",
+					task: { status: "todo" },
+				},
+				{
+					op: "insert",
+					parent: { tempId: "page" },
+					content: "Other task",
+					task: { status: "todo" },
+				},
+			],
+		);
+		const [, task, other] = made.results as Array<{ blockId: string }>;
+		const system = (id: string, blockId: string, status: "doing" | "todo", at: string) =>
+			writeOutline(
+				{
+					spaceId: p.space.id,
+					ops: [{ op: "setTask", block: { id: blockId }, task: { status } }],
+					actor: { kind: "system", id },
+					responsibleUserId: ned.id,
+					narratorId: opened,
+				},
+				{ store, now: () => new Date(at) },
+			);
+		await system(
+			OUTLINE_TASK_OPEN_ACTOR,
+			task?.blockId as string,
+			"doing",
+			"2026-12-05T09:00:00.000Z",
+		);
+		await system(
+			OUTLINE_TASK_OPEN_ACTOR,
+			task?.blockId as string,
+			"todo",
+			"2026-12-05T09:01:00.000Z",
+		);
+		// The control: a system actor the report does not know as routine.
+		await system(
+			"outline-something-new",
+			other?.blockId as string,
+			"doing",
+			"2026-12-05T09:02:00.000Z",
+		);
+		await runJob("2026-12-06T08:00:00.000Z");
+		const day = (await dailies(ned.id)).find(
+			(d) => d.periodKey === "2026-12-05",
+		) as OutlineDigestRow;
+		const d = await detail(ned.id, day.id);
+		expect(d.other.map((o) => [o.event, o.actor.id])).toEqual([
+			["system", "outline-something-new"],
+		]);
 	}, 60_000);
 });
 

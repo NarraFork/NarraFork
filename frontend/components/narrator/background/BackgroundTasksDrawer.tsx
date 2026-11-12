@@ -49,6 +49,7 @@ import {
 import { ContentViewer } from "../content/ContentViewer";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { ToolCallInspector } from "../tool-call/ToolCallInspector";
+import classes from "./BackgroundTasksDrawer.module.css";
 import { useBackgroundTaskList } from "./useBackgroundTaskList";
 
 /** Poll interval for the live output tail of a running task. */
@@ -424,7 +425,7 @@ export function BackgroundTasksPanel({
 
 	return (
 		<>
-			<Stack gap="sm" p={chromeless ? "md" : undefined}>
+			<Stack gap="sm" p={chromeless ? "md" : undefined} className={classes.panel}>
 				{showReattachFallback && (
 					<Alert color="yellow" variant="light">
 						{reattachFallbackReason}
@@ -456,10 +457,8 @@ export function BackgroundTasksPanel({
 						>
 							{/* Only the header row is clickable, so interacting with the
 							    expanded output (select, scroll, copy) can't collapse it. */}
-							<Group
-								justify="space-between"
-								wrap="nowrap"
-								gap="xs"
+							<Box
+								className={classes.header}
 								onClick={() => {
 									if (canOpenSubagent && task.subagentNarratorId) {
 										handleOpenSubagent(task.subagentNarratorId);
@@ -469,7 +468,7 @@ export function BackgroundTasksPanel({
 								}}
 								style={{ cursor: canOpenSubagent || canExpand ? "pointer" : "default" }}
 							>
-								<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+								<Group gap={6} wrap="nowrap" className={classes.identity}>
 									{canExpand &&
 										(expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />)}
 									<Icon size={14} />
@@ -484,26 +483,17 @@ export function BackgroundTasksPanel({
 												: "backgroundTasks.kindTask",
 										)}
 									</Badge>
-									{task.kind === "bash" && task.command ? (
-										<Code
-											style={{
-												fontSize: 11,
-												maxWidth: 180,
-												overflow: "hidden",
-												textOverflow: "ellipsis",
-												whiteSpace: "nowrap",
-												display: "inline-block",
-											}}
-										>
-											{task.command}
-										</Code>
-									) : (
-										<Text size="xs" fw={500} truncate>
-											{task.label}
-										</Text>
-									)}
 								</Group>
-								<Group gap={4} wrap="nowrap">
+								{task.kind === "bash" && task.command ? (
+									<Code className={classes.summary} style={{ fontSize: 11 }}>
+										{task.command}
+									</Code>
+								) : (
+									<Text size="xs" fw={500} className={classes.summary}>
+										{task.label}
+									</Text>
+								)}
+								<Group gap={4} justify="flex-end" className={classes.actions}>
 									{canInspect && (
 										<Tooltip label={t("toolCallInspector.inspect")}>
 											<ActionIcon
@@ -558,7 +548,7 @@ export function BackgroundTasksPanel({
 										</ActionIcon>
 									)}
 								</Group>
-							</Group>
+							</Box>
 							{/* Always shown while it exists — a transfer's bar is the row's whole
 							    point, and it must not be hidden behind expanding the row. */}
 							{task.progress && <TransferProgressBar progress={task.progress} />}
@@ -567,12 +557,12 @@ export function BackgroundTasksPanel({
 							    to resume. The `!isActive` gate below would hide it, since paused
 							    counts as active. */}
 							{task.status === "paused" && task.output && (
-								<Text size="xs" c="dimmed" mt={4} lineClamp={2}>
+								<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
 									{task.output.slice(0, 200)}
 								</Text>
 							)}
 							{!expanded && !isActive && task.output && (
-								<Text size="xs" c="dimmed" mt={4} lineClamp={2}>
+								<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
 									{task.output.slice(0, 200)}
 								</Text>
 							)}

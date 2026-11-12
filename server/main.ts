@@ -60,6 +60,7 @@ import { validateAccessTokenById } from "./lib/oauth-provider";
 import { openFrontendOnce } from "./lib/open-frontend";
 import { IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
+import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "./lib/runtime-target";
 import {
 	registerGracefulShutdownHandler,
 	registerOperatorShutdownHandler,
@@ -340,12 +341,11 @@ let currentHost = await resolveManagerListenHost(
 );
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
-const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
+const isCompiledBinary = isCompiledRuntime();
 // Also treat as production when dist/frontend exists (handles Windows where
 // NODE_ENV=production inline syntax doesn't work)
-const hasFrontendBuild = existsSync(
-	resolve(import.meta.dir, "..", "dist", "frontend", "index.html"),
-);
+const hasFrontendBuild =
+	!isCompiledBinary && existsSync(resolve(import.meta.dir, "..", "dist", "frontend", "index.html"));
 const isProd = isCompiledBinary || process.env.NODE_ENV === "production" || hasFrontendBuild;
 
 // MIME type lookup for embedded static files
@@ -449,18 +449,18 @@ async function serveBrandedManifest(path: string, staticPath: string): Promise<R
 
 // Production: serve Vite build output via Hono
 if (isProd) {
-	// Try embedded assets only for compiled single-executable mode. Source runs
-	// (`bun run start`) should serve dist/frontend from disk so a later
-	// `bun run build` with new hashed asset names is visible without restart.
-	let hasEmbedded = false;
+	// Compiled processes only serve their frozen assets. Explicit source runs
+	// keep serving dist/frontend from disk so a later frontend build is visible.
 	if (isCompiledBinary) {
 		try {
 			// Dynamic import so it doesn't fail when the generated file doesn't exist (dev / bundle mode)
-			const generatedFrontendModulePath = "./generated/embedded-frontend";
-			const generatedModule = (await import(generatedFrontendModulePath)) as {
+			const generatedModule = (await import("@server/generated/embedded-frontend")) as {
 				embeddedAssets?: Record<string, string>;
 			};
-			const rawAssets = generatedModule.embeddedAssets ?? {};
+			if (!generatedModule.embeddedAssets) {
+				throw new Error("Embedded frontend asset map is unavailable in this build");
+			}
+			const rawAssets = generatedModule.embeddedAssets;
 			// Normalise keys: on Windows the build script may produce backslash
 			// keys (e.g. "/assets\\index-abc.js") — convert them to forward slashes
 			// so they match browser request paths.
@@ -469,49 +469,48 @@ if (isProd) {
 				embeddedAssets[key.replaceAll("\\", "/")] = value;
 			}
 			const indexPath = embeddedAssets["/index.html"];
-			if (indexPath) {
-				hasEmbedded = true;
-				logger.info("Serving frontend from embedded assets");
-
-				// Serve exact-match embedded files
-				app.use("*", async (c, next) => {
-					// Skip API and WebSocket routes
-					if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
-						return next();
-					}
-
-					const filePath = embeddedAssets[c.req.path];
-					if (filePath) {
-						const branded = await serveBrandedManifest(c.req.path, filePath);
-						if (branded) return branded;
-						const blob = Bun.file(filePath);
-						const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
-						return new Response(blob, {
-							headers: {
-								"Content-Type": mime,
-								"Cache-Control": getFrontendCacheControl(c.req.path),
-							},
-						});
-					}
-
-					// SPA catch-all: serve index.html for non-file routes
-					if (!c.req.path.includes(".")) {
-						return serveSpaIndex(Bun.file(indexPath), c.req.path);
-					}
-
-					return next();
-				});
+			if (!indexPath && !IS_LOCAL_RUNTIME) {
+				throw new Error("Embedded frontend index is unavailable in this build");
 			}
-		} catch (err) {
-			// Generated file doesn't exist — fall through to filesystem mode
-			logger.debug("Embedded frontend not available, falling back to filesystem", {
-				error: String(err),
+			// Local backend-only launches use Vite for navigation, but still serve
+			// their frozen brand/GenUI assets. Never borrow a checkout's dist.
+			logger.info("Serving frontend from embedded assets", { hasIndex: !!indexPath });
+
+			// Serve exact-match embedded files
+			app.use("*", async (c, next) => {
+				// Skip API and WebSocket routes
+				if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
+					return next();
+				}
+
+				const filePath = embeddedAssets[c.req.path];
+				if (filePath) {
+					const branded = await serveBrandedManifest(c.req.path, filePath);
+					if (branded) return branded;
+					const blob = Bun.file(filePath);
+					const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
+					return new Response(blob, {
+						headers: {
+							"Content-Type": mime,
+							"Cache-Control": getFrontendCacheControl(c.req.path),
+						},
+					});
+				}
+
+				// SPA catch-all: serve index.html for non-file routes
+				if (indexPath && !c.req.path.includes(".")) {
+					return serveSpaIndex(Bun.file(indexPath), c.req.path);
+				}
+
+				return next();
 			});
+		} catch (cause) {
+			throw new Error("Embedded frontend assets are unavailable in this build", { cause });
 		}
 	}
 
-	// Fallback: serve from filesystem (bundle mode or bun run start)
-	if (!hasEmbedded) {
+	// Mutable filesystem assets belong only to explicit source runs.
+	if (!isCompiledBinary) {
 		const staticDir = resolve(import.meta.dir, "..", "dist", "frontend");
 		logger.info(
 			`Static file serving: filesystem mode, dir=${staticDir}, exists=${existsSync(staticDir)}`,
@@ -1465,6 +1464,9 @@ withBackgroundOccupancyInitialization(
 					error: err instanceof Error ? err.message : String(err),
 				}),
 			);
+		void import("./services/storage-history-runtime")
+			.then(({ startStorageHistoryRetention }) => startStorageHistoryRetention())
+			.catch((err) => logger.warn("History retention did not start", { error: String(err) }));
 		if (completions.length) {
 			Promise.all(completions)
 				.then(() => {
@@ -1645,11 +1647,26 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/digest-job")
 		.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
 		.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
-	// Outline tasks a session created and someone else finished: that session is told.
-	import("./services/outline/task-finished")
-		.then(({ startOutlineTaskFinishedNotices }) => startOutlineTaskFinishedNotices())
+	// Outline team events: a session is told when a task is assigned to it by name, when a
+	// prerequisite of its task ends, and when a task it created ends. The commits of the last
+	// minutes are pushed again in the background (what a stop between a commit and its rows left
+	// untold; a row written before is found and not written twice).
+	import("./services/outline/team-events")
+		.then(({ startOutlineTeamEvents, repushRecentOutlineTeamEvents }) => {
+			startOutlineTeamEvents();
+			return repushRecentOutlineTeamEvents();
+		})
+		.catch((err) => logger.warn("Outline team events failed to start", { error: String(err) }));
+	// Sessions that still keep their tasks in Dynamic Spec are imported into the outline while
+	// they are idle (a pass a minute after start, then at intervals; one session at a time).
+	import("./services/outline/spec-import/triggers")
+		.then(({ startSpecImportJob }) => startSpecImportJob())
+		.catch((err) => logger.warn("Dynamic Spec import job failed to start", { error: String(err) }));
+	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
+	import("./services/outline/plugin-task-events")
+		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
 		.catch((err) =>
-			logger.warn("Outline task-finished notices failed to start", { error: String(err) }),
+			logger.warn("Outline plugin task events failed to start", { error: String(err) }),
 		);
 });
 
@@ -1856,7 +1873,9 @@ async function performGracefulShutdown(
 				const tasks = await import("./services/outline/tasks");
 				const inProcess = await import("./services/outline/in-process");
 				const digests = await import("./services/outline/digest-job");
+				const specImport = await import("./services/outline/spec-import/triggers");
 				await Promise.all([
+					specImport.stopSpecImportJob(),
 					inProcess.stopOutlineInProcessRebuild(),
 					tasks.stopOutlineTaskLeaseJob(),
 					digests.stopOutlineDigestJob(),
@@ -1870,6 +1889,9 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
+		// The built-in apikey-quota plugin's process is owned by the shared plugin runtime
+		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
+		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}

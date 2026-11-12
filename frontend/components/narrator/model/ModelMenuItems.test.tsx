@@ -444,7 +444,7 @@ describe("per-model global role actions", () => {
 });
 
 describe("provider prefix on default/summary rows", () => {
-	test("shows the resolved target's provider prefix as a secondary line", async () => {
+	test("role rows stay compact and do not repeat the provider as a second line", async () => {
 		const withRoles: ModelOption[] = [
 			{ value: "__default__", label: "gpt-6-astra", provider: "__default__" },
 			{ value: "__summary__", label: "mimo-v2.6-pro", provider: "__summary__" },
@@ -456,8 +456,9 @@ describe("provider prefix on default/summary rows", () => {
 			summaryModelValue: "xiaomi:mimo-v2.6-pro",
 		});
 		expect(host.textContent).toContain("codex");
-		expect(host.textContent).toContain("xiaomi");
-		// The prefix is a secondary line under the role row label, not a group header.
+		// The provider appears as the group label / concrete model value, not as a second line
+		// under each role row (that extra line is what made the role slots look oversized).
+		expect(host.textContent).toContain("Xiaomi");
 		const roleRows = Array.from(host.querySelectorAll("[data-menu-item]")).filter(
 			(item) =>
 				item.textContent?.includes("gpt-6-astra") || item.textContent?.includes("mimo-v2.6-pro"),
@@ -507,14 +508,16 @@ describe("auto:<model> rows", () => {
 		},
 	];
 
-	test("the auto entry names the source auto would use now, skipping one that cannot serve", async () => {
+	test("the source auto would use is marked on its own row, not in a sentence", async () => {
 		await render("auto:gpt-5.5", autoModels, true, true, { mode: "model" });
-		// A catalog model without a recorded family sits in the "other models" vendor group.
 		expect(host.textContent).toContain(narratorLocale.modelGroupFamilyOther);
-		const automatic = host.querySelector('[data-model-auto="auto:gpt-5.5"]');
-		expect(automatic?.textContent).toContain(
-			narratorLocale.autoCurrentSource.replace("{{provider}}", "Provider A"),
-		);
+		const inUse = (value: string) =>
+			host
+				.querySelector(`[data-model-source="${value}"]`)
+				?.querySelector('[role="img"][aria-label="In use"]');
+		// Provider A can serve; codex cannot, so only Provider A carries the in-use marker.
+		expect(inUse("a:gpt-5.5")).toBeTruthy();
+		expect(inUse("codex:gpt-5.5")).toBeFalsy();
 	});
 
 	test("the focused model lists automatic and every source, and picks keep their values", async () => {

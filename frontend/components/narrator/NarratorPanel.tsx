@@ -3505,6 +3505,7 @@ function NarratorPanelBody({
 															onSelectionResolverChange={setChunkSelectionResolver}
 															rowHandlers={vlistRowHandlers}
 															permCb={permCbWithAsyncQuestions}
+															enableOutlineAsk={!isWorkspacePreview}
 															highlightMessageId={highlightMessageId}
 															highlightRequestId={highlightRequestId}
 															highlightNeedle={highlightNeedle}

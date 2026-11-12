@@ -28,6 +28,8 @@ export interface AgentMessageDelivery {
 	sender: AgentMessageSender;
 	fromToolUseId: string;
 	senderToolCallBinding?: ToolCallBinding;
+	/** Reader-facing display intent only, never privacy or delivery/receipt authority. */
+	showToUser?: boolean;
 	/** Reader-facing body, before sender prefixes and reply-request instructions. */
 	text: string;
 }
@@ -38,6 +40,7 @@ export function createAgentMessageDelivery(
 	fromToolUseId: string,
 	text: string,
 	senderToolCallBinding?: ToolCallBinding,
+	showToUser?: boolean,
 ): AgentMessageDelivery {
 	return {
 		recipientNarratorId,
@@ -45,6 +48,7 @@ export function createAgentMessageDelivery(
 		sender: { ...sender },
 		fromToolUseId,
 		text,
+		...(typeof showToUser === "boolean" ? { showToUser } : {}),
 		...(senderToolCallBinding ? { senderToolCallBinding: { ...senderToolCallBinding } } : {}),
 	};
 }
@@ -688,6 +692,7 @@ export function agentMessageDeliveryBody(delivery: AgentMessageDelivery): SideCa
 				...(delivery.senderToolCallBinding
 					? { fromToolCallBinding: { ...delivery.senderToolCallBinding } }
 					: {}),
+				...(typeof delivery.showToUser === "boolean" ? { showToUser: delivery.showToUser } : {}),
 				text: delivery.text,
 			},
 		],

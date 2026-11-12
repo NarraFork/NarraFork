@@ -27,6 +27,7 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { getNarraforkHome } from "../lib/narrafork-home";
+import { instrumentSqliteConnection } from "../lib/sql-trace";
 
 export function getDbDir(): string {
 	return getNarraforkHome();
@@ -110,5 +111,6 @@ export function openDatabase(dbPath?: string): Database {
 	conn.run("PRAGMA mmap_size = 268435456");
 	// Auto-checkpoint when the WAL reaches ~1000 pages (~4 MB) to bound its growth.
 	conn.run("PRAGMA wal_autocheckpoint = 1000");
-	return conn;
+	// Opt-in per-statement timing (NF_SQL_TRACE); a no-op returning `conn` when disabled.
+	return instrumentSqliteConnection(conn);
 }

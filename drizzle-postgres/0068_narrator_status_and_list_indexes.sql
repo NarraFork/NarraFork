@@ -1,0 +1,2 @@
+CREATE INDEX "idx_narrators_status" ON "narrators" USING btree ("status");--> statement-breakpoint
+CREATE INDEX "idx_narrators_variant_list" ON "narrators" USING btree ("variant","hidden_from_lists","status","updated_at","id");

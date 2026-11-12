@@ -24,9 +24,15 @@ interface Info {
 		settlement: string;
 		workspaceLeaseId: string | null;
 		snapshotRevision: number | null;
+		effects: {
+			diskOutcome: string;
+			intendedAfter: { kind: string; blob?: { digest: string; sizeBytes: number } };
+		}[];
 	}[];
 	leases: { id: string; status: string }[];
 	nativeCalls: { apply: number; query: number; ack: number; helperStarts: number; network: number };
+	nativeRequests: { method: "apply" | "query" | "ack"; operationId: string }[];
+	historyBudgetExpirations: number;
 }
 // Same isolated executable Host fixture as the real browser cold-recovery test.
 // The executor is an independent, prebuilt --server peer, never a Host helper.
@@ -34,6 +40,7 @@ test.each([
 	"terminal-and-ack",
 	"lost-apply-cold",
 	"settlement-cold",
+	"history-budget-cold",
 ] as const)("real remote persistence without Host helper: %s", async (scenario) => {
 	const root = await mkdtemp(join(testEnvironment.isolatedHome, "remote-persistence-"));
 	const home = join(root, "host-home"),
@@ -77,7 +84,7 @@ test.each([
 					const line = pending.slice(0, end);
 					pending = pending.slice(end + 1);
 					onLine?.(line);
-					logs = `${logs}\n${line}`.slice(-8192);
+					if (!line.startsWith("EDITOR_HOST_READY ")) logs = `${logs}\n${line}`.slice(-8192);
 				}
 			}
 		} finally {
@@ -177,12 +184,12 @@ test.each([
 		await response.body?.cancel();
 	}
 	const endpoint = `/api/narrators/${config.narratorId}`;
-	async function save(bytes: Uint8Array, revision: number) {
+	async function save(bytes: Uint8Array, revision: number, path = target) {
 		const opened = await request(`${endpoint}/editor-documents`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
-				path: target,
+				path,
 				deviceId: config.remote.deviceId,
 				origin: "legacy",
 				protocol: "raw-v2",
@@ -258,7 +265,18 @@ test.each([
 	}
 	async function query(operationId: string) {
 		const response = await request(`${endpoint}/editor-operations/${operationId}`);
-		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			const reader = response.body?.getReader();
+			let body = "";
+			try {
+				const chunk = await reader?.read();
+				if (chunk?.value) body = new TextDecoder().decode(chunk.value.subarray(0, 4096));
+			} finally {
+				await reader?.cancel();
+				reader?.releaseLock();
+			}
+			throw new Error(`Operation query failed (${response.status}): ${body}\n${logs}`);
+		}
 		return (await response.json()) as EditorOperationResult;
 	}
 	try {
@@ -309,20 +327,64 @@ test.each([
 		);
 		await waitOnline();
 		if (scenario === "terminal-and-ack") {
-			const content = Buffer.alloc(20 * 1024 * 1024, 65);
+			const largeContent = Buffer.alloc(20 * 1024 * 1024, 65);
+			const largeTarget = join(workspace, "large-file.txt");
+			await writeFile(largeTarget, "before");
+			const large = await save(largeContent, 22, largeTarget);
+			expect(large.ok).toBe(true);
+			expect(large.body).toMatchObject({
+				status: "saved",
+				hashKind: "raw-sha256",
+				hash: hash(largeContent),
+				bytes: largeContent.length,
+				snapshotRevision: 22,
+				diskOutcome: "applied",
+			});
+			expect(await readFile(largeTarget)).toEqual(largeContent);
+			expect((await info()).nativeRequests).toEqual([
+				{ method: "apply", operationId: large.operationId },
+				{ method: "ack", operationId: large.operationId },
+			]);
+			// A 20 MiB history publication may legally exceed its optional 1500 ms budget.
+			// SQLite-only recovery is a separate operation with small before AND after
+			// states, not a timing assertion about the large save's CAS publication.
+			const content = Buffer.from("durable snapshot");
 			const first = await save(content, Number.MAX_SAFE_INTEGER);
 			expect(first.ok).toBe(true);
 			expect(first.body).toMatchObject({
 				status: "saved",
 				hashKind: "raw-sha256",
 				hash: hash(content),
+				bytes: content.length,
 				snapshotRevision: Number.MAX_SAFE_INTEGER,
+				historyStatus: "complete",
 			});
+			expect(await readFile(target)).toEqual(content);
 			const savedInfo = await info();
+			expect(
+				savedInfo.operations,
+				`Cold recovery requires SQLite evidence: ${JSON.stringify(first.body)}\n${logs}`,
+			).toContainEqual(
+				expect.objectContaining({
+					sourceId: first.operationId,
+					settlement: "settled",
+					snapshotRevision: Number.MAX_SAFE_INTEGER,
+					effects: [
+						{
+							diskOutcome: "applied",
+							intendedAfter: {
+								kind: "regular",
+								blob: { algorithm: "sha256", digest: hash(content), sizeBytes: content.length },
+								mode: expect.any(Number),
+							},
+						},
+					],
+				}),
+			);
 			expect(savedInfo.nativeCalls).toMatchObject({
-				apply: 1,
+				apply: 2,
 				query: 0,
-				ack: 1,
+				ack: 2,
 				helperStarts: 0,
 				network: 0,
 			});
@@ -335,7 +397,7 @@ test.each([
 				result: { snapshotRevision: 23 },
 			});
 			const afterQuery = await info();
-			expect(afterQuery.nativeCalls.apply).toBe(2);
+			expect(afterQuery.nativeCalls.apply).toBe(3);
 			expect(afterQuery.nativeCalls.query).toBe(0);
 			expect(afterQuery.nativeCalls.ack).toBe(beforeQuery.nativeCalls.ack + 1);
 			const empty = await save(new Uint8Array(), 24);
@@ -355,19 +417,28 @@ test.each([
 					snapshotRevision: Number.MAX_SAFE_INTEGER,
 				},
 			});
-			expect((await info()).nativeCalls).toMatchObject({
+			const recovered = await info();
+			expect(recovered.nativeCalls, JSON.stringify(recovered)).toMatchObject({
 				apply: 0,
 				query: 0,
+				ack: 1,
 				helperStarts: 0,
 				network: 0,
 			});
+			expect(recovered.nativeRequests).toEqual([{ method: "ack", operationId: first.operationId }]);
 		} else {
-			await fault(scenario === "lost-apply-cold" ? "lost-apply" : "settlement");
+			await fault(
+				scenario === "lost-apply-cold"
+					? "lost-apply"
+					: scenario === "history-budget-cold"
+						? "history-budget"
+						: "settlement",
+			);
 			const bytes = Buffer.from("written"),
 				saved = await save(bytes, 37);
 			// The real IO outcome is reported separately from history: a lost reply is
 			// unknown, while a history failure after a committed receipt is still a save.
-			if (scenario === "settlement-cold")
+			if (scenario !== "lost-apply-cold")
 				expect(saved.body).toMatchObject({
 					status: "saved",
 					diskOutcome: "applied",
@@ -380,6 +451,20 @@ test.each([
 			expect(pending.nativeCalls.apply).toBe(1);
 			if (scenario === "settlement-cold")
 				expect(pending.operations[0]?.settlement).not.toBe("settled");
+			if (scenario === "history-budget-cold") {
+				expect(saved.ok).toBe(true);
+				expect(pending.historyBudgetExpirations).toBe(1);
+				expect(pending.operations[0]).toMatchObject({
+					sourceId: saved.operationId,
+					settlement: "settled",
+					effects: [
+						{
+							diskOutcome: "applied",
+							intendedAfter: { kind: "unknown", reason: "history_unavailable" },
+						},
+					],
+				});
+			}
 			// No workspace barrier and no fabricated lease: the exact executor operation is the key.
 			expect(pending.leases).toEqual([]);
 			expect(pending.operations[0]?.workspaceLeaseId).toBeNull();
@@ -395,10 +480,11 @@ test.each([
 			await stopHost();
 			await startHost();
 			await waitOnline();
+			expect((await info()).nativeRequests).toEqual([]);
 			await fault("ack");
 			expect(await query(saved.operationId)).toMatchObject({
 				status: "saved",
-				result: { hash: hash(bytes), snapshotRevision: 37 },
+				result: { hash: hash(bytes), snapshotRevision: 37, historyStatus: "unavailable" },
 			});
 			const settled = await info();
 			expect(settled.nativeCalls).toMatchObject({
@@ -408,12 +494,16 @@ test.each([
 				helperStarts: 0,
 				network: 0,
 			});
+			expect(settled.nativeRequests).toEqual([
+				{ method: "query", operationId: saved.operationId },
+				{ method: "ack", operationId: saved.operationId },
+			]);
 			expect(settled.leases).toEqual([]);
 			await stopHost();
 			await startHost();
 			await waitOnline();
-			// The recorded effect stays immutably unknown; each cold query re-reads the
-			// executor's retained exact-op receipt and never reapplies.
+			// Missing SQLite proof stays missing: each cold query re-reads the executor's
+			// retained exact-op receipt for this operation and never reapplies.
 			expect(await query(saved.operationId)).toMatchObject({
 				status: "saved",
 				result: { snapshotRevision: 37 },

@@ -61,6 +61,14 @@ import {
 	TASK_BOX,
 } from "@shared/outline";
 import {
+	type NoteWrite,
+	type NoteWriteBlock,
+	noteWriteIssues,
+	noteWriteRefused,
+	OUTLINE_NOTE_RULES,
+	type OutlineNoteRulesMode,
+} from "@shared/outline-note-structure";
+import {
 	boundOutlineEditDisplay,
 	OUTLINE_TOOL_DISPLAY_LIMITS,
 	type OutlineDisplayCreated,
@@ -84,6 +92,7 @@ import {
 	type OutlineWriteRefusal,
 	spaceRootName,
 } from "./agent-scope";
+import { checkAgentAssignees } from "./assignee";
 import {
 	EDIT_LABEL_RE,
 	type EditTextItem,
@@ -108,6 +117,13 @@ import {
 	outlinePendingIdOf,
 	outlinePendingLabel,
 } from "./model";
+import {
+	finishedTaskHints,
+	type NoteAnchor,
+	NoteAnchorReader,
+	noteIssueLines,
+	type TickedTask,
+} from "./note-rules";
 import {
 	confirmOutlinePending,
 	OUTLINE_PENDING_TEXT,
@@ -151,9 +167,9 @@ export type OutlineCheckbox =
 	| "none";
 
 export type OutlineEditRequest =
-	| { add: string; markdown: string; after?: string }
+	| { add: string; markdown: string; after?: string; before?: string }
 	| { replace: string; text: string }
-	| { move: string; to: string; after?: string }
+	| { move: string; to: string; after?: string; before?: string }
 	| { delete: string }
 	| { set: string; checkbox?: OutlineCheckbox; assignee?: string | null; alias?: string | null }
 	| { confirm: string }
@@ -270,6 +286,8 @@ interface EditState {
 	located?: Located;
 	parent?: Located;
 	after?: OutlineResolvedBlock;
+	/** The sibling to place before (an add's first block, a move), instead of `after`. */
+	before?: OutlineResolvedBlock;
 	items?: PlannedItem[];
 	/** For set: the alias asked for (`Q?` resolved later). */
 	alias?: string | null;
@@ -559,6 +577,10 @@ export async function outlineEdit(
 	scope: OutlineAgentScope,
 	input: OutlineEditInput,
 	provenance: OutlineEditProvenance,
+	options: {
+		/** What a clearly over-limit note gets; the configured mode by default (tests pass both). */
+		noteRules?: OutlineNoteRulesMode;
+	} = {},
 ): Promise<OutlineToolOutput> {
 	const meta = { tool: "OutlineEdit" } as Record<string, unknown>;
 	const decisions = input.edits.filter(isDecision);
@@ -602,19 +624,23 @@ export async function outlineEdit(
 			}
 			return located;
 		};
-		if ("add" in r) {
-			edit.parent = await at(r.add, true);
-			if (r.after !== undefined) {
-				const after = await at(r.after, false);
+		const sibling = async (request: { after?: string; before?: string }) => {
+			if (request.after !== undefined) {
+				const after = await at(request.after, false);
 				if (after?.kind === "block") edit.after = after.block;
 			}
+			if (request.before !== undefined) {
+				const before = await at(request.before, false);
+				if (before?.kind === "block") edit.before = before.block;
+			}
+		};
+		if ("add" in r) {
+			edit.parent = await at(r.add, true);
+			await sibling(r);
 		} else if ("move" in r) {
 			edit.located = await at(r.move, false);
 			edit.parent = await at(r.to, true);
-			if (r.after !== undefined) {
-				const after = await at(r.after, false);
-				if (after?.kind === "block") edit.after = after.block;
-			}
+			await sibling(r);
 		} else {
 			edit.located = await at(targetOf(r), false);
 		}
@@ -622,7 +648,10 @@ export async function outlineEdit(
 	const located = edits.flatMap((edit) =>
 		[edit.located, edit.parent].filter((l): l is Located => l !== undefined),
 	);
-	for (const edit of edits) if (edit.after) located.push({ kind: "block", block: edit.after });
+	for (const edit of edits) {
+		if (edit.after) located.push({ kind: "block", block: edit.after });
+		if (edit.before) located.push({ kind: "block", block: edit.before });
+	}
 	const problems = edits.flatMap((edit) => edit.problems.map((p) => `${label(edit)}: ${p}`));
 	if (problems.length > 0) return failed(problems);
 
@@ -853,6 +882,112 @@ export async function outlineEdit(
 			edit.alias = r.alias === null || r.alias.trim() === "" ? null : nextAlias(r.alias);
 		}
 	}
+
+	// The note rules (`@shared/outline-note-structure`): what the call writes under a task, by
+	// where each block sits. Only what this call adds or rewrites; nothing already there is read.
+	const noteMode = options.noteRules ?? OUTLINE_NOTE_RULES.mode;
+	const noteText = OUTLINE_TOOL_TEXT.edit.noteRules;
+	const anchorOf = (edit: EditState) => (edit.kind === "add" ? edit.parent : edit.located);
+	// The edits apply in order: each is judged where its blocks sit once the edits before it
+	// have applied (a block an earlier edit made a task or a plain block, or moved).
+	const reader = new NoteAnchorReader(scope.store, space.id);
+	if (edits.some((edit) => edit.items?.length))
+		await reader.prefetch(
+			edits.flatMap((edit) =>
+				[edit.located, edit.parent].flatMap((l) => (l?.kind === "block" ? [l.block.id] : [])),
+			),
+		);
+	/** The blocks the check names: an existing block, or one the call adds (by its edit). */
+	const noteRefs = new Map<string, { edit: EditState; existing: boolean; text: string }>();
+	const noteWrites: NoteWrite[] = [];
+	for (const edit of edits) {
+		const r = edit.request;
+		const anchor = anchorOf(edit);
+		if (edit.items?.length) {
+			const at: NoteAnchor | undefined =
+				anchor?.kind === "block" ? await reader.anchor(anchor.block.id) : undefined;
+			const anchorDepth: number | null = at?.depth ?? null;
+			const toBlock = (p: PlannedItem, above: number | null, self?: string): NoteWriteBlock => {
+				// A rewrite that leaves the checkbox out keeps it.
+				const task = p.item.task !== null || (self !== undefined && anchorDepth === 0);
+				const depth = task ? 0 : above;
+				const ref = self ?? p.sid;
+				noteRefs.set(ref, {
+					edit,
+					existing: self !== undefined,
+					text: p.item.title || p.content,
+				});
+				return {
+					ref,
+					content: p.content,
+					task,
+					children: p.children.map((child) => toBlock(child, depth === null ? null : depth + 1)),
+				};
+			};
+			if (at?.skip) {
+				// Not held to the rules (a plan being planned, a report, a question).
+			} else if (edit.kind === "add") {
+				const ref = anchor?.kind === "block" ? anchor.block.sid : "/";
+				if (anchor?.kind === "block")
+					noteRefs.set(ref, { edit, existing: true, text: anchor.block.title });
+				noteWrites.push({
+					kind: "under",
+					parent: { ref, depth: anchorDepth },
+					blocks: edit.items.map((p) => toBlock(p, anchorDepth === null ? null : anchorDepth + 1)),
+				});
+			} else if (anchor?.kind === "block") {
+				const self = toBlock(edit.items[0] as PlannedItem, anchorDepth, anchor.block.sid);
+				// An approved plan's block rewritten: its own text was accepted in the plan's
+				// format; what the rewrite adds under it is checked like any other addition.
+				noteWrites.push(
+					at?.approvedPlan
+						? {
+								kind: "under",
+								parent: { ref: self.ref, depth: self.task ? 0 : anchorDepth },
+								blocks: self.children,
+							}
+						: { kind: "self", depth: anchorDepth, block: self },
+				);
+			}
+		}
+		// What this edit changes for the edits after it.
+		if (edit.located?.kind !== "block") continue;
+		const id = edit.located.block.id;
+		if ("set" in r && r.checkbox !== undefined) reader.setTask(id, r.checkbox !== "none");
+		else if ("replace" in r && edit.items?.[0]?.item.task) reader.setTask(id, true);
+		else if ("move" in r)
+			reader.move(id, edit.parent?.kind === "block" ? edit.parent.block.id : null);
+	}
+	const noteReport = noteWriteIssues(noteWrites);
+	/** A block by its id once it exists (`written`: whether a block the edit adds does). */
+	const noteAt = (written: (edit: EditState) => boolean) => (ref: string) => {
+		const named = noteRefs.get(ref);
+		return !named || named.existing || written(named.edit)
+			? noteText.written(scope.addressIn(space)(ref))
+			: noteText.unwritten(named.edit.index + 1, clip(named.text, 40));
+	};
+	const noteMeta = (refused: boolean) => ({
+		mode: noteMode,
+		refused,
+		issues: noteReport.total,
+		clear: noteReport.clear,
+	});
+	if (noteWriteRefused(noteReport, noteMode)) {
+		const clear = { ...noteReport, issues: noteReport.issues.filter((issue) => issue.clear) };
+		return {
+			output: [
+				noteText.refusedHeader,
+				...noteIssueLines(
+					{ ...clear, total: noteReport.clear },
+					noteAt(() => false),
+				).map((l) => `- ${l}`),
+				noteText.refusedRecover,
+			].join("\n"),
+			isError: true,
+			metadata: { ...meta, commit: null, noteRules: noteMeta(true) },
+		};
+	}
+	if (noteReport.total > 0) meta.noteRules = noteMeta(false);
 
 	// Hints, read before the barrier (it holds the space's live sessions while it runs): a new
 	// page whose title another page of the space already has.
@@ -1171,7 +1306,9 @@ export async function outlineEdit(
 							? { after: { tempId: previous } }
 							: edit.after
 								? { after: { id: edit.after.id } }
-								: undefined;
+								: edit.before
+									? { before: { id: edit.before.id } }
+									: undefined;
 						previous = insertTree(edit, p, parent, position);
 					}
 				} else if ("replace" in r) {
@@ -1229,7 +1366,11 @@ export async function outlineEdit(
 						op: "move",
 						block: { id: block.id },
 						parent: edit.parent?.kind === "block" ? { id: edit.parent.block.id } : null,
-						...(edit.after ? { position: { after: { id: edit.after.id } } } : {}),
+						...(edit.after
+							? { position: { after: { id: edit.after.id } } }
+							: edit.before
+								? { position: { before: { id: edit.before.id } } }
+								: {}),
 						baseVersionSeq: base(block.id),
 					});
 				} else if ("delete" in r) {
@@ -1265,6 +1406,28 @@ export async function outlineEdit(
 						});
 					}
 				}
+			}
+
+			// An `@agent:` assignee this write gives a task (design §2.2): a session that could not
+			// do the task there refuses the write; a name no session has is written as a name.
+			const given = ops.flatMap((op) => {
+				if (op.op !== "insert" && op.op !== "setTask" && op.op !== "restore") return [];
+				const assignee = op.task?.assignee;
+				if (!assignee?.startsWith("agent:")) return [];
+				// Unchanged on an existing task: nothing is assigned.
+				if (op.op === "setTask" && "id" in op.block) {
+					if (current.get(op.block.id)?.taskJson?.assignee === assignee) return [];
+				}
+				return [assignee];
+			});
+			if (given.length > 0) {
+				const checked = await checkAgentAssignees(given, space, { store: scope.store });
+				if (checked.refused.length > 0)
+					return {
+						output: failed(checked.refused.map(OUTLINE_TOOL_TEXT.edit.assigneeCannotWork)),
+					};
+				for (const name of checked.unknown)
+					globalNotes.push(OUTLINE_TOOL_TEXT.edit.assigneeUnknown(name));
 			}
 
 			// Write.
@@ -1309,6 +1472,14 @@ export async function outlineEdit(
 				if (error instanceof NotFoundError) return { output: failed([error.message]) };
 				throw error;
 			}
+
+			// A hand-over ended the work on a task in progress: said beside its edit.
+			result.results.forEach((r, i) => {
+				if (!r?.adjustments?.some((a) => a.kind === "handed-over")) return;
+				edits[opEdit[i] as number]?.notes.push(
+					OUTLINE_TOOL_TEXT.edit.handedOver(scope.labelIn(space)(r.sid)),
+				);
+			});
 
 			// The read ledger follows the agent's own writes: what it added and the texts it wrote.
 			// A merged block counts as read only once the result shows it (below), so until then
@@ -1363,6 +1534,30 @@ export async function outlineEdit(
 		const held = outcome.written.pending
 			? await heldSection(scope, space, outcome.written.pending)
 			: null;
+		// Tasks the call ticked done or cancelled (not held, not already so): each is asked for
+		// its one-line result when nothing under it gives one. The write stands.
+		const heldOps = new Set(outcome.written.pending?.opIndexes ?? []);
+		const ticked: TickedTask[] = [];
+		for (const edit of outcome.written.commit ? edits : []) {
+			if (edit.located?.kind !== "block" || edit.opIndexes.some((i) => heldOps.has(i))) continue;
+			const r = edit.request;
+			const to =
+				"set" in r && r.checkbox !== undefined && r.checkbox !== "none"
+					? STATUS_OF[r.checkbox]
+					: "replace" in r
+						? edit.items?.[0]?.item.task?.status
+						: undefined;
+			if (to !== "done" && to !== "cancelled") continue;
+			const block = edit.located.block;
+			if (outcome.before.status.get(block.id) === to || ticked.some((t) => t.id === block.id))
+				continue;
+			ticked.push({ id: block.id, sid: block.sid, cancelled: to === "cancelled" });
+		}
+		if (ticked.length > 0) {
+			const tidy = await finishedTaskHints(scope.store, space.id, ticked, scope.addressIn(space));
+			hints.push(...tidy);
+			if (tidy.length > 0) meta.finishHints = tidy.length;
+		}
 		return successOutput(
 			space,
 			spaceText,
@@ -1373,6 +1568,17 @@ export async function outlineEdit(
 			{
 				globalNotes,
 				hints,
+				// A block of an edit held for confirmation does not exist yet: named by its edit.
+				noteLines:
+					outcome.written.commit || outcome.written.pending
+						? noteIssueLines(
+								noteReport,
+								noteAt(
+									(edit) =>
+										outcome.written.commit !== null && !edit.opIndexes.some((i) => heldOps.has(i)),
+								),
+							)
+						: [],
 				meta,
 				held: held?.lines ?? [],
 				display: {
@@ -1769,6 +1975,8 @@ function successOutput(
 	extra: {
 		globalNotes: string[];
 		hints: string[];
+		/** What the call wrote under tasks that is over the note rules (written all the same). */
+		noteLines: string[];
 		meta: Record<string, unknown>;
 		/** What the result says about operations held for confirmation. */
 		held: string[];
@@ -1917,6 +2125,11 @@ function successOutput(
 		lines.push(OUTLINE_TOOL_TEXT.edit.notesHeader, ...notes.map((n) => `- ${n}`));
 	if (extra.hints.length > 0)
 		lines.push(OUTLINE_TOOL_TEXT.edit.hintsHeader, ...extra.hints.map((h) => `- ${h}`));
+	if (extra.noteLines.length > 0)
+		lines.push(
+			OUTLINE_TOOL_TEXT.edit.noteRules.warnHeader,
+			...extra.noteLines.map((l) => `- ${l}`),
+		);
 	const display = boundOutlineEditDisplay({
 		v: 1,
 		space: extra.display.space,

@@ -38,7 +38,7 @@ import {
 	wholeFileLineStats,
 } from "./file-diff-stats";
 import { consumeTaskReflectionGrant } from "./task-reflection";
-import { trackFileChange } from "./track-file-change";
+import { trackFileChange, withOverlapHint } from "./track-file-change";
 
 // ── Replacer types & implementations ────────────────────────────
 // Sourced from opencode's cascading replacer approach:
@@ -672,8 +672,11 @@ export const editTool: ToolDefinition = {
 				},
 			});
 			if (recorded) {
-				await trackFileChange(ctx, ioPath, "edit", backend, null, { evidenceRecorded: true });
-				return recorded;
+				const hint = await trackFileChange(ctx, ioPath, "edit", backend, null, {
+					evidenceRecorded: true,
+					hint: true,
+				});
+				return withOverlapHint(recorded, hint);
 			}
 			// An explicit runtime decline guarantees that no local IO was performed.
 			flow.declined();
@@ -816,7 +819,7 @@ export const editTool: ToolDefinition = {
 				{ signal: ctx.signal },
 			).then(async (result) => {
 				const { linesAdded, linesRemoved } = result.metadata ?? {};
-				await trackFileChange(
+				const hint = await trackFileChange(
 					ctx,
 					ioPath,
 					"edit",
@@ -824,8 +827,9 @@ export const editTool: ToolDefinition = {
 					typeof linesAdded === "number" && typeof linesRemoved === "number"
 						? { added: linesAdded, removed: linesRemoved }
 						: null,
+					{ evidenceRecorded: false, hint: true },
 				);
-				return result;
+				return withOverlapHint(result, hint);
 			});
 		} catch (err) {
 			if (err instanceof FileNoDispatchEvidenceError) throw err;

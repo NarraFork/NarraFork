@@ -1,6 +1,6 @@
 {
-  "id": "574502c1-4b4e-446a-8c02-1e2dd4beee29",
-  "prevId": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+  "id": "1363fe77-68fa-4135-8d93-e64136d06a6d",
+  "prevId": "c15812ac-e414-43f9-aee6-4290c568a3e5",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -15425,6 +15425,21 @@
           "method": "btree",
           "with": {}
         },
+        "idx_narrators_status": {
+          "name": "idx_narrators_status",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_narrators_owner": {
           "name": "idx_narrators_owner",
           "columns": [
@@ -15505,6 +15520,45 @@
           "columns": [
             {
               "expression": "variant",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_variant_list": {
+          "name": "idx_narrators_variant_list",
+          "columns": [
+            {
+              "expression": "variant",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "hidden_from_lists",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -19481,6 +19535,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'::text"
+        },
+        "expanded_json": {
+          "name": "expanded_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "layout": {
           "name": "layout",
@@ -24484,6 +24544,13 @@
           "notNull": true,
           "default": true
         },
+        "compact_auxiliary_content": {
+          "name": "compact_auxiliary_content",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
         "terminal_theme": {
           "name": "terminal_theme",
           "type": "text",
@@ -24538,6 +24605,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'"
+        },
+        "recent_tabs_show_directory": {
+          "name": "recent_tabs_show_directory",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         },
         "add_subagent_to_recent_tabs": {
           "name": "add_subagent_to_recent_tabs",
@@ -25969,6 +26043,33 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_workspace_panels_kind_workspace": {
+          "name": "idx_workspace_panels_kind_workspace",
+          "columns": [
+            {
+              "expression": "kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "workspace_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -26259,6 +26360,20 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "title_source": {
+          "name": "title_source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'manual'"
+        },
+        "title_revision": {
+          "name": "title_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "tree": {
           "name": "tree",

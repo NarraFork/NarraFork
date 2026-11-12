@@ -16,6 +16,7 @@ mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
 const { narratorStore } = await import("../narrator-store");
 const { settings } = await import("../../lib/settings");
+const compactJson = settings.narratorBlocks.compactJson;
 const blockSync = await import("../narrator-block-sync");
 const targets = await import("../narrator-block-targets");
 const page = await import("../narrator-block-page");
@@ -52,6 +53,7 @@ beforeEach(() => {
 });
 afterEach(() => {
 	settings.narratorBlocks.write = true;
+	settings.narratorBlocks.compactJson = compactJson;
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -157,6 +159,8 @@ describe("the message page in protocol v2", () => {
 	});
 
 	test("an envelope rewritten outside the store is synced before its ids are sent", async () => {
+		// This compatibility write changes a complete projection, not rows-only storage.
+		settings.narratorBlocks.compactJson = false;
 		const { stepId } = await conversation();
 		const before = rowIds(stepId);
 		const content = JSON.parse(

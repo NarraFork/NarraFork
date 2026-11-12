@@ -1,21 +1,26 @@
 /**
  * Queries and live updates of the read-only outline pages.
  */
+
 import type {
 	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
+	OutlineQuestionGroupResponse,
 	OutlineSpaceSummary,
 	OutlineViewMode,
 } from "@shared/outline-api";
 import {
 	OUTLINE_BLOCK_ID_RE,
+	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
+import { boundedFoldView } from "@shared/outline-fold";
 import {
 	type QueryClient,
 	useInfiniteQuery,
 	useMutation,
+	useQueries,
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
@@ -197,11 +202,15 @@ export function useOutlineViewStateSync(
 		const write = () => {
 			timer = null;
 			// Block ids only (the server refuses anything else); the last write of the page wins.
-			const collapsed = [...state.collapsed]
-				.filter((id) => OUTLINE_BLOCK_ID_RE.test(id))
-				.slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed);
+			// What the reader opened and what they closed share one limit.
+			const ok = (ids: Iterable<string>) =>
+				new Set([...ids].filter((id) => OUTLINE_BLOCK_ID_RE.test(id)));
+			const folding = boundedFoldView(
+				{ expanded: ok(state.expanded), collapsed: ok(state.collapsed) },
+				OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+			);
 			void api
-				.putOutlineViewState(pageId, { collapsed, layout: state.layout })
+				.putOutlineViewState(pageId, { ...folding, layout: state.layout })
 				.catch(() => undefined);
 		};
 		const off = state.on((part) => {
@@ -216,7 +225,7 @@ export function useOutlineViewStateSync(
 				.getOutlineViewState(pageId)
 				.then((stored) => {
 					if (disposed || touched || stored.updatedAt === null) return;
-					state.applyStored(stored.collapsed, stored.layout);
+					state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
 				})
 				.catch(() => loadedViewStates.delete(state));
 		}
@@ -295,15 +304,49 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 	void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
 }
 
-/** The questions under a block, with who may answer which (the inbox, the side panel). */
-export function useOutlineQuestions(blockId: string | null, enabled = true) {
-	return useQuery({
-		queryKey: outlineKeys.questions(blockId ?? ""),
-		queryFn: () => api.getOutlineQuestions(blockId as string),
-		enabled: enabled && !!blockId,
-		retry: false,
+/** A question root, or all questions under a task. */
+function outlineQuestionsQuery(blockId: string) {
+	return {
+		queryKey: outlineKeys.questions(blockId),
+		queryFn: () => api.getOutlineQuestions(blockId),
+		retry: false as const,
 		staleTime: 5_000,
-	});
+	};
+}
+
+export function useOutlineQuestions(blockId: string | null, enabled = true) {
+	return useQuery({ ...outlineQuestionsQuery(blockId ?? ""), enabled: enabled && !!blockId });
+}
+
+/** An Ask card reads its own roots, never an older task's entire question history. */
+export function useOutlineQuestionGroups(blockIds: readonly string[]) {
+	return useQueries({ queries: [...new Set(blockIds)].map(outlineQuestionsQuery) });
+}
+
+/** Share the existing page subscriptions with the editor; no polling or second socket. */
+export function useOutlineQuestionsLive(groups: readonly OutlineQuestionGroupResponse[]) {
+	const client = useQueryClient();
+	const pages = JSON.stringify([
+		...new Map(groups.map(({ group }) => [group.pageId, [group.pageId, group.spaceId]])).values(),
+	]);
+	useEffect(() => {
+		const unsubscribe = (JSON.parse(pages) as [string, string][]).map(([pageId, spaceId]) => {
+			let seen = -1;
+			return pageSubscriptions().subscribe(pageId, (hint) => {
+				if (
+					hint.kind === "denied" ||
+					((hint.kind === "subscribed" || hint.kind === "changed") && hint.seq > seen)
+				) {
+					if (hint.kind !== "denied") seen = hint.seq;
+					invalidateOutlineSpace(client, spaceId);
+					void client.invalidateQueries({ queryKey: ["human-attention"] });
+				}
+			});
+		});
+		return () => {
+			for (const dispose of unsubscribe) dispose();
+		};
+	}, [client, pages]);
 }
 
 /** Answer questions of one space at once; questions, views and the inbox re-read after. */
@@ -358,8 +401,26 @@ export function useOutlinePagePending(spaceId: string, pageId: string | undefine
 		queryKey: outlineKeys.pagePending(spaceId, pageId ?? ""),
 		queryFn: () => api.getOutlinePagePending(spaceId, pageId as string),
 		enabled: enabled && !!pageId,
-		retry: false,
+		// The live editor folds by the unanswered questions in it: a failed read is tried again.
+		retry: 2,
 		staleTime: 5_000,
+	});
+}
+
+/**
+ * Who wrote the subagent reports with these container ids, for a reader who may be told: the
+ * live editor's report lines say 「来自 …」. At most the first
+ * {@link OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds} containers are asked for (the rest show the
+ * time alone); a session's title rarely changes, so the answer is kept for a while.
+ */
+export function useOutlineReportAuthors(spaceId: string, ids: readonly string[], enabled = true) {
+	const asked = ids.slice(0, OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds);
+	return useQuery({
+		queryKey: [...outlineKeys.all, "report-authors", spaceId, asked.join(",")],
+		queryFn: async () => (await api.getOutlineReportAuthors(spaceId, asked)).authors,
+		enabled: enabled && asked.length > 0,
+		retry: false,
+		staleTime: 60_000,
 	});
 }
 

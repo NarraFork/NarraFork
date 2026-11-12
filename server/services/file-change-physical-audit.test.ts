@@ -30,6 +30,7 @@ import { join } from "node:path";
 import type { FileChangeBlobRef } from "@shared/file-change-protocol";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTestDb } from "../../tests/setup";
+import { safeSpawn } from "../lib/spawn";
 import { FileChangeBlobCatalog } from "./file-change-blob-catalog";
 import { FileChangeBlobStore } from "./file-change-blob-store";
 import {
@@ -380,6 +381,118 @@ function assertAuthority(summary: FileChangePhysicalAuditSummary): void {
 }
 
 describe("physical audit: actual migrated file DB and BlobStore/Catalog", () => {
+	test("compiled audit self-launches through index without importing the application", async () => {
+		const entry = join(sandbox, "compiled-audit.ts");
+		const binary = join(sandbox, `audit${process.platform === "win32" ? ".exe" : ""}`);
+		await writeFile(
+			entry,
+			`import { auditFileChangePhysical, FILE_CHANGE_PHYSICAL_AUDIT_WORKER_FLAG as flag } from ${JSON.stringify(join(import.meta.dir, "file-change-physical-audit.ts"))};
+if (process.argv.includes(flag)) {
+  await import(${JSON.stringify(join(import.meta.dir, "../index.ts"))});
+} else {
+  const spawn = Bun.spawn;
+  const mode = process.argv[3];
+  const controller = new AbortController();
+  let childPid;
+  let attempts = 0;
+  Bun.spawn = (cmd, options) => {
+    attempts++;
+    if (cmd.length !== 2 || cmd[0] !== process.execPath || cmd[1] !== flag) throw new Error("not a frozen subprocess");
+    if (mode === "start-failure") throw new Error("injected spawn failure");
+    const child = spawn(cmd, { ...options, stderr: "inherit" });
+    childPid = child.pid;
+    if (mode === "crash") child.kill("SIGKILL");
+    if (mode === "cancel") queueMicrotask(() => controller.abort());
+    return child;
+  };
+  const request = JSON.parse(process.argv[2]);
+  if (mode === "deadline") request.budget = { durationMs: 1 };
+  const summary = await auditFileChangePhysical({ ...request, signal: controller.signal });
+  if (attempts !== 1) throw new Error("audit must not retry outside the frozen process");
+  if (mode !== "start-failure" && (!childPid || childPid === process.pid)) throw new Error("audit must use a separate PID");
+  console.log(JSON.stringify(summary));
+}`,
+		);
+		const built = await Bun.build({
+			entrypoints: [entry],
+			target: "bun",
+			compile: { outfile: binary },
+			plugins: [
+				{
+					name: "forbid-application-startup",
+					setup(build) {
+						build.onResolve({ filter: /generated\/build-info$/ }, (args) => ({
+							path: args.path,
+							namespace: "audit-build-info",
+						}));
+						build.onLoad({ filter: /.*/, namespace: "audit-build-info" }, () => ({
+							contents:
+								'export const buildVersion = "audit-fixture"; export const buildCommit = "frozen";',
+							loader: "ts",
+						}));
+						// Keep the real index dispatch, audit client and audit subprocess.
+						// Unselected application branches must neither run nor pull in a DB singleton.
+						build.onResolve(
+							{
+								filter:
+									/^\.\/(?:serve|manager\/main|db\/integrity-probe-worker|db\/snapshot-builder-worker|lib\/watcher\/parcel-watcher-worker|lib\/reveal-protocol-client)$/,
+							},
+							(args) => ({ path: args.path, namespace: "forbidden-app" }),
+						);
+						build.onLoad({ filter: /.*/, namespace: "forbidden-app" }, () => ({
+							contents:
+								'throw new Error("application imported by audit"); export const serve = () => {}; export const exitWithStartupProblem = () => {}; export const runManager = () => {}; export const runRevealProtocolClient = () => {};',
+							loader: "ts",
+						}));
+					},
+				},
+			],
+		});
+		expect(built.success, built.logs.map(String).join("\n")).toBe(true);
+		await put("compiled-audit-frozen-bytes");
+		const originalDb = await readFile(databasePath);
+		// Capture identities only after the fixture/build has stopped mutating ancestors.
+		const request = await options();
+		for (const [mode, issue] of [
+			["healthy", null],
+			["start-failure", "worker_start_failed"],
+			["crash", "worker_exited"],
+			["deadline", "deadline"],
+			["cancel", "cancelled"],
+		] as const) {
+			const run = await safeSpawn({
+				cmd: [binary, JSON.stringify(request), mode],
+				cwd: sandbox,
+				env: { ...process.env, NARRAFORK_HOME: join(sandbox, "unused-home") },
+				timeout: 10_000,
+				maxOutputBytes: 32 * 1024,
+			});
+			expect(run.exitCode, `${mode}: ${run.stderr}`).toBe(0);
+			expect(run.stderr).toBe("");
+			const summary = JSON.parse(run.stdout);
+			if (issue) {
+				expect(summary).toMatchObject({
+					status: mode === "start-failure" ? "unknown" : "partial",
+					full: false,
+				});
+				expect(summary.issues).toContain(issue);
+				if (mode === "start-failure" || mode === "crash") {
+					expect(summary.metrics.catalogRows).toBe(0);
+					expect(summary.metrics.verifiedObjects).toBe(0);
+				}
+			} else {
+				expect(summary).toMatchObject({
+					status: "observed",
+					full: true,
+					issues: [],
+					metrics: { catalogRows: 1, physicalObjects: 1, verifiedObjects: 1 },
+				});
+			}
+			expect(await readFile(databasePath)).toEqual(originalDb);
+			expect(await readdir(sandbox)).not.toContain("unused-home");
+		}
+	}, 60_000);
+
 	test("UTF-8, GBK, CRLF and binary bytes are hashed in a worker; no DB/body mutations", async () => {
 		const contents = [
 			Buffer.from("UTF8 中文\r\nkeep\r\n"),

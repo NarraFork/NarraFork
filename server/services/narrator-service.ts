@@ -41,6 +41,8 @@ import {
 	projects,
 	terminals,
 	terminalViewState,
+	workspacePanels,
+	workspaces,
 } from "../db/schema";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { resolveBackend } from "../lib/agent/execution/registry";
@@ -1178,6 +1180,9 @@ async function applySpecForkCarryover(
  */
 async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void> {
 	try {
+		// An outline session's tasks are not in Dynamic Spec (outline P2 PR 12a): a card would
+		// point at spec tasks it does not use (and reading them would create a spec namespace).
+		if ((await readTaskBackend(narratorId)) === "outline") return;
 		const summary = await specVfsService.summarizeSpecTasks(narratorId);
 		if (summary.total <= 0) return;
 		await narratorPersistence.persistDisplayMessage(narratorId, "", [
@@ -2452,6 +2457,20 @@ export const narratorService = {
 				tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds)).run();
 			}
 
+			// Invalidate generated workspace candidates before the panel FK cascade removes
+			// the only index telling us which workspaces contained this narrator.
+			tx.update(workspaces)
+				.set({ titleRevision: sql`${workspaces.titleRevision} + 1` })
+				.where(
+					inArray(
+						workspaces.id,
+						tx
+							.select({ id: workspacePanels.workspaceId })
+							.from(workspacePanels)
+							.where(eq(workspacePanels.narratorId, narratorId)),
+					),
+				)
+				.run();
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});

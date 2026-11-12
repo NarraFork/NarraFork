@@ -27,6 +27,15 @@ mock.module("../trace/TraceRowInteraction", () => ({
 		return <div data-trace-message={props.identity.messageId}>{props.children}</div>;
 	},
 }));
+const realContentSurfaceModule = { ...(await import("./VListRowInteraction")) };
+const contentSurfaces = new Map<string, import("./VListRowInteraction").VListRowInteractionProps>();
+mock.module("./VListRowInteraction", () => ({
+	...realContentSurfaceModule,
+	VListRowInteraction: (props: import("./VListRowInteraction").VListRowInteractionProps) => {
+		contentSurfaces.set(props.messageId, props);
+		return <div data-content-message={props.messageId}>{props.children}</div>;
+	},
+}));
 const { ExactRow } = await import("./ExactRow");
 const { useVListTraceBindings } = await import("./useVListTraceBindings");
 type HookInput = Parameters<typeof useVListTraceBindings>[0];
@@ -41,6 +50,7 @@ const toggles: RowToggles = {
 	onToggleTranslation: noop,
 	onTogglePrompt: noop,
 	onToggleFileChanges: noop,
+	onPlanTree: noop,
 };
 const labels = { trace: {}, subagent: { openSession: "open-child" } } as VListRenderLabels;
 const sourceIds: readonly string[] = [];
@@ -83,6 +93,7 @@ beforeAll(() => {
 afterAll(() => {
 	renderSpy.mockRestore();
 	mock.module("../trace/TraceRowInteraction", () => realTraceModule);
+	mock.module("./VListRowInteraction", () => realContentSurfaceModule);
 });
 
 let root: Root | undefined;
@@ -130,6 +141,7 @@ afterEach(() => {
 	root = undefined;
 	host?.remove();
 	surfaces.clear();
+	contentSurfaces.clear();
 	renderCounts.clear();
 });
 
@@ -247,6 +259,56 @@ function surface(messageId: string): TraceRowInteractionProps {
 }
 
 describe("useVListTraceBindings", () => {
+	test("auxiliary rows retain the content inspector and source jump without fake tool identity", () => {
+		const openSource = mock(() => {});
+		const item: TraceItem = {
+			key: "aux-received",
+			title: "Reviewer · report",
+			canDrillDown: true,
+			identity: {
+				messageId: "received",
+				blockIndex: 0,
+				blockIndices: [0],
+				auxiliary: true,
+				source: "subagent_message",
+				modelFacing: "original model input",
+				target: { kind: "narrator", narratorId: "child-a", messageId: "report" },
+			},
+		};
+		const input = frame([], { onViewSubagentSession: openSource });
+		const entry: SelectionEntry = {
+			blockId: "msg-received-0",
+			messageId: "received",
+			blockIndex: 0,
+			blockIndices: [0],
+			copyText: "report",
+			seq: 1,
+			chunkIndex: 0,
+		};
+		input.selectionIndex = { entries: [entry], byBlockId: new Map([[entry.blockId, entry]]) };
+		input.renderItems = [group("aux-group", [item])];
+		const first = render(input).get("aux-group");
+		const surface = contentSurfaces.get("received");
+		expect(surface?.blockId).toBe("msg-received-0");
+		expect(surface?.toolUseId).toBeUndefined();
+		expect(surface?.toolDetailRef).toBeUndefined();
+		expect(surface?.inspectContent?.text).toBe("original model input");
+		surface?.actions.onJumpToSource?.();
+		expect(openSource).toHaveBeenLastCalledWith("child-a", "report");
+		expect(render(freshFrame(input)).get("aux-group")).toBe(first);
+		const changed = freshFrame(input);
+		const changedItem = changed.renderItems[0];
+		if (!changedItem) throw new Error("missing auxiliary group");
+		const identity = specRows(changedItem)[0]?.identity;
+		if (!identity) throw new Error("missing auxiliary identity");
+		identity.target = { kind: "narrator", narratorId: "child-b" };
+		identity.modelFacing = "changed model input";
+		expect(render(changed).get("aux-group")).not.toBe(first);
+		const nextSurface = contentSurfaces.get("received");
+		expect(nextSurface?.inspectContent?.text).toBe("changed model input");
+		nextSurface?.actions.onJumpToSource?.();
+		expect(openSource).toHaveBeenLastCalledWith("child-b", undefined);
+	});
 	test("rebuilding every index only repaints the changed tail, not two history groups", () => {
 		const input = frame([group("old-a"), group("old-b"), group("tail")]);
 		const previous = render(input);

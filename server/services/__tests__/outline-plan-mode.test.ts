@@ -105,7 +105,10 @@ async function enter(narratorId: string, owner: string, input: Record<string, un
 	return result;
 }
 
-/** A plan: a person's step, a milestone whose first step waits for its second, and a last step. */
+/**
+ * A plan: the background, a person's step, a milestone whose first step waits for its second, a
+ * last step and a note.
+ */
 async function writePlan(narratorId: string, owner: string) {
 	const root = await findPlanningRoot(narratorId);
 	if (!root) throw new Error("no plan root");
@@ -154,6 +157,13 @@ async function writePlan(narratorId: string, owner: string) {
 			tempId: "note",
 			parent: { id: root.blockId },
 			content: "Decision: use the v2 API",
+		},
+		// The plan format's background, first under the root (plan readability).
+		{
+			op: "insert",
+			parent: { id: root.blockId },
+			position: { first: true },
+			content: "The importer fails every night and is rerun by hand; this makes it run unattended.",
 		},
 	]);
 	const ids = (i: number) => r.results[i]?.blockId as string;
@@ -383,7 +393,7 @@ describe("submitting a plan", () => {
 		expect(input.plan).not.toContain("‹plan");
 		expect(input._planBaseSeq).toBe(0);
 		expect(input._planSummary).toBe("First cut");
-		expect((input._planDiff as { counts: { added: number } }).counts.added).toBe(7);
+		expect((input._planDiff as { counts: { added: number } }).counts.added).toBe(8);
 		expect((input._planRoot as { round: number }).round).toBe(1);
 
 		const inline = await resolveOutlineExitPlanInput(

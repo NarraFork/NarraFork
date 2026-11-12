@@ -131,6 +131,15 @@ export const ERROR_CATALOG = {
 		en: "This session keeps its tasks in the outline, so its Dynamic Spec tasks and notes are not used. Only the behavior fence still applies.",
 	},
 	/**
+	 * A Dynamic Spec write while the session's tasks and notes are being imported into the outline
+	 * (outline P2 PR 12b): the import takes a moment, after which the session is an outline session.
+	 */
+	SPEC_IMPORT_IN_PROGRESS: {
+		status: 409,
+		code: "SPEC_IMPORT_IN_PROGRESS",
+		en: "This session's Dynamic Spec is being imported into the outline. Try again in a moment.",
+	},
+	/**
 	 * `/goal` sent to a subagent of such a session: the goal is a task of the session, and an
 	 * outline subagent has no tasks of its own (D27c).
 	 */

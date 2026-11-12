@@ -111,7 +111,7 @@ for (const [lng, resource] of [
 		expect(result.quotaBalance).not.toContain(t("providerBalance.wallet"));
 		expect(result.detailedQuotaBalance.split("\n")).toEqual([
 			"USD 0",
-			`${t("providerBalance.failed")} · ${t("providerBalance.stale")}`,
+			`${t("providerBalance.errorRequestFailed")} · ${t("providerBalance.stale")}`,
 		]);
 	});
 	test.each([
@@ -149,10 +149,33 @@ for (const [lng, resource] of [
 		value.error = "request_failed";
 		const result = formatProviderBalance(value, t, false, 1000);
 		expect(result.quotaBalance).toContain("5h: 0");
-		expect(result.quotaBalance).toContain(t("providerBalance.failed"));
+		expect(result.quotaBalance).toContain(t("providerBalance.errorRequestFailed"));
 		expect(result.quotaBalance).toContain(t("providerBalance.stale"));
 		expect(formatProviderBalance(snapshot(), t, false, 122_000).quotaBalance).toContain(
 			t("providerBalance.stale"),
+		);
+	});
+	test(`${lng}: each failure code keeps its own fixed label`, () => {
+		const cases = [
+			["request_failed", "providerBalance.errorRequestFailed"],
+			["invalid_configuration", "providerBalance.errorInvalidConfiguration"],
+			["auth_failed", "providerBalance.errorAuth"],
+			["invalid_response", "providerBalance.errorInvalidResponse"],
+			["plugin_not_enabled", "providerBalance.errorPluginNotEnabled"],
+		] as const;
+		for (const [error, key] of cases) {
+			const value = snapshot();
+			value.balance = null;
+			value.status = "error";
+			value.error = error;
+			expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toBe(t(key));
+		}
+		// A failure with no server code falls back to the generic label rather than claiming a
+		// retry can help, since the code (not the transport) decides what is safe to promise.
+		const noCode = snapshot();
+		noCode.balance = null;
+		expect(formatProviderBalance(noCode, t, true, 1000).quotaBalance).toBe(
+			t("providerBalance.failed"),
 		);
 	});
 	test(`${lng}: pending/unsupported and missing balances never show fake zero`, () => {

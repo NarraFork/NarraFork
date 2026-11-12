@@ -1,4 +1,5 @@
 import { type Locale, type LocalizedValue, pickLocalizedValue } from "@shared/i18n-locales";
+import { OUTLINE_NOTE_RULES } from "@shared/outline-note-structure";
 import type { OutlineTaskNoticeChange } from "@shared/outline-task-notice";
 
 // ─── Outline tasks ───
@@ -14,6 +15,12 @@ import type { OutlineTaskNoticeChange } from "@shared/outline-task-notice";
 // what does not change while a session runs (design §0, the three conventions); live task state
 // reaches the model through the views (named context parts, updated when they change) and tool
 // results. The views' text is deterministic (fixed order, no times): it is also their change key.
+//
+// Convention 1 states how a note under a task is written (task tree readability PR D, decision
+// D53: conclusion, then evidence, then detail) with the numbers `OutlineEdit` checks
+// (`@shared/outline-note-structure`): constants, so the text is the same every turn.
+
+const { titleChars, noteChars, detailChars, maxChildren } = OUTLINE_NOTE_RULES;
 
 /** One task as the outline prompts name it. */
 export interface OutlineTaskPromptTask {
@@ -30,7 +37,7 @@ const systemReminder: LocalizedValue<string> = {
 # Outline
 
 This session keeps its notes and tasks in the outline: read with OutlineRead and OutlineSearch, write with OutlineEdit. A task is a block with a checkbox: \`[ ]\` to do, \`[/]\` in progress, \`[x]\` done, \`[-]\` cancelled. Tasks you set yourself go in this session's space (\`session/\`). Three conventions:
-1. Write what will be needed later into the outline: conclusions, decisions, pitfalls, plans. Writing it under the task at hand is enough.
+1. Write what will be needed later into the outline: conclusions, decisions, pitfalls, plans. Write it under the task at hand, conclusion first: each block directly under a task is one conclusion in one line (at most ${noteChars} characters); its evidence (file:line, the commands you ran and their results) goes in blocks under that conclusion, and details under those (each at most ${detailChars} characters, at most ${maxChildren} blocks on one level). Do not record the process (what you looked at, what you tried): the conversation has it. No markdown headings: levels are the indentation. A task's title is one line (at most ${titleChars} characters) saying what done means. A finished task shows as its title and the first line under it, so when you tick a task done, its first block must say the result in one line.
 2. When you start a task, tick it in progress; when it is done, tick it done. When a person has to decide something, ask them and give your recommendation.
 3. When a tool says a change was handed to someone for confirmation, do the parts it does not affect first.
 
@@ -42,7 +49,7 @@ The system keeps two views in your context and updates them when they change: th
 # 大纲
 
 本会话的笔记和任务都在大纲里：用 OutlineRead、OutlineSearch 读，用 OutlineEdit 写。任务就是带复选框的块：\`[ ]\` 待办、\`[/]\` 进行中、\`[x]\` 完成、\`[-]\` 取消。你给自己定的任务写在本会话的空间里（\`session/\`）。三条约定：
-1. 以后还用得到的写进大纲：结论、决定、坑、计划。写在手头的任务下面就行。
+1. 以后还用得到的写进大纲：结论、决定、坑、计划。写在手头的任务下面，按「结论 → 依据 → 细节」：任务下第一层每块是一行结论（不超过 ${noteChars} 字）；依据（文件:行、跑过的命令和结果）写成这条结论的子块，细节再往下一层（每块不超过 ${detailChars} 字，一层不超过 ${maxChildren} 块）。不写过程（先看了什么、又试了什么）：过程在会话记录里。不用 markdown 标题，层次用缩进表达。任务标题只写一行（不超过 ${titleChars} 字），说清做成什么算完成。完成的任务收起后只显示标题和它下面的第一行，所以勾完成时，任务下第一块要是一行结果。
 2. 开始做一个任务就把它勾成进行中，做完勾成完成；需要人决定的，提问并附上你的建议。
 3. 工具说改动「已交给某人确认」时，先做不受影响的部分。
 
@@ -208,9 +215,13 @@ const tasksViewText = {
 	},
 	waiting: { en: "Waiting:", "zh-CN": "等待中：" },
 	next: { en: "Next:", "zh-CN": "下一个：" },
+	assigned: {
+		en: "Assigned to you, not started (set one in progress when you take it up):",
+		"zh-CN": "指派给你、还没开始（要做时把它设成进行中）：",
+	},
 } satisfies Record<string, LocalizedValue<string>>;
 
-export type OutlineTasksViewSection = "doing" | "delegated" | "waiting" | "next";
+export type OutlineTasksViewSection = "doing" | "delegated" | "waiting" | "next" | "assigned";
 
 /** The first line of the current-tasks view. */
 export function getOutlineTasksViewHeading(locale: Locale): string {
@@ -532,6 +543,31 @@ function changeText(change: OutlineTaskEditChange, locale: Locale): string {
 				? `退回了你把它标为${editStatusWord(change.status, locale)}的改动${reason}。它仍未完成，接着做`
 				: `rejected your marking it ${editStatusWord(change.status, locale)}${reason}. It is still open; carry on with it`;
 		}
+		// Team activity's changes (P2 PR 10b): its own text words them (`prompts/outline-team.ts`);
+		// people's edits never carry them, so these words are only a fallback.
+		case "notes":
+			return zh ? `加了 ${change.n} 条笔记` : `${change.n} notes added`;
+		case "reports":
+			return zh ? `挂回了 ${change.n} 份报告` : `${change.n} reports attached`;
+		case "answers":
+			return zh ? `回答了 ${change.n} 个提问` : `${change.n} questions answered`;
+		case "claimable":
+			return zh ? "放进了可领取池" : "put in the claim pool";
+		case "overlap":
+			return zh ? `也在改 ${change.path}` : `also changing ${change.path}`;
+		// Team events' changes (P2 PR 10a): worded by `getOutlineTeamEventsNote`; a fallback too.
+		case "assignedHere":
+			return zh ? "指派给了本会话" : "assigned to this session";
+		case "created":
+			return zh ? "本会话建的" : "created by this session";
+		case "unblocked":
+			return zh
+				? change.by === "done"
+					? "一个前置已完成"
+					: "一个前置被取消了"
+				: change.by === "done"
+					? "a prerequisite was finished"
+					: "a prerequisite was cancelled";
 	}
 }
 
@@ -610,4 +646,120 @@ export function getOutlineTaskFinishedNote(
 	return zh
 		? `系统通知（不是用户发言）：本会话在大纲里建的任务在别处结束了。\n\n${lines.join("\n")}\n\n结果和报告在各自的任务下面，用 OutlineRead 读；不满意可以重开（设回待办）。`
 		: `System notice (not the user speaking): tasks this session created in the outline were finished elsewhere.\n\n${lines.join("\n")}\n\nThe results and any reports are under each task; read them with OutlineRead. If one does not meet what you wanted, reopen it (set it to do).`;
+}
+
+// ─── Team events: assigned, a prerequisite ended, created tasks ended (outline P2 PR 10a) ───
+
+/** A task assigned to the session by name, as the team notice names it. */
+export interface OutlineTeamAssignedEntry {
+	/** `key/sid`. */
+	address: string;
+	title: string;
+	humanCreated: boolean;
+}
+
+/** A task of the session whose prerequisite was ended, as the team notice names it. */
+export interface OutlineTeamUnblockedEntry {
+	address: string;
+	title: string;
+	prerequisite: { address: string; title: string; status: "done" | "cancelled" };
+	/** It still waits for something else (another prerequisite, a person, a confirmation). */
+	stillWaiting: boolean;
+}
+
+/**
+ * The notice a session gets when one commit of someone else concerns it in more than one way
+ * (design §D.2 「合并」: one row per commit and session): tasks assigned to it by name, tasks of its
+ * own whose prerequisite was ended, tasks it created that were ended. A system notice (not the
+ * user speaking), in the past tense: it says what happened in that commit, and the session reads
+ * the tasks for what they are now. `by` is who made the commit, as the caller names them; `more`
+ * counts what the commit's limit left out.
+ */
+export function getOutlineTeamEventsNote(
+	input: {
+		by: string;
+		assigned: readonly OutlineTeamAssignedEntry[];
+		unblocked: readonly OutlineTeamUnblockedEntry[];
+		finished: readonly OutlineTaskFinishedEntry[];
+		more: number;
+	},
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const sep = zh ? "：" : ": ";
+	const blocks: string[] = [];
+	if (input.assigned.length > 0) {
+		const lines = input.assigned.map((entry) => {
+			const mark = entry.humanCreated ? (zh ? "（人建）" : " (set by a person)") : "";
+			return `- \`${entry.address}\` ${entry.title}${mark}`;
+		});
+		blocks.push(
+			[
+				zh
+					? `${input.by}把这些任务指派给了本会话（还没开始；要做时把它设成进行中）：`
+					: `Assigned to this session by ${input.by} (not started; set one in progress when you take it up):`,
+				...lines,
+			].join("\n"),
+		);
+	}
+	if (input.unblocked.length > 0) {
+		const lines = input.unblocked.map((entry) => {
+			const p = entry.prerequisite;
+			// Its title only when the session may read it (the caller leaves it empty otherwise).
+			const named = p.title ? `\`${p.address}\` ${p.title}` : `\`${p.address}\``;
+			const what = zh
+				? p.status === "done"
+					? `它的前置 ${named} 已完成`
+					: `它的前置 ${named} 被取消了，先看看这个任务还要不要做`
+				: p.status === "done"
+					? `its prerequisite ${named} was ticked done`
+					: `its prerequisite ${named} was cancelled; check whether this task is still needed`;
+			const rest = entry.stillWaiting
+				? zh
+					? "；它还在等别的"
+					: "; it still waits for something else"
+				: zh
+					? "；它不再等了"
+					: "; it no longer waits";
+			return `- \`${entry.address}\` ${entry.title}${sep}${what}${rest}`;
+		});
+		blocks.push(
+			[
+				zh
+					? `${input.by}结束了本会话任务的前置：`
+					: `Prerequisites of this session's tasks were ended by ${input.by}:`,
+				...lines,
+			].join("\n"),
+		);
+	}
+	if (input.finished.length > 0) {
+		const lines = input.finished.map((entry) => {
+			const mark = entry.humanCreated ? (zh ? "（人建）" : " (set by a person)") : "";
+			const what = zh
+				? entry.status === "done"
+					? "已勾成完成"
+					: "已取消"
+				: entry.status === "done"
+					? "ticked done"
+					: "cancelled";
+			return `- \`${entry.address}\` ${entry.title}${mark}${sep}${what}`;
+		});
+		blocks.push(
+			[
+				zh
+					? `${input.by}结束了本会话建的任务（结果和报告在各自的任务下面；不满意可以重开）：`
+					: `Tasks this session created were ended by ${input.by} (the results and any reports are under each task; reopen one that does not meet what you wanted):`,
+				...lines,
+			].join("\n"),
+		);
+	}
+	if (input.more > 0)
+		blocks.push(
+			zh
+				? `同一次改动里还有 ${input.more} 处与本会话有关，未列出。`
+				: `${input.more} more changes of the same commit concern this session (not listed).`,
+		);
+	return zh
+		? `系统通知（不是用户发言）：大纲里与本会话有关的任务有了变化。\n\n${blocks.join("\n\n")}\n\n动手前先用 OutlineRead 读这些任务，以它们现在的样子为准。`
+		: `System notice (not the user speaking): tasks in the outline that concern this session changed.\n\n${blocks.join("\n\n")}\n\nRead the tasks with OutlineRead before acting on them: what they are now decides.`;
 }

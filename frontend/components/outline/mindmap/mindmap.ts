@@ -28,6 +28,7 @@ import {
 	layoutTree,
 	planVisible,
 } from "@shared/outline/layout";
+import { buildFoldTree, type FoldTree, foldSubtreeControl } from "@shared/outline-fold";
 import type { LiveTaskChar } from "@shared/outline-live-protocol";
 import { getTypographyRevision, onTypographyChange } from "@shared/pretext-layout/typography";
 import type { Command } from "prosemirror-state";
@@ -35,6 +36,8 @@ import { ensureTypographyCssVars } from "../../../lib/typography-css-vars";
 import { pinchStep, wheelZoomFactor, zoomAround } from "../../common/pan-zoom-math";
 import {
 	applyChrome,
+	type BlockMark,
+	chromeText,
 	createGutter,
 	type Gutter,
 	type MentionResolver,
@@ -55,21 +58,27 @@ import {
 	toggleTask,
 } from "../editor/commands";
 import type { LiveClient, SelInfo } from "../editor/live-client";
+import { liveFoldSource, liveUnderTask } from "../editor/live-fold";
 import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "../editor/view";
 import type { OutlineViewState } from "../view-state";
 import {
 	bodySize,
 	cachedBodySize,
 	frameWidth,
+	type LabelOf,
 	MAP_FONT_FAMILY,
 	MAP_MONO_FAMILY,
+	MAX_MEASURE_BODY_CHARS,
 	mapType,
+	measureKey,
 	NODE,
 	nodeSize,
+	onMeasured,
 } from "./measure";
+import { prewarmBodies } from "./prewarm";
 
 /** Most blocks one map lays out and draws (design §7.2: the same cap as an editor view). */
-export /** Nodes laid out (and measured on the main thread) while the Worker measures the page. */
+export /** Provisional nodes laid out while the Worker measures the page. */
 const HELD_LAYOUT_MAX = 100;
 const MAP_BUDGET = 2000;
 /** Nodes this far outside the stage still get DOM (so panning shows them at once). */
@@ -106,6 +115,15 @@ export interface MapHost {
 	focusBlock(id: string): void;
 	focusUp(): void;
 	toggleCollapse(id: string): void;
+	/** Make sure a block shows its children (one is about to be added or dropped into it). */
+	openBlock(id: string): void;
+	/** Everything inside a block: opened, or back to the default view (Alt on its arrow). */
+	toggleSubtree(id: string, open: boolean): void;
+	/**
+	 * The page's marks as the outline folds by them (a question waiting for an answer holds the
+	 * blocks above it open), and whether the page's summary arrived.
+	 */
+	foldMarks(): { marks: ReadonlyMap<string, BlockMark>; known: boolean };
 	/** Keys shared by the outline, the map and node editors (collapse all, levels, …). */
 	surfaceKeys(): Record<string, Command>;
 	restoreSel(sel: SelInfo): boolean;
@@ -128,6 +146,8 @@ interface NInfo {
 	index: number;
 	/** A "…N more" node: its parent's children beyond the budget. */
 	more: boolean;
+	/** No exact result for the current body/typography; draw clipped plain text. */
+	provisional: boolean;
 }
 
 interface NodeEl {
@@ -176,6 +196,8 @@ export class MindMapView {
 	info = new Map<string, NInfo>();
 	order: string[] = [];
 	rootId = "";
+	/** The tree with what is open, as the last layout worked it out (`@shared/outline-fold`). */
+	foldTree: FoldTree | null = null;
 	readonly els = new Map<string, NodeEl>();
 	/** Nodes that must have DOM while a transition runs. */
 	readonly force = new Set<string>();
@@ -196,15 +218,16 @@ export class MindMapView {
 			w: number;
 			h: number;
 			bodyW: number;
-			/** The typography generation the size was measured under. */
-			gen: number;
+			provisional: boolean;
 		}
 	>();
 	/**
 	 * The typography setting is moving (a slider drag in the 外观 panel), until the host calls
-	 * {@link typographySettled}. Meanwhile only nodes on screen are measured again.
+	 * {@link typographySettled}. Meanwhile every uncached node keeps provisional geometry.
 	 */
 	private typographyMoving = false;
+	/** Automatic cache-miss requests are attempted once; a failure is not a render retry loop. */
+	private readonly requested = new Set<string>();
 	private dirtyLayout = true;
 	private dirtyRender = true;
 	private raf = 0;
@@ -215,6 +238,7 @@ export class MindMapView {
 	private layoutSeq = 0;
 	private readonly ro: ResizeObserver;
 	private readonly offTypography: () => void;
+	private readonly offMeasured: () => void;
 	private destroyed = false;
 	stats = {
 		layouts: [] as number[],
@@ -264,15 +288,9 @@ export class MindMapView {
 			this.schedule(false);
 		});
 		this.ro.observe(this.stage);
-		// The reader changed the typography (外观 · 排版): every node's size was measured under
-		// the old one. The measure cache drops its entries itself (`measure.ts`); the per-block
-		// sizes here are keyed by text, so they go too, and the next layout measures again.
-		// The reader changed the typography (外观 · 排版): sizes were measured under the old one.
-		// Re-measuring every node on each slider step costs ~0.3 ms a body on the main thread
-		// (a quarter of a second at 800 nodes, per step), so until the setting settles only the
-		// nodes on screen are measured again; the rest keep their size (or take a cached one)
-		// and are measured once the host says the setting has settled — by then the Worker has
-		// usually measured them ahead (`EditSurface`), so that layout reads the cache.
+		// A typography change keeps old geometry provisionally until the Worker fills the
+		// current cache. Even nodes on screen must not be re-measured on the UI thread.
+		this.offMeasured = onMeasured(() => this.schedule());
 		this.offTypography = onTypographyChange(() => {
 			this.typographyMoving = true;
 			this.schedule();
@@ -308,6 +326,7 @@ export class MindMapView {
 		this.raf = 0;
 		this.ro.disconnect();
 		this.offTypography();
+		this.offMeasured();
 		this.stage.remove();
 	}
 
@@ -322,9 +341,8 @@ export class MindMapView {
 
 	/**
 	 * Until `until` settles (the page's bodies are being measured in the Worker), lay out at most
-	 * `HELD_LAYOUT_MAX` nodes (breadth first, the rest folded into "N more"): laying out the
-	 * whole page now would measure every body on the main thread. Then the whole tree, the root
-	 * kept where it is on screen.
+	 * `HELD_LAYOUT_MAX` nodes (breadth first, the rest folded into "N more"). Once released,
+	 * lay out the whole tree from cached or provisional geometry, keeping the root in place.
 	 */
 	holdLayout(until: Promise<unknown>): void {
 		const p: Promise<void> = until.then(
@@ -379,8 +397,7 @@ export class MindMapView {
 
 	/**
 	 * The typography setting has settled (the host waits for the slider to rest, and for the
-	 * Worker to measure the page under it): every node still sized under an earlier setting is
-	 * measured now.
+	 * Worker to measure the page under it): use its exact cache entries, leaving failures provisional.
 	 */
 	typographySettled(): void {
 		if (!this.typographyMoving) return;
@@ -424,7 +441,22 @@ export class MindMapView {
 			const kids = v.children(id);
 			return facts ? kids.filter((k) => !v.get(k)?.task) : kids;
 		};
-		const collapsedOf = (id: string) => st.collapsed.has(id);
+		// What is open: the page's default view with the reader's folding over it, as the
+		// outline (`@shared/outline-fold`). A closed node carries a count badge.
+		const tree = buildFoldTree(
+			liveFoldSource(client, {
+				marks: this.host.foldMarks().marks,
+				questionsKnown: this.host.foldMarks().known,
+				...(facts ? { omit: (id) => !!v.get(id)?.task } : {}),
+			}),
+			{ rootId, rootDetail: liveUnderTask(client, rootId) },
+			st,
+		);
+		this.foldTree = tree;
+		const collapsedOf = (id: string) => {
+			const node = tree.nodes.get(id);
+			return node !== undefined && node.kids.length > 0 && !node.open;
+		};
 		const plan = planVisible({
 			rootId,
 			children: kidsOf,
@@ -434,30 +466,32 @@ export class MindMapView {
 		const info = new Map<string, NInfo>();
 		const order: string[] = [];
 		let measureMs = 0;
+		const pending: Array<{ content: string; labelOf: LabelOf }> = [];
 		const ed = this.editing;
 		const gen = getTypographyRevision();
 		const make = (id: string, parent: string | null, index: number): LayoutNode => {
-			const content = client.textOf(id);
+			// A subagent report's container line is measured and drawn as people read it (their
+			// language and time zone); editing the node shows the stored text.
+			const stored = client.textOf(id);
+			const content = chromeText.reportLine(stored, id) ?? stored;
 			const task = v.get(id)?.task ?? null;
 			const allKids = kidsOf(id);
 			const collapsed = id !== rootId && collapsedOf(id) && allKids.length > 0;
-			// Sizes cached per block: unchanged text and checkbox skip the measure cache too (a block
-			// with mentions is looked up every time: what its targets show may have changed).
 			let sz = this.sizes.get(id);
-			const changed = !sz || sz.content !== content || sz.task !== task || content.includes("[[");
-			if (changed || sz?.gen !== gen) {
-				// A size from an earlier setting, off screen, while the setting still moves:
-				// kept unless the new one is already cached (see the typography note above).
-				const cached = changed ? null : cachedBodySize(content, this.labelOf);
-				if (changed || cached || !this.typographyMoving || this.els.has(id)) {
-					const m0 = performance.now();
-					const ns = nodeSize(cached ?? bodySize(content, this.labelOf), !!task);
-					measureMs += performance.now() - m0;
-					sz = { content, task, ...ns, gen };
-					this.sizes.set(id, sz);
-				}
+			const m0 = performance.now();
+			const cached = cachedBodySize(content, this.labelOf);
+			if (!cached && !this.typographyMoving && content.length <= MAX_MEASURE_BODY_CHARS) {
+				const key = `${gen}\u0000${measureKey(content, this.labelOf).key}`;
+				if (!this.requested.has(key)) pending.push({ content, labelOf: this.labelOf });
 			}
-			if (!sz) throw new Error("unreachable: a new block is always measured");
+			// Reuse existing geometry while the exact result is unavailable. New nodes get a
+			// fixed placeholder; neither path parses, wraps or measures the body on the UI.
+			const ns = cached
+				? nodeSize(cached, !!task)
+				: (sz ?? nodeSize(bodySize(content, this.labelOf), !!task));
+			sz = { content, task, w: ns.w, h: ns.h, bodyW: ns.bodyW, provisional: !cached };
+			this.sizes.set(id, sz);
+			measureMs += performance.now() - m0;
 			const editingSize = ed && ed.id === id ? ed.size : null;
 			const node: LayoutNode = {
 				id,
@@ -480,6 +514,7 @@ export class MindMapView {
 				bodyW: sz.bodyW,
 				index,
 				more: false,
+				provisional: sz.provisional,
 			});
 			return node;
 		};
@@ -520,6 +555,7 @@ export class MindMapView {
 					bodyW: NODE.moreW,
 					index: shown.length,
 					more: true,
+					provisional: false,
 				});
 				kids.push(node);
 			}
@@ -552,6 +588,14 @@ export class MindMapView {
 		// The block being edited is gone (deleted, folded away, focus moved): stop editing it.
 		if (this.editing && !info.has(this.editing.id)) this.exitEdit(false);
 		if (this.selected && !info.has(this.selected)) this.selected = null;
+		// Only accepted work is remembered. A healthy reply schedules the next budget-limited slice.
+		if (pending.length > 0)
+			void prewarmBodies(pending, {
+				onAccepted: (key) => {
+					if (this.requested.size >= 4000) this.requested.clear();
+					this.requested.add(`${gen}\u0000${key}`);
+				},
+			});
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -711,19 +755,12 @@ export class MindMapView {
 				if (at) presence.set(at.blockId, peer.color);
 			}
 		}
-		// A node drawn for the first time while the setting moves (panned into view) may still have
-		// its size from an earlier setting: the next layout measures it, now that it is drawn.
-		const gen = this.typographyMoving ? getTypographyRevision() : -1;
-		let stale = false;
-		for (const id of want) {
-			if (gen >= 0 && !this.els.has(id) && (this.sizes.get(id)?.gen ?? gen) !== gen) stale = true;
-			this.updateEl(id, presence.get(id));
-		}
+		// Panning paints existing geometry; it must not trigger synchronous text measurement.
+		for (const id of want) this.updateEl(id, presence.get(id));
 		this.renderEdges();
 		this.stats.nodesInDom = this.els.size;
 		this.stats.renders.push(performance.now() - t0);
 		if (this.stats.renders.length > 5000) this.stats.renders.splice(0, 2500);
-		if (stale) this.schedule();
 	}
 
 	private updateEl(id: string, peer: string | undefined): void {
@@ -737,7 +774,7 @@ export class MindMapView {
 		const editing = this.editing?.id === id;
 		// The body width is in the key: a typography change re-measures every node (same text,
 		// new width), and the body must be laid out at the new width it was measured for.
-		const key = `${inf.content}\u0000${inf.task}\u0000${inf.hasKids}\u0000${inf.collapsed}\u0000${inf.hidden}\u0000${inf.bodyW}`;
+		const key = `${inf.content}\u0000${inf.task}\u0000${inf.hasKids}\u0000${inf.collapsed}\u0000${inf.hidden}\u0000${inf.bodyW}\u0000${inf.provisional}`;
 		if (ne.key !== key) {
 			ne.key = key;
 			if (inf.more) {
@@ -749,7 +786,8 @@ export class MindMapView {
 					task: inf.task,
 				});
 				if (!editing) {
-					ne.body.replaceChildren(renderBody(inf.content, this.host.resolveMention));
+					if (inf.provisional) ne.body.textContent = inf.content.slice(0, 512);
+					else ne.body.replaceChildren(renderBody(inf.content, this.host.resolveMention));
 					ne.body.style.width = `${inf.bodyW}px`;
 				}
 				ne.badge.textContent = inf.hidden ? `+${inf.hidden}` : "";
@@ -758,6 +796,8 @@ export class MindMapView {
 		ne.el.classList.toggle("is-root", id === this.rootId);
 		ne.el.classList.toggle("is-page", id === this.host.pageId);
 		const n = inf.node;
+		ne.el.classList.toggle("is-provisional", inf.provisional && !editing);
+		ne.el.style.height = inf.provisional && !editing ? `${n.h}px` : "";
 		if (!editing && ne.w !== n.w) {
 			ne.w = n.w;
 			ne.el.style.width = `${n.w}px`;
@@ -787,7 +827,7 @@ export class MindMapView {
 		const badge = document.createElement("span");
 		badge.className = "mm-more";
 		if (more) el.append(body);
-		else el.append(g.el, body, badge);
+		else el.append(g.el, body, g.zoom, badge);
 		return { el, g, body, badge, key: "", x: Number.NaN, y: Number.NaN, w: -1 };
 	}
 
@@ -912,7 +952,7 @@ export class MindMapView {
 		ne.body.replaceChildren();
 		const view = new OutlineView(this.client, { kind: "node", blockId: id }, ne.body, {
 			lens: this.host.lens(),
-			collapsed: this.host.state.collapsed,
+			fold: this.host.state,
 			keys: this.host.surfaceKeys(),
 			resolveMention: this.host.resolveMention,
 			restoreSel: (sel) => this.host.restoreSel(sel),
@@ -1039,10 +1079,21 @@ export class MindMapView {
 		return p?.blockId ?? null;
 	}
 
+	/** Fold a node: one level, or (with Alt) everything inside it, as the outline's arrow. */
+	private fold(id: string, everything: boolean): void {
+		const node = this.foldTree?.nodes.get(id);
+		if (everything && node) {
+			const control = foldSubtreeControl(node);
+			if (control) this.host.toggleSubtree(id, control === "expand");
+			return;
+		}
+		this.host.toggleCollapse(id);
+	}
+
 	/** Tab: a new last child, edited at once. */
 	cmdAddChild(id: string): void {
 		if (isMore(id)) return;
-		if (this.host.state.collapsed.has(id)) this.host.toggleCollapse(id);
+		this.host.openBlock(id);
 		const nid = this.runCmd(id, (v) => addChild(v));
 		if (nid && nid !== id) {
 			this.flush();
@@ -1112,8 +1163,7 @@ export class MindMapView {
 	}
 
 	cmdDrop(id: string, target: string, where: DropWhere): void {
-		if (where === "child" && this.host.state.collapsed.has(target))
-			this.host.toggleCollapse(target);
+		if (where === "child") this.host.openBlock(target);
 		this.runCmd(id, () => moveBlockTo(id, target, where));
 		this.flush();
 		this.select(id);
@@ -1257,7 +1307,8 @@ export class MindMapView {
 				return;
 			case " ":
 				handled();
-				if (this.info.get(id)?.hasKids && id !== this.rootId) this.host.toggleCollapse(id);
+				// Space folds the node; with Alt, everything inside it (as its arrow does).
+				if (this.info.get(id)?.hasKids && id !== this.rootId) this.fold(id, e.altKey);
 				return;
 			case "Delete":
 			case "Backspace":
@@ -1329,7 +1380,10 @@ export class MindMapView {
 		const target = e.target as HTMLElement;
 		const id = this.nodeIdAt(target);
 		// Inside the node being edited, the editor handles the pointer itself.
-		if (this.editing && id === this.editing.id && !target.closest(".ob-gutter")) return;
+		// The frame: the gutter before the body and, on a task, the focus handle after it.
+		const zoom = target.closest(".ob-zoom");
+		const frame = zoom ?? target.closest(".ob-gutter");
+		if (this.editing && id === this.editing.id && !frame) return;
 		this.pointers.set(e.pointerId, p);
 		if (this.pointers.size === 2) {
 			// A second finger: pinch.
@@ -1344,10 +1398,10 @@ export class MindMapView {
 			return;
 		}
 		if (this.pointers.size > 2) return;
-		if (id && target.closest(".ob-gutter")) {
+		if (id && frame) {
 			e.preventDefault();
-			if (target.closest(".ob-arrow")) this.host.toggleCollapse(id);
-			else if (target.closest(".ob-bullet")) {
+			if (target.closest(".ob-arrow")) this.fold(id, e.altKey);
+			else if (zoom || target.closest(".ob-bullet")) {
 				if (id === this.rootId) this.host.focusUp();
 				else this.host.focusBlock(id);
 			} else if (target.closest(".ob-check")) this.cmdCycleTask(id);

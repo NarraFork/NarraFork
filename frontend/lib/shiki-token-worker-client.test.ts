@@ -50,7 +50,8 @@ function setup(options: { maxInFlight?: number; maxQueued?: number; watchdogMs?:
 			return port;
 		},
 		appBase: () => "https://app.test/nf/",
-		fallback,
+		// An obsolete JS caller cannot reintroduce UI-thread work through the old option.
+		...{ fallback },
 		...options,
 	});
 	return { load, ports, fallbackCalls };
@@ -106,10 +107,11 @@ describe("shiki token worker loader", () => {
 		void load("new", "typescript", THEME);
 		expect(await oldest).toBeNull();
 		expect(ports[0].requests().map((message) => message.code)).toEqual(["busy"]);
+		ports[0].onerror?.({ message: "cleanup" } as ErrorEvent);
 	});
 
 	it("abandons a runaway request and restarts the Worker for the rest", async () => {
-		const { load, ports } = setup({ maxInFlight: 2, watchdogMs: 5 });
+		const { load, ports, fallbackCalls } = setup({ maxInFlight: 2, watchdogMs: 5 });
 		const stuck = load("stuck", "typescript", THEME);
 		await new Promise((resolve) => setTimeout(resolve, 1));
 		const other = load("other", "typescript", THEME);
@@ -119,36 +121,51 @@ describe("shiki token worker loader", () => {
 		expect(ports[1].requests().map((message) => message.code)).toEqual(["other"]);
 		ports[1].reply("other");
 		expect(await other).toEqual([[{ content: "other" }]]);
+		expect(fallbackCalls).toEqual([]);
 	});
 
-	it("falls back to the main thread once the Worker cannot run", async () => {
+	it("returns plain text after a crash, including queued and later disabled requests", async () => {
 		const { load, ports, fallbackCalls } = setup({ maxInFlight: 1 });
 		const first = load("first", "typescript", THEME);
 		const queued = load("queued", "typescript", THEME);
 		ports[0].onerror?.({ message: "blocked" } as ErrorEvent);
 		await settle();
 		expect(ports[0].terminated).toBe(true);
-		expect(await first).toEqual([[{ content: "main:first" }]]);
-		expect(await queued).toEqual([[{ content: "main:queued" }]]);
-
-		expect(await load("later", "typescript", THEME)).toEqual([[{ content: "main:later" }]]);
+		expect(await first).toBeNull();
+		expect(await queued).toBeNull();
+		expect(await load("later", "typescript", THEME)).toBeNull();
 		expect(ports).toHaveLength(1);
-		expect(fallbackCalls).toEqual(["first", "queued", "later"]);
+		expect(fallbackCalls).toEqual([]);
 	});
 
-	it("falls back when the Worker cannot even be constructed", async () => {
-		const fallbackCalls: string[] = [];
-		const load = createShikiTokenWorkerLoader({
-			factory: () => {
-				throw new Error("SecurityError");
-			},
-			appBase: () => "https://app.test/",
-			fallback: async (code) => {
-				fallbackCalls.push(code);
-				return null;
-			},
+	for (const failure of ["construct", "boot", "tokens"] as const) {
+		it(`returns plain text when Worker ${failure} throws, without invoking legacy local work`, async () => {
+			let mainCalls = 0;
+			let constructions = 0;
+			const port = new FakePort();
+			port.postMessage = (message) => {
+				if (message.type === failure) throw new Error("postMessage failed");
+				port.messages.push(message);
+			};
+			const load = createShikiTokenWorkerLoader({
+				factory: () => {
+					constructions++;
+					if (failure === "construct") throw new Error("SecurityError");
+					return port;
+				},
+				appBase: () => "https://app.test/",
+				...{
+					fallback: async () => {
+						mainCalls++;
+						return null;
+					},
+				},
+			});
+			expect(await load("x", "typescript", THEME)).toBeNull();
+			expect(await load("again", "typescript", THEME)).toBeNull();
+			expect(mainCalls).toBe(0);
+			expect(constructions).toBe(1);
+			if (failure !== "construct") expect(port.terminated).toBe(true);
 		});
-		expect(await load("x", "typescript", THEME)).toBeNull();
-		expect(fallbackCalls).toEqual(["x"]);
-	});
+	}
 });

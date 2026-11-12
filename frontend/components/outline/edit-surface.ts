@@ -31,6 +31,7 @@
  * editors and the map's stage.
  */
 import type { OutlineMapLayout } from "@shared/outline-api";
+import { type FoldAction, type FoldTree, foldPageControl } from "@shared/outline-fold";
 import { getTypographyRevision, onTypographyChange } from "@shared/pretext-layout/typography";
 import type { Command } from "prosemirror-state";
 import { ensureTypographyCssVars } from "../../lib/typography-css-vars";
@@ -40,7 +41,7 @@ import { caretIn } from "./editor/commands";
 import type { LiveClient, SelInfo } from "./editor/live-client";
 import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "./editor/view";
 import { MindMapView } from "./mindmap/mindmap";
-import { prewarmBodies } from "./mindmap/prewarm";
+import { type PrewarmResult, prewarmBodies } from "./mindmap/prewarm";
 import {
 	FrameDeferral,
 	OUTLINE_MOTION_EASING,
@@ -58,10 +59,10 @@ interface Pos {
 
 /**
  * The map waits at most this long for the Worker's sizes: of a page that just arrived, and after
- * a change of typography (then it measures what is left itself).
+ * a change of typography (uncached bodies retain provisional geometry, never local measuring).
  */
 const PREWARM_HOLD_MS = 1500;
-/** Pages smaller than this are measured on the spot (faster than waiting for the Worker). */
+/** Small pages can immediately lay out lightweight placeholders while the Worker runs. */
 const PREWARM_HOLD_MIN_BLOCKS = 300;
 /** A typography change measures the page ahead again once the setting has been still this long. */
 const TYPOGRAPHY_PREWARM_DELAY_MS = 300;
@@ -107,6 +108,10 @@ export interface EditSurfaceOptions {
 	onHiddenChange?: (count: number) => void;
 	/** Measure the map's nodes ahead in a Worker (default on). */
 	premeasure?: boolean;
+	/** The reader asked for the unanswered questions a closed row hid (they are on screen now). */
+	onOpenQuestions?: (ids: string[], under: string | null) => void;
+	/** What the page's folding control offers now (see `EditSurface.pageFold`), when it changes. */
+	onPageFold?: (state: "expand" | "collapse" | null) => void;
 }
 
 export class EditSurface {
@@ -138,7 +143,11 @@ export class EditSurface {
 	/** The outline behind the map was never shown (see the constructor). */
 	private outlineCold = false;
 	private warmTimer: ReturnType<typeof setTimeout> | undefined;
-	prewarmDone: Promise<void> = Promise.resolve();
+	prewarmDone: Promise<PrewarmResult> = Promise.resolve({
+		status: "ready",
+		measured: 0,
+		failed: 0,
+	});
 	/**
 	 * A focus the host asked for while the page is still seeded and the block is not here yet
 	 * (its read is on its way): applied once it arrives.
@@ -177,6 +186,11 @@ export class EditSurface {
 				focusBlock: (id) => this.focusBlock(id),
 				focusUp: () => this.focusUp(),
 				toggleCollapse: (id) => this.toggleCollapse(id),
+				openBlock: (id) => this.openBlock(id),
+				foldMarks: () => ({ marks: this.marks, known: this.marksKnown }),
+				toggleSubtree: (id, open) => {
+					this.foldAct({ kind: "subtree", id, open });
+				},
 				surfaceKeys: () => this.surfaceKeys(),
 				restoreSel: (sel) => this.restoreSel(sel),
 				onSelect: (id) => this.onMapSelect(id),
@@ -234,8 +248,8 @@ export class EditSurface {
 		// The reader changed the typography (外观 · 排版): every node size measured ahead is for
 		// the old setting (`measure.ts` keys sizes by it). Once the setting settles — a slider drag
 		// changes it every frame — the page is measured ahead again in the Worker, and then the
-		// map is told: it measured only the nodes on screen while the setting moved
-		// (`MindMapView.typographySettled`), and the next switch to the map finds the sizes.
+		// map is told (`MindMapView.typographySettled`). Until then it preserves provisional
+		// geometry; no slider step, failed job or deadline authorizes local measuring.
 		let typographyTimer: ReturnType<typeof setTimeout> | undefined;
 		const offTypography = onTypographyChange(() => {
 			clearTimeout(typographyTimer);
@@ -251,9 +265,8 @@ export class EditSurface {
 				};
 				// Not shown yet: the first prewarm is still to come, under the new setting.
 				if (this.prewarmed === "none") return settled();
-				// Then the map measures what it still holds from the old setting — from the cache
-				// the Worker just filled, rather than body by body on the main thread. A Worker that
-				// does not answer in time does not leave the map moving: it settles anyway.
+				// Release the animation hold even on failure/timeout. This does NOT authorize
+				// measuring: the map reads successful cache entries or keeps provisional sizes.
 				Promise.race([
 					this.prewarm(),
 					new Promise<void>((resolve) => setTimeout(resolve, PREWARM_HOLD_MS)),
@@ -318,7 +331,7 @@ export class EditSurface {
 	 * Measure every block of the page for the map, in a Worker: once the page is seeded from its
 	 * HTTP read, and again once live (only bodies not measured yet are sent).
 	 */
-	prewarm(): Promise<void> {
+	prewarm(): Promise<PrewarmResult> {
 		const from = this.shownFrom();
 		if (this.opts.premeasure === false || this.destroyed || from === "none") {
 			return this.prewarmDone;
@@ -331,9 +344,9 @@ export class EditSurface {
 		const client = this.client;
 		// Posted after this task (the page arriving is busy enough); the map's hold below starts
 		// now, before its first layout.
-		this.prewarmDone = new Promise<void>((resolve) => {
+		this.prewarmDone = new Promise<PrewarmResult>((resolve) => {
 			setTimeout(() => {
-				if (this.destroyed) return resolve();
+				if (this.destroyed) return resolve({ status: "cancelled", measured: 0, failed: 0 });
 				// Every block the client has (a seed of a focused block has no page around it).
 				const ids: string[] = [];
 				for (const b of client.visible.blocks.values()) if (!b.deleted) ids.push(b.id);
@@ -341,7 +354,7 @@ export class EditSurface {
 					(function* () {
 						for (const id of ids) yield { content: client.textOf(id), labelOf };
 					})(),
-				).then(resolve, resolve);
+				).then(resolve, () => resolve({ status: "failed", measured: 0, failed: ids.length }));
 			}, 0);
 		});
 		// The map on screen as the page arrives (a panel restored in the map, a jump to another
@@ -387,9 +400,15 @@ export class EditSurface {
 	/** Locks and pending changes of the page's blocks (shown on both outline views). */
 	private marks: ReadonlyMap<string, BlockMark> = new Map();
 
-	setMarks(marks: ReadonlyMap<string, BlockMark>): void {
+	private marksKnown = false;
+
+	/** `known`: the page's summary arrived (see `OutlineView.setMarks`). */
+	setMarks(marks: ReadonlyMap<string, BlockMark>, known = true): void {
 		this.marks = marks;
-		for (const v of this.outlines()) v.setMarks(marks);
+		this.marksKnown = known;
+		for (const v of this.outlines()) v.setMarks(marks, known);
+		// The map folds by the unanswered questions too.
+		this.map.schedule();
 	}
 
 	setLens(lens: OutlineLens): void {
@@ -438,15 +457,16 @@ export class EditSurface {
 	private makeView(rootId: string, host: HTMLElement): OutlineView {
 		const v: OutlineView = new OutlineView(this.client, { kind: "focus", rootId }, host, {
 			lens: this.lens,
-			collapsed: this.state.collapsed,
+			fold: this.state,
 			keys: this.surfaceKeys(),
 			resolveMention: this.opts.resolveMention,
 			onBullet: (id) => this.focusBlock(id),
 			onCollapse: () => {
 				// Folding is shared: the other outline view and the map follow.
-				for (const o of this.outlines()) if (o !== v) o.sync();
+				for (const o of this.outlines()) if (o !== v) o.foldChanged();
 				this.map.schedule();
 				this.state.noteCollapsed();
+				this.reportFold();
 			},
 			onSelect: (blockId) => {
 				if (this.restoring || this.state.view !== "outline") return;
@@ -460,9 +480,10 @@ export class EditSurface {
 			},
 			onRefused: this.opts.onRefused,
 			restoreSel: (sel) => this.restoreSel(sel),
+			onQuestions: (ids, under) => this.opts.onOpenQuestions?.(ids, under),
 		});
 		v.noScroll = this.state.view === "map";
-		if (this.marks.size > 0) v.setMarks(this.marks);
+		if (this.marks.size > 0 || this.marksKnown) v.setMarks(this.marks, this.marksKnown);
 		return v;
 	}
 
@@ -585,14 +606,26 @@ export class EditSurface {
 		}
 		this.map.schedule();
 		this.reportHidden();
+		this.reportFold();
 	}
 
 	/** The stored folding and direction arrived: every view follows. */
 	private onStored(): void {
-		for (const v of this.outlines()) v.sync();
+		for (const v of this.outlines()) v.foldChanged();
 		this.map.schedule();
 		if (this.state.view === "map") this.map.flush();
 		this.renderAttrs();
+		this.reportFold();
+	}
+
+	/**
+	 * Words the frames draw changed without the page changing (the language, who wrote a
+	 * report): the outline's report lines are worked out again and the map lays out again.
+	 */
+	refreshChrome(): void {
+		if (this.destroyed) return;
+		for (const v of this.outlines()) v.refreshDecorations();
+		this.map.schedule();
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1043,52 +1076,81 @@ export class EditSurface {
 	// Folding
 	// ─────────────────────────────────────────────────────────────────────────
 
+	/**
+	 * The tree the view on screen folds (`@shared/outline-fold`), as its last projection worked
+	 * it out: the outline's, or the map's while the outline behind it is not built.
+	 */
+	private foldTree(): FoldTree | null {
+		const outline = this.focusView ?? this.pageView;
+		if (this.state.view === "map" || !outline)
+			return this.map.foldTree ?? outline?.foldTree ?? null;
+		return outline.foldTree;
+	}
+
+	/** The reader folds (the map, the toolbar, the keyboard): every view follows. */
+	foldAct(action: FoldAction): boolean {
+		if (this.destroyed) return false;
+		const tree = this.foldTree();
+		if (!tree || !this.state.fold(tree, action, true)) return false;
+		this.applyCollapse(action);
+		return true;
+	}
+
 	toggleCollapse(id: string): void {
-		const c = this.state.collapsed;
-		if (c.has(id)) c.delete(id);
-		else c.add(id);
-		this.applyCollapse();
+		this.foldAct({ kind: "node", id });
 	}
 
-	/** Blocks under the focused one (not itself) with their level (its children are level 1). */
-	private subtree(): Array<{ id: string; depth: number; kids: number }> {
-		const v = this.client.visible;
-		const root = this.state.focus;
-		const out: Array<{ id: string; depth: number; kids: number }> = [];
-		const stack: Array<{ id: string; depth: number }> = [{ id: root, depth: 0 }];
-		while (stack.length) {
-			const { id, depth } = stack.pop() as { id: string; depth: number };
-			const kids = v.children(id);
-			if (id !== root) out.push({ id, depth, kids: kids.length });
-			for (const k of kids) stack.push({ id: k, depth: depth + 1 });
-		}
-		return out;
+	/** Make sure a block shows its children (a child is about to be added or dropped into it). */
+	openBlock(id: string): void {
+		this.foldAct({ kind: "node", id, open: true });
 	}
 
-	private applyCollapse(): void {
-		for (const v of this.outlines()) v.sync();
+	/**
+	 * What the page's control offers: 「全部展开」 while something under the focused block is
+	 * closed, 「全部收起」 (back to the default view) when all of it is open; null: neither.
+	 */
+	pageFold(): "expand" | "collapse" | null {
+		const tree = this.foldTree();
+		return tree ? foldPageControl(tree, this.state) : null;
+	}
+
+	/** The page's control: everything open, or the default view again. */
+	foldAll(open: boolean): void {
+		this.foldAct({ kind: "all", open });
+	}
+
+	private lastPageFold: "expand" | "collapse" | null | undefined;
+
+	/** Tell the host when what the page's control offers changed. */
+	private reportFold(): void {
+		if (!this.opts.onPageFold) return;
+		const now = this.pageFold();
+		if (now === this.lastPageFold) return;
+		this.lastPageFold = now;
+		this.opts.onPageFold(now);
+	}
+
+	private applyCollapse(action?: FoldAction): void {
+		for (const v of this.outlines()) v.foldChanged(action);
 		this.map.schedule();
 		if (this.state.view === "map") this.map.flush();
 		this.state.noteCollapsed();
+		this.reportFold();
 	}
 
+	/** Mod-ArrowUp: every block with children closed. */
 	collapseAll(): void {
-		for (const b of this.subtree()) if (b.kids) this.state.collapsed.add(b.id);
-		this.applyCollapse();
+		this.foldAct({ kind: "closeAll" });
 	}
 
+	/** Mod-ArrowDown: everything open. */
 	expandAll(): void {
-		for (const b of this.subtree()) this.state.collapsed.delete(b.id);
-		this.applyCollapse();
+		this.foldAct({ kind: "all", open: true });
 	}
 
 	/** Alt+N: open down to level N (level N and deeper folded). */
 	expandToLevel(n: number): void {
-		for (const b of this.subtree()) {
-			if (b.kids && b.depth >= n) this.state.collapsed.add(b.id);
-			else this.state.collapsed.delete(b.id);
-		}
-		this.applyCollapse();
+		this.foldAct({ kind: "level", level: n });
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1143,6 +1205,7 @@ export class EditSurface {
 		else this.zoomOutline(prev, id, animate, t0, takeFocus);
 		noteFocusVisit(id);
 		st.emit("focus");
+		this.reportFold();
 		if (opts.notify !== false) {
 			const told = { id, sent: false };
 			this.echo.push(told);

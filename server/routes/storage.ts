@@ -2,7 +2,10 @@ import { STORAGE_CATEGORY_KEYS } from "@shared/storage-categories";
 import { Hono } from "hono";
 import { z } from "zod/v4";
 import { requireAdmin } from "../middleware/auth";
-import { databaseCleanupService } from "../services/database-cleanup-service";
+import {
+	DEFAULT_TOOL_CALL_PAYLOAD_DAYS,
+	databaseCleanupService,
+} from "../services/database-cleanup-service";
 import {
 	blockBackfillStatus,
 	setBlockBackfillPaused,
@@ -15,8 +18,10 @@ import {
 	startStorageScan,
 } from "../services/storage-scan-job";
 import { storageService } from "../services/storage-service";
+import { storageHistoryRoutes } from "./storage-history";
 
 export const storageRoutes = new Hono();
+storageRoutes.route("/database/history", storageHistoryRoutes);
 
 const scanSelectionSchema = z.object({
 	categories: z.array(z.enum(STORAGE_CATEGORY_KEYS)).min(1).optional(),
@@ -169,6 +174,18 @@ storageRoutes.post("/database/preview", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: "Invalid database cleanup preview request" }, 400);
 	}
+	if (parsed.data.target === "toolCallPayloads") {
+		// Match the legacy cleanup redirect: previews also use the marker-aware read worker.
+		const { getStorageHistoryService } = await import("../services/storage-history-runtime");
+		const days = parsed.data.olderThanDays ?? DEFAULT_TOOL_CALL_PAYLOAD_DAYS;
+		const cutoffAt = new Date(Date.now() - days * 86_400_000).toISOString();
+		const preview = await getStorageHistoryService().preview(
+			"toolCallPayloads",
+			cutoffAt,
+			c.req.raw.signal,
+		);
+		return c.json({ preview });
+	}
 	const result = await databaseCleanupService.previewCleanup(parsed.data.target, {
 		olderThanDays: parsed.data.olderThanDays,
 		sampleLimit: parsed.data.sampleLimit,
@@ -184,6 +201,14 @@ storageRoutes.post("/database/cleanup", requireAdmin, async (c) => {
 	const parsed = databaseCleanupSchema.safeParse(body);
 	if (!parsed.success) {
 		return c.json({ error: "Invalid database cleanup request" }, 400);
+	}
+	if (parsed.data.target === "toolCallPayloads") {
+		// Older clients enter the same bounded, marker-aware cleanup path as the new UI.
+		const { getStorageHistoryService } = await import("../services/storage-history-runtime");
+		const days = parsed.data.olderThanDays ?? DEFAULT_TOOL_CALL_PAYLOAD_DAYS;
+		const cutoffAt = new Date(Date.now() - days * 86_400_000).toISOString();
+		const job = await getStorageHistoryService().start("toolCallPayloads", cutoffAt);
+		return c.json({ job }, 202);
 	}
 	const result = await databaseCleanupService.executeCleanup(parsed.data.target, {
 		olderThanDays: parsed.data.olderThanDays,

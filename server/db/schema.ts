@@ -701,6 +701,8 @@ export const narrators = sqliteTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		// Startup recovery and legacy backfills look up active/legacy rows by status.
+		index("idx_narrators_status").on(table.status),
 		// FK covering index for user deletion, and the lookup behind "my narrators".
 		index("idx_narrators_owner").on(table.ownerUserId),
 		// Leads the visibility predicate pushed down into the paginated list query.
@@ -713,6 +715,16 @@ export const narrators = sqliteTable(
 		// Dependents of a policy source (permission-mode propagation, deletion guard).
 		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
+		// List pages filter by variant + hidden + status before ordering by recency, and count
+		// the same predicate per tab. Covering all three avoids a per-row filter over the
+		// whole variant bucket (measured: ~10ms -> <1ms for both the count and the page).
+		index("idx_narrators_variant_list").on(
+			table.variant,
+			table.hiddenFromLists,
+			table.status,
+			table.updatedAt,
+			table.id,
+		),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 		// 一个模型只有一个 ModelTrace 舱；SQLite 的唯一索引允许多个 NULL。
@@ -2285,6 +2297,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
 	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(true),
+	/** Account-wide transcript display preference; false preserves the original cards. */
+	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
+		.notNull()
+		.default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**
@@ -2326,6 +2342,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	/** Block spacing (markdown block margins + transcript item gaps) multiplier. */
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	/** 最近标签中的会话是否显示工作目录；按账号同步，默认隐藏。 */
+	recentTabsShowDirectory: integer("recent_tabs_show_directory", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),
@@ -3545,6 +3565,12 @@ export const workspaces = sqliteTable(
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
+		// Conservative migration/import default: existing names must never be auto-renamed.
+		titleSource: text("title_source", { enum: ["default", "auto", "manual"] })
+			.notNull()
+			.default("manual"),
+		// Also invalidated when title inputs change, so generated candidates cannot become stale.
+		titleRevision: integer("title_revision").notNull().default(0),
 		/**
 		 * Serialized dockview layout — ARRANGEMENT ONLY.
 		 *
@@ -3645,6 +3671,8 @@ export const workspacePanels = sqliteTable(
 		 */
 		uniqueIndex("idx_workspace_panels_narrator").on(table.workspaceId, table.narratorId),
 		index("idx_workspace_panels_narrator_lookup").on(table.narratorId),
+		// Cursor-paged outline invalidation never scans layouts or non-outline memberships.
+		index("idx_workspace_panels_kind_workspace").on(table.kind, table.workspaceId, table.id),
 	],
 );
 
@@ -6198,7 +6226,12 @@ export const outlineLiveUpdates = sqliteTable(
 );
 
 // === outline_view_state ===
-/** Per user and page: collapsed blocks and the mind-map layout direction. Not part of history. */
+/**
+ * Per user and page: the reader's own folding and the mind-map layout direction. Not part of
+ * history. A page folds some blocks by default (`shared/outline-fold.ts`): `collapsed_json` holds
+ * the blocks the reader closed that are open by default, `expanded_json` those they opened that
+ * are closed by default.
+ */
 export const outlineViewState = sqliteTable(
 	"outline_view_state",
 	{
@@ -6210,6 +6243,8 @@ export const outlineViewState = sqliteTable(
 			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
 		/** Ids of the collapsed blocks. */
 		collapsedJson: text("collapsed_json", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/** Ids of the blocks the reader opened; null (a row written before the column): none. */
+		expandedJson: text("expanded_json", { mode: "json" }).$type<string[]>(),
 		layout: text("layout", { enum: ["right", "down"] })
 			.notNull()
 			.default("right"),

@@ -18,6 +18,7 @@ import {
 	projects,
 } from "@server/db/schema";
 import { decodeExecutionLogCursor } from "@server/lib/execution-log-cursor";
+import { clearedToolOutput } from "@shared/storage-retention";
 import { cleanDb, getTestDb } from "../../tests/setup";
 import { ExecutionLogService } from "./execution-log-service";
 
@@ -247,6 +248,63 @@ describe("ExecutionLogService payload safety", () => {
 		expect(capped?.outputBytes).toBeGreaterThan(400_000);
 		expect(typeof capped?.outputJson).toBe("string");
 		expect((capped?.outputJson as string).length).toBeLessThanOrEqual(256 * 1024);
+	});
+
+	test("cleared tools hide retained replay input from details, summaries and searches", async () => {
+		seedNarrator("narrator-1");
+		const secret = "retained-replay-secret";
+		const marker = clearedToolOutput(T.newest);
+		seedToolCalls([
+			...(["Write", "Edit", "StructSed", "GenUI"] as const).map((toolName) => ({
+				id: `cleared-${toolName}`,
+				toolName,
+				createdAt: T.oldest,
+				inputJson: {
+					file_path: `/private/${secret}.txt`,
+					description: secret,
+					content: `${secret}${"x".repeat(300_000)}`,
+				},
+				outputJson: marker,
+			})),
+			{
+				id: "live-write",
+				toolName: "Write",
+				createdAt: T.newest,
+				inputJson: { file_path: "/work/live.txt", content: "current content" },
+				outputJson: null,
+			},
+		]);
+
+		for (const toolName of ["Write", "Edit", "StructSed", "GenUI"]) {
+			const record = await service.getRecord(`cleared-${toolName}`);
+			expect(record).toMatchObject({
+				toolName,
+				status: "success",
+				inputJson: null,
+				inputBytes: null,
+				inputTruncated: false,
+				outputJson: marker,
+			});
+			expect(JSON.stringify(record)).not.toContain(secret);
+		}
+		const listed = await service.listCursor({}, 10);
+		expect(listed.records).toHaveLength(5);
+		expect(JSON.stringify(listed)).not.toContain(secret);
+		for (const searchPayload of [false, true]) {
+			expect((await service.listCursor({ q: secret, searchPayload }, 10)).records).toEqual([]);
+		}
+		const live = await service.getRecord("live-write");
+		expect(live?.inputJson).toEqual({ file_path: "/work/live.txt", content: "current content" });
+		expect((await service.listCursor({ q: "live.txt" }, 10)).records.map((r) => r.id)).toEqual([
+			"live-write",
+		]);
+		expect(
+			sqlite
+				.query<{ input_json: string }, []>(
+					"SELECT input_json FROM narrator_tool_calls WHERE id = 'cleared-Write'",
+				)
+				.get()?.input_json,
+		).toContain(secret);
 	});
 
 	test("returns null for an unknown id", async () => {

@@ -22,6 +22,7 @@
  * window every frame.
  */
 
+import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import type { ToolCappedDetail, ToolSectionsDetail } from "@shared/pretext-layout/tool-detail";
 import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
 import { makeMessageBlockSelectionId } from "../message/MessageSelectionCtx";
@@ -42,7 +43,11 @@ import {
 	type VListViewTarget,
 } from "./vlist-content-view-target";
 import type { VListEditRole } from "./vlist-edit-target";
-import { textExpansionSignature, type VListInteractionState } from "./vlist-interaction-state";
+import {
+	planTreeRowSignature,
+	textExpansionSignature,
+	type VListInteractionState,
+} from "./vlist-interaction-state";
 import type { VListItem } from "./vlist-pipeline";
 import type { VListRowActionTarget, VListRowToolActions } from "./vlist-row-actions";
 import { sameBoundActionKeys, sameNumberList } from "./vlist-row-payload-reuse";
@@ -83,7 +88,7 @@ export function resolveItemViewTargets(
 			{ sections: renderLabels.toolCall.sections },
 		);
 	}
-	if (kind === "tool-call") {
+	if (kind === "tool-call" || kind === "auxiliary-content") {
 		const labels = { sections: renderLabels.toolCall.sections };
 		const model = (item.spec.data as { detail?: ToolSectionsDetail } | null)?.detail;
 		return fromSource && model
@@ -215,6 +220,7 @@ export function resolveTraceRowViewTargets(
 export const TOGGLEABLE_CARD_KINDS = new Set([
 	"reasoning",
 	"tool-call",
+	"auxiliary-content",
 	"subagent-card",
 	// Slash-command bubbles fold their expanded prompt behind a toggle. Plain user
 	// bubbles carry no `commandText`, so the render layer ignores the callback.
@@ -402,7 +408,9 @@ export function rowInteractionSig(state: VListInteractionState, key: string): st
 	// The file-list fold changes how many rows are DRAWN, so it must move the opts
 	// signature — otherwise expanding it would not re-measure the card.
 	const fileChangesOpen = state.fileChangesOpen.has(key) ? 1 : 0;
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${fileChangesOpen}:${textExpansionSignature(state, key)}`;
+	// An outline plan card's open nodes and texts change which rows it draws.
+	const planTree = planTreeRowSignature(state, key);
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${fileChangesOpen}:${textExpansionSignature(state, key)}:${planTree}`;
 }
 
 /**
@@ -509,6 +517,8 @@ export interface RowToggles {
 	onTogglePrompt: () => void;
 	/** Expand / collapse a subagent card's file-change list (its own fold). */
 	onToggleFileChanges: () => void;
+	/** Open or fold a node, a text or the whole tree of an outline plan card. */
+	onPlanTree: (action: PlanTreeAction) => void;
 }
 
 /**

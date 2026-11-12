@@ -53,6 +53,88 @@ function message(
 // Opt-in is explicitly skipped, never represented as PG evidence. PG_INTEGRATION=1 cannot skip.
 const integration = process.env.PG_INTEGRATION === "1" ? test : test.skip;
 integration(
+	"PG17 refs lastServedProvider uses own assistant replies in ref order after the latest compact",
+	async () => {
+		const outcome = await withPostgres(async ({ exec, port, credentials }) => {
+			for (const migration of await migrationSql()) {
+				const applied = await exec(migration);
+				expect(applied.code, applied.stderr).toBe(0);
+			}
+			const client = createPostgresClient({
+				driver: "bun-sql",
+				url: `postgres://${credentials.user}:${credentials.password}@127.0.0.1:${port}/${credentials.database}`,
+			});
+			try {
+				await client.db.insert(narrators).values(
+					["sticky", "ancestor", "sibling"].map((id) => ({
+						id,
+						createdAt: now,
+						updatedAt: now,
+					})),
+				);
+				const store = createPostgresNarratorMessageRefsPort(client.db);
+				expect(await store.lastServedProvider("missing")).toBeUndefined();
+				expect(await store.lastServedProvider("sticky")).toBeUndefined();
+				const add = async (
+					id: string,
+					seq: number,
+					provider: string | null,
+					options: {
+						owner?: string;
+						refOwner?: string;
+						role?: RefMessageInput["role"];
+						compact?: number;
+						createdAt?: string;
+					} = {},
+				) => {
+					await client.db.insert(narratorMessages).values({
+						...message(id, options.owner ?? "sticky", options.role ?? "assistant"),
+						provider,
+						createdAt: options.createdAt ?? now,
+					});
+					await client.db.insert(narratorMessageRefs).values({
+						id: `ref-${id}`,
+						narratorId: options.refOwner ?? "sticky",
+						messageId: id,
+						seq,
+						isCompact: options.compact ?? 0,
+					});
+				};
+				await add("inherited", 0, "ancestor-provider", { owner: "ancestor" });
+				expect(await store.lastServedProvider("sticky")).toBeUndefined();
+				await add("own-first", 1, "first", { createdAt: "2026-10-01T00:00:00.000Z" });
+				await add("own-last", 2, "last");
+				await add("null-provider", 3, null);
+				await add("user-provider", 4, "not-assistant", { role: "user" });
+				await add("foreign-reply", 5, "not-owned", { owner: "ancestor" });
+				await add("other-refs", 99, "not-referenced-here", { refOwner: "sibling" });
+				expect(await store.lastServedProvider("sticky")).toBe("last");
+				// The compact row itself never supplies the next epoch's provider.
+				await add("compact-first", 6, "compact-provider", { compact: 1 });
+				expect(await store.lastServedProvider("sticky")).toBeUndefined();
+				await add("next-epoch", 7, "next");
+				expect(await store.lastServedProvider("sticky")).toBe("next");
+				await add("compact-latest", 8, null, { compact: 1, role: "system" });
+				await add("inherited-after-compact", 9, "inherited-next", { owner: "ancestor" });
+				expect(await store.lastServedProvider("sticky")).toBeUndefined();
+				await add("latest-epoch", 10, "latest");
+				expect(await store.lastServedProvider("sticky")).toBe("latest");
+				const controller = new AbortController();
+				controller.abort(new Error("cancel sticky read"));
+				await expect(
+					store.lastServedProvider("sticky", { signal: controller.signal }),
+				).rejects.toThrow("cancel sticky read");
+				return "verified";
+			} finally {
+				await client.close();
+			}
+		});
+		// A missing PG runtime must fail this opt-in, not masquerade as successful coverage.
+		expect(outcome).toBe("verified");
+	},
+	300_000,
+);
+integration(
 	"PG17 full journal: production entrypoints, 20 append races, shift, fork, rollback, cursor and FTS",
 	async () => {
 		const outcome = await withPostgres(async ({ exec, port, credentials }) => {

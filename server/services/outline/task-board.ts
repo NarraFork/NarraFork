@@ -63,7 +63,13 @@ import {
 	type OutlineBoardTask,
 	type OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
-import { canReadSpace, canWriteSpace, type OutlinePrincipal, projectUsersWith } from "./access";
+import {
+	canReadSpace,
+	canWriteSpace,
+	narratorVisibility,
+	type OutlinePrincipal,
+	projectUsersWith,
+} from "./access";
 import {
 	readDisplayNames,
 	readNarratorWriteGrants,
@@ -71,6 +77,7 @@ import {
 	readProjectSessionSpacePage,
 	readSessionWriteFacts,
 } from "./access-reads";
+import { agentAssigneeName } from "./assignee";
 import {
 	OUTLINE_BEHAVIOR_ALIAS,
 	OUTLINE_LIMITS,
@@ -90,6 +97,8 @@ import type {
 	OutlineStore,
 	OutlineTaskClaimRow,
 } from "./store/port";
+import { isPlanningRoot, outlineTaskStartBlocker } from "./task-json";
+import { outlineTaskSessionProjectDir, outlineTaskSessionsAvailable } from "./task-session";
 import { deriveOutlineTaskWaits, inDocumentOrder, isClaimLive } from "./tasks";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -334,10 +343,18 @@ export async function markOutlineTasksSeen(
 // Describing tasks
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Distinct `@agent:` names of one board read that are checked for being a readable session. */
+const ASSIGNED_SESSIONS_READ = 50;
+
 interface Context {
 	store: OutlineStore;
 	principal: OutlinePrincipal;
 	spaces: Map<string, OutlineSpaceRow>;
+	/**
+	 * Project spaces whose startable tasks the reader may open a new session for (outline P2
+	 * PR 10c-1): decided once per board, see `readProjectTaskBoard`.
+	 */
+	openSessionSpaces?: ReadonlySet<string>;
 }
 
 /** The space of a session: its root narrator's, by id. */
@@ -402,12 +419,26 @@ async function describe(
 	]);
 	const titles = new Map(heads.map((h) => [h.id, blockTitle(h.contentHead)]));
 	const claims = new Map<string, OutlineTaskClaimRow>(claimRows.map((c) => [c.taskBlockId, c]));
+	// For "open a new session": the claims of tasks in progress above the tasks listed that are
+	// not listed themselves (a step under a task someone is doing is theirs). One keyed read.
+	if (options.open && ctx.openSessionSpaces) {
+		const above = [...known.values()].filter(
+			(m) =>
+				!claims.has(m.id) &&
+				ctx.openSessionSpaces?.has(m.spaceId) &&
+				m.taskJson?.status === "doing",
+		);
+		if (above.length > 0)
+			for (const claim of await store.getTaskClaims(above.map((m) => m.id)))
+				claims.set(claim.taskBlockId, claim);
+	}
 	const newlyDone = options.open
 		? new Set<string>()
 		: await newlyDoneFor(ctx, ordered, claims, nowDate);
 
 	// Holders as sessions (a subagent's claim is its root's work), and the names to show.
 	const holderNarrators = new Set<string>();
+	const assignedNames = new Set<string>();
 	const userIds = new Set<string>();
 	for (const meta of ordered) {
 		const claim = claims.get(meta.id);
@@ -418,7 +449,21 @@ async function describe(
 		const lock = meta.taskJson?.lock;
 		if (lock?.by.kind === "human") userIds.add(lock.by.id);
 		else if (lock) holderNarrators.add(lock.by.id);
+		// Handed to a session by its id (the board's 「转交给会话」, outline P2 PR 10a): shown as
+		// that session where the viewer may read it. Read with the holders, by primary key; a
+		// name that is no narrator's id (a handle, a label) stays a name.
+		const assigned = agentAssigneeName(meta.taskJson?.assignee);
+		if (assigned) assignedNames.add(assigned);
 	}
+	// Anyone who writes the space can type `@agent:<any id>`: the session's title is shown only to
+	// a viewer who may read that session, never because the id was written there.
+	const visible = narratorVisibility(ctx.principal);
+	const assignedSessions = new Set<string>();
+	for (const name of [...assignedNames].slice(0, ASSIGNED_SESSIONS_READ))
+		if (await visible(name)) {
+			assignedSessions.add(name);
+			holderNarrators.add(name);
+		}
 	const roots = await store.getNarratorRoots([...holderNarrators]);
 	const narratorIds = new Set<string>([...holderNarrators]);
 	for (const session of roots.values()) narratorIds.add(session.root);
@@ -451,8 +496,13 @@ async function describe(
 		}
 		if (task.assignee?.startsWith("human:"))
 			return { kind: "human", userId: null, name: task.assignee.slice("human:".length) };
-		if (task.assignee?.startsWith("agent:"))
-			return { kind: "agent", name: task.assignee.slice("agent:".length) };
+		if (task.assignee?.startsWith("agent:")) {
+			const name = task.assignee.slice("agent:".length);
+			// A root session's id the viewer may read: that session will do it. Anything else is
+			// a name, as written.
+			if (assignedSessions.has(name) && roots.get(name)?.root === name) return session(name);
+			return { kind: "agent", name };
+		}
 		if (!open && claim) {
 			if (claim.lastHolderUserId)
 				return {
@@ -464,6 +514,26 @@ async function describe(
 		}
 		const owner = sessionOfSpace(ctx.spaces.get(meta.spaceId));
 		return owner ? session(owner) : { kind: "none" };
+	};
+
+	// "Open a new session for this" (`task-session.ts` decides again when asked): to do, held by
+	// nobody, startable as a delegation would find it, in a space the reader may open sessions in.
+	const canOpenSession = (
+		meta: OutlineBlockMeta,
+		task: OutlineTaskJson,
+		wait: Parameters<typeof outlineTaskStartBlocker>[0]["wait"],
+	): boolean => {
+		if (!options.open || !ctx.openSessionSpaces?.has(meta.spaceId)) return false;
+		if (task.status !== "todo" || isClaimLive(claims.get(meta.id), now)) return false;
+		let planning = false;
+		let above: OutlineBlockMeta | undefined = meta;
+		for (let depth = 0; above && depth <= OUTLINE_LIMITS.maxDepth && !planning; depth++) {
+			planning = isPlanningRoot(above.taskJson);
+			// Someone is doing a task above it: its steps are theirs.
+			if (above !== meta && above.taskJson && isClaimLive(claims.get(above.id), now)) return false;
+			above = above.parentId === null ? undefined : known.get(above.parentId);
+		}
+		return outlineTaskStartBlocker({ task, planning, wait }) === null;
 	};
 
 	const out: OutlineBoardTask[] = [];
@@ -510,6 +580,7 @@ async function describe(
 				: null,
 			versionSeq: meta.versionSeq,
 			...(newlyDone.has(meta.id) ? { newlyDone: true as const } : {}),
+			...(canOpenSession(meta, task, wait) ? { openSession: true as const } : {}),
 		});
 	}
 	return out;
@@ -780,6 +851,27 @@ export async function readSessionTaskBoard(
 }
 
 /**
+ * Whether the person may open new sessions for the project space's tasks (outline P2 PR 10c-1):
+ * the session runtime runs here (not on PostgreSQL), they may create sessions in the project (its
+ * write access) and write its space, and the project has a working directory. A few keyed reads,
+ * once per board.
+ */
+async function mayOpenTaskSessions(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+	projectId: string,
+): Promise<boolean> {
+	if (!outlineTaskSessionsAvailable()) return false;
+	const project = await readProject(projectId);
+	if (!project) return false;
+	const creates =
+		principal.isAdmin ||
+		(await projectUsersWith(project, [principal.userId], "write")).has(principal.userId);
+	if (!creates || !(await canWriteSpace(principal, space))) return false;
+	return (await outlineTaskSessionProjectDir(projectId)) !== null;
+}
+
+/**
  * The board of a project (the project page): the project space on the first page, then the
  * session spaces of its sessions that the person may read, a page at a time. The caller has
  * checked that the person may read the project.
@@ -795,7 +887,11 @@ export async function readProjectTaskBoard(
 	const spaces: OutlineSpaceRow[] = [];
 	if (after === undefined) {
 		const projectSpace = await store.findSpace({ kind: "project", projectId });
-		if (projectSpace && (await canReadSpace(principal, projectSpace))) spaces.push(projectSpace);
+		if (projectSpace && (await canReadSpace(principal, projectSpace))) {
+			spaces.push(projectSpace);
+			if (await mayOpenTaskSessions(principal, projectSpace, projectId))
+				ctx.openSessionSpaces = new Set([projectSpace.id]);
+		}
 	}
 	const page = await readProjectSessionSpacePage(principal, projectId, {
 		afterNarratorId: after,

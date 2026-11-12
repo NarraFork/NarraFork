@@ -31,13 +31,16 @@
  *      hand over) write access to its space (404 when it cannot be read, 403 otherwise).
  *   8. Questions and the digest (P2 PR 7): the questions under a block, answering those put to
  *      the person (one `answer` commit), and acknowledging what agents confirmed on their behalf.
- *   9. Reports (P2 PR 11, `/digests`): only the person's own; see `routes/outline-digest.ts`.
+ *   9. "Open a new session for this" (P2 PR 10c-1): write access to the task's project (to create a
+ *      session in it) and to its space; see the route.
+ *  10. Reports (P2 PR 11, `/digests`): only the person's own; see `routes/outline-digest.ts`.
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
 
 import { blockTitle, isSpaceKey } from "@shared/outline";
 import {
+	OUTLINE_PENDING_API_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 	type OutlineAnswerResponse,
@@ -54,6 +57,7 @@ import {
 	type OutlinePendingSummary,
 	type OutlinePlanDiffResponse,
 	type OutlineQuestionGroupResponse,
+	type OutlineReportAuthorsResponse,
 	type OutlineResolveResponse,
 	type OutlineRevertResponse,
 	type OutlineSearchResponse,
@@ -64,12 +68,17 @@ import {
 	type OutlineTimelineResponse,
 	type OutlineViewStateResponse,
 } from "@shared/outline-api";
-import type {
-	OutlineBoardAddResponse,
-	OutlineBoardFinishedResponse,
-	OutlineBoardSeenResponse,
-	OutlineBoardTaskUpdateResponse,
-	OutlineTaskBoardResponse,
+import { isOutlineReportBlockId } from "@shared/outline-report-line";
+import type { OutlineSpecImportStatus } from "@shared/outline-spec-import";
+import {
+	OUTLINE_TASK_BOARD_LIMITS,
+	type OutlineBoardAddResponse,
+	type OutlineBoardFinishedResponse,
+	type OutlineBoardOpenSessionResponse,
+	type OutlineBoardSeenResponse,
+	type OutlineBoardTaskUpdateResponse,
+	type OutlineBoardTransferSessionsResponse,
+	type OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -81,6 +90,7 @@ import {
 	outlineBacklinksQuerySchema,
 	outlineBlockViewQuerySchema,
 	outlineBoardAddBodySchema,
+	outlineBoardOpenSessionBodySchema,
 	outlineBoardSeenBodySchema,
 	outlineBoardTaskUpdateBodySchema,
 	outlineDigestSeenBodySchema,
@@ -91,6 +101,7 @@ import {
 	outlinePageListQuerySchema,
 	outlinePendingRejectBodySchema,
 	outlinePlanDiffQuerySchema,
+	outlineReportAuthorsQuerySchema,
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
@@ -136,6 +147,7 @@ import {
 	reviewDiffOptions,
 } from "../services/outline/plans";
 import { commitSeqAt } from "../services/outline/read";
+import { readReportAuthors } from "../services/outline/report-authors";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "../services/outline/search";
@@ -160,6 +172,11 @@ import {
 	readProjectTaskBoard,
 	readSessionTaskBoard,
 } from "../services/outline/task-board";
+import {
+	listTransferSessions,
+	OUTLINE_TRANSFER_LIMITS,
+	startSessionOnTransferredTask,
+} from "../services/outline/transfer";
 import { readViewState, writeViewState } from "../services/outline/view-state";
 import {
 	describeLocks,
@@ -769,10 +786,38 @@ outlineRoutes.get("/spaces/:spaceId/pages/:pageId/pending", async (c) => {
 	);
 	const manages = views.size > 0 ? await canManageSpace(principal, space) : false;
 	for (const lock of views.values()) lock.canUnlock = unlockAllowed(principal, lock, manages);
+	// This page's unanswered questions (one indexed read): a block over one is never folded by
+	// default, and a row the reader folded counts those it hides.
+	const questions = await outlineStore.listOpenQuestionBlocksOnPage(
+		space.id,
+		block.pageId,
+		OUTLINE_PENDING_API_LIMITS.openQuestions,
+	);
 	const body: OutlinePagePendingResponse = {
 		pending: await describePending(principal, space, pending),
 		locks: [...views.values()],
+		questions,
 	};
+	return c.json(body);
+});
+
+/**
+ * Who wrote the subagent reports of a page the live editor shows (their container lines say
+ * 「来自 …」): the subagent's session title, for the containers whose session the person may
+ * read. The read-only view gets the same with its blocks (`readBlockView`).
+ */
+outlineRoutes.get("/spaces/:spaceId/report-authors", async (c) => {
+	const principal = principalOf(c);
+	const space = await readableSpace(principal, idParam(c, "spaceId"));
+	const { ids } = parse(outlineReportAuthorsQuerySchema, c.req.query());
+	// Live report containers of this space only (ids of other spaces are not found).
+	const metas = (await outlineStore.getBlockMetas(space.id, { ids: [...new Set(ids)] })).filter(
+		(meta) => !meta.deleted && isOutlineReportBlockId(meta.id),
+	);
+	const authors = await readReportAuthors(space.id, metas, {
+		narratorVisible: narratorVisibility(principal),
+	});
+	const body: OutlineReportAuthorsResponse = { authors: Object.fromEntries(authors) };
 	return c.json(body);
 });
 
@@ -1062,6 +1107,38 @@ outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 102
 });
 
 /**
+ * The import of a session's Dynamic Spec into the outline (outline P2 PR 12b), for the Spec
+ * panel's banner: whether the session is one to import, and how its last attempt went. Read access.
+ */
+outlineRoutes.get("/narrators/:narratorId/spec-import", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	const { specImportStatus } = await import("../services/outline/spec-import/triggers");
+	const body: OutlineSpecImportStatus = {
+		...(await specImportStatus(narrator.id)),
+		canImport: await holds(principal, "write", { narrator }),
+	};
+	return c.json(body);
+});
+
+/**
+ * "Import now" (and its retry): starts the import of the session and answers at once (202) with
+ * its state; the import itself runs in the background, on the session while it is idle. Write
+ * access to the session. With imports switched off (`outline.specImport`) nothing is started.
+ */
+outlineRoutes.post("/narrators/:narratorId/spec-import", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	if (!(await holds(principal, "write", { narrator }))) throw new ForbiddenError();
+	const { requestSpecImport } = await import("../services/outline/spec-import/triggers");
+	const body: OutlineSpecImportStatus = {
+		...(await requestSpecImport(narrator.id)),
+		canImport: true,
+	};
+	return c.json(body, 202);
+});
+
+/**
  * The person saw tasks marked 「新完成」 on a board (outline P2 PR 9b): each is recorded at the
  * version shown, so the mark is gone the next time the board is read. Only tasks that are done and
  * theirs, in spaces they may read, are recorded; the rest are ignored alike (nothing is said about
@@ -1089,11 +1166,22 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 	if (!block || !space || !(await canReadSpace(principal, space)))
 		throw new NotFoundError("Outline task", blockId);
 	const input = parse(outlineBoardTaskUpdateBodySchema, await c.req.json().catch(() => ({})));
-	// Starting a session runs a turn on the person's behalf: only someone who may write it.
-	const startable =
-		input.start && space.kind === "session" && space.narratorId
-			? await readNarrator(space.narratorId)
+	// Handed to a session by name (「转交给会话」): one the person may read (404 otherwise, as for
+	// any session they cannot see).
+	const handedTo =
+		input.assign?.kind === "narrator"
+			? await readableNarrator(principal, input.assign.narratorId)
 			: null;
+	// Starting a session runs a turn on the person's behalf: only someone who may write it. With
+	// a hand-over to a session that is the session started (「转交并开始」); otherwise the session
+	// whose space holds the task.
+	const startable = !input.start
+		? null
+		: handedTo
+			? handedTo
+			: space.kind === "session" && space.narratorId
+				? await readNarrator(space.narratorId)
+				: null;
 	if (input.start && !(startable && (await holds(principal, "write", { narrator: startable }))))
 		throw new ForbiddenError("You cannot start this session");
 	const { result } = await changePersonTask({
@@ -1103,16 +1191,85 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 		status: input.status,
 		assign: input.assign,
 	});
-	const started =
-		startable && (await resolveTaskBackend(startable.id)) === "outline"
-			? await startSessionOn(startable.id, principal.userId, blockId)
-			: false;
+	let started = false;
+	let notStarted: OutlineBoardTaskUpdateResponse["notStarted"];
+	if (startable && (await resolveTaskBackend(startable.id)) === "outline") {
+		if (handedTo) {
+			// Decided before anything is claimed; a start that declines gives the claim back.
+			const outcome = await startSessionOnTransferredTask({
+				narratorId: handedTo.id,
+				userId: principal.userId,
+				blockId,
+			});
+			started = outcome.started;
+			notStarted = outcome.notStarted;
+		} else started = await startSessionOn(startable.id, principal.userId, blockId);
+	}
 	const body: OutlineBoardTaskUpdateResponse = {
 		versionSeq: result?.commit?.seq ?? null,
 		started,
+		...(notStarted ? { notStarted } : {}),
 	};
 	return c.json(body);
 });
+
+/**
+ * The sessions a task may be handed to on the board (「转交给会话…」, outline P2 PR 10a): root
+ * sessions of the task's project the person may read that could do the task, named ones first,
+ * at most 50. Write access to the task's space (404 when it cannot be read).
+ */
+outlineRoutes.get("/tasks/:blockId/transfer-sessions", async (c) => {
+	const principal = principalOf(c);
+	const blockId = idParam(c, "blockId");
+	const block = await outlineStore.getBlock(blockId);
+	const space = block ? await outlineStore.getSpace(block.spaceId) : null;
+	if (!block || block.deleted || !block.taskJson || !space)
+		throw new NotFoundError("Outline task", blockId);
+	if (!(await canReadSpace(principal, space))) throw new NotFoundError("Outline task", blockId);
+	if (!(await canWriteSpace(principal, space))) throw new ForbiddenError();
+	const body: OutlineBoardTransferSessionsResponse = {
+		...(await listTransferSessions(principal, space)),
+		limit: OUTLINE_TRANSFER_LIMITS.sessions,
+	};
+	return c.json(body);
+});
+
+/**
+ * "Open a new session for this" (outline P2 PR 10c-1, D54): a new session of the task's project,
+ * owned by the person, is created, claims the task and starts on it with an opening brief written
+ * from the outline (`services/outline/task-session.ts`, which holds every check). 404 when the
+ * task cannot be read; 403 when the person may not create sessions in the project or write the
+ * task's space; 409 (`details.reason`) when the task cannot be started now, someone took it
+ * meanwhile (`details.holder`), or the session runtime does not run on this store (PostgreSQL);
+ * 500 when the session could not be started (the claim is given back, the session archived).
+ */
+outlineRoutes.post(
+	"/tasks/:blockId/open-session",
+	bodyLimit({
+		maxSize: OUTLINE_TASK_BOARD_LIMITS.openSessionBodyBytes,
+		onError: (c) =>
+			c.json(
+				{
+					code: "PAYLOAD_TOO_LARGE",
+					message: `Request body exceeds ${OUTLINE_TASK_BOARD_LIMITS.openSessionBodyBytes} bytes`,
+				},
+				413,
+			),
+	}),
+	async (c) => {
+		const principal = principalOf(c);
+		const blockId = idParam(c, "blockId");
+		const input = parse(outlineBoardOpenSessionBodySchema, await c.req.json().catch(() => ({})));
+		const { openTaskSession } = await import("../services/outline/task-session");
+		const body: OutlineBoardOpenSessionResponse = await openTaskSession({
+			taskId: blockId,
+			baseVersionSeq: input.baseVersionSeq,
+			by: { kind: "human", userId: principal.userId, isAdmin: principal.isAdmin },
+			options: { model: input.model, cwd: input.cwd, note: input.note },
+		});
+		return c.json(body, body.already ? 200 : 201);
+	},
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // View state
