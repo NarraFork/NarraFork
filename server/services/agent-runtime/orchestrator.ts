@@ -219,7 +219,11 @@ import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { endTurn, startTurn } from "../narrator-turns";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
-import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease-keeper";
+import {
+	keepOutlineTaskLeases,
+	type OutlineLeaseKeeper,
+	outlinePersonHourRunning,
+} from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
@@ -401,11 +405,21 @@ export async function runAgentLoopUnlocked(
 	// A person's message started this run or joined it (outline: such a run keeps the session's
 	// unfinished team tasks for a while; one the system started gives them back when it ends).
 	// Said by the run's entry point, never read off the input (a Retry or a Continue carries no
-	// text): unset is a person. A person's queued message taken up later makes it theirs too.
+	// text): unset is a person. A person's queued message taken up later makes it theirs too, and
+	// so does a person acting inside it (`_runPersonActed`: a permission, a plan, a question
+	// resolved, an asynchronous answer taken up).
 	let personSpoke = active._runInitiatedBy !== "system";
 	const runForTaskId = active._runForTaskId ?? null;
 	active._runInitiatedBy = undefined;
 	active._runForTaskId = undefined;
+	active._runPersonActed = false;
+	const personRun = () => personSpoke || active._runPersonActed === true;
+	/** What the finalizer restarts the session for, and what will wake it when it finishes. */
+	const workPendingAtEnd = async (): Promise<boolean> =>
+		(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
+		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
+		// A question a person has yet to answer: their answer wakes the session.
+		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -3511,7 +3525,12 @@ export async function runAgentLoopUnlocked(
 				// settled terminal below, so nothing awaited sits between the drain and the
 				// arbitration. The drain or a hold continuing the run drops it.
 				const turnEndNote = await decideOutlineTurnEndNote(active, {
-					givingBackTeamTasks: !personSpoke && !runState.wasInterrupted,
+					givingBackTeamTasks:
+						!personRun() &&
+						!runState.wasInterrupted &&
+						!active.abortController.signal.aborted &&
+						!outlinePersonHourRunning(narratorId) &&
+						!(await workPendingAtEnd().catch(() => true)),
 				});
 
 				// Drain any queued injection FIRST, before flipping the DB status to idle.
@@ -3599,13 +3618,11 @@ export async function runAgentLoopUnlocked(
 				!runState.hadError &&
 				!runState.wasInterrupted &&
 				!active.abortController.signal.aborted,
-			person: personSpoke,
+			// A subagent's run is never a person's hour of its own: its claims pass to its root.
+			person: personRun() && !deliverTo,
 			reply: runState.finalText,
 			forTaskId: runForTaskId,
-			// What the finalizer restarts the session for, and what will wake it when it finishes.
-			pending: async () =>
-				(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
-				(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0,
+			pending: workPendingAtEnd,
 		});
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;

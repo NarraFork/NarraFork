@@ -236,6 +236,12 @@ export interface ActiveNarrator {
 	_runInitiatedBy?: "person" | "system";
 	/** The outline task the run about to begin was started for (a session opened for it). */
 	_runForTaskId?: string;
+	/**
+	 * A person acted inside the current run (outline P2 PR 10c-2): resolved its permission, plan
+	 * approval or question, or answered its asynchronous question. Cleared when a run starts and
+	 * read when it ends: the run then counts as a person's.
+	 */
+	_runPersonActed?: boolean;
 	_continuationSuppressed?: boolean;
 	/** Whether the current pass is a normal task continuation or a blocked-task recovery turn. */
 	_continuationTurn?: "task" | "blocked";

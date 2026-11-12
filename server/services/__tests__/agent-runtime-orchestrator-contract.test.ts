@@ -507,6 +507,7 @@ describe("outline task leases", () => {
 				text?: string;
 				forTaskId?: string;
 				during?: (h: ReturnType<typeof fixture>, run: Promise<unknown>) => Promise<void>;
+				profile?: Shape;
 			} = {},
 		) {
 			const release = await import("../outline/release");
@@ -521,7 +522,7 @@ describe("outline task leases", () => {
 			});
 			const enabled = settings.outline.enabled;
 			settings.outline.enabled = true;
-			const h = fixture(profiles[0], script);
+			const h = fixture(options.profile ?? profiles[0], script);
 			// What the entry point says (`runAgentLoop`): taken by the run when it starts.
 			if (options.by) h.session._runInitiatedBy = options.by;
 			if (options.forTaskId) h.session._runForTaskId = options.forTaskId;
@@ -547,6 +548,12 @@ describe("outline task leases", () => {
 				natural: false,
 				person: true,
 			});
+		});
+
+		test("a subagent's run is never a person's hour of its own (its claims pass to its root)", async () => {
+			expect(
+				await endOf([finished], { by: "person", text: "do this", profile: profiles[1] }),
+			).toMatchObject({ person: false });
 		});
 
 		test("a person's Continue or Retry carries no text and is still a person's", async () => {
@@ -662,6 +669,115 @@ describe("outline task leases", () => {
 				}
 			});
 
+		test("a person acting inside a system run (a permission, a plan, a question resolved) makes it a person's", async () => {
+			let session: ActiveNarrator | undefined;
+			const end = await endOf(
+				[
+					async () => {
+						// What `resolvePermission` does when a person decides.
+						if (session) session._runPersonActed = true;
+						return finished;
+					},
+				],
+				{
+					by: "system",
+					during: async (h) => {
+						session = h.session;
+					},
+				},
+			);
+			expect(end).toMatchObject({ natural: false, person: true });
+		});
+
+		test("a system run that ends with a question a person has yet to answer: not natural", async () => {
+			const questions = await import("../narrator-question-service");
+			const open = spyOn(questions, "countOpenAsyncQuestions").mockResolvedValue(1);
+			try {
+				expect(await endOf([finished], { by: "system" })).toMatchObject({
+					natural: false,
+					person: false,
+				});
+			} finally {
+				open.mockRestore();
+			}
+		});
+
+		const noteCases: Array<[string, "person" | "system", boolean, () => Promise<() => void>]> = [
+			["the system's run that ends by itself", "system", true, async () => () => {}],
+			["a person's run", "person", false, async () => () => {}],
+			[
+				"the system's run with a question open",
+				"system",
+				false,
+				async () => {
+					const questions = await import("../narrator-question-service");
+					const open = spyOn(questions, "countOpenAsyncQuestions").mockResolvedValue(1);
+					return () => open.mockRestore();
+				},
+			],
+			[
+				"the system's run inside a person's hour",
+				"system",
+				false,
+				async () => {
+					const keeper = await import("../outline/lease-keeper");
+					const hour = spyOn(keeper, "outlinePersonHourRunning").mockReturnValue(true);
+					return () => hour.mockRestore();
+				},
+			],
+		];
+		for (const [name, by, expected, arrange] of noteCases)
+			test(`the turn-end note is told team tasks are given back only when they will be: ${name} → ${expected}`, async () => {
+				const session = await import("../narrator-session");
+				const note = spyOn(session, "decideOutlineTurnEndNote").mockResolvedValue(null);
+				const restore = await arrange();
+				try {
+					await endOf([finished], { by });
+					expect(note.mock.calls.at(-1)?.[1]?.givingBackTeamTasks).toBe(expected);
+				} finally {
+					restore();
+					note.mockRestore();
+				}
+			});
+
+		test("a person's decision on a permission marks the run of the session asking and of the one it shows on; an automatic one does not", async () => {
+			const { pendingPermissions } = await import("../narrator-session-state");
+			const { resolvePermission } = await import("../narrator-permission");
+			const asking = active("contract-person-asking");
+			const parent = active("contract-person-parent");
+			activeNarrators.set(asking.narratorId, asking);
+			activeNarrators.set(parent.narratorId, parent);
+			const pend = (requestId: string) =>
+				pendingPermissions.set(requestId, {
+					narratorId: asking.narratorId,
+					broadcastTargetId: parent.narratorId,
+					toolName: "Bash",
+					toolUseId: `${requestId}-use`,
+					input: {},
+					resolve: () => {},
+					cleanup: () => {},
+				} as never);
+			try {
+				pend("contract-person-auto");
+				await resolvePermission("contract-person-auto", "allow", { decidedBy: "auto" }).catch(
+					() => false,
+				);
+				expect(asking._runPersonActed).toBeUndefined();
+				expect(parent._runPersonActed).toBeUndefined();
+				pend("contract-person-user");
+				await resolvePermission("contract-person-user", "allow", { userId: "principal-a" }).catch(
+					() => false,
+				);
+				expect(asking._runPersonActed).toBe(true);
+				expect(parent._runPersonActed).toBe(true);
+			} finally {
+				pendingPermissions.delete("contract-person-auto");
+				pendingPermissions.delete("contract-person-user");
+				activeNarrators.delete(asking.narratorId);
+				activeNarrators.delete(parent.narratorId);
+			}
+		});
+
 		test("the next pass of a run that waited (`prepareQueuedRunInput`): a wake delivered is the system's, a person's queued message theirs", async () => {
 			const session = await import("../narrator-session");
 			const h = fixture(profiles[0], []);
@@ -682,6 +798,15 @@ describe("outline task leases", () => {
 					text: "",
 				});
 				expect(initiatedBy()).toBe("system");
+				// A person's answer among what was delivered (the drain marks it): the person's.
+				drain.mockImplementation(async (target) => {
+					target._runPersonActed = true;
+					return "a person's answer";
+				});
+				expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toEqual({
+					text: "",
+				});
+				expect(initiatedBy()).toBe("person");
 			} finally {
 				drain.mockRestore();
 			}

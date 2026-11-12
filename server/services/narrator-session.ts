@@ -2013,10 +2013,10 @@ export async function decideOutlineTurnEndNote(
 	active: ActiveNarrator,
 	options: {
 		/**
-		 * The run is the system's and ends by itself: the session's unfinished team tasks are
-		 * given back right after (outline P2 PR 10c-2, `release.ts`), so a note saying one of them
-		 * was left in progress would be false by the time it is read. Only a task of the session's
-		 * own space is named then.
+		 * The run's end gives the session's unfinished team tasks back at once (outline P2 PR
+		 * 10c-2, `release.ts`: the system's run, ended by itself, nothing pending, not in a
+		 * person's hour), so a note saying one of them was left in progress would be false by the
+		 * time it is read. A team task on a person's hour of its own stays, and is named.
 		 */
 		givingBackTeamTasks?: boolean;
 	} = {},
@@ -2030,8 +2030,15 @@ export async function decideOutlineTurnEndNote(
 		if (!source.turnEndNote) return null;
 		const { tasks, revision } = await source.openTasks();
 		if (revision !== start.revision) return null;
+		const { outlineTaskOnPersonHour } = await import("./outline/release");
 		const doing = tasks.find(
-			(task) => task.status === "doing" && !(options.givingBackTeamTasks && task.elsewhere),
+			(task) =>
+				task.status === "doing" &&
+				!(
+					options.givingBackTeamTasks &&
+					task.teamTaskId &&
+					!outlineTaskOnPersonHour(task.teamTaskId)
+				),
 		);
 		if (!doing) return null;
 		return source.turnEndNote(doing, active.locale);
@@ -2520,6 +2527,8 @@ async function deliverPendingInjectionsInOrder(
 					row,
 				).questionAnswer;
 				if (questionAnswer) {
+					// A person's answer: the run that takes it up is theirs too (outline P2 PR 10c-2).
+					if (active) active._runPersonActed = true;
 					// Adopt the already persisted user receipt, never create a second message.
 					const ref = db
 						.select({ id: narratorMessageRefs.id })
@@ -3825,13 +3834,15 @@ export async function prepareQueuedRunInput(
 	const id = active.narratorId;
 	if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
 	// Who starts the pass about to run (`ActiveNarrator._runInitiatedBy`, taken by the pass): a
-	// wake delivered here (an agent's message, a notice, a background result) is the system's; a
-	// person's queued message is theirs.
+	// wake delivered here (an agent's message, a notice, a background result) is the system's,
+	// unless it carries a person's answer to a question; a person's queued message is theirs.
 	active._runInitiatedBy = undefined;
 	active._runForTaskId = undefined;
+	active._runPersonActed = false;
 	const delivered = await drainAndPersistPendingInjections(active);
 	if (delivered) {
-		active._runInitiatedBy = "system";
+		// A person's answer among what was delivered makes the pass theirs.
+		active._runInitiatedBy = active._runPersonActed ? "person" : "system";
 		return { text: "" };
 	}
 	const row = await claimInboxHead(id, (candidate) => candidate.kind === "user_input");
@@ -5451,6 +5462,7 @@ export function consumeQuestionAnswerModelReceipts(
 export function registerQuestionAnswerFallback(narratorId: string, messageId: string): void {
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
+	active._runPersonActed = true;
 	active._questionAnswerFallbackMessageIds ??= new Set();
 	active._questionAnswerFallbackMessageIds.add(messageId);
 }
@@ -5683,7 +5695,8 @@ export async function startInjectionContinuationIfPossible(
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 		runAgentLoop(active, "", undefined, {
 			principal: executionPrincipal?.userId,
-			initiatedBy: "system",
+			// A person's answer (an asynchronous question) wakes the session on their behalf.
+			initiatedBy: executionPrincipal ? "person" : "system",
 		}).catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (injection)", {
 				narratorId,

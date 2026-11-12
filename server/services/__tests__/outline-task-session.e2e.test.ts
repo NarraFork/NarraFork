@@ -91,6 +91,7 @@ const {
 	prepareOutlineRun,
 	retryLastMessage,
 	sendMessage,
+	startInjectionContinuationIfPossible,
 	startSpecContinuationIfPossible,
 } = await import("../narrator-session");
 const { narratorService } = await import("../narrator-service");
@@ -111,7 +112,9 @@ const { readProjectTaskBoard } = await import("../outline/task-board");
 const { outlineRunEndsSettled, resetOutlinePersonRunEndsForTests } = await import(
 	"../outline/lease-keeper"
 );
-const { resetOutlineGraceLeasesForTests } = await import("../outline/release");
+const { resetOutlineGraceLeasesForTests, settleOutlineTaskClaimsAtRunEnd } = await import(
+	"../outline/release"
+);
 // The run's end asks whether anything still works for the session in the background.
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 await backgroundOccupancyStore.start();
@@ -1487,6 +1490,45 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 		expect(await handoffsUnder(task.id)).toHaveLength(1);
 	});
 
+	test("a wake is the system's; a wake on behalf of a person's answer (its principal) is the person's", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const { body } = await open(alice, task);
+		const id = body.narratorId;
+		await idle(id, 1);
+		onTurn = async () => {
+			if ((await stateOf(task.id)).holder === id) return;
+			await asSession(p.space.id, id, alice, [
+				{ op: "setTask", block: { id: task.id }, task: { status: "doing" } },
+			]);
+		};
+		const wake = async (principal?: { version: 1; userId: string }) => {
+			let started = false;
+			// The previous run's finalizer may still hold the session for a moment after it is idle.
+			for (const deadline = Date.now() + 5_000; !started && Date.now() < deadline; ) {
+				started = (await startInjectionContinuationIfPossible(id, "en", false, principal)).started;
+				if (!started) await Bun.sleep(5);
+			}
+			expect(started).toBe(true);
+		};
+		// A wake (a notice, a background result): the system's, so given back at once.
+		await wake();
+		await idle(id, 2);
+		expect(await stateOf(task.id)).toMatchObject({ status: "todo", holder: null, epoch: 2 });
+		expect(await handoffsUnder(task.id)).toHaveLength(2);
+		// A person answered the session's question: their answer wakes it, and the run is theirs.
+		const before = Date.now();
+		await wake({ version: 1, userId: alice });
+		await idle(id, 3);
+		expect(await stateOf(task.id)).toMatchObject({ status: "doing", holder: id, epoch: 3 });
+		const [claim] = await outlineStore.getTaskClaims([task.id]);
+		const lease = Date.parse(claim?.expiresAt as string) - before;
+		expect(lease).toBeGreaterThan(50 * 60_000);
+		expect(lease).toBeLessThan(70 * 60_000);
+		expect(await handoffsUnder(task.id)).toHaveLength(2);
+	});
+
 	test("a start nobody asked for (a plugin's, `explicitStart: false`) is the system's: an unfinished team task goes back at once", async () => {
 		settings.agent.autoContinuationMode = "protectedOnly";
 		const alice = await person("alice");
@@ -1551,6 +1593,40 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 		expect((await decideOutlineTurnEndNote(active))?.content).toContain("Fix the refresh logic");
 		// A system run ending by itself gives it back right after: no note about it.
 		expect(await decideOutlineTurnEndNote(active, { givingBackTeamTasks: true })).toBeNull();
+		// On a person's hour of its own, the task stays: the note names it.
+		await settleOutlineTaskClaimsAtRunEnd(plain.id, { natural: false, person: true });
+		expect(
+			(await decideOutlineTurnEndNote(active, { givingBackTeamTasks: true }))?.content,
+		).toContain("Fix the refresh logic");
+	});
+
+	test("the turn-end note still names a task of the person's own space the session is doing", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const plain = await narratorService.create({
+			contextProjectId: p.id,
+			cwd: p.dir,
+			ownerUserId: alice,
+			title: "Holder",
+			taskBackend: "outline",
+			startInPlanMode: false,
+		});
+		opened.push(plain.id);
+		const personal = await ensurePersonalSpace(alice);
+		const mine = await taskIn(personal.id, alice, "Sort my notes");
+		await asSession(personal.id, plain.id, alice, [
+			{ op: "setTask", block: { id: mine.id }, task: { status: "doing" } },
+		]);
+		const active = {
+			narratorId: plain.id,
+			locale: "en",
+			_todoReminderCompletedToolCount: 0,
+		} as never as Parameters<typeof decideOutlineTurnEndNote>[0];
+		await prepareOutlineRun(active);
+		(active as { _todoReminderCompletedToolCount: number })._todoReminderCompletedToolCount = 40;
+		expect(
+			(await decideOutlineTurnEndNote(active, { givingBackTeamTasks: true }))?.content,
+		).toContain("Sort my notes");
 	});
 
 	test("opened in the previous session's directory: offered on the board when it is inside the project and still there, and used when asked", async () => {
