@@ -2918,5 +2918,40 @@
 		"remove": "Remove key",
 		"networkTitle": "Network identity · {{name}}",
 		"saveFirst": "Save the provider to add more keys."
-	}
+	},
+	"outlineImportSection": "Outline import",
+	"specImportAdminTitle": "Dynamic Spec import",
+	"specImportAdminDescription": "Sessions that still kept their tasks in Dynamic Spec are imported into the outline. Here you see how each import went, import a session again, or move a session the import moved back to Dynamic Spec. Nothing is deleted either way.",
+	"specImportAdminOutlineOff": "The outline is switched off, so nothing is imported.",
+	"specImportAdminMode": {
+		"auto": "Imports run automatically: before a small session's next run, and in the background while sessions are idle.",
+		"manual": "Imports run only when someone presses \"Import now\" in a session's Spec panel, or from here.",
+		"off": "Imports are switched off (outline.specImport is off)."
+	},
+	"specImportAdminState": {
+		"attention": "Needs attention",
+		"failed": "Failed",
+		"busy": "Busy",
+		"running": "Running",
+		"imported": "Imported",
+		"reverted": "Moved back",
+		"idle": "Waiting"
+	},
+	"specImportAdminBackend": {
+		"spec": "in Dynamic Spec",
+		"outline": "in the outline"
+	},
+	"specImportAdminEmpty": "No session is in this state.",
+	"specImportAdminMore": "Load more",
+	"specImportAdminUntitled": "Untitled session",
+	"specImportAdminOwner": "owner {{name}}",
+	"specImportAdminAttempts": "failed attempts: {{count}}",
+	"specImportAdminReverts": "moved back: {{count}}",
+	"specImportAdminReimport": "Import again",
+	"specImportAdminReimported": "The import started.",
+	"specImportAdminRevert": "Move back to Dynamic Spec",
+	"specImportAdminRevertTitle": "Move this session back to Dynamic Spec?",
+	"specImportAdminRevertConfirm": "The session keeps its tasks in Dynamic Spec again, as they were when it was imported, and its old behavior fence is restored. Nothing in the outline or in Dynamic Spec is deleted: the outline keeps what is there, with a note on top of the task and behavior pages. Only an administrator can import it again.",
+	"specImportAdminReverted": "The session was moved back to Dynamic Spec.",
+	"specImportAdminRevertedUnmarked": "The session was moved back to Dynamic Spec; the note could not be added to its outline pages."
 }

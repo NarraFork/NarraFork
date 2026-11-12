@@ -392,3 +392,49 @@ test("an outline session's old Spec files are read only: previews, no task edito
 	expect(host.querySelector("[data-monaco-test-editor]")).toBeNull();
 	expect(writes).toEqual([]);
 });
+
+test("the old Spec files of a session the import moved say so and link to its task page (12b2)", async () => {
+	backend = "outline";
+	let switchedAt: string | null = "2026-11-12T00:00:00.000Z";
+	const status = spyOn(api, "getSpecImportStatus").mockImplementation(async () => ({
+		mode: "auto",
+		importable: false,
+		canImport: false,
+		state: "imported",
+		error: null,
+		reason: null,
+		at: switchedAt,
+		attempts: 0,
+		switchedAt,
+		spaceId: switchedAt ? "space-1" : null,
+		taskPageId: switchedAt ? "page-1" : null,
+		revertedAt: null,
+	}));
+	restores.push(() => status.mockRestore());
+	const settingsSpy = spyOn(api, "getSettings").mockResolvedValue({
+		agent: {},
+		outline: { enabled: true },
+	} as never);
+	restores.push(() => settingsSpy.mockRestore());
+	queryClient.setQueryData(["settings"], { agent: {}, outline: { enabled: true } });
+	await act(async () => {
+		await queryClient.invalidateQueries();
+	});
+	const legacy = () => host.querySelector('[data-testid="outline-tasks-legacy"]');
+	await waitFor(() => !!legacy());
+	await act(async () => (legacy() as unknown as { click: () => void }).click());
+	const notice = () => host.querySelector('[data-testid="spec-moved-notice"]');
+	await waitFor(() => !!notice());
+	expect(notice()?.textContent).toContain(en.spec.specImportMovedTitle);
+	expect(notice()?.textContent).toContain(en.spec.specImportMovedBody);
+	const link = host.querySelector('[data-testid="spec-moved-open"]');
+	expect(link?.textContent).toBe(en.spec.specImportMovedOpen);
+	expect(link?.getAttribute("href")).toEndWith("/outline/space-1/page-1");
+	// A session created in the outline was never moved: no such line.
+	switchedAt = null;
+	await act(async () => {
+		await queryClient.invalidateQueries({ queryKey: ["spec-import", NARRATOR] });
+	});
+	await waitFor(() => !notice());
+	expect(host.querySelector('[data-testid="outline-tasks-back"]')).not.toBeNull();
+});

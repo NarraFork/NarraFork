@@ -36,6 +36,11 @@ const base: OutlineSpecImportStatus = {
 	error: null,
 	reason: null,
 	at: null,
+	attempts: 0,
+	switchedAt: null,
+	spaceId: null,
+	taskPageId: null,
+	revertedAt: null,
 };
 
 async function waitFor(ready: () => boolean) {
@@ -215,6 +220,19 @@ test("a busy outcome of the button is remembered: the banner says the session wa
 	expect(banner()?.textContent).toContain(en.spec.specImportBusy);
 });
 
+test("a session an administrator moved back says so; only an administrator gets the button (12b2)", async () => {
+	await mount({ state: "reverted", canImport: false, revertedAt: "2026-11-12T00:00:00.000Z" });
+	await waitFor(() => banner() !== null);
+	expect(banner()?.getAttribute("data-state")).toBe("reverted");
+	expect(banner()?.textContent).toContain(en.spec.specImportReverted);
+	expect(button()).toBeNull();
+	await act(async () => root?.unmount());
+	host.remove();
+	await mount({ state: "reverted", canImport: true });
+	await waitFor(() => banner() !== null);
+	expect(button()?.textContent).toBe(en.spec.specImportNow);
+});
+
 test("nothing is drawn for a session that is not to be imported, with imports off, or the outline off", async () => {
 	await mount({ importable: false });
 	await waitFor(() => reads > 0);
@@ -270,9 +288,12 @@ test("every string exists in both languages", () => {
 		expect(zhReasons[code]).toBeTruthy();
 		expect(zhReasons[code]).not.toBe(enReasons[code]);
 	}
-	// No tool for an administrator exists yet: nothing sends the reader to one.
+	// Only a session an administrator moved back sends the reader to one (12b2): attention is
+	// retried from the panel itself.
 	const imports = [en.spec, zh.spec].map((spec) =>
-		Object.entries(spec).filter(([key]) => key.startsWith("specImport")),
+		Object.entries(spec).filter(
+			([key]) => key.startsWith("specImport") && key !== "specImportReverted",
+		),
 	);
 	expect(JSON.stringify(imports)).not.toMatch(/administrator|管理员/);
 });

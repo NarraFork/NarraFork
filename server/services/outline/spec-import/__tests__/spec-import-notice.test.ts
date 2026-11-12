@@ -120,11 +120,10 @@ describe("the notice", () => {
 
 describe("spec tools and writes of a moved session", () => {
 	const read: AgentToolUse = {
-		type: "tool_use",
-		id: "t1",
+		toolUseId: "t1",
 		name: "Read",
 		input: { file_path: "spec://tasks.json" },
-	} as AgentToolUse;
+	};
 
 	test("a spec:// call is told where the old files went", () => {
 		const moved = getOutlineSpecRejection(read, {

@@ -2918,5 +2918,40 @@
 		"remove": "删除 Key",
 		"networkTitle": "网络身份 · {{name}}",
 		"saveFirst": "保存供应商后可以添加更多 Key。"
-	}
+	},
+	"outlineImportSection": "大纲导入",
+	"specImportAdminTitle": "Dynamic Spec 导入",
+	"specImportAdminDescription": "还在用 Dynamic Spec 记任务的会话会导入大纲。这里可以看每个会话导入得怎样，重新导入，或者把被导入搬过去的会话退回 Dynamic Spec。两种操作都不删除任何内容。",
+	"specImportAdminOutlineOff": "大纲已关闭，不会导入。",
+	"specImportAdminMode": {
+		"auto": "自动导入：小会话在下一次开始运行前导入，其余在会话空闲时由后台导入。",
+		"manual": "只在有人点会话 Spec 面板上的「现在导入」，或在这里重新导入时导入。",
+		"off": "导入已关闭（outline.specImport 为 off）。"
+	},
+	"specImportAdminState": {
+		"attention": "需要处理",
+		"failed": "失败",
+		"busy": "忙",
+		"running": "导入中",
+		"imported": "已导入",
+		"reverted": "已退回",
+		"idle": "等待中"
+	},
+	"specImportAdminBackend": {
+		"spec": "在 Dynamic Spec",
+		"outline": "在大纲"
+	},
+	"specImportAdminEmpty": "没有会话处于这个状态。",
+	"specImportAdminMore": "加载更多",
+	"specImportAdminUntitled": "未命名会话",
+	"specImportAdminOwner": "负责人 {{name}}",
+	"specImportAdminAttempts": "失败 {{count}} 次",
+	"specImportAdminReverts": "退回过 {{count}} 次",
+	"specImportAdminReimport": "重新导入",
+	"specImportAdminReimported": "已开始导入。",
+	"specImportAdminRevert": "退回 Dynamic Spec",
+	"specImportAdminRevertTitle": "把这个会话退回 Dynamic Spec？",
+	"specImportAdminRevertConfirm": "会话重新用 Dynamic Spec 记任务，回到导入时的样子，旧的行为护栏也恢复。大纲和 Dynamic Spec 里都不删除任何内容：大纲保留现有内容，并在任务页和行为边界页顶上加一条说明。之后只有管理员能再导入。",
+	"specImportAdminReverted": "会话已退回 Dynamic Spec。",
+	"specImportAdminRevertedUnmarked": "会话已退回 Dynamic Spec；没能在它的大纲页上加说明。"
 }
