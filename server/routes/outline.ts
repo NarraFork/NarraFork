@@ -66,6 +66,8 @@ import {
 	type OutlineSpaceResolveResponse,
 	type OutlineSpaceSummary,
 	type OutlineTimelineResponse,
+	type OutlineTreeResponse,
+	type OutlineTreeSpacesResponse,
 	type OutlineViewStateResponse,
 } from "@shared/outline-api";
 import { isOutlineReportBlockId } from "@shared/outline-report-line";
@@ -106,6 +108,7 @@ import {
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
 	outlineTaskBoardQuerySchema,
+	outlineTreeQuerySchema,
 	outlineViewStatePutSchema,
 } from "../lib/validators/outline";
 import {
@@ -151,6 +154,11 @@ import { readReportAuthors } from "../services/outline/report-authors";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "../services/outline/search";
+import {
+	listOutlineTreeSpaces,
+	readOutlineTree,
+	readSpaceParent,
+} from "../services/outline/space-tree";
 import {
 	ensurePersonalSpace,
 	ensureProjectSpace,
@@ -367,6 +375,7 @@ outlineRoutes.get("/spaces/:spaceId", async (c) => {
 		space: {
 			...(await describeOne(principal, space)),
 			canWrite: await canWriteSpace(principal, space),
+			parent: await readSpaceParent(principal, space),
 		},
 	};
 	return c.json(body);
@@ -381,6 +390,53 @@ outlineRoutes.get("/spaces/:spaceId/pages", async (c) => {
 		cursor: query.cursor ?? null,
 		limit: query.limit ?? OUTLINE_VIEW_LIMITS.defaultListPage,
 	});
+	return c.json(body);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The connected outline (readability E): spaces as one tree by ownership
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The tree's root: the person's own space, a page of project spaces, the groups' counts. */
+outlineRoutes.get("/tree", async (c) => {
+	const principal = principalOf(c);
+	const query = parse(outlineTreeQuerySchema, c.req.query());
+	const body: OutlineTreeResponse = await readOutlineTree(principal, {
+		cursor: query.cursor ?? null,
+	});
+	return c.json(body);
+});
+
+/** A page of a project's sessions in the tree; a project the person cannot read is 404. */
+outlineRoutes.get("/tree/projects/:projectId/sessions", async (c) => {
+	const principal = principalOf(c);
+	const projectId = idParam(c, "projectId");
+	const project = await readProject(projectId);
+	if (!project || !(await holds(principal, "read", { project }))) {
+		throw new NotFoundError("Project", projectId);
+	}
+	const query = parse(outlineTreeQuerySchema, c.req.query());
+	const body: OutlineTreeSpacesResponse = await listOutlineTreeSpaces(
+		principal,
+		{ kind: "project", projectId },
+		{ cursor: query.cursor ?? null },
+	);
+	return c.json(body);
+});
+
+/**
+ * A page of the sessions under no listed project (`loose`), or of the spaces whose owner is gone
+ * (`orphaned`: admins; anyone else gets an empty list).
+ */
+outlineRoutes.get("/tree/:group{loose|orphaned}", async (c) => {
+	const principal = principalOf(c);
+	const group = c.req.param("group") === "orphaned" ? "orphaned" : "loose";
+	const query = parse(outlineTreeQuerySchema, c.req.query());
+	const body: OutlineTreeSpacesResponse = await listOutlineTreeSpaces(
+		principal,
+		{ kind: group },
+		{ cursor: query.cursor ?? null },
+	);
 	return c.json(body);
 });
 

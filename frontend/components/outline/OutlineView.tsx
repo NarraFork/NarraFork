@@ -75,9 +75,10 @@ export function OutlineView({
 				onLoaded={onSpaceLoaded}
 				onMissing={onMissing}
 				actions={actions}
+				host={layout}
 			/>
 		) : (
-			<OutlineHome header={homeHeader} />
+			<OutlineHome header={homeHeader} host={layout} />
 		);
 	return (
 		<OutlineNavProvider onNavigate={onNavigate} renderLink={renderLink}>

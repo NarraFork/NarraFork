@@ -28,12 +28,8 @@
 			"session": "会话"
 		},
 		"orphaned": "所有者已删除",
-		"commits_one": "{{count}} 次提交",
-		"commits_other": "{{count}} 次提交",
 		"readOnly": "只读",
-		"searchPlaceholder": "在这个空间中搜索",
-		"pages": "页面",
-		"noPages": "还没有页面。agent 和编辑器写入的页面会出现在这里。"
+		"searchPlaceholder": "在这个空间中搜索"
 	},
 	"page": {
 		"task": {
@@ -688,5 +684,23 @@
 				"unreadable": "新会话读不到这个项目的大纲，所以没有把任务交给它。请检查项目和会话的可见范围设置。"
 			}
 		}
+	},
+	"tree": {
+		"hint": "箭头就地展开阅读；点页标题打开这一页编辑。",
+		"collapseAll": "全部收起",
+		"recent": "最近访问（{{count}}）",
+		"sessions": "会话（{{count}}）",
+		"sessionsUncounted": "会话",
+		"loose": "不属于项目的会话（{{count}}）",
+		"orphaned": "已失效的空间（{{count}}）",
+		"noSessions": "没有你能查看的会话。",
+		"noPages": "还没有页面。",
+		"moreSpaces_one": "还有 {{count}} 个 ▸",
+		"moreSpaces_other": "还有 {{count}} 个 ▸",
+		"moreProjects": "更多项目 ▸",
+		"gone": "已不可查看。",
+		"partial_one": "这里只显示这一页的前 {{count}} 块。",
+		"partial_other": "这里只显示这一页的前 {{count}} 块。",
+		"openPage": "打开这一页"
 	}
 }

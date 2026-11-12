@@ -161,6 +161,11 @@ export const outlineTaskBoardQuerySchema = z.object({
 	cursor: cursorSchema.optional(),
 });
 
+/** A page of a listing of the connected outline (`/outline/tree…`). */
+export const outlineTreeQuerySchema = z.object({
+	cursor: cursorSchema.optional(),
+});
+
 /** A space's next finished tasks. */
 export const outlineFinishedTasksQuerySchema = z.object({
 	cursor: cursorSchema.optional(),

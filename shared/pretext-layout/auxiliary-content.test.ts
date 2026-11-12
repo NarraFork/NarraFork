@@ -280,7 +280,7 @@ describe("auxiliary content projection", () => {
 		expect(trace.opts).toMatchObject({ collapsed: true, expandedIndices: [] });
 	});
 
-	test("internal Send stays a generic tool card and authoritative question lifecycle reaches adapter", () => {
+	test("internal Send is a bubble from L3 up and authoritative question lifecycle reaches adapter", () => {
 		const msg = message([], { role: "assistant" });
 		const item = {
 			blockIndex: 0,
@@ -293,12 +293,21 @@ describe("auxiliary content projection", () => {
 				inputJson: { id: "child", show_to_user: false },
 			},
 		};
-		const [send] = adaptSegment(
-			{ kind: "tool-run", items: [item], sourceMessages: [msg] },
-			{ lod: 3, compactAuxiliaryContent: true },
-		);
-		expect(send.kind).toBe("tool-call");
-		expect(send.opts?.opened).not.toBe(true);
+		// show_to_user only decides which bubbles survive L1/L2; L3+ shows every one.
+		for (const lod of [3, 4, 5] as const) {
+			const [send] = adaptSegment(
+				{ kind: "tool-run", items: [item], sourceMessages: [msg] },
+				{ lod, compactAuxiliaryContent: true },
+			);
+			expect(send.kind).toBe("communication-bubble");
+			// The identity its L1/L2 trace row carries, so a level switch pairs the two.
+			expect(send.unitId).toBe("tool-send");
+		}
+		const row = adaptActivityUnit([{ kind: "tool", ...item }], "trace", {
+			lod: 2,
+			compactAuxiliaryContent: true,
+		});
+		expect((row.data as { items: { unitId: string }[] }).items[0].unitId).toBe("tool-send");
 		const ask = {
 			...item,
 			isSubagent: false,
@@ -363,7 +372,9 @@ describe("auxiliary content projection", () => {
 				resolveToolTitle: () => "legacy title",
 			};
 			const [spec] = adaptSegment({ kind: "tool-run", items: [item], sourceMessages: [msg] }, ctx);
-			expect(spec.data).toMatchObject({ summary });
+			// From L3 up a Send is a bubble carrying its own text, not a summarized card.
+			if (tc.toolName === "Send") expect(spec.kind).toBe("communication-bubble");
+			else expect(spec.data).toMatchObject({ summary });
 			const trace = adaptActivityUnit([{ kind: "tool", ...item }], "trace", ctx);
 			expect((trace.data as { items: { title: string }[] }).items[0].title).toBe(
 				`${tc.toolName} · ${summary}`,
@@ -392,6 +403,48 @@ describe("auxiliary content projection", () => {
 			toolName: "Reviewer",
 			summary: "Found the issue",
 		});
+	});
+
+	test("received agent messages are rows at L1/L2 and bubbles from L3 up, under one identity", () => {
+		const inbound = message([
+			{
+				type: "system_injection",
+				source: "team_message",
+				modelText: "model",
+				body: {
+					kind: "messages",
+					items: [
+						{ fromId: "sender", fromTitle: "Reviewer", fromType: "primary", text: "Found it" },
+					],
+				},
+			},
+		]);
+		const rowKey = auxiliaryContentKey(inbound, 0);
+		for (const lod of [1, 2] as const) {
+			const [spec] = adaptSegment(
+				{ kind: "message", msg: inbound },
+				{ lod, compactAuxiliaryContent: true },
+			);
+			expect(spec.kind).toBe("auxiliary-content");
+			expect(spec.unitId).toBe(rowKey);
+		}
+		for (const lod of [3, 4, 5] as const) {
+			const [spec] = adaptSegment(
+				{ kind: "message", msg: inbound },
+				{ lod, compactAuxiliaryContent: true },
+			);
+			expect(spec.kind).toBe("injection-bubble");
+			// Without this the bubble and its row have different keys and never pair.
+			expect(spec.unitId).toBe(rowKey);
+		}
+		// Background results are not messages: they stay tool rows at every level.
+		const background = message([injection()]);
+		expect(
+			adaptSegment(
+				{ kind: "message", msg: background },
+				{ lod: 3, compactAuxiliaryContent: true },
+			)[0].kind,
+		).toBe("auxiliary-content");
 	});
 
 	test("false and omitted preserve the legacy bubble projection", () => {

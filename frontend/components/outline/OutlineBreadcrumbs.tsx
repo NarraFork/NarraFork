@@ -2,6 +2,7 @@ import { Menu, UnstyledButton } from "@mantine/core";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
+import { useOutlineSpaceParent } from "../../hooks/useOutline";
 import { planCrumbs } from "../../lib/outline-crumbs";
 import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
@@ -12,7 +13,9 @@ import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 type Ancestor = OutlineBlockViewResponse["path"][number];
 
 /**
- * Outline › space › page › … › the focused block's parent: where the page is, not what it is. The
+ * Outline › (a session's project ›) space › page › … › the focused block's parent: where the page
+ * is, not what it is. A session space names its project when the reader may read it (the space's
+ * `parent`, read once per space and kept: commits do not change it). The
  * focused block's own title is the page title right below (and the tab's name in a dock), so the
  * bar does not say it again. Every crumb is a link that focuses it, keeping the view and the
  * time the page is shown at. While the page is edited live, `path` comes from the live page (it
@@ -32,6 +35,7 @@ export function OutlineBreadcrumbs({
 }) {
 	const { t, i18n } = useTranslation("outline");
 	const spaceName = useOutlineSpaceName();
+	const parent = useOutlineSpaceParent(view.space.id, view.space.kind === "session").data;
 	const plan = planCrumbs(path ?? view.path);
 	const targetOf = (ancestor: Ancestor) =>
 		outlineBlockTarget(view.space.id, ancestor.id, search.view, search.asOf);
@@ -66,6 +70,19 @@ export function OutlineBreadcrumbs({
 				{t("title")}
 			</OutlineLink>
 			{separator}
+			{parent && (
+				<>
+					<OutlineLink
+						to={{ kind: "space", spaceId: parent.spaceId }}
+						className={classes.crumb}
+						title={parent.label ?? t("space.projectUnnamed")}
+						data-testid="outline-crumb-project"
+					>
+						{parent.label ?? t("space.projectUnnamed")}
+					</OutlineLink>
+					{separator}
+				</>
+			)}
 			<OutlineLink
 				to={{ kind: "space", spaceId: view.space.id }}
 				className={classes.crumb}
