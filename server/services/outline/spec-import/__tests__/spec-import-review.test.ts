@@ -501,6 +501,24 @@ describe("mapping details", () => {
 		expect(again.spaceId).toBe(space.id);
 	});
 
+	test("a note dense with [[links]] arrives in ordinary commits, its links as text", async () => {
+		const { id } = await makeSession();
+		const text = Array.from({ length: 200 }, (_, p) =>
+			Array.from({ length: 15 }, (_, k) => `[[n${p}x${k}]]`).join(" "),
+		).join("\n\n");
+		await writeNote(id, "links.md", text);
+		expect((await run(id)).status).toBe("imported");
+		const [page] = (await pages(id)).filter((p) => p.title === "links.md");
+		expect(page?.blocks).toHaveLength(200);
+		const space = await spaceOf(id);
+		const roots = await outlineStore.listChildren(space.id, null, 10);
+		const links = await outlineStore.listOpenLinks(
+			(await outlineStore.listChildren(space.id, roots[0]?.id as string, 500)).map((b) => b.id),
+			10,
+		);
+		expect(links).toEqual([]);
+	});
+
 	test("deleted files are not read and do not count toward the limit", async () => {
 		const { id } = await makeSession();
 		await writeNote(id, "a.md", "a\n");

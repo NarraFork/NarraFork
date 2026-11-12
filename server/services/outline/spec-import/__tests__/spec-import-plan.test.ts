@@ -2,6 +2,7 @@
  * The import's plan (outline P2 PR 12b, `plan.ts`): the mapping rules as pure functions.
  */
 import { describe, expect, test } from "bun:test";
+import { convertNotes } from "../../report-text";
 import {
 	fileTagOfSid,
 	isImportSid,
@@ -167,5 +168,48 @@ describe("planSpecFile", () => {
 		expect(specFileCodeLang("notes.md")).toBeNull();
 		expect(specFileCodeLang("a/b/data.JSON")).toBe("json");
 		expect(specFileCodeLang("Makefile")).toBe("text");
+	});
+});
+
+describe("a file's text as blocks (the reviewer's cases)", () => {
+	const flat = (blocks: readonly SpecImportBlock[]): string[] =>
+		blocks.flatMap((b) => [b.content, ...flat(b.children)]);
+	const letters = (text: string) => text.replace(/[^\p{L}\p{N}]/gu, "");
+	const cases: Record<string, string> = {
+		frontmatter: "---\ntitle: X\ntags: [a, b]\n---\n\n# Head\n\nbody text\n",
+		html: "<div>hello <b>world</b></div>\n\n<!-- a comment kept -->\n\n<script>alert(1)</script>\n",
+		cjk: "# 标题\n\n这是一段中文，包含「引号」和全角标点。\n\n- 第一项\n  - 子项甲\n- 第二项\n",
+		fence:
+			"before\n\n```ts\nconst a = `x`;\n// ``` inside\n```\n\nafter\n\n~~~\ntilde fence\n~~~\n",
+		unclosedFence: "intro\n\n```js\nnever closed\n\n# not a heading\nlast line\n",
+		table: "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n",
+		checkbox:
+			"- [ ] todo item\n- [x] done item\n\nTODO plain\n\n[[wikilink]] and #tag and ((ref))\n",
+		refdefs:
+			'See [the doc][d] and [other].\n\n[d]: https://example.com/doc\n[other]: https://example.com/o "T"\n',
+		footnote: "Text with note[^1].\n\n[^1]: The footnote body.\n",
+		longline: `${"x".repeat(40000)}\n`,
+		longcjk: `${"汉".repeat(30000)}\n`,
+	};
+	for (const [name, text] of Object.entries(cases)) {
+		test(`${name}: every letter and number is kept`, () => {
+			const out = convertNotes({ text, continued: "(cont.)" });
+			expect(letters(flat(out.blocks).join("\n").replaceAll("(cont.)", ""))).toBe(letters(text));
+		});
+	}
+
+	test("a file split over several pages keeps every block, in order", () => {
+		const text = Array.from({ length: 4000 }, (_, i) => `para ${i}`).join("\n\n");
+		const plan = planSpecFile({
+			narratorId: "n",
+			path: "big.md",
+			revisionId: "r",
+			blocks: convertNotes({ text, continued: "(cont.)" }).blocks,
+			locale: "en",
+		});
+		const body = plan.nodes.filter((n) => n.sid.startsWith("sb")).map((n) => n.content);
+		expect(body).toEqual(Array.from({ length: 4000 }, (_, i) => `para ${i}`));
+		expect(plan.pageSids).toHaveLength(3);
+		expect(new Set(plan.nodes.map((n) => n.sid)).size).toBe(plan.nodes.length);
 	});
 });
