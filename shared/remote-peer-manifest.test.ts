@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import componentVersions from "./component-versions.json";
 import {
 	createHelperDistributionDependencies,
 	parseComponentVersions,
@@ -75,7 +76,16 @@ describe("optional remote peer component", () => {
 		expect(parseComponentVersions(old)).toEqual(old);
 		expect(createRemotePeerDistribution(parseComponentVersions(old).remotePeer)).toBeUndefined();
 		expect(createHelperDistributionDependencies()).not.toHaveProperty("remotePeer");
-		expect(REMOTE_PEER_DISTRIBUTION).toEqual({ version, tag: expected.tag, protocolVersion: 1 });
+		const declared = parseComponentVersions(componentVersions).remotePeer;
+		expect(REMOTE_PEER_DISTRIBUTION).toEqual(
+			declared
+				? {
+						version: declared.version,
+						tag: `remote-peer-v${declared.version}`,
+						protocolVersion: declared.protocolVersion,
+					}
+				: undefined,
+		);
 		expect(Object.isFrozen(REMOTE_PEER_DISTRIBUTION)).toBe(true);
 	});
 	test("rejects explicit malformed optional pins rather than app-version fallback", () => {
