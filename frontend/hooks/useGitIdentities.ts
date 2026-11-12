@@ -13,20 +13,25 @@ import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
+import {
+	folderGitIdentityQueryKey,
+	GIT_IDENTITIES_QUERY_KEY,
+	invalidateNarratorGitIdentities,
+	narratorGitIdentityQueryKey,
+} from "./git-identity-query-keys";
+
+export { folderGitIdentityQueryKey, narratorGitIdentityQueryKey };
 
 export interface NarratorGitIdentityState {
 	/** The caller's own identities, in the order the settings page shows them. */
 	identities: GitIdentity[];
 	/** The identity the caller picked for this narrator, or null when they made no pick. */
 	selectedId: string | null;
+	/** The pick of the sidebar folder this narrator sits in, which applies when it has none. */
+	folderSelectedId?: string | null;
 }
 
-const IDENTITIES_KEY = ["auth", "git-identities"] as const;
-
-/** Query key for one caller's pick on one narrator. Shared by the details panel and create flow. */
-export function narratorGitIdentityQueryKey(narratorId: string) {
-	return [...IDENTITIES_KEY, "narrator", narratorId] as const;
-}
+const IDENTITIES_KEY = GIT_IDENTITIES_QUERY_KEY;
 
 /** Every identity write reports the same way: a toast naming what the server refused. */
 function useIdentityWriteFailure(): (error: unknown) => void {
@@ -109,11 +114,6 @@ export function useSetNarratorGitIdentity(narratorId: string) {
 	});
 }
 
-/** Query key for one caller's pick on one sidebar folder. */
-export function folderGitIdentityQueryKey(folderId: string) {
-	return [...IDENTITIES_KEY, "folder", folderId] as const;
-}
-
 /** The caller's pick for one sidebar folder, together with the identities to choose from. */
 export function useFolderGitIdentity(folderId: string | null) {
 	return useQuery({
@@ -133,7 +133,12 @@ export function useSetFolderGitIdentity(folderId: string) {
 	const onError = useIdentityWriteFailure();
 	return useMutation({
 		mutationFn: (identityId: string | null) => api.setFolderGitIdentity(folderId, identityId),
-		onSuccess: () => qc.invalidateQueries({ queryKey: folderGitIdentityQueryKey(folderId) }),
+		onSuccess: () =>
+			Promise.all([
+				qc.invalidateQueries({ queryKey: folderGitIdentityQueryKey(folderId) }),
+				// Sessions in this folder that follow it now follow a different identity.
+				invalidateNarratorGitIdentities(qc),
+			]),
 		onError,
 	});
 }

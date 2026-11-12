@@ -787,29 +787,35 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	}, [ctxMenu, newNarratorHereFor]);
 
 	const handleNewNarratorHereCreated = useCallback(
-		// 目标文件夹由调用点按当次渲染传入：弹窗会先 onClose 再 onCreated，那时
-		// `newNarratorTarget` 已经被清空，从状态里读只会拿到 undefined。
+		// The modal closes (clearing `newNarratorTarget`) before it reports creation, so the
+		// folder comes from the call site's closure rather than from state.
 		(data: CreateNarratorResult, folderId?: string) => {
 			closeNewNarratorHere();
-			void (async () => {
-				await addRecentTab({
-					type: "narrator",
-					id: data.id,
-					title: data.title,
-					subtitle: data.cwd,
-					status: data.status,
-				});
-				// 侧栏 upsert 会剥离 folderId，归属只能走文件夹端点；失败不影响已创建的会话。
-				if (folderId) {
-					await api.moveRecentTab(`narrator:${data.id}`, { folderId }).catch((error) => {
-						if (import.meta.env.DEV) console.warn("[RecentTabs] join folder failed:", error);
-					});
-				}
-			})();
+			void addRecentTab({
+				type: "narrator",
+				id: data.id,
+				title: data.title,
+				subtitle: data.cwd,
+				status: data.status,
+			}).then(() => {
+				if (!folderId) return;
+				// The upsert strips `folderId`, so membership is a separate move. Going through the
+				// tab mutation keeps the row from flashing at top level until the WS delta lands.
+				moveTab(
+					`narrator:${data.id}`,
+					{ folderId },
+					{
+						// The session exists either way; say so, or the modal's "follow the folder"
+						// identity would silently not apply.
+						onError: () =>
+							notifications.show({ color: "orange", message: t("newNarratorJoinFolderFailed") }),
+					},
+				);
+			});
 			navigate({ to: `/narrators/${data.id}` });
 			onNavigate?.();
 		},
-		[navigate, onNavigate, closeNewNarratorHere],
+		[navigate, onNavigate, closeNewNarratorHere, moveTab, t],
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
@@ -1372,7 +1378,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 						/>
 						<CreateNarratorLazyModal
 							opened={newNarratorTarget !== null}
-							// 只有"待解析目录的会话目标"才算忙；文件夹目标直接出表单。
+							// Busy only while a session target's directory is resolving; folders open directly.
 							busy={newNarratorTarget?.narratorId != null && newNarratorTarget.cwd == null}
 							initialCwd={newNarratorTarget?.cwd}
 							// 从文件夹里新建时，弹窗要说清 git 身份跟的是这个文件夹。

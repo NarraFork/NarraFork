@@ -33,6 +33,7 @@ import type {
 	RecentTabsPageResponse,
 } from "../lib/api/settings";
 import { queryClient as globalQC } from "../lib/query-client";
+import { invalidateNarratorGitIdentities } from "./git-identity-query-keys";
 import type { AddRecentTabInput, RecentTab, SubagentRecentTabInput } from "./recent-tabs-utils";
 import {
 	buildRecentTabUpsert,
@@ -1015,7 +1016,11 @@ export function useRecentTabs() {
 		onError: (_error, _variables, context) => {
 			if (context) restoreSectionSnapshots(qc, context.snapshots);
 		},
-		onSuccess: applyAuthoritativeResult,
+		onSuccess: (result) => {
+			applyAuthoritativeResult(result);
+			// A move can change which folder's git identity a session follows.
+			void invalidateNarratorGitIdentities(qc);
+		},
 	});
 
 	const pinMutation = useMutation({
@@ -1137,8 +1142,16 @@ export function useRecentTabs() {
 			(type: RecentTab["type"], id: string) => removeMutation.mutate({ type, id }),
 			[removeMutation],
 		),
+		/**
+		 * Optimistic move with an authoritative follow-up. `onError` runs after the
+		 * optimistic layout has been rolled back, so callers can report the failure.
+		 */
 		moveTab: useCallback(
-			(key: string, target: RecentTabMoveTarget) => moveMutation.mutate({ key, target }),
+			(
+				key: string,
+				target: RecentTabMoveTarget,
+				options?: { onError?: (error: unknown) => void },
+			) => moveMutation.mutate({ key, target }, { onError: options?.onError }),
 			[moveMutation],
 		),
 		pinTab: useCallback(

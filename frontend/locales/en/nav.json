@@ -38,6 +38,7 @@
 	"revealInExplorer": "Reveal in File Manager",
 	"newNarratorHere": "New narrator in this directory",
 	"newNarratorInFolder": "New session here",
+	"newNarratorJoinFolderFailed": "Session created, but it could not be added to the folder",
 	"newNarratorHereNoDir": "Could not resolve a directory for this tab",
 	"copyCwd": "Copy working directory",
 	"copyCwdNoDir": "Could not resolve a working directory for this tab",

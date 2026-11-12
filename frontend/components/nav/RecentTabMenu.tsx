@@ -100,7 +100,7 @@ export interface TabContextMenuProps {
 	canReveal: boolean;
 	onNewNarratorHere: () => void;
 	canNewNarratorHere: boolean;
-	/** 文件夹上删的是分组语义，文案与「在此目录新建」不同；缺省用会话版本。 */
+	/** 文件夹没有目录可继承，文案不同于「在此目录新建」；缺省用会话版本。 */
 	newNarratorHereLabel?: string;
 	onCopyCwd: () => void;
 	canCopyCwd: boolean;

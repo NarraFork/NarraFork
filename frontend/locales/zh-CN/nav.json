@@ -38,6 +38,7 @@
 	"revealInExplorer": "在资源管理器中打开",
 	"newNarratorHere": "在此目录新建叙述者",
 	"newNarratorInFolder": "在此新建会话",
+	"newNarratorJoinFolderFailed": "会话已创建，但未能加入该文件夹",
 	"newNarratorHereNoDir": "无法确定该标签对应的目录",
 	"copyCwd": "复制工作目录",
 	"copyCwdNoDir": "无法确定该标签对应的工作目录",
