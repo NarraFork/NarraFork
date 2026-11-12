@@ -168,8 +168,26 @@ interface ImportNode {
  * Longer than the 8 characters drawn ids have, so they never collide with one.
  */
 function importSids(text: string): { page: string; block: (n: number) => string } {
-	const tag = createHash("sha256").update(text).digest("hex").slice(0, 10);
+	const tag = behaviorImportTag(text);
 	return { page: `fp${tag}`, block: (n) => `fi${tag}${n.toString(36)}` };
+}
+
+function behaviorImportTag(text: string): string {
+	return createHash("sha256").update(text).digest("hex").slice(0, 10);
+}
+
+/**
+ * The fence text a block of the behavior page was imported from, as a tag: the same for every
+ * block an import of one text wrote, compared with {@link behaviorImportTagOf}. Null for a block
+ * no import wrote.
+ */
+export function behaviorImportTagOfSid(sid: string): string | null {
+	return /^fi([0-9a-f]{10})[0-9a-z]+$/.exec(sid)?.[1] ?? null;
+}
+
+/** The tag of the blocks an import of the fence text `own` writes (null: it writes none). */
+export function behaviorImportTagOf(own: string): string | null {
+	return own ? behaviorImportTag(own) : null;
 }
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -284,15 +302,20 @@ export async function importBehaviorFenceText(
 	narratorId: string,
 	locale: Locale,
 	own: string,
+	options: { signal?: AbortSignal } = {},
 ): Promise<"imported" | "nothing"> {
+	const { signal } = options;
 	const fence = { own };
 	leftovers.delete(narratorId);
 	if (!fence.own) return "nothing";
-	const [parsed] = await processEditText({
-		kind: "parse",
-		inputs: [{ mode: "outline", text: fence.own }],
-		labels: [],
-	});
+	const [parsed] = await processEditText(
+		{
+			kind: "parse",
+			inputs: [{ mode: "outline", text: fence.own }],
+			labels: [],
+		},
+		{ signal },
+	);
 	// Rules are not tasks: every item becomes a plain block (a checkbox in the old fence is
 	// dropped, so nothing on the page starts or continues), and the properties (aliases,
 	// prerequisites, dates) are left out so nothing can collide. An item longer than a block may
@@ -339,10 +362,13 @@ export async function importBehaviorFenceText(
 			job.push(node);
 			bytes += size;
 		}
-		const normalized = await processEditText({
-			kind: "normalize",
-			contents: job.map((node) => node.content),
-		});
+		const normalized = await processEditText(
+			{
+				kind: "normalize",
+				contents: job.map((node) => node.content),
+			},
+			{ signal },
+		);
 		job.forEach((node, n) => {
 			const entry = normalized[n];
 			if (entry && entry.split.length === 0) {
@@ -425,6 +451,8 @@ export async function importBehaviorFenceText(
 				inThisCommit.add(node.sid);
 				bytes += size;
 			}
+			// Checked between commits: a commit is whole, what follows is written by the next run.
+			signal?.throwIfAborted();
 			const result = await writeOutline(
 				{
 					spaceId: space.id,
