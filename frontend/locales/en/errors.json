@@ -38,6 +38,7 @@
 	"DEFAULT_MODEL_NOT_CONFIGURED": "No default model is configured. Choose one in Settings → Models, then retry.",
 	"PODMAN_NOT_FOUND": "Podman is not installed",
 	"SPEC_IN_OUTLINE_SESSION": "This session keeps its tasks in the outline, so its Dynamic Spec tasks and notes are not used. Only the behavior fence still applies.",
+	"SPEC_IMPORT_IN_PROGRESS": "This session's Dynamic Spec is being imported into the outline. Try again in a moment.",
 	"GOAL_IN_OUTLINE_SESSION": "/goal adds a task to the session itself. Send it in the main session, not to a subagent.",
 	"GIT_AUTH_REQUIRED": "Git authentication is required",
 	"AUTH_REQUIRED": "Sign in to continue",

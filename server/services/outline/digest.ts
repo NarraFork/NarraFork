@@ -59,6 +59,7 @@ import {
 	type OutlineTaskJson,
 } from "./model";
 import { OUTLINE_PLAN_ACTOR, OUTLINE_PLAN_REVIEW_ACTOR } from "./plans";
+import { OUTLINE_SPEC_IMPORT_ACTOR } from "./spec-import/plan";
 import type { OutlineRangeChange, OutlineVersionMeta } from "./store/digest-port";
 import type {
 	OutlineCommitRow,
@@ -123,7 +124,19 @@ const ROUTINE_SYSTEM_ACTORS = new Set([
 	"outline-live-sync",
 	"outline-behavior-fork",
 	"outline-behavior-import",
+	// Old sessions' Dynamic Spec brought into the outline (P2 PR 12b): one session's import is
+	// several commits and many sessions are imported in a day, none of it anyone's work that day.
+	OUTLINE_SPEC_IMPORT_ACTOR,
 ]);
+
+/** A commit of the Dynamic Spec import: what it writes is where its tasks start from, not news. */
+function isSpecImportCommit(commit: OutlineCommitRow | undefined): boolean {
+	return (
+		commit !== undefined &&
+		commit.actorKind === "system" &&
+		commit.actorId === OUTLINE_SPEC_IMPORT_ACTOR
+	);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Classification (pure)
@@ -453,9 +466,25 @@ export async function summarizeSpaceWindow(
 		const list = versionsOf.get(id) as OutlineRangeChange[];
 		const lastVersion = list[list.length - 1] as OutlineRangeChange;
 		if (lastVersion.deleted) continue;
-		const isNew = created(id);
-		const before = isNew ? null : (prior.get(id)?.taskJson ?? null);
-		if (!isNew && prior.get(id)?.deleted) continue;
+		// A task the Dynamic Spec import made is not created, started or finished that day: the
+		// state the import left it in is where it starts from (its own later commits included: the
+		// move starts what was in progress), and what happens to it afterwards counts.
+		const imported =
+			created(id) && isSpecImportCommit(commitOf.get((list[0] as OutlineRangeChange).commitId));
+		let importedUpTo = 0;
+		while (
+			imported &&
+			importedUpTo + 1 < list.length &&
+			isSpecImportCommit(commitOf.get((list[importedUpTo + 1] as OutlineRangeChange).commitId))
+		)
+			importedUpTo++;
+		const isNew = created(id) && !imported;
+		const before = imported
+			? (list[importedUpTo] as OutlineRangeChange).taskJson
+			: isNew
+				? null
+				: (prior.get(id)?.taskJson ?? null);
+		if (!isNew && !imported && prior.get(id)?.deleted) continue;
 		const after = lastVersion.taskJson;
 		const reopenedBy = (actor: string) =>
 			list.some((v) => {
@@ -671,7 +700,7 @@ export async function summarizeSpaceWindow(
 		const event: OutlineDigestOtherStored["event"] | null =
 			c.kind === "revert"
 				? "revert"
-				: c.kind === "import"
+				: c.kind === "import" && !isSpecImportCommit(c)
 					? "import"
 					: system === OUTLINE_DIGEST_DELEGATE_ACTOR
 						? "delegation"

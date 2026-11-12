@@ -69,6 +69,7 @@ import {
 	type OutlineViewStateResponse,
 } from "@shared/outline-api";
 import { isOutlineReportBlockId } from "@shared/outline-report-line";
+import type { OutlineSpecImportStatus } from "@shared/outline-spec-import";
 import {
 	OUTLINE_TASK_BOARD_LIMITS,
 	type OutlineBoardAddResponse,
@@ -1103,6 +1104,38 @@ outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 102
 		started,
 	};
 	return c.json(body, task.added ? 201 : 200);
+});
+
+/**
+ * The import of a session's Dynamic Spec into the outline (outline P2 PR 12b), for the Spec
+ * panel's banner: whether the session is one to import, and how its last attempt went. Read access.
+ */
+outlineRoutes.get("/narrators/:narratorId/spec-import", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	const { specImportStatus } = await import("../services/outline/spec-import/triggers");
+	const body: OutlineSpecImportStatus = {
+		...(await specImportStatus(narrator.id)),
+		canImport: await holds(principal, "write", { narrator }),
+	};
+	return c.json(body);
+});
+
+/**
+ * "Import now" (and its retry): starts the import of the session and answers at once (202) with
+ * its state; the import itself runs in the background, on the session while it is idle. Write
+ * access to the session. With imports switched off (`outline.specImport`) nothing is started.
+ */
+outlineRoutes.post("/narrators/:narratorId/spec-import", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	if (!(await holds(principal, "write", { narrator }))) throw new ForbiddenError();
+	const { requestSpecImport } = await import("../services/outline/spec-import/triggers");
+	const body: OutlineSpecImportStatus = {
+		...(await requestSpecImport(narrator.id)),
+		canImport: true,
+	};
+	return c.json(body, 202);
 });
 
 /**

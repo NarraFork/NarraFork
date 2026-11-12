@@ -93,6 +93,15 @@ async function all(query: SQL): Promise<Row[]> {
 	return await executor().all(query);
 }
 
+/**
+ * One statement through the executor, for the few modules that keep their own dialect-neutral
+ * SQL next to what they read it for (the Dynamic Spec import's reads, `spec-import/read-port.ts`).
+ * The same rules hold for them: small, indexed, bounded, every value a bound parameter.
+ */
+export async function runOutlineAccessQuery(query: SQL): Promise<Row[]> {
+	return await all(query);
+}
+
 function text(row: Row, column: string): string {
 	const value = row[column];
 	if (typeof value !== "string") throw new Error(`outline access read: ${column} is not text`);
