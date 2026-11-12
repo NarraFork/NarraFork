@@ -67,9 +67,9 @@ describe("overlay bounds", () => {
 
 	test("clears zero-area rectangles and keeps different overlays independent", () => {
 		const bounds = { x: 10, y: 20, width: 30, height: 40 };
-		pluginOverlayBoundsStore.set("one", bounds);
-		pluginOverlayBoundsStore.set("two", bounds);
-		pluginOverlayBoundsStore.set("one", { ...bounds, width: 0 });
+		pluginOverlayBoundsStore.set("one", bounds, 800, 600);
+		pluginOverlayBoundsStore.set("two", bounds, 800, 600);
+		pluginOverlayBoundsStore.set("one", { ...bounds, width: 0 }, 800, 600);
 		expect(pluginOverlayBoundsStore.getSnapshot()).toEqual({ two: bounds });
 		pluginOverlayBoundsStore.clear("two");
 		expect(pluginOverlayBoundsStore.getSnapshot()).toEqual({});
@@ -82,11 +82,11 @@ describe("overlay bounds", () => {
 			calls += 1;
 		});
 		try {
-			pluginOverlayBoundsStore.set("one", bounds);
+			pluginOverlayBoundsStore.set("one", bounds, 800, 600);
 			const snapshot = pluginOverlayBoundsStore.getSnapshot();
 			bounds.x = 999;
 			expect(snapshot.one?.x).toBe(10);
-			pluginOverlayBoundsStore.set("one", { x: 10, y: 20, width: 30, height: 40 });
+			pluginOverlayBoundsStore.set("one", { x: 10, y: 20, width: 30, height: 40 }, 800, 600);
 			pluginOverlayBoundsStore.clear("missing");
 			expect(pluginOverlayBoundsStore.getSnapshot()).toBe(snapshot);
 			expect(calls).toBe(1);
@@ -96,8 +96,8 @@ describe("overlay bounds", () => {
 	});
 
 	test("reclips all regions on resize with a single notification and removes offscreen ones", () => {
-		pluginOverlayBoundsStore.set("one", { x: 0, y: 0, width: 800, height: 600 });
-		pluginOverlayBoundsStore.set("two", { x: 700, y: 500, width: 50, height: 50 });
+		pluginOverlayBoundsStore.set("one", { x: 0, y: 0, width: 800, height: 600 }, 800, 600);
+		pluginOverlayBoundsStore.set("two", { x: 700, y: 500, width: 50, height: 50 }, 800, 600);
 		let calls = 0;
 		const unsubscribe = pluginOverlayBoundsStore.subscribe(() => {
 			calls += 1;
@@ -114,5 +114,37 @@ describe("overlay bounds", () => {
 		} finally {
 			unsubscribe();
 		}
+	});
+
+	test("restores the requested rectangle when the viewport grows back", () => {
+		pluginOverlayBoundsStore.set("one", { x: 0, y: 0, width: 800, height: 600 }, 800, 600);
+		pluginOverlayBoundsStore.set("two", { x: 700, y: 500, width: 50, height: 50 }, 800, 600);
+		pluginOverlayBoundsStore.clipToViewport(400, 300);
+		expect(pluginOverlayBoundsStore.getSnapshot()).toEqual({
+			one: { x: 0, y: 0, width: 400, height: 300 },
+		});
+		pluginOverlayBoundsStore.clipToViewport(800, 600);
+		expect(pluginOverlayBoundsStore.getSnapshot()).toEqual({
+			one: { x: 0, y: 0, width: 800, height: 600 },
+			two: { x: 700, y: 500, width: 50, height: 50 },
+		});
+	});
+
+	test("returns the applied rectangle and remembers an off-screen request", () => {
+		expect(
+			pluginOverlayBoundsStore.set("one", { x: 900, y: 10, width: 50, height: 50 }, 800, 600),
+		).toEqual({ x: 800, y: 10, width: 0, height: 50 });
+		expect(pluginOverlayBoundsStore.getSnapshot()).toEqual({});
+		pluginOverlayBoundsStore.clipToViewport(1000, 600);
+		expect(pluginOverlayBoundsStore.getSnapshot()).toEqual({
+			one: { x: 900, y: 10, width: 50, height: 50 },
+		});
+	});
+
+	test("clear forgets the request so a later resize cannot resurrect it", () => {
+		pluginOverlayBoundsStore.set("one", { x: 10, y: 10, width: 50, height: 50 }, 800, 600);
+		pluginOverlayBoundsStore.clear("one");
+		pluginOverlayBoundsStore.clipToViewport(1000, 1000);
+		expect(pluginOverlayBoundsStore.getSnapshot()).toEqual({});
 	});
 });

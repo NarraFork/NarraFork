@@ -23,7 +23,7 @@ import {
 import { readHostPresentation, subscribeHostPresentation } from "./host-presentation";
 import { pluginContributionStore, toPluginUiContribution } from "./PluginContributionStore";
 import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
-import { clipOverlayBounds, pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
+import { pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
 import {
 	fallbackPluginUiContext,
 	RuntimeContext,
@@ -195,8 +195,12 @@ export function PluginUiRuntimeProvider({
 				overlaySetBounds: (panelInstanceId, bounds) => {
 					const viewportWidth = Math.max(0, window.innerWidth);
 					const viewportHeight = Math.max(0, window.innerHeight);
-					const applied = clipOverlayBounds(bounds, viewportWidth, viewportHeight);
-					pluginOverlayBoundsStore.set(panelInstanceId, applied);
+					const applied = pluginOverlayBoundsStore.set(
+						panelInstanceId,
+						bounds,
+						viewportWidth,
+						viewportHeight,
+					);
 					return { ...applied, viewportWidth, viewportHeight };
 				},
 				navigate:

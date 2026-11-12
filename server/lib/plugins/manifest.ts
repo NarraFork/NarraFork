@@ -1212,7 +1212,13 @@ function validateContributionReferences(
 			tools: Array<{ id: string }>;
 			commands: Array<{ id: string; inputSchema?: unknown }>;
 			events: Array<{ id: string; topic: string }>;
-			views: Array<{ id: string; commandId?: string; providerId?: string; surfaces: string[] }>;
+			views: Array<{
+				id: string;
+				commandId?: string;
+				providerId?: string;
+				surfaces: string[];
+				scope: string;
+			}>;
 			themes: Array<{ id: string }>;
 		};
 	},
@@ -1273,6 +1279,16 @@ function validateContributionReferences(
 				ctx,
 				["contributes", "views", index, "providerId"],
 				"view references an undeclared provider",
+			);
+		}
+		if (view.surfaces.includes("overlay") && view.scope !== "global") {
+			// There is exactly one overlay layer per app instance and the host only mounts
+			// global-scope overlay views; any other scope would parse and then silently
+			// never appear, which reads as a working declaration to the plugin author.
+			addContributionReferenceIssue(
+				ctx,
+				["contributes", "views", index, "scope"],
+				"overlay views must use global scope",
 			);
 		}
 		if (view.providerId && !isProviderSettings) {

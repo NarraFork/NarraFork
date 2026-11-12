@@ -41,6 +41,16 @@ export type PluginOverlayBoundsSnapshot = Readonly<Record<string, PluginOverlayB
 const EMPTY: PluginOverlayBoundsSnapshot = Object.freeze({});
 
 let snapshot: PluginOverlayBoundsSnapshot = EMPTY;
+/**
+ * What each view last asked for, before clipping.
+ *
+ * The snapshot only holds the clipped (applied) rectangle, so clipping it again on every
+ * resize would be lossy: shrink the window and grow it back, and the hit region would
+ * stay at the shrunken size until the plugin happened to report again. Keeping the
+ * request lets every resize re-derive the applied rectangle from the source, including
+ * restoring a region that was fully off-screen while the window was small.
+ */
+const requested = new Map<string, PluginOverlayBounds>();
 const listeners = new Set<() => void>();
 
 function emit(): void {
@@ -59,6 +69,24 @@ function sameBounds(a: PluginOverlayBounds | undefined, b: PluginOverlayBounds):
 	);
 }
 
+function hasArea(bounds: PluginOverlayBounds): boolean {
+	return bounds.width > 0 && bounds.height > 0;
+}
+
+/** Replace one entry of the applied snapshot; returns whether anything changed. */
+function applyEntry(panelInstanceId: string, applied: PluginOverlayBounds): boolean {
+	if (hasArea(applied)) {
+		if (sameBounds(snapshot[panelInstanceId], applied)) return false;
+		snapshot = Object.freeze({ ...snapshot, [panelInstanceId]: Object.freeze({ ...applied }) });
+		return true;
+	}
+	if (!(panelInstanceId in snapshot)) return false;
+	const next = { ...snapshot };
+	delete next[panelInstanceId];
+	snapshot = Object.freeze(next);
+	return true;
+}
+
 export const pluginOverlayBoundsStore = {
 	subscribe(listener: () => void): () => void {
 		listeners.add(listener);
@@ -70,42 +98,46 @@ export const pluginOverlayBoundsStore = {
 	},
 
 	/**
-	 * Publish one view's rectangle. A no-op when nothing changed, which matters
-	 * because a view that follows the pointer reports every frame: rebuilding the
-	 * snapshot each time would re-render the overlay host sixty times a second for no
-	 * reason.
+	 * Record one view's requested rectangle and publish its viewport-clipped form.
+	 *
+	 * Returns the applied rectangle (what the hit region really covers). A no-op for
+	 * subscribers when the applied rectangle did not change, which matters because a view
+	 * that follows the pointer reports every frame: rebuilding the snapshot each time
+	 * would re-render the overlay host sixty times a second for no reason.
+	 *
+	 * A zero-area *request* withdraws the region entirely. A non-empty request that is
+	 * merely off-screen right now is remembered, so it reappears when the viewport grows.
 	 */
-	set(panelInstanceId: string, bounds: PluginOverlayBounds): void {
-		if (bounds.width <= 0 || bounds.height <= 0) {
+	set(
+		panelInstanceId: string,
+		bounds: PluginOverlayBounds,
+		viewportWidth: number,
+		viewportHeight: number,
+	): PluginOverlayBounds {
+		const applied = clipOverlayBounds(bounds, viewportWidth, viewportHeight);
+		if (!hasArea(bounds)) {
 			this.clear(panelInstanceId);
-			return;
+			return applied;
 		}
-		if (sameBounds(snapshot[panelInstanceId], bounds)) return;
-		snapshot = Object.freeze({ ...snapshot, [panelInstanceId]: Object.freeze({ ...bounds }) });
-		emit();
+		requested.set(panelInstanceId, Object.freeze({ ...bounds }));
+		if (applyEntry(panelInstanceId, applied)) emit();
+		return applied;
 	},
 
-	/** Resize can invalidate bounds even when the plugin stops responding. */
+	/** Re-derive every applied rectangle from its request; one notification at most. */
 	clipToViewport(viewportWidth: number, viewportHeight: number): void {
-		const next: Record<string, PluginOverlayBounds> = {};
 		let changed = false;
-		for (const [id, bounds] of Object.entries(snapshot)) {
-			const clipped = clipOverlayBounds(bounds, viewportWidth, viewportHeight);
-			if (clipped.width > 0 && clipped.height > 0) next[id] = Object.freeze(clipped);
-			else changed = true;
-			if (!sameBounds(bounds, clipped)) changed = true;
+		for (const [id, bounds] of requested) {
+			if (applyEntry(id, clipOverlayBounds(bounds, viewportWidth, viewportHeight))) {
+				changed = true;
+			}
 		}
-		if (!changed) return;
-		snapshot = Object.freeze(next);
-		emit();
+		if (changed) emit();
 	},
 
 	/** Drop a view's rectangle when its session goes away, so the hit region disappears. */
 	clear(panelInstanceId: string): void {
-		if (!(panelInstanceId in snapshot)) return;
-		const next = { ...snapshot };
-		delete next[panelInstanceId];
-		snapshot = Object.freeze(next);
-		emit();
+		requested.delete(panelInstanceId);
+		if (applyEntry(panelInstanceId, { x: 0, y: 0, width: 0, height: 0 })) emit();
 	},
 };
