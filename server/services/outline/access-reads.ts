@@ -161,6 +161,45 @@ export async function readNarrator(id: string): Promise<NarratorAccessRow | null
 	};
 }
 
+/** What a handoff says of the session that held a task (`handoff.ts`). */
+export interface NarratorHandoffRow {
+	id: string;
+	title: string | null;
+	ownerUserId: string | null;
+	visibility: string;
+	cwd: string | null;
+	contextProjectId: string | null;
+}
+
+/** Sessions by id, as a handoff names them (primary keys, chunked). */
+export async function readNarratorHandoffRows(
+	ids: readonly string[],
+): Promise<Map<string, NarratorHandoffRow>> {
+	const out = new Map<string, NarratorHandoffRow>();
+	for (const chunk of chunked([...new Set(ids)])) {
+		const rows = await all(sql`
+			select id, title, owner_user_id, visibility, cwd, context_project_id
+			from narrators where id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows)
+			out.set(text(row, "id"), {
+				id: text(row, "id"),
+				title: textOrNull(row, "title"),
+				ownerUserId: textOrNull(row, "owner_user_id"),
+				visibility: text(row, "visibility"),
+				cwd: textOrNull(row, "cwd"),
+				contextProjectId: textOrNull(row, "context_project_id"),
+			});
+	}
+	return out;
+}
+
+/** A project's working directory (`git_path`), or null. */
+export async function readProjectDir(projectId: string): Promise<string | null> {
+	const rows = await all(sql`select git_path from projects where id = ${projectId} limit 1`);
+	return rows[0] ? textOrNull(rows[0], "git_path")?.trim() || null : null;
+}
+
 /**
  * The narrator `row`'s access is judged on, as `resolveJudgedRow` in `narrator-acl.ts` decides
  * it: a primary narrator (forks included) is judged on itself, a subagent on its ACL root. Null

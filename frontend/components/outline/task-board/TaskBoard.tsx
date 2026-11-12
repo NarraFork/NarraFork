@@ -690,6 +690,28 @@ function TaskRow({
 								{t("board.humanCreated")}
 							</Badge>
 						)}
+						{task.handoffs !== undefined && task.handoffs > 0 && (
+							<Tooltip
+								label={
+									task.handoffs >= 3
+										? t("board.handoffsManyHint", { count: task.handoffs })
+										: t("board.handoffsHint")
+								}
+								withinPortal
+								openDelay={300}
+								multiline
+								maw={260}
+							>
+								<Badge
+									size="xs"
+									variant="light"
+									color={task.handoffs >= 3 ? "orange" : "gray"}
+									data-testid="task-badge-handoffs"
+								>
+									{t("board.handoffs", { count: task.handoffs })}
+								</Badge>
+							</Tooltip>
+						)}
 						{task.plan?.state === "planning" && (
 							<Badge size="xs" variant="light" color="yellow" data-testid="task-badge-planning">
 								{t("board.planning")}
@@ -774,7 +796,7 @@ function TaskRow({
 										</Button.Group>
 									</Popover.Target>
 									<Popover.Dropdown>
-										<OpenSessionForm control={session} t={t} />
+										<OpenSessionForm control={session} task={task} t={t} />
 									</Popover.Dropdown>
 								</Popover>
 							)}

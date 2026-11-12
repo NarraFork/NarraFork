@@ -498,7 +498,9 @@ describe("claims (S5)", () => {
 		const looks: string[] = [];
 		const store = new Proxy(outlineStore, {
 			get(target, key, receiver) {
-				if (key === "findSpace" || key === "listClaimedTasks") looks.push(key);
+				// The leftover check is the one that looks at the session's space; the run's end
+				// still reads the session's claims once to settle them (release, PR 10c-2).
+				if (key === "findSpace") looks.push(key);
 				return Reflect.get(target, key, receiver);
 			},
 		});

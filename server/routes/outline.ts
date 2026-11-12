@@ -1321,7 +1321,12 @@ outlineRoutes.post(
 			taskId: blockId,
 			baseVersionSeq: input.baseVersionSeq,
 			by: { kind: "human", userId: principal.userId, isAdmin: principal.isAdmin },
-			options: { model: input.model, cwd: input.cwd, note: input.note },
+			options: {
+				model: input.model,
+				cwd: input.cwd,
+				previousDirectory: input.previousDirectory,
+				note: input.note,
+			},
 		});
 		return c.json(body, body.already ? 200 : 201);
 	},

@@ -15,6 +15,12 @@
  *      (prerequisites, an unanswered question, a change waiting for confirmation) and is not
  *      assigned to a person (`outlineTaskStartBlocker`, shared with delegation); it is still at
  *      the version the board read; the project has a working directory (or one was given).
+ *      Asked to continue in the previous session's directory (`previousDirectory`), that is the
+ *      directory of the session that last held the task, only when it is inside the project's
+ *      own and still exists; otherwise `no_directory`. A managed worktree may be reused so: its
+ *      resource row outlives the session that made it (archiving that session removes nothing),
+ *      and the new session's own `cwd` is a protection source of the lifecycle guard
+ *      (`resource-protection-index`), so the directory cannot be removed under it.
  *   3. The session: a root session in the project, owned by the person, its tasks in the outline,
  *      titled after the task, with the defaults of any session created there (audiences,
  *      permission mode, continuation).
@@ -41,7 +47,10 @@
  * snapshot: what changes later reaches the session through its current-tasks view and the team
  * activity. Its text does not depend on the time: the same outline renders the same bytes.
  * Within {@link OUTLINE_TASK_BRIEF_LIMITS.bytes} (the person's own note aside), in this order:
- * the head (title, goals above, address, the claim generation); the task's own text; the notes,
+ * the head (title, goals above, address, the claim generation); the task's own text; the handoff
+ * of the sessions that had the task before, when there is one (outline P2 PR 10c-2, `handoff.ts`:
+ * the newest whole with the notes it links to, earlier ones by their first line; they are left
+ * out of the notes that follow); the notes,
  * steps and questions under it and its prerequisites (the delegation brief's rendering,
  * `renderDelegationBrief`); the background (the nearest tasks above with their first paragraph,
  * and the nearest one's tasks, to place this one); the facts the task links to; a map of the
@@ -98,6 +107,7 @@ import {
 	OutlineTaskClaimedError,
 	OutlineWriteError,
 } from "./errors";
+import { isHandoffBlockId, OUTLINE_HANDOFF_LIMITS, previousSessionDirectory } from "./handoff";
 import { linkDisplayTitle, linkTitles } from "./link-display";
 import { oneAtATime } from "./person-tasks";
 import { loadBodies, readOutline, readSubtree } from "./read";
@@ -119,6 +129,11 @@ export const OUTLINE_TASK_BRIEF_LIMITS = {
 	bytes: 16 * 1024,
 	/** Of them, at most this many for the task's own text. */
 	bodyBytes: 3 * 1024,
+	/** At most this many for the handoffs of the sessions before (the newest whole). */
+	handoffBytes: 2560,
+	/** UTF-8 bytes of one line of a handoff, and of one note it points to. */
+	handoffLineBytes: 400,
+	handoffNoteBytes: 800,
 	/** The share of the background, the linked facts and the map of pages. */
 	backgroundBytes: 1800,
 	factsBytes: 3 * 1024,
@@ -318,8 +333,11 @@ const realRuntime: OutlineTaskSessionRuntime = {
 			getUserLanguage(userId),
 			getUserReplyInLanguage(userId),
 		]);
+		// The session exists for this task alone: its run is the system's, so a run that ends with
+		// the task unfinished gives it back at once (`release.ts`).
 		const { started } = await startSpecContinuationIfPossible(narratorId, locale, reply, userId, {
 			preferTaskId: taskId,
+			initiatedBy: "system",
 		});
 		return started;
 	},
@@ -423,11 +441,56 @@ export interface TaskBriefInput extends DelegationBriefInput {
 		context: string | null;
 		siblings?: Array<{ title: string; status: TaskStatus; self: boolean }>;
 	}>;
+	/**
+	 * The handoffs of the sessions that gave the task back (`handoff.ts`), when there are any: the
+	 * newest whole, with the notes it points to in full; the earlier ones by their first line.
+	 */
+	handoff?: TaskBriefHandoff | null;
 	facts: TaskBriefFact[];
 	/** The project space's pages, those linked first. */
 	pages: Array<{ address: string; title: string; linked: boolean; lines: string[] }>;
 	/** Pages past the ones listed. */
 	morePages: number;
+}
+
+export interface TaskBriefHandoff {
+	/** How many handoffs are under the task. */
+	times: number;
+	/** The newest handoff's first line and the lines under it. */
+	head: string;
+	lines: string[];
+	/** The notes it links to, as written. */
+	notes: Array<{ address: string; text: string }>;
+	/** First lines of the earlier handoffs, newest first. */
+	earlier: string[];
+}
+
+/** The handoff section within `max` bytes: the newest handoff first, whole before anything else. */
+function handoffSection(handoff: TaskBriefHandoff, max: number): string[] {
+	const limits = OUTLINE_TASK_BRIEF_LIMITS;
+	const text = TASK_BRIEF_TEXT;
+	const out = ["", text.handoff, text.handoffNote(handoff.times)];
+	out.push(`- ${cutText(handoff.head, limits.handoffLineBytes)}`);
+	for (const line of handoff.lines) out.push(`  - ${cutText(line, limits.handoffLineBytes)}`);
+	let left = max - cost(out);
+	const add = (lines: string[]): boolean => {
+		if (cost(lines) > left) return false;
+		out.push(...lines);
+		left -= cost(lines);
+		return true;
+	};
+	if (handoff.notes.length > 0 && add([text.handoffNotes])) {
+		for (const note of handoff.notes) {
+			const [first = "", ...rest] = cutText(note.text.trim(), limits.handoffNoteBytes).split("\n");
+			const lines = [text.handoffNoteAt(note.address), `  ${first}`, ...rest.map((l) => `  ${l}`)];
+			if (!add(lines)) break;
+		}
+	}
+	if (handoff.earlier.length > 0 && add([text.handoffEarlier])) {
+		for (const line of handoff.earlier)
+			if (!add([`- ${cutText(line, limits.handoffLineBytes)}`])) break;
+	}
+	return out;
 }
 
 const cost = (lines: readonly string[]) => (lines.length === 0 ? 0 : utf8(lines.join("\n")) + 1);
@@ -520,6 +583,9 @@ export function renderTaskBrief(
 		bodyBytes: Math.floor(limits.bodyBytes * scale),
 		reserve: share.background + share.facts + share.pages,
 		closing: text.rules,
+		...(input.handoff
+			? { before: handoffSection(input.handoff, Math.floor(limits.handoffBytes * scale)) }
+			: {}),
 		after: (left) => {
 			const out: string[] = [];
 			let rest = left;
@@ -576,8 +642,15 @@ export async function readTaskBrief(args: {
 	if (!(await scope.canRead(space))) return null;
 	const subtree = await readSubtree(block.id, { store });
 	if (!subtree) return null;
-	const found = { targets: [] as string[] };
+	// The handoffs are shown in their own section, before the notes, so earlier siblings cannot
+	// crowd the newest one out.
+	const handoffs = subtree.root.children.filter((child) => isHandoffBlockId(child.id));
+	const found = {
+		targets: [] as string[],
+		omit: (node: OutlineNode) => isHandoffBlockId(node.id),
+	};
 	const core = await readBriefInput(block, subtree, scope, store, found);
+	const handoff = await readHandoffs(subtree, handoffs, space, store);
 
 	// The tasks above, nearest first; their first paragraph is their first block that is a fact.
 	const above = subtree.path
@@ -700,9 +773,55 @@ export async function readTaskBrief(args: {
 					}
 				: {}),
 		})),
+		handoff,
 		facts,
 		pages,
 		morePages: Math.max(0, candidates.length - mapped.length),
+	};
+}
+
+/**
+ * The handoffs under the task as the brief shows them: the newest with its lines and the notes it
+ * links to (blocks under the task itself, so of the space the session reads), the earlier ones by
+ * their first line (at most the newest {@link OUTLINE_HANDOFF_LIMITS.counted}).
+ */
+async function readHandoffs(
+	subtree: NonNullable<Awaited<ReturnType<typeof readSubtree>>>,
+	handoffs: readonly OutlineNode[],
+	space: OutlineSpaceRow,
+	store: OutlineStore,
+): Promise<TaskBriefHandoff | null> {
+	const newest = handoffs[handoffs.length - 1];
+	if (!newest) return null;
+	const earlier = handoffs.slice(0, -1).reverse().slice(0, OUTLINE_HANDOFF_LIMITS.counted);
+	await loadBodies(subtree.state, [newest, ...newest.children, ...earlier], { store });
+	const shown = (node: OutlineNode) => linksAsText(node.content ?? "", new Map()).trim();
+	// The notes it links to: blocks under this task, by their address in this space.
+	const bySid = new Map<string, OutlineNode>();
+	for (const stack = [...subtree.root.children]; stack.length > 0; ) {
+		const node = stack.pop() as OutlineNode;
+		bySid.set(node.sid, node);
+		stack.push(...node.children);
+	}
+	const linked: OutlineNode[] = [];
+	for (const line of newest.children)
+		for (const target of contentTargets(line.content ?? "")) {
+			const address = parseAddress(target);
+			const node = address?.space === space.key ? bySid.get(address.sid) : undefined;
+			if (node && !linked.includes(node) && linked.length < OUTLINE_HANDOFF_LIMITS.notes)
+				linked.push(node);
+		}
+	await loadBodies(subtree.state, linked, { store });
+	return {
+		times: handoffs.length,
+		head: shown(newest),
+		lines: newest.children.map(shown).filter((line) => line !== ""),
+		notes: linked.flatMap((node) =>
+			node.content?.trim()
+				? [{ address: `${space.key}/${node.sid}`, text: linksAsText(node.content, new Map()) }]
+				: [],
+		),
+		earlier: earlier.map((node) => blockTitle(shown(node))).filter((line) => line !== ""),
 	};
 }
 
@@ -818,6 +937,11 @@ export async function openTaskSession(args: {
 		model?: string;
 		/** A working directory other than the project's. */
 		cwd?: string;
+		/**
+		 * The directory of the session that last held the task (`previousSessionDirectory`): the
+		 * person continues where its uncommitted work is. Refused when there is none any more.
+		 */
+		previousDirectory?: boolean;
 		/** The person's own note, added to the brief as it is. */
 		note?: string;
 	};
@@ -900,7 +1024,10 @@ async function openOne(
 		throw new OutlineTaskSessionError(refusal, holder);
 	}
 	if (block.versionSeq !== args.baseVersionSeq) throw new OutlineTaskSessionError("changed");
-	const cwd = args.options?.cwd?.trim() || (await run.projectDir(space.projectId));
+	const projectDir = await run.projectDir(space.projectId);
+	const cwd = args.options?.previousDirectory
+		? ((await previousSessionDirectory(store, claim, projectDir).catch(() => null))?.path ?? null)
+		: args.options?.cwd?.trim() || projectDir;
 	if (!cwd || !isAbsolute(cwd) || !isDirectory(cwd))
 		throw new OutlineTaskSessionError("no_directory");
 
