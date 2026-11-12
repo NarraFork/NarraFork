@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -114,7 +114,9 @@ export async function smokeRemotePeerPlatform(
 	if (host !== platform) throw new Error("Remote-peer smoke must be native");
 	const binary = resolve(output, remotePeerPublishedFilename(identity.version, platform));
 	await chmod(binary, 0o755);
-	const home = await mkdtemp(join(tmpdir(), "nf-peer-smoke-"));
+	// Resolve the temp root first: on macOS it lives under /var, a symlink to /private/var,
+	// and the production state store deliberately rejects any symlinked ancestor.
+	const home = await mkdtemp(join(await realpath(tmpdir()), "nf-peer-smoke-"));
 	const env = { ...updateServerChildEnvironment(), HOME: home, USERPROFILE: home, APPDATA: home };
 	const execute = async (args: string[], input?: string, closeInput = false): Promise<string> => {
 		const proc = Bun.spawn([binary, ...args], {
