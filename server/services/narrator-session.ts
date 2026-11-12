@@ -1955,7 +1955,8 @@ async function maybeDeliverInterruptTaskGuard(
 export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
 
 /**
- * At the start of a run of an outline session: move the old behavior fence's text to the
+ * At the start of a run: import a session that still keeps its tasks in Dynamic Spec (outline P2
+ * PR 12b, `spec-import/triggers.ts`). Then, for an outline session: move the old behavior fence's text to the
  * session's behavior page (once; `importOutlineBehaviorFence`) and a plugin's SOP left in it to the
  * plugin's block there (once; `moveOutlineFenceSop`, outline P2 PR 12a), then note where the run
  * starts for the turn-end note (the completed tool count and the revision of the open tasks).
@@ -1964,6 +1965,13 @@ export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
 export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 	active._outlineTurnStart = undefined;
 	try {
+		// A session still in Dynamic Spec is imported first (outline P2 PR 12b): when that moves
+		// it, this run is an outline run from its first request.
+		const { importSpecAtRunStart } = await import("./outline/spec-import/triggers");
+		await importSpecAtRunStart(active.narratorId, {
+			subagentsRunning: () =>
+				listNarratorAdmissionOwners(active.narratorId).some((id) => id !== active.narratorId),
+		});
 		if ((await resolveTaskBackend(active.narratorId)) !== "outline") return;
 		const { readTaskSession } = await import("./task-source/backend");
 		if ((await readTaskSession(active.narratorId))?.subagent === true) return;
@@ -4505,8 +4513,9 @@ export async function createNarratorForPlugin(
 		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 		// The recruiting plugin drives its members through the Dynamic Spec commands (dispatch,
 		// read, write); members stay spec (D27d), as OAuth-provisioned sessions do. Since outline P2
-		// PR 12a those commands work on outline sessions too (converted), so whether new members
-		// start in the outline is left to the import (plan PR 12b).
+		// PR 12a those commands work on outline sessions too (converted). A member starts in
+		// Dynamic Spec and is moved by the import like any spec session (outline P2 PR 12b): before
+		// its next run or while idle, with whatever the plugin dispatched to it by then.
 		taskBackend: "spec",
 	});
 	return {
@@ -4536,9 +4545,12 @@ async function pluginSpecRoute(
 	narratorId: string,
 	command: "tasks" | "fence",
 ): Promise<"spec" | "outline"> {
-	const { assertSpecTasksUsed, readTaskBackend, readTaskSession } = await import(
+	const { assertSpecTasksUsed, readTaskBackend, readTaskSession, waitForSpecImport } = await import(
 		"./task-source/backend"
 	);
+	// An import under way decides where the session's tasks are: the command waits for it (a
+	// moment), then goes there (outline P2 PR 12b).
+	await waitForSpecImport(narratorId);
 	if ((await readTaskBackend(narratorId)) !== "outline") return "spec";
 	if ((await readTaskSession(narratorId))?.subagent === true) {
 		if (command === "fence") return "spec";

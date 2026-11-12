@@ -35,6 +35,7 @@ import type {
 	OutlineDigestNowResponse,
 	OutlineDigestUndoResponse,
 } from "@shared/outline-digest";
+import type { OutlineSpecImportStatus } from "@shared/outline-spec-import";
 import type {
 	NarratorCurrentTaskResponse,
 	OutlineBoardAddRequest,
@@ -243,6 +244,14 @@ export const outlineApi = {
 		request<OutlineBoardFinishedResponse>(
 			`/outline/spaces/${enc(spaceId)}/tasks/finished${query({ cursor })}`,
 		),
+	/** Whether a session's Dynamic Spec is to be imported into the outline, and how that went. */
+	getSpecImportStatus: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`),
+	/** Start the import of a session's Dynamic Spec now. */
+	startSpecImport: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`, {
+			method: "POST",
+		}),
 	/** A person adds a task to a session. */
 	addBoardTask: (narratorId: string, body: OutlineBoardAddRequest) =>
 		request<OutlineBoardAddResponse>(`/outline/narrators/${enc(narratorId)}/tasks`, {
