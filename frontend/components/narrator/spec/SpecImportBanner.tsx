@@ -66,7 +66,7 @@ export function SpecImportBanner({ narratorId }: { narratorId: string }) {
 						data-testid="spec-import-error"
 						style={{ overflowWrap: "anywhere" }}
 					>
-						{t("spec.specImportError", { error: reason })}
+						{t("spec.specImportError", { error: reason, interpolation: { escapeValue: false } })}
 					</Text>
 				)}
 			</Box>
