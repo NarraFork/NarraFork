@@ -491,6 +491,46 @@ describe("claims (S5)", () => {
 		expect((await run(id)).status).toBe("imported");
 		expect((await taskPage(id)).map((t) => [t.status, t.holder])).toEqual([["doing", id]]);
 	});
+
+	test("an ordinary spec session's renewals do not look at its space each time; an import makes them look again (review r2 NIT 2)", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "going", status: "doing" }]);
+		const looks: string[] = [];
+		const store = new Proxy(outlineStore, {
+			get(target, key, receiver) {
+				if (key === "findSpace" || key === "listClaimedTasks") looks.push(key);
+				return Reflect.get(target, key, receiver);
+			},
+		});
+		let at = Date.now();
+		const renew = async () => {
+			at += 10 * 60_000;
+			const keeper = keepOutlineTaskLeases(id, { now: () => at, intervalMs: 0, store });
+			await keeper.touch();
+			await keeper.stop();
+		};
+		await renew();
+		const first = looks.length;
+		expect(first).toBeGreaterThan(0);
+		await renew();
+		await renew();
+		expect(looks).toHaveLength(first);
+		// An attempt that leaves the move's claim behind: the keeper looks again and renews nothing.
+		await cutAfter(id, 2);
+		const [task] = await taskPage(id);
+		await writeOutline({
+			spaceId: (await spaceOf(id)).id,
+			ops: [{ op: "setTask", block: { id: task?.id as string }, task: { status: "doing" } }],
+			actor: { kind: "system", id: "spec-import" },
+			responsibleUserId: null,
+			narratorId: id,
+		});
+		const [claim] = await outlineStore.getTaskClaims([task?.id as string]);
+		await renew();
+		expect(looks.length).toBeGreaterThan(first);
+		const [after] = await outlineStore.getTaskClaims([task?.id as string]);
+		expect(after?.expiresAt).toBe(claim?.expiresAt as string);
+	});
 });
 
 describe("the idle import gives way to its session (S4)", () => {

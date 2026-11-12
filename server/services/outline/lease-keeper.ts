@@ -28,6 +28,10 @@
  * nothing for it and puts nothing on the idle lease, so the claim runs out and the expiry job
  * reopens the task, instead of a session that is not an outline session keeping it for good. (Its
  * claims elsewhere, if any, run out with it in that case; the next import starts the tasks again.)
+ * That a spec session holds nothing of the kind is remembered for a while
+ * ({@link OUTLINE_LEASE_LEFTOVER_CACHE}), so the renewals of an ordinary Dynamic Spec session do
+ * not look at its space and claims each time; an import of the session forgets it
+ * ({@link forgetSpecImportLeftover}).
  */
 import { logger } from "@server/lib/logger";
 import { readTaskSession } from "../task-source/backend";
@@ -59,19 +63,56 @@ export interface OutlineLeaseKeeper {
 /** Claims of a session one look for what an unfinished import left reads. */
 const LEFTOVER_SCAN = 100;
 
+export const OUTLINE_LEASE_LEFTOVER_CACHE = {
+	/** Spec sessions remembered as holding nothing an import left (oldest dropped first). */
+	sessions: 4096,
+	/** How long that is believed without looking again (an import elsewhere is not seen). */
+	ttlMs: 10 * 60_000,
+} as const;
+
+/** Spec sessions found holding nothing an import left: when it was found (ms). */
+const noLeftover = new Map<string, number>();
+/** Moves on every {@link forgetSpecImportLeftover}: a look that saw it move is not remembered. */
+let leftoverEpoch = 0;
+
+/**
+ * Forget that a session holds nothing an import left: called by the import of the session (its
+ * move is what claims), at its start and its end.
+ */
+export function forgetSpecImportLeftover(narratorId: string): void {
+	leftoverEpoch++;
+	noLeftover.delete(narratorId);
+}
+
 /**
  * A root session still in Dynamic Spec that holds a claim in its own session space (see the
  * module header). One cached read for any other session; for a spec session, its space and its
- * claims (bounded, on the holder index).
+ * claims (bounded, on the holder index), unless it was found holding none lately.
  */
 async function holdsImportLeftover(narratorId: string, store?: OutlineStore): Promise<boolean> {
 	const session = await readTaskSession(narratorId);
 	if (session?.backend !== "spec" || session.subagent) return false;
+	const cachedAt = noLeftover.get(narratorId);
+	if (cachedAt !== undefined && Date.now() - cachedAt < OUTLINE_LEASE_LEFTOVER_CACHE.ttlMs)
+		return false;
+	const epoch = leftoverEpoch;
 	const outline = store ?? (await import("./store")).outlineStore;
 	const space = await outline.findSpace({ kind: "session", narratorId });
-	if (!space) return false;
-	const claims = await outline.listClaimedTasks(narratorId, LEFTOVER_SCAN);
-	return claims.some((claim) => claim.block.spaceId === space.id);
+	const leftover = space
+		? (await outline.listClaimedTasks(narratorId, LEFTOVER_SCAN)).some(
+				(claim) => claim.block.spaceId === space.id,
+			)
+		: false;
+	noLeftover.delete(narratorId);
+	if (!leftover && epoch === leftoverEpoch) {
+		noLeftover.set(narratorId, Date.now());
+		while (noLeftover.size > OUTLINE_LEASE_LEFTOVER_CACHE.sessions) {
+			const oldest = noLeftover.keys().next().value;
+			if (oldest === undefined) break;
+			noLeftover.delete(oldest);
+		}
+	}
+	return leftover;
 }
 
 /** When each session last renewed (ms), shared by its runs. */

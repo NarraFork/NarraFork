@@ -78,6 +78,7 @@ import { writeImportedFenceSop } from "../../task-source/outline-plugin-rules";
 import { outlineAccessBackend } from "../access-reads";
 import { OUTLINE_EDIT_TEXT_LIMITS, processBackgroundText } from "../edit-text-runner";
 import { isOutlineEnabled } from "../feature";
+import { forgetSpecImportLeftover } from "../lease-keeper";
 import { OUTLINE_TASKS_PAGE_ALIAS } from "../model";
 import { OUTLINE_TASKS_PAGE_TITLE } from "../person-tasks";
 import { PluginTaskError, pluginBlockedNoteSid } from "../plugin-tasks";
@@ -337,6 +338,7 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 	const previous = records.get(narratorId);
 	let release: (() => void) | null = null;
 	let unguard: (() => void) | null = null;
+	let touched = false;
 	const started = performance.now();
 	try {
 		const session = await readSpecImportSession(narratorId);
@@ -354,6 +356,9 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 		}
 		if (isSpecImporting(narratorId)) return { status: "busy" };
 		unguard = beginSpecImport(narratorId);
+		// The move claims tasks: the lease keeper looks at the session again (its end, too).
+		forgetSpecImportLeftover(narratorId);
+		touched = true;
 		remember(narratorId, {
 			status: "running",
 			trigger: options.trigger,
@@ -419,6 +424,7 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 		});
 		return { status: "failed", error: message, attention };
 	} finally {
+		if (touched) forgetSpecImportLeftover(narratorId);
 		unguard?.();
 		release?.();
 	}
