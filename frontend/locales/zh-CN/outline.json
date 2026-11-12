@@ -28,12 +28,8 @@
 			"session": "会话"
 		},
 		"orphaned": "所有者已删除",
-		"commits_one": "{{count}} 次提交",
-		"commits_other": "{{count}} 次提交",
 		"readOnly": "只读",
-		"searchPlaceholder": "在这个空间中搜索",
-		"pages": "页面",
-		"noPages": "还没有页面。agent 和编辑器写入的页面会出现在这里。"
+		"searchPlaceholder": "在这个空间中搜索"
 	},
 	"page": {
 		"task": {

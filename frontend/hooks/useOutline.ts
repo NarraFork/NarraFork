@@ -29,7 +29,7 @@ import { useCallback, useEffect, useRef } from "react";
 import type { OutlineViewState } from "../components/outline/view-state";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
-import { OutlinePageSubscriptions } from "../lib/outline-page-subscription";
+import { type OutlinePageHint, OutlinePageSubscriptions } from "../lib/outline-page-subscription";
 
 export { useOutlineEnabled } from "./useOutlineEnabled";
 
@@ -118,6 +118,21 @@ export function useOutlineSpace(spaceId: string, enabled = true) {
 		queryFn: () => api.getOutlineSpace(spaceId),
 		enabled,
 		retry: false,
+	});
+}
+
+/**
+ * Where a session space hangs (its project's space, `parent`), for the breadcrumbs: its own key,
+ * so the commit hints that refresh a space's reads do not read it again; a session's project
+ * rarely changes, and a stale crumb only links to a space that still checks access.
+ */
+export function useOutlineSpaceParent(spaceId: string, enabled = true) {
+	return useQuery({
+		queryKey: ["outline", "space-parent", spaceId] as const,
+		queryFn: async () => (await api.getOutlineSpace(spaceId)).space.parent ?? null,
+		enabled,
+		retry: false,
+		staleTime: 5 * 60_000,
 	});
 }
 
@@ -548,6 +563,93 @@ export function useOutlinePageLive(
 			}
 		});
 	}, [spaceId, pageId, queryClient]);
+}
+
+/** How long a burst of commits to a page open in the connected outline is gathered. */
+export const TREE_PAGE_REFRESH_MS = 300;
+
+/**
+ * The refresh of ONE page open in the connected outline (`tree/OutlineTree.tsx`): a hint of its
+ * page subscription re-reads that page's current block view and nothing else, so a commit to
+ * one page does not reload every page open in the same space (or its page list). A burst of
+ * hints is one read: hints raise the newest seq wanted, and a short timer compares it with what
+ * is shown once no read is in flight. Losing access re-reads too (the server answers 404).
+ */
+export function treePageRefresher(
+	queryClient: QueryClient,
+	spaceId: string,
+	pageId: string,
+	read: () => { shown: number; fetching: boolean },
+	delayMs = TREE_PAGE_REFRESH_MS,
+): { hint: (hint: OutlinePageHint) => void; dispose: () => void } {
+	let wanted = -1;
+	let force = false;
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	const refetch = () =>
+		void queryClient.invalidateQueries({
+			queryKey: outlineKeys.blocks(spaceId),
+			// This page's current view only (views as of a commit never change).
+			predicate: (query) => query.queryKey[3] === pageId && query.queryKey[4] === null,
+		});
+	const check = () => {
+		timer = null;
+		const now = read();
+		if (!force && wanted <= now.shown) return;
+		if (now.fetching) {
+			timer = setTimeout(check, delayMs);
+			return;
+		}
+		force = false;
+		refetch();
+	};
+	const schedule = () => {
+		timer ??= setTimeout(check, delayMs);
+	};
+	return {
+		hint(hint) {
+			if (hint.kind === "subscribed" || hint.kind === "changed") {
+				if (hint.seq <= wanted) return;
+				wanted = hint.seq;
+				schedule();
+			} else if (hint.kind === "denied" || hint.kind === "pending") {
+				// A change waiting for confirmation marks blocks; access lost answers 404.
+				force = true;
+				schedule();
+			}
+		},
+		dispose() {
+			if (timer !== null) clearTimeout(timer);
+			timer = null;
+		},
+	};
+}
+
+/**
+ * Keep a page open in the connected outline fresh (see {@link treePageRefresher}); `enabled`
+ * false: no subscription (the page shows the read it has).
+ */
+export function useOutlineTreePageLive(
+	view: Pick<OutlineBlockViewResponse, "pageId" | "seq" | "space"> | undefined,
+	fetching: boolean,
+	enabled: boolean,
+): void {
+	const queryClient = useQueryClient();
+	const spaceId = view?.space.id;
+	const pageId = view?.pageId;
+	const state = useRef({ shown: -1, fetching: false });
+	state.current = {
+		shown: Math.max(view?.seq ?? -1, view?.space.lastSeq ?? -1),
+		fetching,
+	};
+	useEffect(() => {
+		if (!enabled || !spaceId || !pageId) return;
+		const refresher = treePageRefresher(queryClient, spaceId, pageId, () => state.current);
+		const unsubscribe = pageSubscriptions().subscribe(pageId, refresher.hint);
+		return () => {
+			unsubscribe();
+			refresher.dispose();
+		};
+	}, [enabled, spaceId, pageId, queryClient]);
 }
 
 /** How long a burst of commits is gathered before the plan's diff is read again. */

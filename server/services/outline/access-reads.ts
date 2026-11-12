@@ -699,7 +699,7 @@ export interface OutlineTreeCursor {
 
 /**
  * One group of the connected outline:
- *   - `projects`: the spaces of projects the principal can read;
+ *   - `projects`: the spaces of projects the principal can read, archived projects left out;
  *   - `project`: the session spaces of the sessions whose project is this one (the session's
  *     project by the one shared rule, `narratorProjectIdText`: a session is listed under one
  *     project only, never under those it is merely linked to);
@@ -707,8 +707,9 @@ export interface OutlineTreeCursor {
  *     project, its project has no space, or the principal cannot read the project;
  *   - `orphaned`: spaces whose project or owner is gone (admins only; the caller checks).
  *
- * Every session space is in exactly one of `project` (of a listed project) and `loose`.
- * Archived sessions are in neither, as on the task board.
+ * Every session space is in at most one of `project` and `loose`. Archived sessions are in
+ * neither, as on the task board; nor are the sessions of an archived project (listed under it
+ * when the project is opened by URL, not among the loose ones).
  */
 export type OutlineTreeScope =
 	| { kind: "projects" }
@@ -737,11 +738,15 @@ function treeScopeSql(
 		};
 	}
 	if (scope.kind === "projects") {
+		// Archived projects are not listed (their spaces stay reachable by URL and search).
+		const active = sql`exists (
+			select 1 from projects ap where ap.id = s.project_id and ap.status <> 'archived'
+		)`;
 		return {
 			from: spaces,
 			where: principal.isAdmin
-				? sql`s.kind = 'project' and s.project_id is not null`
-				: sql`s.kind = 'project' and ${bindPlaceholders(
+				? sql`s.kind = 'project' and ${active}`
+				: sql`s.kind = 'project' and ${active} and ${bindPlaceholders(
 						projectReadableForIdText("s.project_id"),
 						principal.userId,
 					)}`,
@@ -781,6 +786,9 @@ function treeScopeSql(
 				select 1 from outline_spaces ps
 				where ps.kind = 'project' and ps.project_id = ${projectId}
 				${listed}
+			)
+			and not exists (
+				select 1 from projects ap where ap.id = ${projectId} and ap.status = 'archived'
 			)`,
 	};
 }

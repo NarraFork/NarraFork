@@ -28,12 +28,8 @@
 			"session": "Session"
 		},
 		"orphaned": "Owner removed",
-		"commits_one": "{{count}} commit",
-		"commits_other": "{{count}} commits",
 		"readOnly": "Read only",
-		"searchPlaceholder": "Search this space",
-		"pages": "Pages",
-		"noPages": "No pages yet. Agents and editors add them here."
+		"searchPlaceholder": "Search this space"
 	},
 	"page": {
 		"task": {

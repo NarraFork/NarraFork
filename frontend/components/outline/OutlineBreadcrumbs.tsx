@@ -2,7 +2,7 @@ import { Menu, UnstyledButton } from "@mantine/core";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
-import { useOutlineSpace } from "../../hooks/useOutline";
+import { useOutlineSpaceParent } from "../../hooks/useOutline";
 import { planCrumbs } from "../../lib/outline-crumbs";
 import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
@@ -15,7 +15,7 @@ type Ancestor = OutlineBlockViewResponse["path"][number];
 /**
  * Outline › (a session's project ›) space › page › … › the focused block's parent: where the page
  * is, not what it is. A session space names its project when the reader may read it (the space's
- * `parent`, from the space's own read, cached per space). The
+ * `parent`, read once per space and kept: commits do not change it). The
  * focused block's own title is the page title right below (and the tab's name in a dock), so the
  * bar does not say it again. Every crumb is a link that focuses it, keeping the view and the
  * time the page is shown at. While the page is edited live, `path` comes from the live page (it
@@ -35,7 +35,7 @@ export function OutlineBreadcrumbs({
 }) {
 	const { t, i18n } = useTranslation("outline");
 	const spaceName = useOutlineSpaceName();
-	const parent = useOutlineSpace(view.space.id, view.space.kind === "session").data?.space.parent;
+	const parent = useOutlineSpaceParent(view.space.id, view.space.kind === "session").data;
 	const plan = planCrumbs(path ?? view.path);
 	const targetOf = (ancestor: Ancestor) =>
 		outlineBlockTarget(view.space.id, ancestor.id, search.view, search.asOf);

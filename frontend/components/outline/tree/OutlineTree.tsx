@@ -51,6 +51,7 @@ import {
 } from "@tabler/icons-react";
 import {
 	createContext,
+	type KeyboardEvent,
 	type ReactNode,
 	useCallback,
 	useContext,
@@ -65,9 +66,10 @@ import { useTranslation } from "react-i18next";
 import {
 	useEnsurePersonalOutlineSpace,
 	useOutlineBlock,
-	useOutlinePageLive,
 	useOutlinePages,
+	useOutlineQuestions,
 	useOutlineTree,
+	useOutlineTreePageLive,
 	useOutlineTreeSpaces,
 	useOutlineViewStateSync,
 } from "../../../hooks/useOutline";
@@ -83,7 +85,12 @@ import { useOutlineSpaceName } from "../OutlineSpaceName";
 import { FOLD_ICONS } from "../outline-icons";
 import { OutlineLink, outlineBlockTarget, useOutlineNavigate } from "../outline-nav";
 import { OutlineViewState } from "../view-state";
-import { TreeOpenState, treeCountLabel } from "./tree-open-state";
+import {
+	type TreeHost,
+	TreeOpenState,
+	treeCountLabel,
+	treeOpenStorageKey,
+} from "./tree-open-state";
 
 /** Tree levels indentation grows for; deeper rows line up with the last. */
 const MAX_TREE_INDENT = 4;
@@ -94,6 +101,8 @@ interface TreeContextValue {
 	open: TreeOpenState;
 	/** Pixels per level. */
 	step: number;
+	/** A phone or a narrow panel: indentation, tree and page together, stops at 4 levels. */
+	narrow: boolean;
 }
 
 const TreeContext = createContext<TreeContextValue | null>(null);
@@ -147,14 +156,20 @@ function TreeRow({
 	return (
 		<div
 			className={classes.treeRow}
+			role="treeitem"
+			aria-level={depth + 1}
+			aria-expanded={open}
 			data-tree-node={nodeKey}
 			data-tree-kind={kind}
 			data-open={open}
 			style={{ paddingInlineStart: indentOf(depth, step) }}
 		>
 			<span className={classes.toggle}>
+				{/* One tab stop per row (its title): the arrow is for the pointer, the arrow keys
+				    open and close from the title. */}
 				<button
 					type="button"
+					tabIndex={-1}
 					className={`${classes.toggleButton} mantine-focus-auto`}
 					aria-expanded={open}
 					aria-label={`${action} · ${title}`}
@@ -176,7 +191,6 @@ function TreeRow({
 				<button
 					type="button"
 					className={`${classes.treeTitle} ${classes.treeGroupTitle} mantine-focus-auto`}
-					aria-expanded={open}
 					onClick={onToggle}
 					data-tree-title=""
 				>
@@ -514,8 +528,10 @@ function OpenPage({
 	live: boolean;
 }) {
 	const { t, i18n } = useTranslation("outline");
-	const { step } = useTree();
+	const { step, narrow, open: openState } = useTree();
 	const navigate = useOutlineNavigate();
+	// Shown: it counts toward the open pages' limits until it is not (its parent closed).
+	useEffect(() => openState.showPage(`page:${pageId}`), [openState, pageId]);
 	// Everything the page holds, tasks included: reading the whole outline is reading what is
 	// being done too, folded so that what is finished takes one line.
 	const query = useOutlineBlock(spaceId, pageId, {
@@ -524,7 +540,8 @@ function OpenPage({
 		bytes: OUTLINE_TREE_LIMITS.pageBytes,
 	});
 	const view = query.data;
-	useOutlinePageLive(live ? view : undefined);
+	// This page's own read, and nothing else, when a commit reaches it.
+	useOutlineTreePageLive(view, query.isFetching, live);
 	// The reader's folding of the page: their own, stored per page.
 	const [state] = useState(() => new OutlineViewState(pageId));
 	useOutlineViewStateSync(pageId, state);
@@ -561,6 +578,12 @@ function OpenPage({
 		},
 		[navigate, pageId, spaceId],
 	);
+	// Once nothing is left to answer, the form goes (a later question does not bring it back).
+	const questions = useOutlineQuestions(asking ? pageId : null, asking !== null);
+	const answered = questions.isSuccess && (questions.data?.questions.length ?? 0) === 0;
+	useEffect(() => {
+		if (answered) setAsking(null);
+	}, [answered]);
 	useEffect(() => {
 		const root = host.current;
 		if (!asking || !root) return;
@@ -612,6 +635,8 @@ function OpenPage({
 		<div
 			ref={host}
 			className={classes.treePage}
+			// biome-ignore lint/a11y/useSemanticElements: the open page's blocks, under its row
+			role="group"
 			style={{ paddingInlineStart: pad }}
 			data-tree-page={pageId}
 			data-live={live || undefined}
@@ -629,7 +654,14 @@ function OpenPage({
 				search={{}}
 				onFold={onFold}
 				onOpenQuestions={onOpenQuestions}
-				indent={{ step, max: MAX_TREE_INDENT * 2 }}
+				indent={{
+					step,
+					// Narrow: the tree and the page together indent at most 4 levels (one more for
+					// a page already that deep, so its rows still nest).
+					max: narrow
+						? Math.max(1, MAX_TREE_INDENT - Math.min(depth, MAX_TREE_INDENT))
+						: MAX_TREE_INDENT * 2,
+				}}
 			/>
 			{partial && (
 				<Text size="xs" c="dimmed" mt={2} pl={24} data-tree-partial="">
@@ -739,18 +771,62 @@ export interface OutlineTreeProps {
 	 * the host shows the space itself above).
 	 */
 	root: { kind: "all" } | { kind: "space"; space: OutlineSpaceSummary };
+	/** Where it is shown: the outline page and the dock panels keep their own open nodes. */
+	host?: TreeHost;
 }
 
-export function OutlineTree({ root }: OutlineTreeProps) {
+/** The arrow keys on a row's title (design §2.5): move between rows, open and close. */
+function onTreeKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+	if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+	const target = event.target as HTMLElement;
+	if (!target.matches("[data-tree-title]")) return;
+	const row = target.closest<HTMLElement>("[data-tree-node]");
+	if (!row) return;
+	const titles = [...event.currentTarget.querySelectorAll<HTMLElement>("[data-tree-title]")];
+	const at = titles.indexOf(target);
+	const move = (to: number) => {
+		const next = titles[Math.max(0, Math.min(titles.length - 1, to))];
+		next?.focus();
+	};
+	const toggle = () => row.querySelector<HTMLButtonElement>("[data-tree-toggle]")?.click();
+	const open = row.dataset.open === "true";
+	switch (event.key) {
+		case "ArrowDown":
+			move(at + 1);
+			break;
+		case "ArrowUp":
+			move(at - 1);
+			break;
+		case "Home":
+			move(0);
+			break;
+		case "End":
+			move(titles.length - 1);
+			break;
+		case "ArrowRight":
+			if (open) move(at + 1);
+			else toggle();
+			break;
+		case "ArrowLeft":
+			if (open) toggle();
+			break;
+		default:
+			return;
+	}
+	event.preventDefault();
+}
+
+export function OutlineTree({ root, host = "page" }: OutlineTreeProps) {
 	const { t } = useTranslation("outline");
-	const [open] = useState(() => new TreeOpenState());
+	const [open] = useState(() => new TreeOpenState(treeOpenStorageKey(host)));
 	const { ref, width } = useElementSize();
-	const step = width > 0 && width < NARROW_PX ? 12 : 18;
-	const value = useMemo(() => ({ open, step }), [open, step]);
+	const narrow = width > 0 && width < NARROW_PX;
+	const step = narrow ? 12 : 18;
+	const value = useMemo(() => ({ open, step, narrow }), [open, step, narrow]);
 	const anyOpen = useSyncExternalStore(open.subscribe, () => open.snapshot().length > 0);
 	return (
 		<TreeContext.Provider value={value}>
-			<Box ref={ref} className={classes.tree} data-testid="outline-tree" data-narrow={step === 12}>
+			<Box ref={ref} className={classes.tree} data-testid="outline-tree" data-narrow={narrow}>
 				<Group justify="space-between" gap="xs" wrap="nowrap" mb={4}>
 					<Text size="xs" c="dimmed" className={classes.ellipsis}>
 						{t("tree.hint")}
@@ -767,11 +843,14 @@ export function OutlineTree({ root }: OutlineTreeProps) {
 						</Button>
 					)}
 				</Group>
-				{root.kind === "all" ? (
-					<RootChildren />
-				) : (
-					<SpaceChildren space={root.space} depth={0} sessions={null} />
-				)}
+				{/* biome-ignore lint/a11y/useSemanticElements: a tree of rows, not a list box */}
+				<div role="tree" aria-label={t("title")} onKeyDown={onTreeKeyDown}>
+					{root.kind === "all" ? (
+						<RootChildren />
+					) : (
+						<SpaceChildren space={root.space} depth={0} sessions={null} />
+					)}
+				</div>
 			</Box>
 		</TreeContext.Provider>
 	);

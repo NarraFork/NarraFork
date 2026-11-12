@@ -5,8 +5,13 @@ import {
 	TREE_OPEN_LIMITS,
 	TreeOpenState,
 	treeCountLabel,
+	treeOpenStorageKey,
+	withinShownPages,
 	withTreeOpen,
 } from "./tree-open-state";
+
+const pages = (n: number, prefix = "p") =>
+	Array.from({ length: n }, (_, i) => `page:${prefix}${i}`);
 
 describe("the connected outline's open nodes", () => {
 	test("stored keys: malformed and repeated ones are dropped", () => {
@@ -29,21 +34,8 @@ describe("the connected outline's open nodes", () => {
 		).toEqual(["space:abc", "page:p1", "group:loose", "group:sessions:proj_1"]);
 	});
 
-	test("opening a page past the limit closes the page open longest; other nodes stay", () => {
-		let keys: string[] = ["space:s"];
-		for (let i = 0; i < TREE_OPEN_LIMITS.maxPages; i++)
-			keys = withTreeOpen(keys, `page:p${i}`, true);
-		expect(keys.filter((k) => k.startsWith("page:"))).toHaveLength(TREE_OPEN_LIMITS.maxPages);
-		keys = withTreeOpen(keys, "page:new", true);
-		expect(keys).toContain("space:s");
-		expect(keys).not.toContain("page:p0");
-		expect(keys).toContain("page:p1");
-		expect(keys.at(-1)).toBe("page:new");
-		expect(keys.filter((k) => k.startsWith("page:"))).toHaveLength(TREE_OPEN_LIMITS.maxPages);
-		// Reopening one moves it to the newest; closing removes it.
-		keys = withTreeOpen(keys, "page:p1", true);
-		expect(keys.at(-1)).toBe("page:p1");
-		expect(withTreeOpen(keys, "space:s", false)).not.toContain("space:s");
+	test("the outline page and the dock panels keep their own", () => {
+		expect(treeOpenStorageKey("page")).not.toBe(treeOpenStorageKey("panel"));
 	});
 
 	test("at most the key limit is kept, the newest", () => {
@@ -54,27 +46,52 @@ describe("the connected outline's open nodes", () => {
 		expect(keys[0]).toBe("space:s20");
 	});
 
-	test("only the newest open pages are kept fresh", () => {
-		const keys = Array.from({ length: 10 }, (_, i) => `page:p${i}`);
-		const live = liveTreePages(["space:s", ...keys]);
-		expect(live.size).toBe(TREE_OPEN_LIMITS.livePages);
-		expect(live.has("page:p9")).toBe(true);
-		expect(live.has("page:p1")).toBe(false);
+	test("only shown pages count: past the limit the shown page opened longest goes", () => {
+		const hidden = pages(5, "h");
+		const shown = pages(TREE_OPEN_LIMITS.maxPages + 1);
+		const keys = ["space:s", ...hidden, ...shown];
+		const kept = withinShownPages(keys, new Set(shown));
+		expect(kept).not.toContain("page:p0");
+		expect(kept).toContain("page:p1");
+		// Pages under a closed parent are not shown: they neither count nor go.
+		for (const h of hidden) expect(kept).toContain(h);
+		expect(kept).toContain("space:s");
+		expect(withinShownPages(keys, new Set(hidden))).toEqual(keys);
 	});
 
-	test("the state tells its listeners and clears", () => {
-		const state = new TreeOpenState([]);
+	test("only the newest shown pages are kept fresh", () => {
+		const keys = pages(10);
+		const live = liveTreePages(["space:s", ...keys], new Set(keys.slice(0, 9)));
+		expect(live.size).toBe(TREE_OPEN_LIMITS.livePages);
+		expect(live.has("page:p8")).toBe(true);
+		expect(live.has("page:p9")).toBe(false);
+		expect(live.has("page:p0")).toBe(false);
+	});
+
+	test("the state: showing a 13th page closes the oldest shown; hiding frees a slot", () => {
+		const state = new TreeOpenState(null, []);
 		let heard = 0;
 		const off = state.subscribe(() => heard++);
-		state.toggle("space:a");
-		expect(state.isOpen("space:a")).toBe(true);
-		state.setOpen("space:a", true);
-		expect(heard).toBe(1);
-		state.toggle("page:p");
-		expect(state.isLive("page:p")).toBe(true);
+		const hides: Array<() => void> = [];
+		for (const key of pages(TREE_OPEN_LIMITS.maxPages + 1)) {
+			state.setOpen(key, true);
+			hides.push(state.showPage(key));
+		}
+		expect(state.isOpen("page:p0")).toBe(false);
+		expect(state.isOpen("page:p1")).toBe(true);
+		const live = pages(TREE_OPEN_LIMITS.maxPages + 1).filter((k) => state.isLive(k));
+		expect(live).toHaveLength(TREE_OPEN_LIMITS.livePages);
+		expect(state.isLive(`page:p${TREE_OPEN_LIMITS.maxPages}`)).toBe(true);
+		// The newest stops being shown (its parent closed): it stays open, an older one goes live.
+		hides[TREE_OPEN_LIMITS.maxPages]?.();
+		expect(state.isOpen(`page:p${TREE_OPEN_LIMITS.maxPages}`)).toBe(true);
+		expect(state.isLive(`page:p${TREE_OPEN_LIMITS.maxPages}`)).toBe(false);
+		expect(state.isLive(`page:p${TREE_OPEN_LIMITS.maxPages - TREE_OPEN_LIMITS.livePages}`)).toBe(
+			true,
+		);
+		expect(heard).toBeGreaterThan(0);
 		state.clear();
 		expect(state.snapshot()).toEqual([]);
-		expect(heard).toBe(3);
 		off();
 	});
 

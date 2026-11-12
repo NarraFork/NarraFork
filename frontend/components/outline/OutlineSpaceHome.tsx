@@ -33,8 +33,11 @@ export function OutlineSpaceHome({
 	onLoaded,
 	onMissing,
 	actions,
+	host = "page",
 }: {
 	spaceId: string;
+	/** The outline page or a dock panel (each keeps its own open nodes of the tree). */
+	host?: "page" | "panel";
 	/** Told the space once it has loaded (a dock panel names its tab after it). */
 	onLoaded?: (space: OutlineSpaceDetail, name: string) => void;
 	/** The space could not be read (it does not exist, or the person may not read it). */
@@ -140,7 +143,7 @@ export function OutlineSpaceHome({
 					))}
 				</Stack>
 			) : (
-				<OutlineTree root={{ kind: "space", space: detail }} />
+				<OutlineTree root={{ kind: "space", space: detail }} host={host} />
 			)}
 		</Stack>
 	);

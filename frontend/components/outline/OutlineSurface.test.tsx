@@ -53,7 +53,7 @@ mock.module("../../hooks/useOutline", () => ({
 	},
 	useOutlinePageLive: () => {},
 	// The breadcrumbs' project crumb (a session space's parent).
-	useOutlineSpace: () => idle,
+	useOutlineSpaceParent: () => idle,
 	useOutlineViewStateSync: () => {},
 	useOutlineSearch: () => idle,
 	useOutlineSeed: () => idle,

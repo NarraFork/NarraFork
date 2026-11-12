@@ -12,7 +12,7 @@ import type {
 	OutlineTreeResponse,
 	OutlineTreeSpacesResponse,
 } from "@shared/outline-api";
-import { sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../../db";
 import { aclGrants, narratorProjectLinks, narrators, projects, users } from "../../../db/schema";
@@ -56,7 +56,11 @@ async function project(owner: string, visibility: "private" | "public" = "privat
 
 async function session(
 	owner: string,
-	options: { projectId?: string; visibility?: "private" | "project"; archived?: boolean } = {},
+	options: {
+		projectId?: string;
+		visibility?: "private" | "project" | "public";
+		archived?: boolean;
+	} = {},
 ) {
 	const id = generateId();
 	await db.insert(narrators).values({
@@ -238,6 +242,56 @@ describe("where a session hangs", () => {
 	});
 });
 
+describe("permission edges", () => {
+	test("a public session of someone's private project is loose to a stranger, without a parent", async () => {
+		const owner = await user();
+		const stranger = await user();
+		const p = await project(owner);
+		const s = await session(owner, { projectId: p.id, visibility: "public" });
+		const loose = await get<OutlineTreeSpacesResponse>(stranger, "/tree/loose");
+		expect(loose.spaces.map((x) => x.id)).toContain(s.space);
+		const root = await get<OutlineTreeResponse>(stranger, "/tree");
+		expect(root.projects.map((x) => x.id)).not.toContain(p.space);
+		const detail = await get<OutlineSpaceDetailResponse>(stranger, `/spaces/${s.space}`);
+		expect(detail.space.parent ?? null).toBeNull();
+		// The owner reads both: under the project, not loose.
+		const ownerLoose = await get<OutlineTreeSpacesResponse>(owner, "/tree/loose");
+		expect(ownerLoose.spaces.map((x) => x.id)).not.toContain(s.space);
+	});
+
+	test("a session's owner who loses read on its project loses the project crumb", async () => {
+		const other = await user();
+		const me = await user();
+		const p = await project(other);
+		await grant("project", p.id, me);
+		const s = await session(me, { projectId: p.id, visibility: "public" });
+		const before = await get<OutlineSpaceDetailResponse>(me, `/spaces/${s.space}`);
+		expect(before.space.parent?.spaceId).toBe(p.space);
+		await db
+			.delete(aclGrants)
+			.where(and(eq(aclGrants.scopeId, p.id), eq(aclGrants.principalId, me)));
+		const after = await get<OutlineSpaceDetailResponse>(me, `/spaces/${s.space}`);
+		expect(after.space.parent ?? null).toBeNull();
+		expect(await status(me, `/tree/projects/${p.id}/sessions`)).toBe(404);
+		const loose = await get<OutlineTreeSpacesResponse>(me, "/tree/loose");
+		expect(loose.spaces.map((x) => x.id)).toContain(s.space);
+	});
+
+	test("an archived project is not listed, nor are its sessions among the loose ones", async () => {
+		const owner = await user();
+		const p = await project(owner);
+		const s = await session(owner, { projectId: p.id });
+		await db.run(sql`update projects set status = 'archived' where id = ${p.id}`);
+		const root = await get<OutlineTreeResponse>(owner, "/tree");
+		expect(root.projects.map((x) => x.id)).not.toContain(p.space);
+		const loose = await get<OutlineTreeSpacesResponse>(owner, "/tree/loose");
+		expect(loose.spaces.map((x) => x.id)).not.toContain(s.space);
+		// Still there for whoever opens the project by URL.
+		const sessions = await get<OutlineTreeSpacesResponse>(owner, `/tree/projects/${p.id}/sessions`);
+		expect(sessions.spaces.map((x) => x.id)).toEqual([s.space]);
+	});
+});
+
 describe("paging", () => {
 	test("pages run through committed spaces, then the never committed, without repeats", async () => {
 		const owner = await user();
@@ -272,6 +326,33 @@ describe("paging", () => {
 				return t(b) - t(a);
 			}),
 		);
+	});
+
+	test("a commit between two pages never shows a space twice", async () => {
+		const owner = await user();
+		const p = await project(owner);
+		const made: string[] = [];
+		for (let i = 0; i < 6; i++) {
+			const s = await session(owner, { projectId: p.id });
+			made.push(s.space);
+			await committedAt(s.space, `2026-11-0${i + 1}T00:00:00.000Z`);
+		}
+		const principal = { userId: owner, isAdmin: false };
+		const scope = { kind: "project" as const, projectId: p.id };
+		const first = await readOutlineTreeSpacePage(principal, scope, { after: null, limit: 3 });
+		expect(first.map((r) => r.id)).toEqual([made[5], made[4], made[3]]);
+		// Commits land on a space already shown and on one not shown yet: both move to the front.
+		await committedAt(made[4] as string, "2026-11-20T00:00:00.000Z");
+		await committedAt(made[1] as string, "2026-11-21T00:00:00.000Z");
+		const last = first.at(-1) as (typeof first)[number];
+		const rest = await readOutlineTreeSpacePage(principal, scope, {
+			after: { lastCommitAt: last.lastCommitAt, id: last.id },
+			limit: 10,
+		});
+		const seen = [...first, ...rest].map((r) => r.id);
+		expect(new Set(seen).size).toBe(seen.length);
+		// The one that moved ahead of the cursor is for the next read from the top.
+		expect(rest.map((r) => r.id)).toEqual([made[2], made[0]]);
 	});
 
 	test("the route pages twenty at a time with a cursor, and refuses a bad one", async () => {

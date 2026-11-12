@@ -17,8 +17,17 @@ import { OutlineTree } from "./tree/OutlineTree";
 
 const TREE_ROOT = { kind: "all" } as const;
 
-/** `header`: the host's entry above the title (the outline route's reports entry). */
-export function OutlineHome({ header }: { header?: ReactNode } = {}) {
+/**
+ * `header`: the host's entry above the title (the outline route's reports entry). `host`: the
+ * outline page or a dock panel (each keeps its own open nodes of the tree).
+ */
+export function OutlineHome({
+	header,
+	host = "page",
+}: {
+	header?: ReactNode;
+	host?: "page" | "panel";
+} = {}) {
 	const { t } = useTranslation("outline");
 	const [query, setQuery] = useState("");
 	const [debounced] = useDebouncedValue(query, 250);
@@ -88,7 +97,7 @@ export function OutlineHome({ header }: { header?: ReactNode } = {}) {
 			</Box>
 
 			{/* The whole outline as one tree (readability E): my space, projects, their sessions. */}
-			<OutlineTree root={TREE_ROOT} />
+			<OutlineTree root={TREE_ROOT} host={host} />
 		</Stack>
 	);
 }
