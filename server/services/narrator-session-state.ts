@@ -227,6 +227,21 @@ export interface ActiveNarrator {
 	/** Cumulative request-token baseline at the start of the current pass. */
 	_tokenUsageBaseline?: number;
 	/** Guard against infinite auto-continuation when continuation turns make no effective progress. */
+	/**
+	 * Who started the run about to begin, set by its entry point and taken by the run when it
+	 * starts (outline: a person's run keeps the session's unfinished team tasks for an hour, a
+	 * system run that ends by itself gives them back). Unset counts as a person: only the entries
+	 * that are the system's say so (wakes, notices, a session opened for a task).
+	 */
+	_runInitiatedBy?: "person" | "system";
+	/** The outline task the run about to begin was started for (a session opened for it). */
+	_runForTaskId?: string;
+	/**
+	 * A person acted inside the current run (outline P2 PR 10c-2): resolved its permission, plan
+	 * approval or question, or answered its asynchronous question. Cleared when a run starts and
+	 * read when it ends: the run then counts as a person's.
+	 */
+	_runPersonActed?: boolean;
 	_continuationSuppressed?: boolean;
 	/** Whether the current pass is a normal task continuation or a blocked-task recovery turn. */
 	_continuationTurn?: "task" | "blocked";

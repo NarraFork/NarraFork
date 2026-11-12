@@ -93,6 +93,15 @@ async function all(query: SQL): Promise<Row[]> {
 	return await executor().all(query);
 }
 
+/**
+ * One statement through the executor, for the few modules that keep their own dialect-neutral
+ * SQL next to what they read it for (the Dynamic Spec import's reads, `spec-import/read-port.ts`).
+ * The same rules hold for them: small, indexed, bounded, every value a bound parameter.
+ */
+export async function runOutlineAccessQuery(query: SQL): Promise<Row[]> {
+	return await all(query);
+}
+
 function text(row: Row, column: string): string {
 	const value = row[column];
 	if (typeof value !== "string") throw new Error(`outline access read: ${column} is not text`);
@@ -150,6 +159,45 @@ export async function readNarrator(id: string): Promise<NarratorAccessRow | null
 		aclRootNarratorId: textOrNull(row, "acl_root_narrator_id"),
 		contextProjectId: textOrNull(row, "context_project_id"),
 	};
+}
+
+/** What a handoff says of the session that held a task (`handoff.ts`). */
+export interface NarratorHandoffRow {
+	id: string;
+	title: string | null;
+	ownerUserId: string | null;
+	visibility: string;
+	cwd: string | null;
+	contextProjectId: string | null;
+}
+
+/** Sessions by id, as a handoff names them (primary keys, chunked). */
+export async function readNarratorHandoffRows(
+	ids: readonly string[],
+): Promise<Map<string, NarratorHandoffRow>> {
+	const out = new Map<string, NarratorHandoffRow>();
+	for (const chunk of chunked([...new Set(ids)])) {
+		const rows = await all(sql`
+			select id, title, owner_user_id, visibility, cwd, context_project_id
+			from narrators where id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows)
+			out.set(text(row, "id"), {
+				id: text(row, "id"),
+				title: textOrNull(row, "title"),
+				ownerUserId: textOrNull(row, "owner_user_id"),
+				visibility: text(row, "visibility"),
+				cwd: textOrNull(row, "cwd"),
+				contextProjectId: textOrNull(row, "context_project_id"),
+			});
+	}
+	return out;
+}
+
+/** A project's working directory (`git_path`), or null. */
+export async function readProjectDir(projectId: string): Promise<string | null> {
+	const rows = await all(sql`select git_path from projects where id = ${projectId} limit 1`);
+	return rows[0] ? textOrNull(rows[0], "git_path")?.trim() || null : null;
 }
 
 /**
@@ -680,6 +728,186 @@ export async function readProjectSessionSpacePage(
 		limit ${options.limit}
 	`);
 	return rows.map(toSpace);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The connected outline (readability E)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A space as the connected outline lists it: with the time of its latest commit. */
+export interface OutlineTreeSpaceRow extends OutlineSpaceRow {
+	lastCommitAt: string | null;
+}
+
+/** Where a page of the connected outline ended: the last row's commit time and id. */
+export interface OutlineTreeCursor {
+	lastCommitAt: string | null;
+	id: string;
+}
+
+/**
+ * One group of the connected outline:
+ *   - `projects`: the spaces of projects the principal can read, archived projects left out;
+ *   - `project`: the session spaces of the sessions whose project is this one (the session's
+ *     project by the one shared rule, `narratorProjectIdText`: a session is listed under one
+ *     project only, never under those it is merely linked to);
+ *   - `loose`: the session spaces that hang under no listed project space: the session has no
+ *     project, its project has no space, or the principal cannot read the project;
+ *   - `orphaned`: spaces whose project or owner is gone (admins only; the caller checks).
+ *
+ * Every session space is in at most one of `project` and `loose`. Archived sessions are in
+ * neither, as on the task board; nor are the sessions of an archived project (listed under it
+ * when the project is opened by URL, not among the loose ones).
+ */
+export type OutlineTreeScope =
+	| { kind: "projects" }
+	| { kind: "project"; projectId: string }
+	| { kind: "loose" }
+	| { kind: "orphaned" };
+
+/**
+ * The scope's FROM and WHERE: readability is the project and narrator lists' own predicates, so
+ * the filter runs in SQL before any LIMIT and a page is never short because rows were dropped
+ * after it. Admins read every project and session.
+ */
+function treeScopeSql(
+	principal: { userId: string; isAdmin: boolean },
+	scope: OutlineTreeScope,
+): { from: SQL; where: SQL } {
+	const spaces = sql`outline_spaces s`;
+	if (scope.kind === "orphaned") {
+		return {
+			from: spaces,
+			where: sql`(
+				(s.kind = 'project' and s.project_id is null)
+				or (s.kind = 'personal' and s.owner_user_id is null)
+				or (s.kind = 'session' and s.narrator_id is null)
+			)`,
+		};
+	}
+	if (scope.kind === "projects") {
+		// Archived projects are not listed (their spaces stay reachable by URL and search).
+		const active = sql`exists (
+			select 1 from projects ap where ap.id = s.project_id and ap.status <> 'archived'
+		)`;
+		return {
+			from: spaces,
+			where: principal.isAdmin
+				? sql`s.kind = 'project' and ${active}`
+				: sql`s.kind = 'project' and ${active} and ${bindPlaceholders(
+						projectReadableForIdText("s.project_id"),
+						principal.userId,
+					)}`,
+		};
+	}
+	const from = sql`outline_spaces s join narrators n on n.id = s.narrator_id`;
+	const readable = principal.isAdmin
+		? sql``
+		: sql`and ${bindPlaceholders(narratorReadableText("n"), principal.userId)}`;
+	const projectId = sql.raw(narratorProjectIdText("n"));
+	if (scope.kind === "project") {
+		// The candidates come from the link index and the explicit project column, each bounded
+		// by the project's sessions; the shared rule then says which of them are the project's.
+		return {
+			from,
+			where: sql`s.kind = 'session'
+				and s.narrator_id in (
+					select npl.narrator_id from narrator_project_links npl
+					where npl.project_id = ${scope.projectId} and npl.role = 'primary'
+					union
+					select n2.id from narrators n2 where n2.context_project_id = ${scope.projectId}
+				)
+				and ${projectId} = ${scope.projectId}
+				and n.status <> 'archived'
+				${readable}`,
+		};
+	}
+	const listed = principal.isAdmin
+		? sql``
+		: sql`and ${bindPlaceholders(projectReadableForIdText("ps.project_id"), principal.userId)}`;
+	return {
+		from,
+		where: sql`s.kind = 'session'
+			and n.status <> 'archived'
+			${readable}
+			and not exists (
+				select 1 from outline_spaces ps
+				where ps.kind = 'project' and ps.project_id = ${projectId}
+				${listed}
+			)
+			and not exists (
+				select 1 from projects ap where ap.id = ${projectId} and ap.status = 'archived'
+			)`,
+	};
+}
+
+function toTreeSpace(row: Row): OutlineTreeSpaceRow {
+	return { ...toSpace(row), lastCommitAt: textOrNull(row, "last_commit_at") };
+}
+
+const TREE_COLUMNS = sql.raw(
+	"s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq, " +
+		"s.in_process_epoch, s.created_at, s.last_commit_at",
+);
+
+/**
+ * A page of one group of the connected outline, latest commit first: by `last_commit_at`
+ * descending then id descending (the order of `idx_outline_spaces_last_commit` read backwards),
+ * and after those the spaces never committed to (or not stamped yet) by id. Strictly after
+ * `after` in that order when given; at most `limit` rows, in at most two statements.
+ *
+ * A space committed to between two pages moves to the front: a later page may then not show it,
+ * and never shows a space twice. The tree is read again from the top to see it.
+ */
+export async function readOutlineTreeSpacePage(
+	principal: { userId: string; isAdmin: boolean },
+	scope: OutlineTreeScope,
+	options: { after?: OutlineTreeCursor | null; limit: number },
+): Promise<OutlineTreeSpaceRow[]> {
+	const { from, where } = treeScopeSql(principal, scope);
+	// Byte order on both backends, so a cursor means the same thing on either.
+	const pg = executor().dialect === "postgres";
+	const id = pg ? sql.raw(`s.id collate "C"`) : sql.raw("s.id");
+	const at = pg ? sql.raw(`s.last_commit_at collate "C"`) : sql.raw("s.last_commit_at");
+	const after = options.after ?? null;
+	const out: OutlineTreeSpaceRow[] = [];
+	if (!after || after.lastCommitAt !== null) {
+		const seek = after
+			? sql`and (${at} < ${after.lastCommitAt}
+					or (s.last_commit_at = ${after.lastCommitAt} and ${id} < ${after.id}))`
+			: sql``;
+		const rows = await all(sql`
+			select ${TREE_COLUMNS} from ${from}
+			where ${where} and s.last_commit_at is not null ${seek}
+			order by ${at} desc, ${id} desc
+			limit ${options.limit}
+		`);
+		for (const row of rows) out.push(toTreeSpace(row));
+	}
+	if (out.length < options.limit) {
+		const seek = after && after.lastCommitAt === null ? sql`and ${id} > ${after.id}` : sql``;
+		const rows = await all(sql`
+			select ${TREE_COLUMNS} from ${from}
+			where ${where} and s.last_commit_at is null ${seek}
+			order by ${id}
+			limit ${options.limit - out.length}
+		`);
+		for (const row of rows) out.push(toTreeSpace(row));
+	}
+	return out;
+}
+
+/** How many spaces a group of the connected outline has, counted up to `cap` and no further. */
+export async function countOutlineTreeSpaces(
+	principal: { userId: string; isAdmin: boolean },
+	scope: OutlineTreeScope,
+	cap: number,
+): Promise<number> {
+	const { from, where } = treeScopeSql(principal, scope);
+	const rows = await all(sql`
+		select count(*) as n from (select 1 as one from ${from} where ${where} limit ${cap}) t
+	`);
+	return Number(rows[0]?.n ?? 0);
 }
 
 /** A session a task may be handed to on the board (outline P2 PR 10a). */

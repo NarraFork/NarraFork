@@ -28,9 +28,16 @@ const { useChatUnread, useNarratorChatRoom, useChatUnreadLive, useChatRoomLive }
 	"./useChat"
 );
 const { useOutlineEnabled, useOutlineEnabledInCache } = await import("./useOutlineEnabled");
-const { useOutlineSpaces, useOutlineQuestionGroups, useOutlineQuestionsLive } = await import(
-	"./useOutline"
-);
+const {
+	useOutlineSpaces,
+	useOutlineTree,
+	useOutlineTreeSpaces,
+	useOutlineSpaceParent,
+	useOutlineBlock,
+	useOutlineTreePageLive,
+	useOutlineQuestionGroups,
+	useOutlineQuestionsLive,
+} = await import("./useOutline");
 const { useDeepSeekBalance } = await import("./useDeepSeekBalance");
 const { useOpencodeUsage } = await import("./useOpencodeUsage");
 const { useProviderBalance } = await import("./useProviderBalance");
@@ -79,8 +86,50 @@ function Probe() {
 	useChatUnreadLive();
 	useChatRoomLive("room");
 	useOutlineSpaces(true);
+	useOutlineTree(true);
+	useOutlineTreeSpaces({ kind: "project", projectId: "project" }, true);
+	useOutlineTreeSpaces({ kind: "loose" }, true);
+	useOutlineTreeSpaces({ kind: "orphaned" }, true);
+	useOutlineSpaceParent("space", true);
+	useOutlineBlock("space", "block", { view: "facts", bytes: 8192, enabled: true });
+	useOutlineTreePageLive(
+		{
+			pageId: "page",
+			seq: 1,
+			space: {
+				id: "space",
+				key: "SpaceKey",
+				kind: "personal",
+				projectId: null,
+				narratorId: null,
+				label: null,
+				mine: true,
+				orphaned: false,
+				lastSeq: 1,
+				canWrite: true,
+			},
+		},
+		false,
+		true,
+	);
 	useOutlineQuestionGroups(["block"]);
-	useOutlineQuestionsLive([]);
+	useOutlineQuestionsLive(
+		[
+			{
+				group: {
+					blockId: "block",
+					spaceId: "space",
+					spaceKey: "SpaceKey",
+					pageId: "page",
+					title: "Question",
+					isQuestion: true,
+				},
+				questions: [],
+				truncated: false,
+			},
+		],
+		true,
+	);
 	useDeepSeekBalance("provider", "generation", true);
 	useOpencodeUsage("provider", "generation", true);
 	useProviderBalance("provider", "generation", true);

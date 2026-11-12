@@ -161,6 +161,11 @@ export const outlineTaskBoardQuerySchema = z.object({
 	cursor: cursorSchema.optional(),
 });
 
+/** A page of a listing of the connected outline (`/outline/tree…`). */
+export const outlineTreeQuerySchema = z.object({
+	cursor: cursorSchema.optional(),
+});
+
 /** A space's next finished tasks. */
 export const outlineFinishedTasksQuerySchema = z.object({
 	cursor: cursorSchema.optional(),
@@ -201,6 +206,7 @@ export const outlineBoardOpenSessionBodySchema = z.object({
 	baseVersionSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
 	model: z.string().trim().min(1).max(256).optional(),
 	cwd: z.string().trim().min(1).max(4096).optional(),
+	previousDirectory: z.boolean().optional(),
 	note: z.string().max(OUTLINE_TASK_BOARD_LIMITS.maxOpenNoteChars).optional(),
 });
 

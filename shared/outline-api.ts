@@ -77,6 +77,63 @@ export interface OutlineSpaceSummary {
 export interface OutlineSpaceDetail extends OutlineSpaceSummary {
 	/** Whether the caller may change the space (and revert its commits). */
 	canWrite: boolean;
+	/**
+	 * A session space's place in the connected outline: the space of the session's project, when
+	 * that space exists and the caller may read the project. Absent or null otherwise (the session
+	 * belongs to no project, or the caller reads it without reading its project).
+	 */
+	parent?: { spaceId: string; label: string | null } | null;
+}
+
+/**
+ * The connected outline (`GET /outline/tree…`): limits of each listing. A node's children are
+ * read when it is opened, a page at a time; nothing here returns block content.
+ */
+export const OUTLINE_TREE_LIMITS = {
+	/** Project spaces per page of the tree's root. */
+	projects: 30,
+	/** Session spaces per page of a group. */
+	sessions: 20,
+	/** Pages of a space per page of its list. */
+	pages: 50,
+	/** Blocks and UTF-8 bytes one opened page reads; what is beyond is read by focusing it. */
+	pageBlocks: 200,
+	pageBytes: 64 * 1024,
+	/** A group counts its spaces up to this many (shown as one less with a plus beyond). */
+	countCap: 100,
+} as const;
+
+/** A space as a row of the connected outline. */
+export interface OutlineTreeSpace extends OutlineSpaceSummary {
+	/** When the space was last committed to; null when never, or not stamped yet. */
+	lastCommitAt: string | null;
+	/**
+	 * A project space: how many session spaces of the project the caller may read, counted up to
+	 * {@link OUTLINE_TREE_LIMITS.countCap}.
+	 */
+	sessions?: number;
+}
+
+/** The root of the connected outline: the caller's own space, then a page of project spaces. */
+export interface OutlineTreeResponse {
+	/** The caller's personal space; null when it does not exist yet, and on later pages. */
+	personal: OutlineTreeSpace | null;
+	/** Project spaces the caller may read, latest commit first. */
+	projects: OutlineTreeSpace[];
+	nextCursor: string | null;
+	/**
+	 * Session spaces the caller may read that hang under no listed project space, and (admins)
+	 * spaces whose owner is gone: counted up to {@link OUTLINE_TREE_LIMITS.countCap}. Zero on
+	 * later pages.
+	 */
+	loose: number;
+	orphaned: number;
+}
+
+/** A page of the session spaces of one group of the connected outline. */
+export interface OutlineTreeSpacesResponse {
+	spaces: OutlineTreeSpace[];
+	nextCursor: string | null;
 }
 
 export interface OutlineSpaceListResponse {

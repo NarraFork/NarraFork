@@ -23,6 +23,8 @@ const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots"
 // Bun's mock.module is process-wide; the real module is put back after this file.
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
 const providerInputs: string[] = [];
+/** What the model stand-in does in a turn besides replying (its tool calls, in effect). */
+let onTurn: (() => Promise<void>) | null = null;
 const testProvider: ProviderAdapter = {
 	formatTools: () => [],
 	buildHistory: rowsAsHistory,
@@ -30,6 +32,7 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		providerInputs.push(`${modelInputText(params as never)}\n${requestInput(params)}`);
 		params.onRequestStart?.();
+		await onTurn?.();
 		yield { text: "task turn ran" };
 	},
 	generate: async () => "",
@@ -64,6 +67,12 @@ const { readTestMessageContent } = await import("../../../tests/setup");
 const { startOutlineTeamEvents, settleOutlineTeamEventsForTests, OUTLINE_TEAM_SOURCE } =
 	await import("../outline/team-events");
 const { invalidateSessionReadScopes } = await import("../outline/session-scope");
+const { outlineRunEndsSettled } = await import("../outline/lease-keeper");
+const { isHandoffBlockId, OUTLINE_HANDOFF_ACTOR } = await import("../outline/handoff");
+const { OUTLINE_TASK_GRACE_LEASE_MS } = await import("../outline/model");
+// A run's end asks whether anything still works for the session in the background.
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
+await backgroundOccupancyStore.start();
 
 const NOW = "2026-11-10T00:00:00.000Z";
 
@@ -80,6 +89,7 @@ beforeEach(() => {
 	invalidateSessionReadScopes();
 	startOutlineTeamEvents();
 	providerInputs.length = 0;
+	onTurn = null;
 });
 
 async function person(): Promise<string> {
@@ -459,5 +469,97 @@ describe("转交并开始", () => {
 		});
 		expect(plain.status).toBe(200);
 		expect((await state(task.blockId)).assignee).toBe(`agent:${target}`);
+	});
+});
+
+describe("a handed-over task the session does not finish (outline P2 PR 10c-2)", () => {
+	const handoffsUnder = async (spaceId: string, blockId: string) =>
+		(await outlineStore.listChildren(spaceId, blockId, 50)).filter((child) =>
+			isHandoffBlockId(child.id),
+		);
+
+	test("「转交并开始」: a person picked this session, so its turn's end keeps the task for an hour, assignment intact", async () => {
+		const { owner, projectId, space } = await world();
+		const target = await session(owner, projectId, { continuation: "off" });
+		const task = await projectTask(space.id, owner, "Fix the flaky test");
+		const before = Date.now();
+		const response = await transfer(owner, task, {
+			assign: { kind: "narrator", narratorId: target },
+			start: true,
+		});
+		expect(await response.json()).toMatchObject({ started: true });
+		await waitIdleAfterTurns(target, 1);
+		await outlineRunEndsSettled(target);
+		expect(await state(task.blockId)).toEqual({
+			status: "doing",
+			assignee: `agent:${target}`,
+			holder: target,
+			epoch: 1,
+		});
+		const [claim] = await outlineStore.getTaskClaims([task.blockId]);
+		const lease = Date.parse(claim?.expiresAt as string) - before;
+		expect(lease).toBeGreaterThan(OUTLINE_TASK_GRACE_LEASE_MS - 5 * 60_000);
+		expect(lease).toBeLessThan(OUTLINE_TASK_GRACE_LEASE_MS + 5 * 60_000);
+		expect(await handoffsUnder(space.id, task.blockId)).toHaveLength(0);
+		closeNarrator(target);
+	});
+
+	test("an agent hands it over, the session is woken, takes it and ends its turn unfinished: given back at once, unassigned, with a handoff that tells and wakes nobody", async () => {
+		const { owner, projectId, space } = await world();
+		const giver = await session(owner, projectId, { title: "Giver" });
+		const target = await session(owner, projectId, { continuation: "off" });
+		const task = await projectTask(space.id, owner, "Tidy the changelog");
+		onTurn = async () => {
+			if ((await state(task.blockId)).holder === target) return;
+			await writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "setTask", block: { id: task.blockId }, task: { status: "doing" } }],
+				actor: { kind: "agent", id: target },
+				narratorId: target,
+				responsibleUserId: owner,
+			});
+		};
+		// An agent's hand-over (its own commit): the session is told and woken.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{
+					op: "setTask",
+					block: { id: task.blockId },
+					task: { assignee: `agent:${target}` },
+				},
+			],
+			actor: { kind: "agent", id: giver },
+			narratorId: giver,
+			responsibleUserId: owner,
+		});
+		await settleOutlineTeamEventsForTests();
+		await waitIdleAfterTurns(target, 1);
+		await outlineRunEndsSettled(target);
+		expect(await state(task.blockId)).toEqual({
+			status: "todo",
+			assignee: null,
+			holder: null,
+			epoch: 1,
+		});
+		expect(await handoffsUnder(space.id, task.blockId)).toHaveLength(1);
+		const block = await outlineStore.getBlock(task.blockId);
+		const [commit] = await outlineStore.getCommitsBySeqs(space.id, [block?.versionSeq as number]);
+		expect(commit).toMatchObject({ actorKind: "system", actorId: OUTLINE_HANDOFF_ACTOR });
+		// The release is the system's bookkeeping: no team row for anyone, no turn for anyone.
+		const told = { giver: await teamRows(giver), target: await teamRows(target) };
+		expect(told.giver).toEqual([]);
+		expect(told.target).toHaveLength(1);
+		await Bun.sleep(50);
+		await settleOutlineTeamEventsForTests();
+		expect(providerInputs).toHaveLength(1);
+		for (const id of [giver, target]) {
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { status: true },
+			});
+			expect(row?.status).toBe("idle");
+		}
+		closeNarrator(target);
 	});
 });

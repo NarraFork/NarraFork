@@ -394,11 +394,13 @@ export interface PgFinalizeTakeoverInput {
 export interface PgStaleTaskRow {
 	readonly id: string;
 	readonly type: string;
+	readonly backgroundKind?: string;
 	readonly parentNarratorId: string;
 	readonly subagentNarratorId: string | null;
 	readonly logicalRunId: string | null;
 	readonly toolCallId: string | null;
 	readonly executionAttempt: number | null;
+	readonly command?: string | null;
 }
 
 export interface PgRecoverStaleTaskInput {
@@ -1773,11 +1775,13 @@ export function createPostgresRuntimePublication(
 					.select({
 						id: backgroundTasks.id,
 						type: backgroundTasks.type,
+						backgroundKind: backgroundTasks.backgroundKind,
 						parentNarratorId: backgroundTasks.parentNarratorId,
 						subagentNarratorId: backgroundTasks.subagentNarratorId,
 						logicalRunId: backgroundTasks.logicalRunId,
 						toolCallId: backgroundTasks.toolCallId,
 						executionAttempt: backgroundTasks.executionAttempt,
+						command: backgroundTasks.command,
 					})
 					.from(backgroundTasks)
 					.where(

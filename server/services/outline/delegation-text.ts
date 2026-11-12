@@ -217,6 +217,13 @@ export const TASK_BRIEF_TEXT = {
 		`Address: \`${address}\` · claimed for this session (claim generation ${epoch})`,
 		"This is the opening brief of a session opened to do this task. The system put it together from the outline as it was when the session was opened; it is not what a person said, and it is not updated afterwards.",
 	],
+	/** The handoffs of the sessions that had the task before (outline P2 PR 10c-2). */
+	handoff: "## Handoff from the previous session",
+	handoffNote: (times: number) =>
+		`This task was given back unfinished ${times === 1 ? "once" : `${times} times`}. The newest handoff follows; continue from it rather than starting over.`,
+	handoffNotes: "The notes it points to, in full:",
+	handoffNoteAt: (address: string) => `- \`${address}\``,
+	handoffEarlier: "Earlier handoffs (their first lines):",
 	background: "## Background (the tasks above this one)",
 	ancestor: (title: string) => `- ${title}`,
 	siblings: "  - Its tasks, with this one among them:",

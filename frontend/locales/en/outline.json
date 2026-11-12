@@ -28,12 +28,8 @@
 			"session": "Session"
 		},
 		"orphaned": "Owner removed",
-		"commits_one": "{{count}} commit",
-		"commits_other": "{{count}} commits",
 		"readOnly": "Read only",
-		"searchPlaceholder": "Search this space",
-		"pages": "Pages",
-		"noPages": "No pages yet. Agents and editors add them here."
+		"searchPlaceholder": "Search this space"
 	},
 	"page": {
 		"task": {
@@ -530,6 +526,8 @@
 			"tasksStarted_other": "{{count}} started",
 			"leaseReturned_one": "{{count}} given back when its session stopped",
 			"leaseReturned_other": "{{count}} given back when their sessions stopped",
+			"handedBack_one": "{{count}} handed back unfinished, with a handoff note",
+			"handedBack_other": "{{count}} handed back unfinished, with handoff notes",
 			"reviewComments_one": "the plan review left comments {{count}} time",
 			"reviewComments_other": "the plan review left comments {{count}} times"
 		},
@@ -579,6 +577,11 @@
 		"humanCreated": "Set by a person",
 		"newlyDone": "Newly done",
 		"newlyDoneHint": "An agent finished this task you created. The mark goes once you have seen it.",
+		"handoffs_one": "Handoff · {{count}} time",
+		"handoffs_other": "Handoff · {{count}} times",
+		"handoffsHint": "A session gave this task back unfinished and left a handoff note under it. The next session continues from that note.",
+		"handoffsManyHint_one": "This task has been given back {{count}} time. Read the handoff notes before opening another session for it.",
+		"handoffsManyHint_other": "This task has been given back {{count}} times. Read the handoff notes before opening another session for it.",
 		"locked": "Locked · {{name}}",
 		"lockedSomeone": "Locked",
 		"waitPrerequisites": "Waits for {{count}} prerequisite(s)",
@@ -665,6 +668,7 @@
 			"model": "Model",
 			"cwd": "Working directory",
 			"cwdPlaceholder": "The project's directory",
+			"previousDirectory": "Continue in the previous session's directory",
 			"note": "Further instructions",
 			"notePlaceholder": "Optional: added to the session's brief as written",
 			"submit": "Open session",
@@ -688,5 +692,23 @@
 				"unreadable": "The new session could not read this project's outline, so it was not given the task. Check the project's and the sessions' visibility settings."
 			}
 		}
+	},
+	"tree": {
+		"hint": "Open anything in place to read it; open a page's title to edit it.",
+		"collapseAll": "Collapse all",
+		"recent": "Recently visited ({{count}})",
+		"sessions": "Sessions ({{count}})",
+		"sessionsUncounted": "Sessions",
+		"loose": "Sessions outside projects ({{count}})",
+		"orphaned": "Spaces without an owner ({{count}})",
+		"noSessions": "No sessions you can read.",
+		"noPages": "No pages yet.",
+		"moreSpaces_one": "{{count}} more ▸",
+		"moreSpaces_other": "{{count}} more ▸",
+		"moreProjects": "More projects ▸",
+		"gone": "No longer available.",
+		"partial_one": "Showing the first {{count}} block of this page here.",
+		"partial_other": "Showing the first {{count}} blocks of this page here.",
+		"openPage": "Open the page"
 	}
 }

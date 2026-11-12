@@ -4,7 +4,7 @@
  * when the input is large (`edit-text-runner.ts`): normalizing a block costs tens of
  * milliseconds per 16 KiB, and agent input is untrusted.
  *
- * FIVE JOBS
+ * THE JOBS
  * ---------
  *   - `parse`: a markdown outline (an `add`) or the text of one block (a `replace`) becomes
  *     items with canonical content. Read annotations (`‹…›` lines) are dropped first, and the
@@ -26,6 +26,9 @@
  *   - `report`: a delegated subagent's report becomes the blocks attached under its task
  *     (`report-text.ts`, outline P2 PR 9a): headings hold their sections, nothing in it is read
  *     as outline syntax, and it is cut to what one commit may carry.
+ *   - `notes`: a whole text becomes blocks the same way, nothing left out (the import of Dynamic
+ *     Spec files, outline P2 PR 12b); the caller bounds it and runs it on the background channel.
+ *   - `taskTexts`: the task texts of that import, kept as written ({@link importTaskText}).
  *
  * Every content returned is canonical (`normalizeBlock(content).content === content`), with the
  * links `contentLinks` would read from it: what `writeOutline` takes as `canonical` content.
@@ -50,7 +53,12 @@ import {
 } from "@shared/outline";
 import { bodyLinks, type ExtractedLink } from "./links";
 import { stripReadAnnotations } from "./render";
-import { convertReport, type ReportConversion } from "./report-text";
+import {
+	convertNotes,
+	convertReport,
+	type NotesConversion,
+	type ReportConversion,
+} from "./report-text";
 
 /**
  * A label a read puts after a bullet: a block's sid (8 letters and digits), or `key/sid` where a
@@ -177,7 +185,26 @@ export type EditTextJob =
 			text: string;
 			/** The marker in front of the pieces of a block cut in several. */
 			continued: string;
+	  }
+	| {
+			/**
+			 * A whole text as blocks, nothing left out (`convertNotes`): a Dynamic Spec file being
+			 * imported (`spec-import/`). Run on the background channel only.
+			 */
+			kind: "notes";
+			text: string;
+			continued: string;
+			/** Not markdown: code blocks in this language. */
+			code?: string | null;
+	  }
+	| {
+			/** Task texts of the Dynamic Spec import, kept as written ({@link importTaskText}). */
+			kind: "taskTexts";
+			contents: string[];
 	  };
+
+/** A task text as the import writes it; null: left to the write path ({@link importTaskText}). */
+export type EditTextTaskText = { content: string; links: ExtractedLink[] } | null;
 
 export type EditTextResult<J extends EditTextJob> = J extends { kind: "parse" }
 	? EditTextParsed[]
@@ -187,7 +214,11 @@ export type EditTextResult<J extends EditTextJob> = J extends { kind: "parse" }
 			? EditTextMerged[]
 			: J extends { kind: "report" }
 				? ReportConversion
-				: EditTextRewritten[];
+				: J extends { kind: "notes" }
+					? NotesConversion
+					: J extends { kind: "taskTexts" }
+						? EditTextTaskText[]
+						: EditTextRewritten[];
 
 /** UTF-8 bytes of the text a job carries. */
 export function editTextJobBytes(job: EditTextJob): number {
@@ -195,7 +226,7 @@ export function editTextJobBytes(job: EditTextJob): number {
 	if (job.kind === "parse") for (const input of job.inputs) bytes += utf8(input.text);
 	else if (job.kind === "merge")
 		for (const m of job.merges) bytes += utf8(m.base) + utf8(m.mine) + utf8(m.theirs);
-	else if (job.kind === "report") bytes += utf8(job.text);
+	else if (job.kind === "report" || job.kind === "notes") bytes += utf8(job.text);
 	else for (const content of job.contents) bytes += utf8(content);
 	return bytes;
 }
@@ -214,6 +245,9 @@ export function runEditTextJob<J extends EditTextJob>(job: J): EditTextResult<J>
 	}
 	if (job.kind === "merge") return job.merges.map(mergeContent) as EditTextResult<J>;
 	if (job.kind === "report") return convertReport(job) as EditTextResult<J>;
+	if (job.kind === "notes") return convertNotes(job) as EditTextResult<J>;
+	if (job.kind === "taskTexts")
+		return job.contents.map((content) => importTaskText(content)) as EditTextResult<J>;
 	return job.contents.map((content) => rewriteContent(content, job.targets)) as EditTextResult<J>;
 }
 
@@ -235,6 +269,27 @@ function normalizeContent(src: string): EditTextNormalized {
 		links: bodyLinks(parseBlock(normalized.content).body),
 		split: normalized.children.map(splitNode),
 	};
+}
+
+/**
+ * A Dynamic Spec task's text as the import writes it (outline P2 PR 12b): the text as written.
+ * When normalizing it changes nothing but the surrounding whitespace, it is that canonical text,
+ * which is also what `/goal` and the plugin commands write and dedupe by for the same text. When
+ * normalizing would change what it says (`2. step` losing its number, `&amp;` decoded, `- [ ] x`
+ * losing its box), it is written as plain text, escaped so it reads back exactly as written.
+ * Null when neither holds (a text of several paragraphs): the write path splits it as it splits
+ * the same text from `/goal`, the first paragraph the task and the rest under it, nothing lost.
+ */
+export function importTaskText(src: string): EditTextTaskText {
+	const text = src.trim();
+	const normalized = normalizeContent(src);
+	if (normalized.split.length === 0 && normalized.content === text)
+		return { content: normalized.content, links: normalized.links };
+	if (/\n[ \t]*\n/.test(text)) return null;
+	const plain = serializeBody({ type: "paragraph", content: [{ type: "text", text, marks: [] }] });
+	const again = normalizeContent(plain);
+	if (again.split.length > 0 || again.content !== plain) return null;
+	return { content: again.content, links: again.links };
 }
 
 /**

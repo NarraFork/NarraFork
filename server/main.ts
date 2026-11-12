@@ -1331,6 +1331,11 @@ void startupReadiness.barrier.then(() => {
 			return repushRecentOutlineTeamEvents();
 		})
 		.catch((err) => logger.warn("Outline team events failed to start", { error: String(err) }));
+	// Sessions that still keep their tasks in Dynamic Spec are imported into the outline while
+	// they are idle (a pass a minute after start, then at intervals; one session at a time).
+	import("./services/outline/spec-import/triggers")
+		.then(({ startSpecImportJob }) => startSpecImportJob())
+		.catch((err) => logger.warn("Dynamic Spec import job failed to start", { error: String(err) }));
 	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
 	import("./services/outline/plugin-task-events")
 		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
@@ -1544,7 +1549,9 @@ async function performGracefulShutdown(
 				const tasks = await import("./services/outline/tasks");
 				const inProcess = await import("./services/outline/in-process");
 				const digests = await import("./services/outline/digest-job");
+				const specImport = await import("./services/outline/spec-import/triggers");
 				await Promise.all([
+					specImport.stopSpecImportJob(),
 					inProcess.stopOutlineInProcessRebuild(),
 					tasks.stopOutlineTaskLeaseJob(),
 					digests.stopOutlineDigestJob(),

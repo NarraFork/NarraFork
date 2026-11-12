@@ -799,6 +799,24 @@ describe("behavior_rules_set", () => {
 		const fence = (await readSpecFile(id, "spec://behavior_fence")).content;
 		expect(fence).toBe("Own rule.");
 	});
+
+	test("an SOP its block cannot hold whole stays in the fence untouched; the plugin's own rules are written (12b review SF1)", async () => {
+		const id = await session();
+		// More top-level blocks than one block takes whole: it would be cut.
+		const sop = Array.from({ length: 260 }, (_, i) => `Paragraph ${i}.`).join("\n\n");
+		const original = `Own rule.\n\n${TEAM_SOP_OPEN}\n${sop}\n${TEAM_SOP_CLOSE}`;
+		settings.outline.enabled = false;
+		await writeSpecFile(id, "spec://behavior_fence", original, { actor: "user" });
+		settings.outline.enabled = true;
+		const before = (await readSpecFile(id, "spec://behavior_fence")).content;
+		await ok("behavior_rules_set", { narratorId: id, mode: "upsert", text: "Lead rules." });
+		expect((await rules(id))?.children.map(([c]) => c)).toEqual(["Lead rules."]);
+		// No cut copy on the page, and the fence still holds every paragraph.
+		expect(await rules(id, TEAM_SOP_PLUGIN_ID)).toBeNull();
+		const fence = (await readSpecFile(id, "spec://behavior_fence")).content;
+		expect(fence).toBe(before);
+		expect(fence).toContain("Paragraph 259.");
+	});
 });
 
 describe("an SOP left in the old fence", () => {

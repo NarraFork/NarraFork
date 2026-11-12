@@ -40,6 +40,7 @@ import { SessionTaskBoard } from "../../outline/task-board/TaskBoardViews";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
+import { SpecImportBanner } from "./SpecImportBanner";
 import { SpecTaskBoard } from "./SpecTaskBoard";
 import type { SpecEditorMode } from "./spec-editor-mode";
 import { registerSpecFileSelector } from "./spec-file-reveal";
@@ -460,7 +461,11 @@ function SpecFilesPanel({
 				</Group>
 			)}
 
-			{onBackToBoard && <BackToBoard onClick={onBackToBoard} />}
+			{onBackToBoard ? (
+				<BackToBoard onClick={onBackToBoard} />
+			) : (
+				<SpecImportBanner narratorId={narratorId} />
+			)}
 			{/* File tabs */}
 			<Box px="xs" py={6} style={{ flexShrink: 0 }}>
 				<SpecFileTabStrip
