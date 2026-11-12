@@ -1,4 +1,5 @@
 import { type Locale, type LocalizedValue, pickLocalizedValue } from "@shared/i18n-locales";
+import { OUTLINE_NOTE_RULES } from "@shared/outline-note-structure";
 import type { OutlineTaskNoticeChange } from "@shared/outline-task-notice";
 
 // ─── Outline tasks ───
@@ -14,6 +15,12 @@ import type { OutlineTaskNoticeChange } from "@shared/outline-task-notice";
 // what does not change while a session runs (design §0, the three conventions); live task state
 // reaches the model through the views (named context parts, updated when they change) and tool
 // results. The views' text is deterministic (fixed order, no times): it is also their change key.
+//
+// Convention 1 states how a note under a task is written (task tree readability PR D, decision
+// D53: conclusion, then evidence, then detail) with the numbers `OutlineEdit` checks
+// (`@shared/outline-note-structure`): constants, so the text is the same every turn.
+
+const { titleChars, noteChars, detailChars, maxChildren } = OUTLINE_NOTE_RULES;
 
 /** One task as the outline prompts name it. */
 export interface OutlineTaskPromptTask {
@@ -30,7 +37,7 @@ const systemReminder: LocalizedValue<string> = {
 # Outline
 
 This session keeps its notes and tasks in the outline: read with OutlineRead and OutlineSearch, write with OutlineEdit. A task is a block with a checkbox: \`[ ]\` to do, \`[/]\` in progress, \`[x]\` done, \`[-]\` cancelled. Tasks you set yourself go in this session's space (\`session/\`). Three conventions:
-1. Write what will be needed later into the outline: conclusions, decisions, pitfalls, plans. Writing it under the task at hand is enough.
+1. Write what will be needed later into the outline: conclusions, decisions, pitfalls, plans. Write it under the task at hand, conclusion first: each block directly under a task is one conclusion in one line (at most ${noteChars} characters); its evidence (file:line, the commands you ran and their results) goes in blocks under that conclusion, and details under those (each at most ${detailChars} characters, at most ${maxChildren} blocks on one level). Do not record the process (what you looked at, what you tried): the conversation has it. No markdown headings: levels are the indentation. A task's title is one line (at most ${titleChars} characters) saying what done means. A finished task shows as its title and the first line under it, so when you tick a task done, its first block must say the result in one line.
 2. When you start a task, tick it in progress; when it is done, tick it done. When a person has to decide something, ask them and give your recommendation.
 3. When a tool says a change was handed to someone for confirmation, do the parts it does not affect first.
 
@@ -44,7 +51,7 @@ The system keeps two views in your context and updates them when they change: th
 # 大纲
 
 本会话的笔记和任务都在大纲里：用 OutlineRead、OutlineSearch 读，用 OutlineEdit 写。任务就是带复选框的块：\`[ ]\` 待办、\`[/]\` 进行中、\`[x]\` 完成、\`[-]\` 取消。你给自己定的任务写在本会话的空间里（\`session/\`）。三条约定：
-1. 以后还用得到的写进大纲：结论、决定、坑、计划。写在手头的任务下面就行。
+1. 以后还用得到的写进大纲：结论、决定、坑、计划。写在手头的任务下面，按「结论 → 依据 → 细节」：任务下第一层每块是一行结论（不超过 ${noteChars} 字）；依据（文件:行、跑过的命令和结果）写成这条结论的子块，细节再往下一层（每块不超过 ${detailChars} 字，一层不超过 ${maxChildren} 块）。不写过程（先看了什么、又试了什么）：过程在会话记录里。不用 markdown 标题，层次用缩进表达。任务标题只写一行（不超过 ${titleChars} 字），说清做成什么算完成。完成的任务收起后只显示标题和它下面的第一行，所以勾完成时，任务下第一块要是一行结果。
 2. 开始做一个任务就把它勾成进行中，做完勾成完成；需要人决定的，提问并附上你的建议。
 3. 工具说改动「已交给某人确认」时，先做不受影响的部分。
 
