@@ -714,8 +714,12 @@ async function writeEverything(
 	}
 
 	// What an earlier attempt wrote from another source goes first (step 2).
+	// An empty `index.md` (the built-in file every namespace starts with) is no page: the page
+	// the compatibility layer would write for it holds nothing.
 	const notePointers: Array<SpecImportFilePointer & { revisionId: string }> = notes.flatMap((p) =>
-		p.revisionId ? [{ ...p, revisionId: p.revisionId }] : [],
+		p.revisionId && !(p.path === "index.md" && (p.chars ?? 0) === 0)
+			? [{ ...p, revisionId: p.revisionId }]
+			: [],
 	);
 	const keep = new Set(
 		[...notePointers, ...(brokenTasks !== null && tasksFile?.revisionId ? [tasksFile] : [])].map(
