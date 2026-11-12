@@ -740,6 +740,9 @@ export function BinaryFilePreview({
 			key={url}
 			options={options}
 			embedded
+			// Clicking the picture itself opens the same enlarged view as the toolbar
+			// button — the file browser's most natural "look closer" gesture.
+			onImageClick={() => openImageViewer(options)}
 			onFullscreen={() => openImageViewer(options)}
 			onError={() => setError(t("filePreview_loadError"))}
 		/>
