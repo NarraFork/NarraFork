@@ -245,24 +245,26 @@ describe("the idle job", () => {
 });
 
 describe("the shipped default", () => {
-	test("is manual: no run and no idle pass imports, the button does", async () => {
-		expect(DEFAULTS.outline.specImport).toBe("manual");
+	test("is auto (12b2): the start of a run and the idle job import, the button too", async () => {
+		expect(DEFAULTS.outline.specImport).toBe("auto");
 		settings.outline.specImport = undefined;
-		const { id } = await makeSession();
-		await writeTasks(id, [{ text: "a" }]);
-		expect(await importSpecAtRunStart(id, { subagentsRunning: () => false })).toBeNull();
-		expect(await runSpecImportPass({ pauseMs: 0 })).toEqual({
-			seen: 0,
-			imported: 0,
-			left: 0,
-			givenUp: 0,
-		});
-		expect(await backendOf(id)).toBe("spec");
-		expect((await specImportStatus(id)).mode).toBe("manual");
-		await requestSpecImport(id);
+		const run = await makeSession();
+		await writeTasks(run.id, [{ text: "a" }]);
+		expect((await specImportStatus(run.id)).mode).toBe("auto");
+		expect((await importSpecAtRunStart(run.id, { subagentsRunning: () => false }))?.status).toBe(
+			"imported",
+		);
+		expect(await backendOf(run.id)).toBe("outline");
+		const idle = await makeSession();
+		await writeTasks(idle.id, [{ text: "b" }]);
+		await runSpecImportPass({ pauseMs: 0 });
+		expect(await backendOf(idle.id)).toBe("outline");
+		const pressed = await makeSession();
+		await writeTasks(pressed.id, [{ text: "c" }]);
+		await requestSpecImport(pressed.id);
 		await settleSpecImportRequests();
-		expect(await backendOf(id)).toBe("outline");
-	});
+		expect(await backendOf(pressed.id)).toBe("outline");
+	}, 30_000);
 });
 
 describe("the button", () => {
