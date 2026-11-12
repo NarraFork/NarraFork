@@ -33,6 +33,18 @@ export function communicationInputField(inputJson: unknown, field: string): unkn
 	return Object.hasOwn(settled, field) ? settled[field] : input[field];
 }
 
+/**
+ * Agent-to-agent messages compact into tool rows only at L1/L2. From L3 up every
+ * message is a bubble, whatever `show_to_user` says: that flag only decides which
+ * bubbles SURVIVE the two lowest levels.
+ */
+export function compactsCommunication(
+	compactAuxiliaryContent: boolean | undefined,
+	lod: number,
+): boolean {
+	return compactAuxiliaryContent === true && lod <= 2;
+}
+
 /** Display policy only. Internal communication remains an ordinary, inspectable tool row. */
 export function shouldShowCommunicationBubble(
 	tool: { toolName: string; inputJson?: unknown },
