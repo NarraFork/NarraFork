@@ -704,10 +704,15 @@ describe("the hour after a person's run is the person's", () => {
 		await start(p.space.id, s, [task]);
 		await run(s, 60_000, { natural: true, person: true });
 
-		// Only the keeper remembers (the claim's hour forgotten): still not given back.
+		// Only the keeper remembers (the claim's hour forgotten): still not given back, and put
+		// on the person's hour (not a new one from this run's end).
 		resetOutlineGraceLeasesForTests();
 		await run(s, 10 * 60_000, { natural: true, person: false });
-		expect(await stateOf(task)).toMatchObject({ status: "doing", holder: s });
+		expect(await stateOf(task)).toMatchObject({
+			status: "doing",
+			holder: s,
+			expiresAt: at(60_000 + OUTLINE_TASK_GRACE_LEASE_MS).toISOString(),
+		});
 		expect(await handoffsUnder(task)).toHaveLength(0);
 		// Only the claim's hour is remembered (the keeper forgot the person's run): the same.
 		const hour = (await stateOf(task)).expiresAt;
