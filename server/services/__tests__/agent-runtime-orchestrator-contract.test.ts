@@ -442,11 +442,18 @@ describe("tool Git status refresh", () => {
 });
 
 describe("outline task leases", () => {
-	test("a run keeps its session's leases alive from its start through its tool boundaries, and puts them on the idle lease at its end", async () => {
+	test("a run keeps its session's leases alive from its start through its tool boundaries, and settles its claims at its end", async () => {
 		const tasks = await import("../outline/tasks");
-		const { outlineLeaseKeepersOf } = await import("../outline/lease-keeper");
+		const release = await import("../outline/release");
+		const { outlineLeaseKeepersOf, outlineRunEndsSettled } = await import(
+			"../outline/lease-keeper"
+		);
 		const renew = spyOn(tasks, "renewOutlineTaskLeases").mockResolvedValue(0);
-		const idle = spyOn(tasks, "idleOutlineTaskClaims").mockResolvedValue(0);
+		const settled = spyOn(release, "settleOutlineTaskClaimsAtRunEnd").mockResolvedValue({
+			kept: 0,
+			grace: 0,
+			released: 0,
+		});
 		const enabled = settings.outline.enabled;
 		settings.outline.enabled = true;
 		let during = -1;
@@ -476,12 +483,342 @@ describe("outline task leases", () => {
 		expect(renew.mock.calls.every(([narratorId]) => narratorId === h.session.narratorId)).toBe(
 			true,
 		);
-		// The run's end (between turns, D41): once, for this session (not waited for by the run).
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(idle).toHaveBeenCalledTimes(1);
-		expect(idle.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+		// The run's end (between turns, D41; P2 PR 10c-2): once, for this session (not waited for by
+		// the run), told how the run ended and with the session's last reply.
+		await outlineRunEndsSettled(h.session.narratorId);
+		expect(settled).toHaveBeenCalledTimes(1);
+		expect(settled.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+		// Nothing said who started it: a person's run, which gives nothing back at once.
+		expect(settled.mock.calls[0]?.[1]).toMatchObject({ natural: false, person: true });
 		renew.mockRestore();
-		idle.mockRestore();
+		settled.mockRestore();
+	});
+	/**
+	 * How the run's end is told to the release (outline P2 PR 10c-2): `natural` (only then are the
+	 * session's unfinished team tasks given back at once) and `person`, by who started the run and
+	 * how it ended. Each case runs the real loop and reads what `release.ts` was handed.
+	 */
+	describe("what the release is told of a run's end", () => {
+		type Script = Parameters<typeof fixture>[1];
+		async function endOf(
+			script: Script,
+			options: {
+				by?: "person" | "system";
+				text?: string;
+				forTaskId?: string;
+				during?: (h: ReturnType<typeof fixture>, run: Promise<unknown>) => Promise<void>;
+				profile?: Shape;
+			} = {},
+		) {
+			const release = await import("../outline/release");
+			const { outlineRunEndsSettled, resetOutlinePersonRunEndsForTests } = await import(
+				"../outline/lease-keeper"
+			);
+			resetOutlinePersonRunEndsForTests();
+			const settled = spyOn(release, "settleOutlineTaskClaimsAtRunEnd").mockResolvedValue({
+				kept: 0,
+				grace: 0,
+				released: 0,
+			});
+			const enabled = settings.outline.enabled;
+			settings.outline.enabled = true;
+			const h = fixture(options.profile ?? profiles[0], script);
+			// What the entry point says (`runAgentLoop`): taken by the run when it starts.
+			if (options.by) h.session._runInitiatedBy = options.by;
+			if (options.forTaskId) h.session._runForTaskId = options.forTaskId;
+			try {
+				const run = h.run(options.text ?? "");
+				if (options.during) await options.during(h, run);
+				await run;
+				await outlineRunEndsSettled(h.session.narratorId);
+				expect(settled).toHaveBeenCalledTimes(1);
+				expect(settled.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+				// Taken, not left for the next run.
+				expect(h.session._runInitiatedBy).toBeUndefined();
+				expect(h.session._runForTaskId).toBeUndefined();
+				return settled.mock.calls[0]?.[1];
+			} finally {
+				settings.outline.enabled = enabled;
+				settled.mockRestore();
+			}
+		}
+
+		test("a person's message: not natural, a person's", async () => {
+			expect(await endOf([finished], { by: "person", text: "do this" })).toMatchObject({
+				natural: false,
+				person: true,
+			});
+		});
+
+		test("a subagent's run is never a person's hour of its own (its claims pass to its root)", async () => {
+			expect(
+				await endOf([finished], { by: "person", text: "do this", profile: profiles[1] }),
+			).toMatchObject({ person: false });
+		});
+
+		test("a person's Continue or Retry carries no text and is still a person's", async () => {
+			expect(await endOf([finished], { by: "person", text: "" })).toMatchObject({
+				natural: false,
+				person: true,
+			});
+		});
+
+		test("a system run that ends by itself: natural, with the task it was started for and its last reply", async () => {
+			expect(await endOf([finished], { by: "system", forTaskId: "task-1" })).toEqual({
+				natural: true,
+				person: false,
+				reply: "finished",
+				forTaskId: "task-1",
+				personHourUntil: null,
+			});
+		});
+
+		test("a system run with text (a wake that carries its content) is still the system's", async () => {
+			expect(await endOf([finished], { by: "system", text: "a notice" })).toMatchObject({
+				natural: true,
+				person: false,
+			});
+		});
+
+		test("a system run a person's queued message joined: a person's", async () => {
+			const end = await endOf([finished, finished], {
+				by: "system",
+				during: async (h) => {
+					setRunHold(h.session.narratorId, { released: false });
+					const deadline = Date.now() + 3_000;
+					while (!h.runControl.wake) {
+						if (Date.now() > deadline) throw new Error("Held run never parked");
+						await new Promise((resolve) => setTimeout(resolve, 2));
+					}
+					const { enqueueBufferedMessage } = await import("../narrator-buffer");
+					expect((await enqueueBufferedMessage(h.session.narratorId, "one more thing")).ok).toBe(
+						true,
+					);
+					setRunHold(h.session.narratorId, { released: true });
+					h.runControl.wake?.("input");
+				},
+			});
+			expect(end).toMatchObject({ natural: false, person: true });
+		});
+
+		test("a system run that was stopped: not natural", async () => {
+			let session: ActiveNarrator | undefined;
+			const end = await endOf(
+				[
+					async () => {
+						session?.abortController.abort();
+						return { ...finished, aborted: true, completedNaturally: false };
+					},
+				],
+				{
+					by: "system",
+					during: async (h) => {
+						session = h.session;
+					},
+				},
+			);
+			expect(end).toMatchObject({ natural: false, person: false });
+		});
+
+		test("a system run that failed: not natural", async () => {
+			const end = await endOf(
+				[
+					{
+						...finished,
+						completedNaturally: false,
+						paymentRequired: { message: "fixture balance exhausted", resumeAction: "retry" },
+					},
+				],
+				{ by: "system" },
+			);
+			expect(end).toMatchObject({ natural: false, person: false });
+		});
+
+		test("a system run that ends while something still works for the session in the background: not natural", async () => {
+			const { backgroundTaskService } = await import("../background-task-service");
+			const busy = spyOn(backgroundTaskService, "countActiveKindsByParent").mockResolvedValue({
+				activeCount: 1,
+				activeWorkCount: 1,
+				activeServiceCount: 0,
+			});
+			try {
+				expect(await endOf([finished], { by: "system" })).toMatchObject({
+					natural: false,
+					person: false,
+				});
+			} finally {
+				busy.mockRestore();
+			}
+		});
+
+		for (const kind of ["agent_message", "task_notice", "user_input"] as const)
+			test(`a system run that ends with a ${kind} waiting to start the next: not natural`, async () => {
+				const inbox = await import("../agent-runtime/inbox");
+				const real = inbox.hasInboxKind;
+				// Only the run end's own question (all three kinds) is answered here.
+				const waiting = spyOn(inbox, "hasInboxKind").mockImplementation(async (id, kinds) =>
+					kinds.length === 3 ? kinds.includes(kind) : real(id, kinds),
+				);
+				try {
+					expect(await endOf([finished], { by: "system" })).toMatchObject({
+						natural: false,
+						person: false,
+					});
+				} finally {
+					waiting.mockRestore();
+				}
+			});
+
+		test("a person acting inside a system run (a permission, a plan, a question resolved) makes it a person's", async () => {
+			let session: ActiveNarrator | undefined;
+			const end = await endOf(
+				[
+					async () => {
+						// What `resolvePermission` does when a person decides.
+						if (session) session._runPersonActed = true;
+						return finished;
+					},
+				],
+				{
+					by: "system",
+					during: async (h) => {
+						session = h.session;
+					},
+				},
+			);
+			expect(end).toMatchObject({ natural: false, person: true });
+		});
+
+		test("a system run that ends with a question a person has yet to answer: not natural", async () => {
+			const questions = await import("../narrator-question-service");
+			const open = spyOn(questions, "countOpenAsyncQuestions").mockResolvedValue(1);
+			try {
+				expect(await endOf([finished], { by: "system" })).toMatchObject({
+					natural: false,
+					person: false,
+				});
+			} finally {
+				open.mockRestore();
+			}
+		});
+
+		const noteCases: Array<[string, "person" | "system", boolean, () => Promise<() => void>]> = [
+			["the system's run that ends by itself", "system", true, async () => () => {}],
+			["a person's run", "person", false, async () => () => {}],
+			[
+				"the system's run with a question open",
+				"system",
+				false,
+				async () => {
+					const questions = await import("../narrator-question-service");
+					const open = spyOn(questions, "countOpenAsyncQuestions").mockResolvedValue(1);
+					return () => open.mockRestore();
+				},
+			],
+			[
+				"the system's run inside a person's hour",
+				"system",
+				false,
+				async () => {
+					const keeper = await import("../outline/lease-keeper");
+					const hour = spyOn(keeper, "outlinePersonHourRunning").mockReturnValue(true);
+					return () => hour.mockRestore();
+				},
+			],
+		];
+		for (const [name, by, expected, arrange] of noteCases)
+			test(`the turn-end note is told team tasks are given back only when they will be: ${name} → ${expected}`, async () => {
+				const session = await import("../narrator-session");
+				const note = spyOn(session, "decideOutlineTurnEndNote").mockResolvedValue(null);
+				const restore = await arrange();
+				try {
+					await endOf([finished], { by });
+					expect(note.mock.calls.at(-1)?.[1]?.givingBackTeamTasks).toBe(expected);
+				} finally {
+					restore();
+					note.mockRestore();
+				}
+			});
+
+		test("a person's decision on a permission marks the run of the session asking and of the one it shows on; an automatic one does not", async () => {
+			const { pendingPermissions } = await import("../narrator-session-state");
+			const { resolvePermission } = await import("../narrator-permission");
+			const asking = active("contract-person-asking");
+			const parent = active("contract-person-parent");
+			activeNarrators.set(asking.narratorId, asking);
+			activeNarrators.set(parent.narratorId, parent);
+			const pend = (requestId: string) =>
+				pendingPermissions.set(requestId, {
+					narratorId: asking.narratorId,
+					broadcastTargetId: parent.narratorId,
+					toolName: "Bash",
+					toolUseId: `${requestId}-use`,
+					input: {},
+					resolve: () => {},
+					cleanup: () => {},
+				} as never);
+			try {
+				pend("contract-person-auto");
+				await resolvePermission("contract-person-auto", "allow", { decidedBy: "auto" }).catch(
+					() => false,
+				);
+				expect(asking._runPersonActed).toBeUndefined();
+				expect(parent._runPersonActed).toBeUndefined();
+				pend("contract-person-user");
+				await resolvePermission("contract-person-user", "allow", { userId: "principal-a" }).catch(
+					() => false,
+				);
+				expect(asking._runPersonActed).toBe(true);
+				expect(parent._runPersonActed).toBe(true);
+			} finally {
+				pendingPermissions.delete("contract-person-auto");
+				pendingPermissions.delete("contract-person-user");
+				activeNarrators.delete(asking.narratorId);
+				activeNarrators.delete(parent.narratorId);
+			}
+		});
+
+		test("the next pass of a run that waited (`prepareQueuedRunInput`): a wake delivered is the system's, a person's queued message theirs", async () => {
+			const session = await import("../narrator-session");
+			const h = fixture(profiles[0], []);
+			// Read afresh each time (a set value would narrow the property's type).
+			const initiatedBy = (): string | undefined => h.session._runInitiatedBy;
+			// A pass before left its own word behind: the next pass never inherits it.
+			h.session._runInitiatedBy = "person";
+			h.session._runForTaskId = "task-1";
+			expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toBe(undefined);
+			expect(h.session._runInitiatedBy).toBeUndefined();
+			expect(h.session._runForTaskId).toBeUndefined();
+
+			const drain = spyOn(session, "drainAndPersistPendingInjections").mockResolvedValue(
+				"an agent's message",
+			);
+			try {
+				expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toEqual({
+					text: "",
+				});
+				expect(initiatedBy()).toBe("system");
+				// A person's answer among what was delivered (the drain marks it): the person's.
+				drain.mockImplementation(async (target) => {
+					target._runPersonActed = true;
+					return "a person's answer";
+				});
+				expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toEqual({
+					text: "",
+				});
+				expect(initiatedBy()).toBe("person");
+			} finally {
+				drain.mockRestore();
+			}
+
+			const { enqueueBufferedMessage } = await import("../narrator-buffer");
+			expect((await enqueueBufferedMessage(h.session.narratorId, "one more thing")).ok).toBe(true);
+			h.session._runInitiatedBy = "system";
+			const input = await session.prepareQueuedRunInput(h.session, h.owner, h.runControl);
+			expect(input?.text ?? "").toContain("one more thing");
+			expect(initiatedBy()).toBe("person");
+			h.session._runInitiatedBy = undefined;
+		});
 	});
 });
 

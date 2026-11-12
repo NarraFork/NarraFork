@@ -23,6 +23,8 @@ import type {
 	OutlineSpaceListResponse,
 	OutlineSpaceResolveResponse,
 	OutlineTimelineResponse,
+	OutlineTreeResponse,
+	OutlineTreeSpacesResponse,
 	OutlineViewMode,
 	OutlineViewStatePutRequest,
 	OutlineViewStateResponse,
@@ -85,12 +87,25 @@ export const outlineApi = {
 		}),
 	getOutlineSpace: (spaceId: string) =>
 		request<OutlineSpaceDetailResponse>(`/outline/spaces/${enc(spaceId)}`),
+	/** The connected outline's root: my space, a page of project spaces, the groups' counts. */
+	getOutlineTree: (params: { cursor?: string | null }) =>
+		request<OutlineTreeResponse>(`/outline/tree${query(params)}`),
+	/** A page of a project's sessions, or of a group's spaces, in the connected outline. */
+	listOutlineTreeSpaces: (
+		group: { kind: "project"; projectId: string } | { kind: "loose" | "orphaned" },
+		params: { cursor?: string | null },
+	) =>
+		request<OutlineTreeSpacesResponse>(
+			group.kind === "project"
+				? `/outline/tree/projects/${enc(group.projectId)}/sessions${query(params)}`
+				: `/outline/tree/${group.kind}${query(params)}`,
+		),
 	listOutlinePages: (spaceId: string, params: { cursor?: string | null; limit?: number }) =>
 		request<OutlinePageListResponse>(`/outline/spaces/${enc(spaceId)}/pages${query(params)}`),
 	getOutlineBlock: (
 		spaceId: string,
 		blockId: string,
-		params: { asOf?: number; view?: OutlineViewMode; blocks?: number },
+		params: { asOf?: number; view?: OutlineViewMode; blocks?: number; bytes?: number },
 	) =>
 		request<OutlineBlockViewResponse>(
 			`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}${query(params)}`,

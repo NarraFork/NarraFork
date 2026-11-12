@@ -617,3 +617,88 @@
 	font-size: var(--mantine-font-size-xs);
 	color: var(--mantine-color-dimmed);
 }
+
+/*
+ * The connected outline (`tree/OutlineTree.tsx`): spaces, groups and pages as rows of one tree,
+ * a page opened in place below its row. A row is one line: the arrow (always drawn), the icon,
+ * the title (a link that focuses it; it truncates), and what it says at its end.
+ */
+.tree {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+}
+
+.treeRow {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	min-width: 0;
+	min-height: 28px;
+	border-radius: var(--mantine-radius-sm);
+}
+
+.treeIcon {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	color: var(--mantine-color-dimmed);
+}
+
+.treeTitle {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: var(--mantine-font-size-sm);
+	font-weight: 500;
+	color: var(--mantine-color-text);
+	text-decoration: none;
+}
+
+.treeTitle:focus-visible {
+	text-decoration: underline;
+}
+
+.treeGroupTitle {
+	padding: 0;
+	border: 0;
+	background: none;
+	cursor: pointer;
+	font-family: inherit;
+	text-align: start;
+	color: var(--mantine-color-dimmed);
+}
+
+.treeMeta {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-inline-start: auto;
+	padding-inline-start: 8px;
+}
+
+.treeNote {
+	display: flex;
+	align-items: center;
+	min-height: 24px;
+	min-width: 0;
+}
+
+.treePage {
+	min-width: 0;
+	padding-block: 2px 6px;
+}
+
+.treeRecent {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+	width: 100%;
+	font-size: var(--mantine-font-size-sm);
+	color: var(--mantine-color-text);
+	text-decoration: none;
+}

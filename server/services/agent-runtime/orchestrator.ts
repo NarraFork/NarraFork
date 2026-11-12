@@ -219,7 +219,11 @@ import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { endTurn, startTurn } from "../narrator-turns";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
-import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease-keeper";
+import {
+	keepOutlineTaskLeases,
+	type OutlineLeaseKeeper,
+	outlinePersonHourRunning,
+} from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
@@ -398,6 +402,24 @@ export async function runAgentLoopUnlocked(
 	let continuationStopNote: string | null = null;
 	let abortedBeforeCleanup: boolean | undefined;
 	let freshInput = false;
+	// A person's message started this run or joined it (outline: such a run keeps the session's
+	// unfinished team tasks for a while; one the system started gives them back when it ends).
+	// Said by the run's entry point, never read off the input (a Retry or a Continue carries no
+	// text): unset is a person. A person's queued message taken up later makes it theirs too, and
+	// so does a person acting inside it (`_runPersonActed`: a permission, a plan, a question
+	// resolved, an asynchronous answer taken up).
+	let personSpoke = active._runInitiatedBy !== "system";
+	const runForTaskId = active._runForTaskId ?? null;
+	active._runInitiatedBy = undefined;
+	active._runForTaskId = undefined;
+	active._runPersonActed = false;
+	const personRun = () => personSpoke || active._runPersonActed === true;
+	/** What the finalizer restarts the session for, and what will wake it when it finishes. */
+	const workPendingAtEnd = async (): Promise<boolean> =>
+		(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
+		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
+		// A question a person has yet to answer: their answer wakes the session.
+		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -640,6 +662,7 @@ export async function runAgentLoopUnlocked(
 			throw error;
 		}
 		if (buffered) {
+			personSpoke = true;
 			const bufferedClaim = buffered._mailboxClaim;
 			if (!bufferedClaim) throw new Error("Claimed buffered input missing mailbox claim");
 			active._bufferSoftStopTaken = false;
@@ -3509,7 +3532,14 @@ export async function runAgentLoopUnlocked(
 				// before the drain (its reads are awaited), and written only once this run has
 				// settled terminal below, so nothing awaited sits between the drain and the
 				// arbitration. The drain or a hold continuing the run drops it.
-				const turnEndNote = await decideOutlineTurnEndNote(active);
+				const turnEndNote = await decideOutlineTurnEndNote(active, {
+					givingBackTeamTasks:
+						!personRun() &&
+						!runState.wasInterrupted &&
+						!active.abortController.signal.aborted &&
+						!outlinePersonHourRunning(narratorId) &&
+						!(await workPendingAtEnd().catch(() => true)),
+				});
 
 				// Drain any queued injection FIRST, before flipping the DB status to idle.
 				// This closes the window where status is already idle (visible to clients /
@@ -3588,8 +3618,20 @@ export async function runAgentLoopUnlocked(
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
 		// The run ended: the session's claims go on the idle lease while it waits for its next
-		// turn, a subagent's pass to its root (not waited for).
-		void outlineLeases?.stop();
+		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
+		// started that ended by itself are given back with a handoff (not waited for).
+		void outlineLeases?.stop({
+			natural:
+				!freshInput &&
+				!runState.hadError &&
+				!runState.wasInterrupted &&
+				!active.abortController.signal.aborted,
+			// A subagent's run is never a person's hour of its own: its claims pass to its root.
+			person: personRun() && !deliverTo,
+			reply: runState.finalText,
+			forTaskId: runForTaskId,
+			pending: workPendingAtEnd,
+		});
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;
 		unregisterUpdateLoop();

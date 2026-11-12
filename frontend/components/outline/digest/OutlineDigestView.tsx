@@ -844,6 +844,9 @@ export function OutlineDigestView({
 			tallies.leaseReturned > 0 &&
 			t("report.tally.leaseReturned", { count: tallies.leaseReturned }),
 		!compact &&
+			tallies.handedBack > 0 &&
+			t("report.tally.handedBack", { count: tallies.handedBack }),
+		!compact &&
 			tallies.deletedFacts > 0 &&
 			t("report.tally.deletedFacts", { count: tallies.deletedFacts }),
 		!compact &&

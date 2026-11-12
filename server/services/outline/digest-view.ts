@@ -418,6 +418,7 @@ export async function readOutlineDigestDetail(
 				tasksCreated: s.tasksCreated,
 				tasksStarted: s.tasksStarted,
 				leaseReturned: s.leaseReturned,
+				handedBack: s.handedBack ?? 0,
 				reviewComments: s.reviewComments,
 				more: s.more ?? {},
 			};

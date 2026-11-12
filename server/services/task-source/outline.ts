@@ -521,13 +521,23 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		currentTask: () => single("doing"),
 		nextTask: () => single("todo"),
 		async openTasks(): Promise<OpenTaskList> {
-			const read = await readOpen(await session());
+			const current = await session();
+			const read = await readOpen(current);
 			// The list is a prefix in document order (its readers show fewer: the interrupt guard
 			// eight); the revision key still covers every task read.
 			const listed = read.entries.slice(0, OUTLINE_TASK_SOURCE_LIMITS.openTasks);
 			const titles = await titlesOf(listed);
+			// Which of them are team tasks (of a project space): one read per other space.
+			const kinds = new Map<string, string | null>();
+			for (const { ref } of listed)
+				if (ref.spaceId !== current.spaceId && !kinds.has(ref.spaceId))
+					kinds.set(ref.spaceId, (await outlineStore.getSpace(ref.spaceId))?.kind ?? null);
 			return {
-				tasks: listed.map((entry) => toView(entry, titles)),
+				tasks: listed.map((entry) => {
+					const view = toView(entry, titles);
+					if (kinds.get(entry.ref.spaceId) === "project") view.teamTaskId = entry.ref.blockId;
+					return view;
+				}),
 				revision: revisionOf(read),
 			};
 		},

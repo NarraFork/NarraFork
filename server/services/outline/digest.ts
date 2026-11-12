@@ -21,7 +21,8 @@
  *   |                    | the person alone wrote are counted, not listed; deleted ones counted |
  *   | 任务 tasks         | `task_json.status` before the window against after it: done,        |
  *   |                    | cancelled, reopened; handed to the person (`assignee`); new and      |
- *   |                    | started only counted; tasks the lease job gave back counted apart    |
+ *   |                    | started only counted; tasks the lease job gave back counted apart,   |
+ *   |                    | and so are tasks a session gave back with a handoff at a run's end   |
  *   | 计划 plans         | each `plan` commit: the root's `task_json.plan` before and after it  |
  *   | 提问 questions     | each version with the question flag: its `ask_json` before and after |
  *   | 其他 other         | reverts, imports, confirmations by people, tasks handed to subagents |
@@ -49,6 +50,7 @@ import type {
 	OutlineDigestTaskStored,
 } from "@shared/outline-digest";
 import { OUTLINE_DIGEST_SECTIONS } from "@shared/outline-digest";
+import { OUTLINE_HANDOFF_ACTOR } from "./handoff";
 import { readInProcess } from "./in-process";
 import {
 	OUTLINE_CHANGE,
@@ -109,6 +111,9 @@ export const OUTLINE_DIGEST_REPORT_ACTOR = "outline-report";
  */
 const ROUTINE_SYSTEM_ACTORS = new Set([
 	OUTLINE_LEASE_ACTOR,
+	// A session's unfinished task given back at a run's end, with a handoff (P2 PR 10c-2):
+	// counted with the tasks (`handedBack`), never listed.
+	OUTLINE_HANDOFF_ACTOR,
 	OUTLINE_PLAN_ACTOR,
 	OUTLINE_PLAN_REVIEW_ACTOR,
 	"outline-task-start",
@@ -274,6 +279,8 @@ export interface OutlineSpaceSummary {
 	tasksCreated: number;
 	tasksStarted: number;
 	leaseReturned: number;
+	/** Tasks a session gave back unfinished at a run's end (commits of `outline-handoff`). */
+	handedBack: number;
 	plans: OutlineDigestPlanStored[];
 	reviewComments: number;
 	questions: Array<Omit<OutlineDigestQuestionStored, "toYou">>;
@@ -337,6 +344,7 @@ export async function summarizeSpaceWindow(
 		tasksCreated: 0,
 		tasksStarted: 0,
 		leaseReturned: 0,
+		handedBack: 0,
 		plans: [],
 		reviewComments: 0,
 		questions: [],
@@ -478,15 +486,17 @@ export async function summarizeSpaceWindow(
 				: (prior.get(id)?.taskJson ?? null);
 		if (!isNew && !imported && prior.get(id)?.deleted) continue;
 		const after = lastVersion.taskJson;
-		const leased = list.some((v) => {
-			const c = commitOf.get(v.commitId);
-			return (
-				(v.changeFlags & OUTLINE_CHANGE.TASK) !== 0 &&
-				c?.actorKind === "system" &&
-				c.actorId === OUTLINE_LEASE_ACTOR
-			);
-		});
-		if (leased) summary.leaseReturned++;
+		const reopenedBy = (actor: string) =>
+			list.some((v) => {
+				const c = commitOf.get(v.commitId);
+				return (
+					(v.changeFlags & OUTLINE_CHANGE.TASK) !== 0 &&
+					c?.actorKind === "system" &&
+					c.actorId === actor
+				);
+			});
+		if (reopenedBy(OUTLINE_LEASE_ACTOR)) summary.leaseReturned++;
+		if (reopenedBy(OUTLINE_HANDOFF_ACTOR)) summary.handedBack++;
 		const change = taskTransition(before, after, isNew);
 		if (change.created && after) summary.tasksCreated++;
 		if (change.started) summary.tasksStarted++;
@@ -811,6 +821,7 @@ export function selectForPerson(
 			tasksCreated: summary.tasksCreated,
 			tasksStarted: summary.tasksStarted,
 			leaseReturned: summary.leaseReturned,
+			...(summary.handedBack > 0 ? { handedBack: summary.handedBack } : {}),
 			reviewComments: summary.reviewComments,
 		},
 		delegated: summary.delegated
@@ -870,6 +881,7 @@ export function spaceWeight(c: OutlinePersonContribution): number {
 		c.space.tasksCreated +
 		c.space.tasksStarted +
 		c.space.leaseReturned +
+		(c.space.handedBack ?? 0) +
 		c.space.reviewComments
 	);
 }

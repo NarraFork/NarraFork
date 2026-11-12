@@ -20,6 +20,7 @@
 import { resolveAssistantTextDisplay, type TextCitation } from "../citations";
 import {
 	communicationInputField,
+	compactsCommunication,
 	isCommunicationTool,
 	limitCommunicationPreview,
 	shouldShowCommunicationBubble,
@@ -1662,7 +1663,10 @@ function adaptOrderedContextBlocks(
 ): ElementSpec[] | null {
 	if (msg.origin === "user") return null;
 	const blocks = messageBody(msg);
-	const auxiliary = auxiliaryContentViews(msg, visibleBlockIndices);
+	// From L3 up agent messages stay out of the row projection and keep their bubbles.
+	const auxiliary = auxiliaryContentViews(msg, visibleBlockIndices, {
+		communication: compactsCommunication(ctx.compactAuxiliaryContent, ctx.lod),
+	});
 	const allViews = [...contextBlockViews(blocks), ...injectionBlockViews(blocks)];
 	// Whole messages without auxiliary content keep their specialized receipt/control path.
 	// Only a filtered remainder needs the ordered dispatcher after grouping split a message.
@@ -2028,6 +2032,14 @@ function adaptMessage(
 				{
 					kind: "injection-bubble",
 					key: `${elementKey(idBase, msg, 0)}-m-legacy`,
+					// Same identity as the row `auxiliaryContentViews` projects for the first text block.
+					unitId: auxiliaryContentKey(
+						msg,
+						Math.max(
+							0,
+							blocks.findIndex((b) => b.type === "text"),
+						),
+					),
 					data: {
 						markdown: rawSideCarToMarkdown(text),
 						speaker: originHeadingLabel(ctx, msg.origin, msg.originLabel),
@@ -3204,6 +3216,8 @@ function adaptSpokenInjection(
 				// content block so the selection system can address it; the sender keeps the
 				// key stable across a same-block re-projection.
 				key: `${elementKey(idBase, msg, blockIndex)}-m-${message.fromId ?? "anon"}`,
+				// The identity its compact L1/L2 row carries, so a level switch pairs the two.
+				unitId: auxiliaryContentKey(msg, blockIndex),
 				data: {
 					...deliveryProjection(msg),
 					markdown: rawSideCarToMarkdown(text),
@@ -4282,7 +4296,11 @@ function adaptToolItemFull(
 	if (ctx.compactAuxiliaryContent && isCommunicationTool(item.tc))
 		item = { ...item, isSubagent: false };
 	const isCommunication =
-		!cleared && shouldShowCommunicationBubble(item.tc, ctx.compactAuxiliaryContent === true);
+		!cleared &&
+		shouldShowCommunicationBubble(
+			item.tc,
+			compactsCommunication(ctx.compactAuxiliaryContent, ctx.lod),
+		);
 	const hasPendingPermission =
 		!cleared && (ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false);
 	// Approval controls only mount on a generic tool card. Once the decision lands,
@@ -5501,15 +5519,16 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 	const isSoleSubagent =
 		items.filter((item) => item.isSubagent && !isCommunicationTool(item.tc)).length === 1;
 	if (ctx.lod >= 3) {
+		const compact = ctx.compactAuxiliaryContent;
 		return items.map((item, index) => {
 			// A bubble breaks the surrounding tool frame as well as the low-LOD fold.
 			const previous = items[index - 1];
 			const next = items[index + 1];
 			const previousIsTool =
 				!!previous &&
-				!shouldShowCommunicationBubble(previous.tc, ctx.compactAuxiliaryContent === true);
+				!shouldShowCommunicationBubble(previous.tc, compactsCommunication(compact, ctx.lod));
 			const nextIsTool =
-				!!next && !shouldShowCommunicationBubble(next.tc, ctx.compactAuxiliaryContent === true);
+				!!next && !shouldShowCommunicationBubble(next.tc, compactsCommunication(compact, ctx.lod));
 			return adaptToolItemFull(item, ctx, {
 				inRun: previousIsTool || nextIsTool,
 				isLast: !nextIsTool,

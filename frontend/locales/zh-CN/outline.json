@@ -28,12 +28,8 @@
 			"session": "会话"
 		},
 		"orphaned": "所有者已删除",
-		"commits_one": "{{count}} 次提交",
-		"commits_other": "{{count}} 次提交",
 		"readOnly": "只读",
-		"searchPlaceholder": "在这个空间中搜索",
-		"pages": "页面",
-		"noPages": "还没有页面。agent 和编辑器写入的页面会出现在这里。"
+		"searchPlaceholder": "在这个空间中搜索"
 	},
 	"page": {
 		"task": {
@@ -530,6 +526,8 @@
 			"tasksStarted_other": "开始 {{count}} 个",
 			"leaseReturned_one": "{{count}} 个因会话停止而退回",
 			"leaseReturned_other": "{{count}} 个因会话停止而退回",
+			"handedBack_one": "{{count}} 个没做完被放手（留了交接）",
+			"handedBack_other": "{{count}} 个没做完被放手（留了交接）",
 			"reviewComments_one": "计划审查留下意见 {{count}} 次",
 			"reviewComments_other": "计划审查留下意见 {{count}} 次"
 		},
@@ -579,6 +577,11 @@
 		"humanCreated": "人建",
 		"newlyDone": "新完成",
 		"newlyDoneHint": "agent 做完了你建的任务。你看过之后，这个标记就会消失。",
+		"handoffs_one": "有交接 · {{count}} 次",
+		"handoffs_other": "有交接 · {{count}} 次",
+		"handoffsHint": "有会话没做完这个任务，放手时在任务下留了交接。下一个会话照交接接着做。",
+		"handoffsManyHint_one": "这个任务已经被放手 {{count}} 次，先看看交接再决定要不要再开会话。",
+		"handoffsManyHint_other": "这个任务已经被放手 {{count}} 次，先看看交接再决定要不要再开会话。",
 		"locked": "已锁定 · {{name}}",
 		"lockedSomeone": "已锁定",
 		"waitPrerequisites": "等 {{count}} 个前置任务",
@@ -665,6 +668,7 @@
 			"model": "模型",
 			"cwd": "工作目录",
 			"cwdPlaceholder": "项目目录",
+			"previousDirectory": "接着用上一个会话的目录",
 			"note": "补充说明",
 			"notePlaceholder": "可选：原样写进会话的开工说明",
 			"submit": "开会话",
@@ -688,5 +692,23 @@
 				"unreadable": "新会话读不到这个项目的大纲，所以没有把任务交给它。请检查项目和会话的可见范围设置。"
 			}
 		}
+	},
+	"tree": {
+		"hint": "箭头就地展开阅读；点页标题打开这一页编辑。",
+		"collapseAll": "全部收起",
+		"recent": "最近访问（{{count}}）",
+		"sessions": "会话（{{count}}）",
+		"sessionsUncounted": "会话",
+		"loose": "不属于项目的会话（{{count}}）",
+		"orphaned": "已失效的空间（{{count}}）",
+		"noSessions": "没有你能查看的会话。",
+		"noPages": "还没有页面。",
+		"moreSpaces_one": "还有 {{count}} 个 ▸",
+		"moreSpaces_other": "还有 {{count}} 个 ▸",
+		"moreProjects": "更多项目 ▸",
+		"gone": "已不可查看。",
+		"partial_one": "这里只显示这一页的前 {{count}} 块。",
+		"partial_other": "这里只显示这一页的前 {{count}} 块。",
+		"openPage": "打开这一页"
 	}
 }

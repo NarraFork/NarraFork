@@ -6,10 +6,14 @@
  * person may set: the model, the working directory, a note added to the brief. Nothing navigates:
  * the row then says which session is on it, and that opens the session.
  *
+ * A task a session gave back unfinished (outline P2 PR 10c-2) carries a handoff: the form then
+ * offers to open the new session in the directory the one before worked in, when the server
+ * found one (its uncommitted work is there).
+ *
  * `useOpenSessionControl` holds one row's state; the row draws the button, the form and the
  * result with the parts below.
  */
-import { Button, Loader, Stack, Text, Textarea, TextInput } from "@mantine/core";
+import { Button, Checkbox, Loader, Stack, Text, Textarea, TextInput } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
 	OUTLINE_TASK_BOARD_LIMITS,
@@ -65,6 +69,8 @@ export function openSessionErrorText(t: Translate, error: unknown): string {
 export interface OpenSessionOptions {
 	model?: string;
 	cwd?: string;
+	/** Open it in the directory of the session that had the task before. */
+	previousDirectory?: boolean;
 	note?: string;
 }
 
@@ -85,7 +91,11 @@ export function useOpenSessionControl(task: OutlineBoardTask, t: Translate) {
 				body: {
 					baseVersionSeq: task.versionSeq,
 					...(options.model ? { model: options.model } : {}),
-					...(options.cwd?.trim() ? { cwd: options.cwd.trim() } : {}),
+					...(options.previousDirectory
+						? { previousDirectory: true }
+						: options.cwd?.trim()
+							? { cwd: options.cwd.trim() }
+							: {}),
 					...(options.note?.trim() ? { note: options.note } : {}),
 				},
 			},
@@ -125,9 +135,18 @@ export function useOpenSessionControl(task: OutlineBoardTask, t: Translate) {
 export type OpenSessionControl = ReturnType<typeof useOpenSessionControl>;
 
 /** The form behind "Open a new session for this…": model, working directory, a note. */
-export function OpenSessionForm({ control, t }: { control: OpenSessionControl; t: Translate }) {
+export function OpenSessionForm({
+	control,
+	task,
+	t,
+}: {
+	control: OpenSessionControl;
+	task: OutlineBoardTask;
+	t: Translate;
+}) {
 	const [model, setModel] = useState("");
 	const [cwd, setCwd] = useState("");
+	const [previous, setPrevious] = useState(false);
 	const [note, setNote] = useState("");
 	return (
 		<Stack gap={8} w={280} maw="calc(100vw - 48px)" data-testid="task-open-session-form">
@@ -141,10 +160,22 @@ export function OpenSessionForm({ control, t }: { control: OpenSessionControl; t
 					onChange={setModel}
 				/>
 			</Suspense>
+			{task.previousDirectory && (
+				<Checkbox
+					size="xs"
+					label={t("board.openSession.previousDirectory")}
+					description={task.previousDirectory}
+					checked={previous}
+					onChange={(e) => setPrevious(e.currentTarget.checked)}
+					styles={{ description: { wordBreak: "break-all" } }}
+					data-testid="task-open-session-previous-directory"
+				/>
+			)}
 			<TextInput
 				size="xs"
 				label={t("board.openSession.cwd")}
 				placeholder={t("board.openSession.cwdPlaceholder")}
+				disabled={previous}
 				value={cwd}
 				onChange={(e) => setCwd(e.currentTarget.value)}
 				data-testid="task-open-session-cwd"
@@ -174,7 +205,7 @@ export function OpenSessionForm({ control, t }: { control: OpenSessionControl; t
 			<Button
 				size="compact-sm"
 				loading={control.pending}
-				onClick={() => control.submit({ model, cwd, note })}
+				onClick={() => control.submit({ model, cwd, previousDirectory: previous, note })}
 				data-testid="task-open-session-submit"
 			>
 				{t("board.openSession.submit")}
