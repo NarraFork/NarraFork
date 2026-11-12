@@ -94,10 +94,12 @@ describe("before a run", () => {
 
 		const once = await makeSession();
 		await writeTasks(once.id, [{ text: "a" }]);
+		// Past the run's time limit the import gives way: busy, not a failure the job counts.
 		expect(
 			(await importSpecAtRunStart(once.id, { subagentsRunning: () => false, timeoutMs: 0 }))
 				?.status,
-		).toBe("failed");
+		).toBe("busy");
+		expect(specImportRecord(once.id)).toMatchObject({ status: "busy", failures: 0 });
 		expect(await importSpecAtRunStart(once.id, { subagentsRunning: () => false })).toBeNull();
 		expect(await backendOf(once.id)).toBe("spec");
 	});
@@ -116,10 +118,12 @@ describe("the idle job", () => {
 		expect(await backendOf(a.id)).toBe("outline");
 		expect(await backendOf(archived.id)).toBe("outline");
 		expect(await backendOf(sub.id)).toBe("spec");
-		// Idle: what the session was doing is on the idle lease.
-		const again = await runSpecImportPass({ pauseMs: 0 });
-		expect(again.imported).toBe(0);
-	});
+		// A second pass leaves what was imported alone. (A large session of an earlier case may
+		// be finished by it: an idle import gives way after its time budget, resumable.)
+		const commits = [await commitCount(a.id), await commitCount(archived.id)];
+		await runSpecImportPass({ pauseMs: 0 });
+		expect([await commitCount(a.id), await commitCount(archived.id)]).toEqual(commits);
+	}, 30_000);
 
 	test("a session that needs attention is left to the button", async () => {
 		const { id } = await makeSession();

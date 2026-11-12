@@ -29,14 +29,21 @@ describe("planSpecTasks", () => {
 		}));
 		const args = { ...base, tasks, protectors: tasks.map(() => null), ownerUserId: "u" };
 		const live = planSpecTasks({ ...args, archived: false });
-		expect(live.expected.map((t) => [t.status, t.claimed, t.noteSids.length])).toEqual([
+		// In progress is written to do and started by the move (nothing claimed before it).
+		expect(live.expected.map((t) => [t.status, t.start, t.noteSids.length])).toEqual([
 			["todo", false, 0],
-			["doing", true, 0],
+			["todo", true, 0],
 			["done", false, 0],
-			["doing", true, 1],
+			["todo", true, 1],
+		]);
+		expect(live.tasks.map((t) => [t.task?.status, t.start === true])).toEqual([
+			["todo", false],
+			["todo", true],
+			["done", false],
+			["todo", true],
 		]);
 		const archived = planSpecTasks({ ...args, archived: true });
-		expect(archived.expected.map((t) => [t.status, t.claimed, t.noteSids.length])).toEqual([
+		expect(archived.expected.map((t) => [t.status, t.start, t.noteSids.length])).toEqual([
 			["todo", false, 0],
 			["todo", false, 1],
 			["done", false, 0],
@@ -47,7 +54,7 @@ describe("planSpecTasks", () => {
 		expect(live.notes[0]?.parentSid).toBe(live.tasks[3]?.sid as string);
 	});
 
-	test("protected is created by a person; only a person's protection locks, for the owner", () => {
+	test("protected is created by a person; a person's protection, or one nobody knows the author of, locks for the owner", () => {
 		const tasks = [0, 1, 2, 3].map((n) => ({
 			text: `t${n}`,
 			status: "todo" as const,
@@ -64,8 +71,13 @@ describe("planSpecTasks", () => {
 			[false, false],
 			[true, true],
 			[true, false],
-			[true, false],
+			// Unknown protector: locked, as a person's (owner decision).
+			[true, true],
 		]);
+		expect(plan.tasks[3]?.task?.lock).toEqual({
+			by: { kind: "human", id: "owner" },
+			delegate: null,
+		});
 		expect(plan.tasks[1]?.task?.lock).toEqual({
 			by: { kind: "human", id: "owner" },
 			delegate: null,

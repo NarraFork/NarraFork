@@ -459,12 +459,20 @@ export async function summarizeSpaceWindow(
 		const lastVersion = list[list.length - 1] as OutlineRangeChange;
 		if (lastVersion.deleted) continue;
 		// A task the Dynamic Spec import made is not created, started or finished that day: the
-		// state it was imported in is where it starts from (what happens to it afterwards counts).
+		// state the import left it in is where it starts from (its own later commits included: the
+		// move starts what was in progress), and what happens to it afterwards counts.
 		const imported =
 			created(id) && isSpecImportCommit(commitOf.get((list[0] as OutlineRangeChange).commitId));
+		let importedUpTo = 0;
+		while (
+			imported &&
+			importedUpTo + 1 < list.length &&
+			isSpecImportCommit(commitOf.get((list[importedUpTo + 1] as OutlineRangeChange).commitId))
+		)
+			importedUpTo++;
 		const isNew = created(id) && !imported;
 		const before = imported
-			? (list[0] as OutlineRangeChange).taskJson
+			? (list[importedUpTo] as OutlineRangeChange).taskJson
 			: isNew
 				? null
 				: (prior.get(id)?.taskJson ?? null);

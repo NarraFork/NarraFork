@@ -9,7 +9,7 @@
  *   |------------------------------|------------------------------|-----------------------------|
  *   | todo                         | to do                        | to do                       |
  *   | doing                        | in progress (the session's   | to do, with a note that it  |
- *   |                              | claim, by the write path)    | was in progress (D54)       |
+ *   |                              | claim, made when it moves)   | was in progress (D54)       |
  *   | done                         | done                         | done                        |
  *   | blocked                      | in progress, a 受阻 note     | to do, a 受阻 note          |
  *   |                              | under it; no question (D52)  |                             |
@@ -18,10 +18,15 @@
  * reads `blocked` for the task through the old commands (12a) and takes the mark away by setting
  * a status.
  *
- * `protected` ⇔ created by a person (`humanCreated`), whoever protected it. Only a task a PERSON
+ * What is in progress in a live session is written TO DO and started only as part of the move
+ * (`start`, `importer.ts`): until the session is an outline session nothing it holds is claimed,
+ * so an import that fails or is abandoned holds no task, and no lease runs out under it.
+ *
+ * `protected` ⇔ created by a person (`humanCreated`), whoever protected it. A task a PERSON
  * protected (the revision its lock was made in was the person's: the Spec panel, `/goal`) is
- * locked, by the session's owner (D52); one an agent or a plugin protected, or whose protector is
- * not known, is not. A session without an owner has nobody to lock for.
+ * locked, by the session's owner (D52), and so is one whose protector is not known (owner
+ * decision: treated as a person's, the safe side); one an agent or a plugin protected is not. A
+ * session without an owner has nobody to lock for.
  *
  * NOTES (every other file)
  *
@@ -64,6 +69,8 @@ export const SPEC_IMPORT_TEXT: Record<
 		summaryNotes: (path: string) => string;
 		summaryStale: string;
 		summaryTasksPage: string;
+		summaryStart: (n: number) => string;
+		summaryGiveBack: (n: number) => string;
 	}
 > = {
 	en: {
@@ -76,6 +83,10 @@ export const SPEC_IMPORT_TEXT: Record<
 		summaryNotes: (path) => `Imported from Dynamic Spec: ${path}`,
 		summaryStale: "Removed what an earlier, unfinished import from Dynamic Spec wrote",
 		summaryTasksPage: "Task page for the import from Dynamic Spec",
+		summaryStart: (n) =>
+			`Moved from Dynamic Spec: ${n} task${n === 1 ? "" : "s"} in progress, started again by the session`,
+		summaryGiveBack: (n) =>
+			`The import from Dynamic Spec did not finish: ${n} task${n === 1 ? "" : "s"} back to do`,
 	},
 	"zh-CN": {
 		blocked: "受阻（导入前在 Dynamic Spec 里的状态）",
@@ -86,6 +97,8 @@ export const SPEC_IMPORT_TEXT: Record<
 		summaryNotes: (path) => `从 Dynamic Spec 导入：${path}`,
 		summaryStale: "清掉上一次没做完的 Dynamic Spec 导入写下的内容",
 		summaryTasksPage: "Dynamic Spec 导入用的任务页",
+		summaryStart: (n) => `从 Dynamic Spec 切换过来：${n} 个进行中的任务由会话重新开始`,
+		summaryGiveBack: (n) => `Dynamic Spec 导入没有完成：${n} 个任务退回待办`,
 	},
 };
 
@@ -112,6 +125,8 @@ export interface SpecImportNode {
 	/** Canonical content from the text worker; absent: the write path normalizes (small text). */
 	links?: ExtractedLink[];
 	task?: OutlineTaskInput;
+	/** A task written to do that the move starts: in progress already is not a drift. */
+	start?: boolean;
 }
 
 export interface SpecImportTask {
@@ -139,11 +154,12 @@ export interface SpecImportTaskPlan {
 
 export interface SpecImportExpectedTask {
 	sid: string;
+	/** Its checkbox until the move (a task to start reads to do, or in progress by the session). */
 	status: TaskStatus;
 	humanCreated: boolean;
 	locked: boolean;
-	/** Claimed by the session after the import. */
-	claimed: boolean;
+	/** Started by the move: in progress and claimed by the session from then on. */
+	start: boolean;
 	/** Canonical content, when the worker gave one. */
 	content: string | null;
 	noteSids: string[];
@@ -171,10 +187,14 @@ export function planSpecTasks(args: {
 	args.tasks.forEach((task, n) => {
 		const sid = `st${t}${n.toString(36)}`;
 		const id = `si${tag([args.narratorId, args.revisionId, String(n)], 30)}`;
-		const open = task.status !== "done";
-		const status: TaskStatus =
-			task.status === "done" ? "done" : task.status === "todo" || args.archived ? "todo" : "doing";
-		const byPerson = task.protected && args.protectors[n] === "user" && args.ownerUserId !== null;
+		// In progress (doing, blocked) in a live session: to do until the move starts it.
+		const start = !args.archived && (task.status === "doing" || task.status === "blocked");
+		const status: TaskStatus = task.status === "done" ? "done" : "todo";
+		const protector = args.protectors[n];
+		const byPerson =
+			task.protected &&
+			(protector === "user" || protector === "unknown" || protector === null) &&
+			args.ownerUserId !== null;
 		const owner = args.ownerUserId;
 		const input: OutlineTaskInput = {
 			status,
@@ -191,6 +211,7 @@ export function planSpecTasks(args: {
 			content: canonical?.content ?? task.text,
 			...(canonical ? { links: canonical.links } : {}),
 			task: input,
+			...(start ? { start: true } : {}),
 		});
 		const noteSids: string[] = [];
 		if (task.status === "blocked") {
@@ -208,7 +229,7 @@ export function planSpecTasks(args: {
 			status,
 			humanCreated: task.protected,
 			locked: byPerson,
-			claimed: open && status === "doing",
+			start,
 			content: canonical?.content ?? null,
 			noteSids,
 		});

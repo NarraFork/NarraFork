@@ -21,8 +21,16 @@
  * back to the running lease. A server that crashes stops no keeper: its leases run out after
  * `leaseMs`. An archived session (or one whose session is) holds nothing: its end lets go of
  * its claims instead.
+ *
+ * A session that still keeps its tasks in Dynamic Spec holds no task of its own session space:
+ * the import (outline P2 PR 12b) claims those only in the step that moves the session. Should it
+ * hold one anyway (a server that stopped between that claim and the move), the keeper renews
+ * nothing for it and puts nothing on the idle lease, so the claim runs out and the expiry job
+ * reopens the task, instead of a session that is not an outline session keeping it for good. (Its
+ * claims elsewhere, if any, run out with it in that case; the next import starts the tasks again.)
  */
 import { logger } from "@server/lib/logger";
+import { readTaskSession } from "../task-source/backend";
 import { isOutlineEnabled } from "./feature";
 import { OUTLINE_TASK_LEASE } from "./model";
 import type { OutlineStore } from "./store/port";
@@ -46,6 +54,24 @@ export interface OutlineLeaseKeeper {
 	 * go on the idle lease, and a subagent's pass to its root on it; resolves when that is done.
 	 */
 	stop(): Promise<void>;
+}
+
+/** Claims of a session one look for what an unfinished import left reads. */
+const LEFTOVER_SCAN = 100;
+
+/**
+ * A root session still in Dynamic Spec that holds a claim in its own session space (see the
+ * module header). One cached read for any other session; for a spec session, its space and its
+ * claims (bounded, on the holder index).
+ */
+async function holdsImportLeftover(narratorId: string, store?: OutlineStore): Promise<boolean> {
+	const session = await readTaskSession(narratorId);
+	if (session?.backend !== "spec" || session.subagent) return false;
+	const outline = store ?? (await import("./store")).outlineStore;
+	const space = await outline.findSpace({ kind: "session", narratorId });
+	if (!space) return false;
+	const claims = await outline.listClaimedTasks(narratorId, LEFTOVER_SCAN);
+	return claims.some((claim) => claim.block.spaceId === space.id);
 }
 
 /** When each session last renewed (ms), shared by its runs. */
@@ -120,6 +146,7 @@ export function keepOutlineTaskLeases(
 		failed: { count: number; retryAt: number; warnedAt: number } | undefined,
 	): Promise<void> => {
 		try {
+			if (await holdsImportLeftover(narratorId, options.store)) return;
 			await renewOutlineTaskLeases(narratorId, { now: new Date(at), ...store });
 			if (failed) {
 				failing.delete(narratorId);
@@ -181,6 +208,7 @@ export function keepOutlineTaskLeases(
 			failing.delete(narratorId);
 			if (!enabled()) return;
 			try {
+				if (await holdsImportLeftover(narratorId, options.store)) return;
 				await idleOutlineTaskClaims(narratorId, { now: new Date(clock()), ...store });
 			} catch (error) {
 				// Its leases then run out on the running lease, as a crashed run's do.

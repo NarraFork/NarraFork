@@ -12,24 +12,30 @@
  *      intervals, the spec namespaces are walked page by page on their primary key, one session
  *      at a time with a pause between them. A session is taken without interrupting it (the
  *      admission a file revert takes, which also covers its subagents): a busy one is skipped and
- *      met again on the next pass. A session that failed {@link SPEC_IMPORT_JOB.attempts} times in
- *      this process, or needs attention, is left to the button.
+ *      met again on the next pass. The admission holds the session's messages, so an import holds
+ *      it at most {@link SPEC_IMPORT_JOB.budgetMs} and gives way at once when a message for it
+ *      arrives (`busy`; the next pass goes on where it stopped). A session that failed
+ *      {@link SPEC_IMPORT_JOB.attempts} times in this process, or needs attention, is left to the
+ *      button.
  *   3. THE BUTTON ({@link requestSpecImport}): the Spec panel's "Import now" (and its retry). The
  *      request only starts the import and answers at once; the panel reads the state
  *      ({@link specImportStatus}) and hears `spec_changed` when the session was moved.
  *
- * `outline.specImport` chooses: `auto` all three, `manual` the button only, `off` none.
+ * `outline.specImport` chooses: `auto` all three, `manual` (the shipped default, `DEFAULTS`) the
+ * button only (the job runs but finds nothing to do), `off` none.
  *
  * On PostgreSQL the session runtime does not run, so there is nothing to wait for: the job and the
  * button import without an admission, and no run starts one.
  */
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
+import type { OutlineSpecImportReason } from "@shared/outline-spec-import";
 import { readTaskSession } from "../../task-source/backend";
 import { outlineAccessBackend } from "../access-reads";
 import {
 	importSpecSession,
 	type SpecImportOutcome,
+	SpecImportPaused,
 	type SpecImportRecord,
 	specImportMode,
 	specImportRecord,
@@ -40,7 +46,8 @@ import { readSpecImportSession, readSpecNamespacePage } from "./read-port";
 /** What a session may hold to be imported at the start of a run. */
 export const SPEC_IMPORT_RUN_LIMITS = {
 	files: 20,
-	chars: 256 * 1024,
+	/** Characters (not bytes) of all its current files. */
+	chars: 262_144,
 	/** The import's time limit there; checked between commits. */
 	timeoutMs: 3_000,
 	/** Sessions remembered as tried at a run start in this process. */
@@ -58,6 +65,18 @@ export const SPEC_IMPORT_JOB = {
 	idlePassMs: 60 * 60_000,
 	/** Failed attempts of one session in this process after which the job leaves it alone. */
 	attempts: 3,
+	/**
+	 * How long one idle import may hold its session (it holds the session's revert admission, so
+	 * the session's messages wait): past it the import gives way, and the next pass goes on where
+	 * it stopped. Checked between commits, as at the start of a run.
+	 */
+	budgetMs: 3_000,
+	/** The same for an import a person started from the Spec panel. */
+	manualBudgetMs: 30_000,
+	/** How often an idle import looks for a message that arrived for its session (it gives way). */
+	messageCheckMs: 250,
+	/** Queued messages of the session one look reads (ids only). */
+	messageCheckRows: 50,
 } as const;
 
 /** The narrator runtime, loaded on first use: this module is reached from it. */
@@ -119,14 +138,21 @@ export async function importSpecAtRunStart(
 			if (oldest === undefined) break;
 			triedAtRun.delete(oldest);
 		}
+		const controller = new AbortController();
+		const timeoutMs = options.timeoutMs ?? SPEC_IMPORT_RUN_LIMITS.timeoutMs;
+		const timer = setTimeout(
+			() => controller.abort(new SpecImportPaused(`the run's time limit of ${timeoutMs} ms`)),
+			timeoutMs,
+		);
+		timer.unref?.();
 		return await importSpecSession(narratorId, {
 			trigger: "run",
-			signal: AbortSignal.timeout(options.timeoutMs ?? SPEC_IMPORT_RUN_LIMITS.timeoutMs),
+			signal: controller.signal,
 			smallOnly: { files: SPEC_IMPORT_RUN_LIMITS.files, chars: SPEC_IMPORT_RUN_LIMITS.chars },
 			// The run holds the session: no admission, and what it does stays on the running lease.
 			isRunning: () => true,
 			onMoved: announce,
-		});
+		}).finally(() => clearTimeout(timer));
 	} catch (error) {
 		logger.warn("Dynamic Spec import at the start of a run failed", {
 			narratorId,
@@ -141,17 +167,101 @@ export function resetSpecImportRunTries(): void {
 	triedAtRun.clear();
 }
 
-/** The import as the job and the button run it: on an idle session, without interrupting it. */
-async function importIdle(
+/**
+ * The import as the job and the button run it: on an idle session, without interrupting it, and
+ * giving way to it ({@link SpecImportPaused}, outcome `busy`) when its time budget runs out or a
+ * message for the session arrives meanwhile (the admission holds the session's messages until it
+ * is released). What was written stays; the next attempt goes on from there.
+ */
+export async function importSpecSessionIdle(
 	narratorId: string,
 	trigger: "sweep" | "manual",
+	options: { budgetMs?: number; messageCheckMs?: number } = {},
 ): Promise<SpecImportOutcome> {
-	return await importSpecSession(narratorId, {
-		trigger,
-		admit: admitIdle,
-		isRunning: outlineAccessBackend() === "postgres" ? () => false : await loopRunning(),
-		onMoved: announce,
-	});
+	const controller = new AbortController();
+	const budgetMs =
+		options.budgetMs ??
+		(trigger === "manual" ? SPEC_IMPORT_JOB.manualBudgetMs : SPEC_IMPORT_JOB.budgetMs);
+	const timer = setTimeout(
+		() => controller.abort(new SpecImportPaused(`its time budget of ${budgetMs} ms`)),
+		budgetMs,
+	);
+	timer.unref?.();
+	let unwatch: (() => void) | null = null;
+	try {
+		return await importSpecSession(narratorId, {
+			trigger,
+			pause: controller.signal,
+			admit: async (id) => {
+				const release = await admitIdle(id);
+				try {
+					unwatch = await watchMessages(
+						id,
+						() => controller.abort(new SpecImportPaused("a message for the session arrived", true)),
+						options.messageCheckMs ?? SPEC_IMPORT_JOB.messageCheckMs,
+					);
+				} catch (error) {
+					release();
+					throw error;
+				}
+				return release;
+			},
+			isRunning: outlineAccessBackend() === "postgres" ? () => false : await loopRunning(),
+			onMoved: announce,
+		});
+	} finally {
+		clearTimeout(timer);
+		(unwatch as (() => void) | null)?.();
+	}
+}
+
+/**
+ * Call `arrived` once a message is queued for the session that was not queued when this started
+ * (ids only, a bounded read on the queue's index, every `everyMs`). The returned function stops
+ * looking. On PostgreSQL the import takes no admission, so nothing waits on it: nothing to watch.
+ */
+async function watchMessages(
+	narratorId: string,
+	arrived: () => void,
+	everyMs: number,
+): Promise<() => void> {
+	if (outlineAccessBackend() === "postgres") return () => {};
+	const [{ db }, { narratorBufferedMessages }, { and, eq }] = await Promise.all([
+		import("../../../db"),
+		import("../../../db/schema"),
+		import("drizzle-orm"),
+	]);
+	const queued = () =>
+		db
+			.select({ id: narratorBufferedMessages.id })
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, narratorId),
+					eq(narratorBufferedMessages.state, "queued"),
+				),
+			)
+			.limit(SPEC_IMPORT_JOB.messageCheckRows + 1)
+			.all()
+			.map((row) => row.id);
+	const before = new Set(queued());
+	const timer = setInterval(() => {
+		try {
+			const now = queued();
+			if (now.some((id) => !before.has(id))) {
+				clearInterval(timer);
+				arrived();
+			}
+		} catch (error) {
+			clearInterval(timer);
+			logger.warn("Could not look for messages during a Dynamic Spec import", {
+				narratorId,
+				error: String(error),
+			});
+		}
+	}, everyMs);
+	timer.unref?.();
+	return () => clearInterval(timer);
 }
 
 /** What the Spec panel shows about a session's import. */
@@ -162,8 +272,10 @@ export interface SpecImportStatus {
 	importable: boolean;
 	/** `idle`: not tried in this process (or the session is not importable). */
 	state: "idle" | SpecImportRecord["status"];
-	/** Why the last attempt did not move the session. */
+	/** Why the last attempt did not move the session (English, as logged). */
 	error: string | null;
+	/** The same, for the Spec panel to say in the reader's language. */
+	reason: OutlineSpecImportReason | null;
 	at: string | null;
 }
 
@@ -178,6 +290,7 @@ export async function specImportStatus(narratorId: string): Promise<SpecImportSt
 		importable,
 		state: record?.status ?? "idle",
 		error: record?.error ?? null,
+		reason: record?.reason ?? null,
 		at: record?.at ?? null,
 	};
 }
@@ -191,7 +304,7 @@ const manual = hotSafe("narrafork.outline.specImport.manual", () => new Set<Prom
 export async function requestSpecImport(narratorId: string): Promise<SpecImportStatus> {
 	const before = await specImportStatus(narratorId);
 	if (!before.importable || before.state === "running") return before;
-	const run = importIdle(narratorId, "manual").catch((error: unknown) =>
+	const run = importSpecSessionIdle(narratorId, "manual").catch((error: unknown) =>
 		logger.warn("Dynamic Spec import from the Spec panel failed", {
 			narratorId,
 			error: String(error),
@@ -206,7 +319,7 @@ export async function requestSpecImport(narratorId: string): Promise<SpecImportS
 	await new Promise((resolve) => setImmediate(resolve));
 	return settled
 		? await specImportStatus(narratorId)
-		: { ...before, state: "running", error: null };
+		: { ...before, state: "running", error: null, reason: null };
 }
 
 /** Imports the button started, settled (tests, shutdown). */
@@ -258,7 +371,7 @@ export async function runSpecImportPass(
 				pass.givenUp++;
 				continue;
 			}
-			const outcome = await importIdle(session.narratorId, "sweep");
+			const outcome = await importSpecSessionIdle(session.narratorId, "sweep");
 			if (outcome.status === "imported") pass.imported++;
 			else if (outcome.status === "failed" && outcome.attention) pass.givenUp++;
 			else if (outcome.status !== "skipped") pass.left++;

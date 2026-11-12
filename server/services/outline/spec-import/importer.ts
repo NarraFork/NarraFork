@@ -17,21 +17,25 @@
  *      {@link SPEC_IMPORT_LIMITS.files} files or {@link SPEC_IMPORT_LIMITS.totalChars} characters
  *      is not imported (needs attention). History is not imported: the current state only.
  *   2. Takes away what an earlier, unfinished attempt wrote from a source that changed since
- *      (the import's short ids of another revision; see `plan.ts`).
+ *      (the import's short ids of another revision; see `plan.ts`; on the behavior page, the
+ *      blocks of another fence text). Only what nobody but the import wrote: a block someone
+ *      added to, moved or edited stays where it is, and the session is not moved until a person
+ *      looks (needs attention).
  *   3. Notes: every file but `tasks.json` and `behavior_fence` becomes a page (`plan.ts`), its
  *      text converted on the background text worker, as it is (nothing is scanned or repaired).
  *   4. Tasks: `tasks.json` onto the session's task page, in order, then the notes under them.
- *      A task of an earlier attempt that was deleted since is brought back, and one whose
- *      checkbox drifted (a lease that ran out between attempts) is set again: until the session
- *      is moved, these blocks are the import's.
- *   5. The behavior fence: its own text onto the behavior page with PR 4's short ids, its plugin
- *      SOP as that plugin's block (`pluginRulesSid`), so the session's first run as an outline
- *      session and the plugin's later updates find them.
- *   6. Verifies the tasks one by one against the source (count, order, text, checkbox, created
- *      by a person, lock, claim, notes). A mismatch moves nothing (needs attention).
+ *      What is in progress is written to do: nothing is claimed before the move. A task of an
+ *      earlier attempt that was deleted since is brought back, and one whose checkbox drifted is
+ *      set again: until the session is moved, these blocks are the import's.
+ *   5. Verifies the tasks one by one against the source (count, order, text, checkbox, created
+ *      by a person, lock, notes). A mismatch moves nothing (needs attention).
+ *   6. The behavior fence, once all of the above holds: its own text onto the behavior page with
+ *      PR 4's short ids, its plugin SOP whole as that plugin's block (`pluginRulesSid`), so the
+ *      session's first run as an outline session and the plugin's later updates find them.
  *   7. Reads the file pointers again: a source that changed since step 1 moves nothing (the next
- *      attempt imports the new state). Then moves the session: `task_backend` from `spec` to
- *      `outline`, conditionally, and forgets the cached backend. Dynamic Spec rows are untouched.
+ *      attempt imports the new state). Then the move: one commit starts what was in progress
+ *      (the session's claims), and `task_backend` goes from `spec` to `outline`, conditionally;
+ *      should that not happen, the claims are given back. Dynamic Spec rows are untouched.
  *
  * Every write is a system commit of the session through the write path, kind `import`, actor
  * {@link OUTLINE_SPEC_IMPORT_ACTOR}, the session's owner responsible: what lands in the session
@@ -44,7 +48,9 @@
  * thread), the event loop yielded between them; existing short ids looked up
  * {@link SPEC_IMPORT_LIMITS.sidLookup} at a time; files converted one at a time. `signal` is
  * checked between commits (a commit is atomic), so an import cut short (a time limit, a crash)
- * leaves whole commits behind, and the next attempt writes the rest.
+ * leaves whole commits behind, and the next attempt writes the rest. The idle triggers give an
+ * import a time budget and stop it when a message for the session arrives
+ * ({@link SpecImportPaused}): the session is `busy` then, not failed, and the next round goes on.
  *
  * While it runs, Dynamic Spec writes to the session are refused and plugins' commands wait
  * (`task-source/backend.ts`).
@@ -53,23 +59,31 @@ import { hotSafe } from "@server/lib/hot-safe";
 import { getUserLanguage } from "@server/lib/i18n";
 import { logger } from "@server/lib/logger";
 import type { Locale } from "@server/lib/prompt-i18n";
-import { settings } from "@server/lib/settings";
+import { DEFAULTS, settings } from "@server/lib/settings";
 import { compareOrderKeys } from "@shared/outline";
+import type { OutlineSpecImportReason } from "@shared/outline-spec-import";
 import { splitBehaviorFence } from "../../behavior-fence-sop";
 import { specIndexSid } from "../../plugin-spec-compat";
 import { parseSpecTasksDocument, SPEC_TASKS_PATH, taskTextHash } from "../../spec-task-service";
 import { beginSpecImport, invalidateTaskBackend, isSpecImporting } from "../../task-source/backend";
-import { importBehaviorFenceText } from "../../task-source/outline-behavior";
+import {
+	behaviorImportTagOf,
+	behaviorImportTagOfSid,
+	findBehaviorPage,
+	importBehaviorFenceText,
+	OUTLINE_BEHAVIOR_IMPORT_ACTOR,
+} from "../../task-source/outline-behavior";
 import { writeImportedFenceSop } from "../../task-source/outline-plugin-rules";
 import { outlineAccessBackend } from "../access-reads";
-import { processBackgroundText } from "../edit-text-runner";
+import { OUTLINE_EDIT_TEXT_LIMITS, processBackgroundText } from "../edit-text-runner";
 import { isOutlineEnabled } from "../feature";
 import { OUTLINE_TASKS_PAGE_ALIAS } from "../model";
 import { OUTLINE_TASKS_PAGE_TITLE } from "../person-tasks";
-import { pluginBlockedNoteSid } from "../plugin-tasks";
+import { PluginTaskError, pluginBlockedNoteSid } from "../plugin-tasks";
 import { yieldToEventLoop } from "../session-scope";
 import { outlineStore } from "../store";
 import type { OutlineBlockMeta, OutlineSpaceRow } from "../store/port";
+import type { OutlineStructureRow } from "../store/read-port";
 import {
 	type OutlineBlockRef,
 	type OutlineCanonicalContent,
@@ -119,6 +133,10 @@ export const SPEC_IMPORT_LIMITS = {
 	stalePages: 500,
 	/** Children of the task page (and of the index page) looked at likewise. */
 	staleChildren: 1000,
+	/** Blocks of one stale subtree read to see who wrote them; more: kept (attention). */
+	staleSubtreeBlocks: 1600,
+	/** Distinct commits of one stale subtree looked up; more: kept (attention). */
+	staleCommits: 200,
 	/** Characters of a failure kept for the Spec panel. */
 	errorChars: 300,
 	/** Sessions whose last import is remembered (least recently touched dropped first). */
@@ -127,11 +145,22 @@ export const SPEC_IMPORT_LIMITS = {
 
 export type SpecImportTrigger = "run" | "sweep" | "manual";
 
-/** How Dynamic Spec sessions are imported (`outline.specImport`); `off` while the outline is. */
-export function specImportMode(): "auto" | "manual" | "off" {
+type SpecImportMode = "auto" | "manual" | "off";
+
+function isMode(value: unknown): value is SpecImportMode {
+	return value === "auto" || value === "manual" || value === "off";
+}
+
+/**
+ * How Dynamic Spec sessions are imported (`outline.specImport`; the shipped default is the one
+ * in `DEFAULTS`); `off` while the outline is.
+ */
+export function specImportMode(): SpecImportMode {
 	if (!isOutlineEnabled()) return "off";
 	const mode = settings.outline?.specImport;
-	return mode === "manual" || mode === "off" ? mode : "auto";
+	if (isMode(mode)) return mode;
+	const fallback = DEFAULTS.outline.specImport;
+	return isMode(fallback) ? fallback : "manual";
 }
 
 export type SpecImportOutcome =
@@ -146,7 +175,11 @@ export type SpecImportOutcome =
 	  }
 	/** Nothing to do: `reason` says why the session is not one the import moves. */
 	| { status: "skipped"; reason: "outline" | "subagent" | "external" | "missing" | "off" }
-	/** The session is running, or another import of it is: nothing was done. */
+	/**
+	 * The session is running, or another import of it is, or the import gave way to the session
+	 * (its time budget, a message for it; {@link SpecImportPaused}): what it wrote stays, and the
+	 * next attempt goes on from there.
+	 */
 	| { status: "busy" }
 	/**
 	 * Not moved. `attention`: trying again will not help until someone looks (too large, a
@@ -156,12 +189,16 @@ export type SpecImportOutcome =
 
 /** The last import of a session, as the Spec panel shows it. Kept in memory (see `rememberedOf`). */
 export interface SpecImportRecord {
-	status: "running" | "imported" | "failed" | "attention";
+	/** `busy`: the session was busy, or the import gave way to it; another attempt will go on. */
+	status: "running" | "imported" | "failed" | "attention" | "busy";
 	trigger: SpecImportTrigger;
 	at: string;
 	/** Attempts in this process that failed (the idle job gives up after a few). */
 	failures: number;
+	/** Why the last attempt did not move the session (English, as logged). */
 	error?: string;
+	/** The same, as the Spec panel says it in the reader's language. */
+	reason?: OutlineSpecImportReason;
 	tasks?: number;
 	pages?: number;
 }
@@ -210,13 +247,57 @@ export function specImportSkipReason(
 	return null;
 }
 
-/** An import that cannot succeed until someone looks. */
-class SpecImportAttention extends Error {}
+/** An import that cannot succeed until someone looks; `reason` is what the Spec panel says. */
+class SpecImportAttention extends Error {
+	constructor(
+		message: string,
+		readonly reason: OutlineSpecImportReason,
+	) {
+		super(message);
+	}
+}
+
+/** An attempt that did not move the session, which another attempt may (a known reason). */
+class SpecImportRetry extends Error {
+	constructor(
+		message: string,
+		readonly reason: OutlineSpecImportReason,
+	) {
+		super(message);
+	}
+}
+
+/**
+ * The reason an idle trigger aborts an import with: it gave way to the session (its time budget
+ * ran out, or a message for the session arrived). Not a failure: the outcome is `busy`, the
+ * attempt counts nothing against the session, and the next one writes the rest.
+ */
+export class SpecImportPaused extends Error {
+	/**
+	 * `urgent` (a message arrived): honoured at the next commit boundary. Otherwise (a time
+	 * budget) honoured once the attempt made a commit, so every attempt gets somewhere even when
+	 * converting one file takes longer than the budget.
+	 */
+	constructor(
+		message: string,
+		readonly urgent = false,
+	) {
+		super(message);
+	}
+}
 
 export interface SpecImportOptions {
 	trigger: SpecImportTrigger;
-	/** Checked between commits; an abort leaves what was committed and moves nothing. */
+	/**
+	 * Checked between commits and passed to the text conversions; an abort leaves what was
+	 * committed and moves nothing (with a {@link SpecImportPaused} reason the outcome is `busy`).
+	 */
 	signal?: AbortSignal;
+	/**
+	 * Giving way to the session ({@link SpecImportPaused} as the reason): looked at between
+	 * commits only, never cutting a conversion short, as that reason says.
+	 */
+	pause?: AbortSignal;
 	/**
 	 * Take the session for the import without interrupting it: resolves to a release function, or
 	 * rejects when the session (or one of its subagents) is busy. Absent: the caller holds the
@@ -262,6 +343,7 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 			try {
 				release = await options.admit(narratorId);
 			} catch {
+				rememberBusy(narratorId, options.trigger, previous);
 				return { status: "busy" };
 			}
 		}
@@ -293,7 +375,25 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 		});
 		return outcome;
 	} catch (error) {
+		if (
+			error instanceof SpecImportPaused ||
+			(options.signal?.aborted === true && options.signal.reason instanceof SpecImportPaused)
+		) {
+			const reason = error instanceof SpecImportPaused ? error : options.signal?.reason;
+			rememberBusy(narratorId, options.trigger, previous);
+			logger.info("Dynamic Spec import gave way to its session; the next attempt goes on", {
+				narratorId,
+				trigger: options.trigger,
+				reason: String(reason),
+				elapsedMs: Math.round(performance.now() - started),
+			});
+			return { status: "busy" };
+		}
 		const attention = error instanceof SpecImportAttention;
+		const reason: OutlineSpecImportReason =
+			error instanceof SpecImportAttention || error instanceof SpecImportRetry
+				? error.reason
+				: { code: "other" };
 		const message = (error instanceof Error ? error.message : String(error)).slice(
 			0,
 			SPEC_IMPORT_LIMITS.errorChars,
@@ -304,6 +404,7 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 			at: new Date().toISOString(),
 			failures: (previous?.failures ?? 0) + 1,
 			error: message,
+			reason,
 		});
 		logger.warn("Dynamic Spec import did not move a session", {
 			narratorId,
@@ -316,6 +417,20 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 		unguard?.();
 		release?.();
 	}
+}
+
+/** A busy attempt: remembered as such, counting nothing against the session. */
+function rememberBusy(
+	narratorId: string,
+	trigger: SpecImportTrigger,
+	previous: SpecImportRecord | undefined,
+): void {
+	remember(narratorId, {
+		status: "busy",
+		trigger,
+		at: new Date().toISOString(),
+		failures: previous?.failures ?? 0,
+	});
 }
 
 /** The files the import reads content of: live, written, readable. */
@@ -338,7 +453,16 @@ interface Context {
 	space: OutlineSpaceRow;
 	locale: Locale;
 	signal: AbortSignal | undefined;
+	pause: AbortSignal | undefined;
 	commits: number;
+}
+
+/** What the steps before the move leave for it. */
+interface Written {
+	tasks: number;
+	pages: number;
+	/** Tasks the move starts (block ids): in progress in the source, to do until then. */
+	start: string[];
 }
 
 async function run(
@@ -348,21 +472,22 @@ async function run(
 ): Promise<Extract<SpecImportOutcome, { status: "imported" }>> {
 	const { narratorId } = session;
 	const files = importable(pointers);
-	const unreadable = pointers.filter((p) => !p.deleted && p.revisionId === null).length;
+	const unreadable = pointers.filter((p) => p.revisionId === null).length;
 	if (pointers.length >= SPEC_IMPORT_READ_LIMITS.files || files.length > SPEC_IMPORT_LIMITS.files)
 		throw new SpecImportAttention(
 			`The session holds more than ${SPEC_IMPORT_LIMITS.files} Dynamic Spec files`,
+			{ code: "too_many_files", count: SPEC_IMPORT_LIMITS.files },
 		);
 	if (
 		tooLargeFor(pointers, { files: SPEC_IMPORT_LIMITS.files, chars: SPEC_IMPORT_LIMITS.totalChars })
 	)
 		throw new SpecImportAttention(
 			`The session's Dynamic Spec files hold more than ${SPEC_IMPORT_LIMITS.totalChars} characters`,
+			{ code: "too_large", count: SPEC_IMPORT_LIMITS.totalChars },
 		);
 
-	let tasks = 0;
-	let pages = 0;
-	let commits = 0;
+	let written: Written = { tasks: 0, pages: 0, start: [] };
+	let ctx: Context | null = null;
 	if (files.length > 0) {
 		const locale: Locale = session.ownerUserId
 			? await getUserLanguage(session.ownerUserId).catch(() => "en" as const)
@@ -371,29 +496,108 @@ async function run(
 			{ kind: "session", narratorId },
 			new Date().toISOString(),
 		);
-		const ctx: Context = { session, space, locale, signal: options.signal, commits: 0 };
-		const written = await writeEverything(ctx, files);
-		tasks = written.tasks;
-		pages = written.pages;
-		commits = ctx.commits;
+		ctx = { session, space, locale, signal: options.signal, pause: options.pause, commits: 0 };
+		written = await writeEverything(ctx, files);
 	}
 
 	// Moved only when what was read is still what is there, and the outline still on.
 	options.signal?.throwIfAborted();
-	if (specImportMode() === "off") throw new Error("The outline was switched off during the import");
+	if (specImportMode() === "off")
+		throw new SpecImportRetry("The outline was switched off during the import", { code: "off" });
 	if (session.namespaceId) {
 		const now = await readSpecFilePointers(session.namespaceId);
 		if (pointerKey(now) !== pointerKey(pointers))
-			throw new Error("The session's Dynamic Spec changed during the import");
+			throw new SpecImportRetry("The session's Dynamic Spec changed during the import", {
+				code: "changed",
+			});
 	}
-	if (!(await switchSessionToOutline(narratorId))) {
-		// Someone else moved it (or it is gone): what is there is right either way.
-		invalidateTaskBackend(narratorId);
-		throw new Error("The session was no longer a Dynamic Spec session when the import ended");
-	}
+	await move(ctx, narratorId, written.start);
 	invalidateTaskBackend(narratorId);
 	await afterMove(session, options);
-	return { status: "imported", tasks, pages, unreadable, commits };
+	return {
+		status: "imported",
+		tasks: written.tasks,
+		pages: written.pages,
+		unreadable,
+		commits: ctx?.commits ?? 0,
+	};
+}
+
+/**
+ * Step 7: start what was in progress (one commit: the session's claims, by the write path) and
+ * move the session. Between the two only the move itself is waited on; should the session not
+ * be moved by this attempt, the claims are given back, so an import that does not move a
+ * session leaves it holding nothing.
+ */
+async function move(
+	ctx: Context | null,
+	narratorId: string,
+	start: readonly string[],
+): Promise<void> {
+	let started: string[] = [];
+	if (ctx && start.length > 0) {
+		const metas = await outlineStore.getBlockMetas(ctx.space.id, { ids: start });
+		const todo = metas
+			.filter((meta) => !meta.deleted && meta.taskJson?.status === "todo")
+			.map((meta) => meta.id);
+		if (todo.length > 0) {
+			await commit(
+				ctx,
+				todo.map((id) => ({ op: "setTask" as const, block: { id }, task: { status: "doing" } })),
+				todo.map(() => null),
+				SPEC_IMPORT_TEXT[ctx.locale].summaryStart(todo.length),
+			);
+			started = todo;
+		}
+		const claims = new Map(
+			(await outlineStore.getTaskClaims(start)).map((row) => [row.taskBlockId, row]),
+		);
+		const unclaimed = start.filter((id) => claims.get(id)?.holderNarratorId !== narratorId);
+		if (unclaimed.length > 0) {
+			await giveBack(ctx, started);
+			throw new SpecImportAttention(
+				`${unclaimed.length} task(s) in progress could not be started by the session`,
+				{ code: "not_started", count: unclaimed.length },
+			);
+		}
+	}
+	let moved: boolean;
+	try {
+		moved = await switchSessionToOutline(narratorId);
+	} catch (error) {
+		await giveBack(ctx, started);
+		throw error;
+	}
+	if (moved) return;
+	invalidateTaskBackend(narratorId);
+	// Moved by someone else meanwhile (another import): the tasks are its in-progress work now.
+	const now = await readSpecImportSession(narratorId).catch(() => null);
+	if (now?.taskBackend !== "outline") await giveBack(ctx, started);
+	throw new SpecImportRetry(
+		"The session was no longer a Dynamic Spec session when the import ended",
+		{ code: "moved_elsewhere" },
+	);
+}
+
+/** Put back to do what the move started (its claims released); never rejects. */
+async function giveBack(ctx: Context | null, started: readonly string[]): Promise<void> {
+	if (!ctx || started.length === 0) return;
+	try {
+		await commit(
+			ctx,
+			started.map((id) => ({ op: "setTask" as const, block: { id }, task: { status: "todo" } })),
+			started.map(() => null),
+			SPEC_IMPORT_TEXT[ctx.locale].summaryGiveBack(started.length),
+			{ ignoreSignal: true },
+		);
+	} catch (error) {
+		// Its lease runs out instead (the lease keeper renews no Dynamic Spec session's claims).
+		logger.warn("Could not give back the tasks an unfinished Dynamic Spec import started", {
+			narratorId: ctx.session.narratorId,
+			tasks: started.length,
+			error: String(error),
+		});
+	}
 }
 
 function pointerKey(pointers: readonly SpecImportFilePointer[]): string {
@@ -443,14 +647,30 @@ async function afterMove(session: SpecImportSession, options: SpecImportOptions)
 async function writeEverything(
 	ctx: Context,
 	files: readonly SpecImportFilePointer[],
-): Promise<{ tasks: number; pages: number }> {
+): Promise<Written> {
 	const { session, locale } = ctx;
 	const { narratorId } = session;
 	const tasksFile = files.find((p) => p.path === SPEC_TASKS_PATH) ?? null;
 	const fenceFile = files.find((p) => p.path === "behavior_fence") ?? null;
 	const notes = files.filter((p) => p !== tasksFile && p !== fenceFile);
 
-	// The tasks first in memory (their plan decides what is stale), written after the notes.
+	// The fence first in memory: its own text is parsed like PR 4's import parses it, and a text
+	// past that parse's limit cannot be imported until someone shortens it (needs attention once,
+	// before anything is written, rather than failing every attempt after writing the rest).
+	let fence: { own: string; sop: string } | null = null;
+	if (fenceFile?.revisionId) {
+		const content =
+			(await readSpecRevisionContents([fenceFile.revisionId])).get(fenceFile.revisionId) ?? "";
+		const split = splitBehaviorFence(content);
+		fence = { own: split.own, sop: split.sop };
+		if (Buffer.byteLength(fence.own, "utf8") > OUTLINE_EDIT_TEXT_LIMITS.maxBytes)
+			throw new SpecImportAttention(
+				`The behavior fence's own text is larger than the ${OUTLINE_EDIT_TEXT_LIMITS.maxBytes / 1024} KiB its import reads`,
+				{ code: "fence_too_large", count: OUTLINE_EDIT_TEXT_LIMITS.maxBytes / 1024 },
+			);
+	}
+
+	// The tasks next in memory (their plan decides what is stale), written after the notes.
 	let taskPlan: SpecImportTaskPlan | null = null;
 	let brokenTasks: string | null = null;
 	if (tasksFile?.revisionId) {
@@ -471,11 +691,17 @@ async function writeEverything(
 			const protectors = session.namespaceId
 				? await readSpecProtectors(session.namespaceId)
 				: { byHash: new Map(), truncated: false };
+			if (protectors.truncated)
+				logger.warn(
+					"Dynamic Spec import read only part of a session's protected-task locks; the protected tasks it did not read are taken as a person's (locked)",
+					{ narratorId, read: SPEC_IMPORT_READ_LIMITS.locks },
+				);
 			taskPlan = planSpecTasks({
 				narratorId,
 				revisionId: tasksFile.revisionId,
 				tasks,
 				normalized: await normalizeTasks(tasks, ctx.signal),
+				// Not read (or not found): "unknown", which locks like a person's protection.
 				protectors: tasks.map((task) =>
 					task.protected ? (protectors.byHash.get(taskTextHash(task.text)) ?? "unknown") : null,
 				),
@@ -487,7 +713,7 @@ async function writeEverything(
 		}
 	}
 
-	// What an earlier attempt wrote from another revision goes first (step 2).
+	// What an earlier attempt wrote from another source goes first (step 2).
 	const notePointers: Array<SpecImportFilePointer & { revisionId: string }> = notes.flatMap((p) =>
 		p.revisionId ? [{ ...p, revisionId: p.revisionId }] : [],
 	);
@@ -496,12 +722,18 @@ async function writeEverything(
 			(p) => specFileTag(narratorId, p.path, p.revisionId as string),
 		),
 	);
-	await removeStale(ctx, keep, taskPlan?.sidPrefix ?? null);
+	const kept = await removeStale(ctx, {
+		keepFileTags: keep,
+		taskSidPrefix: taskPlan?.sidPrefix ?? null,
+		fenceTag: fence ? behaviorImportTagOf(fence.own) : null,
+		indexMd: notePointers.some((p) => p.path === "index.md"),
+	});
 
 	// Notes: a few files' contents read at a time, each converted and written before the next, so
 	// the converted blocks of one file are held at a time, never the whole session's.
 	let pages = 0;
 	const writeFile = async (path: string, revisionId: string, text: string) => {
+		giveWay(ctx);
 		const converted = await processBackgroundText(
 			{
 				kind: "notes",
@@ -530,33 +762,45 @@ async function writeEverything(
 	if (brokenTasks !== null && tasksFile?.revisionId)
 		await writeFile(SPEC_TASKS_PATH, tasksFile.revisionId, brokenTasks);
 
+	let start: string[] = [];
 	if (taskPlan && taskPlan.tasks.length > 0) {
 		const pageId = await ensureTasksPage(ctx);
 		const summary = SPEC_IMPORT_TEXT[locale].summaryTasks(taskPlan.tasks.length);
 		await writeNodes(ctx, taskPlan.tasks, { id: pageId }, summary, { heal: true });
 		await writeNodes(ctx, taskPlan.notes, null, summary);
-		await verifyTasks(ctx, taskPlan.expected, pageId);
-	}
-
-	if (fenceFile?.revisionId) {
-		const content =
-			(await readSpecRevisionContents([fenceFile.revisionId])).get(fenceFile.revisionId) ?? "";
-		const fence = splitBehaviorFence(content);
-		if (fence.own) await importBehaviorFenceText(narratorId, locale, fence.own);
-		if (fence.sop)
-			await writeImportedFenceSop(
-				{ narratorId, ownerUserId: session.ownerUserId, locale },
-				fence.sop,
-			);
+		start = await verifyTasks(ctx, taskPlan.expected, pageId);
 	}
 	if (brokenTasks !== null)
 		throw new SpecImportAttention(
 			"tasks.json is not a valid task list: it was imported as a page, the session was not moved",
+			{ code: "broken_tasks" },
 		);
-	return { tasks: taskPlan?.tasks.length ?? 0, pages };
+	if (kept > 0)
+		throw new SpecImportAttention(
+			`${kept} block(s) an earlier, unfinished import wrote hold what someone added or changed since: they were kept; move what is yours out of them (or delete them), then import again`,
+			{ code: "kept_blocks", count: kept },
+		);
+
+	// Step 6, once everything above holds: the fence text goes onto the behavior page last, so an
+	// attempt that does not get this far leaves nothing of a fence that may still change.
+	if (fence?.own)
+		await importBehaviorFenceText(narratorId, locale, fence.own, { signal: ctx.signal });
+	if (fence?.sop.trim()) {
+		ctx.signal?.throwIfAborted();
+		try {
+			await writeImportedFenceSop(
+				{ narratorId, ownerUserId: session.ownerUserId, locale },
+				fence.sop,
+			);
+		} catch (error) {
+			if (error instanceof PluginTaskError && error.publicCode === "PAYLOAD_TOO_LARGE")
+				throw new SpecImportAttention(error.message, { code: "sop_too_large" });
+			throw error;
+		}
+	}
+	return { tasks: taskPlan?.tasks.length ?? 0, pages, start };
 }
 
-/** Files grouped so one read stays within the port's limits. */
 function contentBatches<T extends { chars: number | null }>(files: readonly T[]): T[][] {
 	const out: T[][] = [];
 	let batch: T[] = [];
@@ -580,28 +824,23 @@ function contentBatches<T extends { chars: number | null }>(files: readonly T[])
 }
 
 /**
- * The tasks' texts as the write path would store them, normalized off the main thread. A text
- * the dialect splits (several paragraphs, a list) is left to the write path, which splits it the
- * same way a `/goal` of that text is split: the first block is the task, the rest go under it.
+ * The tasks' texts as the import writes them, worked out off the main thread past the inline
+ * size: kept as written (`importTaskText` in `edit-text.ts`), canonical when that is the text
+ * itself so `/goal` and the plugin commands dedupe against it. Null: a text of several paragraphs,
+ * left to the write path, which splits it the same way a `/goal` of that text is split.
  */
 async function normalizeTasks(
 	tasks: readonly SpecImportTask[],
 	signal: AbortSignal | undefined,
 ): Promise<Array<NormalizedTaskText | null>> {
 	if (tasks.length === 0) return [];
-	const normalized = await processBackgroundText(
-		{ kind: "normalize", contents: tasks.map((task) => task.text) },
+	const texts = await processBackgroundText(
+		{ kind: "taskTexts", contents: tasks.map((task) => task.text) },
 		{ signal },
 	);
-	return tasks.map((_, i) => {
-		const entry = normalized[i];
-		return entry && entry.split.length === 0
-			? { content: entry.content, links: entry.links }
-			: null;
-	});
+	return tasks.map((_, i) => texts[i] ?? null);
 }
 
-/** What of `sids` is in the space already: its id and whether it is deleted. */
 async function existingBySid(
 	space: OutlineSpaceRow,
 	sids: readonly string[],
@@ -620,8 +859,12 @@ async function commit(
 	ops: OutlineOp[],
 	canonical: Array<OutlineCanonicalContent | null>,
 	summary: string,
+	options: { ignoreSignal?: boolean } = {},
 ) {
-	ctx.signal?.throwIfAborted();
+	if (!options.ignoreSignal) {
+		ctx.signal?.throwIfAborted();
+		giveWay(ctx);
+	}
 	const started = performance.now();
 	const result = await writeOutline(
 		{
@@ -644,6 +887,12 @@ async function commit(
 		});
 	await yieldToEventLoop();
 	return result;
+}
+
+/** Give way to the session when asked to (see {@link SpecImportPaused}). */
+function giveWay(ctx: Context): void {
+	const reason: unknown = ctx.pause?.aborted ? ctx.pause.reason : null;
+	if (reason instanceof SpecImportPaused && (reason.urgent || ctx.commits > 0)) throw reason;
 }
 
 /**
@@ -740,17 +989,18 @@ async function writeNodes(
 	await flush();
 }
 
-/** A task of an earlier attempt whose checkbox or person mark is no longer the plan's. */
+/**
+ * A task of an earlier attempt whose checkbox or person mark is no longer the plan's. A task the
+ * move starts may read in progress already (an attempt that started it and stopped before the
+ * move): that is not a drift, and setting it back would be a commit on every attempt.
+ */
 function drifted(found: OutlineBlockMeta, node: SpecImportNode): boolean {
 	const now = found.taskJson;
 	if (!now || !node.task) return true;
-	return (
-		now.status !== node.task.status ||
-		(now.humanCreated === true) !== (node.task.humanCreated === true)
-	);
+	const status = now.status === node.task.status || (node.start === true && now.status === "doing");
+	return !status || (now.humanCreated === true) !== (node.task.humanCreated === true);
 }
 
-/** The session's task page (alias `tasks`), made when it has none. */
 async function ensureTasksPage(ctx: Context): Promise<string> {
 	const [owner] = await outlineStore.findAliasOwners(ctx.space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
 	if (owner) return owner.id;
@@ -772,23 +1022,48 @@ async function ensureTasksPage(ctx: Context): Promise<string> {
 	return pageId;
 }
 
+/** The actors whose commits are the import's own: this import, and PR 4's fence import it calls. */
+const IMPORT_ACTORS: ReadonlySet<string> = new Set([
+	OUTLINE_SPEC_IMPORT_ACTOR,
+	OUTLINE_BEHAVIOR_IMPORT_ACTOR,
+]);
+
+interface StaleBlock {
+	id: string;
+	versionSeq: number;
+	/** A page (deleted in a commit of its own, read whole); else a block and what is under it. */
+	page: boolean;
+}
+
 /**
  * Take away what an earlier attempt wrote from a source that is not the one read now: the
  * import's tasks of another `tasks.json` revision on the task page (their notes go with them),
- * its pages of other file revisions, and its blocks of another `index.md` revision on the index
- * page. Only the import's own short ids are touched (`isImportSid`), and only before the session
- * is moved, while these blocks are nobody's work yet. Bounded reads; a page goes in a commit of
- * its own.
+ * its pages of other file revisions (the `index.md` page when that file is gone), its blocks of
+ * another `index.md` revision on the index page, and on the behavior page its blocks of another
+ * fence text. Only the import's own short ids are looked at, only before the session is moved,
+ * and only what nobody else wrote is taken away: a stale block someone added to, moved or edited
+ * since ({@link onlyImportWrote}) is kept as it is, and counted (the caller does not move the
+ * session then). Bounded reads; a page goes in a commit of its own. Returns how many were kept.
  */
 async function removeStale(
 	ctx: Context,
-	keepFileTags: ReadonlySet<string>,
-	taskSidPrefix: string | null,
-): Promise<void> {
+	current: {
+		keepFileTags: ReadonlySet<string>;
+		taskSidPrefix: string | null;
+		/** The tag of the fence text read now (null: no fence text). */
+		fenceTag: string | null;
+		/** `index.md` is among the files read now. */
+		indexMd: boolean;
+	},
+): Promise<number> {
 	const { space } = ctx;
 	const limits = SPEC_IMPORT_LIMITS;
-	const stale: string[] = [];
-	const stalePages: string[] = [];
+	const stale: StaleBlock[] = [];
+	const block = (meta: OutlineBlockMeta, page = false): StaleBlock => ({
+		id: meta.id,
+		versionSeq: meta.versionSeq,
+		page,
+	});
 	const [tasksPage] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
 	if (tasksPage) {
 		for (const meta of await outlineStore.listLastChildMetas(
@@ -797,24 +1072,29 @@ async function removeStale(
 			limits.staleChildren,
 		)) {
 			if (!meta.sid.startsWith("st") || !isImportSid(meta.sid)) continue;
-			if (taskSidPrefix === null || !meta.sid.startsWith(taskSidPrefix)) stale.push(meta.id);
+			if (current.taskSidPrefix === null || !meta.sid.startsWith(current.taskSidPrefix))
+				stale.push(block(meta));
 		}
 	}
 	const [index] = await outlineStore.getBlockMetas(space.id, { sids: [specIndexSid()] });
 	if (index && !index.deleted) {
-		for (const meta of await outlineStore.listLastChildMetas(
-			space.id,
-			index.id,
-			limits.staleChildren,
-		)) {
-			if (
-				meta.sid.startsWith("sb") &&
-				isImportSid(meta.sid) &&
-				!keepFileTags.has(fileTagOfSid(meta.sid))
-			)
-				stale.push(meta.id);
-		}
+		// The file is gone: its page goes too, rather than staying behind empty.
+		if (!current.indexMd) stale.push(block(index, true));
+		else
+			for (const meta of await outlineStore.listLastChildMetas(
+				space.id,
+				index.id,
+				limits.staleChildren,
+			)) {
+				if (
+					meta.sid.startsWith("sb") &&
+					isImportSid(meta.sid) &&
+					!current.keepFileTags.has(fileTagOfSid(meta.sid))
+				)
+					stale.push(block(meta));
+			}
 	}
+	const stalePages: string[] = [];
 	let after: { orderKey: string; id: string } | null = null;
 	for (let read = 0; read < limits.stalePages; ) {
 		const page = await outlineStore.listSpacePages(space.id, { after, limit: 100 });
@@ -822,7 +1102,7 @@ async function removeStale(
 			if (
 				row.sid.startsWith("sp") &&
 				isImportSid(row.sid) &&
-				!keepFileTags.has(fileTagOfSid(row.sid))
+				!current.keepFileTags.has(fileTagOfSid(row.sid))
 			)
 				stalePages.push(row.id);
 		}
@@ -831,9 +1111,38 @@ async function removeStale(
 		if (page.length < 100 || !last) break;
 		after = { orderKey: last.orderKey, id: last.id };
 	}
+	for (let i = 0; i < stalePages.length; i += limits.sidLookup)
+		for (const meta of await outlineStore.getBlockMetas(space.id, {
+			ids: stalePages.slice(i, i + limits.sidLookup),
+		}))
+			if (!meta.deleted) stale.push(block(meta, true));
+	const behavior = await findBehaviorPage(space.id);
+	if (behavior) {
+		for (const meta of await outlineStore.listLastChildMetas(
+			space.id,
+			behavior.id,
+			limits.staleChildren,
+		)) {
+			const tag = behaviorImportTagOfSid(meta.sid);
+			if (tag !== null && tag !== current.fenceTag) stale.push(block(meta));
+		}
+	}
+
+	const removable: StaleBlock[] = [];
+	let kept = 0;
+	for (const entry of stale) {
+		if (await onlyImportWrote(space, entry)) removable.push(entry);
+		else kept++;
+	}
+	if (kept > 0)
+		logger.warn("Dynamic Spec import kept blocks of an earlier attempt that others wrote to", {
+			narratorId: ctx.session.narratorId,
+			kept,
+		});
 	const summary = SPEC_IMPORT_TEXT[ctx.locale].summaryStale;
-	for (let i = 0; i < stale.length; i += limits.staleDeletesPerCommit) {
-		const ids = stale.slice(i, i + limits.staleDeletesPerCommit);
+	const blocks = removable.filter((entry) => !entry.page).map((entry) => entry.id);
+	for (let i = 0; i < blocks.length; i += limits.staleDeletesPerCommit) {
+		const ids = blocks.slice(i, i + limits.staleDeletesPerCommit);
 		await commit(
 			ctx,
 			ids.map((id) => ({ op: "delete" as const, block: { id } })),
@@ -841,24 +1150,81 @@ async function removeStale(
 			summary,
 		);
 	}
-	for (const id of stalePages)
-		await commit(ctx, [{ op: "delete", block: { id } }], [null], summary);
+	for (const entry of removable)
+		if (entry.page) await commit(ctx, [{ op: "delete", block: { id: entry.id } }], [null], summary);
+	return kept;
+}
+
+/**
+ * Whether only the import wrote what is under `root` now, itself included: every live block's
+ * current version was opened by one of the import's commits. A block someone added, moved there
+ * or edited was not. Bounded: at most {@link SPEC_IMPORT_LIMITS.staleSubtreeBlocks} blocks read
+ * without content, and {@link SPEC_IMPORT_LIMITS.staleCommits} commits by seq; past either, false
+ * (kept: it cannot tell).
+ */
+async function onlyImportWrote(space: OutlineSpaceRow, root: StaleBlock): Promise<boolean> {
+	const limit = SPEC_IMPORT_LIMITS.staleSubtreeBlocks;
+	const seqs = new Set<number>([root.versionSeq]);
+	const add = (rows: ReadonlyArray<Pick<OutlineStructureRow, "versionSeq">>) => {
+		for (const row of rows) seqs.add(row.versionSeq);
+	};
+	if (root.page) {
+		const { rows, truncated } = await outlineStore.listPageStructure(root.id, {
+			asOf: null,
+			limit,
+		});
+		if (truncated) return false;
+		add(rows);
+	} else {
+		let level = [root.id];
+		let seen = 0;
+		while (level.length > 0) {
+			const next: string[] = [];
+			for (let i = 0; i < level.length; i += SPEC_IMPORT_LIMITS.sidLookup) {
+				const children = await outlineStore.listChildMetas(
+					space.id,
+					level.slice(i, i + SPEC_IMPORT_LIMITS.sidLookup),
+					limit - seen + 1,
+				);
+				seen += children.length;
+				if (seen > limit) return false;
+				add(children);
+				next.push(...children.map((child) => child.id));
+			}
+			level = next;
+		}
+	}
+	if (seqs.size > SPEC_IMPORT_LIMITS.staleCommits) return false;
+	const wanted = [...seqs];
+	let found = 0;
+	for (let i = 0; i < wanted.length; i += 100) {
+		for (const row of await outlineStore.getCommitsBySeqs(space.id, wanted.slice(i, i + 100))) {
+			if (row.actorKind !== "system" || !IMPORT_ACTORS.has(row.actorId)) return false;
+			found++;
+		}
+	}
+	return found === wanted.length;
 }
 
 /**
  * The imported tasks against the source, one by one (PR 12 design §2.5, step 1): all there, live,
  * on the task page in the source's order, with the planned text, checkbox, person mark and lock;
- * what is in progress claimed by the session; every note under its task. Bounded: the tasks (at
- * most 100) by short id, their contents and claims by id. A mismatch rejects (needs attention).
+ * every note under its task. A task the move starts reads to do, or in progress already (an
+ * attempt that started it and stopped before the move; the move checks its claim). Bounded: the
+ * tasks (at most 100) by short id, their contents by id. A mismatch rejects (needs attention).
+ * Returns the block ids of the tasks the move starts.
  */
 async function verifyTasks(
 	ctx: Context,
 	expected: readonly SpecImportExpectedTask[],
 	tasksPageId: string,
-): Promise<void> {
+): Promise<string[]> {
 	const { space, session } = ctx;
 	const fail = (index: number, what: string): never => {
-		throw new SpecImportAttention(`Imported task ${index + 1} does not match its source: ${what}`);
+		throw new SpecImportAttention(`Imported task ${index + 1} does not match its source: ${what}`, {
+			code: "task_mismatch",
+			count: index + 1,
+		});
 	};
 	const metas = await existingBySid(
 		space,
@@ -875,15 +1241,6 @@ async function verifyTasks(
 			row.content,
 		]),
 	);
-	const claimed = expected.flatMap((task, i) =>
-		task.claimed ? [(tasks[i] as OutlineBlockMeta).id] : [],
-	);
-	const claims = new Map(
-		(claimed.length > 0 ? await outlineStore.getTaskClaims(claimed) : []).map((row) => [
-			row.taskBlockId,
-			row,
-		]),
-	);
 	for (const [i, task] of expected.entries()) {
 		const meta = tasks[i] as OutlineBlockMeta;
 		const json = meta.taskJson;
@@ -891,17 +1248,17 @@ async function verifyTasks(
 		const before = i > 0 ? (tasks[i - 1] as OutlineBlockMeta) : null;
 		if (before && compareOrderKeys(before.orderKey, meta.orderKey) >= 0) fail(i, "its order");
 		if (!json) return fail(i, "it is not a task");
-		if (json.status !== task.status) fail(i, `its checkbox is ${json.status}`);
+		if (json.status !== task.status && !(task.start && json.status === "doing"))
+			fail(i, `its checkbox is ${json.status}`);
 		if ((json.humanCreated === true) !== task.humanCreated) fail(i, "its protection");
 		const lockedByOwner = json.lock?.by.kind === "human" && json.lock.by.id === session.ownerUserId;
 		if (lockedByOwner !== task.locked) fail(i, "its lock");
 		if (task.content !== null && contents.get(meta.id) !== task.content) fail(i, "its text");
-		if (task.claimed && claims.get(meta.id)?.holderNarratorId !== session.narratorId)
-			fail(i, "it is not claimed by the session");
 		for (const sid of task.noteSids) {
 			const note = metas.get(sid);
 			// A note a person deleted since is their choice; one that was never written is not.
 			if (!note || (!note.deleted && note.parentId !== meta.id)) fail(i, "a note under it");
 		}
 	}
+	return expected.flatMap((task, i) => (task.start ? [(tasks[i] as OutlineBlockMeta).id] : []));
 }

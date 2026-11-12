@@ -99,12 +99,16 @@ export interface SpecImportFilePointer {
 	chars: number | null;
 }
 
-/** The namespace's file pointers by path, at most {@link SPEC_IMPORT_READ_LIMITS.files}. */
+/**
+ * The namespace's live file pointers by path, at most {@link SPEC_IMPORT_READ_LIMITS.files}. A
+ * deleted file is left out: it is not imported and does not count toward the limit (a file
+ * deleted during the import still changes what this returns).
+ */
 export async function readSpecFilePointers(namespaceId: string): Promise<SpecImportFilePointer[]> {
 	const rows = await runOutlineAccessQuery(sql`
 		select f.path, f.revision_id, f.deleted, r.id as revision_found, length(r.content) as chars
 		from spec_namespace_files f left join spec_file_revisions r on r.id = f.revision_id
-		where f.namespace_id = ${namespaceId}
+		where f.namespace_id = ${namespaceId} and not f.deleted
 		order by f.path limit ${SPEC_IMPORT_READ_LIMITS.files}
 	`);
 	return rows.map((row) => {
