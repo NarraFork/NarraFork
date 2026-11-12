@@ -205,3 +205,17 @@ export async function switchSessionToOutline(narratorId: string): Promise<boolea
 	`);
 	return rows.length > 0;
 }
+
+/**
+ * Move a session back to Dynamic Spec (an administrator's revert, outline P2 PR 12b2): its column
+ * goes from `outline` to `spec`, only while it is still `outline` and the narrator is not a
+ * subagent. False when nothing changed.
+ */
+export async function switchSessionToSpec(narratorId: string): Promise<boolean> {
+	const rows = await runOutlineAccessQuery(sql`
+		update narrators set task_backend = 'spec'
+		where id = ${narratorId} and task_backend = 'outline' and type <> 'subagent'
+		returning id
+	`);
+	return rows.length > 0;
+}
