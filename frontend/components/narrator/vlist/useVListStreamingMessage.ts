@@ -516,11 +516,15 @@ export function useVListStreamingMessage(
 				width,
 				height,
 				rawParentToolUseId,
+				error,
+				errorCode,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
 				upsertStreamingImageGenerationBlock(blocksRef.current, {
 					id,
 					status,
+					error,
+					errorCode,
 					revisedPrompt,
 					outputIndex,
 					partialImageIndex,

@@ -30,6 +30,7 @@ import {
 	stripDelegationNote,
 	withDelegationNote,
 } from "../outline/delegation";
+import { DELEGATION_TEXT } from "../outline/delegation-text";
 import {
 	OutlineClaimChangedError,
 	OutlineTaskClaimedError,
@@ -1064,7 +1065,9 @@ describe("the instructions", () => {
 		expect(brief).not.toContain("SECRET DETAIL");
 		expect(brief).not.toContain("[[");
 		expect(brief).not.toContain(task?.sid as string);
-		expect(brief.trimEnd().endsWith("what needs a person's decision.")).toBe(true);
+		// The closing line: report conclusion first (task tree readability PR D).
+		expect(brief.trimEnd().endsWith(DELEGATION_TEXT.brief.closing)).toBe(true);
+		expect(DELEGATION_TEXT.brief.closing).toContain("conclusion first");
 	});
 
 	test("bounded: the tree breadth first within 16 KiB, the rest counted", async () => {

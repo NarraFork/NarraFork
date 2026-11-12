@@ -22,6 +22,12 @@ export function ProviderBalanceStatus({
 	});
 	const rawGeneration = settings?.providerBalanceGenerations?.[providerId];
 	const generation = typeof rawGeneration === "string" ? rawGeneration : undefined;
+	// The capability belongs to the apikey-quota plugin, so disabling it removes this whole row
+	// instead of leaving a status the operator cannot act on. Served by the projection this
+	// component already fetches; an unknown answer counts as enabled (the safe direction).
+	const capabilityEnabled =
+		(settings as { providerBalanceCapability?: { enabled?: unknown } } | undefined)
+			?.providerBalanceCapability?.enabled !== false;
 	const query = useProviderBalance(providerId, generation);
 	const canProbe =
 		user?.role === "admin" &&
@@ -30,6 +36,9 @@ export function ProviderBalanceStatus({
 		!query.isPending &&
 		!query.isError;
 	const probe = useProbeProviderBalance(providerId, generation, canProbe);
+	// The capability is the plugin's, so a disabled plugin removes the whole row — status label
+	// and rediscover action included — instead of advertising a state the operator cannot change.
+	if (!capabilityEnabled) return null;
 	if (!generation) return null;
 	const snapshot = query.data;
 	const formatted = formatProviderBalance(snapshot, t, query.isError);
@@ -52,10 +61,19 @@ export function ProviderBalanceStatus({
 					</Button>
 				)}
 			</Group>
-			{snapshot?.balance && (
+			{snapshot?.balance ? (
 				<Text size="xs" style={{ whiteSpace: "pre-line" }}>
 					{formatted.detailedQuotaBalance}
 				</Text>
+			) : (
+				// Without a value the failure code is the only thing worth showing: "the plugin is
+				// disabled" and "your token was rejected" need different fixes.
+				!(query.isError || probe.isError) &&
+				snapshot?.error && (
+					<Text size="xs" c={snapshot.error === "plugin_not_enabled" ? "dimmed" : "red"}>
+						{formatted.quotaBalance}
+					</Text>
+				)
 			)}
 			{(query.isError || probe.isError) && (
 				<Text size="xs" c="red">

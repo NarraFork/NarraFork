@@ -35,6 +35,39 @@ bun run build:linux-arm64
 
 `--platform=` 支持完整后缀（`darwin-arm64`、`linux-x64`、`windows-x64`）或短别名前缀（`windows`/`linux`/`darwin` 匹配对应 `*-*`）；裸 `arm64` 不会命中。
 
+## 本机稳定运行
+
+`bun run start` 和 `bun run start:dev` 先构建本机单文件运行产物，再从该产物启动后端。
+主程序、Worker、迁移及原生依赖固定在同一次构建中；启动后对源码执行 rebase，不会改变后续新建 Worker 使用的代码。
+`start` 使用已构建的 `dist/frontend`；`start:dev` 保留源码 Vite 前端及原端口（前端 41221、后端默认 7778），不要求先构建整站前端。
+显式 `dev` / `dev:all` / `dev:cold` 仍是源码开发模式，不提供这层隔离。
+
+构建不会发布版本，也不会重启或接管已有服务。迁移由新后端取得实例锁后使用内嵌材料执行，不再在启动前单独运行源码迁移。
+构建失败即停止，不回退源码或某个旧版本。构建期间应避免修改源码；运行版本固定不等于构建输入自动取得了 Git 快照。
+
+### 构建一次，多次启动
+
+每次构建输出独占路径以及耗时、产物大小。**日常重启建议复用该路径，代码变更后再构建**：
+
+```sh
+# 只构建后端，用于与 Vite 搭配
+bun run build:runtime
+bun run start:dev --runtime="<构建输出的可执行文件绝对路径>"
+
+# 连同已有的静态前端一起构建
+bun run build
+bun run build:runtime --frontend
+bun run start --runtime="<构建输出的可执行文件绝对路径>"
+```
+
+`--runtime` 明确选择已有产物，跳过编译；找不到该文件会报错，不自动换一个版本。
+后端参数可继续传递，例如 `--no-auto-resume`。不要为了测试上述命令而停止承载会话的服务器；验证请使用独立 HOME、端口和数据库。
+
+产物位于 `NARRAFORK_HOME/runtime/<buildId>/`（默认 `~/.narrafork/runtime/`），成功构建后不自动覆盖或删除。
+保留正在使用的版本及需要回退的版本；确认某版本已不被服务、维护子进程或启动配置引用后，才手动删除其整个独占目录。
+不要删除正在运行的版本，即使后端已经启动，后续 Worker 和维护子进程仍可能需要它。
+本机产物不走正式发行版的自动替换更新；源码更新后重新构建并由操作员选择切换时机。
+
 ## 构建流程
 
 构建脚本 `scripts/build-cross-platform.ts` 执行以下步骤：
@@ -198,4 +231,6 @@ chmod +x dist/narrafork-*
 - `bun run build:cross --platform=linux-x64` — 构建指定平台
 - `bun run build:update-server` — 构建更新服务器
 - `bun run build:android-rootfs` — 构建 Android rootfs
-- `bun run start` — 生产模式运行（跑迁移 + 后端 + 静态前端，不编译独立二进制）
+- `bun run build:runtime` — 构建本机冻结后端；加 `--frontend` 嵌入已有静态前端
+- `bun run start` — 构建并运行本机产物及静态前端；`--runtime=<path>` 复用已构建版本
+- `bun run start:dev` — 冻结后端搭配源码 Vite；同样支持 `--runtime=<path>`

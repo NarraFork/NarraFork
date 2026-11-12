@@ -11,6 +11,7 @@ import type { RemotePeerDistribution } from "../../shared/remote-peer";
 import { REMOTE_PEER_DISTRIBUTION } from "../../shared/remote-peer-distribution";
 import { parseRemotePeerDistribution } from "../../shared/remote-peer-manifest";
 import { DEVICE_PROTOCOL_VERSION } from "./agent/execution/rpc-types";
+import { isCompiledRuntime, RUNTIME_BUILD_ID } from "./runtime-target";
 
 export { BUILD_GITHUB_REPOSITORY } from "../../shared/build-repository";
 
@@ -24,7 +25,7 @@ let embeddedRemotePeerDistribution: unknown;
 
 // Dev mode: read from package.json + git directly
 const pkgPath = resolve(import.meta.dir, "../../package.json");
-if (existsSync(pkgPath)) {
+if (!isCompiledRuntime() && existsSync(pkgPath)) {
 	const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 	version = pkg.version ?? "0.0.0";
 	helperDistribution = createHelperDistributionDependencies();
@@ -40,7 +41,7 @@ if (existsSync(pkgPath)) {
 		// git not available
 	}
 } else {
-	// Compiled binary: no package.json, use generated build info
+	// Compiled binaries always use their embedded metadata, even inside a checkout.
 	try {
 		const mod = (await import("@server/generated/build-info")) as {
 			buildVersion: string;
@@ -49,13 +50,24 @@ if (existsSync(pkgPath)) {
 			buildHelperDistribution?: unknown;
 			buildRemotePeerDistribution?: unknown;
 		};
+		if (
+			typeof mod.buildVersion !== "string" ||
+			!mod.buildVersion ||
+			typeof mod.buildCommit !== "string"
+		) {
+			throw new Error("Invalid embedded build information");
+		}
 		version = mod.buildVersion;
 		commitHash = mod.buildCommit;
 		platform = mod.buildPlatform ?? "";
 		embeddedHelperDistribution = mod.buildHelperDistribution;
 		embeddedRemotePeerDistribution = mod.buildRemotePeerDistribution;
-	} catch {
-		// no build info either
+	} catch (cause) {
+		// Identified frozen runtimes must carry their matching build metadata.
+		// Legacy/bare compile probes keep the unknown version, never a disk fallback.
+		if (isCompiledRuntime() && RUNTIME_BUILD_ID !== null) {
+			throw new Error("Embedded build information is unavailable", { cause });
+		}
 	}
 }
 

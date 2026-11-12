@@ -52,3 +52,11 @@ declare module "@tabler/icons-react/dist/esm/icons/IconLock.mjs" {
 declare module "@tabler/icons-react/dist/esm/icons/IconX.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }
+
+declare module "@tabler/icons-react/dist/esm/icons/IconFoldDown.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconFoldUp.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}

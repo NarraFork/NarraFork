@@ -20,7 +20,11 @@ function invalidateSettings(client: QueryClient) {
 
 export function providerBalancePollInterval(snapshot: ProviderBalanceSnapshot | null | undefined) {
 	if (!snapshot || snapshot.status === "pending" || snapshot.status === "probing") return 2_000;
-	return snapshot.status === "supported" ? 60_000 : false;
+	if (snapshot.status === "supported") return 60_000;
+	// A disabled capability plugin is the one terminal state an administrator can undo, so
+	// it keeps a slow poll: re-enabling the plugin must restore the value by itself.
+	if (snapshot.error === "plugin_not_enabled") return 30_000;
+	return false;
 }
 
 export function providerBalanceOptions(
@@ -127,4 +131,23 @@ export function useProbeProviderBalance(
 		[client, providerId, generation, canProbe],
 	);
 	return useMutation(options);
+}
+
+/**
+ * Whether the quota-query capability is switched on.
+ *
+ * The capability belongs to the `apikey-quota` plugin, so an administrator disabling it must
+ * remove the provider page's balance row and site-quota inputs rather than leave controls on
+ * screen that cannot work. Shares the `["settings"]` cache with the rest of the page, so this
+ * costs no extra request, and an unknown answer counts as enabled (the safe direction).
+ */
+export function useProviderBalanceCapability(): boolean {
+	const { data: settings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		staleTime: 30_000,
+	});
+	const capability = (settings as { providerBalanceCapability?: { enabled?: unknown } } | undefined)
+		?.providerBalanceCapability;
+	return capability?.enabled !== false;
 }

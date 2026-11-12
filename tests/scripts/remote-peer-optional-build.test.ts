@@ -51,9 +51,11 @@ async function compiledVersion(peer: unknown, present: boolean) {
 }
 describe("remote peer is an optional non-bundled component", () => {
 	test("compiled legacy NF never selects current source pin or APP_VERSION", async () => {
-		const mod = await compiledVersion(undefined, false);
-		expect(mod.APP_VERSION).toBe("9.9.9");
-		expect(mod.BUILD_REMOTE_PEER_DISTRIBUTION).toBeUndefined();
+		for (const present of [false, true]) {
+			const mod = await compiledVersion(undefined, present);
+			expect(mod.APP_VERSION).toBe("9.9.9");
+			expect(mod.BUILD_REMOTE_PEER_DISTRIBUTION).toBeUndefined();
+		}
 	});
 	test("compiled metadata preserves exact independent peer identity", async () => {
 		const mod = await compiledVersion(REMOTE_PEER_DISTRIBUTION, true);
@@ -67,14 +69,24 @@ describe("remote peer is an optional non-bundled component", () => {
 		).rejects.toThrow();
 	});
 	test("main build and startup keep optional component preparation out of defaults", async () => {
-		const [build, main, startup] = await Promise.all([
+		const [build, materials, compiler, main, startup] = await Promise.all([
 			readFile(resolve(root, "scripts/build-cross-platform.ts"), "utf8"),
+			readFile(resolve(root, "scripts/lib/build-materials.ts"), "utf8"),
+			readFile(resolve(root, "scripts/lib/runtime-compiler.ts"), "utf8"),
 			readFile(resolve(root, "server/main.ts"), "utf8"),
 			readFile(resolve(root, "server/index.ts"), "utf8"),
 		]);
-		expect(build.match(/export const buildRemotePeerDistribution =/g)).toHaveLength(2);
-		expect(build).not.toContain("remote-peer/dist");
-		expect(build).not.toMatch(/buildRemotePeerPlatform|ensureRemotePeerBinary|go build/);
+		expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(build)).not.toThrow();
+		expect(materials.match(/export const buildRemotePeerDistribution =/g)).toHaveLength(1);
+		expect(materials).toContain("JSON.stringify(info.remotePeerDistribution)");
+		expect(build).toMatch(/remotePeerDistribution:\s*REMOTE_PEER_DISTRIBUTION/);
+		expect(build).toContain("collectBuildModules(");
+		expect(build).toContain("renderBuildInfo({ ...buildInfo, platform: platform.platformId })");
+		expect(compiler).toContain("...runtimeComponentDistributions(root)");
+		for (const source of [build, materials, compiler]) {
+			expect(source).not.toContain("remote-peer/dist");
+			expect(source).not.toMatch(/buildRemotePeerPlatform|ensureRemotePeerBinary|go build/);
+		}
 		for (const entry of [main, startup])
 			expect(entry).not.toMatch(/remote-peer-binaries|ensureRemotePeerBinary|remote-peer\/dist/);
 	});

@@ -34,6 +34,7 @@ import { IconFoldDown, IconFoldUp } from "@tabler/icons-react";
 import type React from "react";
 import { Fragment, type RefObject, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ownKeys, plainClick, spokenLabel } from "../fold-controls";
 import { OutlineStatusIcon } from "../OutlineStatusIcon";
 import { FOLD_ICONS } from "../outline-icons";
 
@@ -82,34 +83,10 @@ function LineText({ line }: { line: PlanTreeLine }) {
 	);
 }
 
-/** A modified click (Ctrl/Cmd/Shift) is not a toggle. */
-function plainClick(e: React.MouseEvent): boolean {
-	return !(e.metaKey || e.ctrlKey || e.shiftKey);
-}
-
-/** Enter and Space on a control: its own, never the window's. `activate` gets Alt. */
-function ownKeys(activate: (alt: boolean) => void) {
-	return (e: React.KeyboardEvent) => {
-		const space = e.code === "Space" || e.key === " " || e.key === "Spacebar";
-		if (e.key !== "Enter" && !space) return;
-		if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey) return;
-		e.preventDefault();
-		e.stopPropagation();
-		// A held key repeats: one toggle per press.
-		if (e.repeat) return;
-		activate(e.altKey);
-	};
-}
-
 /** The preview's line as plain text, for its accessible name. */
 function firstLineText(preview: PlanTreePreview): string {
 	const text = preview.first.plain.split("\n")[0] ?? "";
 	return text.length > 80 ? `${text.slice(0, 79)}…` : text;
-}
-
-/** A label without its trailing arrow (an accessible name says what, not "▸"). */
-function spoken(label: string): string {
-	return label.replace(/\s*[▸▾▴►]\s*$/u, "");
 }
 
 /**
@@ -165,7 +142,7 @@ function PreviewLine({
 			tabIndex={0}
 			aria-expanded={false}
 			aria-label={`${t("outlinePlan.tree.showInside")}: ${firstLineText(preview)}${
-				label ? ` (${spoken(label)})` : ""
+				label ? ` (${spokenLabel(label)})` : ""
 			}`}
 			onClick={(e: React.MouseEvent) => {
 				if (plainClick(e)) onOpen();

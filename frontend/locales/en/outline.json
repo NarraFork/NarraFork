@@ -266,6 +266,30 @@
 		"interrupted": "unfinished: interrupted",
 		"empty": "no output"
 	},
+	"fold": {
+		"expandAll": "Expand all",
+		"collapseAll": "Collapse all",
+		"collapseAllHint": "Back to the default view",
+		"altHint": "Alt+click: everything inside",
+		"subtree": "Expand/collapse everything in “{{title}}”",
+		"subtreeExpand": "Expand everything inside",
+		"subtreeCollapse": "Collapse everything inside",
+		"more_one": "{{count}} more ▸",
+		"more_other": "{{count}} more ▸",
+		"open": "Expand ▸",
+		"reportAll_one": "Show all ({{count}} block) ▸",
+		"reportAll_other": "Show all ({{count}} blocks) ▸",
+		"showInside": "Show everything inside this item",
+		"untitled": "Untitled block",
+		"hiddenQuestion_one": "{{count}} question waiting for an answer inside",
+		"hiddenQuestion_other": "{{count}} questions waiting for an answer inside",
+		"hiddenPending_one": "{{count}} change waiting for confirmation inside",
+		"hiddenPending_other": "{{count}} changes waiting for confirmation inside",
+		"hiddenLocked_one": "{{count}} locked task inside",
+		"hiddenLocked_other": "{{count}} locked tasks inside",
+		"hiddenFresh_one": "{{count}} newly finished task inside",
+		"hiddenFresh_other": "{{count}} newly finished tasks inside"
+	},
 	"lock": {
 		"badge": "Locked · {{name}}",
 		"someone": "someone",
@@ -540,6 +564,7 @@
 		"thisSession": "This session",
 		"untitledSession": "Untitled session",
 		"nobody": "Unassigned",
+		"readyToStart": "Ready to start",
 		"agent": "Agent {{name}}",
 		"you": "{{name}} (you)",
 		"status": {
@@ -584,12 +609,31 @@
 			"assignMe": "Hand to me",
 			"assignUser": "Hand to someone…",
 			"assignSession": "Hand back to the session",
+			"transferSession": "Hand to a session…",
 			"usernamePlaceholder": "Username",
 			"assign": "Hand over",
 			"open": "Open in the outline",
 			"failed": "Could not change the task",
 			"conflict": "The task changed meanwhile; the board was reloaded.",
 			"updated": "Task updated"
+		},
+		"transfer": {
+			"note": "An existing session brings its earlier context along. A new session is usually the better choice.",
+			"only": "Hand over",
+			"andStart": "Hand over and start",
+			"empty": "No session of this project can take it.",
+			"failed": "Could not list the sessions",
+			"more": "Only the first {{n}} sessions are listed.",
+			"untitled": "Untitled session",
+			"started": "Handed over; the session started on it.",
+			"notStarted": {
+				"finished": "Handed over. The task is finished already, so the session was not started.",
+				"busy": "Handed over. The session is running, so it was not started; it will read the hand-over.",
+				"plan_mode": "Handed over. The session is in plan mode, so it was not started.",
+				"continuation_off": "Handed over. The session's continuation is off, so it was not started.",
+				"continuation_mode": "Handed over. The session's continuation setting does not continue on this task, so it was not started.",
+				"not_started": "Handed over, but the session did not start."
+			}
 		},
 		"completion": {
 			"asks": "The agent marked it {{status}}: waiting for your confirmation",
@@ -611,6 +655,38 @@
 			"awaitingYou": "{{count}} goal(s) wait for your confirmation",
 			"awaitingFrom": "{{count}} goal(s) wait for {{names}} to confirm",
 			"awaitingOthers": "{{count}} goal(s) wait for confirmation"
+		},
+		"openSession": {
+			"button": "Open a new session for this",
+			"options": "Open a new session for this…",
+			"doing": "Session “{{title}}” is on it",
+			"doingUntitled": "A session is on it",
+			"hint": "A new session of this project takes the task and starts on it with a brief put together from the outline. Every session opened costs at least one model request.",
+			"model": "Model",
+			"cwd": "Working directory",
+			"cwdPlaceholder": "The project's directory",
+			"note": "Further instructions",
+			"notePlaceholder": "Optional: added to the session's brief as written",
+			"submit": "Open session",
+			"failed": "Could not open a session",
+			"error": {
+				"finished": "The task is finished already.",
+				"planning": "The task is part of a plan that is not approved yet.",
+				"prerequisites": "The task waits for its prerequisites.",
+				"people": "The task waits for an answer to a question under it.",
+				"confirmation": "The task waits for a change to be confirmed.",
+				"assigned_to_person": "The task is assigned to a person.",
+				"unavailable": "Sessions cannot be opened for tasks on this deployment.",
+				"not_project_task": "Only a task of the project's own space can be given a new session.",
+				"no_directory": "The project has no working directory (or the one given does not exist). Choose one under “Open a new session for this…”.",
+				"in_progress": "The task is in progress already.",
+				"claimed": "Someone is doing this task already.",
+				"claimedBy": "{{name}} is doing this task already.",
+				"changed": "The task changed meanwhile; the board was reloaded.",
+				"start_failed": "The session could not be started. The task is back to do; try again.",
+				"forbidden": "You may not open sessions for this project's tasks.",
+				"unreadable": "The new session could not read this project's outline, so it was not given the task. Check the project's and the sessions' visibility settings."
+			}
 		}
 	}
 }

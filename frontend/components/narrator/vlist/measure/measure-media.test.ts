@@ -11,6 +11,39 @@ beforeAll(() => {
 /** The xs line the measure layer reads live (20 at the default setting). */
 const LIVE_XS_LINE = 20;
 
+describe("native image lifecycle geometry", () => {
+	it("reserves loader space only for in_progress and generating", async () => {
+		const { measureImageGeneration } = await import("./measure-media");
+		const baseline = measureImageGeneration({ statusText: "Status" }, 600);
+		for (const status of [undefined, "completed", "failed", "cancelled", "incomplete", "unknown"]) {
+			const measured = measureImageGeneration({ status, statusText: "Status" }, 600);
+			expect(measured.generating).toBe(false);
+			expect(measured.frame).toEqual(baseline.frame);
+		}
+		for (const status of ["in_progress", "generating"]) {
+			const measured = measureImageGeneration({ status, statusText: "Status" }, 600);
+			expect(measured.generating).toBe(true);
+			expect(measured.frame.usedWidth).toBeGreaterThan(baseline.frame.usedWidth);
+		}
+	});
+
+	it("keeps dimensioned partial previews after a terminal failure", async () => {
+		const { measureImageGeneration } = await import("./measure-media");
+		for (const status of ["failed", "cancelled", "incomplete"]) {
+			const measured = measureImageGeneration(
+				{ status, partialSavedPath: "/partial.png", width: 512, height: 256 },
+				600,
+			);
+			expect(measured.generating).toBe(false);
+			expect(measured.blocks[1]).toMatchObject({
+				kind: "fixed",
+				height: 256,
+				data: { partialSavedPath: "/partial.png" },
+			});
+		}
+	});
+});
+
 describe("media run framing", () => {
 	it("forwards run opts only to generated images and keeps source payload intact", async () => {
 		const { VLIST_REGISTRY } = await import("../registry");

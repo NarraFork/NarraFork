@@ -35,9 +35,10 @@
  * rides the drill-down's own transition (see `adaptActivityItems`' pinned-open rows).
  */
 
-import { isCommunicationTool } from "@shared/communication-tool";
+import { isCommunicationTool, shouldShowCommunicationBubble } from "@shared/communication-tool";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { isPreferOpenTool } from "@shared/prefer-open-tool";
+import { auxiliaryContentViews } from "@shared/pretext-layout/auxiliary-content";
 import type { RenderSegment, ToolRunItem } from "../message/message-segments";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import { isReasoningBlock } from "./reasoning-segments";
@@ -91,7 +92,16 @@ export interface ActivityToolInput {
 	dedupeSuffix?: number;
 }
 
-export type ActivityInput = ActivityReasoningInput | ActivityToolInput;
+export interface ActivityAuxiliaryInput {
+	kind: "auxiliary";
+	msg: NarratorMsg;
+	blockIndex: number;
+	sourceIndices: number[];
+	block: ContentBlock;
+	source: string;
+}
+
+export type ActivityInput = ActivityReasoningInput | ActivityToolInput | ActivityAuxiliaryInput;
 
 export type RenderUnit =
 	| { kind: "segment"; seg: RenderSegment }
@@ -143,6 +153,10 @@ export function isLatestSpecTasksToolItem(
 export function groupToolRunItemsForLod(
 	items: ToolRunItem[],
 	latestSpecTasksToolUseId?: string | null,
+	opts?: {
+		compactAuxiliaryContent?: boolean;
+		resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
+	},
 ): ToolRunLodGroup[] {
 	const groups: ToolRunLodGroup[] = [];
 	let pendingFolded: ToolRunItem[] = [];
@@ -157,10 +171,13 @@ export function groupToolRunItemsForLod(
 	for (let index = 0; index < items.length; index++) {
 		const item = items[index];
 		if (
-			isCommunicationTool(item.tc) ||
-			item.isSubagent ||
+			shouldShowCommunicationBubble(item.tc, opts?.compactAuxiliaryContent === true) ||
+			(item.isSubagent && !opts?.compactAuxiliaryContent) ||
 			isActiveToolItem(item) ||
-			isPreferOpenTool(item.tc) ||
+			isPreferOpenTool(item.tc, {
+				...opts,
+				questionStatus: opts?.resolveQuestionStatus?.(item.tc.toolUseId),
+			}) ||
 			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
 		) {
 			flushFolded();
@@ -186,23 +203,28 @@ type MessageActivityPart =
  */
 function splitMessageSegmentForActivity(
 	seg: Extract<RenderSegment, { kind: "message" }>,
+	compactAuxiliaryContent = false,
 ): MessageActivityPart[] | null {
-	if (seg.msg.role !== "assistant") return null;
-
 	const blocks = messageBody(seg.msg);
-	const indices = seg.visibleBlockIndices ?? blocks.map((_, i) => i);
-	if (indices.length === 0 || !indices.some((bi) => blocks[bi] && isReasoningBlock(blocks[bi]))) {
-		return null;
-	}
+	const sourceIndices = seg.visibleBlockIndices ?? blocks.map((_, i) => i);
+	const indices = compactAuxiliaryContent
+		? [...sourceIndices].sort((a, b) => a - b)
+		: sourceIndices;
+	const auxiliary = compactAuxiliaryContent ? auxiliaryContentViews(seg.msg, indices) : [];
+	const views = new Map(auxiliary.map((view) => [view.blockIndex, view]));
+	const owned = new Set(auxiliary.flatMap((view) => view.sourceIndices));
+	const hasReasoning =
+		seg.msg.role === "assistant" &&
+		indices.some((bi) => blocks[bi] && isReasoningBlock(blocks[bi]));
+	if (!hasReasoning && auxiliary.length === 0) return null;
 
 	const parts: MessageActivityPart[] = [];
-	let pendingReasoning: ActivityInput[] = [];
+	let pendingActivity: ActivityInput[] = [];
 	let pendingContentIndices: number[] = [];
-
-	const flushReasoning = () => {
-		if (pendingReasoning.length === 0) return;
-		parts.push({ kind: "reasoning", items: pendingReasoning });
-		pendingReasoning = [];
+	const flushActivity = () => {
+		if (pendingActivity.length === 0) return;
+		parts.push({ kind: "reasoning", items: pendingActivity });
+		pendingActivity = [];
 	};
 	const flushContent = () => {
 		if (pendingContentIndices.length === 0) return;
@@ -212,23 +234,29 @@ function splitMessageSegmentForActivity(
 		});
 		pendingContentIndices = [];
 	};
-
 	for (const blockIndex of indices) {
 		const block = blocks[blockIndex];
-		if (block && isReasoningBlock(block)) {
+		const view = views.get(blockIndex);
+		if (view) {
 			flushContent();
-			pendingReasoning.push({
-				kind: "reasoning",
+			flushActivity();
+			pendingActivity.push({
+				kind: "auxiliary",
 				msg: seg.msg,
-				blockIndex,
-				block,
+				...view,
+				block: view.block as ContentBlock,
 			});
+			flushActivity();
+		} else if (owned.has(blockIndex)) {
+		} else if (seg.msg.role === "assistant" && block && isReasoningBlock(block)) {
+			flushContent();
+			pendingActivity.push({ kind: "reasoning", msg: seg.msg, blockIndex, block });
 		} else {
-			flushReasoning();
+			flushActivity();
 			pendingContentIndices.push(blockIndex);
 		}
 	}
-	flushReasoning();
+	flushActivity();
 	flushContent();
 	return parts;
 }
@@ -248,10 +276,24 @@ function splitMessageSegmentForActivity(
  *    id via `keepToolUseIds` (the vlist pins that card expanded at every LOD —
  *    the task board is the narrator's live working state).
  */
-function isKeptToolItem(item: ToolRunItem, keepToolUseIds?: ReadonlySet<string>): boolean {
-	if (item.isSubagent || isCommunicationTool(item.tc) || isPreferOpenTool(item.tc)) {
+function isKeptToolItem(
+	item: ToolRunItem,
+	keepToolUseIds?: ReadonlySet<string>,
+	compactAuxiliaryContent = false,
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined,
+): boolean {
+	const subagentKept =
+		item.isSubagent &&
+		(!compactAuxiliaryContent || (!isCommunicationTool(item.tc) && isActiveToolItem(item)));
+	if (
+		subagentKept ||
+		shouldShowCommunicationBubble(item.tc, compactAuxiliaryContent) ||
+		isPreferOpenTool(item.tc, {
+			compactAuxiliaryContent,
+			questionStatus: resolveQuestionStatus?.(item.tc.toolUseId),
+		})
+	)
 		return true;
-	}
 	const toolUseId = item.tc.toolUseId;
 	return !!toolUseId && keepToolUseIds != null && keepToolUseIds.has(toolUseId);
 }
@@ -280,10 +322,17 @@ type ToolRunActivityPart = {
 function splitToolRunForActivity(
 	items: ToolRunItem[],
 	keepToolUseIds?: ReadonlySet<string>,
+	compactAuxiliaryContent = false,
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined,
 ): ToolRunActivityPart[] {
 	const parts: ToolRunActivityPart[] = [];
 	for (const item of items) {
-		const kind: ToolRunActivityPart["kind"] = isKeptToolItem(item, keepToolUseIds)
+		const kind: ToolRunActivityPart["kind"] = isKeptToolItem(
+			item,
+			keepToolUseIds,
+			compactAuxiliaryContent,
+			resolveQuestionStatus,
+		)
 			? "keep"
 			: "fold";
 		const last = parts[parts.length - 1];
@@ -375,7 +424,11 @@ function toolItemsFromToolRunSegment(
 export function groupRenderUnits(
 	segments: RenderSegment[],
 	enabled: boolean,
-	opts?: { keepToolUseIds?: ReadonlySet<string> },
+	opts?: {
+		keepToolUseIds?: ReadonlySet<string>;
+		compactAuxiliaryContent?: boolean;
+		resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
+	},
 ): RenderUnit[] {
 	// Communication bubbles keep their shape across streaming hand-off at EVERY LOD.
 	// Retire only synthetic twins; persisted retries remain distinct occurrences.
@@ -506,20 +559,26 @@ export function groupRenderUnits(
 
 	for (const seg of segments) {
 		if (seg.kind === "message") {
-			const parts = splitMessageSegmentForActivity(seg);
+			const parts = splitMessageSegmentForActivity(seg, opts?.compactAuxiliaryContent);
 			if (parts) {
 				for (const part of parts) {
 					if (part.kind === "reasoning") {
 						// One `stableKeyBase` per reasoning RUN, counted within the unit. The
 						// blocks of a run share it and are distinguished by their offset, so a
 						// run that persists under a different message id keeps its row keys.
-						const base = `run${pendingReasoningRuns++}`;
+						const base = part.items.some((item) => item.kind === "reasoning")
+							? `run${pendingReasoningRuns++}`
+							: undefined;
 						absorb(
-							part.items.map((item, offset) => ({
-								...item,
-								stableKeyBase: base,
-								stableKeyOffset: offset,
-							})),
+							part.items.map((item, offset) =>
+								item.kind === "reasoning"
+									? {
+											...item,
+											stableKeyBase: base,
+											stableKeyOffset: offset,
+										}
+									: item,
+							),
 							[seg.msg],
 							seg,
 						);
@@ -536,7 +595,12 @@ export function groupRenderUnits(
 			// the fold, and its foldable neighbours still become named trace rows
 			// instead of collapsing to an anonymous count line (see
 			// splitToolRunForActivity).
-			for (const part of splitToolRunForActivity(seg.items, opts?.keepToolUseIds)) {
+			for (const part of splitToolRunForActivity(
+				seg.items,
+				opts?.keepToolUseIds,
+				opts?.compactAuxiliaryContent,
+				opts?.resolveQuestionStatus,
+			)) {
 				const partMessages = sourceMessagesForPart(part, seg.sourceMessages);
 				if (part.kind === "fold") {
 					absorb(toolItemsFromToolRunSegment({ ...seg, items: part.items }), partMessages, {

@@ -1091,7 +1091,9 @@ function observeSlowTimers(advance?: () => void) {
 	const timers: Array<ReturnType<typeof setTimeout>> = [];
 	const fire: Array<() => void> = [];
 	const spy = spyOn(timerGlobal, "setTimeout").mockImplementation((handler, delay, ...args) => {
-		if (delay !== 10_000) return realTimeout(handler, delay, ...args);
+		// Readiness has the same production budget but is a separate failure boundary.
+		if (delay !== 10_000 || handler.name !== "warnIfSlow")
+			return realTimeout(handler, delay, ...args);
 		const callback = () => handler(...args);
 		fire.push(callback);
 		const timer = realTimeout(

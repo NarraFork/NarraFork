@@ -332,6 +332,7 @@ export const settingsApi = {
 			replyInUserLanguage: boolean;
 			showTokenUsage: boolean;
 			showOutputStats: boolean;
+			compactAuxiliaryContent: boolean;
 			terminalTheme: string;
 			terminalFontSize: number;
 			/** Narrator transcript typography, as percentages of the built-in defaults. */
@@ -412,6 +413,7 @@ export const settingsApi = {
 		replyInUserLanguage?: boolean;
 		showTokenUsage?: boolean;
 		showOutputStats?: boolean;
+		compactAuxiliaryContent?: boolean;
 		terminalTheme?: string;
 		terminalFontSize?: number;
 		narratorFontScalePercent?: number;

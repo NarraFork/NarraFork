@@ -9,6 +9,7 @@
  */
 import type {
 	OutlineBoardAddRequest,
+	OutlineBoardOpenSessionRequest,
 	OutlineBoardTaskUpdateRequest,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
@@ -164,6 +165,19 @@ export function useUpdateBoardTask() {
 	return useMutation({
 		mutationFn: (input: { blockId: string; body: OutlineBoardTaskUpdateRequest }) =>
 			api.updateBoardTask(input.blockId, input.body),
+		onSettled: () => invalidateTaskBoards(queryClient),
+	});
+}
+
+/**
+ * "Open a new session for this" (outline P2 PR 10c-1): the boards re-read whether it worked or
+ * not (a refusal means the task changed).
+ */
+export function useOpenTaskSession() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (input: { blockId: string; body: OutlineBoardOpenSessionRequest }) =>
+			api.openTaskSession(input.blockId, input.body),
 		onSettled: () => invalidateTaskBoards(queryClient),
 	});
 }

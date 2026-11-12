@@ -2297,6 +2297,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
 	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(true),
+	/** Account-wide transcript display preference; false preserves the original cards. */
+	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
+		.notNull()
+		.default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**
@@ -6222,7 +6226,12 @@ export const outlineLiveUpdates = sqliteTable(
 );
 
 // === outline_view_state ===
-/** Per user and page: collapsed blocks and the mind-map layout direction. Not part of history. */
+/**
+ * Per user and page: the reader's own folding and the mind-map layout direction. Not part of
+ * history. A page folds some blocks by default (`shared/outline-fold.ts`): `collapsed_json` holds
+ * the blocks the reader closed that are open by default, `expanded_json` those they opened that
+ * are closed by default.
+ */
 export const outlineViewState = sqliteTable(
 	"outline_view_state",
 	{
@@ -6234,6 +6243,8 @@ export const outlineViewState = sqliteTable(
 			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
 		/** Ids of the collapsed blocks. */
 		collapsedJson: text("collapsed_json", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/** Ids of the blocks the reader opened; null (a row written before the column): none. */
+		expandedJson: text("expanded_json", { mode: "json" }).$type<string[]>(),
 		layout: text("layout", { enum: ["right", "down"] })
 			.notNull()
 			.default("right"),

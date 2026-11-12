@@ -179,6 +179,11 @@ export interface OutlineViewBlock {
 	 * it (a mark only).
 	 */
 	pending: string[];
+	/**
+	 * On a subagent report's container: the subagent's session title, when the reader may read
+	 * that session (absent otherwise, and past the containers one view names).
+	 */
+	reportFrom?: string;
 }
 
 export interface OutlineBlockViewResponse {
@@ -191,6 +196,11 @@ export interface OutlineBlockViewResponse {
 	current: boolean;
 	/** The view applied: `all` when the root is a task or under one. */
 	view: OutlineViewMode;
+	/**
+	 * The root is under a task or inside a subagent report: its blocks are details, folded by
+	 * default (`shared/outline-fold.ts`). Absent from an older server: false.
+	 */
+	rootInTask?: boolean;
 	/** The root's ancestors, the page first. */
 	path: Array<{ id: string; sid: string; title: string }>;
 	/** The blocks shown, the root first, breadth first. */
@@ -327,7 +337,8 @@ export type OutlineMapLayout = "right" | "down";
  * Limits of `GET/PUT /api/outline/view-state/:pageId`: one person's folding and mind-map
  * direction of one page (design §7.1 `outline_view_state`). Folding is personal and never part
  * of the block model; a page shows at most `maxCollapsed` blocks per view (design §7.2), so more
- * folded ids than that are never needed.
+ * folded ids than that are never needed. `maxCollapsed` bounds the blocks the reader closed and
+ * the blocks they opened TOGETHER (`shared/outline-fold.ts`): one budget, not one each.
  */
 export const OUTLINE_VIEW_STATE_LIMITS = {
 	maxCollapsed: 2000,
@@ -350,7 +361,10 @@ export const OUTLINE_BLOCK_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 /** One person's view state of one page; defaults when they never changed it. */
 export interface OutlineViewStateResponse {
 	pageId: string;
+	/** Blocks the reader closed that the page shows open by default. */
 	collapsed: string[];
+	/** Blocks the reader opened that the page folds by default (`shared/outline-fold.ts`). */
+	expanded: string[];
 	layout: OutlineMapLayout;
 	/** When it was last written; null for the defaults. */
 	updatedAt: string | null;
@@ -358,6 +372,8 @@ export interface OutlineViewStateResponse {
 
 export interface OutlineViewStatePutRequest {
 	collapsed: string[];
+	/** Left out (a client from before the default folding): what is stored is kept. */
+	expanded?: string[];
 	layout: OutlineMapLayout;
 }
 
@@ -368,6 +384,8 @@ export interface OutlineViewStatePutRequest {
 export const OUTLINE_PENDING_API_LIMITS = {
 	/** Tasks one "in progress" marker lists. */
 	inProgressItems: 10,
+	/** Unanswered questions of a page its summary names (the newest). */
+	openQuestions: 200,
 	/** Characters of a rejection's reason. */
 	maxReasonChars: 500,
 } as const;
@@ -413,6 +431,23 @@ export interface OutlinePagePendingResponse {
 	pending: OutlinePendingSummary[];
 	/** Locked tasks of the page. */
 	locks: OutlineLockView[];
+	/**
+	 * Blocks of the page that are questions put to a person and not answered yet (the newest
+	 * {@link OUTLINE_PENDING_API_LIMITS.openQuestions}): the blocks above them are not folded by
+	 * default, and a row the reader folded counts the ones it hides. Absent from an older server.
+	 */
+	questions?: string[];
+}
+
+/** Limits of `GET /spaces/:spaceId/report-authors`: who wrote the subagent reports of a page. */
+export const OUTLINE_REPORT_AUTHORS_API_LIMITS = {
+	/** Report containers one request names. */
+	maxIds: 20,
+} as const;
+
+/** The subagent's session title by report container, for those the reader may be told. */
+export interface OutlineReportAuthorsResponse {
+	authors: Record<string, string>;
 }
 
 /** One block of a pending change: as proposed against, as proposed, and as it is now. */

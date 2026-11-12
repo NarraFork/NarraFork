@@ -51,6 +51,12 @@ export interface CustomApiProviderState {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	/** Site interface root for the `/api/user/self` credit query (independent of baseUrl). */
+	quotaSiteUrl?: string;
+	/** Site system access token (not the inference `sk-` key). */
+	quotaAccessToken?: string;
+	/** Site user id, sent as `New-Api-User`. */
+	quotaUserId?: string;
 	disabled?: boolean;
 }
 

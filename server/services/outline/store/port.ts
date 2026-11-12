@@ -155,13 +155,15 @@ export interface OutlineLiveUpdateRow {
 }
 
 /**
- * One person's view state of one page (`outline_view_state`, design §7.1): folded blocks and the
- * mind map's direction. Personal and outside history: never versioned, never part of a commit.
+ * One person's view state of one page (`outline_view_state`, design §7.1): the blocks they
+ * closed, the blocks they opened, and the mind map's direction. Personal and outside history: never versioned, never part of a commit.
  */
 export interface OutlineViewStateRow {
 	userId: string;
 	pageBlockId: string;
 	collapsed: string[];
+	/** Blocks the reader opened that are closed by default (`shared/outline-fold.ts`). */
+	expanded: string[];
 	layout: "right" | "down";
 	updatedAt: string;
 }
@@ -939,6 +941,12 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort, Outlin
 		spaceIds: readonly string[],
 		limitPerSpace: number,
 	): Promise<OutlineQuestionRow[]>;
+	/**
+	 * Block ids of the open questions that are live blocks of one page, newest first, at most
+	 * `limit`: the page's own, whatever else the space has open (a folded row of the page counts
+	 * the ones it hides). The space's open questions by their index, each block by primary key.
+	 */
+	listOpenQuestionBlocksOnPage(spaceId: string, pageId: string, limit: number): Promise<string[]>;
 	/** Open questions put to a person, oldest first, at most `limit`. */
 	listOpenQuestionsForUser(userId: string, limit: number): Promise<OutlineQuestionRow[]>;
 	/** Open questions a session asked, oldest first, at most `limit`. */

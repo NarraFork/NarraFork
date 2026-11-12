@@ -129,6 +129,35 @@ const imgsOf = (root: Element) => Array.from(root.querySelectorAll("img"));
 const textOf = (root: Element) => root.textContent ?? "";
 
 describe("generated image reaches the DOM (virtual list)", () => {
+	for (const status of ["failed", "cancelled", "incomplete"]) {
+		it(`renders ${status} without a loader, even if generic render extras remain generating`, () => {
+			const measured = VLIST_REGISTRY.media.measure(
+				{
+					type: "image_generation",
+					status,
+					statusText: "Terminal state",
+					partialSavedPath: "/partial.png",
+					width: 512,
+					height: 256,
+				},
+				600,
+				5,
+			);
+			const root = renderWithProviders(
+				<RenderMedia measured={measured} generating resolveImageSrc={() => "/partial.png"} />,
+			);
+			expect(textOf(root)).toContain("Terminal state");
+			expect(textOf(root)).not.toContain("…");
+			expect(imgsOf(root)[0]?.getAttribute("src")).toBe("/partial.png");
+		});
+	}
+
+	it("does not claim an empty legacy block generated an image", () => {
+		const { root } = renderGenerated({ type: "image_generation", id: "unknown" });
+		expect(textOf(root)).toContain("No image received");
+		expect(textOf(root)).not.toContain("Generated image");
+		expect(imgsOf(root)).toHaveLength(0);
+	});
 	for (const isLast of [false, true]) {
 		it(`renders measured run framing with preview and loader intact (last=${isLast})`, () => {
 			const data = {

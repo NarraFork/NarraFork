@@ -264,6 +264,57 @@ export async function readTeamActivityFacts(
 }
 
 /**
+ * The session a handle names (`@agent:<handle>`, outline P2 PR 10a): the narrator holding the
+ * folded handle (the unique index `idx_narrators_handle_fold`), with its type. Null when nobody
+ * holds it.
+ */
+export async function readNarratorByHandleFold(
+	folded: string,
+): Promise<{ id: string; type: string } | null> {
+	if (!folded) return null;
+	const rows = await all(sql`
+		select id, type from narrators where handle_fold = ${folded} limit 1
+	`);
+	const row = rows[0];
+	return row ? { id: text(row, "id"), type: text(row, "type") } : null;
+}
+
+/**
+ * What decides whether a team event may wake a session (outline P2 PR 10a): its status, whether
+ * it is in plan mode (the `plan` trait), how its last run stopped, and its handle. By primary
+ * key; null when the narrator does not exist.
+ */
+export async function readNarratorWakeFacts(narratorId: string): Promise<{
+	status: string;
+	planMode: boolean;
+	lastStopReason: string | null;
+	handle: string | null;
+} | null> {
+	const rows = await all(sql`
+		select status, traits, last_stop_reason, handle from narrators
+		where id = ${narratorId} limit 1
+	`);
+	const row = rows[0];
+	if (!row) return null;
+	// `traits` is JSON text on SQLite and jsonb on PostgreSQL.
+	const raw = row.traits;
+	let traits: unknown = raw;
+	if (typeof raw === "string") {
+		try {
+			traits = JSON.parse(raw);
+		} catch {
+			traits = [];
+		}
+	}
+	return {
+		status: text(row, "status"),
+		planMode: Array.isArray(traits) && traits.includes("plan"),
+		lastStopReason: textOrNull(row, "last_stop_reason"),
+		handle: textOrNull(row, "handle"),
+	};
+}
+
+/**
  * Running state of narrators for the live editor's agent presence (outline P2 PR 10b): status,
  * title, type and session root, by primary key, chunked. Missing narrators are left out.
  */
@@ -629,6 +680,57 @@ export async function readProjectSessionSpacePage(
 		limit ${options.limit}
 	`);
 	return rows.map(toSpace);
+}
+
+/** A session a task may be handed to on the board (outline P2 PR 10a). */
+export interface TransferSessionRow {
+	id: string;
+	title: string | null;
+	handle: string | null;
+	ownerUserId: string | null;
+}
+
+/**
+ * The root sessions of a project a task could be handed to, as the board's 「转交给会话」 lists
+ * them: sessions of the project (as {@link readProjectSessionSpacePage} counts them), not
+ * archived, not subagents, keeping their tasks in the outline, that the principal can read (the
+ * narrator list's predicate, in SQL before the LIMIT; admins read every one). Named sessions
+ * (with a handle) first, then the most recently active; `limit` rows after `offset`. With
+ * `onlyId`: that one session, when it passes the same predicate (what a hand-over to it is
+ * checked with). Whether each could work in the task's space is the caller's check
+ * (`canSessionWorkIn`).
+ */
+export async function readProjectTransferSessions(
+	principal: { userId: string; isAdmin: boolean },
+	projectId: string,
+	options: { limit: number; offset?: number; onlyId?: string },
+): Promise<TransferSessionRow[]> {
+	const visible = principal.isAdmin
+		? sql``
+		: sql`and ${bindPlaceholders(narratorReadableText("n"), principal.userId)}`;
+	const rows = await all(sql`
+		select n.id, n.title, n.handle, n.owner_user_id
+		from narrators n
+		where n.id in (
+				select npl.narrator_id from narrator_project_links npl where npl.project_id = ${projectId}
+				union
+				select n2.id from narrators n2 where n2.context_project_id = ${projectId}
+			)
+			and n.status <> 'archived'
+			and n.type <> 'subagent'
+			and n.task_backend = 'outline'
+			${options.onlyId !== undefined ? sql`and n.id = ${options.onlyId}` : sql``}
+			${visible}
+		order by (case when n.handle is null then 1 else 0 end),
+			coalesce(n.last_message_at, n.updated_at) desc, n.id
+		limit ${options.limit} offset ${Math.max(0, options.offset ?? 0)}
+	`);
+	return rows.map((row) => ({
+		id: text(row, "id"),
+		title: textOrNull(row, "title"),
+		handle: textOrNull(row, "handle"),
+		ownerUserId: textOrNull(row, "owner_user_id"),
+	}));
 }
 
 /** What a session's write rule is decided from, for many sessions at once (the task board). */

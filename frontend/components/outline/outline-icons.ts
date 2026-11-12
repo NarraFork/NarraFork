@@ -27,6 +27,8 @@ import {
 	IconCircle,
 	IconCircleHalf2,
 	IconFocusCentered,
+	IconFoldDown,
+	IconFoldUp,
 	IconHelpCircle,
 	IconHourglass,
 	IconLock,
@@ -43,6 +45,8 @@ import { __iconNode as chevronRightNode } from "@tabler/icons-react/dist/esm/ico
 import { __iconNode as circleNode } from "@tabler/icons-react/dist/esm/icons/IconCircle.mjs";
 import { __iconNode as circleHalf2Node } from "@tabler/icons-react/dist/esm/icons/IconCircleHalf2.mjs";
 import { __iconNode as focusCenteredNode } from "@tabler/icons-react/dist/esm/icons/IconFocusCentered.mjs";
+import { __iconNode as foldDownNode } from "@tabler/icons-react/dist/esm/icons/IconFoldDown.mjs";
+import { __iconNode as foldUpNode } from "@tabler/icons-react/dist/esm/icons/IconFoldUp.mjs";
 import { __iconNode as helpCircleNode } from "@tabler/icons-react/dist/esm/icons/IconHelpCircle.mjs";
 import { __iconNode as hourglassNode } from "@tabler/icons-react/dist/esm/icons/IconHourglass.mjs";
 import { __iconNode as lockNode } from "@tabler/icons-react/dist/esm/icons/IconLock.mjs";
@@ -112,6 +116,26 @@ export const QUESTION_ICON: OutlineIcon = {
 export const FOLD_ICONS: Record<"expanded" | "collapsed", OutlineIcon> = {
 	expanded: { name: "chevron-down", Icon: IconChevronDown, node: chevronDownNode },
 	collapsed: { name: "chevron-right", Icon: IconChevronRight, node: chevronRightNode },
+};
+
+/**
+ * The row's quick control for everything inside it (`@shared/outline-fold`): expand it all, or
+ * return it to the default view.
+ */
+export const FOLD_ALL_ICONS: Record<"expand" | "collapse", OutlineIcon> = {
+	expand: { name: "fold-down", Icon: IconFoldDown, node: foldDownNode },
+	collapse: { name: "fold-up", Icon: IconFoldUp, node: foldUpNode },
+};
+
+/**
+ * What a closed row counts of what it hides, by kind: the question's mark, and the states'
+ * badges (waiting for confirmation, locked, newly done).
+ */
+export const FOLD_HIDDEN_ICONS: Record<"question" | "pending" | "locked" | "fresh", OutlineIcon> = {
+	question: QUESTION_ICON,
+	pending: STATUS_ICONS.waiting,
+	locked: STATUS_ICONS.locked,
+	fresh: STATUS_ICONS.newly_done,
 };
 
 /**

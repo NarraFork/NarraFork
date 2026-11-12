@@ -899,6 +899,46 @@ describe("buildCacheKey", () => {
 });
 
 describe("extractDataRevision", () => {
+	it("keys auxiliary paint, inspector content and structured navigation targets", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const auxiliary = {
+			contentRole: "auxiliary",
+			status: "success",
+			sourceStatus: "completed",
+			toolName: "Agent A",
+			summary: "report A",
+			target: { kind: "narrator", narratorId: "a" },
+		};
+		const base = extractDataRevision(auxiliary);
+		for (const patch of [
+			{ toolName: "Agent B" },
+			{ summary: "report B" },
+			{ sourceStatus: "failed" },
+			{ target: { kind: "narrator", narratorId: "b" } },
+		]) {
+			expect(extractDataRevision({ ...auxiliary, ...patch })).not.toBe(base);
+		}
+		const detail = (id: string) => ({
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "refs",
+						body: {
+							kind: "structured",
+							entries: [
+								{
+									title: "Same title",
+									target: { kind: "knowledge", entryId: id, scope: "global" },
+								},
+							],
+						},
+					},
+				],
+			},
+		});
+		expect(extractDataRevision(detail("a"))).not.toBe(extractDataRevision(detail("b")));
+	});
 	it("extracts status from tool data", async () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		expect(extractDataRevision({ status: "running", toolName: "Read" })).toBe("s:running");

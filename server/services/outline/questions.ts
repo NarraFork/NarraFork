@@ -74,6 +74,7 @@ import {
 } from "./store/port";
 import { OUTLINE_PAGE_HEAD_CHARS } from "./store/read-port";
 import type { OutlineTaskSubject } from "./tasks";
+import { wakeForTeam } from "./team-wake";
 import { type OutlineOp, writeOutline } from "./write";
 
 export const OUTLINE_QUESTION_LIMITS = {
@@ -1316,6 +1317,11 @@ export function outlineAnswerMessageId(
  *     reads the answer on its next turn. The chosen id is not used there (`deliverInjection`
  *     reads an existing id's role from the SQLite handle), so a crash between writing and marking
  *     may deliver twice.
+ *
+ * The wake counts against the session's team wake limit (`team-wake.ts`, outline P2 PR 10a: six a
+ * minute with the team events): past it the message is written all the same, without a wake, and
+ * one wake follows when the limit has room again (the same wake a retry makes: not when the
+ * session replied after the message meanwhile).
  */
 const realDelivery: OutlineAnswerDelivery = {
 	async deliver(narratorId, message) {
@@ -1358,23 +1364,59 @@ const realDelivery: OutlineAnswerDelivery = {
 				const { assistantReplyFollowsAnswer } = await import("../narrator-session");
 				if (ref && assistantReplyFollowsAnswer(narratorId, ref.seq))
 					return { written: true, woke: false };
-				return {
-					written: true,
-					woke: await wakeIdleAfterDelivery(narratorId, "en", executionPrincipal),
-				};
+				const again = await wakeForTeam(
+					narratorId,
+					() => wakeIdleAfterDelivery(narratorId, "en", executionPrincipal),
+					undefined,
+					`answer:${existing.id}`,
+				);
+				return { written: true, woke: again.woke };
 			}
 		}
+		// Written first, without a wake: the wake is the limit's to give, now or later.
 		const result = await deliverInjection(narratorId, {
 			...(postgres ? {} : { messageId: message.messageId }),
 			content: message.content,
 			...(message.body ? { body: message.body } : {}),
 			source: "outline_answer",
 			role: "user",
-			schedule: postgres ? "none" : "wakeIfIdle",
+			schedule: "none",
 			createdBy: message.createdBy,
 			...(executionPrincipal ? { executionPrincipal } : {}),
 		});
-		return { written: result.messageId !== null, woke: result.started };
+		if (result.messageId === null) return { written: false, woke: false };
+		if (postgres) return { written: true, woke: false };
+		const answerId = result.messageId;
+		const woken = await wakeForTeam(
+			narratorId,
+			() => wakeIdleAfterDelivery(narratorId, "en", executionPrincipal),
+			// Later, when the limit has room: unless the session replied after the answer meanwhile.
+			async () => {
+				const [{ db }, { narratorMessageRefs }, { and, eq }] = await Promise.all([
+					import("@server/db"),
+					import("@server/db/schema"),
+					import("drizzle-orm"),
+				]);
+				const ref = db
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, answerId),
+						),
+					)
+					.limit(1)
+					.get();
+				const { assistantReplyFollowsAnswer } = await import("../narrator-session");
+				if (ref && assistantReplyFollowsAnswer(narratorId, ref.seq)) return false;
+				return await wakeIdleAfterDelivery(narratorId, "en", executionPrincipal);
+			},
+			// Its own question ("did the session reply after it"): a later team row's deferral
+			// does not take its place.
+			`answer:${answerId}`,
+		);
+		return { written: true, woke: woken.woke };
 	},
 };
 

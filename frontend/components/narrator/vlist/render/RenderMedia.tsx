@@ -243,7 +243,7 @@ function TextFileView({ block, frame }: { block: PreparedFixedBlock; frame: Bloc
 function RenderImageGeneration({
 	measured,
 	resolveImageSrc,
-	generating,
+	generating: legacyGenerating,
 	narratorId,
 }: {
 	measured: MeasuredElement;
@@ -252,7 +252,14 @@ function RenderImageGeneration({
 	narratorId?: string;
 }) {
 	const { blocks, frame, contentWidth } = measured;
-	const { inRun, isLast } = measured as Partial<MeasuredImageGeneration>;
+	const {
+		inRun,
+		isLast,
+		generating: measuredGenerating,
+	} = measured as Partial<MeasuredImageGeneration>;
+	// Use the measure layer's activity state, so stale generic render extras cannot
+	// keep a failed/cancelled card spinning or shift its header geometry.
+	const generating = measuredGenerating ?? legacyGenerating;
 	const header = blocks[0] as PreparedInlineBlock;
 	const headerFrame = frame.blocks[0]!;
 	const imageBlock = blocks[1];

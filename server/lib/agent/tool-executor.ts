@@ -93,6 +93,8 @@ export interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Already saved image assets; never re-decode these through the upload lane. */
+	imageRefs?: ToolResult["imageRefs"];
 	media?: NativeMediaInput[];
 	mediaRefs?: MediaContentBlock[];
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
@@ -1786,6 +1788,7 @@ async function executeToolUntraced(
 							pipelineCapturedBytes: captured.capture.bytes,
 						}),
 						images: result.images,
+						imageRefs: result.imageRefs,
 						media: result.media,
 						mediaRefs: result.mediaRefs,
 						updatedInput: redirectedInput,
@@ -1807,6 +1810,7 @@ async function executeToolUntraced(
 					completedAt: Date.now(),
 					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
+					imageRefs: result.imageRefs,
 					media: result.media,
 					mediaRefs: result.mediaRefs,
 					updatedInput: redirectedInput,
@@ -1825,6 +1829,7 @@ async function executeToolUntraced(
 				completedAt: Date.now(),
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
+				imageRefs: result.imageRefs,
 				media: result.media,
 				mediaRefs: result.mediaRefs,
 				updatedInput: redirectedInput,

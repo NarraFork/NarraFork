@@ -322,6 +322,7 @@ export function useVListLabels(): VListLabels {
 		() => ({
 			historyCleared: t("historyCleared"),
 			toolDetailsCleared: t("toolDetailsCleared"),
+			status_fail: t("traceRowMark.failed"),
 			// ── compact / segment-compact indicator lines ───────────────────────────
 			compacting: t("compacting"),
 			compacted: t("compacted"),
@@ -376,6 +377,10 @@ export function useVListLabels(): VListLabels {
 			imageGenerated: t("imageGenerated"),
 			imageGenerating: t("imageGenerating"),
 			imageGenerationPreparing: t("imageGenerationPreparing"),
+			imageGenerationFailed: t("imageGenerationFailed"),
+			imageGenerationCancelled: t("imageGenerationCancelled"),
+			imageGenerationIncomplete: t("imageGenerationIncomplete"),
+			imageGenerationNoImage: t("imageGenerationNoImage"),
 			// ── web_search header status ─────────────────────────────────────────────
 			webSearched: t("webSearched"),
 			webSearching: t("webSearching"),
@@ -588,6 +593,8 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceOutlineTaskEdit: t("sidecar.sources.outline_task_edit"),
 			sidecarSourceOutlineTaskFinished: t("sidecar.sources.outline_task_finished"),
 			sidecarSourceOutlineTeamActivity: t("sidecar.sources.outline_team_activity"),
+			sidecarSourceOutlineTeam: t("sidecar.sources.outline_team"),
+			sidecarSourceOutlineTaskBrief: t("sidecar.sources.outline_task_brief"),
 			contextViewsUpdated: t("sidecar.contextViews.updated", { parts: "{parts}" }),
 			// ── task notices (`shared/pretext-layout/task-notice.ts`) ────────────────
 			taskNoticeStatusTodo: t("sidecar.taskNotice.statusTodo"),
@@ -619,7 +626,13 @@ export function useVListLabels(): VListLabels {
 			taskNoticeChangeClaimable: t("sidecar.taskNotice.changeClaimable"),
 			taskNoticeChangeOverlap: t("sidecar.taskNotice.changeOverlap", { path: "{path}" }),
 			taskNoticeChangeOverlapHidden: t("sidecar.taskNotice.changeOverlapHidden"),
+			taskNoticeChangeAssignedHere: t("sidecar.taskNotice.changeAssignedHere"),
+			taskNoticeChangeUnblockedDone: t("sidecar.taskNotice.changeUnblockedDone"),
+			taskNoticeChangeUnblockedCancelled: t("sidecar.taskNotice.changeUnblockedCancelled"),
+			taskNoticeChangeStillWaiting: t("sidecar.taskNotice.changeStillWaiting"),
+			taskNoticeChangeCreated: t("sidecar.taskNotice.changeCreated"),
 			taskNoticeActivityTitle: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
+			taskNoticeTeamTitle: t("sidecar.taskNotice.teamTitle", { who: "{who}", n: "{n}" }),
 			taskNoticeJoin: t("sidecar.taskNotice.join"),
 			taskNoticeWhoJoin: t("sidecar.taskNotice.whoJoin"),
 			taskNoticeEditedTitle: t("sidecar.taskNotice.editedTitle", { who: "{who}", n: "{n}" }),
@@ -664,6 +677,7 @@ export function useVListLabels(): VListLabels {
 			outlineTaskEditedHeading: t("sidecar.taskNotice.editedHeading", { n: "{n}" }),
 			outlineTaskFinishedHeading: t("sidecar.taskNotice.finishedHeading", { n: "{n}" }),
 			outlineTaskActivityHeading: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
+			outlineTaskTeamHeading: t("sidecar.taskNotice.teamHeading", { n: "{n}" }),
 			outlineTaskMore: t("sidecar.taskNotice.moreRow", { n: "{n}" }),
 			// ── outline tool cards (`shared/pretext-layout/outline-tool-card.ts`) ─────────
 			outlineSpaceOwnSession: t("outlineCard.spaceOwnSession"),
@@ -1011,6 +1025,7 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 	switch (kind) {
 		case "reasoning":
 			return labels.reasoning;
+		case "auxiliary-content":
 		case "tool-call":
 			return labels.toolCall;
 		case "activity-trace":

@@ -1311,6 +1311,7 @@ export const userPreferences = pgTable("user_preferences", {
 	replyInUserLanguage: boolean("reply_in_user_language").notNull().default(true),
 	showTokenUsage: boolean("show_token_usage").notNull().default(false),
 	showOutputStats: boolean("show_output_stats").notNull().default(true),
+	compactAuxiliaryContent: boolean("compact_auxiliary_content").notNull().default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	narratorFontScalePercent: integer("narrator_font_scale_percent").notNull().default(100),
@@ -3864,6 +3865,7 @@ export const outlineViewState = pgTable(
 			.notNull()
 			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
 		collapsedJson: jsonText("collapsed_json").notNull().default(sql.raw("'[]'::text")),
+		expandedJson: jsonText("expanded_json"),
 		layout: text("layout").notNull().default("right"),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -4376,7 +4378,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 141,
-  "columnCount": 1864,
+  "columnCount": 1866,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11642,6 +11644,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "showOutputStats",
           "name": "show_output_stats",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "true",
+          "defaultExpression": "true"
+        },
+        {
+          "property": "compactAuxiliaryContent",
+          "name": "compact_auxiliary_content",
           "kind": "integer",
           "mode": "boolean",
           "pgType": "boolean",
@@ -26484,6 +26498,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "[]",
           "defaultExpression": "sql.raw(\"'[]'::text\")"
+        },
+        {
+          "property": "expandedJson",
+          "name": "expanded_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "layout",

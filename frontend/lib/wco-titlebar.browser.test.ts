@@ -1,7 +1,26 @@
 import { expect, test } from "bun:test";
-import puppeteer from "puppeteer-core";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
+import puppeteer, { type Browser } from "puppeteer-core";
 
-const executablePath = process.env.NF_TEST_CHROMIUM_PATH;
+async function chromePath() {
+	const configured = process.env.NF_TEST_CHROMIUM_PATH;
+	if (configured) return configured;
+	const installed =
+		Bun.which("chromium") ?? Bun.which("google-chrome") ?? Bun.which("chromium-browser");
+	if (installed) return installed;
+	const cache = process.env.PUPPETEER_CACHE_DIR ?? join(homedir(), ".cache", "puppeteer");
+	if (existsSync(cache)) {
+		for await (const path of new Bun.Glob("chrome/*/**/chrome").scan({
+			cwd: cache,
+			absolute: true,
+		}))
+			return path;
+	}
+	return undefined;
+}
+const executablePath = await chromePath();
 
 test.skipIf(!executablePath)(
 	"WCO page strip stays at the viewport top inside the padded shell while scrolling",
@@ -228,3 +247,215 @@ test.skipIf(!executablePath)(
 	},
 	30_000,
 );
+
+test("real narrator header survives mobile breakpoint round trips, both native-control sides and WCO exit", async () => {
+	if (!executablePath) throw new Error("Chromium is required; set NF_TEST_CHROMIUM_PATH");
+	let buildTimer: ReturnType<typeof setTimeout> | undefined;
+	const build = await Promise.race([
+		Bun.build({
+			entrypoints: [join(import.meta.dir, "wco-mobile-titlebar.browser-fixture.tsx")],
+			target: "browser",
+			minify: true,
+			define: { "process.env.NODE_ENV": '"production"' },
+		}),
+		new Promise<never>((_, reject) => {
+			buildTimer = setTimeout(() => reject(new Error("WCO fixture build exceeded 15s")), 15_000);
+		}),
+	]).finally(() => clearTimeout(buildTimer));
+	if (!build.success) throw new Error(build.logs.map(String).join("\n").slice(0, 8_000));
+	if (build.outputs.reduce((bytes, output) => bytes + output.size, 0) > 16 * 1024 * 1024)
+		throw new Error("WCO fixture exceeds 16MiB");
+	const assets = new Map(build.outputs.map((output) => [`/${basename(output.path)}`, output]));
+	const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">${build.outputs
+		.filter((output) => output.path.endsWith(".css"))
+		.map((output) => `<link rel="stylesheet" href="/${basename(output.path)}">`)
+		.join("")}</head><body><div id="root"></div>${build.outputs
+		.filter((output) => output.kind === "entry-point" && output.path.endsWith(".js"))
+		.map((output) => `<script type="module" src="/${basename(output.path)}"></script>`)
+		.join("")}</body></html>`;
+	// Independent loopback server and fresh browser profile; no running app or user data.
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		maxRequestBodySize: 1024,
+		idleTimeout: 5,
+		fetch(request) {
+			if (request.method !== "GET") return new Response(null, { status: 405 });
+			const path = new URL(request.url).pathname;
+			if (path === "/") return new Response(html, { headers: { "content-type": "text/html" } });
+			const asset = assets.get(path);
+			return new Response(asset ?? null, { status: asset ? 200 : 404 });
+		},
+	});
+	let browser: Browser | undefined;
+	try {
+		browser = await puppeteer.launch({
+			executablePath,
+			headless: true,
+			args: ["--no-sandbox", "--disable-dev-shm-usage"],
+			timeout: 15_000,
+			protocolTimeout: 10_000,
+		});
+		const page = await browser.newPage();
+		page.setDefaultTimeout(5_000);
+		const errors: string[] = [];
+		page.on("pageerror", (error) => errors.push(String(error)));
+		await page.setViewport({ width: 1000, height: 600 });
+		await page.goto(server.url.href, { timeout: 15_000 });
+		await page.waitForSelector("[data-narrator-header-layout]", { visible: true });
+		const settle = () =>
+			page.evaluate(async () => {
+				for (let index = 0; index < 6; index++) await new Promise(requestAnimationFrame);
+			});
+		for (const width of [1000, 767, 480, 768, 1000, 360, 1000]) {
+			await page.setViewport({ width, height: 600 });
+			for (const side of ["right", "left", "off"] as const) {
+				await page.evaluate((side) => {
+					const html = document.documentElement;
+					if (side === "off") html.removeAttribute("data-nf-wco");
+					else html.setAttribute("data-nf-wco", side);
+					// Only OS-reported WCO geometry is substituted. All rects are browser layout.
+					html.style.setProperty("--nf-wco-strip-height", "40px");
+					html.style.setProperty("--nf-wco-inset-right", side === "right" ? "144px" : "0px");
+					html.style.setProperty("--nf-wco-inset-left", side === "left" ? "128px" : "0px");
+				}, side);
+				await settle();
+				const state = await page.evaluate(() => {
+					const row = document.querySelector<HTMLElement>("[data-narrator-header-layout]");
+					const title = document.getElementById("title");
+					const toolbar = document.getElementById("toolbar");
+					if (!row || !title || !toolbar) throw new Error("Missing real header");
+					const style = getComputedStyle(row);
+					const rect = row.getBoundingClientRect();
+					const region = (element: Element) =>
+						getComputedStyle(element).getPropertyValue("-webkit-app-region");
+					// app-region is not inherited: a parent's geometric drag region still covers
+					// ordinary descendants, while an explicit no-drag descendant cuts it out.
+					const effectiveRegion = (element: Element): string => {
+						for (let current: Element | null = element; current; current = current.parentElement) {
+							const value = region(current);
+							if (value && value !== "none") return value;
+						}
+						return "none";
+					};
+					const controls = Array.from(row.querySelectorAll("button"));
+					return {
+						top: rect.top,
+						left: rect.left,
+						right: rect.right,
+						width: rect.width,
+						height: rect.height,
+						padLeft: Number.parseFloat(style.paddingLeft),
+						padRight: Number.parseFloat(style.paddingRight),
+						row: region(row),
+						title: effectiveRegion(title),
+						selection: getComputedStyle(title).userSelect,
+						marks: ["row", "start", "end"].map((mark) =>
+							row.hasAttribute(`data-nf-titlebar-${mark}`),
+						),
+						blank: region(
+							document.elementFromPoint(
+								rect.left + Number.parseFloat(style.paddingLeft) + 1,
+								rect.top + 1,
+							) ?? row,
+						),
+						controlRegions: controls.map(region),
+						contentBounds: [...controls, title].map((element) => {
+							const bounds = element.getBoundingClientRect();
+							return { left: bounds.left, right: bounds.right };
+						}),
+						visibleTools: Number(toolbar.dataset.visibleTools),
+						unmeasured: toolbar.dataset.unmeasured,
+						titleWidth: title.getBoundingClientRect().width,
+					};
+				});
+				expect(state.top).toBe(0);
+				expect(state.left).toBe(width < 768 ? 0 : 80);
+				expect(state.right).toBe(width);
+				expect(state.unmeasured).toBe("false");
+				if (side === "off") {
+					expect(state.marks).toEqual([false, false, false]);
+					expect(state.row).not.toBe("drag");
+					expect(state.title).not.toBe("drag");
+					expect(state.selection).not.toBe("none");
+					expect(state.padLeft).toBe(16);
+					expect(state.padRight).toBe(16);
+					expect(state.height).not.toBe(41);
+				} else {
+					expect(state.marks).toEqual([true, true, true]);
+					expect(state.height).toBe(41);
+					expect(state.row).toBe("drag");
+					expect(state.title).toBe("drag");
+					expect(state.blank).toBe("drag");
+					expect(state.selection).toBe("none");
+					expect(state.controlRegions.every((region) => region === "no-drag")).toBe(true);
+					if (side === "left") expect(state.padLeft).toBe(width < 768 ? 136 : 56);
+					if (side === "right") expect(state.padRight).toBe(152);
+				}
+				// Capacity must use the CSS content box, not the reserved native-button padding.
+				const usableWidth = state.width - state.padLeft - state.padRight;
+				const chrome = (width < 768 ? 36 : 0) + 44 + 8 + 22;
+				const titleBudget = Math.max(80, Math.min(220, usableWidth - chrome));
+				expect(state.titleWidth).toBeCloseTo(titleBudget, 3);
+				expect(state.visibleTools).toBe(
+					Math.max(0, Math.min(8, Math.floor((usableWidth - chrome - titleBudget) / 32))),
+				);
+				for (const bounds of state.contentBounds) {
+					expect(bounds.left).toBeGreaterThanOrEqual(state.left + state.padLeft - 1);
+					expect(bounds.right).toBeLessThanOrEqual(state.right - state.padRight + 1);
+					if (side === "left") expect(bounds.left).toBeGreaterThanOrEqual(128);
+					if (side === "right") expect(bounds.right).toBeLessThanOrEqual(width - 144);
+				}
+				await page.evaluate(() => window.getSelection()?.removeAllRanges());
+				await page.click("#title", { clickCount: 2 });
+				const selected = await page.evaluate(() => window.getSelection()?.toString() ?? "");
+				if (side === "off") expect(selected.length).toBeGreaterThan(0);
+				else expect(selected).toBe("");
+				const clicks = Number(await page.$eval("#clicks", (el) => el.textContent));
+				await page.click("#overflow");
+				await page.click("#generate");
+				if (width < 768) await page.click("#menu");
+				expect(Number(await page.$eval("#clicks", (el) => el.textContent))).toBe(
+					clicks + (width < 768 ? 3 : 2),
+				);
+				await page.click("#edit");
+				await page.focus("#title-input");
+				await page.keyboard.down("Control");
+				await page.keyboard.press("a");
+				await page.keyboard.up("Control");
+				await page.keyboard.type("Edited title");
+				await page.keyboard.down("Shift");
+				await page.keyboard.press("Home");
+				await page.keyboard.up("Shift");
+				const input = await page.$eval("#title-input", (element) => {
+					const input = element as HTMLInputElement;
+					const style = getComputedStyle(input);
+					return {
+						value: input.value,
+						start: input.selectionStart,
+						end: input.selectionEnd,
+						region: style.getPropertyValue("-webkit-app-region"),
+						selection: style.userSelect,
+						left: input.getBoundingClientRect().left,
+						right: input.getBoundingClientRect().right,
+					};
+				});
+				expect(input.left).toBeGreaterThanOrEqual(state.left + state.padLeft - 1);
+				expect(input.right).toBeLessThanOrEqual(state.right - state.padRight + 1);
+				expect(input.value).toBe("Edited title");
+				expect([input.start, input.end]).toEqual([0, 12]);
+				expect(input.selection).not.toBe("none");
+				if (side !== "off") expect(input.region).toBe("no-drag");
+				await page.click("#edit");
+			}
+		}
+		expect(errors).toEqual([]);
+		// Headless verifies CSS regions and DOM interaction, not OS-window movement.
+	} finally {
+		try {
+			await browser?.close();
+		} finally {
+			await server.stop(true);
+		}
+	}
+}, 90_000);

@@ -135,6 +135,8 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 	const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const mountedRef = useRef(true);
 	const indicatorFrameRef = useRef<number | null>(null);
+	/** Removes the release watchdog armed by onDragStart. */
+	const releaseWatchRef = useRef<(() => void) | null>(null);
 	const sensors = useSensors(
 		useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
 		useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 5 } }),
@@ -216,6 +218,8 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 			cancelAnimationFrame(indicatorFrameRef.current);
 			indicatorFrameRef.current = null;
 		}
+		releaseWatchRef.current?.();
+		releaseWatchRef.current = null;
 		activeRef.current = null;
 		sourceIdentityRef.current = null;
 		draggingRef.current = false;
@@ -242,6 +246,8 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 		if (ownedRef.current && getPanelDrag() === ownedRef.current) cancelDrag();
 		clear();
 	}, [clear, suppressClick]);
+	const onDragCancelRef = useRef(onDragCancel);
+	onDragCancelRef.current = onDragCancel;
 
 	useEffect(() => {
 		if (!activeRef.current) return;
@@ -288,6 +294,43 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 		};
 	}, [clear]);
 
+	/**
+	 * @dnd-kit drops the end callback when the release arrives before it has committed the
+	 * drag (`active`/translate still null in its sensor context): a quick click or double
+	 * click that crossed the 5px threshold. onDragStart already ran, so without this the
+	 * hook stays "dragging" — every mousemove keeps broadcasting the panel drag (drop
+	 * previews on the page) and nothing ever ends it until another drag runs. After any
+	 * release, give @dnd-kit's own handler a tick; if it never came, cancel.
+	 */
+	const armReleaseWatch = useCallback(() => {
+		releaseWatchRef.current?.();
+		const doc = optionsRef.current.containerRef.current?.ownerDocument ?? document;
+		const win = doc.defaultView;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const check = () => {
+			if (timer !== null) return;
+			timer = setTimeout(() => {
+				timer = null;
+				if (activeRef.current) onDragCancelRef.current();
+			}, 0);
+		};
+		// A move with no button held means the release happened where we could not see it.
+		const onMove = (event: Event) => {
+			if ((event as MouseEvent).buttons === 0) check();
+		};
+		// Same events @dnd-kit's mouse/touch sensors end on; pointer events are left out because
+		// they fire before those, and touch may emit pointercancel while a drag is still live.
+		const releases = ["mouseup", "touchend", "touchcancel"];
+		for (const name of releases) doc.addEventListener(name, check, true);
+		doc.addEventListener("mousemove", onMove, true);
+		win?.addEventListener("blur", check);
+		releaseWatchRef.current = () => {
+			if (timer !== null) clearTimeout(timer);
+			for (const name of releases) doc.removeEventListener(name, check, true);
+			doc.removeEventListener("mousemove", onMove, true);
+			win?.removeEventListener("blur", check);
+		};
+	}, []);
 	const onDragStart = useCallback(
 		(event: DragStartEvent) => {
 			if (pendingRef.current || activeRef.current) return;
@@ -308,9 +351,10 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 				startDragManual(narratorId, tab.title, pointer.x, pointer.y);
 				ownedRef.current = getPanelDrag();
 			}
+			armReleaseWatch();
 			updateIndicator();
 		},
-		[updateIndicator],
+		[armReleaseWatch, updateIndicator],
 	);
 	const updatePointer = useCallback((event: DragMoveEvent | DragEndEvent) => {
 		if (!activeRef.current) return;

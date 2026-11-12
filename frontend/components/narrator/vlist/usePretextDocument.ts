@@ -45,6 +45,7 @@ export interface PretextDocumentView {
 }
 
 export interface UsePretextDocumentOptions {
+	compactAuxiliaryContent?: boolean;
 	enabled?: boolean;
 	/** DOM readiness is separate from coordinator lifetime: parked panes keep their input. */
 	layoutReady?: boolean;
@@ -122,6 +123,7 @@ export interface UsePretextDocumentOptions {
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
 	/**
 	 * First-frame layout / painted height of a live InlinePermission form. Both
 	 * change identity when their inputs do (a request arriving, a form reporting a new
@@ -394,6 +396,7 @@ export function usePretextDocument(
 	const buildOptions = useMemo<PretextLayoutBuildOptions>(
 		() => ({
 			lod: options.lod,
+			compactAuxiliaryContent: options.compactAuxiliaryContent,
 			keepEmptyReasoningLive: options.keepEmptyReasoningLive,
 			isSubagent: options.isSubagent,
 			widthBucket: options.widthBucket,
@@ -424,6 +427,7 @@ export function usePretextDocument(
 			canOfferProviderFix: options.canOfferProviderFix,
 			canOfferModelTest: options.canOfferModelTest,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
+			resolveQuestionStatus: options.resolveQuestionStatus,
 			resolvePermissionFormPrediction: options.resolvePermissionFormPrediction,
 			resolvePermissionFormHeight: options.resolvePermissionFormHeight,
 			pinLatestSpecTasks: options.pinLatestSpecTasks,
@@ -449,6 +453,7 @@ export function usePretextDocument(
 			// The preference changes the item list. The breakpoint here is already
 			// settled; its live value belongs to the bounded preview, not this build.
 			options.showTokenUsage,
+			options.compactAuxiliaryContent,
 			options.compactUsageLines,
 			options.formatUsageNumber,
 			options.contentWidth,
@@ -481,6 +486,7 @@ export function usePretextDocument(
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,
+			options.resolveQuestionStatus,
 			// The live form's reserve: a new request (prediction) and a new painted height
 			// both change a card's height, so each must rebuild the document.
 			options.resolvePermissionFormPrediction,

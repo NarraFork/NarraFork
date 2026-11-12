@@ -634,24 +634,31 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return out.slice(0, query.limit);
 	},
 
-	async listLinksTo(targets, spaceIds, limit) {
+	async listLinksTo(targets, spaceIds, limit, options) {
 		const out: OutlineLinkRow[] = [];
 		if (targets.length === 0) return out;
-		const target = or(
-			...targets.map((t) =>
-				and(
-					eq(outlineLinks.targetKind, t.targetKind),
-					eq(outlineLinks.targetRef, t.targetRef),
-					t.spaceId === undefined ? undefined : eq(outlineLinks.spaceId, t.spaceId),
+		const kinds = options?.kinds;
+		if (kinds && kinds.length === 0) return out;
+		const target = and(
+			or(
+				...targets.map((t) =>
+					and(
+						eq(outlineLinks.targetKind, t.targetKind),
+						eq(outlineLinks.targetRef, t.targetRef),
+						t.spaceId === undefined ? undefined : eq(outlineLinks.spaceId, t.spaceId),
+					),
 				),
 			),
+			isNull(outlineLinks.toSeq),
+			kinds ? inArray(outlineLinks.kind, [...kinds]) : undefined,
 		);
-		for (const spaces of chunked(spaceIds)) {
+		// Any space: one read by the target index.
+		for (const spaces of spaceIds === null ? [null] : chunked(spaceIds)) {
 			if (out.length >= limit) break;
 			const rows = db
 				.select()
 				.from(outlineLinks)
-				.where(and(target, isNull(outlineLinks.toSeq), inArray(outlineLinks.spaceId, spaces)))
+				.where(spaces === null ? target : and(target, inArray(outlineLinks.spaceId, spaces)))
 				.orderBy(asc(outlineLinks.id))
 				.limit(limit - out.length)
 				.all();

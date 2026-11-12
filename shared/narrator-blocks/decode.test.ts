@@ -219,6 +219,49 @@ describe("decodeLegacyContent: assistant steps", () => {
 		]);
 	});
 
+	test("native image decode preserves terminal diagnostics and never infers legacy success without output", () => {
+		const raws = [
+			{ type: "image_generation", id: "unknown" },
+			{ type: "image_generation", id: "saved", savedPath: "/generated.png" },
+			{ type: "image_generation", id: "inline", result: "base64-image" },
+			...["failed", "cancelled", "incomplete"].map((status) => ({
+				type: "image_generation",
+				id: status,
+				status,
+				error: "upstream detail",
+				errorCode: "image_error",
+				partialSavedPath: "/preview.png",
+				width: 512,
+				height: 256,
+			})),
+			{ type: "image_generation", id: "active", status: "generating" },
+		];
+		const { blocks } = decodeLegacyContent(row({ role: "assistant", contentJson: raws }));
+		expect(blocks[0]).toMatchObject({ phase: "done", providerMeta: { result: {} } });
+		expect(blocks[0]?.kind === "tool" && blocks[0].providerMeta?.result?.status).toBeUndefined();
+		for (const block of blocks.slice(1, 3))
+			expect(block).toMatchObject({
+				phase: "done",
+				providerMeta: { result: { status: "completed" } },
+			});
+		for (const [index, status] of ["failed", "cancelled", "incomplete"].entries()) {
+			expect(blocks[index + 3]).toMatchObject({
+				phase: "failed",
+				providerMeta: {
+					result: {
+						status,
+						error: "upstream detail",
+						errorCode: "image_error",
+						partialSavedPath: "/preview.png",
+						width: 512,
+						height: 256,
+					},
+				},
+			});
+		}
+		expect(blocks.at(-1)).toMatchObject({ phase: "open" });
+	});
+
 	test("redacted thinking, legacy thinking and provider tools", () => {
 		const envelope = decodeLegacyContent(
 			row({

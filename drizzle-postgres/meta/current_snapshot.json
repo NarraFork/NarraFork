@@ -1,6 +1,6 @@
 {
-  "id": "c62a7648-b67f-432a-b39e-aa9145a2c13d",
-  "prevId": "35748555-debf-4155-bbff-1561d3be9674",
+  "id": "1363fe77-68fa-4135-8d93-e64136d06a6d",
+  "prevId": "c15812ac-e414-43f9-aee6-4290c568a3e5",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -19536,6 +19536,12 @@
           "notNull": true,
           "default": "'[]'::text"
         },
+        "expanded_json": {
+          "name": "expanded_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "layout": {
           "name": "layout",
           "type": "text",
@@ -24533,6 +24539,13 @@
         },
         "show_output_stats": {
           "name": "show_output_stats",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
+        "compact_auxiliary_content": {
+          "name": "compact_auxiliary_content",
           "type": "boolean",
           "primaryKey": false,
           "notNull": true,

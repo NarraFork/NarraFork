@@ -1,6 +1,7 @@
 import {
 	OUTLINE_BLOCK_ID_RE,
 	OUTLINE_PENDING_API_LIMITS,
+	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	OUTLINE_RESOLVE_REQUEST_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
@@ -83,14 +84,41 @@ export const outlineResolveQuerySchema = z
 		message: "commit needs space",
 	});
 
-/** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
-export const outlineViewStatePutSchema = z.object({
-	// Block ids only: not free text (a reader may write this for every page they can read).
-	collapsed: z
-		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
-		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
-	layout: z.enum(["right", "down"]),
+/** The report containers to name the subagents of (`GET /spaces/:spaceId/report-authors`). */
+export const outlineReportAuthorsQuerySchema = z.object({
+	ids: z
+		.string()
+		.max(OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds * (OUTLINE_VIEW_STATE_LIMITS.maxIdChars + 1))
+		.transform((value) => value.split(",").filter(Boolean))
+		.pipe(
+			z
+				.array(z.string().regex(OUTLINE_BLOCK_ID_RE))
+				.min(1)
+				.max(OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds),
+		),
 });
+
+/** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
+export const outlineViewStatePutSchema = z
+	.object({
+		// Block ids only: not free text (a reader may write this for every page they can read).
+		collapsed: z
+			.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+			.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
+		// What the reader opened that is folded by default; absent from an older client.
+		expanded: z
+			.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+			.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed)
+			.optional(),
+		layout: z.enum(["right", "down"]),
+	})
+	// The two sets share one budget (what is stored is bounded the same way).
+	.refine(
+		(body) =>
+			body.collapsed.length + (body.expanded?.length ?? 0) <=
+			OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+		{ message: "collapsed and expanded together exceed the limit" },
+	);
 
 /** Locking a task tree: the session that may confirm step changes on the locker's behalf. */
 export const outlineLockBodySchema = z.object({
@@ -159,6 +187,7 @@ export const outlineBoardTaskUpdateBodySchema = z
 					username: z.string().trim().min(1).max(OUTLINE_TASK_BOARD_LIMITS.maxUsernameChars),
 				}),
 				z.object({ kind: z.literal("session") }),
+				z.object({ kind: z.literal("narrator"), narratorId: outlineIdSchema }),
 			])
 			.optional(),
 		start: z.boolean().optional(),
@@ -166,6 +195,14 @@ export const outlineBoardTaskUpdateBodySchema = z
 	.refine((body) => body.status !== undefined || body.assign !== undefined, {
 		message: "nothing to change",
 	});
+
+/** Open a new session for a project task (outline P2 PR 10c-1). */
+export const outlineBoardOpenSessionBodySchema = z.object({
+	baseVersionSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+	model: z.string().trim().min(1).max(256).optional(),
+	cwd: z.string().trim().min(1).max(4096).optional(),
+	note: z.string().max(OUTLINE_TASK_BOARD_LIMITS.maxOpenNoteChars).optional(),
+});
 
 /** The reader saw these tasks marked 「新完成」 on a board (outline P2 PR 9b). */
 export const outlineBoardSeenBodySchema = z.object({

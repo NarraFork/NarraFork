@@ -109,6 +109,9 @@ export type NeutralAssistantItem =
 			kind: "image_generation";
 			blockId: string;
 			wireId: string;
+			status?: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			savedPath?: string;
 			/** Base64 bytes, when readable. */
@@ -164,7 +167,14 @@ function assistantItems(
 ): NeutralAssistantItem[] {
 	const items: NeutralAssistantItem[] = [];
 	for (const block of envelope.blocks) {
-		if (!isModelVisible(block)) continue;
+		// Native image failures retain their status for the provider's lightweight
+		// history notice, never as a successful image result. Open calls stay hidden.
+		const terminalImage =
+			block.kind === "tool" &&
+			block.payload.executor === "provider" &&
+			block.subtype === "image_generation" &&
+			block.phase === "failed";
+		if (!isModelVisible(block) && !terminalImage) continue;
 		switch (block.kind) {
 			case "output": {
 				const text = block.payload.parts
@@ -214,17 +224,27 @@ function assistantItems(
 						});
 					} else if (block.subtype === "image_generation") {
 						const result = record(block.providerMeta?.result);
-						const bytes =
-							assets.generatedImages.get(block.id) ??
-							(typeof result.result === "string" && result.result ? result.result : undefined);
+						const status = typeof result.status === "string" ? result.status : undefined;
+						const successful = status === "completed" || (!status && block.phase === "done");
+						const bytes = successful
+							? (assets.generatedImages.get(block.id) ??
+								(typeof result.result === "string" && result.result.trim()
+									? result.result
+									: undefined))
+							: undefined;
 						items.push({
 							kind: "image_generation",
 							blockId: block.id,
 							wireId: block.wireId,
+							...(status ? { status } : {}),
+							...(typeof result.error === "string" ? { error: result.error } : {}),
+							...(typeof result.errorCode === "string" ? { errorCode: result.errorCode } : {}),
 							...(typeof result.revisedPrompt === "string"
 								? { revisedPrompt: result.revisedPrompt }
 								: {}),
-							...(typeof result.savedPath === "string" ? { savedPath: result.savedPath } : {}),
+							...(typeof result.savedPath === "string" && result.savedPath.trim()
+								? { savedPath: result.savedPath }
+								: {}),
 							...(bytes ? { result: bytes } : {}),
 						});
 					}
