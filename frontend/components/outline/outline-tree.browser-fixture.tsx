@@ -200,3 +200,22 @@ export function activeInside(selector: string): boolean {
 	const host = document.querySelector(selector);
 	return !!host && host.contains(document.activeElement);
 }
+
+/**
+ * The tree holds only tree items; a group belongs to the tree item it is in, and holds tree
+ * items (an open page's group holds the page).
+ */
+export function ariaOwnedWell(): boolean {
+	const tree = document.querySelector("[role=tree]");
+	if (!tree) return false;
+	const items = (parent: Element) =>
+		[...parent.children].every((child) => child.getAttribute("role") === "treeitem");
+	if (!items(tree)) return false;
+	for (const group of tree.querySelectorAll("[role=group]")) {
+		const owner = group.parentElement;
+		if (owner?.getAttribute("role") !== "treeitem") return false;
+		const page = owner.querySelector(":scope > [data-tree-node]")?.getAttribute("data-tree-kind");
+		if (page !== "page" && !items(group)) return false;
+	}
+	return true;
+}

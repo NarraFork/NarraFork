@@ -49,6 +49,7 @@ import {
 	IconMessages,
 	IconUser,
 } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
 	createContext,
 	type KeyboardEvent,
@@ -64,6 +65,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	outlineKeys,
 	useEnsurePersonalOutlineSpace,
 	useOutlineBlock,
 	useOutlinePages,
@@ -137,6 +139,7 @@ function TreeRow({
 	to,
 	meta,
 	kind,
+	children,
 }: {
 	nodeKey: string;
 	depth: number;
@@ -148,58 +151,70 @@ function TreeRow({
 	to?: Parameters<typeof OutlineLink>[0]["to"];
 	meta?: ReactNode;
 	kind: "space" | "page" | "group";
+	/** What the node holds, shown (in its group) while it is open. */
+	children?: ReactNode;
 }) {
 	const { t } = useTranslation("outline");
 	const { step } = useTree();
 	const { Icon: Arrow } = FOLD_ICONS[open ? "expanded" : "collapsed"];
 	const action = t(open ? "page.collapse" : "page.expand");
+	// The tree item holds its line and, open, its group: what it owns is nested in it.
 	return (
 		<div
-			className={classes.treeRow}
 			role="treeitem"
 			// Focusable for assistive technology; the keyboard's tab stop is the title.
 			tabIndex={-1}
 			aria-level={depth + 1}
 			aria-expanded={open}
-			data-tree-node={nodeKey}
-			data-tree-kind={kind}
-			data-open={open}
-			style={{ paddingInlineStart: indentOf(depth, step) }}
+			aria-selected={false}
+			data-tree-item=""
 		>
-			<span className={classes.toggle}>
-				{/* One tab stop per row (its title): the arrow is for the pointer, the arrow keys
+			<div
+				className={classes.treeRow}
+				data-tree-node={nodeKey}
+				data-tree-kind={kind}
+				data-open={open}
+				style={{ paddingInlineStart: indentOf(depth, step) }}
+			>
+				<span className={classes.toggle}>
+					{/* One tab stop per row (its title): the arrow is for the pointer, the arrow keys
 				    open and close from the title. */}
-				<button
-					type="button"
-					tabIndex={-1}
-					className={`${classes.toggleButton} mantine-focus-auto`}
-					aria-expanded={open}
-					aria-label={`${action} · ${title}`}
-					title={action}
-					data-tree-toggle=""
-					onClick={onToggle}
-				>
-					<Arrow size={14} />
-				</button>
-			</span>
-			<span className={classes.treeIcon} aria-hidden="true">
-				{icon}
-			</span>
-			{to ? (
-				<OutlineLink to={to} className={classes.treeTitle} title={title} data-tree-title="">
-					{title}
-				</OutlineLink>
-			) : (
-				<button
-					type="button"
-					className={`${classes.treeTitle} ${classes.treeGroupTitle} mantine-focus-auto`}
-					onClick={onToggle}
-					data-tree-title=""
-				>
-					{title}
-				</button>
+					<button
+						type="button"
+						tabIndex={-1}
+						className={`${classes.toggleButton} mantine-focus-auto`}
+						aria-expanded={open}
+						aria-label={`${action} · ${title}`}
+						title={action}
+						data-tree-toggle=""
+						onClick={onToggle}
+					>
+						<Arrow size={14} />
+					</button>
+				</span>
+				<span className={classes.treeIcon} aria-hidden="true">
+					{icon}
+				</span>
+				{to ? (
+					<OutlineLink to={to} className={classes.treeTitle} title={title} data-tree-title="">
+						{title}
+					</OutlineLink>
+				) : (
+					<button
+						type="button"
+						className={`${classes.treeTitle} ${classes.treeGroupTitle} mantine-focus-auto`}
+						onClick={onToggle}
+						data-tree-title=""
+					>
+						{title}
+					</button>
+				)}
+				{meta && <span className={classes.treeMeta}>{meta}</span>}
+			</div>
+			{open && children !== undefined && (
+				// biome-ignore lint/a11y/useSemanticElements: a tree item's children, not a form's fields
+				<div role="group">{children}</div>
 			)}
-			{meta && <span className={classes.treeMeta}>{meta}</span>}
 		</div>
 	);
 }
@@ -207,8 +222,13 @@ function TreeRow({
 /** A line under a node: loading, empty, gone, or the next page. */
 function TreeNote({ depth, children }: { depth: number; children: ReactNode }) {
 	const { step } = useTree();
+	// A leaf of the tree, so that the tree holds nothing but its items.
 	return (
 		<div
+			role="treeitem"
+			tabIndex={-1}
+			aria-level={depth + 1}
+			aria-selected={false}
 			className={classes.treeNote}
 			style={{ paddingInlineStart: indentOf(depth, step) + 24 }}
 			data-tree-note=""
@@ -261,39 +281,36 @@ function SpaceNode({ space, depth }: { space: OutlineTreeSpace; depth: number })
 	const [open, toggle] = useNodeOpen(key);
 	const Icon = SPACE_ICON[space.kind];
 	return (
-		<>
-			<TreeRow
-				nodeKey={key}
-				kind="space"
-				depth={depth}
-				open={open}
-				onToggle={toggle}
-				icon={<Icon size={16} />}
-				title={spaceName(space)}
-				to={{ kind: "space", spaceId: space.id }}
-				meta={
-					<>
-						{space.orphaned && (
-							<Badge size="xs" variant="light" color="orange" tt="none">
-								{t("space.orphaned")}
-							</Badge>
-						)}
-						{space.lastCommitAt && (
-							<Text span size="xs" c="dimmed" data-tree-time="">
-								{formatSmartTime(space.lastCommitAt)}
-							</Text>
-						)}
-					</>
-				}
+		<TreeRow
+			nodeKey={key}
+			kind="space"
+			depth={depth}
+			open={open}
+			onToggle={toggle}
+			icon={<Icon size={16} />}
+			title={spaceName(space)}
+			to={{ kind: "space", spaceId: space.id }}
+			meta={
+				<>
+					{space.orphaned && (
+						<Badge size="xs" variant="light" color="orange" tt="none">
+							{t("space.orphaned")}
+						</Badge>
+					)}
+					{space.lastCommitAt && (
+						<Text span size="xs" c="dimmed" data-tree-time="">
+							{formatSmartTime(space.lastCommitAt)}
+						</Text>
+					)}
+				</>
+			}
+		>
+			<SpaceChildren
+				space={space}
+				depth={depth + 1}
+				sessions={space.kind === "project" ? (space.sessions ?? null) : null}
 			/>
-			{open && (
-				<SpaceChildren
-					space={space}
-					depth={depth + 1}
-					sessions={space.kind === "project" ? (space.sessions ?? null) : null}
-				/>
-			)}
-		</>
+		</TreeRow>
 	);
 }
 
@@ -335,18 +352,17 @@ function SessionsGroup({
 			? t("tree.sessionsUncounted")
 			: t("tree.sessions", { count: treeCountLabel(count, OUTLINE_TREE_LIMITS.countCap) });
 	return (
-		<>
-			<TreeRow
-				nodeKey={key}
-				kind="group"
-				depth={depth}
-				open={open}
-				onToggle={toggle}
-				icon={<IconFolders size={16} />}
-				title={title}
-			/>
-			{open && <SpaceList group={{ kind: "project", projectId }} count={count} depth={depth + 1} />}
-		</>
+		<TreeRow
+			nodeKey={key}
+			kind="group"
+			depth={depth}
+			open={open}
+			onToggle={toggle}
+			icon={<IconFolders size={16} />}
+			title={title}
+		>
+			<SpaceList group={{ kind: "project", projectId }} count={count} depth={depth + 1} />
+		</TreeRow>
 	);
 }
 
@@ -356,20 +372,19 @@ function SpacesGroup({ kind, count }: { kind: "loose" | "orphaned"; count: numbe
 	const key = `group:${kind}`;
 	const [open, toggle] = useNodeOpen(key);
 	return (
-		<>
-			<TreeRow
-				nodeKey={key}
-				kind="group"
-				depth={0}
-				open={open}
-				onToggle={toggle}
-				icon={<IconFolders size={16} />}
-				title={t(`tree.${kind}`, {
-					count: treeCountLabel(count, OUTLINE_TREE_LIMITS.countCap),
-				})}
-			/>
-			{open && <SpaceList group={{ kind }} count={count} depth={1} />}
-		</>
+		<TreeRow
+			nodeKey={key}
+			kind="group"
+			depth={0}
+			open={open}
+			onToggle={toggle}
+			icon={<IconFolders size={16} />}
+			title={t(`tree.${kind}`, {
+				count: treeCountLabel(count, OUTLINE_TREE_LIMITS.countCap),
+			})}
+		>
+			<SpaceList group={{ kind }} count={count} depth={1} />
+		</TreeRow>
 	);
 }
 
@@ -490,26 +505,25 @@ function PageNode({
 	const [open, toggle] = useNodeOpen(key);
 	const live = useSyncExternalStore(state.subscribe, () => state.isLive(key));
 	return (
-		<>
-			<TreeRow
-				nodeKey={key}
-				kind="page"
-				depth={depth}
-				open={open}
-				onToggle={toggle}
-				icon={page.isTask ? <OutlineTaskIcon status="todo" /> : <IconFileText size={16} />}
-				title={page.title || page.sid}
-				to={outlineBlockTarget(spaceId, page.id)}
-				meta={
-					page.alias ? (
-						<Badge size="xs" variant="outline" color="gray" tt="none">
-							{t("page.alias", { alias: page.alias })}
-						</Badge>
-					) : undefined
-				}
-			/>
-			{open && <OpenPage spaceId={spaceId} pageId={page.id} depth={depth + 1} live={live} />}
-		</>
+		<TreeRow
+			nodeKey={key}
+			kind="page"
+			depth={depth}
+			open={open}
+			onToggle={toggle}
+			icon={page.isTask ? <OutlineTaskIcon status="todo" /> : <IconFileText size={16} />}
+			title={page.title || page.sid}
+			to={outlineBlockTarget(spaceId, page.id)}
+			meta={
+				page.alias ? (
+					<Badge size="xs" variant="outline" color="gray" tt="none">
+						{t("page.alias", { alias: page.alias })}
+					</Badge>
+				) : undefined
+			}
+		>
+			<OpenPage spaceId={spaceId} pageId={page.id} depth={depth + 1} live={live} />
+		</TreeRow>
 	);
 }
 
@@ -541,8 +555,16 @@ function OpenPage({
 		bytes: OUTLINE_TREE_LIMITS.pageBytes,
 	});
 	const view = query.data;
-	// This page's own read, and nothing else, when a commit reaches it.
-	useOutlineTreePageLive(view, query.isFetching, live);
+	// This page's own read, and nothing else, when a commit reaches it; and the questions of the
+	// answer form it shows (see below).
+	const queryClient = useQueryClient();
+	const askingUnder = useRef<string | null>(null);
+	const refreshQuestions = useCallback(() => {
+		const under = askingUnder.current;
+		if (!under) return;
+		void queryClient.invalidateQueries({ queryKey: outlineKeys.questions(under) });
+		void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+	}, [queryClient]);
 	// The reader's folding of the page: their own, stored per page.
 	const [state] = useState(() => new OutlineViewState(pageId));
 	useOutlineViewStateSync(pageId, state);
@@ -570,6 +592,9 @@ function OpenPage({
 	// without leaving the tree.
 	const host = useRef<HTMLDivElement>(null);
 	const [asking, setAsking] = useState<{ ids: string[]; under: string } | null>(null);
+	askingUnder.current = asking?.under ?? null;
+	// Subscribed while it is among the newest open pages, or while its answer form is open.
+	useOutlineTreePageLive(view, query.isFetching, live || asking !== null, refreshQuestions);
 	const onOpenQuestions = useCallback(
 		(ids: string[], under: string | null) => setAsking({ ids, under: under ?? pageId }),
 		[pageId],
@@ -630,11 +655,9 @@ function OpenPage({
 	const body = root && root.content.trim() !== title.trim() ? root.content : null;
 	const partial = view.blocks.some((b) => b.hidden > 0) || view.pageTruncated;
 	return (
-		// biome-ignore lint/a11y/useSemanticElements: the open page's blocks, under its row
 		<div
 			ref={host}
 			className={classes.treePage}
-			role="group"
 			style={{ paddingInlineStart: pad }}
 			data-tree-page={pageId}
 			data-live={live || undefined}
@@ -671,7 +694,7 @@ function OpenPage({
 			)}
 			{asking && view.current && (
 				<Paper withBorder p="sm" my="sm" ml={24} data-testid="outline-tree-questions">
-					<OutlineQuestionsForm blockId={asking.under} showOpenLink={false} />
+					<OutlineQuestionsForm blockId={asking.under} showOpenLink={false} live={false} />
 				</Paper>
 			)}
 		</div>
@@ -688,33 +711,31 @@ function RecentGroup() {
 	const recents = useMemo(() => readOutlineRecents(), []);
 	if (recents.length === 0) return null;
 	return (
-		<>
-			<TreeRow
-				nodeKey="group:recent"
-				kind="group"
-				depth={0}
-				open={open}
-				onToggle={toggle}
-				icon={<IconClock size={16} />}
-				title={t("tree.recent", { count: recents.length })}
-			/>
-			{open &&
-				recents.map((recent) => (
-					<TreeNote key={recent.blockId} depth={1}>
-						<OutlineLink
-							to={outlineBlockTarget(recent.spaceId, recent.blockId)}
-							className={classes.treeRecent}
-						>
-							<span className={classes.ellipsis}>
-								{reportLineDisplay(recent.title, { t, locale: i18n?.language }) ?? recent.title}
-							</span>
-							<Text span size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-								{formatSmartTime(new Date(recent.visitedAt).toISOString())}
-							</Text>
-						</OutlineLink>
-					</TreeNote>
-				))}
-		</>
+		<TreeRow
+			nodeKey="group:recent"
+			kind="group"
+			depth={0}
+			open={open}
+			onToggle={toggle}
+			icon={<IconClock size={16} />}
+			title={t("tree.recent", { count: recents.length })}
+		>
+			{recents.map((recent) => (
+				<TreeNote key={recent.blockId} depth={1}>
+					<OutlineLink
+						to={outlineBlockTarget(recent.spaceId, recent.blockId)}
+						className={classes.treeRecent}
+					>
+						<span className={classes.ellipsis}>
+							{reportLineDisplay(recent.title, { t, locale: i18n?.language }) ?? recent.title}
+						</span>
+						<Text span size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+							{formatSmartTime(new Date(recent.visitedAt).toISOString())}
+						</Text>
+					</OutlineLink>
+				</TreeNote>
+			))}
+		</TreeRow>
 	);
 }
 
@@ -807,9 +828,19 @@ function onTreeKeyDown(event: KeyboardEvent<HTMLDivElement>) {
 			if (open) move(at + 1);
 			else toggle();
 			break;
-		case "ArrowLeft":
-			if (open) toggle();
+		case "ArrowLeft": {
+			if (open) {
+				toggle();
+				break;
+			}
+			// Closed, or a leaf: to the row it is under.
+			const parent = row
+				.closest("[role=treeitem]")
+				?.parentElement?.closest<HTMLElement>("[role=treeitem]")
+				?.querySelector<HTMLElement>("[data-tree-title]");
+			parent?.focus();
 			break;
+		}
 		default:
 			return;
 	}

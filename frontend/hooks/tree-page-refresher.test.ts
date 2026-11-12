@@ -4,32 +4,31 @@
  * page list, nor a view as of a commit; a burst of hints is one read.
  */
 import { describe, expect, test } from "bun:test";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { outlineKeys, treePageRefresher } from "./useOutline";
 
 const SPACE = "space1";
 
+/** Block reads of two open pages, a view as of a commit and the page list, each observed. */
 function client() {
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	const reads: string[] = [];
-	const seed = (key: readonly unknown[], name: string) => {
-		queryClient.setQueryData(key, { name });
-		// An observer, so an invalidation refetches (what a mounted page does).
-		queryClient
-			.getQueryCache()
-			.find({ queryKey: key, exact: true })
-			?.setOptions({
-				queryKey: key,
-				queryFn: async () => {
-					reads.push(name);
-					return { name };
-				},
-			});
+	const observe = (key: readonly unknown[], name: string) => {
+		const observer = new QueryObserver(queryClient, {
+			queryKey: key,
+			queryFn: async () => {
+				reads.push(name);
+				return { name };
+			},
+			initialData: { name },
+			staleTime: Number.POSITIVE_INFINITY,
+		});
+		observer.subscribe(() => {});
 	};
-	seed([...outlineKeys.block(SPACE, "pageA", null, "all"), 200, 65536], "A");
-	seed([...outlineKeys.block(SPACE, "pageB", null, "all"), 200, 65536], "B");
-	seed([...outlineKeys.block(SPACE, "pageA", 7, "all"), 200, 65536], "A@7");
-	seed(outlineKeys.pages(SPACE), "pages");
+	observe([...outlineKeys.block(SPACE, "pageA", null, "all"), 200, 65536], "A");
+	observe([...outlineKeys.block(SPACE, "pageB", null, "all"), 200, 65536], "B");
+	observe([...outlineKeys.block(SPACE, "pageA", 7, "all"), 200, 65536], "A@7");
+	observe(outlineKeys.pages(SPACE), "pages");
 	return { queryClient, reads };
 }
 
@@ -46,24 +45,33 @@ function stale(queryClient: QueryClient): string[] {
 
 describe("a page open in the connected outline", () => {
 	test("a commit to it re-reads it alone, once per burst", async () => {
-		const { queryClient } = client();
+		const { queryClient, reads } = client();
+		let refreshed = 0;
 		const refresher = treePageRefresher(
 			queryClient,
 			SPACE,
 			"pageA",
 			() => ({ shown: 3, fetching: false }),
 			1,
+			() => refreshed++,
 		);
 		refresher.hint({ kind: "changed", seq: 4 });
 		refresher.hint({ kind: "changed", seq: 5 });
 		refresher.hint({ kind: "changed", seq: 6 });
-		await tick();
-		expect(stale(queryClient)).toEqual(["A"]);
+		await tick(20);
+		expect(stale(queryClient)).toEqual([]);
+		expect(reads).toEqual(["A"]);
+		expect(refreshed).toBe(1);
+		// The next burst: one more read.
+		refresher.hint({ kind: "changed", seq: 7 });
+		refresher.hint({ kind: "changed", seq: 8 });
+		await tick(20);
+		expect(reads).toEqual(["A", "A"]);
 		refresher.dispose();
 	});
 
 	test("nothing newer than what is shown: nothing is read", async () => {
-		const { queryClient } = client();
+		const { queryClient, reads } = client();
 		const refresher = treePageRefresher(
 			queryClient,
 			SPACE,
@@ -72,17 +80,17 @@ describe("a page open in the connected outline", () => {
 			1,
 		);
 		refresher.hint({ kind: "subscribed", seq: 9 });
-		await tick();
-		expect(stale(queryClient)).toEqual([]);
+		await tick(20);
+		expect(reads).toEqual([]);
 		// A change waiting for confirmation, or access lost, reads it whatever the seq.
 		refresher.hint({ kind: "pending" });
-		await tick();
-		expect(stale(queryClient)).toEqual(["A"]);
+		await tick(20);
+		expect(reads).toEqual(["A"]);
 		refresher.dispose();
 	});
 
 	test("a read in flight is waited for, then looked at again", async () => {
-		const { queryClient } = client();
+		const { queryClient, reads } = client();
 		let fetching = true;
 		const refresher = treePageRefresher(
 			queryClient,
@@ -92,12 +100,12 @@ describe("a page open in the connected outline", () => {
 			1,
 		);
 		refresher.hint({ kind: "changed", seq: 2 });
-		await tick();
-		expect(stale(queryClient)).toEqual([]);
+		await tick(20);
+		expect(reads).toEqual([]);
 		// The read that was in flight already holds seq 2: nothing more to read.
 		fetching = false;
-		await tick();
-		expect(stale(queryClient)).toEqual([]);
+		await tick(20);
+		expect(reads).toEqual([]);
 		refresher.dispose();
 	});
 });

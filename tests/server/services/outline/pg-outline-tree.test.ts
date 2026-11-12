@@ -28,10 +28,16 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 const RUN_TIMEOUT_MS = 600_000;
 const NOW = "2026-11-03T00:00:00.000Z";
 
+/**
+ * The database the listings run in: created by this test with an ICU collation (en-US), whatever
+ * the server's default, so byte order has to come from the queries' own `collate "C"`.
+ */
+const ICU_DATABASE = "nf_tree_icu";
+
 function urlFor(port: number, credentials: { user: string; password: string }): string {
 	return `postgres://${encodeURIComponent(credentials.user)}:${encodeURIComponent(
 		credentials.password,
-	)}@127.0.0.1:${port}/nf_harness`;
+	)}@127.0.0.1:${port}/${ICU_DATABASE}`;
 }
 
 const me = { userId: "me", isAdmin: false };
@@ -115,8 +121,12 @@ describe("PostgreSQL connected outline", () => {
 		async () => {
 			const sqls = await migrationSql();
 			const outcome = await withPostgres(async ({ exec, port, credentials }) => {
+				const created = await exec(
+					`DROP DATABASE IF EXISTS ${ICU_DATABASE};\nCREATE DATABASE ${ICU_DATABASE} TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C';`,
+				);
+				if (created.code !== 0) return { icuDatabaseError: created.stderr.slice(0, 400) };
 				for (const statement of sqls) {
-					const applied = await exec(statement);
+					const applied = await exec(`\\connect ${ICU_DATABASE}\n${statement}`);
 					if (applied.code !== 0) return { migrationError: applied.stderr.slice(0, 400) };
 				}
 				const client = createPostgresClient({
@@ -127,6 +137,10 @@ describe("PostgreSQL connected outline", () => {
 				});
 				setOutlineAccessExecutor(createPostgresOutlineAccessExecutor(client.db));
 				try {
+					// The database's own order is not byte order (else this proves nothing).
+					const [order] = (await client.sql.unsafe("select 'a_b' < 'aB' as icu")) as Array<{
+						icu: boolean;
+					}>;
 					await seed((q) => client.db.execute(q));
 					const sessions = await walk({ kind: "project", projectId: "P1" }, 100);
 					const bySize: Record<number, string[]> = {};
@@ -135,6 +149,7 @@ describe("PostgreSQL connected outline", () => {
 					}
 					return {
 						backend: outlineAccessBackend(),
+						icuOrder: order?.icu === true,
 						sessions,
 						bySize,
 						count: await countOutlineTreeSpaces(me, { kind: "project", projectId: "P1" }, 100),
@@ -151,6 +166,7 @@ describe("PostgreSQL connected outline", () => {
 				} finally {
 					setOutlineAccessExecutor(undefined);
 					await client.close();
+					await exec(`DROP DATABASE IF EXISTS ${ICU_DATABASE} WITH (FORCE);`);
 				}
 			});
 			if (
@@ -162,6 +178,7 @@ describe("PostgreSQL connected outline", () => {
 				throw new Error(`PostgreSQL harness did not run: ${JSON.stringify(outcome)}`);
 			}
 			expect(outcome.backend).toBe("postgres");
+			expect(outcome.icuOrder).toBe(true);
 			const committed = ["a_b", "aB", "AA", "a-c", "Zz", "zz", "b"]
 				.map((i) => `s${i}`)
 				.sort(byteDesc);

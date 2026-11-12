@@ -8,9 +8,10 @@
  *
  *   - at most {@link TREE_OPEN_LIMITS.maxKeys} keys are kept (stored in `localStorage`);
  *   - at most {@link TREE_OPEN_LIMITS.maxPages} pages are SHOWN open with their content at once:
- *     opening (or showing again, by opening its parent) one more closes the shown page opened
- *     longest ago (its row stays; opening it reads it again). A page open under a closed parent
- *     is not shown: it holds no content and does not count;
+ *     opening (or showing again, by opening its parent) one more closes the shown page opened or
+ *     shown longest ago (its row stays; opening it reads it again). A page shown again counts as
+ *     the newest. A page open under a closed parent is not shown: it holds no content and does
+ *     not count;
  *   - of the shown open pages, the newest {@link TREE_OPEN_LIMITS.livePages} are kept fresh by a
  *     page subscription; the others show the read they have.
  *
@@ -134,8 +135,11 @@ export class TreeOpenState {
 	 * function says it is not shown any more.
 	 */
 	showPage(key: string): () => void {
-		this.shown.set(key, (this.shown.get(key) ?? 0) + 1);
-		this.commit(this.keys);
+		const was = this.shown.get(key) ?? 0;
+		this.shown.set(key, was + 1);
+		// Shown again (its parent reopened): it is what the reader looks at now, so it counts as
+		// the newest and the limits fall on pages out of sight or opened longer ago.
+		this.commit(was === 0 && this.set.has(key) ? withTreeOpen(this.keys, key, true) : this.keys);
 		return () => {
 			const n = (this.shown.get(key) ?? 1) - 1;
 			if (n <= 0) this.shown.delete(key);

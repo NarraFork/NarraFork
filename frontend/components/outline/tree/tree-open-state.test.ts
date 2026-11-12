@@ -99,4 +99,24 @@ describe("the connected outline's open nodes", () => {
 		expect(treeCountLabel(12, 100)).toBe("12");
 		expect(treeCountLabel(100, 100)).toBe("99+");
 	});
+	test("reopening a parent keeps the pages it shows again; older shown pages go", () => {
+		const state = new TreeOpenState(null, []);
+		const a = pages(12, "a");
+		const b = pages(12, "b");
+		const hideA = a.map((key) => {
+			state.setOpen(key, true);
+			return state.showPage(key);
+		});
+		// A closes: its pages stay open, not shown.
+		for (const hide of hideA) hide();
+		for (const key of b) {
+			state.setOpen(key, true);
+			state.showPage(key);
+		}
+		// A opens again: its twelve pages are shown, and they are what the reader looks at.
+		for (const key of a) if (state.isOpen(key)) state.showPage(key);
+		expect(a.filter((key) => state.isOpen(key))).toHaveLength(12);
+		expect(b.filter((key) => state.isOpen(key))).toHaveLength(0);
+		expect(a.filter((key) => state.isLive(key))).toHaveLength(TREE_OPEN_LIMITS.livePages);
+	});
 });

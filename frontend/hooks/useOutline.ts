@@ -382,12 +382,20 @@ export function useOutlineQuestionGroups(blockIds: readonly string[]) {
 }
 
 /** Share the existing page subscriptions with the editor; no polling or second socket. */
-export function useOutlineQuestionsLive(groups: readonly OutlineQuestionGroupResponse[]) {
+/**
+ * Keep the questions shown fresh through their pages' subscriptions. `enabled` false: the host
+ * keeps them fresh itself (a page open in the connected outline, which re-reads that page only).
+ */
+export function useOutlineQuestionsLive(
+	groups: readonly OutlineQuestionGroupResponse[],
+	enabled = true,
+) {
 	const client = useQueryClient();
 	const pages = JSON.stringify([
 		...new Map(groups.map(({ group }) => [group.pageId, [group.pageId, group.spaceId]])).values(),
 	]);
 	useEffect(() => {
+		if (!enabled) return;
 		const unsubscribe = (JSON.parse(pages) as [string, string][]).map(([pageId, spaceId]) => {
 			let seen = -1;
 			return pageSubscriptions().subscribe(pageId, (hint) => {
@@ -404,7 +412,7 @@ export function useOutlineQuestionsLive(groups: readonly OutlineQuestionGroupRes
 		return () => {
 			for (const dispose of unsubscribe) dispose();
 		};
-	}, [client, pages]);
+	}, [client, pages, enabled]);
 }
 
 /** Answer questions of one space at once; questions, views and the inbox re-read after. */
@@ -581,6 +589,8 @@ export function treePageRefresher(
 	pageId: string,
 	read: () => { shown: number; fetching: boolean },
 	delayMs = TREE_PAGE_REFRESH_MS,
+	/** Also when the page is read again (the answer form the page shows, its questions). */
+	onRefresh?: () => void,
 ): { hint: (hint: OutlinePageHint) => void; dispose: () => void } {
 	let wanted = -1;
 	let force = false;
@@ -601,6 +611,7 @@ export function treePageRefresher(
 		}
 		force = false;
 		refetch();
+		onRefresh?.();
 	};
 	const schedule = () => {
 		timer ??= setTimeout(check, delayMs);
@@ -632,8 +643,11 @@ export function useOutlineTreePageLive(
 	view: Pick<OutlineBlockViewResponse, "pageId" | "seq" | "space"> | undefined,
 	fetching: boolean,
 	enabled: boolean,
+	onRefresh?: () => void,
 ): void {
 	const queryClient = useQueryClient();
+	const refreshed = useRef(onRefresh);
+	refreshed.current = onRefresh;
 	const spaceId = view?.space.id;
 	const pageId = view?.pageId;
 	const state = useRef({ shown: -1, fetching: false });
@@ -643,7 +657,14 @@ export function useOutlineTreePageLive(
 	};
 	useEffect(() => {
 		if (!enabled || !spaceId || !pageId) return;
-		const refresher = treePageRefresher(queryClient, spaceId, pageId, () => state.current);
+		const refresher = treePageRefresher(
+			queryClient,
+			spaceId,
+			pageId,
+			() => state.current,
+			TREE_PAGE_REFRESH_MS,
+			() => refreshed.current?.(),
+		);
 		const unsubscribe = pageSubscriptions().subscribe(pageId, refresher.hint);
 		return () => {
 			unsubscribe();

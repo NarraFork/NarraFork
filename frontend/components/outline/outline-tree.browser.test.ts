@@ -339,6 +339,7 @@ test("a page opens in place, read-only and folded by default; the folding is sto
 	expect(byId.has(taskPage.idOf("Seen in the logs"))).toBe(false);
 	const previews = await call(page, (f, id: string) => f.previews(id), taskPage.pageId);
 	expect(previews).toContain(taskPage.idOf("Reproduce the race"));
+	expect(await call(page, (f) => f.ariaOwnedWell())).toBe(true);
 	// Nothing in the tree edits: no editor, no editable text.
 	expect(await call(page, (f) => f.count("[contenteditable='true']"))).toBe(0);
 	await shot(page, "3-page-folded-tasks");
@@ -573,7 +574,10 @@ test("the keyboard: one tab stop per row; arrows move, open and close", async ()
 	await until(page, "the project open", hasRow, "Facts: the outline system");
 	await page.keyboard.press("ArrowRight");
 	expect(await call(page, (f) => f.focusedTitle())).toBe("Facts: the outline system");
-	await page.keyboard.press("ArrowUp");
+	// Left on a closed row goes to the row it is under; there it closes it.
+	await page.keyboard.press("ArrowLeft");
+	expect(await call(page, (f) => f.focusedTitle())).toBe("NarraFork");
+	expect(await call(page, (f) => f.ariaOwnedWell())).toBe(true);
 	await page.keyboard.press("ArrowLeft");
 	await until(
 		page,
