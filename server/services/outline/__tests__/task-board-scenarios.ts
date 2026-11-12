@@ -628,7 +628,7 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 			]);
 			expect(copy?.parentId).toBe(page?.id);
 			expect((await outlineStore.getBlock(id))?.taskJson?.depends).toEqual([
-				{ target: out.handedOut?.copy.address, label: null },
+				{ target: out.handedOut?.copy.address as string, label: null },
 			]);
 			// Waiting for it on the session's board.
 			const after = await readSessionTaskBoard(as(owner.id), session);

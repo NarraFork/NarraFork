@@ -356,7 +356,7 @@ describe("handing a task out to the team", () => {
 		let calls = 0;
 		const failing = (async () => {
 			calls++;
-			throw new OutlineBusyError(sessionSpace.id);
+			throw new OutlineBusyError(sessionSpace.id, 1);
 		}) as unknown as typeof writeOutline;
 		let error: unknown = null;
 		try {
