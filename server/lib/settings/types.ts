@@ -676,15 +676,19 @@ export interface NarraForkSettings {
 		 * Master switch, off by default while the feature is built: when off the outline agent
 		 * tools are not offered, its routes answer 404 and navigation hides it. When on, root
 		 * sessions created from then on keep their tasks in the outline (`narrators.task_backend`
-		 * `outline`); existing sessions keep Dynamic Spec. Turned off again, every session reads
-		 * as a spec session until it is back on (`services/task-source`).
+		 * `outline`); existing sessions keep Dynamic Spec until they are imported into the outline
+		 * (`specImport`), which moves them to it and leaves their Dynamic Spec rows in place.
+		 * Turned off again, every session reads as a spec session until it is back on
+		 * (`services/task-source`).
 		 */
 		enabled: boolean;
 		/**
 		 * How sessions that still keep their tasks in Dynamic Spec are imported into the outline
-		 * (outline P2 PR 12b), while `enabled` is on. `auto` (the default): before a session's next
-		 * run, by a background job while it is idle, and from the Spec panel's button. `manual`:
-		 * only from the button. `off`: not at all.
+		 * (outline P2 PR 12b), while `enabled` is on: their current spec files, tasks and behavior
+		 * fence are written into the session space, checked one by one, and the session is moved
+		 * to the outline (its Dynamic Spec rows stay). `manual` (the default): only from the Spec
+		 * panel's button. `auto`: also before a small session's next run and by a background job
+		 * while sessions are idle. `off`: not at all.
 		 */
 		specImport?: "auto" | "manual" | "off";
 	};

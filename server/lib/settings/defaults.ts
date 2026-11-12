@@ -42,7 +42,8 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	outline: {
 		enabled: false,
-		specImport: "auto",
+		// Owner decision pending: "manual" until imports are switched on for everyone ("auto").
+		specImport: "manual",
 	},
 	requestEvidence: {
 		ringEnabled: true,
@@ -406,14 +407,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── outline ─────────────────────────────────────────────────────────
 	"outline.enabled": {
-		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示；现有的 spec:// 和知识库不受影响。",
+		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示，所有会话都按 Dynamic Spec（spec://）会话运行。打开后新建的根会话把任务记在大纲里；还在用 spec:// 的旧会话按 outline.specImport 导入大纲（导入后改用大纲记任务，spec:// 的数据保留不删）。知识库不受影响。",
 		type: "boolean",
 		valid: "true / false，默认 false",
 	},
 	"outline.specImport": {
-		desc: "大纲开关打开后，还在用 Dynamic Spec 记任务的旧会话怎样导入大纲。auto：会话下一次开始运行前、后台在会话空闲时、以及 Spec 面板的「现在导入」都会导入；manual：只在点「现在导入」时导入；off：不导入。导入不删除 Dynamic Spec 的数据。",
+		desc: "大纲开关打开后，还在用 Dynamic Spec（spec://）记任务的旧会话怎样导入大纲。导入把会话当前的 spec 文件、任务和行为边界写进会话的大纲空间，逐条核对后把会话改成用大纲记任务；Dynamic Spec 的数据保留不删。manual：只在 Spec 面板点「现在导入」时导入；auto：另外在会话下一次开始运行前（小会话）和后台在会话空闲时导入；off：不导入。",
 		type: "string",
-		valid: "auto / manual / off，默认 auto",
+		valid: "auto / manual / off，默认 manual",
 	},
 
 	// ── plugins ─────────────────────────────────────────────────────────
