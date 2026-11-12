@@ -17,7 +17,10 @@
  *      the version the board read; the project has a working directory (or one was given).
  *      Asked to continue in the previous session's directory (`previousDirectory`), that is the
  *      directory of the session that last held the task, only when it is inside the project's
- *      own and still exists; otherwise `no_directory`.
+ *      own and still exists; otherwise `no_directory`. A managed worktree may be reused so: its
+ *      resource row outlives the session that made it (archiving that session removes nothing),
+ *      and the new session's own `cwd` is a protection source of the lifecycle guard
+ *      (`resource-protection-index`), so the directory cannot be removed under it.
  *   3. The session: a root session in the project, owned by the person, its tasks in the outline,
  *      titled after the task, with the defaults of any session created there (audiences,
  *      permission mode, continuation).
