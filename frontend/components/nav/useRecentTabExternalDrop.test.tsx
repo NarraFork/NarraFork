@@ -69,7 +69,7 @@ beforeEach(() => {
 	measurements = 0;
 	drops = [];
 	rows = [
-		{ key: "narrator:anchor", top: 30, bottom: 70, pinned: false, keyBlock: ["narrator:anchor"] },
+		{ key: "narrator:anchor", top: 36, bottom: 76, kind: "tab", pinned: false, canNest: true },
 	];
 	rect = { left: 0, right: 100, top: 10, bottom: 200 } as DOMRect;
 	const sidebar = document.createElement("div");
@@ -83,6 +83,12 @@ beforeEach(() => {
 			measurements++;
 			return rows;
 		},
+		sourceFor: (narratorId) => ({
+			key: `narrator:${narratorId}`,
+			kind: "tab",
+			pinned: false,
+			canNest: true,
+		}),
 		onDrop: (drop) => drops.push(drop),
 	};
 });
@@ -133,21 +139,22 @@ describe("useRecentTabExternalDrop", () => {
 		expect(measurements).toBe(1);
 	});
 
-	test("uses release coordinates and fresh rows for workspace drops", async () => {
+	test("uses release coordinates and fresh rows for folder drops", async () => {
 		await render();
 		await drag(() => startDragManual("external", "External", 50, 40));
 		rows = [
 			{
-				key: "workspace:w",
+				key: "folder:f",
 				top: 80,
 				bottom: 120,
+				kind: "folder",
 				pinned: false,
-				workspaceId: "w",
-				keyBlock: ["workspace:w"],
+				folderId: "f",
+				canNest: false,
 			},
 		];
 		await drag(() => releaseAt(50, 100));
-		expect(drops[0]?.target).toEqual({ kind: "workspace", workspaceId: "w" });
+		expect(drops[0]?.target).toEqual({ kind: "into-folder", folderId: "f" });
 		expect(measurements).toBe(2);
 		expect(state).toBeNull();
 	});

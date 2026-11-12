@@ -91,9 +91,15 @@ export function useDashboardSessions() {
 		() => buildDashboardSessions({ attentionItems, narrators, activity: new Map() }),
 		[attentionItems, narrators],
 	);
+	// Unread sessions come last: they only change when read, so running ones keep
+	// their live tool rows when the subscription cap is reached.
 	const watchedIds = useMemo(
 		() =>
-			[...initial.attention, ...initial.running]
+			[
+				...initial.attention.filter((session) => !session.unread),
+				...initial.running,
+				...initial.attention.filter((session) => session.unread),
+			]
 				.map((session) => session.narratorId)
 				.slice(0, MAX_ACTIVITY_SUBSCRIPTIONS),
 		[initial],
@@ -269,7 +275,9 @@ function SessionCard({
 			: "var(--mantine-color-blue-filled)"
 		: session.errored
 			? "var(--mantine-color-red-filled)"
-			: undefined;
+			: session.unread
+				? "var(--mantine-color-green-filled)"
+				: undefined;
 
 	return (
 		<Card
@@ -350,8 +358,8 @@ function SessionCard({
 							</Text>
 						)}
 					</Stack>
-				) : session.errored ? (
-					<Text size="xs" c="red">
+				) : session.errored || session.unread ? (
+					<Text size="xs" c={session.errored ? "red" : "green"}>
 						{tc(display.i18nKey)}
 					</Text>
 				) : null}

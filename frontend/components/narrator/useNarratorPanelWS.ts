@@ -1,5 +1,5 @@
 import { notifications } from "@mantine/notifications";
-import { quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
+import { providerWaitKind, quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ProgressSnapshot } from "@shared/progress-phase";
@@ -9,7 +9,7 @@ import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
-import { useNarratorWS } from "../../hooks/useNarratorWS";
+import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { formatFullLocaleDateTime } from "../../lib/format";
@@ -36,6 +36,7 @@ import type {
 	PendingPermission,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
+import { createNarratorWarningHandler, nativeMediaFallbackNotice } from "./narrator-warning";
 import {
 	reconcilePendingPermissions,
 	upsertPendingPermissionMap,
@@ -95,16 +96,15 @@ export interface RetryInfo {
 }
 
 /**
- * A narrator parked on an exhausted Kimi quota window.
- *
- * Only the reset instant is needed: the label is `status_quota_exhausted` and the
- * reset time is appended to it. Null when the server knew the wall but not the
- * clock, so the label stays generic rather than inventing a time.
+ * Live details for a timed provider wait: allowance reset, capacity or rate limit.
+ * The persisted waiting payload supplies the same details after a page reload.
+ * Older quota events omit waitKind and retain their original quota semantics.
  */
 export interface QuotaWaitInfo {
 	resumeAt: number | null;
 	/** Which plan the wait belongs to; absent from older servers (always Kimi). */
 	quotaProvider?: "kimi" | "opencode";
+	waitKind?: "quota" | "capacity" | "rate_limit";
 }
 
 export interface PaymentRequiredInfo {
@@ -1023,30 +1023,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removePendingPermission(requestId);
 			},
 			onPlanReflectionStarted: () => {},
-			onPlanReflectionStopped: ({
-				requestId,
-				toolUseId,
-				toolName,
-				inputJson,
-				reason,
-				parentToolUseId,
-				subagentNarratorId,
-				ownerNarratorId,
-			}) => {
-				const existing = pendingPermsByRequestIdRef.current.get(requestId);
-				upsertPendingPermission({
-					...(existing ?? {}),
-					id: requestId,
-					toolName,
-					toolUseId,
-					parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
-					subagentNarratorId: subagentNarratorId ?? existing?.subagentNarratorId,
-					ownerNarratorId: ownerNarratorId ?? existing?.ownerNarratorId,
-					inputJson: existing?.inputJson ?? inputJson ?? {},
-					decisionReason: reason ?? existing?.decisionReason,
-					suggestions: [{ type: "plan_reflection", status: "awaiting_user", requestId, reason }],
-				});
-				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
+			onPlanReflectionStopped: ({ requestId }) => {
+				// A plan reflection's exit_plan_* id is a synthetic gate, not a permission
+				// row. Handover retires it before registering the real permission_request.
+				// Keeping both ids makes the tool card pick the synthetic one first and
+				// submit an approval whose owner no longer exists. Only the real request
+				// (or its durable panel snapshot) may supply the approval form.
+				clearReflectionProgress(requestId);
+				removePendingPermission(requestId);
+				requestPanelReconcileRef.current();
 			},
 			onPlanReflectionResolved: ({ requestId }) => {
 				clearReflectionProgress(requestId);
@@ -1342,33 +1327,59 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// pool coming back, or a Kimi / OpenCode Go quota window resetting. Reflect the
 				// waiting status locally and surface a dismissible notice that says
 				// which of the two it is.
-				const isQuota = info.waitKind === "quota";
+				const waitKind = providerWaitKind(info);
+				const isQuota = waitKind === "quota";
+				const transientPrefix =
+					waitKind === "capacity" ? "capacity" : waitKind === "rate_limit" ? "rateLimit" : null;
 				const substatus = isQuota ? "quota_exhausted" : "model_unavailable";
 				applyQuotaWaitInfo(
-					isQuota ? { resumeAt: info.resumeAt ?? null, quotaProvider: info.quotaProvider } : null,
+					waitKind !== "credentials"
+						? { resumeAt: info.resumeAt ?? null, quotaProvider: info.quotaProvider, waitKind }
+						: null,
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				notifications.show({
 					id: `model-unavailable-${narratorId}`,
-					title: t(isQuota ? "quotaExhaustedWaitingTitle" : "modelUnavailableWaitingTitle", {
-						provider: quotaProviderLabel(info.quotaProvider),
-					}),
-					message: isQuota
-						? t("quotaExhaustedWaitingDesc", {
+					title: t(
+						transientPrefix
+							? `${transientPrefix}WaitingTitle`
+							: isQuota
+								? "quotaExhaustedWaitingTitle"
+								: "modelUnavailableWaitingTitle",
+						{
+							provider: quotaProviderLabel(info.quotaProvider),
+						},
+					),
+					message: transientPrefix
+						? t(`${transientPrefix}WaitingDesc`, {
 								model: info.model,
-								provider: quotaProviderLabel(info.quotaProvider),
 								resetAt: info.resumeAt
 									? formatFullLocaleDateTime(new Date(info.resumeAt), i18n.language)
-									: t("quotaExhaustedResetUnknown"),
+									: t("providerRetryTimeUnknown"),
 							})
-						: t("modelUnavailableWaitingDesc", { model: info.model }),
+						: isQuota
+							? t("quotaExhaustedWaitingDesc", {
+									model: info.model,
+									provider: quotaProviderLabel(info.quotaProvider),
+									resetAt: info.resumeAt
+										? formatFullLocaleDateTime(new Date(info.resumeAt), i18n.language)
+										: t("quotaExhaustedResetUnknown"),
+								})
+							: t("modelUnavailableWaitingDesc", { model: info.model }),
 					// Blue-toned neutral, not yellow: nothing here is actionable.
 					color: statusRegistry.accentColor(statusRegistry.narratorSubstatus(substatus)),
 					autoClose: false,
 				});
 			},
 			onModelUnavailableRecovered: (info) => {
-				const isQuota = info.waitKind === "quota";
+				// Older recovery events omit the bucket; retain the reason from their waiting event.
+				const waitKind =
+					info.waitKind === "quota" && quotaWaitInfoRef.current?.waitKind
+						? quotaWaitInfoRef.current.waitKind
+						: providerWaitKind(info);
+				const isQuota = waitKind === "quota";
+				const transientPrefix =
+					waitKind === "capacity" ? "capacity" : waitKind === "rate_limit" ? "rateLimit" : null;
 				notifications.hide(`model-unavailable-${narratorId}`);
 				clearQuotaWaitIfActive();
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -1376,10 +1387,23 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				notifications.show({
-					title: t(isQuota ? "quotaExhaustedRecoveredTitle" : "modelUnavailableRecoveredTitle"),
-					message: t(isQuota ? "quotaExhaustedRecoveredDesc" : "modelUnavailableRecoveredDesc", {
-						model: info.model,
-					}),
+					title: t(
+						transientPrefix
+							? `${transientPrefix}RecoveredTitle`
+							: isQuota
+								? "quotaExhaustedRecoveredTitle"
+								: "modelUnavailableRecoveredTitle",
+					),
+					message: t(
+						transientPrefix
+							? `${transientPrefix}RecoveredDesc`
+							: isQuota
+								? "quotaExhaustedRecoveredDesc"
+								: "modelUnavailableRecoveredDesc",
+						{
+							model: info.model,
+						},
+					),
 					color: "green",
 					autoClose: 4000,
 				});
@@ -1495,28 +1519,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					autoClose: 8000,
 				});
 			},
-			onNarratorWarning: (info) => {
-				// Localize via the structured diagnostics so a retry toast explains the
-				// actual cause instead of echoing the provider's raw English text.
-				const localizedWarning =
-					localizeNarratorError(info.message, t, undefined, info.diagnostics) ?? info.message;
-				if (info.retryCount != null && info.maxRetries != null && info.delayMs != null) {
-					const ri = {
-						message: localizedWarning,
-						retryCount: info.retryCount,
-						maxRetries: info.maxRetries,
-						retryAt: Date.now() + info.delayMs,
-					};
-					retryInfoRef.current = ri;
-					setRetryInfo(ri);
-				}
-				notifications.show({
-					title: t("narratorRetrying"),
-					message: localizedWarning,
-					color: "yellow",
-					autoClose: 10000,
-				});
-			},
+			onNarratorWarning: createNarratorWarningHandler({
+				t,
+				localizeWarning: (info) =>
+					localizeNarratorError(info.message, t, undefined, info.diagnostics) ?? info.message,
+				setRetryInfo: (info) => {
+					retryInfoRef.current = info;
+					setRetryInfo(info);
+				},
+				notify: (notice) => notifications.show({ ...notice }),
+			}),
 			onLeakedToolCall: (info) => {
 				if (info.phase === "stream_captured") return;
 				setLeakedToolEvent({
@@ -1558,10 +1570,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 			},
-			onSubagentWarning: (
-				subagentNarratorId: string,
-				info: { message: string; retryCount?: number; maxRetries?: number; delayMs?: number },
-			) => {
+			onSubagentWarning: (subagentNarratorId: string, info: NarratorWarningInfo) => {
+				const fallbackNotice = nativeMediaFallbackNotice(info, t);
+				if (fallbackNotice) {
+					notifications.show({ ...fallbackNotice });
+					return;
+				}
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
 				qc.setQueryData(["narrators", subagentNarratorId], (old: any) =>
 					old

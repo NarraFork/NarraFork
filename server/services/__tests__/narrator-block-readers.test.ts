@@ -30,6 +30,8 @@ await import("../narrator-service");
 const { narratorStore } = await import("../narrator-store");
 const { narratorPersistence } = await import("../narrator-persistence");
 const { settings } = await import("../../lib/settings");
+const compactJson = settings.narratorBlocks.compactJson;
+const { blockReadsEnabled, noteRowsOnlyEnvelopes } = await import("../narrator-block-scans");
 const blockSync = await import("../narrator-block-sync");
 const { externalReasoningScan } = await import("../external-resource-service");
 const { NARRATOR_EXPORT_DEFAULTS, streamNarratorExport } = await import("../narrator-export");
@@ -39,6 +41,7 @@ const NOW = "2026-10-01T00:00:00.000Z";
 
 beforeEach(() => {
 	cleanDb(sqlite);
+	noteRowsOnlyEnvelopes(undefined);
 	sqlite.run(
 		`INSERT INTO narrators (id, title, model, created_at, updated_at)
 		 VALUES ('n1', 'Main', 'claude-opus-4.6', ?, ?)`,
@@ -47,6 +50,7 @@ beforeEach(() => {
 });
 afterEach(() => {
 	settings.narratorBlocks.read = true;
+	settings.narratorBlocks.compactJson = compactJson;
 	setSystemTime();
 });
 afterAll(() => {
@@ -65,6 +69,8 @@ const LONG_TEXT = "Résumé of the tree — 目录很长。".repeat(300);
  * clamped (one of them with translated reasoning).
  */
 async function writeConversation() {
+	// This fixture compares the two readable copies; afterEach restores the default.
+	settings.narratorBlocks.compactJson = false;
 	const input = await narratorStore.appendInput("n1", "List the files, 请");
 	const step = await narratorStore.openStep("n1", { uuid: "u1", session_id: "s" });
 	await narratorStore.writeStepItem(step.id, "n1", {
@@ -159,6 +165,8 @@ function overwriteContentJson(): void {
 /** Read with the switch off, then from block rows alone with it on. */
 async function readBoth<T>(read: () => Promise<T>): Promise<{ legacy: T; blocks: T }> {
 	settings.narratorBlocks.read = false;
+	// A rows-only fixture would force block reads and make this comparison vacuous.
+	expect(blockReadsEnabled()).toBe(false);
 	const legacy = await read();
 	overwriteContentJson();
 	settings.narratorBlocks.read = true;
@@ -200,6 +208,7 @@ describe("readers on block bodies", () => {
 	});
 
 	test("an envelope over the scan limit is unavailable either way when its reasoning is", async () => {
+		settings.narratorBlocks.compactJson = false;
 		const step = await narratorStore.openStep("n1", { uuid: "u1", session_id: "s" });
 		await narratorStore.writeStepItem(step.id, "n1", {
 			type: "reasoning",
@@ -215,6 +224,7 @@ describe("readers on block bodies", () => {
 	});
 
 	test("a large tool block no longer hides the reasoning beside it", async () => {
+		settings.narratorBlocks.compactJson = false;
 		const step = await narratorStore.openStep("n1", { uuid: "u1", session_id: "s" });
 		await narratorStore.writeStepItem(step.id, "n1", {
 			type: "reasoning",

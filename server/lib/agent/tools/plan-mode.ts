@@ -1,3 +1,4 @@
+import { NOTABLE_POINTS_TITLE, OUTLINE_PLAN_STRUCTURE } from "@shared/outline-plan-structure";
 import { z } from "zod/v4";
 import { PLAN_DIR_REL } from "../../plan-file-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
@@ -5,6 +6,11 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 const DISABLE_REFLECTION_REVIEW_DESCRIPTION =
 	"Set true to disable plan reflection for the current narrator when the user explicitly requires human approval of the plan.";
+
+const ENTER_PLAN_UNDER_DESCRIPTION =
+	"Outline sessions only: the address of a task in this session's space (a goal you are planning for) to put the plan root under. Default: the end of the session's task page.";
+const ENTER_PLAN_ROOT_DESCRIPTION =
+	"Outline sessions only: the address of an existing task tree of this session's space to plan again, instead of a new plan root.";
 
 export function shouldDisablePlanReflectionReview(value: unknown): boolean {
 	return value === true || value === "true" || value === 1 || value === "1";
@@ -75,6 +81,9 @@ export const enterPlanModeTool: ToolDefinition = {
 		"- Simple, obvious implementation\n\n" +
 		'User: "What files handle routing?"\n' +
 		"- Research task, not implementation planning\n\n" +
+		"## Outline Sessions\n\n" +
+		"When this session keeps its tasks in the outline, the plan is a task tree there, not a file: entering plan mode creates (or resumes) a plan root in the session space and names it. " +
+		"Pass `under` with a task's address to plan beneath it (a goal you are planning for), or `root` to plan an existing task tree again; `plan_name` becomes the root's title (keep it a short one-line title; the background paragraph goes in the first block under it).\n\n" +
 		"## Important Notes\n\n" +
 		"- If the user explicitly requires human approval of the plan, set `disableReflectionReview: true`.\n" +
 		"- This tool REQUIRES user approval - they must consent to entering plan mode\n" +
@@ -97,6 +106,8 @@ export const enterPlanModeTool: ToolDefinition = {
 					{ type: "integer", enum: [1, 0] },
 				],
 			},
+			under: { description: ENTER_PLAN_UNDER_DESCRIPTION, type: "string" },
+			root: { description: ENTER_PLAN_ROOT_DESCRIPTION, type: "string" },
 		},
 		additionalProperties: false,
 	},
@@ -111,12 +122,27 @@ export const enterPlanModeTool: ToolDefinition = {
 			.union([z.boolean(), z.enum(["true", "false", "1", "0"]), z.literal(1), z.literal(0)])
 			.optional()
 			.describe(DISABLE_REFLECTION_REVIEW_DESCRIPTION),
+		under: z.string().optional().describe(ENTER_PLAN_UNDER_DESCRIPTION),
+		root: z.string().optional().describe(ENTER_PLAN_ROOT_DESCRIPTION),
 	}),
-	async execute(_args, ctx): Promise<ToolResult> {
+	async execute(args, ctx): Promise<ToolResult> {
 		// DB update + WS broadcast handled by session layer (assistant_message event).
 		// The session layer will call enterNarratorPlanMode with the custom plan name
 		// and set the planFilePath in the active narrator state.
 		const locale = (ctx?.locale as Locale) ?? "en";
+		// An outline session plans in the outline (outline P2 PR 8): the plan root is made or
+		// resumed here, and the result names it instead of a plan file.
+		if (ctx?.narratorId) {
+			const { enterOutlinePlanMode } = await import("../../../services/outline-plan-mode");
+			const outline = await enterOutlinePlanMode({
+				narratorId: ctx.narratorId,
+				userId: ctx.userId ?? null,
+				input: args as Record<string, unknown>,
+				locale,
+				toolCallId: ctx.toolCallBinding?.toolCallId ?? null,
+			});
+			if (outline) return outline.isError ? { output: outline.output, isError: true } : outline;
+		}
 		const planFilePath = ctx?.planFilePath as string | undefined;
 
 		// Session layer injects the designated path; keep the receipt as a
@@ -175,6 +201,8 @@ const EXIT_PLAN_ALLOWED_PROMPTS_DEPRECATED_DESCRIPTION =
  */
 export const EXIT_PLAN_MODE_INLINE = "inline";
 export const EXIT_PLAN_MODE_FILE = "file";
+/** The plan is the session's task tree in the outline (outline sessions, outline P2 PR 8). */
+export const EXIT_PLAN_MODE_OUTLINE = "outline";
 export type ExitPlanModeSource = typeof EXIT_PLAN_MODE_INLINE | typeof EXIT_PLAN_MODE_FILE;
 
 /** Read the declared mode off a raw tool input, if it is one of the known values. */
@@ -193,7 +221,29 @@ function buildExitPlanModeParamDescription(): string {
 		'"inline" means the complete plan body is in `inline_plan` — declaring it without a real ' +
 		"plan body is an error, not a request to read a file. " +
 		'"file" means the plan was written to a plan file and the system should read it; ' +
-		"`inline_plan` is ignored."
+		"`inline_plan` is ignored. " +
+		'"outline" (only when the plan-mode context says the plan lives in the outline) means the plan is the task tree under the plan root; ' +
+		"`inline_plan` and `plan_file_path` are ignored."
+	);
+}
+
+const EXIT_PLAN_SUMMARY_DESCRIPTION =
+	'With mode "outline": one or two sentences on what changed in this version of the plan, shown to the person deciding.';
+const EXIT_PLAN_ROOT_DESCRIPTION =
+	'With mode "outline": the plan root\'s address, when it is not the one the plan-mode context names.';
+
+/** The format an outline plan is held to (the numbers ExitPlanMode refuses a plan by). */
+function outlinePlanLayoutRules(): string {
+	const { rootChars, backgroundChars, pointChars, detailChars, maxChildren } =
+		OUTLINE_PLAN_STRUCTURE;
+	return (
+		"An outline plan follows one format, read top-down by an approver who tracks many tasks and knows the project only roughly. " +
+		`The root is a short one-line title (at most ${rootChars} characters). ` +
+		`The root's first block is the background: one concise paragraph (at most ${backgroundChars} characters; not a task, nothing under it) that brings back what this work is and why, and leads into the plan (OutlineEdit add with before puts it first when the root has blocks already). ` +
+		"Then the big points (phases or workstreams), each with its small points (tasks), each small point with its implementation details as child blocks (the person sees one line of them until they open them). " +
+		`A big or small point is one idea (at most ${pointChars} characters); a detail at most ${detailChars} characters; at most ${maxChildren} blocks on one level. ` +
+		`The root's last block is "${NOTABLE_POINTS_TITLE.en}" (「${NOTABLE_POINTS_TITLE["zh-CN"]}」 in Chinese, not a task), with risks, irreversible steps and what the approver must look at as its children; leave it out only when there is truly nothing. ` +
+		"A plan that breaks the format is refused with the blocks to fix; fix them with OutlineEdit and call ExitPlanMode again.\n\n"
 	);
 }
 
@@ -204,6 +254,8 @@ function buildExitPlanModeDescription(): string {
 	const howItWorks =
 		"## How This Tool Works\n\n" +
 		"Consult the current plan-mode context for the designated plan path, whether inline plans are allowed, and whether relaxed planning is enabled. The runtime validates these restrictions independently of this schema.\n\n" +
+		'In an outline session the plan-mode context names a plan root instead: declare `mode: "outline"`. The person sees the plan against its previous version and returns it, executes it as a draft, or locks it and executes it.\n\n' +
+		outlinePlanLayoutRules() +
 		'The required `mode` declares the plan source. With `mode: "inline"`, supply the complete actual plan body in `inline_plan`, never a path or reference. Missing plan text is an error, not a fallback to a file.\n\n' +
 		'With `mode: "file"`, write the complete plan to the designated file first; `inline_plan` is ignored. Only in relaxed plan mode may `plan_file_path` select another file. ' +
 		`Custom plan paths must still resolve inside \`${PLAN_DIR_REL}/\` of the working directory, including after symlink resolution.\n\n`;
@@ -230,10 +282,12 @@ function buildExitPlanModeSchema(): Record<string, unknown> {
 			mode: {
 				description: buildExitPlanModeParamDescription(),
 				type: "string",
-				enum: [EXIT_PLAN_MODE_INLINE, EXIT_PLAN_MODE_FILE],
+				enum: [EXIT_PLAN_MODE_INLINE, EXIT_PLAN_MODE_FILE, EXIT_PLAN_MODE_OUTLINE],
 			},
 			inline_plan: { description: EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION, type: "string" },
 			plan_file_path: { description: EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION, type: "string" },
+			summary: { description: EXIT_PLAN_SUMMARY_DESCRIPTION, type: "string" },
+			root: { description: EXIT_PLAN_ROOT_DESCRIPTION, type: "string" },
 		},
 		required: ["mode"],
 		additionalProperties: {},
@@ -245,6 +299,16 @@ export const exitPlanModeTool: ToolDefinition = {
 	executionRouting: {
 		kind: "single",
 		resolve(input, config) {
+			// An outline plan reads no file (outline P2 PR 8).
+			if (
+				typeof input.mode === "string" &&
+				input.mode.trim().toLowerCase() === EXIT_PLAN_MODE_OUTLINE
+			)
+				return {
+					key: "primary",
+					operation: "control",
+					...(typeof input.device === "string" ? { deviceId: input.device } : {}),
+				};
 			const path =
 				config.relaxedPlan === true &&
 				typeof input.plan_file_path === "string" &&
@@ -279,6 +343,8 @@ export const exitPlanModeTool: ToolDefinition = {
 		plan: z.string().optional().describe(EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION),
 		inline_plan: z.string().optional().describe(EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION),
 		plan_file_path: z.string().optional().describe(EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION),
+		summary: z.string().optional().describe(EXIT_PLAN_SUMMARY_DESCRIPTION),
+		root: z.string().optional().describe(EXIT_PLAN_ROOT_DESCRIPTION),
 		// Retired: no longer advertised to models. See the constant's doc comment.
 		allowedPrompts: z
 			.array(

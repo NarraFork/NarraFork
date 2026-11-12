@@ -8,7 +8,12 @@
  * a person, not locked, not claimable.
  */
 import type { LinkTarget, TaskStatus } from "@shared/outline";
-import type { OutlineTaskActorRef, OutlineTaskJson, OutlineTaskLockJson } from "./model";
+import type {
+	OutlineTaskActorRef,
+	OutlineTaskJson,
+	OutlineTaskLockJson,
+	OutlineTaskPlanJson,
+} from "./model";
 
 /** Every task field, each optional except the status; `null` and `false` mean the default. */
 export interface OutlineTaskFields {
@@ -20,6 +25,7 @@ export interface OutlineTaskFields {
 	humanCreated?: boolean | null;
 	lock?: OutlineTaskLockJson | null;
 	claimable?: boolean | null;
+	plan?: OutlineTaskPlanJson | null;
 }
 
 /** The stored form: fields in a fixed order, defaults left out, prerequisites deduplicated. */
@@ -45,10 +51,39 @@ export function canonicalTaskJson(task: OutlineTaskFields): OutlineTaskJson {
 		};
 	}
 	if (task.claimable) out.claimable = true;
+	if (task.plan) out.plan = canonicalPlan(task.plan);
 	return out;
 }
 
-function sameActor(
+/** A plan's state in a fixed field order. */
+function canonicalPlan(plan: OutlineTaskPlanJson): OutlineTaskPlanJson {
+	return {
+		state: plan.state,
+		by: plan.by,
+		round: plan.round,
+		baseSeq: plan.baseSeq,
+		...(plan.approvedBy
+			? { approvedBy: { kind: plan.approvedBy.kind, id: plan.approvedBy.id } }
+			: {}),
+	};
+}
+
+/** Whether two plan states are equal (absent equals absent). */
+export function samePlan(
+	a: OutlineTaskPlanJson | null | undefined,
+	b: OutlineTaskPlanJson | null | undefined,
+): boolean {
+	if (!a || !b) return !a && !b;
+	return (
+		a.state === b.state &&
+		a.by === b.by &&
+		a.round === b.round &&
+		a.baseSeq === b.baseSeq &&
+		sameActor(a.approvedBy, b.approvedBy)
+	);
+}
+
+export function sameActor(
 	a: OutlineTaskActorRef | null | undefined,
 	b: OutlineTaskActorRef | null | undefined,
 ): boolean {
@@ -80,7 +115,8 @@ export function sameTaskJson(a: OutlineTaskJson | null, b: OutlineTaskJson | nul
 		sameActor(a.manager, b.manager) &&
 		(a.humanCreated === true) === (b.humanCreated === true) &&
 		sameTaskLock(a.lock, b.lock) &&
-		(a.claimable === true) === (b.claimable === true)
+		(a.claimable === true) === (b.claimable === true) &&
+		samePlan(a.plan, b.plan)
 	);
 }
 
@@ -97,6 +133,32 @@ export function isHumanCreatedTask(task: OutlineTaskJson | null): boolean {
 /** The lock on the task tree, if any. */
 export function taskLock(task: OutlineTaskJson | null): OutlineTaskLockJson | null {
 	return task?.lock ?? null;
+}
+
+/** The plan whose root the task is (outline P2 PR 8), if any. */
+export function taskPlan(task: OutlineTaskJson | null): OutlineTaskPlanJson | null {
+	return task?.plan ?? null;
+}
+
+/** The root of a plan not approved yet: it and its tasks are never continued. */
+export function isPlanningRoot(task: OutlineTaskJson | null): boolean {
+	return task?.plan?.state === "planning";
+}
+
+/** The root of an approved plan (a draft or locked). */
+export function isApprovedPlanRoot(task: OutlineTaskJson | null): boolean {
+	return task?.plan?.state === "approved";
+}
+
+/**
+ * Work a person wants of `session` (D27a; D48 Q2 and ⑦): a task a person created (`/goal`, the
+ * board), or the root of a plan of this session a person approved (as a draft or locked). A plan
+ * the system approved for them (a plan review) is executed, but is not counted.
+ */
+export function isPersonWork(task: OutlineTaskJson | null, session: string): boolean {
+	if (task?.humanCreated === true) return true;
+	const plan = task?.plan;
+	return plan?.state === "approved" && plan.approvedBy?.kind === "human" && plan.by === session;
 }
 
 /** In the claimable pool. */
@@ -117,4 +179,35 @@ export function isFinishedTask(task: OutlineTaskJson | null): boolean {
 /** Assigned to a person (`@human:name`). */
 export function hasHumanAssignee(task: OutlineTaskJson | null): boolean {
 	return task?.assignee?.startsWith("human:") === true;
+}
+
+/** Why a task cannot be handed to an agent to start now (`outlineTaskStartBlocker`). */
+export type OutlineTaskStartBlocker =
+	| "finished"
+	| "planning"
+	| "prerequisites"
+	| "people"
+	| "confirmation"
+	| "assigned_to_person";
+
+/**
+ * Why an agent cannot be set to work on a task now, or null when it can: the conditions a
+ * delegation (`Agent({ task })`, `delegation.ts`) and the board's "open a new session for this"
+ * (`task-session.ts`) share, in the order they are told. Pure: the caller reads the facts.
+ * Who holds the task is not judged here (the two differ on it).
+ */
+export function outlineTaskStartBlocker(facts: {
+	task: OutlineTaskJson;
+	/** The task, or a block above it, is the root of a plan not approved yet. */
+	planning: boolean;
+	/** What it waits for, as `deriveOutlineTaskWaits` derives it. */
+	wait?: { prerequisites: readonly unknown[]; people: boolean; confirmation: boolean } | null;
+}): OutlineTaskStartBlocker | null {
+	if (isFinishedTask(facts.task)) return "finished";
+	if (facts.planning) return "planning";
+	if (facts.wait && facts.wait.prerequisites.length > 0) return "prerequisites";
+	if (facts.wait?.people) return "people";
+	if (facts.wait?.confirmation) return "confirmation";
+	if (hasHumanAssignee(facts.task)) return "assigned_to_person";
+	return null;
 }

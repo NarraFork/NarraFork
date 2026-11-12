@@ -884,6 +884,12 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				(await ctx.store.listSessionTaskClaims(root, 100)).map((x) => x.claim.taskBlockId).sort(),
 			).toEqual([a, b, c, f].sort());
 			expect((await ctx.store.listSessionTaskClaims(root, 2)).length).toBe(2);
+			// Only its subagents' (the current-tasks view's "delegated" section, P2 PR 9b).
+			expect(
+				(await ctx.store.listSessionTaskClaims(root, 100, { subagentsOnly: true }))
+					.map((x) => x.claim.taskBlockId)
+					.sort(),
+			).toEqual([b, c, f].sort());
 			expect(
 				(await ctx.store.listSessionTaskClaims(sub, 100)).map((x) => x.claim.taskBlockId).sort(),
 			).toEqual([b, f].sort());
@@ -1637,15 +1643,16 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			]);
 			const waits = await deriveOutlineTaskWaits(subjects, { store: ctx.store });
 			const [wx, wy, wz, ww] = x.results.map((res) => waits.get(res.blockId));
-			expect(wx).toEqual({ prerequisites: [a?.blockId], people: false });
-			expect(wy).toEqual({ prerequisites: [], people: false });
+			expect(wx).toEqual({ prerequisites: [a?.blockId], people: false, confirmation: false });
+			expect(wy).toEqual({ prerequisites: [], people: false, confirmation: false });
 			expect(wz?.prerequisites).toEqual([a?.blockId]);
 			expect(ww?.prerequisites).toEqual([a?.blockId]);
 			expect(waits.get(far.results[0]?.blockId as string)?.prerequisites).toEqual([a?.blockId]);
 			// Once A is done, nothing waits.
 			await write(ctx, space, n1, [status(a?.blockId as string, "done")]);
 			const after = await deriveOutlineTaskWaits(subjects, { store: ctx.store });
-			for (const wait of after.values()) expect(wait).toEqual({ prerequisites: [], people: false });
+			for (const wait of after.values())
+				expect(wait).toEqual({ prerequisites: [], people: false, confirmation: false });
 		},
 	},
 	{
@@ -1749,7 +1756,7 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				claim: { holderNarratorId: narrator, epoch: 1 },
 			});
 			expect(found.waiting.map((w) => [w.blockId, w.wait])).toEqual([
-				[t3, { prerequisites: [t1], people: false }],
+				[t3, { prerequisites: [t1], people: false, confirmation: false }],
 			]);
 			const limited = await findContinuationCandidates({
 				narratorId: narrator,
@@ -1767,6 +1774,25 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				now: at(t0, 30),
 			});
 			expect(held.candidates.map((c) => c.blockId).sort()).toEqual([t2, shared].sort());
+			// Pages left out (a session's behavior page holds rules, not tasks) are left out by the
+			// scan itself, before its limit, so their checkboxes cannot use it up.
+			const pageOne = id(1);
+			expect(await ctx.store.listOpenTasks(session.id, 100)).toHaveLength(8);
+			const scanned = await ctx.store.listOpenTasks(session.id, 100, {
+				excludePageIds: [pageOne],
+			});
+			expect(scanned.map((b) => b.id).sort()).toEqual([t2, t7, t8, t9].sort());
+			const two = await ctx.store.listOpenTasks(session.id, 2, { excludePageIds: [pageOne] });
+			expect(two).toHaveLength(2);
+			expect(two.every((b) => b.pageId !== pageOne)).toBe(true);
+			const excluded = await findContinuationCandidates({
+				narratorId: narrator,
+				sessionSpaceId: session.id,
+				excludePageIds: [pageOne],
+				store: ctx.store,
+				now: at(t0, 30),
+			});
+			expect(excluded.candidates.map((c) => c.blockId)).toEqual([t2, t8, shared]);
 		},
 	},
 	{
@@ -2500,6 +2526,130 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			// The one claimed in between and the one held all along are untouched.
 			expect((await ctx.store.getBlock(two))?.taskJson?.status).toBe("doing");
 			expect((await ctx.store.getBlock(held))?.taskJson?.status).toBe("doing");
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "plans and trees (P2 PR 8): a plan being planned is left out with its tasks; containers and the tree being worked are marked; the plan state round-trips through writes and reverts",
+		async run(ctx) {
+			const narrator = await ctx.seedNarrator();
+			const me: Writer = { kind: "agent", narratorId: narrator };
+			const sys: Writer = { kind: "system" };
+			const user = await ctx.seedUser();
+			const space = await ctx.store.ensureSpace({ kind: "session", narratorId: narrator }, NOW);
+			const todo = (content: string) => ({ content, task: { status: "todo" as const } });
+			const r = await write(ctx, space, sys, [
+				{ op: "insert", tempId: "page", parent: null, content: "Tasks" },
+				{ op: "insert", tempId: "loose", parent: { tempId: "page" }, ...todo("loose to-do") },
+				{
+					op: "insert",
+					tempId: "plan",
+					parent: { tempId: "page" },
+					content: "the plan",
+					task: {
+						status: "todo",
+						plan: { state: "planning", by: narrator, round: 0, baseSeq: 0 },
+					},
+				},
+				{ op: "insert", tempId: "s1", parent: { tempId: "plan" }, ...todo("step one") },
+				{ op: "insert", tempId: "s2", parent: { tempId: "plan" }, ...todo("step two") },
+				{ op: "insert", tempId: "goal", parent: { tempId: "page" }, ...todo("a goal") },
+				{ op: "insert", tempId: "g1", parent: { tempId: "goal" }, ...todo("goal step") },
+			]);
+			const id = (i: number) => r.results[i]?.blockId as string;
+			const [loose, plan, s1, s2, goal, g1] = [id(1), id(2), id(3), id(4), id(5), id(6)];
+			// The plan state is stored as given, baseSeq included.
+			expect((await ctx.store.getBlock(plan))?.taskJson?.plan).toEqual({
+				state: "planning",
+				by: narrator,
+				round: 0,
+				baseSeq: 0,
+			});
+			const read = () =>
+				findContinuationCandidates({
+					narratorId: narrator,
+					sessionSpaceId: space.id,
+					store: ctx.store,
+				});
+			let found = await read();
+			const ids = (list: { blockId: string }[]) => list.map((c) => c.blockId);
+			// Planning: the root and its steps are not there.
+			expect(ids(found.ordered)).toEqual([loose, goal, g1]);
+			const goalRef = found.ordered.find((c) => c.blockId === goal);
+			const stepRef = found.ordered.find((c) => c.blockId === g1);
+			expect(goalRef?.container).toBe(true);
+			expect(stepRef?.container).toBe(false);
+			expect(stepRef?.taskAncestorIds).toEqual([goal]);
+			expect(stepRef?.inWorkedTree).toBe(false);
+
+			// An agent may not set or clear a plan's state.
+			await expect(
+				write(ctx, space, me, [{ op: "setTask", block: { id: plan }, task: { plan: null } }]),
+			).rejects.toThrow();
+
+			// Approved (by the system for a person): `baseSeq` left out is the commit's seq.
+			const approved = await write(ctx, space, sys, [
+				{
+					op: "setTask",
+					block: { id: plan },
+					task: {
+						plan: {
+							state: "approved",
+							by: narrator,
+							round: 1,
+							approvedBy: { kind: "human", id: user },
+						},
+					},
+				},
+			]);
+			expect((await ctx.store.getBlock(plan))?.taskJson?.plan).toEqual({
+				state: "approved",
+				by: narrator,
+				round: 1,
+				baseSeq: approved.commit?.seq as number,
+				approvedBy: { kind: "human", id: user },
+			});
+			// Reverting the approval puts the plan back to planning; approving again brings it back.
+			const reverted = await revertCommit(
+				{
+					commitId: approved.commit?.id as string,
+					actor: { kind: "human", id: user },
+					responsibleUserId: user,
+				},
+				{ store: ctx.store },
+			);
+			expect((await ctx.store.getBlock(plan))?.taskJson?.plan?.state).toBe("planning");
+			expect(ids((await read()).ordered)).toEqual([loose, goal, g1]);
+			await revertCommit(
+				{
+					commitId: reverted.commit?.id as string,
+					actor: { kind: "human", id: user },
+					responsibleUserId: user,
+				},
+				{ store: ctx.store },
+			);
+			expect((await ctx.store.getBlock(plan))?.taskJson?.plan?.state).toBe("approved");
+			found = await read();
+			expect(ids(found.ordered)).toEqual([loose, plan, s1, s2, goal, g1]);
+			expect(found.ordered.find((c) => c.blockId === s1)?.inWorkedTree).toBe(false);
+			// The session starts the plan: its steps are the tree being worked.
+			await write(ctx, space, me, [
+				{ op: "setTask", block: { id: plan }, task: { status: "doing" } },
+			]);
+			found = await read();
+			const planRef = found.ordered.find((c) => c.blockId === plan);
+			expect(planRef?.container).toBe(true);
+			for (const step of [s1, s2]) {
+				const ref = found.ordered.find((c) => c.blockId === step);
+				expect(ref?.inWorkedTree).toBe(true);
+				expect(ref?.taskAncestorIds).toEqual([plan]);
+			}
+			// A checkbox change by the agent keeps the plan state.
+			await write(ctx, space, me, [{ op: "setTask", block: { id: s1 }, task: { status: "done" } }]);
+			await write(ctx, space, me, [
+				{ op: "setTask", block: { id: plan }, task: { status: "todo" } },
+			]);
+			expect((await ctx.store.getBlock(plan))?.taskJson?.plan?.state).toBe("approved");
 			checkSpaceInvariants(await ctx.dump(space.id));
 		},
 	},

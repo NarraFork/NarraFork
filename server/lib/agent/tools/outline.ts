@@ -1,6 +1,7 @@
 /**
  * The outline tools: `OutlineRead` and `OutlineSearch` (core, read-only, across every space the
- * session may read) and `OutlineEdit` (optional, loaded with its routine). The work lives in
+ * session may read), `OutlineEdit` (optional, loaded with its routine; core in outline sessions)
+ * and `Ask` (questions put to people, outline P2 PR 7: outline root sessions only). The work lives in
  * `server/services/outline/agent-*.ts`, loaded on first use; this module holds the schemas, the
  * descriptions and what only a tool call knows: the turn's person, the session's permission
  * mode and the call's provenance.
@@ -8,12 +9,18 @@
  * All three are offered only while `outline.enabled` is on. Descriptions are static strings, so
  * an optional tool loaded in the history keeps the prompt cache (`tool-loading.ts`).
  */
+import { OUTLINE_NOTE_RULES } from "@shared/outline-note-structure";
 import { z } from "zod/v4";
 import { settings } from "../../settings";
 import { MAX_BYTES, MAX_LINES } from "../truncate";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 import { looseNumber } from "./number-param";
-import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOL, OUTLINE_SEARCH_TOOL } from "./outline-names";
+import {
+	OUTLINE_ASK_TOOL,
+	OUTLINE_EDIT_TOOL,
+	OUTLINE_READ_TOOL,
+	OUTLINE_SEARCH_TOOL,
+} from "./outline-names";
 
 type ToolOutput = import("../../../services/outline/agent-read").OutlineToolOutput;
 type Scope = import("../../../services/outline/agent-scope").OutlineAgentScope;
@@ -245,6 +252,10 @@ const editSchema = z.object({
 		.string()
 		.optional()
 		.describe("With add or move: the sibling to place after (default: last)"),
+	before: z
+		.string()
+		.optional()
+		.describe("With add or move: the sibling to place before (instead of after)"),
 	delete: z.string().optional().describe("Delete this block and everything under it"),
 	set: z.string().optional().describe("Set the checkbox, assignee or alias of this block"),
 	checkbox: z
@@ -261,17 +272,28 @@ const editSchema = z.object({
 		.nullable()
 		.optional()
 		.describe('With set: an alias such as Q17, "Q?" for the next free number, null to clear'),
+	confirm: z
+		.string()
+		.optional()
+		.describe("Confirm this change waiting for your confirmation (P and 8 characters)"),
+	reject: z
+		.string()
+		.optional()
+		.describe("Reject this change waiting for your confirmation, or withdraw your own"),
+	reason: z.string().optional().describe("With reject: why, for its proposer"),
 });
 
 type EditInput = z.infer<typeof editSchema>;
 
-const EDIT_KINDS = ["add", "replace", "move", "delete", "set"] as const;
+const EDIT_KINDS = ["add", "replace", "move", "delete", "set", "confirm", "reject"] as const;
 const EDIT_FIELDS: Record<(typeof EDIT_KINDS)[number], readonly string[]> = {
-	add: ["markdown", "after"],
+	add: ["markdown", "after", "before"],
 	replace: ["text"],
-	move: ["to", "after"],
+	move: ["to", "after", "before"],
 	delete: [],
 	set: ["checkbox", "assignee", "alias"],
+	confirm: [],
+	reject: ["reason"],
 };
 
 /** One edit as the service takes it, or what is wrong with it. */
@@ -281,11 +303,13 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 		.map(([key]) => key);
 	const kinds = EDIT_KINDS.filter((kind) => present.includes(kind));
 	if (kinds.length !== 1) {
-		return `edit ${n}: give exactly one of add, replace, move, delete, set (got ${kinds.join(", ") || "none"})`;
+		return `edit ${n}: give exactly one of add, replace, move, delete, set, confirm, reject (got ${kinds.join(", ") || "none"})`;
 	}
 	const kind = kinds[0] as (typeof EDIT_KINDS)[number];
 	const stray = present.filter((key) => key !== kind && !EDIT_FIELDS[kind].includes(key));
 	if (stray.length > 0) return `edit ${n}: ${stray.join(", ")} does not go with ${kind}`;
+	if (edit.after !== undefined && edit.before !== undefined)
+		return `edit ${n}: give after or before, not both`;
 	switch (kind) {
 		case "add":
 			if (edit.markdown === undefined) return `edit ${n}: add needs markdown`;
@@ -293,6 +317,7 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 				add: edit.add as string,
 				markdown: edit.markdown,
 				...(edit.after !== undefined ? { after: edit.after } : {}),
+				...(edit.before !== undefined ? { before: edit.before } : {}),
 			};
 		case "replace":
 			if (edit.text === undefined) return `edit ${n}: replace needs text`;
@@ -303,6 +328,7 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 				move: edit.move as string,
 				to: edit.to,
 				...(edit.after !== undefined ? { after: edit.after } : {}),
+				...(edit.before !== undefined ? { before: edit.before } : {}),
 			};
 		case "delete":
 			return { delete: edit.delete as string };
@@ -316,6 +342,13 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 				...(edit.assignee !== undefined ? { assignee: edit.assignee } : {}),
 				...(edit.alias !== undefined ? { alias: edit.alias } : {}),
 			};
+		case "confirm":
+			return { confirm: edit.confirm as string };
+		case "reject":
+			return {
+				reject: edit.reject as string,
+				...(edit.reason !== undefined ? { reason: edit.reason } : {}),
+			};
 	}
 }
 
@@ -323,13 +356,15 @@ export const outlineEditTool: ToolDefinition = {
 	name: OUTLINE_EDIT_TOOL,
 	description: `Write to the outline. One call is one commit in one space: all edits apply, or none does. Every commit records who wrote it and can be reverted.
 edits, in order, each one of:
-- { add: <parent>, markdown, after? }: add blocks written as a markdown outline under a block, or as new pages with key/ (or project/, session/, personal/), or "/" for this session's project space (its own notes when it may not write the project's). after: the sibling to place them after (default: last).
+- { add: <parent>, markdown, after? | before? }: add blocks written as a markdown outline under a block, or as new pages with key/ (or project/, session/, personal/), or "/" for this session's project space (its own notes when it may not write the project's). after: the sibling to place them after (default: last); before: the sibling to place them before (before the first child puts them first).
 - { replace: <block>, text }: the block's new text, written like one outline item without its bullet. A checkbox, @assignee and key:: lines in it are applied, whatever you leave out keeps its value, indented items become child blocks.
-- { move: <block>, to: <parent or key/>, after? }
+- { move: <block>, to: <parent or key/>, after? | before? }
 - { delete: <block> }: the block and everything under it.
 - { set: <block>, checkbox?, assignee?, alias? }: checkbox " " todo, "/" doing, "x" done, "-" cancelled, "none" makes a task a plain block; assignee agent:name, human:name or null; alias Q17, "Q?" (next free number) or null.
 Markdown outline: every list item is a block, indentation nests; \`- [ ] task @agent:name\` is a task; \`depends:: [[…]]\`, \`due:: 2026-11-01\`, \`alias:: Q?\`, \`tags:: [[…]]\` lines under an item are properties. Link with [[title]], [[alias]] or [[key/id]]; links are stored as addresses, so renaming never breaks them, and blocks added in one call can link to each other by title. Text copied from OutlineRead works as is: the ids after bullets and the ‹…› notes are dropped. Lists or extra paragraphs inside one item become child blocks; the result says what was split.
 <block>, <parent>: an id, key/id, an alias or a title. message: a short summary for the timeline.
+Notes under a task go conclusion first: a block directly under a task is one conclusion in one line (at most ${OUTLINE_NOTE_RULES.noteChars} characters), its evidence and details go in blocks under it (at most ${OUTLINE_NOTE_RULES.detailChars} characters each, at most ${OUTLINE_NOTE_RULES.maxChildren} blocks on one level), with no headings and no record of the process; a task's title is one line (at most ${OUTLINE_NOTE_RULES.titleChars} characters). When you tick a task done or cancelled, its first block should say the result in one line. The result says which blocks you wrote are over these limits and how to restructure them; a write far over them may be refused.
+Locked plans: a task tree a person locked takes changes to its plan (its steps, their text and order, its background, cancelling a step, the whole plan done) as proposals waiting for their confirmation; the rest of the call is written. The result names the proposal (P and 8 characters) and the tasks waiting for it: do other work meanwhile; reading the plan shows your proposed version. Progress, findings, ticking steps and splitting a step into sub-steps are written directly. A session the locker named confirms with { confirm: "P…" } or rejects with { reject: "P…", reason }, in a call of their own; never its own proposals (rejecting your own withdraws it).
 The result gives each edit's outcome and the ids of new blocks. Read a block (OutlineRead) before you replace or delete it, unless this session wrote it (blocks another session or a subagent wrote need a read too): what you read is forgotten when the server restarts, and an edit of a block you have not read that someone else wrote writes nothing and shows the block's current text, which then counts as read. If someone else changed a block after you read it, your replace is merged with their change where the two do not overlap, and the result shows the merged text (continue from that text); if they overlap, or the block's edit is a move, delete or set, nothing is written: read it again and redo the edit. A delete also writes nothing when blocks under the block changed (or were added by someone else) since you read them; the result shows them.`,
 	parameters: z.object({
 		edits: z.array(editSchema).min(1).max(200).describe("The edits, applied in order"),
@@ -355,6 +390,7 @@ The result gives each edit's outcome and the ids of new blocks. Read a block (Ou
 		}
 		try {
 			const { outlineEdit } = await import("../../../services/outline/agent-edit");
+			const { consumeBehaviorFenceEditGrant } = await import("./behavior-fence-grant");
 			const scope = await openScope(ctx, true);
 			const provenance = await callProvenance(ctx);
 			return toResult(
@@ -364,11 +400,149 @@ The result gives each edit's outcome and the ids of new blocks. Read a block (Ou
 						edits,
 						...(typeof args.message === "string" ? { message: args.message } : {}),
 					},
-					{ ...provenance, signal: ctx.signal },
+					{
+						...provenance,
+						signal: ctx.signal,
+						// The behavior page takes the same one-shot grant the old fence did: the first
+						// tool call of a real user turn, consumed only by a write that touches the page.
+						behaviorGrant: () => consumeBehaviorFenceEditGrant(ctx.narratorId),
+					},
 				),
 			);
 		} catch (error) {
 			return await failure(error, OUTLINE_EDIT_TOOL);
+		}
+	},
+};
+
+// ─── Ask ───
+
+const askItemSchema = z.object({
+	question: z.string().describe("The question, on its own (the person reads it out of context)"),
+	options: z.array(z.string()).optional().describe("The choices, when there are any (at most 6)"),
+	recommend: z
+		.union([z.number(), z.string()])
+		.optional()
+		.describe("Your recommendation: an option's number, or what you would do"),
+	reason: z.string().optional().describe("Why you recommend it"),
+});
+
+const askQuestionSchema = askItemSchema.extend({
+	items: z
+		.array(askItemSchema)
+		.optional()
+		.describe("Sub-questions of this question: decided together with it"),
+});
+
+function askNumber(value: unknown): number | undefined {
+	if (typeof value === "number") return value;
+	if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value.trim());
+	return undefined;
+}
+
+function askRecommend(value: unknown): number | string | undefined {
+	const n = askNumber(value);
+	if (n !== undefined) return n;
+	return typeof value === "string" ? value : undefined;
+}
+
+type AskRequest = import("../../../services/outline/questions").OutlineAskRequest;
+type AskQuestion = import("../../../services/outline/questions").OutlineAskQuestionInput;
+
+function askQuestionOf(raw: unknown, nested: boolean): AskQuestion {
+	const q = (raw ?? {}) as Record<string, unknown>;
+	const recommend = askRecommend(q.recommend);
+	return {
+		question: typeof q.question === "string" ? q.question : "",
+		...(Array.isArray(q.options) ? { options: q.options.map((o) => String(o)) } : {}),
+		...(recommend !== undefined ? { recommend } : {}),
+		...(typeof q.reason === "string" ? { reason: q.reason } : {}),
+		...(!nested && Array.isArray(q.items)
+			? { items: q.items.map((item) => askQuestionOf(item, true)) }
+			: nested && Array.isArray(q.items)
+				? { items: [] as AskQuestion[] }
+				: {}),
+	};
+}
+
+export const askTool: ToolDefinition = {
+	name: OUTLINE_ASK_TOOL,
+	description: `Ask a person to decide something. The question is recorded in the outline under the block it is about: your task in progress by default (under: another block). Give each question its options if any, your recommendation (an option's number, or what you would do) and why.
+Asking never blocks. The task the question is under waits for the answer and continuation skips it: do the work it does not affect meanwhile. For a reversible decision, go ahead with your recommendation and set proceed: then nothing waits, and you hear back only if the answer differs. Decide yourself what has a reasonable, reversible default; ask about what is irreversible or a matter of the person's preference.
+Questions about one thing go in one call (they are answered together); a question's sub-questions go in its items. The answer comes back as a message from the person: it wakes this session when it is idle (on a PostgreSQL server the session reads it on its next turn).
+- to: who is asked (human:name). By default the person who manages the task, else the person you work for.
+- withdraw: questions you asked that no longer matter (Q12, or an address).
+- answered: when the person asked answers in this conversation instead, write their answer down here (option, text, or adopt for your recommendation).
+Give exactly one of questions, withdraw or answered.`,
+	parameters: z.object({
+		questions: z.array(askQuestionSchema).optional().describe("The questions (at most 10)"),
+		under: z
+			.string()
+			.optional()
+			.describe(
+				"The block they are about (id, key/id, alias or title); default: your task in progress",
+			),
+		to: z.string().optional().describe("Who is asked: human:name"),
+		proceed: z
+			.boolean()
+			.optional()
+			.describe("You went ahead with your recommendations (reversible decisions): nothing waits"),
+		withdraw: z
+			.array(z.string())
+			.optional()
+			.describe("Your questions to withdraw (Q12 or addresses)"),
+		answered: z
+			.array(
+				z.object({
+					question: z.string().describe("The question (Q12 or an address)"),
+					option: z.union([z.number(), z.string()]).optional().describe("The option they chose"),
+					text: z.string().optional().describe("Their answer in their words"),
+					adopt: z.boolean().optional().describe("They took your recommendation"),
+				}),
+			)
+			.optional()
+			.describe("Answers the person asked gave in this conversation"),
+	}),
+	isAvailable: outlineEnabled,
+	async execute(args, ctx): Promise<ToolResult> {
+		if (!outlineEnabled()) return { output: await disabledText(), isError: true };
+		const request: AskRequest = {
+			...(Array.isArray(args.questions)
+				? { questions: args.questions.map((q: unknown) => askQuestionOf(q, false)) }
+				: {}),
+			...(typeof args.under === "string" ? { under: args.under } : {}),
+			...(typeof args.to === "string" ? { to: args.to } : {}),
+			...(args.proceed === true ? { proceed: true } : {}),
+			...(Array.isArray(args.withdraw)
+				? { withdraw: args.withdraw.filter((w: unknown): w is string => typeof w === "string") }
+				: {}),
+			...(Array.isArray(args.answered)
+				? {
+						answered: args.answered.map((raw: unknown) => {
+							const a = (raw ?? {}) as Record<string, unknown>;
+							const option = askNumber(a.option);
+							return {
+								question: typeof a.question === "string" ? a.question : "",
+								...(option !== undefined ? { option } : {}),
+								...(typeof a.text === "string" ? { text: a.text } : {}),
+								...(a.adopt === true ? { adopt: true } : {}),
+							};
+						}),
+					}
+				: {}),
+		};
+		try {
+			const { outlineAsk } = await import("../../../services/outline/questions");
+			const scope = await openScope(ctx, false);
+			const provenance = await callProvenance(ctx);
+			const out = await outlineAsk(scope, request, provenance);
+			return {
+				output: out.output,
+				...(out.isError ? { isError: true } : {}),
+				metadata: out.metadata,
+			};
+		} catch (error) {
+			return await failure(error, OUTLINE_ASK_TOOL);
 		}
 	},
 };

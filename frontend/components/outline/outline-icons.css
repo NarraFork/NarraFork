@@ -1,0 +1,125 @@
+/*
+ * Sizes of the outline's icons (`outline-icons.ts`): the read-only tree's rows, the live editor's
+ * and the mind map's frames, the editor's "in progress" list. They follow the reader's body text
+ * (外观 · 排版, `--nf-type-body-size`; 14px by default, which gives the tree's 16 / 14 / 6 px).
+ * The checkbox column grows with its icon (the mind map measures it with the same formula:
+ * `mindmap/measure.ts` → `checkIconPx`); the arrow and the bullet keep columns of 14px or more,
+ * so their icons stop growing there.
+ */
+:root {
+	/* A task's checkbox and a question's mark. */
+	--nf-outline-icon: clamp(12px, calc(var(--nf-type-body-size, 14px) + 2px), 24px);
+	/* The folding arrow. */
+	--nf-outline-chevron: clamp(10px, var(--nf-type-body-size, 14px), 14px);
+	/* The bullet: a dot drawn by CSS (with a folded block's halo, at most 13px: the map's 14px). */
+	--nf-outline-dot: clamp(4px, calc(var(--nf-type-body-size, 14px) * 3 / 7), 7px);
+}
+
+/*
+ * A task's state as a badge (`STATUS_ICONS` in `outline-icons.ts`): the icon on a small rounded
+ * background tinted with the state's colour (`shared/outline-status.ts` names the colours). The
+ * badge is the SVG itself: its padding insets the drawing, so it fills exactly the box a bare
+ * icon would (whatever width and height its place gives it) and nothing measured changes.
+ *
+ * Tokens per state and scheme. Light: the colour's shade 8 or darker on a 14% tint of it; dark:
+ * shade 4 or lighter on a 24% tint. Each icon keeps 3:1 or more against its own background over
+ * the page (`outline-status.test.ts` computes it from these lines), and the shapes differ, so
+ * the colour is never the only signal. No `:hover` rule here or on a frame part that holds a
+ * badge: Chromium's touch adjustment retargets a nearby long press to an element with one.
+ */
+.nf-status {
+	--nf-status-tint: 14%;
+	box-sizing: border-box;
+	flex: none;
+	padding: 2px;
+	border-radius: 4px;
+	color: var(--nf-status-fg);
+	background: color-mix(in srgb, var(--nf-status-bg) var(--nf-status-tint), transparent);
+	--nf-status-fg: var(--mantine-color-gray-7);
+	--nf-status-bg: var(--mantine-color-gray-6);
+}
+
+.nf-status[data-status="todo"] {
+	--nf-status-fg: var(--mantine-color-gray-7);
+	--nf-status-bg: var(--mantine-color-gray-6);
+}
+
+.nf-status[data-status="doing"] {
+	--nf-status-fg: var(--mantine-color-blue-8);
+	--nf-status-bg: var(--mantine-color-blue-6);
+}
+
+.nf-status[data-status="done"] {
+	--nf-status-fg: var(--mantine-color-green-9);
+	--nf-status-bg: var(--mantine-color-green-6);
+}
+
+/* Cancelled is not "to do": the cross, on a warmer (red-tinted) ground than to do's gray. */
+.nf-status[data-status="cancelled"] {
+	--nf-status-fg: var(--mantine-color-gray-7);
+	--nf-status-bg: var(--mantine-color-red-6);
+}
+
+.nf-status[data-status="waiting"] {
+	--nf-status-fg: var(--mantine-color-orange-9);
+	--nf-status-bg: var(--mantine-color-orange-6);
+}
+
+.nf-status[data-status="delegated"] {
+	--nf-status-fg: var(--mantine-color-violet-8);
+	--nf-status-bg: var(--mantine-color-violet-6);
+}
+
+.nf-status[data-status="locked"] {
+	--nf-status-fg: var(--mantine-color-indigo-8);
+	--nf-status-bg: var(--mantine-color-indigo-6);
+}
+
+.nf-status[data-status="newly_done"] {
+	--nf-status-fg: var(--mantine-color-teal-9);
+	--nf-status-bg: var(--mantine-color-teal-6);
+}
+
+[data-mantine-color-scheme="dark"] .nf-status {
+	--nf-status-tint: 24%;
+}
+
+[data-mantine-color-scheme="dark"] .nf-status[data-status="todo"] {
+	--nf-status-fg: var(--mantine-color-gray-4);
+	--nf-status-bg: var(--mantine-color-gray-5);
+}
+
+[data-mantine-color-scheme="dark"] .nf-status[data-status="doing"] {
+	--nf-status-fg: var(--mantine-color-blue-4);
+	--nf-status-bg: var(--mantine-color-blue-6);
+}
+
+[data-mantine-color-scheme="dark"] .nf-status[data-status="done"] {
+	--nf-status-fg: var(--mantine-color-green-4);
+	--nf-status-bg: var(--mantine-color-green-6);
+}
+
+[data-mantine-color-scheme="dark"] .nf-status[data-status="cancelled"] {
+	--nf-status-fg: var(--mantine-color-gray-5);
+	--nf-status-bg: var(--mantine-color-red-6);
+}
+
+[data-mantine-color-scheme="dark"] .nf-status[data-status="waiting"] {
+	--nf-status-fg: var(--mantine-color-orange-4);
+	--nf-status-bg: var(--mantine-color-orange-6);
+}
+
+[data-mantine-color-scheme="dark"] .nf-status[data-status="delegated"] {
+	--nf-status-fg: var(--mantine-color-violet-3);
+	--nf-status-bg: var(--mantine-color-violet-6);
+}
+
+[data-mantine-color-scheme="dark"] .nf-status[data-status="locked"] {
+	--nf-status-fg: var(--mantine-color-indigo-3);
+	--nf-status-bg: var(--mantine-color-indigo-6);
+}
+
+[data-mantine-color-scheme="dark"] .nf-status[data-status="newly_done"] {
+	--nf-status-fg: var(--mantine-color-teal-4);
+	--nf-status-bg: var(--mantine-color-teal-6);
+}

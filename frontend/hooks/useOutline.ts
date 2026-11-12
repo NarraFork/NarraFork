@@ -1,20 +1,26 @@
 /**
  * Queries and live updates of the read-only outline pages.
  */
+
 import type {
+	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
+	OutlineQuestionGroupResponse,
 	OutlineSpaceSummary,
 	OutlineViewMode,
 } from "@shared/outline-api";
 import {
 	OUTLINE_BLOCK_ID_RE,
+	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
+import { boundedFoldView } from "@shared/outline-fold";
 import {
 	type QueryClient,
 	useInfiniteQuery,
 	useMutation,
+	useQueries,
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
@@ -40,6 +46,11 @@ export const outlineKeys = {
 	backlinks: (spaceId: string, blockId: string) =>
 		["outline", "backlinks", spaceId, blockId] as const,
 	search: (q: string, spaceId: string | null) => ["outline", "search", q, spaceId] as const,
+	pagePending: (spaceId: string, pageId: string) =>
+		["outline", "pending", spaceId, pageId] as const,
+	pending: (pendingId: string) => ["outline", "pending-detail", pendingId] as const,
+	questions: (blockId: string) => ["outline", "questions", blockId] as const,
+	digest: () => ["outline", "digest"] as const,
 };
 
 export function useOutlineSpaces(enabled: boolean) {
@@ -191,11 +202,15 @@ export function useOutlineViewStateSync(
 		const write = () => {
 			timer = null;
 			// Block ids only (the server refuses anything else); the last write of the page wins.
-			const collapsed = [...state.collapsed]
-				.filter((id) => OUTLINE_BLOCK_ID_RE.test(id))
-				.slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed);
+			// What the reader opened and what they closed share one limit.
+			const ok = (ids: Iterable<string>) =>
+				new Set([...ids].filter((id) => OUTLINE_BLOCK_ID_RE.test(id)));
+			const folding = boundedFoldView(
+				{ expanded: ok(state.expanded), collapsed: ok(state.collapsed) },
+				OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+			);
 			void api
-				.putOutlineViewState(pageId, { collapsed, layout: state.layout })
+				.putOutlineViewState(pageId, { ...folding, layout: state.layout })
 				.catch(() => undefined);
 		};
 		const off = state.on((part) => {
@@ -210,7 +225,7 @@ export function useOutlineViewStateSync(
 				.getOutlineViewState(pageId)
 				.then((stored) => {
 					if (disposed || touched || stored.updatedAt === null) return;
-					state.applyStored(stored.collapsed, stored.layout);
+					state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
 				})
 				.catch(() => loadedViewStates.delete(state));
 		}
@@ -282,9 +297,165 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 		// Views as of a commit never change.
 		predicate: (query) => query.queryKey[4] === null,
 	});
-	for (const kind of ["timeline", "history", "backlinks", "pages", "space"]) {
+	for (const kind of ["timeline", "history", "backlinks", "pages", "space", "pending"]) {
 		void queryClient.invalidateQueries({ queryKey: ["outline", kind, spaceId] });
 	}
+	void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });
+	void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
+}
+
+/** A question root, or all questions under a task. */
+function outlineQuestionsQuery(blockId: string) {
+	return {
+		queryKey: outlineKeys.questions(blockId),
+		queryFn: () => api.getOutlineQuestions(blockId),
+		retry: false as const,
+		staleTime: 5_000,
+	};
+}
+
+export function useOutlineQuestions(blockId: string | null, enabled = true) {
+	return useQuery({ ...outlineQuestionsQuery(blockId ?? ""), enabled: enabled && !!blockId });
+}
+
+/** An Ask card reads its own roots, never an older task's entire question history. */
+export function useOutlineQuestionGroups(blockIds: readonly string[]) {
+	return useQueries({ queries: [...new Set(blockIds)].map(outlineQuestionsQuery) });
+}
+
+/** Share the existing page subscriptions with the editor; no polling or second socket. */
+export function useOutlineQuestionsLive(groups: readonly OutlineQuestionGroupResponse[]) {
+	const client = useQueryClient();
+	const pages = JSON.stringify([
+		...new Map(groups.map(({ group }) => [group.pageId, [group.pageId, group.spaceId]])).values(),
+	]);
+	useEffect(() => {
+		const unsubscribe = (JSON.parse(pages) as [string, string][]).map(([pageId, spaceId]) => {
+			let seen = -1;
+			return pageSubscriptions().subscribe(pageId, (hint) => {
+				if (
+					hint.kind === "denied" ||
+					((hint.kind === "subscribed" || hint.kind === "changed") && hint.seq > seen)
+				) {
+					if (hint.kind !== "denied") seen = hint.seq;
+					invalidateOutlineSpace(client, spaceId);
+					void client.invalidateQueries({ queryKey: ["human-attention"] });
+				}
+			});
+		});
+		return () => {
+			for (const dispose of unsubscribe) dispose();
+		};
+	}, [client, pages]);
+}
+
+/** Answer questions of one space at once; questions, views and the inbox re-read after. */
+export function useAnswerOutlineQuestions(spaceId: string | null) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (answers: OutlineAnswerHttpInput[]) => api.answerOutlineQuestions({ answers }),
+		onSettled: () => {
+			if (spaceId) invalidateOutlineSpace(queryClient, spaceId);
+			void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
+}
+
+/** What agents confirmed on the person's behalf that they have not acknowledged. */
+export function useOutlineDigest(enabled = true) {
+	return useQuery({
+		queryKey: outlineKeys.digest(),
+		queryFn: () => api.getOutlineDigest(),
+		enabled,
+		retry: false,
+	});
+}
+
+/** Acknowledge confirmations in the digest. */
+export function useMarkOutlineDigestSeen() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (pendingIds: string[]) => api.markOutlineDigestSeen(pendingIds),
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: outlineKeys.digest() });
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
+}
+
+/** Mark all unread reports read (P2 PR 11): the inbox row's "Got it". */
+export function useMarkOutlineReportsSeen() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.markOutlineReportsSeen(),
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
+}
+
+/** What waits for confirmation on a page, and its locked tasks (design §2.2, §2.6). */
+export function useOutlinePagePending(spaceId: string, pageId: string | undefined, enabled = true) {
+	return useQuery({
+		queryKey: outlineKeys.pagePending(spaceId, pageId ?? ""),
+		queryFn: () => api.getOutlinePagePending(spaceId, pageId as string),
+		enabled: enabled && !!pageId,
+		// The live editor folds by the unanswered questions in it: a failed read is tried again.
+		retry: 2,
+		staleTime: 5_000,
+	});
+}
+
+/**
+ * Who wrote the subagent reports with these container ids, for a reader who may be told: the
+ * live editor's report lines say 「来自 …」. At most the first
+ * {@link OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds} containers are asked for (the rest show the
+ * time alone); a session's title rarely changes, so the answer is kept for a while.
+ */
+export function useOutlineReportAuthors(spaceId: string, ids: readonly string[], enabled = true) {
+	const asked = ids.slice(0, OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds);
+	return useQuery({
+		queryKey: [...outlineKeys.all, "report-authors", spaceId, asked.join(",")],
+		queryFn: async () => (await api.getOutlineReportAuthors(spaceId, asked)).authors,
+		enabled: enabled && asked.length > 0,
+		retry: false,
+		staleTime: 60_000,
+	});
+}
+
+/** One pending change block by block. */
+export function useOutlinePendingDetail(pendingId: string | null) {
+	return useQuery({
+		queryKey: outlineKeys.pending(pendingId ?? ""),
+		queryFn: () => api.getOutlinePending(pendingId as string),
+		enabled: !!pendingId,
+		retry: false,
+	});
+}
+
+/** Confirm or reject a pending change; the page's summaries and views re-read after. */
+export function useDecideOutlinePending(spaceId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (input: { pendingId: string; decision: "confirm" | "reject"; reason?: string }) =>
+			input.decision === "confirm"
+				? api.confirmOutlinePending(input.pendingId)
+				: api.rejectOutlinePending(input.pendingId, input.reason?.trim() || null),
+		onSettled: () => invalidateOutlineSpace(queryClient, spaceId),
+	});
+}
+
+/** Lock (with an optional delegate session) or unlock a task's tree. */
+export function useOutlineLock(spaceId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (input: { blockId: string; lock: boolean; delegate?: string | null }) =>
+			input.lock
+				? api.lockOutlineBlock(spaceId, input.blockId, input.delegate ?? null)
+				: api.unlockOutlineBlock(spaceId, input.blockId),
+		onSettled: () => invalidateOutlineSpace(queryClient, spaceId),
+	});
 }
 
 export function useRevertOutlineCommit(spaceId: string) {
@@ -327,9 +498,72 @@ export function useOutlinePageLive(
 				}
 			} else if (hint.kind === "denied") {
 				invalidateOutlineSpace(queryClient, spaceId);
+			} else if (hint.kind === "pending") {
+				void queryClient.invalidateQueries({ queryKey: outlineKeys.pagePending(spaceId, pageId) });
+				void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });
+				void queryClient.invalidateQueries({ queryKey: outlineKeys.blocks(spaceId) });
 			}
 		});
 	}, [spaceId, pageId, queryClient]);
+}
+
+/** How long a burst of commits is gathered before the plan's diff is read again. */
+const PLAN_DIFF_REFRESH_MS = 300;
+
+/**
+ * A submitted plan against the version it is compared with (outline P2 PR 8), kept fresh while
+ * shown: its page is subscribed to, and a commit past what is shown reads it again (the person may
+ * be editing the plan in the outline beside the session).
+ *
+ * At most one read per burst (review round 1 N6): hints only raise the newest seq wanted, and a
+ * short timer compares it with what is shown once no read is in flight, so the subscription's
+ * first hint does not restart the first read and a live flush's commits share one refetch. The
+ * space-wide invalidation leaves this query to its own subscription.
+ */
+export function useOutlinePlanDiff(
+	plan: { spaceId: string; pageId: string; blockId: string; from: number },
+	enabled: boolean,
+) {
+	const queryClient = useQueryClient();
+	const { spaceId, pageId, blockId, from } = plan;
+	const query = useQuery({
+		queryKey: ["outline", "plan-diff", spaceId, blockId, from],
+		queryFn: () => api.getOutlinePlanDiff(spaceId, blockId, from),
+		enabled,
+		retry: false,
+		staleTime: 5_000,
+	});
+	const state = useRef({ wanted: -1, shown: -1, fetching: false });
+	state.current.shown = query.data?.toSeq ?? -1;
+	state.current.fetching = query.isFetching;
+	useEffect(() => {
+		if (!enabled) return;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const check = () => {
+			timer = null;
+			const s = state.current;
+			if (s.wanted <= s.shown) return;
+			// A read in flight may already include the newest commit: look again once it lands.
+			if (s.fetching) {
+				timer = setTimeout(check, PLAN_DIFF_REFRESH_MS);
+				return;
+			}
+			void queryClient.invalidateQueries({
+				queryKey: ["outline", "plan-diff", spaceId, blockId],
+			});
+		};
+		const unsubscribe = pageSubscriptions().subscribe(pageId, (hint) => {
+			if (hint.kind !== "changed" && hint.kind !== "subscribed") return;
+			if (hint.seq <= state.current.wanted) return;
+			state.current.wanted = hint.seq;
+			timer ??= setTimeout(check, PLAN_DIFF_REFRESH_MS);
+		});
+		return () => {
+			unsubscribe();
+			if (timer !== null) clearTimeout(timer);
+		};
+	}, [enabled, pageId, spaceId, blockId, queryClient]);
+	return query;
 }
 
 /**

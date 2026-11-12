@@ -14,7 +14,9 @@ import {
 } from "@server/services/file-change-runtime";
 import { withFileWrite } from "@server/services/file-write-queue";
 import { GEN_UI_DIRECTORY, GEN_UI_ENTRY, type GenUiFileReference } from "@shared/gen-ui-files";
+import { assertRuntimeCanAskQuestion, runtimePolicyForContext } from "../agent-runtime/policy";
 import { checkedIdentity, uiError, validateDirectory, workspaceKey, workspaceRoot } from "./files";
+import { describeGenUiFormOutcome, waitForGenUiForm } from "./form-wait";
 import { executeKitAction, type KitToolEnvironment, kitNoticeFor } from "./kit-runtime";
 
 const TEMPLATE = `import { useState } from "react";
@@ -155,15 +157,30 @@ export async function executeGenUiTool(
 		const { inspectGenUi } = await import("./inspect");
 		return inspectGenUi(input, kitEnvironment);
 	}
-	if (input.action === "render" || input.action === "kit_status" || input.action === "kit_build")
+	// render({path}) draws an app written by create. It resolves the directory exactly like
+	// show does; the only difference is what happens once the card is on screen.
+	const appPath =
+		input.action === "show"
+			? input.path
+			: input.action === "render" && typeof input.path === "string"
+				? input.path
+				: undefined;
+	const appRender = input.action === "render" && appPath !== undefined;
+	if (input.action === "render" && !appRender) {
+		if (typeof input.source !== "string") throw uiError("render needs source or path", 400);
+		return executeKitAction({ ...input, source: input.source }, kitEnvironment);
+	}
+	if (input.action === "kit_status" || input.action === "kit_build")
 		return executeKitAction(input, kitEnvironment);
 	let directory: string;
 	let fileMetadata: ToolResult["metadata"];
-	if (input.action === "show") {
-		const valid = await validateDirectory(backend, workspace, input.path, ctx.signal);
+	if (appPath) {
+		const valid = await validateDirectory(backend, workspace, appPath, ctx.signal);
 		directory = valid.directory;
 		await deps.authorizeRead(ctx, backend, valid.entryPath);
 	} else {
+		// Everything that is not an app render or a show creates a directory.
+		if (input.action !== "create") throw uiError("Unsupported UI action", 400);
 		if (!/^[\p{L}\p{N}][\p{L}\p{N}_-]{0,47}$/u.test(input.prefix))
 			throw uiError("Invalid UI directory prefix", 400);
 		if (!backend.mkdirExclusive)
@@ -268,7 +285,7 @@ export async function executeGenUiTool(
 			fileMetadata = { ...fileMetadata, historyStatus: "unavailable" };
 		}
 	}
-	if (input.action === "show") await check();
+	if (appPath) await check();
 	// Which kit the preview will compile against, and whether the user is being asked
 	// to build one. Advisory: a kit problem must never fail a file preview.
 	const kitNotice = await kitNoticeFor(kitEnvironment);
@@ -283,25 +300,38 @@ export async function executeGenUiTool(
 		entry: GEN_UI_ENTRY,
 		title: backend.paths.basename(directory),
 	};
+	// An app render can hold the call open: its card comes from this call's own arguments,
+	// not from the result, so waiting here never hides the UI the reader has to answer.
+	const waits = appRender && input.wait === true;
+	if (waits) {
+		if (!toolUseId) throw uiError("This call cannot wait for a form; render it without wait", 400);
+		assertRuntimeCanAskQuestion(runtimePolicyForContext(ctx));
+	}
+	const outcome = waits
+		? await waitForGenUiForm({ narratorId: ctx.narratorId, toolUseId, signal: ctx.signal })
+		: undefined;
+	const answer = outcome ? describeGenUiFormOutcome(outcome) : undefined;
 	return withFileHistoryNotice(
 		{
 			output:
 				input.action === "create"
 					? `Created ${directory}/App.tsx. Edit it using ordinary file tools, then show this directory. The user sees nothing until you show it.`
-					: `Shown: ${directory}/App.tsx. The user's browser builds the app from the files on disk when the card displays it, and runs it in the chat: build errors appear in the card and are not reported to you, and later edits change what a reopened card shows. Only the latest app starts by itself; an older one waits for the user to click Run. Calls to genUI.sendPrompt / submit / openLink reach you only after the user confirms them. \nInspect: ${JSON.stringify({ action: "inspect", toolUseId, toolCallId: binding.toolCallId })}`,
+					: `${answer ? answer.output : `Shown: ${directory}/App.tsx. The user's browser builds the app from the files on disk when the card displays it, and runs it in the chat: build errors appear in the card and are not reported to you, and later edits change what a reopened card shows. Only the latest app starts by itself; an older one waits for the user to click Run. Calls to genUI.sendPrompt / submit / openLink reach you only after the user confirms them.`}\nInspect: ${JSON.stringify({ action: "inspect", toolUseId, toolCallId: binding.toolCallId })}`,
+			...(answer?.isError ? { isError: true } : {}),
 			title: reference.title,
 			metadata: {
 				...fileMetadata,
 				genUi: reference,
-				...(input.action === "show"
+				...(appPath
 					? {
 							genUiShow: {
 								version: 1,
 								shownAt: new Date().toISOString(),
-								size: input.size ?? "md",
+								size: (input.action === "create" ? undefined : input.size) ?? "md",
 							},
 						}
 					: {}),
+				...(outcome ? { genUiForm: { version: 1, status: outcome.status } } : {}),
 				...(kitNotice ? { genUiKit: kitNotice } : {}),
 			},
 		},

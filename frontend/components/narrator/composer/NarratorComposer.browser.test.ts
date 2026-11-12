@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ComposerDocument } from "@shared/composer-document";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { heightTransitionStepLimit } from "./height-transition-sampling.test-support";
 import type * as Fixture from "./NarratorComposer.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -36,7 +38,9 @@ const persistentDrafts = new Map<
 beforeAll(async () => {
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
 	const bundle = await Bun.build({
-		entrypoints: [new URL("./NarratorComposer.browser-fixture.tsx", import.meta.url).pathname],
+		entrypoints: [
+			fileURLToPath(new URL("./NarratorComposer.browser-fixture.tsx", import.meta.url)),
+		],
 		target: "browser",
 		format: "esm",
 		define: {
@@ -183,6 +187,52 @@ async function settle(page: Page) {
 			),
 	);
 }
+async function settledComposerLayout(page: Page) {
+	await settle(page);
+	// ResizeObserver can schedule another measurement after the first pair of RAFs.
+	// Compare caret/shell coordinates only once height and text transforms stop moving.
+	await page.evaluate(
+		() =>
+			new Promise<void>((resolve, reject) => {
+				const started = performance.now();
+				let previous = "";
+				let stableFrames = 0;
+				const measure = () => {
+					const root = document.querySelector<HTMLElement>("[data-inline-composer]");
+					const textbox = root?.querySelector<HTMLElement>('[role="textbox"]');
+					if (!root || !textbox) return reject(new Error("Missing composer layout"));
+					const box = root.getBoundingClientRect();
+					const text = textbox.getBoundingClientRect();
+					const signature = JSON.stringify([
+						box.top,
+						box.height,
+						text.top,
+						text.height,
+						root.style.height,
+						root.dataset.layout,
+					]);
+					// Flex sizing can constrain the rendered box below its inline target height.
+					// Wait for actual geometry and animations, not equality with that target.
+					const settled = [root, textbox].every((element) =>
+						element.getAnimations().every((animation) => animation.playState !== "running"),
+					);
+					stableFrames = settled && signature === previous ? stableFrames + 1 : 0;
+					previous = signature;
+					if (stableFrames >= 2) return resolve();
+					if (performance.now() - started > 5000)
+						return reject(new Error(`Composer layout did not settle: ${signature}`));
+					requestAnimationFrame(measure);
+				};
+				requestAnimationFrame(measure);
+			}),
+	);
+}
+async function focusedComposer(page: Page) {
+	await page.waitForFunction(
+		() =>
+			document.hasFocus() && document.activeElement === document.querySelector('[role="textbox"]'),
+	);
+}
 async function waitForCaretMove(page: Page, previousHead: number) {
 	// Rendering two frames does not guarantee that the browser's selectionchange
 	// has reached the editor state. Wait for the observable keyboard result instead.
@@ -193,11 +243,11 @@ async function waitForCaretMove(page: Page, previousHead: number) {
 	);
 	await settle(page);
 }
-async function open() {
+async function open(viewport?: { width: number; height: number }) {
 	if (!browser || !server) throw new Error("Fixture unavailable");
 	const page = await browser.newPage();
 	page.setDefaultTimeout(5000);
-	await page.setViewport({ width: 1000, height: 700 });
+	await page.setViewport(viewport ?? { width: 1000, height: 700 });
 	const captured: string[] = [];
 	errors.set(page, captured);
 	page.on("pageerror", (error) => captured.push(String(error)));
@@ -206,6 +256,8 @@ async function open() {
 			response.url().endsWith("/draft") && response.request().method() === "GET" && response.ok(),
 	);
 	await page.goto(server.url.origin);
+	await page.bringToFront();
+	await page.waitForFunction(() => document.hasFocus());
 	await hydrated;
 	await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
 	await settle(page);
@@ -575,12 +627,14 @@ test("arrow keys change visual lines before recalling input history", async () =
 		await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.placeCaretAt("line2", 2),
 		);
-		await settle(page);
+		await focusedComposer(page);
+		await settledComposerLayout(page);
 		const middle = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
 		await page.keyboard.press("ArrowUp");
 		await waitForCaretMove(page, middle.head);
+		await settledComposerLayout(page);
 		const moved = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -616,6 +670,8 @@ test("arrow keys change visual lines before recalling input history", async () =
 			() => (window as unknown as FixtureWindow).fixture.snapshot().text === "hist1\nhist2\nhist3",
 		);
 		await settle(page);
+		await focusedComposer(page);
+		await settledComposerLayout(page);
 		const recalledEnd = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -646,12 +702,14 @@ test("arrow keys change visual lines before recalling input history", async () =
 		await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.placeCaretAt("para2", 0),
 		);
-		await settle(page);
+		await focusedComposer(page);
+		await settledComposerLayout(page);
 		const second = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
 		await page.keyboard.press("ArrowUp");
 		await waitForCaretMove(page, second.head);
+		await settledComposerLayout(page);
 		const previousParagraph = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -1483,14 +1541,26 @@ test("height transitions reverse in flight without remounting the editor or queu
 				const root = document.querySelector<HTMLElement>("[data-inline-composer]");
 				if (!root) throw new Error("No input");
 				const frames: { time: number; height: number; target: number }[] = [];
-				for (let index = 0; index < 48; index++) {
-					if (index < 24 && index % 3 === 0) fixture.load(index % 6 === 0 ? long : short);
-					await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+				const sample = () => {
+					// CSS transitions use this frame's document timeline, not the wall-clock
+					// time when a CPU-starved rAF callback happens to execute.
+					const time = document.timeline.currentTime;
+					if (typeof time !== "number") throw new Error("Missing animation timeline");
 					frames.push({
-						time: performance.now(),
+						time,
 						height: root.getBoundingClientRect().height,
 						target: Number.parseFloat(root.style.height),
 					});
+				};
+				for (let index = 0; index < 48; index++) {
+					if (index < 24 && index % 3 === 0) {
+						sample();
+						fixture.load(index % 6 === 0 ? long : short);
+						// Also test synchronous layout changes without advancing animation time.
+						sample();
+					}
+					await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+					sample();
 				}
 				return {
 					frames,
@@ -1508,21 +1578,35 @@ test("height transitions reverse in flight without remounting the editor or queu
 		expect(
 			result.frames.some((frame) => frame.height > compact + 1 && frame.height < max - 1),
 		).toBe(true);
+		expect(
+			result.frames.some(
+				(frame, index) =>
+					index > 0 &&
+					frame.target !== result.frames[index - 1].target &&
+					result.frames[index - 1].height > compact + 1 &&
+					result.frames[index - 1].height < max - 1,
+			),
+		).toBe(true);
+		// Both directions must be visible, not merely a non-endpoint static height.
+		for (const direction of [-1, 1]) {
+			expect(
+				result.frames.some(
+					(frame, index) =>
+						index > 0 && direction * (frame.height - result.frames[index - 1].height) > 1,
+				),
+			).toBe(true);
+		}
+		expect(
+			result.frames.some(
+				(frame, index) => index > 0 && frame.time === result.frames[index - 1].time,
+			),
+		).toBe(true);
 		for (let index = 1; index < result.frames.length; index++) {
 			const current = result.frames[index];
 			const previous = result.frames[index - 1];
 			expect(current.height).toBeGreaterThanOrEqual(compact - 1);
 			expect(current.height).toBeLessThanOrEqual(max + 1);
-			// cubic-bezier(0.2, 0, 0, 1) peaks near 4× linear over the 180ms height
-			// transition. Headless CI often composites more than one vsync between two
-			// close performance.now() samples, so the budget also covers a 30Hz gap.
-			// It still rejects a same-frame snap of the whole travel.
-			const frameMs = Math.max(current.time - previous.time, 1000 / 60);
-			const step = (duration: number) => ((span * duration) / 180) * 4 + 2;
-			const allowed = Math.min(
-				span * 0.75,
-				Math.max(step(frameMs), step(Math.max(frameMs, 1000 / 30))),
-			);
+			const allowed = heightTransitionStepLimit(span, current.time - previous.time);
 			expect(Math.abs(current.height - previous.height)).toBeLessThanOrEqual(allowed);
 		}
 		await layoutSettled(page);
@@ -2033,15 +2117,13 @@ test("reusing the mounted composer never exposes the previous account's live or 
 for (const width of [1440, 390]) {
 	for (const scheme of ["light", "dark"] as const) {
 		test(`${width}px ${scheme}: floating quote button keeps the composer still and aligns its content`, async () => {
-			const page = await open();
+			const page = await open({ width, height: 844 });
 			try {
-				await page.setViewport({ width, height: 844 });
 				await page.evaluate((theme) => {
 					document.documentElement.setAttribute("data-mantine-color-scheme", theme);
 				}, scheme);
 				const settleLayout = async () => {
 					await settle(page);
-					// Measure settled geometry, not an intermediate frame of the adaptive layout.
 					await page.waitForFunction(() =>
 						[
 							...document.querySelectorAll(
@@ -2114,7 +2196,7 @@ for (const width of [1440, 390]) {
 			} finally {
 				await close(page);
 			}
-		});
+		}, 15_000);
 	}
 }
 

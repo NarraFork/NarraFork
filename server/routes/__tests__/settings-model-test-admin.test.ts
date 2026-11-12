@@ -190,6 +190,50 @@ describe("search channel settings validation", () => {
 });
 
 describe("settings restart redirects", () => {
+	test("defaults and toggles TLS autoReissue without restarting the listener", async () => {
+		const original = structuredClone(settings);
+		const previousSuppressRestart = process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+		let restartCalls = 0;
+		try {
+			delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			registerServerRestart((host, port) => {
+				restartCalls += 1;
+				return { host, port, protocol: "https" };
+			});
+			const { issueServerCert } = await import("../../lib/tls");
+			const { certPath, keyPath } = await issueServerCert([]);
+			const tls = { enabled: true, certFile: certPath, keyFile: keyPath };
+			saveSettings({ ...settings, server: { ...settings.server, tls } });
+			expect(settings.server.tls?.autoReissue).toBeUndefined();
+
+			for (const autoReissue of [undefined, false]) {
+				const response = await appForRole("admin").request("http://localhost/settings", {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ server: { tls: { ...tls, autoReissue } } }),
+				});
+				const body = (await response.json()) as {
+					serverRestarting?: boolean;
+					server: { tls: typeof tls & { autoReissue: boolean } };
+				};
+				expect(response.status).toBe(200);
+				expect(restartCalls).toBe(0);
+				// The response omits this flag when no restart is needed.
+				expect(body.serverRestarting ?? false).toBe(false);
+				const expectedTls = { ...tls, autoReissue: autoReissue ?? true };
+				expect(settings.server.tls).toEqual(expectedTls);
+				expect(body.server.tls).toEqual(expectedTls);
+			}
+		} finally {
+			saveSettings(original);
+			registerServerRestart(null);
+			if (previousSuppressRestart === undefined) {
+				delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			} else {
+				process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART = previousSuppressRestart;
+			}
+		}
+	});
 	test.each([
 		"/settings/generate-tls",
 		"/tls/generate",

@@ -1,19 +1,22 @@
 import { describe, expect, mock, test } from "bun:test";
 import type { ComposerDocument } from "@shared/composer-document";
 import { type FileReference, fileReferenceMessageForDisplay } from "@shared/file-reference";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { Hono } from "hono";
 import {
 	bindComposerDocumentReferences,
+	bindComposerMediaProjection,
 	parseOptionalComposerDocument,
 	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../../lib/composer-document";
-import { AppError, ValidationError } from "../../lib/errors";
+import { AppError, catalogError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
 import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
 
@@ -32,7 +35,9 @@ const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(
 		section('narratorRoutes.post("/:id/messages"', "// Retry last user message"),
 	]
 		.join("\n")
-		.replaceAll("export async function", "async function"),
+		.replaceAll("export async function", "async function")
+		.replaceAll("export function", "function")
+		.replaceAll("export interface", "interface"),
 );
 
 function fixture(
@@ -48,6 +53,8 @@ function fixture(
 		control?: "bash" | "load" | "unload" | "block" | "unblock" | "save";
 		reject?: boolean;
 		canonicalPrefix?: string;
+		/** The session's task backend (outline P2). */
+		taskBackend?: "spec" | "outline";
 	} = {},
 ) {
 	let status = options.status ?? "idle";
@@ -96,13 +103,22 @@ function fixture(
 		parseFileReferenceInput,
 		parseOptionalComposerDocument,
 		bindComposerDocumentReferences,
+		bindComposerMediaProjection,
 		restoreMultipartComposerText,
 		validateComposerProjection,
 		validateComposerAssets,
 		sendMessageSchema,
 		bufferQueueModeSchema,
+		MAX_MEDIA_ATTACHMENTS,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+		MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
+		// Staged attachments need a real store; these tests never send any, so the
+		// bindings only have to exist for the helper's code path to be reachable.
+		findStagedAttachment: () => null,
+		stagedAttachmentAsFile: () => {
+			throw new Error("no staged attachments in this fixture");
+		},
 		fileReferenceMessageForDisplay,
 		captureFileReferences: async (_id: string, _userId: string, refs: FileReference[]) =>
 			refs.map((reference) => ({
@@ -190,6 +206,11 @@ function fixture(
 		users: { id: "id" },
 		eq: () => undefined,
 		logger: { warn: () => {} },
+		resolveTaskBackend: async () => options.taskBackend ?? "spec",
+		// Only an outline subagent refuses `/goal` (outline P2 PR 5).
+		isRefusedOutlineGoal: async (_id: string, text: string) =>
+			options.taskBackend === "outline" && !!options.subagent && text.startsWith("/goal"),
+		catalogError,
 	};
 	new Function(...Object.keys(bindings), compiled)(...Object.values(bindings));
 	const app = new Hono();
@@ -564,6 +585,39 @@ describe("primary HTTP message admission", () => {
 			objective: "do work",
 		});
 		expect(f.accept.mock.calls[0]?.[2].commandText).toBe("/goal do work");
+	});
+
+	test("a busy outline session queues /goal like a spec session, saying where its task goes", async () => {
+		const f = fixture({ status: "working", busy: true, buffered: true, taskBackend: "outline" });
+		const response = await f.post({ message: "/goal do work" });
+		expect(response.status).toBe(202);
+		expect(await response.json()).toEqual({
+			buffered: true,
+			id: "queued-message",
+			bufferedAt: "now",
+			specGoalQueued: true,
+			objective: "do work",
+			taskBackend: "outline",
+		});
+		expect(f.accept.mock.calls[0]?.[2].commandText).toBe("/goal do work");
+	});
+
+	test.each([
+		false,
+		true,
+	])("/goal to an outline subagent is refused before anything is persisted (busy=%s)", async (busy) => {
+		const f = fixture({
+			status: busy ? "working" : "idle",
+			busy,
+			buffered: busy,
+			subagent: true,
+			taskBackend: "outline",
+		});
+		const response = await f.post({ message: "/goal do work" });
+		expect(response.status).toBe(409);
+		expect(((await response.json()) as { error: string }).error).toContain("/goal");
+		expect(f.accept).not.toHaveBeenCalled();
+		expect(f.broadcast).not.toHaveBeenCalled();
 	});
 
 	test.each([false, true])("model override travels with admission (busy=%s)", async (busy) => {

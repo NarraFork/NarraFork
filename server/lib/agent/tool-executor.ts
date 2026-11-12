@@ -15,15 +15,31 @@ import {
 	waitUntilUpdateGateOpens,
 } from "@server/services/update-coordinator";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import type { MediaContentBlock, NativeMediaInput } from "@shared/media-attachments";
 import { logger } from "../logger";
-import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import {
+	getOutlineSpecUnavailableHint,
+	getToolMessage,
+	getToolMessageWithParams,
+	type Locale,
+} from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import { settings } from "../settings";
-import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
+import {
+	assertSpecPath,
+	assertToolSpecPaths,
+	toolNamesSpecPath,
+	toolSpecPathError,
+} from "../spec-uri";
+import { withSqlTraceSpan } from "../sql-trace";
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
-import { targetPathSemantics, toolBaseCwd } from "./execution/path-resolve";
+import {
+	bindSessionWorkspaceCwd,
+	targetPathSemantics,
+	toolBaseCwd,
+} from "./execution/path-resolve";
 import {
 	ExecutionTargetAuthorizationError,
 	ExecutionTargetError,
@@ -38,6 +54,7 @@ import {
 } from "./pipeline-state";
 import { isBashToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
+import { isPlanReviewLoop } from "./tools/reflection-description";
 import { truncateOutput } from "./truncate";
 import type {
 	AgentConfig,
@@ -76,6 +93,10 @@ export interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Already saved image assets; never re-decode these through the upload lane. */
+	imageRefs?: ToolResult["imageRefs"];
+	media?: NativeMediaInput[];
+	mediaRefs?: MediaContentBlock[];
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
@@ -189,8 +210,10 @@ async function resolveEndpoint(
 		);
 	}
 	assertAuthorizedExecutionDevice(requested, config);
-	const backend =
-		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId });
+	const backend = bindSessionWorkspaceCwd(
+		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId }),
+		config.workspaceContext,
+	);
 	if (previous && backend.deviceId !== previous.target.deviceId) {
 		throw new Error(`Endpoint ${request.key} changed its frozen execution device.`);
 	}
@@ -728,6 +751,17 @@ export function getReflectionToolRejection(
 		return undefined;
 	}
 	const allowedTools = config.reflectionLoop.allowedTools.join(", ") || "(none / 无)";
+	// An outline plan's review leaves comments for the user; nothing goes back for revision.
+	if (isPlanReviewLoop(config.reflectionLoop.allowedTools)) {
+		return {
+			output:
+				config.locale === "zh-CN"
+					? `工具 ${tu.name} 没有执行。这个计划审查只能调用 ${allowedTools}。不得直接编辑文件或执行原操作；用 PlanReview 给出结论，意见会写在计划下面给用户看。`
+					: `Tool ${tu.name} was not executed. This plan review only allows ${allowedTools}. Do not edit files or execute the original operation; give your verdict with PlanReview: its comments are written under the plan for the user.`,
+			isError: true,
+			durationMs: 0,
+		};
+	}
 	return {
 		output:
 			config.locale === "zh-CN"
@@ -738,15 +772,50 @@ export function getReflectionToolRejection(
 	};
 }
 
-export async function executeTool(
+/**
+ * A tool call that names a `spec://` path in a session whose tasks live in the outline: the
+ * outline session has no Dynamic Spec (plan §3), so instead of reading or writing one it can no
+ * longer see, the call is answered with where its tasks, notes and behavior boundary are. That
+ * includes `spec://behavior_fence`: the session's boundary is the behavior page of its session
+ * space (plan PR 4), which the system keeps in its context. Spec sessions pass.
+ */
+export function getOutlineSpecRejection(
+	tu: AgentToolUse,
+	config: Pick<AgentConfig, "taskBackend" | "locale">,
+): ToolExecResult | undefined {
+	if (config.taskBackend !== "outline" || !toolNamesSpecPath(tu.name, tu.input)) return undefined;
+	return {
+		output: getOutlineSpecUnavailableHint((config.locale as Locale) ?? "en"),
+		isError: true,
+		durationMs: 0,
+	};
+}
+
+export function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
+): Promise<ToolExecResult> {
+	// SQL tracing (NF_SQL_TRACE): statements run by this tool call are attributed to it.
+	return withSqlTraceSpan("tool", `tool ${tu.name}`, { narratorId: config.narratorId }, () =>
+		executeToolUntraced(tu, config, options),
+	);
+}
+
+async function executeToolUntraced(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	options: ExecuteToolOptions,
 ): Promise<ToolExecResult> {
 	const reflectionRejection = getReflectionToolRejection(tu, config);
 	if (reflectionRejection) {
 		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
 		return reflectionRejection;
+	}
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
+		return outlineSpecRejection;
 	}
 	const specError = toolSpecPathError(tu.name, tu.input);
 	if (specError) {
@@ -1342,7 +1411,10 @@ export async function executeTool(
 					}
 					return frozenExecution.backend;
 				}
-				return resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId });
+				return bindSessionWorkspaceCwd(
+					resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId }),
+					config.workspaceContext,
+				);
 			},
 			executionTarget: frozenExecution?.target,
 			executionPlan: frozenExecution?.plan,
@@ -1716,6 +1788,9 @@ export async function executeTool(
 							pipelineCapturedBytes: captured.capture.bytes,
 						}),
 						images: result.images,
+						imageRefs: result.imageRefs,
+						media: result.media,
+						mediaRefs: result.mediaRefs,
 						updatedInput: redirectedInput,
 						pipelineExitConfirmation,
 						pipelineExitConfirmationStateId,
@@ -1735,6 +1810,9 @@ export async function executeTool(
 					completedAt: Date.now(),
 					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
+					imageRefs: result.imageRefs,
+					media: result.media,
+					mediaRefs: result.mediaRefs,
 					updatedInput: redirectedInput,
 					pipelineExitConfirmation,
 					pipelineExitConfirmationStateId,
@@ -1751,6 +1829,9 @@ export async function executeTool(
 				completedAt: Date.now(),
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
+				imageRefs: result.imageRefs,
+				media: result.media,
+				mediaRefs: result.mediaRefs,
 				updatedInput: redirectedInput,
 				pipelineExitConfirmation,
 				pipelineExitConfirmationStateId,

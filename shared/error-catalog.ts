@@ -120,6 +120,26 @@ export const ERROR_CATALOG = {
 		en: "podman is not installed",
 	},
 
+	// --- outline tasks (outline P2: sessions whose tasks live in the outline) -----------
+	/**
+	 * A Dynamic Spec task or note (a write, a reset, a plugin's task read) for a session whose tasks
+	 * live in the outline: neither the session nor its continuation look there any more.
+	 */
+	SPEC_IN_OUTLINE_SESSION: {
+		status: 409,
+		code: "SPEC_OUTLINE_SESSION",
+		en: "This session keeps its tasks in the outline, so its Dynamic Spec tasks and notes are not used. Only the behavior fence still applies.",
+	},
+	/**
+	 * `/goal` sent to a subagent of such a session: the goal is a task of the session, and an
+	 * outline subagent has no tasks of its own (D27c).
+	 */
+	GOAL_IN_OUTLINE_SESSION: {
+		status: 409,
+		code: "SPEC_OUTLINE_SESSION",
+		en: "/goal adds a task to the session itself. Send it in the main session, not to a subagent.",
+	},
+
 	// --- git -------------------------------------------------------------------
 	GIT_AUTH_REQUIRED: {
 		status: 401,
@@ -177,6 +197,131 @@ export const ERROR_CATALOG = {
 		status: 429,
 		code: "LOGIN_THROTTLED",
 		en: "Too many attempts. Please try again later.",
+	},
+
+	// --- storage data portability ----------------------------------------------
+	EXPORT_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The export request is invalid",
+	},
+	/** 401: the ticket is the credential, and this one can never succeed unchanged. */
+	EXPORT_TICKET_INVALID: {
+		status: 401,
+		code: "EXPORT_TICKET_INVALID",
+		en: "This download link has expired. Start the export again",
+	},
+	IMPORT_FILE_REQUIRED: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "Choose a .zip file exported from NarraFork",
+	},
+	IMPORT_FILE_TOO_LARGE: {
+		status: 413,
+		code: "IMPORT_FILE_TOO_LARGE",
+		en: "The import file exceeds the {limit} limit",
+	},
+	IMPORT_ZIP_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The uploaded file is not a valid ZIP archive",
+	},
+	IMPORT_ENTRY_MISSING: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import archive is missing {name}; it may not be a NarraFork export",
+	},
+	IMPORT_TABLE_MISSING: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import archive is missing core table {table}; it may not be a complete NarraFork export",
+	},
+	IMPORT_VERSION_TOO_NEW: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "Import version {version} is newer than the supported version {supported}",
+	},
+	IMPORT_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import request is invalid",
+	},
+	/** 410: the preview snapshot is gone, so the request can never succeed unchanged. */
+	IMPORT_PREVIEW_EXPIRED: {
+		status: 410,
+		code: "IMPORT_PREVIEW_EXPIRED",
+		en: "The import preview expired. Choose the file again",
+	},
+	IMPORT_SNAPSHOT_EXPIRED: {
+		status: 410,
+		code: "IMPORT_SNAPSHOT_EXPIRED",
+		en: "The import snapshot is no longer available. Choose the file again",
+	},
+	/** The archive carries sealed provider keys and providers were selected. */
+	IMPORT_PASSPHRASE_REQUIRED: {
+		status: 400,
+		code: "IMPORT_PASSPHRASE_REQUIRED",
+		en: "Enter the passphrase the provider keys were exported with",
+	},
+	CLEAR_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The clear request is invalid",
+	},
+	CLEAR_USER_UNKNOWN: {
+		status: 401,
+		code: "UNAUTHORIZED",
+		en: "Cannot identify the current user",
+	},
+	CLEAR_PASSWORD_NOT_SET: {
+		status: 400,
+		code: "CLEAR_PASSWORD_NOT_SET",
+		en: "This account has no password, so data cannot be cleared",
+	},
+	/** 403 rather than 400: the request is well-formed, the caller is not authorized for it. */
+	CLEAR_PASSWORD_INVALID: {
+		status: 403,
+		code: "CLEAR_PASSWORD_INVALID",
+		en: "The password is incorrect. No data was cleared",
+	},
+
+	// --- step-up verification (credential export) -------------------------------
+	STEP_UP_MFA_REQUIRED: {
+		status: 403,
+		code: "STEP_UP_MFA_REQUIRED",
+		en: "Set up two-factor authentication first",
+	},
+	STEP_UP_METHOD_UNAVAILABLE: {
+		status: 400,
+		code: "STEP_UP_METHOD_UNAVAILABLE",
+		en: "This verification method is not set up",
+	},
+	STEP_UP_FAILED: {
+		status: 401,
+		code: "STEP_UP_FAILED",
+		en: "Password or verification code is incorrect",
+	},
+	STEP_UP_REQUIRED: {
+		status: 401,
+		code: "STEP_UP_REQUIRED",
+		en: "Verify your identity again to continue",
+	},
+
+	// --- credential transfer bundles -------------------------------------------
+	BUNDLE_INVALID: {
+		status: 400,
+		code: "BUNDLE_INVALID",
+		en: "Not a NarraFork credential bundle",
+	},
+	BUNDLE_PASSPHRASE: {
+		status: 400,
+		code: "BUNDLE_PASSPHRASE",
+		en: "Wrong passphrase, or the file was altered",
+	},
+	BUNDLE_TOO_LARGE: {
+		status: 400,
+		code: "BUNDLE_TOO_LARGE",
+		en: "The file is too large to be a credential bundle",
 	},
 } as const satisfies Record<string, ErrorCatalogEntry>;
 
@@ -260,6 +405,11 @@ export interface ErrorResponsePayload {
 	code: string;
 	messageCode?: ErrorMessageCode;
 	messageParams?: ErrorMessageParams;
+	/**
+	 * Machine-readable extras for errors the client must act on, not merely display.
+	 * Opaque on the wire: each error documents its own shape and the client narrows it.
+	 */
+	details?: unknown;
 }
 
 /**

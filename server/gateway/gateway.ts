@@ -30,6 +30,7 @@ import type { ImageRef } from "../lib/uploads";
 import { sendMessage } from "../services/narrator-session";
 import { pendingPermissions } from "../services/narrator-session-state";
 import { getRecentTabUserIdsForNarrator, listAllRecentTabs } from "../services/recent-tabs-service";
+import { defaultTaskBackendForNewSession } from "../services/task-source";
 import { RateLimiter } from "./base-adapter";
 import { loadGatewayConfig } from "./config";
 import { GatewayStreamConsumer } from "./stream-consumer";
@@ -664,6 +665,8 @@ class Gateway {
 			isAskInPassing: false,
 			variant: "primary",
 			traits: ["standalone"],
+			// A new root session like any other: the outline's while it is switched on.
+			taskBackend: defaultTaskBackendForNewSession(),
 			messageVersion: 0,
 			// Access control: the auto-resolved deployment user owns the session, the
 			// same id already used for attribution and knowledge-base reads below. It
@@ -1526,7 +1529,7 @@ class Gateway {
 			return;
 		}
 
-		// The authoritative store is bounded to 500 rows and preserves global workspace ordering.
+		// The authoritative store is bounded to 500 rows and preserves global folder ordering.
 		const tabs = await listAllRecentTabs(appUserId, 500);
 
 		if (tabs.length === 0) {
@@ -1550,7 +1553,7 @@ class Gateway {
 			for (const r of rows) statusMap.set(r.id, r.status);
 		}
 
-		// Format output: group by workspace, show narrator tabs
+		// Format output: group by folder, show narrator tabs
 		const lines: string[] = [t("gateway.recentTabs", locale)];
 		const orderedNarratorIds: string[] = [];
 		let idx = 0;
@@ -1558,18 +1561,18 @@ class Gateway {
 		for (const tab of tabs) {
 			const type = typeof tab.type === "string" ? tab.type : "";
 
-			if (type === "workspace") {
-				lines.push(`\n📁 ${typeof tab.title === "string" ? tab.title : "Workspace"}`);
+			if (type === "folder") {
+				lines.push(`\n📁 ${typeof tab.title === "string" ? tab.title : "Folder"}`);
 				continue;
 			}
 
 			if (type === "project") {
-				const indent = tab.workspaceId ? "    " : "  ";
+				const indent = tab.folderId ? "    " : "  ";
 				lines.push(`${indent}📂 ${tab.title ?? tab.id ?? "?"}`);
 				continue;
 			}
 
-			const indent = tab.workspaceId ? "    " : "  ";
+			const indent = tab.folderId ? "    " : "  ";
 			const narratorId =
 				type === "narrator"
 					? typeof tab.id === "string"

@@ -8,7 +8,19 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { isSqliteLockError } from "./db-worker/failure";
 import { logger } from "./logger";
+
+/**
+ * The SQLite result code of a failed statement, e.g. `SQLITE_BUSY` or `SQLITE_BUSY_SNAPSHOT`.
+ * Both read "database is locked", but they mean different things: BUSY is another connection
+ * holding the write lock right now; BUSY_SNAPSHOT is another connection having committed since
+ * this transaction's first read. Log it next to the message so the two can be told apart.
+ */
+export function sqliteErrorCode(err: unknown): string | undefined {
+	const code = (err as { code?: unknown } | null)?.code;
+	return typeof code === "string" ? code : undefined;
+}
 
 /**
  * Retry a database operation with exponential backoff.
@@ -16,22 +28,36 @@ import { logger } from "./logger";
  */
 export async function withDbRetry<T>(
 	fn: () => Promise<T>,
-	opts: { label?: string; maxRetries?: number } = {},
+	opts: {
+		label?: string;
+		/** Historical option name: total attempts, including the first execution. */
+		maxRetries?: number;
+		signal?: AbortSignal;
+		/** Existing callers retain text-only compatibility; isolated history requires result codes. */
+		retryLegacyMessages?: boolean;
+	} = {},
 ): Promise<T> {
-	const { label = "db_operation", maxRetries = 3 } = opts;
+	const { label = "db_operation", maxRetries = 3, signal, retryLegacyMessages = true } = opts;
 	let lastError: unknown;
 
 	for (let attempt = 1; attempt <= maxRetries; attempt++) {
+		signal?.throwIfAborted();
 		try {
 			return await fn();
 		} catch (err) {
 			lastError = err;
 			const msg = err instanceof Error ? err.message : String(err);
-			const isRetryable = msg.includes("database is locked") || msg.includes("SQLITE_BUSY");
+			if (signal?.aborted) throw err;
+			const isRetryable =
+				isSqliteLockError(err) ||
+				(retryLegacyMessages &&
+					sqliteErrorCode(err) === undefined &&
+					(msg.includes("database is locked") || msg.includes("SQLITE_BUSY")));
 
 			if (!isRetryable || attempt === maxRetries) {
 				logger.error(`${label} failed after ${attempt} attempt(s)`, {
 					error: msg,
+					code: sqliteErrorCode(err),
 					attempt,
 				});
 				throw err;
@@ -39,10 +65,11 @@ export async function withDbRetry<T>(
 
 			logger.warn(`${label} failed (attempt ${attempt}/${maxRetries}), retrying...`, {
 				error: msg,
+				code: sqliteErrorCode(err),
 			});
 
 			// Exponential backoff: 200ms, 400ms, 800ms
-			await sleep(200 * 2 ** (attempt - 1));
+			await sleep(200 * 2 ** (attempt - 1), signal);
 		}
 	}
 
@@ -361,6 +388,20 @@ export function startWalCheckpointInterval(
 	return setInterval(createWalUpkeepTick(sqlite), intervalMs);
 }
 
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	return new Promise((resolve, reject) => {
+		const finish = () => {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		};
+		const timer = setTimeout(finish, ms);
+		const abort = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			reject(signal?.reason);
+		};
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) abort();
+	});
 }

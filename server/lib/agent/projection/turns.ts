@@ -12,12 +12,14 @@
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import type { WebSearchAction } from "@shared/agent-protocol/types";
+import type { NativeMediaInput } from "@shared/media-attachments";
 import {
 	type CanonicalEnvelope,
 	type ContextUpdate,
 	isModelVisible,
 	type ToolChange,
 } from "@shared/narrator-blocks/types";
+import { isClearedToolOutput } from "@shared/storage-retention";
 
 /** What the request targets; everything here can change the projected bytes. */
 export interface ProjectionTarget {
@@ -44,6 +46,9 @@ export interface ProjectionAssets {
 	generatedImages: ReadonlyMap<string, string>;
 	/** Readable images a local tool returned, by tool block id; unreadable ones are left out. */
 	toolResultImages: ReadonlyMap<string, readonly ResolvedImage[]>;
+	/** Original media bytes, resolved only for the request's supported native modalities. */
+	inputMedia?: ReadonlyMap<string, readonly NativeMediaInput[]>;
+	toolResultMedia?: ReadonlyMap<string, readonly NativeMediaInput[]>;
 }
 
 export const NO_ASSETS: ProjectionAssets = {
@@ -59,6 +64,7 @@ export interface NeutralInputItem {
 	text: string;
 	/** Index-aligned with `[image #N]` placeholders; null keeps the slot of an unreadable image. */
 	images: ReadonlyArray<ResolvedImage | null>;
+	media?: readonly NativeMediaInput[];
 	toolChange?: ToolChange;
 	/** Host state replacement, not a new top-level system prompt. */
 	contextUpdate?: ContextUpdate;
@@ -103,6 +109,9 @@ export type NeutralAssistantItem =
 			kind: "image_generation";
 			blockId: string;
 			wireId: string;
+			status?: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			savedPath?: string;
 			/** Base64 bytes, when readable. */
@@ -122,6 +131,7 @@ export interface NeutralToolResult {
 	isError: boolean;
 	text: string;
 	images: ResolvedImage[];
+	media?: readonly NativeMediaInput[];
 }
 
 export interface NeutralToolResults {
@@ -157,7 +167,14 @@ function assistantItems(
 ): NeutralAssistantItem[] {
 	const items: NeutralAssistantItem[] = [];
 	for (const block of envelope.blocks) {
-		if (!isModelVisible(block)) continue;
+		// Native image failures retain their status for the provider's lightweight
+		// history notice, never as a successful image result. Open calls stay hidden.
+		const terminalImage =
+			block.kind === "tool" &&
+			block.payload.executor === "provider" &&
+			block.subtype === "image_generation" &&
+			block.phase === "failed";
+		if (!isModelVisible(block) && !terminalImage) continue;
 		switch (block.kind) {
 			case "output": {
 				const text = block.payload.parts
@@ -187,6 +204,13 @@ function assistantItems(
 				break;
 			}
 			case "tool": {
+				if (
+					block.payload.payloadCleared ||
+					isClearedToolOutput(envelope.toolOutputs?.[block.wireId]?.output)
+				) {
+					items.push({ kind: "text", blockId: block.id, text: "[Tool details cleared]" });
+					break;
+				}
 				if (block.payload.executor === "provider") {
 					const input = record(block.payload.input);
 					if (block.subtype === "web_search") {
@@ -200,17 +224,27 @@ function assistantItems(
 						});
 					} else if (block.subtype === "image_generation") {
 						const result = record(block.providerMeta?.result);
-						const bytes =
-							assets.generatedImages.get(block.id) ??
-							(typeof result.result === "string" && result.result ? result.result : undefined);
+						const status = typeof result.status === "string" ? result.status : undefined;
+						const successful = status === "completed" || (!status && block.phase === "done");
+						const bytes = successful
+							? (assets.generatedImages.get(block.id) ??
+								(typeof result.result === "string" && result.result.trim()
+									? result.result
+									: undefined))
+							: undefined;
 						items.push({
 							kind: "image_generation",
 							blockId: block.id,
 							wireId: block.wireId,
+							...(status ? { status } : {}),
+							...(typeof result.error === "string" ? { error: result.error } : {}),
+							...(typeof result.errorCode === "string" ? { errorCode: result.errorCode } : {}),
 							...(typeof result.revisedPrompt === "string"
 								? { revisedPrompt: result.revisedPrompt }
 								: {}),
-							...(typeof result.savedPath === "string" ? { savedPath: result.savedPath } : {}),
+							...(typeof result.savedPath === "string" && result.savedPath.trim()
+								? { savedPath: result.savedPath }
+								: {}),
 							...(bytes ? { result: bytes } : {}),
 						});
 					}
@@ -253,7 +287,7 @@ function toolResults(envelope: CanonicalEnvelope, assets: ProjectionAssets): Neu
 		if (block.kind !== "tool" || block.payload.executor !== "local" || !isModelVisible(block))
 			continue;
 		const output = envelope.toolOutputs?.[block.wireId];
-		if (!output) continue;
+		if (!output || block.payload.payloadCleared || isClearedToolOutput(output.output)) continue;
 		const appendix = block.payload.result?.appendix;
 		const text = outputToText(output.output);
 		results.push({
@@ -262,6 +296,9 @@ function toolResults(envelope: CanonicalEnvelope, assets: ProjectionAssets): Neu
 			isError: output.status === "fail",
 			text: appendix ? `${text}${appendix}` : text,
 			images: [...(assets.toolResultImages.get(block.id) ?? [])],
+			...(assets.toolResultMedia?.get(block.id)?.length
+				? { media: assets.toolResultMedia.get(block.id) }
+				: {}),
 		});
 	}
 	return results;
@@ -306,6 +343,9 @@ export function toTurns(
 			role: envelope.role,
 			text: block.modelText ?? "",
 			images: block.kind === "input" ? (assets.inputImages.get(block.id) ?? []) : [],
+			...(block.kind === "input" && assets.inputMedia?.get(block.id)?.length
+				? { media: assets.inputMedia.get(block.id) }
+				: {}),
 			...(block.kind === "context" && block.toolChange ? { toolChange: block.toolChange } : {}),
 			...(block.kind === "context" && block.contextUpdate
 				? { contextUpdate: block.contextUpdate }

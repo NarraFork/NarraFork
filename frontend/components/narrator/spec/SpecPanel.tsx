@@ -13,7 +13,8 @@ import {
 } from "@mantine/core";
 import { useHotkeys } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconChecklist, IconLock, IconX } from "@tabler/icons-react";
+import type { OutlineBoardTask } from "@shared/outline-task-board";
+import { IconChecklist, IconInfoCircle, IconLock, IconX } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -22,10 +23,22 @@ import {
 	useUpdateBehaviorFence,
 	useUpdateReflectionOverrides,
 } from "../../../hooks/useNarrator";
-import { useSpecFile, useSpecFiles, useSpecTasks, useUpdateSpecFile } from "../../../hooks/useSpec";
+import {
+	useSpecFile,
+	useSpecFiles,
+	useSpecOutlineBehavior,
+	useSpecOutlineSwitchedOff,
+	useSpecTasks,
+	useUpdateSpecFile,
+} from "../../../hooks/useSpec";
+import { useNarratorCurrentTask } from "../../../hooks/useTaskBoard";
 import { api } from "../../../lib/api";
-import type { SpecTaskItem } from "../../../lib/api/spec";
+import type { SpecOutlineBehavior, SpecTaskItem } from "../../../lib/api/spec";
+import { outlineTargetHref } from "../../../lib/outline-href";
+import { isOpenClick, useOutlineOpener, wantsNewPanel } from "../../../lib/outline-opener";
+import { SessionTaskBoard } from "../../outline/task-board/TaskBoardViews";
 import { MarkdownContent } from "../markdown/MarkdownContent";
+import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecTaskBoard } from "./SpecTaskBoard";
 import type { SpecEditorMode } from "./spec-editor-mode";
@@ -51,14 +64,127 @@ interface SpecPanelProps {
 	 * ToolPanelShell provides the single header. The file-tabs row stays as the content top row.
 	 */
 	chromeless?: boolean;
+	/**
+	 * Whether the panel is shown (a dock tab behind another stays mounted). Given to the outline
+	 * task board only, which marks as seen what was on screen (outline P2 PR 9b); default shown.
+	 */
+	visible?: boolean;
 }
 
 const TASKS_URI = "spec://tasks.json";
 
-export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanelProps) {
+/**
+ * The session's task panel. A session whose tasks live in the outline shows the task board (outline
+ * P2 PR 5: it replaces the Spec task list), with its old Spec files (the plugins' SOP fence, old
+ * notes) one click away, read-only; a Dynamic Spec session shows the Spec files as before.
+ */
+export function SpecPanel(props: SpecPanelProps) {
+	const current = useNarratorCurrentTask(props.narratorId);
+	const [legacy, setLegacy] = useState(false);
+	if (current.isLoading)
+		return (
+			<Center h="100%">
+				<Loader size="sm" />
+			</Center>
+		);
+	if (current.data?.backend === "outline" && !legacy)
+		return <OutlineTasksPanel {...props} onShowLegacy={() => setLegacy(true)} />;
+	return (
+		<SpecFilesPanel
+			{...props}
+			onBackToBoard={current.data?.backend === "outline" ? () => setLegacy(false) : undefined}
+		/>
+	);
+}
+
+/** An outline session's task board, with the continuation mode and a way to the old Spec files. */
+function OutlineTasksPanel({
+	narratorId,
+	onClose,
+	chromeless = false,
+	visible = true,
+	onShowLegacy,
+}: SpecPanelProps & { onShowLegacy: () => void }) {
+	const { t } = useTranslation("outline");
+	const opener = useOutlineOpener();
+	const openTask = useCallback(
+		(task: OutlineBoardTask) => {
+			const state = {
+				spaceId: task.spaceId,
+				blockId: task.id,
+				pageId: task.pageId,
+				view: "all" as const,
+			};
+			if (opener?.open(state)) return;
+			window.location.assign(
+				outlineTargetHref({ kind: "block", spaceId: task.spaceId, blockId: task.id }),
+			);
+		},
+		[opener],
+	);
+	return (
+		<Box
+			h="100%"
+			style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}
+			data-testid="outline-tasks-panel"
+		>
+			{!chromeless && (
+				<Group
+					gap={6}
+					px="xs"
+					py={4}
+					wrap="nowrap"
+					style={{ flexShrink: 0, borderBottom: "1px solid var(--mantine-color-default-border)" }}
+				>
+					<IconChecklist size={15} color="var(--mantine-color-indigo-4)" />
+					<Text size="xs" fw={600}>
+						{t("board.title")}
+					</Text>
+					<Box style={{ flex: 1 }} />
+					<ActionIcon size="sm" variant="subtle" color="gray" onClick={onClose}>
+						<IconX size={14} />
+					</ActionIcon>
+				</Group>
+			)}
+			<ScrollArea style={{ flex: 1 }}>
+				<AutoContinuationControl narratorId={narratorId} />
+				<Box px="xs" pb="xs">
+					<NarratorPanelVisibilityProvider value={visible}>
+						<SessionTaskBoard narratorId={narratorId} onOpenTask={openTask} />
+					</NarratorPanelVisibilityProvider>
+					<Anchor
+						component="button"
+						type="button"
+						size="xs"
+						c="dimmed"
+						mt="sm"
+						onClick={onShowLegacy}
+						data-testid="outline-tasks-legacy"
+					>
+						{t("board.legacy.show")}
+					</Anchor>
+				</Box>
+			</ScrollArea>
+		</Box>
+	);
+}
+
+/**
+ * The Spec files. With `onBackToBoard` (an outline session's old files) they are read only: every
+ * file is shown as a preview, with no editor, save, reload or task controls (the server refuses
+ * those writes with `SPEC_IN_OUTLINE_SESSION`).
+ */
+function SpecFilesPanel({
+	narratorId,
+	onClose,
+	chromeless = false,
+	onBackToBoard,
+}: SpecPanelProps & { onBackToBoard?: () => void }) {
 	const { t } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
 	const { data: files } = useSpecFiles(narratorId);
+	const { data: outlineBehavior } = useSpecOutlineBehavior(narratorId);
+	const { data: outlineSwitchedOff } = useSpecOutlineSwitchedOff(narratorId);
 	const [selectedUri, setSelectedUri] = useState<string>(TASKS_URI);
 	const isTasksFile = selectedUri === TASKS_URI;
 
@@ -111,8 +237,10 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	const uiEditable = fileData?.uiEditable ?? selectedMeta?.uiEditable ?? true;
 	// Agent-readonly: the assistant's tools can't write it (e.g. behavior_fence).
 	const isAgentReadonly = fileData?.readonly ?? selectedMeta?.readonly ?? false;
-	// Preview-only in the UI: not a task file and not UI-editable.
-	const isPreviewOnly = !isTasksFile && !uiEditable;
+	// An outline session's old Spec files: read only, every one of them.
+	const readOnly = onBackToBoard !== undefined;
+	// Preview-only in the UI: read only, or not a task file and not UI-editable.
+	const isPreviewOnly = readOnly || (!isTasksFile && !uiEditable);
 	// Show the behavior-fence hint: agent-readonly but the user may still edit it.
 	const showFenceEditHint = !isTasksFile && isAgentReadonly && uiEditable;
 
@@ -332,6 +460,7 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 				</Group>
 			)}
 
+			{onBackToBoard && <BackToBoard onClick={onBackToBoard} />}
 			{/* File tabs */}
 			<Box px="xs" py={6} style={{ flexShrink: 0 }}>
 				<SpecFileTabStrip
@@ -349,10 +478,24 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 					<Center style={{ flex: 1 }}>
 						<Loader size="sm" />
 					</Center>
-				) : isPreviewOnly ? (
-					<ScrollArea style={{ flex: 1 }} p="sm">
-						<MarkdownContent text={fileData?.content ?? ""} />
+				) : isPreviewOnly && isTasksFile ? (
+					<ScrollArea style={{ flex: 1 }} p="sm" data-testid="spec-tasks-readonly">
+						<MarkdownContent
+							text={`\`\`\`json\n${JSON.stringify(tasksData?.document ?? { tasks: [] }, null, 2)}\n\`\`\``}
+						/>
 					</ScrollArea>
+				) : isPreviewOnly ? (
+					<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+						{outlineBehavior && selectedMeta?.path === "behavior_fence" && (
+							<OutlineFenceNotice behavior={outlineBehavior} />
+						)}
+						{outlineSwitchedOff && selectedMeta?.path === "behavior_fence" && (
+							<OutlineSwitchedOffNotice />
+						)}
+						<ScrollArea style={{ flex: 1 }} p="sm">
+							<MarkdownContent text={fileData?.content ?? ""} />
+						</ScrollArea>
+					</Box>
 				) : isTasksFile ? (
 					<ScrollArea style={{ flex: 1 }}>
 						<AutoContinuationControl narratorId={narratorId} />
@@ -400,6 +543,9 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 								</Text>
 							</Group>
 						)}
+						{outlineSwitchedOff && selectedMeta?.path === "behavior_fence" && (
+							<OutlineSwitchedOffNotice />
+						)}
 						{selectedMeta?.path === "behavior_fence" && (
 							<BehaviorFenceControl narratorId={narratorId} />
 						)}
@@ -440,6 +586,114 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 				)}
 			</Box>
 		</Box>
+	);
+}
+
+// === Outline session: where the behavior boundary lives ===
+
+/** Back from an outline session's old Spec files to its task board. */
+function BackToBoard({ onClick }: { onClick: () => void }) {
+	const { t } = useTranslation("outline");
+	return (
+		<Box px="xs" pt={6} style={{ flexShrink: 0 }}>
+			<Anchor
+				component="button"
+				type="button"
+				size="xs"
+				onClick={onClick}
+				data-testid="outline-tasks-back"
+			>
+				{t("board.legacy.back")}
+			</Anchor>
+		</Box>
+	);
+}
+
+/**
+ * The fence tab of a session whose tasks live in the outline: its behavior boundary is the
+ * behavior page of its session space (outline plan PR 4), so the old fence is shown read-only (it
+ * only carries plugin SOP) under a note that opens the page in the outline, beside the session
+ * when the host has an outline dock, else on the outline page.
+ */
+function OutlineFenceNotice({ behavior }: { behavior: SpecOutlineBehavior }) {
+	const { t } = useTranslation("narrator");
+	const opener = useOutlineOpener();
+	const spaceId = behavior.spaceId;
+	const href = spaceId
+		? outlineTargetHref(
+				behavior.pageId
+					? { kind: "block", spaceId, blockId: behavior.pageId }
+					: { kind: "space", spaceId },
+			)
+		: null;
+	return (
+		<Group
+			gap={6}
+			px="sm"
+			py={6}
+			wrap="nowrap"
+			align="flex-start"
+			data-testid="spec-outline-fence-notice"
+			style={{
+				flexShrink: 0,
+				borderBottom: "1px solid var(--mantine-color-default-border)",
+				background: "var(--mantine-color-default-hover)",
+			}}
+		>
+			<IconLock size={13} color="var(--mantine-color-dimmed)" style={{ marginTop: 2 }} />
+			<Text size="xs" style={{ flex: 1 }}>
+				{t("spec.outlineFenceHint")}{" "}
+				{href && spaceId && (
+					<Anchor
+						size="xs"
+						href={href}
+						onClick={(event) => {
+							if (!opener || !isOpenClick(event)) return;
+							// A host that cannot show a panel right now leaves the link to navigate.
+							const opened = opener.open(
+								behavior.pageId
+									? { spaceId, blockId: behavior.pageId, pageId: behavior.pageId }
+									: { spaceId },
+								{ newPanel: wantsNewPanel(event) },
+							);
+							if (opened) event.preventDefault();
+						}}
+					>
+						{t("spec.outlineFenceOpen")}
+					</Anchor>
+				)}
+			</Text>
+		</Group>
+	);
+}
+
+/**
+ * The fence tab of an outline session while the outline is switched off: it runs on Dynamic Spec
+ * and its fence is editable, but the rules on its behavior page still apply (they are shown to
+ * the agent with this file). One line says so, so nobody copies them here, from where turning the
+ * outline back on would import them a second time.
+ */
+function OutlineSwitchedOffNotice() {
+	const { t } = useTranslation("narrator");
+	return (
+		<Group
+			gap={6}
+			px="sm"
+			py={6}
+			wrap="nowrap"
+			align="flex-start"
+			data-testid="spec-outline-switched-off-notice"
+			style={{
+				flexShrink: 0,
+				borderBottom: "1px solid var(--mantine-color-default-border)",
+				background: "var(--mantine-color-default-hover)",
+			}}
+		>
+			<IconInfoCircle size={13} color="var(--mantine-color-dimmed)" style={{ marginTop: 2 }} />
+			<Text size="xs" style={{ flex: 1 }}>
+				{t("spec.outlineFenceSwitchedOff")}
+			</Text>
+		</Group>
 	);
 }
 

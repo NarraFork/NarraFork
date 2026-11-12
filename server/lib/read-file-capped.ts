@@ -54,8 +54,10 @@ export async function readFileCapped(
 		const info = await stat(path);
 		if (!info.isFile()) return null;
 		fileSize = info.size;
-	} catch {
-		return null;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return null;
+		throw error;
 	}
 
 	const want = Math.min(Math.max(fileSize, 0), maxBytes);

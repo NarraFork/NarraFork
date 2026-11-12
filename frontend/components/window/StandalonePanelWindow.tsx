@@ -82,6 +82,11 @@ const AppearancePanel = lazy(() =>
 const FileTreePanel = lazy(() =>
 	import("../narrator/file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
 );
+const NarratorTimelinePanel = lazy(() =>
+	import("../narrator/timeline/NarratorTimelinePanel").then((m) => ({
+		default: m.NarratorTimelinePanel,
+	})),
+);
 const KnowledgeEntryPanelContent = lazy(() =>
 	import("../narrator/knowledge/KnowledgeEntryPanelContent").then((m) => ({
 		default: m.KnowledgeEntryPanelContent,
@@ -281,6 +286,8 @@ function NarratorBoundWindow({
 			return <NarratorUserChatPanel narratorId={narratorId} />;
 		case "appearance":
 			return <AppearancePanel />;
+		case "timeline":
+			return <NarratorTimelinePanel narratorId={narratorId} />;
 		case "filetree":
 			return <FileTreeWindow narratorId={narratorId} />;
 		default:

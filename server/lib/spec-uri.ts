@@ -78,6 +78,20 @@ export function assertToolSpecPaths(toolName: string, input: Record<string, unkn
 	if (toolName === "Glob") assertSpecPath(input.pattern);
 }
 
+/**
+ * Whether a tool call names a `spec://` path in a path field, the fields `assertToolSpecPaths`
+ * checks: a call that would read or write Dynamic Spec (or be refused for trying).
+ */
+export function toolNamesSpecPath(toolName: string, input: Record<string, unknown>): boolean {
+	const paths: unknown[] = [];
+	if (SPEC_FILE_TOOLS.has(toolName) || toolName === "StructView" || toolName === "StructSed") {
+		paths.push(input.file_path);
+	}
+	if (toolName === "Grep" || toolName === "Glob") paths.push(input.path);
+	if (toolName === "Glob") paths.push(input.pattern);
+	return paths.some(isSpecUri);
+}
+
 export function toolSpecPathError(
 	toolName: string,
 	input: Record<string, unknown>,

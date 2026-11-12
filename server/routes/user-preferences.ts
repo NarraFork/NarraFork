@@ -1,4 +1,10 @@
-import { DEFAULT_TYPOGRAPHY } from "@shared/pretext-layout/typography";
+import {
+	DEFAULT_TYPOGRAPHY,
+	LEGACY_LINE_HEIGHT_RANGE,
+	legacyLineHeightPercentFrom,
+	lineHeightPercentFromLegacy,
+	lineHeightPercentFromStored,
+} from "@shared/pretext-layout/typography";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
@@ -10,19 +16,29 @@ import { saveSettings, settings } from "../lib/settings";
 import {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
+	createRecentTabFolderSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
 	restoreRecentTabsSchema,
-	setRecentTabDirectoryOrderSchema,
+	setNarratorGitIdentitySchema,
 	specTabLayoutPatchSchema,
+	updateRecentTabFolderSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
 import {
+	getFolderGitIdentityPick,
+	listUserGitIdentities,
+	setFolderGitIdentityPick,
+} from "../services/git-identities";
+import { serverTimeZone } from "../services/outline/digest-time";
+import {
 	clearRecentTabs,
+	createRecentTabFolder,
+	dissolveRecentTabFolder,
 	getRuntimePatches,
 	listLegacyTabs,
 	listPage,
@@ -30,7 +46,7 @@ import {
 	pinRecentTab,
 	removeRecentTab,
 	restoreRecentTabs,
-	setRecentTabDirectoryOrder,
+	updateRecentTabFolder,
 	upsertRecentTab,
 	upsertRecentTabsBatch,
 } from "../services/recent-tabs-service";
@@ -49,6 +65,7 @@ const DEFAULTS = {
 	replyInUserLanguage: true,
 	showTokenUsage: false,
 	showOutputStats: true,
+	compactAuxiliaryContent: true,
 	terminalTheme: "auto",
 	terminalFontSize: 14,
 	// Narrator transcript typography. Sourced from the shared neutral setting rather
@@ -56,9 +73,12 @@ const DEFAULTS = {
 	// treats as unscaled (see shared/pretext-layout/typography.ts).
 	narratorFontScalePercent: DEFAULT_TYPOGRAPHY.fontScalePercent,
 	narratorLetterSpacingPercent: DEFAULT_TYPOGRAPHY.letterSpacingPercent,
-	narratorLineHeightScalePercent: DEFAULT_TYPOGRAPHY.lineHeightScalePercent,
+	// Line height: the old-scale column's default, and the current-scale value it means.
+	narratorLineHeightScalePercent: LEGACY_LINE_HEIGHT_RANGE.fallback,
+	narratorLineHeightV2Percent: DEFAULT_TYPOGRAPHY.lineHeightScalePercent,
 	narratorParagraphScalePercent: DEFAULT_TYPOGRAPHY.paragraphScalePercent,
 	recentTabs: "[]",
+	recentTabsShowDirectory: false,
 	addSubagentToRecentTabs: true,
 	recentTabsGroupMode: "flat" as const,
 	// Notification defaults
@@ -90,6 +110,10 @@ const DEFAULTS = {
 	// Git 提交身份入口的显示位置（跟账号走）
 	gitIdentityContextMenu: false,
 	gitIdentityCreateModal: false,
+	gitIdentityFolderContextMenu: false,
+	// The outline's daily report (P2 PR 11): null is the server's time zone and 07:00.
+	outlineDigestTimeZone: null as string | null,
+	outlineDigestTime: null as string | null,
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -142,12 +166,14 @@ const INSERT_COLUMNS = [
 	"reply_in_user_language",
 	"show_token_usage",
 	"show_output_stats",
+	"compact_auxiliary_content",
 	"terminal_theme",
 	"terminal_font_size",
 	"narrator_font_scale_percent",
 	"narrator_letter_spacing_percent",
 	"narrator_paragraph_scale_percent",
 	"narrator_line_height_scale_percent",
+	"narrator_line_height_v2_percent",
 	"add_subagent_to_recent_tabs",
 	"recent_tabs_group_mode",
 	"notify_on_done",
@@ -174,6 +200,10 @@ const INSERT_COLUMNS = [
 	"narrator_toolbar_layout",
 	"git_identity_context_menu",
 	"git_identity_create_modal",
+	"git_identity_folder_context_menu",
+	"recent_tabs_show_directory",
+	"outline_digest_time_zone",
+	"outline_digest_time",
 	"created_at",
 	"updated_at",
 ] as const;
@@ -294,13 +324,46 @@ function instanceSetupWizardCompleted(): boolean {
 	return settings.setupWizardCompleted === true;
 }
 
+/**
+ * The two line-height columns a PATCH writes, from whichever scale the client used.
+ *
+ * Both are always written together so they never disagree: a current client sends the
+ * new-scale value (the old column gets its mirror, for a downgrade); a client built
+ * before the rescale sends the old-scale value (the new column gets its conversion, so a
+ * tab left open across the upgrade cannot store a value that is later read on the wrong
+ * scale). If both arrive, the new-scale one wins.
+ */
+function lineHeightWrite(d: {
+	narratorLineHeightV2Percent?: number;
+	narratorLineHeightScalePercent?: number;
+}): { v2: number | null; legacy: number | null } {
+	if (d.narratorLineHeightV2Percent !== undefined) {
+		return {
+			v2: d.narratorLineHeightV2Percent,
+			legacy: legacyLineHeightPercentFrom(d.narratorLineHeightV2Percent),
+		};
+	}
+	if (d.narratorLineHeightScalePercent !== undefined) {
+		return {
+			v2: lineHeightPercentFromLegacy(d.narratorLineHeightScalePercent),
+			legacy: d.narratorLineHeightScalePercent,
+		};
+	}
+	return { v2: null, legacy: null };
+}
+
 function serializeUserPreferences(
 	pref: typeof userPreferences.$inferSelect,
 	recentTabs?: Record<string, unknown>[],
 ): Record<string, unknown> {
 	return {
 		...pref,
+		narratorLineHeightV2Percent: lineHeightPercentFromStored(
+			pref.narratorLineHeightV2Percent,
+			pref.narratorLineHeightScalePercent,
+		),
 		setupWizardCompleted: instanceSetupWizardCompleted(),
+		outlineDigestServerTimeZone: serverTimeZone(),
 		...(recentTabs === undefined ? {} : { recentTabs }),
 		commands: parseJsonArray(pref.commands),
 		notifyDingtalkWebhook: maskSecret(pref.notifyDingtalkWebhook),
@@ -328,6 +391,7 @@ userPreferencesRoutes.get("/", async (c) => {
 		return c.json({
 			...DEFAULTS,
 			setupWizardCompleted: instanceSetupWizardCompleted(),
+			outlineDigestServerTimeZone: serverTimeZone(),
 			recentTabs,
 			commands: [],
 			gatewayConfig: {},
@@ -379,6 +443,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		const dingtalkSecret = d.notifyDingtalkSecret ?? null;
 		const feishuWebhook = d.notifyFeishuWebhook ?? null;
 		const feishuSecret = d.notifyFeishuSecret ?? null;
+		const lineHeight = lineHeightWrite(d);
 
 		// Atomic upsert — avoids read-then-write race condition
 		const commandsJson = d.commands != null ? JSON.stringify(d.commands) : null;
@@ -410,12 +475,14 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   reply_in_user_language = COALESCE(?, reply_in_user_language),
 		   show_token_usage = COALESCE(?, show_token_usage),
 		   show_output_stats = COALESCE(?, show_output_stats),
+		   compact_auxiliary_content = COALESCE(?, compact_auxiliary_content),
 		   terminal_theme = COALESCE(?, terminal_theme),
 		   terminal_font_size = COALESCE(?, terminal_font_size),
 		   narrator_font_scale_percent = COALESCE(?, narrator_font_scale_percent),
 		   narrator_letter_spacing_percent = COALESCE(?, narrator_letter_spacing_percent),
 		   narrator_paragraph_scale_percent = COALESCE(?, narrator_paragraph_scale_percent),
 		   narrator_line_height_scale_percent = COALESCE(?, narrator_line_height_scale_percent),
+		   narrator_line_height_v2_percent = COALESCE(?, narrator_line_height_v2_percent),
 		   add_subagent_to_recent_tabs = COALESCE(?, add_subagent_to_recent_tabs),
 		   recent_tabs_group_mode = COALESCE(?, recent_tabs_group_mode),
 		   notify_on_done = COALESCE(?, notify_on_done),
@@ -442,6 +509,10 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   narrator_toolbar_layout = COALESCE(?, narrator_toolbar_layout),
 		   git_identity_context_menu = COALESCE(?, git_identity_context_menu),
 		   git_identity_create_modal = COALESCE(?, git_identity_create_modal),
+		   git_identity_folder_context_menu = COALESCE(?, git_identity_folder_context_menu),
+		   recent_tabs_show_directory = COALESCE(?, recent_tabs_show_directory),
+		   outline_digest_time_zone = CASE WHEN ? THEN ? ELSE outline_digest_time_zone END,
+		   outline_digest_time = CASE WHEN ? THEN ? ELSE outline_digest_time END,
 		   updated_at = ?`,
 			[
 				// INSERT values
@@ -457,12 +528,14 @@ userPreferencesRoutes.patch("/", async (c) => {
 				(d.replyInUserLanguage ?? DEFAULTS.replyInUserLanguage) ? 1 : 0,
 				(d.showTokenUsage ?? DEFAULTS.showTokenUsage) ? 1 : 0,
 				(d.showOutputStats ?? DEFAULTS.showOutputStats) ? 1 : 0,
+				(d.compactAuxiliaryContent ?? DEFAULTS.compactAuxiliaryContent) ? 1 : 0,
 				d.terminalTheme ?? DEFAULTS.terminalTheme,
 				d.terminalFontSize ?? DEFAULTS.terminalFontSize,
 				d.narratorFontScalePercent ?? DEFAULTS.narratorFontScalePercent,
 				d.narratorLetterSpacingPercent ?? DEFAULTS.narratorLetterSpacingPercent,
 				d.narratorParagraphScalePercent ?? DEFAULTS.narratorParagraphScalePercent,
-				d.narratorLineHeightScalePercent ?? DEFAULTS.narratorLineHeightScalePercent,
+				lineHeight.legacy ?? DEFAULTS.narratorLineHeightScalePercent,
+				lineHeight.v2,
 				(d.addSubagentToRecentTabs ?? DEFAULTS.addSubagentToRecentTabs) ? 1 : 0,
 				d.recentTabsGroupMode ?? DEFAULTS.recentTabsGroupMode,
 				(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
@@ -489,6 +562,10 @@ userPreferencesRoutes.patch("/", async (c) => {
 				narratorToolbarLayoutJson ?? DEFAULTS.narratorToolbarLayout,
 				(d.gitIdentityContextMenu ?? DEFAULTS.gitIdentityContextMenu) ? 1 : 0,
 				(d.gitIdentityCreateModal ?? DEFAULTS.gitIdentityCreateModal) ? 1 : 0,
+				(d.gitIdentityFolderContextMenu ?? DEFAULTS.gitIdentityFolderContextMenu) ? 1 : 0,
+				(d.recentTabsShowDirectory ?? DEFAULTS.recentTabsShowDirectory) ? 1 : 0,
+				d.outlineDigestTimeZone ?? DEFAULTS.outlineDigestTimeZone,
+				d.outlineDigestTime ?? DEFAULTS.outlineDigestTime,
 				now,
 				now,
 				// ON CONFLICT UPDATE values (null = keep existing)
@@ -502,12 +579,14 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.replyInUserLanguage != null ? (d.replyInUserLanguage ? 1 : 0) : null,
 				d.showTokenUsage != null ? (d.showTokenUsage ? 1 : 0) : null,
 				d.showOutputStats != null ? (d.showOutputStats ? 1 : 0) : null,
+				d.compactAuxiliaryContent != null ? (d.compactAuxiliaryContent ? 1 : 0) : null,
 				d.terminalTheme ?? null,
 				d.terminalFontSize ?? null,
 				d.narratorFontScalePercent ?? null,
 				d.narratorLetterSpacingPercent ?? null,
 				d.narratorParagraphScalePercent ?? null,
-				d.narratorLineHeightScalePercent ?? null,
+				lineHeight.legacy,
+				lineHeight.v2,
 				d.addSubagentToRecentTabs != null ? (d.addSubagentToRecentTabs ? 1 : 0) : null,
 				d.recentTabsGroupMode ?? null,
 				d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,
@@ -534,6 +613,13 @@ userPreferencesRoutes.patch("/", async (c) => {
 				narratorToolbarLayoutJson,
 				d.gitIdentityContextMenu != null ? (d.gitIdentityContextMenu ? 1 : 0) : null,
 				d.gitIdentityCreateModal != null ? (d.gitIdentityCreateModal ? 1 : 0) : null,
+				d.gitIdentityFolderContextMenu != null ? (d.gitIdentityFolderContextMenu ? 1 : 0) : null,
+				d.recentTabsShowDirectory != null ? (d.recentTabsShowDirectory ? 1 : 0) : null,
+				// Unlike the columns above, null is a value here (back to the default): absent keeps.
+				d.outlineDigestTimeZone !== undefined ? 1 : 0,
+				d.outlineDigestTimeZone ?? null,
+				d.outlineDigestTime !== undefined ? 1 : 0,
+				d.outlineDigestTime ?? null,
 				now,
 			],
 		);
@@ -543,6 +629,29 @@ userPreferencesRoutes.patch("/", async (c) => {
 		});
 	});
 	return c.json(updated ? serializeUserPreferences(updated) : updated);
+});
+
+// === Sidebar folder git identity ===
+// Which of MY identities commits inside one of MY sidebar folders. Same personal-scope rule
+// as the per-narrator pick: the folder is looked up in the caller's own recent tabs, so
+// another user's layout can neither be bound nor probed through here.
+
+userPreferencesRoutes.get("/git-identity/folders/:folderId", async (c) => {
+	const userId = c.get("user").sub;
+	const folderId = c.req.param("folderId");
+	const [identities, selectedId] = await Promise.all([
+		listUserGitIdentities(userId),
+		getFolderGitIdentityPick(userId, folderId),
+	]);
+	return c.json({ identities, selectedId });
+});
+
+userPreferencesRoutes.put("/git-identity/folders/:folderId", async (c) => {
+	const parsed = setNarratorGitIdentitySchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const userId = c.get("user").sub;
+	await setFolderGitIdentityPick(userId, c.req.param("folderId"), parsed.data.identityId);
+	return c.json({ ok: true });
 });
 
 // === Recent Tabs endpoints ===
@@ -576,7 +685,7 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey }));
 });
 
-/** Atomically upsert a workspace header and its children with one revision. */
+/** Atomically upsert several tabs with one revision. */
 userPreferencesRoutes.post("/recent-tabs/batch", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = batchUpsertRecentTabsSchema.safeParse(await c.req.json());
@@ -591,13 +700,18 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 		id: c.req.param("id"),
 		// `?cascade=1` marks entity-teardown cleanups (project deleted, narrator archived).
 		cascade: c.req.query("cascade") === "1" ? true : undefined,
+		// 归档是 cascade，但会话可以撤销归档回来：文件夹要留着。
+		keepEmptyFolder: c.req.query("keepEmptyFolder") === "1" ? true : undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const type = parsed.data.type === "session" ? "narrator" : parsed.data.type;
 	// User-initiated close (swipe / context menu / middle-click) mints an undo token;
 	// cascade cleanups must not (they would clobber a pending user undo).
 	return c.json(
-		await removeRecentTab(userId, type, parsed.data.id, { storeUndo: !parsed.data.cascade }),
+		await removeRecentTab(userId, type, parsed.data.id, {
+			storeUndo: !parsed.data.cascade,
+			keepEmptyFolder: parsed.data.keepEmptyFolder,
+		}),
 	);
 });
 
@@ -629,16 +743,30 @@ userPreferencesRoutes.patch("/recent-tabs/pin", async (c) => {
 	return c.json(await pinRecentTab(userId, parsed.data.key, parsed.data.pinned));
 });
 
-/**
- * Member order inside one directory group. Separate from `/recent-tabs/move` because it
- * writes a different column with different semantics: move rewrites the flat recency
- * order (and has to expand workspace groups), this only records a hand-made arrangement.
- */
-userPreferencesRoutes.patch("/recent-tabs/dir-order", async (c) => {
+/** Create a folder from two top-level tabs (drag one onto the other). */
+userPreferencesRoutes.post("/recent-tabs/folders", async (c) => {
 	const userId = c.get("user").sub;
-	const parsed = setRecentTabDirectoryOrderSchema.safeParse(await c.req.json());
+	const parsed = createRecentTabFolderSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await setRecentTabDirectoryOrder(userId, parsed.data.keys));
+	return c.json(await createRecentTabFolder(userId, parsed.data));
+});
+
+/** Rename a folder, or change its icon, colour or preview count. */
+userPreferencesRoutes.patch("/recent-tabs/folders/:id", async (c) => {
+	const userId = c.get("user").sub;
+	const id = c.req.param("id");
+	if (!id || id.length > 50) throw new ValidationError("Invalid folder id");
+	const parsed = updateRecentTabFolderSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await updateRecentTabFolder(userId, id, parsed.data));
+});
+
+/** Remove a folder, keeping its members at its position. */
+userPreferencesRoutes.post("/recent-tabs/folders/:id/dissolve", async (c) => {
+	const userId = c.get("user").sub;
+	const id = c.req.param("id");
+	if (!id || id.length > 50) throw new ValidationError("Invalid folder id");
+	return c.json(await dissolveRecentTabFolder(userId, id));
 });
 
 // --- Graph viewport persistence (per-project) ---

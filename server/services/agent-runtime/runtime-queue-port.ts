@@ -79,6 +79,7 @@ export interface RuntimeMailboxRow {
 	narratorId: string;
 	text: string;
 	imagesJson: string | null;
+	mediaJson: string | null;
 	commandText: string | null;
 	bashCommand: string | null;
 	createdBy: string | null;

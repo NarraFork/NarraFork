@@ -4,6 +4,7 @@ import {
 	HUMAN_ATTENTION_DEFAULT_PAGE_SIZE,
 	HUMAN_ATTENTION_MAX_PAGE_SIZE,
 } from "@shared/human-attention";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	handleLength,
 	isValidHandle,
@@ -78,6 +79,12 @@ export const createNarratorSchema = z.object({
 	permissionMode: permissionModeSchema.optional(),
 	startInPlanMode: z.boolean().optional(),
 	cwd: z.string().min(1).max(4096).optional(),
+	/**
+	 * Execution device the session starts on. Null/"local" (and omission) mean the
+	 * NarraFork server; a remote id must be one the caller can see and that is online,
+	 * and `cwd` is then an absolute path on that device, in its own grammar.
+	 */
+	deviceId: z.string().trim().min(1).max(128).nullish(),
 	reasoningEffort: reasoningEffortSchema.nullable().optional(),
 	/** @deprecated Use fastModeOverride. Kept so older clients keep working. */
 	fastMode: z.boolean().optional(),
@@ -85,6 +92,7 @@ export const createNarratorSchema = z.object({
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
+	questionReflectionOverride: booleanOverrideSchema.optional(),
 	autoContinuationOverride: autoContinuationOverrideSchema.optional(),
 	behaviorFenceIntervalOverride: z
 		.number()
@@ -144,6 +152,8 @@ export const codexUpdateCredentialSchema = z.object({
 	displayName: z.string().optional(),
 	priority: z.number().optional(),
 	useCreditQuota: z.boolean().optional(),
+	/** Network identity; validated by `normalizeCredentialNetwork`. `null` clears it. */
+	network: z.unknown().optional(),
 });
 
 export const codexUseWebSocketSchema = z.object({
@@ -510,6 +520,7 @@ export const updateBufferedMessageSchema = z.object({
 	fileReferences: fileReferencesSchema.optional(),
 	composerDocument: composerDocumentSchema,
 	keepImageIds: z.array(z.string().min(1)).max(MAX_EDIT_IMAGES_PER_MESSAGE).optional(),
+	keepMediaIds: z.array(z.string().min(1)).max(MAX_MEDIA_ATTACHMENTS).optional(),
 	keepTextFiles: z
 		.array(z.object({ index: z.number().int().min(0), filename: z.string().min(1) }))
 		.max(MAX_EDIT_TEXT_FILES_PER_MESSAGE)
@@ -779,6 +790,7 @@ export const editAndRegenerateJsonSchema = z.object({
 	fileReferences: fileReferencesSchema.optional(),
 	composerDocument: composerDocumentSchema,
 	keepImageIds: z.array(z.string()).max(100).optional(),
+	keepMediaIds: z.array(z.string().min(1)).max(MAX_MEDIA_ATTACHMENTS).optional(),
 	keepTextFilePaths: z.array(z.string()).max(100).optional(),
 	/** True => delete the messages but leave the workspace alone. */
 	skipRevert: z.boolean().optional(),
@@ -838,3 +850,15 @@ export const optimizePromptSchema = z.object({
 	withContext: z.boolean().optional().default(false),
 	messageId: z.string().optional(),
 });
+
+/**
+ * Optimizing a draft prompt that has no session yet (the "new session" dialog's
+ * project-prompt box).
+ *
+ * Only `text` and `style`, because the omitted fields are exactly the ones that
+ * describe a SESSION: `withContext` would need messages to attach and `messageId`
+ * would need an inline editor. Deriving rather than restating keeps the text cap and
+ * the style list in one place; unknown keys are stripped by Zod, so a client that
+ * sends them gets the documented behaviour (none) instead of a silent context load.
+ */
+export const optimizeDraftPromptSchema = optimizePromptSchema.pick({ text: true, style: true });

@@ -10,10 +10,13 @@
  */
 
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import en from "../../locales/en/settings.json";
+import zh from "../../locales/zh-CN/settings.json";
 
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 // Both module mocks MUST spread the real modules: bun's mock.module is process-global
@@ -22,32 +25,35 @@ const realReactI18nextModule = { ...(await import("react-i18next")) };
 // factory would erase them and fail those files at link time.
 const realApiModule = { ...(await import("../../lib/api")) };
 const realReactQueryModule = { ...(await import("@tanstack/react-query")) };
+const queryClient = new realReactQueryModule.QueryClient({
+	defaultOptions: { mutations: { retry: false } },
+});
+const saveSettings = mock(async (patch: Record<string, unknown>) => patch);
 
 /** Controllable query result: swapping `.current` simulates a refetch landing. */
 const queryState: { current: { data: unknown } } = { current: { data: undefined } };
 
-// i18n returns raw keys so assertions are translation-stable. Note the mock `t`
-// ignores interpolation params, so auto-SANs never reach the rendered text — the
-// assertions below target the custom-SAN pills, which are real text. `returnObjects`
-// must yield an array because the trust-guide modal maps over the step list.
+// Keep keys translation-stable while exposing SAN interpolation for status assertions.
+// The trust-guide modal needs returnObjects to yield an array.
 mock.module("react-i18next", () => ({
 	...realReactI18nextModule,
 	useTranslation: () => ({
-		t: (key: string, opts?: { returnObjects?: boolean }) =>
-			opts?.returnObjects ? [`${key}-step`] : key,
+		t: (key: string, opts?: { returnObjects?: boolean; sans?: string }) =>
+			opts?.returnObjects ? [`${key}-step`] : opts?.sans ? `${key}: ${opts.sans}` : key,
 		i18n: { language: "en" },
 	}),
 }));
 mock.module("@tanstack/react-query", () => ({
 	...realReactQueryModule,
 	useQuery: () => queryState.current,
-	useQueryClient: () => ({ invalidateQueries: async () => {} }),
+	useQueryClient: () => queryClient,
 }));
 mock.module("../../lib/api", () => ({
 	...realApiModule,
 	api: {
 		...realApiModule.api,
 		getTlsStatus: async () => queryState.current.data,
+		updateSettings: saveSettings,
 		generateTlsWithCa: async () => {
 			throw new Error("not exercised by this test");
 		},
@@ -61,6 +67,13 @@ mock.module("../../lib/api", () => ({
 }));
 
 const { TlsSection } = await import("./TlsSection");
+const { useInstanceSettings } = await import("../../hooks/useInstanceSettings");
+let settingsForm: ReturnType<typeof useInstanceSettings>;
+
+function SettingsProbe() {
+	settingsForm = useInstanceSettings();
+	return null;
+}
 
 let currentRoot: Root | null = null;
 let currentContainer: HTMLElement | null = null;
@@ -116,7 +129,7 @@ function setupDom() {
 	return win.document;
 }
 
-function renderSection(): HTMLElement {
+function renderSection(settingsProbe = false): HTMLElement {
 	const doc = setupDom();
 	const container = doc.createElement("div");
 	doc.body.appendChild(container);
@@ -125,9 +138,11 @@ function renderSection(): HTMLElement {
 	currentRoot = root;
 	act(() => {
 		root.render(
-			<MantineProvider>
-				<TlsSection onCertIssued={() => {}} />
-			</MantineProvider>,
+			<realReactQueryModule.QueryClientProvider client={queryClient}>
+				<MantineProvider>
+					{settingsProbe ? <SettingsProbe /> : <TlsSection onCertIssued={() => {}} />}
+				</MantineProvider>
+			</realReactQueryModule.QueryClientProvider>,
 		);
 	});
 	return currentContainer;
@@ -139,9 +154,11 @@ function rerender() {
 	if (!root) throw new Error("expected a mounted section");
 	act(() => {
 		root.render(
-			<MantineProvider>
-				<TlsSection onCertIssued={() => {}} />
-			</MantineProvider>,
+			<realReactQueryModule.QueryClientProvider client={queryClient}>
+				<MantineProvider>
+					<TlsSection onCertIssued={() => {}} />
+				</MantineProvider>
+			</realReactQueryModule.QueryClientProvider>,
 		);
 	});
 }
@@ -155,6 +172,8 @@ afterEach(() => {
 	currentContainer?.remove();
 	currentContainer = null;
 	queryState.current = { data: undefined };
+	queryClient.clear();
+	saveSettings.mockClear();
 });
 
 afterAll(() => {
@@ -197,6 +216,62 @@ describe("TlsSection — SAN editor initialization", () => {
 	});
 });
 
+describe("TLS startup update settings", () => {
+	for (const savedValue of [undefined, false, true]) {
+		test(`loads and saves autoReissue=${savedValue} through the real settings hook`, async () => {
+			queryState.current = {
+				data: {
+					server: { tls: savedValue === undefined ? {} : { autoReissue: savedValue } },
+				},
+			};
+			renderSection(true);
+			expect(settingsForm.initialized).toBe(true);
+			expect(settingsForm.tlsAutoReissue).toBe(savedValue ?? true);
+			expect(settingsForm.isDirty).toBe(false);
+
+			await act(async () => {
+				settingsForm.save();
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+			expect(saveSettings).toHaveBeenCalledTimes(1);
+			expect(saveSettings.mock.calls[0]?.[0]).toMatchObject({
+				server: { tls: { autoReissue: savedValue ?? true } },
+			});
+		});
+	}
+
+	test("the generated setter saves an explicit false and updates the dirty state", async () => {
+		queryState.current = { data: {} };
+		renderSection(true);
+		expect(settingsForm.tlsAutoReissue).toBe(true);
+		act(() => settingsForm.setTlsAutoReissue(false));
+		expect(settingsForm.tlsAutoReissue).toBe(false);
+		expect(settingsForm.isDirty).toBe(true);
+		await act(async () => {
+			settingsForm.save();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+		expect(saveSettings.mock.calls[0]?.[0]).toMatchObject({
+			server: { tls: { autoReissue: false } },
+		});
+		expect(settingsForm.isDirty).toBe(false);
+	});
+
+	test("wires the startup update switch and provides both translations", () => {
+		const page = readFileSync(new URL("../../routes/settings/server.tsx", import.meta.url), "utf8");
+		const section = readFileSync(new URL("./ServerSystemSection.tsx", import.meta.url), "utf8");
+		expect(page).toContain("tlsAutoReissue={is.tlsAutoReissue}");
+		expect(page).toContain("setTlsAutoReissue={is.setTlsAutoReissue}");
+		expect(section).toContain("checked={tlsAutoReissue}");
+		expect(section).toContain("setTlsAutoReissue(e.currentTarget.checked)");
+		for (const locale of [en, zh]) {
+			expect(locale.tlsAutoReissue).toBeTruthy();
+			expect(locale.tlsAutoReissueDesc).toContain("CA");
+			expect(locale.tlsCertSans).toContain("{{sans}}");
+		}
+	});
+});
+
 describe("TlsSection — re-issue pulse", () => {
 	const reissueButton = (c: HTMLElement) => c.querySelector("[data-sans-changed]");
 
@@ -214,6 +289,48 @@ describe("TlsSection — re-issue pulse", () => {
 		};
 		const container = renderSection();
 		expect(reissueButton(container)).not.toBeNull();
+	});
+
+	test("shows actual certificate SANs separately from automatic issuance names", () => {
+		queryState.current = {
+			data: {
+				...tlsStatus([]),
+				certSans: ["localhost", "192.168.1.10"],
+				autoSans: ["localhost", "192.168.1.20"],
+			},
+		};
+		const container = renderSection();
+		expect(container.textContent).toContain("tlsCertSans: localhost, 192.168.1.10");
+		expect(container.textContent).toContain("tlsAutoSansNote: localhost, 192.168.1.20");
+		expect(container.textContent).toContain("tlsSansPendingReissue");
+		expect(reissueButton(container)).not.toBeNull();
+	});
+
+	test("treats equivalent IPv6 and case-insensitive DNS names as equal", () => {
+		queryState.current = {
+			data: {
+				...tlsStatus(["NAS.local", "2001:db8::1", "localhost"]),
+				certSans: [
+					"localhost",
+					"127.0.0.1",
+					"nas.local",
+					"0:0:0:0:0:0:0:1",
+					"2001:0db8:0:0:0:0:0:1",
+				],
+				autoSans: ["localhost", "127.0.0.1", "::1"],
+			},
+		};
+		const container = renderSection();
+		expect(reissueButton(container)).toBeNull();
+		expect(container.textContent).not.toContain("tlsSansPendingReissue");
+	});
+
+	test("does not suggest re-issuing when no certificate exists", () => {
+		queryState.current = { data: { ...tlsStatus(["nas.local"]), certExists: false } };
+		const container = renderSection();
+		expect(reissueButton(container)).toBeNull();
+		expect(container.textContent).not.toContain("tlsSansPendingReissue");
+		expect(container.textContent).not.toContain("tlsCertSans");
 	});
 
 	test("pulses when a SAN was removed but the cert still has it", () => {

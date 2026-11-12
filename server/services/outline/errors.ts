@@ -31,7 +31,24 @@ export type OutlineWriteErrorCode =
 	/** A caller-chosen block id is already in use. */
 	| "OUTLINE_ID_TAKEN"
 	/** The task is being done by someone else (a live claim); see `OutlineTaskClaimedError`. */
-	| "OUTLINE_TASK_CLAIMED";
+	| "OUTLINE_TASK_CLAIMED"
+	/** An agent's write sets or clears a lock: only people lock (`lockOutlineTask`). */
+	| "OUTLINE_LOCK_DENIED"
+	/**
+	 * The task is locked by someone else: locking it again would take their lock over. Unlocking
+	 * comes first, by someone who may (the locker, a manager of the space, an admin).
+	 */
+	| "OUTLINE_LOCK_HELD"
+	/** One write changes several locked plans; one call per plan. */
+	| "OUTLINE_LOCKED_MANY"
+	/** The page has as many open pending changes as it may hold. */
+	| "OUTLINE_PENDING_FULL"
+	/** A pending change would grow past its limits. */
+	| "OUTLINE_PENDING_TOO_LARGE"
+	/** An agent wrote a session's behavior page without the user turn's one-shot grant. */
+	| "OUTLINE_BEHAVIOR_PAGE_READONLY"
+	/** An agent gave or took a session's task page alias, or moved or deleted the page. */
+	| "OUTLINE_TASKS_PAGE_RESERVED";
 
 /** The transaction is invalid as written. `opIndex` is the offending operation, when one is. */
 export class OutlineWriteError extends ValidationError {
@@ -110,6 +127,22 @@ export class OutlineTaskClaimedError extends OutlineWriteError {
 			opIndex,
 		);
 		this.name = "OutlineTaskClaimedError";
+	}
+}
+
+/**
+ * A claim the caller decided on is no longer as it read it (`OutlineWriteOptions.expectClaims`),
+ * or a delegation's claim moved on before it was written (`delegateClaim`: someone claimed the
+ * task in between). Nothing was written; the caller reads the claim again and decides again.
+ */
+export class OutlineClaimChangedError extends AppError {
+	constructor(readonly blockId: string) {
+		super(
+			`the claim of task ${blockId} changed while the write was planned`,
+			409,
+			"OUTLINE_CLAIM_CHANGED",
+		);
+		this.name = "OutlineClaimChangedError";
 	}
 }
 

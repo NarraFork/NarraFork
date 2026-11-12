@@ -10,6 +10,7 @@ import {
 	narrators,
 	runtimePublicationOutbox as outbox,
 	narratorMessageRefs as refs,
+	narratorToolCalls as toolCalls,
 } from "../../db/postgres-schema";
 import { createPostgresRuntimePublication } from "./postgres-runtime-publication";
 import { createPostgresRuntimeQueue } from "./postgres-runtime-queue";
@@ -93,6 +94,15 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 				await message("old-history", "OLD HISTORY RESULT");
 				await message("old-compact", "OLD COMPACT SUMMARY", "system");
 				const first = await start();
+				expect(await engine.readRunPublicationState(first)).toEqual({ state: "reserved" });
+				expect(
+					await engine.readRunPublicationState({
+						producerKind: "agent",
+						taskId: "actor",
+						logicalRunId: "never-registered",
+						recipientId: "parent",
+					}),
+				).toEqual({ state: "none" });
 				expect(await engine.readAgentTerminalResult(first)).toBeNull();
 				expect(
 					await engine.readAgentTerminalResult(first, { settledRunId: first.logicalRunId }),
@@ -140,6 +150,75 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 					text: "FIRST FINAL",
 					summary: "done",
 				});
+				expect(await engine.readRunPublicationState(first)).toEqual({
+					state: "settled",
+					eventKind: "completed",
+				});
+				// An active parent projection is settled by the composite, while the already
+				// published same-kind terminal remains a duplicate.
+				await db.insert(messages).values({
+					id: "parent-tool-message",
+					narratorId: "parent",
+					role: "assistant",
+					contentJson: [],
+					createdAt: now,
+				});
+				await db.insert(toolCalls).values({
+					id: "parent-tool-call",
+					narratorId: "parent",
+					messageId: "parent-tool-message",
+					toolUseId: "test-tool-use",
+					toolName: "Agent",
+					inputJson: {},
+					status: "running",
+					executionAttempt: 1,
+					createdAt: now,
+				});
+				const repeated = await engine.commitAgentTerminal({
+					run: first,
+					eventKind: "completed",
+					text: "FIRST FINAL",
+					summary: "done",
+					toolConclusion: {
+						toolCallId: "parent-tool-call",
+						messageId: "parent-tool-message",
+						toolUseId: "test-tool-use",
+						attempt: 1,
+						output: "RECOVERED PARENT RESULT",
+						status: "success",
+					},
+				});
+				expect(repeated.status).toBe("duplicate");
+				expect((await db.select().from(toolCalls))[0]).toMatchObject({
+					status: "success",
+					outputJson: "RECOVERED PARENT RESULT",
+				});
+				const terminalConclusion = {
+					toolCallId: "parent-tool-call",
+					messageId: "parent-tool-message",
+					toolUseId: "test-tool-use",
+					attempt: 1,
+					output: "MUST NOT REPLACE TERMINAL RESULT",
+					status: "success" as const,
+					onlyIfActive: true,
+				};
+				await engine.commitAgentTerminal({
+					run: first,
+					eventKind: "completed",
+					text: "FIRST FINAL",
+					summary: "done",
+					toolConclusion: terminalConclusion,
+				});
+				expect((await db.select().from(toolCalls))[0]?.outputJson).toBe("RECOVERED PARENT RESULT");
+				await db.delete(toolCalls);
+				const missingParent = await engine.commitAgentTerminal({
+					run: first,
+					eventKind: "completed",
+					text: "FIRST FINAL",
+					summary: "done",
+					toolConclusion: terminalConclusion,
+				});
+				expect(missingParent.status).toBe("duplicate");
 				expect(await engine.readAgentTerminalResult(first)).toEqual({
 					output: "FIRST FINAL",
 					sourceResultRef: "message:first-output",
@@ -154,6 +233,7 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 				});
 				await queue.outbox.consumeAwaitedTerminal(first);
 				await db.delete(mailbox);
+				expect(await engine.readRunPublicationState(first)).toEqual({ state: "settled" });
 				expect(await engine.readAgentTerminalResult(first)).toEqual({
 					output: "FIRST FINAL",
 					sourceResultRef: "message:first-output",
@@ -209,6 +289,10 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 					eventKind: "failed",
 					text: "EARLY FAILURE",
 					summary: "failed",
+				});
+				expect(await engine.readRunPublicationState(third)).toEqual({
+					state: "settled",
+					eventKind: "failed",
 				});
 				expect(await engine.readAgentTerminalResult(third)).toEqual({ output: "EARLY FAILURE" });
 				await queue.outbox.consumeAwaitedTerminal(third);
@@ -320,6 +404,89 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 					);
 					await queue.outbox.releaseUnusedRunSlots(atomicFailure);
 				}
+				return "passed";
+			} catch (error) {
+				callbackError = error;
+				throw error;
+			} finally {
+				await client.close();
+			}
+		});
+		if (callbackError) throw callbackError;
+		if (result !== "passed")
+			throw new Error(`PostgreSQL harness failed: ${JSON.stringify(result)}`);
+	},
+	300_000,
+);
+
+(PG_ENABLED ? test : test.skip)(
+	"real PG journal: a task restart adopts an unsettled run and replaces a settled one",
+	async () => {
+		let callbackError: unknown;
+		const result = await withPostgres(async ({ port, credentials }) => {
+			const url = `postgres://${encodeURIComponent(credentials.user)}:${encodeURIComponent(credentials.password)}@127.0.0.1:${port}/nf_harness`;
+			const client = createPostgresClient({ driver: "bun-sql", url });
+			try {
+				const db = client.db;
+				await migrate(db, { migrationsFolder: "drizzle-postgres" } as Parameters<
+					typeof migrate
+				>[1]);
+				const queue = createPostgresRuntimeQueue(db);
+				const engine = createPostgresRuntimePublication(
+					db,
+					queue,
+					{ legacyReaders: new Map() },
+					{ summarize: (text) => text.slice(0, 600), snapshotBytes: 64 * 1024 },
+				);
+				const now = new Date().toISOString();
+				await db.insert(narrators).values([
+					{ id: "parent", createdAt: now, updatedAt: now },
+					{
+						id: "actor",
+						type: "subagent",
+						variant: "subagent:general",
+						parentNarratorId: "parent",
+						status: "idle",
+						createdAt: now,
+						updatedAt: now,
+					},
+				]);
+				const binding = { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } };
+				const restart = async () =>
+					(await engine.startRun({ narratorId: "actor", binding, adoptRegisteredRun: true }))
+						.publication!;
+				const reservedTerminals = async (logicalRunId: string) =>
+					(await db.select().from(outbox).where(eq(outbox.logicalRunId, logicalRunId))).filter(
+						(row) => row.eventKind === "terminal" && row.state === "reserved",
+					);
+				const first = (await engine.startRun({ narratorId: "actor", binding })).publication!;
+				// Unsettled: the restart keeps the run and its single reservation.
+				expect(await restart()).toEqual(first);
+				expect(await reservedTerminals(first.logicalRunId)).toHaveLength(1);
+				// Settled: its terminal spent the slot, so the restart needs a new run.
+				await engine.commitAgentTerminal({
+					run: first,
+					eventKind: "failed",
+					text: "FIRST FAILURE",
+					summary: "failed",
+				});
+				expect(await reservedTerminals(first.logicalRunId)).toHaveLength(0);
+				const second = await restart();
+				expect(second.logicalRunId).not.toBe(first.logicalRunId);
+				expect(await reservedTerminals(second.logicalRunId)).toHaveLength(1);
+				// The new run's terminal commits into its own reservation.
+				expect(
+					(
+						await engine.commitAgentTerminal({
+							run: second,
+							eventKind: "completed",
+							text: "SECOND ANSWER",
+							summary: "done",
+						})
+					).status,
+				).toBe("committed");
+				// No task row is inserted by a restart registration.
+				expect(await db.select().from(backgroundTasks)).toHaveLength(0);
 				return "passed";
 			} catch (error) {
 				callbackError = error;

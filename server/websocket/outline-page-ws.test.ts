@@ -170,6 +170,26 @@ describe("subscribing", () => {
 		expect(JSON.stringify(ws.frames)).not.toContain("A3 body");
 	});
 
+	test("pending changes of a page reach its subscribers as one coalesced frame, ids only (P2 PR 6)", async () => {
+		const ws = socket(reader);
+		await subscribe(ws, "pend", pageA);
+		const other = socket(reader);
+		await subscribe(other, "pend-b", pageB);
+		eventBus.emit({ type: "outline:pending", spaceId: space.id, pageIds: [pageA] });
+		eventBus.emit({ type: "outline:pending", spaceId: space.id, pageIds: [pageA] });
+		// Another space's page id is not this page.
+		eventBus.emit({ type: "outline:pending", spaceId: "another-space", pageIds: [pageB] });
+		await settle(() => ws.frames.length === 2);
+		await quiet();
+		expect(ws.frames[1]).toEqual({
+			type: "outline_page_pending",
+			subscriptionId: "pend",
+			pageId: pageA,
+		});
+		expect(ws.frames).toHaveLength(2);
+		expect(other.frames).toHaveLength(1);
+	});
+
 	test("a page that does not exist and a page one may not read answer alike", async () => {
 		const ws = socket(stranger);
 		await subscribe(ws, "missing", "no-such-page");

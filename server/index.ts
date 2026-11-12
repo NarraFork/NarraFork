@@ -1,12 +1,13 @@
 import { DB_INTEGRITY_WORKER_FLAG } from "./db/integrity-protocol";
+import { DB_SNAPSHOT_WORKER_FLAG } from "./db/snapshot-protocol";
 import { captureManagerTokenFromEnv } from "./lib/manager-token";
 import { neutralizeAmbientProxyEnv } from "./lib/net/proxy-env";
-import { waitForPreviousServerShutdown } from "./lib/restart-handoff";
 import { parseRevealActivation } from "./lib/reveal-protocol";
 import { isCompiledRuntime } from "./lib/runtime-target";
 import { WATCHER_WORKER_FLAG } from "./lib/watcher/worker-protocol";
 import { shouldRunManager } from "./manager/launch-mode";
 import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
+import { FILE_CHANGE_PHYSICAL_AUDIT_WORKER_FLAG } from "./services/file-change-physical-audit";
 
 // Must run before ANY outbound fetch. Bun's fetch honours ambient HTTP(S)_PROXY
 // even when a request explicitly asks for a direct connection, so the ambient
@@ -29,6 +30,13 @@ if (parseRevealActivation(process.argv)) {
 	// Read-only integrity probe subprocess. Must be checked before anything else: importing ./main
 	// (or the watcher worker) would open the database read-write and take the instance lock.
 	await import("./db/integrity-probe-worker");
+} else if (process.argv.includes(DB_SNAPSHOT_WORKER_FLAG)) {
+	// 导出快照构建子进程：只读源库、只写目标库，同样必须在 ./main 之前分流。
+	await import("./db/snapshot-builder-worker");
+} else if (process.argv.includes(FILE_CHANGE_PHYSICAL_AUDIT_WORKER_FLAG)) {
+	// Read-only physical audit stays in its own process, with no application DB,
+	// instance lock or server imports (also when this executable is self-launched).
+	await import("./services/file-change-physical-audit-worker");
 } else if (process.argv.includes(WATCHER_WORKER_FLAG)) {
 	await import("./lib/watcher/parcel-watcher-worker");
 } else if (process.argv.includes(PLUGIN_RUNTIME_WORKER_FLAG)) {
@@ -55,9 +63,14 @@ if (parseRevealActivation(process.argv)) {
 }
 
 async function runServer(): Promise<void> {
+	const { waitForPreviousServerShutdown } = await import("./lib/restart-handoff");
 	const handoffOk = await waitForPreviousServerShutdown();
+	const { exitWithStartupProblem, serve } = await import("./serve");
 	if (!handoffOk) {
-		process.exit(1);
+		// The old server is still up, or nothing proves it is gone: starting now could run this
+		// version on a fallback port next to it. The reason is already on stderr.
+		const { handoffFailed } = await import("./lib/startup-status/startup-problems");
+		await exitWithStartupProblem(handoffFailed());
 	}
-	await import("./main");
+	await serve();
 }

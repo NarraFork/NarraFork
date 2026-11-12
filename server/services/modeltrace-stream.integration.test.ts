@@ -1,8 +1,9 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
 import type { StreamingBlock } from "../../frontend/components/narrator/message/message-segments";
 import { applyStreamingDelta } from "../../frontend/components/narrator/streaming/streaming-delta-fold";
-import { getTestDb } from "../../tests/setup";
+import { getTestDb, readTestMessageContent } from "../../tests/setup";
 import { apiRequests, narratorMessageRefs, narratorMessages, narrators, users } from "../db/schema";
 import {
 	forgetModelTraceRequest,
@@ -14,6 +15,7 @@ const { db, sqlite } = getTestDb();
 const dbStub = {
 	db,
 	sqlite,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
@@ -101,9 +103,9 @@ async function launch() {
 	await retryModelTrace(id, userId);
 }
 async function replies() {
-	return (
-		await db.query.narratorMessages.findMany({ where: eq(narratorMessages.narratorId, id) })
-	).filter((row) => row.role === "assistant");
+	return (await db.query.narratorMessages.findMany({ where: eq(narratorMessages.narratorId, id) }))
+		.filter((row) => row.role === "assistant")
+		.map((row) => ({ ...row, contentJson: readTestMessageContent(sqlite, row.id) }));
 }
 function deltas() {
 	return frames.filter(

@@ -1,0 +1,63 @@
+/* The search page: one column, the query box on top, then a single row of tabs and filters. */
+.page {
+	max-width: 860px;
+	margin-inline: auto;
+	width: 100%;
+}
+
+/* Tabs on the left, filters on the right, one shared bottom line. */
+.toolbar {
+	display: flex;
+	align-items: flex-end;
+	gap: var(--mantine-spacing-xs);
+	flex-wrap: wrap;
+	border-bottom: 1px solid var(--mantine-color-default-border);
+}
+
+.tabs {
+	flex: 1;
+	min-width: 0;
+}
+
+/* The tab list's own line would double the toolbar's. */
+.tabs :global(.mantine-Tabs-list)::before {
+	display: none;
+}
+
+.filters {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	padding-bottom: 4px;
+	flex-wrap: wrap;
+}
+
+/* A result: lifts its border on hover so the whole card reads as one target. */
+.result {
+	transition: border-color 120ms ease;
+}
+
+.result:hover {
+	border-color: var(--mantine-color-default-border-hover, var(--mantine-color-gray-4));
+}
+
+.resultLink:hover .resultTitle,
+.resultTitle:hover {
+	color: var(--mantine-primary-color-filled);
+}
+
+/* One matching message: "who · when" on the left, the excerpt on the right. */
+.hit {
+	display: flex;
+	align-items: baseline;
+	gap: 12px;
+	padding: 4px 8px;
+	margin-inline: -8px;
+	border-radius: var(--mantine-radius-sm);
+	text-decoration: none;
+	color: inherit;
+}
+
+.hit:hover {
+	background: var(--mantine-color-default-hover);
+}

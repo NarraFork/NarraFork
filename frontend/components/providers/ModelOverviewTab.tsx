@@ -36,6 +36,8 @@ export interface ProviderGroup {
 	badgeLabel?: string;
 	models: ModelOption[];
 	disabled: boolean;
+	/** Left out of `auto:<model>` routing (`agent.autoExcludedProviders`, draft). */
+	autoExcluded?: boolean;
 	isPlatform: boolean;
 	/**
 	 * Owning plugin, when this provider comes from an executable plugin rather than a

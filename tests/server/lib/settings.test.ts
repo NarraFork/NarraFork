@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { normalizeAutoContinuationMode } from "../../../server/lib/boolean-override";
+import { getModelOverride, replaceModelOverridesForTests } from "../../../server/lib/model-catalog";
 import { getNarraforkHome } from "../../../server/lib/narrafork-home";
 import {
 	deepMerge,
@@ -9,19 +10,22 @@ import {
 	settings as liveSettings,
 	type McpServerConfig,
 	normalizeMcpServerIds,
+	parseSettingsText,
 	reloadSettings,
 	saveSettings,
 	stripObsoleteSettingsKeys,
 } from "../../../server/lib/settings";
+import { StartupError } from "../../../server/lib/startup-status/startup-error";
 
-const ownWindow = (value: typeof liveSettings, model: string) =>
-	value.agent.modelCatalog?.local.connections?.[model]?.working_context_tokens;
+/** A provider entry's own window, held in the catalog's overrides file. */
+const ownWindow = (model: string) => getModelOverride("connection", model)?.contextWindow;
 
 describe("TokenDance collection persistence", () => {
 	it("initializes legacy connections once and preserves manual choices across save and reload", () => {
 		const path = resolve(getNarraforkHome(), "settings.json");
 		const original = readFileSync(path, "utf8");
 		const snapshot = structuredClone(liveSettings);
+		const restoreOverrides = replaceModelOverridesForTests({});
 		try {
 			const raw = getDefaults();
 			raw.tokendance = { apiKey: "collection-test-key", disabled: false, generation: 4 };
@@ -34,7 +38,8 @@ describe("TokenDance collection persistence", () => {
 			expect(loaded.agent.hiddenModels).toHaveLength(66);
 			expect(loaded.agent.hiddenModels).not.toContain("tokendance:kimi-k3");
 			expect(loaded.agent.hiddenModels).toContain("tokendance:glm-5");
-			expect(ownWindow(loaded, "tokendance:glm-5")).toBe(64000);
+			expect(ownWindow("tokendance:glm-5")).toBe(64000);
+			expect(loaded.agent.modelCatalog).toEqual({ autoUpdate: true });
 			const edited = structuredClone(loaded);
 			edited.agent.hiddenModels = edited.agent.hiddenModels?.filter(
 				(id) => id !== "tokendance:glm-5",
@@ -54,13 +59,14 @@ describe("TokenDance collection persistence", () => {
 			expect(again.agent.hiddenModels).not.toContain("tokendance:glm-5");
 			expect(again.agent.hiddenModels).toContain("tokendance:kimi-k3");
 			expect(again.agent.hiddenModels).not.toContain("tokendance:future-new-model");
-			expect(ownWindow(again, "tokendance:glm-5")).toBe(64000);
+			expect(ownWindow("tokendance:glm-5")).toBe(64000);
 			expect(JSON.parse(readFileSync(path, "utf8")).tokendance.modelCollectionInitialized).toBe(
 				true,
 			);
 		} finally {
 			saveSettings(snapshot);
 			writeFileSync(path, original);
+			restoreOverrides();
 		}
 	});
 
@@ -177,6 +183,55 @@ describe("settings deepMerge", () => {
 	});
 });
 
+describe("stable single-copy block defaults migration", () => {
+	it("defaults to block reads/writes and one body copy", () => {
+		expect(getDefaults().narratorBlocks).toEqual({
+			write: true,
+			read: true,
+			compactJson: true,
+			singleCopyDefaultsVersion: 1,
+			singleCopyBackfillResumeVersion: 0,
+		});
+	});
+
+	it("upgrades persisted rollout switches once without a UI visit and preserves later rollbacks", () => {
+		const path = resolve(getNarraforkHome(), "settings.json");
+		const original = readFileSync(path, "utf8");
+		const snapshot = structuredClone(liveSettings);
+		try {
+			for (const narratorBlocks of [
+				undefined,
+				{ write: true, read: true, compactJson: false },
+				{ write: false, read: false, compactJson: false, singleCopyDefaultsVersion: 0 },
+			]) {
+				writeFileSync(path, JSON.stringify({ ...getDefaults(), narratorBlocks }));
+				expect(reloadSettings().narratorBlocks).toEqual(getDefaults().narratorBlocks);
+				expect(JSON.parse(readFileSync(path, "utf8")).narratorBlocks).toEqual(
+					getDefaults().narratorBlocks,
+				);
+				const migrated = readFileSync(path, "utf8");
+				reloadSettings();
+				expect(readFileSync(path, "utf8")).toBe(migrated);
+			}
+			const rollback = structuredClone(liveSettings);
+			rollback.narratorBlocks.write = false;
+			rollback.narratorBlocks.read = false;
+			rollback.narratorBlocks.compactJson = false;
+			saveSettings(rollback);
+			expect(reloadSettings().narratorBlocks).toEqual({
+				write: false,
+				read: false,
+				compactJson: false,
+				singleCopyDefaultsVersion: 1,
+				singleCopyBackfillResumeVersion: 0,
+			});
+		} finally {
+			saveSettings(snapshot);
+			writeFileSync(path, original);
+		}
+	});
+});
+
 describe("auto-continuation defaults", () => {
 	it("uses protected-only mode when no value has been configured", () => {
 		expect(getDefaults().agent.autoContinuationMode).toBe("protectedOnly");
@@ -265,5 +320,32 @@ describe("stripObsoleteSettingsKeys", () => {
 
 		expect(stripObsoleteSettingsKeys(value)).toBe(false);
 		expect(value).toEqual({ customApiProviders: [] });
+	});
+});
+
+describe("parseSettingsText", () => {
+	it("accepts the comments and trailing commas of a hand-edited file", () => {
+		const text = '{\n\t// moved to 7780\n\t"server": { "port": 7780, },\n\t/* old */\n}';
+		expect(parseSettingsText(text)).toEqual({ server: { port: 7780 } });
+	});
+
+	it("names the file and the reason when it cannot be read", () => {
+		let error: unknown;
+		try {
+			parseSettingsText('{ "server": { "port": 7780 ');
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(StartupError);
+		const { message, command } = (error as StartupError).problem;
+		expect(message.en).toContain("settings.json is not valid JSON");
+		expect(message.en).not.toContain("JSONC Parse error");
+		expect(command).toContain("settings.json");
+	});
+
+	it("rejects a file whose top level is not an object", () => {
+		for (const text of ["[]", "null", "42"]) {
+			expect(() => parseSettingsText(text)).toThrow(/top level must be an object/);
+		}
 	});
 });

@@ -460,3 +460,57 @@ browserTest(
 	},
 	120_000,
 );
+
+browserTest(
+	"what the reader typed only in the expanded view is still in the card after closing it",
+	async () => {
+		const kit = async (path: string) =>
+			path.endsWith("/gen-ui/kit")
+				? Response.json({ status: { state: "builtin", components: [] }, request: null })
+				: null;
+		await withFixturePage(kit, async (page) => {
+			// One bound control, and two the markup left without bind: the reader's input in
+			// those lives only in the frame, yet must reach the card too.
+			const markup = `<Stack>
+			<TextInput id="who" bind="who" />
+			<Textarea id="note" />
+			<Checkbox id="agree" label="Agree" />
+			<Text id="echo">hi {$who}</Text>
+			</Stack>`;
+			await page.evaluate((s) => window.inlineFixture.stream(s, false), markup);
+			const card = (await (
+				await page.waitForSelector('#card iframe[title="Plans"]')
+			)?.contentFrame()) as Frame;
+			await card.waitForSelector("#who");
+
+			const expand = await page.waitForSelector("#card button ::-p-text(Expand)");
+			await expand?.click();
+			const expandedHandle = await page.waitForFunction(() => {
+				const frames = document.querySelectorAll('iframe[title="Plans"]');
+				return frames.length === 2 ? frames[1] : null;
+			});
+			const expanded = (await (
+				expandedHandle.asElement() as unknown as { contentFrame(): Promise<Frame> }
+			).contentFrame()) as Frame;
+			await expanded.waitForSelector("#who");
+			await expanded.type("#who", "Ada");
+			await expanded.type("#note", "first line");
+			await expanded.click("#agree");
+			await expanded.waitForFunction(
+				() => document.getElementById("echo")?.textContent === "hi Ada",
+			);
+
+			await (await page.waitForSelector(".mantine-Modal-close"))?.click();
+			await page.waitForFunction(
+				() => document.querySelectorAll('iframe[title="Plans"]').length === 1,
+			);
+			await card.waitForFunction(() => document.getElementById("echo")?.textContent === "hi Ada");
+			expect(await card.$eval("#who", (node) => (node as HTMLInputElement).value)).toBe("Ada");
+			expect(await card.$eval("#note", (node) => (node as HTMLTextAreaElement).value)).toBe(
+				"first line",
+			);
+			expect(await card.$eval("#agree", (node) => (node as HTMLInputElement).checked)).toBe(true);
+		});
+	},
+	120_000,
+);

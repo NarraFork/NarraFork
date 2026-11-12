@@ -1,16 +1,17 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { Worker } from "node:worker_threads";
 import { blockAssets } from "../../shared/narrator-blocks/plan";
 import type { BlockDraft } from "../../shared/narrator-blocks/storage";
 import { withPostgres } from "../../tests/db/pg-test-harness";
 import { createPrefixSnapshotStore, type PrefixSnapshotStore } from "./narrator-prefix-snapshots";
-import { PrefixSnapshotCache } from "./narrator-prefix-snapshots-worker";
+import { openPrefixSnapshotSqlite } from "./narrator-prefix-snapshots-worker";
 
 const schema = `CREATE TABLE narrator_text_snapshots (
  sha256 TEXT PRIMARY KEY, text TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at TEXT NOT NULL
@@ -48,6 +49,23 @@ async function roundtrip(store: PrefixSnapshotStore) {
 	return { hash, jsonHash };
 }
 
+test("the worker connection does not hold the main database's write lock through an fsync", async () => {
+	// It writes to the main NarraFork database. SQLite's default synchronous=FULL fsyncs the WAL
+	// on every commit while holding the write lock; the main connection runs NORMAL.
+	const { path } = await fixture();
+	const db = openPrefixSnapshotSqlite(path);
+	try {
+		expect(db.query("PRAGMA synchronous").get()).toEqual({ synchronous: 1 });
+		expect(db.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+		expect(db.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 50 });
+	} finally {
+		db.close();
+	}
+	expect(() => openPrefixSnapshotSqlite(`${path}.missing`)).toThrow(
+		"Prefix snapshot database is missing",
+	);
+});
+
 test("content-addressed Unicode text/JSON roundtrip and conflict reuse", async () => {
 	const { store, db } = await fixture();
 	const { jsonHash } = await roundtrip(store);
@@ -79,16 +97,31 @@ test("coalesces concurrent same-object puts, but snapshots later mutations", asy
 	expect(db.query("SELECT count(*) AS n FROM narrator_text_snapshots").get()).toEqual({ n: 2 });
 });
 
-test("cache budget evicts old values; an oversized item is still persisted and readable", async () => {
-	const cache = new PrefixSnapshotCache(600);
-	cache.set("a", "a".repeat(100), 100);
-	cache.set("b", "b".repeat(100), 100);
-	expect(cache.size).toBe(1);
-	expect(cache.get("a")).toBeUndefined();
-	cache.set("large", "x".repeat(10000), 10000);
-	expect(cache.get("large")).toBeUndefined();
-	expect(cache.get("b")).toBe("b".repeat(100));
-	expect(cache.retainedBytes).toBeLessThanOrEqual(600);
+test("text and JSON share one LRU budget and remain separate representations of the same hash", async () => {
+	const { store } = await fixture({ cacheBytes: 700 });
+	const post = spyOn(Worker.prototype, "postMessage");
+	try {
+		const hash = await store.putPrefixJson({ text: "a".repeat(100) });
+		const text = JSON.stringify({ text: "a".repeat(100) });
+		expect(await store.getPrefixText(hash)).toBe(text);
+		const reads = () =>
+			post.mock.calls.filter(([request]) => request.operation === "getText").length;
+		const before = reads();
+		expect(await store.getPrefixText(hash)).toBe(text);
+		expect(reads()).toBe(before);
+		const json = await store.getPrefixJson<{ text: string }>(hash);
+		expect(json.text).toBe("a".repeat(100));
+		expect(Object.isFrozen(json)).toBe(true);
+		// Loading JSON consumes the same budget, evicting text; the worker has no backup cache.
+		expect(await store.getPrefixText(hash)).toBe(text);
+		expect(reads()).toBe(before + 1);
+		expect(await store.getPrefixJson(hash)).toBe(json); // caller-held weak reuse
+	} finally {
+		post.mockRestore();
+	}
+});
+
+test("an oversized item bypasses residency but is still persisted and readable", async () => {
 	const { store } = await fixture({ cacheBytes: 1 });
 	const text = "大".repeat(128 * 1024);
 	const hash = await store.putPrefixText(text);

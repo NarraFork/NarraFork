@@ -25,7 +25,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { measureMessageBubble } from "./measure/measure-message-bubble";
 import {
-	MEASURE_SYSTEM_TEXT_CONSTANTS as c,
+	MEASURE_SYSTEM_TEXT_CONSTANTS as baseline,
 	KIND_CHROME,
 	measureSystemTextCard,
 	systemTextChromeHeight,
@@ -37,6 +37,13 @@ import { renderElement, resolveRenderExtra } from "./render-registry";
 beforeAll(() => {
 	installCanvasStub();
 });
+
+/**
+ * The system-text constants with the xs body line bound to its LIVE value: the exported
+ * one is the bare-Mantine 17, the default setting measures 120% of it (20 — see
+ * LINE_HEIGHT_BASELINE_PERCENT).
+ */
+const c = { ...baseline, BODY_LINE_HEIGHT: 20 };
 
 const WIDTH = 600;
 /** Full detail level, matching segment-adapter.test.ts. */

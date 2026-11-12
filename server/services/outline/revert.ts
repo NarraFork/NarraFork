@@ -67,6 +67,11 @@ export interface OutlineRevertInput {
 	toolCallId?: string | null;
 	/** Default: `revert #seq: <the reverted commit's summary>`. */
 	summary?: string;
+	/**
+	 * Whether the actor may take away someone else's lock (a manager of the space, an admin; the
+	 * caller decides). Without it a revert that would unlock keeps the lock (`lock-kept`).
+	 */
+	unlockAuthority?: () => Promise<boolean>;
 }
 
 export interface OutlineRevertSkip extends OutlineBlockAddressed {
@@ -136,6 +141,7 @@ function taskInput(task: OutlineTaskJson): OutlineTaskInput {
 		humanCreated: task.humanCreated === true,
 		lock: task.lock ?? null,
 		claimable: task.claimable === true,
+		plan: task.plan ?? null,
 	};
 }
 
@@ -412,6 +418,7 @@ class RevertAnalysis {
 						content: before.content ?? "",
 						alias: before.alias,
 						task: before.taskJson ? taskInput(before.taskJson) : null,
+						ask: before.askJson,
 						tags,
 					},
 					t.id,
@@ -446,6 +453,10 @@ class RevertAnalysis {
 					t.id,
 				);
 			}
+			// A question goes back to what it was: an answer reverted reopens it.
+			if (JSON.stringify(before.askJson) !== JSON.stringify(t.meta.askJson)) {
+				push({ op: "update", block: { id: t.id }, ask: before.askJson }, t.id);
+			}
 		}
 		for (const t of topmost) {
 			if (holding.has(t.id)) push({ op: "delete", block: { id: t.id } }, t.id);
@@ -453,6 +464,24 @@ class RevertAnalysis {
 		const changed = [...new Set([...ordered.map((t) => t.id), ...deletes.map((t) => t.id)])];
 		return { ops, opBlocks, changed, skipped: this.skipped, metas: this.metas };
 	}
+}
+
+/**
+ * What reverting a commit would put back now, without writing anything: the blocks it would
+ * change and those it would leave alone. The reports' undo (P2 PR 11) asks this before reverting
+ * a decision, so a decision that can no longer be taken back is refused rather than half undone.
+ */
+export async function previewRevert(
+	commitId: string,
+	options: { store?: OutlineStore } = {},
+): Promise<{ changed: string[]; skipped: string[] }> {
+	const store = options.store ?? outlineStore;
+	const commit = await store.getCommit(commitId);
+	if (!commit) throw new NotFoundError("Outline commit", commitId);
+	const space = await store.getSpace(commit.spaceId);
+	if (!space) throw new NotFoundError("Outline space", commit.spaceId);
+	const plan = await new RevertAnalysis(store, space, commit).run();
+	return { changed: plan.ops.length > 0 ? plan.changed : [], skipped: [...plan.skipped.keys()] };
 }
 
 /**
@@ -514,6 +543,7 @@ async function revertAttempts(
 					messageId: input.messageId ?? null,
 					toolCallId: input.toolCallId ?? null,
 					summary: input.summary ?? OUTLINE_TEXT.revertSummary(commit.seq, commit.summary),
+					...(input.unlockAuthority ? { unlockAuthority: input.unlockAuthority } : {}),
 				},
 				{
 					store,
@@ -552,13 +582,26 @@ async function revertAttempts(
 						)
 					: adjustment.kind === "order-key-moved"
 						? OUTLINE_TEXT.orderKeyMoved(adjustment.wanted)
-						: OUTLINE_TEXT.taskNotStarted,
+						: adjustment.kind === "lock-kept"
+							? OUTLINE_TEXT.lockKept
+							: OUTLINE_TEXT.taskNotStarted,
 		}));
+		// What was put back is what the commit wrote: a lock left as it was (`lock-kept`) may leave
+		// a block, or the whole revert, with nothing written.
+		let changed = written.commit ? plan.changed : [];
+		if (written.commit && notes.some((note) => note.adjustment.kind === "lock-kept")) {
+			const wrote = new Set(
+				(await store.listCommitVersions(written.commit.id, OUTLINE_LIMITS.maxRowsTouched)).map(
+					(v) => v.blockId,
+				),
+			);
+			changed = changed.filter((id) => wrote.has(id));
+		}
 		return {
 			...base,
 			commit: written.commit,
 			pageIds: written.pageIds,
-			changed: plan.changed.map(address),
+			changed: changed.map(address),
 			notes,
 		};
 	}

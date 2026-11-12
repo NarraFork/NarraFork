@@ -337,6 +337,174 @@
 			"when": 1793519539201,
 			"tag": "0047_modeltrace_narrator",
 			"breakpoints": true
+		},
+		{
+			"idx": 48,
+			"version": "7",
+			"when": 1793521234697,
+			"tag": "0048_native_media",
+			"breakpoints": true
+		},
+		{
+			"idx": 49,
+			"version": "7",
+			"when": 1793670527012,
+			"tag": "0049_narrator_task_backend",
+			"breakpoints": true
+		},
+		{
+			"idx": 50,
+			"version": "7",
+			"when": 1793674223178,
+			"tag": "0050_outline_pending",
+			"breakpoints": true
+		},
+		{
+			"idx": 51,
+			"version": "7",
+			"when": 1793696854801,
+			"tag": "0051_reply_context",
+			"breakpoints": true
+		},
+		{
+			"idx": 52,
+			"version": "7",
+			"when": 1793725029260,
+			"tag": "0052_outline_task_board",
+			"breakpoints": true
+		},
+		{
+			"idx": 53,
+			"version": "7",
+			"when": 1793787558508,
+			"tag": "0053_api_request_decode_ms",
+			"breakpoints": true
+		},
+		{
+			"idx": 54,
+			"version": "7",
+			"when": 1793792477124,
+			"tag": "0054_outline_questions",
+			"breakpoints": true
+		},
+		{
+			"idx": 55,
+			"version": "7",
+			"when": 1793793849097,
+			"tag": "0055_narrator_line_height_v2",
+			"breakpoints": true
+		},
+		{
+			"idx": 56,
+			"version": "7",
+			"when": 1793797130233,
+			"tag": "0056_recent_tab_folders",
+			"breakpoints": true
+		},
+		{
+			"idx": 57,
+			"version": "7",
+			"when": 1793966431473,
+			"tag": "0057_outline_digests",
+			"breakpoints": true
+		},
+		{
+			"idx": 58,
+			"version": "7",
+			"when": 1793990635878,
+			"tag": "0058_outline_task_seen",
+			"breakpoints": true
+		},
+		{
+			"idx": 59,
+			"version": "7",
+			"when": 1794043084247,
+			"tag": "0059_usage_daily",
+			"breakpoints": true
+		},
+		{
+			"idx": 60,
+			"version": "7",
+			"when": 1794130719061,
+			"tag": "0060_add-question-reflection-override",
+			"breakpoints": true
+		},
+		{
+			"idx": 61,
+			"version": "7",
+			"when": 1794134144250,
+			"tag": "0061_submission_author_read",
+			"breakpoints": true
+		},
+		{
+			"idx": 62,
+			"version": "7",
+			"when": 1794136142791,
+			"tag": "0062_narrator_workspace_directories",
+			"breakpoints": true
+		},
+		{
+			"idx": 63,
+			"version": "7",
+			"when": 1794137358287,
+			"tag": "0063_folder-git-identity-bindings",
+			"breakpoints": true
+		},
+		{
+			"idx": 64,
+			"version": "7",
+			"when": 1794138790612,
+			"tag": "0064_recent-tab-archive-marks",
+			"breakpoints": true
+		},
+		{
+			"idx": 65,
+			"version": "7",
+			"when": 1794149533236,
+			"tag": "0065_workspace-auto-title",
+			"breakpoints": true
+		},
+		{
+			"idx": 66,
+			"version": "7",
+			"when": 1794151608019,
+			"tag": "0066_workspace-outline-title-invalidation",
+			"breakpoints": true
+		},
+		{
+			"idx": 67,
+			"version": "7",
+			"when": 1794283712715,
+			"tag": "0067_recent_tabs_show_directory",
+			"breakpoints": true
+		},
+		{
+			"idx": 68,
+			"version": "7",
+			"when": 1794325379040,
+			"tag": "0068_narrator_status_and_list_indexes",
+			"breakpoints": true
+		},
+		{
+			"idx": 69,
+			"version": "7",
+			"when": 1794332183087,
+			"tag": "0069_compact_auxiliary_content",
+			"breakpoints": true
+		},
+		{
+			"idx": 70,
+			"version": "7",
+			"when": 1794365828817,
+			"tag": "0070_outline_view_state_expanded",
+			"breakpoints": true
+		},
+		{
+			"idx": 71,
+			"version": "7",
+			"when": 1794444527008,
+			"tag": "0071_context_memories",
+			"breakpoints": true
 		}
   ]
 }

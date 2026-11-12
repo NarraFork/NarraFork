@@ -7,6 +7,7 @@ import {
 	renderContextUpdate,
 	renderPrefixPrompt,
 } from "./prefix-context";
+import { serializeWorkspaceContext, type WorkspaceContext } from "./workspace-context";
 
 describe("named prefix replacements", () => {
 	test("empty is a value, null removes, and omitted unchanged sections survive", () => {
@@ -104,6 +105,69 @@ describe("named prefix replacements", () => {
 			{ ...record, changes: [{ key: "x", value: false }] },
 		]) {
 			expect(contextUpdateOf(invalid)).toBeUndefined();
+		}
+	});
+});
+
+describe("workspace context serialization", () => {
+	const workspace: WorkspaceContext = {
+		revision: 1,
+		deviceId: "local",
+		cwd: "/repo/中文 path ",
+		pathFlavor: "posix",
+		contextKey: "context",
+		contextProjectId: "project",
+		git: {
+			workspaceKey: "workspace",
+			repositoryKey: "repository",
+			rootPath: "/repo",
+			repositoryPath: "/repo/.git",
+		},
+		capabilities: { switchDirectory: false, reason: "read only" },
+	};
+
+	test("top-level and nested key order cannot publish a phantom workspace change", () => {
+		const reordered: WorkspaceContext = {
+			...Object.fromEntries(Object.entries(workspace).reverse()),
+			git: {
+				rootPath: "/repo",
+				repositoryPath: "/repo/.git",
+				workspaceKey: "workspace",
+				repositoryKey: "repository",
+			},
+			capabilities: { reason: "read only", switchDirectory: false },
+		} as WorkspaceContext;
+		const original = JSON.stringify(workspace);
+		const before = serializeWorkspaceContext(workspace);
+		const after = serializeWorkspaceContext(reordered);
+		expect(after).toBe(before);
+		expect(JSON.parse(after)).toEqual(workspace);
+		expect(JSON.stringify(workspace)).toBe(original);
+		expect(
+			contextChanges(new Map([["workspace", before]]), [{ key: "workspace", text: after }]),
+		).toEqual([]);
+	});
+
+	test("real field changes, optional removals and meaningful path whitespace remain visible", () => {
+		const state = new Map([["workspace", serializeWorkspaceContext(workspace)]]);
+		const git = workspace.git;
+		if (!git) throw new Error("Expected fixture Git metadata");
+		const variants: WorkspaceContext[] = [
+			{ ...workspace, revision: 2 },
+			{ ...workspace, cwd: workspace.cwd.trim() },
+			{ ...workspace, deviceId: "remote" },
+			{ ...workspace, pathFlavor: "windows" },
+			{ ...workspace, contextKey: "new-context" },
+			{ ...workspace, contextProjectId: undefined },
+			{ ...workspace, git: undefined },
+			{ ...workspace, git: { ...git, repositoryPath: "/other/.git" } },
+			{ ...workspace, capabilities: { switchDirectory: true } },
+		];
+		for (const current of variants) {
+			const text = serializeWorkspaceContext(current);
+			expect(contextChanges(state, [{ key: "workspace", text }])).toEqual([
+				{ key: "workspace", value: text },
+			]);
 		}
 	});
 });

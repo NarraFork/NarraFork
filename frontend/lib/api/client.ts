@@ -1,5 +1,6 @@
 import { apiUrl } from "@frontend/lib/base-path";
 import { isSessionInvalidResponse } from "@shared/session-auth";
+import { leaveForStartupPageIfStarting } from "../pwa";
 
 /**
  * The API root, resolved against the app's mount prefix.
@@ -132,7 +133,9 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
 	if (token && !headers.has("Authorization")) {
 		headers.set("Authorization", `Bearer ${token}`);
 	}
-	return fetch(input, { ...init, headers });
+	const response = await fetch(input, { ...init, headers });
+	leaveForStartupPageIfStarting(response);
+	return response;
 }
 
 /**
@@ -346,6 +349,7 @@ export async function request<T>(
 		headers.Authorization = `Bearer ${token}`;
 	}
 	const response = await fetch(apiUrl(path), { ...fetchOptions, headers });
+	leaveForStartupPageIfStarting(response);
 	// Apply the same byte budget before parsing either success or error bodies.
 	const boundedText =
 		maxResponseBytes == null
@@ -396,23 +400,17 @@ function parseRawHeaders(raw: string): Headers {
 	return headers;
 }
 
-/**
- * POST a FormData body while reporting upload progress. `fetch` cannot surface
- * upload progress, so this uses XMLHttpRequest and rebuilds a standard
- * `Response` from the result — callers keep using `readFetchError` / `res.json()`
- * exactly as they would with `fetch`. Network errors / timeouts / aborts reject.
- *
- * The Content-Type is intentionally left unset so the browser adds the multipart
- * boundary automatically; do not pass a Content-Type header here.
- */
-export function postFormDataWithProgress(
+interface UploadProgressOptions {
+	headers?: Record<string, string>;
+	onProgress?: (fraction: number) => void;
+	signal?: AbortSignal;
+}
+
+/** XHR exposes upload progress; return a standard Response for API error handling. */
+function postWithProgress(
 	url: string,
-	formData: FormData,
-	options?: {
-		headers?: Record<string, string>;
-		onProgress?: (fraction: number) => void;
-		signal?: AbortSignal;
-	},
+	body: Blob | FormData,
+	options?: UploadProgressOptions,
 ): Promise<Response> {
 	return new Promise((resolve, reject) => {
 		const signal = options?.signal;
@@ -427,7 +425,7 @@ export function postFormDataWithProgress(
 		if (options?.headers) {
 			for (const [key, value] of Object.entries(options.headers)) {
 				// Skip Content-Type so the browser sets the multipart boundary.
-				if (key.toLowerCase() === "content-type") continue;
+				if (body instanceof FormData && key.toLowerCase() === "content-type") continue;
 				xhr.setRequestHeader(key, value);
 			}
 		}
@@ -467,8 +465,26 @@ export function postFormDataWithProgress(
 			reject(new ApiError("Upload cancelled", 0, { code: "UPLOAD_ABORTED" }));
 		};
 
-		xhr.send(formData);
+		xhr.send(body);
 	});
+}
+
+/** Let the browser choose the multipart Content-Type and boundary. */
+export function postFormDataWithProgress(
+	url: string,
+	formData: FormData,
+	options?: UploadProgressOptions,
+): Promise<Response> {
+	return postWithProgress(url, formData, options);
+}
+
+/** Raw attachments retain the caller's Content-Type. */
+export function postBodyWithProgress(
+	url: string,
+	body: Blob,
+	options?: UploadProgressOptions,
+): Promise<Response> {
+	return postWithProgress(url, body, options);
 }
 
 /**

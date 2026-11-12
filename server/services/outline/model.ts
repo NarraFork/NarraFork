@@ -23,9 +23,27 @@
  *      transaction as the rows it writes. Nothing writes outline rows outside a commit, so a
  *      writer that planned against an older counter value knows the space changed under it.
  */
-import type { OutlineTaskActorRef, OutlineTaskJson, OutlineTaskLockJson } from "@server/db/schema";
+import type {
+	OutlineAskAnswerJson,
+	OutlineAskJson,
+	OutlinePendingDeciderJson,
+	OutlinePendingRequesterJson,
+	OutlineTaskActorRef,
+	OutlineTaskJson,
+	OutlineTaskLockJson,
+	OutlineTaskPlanJson,
+} from "@server/db/schema";
 
-export type { OutlineTaskActorRef, OutlineTaskJson, OutlineTaskLockJson };
+export type {
+	OutlineAskAnswerJson,
+	OutlineAskJson,
+	OutlinePendingDeciderJson,
+	OutlinePendingRequesterJson,
+	OutlineTaskActorRef,
+	OutlineTaskJson,
+	OutlineTaskLockJson,
+	OutlineTaskPlanJson,
+};
 
 /** What a version changed relative to the previous one. A bitmask: several can be set. */
 export const OUTLINE_CHANGE = {
@@ -51,6 +69,8 @@ export const OUTLINE_CHANGE = {
 	 * together with what the write changed.
 	 */
 	MERGE: 256,
+	/** Its question (`ask_json`: asked, answered, withdrawn) changed. */
+	ASK: 512,
 } as const;
 
 export type OutlineChangeFlag = (typeof OUTLINE_CHANGE)[keyof typeof OUTLINE_CHANGE];
@@ -62,8 +82,39 @@ export type OutlineSpaceKind = (typeof OUTLINE_SPACE_KINDS)[number];
 export const OUTLINE_ACTOR_KINDS = ["human", "agent", "system"] as const;
 export type OutlineActorKind = (typeof OUTLINE_ACTOR_KINDS)[number];
 
-/** `edit` is every ordinary write; `revert` and `import` are written by their own paths. */
-export const OUTLINE_COMMIT_KINDS = ["edit", "revert", "import"] as const;
+/**
+ * The alias of a session's behavior page (outline plan PR 4, decision D43): the page of its
+ * session space holding the person's standing rules, which the system keeps in the session's
+ * context. People and plugins write it; an agent only under the one-shot grant of a user turn
+ * (`OutlineWriteOptions.agentBehaviorGrant`). Reserved in session spaces only.
+ */
+export const OUTLINE_BEHAVIOR_ALIAS = "behavior";
+
+/**
+ * The alias of a session's task page (outline P2 PR 5): the page of its session space where
+ * `/goal` and the task board add a person's tasks. People and the system give, take and move it
+ * freely; an agent may write under it (the steps it adds under a goal live there) but not give or
+ * take the alias, nor move or delete the page (review round 1, trade-off 2), so later goals land
+ * where people put them. Reserved in session spaces only.
+ */
+export const OUTLINE_TASKS_PAGE_ALIAS = "tasks";
+
+/**
+ * `edit` is every ordinary write; `revert` and `import` are written by their own paths; `confirm`
+ * is a pending change taking effect (`pending.ts`): its actor is the proposer, its responsible
+ * person the decider's; `answer` is a person's answer to questions (`questions.ts`), written as
+ * that person (or relayed by the asking session, the person still responsible); `plan` is a plan
+ * entering planning, returned or approved (`plans.ts`, outline P2 PR 8): a marker on the
+ * timeline, written like an `edit`.
+ */
+export const OUTLINE_COMMIT_KINDS = [
+	"edit",
+	"revert",
+	"import",
+	"confirm",
+	"answer",
+	"plan",
+] as const;
 export type OutlineCommitKind = (typeof OUTLINE_COMMIT_KINDS)[number];
 
 /**
@@ -135,4 +186,45 @@ export const OUTLINE_TASK_IDLE_LEASE_MS = 24 * 60 * 60_000;
 /** The end of a lease taken or renewed at `now` (ISO time): a running session's by default. */
 export function outlineLeaseEnd(now: string, leaseMs: number = OUTLINE_TASK_LEASE.leaseMs): string {
 	return new Date(Date.parse(now) + leaseMs).toISOString();
+}
+
+/** What a pending change is (design §2.6); P2 has only the locked plan's row. */
+export const OUTLINE_PENDING_KINDS = ["locked_plan"] as const;
+export type OutlinePendingKind = (typeof OUTLINE_PENDING_KINDS)[number];
+
+export const OUTLINE_PENDING_STATUSES = ["open", "confirmed", "rejected", "withdrawn"] as const;
+export type OutlinePendingStatus = (typeof OUTLINE_PENDING_STATUSES)[number];
+
+/** Limits of pending changes (`pending.ts`). */
+export const OUTLINE_PENDING_LIMITS = {
+	/** Open pending changes on one page; a proposal past it is refused. */
+	openPerPage: 100,
+	/** Operations one pending change holds, merges included. */
+	maxOps: OUTLINE_LIMITS.maxOps,
+	/** UTF-8 bytes of content one pending change holds: what one transaction may carry. */
+	maxContentBytes: OUTLINE_LIMITS.maxTransactionBodyBytes,
+	/** UTF-8 bytes of a pending change's stored operations. */
+	maxOpsBytes: 256 * 1024,
+	/** Characters of a rejection's reason. */
+	maxReasonChars: 500,
+	/** Open pending changes of a space one wait derivation or reference check reads. */
+	scanPerSpace: 500,
+	/** Blocks a pending change's diff shows, and UTF-8 bytes of each text in it. */
+	diffBlocks: 50,
+	diffTextBytes: 16 * 1024,
+	/** Rows one diff reads checking the subtrees of the deletes it shows (past it: unchecked). */
+	diffSubtreeRows: OUTLINE_LIMITS.maxRowsTouched,
+	/** Unreported decisions one read shows. */
+	reportsPerRead: 10,
+} as const;
+
+/** How a pending change is named to people and agents: `P` and its id (8 characters). */
+export function outlinePendingLabel(id: string): string {
+	return `P${id}`;
+}
+
+/** The id a pending change's label (`P` and 8 characters) names, or null. */
+export function outlinePendingIdOf(label: string): string | null {
+	const m = /^P([A-Za-z0-9]{8})$/.exec(label.trim());
+	return m ? (m[1] as string) : null;
 }

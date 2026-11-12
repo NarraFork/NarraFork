@@ -15,6 +15,7 @@ import {
 } from "@shared/external/message-detail";
 import { normalizeLocale } from "@shared/i18n-locales";
 import { formatOriginLabel } from "@shared/message-origin";
+import { clearedToolOutputSql } from "@shared/narrator-blocks/retention";
 import {
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
 	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
@@ -1079,6 +1080,9 @@ export async function provisionExternalNarrator(
 				// surface itself keeps authorizing purely on the integration binding —
 				// `requireOwnedExternalNarrator` is unchanged and does not consult this.
 				ownerUserId: ctx.userId,
+				// Externally provisioned sessions are not offered the outline tools, so their
+				// tasks stay in Dynamic Spec, which their clients already drive.
+				taskBackend: "spec",
 			});
 			const committed = db.transaction((tx) => {
 				const narrator = createPreparedNarratorInTransaction(tx, prepared);
@@ -1343,6 +1347,8 @@ export const externalReasoningScan = {
 	findUnscannableReasoningMessages,
 } as const;
 
+const CLEARED_EXTERNAL_TOOL_SQL = sql.raw(clearedToolOutputSql("narrator_tool_calls.output_json"));
+
 /** SQL projection of the whitelisted short input keys; never selects `input_json`. */
 function externalToolTargetSql(): SQL<string | null> {
 	const pairs: SQL[] = [];
@@ -1352,6 +1358,7 @@ function externalToolTargetSql(): SQL<string | null> {
 		);
 	}
 	return sql<string | null>`CASE
+		WHEN ${CLEARED_EXTERNAL_TOOL_SQL} THEN NULL
 		WHEN ${narratorToolCalls.inputJson} IS NOT NULL
 			AND octet_length(${narratorToolCalls.inputJson}) <= ${MAX_SUBAGENT_SUMMARY_INPUT_BYTES}
 			AND json_valid(${narratorToolCalls.inputJson})
@@ -1384,7 +1391,9 @@ async function loadExternalToolRows(
 			durationMs: narratorToolCalls.durationMs,
 			errorMessage: narratorToolCalls.errorMessage,
 			createdAt: narratorToolCalls.createdAt,
-			inputBytes: sql<number | null>`octet_length(${narratorToolCalls.inputJson})`.as(
+			inputBytes: sql<
+				number | null
+			>`CASE WHEN ${CLEARED_EXTERNAL_TOOL_SQL} THEN NULL ELSE octet_length(${narratorToolCalls.inputJson}) END`.as(
 				"input_bytes",
 			),
 			outputBytes: sql<number | null>`octet_length(${narratorToolCalls.outputJson})`.as(
@@ -1397,7 +1406,7 @@ async function loadExternalToolRows(
 			inputJson: wantPayloads
 				? sql<
 						string | null
-					>`CASE WHEN octet_length(${narratorToolCalls.inputJson}) <= ${EXTERNAL_TOOL_PAYLOAD_SELECT_MAX_BYTES} THEN ${narratorToolCalls.inputJson} END`.as(
+					>`CASE WHEN ${CLEARED_EXTERNAL_TOOL_SQL} THEN NULL WHEN octet_length(${narratorToolCalls.inputJson}) <= ${EXTERNAL_TOOL_PAYLOAD_SELECT_MAX_BYTES} THEN ${narratorToolCalls.inputJson} END`.as(
 						"input_payload",
 					)
 				: sql<string | null>`NULL`.as("input_payload"),

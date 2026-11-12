@@ -13,12 +13,10 @@ import {
 	type RawMetadata,
 	validateRawMetadata,
 } from "@shared/model-catalog/card";
-import { normalizeRawLocalState } from "@shared/model-catalog/card-local";
 import type {
 	MatchRules,
 	MetadataSource,
 	RawCatalog,
-	RawLocalState,
 	RawModel,
 } from "@shared/model-catalog/schema/catalog";
 import { validateRawCatalog } from "@shared/model-catalog/src/validation";
@@ -153,28 +151,25 @@ function status(value: string | undefined): RawModel["status"] {
 	return value as RawModel["status"];
 }
 
-/** Migration provenance recorded old field paths; it names raw keys from now on. */
-function legacyFieldPath(path: string): string {
-	if (path === "limits.contextWindow") return "working_context_tokens";
-	if (path.startsWith("referencePricing.longContext"))
-		return path.replace("referencePricing.longContext", "reference_pricing_long_context");
-	if (path === "referencePricing.currency") return "currency";
-	return groupedKeys[path] ?? path;
+/** The raw local layer settings.json held before overrides moved to their own file. */
+export interface RawLocalLayer {
+	overrides?: Array<{ target: string; targetId: string; metadata: RawMetadata }>;
+	connections?: Record<string, RawMetadata>;
+	bindings?: Array<{
+		id: string;
+		providerId?: string;
+		upstreamModelId: string;
+		overrides?: RawMetadata;
+	}>;
+	models?: unknown[];
+	variants?: unknown[];
 }
 
-export function legacyLocalToRaw(local: LegacyLocalState): RawLocalState {
-	return normalizeRawLocalState({
-		...structuredClone(local),
-		...(local.legacyFields
-			? {
-					legacyFields: Object.fromEntries(
-						Object.entries(local.legacyFields).map(([key, paths]) => [
-							key,
-							[...new Set(paths.map(legacyFieldPath))],
-						]),
-					),
-				}
-			: {}),
+export function legacyLocalToRaw(local: LegacyLocalState): RawLocalLayer {
+	return {
+		connections: structuredClone(
+			(local as { connections?: Record<string, RawMetadata> }).connections,
+		),
 		models: local.models?.map(({ metadata, rawMetadata, ...entry }) => ({
 			...structuredClone(entry),
 			status: status(entry.status),
@@ -197,7 +192,7 @@ export function legacyLocalToRaw(local: LegacyLocalState): RawLocalState {
 			...structuredClone(entry),
 			metadata: entryMetadata({ metadata, rawMetadata }, true),
 		})),
-	});
+	} as RawLocalLayer;
 }
 
 /** Catalog snapshots cached by an older binary. Without kept originals, values convert as-is. */
@@ -255,30 +250,4 @@ export function legacyCardMetadata(card: LegacyModelCard): RawMetadata {
 }
 
 /** How builds before provider-model overrides stored a provider-page window: a binding. */
-const WINDOW_BINDING_PREFIX = "legacy-window:";
-
-/**
- * Move provider-page window bindings (`legacy-window:<model value>`) into the per-provider
- * layer they always stood for, keyed by the same model value. Their selector and pinned
- * identity are dropped: that layer applies by name. Returns the input when there is
- * nothing to move. Expects a normalized local state (binding overrides already folded).
- */
-export function liftWindowBindings(local: RawLocalState): RawLocalState {
-	const lifted = (local.bindings ?? []).filter((b) => b.id.startsWith(WINDOW_BINDING_PREFIX));
-	if (!lifted.length) return local;
-	const next = structuredClone(local);
-	next.bindings = next.bindings?.filter((b) => !b.id.startsWith(WINDOW_BINDING_PREFIX));
-	for (const binding of lifted) {
-		const model = binding.id.slice(WINDOW_BINDING_PREFIX.length).trim();
-		const origins = next.legacyFields?.[`binding:${binding.id}`];
-		if (next.legacyFields) delete next.legacyFields[`binding:${binding.id}`];
-		if (!model || !binding.overrides || !Object.keys(binding.overrides).length) continue;
-		next.connections = {
-			...next.connections,
-			[model]: { ...next.connections?.[model], ...binding.overrides },
-		};
-		if (origins?.length)
-			next.legacyFields = { ...next.legacyFields, [`connection:${model}`]: origins };
-	}
-	return normalizeRawLocalState(next);
-}
+export const WINDOW_BINDING_PREFIX = "legacy-window:";

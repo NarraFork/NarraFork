@@ -29,6 +29,14 @@
  * the event loop: an access change meanwhile makes them start again (`stableAnswer`), so they
  * never show what the session may no longer read.
  *
+ * CHANGES WAITING FOR CONFIRMATION
+ * --------------------------------
+ * A current read of a page with open pending changes (a locked plan, design §2.6) shows this
+ * session's own changes laid over the outline, its version, and others' as marks on the blocks
+ * they touch (`pending-overlay.ts`, owner decision Q1). Changes waiting for this session's
+ * confirmation (it is the locker's delegate) are listed after the outline, and so is, once, each
+ * decision on this session's own changes on the page it has not been told of.
+ *
  * The output is bounded by the read's budget, so the agent loop must not cut it again (its cut
  * keeps the tail and would lose the top of the outline).
  */
@@ -36,6 +44,14 @@ import { blockTitle, serializeMarkdownOutline, TASK_BOX } from "@shared/outline"
 import { type OutlineAgentScope, type OutlineSpaceWord, spaceRootName } from "./agent-scope";
 import { LINK_DISPLAY_LIMITS, linkTitles, withLinkTitles } from "./link-display";
 import { OUTLINE_LISTED_NAMES, OUTLINE_TOOL_TEXT } from "./messages";
+import { OUTLINE_PENDING_LIMITS, outlinePendingLabel } from "./model";
+import { mergeProposal, pendingNames, takePendingReports, withCurrentDeciders } from "./pending";
+import { PENDING_WITHDRAW } from "./pending-hold";
+import {
+	type OutlineOwnPending,
+	type OutlinePendingOverlay,
+	pendingOverlay,
+} from "./pending-overlay";
 import { commitSeqAt, loadBodiesWithin, readOutline } from "./read";
 import { recordOutlineReads } from "./read-ledger";
 import {
@@ -50,7 +66,7 @@ import {
 import type { OutlineResolvedBlock } from "./resolve";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "./search";
 import { sessionScopeEpoch, yieldToEventLoop } from "./session-scope";
-import type { OutlineBlockMeta, OutlineSpaceRow } from "./store/port";
+import type { OutlineBlockMeta, OutlinePendingHead, OutlineSpaceRow } from "./store/port";
 import type { OutlinePageListRow, OutlineStructureRow } from "./store/read-port";
 import { buildTree, type OutlineNode, type OutlineView } from "./tree";
 
@@ -206,6 +222,7 @@ function pageNode(meta: OutlineBlockMeta): OutlineNode {
 		orderKey: meta.orderKey,
 		alias: meta.alias,
 		task: meta.taskJson,
+		ask: meta.askJson,
 		versionSeq: meta.versionSeq,
 		parent: null,
 		children: [],
@@ -713,6 +730,7 @@ export async function outlineRead(
 	}
 	const seen = new Map<string, number>();
 	const label = scope.labelIn(space);
+	const pending = asOf === undefined ? await pendingForRead(scope, block.pageId) : null;
 	const result = await readOutline({
 		blockId: block.id,
 		view: input.view,
@@ -720,6 +738,7 @@ export async function outlineRead(
 		asOf,
 		label: (node) => label(node.sid),
 		display: displayFor(scope, seen),
+		...(pending?.overlay ? { overlay: pending.overlay } : {}),
 	});
 	if (!result) {
 		return {
@@ -732,11 +751,13 @@ export async function outlineRead(
 		};
 	}
 	if (result.current) {
+		// Blocks a pending change of this session adds are shown but not stored: not read.
+		const added = pending?.overlay?.added;
 		recordOutlineReads(
 			scope.narratorId,
 			result.blockIds.flatMap((id) => {
 				const version = seen.get(id);
-				return version === undefined ? [] : [[id, version] as const];
+				return version === undefined || added?.has(id) ? [] : [[id, version] as const];
 			}),
 		);
 	}
@@ -748,7 +769,8 @@ export async function outlineRead(
 			result.current ? null : result.seq,
 		),
 	);
-	const output = `${header}\n${result.markdown}`;
+	const notes = result.current ? (pending?.notes ?? []).map(note) : [];
+	const output = [header, result.markdown, ...notes].join("\n");
 	return {
 		output,
 		title: `OutlineRead: ${clip(blockTitle(block.title), 60) || block.address}`,
@@ -765,7 +787,122 @@ export async function outlineRead(
 			hiddenByView: result.hiddenByView,
 			truncated: result.truncated,
 			...(result.current ? {} : { asOf: result.seq }),
+			// For the reader's card, never the model's text: the block by its title, where it sits,
+			// and the space by its name.
+			title: clip(blockTitle(block.title), 80),
+			// The titles as they are (an untitled block's is empty: the card words it in the
+			// reader's language, not the model's "(untitled)").
+			path: result.path.slice(-6).map((p) => clip(p.title, 40)),
+			display: { v: 1, space: await scope.spaceDisplay(space) },
 		},
+	};
+}
+
+/**
+ * The open changes of a page as a read of this session shows them (the module header): its own
+ * laid over, others' marked, those waiting for its confirmation and its decided ones listed.
+ * Null when the page has none of either.
+ */
+async function pendingForRead(
+	scope: OutlineAgentScope,
+	pageId: string,
+): Promise<{ overlay: OutlinePendingOverlay | null; notes: string[] } | null> {
+	const session = scope.rootNarratorId ?? scope.narratorId;
+	const store = scope.store;
+	// Heads only (review S-7): the operations of this session's own changes are read below.
+	const heads = await store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerPage);
+	const reports = await takePendingReports(session, { store, pageId });
+	if (heads.length === 0 && reports.length === 0) return null;
+	// Who decides each change is the lock as it is now (review S-8).
+	const rows = await withCurrentDeciders(heads, { store });
+	const names = await pendingNames([...rows, ...reports]);
+	// Sessions are named by title only when this session may read them (review S-5).
+	const titles = await scope.readableTitles(names.narrators);
+	const text = OUTLINE_TOOL_TEXT.pending;
+	const sessionName = (id: string) => text.deciderSession(titles.get(id) ?? null, id);
+	const actorName = (ref: { kind: string; id: string }) =>
+		ref.kind === "human"
+			? text.deciderPerson(names.users.get(ref.id) ?? null, ref.id)
+			: sessionName(ref.id);
+	const deciderOf = (row: OutlinePendingHead) => {
+		const by = actorName(row.deciderJson.by);
+		return row.deciderJson.delegate
+			? text.deciderEither(by, sessionName(row.deciderJson.delegate))
+			: by;
+	};
+	const labeled = (row: OutlinePendingHead) => ({
+		row,
+		label: outlinePendingLabel(row.id),
+		decider: deciderOf(row),
+	});
+	const others = rows.filter((r) => r.requesterSession !== session);
+	// This session's own changes whole, laid over the blocks as they are now (review S-2).
+	const ownIds = new Set(rows.filter((r) => r.requesterSession === session).map((r) => r.id));
+	const deciderById = new Map(rows.map((r) => [r.id, r.deciderJson]));
+	const own: OutlineOwnPending[] = [];
+	if (ownIds.size > 0) {
+		for (const whole of await store.getPending([...ownIds])) {
+			if (whole.status !== "open") continue;
+			const row = { ...whole, deciderJson: deciderById.get(whole.id) ?? whole.deciderJson };
+			own.push({ ...labeled(row), row, merges: await mergeProposal(store, row) });
+		}
+	}
+	const notes: string[] = own.map(({ label, decider, merges }) => {
+		const states = [...merges.values()].map((m) => m.state);
+		return text.yours(
+			label,
+			decider,
+			states.includes("conflict") ? "conflict" : states.includes("merged") ? "merged" : "none",
+		);
+	});
+	// Changes this session decides: it is the session the locker named (or its subagent).
+	const delegates = [
+		...new Set(others.flatMap((r) => (r.deciderJson.delegate ? [r.deciderJson.delegate] : []))),
+	];
+	if (delegates.length > 0) {
+		const roots = await store.getNarratorRoots(delegates);
+		for (const row of others) {
+			const delegate = row.deciderJson.delegate;
+			if (!delegate || (roots.get(delegate)?.root ?? delegate) !== session) continue;
+			notes.push(
+				text.forYou(
+					outlinePendingLabel(row.id),
+					row.summary || text.summaryOf(row.opCount),
+					row.requesterSession ? sessionName(row.requesterSession) : actorName(row.requestedByJson),
+				),
+			);
+		}
+	}
+	for (const row of reports) {
+		const label = outlinePendingLabel(row.id);
+		const by = row.decidedByJson ? actorName(row.decidedByJson) : OUTLINE_TOOL_TEXT.edit.someone;
+		if (row.status === "confirmed") {
+			const seq = row.decisionCommitId
+				? ((await store.getCommit(row.decisionCommitId))?.seq ?? null)
+				: null;
+			notes.push(text.reportConfirmed(label, by, seq));
+		} else if (row.status === "rejected") notes.push(text.reportRejected(label, by, row.reason));
+		else
+			notes.push(
+				text.reportWithdrawn(
+					label,
+					row.reason === PENDING_WITHDRAW.deleted ? text.whyDeleted : text.whyUnlocked,
+				),
+			);
+	}
+	return {
+		overlay: pendingOverlay({
+			own,
+			others: others.map(labeled),
+			text: {
+				own: text.markOwn,
+				ownDeleted: text.markOwnDeleted,
+				other: text.markOther,
+				ownMerged: text.markOwnMerged,
+				ownConflict: text.markOwnConflict,
+			},
+		}),
+		notes,
 	};
 }
 

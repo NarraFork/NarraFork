@@ -12,12 +12,14 @@ import {
 	exitPlanConfirmAndCompactTool,
 	exitPlanConfirmTool,
 	exitPlanReviseTool,
+	planReviewTool,
 } from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
 import { genUiTool } from "./gen-ui";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { hookAdminTool } from "./hook-admin";
+import { imageGenTool } from "./image-gen";
 import { knowledgeLibraryTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
 import { knowledgeAdminTool } from "./knowledge-admin";
 import { knowledgeCreateTool, knowledgeEditTool } from "./knowledge-edit";
@@ -26,7 +28,7 @@ import { learningGuideTool } from "./learning-guide";
 import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { notificationTool } from "./notification";
-import { outlineEditTool, outlineReadTool, outlineSearchTool } from "./outline";
+import { askTool, outlineEditTool, outlineReadTool, outlineSearchTool } from "./outline";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
@@ -68,6 +70,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
 	["GenUI", genUiTool],
+	["ImageGen", imageGenTool],
 	["Notification", notificationTool],
 	["Recall", recallTool],
 	["Browser", browserTool],
@@ -146,6 +149,7 @@ const coreProvider: ToolProvider = {
 			knowledgeLibraryTool,
 			outlineReadTool,
 			outlineSearchTool,
+			askTool,
 			switchDeviceTool,
 			switchWorkingDirectoryTool,
 			worktreeTool,
@@ -157,6 +161,7 @@ const coreProvider: ToolProvider = {
 			exitPlanConfirmTool,
 			exitPlanConfirmAndCompactTool,
 			exitPlanReviseTool,
+			planReviewTool,
 			taskReflectConfirmTool,
 			taskReflectReviseTool,
 		];

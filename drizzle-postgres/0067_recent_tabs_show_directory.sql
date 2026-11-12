@@ -1,0 +1,1 @@
+ALTER TABLE "user_preferences" ADD COLUMN "recent_tabs_show_directory" boolean DEFAULT false NOT NULL;

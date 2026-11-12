@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { encodeToolOutput } from "../agent-protocol/tool-output";
+import { historyClearedText } from "../storage-retention";
 import { type DecodableMessage, decodeLegacyContent, splitToolInput } from "./decode";
 import { isModelVisible } from "./types";
 
@@ -13,6 +14,33 @@ function row(overrides: Partial<DecodableMessage>): DecodableMessage {
 		...overrides,
 	};
 }
+
+test("whole-envelope tombstones dominate stale appended blocks, flat text, upstream ids and ledger projections", () => {
+	const envelope = decodeLegacyContent(
+		row({
+			role: "assistant",
+			messageUuid: "private-upstream-id",
+			contentText: "private flat text",
+			contentJson: [
+				historyClearedText("2026-10-01T00:00:00.000Z"),
+				{ type: "text", text: "private late checkpoint" },
+				{ type: "tool_use", id: "private-wire", name: "Read", input: { path: "private-path" } },
+			],
+			toolCalls: [
+				{
+					toolUseId: "private-wire",
+					toolName: "Read",
+					inputJson: { path: "private-path" },
+					outputJson: "private-result",
+					status: "success",
+				},
+			],
+		}),
+	);
+	expect(envelope.blocks).toHaveLength(1);
+	expect(envelope.upstreamMessageId).toBeUndefined();
+	expect(JSON.stringify(envelope)).not.toContain("private");
+});
 
 describe("decodeLegacyContent: assistant steps", () => {
 	test("one block per stored item, in stored order, with deterministic ids", () => {
@@ -189,6 +217,49 @@ describe("decodeLegacyContent: assistant steps", () => {
 			["m1:text", "output"],
 			["m1:0", "tool"],
 		]);
+	});
+
+	test("native image decode preserves terminal diagnostics and never infers legacy success without output", () => {
+		const raws = [
+			{ type: "image_generation", id: "unknown" },
+			{ type: "image_generation", id: "saved", savedPath: "/generated.png" },
+			{ type: "image_generation", id: "inline", result: "base64-image" },
+			...["failed", "cancelled", "incomplete"].map((status) => ({
+				type: "image_generation",
+				id: status,
+				status,
+				error: "upstream detail",
+				errorCode: "image_error",
+				partialSavedPath: "/preview.png",
+				width: 512,
+				height: 256,
+			})),
+			{ type: "image_generation", id: "active", status: "generating" },
+		];
+		const { blocks } = decodeLegacyContent(row({ role: "assistant", contentJson: raws }));
+		expect(blocks[0]).toMatchObject({ phase: "done", providerMeta: { result: {} } });
+		expect(blocks[0]?.kind === "tool" && blocks[0].providerMeta?.result?.status).toBeUndefined();
+		for (const block of blocks.slice(1, 3))
+			expect(block).toMatchObject({
+				phase: "done",
+				providerMeta: { result: { status: "completed" } },
+			});
+		for (const [index, status] of ["failed", "cancelled", "incomplete"].entries()) {
+			expect(blocks[index + 3]).toMatchObject({
+				phase: "failed",
+				providerMeta: {
+					result: {
+						status,
+						error: "upstream detail",
+						errorCode: "image_error",
+						partialSavedPath: "/preview.png",
+						width: 512,
+						height: 256,
+					},
+				},
+			});
+		}
+		expect(blocks.at(-1)).toMatchObject({ phase: "open" });
 	});
 
 	test("redacted thinking, legacy thinking and provider tools", () => {

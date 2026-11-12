@@ -88,8 +88,19 @@ export function useCreateWorkspace() {
  * here would silently bypass that lock.
  */
 export function useUpdateWorkspace() {
+	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({ id, ...data }: { id: string; title: string }) => api.updateWorkspace(id, data),
+		mutationFn: ({ id, ...data }: { id: string; title: string; expectedTitleRevision?: number }) =>
+			api.updateWorkspace(id, data),
+		// Recover revisions missed while disconnected before the user retries.
+		onError: (_error, { id }) => qc.invalidateQueries({ queryKey: workspaceQueryKey(id) }),
+		// Refresh both the title toolbar and the workspace switcher.
+		onSuccess: async (_result, { id }) => {
+			await Promise.all([
+				qc.invalidateQueries({ queryKey: ["workspaces"] }),
+				qc.invalidateQueries({ queryKey: workspaceQueryKey(id) }),
+			]);
+		},
 	});
 }
 

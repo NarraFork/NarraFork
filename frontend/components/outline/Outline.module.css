@@ -37,6 +37,12 @@
 	padding: var(--mantine-spacing-xs);
 }
 
+/* The panel's page scrolls; nothing in it shrinks to make room (an Alert, which hides its own
+   overflow, would otherwise be squashed to a sliver once the body outgrows the panel). */
+.surface[data-layout="panel"] > .page > * {
+	flex-shrink: 0;
+}
+
 .toolbar {
 	display: flex;
 	align-items: center;
@@ -46,19 +52,67 @@
 	flex-wrap: wrap;
 }
 
+/*
+ * The breadcrumbs: one line, always. Crumbs shrink and truncate inside the width there is; the
+ * "Outline" crumb and the fold never shrink, the last crumb (where the page hangs) gives way last.
+ */
 .breadcrumbs {
 	flex: 1 1 16rem;
 	min-width: 0;
+	display: flex;
+	flex-wrap: nowrap;
+	align-items: center;
+	gap: 4px;
 	overflow: hidden;
+	white-space: nowrap;
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
 }
 
 .crumb {
+	flex: 0 4 auto;
+	min-width: 1.5em;
 	max-width: 14rem;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	display: inline-block;
-	vertical-align: bottom;
+	color: var(--mantine-color-anchor);
+	text-decoration: none;
+}
+
+.crumb:hover {
+	text-decoration: underline;
+}
+
+.crumb[data-fixed] {
+	flex: none;
+}
+
+.crumb[data-last] {
+	flex-shrink: 1;
+	min-width: 3em;
+}
+
+.crumbSeparator {
+	flex: none;
+	color: var(--mantine-color-dimmed);
+}
+
+.crumbFold {
+	flex: none;
+	padding-inline: 4px;
+	border-radius: var(--mantine-radius-sm);
+	color: var(--mantine-color-anchor);
+	font-size: inherit;
+	line-height: inherit;
+}
+
+.crumbMenuItem {
+	display: block;
+	max-width: min(20rem, 70vw);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 
 .body {
@@ -111,24 +165,28 @@
 	padding-block: 2px;
 	border-radius: var(--mantine-radius-sm);
 	content-visibility: auto;
-	contain-intrinsic-size: auto 28px;
+	contain-intrinsic-size: auto calc(var(--nf-type-body-line) + 4px);
 }
 
 .indent {
 	flex: 0 0 auto;
 }
 
+/* Toggle, marker (bullet, checkbox or question mark) and focus handle sit on the first line:
+   the conversation's body line box. */
 .toggle {
 	flex: 0 0 20px;
-	height: 24px;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 	justify-content: center;
 }
 
+/* The marker's column is one width whatever the marker (the bullet or a task's badge, which
+   grows with the reader's text), so text starts in one column on every row. */
 .bullet {
-	flex: 0 0 16px;
-	height: 24px;
+	flex: 0 0 max(16px, var(--nf-outline-icon));
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -137,30 +195,78 @@
 	border-radius: 50%;
 }
 
-.bullet:hover {
-	color: var(--mantine-color-indigo-5);
+/*
+ * The folding arrow: a plain button (no hover style on a frame part, as in the live editor:
+ * touch has no hover, and Chromium retargets a nearby long press to an element with one).
+ */
+.toggleButton {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 0;
+	background: none;
+	color: var(--mantine-color-dimmed);
+	border-radius: var(--mantine-radius-sm);
+	cursor: pointer;
+}
+
+/* The outline's icons (`outline-icons.ts`), sized as the live editor's frame draws them. */
+.toggle svg {
+	width: var(--nf-outline-chevron);
+	height: var(--nf-outline-chevron);
 }
 
 .bulletDot {
-	width: 6px;
-	height: 6px;
+	width: var(--nf-outline-dot);
+	height: var(--nf-outline-dot);
 	border-radius: 50%;
 	background: currentColor;
 }
 
+/* Folded with children: the dot keeps a halo, as in the live editor. */
+.bulletDot[data-collapsed="true"] {
+	box-shadow: 0 0 0 min(3px, calc(var(--nf-outline-dot) / 2))
+		color-mix(in srgb, currentColor 30%, transparent);
+}
+
 .taskIcon {
 	flex: 0 0 auto;
-	height: 24px;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
+}
+
+.row > .taskIcon {
+	flex: 0 0 max(16px, var(--nf-outline-icon));
+	justify-content: center;
+}
+
+/*
+ * Beside text that follows the reader's typography (a row's body, the page title), the frame's
+ * size. Elsewhere (the "in progress" popover, the space's page list) the text is Mantine's fixed
+ * 14px, and the icon keeps its fixed 16px (`size={16}`).
+ */
+.row > .taskIcon svg,
+.titleRow > .taskIcon svg {
+	width: var(--nf-outline-icon);
+	height: var(--nf-outline-icon);
+}
+
+/* The page title's task icon sits on the title's first line (the conversation's h3). */
+.titleRow > .taskIcon {
+	height: var(--nf-type-h3-line);
 }
 
 .content {
 	flex: 1 1 auto;
 	min-width: 0;
 	overflow-wrap: anywhere;
-	line-height: 24px;
-	font-size: var(--mantine-font-size-sm);
+	/* The conversation's body text; the body inside carries `.nf-type-scope` (OutlineBlockBody). */
+	line-height: var(--nf-type-body-line);
+	font-size: var(--nf-type-body-size);
 }
 
 .content[data-done="true"] {
@@ -168,25 +274,122 @@
 	text-decoration: line-through;
 }
 
-/* Bodies are one block each: no outer margins, no horizontal overflow. */
-.content :global([data-md-body]) > *,
-.content :global(p),
-.content :global(h1),
-.content :global(h2),
-.content :global(h3),
-.content :global(h4),
-.content :global(h5),
-.content :global(h6),
-.content :global(blockquote),
-.content :global(pre),
-.content :global(table) {
-	margin-block: 0;
-}
-
 .content :global(pre),
 .content :global(table) {
 	max-width: 100%;
 	overflow-x: auto;
+}
+
+/*
+ * Bodies are one block each: no outer margins, no horizontal overflow. Two classes deep, so the
+ * reset wins over the markdown renderer's own margins (one class and one element, like a single
+ * `.content` here) whatever order the bundler emits the two stylesheets in.
+ */
+.content :global(.nf-type-scope) :global([data-md-body]) > *,
+.content :global(.nf-type-scope) :global(p),
+.content :global(.nf-type-scope) :global(h1),
+.content :global(.nf-type-scope) :global(h2),
+.content :global(.nf-type-scope) :global(h3),
+.content :global(.nf-type-scope) :global(h4),
+.content :global(.nf-type-scope) :global(h5),
+.content :global(.nf-type-scope) :global(h6),
+.content :global(.nf-type-scope) :global(blockquote),
+.content :global(.nf-type-scope) :global(pre),
+.content :global(.nf-type-scope) :global(table) {
+	margin-block: 0;
+}
+
+/*
+ * A markdown heading inside a block is body text in bold: the page title is the largest text on
+ * the page, and a heading nested under a task never outgrows the task's own title. Its toggle,
+ * marker and focus handle therefore sit on the body line box like every other row's. Two
+ * classes and an element, over the markdown renderer's own heading sizes (one class, one element).
+ */
+.content :global(.nf-type-scope) :is(h1, h2, h3, h4, h5, h6) {
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+	font-weight: 700;
+}
+
+/*
+ * The focus handle of a row without a bullet (a task, a question): the bullet is how a block is
+ * focused, and those rows show their checkbox or mark in its place. Always drawn (touch has no
+ * hover), on the first line.
+ */
+.focusHandle {
+	flex: 0 0 20px;
+	height: var(--nf-type-body-line);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	/* The only pointer and touch route to focusing a task: 3:1 or more against the page in both
+	   schemes (the dimmed colour as it is, no opacity over it). */
+	color: var(--mantine-color-dimmed);
+	text-decoration: none;
+	border-radius: var(--mantine-radius-sm);
+}
+
+.focusHandle svg {
+	width: var(--nf-outline-chevron);
+	height: var(--nf-outline-chevron);
+}
+
+/*
+ * The row's quick control (everything inside it: expand, or back to the default view): always
+ * drawn, on the first line, before the focus handle. No `:hover` rule (see `.focusHandle`).
+ */
+.foldAll {
+	flex: 0 0 20px;
+	height: var(--nf-type-body-line);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	border: 0;
+	background: none;
+	color: var(--mantine-color-dimmed);
+	border-radius: var(--mantine-radius-sm);
+	cursor: pointer;
+}
+
+/* The page's control: 「全部展开 / 全部收起」, at the tree's top right. */
+.foldPage {
+	align-self: flex-end;
+	flex: none;
+}
+
+/*
+ * What a closed row holds, as ONE line under it: the first line of its first block, cut with an
+ * ellipsis, and how much more there is. It starts where the row's text does (the indentation,
+ * the arrow's column, the marker's column and the three 4px gaps between them).
+ */
+.preview {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+	padding-left: calc(var(--nf-fold-indent, 0px) + 32px + max(16px, var(--nf-outline-icon)));
+	padding-bottom: 2px;
+	white-space: nowrap;
+	cursor: pointer;
+	color: var(--mantine-color-dimmed);
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+	border-radius: var(--mantine-radius-sm);
+	content-visibility: auto;
+	contain-intrinsic-size: auto calc(var(--nf-type-body-line) + 2px);
+}
+
+.previewText {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.previewLabel {
+	flex: 0 0 auto;
+	color: var(--mantine-color-anchor);
 }
 
 .meta {
@@ -198,7 +401,7 @@
 }
 
 .more {
-	font-size: var(--mantine-font-size-xs);
+	font-size: var(--nf-type-xs-size);
 	color: var(--mantine-color-dimmed);
 	text-decoration: none;
 }
@@ -294,6 +497,12 @@
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
+}
+
+/* A text of a pending change's diff: as written, wrapped anywhere. */
+.diffText {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 }
 
 /*

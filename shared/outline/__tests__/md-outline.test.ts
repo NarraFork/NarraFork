@@ -269,6 +269,19 @@ describe("tasks and assignees", () => {
 		expect(r.notes.map((n) => [n.line, n.code])).toEqual([[3, "extra-assignee"]]);
 	});
 
+	test("a name may end in - (SSO usernames), never in . (a sentence's end)", () => {
+		const r = parseMarkdownOutline(
+			"- [ ] a @human:user- b\n- [ ] c @human:pat.\n- [ ] d @human:x-y-",
+		);
+		expect(r.items.map((i) => i.task?.assignee ?? null)).toEqual([
+			"human:user-",
+			"human:pat",
+			"human:x-y-",
+		]);
+		const items = [item("e", [], { status: "todo", assignee: "human:sso-name-" })];
+		expect(parseMarkdownOutline(serializeMarkdownOutline(items))).toEqual({ items, notes: [] });
+	});
+
 	test("text that would read as task syntax is escaped on the way out", () => {
 		const items = [
 			item("[ ] 不是任务"),

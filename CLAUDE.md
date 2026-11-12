@@ -60,12 +60,20 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 - **代码评审特殊规则：** 如果评审中的改动修改了 `server/db/schema.ts` 但尚未生成对应迁移，**不要**把“未生成迁移”列为阻塞项或必须修复项；最多作为非阻塞提醒说明“合并/发布前需要生成迁移”。评审应优先确认 schema 设计和业务逻辑正确，迁移可在评审通过后再生成。
 - **⚠️ 禁止自行删除数据库文件（`~/.narrafork/narrafork.db*`）或 `drizzle/` 目录** — 数据库包含用户数据，删除不可逆。迁移失败时应先尝试修复（如关闭外键检查、调整迁移顺序等），必须由用户明确授权后才能执行删除操作
 - 如用户明确要求全新迁移：删除 `drizzle/` 目录和数据库文件（`~/.narrafork/narrafork.db*`），再运行 `bun run db:generate` + `bun run db:migrate`
+- **⚠️ schema 变更必须同步「数据导入 / 导出」兼容**（`server/services/data-portability.ts`）：导出是 `SNAPSHOT_TABLES` 里的固定表（子进程复制，新表不会自动包含），导入只合并显式列举的表（`api_requests` / `narrators` / `narrator_messages` / `narrator_message_refs` / `narrator_tool_calls` / `narrator_blocks` + providers）并按列交集拷贝。新增需要迁移的表 → 加进 `SNAPSHOT_TABLES` 并在 `applyImport` 补 `copyTable`；新增 NOT NULL 且无默认值的列 → 旧快照导入会缺列失败，需补默认值或拒绝旧版本；新增需清空的数据 → 在 `clearData` 处理。详见 [docs/DATA_PORTABILITY.md](docs/DATA_PORTABILITY.md)，改动后跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`
 
 **PostgreSQL 迁移元数据规则：**
 - `drizzle-postgres/` 保留全部增量SQL和journal，但全量schema只保留固定的 `meta/current_snapshot.json`；`meta/_snapshot_history.json` 保存小型谱系记录，不增加历史全量快照或压缩归档。
 - PG schema继续由 `bun scripts/generate-postgres-schema.ts` 从SQLite schema转译，再用 `bun run db:generate:pg --name <name>` 生成增量迁移；不要对正式PG目录直接运行裸 `drizzle-kit generate/check/up/drop`。
 - 不改写已发布SQL、编号或journal时间戳；回退已发布结构应追加补偿迁移，不删除历史。尚未发布的custom SQL可以按正常流程填写。
 - 出现pending receipt时使用 `db:resume:pg`；中断遗留锁必须先确认生产者已停止后由操作员修复，不自动抢占锁、不删除故障证据。
+
+**Worker 隔离不可降级（全仓严格遵守）：**
+- 已交给 Worker 执行的任务，在创建失败、未就绪、崩溃、超时、被禁用或运行环境不可用时，**禁止回退到服务主线程或浏览器 UI 线程执行原任务**。禁止保留 `inlineFallback`、故障回调内的本地重算，或以“小数据、缩小批次、开发环境、可用性兜底”为理由绕过隔离。
+- `async`、Promise、`setTimeout` 和缩小批次不会改变任务所在的线程，不能作为 Worker 故障后的替代隔离方案。
+- 故障按任务语义明确失败、保留进度后暂停/重试，或显示已有缓存/轻量普通文本占位。可以使用另一 Worker 或独立子进程，但仍须保留超时、取消、背压和资源预算；不得把未知结果伪装成零值或空成功。
+- 第三方组件也适用：集成层必须阻断库内部的同步 Worker 回退，并保留健康 Worker 的功能。不能仅让 `getWorker` 抛错，却任由库在内部吞错后切换到主线程。
+- 测试可显式调用纯计算核心或注入测试 reader，但不得为测试便利保留生产故障回退入口。新增或修改 Worker 客户端时，必须用故障注入覆盖创建/运行/超时/禁用路径，并断言原任务没有在主线程执行。
 
 **后端主线程性能规则（严格遵守）：**
 - Bun HTTP/WS、`bun:sqlite`、JSON 序列化、同步 FS/crypto/zlib 都可能占用同一个 JS 主线程；任何长时间同步工作都会表现为“所有请求无响应”。

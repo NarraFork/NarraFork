@@ -858,7 +858,7 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 				.where(personalInjectionWhere(opts))
 				.orderBy(desc(knowledgeDrafts.updatedAt), knowledgeDrafts.id)
 				.limit(limit),
-			{ signal: opts.signal, timeoutMs: 750, maxRows: limit, inlineFallback: false },
+			{ signal: opts.signal, timeoutMs: 750, maxRows: limit },
 		);
 	},
 	async personalKeywordInjectionSignature(opts) {
@@ -870,7 +870,7 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 				})
 				.from(knowledgeDrafts)
 				.where(personalInjectionWhere(opts)),
-			{ signal: opts.signal, timeoutMs: 750, maxRows: 1, inlineFallback: false },
+			{ signal: opts.signal, timeoutMs: 750, maxRows: 1 },
 		);
 		return `${Number(rows[0]?.cnt ?? 0)}:${rows[0]?.maxUpdated ?? ""}`;
 	},
@@ -916,7 +916,7 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 				)
 				.orderBy(desc(knowledgeEntries.updatedAt), knowledgeEntries.id)
 				.limit(limit),
-			{ signal: opts.signal, timeoutMs: 750, maxRows: limit, inlineFallback: false },
+			{ signal: opts.signal, timeoutMs: 750, maxRows: limit },
 		);
 	},
 
@@ -936,7 +936,7 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 						projectScopeClause(opts.projectId),
 					),
 				),
-			{ signal: opts.signal, timeoutMs: 750, maxRows: 1, inlineFallback: false },
+			{ signal: opts.signal, timeoutMs: 750, maxRows: 1 },
 		);
 		const row = rows[0];
 		return `${Number(row?.cnt ?? 0)}:${row?.maxUpdated ?? ""}`;

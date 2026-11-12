@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 134 tables and 1759 columns including the outline storage tables", () => {
-		expect(target.tables.length).toBe(134);
+	test("covers 141 tables and 1866 columns including the outline view state's opened blocks", () => {
+		expect(target.tables.length).toBe(141);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -542,10 +542,65 @@ describe("real schema parity", () => {
 		// outline_block_versions (13), outline_links (8), outline_commits (12),
 		// outline_live_updates (7) and outline_view_state (5).
 		// Account-scoped Git identity entry visibility adds two user_preferences columns.
+		// Native media adds narrator_buffered_messages.media_json.
 		// Outline tasks (P2) add outline_task_claims (9), outline_blocks.in_process,
 		// outline_spaces.in_process_ready and outline_spaces.in_process_epoch.
 		// ModelTrace cabins add narrators.hidden_from_lists and narrators.modeltrace_key (2).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1759);
+		// The outline task source (P2) adds narrators.task_backend.
+		// Locks and pending confirmation (P2) add outline_pending (25).
+		// Durable reply language adds narrators.reply_context without a NOT NULL constraint.
+		// Questions and the inbox (P2) add outline_questions (12), ask_json on outline_blocks and
+		// outline_block_versions, and outline_pending.digest_seen_at.
+		// Output-speed timing adds api_requests.decode_ms (1).
+		// The line-height rescale adds user_preferences.narrator_line_height_v2_percent (nullable).
+		// Sidebar folders add four user_recent_tabs columns and user_recent_tabs_meta.folders_migrated.
+		// Reports (outline P2 PR 11) add outline_digests (14), outline_spaces.last_commit_at and the
+		// two user_preferences report settings (time zone and time, both nullable).
+		// The board's 「新完成」 (outline P2 PR 9b) adds outline_task_seen (4).
+		// Per-narrator question reflection adds narrators.question_reflection_override.
+		// Submission outcome read receipts add knowledge_submissions.author_read_at (nullable).
+		// Per-executor working directories add narrators.workspace_directories (1).
+		// Folder Git identities add folder_git_identity_bindings (5) and one user preference.
+		// Sidebar archive marks add recent_tab_archive_marks (5).
+		// Workspace auto titles add title_source and title_revision (2).
+		// Recent-tab directory visibility adds one account-scoped user preference.
+		// The outline's default folding adds outline_view_state.expanded_json (nullable).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1866);
+		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "replyContext",
+					name: "reply_context",
+					pgType: "text",
+					notNull: false,
+				}),
+				expect.objectContaining({
+					property: "hiddenFromLists",
+					name: "hidden_from_lists",
+					pgType: "boolean",
+					notNull: true,
+					defaultExpression: "false",
+				}),
+				expect.objectContaining({
+					property: "modeltraceKey",
+					name: "modeltrace_key",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
+		expect(
+			target.tables.find((table) => table.name === "narrator_buffered_messages")?.columns,
+		).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "mediaJson",
+					name: "media_json",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

@@ -24,14 +24,17 @@ import {
 	Text,
 	Textarea,
 } from "@mantine/core";
-import { type CSSProperties, useContext, useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorPermissionsCapability } from "../../../hooks/usePlatform";
+import { isOutlinePlanApproval, OutlinePlanApproval } from "../../outline/plan/OutlinePlanApproval";
 import { DiffView } from "../diff/DiffView";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
+import { type PermButton, PermButtonBar } from "./PermButtonBar";
 import { PermissionRuleRequestDetails } from "./PermissionRuleRequestDetails";
+import { usePermissionTextareaStyle } from "./permission-textarea-typography";
 
 const noop = () => {};
 
@@ -105,69 +108,6 @@ function StructSedChangePreview({ permission }: { permission: PendingPermission 
 				</Text>
 			) : null}
 		</Stack>
-	);
-}
-
-// --- Permission button bar with keyboard navigation ---
-
-interface PermButton {
-	label: string;
-	color: string;
-	variant?: string;
-	onClick: () => void;
-}
-
-/**
- * Renders a row of permission buttons with keyboard-driven focus highlight.
- * Reports button count to the parent via setButtonCount so the global
- * keydown handler knows the navigation range.
- */
-function PermButtonBar({
-	buttons,
-	focusIndex,
-	setButtonCount,
-	registerActions,
-}: {
-	buttons: PermButton[];
-	focusIndex: number | null;
-	setButtonCount: (n: number) => void;
-	registerActions: (actions: (() => void)[]) => void;
-}) {
-	useEffect(() => {
-		setButtonCount(buttons.length);
-		registerActions(buttons.map((b) => b.onClick));
-	}, [buttons, setButtonCount, registerActions]);
-
-	return (
-		<Group gap="sm">
-			{buttons.map((btn, i) => {
-				const focused = focusIndex === i;
-				return (
-					<Button
-						key={`${btn.label}-${btn.color}`}
-						size="sm"
-						color={btn.color}
-						variant={btn.variant as "light" | "subtle" | undefined}
-						onClick={btn.onClick}
-						className={focused ? "perm-btn-pulse" : undefined}
-						style={
-							focused
-								? ({
-										"--perm-pulse-color": `var(--mantine-color-${btn.color}-filled)`,
-									} as CSSProperties)
-								: undefined
-						}
-					>
-						{btn.label}
-						{focused && (
-							<Text span size="xs" ml={4} opacity={0.7}>
-								⏎
-							</Text>
-						)}
-					</Button>
-				);
-			})}
-		</Group>
 	);
 }
 
@@ -255,9 +195,17 @@ export function InlinePermission({
 	const permissionTargetDeviceId = permissionTarget?.deviceId ?? permission.executionDeviceId;
 	const permissionTargetCwd = permissionTarget?.cwd ?? permission.executionCwd;
 	const permissionLexicalPath = permissionTarget?.lexicalPath ?? permission.resolvedFilePath;
-	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
-		useContext(PermEnterHintCtx);
+	const {
+		focusIndex,
+		setFocusIndex,
+		setButtonCount,
+		setHasFeedback,
+		registerActions,
+		activePermissionId,
+	} = useContext(PermEnterHintCtx);
 	const isActivePermission = permission.id === activePermissionId;
+	// In the transcript both textareas paint the rows its height model counts (D49).
+	const textareaStyle = usePermissionTextareaStyle();
 	const draftKey = permission.id;
 	const storedDraftRef = useRef<StoredPermissionDraft | null | undefined>(undefined);
 	const getStoredDraft = () => {
@@ -330,6 +278,11 @@ export function InlinePermission({
 		permission.toolName === "AskUserQuestion"
 			? coerceQuestions(permission.inputJson?.questions)
 			: [];
+	// An outline session's plan (outline P2 PR 8): its own approval, against the diff from the
+	// previous version, with the three choices.
+	if (isOutlinePlanApproval(permission)) {
+		return <OutlinePlanApproval permission={permission} readOnly={effectiveReadOnly} />;
+	}
 	if (permission.toolName === "AskUserQuestion" && askQuestions.length > 0) {
 		return (
 			<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
@@ -463,7 +416,13 @@ export function InlinePermission({
 					minRows={8}
 					maxRows={30}
 					disabled={effectiveReadOnly || !permissionInputSupported}
-					styles={{ input: { fontFamily: "monospace", fontSize: "var(--mantine-font-size-xs)" } }}
+					styles={{
+						input: {
+							fontFamily: "monospace",
+							fontSize: "var(--mantine-font-size-xs)",
+							...textareaStyle,
+						},
+					}}
 				/>
 			)}
 			{localizedDecisionReason && (
@@ -474,6 +433,7 @@ export function InlinePermission({
 			<Textarea
 				size="xs"
 				placeholder={t("feedbackPlaceholder")}
+				data-testid="permission-feedback"
 				value={feedback}
 				onChange={(e) => setFeedback(e.currentTarget.value)}
 				onKeyDown={(e) => {
@@ -489,6 +449,7 @@ export function InlinePermission({
 				maxRows={3}
 				mb="xs"
 				disabled={effectiveReadOnly}
+				styles={textareaStyle ? { input: textareaStyle } : undefined}
 			/>
 			{effectiveReadOnly ? (
 				<Text size="xs" c="dimmed">
@@ -497,6 +458,7 @@ export function InlinePermission({
 			) : (
 				<PermButtonBar
 					focusIndex={isActivePermission ? focusIndex : null}
+					setFocusIndex={isActivePermission ? setFocusIndex : undefined}
 					buttons={(() => {
 						const btns: PermButton[] = [];
 						if (!editing) {

@@ -36,6 +36,8 @@ import {
 	type ChunkFrameHeader,
 	decodeChunkFrame,
 	encodeChunkFrame,
+	FEATURE_FS_STAT_RESOLVED_PATH_V1,
+	type FsStatResult,
 	type TransferBeginResult,
 	type TransferDirection,
 	type TransferStatResult,
@@ -379,6 +381,38 @@ export function resolveRemoteBrowseTarget(
 		pathFlavor,
 		sep: pathApi.sep,
 	};
+}
+
+/**
+ * Resolve an existing remote directory through the executor's own PathGuard.
+ *
+ * Authorization boundaries must require the canonical-stat capability: falling
+ * back to the lexical path would make a symlink or Windows junction indistinguishable
+ * from an ordinary child of an allowed root. The response comes directly from the
+ * authenticated device RPC, never from caller-provided browse metadata.
+ */
+export async function resolveRemoteBrowsePath(
+	deviceId: string,
+	path: string,
+	opts: { signal?: AbortSignal } = {},
+): Promise<string> {
+	const platformOs = getRemotePlatformOs(deviceId);
+	const remotePath = validateRemoteAbsolutePath(path, platformOs, "Remote directory");
+	const result = (await sendRpc(
+		deviceId,
+		"fs.stat",
+		{ path: remotePath },
+		{ signal: opts.signal, requiredFeatures: [FEATURE_FS_STAT_RESOLVED_PATH_V1] },
+	)) as FsStatResult;
+	if (
+		result.exists !== true ||
+		result.isDirectory !== true ||
+		typeof result.resolvedPath !== "string" ||
+		!result.resolvedPath.trim()
+	) {
+		throw new Error(`Device ${deviceId} could not canonically resolve the remote directory`);
+	}
+	return validateRemoteAbsolutePath(result.resolvedPath, platformOs, "Resolved remote directory");
 }
 
 /**

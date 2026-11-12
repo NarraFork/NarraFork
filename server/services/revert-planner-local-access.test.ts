@@ -19,8 +19,9 @@ import {
 	type FileChangeRevertAction,
 	type FileChangeState,
 } from "@shared/file-change-protocol";
-import { eq, inArray } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { testEnvironment } from "../../tests/preload";
+import { readTestMessageContent } from "../../tests/setup";
 import { app } from "../app";
 import { db, sqlite } from "../db";
 import * as schema from "../db/schema";
@@ -283,11 +284,12 @@ function message(role: "user" | "assistant", blocks: unknown[]) {
 	return messageId;
 }
 function messageRow(messageId: string) {
-	return db
+	const row = db
 		.select()
 		.from(schema.narratorMessages)
 		.where(eq(schema.narratorMessages.id, messageId))
 		.get();
+	return row ? { ...row, contentJson: readTestMessageContent<unknown>(sqlite, row.id) } : row;
 }
 function messageRefs() {
 	return db
@@ -411,24 +413,32 @@ async function fixture() {
 	const call = await write(path, "new\n");
 	return { path, call };
 }
+/**
+ * Snapshot of the narrator's history for before/after equality. Ordered by id: without an ORDER
+ * BY, SQLite may return the same rows in a different order once a write touched an index, and
+ * the comparison then failed on order alone (seen in CI: refs seq 2,1 before and 1,2 after).
+ */
 function history() {
 	return JSON.stringify({
 		refs: db
 			.select()
 			.from(schema.narratorMessageRefs)
 			.where(eq(schema.narratorMessageRefs.narratorId, narratorId))
+			.orderBy(asc(schema.narratorMessageRefs.id))
 			.limit(100)
 			.all(),
 		messages: db
 			.select()
 			.from(schema.narratorMessages)
 			.where(eq(schema.narratorMessages.narratorId, narratorId))
+			.orderBy(asc(schema.narratorMessages.id))
 			.limit(100)
 			.all(),
 		tools: db
 			.select()
 			.from(schema.narratorToolCalls)
 			.where(eq(schema.narratorToolCalls.narratorId, narratorId))
+			.orderBy(asc(schema.narratorToolCalls.id))
 			.limit(100)
 			.all(),
 	});

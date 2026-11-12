@@ -1131,7 +1131,7 @@ describe("adaptSegment — assistant message", () => {
 	// The header status line wraps together with the revisedPrompt, so its text is
 	// measured — it must come from the adapter (ctx.labels), not the render layer.
 	it("composes the image_generation header statusText from status + labels", () => {
-		const statusText = (status: string | undefined, ctx: AdapterContext) =>
+		const statusText = (status: string | undefined, ctx: AdapterContext, savedPath?: string) =>
 			(
 				adaptSegment(
 					{
@@ -1141,7 +1141,7 @@ describe("adaptSegment — assistant message", () => {
 								id: `gen-${status ?? "none"}`,
 								role: "assistant",
 							},
-							[{ type: "image_generation", ...(status ? { status } : {}) }],
+							[{ type: "image_generation", savedPath, ...(status ? { status } : {}) }],
 						),
 					},
 					ctx,
@@ -1154,15 +1154,18 @@ describe("adaptSegment — assistant message", () => {
 				imageGenerated: "已生成图片",
 				imageGenerating: "正在生成图片…",
 				imageGenerationPreparing: "准备生成图片…",
+				imageGenerationNoImage: "未获得图片",
 			},
 		};
 		expect(statusText("generating", zh)).toBe("正在生成图片…");
 		expect(statusText("in_progress", zh)).toBe("准备生成图片…");
-		expect(statusText("completed", zh)).toBe("已生成图片");
-		// A persisted block has no status at all — that reads as "generated".
-		expect(statusText(undefined, zh)).toBe("已生成图片");
+		expect(statusText("completed", zh, "/final.png")).toBe("已生成图片");
+		// Legacy success requires a final artifact, not merely absent status.
+		expect(statusText(undefined, zh, "/final.png")).toBe("已生成图片");
+		expect(statusText(undefined, zh)).toBe("未获得图片");
+		expect(statusText("completed", zh)).toBe("未获得图片");
 		// No injected labels → English fallbacks (never a raw key).
-		expect(statusText("completed", CTX)).toBe("Generated image");
+		expect(statusText("completed", CTX, "/final.png")).toBe("Generated image");
 	});
 
 	it("omits statusText for non-generation media blocks", () => {
@@ -1362,6 +1365,28 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		expect(data.text).toBe("the objective");
 		expect(data.added).toBe(false);
 		expect(data.badges[1]).toBe("Already tracked");
+	});
+
+	it("spec_goal_added of an outline session: its own words, the same layout (outline P2 PR 5)", () => {
+		const data = sysData([
+			{
+				type: "spec_goal_added",
+				task: "Ship the release",
+				added: true,
+				protected: true,
+				taskBackend: "outline",
+				ref: "abc/xyz",
+				locked: true,
+			},
+		]);
+		expect(data.kind).toBe("spec_goal_added");
+		expect(data.text).toBe("Ship the release");
+		expect(data.badges).toEqual(["Locked goal", "Added to the outline"]);
+		expect(data.buttons).toEqual(["View task board"]);
+		const exists = sysData([
+			{ type: "spec_goal_added", task: "x", added: false, taskBackend: "outline", locked: false },
+		]);
+		expect(exists.badges).toEqual(["Set by a person", "Already on the board"]);
 	});
 
 	it("spec_continuation: framed as a bubble task row (glyph + lock + wrapping text)", () => {
@@ -4804,7 +4829,8 @@ describe("adaptSegment — a concluded review", () => {
 				},
 			});
 			const measured = VLIST_REGISTRY[specs[0].kind].measure(specs[0].data, 320, lod);
-			expect(measured.height).toBe(25);
+			// py 4×2 + one xs line (20 at the default setting: 120% of the Mantine 17).
+			expect(measured.height).toBe(28);
 		});
 		it.each(["sys", "system", "assistant"])("does not collapse %s messages", (role) => {
 			const specs = adaptSegment(

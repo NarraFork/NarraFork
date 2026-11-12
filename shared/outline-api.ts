@@ -13,7 +13,7 @@ export type OutlineViewMode = "facts" | "all";
 
 export type OutlineActorKind = "human" | "agent" | "system";
 
-export type OutlineCommitKind = "edit" | "revert" | "import";
+export type OutlineCommitKind = "edit" | "revert" | "import" | "confirm" | "answer" | "plan";
 
 export type OutlineTaskStatus = "todo" | "doing" | "done" | "cancelled";
 
@@ -116,6 +116,38 @@ export interface OutlineTaskView {
 	depends: string[];
 }
 
+/** Who locked a task tree (design §2.2), and the session confirming on their behalf. */
+export interface OutlineLockView {
+	/** The locked task. */
+	blockId: string;
+	by: { kind: OutlineActorKind; id: string; name: string | null };
+	delegate: { narratorId: string; title: string | null } | null;
+	/** Seq of the commit that locked it. */
+	versionSeq: number;
+	/** Whether the caller may unlock it: the locker, a manager of the space, an admin. */
+	canUnlock: boolean;
+}
+
+/** A task under a fact, as its "in progress" marker lists it (design §3.1). */
+export interface OutlineInProgressItem {
+	id: string;
+	sid: string;
+	title: string;
+	status: OutlineTaskStatus;
+	assignee: string | null;
+	/** A change to it waits for confirmation. */
+	waiting: boolean;
+	/** It is a question put to a person (`Ask`), not a task. */
+	question?: boolean;
+}
+
+/** A question block as a page shows it (`Ask`, outline P2 PR 7). */
+export interface OutlineQuestionMark {
+	state: "open" | "answered" | "withdrawn";
+	/** A reversible decision the asker went ahead with: nothing waits for it. */
+	proceed: boolean;
+}
+
 export interface OutlineViewBlock {
 	id: string;
 	sid: string;
@@ -123,16 +155,35 @@ export interface OutlineViewBlock {
 	/** Canonical in-block markdown. */
 	content: string;
 	task: OutlineTaskView | null;
+	/** On a question put to a person (`Ask`): its state. */
+	question?: OutlineQuestionMark | null;
 	alias: string | null;
 	tags: string[];
 	/** Children shown in this view, in sibling order. */
 	childIds: string[];
 	/** Blocks of the view under this block that did not fit the budget. */
 	hidden: number;
-	/** Blocks the facts view leaves out under this block (tasks and what is under them). */
+	/** Blocks the facts view leaves out under this block (tasks, questions and what is under them). */
 	processHidden: number;
-	/** Tasks directly under this block that are neither done nor cancelled. */
+	/** Tasks and unanswered questions directly under this block (neither done nor cancelled). */
 	openTasks: number;
+	/**
+	 * Those tasks (at most {@link OUTLINE_PENDING_API_LIMITS.inProgressItems}), for the "in
+	 * progress" marker of the facts view.
+	 */
+	inProgress: OutlineInProgressItem[];
+	/** The lock, on a locked task. */
+	lock: OutlineLockView | null;
+	/**
+	 * Open changes (ids) that target this block (it waits for confirmation) or add blocks under
+	 * it (a mark only).
+	 */
+	pending: string[];
+	/**
+	 * On a subagent report's container: the subagent's session title, when the reader may read
+	 * that session (absent otherwise, and past the containers one view names).
+	 */
+	reportFrom?: string;
 }
 
 export interface OutlineBlockViewResponse {
@@ -145,6 +196,11 @@ export interface OutlineBlockViewResponse {
 	current: boolean;
 	/** The view applied: `all` when the root is a task or under one. */
 	view: OutlineViewMode;
+	/**
+	 * The root is under a task or inside a subagent report: its blocks are details, folded by
+	 * default (`shared/outline-fold.ts`). Absent from an older server: false.
+	 */
+	rootInTask?: boolean;
 	/** The root's ancestors, the page first. */
 	path: Array<{ id: string; sid: string; title: string }>;
 	/** The blocks shown, the root first, breadth first. */
@@ -281,7 +337,8 @@ export type OutlineMapLayout = "right" | "down";
  * Limits of `GET/PUT /api/outline/view-state/:pageId`: one person's folding and mind-map
  * direction of one page (design §7.1 `outline_view_state`). Folding is personal and never part
  * of the block model; a page shows at most `maxCollapsed` blocks per view (design §7.2), so more
- * folded ids than that are never needed.
+ * folded ids than that are never needed. `maxCollapsed` bounds the blocks the reader closed and
+ * the blocks they opened TOGETHER (`shared/outline-fold.ts`): one budget, not one each.
  */
 export const OUTLINE_VIEW_STATE_LIMITS = {
 	maxCollapsed: 2000,
@@ -304,7 +361,10 @@ export const OUTLINE_BLOCK_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 /** One person's view state of one page; defaults when they never changed it. */
 export interface OutlineViewStateResponse {
 	pageId: string;
+	/** Blocks the reader closed that the page shows open by default. */
 	collapsed: string[];
+	/** Blocks the reader opened that the page folds by default (`shared/outline-fold.ts`). */
+	expanded: string[];
 	layout: OutlineMapLayout;
 	/** When it was last written; null for the defaults. */
 	updatedAt: string | null;
@@ -312,5 +372,393 @@ export interface OutlineViewStateResponse {
 
 export interface OutlineViewStatePutRequest {
 	collapsed: string[];
+	/** Left out (a client from before the default folding): what is stored is kept. */
+	expanded?: string[];
 	layout: OutlineMapLayout;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Locks and pending confirmation (design §2.2, §2.6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const OUTLINE_PENDING_API_LIMITS = {
+	/** Tasks one "in progress" marker lists. */
+	inProgressItems: 10,
+	/** Unanswered questions of a page its summary names (the newest). */
+	openQuestions: 200,
+	/** Characters of a rejection's reason. */
+	maxReasonChars: 500,
+} as const;
+
+export type OutlinePendingStatus = "open" | "confirmed" | "rejected" | "withdrawn";
+
+/** A change waiting for confirmation (or decided), as a page lists it. */
+export interface OutlinePendingSummary {
+	id: string;
+	/** `P` and the id: how people and agents name it. */
+	label: string;
+	status: OutlinePendingStatus;
+	/** The locked task whose plan it changes. */
+	rootBlockId: string | null;
+	pageId: string;
+	summary: string;
+	createdAt: string;
+	updatedAt: string;
+	/** The session that proposed it. */
+	proposer: { narratorId: string | null; title: string | null };
+	/** Who decides it: the locker, or the session they named. */
+	decider: {
+		by: { kind: OutlineActorKind; id: string; name: string | null };
+		delegate: { narratorId: string; title: string | null } | null;
+	};
+	/** Existing blocks it targets (rewrites, moves, deletes, changes the task of): they wait. */
+	blockIds: string[];
+	/**
+	 * Existing blocks it adds blocks under (a proposed new step's parent): marked like the
+	 * targets, but they do not wait.
+	 */
+	addedUnder: string[];
+	/** Operations it holds. */
+	ops: number;
+	/** A block it touches changed since it was proposed: confirming merges, or may fail. */
+	changedSince: boolean;
+	/** Whether the caller decides it (they locked the plan). */
+	canDecide: boolean;
+}
+
+/** `GET /spaces/:spaceId/pages/:pageId/pending`: what waits for confirmation on a page. */
+export interface OutlinePagePendingResponse {
+	pending: OutlinePendingSummary[];
+	/** Locked tasks of the page. */
+	locks: OutlineLockView[];
+	/**
+	 * Blocks of the page that are questions put to a person and not answered yet (the newest
+	 * {@link OUTLINE_PENDING_API_LIMITS.openQuestions}): the blocks above them are not folded by
+	 * default, and a row the reader folded counts the ones it hides. Absent from an older server.
+	 */
+	questions?: string[];
+}
+
+/** Limits of `GET /spaces/:spaceId/report-authors`: who wrote the subagent reports of a page. */
+export const OUTLINE_REPORT_AUTHORS_API_LIMITS = {
+	/** Report containers one request names. */
+	maxIds: 20,
+} as const;
+
+/** The subagent's session title by report container, for those the reader may be told. */
+export interface OutlineReportAuthorsResponse {
+	authors: Record<string, string>;
+}
+
+/** One block of a pending change: as proposed against, as proposed, and as it is now. */
+export interface OutlinePendingDiffEntry {
+	blockId: string;
+	sid: string;
+	kind: "update" | "insert" | "delete" | "move" | "task" | "restore";
+	base: string | null;
+	proposed: string | null;
+	now: string | null;
+	changedSince: boolean;
+	/** For a task change: the fields as proposed (null: the checkbox taken away). */
+	task?: {
+		status?: OutlineTaskStatus;
+		assignee?: string | null;
+		due?: string | null;
+		depends?: string[] | null;
+	} | null;
+	/** For a move or an insert: the parent's title (null: the top level). */
+	parentTitle?: string | null;
+	/** For a delete: blocks in or under it others added, changed or moved away since it was proposed. */
+	changedUnder?: number;
+	/**
+	 * For a delete: its subtree could not be checked for changes since it was proposed: too many
+	 * blocks (`size`), or too many writers of the proposing session on one block (`writers`).
+	 */
+	subtreeUnchecked?: "size" | "writers";
+}
+
+/** `GET /pending/:id`: a pending change block by block (bounded). */
+export interface OutlinePendingDetailResponse {
+	pending: OutlinePendingSummary;
+	entries: OutlinePendingDiffEntry[];
+	/** More blocks than the diff shows. */
+	truncated: boolean;
+}
+
+/** `POST /pending/:id/confirm` and `/reject`. */
+export interface OutlinePendingDecisionResponse {
+	pending: OutlinePendingSummary;
+	/** The `confirm` commit; null for a rejection, or a confirmation that changed nothing. */
+	commit: { id: string; seq: number } | null;
+}
+
+/** Why a confirmation failed, beside the error's code (`OUTLINE_PENDING_CONFLICT`). */
+export interface OutlinePendingConflictBody {
+	code: string;
+	message: string;
+	details?: string[];
+}
+
+/** `POST /spaces/:spaceId/blocks/:blockId/lock`. */
+export interface OutlineLockRequest {
+	/** The session that may confirm step changes on the locker's behalf (one the caller may write). */
+	delegate?: string | null;
+}
+
+/** `POST …/lock` and `DELETE …/lock`. */
+export interface OutlineLockResponse {
+	lock: OutlineLockView | null;
+	commit: { id: string; seq: number } | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Questions and the digest (`Ask` and the inbox, outline P2 PR 7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A question put to a person, as the inbox, a page's side panel and the `Ask` card show it. */
+export interface OutlineQuestionView {
+	blockId: string;
+	spaceId: string;
+	sid: string;
+	/** `key/sid`. */
+	address: string;
+	/** Its parent: a question, for a sub-question. */
+	parentId: string | null;
+	/** `Q12`. */
+	alias: string | null;
+	/** The question (canonical in-block markdown). */
+	text: string;
+	options: string[];
+	/** The asker's recommendation: an option (1-based) or in words, and why. */
+	recommend: { option: number | null; text: string | null; reason: string | null };
+	/** The asker went ahead with its recommendation (reversible): nothing waits for it. */
+	proceed: boolean;
+	state: "open" | "answered" | "withdrawn";
+	/** The person asked. */
+	to: { userId: string | null; name: string | null };
+	answer: {
+		option: number | null;
+		text: string | null;
+		/** It is the recommendation. */
+		adopted: boolean;
+		by: { userId: string; name: string | null };
+		at: string;
+		/** Written down by the asking session from the conversation. */
+		relayed: boolean;
+		/** The door the relayed message came through (`gateway:…`, `oauth:…`), when not NarraFork. */
+		relayedVia: string | null;
+	} | null;
+	/**
+	 * The asking session. `hidden`: the viewer may not read it, so neither its id nor its title is
+	 * given (a placeholder is shown).
+	 */
+	askedBy: { narratorId: string | null; title: string | null; hidden: boolean };
+	createdAt: string | null;
+	/** The viewer is the person asked, it is open, and they may write the space. */
+	canAnswer: boolean;
+	/** The block's version: an answer names it, and is refused when it changed since. */
+	versionSeq: number;
+}
+
+/** `GET /blocks/:blockId/questions`: the questions under a block (or a question and its items). */
+export interface OutlineQuestionGroupResponse {
+	group: {
+		blockId: string;
+		spaceId: string;
+		spaceKey: string;
+		pageId: string;
+		title: string;
+		/** The block is itself a question (one asked at the top of a page). */
+		isQuestion: boolean;
+	};
+	questions: OutlineQuestionView[];
+	/** More questions than shown. */
+	truncated: boolean;
+}
+
+/** One answer: a choice, words, both, or the recommendation (`adopt`). */
+export interface OutlineAnswerInput {
+	blockId: string;
+	option?: number;
+	text?: string;
+	adopt?: boolean;
+	/**
+	 * The question's version the person read (`OutlineQuestionView.versionSeq`): checked.
+	 * Required over HTTP ({@link OutlineAnswerRequest}); the service's own callers may omit it.
+	 */
+	versionSeq?: number;
+}
+
+/** One answer as the API takes it: always with the version read. */
+export type OutlineAnswerHttpInput = OutlineAnswerInput & { versionSeq: number };
+
+/** `POST /questions/answer`: questions of one space answered at once. */
+export interface OutlineAnswerRequest {
+	answers: OutlineAnswerHttpInput[];
+}
+
+export interface OutlineAnswerResponse {
+	/** The `answer` commit. */
+	commitId: string | null;
+	answered: string[];
+}
+
+/** A confirmation an agent made on the person's behalf, not acknowledged yet (their digest). */
+export interface OutlineDigestItem {
+	pendingId: string;
+	/** `P` and 8 characters. */
+	label: string;
+	spaceId: string;
+	spaceKey: string;
+	pageId: string;
+	rootBlockId: string | null;
+	summary: string;
+	opCount: number;
+	decidedAt: string | null;
+	/**
+	 * The session that confirmed it. `hidden`: the viewer may not read it, so neither its id nor
+	 * its title is given (a placeholder is shown).
+	 */
+	decidedBy: { narratorId: string | null; title: string | null; hidden: boolean };
+	/** The `confirm` commit: reverting it takes the change back. */
+	commitId: string | null;
+	/** The viewer may write the space, so may revert it (acknowledging needs no access). */
+	canRevert: boolean;
+}
+
+/** `GET /digest`. */
+export interface OutlineDigestResponse {
+	items: OutlineDigestItem[];
+	/** More than shown. */
+	truncated: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plans (outline P2 PR 8): a plan is a task tree; ExitPlanMode submits its root, and the person
+// decides against the diff from the previous version.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A task's fields as a plan diff shows them. */
+export interface OutlinePlanTaskView {
+	status: OutlineTaskStatus;
+	assignee: string | null;
+	due: string | null;
+	depends: string[];
+}
+
+/** What changed about one block of a plan. */
+export type OutlinePlanChange = "added" | "removed" | "text" | "task" | "moved";
+
+/** One block of a plan's diff against its previous version, in tree order. */
+export interface OutlinePlanDiffEntry {
+	blockId: string;
+	sid: string;
+	changes: OutlinePlanChange[];
+	/** Depth under the plan root (0: the root), in the tree it is shown from (removed: before). */
+	depth: number;
+	/** The text before and after (clipped); null when the block was not there. */
+	before: string | null;
+	after: string | null;
+	/** The task fields before and after; null when it was not a task (or not there). */
+	taskBefore: OutlinePlanTaskView | null;
+	taskAfter: OutlinePlanTaskView | null;
+	/** For an added, moved or removed block: its parent's title (where it is, or was). */
+	parentTitle?: string | null;
+}
+
+/** How many blocks of each kind a plan diff has (each block counted once per change). */
+export interface OutlinePlanDiffCounts {
+	added: number;
+	removed: number;
+	text: number;
+	task: number;
+	moved: number;
+}
+
+/** `GET /plans/:blockId/diff`: a plan against the version it is compared with (bounded). */
+export interface OutlinePlanDiffResponse {
+	root: { blockId: string; spaceId: string; address: string; title: string };
+	/** The seq compared from (0: nothing before, everything is new) and the seq shown. */
+	fromSeq: number;
+	toSeq: number;
+	counts: OutlinePlanDiffCounts;
+	entries: OutlinePlanDiffEntry[];
+	/** More changes than shown, or a plan larger than one diff reads. */
+	truncated: boolean;
+}
+
+/** One comment of a plan review (outline P2 PR 8b): a child block of the review's block. */
+export interface OutlinePlanReviewComment {
+	/** The comment's text, without the link to its target. */
+	text: string;
+	/** The block of the plan it is about, when it names one. */
+	target: { address: string; title: string } | null;
+}
+
+/**
+ * A plan review's comments (outline P2 PR 8b, D48 Q1): one block 「审查意见（第 N 版）」 under the
+ * plan root, each comment a child of it. The person decides with them in view; nothing goes back
+ * to the planning agent until they decide.
+ */
+export interface OutlinePlanReview {
+	/** The review's block under the plan root, and its address. */
+	blockId: string;
+	address: string;
+	/** The version reviewed. */
+	round: number;
+	/** How many comments it holds (as written). */
+	count: number;
+	/** The comments as written, at most `OUTLINE_PLAN_LIMITS.reviewComments`. */
+	comments: OutlinePlanReviewComment[];
+	/**
+	 * The seq of the version the review reviewed (the submission's): what the person changed
+	 * since then is what the agent is told they changed while deciding.
+	 */
+	submittedSeq: number;
+}
+
+/**
+ * What a pending ExitPlanMode of an outline session carries in its input (`_planRoot`,
+ * `_planSeq`, `_planBaseSeq`, `_planDiff`, `_planReview`): enough for the approval card to show
+ * its summary and fetch the diff.
+ */
+export interface OutlinePlanSubmission {
+	root: {
+		blockId: string;
+		spaceId: string;
+		/** The page the plan is on (what the card subscribes to, to refresh its diff). */
+		pageId: string;
+		address: string;
+		title: string;
+		round: number;
+	};
+	/** The seq of the version submitted. */
+	seq: number;
+	/** The seq it is compared with. */
+	baseSeq: number;
+	counts: OutlinePlanDiffCounts;
+	truncated: boolean;
+	/** What the agent said changed in this version. */
+	summary: string | null;
+	/** The plan review's comments on this version, when a review left any (PR 8b). */
+	review: OutlinePlanReview | null;
+}
+
+/** `POST /narrators/permissions/:requestId/plan`: the person's decision on a submitted plan. */
+export interface OutlinePlanDecisionRequest {
+	/** `return`: back to the agent with feedback; `draft`: execute; `lock`: lock, then execute. */
+	action: "return" | "draft" | "lock";
+	feedback?: string;
+	/** `lock`: the session that may confirm step changes on the person's behalf. */
+	delegate?: string | null;
+	/** The seq of the diff the person looked at: a change by someone else since is a 409. */
+	seenSeq: number;
+	/** Reset the context onto the plan before executing. */
+	compactAfter?: boolean;
+}
+
+export interface OutlinePlanDecisionResponse {
+	ok: true;
+	/** The commit the decision wrote. */
+	commit: { id: string; seq: number } | null;
 }

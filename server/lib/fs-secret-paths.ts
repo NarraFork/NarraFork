@@ -50,6 +50,8 @@ import { narraforkDir } from "./settings";
 const SECRET_HOME_FILES: readonly string[] = [
 	"settings.json", // holds auth.jwtSecret — forging MFA challenges and internal signatures
 	"codex-credentials.json",
+	"provider-keys.json",
+	"secret.key", // decrypts every credential file (secret-store.ts)
 	"update-server.json",
 	"update-server-test.json",
 	"narrafork.lock",
@@ -70,6 +72,7 @@ const SECRET_HOME_DIRS: readonly string[] = [
 	"editor-transfers",
 	"editor-native",
 	"editor-native-operations",
+	"image-generation-responses",
 	...PRIVATE_RECORDING_DIRS,
 ];
 
@@ -207,17 +210,28 @@ export function isSecretPlatformPath(absPath: string, dir: string = narraforkDir
  */
 const SECRET_USER_DIRS: readonly string[] = [".ssh", ".aws", ".gnupg", ".kube"];
 
-/** A path inside a well-known third-party credential store under `home`. */
-export function isSecretUserPath(absPath: string, home: string): boolean {
+function matchesSecretUserPath(home: string, target: string): boolean {
 	const base = resolve(home);
-	const target = resolve(absPath);
-	if (!isInsidePath(base, target)) return false;
-	const relative = relativePath(base, target);
+	const absTarget = resolve(target);
+	if (!isInsidePath(base, absTarget)) return false;
+	const relative = relativePath(base, absTarget);
 	if (!relative) return false;
 	const first = relative.split(/[\\/]/)[0] ?? "";
 	// Only when it is a real path segment, so a file literally named `.ssh` in the
 	// home directory is not mistaken for the directory.
 	return SECRET_USER_DIRS.includes(first) && relative.length > first.length;
+}
+
+/**
+ * A path inside a well-known third-party credential store under `home`.
+ *
+ * Checked against both the lexical path and its realpath, same as platform secrets. A symlink
+ * named `notes.txt` whose target is `~/.ssh/id_rsa` is otherwise a normal file to every caller
+ * that only looks at the spelling, including the public download ticket.
+ */
+export function isSecretUserPath(absPath: string, home: string): boolean {
+	if (matchesSecretUserPath(home, absPath)) return true;
+	return matchesSecretUserPath(physicalOrLexicalPath(home), physicalOrLexicalPath(absPath));
 }
 
 /** Message used by both routes, so the two cannot describe the refusal differently. */

@@ -122,6 +122,15 @@ export const listDraftSubmissionsQuerySchema = z.object({
 	limit: z.coerce.number().int().positive().max(200).optional(),
 });
 
+/**
+ * Author acknowledging verdicts in the notification bell. Ids only — the server scopes the
+ * update to the caller's own submissions, so an id from someone else is a no-op rather than
+ * an authorization decision the client has to get right.
+ */
+export const markSubmissionOutcomesReadSchema = z.object({
+	ids: z.array(z.string().min(1).max(64)).min(1).max(50),
+});
+
 // === review ===
 const findingSchema = z.object({
 	severity: z.enum(["critical", "major", "minor", "suggestion"]),

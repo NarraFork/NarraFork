@@ -108,6 +108,71 @@ afterAll(() => {
 	mock.restore();
 });
 
+describe("auxiliary content display preference", () => {
+	async function patch(body: Record<string, unknown>) {
+		return requestJson("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	}
+
+	it("defaults to compact display before and after an unrelated first save", async () => {
+		seedUser();
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: true });
+		expect((await patch({ wordWrapCode: false })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: true });
+	});
+
+	it("persists an explicit legacy choice on first save and across clients", async () => {
+		seedUser();
+		const saved = await patch({ compactAuxiliaryContent: false });
+		expect(saved.status).toBe(200);
+		expect(saved.body).toMatchObject({ compactAuxiliaryContent: false });
+		// A separate request reads the account preference, not browser-local state.
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: false });
+		expect((await patch({ wordWrapCode: false })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({
+			compactAuxiliaryContent: false,
+			wordWrapCode: false,
+		});
+		expect((await patch({ compactAuxiliaryContent: true })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: true });
+	});
+
+	it("updates existing preferences without changing another user's choice", async () => {
+		seedPreferences([]);
+		expect((await patch({ compactAuxiliaryContent: false })).status).toBe(200);
+		db.insert(users)
+			.values({
+				id: "other-user",
+				username: "other-user",
+				passwordHash: "test",
+				role: "user",
+				createdAt: NOW,
+			})
+			.run();
+		authUser.sub = "other-user";
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: true });
+		expect((await patch({ compactAuxiliaryContent: true })).status).toBe(200);
+		authUser.sub = "user-1";
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: false });
+	});
+
+	it("accepts only boolean choices", () => {
+		for (const value of [true, false]) {
+			expect(
+				updateUserPreferencesSchema.safeParse({ compactAuxiliaryContent: value }).success,
+			).toBe(true);
+		}
+		for (const value of ["false", 0, null, {}]) {
+			expect(
+				updateUserPreferencesSchema.safeParse({ compactAuxiliaryContent: value }).success,
+			).toBe(false);
+		}
+	});
+});
+
 describe("local access preference", () => {
 	async function patch(body: Record<string, unknown>) {
 		return requestJson("/", {
@@ -637,7 +702,7 @@ describe("narrator typography preferences", () => {
 			narratorFontScalePercent: 111,
 			narratorLetterSpacingPercent: 7,
 			narratorParagraphScalePercent: 133,
-			narratorLineHeightScalePercent: 144,
+			narratorLineHeightV2Percent: 144,
 		};
 		const patchResult = await requestJson("/", {
 			method: "PATCH",
@@ -645,10 +710,11 @@ describe("narrator typography preferences", () => {
 			body: JSON.stringify(typography),
 		});
 		expect(patchResult.status).toBe(200);
-		expect(patchResult.body).toMatchObject(typography);
+		// The old-scale column carries the mirror (144 × 1.2), not a neighbour's value.
+		expect(patchResult.body).toMatchObject({ ...typography, narratorLineHeightScalePercent: 173 });
 
 		const getResult = await requestJson("/");
-		expect(getResult.body).toMatchObject(typography);
+		expect(getResult.body).toMatchObject({ ...typography, narratorLineHeightScalePercent: 173 });
 	});
 
 	it("creates a row carrying all four values when none exists yet", async () => {
@@ -658,7 +724,7 @@ describe("narrator typography preferences", () => {
 			narratorFontScalePercent: 90,
 			narratorLetterSpacingPercent: -3,
 			narratorParagraphScalePercent: 120,
-			narratorLineHeightScalePercent: 80,
+			narratorLineHeightV2Percent: 80,
 		};
 		const patchResult = await requestJson("/", {
 			method: "PATCH",
@@ -674,7 +740,8 @@ describe("narrator typography preferences", () => {
 			narratorFontScalePercent: 125,
 			narratorLetterSpacingPercent: 5,
 			narratorParagraphScalePercent: 115,
-			narratorLineHeightScalePercent: 135,
+			narratorLineHeightScalePercent: 162,
+			narratorLineHeightV2Percent: 135,
 		});
 
 		const patchResult = await requestJson("/", {
@@ -688,7 +755,8 @@ describe("narrator typography preferences", () => {
 			narratorFontScalePercent: 125,
 			narratorLetterSpacingPercent: 5,
 			narratorParagraphScalePercent: 115,
-			narratorLineHeightScalePercent: 135,
+			narratorLineHeightScalePercent: 162,
+			narratorLineHeightV2Percent: 135,
 		});
 	});
 
@@ -703,6 +771,152 @@ describe("narrator typography preferences", () => {
 
 		const { body } = await requestJson("/");
 		expect(body).toMatchObject({ narratorFontScalePercent: 100 });
+	});
+});
+
+/**
+ * The line-height rescale (the old 120% is the new 100%, LINE_HEIGHT_BASELINE_PERCENT).
+ *
+ * The old column is never rewritten by the rescale: the new value is derived from it on
+ * read until the reader saves on the new scale. So the rescale cannot run twice, a
+ * downgrade still finds its own column, and a client built before the rescale (still
+ * sending `narratorLineHeightScalePercent`) has its value converted on write.
+ */
+describe("narrator line height across the rescale", () => {
+	const v2Of = async () =>
+		((await requestJson("/")).body as { narratorLineHeightV2Percent: number })
+			.narratorLineHeightV2Percent;
+
+	it("reads the new default for a reader with no preferences row", async () => {
+		seedUser();
+		expect(await requestJson("/")).toMatchObject({
+			status: 200,
+			body: { narratorLineHeightV2Percent: 100, narratorLineHeightScalePercent: 100 },
+		});
+	});
+
+	it("gives a row saved before the rescale at the old default the NEW (taller) default", async () => {
+		// Every pre-rescale row carries 100 in the old column whether or not the reader ever
+		// touched the slider (the INSERT writes the default); 100 is also what reset wrote.
+		seedPreferences([], { narratorLineHeightScalePercent: 100 });
+		expect(await v2Of()).toBe(100);
+	});
+
+	it("keeps the effective line height of every custom value saved on the old scale", async () => {
+		for (const [legacy, expected] of [
+			[120, 100], // the decision's own example: old 120% is the new 100%
+			[150, 125],
+			[110, 92],
+			[75, 63], // the old floor still has a place on the new scale
+			[220, 183], // and so does the old ceiling
+		] as const) {
+			cleanDb(sqlite);
+			seedPreferences([], { narratorLineHeightScalePercent: legacy });
+			expect(await v2Of()).toBe(expected);
+		}
+	});
+
+	it("never rescales twice: reads and unrelated writes leave both columns as they were", async () => {
+		seedPreferences([], { narratorLineHeightScalePercent: 150 });
+		for (let i = 0; i < 3; i++) expect(await v2Of()).toBe(125);
+		await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ terminalFontSize: 16 }),
+		});
+		expect(await v2Of()).toBe(125);
+		const row = db.select().from(userPreferences).all()[0];
+		expect(row?.narratorLineHeightScalePercent).toBe(150);
+		expect(row?.narratorLineHeightV2Percent).toBeNull();
+	});
+
+	it("stores a new-scale value as given, mirrored onto the old column for a downgrade", async () => {
+		seedPreferences([], { narratorLineHeightScalePercent: 150 });
+		const { body } = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ narratorLineHeightV2Percent: 92 }),
+		});
+		expect(body).toMatchObject({
+			narratorLineHeightV2Percent: 92,
+			narratorLineHeightScalePercent: 110,
+		});
+		// Once saved on the new scale, the old column no longer decides anything.
+		expect(await v2Of()).toBe(92);
+	});
+
+	it("converts an old-scale value from a client built before the rescale", async () => {
+		seedPreferences([], { narratorLineHeightV2Percent: 100 });
+		const { body } = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ narratorLineHeightScalePercent: 130 }),
+		});
+		expect(body).toMatchObject({
+			narratorLineHeightScalePercent: 130,
+			narratorLineHeightV2Percent: 108,
+		});
+	});
+
+	it("takes a change made by an older build after a downgrade (the old column is newer)", async () => {
+		// The pair this build wrote: 92 on the new scale, its mirror 110 on the old one.
+		seedPreferences([], { narratorLineHeightScalePercent: 110, narratorLineHeightV2Percent: 92 });
+		expect(await v2Of()).toBe(92);
+		// A build from before the rescale (a downgrade) changes the line height: it writes only
+		// the old column. Back on this build, that newer choice is what the reader sees.
+		db.update(userPreferences).set({ narratorLineHeightScalePercent: 130 }).run();
+		expect(await v2Of()).toBe(108);
+		// A reset there (old 100) reads as the new default.
+		db.update(userPreferences).set({ narratorLineHeightScalePercent: 100 }).run();
+		expect(await v2Of()).toBe(100);
+		// Reading wrote nothing: the stale new-scale value is still stored.
+		expect(db.select().from(userPreferences).all()[0]?.narratorLineHeightV2Percent).toBe(92);
+	});
+
+	it("keeps every pair this build writes, at the edges of both ranges too", async () => {
+		const {
+			legacyLineHeightPercentFrom,
+			lineHeightPercentFromLegacy,
+			lineHeightPercentFromStored: readLineHeightV2,
+		} = await import("@shared/pretext-layout/typography");
+		for (let v2 = 60; v2 <= 185; v2++) {
+			expect(readLineHeightV2(v2, legacyLineHeightPercentFrom(v2))).toBe(v2);
+		}
+		for (let legacy = 75; legacy <= 220; legacy++) {
+			const v2 = lineHeightPercentFromLegacy(legacy);
+			expect(readLineHeightV2(v2, legacy)).toBe(v2);
+		}
+	});
+
+	it("validates each field on its own scale", async () => {
+		seedPreferences([]);
+		for (const payload of [
+			{ narratorLineHeightV2Percent: 59 },
+			{ narratorLineHeightV2Percent: 186 },
+			{ narratorLineHeightScalePercent: 74 },
+			{ narratorLineHeightScalePercent: 221 },
+		]) {
+			const response = await app.request("/", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(payload),
+			});
+			expect(response.status).not.toBe(200);
+		}
+		// 60 / 185 and 75 / 220 are the inclusive bounds.
+		for (const payload of [
+			{ narratorLineHeightV2Percent: 60 },
+			{ narratorLineHeightV2Percent: 185 },
+			{ narratorLineHeightScalePercent: 75 },
+			{ narratorLineHeightScalePercent: 220 },
+		]) {
+			const response = await app.request("/", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(payload),
+			});
+			expect(response.status).toBe(200);
+		}
 	});
 });
 
@@ -728,16 +942,13 @@ describe("recent-tabs route contracts", () => {
 		expect("tabs" in (body as Record<string, unknown>)).toBe(false);
 	});
 
-	it("atomically batch-upserts workspace headers and children", async () => {
+	it("batch-upserts tabs in one revision but never creates folders", async () => {
 		seedPreferences([]);
 		const { status, body } = await requestJson("/recent-tabs/batch", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
-				tabs: [
-					tab("child-1", { workspaceId: "workspace-1" }),
-					tab("workspace-1", { type: "workspace" }),
-				],
+				tabs: [tab("child-1", { folderId: "folder-1" }), tab("folder-1", { type: "folder" })],
 			}),
 		});
 
@@ -745,14 +956,61 @@ describe("recent-tabs route contracts", () => {
 		expect(body).toMatchObject({ changed: true, baseRevision: 0, revision: 1 });
 		expect(
 			db
-				.select({ key: userRecentTabs.tabKey, workspaceId: userRecentTabs.workspaceId })
+				.select({ key: userRecentTabs.tabKey, folderId: userRecentTabs.folderId })
+				.from(userRecentTabs)
+				.orderBy(userRecentTabs.sortOrder)
+				.all(),
+		).toEqual([{ key: "narrator:child-1", folderId: null }]);
+	});
+
+	it("creates, edits and dissolves a folder through its routes", async () => {
+		seedPreferences([tab("a"), tab("b"), tab("c")]);
+		const created = await requestJson("/recent-tabs/folders", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ targetKey: "narrator:a", sourceKey: "narrator:c", title: "Work" }),
+		});
+		expect(created.status).toBe(200);
+		const folderId = (created.body as { folderId: string }).folderId;
+		expect(folderId).toBeString();
+
+		const edited = await requestJson(`/recent-tabs/folders/${folderId}`, {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ icon: "rocket", color: "teal", previewCount: 1 }),
+		});
+		expect(edited.status).toBe(200);
+		const moved = await requestJson("/recent-tabs/move", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ key: "narrator:b", folderId }),
+		});
+		expect(moved.status).toBe(200);
+		expect(
+			db
+				.select({ key: userRecentTabs.tabKey, folderId: userRecentTabs.folderId })
 				.from(userRecentTabs)
 				.orderBy(userRecentTabs.sortOrder)
 				.all(),
 		).toEqual([
-			{ key: "workspace:workspace-1", workspaceId: null },
-			{ key: "narrator:child-1", workspaceId: "workspace-1" },
+			{ key: `folder:${folderId}`, folderId: null },
+			{ key: "narrator:a", folderId },
+			{ key: "narrator:c", folderId },
+			{ key: "narrator:b", folderId },
 		]);
+
+		const dissolved = await requestJson(`/recent-tabs/folders/${folderId}/dissolve`, {
+			method: "POST",
+		});
+		expect(dissolved.status).toBe(200);
+		expect(
+			db
+				.select({ key: userRecentTabs.tabKey })
+				.from(userRecentTabs)
+				.orderBy(userRecentTabs.sortOrder)
+				.all()
+				.map((row) => row.key),
+		).toEqual(["narrator:a", "narrator:c", "narrator:b"]);
 	});
 
 	it("supports section pagination and key-relative moves", async () => {

@@ -1,0 +1,70 @@
+/*
+ * Theme native scrollers, including the recent-tabs sidebar, without replacing
+ * their scroll containers. Zero-specificity rules let component styles keep
+ * ownership of hidden scrollbars (collapsed navigation, ScrollArea, editors).
+ * Forced-colors users retain the system's scrollbar dimensions and palette.
+ */
+@media (forced-colors: none) {
+	:root {
+		--nf-scrollbar-size: 6px;
+		--nf-scrollbar-thumb: var(--mantine-color-gray-6, #868e96);
+		--nf-scrollbar-thumb-hover: var(--mantine-color-gray-7, #495057);
+	}
+
+	:root[data-mantine-color-scheme="dark"] {
+		--nf-scrollbar-thumb: var(--mantine-color-dark-2, #909296);
+		--nf-scrollbar-thumb-hover: var(--mantine-color-dark-1, #c1c2c5);
+	}
+
+	/* Firefox and touch devices use the standard native thin scrollbar. */
+	:where(*) {
+		scrollbar-width: thin;
+		scrollbar-color: var(--nf-scrollbar-thumb) transparent;
+	}
+
+	:where(*:hover) {
+		scrollbar-color: var(--nf-scrollbar-thumb-hover) transparent;
+	}
+
+	/*
+	 * Desktop Chromium/WebKit can also hide the arrow buttons and fix the
+	 * thickness. Non-auto standard properties override these pseudo-elements,
+	 * so reset them ONLY in this branch. Include keyboard-only/no-pointer
+	 * environments, but leave coarse-pointer touch scrollbars OS-controlled.
+	 */
+	@media (pointer: fine), (pointer: none) {
+		@supports selector(::-webkit-scrollbar) {
+			:where(*) {
+				scrollbar-width: auto;
+				scrollbar-color: auto;
+			}
+
+			:where(*)::-webkit-scrollbar {
+				width: var(--nf-scrollbar-size);
+				height: var(--nf-scrollbar-size);
+			}
+
+			:where(*)::-webkit-scrollbar-track,
+			:where(*)::-webkit-scrollbar-corner {
+				background: transparent;
+			}
+
+			:where(*)::-webkit-scrollbar-thumb {
+				min-width: 24px;
+				min-height: 24px;
+				border-radius: 999px;
+				background: var(--nf-scrollbar-thumb);
+			}
+
+			:where(*)::-webkit-scrollbar-thumb:hover {
+				background: var(--nf-scrollbar-thumb-hover);
+			}
+
+			:where(*)::-webkit-scrollbar-button {
+				display: none;
+				width: 0;
+				height: 0;
+			}
+		}
+	}
+}

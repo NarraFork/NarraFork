@@ -303,8 +303,8 @@
 	"activeBackgroundTasks": "{{count}} 个后台任务正在运行",
 	"activeBackgroundServices": "{{count}} 个后台服务正在运行",
 	"viewersWatching": "{{count}} 人正在查看",
-	"swipePin": "置顶",
-	"swipeUnpin": "取消置顶",
+	"recentTabScheduled": "由定时任务启动",
+	"recentTabHasDraft": "有未发送的草稿",
 	"containerRunning": "容器运行中",
 	"containerPaused": "容器已暂停",
 	"containerStopped": "容器已停止",
@@ -313,6 +313,7 @@
 	"browse": "浏览",
 	"selectDirectory": "选择目录",
 	"selectThisDirectory": "选择此目录",
+	"directoryList": "目录列表",
 	"goUp": "上一级",
 	"emptyDirectory": "空目录",
 	"noMatchingDirectories": "没有匹配的目录",
@@ -799,5 +800,6 @@
 	"imageViewer_copyUnavailableDownloaded": "当前环境无法写入剪贴板，已改为下载图片",
 	"imageViewer_copyFailed": "复制图片失败",
 	"imageViewer_downloadFailed": "下载图片失败",
-	"botBadge": "Bot"
+	"botBadge": "Bot",
+	"swipeMenu": "菜单"
 }

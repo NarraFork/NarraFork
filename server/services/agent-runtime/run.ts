@@ -1,3 +1,5 @@
+import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
+
 /**
  * The one way a narrator run starts, is controlled, and ends.
  *
@@ -13,6 +15,8 @@
  * and the live {@link RunControl} on its owner record. A delegation is a caller that
  * registers those facts; any two sessions can be related the same way.
  */
+
+import type { MediaRef } from "@shared/media-attachments";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
@@ -29,8 +33,10 @@ import {
 	RUNTIME_SOURCE_COLUMNS,
 	runDeliverToOf,
 } from "../../lib/runtime-source";
+import { withSqlTraceSpan } from "../../lib/sql-trace";
 import type { ImageRef } from "../../lib/uploads";
 import {
+	type DelegatedTaskRegistration,
 	type RunBindingInput,
 	type RunDeliverTo,
 	type RuntimeRunBinding,
@@ -64,6 +70,7 @@ export interface StartNarratorRunRequest {
 	locale: Locale;
 	text: string;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	replyInUserLanguage?: boolean;
 	/** An already prepared session (an input path persisted the user turn into it). */
 	active?: ActiveNarrator;
@@ -84,6 +91,8 @@ export interface StartNarratorRunRequest {
 	resumeRunId?: string;
 	/** Recovery of a run that already executed: its attribution window is kept. */
 	recovered?: boolean;
+	/** A recovery explanation may settle active projections, never overwrite terminal ones. */
+	convergeOnlyActiveProjections?: boolean;
 	/** Recovery that must not deliver into a call that already has its result. */
 	deliver?: boolean;
 	/** The caller's own cancellation (the caller attempt of a foreground delegation). */
@@ -181,7 +190,7 @@ async function prepareLogicalRun(
 	// result delivers through a task row instead of rewriting that result.
 	const inherited = !(req.binding || req.resumeRunId || req.recovered);
 	if (!req.foreground && (deliverTo.viaTask || (inherited && (await settled(deliverTo)))))
-		await projectRunAsTask(narratorId, row, deliverTo, publicationRun, binding);
+		await projectRunAsTask(narratorId, row, deliverTo, publicationRun, binding, req.recovered);
 	return { binding: registered, publicationRun };
 }
 
@@ -206,6 +215,7 @@ async function projectRunAsTask(
 	deliverTo: RunDeliverTo,
 	publicationRun: PublicationRun,
 	binding: RunBindingInput,
+	recovered?: boolean,
 ): Promise<void> {
 	const [{ backgroundTaskService }, { registerAndPersistSubagentAlias }] = await Promise.all([
 		import("../background-task-service"),
@@ -213,6 +223,10 @@ async function projectRunAsTask(
 	]);
 	const task = await backgroundTaskService.getById(narratorId).catch(() => null);
 	if (task?.status === "running" && task.logicalRunId === publicationRun.logicalRunId) return;
+	// Recovery continues THIS run. Restarting its settled task row here would mint a
+	// new logical run before the recovered-run check, leaving the old result undelivered
+	// and the new row running forever. The terminal row already describes this run.
+	if (recovered && task && task.logicalRunId === publicationRun.logicalRunId) return;
 	// The id belongs to another caller's task: deliver to the tool call instead.
 	if (task && (task.type !== "agent" || task.parentNarratorId !== deliverTo.narratorId)) return;
 	const alias =
@@ -301,7 +315,12 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 		setRunControl(owner, run);
 		// The model and every preparation step run outside the short start mutex. A
 		// foreground caller not handed back by a detach receives the terminal itself.
-		const completion = withNarratorWorkAdmission(id, () => executeRun(req, owner, run)).then(
+		const completion = withSqlTraceSpan(
+			"agent",
+			"agent run",
+			{ narratorId: id, ...(req.foreground ? { foreground: true } : {}) },
+			() => withNarratorWorkAdmission(id, () => executeRun(req, owner, run)),
+		).then(
 			(result) => {
 				resolveTerminal(result);
 				settleForeground(result);
@@ -357,14 +376,28 @@ async function executeRun(
 	/** False until `prepareLogicalRun` has returned the destination, including "none". */
 	let deliverToResolved = false;
 	let publicationRun: PublicationRun | undefined;
+	/** The outline task the session was sent to do: its results are attached under it. */
+	let delegated: DelegatedTaskRegistration | undefined;
 	let finished = false;
 	try {
+		// Notification locale is display-only. A trusted recovery snapshot may seed a legacy row.
+		const replyContext = await ensureReplyContext(
+			id,
+			req.recovered
+				? {
+						locale: req.locale,
+						replyInUserLanguage: req.replyInUserLanguage ?? false,
+					}
+				: undefined,
+		);
 		// The one session construction, outside every admission transaction.
 		active =
 			req.active ??
 			(await sessionModule.ensureNarrator(id, req.locale, req.replyInUserLanguage ?? false));
+		syncActiveReplyContext(id, replyContext);
 		const session = active;
 		const source = await readRunSource(id);
+		delegated = readRuntimeRegistrationColumn(source.runtimeRegistrationJson)?.delegatedTask;
 		// Only human input or this session's own registration establishes identity.
 		// An explicitly anonymous binding must not fall through to an old session user.
 		const principal =
@@ -464,11 +497,17 @@ async function executeRun(
 				backgroundTaskService.registerAbortController(id, run.cancel);
 		}
 		if (req.recovered && publicationRun) {
-			const committed = await getRuntimePublicationService().readAgentTerminalResult(
-				publicationRun,
-				{ includeEventKind: true },
-			);
-			const checkpoint = !committed
+			// The publication slots, not the readability of the result, decide whether this
+			// run may execute again. A settled run NEVER runs the model a second time.
+			const publicationState =
+				await getRuntimePublicationService().readRunPublicationState(publicationRun);
+			const settled = publicationState.state === "settled";
+			const committed = settled
+				? await getRuntimePublicationService().readAgentTerminalResult(publicationRun, {
+						includeEventKind: true,
+					})
+				: null;
+			const checkpoint = !settled
 				? await db.query.narrators.findFirst({
 						where: and(eq(narrators.id, id), eq(narrators.logicalRunId, binding.logicalRunId)),
 						columns: {
@@ -505,6 +544,7 @@ async function executeRun(
 					deliverTo,
 					publicationRun,
 					{
+						delegated,
 						finalText: saved.output,
 						committedEvent: saved.eventKind,
 						...(pending && checkpoint
@@ -518,7 +558,27 @@ async function executeRun(
 								}
 							: {}),
 					},
-					req,
+					settled ? { ...req, convergeOnlyActiveProjections: true } : req,
+				);
+			}
+			if (settled) {
+				// The terminal was already published but its snapshot is unreadable. Reuse the
+				// normal delivery path so task/narrator projections, legacy targets and PG
+				// composites all converge, but only projections that are still ACTIVE may be
+				// written; an existing terminal result is never replaced by this explanation.
+				finished = true;
+				allowInboxWake = true;
+				return await finishRun(
+					id,
+					run,
+					deliverTo,
+					publicationRun,
+					{
+						finalText:
+							"Recovered after restart: this run had already published its terminal result, but the stored result is no longer readable. The run was not executed again.",
+						committedEvent: publicationState.eventKind ?? "failed",
+					},
+					{ ...req, convergeOnlyActiveProjections: true },
 				);
 			}
 		}
@@ -532,6 +592,7 @@ async function executeRun(
 					req.images,
 					run,
 					req.prePromptBashCommand,
+					req.media,
 				);
 		for (;;) {
 			// The loop's async cleanup may have admitted a hold after its last boundary.
@@ -574,11 +635,12 @@ async function executeRun(
 					input.images,
 					run,
 					input.prePromptBashCommand,
+					input.media,
 				);
 		}
 		allowInboxWake = outcome.allowInboxWake === true;
 		finished = true;
-		return await finishRun(id, run, deliverTo, publicationRun, outcome, req);
+		return await finishRun(id, run, deliverTo, publicationRun, { ...outcome, delegated }, req);
 	} catch (error) {
 		// Infrastructure failure is not a successful turn boundary. In particular,
 		// do not auto-start queued work over a retained same-run terminal checkpoint.
@@ -593,7 +655,7 @@ async function executeRun(
 				run,
 				deliverTo,
 				publicationRun,
-				{ hasError: true, finalText: failureText },
+				{ hasError: true, finalText: failureText, delegated },
 				req,
 			).catch((finalizeError) =>
 				logger.warn("Run finalization after failure failed", {
@@ -687,6 +749,8 @@ interface RunOutcome {
 	freshInput?: boolean;
 	/** Immutable classification when recovery observes an already committed terminal. */
 	committedEvent?: "completed" | "failed" | "timed_out" | "cancelled";
+	/** The outline task the session was sent to do (outline P2 PR 9a): see `delegatedDelivery`. */
+	delegated?: DelegatedTaskRegistration;
 }
 
 /**
@@ -750,11 +814,6 @@ async function finishRun(
 	};
 	// Keep the exact answer for a release retry even when rendering/commit fails.
 	if (hold) hold.result = base;
-	const output =
-		deliverTo && publicationRun
-			? await renderResult(id, deliverTo, publicationRun, finalText)
-			: finalText;
-	const result: RunResult = { ...base, output };
 	const eventKind = timedOut
 		? "timed_out"
 		: hasError
@@ -762,6 +821,27 @@ async function finishRun(
 			: interrupted
 				? "cancelled"
 				: "completed";
+	// What reaches the destination: a session sent with an outline task attaches its result under
+	// the task first, and the destination gets the result with a note saying where and how.
+	const delegatedResult =
+		deliverTo && publicationRun && req.deliver !== false && outcome.delegated
+			? await delegatedDelivery(id, outcome.delegated, publicationRun.logicalRunId, {
+					delivered: finalText,
+					report: outcome.finalText ?? "",
+					ending: eventKind,
+					principal: run.principal ?? null,
+				})
+			: null;
+	const delivered = delegatedResult?.text ?? finalText;
+	const output =
+		deliverTo && publicationRun
+			? await renderResult(id, deliverTo, publicationRun, delivered)
+			: finalText;
+	const result: RunResult = {
+		...base,
+		output,
+		...(delegatedResult?.note ? { outlineReport: delegatedResult.note } : {}),
+	};
 	try {
 		if (deliverTo && publicationRun && req.deliver !== false) {
 			if (foregroundCaller) {
@@ -770,19 +850,25 @@ async function finishRun(
 				await getRuntimePublicationService().commitAgentTerminal({
 					run: publicationRun,
 					eventKind,
-					text: finalText,
+					text: delivered,
 					summary: "Foreground agent result delivered",
 					delivery: "foreground",
 				});
 				await bindResultMessage(id, deliverTo);
 			} else {
 				const deliver = () =>
-					deliverDetachedResult(id, deliverTo, publicationRun, {
-						eventKind,
-						finalText,
-						hasError,
-						principal: run.principal ?? null,
-					});
+					deliverDetachedResult(
+						id,
+						deliverTo,
+						publicationRun,
+						{
+							eventKind,
+							finalText: delivered,
+							hasError,
+							principal: run.principal ?? null,
+						},
+						req.convergeOnlyActiveProjections,
+					);
 				// No caller can retry a background/detached source transaction. Retry
 				// transient locks here; a hold keeps its explicit release-retry contract.
 				if (hold) await deliver();
@@ -844,6 +930,31 @@ async function finishRun(
 	return result;
 }
 
+/**
+ * A delegated session's result as it is delivered (outline P2 PR 9a): attached under its outline
+ * task first (`outline/delegation.ts`, idempotent per logical run), then handed on with the note
+ * saying where and whether it is late. Never throws: the result is delivered either way.
+ */
+async function delegatedDelivery(
+	id: string,
+	delegated: DelegatedTaskRegistration,
+	logicalRunId: string,
+	result: {
+		delivered: string;
+		report: string;
+		ending: TerminalEvent;
+		principal: string | null;
+	},
+): Promise<{ text: string; note: import("@shared/outline-report-note").OutlineReportNote | null }> {
+	try {
+		const { deliverDelegatedResult } = await import("../outline/delegation");
+		return await deliverDelegatedResult({ subagentId: id, delegated, logicalRunId, ...result });
+	} catch (error) {
+		logger.warn("Delegated result delivered without its report", { id, error: String(error) });
+		return { text: result.delivered, note: null };
+	}
+}
+
 async function clearDeliveredHold(id: string, hold: RunHold | undefined): Promise<void> {
 	if (!hold || getRunHold(id) !== hold) return;
 	const { narratorService } = await import("../narrator-service");
@@ -885,7 +996,6 @@ async function renderResult(
 	);
 }
 
-/** Terminal status of a run that delivers to a tool call, and its display frames. */
 async function settleStatus(
 	id: string,
 	deliverTo: RunDeliverTo | undefined,
@@ -1009,6 +1119,7 @@ async function deliverDetachedResult(
 		/** Execution principal the notice is attributed to. */
 		principal: string | null;
 	},
+	onlyIfActive = false,
 ): Promise<void> {
 	const { eventKind, finalText, hasError } = terminal;
 	const { recordTaskNoticeUser } = await import("../parent-injection-queue");
@@ -1034,62 +1145,76 @@ async function deliverDetachedResult(
 			return;
 		}
 	}
-	const { getSubagentResultMessageId, updateToolCallConclusion } = await session();
-	const reference = await resolveDeliveryTarget(id, deliverTo);
-	const summary = `[System] Agent ${id} ${publicationEvent(eventKind)}. Its run has ended.`;
-	const sqlite = getRuntimePublicationService().backend === "sqlite";
-	if (!sqlite) {
-		const output = await renderResult(id, deliverTo, publicationRun, finalText);
-		await getRuntimePublicationService().commitAgentTerminal({
-			run: publicationRun,
-			eventKind,
-			text: finalText,
-			summary,
-			toolConclusion: {
-				...reference,
-				toolUseId: deliverTo.toolUseId,
-				attempt: deliverTo.attempt,
-				output,
-				status: hasError ? "fail" : "success",
-				resultMessageId: await getSubagentResultMessageId(id),
-			},
-		});
-		broadcastToNarrator(deliverTo.narratorId, {
-			type: "subagent_conclusion_updated",
-			narratorId: deliverTo.narratorId,
-			subagentNarratorId: id,
+	try {
+		const { getSubagentResultMessageId, updateToolCallConclusion } = await session();
+		const reference = await resolveDeliveryTarget(id, deliverTo);
+		const summary = `[System] Agent ${id} ${publicationEvent(eventKind)}. Its run has ended.`;
+		const sqlite = getRuntimePublicationService().backend === "sqlite";
+		if (!sqlite) {
+			const output = await renderResult(id, deliverTo, publicationRun, finalText);
+			const committed = await getRuntimePublicationService().commitAgentTerminal({
+				run: publicationRun,
+				eventKind,
+				text: finalText,
+				summary,
+				toolConclusion: {
+					...reference,
+					toolUseId: deliverTo.toolUseId,
+					attempt: deliverTo.attempt,
+					output,
+					status: hasError ? "fail" : "success",
+					resultMessageId: await getSubagentResultMessageId(id),
+					onlyIfActive,
+				},
+			});
+			if (committed.toolConclusionApplied !== false)
+				broadcastToNarrator(deliverTo.narratorId, {
+					type: "subagent_conclusion_updated",
+					narratorId: deliverTo.narratorId,
+					subagentNarratorId: id,
+					toolUseId: deliverTo.toolUseId,
+					output,
+					hasError,
+				});
+			await backgroundTaskService.announcePersistedAgentTerminal(id, publicationRun.logicalRunId);
+			getRuntimePublicationService().schedule();
+			return;
+		}
+		await updateToolCallConclusion({
+			subagentId: id,
+			parentNarratorId: deliverTo.narratorId,
 			toolUseId: deliverTo.toolUseId,
-			output,
+			toolCallId: reference.toolCallId,
+			messageId: reference.messageId,
+			finalText,
 			hasError,
+			resultMessageId: await getSubagentResultMessageId(id),
+			refreshTiming: true,
+			onlyIfActive,
+			onPersist: (tx) => {
+				runtimePublication.commit(
+					{
+						...publicationRun,
+						eventKind,
+						resultRef: runtimePublication.persistResult(publicationRun, finalText, tx, eventKind),
+						summary,
+					},
+					tx,
+				);
+			},
 		});
 		await backgroundTaskService.announcePersistedAgentTerminal(id, publicationRun.logicalRunId);
 		getRuntimePublicationService().schedule();
-		return;
+	} catch (error) {
+		// A recovery explanation is best-effort for a receipt that may already be gone.
+		const validation =
+			error instanceof Error && "code" in error && error.code === "VALIDATION_ERROR";
+		if (onlyIfActive && validation) {
+			getRuntimePublicationService().schedule();
+			return;
+		}
+		throw error;
 	}
-	await updateToolCallConclusion({
-		subagentId: id,
-		parentNarratorId: deliverTo.narratorId,
-		toolUseId: deliverTo.toolUseId,
-		toolCallId: reference.toolCallId,
-		messageId: reference.messageId,
-		finalText,
-		hasError,
-		resultMessageId: await getSubagentResultMessageId(id),
-		refreshTiming: true,
-		onPersist: (tx) => {
-			runtimePublication.commit(
-				{
-					...publicationRun,
-					eventKind,
-					resultRef: runtimePublication.persistResult(publicationRun, finalText, tx, eventKind),
-					summary,
-				},
-				tx,
-			);
-		},
-	});
-	await backgroundTaskService.announcePersistedAgentTerminal(id, publicationRun.logicalRunId);
-	getRuntimePublicationService().schedule();
 }
 
 // === Control ===
@@ -1373,17 +1498,29 @@ async function deliverHeldResult(
 	const hasError = hold.result?.hasError ?? parseSubstatus(current?.substatus).includes("error");
 	const deliverTo = prepared.binding.deliverTo;
 	if (deliverTo && prepared.publicationRun) {
+		const eventKind: TerminalEvent = hold.result?.timedOut
+			? "timed_out"
+			: hold.result?.interrupted
+				? "cancelled"
+				: hasError
+					? "failed"
+					: "completed";
+		const principal = prepared.binding.principal?.userId ?? null;
+		const delegated = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.delegatedTask;
 		await deliverDetachedResult(narratorId, deliverTo, prepared.publicationRun, {
-			eventKind: hold.result?.timedOut
-				? "timed_out"
-				: hold.result?.interrupted
-					? "cancelled"
-					: hasError
-						? "failed"
-						: "completed",
-			finalText,
+			eventKind,
+			finalText: delegated
+				? (
+						await delegatedDelivery(narratorId, delegated, prepared.publicationRun.logicalRunId, {
+							delivered: finalText,
+							report: finalText,
+							ending: eventKind,
+							principal,
+						})
+					).text
+				: finalText,
 			hasError,
-			principal: prepared.binding.principal?.userId ?? null,
+			principal,
 		});
 		await getRuntimePublicationService().releaseUnusedRunSlots(prepared.publicationRun);
 	}

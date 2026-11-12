@@ -27,6 +27,7 @@ const outcome = (
 	verdict: null,
 	findingsJson: findings,
 	reviewedAt: "2026-02-01T00:00:00Z",
+	authorReadAt: null,
 	createdAt: "2026-01-01T00:00:00Z",
 });
 

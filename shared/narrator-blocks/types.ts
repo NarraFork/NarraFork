@@ -86,7 +86,12 @@ export interface FileRefPart {
 	capturedAt: string;
 }
 
-export type BlockPart = TextPart | ImagePart | FilePart | FileRefPart;
+/** Original audio/video. Stored envelopes use references; only transient memory rows may carry bytes. */
+export type MediaPart =
+	| import("../media-attachments").MediaContentBlock
+	| import("../media-attachments").NativeMediaInput;
+
+export type BlockPart = TextPart | ImagePart | MediaPart | FilePart | FileRefPart;
 
 // === Provider metadata (§3.4) ===
 
@@ -128,8 +133,8 @@ export interface ToolResult {
 	/** Adopted ledger attempt; absent for provider-executed tools. */
 	toolCallId?: string;
 	isError?: boolean;
-	/** Images returned by the tool. */
-	parts?: ImagePart[];
+	/** Original image/audio/video assets returned by the tool. */
+	parts?: Array<ImagePart | MediaPart>;
 	/** Text that belongs to this result beyond the tool output. */
 	appendix?: string;
 }
@@ -140,6 +145,8 @@ export interface ToolPayload {
 	executor: "local" | "provider";
 	issuer: "model" | "user";
 	result?: ToolResult;
+	/** Durable retention tombstone: display the receipt, never replay half a call/result. */
+	payloadCleared?: boolean;
 }
 
 export interface ContextPayload {
@@ -254,7 +261,8 @@ export function isModelVisible(block: CanonicalBlock): boolean {
 		case "input":
 			return (
 				block.phase === "done" &&
-				(!!block.modelText || block.payload.parts.some((part) => part.type === "image"))
+				(!!block.modelText ||
+					block.payload.parts.some((part) => ["image", "audio", "video"].includes(part.type)))
 			);
 		case "context":
 			return block.phase === "done" && !!block.modelText;

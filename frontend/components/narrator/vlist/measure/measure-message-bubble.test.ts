@@ -5,6 +5,25 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+/**
+ * `MEASURE_MESSAGE_CONSTANTS` with the text line boxes the measure layer reads LIVE
+ * replaced by their live values. The exported line constants are the bare-Mantine
+ * baseline; the default setting measures lines at 120% of it
+ * (`LINE_HEIGHT_BASELINE_PERCENT`). Padding, gaps and chrome stay as exported.
+ */
+async function liveMessageConstants() {
+	const { MEASURE_MESSAGE_CONSTANTS } = await import("./measure-message-bubble");
+	const { typographyMetrics } = await import("../pretext-fonts");
+	const line = typographyMetrics().line;
+	return {
+		...MEASURE_MESSAGE_CONSTANTS,
+		BODY_LINE_HEIGHT: line.body,
+		COMMAND_LINE_HEIGHT: line.body,
+		COMMAND_PREVIEW_LINE_HEIGHT: line.xs,
+		COMMAND_TOGGLE_HEIGHT: line.xs,
+	};
+}
+
 describe("measureMessageBubble — assistant", () => {
 	it("adds markdown vertical padding around the body", async () => {
 		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
@@ -12,9 +31,9 @@ describe("measureMessageBubble — assistant", () => {
 		);
 		const r = measureMessageBubble({ role: "assistant", text: "Hello world." }, 1000);
 		// one body line + top/bottom assistant padding
-		expect(r.height).toBe(
-			MEASURE_MESSAGE_CONSTANTS.BODY_LINE_HEIGHT + MEASURE_MESSAGE_CONSTANTS.ASSISTANT_PAD_Y * 2,
-		);
+		const c = await liveMessageConstants();
+		expect(MEASURE_MESSAGE_CONSTANTS.ASSISTANT_PAD_Y).toBe(c.ASSISTANT_PAD_Y);
+		expect(r.height).toBe(c.BODY_LINE_HEIGHT + c.ASSISTANT_PAD_Y * 2);
 	});
 
 	it("wraps assistant markdown as width shrinks", async () => {
@@ -134,11 +153,9 @@ describe("measureMessageBubble — user", () => {
 		expect(plain.blocks[0]?.kind).toBe("code");
 	});
 	it("includes bubble padding and header row", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
+		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const r = measureMessageBubble({ role: "user", text: "hi" }, 1000);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const c = await liveMessageConstants();
 		const expected =
 			c.USER_BUBBLE_PADDING * 2 +
 			c.USER_HEADER_HEIGHT +
@@ -148,22 +165,18 @@ describe("measureMessageBubble — user", () => {
 	});
 
 	it("omits header height when hasHeader is false", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
+		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const withHeader = measureMessageBubble({ role: "user", text: "hi" }, 1000);
 		const noHeader = measureMessageBubble({ role: "user", text: "hi", hasHeader: false }, 1000);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const c = await liveMessageConstants();
 		expect(withHeader.height - noHeader.height).toBe(c.USER_HEADER_HEIGHT + c.USER_HEADER_BODY_GAP);
 	});
 
 	it("preserves hard newlines in plain user text (pre-wrap, not markdown)", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
+		const { measureMessageBubble } = await import("./measure-message-bubble");
 		// Markdown would collapse these into one paragraph; pre-wrap keeps 3 lines.
 		const r = measureMessageBubble({ role: "user", text: "line1\nline2\nline3" }, 1000);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const c = await liveMessageConstants();
 		const bodyHeight =
 			r.height - (c.USER_BUBBLE_PADDING * 2 + c.USER_HEADER_HEIGHT + c.USER_HEADER_BODY_GAP);
 		expect(bodyHeight).toBe(c.BODY_LINE_HEIGHT * 3);
@@ -186,9 +199,7 @@ describe("measureMessageBubble — user", () => {
 	});
 
 	it("flows interleaved quotes and attachments inline with the text", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
+		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const text =
 			"> [quote] first @@m:msg1234\n> one\n\n怎样算？\n> [quote] second\n> two\n\n怎样算[image #1: a.png]";
 		const r = measureMessageBubble(
@@ -217,7 +228,7 @@ describe("measureMessageBubble — user", () => {
 			"怎样算",
 			2,
 		]);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const c = await liveMessageConstants();
 		expect(r.height).toBe(
 			c.USER_BUBBLE_PADDING * 2 +
 				c.USER_HEADER_HEIGHT +
@@ -269,10 +280,8 @@ describe("measureMessageBubble — user", () => {
 	});
 
 	it("floors bubble width at the header minimum when a header is present", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		// A 2-char body shrink-wraps below the header row's needs; the header floor
 		// keeps the bubble wide enough for avatar + name + time.
 		const withHeader = measureMessageBubble({ role: "user", text: "hi" }, 1000);
@@ -282,10 +291,8 @@ describe("measureMessageBubble — user", () => {
 	});
 
 	it("does not apply the header width floor when hasHeader is false", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const noHeader = measureMessageBubble({ role: "user", text: "hi", hasHeader: false }, 1000);
 		// Without a header there is no floor, so a short body stays narrow.
 		expect(noHeader.usedWidth).toBeLessThan(
@@ -358,11 +365,9 @@ describe("measureMessageBubble — quote strip", () => {
 
 describe("measureMessageBubble — tombstone", () => {
 	it("collapses body AND attachments to one dimmed line", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
+		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const { typographyMetrics } = await import("../pretext-fonts");
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const c = await liveMessageConstants();
 		const tombstone = measureMessageBubble(
 			{
 				role: "user",
@@ -385,10 +390,8 @@ describe("measureMessageBubble — tombstone", () => {
 	});
 
 	it("shrink-wraps around the tombstone label's natural width", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const tombstone = measureMessageBubble(
 			{ role: "user", text: "", deleted: true, deletedLabel: "此消息已删除", hasHeader: false },
 			1000,
@@ -450,10 +453,8 @@ describe("extractDataRevision — quote/tombstone/edit keys", () => {
 // the user sent was measured (and painted) as if it did not exist.
 describe("measureMessageBubble — user attachments", () => {
 	it("reserves an image box above the body text", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const plain = measureMessageBubble({ role: "user", text: "look" }, 1000);
 		const withImage = measureMessageBubble(
 			{
@@ -467,10 +468,8 @@ describe("measureMessageBubble — user attachments", () => {
 	});
 
 	it("reserves a single row for a text-file attachment", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const plain = measureMessageBubble({ role: "user", text: "see file" }, 1000);
 		const withFile = measureMessageBubble(
 			{
@@ -488,10 +487,8 @@ describe("measureMessageBubble — user attachments", () => {
 	// filename has nowhere to go — it wrapped, overflowed the reserved 26px, and
 	// collided with the text underneath. The bubble must widen around the row.
 	it("widens the bubble around a long attachment filename instead of the caption", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const longName = "api-request-2026-09-01T17-58-20-793Z-WsKWNTpwoGGUne6.json";
 		const short = measureMessageBubble(
 			{
@@ -522,10 +519,8 @@ describe("measureMessageBubble — user attachments", () => {
 	});
 
 	it("caps a filename longer than the column at the bubble's inner width", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble(
 			{
 				role: "user",
@@ -569,10 +564,8 @@ describe("measureMessageBubble — user attachments", () => {
 	});
 
 	it("stacks multiple attachments with a gap between each", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const plain = measureMessageBubble({ role: "user", text: "two" }, 1000);
 		const withTwo = measureMessageBubble(
 			{
@@ -590,10 +583,8 @@ describe("measureMessageBubble — user attachments", () => {
 	});
 
 	it("an image-only message reserves no empty body line", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const imageOnly = measureMessageBubble(
 			{ role: "user", text: "", attachments: [{ type: "image", imageId: "img-1" }] },
 			1000,
@@ -647,17 +638,15 @@ describe("measureMessageBubble — user attachments", () => {
 		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const plain = measureMessageBubble({ role: "user", text: "hi" }, 1000);
 		const withUnknown = measureMessageBubble(
-			{ role: "user", text: "hi", attachments: [{ type: "video" }] },
+			{ role: "user", text: "hi", attachments: [{ type: "unknown_attachment" }] },
 			1000,
 		);
 		expect(withUnknown.height).toBe(plain.height);
 	});
 
 	it("floors the bubble width so a short caption cannot clip the image", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble(
 			{ role: "user", text: "hi", attachments: [{ type: "image", imageId: "a" }] },
 			1000,
@@ -668,10 +657,8 @@ describe("measureMessageBubble — user attachments", () => {
 	});
 
 	it("reserves the aspect-fitted height for an image with intrinsic dimensions", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		// 16:9 screenshot; the 1000px column minus bubble padding is the fit width.
 		const r = measureMessageBubble(
 			{
@@ -699,10 +686,8 @@ describe("measureMessageBubble — user attachments", () => {
 	});
 
 	it("widens the bubble around a wide strip instead of squeezing it into the caption width", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble(
 			{
 				role: "user",
@@ -723,10 +708,8 @@ describe("measureMessageBubble — user attachments", () => {
 	});
 
 	it("keeps the 300px floor for a narrow image with dimensions", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
-			"./measure-message-bubble"
-		);
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble(
 			{
 				role: "user",
@@ -774,8 +757,8 @@ describe("measureMessageBubble — slash command", () => {
 	});
 
 	it("collapsed height = chrome + command line + one preview line + toggle", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await commandBubble();
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await commandBubble();
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble(
 			{ role: "user", text: LONG_EXPANSION, commandText: "/generate-changelog" },
 			600,
@@ -824,9 +807,8 @@ describe("measureMessageBubble — slash command", () => {
 	});
 
 	it("omits the toggle when the expansion already fits one preview line", async () => {
-		const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-			await commandBubble();
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble({ role: "user", text: "ok", commandText: "/clear" }, 600);
 		if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
 		expect(r.overflows).toBe(false);
@@ -842,9 +824,8 @@ describe("measureMessageBubble — slash command", () => {
 	});
 
 	it("a command with no expansion is just the command line", async () => {
-		const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-			await commandBubble();
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble({ role: "user", text: "", commandText: "/clear" }, 600);
 		if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
 		expect(r.bodyTop).toBe(-1);
@@ -858,9 +839,8 @@ describe("measureMessageBubble — slash command", () => {
 	});
 
 	it("expanding grows the height by the expansion's wrapped lines", async () => {
-		const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-			await commandBubble();
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+		const c = await liveMessageConstants();
 		const collapsed = measureMessageBubble(
 			{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
 			600,
@@ -911,9 +891,8 @@ describe("measureMessageBubble — slash command", () => {
 	});
 
 	it("bounds the measured expansion so a pathological prompt cannot stall layout", async () => {
-		const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-			await commandBubble();
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble(
 			{ role: "user", text: "x".repeat(c.COMMAND_EXPANSION_MAX_CHARS + 5000), commandText: "/x" },
 			600,
@@ -923,8 +902,8 @@ describe("measureMessageBubble — slash command", () => {
 	});
 
 	it("keeps the header width floor so the avatar row is not clipped", async () => {
-		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await commandBubble();
-		const c = MEASURE_MESSAGE_CONSTANTS;
+		const { measureMessageBubble } = await commandBubble();
+		const c = await liveMessageConstants();
 		const r = measureMessageBubble({ role: "user", text: "", commandText: "/c" }, 1000);
 		expect(r.usedWidth).toBeGreaterThanOrEqual(
 			c.USER_BUBBLE_PADDING * 2 + c.USER_HEADER_MIN_CONTENT_WIDTH,
@@ -941,9 +920,8 @@ describe("measureMessageBubble — slash command", () => {
 	 */
 	describe("overflow is judged against the SHRUNK bubble, not the full width", () => {
 		it("reports the shrink-wrapped box as the width the body was measured for", async () => {
-			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-				await commandBubble();
-			const c = MEASURE_MESSAGE_CONSTANTS;
+			const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+			const c = await liveMessageConstants();
 			const r = measureMessageBubble(
 				{ role: "user", text: "a moderately long single-line expansion", commandText: "/c" },
 				900,
@@ -972,9 +950,8 @@ describe("measureMessageBubble — slash command", () => {
 		});
 
 		it("does not clip an expansion narrower than the bubble it shares with the command", async () => {
-			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-				await commandBubble();
-			const c = MEASURE_MESSAGE_CONSTANTS;
+			const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+			const c = await liveMessageConstants();
 			// A long command widens the bubble; the short expansion genuinely fits, so
 			// no toggle is correct here.
 			const r = measureMessageBubble(
@@ -995,9 +972,8 @@ describe("measureMessageBubble — slash command", () => {
 		});
 
 		it("never reports a body that fits a box narrower than the box it measured", async () => {
-			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-				await commandBubble();
-			const c = MEASURE_MESSAGE_CONSTANTS;
+			const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+			const c = await liveMessageConstants();
 			// Whatever the input, "no toggle" must imply "the single preview line
 			// genuinely holds everything at the width that gets painted".
 			for (const [commandText, text] of [
@@ -1019,9 +995,8 @@ describe("measureMessageBubble — slash command", () => {
 		});
 
 		it("keeps the expanded height consistent with the painted (narrower) box", async () => {
-			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-				await commandBubble();
-			const c = MEASURE_MESSAGE_CONSTANTS;
+			const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+			const c = await liveMessageConstants();
 			const expanded = measureMessageBubble(
 				{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
 				900,
@@ -1054,9 +1029,8 @@ describe("measureMessageBubble — slash command", () => {
 	 */
 	describe("frame agrees with the reported height", () => {
 		it("matches the collapsed geometry", async () => {
-			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-				await commandBubble();
-			const c = MEASURE_MESSAGE_CONSTANTS;
+			const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+			const c = await liveMessageConstants();
 			const r = measureMessageBubble(
 				{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
 				600,
@@ -1072,9 +1046,8 @@ describe("measureMessageBubble — slash command", () => {
 		});
 
 		it("matches the expanded geometry", async () => {
-			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-				await commandBubble();
-			const c = MEASURE_MESSAGE_CONSTANTS;
+			const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+			const c = await liveMessageConstants();
 			const r = measureMessageBubble(
 				{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
 				600,
@@ -1089,9 +1062,8 @@ describe("measureMessageBubble — slash command", () => {
 		});
 
 		it("reports the shrink-wrapped inner width, not the full frame width", async () => {
-			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
-				await commandBubble();
-			const c = MEASURE_MESSAGE_CONSTANTS;
+			const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+			const c = await liveMessageConstants();
 			const r = measureMessageBubble({ role: "user", text: "ok", commandText: "/c" }, 900);
 			if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
 			expect(r.frame.usedWidth).toBe(r.usedWidth - c.USER_BUBBLE_PADDING * 2);

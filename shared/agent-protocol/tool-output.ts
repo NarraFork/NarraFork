@@ -7,6 +7,37 @@
  * to do with injected content.
  */
 
+import {
+	isMediaContentBlock,
+	type MediaContentBlock,
+	mediaRefToContentBlock,
+} from "../media-attachments";
+
+/** Keep durable media references alongside text, never inline binary payloads. */
+export function toolOutputForPersistence(
+	text: string,
+	metadata?: Record<string, unknown>,
+	mediaRefs?: readonly MediaContentBlock[],
+): string | { _text: string; _metadata?: Record<string, unknown>; _media?: MediaContentBlock[] } {
+	if (!metadata && !mediaRefs?.length) return text;
+	return {
+		_text: text,
+		...(metadata ? { _metadata: metadata } : {}),
+		...(mediaRefs?.length
+			? {
+					_media: mediaRefs.map((ref) => ({
+						type: ref.type,
+						mediaId: ref.mediaId,
+						mediaType: ref.mediaType,
+						filename: ref.filename,
+						size: ref.size,
+						...(ref.uploadNarratorId ? { uploadNarratorId: ref.uploadNarratorId } : {}),
+					})),
+				}
+			: {}),
+	};
+}
+
 /**
  * Coerce a stored tool output to text.
  *
@@ -48,7 +79,8 @@ export type ToolOutputImageRef =
  *   - `_metadata` — the tool's structured result for the reader's card;
  *   - `_broken`   — the call's input was invalid and it never ran; the model's
  *                   history leaves the call and its result out (a notice row says why);
- *   - `_images`   — images the tool returned, by upload reference.
+ *   - `_images`   — images the tool returned, by upload reference;
+ *   - `_media`    — original audio/video assets, by durable upload reference.
  */
 export function encodeToolOutput(
 	text: string,
@@ -56,15 +88,30 @@ export function encodeToolOutput(
 		metadata?: Record<string, unknown>;
 		broken?: boolean;
 		images?: readonly ToolOutputImageRef[];
+		/** Original media assets, referenced durably without inline bytes. */
+		media?: readonly MediaContentBlock[];
 	} = {},
 ): unknown {
-	if (!extra.metadata && !extra.broken && !extra.images?.length) return text;
+	if (!extra.metadata && !extra.broken && !extra.images?.length && !extra.media?.length)
+		return text;
 	return {
 		_text: text,
 		...(extra.metadata ? { _metadata: extra.metadata } : {}),
 		...(extra.broken ? { _broken: true } : {}),
 		...(extra.images?.length ? { _images: extra.images.map((image) => ({ ...image })) } : {}),
+		...(extra.media?.length
+			? { _media: extra.media.map((ref) => mediaRefToContentBlock(ref)) }
+			: {}),
 	};
+}
+
+/** Native media references must be complete: silently skipping malformed data loses attachments. */
+export function toolOutputMedia(value: unknown): MediaContentBlock[] {
+	const media = outputRecord(value)?._media;
+	if (media === undefined) return [];
+	if (!Array.isArray(media) || media.some((ref) => !isMediaContentBlock(ref)))
+		throw new Error("Stored tool media references are invalid.");
+	return media;
 }
 
 function outputRecord(value: unknown): Record<string, unknown> | undefined {
@@ -76,6 +123,12 @@ function outputRecord(value: unknown): Record<string, unknown> | undefined {
 /** Whether a stored output belongs to a call whose input was invalid and never ran. */
 export function isBrokenToolOutput(value: unknown): boolean {
 	return outputRecord(value)?._broken === true;
+}
+
+/** Keep saved image references in a live text preview without sending inline image bytes. */
+export function toolOutputImagePreview(preview: unknown, persistedOutput: unknown): unknown {
+	const images = toolOutputImages(persistedOutput).filter((image) => "uploadNarratorId" in image);
+	return images.length ? { _text: preview, _images: images } : preview;
 }
 
 /** Image references of a stored output; malformed entries are skipped. */

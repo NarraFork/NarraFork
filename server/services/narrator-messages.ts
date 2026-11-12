@@ -1,5 +1,6 @@
 import { parseCompactMessageBlock } from "@shared/compact-message";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
+import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
@@ -13,6 +14,7 @@ import {
 	isDanglingReasoningOnlyAssistantMessage,
 	isMetadataOnlyEmptyReasoningAssistantMessage,
 } from "@shared/reasoning-content";
+import { isClearedToolOutput } from "@shared/storage-retention";
 import {
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
 	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
@@ -74,6 +76,7 @@ import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings"
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { ModelSourceRow } from "./agent-runtime/model-history-query";
 import {
 	type LoadModelHistoryOptions,
 	loadModelHistorySource,
@@ -88,7 +91,11 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
-import { newEnvelopeColumns, withRetiredBlocks } from "./narrator-block-sync";
+import {
+	CLEARED_TOOL_OUTPUT_SQL,
+	newEnvelopeColumns,
+	withRetiredBlocks,
+} from "./narrator-block-sync";
 import {
 	MAX_BLOCK_DELETE_ELEMENTS,
 	materializeTargets,
@@ -1991,8 +1998,16 @@ const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 /**
  * Tool names whose inputJson should not be truncated. OutlineEdit's input is the markdown it
  * writes, bounded by the tool (200 edits, 256 KiB of text), and its card renders it whole.
+ * GenUI `render` carries the UI itself in `source` (schema-capped at 12K chars): a truncated
+ * leaf is not markup, so the finished card would drop the UI and show the model-facing output.
  */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set([
+	"Agent",
+	"Task",
+	"Send",
+	OUTLINE_EDIT_TOOL,
+	GEN_UI_TOOL_NAME,
+]);
 
 const SPEC_TASKS_URI = "spec://tasks.json";
 
@@ -2063,6 +2078,8 @@ export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): an
 				: {}),
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			toolCalls: toolCalls?.map((tc: any) => {
+				if (isClearedToolOutput(tc.outputJson))
+					return toolCallWithExecutionTargets({ ...tc, inputJson: null });
 				const withExecutionTargets = toolCallWithExecutionTargets(tc);
 				if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return withExecutionTargets;
 				const skipInput =
@@ -2080,7 +2097,17 @@ export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): an
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function enrichToolUseBlocks(tree: any[]): any[] {
-	return tree.map((msg) => {
+	return tree.map((original) => {
+		const msg = original.toolCalls?.some((tc: { outputJson?: unknown }) =>
+			isClearedToolOutput(tc.outputJson),
+		)
+			? {
+					...original,
+					toolCalls: original.toolCalls.map((tc: { inputJson?: unknown; outputJson?: unknown }) =>
+						isClearedToolOutput(tc.outputJson) ? { ...tc, inputJson: null } : tc,
+					),
+				}
+			: original;
 		if (!msg.toolCalls?.length || !Array.isArray(msg.contentJson)) {
 			return msg.children?.length ? { ...msg, children: enrichToolUseBlocks(msg.children) } : msg;
 		}
@@ -2100,7 +2127,8 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 					: undefined;
 			return {
 				...block,
-				inputJson: tc.inputJson ?? block.input,
+				input: isClearedToolOutput(tc.outputJson) ? {} : block.input,
+				inputJson: isClearedToolOutput(tc.outputJson) ? null : (tc.inputJson ?? block.input),
 				outputJson: tc.outputJson,
 				status: tc.status,
 				executionAttempt: tc.executionAttempt,
@@ -2373,7 +2401,7 @@ function subagentSummarySql(): SQL<string | null> {
 		pairs.push(sql`${key}, ${paths[index]}`);
 	});
 	return sql<string | null>`CASE
-		WHEN ${narratorToolCalls.inputJson} IS NOT NULL
+		WHEN NOT (${sql.raw(CLEARED_TOOL_OUTPUT_SQL)}) AND ${narratorToolCalls.inputJson} IS NOT NULL
 			AND octet_length(${narratorToolCalls.inputJson}) <= ${MAX_SUBAGENT_SUMMARY_INPUT_BYTES}
 			AND json_valid(${narratorToolCalls.inputJson})
 		THEN json_object(${sql.join(pairs, sql`, `)})
@@ -3321,8 +3349,15 @@ function getToolCallDetailTx(
 	const selected = selectVisibleToolCallTx(tx, narratorId, toolUseId, reference);
 	// Even a unique authorized row has a response budget. Never truncate it and
 	// claim it is complete, or parse a large payload just to discover its length.
+	const columns = getTableColumns(narratorToolCalls);
+	const allBytes = storedRowBytes(Object.values(columns));
+	const visibleBytes = storedRowBytes(
+		Object.values(columns).filter((column) => column !== narratorToolCalls.inputJson),
+	);
 	const size = tx
-		.select({ bytes: storedRowBytes(Object.values(getTableColumns(narratorToolCalls))) })
+		.select({
+			bytes: sql<number>`CASE WHEN ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN ${visibleBytes} ELSE ${allBytes} END`,
+		})
 		.from(narratorToolCalls)
 		.where(eq(narratorToolCalls.id, selected.id))
 		.get();
@@ -3335,7 +3370,13 @@ function getToolCallDetailTx(
 		);
 	}
 	const detail = tx
-		.select()
+		.select({
+			...columns,
+			inputJson:
+				sql<unknown>`CASE WHEN ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN NULL ELSE ${narratorToolCalls.inputJson} END`.mapWith(
+					narratorToolCalls.inputJson,
+				),
+		})
 		.from(narratorToolCalls)
 		.where(eq(narratorToolCalls.id, selected.id))
 		.get();
@@ -3382,6 +3423,23 @@ const narratorMessageQueriesUnlocked = {
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(1);
 		return lastCompactRow[0]?.seq ?? null;
+	},
+
+	/**
+	 * When the narrator's latest compact marker was written (its message's `created_at`), or null
+	 * without one: one indexed read on the refs, one primary-key join.
+	 */
+	async getLatestCompactCreatedAt(narratorId: string): Promise<string | null> {
+		const rows = await db
+			.select({ createdAt: narratorMessages.createdAt })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+		return rows[0]?.createdAt ?? null;
 	},
 
 	async getMessagesSinceLastCompact(narratorId: string) {
@@ -3508,7 +3566,7 @@ const narratorMessageQueriesUnlocked = {
 				toolName: narratorToolCalls.toolName,
 				status: narratorToolCalls.status,
 				inputText: sql<string | null>`CASE
-					WHEN ${narratorToolCalls.inputJson} IS NULL THEN NULL
+					WHEN ${narratorToolCalls.inputJson} IS NULL OR ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN NULL
 					ELSE substr(CAST(${narratorToolCalls.inputJson} AS TEXT), 1, ${CONTEXT_ASK_TOOL_INPUT_LIMIT})
 				END`,
 				outputText: sql<string | null>`CASE
@@ -3516,6 +3574,7 @@ const narratorMessageQueriesUnlocked = {
 					ELSE substr(CAST(${narratorToolCalls.outputJson} AS TEXT), 1, ${CONTEXT_ASK_TOOL_OUTPUT_LIMIT})
 				END`,
 				inputTruncated: sql<number>`CASE
+					WHEN ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN 0
 					WHEN ${narratorToolCalls.inputJson} IS NOT NULL
 						AND length(CAST(${narratorToolCalls.inputJson} AS TEXT)) > ${CONTEXT_ASK_TOOL_INPUT_LIMIT}
 					THEN 1 ELSE 0
@@ -3618,7 +3677,7 @@ const narratorMessageQueriesUnlocked = {
 		narratorId: string,
 		limit?: number,
 		options: Omit<LoadModelHistoryOptions, "limit"> = {},
-	) {
+	): Promise<readonly ModelSourceRow[]> {
 		const postgres = modelHistoryDatabase.postgresRuntime;
 		if (
 			modelHistoryDatabase.activeDatabaseBackend === "postgres" &&
@@ -4607,7 +4666,10 @@ const narratorMessageQueriesUnlocked = {
 		return db.transaction((tx) => {
 			const selected = selectVisibleToolCallTx(tx, narratorId, toolUseId, reference);
 			const row = tx
-				.select(toolEditPreviewColumns)
+				.select({
+					...toolEditPreviewColumns,
+					payloadCleared: sql<boolean>`(${sql.raw(CLEARED_TOOL_OUTPUT_SQL)})`,
+				})
 				.from(narratorToolCalls)
 				.where(eq(narratorToolCalls.id, selected.id))
 				.get();
@@ -5214,6 +5276,7 @@ const narratorMessageQueriesUnlocked = {
 			const copied = copySharedCompactMessageTx(tx, narratorId, msg, ref);
 
 			writeEnvelopeBody(tx, copied.messageId, [newBlock], {
+				allowHistoryRewrite: true,
 				set: {
 					contextCharsJson: { segments: [] },
 					contentText: `${prefix} ${summary.slice(0, 200)}...`,

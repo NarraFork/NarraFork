@@ -258,4 +258,24 @@ describe("third-party credential stores in the user's home", () => {
 	test("allows paths outside the home", () => {
 		expect(isSecretUserPath("/etc/hosts", USER_HOME)).toBe(false);
 	});
+
+	test("a symlink outside the home whose target is inside ~/.ssh is refused", () => {
+		const temporary = mkdtempSync(join(tmpdir(), "nf-user-secret-symlink-"));
+		const home = join(temporary, "home");
+		const key = join(home, ".ssh", "id_rsa");
+		mkdirSync(join(home, ".ssh"), { recursive: true });
+		writeFileSync(key, "secret-key");
+		const notes = join(home, "notes.txt");
+		writeFileSync(notes, "hi");
+		const keyLink = join(temporary, "notes.txt");
+		const notesLink = join(temporary, "alias.txt");
+		try {
+			symlinkSync(key, keyLink, "file");
+			symlinkSync(notes, notesLink, "file");
+			expect(isSecretUserPath(keyLink, home)).toBe(true);
+			expect(isSecretUserPath(notesLink, home)).toBe(false);
+		} finally {
+			rmSync(temporary, { recursive: true, force: true });
+		}
+	});
 });

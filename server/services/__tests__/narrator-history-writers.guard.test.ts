@@ -10,9 +10,10 @@
  *
  * Today other modules still write them directly: card state, mailbox receipts on refs,
  * permission and file-change bookkeeping on ledger rows, archive/import/cleanup jobs.
- * `DIRECT_WRITERS` is that list, frozen. It may only shrink:
- *   - a direct write in an unlisted file fails — route it through the store (or the
- *     persistence layer behind it) instead of adding the file here;
+ * `DIRECT_WRITERS` documents those audited owners. Ordinary producers still write through
+ * the store. A specialized retention owner is separately audited: it rewrites only the
+ * worker-prepared payload under a fence/admission/CAS transaction, avoiding whole-body sync.
+ *   - a direct write in an unlisted file fails;
  *   - a listed file that no longer writes fails too — drop its entry, so the list keeps
  *     describing the work left.
  *
@@ -51,6 +52,9 @@ const DIRECT_WRITERS: Record<string, string> = {
 	"server/services/narrator-tree-snapshot-hooks.ts": "tree snapshot metadata",
 	"server/lib/usage-tracking.ts": "message usage and cost",
 	"server/services/user-deletion.ts": "author anonymization",
+	// 固定表清单的快照导入必须按列交集直写历史表：它拷的是别人机器上的完整行，没有经过本进程的
+	// store 事务，也不该经过——store 会重写 id、重建 refs，等于把快照改成当前库的内容。
+	"server/services/data-portability.ts": "snapshot import: whole-table copy",
 	// Mailbox receipts and publication on refs and messages.
 	"server/services/agent-message-delivery.ts": "delivery receipt on refs",
 	"server/services/agent-runtime/mailbox.ts": "delivery receipt on refs",
@@ -82,6 +86,8 @@ const DIRECT_WRITERS: Record<string, string> = {
 	// Bulk jobs: import, cleanup, migration, revision triggers.
 	"server/services/session-interchange/import.ts": "session import",
 	"server/services/database-cleanup-service.ts": "storage cleanup",
+	"server/services/storage-history-mutations.ts":
+		"worker-prepared retention payload rewrite under fence/admission/CAS; never creates ledger rows",
 	"server/db/migrate-role-to-disp.ts": "one-off role migration",
 	"server/services/agent-runtime/model-history-revision-sql.ts": "revision trigger SQL",
 };
@@ -143,14 +149,14 @@ function scan(pattern: RegExp): Map<string, number[]> {
 describe("narrator history writers", () => {
 	const writers = scan(WRITE);
 
-	test("no new module writes the history tables directly", () => {
+	test("no unaudited module writes the history tables directly", () => {
 		const unregistered = [...writers]
 			.filter(([path]) => !(path in DIRECT_WRITERS))
 			.map(([path, lines]) => `${path}:${lines.join(",")}`);
 		expect(unregistered, "write through narrator-store instead").toEqual([]);
 	});
 
-	test("every listed direct writer still writes (the list only shrinks)", () => {
+	test("every audited direct writer still writes", () => {
 		const stale = Object.keys(DIRECT_WRITERS).filter((path) => !writers.has(path));
 		expect(stale, "drop these entries from DIRECT_WRITERS").toEqual([]);
 	});

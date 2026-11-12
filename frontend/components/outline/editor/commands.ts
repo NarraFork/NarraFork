@@ -260,10 +260,13 @@ export function joinForward(host: CmdHost): Command {
 			dispatch?.(tr.setSelection(TextSelection.near($n, 1)).scrollIntoView());
 			return true;
 		}
-		// Where the next block's body starts.
+		// Where the next block's body starts: the next block on screen (what a folded block
+		// hides is not pulled into it).
 		let next: number | null = null;
-		state.doc.nodesBetween($from.pos, state.doc.content.size, (n, pos) => {
+		const here = $from.node(d);
+		state.doc.nodesBetween($from.pos, state.doc.content.size, (n, pos, parent) => {
 			if (next !== null) return false;
+			if (n.type === N.children && parent === here && here.attrs.collapsed) return false;
 			if (n.type === N.block && pos > $from.before(d)) {
 				next = pos + 2;
 				return false;
@@ -399,7 +402,10 @@ export function toggleTask(): Command {
 		const d = blockDepth(state.selection.$from);
 		if (d < 0) return false;
 		const pos = state.selection.$from.before(d);
-		const cur = state.selection.$from.node(d).attrs.task;
+		const node = state.selection.$from.node(d);
+		// A question put to a person is answered, never ticked (the page refuses its checkbox).
+		if (node.attrs.question) return false;
+		const cur = node.attrs.task;
 		dispatch?.(state.tr.setNodeAttribute(pos, "task", cur ? null : " "));
 		return true;
 	};

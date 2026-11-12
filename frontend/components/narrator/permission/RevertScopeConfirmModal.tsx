@@ -28,6 +28,9 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../../common/TruncatedPath";
 
+/** Files on the server itself need no device label. */
+const LOCAL_DEVICE_ID = "local";
+
 export interface RevertScopeConfirmModalProps {
 	opened: boolean;
 	title: string;
@@ -213,6 +216,10 @@ export function RevertScopeConfirmModal({
 				: planUnavailableKey(plan, previewKey, activeFiles.length)
 			: null;
 	const revertBlocked = !opened || isLoading || !plan || !!planUnavailable || !narratorUsable;
+	// With no files to restore, "history only" does exactly what the main button does
+	// (a partial plan keeps message history, so it still differs).
+	const noFileWork =
+		!!plan && !snapshotPlan && plan.coverageComplete === true && activeFiles.length === 0;
 	useEffect(() => {
 		if (!opened || isLoading || submitting) {
 			if (lastReadyPlan.current) setRetiredPlanId(lastReadyPlan.current);
@@ -280,7 +287,16 @@ export function RevertScopeConfirmModal({
 			size="md"
 		>
 			<Stack gap="md">
-				{isLoading ? (
+				{submitting ? (
+					// The plan is spent the moment it is sent, so the review below would read
+					// as "unavailable" while the request is still running. Show progress instead.
+					<Center py="md">
+						<Stack align="center" gap="xs">
+							<Loader size="sm" />
+							<Text size="xs">{t("revertApplying")}</Text>
+						</Stack>
+					</Center>
+				) : isLoading ? (
 					<Center py="md">
 						<Stack align="center" gap="xs">
 							<Loader size="sm" />
@@ -291,22 +307,17 @@ export function RevertScopeConfirmModal({
 					<>
 						<Text size="sm">{description}</Text>
 
-						{plan && !revertBlocked && (
+						{plan && !revertBlocked && !plan.coverageComplete && (
 							<Alert color="yellow" variant="light">
-								<Text size="xs">{t("revertPlanExternalWritesWarning")}</Text>
-								{!plan.coverageComplete && (
-									<>
-										<Text size="xs">{t("revertPlanIncompleteWarning")}</Text>
-										{diagnostics.map((item) => (
-											<Text size="xs" key={JSON.stringify(item)}>
-												{item.filePath ?? item.toolCallId ?? item.operationId}:{" "}
-												{t(`revertDiagnosticReason.${item.reason ?? item.code}`, {
-													defaultValue: item.reason ?? item.code,
-												})}
-											</Text>
-										))}
-									</>
-								)}
+								<Text size="xs">{t("revertPlanIncompleteWarning")}</Text>
+								{diagnostics.map((item) => (
+									<Text size="xs" key={JSON.stringify(item)}>
+										{item.filePath ?? item.toolCallId ?? item.operationId}:{" "}
+										{t(`revertDiagnosticReason.${item.reason ?? item.code}`, {
+											defaultValue: item.reason ?? item.code,
+										})}
+									</Text>
+								))}
 							</Alert>
 						)}
 
@@ -422,7 +433,7 @@ export function RevertScopeConfirmModal({
 											wrap="nowrap"
 										>
 											<TruncatedPath path={file.filePath} />
-											{plan && (
+											{plan && file.deviceId !== LOCAL_DEVICE_ID && (
 												<Badge size="xs" variant="outline">
 													{file.deviceId}
 												</Badge>
@@ -454,7 +465,8 @@ export function RevertScopeConfirmModal({
 					</>
 				)}
 				<Group gap="xs" justify="flex-end">
-					{onReload && (
+					{/* A ready plan needs no reload; only offer it once the plan cannot be used. */}
+					{onReload && revertBlocked && !isLoading && !submitting && (
 						<Button
 							size="xs"
 							variant="subtle"
@@ -472,18 +484,20 @@ export function RevertScopeConfirmModal({
 					<Button size="xs" variant="subtle" onClick={onCancel} disabled={submitting}>
 						{t("cancel")}
 					</Button>
-					<Button
-						size="xs"
-						variant="default"
-						onClick={() => {
-							if (!opened || submitting) return;
-							onConfirm({ skipRevert: true });
-						}}
-						loading={submitting}
-						disabled={submitting}
-					>
-						{messagesOnlyLabel}
-					</Button>
+					{!submitting && !(noFileWork && !revertBlocked) && (
+						<Button
+							size="xs"
+							variant="default"
+							onClick={() => {
+								if (!opened || submitting) return;
+								onConfirm({ skipRevert: true });
+							}}
+							loading={submitting}
+							disabled={submitting}
+						>
+							{messagesOnlyLabel}
+						</Button>
+					)}
 					<Button
 						size="xs"
 						color="red"
@@ -509,15 +523,17 @@ export function RevertScopeConfirmModal({
 						}}
 						loading={isLoading || submitting}
 					>
-						{revertBlocked
-							? t("revertScopeUnavailableTitle")
-							: snapshotPlan
-								? t("revertSnapshotConfirm")
-								: plan && !plan.coverageComplete
-									? t("revertPartialConfirm")
-									: activeFiles.length > 0
-										? confirmWithRevertLabel
-										: confirmNoFilesLabel}
+						{submitting
+							? t("revertApplying")
+							: revertBlocked
+								? t("revertScopeUnavailableTitle")
+								: snapshotPlan
+									? t("revertSnapshotConfirm")
+									: plan && !plan.coverageComplete
+										? t("revertPartialConfirm")
+										: activeFiles.length > 0
+											? confirmWithRevertLabel
+											: confirmNoFilesLabel}
 					</Button>
 				</Group>
 			</Stack>
@@ -551,12 +567,14 @@ export function RevertActionConfirmModal({
 			opened={!!pending}
 			title={t(isBlockDelete ? "blockDeleteConfirmTitle" : "rollbackConfirmTitle")}
 			description={
-				summary
-					? t("revertPlanHistorySummary", {
-							blockCount: summary.deletedBlockCount,
-							messageCount: summary.deletedMessageCount,
-						})
-					: t("revertPlanHistoryUnknown")
+				!summary
+					? t("revertPlanHistoryUnknown")
+					: summary.deletedBlockCount === 0 && summary.deletedMessageCount === 0
+						? t("revertPlanHistoryNothing")
+						: t("revertPlanHistorySummary", {
+								blockCount: summary.deletedBlockCount,
+								messageCount: summary.deletedMessageCount,
+							})
 			}
 			data={preview.data}
 			previewKey={preview.previewKey}

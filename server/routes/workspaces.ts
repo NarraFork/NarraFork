@@ -1,5 +1,5 @@
 import { WORKSPACE_PANEL_CONFIG_MAX_BYTES } from "@shared/workspace-panels";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -15,7 +15,6 @@ import {
 	updateWorkspaceSchema,
 } from "../lib/validators";
 import { WORKSPACE_TREE_MAX_BYTES } from "../lib/validators/workspaces";
-import { ensureMigrated, hasRecentTab, removeRecentTab } from "../services/recent-tabs-service";
 import {
 	addWorkspacePanel,
 	listWorkspacePanels,
@@ -24,6 +23,11 @@ import {
 	updateWorkspacePanelConfig,
 	WorkspaceLayoutConflictError,
 } from "../services/workspace-panel-service";
+import {
+	generateWorkspaceTitle,
+	scheduleWorkspaceTitle,
+	updateWorkspaceTitle,
+} from "../services/workspace-title";
 import { broadcastToUser } from "../websocket/narrator-ws";
 
 export const workspaceRoutes = new Hono();
@@ -121,6 +125,8 @@ workspaceRoutes.get("/", async (c) => {
 			id: workspaces.id,
 			userId: workspaces.userId,
 			title: workspaces.title,
+			titleSource: workspaces.titleSource,
+			titleRevision: workspaces.titleRevision,
 			treeBytes: sql<number>`length(cast(${workspaces.tree} as blob))`,
 			createdAt: workspaces.createdAt,
 			updatedAt: workspaces.updatedAt,
@@ -243,13 +249,26 @@ workspaceRoutes.post("/", workspaceWriteBodyLimit, async (c) => {
 			id,
 			userId,
 			title,
+			titleSource: parsed.data.title !== undefined ? "manual" : "default",
 			tree: parsed.data.tree,
 			createdAt: now,
 			updatedAt: now,
 		})
 		.returning();
 
+	// Legacy/seed create payloads may still carry initial members in the layout.
+	// Materialize them once; generation itself reads only workspace_panels.
+	await listWorkspacePanels(userId, id);
+	scheduleWorkspaceTitle(userId, id);
 	return c.json(ws, 201);
+});
+
+workspaceRoutes.post("/:id/generate-title", bodyLimit({ maxSize: 1024 }), async (c) => {
+	const body = await readWorkspaceJson(c);
+	if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length) {
+		throw new ValidationError("Workspace title generation expects an empty JSON object");
+	}
+	return c.json(await generateWorkspaceTitle(c.get("user").sub, c.req.param("id")));
 });
 
 // Update a workspace (tree or title)
@@ -259,25 +278,21 @@ workspaceRoutes.patch("/:id", workspaceWriteBodyLimit, async (c) => {
 	const parsed = updateWorkspaceSchema.safeParse(await readWorkspaceJson(c));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
+	// A same-name write is intentional too: it protects the title from automatic generation.
+	if (parsed.data.title !== undefined) {
+		const result = await updateWorkspaceTitle(
+			userId,
+			id,
+			parsed.data.title,
+			parsed.data.expectedTitleRevision,
+		);
+		return c.json({ ok: true, ...result });
+	}
 	const ws = await db.query.workspaces.findFirst({
 		where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
+		columns: { id: true },
 	});
 	if (!ws) throw new NotFoundError("Workspace", id);
-
-	// Title only. The layout is written exclusively by `PUT /:id/layout`, which guards it
-	// with `expectedRevision`; see `updateWorkspaceSchema`.
-	const updates: Record<string, unknown> = { updatedAt: new Date() };
-	if (parsed.data.title !== undefined) updates.title = parsed.data.title;
-
-	await db.update(workspaces).set(updates).where(eq(workspaces.id, id));
-
-	// Other devices with this workspace open show the title in their toolbar —
-	// but only a real change earns a broadcast; a same-title resubmit changes
-	// nothing they could refetch.
-	if (parsed.data.title !== undefined && parsed.data.title !== ws.title) {
-		broadcastToUser(userId, { type: "workspace_changed", workspaceId: id, reason: "title" });
-	}
-
 	return c.json({ ok: true });
 });
 
@@ -291,56 +306,12 @@ workspaceRoutes.delete("/:id", async (c) => {
 	});
 	if (!ws) throw new NotFoundError("Workspace", id);
 
-	// Remove the authoritative header first so children are released and clients receive a delta.
-	await removeRecentTab(userId, "workspace", id);
-	// Keep DELETE semantics for legacy/inconsistent rows that had no recent-tab header.
-	// `removeRecentTab` may already have deleted the row (announcing it in the
-	// process); announce only when THIS delete is the one that lands.
-	const remaining = await db.query.workspaces.findFirst({
-		where: eq(workspaces.id, id),
-		columns: { id: true },
-	});
-	if (remaining) {
-		await db.delete(workspaces).where(eq(workspaces.id, id));
-		// A device with this workspace still open navigates away on this signal; its
-		// re-fetch would 404 now.
-		broadcastToUser(userId, { type: "workspace_changed", workspaceId: id, reason: "deleted" });
-	}
+	// The sidebar no longer lists workspaces (its folders are an independent structure),
+	// so deleting one touches only the workspace and its panels (FK cascade).
+	await db.delete(workspaces).where(eq(workspaces.id, id));
+	// A device with this workspace still open navigates away on this signal; its re-fetch
+	// would 404 now.
+	broadcastToUser(userId, { type: "workspace_changed", workspaceId: id, reason: "deleted" });
 
 	return c.json({ ok: true });
 });
-
-/**
- * Delete workspace DB records that are not referenced by their owner's authoritative recent tabs.
- * Called on server startup to clean up orphans left by previous runs.
- */
-export async function dissolveOrphanWorkspaces(): Promise<number> {
-	const batchSize = 100;
-	let cursor: string | undefined;
-	let removed = 0;
-
-	while (true) {
-		const rows = await db
-			.select({ id: workspaces.id, userId: workspaces.userId })
-			.from(workspaces)
-			.where(cursor ? gt(workspaces.id, cursor) : undefined)
-			.orderBy(asc(workspaces.id))
-			.limit(batchSize);
-		if (rows.length === 0) break;
-		cursor = rows.at(-1)?.id;
-
-		for (const userId of new Set(rows.map((row) => row.userId))) {
-			await ensureMigrated(userId);
-		}
-		const orphanIds = rows
-			.filter((row) => !hasRecentTab(row.userId, `workspace:${row.id}`))
-			.map((row) => row.id);
-		if (orphanIds.length > 0) {
-			await db.delete(workspaces).where(inArray(workspaces.id, orphanIds));
-			removed += orphanIds.length;
-		}
-		if (rows.length < batchSize) break;
-	}
-
-	return removed;
-}

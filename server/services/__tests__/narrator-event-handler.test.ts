@@ -1,9 +1,10 @@
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
+import { getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	apiRequests,
 	narratorMessageRefs,
@@ -21,6 +22,7 @@ const { db, sqlite } = getTestDb();
 const dbStub = {
 	db,
 	sqlite,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
@@ -366,7 +368,7 @@ describe("request attribution", () => {
 				where: eq(narratorMessages.id, partialId as string),
 			});
 			expect(persisted).toMatchObject({ model: "gpt-resolved", provider: "openai" });
-			expect(persisted?.contentJson).toMatchObject([
+			expect(readTestMessageContent(sqlite, partialId as string)).toMatchObject([
 				{ type: "reasoning", text: "Actual reasoning" },
 			]);
 		} finally {
@@ -704,6 +706,7 @@ describe("request occupancy is independent from billing and historical usage", (
 					contextPercent: 92.6,
 					contextSnapshot: snapshot,
 					usage: { promptTokens: 510800, inputTokens: 510800, completionTokens: 12 },
+					decodeMs: 400,
 				},
 				ctx,
 			);
@@ -723,6 +726,7 @@ describe("request occupancy is independent from billing and historical usage", (
 			const request = db.select().from(apiRequests).where(eq(apiRequests.narratorId, id)).get();
 			expect(request?.inputTokens).toBe(510800);
 			expect(request?.contextUsageSnapshotJson).toEqual(snapshot);
+			expect(request?.decodeMs).toBe(400);
 			expect(broadcastMessages.at(-1)).toMatchObject({
 				type: "context_usage",
 				promptTokens: 926000,
@@ -737,7 +741,9 @@ describe("request occupancy is independent from billing and historical usage", (
 			expect(message?.usage).toMatchObject({
 				input_tokens: 510800,
 				prompt_tokens: 510800,
+				output_tokens: 12,
 				context_snapshot: snapshot,
+				decode_ms: 400,
 			});
 		} finally {
 			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
@@ -797,11 +803,11 @@ describe("durable API error association", () => {
 			});
 			// Re-read backing storage (the path used after refresh), not a live broadcast.
 			const message = db
-				.select({ content: narratorMessages.contentJson })
+				.select({ id: narratorMessages.id })
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, id))
 				.get();
-			expect(message?.content).toEqual([
+			expect(readTestMessageContent(sqlite, message?.id ?? "")).toEqual([
 				{ type: "error", message: "upstream failed", diagnostics },
 			]);
 			expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThanOrEqual(16 * 1024);
@@ -828,11 +834,13 @@ describe("durable API error association", () => {
 				errorMessage: "internal failure",
 			});
 			const message = db
-				.select({ content: narratorMessages.contentJson })
+				.select({ id: narratorMessages.id })
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, id))
 				.get();
-			expect(message?.content).toEqual([{ type: "error", message: "internal failure" }]);
+			expect(readTestMessageContent(sqlite, message?.id ?? "")).toEqual([
+				{ type: "error", message: "internal failure" },
+			]);
 			const diagnostics = {
 				schema: "narrafork.error-diagnostics.v1" as const,
 				requestId: "untrusted-upstream-only",
@@ -1090,17 +1098,15 @@ describe("assistant file-reference provenance", () => {
 				{ type: "assistant_message", text: "[file](src/a.ts#L2)next", toolUses: [] },
 				ctx,
 			);
-			const reloaded = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, savedId as string),
-			});
-			expect(reloaded?.contentJson).toMatchObject([
+			const reloaded = readTestMessageContent(sqlite, savedId as string);
+			expect(reloaded).toMatchObject([
 				{ fileReferenceContext: { deviceId: "DeviceA", cwd: "/repo" } },
 				{ fileReferenceContext: { deviceId: "DeviceB", cwd: "/other" } },
 			]);
 			const final = broadcastMessages.findLast(
 				(m) => (m as { type?: string }).type === "message",
 			) as { message: { contentJson: unknown } };
-			expect(final.message.contentJson).toEqual(reloaded?.contentJson);
+			expect(final.message.contentJson).toEqual(reloaded);
 		} finally {
 			clearStreamingSnapshot(id);
 			await cleanupFileContextNarrator(id);
@@ -1152,14 +1158,12 @@ describe("assistant file-reference provenance", () => {
 				{ type: "block_complete", block: { type: "text", text: "first second", outputIndex: 1 } },
 				ctx,
 			);
-			const message = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, partialId as string),
-			});
-			expect((message?.contentJson as unknown[])?.[0]).toMatchObject({
+			const content = readTestMessageContent(sqlite, partialId as string);
+			expect(content[0]).toMatchObject({
 				type: "text",
 				text: "first second",
 			});
-			expect((message?.contentJson as unknown[])?.[0]).not.toHaveProperty("fileReferenceContext");
+			expect(content[0]).not.toHaveProperty("fileReferenceContext");
 		} finally {
 			clearStreamingSnapshot(id);
 			await cleanupFileContextNarrator(id);
@@ -1191,10 +1195,8 @@ describe("assistant file-reference provenance", () => {
 				{ type: "block_complete", block: { type: "text", text: "src/a.ts" } },
 				ctx,
 			);
-			const message = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, partialId as string),
-			});
-			expect((message?.contentJson as unknown[])?.[0]).not.toHaveProperty("fileReferenceContext");
+			const content = readTestMessageContent(sqlite, partialId as string);
+			expect(content[0]).not.toHaveProperty("fileReferenceContext");
 		} finally {
 			await cleanupFileContextNarrator(id);
 		}
@@ -1487,6 +1489,172 @@ describe("工具展示事件与执行快照解耦", () => {
 	});
 });
 
+describe("native image generation persistence", () => {
+	test.each([
+		"failed",
+		"cancelled",
+		"incomplete",
+	])("persists %s with errors and partial previews", async (status) => {
+		const id = `image-terminal-${status}`;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		try {
+			await processEvent(
+				{
+					type: "image_generation",
+					id: "ig",
+					status: "generating",
+					partialSavedPath: "/tmp/preview.png",
+					partialImageIndex: 1,
+				},
+				ctx,
+			);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: {
+						type: "image_generation",
+						id: "ig",
+						status,
+						error: "image provider rejected",
+						errorCode: "content_filter",
+						partialImageIndex: 1,
+					},
+				},
+				ctx,
+			);
+			if (!partialId) throw new Error("missing persisted image message");
+			const content = readTestMessageContent(sqlite, partialId);
+			expect(content).toEqual([
+				expect.objectContaining({
+					type: "image_generation",
+					status,
+					error: "image provider rejected",
+					errorCode: "content_filter",
+					partialSavedPath: "/tmp/preview.png",
+				}),
+			]);
+			expect(getStreamingSnapshot(id)?.streamingBlocks).toEqual([
+				expect.objectContaining({
+					status,
+					partialSavedPath: "/tmp/preview.png",
+					error: "image provider rejected",
+				}),
+			]);
+			expect(broadcastMessages).toContainEqual(
+				expect.objectContaining({
+					type: "image_generation",
+					narratorId: id,
+					status,
+					errorCode: "content_filter",
+					partialSavedPath: "/tmp/preview.png",
+				}),
+			);
+		} finally {
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test.each([
+		"completed",
+		"incomplete",
+	])("stores image bytes for %s without losing a partial-only artifact", async (status) => {
+		const id = `image-artifact-${status}`;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			conversationId: id,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		const png =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+		try {
+			await processEvent(
+				{
+					type: "block_complete",
+					block: {
+						type: "image_generation",
+						id: "ig_artifact",
+						status,
+						...(status === "completed"
+							? { result: png }
+							: { partialImageB64: png, partialImageIndex: 0 }),
+					},
+				},
+				ctx,
+			);
+			if (!partialId) throw new Error("missing persisted image message");
+			const content = readTestMessageContent(sqlite, partialId) as Array<Record<string, unknown>>;
+			expect(content).toHaveLength(1);
+			expect(content[0]).toMatchObject({ type: "image_generation", status, width: 1, height: 1 });
+			const path = content[0][status === "completed" ? "savedPath" : "partialSavedPath"];
+			expect(typeof path).toBe("string");
+			expect(await Bun.file(String(path)).exists()).toBe(true);
+			expect(content[0].result).toBeUndefined();
+			expect(content[0].partialImageB64).toBeUndefined();
+		} finally {
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test("completed lifecycle alone remains active instead of looking like a generated image", async () => {
+		const ctx = makeMainContext();
+		await processEvent({ type: "image_generation", id: "ig_lifecycle", status: "completed" }, ctx);
+		expect(getStreamingSnapshot(ctx.narratorId)?.streamingBlocks).toContainEqual(
+			expect.objectContaining({ id: "ig_lifecycle", status: "generating" }),
+		);
+		expect(broadcastMessages).toContainEqual(
+			expect.objectContaining({
+				type: "image_generation",
+				id: "ig_lifecycle",
+				status: "generating",
+			}),
+		);
+	});
+
+	test("already persisted tool image refs are encoded directly without upload re-save", async () => {
+		const { toolResultLedgerOutput } = await import("../narrator-event-handler");
+		const uploads = await import("../../lib/uploads");
+		const save = spyOn(uploads, "saveUploadedImage");
+		try {
+			const ref = {
+				imageId: "image-from-worker",
+				mediaType: "image/png",
+				uploadNarratorId: "image-owner",
+			};
+			const output = await toolResultLedgerOutput("caller", {
+				type: "tool_result",
+				toolUseId: "image-tool",
+				toolName: "Image",
+				output: "saved",
+				isError: false,
+				imageRefs: [ref],
+			});
+			expect(output).toEqual({ _text: "saved", _images: [ref] });
+			expect(save).not.toHaveBeenCalled();
+		} finally {
+			save.mockRestore();
+		}
+	});
+});
+
 describe("完成工具输入传递", () => {
 	test("onGitTrack 收到 tool_result 携带的实际完成输入", async () => {
 		const ctx = makeSubagentContext();
@@ -1586,7 +1754,7 @@ describe("完成工具输入传递", () => {
 			{
 				type: "image_generation",
 				id: "image-partial",
-				status: "completed",
+				status: "incomplete",
 				revisedPrompt: undefined,
 				partialSavedPath: "/tmp/image-partial.png",
 				outputIndex: 3,
@@ -1736,7 +1904,7 @@ describe("完成工具输入传递", () => {
 			{
 				type: "image_generation",
 				id: "child-partial",
-				status: "completed",
+				status: "incomplete",
 				revisedPrompt: undefined,
 				partialSavedPath: "/tmp/child-partial.png",
 				outputIndex: 1,
@@ -2024,10 +2192,7 @@ describe("narrator event handler persistence", () => {
 				ctx,
 			);
 
-			const saved = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, savedMessageId as string),
-				columns: { contentJson: true },
-			});
+			const saved = readTestMessageContent(sqlite, savedMessageId as string);
 			const getToolIds = (contentJson: unknown) =>
 				(Array.isArray(contentJson) ? contentJson : [])
 					.filter(
@@ -2039,7 +2204,7 @@ describe("narrator event handler persistence", () => {
 					)
 					.map((block) => block.id);
 			const expected = ["tool-a", "tool-b"];
-			expect(getToolIds(saved?.contentJson)).toEqual(expected);
+			expect(getToolIds(saved)).toEqual(expected);
 
 			const messageBroadcast = broadcastMessages.find(
 				(message): message is { type: "message"; message?: { contentJson?: unknown } } =>
@@ -2333,14 +2498,10 @@ test.each([
 		} finally {
 			cowSpy?.mockRestore();
 		}
-		const current = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-		});
-		const snapshot = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, sharedId),
-		});
-		expect(current?.contentJson).toEqual([{ type: "text", text: "historical prefix" }]);
-		expect(JSON.stringify(snapshot?.contentJson)).toContain("current thought");
+		const current = readTestMessageContent(sqlite, partialId);
+		const snapshot = readTestMessageContent(sqlite, sharedId);
+		expect(current).toEqual([{ type: "text", text: "historical prefix" }]);
+		expect(JSON.stringify(snapshot)).toContain("current thought");
 		expect(partialId).not.toBe(sharedId);
 		expect(
 			broadcastMessages.some((message) => (message as { type: string }).type === "streaming_reset"),

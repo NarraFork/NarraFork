@@ -1,18 +1,38 @@
-import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterAll, afterEach, beforeEach, expect, expectTypeOf, mock, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type MediaRef, mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { historyStrings } from "../../../tests/fixtures/model-input";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { wavBytes } from "../../../tests/fixtures/native-media";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import { narratorMessageRefs, narrators, narratorToolCalls } from "../../db/schema";
+import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
+import { saveUploadedMedia } from "../../lib/media-uploads";
+import { setOutboundFetchOverrideForTest } from "../../lib/net/outbound-fetch";
 import { settings } from "../../lib/settings";
 import { setUploadsDirForTests } from "../../lib/uploads";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
+import { modelHistoryFixtureSql } from "../agent-runtime/model-history-fixture";
+import type {
+	ModelHistoryJson,
+	ModelHistorySource,
+	ModelSourceRow,
+} from "../agent-runtime/model-history-query";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
-import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
+import {
+	MODEL_HISTORY_REVISION_CONTRACT,
+	renderModelHistoryRevisionSql,
+} from "../agent-runtime/model-history-revision-sql";
+import {
+	clearModelHistorySourceCacheForTest,
+	freezeModelHistorySource,
+	loadModelHistorySource,
+} from "../agent-runtime/model-history-source";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -103,7 +123,244 @@ function message(
 	};
 }
 
-test("hydration may outlive the source-read deadline without rejecting a valid history", async () => {
+for (const scenario of [
+	"accepted",
+	"sys-tail",
+	"unpersisted-text",
+	"other-owner",
+	"other-id",
+	"older-row",
+] as const) {
+	test(`native media current lane deduplicates only accepted owner+id: ${scenario}`, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-runtime-media-lanes-"));
+		setUploadsDirForTests(directory);
+		try {
+			const bytes = wavBytes();
+			const ref = await saveUploadedMedia(
+				"primary",
+				new File([new Uint8Array(bytes)], "voice.wav", { type: "audio/wav" }),
+			);
+			const source = message("media-row", "user", "accepted media");
+			source.contentJson = [mediaRefToContentBlock(ref), { type: "text", text: "accepted media" }];
+			const rows =
+				scenario === "older-row"
+					? [
+							source,
+							message("reply", "assistant", "done"),
+							message("new-row", "user", "next input"),
+						]
+					: scenario === "sys-tail"
+						? [source, message("hint", "sys", "notice")]
+						: [source];
+			const currentRef: MediaRef =
+				scenario === "other-owner"
+					? { ...ref, uploadNarratorId: "child" }
+					: scenario === "other-id"
+						? { ...ref, mediaId: `${ref.mediaId}-new` }
+						: ref;
+			const before = JSON.stringify(rows);
+			const built = await buildRuntimeHistory({
+				narratorId: "primary",
+				model: "gemini-2.5-pro",
+				provider: "question-gemini",
+				sourceMessages: rows,
+				currentInput:
+					scenario === "unpersisted-text"
+						? "separate control input"
+						: scenario === "older-row"
+							? "next input"
+							: scenario === "sys-tail"
+								? ""
+								: "accepted media",
+				currentMedia: [currentRef],
+			});
+			expect(built.currentMedia).toEqual(
+				["other-owner", "other-id", "older-row"].includes(scenario) ? [currentRef] : undefined,
+			);
+			expect(JSON.stringify(rows)).toBe(before);
+			expect(JSON.stringify(built.modelMessages)).toContain(ref.mediaId);
+			expect(JSON.stringify(built.history).split(bytes.toString("base64"))).toHaveLength(2);
+		} finally {
+			setUploadsDirForTests(null);
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const scenario of [
+	"uncompressed",
+	"post-compact-current-row",
+	"post-compact-assistant-tool-tail",
+	"persisted-current-without-currentMedia",
+] as const) {
+	test(`Qwen MP3 runtime history reaches the final completions wire: ${scenario}`, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-runtime-qwen-mp3-"));
+		setUploadsDirForTests(directory);
+		try {
+			// Two complete silent MPEG-1 Layer III frames (128 kbps, 44.1 kHz, mono).
+			// This is a small synthetic upload, not the user's original 50-second recording.
+			const frame = Buffer.alloc(417);
+			frame.set([0xff, 0xfb, 0x90, 0xc4]);
+			const bytes = Buffer.concat([frame, frame]);
+			const ref = await saveUploadedMedia(
+				"primary",
+				new File([new Uint8Array(bytes)], "sampleone.mp3", { type: "audio/mpeg" }),
+			);
+			const prompt = "听这首歌，然后解析一下结构";
+			const saved = await narratorPersistence.persistUserMessage("primary", prompt, [
+				{ type: "text", text: prompt },
+				mediaRefToContentBlock(ref),
+			]);
+			const current: RuntimeHistoryMessage = { ...saved, role: "user" };
+			const oldVideoPath = String.raw`F:\F03\MyDownloads\ChatGPT Image\20260730\vids\12.mp4`;
+			const priorVideo = message("old-video", "user", `解析这个视频：${oldVideoPath}`);
+			const priorReply = message("old-video-reply", "assistant", "上一次的视频已分析完成。");
+			const assistant = message("audio-analysis", "assistant", "检查当前音频。");
+			assistant.contentJson = [
+				{ type: "text", text: "检查当前音频。" },
+				{ type: "tool_use", id: "audio-probe", name: "Read", input: { file_path: "fixture" } },
+			];
+			assistant.toolCalls = [
+				{
+					toolUseId: "audio-probe",
+					toolName: "Read",
+					inputJson: { file_path: "fixture" },
+					outputJson: "Current audio probe completed.",
+					status: "success",
+				},
+			];
+			// sourceMessages models the rows visible AFTER compaction. This deliberately
+			// tests history reconstruction, not the real compaction scheduler.
+			const rows =
+				scenario === "uncompressed"
+					? [priorVideo, priorReply, current]
+					: scenario === "post-compact-assistant-tool-tail"
+						? [current, assistant]
+						: [current];
+			const before = JSON.stringify(rows);
+			const model = "qwen3.8-omni-flash";
+			const prepared = await buildRuntimeHistory({
+				narratorId: "primary",
+				ownTurnPlacement: null,
+				model,
+				provider: "question-completions",
+				sourceMessages: rows,
+				currentInput: scenario === "post-compact-assistant-tool-tail" ? "" : prompt,
+				currentMedia:
+					scenario === "post-compact-assistant-tool-tail" ||
+					scenario === "persisted-current-without-currentMedia"
+						? undefined
+						: [ref],
+			});
+			expect(prepared.currentMedia).toBeUndefined();
+			expect(prepared.currentText).toBe("");
+			expect(JSON.stringify(rows)).toBe(before);
+			expect(JSON.stringify(prepared.modelMessages)).toContain(ref.mediaId);
+			const requests: Array<{ url: string; body: string }> = [];
+			setOutboundFetchOverrideForTest(async (input, init) => {
+				expect(typeof init?.body).toBe("string");
+				requests.push({ url: String(input), body: String(init?.body) });
+				return new Response(
+					'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			});
+			const provider = new OpenAIProvider({
+				id: "qwen-mp3-wire",
+				name: "Offline Qwen MP3 wire",
+				prefix: "question-completions",
+				apiKey: "isolated-test-no-network",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: model,
+				apiMode: "completions",
+			});
+			const systemText = scenario.startsWith("post-compact")
+				? `上下文已压缩。先前分析的视频：${oldVideoPath}`
+				: "Analyze the current user attachment, keeping earlier history separate.";
+			const events = [];
+			for await (const event of provider.chat({
+				conversationId: "primary",
+				content: prepared.currentText,
+				model,
+				cwd: directory,
+				history: [{ role: "system", content: systemText }, ...prepared.history],
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			})) {
+				events.push(event);
+			}
+			expect(events.some((event) => event.text === "ok")).toBe(true);
+			expect(requests).toHaveLength(1);
+			expect(requests[0].url).toBe("https://example.invalid/v1/chat/completions");
+			const wire = JSON.parse(requests[0].body) as {
+				model: string;
+				messages: Array<{
+					role: string;
+					content: string | Array<{ type: string; text?: string; input_audio?: unknown }>;
+				}>;
+			};
+			expect(wire.model).toBe(model);
+			const audioMessages = wire.messages.filter(
+				(row) =>
+					Array.isArray(row.content) && row.content.some((part) => part.type === "input_audio"),
+			);
+			expect(audioMessages).toHaveLength(1);
+			const audioMessage = audioMessages[0];
+			expect(audioMessage.role).toBe("user");
+			if (!Array.isArray(audioMessage.content)) throw new Error("Missing native audio parts");
+			expect(audioMessage.content.filter((part) => part.type === "input_audio")).toEqual([
+				{
+					type: "input_audio",
+					input_audio: { data: `data:;base64,${bytes.toString("base64")}`, format: "mp3" },
+				},
+			]);
+			expect(
+				audioMessage.content.every((part) => ["text", "input_audio"].includes(part.type)),
+			).toBe(true);
+			const currentText = audioMessage.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			expect(currentText).toContain(prompt);
+			expect(currentText).toContain(ref.filename);
+			expect(currentText).not.toContain(oldVideoPath);
+			const audioIndex = audioMessage.content.findIndex((part) => part.type === "input_audio");
+			const identity = audioMessage.content[audioIndex - 1];
+			expect(identity).toEqual({
+				type: "text",
+				text:
+					`Native media attachment metadata: ${JSON.stringify({ filename: ref.filename, type: "audio", mediaType: "audio/mpeg" })}\n` +
+					"The following audio content is included directly in this message. The filename is an attachment label, not a device file path. Use this attachment for this message; do not substitute a file path from earlier conversation history.",
+			});
+			expect(requests[0].body.split(bytes.toString("base64"))).toHaveLength(2);
+			expect(requests[0].body).not.toContain('"type":"file"');
+			expect(requests[0].body).not.toContain('"type":"video_url"');
+			const pathMessages = wire.messages.filter((row) =>
+				historyStrings(row.content).includes(oldVideoPath),
+			);
+			expect(pathMessages).toHaveLength(
+				scenario === "persisted-current-without-currentMedia" ? 0 : 1,
+			);
+			if (pathMessages.length) {
+				expect(pathMessages[0].role).toBe(scenario === "uncompressed" ? "user" : "system");
+				expect(pathMessages[0]).not.toBe(audioMessage);
+			}
+			if (scenario === "post-compact-assistant-tool-tail") {
+				expect(wire.messages.some((row) => row.role === "assistant")).toBe(true);
+				expect(wire.messages.some((row) => row.role === "tool")).toBe(true);
+			}
+			// A visible label must travel with the current bytes, not just with a UI resource.
+			expect(historyStrings(wire.messages)).toContain(ref.filename);
+		} finally {
+			setOutboundFetchOverrideForTest(null);
+			setUploadsDirForTests(null);
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("hydration may exceed ten seconds without rejecting a valid history", async () => {
 	const prefix = await import("../narrator-prefix-state");
 	const original = prefix.hydrateContextUpdates;
 	let now = Date.now();
@@ -116,7 +373,6 @@ test("hydration may outlive the source-read deadline without rejecting a valid h
 	try {
 		const built = await buildRuntimeHistory({
 			...options(),
-			deadline: now + 10_000,
 			sourceMessages: [message("input", "user", "large history survives hydration")],
 		});
 		expect(built.modelMessages[0].contentText).toBe("large history survives hydration");
@@ -278,6 +534,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 					);
 				if (placement !== "trailing")
 					source.push(message("after-question", "assistant", "Acknowledged"));
+				await freezeModelHistorySource(source);
 				const before = structuredClone(source);
 				const prepared = await buildRuntimeHistory({
 					...options(profile),
@@ -358,6 +615,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 			},
 		];
 		const source = [tool];
+		await freezeModelHistorySource(source);
 		const before = structuredClone(source);
 		const prepared = await buildRuntimeHistory({
 			...options(),
@@ -401,7 +659,8 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 			where: eq(narratorToolCalls.id, call.id),
 		});
 		expect(auditBefore?.inputJson).toEqual(audit);
-		expect(before?.contentJson).toEqual([
+		const contentBefore = readTestMessageContent(sqlite, saved.id);
+		expect(contentBefore).toEqual([
 			{ type: "tool_use", id: "question-use", name: "AskUserQuestion", input: questionInput },
 		]);
 		for (const narratorId of ["primary", "fork"]) {
@@ -422,6 +681,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 				where: (messages, { eq }) => eq(messages.id, saved.id),
 			}),
 		).toEqual(before);
+		expect(readTestMessageContent(sqlite, saved.id)).toEqual(contentBefore);
 		expect(
 			await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, call.id) }),
 		).toEqual(auditBefore);
@@ -438,6 +698,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 			},
 		];
 		const source = [orphan];
+		await freezeModelHistorySource(source);
 		const before = structuredClone(source);
 		const prepared = await buildRuntimeHistory({
 			...options(),
@@ -477,6 +738,7 @@ for (const entry of [
 			},
 			{ ...injectionMessage("display-notice", "sys", "display-only-body"), role: "disp" as const },
 		];
+		await freezeModelHistorySource(source);
 		const before = structuredClone(source);
 		const prepared = await buildRuntimeHistory({ ...options(), ...entry, sourceMessages: source });
 		expect(prepared.replayedInjectionMessageIds).toEqual(["u", "historical-notice", "tail-notice"]);
@@ -637,6 +899,203 @@ test("child placement is projected while complete tools and reasoning metadata a
 	const primary = await buildRuntimeHistory({ ...options(), sourceMessages: source });
 	expect(primary.history).toEqual([]);
 });
+
+test("model source exposes recursive readonly JSON and preserves the public return boundary", () => {
+	type Returned = Awaited<
+		ReturnType<
+			typeof import("../narrator-messages").narratorMessageQueries.getModelHistorySinceLastCompact
+		>
+	>;
+	expectTypeOf<Returned>().toEqualTypeOf<readonly ModelSourceRow[]>();
+	// Compile-only negative probes: these must remain errors after future type refactors.
+	const readonlyProbe = (
+		source: ModelHistorySource,
+		array: readonly ModelHistoryJson[],
+		object: { readonly [key: string]: ModelHistoryJson },
+	) => {
+		// @ts-expect-error Shared source containers cannot be appended to.
+		source.messages.push(source.messages[0]);
+		// @ts-expect-error Shared source row fields cannot be replaced.
+		source.messages[0].contentJson = null;
+		// @ts-expect-error Shared tool containers cannot be appended to.
+		source.messages[0].toolCalls.push(source.messages[0].toolCalls[0]);
+		// @ts-expect-error Shared nested tool JSON cannot be replaced.
+		source.messages[0].toolCalls[0].inputJson = null;
+		// @ts-expect-error Shared parsed JSON arrays are recursively readonly.
+		array.push(null);
+		// @ts-expect-error Shared parsed JSON objects are recursively readonly.
+		object.nested = null;
+	};
+	expect(readonlyProbe).toBeFunction();
+});
+
+for (const width of [3, 17_001])
+	test(`real provider projections preserve frozen worker sources and delta subtrees (width=${width})`, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-provider-source-ownership-"));
+		const connection = new Database(join(directory, "history.db"));
+		const started = performance.now();
+		let lastHeartbeat = started;
+		let maxHeartbeatGapMs = 0;
+		let heartbeats = 0;
+		const heartbeat = setInterval(() => {
+			const now = performance.now();
+			maxHeartbeatGapMs = Math.max(maxHeartbeatGapMs, now - lastHeartbeat);
+			lastHeartbeat = now;
+			heartbeats++;
+		}, 5);
+		try {
+			connection.run("PRAGMA journal_mode = WAL");
+			connection.run(modelHistoryFixtureSql);
+			connection.run(renderModelHistoryRevisionSql("sqlite"));
+			connection.run("INSERT INTO narrators (id, title) VALUES ('primary', 'Frozen owner')");
+			const insert = (
+				id: string,
+				seq: number,
+				role: string,
+				content: ModelHistoryJson,
+				parent: string | null = null,
+			) => {
+				connection
+					.query(
+						"INSERT INTO narrator_messages (id, narrator_id, role, content_json, parent_tool_use_id) VALUES (?, 'primary', ?, ?, ?)",
+					)
+					.run(id, role, JSON.stringify(content), parent);
+				connection
+					.query(
+						"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, 'primary', ?, ?)",
+					)
+					.run(`ref:${id}`, id, seq);
+			};
+			// This is within the preparation byte budget, but wider than the former 16,384 limit.
+			const wide = Array.from({ length: width }, (_, index) => ({
+				type: "text",
+				text: `wide-${index}`,
+			}));
+			insert("wide-user", 1, "user", wide);
+			const input = { path: "example", nested: { values: [1, { preserve: "input-subtree" }] } };
+			const output = {
+				result: "shared-output-marker",
+				nested: { values: [2, { preserve: "output-subtree" }] },
+			};
+			insert(
+				"shared-assistant",
+				2,
+				"assistant",
+				[
+					{ type: "text", text: "source answer" },
+					{ type: "tool_use", id: "shared-call", name: "Read", input },
+				],
+				"origin",
+			);
+			connection
+				.query(
+					"INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json, status, created_at) VALUES ('tool-row', 'primary', 'shared-assistant', 'shared-call', 'Read', ?, ?, 'success', ?)",
+				)
+				.run(JSON.stringify(input), JSON.stringify(output), time);
+			const backend = { backend: "sqlite" as const, sqlite: connection };
+			const source = await loadModelHistorySource(backend, "primary");
+			await freezeModelHistorySource(source);
+			const before = structuredClone(source);
+			expect(Object.isFrozen(source.messages[0].contentJson)).toBe(true);
+			expect(Object.isFrozen(source.messages[1].toolCalls[0].inputJson)).toBe(true);
+			insert("delta-user", 3, "user", [{ type: "text", text: "appended delta question" }]);
+			const delta = await loadModelHistorySource(backend, "primary");
+			await freezeModelHistorySource(delta);
+			const deltaBefore = structuredClone(delta);
+			expect(delta.counters.reusedBodies).toBe(2);
+			expect(delta.counters.reusedTools).toBe(1);
+			expect(delta.messages[0].contentJson).toBe(source.messages[0].contentJson);
+			expect(delta.messages[1].contentJson).toBe(source.messages[1].contentJson);
+			expect(delta.messages[1].toolCalls[0].inputJson).toBe(
+				source.messages[1].toolCalls[0].inputJson,
+			);
+			expect(delta.messages[1].toolCalls[0].outputJson).toBe(
+				source.messages[1].toolCalls[0].outputJson,
+			);
+			for (const entry of [
+				{ model: "claude-sonnet-4", provider: "history-official" },
+				{ model: "claude-sonnet-4", provider: "history-relay" },
+				{ model: "gpt-5", provider: "question-responses" },
+				{ model: "gpt-5", provider: "question-completions" },
+				{ model: "gemini-2.5-pro", provider: "question-gemini" },
+				{ model: "gemini-2.5-pro", provider: "question-interactions" },
+			]) {
+				const project = (shared: ModelHistorySource) =>
+					buildRuntimeHistory({
+						...entry,
+						narratorId: "primary",
+						ownTurnPlacement: "origin",
+						sourceMessages: shared.messages,
+					});
+				// Measure one real build only; assertions/clones and sibling builds are outside this timer.
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+				let projectionLastBeat = performance.now();
+				let projectionMaxGap = 0;
+				let projectionBeats = 0;
+				const projectionHeartbeat = setInterval(() => {
+					const now = performance.now();
+					projectionMaxGap = Math.max(projectionMaxGap, now - projectionLastBeat);
+					projectionLastBeat = now;
+					projectionBeats++;
+				}, 1);
+				const projectionStarted = performance.now();
+				let first: Awaited<ReturnType<typeof buildRuntimeHistory>>;
+				try {
+					first = await project(source);
+					const buildMs = performance.now() - projectionStarted;
+					await new Promise<void>((resolve) => setTimeout(resolve, 0));
+					console.info("single provider projection timing", {
+						width,
+						provider: entry.provider,
+						buildMs: Math.round(buildMs),
+						heartbeats: projectionBeats,
+						maxHeartbeatGapMs: Math.round(
+							Math.max(projectionMaxGap, performance.now() - projectionLastBeat),
+						),
+					});
+				} finally {
+					clearInterval(projectionHeartbeat);
+				}
+				const [second, next] = await Promise.all([project(source), project(delta)]);
+				expect(first.history).toEqual(second.history);
+				expect(first.history).not.toBe(second.history);
+				expect(JSON.stringify(first.history)).toContain(`wide-${width - 1}`);
+				expect(JSON.stringify(first.history)).toContain("shared-output-marker");
+				expect(JSON.stringify(next.history)).toContain("appended delta question");
+				expect(first.sourceMessages).toBe(source.messages);
+				expect(first.modelMessages[1]).not.toBe(second.modelMessages[1]);
+				expect(first.modelMessages[1].toolCalls?.[0]).not.toBe(
+					second.modelMessages[1].toolCalls?.[0],
+				);
+				expect(first.modelMessages[1].parentToolUseId).toBeNull();
+				const secondBefore = structuredClone(second);
+				const nextBefore = structuredClone(next);
+				// These containers are request-owned. Mutating them cannot alter another request or source.
+				first.modelMessages[1].contentText = "request-local edit";
+				const call = first.modelMessages[1].toolCalls?.[0];
+				if (!call) throw new Error("Missing request-owned tool projection");
+				call.outputJson = "request-local output";
+				first.history.push({ role: "user", content: "request-local history" });
+				expect(second).toEqual(secondBefore);
+				expect(next).toEqual(nextBefore);
+				expect(source).toEqual(before);
+				expect(delta).toEqual(deltaBefore);
+			}
+			console.info("frozen provider source probe", {
+				width,
+				elapsedMs: Math.round(performance.now() - started),
+				heartbeats,
+				maxHeartbeatGapMs: Math.round(
+					Math.max(maxHeartbeatGapMs, performance.now() - lastHeartbeat),
+				),
+			});
+		} finally {
+			clearInterval(heartbeat);
+			clearModelHistorySourceCacheForTest();
+			connection.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	}, 30_000);
 
 test("reconciled epoch and raw candidates are reused without a second epoch query", async () => {
 	const epochs = await import("../narrator-epochs");
@@ -974,7 +1433,9 @@ test.each([
 		const history = JSON.stringify(historical.history);
 		expect(history).toContain("logo.png");
 		expect(history).toContain("device: local");
-		expect(history).toContain(join(cwd, ".narrafork", "attached"));
+		expect(historyStrings(historical.history)).toContain(
+			JSON.stringify(join(cwd, ".narrafork", "attached")).slice(1, -1),
+		);
 		expect(history).toContain(mode === "relay" || mode === "official" ? '"type":"image"' : "image");
 		expect(readdirSync(join(cwd, ".narrafork", "attached"))).toHaveLength(1);
 		const recovered = await buildRuntimeHistory({ ...runtimeOptions, sourceMessages: [user] });

@@ -1,7 +1,13 @@
-/** One immutable request baseline; only compact and model changes start another epoch. */
+/**
+ * One immutable request baseline. Compact, a model/protocol/strategy change, or an
+ * explicit load the strategy cannot append starts another epoch.
+ */
 import type { DbMessage } from "@shared/agent-protocol/types";
 import {
+	boundContextUpdateDisplay,
+	CONTEXT_UPDATE_NOTICE,
 	contextChanges,
+	contextUpdateDisplayEntries,
 	type PrefixSnapshot,
 	type PromptPart,
 	renderContextUpdate,
@@ -9,7 +15,7 @@ import {
 import { and, desc, eq, sql } from "drizzle-orm";
 import { activeDatabaseBackend, db, sqlite } from "../db";
 import { narratorMessageRefs, narratorMessages } from "../db/schema";
-import { resolveEpochTarget, resolveHistoryToolLoadingStrategy } from "../lib/agent";
+import { type EpochTarget, resolveEpochTarget } from "../lib/agent";
 import { collectSenderContext } from "../lib/agent/sender-context";
 import {
 	classifyToolAdditions,
@@ -21,13 +27,16 @@ import {
 	ToolEpochError,
 	type ToolLoadingEpoch,
 	toolLoadingDrift,
+	undeclaredExplicitLoads,
 } from "../lib/agent/tool-loading";
 import { resolveToolJsonSchema, toolRegistry } from "../lib/agent/tool-registry";
 import type { ToolDefinition } from "../lib/agent/types";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
+import { sqliteErrorCode } from "../lib/db-resilience";
 import type { Locale } from "../lib/i18n";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { baselineContextDisplays, refineContextDisplay } from "./context-display-refiners";
 import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
 import {
 	getPrefixToolDefinitions,
@@ -214,13 +223,30 @@ export interface ReconcileEpochInput {
 	registryRevision?: string;
 	model: string;
 	provider: string;
-	prompt?: { contract: string; parts: readonly PromptPart[]; compactMessageId?: string | null };
+	prompt?: {
+		contract: string;
+		parts: readonly PromptPart[];
+		compactMessageId?: string | null;
+		/**
+		 * Parts the builder could not read this time: within an epoch they keep their previous
+		 * value (no update); a new baseline goes without them until they can be read.
+		 */
+		keepParts?: readonly string[];
+		/**
+		 * Reader summaries of parts (`ContextPart.display`): stored on a `context_update` row that
+		 * changes those parts, for the transcript. Never part of the prefix or its change key.
+		 */
+		displays?: Readonly<Record<string, unknown>>;
+	};
 	refreshTools?: () => Promise<PrefixToolInput>;
 	signal?: AbortSignal;
 	noticeText: (kind: "tool_loaded" | "tool_unloaded", toolName: string) => string;
 	/** Compatibility for callers/tests; cache age never opens an epoch. */
 	now?: number;
-	resolveTarget?: typeof resolveEpochTarget;
+	resolveTarget?: (
+		model: string,
+		provider: string,
+	) => Pick<EpochTarget, "fingerprint" | "cacheTtlMs"> & Partial<EpochTarget>;
 }
 
 /** Serializes with /load so two request preparations cannot publish the same update. */
@@ -234,9 +260,13 @@ export async function reconcileEpoch(input: ReconcileEpochInput): Promise<Reconc
 				return { ...result, ...(loading ? { loading } : {}) };
 			} catch (error) {
 				if (error instanceof PrefixContextChangedError) throw error;
+				// A lock here terminates the whole loop, so keep the origin identifiable:
+				// the message alone cannot tell BUSY from BUSY_SNAPSHOT, nor which write.
 				logger.warn("Prefix epoch could not be prepared", {
 					narratorId: input.narratorId,
 					error: String(error),
+					code: sqliteErrorCode(error),
+					stack: error instanceof Error ? error.stack : undefined,
 				});
 				throw new ToolEpochError(error);
 			}
@@ -263,14 +293,21 @@ function currentPromptParts(
 		`Currently available tools: ${allowed.sort().join(", ")}`,
 		...(blocked.length
 			? [
-					`Unavailable in this model's current tool-declaration protocol: ${blocked.sort().join(", ")}. Other tools remain available; a compact or model change can establish a new declaration baseline.`,
+					`Unavailable in this model's current tool-declaration protocol: ${blocked.sort().join(", ")}. Other tools remain available. Loading a loadable one explicitly (ToolSearch or /load) declares it in a new baseline; a compact or a model or protocol change declares all of them.`,
 				]
 			: []),
 	].join("\n");
+	const given = (input.prompt?.parts ?? []).filter(
+		(part) => part.key !== "senders" && part.key !== "tools.availability",
+	);
+	const kept: PromptPart[] = [];
+	for (const key of input.prompt?.keepParts ?? []) {
+		const text = previous?.get(key);
+		if (text !== undefined && !given.some((part) => part.key === key)) kept.push({ key, text });
+	}
 	return [
-		...(input.prompt?.parts ?? []).filter(
-			(part) => part.key !== "senders" && part.key !== "tools.availability",
-		),
+		...given,
+		...kept,
 		{ key: "tools.availability", text: availability },
 		{ key: "senders", text: collectSenderContext(messages, previous?.get("senders")) },
 	];
@@ -309,9 +346,37 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 	const current = new Set(input.current);
 	const candidates = input.candidates ?? toolRegistry.all();
 	const targetChanged = epoch?.target !== undefined && epoch.target !== target.fingerprint;
+	// Only a prefix epoch records a strategy. A test target that names only a fingerprint
+	// still gets the real strategy.
+	const profile = !input.prompt
+		? undefined
+		: target.strategy
+			? target
+			: resolveEpochTarget(input.model, input.provider);
+	// Epochs written before `protocol` was recorded compare only their strategy, so an
+	// upgrade alone does not discard every session's cache.
+	const profileChanged =
+		!!epoch?.prefix &&
+		!!profile &&
+		((epoch.protocol !== undefined &&
+			profile.protocol !== undefined &&
+			epoch.protocol !== profile.protocol) ||
+			(epoch.strategy !== undefined && epoch.strategy !== profile.strategy));
+	// An explicit load the epoch's strategy could not append (`changeLoadedToolGroup`)
+	// is honoured by declaring it in a new baseline, at the cost of this prefix's cache.
+	const pendingLoads =
+		epoch?.prefix && profile && !targetChanged && !profileChanged
+			? undeclaredExplicitLoads(messages, managed, current, epoch, candidates)
+			: [];
 	let changed = false;
 	let opened = false;
-	if (!epoch || targetChanged || (input.prompt && !epoch.prefix)) {
+	if (
+		!epoch ||
+		targetChanged ||
+		profileChanged ||
+		pendingLoads.length > 0 ||
+		(input.prompt && !epoch.prefix)
+	) {
 		const baseCandidates = candidates.filter(
 			(tool) => !managed.has(tool.name) || current.has(tool.name),
 		);
@@ -327,16 +392,38 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 				tools: await putPrefixToolDefinitions(definitions, signal),
 			};
 		}
+		// Reader-only: the summaries of the parts this baseline holds, for the epoch's first update
+		// row to be compared with. Stored on the marker; no part of the prefix or its hashes.
+		const baselineDisplays =
+			prefix && input.prompt
+				? baselineContextDisplays({
+						parts: prefix.parts,
+						keepParts: input.prompt.keepParts,
+						displays: input.prompt.displays,
+					})
+				: undefined;
 		const record: EpochRecord = {
-			reason: targetChanged ? "target" : epoch?.reason === "compact" ? "compact" : "initial",
+			reason:
+				targetChanged || profileChanged
+					? "target"
+					: pendingLoads.length > 0
+						? "tools"
+						: epoch?.reason === "compact"
+							? "compact"
+							: "initial",
 			target: target.fingerprint,
 			compactMessageId,
 			toolNames: [...current].sort(),
 			registryRevision: input.registryRevision ?? toolRegistry.revision,
 			baseToolNames: baseCandidates.map((tool) => tool.name),
-			...(prefix
-				? { prefix, strategy: resolveHistoryToolLoadingStrategy(input.model, input.provider) }
+			...(prefix && profile
+				? {
+						prefix,
+						strategy: profile.strategy,
+						...(profile.protocol ? { protocol: profile.protocol } : {}),
+					}
 				: { definitionSnapshots: definitions }),
+			...(baselineDisplays ? { baselineDisplays } : {}),
 		};
 		const marker = await withPrefixSnapshotPublication(
 			prefix ? [prefix.contract, prefix.tools, ...prefix.parts.map((part) => part.hash)] : [],
@@ -412,14 +499,35 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 	if (changes.length) {
 		const modelText = renderContextUpdate(changes);
 		const snapshotRef = await putPrefixJson({ changes, modelText }, signal);
+		// The reader's summaries: each changed part's own, refined against the row this session was
+		// last shown (the current-tasks view then names what was finished or started in between).
+		// Rendered after, and never read by, the model's text above.
+		const display = boundContextUpdateDisplay(
+			await refineContextDisplay({
+				narratorId,
+				display: contextUpdateDisplayEntries(changes, input.prompt.displays),
+				messages,
+				epochId: epoch.markerId,
+				baseline: epoch.baselineDisplays,
+				signal,
+			}),
+		);
 		const row = await withPrefixSnapshotPublication(
 			[snapshotRef],
 			() =>
 				publish(() =>
 					narratorStore.appendNotice(
 						narratorId,
-						`Context updated: ${changes.map((part) => part.key).join(", ")}`,
-						[{ type: "context_update", epochId: epoch.markerId, changes: [], snapshotRef }],
+						`${CONTEXT_UPDATE_NOTICE}${changes.map((part) => part.key).join(", ")}`,
+						[
+							{
+								type: "context_update",
+								epochId: epoch.markerId,
+								changes: [],
+								snapshotRef,
+								...(display ? { display } : {}),
+							},
+						],
 					),
 				),
 			signal,

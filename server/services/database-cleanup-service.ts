@@ -38,6 +38,7 @@ import {
 	type NarratorCleanupPlan,
 	type NarratorCleanupRecord,
 } from "./database-cleanup-utils";
+import { DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS } from "./storage/database-storage-port";
 // Storage-scan query primitives live in a DB-singleton-free module so the read worker can import
 // them without re-bootstrapping the database. See storage-scan-queries.ts for why that matters.
 import {
@@ -87,6 +88,11 @@ function legacyRequestDumpsRetained(): boolean {
 	return hasRetainedLegacyRequestDump(sqlite);
 }
 const databaseMaintenanceLock = new AsyncMutex();
+
+/** Share the maintenance window with bounded history cleanup batches. */
+export function withDatabaseMaintenance<T>(work: () => Promise<T>): Promise<T> {
+	return databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, work);
+}
 
 const SESSION_OWNED_TABLES: SessionOwnedTableRelation[] = [
 	{ tableName: "narrator_message_refs", alias: "r", narratorColumn: "narrator_id" },
@@ -426,6 +432,7 @@ function isCleanupRootStillEligible(
 async function runCleanupReadTask<T>(
 	params: StorageScanCleanupSummariesParams | StorageScanSessionPreviewParams,
 	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<T> {
 	if (params.kind === "storageScanSessionPreview") {
 		try {
@@ -438,25 +445,32 @@ async function runCleanupReadTask<T>(
 		}
 	}
 	const dbPath = getDbPath();
+	const options = () => ({
+		signal,
+		...(deadlineAt === undefined ? {} : { timeoutMs: Math.max(0, deadlineAt - Date.now()) }),
+	});
 	try {
-		return await runReadTask<T>(dbPath, params, { signal });
+		try {
+			return await runReadTask<T>(dbPath, params, options());
+		} catch (err) {
+			if (signal?.aborted) throw err;
+			if (!(err instanceof WorkersUnavailableError) || err.reason === "pool_shutdown") throw err;
+			// Only inability to start the work justifies another worker. A watchdog or SQL
+			// error after a real read must not repeat the same large payload scan.
+			return await runEphemeralReadTask<T>(dbPath, params, options());
+		}
 	} catch (err) {
 		if (signal?.aborted) throw err;
 		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
-		try {
-			return await runEphemeralReadTask<T>(dbPath, params, { signal });
-		} catch (ephemeralErr) {
-			if (signal?.aborted) throw ephemeralErr;
-			logger.warn("Database cleanup read workers unavailable", {
-				task: params.kind,
-				reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
-			});
-			throw new AppError(
-				"Database cleanup statistics are unavailable: read workers failed",
-				503,
-				"DATABASE_CLEANUP_WORKERS_UNAVAILABLE",
-			);
-		}
+		logger.warn("Database cleanup read workers unavailable", {
+			task: params.kind,
+			reason: err instanceof Error ? err.message : String(err),
+		});
+		throw new AppError(
+			"Database cleanup statistics are unavailable: read workers failed",
+			503,
+			"DATABASE_CLEANUP_WORKERS_UNAVAILABLE",
+		);
 	}
 }
 
@@ -741,6 +755,7 @@ function cleanupSummariesFromAggregates(
  */
 async function measureCleanupCandidatesOffThread(
 	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<DatabaseStorageBreakdown["cleanupCandidates"]> {
 	const cleanupContext = await loadCleanupNarratorContext();
 	const archivedPlan = buildNarratorCleanupPlan("archivedSessions", cleanupContext.narrators, {
@@ -763,7 +778,11 @@ async function measureCleanupCandidatesOffThread(
 		relations: SESSION_OWNED_TABLES,
 		toolCallCutoffIso: getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS),
 	};
-	const aggregates = await runCleanupReadTask<StorageScanCleanupSummariesResult>(params, signal);
+	const aggregates = await runCleanupReadTask<StorageScanCleanupSummariesResult>(
+		params,
+		signal,
+		deadlineAt,
+	);
 	return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
 }
 
@@ -784,20 +803,26 @@ export const databaseCleanupService = {
 		const startedAt = performance.now();
 		let executedOn: ParallelScanOutcome["executedOn"] = "workers";
 		if (options.signal?.aborted) throw new Error("database storage scan aborted");
-		const cleanup = measureCleanupCandidatesOffThread(options.signal);
+		const deadlineAt = Date.now() + DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS;
+		const scope = new AbortController();
+		const signal = options.signal ? AbortSignal.any([options.signal, scope.signal]) : scope.signal;
+		const cleanup = measureCleanupCandidatesOffThread(signal, deadlineAt);
 		// It runs concurrently with the object scan, which may outlive a fast worker failure.
 		cleanup.catch(() => {});
 		try {
 			const fileSizes = await getDatabaseFileSizes();
-			const objectStorage = await runParallelObjectStorageScan({
-				sqlite,
-				dbPath: getDbPath(),
-				mainBytes: fileSizes.mainBytes,
-				onProgress: options.onProgress,
-				signal: options.signal,
-			});
+			const [objectStorage, cleanupCandidates] = await Promise.all([
+				runParallelObjectStorageScan({
+					sqlite,
+					dbPath: getDbPath(),
+					mainBytes: fileSizes.mainBytes,
+					onProgress: options.onProgress,
+					signal,
+					budgetMs: Math.max(0, deadlineAt - Date.now()),
+				}),
+				cleanup,
+			]);
 			executedOn = objectStorage.executedOn;
-			const cleanupCandidates = await cleanup;
 			const { executedOn: _executedOn, workerCount, durationMs, ...storage } = objectStorage;
 			logger.info("Database storage scan completed", {
 				executedOn: objectStorage.executedOn,
@@ -815,6 +840,8 @@ export const databaseCleanupService = {
 			cleanup.catch(() => {});
 			throw err;
 		} finally {
+			// Either branch failing must release the other's read workers, not leave an orphan scan.
+			scope.abort();
 			logSlowDatabaseStep("scanDatabaseBreakdown", startedAt, { executedOn });
 		}
 	},

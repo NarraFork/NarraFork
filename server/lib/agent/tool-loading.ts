@@ -19,8 +19,9 @@
  *     for endpoints that do not validate tool names against the declared list.
  *
  * `replace_tools` remains readable for legacy callers; a persisted prefix epoch never
- * rewrites its declared array, including on targets without additive loading. Only
- * compact or a model change folds accumulated declarations into a new baseline.
+ * rewrites its declared array, including on targets without additive loading. Compact,
+ * a model/protocol/strategy change, or an explicit load the strategy cannot append
+ * (its notice carries `rebaseline`) folds accumulated declarations into a new baseline.
  *
  * An epoch that recorded its loaded set (`ToolLoadingEpoch`) fixes the array's share for
  * its whole length; a change that bypassed `/load` is reconciled into the history as a
@@ -32,6 +33,7 @@
  */
 
 import type { DbMessage } from "@shared/agent-protocol/types";
+import { TOOL_LOADING_MODES, type ToolLoadingMode } from "@shared/model-catalog/override";
 import { parseModelId } from "@shared/model-id";
 import type { PrefixSnapshot } from "@shared/prefix-context";
 import {
@@ -40,21 +42,14 @@ import {
 	parseClaudeModel,
 } from "@shared/reasoning-effort-support";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../builtin-routines";
-import type { ModelProtocol } from "../settings/types";
+import { AppError } from "../errors";
+import { isModelProtocol, type ModelProtocol } from "../settings/types";
 import type { ProviderAdapter } from "./provider";
 import { effectiveModelProfile } from "./provider-model-metadata";
 import { resolveToolJsonSchema, toolRegistry } from "./tool-registry";
 import type { ResolvedToolDefinition, ToolDefinition } from "./types";
 
-export const TOOL_LOADING_MODES = [
-	"anthropic_tool_addition",
-	"anthropic_deferred_tail",
-	"openai_additional_tools",
-	"kimi_system_tools",
-	"custom_injection",
-] as const;
-
-export type ToolLoadingMode = (typeof TOOL_LOADING_MODES)[number];
+export { TOOL_LOADING_MODES, type ToolLoadingMode } from "@shared/model-catalog/override";
 
 /** A mode, or the fallback that rewrites `tools` on every change. */
 export type ToolLoadingStrategy = ToolLoadingMode | "replace_tools";
@@ -182,12 +177,32 @@ export function resolveAdapterToolLoadingStrategy(
 	adapter: Pick<ProviderAdapter, "toolLoadingTarget">,
 	model: string,
 ): ToolLoadingStrategy {
-	const target = adapter.toolLoadingTarget?.(model);
-	if (!target) return "replace_tools";
+	return resolveTargetToolLoadingStrategy(model, adapter.toolLoadingTarget?.(model));
+}
+
+/** The strategy for `model` (`prefix:id`) on an already resolved wire target. */
+export function resolveTargetToolLoadingStrategy(
+	model: string,
+	target: ToolLoadingTarget | undefined,
+): ToolLoadingStrategy {
 	return resolveToolLoadingStrategy(
 		parseModelId(model).model,
 		target,
 		effectiveModelProfile(model).toolLoadingModes,
+	);
+}
+
+/**
+ * The protocols among `candidates` on which `model` could load tools without rewriting
+ * the declared array, in the given order. Used to suggest a protocol switch when the
+ * current one can only rebuild the prefix.
+ */
+export function protocolsWithToolAppending(
+	model: string,
+	candidates: readonly ModelProtocol[],
+): ModelProtocol[] {
+	return candidates.filter(
+		(protocol) => resolveTargetToolLoadingStrategy(model, { protocol }) !== "replace_tools",
 	);
 }
 
@@ -294,6 +309,10 @@ export interface ToolLoadingEpoch {
 	prefixState?: object;
 	/** The request target the epoch opened for (`resolveEpochTarget`), when recorded. */
 	target?: string;
+	/** The wire protocol the epoch opened on; absent on epochs written before it was recorded. */
+	protocol?: ModelProtocol;
+	/** {@link EpochRecord.baselineDisplays}. */
+	baselineDisplays?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -316,18 +335,29 @@ export function classifyToolAdditions(
 	return { allowed, blocked };
 }
 
-/** A persisted epoch boundary failed; do not fall back to a transcript from the old epoch. */
+/** Request preparation failed; do not fall back to a transcript from the old epoch. */
 export class ToolEpochError extends Error {
 	constructor(cause: unknown) {
-		super("Could not save the tool epoch. Retry when message storage is available.", { cause });
+		// AppError already marks public prose; raw driver errors may contain credentials or SQL.
+		const message =
+			cause instanceof AppError
+				? cause.message
+				: cause instanceof Error && cause.name === "AbortError"
+					? "Request preparation cancelled."
+					: "Could not prepare tool and context state. See server logs for details.";
+		super(message, { cause });
 		this.name = "ToolEpochError";
 	}
 }
 /** What an epoch marker records (§7.7); a compact element carries the same as `epoch`. */
 export interface EpochRecord {
-	/** cold/manual remain readable for legacy rows; new boundaries use initial/compact/target. */
-	reason: "initial" | "compact" | "target" | "cold" | "manual";
+	/**
+	 * cold/manual remain readable for legacy rows; new boundaries use initial/compact/target,
+	 * or tools when an explicit load needs a declaration the current strategy cannot append.
+	 */
+	reason: "initial" | "compact" | "target" | "tools" | "cold" | "manual";
 	target?: string;
+	protocol?: ModelProtocol;
 	toolNames: string[];
 	registryRevision?: string;
 	definitionSnapshots?: ToolDefinitionSnapshot[];
@@ -335,6 +365,14 @@ export interface EpochRecord {
 	compactMessageId?: string | null;
 	baseToolNames?: string[];
 	strategy?: ToolLoadingStrategy;
+	/**
+	 * Reader-only summaries of context parts as the prefix baseline held them (`ContextPart.display`,
+	 * by key; `null` for a part the baseline went without): what the epoch's FIRST `context_update`
+	 * row of such a part is compared with to say what changed (`context-display-refiners.ts`).
+	 * Never part of the prefix, its hashes or anything the model reads. Absent on epochs written
+	 * before it existed: their first row has nothing to compare with.
+	 */
+	baselineDisplays?: Record<string, unknown>;
 }
 
 /** The epoch a stored element opens: a marker `{type:"epoch"}` or a compact with `epoch`. */
@@ -347,6 +385,7 @@ export function epochRecordOf(block: unknown): EpochRecord | undefined {
 	return {
 		reason: (typeof epoch.reason === "string" ? epoch.reason : "manual") as EpochRecord["reason"],
 		...(typeof epoch.target === "string" ? { target: epoch.target } : {}),
+		...(isModelProtocol(epoch.protocol) ? { protocol: epoch.protocol } : {}),
 		toolNames: epoch.toolNames.filter((name): name is string => typeof name === "string"),
 		...(typeof epoch.registryRevision === "string"
 			? { registryRevision: epoch.registryRevision }
@@ -361,6 +400,11 @@ export function epochRecordOf(block: unknown): EpochRecord | undefined {
 		...(Array.isArray(epoch.baseToolNames) ? { baseToolNames: epoch.baseToolNames } : {}),
 		...(typeof epoch.strategy === "string"
 			? { strategy: epoch.strategy as ToolLoadingStrategy }
+			: {}),
+		...(epoch.baselineDisplays &&
+		typeof epoch.baselineDisplays === "object" &&
+		!Array.isArray(epoch.baselineDisplays)
+			? { baselineDisplays: epoch.baselineDisplays as Record<string, unknown> }
 			: {}),
 	};
 }
@@ -385,6 +429,8 @@ export function latestToolLoadingEpoch(
 				baseToolNames: epoch.baseToolNames,
 				strategy: epoch.strategy,
 				...(epoch.target ? { target: epoch.target } : {}),
+				...(epoch.protocol ? { protocol: epoch.protocol } : {}),
+				...(epoch.baselineDisplays ? { baselineDisplays: epoch.baselineDisplays } : {}),
 			};
 	}
 	return undefined;
@@ -422,6 +468,47 @@ function epochRows(messages: readonly DbMessage[], markerId: string | undefined)
 	if (!markerId) return messages;
 	const index = messages.findIndex((message) => message.id === markerId);
 	return index === -1 ? messages : messages.slice(index + 1);
+}
+
+/**
+ * Tools an explicit load (`/load`, ToolSearch) committed inside this epoch that its
+ * strategy could not append. Their notices carry `rebaseline: true`; the next request
+ * opens a new epoch that declares them. Only tools the new baseline would actually
+ * declare are returned, so a tool that cannot be declared never reopens epochs.
+ */
+export function undeclaredExplicitLoads(
+	messages: readonly DbMessage[],
+	managed: ReadonlySet<string>,
+	current: ReadonlySet<string>,
+	epoch: Pick<ToolLoadingEpoch, "markerId" | "baseToolNames" | "toolNames">,
+	candidates: readonly ToolDefinition[],
+): string[] {
+	const declared = new Set(epoch.baseToolNames ?? epoch.toolNames);
+	const declarable = new Set(
+		candidates
+			.filter((tool) => !managed.has(tool.name) || current.has(tool.name))
+			.map((tool) => tool.name),
+	);
+	return [...rebaselineRequests(messages, epoch.markerId)]
+		.filter((name) => !declared.has(name) && declarable.has(name))
+		.sort();
+}
+
+/** Tool names whose load notices inside this epoch asked for a new baseline. */
+export function rebaselineRequests(
+	messages: readonly DbMessage[],
+	markerId: string | undefined,
+): Set<string> {
+	const names = new Set<string>();
+	for (const message of epochRows(messages, markerId)) {
+		if (message.role !== "user" || message.parentToolUseId) continue;
+		const block = Array.isArray(message.contentJson) ? message.contentJson[0] : null;
+		if (!block || typeof block !== "object") continue;
+		const record = block as Record<string, unknown>;
+		if (record.type !== "tool_loaded" || record.rebaseline !== true) continue;
+		for (const name of eventToolNames(record)) names.add(name);
+	}
+	return names;
 }
 
 export function deriveToolLoadingState(

@@ -18,6 +18,37 @@ const BASE = {
 };
 
 describe("resolveSubagentExpanded — LOD / exemption main switch", () => {
+	it("compact display folds completed cards like ordinary tools but leaves live controls visible", async () => {
+		const { resolveSubagentExpanded, measureSubagentCard } = await import("./measure-subagent");
+		const input = {
+			isActive: false,
+			hasSelfPermission: false,
+			pendingPermissionCount: 0,
+			isRecent: true,
+			opened: true,
+			compactAuxiliaryContent: true,
+		};
+		for (const lod of [1, 2, 3] as const) expect(resolveSubagentExpanded(lod, input)).toBe(false);
+		expect(resolveSubagentExpanded(4, input)).toBe(true);
+		expect(resolveSubagentExpanded(4, { ...input, isRecent: false })).toBe(false);
+		expect(resolveSubagentExpanded(5, { ...input, opened: false })).toBe(true);
+		expect(resolveSubagentExpanded(5, { ...input, userCollapsed: true })).toBe(false);
+		expect(resolveSubagentExpanded(1, { ...input, hasSelfPermission: true })).toBe(true);
+		expect(resolveSubagentExpanded(1, { ...input, isActive: true })).toBe(true);
+		expect(
+			measureSubagentCard(BASE, WIDTH, 3, { compactAuxiliaryContent: true }).effectiveExpanded,
+		).toBe(false);
+		expect(measureSubagentCard(BASE, WIDTH, 3).effectiveExpanded).toBe(true);
+		expect(
+			measureSubagentCard(BASE, WIDTH, 4, { compactAuxiliaryContent: true, isRecent: true })
+				.effectiveExpanded,
+		).toBe(true);
+		expect(
+			measureSubagentCard(BASE, WIDTH, 4, { compactAuxiliaryContent: true, isRecent: false })
+				.effectiveExpanded,
+		).toBe(false);
+	});
+
 	it("lodExempt (active | selfPermission | pending) is always expanded", async () => {
 		const { resolveSubagentExpanded } = await import("./measure-subagent");
 		const base = { isRecent: false, opened: false };
@@ -128,9 +159,27 @@ describe("resolveSubagentExpanded — LOD / exemption main switch", () => {
 	});
 });
 
-describe("measureSubagentCard — collapsed header (55-75px)", () => {
-	it("collapsed with no result preview ≈ 56px (padding + badge + desc)", async () => {
-		const c = await import("./measure-subagent");
+/**
+ * The module with the line boxes the measure layer reads LIVE bound to their live
+ * values. The exported `XS_LINE_HEIGHT` / `RECENT_ROW_HEIGHT` / `FILE_CHANGE_ROW_HEIGHT`
+ * are the bare-Mantine baseline; the default setting measures text lines at 120% of it
+ * (`LINE_HEIGHT_BASELINE_PERCENT`): xs 20, a bare row 22.16.
+ */
+async function liveSubagent() {
+	const m = await import("./measure-subagent");
+	const { typographyMetrics } = await import("../pretext-fonts");
+	const { bareRowMetrics } = await import("@shared/pretext-layout/row-metrics");
+	return {
+		...m,
+		XS_LINE_HEIGHT: typographyMetrics().line.xs,
+		RECENT_ROW_HEIGHT: bareRowMetrics().height,
+		FILE_CHANGE_ROW_HEIGHT: bareRowMetrics().height,
+	};
+}
+
+describe("measureSubagentCard — collapsed header (62-86px)", () => {
+	it("collapsed with no result preview = 62px (padding + badge + desc)", async () => {
+		const c = await liveSubagent();
 		const { measureSubagentCard } = c;
 		// Explicitly folded; not recent, terminal, no result.
 		const r = measureSubagentCard(BASE, WIDTH, 3, { isRecent: false, opened: false });
@@ -139,15 +188,16 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 		const expectedHeader =
 			c.CARD_PADDING * 2 + c.badgeRowHeight() + c.DESC_MARGIN_TOP + c.XS_LINE_HEIGHT;
 		expect(r.headerHeight).toBe(expectedHeader);
-		expect(r.headerHeight).toBe(56);
+		// 56 at the bare Mantine lines; the default line is 120% of them (LINE_HEIGHT_BASELINE_PERCENT).
+		expect(r.headerHeight).toBe(62);
 		expect(r.hasResultPreview).toBe(false);
 		expect(r.height).toBe(expectedHeader + c.CARD_BORDER * 2);
-		expect(r.height).toBeGreaterThanOrEqual(55);
-		expect(r.height).toBeLessThanOrEqual(75);
+		expect(r.height).toBeGreaterThanOrEqual(62);
+		expect(r.height).toBeLessThanOrEqual(84);
 	});
 
-	it("collapsed WITH terminal result preview adds one line (≈75px)", async () => {
-		const c = await import("./measure-subagent");
+	it("collapsed WITH terminal result preview adds one line (84px)", async () => {
+		const c = await liveSubagent();
 		const { measureSubagentCard } = c;
 		const r = measureSubagentCard(
 			{ ...BASE, resultBody: bodyFixture("output.main", "The auth flow uses JWT bearer tokens.") },
@@ -164,8 +214,8 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 			c.XS_LINE_HEIGHT +
 			(c.RESULT_PREVIEW_MARGIN_TOP + c.XS_LINE_HEIGHT);
 		expect(r.headerHeight).toBe(expectedHeader);
-		expect(r.headerHeight).toBe(75);
-		expect(r.height).toBeLessThanOrEqual(75 + c.CARD_BORDER * 2);
+		expect(r.headerHeight).toBe(84);
+		expect(r.height).toBeLessThanOrEqual(84 + c.CARD_BORDER * 2);
 	});
 
 	it("collapsed description is a single fixed line regardless of length", async () => {
@@ -321,7 +371,7 @@ describe("measureSubagentCard — expanded body", () => {
 
 describe("measureSubagentCard — recent calls (independent of expansion)", () => {
 	it("recent calls show even when collapsed; ≤3 rows", async () => {
-		const c = await import("./measure-subagent");
+		const c = await liveSubagent();
 		const { measureSubagentCard } = c;
 		const none = measureSubagentCard(BASE, WIDTH, 3, { opened: false });
 		expect(none.recentCallsHeight).toBe(0);
@@ -346,7 +396,7 @@ describe("measureSubagentCard — recent calls (independent of expansion)", () =
 	});
 
 	it("recent-calls title button row uses the taller compact-xs when present", async () => {
-		const c = await import("./measure-subagent");
+		const c = await liveSubagent();
 		const { measureSubagentCard } = c;
 		const withBtn = measureSubagentCard(
 			{ ...BASE, recentCallCount: 1, hasRecentCallsButton: true },
@@ -594,9 +644,8 @@ describe("measureSubagent — file changes", () => {
 	});
 
 	it("caps the visible rows so a 220-file aggregate cannot fill the viewport", async () => {
-		const { measureSubagentCard, FILE_CHANGE_MAX_ROWS, FILE_CHANGE_ROW_HEIGHT } = await import(
-			"./measure-subagent"
-		);
+		const { measureSubagentCard, FILE_CHANGE_MAX_ROWS, FILE_CHANGE_ROW_HEIGHT } =
+			await liveSubagent();
 		const capped = measureSubagentCard({ ...baseCard(), fileChanges: changes(220) }, 600, 5);
 		expect(capped.fileChangeRowCount).toBe(FILE_CHANGE_MAX_ROWS);
 		// It is taller than an exactly-at-cap card by precisely ONE row — the overflow

@@ -338,6 +338,7 @@ describe("PostgreSQL modeltrace exclusion SQL", () => {
 				await store.searchRecallMessages({ ...q, narratorId, previewChars: 200 });
 			}
 			for (const sql of statements) {
+				expect(sql).toContain("n.hidden_from_lists = FALSE");
 				expect(sql).toContain(exclusion);
 				if (sql.includes("LIMIT"))
 					expect(sql.indexOf(exclusion)).toBeLessThan(sql.lastIndexOf("LIMIT"));

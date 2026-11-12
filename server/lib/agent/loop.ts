@@ -2,6 +2,14 @@ import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
 import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
+import {
+	MEDIA_MIME_TO_EXT,
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+	type NativeMediaInput,
+} from "@shared/media-attachments";
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -29,9 +37,15 @@ import { matchContextComposition, validInputCharacters } from "../context-usage-
 import { logger } from "../logger";
 import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
+import { redactSecretPatterns } from "../net/diagnostic-redaction";
 import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
-import { getPrompt, getToolMessage, type Locale } from "../prompt-i18n";
+import {
+	getOutlinePlanRelaxedReminder,
+	getPrompt,
+	getToolMessage,
+	type Locale,
+} from "../prompt-i18n";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -65,6 +79,7 @@ import { countInputCharacters } from "./input-characters";
 import { LoopTranscript, type TranscriptImage } from "./loop-transcript";
 import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-request";
 import { rememberModelTraceRequest } from "./modeltrace-request";
+import { assertNativeMediaPayload, splitNativeMediaReferences } from "./native-media";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type DbMessage, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { projectQuestionModelInput } from "./question-model-input";
@@ -91,6 +106,7 @@ import {
 import {
 	executeTool,
 	freezeToolExecution,
+	getOutlineSpecRejection,
 	getReflectionToolRejection,
 	preAdmitToolExecution,
 	releaseToolAdmissionState,
@@ -119,10 +135,13 @@ import {
 	EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
+	handOverExitPlanReflection,
 	isExitPlanReflectionWaitingForUser,
 	markExitPlanReflectionStarted,
+	PLAN_REVIEW_TOOL_NAME,
 } from "./tools/exit-plan-reflection";
 import { isOutlineTool } from "./tools/outline-names";
+import { isPlanReviewLoop } from "./tools/reflection-description";
 import {
 	broadcastTaskReflectionProgress,
 	cleanupTaskReflection,
@@ -651,6 +670,8 @@ export async function shouldInjectRelaxedPlanToolReminder(
 ): Promise<boolean> {
 	if (!config.planMode || !config.relaxedPlan) return false;
 	if (RELAXED_PLAN_READ_ONLY_TOOLS.has(tu.name)) return false;
+	// Writing the outline is how an outline session writes its plan (outline P2 PR 8).
+	if (isOutlineTool(tu.name)) return false;
 	if (isTaskStateMaintenanceToolUse(tu)) return false;
 	if (isPlanAuthoringToolUse(tu, config)) return false;
 
@@ -823,8 +844,14 @@ function collectCompletedImageGenerations(
 	map: Map<
 		string,
 		{
+			status?: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
+			partialImageIndex?: number;
+			partialImageB64?: string;
+			final?: boolean;
 			emitted: boolean;
 			outputIndex?: number;
 		}
@@ -832,24 +859,41 @@ function collectCompletedImageGenerations(
 ):
 	| Array<{
 			id: string;
+			status?: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
+			partialImageIndex?: number;
+			partialImageB64?: string;
+			final?: boolean;
 			outputIndex?: number;
 	  }>
 	| undefined {
 	const blocks: Array<{
 		id: string;
+		status?: string;
+		error?: string;
+		errorCode?: string;
 		revisedPrompt?: string;
 		result?: string;
+		partialImageIndex?: number;
+		partialImageB64?: string;
+		final?: boolean;
 		outputIndex?: number;
 	}> = [];
 	for (const [id, entry] of map.entries()) {
-		// Skip entries with no meaningful data (e.g. generation started but never completed)
-		if (!entry.revisedPrompt && !entry.result) continue;
+		// Every observed native image call is meaningful. In particular, do not drop a
+		// failed/partial call merely because it has no revised prompt or final result.
 		blocks.push({
 			id,
+			status: entry.status,
+			error: entry.error,
+			errorCode: entry.errorCode,
 			revisedPrompt: entry.revisedPrompt,
 			result: entry.result,
+			partialImageIndex: entry.partialImageIndex,
+			partialImageB64: entry.partialImageB64,
 			outputIndex: entry.outputIndex,
 		});
 	}
@@ -978,9 +1022,16 @@ export function shouldAllowExitPlanReflectionAutoCompact(
 	return config.planReflectionAllowAutoCompact ?? settings.agent.planReflectionAllowAutoCompact;
 }
 
+/**
+ * The decision tools of a plan reflection. An outline plan's review has one, PlanReview (outline
+ * P2 PR 8b): it leaves comments under the plan instead of sending it back, and never resets the
+ * context. A spec session's keep the three ExitPlan* tools.
+ */
 export function getExitPlanReflectionAllowedTools(
 	config: Partial<ExitPlanReflectionAutoCompactConfig> = {},
+	outline = false,
 ): string[] {
+	if (outline) return [PLAN_REVIEW_TOOL_NAME];
 	const allowedTools = [...EXIT_PLAN_REFLECTION_TOOLS];
 	if (shouldAllowExitPlanReflectionAutoCompact(config)) {
 		allowedTools.push(EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME);
@@ -1232,6 +1283,7 @@ async function recordReflectionApiRequestEnd(
 			credentialId: event.credentialId,
 			ttftMs: event.ttftMs ?? null,
 			durationMs: event.durationMs ?? null,
+			decodeMs: event.decodeMs ?? null,
 			contextPercent: event.contextPercent ?? null,
 			contextSnapshot: event.contextSnapshot,
 			meterUsage: event.meterUsage ?? null,
@@ -1294,6 +1346,12 @@ const requestToolSnapshots = new WeakMap<
 
 function buildReflectionCorrectionPrompt(config: AgentConfig): string {
 	const tools = config.reflectionLoop?.allowedTools.join(", ") ?? "";
+	// An outline plan's review (PR 8b): its comments go to the user, nothing back to the planner.
+	if (isPlanReviewLoop(config.reflectionLoop?.allowedTools ?? [])) {
+		return config.locale === "zh-CN"
+			? "审查还没有形成有效结论。你最多有两轮；如仍有下一轮，请根据工具结果改正参数，再调用一次 PlanReview。不要执行原操作，也不要直接修改文件或大纲。"
+			: "The review has not produced a valid verdict. You have at most two responses; if another remains, correct the arguments using the tool result and call PlanReview once. Do not execute the original operation or edit files or the outline.";
+	}
 	const strict = config.reflectionLoop?.context.purpose === "permissionRuleRequest";
 	const budget = strict ? "一轮" : "两轮";
 	return config.locale === "zh-CN"
@@ -1568,15 +1626,17 @@ async function runExitPlanModeReflectionLoop(
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
 	reflectionAbort: AbortController,
+	/** An outline plan's review prompt (PR 8b): its tool is PlanReview. */
+	outlinePrompt: string | null = null,
 ): Promise<ReflectionLoopObservation> {
 	const locale = (parentConfig.locale as Locale) ?? "en";
 	return runReflectionLoop({
 		parentConfig,
 		rows,
-		prompt: buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
+		prompt: outlinePrompt ?? buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
 		onProgress: (snapshot) => void broadcastPlanReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
-			allowedTools: getExitPlanReflectionAllowedTools(parentConfig),
+			allowedTools: getExitPlanReflectionAllowedTools(parentConfig, outlinePrompt !== null),
 			context: {
 				kind: "exitPlanMode",
 				requestId,
@@ -1830,6 +1890,10 @@ export async function resolveDangerReflectionDecision(
 
 interface ExitPlanReflectionGateResult {
 	checkFailed?: boolean;
+	/**
+	 * `human` (an outline plan's review, PR 8b): the plan goes to a person, as with `manual`, but
+	 * with the person told as for any plan waiting for them (they are not already watching).
+	 */
 	decision: ExitPlanReflectionDecision | { action: "manual"; reason?: string };
 	input: Record<string, unknown>;
 }
@@ -1845,6 +1909,9 @@ export async function resolveExitPlanModeReflection(
 		"@server/services/narrator-permission"
 	);
 	const planReadPolicy = await loadPlanFileReadPolicy(config.narratorId);
+	// The ExitPlanMode call: an outline plan's review is written for it and handed on by it.
+	const toolCallId =
+		recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId ?? null;
 	const resolvedInput = await resolveExitPlanModeInputWithBackend(
 		config.narratorId,
 		config.cwd,
@@ -1855,6 +1922,10 @@ export async function resolveExitPlanModeReflection(
 		config.executionTarget,
 		config.planFilePath,
 		planReadPolicy,
+		// A restored gate's input is the one resolved before (an outline plan decided meanwhile).
+		recoveryGate !== undefined,
+		// Not the call's permission: nothing handed on is taken here (review round 2 N8).
+		{ toolCallId },
 	);
 	if (!resolvedInput.ok) {
 		return {
@@ -1871,7 +1942,13 @@ export async function resolveExitPlanModeReflection(
 		// A taken-over plan gate is no longer AI-owned. The caller must re-register
 		// the real ExitPlanMode permission under the original tool-call identity.
 		// Do not create a synthetic running gate or launch an auxiliary model request.
-		if (typeof toolUse.input.plan === "string" && toolUse.input.plan !== resolvedInput.input.plan) {
+		// An outline plan that changed while it waited is put to the person again as it is now
+		// (outline P2 PR 8b, review round 1); a plan file is still refused.
+		if (
+			typeof toolUse.input.plan === "string" &&
+			toolUse.input.plan !== resolvedInput.input.plan &&
+			!outlinePlanSubmissionOf(resolvedInput.input)
+		) {
 			return {
 				decision: {
 					action: "revise",
@@ -1888,6 +1965,53 @@ export async function resolveExitPlanModeReflection(
 	const requestId =
 		restoredReflection?.requestId ??
 		`exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	// An outline plan (outline P2 PR 8b, D48 Q1) is reviewed, not revised: PlanReview leaves its
+	// concerns under the plan and hands it to a person; no concerns approves it as before.
+	const outlinePlan = outlinePlanSubmissionOf(resolvedInput.input) !== null;
+	const outlinePlanMode = outlinePlan ? await import("@server/services/outline-plan-mode") : null;
+	// A new review of this call: whatever an earlier attempt handed on is stale (round 2 N8).
+	outlinePlanMode?.forgetHandedCall(config.narratorId, toolUse.toolUseId);
+	if (outlinePlanMode && restoredReflection?.requestId) {
+		// Restored after its comments were written: a person decides on them; no second review.
+		const recovered = await outlinePlanMode.recoverOutlinePlanReview({
+			narratorId: config.narratorId,
+			requestId,
+			toolUseId: toolUse.toolUseId,
+			toolCallId,
+			input: resolvedInput.input,
+			locale,
+		});
+		if (recovered) {
+			const restoredGate = createExitPlanReflectionDecision(requestId, {
+				narratorId: config.narratorId,
+				broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+				parentToolUseId: config.parentToolUseId,
+				toolUseId: toolUse.toolUseId,
+				toolName: toolUse.name,
+				inputJson: recovered.input,
+				toolCallId: toolCallId ?? undefined,
+				restoredStartedAt: restoredReflection.startedAt,
+			});
+			const reason = `Plan review left ${recovered.review.count} comment(s) under the plan; awaiting user decision`;
+			const handed = await handOverExitPlanReflection(requestId, {
+				reason,
+				input: recovered.input,
+			});
+			const decision = handed
+				? await restoredGate
+				: { action: "human" as const, reason, input: recovered.input };
+			cleanupExitPlanReflection(requestId);
+			return { decision, input: recovered.input };
+		}
+	}
+	const outlinePrompt = outlinePlanMode
+		? await outlinePlanMode.outlinePlanReviewPrompt({
+				narratorId: config.narratorId,
+				requestId,
+				input: resolvedInput.input,
+				locale,
+			})
+		: null;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createExitPlanReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -1916,6 +2040,7 @@ export async function resolveExitPlanModeReflection(
 		toolUse,
 		resolvedInput.input,
 		reflectionAbort,
+		outlinePrompt,
 	).finally(() => {
 		reflectionDone = true;
 	});
@@ -1937,6 +2062,29 @@ export async function resolveExitPlanModeReflection(
 					typeof outcome === "string"
 						? `the reflection loop crashed before producing a decision: ${outcome}`
 						: outcome.failureSummary;
+				// An outline plan's review that could not finish hands the plan to a person (PR 8b):
+				// a review never holds a plan back.
+				if (outlinePlan) {
+					const reason = `Plan review could not finish (${failureSummary ?? "no decision"}); awaiting user decision`;
+					// The version submitted goes on with it (review round 2 N7), handed on before
+					// the handover so the permission always finds it (round 3). This runs after a
+					// review that decided too: then it writes nothing over that review's hand-off,
+					// and takes back only its own when its handover does not happen.
+					const handed = outlinePlanMode?.handOnSubmission({
+						narratorId: config.narratorId,
+						toolUseId: toolUse.toolUseId,
+						toolCallId,
+						input: resolvedInput.input,
+					});
+					if (await handOverExitPlanReflection(requestId, { reason })) return decisionPromise;
+					if (handed)
+						outlinePlanMode?.forgetHandedCall(config.narratorId, toolUse.toolUseId, handed);
+					const settled = await Promise.race<ExitPlanReflectionDecision | null>([
+						decisionPromise,
+						Promise.resolve(null),
+					]);
+					return settled ?? { action: "human" as const, reason };
+				}
 				const fallbackMessage = buildReflectionFallbackMessage(
 					"ExitPlanMode reflection",
 					failureSummary,
@@ -1968,6 +2116,27 @@ export async function resolveExitPlanModeReflection(
 	}
 	config.signal.removeEventListener("abort", onPreparationAbort);
 	cleanupExitPlanReflection(requestId);
+	if (outlinePlanMode && decision.action === "manual") {
+		// Taken over just as the review wrote its comments: the person decides with them.
+		const written = await outlinePlanMode
+			.recoverOutlinePlanReview({
+				narratorId: config.narratorId,
+				requestId,
+				toolUseId: toolUse.toolUseId,
+				toolCallId,
+				input: resolvedInput.input,
+				locale,
+			})
+			.catch(() => null);
+		if (written) return { decision, input: written.input };
+		// Taken over before it wrote anything: the version submitted goes on (round 2 N7).
+		outlinePlanMode.handOnSubmission({
+			narratorId: config.narratorId,
+			toolUseId: toolUse.toolUseId,
+			toolCallId,
+			input: resolvedInput.input,
+		});
+	}
 	return {
 		decision,
 		input: resolvedInput.input,
@@ -2079,8 +2248,15 @@ export async function shouldRunExitPlanModeReflectionLive(
 	});
 }
 
-export function shouldRunTaskReflection(config: Pick<AgentConfig, "reflectionLoop">): boolean {
-	return !config.reflectionLoop;
+/**
+ * taskReflection guards protected tasks in `spec://tasks.json`. It never runs in a reflection
+ * loop, nor in a session whose tasks live in the outline (plan §8 trade-off 3: outline sessions
+ * get no task reflection; their `spec://` is closed anyway).
+ */
+export function shouldRunTaskReflection(
+	config: Pick<AgentConfig, "reflectionLoop" | "taskBackend">,
+): boolean {
+	return !config.reflectionLoop && config.taskBackend !== "outline";
 }
 
 function normalizeEditText(text: string): string {
@@ -2474,6 +2650,13 @@ async function executeToolAfterReflections(
 		releaseToolAdmissionState(admissionState);
 		return reflectionRejection;
 	}
+	// Before admission, permission and the reflections: an outline session has no `spec://`,
+	// so neither a permission prompt nor taskReflection may start for one.
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		releaseToolAdmissionState(admissionState);
+		return outlineSpecRejection;
+	}
 	let preFrozenExecution: Awaited<ReturnType<typeof freezeToolExecution>>;
 	let preAdmissionComplete = options.preAdmissionComplete === true;
 	if (!preAdmissionComplete || !admissionState.startGrant) {
@@ -2550,12 +2733,33 @@ async function executeToolAfterReflections(
 				tu,
 				options.recoveryGate,
 			);
+			// What the review gate handed on for an outline plan is taken by its permission; if the
+			// permission never ran (an abort first), it is forgotten here (review round 2 N8).
+			const forgetHanded = async () => {
+				if (!outlinePlanSubmissionOf(tu.input)) return;
+				const { forgetHandedCall } = await import("@server/services/outline-plan-mode");
+				forgetHandedCall(config.narratorId, tu.toolUseId);
+			};
 			if (reflected.decision.action === "manual") {
 				tu.input = reflected.input;
 				// User manually took over the plan reflection; the loop falls back to the
 				// normal ExitPlanMode approval. They are already driving this, so the
 				// fallback permission request must not raise a user-facing notification.
-				return executeAfterPreAdmission({ suppressAttention: true });
+				try {
+					return await executeAfterPreAdmission({ suppressAttention: true });
+				} finally {
+					await forgetHanded();
+				}
+			}
+			if (reflected.decision.action === "human") {
+				// An outline plan's review left its comments under the plan, or could not finish
+				// (PR 8b): the plan waits for a person like any ExitPlanMode, told as usual.
+				tu.input = reflected.decision.input ?? reflected.input;
+				try {
+					return await executeAfterPreAdmission();
+				} finally {
+					await forgetHanded();
+				}
 			}
 			if (
 				reflected.decision.action !== "confirm" &&
@@ -2596,6 +2800,12 @@ async function executeToolAfterReflections(
 				pendingPlanApproverSource.delete(config.narratorId);
 			}
 			return result;
+		}
+		if (tu.name === "ExitPlanMode") {
+			// No review this time: nothing an earlier attempt of this call handed on may reach its
+			// permission (outline P2 PR 8b review round 2 N8).
+			const { forgetHandedCall } = await import("@server/services/outline-plan-mode");
+			forgetHandedCall(config.narratorId, tu.toolUseId);
 		}
 		if ((tu.name === "Write" || tu.name === "Edit") && shouldRunTaskReflection(config)) {
 			const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);
@@ -2663,6 +2873,40 @@ async function executeToolAfterReflections(
 	}
 }
 
+/** Create per-execution durable media conversion with identity deduplication. */
+export function createDurableMediaReferences(config: Pick<AgentConfig, "narratorId" | "signal">) {
+	const savedMedia = new WeakMap<NativeMediaInput, Promise<MediaContentBlock>>();
+	return async (
+		inputs: readonly (MediaRef | NativeMediaInput)[] = [],
+	): Promise<MediaContentBlock[]> =>
+		Promise.all(
+			inputs.map(async (item) => {
+				if ("mediaId" in item) return mediaRefToContentBlock(item, config.narratorId);
+				let saved = savedMedia.get(item);
+				if (!saved) {
+					assertNativeMediaPayload(item);
+					config.signal.throwIfAborted();
+					const { saveUploadedMedia, deleteUploadedMedia } = await import("../media-uploads");
+					const filename = item.filename ?? `attachment${MEDIA_MIME_TO_EXT[item.mediaType] ?? ""}`;
+					saved = saveUploadedMedia(
+						config.narratorId,
+						new File([new Uint8Array(Buffer.from(item.base64, "base64"))], filename, {
+							type: item.mediaType,
+						}),
+					).then((ref) => {
+						if (config.signal.aborted) {
+							deleteUploadedMedia(config.narratorId, ref.mediaId);
+							config.signal.throwIfAborted();
+						}
+						return mediaRefToContentBlock(ref, config.narratorId);
+					});
+					savedMedia.set(item, saved);
+				}
+				return saved;
+			}),
+		);
+}
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -2678,6 +2922,7 @@ async function* agentLoopInMetadataSnapshot(
 	userText: string,
 	initialHistory: AgentLoopHistory = { rows: [] },
 	images?: Array<{ format: string; base64: string }>,
+	media?: readonly (MediaRef | NativeMediaInput)[],
 ): AsyncGenerator<AgentEvent> {
 	const guidanceSignal =
 		config.guidanceSignal && config.urgentGuidanceSignal
@@ -2708,16 +2953,28 @@ async function* agentLoopInMetadataSnapshot(
 	);
 	const locale = (config.locale as Locale) ?? "en";
 
+	// Durable refs are the transcript's authority. Direct low-level byte inputs are
+	// validated and persisted once, never copied into rows or diagnostic events.
+	const durableMediaReferences = createDurableMediaReferences(config);
+	async function withDurableToolMedia(result: ToolExecResult): Promise<ToolExecResult> {
+		if (!result.media?.length || result.mediaRefs?.length) return result;
+		return { ...result, mediaRefs: await durableMediaReferences(result.media) };
+	}
+
 	/** The conversation this loop's requests are projected from (`loop-transcript.ts`). */
 	const transcript = new LoopTranscript(initialHistory.rows);
 	/** The turn's input until the model has answered it; then it is a transcript row. */
-	let uncommittedInput: { text: string; images?: readonly TranscriptImage[] } = { text: "" };
+	let uncommittedInput: {
+		text: string;
+		images?: readonly TranscriptImage[];
+		media?: readonly MediaRef[];
+	} = { text: "" };
 	/**
 	 * The rows the current request is projected from: the transcript plus the turn's
 	 * input. A reflection gating one of its calls starts from exactly these.
 	 */
 	const requestRows = (): DbMessage[] =>
-		transcript.withInput(uncommittedInput.text, uncommittedInput.images);
+		transcript.withInput(uncommittedInput.text, uncommittedInput.images, uncommittedInput.media);
 
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
 	// This prevents concurrent permission prompts / danger reflection loops from racing each other.
@@ -2842,6 +3099,9 @@ async function* agentLoopInMetadataSnapshot(
 	 * the execution-group loop). They could only ever hold the same ids.
 	 */
 	const processedToolUseIds = new Set<string>();
+	// Keep the first planning nudge, without repeating it after every tool/turn in
+	// this run. A new agentLoop invocation (e.g. the next user message) re-arms it.
+	let relaxedPlanReminderQueued = false;
 	const pipelineExitConfirmationAttachedStateIds = new Set<string>();
 	// Knowledge-base entry ids already injected this compact cycle (point B de-dup; shared
 	// across tool outputs). Prefer the session-provided shared set so point A (user message)
@@ -2943,6 +3203,8 @@ async function* agentLoopInMetadataSnapshot(
 			updatedInput: brokenInputOverride ?? result.updatedInput,
 			metadata: overrides.metadata ?? result.metadata,
 			...(!result.broken && result.images?.length ? { images: result.images } : {}),
+			...(!result.broken && result.imageRefs?.length ? { imageRefs: result.imageRefs } : {}),
+			...(!result.broken && result.mediaRefs?.length ? { mediaRefs: result.mediaRefs } : {}),
 		};
 	}
 
@@ -3006,18 +3268,42 @@ async function* agentLoopInMetadataSnapshot(
 		// toward the completed-tool cadence, which measures productive work.
 		if (result.broken || result.fatal) return;
 
-		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
+		if (
+			!relaxedPlanReminderQueued &&
+			(await shouldInjectRelaxedPlanToolReminder(tu, config)) &&
+			!relaxedPlanReminderQueued
+		) {
+			// Re-check after awaiting classification: parallel tool completions may
+			// reach this point together, but must still queue only one reminder.
+			relaxedPlanReminderQueued = true;
+			// An outline session's plan goes under its plan root (outline P2 PR 8), not in a file:
+			// its own wording (review round 1 N4). A plan-file cycle keeps the file's (S7).
+			const outlineView =
+				config.taskBackend === "outline"
+					? await (await import("@server/services/outline-plan-mode")).outlinePlanPromptRoot(
+							config.narratorId,
+						)
+					: null;
 			queueLoopInjection({
 				source: "relaxed_plan",
-				...sideCarBodyWithText(
-					"relaxed_plan",
-					// The reminder now says WHERE the plan goes. Without it the model is told
-					// "keep planning" and left to rediscover the designated path from the
-					// EnterPlanMode result many turns back — which is how a plan ends up
-					// written somewhere ExitPlanMode will not read.
-					{ kind: "notice", params: { planFile: relaxedPlanReminderPlanFile(config) } },
-					locale,
-				),
+				...(outlineView
+					? sideCarBodyWithText(
+							"relaxed_plan",
+							{
+								kind: "prose",
+								text: getOutlinePlanRelaxedReminder(locale, outlineView.root?.address ?? null),
+							},
+							locale,
+						)
+					: sideCarBodyWithText(
+							"relaxed_plan",
+							// The reminder now says WHERE the plan goes. Without it the model is told
+							// "keep planning" and left to rediscover the designated path from the
+							// EnterPlanMode result many turns back — which is how a plan ends up
+							// written somewhere ExitPlanMode will not read.
+							{ kind: "notice", params: { planFile: relaxedPlanReminderPlanFile(config) } },
+							locale,
+						)),
 				toolUseId: tu.toolUseId,
 			});
 		}
@@ -3172,6 +3458,8 @@ async function* agentLoopInMetadataSnapshot(
 					: {}),
 			},
 		);
+		if (built.mediaFallbackWarnings?.length)
+			config.onEvent?.({ type: "media_fallback", warnings: built.mediaFallbackWarnings });
 		return withSystemPrompt(built.history);
 	}
 
@@ -3243,6 +3531,8 @@ async function* agentLoopInMetadataSnapshot(
 		}
 		hostHistory = withSystemPrompt(replacement.history);
 		transcript.replace(replacement.rows);
+		if (replacement.mediaFallbackWarnings?.length)
+			config.onEvent?.({ type: "media_fallback", warnings: replacement.mediaFallbackWarnings });
 		// Only a loading-aware rebuild may replace the request's tool view. Candidates and
 		// loading state move together; even an unchanged layout may carry a new tool/schema.
 		if (!inheritedTools && replacement.toolLoading && replacement.toolCandidates) {
@@ -3290,57 +3580,9 @@ async function* agentLoopInMetadataSnapshot(
 
 		if (!newModel && !reasoningChanged) return null;
 
+		let newResolved: ReturnType<typeof resolveProviderAndModel> | undefined;
 		try {
-			let providerChanged = false;
-			let modelChanged = false;
-			if (newModel) {
-				const newResolved = resolveProviderAndModel(newModel);
-				providerChanged = newResolved.provider !== effectiveProvider;
-				modelChanged = newResolved.model !== effectiveModel;
-				provider = newResolved.adapter;
-				effectiveModel = newResolved.model;
-				effectiveProvider = newResolved.provider;
-				config.model = newResolved.model;
-				config.provider = newResolved.provider;
-				if (providerChanged || modelChanged) {
-					tools = formatRequestToolsForProvider();
-					await reportToolsCharacters(tools);
-				}
-			}
-
-			if (hasReasoningOverride) {
-				config.reasoningEffort = nextReasoningEffort;
-			}
-
-			if (providerChanged || modelChanged) {
-				// Force history/tool-result rebuild so the next API call uses the new
-				// provider protocol even when this switch happens inside a retry loop.
-				const replacement = await config.onBeforeTurn?.(turnIndex, {
-					force: true,
-					cause: "model_switch",
-				});
-				if (replacement) applyHistoryReplacement(replacement);
-				// Without a rebuild the transcript is projected for the new protocol.
-				else hostHistory = null;
-			}
-
-			logger.info("Agent loop switched runtime settings before API call", {
-				narratorId: config.narratorId,
-				cause,
-				model: effectiveModel,
-				provider: effectiveProvider,
-				reasoningEffort: config.reasoningEffort,
-				modelChanged,
-				providerChanged,
-				reasoningChanged,
-			});
-			return {
-				type: "model_switched",
-				model: effectiveModel,
-				provider: effectiveProvider,
-				reasoningEffort: config.reasoningEffort ?? null,
-				cause,
-			};
+			if (newModel) newResolved = resolveProviderAndModel(newModel);
 		} catch (err) {
 			if (err instanceof ToolEpochError) throw err;
 			logger.warn("Failed to switch runtime settings during agent loop", {
@@ -3352,6 +3594,55 @@ async function* agentLoopInMetadataSnapshot(
 			});
 			return null;
 		}
+
+		// Once the adapter or request state changes, preparation must succeed before
+		// dispatch. In particular, identity/storage failures cannot reuse the old
+		// prepared first attempt under a new model or provider.
+		let providerChanged = false;
+		let modelChanged = false;
+		if (newResolved) {
+			providerChanged = newResolved.provider !== effectiveProvider;
+			modelChanged = newResolved.model !== effectiveModel;
+			provider = newResolved.adapter;
+			effectiveModel = newResolved.model;
+			effectiveProvider = newResolved.provider;
+			config.model = newResolved.model;
+			config.provider = newResolved.provider;
+			if (providerChanged || modelChanged) {
+				tools = formatRequestToolsForProvider();
+				await reportToolsCharacters(tools);
+			}
+		}
+
+		if (hasReasoningOverride) config.reasoningEffort = nextReasoningEffort;
+
+		if (providerChanged || modelChanged) {
+			// Force history/tool-result rebuild even when switching inside a retry loop.
+			const replacement = await config.onBeforeTurn?.(turnIndex, {
+				force: true,
+				cause: "model_switch",
+			});
+			if (replacement) applyHistoryReplacement(replacement);
+			else hostHistory = null;
+		}
+
+		logger.info("Agent loop switched runtime settings before API call", {
+			narratorId: config.narratorId,
+			cause,
+			model: effectiveModel,
+			provider: effectiveProvider,
+			reasoningEffort: config.reasoningEffort,
+			modelChanged,
+			providerChanged,
+			reasoningChanged,
+		});
+		return {
+			type: "model_switched",
+			model: effectiveModel,
+			provider: effectiveProvider,
+			reasoningEffort: config.reasoningEffort ?? null,
+			cause,
+		};
 	}
 
 	turnLoop: while (turnIndex < maxTurns) {
@@ -3429,10 +3720,15 @@ async function* agentLoopInMetadataSnapshot(
 			let content = combinePendingInput(baseContent, currentInputParts);
 			nextTurnContent = ""; // consume once
 			const turnImages = isFirstTurn ? images : undefined;
-			uncommittedInput = { text: content, images: turnImages };
+			const turnMedia = isFirstTurn ? await durableMediaReferences(media) : undefined;
+			uncommittedInput = { text: content, images: turnImages, media: turnMedia };
 			/** The model answered the turn's input: from now on it is part of the conversation. */
 			const commitInput = () => {
-				transcript.appendInput(uncommittedInput.text, uncommittedInput.images);
+				transcript.appendInput(
+					uncommittedInput.text,
+					uncommittedInput.images,
+					uncommittedInput.media,
+				);
 				uncommittedInput = { text: "" };
 			};
 
@@ -3604,7 +3900,9 @@ async function* agentLoopInMetadataSnapshot(
 					},
 				});
 				const execution = settleToolExecutionResult(
-					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale),
+					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale).then(
+						withDurableToolMedia,
+					),
 				);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
@@ -3757,8 +4055,14 @@ async function* agentLoopInMetadataSnapshot(
 			const imageGenAccum = new Map<
 				string,
 				{
+					status?: string;
+					error?: string;
+					errorCode?: string;
 					revisedPrompt?: string;
 					result?: string;
+					partialImageIndex?: number;
+					partialImageB64?: string;
+					final?: boolean;
 					emitted: boolean;
 					outputIndex?: number;
 				}
@@ -3905,6 +4209,12 @@ async function* agentLoopInMetadataSnapshot(
 			let requestId = "";
 			let requestStartTime = 0;
 			let requestTtftMs: number | undefined;
+			/**
+			 * When this attempt's first persistable content (text / reasoning / named tool
+			 * call / search / image) arrived. Unlike TTFT it ignores queue notices, so
+			 * `now - requestFirstContentAt` is pure decode time for output-speed figures.
+			 */
+			let requestFirstContentAt: number | undefined;
 			let requestUsage:
 				| {
 						promptTokens?: number;
@@ -4029,7 +4339,79 @@ async function* agentLoopInMetadataSnapshot(
 					: undefined;
 			}
 
-			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
+			function imageTerminalStatus(
+				entry: { status?: string; error?: string; result?: string; final?: boolean },
+				errorMessage?: string,
+			): "completed" | "failed" | "cancelled" | "incomplete" {
+				// SDK result is optional: omission does not negate an otherwise successful item.
+				if (
+					entry.final &&
+					entry.status !== "failed" &&
+					entry.status !== "cancelled" &&
+					entry.status !== "incomplete" &&
+					!entry.error &&
+					entry.result?.trim()
+				)
+					return "completed";
+				if (entry.status === "failed") return "failed";
+				if (entry.status === "cancelled") return "cancelled";
+				if (entry.status === "incomplete") return "incomplete";
+				if (entry.status === "completed") return "incomplete";
+				if (config.signal.aborted || guidanceSignal?.aborted) return "cancelled";
+				if (errorMessage && errorMessage !== "Silent disconnect") return "failed";
+				return "incomplete";
+			}
+
+			function* finalizePendingImageGenerations(errorMessage?: string): Generator<AgentEvent> {
+				for (const [id, entry] of imageGenAccum) {
+					if (entry.emitted) continue;
+					const previousStatus = entry.status;
+					const status = imageTerminalStatus(entry, errorMessage);
+					const error = normalizeApiRequestDiagnostics({
+						...(previousStatus === "completed" && status === "incomplete"
+							? { reason: "image_result_missing" }
+							: {}),
+						message:
+							entry.error ??
+							(status === "failed"
+								? errorMessage && errorMessage !== "Silent disconnect"
+									? errorMessage
+									: "Image generation failed"
+								: status === "cancelled" && errorMessage && errorMessage !== "Silent disconnect"
+									? errorMessage
+									: status === "incomplete" && previousStatus === "completed"
+										? "Image generation completed without a result"
+										: undefined),
+					})?.message;
+					entry.status = status;
+					if (error) entry.error = redactSecretPatterns(error);
+					if (!entry.errorCode && errorMessage) {
+						const code = requestDiagnostics?.code ?? requestDiagnostics?.reason;
+						if (code != null) entry.errorCode = String(code);
+					}
+					entry.emitted = true;
+					yield {
+						type: "block_complete",
+						block: {
+							type: "image_generation",
+							id,
+							status,
+							error: entry.error,
+							errorCode: entry.errorCode,
+							revisedPrompt: entry.revisedPrompt,
+							result: status === "completed" ? entry.result : undefined,
+							partialImageIndex: entry.partialImageIndex,
+							partialImageB64: entry.partialImageB64,
+							outputIndex: entry.outputIndex,
+						},
+					};
+				}
+			}
+
+			function* finishRequest(
+				errorMessage?: string,
+				options: { finalizeImages?: boolean } = {},
+			): Generator<AgentEvent> {
 				// A failed/no-op settings switch can reach teardown twice for one attempt.
 				// Do not re-emit its end or erase the durable association added by the consumer.
 				if (requestFinished) return;
@@ -4047,6 +4429,7 @@ async function* agentLoopInMetadataSnapshot(
 					if (activeRequestDump === requestDump) activeRequestDump = undefined;
 					return;
 				}
+				if (options.finalizeImages !== false) yield* finalizePendingImageGenerations(errorMessage);
 				// Retract the live tool cards this request published but never completed.
 				//
 				// This sits in the request teardown rather than at each retry site because
@@ -4123,6 +4506,9 @@ async function* agentLoopInMetadataSnapshot(
 						),
 					ttftMs: requestTtftMs,
 					durationMs: Date.now() - requestStartTime,
+					...(requestFirstContentAt !== undefined
+						? { decodeMs: Math.max(0, Date.now() - requestFirstContentAt) }
+						: {}),
 					contextPercent: requestContextPercent,
 					meterUsage: requestMeterUsage,
 					meterUnit: requestMeterUnit,
@@ -4142,7 +4528,9 @@ async function* agentLoopInMetadataSnapshot(
 			// stateful providers replay in the outer runtime, stateless providers retry
 			// here. Giving both layers a full budget multiplies the configured limit.
 			const getMaxChatRetries = () =>
-				usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
+				imageGenAccum.size > 0 || usesStatefulModel(effectiveProvider, effectiveModel)
+					? 0
+					: maxConfiguredRetries;
 			const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 			const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 300_000);
 			let chatRetryCount = 0;
@@ -4214,6 +4602,7 @@ async function* agentLoopInMetadataSnapshot(
 			 * carries them.
 			 */
 			const hasIrreplaceableProgress = (): boolean =>
+				imageGenAccum.size > 0 ||
 				toolUses.length > 0 ||
 				settledResults.size > 0 ||
 				yieldedToolResults.size > 0 ||
@@ -4350,7 +4739,7 @@ async function* agentLoopInMetadataSnapshot(
 					model: effectiveModel,
 					providerId: decided.providerId,
 					providerPrefix: decided.providerPrefix,
-					waitKind: "quota",
+					waitKind: decided.waitKind ?? "quota",
 					quotaProvider: decided.quotaProvider,
 					quotaBucket: decided.bucket,
 					resumeAt: quota.kind === "wait" ? quota.wait.resumeAt : undefined,
@@ -4496,7 +4885,7 @@ async function* agentLoopInMetadataSnapshot(
 			/** Replay teardown: discard what this attempt persisted, then end its request. */
 			function* abandonAttemptForReplay(errorMessage?: string): Generator<AgentEvent> {
 				yield* discardAttemptPersistence();
-				yield* finishRequest(errorMessage);
+				yield* finishRequest(errorMessage, { finalizeImages: false });
 			}
 
 			// Settle every completed call through the normal permission/serial execution path
@@ -4565,6 +4954,10 @@ async function* agentLoopInMetadataSnapshot(
 					applyHistoryReplacement(await config.rebuildRequestHistory());
 				}
 				prefixPreparedForAttempt = false;
+				// Reflection and legacy configurations may have no prefix/history hook.
+				// Every attempt still needs durable identity before dispatch. Keep this
+				// outside transport retry handling: a failed admission is not an API error.
+				await config.beforeProviderRequest?.();
 
 				// Generate unique request ID for this provider attempt (reset on each retry).
 				// The actual request start time is set by markRequestStarted() after the
@@ -4575,6 +4968,7 @@ async function* agentLoopInMetadataSnapshot(
 				requestFinished = false;
 				requestStartPending = false;
 				requestTtftMs = undefined;
+				requestFirstContentAt = undefined;
 				requestUsage = undefined;
 				inputCharacters = null;
 				inputComposition = null;
@@ -4772,10 +5166,32 @@ async function* agentLoopInMetadataSnapshot(
 					// original fragments, not a previously filtered string, so both newly
 					// replayed and newly lifted-out rows are represented exactly once.
 					content = combinePendingInput(baseContent, currentInputParts);
-					uncommittedInput = { text: content, images: turnImages };
-					// A host-built history carries the rows and the input rides beside it as the
-					// current turn; otherwise the transcript plus the input is the whole request.
-					const requestContent = hostHistory ? content : "";
+					uncommittedInput = { text: content, images: turnImages, media: turnMedia };
+					// A host-built history carries prior rows, so separate current media rides
+					// beside it. Otherwise the single row projection handles all media, including
+					// tool results. Re-split the original refs on EVERY attempt/model switch.
+					let requestContent = hostHistory ? content : "";
+					let requestMedia: NativeMediaInput[] | undefined;
+					if (hostHistory && turnMedia?.length) {
+						const projected = splitNativeMediaReferences(
+							turnMedia,
+							effectiveModel,
+							provider,
+							config.narratorId,
+						);
+						if (projected.warnings.length)
+							config.onEvent?.({ type: "media_fallback", warnings: projected.warnings });
+						if (projected.fallbackText)
+							requestContent = [requestContent, projected.fallbackText]
+								.filter(Boolean)
+								.join("\n\n");
+						if (projected.nativeRefs.length) {
+							const { mediaToBase64 } = await import("../media-uploads");
+							requestMedia = await Promise.all(
+								projected.nativeRefs.map((ref) => mediaToBase64(ref, config.narratorId)),
+							);
+						}
+					}
 					const questionInput = projectQuestionModelInput(
 						hostHistory ?? (await projectRows(requestRows())),
 						requestContent,
@@ -4871,6 +5287,7 @@ async function* agentLoopInMetadataSnapshot(
 							}
 						},
 						...(hostHistory && turnImages?.length ? { images: turnImages } : {}),
+						...(requestMedia?.length ? { media: requestMedia } : {}),
 					};
 					const stream = provider.chat(requestParams);
 
@@ -4945,6 +5362,7 @@ async function* agentLoopInMetadataSnapshot(
 						// notice or an id-only toolUseChunk must register as contentless,
 						// otherwise "only bookkeeping arrived" cannot be detected.
 						if (!hasPersistableStreamContent(parsed)) contentlessEventCount++;
+						else requestFirstContentAt ??= Date.now();
 						// `stopReason` is the provider's own completion reason. It was
 						// previously read nowhere in this loop, which is why an empty turn
 						// could not distinguish "model stopped" from "nothing arrived".
@@ -5635,32 +6053,81 @@ async function* agentLoopInMetadataSnapshot(
 							}
 							// biome-ignore lint/style/noNonNullAssertion: just set above
 							const acc = imageGenAccum.get(ig.id)!;
-							if (ig.revisedPrompt) acc.revisedPrompt = ig.revisedPrompt;
-							if (ig.result) acc.result = ig.result;
-							if (ig.outputIndex != null) acc.outputIndex = ig.outputIndex;
-							if (ig.final && !acc.emitted) {
-								acc.emitted = true;
+							// A late lifecycle/duplicate snapshot must not reopen a settled call.
+							if (!acc.emitted) {
+								if (ig.status) acc.status = ig.status;
+								if (ig.error || ig.errorCode) {
+									const diagnostics = normalizeApiRequestDiagnostics({
+										message: ig.error ? redactSecretPatterns(ig.error) : undefined,
+										code: ig.errorCode,
+									});
+									acc.error = diagnostics?.message;
+									acc.errorCode = diagnostics?.code != null ? String(diagnostics.code) : undefined;
+								}
+								if (ig.revisedPrompt) acc.revisedPrompt = ig.revisedPrompt;
+								if (ig.result) acc.result = ig.result;
+								if (ig.partialImageIndex != null) acc.partialImageIndex = ig.partialImageIndex;
+								if (ig.partialImageB64) acc.partialImageB64 = ig.partialImageB64;
+								if (ig.final) acc.final = true;
+								if (ig.outputIndex != null) acc.outputIndex = ig.outputIndex;
+								const hasValidFinal = !!acc.final && imageTerminalStatus(acc) === "completed";
+								const completedLifecycleWithoutResult =
+									ig.final && ig.status === "completed" && !acc.result?.trim();
+								// The SDK's completed lifecycle has no base64. Do not mistake it for
+								// an image-bearing output_item.done; a later final item may still
+								// supply the bytes that this lifecycle only announced.
+								const completedAwaitingResult =
+									completedLifecycleWithoutResult &&
+									!acc.error &&
+									!config.signal.aborted &&
+									!guidanceSignal?.aborted;
+								const terminal =
+									!completedAwaitingResult &&
+									(ig.final ||
+										ig.status === "failed" ||
+										ig.status === "cancelled" ||
+										ig.status === "incomplete");
+								if (terminal && !acc.emitted) {
+									acc.status = hasValidFinal ? "completed" : imageTerminalStatus(acc);
+									if (acc.status === "completed" && !hasValidFinal) acc.status = "incomplete";
+									if (acc.error && acc.status === "incomplete" && ig.status !== "incomplete")
+										acc.status = "failed";
+									acc.emitted = true;
+									yield {
+										type: "block_complete",
+										block: {
+											type: "image_generation",
+											id: ig.id,
+											status: acc.status,
+											error: acc.error,
+											errorCode: acc.errorCode,
+											revisedPrompt: acc.revisedPrompt,
+											result: hasValidFinal ? acc.result : undefined,
+											partialImageIndex: acc.partialImageIndex,
+											partialImageB64: acc.partialImageB64,
+											outputIndex: acc.outputIndex,
+										},
+									};
+								}
+								const displayStatus = terminal
+									? (acc.status ?? "incomplete")
+									: ig.status === "completed"
+										? "generating"
+										: ig.status;
 								yield {
-									type: "block_complete",
-									block: {
-										type: "image_generation",
-										id: ig.id,
-										revisedPrompt: acc.revisedPrompt,
-										result: acc.result,
-										outputIndex: acc.outputIndex,
-									},
+									type: "image_generation",
+									id: ig.id,
+									status: displayStatus,
+									error: acc.error,
+									errorCode: acc.errorCode,
+									revisedPrompt: ig.revisedPrompt,
+									result: ig.result,
+									partialImageIndex: ig.partialImageIndex,
+									partialImageB64: ig.partialImageB64,
+									outputIndex: acc.outputIndex,
+									...(ig.final ? { final: true } : {}),
 								};
 							}
-							yield {
-								type: "image_generation",
-								id: ig.id,
-								status: ig.status,
-								revisedPrompt: ig.revisedPrompt,
-								result: ig.result,
-								partialImageIndex: ig.partialImageIndex,
-								partialImageB64: ig.partialImageB64,
-								outputIndex: acc.outputIndex,
-							};
 						}
 						if (parsed.invalidState) {
 							const reason = String(parsed.invalidState.reason ?? "api_error");
@@ -6258,19 +6725,6 @@ async function* agentLoopInMetadataSnapshot(
 					// retry budget re-uploading the whole history. Mirrors the invalidState
 					// branch earlier in this loop.
 					if (yield* tryQuotaSuspension(msg)) return;
-					// Detect upstream API context length exceeded (HTTP 400)
-					if (
-						err &&
-						typeof err === "object" &&
-						"code" in err &&
-						(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
-					) {
-						// Persist partial content before signalling overflow
-						yield* outputContent.flush();
-						yield* finishRequest(msg);
-						yield { type: "context_length_exceeded", message: msg };
-						return;
-					}
 					// Detect context overflow errors from OpenAI/Codex-compatible providers.
 					// Treat as context_length_exceeded so caller can prune/compact+retry.
 					if (isContextWindowExceededError(err)) {
@@ -7529,6 +7983,8 @@ async function* agentLoopInMetadataSnapshot(
 					output: result.output,
 					isError: result.isError,
 					images: result.images,
+					imageRefs: result.imageRefs,
+					mediaRefs: result.mediaRefs,
 					broken: brokenToolUseIds.has(tu.toolUseId),
 				});
 			}

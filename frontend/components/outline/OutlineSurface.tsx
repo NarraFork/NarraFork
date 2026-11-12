@@ -51,6 +51,7 @@ import {
 import { useElementSize, useMediaQuery } from "@mantine/hooks";
 import { titleOf } from "@shared/outline";
 import type { OutlineViewMode } from "@shared/outline-api";
+import type { FoldAction, FoldTree, FoldView } from "@shared/outline-fold";
 import {
 	IconArrowLeft,
 	IconArrowRight,
@@ -73,15 +74,19 @@ import {
 	prefetchOutlineSeed,
 	useOutlineBlock,
 	useOutlinePageLive,
+	useOutlinePagePending,
+	useOutlineReportAuthors,
 	useOutlineSeed,
 	useOutlineViewStateSync,
 } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
 import { forgetOutlineRecent, recordOutlineRecent } from "../../lib/outline-recents";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { MANTINE_SM_BREAKPOINT_PX, MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
 import { useNarratorPanelVisible } from "../narrator/narrator-panel-visibility";
 import type { EditSurface } from "./edit-surface";
+import type { BlockMark } from "./editor/chrome";
 import { liveSessionIfReady } from "./editor/live-sessions";
 import {
 	OutlineEditor,
@@ -97,6 +102,7 @@ import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
 import { OutlineBreadcrumbs } from "./OutlineBreadcrumbs";
 import { OutlineGate } from "./OutlineGate";
+import { OutlineQuestionsSection } from "./OutlineQuestions";
 import { OutlineSidePanel } from "./OutlineSidePanel";
 import { OutlineTimeline } from "./OutlineTimeline";
 import {
@@ -193,7 +199,7 @@ function SurfaceBody({
 	actions,
 	history,
 }: OutlineSurfaceProps) {
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const mode: OutlineViewMode = viewMode ?? "facts";
 	// The current page is edited live while on screen, unless live editing turned out
 	// unavailable here.
@@ -205,7 +211,7 @@ function SurfaceBody({
 	useEffect(() => {
 		if (!onScreen) setFallback((current) => (current === "tab_limit" ? null : current));
 	}, [onScreen]);
-	// While editing, the HTTP read only feeds the breadcrumbs, side panel and timeline.
+	// While editing, the HTTP read feeds the breadcrumbs, questions, side panel and timeline.
 	const query = useOutlineBlock(spaceId, blockId, {
 		asOf,
 		view: mode,
@@ -248,6 +254,30 @@ function SurfaceBody({
 	useEffect(() => {
 		if (pageId) setFallback(null);
 	}, [pageId]);
+	// Locks and changes waiting for confirmation, shown on the live page's blocks (P2 PR 6).
+	const pagePending = useOutlinePagePending(spaceId, pageId, editing);
+	const lockedLabel = t("lock.someone");
+	const marks = useMemo(() => {
+		const out = new Map<string, BlockMark>();
+		const data = pagePending.data;
+		if (!data) return out;
+		for (const lock of data.locks) {
+			out.set(lock.blockId, {
+				lockedBy:
+					lock.by.kind === "human" ? (lock.by.name ?? lockedLabel) : (lock.by.name ?? lockedLabel),
+			});
+		}
+		for (const change of data.pending) {
+			// The blocks it targets, and those it adds blocks under (a proposed step's parent).
+			for (const id of new Set([...change.blockIds, ...change.addedUnder])) {
+				const mark = out.get(id) ?? {};
+				out.set(id, { ...mark, pending: [...(mark.pending ?? []), change.label] });
+			}
+		}
+		// Questions nobody answered yet: a folded row counts the ones it hides.
+		for (const id of data.questions ?? []) out.set(id, { ...out.get(id), openQuestion: true });
+		return out;
+	}, [pagePending.data, lockedLabel]);
 
 	// Folding, caret and block selection of each page this surface showed: its own, not shared
 	// with another surface on the same page.
@@ -270,16 +300,65 @@ function SurfaceBody({
 			}),
 		[viewState],
 	);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: foldVersion says the set changed
-	const collapsed = useMemo<ReadonlySet<string>>(
-		() => new Set(viewState?.collapsed ?? []),
+	// The reader's folding as the read-only tree takes it: a new object when it changed.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: foldVersion says the sets changed
+	const fold = useMemo<FoldView>(
+		() => ({
+			expanded: new Set(viewState?.expanded ?? []),
+			collapsed: new Set(viewState?.collapsed ?? []),
+		}),
 		[viewState, foldVersion],
 	);
 	useOutlineViewStateSync(pageId, viewState);
+	// Who wrote the live page's subagent reports (the editor names the containers it holds).
+	const [reportContainers, setReportContainers] = useState<string[]>([]);
+	const reportAuthors = useOutlineReportAuthors(spaceId, reportContainers, editing).data;
+	// A closed row's count of unanswered questions was used: the rows are open now, and the
+	// reader goes to where the first of them is answered. The form in the page's body holds the
+	// questions directly under the focused block (and their sub-questions): when the question is
+	// deeper, the block it is under is focused, and its form takes the keyboard once it is there.
+	const formWatch = useRef<MutationObserver | null>(null);
+	useEffect(() => () => formWatch.current?.disconnect(), []);
+	const openQuestionForm = useCallback((ids: string[], under: string | null) => {
+		const host = pageRef.current;
+		if (!host || ids.length === 0) return;
+		const focusForm = (): boolean => {
+			for (const id of ids) {
+				const card = host.querySelector<HTMLElement>(`[data-testid="outline-question-${id}"]`);
+				if (!card) continue;
+				card.scrollIntoView({ block: "nearest" });
+				card.querySelector<HTMLElement>("input:not(:disabled), textarea:not(:disabled)")?.focus();
+				return true;
+			}
+			return false;
+		};
+		formWatch.current?.disconnect();
+		formWatch.current = null;
+		if (focusForm()) return;
+		if (under) goRef.current({ blockId: under });
+		// The form arrives with the focused block's questions (bounded: a few seconds, then quiet).
+		const watch = new MutationObserver(() => {
+			if (focusForm()) stop();
+		});
+		const timer = setTimeout(() => stop(), 8000);
+		const stop = () => {
+			clearTimeout(timer);
+			watch.disconnect();
+			if (formWatch.current === watch) formWatch.current = null;
+		};
+		formWatch.current = watch;
+		watch.observe(host, { childList: true, subtree: true });
+	}, []);
+	const pageRef = useRef<HTMLDivElement | null>(null);
 	const [focusInfo, setFocusInfo] = useState<OutlineFocusInfo | null>(null);
 	const switcher = useRef<QuickSwitcherHandle | null>(null);
 	const openSwitcher = useCallback(() => switcher.current?.open(), []);
-	const toggle = useCallback((id: string) => viewState?.toggleCollapsed(id), [viewState]);
+	const onFold = useCallback(
+		(tree: FoldTree, action: FoldAction) => {
+			viewState?.fold(tree, action);
+		},
+		[viewState],
+	);
 
 	const mobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const { ref: surfaceRef, width } = useElementSize();
@@ -313,15 +392,21 @@ function SurfaceBody({
 	);
 
 	const root = view?.blocks.find((block) => block.id === view.rootId);
-	const rootTitle = root ? titleOf(root.content) || root.sid : "";
+	const storedTitle = root ? titleOf(root.content) || root.sid : "";
+	// A subagent report's container, focused: its line as people read it (their language and
+	// time zone). Display only: what is remembered ("recent") and what is handed on (`onLoaded`,
+	// from which hosts name the tab and write references into messages) is the stored title,
+	// decoded again wherever it is shown, so a time never goes stale or loses its date.
+	const rootTitle =
+		(root && reportLineDisplay(root.content, { t, locale: i18n?.language })) ?? storedTitle;
 
 	// Remember pages actually opened (their current state), and forget ones that are gone.
 	const missing = query.error instanceof ApiError && query.error.status === 404;
 	useEffect(() => {
 		if (view?.current && root && settled) {
-			recordOutlineRecent({ spaceId, blockId, title: rootTitle, visitedAt: Date.now() });
+			recordOutlineRecent({ spaceId, blockId, title: storedTitle, visitedAt: Date.now() });
 		}
-	}, [view?.current, root, settled, spaceId, blockId, rootTitle]);
+	}, [view?.current, root, settled, spaceId, blockId, storedTitle]);
 	useEffect(() => {
 		if (missing && asOf === undefined) forgetOutlineRecent(blockId);
 	}, [missing, asOf, blockId]);
@@ -339,7 +424,7 @@ function SurfaceBody({
 			pageId,
 			rootId: blockId,
 			address: `${loadedSpaceKey}/${rootSid}`,
-			title: rootTitle,
+			title: storedTitle,
 			canWrite: loadedCanWrite,
 		});
 	}, [
@@ -349,7 +434,7 @@ function SurfaceBody({
 		pageId,
 		loadedSpaceKey,
 		rootSid,
-		rootTitle,
+		storedTitle,
 		loadedCanWrite,
 		settled,
 	]);
@@ -412,11 +497,11 @@ function SurfaceBody({
 			? focusInfo
 			: null;
 	const seedRoot = seed && !liveCrumbs ? seed.blocks.find((b) => b.id === seed.rootId) : undefined;
-	const crumbs = liveCrumbs
-		? { title: liveCrumbs.title || liveCrumbs.sid, path: liveCrumbs.path }
+	const crumbPath = liveCrumbs
+		? liveCrumbs.path
 		: seed && seedRoot && editing
-			? { title: titleOf(seedRoot.content) || seedRoot.sid, path: seed.path }
-			: null;
+			? seed.path
+			: undefined;
 
 	let content: React.ReactNode;
 	let drawer: React.ReactNode = null;
@@ -468,12 +553,7 @@ function SurfaceBody({
 		content = (
 			<>
 				<div className={classes.toolbar}>
-					<OutlineBreadcrumbs
-						view={view}
-						rootTitle={crumbs ? crumbs.title : rootTitle}
-						search={linkSearch}
-						path={crumbs?.path}
-					/>
+					<OutlineBreadcrumbs view={view} search={linkSearch} path={crumbPath} />
 					<Group gap="xs" wrap="nowrap">
 						{history && (
 							<Group gap={2} wrap="nowrap">
@@ -584,33 +664,51 @@ function SurfaceBody({
 								onFocus={(id) => go({ blockId: id })}
 								onUnavailable={setFallback}
 								onHiddenChange={setHiddenLive}
+								marks={marks}
+								marksKnown={pagePending.data !== undefined}
 								onFocusInfo={setFocusInfo}
 								onSurface={setEditSurface}
 								onOpenSwitcher={openSwitcher}
+								reportAuthors={reportAuthors}
+								onReportContainers={setReportContainers}
+								onOpenQuestions={openQuestionForm}
 								seed={seed && seed.pageId === (pageId ?? view.pageId) ? seed : null}
 							/>
 						) : (
 							<>
 								{/* Typing of this tab that did not reach the page (the editor shows it live). */}
 								<UnsavedTextsNotice pageId={view.pageId} />
-								<Group gap={6} wrap="nowrap" align="flex-start" mb="xs">
+								{/* The page title: the conversation's h3, as in the live editor. */}
+								<Group
+									gap={6}
+									wrap="nowrap"
+									align="flex-start"
+									mb="xs"
+									className={`nf-type-scope ${classes.titleRow}`}
+								>
 									{root.task && <OutlineTaskIcon status={root.task.status} />}
 									<Title order={3} className={classes.rootTitle}>
 										{rootTitle}
 									</Title>
 								</Group>
-								{root.content.trim() !== rootTitle && (
+								{root.content.trim() !== storedTitle && (
 									<Box className={classes.content} mb="xs">
 										<OutlineBlockBody content={root.content} />
 									</Box>
 								)}
 								<OutlineBlockTree
 									view={view}
-									collapsed={collapsed}
+									fold={fold}
 									search={linkSearch}
-									onToggle={toggle}
+									onFold={onFold}
+									onOpenQuestions={openQuestionForm}
 								/>
 							</>
+						)}
+						{/* Answer in the main content, also when live editing or the sidebar is unavailable.
+						    A retained read from the previous focus must not offer answers for that block. */}
+						{settled && view.current && asOf === undefined && (
+							<OutlineQuestionsSection view={view} hideQuestionTitle={!!root.question} />
 						)}
 						{view.view === "facts" && (editing ? hiddenLive : view.hiddenByView) > 0 && (
 							<Text size="xs" c="dimmed" mt="sm">
@@ -643,7 +741,9 @@ function SurfaceBody({
 			data-testid="outline-surface"
 			onKeyDown={onKeyDown}
 		>
-			<Box className={classes.page}>{content}</Box>
+			<Box className={classes.page} ref={pageRef}>
+				{content}
+			</Box>
 			{drawer}
 			<QuickSwitcherHost
 				ref={switcher}

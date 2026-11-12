@@ -206,6 +206,83 @@ function checkRevert(
 
 export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 	{
+		name: "narrator writes: a session's own newest ordinary commits in a space and what they opened",
+		async run(ctx) {
+			const narrator = await ctx.seedNarrator();
+			const other = await ctx.seedNarrator();
+			const space = await ctx.store.ensureSpace({ kind: "session", narratorId: narrator }, NOW);
+			const as = (id: string) => ({ actor: { kind: "agent" as const, id }, narratorId: id });
+			const first = await write(
+				ctx,
+				space,
+				[{ op: "insert", parent: null, content: "A" }],
+				as(narrator),
+			);
+			const page = a0(first);
+			await write(
+				ctx,
+				space,
+				[{ op: "insert", parent: { id: page }, content: "Theirs" }],
+				as(other),
+			);
+			const second = await write(
+				ctx,
+				space,
+				[
+					{ op: "insert", parent: { id: page }, content: "B" },
+					{ op: "update", block: { id: page }, content: "A2" },
+				],
+				as(narrator),
+			);
+			// A system commit made for the session (a fork's copy, an import) is not its own.
+			await write(ctx, space, [{ op: "insert", parent: { id: page }, content: "Copied" }], {
+				actor: { kind: "system", id: "outline-behavior-fork" },
+				narratorId: narrator,
+			});
+			// A revert the session makes is not an ordinary commit.
+			await revertCommit(
+				{
+					commitId: second.commit?.id as string,
+					actor: { kind: "agent", id: narrator },
+					responsibleUserId: null,
+					narratorId: narrator,
+				},
+				{ store: ctx.store },
+			);
+			const rows = await ctx.store.listNarratorWrites(space.id, narrator, {
+				commits: 10,
+				limit: 10,
+			});
+			const firstSeq = first.commit?.seq as number;
+			const secondSeq = second.commit?.seq as number;
+			const secondIds = [a0(second), page].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+			expect(rows.map((r) => [r.seq, r.blockId] as [number, string])).toEqual([
+				...secondIds.map((id): [number, string] => [secondSeq, id]),
+				[firstSeq, page],
+			]);
+			const flags = new Map(
+				rows.filter((r) => r.seq === secondSeq).map((r) => [r.blockId, r.changeFlags]),
+			);
+			expect((flags.get(a0(second)) ?? 0) & OUTLINE_CHANGE.CREATE).toBeTruthy();
+			expect((flags.get(page) ?? 0) & OUTLINE_CHANGE.CONTENT).toBeTruthy();
+			expect(rows.every((r) => typeof r.createdAt === "string" && r.createdAt.length > 0)).toBe(
+				true,
+			);
+			// The newest commits only, and at most `limit` versions.
+			const newest = await ctx.store.listNarratorWrites(space.id, narrator, {
+				commits: 1,
+				limit: 10,
+			});
+			expect(newest.map((r) => r.seq)).toEqual(secondIds.map(() => secondSeq));
+			expect(
+				await ctx.store.listNarratorWrites(space.id, narrator, { commits: 10, limit: 1 }),
+			).toHaveLength(1);
+			expect(
+				await ctx.store.listNarratorWrites(space.id, "nobody", { commits: 10, limit: 10 }),
+			).toEqual([]);
+		},
+	},
+	{
 		name: "aliases: a byte-order range of the live aliases of one space",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
@@ -605,7 +682,7 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "last writes: the latest version that counts, leaving out an actor's own or its moves",
+		name: "last writes: the latest version that counts, leaving out an actor's own (or several actors') or its moves",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
 			const agent = { kind: "agent" as const, id: "agent-last-writes" };
@@ -646,6 +723,15 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 			expect(await last(0, MOVES)).toBe(s4);
 			expect(await last(s4, MOVES)).toBeUndefined();
 			expect(await last(s2, MOVES, "someone-else")).toBe(s5);
+			// Several actors of a kind left out at once (a session's narrators): theirs do not count.
+			const several = await ctx.store.findLastWrites([{ blockId: x, afterSeq: s4 }], {
+				actorKind: "agent",
+				actorId: "someone-else",
+				actorIds: [agent.id, "another"],
+				flags: ALL,
+			});
+			expect(several).toEqual([]);
+			expect(await last(s4, ALL, "someone-else")).toBe(s5);
 			// The agent's own content write counts when only moves are left out.
 			const own = a0(
 				await write(ctx, space, [{ op: "insert", parent: null, content: "by the agent" }], {

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { specFileRevisions, specProtectedTasks } from "../db/schema";
+import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 
 export const SPEC_TASKS_PATH = "tasks.json";
@@ -295,6 +296,34 @@ async function syncProtectedLocks(
 	}
 }
 
+/**
+ * The refusal of a write that changes protected tasks without taskReflection: what a spec session's
+ * write throws, and what a plugin's `spec_write` of tasks.json in an outline session throws for a
+ * task a person created (`plugin-spec-compat.ts`), so both read the same.
+ */
+export function protectedMutationMessage(
+	mutations: ReadonlyArray<{ kind: string; text: string; details: string }>,
+): string {
+	const details = mutations
+		.map((mutation) => `- ${mutation.kind}: ${mutation.text} (${mutation.details})`)
+		.join("\n");
+	return `This change affects protected task(s) and requires taskReflection before it can be applied.\n${details}`;
+}
+
+/**
+ * That refusal as an error (409, `SPEC_PROTECTED_TASK`): permanent for the writer as it is, so a
+ * plugin gets `CONFLICT` with this message (outline P2 PR 12a, owner decision 4) instead of an
+ * opaque internal error. The message is the per-task list above, verbatim (an agent reads it).
+ * Not a catalog entry: no frame of the catalog could carry the list, and nothing in the interface
+ * shows it (the Spec panel's writes may change protected tasks).
+ */
+export class SpecProtectedTaskError extends AppError {
+	constructor(mutations: ReadonlyArray<{ kind: string; text: string; details: string }>) {
+		super(protectedMutationMessage(mutations), 409, "SPEC_PROTECTED_TASK");
+		this.name = "SpecProtectedTaskError";
+	}
+}
+
 export async function validateSpecTasksWrite(
 	namespaceId: string,
 	content: string,
@@ -305,12 +334,7 @@ export async function validateSpecTasksWrite(
 	const locks = await listProtectedLocks(namespaceId);
 	const protectedMutations = detectProtectedMutations(locks, document);
 	if (protectedMutations.length > 0 && !options.allowProtectedMutations) {
-		const details = protectedMutations
-			.map((mutation) => `- ${mutation.kind}: ${mutation.text} (${mutation.details})`)
-			.join("\n");
-		throw new Error(
-			`This change affects protected task(s) and requires taskReflection before it can be applied.\n${details}`,
-		);
+		throw new SpecProtectedTaskError(protectedMutations);
 	}
 	await syncProtectedLocks(namespaceId, document, options.revisionId ?? null);
 	return { document, compiled, protectedMutations };

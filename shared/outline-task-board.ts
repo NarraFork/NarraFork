@@ -1,0 +1,314 @@
+/**
+ * The task board's API (outline P2 PR 5): the built-in view of the process dimension, grouped by
+ * executor and status, for one session (the session dock) or one project (the project page).
+ * Types only, shared by the routes and the client.
+ */
+import type { OutlineActorKind, OutlineSpaceKind, OutlineTaskStatus } from "./outline-api";
+
+/** Limits of the board; the server clamps what a client asks for to these. */
+export const OUTLINE_TASK_BOARD_LIMITS = {
+	/** Open tasks a session board shows of its session space (more are counted as truncated). */
+	sessionOpen: 200,
+	/**
+	 * Open tasks a project board shows of each space (more are counted as truncated; the session's
+	 * own board shows them all). Kept small with {@link projectSpaces}: a page is one bounded read.
+	 */
+	projectOpen: 20,
+	/** Tasks a session holds in other spaces that its board shows. */
+	claimedElsewhere: 50,
+	/** Finished tasks a session board shows at first, and per page after. */
+	sessionFinished: 20,
+	/** Finished tasks a project board shows of each space at first. */
+	projectFinished: 5,
+	/** Finished tasks one page of a space's finished list holds at most. */
+	maxFinishedPage: 50,
+	/** Session spaces one page of a project board covers (the project space comes first). */
+	projectSpaces: 10,
+	/** Characters of a task's text (`/goal`, the add form). */
+	maxTaskChars: 4000,
+	/** Characters of a username an assignment names. */
+	maxUsernameChars: 128,
+	/** Tasks one "seen" request (「新完成」, outline P2 PR 9b) names at most. */
+	seenPerRequest: 100,
+	/** Characters of the note a person adds when opening a session for a task (P2 PR 10c-1). */
+	maxOpenNoteChars: 4000,
+	/** Bytes of the request that opens a session for a task. */
+	openSessionBodyBytes: 64 * 1024,
+} as const;
+
+/**
+ * Who does a task, as the board groups it:
+ *   - `session`: a session holds it (its claim, lease running or lapsed), or it is handed to a
+ *     session by its id (`@agent:<session id>`, 「转交给会话」), or it is an open task of the
+ *     session's own space that nobody else is assigned (the session will take it up);
+ *   - `human`: a person holds it, or it is assigned to a person (`@human:name`);
+ *   - `agent`: assigned by name to an agent (`@agent:name`) that holds nothing yet;
+ *   - `none`: nobody (an unassigned task of a project space).
+ * Finished tasks are grouped by who finished them (the claim's last holder) when known.
+ */
+export type OutlineBoardExecutor =
+	| { kind: "session"; narratorId: string; title: string | null }
+	| { kind: "human"; userId: string | null; name: string }
+	| { kind: "agent"; name: string }
+	| { kind: "none" };
+
+export interface OutlineBoardTask {
+	id: string;
+	spaceId: string;
+	sid: string;
+	/** `key/sid`. */
+	address: string;
+	pageId: string;
+	/** The task's first line, plain text. */
+	title: string;
+	status: OutlineTaskStatus;
+	/**
+	 * What an open task waits for (derived, never stored: D27b); null when it does not wait or is
+	 * finished. `prerequisites` is how many unfinished prerequisites it has.
+	 */
+	waiting: { prerequisites: number; people: boolean; confirmation: boolean } | null;
+	/** `agent:name` or `human:name`. */
+	assignee: string | null;
+	executor: OutlineBoardExecutor;
+	/** Created by a person (`/goal`, the board). */
+	humanCreated: boolean;
+	/** The lock on the task's tree, when this task is a locked root. */
+	lock: { by: { kind: OutlineActorKind; id: string; name: string | null } } | null;
+	/**
+	 * When this task is a plan's root (outline P2 PR 8): `planning` (not approved yet, never
+	 * executed: "计划中") or `approved`, and the versions decided so far.
+	 */
+	plan: { state: "planning" | "approved"; round: number } | null;
+	/**
+	 * An open change asking to end the task (a locked plan's root done or cancelled, D26b): the
+	 * person who locked it confirms or rejects it on the board.
+	 */
+	completion: {
+		pendingId: string;
+		/** What the change sets the task to. */
+		status: "done" | "cancelled";
+		/** Whether the caller decides it (the locker, D25: no delegate by default). */
+		canDecide: boolean;
+	} | null;
+	/** The task's `version_seq` as read: a change names it as its base. */
+	versionSeq: number;
+	/**
+	 * 「新完成」 (outline P2 PR 9b, D50 ④): a task the reader manages that an agent finished, and the
+	 * reader has not seen on a board since (`POST /outline/tasks/seen`). Absent otherwise.
+	 */
+	newlyDone?: true;
+	/**
+	 * The reader may open a new session for it now (outline P2 PR 10c-1, D54): an open task of a
+	 * project space that is to do, that nobody holds, that does not wait, is not in a plan being
+	 * planned and is not assigned to a person; the reader may create sessions in the project and
+	 * write its space; the project has a working directory and the session runtime runs here.
+	 * Absent otherwise (the server decides again when asked).
+	 */
+	openSession?: true;
+}
+
+export interface OutlineBoardSpace {
+	id: string;
+	key: string;
+	kind: OutlineSpaceKind;
+	projectId: string | null;
+	narratorId: string | null;
+	/** The project's name or the session's title. */
+	label: string | null;
+}
+
+/** One space's tasks on a board. */
+export interface OutlineBoardSection {
+	space: OutlineBoardSpace;
+	/** Whether the caller may change tasks of this space (assign, transfer, reopen, finish). */
+	canWrite: boolean;
+	/**
+	 * `own`: the space's tasks. `claimed`: only the tasks the board's session holds in a space
+	 * that is not its own (a session board).
+	 */
+	role: "own" | "claimed";
+	/** Open tasks in document order. */
+	open: OutlineBoardTask[];
+	/**
+	 * More open tasks than the board shows. Those in progress or locked are shown first, so a cut
+	 * leaves out to-dos only (while the space has no more of those than the cap).
+	 */
+	openTruncated: boolean;
+	/** Finished tasks, latest change first (none for a `claimed` section). */
+	finished: OutlineBoardTask[];
+	/** Pass back to read the space's next finished tasks; null when there are no more. */
+	finishedCursor: string | null;
+}
+
+export type OutlineBoardScope =
+	| { kind: "session"; narratorId: string }
+	| { kind: "project"; projectId: string };
+
+export interface OutlineTaskBoardResponse {
+	scope: OutlineBoardScope;
+	sections: OutlineBoardSection[];
+	/** A session board: whether the caller may add tasks to the session (`/goal`, the form). */
+	canAdd: boolean;
+	/** A project board: pass back as `cursor` for the next spaces; null on the last page. */
+	nextCursor: string | null;
+	/** The caller, for "assign to me". */
+	me: { userId: string; name: string };
+}
+
+export interface OutlineBoardFinishedResponse {
+	tasks: OutlineBoardTask[];
+	nextCursor: string | null;
+}
+
+/** Add a task to a session, as a person (the board's form). */
+export interface OutlineBoardAddRequest {
+	text: string;
+	/** Lock it (D26b); default true. */
+	lock?: boolean;
+	/** Start the session on its tasks right away when it is idle ("Add and start", Q5). */
+	start?: boolean;
+}
+
+export interface OutlineBoardAddResponse {
+	/** False when an open or done task with the same text exists already (nothing was written). */
+	added: boolean;
+	task: { id: string; address: string; spaceId: string };
+	locked: boolean;
+	/** A turn was started. */
+	started: boolean;
+}
+
+/** Who a task is handed to. */
+export type OutlineBoardAssignTarget =
+	| { kind: "me" }
+	| { kind: "user"; username: string }
+	/** Back to the session: no assignee. */
+	| { kind: "session" }
+	/**
+	 * To a session by name (「转交给会话」, outline P2 PR 10a): `@agent:<its id>`. A root session of
+	 * the task's project the caller may read, that could do the task.
+	 */
+	| { kind: "narrator"; narratorId: string };
+
+/** A session a task may be handed to (`GET /outline/tasks/:blockId/transfer-sessions`). */
+export interface OutlineBoardTransferSession {
+	narratorId: string;
+	title: string | null;
+	/** A named session's handle: named sessions come first. */
+	handle?: string;
+	/** The caller may write the session: 「转交并开始」 is theirs to ask. */
+	canStart: boolean;
+}
+
+export interface OutlineBoardTransferSessionsResponse {
+	sessions: OutlineBoardTransferSession[];
+	/** The project has (or may have) more sessions that could take it than the board offers. */
+	truncated: boolean;
+	/** How many the board offers at most. */
+	limit: number;
+}
+
+/**
+ * Why 「转交并开始」 handed the task over but did not start the session: it is running; it is in
+ * plan mode; its continuation mode would not continue on this task; the task is finished; or the
+ * start declined all the same.
+ */
+export type OutlineBoardNotStarted =
+	| "finished"
+	| "busy"
+	| "plan_mode"
+	| "continuation_off"
+	| "continuation_mode"
+	| "not_started";
+
+/** A person's change to one task on the board. */
+export interface OutlineBoardTaskUpdateRequest {
+	/** The task's `version_seq` as the board read it; a change since then is refused (409). */
+	baseVersionSeq: number;
+	/** `todo` reopens a finished task (or stops one in progress). */
+	status?: "todo" | "done" | "cancelled";
+	assign?: OutlineBoardAssignTarget;
+	/**
+	 * Start a session on the task right away when it is idle. With `assign` to a session
+	 * (`narrator`): that session (「转交并开始」). Otherwise the session whose space holds the task
+	 * ("Reopen and start", Q5), only for a task of a session space.
+	 */
+	start?: boolean;
+}
+
+export interface OutlineBoardTaskUpdateResponse {
+	/** The task's new `version_seq`, or null when nothing changed. */
+	versionSeq: number | null;
+	started: boolean;
+	/** 「转交并开始」: why the session was not started (the hand-over was written all the same). */
+	notStarted?: OutlineBoardNotStarted;
+}
+
+/** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
+export interface OutlineBoardOpenSessionRequest {
+	/** The task's `version_seq` as the board read it; a change since then is refused (409). */
+	baseVersionSeq: number;
+	/** The session's model; absent follows the default, as creating any session does. */
+	model?: string;
+	/** A working directory other than the project's. */
+	cwd?: string;
+	/** The person's own note, added to the session's opening brief as it is. */
+	note?: string;
+}
+
+export interface OutlineBoardOpenSessionResponse {
+	narratorId: string;
+	/** The session's first turn was started. */
+	started: boolean;
+	/** The claim generation the session holds the task at. */
+	epoch: number;
+	/** The session a click just before this one opened: nothing new was created. */
+	already?: true;
+}
+
+/** Why a session was not opened (`details.reason` of the 409; `OUTLINE_TASK_SESSION_*` codes). */
+export type OutlineBoardOpenSessionRefusal =
+	| "finished"
+	| "planning"
+	| "prerequisites"
+	| "people"
+	| "confirmation"
+	| "assigned_to_person"
+	| "unavailable"
+	| "not_project_task"
+	| "no_directory"
+	| "in_progress"
+	| "claimed"
+	| "unreadable"
+	| "changed"
+	| "start_failed";
+
+/**
+ * The reader saw these tasks marked 「新完成」 on a board, each at the version shown (outline P2
+ * PR 9b). At most {@link OUTLINE_TASK_BOARD_LIMITS.seenPerRequest}; tasks that are not done, not
+ * theirs or not readable are ignored.
+ */
+export interface OutlineBoardSeenRequest {
+	tasks: Array<{ id: string; versionSeq: number }>;
+}
+
+export interface OutlineBoardSeenResponse {
+	/** How many were recorded. */
+	marked: number;
+}
+
+/** The status bar's read (any task backend). */
+export interface NarratorCurrentTaskResponse {
+	/** The session's task backend in effect (`spec` while the outline is switched off). */
+	backend: "spec" | "outline";
+	current: { text: string; address: string | null; protected: boolean } | null;
+	/** Person-created goals of the session whose completion waits for confirmation (outline). */
+	awaitingConfirmation: number;
+	/** Of those, the ones the caller decides: they locked the goal (the board gives them Confirm). */
+	awaitingYourConfirmation: number;
+	/** Who decides the others (usernames, at most three): "waits for alice's confirmation". */
+	awaitingFrom: string[];
+}
+
+/** WebSocket event: the tasks a session's board shows changed (ids only; the client re-reads). */
+export const OUTLINE_TASKS_CHANGED_EVENT = "outline_tasks_changed";

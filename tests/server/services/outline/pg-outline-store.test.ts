@@ -22,9 +22,14 @@ import * as pgSchema from "../../../../server/db/postgres-schema";
 import { generateId } from "../../../../server/lib/id";
 import {
 	OUTLINE_STORE_CONTRACT,
-	type OutlineContractContext,
 	type SpaceDump,
 } from "../../../../server/services/outline/__tests__/contract";
+import {
+	OUTLINE_DIGEST_CONTRACT,
+	type OutlineDigestContractContext,
+} from "../../../../server/services/outline/__tests__/digest-contract";
+import { OUTLINE_PENDING_CONTRACT } from "../../../../server/services/outline/__tests__/pending-contract";
+import { OUTLINE_QUESTION_CONTRACT } from "../../../../server/services/outline/__tests__/question-contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
 import { OUTLINE_TASK_CONTRACT } from "../../../../server/services/outline/__tests__/task-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
@@ -76,7 +81,7 @@ describe("PostgreSQL outline store", () => {
 				const pgDb: BunSQLDatabase = client.db;
 				await ensurePgFts(client.sql);
 				const store = createPostgresOutlineStore(pgDb);
-				const ctx: OutlineContractContext = {
+				const ctx: OutlineDigestContractContext = {
 					store,
 					randomTransactions: 40,
 					async seedUser() {
@@ -133,6 +138,7 @@ describe("PostgreSQL outline store", () => {
 						).map((b) => ({
 							...b,
 							taskJson: task(b.taskJson),
+							askJson: (b.askJson ?? null) as OutlineVersionRow["askJson"],
 							authorKind: b.authorKind as "human" | "agent" | "system",
 						}));
 						const versions: OutlineVersionRow[] = [];
@@ -141,7 +147,12 @@ describe("PostgreSQL outline store", () => {
 								.select()
 								.from(pgSchema.outlineBlockVersions)
 								.where(inArray(pgSchema.outlineBlockVersions.blockId, ids));
-							for (const v of rows) versions.push({ ...v, taskJson: task(v.taskJson) });
+							for (const v of rows)
+								versions.push({
+									...v,
+									taskJson: task(v.taskJson),
+									askJson: (v.askJson ?? null) as OutlineVersionRow["askJson"],
+								});
 						}
 						const links = (
 							await pgDb
@@ -174,6 +185,12 @@ describe("PostgreSQL outline store", () => {
 							.delete(pgSchema.outlineTaskClaims)
 							.where(inArray(pgSchema.outlineTaskClaims.taskBlockId, [...taskBlockIds]));
 					},
+					async setLastCommitAt(spaceId, value) {
+						await pgDb
+							.update(pgSchema.outlineSpaces)
+							.set({ lastCommitAt: value })
+							.where(eq(pgSchema.outlineSpaces.id, spaceId));
+					},
 					async searchContent(needle) {
 						const rows = await client.sql.unsafe(
 							"SELECT id FROM search_outline_blocks WHERE content ILIKE $1",
@@ -189,7 +206,10 @@ describe("PostgreSQL outline store", () => {
 					for (const contractCase of [
 						...OUTLINE_STORE_CONTRACT,
 						...OUTLINE_TASK_CONTRACT,
+						...OUTLINE_PENDING_CONTRACT,
+						...OUTLINE_QUESTION_CONTRACT,
 						...OUTLINE_READ_CONTRACT,
+						...OUTLINE_DIGEST_CONTRACT,
 					]) {
 						try {
 							await contractCase.run(ctx);
@@ -213,7 +233,12 @@ describe("PostgreSQL outline store", () => {
 			}
 			expect(outcome.problems).toEqual([]);
 			expect(outcome.passed).toHaveLength(
-				OUTLINE_STORE_CONTRACT.length + OUTLINE_TASK_CONTRACT.length + OUTLINE_READ_CONTRACT.length,
+				OUTLINE_STORE_CONTRACT.length +
+					OUTLINE_TASK_CONTRACT.length +
+					OUTLINE_PENDING_CONTRACT.length +
+					OUTLINE_QUESTION_CONTRACT.length +
+					OUTLINE_READ_CONTRACT.length +
+					OUTLINE_DIGEST_CONTRACT.length,
 			);
 		},
 		RUN_TIMEOUT_MS,

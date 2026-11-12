@@ -169,6 +169,33 @@ export async function narratorUsersWith(
 	return out;
 }
 
+/**
+ * Whether the person may read a session, memoized for one request: a session is named by its
+ * title only to people who may read it (P2 PR 6 review S-5, applied everywhere the outline shows a
+ * session title). Admins read every session.
+ */
+export function narratorVisibility(
+	principal: OutlinePrincipal,
+): (narratorId: string) => Promise<boolean> {
+	const memo = new Map<string, Promise<boolean>>();
+	return (narratorId) => {
+		let verdict = memo.get(narratorId);
+		if (!verdict) {
+			verdict = (async () => {
+				if (!narratorId || !principal.userId) return false;
+				if (principal.isAdmin) return true;
+				const narrator = await readNarrator(narratorId);
+				return (
+					narrator !== null &&
+					(await narratorUsersWith(narrator, [principal.userId], "read")).has(principal.userId)
+				);
+			})();
+			memo.set(narratorId, verdict);
+		}
+		return verdict;
+	};
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Per person
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,6 +236,38 @@ export async function canWriteSpace(
 	space: OutlineSpaceRow,
 ): Promise<boolean> {
 	return await hasAccess(principal, space, "write");
+}
+
+/**
+ * Whether the person manages the space (P2 PR 6: may unlock anyone's locked plan there, the
+ * fallback when the locker is away): an admin (not for a personal space, D31), a project's owner
+ * or holder of a `manage` grant, a session's owner (a subagent's root's), a personal space's
+ * owner. Orphaned spaces are frozen: nobody.
+ */
+export async function canManageSpace(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+): Promise<boolean> {
+	const { userId } = principal;
+	if (!userId || isOrphanedSpace(space)) return false;
+	if (space.kind === "personal") return space.ownerUserId === userId;
+	if (principal.isAdmin) return true;
+	if (space.kind === "project" && space.projectId) {
+		const project = await readProject(space.projectId);
+		if (!project) return false;
+		if (project.ownerUserId === userId) return true;
+		const grants = await readScopeGrants({ type: "project", id: project.id }, [userId]);
+		return (
+			holdsAnyCapability(grants.everyUser, ["manage"]) ||
+			holdsAnyCapability(grants.users.get(userId), ["manage"])
+		);
+	}
+	if (space.kind === "session" && space.narratorId) {
+		const narrator = await readNarrator(space.narratorId);
+		const judged = narrator ? await readJudgedNarrator(narrator) : null;
+		return judged?.ownerUserId === userId;
+	}
+	return false;
 }
 
 /**

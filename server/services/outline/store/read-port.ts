@@ -12,6 +12,7 @@
  */
 import type {
 	OutlineActorKind,
+	OutlineAskJson,
 	OutlineLinkKind,
 	OutlineLinkTargetKind,
 	OutlineTaskJson,
@@ -26,6 +27,8 @@ export interface OutlineStructureRow {
 	orderKey: string;
 	alias: string | null;
 	taskJson: OutlineTaskJson | null;
+	/** A question put to a person; process like a task (design §2.1). Absent: none. */
+	askJson?: OutlineAskJson | null;
 	/** `from_seq` of the version this row comes from (the block's `version_seq` when current). */
 	versionSeq: number;
 }
@@ -98,6 +101,15 @@ export interface OutlineLinkTargetRef {
 	spaceId?: string;
 }
 
+/** A version a session's commit opened (`listNarratorWrites`). */
+export interface OutlineNarratorWrite {
+	blockId: string;
+	seq: number;
+	/** The commit's `created_at`. */
+	createdAt: string;
+	changeFlags: number;
+}
+
 export interface OutlineReadPort {
 	/**
 	 * Live blocks of a page as of `asOf` (`null`: current state), unordered and without content.
@@ -141,7 +153,8 @@ export interface OutlineReadPort {
 	): Promise<OutlineVersionRow[]>;
 	/**
 	 * For each block, its latest version after `afterSeq` that counts, with its change flags.
-	 * Left out: `except.actor`'s versions whose change flags lie within `except.flags` (every
+	 * Left out: `except.actor`'s versions (or those of any of `except.actorIds` too, of the same
+	 * kind) whose change flags lie within `except.flags` (every
 	 * flag: none of the actor's versions count; a move's flags: its moves do not), and anyone's
 	 * whose flags lie within `except.anyoneFlags` (default none). Blocks without one are left out.
 	 * At most {@link OUTLINE_LAST_WRITES_SCAN} of a block's newest versions after `afterSeq` are
@@ -150,7 +163,14 @@ export interface OutlineReadPort {
 	 */
 	findLastWrites(
 		keys: ReadonlyArray<{ blockId: string; afterSeq: number }>,
-		except: { actorKind: OutlineActorKind; actorId: string; flags: number; anyoneFlags?: number },
+		except: {
+			actorKind: OutlineActorKind;
+			actorId: string;
+			/** More actors of that kind treated as `actorId` is (a session's other narrators). */
+			actorIds?: readonly string[];
+			flags: number;
+			anyoneFlags?: number;
+		},
 	): Promise<Array<{ blockId: string; fromSeq: number | null; changeFlags: number | null }>>;
 	/** Links of the given blocks and kinds valid at `seq` (`null`: open links), at most `limit`. */
 	listLinksAt(
@@ -174,6 +194,18 @@ export interface OutlineReadPort {
 	/** Versions a commit opened, at most `limit`. */
 	listCommitVersions(commitId: string, limit: number): Promise<OutlineVersionRow[]>;
 	/**
+	 * What a session wrote lately in a space: the versions opened by its newest `commits` ordinary
+	 * commits there that it wrote itself (`kind` `edit`, actor an agent, written for `narratorId`;
+	 * not system commits made for it, like a fork's copy or an import), newest commit first (block
+	 * id bytewise within one), at most `limit`. The commits come from the space-and-narrator index;
+	 * their versions from the commit index.
+	 */
+	listNarratorWrites(
+		spaceId: string,
+		narratorId: string,
+		options: { commits: number; limit: number },
+	): Promise<OutlineNarratorWrite[]>;
+	/**
 	 * Which of the blocks have a version opened after `seq` whose change flags are anything but
 	 * exactly `ignoreFlags` (a later page change that only followed an ancestor, say).
 	 */
@@ -184,6 +216,11 @@ export interface OutlineReadPort {
 	): Promise<string[]>;
 	/** Blocks by id, live or deleted, in any space. */
 	getBlocks(ids: readonly string[]): Promise<OutlineBlockRow[]>;
+	/**
+	 * The first {@link OUTLINE_PAGE_HEAD_CHARS} characters of the content of blocks, by id, in any
+	 * space: enough for their titles (a task list shows many, and a whole body is up to 16 KiB).
+	 */
+	getBlockHeads(ids: readonly string[]): Promise<Array<{ id: string; contentHead: string }>>;
 	/** Live blocks of the given spaces with a sid or an alias, at most `limit`. */
 	findLiveBlocks(
 		spaceIds: readonly string[],
@@ -202,11 +239,16 @@ export interface OutlineReadPort {
 	): Promise<string[]>;
 	/** Live blocks matching a full-text query, best first, at most `query.limit`. */
 	searchBlocks(query: OutlineSearchQuery): Promise<OutlineSearchRow[]>;
-	/** Open links to any of the targets, written in one of `spaceIds`, at most `limit`. */
+	/**
+	 * Open links to any of the targets, written in one of `spaceIds` (null: in any space, for a
+	 * system read that tells nobody what it found), only of `kinds` when given, at most `limit`.
+	 * By the target index (`idx_outline_links_target`).
+	 */
 	listLinksTo(
 		targets: readonly OutlineLinkTargetRef[],
-		spaceIds: readonly string[],
+		spaceIds: readonly string[] | null,
 		limit: number,
+		options?: { kinds?: readonly OutlineLinkKind[] },
 	): Promise<OutlineLinkRow[]>;
 	/**
 	 * Live pages of a space in sibling order (order key, then id, bytewise), after the page

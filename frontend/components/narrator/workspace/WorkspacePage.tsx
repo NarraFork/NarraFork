@@ -11,7 +11,18 @@
  *   of the workspace, not a new visit to it).
  */
 
-import { ActionIcon, Box, Center, Group, Loader, Text, TextInput, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Box,
+	Center,
+	Group,
+	Loader,
+	Text,
+	TextInput,
+	Tooltip,
+	UnstyledButton,
+} from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import type { WorkspacePanel } from "@shared/workspace-panels";
 import {
 	IconArrowLeft,
@@ -23,14 +34,9 @@ import {
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineEnabled } from "../../../hooks/useOutlineEnabled";
-import {
-	recordRecentTabVisit,
-	refreshRecentTabsLoadedWindow,
-	updateRecentTabLocal,
-} from "../../../hooks/useRecentTabs";
 import {
 	useUpdateWorkspace,
 	useWorkspace,
@@ -38,12 +44,14 @@ import {
 	workspaceQueryKey,
 } from "../../../hooks/useWorkspace";
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "../../../lib/safe-area";
+import { useWcoTitlebarRows } from "../../../lib/wco-titlebar";
 import type { WebviewLeafConfig } from "../split-tree";
 import { DirectorLayout } from "./DirectorLayout";
 import { type DirectorControl, DockviewWorkspace } from "./DockviewWorkspace";
 import { DEFAULT_DIRECTOR_PRIMARY_RATIO, type DirectorLeaf } from "./director-constants";
 import type { WorkspaceDirectorState } from "./dockview-layout";
 import type { WorkspacePanelParams } from "./panel-types";
+import { WorkspaceTitleGenerator } from "./WorkspaceTitleGenerator";
 
 const AddOutlinePanelModal = lazy(() =>
 	import("./AddOutlinePanelModal").then((m) => ({ default: m.AddOutlinePanelModal })),
@@ -97,24 +105,30 @@ export function WorkspacePage({
 	useWorkspaceChangeSync(workspaceId, handleWorkspaceDeleted);
 
 	// ── Editable title ──
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-	const serverTitle = (workspace as any)?.title as string | undefined;
+	const serverTitle = workspace?.title;
 	const [editing, setEditing] = useState(false);
 	const [editTitle, setEditTitle] = useState("");
+	const editRevision = useRef<number | null>(null);
 
 	const startEditing = useCallback(() => {
 		setEditTitle(serverTitle || "");
+		editRevision.current = workspace?.titleRevision ?? 0;
 		setEditing(true);
-	}, [serverTitle]);
+	}, [serverTitle, workspace?.titleRevision]);
 
 	const commitTitle = useCallback(() => {
+		const revision = editRevision.current;
+		editRevision.current = null;
 		setEditing(false);
 		const trimmed = editTitle.trim();
-		if (trimmed && trimmed !== serverTitle) {
-			updateRef.current.mutate({ id: workspaceId, title: trimmed });
-			updateRecentTabLocal("workspace", workspaceId, { title: trimmed });
+		// A same-title save still marks the title as explicitly user-owned.
+		if (trimmed && revision !== null) {
+			updateRef.current.mutate(
+				{ id: workspaceId, title: trimmed, expectedTitleRevision: revision },
+				{ onError: (error) => notifications.show({ color: "red", message: error.message }) },
+			);
 		}
-	}, [editTitle, serverTitle, workspaceId]);
+	}, [editTitle, workspaceId]);
 
 	// ── Director mode ──
 	// DockviewWorkspace owns the dockview api + persistence; director mode is a
@@ -187,38 +201,21 @@ export function WorkspacePage({
 		directorControlRef.current?.updatePanelTitle(panelId, title);
 	}, []);
 
-	// ── Record recent tab (app chrome only — a window mirrors the workspace) ──
-	useEffect(() => {
-		if (!workspace || chrome === "window") return;
-		void recordRecentTabVisit({
-			type: "workspace",
-			id: workspaceId,
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-			title: (workspace as any).title || "Workspace",
-		});
-	}, [workspaceId, workspace, chrome]);
-
 	/**
 	 * Re-read membership after the surface changed it (a panel was closed).
 	 *
 	 * Awaited by the caller so the surface is only considered converged once its
-	 * authoritative input reflects the change. Also refreshes the sidebar window,
-	 * because removing a narrator panel releases its tab back to the top level —
-	 * server-side, in the same transaction.
+	 * authoritative input reflects the change. The sidebar is independent of workspace
+	 * membership, so nothing else needs refreshing.
 	 */
 	const handleMembershipChanged = useCallback(async () => {
 		await qc.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId) });
-		void refreshRecentTabsLoadedWindow(qc).catch(() => {});
 	}, [qc, workspaceId]);
 
 	// The sidebar projection is NOT maintained here any more.
 	//
-	// This route used to diff the live narrator-id set against the previous one and
-	// write `workspaceId` onto recent tabs accordingly. Two problems, both structural:
-	// the initial "previous" set was empty, so the diff could only ever ATTACH and
-	// never detach; and it made the client a second writer of membership, racing the
-	// layout save. Both are gone — `workspace-panel-service` now writes the panel row
-	// and its projection in one transaction.
+	// The sidebar no longer mirrors workspace membership at all (folders replaced that
+	// grouping), so this route writes nothing to recent tabs.
 
 	const treeJson = workspace?.layout ?? workspace?.tree;
 	const panels = workspace?.panels ?? EMPTY_PANELS;
@@ -235,6 +232,8 @@ export function WorkspacePage({
 					my: "calc(var(--mantine-spacing-md) * -1)",
 				};
 
+	const titlebarRootRef = useWcoTitlebarRows(chrome !== "window" && !isLoading && !!workspace);
+
 	if (isLoading || !workspace) {
 		return (
 			<Box {...shellBoxProps}>
@@ -247,11 +246,21 @@ export function WorkspacePage({
 
 	return (
 		<Box
+			ref={titlebarRootRef}
 			{...shellBoxProps}
+			// Desktop WCO: the toolbar row below is the window title bar (lib/wco-titlebar).
+			data-nf-wco-titlebar={chrome !== "window" || undefined}
 			style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}
 		>
 			{/* Toolbar with editable title */}
-			<Group px="sm" py={4} gap="xs" style={{ flexShrink: 0 }}>
+			<Group
+				px="sm"
+				py={4}
+				gap="xs"
+				wrap="nowrap"
+				data-nf-titlebar-candidate
+				style={{ flexShrink: 0 }}
+			>
 				<Tooltip label={t("listView")}>
 					<ActionIcon size="sm" variant="subtle" component={Link} to="/narrators">
 						<IconArrowLeft size={16} />
@@ -265,7 +274,10 @@ export function WorkspacePage({
 						onBlur={commitTitle}
 						onKeyDown={(e) => {
 							if (e.key === "Enter") commitTitle();
-							if (e.key === "Escape") setEditing(false);
+							if (e.key === "Escape") {
+								editRevision.current = null;
+								setEditing(false);
+							}
 						}}
 						autoFocus
 						styles={{ input: { minWidth: 120 } }}
@@ -276,13 +288,24 @@ export function WorkspacePage({
 						}
 					/>
 				) : (
-					<Group gap={4} style={{ cursor: "pointer" }} onClick={startEditing}>
-						<Text size="sm" fw={500}>
-							{serverTitle || "Workspace"}
-						</Text>
-						<IconPencil size={14} color="var(--mantine-color-dimmed)" />
-					</Group>
+					// A real button also opts out of the WCO toolbar's window-drag region.
+					// A clickable Group lost its click to native dragging before editing began.
+					<UnstyledButton onClick={startEditing}>
+						<Group gap={4} wrap="nowrap">
+							<Text size="sm" fw={500}>
+								{serverTitle || "Workspace"}
+							</Text>
+							<IconPencil size={14} color="var(--mantine-color-dimmed)" />
+						</Group>
+					</UnstyledButton>
 				)}
+				<WorkspaceTitleGenerator
+					key={workspaceId}
+					workspaceId={workspaceId}
+					titleSource={workspace.titleSource}
+					titleRevision={workspace.titleRevision}
+					editing={editing}
+				/>
 				<Box style={{ flex: 1 }} />
 				<Group gap={4}>
 					{outlineEnabled && (

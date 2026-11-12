@@ -13,7 +13,12 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import { api } from "../../../lib/api";
-import type { SpecFileDetail, SpecFileMeta, SpecWriteResult } from "../../../lib/api/spec";
+import type {
+	SpecFileDetail,
+	SpecFileMeta,
+	SpecOutlineBehavior,
+	SpecWriteResult,
+} from "../../../lib/api/spec";
 import en from "../../../locales/en/narrator.json";
 import { ConfirmDialogContext } from "../../common/confirm-dialog-context";
 import {
@@ -36,6 +41,12 @@ let queryClient: QueryClient;
 /** Server-side state: current content and revision per path. */
 let server: Map<string, { content: string; revisionId: string }>;
 let revisionCounter = 0;
+/** Set for a session whose tasks live in the outline: its fence is shown read-only. */
+let outlineBehavior: SpecOutlineBehavior | undefined;
+/** Set for an outline session while the outline is switched off (it runs on Dynamic Spec). */
+let outlineSwitchedOff = false;
+/** The session's task backend, as the status bar's route reports it. */
+let backend: "spec" | "outline" = "spec";
 const writes: { uri: string; content: string; baseRevisionId?: string | null }[] = [];
 /** Every source editor render: the document it shows and the text it was opened on. */
 const sourceRenders: { documentKey: string; initialValue: string }[] = [];
@@ -45,7 +56,7 @@ function meta(path: string): SpecFileMeta {
 		path,
 		uri: `spec://${path}`,
 		readonly: path === "behavior_fence",
-		uiEditable: true,
+		uiEditable: !(outlineBehavior && path === "behavior_fence"),
 		builtin: path === "tasks.json" || path === "behavior_fence",
 		revisionId: server.get(path)?.revisionId ?? null,
 	};
@@ -144,12 +155,17 @@ beforeEach(async () => {
 		["notes.json", { content: '{"key_name": ["*"]}\n', revisionId: "n1" }],
 	]);
 	revisionCounter = 0;
+	outlineBehavior = undefined;
+	outlineSwitchedOff = false;
+	backend = "spec";
 	writes.length = 0;
 	sourceRenders.length = 0;
 
 	const spies = [
 		spyOn(api, "listSpecFiles").mockImplementation(async () => ({
 			files: [...server.keys()].map(meta),
+			...(outlineBehavior ? { outlineBehavior } : {}),
+			...(outlineSwitchedOff ? { outlineSwitchedOff: true } : {}),
 		})),
 		spyOn(api, "readSpecFile").mockImplementation(async (_narrator, uri) => detail(uri)),
 		spyOn(api, "readSpecTasks").mockImplementation(async () => ({
@@ -171,6 +187,20 @@ beforeEach(async () => {
 				interjected: false,
 			} as SpecWriteResult;
 		}),
+		spyOn(api, "getNarratorCurrentTask").mockImplementation(async () => ({
+			backend,
+			current: null,
+			awaitingConfirmation: 0,
+			awaitingYourConfirmation: 0,
+			awaitingFrom: [],
+		})),
+		spyOn(api, "getSessionTaskBoard").mockImplementation(async () => ({
+			scope: { kind: "session", narratorId: NARRATOR },
+			sections: [],
+			canAdd: false,
+			nextCursor: null,
+			me: { userId: "u1", name: "u1" },
+		})),
 		spyOn(api, "getUserPreferences").mockResolvedValue({} as never),
 		spyOn(api, "getSettings").mockResolvedValue({ agent: {} } as never),
 		spyOn(api, "getNarrator").mockResolvedValue({ id: NARRATOR } as never),
@@ -278,5 +308,87 @@ test("switching files never opens the new file on the previous file's text", asy
 		const expected = render.documentKey.includes("spec://notes.json") ? notesText : designText;
 		expect(render.initialValue).toBe(expected ?? "");
 	}
+	expect(writes).toEqual([]);
+});
+
+test("an outline session's fence tab is read-only and opens the behavior page in the outline", async () => {
+	outlineBehavior = { spaceId: "space-1", pageId: "page-1" };
+	server.set("behavior_fence", { content: "Plugin SOP: report back.", revisionId: "f1" });
+	await act(async () => {
+		await queryClient.invalidateQueries();
+	});
+	await act(async () => {
+		revealSpecFile(NARRATOR, "spec://behavior_fence");
+	});
+	const notice = () => host.querySelector('[data-testid="spec-outline-fence-notice"]');
+	await waitFor(() => !!notice() && !!host.textContent?.includes("Plugin SOP: report back."));
+	expect(notice()?.textContent).toContain(en.spec.outlineFenceHint);
+	const link = notice()?.querySelector("a");
+	expect(link?.textContent).toBe(en.spec.outlineFenceOpen);
+	expect(link?.getAttribute("href")).toContain("space-1");
+	expect(link?.getAttribute("href")).toContain("page-1");
+	// Shown, not edited: no editor, no fence settings, nothing saved.
+	expect(host.querySelector("[data-monaco-test-editor]")).toBeNull();
+	expect(host.textContent).not.toContain(en.spec.behaviorFenceEditHint);
+	expect(writes).toEqual([]);
+});
+
+test("a spec session's fence tab stays editable, without the outline note", async () => {
+	server.set("behavior_fence", { content: "Never force-push.", revisionId: "f1" });
+	await act(async () => {
+		await queryClient.invalidateQueries();
+	});
+	await open("behavior_fence");
+	expect(host.querySelector('[data-testid="spec-outline-fence-notice"]')).toBeNull();
+	expect(host.querySelector('[data-testid="spec-outline-switched-off-notice"]')).toBeNull();
+	expect(host.textContent).toContain(en.spec.behaviorFenceEditHint);
+});
+
+test("with the outline switched off, an outline session's fence tab is editable and says where its rules are", async () => {
+	outlineSwitchedOff = true;
+	server.set("behavior_fence", { content: "Plugin SOP: report back.", revisionId: "f1" });
+	await act(async () => {
+		await queryClient.invalidateQueries();
+	});
+	await open("behavior_fence");
+	const notice = () => host.querySelector('[data-testid="spec-outline-switched-off-notice"]');
+	await waitFor(() => !!notice());
+	expect(notice()?.textContent).toBe(en.spec.outlineFenceSwitchedOff);
+	// Editable as in any spec session; the read-only outline note is not shown.
+	expect(host.textContent).toContain(en.spec.behaviorFenceEditHint);
+	expect(host.querySelector('[data-testid="spec-outline-fence-notice"]')).toBeNull();
+	// Only on the fence tab.
+	await open("design.md");
+	expect(notice()).toBeNull();
+});
+
+test("an outline session's old Spec files are read only: previews, no task editor, nothing saved", async () => {
+	backend = "outline";
+	server.set("tasks.json", {
+		content: '{"tasks":[{"text":"Old spec task","status":"todo"}]}\n',
+		revisionId: "t2",
+	});
+	spyOn(api, "readSpecTasks").mockImplementation(async () => ({
+		content: server.get("tasks.json")?.content ?? "",
+		revisionId: "t2",
+		document: { tasks: [{ text: "Old spec task", status: "todo" }] },
+		compiled: null as never,
+	}));
+	await act(async () => {
+		await queryClient.invalidateQueries();
+	});
+	const legacy = () => host.querySelector('[data-testid="outline-tasks-legacy"]');
+	await waitFor(() => !!legacy());
+	await act(async () => (legacy() as unknown as { click: () => void }).click());
+	const tasks = () => host.querySelector('[data-testid="spec-tasks-readonly"]');
+	await waitFor(() => !!tasks() && !!tasks()?.textContent?.includes("Old spec task"));
+	expect(host.querySelector('[data-testid="outline-tasks-back"]')).not.toBeNull();
+	// No task editor (its empty state, its add and save controls).
+	expect(host.textContent).not.toContain(en.spec.noTasks);
+	await act(async () => {
+		revealSpecFile(NARRATOR, "spec://design.md");
+	});
+	await waitFor(() => !!host.textContent?.includes("snake_case"));
+	expect(host.querySelector("[data-monaco-test-editor]")).toBeNull();
 	expect(writes).toEqual([]);
 });

@@ -3,9 +3,11 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { MediaRef } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { modelInputText } from "../../../tests/fixtures/model-input";
-import { cleanDb } from "../../../tests/setup";
+import { wavBytes, webmBytes } from "../../../tests/fixtures/native-media";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -15,6 +17,8 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { saveUploadedMedia } from "../../lib/media-uploads";
+import { setUploadsDirForTests } from "../../lib/uploads";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
 import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
@@ -230,9 +234,49 @@ function fixture(
 		owner,
 		session,
 		runControl,
-		run: (text = "same input") => runAgentLoopUnlocked(session, owner, text, undefined, runControl),
+		run: (text = "same input", media?: MediaRef[], prePromptBashCommand?: string) =>
+			runAgentLoopUnlocked(
+				session,
+				owner,
+				text,
+				undefined,
+				runControl,
+				prePromptBashCommand,
+				media,
+			),
 	};
 }
+
+describe("context overflow recovery cancellation", () => {
+	for (const profile of profiles) {
+		test(`${profile.kind}: abort during compact remains an interruption, not a compact failure`, async () => {
+			const service = await import("../narrator-service");
+			const session = await import("../narrator-session");
+			const h = fixture(profile, [
+				{
+					...finished,
+					finalText: "",
+					completedAssistantTurn: false,
+					completedNaturally: false,
+					contextLengthExceeded: true,
+				},
+			]);
+			spyOn(service.narratorService, "getCompactBoundaryMessage").mockResolvedValue("boundary");
+			const compact = spyOn(session, "runCustomCompact").mockImplementation(async () => {
+				h.session.abortController.abort();
+				return true;
+			});
+			const emitted: Array<{ type: string }> = [];
+			h.session.events.on("event", (event) => emitted.push(event));
+			const result = await h.run();
+			expect(result.aborted).toBe(true);
+			expect(result.hasError).toBe(false);
+			expect(h.calls).toHaveLength(1);
+			expect(compact).toHaveBeenCalledTimes(1);
+			expect(emitted.some((event) => event.type === "error")).toBe(false);
+		});
+	}
+});
 
 describe("round token totals at the Stop hook", () => {
 	for (const exit of ["normal", "workspace", "tool-limit", "throw"] as const) {
@@ -514,6 +558,161 @@ describe("subagent signed source projection", () => {
 		expect(projected).toBe(true);
 		expect(h.calls).toHaveLength(1);
 	});
+});
+
+describe("native media input transitions follow the unified run control", () => {
+	const refs: MediaRef[] = [
+		{
+			mediaId: "current-audio",
+			filename: "voice.wav",
+			mediaType: "audio/wav",
+			size: 60,
+			uploadNarratorId: "contract-parent",
+		},
+		{
+			mediaId: "current-video",
+			filename: "clip.webm",
+			mediaType: "video/webm",
+			size: 36,
+			uploadNarratorId: "contract-parent",
+		},
+	];
+	for (const rich of [false, true])
+		test(`queued /new consumes the real mailbox and strips command layout (document=${rich})`, async () => {
+			const { enqueueBufferedMessage, getBufferedMessages } = await import("../narrator-buffer");
+			const { resumeNextBufferedMessage } = await import("../narrator-session");
+			const source = active("contract-primary");
+			const directory = mkdtempSync(join(tmpdir(), "nf-queued-new-media-"));
+			setUploadsDirForTests(directory);
+			const media = await Promise.all([
+				saveUploadedMedia(
+					"contract-parent",
+					new File([new Uint8Array(wavBytes())], "voice.wav", { type: "audio/wav" }),
+				),
+				saveUploadedMedia(
+					"contract-parent",
+					new File([new Uint8Array(webmBytes([3, 4]))], "clip.webm", { type: "video/webm" }),
+				),
+			]);
+			const completed = Promise.withResolvers<string>();
+			const document = rich
+				? {
+						version: 1 as const,
+						paragraphs: [{ children: [{ type: "text" as const, text: "/new hello" }] }],
+						assets: [],
+					}
+				: undefined;
+			const queued = await enqueueBufferedMessage(
+				"contract-primary",
+				"/new hello",
+				undefined,
+				undefined,
+				"principal-a",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				document,
+				rich ? undefined : media,
+			);
+			expect(queued.ok).toBe(true);
+			spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.config.narratorId).not.toBe("contract-primary");
+				expect(modelInputText(options)).toContain("hello");
+				expect(modelInputText(options)).not.toContain("/new hello");
+				if (!rich)
+					for (const ref of media) {
+						expect(JSON.stringify(options.history.rows)).toContain(ref.mediaId);
+						expect(JSON.stringify(options.history.rows)).toContain(ref.uploadNarratorId as string);
+					}
+				completed.resolve(options.config.narratorId as string);
+				return finished;
+			});
+			await resumeNextBufferedMessage(source, "en");
+			const id = await completed.promise;
+			await getRunControl(id)?.terminal;
+			expect(getBufferedMessages("contract-primary")).toHaveLength(0);
+			expect(getBufferedMessages(id)).toHaveLength(0);
+			activeNarrators.delete(id);
+			getExecutionOwner(id)?.release();
+			setUploadsDirForTests(null);
+			rmSync(directory, { recursive: true, force: true });
+		});
+	for (const transition of ["permission-feedback", "workspace-replay"] as const) {
+		test(`${transition}: committed input does not inherit current native refs`, async () => {
+			const { pendingFeedback } = await import("../narrator-session-state");
+			const nextText = `committed ${transition} input`;
+			const h = fixture(profiles[0], [
+				async (options) => {
+					expect(options.media).toEqual(refs);
+					if (transition === "permission-feedback")
+						pendingFeedback.set("contract-primary", {
+							toolUseId: "approved-tool",
+							feedbackText: nextText,
+							userId: "principal-a",
+						});
+					if (transition === "workspace-replay") h.session._workspacePassInvalidated = true;
+					return finished;
+				},
+				async (options) => {
+					expect(options.media).toBeUndefined();
+					if (transition !== "workspace-replay")
+						expect(modelInputText(options)).toContain(nextText);
+					return finished;
+				},
+			]);
+			expect((await h.run("unpersisted current input", refs)).hasError).toBe(false);
+			expect(h.calls).toHaveLength(2);
+		});
+	}
+	for (const profile of profiles)
+		test(`${profile.kind}: startNarratorRun forwards refs into its owned pass`, async () => {
+			const id = profile.kind === "primary" ? "contract-primary" : "contract-child";
+			const session = active(id);
+			activeNarrators.set(id, session);
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.media).toEqual(refs);
+				expect(getExecutionOwner(id)).toBeDefined();
+				expect(getRunControl(id)).toBeDefined();
+				return finished;
+			});
+			const handle = await startNarratorRun({
+				narratorId: id,
+				locale: "en",
+				text: "unpersisted native input",
+				principal: "principal-a",
+				media: refs,
+				active: session,
+				deliver: false,
+			});
+			expect(handle.started).toBe(true);
+			expect((await handle.completion).hasError).toBe(false);
+			expect(execute).toHaveBeenCalledTimes(1);
+		});
+	for (const profile of profiles)
+		test(`${profile.kind}: pre-prompt Bash clears separate media without changing run ownership`, async () => {
+			const service = await import("../narrator-service");
+			const bash = spyOn(service, "handleBashCommand").mockResolvedValue({
+				type: "bash",
+				id: "native-media-bash",
+				output: "committed Bash result",
+				isError: false,
+			});
+			const h = fixture(profile, [
+				async (options) => {
+					expect(bash).toHaveBeenCalledTimes(1);
+					expect(options.media).toBeUndefined();
+					expect(getRunControl(h.session.narratorId)).toBe(h.runControl);
+					return finished;
+				},
+			]);
+			expect((await h.run("unpersisted current input", refs, "printf done")).hasError).toBe(false);
+			expect(h.calls).toHaveLength(1);
+		});
 });
 
 describe("real shared orchestrator profile contract", () => {
@@ -941,7 +1140,8 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+			const error = rows.find((row) => row.contentText?.startsWith("[Error]"));
+			expect(readTestMessageContent(sqlite, error?.id ?? "")).toEqual([
 				{ type: "error", message: "fixture exhausted provider retries", diagnostics },
 			]);
 		});
@@ -969,7 +1169,8 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+			const error = rows.find((row) => row.contentText?.startsWith("[Error]"));
+			expect(readTestMessageContent(sqlite, error?.id ?? "")).toEqual([
 				{
 					type: "error",
 					message: "upstream failure 3",

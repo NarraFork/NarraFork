@@ -8,6 +8,7 @@ import { generate } from "selfsigned";
 import {
 	buildExecutorInstallOneLiner,
 	buildExecutorInstallScript,
+	buildUniversalExecutorInstall,
 	type ExecutorInstallScriptInput,
 } from "../executor-install-script";
 import { BUILD_EXECUTOR_DISTRIBUTION } from "../version";
@@ -368,6 +369,90 @@ describe("custom CA provisioning prefix (sandbox, no service setup)", () => {
 	}
 });
 
+describe("systemd reinstall (sandbox, fake service manager only)", () => {
+	for (const mode of ["system", "user"] as const) {
+		(process.platform === "linux" ? test : test.skip)(
+			`${mode}: restarts after writing the replacement URL and key`,
+			async () => {
+				await withFixture(async (dir, env) => {
+					const bin = join(dir, "bin");
+					const units = join(dir, "units");
+					await Promise.all([mkdir(bin), mkdir(units)]);
+					await writeFile(
+						join(bin, "sudo"),
+						'#!/bin/sh\ncase "$1" in chown|useradd) exit 0 ;; esac\nexec "$@"\n',
+						{ mode: 0o755 },
+					);
+					await writeFile(
+						join(bin, "systemctl"),
+						[
+							"#!/bin/sh",
+							"set -eu",
+							'printf "%s\\n" "$*" >> "$NF_TEST_SERVICE_LOG"',
+							'case " $* " in *" restart "*) cp "$NF_TEST_CONFIG/executor.json" "$NF_TEST_CONFIG/active.json"; cp "$NF_TEST_CONFIG/device-token" "$NF_TEST_CONFIG/active-token" ;; esac',
+						].join("\n"),
+						{ mode: 0o755 },
+					);
+					const binary = "#!/bin/sh\nexit 0\n";
+					let token = "";
+					const server = Bun.serve({
+						hostname: "127.0.0.1",
+						port: 0,
+						fetch(request) {
+							return new URL(request.url).pathname.includes("/enroll/")
+								? Response.json({ token })
+								: new Response(binary);
+						},
+					});
+					try {
+						const config =
+							mode === "system" ? join(dir, "config") : join(env.HOME, ".config/narrafork");
+						const log = join(dir, "service-log");
+						for (const revision of [1, 2]) {
+							token = `rdev_revision_${revision}`;
+							const wsUrl = `wss://revision-${revision}.example/ws/device`;
+							const generated = buildExecutorInstallScript(
+								input({
+									mode,
+									platform: process.arch === "arm64" ? "linux-arm64" : "linux-amd64",
+									serverBaseUrl: `http://127.0.0.1:${server.port}`,
+									deviceWsUrl: wsUrl,
+									expectedSha256: createHash("sha256").update(binary).digest("hex"),
+									caCertPem: undefined,
+								}),
+							).script;
+							// Redirect every privileged path and the systemd presence probe into the fixture.
+							const sandbox = generated
+								.replaceAll("/usr/local/bin", join(dir, "installed-bin"))
+								.replaceAll("/etc/narrafork", config)
+								.replaceAll("/etc/systemd/system", units)
+								.replaceAll("/run/systemd/system", units);
+							const saved = join(dir, "install.sh");
+							await writeFile(saved, sandbox);
+							const result = await runShell([saved], dir, {
+								...env,
+								PATH: `${bin}:${env.PATH}`,
+								NF_TEST_CONFIG: config,
+								NF_TEST_SERVICE_LOG: log,
+							});
+							expect(result.exitCode).toBe(0);
+							expect(
+								JSON.parse(await readFile(join(config, "active.json"), "utf8")).serverUrl,
+							).toBe(wsUrl);
+							expect(await readFile(join(config, "active-token"), "utf8")).toBe(token);
+						}
+						const calls = await readFile(log, "utf8");
+						expect(calls).not.toContain("--now");
+						expect(calls.match(/restart narrafork-executor/g)).toHaveLength(2);
+					} finally {
+						await server.stop(true);
+					}
+				});
+			},
+		);
+	}
+});
+
 describe("custom CA installer generation (never executes installers)", () => {
 	test("rejects malformed, oversized, injected or private PEM content", () => {
 		for (const caCertPem of [
@@ -520,6 +605,142 @@ describe("custom CA installer generation (never executes installers)", () => {
 			["curl 7.69.1 (Windows) libcurl/7.69.1 Schannel", true],
 		] as const) {
 			expect(schannel.test(version.replace(inactive, ""))).toBe(expected);
+		}
+	});
+
+	for (const [os, arch, platform] of [
+		["Linux", "x86_64", "linux-amd64"],
+		["Linux", "aarch64", "linux-arm64"],
+		["Darwin", "amd64", "darwin-amd64"],
+		["Darwin", "arm64", "darwin-arm64"],
+	] as const) {
+		unixTest(
+			`universal ${platform}: saved script and command select one URL and preserve stdin`,
+			async () => {
+				await withFixture(async (dir, env) => {
+					const bin = join(dir, "bin");
+					await mkdir(bin);
+					await writeFile(
+						join(bin, "uname"),
+						`#!/bin/sh\ncase "$1" in -s) printf '%s' '${os}' ;; -m) printf '%s' '${arch}' ;; esac\n`,
+						{ mode: 0o755 },
+					);
+					await writeFile(
+						join(bin, "curl"),
+						[
+							"#!/bin/sh",
+							"set -eu",
+							'printf "%s\\n" "$@" > "$NF_TEST_CURL_ARGS"',
+							'while [ "$#" -gt 0 ]; do case "$1" in -o) shift; cp "$NF_TEST_PAYLOAD" "$1" ;; esac; shift; done',
+						].join("\n"),
+						{ mode: 0o755 },
+					);
+					const payload = join(dir, "payload");
+					await writeFile(payload, HARMLESS_SCRIPT);
+					const argsFile = join(dir, "curl-args");
+					const generated = buildUniversalExecutorInstall({
+						target: "unix",
+						scriptUrls: Object.fromEntries(
+							EXECUTOR_PLATFORMS.map((value) => [
+								value,
+								`https://localhost/${value}?ticket=${TICKET}`,
+							]),
+						),
+						caCertPem: trusted.cert,
+					});
+					const testEnv = {
+						...env,
+						PATH: `${bin}:${env.PATH}`,
+						NF_TEST_PAYLOAD: payload,
+						NF_TEST_CURL_ARGS: argsFile,
+					};
+					const saved = join(dir, generated.filename);
+					await writeFile(saved, generated.script);
+					const withoutCa = buildUniversalExecutorInstall({
+						target: "unix",
+						scriptUrls: { [platform]: `https://localhost/${platform}?ticket=${TICKET}` },
+					});
+					expect(generated.oneLiner).not.toContain("\n");
+					for (const args of [[saved], ["-c", generated.oneLiner], ["-c", withoutCa.oneLiner]]) {
+						const result = await runShell(args, dir, testEnv, `${STDIN}\n`);
+						expect(result.exitCode).toBe(0);
+						expect(await readFile(env.NF_TEST_STDIN, "utf8")).toBe(STDIN);
+						expect(await readFile(argsFile, "utf8")).toContain(
+							`https://localhost/${platform}?ticket=${TICKET}`,
+						);
+						expect(await readdir(env.TMPDIR)).toEqual([]);
+					}
+					expect(generated.script.match(/BEGIN CERTIFICATE/g)).toHaveLength(1);
+					expectSecureCurl(generated.script);
+				});
+			},
+		);
+	}
+
+	for (const scenario of [
+		"unknown OS",
+		"unknown arch",
+		"missing release",
+		"curl failure",
+	] as const) {
+		unixTest(`universal ${scenario}: fails without executing a partial download`, async () => {
+			await withFixture(async (dir, env) => {
+				const bin = join(dir, "bin");
+				await mkdir(bin);
+				await writeFile(
+					join(bin, "uname"),
+					`#!/bin/sh\ncase "$1" in -s) printf '%s' '${scenario === "unknown OS" ? "FreeBSD" : "Linux"}' ;; -m) printf '%s' '${scenario === "unknown arch" ? "riscv64" : "x86_64"}' ;; esac\n`,
+					{ mode: 0o755 },
+				);
+				await writeFile(
+					join(bin, "curl"),
+					'#!/bin/sh\n: > "$NF_TEST_CURL_CALLED"\nprintf "touch %s" "$NF_TEST_EXECUTED"\nexit 60\n',
+					{ mode: 0o755 },
+				);
+				const called = join(dir, "called");
+				const generated = buildUniversalExecutorInstall({
+					target: "unix",
+					scriptUrls:
+						scenario === "missing release" ? {} : { "linux-amd64": "https://localhost/install" },
+					caCertPem: trusted.cert,
+				});
+				const result = await runShell(["-c", generated.oneLiner], dir, {
+					...env,
+					PATH: `${bin}:${env.PATH}`,
+					NF_TEST_CURL_CALLED: called,
+				});
+				expect(result.exitCode).not.toBe(0);
+				expect(existsSync(called)).toBe(scenario === "curl failure");
+				expect(existsSync(env.NF_TEST_EXECUTED)).toBe(false);
+				expect(await readdir(env.TMPDIR)).toEqual([]);
+			});
+		});
+	}
+
+	test("universal Windows shares native-architecture guards with final scripts", () => {
+		const generated = buildUniversalExecutorInstall({
+			target: "windows",
+			scriptUrls: {
+				"windows-amd64": "https://localhost/amd64",
+				"windows-arm64": "https://localhost/arm64",
+			},
+			caCertPem: trusted.cert,
+		});
+		expect(generated.shell).toBe("powershell");
+		expect(generated.filename).toEndWith("windows.ps1");
+		expect(generated.script.indexOf("PROCESSOR_ARCHITEW6432")).toBeLessThan(
+			generated.script.indexOf("Get-Command curl.exe"),
+		);
+		expect(generated.script).toContain("RuntimeInformation]::OSArchitecture");
+		expect(generated.script).toContain("Unsupported Windows architecture");
+		expect(generated.script).toContain("executor is not published");
+		expect(generated.script.match(/FromBase64String/g)).toHaveLength(1);
+		expect(generated.script).toContain("$LASTEXITCODE -ne 0");
+		expectSecureCurl(generated.script);
+		for (const platform of ["windows-amd64", "windows-arm64"] as const) {
+			const final = buildExecutorInstallScript(input({ platform })).script;
+			expect(final).toContain("PROCESSOR_ARCHITEW6432");
+			expect(final).toContain("RuntimeInformation]::OSArchitecture");
 		}
 	});
 

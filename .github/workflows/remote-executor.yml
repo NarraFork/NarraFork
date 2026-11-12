@@ -71,6 +71,9 @@ on:
       - "bun.lock"
       - ".github/workflows/remote-executor.yml"
 
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
 jobs:
   executor-go:
     name: Go tests, vet, and cross-build
@@ -172,6 +175,9 @@ jobs:
       - name: Install native Host test dependencies
         working-directory: .
         run: bun install --frozen-lockfile
+      - name: Test native executor install scripts
+        working-directory: .
+        run: bun test --isolate server/lib/__tests__/executor-install-script.test.ts
       # This explicit remote peer is separate from the fresh Host, which forbids helper bootstrap.
       - name: Build controlled remote editor fixture
         working-directory: .

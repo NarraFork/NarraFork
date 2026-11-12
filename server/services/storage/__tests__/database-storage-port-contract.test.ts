@@ -41,6 +41,8 @@ import {
 	enforceReportLimits,
 	runWithScanBudget,
 } from "../database-storage-port";
+// Adapter-first is intentional: eagerly importing the cleanup service here used to loop through
+// narrator-service → storage-service → store and read the adapter before its initialization.
 import { sqliteDatabaseStoragePort } from "../sqlite-database-storage";
 import { databaseStoragePort } from "../store";
 
@@ -220,6 +222,50 @@ describe("runWithScanBudget", () => {
 		expect(result).toBe("measured");
 	});
 
+	test("handles synchronous caller abort followed by synchronous throw", async () => {
+		const controller = new AbortController();
+		const running = runWithScanBudget(5_000, controller.signal, () => {
+			controller.abort();
+			throw new Error("synchronous failure after abort");
+		});
+		await expect(running).rejects.toBeInstanceOf(DatabaseStorageScanCancelledError);
+		// Give the runtime a turn to surface any unhandled rejection from the abort race.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	});
+
+	test("propagates a synchronous operation failure unchanged", async () => {
+		const failure = new Error("synchronous failure");
+		await expect(
+			runWithScanBudget(5_000, undefined, () => {
+				throw failure;
+			}),
+		).rejects.toBe(failure);
+	});
+
+	test.each([
+		"success",
+		"failure",
+	] as const)("removes its linked abort listener on %s", async (outcome) => {
+		const removed: EventListenerOrEventListenerObject[] = [];
+		const failure = new Error("operation failed");
+		const running = runWithScanBudget(5_000, undefined, (linked) => {
+			const remove = linked.removeEventListener.bind(linked);
+			linked.removeEventListener = (
+				type: string,
+				listener: EventListenerOrEventListenerObject,
+				options?: boolean | EventListenerOptions,
+			) => {
+				if (type === "abort" && listener) removed.push(listener);
+				remove(type, listener, options);
+			};
+			if (outcome === "failure") throw failure;
+			return Promise.resolve("done");
+		});
+		if (outcome === "failure") await expect(running).rejects.toBe(failure);
+		else await expect(running).resolves.toBe("done");
+		expect(removed).toHaveLength(1);
+	});
+
 	test("aborts the work when the budget expires, and reports a timeout", async () => {
 		let observedAbort = false;
 		const failure = await runWithScanBudget(30, undefined, async (linked) => {
@@ -239,19 +285,36 @@ describe("runWithScanBudget", () => {
 		expect(failure.budgetMs).toBe(30);
 	});
 
-	/**
-	 * The regression this helper exists for.
-	 *
-	 * A backend that ignores its linked signal can still RETURN successfully after the budget has
-	 * expired. Handing that result back would make the budget advisory — true of a cooperative
-	 * adapter and quietly false of the next one. The contract test above caught exactly this on a
-	 * second backend, so the rule is enforced here rather than trusted.
-	 */
-	test("discards a result produced after the budget expired", async () => {
-		const failure = await runWithScanBudget(0, undefined, async () => "ignored the signal").catch(
-			(error) => error,
-		);
+	// An exhausted budget must not even begin work, including an adapter's lazy import.
+	test("does not start work when the budget is already exhausted", async () => {
+		let started = false;
+		const failure = await runWithScanBudget(0, undefined, async () => {
+			started = true;
+			return "ignored the signal";
+		}).catch((error) => error);
 		expect(failure).toBeInstanceOf(DatabaseStorageScanTimedOutError);
+		expect(started).toBe(false);
+	});
+
+	test("settles on timeout even if the operation ignores cancellation", async () => {
+		let linkedSignal: AbortSignal | undefined;
+		const failure = await runWithScanBudget(20, undefined, async (linked) => {
+			linkedSignal = linked;
+			return new Promise<never>(() => {});
+		}).catch((error) => error);
+		expect(failure).toBeInstanceOf(DatabaseStorageScanTimedOutError);
+		expect(linkedSignal?.aborted).toBe(true);
+	});
+
+	test("settles on caller cancellation even if the operation ignores it", async () => {
+		const controller = new AbortController();
+		const running = runWithScanBudget(
+			5_000,
+			controller.signal,
+			async () => new Promise<never>(() => {}),
+		);
+		controller.abort();
+		await expect(running).rejects.toBeInstanceOf(DatabaseStorageScanCancelledError);
 	});
 
 	test("a caller abort is a cancellation, not a timeout", async () => {
@@ -458,9 +521,8 @@ describe("the SQLite adapter reports where the scan actually runs", () => {
 	});
 
 	test("loses offRequestThreadScan when read workers are disabled", () => {
-		// Read at access time on purpose. A frozen `true` would keep claiming the request thread is
-		// protected in exactly the states where it is not — workers off by configuration, or the
-		// pool torn down for a VACUUM maintenance window.
+		// Read shared-pool availability at access time. Disabling it must not leave a stale `true`;
+		// dedicated-worker recovery remains a separate isolated path, exercised below.
 		process.env.NARRAFORK_DB_WORKER = "off";
 		expect(sqliteDatabaseStoragePort.capabilities.offRequestThreadScan).toBe(false);
 
@@ -469,8 +531,8 @@ describe("the SQLite adapter reports where the scan actually runs", () => {
 	});
 
 	test("still measures with workers disabled, degrading rather than failing", async () => {
-		// The existing SQLite fallback, preserved: a serial main-thread scan is slow, but a slow
-		// report beats a broken settings page.
+		// A dedicated ephemeral worker runs the serial scan when the shared pool is disabled.
+		// The report remains available without moving measurement onto the request thread.
 		process.env.NARRAFORK_DB_WORKER = "off";
 		const report = await sqliteDatabaseStoragePort.scanBreakdown();
 		expect(report.sizeBytes).toBeGreaterThan(0);

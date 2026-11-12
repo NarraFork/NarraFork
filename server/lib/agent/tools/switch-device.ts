@@ -62,9 +62,24 @@ export const switchDeviceTool: ToolDefinition = {
 		const resolvedId =
 			target === LOCAL_DEVICE_ID ? LOCAL_DEVICE_ID : normalizeToId(target, devices);
 		// Persist + apply the new default via the session hook when available.
-		const applied = await ctx.setDefaultDevice?.(
-			resolvedId === LOCAL_DEVICE_ID ? null : resolvedId,
-		);
+		//
+		// A device that has never been given a working directory refuses the switch:
+		// switching anyway would run tools somewhere nobody chose. Point at the tool
+		// that picks the directory instead of surfacing a bare 409.
+		let applied: boolean | undefined;
+		try {
+			applied = await ctx.setDefaultDevice?.(resolvedId === LOCAL_DEVICE_ID ? null : resolvedId);
+		} catch (error) {
+			if ((error as { code?: string }).code !== "WORKSPACE_DIRECTORY_REQUIRED") throw error;
+			const name = devices.find((d) => d.id === resolvedId)?.name ?? resolvedId;
+			return {
+				output:
+					`Device "${name}" has no working directory yet, so the session was not switched. ` +
+					"Choose one with SwitchWorkingDirectory (it accepts a device and an absolute path); " +
+					"that also remembers the directory for this device.",
+				isError: true,
+			};
+		}
 		if (ctx.setDefaultDevice && applied === false) {
 			return { output: "Failed to switch device (session not found).", isError: true };
 		}

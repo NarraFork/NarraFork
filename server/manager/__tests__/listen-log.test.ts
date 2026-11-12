@@ -10,6 +10,18 @@ describe("parseServiceLogLine", () => {
 			protocol: "http",
 			host: "127.0.0.1",
 			port: 7779,
+			startupPage: false,
+		});
+	});
+
+	test("启动状态页的地址单独标记，不当成服务已在监听", () => {
+		const line = '{"msg":"NarraFork startup page on http://127.0.0.1:7778"}';
+		expect(parseServiceLogLine(line)).toEqual({
+			kind: "address",
+			protocol: "http",
+			host: "127.0.0.1",
+			port: 7778,
+			startupPage: true,
 		});
 	});
 
@@ -19,6 +31,7 @@ describe("parseServiceLogLine", () => {
 			protocol: "https",
 			host: "[::1]",
 			port: 8443,
+			startupPage: false,
 		});
 	});
 

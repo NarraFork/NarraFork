@@ -399,11 +399,16 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/db/migrate-narrator-drafts.ts", "one-time SQLite data migration"],
 	["server/db/integrity-probe-worker.ts", "read-only `PRAGMA integrity_check` subprocess"],
 	[
+		"server/db/snapshot-builder-worker.ts",
+		"固定表清单的快照构建子进程：ATTACH 源库后逐表 `INSERT … SELECT` 拷贝，再 `VACUUM` 压实；两者都是 SQLite 专属且 O(数据量) 的同步操作",
+	],
+	[
 		"server/db/integrity-check.ts",
 		"orchestrates the SQLite integrity probe and the `sqlite3 .recover` fallback",
 	],
 	["server/lib/db-resilience.ts", "WAL recovery and `sqlite3 .recover` CLI fallback"],
 	["server/lib/db-worker/worker-entry.ts", "read-only SQLite worker connection"],
+	["server/lib/sql-trace.ts", "opt-in per-statement timing of `bun:sqlite` connections"],
 	["server/lib/db-worker/select-rows.ts", "bounded read-only SQLite SELECT worker execution"],
 	["server/db/worker-read.ts", "routes Drizzle SQLite selects to the read-only worker"],
 	["server/lib/db-worker/storage-scan-runner.ts", "SQLite storage scan budgets"],
@@ -420,6 +425,14 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	[
 		"server/services/file-change-physical-audit-worker.ts",
 		"SQLite-side physical audit in a worker",
+	],
+	[
+		"server/services/data-portability.ts",
+		"固定表清单的导出与导入：子进程逐表复制后再压实，ATTACH 之后靠 `sqlite_master` 与 `rowid` 按列交集拷贝；PostgreSQL 侧要走 `pg_dump`/`COPY` 的另一套实现",
+	],
+	[
+		"server/services/data-portability-memory.ts",
+		"SQLite 快照导入的记忆及审计子模块，与 data-portability.ts 共用 ATTACH 事务和按列交集拷贝",
 	],
 ]);
 
@@ -482,11 +495,28 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
+	"server/lib/sql-trace.ts": ["driver"],
 	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/db/worker-read.ts": ["driver", "drizzleDialect"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
+	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
+	// （复制后压实），ATTACH + 按列交集拷贝回库，`INSERT OR IGNORE` 跳过已存在的行，
+	// `SQLITE_BUSY` 之类的错误码决定重试；源库与目标库都按文件路径打开。
+	"server/services/data-portability-memory.ts": ["driver", "pragma", "rowid", "json1"],
+	"server/services/data-portability.ts": [
+		"connectionModule",
+		"driver",
+		"handle",
+		"pragma",
+		"sqliteCatalog",
+		"rowid",
+		"insertOr",
+		"errorCode",
+		// Session model remap filters the imported ids with json_each over a JSON parameter.
+		"json1",
+	],
 	"server/routes/user-preferences.ts": ["handle"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
 	// History/display ports also have PG implementations. Register the SQLite branches
@@ -499,7 +529,14 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/agent-runtime/model-history-query.ts": ["driver"],
 	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
 	// Dual-backend snapshot worker: these capabilities belong to its SQLite branch.
-	"server/services/narrator-prefix-snapshots-worker.ts": ["driver", "pragma", "errorCode"],
+	"server/services/narrator-prefix-snapshots-worker.ts": [
+		"driver",
+		"connectionModule",
+		"pragma",
+		"errorCode",
+	],
+	// 固定表清单的构建同样放在独立进程：`INSERT … SELECT` 与 `VACUUM` 都是 O(数据量) 的同步操作。
+	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
@@ -557,6 +594,15 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"rowid",
 	],
 	"server/services/narrator-epochs.ts": ["handle", "json1"],
+	// The startup migrations run on both backends: SQLite column types and the synchronous
+	// Drizzle handle are used only in the SQLite branch; PostgreSQL goes through BunSQLDatabase.
+	"server/services/migration-db.ts": ["drizzleDialect"],
+	// Same two-backend shape as migration-db.ts: dialect-bound column types in the plan phase.
+	"server/services/aggregation-migration-service.ts": ["drizzleDialect"],
+	"server/services/provider-prefix-migration-service.ts": ["drizzleDialect"],
+	// The usage ledger is fed from the api_requests rowid cursor after an import; the SQLite
+	// driver type is the function's parameter type.
+	"server/services/usage-daily.ts": ["driver", "rowid", "blobFn"],
 	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
 	"server/services/narrator-block-backfill.ts": [
 		"handle",
@@ -576,6 +622,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-block-scans.ts": ["handle", "indexHint"],
 	// Main-thread Drizzle readers' bodies from block rows (SQLite-only, like block storage).
 	"server/services/narrator-body-reads.ts": ["handle", "json1"],
+	// Retention fences consult the SQLite body projection before accepting late writes.
+	"server/services/narrator-body-writes.ts": ["handle"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
 	"server/lib/narrator-bodies.ts": ["driver", "sqliteCatalog"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
@@ -599,6 +647,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// status) so SQLite uses it; the PostgreSQL store spells the same predicate with `#>>`.
 	"server/services/outline/store/sqlite-store.ts": ["json1"],
 	"server/services/parent-injection-queue.ts": ["json1"],
+	// SQLite-gated project indexing uses connection change counters only to invalidate
+	// per-pass caches; a PostgreSQL implementation must provide its own revision signal.
+	"server/services/project-index.ts": ["handle", "sessionFn"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",
@@ -641,6 +692,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"fts5",
 		"errorCode",
 	],
+	"server/services/narrator-timeline.ts": ["json1"],
 	"server/services/subagent-activity.ts": ["json1"],
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
 	"server/services/token-recalculation-sqlite.ts": ["driver"],
@@ -662,8 +714,23 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
-	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
+	"server/services/tool-input-stream-source.ts": ["driver", "pragma", "handle"],
+	// 用量分桶：SQLite 用 strftime + 按 DST 分段应用的偏移，PostgreSQL 用 date_trunc/AT TIME ZONE。
+	// 两个分支都在 usage-bucket-sql.ts 里，PG 分支有真实库测试。
+	"server/services/usage-bucket-sql.ts": ["timeFn"],
 	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
+	// History retention has an explicit SQLite capability boundary; a PG implementation
+	// needs its own async candidate/read/write adapter, rather than opening a second DB.
+	"server/lib/db-worker/storage-history-query.ts": ["driver", "rowid", "json1", "timeFn"],
+	"server/services/storage-history-runtime.ts": ["connectionModule"],
+	"server/services/storage-history-mutations.ts": [
+		"handle",
+		"connectionModule",
+		"pragma",
+		"sessionFn",
+	],
+	"server/services/storage-history-service.ts": ["rowid"],
+	"shared/storage-retention.ts": ["rowid"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
 

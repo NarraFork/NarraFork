@@ -1,4 +1,5 @@
 import { renderPrefixPrompt } from "@shared/prefix-context";
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
 import { ContextEvidenceBudget, projectKnowledgeEvidence } from "../context-evidence-budget";
@@ -25,13 +26,19 @@ export interface PreparePrefixRequestOptions<
 > {
 	narratorId: string;
 	locale: Locale;
+	getReplyContext?: () => ReplyContext;
+	/** Persist upstream identity before any prepared request can leave the runtime. */
+	ensureRequestIdentity?: () => Promise<void>;
 	getModel: () => string;
 	getProvider: () => string;
 	signal?: AbortSignal;
 	getToolLoading?: (identity: RequestModelIdentity) => RuntimeHistoryOptions["toolLoading"];
 	refreshToolLoading?: (identity: RequestModelIdentity) => Promise<void>;
 	/** Runs after tool refresh under the existing /load serialization queue. */
-	buildPrefixPrompt?: (identity: RequestModelIdentity) => Promise<Prompt>;
+	buildPrefixPrompt?: (
+		identity: RequestModelIdentity,
+		replyContext: ReplyContext,
+	) => Promise<Prompt>;
 	/** Revocable observations collected after reconciliation; never stored in an epoch. */
 	getRequestContext?: (allowance: { byteBudget: number }) => Promise<string>;
 	/** Shared with user-message injection and concurrent tool-output scans. */
@@ -54,12 +61,17 @@ export interface PreparedPrefixRequest<Prompt extends RequestPrefixPrompt = Requ
 /**
  * Prepare the same authoritative prefix for first requests, later turns and retries.
  * Snapshot construction and prompt collection have no fixed total wall-clock budget:
- * they remain cancellable while progressing. Each source read gets its own query budget.
+ * source reads also remain cancellable while progressing, without a fixed time cutoff.
  */
 export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 	options: PreparePrefixRequestOptions<Prompt>,
 ): Promise<PreparedPrefixRequest<Prompt>> {
-	const { narratorId, locale, signal } = options;
+	const { narratorId, signal } = options;
+	const replyContext = parseReplyContext(options.getReplyContext?.()) ?? {
+		locale: options.locale,
+		replyInUserLanguage: false,
+	};
+	const { locale } = replyContext;
 	// A UI selection change is consumed by the loop's next model-switch boundary,
 	// not by a queued prepare or a compact retry within this request.
 	const identity: RequestModelIdentity = {
@@ -70,7 +82,6 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 		signal?.throwIfAborted();
 		return narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 			signal,
-			deadline: Date.now() + 10_000,
 		});
 	};
 	const evidenceBudget =
@@ -105,7 +116,8 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 		if (!capturedLoading) {
 			// Compatibility for standalone callers without loading-aware prefix epochs.
 			const sourceMessages = projectHistory(await readHistory());
-			const prompt = await options.buildPrefixPrompt?.(identity);
+			const prompt = await options.buildPrefixPrompt?.(identity, replyContext);
+			await options.ensureRequestIdentity?.();
 			signal?.throwIfAborted();
 			const systemPrompt = await requestPrompt(
 				prompt ? renderPrefixPrompt(prompt.contract, prompt.parts) : undefined,
@@ -126,7 +138,7 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 				refreshTools: async () => {
 					await options.refreshToolLoading?.(identity);
 					signal?.throwIfAborted();
-					prompt = await options.buildPrefixPrompt?.(identity);
+					prompt = await options.buildPrefixPrompt?.(identity, replyContext);
 					return { ...(options.getToolLoading?.(identity) ?? capturedLoading), prompt };
 				},
 				noticeText: (kind, toolName) =>
@@ -141,6 +153,7 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 			if (reconciled.changed) sourceMessages = await readHistory();
 			else sourceMessages = reconciled.sourceMessages ?? sourceMessages ?? (await readHistory());
 			sourceMessages = projectHistory(sourceMessages);
+			await options.ensureRequestIdentity?.();
 			const systemPrompt = await requestPrompt(reconciled.systemPrompt);
 			if (
 				prompt?.compactMessageId !== undefined &&

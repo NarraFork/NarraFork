@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { z } from "zod/v4";
+import { AppError } from "../../errors";
 import type { AnthropicProviderConfig, OpenAIProviderConfig } from "../../settings";
 import { AnthropicProvider } from "../anthropic-provider";
 import { OpenAIProvider } from "../openai-provider";
@@ -13,9 +14,11 @@ import {
 	formatRequestTools,
 	latestToolLoadingEpoch,
 	projectToolLoadingHistory,
+	protocolsWithToolAppending,
 	resolveLoadableToolDefinition,
 	resolveToolLoadingStrategy,
 	selectRequestTools,
+	ToolEpochError,
 	type ToolLoadingState,
 	type ToolLoadingStrategy,
 	toolLoadingChangeOf,
@@ -1002,4 +1005,47 @@ test("newly available built-ins append declarations without becoming optional ex
 	);
 	expect(projected[0].contentText).toContain("<tool_definitions>");
 	expect(projected[0].contentText).toContain(TERMINAL.name);
+});
+
+describe("protocolsWithToolAppending", () => {
+	test("DeepSeek keeps the cache only on Anthropic Messages", () => {
+		expect(
+			protocolsWithToolAppending("opencode:deepseek-v4.1-flash", [
+				"anthropic-messages",
+				"openai-responses",
+				"completions-compatible",
+				"gemini-compatible",
+			]),
+		).toEqual(["anthropic-messages"]);
+	});
+	test("a model whose defaults inject on any protocol keeps every candidate", () => {
+		expect(
+			protocolsWithToolAppending("custom:glm-5.1", ["openai-responses", "gemini-compatible"]),
+		).toEqual(["openai-responses", "gemini-compatible"]);
+	});
+});
+
+describe("ToolEpochError public diagnostics", () => {
+	test("preserves a public reader error and the fatal epoch marker", () => {
+		const cause = new AppError("Model history read-only worker failed");
+		const error = new ToolEpochError(cause);
+		expect(error).toBeInstanceOf(ToolEpochError);
+		expect(error.name).toBe("ToolEpochError");
+		expect(error.cause).toBe(cause);
+		expect(error.message).toBe(cause.message);
+	});
+	test("does not expose raw driver details or misdiagnose them as storage unavailability", () => {
+		const cause = new Error("driver postgres://user:PRIVATE_PASSWORD@host/db SELECT PRIVATE_SQL");
+		const error = new ToolEpochError(cause);
+		expect(error.cause).toBe(cause);
+		expect(error.message).toBe(
+			"Could not prepare tool and context state. See server logs for details.",
+		);
+		expect(error.message).not.toContain("PRIVATE_");
+		expect(error.message).not.toContain("message storage");
+	});
+	test("identifies cancellation without echoing the caller's private reason", () => {
+		const error = new ToolEpochError(new DOMException("PRIVATE_REASON", "AbortError"));
+		expect(error.message).toBe("Request preparation cancelled.");
+	});
 });

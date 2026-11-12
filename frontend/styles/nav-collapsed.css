@@ -1,17 +1,175 @@
 /*
- * Collapsed navbar: center NavLink icons when label is hidden.
- * Applied via data-collapsed attribute on AppShell.Navbar.
+ * Collapsed sidebar: the expanded content box, laid out at the expanded width (see
+ * NavHoverPanel). Every row's icon sits in the first 40px of its row, so clipping each
+ * row to that block leaves a column of icons. Open on hover, the clips come off and the
+ * box paints over the page at the same position: nothing in it moves, the titles and the
+ * controls on the right appear in place.
+ *
+ * Clipping (clip-path) never changes layout, which is what keeps every row at the same
+ * x/y in both states. It also animates: opening and closing are one motion, the rows'
+ * clips and the backdrop's (NavHoverPanel) sliding between the rail's edge and the
+ * expanded width together.
  */
+/*
+ * Let the recent-tabs scrollport use the navbar's trailing padding. Its rows keep
+ * their original width and alignment, while the scrollbar gets a separate lane
+ * 4px inside the navbar edge (clear of the resize handle). Logical properties
+ * keep the same spacing in RTL. This also applies to the expanded hover panel.
+ */
+.nf-nav-tabs {
+	--nf-nav-scrollbar-inset: 4px;
 
-[data-collapsed] .mantine-NavLink-root {
-	justify-content: center;
-	padding-inline: 0;
+	margin-inline-end: calc(var(--nf-nav-scrollbar-inset) - var(--mantine-spacing-md));
+	padding-inline-end: calc(var(--mantine-spacing-md) - var(--nf-nav-scrollbar-inset));
+	scrollbar-gutter: stable;
 }
 
-[data-collapsed] .mantine-NavLink-section {
-	margin-inline-end: 0;
+.nf-nav-hover-panel {
+	--nf-nav-open-ease: cubic-bezier(0.2, 0, 0, 1);
+	--nf-nav-open-duration: 220ms;
 }
 
-[data-collapsed] .mantine-NavLink-body {
+/*
+ * The session list's scrollbar sits at the expanded right edge, past the rail and out
+ * over the page while collapsed: hidden there, back once it opens. Wheel and keyboard
+ * scrolling still work.
+ */
+[data-nav-hover-panel="closed"] .nf-nav-tabs {
+	scrollbar-width: none;
+}
+
+[data-nav-hover-panel="closed"] .nf-nav-tabs::-webkit-scrollbar {
 	display: none;
+}
+
+/*
+ * The rows reach past the rail while collapsed; each one is clipped to its icon below, so
+ * the navbar itself never clips (that would cut the opening motion off at its edge).
+ * Anything left unclipped, `nf-nav-expanded-only`, is hidden instead.
+ */
+.nf-nav-hover-panel
+:is(
+	.mantine-NavLink-root,
+	[data-folder-unit],
+	[data-recent-tab-pin-divider],
+	.nf-nav-status-row,
+	.nf-nav-bottom-bar
+) {
+	clip-path: inset(0 0 0 0 round var(--mantine-radius-sm));
+	transition: clip-path var(--nf-nav-open-duration) var(--nf-nav-open-ease);
+}
+
+/*
+ * What takes the pointer while closed: only what is painted. The box and the wrappers
+ * between it and the rows (session list, stacks, groups) still span the expanded width,
+ * over the page; left to take the pointer, they opened the sidebar from the middle of the
+ * page. So the box passes the pointer through and the painted parts take it back: the
+ * clipped rows below (clip-path clips hit testing too), the backdrop (the rail out to the
+ * window edge, NavHoverPanel), and the floating card / menu the sidebar opens.
+ */
+[data-nav-hover-panel="closed"] {
+	pointer-events: none;
+}
+
+[data-nav-hover-panel="closed"]
+	:is(
+		.mantine-NavLink-root,
+		[data-folder-unit],
+		[data-recent-tab-pin-divider],
+		.nf-nav-status-row,
+		.nf-nav-bottom-bar,
+		.nf-nav-brand,
+		[data-nav-keep-open],
+		[data-nav-pointer],
+		.nf-nav-resize-handle
+	) {
+	pointer-events: auto;
+}
+
+[data-nav-hover-panel="closed"]
+	:is(
+		.mantine-NavLink-root,
+		[data-folder-unit],
+		[data-recent-tab-pin-divider],
+		.nf-nav-status-row,
+		.nf-nav-bottom-bar
+	) {
+	clip-path: inset(0 calc(100% - 40px) 0 0 round var(--mantine-radius-sm));
+}
+
+/*
+ * Controls past the icon column that no clip above covers (the brand row's workspace
+ * button and bell; the bottom bar's icons, for keyboard focus). `visibility`, not
+ * `display`: they keep their place. They fade in once the panel has mostly opened, and
+ * out at once on closing, so they never show over the page past the closing backdrop.
+ */
+.nf-nav-hover-panel .nf-nav-expanded-only {
+	transition:
+		opacity 120ms ease 100ms,
+		visibility 0s linear 100ms;
+}
+
+[data-nav-hover-panel="closed"] .nf-nav-expanded-only {
+	visibility: hidden;
+	opacity: 0;
+	transition:
+		opacity 80ms ease,
+		visibility 0s linear 80ms;
+}
+
+/*
+ * The brand: the name and its attribution line shrink together to fit the column
+ * (NavTopSection measures the scale). A transform, so the row keeps its height; moved
+ * 12px left so it is centred in the column (it starts at x = 20, the column is 0-72).
+ */
+.nf-nav-brand {
+	transform-origin: left center;
+	transition: transform var(--nf-nav-open-duration, 220ms) var(--nf-nav-open-ease, ease);
+}
+
+[data-nav-hover-panel="closed"] .nf-nav-brand {
+	transform: translateX(-12px) scale(var(--nf-nav-brand-scale, 1));
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.nf-nav-hover-panel {
+		--nf-nav-open-duration: 0ms;
+	}
+}
+
+/* Shortcut hints of Search / New session: right after the word, only while the row is hovered. */
+.nf-nav-row-kbd {
+	opacity: 0;
+	transition: opacity 120ms ease;
+}
+
+.mantine-NavLink-root:hover .nf-nav-row-kbd {
+	opacity: 0.75;
+}
+
+/* Sidebar status row (maintenance / update / evidence badges): no gap when empty. */
+.nf-nav-status-row:empty {
+	display: none;
+}
+
+/*
+ * Phone-only elements that cannot use Mantine's `hiddenFrom` (see MobileNavButton).
+ * 48em is Mantine's `sm` breakpoint, the same boundary as everywhere else here.
+ */
+@media (min-width: 48em) {
+	.nf-mobile-only {
+		/* biome-ignore lint/complexity/noImportantStyles: the elements set an inline display, this must win on desktop */
+		display: none !important;
+	}
+}
+
+/*
+ * The sidebar's edge line, in the same 1px and colour as the dividers between dockview
+ * panels, so the rail reads as one more split in the workspace. Mantine's AppShell paints
+ * it with `--app-shell-border-color` (gray-3); dockview's separators use
+ * `--mantine-color-default-border` (see dockview/theme.css), and the two are visibly
+ * different lines side by side.
+ */
+.mantine-AppShell-navbar {
+	border-inline-end-color: var(--mantine-color-default-border);
 }

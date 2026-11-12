@@ -15,29 +15,48 @@
  * parent is shown. Under each shown block, `hidden` counts the blocks of the view below it that
  * were left out; the client offers to focus that block, which reads its subtree with a fresh
  * budget.
+ *
+ * LOCKS, PENDING CHANGES, IN PROGRESS (P2 PR 6)
+ * --------------------------------------------
+ * A locked task carries its lock (who, and the session confirming on their behalf); a block an
+ * open change touches carries the change's id (it waits for confirmation); every shown block
+ * lists the open tasks directly under it (at most {@link OUTLINE_PENDING_API_LIMITS}), the facts
+ * view's "in progress" marker. One indexed read of the page's open changes, the names of the
+ * people and sessions, and the titles of the listed tasks (their content, by version).
  */
 import { ValidationError } from "@server/lib/errors";
 import { titleOf } from "@shared/outline";
-import type {
-	OutlineBlockHistoryResponse,
-	OutlineBlockViewResponse,
-	OutlineChange,
-	OutlineCommitSummary,
-	OutlinePageListResponse,
-	OutlineSpaceSummary,
-	OutlineTimelineResponse,
-	OutlineViewBlock,
-	OutlineViewMode,
+import {
+	OUTLINE_PENDING_API_LIMITS,
+	type OutlineBlockHistoryResponse,
+	type OutlineBlockViewResponse,
+	type OutlineChange,
+	type OutlineCommitSummary,
+	type OutlineInProgressItem,
+	type OutlineLockView,
+	type OutlinePageListResponse,
+	type OutlineQuestionMark,
+	type OutlineSpaceSummary,
+	type OutlineTimelineResponse,
+	type OutlineViewBlock,
+	type OutlineViewMode,
 } from "@shared/outline-api";
+import { isOutlineReportBlockId, isOutlineReportContainer } from "@shared/outline-report-line";
 import type { OutlinePrincipal } from "./access";
 import { readDisplayNames } from "./access-reads";
-import { OUTLINE_CHANGE } from "./model";
+import {
+	OUTLINE_CHANGE,
+	OUTLINE_PENDING_LIMITS,
+	type OutlineAskJson,
+	type OutlineTaskLockJson,
+} from "./model";
 import { loadBodies, loadBodiesWithin, readPageTimeline, readSubtree } from "./read";
 import { clampBudget, type OutlineBudget } from "./render";
+import { readReportAuthors } from "./report-authors";
 import { isOrphanedSpace } from "./spaces";
 import { outlineStore } from "./store";
 import type { OutlineCommitRow, OutlineSpaceRow, OutlineStore } from "./store/port";
-import { effectiveView, type OutlineNode, viewChildren } from "./tree";
+import { effectiveView, isProcessNode, type OutlineNode, viewChildren } from "./tree";
 
 /** Characters of a title in a page list. */
 const TITLE_CHARS = 200;
@@ -146,6 +165,19 @@ export async function listSpacePages(
 
 const OPEN_TASK = new Set(["todo", "doing"]);
 
+/** A task not done or cancelled, or a question not answered or withdrawn: "in progress". */
+function isOpenWork(node: OutlineNode): boolean {
+	if (node.task) return OPEN_TASK.has(node.task.status);
+	return !!node.ask && !node.ask.answer && !node.ask.withdrawn;
+}
+
+function questionMark(ask: OutlineAskJson): OutlineQuestionMark {
+	return {
+		state: ask.withdrawn ? "withdrawn" : ask.answer ? "answered" : "open",
+		proceed: ask.proceed === true,
+	};
+}
+
 function countSubtree(root: OutlineNode): number {
 	let count = 0;
 	const stack = [root];
@@ -164,6 +196,8 @@ export interface OutlineBlockViewRequest {
 	view?: OutlineViewMode;
 	budget?: Partial<OutlineBudget>;
 	store?: OutlineStore;
+	/** Whether the viewer may read a session (locks name it by title only then, review S-5). */
+	narratorVisible?: (narratorId: string) => Promise<boolean>;
 }
 
 export type OutlineBlockView = Omit<OutlineBlockViewResponse, "space">;
@@ -214,6 +248,50 @@ export async function readBlockView(
 	}
 	const shownSet = new Set(shown);
 
+	// The open tasks under each shown block (the "in progress" marker), with their titles.
+	const inProgressOf = new Map<OutlineNode, OutlineNode[]>();
+	const listed: OutlineNode[] = [];
+	for (const node of shown) {
+		const room = IN_PROGRESS_TITLES - listed.length;
+		if (room <= 0) break;
+		const open = node.children.filter(isOpenWork);
+		// Past the titles a view loads, a marker lists what fits (the client says how many more).
+		const take = open.slice(0, Math.min(OUTLINE_PENDING_API_LIMITS.inProgressItems, room));
+		inProgressOf.set(node, take);
+		listed.push(...take);
+	}
+	await loadBodies(state, listed, { store });
+	const pendingRows = state.current
+		? await store.listOpenPendingByPage(state.pageId, OUTLINE_PENDING_LIMITS.openPerPage)
+		: [];
+	// What waits: the blocks a change targets. What is marked: those, and the blocks a change
+	// adds blocks under (review N-3; a proposed step's parent does not wait, decision 20).
+	const pendingOf = new Map<string, string[]>();
+	const markedOf = new Map<string, string[]>();
+	const mark = (map: Map<string, string[]>, id: string, rowId: string) => {
+		const list = map.get(id) ?? [];
+		if (!list.includes(rowId)) map.set(id, [...list, rowId]);
+	};
+	for (const row of pendingRows) {
+		for (const id of row.blockIdsJson) {
+			mark(pendingOf, id, row.id);
+			mark(markedOf, id, row.id);
+		}
+		for (const add of row.addsJson) if (add.parentId) mark(markedOf, add.parentId, row.id);
+	}
+	const locks = await describeLocks(
+		shown.flatMap((node) => (node.task?.lock ? [{ blockId: node.id, lock: node.task.lock }] : [])),
+		{ narratorVisible: request.narratorVisible },
+	);
+
+	// Who wrote each subagent report shown (its container line says it), for a reader who may
+	// read that session.
+	const reportFrom = await readReportAuthors(
+		state.space.id,
+		shown.filter((node) => isOutlineReportBlockId(node.id)),
+		{ narratorVisible: request.narratorVisible, store },
+	);
+
 	let hiddenByView = 0;
 	const blocks: OutlineViewBlock[] = shown.map((node) => {
 		const children = kids.get(node) ?? [];
@@ -226,8 +304,8 @@ export async function readBlockView(
 		let processHidden = 0;
 		let openTasks = 0;
 		for (const child of node.children) {
-			if (child.task && OPEN_TASK.has(child.task.status)) openTasks++;
-			if (view === "facts" && child.task) processHidden += countSubtree(child);
+			if (isOpenWork(child)) openTasks++;
+			if (view === "facts" && isProcessNode(child)) processHidden += countSubtree(child);
 		}
 		return {
 			id: node.id,
@@ -242,17 +320,33 @@ export async function readBlockView(
 						depends: (node.task.depends ?? []).map((d) => d.target),
 					}
 				: null,
+			question: node.ask ? questionMark(node.ask) : null,
 			alias: node.alias,
 			tags: node.tags ?? [],
 			childIds,
 			hidden,
 			processHidden,
 			openTasks,
+			inProgress: (inProgressOf.get(node) ?? []).map(
+				(task): OutlineInProgressItem => ({
+					id: task.id,
+					sid: task.sid,
+					title: shortTitle(task.content ?? ""),
+					status: task.task?.status ?? "todo",
+					assignee: task.task?.assignee ?? null,
+					waiting: pendingOf.has(task.id),
+					...(task.ask ? { question: true } : {}),
+				}),
+			),
+			lock: locks.get(node.id) ?? null,
+			pending: markedOf.get(node.id) ?? [],
+			...(reportFrom.has(node.id) ? { reportFrom: reportFrom.get(node.id) } : {}),
 		};
 	});
 	if (view === "facts") {
 		for (const node of order) {
-			for (const child of node.children) if (child.task) hiddenByView += countSubtree(child);
+			for (const child of node.children)
+				if (isProcessNode(child)) hiddenByView += countSubtree(child);
 		}
 	}
 	return {
@@ -261,6 +355,9 @@ export async function readBlockView(
 		seq: state.seq,
 		current: state.current,
 		view,
+		rootInTask: path.some(
+			(node) => node.task !== null || isOutlineReportContainer(node.id, node.content ?? ""),
+		),
 		path: path.map((node) => ({
 			id: node.id,
 			sid: node.sid,
@@ -272,6 +369,54 @@ export async function readBlockView(
 		pageTruncated: state.truncated,
 		pageBlocks: state.nodes.size,
 	};
+}
+
+/** Titles of listed tasks one view loads at most (the rest of the markers show counts only). */
+const IN_PROGRESS_TITLES = 200;
+
+/**
+ * Locks as the client shows them, with the names of the people and sessions they name: a
+ * session by title only when `narratorVisible` says the viewer may read it (review S-5; without
+ * it, never). `canUnlock` is the caller's to decide (the routes know the person); false here.
+ */
+export async function describeLocks(
+	locks: ReadonlyArray<{ blockId: string; lock: OutlineTaskLockJson }>,
+	options: { narratorVisible?: (narratorId: string) => Promise<boolean> } = {},
+): Promise<Map<string, OutlineLockView>> {
+	const out = new Map<string, OutlineLockView>();
+	if (locks.length === 0) return out;
+	const found = await readDisplayNames({
+		userIds: locks.flatMap((l) => (l.lock.by.kind === "human" ? [l.lock.by.id] : [])),
+		narratorIds: locks.flatMap((l) => [
+			...(l.lock.by.kind === "agent" ? [l.lock.by.id] : []),
+			...(l.lock.delegate ? [l.lock.delegate] : []),
+		]),
+	});
+	const titles = new Map<string, string | null>();
+	for (const [id, title] of found.narrators) {
+		const visible = title !== null && (await options.narratorVisible?.(id)) === true;
+		titles.set(id, visible ? title : null);
+	}
+	const names = { users: found.users, narrators: titles };
+	for (const { blockId, lock } of locks) {
+		out.set(blockId, {
+			blockId,
+			by: {
+				kind: lock.by.kind,
+				id: lock.by.id,
+				name:
+					lock.by.kind === "human"
+						? (names.users.get(lock.by.id) ?? null)
+						: (names.narrators.get(lock.by.id) ?? null),
+			},
+			delegate: lock.delegate
+				? { narratorId: lock.delegate, title: names.narrators.get(lock.delegate) ?? null }
+				: null,
+			versionSeq: lock.versionSeq,
+			canUnlock: false,
+		});
+	}
+	return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

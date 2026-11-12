@@ -30,11 +30,12 @@ for (const [lng, resource] of [
 		interpolation: { escapeValue: false },
 	});
 	const t = (key: string, options?: Record<string, unknown>) => String(i18n.t(key, options));
-	test(`${lng}: zero quota preserves scope, window and real unit with used/total details`, () => {
+	test(`${lng}: zero quota preserves window and real unit, scope lives in the tooltip`, () => {
 		const result = formatProviderBalance(snapshot(), t, false, 1000);
-		expect(result.quotaBalance).toContain(t("providerBalance.key"));
+		expect(result.quotaBalance).not.toContain(t("providerBalance.key"));
 		expect(result.quotaBalance).toContain(`5h: 0 ${t("providerBalance.quotaUnit")}`);
 		expect(result.quotaBalance).not.toContain("USD");
+		expect(result.detailedQuotaBalance).toContain(t("providerBalance.key"));
 		expect(result.detailedQuotaBalance).toContain(
 			t("providerBalance.used", { amount: `2 ${t("providerBalance.quotaUnit")}` }),
 		);
@@ -57,7 +58,7 @@ for (const [lng, resource] of [
 		value.balance.scope = "subscription";
 		value.balance.amounts = [{ unit: "TOKENS", remaining: null }];
 		const result = formatProviderBalance(value, t, false, 1000);
-		expect(result.quotaBalance).toContain(t("providerBalance.subscription"));
+		expect(result.detailedQuotaBalance).toContain(t("providerBalance.subscription"));
 		expect(result.quotaBalance).toContain(t("providerBalance.unknown"));
 		value.balance.amounts[0].remaining = -1;
 		expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toContain(
@@ -110,7 +111,7 @@ for (const [lng, resource] of [
 		expect(result.quotaBalance).not.toContain(t("providerBalance.wallet"));
 		expect(result.detailedQuotaBalance.split("\n")).toEqual([
 			"USD 0",
-			`${t("providerBalance.failed")} · ${t("providerBalance.stale")}`,
+			`${t("providerBalance.errorRequestFailed")} · ${t("providerBalance.stale")}`,
 		]);
 	});
 	test.each([
@@ -148,10 +149,33 @@ for (const [lng, resource] of [
 		value.error = "request_failed";
 		const result = formatProviderBalance(value, t, false, 1000);
 		expect(result.quotaBalance).toContain("5h: 0");
-		expect(result.quotaBalance).toContain(t("providerBalance.failed"));
+		expect(result.quotaBalance).toContain(t("providerBalance.errorRequestFailed"));
 		expect(result.quotaBalance).toContain(t("providerBalance.stale"));
 		expect(formatProviderBalance(snapshot(), t, false, 122_000).quotaBalance).toContain(
 			t("providerBalance.stale"),
+		);
+	});
+	test(`${lng}: each failure code keeps its own fixed label`, () => {
+		const cases = [
+			["request_failed", "providerBalance.errorRequestFailed"],
+			["invalid_configuration", "providerBalance.errorInvalidConfiguration"],
+			["auth_failed", "providerBalance.errorAuth"],
+			["invalid_response", "providerBalance.errorInvalidResponse"],
+			["plugin_not_enabled", "providerBalance.errorPluginNotEnabled"],
+		] as const;
+		for (const [error, key] of cases) {
+			const value = snapshot();
+			value.balance = null;
+			value.status = "error";
+			value.error = error;
+			expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toBe(t(key));
+		}
+		// A failure with no server code falls back to the generic label rather than claiming a
+		// retry can help, since the code (not the transport) decides what is safe to promise.
+		const noCode = snapshot();
+		noCode.balance = null;
+		expect(formatProviderBalance(noCode, t, true, 1000).quotaBalance).toBe(
+			t("providerBalance.failed"),
 		);
 	});
 	test(`${lng}: pending/unsupported and missing balances never show fake zero`, () => {

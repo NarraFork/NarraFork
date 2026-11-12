@@ -34,6 +34,7 @@ import {
 	IconSearch,
 	IconTerminal,
 	IconTextSize,
+	IconTimeline,
 	IconWorldWww,
 } from "@tabler/icons-react";
 import type { ComponentType } from "react";
@@ -158,6 +159,12 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		// Dock only: the panel's whole purpose is being visible BESIDE the transcript
 		// while a slider moves, which a modal drawer over the content cannot provide.
 		hosts: ["dock"],
+	},
+	timeline: {
+		labelKey: "timeline.title",
+		icon: IconTimeline,
+		// Dock panel on desktop; a full-screen drawer on mobile (MobileToolPanelHost).
+		hosts: ["dock", "drawer"],
 	},
 	lodlevel: {
 		labelKey: "lodDensity",

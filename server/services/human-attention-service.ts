@@ -5,6 +5,7 @@ import {
 	type HumanAttentionItem,
 	type HumanAttentionPage,
 } from "@shared/human-attention";
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import { and, eq, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorQuestions, narrators, narratorToolCalls } from "../db/schema";
@@ -64,6 +65,7 @@ export interface HumanAttentionDetail {
 
 type Cursor =
 	| { v: 1; phase: "live"; after: string }
+	| { v: 1; phase: "outline"; after: string }
 	| { v: 1; phase: "questions"; narratorId: string; questionId: string };
 
 function encodeCursor(cursor: Cursor): string {
@@ -81,6 +83,9 @@ function decodeCursor(value?: string): Cursor {
 				if (c.v === 1 && c.phase === "live" && key(c.after)) {
 					return { v: 1, phase: "live", after: c.after };
 				}
+				if (c.v === 1 && c.phase === "outline" && key(c.after)) {
+					return { v: 1, phase: "outline", after: c.after };
+				}
 				if (c.v === 1 && c.phase === "questions" && key(c.narratorId) && key(c.questionId)) {
 					return { v: 1, phase: "questions", narratorId: c.narratorId, questionId: c.questionId };
 				}
@@ -92,11 +97,20 @@ function decodeCursor(value?: string): Cursor {
 	throw new ValidationError("Invalid human attention cursor");
 }
 
-function parseId(id: string): { source: "question" | "permission"; requestId: string } | null {
+function parseId(
+	id: string,
+): { source: "question" | "permission" | "outline"; requestId: string } | null {
 	const match = /^(question|permission):([A-Za-z0-9_-]{1,200})$/.exec(id);
-	return match
-		? { source: match[1] as "question" | "permission", requestId: match[2] as string }
-		: null;
+	if (match)
+		return { source: match[1] as "question" | "permission", requestId: match[2] as string };
+	const outline = /^outline:([qpd]:[A-Za-z0-9_-]{1,200})$/.exec(id);
+	return outline ? { source: "outline", requestId: outline[1] as string } : null;
+}
+
+/** The person's outline rows (questions, changes to confirm, the digest), sorted by id. */
+async function outlineItems(principal: NarratorPrincipal): Promise<HumanAttentionItem[]> {
+	const { listOutlineAttention } = await import("./outline/inbox");
+	return await listOutlineAttention(principal);
 }
 
 const narratorColumns = {
@@ -306,6 +320,13 @@ async function permissionItem(requestId: string, context: RequestContext) {
 		.limit(1)
 		.get();
 	if (!row || !stillLive(requestId, live)) return null;
+	// An outline plan (outline P2 PR 8): its title and the version's changes, locale-neutral.
+	const plan = live.kind === "plan_approval" ? outlinePlanSubmissionOf(live.input) : null;
+	const planSummary = plan
+		? `${plan.root.title} · v${plan.root.round} +${plan.counts.added} ~${
+				plan.counts.text + plan.counts.task + plan.counts.moved
+			} −${plan.counts.removed}`.slice(0, SUMMARY_CHARS)
+		: null;
 	const item: HumanAttentionItem = {
 		...baseItem(owner),
 		id: `permission:${requestId}`,
@@ -317,7 +338,7 @@ async function permissionItem(requestId: string, context: RequestContext) {
 		createdAt: row.createdAt,
 		blocking: true,
 		// Only stored context belongs here; generic labels are localized by the client.
-		summary: row.summary ?? "",
+		summary: planSummary ?? row.summary ?? "",
 	};
 	return { item, live, owner };
 }
@@ -429,6 +450,19 @@ export async function listHumanAttentionForPrincipal(
 					item = row && isAsyncQuestionAwaited(row.id) ? await questionItem(row, context) : null;
 				}
 				if (item) entries.push({ item, cursor });
+				if (entries.length > limit) return finish(true);
+			}
+			cursor = { v: 1, phase: "outline", after: "" };
+		}
+		if (cursor.phase === "outline") {
+			// Bounded reads of the outline (`outline/inbox.ts`), between live gates and async questions.
+			const after = cursor.after;
+			for (const item of await outlineItems(principal)) {
+				context.check();
+				if (item.id <= after) continue;
+				checked++;
+				cursor = { v: 1, phase: "outline", after: item.id };
+				entries.push({ item, cursor });
 				if (entries.length > limit) return finish(true);
 			}
 			cursor = { v: 1, phase: "questions", narratorId: "", questionId: "" };
@@ -668,6 +702,12 @@ export async function getHumanAttentionForPrincipal(
 			if (!found) throw new NotFoundError("Human attention", attentionId);
 			context.check();
 			return await permissionDetail(found.item, found.live, found.owner);
+		}
+		if (parsed.source === "outline") {
+			// The row only: its questions, diff or digest are read from the outline API.
+			const item = (await outlineItems(principal)).find((i) => i.id === attentionId);
+			if (!item) throw new NotFoundError("Human attention", attentionId);
+			return { item };
 		}
 		const row = await readQuestionSummary(parsed.requestId);
 		const item = row ? await questionItem(row, context) : null;

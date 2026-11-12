@@ -1,5 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import { getTestDb } from "../../../../tests/setup";
 import { setNugCachedModels } from "../../nug-model-cache";
@@ -30,7 +31,12 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
 	// The unified import graph initializes durable runtime tables. Keep it isolated
 	// but complete, rather than an empty schema handle with a stale module contract.
 	const { db, sqlite } = getTestDb();
-	mock.module("../../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+	mock.module("../../../db", () => ({
+		db,
+		sqlite,
+		activeDatabaseBackend: "sqlite",
+		databaseMaintenance: createSqliteMaintenance(() => sqlite),
+	}));
 	const { buildHistory } = await import("../index");
 	afterAll(() => sqlite.close());
 

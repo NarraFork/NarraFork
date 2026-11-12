@@ -3,6 +3,10 @@
  * scoped under `.nf-outline-editor`. Mobile first: indentation and the frame shrink when the
  * editor is narrow (a phone, or a dock panel: a container query on the editor's own width), and
  * nothing may widen it past its container.
+ *
+ * Text uses the conversation's typography (外观 · 排版) through the `--nf-type-*` variables
+ * (frontend/lib/typography-css-vars.ts): body, headings, inline code, code blocks and meta
+ * text each take the conversation's value for that role, and move with its sliders.
  */
 .nf-outline-editor {
 	--ob-line: var(--mantine-color-default-border);
@@ -20,6 +24,39 @@
 	margin-bottom: 4px;
 }
 
+/*
+ * An agent at work on the page (P2 PR 10b): its session's first letter with a small robot at the
+ * corner, or a robot alone for someone who may not read the session.
+ */
+.nf-outline-agent-avatar {
+	position: relative;
+	overflow: visible;
+	text-decoration: none;
+}
+
+.nf-outline-agent-avatar .mantine-Avatar-placeholder {
+	background: transparent;
+	color: inherit;
+}
+
+.nf-outline-agent-initial {
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1;
+}
+
+/* Bottom left: the next avatar of the group overlaps this one's right side. */
+.nf-outline-agent-badge {
+	position: absolute;
+	left: -4px;
+	bottom: -4px;
+	padding: 1px;
+	border-radius: 50%;
+	background: var(--mantine-color-body);
+	color: var(--mantine-color-text);
+	box-shadow: 0 0 0 1px var(--mantine-color-default-border);
+}
+
 .nf-outline-editor-host {
 	min-width: 0;
 	overflow-wrap: anywhere;
@@ -31,7 +68,13 @@
 	word-wrap: break-word;
 	min-height: 40px;
 	padding-left: 18px;
-	line-height: 1.55;
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+}
+
+/* An em fraction of each element's own size, as the conversation applies it per run. */
+:where(.nf-outline-editor .ProseMirror, .nf-outline-editor .ProseMirror *) {
+	letter-spacing: var(--nf-type-letter-spacing);
 }
 
 .nf-outline-editor .ProseMirror[contenteditable="false"] {
@@ -57,87 +100,370 @@
 .nf-outline-editor .ob-content pre,
 .nf-outline-editor .ob-content table {
 	margin: 0;
-	min-height: 1.55em;
+	min-height: 1lh;
 }
 
-/* The frame: folding arrow (left of the bullet), bullet (focus), checkbox. */
+/*
+ * The frame: the folding arrow, then ONE marker: the bullet (which focuses the block), or a
+ * task's checkbox, or a question's mark (`rowMarker`). Headings inside blocks are body size
+ * (below), so every frame sits on the body line box.
+ */
 .nf-outline-editor .ob-gutter {
 	position: absolute;
 	left: -16px;
 	top: 0;
 	width: 38px;
-	height: 1.55em;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 	user-select: none;
 }
 
+/*
+ * The frame's icons are the read-only tree's (`../outline-icons.ts`, sized by `outline-icons.css`):
+ * Tabler chevrons and checkboxes as inline SVG in `currentColor`, the bullet a CSS dot. Each part
+ * is as tall as the gutter, i.e. the first line box, and centres its icon on it; the SVG never
+ * takes the pointer, so a click's target is always the part itself. No `:hover` styles on these
+ * parts: Chromium's touch adjustment retargets a nearby long press to an element with one.
+ */
+.nf-outline-editor .ob-arrow,
+.nf-outline-editor .ob-bullet,
+.nf-outline-editor .ob-check,
+.nf-outline-editor .ob-zoom {
+	flex: none;
+	align-self: stretch;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+}
+
+.nf-outline-editor .ob-gutter svg,
+.nf-outline-editor .ob-zoom svg {
+	flex: none;
+	display: block;
+	pointer-events: none;
+}
+
 .nf-outline-editor .ob-arrow {
 	width: 16px;
-	flex: none;
-	text-align: center;
-	cursor: pointer;
 	color: var(--ob-muted);
-	font-size: 11px;
 }
 
-.nf-outline-editor .has-kids > .ob-gutter .ob-arrow::before {
-	content: "▾";
-}
-
-.nf-outline-editor .collapsed > .ob-gutter .ob-arrow::before {
-	content: "▸";
+.nf-outline-editor .ob-arrow svg {
+	width: var(--nf-outline-chevron);
+	height: var(--nf-outline-chevron);
 }
 
 .nf-outline-editor .ob-bullet {
 	width: 22px;
-	flex: none;
-	text-align: center;
-	cursor: pointer;
 	color: var(--ob-muted);
 }
 
 .nf-outline-editor .ob-bullet::before {
-	content: "•";
+	content: "";
+	flex: none;
+	width: var(--nf-outline-dot);
+	height: var(--nf-outline-dot);
+	border-radius: 50%;
+	background: currentColor;
 }
 
+/* Folded with children: the dot keeps a halo, as outliners mark a block that hides more. */
 .nf-outline-editor .collapsed > .ob-gutter .ob-bullet::before {
-	content: "◉";
+	box-shadow: 0 0 0 min(3px, calc(var(--nf-outline-dot) / 2))
+		color-mix(in srgb, currentColor 30%, transparent);
 }
 
 .nf-outline-editor .ob-block.collapsed > .ob-content > .ob-children {
 	display: none;
 }
 
-.nf-outline-editor .ob-block[data-task]:not([data-task=""]) {
-	padding-left: 40px;
+/*
+ * A task or a question: the checkbox (or the question's mark) stands where the bullet does on
+ * other rows, and its text starts in the same column as theirs (`--ob-indent`: 22px, 18px when
+ * the editor is narrow), the mark keeping at least 2px before the text. The mark sits 4px before
+ * the text where the column has that room.
+ */
+.nf-outline-editor .ob-block[data-task]:not([data-task=""]),
+.nf-outline-editor .ob-block[data-question="1"] {
+	--ob-check-pad: max(var(--ob-indent), calc(var(--nf-outline-icon) + 2px));
+	--ob-check-lead: max(0px, calc(var(--ob-check-pad) - var(--nf-outline-icon) - 4px));
+	padding-left: var(--ob-check-pad);
 }
 
-.nf-outline-editor .ob-block[data-task]:not([data-task=""]) > .ob-gutter {
-	width: 56px;
+.nf-outline-editor .ob-block[data-task]:not([data-task=""]) > .ob-gutter,
+.nf-outline-editor .ob-block[data-question="1"] > .ob-gutter {
+	width: calc(16px + var(--ob-check-pad));
 }
 
+/* In the mind map (`mindmap.css`) the checkbox's column is its icon and the 4px after it. */
 .nf-outline-editor .ob-check {
-	width: 18px;
-	flex: none;
+	width: var(--ob-check-pad, calc(var(--nf-outline-icon) + 4px));
+	padding-left: var(--ob-check-lead, 0px);
+	box-sizing: border-box;
+	justify-content: flex-start;
+}
+
+/*
+ * The focus handle of a row without a bullet: floated to the end of the first line, always drawn
+ * (touch has no hover). It takes the first line's end only; later lines run full width.
+ */
+.nf-outline-editor .ob-zoom {
+	float: right;
+	align-self: auto;
+	width: 20px;
+	height: var(--nf-type-body-line);
+	margin-left: 4px;
+	/* The only pointer and touch route to focusing a task: 3:1 or more against the page in both
+	   schemes (the muted colour as it is, no opacity over it). */
+	color: var(--ob-muted);
+	user-select: none;
+}
+
+/*
+ * A body that is one box (a code block, a table) would be narrowed whole by a float beside it:
+ * there the handle sits over the box's top right corner and takes no room.
+ */
+.nf-outline-editor .ob-block:has(> .ob-content > :is(pre, table):first-child) > .ob-zoom {
+	float: none;
+	position: absolute;
+	right: 0;
+	top: 0;
+	z-index: 1;
+}
+
+.nf-outline-editor .ob-zoom svg {
+	width: var(--nf-outline-chevron);
+	height: var(--nf-outline-chevron);
+}
+
+/*
+ * The row's quick control (everything inside it: expand, or back to the default view): floated
+ * to the end of the first line beside the focus handle, always drawn (touch has no hover). No
+ * `:hover` style, as on the other frame parts.
+ */
+.nf-outline-editor .ob-subtree {
+	float: right;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 20px;
+	height: var(--nf-type-body-line);
+	margin-left: 4px;
+	color: var(--ob-muted);
 	cursor: pointer;
+	user-select: none;
+	border-radius: 4px;
+}
+
+.nf-outline-editor .ob-subtree svg {
+	flex: none;
+	display: block;
+	width: var(--nf-outline-chevron);
+	height: var(--nf-outline-chevron);
+	pointer-events: none;
+}
+
+/*
+ * Beside a body that is one box (see `.ob-zoom` above): over its corner, left of the handle. The
+ * frame marks such a block itself (`data-box`): a second `:has()` rule over every block costs a
+ * style pass on each structural edit of a large page.
+ */
+.nf-outline-editor .ob-block[data-box] > .ob-subtree {
+	float: none;
+	position: absolute;
+	right: 24px;
+	top: 0;
+	z-index: 1;
+}
+
+/*
+ * What a closed block holds, as ONE line in its children's place: the first line of its first
+ * block, cut with an ellipsis, and how much more there is. Frame DOM (not part of the document):
+ * nothing to select or type into; a click opens everything inside the block.
+ */
+.nf-outline-editor .ob-preview {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+	clear: both;
+	white-space: nowrap;
+	color: var(--ob-muted);
+	cursor: pointer;
+	user-select: none;
+	border-radius: 4px;
+}
+
+.nf-outline-editor .ob-preview-text {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.nf-outline-editor .ob-preview-label {
+	flex: none;
+	color: var(--mantine-color-anchor);
+}
+
+/* The folding controls take focus from assistive technology and scripts, never from Tab. */
+.nf-outline-editor :is(.ob-arrow, .ob-subtree, .ob-preview):focus-visible {
+	outline: 2px solid var(--ob-accent);
+	outline-offset: 1px;
+}
+
+/*
+ * What a closed block hides that must not be missed: each kind's icon (the states' badges, the
+ * question's mark) and how many, among the block's own marks.
+ */
+.nf-outline-editor .ob-fold-hidden {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	color: var(--ob-muted);
+	font-variant-numeric: tabular-nums;
+	user-select: none;
+}
+
+.nf-outline-editor .ob-fold-hidden svg {
+	flex: none;
+	width: 14px;
+	height: 14px;
+}
+
+.nf-outline-editor .ob-fold-hidden[role="button"] {
+	cursor: pointer;
+	border-radius: 4px;
+}
+
+.nf-outline-editor .ob-fold-hidden[role="button"]:focus-visible {
+	outline: 2px solid var(--ob-accent);
+	outline-offset: 1px;
+}
+
+.nf-outline-editor .ob-fold-hidden[data-kind="question"] svg {
+	color: var(--mantine-color-teal-text);
+}
+
+.nf-outline-editor .ob-check svg {
+	width: var(--nf-outline-icon);
+	height: var(--nf-outline-icon);
+}
+
+/* A question put to a person (`Ask`): marked where a task has its checkbox, not clickable. */
+.nf-outline-editor .ob-check.is-question {
+	cursor: help;
+	color: var(--mantine-color-teal-text);
 }
 
 .nf-outline-editor .ob-peers {
 	display: none;
 }
 
+/* What the facts view leaves out under a block (design §3.1): how many blocks under tasks. */
 .nf-outline-editor .ob-hidden {
 	position: absolute;
 	right: 0;
 	top: 0.15em;
 	font-size: 11px;
-	color: var(--ob-muted);
 	border: 1px solid var(--ob-line);
 	border-radius: 8px;
 	padding: 0 5px;
 	user-select: none;
-	pointer-events: none;
+	color: var(--ob-muted);
+	z-index: 1;
+}
+
+/* Open tasks under the block: the marker opens their list. */
+.nf-outline-editor .ob-hidden[data-open] {
+	color: var(--mantine-color-yellow-text, var(--ob-muted));
+	cursor: pointer;
+}
+
+.nf-outline-editor .ob-task-list {
+	position: absolute;
+	right: 0;
+	top: 1.6em;
+	z-index: 3;
+	min-width: 180px;
+	max-width: min(360px, 90vw);
+	padding: 4px;
+	border: 1px solid var(--ob-line);
+	border-radius: 6px;
+	background: var(--mantine-color-body);
+	box-shadow: var(--mantine-shadow-sm);
+	font-size: var(--nf-type-xs-size);
+	line-height: var(--nf-type-xs-line);
+	user-select: none;
+}
+
+.nf-outline-editor .ob-task-item {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 2px 6px;
+	border-radius: 4px;
+	cursor: pointer;
+}
+
+/* The task's checkbox at the frame's size (`--nf-outline-icon`: body + 2), not the list's xs. */
+.nf-outline-editor .ob-task-icon {
+	flex: none;
+	display: flex;
+}
+
+.nf-outline-editor .ob-task-icon svg {
+	width: var(--nf-outline-icon);
+	height: var(--nf-outline-icon);
+}
+
+.nf-outline-editor .ob-task-title {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.nf-outline-editor .ob-task-item:hover {
+	background: var(--mantine-color-default-hover);
+}
+
+/* A locked plan's root and blocks a pending change touches (P2 PR 6). */
+.nf-outline-editor .ob-marks {
+	float: right;
+	display: inline-flex;
+	gap: 4px;
+	margin-left: 6px;
+	font-size: 11px;
+	user-select: none;
+}
+
+.nf-outline-editor .ob-lock,
+.nf-outline-editor .ob-pending {
+	border-radius: 8px;
+	padding: 0 6px;
+	white-space: nowrap;
+}
+
+.nf-outline-editor .ob-lock {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	color: var(--mantine-color-indigo-text);
+	background: var(--mantine-color-indigo-light);
+}
+
+.nf-outline-editor .ob-lock svg {
+	flex: none;
+	width: 10px;
+	height: 10px;
+}
+
+.nf-outline-editor .ob-pending {
+	color: var(--mantine-color-orange-text);
+	background: var(--mantine-color-orange-light);
 }
 
 /* The focused block is the root: its first line is the title. */
@@ -145,12 +471,15 @@
 	padding-left: 0;
 }
 
-.nf-outline-editor .ProseMirror > .ob-block > .ob-gutter {
+.nf-outline-editor .ProseMirror > .ob-block > .ob-gutter,
+.nf-outline-editor .ProseMirror > .ob-block > .ob-zoom {
 	display: none;
 }
 
+/* The page title: the conversation's h3, as the read-only tree's `Title order={3}`. */
 .nf-outline-editor .ProseMirror > .ob-block > .ob-content > :first-child {
-	font-size: 1.5em;
+	font-size: var(--nf-type-h3-size);
+	line-height: var(--nf-type-h3-line);
 	font-weight: 700;
 	margin-bottom: 6px;
 }
@@ -165,21 +494,40 @@
 	display: none;
 }
 
-.nf-outline-editor .ob-block[data-task="x"] > .ob-content > p {
+/* Done or cancelled: the body is struck through and muted, as in the read-only tree. */
+.nf-outline-editor .ob-block:is([data-task="x"], [data-task="-"])
+	> .ob-content
+	> :not(.ob-children) {
 	color: var(--ob-muted);
 	text-decoration: line-through;
 }
 
-.nf-outline-editor .ob-content h1 {
-	font-size: 1.5em;
+/*
+ * A heading inside a block is body text in bold: the page title (above) is the largest text on
+ * the page, and a heading under a task never outgrows the task's title.
+ */
+.nf-outline-editor .ob-content :is(h1, h2, h3) {
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+	font-weight: 700;
 }
 
-.nf-outline-editor .ob-content h2 {
-	font-size: 1.25em;
+/*
+ * A subagent report's container line (`view.ts` → `reportLineDecorations`): the stored text stays in the document
+ * and is hidden while the cursor is elsewhere; the widget before it says the same in the reader's
+ * language and time zone. With the cursor in the block the stored text shows as it is.
+ */
+.nf-outline-editor .ob-block:not(.ob-here) > .ob-content > .ob-report-line::before {
+	content: attr(data-report-label);
 }
 
-.nf-outline-editor .ob-content h3 {
-	font-size: 1.1em;
+.nf-outline-editor .ob-block:not(.ob-here) > .ob-content > .ob-report-line > .ob-report-raw {
+	display: inline-block;
+	width: 0;
+	height: 0;
+	overflow: hidden;
+	vertical-align: top;
+	white-space: nowrap;
 }
 
 .nf-outline-editor .ob-content blockquote {
@@ -192,7 +540,9 @@
 	background: var(--ob-code-bg);
 	padding: 4px 8px;
 	border-radius: 4px;
-	font: 13px / 1.5 var(--mantine-font-family-monospace);
+	font:
+		var(--nf-type-code-block-size) / var(--nf-type-code-block-line)
+		var(--mantine-font-family-monospace);
 	overflow-x: auto;
 	white-space: pre;
 }
@@ -202,7 +552,12 @@
 	border-radius: 3px;
 	padding: 0 3px;
 	font-family: var(--mantine-font-family-monospace);
-	font-size: 0.9em;
+	font-size: var(--nf-type-code-size);
+	/* No line box of its own: an inherited px line box on a smaller mono font sits lower on
+	   the baseline and grows the line (the mind map measures lines at the body line box), and
+	   even 1 sticks out at the lowest line-height setting. The background still paints the
+	   glyphs' own box. */
+	line-height: 0;
 }
 
 .nf-outline-editor .ob-content pre code {
@@ -246,7 +601,7 @@
 }
 
 .nf-outline-editor .ob-embed-head {
-	font-size: 11px;
+	font-size: var(--nf-type-xs-size);
 	color: var(--ob-muted);
 }
 

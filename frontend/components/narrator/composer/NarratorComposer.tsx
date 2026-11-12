@@ -36,6 +36,7 @@ import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
+import { enterOwnedByTarget } from "../interaction/enter-ownership";
 import type { AskSelectionInput } from "../interaction/use-ask-selection-in-passing";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
@@ -188,11 +189,12 @@ export interface NarratorComposerProps {
 	onPasteImages?: (files: File[]) => void;
 	attachedImages?: File[];
 	attachedTextFiles?: File[];
+	attachedMedia?: File[];
 	attachmentsHydrating?: boolean;
 	attachmentsRestoreFailed?: boolean;
 	onRetryAttachments?: () => void;
 	restoredAttachmentResources?: ReadonlyMap<string, File>;
-	onAttachmentsChange?: (images: File[], textFiles: File[]) => void;
+	onAttachmentsChange?: (images: File[], textFiles: File[], media: File[]) => void;
 	onDocumentAssetsChange?: (ids: readonly string[]) => void;
 	controls?: React.ReactNode;
 	actions?: React.ReactNode;
@@ -247,6 +249,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			onPasteImages,
 			attachedImages = EMPTY_FILES,
 			attachedTextFiles = EMPTY_FILES,
+			attachedMedia = EMPTY_FILES,
 			attachmentsHydrating = false,
 			attachmentsRestoreFailed = false,
 			onRetryAttachments,
@@ -421,7 +424,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		// They are not live attachments and never drive legacy adoption or persistence by themselves.
 		for (const [id, file] of restoredAttachmentResources ?? [])
 			if (!resourceCacheRef.current.has(id)) resourceCacheRef.current.set(id, file);
-		for (const file of [...attachedImages, ...attachedTextFiles])
+		for (const file of [...attachedImages, ...attachedTextFiles, ...attachedMedia])
 			resourceCacheRef.current.set(getComposerAssetId(file), file);
 		const resources = new Map(resourceCacheRef.current);
 		const documentRef = useRef(document);
@@ -451,11 +454,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const attachmentStateRef = useRef({
 			images: attachedImages,
 			textFiles: attachedTextFiles,
+			media: attachedMedia,
 			onChange: onAttachmentsChange,
 		});
 		attachmentStateRef.current = {
 			images: attachedImages,
 			textFiles: attachedTextFiles,
+			media: attachedMedia,
 			onChange: onAttachmentsChange,
 		};
 		// null until the user is known: recall is keyed per `(user, narrator)`, and a
@@ -538,11 +543,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					const current = attachmentStateRef.current;
 					const images = current.images.filter((file) => keep.has(getComposerAssetId(file)));
 					const textFiles = current.textFiles.filter((file) => keep.has(getComposerAssetId(file)));
+					const media = current.media.filter((file) => keep.has(getComposerAssetId(file)));
 					if (
 						images.length !== current.images.length ||
-						textFiles.length !== current.textFiles.length
+						textFiles.length !== current.textFiles.length ||
+						media.length !== current.media.length
 					)
-						current.onChange?.(images, textFiles);
+						current.onChange?.(images, textFiles, media);
 				}
 			},
 			[restoreInput, declareDocumentAssets],
@@ -597,14 +604,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			});
 			const images = files.filter((item) => item.kind === "image").map((item) => item.file);
 			const textFiles = files.filter((item) => item.kind === "textFile").map((item) => item.file);
+			const media = files
+				.filter((item) => item.kind === "audio" || item.kind === "video")
+				.map((item) => item.file);
 			const previous = attachmentStateRef.current;
 			if (
 				images.length !== previous.images.length ||
 				textFiles.length !== previous.textFiles.length ||
+				media.length !== previous.media.length ||
 				images.some((file, index) => file !== previous.images[index]) ||
-				textFiles.some((file, index) => file !== previous.textFiles[index])
+				textFiles.some((file, index) => file !== previous.textFiles[index]) ||
+				media.some((file, index) => file !== previous.media[index])
 			)
-				previous.onChange?.(images, textFiles);
+				previous.onChange?.(images, textFiles, media);
 		}, []);
 		const applyDocument = useCallback(
 			(next: ComposerDocument) => {
@@ -657,7 +669,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 				const assets = composerAssetsFromFiles(
 					files.filter((file) => file.type.startsWith("image/")),
-					files.filter((file) => !file.type.startsWith("image/")),
+					files.filter(
+						(file) =>
+							!file.type.startsWith("image/") &&
+							!file.type.startsWith("audio/") &&
+							!file.type.startsWith("video/"),
+					),
+					files.filter((file) => file.type.startsWith("audio/") || file.type.startsWith("video/")),
 				);
 				for (const file of files) resourceCacheRef.current.set(getComposerAssetId(file), file);
 				const nodes: ComposerInlineNode[] = files.map((file) => ({
@@ -695,7 +713,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				if (sendingRef.current) return;
 				const current = documentRef.current;
 				const known = new Set(current.assets.map((asset) => asset.id));
-				const fresh = composerAssetsFromFiles(attachedImages, attachedTextFiles).filter(
+				const fresh = composerAssetsFromFiles(
+					attachedImages,
+					attachedTextFiles,
+					attachedMedia,
+				).filter(
 					(asset) =>
 						!known.has(asset.id) &&
 						(!authoritativeAssetsRef.current || authoritativeAssetsRef.current.has(asset.id)),
@@ -737,7 +759,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			return () => {
 				cancelled = true;
 			};
-		}, [attachedImages, attachedTextFiles, applyInput, sendingRef]);
+		}, [attachedImages, attachedTextFiles, attachedMedia, applyInput, sendingRef]);
 
 		// Prompt optimization hook
 		const optimizeHook = usePromptOptimize({
@@ -881,7 +903,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			restoreInput("", []);
 			declareDocumentAssets([]);
 			releaseUnusedResources();
-			attachmentStateRef.current.onChange?.([], []);
+			attachmentStateRef.current.onChange?.([], [], []);
 			if (draftSyncState === "ready") void syncDraftNow("", [], null).catch(() => {});
 		}, [draftSyncState, syncDraftNow, restoreInput, releaseUnusedResources, declareDocumentAssets]);
 
@@ -1618,13 +1640,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				)
 					return;
 				const target = e.target instanceof Element ? e.target : null;
-				if (
-					target?.closest(
-						'input, textarea, select, button, a[href], summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="menu"], [role="listbox"], [role="dialog"], [role="alertdialog"], .xterm',
-					) ||
-					doc.querySelector('[aria-modal="true"]')
-				)
-					return;
+				// The same rule as the waiting permission's Enter shortcut (`enter-ownership.ts`).
+				if (enterOwnedByTarget(target, doc)) return;
 				const panel = textarea.closest("[data-narrator-panel]");
 				if (target && target !== doc.body && target !== doc.documentElement) {
 					if (!panel?.contains(target)) return;
@@ -1822,6 +1839,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						key={`${attachmentPreviewScope}:${activeAttachmentPreview.asset.id}`}
 						file={resourceCacheRef.current.get(activeAttachmentPreview.asset.id)}
 						name={activeAttachmentPreview.asset.name}
+						mediaKind={
+							activeAttachmentPreview.asset.kind === "audio" ||
+							activeAttachmentPreview.asset.kind === "video"
+								? activeAttachmentPreview.asset.kind
+								: undefined
+						}
 						onClose={() => setAttachmentPreview(null)}
 					/>
 				)}
@@ -1943,7 +1966,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onOpenQuote={setQuoteDetail}
 					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
 					onOpenAttachment={(asset) => {
-						if (asset.kind !== "textFile") return;
+						if (asset.kind === "image") return;
 						setAttachmentPreview({ scope: attachmentPreviewScope, asset });
 					}}
 					onOpenImage={(asset) => {

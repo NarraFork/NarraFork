@@ -64,7 +64,7 @@ export type RenderSegment =
 
 function isVisibleContentBlock(b: ContentBlock): boolean {
 	if (b.type === "text") return !!b.text?.trim();
-	if (b.type === "image") return true;
+	if (b.type === "image" || b.type === "audio" || b.type === "video") return true;
 	if (b.type === "text_file" || b.type === "file_reference") return true;
 	if (b.type === "web_search") return true;
 	if (b.type === "image_generation") return true;
@@ -239,6 +239,8 @@ function sameRows(left: readonly NarratorMsg[], right: readonly NarratorMsg[]): 
 // ---------------------------------------------------------------------------
 
 export interface SegmentOptions {
+	/** New-mode-only source lane preservation; absent keeps the old segmentation. */
+	compactAuxiliaryContent?: boolean;
 	streamingMsg?: NarratorMsg | null;
 	cache?: MessageSegmentationCache;
 }
@@ -254,6 +256,7 @@ type MessageMaterials = {
 };
 
 type CachedMessageMaterials = {
+	compactAuxiliaryContent: boolean;
 	msg: NarratorMsg;
 	role: NarratorMsg["role"];
 	body: readonly unknown[];
@@ -312,10 +315,15 @@ export class MessageSegmentationCache {
 	}
 
 	/** Internal to segmentMessages; exposed for coordinator-independent ownership. */
-	getMaterials(msg: NarratorMsg, nestedRows: readonly NarratorMsg[] = NO_ROWS): MessageMaterials {
+	getMaterials(
+		msg: NarratorMsg,
+		nestedRows: readonly NarratorMsg[] = NO_ROWS,
+		compactAuxiliaryContent = false,
+	): MessageMaterials {
 		const entry = this.entries.get(msg.id);
 		if (
 			entry &&
+			entry.compactAuxiliaryContent === compactAuxiliaryContent &&
 			entry.msg === msg &&
 			entry.role === msg.role &&
 			entry.body === messageBody(msg) &&
@@ -328,13 +336,14 @@ export class MessageSegmentationCache {
 		// A same-id replacement must release the previous version even if the new
 		// materials exceed the budget and therefore cannot be retained.
 		this.invalidate(msg.id);
-		const materials = buildMessageMaterials(msg, nestedRows);
+		const materials = buildMessageMaterials(msg, nestedRows, compactAuxiliaryContent);
 		if (
 			msg.id !== "__streaming__" &&
 			this.entries.size < this.maxMessages &&
 			this.retainedAtoms + materials.atoms.length <= this.maxAtoms
 		) {
 			this.entries.set(msg.id, {
+				compactAuxiliaryContent,
 				msg,
 				role: msg.role,
 				body: messageBody(msg),
@@ -357,8 +366,11 @@ export class MessageSegmentationCache {
 
 type VisualLane = "content" | "tool";
 
-function classifyBlock(b: ContentBlock): VisualLane | null {
+function classifyBlock(b: ContentBlock, compactAuxiliaryContent: boolean): VisualLane | null {
 	if (b.type === "tool_use") return "tool";
+	// Keep the physical context lane before the grouper classifies mixed messages.
+	if (compactAuxiliaryContent && (b.type === "system_injection" || b.type === "knowledge_hint"))
+		return "content";
 	if (isVisibleContentBlock(b)) return "content";
 	return null;
 }
@@ -371,6 +383,7 @@ function isEpochMarker(msg: NarratorMsg): boolean {
 function buildMessageMaterials(
 	msg: NarratorMsg,
 	nestedRows: readonly NarratorMsg[] = NO_ROWS,
+	compactAuxiliaryContent = false,
 ): MessageMaterials {
 	const atoms: MessageAtom[] = [];
 	const materials: MessageMaterials = { atoms, toolCalls: [] };
@@ -385,7 +398,7 @@ function buildMessageMaterials(
 	const blocks = messageBody(msg);
 	let hasTools = false;
 	for (let bi = 0; bi < blocks.length; bi++) {
-		const lane = classifyBlock(blocks[bi]);
+		const lane = classifyBlock(blocks[bi], compactAuxiliaryContent);
 		if (lane === "content") atoms.push({ lane: "content", msg, blockIndex: bi });
 		else if (lane === "tool") {
 			atoms.push({ lane: "tool", msg, blockIndex: bi });
@@ -428,6 +441,7 @@ export function segmentMessages(
 	opts: SegmentOptions = {},
 ): RenderSegment[] {
 	const { streamingMsg, cache } = opts;
+	const compactAuxiliaryContent = opts.compactAuxiliaryContent === true;
 
 	const effectiveMessages = streamingMsg != null ? [...messages, streamingMsg] : messages;
 	const nestedByParent = nestedRowsByParent(messages);
@@ -437,8 +451,8 @@ export function segmentMessages(
 		if (isNestedRow(msg)) continue;
 		const nestedRows = nestedByParent.get(msg.id) ?? NO_ROWS;
 		const materials = cache
-			? cache.getMaterials(msg, nestedRows)
-			: buildMessageMaterials(msg, nestedRows);
+			? cache.getMaterials(msg, nestedRows, compactAuxiliaryContent)
+			: buildMessageMaterials(msg, nestedRows, compactAuxiliaryContent);
 		// Do not spread arbitrarily large block lists into a function call.
 		for (const atom of materials.atoms) atoms.push(atom);
 	}
@@ -579,6 +593,8 @@ export type StreamingBlock =
 			type: "image_generation";
 			id: string;
 			status: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			partialImageIndex?: number;
@@ -636,6 +652,8 @@ export interface StreamingWebSearchUpdate {
 export interface StreamingImageGenerationUpdate {
 	id: string;
 	status: string;
+	error?: string;
+	errorCode?: string;
 	revisedPrompt?: string;
 	result?: string;
 	partialImageIndex?: number;
@@ -702,6 +720,8 @@ export function upsertStreamingImageGenerationBlock(
 		id: update.id,
 		status: update.status,
 	};
+	if (update.error !== undefined) next.error = update.error;
+	if (update.errorCode !== undefined) next.errorCode = update.errorCode;
 	if (update.revisedPrompt !== undefined) next.revisedPrompt = update.revisedPrompt;
 	if (update.result !== undefined) next.result = update.result;
 	if (update.partialImageIndex !== undefined) next.partialImageIndex = update.partialImageIndex;
@@ -864,6 +884,8 @@ export function buildStreamingMsg(opts: {
 					type: "image_generation",
 					id: sb.id,
 					status: sb.status,
+					error: sb.error,
+					errorCode: sb.errorCode,
 					revisedPrompt: sb.revisedPrompt,
 					result: sb.result,
 					partialImageIndex: sb.partialImageIndex,

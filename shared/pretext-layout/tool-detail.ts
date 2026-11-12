@@ -14,11 +14,19 @@
  */
 
 import { toolOutputImages } from "../agent-protocol/tool-output";
-import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
+import { GEN_UI_ENTRY, type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
 import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
 import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
-import { outlineAddressPath, outlineCommitPath } from "../outline-links";
+import { outlineAddressPath } from "../outline-links";
+import { isOutlinePlanInput } from "../outline-plan-submission";
+import {
+	DEFAULT_PLAN_TREE_VIEW,
+	type PlanTree,
+	type PlanTreeView,
+	parsePlanTree,
+} from "../outline-plan-tree";
+import { readOutlineAskDisplay, readOutlineEditDisplay } from "../outline-tool-display";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -44,6 +52,17 @@ import {
 	type DiffSourcePoint,
 	MAX_DIFF_INPUT_CHARS,
 } from "./diff-core";
+import type { InjectionTarget } from "./injection-target";
+import {
+	isOutlineDecisionCall,
+	OUTLINE_CARD_LABEL_FALLBACKS,
+	outlineAskRows,
+	outlineCommitLink,
+	outlineDecisionRows,
+	outlineEditRows,
+	outlineLegacyEditRows,
+	outlineSpaceChips,
+} from "./outline-tool-card";
 import {
 	createSourceText,
 	isSourceTextRange,
@@ -283,7 +302,96 @@ export interface ToolStructuredBadge {
 	label: string;
 	/** Mantine colour name (defaults to a neutral tint in the render layer). */
 	color?: string;
+	/**
+	 * Painted exactly as written. A Mantine badge upper-cases its label, which turns a
+	 * case-sensitive id or alias (`MTBXwl1Y`) into a different one (`MTBXWL1Y`).
+	 */
+	verbatim?: boolean;
+	/**
+	 * A long label (a project's name) that gives way on a narrow row: truncated, its full text on
+	 * hover, so the chips after it stay on the row's one reserved line. Height-neutral.
+	 */
+	clip?: boolean;
 }
+
+/** A glyph that leads a change row (render-only, a fixed slot). */
+export type ToolChangeGlyph =
+	| "status"
+	| "done"
+	| "add"
+	| "child"
+	| "move"
+	| "edit"
+	| "delete"
+	| "assign"
+	| "alias"
+	| "pending"
+	| "confirm"
+	| "reject"
+	| "question"
+	| "withdraw"
+	| "answer"
+	| "failed"
+	| "more";
+
+/** One piece of a change row: words, a link, or a chip. All of it is height-neutral. */
+export type ToolChangePart =
+	| { kind: "text"; text: string; tone?: "dim" | "red" }
+	/** A link's text gives way first when the row is too narrow (truncated, its tip on hover). */
+	| { kind: "link"; text: string; href?: string; tip?: string }
+	| { kind: "chip"; label: string; color: string; verbatim?: boolean };
+
+/** One line of a change list: what one step of a tool call did. */
+export interface ToolChangeRow {
+	glyph?: ToolChangeGlyph;
+	tone?: "red" | "dim";
+	/** 0 for a change, 1 for what it created under it. */
+	indent?: 0 | 1;
+	parts: ToolChangePart[];
+}
+
+/** Rows a change list draws at most (the producer counts the rest in a last row). */
+export const CHANGE_ROWS_MAX = 24;
+
+/**
+ * 🔴 A change list (the outline tool cards): one single line per change, each a few words, a
+ * titled link and chips. Every line is one fixed line (truncated, never wrapped), so the height
+ * is the row count alone: no text layout.
+ *
+ * `toggle` is the fold under the list that opens the call's raw input and the result the model
+ * saw (sections after this one, present only while it is open).
+ */
+export interface ToolChangeRowsDetail {
+	kind: "change-rows";
+	rows: ToolChangeRow[];
+	toggle?: { open: boolean; label: string };
+}
+
+/**
+ * 🔴 An outline plan as an outline (plan readability): the title, the background paragraph whole,
+ * the big and small points, each small point's implementation details behind one preview line,
+ * the notable points whole, each opened by the reader (`outline-plan-tree.ts`; `view` is their
+ * choice, resolved during adaptation like every fold). Measured row by row
+ * (`measure-plan-tree.ts`) inside the plan's capped box.
+ *
+ * `markdown` is the same plan as the capped markdown body a plan file gets: what the fullscreen
+ * viewer opens and what a copy takes. It is never drawn inline.
+ */
+export interface ToolPlanTreeDetail {
+	kind: "plan-tree";
+	tree: PlanTree;
+	view: PlanTreeView;
+	markdown: ToolCappedDetail;
+	/**
+	 * The preview line's labels (measured: they share its line): `more` with `{n}` for the
+	 * children past the first (「还有 {n} 条 ▸」), `one` for a lone first child longer than its
+	 * line (「展开 ▸」). From the adapter's labels, English when absent.
+	 */
+	labels: { more: string; one: string };
+}
+
+/** The preview labels when the adapter injects none (tests, the purity-guarded default). */
+const PLAN_TREE_LABEL_FALLBACKS = { more: "{n} more ▸", one: "Expand ▸" } as const;
 
 /**
  * Defensive ceilings on a read-only AskUserQuestion replay. The tool schema
@@ -358,6 +466,8 @@ export interface ToolStructuredEntry {
 	title: string;
 	/** External link for the title (render layer draws an <a>). Height-neutral. */
 	href?: string;
+	/** In-app destination; the host decides whether it can open it. */
+	target?: InjectionTarget;
 	/** Secondary info shown after/below the title (domain / time / seq). */
 	meta?: string;
 	/** Body excerpt (wraps, clamped to a fixed number of lines). */
@@ -544,7 +654,9 @@ export type ToolSectionBody =
 	| ToolSpecTasksDetail
 	| ToolMetaRowsDetail
 	| ToolAskDetail
-	| ToolGenUiDetail;
+	| ToolGenUiDetail
+	| ToolChangeRowsDetail
+	| ToolPlanTreeDetail;
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
@@ -867,11 +979,23 @@ interface ClassifyToolDetailFields {
 	hasPendingPermission?: boolean;
 	/**
 	 * Injected chrome labels (the adapter forwards `ctx.labels`). Only the strings
-	 * that participate in MEASUREMENT belong here — currently the ask replay's
+	 * that participate in MEASUREMENT belong here — e.g. the ask replay's
 	 * "Answer:" / "Custom answer:" prefixes, which wrap with their answer text and
-	 * therefore cannot be substituted by the render layer.
+	 * therefore cannot be substituted by the render layer, and an outline plan's
+	 * preview labels (`planTreeDetailsMore` / `planTreeDetailsOne`), which share
+	 * the preview's line.
 	 */
 	labels?: Record<string, string>;
+	/**
+	 * The reader opened the fold of an outline tool card that shows the call's raw input and the
+	 * result the model saw (`ToolChangeRowsDetail.toggle`). Folded by default.
+	 */
+	rawOpen?: boolean;
+	/**
+	 * The reader's view of an outline plan's tree (which nodes and texts they opened), keyed by
+	 * the card. Absent: the overview (the root and two levels under it).
+	 */
+	planView?: PlanTreeView;
 }
 
 /** Trim a possibly-null string; undefined when absent or blank. */
@@ -944,20 +1068,24 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 	const uiUnusable = isFailStatus(status) || status === "denied" || status === "cancelled";
 	// `render` carries its UI in its own input, so the card exists from the first streamed
 	// chunk.
+	// A render({path}) app draws from the call's own arguments as well: its card has to
+	// exist before the result, because the call is what waits for the reader.
+	const ui = uiInput ?? {};
+	const renderPath = ui.action === "render" && typeof ui.path === "string" ? ui.path : undefined;
 	const uiInline: ToolDetailData | null =
-		typeof uiInput?.source === "string" &&
-		(uiInput.action === undefined || uiInput.action === "render") &&
+		(typeof ui.source === "string" || renderPath !== undefined) &&
+		(ui.action === undefined || ui.action === "render") &&
 		!uiUnusable
 			? single("gen-ui", {
 					kind: "gen-ui",
-					file: null,
-					text: uiInput.source,
-					contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(uiInput.size)],
-					...(typeof uiInput.title === "string" ? { title: uiInput.title.slice(0, 80) } : {}),
+					file: renderPath ? liveAppFile(renderPath, ui, input) : null,
+					text: typeof ui.source === "string" ? ui.source : undefined,
+					contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(ui.size)],
+					...(typeof ui.title === "string" ? { title: ui.title.slice(0, 80) } : {}),
 					...(!isTerminalToolStatus(status) && input.isStreaming === true ? { live: true } : {}),
 					...uiKitFields,
 					...(typeof input.toolUseId === "string" ? { stateKey: input.toolUseId } : {}),
-					...(uiInput.wait === true &&
+					...(ui.wait === true &&
 					status != null &&
 					!isTerminalToolStatus(status) &&
 					typeof input.toolUseId === "string"
@@ -983,6 +1111,8 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 							}
 						: {}),
 					...(metadata?.fileChangeHistoryUnavailable === true ? { historyUnavailable: true } : {}),
+					// 应用自己写的草稿按 tool call 存，展开/切会话回来时靠它恢复；没有 app 就没有草稿。
+					...(uiFile ? { stateKey: uiFile.toolUseId } : {}),
 					...uiKitFields,
 				})
 			: // A kit build the user must confirm is something to act on, not text to read.
@@ -990,11 +1120,13 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				? single("gen-ui", { kind: "gen-ui", file: null, ...uiKitFields })
 				: null;
 	const base = withErrorSection(
-		toolName === "GenUI"
-			? uiInput?.action === "inspect"
-				? classifyGenUiInspection(output)
-				: (uiDetail ?? sections([textSection("output.main", output, "output")]))
-			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
+		toolName === "ImageGen"
+			? classifyToolImages(output)
+			: toolName === "GenUI"
+				? uiInput?.action === "inspect"
+					? classifyToolImages(output)
+					: (uiDetail ?? sections([textSection("output.main", output, "output")]))
+				: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
 		input.outputJson,
 	);
@@ -1003,13 +1135,42 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 		kind: "sections",
 		sections: base.sections.map((part) => ({
 			...part,
-			body: part.body.kind === "capped" ? describeToolBody(part.body, input) : part.body,
+			body:
+				part.body.kind === "capped"
+					? describeToolBody(part.body, input)
+					: // An outline plan's tree keeps its markdown for the viewer: the same identity.
+						part.body.kind === "plan-tree"
+						? { ...part.body, markdown: describeToolBody(part.body.markdown, input) }
+						: part.body,
 		})),
 	};
 }
 
+/**
+ * The card of a render({path}) that has not returned yet. Only the two ids reach the
+ * preview URL; the rest of the reference is resolved server-side from the call itself.
+ */
+function liveAppFile(
+	directory: string,
+	uiInput: Record<string, unknown> | undefined,
+	input: { toolUseId?: unknown; toolCallId?: unknown },
+): GenUiFileReference | null {
+	if (typeof input.toolUseId !== "string") return null;
+	return {
+		version: 1,
+		toolUseId: input.toolUseId,
+		toolCallId: typeof input.toolCallId === "string" ? input.toolCallId : input.toolUseId,
+		deviceId: "",
+		workspaceKey: "",
+		cwd: "",
+		directory,
+		entry: GEN_UI_ENTRY,
+		title: typeof uiInput?.title === "string" ? uiInput.title.slice(0, 80) : "",
+	};
+}
+
 /** Inspection screenshots use the existing private upload lane, not diagnostic metadata URLs. */
-function classifyGenUiInspection(output: unknown): ToolDetailData | null {
+function classifyToolImages(output: unknown): ToolDetailData | null {
 	return sections([
 		textSection("output.main", output, "output"),
 		...toolOutputImages(output).flatMap((image, index) => {
@@ -1167,6 +1328,8 @@ function classifyByCategory(
 				inputJson,
 				metadata,
 				isFailStatus(status) ? nonEmptyTrimmedText(input.denyMessage) : undefined,
+				input.planView,
+				input.labels,
 			);
 		case "pipeline":
 			return classifyPipeline(toolName, inputJson, outputJson, metadata);
@@ -1185,7 +1348,7 @@ function classifyByCategory(
 		case "knowledge":
 			return classifyKnowledge(toolName, inputJson, outputJson, metadata);
 		case "outline":
-			return classifyOutline(toolName, inputJson, outputJson, metadata);
+			return classifyOutline(toolName, inputJson, outputJson, metadata, input);
 		case "contextAsk":
 			return classifyContextAsk(inputJson, outputJson, metadata, status);
 		case "workspace":
@@ -2640,6 +2803,8 @@ function classifyPlan(
 	inputJson: unknown,
 	metadata: Record<string, unknown> | null,
 	denyMessage?: string,
+	planView?: PlanTreeView,
+	labels?: Record<string, string>,
 ): ToolDetailData | null {
 	const planText = extractField(inputJson, "plan") || String(asObject(inputJson)?.plan ?? "");
 	// `hasUsablePlanBody` rejects our own model-facing plan reference. It reaches
@@ -2657,13 +2822,32 @@ function classifyPlan(
 	// degrade them to monospace plain text. `_planFile` marks a file-based plan;
 	// pass the raw path through and let the render layer localize it.
 	const planFile = extractField(inputJson, "_planFile");
-	const body = capped("input.plan", "plan", {
+	const markdown = capped("input.plan", "plan", {
 		contentLines: countLines(planText),
 		text: planText,
 		...truncatedFlag(inputJson),
 		format: "markdown",
 		...(planFile ? { sourcePath: planFile } : {}),
 	});
+	// An outline plan reads as its outline (plan readability): folded to the root and two levels.
+	// Only a whole one: a server-side prefix is a cut tree, so it stays the capped markdown body
+	// (which fetches the rest as it is read), as does anything that is not one outline tree.
+	const tree =
+		markdown.textTruncated !== true && isOutlinePlanInput(inputJson)
+			? parsePlanTree(planText)
+			: null;
+	const body: ToolSectionBody = tree
+		? {
+				kind: "plan-tree",
+				tree,
+				view: planView ?? DEFAULT_PLAN_TREE_VIEW,
+				markdown,
+				labels: {
+					more: labels?.planTreeDetailsMore ?? PLAN_TREE_LABEL_FALLBACKS.more,
+					one: labels?.planTreeDetailsOne ?? PLAN_TREE_LABEL_FALLBACKS.one,
+				},
+			}
+		: markdown;
 	// A DENIED plan carries the reviewer's feedback above the body.
 	//
 	// `permissionDenyMessage` is a TOP-LEVEL tool-call column, not part of
@@ -3396,23 +3580,29 @@ function classifyKnowledge(
 }
 
 /**
- * The outline tools. A read is a markdown outline (rendered as markdown, under a header naming
- * the address, its space and size); a search lists its hits; an edit shows what it wrote (its
- * input is kept whole, see `SKIP_INPUT_TRUNCATE_TOOLS`) and what came of it.
+ * The outline tools. Each card says what its call did, in the reader's words
+ * (`./outline-tool-card.ts`): an edit is a change list (one line per change, the block as a
+ * titled outline link, status chips), its space by name and its commit as a link to the outline
+ * timeline (where it can be reverted); `Ask` lists its questions the same way; a read is its
+ * markdown outline under a header naming the block; a search lists its hits.
  *
- * Block addresses and the commit link to the outline (`outline-links.ts`): the read's address,
- * each hit, each edit's target (the block the edit changed or created, from the result) and the
- * edit's commit. The render layer opens them in an outline panel beside the session, and shows
- * them as plain text where nothing can open them.
+ * The call's input and the result the model got are folded under the change list
+ * (`ToolChangeRowsDetail.toggle`, opened by the reader: `input.rawOpen`). A call that failed or
+ * wrote nothing shows them directly: there is no change to list, and the result says why.
+ *
+ * Block addresses and commits link to the outline (`outline-links.ts`); the render layer opens
+ * them in an outline panel beside the session, and shows them as plain text where nothing can
+ * open them.
  */
 function classifyOutline(
 	toolName: string,
 	inputJson: unknown,
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	input: Pick<ClassifyToolDetailInput, "labels" | "status" | "rawOpen">,
 ): ToolDetailData | null {
-	const space = asObject(metadata?.space);
-	const spaceKey = space ? readLeafText(space.key) : undefined;
+	const labels = input.labels;
+	const spaceChips = outlineSpaceChips(metadata, labels);
 	if (toolName === "OutlineSearch" && metadata && Array.isArray(metadata.results)) {
 		const results = metadata.results as unknown[];
 		const entries: ToolStructuredEntry[] = [];
@@ -3426,11 +3616,14 @@ function classifyOutline(
 				title: readLeafText(r.title) || address,
 				...(href ? { href } : {}),
 				...(address || path.length > 0
-					? { meta: [address, path.join(" › ")].filter(Boolean).join(" · ") }
+					? { meta: [path.join(" › "), address].filter(Boolean).join(" · ") }
 					: {}),
 				badges: chips([
-					chip(readLeafText(r.alias), "teal"),
-					chip(r.process === true ? "process" : undefined, "gray"),
+					verbatimChip(readLeafText(r.alias), "teal"),
+					chip(
+						r.process === true ? outlineLabel(labels, "outlineSearchProcess") : undefined,
+						"gray",
+					),
 				]),
 				...(snippet ? { snippet: snippet.slice(0, 300) } : {}),
 			});
@@ -3438,7 +3631,9 @@ function classifyOutline(
 		return single("output.results", {
 			kind: "structured",
 			badgeRows: 1,
-			badges: chips([chip(`${results.length} results`, "teal")]),
+			badges: chips([
+				chip(outlineLabel(labels, "outlineSumResults", { n: results.length }), "teal"),
+			]),
 			bodyLines: [],
 			entries,
 		});
@@ -3446,17 +3641,43 @@ function classifyOutline(
 	if (toolName === "OutlineRead") {
 		const body = resolveDisplayText(outputJson);
 		const address = (metadata ? readLeafText(metadata.address) : undefined) || "";
+		const title = metadata ? readLeafText(metadata.title) : undefined;
+		const path = stringArray(metadata?.path);
 		const blocks = typeof metadata?.blocks === "number" ? metadata.blocks : undefined;
 		const asOf = typeof metadata?.asOf === "number" ? metadata.asOf : undefined;
 		const addressHref = outlineAddressPath(address);
 		const header = metaRows([
-			pathRow(address, addressHref ? { href: addressHref } : {}),
+			// The block by its title (its address on hover is the link's target), where it sits.
+			pathRow(
+				title
+					? [...path, title]
+							.map((part) => part || outlineLabel(labels, "outlineUntitled"))
+							.join(" › ")
+					: address,
+				{
+					...(addressHref ? { href: addressHref } : {}),
+					...(title ? { mono: false } : {}),
+				},
+			),
 			badgeRow(
 				chips([
-					chip(spaceKey, "teal"),
-					chip(blocks === undefined ? undefined : `${blocks} blocks`, "gray"),
-					chip(asOf === undefined ? undefined : `as of #${asOf}`, "yellow"),
-					chip(metadata?.truncated === true ? "more not shown" : undefined, "orange"),
+					...spaceChips,
+					chip(
+						blocks === undefined
+							? undefined
+							: outlineLabel(labels, "outlineSumBlocks", { n: blocks }),
+						"gray",
+					),
+					chip(
+						asOf === undefined ? undefined : outlineLabel(labels, "outlineSumAsOf", { n: asOf }),
+						"yellow",
+					),
+					chip(
+						metadata?.truncated === true
+							? outlineLabel(labels, "outlineSumMoreTruncated")
+							: undefined,
+						"orange",
+					),
 				]),
 			),
 		]);
@@ -3470,77 +3691,181 @@ function classifyOutline(
 			}),
 		]);
 	}
-	if (toolName === "OutlineEdit") {
-		const edits = asObject(inputJson)?.edits;
-		// What each edit touched, once committed: one summary per edit, in order.
-		const done = Array.isArray(metadata?.edits) ? (metadata.edits as unknown[]) : [];
-		const lines: string[] = [];
-		if (Array.isArray(edits)) {
-			edits.forEach((raw, index) => {
-				const edit = asObject(raw);
-				if (!edit) return;
-				const kind = ["add", "replace", "move", "delete", "set"].find((k) => k in edit);
-				if (!kind) return;
-				const target = readLeafText(edit[kind]) ?? "";
-				const extra =
-					kind === "move"
-						? ` → ${readLeafText(edit.to) ?? ""}`
-						: kind === "set"
-							? setText(edit)
-							: "";
-				const result = asObject(done[index]);
-				const touched =
-					result?.op === kind
-						? kind === "add"
-							? stringArray(result.created)[0]
-							: readLeafText(result.address)
-						: undefined;
-				const href = outlineAddressPath(touched);
-				// Link text without code spans: the brackets of a markdown link must not be split.
-				const label = target.replace(/[[\]`]/g, "");
-				lines.push(
-					href && label
-						? `**${kind}** [${label}](${href})${extra}`
-						: `**${kind}** \`${target}\`${extra}`,
-				);
-				const text = readLeafText(
-					kind === "add" ? edit.markdown : kind === "replace" ? edit.text : undefined,
-				);
-				if (text) lines.push("", text, "");
-			});
-		}
-		const commit = asObject(metadata?.commit);
-		const seq = commit && typeof commit.seq === "number" ? commit.seq : undefined;
-		const commitHref = spaceKey && seq !== undefined ? outlineCommitPath(spaceKey, seq) : null;
-		const input = lines.join("\n").trim();
-		return sections([
-			section(
-				"meta.edit",
-				undefined,
-				metaRows([
-					badgeRow(
-						chips([
-							chip(spaceKey, "teal"),
-							chip(seq === undefined || commitHref ? undefined : `commit #${seq}`, "green"),
-						]),
-					),
-					commitHref ? pathRow(`commit #${seq}`, { href: commitHref, dimmed: false }) : null,
-				]),
-			),
-			input
-				? textSection("input.edits", inputJson, "input", {
-						cap: "knowledge",
-						contentLines: countLines(input) + 2,
-						text: input,
-						format: "markdown",
+	const failed = isFailStatus(input.status);
+	if (toolName === "Ask") {
+		// The block the questions are under, by its title (an older call: its address).
+		const underRef = readOutlineAskDisplay(metadata)?.under;
+		const under = underRef?.address ?? (metadata ? readLeafText(metadata.under) : undefined);
+		const underHref = outlineAddressPath(under);
+		const rows = outlineAskRows(inputJson, metadata, labels);
+		const meta = metaRows([
+			under
+				? pathRow(underRef?.title || under, {
+						...(underHref ? { href: underHref } : {}),
+						...(underRef?.title ? { mono: false } : {}),
 					})
 				: null,
+			badgeRow(
+				chips([
+					...spaceChips,
+					chip(
+						metadata?.proceed === true ? outlineLabel(labels, "outlineAskWentAhead") : undefined,
+						"yellow",
+					),
+				]),
+			),
+		]);
+		if (failed || rows.length === 0) {
+			return sections([
+				meta ? section("meta.ask", undefined, meta) : null,
+				outputJson != null
+					? textSection("output.main", outputJson, "result", { format: "markdown" })
+					: null,
+			]);
+		}
+		return sections([
+			meta ? section("meta.ask", undefined, meta) : null,
+			changeSection("output.changes", rows, labels, input.rawOpen === true),
+			...(input.rawOpen === true
+				? [
+						outputJson != null
+							? textSection("output.main", outputJson, "result", { format: "markdown" })
+							: null,
+					]
+				: []),
+		]);
+	}
+	if (toolName === "OutlineEdit") {
+		const decisions = isOutlineDecisionCall(inputJson, metadata);
+		const display = readOutlineEditDisplay(metadata);
+		const commit = outlineCommitLink(metadata, labels);
+		const meta = metaRows([
+			badgeRow(chips(spaceChips)),
+			// The commit: its place in the outline timeline, where it can be reverted. No control
+			// in the transcript changes the outline.
+			commit ? pathRow(commit.text, { href: commit.href, dimmed: false, mono: false }) : null,
+		]);
+		const inputSection = (): ToolDetailSection | null => {
+			const text = outlineEditInputMarkdown(inputJson, metadata);
+			return text
+				? textSection("input.edits", inputJson, "input", {
+						cap: "knowledge",
+						contentLines: countLines(text) + 2,
+						text,
+						format: "markdown",
+					})
+				: null;
+		};
+		const resultSection = () =>
 			outputJson != null
 				? textSection("output.main", outputJson, "result", { format: "markdown" })
-				: null,
+				: null;
+		// Nothing to list: the call failed, or wrote nothing (no commit, nothing held). Its input
+		// and result say what it tried and why.
+		const wroteNothing =
+			!decisions &&
+			!display &&
+			(metadata?.commit === null || metadata?.commit === undefined) &&
+			!metadata?.pending;
+		const rows =
+			failed || wroteNothing
+				? []
+				: decisions
+					? outlineDecisionRows(inputJson, metadata, labels)
+					: display
+						? outlineEditRows(display, labels)
+						: outlineLegacyEditRows(inputJson, metadata, labels);
+		if (rows.length === 0) {
+			return sections([
+				meta ? section("meta.edit", undefined, meta) : null,
+				decisions ? null : inputSection(),
+				resultSection(),
+			]);
+		}
+		const open = input.rawOpen === true;
+		return sections([
+			meta ? section("meta.edit", undefined, meta) : null,
+			changeSection("output.changes", rows, labels, open),
+			...(open ? [decisions ? null : inputSection(), resultSection()] : []),
 		]);
 	}
 	return classifyGeneric(inputJson, outputJson);
+}
+
+/** The change list of an outline card, with the fold for its raw input and result. */
+function changeSection(
+	key: string,
+	rows: ToolChangeRow[],
+	labels: Record<string, string> | undefined,
+	open: boolean,
+): ToolDetailSection | null {
+	return section(key, undefined, {
+		kind: "change-rows",
+		rows: rows.slice(0, CHANGE_ROWS_MAX),
+		toggle: { open, label: outlineLabel(labels, "outlineRawFold") },
+	});
+}
+
+function outlineLabel(
+	labels: Record<string, string> | undefined,
+	key: string,
+	params?: Record<string, string | number>,
+): string {
+	let out = labels?.[key] ?? OUTLINE_CARD_LABEL_FALLBACKS[key] ?? key;
+	if (params)
+		for (const [k, v] of Object.entries(params)) out = out.replaceAll(`{${k}}`, String(v));
+	return out;
+}
+
+/** A chip painted as written (a case-sensitive id or alias), or null when empty. */
+function verbatimChip(label: string | undefined, color: string): ToolStructuredBadge | null {
+	return label ? { label, color, verbatim: true } : null;
+}
+
+/**
+ * An edit call's input as markdown (the raw-input fold): each edit's kind and target (linked to
+ * the block it touched, from the result), and the text it wrote.
+ */
+function outlineEditInputMarkdown(
+	inputJson: unknown,
+	metadata: Record<string, unknown> | null,
+): string {
+	const edits = asObject(inputJson)?.edits;
+	// What each edit touched, once committed: one summary per edit, in order.
+	const done = Array.isArray(metadata?.edits) ? (metadata.edits as unknown[]) : [];
+	const lines: string[] = [];
+	if (!Array.isArray(edits)) return "";
+	edits.forEach((raw, index) => {
+		const edit = asObject(raw);
+		if (!edit) return;
+		const kind = ["add", "replace", "move", "delete", "set", "confirm", "reject"].find(
+			(k) => k in edit,
+		);
+		if (!kind) return;
+		const target = readLeafText(edit[kind]) ?? "";
+		const extra =
+			kind === "move" ? ` → ${readLeafText(edit.to) ?? ""}` : kind === "set" ? setText(edit) : "";
+		const result = asObject(done[index]);
+		const touched =
+			result?.op === kind
+				? kind === "add"
+					? stringArray(result.created)[0]
+					: readLeafText(result.address)
+				: undefined;
+		const href = outlineAddressPath(touched);
+		// Link text without code spans: the brackets of a markdown link must not be split.
+		const label = target.replace(/[[\]`]/g, "");
+		lines.push(
+			href && label
+				? `**${kind}** [${label}](${href})${extra}`
+				: `**${kind}** \`${target}\`${extra}`,
+		);
+		const text = readLeafText(
+			kind === "add" ? edit.markdown : kind === "replace" ? edit.text : undefined,
+		);
+		if (text) lines.push("", text, "");
+	});
+	return lines.join("\n").trim();
 }
 
 function setText(edit: Record<string, unknown>): string {
@@ -3783,6 +4108,13 @@ function classifyWorkspace(
 				worktree?.path ?? args?.destinationPath,
 				worktree?.branch ?? args?.branchName ?? workspaceObject(args?.branch)?.name,
 			);
+			const worktreeSwitch = workspaceObject(result?.switch);
+			if (typeof worktreeSwitch?.switched === "boolean") {
+				const switched = worktreeSwitch.switched;
+				rows.push({ text: text(switched ? "workspaceChanged" : "workspaceUnchanged") });
+				const switchMessage = readLeafText(workspaceObject(worktreeSwitch.error)?.message);
+				if (!switched && switchMessage) rows.push({ text: switchMessage });
+			}
 			handled = ["created", "failed", "unknown"].includes(outcome ?? "");
 		}
 	} else if (toolName === "SwitchWorkingDirectory") {

@@ -12,6 +12,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import type { PromptPart } from "@shared/prefix-context";
 import { taskSourceForNarrator } from "../index";
 import type { ContinuationTask, OpenTaskView, TaskBackend, TaskStatus } from "../types";
 
@@ -34,12 +35,31 @@ export interface TaskSourceContractHarness {
 	 * runs. Without it the failure-semantics tests are skipped.
 	 */
 	makeUnreadable?(narratorId: string): Promise<() => void>;
+	/**
+	 * How the backend gets its tasks and behavior fence to the model. `cadence` (spec, the
+	 * default): the periodic digest and the fence the drain injects (`taskDigest`,
+	 * `behaviorFence`), with no context parts. `views` (outline, plan PR 4): context parts of the
+	 * request prefix (`contextParts`), with the digest and the injected fence retired (always null).
+	 */
+	delivery?: "cadence" | "views";
+	/**
+	 * What the backend marks every digest body with, exactly; spec marks nothing. Empty digests
+	 * are compared exactly against `{ kind, variant }` plus this, so no other field may ride along
+	 * unnoticed. Only for `cadence` delivery.
+	 */
+	digestStamp?: { taskBackend?: "outline" };
 }
 
 const texts = (tasks: readonly { text: string }[]) => tasks.map((task) => task.text);
 const STANDALONE_SEVEN = /(?<![0-9])7(?![0-9])/;
 
+/** Every part's text, one after another: what the model reads of a source's context parts. */
+function partsText(parts: readonly PromptPart[]): string {
+	return parts.map((part) => `[${part.key}]\n${part.text}`).join("\n");
+}
+
 export function describeTaskSourceContract(harness: TaskSourceContractHarness): void {
+	const views = harness.delivery === "views";
 	async function sourceWith(tasks: readonly SeedTask[] = []) {
 		const narratorId = await harness.createNarrator();
 		if (tasks.length > 0) await harness.seedTasks(narratorId, tasks);
@@ -324,20 +344,38 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 				}
 			});
 
-			test("an empty behavior fence injects nothing; a written one is returned", async () => {
+			test("an empty behavior fence injects nothing; a written one is delivered", async () => {
 				const { narratorId, source } = await sourceWith();
+				if (views) {
+					// Retired: the fence reaches the model as a context part instead.
+					for (const locale of ["en", "zh-CN"] as const) {
+						expect(partsText(await source.contextParts(locale))).not.toContain("force-push");
+					}
+					await harness.seedBehaviorFence(narratorId, "  Never force-push the main branch.  ");
+					expect(await source.behaviorFence()).toBeNull();
+					for (const locale of ["en", "zh-CN"] as const) {
+						expect(partsText(await source.contextParts(locale))).toContain(
+							"Never force-push the main branch.",
+						);
+					}
+					return;
+				}
+				expect(await source.contextParts("en")).toEqual([]);
 				expect(await source.behaviorFence()).toBeNull();
 				await harness.seedBehaviorFence(narratorId, "  Never force-push the main branch.  ");
 				const fence = await source.behaviorFence();
 				expect(fence?.kind).toBe("prose");
 				if (fence?.kind !== "prose") return;
 				expect(fence.text).toContain("Never force-push the main branch.");
+				expect(await source.contextParts("en")).toEqual([]);
 			});
 
-			test("compact context is absent without tasks and lists every open task", async () => {
+			test("compact context lists every open task (and is absent without tasks, cadence)", async () => {
 				const empty = await sourceWith();
-				expect(await empty.source.compactContext("en")).toBeNull();
-				expect(await empty.source.compactContext("zh-CN")).toBeNull();
+				if (!views) {
+					expect(await empty.source.compactContext("en")).toBeNull();
+					expect(await empty.source.compactContext("zh-CN")).toBeNull();
+				}
 
 				const { source } = await sourceWith([
 					{ text: "Done already", status: "done" },
@@ -353,28 +391,62 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 				}
 			});
 
-			// Never null while readable: with the default fence settings the behavior fence is
-			// injected only alongside a non-null digest, so a quiet digest would drop it too.
-			test("a readable source always has a digest, led by the current task", async () => {
+			// Cadence: never null while readable: with the default fence settings the behavior fence
+			// is injected only alongside a non-null digest, so a quiet digest would drop it too.
+			// Views: the digest is retired, so the tasks must be in the context parts, current first.
+			test("a readable source delivers its tasks, led by the current task", async () => {
 				const { source } = await sourceWith([
 					{ text: "Write the parser", status: "doing" },
 					{ text: "Write the printer", status: "todo" },
 				]);
+				if (views) {
+					expect(await source.taskDigest()).toBeNull();
+					for (const locale of ["en", "zh-CN"] as const) {
+						const text = partsText(await source.contextParts(locale));
+						expect(text).toContain("Write the parser");
+						expect(text).toContain("Write the printer");
+						expect(text.indexOf("Write the parser")).toBeLessThan(
+							text.indexOf("Write the printer"),
+						);
+					}
+					return;
+				}
 				const digest = await source.taskDigest();
 				expect(digest?.kind).toBe("tasks");
 				if (digest?.kind !== "tasks") return;
 				expect(digest.tasks?.[0]).toMatchObject({ role: "doing", text: "Write the parser" });
 			});
 
-			test("without open tasks the digest is an empty variant, never null", async () => {
+			// Exactly the variant plus what the backend declares it stamps (`digestStamp`): a spec
+			// body must never carry a stamp. Views: no digest, and no nudge either (the parts are
+			// simply absent without tasks).
+			test("without open tasks the digest is an empty variant (cadence) or absent (views)", async () => {
+				if (views) {
+					const never = await sourceWith();
+					expect(await never.source.taskDigest()).toBeNull();
+					expect(await never.source.contextParts("en")).toEqual([]);
+					const done = await sourceWith([{ text: "Write the parser", status: "done" }]);
+					expect(await done.source.taskDigest()).toBeNull();
+					expect(await done.source.contextParts("en")).toEqual([]);
+					return;
+				}
+				const stamp = harness.digestStamp ?? {};
 				const never = await sourceWith();
-				expect(await never.source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyNever" });
+				expect(await never.source.taskDigest()).toStrictEqual({
+					kind: "tasks",
+					variant: "emptyNever",
+					...stamp,
+				});
 
 				const done = await sourceWith([
 					{ text: "Write the parser", status: "done" },
 					{ text: "Write the printer", status: "done" },
 				]);
-				expect(await done.source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyDone" });
+				expect(await done.source.taskDigest()).toStrictEqual({
+					kind: "tasks",
+					variant: "emptyDone",
+					...stamp,
+				});
 			});
 		});
 
@@ -398,6 +470,10 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 						expect(await source.taskDigest()).toBeNull();
 						expect(await source.behaviorFence()).toBeNull();
 						expect(await source.compactContext("en")).toBeNull();
+						// No part says anything; a view that cannot be read is marked so the request
+						// keeps what the model was shown, never removed.
+						const parts = await source.contextParts("en");
+						expect(parts.every((part) => part.unreadable === true && part.text === "")).toBe(true);
 						// The continuation reader treats it as nothing to continue.
 						const { readSpecContinuationState } = await import("../../narrator-session");
 						expect(await readSpecContinuationState(narratorId)).toEqual({

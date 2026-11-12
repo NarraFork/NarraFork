@@ -10,7 +10,7 @@
  * model correctly. No mocks here: the resolution chain under test is the point.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { getModelCatalogRevision, setModelWindow } from "../../model-catalog";
+import { replaceModelOverridesForTests } from "../../model-catalog";
 import type { ModelAggregation } from "../../settings/types";
 import {
 	DEFAULT_CONTEXT_WINDOW,
@@ -19,7 +19,6 @@ import {
 	getSummaryModelContextWindowDetail,
 	parseModelId,
 	resolveModelContextWindow,
-	saveSettings,
 	settings,
 } from "../index";
 
@@ -133,21 +132,16 @@ describe("getSummaryModelContextWindowDetail", () => {
 		const parsed = parseModelId(SUMMARY_MODEL);
 		const key = `anthropic:${parsed.model}`;
 		settings.agent.summaryModel = SUMMARY_MODEL;
-		// The provider page writes the entry's own window into the catalog.
-		const originalCatalog = settings.agent.modelCatalog;
+		// The provider page saves the entry's own window as its override.
+		const restore = replaceModelOverridesForTests({
+			connections: { [key]: { contextWindow: 50_000 } },
+		});
 		try {
-			setModelWindow({
-				baseRevision: getModelCatalogRevision(),
-				scope: "connection",
-				target: key,
-				contextWindow: 50_000,
-			});
 			const detail = getSummaryModelContextWindowDetail();
 			expect(detail.contextWindow).toBe(50_000);
 			expect(detail.source).toBe("user");
 		} finally {
-			settings.agent.modelCatalog = originalCatalog;
-			saveSettings(settings);
+			restore();
 		}
 	});
 

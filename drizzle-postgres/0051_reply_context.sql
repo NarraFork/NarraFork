@@ -1,0 +1,1 @@
+ALTER TABLE "narrators" ADD COLUMN "reply_context" text;

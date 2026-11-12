@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -14,6 +15,7 @@ import {
 	getConfiguredConcurrency,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
+	runEphemeralReadTask,
 	runReadTask,
 	setDbWorkerSpecifiersForTest,
 	shutdownDbWorkerPool,
@@ -51,7 +53,7 @@ function createFixtureDatabase(dbPath: string): void {
 		}
 	});
 	seed();
-	db.close();
+	db.close(true);
 }
 
 /**
@@ -173,7 +175,7 @@ describe("scan result determinism", () => {
 			expect(serial.topTables.length).toBeGreaterThan(0);
 			expect(serial.objectBytes).toBeGreaterThan(0);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	});
 
@@ -186,7 +188,7 @@ describe("scan result determinism", () => {
 				second.topTables.map((table) => table.name),
 			);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	});
 
@@ -201,7 +203,7 @@ describe("scan result determinism", () => {
 			const fromSubset = subset.topTables.find((table) => table.name === "narrator_messages");
 			expect(fromSubset).toEqual(fromFull);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	});
 });
@@ -217,12 +219,23 @@ describe("worker pool", () => {
 		resetDbWorkerPoolForTest();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		shutdownDbWorkerPool();
 		setDbWorkerSpecifiersForTest(null);
 		delete process.env.NARRAFORK_DB_WORKER;
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
-		rmSync(home, { recursive: true, force: true });
+		// terminate() requests exit; Windows can hold SQLite files until the worker closes.
+		// Bun 1.4.3 on Windows ignores fs.rm maxRetries; retry transient locks with a hard bound.
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await rm(home, { recursive: true, force: true });
+				break;
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (process.platform !== "win32" || code !== "EBUSY" || attempt >= 20) throw error;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+		}
 	});
 
 	test("wakes queued work after cancellation during cold startup", async () => {
@@ -288,7 +301,7 @@ describe("worker pool", () => {
 		try {
 			expect(context.dbstatSupported).toBe(loadScanContext(probe).dbstat.supported);
 		} finally {
-			probe.close();
+			probe.close(true);
 		}
 	}, 60_000);
 
@@ -325,7 +338,7 @@ describe("worker pool", () => {
 			const direct = measureTable(db, table, context);
 			expect(workerResult.tables[0]).toEqual(direct);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	}, 60_000);
 
@@ -473,6 +486,50 @@ describe("worker pool", () => {
 		});
 		expect(ok.pageSize).toBeGreaterThan(0);
 	}, 60_000);
+
+	test("ephemeral watchdog is classified and does not restart on another specifier", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "ephemeral-hang.ts", HANGING_WORKER_BODY),
+			writeWorkerFixture(
+				home,
+				"ephemeral-must-not-run.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "result", requestId: event.data.requestId, result: "restarted" });
+				};
+			`,
+			),
+		]);
+		await expect(
+			runEphemeralReadTask(dbPath, { kind: "storageScanContext" }, { timeoutMs: 200 }),
+		).rejects.toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
+	}, 5000);
+
+	test("ephemeral query failure does not retry another worker entry", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(
+				home,
+				"ephemeral-query-error.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "error", requestId: event.data.requestId, message: "query failed" });
+				};
+			`,
+			),
+			writeWorkerFixture(
+				home,
+				"ephemeral-must-not-retry.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "result", requestId: event.data.requestId, result: "restarted" });
+				};
+			`,
+			),
+		]);
+		await expect(
+			runEphemeralReadTask(dbPath, { kind: "storageScanContext" }),
+		).rejects.toMatchObject({ name: "DbReadTaskExecutionError", message: "query failed" });
+	}, 5000);
 
 	test("rejects an already-aborted signal", async () => {
 		const controller = new AbortController();

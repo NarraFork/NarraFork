@@ -198,6 +198,15 @@ export function createSpecTaskSource(narratorId: string): NarratorTaskSource {
 			const { compiled } = await readCompiledTasks(narratorId);
 			return compiled.currentTask ? toTaskView(compiled.currentTask) : null;
 		},
+		async statusBar() {
+			const { compiled } = await readCompiledTasks(narratorId);
+			return {
+				current: compiled.currentTask
+					? { ...toTaskView(compiled.currentTask), address: null }
+					: null,
+				awaitingConfirmation: { total: 0, mine: 0, from: [] },
+			};
+		},
 		async nextTask() {
 			const { compiled } = await readCompiledTasks(narratorId);
 			return compiled.nextTask ? toTaskView(compiled.nextTask) : null;
@@ -219,6 +228,8 @@ export function createSpecTaskSource(narratorId: string): NarratorTaskSource {
 		continuationPrompt: specContinuationPrompt,
 		taskDigest: () => buildSpecTaskDigestBody(narratorId),
 		behaviorFence: () => buildBehaviorFenceBody(narratorId),
+		// Spec delivers its tasks and fence by the cadence drain: the prefix gets nothing.
+		contextParts: async () => [],
 		compactContext: (locale) => buildSpecCompactContext(narratorId, locale),
 		interruptGuardNote: specInterruptGuardNote,
 	};

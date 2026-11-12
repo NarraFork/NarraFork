@@ -2,7 +2,11 @@ import { ApiError } from "@frontend/lib/api/client";
 import { describeApiError } from "@frontend/lib/api-error";
 import { formatFullLocaleDateTime } from "@frontend/lib/format";
 import { extractPolicyViolationCode } from "@shared/agent-protocol/policy-violation";
-import { quotaProviderFromCode, quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
+import {
+	providerWaitKind,
+	quotaProviderFromCode,
+	quotaProviderLabel,
+} from "@shared/agent-protocol/quota-exhausted";
 import { ERROR_CATALOG } from "@shared/error-catalog";
 import type { TFunction } from "i18next";
 
@@ -107,6 +111,22 @@ export function localizeNarratorError(
 	// which is what this branch exists to fix. Read from the payload, not from
 	// `diagnostics`, because only `errorMessage` survives a page reload.
 	const quotaProvider = quotaProviderFromCode(payload?.type);
+	const waitKind = payload
+		? providerWaitKind({
+				...payload,
+				waitKind: payload.waitKind ?? (quotaProvider ? "quota" : undefined),
+			})
+		: "credentials";
+	if (
+		(payload?.type === "provider_wait_exhausted" || quotaProvider) &&
+		(waitKind === "capacity" || waitKind === "rate_limit")
+	) {
+		const prefix = waitKind === "capacity" ? "capacity" : "rateLimit";
+		const resetAt = payload?.quotaResetAt;
+		return typeof resetAt === "number" && Number.isFinite(resetAt)
+			? t(`${prefix}WaitNotPossible`, { resetAt: formatFullLocaleDateTime(new Date(resetAt)) })
+			: t(`${prefix}WaitNotPossibleNoReset`);
+	}
 	if (quotaProvider) {
 		const resetAt = payload?.quotaResetAt;
 		const provider = quotaProviderLabel(quotaProvider);

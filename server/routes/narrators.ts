@@ -10,13 +10,22 @@ import {
 	type FileReferenceSnapshot,
 	fileReferenceMessageForDisplay,
 } from "@shared/file-reference";
+import {
+	isMediaContentBlock,
+	MAX_MEDIA_ATTACHMENTS,
+	type MediaRef,
+} from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import type { OutlinePlanDecisionResponse } from "@shared/outline-api";
+import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
+import { isAbsoluteForFlavor, normalizeWorkspacePathFlavor } from "@shared/workspace-directories";
 import {
 	and,
 	asc,
@@ -50,14 +59,17 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
-import { summaryGenerate } from "../lib/agent";
+import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
-import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token-timeout";
-import type { ResponseFormat } from "../lib/agent/provider";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { narratorTraitsLock } from "../lib/async-mutex";
+import {
+	findStagedAttachment,
+	releaseStagedAttachment,
+	stagedAttachmentAsFile,
+} from "../lib/attachment-staging";
 import {
 	AUTO_CONTINUATION_OVERRIDE_VALUES,
 	type AutoContinuationOverride,
@@ -90,12 +102,19 @@ import {
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
 	bindComposerDocumentReferences,
+	bindComposerMediaProjection,
 	parseOptionalComposerDocument,
 	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../lib/composer-document";
-import { AppError, NotFoundError, ValidationError, zodValidationError } from "../lib/errors";
+import {
+	AppError,
+	catalogError,
+	NotFoundError,
+	ValidationError,
+	zodValidationError,
+} from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import {
 	parseFileReferenceInput,
@@ -103,6 +122,11 @@ import {
 } from "../lib/file-reference-input";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import {
+	deleteUploadedMedia,
+	saveUploadedMedia,
+	validateUploadedMedia,
+} from "../lib/media-uploads";
 import {
 	getAuthorizedNarrator,
 	narratorPrincipalOf,
@@ -149,21 +173,13 @@ import {
 	resolveSetupAuthorization,
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
-import {
-	getOptimizeOutputSchema,
-	getPromptOptimizeInstruction,
-	OPTIMIZE_OUTPUT_SCHEMA_NAME,
-	OPTIMIZE_SUMMARY_FIELD,
-	type PromptOptimizeStyle,
-	readOptimizeResult,
-} from "../lib/prompts/prompt-optimize";
-import { normalizeOptimizedPrompt } from "../lib/prompts/prompt-optimize-output";
+import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getQueueDuringCompaction,
-	resolveEffectiveModel,
+	normalizeAutoModelValueForSave,
 	settings,
 } from "../lib/settings";
 import {
@@ -238,6 +254,7 @@ import {
 	revertPlanIdSchema,
 	rollbackToBlocksSchema,
 } from "../lib/validators/narrators";
+import { outlinePlanDecisionSchema } from "../lib/validators/outline";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
@@ -275,6 +292,7 @@ import {
 import { dependencyService } from "../services/dependency-service";
 import {
 	browseRemoteDirectory,
+	resolveRemoteBrowsePath,
 	resolveRemoteBrowseTarget,
 } from "../services/device-transfer-service";
 import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/execution-policy";
@@ -322,6 +340,7 @@ import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-wri
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
+	releaseStagedFiles,
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
@@ -393,6 +412,7 @@ import {
 	editAndRegenerate,
 	editAssistantMessage,
 	editOutputBlock,
+	executeQueuedGoalCommand,
 	getBufferedMessagesAsync,
 	getNarratorExecutionDeviceState,
 	interruptAndWaitForIdle,
@@ -400,15 +420,17 @@ import {
 	isCompactInProgress,
 	isLoopRunning,
 	isNarratorActive,
+	isRefusedOutlineGoal,
 	normalizeRollbackBlockIndexForMessage,
-	persistGoalAddedNotice,
 	readSessionDeliverTo,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
 	reorderBufferedMessages,
 	reprocessAllPendingPermissions,
+	resolveNarratorDefaultDeviceRequest,
 	resolveOptionalToolState,
 	resolvePermissionOrDangerReflection,
+	resolveSessionDevices,
 	restoreAssistantMessage,
 	restoreOutputBlock,
 	retryFailedCompact,
@@ -416,7 +438,7 @@ import {
 	rollbackToBlocks,
 	runCustomCompact,
 	runSegmentCompact,
-	sendMessage,
+	sendHumanMessage as sendMessage,
 	setNarratorDefaultDevice,
 	startSpecContinuationIfPossible,
 	toBufferSummary,
@@ -476,14 +498,13 @@ import {
 	SnapshotRevertError,
 	unavailableSnapshotRevert,
 } from "../services/snapshot-revert";
-import { broadcastSpecChanged } from "../services/spec-broadcast";
-import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cwd";
 import {
 	resolveSubagentModelForRun,
 	resolveSubagentModelInheritance,
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
+import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -509,6 +530,104 @@ function parseNewCommand(message: string): { rawCommand: string; initialMessage:
 	return { rawCommand: message.trim(), initialMessage: match[1]?.trim() ?? "" };
 }
 
+/** Index is in the original newly-added textFiles list, excluding kept attachments. */
+export interface StagedAttachmentInput {
+	uploadId: string;
+	index: number;
+}
+
+const MAX_STAGED_ATTACHMENT_IDS = MAX_EDIT_TEXT_FILES_PER_MESSAGE;
+
+/** Parse the `stagedAttachments` form field, rejecting anything malformed outright. */
+export function parseStagedAttachmentInput(
+	raw: FormDataEntryValue | null | undefined,
+): StagedAttachmentInput[] {
+	if (raw === null || raw === undefined) return [];
+	if (typeof raw !== "string") {
+		throw new ValidationError("stagedAttachments must be a JSON array");
+	}
+	// At most ten small descriptors; reject oversized control data before JSON.parse.
+	if (raw.length > 4096) throw new ValidationError("stagedAttachments metadata is too large");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new ValidationError("stagedAttachments must be valid JSON");
+	}
+	if (!Array.isArray(parsed)) throw new ValidationError("stagedAttachments must be a JSON array");
+	if (parsed.length > MAX_STAGED_ATTACHMENT_IDS) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
+	}
+	const out: StagedAttachmentInput[] = [];
+	const ids = new Set<string>();
+	const indexes = new Set<number>();
+	for (const entry of parsed) {
+		const uploadId = entry && typeof entry === "object" ? entry.uploadId : undefined;
+		const index = entry && typeof entry === "object" ? entry.index : undefined;
+		if (typeof uploadId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(uploadId)) {
+			throw new ValidationError("Each staged attachment needs a valid uploadId");
+		}
+		if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+			throw new ValidationError("Each staged attachment needs a valid index");
+		}
+		if (ids.has(uploadId) || indexes.has(index)) {
+			throw new ValidationError("Duplicate staged attachment uploadId or index");
+		}
+		ids.add(uploadId);
+		indexes.add(index);
+		out.push({ uploadId, index });
+	}
+	return out;
+}
+
+/**
+ * Turn staged upload ids into disk-backed `File` values for the shared pipeline.
+ *
+ * The returned objects behave like any other upload: `size`, `name` and `type`
+ * are real, and `Bun.write` streams from the staged path. That is what lets the
+ * buffered mailbox, the worktree copy and the retry path stay unaware that these
+ * attachments never travelled inside a request body.
+ *
+ * A missing id is a user-visible condition, not an internal one: the TTL sweep,
+ * a restart or another tab can remove it between upload and send.
+ */
+export function resolveStagedAttachments(
+	narratorId: string,
+	inputs: readonly StagedAttachmentInput[],
+	inlineFiles: readonly FormDataEntryValue[] = [],
+): File[] {
+	const count = inputs.length + inlineFiles.length;
+	if (count > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
+	}
+	for (const file of inlineFiles) {
+		if (!(file instanceof File)) throw new ValidationError("textFiles must contain files");
+	}
+	const stagedByIndex = new Map<number, File>();
+	for (const { uploadId, index } of inputs) {
+		if (!Number.isInteger(index) || index < 0 || index >= count || stagedByIndex.has(index)) {
+			throw new ValidationError("Invalid or duplicate staged attachment index");
+		}
+		const staged = findStagedAttachment(narratorId, uploadId);
+		if (!staged) {
+			throw new ValidationError(
+				"An attached file is no longer available (its upload expired); attach it again",
+			);
+		}
+		stagedByIndex.set(index, stagedAttachmentAsFile(staged));
+	}
+	let inlineIndex = 0;
+	return Array.from(
+		{ length: count },
+		(_, index) => stagedByIndex.get(index) ?? (inlineFiles[inlineIndex++] as File),
+	);
+}
+
+/** Combined size of a set of attachment files, in bytes. */
+export function attachmentBytesOf(files: readonly File[]): number {
+	return files.reduce((total, file) => total + file.size, 0);
+}
+
 /** Parse message request supporting both JSON and multipart/form-data (with images and text files) */
 export async function parseMessageRequest(
 	c: {
@@ -522,6 +641,7 @@ export async function parseMessageRequest(
 ): Promise<{
 	message: string;
 	images: ImageRef[];
+	media: MediaRef[];
 	textFiles: File[];
 	priority?: boolean;
 	interrupt?: boolean;
@@ -536,30 +656,45 @@ export async function parseMessageRequest(
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
-		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
-		const composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
-		const message = restoreMultipartComposerText(
+		let fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
+		let composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		let message = restoreMultipartComposerText(
 			typeof rawMessage === "string" ? rawMessage : "",
 			composerDocument,
 		);
 		validateComposerProjection(composerDocument, message, fileReferences);
+		const mediaFiles = formData.getAll("media") as File[];
+		if (mediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+			throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+		const mediaMetadata: Array<{ filename: string; size: number; mediaType: string }> = [];
+		for (const file of mediaFiles) {
+			mediaMetadata.push({
+				filename: file.name,
+				size: file.size,
+				mediaType: await validateUploadedMedia(file),
+			});
+		}
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
-			throw new ValidationError(
-				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
-			);
-		}
+		// Attachments over the buffered ceiling never appear here: the composer
+		// uploaded them through the streaming endpoint and sent only their ids, so
+		// the multipart body stays small no matter how large the file is.
+		const allTextFiles = resolveStagedAttachments(
+			narratorId,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
 		// An attachment carries the turn on its own: images (and text files, whose
 		// paths are injected as an <attached_files> hint) are meaningful content even
 		// when the user typed nothing. Only a fully empty request is rejected.
 		if (
 			!message.trim() &&
 			imageFiles.length === 0 &&
-			textFileEntries.length === 0 &&
+			mediaFiles.length === 0 &&
+			allTextFiles.length === 0 &&
 			!fileReferences?.length
 		) {
 			throw new ValidationError("message or an attachment is required");
@@ -569,12 +704,25 @@ export async function parseMessageRequest(
 		for (const file of textFileEntries) {
 			validateTextFile(file);
 		}
+		// Staged files were size-checked while streaming, and re-reading a gigabyte
+		// to check it again would undo the point of staging; only the count and the
+		// combined ceiling apply to them.
+		if (attachmentBytesOf(allTextFiles) > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
+		}
 		for (const file of imageFiles) {
 			validateUploadedImage(file);
 		}
-		validateComposerAssets(composerDocument, imageFiles, textFileEntries);
+		({
+			document: composerDocument,
+			text: message,
+			references: fileReferences,
+		} = bindComposerMediaProjection(composerDocument, message, fileReferences, mediaMetadata));
+		validateComposerAssets(composerDocument, imageFiles, allTextFiles, mediaMetadata);
 		const images: ImageRef[] = [];
+		const media: MediaRef[] = [];
 		try {
+			for (const file of mediaFiles) media.push(await saveUploadedMedia(narratorId, file));
 			for (const file of imageFiles) {
 				const image = await saveUploadedImage(narratorId, file);
 				images.push(
@@ -592,13 +740,15 @@ export async function parseMessageRequest(
 					// Best-effort: the original failure is what the caller needs to see.
 				}
 			}
+			for (const item of media) deleteUploadedMedia(narratorId, item.mediaId);
 			throw error;
 		}
 		const priority = formData.get("priority") === "true";
 		return {
 			message,
 			images,
-			textFiles: textFileEntries,
+			media,
+			textFiles: allTextFiles,
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
 			queueMode: modeResult.data,
@@ -618,6 +768,7 @@ export async function parseMessageRequest(
 	return {
 		message: parsed.data.message,
 		images: [],
+		media: [],
 		textFiles: [],
 		priority: parsed.data.priority,
 		interrupt: parsed.data.interrupt,
@@ -777,6 +928,11 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	"blacklist-dirs",
 	"cmd-whitelist",
 	"cmd-blacklist",
+	// Creating a session needs a device list and a directory browser BEFORE the
+	// narrator exists, so these cannot be keyed on a narrator id. Both authorize
+	// against the caller's own device visibility instead (`assertWorkspaceDeviceVisible`).
+	"workspace-devices",
+	"workspace-directory-browse",
 ]);
 
 /**
@@ -1272,6 +1428,161 @@ function standaloneNarratorCwd(
 	return decision.kind === "cwd" ? decision.cwd : undefined;
 }
 
+/**
+ * Which device a new session starts on.
+ *
+ * Only devices this caller can already see through the project axis (plus the OAuth
+ * allowlist) — the same list its tools are authorized against — and a remote one has to
+ * be online: creating a session on a device that cannot run anything would leave it
+ * stuck from its first tool call.
+ */
+async function resolveCreationDevice(
+	userId: string,
+	projectId: string | null | undefined,
+	requested: string,
+): Promise<string> {
+	const devices = (await resolveSessionDevices(projectId ?? null, userId)) ?? [];
+	const resolved = resolveNarratorDefaultDeviceRequest(requested, devices, { allowLocal: true });
+	return resolved ?? "local";
+}
+
+/**
+ * Validate a creation directory on a remote device.
+ *
+ * The path belongs to that machine, so it is checked in that machine's grammar and by
+ * that machine's own filesystem call — resolving it here would both misjudge a Windows
+ * path as relative and silently accept a directory that only exists on the server.
+ * There is deliberately no fallback to the device default directory: the session would
+ * then start somewhere the user did not pick.
+ */
+async function resolveRemoteCreationCwd(
+	deviceId: string,
+	requestedCwd: string | undefined,
+): Promise<string> {
+	let backend: ReturnType<typeof resolveBackend>;
+	try {
+		backend = resolveBackend({ requested: deviceId });
+	} catch {
+		throw new ValidationError(`Device is offline: ${deviceId}`);
+	}
+	const flavor = normalizeWorkspacePathFlavor(backend.pathFlavor);
+	const requested = requestedCwd?.trim();
+	if (!requested)
+		throw new ValidationError("Choose a working directory for the selected execution device");
+	if (!isAbsoluteForFlavor(requested, flavor))
+		throw new ValidationError("Working directory must be an absolute path on that device");
+	const normalized = backend.paths.normalize(requested);
+	let isDirectory = false;
+	let resolvedPath: string | undefined;
+	try {
+		const stat = await backend.statFile(normalized);
+		isDirectory = stat?.isDirectory === true;
+		resolvedPath = stat?.resolvedPath;
+	} catch (err) {
+		throw new ValidationError(err instanceof Error ? err.message : String(err));
+	}
+	if (!isDirectory)
+		throw new ValidationError("Working directory does not exist or is not accessible");
+	return resolvedPath ?? normalized;
+}
+
+/**
+ * The caller must be able to see the device at all.
+ *
+ * An unknown id gets the same answer as an unauthorized one, so this cannot be used to
+ * enumerate device ids. Visibility is the same project-axis list (`getSessionDevices`,
+ * which already filters by project membership and private ownership) that authorizes
+ * the caller's own tool routing.
+ */
+async function assertWorkspaceDeviceVisible(
+	deviceId: string,
+	projectId: string | null,
+	userId: string,
+): Promise<NonNullable<Awaited<ReturnType<typeof resolveSessionDevices>>>[number]> {
+	const devices = (await resolveSessionDevices(projectId, userId)) ?? [];
+	const device = devices.find((entry) => entry.id === deviceId || entry.slug === deviceId);
+	if (!device) throw new ValidationError(`Unknown or unauthorized device: ${deviceId}`);
+	return device;
+}
+
+/**
+ * Devices this caller may start a session on.
+ *
+ * The creation dialog needs this list BEFORE a narrator exists, so it cannot be the
+ * per-narrator endpoint. Authorization is the caller's own device visibility; nothing
+ * here reveals a device the caller could not otherwise route tools to.
+ */
+narratorRoutes.get("/workspace-devices", async (c) => {
+	const projectId = c.req.query("projectId")?.trim() || null;
+	const devices = (await resolveSessionDevices(projectId, c.get("user").sub)) ?? [];
+	return c.json({
+		devices: devices.map((device) => ({
+			id: device.id,
+			name: device.name,
+			online: device.online,
+			platform: device.platform ? { os: device.platform.os } : undefined,
+			defaultCwd: device.defaultCwd ?? null,
+			ownedByActingUser: device.ownedByActingUser ?? false,
+			scope: device.scope,
+		})),
+	});
+});
+
+/**
+ * Browse one level of a device filesystem before the session exists.
+ *
+ * Deliberately narrower than `/:id/device-browse`: there is no narrator whose rules
+ * could anchor a non-admin caller, and `/api/devices` (arbitrary device browse) is
+ * admin-only because `allowRoots` defaults to empty. So a non-admin may only walk the
+ * subtree of the device's own declared workspace root (`defaultCwd`) — a path the
+ * creation dialog is handed anyway as `defaultCwd`, so listing inside it reveals
+ * nothing the caller could not already see. Widening that means changing the device's
+ * `defaultCwd` (or making the caller an administrator); there is intentionally no
+ * "browse anywhere" for non-admins.
+ */
+narratorRoutes.get("/workspace-directory-browse", async (c) => {
+	const deviceId = c.req.query("deviceId")?.trim();
+	if (!deviceId) throw new ValidationError("deviceId is required");
+	const parsed = deviceBrowseQuerySchema.safeParse({
+		path: c.req.query("path") || undefined,
+		showHidden: c.req.query("showHidden") === "1",
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const device = await assertWorkspaceDeviceVisible(
+		deviceId,
+		c.req.query("projectId")?.trim() || null,
+		c.get("user").sub,
+	);
+	// Admins already hold the unrestricted /api/devices browse capability, so deriving a
+	// narrower scope for them would only break the admin picker.
+	if (c.get("user").role !== "admin") {
+		// Resolve the target the way the listing itself will, then decide: a refused path
+		// never reaches the device.
+		let target: ReturnType<typeof resolveRemoteBrowseTarget>;
+		try {
+			target = resolveRemoteBrowseTarget(device.id, parsed.data.path);
+		} catch (err) {
+			throw new ValidationError(err instanceof Error ? err.message : String(err));
+		}
+		const allowed = await isRemoteDeviceBrowsePathWithinNarratorScope({
+			deviceId: device.id,
+			target,
+			defaultCwd: device.defaultCwd ?? null,
+			rules: [],
+		});
+		if (!allowed) throw new AppError(DEVICE_BROWSE_FORBIDDEN_MESSAGE, 403, "FORBIDDEN");
+	}
+	try {
+		return c.json(
+			await browseRemoteDirectory(device.id, parsed.data.path, {
+				showHidden: parsed.data.showHidden,
+			}),
+		);
+	} catch (err) {
+		throw new ValidationError(err instanceof Error ? err.message : String(err));
+	}
+});
+
 // Create narrator
 narratorRoutes.post("/", async (c) => {
 	const body = await c.req.json();
@@ -1282,7 +1593,7 @@ narratorRoutes.post("/", async (c) => {
 	// tri-state override and "inherit" is resolved against the user's
 	// fastModeDefault on every turn, so changing that default also affects
 	// narrators created before the change.
-	const input = parsed.data;
+	const input = { ...parsed.data, model: normalizeAutoModelValueForSave(parsed.data.model) };
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -1300,7 +1611,16 @@ narratorRoutes.post("/", async (c) => {
 		});
 		projectDir = project?.gitPath ?? undefined;
 	}
-	const resolvedCwd = standaloneNarratorCwd(input, projectDir);
+	// The device comes first: it decides what the directory even means.
+	const deviceId = await resolveCreationDevice(
+		ownerUserId,
+		input.contextProjectId,
+		input.deviceId?.trim() || "local",
+	);
+	const resolvedCwd =
+		deviceId === "local"
+			? standaloneNarratorCwd(input, projectDir)
+			: await resolveRemoteCreationCwd(deviceId, input.cwd);
 	// Only ordinary HTTP project sessions adopt the legacy project defaults. External
 	// provisioning still uses the service's private default and frozen OAuth policy.
 	const audiences = input.contextProjectId
@@ -1320,6 +1640,7 @@ narratorRoutes.post("/", async (c) => {
 			...input,
 			...audiences,
 			cwd: resolvedCwd,
+			defaultDeviceId: deviceId === "local" ? null : deviceId,
 			ownerUserId,
 			creatorIsAdmin: user.role === "admin",
 			locale,
@@ -1331,6 +1652,7 @@ narratorRoutes.post("/", async (c) => {
 		...input,
 		...audiences,
 		cwd: resolvedCwd,
+		defaultDeviceId: deviceId === "local" ? null : deviceId,
 		ownerUserId,
 	});
 	return c.json(publicNarratorResponse(narrator), 201);
@@ -1589,6 +1911,31 @@ narratorRoutes.get("/:id/git/summary", async (c) => {
 	return c.json(summary);
 });
 
+/**
+ * The status bar's current task, from the task source (outline P2 PR 5): the first task in
+ * progress for either task backend (with its outline address), and for an outline session how
+ * many of its person-created goals wait for confirmation of being done, and how many of those the
+ * caller decides. Read access to the session.
+ */
+narratorRoutes.get("/:id/tasks/current", async (c) => {
+	const id = c.req.param("id");
+	getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const source = await taskSourceForNarrator(id);
+	// One read of the tasks; an unreadable source shows nothing rather than failing the bar.
+	const view = await source.statusBar(c.get("user").sub).catch(() => null);
+	const current = view?.current ?? null;
+	const body: NarratorCurrentTaskResponse = {
+		backend: source.backend,
+		current: current
+			? { text: current.text, address: current.address, protected: current.protected }
+			: null,
+		awaitingConfirmation: view?.awaitingConfirmation.total ?? 0,
+		awaitingYourConfirmation: view?.awaitingConfirmation.mine ?? 0,
+		awaitingFrom: view?.awaitingConfirmation.from ?? [],
+	};
+	return c.json(body);
+});
+
 narratorRoutes.get("/:id/panel-state", async (c) => {
 	const id = c.req.param("id");
 	const result = await getNarratorPanelState(id, c.get("user").sub, {
@@ -1648,6 +1995,15 @@ narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {
 	return c.json({
 		composerDocument: message.composerDocument ?? undefined,
 		images,
+		media: Array.isArray(blocks)
+			? blocks.filter(isMediaContentBlock).map((media) => ({
+					mediaId: media.mediaId,
+					filename: media.filename,
+					mediaType: media.mediaType,
+					size: media.size,
+					uploadNarratorId: media.uploadNarratorId ?? id,
+				}))
+			: [],
 		textFiles,
 		bodyRevision: message.bodyRevision,
 		text: Array.isArray(blocks)
@@ -1688,6 +2044,7 @@ narratorRoutes.get("/:id/buffer/:mid/composer-document", async (c) => {
 	return c.json({
 		composerDocument: message.composerDocument,
 		images,
+		media: message.media ?? [],
 		textFiles,
 		text: message.text,
 		fileReferences: (message.fileReferences ?? []).map((snapshot) => snapshot.reference),
@@ -1872,15 +2229,7 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	const body = await c.req.json();
 	const { text, style, withContext, messageId } = optimizePromptSchema.parse(body);
 
-	// Get system instruction for the chosen style
 	const locale = await getUserLanguage(userId);
-	let systemInstruction = getPromptOptimizeInstruction(style as PromptOptimizeStyle, locale);
-	// Multi-segment drafts wrap each segment in <<<NF_..._n>>> ... <<<NF_..._n_END>>> markers
-	// that the client uses to put results back; the model must echo them verbatim.
-	if (/<<<NF_[^>\n]+>>>/.test(text)) {
-		systemInstruction +=
-			"\n\nSEGMENT MARKERS: The draft contains several segments delimited by marker lines like <<<NF_xxx_0>>> and <<<NF_xxx_0_END>>>. Optimize each segment's content separately, and output every marker line EXACTLY as given, in the original order, each on its own line, with each segment's result between its start and end markers. Never merge, drop, reorder or alter markers, and add nothing outside them. This overrides the instruction to output only the prompt text.";
-	}
 
 	// Load context if requested
 	let contextText = "";
@@ -1893,76 +2242,15 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 		contextText = formatMessagesAsContext(contextMessages);
 	}
 
-	// Tag the user's text to prevent prompt injection
-	const taggedContent = contextText
-		? `${contextText}\n\n---\n\n<prompt>\n${text}\n</prompt>`
-		: `<prompt>\n${text}\n</prompt>`;
-
-	// Resolve the model (default follows summaryModel via __summary__)
-	const model = resolveEffectiveModel(settings.agent.promptOptimizeModel);
-
-	// Ask for the optimized text as a schema-constrained object when the resolved
-	// adapter can express one. `responseFormatDegraded` reports adapters that
-	// cannot (they must not silently ignore it), and the text path below is then
-	// the only source of truth.
-	const responseFormat: ResponseFormat = {
-		type: "json_schema",
-		name: OPTIMIZE_OUTPUT_SCHEMA_NAME,
-		schema: getOptimizeOutputSchema(),
-		strict: true,
-		// Lets the provider layer lift the rationale without knowing field names.
-		summaryField: OPTIMIZE_SUMMARY_FIELD,
-	};
-
-	// Follow the configured first-token budget; output clears the timer. Request
-	// cancellation remains connected to the provider throughout generation.
-	const generated = await generateWithFirstTokenTimeout(
-		(options) =>
-			summaryGenerate(
-				taggedContent,
-				systemInstruction,
-				{ narratorId, kind: "optimize" },
-				options.signal,
-				options.onTextDelta,
-				model,
-				undefined,
-				false,
-				options.onReasoningDelta,
-				undefined,
-				undefined,
-				{ responseFormat, onGenerationProgress: options.onGenerationProgress },
-			),
-		settings.agent.firstTokenTimeoutMs,
-		c.req.raw.signal,
-	).catch((err: unknown) => {
-		if (err instanceof Error && err.name === "TimeoutError") {
-			throw new ValidationError(err.message);
-		}
-		throw err;
+	const result = await runPromptOptimize({
+		text,
+		style,
+		locale,
+		contextText,
+		narratorId,
+		signal: c.req.raw.signal,
 	});
-
-	if (generated.responseFormatDegraded) {
-		// Log loss of native schema enforcement; validated fields remain usable.
-		logger.warn("Prompt optimize fell back to text parsing", {
-			narratorId,
-			model,
-			reason: generated.responseFormatDegraded,
-		});
-	}
-
-	const structured = readOptimizeResult(generated.structured);
-	// Failed or incomplete schema output is not prompt text. Keep the draft rather
-	// than leaking the raw JSON envelope (or a partial rewrite) into the composer.
-	if (generated.outputTruncated || (generated.structured !== undefined && !structured)) {
-		return c.json({ text, model });
-	}
-	// The validated field is already the payload; only plaintext fallback needs
-	// wrapper removal. Its examples, headings and literal thinking tags are content.
-	const result = structured?.optimizedPrompt ?? normalizeOptimizedPrompt(generated.text, text);
-	if (!structured && result.startsWith("{")) return c.json({ text, model });
-	const reasoningSummary = structured?.reasoningSummary ?? generated.reasoningSummary;
-
-	return c.json({ text: result, model, ...(reasoningSummary ? { reasoningSummary } : {}) });
+	return c.json(result);
 });
 
 // Get usage stats for this narrator, optionally including direct subagents.
@@ -2178,6 +2466,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const {
 		message,
 		images,
+		media,
 		textFiles,
 		priority: requestedPriority,
 		interrupt: requestedInterrupt,
@@ -2218,6 +2507,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Set when a busy `/goal` falls through to the buffer path, so the buffered
 		// response can prompt the UI to show a "queued protected task" toast.
 		let specGoalQueued = false;
+		let specGoalOutline = false;
 		let specGoalObjective = "";
 		const cmdResult =
 			queuedNewCommand || mixedDocument
@@ -2246,7 +2536,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			!("loadSkill" in cmdResult) &&
 			!("specGoal" in cmdResult)
 		) {
+			const locale = await getUserLanguage(userId);
+			const replyInUserLanguage = await getUserReplyInLanguage(userId);
 			const result = await acceptUserMessage(id, message, {
+				humanReplyContext: { locale, replyInUserLanguage },
 				userId,
 				commandText: message,
 				locale: await getUserLanguage(userId),
@@ -2330,12 +2623,19 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			);
 			return c.json(bashResult, 201);
 		}
-		// Handle /goal <objective> — add a protected task to spec://tasks.json and
-		// immediately start its first Spec execution turn. When the narrator is busy,
-		// queue the command and append/start it once the buffer consumer reaches it;
-		// this avoids mutating tasks.json in the middle of the current turn.
+		// Handle /goal <objective> — add its task where the session keeps its tasks (a protected
+		// todo in spec://tasks.json, or a person-created, locked task in the outline: P2 PR 5) and
+		// immediately start its first execution turn. When the narrator is busy, queue the command
+		// and add/start it once the buffer consumer reaches it; this avoids changing the tasks in
+		// the middle of the current turn.
 		if (cmdResult.resolved && "specGoal" in cmdResult) {
 			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+			// An outline subagent has no tasks of its own to add the goal to. Refused before
+			// anything is persisted, so nothing lands where the session cannot see.
+			if (await isRefusedOutlineGoal(id, rawCommand)) {
+				throw catalogError("GOAL_IN_OUTLINE_SESSION");
+			}
+			const goalBackend = await resolveTaskBackend(id);
 			// A compacting narrator counts as busy here for the same reason a running one
 			// does: appending the protected task now and starting its Spec turn would run
 			// that turn against the history the compact is replacing.
@@ -2345,59 +2645,176 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				isLoopRunning(id) ||
 				queueBehindCompaction;
 			if (!goalNarratorBusy) {
-				// Idle: persist the typed /goal command as the canonical user message and
-				// append the protected task immediately.
-				const userMsg = await narratorService.persistUserMessage(
-					id,
-					rawCommand,
-					[{ type: "text", text: rawCommand }],
-					rawCommand,
-					userId,
-				);
-				broadcastToNarrator(id, {
-					type: "user_message",
-					narratorId: id,
-					message: {
-						id: userMsg.id,
-						narratorId: id,
-						role: "user",
-						contentJson: userMsg.contentJson,
-						contentText: userMsg.contentText,
-						commandText: rawCommand,
-						createdAt: userMsg.createdAt,
-						seq: userMsg.seq,
-						children: [],
-						creator: userMsg.creator ?? null,
-					},
-				});
-				const { added, written } = await appendProtectedSpecTask(id, objective);
-				if (added) {
-					broadcastSpecChanged(
-						id,
-						{ uri: written.uri, path: written.path, revisionId: written.revisionId },
-						"ui",
-						"user",
-					);
-				}
-				// Leave a durable, self-explanatory card in the conversation so the
-				// effect of /goal is visible on scrollback, not only via a toast. This
-				// display-only side effect must not turn an already-applied goal into a
-				// failed command if message persistence is temporarily unavailable.
-				await persistGoalAddedNotice(id, objective, added).catch((err) => {
-					logger.warn("Failed to persist /goal confirmation notice", {
-						narratorId: id,
-						error: String(err),
-					});
-				});
 				const locale = await getUserLanguage(userId);
 				const replyInUserLanguage = await getUserReplyInLanguage(userId);
-				const { started } = await startSpecContinuationIfPossible(
-					id,
-					locale,
-					replyInUserLanguage,
-					userId,
+				const {
+					enqueueBufferedMessage,
+					projectMailboxUserMessage,
+					readBufferedMessageDeliveryReceipt,
+				} = await import("../services/narrator-buffer");
+				const { isNarratorRuntimeBusy, withNarratorStartAdmission } = await import(
+					"../services/narrator-session-state"
 				);
-				return c.json({ specGoal: true, added, objective, started }, 200);
+				const { getExecutionOwner } = await import("../services/agent-runtime/ownership");
+				const { claimInboxHead, withInboxOwner, wakeInboxIfEligible } = await import(
+					"../services/agent-runtime/inbox"
+				);
+				const result = await withNarratorStartAdmission(id, async () => {
+					// Recheck under admission: an idle HTTP snapshot does not own execution.
+					if (getExecutionOwner(id) || isNarratorRuntimeBusy(id) || isCompactInProgress(id))
+						return null;
+					const accepted = await enqueueBufferedMessage(
+						id,
+						rawCommand,
+						undefined,
+						rawCommand,
+						userId,
+						undefined,
+						undefined,
+						"back",
+						undefined,
+						undefined,
+						"fifo",
+						undefined,
+						"turn",
+						undefined,
+						undefined,
+						{ locale, replyInUserLanguage },
+					);
+					if (!accepted.ok) throw new ValidationError("Message queue is full");
+					try {
+						return await withInboxOwner(id, async () => {
+							const claimed = await claimInboxHead(
+								id,
+								(row) => row.id === accepted.id && row.kind === "user_input",
+							);
+							if (!claimed) return { accepted, outcome: null };
+							const outcome = await executeQueuedGoalCommand(
+								id,
+								projectMailboxUserMessage(claimed),
+								objective,
+							);
+							return { accepted, outcome };
+						});
+					} catch (error) {
+						// Acceptance already committed. Owner cleanup releases an uncommitted
+						// claim; never make the client retry and duplicate that durable input.
+						logger.warn("Accepted goal dispatch failed", {
+							narratorId: id,
+							messageId: accepted.id,
+							error: String(error),
+						});
+						const receipt = await readBufferedMessageDeliveryReceipt(id, accepted.id).catch(
+							() => undefined,
+						);
+						if (
+							receipt &&
+							(receipt.state === "queued" ||
+								receipt.state === "failed" ||
+								receipt.state === "claimed")
+						)
+							return { accepted, outcome: null };
+						// After materialization the user message/policy is committed, but a later
+						// task write can fail. Acknowledge it without claiming it is still queued.
+						return {
+							accepted,
+							outcome: null,
+							dispatchFailure: {
+								messageId: receipt?.recipientMessageId,
+								error: String(error),
+							},
+						};
+					}
+				});
+				if (result?.outcome) {
+					if (result.outcome.refused) throw catalogError("GOAL_IN_OUTLINE_SESSION");
+					const { started } = await startSpecContinuationIfPossible(
+						id,
+						locale,
+						replyInUserLanguage,
+						userId,
+					).catch((error) => {
+						logger.warn("Accepted goal continuation deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+						return { started: false };
+					});
+					const outcome = result.outcome;
+					return c.json(
+						{
+							specGoal: true,
+							added: outcome.added,
+							objective,
+							started,
+							...(outcome.outline
+								? {
+										taskBackend: "outline" as const,
+										address: outcome.outline.address,
+										locked: outcome.outline.locked,
+									}
+								: {}),
+						},
+						200,
+					);
+				}
+				if (result && "dispatchFailure" in result && result.dispatchFailure) {
+					try {
+						broadcastToNarrator(id, {
+							type: "narrator_error",
+							narratorId: id,
+							error:
+								locale === "zh-CN"
+									? `/goal 输入已接收，但目标处理失败。请检查任务列表后再决定是否重试。${result.dispatchFailure.error}`
+									: `The /goal input was accepted, but goal processing failed. Check the task list before retrying. ${result.dispatchFailure.error}`,
+						});
+					} catch (error) {
+						logger.warn("Accepted goal error notification deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+					}
+					return c.json(
+						{
+							accepted: true,
+							buffered: false,
+							objective,
+							started: false,
+							messageId: result.dispatchFailure.messageId,
+							goalError: result.dispatchFailure.error,
+						},
+						202,
+					);
+				}
+				if (result) {
+					// An earlier inbox row owns the next turn; do not consume this goal twice.
+					try {
+						broadcastToNarrator(id, {
+							type: "buffer_set",
+							narratorId: id,
+							messages: toBufferSummary(await getBufferedMessagesAsync(id)),
+						});
+					} catch (error) {
+						logger.warn("Accepted goal buffer notification deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+					}
+					void wakeInboxIfEligible(id, locale).catch((error) =>
+						logger.warn("Queued goal wake deferred", { narratorId: id, error: String(error) }),
+					);
+					return c.json(
+						{
+							buffered: true,
+							id: result.accepted.id,
+							bufferedAt: result.accepted.bufferedAt,
+							specGoalQueued: true,
+							objective,
+							...(goalBackend === "outline" ? { taskBackend: "outline" as const } : {}),
+						},
+						202,
+					);
+				}
 			}
 			// Busy: fall through to the shared buffer path. Carry the raw command so the
 			// buffer consumer recognizes it as a /goal, appends the task, and starts its
@@ -2406,6 +2823,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			commandText = rawCommand;
 			specGoalQueued = true;
 			specGoalObjective = objective;
+			specGoalOutline = goalBackend === "outline";
 		}
 		let prePromptBashCommand: string | undefined;
 		if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
@@ -2468,6 +2886,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				dangerReflectionOverride: normalizeDangerReflectionOverride(
 					narrator.dangerReflectionOverride,
 				),
+				questionReflectionOverride: normalizeBooleanOverride(narrator.questionReflectionOverride),
 				autoContinuationOverride: normalizeAutoContinuationOverride(
 					narrator.autoContinuationOverride,
 				),
@@ -2478,16 +2897,21 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			});
 			const locale = await getUserLanguage(userId);
 			const replyInUserLanguage = await getUserReplyInLanguage(userId);
-			if (queuedNewCommand.initialMessage) {
+			if (queuedNewCommand.initialMessage || media.length > 0) {
 				await sendMessage(
 					newNarrator.id,
-					queuedNewCommand.initialMessage,
+					queuedNewCommand.initialMessage ?? "",
 					images,
 					locale,
 					replyInUserLanguage,
 					undefined,
 					userId,
 					textFiles,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					media,
 				);
 				uploadsAccepted = true;
 			}
@@ -2515,7 +2939,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// The service atomically enqueues and claims this message, or leaves it queued
 		// behind an existing owner/backlog. HTTP status observations never decide admission.
 		const result = await acceptUserMessage(id, finalMessage, {
+			humanReplyContext: { locale, replyInUserLanguage },
 			images,
+			media,
 			locale,
 			replyInUserLanguage,
 			commandText,
@@ -2539,7 +2965,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					buffered: true,
 					bufferedAt: result.bufferedAt,
 					id: result.id,
-					...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
+					...(specGoalQueued
+						? {
+								specGoalQueued: true,
+								objective: specGoalObjective,
+								...(specGoalOutline ? { taskBackend: "outline" as const } : {}),
+							}
+						: {}),
 				},
 				202,
 			);
@@ -2547,6 +2979,16 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		return c.json(fileReferenceMessageForDisplay(result.userMsg), 201);
 	} finally {
 		if (!uploadsAccepted) {
+			for (const item of media) {
+				try {
+					deleteUploadedMedia(id, item.mediaId);
+				} catch (error) {
+					logger.warn("Failed to clean rejected media upload", {
+						mediaId: item.mediaId,
+						error: String(error),
+					});
+				}
+			}
 			for (const image of images) {
 				try {
 					deleteUploadedImage(id, image.imageId);
@@ -2554,6 +2996,20 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					logger.warn("Failed to clean rejected message upload", {
 						narratorId: id,
 						imageId: image.imageId,
+						error: String(error),
+					});
+				}
+			}
+			// Staged uploads are only consumed once an attachment reaches its
+			// durable location. A rejected message never got that far, so anything
+			// still staged would sit there until the TTL sweep — which for a
+			// gigabyte attachment is a long time to hold disk for a failed send.
+			for (const file of textFiles) {
+				try {
+					releaseStagedAttachment(file);
+				} catch (error) {
+					logger.warn("Failed to clean rejected staged attachment", {
+						narratorId: id,
 						error: String(error),
 					});
 				}
@@ -2575,7 +3031,10 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId);
+	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId, {
+		locale,
+		replyInUserLanguage,
+	});
 	return c.json(result);
 });
 
@@ -2614,8 +3073,10 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			deletedMessageIds: [recoveryMessageId],
 		});
 	};
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+	const humanReplyContext = { locale, replyInUserLanguage };
 	const { manuallyResumeRestartRecovery } = await import("../services/restart-recovery-service");
-	if (await manuallyResumeRestartRecovery(id)) {
+	if (await manuallyResumeRestartRecovery(id, humanReplyContext)) {
 		await dismissRecoveryMessage();
 		return c.json({
 			ok: true,
@@ -2623,7 +3084,6 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [],
 		});
 	}
-	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	// Seamless subagent recovery: when the latest assistant turn still holds
 	// unfinished Agent / Await work, re-drive it first. The recovery flow owns the
@@ -2634,6 +3094,7 @@ narratorRoutes.post("/:id/continue", async (c) => {
 		locale,
 		replyInUserLanguage,
 		userId,
+		humanReplyContext,
 	});
 	if (recovery.recovering) {
 		await dismissRecoveryMessage();
@@ -2644,7 +3105,14 @@ narratorRoutes.post("/:id/continue", async (c) => {
 		});
 	}
 
-	const result = await continueNarrator(id, locale, replyInUserLanguage, userId);
+	const result = await continueNarrator(
+		id,
+		locale,
+		replyInUserLanguage,
+		userId,
+		undefined,
+		humanReplyContext,
+	);
 	await dismissRecoveryMessage();
 	return c.json({
 		...result,
@@ -2702,6 +3170,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 			locale,
 			replyInUserLanguage,
 			userId,
+			humanReplyContext: { locale, replyInUserLanguage },
 		});
 		return c.json({ ok: true, mode: "await", resumed: resumed.length, skipped });
 	}
@@ -2817,10 +3286,12 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	let scope: RevertScope | undefined;
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
+	let keepMediaIds: string[] | undefined;
 	// undefined => keep all existing text files (legacy); array => keep only these paths.
 	let keepTextFilePaths: string[] | undefined;
 	// Editing uploads are only parsed/validated here. The service owns every file write.
 	const newImages: File[] = [];
+	const newMedia: File[] = [];
 	const newTextFiles: File[] = [];
 
 	const parseJsonStringArray = (raw: FormDataEntryValue | null, field: string): string[] => {
@@ -2860,6 +3331,8 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 				throw new ValidationError("Invalid confirmed revert plan");
 			}
 		}
+		if (formData.has("keepMediaIds"))
+			keepMediaIds = parseJsonStringArray(formData.get("keepMediaIds"), "keepMediaIds");
 		if (typeof formData.get("keepImageIds") === "string") {
 			keepImageIds = parseJsonStringArray(formData.get("keepImageIds"), "keepImageIds");
 		}
@@ -2869,6 +3342,21 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 				"keepTextFilePaths",
 			);
 		}
+		const mediaFiles = formData.getAll("media") as File[];
+		if (mediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+			throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+		const detectedMedia = [];
+		for (const file of mediaFiles)
+			detectedMedia.push({
+				filename: file.name,
+				size: file.size,
+				mediaType: await validateUploadedMedia(file),
+			});
+		({
+			document: composerDocument,
+			text: content,
+			references: fileReferences,
+		} = bindComposerMediaProjection(composerDocument, content, fileReferences, detectedMedia));
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -2878,21 +3366,28 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 			newImages.push(file);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
-			throw new ValidationError(
-				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
-			);
-		}
+		const orderedTextFiles = resolveStagedAttachments(
+			id,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
 		for (const file of textFileEntries) {
 			validateTextFile(file);
-			newTextFiles.push(file);
 		}
-		const attachmentBytes = [...imageFiles, ...textFileEntries].reduce(
+		newMedia.push(...mediaFiles);
+		newTextFiles.push(...orderedTextFiles);
+		// Everything that arrived inside this multipart body was buffered by
+		// `req.formData()`; staged text files did not, so they are excluded here and
+		// bounded by the 2 GiB ceiling below instead.
+		const bodyBytes = [...imageFiles, ...textFileEntries, ...mediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
-		if (attachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+		if (bodyBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+		}
+		if (attachmentBytesOf(newTextFiles) > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 		}
 	} else {
 		const body = editAndRegenerateJsonSchema.parse(await c.req.json());
@@ -2904,6 +3399,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 		revertPlan = body.revertPlan;
 		scope = body.scope;
 		keepImageIds = body.keepImageIds;
+		keepMediaIds = body.keepMediaIds;
 		keepTextFilePaths = body.keepTextFilePaths;
 	}
 
@@ -2948,9 +3444,12 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage, {
+		humanReplyContext: { locale, replyInUserLanguage },
 		fileReferences: snapshots,
 		composerDocument,
 		keepImageIds,
+		keepMediaIds,
+		newMedia: newMedia.length ? newMedia : undefined,
 		newImages: newImages.length > 0 ? newImages : undefined,
 		keepTextFilePaths,
 		newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
@@ -3115,8 +3614,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	let fileReferences: FileReference[] | undefined;
 	let composerDocument: ComposerDocument | undefined;
 	let keepImageIds: string[] | undefined;
+	let keepMediaIds: string[] | undefined;
 	let keepTextFiles: Array<{ index: number; filename: string }> | undefined;
 	const newImageFiles: File[] = [];
+	const newMediaFiles: File[] = [];
 	const newTextFiles: File[] = [];
 
 	const contentType = c.req.header("content-type") ?? "";
@@ -3128,6 +3629,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			...(rawText !== undefined ? { text: rawText } : {}),
 			fileReferences: parseFileReferenceInput(formData.get("fileReferences")),
 			composerDocument: parseOptionalComposerDocument(formData.get("composerDocument")),
+			...(formData.has("keepMediaIds")
+				? { keepMediaIds: parseJsonArrayField(formData.get("keepMediaIds"), "keepMediaIds") }
+				: {}),
 			...(formData.has("keepImageIds")
 				? { keepImageIds: parseJsonArrayField(formData.get("keepImageIds"), "keepImageIds") }
 				: {}),
@@ -3137,31 +3641,53 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		});
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 		keepImageIds = parsed.data.keepImageIds;
+		keepMediaIds = parsed.data.keepMediaIds;
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
 		if (rawText !== undefined) rawText = restoreMultipartComposerText(rawText, composerDocument);
 
+		for (const file of formData.getAll("media") as File[]) {
+			await validateUploadedMedia(file);
+			newMediaFiles.push(file);
+		}
 		for (const file of formData.getAll("images") as File[]) {
 			validateUploadedImage(file);
 			newImageFiles.push(file);
 		}
-		for (const file of formData.getAll("textFiles") as File[]) {
+		const textFileEntries = formData.getAll("textFiles") as File[];
+		const orderedTextFiles = resolveStagedAttachments(
+			id,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
+		for (const file of textFileEntries) {
 			validateTextFile(file);
-			newTextFiles.push(file);
 		}
-		const uploadBytes = [...newImageFiles, ...newTextFiles].reduce(
+		newTextFiles.push(...orderedTextFiles);
+		// The multipart body (images, inline text files, media) was buffered whole by
+		// `req.formData()` and keeps the 128 MiB budget; staged text files only count
+		// toward the 2 GiB per-message ceiling.
+		const bodyBytes = [...newImageFiles, ...textFileEntries, ...newMediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
-		if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+		if (bodyBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+		}
+		const uploadBytes = [...newImageFiles, ...newTextFiles, ...newMediaFiles].reduce(
+			(total, file) => total + file.size,
+			0,
+		);
+		if (uploadBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 		}
 	} else {
 		const parsed = updateBufferedMessageSchema.safeParse(await c.req.json());
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 		rawText = parsed.data.text;
 		keepImageIds = parsed.data.keepImageIds;
+		keepMediaIds = parsed.data.keepMediaIds;
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
@@ -3172,7 +3698,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	// Omitted text keeps the current wording, so a client that only manages
 	// attachments does not have to echo the message body back.
-	const text = composerDocument
+	let text = composerDocument
 		? (rawText ?? located.message.text)
 		: (rawText ?? located.message.text).trim();
 	const { keptImages, keptTextFileIndexes } = resolveKeptBufferAttachments(
@@ -3181,6 +3707,40 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepTextFiles,
 	);
 
+	if (
+		keepMediaIds?.some(
+			(mediaId) => !(located.message.media ?? []).some((item) => item.mediaId === mediaId),
+		)
+	) {
+		throw new ValidationError(
+			"Queued attachments changed since this edit started; reload and try again",
+		);
+	}
+	const keptMedia = (located.message.media ?? []).filter(
+		(item) => keepMediaIds === undefined || keepMediaIds.includes(item.mediaId),
+	);
+	const detectedMedia = await Promise.all(
+		newMediaFiles.map(async (file) => ({
+			filename: file.name,
+			size: file.size,
+			mediaType: await validateUploadedMedia(file),
+		})),
+	);
+	const normalized = bindComposerMediaProjection(
+		composerDocument,
+		text,
+		fileReferences ?? located.message.fileReferences?.map((snapshot) => snapshot.reference),
+		[...keptMedia, ...detectedMedia],
+	);
+	composerDocument = normalized.document;
+	text = normalized.text;
+	// Persist the normalized projection even when the client omitted references and
+	// the queue's existing snapshots supplied them. The replacement helper reuses
+	// their captured bytes while updating the projected ranges.
+	if (fileReferences !== undefined || (composerDocument && located.message.fileReferences?.length))
+		fileReferences = normalized.references;
+	if (keptMedia.length + newMediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
 	if (keptImages.length + newImageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 	}
@@ -3200,6 +3760,18 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	) {
 		throw new ValidationError("File references are not supported by queued /new or /goal commands");
 	}
+	// Nor an outline subagent's refusal of /goal: an edit must not turn a queued message into one.
+	if (
+		await isRefusedOutlineGoal(
+			id,
+			text,
+			located.message.commandText,
+			composerDocument,
+			located.message.executionIntent,
+		)
+	) {
+		throw catalogError("GOAL_IN_OUTLINE_SESSION");
+	}
 	const snapshots = await replaceFileReferenceSnapshots(
 		located.message.fileReferences ?? [],
 		fileReferences,
@@ -3212,7 +3784,13 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	const finalReferenceCount = (snapshots ?? located.message.fileReferences ?? []).length;
 	const finalImageCount = keptImages.length + newImageFiles.length;
 	const finalTextFileCount = keptTextFileIndexes.length + newTextFiles.length;
-	if (!text && finalImageCount === 0 && finalTextFileCount === 0 && finalReferenceCount === 0) {
+	if (
+		!text &&
+		finalImageCount === 0 &&
+		finalTextFileCount === 0 &&
+		finalReferenceCount === 0 &&
+		keptMedia.length + newMediaFiles.length === 0
+	) {
 		throw new ValidationError("Message cannot be empty");
 	}
 
@@ -3231,6 +3809,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	// Everything this request writes to disk, so a failure leaves nothing behind.
 	const createdImageIds: string[] = [];
+	const createdMedia: MediaRef[] = [];
 	let createdSavedFiles: SavedBufferedFile[] = [];
 	let committed = false;
 	try {
@@ -3243,6 +3822,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			);
 		}
 
+		for (const file of newMediaFiles) createdMedia.push(await saveUploadedMedia(id, file));
 		// Both actor types retain the same saved paths; never re-upload kept Files.
 		createdSavedFiles = newTextFiles.length
 			? await persistAdditionalBufferedTextFiles(
@@ -3254,14 +3834,20 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
 		const ok = await updateBufferedMessage(id, mid, text, {
 			images: [...keptImages, ...newImages],
+			media: [...keptMedia, ...createdMedia],
 			savedFiles,
 			fileReferences: snapshots,
 			composerDocument,
 		});
 		if (!ok) throw new NotFoundError("Buffered message", mid);
 		committed = true;
+		// The queued row now references its own mailbox copies, so the staged
+		// originals can go. Only after the update landed: a refused edit keeps them,
+		// so the composer's retry can still claim the same uploads.
+		releaseStagedFiles(newTextFiles);
 	} finally {
 		if (!committed) {
+			for (const item of createdMedia) deleteUploadedMedia(id, item.mediaId);
 			for (const imageId of createdImageIds) deleteUploadedImage(id, imageId);
 			for (const file of createdSavedFiles) deleteBufferedTextFile(file);
 		}
@@ -3272,6 +3858,8 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	for (const image of droppedImages) {
 		deleteUploadedImage(image.uploadNarratorId ?? id, image.imageId);
 	}
+	// A source-owned media reference may also be used by a fork. Removing a ref
+	// never deletes shared bytes; only newly-created uncommitted uploads are rolled back.
 	for (const file of droppedSavedFiles) deleteBufferedTextFile(file);
 
 	await broadcastBufferQueue(id);
@@ -4615,6 +5203,65 @@ export function isDeviceBrowsePathWithinNarratorScope(input: {
 	});
 }
 
+/**
+ * Canonical counterpart to the cheap lexical preflight above. Both are required:
+ * lexical containment rejects obvious escapes without any device RPC, while the
+ * device-resolved paths catch symlinks and Windows junctions before `fs.list`.
+ * Missing canonical support, malformed responses and unreadable roots fail closed.
+ */
+export async function isRemoteDeviceBrowsePathWithinNarratorScope(
+	input: {
+		deviceId: string;
+		target: ReturnType<typeof resolveRemoteBrowseTarget>;
+		defaultCwd: string | null;
+		rules: readonly { path: string; pathFlavor: PathFlavor; enabled: boolean }[];
+	},
+	resolvePath: (deviceId: string, path: string) => Promise<string> = resolveRemoteBrowsePath,
+): Promise<boolean> {
+	if (
+		!isDeviceBrowsePathWithinNarratorScope({
+			requestedPath: input.target.path,
+			pathFlavor: input.target.pathFlavor,
+			defaultCwd: input.defaultCwd,
+			rules: input.rules,
+		})
+	) {
+		return false;
+	}
+
+	let resolvedTarget: string;
+	try {
+		resolvedTarget = await resolvePath(input.deviceId, input.target.path);
+	} catch {
+		return false;
+	}
+	const anchors = [
+		...(input.defaultCwd?.trim() ? [input.defaultCwd.trim()] : []),
+		...input.rules
+			.filter((rule) => rule.enabled && rule.pathFlavor === input.target.pathFlavor)
+			.map((rule) => rule.path),
+	];
+	for (const anchor of anchors) {
+		try {
+			const resolvedAnchor = await resolvePath(input.deviceId, anchor);
+			if (
+				isDeviceBrowsePathWithinNarratorScope({
+					requestedPath: resolvedTarget,
+					pathFlavor: input.target.pathFlavor,
+					defaultCwd: resolvedAnchor,
+					rules: [],
+				})
+			) {
+				return true;
+			}
+		} catch {
+			// One malformed or disappearing rule must not authorize the target, but it
+			// also need not disable another independent valid root.
+		}
+	}
+	return false;
+}
+
 narratorRoutes.get("/:id/device-browse", async (c) => {
 	const narratorId = c.req.param("id");
 	const deviceId = c.req.query("deviceId");
@@ -4646,9 +5293,9 @@ narratorRoutes.get("/:id/device-browse", async (c) => {
 		const deviceRules = [...rules.directoryWhitelist, ...rules.directoryBlacklist].filter(
 			(rule) => rule.selector.kind === "device" && rule.selector.deviceId === deviceId,
 		);
-		const allowed = isDeviceBrowsePathWithinNarratorScope({
-			requestedPath: target.path,
-			pathFlavor: target.pathFlavor,
+		const allowed = await isRemoteDeviceBrowsePathWithinNarratorScope({
+			deviceId,
+			target,
 			defaultCwd: target.defaultCwd,
 			rules: deviceRules,
 		});
@@ -4726,8 +5373,9 @@ narratorRoutes.patch("/:id/model", async (c) => {
 			c.get("user").sub,
 		);
 	}
-	await narratorService.updateModel(id, parsed.data.model);
-	await updateNarratorModel(id, parsed.data.model);
+	const model = normalizeAutoModelValueForSave(parsed.data.model);
+	await narratorService.updateModel(id, model);
+	await updateNarratorModel(id, model);
 	return c.json({ ok: true });
 });
 
@@ -4831,12 +5479,31 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		columns: { id: true },
 	});
 	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
+	// An outline session plans in the outline (outline P2 PR 8): its plan root is made or resumed
+	// now, and the result names it instead of a plan file.
+	const { enterOutlinePlanMode } = await import("../services/outline-plan-mode");
+	const outline = await enterOutlinePlanMode({
+		narratorId: id,
+		userId,
+		input: {},
+		locale: locale as Locale,
+		toolCallId: manualToolCall.id,
+		messageId: msg.id,
+	}).catch((error: unknown) => {
+		logger.warn("Outline plan root could not be made on the plan-mode switch", {
+			narratorId: id,
+			error: String(error),
+		});
+		return null;
+	});
 	await narratorService.updateToolCallResult(
 		toolUseId,
 		{
-			output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
-				planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
-			}),
+			output:
+				outline?.output ??
+				getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
+					planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
+				}),
 			status: "success",
 			// The following message broadcast already accounts for this persisted tool state.
 			bumpMessageVersion: false,
@@ -4888,6 +5555,12 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	const message = getToolMessage("planModeCancelled", locale);
 	const cancelledPermissions = await cancelPendingExitPlanMode(id, message);
 	const planState = await exitNarratorPlanMode(id);
+	// An outline session's unapproved plan stays planning (never executed); an empty one goes
+	// (outline P2 PR 8, D48 Q3).
+	if (planState.wasPlanMode) {
+		const { cancelOutlinePlanMode } = await import("../services/outline-plan-mode");
+		await cancelOutlinePlanMode(id, userId);
+	}
 	const active = activeNarrators.get(id);
 	if (active) {
 		active._planFileId = undefined;
@@ -5007,6 +5680,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	const updates: {
 		planReflectionAutoApproveOverride?: BooleanOverride;
 		dangerReflectionOverride?: DangerReflectionOverride;
+		questionReflectionOverride?: BooleanOverride;
 		autoContinuationOverride?: AutoContinuationOverride;
 		tasksReminderIntervalOverride?: number | null;
 	} = {};
@@ -5014,6 +5688,12 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 		updates.planReflectionAutoApproveOverride = parseBooleanOverride(
 			input.planReflectionAutoApproveOverride,
 			"planReflectionAutoApproveOverride",
+		);
+	}
+	if (Object.hasOwn(input, "questionReflectionOverride")) {
+		updates.questionReflectionOverride = parseBooleanOverride(
+			input.questionReflectionOverride,
+			"questionReflectionOverride",
 		);
 	}
 	if (Object.hasOwn(input, "dangerReflectionOverride")) {
@@ -5048,6 +5728,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	}
 	if (
 		!updates.planReflectionAutoApproveOverride &&
+		!updates.questionReflectionOverride &&
 		!updates.dangerReflectionOverride &&
 		!updates.autoContinuationOverride &&
 		!Object.hasOwn(updates, "tasksReminderIntervalOverride")
@@ -5150,6 +5831,9 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 narratorRoutes.patch("/:id/archive", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
+	// 归档会删掉侧栏那一行（连同它所在的文件夹）。先记住位置，撤销归档时才放得回去。
+	const { rememberArchivedTabPlacement } = await import("../services/recent-tabs-service");
+	await rememberArchivedTabPlacement(c.get("user").sub, id);
 	// HTTP write ACL and Agent controller authorization share the same mechanism:
 	// end the complete run (including a hold), then archive any kind of session.
 	const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
@@ -5162,8 +5846,11 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 // Unarchive narrator
 narratorRoutes.patch("/:id/unarchive", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	const narrator = await narratorService.getById(id);
 	await narratorService.updateStatus(id, "idle");
+	// 位置还留着、文件夹也还在时，直接回到它原来所在的那一层。
+	const { restoreArchivedTabPlacement } = await import("../services/recent-tabs-service");
+	await restoreArchivedTabPlacement(c.get("user").sub, id, narrator.title ?? id);
 	return c.json({ ok: true });
 });
 
@@ -5824,6 +6511,26 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
 	return c.json({ ok: true });
+});
+
+/**
+ * A person's decision on an outline session's submitted plan (outline P2 PR 8, D48): return it,
+ * execute it as a draft, or lock it and execute it. The outline is written first, then the
+ * waiting ExitPlanMode is resolved, so a refused decision (403, 409) leaves it waiting.
+ */
+narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
+	const requestId = c.req.param("requestId");
+	const user = c.get("user");
+	const parsed = outlinePlanDecisionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	const { decideOutlinePlanRequest } = await import("../services/outline-plan-mode");
+	const result = await decideOutlinePlanRequest({
+		requestId,
+		principal: { userId: user.sub, isAdmin: user.role === "admin" },
+		body: parsed.data,
+	});
+	const response: OutlinePlanDecisionResponse = { ok: true, commit: result.commit };
+	return c.json(response);
 });
 
 /**

@@ -55,6 +55,8 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	onDeliveryResolved?: (target: SendDeliveryTarget & { deliveryMessageId: string }) => void;
 	onTargetsResolved?: (count: number) => void;
 	message: string;
+	/** Display intent only; false messages remain readable by the user. Defaults to false for Send. */
+	showToUser?: boolean;
 	doInterrupt?: boolean;
 	/**
 	 * Explicitly restart a direct child whose last turn ended with an error. Agent
@@ -902,6 +904,7 @@ async function deliverSubagentMessageToParent(
 		input.toolUseId,
 		input.message,
 		input.toolCallBinding,
+		input.showToUser ?? false,
 	);
 	const accepted = await enqueueInboxAgent(delivery, input.message, {
 		channel: "parent",
@@ -1086,6 +1089,7 @@ export async function sendSubagentMessageDetailed(
 				input.toolUseId,
 				input.message,
 				input.toolCallBinding,
+				input.showToUser ?? false,
 			);
 			let deliveryMessageId = delivery.recipientMessageId;
 

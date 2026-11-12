@@ -163,6 +163,81 @@ describe("structured send snapshots", () => {
 		});
 		return { doc, projection, images, textFiles };
 	}
+	function mediaDraft(mediaOnly = false) {
+		const media = [
+			new File([new Uint8Array([0, 128, 255])], "voice.wav", { type: "audio/wav" }),
+			new File([new Uint8Array([255, 0, 129])], "clip.mp4", { type: "video/mp4" }),
+		];
+		const assets = [media[1], media[0]].map((file) => ({
+			id: getComposerAssetId(file),
+			kind: file.type === "audio/wav" ? ("audio" as const) : ("video" as const),
+			name: file.name,
+			size: file.size,
+			mimeType: file.type,
+		}));
+		const doc: ComposerDocument = {
+			version: 1,
+			assets,
+			paragraphs: [
+				{
+					children: [
+						...(mediaOnly ? [] : [{ type: "text" as const, text: "检查😀 " }]),
+						...assets.map((asset) => ({
+							type: "attachment" as const,
+							id: `${asset.id}-node`,
+							assetId: asset.id,
+						})),
+					],
+				},
+			],
+		};
+		const projection = composerDocumentText(doc);
+		Object.assign(options.composerRef.current ?? {}, {
+			getDocument: () => doc,
+			getText: () => projection.text,
+			getFileReferences: () => projection.fileReferences,
+			isTextEmpty: () => !projection.text,
+		});
+		return { media, doc, projection };
+	}
+	for (const state of ["busy", "idle", "compacting"] as const) {
+		for (const mediaOnly of [false, true]) {
+			test(`${state} sends ${mediaOnly ? "media-only" : "text plus media"} in exact manifest order`, async () => {
+				const { media, doc, projection } = mediaDraft(mediaOnly);
+				await render({
+					isActive: state === "busy",
+					showCompactQueueChoice: state === "compacting",
+					attachedMedia: media,
+				});
+				await act(async () => actions.handleSend());
+				expect(send).toHaveBeenCalledTimes(1);
+				expect(send.mock.calls[0]?.[1]).toBe(projection.text);
+				expect(send.mock.calls[0]?.[10]).toEqual({ composerDocument: doc });
+				expect(send.mock.calls[0]?.[11]).toEqual([media[1], media[0]]);
+				const uploaded = send.mock.calls[0]?.[11]?.[0];
+				if (!uploaded) throw new Error("Expected native media upload");
+				expect(new Uint8Array(await uploaded.arrayBuffer())).toEqual(new Uint8Array([255, 0, 129]));
+				expect(notify).not.toHaveBeenCalled();
+			});
+		}
+		test(`${state} cancelled native upload restores the identical rich document and media`, async () => {
+			const { media, doc } = mediaDraft();
+			send.mockRejectedValue(new DOMException("Cancelled", "AbortError"));
+			await render({
+				isActive: state === "busy",
+				showCompactQueueChoice: state === "compacting",
+				attachedMedia: media,
+			});
+			await act(async () => actions.handleSend());
+			expect(send.mock.calls[0]?.[11]).toEqual([media[1], media[0]]);
+			expect(options.composerRef.current?.getDocument?.()).toBe(doc);
+			expect(options.composerRef.current?.getText()).toBe(composerDocumentText(doc).text);
+			expect(options.attachedMedia).toEqual(media);
+			expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+			expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		});
+	}
 	test.each([
 		"busy",
 		"idle",
@@ -1368,10 +1443,11 @@ describe("send ownership across narrator switches", () => {
 		"switch-back",
 		"remount",
 		"account",
-	] as const)("%s does not revive the previous request when it succeeds late", async (change) => {
+	] as const)("%s does not revive the previous upload when it succeeds late", async (change) => {
 		const request = deferred<{ buffered: boolean; id: string }>();
 		send.mockImplementationOnce(() => request.promise);
-		await render({ currentUser: { id: "owner" } });
+		const file = new File(["contents"], "log.txt", { type: "text/plain" });
+		await render({ currentUser: { id: "owner" }, attachedTextFiles: [file] });
 		let pending!: Promise<void>;
 		await act(async () => {
 			pending = actions.handleSend();
@@ -1398,6 +1474,105 @@ describe("send ownership across narrator switches", () => {
 		expect(options.setNarratorWorking).not.toHaveBeenCalled();
 		expect(actions.sendingState).toBeNull();
 		expect(notify).not.toHaveBeenCalled();
+	});
+
+	describe("a sent text message is not abandoned by switching", () => {
+		let getDraft: ReturnType<typeof spyOn<typeof api, "getNarratorDraft">>;
+		let putDraft: ReturnType<typeof spyOn<typeof api, "updateNarratorDraft">>;
+		let serverText: string;
+		const draftState = (text: string, revision: number) => ({
+			hasDraft: !!text,
+			text,
+			revision,
+			updatedAt: "2026-01-01T00:00:00Z",
+			updatedBy: "owner",
+			sourceId: null,
+		});
+		beforeEach(() => {
+			serverText = "replace";
+			getDraft = spyOn(api, "getNarratorDraft").mockImplementation(async () =>
+				draftState(serverText, 4),
+			);
+			putDraft = spyOn(api, "updateNarratorDraft").mockImplementation(async (_id, text) => ({
+				ok: true,
+				traits: [],
+				...draftState(text, 5),
+			}));
+		});
+		afterEach(() => {
+			getDraft.mockRestore();
+			putDraft.mockRestore();
+		});
+		async function sendThenSwitch(owner: string) {
+			const request = deferred<{ buffered: boolean; id: string }>();
+			send.mockImplementationOnce(() => request.promise);
+			await render({ currentUser: { id: owner } });
+			let pending!: Promise<void>;
+			await act(async () => {
+				pending = actions.handleSend();
+			});
+			const signal = send.mock.calls[0]?.[6];
+			await render({ narratorId: "other" });
+			expect(signal?.aborted).toBe(false);
+			expect(actions.isSending).toBe(false);
+			expect(options.sendingRef.current).toBe(false);
+			return { request, pending };
+		}
+
+		test("acceptance after switching away clears the sent draft on the server", async () => {
+			const { request, pending } = await sendThenSwitch("delivered-away");
+			await act(async () => {
+				request.resolve({ buffered: true, id: "accepted" });
+				await pending;
+			});
+			await act(async () => {
+				await Promise.resolve();
+			});
+			expect(getDraft).toHaveBeenCalledTimes(1);
+			expect(getDraft.mock.calls[0]?.[0]).toBe("n");
+			expect(putDraft).toHaveBeenCalledTimes(1);
+			expect(putDraft.mock.calls[0]?.slice(0, 2)).toEqual(["n", ""]);
+			// The stale request must not touch the narrator now on screen.
+			expect(queue.map((entry) => entry.id)).toEqual(["existing"]);
+			expect(options.composerRef.current?.clearTextAndDraft).not.toHaveBeenCalled();
+		});
+
+		test("a draft edited since the send is kept", async () => {
+			serverText = "typed on another device";
+			const { request, pending } = await sendThenSwitch("delivered-edited");
+			await act(async () => {
+				request.resolve({ buffered: true, id: "accepted" });
+				await pending;
+			});
+			await act(async () => {
+				await Promise.resolve();
+			});
+			expect(getDraft).toHaveBeenCalledTimes(1);
+			expect(putDraft).not.toHaveBeenCalled();
+		});
+
+		test("switching back before acceptance clears the remounted composer", async () => {
+			const { request, pending } = await sendThenSwitch("delivered-back");
+			await render({ narratorId: "n" });
+			await act(async () => {
+				request.resolve({ buffered: true, id: "accepted" });
+				await pending;
+			});
+			expect(options.composerRef.current?.clearTextAndDraft).toHaveBeenCalledTimes(1);
+			expect(options.clearAttachedFilesAndDraft).toHaveBeenCalledTimes(1);
+			expect(getDraft).not.toHaveBeenCalled();
+		});
+
+		test("a rejected send keeps the draft", async () => {
+			const { request, pending } = await sendThenSwitch("delivered-rejected");
+			await act(async () => {
+				request.reject(new Error("queue full"));
+				await pending;
+			});
+			expect(getDraft).not.toHaveBeenCalled();
+			expect(putDraft).not.toHaveBeenCalled();
+			expect(notify).not.toHaveBeenCalled();
+		});
 	});
 
 	test("unmount aborts the transport and retains Files without waiting for rejection", async () => {

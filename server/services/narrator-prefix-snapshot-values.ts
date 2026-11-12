@@ -16,6 +16,12 @@ export function isPrefixToolsManifest(value: unknown): value is PrefixToolsManif
 
 /** Freeze once per object identity, with cooperative traversal and no JSON/string copies. */
 const frozen = new WeakMap<object, number>();
+/** Read the measurement established when adopting an immutable snapshot. */
+export function prefixValueBytes(value: object): number {
+	const bytes = frozen.get(value);
+	if (bytes === undefined) throw new Error("Prefix snapshot value has not been adopted");
+	return bytes;
+}
 export async function freezePrefixValue(
 	value: unknown,
 	check: () => void = () => {},

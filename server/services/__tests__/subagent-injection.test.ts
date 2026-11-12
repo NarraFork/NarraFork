@@ -66,13 +66,13 @@ const { AnthropicProvider } = await import("../../lib/agent/anthropic-provider")
  * provider from settings and throws in a test environment that has none. The filter
  * under test (`!m.parentToolUseId`) lives in the adapter either way.
  */
-async function buildAnthropicHistoryForTest(rows: unknown[]) {
+async function buildAnthropicHistoryForTest(rows: readonly unknown[]) {
 	const provider = new (
 		AnthropicProvider as unknown as new (
 			config: Record<string, unknown>,
 		) => {
 			buildHistory: (
-				rows: unknown[],
+				rows: readonly unknown[],
 				model: string,
 			) => Promise<{
 				history: unknown[];

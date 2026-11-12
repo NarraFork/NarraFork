@@ -105,6 +105,12 @@ function toRegistryModel(model: RpcModelDescriptor): ProviderModelDescriptor {
 			...(model.capabilities.inputImages === undefined
 				? {}
 				: { inputImages: model.capabilities.inputImages }),
+			...(model.capabilities.inputAudio === undefined
+				? {}
+				: { inputAudio: model.capabilities.inputAudio }),
+			...(model.capabilities.inputVideo === undefined
+				? {}
+				: { inputVideo: model.capabilities.inputVideo }),
 			...(model.capabilities.reasoning === undefined
 				? {}
 				: { reasoning: model.capabilities.reasoning }),

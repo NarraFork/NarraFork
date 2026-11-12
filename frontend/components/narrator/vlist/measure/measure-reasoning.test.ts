@@ -46,7 +46,7 @@ describe("measureReasoning — non-expanded forms are a single fixed row", () =>
 		expect(r.blocks).toHaveLength(0);
 	});
 
-	it("L2 low-LOD collapses to the count line (fixed 20.8→21px row)", async () => {
+	it("L2 low-LOD collapses to the count line (fixed 24px row)", async () => {
 		const {
 			measureReasoning,
 			reasoningHeaderRowHeight,
@@ -56,14 +56,14 @@ describe("measureReasoning — non-expanded forms are a single fixed row", () =>
 		const r = measureReasoning({ text: "long reasoning body", stepCount: 4 }, 600, 2);
 		expect(r.form).toBe("count");
 		expect(r.height).toBe(reasoningHeaderRowHeight());
-		// The frozen baseline export remains the neutral documentation value.
+		// The export is resolved when the module loads (the default setting here).
 		expect(REASONING_COUNT_LINE_HEIGHT).toBe(reasoningHeaderRowHeight());
 		expect(r.stepCount).toBe(4);
-		// Row = py*2 + max(icon 16, xs line 17) = 4 + 17 = 21.
+		// Row = py*2 + max(icon 16, xs line 20) = 4 + 20 = 24: the default setting measures
+		// the xs line at 120% of the Mantine 17 (LINE_HEIGHT_BASELINE_PERCENT).
 		const c = MEASURE_REASONING_CONSTANTS;
-		expect(r.height).toBe(
-			c.REASONING_ROW_PADDING_Y * 2 + Math.max(c.REASONING_ICON_SIZE, c.REASONING_XS_LINE_HEIGHT),
-		);
+		expect(r.height).toBe(c.REASONING_ROW_PADDING_Y * 2 + Math.max(c.REASONING_ICON_SIZE, 20));
+		expect(r.height).toBe(24);
 		expect(r.blocks).toHaveLength(0);
 	});
 

@@ -73,11 +73,11 @@ export interface DatabaseStorageCapabilities {
 /**
  * Default wall-clock budget for one whole measurement.
  *
- * Deliberately far above every internal budget it contains (the read-worker pool allows 30s for
- * the schema task and 120s per table shard, and the serial main-thread fallback was measured at
- * ~4.9s over 116 tables on a 5.3 GB database). This is a backstop against a measurement that
- * never returns at all — not a performance target, and not a replacement for those budgets. Set
- * it lower only when a caller genuinely prefers "no answer" to "a late answer".
+ * The SQLite object scan shares this deadline across context, shards and worker-unavailable
+ * fallbacks. Context walks dbstat over the whole database: a separate 30s "schema" budget
+ * incorrectly killed cold multi-GB scans and restarted them from scratch. All heavy work stays
+ * off the request thread, and expiration cancels outstanding workers. This is a backstop, not a
+ * performance target. Set it lower only when a caller prefers "no answer" to "a late answer".
  */
 export const DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS = 300_000;
 
@@ -228,29 +228,40 @@ export async function runWithScanBudget<T>(
 	operation: (linked: AbortSignal) => Promise<T>,
 ): Promise<T> {
 	if (signal?.aborted) throw new DatabaseStorageScanCancelledError();
+	if (budgetMs <= 0) throw new DatabaseStorageScanTimedOutError(budgetMs);
 
 	const controller = new AbortController();
 	let expired = false;
 	const onCallerAbort = () => controller.abort();
 	signal?.addEventListener("abort", onCallerAbort, { once: true });
 
-	// A non-positive budget means it is ALREADY gone. `setTimeout(…, 0)` would still let the
-	// operation run a turn — and on a fast backend, run to completion — so the abort has to happen
-	// synchronously here. Treating `0` as "no budget" is how an unbounded scan slips back in.
-	if (budgetMs <= 0) {
+	const timer = setTimeout(() => {
 		expired = true;
 		controller.abort();
-	}
-	const timer =
-		budgetMs > 0
-			? setTimeout(() => {
-					expired = true;
-					controller.abort();
-				}, budgetMs)
-			: undefined;
+	}, budgetMs);
+	// Some operations (including module loading) cannot observe AbortSignal. Race their completion
+	// against cancellation so they cannot keep the caller waiting past the budget.
+	let onAbort: (() => void) | undefined;
+	const aborted = new Promise<never>((_, reject) => {
+		onAbort = () => reject(new Error("scan aborted"));
+		controller.signal.addEventListener("abort", onAbort, { once: true });
+	});
+	let resolveWork!: (value: T | PromiseLike<T>) => void;
+	let rejectWork!: (reason: unknown) => void;
+	const work = new Promise<T>((resolve, reject) => {
+		resolveWork = resolve;
+		rejectWork = reject;
+	});
+	// Attach both race handlers before invoking work: it may abort and throw synchronously.
+	const raced = Promise.race([work, aborted]);
 
 	try {
-		const result = await operation(controller.signal);
+		try {
+			resolveWork(operation(controller.signal));
+		} catch (error) {
+			rejectWork(error);
+		}
+		const result = await raced;
 		// A backend that ignores the signal can still return successfully after the budget expired.
 		// Honouring the budget only when the backend cooperates would make it advisory, so the
 		// result is discarded here rather than handed back as if it had been in time.
@@ -271,6 +282,7 @@ export async function runWithScanBudget<T>(
 	} finally {
 		if (timer) clearTimeout(timer);
 		signal?.removeEventListener("abort", onCallerAbort);
+		if (onAbort) controller.signal.removeEventListener("abort", onAbort);
 	}
 }
 

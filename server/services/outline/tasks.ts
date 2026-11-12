@@ -25,7 +25,8 @@
  *     was listening ({@link releaseEndedOutlineSessionClaims}). An archived session holds
  *     nothing: the end of its runs releases too, and nothing is handed back to it.
  *   - WAITING (read time, never stored): a task waits for its prerequisites (`depends::`) until
- *     each is done or cancelled, and for people while a question under it is unanswered.
+ *     each is done or cancelled, for people while a question under it is unanswered, and for
+ *     confirmation while an open pending change touches it (`pending.ts`).
  *   - CONTINUATION CANDIDATES (§4.8): the open tasks a session may continue with.
  *
  * Every read is indexed and bounded; nothing here scans a space.
@@ -44,15 +45,30 @@ import {
 	type OutlineTaskJson,
 	outlineLeaseEnd,
 } from "./model";
+import { findTasksWaitingForConfirmation } from "./pending";
+import {
+	questionWaits,
+	sweepOutlineAnswerDeliveries,
+	watchArchivedSessionQuestions,
+} from "./questions";
+import { readSubtree } from "./read";
 import { outlineStore } from "./store";
 import {
 	chunked,
 	type OutlineBlockMeta,
+	type OutlinePendingHead,
 	type OutlineSpaceRow,
 	type OutlineStore,
 	type OutlineTaskClaimRow,
 } from "./store/port";
-import { hasHumanAssignee, isFinishedTask, isOpenTask } from "./task-json";
+import {
+	hasHumanAssignee,
+	isFinishedTask,
+	isOpenTask,
+	isPersonWork,
+	isPlanningRoot,
+} from "./task-json";
+import type { OutlineNode } from "./tree";
 import { type OutlineOp, writeOutline } from "./write";
 
 export const OUTLINE_TASK_LIMITS = {
@@ -72,6 +88,8 @@ export const OUTLINE_TASK_LIMITS = {
 	unclaimedScan: 200,
 	/** Tasks nobody holds one run reopens. */
 	unclaimedBatch: 50,
+	/** Open tasks of one subtree a `within` read takes (a plan's limit). */
+	withinBlocks: 2000,
 	/** Claims of an archived or deleted session one round reads and releases. */
 	releaseBatch: 100,
 	/** Rounds one archived or deleted session gets; what is left runs out as a lease. */
@@ -575,10 +593,12 @@ const leaseJob: {
 	timer: ReturnType<typeof setInterval> | null;
 	running: Promise<void> | null;
 	sessionEnds: OutlineSessionEndWatch | null;
+	questionEnds: { stop(): Promise<void> } | null;
 } = {
 	timer: null,
 	running: null,
 	sessionEnds: null,
+	questionEnds: null,
 };
 
 function runLeaseExpiry(): void {
@@ -593,6 +613,9 @@ function runLeaseExpiry(): void {
 		const ended = await releaseEndedOutlineSessionClaims();
 		if (ended.reopened || ended.skipped || ended.failed)
 			logger.info("Outline tasks of sessions archived or deleted earlier reopened", { ...ended });
+		// Answers a crash left undelivered to their askers (outline P2 PR 7).
+		const answers = await sweepOutlineAnswerDeliveries();
+		if (answers) logger.info("Outline answers delivered late", { delivered: answers });
 	};
 	leaseJob.running = run()
 		.catch((error) => logger.warn("Outline lease expiry failed", { error: String(error) }))
@@ -611,6 +634,7 @@ export function startOutlineTaskLeaseJob(): void {
 	leaseJob.timer = setInterval(runLeaseExpiry, EXPIRY_INTERVAL_MS);
 	leaseJob.timer.unref?.();
 	leaseJob.sessionEnds = watchOutlineSessionEnds();
+	leaseJob.questionEnds = watchArchivedSessionQuestions();
 	runLeaseExpiry();
 }
 
@@ -619,8 +643,10 @@ export async function stopOutlineTaskLeaseJob(): Promise<void> {
 	if (leaseJob.timer) clearInterval(leaseJob.timer);
 	leaseJob.timer = null;
 	const sessionEnds = leaseJob.sessionEnds;
+	const questionEnds = leaseJob.questionEnds;
 	leaseJob.sessionEnds = null;
-	await Promise.all([leaseJob.running, sessionEnds?.stop()]);
+	leaseJob.questionEnds = null;
+	await Promise.all([leaseJob.running, sessionEnds?.stop(), questionEnds?.stop()]);
 }
 
 /** Wait before retrying a session's release that failed, once. */
@@ -741,16 +767,25 @@ export function watchOutlineSessionEnds(
 // Waiting (derived at read time)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** What an open task waits for. Neither is stored: both are read from the outline. */
+/** What an open task waits for. None is stored: each is read from the outline. */
 export interface OutlineTaskWait {
 	/** Prerequisites (`depends::`) that are tasks not done or cancelled yet, by block id. */
 	prerequisites: string[];
-	/** A question under the task is unanswered (always false until `Ask` exists, plan PR 7). */
+	/**
+	 * A question under the task is unanswered (`Ask`, plan PR 7): the question's nearest task
+	 * waits, unless its asker went ahead with its recommendation (`proceed`).
+	 */
 	people: boolean;
+	/**
+	 * A change to it waits for confirmation (a locked plan, design §2.2): an open pending change
+	 * touches the task, or the plan's being done waits for its locker. The agent does something
+	 * else meanwhile; continuation skips it.
+	 */
+	confirmation: boolean;
 }
 
 export function isWaiting(wait: OutlineTaskWait | undefined): boolean {
-	return !!wait && (wait.prerequisites.length > 0 || wait.people);
+	return !!wait && (wait.prerequisites.length > 0 || wait.people || wait.confirmation);
 }
 
 /** A task as the derivations read it. */
@@ -761,15 +796,15 @@ export interface OutlineTaskSubject {
 }
 
 /**
- * Of the given tasks, those with an unanswered question under them. Questions are plan PR 7
- * (`Ask`); until they exist, no task waits for people.
+ * Of the given tasks, those an unanswered question waits under (`Ask`, plan PR 7): a question
+ * makes its nearest task above it wait, unless its asker went ahead with its recommendation
+ * (`proceed`). One bounded read of each space's open questions (`questions.ts`).
  */
 export async function findTasksWaitingForPeople(
-	_taskIds: readonly string[],
-	_options: { store?: OutlineStore } = {},
+	tasks: readonly OutlineTaskSubject[],
+	options: { store?: OutlineStore } = {},
 ): Promise<Set<string>> {
-	// TODO(outline P2 PR 7): an `Ask` under a task (or under its steps) that has no answer yet.
-	return new Set();
+	return await questionWaits(tasks, options);
 }
 
 /**
@@ -781,11 +816,18 @@ export async function findTasksWaitingForPeople(
  */
 export async function deriveOutlineTaskWaits(
 	tasks: readonly OutlineTaskSubject[],
-	options: { store?: OutlineStore } = {},
+	options: {
+		store?: OutlineStore;
+		/**
+		 * The open pending changes that may touch these tasks, already read by the caller (the task
+		 * board reads them by lock root for many spaces at once); read per space when absent.
+		 */
+		openPending?: readonly OutlinePendingHead[];
+	} = {},
 ): Promise<Map<string, OutlineTaskWait>> {
 	const store = options.store ?? outlineStore;
 	const out = new Map<string, OutlineTaskWait>(
-		tasks.map((t) => [t.id, { prerequisites: [], people: false }]),
+		tasks.map((t) => [t.id, { prerequisites: [], people: false, confirmation: false }]),
 	);
 
 	// The targets, grouped by the space they are looked up in.
@@ -851,13 +893,17 @@ export async function deriveOutlineTaskWaits(
 		}
 	}
 
-	const people = await findTasksWaitingForPeople(
-		tasks.map((t) => t.id),
-		{ store },
-	);
+	const people = await findTasksWaitingForPeople(tasks, { store });
 	for (const id of people) {
 		const wait = out.get(id);
 		if (wait) wait.people = true;
+	}
+	for (const id of await findTasksWaitingForConfirmation(tasks, {
+		store,
+		openPending: options.openPending,
+	})) {
+		const wait = out.get(id);
+		if (wait) wait.confirmation = true;
 	}
 	return out;
 }
@@ -874,17 +920,47 @@ export interface OutlineTaskRef {
 	address: string;
 	status: "todo" | "doing";
 	assignee: string | null;
+	/** The task's `version_seq` as read: a write that starts it names it as its base. */
+	versionSeq: number;
+	/** The task's fields as read (`manager`, `humanCreated`, …). */
+	taskJson: OutlineTaskJson;
 	/** The task's claim, when it has a row (it may be released or someone's expired lease). */
 	claim: OutlineTaskClaimRow | null;
+	/**
+	 * It has unfinished tasks under it (outline P2 PR 8, D48 Q2): its work is theirs, so it is not
+	 * the one continuation names or starts; it is named again once they are finished.
+	 */
+	container: boolean;
+	/** The tasks it is under, nearest first (within the read). */
+	taskAncestorIds: string[];
+	/**
+	 * A task it is under is in progress: it belongs to the tree being worked, whose steps
+	 * continuation starts before any other to-do (D48 Q2).
+	 */
+	inWorkedTree: boolean;
 }
 
 export interface OutlineContinuationCandidates {
-	/** Tasks the session can continue with, in document order. */
+	/**
+	 * Tasks the session can continue with, in document order: at most `limit` (plus the work in
+	 * progress past it, with `keepWorkInProgress`).
+	 */
 	candidates: OutlineTaskRef[];
 	/** Tasks that would be candidates but wait (for prerequisites or people), in document order. */
 	waiting: Array<OutlineTaskRef & { wait: OutlineTaskWait }>;
+	/**
+	 * `candidates` and `waiting` together, in document order (`wait` null for a candidate): the
+	 * session's open tasks as one list.
+	 */
+	ordered: Array<OutlineTaskRef & { wait: OutlineTaskWait | null }>;
 	/** More tasks than {@link OUTLINE_TASK_LIMITS.candidateScan} were found; the rest were not read. */
 	truncated: boolean;
+	/**
+	 * Every task read that is work a person wants of the session (`isPersonWork`: their own, or
+	 * the root of a plan they approved), however many come before it (review round 1 S3): what
+	 * `protectedOnly` counts. With its wait.
+	 */
+	personWork: Array<OutlineTaskRef & { wait: OutlineTaskWait | null }>;
 }
 
 /**
@@ -897,11 +973,34 @@ export interface OutlineContinuationCandidates {
  *
  * Order is document order: the session space first, then other spaces by key; within a space by
  * page, then depth first by sibling order. At most `limit` of each list.
+ *
+ * A task with unfinished tasks under it is a `container`: listed (it is still open, and counts as
+ * the person's work when it is theirs) but never the one continuation names or starts. A plan that
+ * is not approved yet (`task_json.plan.state = planning`) is left out with every task under it: it
+ * is never executed (D48 Q3). So is every task under a task a subagent of this session is doing
+ * (a delegation, outline P2 PR 9a): that tree is the subagent's while it runs, and comes back
+ * when its claim does.
  */
 export async function findContinuationCandidates(options: {
 	narratorId: string;
 	/** The session's space (a subagent's is its root's, D31); null when it has none yet. */
 	sessionSpaceId: string | null;
+	/**
+	 * Pages whose blocks are never the session's tasks, checkbox or not: its behavior page holds
+	 * rules, which the agent may not tick (outline plan PR 4).
+	 */
+	excludePageIds?: readonly string[];
+	/**
+	 * Only the tasks of this block's subtree (a tree a person asked to start, an approved plan;
+	 * review round 1 S3): read from its page's structure, so tasks elsewhere neither crowd it out
+	 * nor show. At most {@link OUTLINE_TASK_LIMITS.withinBlocks} of its open tasks.
+	 */
+	within?: string;
+	/**
+	 * Keep the work in progress past `limit` (review round 1 S3): the tasks the session holds and
+	 * the open tasks under a task in progress, so to-dos before them cannot crowd them out.
+	 */
+	keepWorkInProgress?: boolean;
 	store?: OutlineStore;
 	now?: Date;
 	limit?: number;
@@ -910,11 +1009,37 @@ export async function findContinuationCandidates(options: {
 	const now = (options.now ?? new Date()).toISOString();
 	const limit = options.limit ?? OUTLINE_TASK_LIMITS.candidates;
 	const scan = OUTLINE_TASK_LIMITS.candidateScan;
+	const empty = (truncated: boolean): OutlineContinuationCandidates => ({
+		candidates: [],
+		waiting: [],
+		ordered: [],
+		truncated,
+		personWork: [],
+	});
 
-	const claimed = await store.listClaimedTasks(options.narratorId, scan + 1);
-	const own = options.sessionSpaceId
-		? await store.listOpenTasks(options.sessionSpaceId, scan + 1)
-		: [];
+	let subtree: Set<string> | null = null;
+	if (options.within) {
+		const read = await readSubtree(options.within, { store });
+		if (!read) return empty(false);
+		subtree = new Set();
+		const stack = [read.root];
+		while (stack.length > 0 && subtree.size < OUTLINE_TASK_LIMITS.withinBlocks) {
+			const node = stack.pop() as OutlineNode;
+			if (node.task && isOpenTask(node.task)) subtree.add(node.id);
+			for (const child of node.children) stack.push(child);
+		}
+	}
+	const claimedAll = await store.listClaimedTasks(options.narratorId, scan + 1);
+	const inTree = subtree;
+	const claimed = inTree ? claimedAll.filter(({ block }) => inTree.has(block.id)) : claimedAll;
+	// Excluded pages are left out inside the scan, so their checkboxes cannot use it up.
+	const own = inTree
+		? await store.getBlockMetasByIds([...inTree])
+		: options.sessionSpaceId
+			? await store.listOpenTasks(options.sessionSpaceId, scan + 1, {
+					excludePageIds: options.excludePageIds,
+				})
+			: [];
 	const truncated = claimed.length > scan || own.length > scan;
 	const metas = new Map<string, OutlineBlockMeta>();
 	const claims = new Map<string, OutlineTaskClaimRow>();
@@ -926,17 +1051,49 @@ export async function findContinuationCandidates(options: {
 	const unread = [...metas.keys()].filter((id) => !claims.has(id));
 	for (const [id, claim] of await getOutlineTaskClaims(unread, { store })) claims.set(id, claim);
 
-	const open = [...metas.values()].filter((block) => {
-		if (block.deleted || !isOpenTask(block.taskJson) || hasHumanAssignee(block.taskJson))
-			return false;
+	const excluded = new Set(options.excludePageIds ?? []);
+	// Every open task read: what makes a task a container (a person's step under it counts too)
+	// and what a plan being planned hides.
+	const live = [...metas.values()].filter(
+		(block) => !block.deleted && isOpenTask(block.taskJson) && !excluded.has(block.pageId),
+	);
+	if (live.length === 0) return empty(truncated);
+	const ancestors = new Map<string, OutlineBlockMeta>();
+	const inOrder = await inDocumentOrder(store, live, options.sessionSpaceId, { ancestors });
+	const known = new Map<string, OutlineBlockMeta>(ancestors);
+	for (const block of live) known.set(block.id, block);
+	/** Ancestors of a block, nearest first. */
+	const above = (block: OutlineBlockMeta): OutlineBlockMeta[] => {
+		const out: OutlineBlockMeta[] = [];
+		let parent = block.parentId === null ? undefined : known.get(block.parentId);
+		while (parent && out.length <= OUTLINE_LIMITS.maxDepth) {
+			out.push(parent);
+			parent = parent.parentId === null ? undefined : known.get(parent.parentId);
+		}
+		return out;
+	};
+	const chains = new Map(live.map((block) => [block.id, above(block)]));
+	const delegated = await delegatedTasksAbove(store, chains, claims, options.narratorId, now);
+	const hidden = (block: OutlineBlockMeta): boolean =>
+		isPlanningRoot(block.taskJson) ||
+		(chains.get(block.id) ?? []).some((a) => isPlanningRoot(a.taskJson) || delegated.has(a.id));
+	const shown = inOrder.filter((block) => !hidden(block));
+	const containers = new Set<string>();
+	for (const block of shown) {
+		for (const ancestor of chains.get(block.id) ?? []) {
+			if (ancestor.taskJson && isOpenTask(ancestor.taskJson)) containers.add(ancestor.id);
+		}
+	}
+	const open = shown.filter((block) => {
+		if (hasHumanAssignee(block.taskJson)) return false;
 		const claim = claims.get(block.id);
 		if (!claim || claim.holderNarratorId === options.narratorId) return true;
 		return !isClaimLive(claim, now);
 	});
-	if (open.length === 0) return { candidates: [], waiting: [], truncated };
+	if (open.length === 0) return empty(truncated);
 
 	const waits = await deriveOutlineTaskWaits(open, { store });
-	const ordered = await inDocumentOrder(store, open, options.sessionSpaceId);
+	const ordered = open;
 	const spaces = new Map<string, OutlineSpaceRow>();
 	for (const spaceId of new Set(open.map((b) => b.spaceId))) {
 		const space = await store.getSpace(spaceId);
@@ -949,46 +1106,110 @@ export async function findContinuationCandidates(options: {
 		address: `${spaces.get(block.spaceId)?.key ?? "?"}/${block.sid}`,
 		status: (block.taskJson as OutlineTaskJson).status as "todo" | "doing",
 		assignee: block.taskJson?.assignee ?? null,
+		versionSeq: block.versionSeq,
+		taskJson: block.taskJson as OutlineTaskJson,
 		claim: claims.get(block.id) ?? null,
+		container: containers.has(block.id),
+		taskAncestorIds: (chains.get(block.id) ?? []).filter((a) => a.taskJson).map((a) => a.id),
+		inWorkedTree: (chains.get(block.id) ?? []).some((a) => a.taskJson?.status === "doing"),
 	});
 	const candidates: OutlineTaskRef[] = [];
 	const waiting: OutlineContinuationCandidates["waiting"] = [];
+	const all: OutlineContinuationCandidates["ordered"] = [];
+	// With `keepWorkInProgress` the work in progress is not cut by the window (P2 PR 8 review S3):
+	// a task the session holds, and the open tasks of a tree being worked (a goal, an approved
+	// plan), are kept past `limit`, however many to-dos come before them; the scan bounds them.
+	const inProgress = (block: OutlineBlockMeta) =>
+		options.keepWorkInProgress === true &&
+		(claims.get(block.id)?.holderNarratorId === options.narratorId ||
+			(chains.get(block.id) ?? []).some((a) => a.taskJson?.status === "doing"));
 	for (const block of ordered) {
 		const wait = waits.get(block.id);
 		if (isWaiting(wait)) {
-			if (waiting.length < limit) waiting.push({ ...ref(block), wait: wait as OutlineTaskWait });
-		} else if (candidates.length < limit) candidates.push(ref(block));
+			if (waiting.length >= limit && !inProgress(block)) continue;
+			const entry = { ...ref(block), wait: wait as OutlineTaskWait };
+			waiting.push(entry);
+			all.push(entry);
+		} else if (candidates.length < limit || inProgress(block)) {
+			const entry = ref(block);
+			candidates.push(entry);
+			all.push({ ...entry, wait: null });
+		}
 	}
-	return { candidates, waiting, truncated };
+	const personWork = open
+		.filter((block) => isPersonWork(block.taskJson, options.narratorId))
+		.map((block) => ({
+			...ref(block),
+			wait: isWaiting(waits.get(block.id)) ? (waits.get(block.id) as OutlineTaskWait) : null,
+		}));
+	return { candidates, waiting, ordered: all, truncated, personWork };
+}
+
+/**
+ * Of the open tasks above the blocks read, those a subagent of `narratorId`'s session is doing
+ * (its lease running): what is under them is the subagent's work while it runs. Their claims are
+ * read in one indexed batch (those not read already), and the holders' sessions in one more; at
+ * most {@link OUTLINE_TASK_LIMITS.candidateScan} tasks are considered.
+ */
+async function delegatedTasksAbove(
+	store: OutlineStore,
+	chains: ReadonlyMap<string, readonly OutlineBlockMeta[]>,
+	claims: Map<string, OutlineTaskClaimRow>,
+	narratorId: string,
+	now: string,
+): Promise<Set<string>> {
+	const ids = new Set<string>();
+	for (const chain of chains.values()) {
+		for (const a of chain) {
+			if (ids.size >= OUTLINE_TASK_LIMITS.candidateScan) break;
+			if (a.taskJson && isOpenTask(a.taskJson)) ids.add(a.id);
+		}
+	}
+	if (ids.size === 0) return new Set();
+	const unread = [...ids].filter((id) => !claims.has(id));
+	for (const [id, claim] of await getOutlineTaskClaims(unread, { store })) claims.set(id, claim);
+	const held = new Map<string, string>();
+	for (const id of ids) {
+		const claim = claims.get(id);
+		const holder = claim?.holderNarratorId;
+		if (holder && holder !== narratorId && isClaimLive(claim, now)) held.set(id, holder);
+	}
+	if (held.size === 0) return new Set();
+	const roots = await store.getNarratorRoots([...new Set(held.values())]);
+	const out = new Set<string>();
+	for (const [id, holder] of held) if (roots.get(holder)?.root === narratorId) out.add(id);
+	return out;
 }
 
 /**
  * Sort blocks into document order: `first` space before the others (by key), then by the path of
  * sibling positions from the page down. Ancestors are read level by level, one indexed query per
- * space and level, at most {@link OUTLINE_LIMITS.maxDepth} levels.
+ * space and level, at most {@link OUTLINE_LIMITS.maxDepth} levels. Also the task board's order.
  */
-async function inDocumentOrder(
+export async function inDocumentOrder(
 	store: OutlineStore,
 	blocks: readonly OutlineBlockMeta[],
 	first: string | null,
+	options: {
+		/** Space keys the caller has already read, by space id (the rest are read here). */
+		keys?: ReadonlyMap<string, string>;
+		/** Ancestors read on the way, by id, for a caller that needs them too. */
+		ancestors?: Map<string, OutlineBlockMeta>;
+	} = {},
 ): Promise<OutlineBlockMeta[]> {
 	const known = new Map(blocks.map((b) => [b.id, b]));
 	for (let depth = 0; ; depth++) {
-		const missing = new Map<string, Set<string>>();
+		// Every space's missing parents of this level in one read (by primary key).
+		const missing = new Set<string>();
 		for (const block of known.values()) {
-			if (block.parentId !== null && !known.has(block.parentId)) {
-				const set = missing.get(block.spaceId);
-				if (set) set.add(block.parentId);
-				else missing.set(block.spaceId, new Set([block.parentId]));
-			}
+			if (block.parentId !== null && !known.has(block.parentId)) missing.add(block.parentId);
 		}
 		if (missing.size === 0 || depth >= OUTLINE_LIMITS.maxDepth) break;
 		let found = 0;
-		for (const [spaceId, ids] of missing) {
-			for (const meta of await store.getBlockMetas(spaceId, { ids: [...ids] })) {
-				known.set(meta.id, meta);
-				found++;
-			}
+		for (const meta of await store.getBlockMetasByIds([...missing])) {
+			known.set(meta.id, meta);
+			options.ancestors?.set(meta.id, meta);
+			found++;
 		}
 		if (found === 0) break;
 	}
@@ -1003,7 +1224,11 @@ async function inDocumentOrder(
 	};
 	const keys = new Map<string, string>();
 	for (const spaceId of new Set(blocks.map((b) => b.spaceId))) {
-		keys.set(spaceId, spaceId === first ? "" : ((await store.getSpace(spaceId))?.key ?? spaceId));
+		const known = options.keys?.get(spaceId);
+		keys.set(
+			spaceId,
+			spaceId === first ? "" : (known ?? (await store.getSpace(spaceId))?.key ?? spaceId),
+		);
 	}
 	const paths = new Map(blocks.map((b) => [b.id, pathOf(b)]));
 	return [...blocks].sort((a, b) => {

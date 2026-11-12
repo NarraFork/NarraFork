@@ -23,7 +23,7 @@ export function scopeKey(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): string
 function narratorClauses(scope: MessageSearchScope): string[] {
 	const clauses: string[] = [
 		// 系统内部叙述者（ModelTrace 舱）不参与搜索；traits 判断保留给尚未回填的历史行。
-		"n.hidden_from_lists = 0",
+		"n.hidden_from_lists = FALSE",
 		`COALESCE(n.traits, '[]') NOT LIKE '%"modeltrace"%'`,
 	];
 	if (!scope.subagents) clauses.push("n.type <> 'subagent'");

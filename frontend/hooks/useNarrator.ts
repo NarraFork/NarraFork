@@ -21,6 +21,7 @@ import {
 	type RevertActionPreview,
 	type RevertActionTarget,
 	type RevertDiagnostic,
+	type RevertPlanApplyResult,
 	type RevertPlanFile,
 	type RevertPlanPreviewIssue,
 	type RevertScopePreviews,
@@ -35,12 +36,14 @@ import type {
 	RuleTargetSelector,
 } from "../lib/api/types";
 import {
+	extractRevertResult,
 	formatRevertFailure,
 	formatRevertSuccessWarning,
 	invalidateRevertQueries,
+	isAvailableFilesRestored,
 	isRevertHistoryCommitted,
 } from "../lib/revert-result";
-import { removeRecentTabCascade } from "./useRecentTabs";
+import { recentTabsSectionQueryKey, removeRecentTabCascade } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
 const NARRATORS_LIST_GC_TIME_MS = 60_000;
@@ -476,13 +479,32 @@ export function useRevertHistoryAction(narratorId: string) {
 			if (!plan?.planId || !plan.planHash || plan.action !== action) {
 				throw new Error(t("revertPlanReloadRequired"));
 			}
-			const result = await api.applyRevertPlan(narratorId, plan);
+			let result: RevertPlanApplyResult;
+			try {
+				result = await api.applyRevertPlan(narratorId, plan);
+			} catch (error) {
+				// The server answers 409 for anything but a history commit, including the
+				// reviewed "restore available files" outcome of a partial-coverage plan.
+				const restored = extractRevertResult(error);
+				if (restored?.planId === plan.planId && isAvailableFilesRestored(restored)) {
+					return { ...restored, availableFilesOnly: true as const };
+				}
+				throw error;
+			}
 			if (result.planId !== plan.planId || !isRevertHistoryCommitted(result)) {
 				throw new ApiError(result.reason ?? t("revertPlanApplyFailed"), 409, { ...result });
 			}
 			return result;
 		},
 		onSuccess: (result) => {
+			if ("availableFilesOnly" in result && result.availableFilesOnly) {
+				notifications.show({
+					title: t("revertAvailableFilesRestoredTitle"),
+					message: t("revertAvailableFilesRestored", { count: result.files.length }),
+					color: "blue",
+				});
+				return;
+			}
 			const warning = formatRevertSuccessWarning(t, result);
 			if (warning) {
 				notifications.show({
@@ -756,6 +778,7 @@ export function useCreateNarrator() {
 			relaxedPlan?: boolean;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			cwd?: string;
 			title?: string;
 			makeNamed?: boolean;
@@ -781,7 +804,8 @@ export function useArchiveNarrator() {
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			// Cascade cleanup after archive — no undo token for entities that are gone.
-			void removeRecentTabCascade(qc, "narrator", narratorId);
+			// 归档是可撤销的，所以它所在的文件夹即使变空也留着，撤销归档才回得去。
+			void removeRecentTabCascade(qc, "narrator", narratorId, { keepEmptyFolder: true });
 		},
 		onError: () => {
 			notifications.show({ color: "red", message: t("archiveFailed") });
@@ -794,6 +818,9 @@ export function useUnarchiveNarrator() {
 		mutationFn: (id: string) => api.unarchiveNarrator(id),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
+			// 恢复可能把它放回归档前所在的文件夹，侧栏要重新读一遍。
+			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey("work") });
+			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey("projects") });
 		},
 	});
 }
@@ -1126,6 +1153,7 @@ export function useUpdateReflectionOverrides() {
 			id: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 			tasksReminderIntervalOverride?: number | null;
 		}) => api.updateNarratorReflectionOverrides(id, data),

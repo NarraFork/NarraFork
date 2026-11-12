@@ -37,6 +37,11 @@ import {
 	planEnvelopeBlocks,
 } from "@shared/narrator-blocks/plan";
 import {
+	clearedToolOutputSql,
+	isHistoryProtectedContent,
+	redactToolPayloadElement,
+} from "@shared/narrator-blocks/retention";
+import {
 	assembleContent,
 	type BlockDraft,
 	inAssembledOrder,
@@ -106,7 +111,11 @@ export function storedProjection(
 	content: unknown,
 ): { contentJson: unknown; bodyRowsOnly: 0 | 1 } {
 	const rowsOnly =
-		bodyFormat === 2 && Array.isArray(content) && !keepsProjection(content) && rowsOnlyWrites();
+		bodyFormat === 2 &&
+		Array.isArray(content) &&
+		!isHistoryProtectedContent(content) &&
+		!keepsProjection(content) &&
+		rowsOnlyWrites();
 	if (!rowsOnly) return { contentJson: content, bodyRowsOnly: 0 };
 	noteRowsOnlyEnvelopes(true);
 	return { contentJson: [], bodyRowsOnly: 1 };
@@ -141,6 +150,11 @@ const FLUSH_LIMIT = 64;
 /**
  * The sync queue's high-water mark. A store transaction takes it before its writes: the
  * envelopes queued after it are the ones its own writes queued (`flushQueuedSince`).
+ *
+ * Callers open that transaction with `{ behavior: "immediate" }`. The mark is a read, so a
+ * deferred transaction is a reader by the time it upgrades to a write lock, and SQLite then
+ * skips the busy handler and reports "database is locked" at once. `immediate` waits for the
+ * lock under `busy_timeout` instead.
  */
 export function syncQueueMark(): number {
 	if (!hasBlockSchema()) return 0;
@@ -510,8 +524,30 @@ interface LedgerRow extends PlanLedgerRow {
 const BROKEN_OUTPUT_SQL = `CASE WHEN instr(output_json, '"_broken"') > 0 AND json_valid(output_json)
 	AND json_type(output_json, '$._broken') = 'true' THEN '{"_broken":true}' END`;
 
-const LEDGER_COLUMNS = `id, tool_use_id AS toolUseId, tool_name AS toolName, input_json AS inputJson,
-	${BROKEN_OUTPUT_SQL} AS outputJson, status, model_revision AS modelRevision`;
+export const CLEARED_TOOL_OUTPUT_SQL = clearedToolOutputSql();
+
+const LEDGER_COLUMNS = `id, tool_use_id AS toolUseId, tool_name AS toolName,
+	CASE WHEN ${CLEARED_TOOL_OUTPUT_SQL} THEN NULL ELSE input_json END AS inputJson,
+	CASE WHEN ${CLEARED_TOOL_OUTPUT_SQL} THEN output_json ELSE ${BROKEN_OUTPUT_SQL} END AS outputJson,
+	status, model_revision AS modelRevision`;
+
+/** Retention writes keep this tiny marker in the column, even for rows-only bodies. */
+export function isEnvelopeHistoryProtected(messageId: string): boolean {
+	if (database.activeDatabaseBackend !== "sqlite") return false;
+	return !!database.sqlite
+		.prepare(`SELECT 1 FROM narrator_messages WHERE id = ? AND (
+		instr(substr(content_json, 1, 256), '"historyClearVersion":1') > 0 OR
+		instr(substr(content_json, 1, 256), '"historyToolsSuppressed":true') > 0)`)
+		.get(messageId);
+}
+
+export function isEnvelopeHistoryCleared(messageId: string): boolean {
+	if (database.activeDatabaseBackend !== "sqlite") return false;
+	return !!database.sqlite
+		.prepare(`SELECT 1 FROM narrator_messages WHERE id = ?
+		AND instr(substr(content_json, 1, 256), '"historyClearVersion":1') > 0`)
+		.get(messageId);
+}
 
 /** Non-internal ledger rows of a message, in the order `adoptedLedger` expects. */
 function ledgerRows(messageId: string): LedgerRow[] {
@@ -588,6 +624,13 @@ export function syncEnvelope(
 	for (const watch of syncWatches) watch.add(messageId);
 	const row = envelopeRow(messageId);
 	if (!row || row.bodyFormat !== 2) return;
+	// Stale streaming/checkpoint callbacks may still carry a pre-retention body.
+	if (
+		given !== undefined &&
+		isEnvelopeHistoryProtected(messageId) &&
+		!isHistoryProtectedContent(given)
+	)
+		return;
 	const content = given === undefined ? envelopeBody(messageId) : given;
 	if (!Array.isArray(content)) return;
 	const hash =
@@ -607,7 +650,7 @@ export function syncEnvelope(
 		origin: row.origin,
 		provider: row.provider,
 	};
-	const adopted = adoptedLedger(ledgerRows(messageId));
+	const adopted = isHistoryProtectedContent(content) ? [] : adoptedLedger(ledgerRows(messageId));
 	const attempts = new Map(adopted.map((attempt) => [attempt.toolUseId, attempt]));
 	const planned = planEnvelopeBlocks({ ...message, contentJson: content }, adopted, {
 		streaming: mode === "streaming",
@@ -752,7 +795,10 @@ export function syncEnvelope(
 		const derive = !current || changed || ledgerMoved || !!options.reindex;
 		if (derive) {
 			clearAssets.run(plan.id);
-			const output = attempt ? ledgerOutput(attempt.id) : undefined;
+			const output =
+				attempt && !(draft.canonical?.kind === "tool" && draft.canonical.payload.payloadCleared)
+					? ledgerOutput(attempt.id)
+					: undefined;
 			for (const [assetId, role] of blockAssets(draft, output))
 				addAsset.run(plan.id, assetId, role);
 		}
@@ -1028,12 +1074,31 @@ export function patchEnvelopeState(
 	mutate: (content: unknown[]) => unknown[] | null,
 ): boolean {
 	return database.sqlite.transaction(() => {
+		if (isEnvelopeHistoryProtected(messageId)) return false;
 		const row = envelopeRow(messageId);
 		if (!row) return false;
 		const content = envelopeBody(messageId);
 		if (!Array.isArray(content)) return false;
-		const next = mutate(structuredClone(content));
+		let next = mutate(structuredClone(content));
 		if (!next) return false;
+		const calls = database.sqlite
+			.query<
+				{
+					toolUseId: string;
+					cleared: number;
+				},
+				[string]
+			>(`SELECT tool_use_id AS toolUseId, (${CLEARED_TOOL_OUTPUT_SQL}) AS cleared
+			FROM narrator_tool_calls WHERE message_id = ? AND is_internal = 0
+			ORDER BY tool_use_id, execution_attempt, created_at, id LIMIT 1025`)
+			.all(messageId);
+		if (calls.length > 1024) return false;
+		const cleared = new Set(
+			adoptedLedger(calls)
+				.filter((call) => call.cleared)
+				.map((call) => call.toolUseId),
+		);
+		if (cleared.size) next = next.map((element) => redactToolPayloadElement(element, cleared));
 		const json = JSON.stringify(next);
 		if (json === JSON.stringify(content)) return false;
 		const message = {

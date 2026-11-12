@@ -699,8 +699,11 @@ describe("fold transition: stays out of the height model", () => {
 			SHELL.indexOf("const effectiveHeightOverrides"),
 		);
 		expect(block.length).toBeGreaterThan(0);
-		expect(block).not.toContain("fold");
-		expect(block).not.toContain("Fold");
+		// Comments may describe collapsing a form; only executable references would
+		// couple the animation controller to dynamic row measurement.
+		const code = block.replace(/\/\/[^\n]*/g, "");
+		expect(code).not.toContain("fold");
+		expect(code).not.toContain("Fold");
 	});
 });
 

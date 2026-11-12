@@ -1,5 +1,5 @@
 /**
- * measure-media.ts — Zero-DOM height model for the three MessageBubble media
+ * measure-media.ts — Zero-DOM height model for the MessageBubble media
  * blocks (CONTRACT.md §4, WBS-batch2 P2):
  *
  *   - image            → aspect-ratio fitted box when the block carries the
@@ -26,6 +26,10 @@
 import { measureNaturalWidth } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
+import {
+	MEDIA_ATTACHMENT_WIDTH,
+	mediaAttachmentHeight,
+} from "@shared/pretext-layout/media-attachment-layout";
 import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
 import { formatFileSize } from "@shared/text-file-types";
 import {
@@ -269,7 +273,7 @@ export const IMGGEN_GROUP_GAP = 6;
 /** Group mb="xs" between header and the reserved image area. */
 export const IMGGEN_IMAGE_GAP = SPACING.xs; // 10
 /** Header text (xs) line box height. */
-export const IMGGEN_HEADER_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const IMGGEN_HEADER_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** GENERATED_IMAGE_MAX_DISPLAY_WIDTH from the original component. */
 export const IMGGEN_MAX_DISPLAY_WIDTH = 512;
 /** Conservative fallback image area height when intrinsic size is unknown. */
@@ -305,6 +309,8 @@ export interface MeasureMediaOpts {
 export interface MeasuredImageGeneration extends MeasuredElement {
 	inRun: boolean;
 	isLast: boolean;
+	/** Exactly the same activity predicate drives reserved and painted loader space. */
+	generating: boolean;
 }
 
 interface ImageMetrics {
@@ -328,7 +334,7 @@ function getImageMetrics(data: MeasureImageGenerationInput): ImageMetrics | null
 }
 
 function isGeneratingStatus(status: string | undefined): boolean {
-	return !!status && status !== "completed";
+	return status === "in_progress" || status === "generating";
 }
 
 /** Build the header rich-inline flow (status text + optional revisedPrompt). */
@@ -499,6 +505,7 @@ export function measureImageGeneration(
 	return {
 		inRun,
 		isLast,
+		generating,
 		height,
 		blocks,
 		frame,
@@ -508,13 +515,14 @@ export function measureImageGeneration(
 }
 
 // ── Unified dispatcher ───────────────────────────────────────────────────────
-export type MediaBlockType = "image" | "image_generation" | "text_file";
+export type MediaBlockType = "image" | "image_generation" | "text_file" | "audio" | "video";
 
 export interface MediaBlockInput
 	extends MeasureImageInput,
 		MeasureTextFileInput,
 		MeasureImageGenerationInput {
 	type: MediaBlockType | string;
+	mediaId?: string | null;
 }
 
 /**
@@ -528,6 +536,36 @@ export function measureMedia(
 	opts: MeasureMediaOpts = {},
 ): MeasuredElement {
 	switch (block.type) {
+		case "audio":
+		case "video": {
+			// Native controls, filename, loading and error all occupy the same box.
+			const displayWidth = Math.min(contentWidth, MEDIA_ATTACHMENT_WIDTH);
+			const fixed: PreparedFixedBlock = {
+				...FLAT_BASE,
+				kind: "fixed",
+				height: mediaAttachmentHeight(block.type),
+				tag: block.type,
+				displayWidth,
+				data: {
+					type: block.type,
+					mediaId: block.mediaId ?? null,
+					previewUrl: block.previewUrl ?? null,
+					filename: block.filename ?? null,
+					mediaType: block.mediaType ?? null,
+					size: block.size ?? null,
+					uploadNarratorId: block.uploadNarratorId ?? null,
+				},
+			};
+			const blocks: PreparedBlock[] = [fixed];
+			const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics);
+			return {
+				height: frame.contentHeight,
+				blocks,
+				frame,
+				contentWidth,
+				usedWidth: displayWidth,
+			};
+		}
 		case "image":
 			return measureImage(block, contentWidth, lod);
 		case "text_file":
@@ -553,7 +591,7 @@ export const MEASURE_MEDIA_CONSTANTS = {
 	IMGGEN_LOADER_SIZE,
 	IMGGEN_GROUP_GAP,
 	IMGGEN_IMAGE_GAP,
-	IMGGEN_HEADER_LINE_HEIGHT,
+	IMGGEN_HEADER_LINE_HEIGHT_BASELINE,
 	IMGGEN_MAX_DISPLAY_WIDTH,
 	IMGGEN_UNKNOWN_IMAGE_HEIGHT,
 } as const;

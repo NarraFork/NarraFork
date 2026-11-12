@@ -127,6 +127,8 @@ export interface SeedBlock {
 	/** The block's markdown, as the live document holds it. */
 	content: string;
 	task: LiveTaskChar | null;
+	/** A question put to a person (`Ask`). */
+	question?: boolean;
 	/** Children in sibling order (those the read included). */
 	childIds: readonly string[];
 }
@@ -179,6 +181,12 @@ export interface Peer {
 	color: string;
 	editing: boolean;
 	sel: LiveSelWire | null;
+	/**
+	 * An agent the server shows (outline P2 PR 10b): a session at work on this page. Its session id
+	 * and, for a subagent, its session's title, only when this person may read that session (its
+	 * name is empty otherwise).
+	 */
+	agent?: { narratorId: string | null; session: string | null };
 }
 
 export type LiveStatus =
@@ -207,7 +215,9 @@ export type ClientEvent =
 	| "deleted"
 	| "rejected"
 	| "readonly"
-	| "closed";
+	| "closed"
+	/** A local delete took questions put to people: it withdraws them (`withdrawnQuestions`). */
+	| "withdrew";
 
 let idCounter = 0;
 
@@ -222,7 +232,7 @@ function randomId(length: number): string {
 
 function storeFromSnapshot(pageId: string, blocks: readonly LiveBlockWire[]): Store {
 	const store = new Store(pageId);
-	for (const [id, parent, orderKey, sid, task] of blocks) {
+	for (const [id, parent, orderKey, sid, task, question] of blocks) {
 		store.put({
 			id,
 			parentId: parent < 0 ? null : (blocks[parent]?.[0] ?? null),
@@ -230,6 +240,7 @@ function storeFromSnapshot(pageId: string, blocks: readonly LiveBlockWire[]): St
 			task: task === "" ? null : task,
 			deleted: false,
 			sid,
+			question: question === 1,
 		});
 	}
 	return store;
@@ -251,6 +262,8 @@ export class LiveClient {
 	awaiting: PendingTx[] = [];
 	readonly views = new Set<ClientView>();
 	readonly presence = new Map<number, Peer>();
+	/** Agents present beyond those the server lists (P2 PR 10b). */
+	agentsMore = 0;
 	undoStack: Step[] = [];
 	redoStack: Step[] = [];
 	status: LiveStatus = "connecting";
@@ -284,6 +297,8 @@ export class LiveClient {
 	 * (`claimed`; shown by the editor later). Unknown fields of a newer server are kept as is.
 	 */
 	lastReject: LiveRejectHead | null = null;
+	/** Questions the last local delete that took any withdrew (the editor says so). */
+	withdrawnQuestions = 0;
 
 	private handle: number | null = null;
 	private n = 0;
@@ -507,6 +522,7 @@ export class LiveClient {
 				task: b.task,
 				deleted: false,
 				sid: b.sid,
+				question: b.question === true,
 			};
 			this.confirmed.put({ ...rec });
 			this.visible.put(rec);
@@ -676,6 +692,10 @@ export class LiveClient {
 		const inverses: ClientOp[] = [];
 		const ops: ClientOp[] = [];
 		const bodies = new Map<string, { before: string; after: string }>();
+		let withdrawn = 0;
+		const questionGoes = (id: string) => {
+			if (this.visible.alive(id)?.question) withdrawn++;
+		};
 		try {
 			const created = input.ops.filter((op) => op.t === "i" && !this.ytext(op.id));
 			if (created.length > 0) {
@@ -693,10 +713,12 @@ export class LiveClient {
 					// deepest first, so undo brings every one of them back.
 					for (const id of this.visible.subtree(op.id).slice(1).reverse()) {
 						if (!this.visible.alive(id)) continue;
+						questionGoes(id);
 						const inv = this.visible.apply({ t: "d", id }, (x) => this.textOf(x));
 						if (inv) inverses.unshift(inv);
 						ops.push({ t: "d", id });
 					}
+					questionGoes(op.id);
 				}
 				const inv = this.visible.apply(op, (id) => this.textOf(id));
 				if (inv) inverses.unshift(inv);
@@ -715,6 +737,10 @@ export class LiveClient {
 		this.redoStack = [];
 		this.enqueue(ops, bodies, ops.length > 0);
 		this.syncViews(input.view);
+		if (withdrawn > 0) {
+			this.withdrawnQuestions = withdrawn;
+			this.emit("withdrew");
+		}
 	}
 
 	/** Queue what the last local transaction sent; text-only batches wait a moment. */
@@ -954,7 +980,7 @@ export class LiveClient {
 	}
 
 	private applyPeers(peers: readonly LivePeerWire[] | undefined): void {
-		for (const [pno, userId, name, color, mode] of peers ?? []) {
+		for (const [pno, userId, name, color, mode, kind, narratorId, session] of peers ?? []) {
 			if (pno === this.me) continue;
 			const prior = this.presence.get(pno);
 			this.presence.set(pno, {
@@ -964,6 +990,9 @@ export class LiveClient {
 				color,
 				editing: mode === "e",
 				sel: prior?.sel ?? null,
+				...(kind === "a"
+					? { agent: { narratorId: narratorId || null, session: session || null } }
+					: {}),
 			});
 		}
 	}
@@ -1054,6 +1083,7 @@ export class LiveClient {
 		this.canWrite = head.w;
 		this.presence.clear();
 		this.applyPeers(head.peers);
+		this.agentsMore = head.am ?? 0;
 		for (const [pno, sel] of head.cur ?? []) {
 			const p = this.presence.get(pno);
 			if (p) p.sel = sel;
@@ -1252,6 +1282,7 @@ export class LiveClient {
 
 	private onPresence(head: LivePresenceDown): void {
 		this.applyPeers(head.peers);
+		if (head.am !== undefined) this.agentsMore = head.am;
 		for (const pno of head.gone ?? []) this.presence.delete(pno);
 		for (const [pno, sel] of head.cur ?? []) {
 			const p = this.presence.get(pno);
@@ -1323,6 +1354,7 @@ export class LiveClient {
 				p: b.parentId,
 				k: b.orderKey,
 				task: b.task,
+				...(b.question ? { q: true as const } : {}),
 				content: this.textOf(id),
 			});
 			for (const [kid, rec] of this.confirmed.blocks)

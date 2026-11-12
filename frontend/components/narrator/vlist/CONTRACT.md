@@ -67,6 +67,7 @@ export function measureXxx(
 
 **派生行盒高**（`lineBoxHeight = round(size × lineHeight)`）：
 - body（sm/1.45）≈ **20px**；xs（12/1.4）≈ **17px**；inline code（12/1.55）≈ 19px；code block（12/1.55）≈ **19px**。
+- ⚠️ 以上是 Mantine **基线**。「外观 · 排版」的行距滑杆 100% = 基线 × 1.2（`LINE_HEIGHT_BASELINE_PERCENT`，原来的 120% 即现在的 100%），所以**默认设置下**实测行盒是：body **24px**、xs **20px**、markdown 代码块（11px）**20px**、h1 **53px**。测量必须读 `typographyMetrics()` / `headingMetrics()`，不要用上面的基线数字；大纲（编辑器、历史树、导图、任务看板）经 `--nf-type-*` CSS 变量用同一组数值（`shared/pretext-layout/typography-css.ts`）。
 - Badge size=xs = **16px**；ThemeIcon 16/14；Loader 12；chevron 12；StatusIcon 12。
 - Button：compact-xs=18, xs=30, sm=36, compact-sm=22。
 - `truncate` / `lineClamp={1}` → **强制单行**（xs 单行=17px），高度恒定，无需 pretext。
@@ -172,6 +173,7 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 **刻意排除**，三类各有理由：
 - `compact` / `segment_compact` —— 关于对话的元信息（"这里之后历史被截断"），不是谁说的话。
 - `spec_fork_carryover` / `spec_context_cleared` / `spec_goal_added` / `error` —— **带 live button**。shell 靠 `kind === "system-text"` 匹配来注入 `specCarryoverActions` / `errorNoticeActions`，改路由会让每个按钮静默失去 handler：照样画出来，点了没反应。**死按钮比缺一行说话人更糟**。要框它们得先让 action 注入能穿透到嵌套 payload。
+  大纲会话（P2 PR 12a）里 `spec_fork_carryover` / `spec_context_cleared` 的「清空」「重置 Spec」不给 handler，`readOnlyHint` 让它们以 `data-disabled` 画成禁用样式、悬停或轻点说明原因（不是死按钮：点了不做事，也说了为什么）；还是那三个按钮，位置尺寸不变，测量不受影响。
 - `bash_command` / `tool_loaded` / `tool_unloaded` —— 用户**自己**动作的回执，归给另一个说话人是反的。
 - `ask_in_passing` / `subagent_recovery` / permission / question 表单 —— 是要**操作**的控件，不是读完的话；混成一个视觉语言会让"读消息"和"填表单"分不清。
 - `container_ready` / `browser_session_lost` —— 想框但**框不了**：这两个 block type 从来不被 `isRecognizedSystemBlockType` 识别（chunked 侧也没特判过），所以根本到不了路由，只会回落到自己的 text 块渲染成 `info` 卡。先把它们注册为已识别的系统卡才谈框。
@@ -197,6 +199,14 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
   - **media 详情（截图/图片）带 `media.width/height` 时按宽高比预留**（`fitImageBox` 进 可用宽×cap，纯算术，见 measure-tool-call 的 `mediaContentPx`）：截图 metadata 自带宽高，无尺寸时回落固定 200px。
   - **需测量🔴**：SpecTasks 列表(任务数×行高)、Recall/Send/Pipeline/WebSearch 结构化列表段、各 badge 头部行、error 文本、AskUserQuestionBanner、ReflectionNotice、InlinePermission 的 Textarea(1-3/8-30 行)+动态按钮行。
   - isPlan 的 `vpHeight`=0.85×视口高 → **用视口高公式替代，不测 DOM**。plan 正文按 **markdown** 测量/渲染（与 chunked 路径的 `ContentViewer markdown` 对齐），并可前置一行 `_planFile` 来源提示；正文解析同样走有界前缀（块边界截断）。plan 详情**不向上转发 `onUnknownHeight`** —— 外框高度由 cap 决定，转发会让虚拟列表与滚动框互相打架。
+  - **大纲计划画成大纲（`plan-tree`，计划可读性）**：大纲会话的 ExitPlanMode（输入声明 `mode: "outline"` 或带服务端写的 `_planRoot`）、计划文本完整（不是服务端前缀）且能解析成一棵树（`@shared/outline-plan-tree`）时，正文不是 markdown 而是 `ToolPlanTreeDetail`，按计划格式画：标题行（根）；根下第一块（跳过向人提的问题——渲染里每个 Ask 块下有一行 `‹question …›`——和给代理的意见块，和提交检查同一条规则）若是不带复选框、除问题外不挂子块、不超过 2×400 字的一段话就是**背景**，紧挨标题、对齐标题文字、无箭头无标记、整段显示（从不截断）；深度 1（大点）和深度 2（小点）默认可见，文字超过 3 行截断加省略号、点文字看全文；**关着的有子块的节点不画子块而画一行预览**：第一个子块的第一行，截成一视觉行，后接「…」和「还有 N 条 ▸」（N = 其余直接子块数；只有一个子块但一行放不下 / 有多行 / 有子块时是「展开 ▸」；放得下且没有更多时不带省略号和标签）——默认关着的是深度 ≥2 的节点，所以每个小点的实施细节只占一行；「特别值得注意的点」（按标题文字识别，不是任务）的条目和实施细节整段显示。
+    - **控件**：箭头开合单个节点；Alt+点击箭头（或焦点在箭头上按 Alt+Enter / Alt+Space）= 展开/收起该节点内的全部；有折叠内容的行右侧常显一个快捷按钮（名字固定为「其中全部」，状态在 `aria-expanded`，同一动作，不靠 hover，触屏可用）；点预览行 = 展开该节点内的全部（每条细节整段、连同其子块），之后焦点移到这一行的快捷按钮（没有就到箭头），不会掉到页面上；工具行「全部展开 / 全部收起」= 根的同一动作，收起回到默认视图。子树和全部的动作带上按钮当时显示的方向（`open`），按钮说什么就做什么。
+    - **键盘和点击归控件自己**：箭头、快捷按钮、工具行按钮、预览行、可点的文字上的 Enter / Space 由控件处理并 `preventDefault` + `stopPropagation`，等待中的审批在 window 上的 Enter 快捷键（`usePermissionFocusNav`）不会越过它们执行「按草稿执行」；那个快捷键本身也不再处理焦点在按钮、链接、`role=button`、`role=tab` 等控件上（或已被处理过、或有模态框开着）的 Enter——判断和输入框「Enter 回到输入框」用同一条规则（`interaction/enter-ownership.ts`）——只在页面本身、空的输入框和审批自己的按钮行里生效；在按钮行里它照旧执行高亮的那个（`PermButtonBar` 让真实焦点和 ⏎ 高亮保持在同一个按钮上），焦点在别处的控件上时 ⏎ 提示隐藏。按住不放的重复按键只算一次。Ctrl/Cmd/Shift 点击是列表的选中，不是开合。箭头和快捷按钮的点击区宽 24px（箭头向缩进和标记各借 3px，不改布局；标记 `pointer-events: none`）。快捷按钮的可访问名称写出它这一行（「展开/收起『…』里的全部」），预览行的名称带上它显示的那一行。
+    - **工具行**：有预览、有比截断更长的文字、或读者开合过节点/子树时出现（只翻转过文字、而卡片变宽后什么都不截断了，就不再出现）；「全部收起」在全部展开、或画出来的内容已经什么都没藏（没有预览、没有截断、没有关着的节点）时出现。
+    - **盒子滚动用列表的覆盖式滚动条**（`AutoFollowScroll` 声明布局：`scrollbarWidth: none` + `ContentScrollbars`），滚动条不占行的宽度；盒子要滚动时（内容高过 cap），行按少 8px（滚动条的条带，`PLAN_TREE_SCROLL_GUTTER`）的宽度重新排，右侧的快捷按钮不在滑块下面。
+    - **读者的开合是交互状态，不是渲染态**：`VListInteractionState.planTrees`（按卡片 key，`applyVListPlanTreeAction`），视图 = `scopes`（某子树全部展开 `x` / 在展开的子树里回到默认 `d`，最近的祖先说了算）+ 节点、文字的单独翻转；经 `ctx.planTreeView` 在适配时进 `classifyToolDetail` 的 `planView`，所以开合一次就重新测量；`extractDataRevision` 的 `|ptv:`（视图签名）、`|ptx:`（计划文本签名）、`|ptl:`（预览标签）进缓存键，`rowInteractionSig` 也带上视图签名；换 LOD 保留。预览标签（「还有 {n} 条 ▸」「展开 ▸」）和预览文字共用一行、参与测量，所以是适配器标签 `planTreeDetailsMore` / `planTreeDetailsOne`（随 `labelsRevision` 失效），不是渲染层标签。
+    - **高度纯算术**（`measure/measure-plan-tree.ts`）：工具行（一行 xs，只在有预览/截断或读者改过视图时出现）+ 间距 + 盒子 `min(行高之和 + 上下内边距, 0.85×视口)`；每行 = 显示的视觉行数 × `line.body`（+ 有预览时 2px + 一行），行间 2px，背景下面再多 4px。文字按硬换行一段一个 rich-inline flow，宽度 = 盒内宽 − 缩进（深度 × 16，超过 6 层不再缩进）− 箭头槽 − 复选框槽 − 有快捷按钮时的 24+4px；预览文字从子块文字的左边开始，宽度 = 剩余宽 − 标签宽（正文字体量出）− 8px − 省略号宽。截断行和预览行在渲染层按「宽度 − 省略号宽（− 标签）」重新排，**高度不变**。
+    - 全屏查看仍是计划的 markdown（`ToolPlanTreeDetail.markdown`，同一个 body id），但这张卡不画源码视图，所以不声明 `sourceInline`。被截断成前缀的计划、计划文件、不是一棵树的文本都照旧走 markdown。
 - **服务端截断的正文（`textTruncated`）预留整个 cap，且不占任何额外行**：
   - 无论普通 capped 正文（`cappedBodyHeight`）还是 markdown 正文（`measureMarkdownDetail`），只要正文是服务端前缀就把盒高钉在 `cap`，**不测前缀**。测前缀会让高度取决于服务端预算切在哪里（更宽的布局把前缀折成更少行 → 盒子变矮，剩余可滚内容无处安放）；cap 永不裁切，因为盒子本身 `overflow:auto`。
   - **没有"内容已截断"提示行**：完整 payload 由读者在正文盒内滚过一半时自动取（`VListContentViewHost` 的 capture 阶段 scroll 监听），或打开全屏查看器时取。两条路都经同一个 `fullPayloadRequested` 门控，所以仍是用户动作；又因为盒高已钉在 cap，落地的完整正文测得 `min(exact, cap)` —— 对任何溢出盒子的正文（每个服务端前缀都溢出）逐像素相同。
@@ -227,7 +237,10 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 - **ReasoningStepsTrace**（L3–L5）：表头 + min(N,5)×18.8 + 展开 step markdown🔴。**不读 LOD**：不存在"标题可见但正文打不开"的档位（旧 `titlesOnly` 已下线），L3/L4/L5 形态一致，只有读者展开了哪些步骤不同。
 
 ### SubagentCard（唯一直接读 useRenderLod）
-- Header：p=xs(20) + 徽标行 16.8 + description(折叠 truncate🟢 / 展开换行🔴) + 可选结果预览行。折叠≈55-75px。
+- Header：p=xs(20) + 徽标行（`badgeRowHeight()` = max(16, line.xs)，默认排版 20）+ mt2 + description(折叠 truncate🟢 一行 line.xs / 展开换行🔴) + 可选任务行 + 可选结果预览行（mt2 + line.xs）。默认排版 line.xs = round(12 × 1.4 × 120%) = 20：折叠 62px（无结果预览）/ 84px（有结果预览），任务行再 +(2 + line.xs) = +22，带任务行和结果预览 106px。
+  - **任务行**（outline P2 PR 9b）：`Agent` 带 `task` 派出时，description 下面一行「任务：标题」🟢，mt2 + 一行 xs（`DELEGATION_ROW_MARGIN_TOP + line.xs`），**不论展开折叠都在**，高度只由它在不在决定（`delegationRowHeight`）；渲染层把这一行的 `height` / `lineHeight` 钉在 `line.xs`，任何排版设置下画出来都正好是测量的那一行。标题和地址先读调用结果的 metadata（`_metadata.outlineDelegation`：Agent 工具写入任务地址、标题、认领代数，前台结果交付后再带附注头的 status/reason），它不受任何投影截断；没有 metadata（旧调用）才退回读文本：结果末尾的附注（`<outline_report …>` 头、正文、闭合 `</outline_report>` 三行，先去掉 run service 追加在附注后的 `<subagent_file_changes>` 块）或文本开头 `<background_task_id>` 之后那行「Delegated [[key/sid|标题]]」，都读不到时用调用写的 `task`；地址能解析时标题是大纲链接（`useOutlineLinkProps`，会话宿主里开大纲面板，服务端按读者权限解析，宿主外是纯文字）。
+  - **迟到徽标**：metadata（或退回时的附注）说迟到时，徽标行加一个「迟到」徽标（橙色，tooltip 写原因），和 `isTakenOver` 一样在固定的徽标行里，高度不变。后台派出的卡只有派出时的 metadata（任务、标题、代数），结果晚到时调用输出不改写，迟到经完成通知 / Await 文本告诉会话，卡上没有迟到徽标。
+  - 三者（标题、地址、迟到原因）都从缓存的 payload 画出来，且结论 patch 会单独带来它们（metadata 和附注随结果到达，`tool_completed` patch 带 `_metadata`），所以都进 `subagentRevision`（`gtk:` / `gta:` / `gtl:`）。metadata 随实时帧（文本截到 2000 字）和分页投影（8K）都完整到达，所以截断的结果照样有任务链接和迟到徽标。只有退回读文本时截断才有影响：附注被截掉就只显示调用写的 `task`、没有迟到徽标，直到 shell 取回全文——**展开卡片不会取全文**，只有全屏打开结果、或在内联查看器里读过一半时才取（`useVListContentView.ts` 的 `requestFullPayload`）。
 - Recent Calls：≤3 行 × **18.8px（= `TRACE_ROW_HEIGHT`）🟢，行间无缝**（`RECENT_STACK_GAP = 0`）。这些行就是 trace 行：dot + 14px 类别 chip + 单行 `Tool · summary` + 状态槽 + 耗时，高度直接引用 `measure-tool-run` 而不是自己再算一遍；成功不画勾与"耗时紧贴标题"的规则同上，两条渲染路径的一致性由 `RenderSubagent.traceparity.test.tsx` 逐项比对守住。
   `recentCallSummaries` / `recentCallCategories` 是 render-only（切到 `recentRowCount`），summary 由 shell 注入的 `resolveSubagentRecentSummary` 从 header 的 `inputSummary` 得出；两者都进 `subagentRevision`（`gs:` / `gc:`），因为流式补全 `inputSummary` 时行数/名字/状态都不动，它们是唯一增量。
 - 展开体：prompt ContentViewer **maxHeight:200🟡**、result ContentViewer **maxHeight:300🟡**、permission 子块。

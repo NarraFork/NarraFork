@@ -25,6 +25,8 @@
  * One scope serves one tool call; verdicts are memoized for its length only (the session read
  * scope caches across calls itself).
  */
+import { clipNoticeLine } from "@shared/outline-task-notice";
+import type { OutlineDisplaySpace } from "@shared/outline-tool-display";
 import { canAgentWriteSpace, type OutlinePrincipal } from "./access";
 import {
 	readNarratorTitle,
@@ -34,7 +36,11 @@ import {
 } from "./access-reads";
 import { OUTLINE_TOOL_TEXT } from "./messages";
 import { type OutlineResolution, resolveAddress } from "./resolve";
-import { canSessionReadSpace, listSessionReadableSpaces } from "./session-scope";
+import {
+	canSessionReadNarrator,
+	canSessionReadSpace,
+	listSessionReadableSpaces,
+} from "./session-scope";
 import {
 	ensurePersonalSpace,
 	ensureProjectSpace,
@@ -157,6 +163,23 @@ export class OutlineAgentScope {
 
 	get projectId(): string | null {
 		return this.spaces?.projectId ?? null;
+	}
+
+	/**
+	 * Session titles as this session may see them (review S-5): the title of a session it may
+	 * read (`canSessionReadNarrator`), null for any other (texts name it by id only).
+	 */
+	async readableTitles(
+		titles: ReadonlyMap<string, string | null>,
+	): Promise<Map<string, string | null>> {
+		const out = new Map<string, string | null>();
+		for (const [id, title] of titles) {
+			out.set(
+				id,
+				title !== null && (await canSessionReadNarrator(this.ctx.narratorId, id)) ? title : null,
+			);
+		}
+		return out;
 	}
 
 	/** Whether the session may read the space (memoized for this scope). */
@@ -382,6 +405,34 @@ export class OutlineAgentScope {
 	labelIn(space: OutlineSpaceRow): (sid: string) => string {
 		const address = this.addressIn(space);
 		return (sid) => `[${address(sid)}]`;
+	}
+
+	/**
+	 * The space as a tool card names it for the reader (`metadata.display.space`): the project's
+	 * name or the session's title, and whether it is this session's own notes or the personal space
+	 * of the person it works for (the card words those itself). Never model-facing.
+	 */
+	async spaceDisplay(space: OutlineSpaceRow): Promise<OutlineDisplaySpace> {
+		const base = { key: space.key, kind: space.kind };
+		switch (space.kind) {
+			case "project": {
+				const name = space.projectId ? await readProjectName(space.projectId) : null;
+				return { ...base, ...(name ? { name: clipNoticeLine(name, 60) } : {}) };
+			}
+			case "session": {
+				if (space.narratorId && space.narratorId === this.rootNarratorId) {
+					return { ...base, own: true };
+				}
+				const title = space.narratorId ? await readNarratorTitle(space.narratorId) : null;
+				return { ...base, ...(title ? { name: clipNoticeLine(title, 60) } : {}) };
+			}
+			case "personal":
+				return space.ownerUserId && space.ownerUserId === this.ctx.userId
+					? { ...base, own: true }
+					: base;
+			default:
+				return base;
+		}
 	}
 
 	private async spaceName(space: OutlineSpaceRow): Promise<string> {

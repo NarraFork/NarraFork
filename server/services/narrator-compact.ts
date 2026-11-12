@@ -36,6 +36,7 @@ import {
 	compactLocks,
 	markActiveHistoryCompactPending,
 	resetActiveUpstreamSession,
+	withNarratorMutationAdmission,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
@@ -1107,41 +1108,43 @@ async function doRunCustomCompact({
 		const finalSummary = appendHint ? `${summary}\n\n${appendHint}` : summary;
 
 		const finalizeMode = currentHistoryCompactMode(narratorId, mode);
-		const compactedMsg = await narratorService.finalizeCompactingMessage(
-			compactingMsg.id,
-			narratorId,
-			finalSummary,
-			contextPercent,
-			{
-				mode: finalizeMode,
-				workState,
-				workStateLocale: locale,
-				expectedAttempt,
-				expectedSeq,
-				epoch: compactEpochRecord(activeNarrators.get(narratorId)),
-				...(options?.preparedRetryMessage
-					? {
-							expectedCompactBoundaryMessageId:
-								options.preparedRetryMessage.compactBoundaryMessageId,
-						}
-					: {}),
-			},
-		);
-		if (!compactedMsg) {
-			throw new AppError(
-				"Compact marker disappeared or its attempt changed before finalize",
-				409,
-				"COMPACT_FINALIZE_CONFLICT",
+		// Only publication is admitted, never the remote summary request. Share the
+		// claim mutex so durable clearing and the live persistence baseline move
+		// together even when a PostgreSQL conversation-id claim is still awaiting IO.
+		const compactedMsg = await withNarratorMutationAdmission(narratorId, async () => {
+			if (signal?.aborted) throw compactAbortError();
+			const committed = await narratorService.finalizeCompactingMessage(
+				compactingMsg.id,
+				narratorId,
+				finalSummary,
+				contextPercent,
+				{
+					mode: finalizeMode,
+					workState,
+					workStateLocale: locale,
+					expectedAttempt,
+					expectedSeq,
+					epoch: compactEpochRecord(activeNarrators.get(narratorId)),
+					...(options?.preparedRetryMessage
+						? {
+								expectedCompactBoundaryMessageId:
+									options.preparedRetryMessage.compactBoundaryMessageId,
+							}
+						: {}),
+				},
 			);
-		}
-
-		resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
-		// Record that a history compact has completed but the active agent loop
-		// has not yet rebuilt its in-memory history from the new summary. This
-		// guards against a second background compact firing on the same (stale)
-		// context before the first one is consumed, which previously dropped a
-		// large chunk of context.
-		markActiveHistoryCompactPending(narratorId, compactedMsg?.seq ?? null);
+			if (!committed) {
+				throw new AppError(
+					"Compact marker disappeared or its attempt changed before finalize",
+					409,
+					"COMPACT_FINALIZE_CONFLICT",
+				);
+			}
+			resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
+			// Do not let another background compact consume the old in-memory history.
+			markActiveHistoryCompactPending(narratorId, committed.seq ?? null);
+			return committed;
+		});
 
 		let contextPercentAfter = contextPercent;
 		if (compactedMsg) {
@@ -1729,7 +1732,13 @@ async function runPlanCompactUnlocked(narratorId: string, planText: string): Pro
 
 	// persistPlanMessage atomically inserts the message, sets isCompact=1,
 	// and updates narrator's contextSummary + clears apiConversationId.
-	const compactMsg = await narratorService.persistPlanMessage(narratorId, planText);
+	const compactMsg = await withNarratorMutationAdmission(narratorId, async () => {
+		const committed = await narratorService.persistPlanMessage(narratorId, planText);
+		// Every caller (normal loop, denied retry and persisted recovery) observes the
+		// durable clear and live CAS baseline together; no lock-free caller reset.
+		if (committed) resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
+		return committed;
+	});
 	if (compactMsg) {
 		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactMsg });
 	}

@@ -26,6 +26,10 @@ import { unescapeComposerText } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
+import {
+	MEDIA_ATTACHMENT_WIDTH,
+	mediaAttachmentHeight,
+} from "@shared/pretext-layout/media-attachment-layout";
 import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
 import {
 	type ComposerQuote,
@@ -120,7 +124,7 @@ export const ASSISTANT_PAD_Y = 4; // 0.25rem ≈ 4px
  * heights in multiples of a line. NOT used for measurement — that reads
  * `typographyMetrics().line.body`, which follows the reader's scale.
  */
-const BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
+const BODY_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
 
 // ── Slash-command bubble chrome ──────────────────────────────────────────────
 /**
@@ -136,9 +140,9 @@ const BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
  * clicks the toggle, regardless of how long the expansion is.
  */
 /** Command line: sm monospace, weight 500, forced single line (truncate). */
-export const COMMAND_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
+export const COMMAND_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
 /** Clamped preview line of the expansion: xs, forced single line. */
-export const COMMAND_PREVIEW_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+export const COMMAND_PREVIEW_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 /** "Show / hide expanded prompt" control row: xs single line. */
 export const COMMAND_TOGGLE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 /**
@@ -175,6 +179,7 @@ export type MessageRole = "assistant" | "user";
 export interface MeasureUserAttachment {
 	type: string;
 	imageId?: string | null;
+	mediaId?: string | null;
 	previewUrl?: string | null;
 	filename?: string | null;
 	mediaType?: string | null;
@@ -357,6 +362,29 @@ function attachmentBlock(
 	marginTop: number,
 	innerWidth: number,
 ): PreparedFixedBlock | null {
+	if (attachment.type === "audio" || attachment.type === "video") {
+		return {
+			kind: "fixed",
+			marginTop,
+			height: mediaAttachmentHeight(attachment.type),
+			tag: `user-${attachment.type}`,
+			displayWidth: Math.min(innerWidth, MEDIA_ATTACHMENT_WIDTH),
+			data: {
+				type: attachment.type,
+				mediaId: attachment.mediaId ?? null,
+				previewUrl: attachment.previewUrl ?? null,
+				filename: attachment.filename ?? null,
+				mediaType: attachment.mediaType ?? null,
+				size: attachment.size ?? null,
+				uploadNarratorId: attachment.uploadNarratorId ?? null,
+			},
+			contentLeft: 0,
+			quoteRailLefts: [],
+			markerText: null,
+			markerLeft: null,
+			markerClassName: null,
+		};
+	}
 	const isImage = attachment.type === "image";
 	const isReference = attachment.type === "file_reference" && !!attachment.reference;
 	if (!isImage && !isReference && attachment.type !== "text_file") return null;
@@ -1058,9 +1086,9 @@ export const MEASURE_MESSAGE_CONSTANTS = {
 	USER_TEXT_FILE_HEIGHT: TEXT_FILE_HEIGHT,
 	ASSISTANT_PAD_X,
 	ASSISTANT_PAD_Y,
-	BODY_LINE_HEIGHT,
-	COMMAND_LINE_HEIGHT,
-	COMMAND_PREVIEW_LINE_HEIGHT,
+	BODY_LINE_HEIGHT_BASELINE,
+	COMMAND_LINE_HEIGHT_BASELINE,
+	COMMAND_PREVIEW_LINE_HEIGHT_BASELINE,
 	COMMAND_TOGGLE_HEIGHT,
 	COMMAND_ROW_GAP,
 	COMMAND_EXPANSION_MAX_CHARS,

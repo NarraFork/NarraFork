@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { generateSQLiteDrizzleJson, generateSQLiteMigration } from "drizzle-kit/api";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { z } from "zod";
+import { readTestMessageContent } from "../../../tests/setup";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import { OutputContentAccumulator } from "../../lib/agent/output-content";
@@ -32,6 +34,7 @@ function cleanDb() {
 const dbStub = {
 	db,
 	sqlite,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
@@ -90,7 +93,7 @@ function message(id: string) {
 		)
 		.get(id) as { content: string; text: string | null; chars: string | null };
 	return {
-		content: JSON.parse(row.content),
+		content: readTestMessageContent(sqlite, id),
 		text: row.text,
 		chars: JSON.parse(row.chars ?? "null"),
 	};

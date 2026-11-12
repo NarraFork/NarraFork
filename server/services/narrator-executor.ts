@@ -1,3 +1,4 @@
+import type { MediaRef, NativeMediaInput } from "@shared/media-attachments";
 import { type AgentConfig, type AgentLoopHistory, agentLoop } from "../lib/agent";
 import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
@@ -18,6 +19,7 @@ export interface ExecuteLoopOptions {
 	/** The history ends with tool results the model has not answered yet. */
 	startedWithToolResults?: boolean;
 	images?: Array<{ format: string; base64: string }>;
+	media?: (MediaRef | NativeMediaInput)[];
 	eventContext: EventHandlerContext;
 	hooks?: EventHooks;
 }
@@ -58,7 +60,7 @@ export interface ExecuteLoopResult {
 		providerId?: string;
 		providerPrefix?: string;
 		nugModelId?: string;
-		waitKind?: "credentials" | "quota";
+		waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 		quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
 		quotaBucket?: string;
@@ -143,7 +145,8 @@ export async function executeAgentLoop(
 	// Read the active pass's mutable default only when a new text block starts.
 	// Rebind per pass: a reused event context must not close over an older config.
 	eventContext.getFileReferenceContext = () => getAgentFileReferenceContext(config);
-	const eventSource = sourceOptions?.eventSource ?? agentLoop(config, userText, history, images);
+	const eventSource =
+		sourceOptions?.eventSource ?? agentLoop(config, userText, history, images, options.media);
 	const processEventFn = sourceOptions?.processEventFn ?? processEvent;
 
 	let finalText = "";

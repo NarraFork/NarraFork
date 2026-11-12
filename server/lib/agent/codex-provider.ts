@@ -1,4 +1,6 @@
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import { rejectNativeMedia, storedMessageMedia } from "./native-media";
 import type { ToolLoadingTarget } from "./tool-loading";
 
 // Codex Provider — uses the centralized CodexManager for multi-account OAuth
@@ -11,11 +13,10 @@ import {
 } from "@shared/agent-protocol/policy-violation";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { isAgentTaskInvalidMessage } from "../codex-agent-identity";
-import { type CallContext, getCodexManager } from "../codex-manager";
+import { type CallContext, type CodexCredential, getCodexManager } from "../codex-manager";
+import { codexFingerprintConfig, codexInstallationId, codexProxy } from "../codex-network";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
-import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
-import { resolveOverride } from "../net/proxy";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import { parseModelId, settings } from "../settings";
 import { getHttpCodexUserAgent, resolveClientFingerprint } from "../user-agent";
@@ -46,6 +47,8 @@ import type {
 	DbMessage,
 	GenerateMetaResult,
 	GenerateOptions,
+	ImageGenerationRequest,
+	ImageGenerationResponse,
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
@@ -105,32 +108,14 @@ function classifyCodexError(
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
-/**
- * Resolve the client-fingerprint config for the built-in Codex adapter from
- * `settings.codex`. The adapter always presents itself as the Codex client;
- * users can still override the UA or individual headers via settings.
- */
-function codexFingerprintConfig(): {
-	userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
-	customUserAgent?: string;
-	extraHeaders?: Record<string, string>;
-} {
-	const codex = settings.codex;
-	return {
-		userAgentMode: codex?.userAgentMode ?? "codex",
-		customUserAgent: codex?.customUserAgent,
-		extraHeaders: codex?.extraHeaders,
-	};
-}
-
-function resolveCodexProviderFingerprint(conversationId: string) {
-	const config = codexFingerprintConfig();
+function resolveCodexProviderFingerprint(conversationId: string, credential?: CodexCredential) {
+	const config = codexFingerprintConfig(credential);
 	return resolveClientFingerprint({
 		mode: config.userAgentMode,
 		custom: config.customUserAgent,
 		fallback: getHttpCodexUserAgent(),
 		extraHeaders: config.extraHeaders,
-		installationId: getInstallationId(),
+		installationId: codexInstallationId(credential),
 		conversationId,
 	});
 }
@@ -198,11 +183,11 @@ export class CodexProvider implements ProviderAdapter {
 
 	/** Create a temporary OpenAIProvider with the current credential. */
 	private createProvider(ctx: CallContext): OpenAIProvider {
-		// Resolve codex's own proxy override (absent/"default" → global). The
+		// The credential's own proxy, else codex's override (absent/"default" → global). The
 		// resolved string is passed to OpenAIProvider so it covers both HTTP
 		// (via pfetch precedence) and the WebSocket path, never falling back to
-		// the global policy and losing codex's override.
-		const proxy = resolveOverride(settings.codex?.proxy);
+		// the global policy and losing either override.
+		const proxy = codexProxy(ctx.credential);
 
 		return new OpenAIProvider(
 			{
@@ -218,7 +203,8 @@ export class CodexProvider implements ProviderAdapter {
 				codexAccountId: ctx.credential.accountId,
 				codexWebSearch: this.useWebSearch,
 				codexImageGeneration: this.useImageGeneration,
-				...codexFingerprintConfig(),
+				...codexFingerprintConfig(ctx.credential),
+				codexInstallationId: codexInstallationId(ctx.credential),
 			},
 			proxy,
 		);
@@ -445,6 +431,13 @@ export class CodexProvider implements ProviderAdapter {
 		throw new Error("Codex request failed");
 	}
 
+	supportsNativeMediaInput(
+		_media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		_model: string,
+	): boolean {
+		return false;
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		// Use a dummy provider just for formatting
 		const dummy = new OpenAIProvider({
@@ -470,6 +463,7 @@ export class CodexProvider implements ProviderAdapter {
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
+		rejectNativeMedia("Codex Responses", dbMessages.flatMap(storedMessageMedia));
 		const ctx = await this.getContext();
 		const provider = this.createProvider(ctx);
 		return provider.buildHistory(dbMessages, model, narratorId);
@@ -497,6 +491,7 @@ export class CodexProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		rejectNativeMedia("Codex Responses", [params.media, params.history, params.toolResults]);
 		// Use WebSocket mode if enabled
 		if (this.useWebSocket) {
 			yield* this.chatWebSocket(params);
@@ -595,8 +590,8 @@ export class CodexProvider implements ProviderAdapter {
 			let sawPolicyViolation = false;
 
 			try {
-				const request = this.buildResponsesWebSocketRequest(params);
-				const fingerprint = resolveCodexProviderFingerprint(params.conversationId);
+				const request = this.buildResponsesWebSocketRequest(params, ctx.credential);
+				const fingerprint = resolveCodexProviderFingerprint(params.conversationId, ctx.credential);
 
 				await reportInputCharacters(params, request);
 				params.onRequestStart?.({ credentialId: ctx.id });
@@ -605,7 +600,7 @@ export class CodexProvider implements ProviderAdapter {
 					apiKey: ctx.token,
 					authorization: ctx.authorization,
 					accountId: ctx.credential.accountId,
-					proxy: resolveOverride(settings.codex?.proxy),
+					proxy: codexProxy(ctx.credential),
 					sessionKey:
 						params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId,
 					conversationId: params.conversationId,
@@ -777,7 +772,10 @@ export class CodexProvider implements ProviderAdapter {
 		throw new Error("Codex Responses WebSocket chat failed");
 	}
 
-	private buildResponsesWebSocketRequest(params: ChatParams): CodexResponsesRequestBody {
+	private buildResponsesWebSocketRequest(
+		params: ChatParams,
+		credential?: CodexCredential,
+	): CodexResponsesRequestBody {
 		const model = parseModelId(params.model).model;
 		const messages: OAIMessage[] = [...(params.history as OAIMessage[])];
 		for (const tr of params.toolResults as Array<{
@@ -866,7 +864,7 @@ export class CodexProvider implements ProviderAdapter {
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
-			identity: createCodexRequestIdentity(params.conversationId),
+			identity: createCodexRequestIdentity(params.conversationId, codexInstallationId(credential)),
 			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
 		if (params.serviceTier) {
@@ -875,6 +873,12 @@ export class CodexProvider implements ProviderAdapter {
 
 		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
 		return request;
+	}
+
+	async generateImage(params: ImageGenerationRequest): Promise<ImageGenerationResponse> {
+		const ctx = await this.getContext(params.conversationId);
+		const response = await this.createProvider(ctx).generateImage(params);
+		return { ...response, credentialId: ctx.id };
 	}
 
 	async generate(text: string, model: string): Promise<string> {

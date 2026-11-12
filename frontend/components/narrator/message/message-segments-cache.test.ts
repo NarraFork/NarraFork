@@ -33,6 +33,29 @@ function expectColdEqual(messages: NarratorMsg[], cache: MessageSegmentationCach
 }
 
 describe("MessageSegmentationCache", () => {
+	test("compact auxiliary mode participates in material identity and false preserves the old lanes", () => {
+		const msg = message("mixed", [
+			{ type: "text", text: "before" },
+			{
+				type: "system_injection",
+				source: "behavior_fence",
+				modelText: "model",
+				body: { kind: "prose", text: "reminder" },
+			},
+			{ type: "text", text: "after" },
+		]);
+		const cache = new MessageSegmentationCache();
+		for (const compactAuxiliaryContent of [false, true, true, false]) {
+			const hot = segmentMessages([msg], { cache, compactAuxiliaryContent });
+			expect(hot).toEqual(segmentMessages([msg], { compactAuxiliaryContent }));
+			expect(hot[0]).toMatchObject({
+				visibleBlockIndices: compactAuxiliaryContent ? [0, 1, 2] : [0, 2],
+			});
+			expect(cache.size).toBe(1);
+			expect(cache.atomCount).toBe(compactAuxiliaryContent ? 3 : 2);
+		}
+	});
+
 	test("500 historical messages reuse classifications, resolved calls and items over 20 tail updates", () => {
 		let classificationReads = 0;
 		let resolutionReads = 0;

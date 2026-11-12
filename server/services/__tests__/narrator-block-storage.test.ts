@@ -47,6 +47,7 @@ const { clearModelHistorySourceCacheForTest } = await import(
 const NOW = "2026-10-01T00:00:00.000Z";
 
 beforeEach(async () => {
+	(await import("../../lib/settings")).settings.narratorBlocks.compactJson = false;
 	await (await import("../narrator-prefix-snapshots")).closePrefixSnapshotStore();
 	clearModelHistorySourceCacheForTest();
 	cleanDb(sqlite);
@@ -369,7 +370,7 @@ describe("epoch reconcile", () => {
 		const withLoad = await rows();
 		expect(await reconcile(["WebFetch"], "t", later)).toBe(false);
 		expect(await rows()).toEqual(withLoad);
-		expect(withLoad.slice(0, baseline.length)).toEqual(baseline);
+		expect<unknown>(withLoad.slice(0, baseline.length)).toEqual(baseline);
 		expect(
 			withLoad
 				.filter((row) => (row.contentJson as { type?: string }[])[0]?.type === "epoch")

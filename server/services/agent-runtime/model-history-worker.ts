@@ -2,6 +2,8 @@
 
 import { Database } from "bun:sqlite";
 import { SQL } from "bun";
+import { safeSqliteCode, workerFailureDetails } from "../../lib/db-worker/failure";
+import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { type ModelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import {
 	type ModelHistoryCounters,
@@ -18,7 +20,7 @@ import {
 
 declare const self: Worker;
 
-type Request = ModelHistoryQueryOptions & {
+type Request = Omit<ModelHistoryQueryOptions, "signal"> & {
 	previous?: ModelHistoryManifest;
 	previousCatalogIdentity?: string;
 } & ({ backend: "sqlite"; path: string } | { backend: "postgres"; url: string });
@@ -80,13 +82,8 @@ self.onmessage = async (event: MessageEvent<Request | { type: "ack" }>) => {
 			try {
 				completed = await sql.begin(async (tx) => {
 					await tx.unsafe("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
-					await tx.unsafe("SET LOCAL statement_timeout = '10s'");
 					const signature = request.versioned
-						? pin(
-								await readPostgresModelHistorySignature(tx, request.narratorId, {
-									deadline: request.deadline,
-								}),
-							)
+						? pin(await readPostgresModelHistorySignature(tx, request.narratorId))
 						: undefined;
 					const query = async <T>(statement: string, parameters: unknown[] = []) =>
 						(await tx.unsafe(postgresHistorySql(statement), parameters as string[])) as T[];
@@ -120,9 +117,14 @@ self.onmessage = async (event: MessageEvent<Request | { type: "ack" }>) => {
 		const message = error instanceof Error ? error.message : "";
 		postMessage({
 			type: "error",
+			code: request.backend === "sqlite" ? safeSqliteCode(error) : undefined,
+			diagnostic: workerFailureDetails(error, false),
 			message: message.startsWith("Model history")
 				? message
 				: "Model history read-only worker failed",
 		});
 	}
 };
+
+// Identity is embedded in this worker's code, never copied from the parent's request/environment.
+postMessage({ type: "ready", buildId: RUNTIME_BUILD_ID });

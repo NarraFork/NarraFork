@@ -85,7 +85,11 @@ import type {
 	ToolSectionLabel,
 	ToolStructuredEntry,
 } from "@shared/pretext-layout/tool-detail";
-import { ASK_OPTIONS_MAX, ASK_QUESTIONS_MAX } from "@shared/pretext-layout/tool-detail";
+import {
+	ASK_OPTIONS_MAX,
+	ASK_QUESTIONS_MAX,
+	CHANGE_ROWS_MAX,
+} from "@shared/pretext-layout/tool-detail";
 import { sharePreviewHeight } from "@shared/share-preview";
 
 export type {
@@ -156,21 +160,29 @@ import { MEASURE_MARKDOWN_CODE_PADDING } from "./measure-markdown";
 import {
 	ALERT_STACK_GAP,
 	CUSTOM_ANSWER_FONT,
-	CUSTOM_ANSWER_LINE_HEIGHT,
+	CUSTOM_ANSWER_LINE_HEIGHT_BASELINE,
 	HEADER_FONT,
-	HEADER_LINE_HEIGHT,
+	HEADER_LINE_HEIGHT_BASELINE,
 	type InlinePermissionData,
 	type MeasuredInlinePermission,
 	measureInlinePermission,
 	OPTION_DESC_FONT,
-	OPTION_DESC_LINE_HEIGHT,
+	OPTION_DESC_LINE_HEIGHT_BASELINE,
 	OPTION_DESC_MARGIN_TOP,
 	OPTION_INDENT,
 	OPTION_LABEL_FONT,
-	OPTION_LABEL_LINE_HEIGHT,
+	OPTION_LABEL_LINE_HEIGHT_BASELINE,
 	OPTIONS_GAP,
 	QUESTION_STACK_GAP,
 } from "./measure-permission";
+import {
+	layoutPlanTree,
+	PLAN_TREE_PAD_X,
+	PLAN_TREE_PAD_Y,
+	PLAN_TREE_SCROLL_GUTTER,
+	PLAN_TREE_TOOLBAR_GAP,
+	planTreeToolbarHeight,
+} from "./measure-plan-tree";
 import {
 	type MeasuredReflectionNotice,
 	measureReflectionNotice,
@@ -286,7 +298,7 @@ export const CARD_HEADER_INNER_ICON = 9;
  *
  * Baseline only — measurement and paint must call {@link headerRowHeight}.
  */
-export const HEADER_TEXT_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEIGHT); // 19
+export const HEADER_TEXT_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEIGHT); // 19
 /**
  * Header row height at NEUTRAL typography: the taller of the icon lane (14) vs the text line (19).
  *
@@ -296,7 +308,7 @@ export const HEADER_TEXT_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEI
  * and the drill morph then animated between two geometries that no longer described the
  * same line.
  */
-export const HEADER_ROW_HEIGHT = Math.max(HEADER_CATEGORY_ICON, HEADER_TEXT_LINE_HEIGHT); // 19
+export const HEADER_ROW_HEIGHT = Math.max(HEADER_CATEGORY_ICON, HEADER_TEXT_LINE_HEIGHT_BASELINE); // 19
 
 /**
  * Card-header row height at the reader's current typography.
@@ -324,7 +336,10 @@ export const DETAIL_BODY_FONT_SIZE = 11;
  * wrapped line drifts 0.4px from the box this constant reserved and a 15-line
  * body overflows by 6px — clipped silently, because the box is height-fixed.
  */
-export const DETAIL_CONTENT_LINE_HEIGHT = lineBoxHeight(DETAIL_BODY_FONT_SIZE, LINE_HEIGHT.xs);
+export const DETAIL_CONTENT_LINE_HEIGHT_BASELINE = lineBoxHeight(
+	DETAIL_BODY_FONT_SIZE,
+	LINE_HEIGHT.xs,
+);
 /** detailContentLineHeight() at the reader's typography (baseline above). */
 export function detailContentLineHeight(): number {
 	return scaledLineBoxHeight(DETAIL_BODY_FONT_SIZE, LINE_HEIGHT.xs);
@@ -346,7 +361,7 @@ export function detailBodyFontSize(): number {
 	return scaleFontSize(DETAIL_BODY_FONT_SIZE);
 }
 /** Detail section label ("Input"/"Output", Text size="xs") line box: 12×1.4 = 17. */
-export const DETAIL_LABEL_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const DETAIL_LABEL_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Detail section label `mb={2}`. */
 export const DETAIL_LABEL_MARGIN_BOTTOM = 2;
 /**
@@ -356,7 +371,7 @@ export const DETAIL_LABEL_MARGIN_BOTTOM = 2;
  * which would silently clip (or under-fill) the body the day either part of the
  * label chrome moved.
  */
-export const DETAIL_LABEL_CHROME_Y = DETAIL_LABEL_LINE_HEIGHT + DETAIL_LABEL_MARGIN_BOTTOM; // 19
+export const DETAIL_LABEL_CHROME_Y = DETAIL_LABEL_LINE_HEIGHT_BASELINE + DETAIL_LABEL_MARGIN_BOTTOM; // 19
 /** Generic detail: `mt="xs"` gap before the output section. */
 export const GENERIC_SECTION_GAP = SPACING.xs; // 10
 
@@ -414,7 +429,7 @@ export const DETAIL_MARKDOWN_PREFIX_MAX_CHARS = 32 * 1024;
 export const DETAIL_SOURCE_LINE_MARGIN_BOTTOM = 4;
 
 /** Shared xs text line box (measured detail bodies): 12×1.4 = 17. */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 
 /** SpecTasks: List `size="xs"` icon (ThemeIcon 16) + its label offset. */
 export const SPEC_TASK_ICON = 16;
@@ -446,7 +461,7 @@ export const SPEC_TASK_EMPTY_HEIGHT =
 /** Structured (recall/send/pipeline/web-search) badge header row (Badge xs). */
 export const STRUCT_BADGE_ROW = 16;
 /** Structured body line box (xs text). */
-export const STRUCT_BODY_LINE_HEIGHT = XS_LINE_HEIGHT; // 17
+export const STRUCT_BODY_LINE_HEIGHT_BASELINE = XS_LINE_HEIGHT_BASELINE; // 17
 /** Structured: gap between the badge header and the first body line. */
 export const STRUCT_BADGE_GAP = 4;
 
@@ -478,6 +493,20 @@ export const META_ACTION_ROW = 30;
 export const META_PROGRESS_ROW = 18;
 /** Reserved figures line under a progress bar (xs text). */
 export const META_PROGRESS_FIGURES_ROW = 16;
+/** Change list (outline cards): gap between two change rows. */
+export const CHANGE_ROW_GAP = 4;
+/** Change list: gap above the raw input / result fold under it. */
+export const CHANGE_TOGGLE_GAP = 6;
+
+/**
+ * One change row (and the fold row under a change list): a single nowrap line of xs text with
+ * xs badges beside it, so the taller of the reader's live xs line box and a badge. Read at
+ * measure time — the line follows the reader's typography, the badge does not.
+ */
+export function changeRowHeight(): number {
+	return Math.max(typographyMetrics().line.xs, META_BADGE_ROW);
+}
+
 /** Max meta rows measured/painted in one region (bounded work). */
 export const META_ROWS_MAX = 12;
 /** Max structured entries measured/painted (mirrors the classifier's slice). */
@@ -494,14 +523,14 @@ export const ENTRY_SNIPPET_MAX_LINES = 3;
 
 // ── Grouped-card chrome ──────────────────────────────────────────────────────
 /** Group header text line box at NEUTRAL typography (Mantine `<Text size="xs">` → xs 1.4 = 17). */
-export const GROUP_HEADER_TEXT_LINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const GROUP_HEADER_TEXT_LINE_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Group header ThemeIcon size={16}. */
 export const GROUP_HEADER_ICON = 16;
 /**
  * Group header row at NEUTRAL typography: max(icon 16, badge 16, xs text 17, chevron 12) = 17.
  * Baseline only — measure/paint read {@link groupHeaderRowHeight}.
  */
-export const GROUP_HEADER_ROW = Math.max(GROUP_HEADER_ICON, GROUP_HEADER_TEXT_LINE); // 17
+export const GROUP_HEADER_ROW = Math.max(GROUP_HEADER_ICON, GROUP_HEADER_TEXT_LINE_BASELINE); // 17
 
 /** Group-header row height at the reader's current typography (xs line scales; icons do not). */
 export function groupHeaderRowHeight(): number {
@@ -576,6 +605,10 @@ function mediaContentPx(
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface ToolCallData {
+	/** Auxiliary records share this view model without acquiring tool execution identity. */
+	contentRole?: "auxiliary";
+	/** Omitted for notices that have no real execution/delivery status. */
+	sourceStatus?: string | null;
 	/** Tool name (renderer header; height-neutral). */
 	toolName: string;
 	/** Header summary line (truncated → height-neutral). */
@@ -761,6 +794,8 @@ export function earliestToolStartMs(timing: ToolTimingStamps): number | null {
 }
 
 export interface MeasureToolCallOpts {
+	/** Presentation default, separate from a reader's explicit opened preference. */
+	defaultOpened?: boolean;
 	/** Viewport height (px) — plan cards cap their detail at 0.85 × this. */
 	viewportHeight?: number;
 	/** L5: recent cards follow `opened`; older ones collapse. Default true. */
@@ -837,6 +872,8 @@ export interface MeasuredToolDetail {
 }
 
 export interface MeasuredToolCall extends MeasuredElement {
+	contentRole?: "auxiliary";
+	sourceStatus?: string | null;
 	/** Resolved expand decision (the height/shape main switch). */
 	effectiveOpened: boolean;
 	/** True when running/streaming/pendingPermission (always expanded). */
@@ -1470,7 +1507,7 @@ function metaRowBlocks(row: ToolMetaRow, marginTop: number): PreparedBlock[] {
 			makeInline(
 				row.text,
 				row.mono ? typographyMetrics().font.xsMono : typographyMetrics().font.xs,
-				XS_LINE_HEIGHT,
+				XS_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-meta-row",
@@ -1536,12 +1573,13 @@ function entryBlocks(
 		makeInline(
 			entry.title.length > 0 ? entry.title : " ",
 			DETAIL_TEXT_FONT,
-			XS_LINE_HEIGHT,
+			XS_LINE_HEIGHT_BASELINE,
 			0,
 			nextMargin,
 			"vlist-tc-entry-title",
 			{
 				...(entry.href ? { href: entry.href } : {}),
+				...(entry.target ? { target: entry.target } : {}),
 				...(entry.tone ? { tone: entry.tone } : {}),
 			},
 		),
@@ -1557,7 +1595,7 @@ function entryBlocks(
 			makeInline(
 				entry.meta,
 				DETAIL_MONO_FONT,
-				XS_LINE_HEIGHT,
+				XS_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-entry-meta",
@@ -1609,7 +1647,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				question.header.length > 0 ? question.header : " ",
 				HEADER_FONT,
-				HEADER_LINE_HEIGHT,
+				HEADER_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-ask-header",
@@ -1624,7 +1662,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				question.description,
 				OPTION_DESC_FONT,
-				OPTION_DESC_LINE_HEIGHT,
+				OPTION_DESC_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-ask-description",
@@ -1643,7 +1681,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				optionTitle,
 				OPTION_LABEL_FONT,
-				OPTION_LABEL_LINE_HEIGHT,
+				OPTION_LABEL_LINE_HEIGHT_BASELINE,
 				OPTION_INDENT,
 				index === 0 ? nextMargin : OPTIONS_GAP,
 				"vlist-tc-ask-option-label",
@@ -1655,7 +1693,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 				makeInline(
 					option.description,
 					OPTION_DESC_FONT,
-					OPTION_DESC_LINE_HEIGHT,
+					OPTION_DESC_LINE_HEIGHT_BASELINE,
 					OPTION_INDENT,
 					OPTION_DESC_MARGIN_TOP,
 					"vlist-tc-ask-option-desc",
@@ -1673,7 +1711,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				question.answer,
 				OPTION_LABEL_FONT,
-				OPTION_LABEL_LINE_HEIGHT,
+				OPTION_LABEL_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-ask-answer",
@@ -1687,7 +1725,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				question.customAnswer,
 				CUSTOM_ANSWER_FONT,
-				CUSTOM_ANSWER_LINE_HEIGHT,
+				CUSTOM_ANSWER_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-ask-custom-answer",
@@ -1769,6 +1807,53 @@ export function measureToolBody(
 				innerWidth,
 				null,
 			);
+		case "change-rows": {
+			// Every row is one fixed line (truncated, never wrapped): the height is the row count.
+			const line = changeRowHeight();
+			const blocks: PreparedBlock[] = detail.rows
+				.slice(0, CHANGE_ROWS_MAX)
+				.map((row, i) =>
+					makeFixed(line, "detail-change-row", i === 0 ? 0 : CHANGE_ROW_GAP, { row }),
+				);
+			if (detail.toggle) {
+				blocks.push(
+					makeFixed(line, "detail-change-toggle", blocks.length > 0 ? CHANGE_TOGGLE_GAP : 0, {
+						toggle: detail.toggle,
+					}),
+				);
+			}
+			if (blocks.length === 0) blocks.push(makeFixed(line, "detail-change-empty", 0));
+			return finishRegion(detail, blocks, innerWidth, null);
+		}
+
+		case "plan-tree": {
+			// An outline plan's tree (plan readability): the toolbar line when something is folded,
+			// clamped or opened, then the rows in the plan's capped box (scrolls past 0.85 × viewport, as the
+			// markdown plan did). Rows are laid out by `measure-plan-tree`.
+			const cap = resolveDetailCap("plan", viewportHeight);
+			const inner = Math.max(1, innerWidth - PLAN_TREE_PAD_X * 2);
+			let layout = layoutPlanTree(detail.tree, detail.view, inner, detail.labels);
+			// A box past its cap scrolls: its rows are laid out clear of the overlay scrollbar's strip.
+			if (layout.contentHeight + PLAN_TREE_PAD_Y * 2 > cap)
+				layout = layoutPlanTree(
+					detail.tree,
+					detail.view,
+					Math.max(1, inner - PLAN_TREE_SCROLL_GUTTER),
+					detail.labels,
+				);
+			const blocks: PreparedBlock[] = [];
+			if (layout.toolbar)
+				blocks.push(makeFixed(planTreeToolbarHeight(), "detail-plan-toolbar", 0, { layout }));
+			const box = Math.min(layout.contentHeight + PLAN_TREE_PAD_Y * 2, cap);
+			blocks.push(
+				makeFixed(box, "detail-plan-tree", layout.toolbar ? PLAN_TREE_TOOLBAR_GAP : 0, {
+					layout,
+					cap,
+				}),
+			);
+			return finishRegion(detail, blocks, innerWidth, cap);
+		}
+
 		case "meta-rows": {
 			const rows = detail.rows.slice(0, META_ROWS_MAX);
 			const blocks: PreparedBlock[] = [];
@@ -1855,7 +1940,7 @@ export function measureToolBody(
 				return makeInline(
 					task.text.length > 0 ? task.text : "—",
 					DETAIL_TEXT_FONT,
-					XS_LINE_HEIGHT,
+					XS_LINE_HEIGHT_BASELINE,
 					indent,
 					i === 0 ? 0 : SPEC_TASK_GAP,
 					"vlist-tc-spec-task",
@@ -1925,7 +2010,7 @@ export function measureToolBody(
 					makeInline(
 						line.length > 0 ? line : " ",
 						font,
-						STRUCT_BODY_LINE_HEIGHT,
+						STRUCT_BODY_LINE_HEIGHT_BASELINE,
 						0,
 						marginTop,
 						"vlist-tc-struct-line",
@@ -1948,7 +2033,7 @@ export function measureToolBody(
 			const block = makeInline(
 				detail.text.length > 0 ? detail.text : " ",
 				DETAIL_TEXT_FONT,
-				XS_LINE_HEIGHT,
+				XS_LINE_HEIGHT_BASELINE,
 				ERROR_INDENT,
 				0,
 				"vlist-tc-error",
@@ -1996,14 +2081,15 @@ export function measureToolCall(
 	// forces the card expanded so the permission area shows.
 	const hasPendingPermission = opts.hasPendingPermission === true;
 	const forceExpanded = hasPending || hasPendingPermission || opts.forceExpanded === true;
-	const preferOpen = opts.preferOpen === true || prefersOpenToolCategory(data.category);
+	const preferOpen = opts.preferOpen ?? prefersOpenToolCategory(data.category);
 
 	const innerWidth = toolCardInnerWidth(contentWidth, inRun);
 
 	// ── Expand decision ──────────────────────────────────────────────────────
 	const lodExempt = isRunningStatus(data.status) || isStreaming || forceExpanded;
 	const isRecent = opts.isRecent ?? true;
-	const opened = opts.opened ?? (preferOpen || computeDefaultOpen(data, forceExpanded));
+	const opened =
+		opts.opened ?? opts.defaultOpened ?? (preferOpen || computeDefaultOpen(data, forceExpanded));
 	// An EXPLICIT fold, as opposed to `opened === false` derived from
 	// `computeDefaultOpen`. The two must stay distinct: at L5 the derived default is
 	// not a decision the reader made, so honouring it there would collapse every
@@ -2101,6 +2187,8 @@ export function measureToolCall(
 		lodExempt,
 		isStreaming,
 		queuedBehindUpstream: data.queuedBehindUpstream === true ? true : undefined,
+		contentRole: data.contentRole,
+		sourceStatus: data.sourceStatus,
 		inRun,
 		isLast,
 		hasBorder,

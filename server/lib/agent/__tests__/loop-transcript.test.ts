@@ -4,7 +4,9 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import type { MediaContentBlock } from "@shared/media-attachments";
 import { assembleContent, splitEnvelope } from "@shared/narrator-blocks/storage";
+import { clearedToolOutput, historyClearedText } from "@shared/storage-retention";
 import { AnthropicProvider } from "../anthropic-provider";
 import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
 import { GeminiProvider } from "../gemini-provider";
@@ -87,6 +89,66 @@ function restoredRows(rows: DbMessage[]): DbMessage[] {
 }
 
 for (const [name, provider, model] of projectionProviders()) {
+	test(`${name}: cleared history continues as text without incomplete calls, credentials or ledger revival`, async () => {
+		const at = "2026-10-01T00:00:00.000Z";
+		const base = { contentText: null, parentToolUseId: null, messageUuid: null };
+		const rows: DbMessage[] = [
+			{ ...base, id: "old-user", role: "user", contentJson: [historyClearedText(at)] },
+			{
+				...base,
+				id: "cleared-assistant",
+				role: "assistant",
+				contentJson: [historyClearedText(at)],
+				toolCalls: [
+					{
+						toolUseId: "wire-old-ledger",
+						toolName: "Read",
+						inputJson: { path: "private-ledger-input" },
+						outputJson: "private-ledger-output",
+						status: "success",
+					},
+				],
+			},
+			{
+				...base,
+				id: "cleared-tool",
+				role: "assistant",
+				contentJson: [
+					{
+						type: "tool_use",
+						id: "wire-cleared",
+						name: "Write",
+						input: { content: "private-stale-input" },
+						thoughtSignature: "private-old-signature",
+					},
+				],
+				toolCalls: [
+					{
+						toolUseId: "wire-cleared",
+						toolName: "Write",
+						inputJson: null,
+						outputJson: clearedToolOutput(at),
+						status: "success",
+					},
+				],
+			},
+			{
+				...base,
+				id: "continue-input",
+				role: "user",
+				contentJson: [{ type: "text", text: "continue after retention" }],
+			},
+		];
+		const history = (await provider.buildHistory(rows, model)).history;
+		const wire = JSON.stringify(history);
+		expect(wire).toContain("[History cleared]");
+		expect(wire).toContain("[Tool details cleared]");
+		expect(wire).toContain("continue after retention");
+		expect(wire).not.toContain("wire-cleared");
+		expect(wire).not.toContain("wire-old-ledger");
+		expect(wire).not.toContain("private-");
+		expect((await provider.buildHistory(restoredRows(rows), model)).history).toEqual(history);
+	});
 	test(`${name}: typed updates append once and rebuild identically after a tool result`, async () => {
 		const transcript = new LoopTranscript([
 			{
@@ -213,6 +275,45 @@ function toolStep(transcript: LoopTranscript, ids: string[]) {
 }
 
 describe("loop transcript", () => {
+	const media: MediaContentBlock = {
+		type: "audio",
+		mediaId: "durable-audio",
+		filename: "recording.wav",
+		mediaType: "audio/wav",
+		size: 46,
+		uploadNarratorId: "original-owner",
+	};
+
+	test("media-only input keeps durable original refs without storing provider bytes", () => {
+		const transcript = new LoopTranscript();
+		const pending = transcript.withInput("", undefined, [media]);
+		expect(transcript.rows).toEqual([]);
+		expect(pending[0]?.contentJson).toEqual([media]);
+		transcript.appendInput("", undefined, [media]);
+		expect(transcript.rows[0]?.contentJson).toEqual([media]);
+		media.filename = "changed-after-snapshot.wav";
+		expect(pending[0]?.contentJson).toMatchObject([{ filename: "recording.wav" }]);
+		media.filename = "recording.wav";
+		expect(JSON.stringify(transcript.rows)).not.toContain("base64");
+	});
+
+	test("settled media is stored in the canonical tool output envelope and broken calls omit it", () => {
+		const transcript = new LoopTranscript();
+		toolStep(transcript, ["media", "bad"]);
+		const before = transcript.rows;
+		transcript.settleTool("media", { output: "audio read", mediaRefs: [media] });
+		transcript.settleTool("bad", { output: "broken", broken: true, mediaRefs: [media] });
+		expect(before[0]?.toolCalls?.[0]?.outputJson).toBeNull();
+		expect(transcript.rows[0]?.toolCalls?.[0]?.outputJson).toEqual({
+			_text: "audio read",
+			_media: [media],
+		});
+		expect(transcript.rows[0]?.toolCalls?.[1]?.outputJson).toEqual({
+			_text: "broken",
+			_broken: true,
+		});
+	});
+
 	test("a call reaches the model only together with its result, in call order", async () => {
 		const transcript = new LoopTranscript();
 		transcript.appendInput("read both");

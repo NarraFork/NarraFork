@@ -22,7 +22,12 @@
  * here and carry their bytes (`data`), which stored rows never do.
  */
 
-import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import { encodeToolOutput, type ToolOutputImageRef } from "@shared/agent-protocol/tool-output";
+import {
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+} from "@shared/media-attachments";
 import type { DbMessage, DbToolCall } from "./provider";
 import { markSenderProjected } from "./sender-projection";
 import type { ContentBlock } from "./types";
@@ -36,6 +41,10 @@ export interface TranscriptToolResult {
 	output: string;
 	isError?: boolean;
 	images?: readonly TranscriptImage[];
+	/** Images already saved by a tool worker; do not decode and upload them again. */
+	imageRefs?: readonly Extract<ToolOutputImageRef, { uploadNarratorId: string }>[];
+	/** Replay uses durable original assets; provider bytes never enter transcript rows. */
+	mediaRefs?: readonly MediaContentBlock[];
 	/** The call's input was invalid and it never ran; the model's history leaves it out. */
 	broken?: boolean;
 }
@@ -51,7 +60,11 @@ function mediaType(format: string): string {
  * The turn's input as a user row. Its text is already what the model reads (the loop's
  * prompt, a correction, unpersisted host text), so the projection adds no attribution.
  */
-function inputRow(text: string, images: readonly TranscriptImage[] = []): DbMessage {
+function inputRow(
+	text: string,
+	images: readonly TranscriptImage[] = [],
+	media: readonly MediaRef[] = [],
+): DbMessage {
 	const id = nextRowId();
 	return markSenderProjected({
 		id,
@@ -64,6 +77,7 @@ function inputRow(text: string, images: readonly TranscriptImage[] = []): DbMess
 				mediaType: mediaType(image.format),
 				data: image.base64,
 			})),
+			...media.map((ref) => mediaRefToContentBlock(ref)),
 		],
 		contentText: text,
 		parentToolUseId: null,
@@ -91,8 +105,14 @@ export class LoopTranscript {
 	}
 
 	/** The rows plus an input the model has not answered yet: what a request with it reads. */
-	withInput(text: string, images?: readonly TranscriptImage[]): DbMessage[] {
-		return text || images?.length ? [...this.#rows, inputRow(text, images)] : this.rows;
+	withInput(
+		text: string,
+		images?: readonly TranscriptImage[],
+		media?: readonly MediaRef[],
+	): DbMessage[] {
+		return text || images?.length || media?.length
+			? [...this.#rows, inputRow(text, images, media)]
+			: this.rows;
 	}
 
 	/** Take over a host's rebuild: its rows are the conversation from here on. */
@@ -100,8 +120,12 @@ export class LoopTranscript {
 		this.#rows = [...rows];
 	}
 
-	appendInput(text: string, images?: readonly TranscriptImage[]): void {
-		if (text || images?.length) this.#rows.push(inputRow(text, images));
+	appendInput(
+		text: string,
+		images?: readonly TranscriptImage[],
+		media?: readonly MediaRef[],
+	): void {
+		if (text || images?.length || media?.length) this.#rows.push(inputRow(text, images, media));
 	}
 
 	/** An assistant step; its tool calls are open until settled. */
@@ -142,15 +166,19 @@ export class LoopTranscript {
 				status: result.isError ? "fail" : "success",
 				outputJson: encodeToolOutput(result.output, {
 					...(result.broken ? { broken: true } : {}),
-					...(!result.broken && result.images?.length
+					...(!result.broken && (result.imageRefs?.length || result.images?.length)
 						? {
-								images: result.images.map((image, position) => ({
-									imageId: `${toolUseId}-${position}`,
-									mediaType: mediaType(image.format),
-									data: image.base64,
-								})),
+								images: [
+									...(result.imageRefs ?? []),
+									...(result.images ?? []).map((image, position) => ({
+										imageId: `${toolUseId}-${position}`,
+										mediaType: mediaType(image.format),
+										data: image.base64,
+									})),
+								],
 							}
 						: {}),
+					...(!result.broken && result.mediaRefs?.length ? { media: [...result.mediaRefs] } : {}),
 				}),
 			};
 			this.#rows[index] = {

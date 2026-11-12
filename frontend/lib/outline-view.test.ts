@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { OutlineCommitSummary, OutlineViewBlock } from "@shared/outline-api";
+import { visibleFoldRows } from "@shared/outline-fold";
 import { OUTLINE_RECENTS_MAX, parseOutlineRecents, withOutlineRecent } from "./outline-recents";
 import {
 	parseOutlineBlockSearch,
 	spaceLabelKey,
 	timelineOldestFirst,
 	timelinePosition,
-	visibleRows,
+	viewFoldSource,
+	viewFoldTree,
 } from "./outline-view";
 
 function block(id: string, childIds: string[] = [], extra: Partial<OutlineViewBlock> = {}) {
@@ -22,6 +24,9 @@ function block(id: string, childIds: string[] = [], extra: Partial<OutlineViewBl
 		hidden: 0,
 		processHidden: 0,
 		openTasks: 0,
+		inProgress: [],
+		lock: null,
+		pending: [],
 		...extra,
 	} satisfies OutlineViewBlock;
 }
@@ -50,41 +55,91 @@ describe("block page search", () => {
 	});
 });
 
-describe("visible rows", () => {
+describe("a view as the tree its folding is worked out on", () => {
 	const view = {
 		rootId: "root",
 		blocks: [
-			block("root", ["a", "b"]),
+			block("root", ["a", "t", "b"]),
 			block("a", ["a1", "a2"]),
+			block("t", ["n", "r", "q"], {
+				task: { status: "doing", assignee: null, due: null, depends: [] },
+			}),
 			block("b", [], { hidden: 3 }),
 			block("a1", ["a1x"]),
 			block("a2"),
+			block("n", ["n1"], { pending: ["chg1"] }),
+			block("r", ["rh"], { content: "Report (generation 1 · 2026-11-09 17:38 UTC)" }),
+			block("q", [], { question: { state: "open", proceed: false } }),
 			block("a1x"),
+			block("n1", [], {
+				question: { state: "answered", proceed: false },
+				lock: {
+					blockId: "n1",
+					by: { kind: "human", id: "u", name: "alice" },
+					delegate: null,
+					versionSeq: 1,
+					canUnlock: false,
+				},
+			}),
+			block("rh", ["rp"], { content: "## Findings" }),
+			block("rp"),
 		],
 	};
+	const none = { expanded: new Set<string>(), collapsed: new Set<string>() };
+	const rowsOf = (v: Parameters<typeof viewFoldTree>[0], fold = none) => {
+		const source = viewFoldSource(v);
+		return visibleFoldRows(viewFoldTree(v, source, fold), source).rows;
+	};
 
-	test("depth first from the root's children, the root itself left out", () => {
-		expect(visibleRows(view, new Set()).map((r) => [r.block.id, r.depth])).toEqual([
+	test("depth first from the root's children, the root itself left out; facts stay open", () => {
+		expect(rowsOf(view).map((r) => [r.node.id, r.depth])).toEqual([
 			["a", 0],
 			["a1", 1],
 			["a1x", 2],
 			["a2", 1],
+			["t", 0],
+			["n", 1],
+			["r", 1],
+			["q", 1],
 			["b", 0],
 		]);
 	});
 
-	test("a collapsed block hides its subtree; blocks with only hidden children can collapse", () => {
-		const rows = visibleRows(view, new Set(["a", "b", "a2"]));
-		expect(rows.map((r) => r.block.id)).toEqual(["a", "b"]);
-		expect(rows.find((r) => r.block.id === "b")).toMatchObject({
-			hasChildren: true,
-			collapsed: true,
+	test("tasks, reports, headings and marks are read from the blocks", () => {
+		const source = viewFoldSource(view);
+		expect(source.task("t")).toBe("doing");
+		expect(source.task("a")).toBeNull();
+		// A report is known by its line (or its id).
+		expect(source.report("r")).toBe(true);
+		expect(source.report("n")).toBe(false);
+		expect(source.heading?.("rh")).toBe(true);
+		expect(source.heading?.("rp")).toBe(false);
+		expect(source.marks?.("q")).toEqual({ question: 1, pending: 0, locked: 0 });
+		// An answered question is no mark; a lock is.
+		expect(source.marks?.("n1")).toEqual({ question: 0, pending: 0, locked: 1 });
+		expect(source.marks?.("n")).toEqual({ question: 0, pending: 1, locked: 0 });
+		expect(source.marks?.("a")).toBeNull();
+		expect(source.children("missing")).toEqual([]);
+		const rows = rowsOf(view);
+		expect(rows.find((r) => r.node.id === "n")?.hidden).toMatchObject({ locked: 1 });
+		expect(rows.find((r) => r.node.id === "r")?.preview).toMatchObject({
+			kind: "report",
+			textId: "rp",
 		});
-		// A leaf is never collapsed, whatever the set says.
-		expect(visibleRows(view, new Set(["a2"])).find((r) => r.block.id === "a2")?.collapsed).toBe(
-			false,
-		);
-		expect(visibleRows({ rootId: "missing", blocks: view.blocks }, new Set())).toEqual([]);
+	});
+
+	test("the reader's folding goes over the default; a block whose children were not read cannot fold", () => {
+		const rows = rowsOf(view, { expanded: new Set(["n"]), collapsed: new Set(["a", "b", "a2"]) });
+		expect(rows.map((r) => r.node.id)).toEqual(["a", "t", "n", "n1", "r", "q", "b"]);
+		expect(rows.find((r) => r.node.id === "b")?.node.open).toBe(false);
+		expect(rows.find((r) => r.node.id === "b")?.node.kids).toEqual([]);
+		expect(rowsOf({ rootId: "missing", blocks: view.blocks })).toEqual([]);
+	});
+
+	test("a root under a task makes its blocks details", () => {
+		const focused = { rootId: "a", blocks: view.blocks };
+		expect(rowsOf(focused).map((r) => r.node.id)).toEqual(["a1", "a1x", "a2"]);
+		expect(rowsOf({ ...focused, rootInTask: true }).map((r) => r.node.id)).toEqual(["a1", "a2"]);
 	});
 });
 

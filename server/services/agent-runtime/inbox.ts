@@ -21,6 +21,7 @@ import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
+import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
@@ -1157,6 +1158,7 @@ export async function persistClaimedUserInput(input: {
 	});
 	if (getRuntimeQueuePort()) {
 		const materialized = await materializeClaimedInboxUserMessage(input);
+		syncActiveReplyContext(input.narratorId, await ensureReplyContext(input.narratorId));
 		return toClaimedUserInputMessage(materialized);
 	}
 	const { narratorService } = await import("../narrator-service");
@@ -1173,6 +1175,7 @@ export async function persistClaimedUserInput(input: {
 			...(input.parentToolUseId === undefined ? {} : { parentToolUseId: input.parentToolUseId }),
 		},
 	);
+	syncActiveReplyContext(input.narratorId, await ensureReplyContext(input.narratorId));
 	return toClaimedUserInputMessage(persisted);
 }
 

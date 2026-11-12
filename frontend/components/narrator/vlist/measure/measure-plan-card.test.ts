@@ -8,6 +8,18 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+/**
+ * `MARKDOWN_CONSTANTS` with the line boxes bound to their LIVE values. The exported
+ * ones are the bare-Mantine baseline; the default setting measures lines at 120% of it
+ * (LINE_HEIGHT_BASELINE_PERCENT): body 24 (not 20), code 20 (not 17). Margins stay.
+ */
+async function liveMarkdownConstants() {
+	const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+	const { typographyMetrics } = await import("../pretext-fonts");
+	const line = typographyMetrics().line;
+	return { ...MARKDOWN_CONSTANTS, BODY_LINE_HEIGHT: line.body, CODE_LINE_HEIGHT: line.code };
+}
+
 describe("measurePlanCard", () => {
 	it("adds fixed chrome (padding + border + header + mb) around the markdown body", async () => {
 		const { measurePlanCard, planCardChrome } = await import("./measure-plan-card");
@@ -40,14 +52,14 @@ describe("measurePlanCard", () => {
 		expect(planCardChrome(false)).toBe(expectedChrome);
 
 		// A single short line: whole card = chrome + one body line height.
-		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const MARKDOWN_CONSTANTS = await liveMarkdownConstants();
 		const result = measurePlanCard({ summary: "Hello." }, 1000);
 		expect(result.height).toBe(expectedChrome + MARKDOWN_CONSTANTS.BODY_LINE_HEIGHT);
 	});
 
 	it("markdown body wraps to more lines (taller card) as width shrinks", async () => {
 		const { measurePlanCard } = await import("./measure-plan-card");
-		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const MARKDOWN_CONSTANTS = await liveMarkdownConstants();
 
 		const summary = "one two three four five six seven eight nine ten eleven twelve";
 		const wide = measurePlanCard({ summary }, 2000);
@@ -63,7 +75,7 @@ describe("measurePlanCard", () => {
 
 	it("multi-paragraph markdown adds inter-block margins inside the body", async () => {
 		const { measurePlanCard } = await import("./measure-plan-card");
-		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const MARKDOWN_CONSTANTS = await liveMarkdownConstants();
 
 		const one = measurePlanCard({ summary: "First paragraph." }, 1000);
 		const two = measurePlanCard({ summary: "First paragraph.\n\nSecond paragraph." }, 1000);
@@ -78,20 +90,31 @@ describe("measurePlanCard", () => {
 
 	it("header height grows when action buttons are present (compact-xs=18 > icon/label)", async () => {
 		const { planCardHeaderHeight, planCardChrome } = await import("./measure-plan-card");
-		const { PLAN_HEADER_ICON, PLAN_HEADER_LABEL_LINE, PLAN_HEADER_BUTTON } = await import(
-			"./measure-plan-card"
+		const { PLAN_HEADER_ICON, PLAN_HEADER_BUTTON } = await import("./measure-plan-card");
+		const { typographyMetrics } = await import("../pretext-fonts");
+		const { resetTypographyForTest, setTypography } = await import(
+			"@shared/pretext-layout/typography"
 		);
 
-		const noActions = planCardHeaderHeight(false);
-		const withActions = planCardHeaderHeight(true);
+		// At the default setting the xs label line is 20 (120% of the Mantine 17), already
+		// taller than the 18px compact-xs button: the buttons fit inside the header.
+		const label = typographyMetrics().line.xs;
+		expect(planCardHeaderHeight(false)).toBe(Math.max(PLAN_HEADER_ICON, label));
+		expect(planCardHeaderHeight(true)).toBe(Math.max(PLAN_HEADER_ICON, label, PLAN_HEADER_BUTTON));
+		expect(planCardHeaderHeight(true)).toBe(planCardHeaderHeight(false));
 
-		expect(noActions).toBe(Math.max(PLAN_HEADER_ICON, PLAN_HEADER_LABEL_LINE));
-		expect(withActions).toBe(
-			Math.max(PLAN_HEADER_ICON, PLAN_HEADER_LABEL_LINE, PLAN_HEADER_BUTTON),
-		);
-		// compact-xs button (18) is the tallest → header (and chrome) grows.
-		expect(withActions).toBeGreaterThan(noActions);
-		expect(planCardChrome(true)).toBeGreaterThan(planCardChrome(false));
+		// With tighter lines the compact-xs button (18) is the tallest → header (and
+		// chrome) grows.
+		try {
+			setTypography({ lineHeightScalePercent: 80 });
+			const noActions = planCardHeaderHeight(false);
+			const withActions = planCardHeaderHeight(true);
+			expect(withActions).toBe(PLAN_HEADER_BUTTON);
+			expect(withActions).toBeGreaterThan(noActions);
+			expect(planCardChrome(true)).toBeGreaterThan(planCardChrome(false));
+		} finally {
+			resetTypographyForTest();
+		}
 	});
 
 	it("hasActions flag increases total card height by the header delta", async () => {

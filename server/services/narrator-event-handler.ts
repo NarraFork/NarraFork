@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { normalizeApiRequestDiagnostics } from "@shared/agent-protocol/error-diagnostics";
-import { encodeToolOutput, type ToolOutputImageRef } from "@shared/agent-protocol/tool-output";
+import {
+	encodeToolOutput,
+	type ToolOutputImageRef,
+	toolOutputImagePreview,
+} from "@shared/agent-protocol/tool-output";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
@@ -29,7 +33,7 @@ import {
 import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
-import { withDbRetry } from "../lib/db-resilience";
+import { sqliteErrorCode, withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -192,7 +196,7 @@ export async function toolResultLedgerOutput(
 	narratorId: string,
 	event: Extract<AgentEvent, { type: "tool_result" }>,
 ): Promise<unknown> {
-	const images: ToolOutputImageRef[] = [];
+	const images: ToolOutputImageRef[] = [...(event.imageRefs ?? [])];
 	for (const [index, image] of (event.images ?? []).entries()) {
 		try {
 			const saved = await saveUploadedImage(
@@ -222,6 +226,7 @@ export async function toolResultLedgerOutput(
 		metadata: event.metadata,
 		broken: !!event.brokenInputOverride,
 		images,
+		media: event.mediaRefs,
 	});
 }
 
@@ -310,6 +315,8 @@ export interface TokenUsageSnapshot {
 	cacheCreation1hTokens?: number;
 	contextWindow?: number;
 	isEstimated?: boolean;
+	/** This request's first-content → end time; set by api_request_end. */
+	decodeMs?: number;
 }
 
 export interface EventHandlerContext {
@@ -672,6 +679,8 @@ export type SnapshotStreamingBlock =
 			type: "image_generation";
 			id: string;
 			status: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			partialImageIndex?: number;
@@ -1065,19 +1074,19 @@ function discardRetryableImageGenerationProgress(ctx: EventHandlerContext): bool
 	let changed = false;
 	const remainingBlocks: SnapshotStreamingBlock[] = [];
 	for (const block of snap.streamingBlocks) {
-		if (
-			block.type !== "image_generation" ||
-			(block.status !== "in_progress" && block.status !== "generating")
-		) {
+		const unfinishedImage =
+			block.type === "image_generation" &&
+			(block.status === "in_progress" || block.status === "generating");
+		if (!unfinishedImage) {
 			remainingBlocks.push(block);
 			continue;
 		}
 
 		changed = true;
-		// A real partial/final artifact remains useful after the request dies. Freeze it as
-		// settled content so the retry backoff does not leave its old spinner running.
+		// A real partial artifact remains useful after the request dies. Freeze it as
+		// incomplete content so retry cleanup never presents a partial preview as success.
 		if (hasImageGenerationArtifact(block)) {
-			remainingBlocks.push({ ...block, status: "completed" });
+			remainingBlocks.push({ ...block, status: "incomplete" });
 		}
 	}
 	if (!changed) return false;
@@ -1662,6 +1671,29 @@ export async function processEvent(
 	}
 
 	switch (event.type) {
+		case "media_fallback": {
+			if (!event.warnings.length) return null;
+			const files = event.warnings.map((warning) => warning.filename).join(", ");
+			const message = ctx.locale?.startsWith("zh")
+				? `当前模型不支持读取该模态数据，回退到一般文件。仅提供文件路径和元信息，未读取音视频内容。文件：${files}`
+				: `The current model does not support this audio/video input. Falling back to regular files with paths and metadata only; the media contents have not been read. Files: ${files}`;
+			dualBroadcast(ctx, {
+				type: "warning",
+				narratorId: broadcastTargetId,
+				warningCode: "native_media_fallback",
+				mediaFallbackWarnings: event.warnings,
+				message,
+			});
+			ctx.sseEmitter?.emit("event", {
+				type: "warning",
+				data: {
+					warningCode: "native_media_fallback",
+					mediaFallbackWarnings: event.warnings,
+					message,
+				},
+			});
+			return null;
+		}
 		case "stream_text": {
 			ctx.fileReferenceContexts ??= new FileReferenceContextTracker();
 			const textBlockId = event.blockId;
@@ -2159,13 +2191,17 @@ export async function processEvent(
 				});
 				retireCompletedSnapshot();
 			} else if (block.type === "image_generation") {
-				// Save base64 image to filesystem. If saving fails, keep the raw result
-				// in the persisted block so the UI/history replay can still recover it.
-				let savedPath: string | undefined;
-				let imageWidth: number | undefined;
-				let imageHeight: number | undefined;
+				// Save final and partial image bytes independently. A terminal failure or
+				// interruption may have no final result but must retain its latest preview.
+				let savedPath = block.savedPath;
+				const imageSnapshot =
+					completedSnapshot?.type === "image_generation" ? completedSnapshot : undefined;
+				let partialSavedPath = block.partialSavedPath ?? imageSnapshot?.partialSavedPath;
+				let imageWidth: number | undefined = block.width ?? imageSnapshot?.width;
+				let imageHeight: number | undefined = block.height ?? imageSnapshot?.height;
 				let shouldPersistInlineResult = false;
-				if (block.result) {
+				let shouldPersistInlinePartial = false;
+				if (block.result && !savedPath) {
 					try {
 						const saved = await saveImageGenerationResult(
 							ctx.conversationId ?? "unknown",
@@ -2183,57 +2219,104 @@ export async function processEvent(
 						});
 					}
 				}
+				if (block.partialImageB64 && !partialSavedPath) {
+					try {
+						const saved = await saveImageGenerationResult(
+							ctx.conversationId ?? "unknown",
+							partialImageGenerationArtifactId(block.id, block.partialImageIndex),
+							block.partialImageB64,
+						);
+						partialSavedPath = saved.filePath;
+						imageWidth ??= saved.width;
+						imageHeight ??= saved.height;
+					} catch (err) {
+						shouldPersistInlinePartial = true;
+						logger.warn("Failed to save partial generated image to disk", {
+							error: err,
+							imageId: block.id,
+							partialImageIndex: block.partialImageIndex,
+						});
+					}
+				}
+				const status =
+					block.status === "failed" || block.status === "cancelled" || block.status === "incomplete"
+						? block.status
+						: block.error
+							? "failed"
+							: (block.status == null || block.status === "completed") &&
+									(savedPath || block.result?.trim())
+								? "completed"
+								: "incomplete";
+				if (status === "completed") partialSavedPath = undefined;
 				await writeAttemptItem(ctx, partialId, {
 					type: "image_generation",
 					id: block.id,
+					status,
+					error: block.error,
+					errorCode: block.errorCode,
 					revisedPrompt: block.revisedPrompt,
 					outputIndex: block.outputIndex,
 					...(savedPath ? { savedPath } : {}),
+					...(partialSavedPath ? { partialSavedPath } : {}),
+					...(block.partialImageIndex != null
+						? { partialImageIndex: block.partialImageIndex }
+						: {}),
 					...(imageWidth != null && imageHeight != null
 						? { width: imageWidth, height: imageHeight }
 						: {}),
 					...(shouldPersistInlineResult && block.result ? { result: block.result } : {}),
+					...(shouldPersistInlinePartial && block.partialImageB64
+						? { partialImageB64: block.partialImageB64 }
+						: {}),
 				});
 				retireCompletedSnapshot();
-				if (savedPath) {
-					const snap = getOrCreateSnapshot(snapshotNarratorId);
-					const existingIdx = snap.streamingBlocks.findIndex(
-						(b) => b.type === "image_generation" && b.id === block.id,
+				const snap = getOrCreateSnapshot(snapshotNarratorId);
+				const existingIdx = snap.streamingBlocks.findIndex(
+					(b) => b.type === "image_generation" && b.id === block.id,
+				);
+				const finalBlock: SnapshotStreamingBlock = {
+					type: "image_generation",
+					id: block.id,
+					status,
+					error: block.error,
+					errorCode: block.errorCode,
+					revisedPrompt: block.revisedPrompt,
+					...(block.partialImageIndex != null
+						? { partialImageIndex: block.partialImageIndex }
+						: {}),
+					...(partialSavedPath ? { partialSavedPath } : {}),
+					...(savedPath ? { savedPath } : {}),
+					...(imageWidth != null && imageHeight != null
+						? { width: imageWidth, height: imageHeight }
+						: {}),
+					...(block.outputIndex != null ? { outputIndex: block.outputIndex } : {}),
+				};
+				if (existingIdx !== -1) snap.streamingBlocks[existingIdx] = finalBlock;
+				else {
+					snap.streamingBlocks.splice(
+						findOrderedSnapshotInsertIndex(snap.streamingBlocks, block.outputIndex),
+						0,
+						finalBlock,
 					);
-					const finalBlock: SnapshotStreamingBlock = {
-						type: "image_generation",
-						id: block.id,
-						status: "completed",
-						revisedPrompt: block.revisedPrompt,
-						savedPath,
-						...(imageWidth != null && imageHeight != null
-							? { width: imageWidth, height: imageHeight }
-							: {}),
-						...(block.outputIndex != null ? { outputIndex: block.outputIndex } : {}),
-					};
-					if (existingIdx !== -1) snap.streamingBlocks[existingIdx] = finalBlock;
-					else {
-						snap.streamingBlocks.splice(
-							findOrderedSnapshotInsertIndex(snap.streamingBlocks, block.outputIndex),
-							0,
-							finalBlock,
-						);
-					}
-					dualBroadcast(ctx, {
-						type: "image_generation",
-						narratorId: broadcastTargetId,
-						id: block.id,
-						status: "completed",
-						revisedPrompt: block.revisedPrompt,
-						outputIndex: block.outputIndex,
-						...(savedPath ? { savedPath } : {}),
-						...(imageWidth != null && imageHeight != null
-							? { width: imageWidth, height: imageHeight }
-							: {}),
-						...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
-					});
-					cleanupPartialImageGenerationArtifacts(ctx, block.id);
 				}
+				dualBroadcast(ctx, {
+					type: "image_generation",
+					narratorId: broadcastTargetId,
+					id: block.id,
+					status,
+					error: block.error,
+					errorCode: block.errorCode,
+					revisedPrompt: block.revisedPrompt,
+					outputIndex: block.outputIndex,
+					...(partialSavedPath ? { partialSavedPath } : {}),
+					...(savedPath ? { savedPath } : {}),
+					...(imageWidth != null && imageHeight != null
+						? { width: imageWidth, height: imageHeight }
+						: {}),
+					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				});
+				if (status === "completed" && savedPath)
+					cleanupPartialImageGenerationArtifacts(ctx, block.id);
 			}
 			return null;
 		}
@@ -2272,6 +2355,7 @@ export async function processEvent(
 						}),
 						...(tokenUsage.contextSnapshot && { context_snapshot: tokenUsage.contextSnapshot }),
 						...(tokenUsage.isEstimated && { is_estimated: true }),
+						...(tokenUsage.decodeMs != null && { decode_ms: tokenUsage.decodeMs }),
 					}
 				: undefined;
 			let savedId: string;
@@ -2666,8 +2750,8 @@ export async function processEvent(
 			// plan-mode file path) the input actually used. Either rides with the result.
 			const settledInput = event.brokenInputOverride ?? event.updatedInput;
 			if (!shouldCommitEnterPlanModeAtomically && resultToolCallId) {
-				try {
-					await narratorStore.settleTool(
+				const settle = () =>
+					narratorStore.settleTool(
 						event.toolUseId,
 						{
 							output: persistedOutput,
@@ -2682,41 +2766,23 @@ export async function processEvent(
 						undefined,
 						resultToolCallId,
 					);
+				try {
+					// 与其它写路径一致：SQLITE_BUSY 交给带退避的 withDbRetry。
+					// 事务本身是 immediate，单次尝试会先忙等一次 busy_timeout；再撞锁就退避
+					// 200+400+800+1600ms 重试，5 次合计约 4.5 秒。只「立即重试一次」会在同一
+					// 个锁窗口里再失败，把瞬时争用升级成 CriticalEventPersistenceError、终止 loop。
+					await withDbRetry(settle, { label: "tool_result.settle", maxRetries: 5 });
 					toolResultPersisted = true;
 				} catch (err) {
-					logger.error("Failed to persist tool result", {
+					logger.error("CRITICAL: tool_result persist failed", {
 						narratorId,
 						toolUseId: event.toolUseId,
 						error: String(err),
+						code: sqliteErrorCode(err),
 					});
-					// Retry once — transient DB lock / busy errors are common with SQLite
-					try {
-						await narratorStore.settleTool(
-							event.toolUseId,
-							{
-								output: persistedOutput,
-								status,
-								errorMessage: event.isError ? event.output : undefined,
-								durationMs: event.durationMs,
-								permissionStartedAt: event.permissionStartedAt,
-								executionStartedAt: event.executionStartedAt,
-								completedAt: event.completedAt,
-								input: settledInput,
-							},
-							undefined,
-							resultToolCallId,
-						);
-						toolResultPersisted = true;
-					} catch (retryErr) {
-						logger.error("CRITICAL: tool_result persist failed after retry", {
-							narratorId,
-							toolUseId: event.toolUseId,
-							error: String(retryErr),
-						});
-						throw new CriticalEventPersistenceError("Tool result could not be persisted", {
-							cause: retryErr,
-						});
-					}
+					throw new CriticalEventPersistenceError("Tool result could not be persisted", {
+						cause: err,
+					});
 				}
 			}
 
@@ -2765,7 +2831,8 @@ export async function processEvent(
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				status,
-				output: truncateJson(event.output, 2000),
+				// Live patches do not refetch history: retain the small, saved image references.
+				output: toolOutputImagePreview(truncateJson(event.output, 2000), persistedOutput),
 				durationMs: event.durationMs,
 				...(event.updatedInput && { updatedInput: event.updatedInput }),
 				...(event.metadata && { metadata: event.metadata }),
@@ -3309,6 +3376,10 @@ export async function processEvent(
 		}
 
 		case "image_generation": {
+			const displayStatus =
+				event.status === "completed" && !event.final && !event.savedPath
+					? "generating"
+					: event.status;
 			let partialSavedPath = event.partialSavedPath;
 			let imageWidth = event.width;
 			let imageHeight = event.height;
@@ -3342,7 +3413,9 @@ export async function processEvent(
 				if (existingIdx !== -1) {
 					const existing = snap.streamingBlocks[existingIdx];
 					if (existing.type === "image_generation") {
-						existing.status = event.status;
+						existing.status = displayStatus;
+						if (event.error) existing.error = event.error;
+						if (event.errorCode) existing.errorCode = event.errorCode;
 						if (event.revisedPrompt) existing.revisedPrompt = event.revisedPrompt;
 						if (event.outputIndex != null) existing.outputIndex = event.outputIndex;
 						if (event.partialImageIndex != null)
@@ -3361,7 +3434,9 @@ export async function processEvent(
 						{
 							type: "image_generation",
 							id: event.id,
-							status: event.status,
+							status: displayStatus,
+							...(event.error ? { error: event.error } : {}),
+							...(event.errorCode ? { errorCode: event.errorCode } : {}),
 							revisedPrompt: event.revisedPrompt,
 							...(event.partialImageIndex != null
 								? { partialImageIndex: event.partialImageIndex }
@@ -3382,7 +3457,9 @@ export async function processEvent(
 				type: "image_generation",
 				narratorId: broadcastTargetId,
 				id: event.id,
-				status: event.status as "in_progress" | "generating" | "completed",
+				status: displayStatus,
+				error: event.error,
+				errorCode: event.errorCode,
 				revisedPrompt: event.revisedPrompt,
 				outputIndex: event.outputIndex,
 				...(event.partialImageIndex != null ? { partialImageIndex: event.partialImageIndex } : {}),
@@ -3504,6 +3581,10 @@ export async function processEvent(
 				ctx.accountRequestTokenUsage?.(event.usage);
 				recordTurnStep(narratorId, ctx.model, event.usage);
 			}
+			// The assistant_message that follows this end stamps it into turnUsageJson.
+			if (requestInfo && event.decodeMs != null) {
+				ctx.setTokenUsage({ ...ctx.getTokenUsage(), decodeMs: event.decodeMs });
+			}
 			const snapshot = boundedContextSnapshot(event.contextSnapshot);
 			if (snapshot) {
 				await storeNarratorContextUsage(narratorId, snapshot);
@@ -3552,6 +3633,7 @@ export async function processEvent(
 					credentialId: event.credentialId,
 					ttftMs: event.ttftMs ?? null,
 					durationMs: event.durationMs ?? null,
+					decodeMs: event.decodeMs ?? null,
 					contextPercent: event.contextPercent ?? null,
 					contextSnapshot: snapshot,
 					meterUsage: event.meterUsage ?? null,

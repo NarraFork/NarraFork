@@ -20,6 +20,14 @@ export type {
 	ProviderBalanceSnapshot,
 	ProviderBalanceStatus,
 } from "@shared/provider-balance";
+export type {
+	StorageHistoryJob,
+	StorageHistoryJobs,
+	StorageHistoryPreview,
+	StorageRetentionRule,
+	StorageRetentionSettings,
+	StorageRetentionTarget,
+} from "@shared/storage-retention";
 export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type ChangelogEntry = {
@@ -727,6 +735,8 @@ export interface BaseContentBlock {
 	summary?: string;
 	previewUrl?: string;
 	imageId?: string;
+	mediaId?: string;
+	size?: number;
 	filename?: string;
 	mediaType?: string;
 	uploadNarratorId?: string;
@@ -790,6 +800,8 @@ export interface ToolCallRecord {
 	toolName: string;
 	inputJson?: unknown;
 	outputJson?: unknown;
+	/** A cleared pair is not user-visible even if the replay ledger retains input. */
+	payloadCleared?: boolean;
 	status?: string;
 	durationMs?: number;
 	streamStartedAt?: string | number | null;
@@ -968,6 +980,27 @@ export interface HookApiRecord {
 	updatedAt: string;
 }
 
+/**
+ * One reusable system prompt from the library (`/api/prompt-library`).
+ *
+ * A narrator created from an entry stores its own copy of `content`, so deleting the
+ * entry never changes an existing session.
+ */
+export interface PromptLibraryEntryData {
+	id: string;
+	name: string;
+	description: string;
+	content: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface PromptLibraryInputData {
+	name: string;
+	description?: string;
+	content: string;
+}
+
 export interface CustomSubagentData {
 	name: string;
 	description: string;
@@ -1020,6 +1053,7 @@ export interface BufferMessageSummary {
 	imageCount: number;
 	/** Optional so a snapshot from an older server still parses. */
 	images?: BufferedImageSummary[];
+	media?: import("@shared/media-attachments").MediaRef[];
 	textFiles?: BufferedTextFileSummary[];
 	fileReferences?: FileReference[];
 	creator?: BufferCreator | null;

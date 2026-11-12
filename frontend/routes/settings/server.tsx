@@ -38,6 +38,8 @@ function SettingsServerPage() {
 				handlePwaUpdate={handlePwaUpdate}
 				tlsEnabled={is.tlsEnabled}
 				setTlsEnabled={is.setTlsEnabled}
+				tlsAutoReissue={is.tlsAutoReissue}
+				setTlsAutoReissue={is.setTlsAutoReissue}
 				tlsCertFile={is.tlsCertFile}
 				setTlsCertFile={is.setTlsCertFile}
 				tlsKeyFile={is.tlsKeyFile}
@@ -46,6 +48,8 @@ function SettingsServerPage() {
 				setTlsPassphrase={is.setTlsPassphrase}
 				tlsCaFile={is.tlsCaFile}
 				setTlsCaFile={is.setTlsCaFile}
+				encryptSecrets={is.encryptSecrets}
+				setEncryptSecrets={is.setEncryptSecrets}
 				updateSource={is.updateSource}
 				setUpdateSource={is.setUpdateSource}
 				updateGithubRepository={is.updateGithubRepository}

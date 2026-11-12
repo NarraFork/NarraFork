@@ -397,6 +397,24 @@ export async function canSessionReadSpace(
 	return false;
 }
 
+/**
+ * Whether the session may read another narrator (as it may read that narrator's session space:
+ * everyone who reads this session may read it). Its own narrator and root, and their subagents,
+ * always. What outline texts name a session by its title on (review S-5).
+ */
+export async function canSessionReadNarrator(
+	narratorId: string,
+	targetNarratorId: string,
+): Promise<boolean> {
+	const entry = entryFor(narratorId);
+	const state = await entry.state;
+	if (state.rootNarratorId === null) return false;
+	if (targetNarratorId === state.rootNarratorId || targetNarratorId === narratorId) return true;
+	return await memo(entry, `session:${targetNarratorId}`, () =>
+		sessionVerdict(state, targetNarratorId),
+	);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Listing
 // ─────────────────────────────────────────────────────────────────────────────

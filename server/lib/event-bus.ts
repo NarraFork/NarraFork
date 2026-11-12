@@ -12,6 +12,8 @@ import { logger } from "./logger";
 
 export type NarraForkEvent =
 	| { type: "auth:changed"; userId?: string }
+	// Invalidation only: lifecycle details are fetched through the authorized status API.
+	| { type: "system:lifecycle_changed" }
 	| { type: "git:workspace_invalidated"; queryKey: string }
 	// OAuth authorization transport invalidation (fixed identifiers only; no bearer material)
 	| {
@@ -32,7 +34,11 @@ export type NarraForkEvent =
 			change: "revoked" | "restricted";
 			reasonCode: string;
 	  }
-	| { type: "human_attention:changed" }
+	/**
+	 * Decisions waiting for people changed. Data-free: inboxes read again. With `userIds`, only
+	 * those people's inboxes are concerned (an outline question's recipients).
+	 */
+	| { type: "human_attention:changed"; userIds?: string[] }
 	/**
 	 * Who may read or drive a narrator changed: its audiences, its grants, its owner, or a
 	 * public share link. Ids only. Server-side holders of access decisions about the narrator
@@ -424,6 +430,58 @@ export type NarraForkEvent =
 			pageIds: string[];
 			actorKind: "human" | "agent" | "system";
 			actorId: string;
+			/**
+			 * The session the commit was written for: `outline_commits.narrator_id`, or the agent
+			 * itself when a write left it out; the session a system write was made for; null for a
+			 * person's commit and a system job. What the live editor shows an agent's cursor from
+			 * (outline P2 PR 10b).
+			 * Optional only so events built before it existed (tests) still type-check.
+			 */
+			narratorId?: string | null;
+	  }
+	| {
+			/**
+			 * Tasks of an outline root session changed in one commit of its session space (outline P2
+			 * PR 12a, `outline/plugin-task-events.ts`): what plugins follow a session's tasks by (the
+			 * public topic `narrafork.narrator.tasks.changed`, and `narrafork.narrator.spec.changed`
+			 * while the old commands last). Ids and statuses only; `deleted` / `none` for a task deleted
+			 * or no longer a task. At most 50 changes; `truncated` when the commit made more.
+			 */
+			type: "outline:session_tasks_changed";
+			narratorId: string;
+			spaceKey: string;
+			seq: number;
+			actorKind: "human" | "agent" | "system";
+			changes: Array<{
+				blockId: string;
+				status: "todo" | "doing" | "done" | "cancelled" | "deleted" | "none";
+			}>;
+			truncated: boolean;
+	  }
+	| {
+			/**
+			 * Pending changes of outline pages changed (one proposed, merged into, decided or
+			 * withdrawn; design §2.6). Ids only: a page subscriber re-reads the page's summary.
+			 * Notifying the people who decide is plan PR 7 (the inbox).
+			 */
+			type: "outline:pending";
+			spaceId: string;
+			pageIds: string[];
+			/**
+			 * The narrators the change is about, when known (its proposer): their sessions' task
+			 * boards show it, wherever the task lives (outline P2 PR 5).
+			 */
+			narratorIds?: string[];
+	  }
+	| {
+			/**
+			 * Someone rejected a pending change (not its proposer withdrawing it). Ids only: a
+			 * listener re-reads the row. The proposing session is told when the change asked to end a
+			 * locked goal (outline P2 PR 5): the rejection writes no commit, so nothing else tells it.
+			 */
+			type: "outline:pending_rejected";
+			spaceId: string;
+			pendingId: string;
 	  }
 	// Human-to-human chat. Ids and scalars only — never message bodies — so a
 	// listener (WS fan-out today, an IM bridge later) can route without holding a

@@ -18,7 +18,12 @@
  */
 
 import { resolveAssistantTextDisplay, type TextCitation } from "../citations";
-import { isCommunicationTool, limitCommunicationPreview } from "../communication-tool";
+import {
+	communicationInputField,
+	isCommunicationTool,
+	limitCommunicationPreview,
+	shouldShowCommunicationBubble,
+} from "../communication-tool";
 import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
@@ -29,6 +34,8 @@ import {
 	injectionBlockViews,
 	isNativeModelContextBlock,
 } from "../native-injection";
+import type { PlanTreeView } from "../outline-plan-tree";
+import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
@@ -39,8 +46,10 @@ import {
 	type SideCarBody,
 	type SideCarInboundMessage,
 	sideCarBodyToMarkdown,
+	sideCarBodyToPlainText,
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
+import { isClearedToolOutput } from "../storage-retention";
 import { subagentResultText } from "../subagent-result-text";
 import { type FileChangeTiming, resolveToolDisplayDurationMs } from "../tool-display-duration";
 
@@ -62,6 +71,12 @@ type ToolTimingRecord = Partial<
 import { dangerCopyEnglishFallbacks } from "../danger-copy";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
 import {
+	type AuxiliaryContentProjection,
+	auxiliaryContentKey,
+	auxiliaryContentViews,
+	buildAuxiliaryContentData,
+} from "./auxiliary-content";
+import {
 	type CommunicationState,
 	communicationSelectors,
 	communicationTargetLabel,
@@ -70,6 +85,7 @@ import {
 } from "./communication-state";
 import type { VListElementKind } from "./element-kinds";
 import type { InjectionTarget } from "./injection-target";
+import { outlineEditHeaderStats } from "./outline-tool-card";
 import type { RenderLod } from "./prepared-block";
 import { type ReasoningLiveTail, resolveReasoningLiveTail } from "./reasoning-live-tail";
 import {
@@ -99,6 +115,7 @@ import {
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
 } from "./streaming-live-blocks";
+import { contextUpdateKeys, taskNoticeFromBody, taskNoticeFromContextUpdate } from "./task-notice";
 import { TEXT_PREVIEW_MAX_CHARS } from "./text-preview";
 import {
 	type ClassifyToolDetailInput,
@@ -139,6 +156,7 @@ export interface AdapterContentBlock {
 	query?: string | null;
 	queries?: string[] | null;
 	status?: string | null;
+	errorCode?: string | null;
 	revisedPrompt?: string | null;
 	result?: string | null;
 	width?: number | null;
@@ -146,6 +164,7 @@ export interface AdapterContentBlock {
 	filename?: string | null;
 	mediaType?: string | null;
 	imageId?: string | null;
+	mediaId?: string | null;
 	previewUrl?: string | null;
 	/**
 	 * image_generation: the server-side file the generated image was saved to.
@@ -168,6 +187,10 @@ export interface AdapterContentBlock {
 	added?: boolean | null;
 	/** spec_*: whether the task is a protected commitment. */
 	protected?: boolean | null;
+	/** spec_goal_added: `outline` for a goal added to the outline (outline P2 PR 5). */
+	taskBackend?: string | null;
+	/** spec_goal_added (outline): whether the goal is locked. */
+	locked?: boolean | null;
 	/** command block (bash_command): the shell command body. */
 	command?: string | null;
 	/** spec_fork_carryover / spec_context_cleared summary counts. */
@@ -317,6 +340,7 @@ export interface AdapterToolItem {
 		status?: string | null;
 		inputJson?: unknown;
 		outputJson?: unknown;
+		payloadCleared?: boolean;
 		toolUseId?: string;
 		/** Subagent activity summary (drives recent-calls rows on subagent cards). */
 		_subagentActivity?: {
@@ -500,7 +524,68 @@ function isTerminalStatus(status?: string | null): boolean {
  * that made Edit/Write headers render with no target path. `getSummary` resolves
  * those through `_hints` / a preview scan, hence the injection.
  */
+function compactSummaryPrefix(value: unknown, max = 160): string {
+	return (readLeafText(value) ?? "").slice(0, max).replace(/\s+/g, " ").trim();
+}
+
 function toolSummary(tc: AdapterToolItem["tc"], ctx?: AdapterContext): string {
+	if (toolPayloadCleared(tc)) return sysLabel(ctx ?? { lod: 5 }, "toolDetailsCleared");
+	if (ctx?.compactAuxiliaryContent) {
+		if (isCommunicationTool(tc) && !shouldShowCommunicationBubble(tc, true)) {
+			const metadata = asObject(resolveToolMetadata(tc));
+			const targets = resolveCommunicationTargets(metadata, tc._sendDeliveryTargets);
+			const recipients =
+				targets.length > 0
+					? targets.slice(0, 3).map(communicationTargetLabel)
+					: communicationSelectors(tc.inputJson).slice(0, 3);
+			const recipient = recipients
+				.map((label) => compactSummaryPrefix(label, 48))
+				.filter(Boolean)
+				.join(", ");
+			const message = compactSummaryPrefix(communicationInputField(tc.inputJson, "message"));
+			if (recipient || message)
+				return recipient && message ? `${recipient}：${message}` : recipient || message;
+		}
+		if (tc.toolName === "AskUserQuestion") {
+			const answers = asObject(asObject(tc.inputJson).answers);
+			const selected = Object.values(answers)
+				.slice(0, 3)
+				.map((value) =>
+					Array.isArray(value)
+						? value
+								.slice(0, 3)
+								.map((answer) => compactSummaryPrefix(answer, 48))
+								.join(", ")
+						: compactSummaryPrefix(value, 120),
+				)
+				.filter(Boolean);
+			if (selected.length > 0)
+				return `${ctx.labels?.askAnswerPrefix ?? "Answer:"} ${selected.join(" · ")}`;
+		}
+		if (
+			tc.toolName === "ExitPlanMode" &&
+			tc.status &&
+			["success", "completed", "fail", "error", "denied", "cancelled", "interrupted"].includes(
+				tc.status,
+			)
+		) {
+			const status =
+				ctx.labels?.[`status_${tc.status}`] ??
+				(
+					{
+						success: "Completed",
+						completed: "Completed",
+						fail: "Failed",
+						error: "Failed",
+						denied: "Denied",
+						cancelled: "Cancelled",
+						interrupted: "Interrupted",
+					} as Record<string, string>
+				)[tc.status];
+			const decision = compactSummaryPrefix(tc.permissionDenyMessage);
+			return decision ? `${status} · ${decision}` : status;
+		}
+	}
 	const resolved = ctx?.resolveToolSummary?.(tc);
 	if (typeof resolved === "string") return resolved;
 	const input = (tc.inputJson ?? {}) as Record<string, unknown>;
@@ -541,6 +626,14 @@ export type AdapterSegment =
 	| { kind: "tool-run"; items: AdapterToolItem[]; sourceMessages: AdapterMessage[] };
 
 export type AdapterActivityInput =
+	| {
+			kind: "auxiliary";
+			msg: AdapterMessage;
+			blockIndex: number;
+			sourceIndices: number[];
+			block: AdapterContentBlock;
+			source: string;
+	  }
 	| {
 			kind: "reasoning";
 			msg?: AdapterMessage;
@@ -591,6 +684,12 @@ export type AdapterActivityInput =
  * passes it through and never reads it for layout.
  */
 export interface AdapterTraceRowIdentity {
+	/** Real source content, not a fabricated tool identity. */
+	auxiliary?: true;
+	source?: string;
+	modelFacing?: string;
+	inspectContent?: string;
+	target?: InjectionTarget | null;
 	/** Owning message id. */
 	messageId: string;
 	/**
@@ -616,6 +715,8 @@ export interface AdapterTraceRowIdentity {
 }
 
 interface AdapterTraceItem {
+	contentRole?: "auxiliary";
+	sourceStatus?: string | null;
 	title: string;
 	hasIcon?: boolean;
 	iconColor?: string;
@@ -638,7 +739,7 @@ interface AdapterTraceItem {
 	 * Edit, a live patch landing the tool's metadata), and a stale entry would keep
 	 * drawing the previous numbers.
 	 */
-	diffStats?: { added: number; removed: number };
+	diffStats?: { added: number; removed: number; done?: number; commit?: number };
 	/**
 	 * Raw tool status. Height-neutral (a fixed 12px glyph slot inside the row's
 	 * existing content lane), and part of the measure cache's `traceRevision` so a
@@ -733,7 +834,7 @@ interface AdapterTraceItem {
 	 * to pick `measureSubagentCard` vs `measureToolCall`, and by the render shell to
 	 * dispatch `renderElement` the same way.
 	 */
-	cardKind?: "tool-call" | "subagent-card";
+	cardKind?: "tool-call" | "subagent-card" | "auxiliary-content";
 	/**
 	 * The row is drilled open by the SYSTEM, not the reader: its call is blocked on a
 	 * live permission request, and the card it opens onto is the only place the
@@ -874,6 +975,10 @@ function adapterTextExpanded(
 
 export interface AdapterContext {
 	lod: RenderLod;
+	/** Explicit opt-in; absent/false preserves the historical projection. */
+	compactAuxiliaryContent?: boolean;
+	/** Actual question lifecycle from the existing async-question slot, never tool success alone. */
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
 	/** Explicit interaction override; undefined preserves the measure's default. */
 	isExpanded?: (key: string) => boolean | undefined;
 	/** Full body expansion; separate from the surrounding card's fold. */
@@ -934,6 +1039,12 @@ export interface AdapterContext {
 	 * draws every row instead of the capped head.
 	 */
 	isFileChangesOpen?: (key: string) => boolean;
+	/**
+	 * The reader's view of an outline plan card's tree (ExitPlanMode of an outline session):
+	 * which nodes and texts they opened. Undefined: the overview (root and two levels).
+	 * Height-affecting, so it is resolved here like every other fold.
+	 */
+	planTreeView?: (key: string) => PlanTreeView | undefined;
 	/** L4 recency window. Undefined preserves the old "all recent" fallback. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -1164,6 +1275,31 @@ const USER_SYSTEM_CARD_TYPES = new Set([
 	"segment_compact",
 ]);
 
+/** The named context parts of an outline session's built-in views (outline plan PR 4). */
+const OUTLINE_VIEW_LABEL_KEYS: Readonly<Record<string, string>> = {
+	"outline.tasks": "contextViewOutlineTasks",
+	"outline.behavior": "contextViewOutlineBehavior",
+};
+
+/**
+ * The line a host `context_update` row reads as when it updates an outline session's views:
+ * "Context updated: Current tasks / Behavior boundary" in the reader's language, other keys as
+ * they are. Null for any other row, which keeps the stored notice text. The stored row is not
+ * changed: its English text names the keys, and the change itself is in its snapshot.
+ */
+function outlineViewUpdateLine(
+	blocks: readonly AdapterContentBlock[],
+	ctx: AdapterContext,
+): string | null {
+	const keys = contextUpdateKeys(blocks);
+	if (!keys?.some((key) => OUTLINE_VIEW_LABEL_KEYS[key])) return null;
+	const names = keys.map((key) => {
+		const label = OUTLINE_VIEW_LABEL_KEYS[key];
+		return label ? sysLabel(ctx, label) : key;
+	});
+	return formatSysLabel(ctx, "contextViewsUpdated", { parts: names.join(" / ") });
+}
+
 /** True when a block type is a recognized system-card block (used to locate the
  * meaningful block within a system message, which may not be blocks[0]). */
 function isRecognizedSystemBlockType(type: string): boolean {
@@ -1184,6 +1320,8 @@ export function classifyContentBlock(block: AdapterContentBlock): VListElementKi
 		case "text":
 			return block.text?.trim() ? "markdown" : null;
 		case "image":
+		case "audio":
+		case "video":
 		case "text_file":
 		case "image_generation":
 			return "media";
@@ -1368,7 +1506,7 @@ function webSearchData(block: AdapterContentBlock, ctx: AdapterContext) {
 }
 
 /**
- * Attachment payload for a user bubble's image / text_file block. `type` plus
+ * Attachment payload for a user bubble's image / audio / video / text_file block. `type` plus
  * the image's intrinsic `width`/`height` are height-relevant (known dimensions
  * reserve an aspect-ratio-fitted box; absent ones fall back to the fixed
  * placeholder height); the rest are render-only fields the integration layer
@@ -1385,6 +1523,17 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		});
 	}
 	const uploadNarratorId = readNonEmptyString(block, "uploadNarratorId") ?? msg.narratorId;
+	if (block.type === "audio" || block.type === "video") {
+		return {
+			type: block.type,
+			mediaId: block.mediaId ?? null,
+			previewUrl: block.previewUrl ?? null,
+			filename: block.filename ?? null,
+			mediaType: block.mediaType ?? null,
+			size: typeof block.size === "number" ? block.size : null,
+			uploadNarratorId: uploadNarratorId ?? null,
+		};
+	}
 	return {
 		type: block.type,
 		imageId: block.imageId ?? null,
@@ -1408,22 +1557,40 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 	};
 }
 
-/**
- * Localized header text of an image_generation block, mirroring MessageBubble's
- * `imageGenerating / imageGenerationPreparing / imageGenerated` ternary.
- *
- * MEASURED: the header line wraps together with the revised prompt, so the
- * wording belongs to the adapter (ctx.labels) rather than the render layer. A
- * persisted block carries no `status` at all (the event handler stores only the
- * saved path + size), which correctly reads as "generated".
- */
-function imageGenerationStatusText(ctx: AdapterContext, status: string | null | undefined): string {
-	if (!status || status === "completed") return sysLabel(ctx, "imageGenerated");
-	return sysLabel(ctx, status === "generating" ? "imageGenerating" : "imageGenerationPreparing");
+/** The header is measured, including real upstream diagnostics; never infer an error. */
+function imageGenerationStatusText(ctx: AdapterContext, block: AdapterContentBlock): string {
+	let key = "imageGenerationNoImage";
+	if (block.status === "generating") key = "imageGenerating";
+	else if (block.status === "in_progress") key = "imageGenerationPreparing";
+	else if (block.status === "failed") key = "imageGenerationFailed";
+	else if (block.status === "cancelled") key = "imageGenerationCancelled";
+	else if (block.status === "incomplete") key = "imageGenerationIncomplete";
+	else if (
+		(!block.status || block.status === "completed") &&
+		((typeof block.result === "string" && block.result.trim()) ||
+			(typeof block.savedPath === "string" && block.savedPath.trim()))
+	)
+		key = "imageGenerated";
+	const label = sysLabel(ctx, key);
+	const diagnostic = [block.errorCode, block.error]
+		.filter((value) => typeof value === "string" && value.trim())
+		.join(": ");
+	return diagnostic ? `${label}: ${diagnostic}` : label;
 }
 
 function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 	// measureMedia dispatches on `type`.
+	if (block.type === "audio" || block.type === "video") {
+		return {
+			type: block.type,
+			mediaId: block.mediaId ?? null,
+			previewUrl: block.previewUrl ?? null,
+			filename: block.filename ?? null,
+			mediaType: block.mediaType ?? null,
+			size: typeof block.size === "number" ? block.size : null,
+			uploadNarratorId: readNonEmptyString(block, "uploadNarratorId") ?? null,
+		};
+	}
 	return {
 		type: block.type,
 		imageId: block.imageId ?? null,
@@ -1431,6 +1598,8 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 		filename: block.filename ?? null,
 		mediaType: block.mediaType ?? null,
 		status: block.status ?? null,
+		error: block.error ?? null,
+		errorCode: block.errorCode ?? null,
 		revisedPrompt: block.revisedPrompt ?? null,
 		// The image SOURCE fields. `savedPath` is the normal one (the base64 payload
 		// is written to disk and only the path persisted); `result` survives only when
@@ -1441,7 +1610,7 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 		width: block.width ?? null,
 		height: block.height ?? null,
 		...(block.type === "image_generation"
-			? { statusText: imageGenerationStatusText(ctx, block.status) }
+			? { statusText: imageGenerationStatusText(ctx, block) }
 			: {}),
 	};
 }
@@ -1449,6 +1618,96 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Public: segment → ElementSpec[]
 // ─────────────────────────────────────────────────────────────────────────────
+
+function adaptAuxiliaryContent(
+	msg: AdapterMessage,
+	projection: AuxiliaryContentProjection,
+	ctx: AdapterContext,
+): ElementSpec {
+	const key = auxiliaryContentKey(msg, projection.blockIndex);
+	const opened = ctx.isExpanded?.(key);
+	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
+	const recent = !ctx.recentMessageIds || (!!msg.id && ctx.recentMessageIds.has(msg.id));
+	const defaultOpened = ctx.lod === 5 || (ctx.lod === 4 && recent);
+	const includeDetail =
+		opened === true || lodUserOverride || (ctx.lod >= 4 && defaultOpened && opened !== false);
+	return {
+		kind: "auxiliary-content",
+		key,
+		unitId: key,
+		lifecycleId: contentBlockLifecycleId(projection.block as AdapterContentBlock),
+		data: buildAuxiliaryContentData(projection, {
+			labels: ctx.labels,
+			includeDetail,
+			preview: ctx.lod === 4 && opened !== true && !lodUserOverride,
+			id: key,
+		}),
+		opts: {
+			isRecent: recent,
+			defaultOpened,
+			lodUserOverride,
+			...(opened === undefined ? {} : { opened }),
+			preferOpen: false,
+			viewportHeight: ctx.viewportHeight,
+			collapsesByLod: ctx.lod <= 3 || (ctx.lod === 4 && !recent),
+		},
+	};
+}
+
+/** New-mode path: visible physical order is authoritative, including mixed messages. */
+function adaptOrderedContextBlocks(
+	msg: AdapterMessage,
+	visibleBlockIndices: number[] | undefined,
+	ctx: AdapterContext,
+): ElementSpec[] | null {
+	if (msg.origin === "user") return null;
+	const blocks = messageBody(msg);
+	const auxiliary = auxiliaryContentViews(msg, visibleBlockIndices);
+	const allViews = [...contextBlockViews(blocks), ...injectionBlockViews(blocks)];
+	// Whole messages without auxiliary content keep their specialized receipt/control path.
+	// Only a filtered remainder needs the ordered dispatcher after grouping split a message.
+	if (auxiliary.length === 0 && (!visibleBlockIndices || allViews.length === 0)) return null;
+	const visible = visibleBlockIndices ? new Set(visibleBlockIndices) : undefined;
+	const visibleViews = allViews.filter((view) => !visible || visible.has(view.blockIndex));
+	const views = new Map(visibleViews.map((view) => [view.blockIndex, view]));
+	const auxiliaryByIndex = new Map(auxiliary.map((view) => [view.blockIndex, view]));
+	const owned = new Set(visibleViews.flatMap((view) => view.sourceIndices));
+	const auxiliaryOwned = new Set(auxiliary.flatMap((view) => view.sourceIndices));
+	const indices = [...(visibleBlockIndices ?? blocks.map((_, index) => index))].sort(
+		(a, b) => a - b,
+	);
+	const specs: ElementSpec[] = [];
+	const idBase = msg.id ?? "msg";
+	for (const index of indices) {
+		const projection = auxiliaryByIndex.get(index);
+		if (projection) {
+			specs.push(adaptAuxiliaryContent(msg, projection, ctx));
+			continue;
+		}
+		const view = views.get(index);
+		if (view) {
+			const block = { ...blocks[index], ...view.block } as AdapterContentBlock;
+			const spoken = adaptSpokenInjection(block, idBase, index, block.modelText ?? "", msg, ctx);
+			const framed =
+				!spoken && adaptFramedSystemCard(block, idBase, index, msg, block.modelText ?? "", ctx);
+			if (spoken) specs.push(...spoken);
+			else if (framed) specs.push(framed);
+			else specs.push(adaptSystemBlock(block.type, block, idBase, msg, ctx, index));
+			continue;
+		}
+		if (owned.has(index) || auxiliaryOwned.has(index)) continue;
+		const block = blocks[index];
+		if (!block) continue;
+		if (msg.role === "assistant") {
+			specs.push(...adaptMessage(msg, [index], { ...ctx, compactAuxiliaryContent: false }));
+		} else if (block.type === "text" && block.text?.trim()) {
+			specs.push({ kind: "markdown", key: elementKey(idBase, msg, index), data: block.text });
+		} else if (isRecognizedSystemBlockType(block.type)) {
+			specs.push(adaptSystemBlock(block.type, block, idBase, msg, ctx, index));
+		}
+	}
+	return specs;
+}
 
 /** Render native/legacy context blocks independently while preserving physical order. */
 function adaptContextBlocks(
@@ -1646,6 +1905,10 @@ function adaptMessage(
 	const blocks = messageBody(msg);
 	const indices = visibleBlockIndices ?? blocks.map((_, i) => i);
 	const idBase = msg.id ?? "msg";
+	if (ctx.compactAuxiliaryContent) {
+		const ordered = adaptOrderedContextBlocks(msg, visibleBlockIndices, ctx);
+		if (ordered) return ordered;
+	}
 
 	// user messages: a single bubble with plain pre-wrap text (not markdown) plus
 	// its attachments (images / text files), which live INSIDE the same bubble —
@@ -1812,6 +2075,8 @@ function adaptMessage(
 			.filter(
 				(b) =>
 					b.type === "image" ||
+					b.type === "audio" ||
+					b.type === "video" ||
 					b.type === "text_file" ||
 					(b.type === "file_reference" && b.reference),
 			)
@@ -1938,7 +2203,37 @@ function adaptMessage(
 		// affordances the reader can use (branch names, a commit sha, badges).
 		const framed = adaptFramedSystemCard(sysBlock, idBase, blockIndex, msg, modelFacingText, ctx);
 		if (framed) return [...specs, framed];
-		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx, blockIndex));
+		// An update of an outline session's views reads in the reader's words, not as the stored
+		// English notice naming internal keys (the row itself is unchanged).
+		const viewUpdate = outlineViewUpdateLine(blocks, ctx);
+		// One that changed the current-tasks view and carries its summary names the tasks: one
+		// line, the tasks as rows when unfolded. Older rows keep the line above.
+		const tasksUpdate = taskNoticeFromContextUpdate(blocks, viewUpdate, ctx.labels);
+		if (tasksUpdate) {
+			specs.push(
+				taskNoticeSpec(
+					`${elementKey(idBase, msg, blockIndex)}-sys`,
+					{
+						...tasksUpdate,
+						timeLabel: formatOriginNoticeTime(msg.createdAt),
+						origin: "system",
+						originLabel: "context_update",
+					},
+					ctx,
+				),
+			);
+			return specs;
+		}
+		specs.push(
+			adaptSystemBlock(
+				sysBlock.type,
+				viewUpdate === null ? sysBlock : { ...sysBlock, text: viewUpdate },
+				idBase,
+				msg,
+				ctx,
+				blockIndex,
+			),
+		);
 		return specs;
 	}
 
@@ -2154,14 +2449,21 @@ function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
  * testable. Keys mirror MessageBubble's i18n keys (narrator namespace).
  */
 const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
+	status_fail: "Failed",
 	// Body of a background-task bubble whose task produced no output. Needs a fallback
 	// like every other composed string: without one, `sysLabel` returns the raw key and
 	// the reader would see the literal "empty" in the bubble.
 	empty: "(empty)",
+	toolDetailsCleared: "Tool-call details cleared",
 	specProtectedBadge: "Protected",
 	specGoalAddedBadge: "Goal added",
 	specGoalExistsBadge: "Already tracked",
 	specGoalViewTasks: "View tasks",
+	outlineGoalBadge: "Set by a person",
+	outlineGoalLockedBadge: "Locked goal",
+	outlineGoalAddedBadge: "Added to the outline",
+	outlineGoalExistsBadge: "Already on the board",
+	outlineGoalViewBoard: "View task board",
 	specContinuation: "Task",
 	specBlockedContinuation: "Blocked",
 	segmentCompactFailed: "Compaction failed",
@@ -2221,6 +2523,10 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	imageGenerated: "Generated image",
 	imageGenerating: "Generating image…",
 	imageGenerationPreparing: "Preparing image generation…",
+	imageGenerationFailed: "Image generation failed",
+	imageGenerationCancelled: "Image generation cancelled",
+	imageGenerationIncomplete: "Image generation incomplete",
+	imageGenerationNoImage: "No image received",
 	// Trace / count-line chrome (CollapsibleTrace headers + ToolRun/Reasoning
 	// count lines). Interpolated entries keep literal {count}/{reasoning}/{tools}
 	// placeholders that the composers substitute with live values.
@@ -2310,6 +2616,17 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
+	sidecarSourceOutlineTurnEnd: "Task reminder at turn end",
+	sidecarSourceOutlineTaskEdit: "Task changes by people",
+	sidecarSourceOutlineTaskFinished: "Tasks this session created were finished elsewhere",
+	sidecarSourceOutlineTeamActivity: "Team activity",
+	sidecarSourceOutlineTeam: "Task events for this session",
+	sidecarSourceOutlineTaskBrief: "Opening brief",
+	sidecarSourceOutlineAnswer: "Answers to your questions",
+	// An update of an outline session's views (`context_update` row of `outline.*` parts).
+	contextViewsUpdated: "Context updated: {parts}",
+	contextViewOutlineTasks: "Current tasks",
+	contextViewOutlineBehavior: "Behavior boundary",
 	sidecarSourceTutorialLesson: "Tutorial lesson",
 	sidecarSourceTurnNudge: "Turn budget",
 	sidecarSourceBrokenCall: "Invalid tool call",
@@ -2421,6 +2738,19 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
 	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
+	// An outline session's long turn that left a task in progress it never touched (plan PR 4).
+	outline_task_turn_end: "sidecarSourceOutlineTurnEnd",
+	// People's changes to the session's outline tasks, told to it as a system notice (PR 5).
+	outline_task_edit: "sidecarSourceOutlineTaskEdit",
+	// Tasks the session created were finished by another session or a person (P2 PR 9b).
+	outline_task_finished: "sidecarSourceOutlineTaskFinished",
+	// What others did around the session's tasks since its last turn (P2 PR 10b).
+	outline_team_activity: "sidecarSourceOutlineTeamActivity",
+	// One commit of someone else that concerns the session's tasks (P2 PR 10a).
+	outline_team: "sidecarSourceOutlineTeam",
+	// The opening brief of a session opened to do a project task (P2 PR 10c-1).
+	outline_task_brief: "sidecarSourceOutlineTaskBrief",
+	outline_answer: "sidecarSourceOutlineAnswer",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",
@@ -3069,13 +3399,14 @@ function adaptSpokenInjection(
 		const tasks = Array.isArray(body.tasks) ? body.tasks : [];
 		// Empty / over-threshold digests have no rows to draw; they carry the same
 		// localized sentence the markdown projection used as its headline.
+		const outline = body.taskBackend === "outline";
 		const emptyLabel =
 			variant === "current" && tasks.length > 0
 				? null
 				: variant === "emptyNever"
-					? sysLabel(ctx, "tasksEmptyNever")
+					? sysLabel(ctx, outline ? "outlineTasksEmptyNever" : "tasksEmptyNever")
 					: variant === "emptyDone"
-						? sysLabel(ctx, "tasksEmptyDone")
+						? sysLabel(ctx, outline ? "outlineTasksEmptyDone" : "tasksEmptyDone")
 						: variant === "tooMany"
 							? // `tasksTooMany` carries an `{n}` placeholder; sysLabel has no
 								// interpolation, so substitute here (same as the markdown path).
@@ -3250,6 +3581,24 @@ function spokenSpeakerLabel(message: SideCarInboundMessage): string {
 	);
 }
 
+/**
+ * The `system-text` spec of a task notice. Its fold is the generic per-key expansion (the
+ * header toggles it): the measure pass reads `opts.expanded`, so the open and folded heights are
+ * separate cache entries. A notice with nothing more to show unfolded carries no opts at all.
+ */
+function taskNoticeSpec(
+	key: string,
+	data: Record<string, unknown>,
+	ctx: AdapterContext,
+): ElementSpec {
+	return {
+		kind: "system-text",
+		key,
+		data,
+		...(data.expandable === true ? { opts: { expanded: ctx.isExpanded?.(key) === true } } : {}),
+	};
+}
+
 function adaptSystemBlock(
 	blockType: string,
 	block: AdapterContentBlock,
@@ -3394,11 +3743,10 @@ function adaptSystemBlock(
 		};
 	}
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
-		return {
-			kind: "system-text",
-			key: `${keyBase}-sys`,
-			data: adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt),
-		};
+		const data = adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt);
+		return data.kind === "tasks_notice"
+			? taskNoticeSpec(`${keyBase}-sys`, data, ctx)
+			: { kind: "system-text", key: `${keyBase}-sys`, data };
 	}
 	// fallback: treat as info text. `message` is checked first because that is
 	// where display notices keep their body (see the `info` case below).
@@ -3533,12 +3881,26 @@ function adaptSystemTextData(
 			// Native self-contained injections keep their model-facing projection on
 			// `modelText`; legacy rows may still provide a sibling `text` block.
 			const modelFacingText = block.modelText ?? block.text ?? contentText;
-			const markdown = body
-				? sideCarBodyToMarkdown(source, body, ctx.labels)
-				: rawSideCarToMarkdown(modelFacingText);
+			// A notice about the session's tasks (turn end, people's changes, the interrupt
+			// guard) is one line naming the tasks, with the tasks as rows when unfolded.
+			const tasks = body
+				? taskNoticeFromBody(source, body, injectionHeadingLabel(ctx, source), ctx.labels)
+				: null;
+			if (tasks) {
+				return {
+					...tasks,
+					timeLabel: formatOriginNoticeTime(createdAt),
+					origin: "system",
+					originLabel: source || null,
+					modelFacing: modelFacingText,
+				};
+			}
+			// The card paints its body as PLAIN text, so it gets the plain projection: the
+			// Markdown one showed its `######` and escapes, and a prose body twice.
+			const plain = body ? sideCarBodyToPlainText(source, body, ctx.labels) : "";
 			return {
 				kind: "origin_notice",
-				text: markdown || rawSideCarToMarkdown(modelFacingText),
+				text: plain || rawSideCarToMarkdown(modelFacingText),
 				title: injectionHeadingLabel(ctx, source),
 				timeLabel: formatOriginNoticeTime(createdAt),
 				origin: "system",
@@ -3552,6 +3914,9 @@ function adaptSystemTextData(
 		}
 		case "spec_goal_added": {
 			const added = block.added !== false;
+			// A goal added to the outline (outline P2 PR 5): a person's task, locked; the same
+			// layout (two badges, one button) with its own words, and the button opens the board.
+			const outline = block.taskBackend === "outline";
 			return {
 				kind: "spec_goal_added",
 				// chunk: goalBlock.task ?? message.contentText
@@ -3559,10 +3924,26 @@ function adaptSystemTextData(
 				added,
 				color: "indigo",
 				badges: [
-					sysLabel(ctx, "specProtectedBadge"),
-					sysLabel(ctx, added ? "specGoalAddedBadge" : "specGoalExistsBadge"),
+					sysLabel(
+						ctx,
+						outline
+							? block.locked === false
+								? "outlineGoalBadge"
+								: "outlineGoalLockedBadge"
+							: "specProtectedBadge",
+					),
+					sysLabel(
+						ctx,
+						added
+							? outline
+								? "outlineGoalAddedBadge"
+								: "specGoalAddedBadge"
+							: outline
+								? "outlineGoalExistsBadge"
+								: "specGoalExistsBadge",
+					),
 				],
-				buttons: [sysLabel(ctx, "specGoalViewTasks")],
+				buttons: [sysLabel(ctx, outline ? "outlineGoalViewBoard" : "specGoalViewTasks")],
 			};
 		}
 		case "spec_fork_carryover":
@@ -3627,6 +4008,10 @@ function isLatestSpecTasksToolItem(
 export function groupToolItemsForLod(
 	items: AdapterToolItem[],
 	latestSpecTasksToolUseId?: string | null,
+	policy?: {
+		compactAuxiliaryContent?: boolean;
+		resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
+	},
 ): ToolLodGroup[] {
 	const groups: ToolLodGroup[] = [];
 	let pending: AdapterToolItem[] = [];
@@ -3640,10 +4025,13 @@ export function groupToolItemsForLod(
 		const item = items[i];
 		if (!item) continue;
 		if (
-			isCommunicationTool(item.tc) ||
-			item.isSubagent ||
+			shouldShowCommunicationBubble(item.tc, policy?.compactAuxiliaryContent === true) ||
+			(item.isSubagent && !policy?.compactAuxiliaryContent) ||
 			isActiveToolItem(item) ||
-			isPreferOpenTool(item.tc) ||
+			isPreferOpenTool(item.tc, {
+				...policy,
+				questionStatus: policy?.resolveQuestionStatus?.(item.tc.toolUseId),
+			}) ||
 			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
 		) {
 			flush();
@@ -3886,15 +4274,26 @@ function adaptToolItemFull(
 	ctx: AdapterContext,
 	runContext: ToolRunContext = { inRun: false, isLast: true, isSoleSubagent: false },
 ): ElementSpec {
-	const isCommunication = isCommunicationTool(item.tc);
-	const hasPendingPermission = ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false;
+	item = visibleToolItem(item, ctx);
+	const cleared = item.tc.payloadCleared === true;
+	if (ctx.compactAuxiliaryContent && isCommunicationTool(item.tc))
+		item = { ...item, isSubagent: false };
+	const isCommunication =
+		!cleared && shouldShowCommunicationBubble(item.tc, ctx.compactAuxiliaryContent === true);
+	const hasPendingPermission =
+		!cleared && (ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false);
 	// Approval controls only mount on a generic tool card. Once the decision lands,
 	// the same tool identity becomes its conversation bubble, never a subagent card.
 	if (isCommunication && !hasPendingPermission) return adaptCommunicationBubble(item, ctx);
 	const key = toolItemKey(item);
 	const opened = ctx.isExpanded?.(key);
 	const defaultOpened =
-		opened === undefined && item.isSubagent && runContext.isSoleSubagent ? true : opened;
+		opened === undefined &&
+		item.isSubagent &&
+		runContext.isSoleSubagent &&
+		!ctx.compactAuxiliaryContent
+			? true
+			: opened;
 	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
 	// The latest tasks.json call stays expanded at every LOD (the task board is the
 	// narrator's live working state). Like the permission flag it folds into the
@@ -3908,7 +4307,12 @@ function adaptToolItemFull(
 	// exactly the L5 bug `userCollapsed` was introduced to fix. `collapsesByLod`
 	// must stay false so the header toggle writes `expanded` rather than
 	// `lodUserOverride` (the override channel FORCE-expands and cannot fold).
-	const preferOpen = isPreferOpenTool(item.tc);
+	const preferOpen =
+		!cleared &&
+		isPreferOpenTool(item.tc, {
+			compactAuxiliaryContent: ctx.compactAuxiliaryContent,
+			questionStatus: ctx.resolveQuestionStatus?.(item.tc.toolUseId),
+		});
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -3922,7 +4326,11 @@ function adaptToolItemFull(
 		// Same contract for the pinned tasks card: it never collapses to a header,
 		// even at L3 or as an older card at L4.
 		...(isPinnedSpecTasks ? { forceExpanded: true } : {}),
-		...(preferOpen ? { preferOpen: true } : {}),
+		...(ctx.compactAuxiliaryContent
+			? { preferOpen, compactAuxiliaryContent: true }
+			: preferOpen
+				? { preferOpen: true }
+				: {}),
 		collapsesByLod:
 			!hasPendingPermission &&
 			!preferOpen &&
@@ -4082,6 +4490,11 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? undefined
 			: makeBody("output.main", resultContent, hasTruncatedLeaf(outputJson));
 	const isBackground = input.background === true || input.run_in_background === true;
+	// An agent sent with an outline task (`task`, outline P2 PR 9): the card names the task under
+	// its description and marks a late result, from the call's metadata (the server writes it;
+	// no projection of the text cuts it), else from the result's note or the line a background
+	// launch names the task in (calls from before the metadata).
+	const delegation = readSubagentDelegation(readLeafText(input.task), resultContent, metadata);
 	const agentType = readNonEmptyString(input, "subagent_type") ?? item.tc.toolName;
 	// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
 	// narrator query (which the adapter has no access to): the activity summary
@@ -4120,6 +4533,7 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		// Still a preview → the shell may fetch the real body while it is open.
 		...(promptTruncated ? { promptTruncated: true } : {}),
 		isBackground,
+		...(delegation ? { delegation } : {}),
 		// Files the child wrote. Absent when it changed nothing, so a card with no
 		// file list keeps the payload (and the height) it had before.
 		...(activity?.fileChanges ? { fileChanges: activity.fileChanges } : {}),
@@ -4227,6 +4641,8 @@ function buildToolCardData(
 	runContext: ToolRunContext,
 	hasPendingPermission: boolean,
 ): unknown {
+	item = visibleToolItem(item);
+	if (item.tc.payloadCleared) return clearedToolCardData(item, ctx, runContext);
 	// category drives measure-tool-call's default-open (→ height). Resolved
 	// via the injected authoritative resolver; "generic" when absent.
 	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson) ?? "generic";
@@ -4322,6 +4738,17 @@ function buildToolCardData(
 			// classifier is the single place that decides what counts as a denial.
 			...(denyMessage ? { denyMessage } : {}),
 			hasPendingPermission,
+			// An outline card's fold (its raw input and model result under the change list), keyed
+			// by the CARD (`promptOpen`, the subagent prompt fold's channel): the same key whether
+			// the card stands alone or is drilled into from a folded row, so it survives an LOD
+			// change.
+			...(category === "outline" && ctx.isPromptOpen?.(toolItemKey(item)) === true
+				? { rawOpen: true }
+				: {}),
+			// An outline plan's tree, as the reader opened it, keyed by the CARD like the fold above.
+			...(category === "plan" && ctx.planTreeView
+				? { planView: ctx.planTreeView(toolItemKey(item)) }
+				: {}),
 			// Only MEASURED chrome strings (the ask replay's answer prefixes) —
 			// render-layer chrome is injected through renderLabels instead.
 			...(ctx.labels ? { labels: ctx.labels } : {}),
@@ -4342,8 +4769,15 @@ function toolDiffStatsFields(
 	item: AdapterToolItem,
 	isStreaming: boolean,
 	metadata: unknown,
-): { diffStats?: { added: number; removed: number } } {
+): { diffStats?: { added: number; removed: number; done?: number; commit?: number } } {
 	if (isStreaming) return {};
+	// An outline edit's figures: tasks ticked done, blocks added and deleted, its commit.
+	if (item.tc.toolName === "OutlineEdit") {
+		const stats = outlineEditHeaderStats(
+			metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : null,
+		);
+		return stats ? { diffStats: stats } : {};
+	}
 	const stats = resolveFileDiffStats(
 		item.tc.toolName,
 		item.tc.inputJson,
@@ -4743,7 +5177,75 @@ const completedEditInputs = new WeakMap<
 	WeakMap<object, { context: string; value: unknown }>
 >();
 
+function toolPayloadCleared(source: Record<string, unknown>): boolean {
+	return (
+		source.payloadCleared === true ||
+		isClearedToolOutput(source.outputJson) ||
+		isClearedToolOutput(source.output)
+	);
+}
+
+/** A current block's tombstone wins over an already-hydrated, pre-cleanup relation. */
+function isClearedToolItem(item: AdapterToolItem): boolean {
+	if (toolPayloadCleared(item.tc)) return true;
+	const block = messageBody(item.msg)[item.blockIndex];
+	return block?.type === "tool_use" && block.id === item.tc.toolUseId && toolPayloadCleared(block);
+}
+
+/** One display boundary for every tool kind; never carry ledger-only data into a spec. */
+function visibleToolItem(item: AdapterToolItem, ctx?: AdapterContext): AdapterToolItem {
+	const cleared = isClearedToolItem(item);
+	// A fetched tombstone is authoritative too. Inspect output before any input
+	// hydration or specialized renderer; known row tombstones call neither resolver.
+	const cachedCleared =
+		!cleared &&
+		hasTruncatedLeaf(item.tc.outputJson) &&
+		isClearedToolOutput(
+			ctx?.resolveFullToolOutput?.(item.tc.toolUseId, resolveToolDetailRef(item)),
+		);
+	if (!cleared && !cachedCleared) return item;
+	return {
+		...item,
+		isSubagent: false,
+		tc: {
+			id: item.tc.id,
+			messageId: item.tc.messageId,
+			executionAttempt: item.tc.executionAttempt,
+			toolUseId: item.tc.toolUseId,
+			toolName: item.tc.toolName,
+			status: item.tc.status,
+			...toolTimingStamps(item.tc),
+			...(typeof item.tc.durationMs === "number" ? { durationMs: item.tc.durationMs } : {}),
+			payloadCleared: true,
+			inputJson: null,
+			outputJson: null,
+		},
+	};
+}
+
+function clearedToolCardData(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+	runContext: ToolRunContext,
+) {
+	return {
+		toolName: item.tc.toolName,
+		summary: sysLabel(ctx, "toolDetailsCleared"),
+		status: item.tc.status ?? "success",
+		isStreaming: false,
+		inRun: runContext.inRun,
+		isLast: runContext.isLast,
+		category: "generic",
+		payloadCleared: true,
+		toolUseId: item.tc.toolUseId,
+		toolDetailRef: resolveToolDetailRef(item),
+		...cardTiming(item.tc),
+		detail: null,
+	};
+}
+
 function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
+	if (isClearedToolItem(item)) return null;
 	if (
 		!ctx.resolveFullToolInput ||
 		(item.tc.toolName !== "Write" && !hasTruncatedLeaf(item.tc.inputJson))
@@ -4814,6 +5316,7 @@ function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
 
 /** Full (un-truncated) tool output once the shell has fetched it. */
 function withFullOutput(item: AdapterToolItem, ctx: AdapterContext): unknown {
+	if (isClearedToolItem(item)) return null;
 	if (!ctx.resolveFullToolOutput || !hasTruncatedLeaf(item.tc.outputJson))
 		return item.tc.outputJson;
 	return (
@@ -4888,15 +5391,25 @@ function toolTraceItem(
 	expanded = false,
 	queuedBehindUpstream = false,
 ): AdapterTraceItem {
+	item = visibleToolItem(item, ctx);
+	const cleared = item.tc.payloadCleared === true;
 	const summary = toolSummary(item.tc, ctx);
 	const name = item.tc.toolName === "Task" ? "Agent" : item.tc.toolName;
-	const rawTitle = ctx.resolveToolTitle?.(item.tc) ?? (summary ? `${name} · ${summary}` : name);
+	const compactTitle =
+		ctx.compactAuxiliaryContent &&
+		(isCommunicationTool(item.tc) || name === "AskUserQuestion" || name === "ExitPlanMode");
+	const fallbackTitle = summary ? `${name} · ${summary}` : name;
+	const rawTitle = cleared
+		? fallbackTitle
+		: ((!compactTitle ? ctx.resolveToolTitle?.(item.tc) : undefined) ?? fallbackTitle);
 	// Only a real, identifiable tool call can be drilled into: the card's detail
 	// classification and its on-demand payload fetch are both keyed by tool use id.
 	const canDrillDown = !!item.tc.toolUseId;
 	// The gate's own status, read with the same live-wins precedence the card uses.
-	const reflectionStatus = resolveToolReflectionStatus(item, ctx);
-	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson);
+	const reflectionStatus = cleared ? undefined : resolveToolReflectionStatus(item, ctx);
+	const category = cleared
+		? "generic"
+		: ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson);
 	// The figure the row PAINTS, which is not always `timing.durationMs`: for bash
 	// that field absorbs permission / reflection / queue waiting, and a 1.2s command
 	// that waited 19s on a gate read as a 20s command. Same shared rule the card
@@ -4906,7 +5419,7 @@ function toolTraceItem(
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
-		iconColor: ctx.resolveToolColor?.(item.tc.toolName, item.tc.inputJson),
+		iconColor: cleared ? "gray" : ctx.resolveToolColor?.(item.tc.toolName, item.tc.inputJson),
 		toolName: item.tc.toolName,
 		category,
 		key: toolItemKey(item),
@@ -4989,8 +5502,11 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 			// A bubble breaks the surrounding tool frame as well as the low-LOD fold.
 			const previous = items[index - 1];
 			const next = items[index + 1];
-			const previousIsTool = !!previous && !isCommunicationTool(previous.tc);
-			const nextIsTool = !!next && !isCommunicationTool(next.tc);
+			const previousIsTool =
+				!!previous &&
+				!shouldShowCommunicationBubble(previous.tc, ctx.compactAuxiliaryContent === true);
+			const nextIsTool =
+				!!next && !shouldShowCommunicationBubble(next.tc, ctx.compactAuxiliaryContent === true);
 			return adaptToolItemFull(item, ctx, {
 				inRun: previousIsTool || nextIsTool,
 				isLast: !nextIsTool,
@@ -5001,7 +5517,7 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 	}
 	// Resolved once per run: the resolver is a shell closure over the latest id,
 	// and the grouping below only ever compares against it.
-	const groups = groupToolItemsForLod(items, ctx.resolveLatestSpecTasksToolUseId?.());
+	const groups = groupToolItemsForLod(items, ctx.resolveLatestSpecTasksToolUseId?.(), ctx);
 	const specs: ElementSpec[] = [];
 	for (const group of groups) {
 		if (group.kind === "active") {
@@ -5195,6 +5711,52 @@ function adaptActivityItems(
 	const consumedReasoningBlocks = new Set<number>();
 	const pinnedRowIndices: number[] = [];
 	for (const [itemIndex, item] of items.entries()) {
+		if (item.kind === "auxiliary") {
+			const rowKey = auxiliaryContentKey(item.msg, item.blockIndex);
+			const data = buildAuxiliaryContentData(item, { labels: ctx.labels });
+			const expanded =
+				(ctx.isRowExpanded?.(traceKey, rowKey) ?? false) ||
+				ctx.isExpanded?.(rowKey) === true ||
+				(ctx.isLodUserOverride?.(rowKey) ?? false);
+			if (expanded) expandedIndices.push(traceItems.length);
+			traceItems.push({
+				title: truncateTitle(data.summary ? `${data.toolName} · ${data.summary}` : data.toolName),
+				contentRole: "auxiliary",
+				sourceStatus: data.sourceStatus,
+				hasIcon: true,
+				iconColor: data.category === "bash" ? "teal" : "gray",
+				toolName: data.toolName,
+				category: data.category,
+				summary: data.summary,
+				key: rowKey,
+				unitId: rowKey,
+				status: data.sourceStatus ? data.status : null,
+				canDrillDown: true,
+				cardKind: "auxiliary-content",
+				identity: item.msg.id
+					? {
+							messageId: item.msg.id,
+							blockIndex: item.blockIndex,
+							blockIndices: item.sourceIndices,
+							auxiliary: true,
+							source: data.source,
+							modelFacing: data.modelFacing,
+							inspectContent: data.inspectContent,
+							target: data.target,
+						}
+					: undefined,
+				...(expanded
+					? {
+							card: buildAuxiliaryContentData(item, {
+								labels: ctx.labels,
+								includeDetail: true,
+								id: rowKey,
+							}),
+						}
+					: {}),
+			});
+			continue;
+		}
 		if (item.kind === "reasoning") {
 			if (consumedReasoningBlocks.has(itemIndex)) continue;
 			// Collect this run's remaining blocks: the grouper gives every block of one
@@ -5337,7 +5899,8 @@ function adaptActivityItems(
 			// Carried in from the render-unit fold: a subagent row must drill into a
 			// subagent CARD, and hard-coding `false` here is what made every folded
 			// Agent call expand into the generic tool card at L1/L2.
-			isSubagent: item.isSubagent === true,
+			isSubagent:
+				item.isSubagent === true && (!ctx.compactAuxiliaryContent || !isCommunicationTool(item.tc)),
 			tc: item.tc,
 		};
 		// The row's FINAL key, resolved BEFORE the expansion lookup.
@@ -5432,6 +5995,20 @@ export function adaptActivityUnit(
 	const hasPinnedRow = activity.pinnedRowIndices.length > 0;
 	const firstVisibleIndex = Math.max(0, activity.traceItems.length - ADAPTER_ACTIVITY_MAX_VISIBLE);
 	const pinnedRowHidden = activity.pinnedRowIndices.some((index) => index < firstVisibleIndex);
+	const hasOpenedRow = ctx.compactAuxiliaryContent === true && activity.expandedIndices.length > 0;
+	const openedRowHidden =
+		ctx.compactAuxiliaryContent === true &&
+		activity.expandedIndices.some((index) => index < firstVisibleIndex);
+	const auxiliaryCount = items.filter((item) => item.kind === "auxiliary").length;
+	const failureCount = activity.traceItems.filter(
+		(row) => row.status != null && ["fail", "error", "failed"].includes(row.status),
+	).length;
+	const countLabel =
+		auxiliaryCount > 0
+			? String(activity.traceItems.length)
+			: sysLabel(ctx, "activityTraceCount")
+					.replace(/\{reasoning\}/g, String(activity.reasoningCount))
+					.replace(/\{tools\}/g, String(activity.toolCount));
 	return {
 		kind: "activity-trace",
 		key,
@@ -5441,16 +6018,19 @@ export function adaptActivityUnit(
 		data: {
 			items: activity.traceItems,
 			headerLabel: sysLabel(ctx, "activityTraceLabel"),
-			headerCount: sysLabel(ctx, "activityTraceCount")
-				.replace(/\{reasoning\}/g, String(activity.reasoningCount))
-				.replace(/\{tools\}/g, String(activity.toolCount)),
+			headerCount:
+				ctx.compactAuxiliaryContent && failureCount > 0
+					? `${countLabel} · ${failureCount} ${sysLabel(ctx, "status_fail")}`
+					: countLabel,
+			...(ctx.compactAuxiliaryContent ? { auxiliaryCount, failureCount } : {}),
 		},
 		opts: {
 			// L1 folds history behind the header but keeps the current run's rows on
 			// screen, so live activity stays readable at the simplest level.
-			collapsed: ctx.lod === 1 && !hasPinnedRow && !isRecentActivityUnit(items, ctx),
+			collapsed:
+				ctx.lod === 1 && !hasPinnedRow && !hasOpenedRow && !isRecentActivityUnit(items, ctx),
 			itemsOpened: ctx.isExpanded?.(key) ?? false,
-			showEarlier: pinnedRowHidden || (ctx.showEarlier?.(key) ?? false),
+			showEarlier: pinnedRowHidden || openedRowHidden || (ctx.showEarlier?.(key) ?? false),
 			// Derived while the rows were emitted, never resolved a second time — see
 			// adaptActivityItems on why a stored index cannot survive a live run.
 			expandedIndices: activity.expandedIndices,

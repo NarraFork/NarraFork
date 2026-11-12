@@ -8,7 +8,12 @@
  * projection (neutral turns, then its wire format).
  */
 
+import type { MediaRef } from "@shared/media-attachments";
 import { projectFileReferencesForModel } from "./file-reference-projection";
+import {
+	projectCurrentNativeMediaForModel,
+	projectUnsupportedNativeMediaForModel,
+} from "./native-media";
 import type { BuiltHistory, DbMessage, ProviderAdapter } from "./provider";
 import { projectAskUserQuestionMessagesForModel } from "./question-model-input";
 import { projectMessageSenderForModel } from "./sender-projection";
@@ -24,6 +29,8 @@ import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
 
 export interface AdapterHistoryOptions {
 	narratorId?: string;
+	/** Only references actually sent in a separate current-input lane may be omitted from rows. */
+	currentMedia?: readonly MediaRef[];
 	/**
 	 * Loading state the request's `tools` array is built from, and the strategy
 	 * resolved for this model. Tool loads inside the history are rendered for it.
@@ -32,35 +39,64 @@ export interface AdapterHistoryOptions {
 }
 
 /** Build `adapter`'s history for `model` (the bare id it resolved) from `rows`. */
-export function buildAdapterHistory(
-	adapter: Pick<ProviderAdapter, "buildHistory">,
+export async function buildAdapterHistory(
+	adapter: Pick<ProviderAdapter, "buildHistory" | "supportsNativeMediaInput">,
 	rows: readonly DbMessage[],
 	target: { provider: string; model: string },
 	options: AdapterHistoryOptions = {},
 ): Promise<BuiltHistory> {
+	// These independent projections may each scan a wide row's blocks. Promise
+	// continuations alone do not release Bun's HTTP/WS event loop between scans.
+	let lastYield = performance.now();
+	const checkpoint = async () => {
+		if (performance.now() - lastYield < 8) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		lastYield = performance.now();
+	};
 	// Replace file-based ExitPlanMode plan bodies with a short path reference so
 	// the model history does not carry the full plan text on every rebuild. The
 	// persisted DB rows keep the full plan for the UI; this only mutates the
 	// in-memory copy passed to the provider adapter.
-	const modelMessages = stripPlanBodyForModel(projectAskUserQuestionMessagesForModel(rows));
+	const questionMessages = projectAskUserQuestionMessagesForModel(rows);
+	await checkpoint();
+	const modelMessages = stripPlanBodyForModel(questionMessages);
+	await checkpoint();
 	// Historical rows may still embed provider-internal citation markers. Replaying
 	// them teaches the model the markers are part of its output format, so it keeps
 	// producing them; strip on the in-memory copy only.
 	// Expand accepted file bytes after prose cleanup: citation-like strings in
 	// a source file are data and must not be rewritten by the citation sanitizer.
-	const cleanedMessages = projectFileReferencesForModel(
-		stripCitationMarkersForModel(modelMessages),
-	);
+	const citationMessages = stripCitationMarkersForModel(modelMessages);
+	await checkpoint();
+	const cleanedMessages = projectFileReferencesForModel(citationMessages);
+	await checkpoint();
 	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
 	// which only breaks once several turns accumulate: the replayed history then
 	// carries duplicate ids and the API rejects the request with 400. Rename the
 	// later collisions in this in-memory copy — DB rows keep the original ids.
 	// Attribution is a model-only projection, after accepted file material. Roles and
 	// stored rows stay unchanged; every provider receives the same sender format.
-	const uniqueMessages = uniquifyDbMessageToolUseIds(
-		cleanedMessages.map(projectMessageSenderForModel),
-		{ narratorId: options.narratorId, provider: target.provider, model: target.model },
+	const currentMediaMessages = projectCurrentNativeMediaForModel(
+		cleanedMessages,
+		options.currentMedia,
+		options.narratorId,
 	);
+	await checkpoint();
+	const mediaProjection = projectUnsupportedNativeMediaForModel(
+		currentMediaMessages,
+		target.model,
+		adapter,
+		options.narratorId,
+	);
+	await checkpoint();
+	const senderMessages = mediaProjection.messages.map(projectMessageSenderForModel);
+	await checkpoint();
+	const uniqueMessages = uniquifyDbMessageToolUseIds(senderMessages, {
+		narratorId: options.narratorId,
+		provider: target.provider,
+		model: target.model,
+	});
+	await checkpoint();
 	// Last, so builders see exactly these row objects (changes are keyed by row).
 	const projectedMessages = options.toolLoading
 		? projectToolLoadingHistory(
@@ -70,7 +106,17 @@ export function buildAdapterHistory(
 				resolveLoadableToolDefinition,
 			)
 		: uniqueMessages;
-	return adapter.buildHistory(projectedMessages, target.model, options.narratorId);
+	await checkpoint();
+	const built = await adapter.buildHistory(projectedMessages, target.model, options.narratorId);
+	return mediaProjection.warnings.length
+		? {
+				...built,
+				mediaFallbackWarnings: [
+					...(built.mediaFallbackWarnings ?? []),
+					...mediaProjection.warnings,
+				],
+			}
+		: built;
 }
 
 /** The last top-level row the model reads, and whether it is an answered tool step. */

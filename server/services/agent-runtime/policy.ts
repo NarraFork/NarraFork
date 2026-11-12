@@ -1,5 +1,9 @@
 import { BASH_TOOL_NAME } from "@server/lib/agent/tool-name";
-import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "@server/lib/agent/tools/outline-names";
+import {
+	isOutlineTool,
+	OUTLINE_EDIT_TOOL,
+	OUTLINE_READ_TOOLS,
+} from "@server/lib/agent/tools/outline-names";
 import type { RuntimePolicyTrait } from "@server/lib/runtime-policy-trait";
 
 /**
@@ -99,6 +103,13 @@ export interface DelegationTemplateInput {
 		toolAccess: "readOnly" | "general" | "custom";
 		customTools: readonly string[];
 	} | null;
+	/**
+	 * The delegating session keeps its tasks in the outline (task backend `outline`): its
+	 * subagents get no outline tools by default (design §4.4, R16) — they work from a plain
+	 * description and their report is filed for them. A custom template that names outline tools
+	 * in its own tool list keeps them ("when needed"). Spec sessions' subagents are unchanged.
+	 */
+	outlineSession?: boolean;
 }
 
 /**
@@ -112,27 +123,30 @@ export function compileDelegationPolicy(input: DelegationTemplateInput): Runtime
 		deny: [...DELEGATED_DENY],
 		continuation: { promoteTodo: false, maxPasses: 6 },
 	};
+	// A template's built-in list, without the outline tools for an outline session's subagent.
+	const builtin = (tools: readonly string[]) =>
+		input.outlineSession ? tools.filter((name) => !isOutlineTool(name)) : [...tools];
 	switch (input.template) {
 		case "general":
-			return { ...base, tools: [...GENERAL_TOOLS], mcp: "nonDenied" };
+			return { ...base, tools: builtin(GENERAL_TOOLS), mcp: "nonDenied" };
 		case "search":
 			return { ...base, tools: [...SEARCH_TOOLS], mcp: "none", readOnly: true, searchOnly: true };
 		case "review":
 			// Review may inspect Git synchronously, never control running tasks.
 			return {
 				...base,
-				tools: READ_TOOLS.filter((name) => name !== "Stop"),
+				tools: builtin(READ_TOOLS.filter((name) => name !== "Stop")),
 				mcp: "readOnly",
 				readOnly: true,
 				readOnlyGitShell: true,
 			};
 		case "explore":
 		case "plan":
-			return { ...base, tools: [...READ_TOOLS], mcp: "readOnly", readOnly: true };
+			return { ...base, tools: builtin(READ_TOOLS), mcp: "readOnly", readOnly: true };
 	}
 	const custom = input.customDefinition;
 	if (custom?.toolAccess === "general")
-		return { ...base, tools: [...GENERAL_TOOLS], mcp: "nonDenied" };
+		return { ...base, tools: builtin(GENERAL_TOOLS), mcp: "nonDenied" };
 	if (custom?.toolAccess === "custom")
 		return {
 			...base,
@@ -140,7 +154,7 @@ export function compileDelegationPolicy(input: DelegationTemplateInput): Runtime
 			mcpNames: [...custom.customTools],
 			mcp: "nonDenied",
 		};
-	return { ...base, tools: [...READ_TOOLS], mcp: "readOnly", readOnly: true };
+	return { ...base, tools: builtin(READ_TOOLS), mcp: "readOnly", readOnly: true };
 }
 
 const MCP_RANK = { none: 0, readOnly: 1, nonDenied: 2 } as const;

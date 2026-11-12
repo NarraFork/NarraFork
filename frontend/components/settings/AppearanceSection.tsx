@@ -13,6 +13,7 @@ import {
 	usePluginAvailableThemes,
 	usePluginThemePref,
 } from "../../hooks/usePluginThemes";
+import { typographyPreferencePatch } from "../../lib/typography-preferences";
 import { LanguageSwitcher } from "../LanguageSwitcher";
 import { ThemeSwitcher } from "../ThemeSwitcher";
 import { TERMINAL_THEMES } from "../terminal/terminal-theme";
@@ -201,6 +202,14 @@ export function AppearanceSection({
 				}}
 			/>
 			<Switch
+				label={t("recentTabsShowDirectory")}
+				description={t("recentTabsShowDirectoryDesc")}
+				checked={userPrefs?.recentTabsShowDirectory ?? false}
+				onChange={(e) =>
+					updateUserPref.mutate({ recentTabsShowDirectory: e.currentTarget.checked })
+				}
+			/>
+			<Switch
 				label={t("bottomSpacingResize")}
 				description={t("bottomSpacingResizeDesc")}
 				checked={bottomSpacingResize}
@@ -295,6 +304,20 @@ export function AppearanceSection({
 				checked={lodAltGesture}
 				onChange={(e) => setLodAltGesture(e.currentTarget.checked)}
 			/>
+			<Select
+				label={t("auxiliaryContentDisplay")}
+				description={t("auxiliaryContentDisplayDesc")}
+				value={userPrefs?.compactAuxiliaryContent === false ? "legacy" : "compact"}
+				data={[
+					{ value: "compact", label: t("auxiliaryContentDisplayCompact") },
+					{ value: "legacy", label: t("auxiliaryContentDisplayLegacy") },
+				]}
+				allowDeselect={false}
+				disabled={!userPrefs || updateUserPref.isPending}
+				onChange={(value) => {
+					if (value) updateUserPref.mutate({ compactAuxiliaryContent: value === "compact" });
+				}}
+			/>
 			{/* Narrator typography — the same three knobs the in-session Typography panel
 			    exposes. Both write the SAME user preference; this surface exists so the
 			    controls are reachable without opening a conversation, while the docked
@@ -318,7 +341,7 @@ export function AppearanceSection({
 					{ value: 180, label: "180%" },
 				]}
 				onPreview={(v) => setTypography({ fontScalePercent: v })}
-				onCommit={(v) => updateUserPref.mutate({ narratorFontScalePercent: v })}
+				onCommit={(v) => updateUserPref.mutate(typographyPreferencePatch({ fontScalePercent: v }))}
 			/>
 			<TypographyKnob
 				label={t("narratorLetterSpacing")}
@@ -333,24 +356,32 @@ export function AppearanceSection({
 					{ value: 25, label: "25%" },
 				]}
 				onPreview={(v) => setTypography({ letterSpacingPercent: v })}
-				onCommit={(v) => updateUserPref.mutate({ narratorLetterSpacingPercent: v })}
+				onCommit={(v) =>
+					updateUserPref.mutate(typographyPreferencePatch({ letterSpacingPercent: v }))
+				}
 			/>
 			<TypographyKnob
 				label={t("narratorLineHeight")}
 				description={t("narratorLineHeightDesc")}
-				value={
-					userPrefs?.narratorLineHeightScalePercent ?? DEFAULT_TYPOGRAPHY.lineHeightScalePercent
-				}
+				value={userPrefs?.narratorLineHeightV2Percent ?? DEFAULT_TYPOGRAPHY.lineHeightScalePercent}
 				min={TYPOGRAPHY_RANGE.lineHeightScalePercent.min}
 				max={TYPOGRAPHY_RANGE.lineHeightScalePercent.max}
 				step={5}
 				marks={[
-					{ value: 75, label: "75%" },
+					{
+						value: TYPOGRAPHY_RANGE.lineHeightScalePercent.min,
+						label: `${TYPOGRAPHY_RANGE.lineHeightScalePercent.min}%`,
+					},
 					{ value: 100, label: "100%" },
-					{ value: 220, label: "220%" },
+					{
+						value: TYPOGRAPHY_RANGE.lineHeightScalePercent.max,
+						label: `${TYPOGRAPHY_RANGE.lineHeightScalePercent.max}%`,
+					},
 				]}
 				onPreview={(v) => setTypography({ lineHeightScalePercent: v })}
-				onCommit={(v) => updateUserPref.mutate({ narratorLineHeightScalePercent: v })}
+				onCommit={(v) =>
+					updateUserPref.mutate(typographyPreferencePatch({ lineHeightScalePercent: v }))
+				}
 			/>
 			<TypographyKnob
 				label={t("narratorParagraphScale")}
@@ -365,7 +396,9 @@ export function AppearanceSection({
 					{ value: 250, label: "250%" },
 				]}
 				onPreview={(v) => setTypography({ paragraphScalePercent: v })}
-				onCommit={(v) => updateUserPref.mutate({ narratorParagraphScalePercent: v })}
+				onCommit={(v) =>
+					updateUserPref.mutate(typographyPreferencePatch({ paragraphScalePercent: v }))
+				}
 			/>
 
 			{/* Word Wrap */}

@@ -186,6 +186,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 						interrupted: true,
 						interruptedReason: "resumable_error",
 						shouldReplayInterruptedToolResultTurn: false,
+						finalText: "partial output",
 					},
 					0,
 				),
@@ -204,6 +205,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 						interrupted: true,
 						interruptedReason: "completion_limit",
 						shouldReplayInterruptedToolResultTurn: true,
+						finalText: "partial output",
 					},
 					1,
 				),
@@ -213,7 +215,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 		test("bounds repeated interrupted continuations and resets after success", async () => {
 			expect(
 				planSubagentInterruption(
-					{ interrupted: true, interruptedReason: "resumable_error" },
+					{ interrupted: true, interruptedReason: "resumable_error", finalText: "partial output" },
 					MAX_SUBAGENT_INTERRUPTION_RETRIES,
 				),
 			).toEqual({
@@ -221,7 +223,9 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 				retries: MAX_SUBAGENT_INTERRUPTION_RETRIES + 1,
 				reason: "resumable_error",
 			});
-			expect(planSubagentInterruption({ interrupted: false }, 2)).toEqual({
+			expect(
+				planSubagentInterruption({ interrupted: false, finalText: "partial output" }, 2),
+			).toEqual({
 				action: "none",
 				retries: 0,
 			});

@@ -19,6 +19,21 @@
  *   - Block selection (Esc): whole blocks, moved, indented, deleted, copied together.
  *   - Clipboard: copying gives a markdown outline; pasting markdown splits into blocks; pasted
  *     HTML (from a web page or a word processor) becomes blocks too.
+ *   - Folding (task tree readability, PR C): what is open is the page's default view with the
+ *     reader's own folding over it (`@shared/outline-fold`, as the read-only tree and the mind
+ *     map). A closed block keeps its children in the document (edits by others inside it still
+ *     apply, and undo works as before); CSS hides them, and the block's frame shows ONE preview
+ *     line in their place. The preview, the quick control and the counts of what is hidden are
+ *     frame DOM projected from a derived attribute (`fold`): never part of the block model, of
+ *     what is saved, or of the undo stack. The cursor never stays in hidden content: a selection
+ *     put there (undo, a jump) opens its ancestors for good; a change that closes a block around
+ *     the cursor (a task ticked done, an indent under a closed block) keeps that block open while
+ *     the cursor is in it and lets it close when the cursor leaves; folding a block around the
+ *     cursor moves the cursor onto that block. While an input method composes, the block it
+ *     composes in stays on screen whatever closes around it. A text selection that reaches into
+ *     a closed block, or covers one, never deletes what the block hides: the block opens first,
+ *     so the reader sees what would go (rows deleted as blocks take what they hold). A change by someone else that folds or adds rows above keeps the reader's
+ *     row where it is on screen.
  */
 import {
 	type DeltaOp,
@@ -34,7 +49,22 @@ import {
 	srcToPm,
 	titleOf,
 } from "@shared/outline";
-import type { LiveTaskChar } from "@shared/outline-live-protocol";
+import {
+	applyFoldAction,
+	buildFoldTree,
+	FOLD_MARK_KEYS,
+	type FoldAction,
+	type FoldPreview,
+	type FoldSource,
+	type FoldTree,
+	foldHiddenMarks,
+	foldPreview,
+	foldPreviewLine,
+	foldQuestionsUnder,
+	foldSubtreeControl,
+	type MutableFoldView,
+} from "@shared/outline-fold";
+import { LIVE_STATUS_OF_TASK, type LiveTaskChar } from "@shared/outline-live-protocol";
 import { baseKeymap, toggleMark } from "prosemirror-commands";
 import { keymap } from "prosemirror-keymap";
 import { Fragment, type Node as PMNode, Slice } from "prosemirror-model";
@@ -49,8 +79,18 @@ import {
 } from "prosemirror-state";
 import { ReplaceStep } from "prosemirror-transform";
 import { Decoration, DecorationSet, EditorView, type NodeView } from "prosemirror-view";
+import { plainClick, spokenLabel, takeFoldKey } from "../fold-controls";
+import {
+	FOLD_ALL_ICONS,
+	FOLD_HIDDEN_ICONS,
+	iconSvg,
+	LOCK_CHIP_ICON,
+	setIcon,
+	taskIconOf,
+} from "../outline-icons";
 import {
 	applyChrome,
+	type BlockMark,
 	chromeText,
 	createGutter,
 	type Gutter,
@@ -61,6 +101,7 @@ import {
 import {
 	blockDepth,
 	type CmdHost,
+	caretIn,
 	hardBreak,
 	indent,
 	joinBackward,
@@ -80,6 +121,7 @@ import {
 } from "./convert";
 import { htmlToOutline, isOwnClipboardHtml } from "./html-paste";
 import type { BodyChange, ClientView, LiveClient, SelInfo, SelPoint } from "./live-client";
+import { liveFoldSource, liveUnderTask } from "./live-fold";
 import { schema } from "./schema";
 import { type ClientOp, keyBetweenLoose } from "./store";
 
@@ -99,10 +141,62 @@ interface CacheEntry {
 	content: string;
 	body: PMNode;
 	task: LiveTaskChar | null;
+	question: boolean;
 	collapsed: boolean;
 	hidden: number;
+	/** What the frame shows about the folding (`foldAttr`). */
+	fold: string;
 	kids: PMNode[];
 	node: PMNode;
+}
+
+/**
+ * What a block's frame shows about its folding, as the `fold` attribute carries it (a string, so
+ * an unchanged block keeps its node): the quick control, the preview line, the counts of what
+ * the closed block hides. Empty for a block with nothing to say.
+ */
+export function foldAttr(
+	subtree: "expand" | "collapse" | null,
+	preview: FoldPreview | null,
+	hidden: Record<(typeof FOLD_MARK_KEYS)[number], number> | null,
+): string {
+	if (!subtree && !preview && !hidden) return "";
+	const p = preview
+		? `${preview.kind}:${preview.textId}:${preview.rest}:${preview.total}:${preview.more ? 1 : 0}`
+		: "";
+	const h = hidden ? FOLD_MARK_KEYS.map((key) => hidden[key]).join(",") : "";
+	return `${subtree ?? ""}|${p}|${h}`;
+}
+
+/** Transaction meta: whole blocks are deleted as blocks (a block selection), not as text. */
+const WHOLE_BLOCKS = "outlineWholeBlocks";
+
+export interface FoldChrome {
+	subtree: "expand" | "collapse" | null;
+	preview: Pick<FoldPreview, "kind" | "textId" | "rest" | "total" | "more"> | null;
+	/** Counts in {@link FOLD_MARK_KEYS}' order; empty for none. */
+	hidden: number[];
+}
+
+/** {@link foldAttr} read back. */
+export function readFoldAttr(attr: string): FoldChrome {
+	if (!attr) return { subtree: null, preview: null, hidden: [] };
+	const [sub = "", p = "", h = ""] = attr.split("|");
+	const parts = p ? p.split(":") : [];
+	return {
+		subtree: sub === "expand" || sub === "collapse" ? sub : null,
+		preview:
+			parts.length === 5
+				? {
+						kind: parts[0] as FoldPreview["kind"],
+						textId: parts[1] as string,
+						rest: Number(parts[2]),
+						total: Number(parts[3]),
+						more: parts[4] === "1",
+					}
+				: null,
+		hidden: h ? h.split(",").map(Number) : [],
+	};
 }
 
 /** Which blocks a view shows: everything, or the facts view (tasks and what is under them
@@ -119,6 +213,7 @@ interface Rec {
 
 const presenceKey = new PluginKey<DecorationSet>("outline-presence");
 const bselKey = new PluginKey<DecorationSet>("outline-block-selection");
+const reportLineKey = new PluginKey("outline-report-line");
 const TOP = "\u0000top";
 
 function sameArr(a: PMNode[], b: PMNode[]) {
@@ -160,14 +255,24 @@ export type OutlineRefusal = "too-large" | "root" | "connecting";
 export interface ViewOptions {
 	/** The facts view or everything (default). */
 	lens?: OutlineLens;
-	/** Collapsed blocks (shared view state, `view-state.ts`). */
-	collapsed?: Set<string>;
+	/**
+	 * The reader's folding (shared view state, `view-state.ts`): what they closed and what they
+	 * opened, over the page's default view. The view changes these sets itself when the reader
+	 * folds here, and tells `onCollapse`.
+	 */
+	fold?: MutableFoldView;
 	/** Keys that win over the outline keys (focus, collapse all, …). */
 	keys?: Record<string, Command>;
 	/** The bullet was clicked: focus that block. */
 	onBullet?: (id: string) => void;
-	/** A block was folded or unfolded here. */
-	onCollapse?: (id: string) => void;
+	/** The reader folded something here (this view re-projected already). */
+	onCollapse?: () => void;
+	/**
+	 * The reader asked for the questions a closed row hides (its count): they are on screen now;
+	 * the host takes the reader to where they are answered (`under`: the block the first of
+	 * them is under, whose page holds its answer form).
+	 */
+	onQuestions?: (ids: string[], under: string | null) => void;
 	/** The cursor moved to another block. */
 	onSelect?: (blockId: string) => void;
 	/** Block selection changed (empty: left block selection). */
@@ -187,7 +292,13 @@ export interface ViewOptions {
 export class OutlineView implements CmdHost, ClientView {
 	pm: EditorView;
 	nodeCache = new Map<string, CacheEntry>();
-	collapsed = new Set<string>();
+	/** The reader's folding; the surface's own sets when given (`ViewOptions.fold`). */
+	foldView: MutableFoldView = { expanded: new Set(), collapsed: new Set() };
+	/** The page's tree with what is open, as the last projection worked it out. */
+	foldTree: FoldTree | null = null;
+	foldSource: FoldSource | null = null;
+	/** A fold of the reader is being projected: the cursor follows instead of opening it again. */
+	private folding = false;
 	pendingMap = new Map<string, DeltaOp[][] | "reset" | ((s: number) => number)>();
 	composingBlock: string | null = null;
 	compositionDirty = false;
@@ -198,6 +309,21 @@ export class OutlineView implements CmdHost, ClientView {
 	lastSelBlock: string | null = null;
 	/** Block id → its frame's DOM (presence, anchors, PR9's animations). */
 	blockEls = new Map<string, HTMLElement>();
+	/** Block id → its node view: marks change without the document changing. */
+	blockViews = new Map<string, BlockView>();
+	/** Locks and pending changes of the page's blocks (P2 PR 6), from the page's summary. */
+	marks: ReadonlyMap<string, BlockMark> = new Map();
+	/** The page's summary (its unanswered questions among it) arrived; see `setMarks`. */
+	marksKnown = false;
+	/**
+	 * Blocks kept on screen because the cursor is in them while a change closed a block around
+	 * them (a task ticked done with the cursor in its notes): open until the cursor leaves, and
+	 * nothing is stored for it.
+	 */
+	private caretPins: string[] = [];
+	/** The last projection added, removed or folded rows (what can move the rows below). */
+	private rowsChanged = false;
+	private scrollBox: HTMLElement | null = null;
 	/** Block selection: the selected sibling range, anchor and head ids. */
 	blockSel: { anchor: string; head: string } | null = null;
 	lens: OutlineLens;
@@ -226,7 +352,7 @@ export class OutlineView implements CmdHost, ClientView {
 		public mount: HTMLElement,
 		public opts: ViewOptions = {},
 	) {
-		if (opts.collapsed) this.collapsed = opts.collapsed;
+		if (opts.fold) this.foldView = opts.fold;
 		this.lens = opts.lens ?? "all";
 		this.placeholderId = client.newId();
 		client.views.add(this);
@@ -245,10 +371,14 @@ export class OutlineView implements CmdHost, ClientView {
 			handlePaste: (_v, ev) => this.handlePaste(ev),
 			clipboardTextSerializer: (slice) => this.copyText(slice),
 			handleTextInput: (_v, from, to, text) => this.handleTextInput(from, to, text),
-			handleKeyDown: (_v, ev) => this.handleBlockKeys(ev),
+			handleKeyDown: (_v, ev) =>
+				this.handleBlockKeys(ev) || this.swallowFoldRepeat(ev) || this.stepOverHidden(ev),
 			handleScrollToSelection: () => this.noScroll,
 			handleDOMEvents: {
 				compositionstart: () => {
+					// Composing over a selection that reaches into a closed block would delete what
+					// it hides: the block opens and the composition starts at the cursor instead.
+					this.guardSelectionDelete(true);
 					const p = this.locate(this.pm.state.doc, this.pm.state.selection.head);
 					this.composingBlock = p?.blockId ?? null;
 					this.compositionDirty = false;
@@ -261,6 +391,11 @@ export class OutlineView implements CmdHost, ClientView {
 				},
 				focus: () => {
 					this.afterSelection();
+					this.markCursorBlock(true);
+					return false;
+				},
+				blur: () => {
+					this.markCursorBlock(false);
 					return false;
 				},
 				mousedown: () => {
@@ -319,6 +454,12 @@ export class OutlineView implements CmdHost, ClientView {
 		if (!this.destroyed) this.pm.setProps({});
 	}
 
+	/** Work the report lines out again (the words changed, not the document). */
+	refreshDecorations(): void {
+		if (this.destroyed) return;
+		this.pm.dispatch(this.pm.state.tr.setMeta("remote", true));
+	}
+
 	// ─────────────────────────────────────────────────────────────────────────
 	// Plugins
 	// ─────────────────────────────────────────────────────────────────────────
@@ -344,6 +485,10 @@ export class OutlineView implements CmdHost, ClientView {
 				"Alt-ArrowUp": moveBlock(this, -1),
 				"Alt-ArrowDown": moveBlock(this, 1),
 				"Mod-Enter": toggleTask(),
+				// Folding from the keyboard, on the cursor's block: one level, and everything inside
+				// (the arrow and its Alt+click; the frame's controls are no tab stops).
+				"Mod-.": () => this.foldAtCursor(false),
+				"Alt-Enter": () => this.foldAtCursor(true),
 				"Mod-z": undo,
 				"Mod-Shift-z": redo,
 				"Mod-y": redo,
@@ -378,7 +523,69 @@ export class OutlineView implements CmdHost, ClientView {
 				},
 				props: { decorations: (s) => bselKey.getState(s) },
 			}),
+			// Subagent report container lines read in the reader's language and time zone
+			// (display only: the document, and so what is saved and copied, keeps the stored text).
+			new Plugin({
+				key: reportLineKey,
+				props: { decorations: (s) => this.reportLineDecorations(s.doc) },
+				view: () => ({ update: () => this.markCursorBlock() }),
+			}),
 		];
+	}
+
+	private reportLineCache: {
+		doc: PMNode;
+		label: typeof chromeText.reportLine;
+		set: DecorationSet;
+	} | null = null;
+
+	/**
+	 * A report container's line (`chromeText.reportLine`): the paragraph carries the readable
+	 * line as an attribute that CSS draws, and its stored text is wrapped so CSS can hide it. Both
+	 * only while the cursor is elsewhere (`markCursorBlock`): a block being edited shows its text.
+	 */
+	private reportLineDecorations(doc: PMNode): DecorationSet {
+		const cached = this.reportLineCache;
+		if (cached && cached.doc === doc && cached.label === chromeText.reportLine) return cached.set;
+		const decos: Decoration[] = [];
+		doc.descendants((n, pos) => {
+			if (n.type !== N.block) return n.type === N.children;
+			const body = n.child(0);
+			const only = body.childCount === 1 ? body.child(0) : null;
+			if (body.type === N.paragraph && only?.isText && only.marks.length === 0) {
+				const label = chromeText.reportLine(only.text ?? "", n.attrs.id ?? undefined);
+				if (label) {
+					decos.push(
+						Decoration.node(pos + 1, pos + 1 + body.nodeSize, {
+							class: "ob-report-line",
+							"data-report-label": label,
+						}),
+						Decoration.inline(pos + 2, pos + 2 + body.content.size, { class: "ob-report-raw" }),
+					);
+				}
+			}
+			return true;
+		});
+		const set = decos.length ? DecorationSet.create(doc, decos) : DecorationSet.empty;
+		this.reportLineCache = { doc, label: chromeText.reportLine, set };
+		return set;
+	}
+
+	private cursorEl: HTMLElement | null = null;
+
+	/**
+	 * Mark the block the cursor is in while the editor has focus (`.ob-here`): there a report
+	 * line shows its stored text. A class on the block's own frame element, so moving the cursor
+	 * or focus never redraws a body.
+	 */
+	private markCursorBlock(focused = this.pm?.hasFocus() ?? false): void {
+		if (!this.pm) return;
+		const p = focused ? this.locate(this.pm.state.doc, this.pm.state.selection.head) : null;
+		const el = p ? (this.blockEls.get(p.blockId) ?? null) : null;
+		if (el === this.cursorEl && (!el || el.classList.contains("ob-here"))) return;
+		this.cursorEl?.classList.remove("ob-here");
+		el?.classList.add("ob-here");
+		this.cursorEl = el;
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -394,6 +601,61 @@ export class OutlineView implements CmdHost, ClientView {
 		this.pendingMap.clear();
 	}
 
+	/** Show these locks and pending changes on the blocks (the page's pending summary). */
+	/**
+	 * `known`: the page's summary arrived. Until it does, every question on the page counts as
+	 * unanswered for the folding (the blocks above a question are never folded away by mistake:
+	 * at worst an answered one's stay open a moment longer, or for good if the summary never
+	 * comes).
+	 */
+	setMarks(marks: ReadonlyMap<string, BlockMark>, known = true): void {
+		const sig = (m: BlockMark | undefined) =>
+			m
+				? `${m.lockedBy ?? ""}\u0000${m.pending?.join("\u0001") ?? ""}\u0000${m.openQuestion ? 1 : 0}`
+				: "";
+		// What the folding counts of a mark: whether there is a lock, a change, a question.
+		const counted = (m: BlockMark | undefined) =>
+			m ? `${m.lockedBy ? 1 : 0}${m.pending?.length ? 1 : 0}${m.openQuestion ? 1 : 0}` : "000";
+		const old = this.marks;
+		let refold = known !== this.marksKnown;
+		const redraw: string[] = [];
+		for (const id of new Set([...old.keys(), ...marks.keys()])) {
+			const a = old.get(id);
+			const b = marks.get(id);
+			if (sig(a) === sig(b)) continue;
+			redraw.push(id);
+			if (counted(a) !== counted(b)) refold = true;
+		}
+		this.marks = marks;
+		this.marksKnown = known;
+		for (const id of redraw) this.blockViews.get(id)?.renderMarks();
+		// A closed block counts the marks it hides, and a question holds the blocks above it open:
+		// the frames follow when that changed (and only then).
+		if (refold && !this.destroyed && this.pm) this.sync();
+	}
+
+	/**
+	 * The open tasks the facts view leaves out under a block, for its "in progress" marker: id,
+	 * title, checkbox, and whether a change to it waits for confirmation.
+	 */
+	hiddenTasks(
+		id: string,
+	): Array<{ id: string; title: string; task: LiveTaskChar; waiting: boolean }> {
+		const v = this.client.visible;
+		const out: Array<{ id: string; title: string; task: LiveTaskChar; waiting: boolean }> = [];
+		for (const k of v.children(id)) {
+			const task = v.get(k)?.task;
+			if (task !== " " && task !== "/") continue;
+			out.push({
+				id: k,
+				title: titleOf(this.client.textOf(k)).slice(0, 120),
+				task,
+				waiting: (this.marks.get(k)?.pending?.length ?? 0) > 0,
+			});
+		}
+		return out;
+	}
+
 	/** Switch between the facts view and everything. */
 	setLens(lens: OutlineLens): void {
 		if (this.lens === lens) return;
@@ -406,7 +668,7 @@ export class OutlineView implements CmdHost, ClientView {
 		if (this.lens !== "facts") return false;
 		const v = this.client.visible;
 		for (let cur: string | null = this.rootId; cur; cur = v.get(cur)?.parentId ?? null) {
-			if (v.get(cur)?.task) return false;
+			if (v.get(cur)?.task || v.get(cur)?.question) return false;
 		}
 		return true;
 	}
@@ -425,6 +687,30 @@ export class OutlineView implements CmdHost, ClientView {
 		const v = this.client.visible;
 		const facts = this.factsHere();
 		let hiddenTotal = 0;
+		// What is open: the page's default view with the reader's folding over it. The block an
+		// input method composes in stays on screen (its ancestors open, nothing stored).
+		const single = this.surface.kind === "node";
+		const source = liveFoldSource(this.client, {
+			marks: this.marks,
+			questionsKnown: this.marksKnown,
+			...(facts ? { omit: (id) => !!(v.get(id)?.task || v.get(id)?.question) } : {}),
+		});
+		const composing = this.pm?.composing ? this.composingBlock : null;
+		const pinned = composing ? [composing, ...this.caretPins] : this.caretPins;
+		let rowsChanged = false;
+		const tree = single
+			? null
+			: buildFoldTree(
+					source,
+					{
+						rootId: this.rootId,
+						rootDetail: liveUnderTask(this.client, this.rootId),
+						...(pinned.length > 0 ? { pinned } : {}),
+					},
+					this.foldView,
+				);
+		this.foldTree = tree;
+		this.foldSource = source;
 		const staged = new Map<string, CacheEntry>();
 		const changed = new Set<string>();
 		const frozenId = this.pm?.composing ? this.composingBlock : null;
@@ -462,10 +748,10 @@ export class OutlineView implements CmdHost, ClientView {
 			}
 			const kids: PMNode[] = [];
 			let hidden = 0;
-			const single = depth === 0 && this.surface.kind === "node";
 			if (!single)
 				for (const k of v.children(id)) {
-					if (facts && v.get(k)?.task) {
+					// Tasks and questions put to people are process (design §2.1).
+					if (facts && (v.get(k)?.task || v.get(k)?.question)) {
 						hidden += this.countSubtree(k);
 						continue;
 					}
@@ -473,23 +759,46 @@ export class OutlineView implements CmdHost, ClientView {
 					if (n) kids.push(n);
 				}
 			hiddenTotal += hidden;
-			const collapsed = depth > 0 && this.collapsed.has(id) && kids.length > 0;
+			const fn = tree?.nodes.get(id);
+			const collapsed = depth > 0 && kids.length > 0 && fn !== undefined && !fn.open;
+			const fold =
+				fn && tree && depth > 0 && kids.length > 0
+					? foldAttr(
+							foldSubtreeControl(fn),
+							collapsed ? foldPreview(tree, source, id) : null,
+							foldHiddenMarks(fn),
+						)
+					: "";
+			const question = rec.question === true;
+			if (!c || c.collapsed !== collapsed || c.kids.length !== kids.length) rowsChanged = true;
 			let node: PMNode;
 			if (
 				c &&
 				c.body === body &&
 				c.task === rec.task &&
+				c.question === question &&
 				c.collapsed === collapsed &&
 				c.hidden === hidden &&
+				c.fold === fold &&
 				sameArr(c.kids, kids)
 			)
 				node = c.node;
 			else
 				node = N.block.create(
-					{ id, task: rec.task, collapsed, hidden },
+					{ id, task: rec.task, collapsed, hidden, question, fold },
 					kids.length ? [body, N.children.create(null, kids)] : [body],
 				);
-			staged.set(id, { content, body, task: rec.task, collapsed, hidden, kids, node });
+			staged.set(id, {
+				content,
+				body,
+				task: rec.task,
+				question,
+				collapsed,
+				hidden,
+				fold,
+				kids,
+				node,
+			});
 			return node;
 		};
 		const nodes: PMNode[] = [];
@@ -499,6 +808,7 @@ export class OutlineView implements CmdHost, ClientView {
 		}
 		if (!nodes.length) nodes.push(N.block.create({ id: this.placeholderId }, N.paragraph.create()));
 		this.hiddenByLens = hiddenTotal;
+		this.rowsChanged = rowsChanged || staged.size !== this.nodeCache.size;
 		return { doc: N.outline.create(null, nodes), staged, changed };
 	}
 
@@ -530,6 +840,104 @@ export class OutlineView implements CmdHost, ClientView {
 
 	sync() {
 		if (this.destroyed) return;
+		// Not the reader's own folding: what they are reading stays where it is on screen.
+		const anchor = this.folding ? null : this.scrollAnchor();
+		this.project();
+		// A change may have closed a block around the cursor (a task ticked done): while the
+		// person is in the editor it stays open until the cursor leaves it; otherwise the cursor
+		// moves out of it.
+		if (!this.folding) this.keepSelectionVisible(this.pm.hasFocus() ? "hold" : "move");
+		if (anchor && this.rowsChanged) this.restoreScroll(anchor);
+	}
+
+	/**
+	 * The reader folded somewhere else (another view of the page, the toolbar, the stored folding
+	 * arriving): this view follows, and a cursor it hides moves onto the nearest block still
+	 * shown. A block kept open for the cursor stays open unless `action` closes it
+	 * ({@link pinsAfter}); without an action (another view's own folding, the stored folding),
+	 * it stays while the person is in this editor.
+	 */
+	foldChanged(action?: FoldAction): void {
+		if (this.destroyed) return;
+		this.caretPins = action ? this.pinsAfter(action) : this.pm.hasFocus() ? this.caretPins : [];
+		this.folding = true;
+		try {
+			this.sync();
+			this.keepSelectionVisible("move");
+		} finally {
+			this.folding = false;
+		}
+	}
+
+	/** The element that scrolls the editor (found once; the window's when none does). */
+	private scroller(): HTMLElement | null {
+		if (this.scrollBox?.isConnected) return this.scrollBox;
+		this.scrollBox = null;
+		for (let el = this.pm.dom.parentElement; el; el = el.parentElement) {
+			const overflow = getComputedStyle(el).overflowY;
+			if (overflow === "auto" || overflow === "scroll") {
+				this.scrollBox = el;
+				break;
+			}
+		}
+		return this.scrollBox;
+	}
+
+	/**
+	 * The row the reader is at, and where it is on screen: the cursor's row while the editor has
+	 * the keyboard and that row is in view, else the first row in view. Null when the view is not
+	 * on screen. One hit test and one box read, before the projection (the layout is clean then).
+	 */
+	private scrollAnchor(): { id: string; top: number } | null {
+		if (this.noScroll || !this.pm || this.surface.kind !== "focus") return null;
+		const dom = this.pm.dom as HTMLElement;
+		const box = this.scroller();
+		const frame = box
+			? box.getBoundingClientRect()
+			: { top: 0, bottom: window.innerHeight, left: 0, right: window.innerWidth };
+		const top = Math.max(frame.top, 0);
+		const bottom = Math.min(frame.bottom, window.innerHeight);
+		if (bottom - top < 8) return null;
+		const rowOf = (id: string) =>
+			this.blockEls.get(id)?.querySelector<HTMLElement>(":scope > .ob-content > :first-child");
+		if (this.pm.hasFocus()) {
+			const at = this.locate(this.pm.state.doc, this.pm.state.selection.head)?.blockId;
+			const r = at ? rowOf(at)?.getBoundingClientRect() : undefined;
+			if (at && r && r.height > 0 && r.bottom > top && r.top < bottom)
+				return { id: at, top: r.top };
+		}
+		const rect = dom.getBoundingClientRect();
+		if (rect.width === 0 || rect.bottom <= top || rect.top >= bottom) return null;
+		const hit = dom.ownerDocument
+			.elementFromPoint(rect.left + Math.min(rect.width / 2, 120), Math.max(top, rect.top) + 6)
+			?.closest<HTMLElement>(".ob-block");
+		const id = hit && dom.contains(hit) ? hit.dataset.id : undefined;
+		const r = id ? rowOf(id)?.getBoundingClientRect() : undefined;
+		return id && r ? { id, top: r.top } : null;
+	}
+
+	/** Put the anchor row back where it was on screen (or the nearest row above it still shown). */
+	private restoreScroll(anchor: { id: string; top: number }): void {
+		let id: string | null = anchor.id;
+		let rect: DOMRect | undefined;
+		for (let guard = 0; id && guard < 200; guard++) {
+			const el: HTMLElement | null | undefined = this.blockEls
+				.get(id)
+				?.querySelector<HTMLElement>(":scope > .ob-content > :first-child");
+			rect = el?.getClientRects().length ? el.getBoundingClientRect() : undefined;
+			if (rect) break;
+			id = this.foldTree?.nodes.get(id)?.parent ?? this.client.visible.get(id)?.parentId ?? null;
+		}
+		if (!rect) return;
+		const delta = rect.top - anchor.top;
+		if (Math.abs(delta) < 1) return;
+		const box = this.scroller();
+		if (box) box.scrollTop += delta;
+		else window.scrollBy(0, delta);
+	}
+
+	/** Bring the editor's document in line with the block model, the texts and the folding. */
+	private project() {
 		const t0 = performance.now();
 		const { doc: newDoc, staged, changed } = this.buildDoc();
 		const state = this.pm.state;
@@ -590,6 +998,368 @@ export class OutlineView implements CmdHost, ClientView {
 		this.renderPresence();
 		this.stats.syncs++;
 		this.stats.syncMs += performance.now() - t0;
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// Folding
+	// ─────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * The reader folds here: the view state changes, this view re-projects, and a cursor the fold
+	 * hid moves onto the nearest block still shown. True when something changed.
+	 */
+	foldAct(action: FoldAction): boolean {
+		if (this.destroyed || !this.foldTree) return false;
+		// The reader's own folding is not held open against them: a block kept open for the
+		// cursor closes when they close it (nothing was stored for it, so nothing changes there).
+		// Folding anywhere else leaves it open: only the cursor leaving lets it go.
+		const pins = this.pinsAfter(action);
+		const released = pins.length !== this.caretPins.length;
+		if (!applyFoldAction(this.foldTree, this.foldView, action) && !released) return false;
+		this.caretPins = pins;
+		this.folding = true;
+		try {
+			this.sync();
+			this.keepSelectionVisible(action.kind === "reveal" ? "reveal" : "move");
+		} finally {
+			this.folding = false;
+		}
+		this.opts.onCollapse?.();
+		return true;
+	}
+
+	/**
+	 * The blocks still kept open for the cursor after the reader's `action`: one is let go only
+	 * when the action is about a block around it (the arrow or the quick control of the block
+	 * held open, or of one above it) or closes blocks page-wide. Folding elsewhere on the page,
+	 * opening, and bringing a block on screen leave it as it is.
+	 */
+	private pinsAfter(action: FoldAction): string[] {
+		const pins = this.caretPins;
+		if (pins.length === 0) return pins;
+		switch (action.kind) {
+			case "reveal":
+				return pins;
+			case "all":
+				return action.open ? pins : [];
+			case "closeAll":
+			case "level":
+				return [];
+			case "node":
+			case "subtree": {
+				const tree = this.foldTree;
+				if (!tree) return [];
+				const around = (pin: string) => {
+					for (
+						let at = tree.nodes.get(pin)?.parent ?? null;
+						at !== null;
+						at = tree.nodes.get(at)?.parent ?? null
+					)
+						if (at === action.id) return true;
+					return false;
+				};
+				return pins.filter((pin) => !around(pin));
+			}
+		}
+	}
+
+	/** Open or close one block (its arrow). */
+	toggleCollapse(id: string) {
+		this.foldAct({ kind: "node", id });
+	}
+
+	/** Everything inside a block: opened, or back to the default view, as its quick control says. */
+	toggleSubtree(id: string, open?: boolean) {
+		const node = this.foldTree?.nodes.get(id);
+		if (!node) return;
+		// One level of children only: "everything inside" is what the arrow does.
+		const control = foldSubtreeControl(node);
+		if (open === undefined && control === null) return this.toggleCollapse(id);
+		this.foldAct({ kind: "subtree", id, open: open ?? control !== "collapse" });
+	}
+
+	/**
+	 * The count of unanswered questions on a closed row was used: the blocks above each of them
+	 * open, and the host is told which they are (it shows where they are answered).
+	 */
+	openQuestionsUnder(id: string): void {
+		const tree = this.foldTree;
+		if (this.destroyed || !tree || !this.foldSource) return;
+		const ids = foldQuestionsUnder(tree, this.foldSource, id);
+		if (ids.length === 0) return;
+		let changed = false;
+		// (Opening is by each block's own default, so the tree as it was serves them all.)
+		for (const q of ids)
+			if (applyFoldAction(tree, this.foldView, { kind: "reveal", id: q })) changed = true;
+		if (changed) {
+			this.folding = true;
+			try {
+				this.sync();
+			} finally {
+				this.folding = false;
+			}
+			this.opts.onCollapse?.();
+		}
+		this.opts.onQuestions?.(ids, tree.nodes.get(ids[0] as string)?.parent ?? null);
+	}
+
+	/** Mod-. and Alt-Enter: fold the cursor's block; taken only where there is something to fold. */
+	private foldAtCursor(everything: boolean): boolean {
+		const p = this.locate(this.pm.state.doc, this.pm.state.selection.head);
+		const node = p ? this.foldTree?.nodes.get(p.blockId) : undefined;
+		if (!node || node.parent === null || node.kids.length === 0) return false;
+		if (everything) this.toggleSubtree(node.id);
+		else this.toggleCollapse(node.id);
+		return true;
+	}
+
+	/** Mod-. and Alt-Enter held down: one toggle per press (the repeats are swallowed). */
+	private swallowFoldRepeat(ev: KeyboardEvent): boolean {
+		if (!ev.repeat) return false;
+		const mod = ev.ctrlKey || ev.metaKey;
+		const fold = (ev.key === "." && mod && !ev.altKey) || (ev.key === "Enter" && ev.altKey && !mod);
+		if (!fold) return false;
+		ev.preventDefault();
+		return true;
+	}
+
+	/**
+	 * Blocks a change would delete although the reader cannot see them. With a text selection
+	 * (`text`), every block hidden under a closed row that the change removes: whether the row
+	 * itself stays (the selection starts or ends inside its line) or goes with it (the selection
+	 * starts at the very start of its line, or covers the row from a row above — select all
+	 * too). Rows deleted as blocks (a block selection: `deleteBlocks`) take what they hold with
+	 * them, as they always did: only what hides under a closed block that stays counts then.
+	 */
+	private hiddenLoss(before: EditorState, after: PMNode, text: boolean): string[] {
+		const kept = new Set<string>();
+		after.descendants((n) => {
+			if (n.type === N.block) kept.add(n.attrs.id);
+			return n.type === N.block || n.type === N.children;
+		});
+		const lost: string[] = [];
+		// `closed`: the outermost closed block above (the row the reader sees).
+		const walk = (node: PMNode, closed: string | null) => {
+			const id = node.attrs.id as string;
+			if (closed !== null && !kept.has(id) && (text || kept.has(closed))) lost.push(id);
+			if (node.childCount < 2) return;
+			const under = closed ?? (node.attrs.collapsed ? id : null);
+			node.child(1).forEach((kid) => {
+				walk(kid, under);
+			});
+		};
+		before.doc.forEach((n) => {
+			walk(n, null);
+		});
+		return lost;
+	}
+
+	/** Open the closed blocks over `ids` for the reader, keeping the selection as it is. */
+	private showBeforeDelete(ids: readonly string[]): void {
+		if (!this.foldTree) return;
+		let changed = false;
+		const tree = this.foldTree;
+		// (Opening is by each block's own default, so the tree as it was serves them all.)
+		for (const id of ids)
+			if (applyFoldAction(tree, this.foldView, { kind: "reveal", id })) changed = true;
+		if (!changed) return;
+		this.folding = true;
+		try {
+			this.sync();
+		} finally {
+			this.folding = false;
+		}
+		this.opts.onCollapse?.();
+	}
+
+	/**
+	 * Would deleting the selection take hidden blocks with it? Then the closed blocks open and
+	 * nothing is deleted (true). With `collapse`, the selection also becomes a cursor at its head
+	 * (an input method is about to compose there).
+	 */
+	private guardSelectionDelete(collapse = false): boolean {
+		const state = this.pm.state;
+		const sel = state.selection;
+		if (sel.empty || sel.$from.sameParent(sel.$to) || !this.client.editable) return false;
+		const lost = this.hiddenLoss(state, state.tr.deleteSelection().doc, !this.blockSel);
+		if (lost.length === 0) return false;
+		this.showBeforeDelete(lost);
+		if (collapse) {
+			const now = this.pm.state;
+			this.pm.dispatch(
+				now.tr
+					.setSelection(TextSelection.create(now.doc, now.selection.head))
+					.setMeta("remote", true),
+			);
+		}
+		return true;
+	}
+
+	/** Whether a block is folded away under a closed ancestor. */
+	isHidden(id: string): boolean {
+		return this.foldTree?.nodes.get(id)?.visible === false;
+	}
+
+	/**
+	 * Arrow keys at the edge of a closed block step over what it hides: down or right from its
+	 * line goes to the next block on screen, up or left into it from the block after goes to its
+	 * line. Left to the browser, the caret would be looked for past the block's own line, where
+	 * the hidden children and the preview line are. With Shift the selection extends the same way.
+	 */
+	private stepOverHidden(ev: KeyboardEvent): boolean {
+		if (ev.altKey || ev.ctrlKey || ev.metaKey || this.pm.composing) return false;
+		const key = ev.key;
+		const forward = key === "ArrowDown" || key === "ArrowRight";
+		if (!forward && key !== "ArrowUp" && key !== "ArrowLeft") return false;
+		const state = this.pm.state;
+		const sel = state.selection;
+		if (!(sel instanceof TextSelection) || (!sel.empty && !ev.shiftKey)) return false;
+		const $head = sel.$head;
+		const d = blockDepth($head);
+		if (d < 0) return false;
+		const block = $head.node(d);
+		const body = block.child(0);
+		if ($head.parent !== body) return false;
+		const doc = state.doc;
+		const closed = (n: PMNode) => n.childCount > 1 && !!n.attrs.collapsed;
+		const horizontal = key === "ArrowRight" || key === "ArrowLeft";
+		let target: number | null = null;
+		let targetBlock: number | null = null;
+		if (forward) {
+			if (!closed(block)) return false;
+			if (horizontal ? $head.parentOffset !== body.content.size : !this.pm.endOfTextblock("down"))
+				return false;
+			// The next block in document order after this block and all it holds.
+			const after = $head.after(d);
+			doc.nodesBetween(after, doc.content.size, (n, pos) => {
+				if (targetBlock !== null) return false;
+				if (n.type === N.block && pos >= after) {
+					targetBlock = pos;
+					return false;
+				}
+				return true;
+			});
+			// The last block on screen: the caret stays (nothing below but what is hidden).
+			if (targetBlock === null) {
+				ev.preventDefault();
+				return true;
+			}
+			target = (targetBlock as number) + 2;
+		} else {
+			if (horizontal ? $head.parentOffset !== 0 : !this.pm.endOfTextblock("up")) return false;
+			const index = $head.index(d - 1);
+			// The block before on screen: the previous sibling, or the last block it shows.
+			if (index === 0) return false;
+			let prev = $head.node(d - 1).child(index - 1);
+			let prevPos = $head.before(d) - prev.nodeSize;
+			while (prev.childCount > 1 && !prev.attrs.collapsed) {
+				const kids = prev.child(1);
+				const last = kids.lastChild as PMNode;
+				prevPos = prevPos + 1 + prev.child(0).nodeSize + 1 + (kids.content.size - last.nodeSize);
+				prev = last;
+			}
+			if (!closed(prev)) return false;
+			targetBlock = prevPos;
+			target = prevPos + 2 + prev.child(0).content.size;
+		}
+		const at = targetBlock as number;
+		const targetBody = (doc.nodeAt(at) as PMNode).child(0);
+		if (!targetBody.isTextblock) {
+			// A table or an embed: the caret goes where the editor puts one in such a block.
+			if (ev.shiftKey) return false;
+			this.pm.dispatch(state.tr.setSelection(caretIn(doc, at, forward ? 0 : -1)).scrollIntoView());
+			ev.preventDefault();
+			return true;
+		}
+		if (!horizontal) {
+			// Keep the column: the position under (or over) the caret on the target's edge line.
+			const from = this.pm.coordsAtPos($head.pos);
+			const box = this.pm.nodeDOM(at + 1);
+			if (box instanceof HTMLElement) {
+				const r = box.getBoundingClientRect();
+				const hit = this.pm.posAtCoords({
+					left: from.left,
+					top: forward ? r.top + 2 : r.bottom - 2,
+				});
+				const lo = at + 2;
+				const hi = lo + targetBody.content.size;
+				if (hit && hit.pos >= lo && hit.pos <= hi) target = hit.pos;
+			}
+		}
+		const next = ev.shiftKey
+			? TextSelection.create(doc, sel.anchor, target as number)
+			: TextSelection.create(doc, target as number);
+		this.pm.dispatch(state.tr.setSelection(next).scrollIntoView());
+		ev.preventDefault();
+		return true;
+	}
+
+	private keepingVisible = false;
+
+	/**
+	 * The cursor never stays in hidden content. `reveal`: the blocks around it open for good (a
+	 * jump, undo putting a selection back: the person meant to be there). `hold`: they stay open
+	 * while the cursor is in them (a change closed a block around the cursor: a task ticked done,
+	 * an indent under a closed block). `move`: the cursor goes to the end of the nearest block
+	 * still shown (the reader folded a block around it, or is not in the editor at all). Never while an input method composes: its
+	 * block is kept on screen by the projection.
+	 */
+	private keepSelectionVisible(mode: "reveal" | "hold" | "move"): void {
+		if (this.destroyed || this.keepingVisible || !this.foldTree || this.pm.composing) return;
+		const sel = this.pm.state.selection;
+		if (!(sel instanceof TextSelection) && !(sel instanceof NodeSelection)) return;
+		const doc = this.pm.state.doc;
+		const tree = this.foldTree;
+		const hidden: string[] = [];
+		for (const pos of sel.anchor === sel.head ? [sel.head] : [sel.head, sel.anchor]) {
+			const at = this.locate(doc, pos)?.blockId;
+			if (at && tree.nodes.get(at)?.visible === false) hidden.push(at);
+		}
+		const head = hidden[0];
+		if (head === undefined) return;
+		this.keepingVisible = true;
+		try {
+			if (mode === "hold") {
+				// Open while the cursor is in it; nothing stored (`afterSelection` lets go).
+				this.caretPins = hidden;
+				this.folding = true;
+				try {
+					this.sync();
+				} finally {
+					this.folding = false;
+				}
+				return;
+			}
+			if (mode === "reveal") {
+				let changed = false;
+				for (const id of hidden) {
+					if (!this.foldTree) break;
+					if (applyFoldAction(this.foldTree, this.foldView, { kind: "reveal", id })) {
+						changed = true;
+						// The next block's ancestors are read from the tree as it is now.
+						this.folding = true;
+						try {
+							this.sync();
+						} finally {
+							this.folding = false;
+						}
+					}
+				}
+				if (changed) this.opts.onCollapse?.();
+				return;
+			}
+			// The nearest ancestor on screen: the cursor at the end of its body.
+			let at: string | null = head;
+			while (at !== null && tree.nodes.get(at)?.visible === false)
+				at = tree.nodes.get(at)?.parent ?? null;
+			const pos = at === null ? null : findBlockPos(doc, at);
+			if (pos == null) return;
+			this.pm.dispatch(
+				this.pm.state.tr.setSelection(caretIn(doc, pos, -1)).setMeta("remote", true),
+			);
+		} finally {
+			this.keepingVisible = false;
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -687,6 +1457,12 @@ export class OutlineView implements CmdHost, ClientView {
 		}
 		if (p.blockId === this.lastSelBlock) return;
 		this.lastSelBlock = p.blockId;
+		// The cursor left a block that was kept open for it: what closed around it closes now
+		// (and holds again if the cursor is still inside).
+		if (this.caretPins.length > 0 && !this.caretPins.includes(p.blockId) && !this.keepingVisible) {
+			this.caretPins = [];
+			this.sync();
+		}
 		this.opts.onSelect?.(p.blockId);
 	}
 
@@ -709,13 +1485,16 @@ export class OutlineView implements CmdHost, ClientView {
 			if (!sel) continue;
 			const style = `--peer:${peer.color}`;
 			if ("b" in sel) {
+				// An agent's cursor is always whole blocks: the task it holds, what it just wrote
+				// (P2 PR 10b); drawn as a person's block selection is.
+				const attrs = peer.agent
+					? { class: "ob-peer-bsel ob-agent-bsel", style, "data-agent": peer.name || "agent" }
+					: { class: "ob-peer-bsel", style };
 				for (const id of sel.b) {
 					const bpos = findBlockPos(doc, id);
 					if (bpos == null) continue;
 					const block = doc.nodeAt(bpos) as PMNode;
-					decos.push(
-						Decoration.node(bpos, bpos + block.nodeSize, { class: "ob-peer-bsel", style }),
-					);
+					decos.push(Decoration.node(bpos, bpos + block.nodeSize, attrs));
 				}
 				continue;
 			}
@@ -869,6 +1648,19 @@ export class OutlineView implements CmdHost, ClientView {
 	/** Delete whole blocks (with their subtrees) in one transaction. */
 	deleteBlocks(ids: readonly string[]) {
 		const tr = this.pm.state.tr;
+		// Where the cursor goes: the end of the block shown before the first one deleted (not
+		// into what a closed block before it hides).
+		let target: string | null = null;
+		const first = ids.length > 0 ? findBlockPos(tr.doc, ids[0] as string) : null;
+		if (first != null) {
+			const $p = tr.doc.resolve(first);
+			if ($p.index() > 0) {
+				let prev = $p.parent.child($p.index() - 1);
+				while (prev.childCount > 1 && !prev.attrs.collapsed)
+					prev = prev.child(1).lastChild as PMNode;
+				target = prev.attrs.id;
+			} else if ($p.depth > 1) target = $p.node($p.depth - 1).attrs.id;
+		}
 		for (const id of [...ids].reverse()) {
 			const pos = findBlockPos(tr.doc, id);
 			if (pos == null) continue;
@@ -878,10 +1670,14 @@ export class OutlineView implements CmdHost, ClientView {
 				tr.delete($p.before(), $p.after());
 			else tr.delete(pos, pos + n.nodeSize);
 		}
-		const near = Math.max(0, Math.min(tr.mapping.map(tr.selection.from), tr.doc.content.size));
-		tr.setSelection(TextSelection.near(tr.doc.resolve(near), -1));
+		const at = target === null ? null : findBlockPos(tr.doc, target);
+		if (at != null) tr.setSelection(caretIn(tr.doc, at, -1));
+		else {
+			const near = Math.max(0, Math.min(tr.mapping.map(tr.selection.from), tr.doc.content.size));
+			tr.setSelection(TextSelection.near(tr.doc.resolve(near), -1));
+		}
 		this.blockSel = null;
-		this.pm.dispatch(tr);
+		this.pm.dispatch(tr.setMeta(WHOLE_BLOCKS, true));
 		this.setBlockSelection(null);
 	}
 
@@ -1069,8 +1865,10 @@ export class OutlineView implements CmdHost, ClientView {
 			content,
 			body,
 			task: node.attrs.task ?? null,
+			question: node.attrs.question === true,
 			collapsed: node.attrs.collapsed,
 			hidden: node.attrs.hidden ?? 0,
+			fold: node.attrs.fold ?? "",
 			kids,
 			node,
 		});
@@ -1165,6 +1963,8 @@ export class OutlineView implements CmdHost, ClientView {
 		let state = before.apply(tr);
 		if (tr.getMeta("remote") || !tr.docChanged) {
 			this.pm.updateState(state);
+			// A selection put into hidden content (undo, a jump): the blocks around it open.
+			if (tr.selectionSet && !this.folding) this.keepSelectionVisible("reveal");
 			if (tr.selectionSet) this.afterSelection();
 			if (!this.pm.composing && this.composingBlock) this.endComposition();
 			return;
@@ -1176,6 +1976,24 @@ export class OutlineView implements CmdHost, ClientView {
 		const fast = this.bodyOnly(tr);
 		// Shown from an HTTP read, not live yet: typing is queued, structure waits.
 		if (!fast && this.client.provisional) return this.refuse(before, "connecting");
+		// A selection reaching into a closed block: typing over it, deleting, cutting or pasting
+		// over it would take what the block hides. The block opens instead and nothing changes;
+		// the same key again deletes what the reader now sees.
+		if (
+			!fast &&
+			!before.selection.empty &&
+			!before.selection.$from.sameParent(before.selection.$to)
+		) {
+			// (Whole blocks deleted as blocks take what they hold: `deleteBlocks`.)
+			const text = !tr.getMeta(WHOLE_BLOCKS) && !this.blockSel;
+			const lost = this.hiddenLoss(before, state.doc, text);
+			if (lost.length > 0) {
+				this.stats.refused++;
+				this.pm.updateState(before);
+				this.showBeforeDelete(lost);
+				return;
+			}
+		}
 		if (!fast) state = this.fixIds(state);
 		this.pm.updateState(state);
 		if (fast && this.pm.composing && fast.length === 1 && fast[0] === this.composingBlock) {
@@ -1245,8 +2063,31 @@ export class OutlineView implements CmdHost, ClientView {
 			// those blocks through the mapping, keeping the cursor.
 			for (const [id, f] of rebased) this.pendingMap.set(id, f);
 			this.sync();
+		} else if (!fast && this.foldMayChange(ops)) {
+			// A structural edit changes what folds (a task ticked done closes, a block indented
+			// under a closed one is hidden): the frames follow at once, and a block closed around
+			// the cursor stays open while the cursor is in it.
+			this.sync();
 		}
 		this.afterSelection();
+	}
+
+	/**
+	 * Whether a structural edit can change what a frame shows of the folding. New blocks without
+	 * children under a block that is open and on screen cannot (Enter, a paste of plain lines):
+	 * the projection is skipped for them.
+	 */
+	private foldMayChange(ops: readonly ClientOp[]): boolean {
+		const tree = this.foldTree;
+		if (!tree) return true;
+		for (const op of ops) {
+			if (op.t !== "i") return true;
+			const parent = tree.nodes.get(op.p);
+			if (!parent || parent.kids.length === 0 || !parent.open || !parent.visible) return true;
+			// In the facts view a new task is left out (its parent counts it).
+			if (op.task && this.lens === "facts") return true;
+		}
+		return false;
 	}
 
 	/** Composition ended: what was typed goes into Yjs, rebased over what arrived meanwhile. */
@@ -1453,11 +2294,18 @@ export class OutlineView implements CmdHost, ClientView {
 		return false;
 	}
 
-	toggleCollapse(id: string) {
-		if (this.collapsed.has(id)) this.collapsed.delete(id);
-		else this.collapsed.add(id);
-		this.sync();
-		this.opts.onCollapse?.(id);
+	/** A block's first line as a preview shows it (plain text; a mention reads as its label). */
+	previewText(body: PMNode): string {
+		const text = body.textBetween(0, body.content.size, "\n", (leaf) =>
+			leaf.type === N.mention
+				? this.mention(leaf.attrs.ref, leaf.attrs.label)
+				: leaf.type === N.hard_break
+					? "\n"
+					: "",
+		);
+		const line = text.split("\n")[0] ?? "";
+		// A subagent report's container line reads as people read it.
+		return foldPreviewLine(chromeText.reportLine(line) ?? line);
 	}
 
 	/** Text a mention shows (`chrome.ts`). */
@@ -1487,11 +2335,30 @@ export function findBlockPos(doc: PMNode, id: string): number | null {
 	return found;
 }
 
+/**
+ * The block with `id` among a block's children, or one level below them (a report's summary
+ * stands under its first heading): where a preview line's text comes from.
+ */
+function findUnder(block: PMNode, id: string): PMNode | null {
+	if (block.childCount < 2) return null;
+	const kids = block.child(1);
+	for (let i = 0; i < kids.childCount; i++) if (kids.child(i).attrs.id === id) return kids.child(i);
+	for (let i = 0; i < kids.childCount; i++) {
+		const kid = kids.child(i);
+		if (kid.childCount < 2) continue;
+		const under = kid.child(1);
+		for (let j = 0; j < under.childCount; j++)
+			if (under.child(j).attrs.id === id) return under.child(j);
+	}
+	return null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Node views
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** A block's frame: folding arrow, bullet, checkbox; native DOM (`chrome.ts`). */
+/** A block's frame: folding arrow and one marker (bullet, checkbox or question mark), with a
+ * focus handle at the row's end where there is no bullet; native DOM (`chrome.ts`). */
 class BlockView implements NodeView {
 	dom: HTMLElement;
 	contentDOM: HTMLElement;
@@ -1506,16 +2373,30 @@ class BlockView implements NodeView {
 		this.dom = document.createElement("div");
 		this.dom.className = "ob-block";
 		this.g = createGutter();
+		// The arrow opens or closes one level; with Alt, everything inside (as an outline plan's
+		// arrow does). A click with Ctrl, Cmd or Shift is not a toggle.
+		const fold = (alt: boolean) => {
+			const id = this.node.attrs.id as string;
+			if (alt) this.owner.toggleSubtree(id);
+			else this.owner.toggleCollapse(id);
+		};
 		this.g.arrow.addEventListener("mousedown", (e) => {
 			e.preventDefault();
-			this.owner.toggleCollapse(this.node.attrs.id);
+			if (plainClick(e)) fold(e.altKey);
 		});
-		this.g.bullet.addEventListener("mousedown", (e) => {
+		this.g.arrow.addEventListener("keydown", (e) => {
+			takeFoldKey(e, fold);
+		});
+		// The bullet focuses its block; on a row without one (a task, a question) the focus handle
+		// at the row's end does.
+		const focus = (e: MouseEvent) => {
 			e.preventDefault();
 			const id = this.node.attrs.id as string;
 			if (this.owner.opts.onBullet) this.owner.opts.onBullet(id);
 			else this.owner.toggleCollapse(id);
-		});
+		};
+		this.g.bullet.addEventListener("mousedown", focus);
+		this.g.zoom.addEventListener("mousedown", focus);
 		this.g.check.addEventListener("mousedown", (e) => {
 			e.preventDefault();
 			const task = this.node.attrs.task as LiveTaskChar | null;
@@ -1528,11 +2409,121 @@ class BlockView implements NodeView {
 		this.chip = document.createElement("span");
 		this.chip.className = "ob-hidden";
 		this.chip.contentEditable = "false";
-		this.dom.append(this.g.el, this.chip, this.contentDOM);
+		this.chip.addEventListener("mousedown", (e) => {
+			e.preventDefault();
+			if (this.chip.dataset.open) this.toggleTaskList();
+		});
+		this.marksEl = document.createElement("span");
+		this.marksEl.className = "ob-marks";
+		this.marksEl.contentEditable = "false";
+		this.dom.append(this.g.el, this.chip, this.g.zoom, this.marksEl, this.contentDOM);
 		this.render();
 	}
 
 	private chip: HTMLElement;
+	private marksEl: HTMLElement;
+	private subtreeEl: HTMLElement | null = null;
+	private preview: { el: HTMLElement; text: HTMLElement; label: HTMLElement } | null = null;
+	/** The folding the frame last drew (`fold` attribute and the texts it showed). */
+	private foldKey = "";
+	private taskList: HTMLElement | null = null;
+
+	/** The lock and pending marks of the block (`OutlineView.marks`). */
+	renderMarks() {
+		const mark = this.owner.marks.get(this.node.attrs.id as string);
+		this.marksEl.replaceChildren();
+		if (mark?.lockedBy) {
+			const lock = document.createElement("span");
+			lock.className = "ob-lock";
+			lock.dataset.testid = "outline-lock-badge";
+			// The lock's icon, then who: the same chip the read-only tree shows.
+			lock.append(iconSvg(LOCK_CHIP_ICON, lock.ownerDocument), chromeText.locked(mark.lockedBy));
+			this.marksEl.append(lock);
+		}
+		if (mark?.pending?.length) {
+			const pending = document.createElement("span");
+			pending.className = "ob-pending";
+			pending.dataset.testid = "outline-pending-badge";
+			pending.textContent = chromeText.pending;
+			pending.title = mark.pending.join(", ");
+			this.marksEl.append(pending);
+		}
+		// What the closed block hides that must not be missed: each kind's icon and its count.
+		const hidden = readFoldAttr(this.node.attrs.fold ?? "").hidden;
+		FOLD_MARK_KEYS.forEach((kind, i) => {
+			const count = hidden[i] ?? 0;
+			if (count <= 0) return;
+			const chip = document.createElement("span");
+			chip.className = "ob-fold-hidden";
+			chip.dataset.testid = "outline-fold-hidden";
+			chip.dataset.kind = kind;
+			const label = chromeText.foldHidden[kind](count);
+			chip.title = label;
+			chip.setAttribute("role", "img");
+			chip.setAttribute("aria-label", label);
+			chip.append(iconSvg(FOLD_HIDDEN_ICONS[kind], chip.ownerDocument), String(count));
+			if (kind === "question") {
+				// The questions it hides are one step away: the count opens them and where they
+				// are answered.
+				const open = () => this.owner.openQuestionsUnder(this.node.attrs.id as string);
+				chip.setAttribute("role", "button");
+				chip.tabIndex = -1;
+				chip.addEventListener("mousedown", (e) => {
+					e.preventDefault();
+					if (plainClick(e)) open();
+				});
+				chip.addEventListener("keydown", (e) => {
+					takeFoldKey(e, open);
+				});
+			}
+			this.marksEl.append(chip);
+		});
+		this.marksEl.style.display = this.marksEl.childElementCount > 0 ? "" : "none";
+		if (this.taskList) this.fillTaskList(this.taskList);
+	}
+
+	/** Open or close the list of the open tasks the facts view leaves out under the block. */
+	private toggleTaskList() {
+		if (this.taskList) {
+			this.taskList.remove();
+			this.taskList = null;
+			return;
+		}
+		const list = document.createElement("div");
+		list.className = "ob-task-list";
+		list.contentEditable = "false";
+		list.dataset.testid = "outline-in-progress-list";
+		this.fillTaskList(list);
+		this.chip.after(list);
+		this.taskList = list;
+	}
+
+	private fillTaskList(list: HTMLElement) {
+		list.replaceChildren();
+		for (const task of this.owner.hiddenTasks(this.node.attrs.id as string)) {
+			const item = document.createElement("div");
+			item.className = "ob-task-item";
+			item.setAttribute("role", "button");
+			item.dataset.taskId = task.id;
+			// The task's checkbox, as the tree's list shows it, then its title.
+			const icon = document.createElement("span");
+			icon.className = "ob-task-icon";
+			icon.setAttribute("role", "img");
+			icon.setAttribute("aria-label", chromeText.status[LIVE_STATUS_OF_TASK[task.task]]);
+			icon.append(iconSvg(taskIconOf(task.task), icon.ownerDocument));
+			const label = document.createElement("span");
+			label.className = "ob-task-title";
+			label.textContent = `${task.title}${task.waiting ? ` · ${chromeText.waiting}` : ""}`;
+			item.append(icon, label);
+			item.addEventListener("mousedown", (e) => {
+				e.preventDefault();
+				this.taskList?.remove();
+				this.taskList = null;
+				this.owner.opts.onBullet?.(task.id);
+			});
+			list.append(item);
+		}
+	}
 
 	private render() {
 		const n = this.node;
@@ -1540,17 +2531,165 @@ class BlockView implements NodeView {
 		if (this.dom.dataset.id && this.dom.dataset.id !== id) {
 			if (this.owner.blockEls.get(this.dom.dataset.id) === this.dom)
 				this.owner.blockEls.delete(this.dom.dataset.id);
+			if (this.owner.blockViews.get(this.dom.dataset.id) === this)
+				this.owner.blockViews.delete(this.dom.dataset.id);
 		}
 		this.dom.dataset.id = id;
-		if (id) this.owner.blockEls.set(id, this.dom);
+		if (id) {
+			this.owner.blockEls.set(id, this.dom);
+			this.owner.blockViews.set(id, this);
+		}
+		const hasKids = n.childCount > 1;
+		const collapsed = hasKids && !!n.attrs.collapsed;
+		// The row's title names its folding controls (only rows with children have any).
+		const title = hasKids
+			? this.owner.previewText(n.child(0)).slice(0, 80) || chromeText.foldUntitled
+			: "";
 		applyChrome(this.dom, this.g, {
-			hasKids: n.childCount > 1,
-			collapsed: !!n.attrs.collapsed,
+			hasKids,
+			collapsed,
 			task: n.attrs.task ?? null,
+			question: n.attrs.question === true,
+			title,
 		});
+		// A body that is one box (a code block, a table): the quick control sits over its corner.
+		const box = n.child(0).type === N.code_block || n.child(0).type === N.table;
+		if (box !== (this.dom.dataset.box === "1")) {
+			if (box) this.dom.dataset.box = "1";
+			else delete this.dom.dataset.box;
+		}
+		this.renderFold(n, collapsed, title);
 		const hidden = (n.attrs.hidden as number) ?? 0;
-		this.chip.textContent = hidden > 0 ? chromeText.hidden(hidden) : "";
+		const open = hidden > 0 ? this.owner.hiddenTasks(id).length : 0;
+		// Open tasks: the "in progress" marker, which lists them. Only done or cancelled ones: how
+		// many blocks the facts view leaves out, as before (`+N under tasks`).
+		this.chip.textContent =
+			open > 0 ? chromeText.hidden(open) : hidden > 0 ? chromeText.hiddenUnder(hidden) : "";
 		this.chip.style.display = hidden > 0 ? "" : "none";
+		if (open > 0) {
+			this.chip.dataset.open = "1";
+			this.chip.setAttribute("role", "button");
+			this.chip.title = chromeText.hiddenHint;
+		} else {
+			delete this.chip.dataset.open;
+			this.chip.removeAttribute("role");
+			this.chip.title = "";
+		}
+		if (open === 0 && this.taskList) {
+			this.taskList.remove();
+			this.taskList = null;
+		}
+		this.renderMarks();
+	}
+
+	/** The quick control and the preview line, from the block's `fold` attribute. */
+	private renderFold(n: PMNode, collapsed: boolean, title: string) {
+		const fold = readFoldAttr((n.attrs.fold as string) ?? "");
+		const preview = collapsed ? fold.preview : null;
+		let text = "";
+		if (preview) {
+			const from = findUnder(n, preview.textId);
+			if (from) text = this.owner.previewText(from.child(0));
+		}
+		const label = preview
+			? preview.kind === "report"
+				? chromeText.foldReportAll(preview.total)
+				: preview.rest > 0
+					? chromeText.foldMore(preview.rest)
+					: preview.more
+						? chromeText.foldOpen
+						: ""
+			: "";
+		// Drawn again only when what it shows changed (frames re-render on every edit below them).
+		const key = `${n.attrs.fold}\u0000${collapsed}\u0000${title}\u0000${text}\u0000${label}\u0000${chromeText.foldShowInside}`;
+		if (key === this.foldKey) return;
+		this.foldKey = key;
+		const sub = fold.subtree;
+		if (sub) {
+			const el = this.subtreeControl();
+			setIcon(el, FOLD_ALL_ICONS[sub]);
+			el.dataset.foldSubtree = sub;
+			el.setAttribute("aria-expanded", String(sub === "collapse"));
+			el.setAttribute("aria-label", chromeText.foldSubtree(title));
+			el.title = sub === "collapse" ? chromeText.foldSubtreeCollapse : chromeText.foldSubtreeExpand;
+			if (!el.parentNode) this.marksEl.before(el);
+		} else if (this.subtreeEl?.parentNode) {
+			// Its focus (assistive technology) goes to the arrow, which stays.
+			if (this.subtreeEl.ownerDocument.activeElement === this.subtreeEl) this.g.arrow.focus();
+			this.subtreeEl.remove();
+		}
+		if (preview) {
+			const line = this.previewLine();
+			line.text.textContent = text;
+			line.text.style.display = text ? "" : "none";
+			line.label.textContent = label;
+			line.label.style.display = label ? "" : "none";
+			line.el.dataset.foldPreview = preview.kind;
+			line.el.setAttribute("aria-expanded", "false");
+			line.el.setAttribute(
+				"aria-label",
+				`${chromeText.foldShowInside}: ${text || title}${label ? ` (${spokenLabel(label)})` : ""}`,
+			);
+			if (!line.el.parentNode) this.dom.append(line.el);
+		} else if (this.preview?.el.parentNode) {
+			// The line goes when it is used: its focus moves to the row's own control.
+			const el = this.preview.el;
+			if (el.ownerDocument.activeElement === el)
+				(sub && this.subtreeEl ? this.subtreeEl : this.g.arrow).focus();
+			el.remove();
+		}
+	}
+
+	/**
+	 * The row's quick control (everything inside it, expanded or back to the default view), made
+	 * when the row first needs one: most blocks never do, and a page has thousands of frames.
+	 * Always drawn where it applies (touch has no hover); a control for assistive technology,
+	 * not a tab stop.
+	 */
+	private subtreeControl(): HTMLElement {
+		if (this.subtreeEl) return this.subtreeEl;
+		const el = document.createElement("span");
+		el.className = "ob-subtree";
+		el.contentEditable = "false";
+		el.setAttribute("role", "button");
+		el.tabIndex = -1;
+		el.addEventListener("mousedown", (e) => {
+			e.preventDefault();
+			if (plainClick(e)) this.owner.toggleSubtree(this.node.attrs.id);
+		});
+		el.addEventListener("keydown", (e) => {
+			takeFoldKey(e, () => this.owner.toggleSubtree(this.node.attrs.id));
+		});
+		this.subtreeEl = el;
+		return el;
+	}
+
+	/**
+	 * What a closed block holds, as one line in its children's place, made when the block is
+	 * first closed: frame DOM, never part of the document (nothing to type into, select, save or
+	 * undo).
+	 */
+	private previewLine(): { el: HTMLElement; text: HTMLElement; label: HTMLElement } {
+		if (this.preview) return this.preview;
+		const el = document.createElement("div");
+		el.className = "ob-preview";
+		el.contentEditable = "false";
+		el.setAttribute("role", "button");
+		el.tabIndex = -1;
+		const text = document.createElement("span");
+		text.className = "ob-preview-text";
+		const label = document.createElement("span");
+		label.className = "ob-preview-label";
+		el.append(text, label);
+		el.addEventListener("mousedown", (e) => {
+			e.preventDefault();
+			if (plainClick(e)) this.owner.toggleSubtree(this.node.attrs.id, true);
+		});
+		el.addEventListener("keydown", (e) => {
+			takeFoldKey(e, () => this.owner.toggleSubtree(this.node.attrs.id, true));
+		});
+		this.preview = { el, text, label };
+		return this.preview;
 	}
 
 	update(node: PMNode) {
@@ -1563,6 +2702,7 @@ class BlockView implements NodeView {
 	destroy() {
 		const id = this.dom.dataset.id;
 		if (id && this.owner.blockEls.get(id) === this.dom) this.owner.blockEls.delete(id);
+		if (id && this.owner.blockViews.get(id) === this) this.owner.blockViews.delete(id);
 	}
 
 	ignoreMutation(m: MutationRecord | { type: "selection"; target: Node }) {
@@ -1571,7 +2711,16 @@ class BlockView implements NodeView {
 	}
 
 	stopEvent(e: Event) {
-		return this.g.el.contains(e.target as Node) || this.chip.contains(e.target as Node);
+		const target = e.target as Node;
+		return (
+			this.g.el.contains(target) ||
+			this.g.zoom.contains(target) ||
+			(this.subtreeEl?.contains(target) ?? false) ||
+			(this.preview?.el.contains(target) ?? false) ||
+			this.chip.contains(target) ||
+			this.marksEl.contains(target) ||
+			(this.taskList?.contains(target) ?? false)
+		);
 	}
 }
 

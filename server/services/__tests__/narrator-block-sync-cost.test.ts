@@ -4,7 +4,7 @@
  * and search text is written by the index job, not the writer.
  */
 
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 
 const { db, sqlite } = getTestDb();
@@ -17,13 +17,17 @@ const { narratorStore } = await import("../narrator-store");
 const { settings } = await import("../../lib/settings");
 const blockSync = await import("../narrator-block-sync");
 const blockIndex = await import("../narrator-block-index");
+const workerPool = await import("../../lib/db-worker/pool");
 const { runBlockIndexQueueSlice } = await import("../../lib/db-worker/block-backfill-query");
+const readIndex: import("../narrator-block-index").IndexQueueReader = async (params) =>
+	runBlockIndexQueueSlice(sqlite, params);
 const { ensureFts } = await import("../../db/fts");
 
 const NOW = "2026-10-01T00:00:00.000Z";
 ensureFts(sqlite, { wasClean: true });
 
 beforeEach(() => {
+	settings.narratorBlocks.compactJson = false;
 	cleanDb(sqlite);
 	sqlite.run("DELETE FROM narrator_blocks_fts");
 	blockIndex.resetBlockIndexForTests();
@@ -124,7 +128,7 @@ async function parallelTools(count: number, narratorId = "n1") {
 describe("a ledger change re-derives only the tool blocks whose attempt moved", () => {
 	test("settling one tool queues only its block's search text", async () => {
 		const { stepId, calls } = await parallelTools(4);
-		await blockIndex.drainBlockIndexQueue();
+		await blockIndex.drainBlockIndexQueue(readIndex);
 		expect(owed()).toEqual([]);
 		for (const [i, call] of calls.entries()) {
 			await narratorStore.settleTool(
@@ -134,7 +138,7 @@ describe("a ledger change re-derives only the tool blocks whose attempt moved", 
 				call.toolCallId,
 			);
 			expect(owed()).toEqual([toolBlock(stepId, call.toolUseId)]);
-			await blockIndex.drainBlockIndexQueue();
+			await blockIndex.drainBlockIndexQueue(readIndex);
 		}
 		expect(queued()).toEqual([]);
 		for (let i = 0; i < calls.length; i++) expect(indexed(`variety ${i}`)).toHaveLength(1);
@@ -224,7 +228,7 @@ describe("a ledger change re-derives only the tool blocks whose attempt moved", 
 
 	test("a ledger write outside the store is re-derived by its queued sync, content unread", async () => {
 		const { stepId, calls } = await parallelTools(2);
-		await blockIndex.drainBlockIndexQueue();
+		await blockIndex.drainBlockIndexQueue(readIndex);
 		sqlite.run("UPDATE narrator_tool_calls SET status = 'success', output_json = ? WHERE id = ?", [
 			JSON.stringify("quince jelly"),
 			calls[1].toolCallId ?? "",
@@ -328,7 +332,7 @@ describe("the index job", () => {
 			return slice;
 		});
 		expect(written).toBeGreaterThan(0);
-		await blockIndex.drainBlockIndexQueue();
+		await blockIndex.drainBlockIndexQueue(readIndex);
 		expect(indexed("greengage")).toHaveLength(1);
 		expect(indexed("damson")).toEqual([]);
 		expect(owed()).toEqual([]);
@@ -336,6 +340,12 @@ describe("the index job", () => {
 
 	test("started by a write, it writes what is owed in paced slices", async () => {
 		const { stepId, calls } = await parallelTools(3);
+		// Explicit unit fixture: the real scheduler still dispatches to the worker interface;
+		// only this test substitutes a reader for its private in-memory database.
+		const read = spyOn(workerPool, "runReadTask").mockImplementation(async (_path, params) => {
+			if (params.kind !== "blockIndexQueueSlice") throw new Error("unexpected worker task");
+			return (await readIndex(params)) as never;
+		});
 		blockIndex.setBlockIndexAutoRunForTests(true);
 		try {
 			for (const [i, call] of calls.entries())
@@ -348,8 +358,10 @@ describe("the index job", () => {
 			const deadline = Date.now() + 5_000;
 			while (owed().length && Date.now() < deadline)
 				await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(read).toHaveBeenCalled();
 		} finally {
 			blockIndex.setBlockIndexAutoRunForTests(false);
+			read.mockRestore();
 		}
 		expect(owed()).toEqual([]);
 		for (let i = 0; i < calls.length; i++) expect(indexed(`cherry ${i}`)).toHaveLength(1);

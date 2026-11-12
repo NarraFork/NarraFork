@@ -1,3 +1,4 @@
+import { isMediaContentBlock, type MediaRef } from "@shared/media-attachments";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { contextUpdateOf } from "@shared/prefix-context";
 import { buildHistory, resolveHistoryToolLoadingStrategy } from "../../lib/agent";
@@ -7,7 +8,7 @@ import {
 	projectFileReferenceText,
 } from "../../lib/agent/file-reference-projection";
 import { historyTail } from "../../lib/agent/history-build";
-import type { BuiltHistory } from "../../lib/agent/provider";
+import type { BuiltHistory, DbToolCall } from "../../lib/agent/provider";
 import { projectFrozenSenders } from "../../lib/agent/sender-context";
 import {
 	findCurrentSenderMessage,
@@ -32,6 +33,15 @@ export type RuntimeHistoryMessage = SenderMessage & {
 	injectionConsumedAt?: Date | string | null;
 };
 
+/** Legacy structural inputs are accepted, but only detached model rows may be rewritten. */
+export type RuntimeHistorySourceMessage = Readonly<
+	Omit<RuntimeHistoryMessage, "toolCalls" | "creator" | "narrator">
+> & {
+	readonly toolCalls?: readonly Readonly<DbToolCall>[];
+	readonly creator?: Readonly<{ username: string }> | null;
+	readonly narrator?: Readonly<{ title?: string | null }> | null;
+};
+
 /** The one "top-level message" rule; defined beside the placement it reads. */
 export { isTopLevelMessage } from "../../lib/runtime-source";
 
@@ -46,14 +56,14 @@ export interface RuntimeHistoryOptions {
 	 */
 	ownTurnPlacement?: OwnTurnPlacement;
 	/** Already-authorized exact history page, when the caller also needs it for context preparation. */
-	sourceMessages?: readonly RuntimeHistoryMessage[];
+	sourceMessages?: readonly RuntimeHistorySourceMessage[];
 	/** Already accepted current input, with its original principal/attachment barrier. */
 	currentInput?: string;
+	/** Portable current refs; canonical persisted rows retain their own media blocks. */
+	currentMedia?: MediaRef[];
 	/** Explicit server-local cwd only; never a remote workspace path. */
 	attachmentCwd?: string;
 	attachmentSignal?: AbortSignal;
-	/** Optional deadline for the bounded source read, not large hydration/projection. */
-	deadline?: number;
 	/**
 	 * Optional tools whose presence follows session loading, and the currently loaded
 	 * ones. When set, loads inside the history keep the request's tool array fixed.
@@ -74,11 +84,13 @@ export interface PreparedRuntimeHistory extends BuiltHistory {
 	/** Provenance reported by the actual provider builder, never inferred from DB row presence. */
 	replayedInjectionMessageIds: readonly string[];
 	/** Original rows for audit/context consumers; never mutated by provider projection. */
-	sourceMessages: readonly RuntimeHistoryMessage[];
+	sourceMessages: readonly RuntimeHistorySourceMessage[];
 	/** Detached rows that entered this particular provider build and receipt candidate registration. */
 	modelMessages: RuntimeHistoryMessage[];
 	/** Current input no persisted row carries; empty when `history` already holds it. */
 	currentText: string;
+	/** Refs not already owned by the accepted current row, for a separate current lane. */
+	currentMedia?: MediaRef[];
 	/** Projected caller packet only, for a subagent whose initial history is already prepared. */
 	currentInputText: string;
 	/** Whether a persisted row (now part of `history`) carries the current input. */
@@ -194,8 +206,8 @@ export function projectQuestionFallbackToolResults(messages: RuntimeHistoryMessa
 export async function buildRuntimeHistory(
 	options: RuntimeHistoryOptions,
 ): Promise<PreparedRuntimeHistory> {
-	// Source reads enforce their own short timeout. A valid large history must not
-	// expire just because hydration and projection take longer than that read.
+	// Source reads, hydration and projection remain cancellable without a fixed
+	// wall-clock cutoff for otherwise valid large histories.
 	const checkBudget = () => options.attachmentSignal?.throwIfAborted();
 	checkBudget();
 	const sourceMessages =
@@ -204,7 +216,6 @@ export async function buildRuntimeHistory(
 			await import("../narrator-service")
 		).narratorService.getModelHistorySinceLastCompact(options.narratorId, undefined, {
 			signal: options.attachmentSignal,
-			deadline: options.deadline,
 		}));
 	checkBudget();
 	const ownPlacement =
@@ -347,6 +358,18 @@ export async function buildRuntimeHistory(
 	// The history carries every persisted row, the current input included; only text no
 	// row holds is still sent as the request's current content.
 	const current = projectCurrentInput(modelMessages, currentInput ?? "");
+	const accepted = findCurrentSenderMessage(modelMessages);
+	const acceptedBlocks = Array.isArray(accepted?.contentJson) ? accepted.contentJson : [];
+	const currentMedia = options.currentMedia?.filter(
+		(ref) =>
+			!acceptedBlocks.some(
+				(block) =>
+					isMediaContentBlock(block) &&
+					block.mediaId === ref.mediaId &&
+					(block.uploadNarratorId || accepted?.narratorId || options.narratorId) ===
+						(ref.uploadNarratorId || options.narratorId),
+			),
+	);
 	const tail = historyTail(modelMessages);
 	return {
 		...built,
@@ -356,6 +379,7 @@ export async function buildRuntimeHistory(
 		currentInputText: current.text,
 		currentText: current.persisted ? "" : current.text,
 		currentInputPersisted: current.persisted,
+		currentMedia: currentMedia?.length ? currentMedia : undefined,
 		endsWithToolResults: tail.toolResults,
 		endsWithInput: tail.input,
 		...(toolLoadingState ? { toolLoading: toolLoadingState } : {}),

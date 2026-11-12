@@ -1,27 +1,28 @@
 import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { specFileRevisions, specNamespaceFiles, type specNamespaces } from "../db/schema";
+import { specFileRevisions, specNamespaceFiles, specNamespaces } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { isSpecUri, normalizeSpecPath, SPEC_URI_PREFIX } from "../lib/spec-uri";
 import { knowledgeWriteStore } from "./knowledge/store";
-import type { SpecProtectedMutation } from "./knowledge/write-store";
 import {
 	analyzeSpecTasksCandidate,
 	compileSpecTasks,
 	detectProtectedMutations,
 	parseSpecTasksDocument,
 	SPEC_TASKS_PATH,
+	SpecProtectedTaskError,
 	type SpecTasksDocument,
 	serializeSpecTasksDocument,
 	taskTextHash,
 } from "./spec-task-service";
+import { assertSpecWritable } from "./task-source/backend";
 
 export { isSpecUri, normalizeSpecPath, SPEC_URI_PREFIX };
 
-const MAX_SPEC_FILE_CHARS = 200_000;
+export const MAX_SPEC_FILE_CHARS = 200_000;
 
 const specWriteLock = new AsyncMutex();
 
@@ -93,6 +94,13 @@ export interface SpecWriteOptions {
 	 * `"user"` (UI route) is subject to `uiEditable`.
 	 */
 	actor?: SpecWriteActor;
+	/**
+	 * The write is the plugin-SOP channel of `spec://behavior_fence`: a plugin's SOP command, or an
+	 * outline session's import leaving only that SOP in the fence. In a session whose tasks live
+	 * in the outline this is the only write the old fence still takes (its behavior boundary is
+	 * the outline page; outline plan PR 4). Ignored for other paths.
+	 */
+	pluginSop?: boolean;
 }
 
 /**
@@ -103,7 +111,14 @@ export interface SpecWriteOptions {
  * narrator's queue is on the agent side of that line. A plugin therefore writes as
  * `"agent"` — it does not get the user's ability to mint protected tasks for free.
  */
-export type SpecWriteActor = "agent" | "user";
+export type SpecWriteActor =
+	| "agent"
+	| "user"
+	/**
+	 * The system itself, on a path of its own (an outline session's import leaving only the plugin
+	 * SOP in its fence): subject to neither axis, and reported as such on `spec:changed`.
+	 */
+	| "system";
 
 export interface SpecCandidateAnalysis {
 	path: string;
@@ -117,13 +132,6 @@ export function toSpecUri(path: string): string {
 
 function hashContent(content: string): string {
 	return createHash("sha256").update(content).digest("hex");
-}
-
-function formatProtectedMutationError(mutations: readonly SpecProtectedMutation[]): string {
-	const details = mutations
-		.map((mutation) => `- ${mutation.kind}: ${mutation.text} (${mutation.details})`)
-		.join("\n");
-	return `This change affects protected task(s) and requires taskReflection before it can be applied.\n${details}`;
 }
 
 export async function ensureNamespace(
@@ -194,6 +202,28 @@ export async function readSpecFile(narratorId: string, uri: string): Promise<Spe
 	throw new Error(`Spec file not found: ${toSpecUri(path)}`);
 }
 
+/**
+ * A spec file's current content, read without creating anything: null when the narrator has no
+ * namespace (or the file was deleted), a built-in file's default when it was never written. For
+ * readers on a request path that must not write (an outline session's behavior view reading the
+ * plugin SOP of its old fence).
+ */
+export async function readSpecFileContentIfExists(
+	narratorId: string,
+	uri: string,
+): Promise<string | null> {
+	const path = normalizeSpecPath(uri);
+	const namespace = await db.query.specNamespaces.findFirst({
+		where: eq(specNamespaces.narratorId, narratorId),
+	});
+	if (!namespace) return null;
+	const current = await getCurrentFile(namespace.id, path);
+	if (current?.deleted) return null;
+	const revision = await getRevision(current?.revisionId);
+	if (revision) return revision.content;
+	return BUILTIN_FILES[path]?.content ?? null;
+}
+
 export async function analyzeSpecWriteCandidate(
 	narratorId: string,
 	uri: string,
@@ -213,6 +243,8 @@ export async function writeSpecFile(
 	options: SpecWriteOptions = {},
 ): Promise<SpecResolvedFile> {
 	const path = normalizeSpecPath(uri);
+	// An outline session has no Dynamic Spec to write to (the fence's plugin-SOP channel excepted).
+	await assertSpecWritable(narratorId, path, { pluginSop: options.pluginSop === true });
 	const actor = options.actor ?? "agent";
 	const fenceMutationAllowed = path === "behavior_fence" && options.allowFenceMutation === true;
 	if (actor === "agent" && isAgentReadonly(path) && !fenceMutationAllowed) {
@@ -274,7 +306,7 @@ export async function writeSpecFile(
 				: {}),
 		});
 		if (!result.ok) {
-			throw new Error(formatProtectedMutationError(result.protectedMutations));
+			throw new SpecProtectedTaskError(result.protectedMutations);
 		}
 
 		const written = await readSpecFile(narratorId, toSpecUri(path));
@@ -292,6 +324,8 @@ export async function writeSpecFile(
 
 export async function deleteSpecFile(narratorId: string, uri: string): Promise<void> {
 	const path = normalizeSpecPath(uri);
+	// An outline session has no Dynamic Spec to change, as for every other write.
+	await assertSpecWritable(narratorId, path);
 	// Built-in files are never deletable: they would reappear in listSpecFiles,
 	// so deletion has no lasting effect and only causes confusion.
 	if (BUILTIN_FILES[path])
@@ -389,6 +423,7 @@ export async function appendSpecTaskForExternalActor(
 ): Promise<{ added: boolean; protected: boolean; written: SpecResolvedFile }> {
 	const text = objective.trim();
 	if (!text) throw new Error("objective must not be empty");
+	await assertSpecWritable(narratorId, SPEC_TASKS_PATH);
 	const current = await readTasksFileForNarrator(narratorId);
 	const document = parseSpecTasksDocument(current.content);
 	const existing = document.tasks.find((task) => task.text.trim() === text);
@@ -485,6 +520,7 @@ export async function clearSpecTasks(narratorId: string): Promise<SpecResolvedFi
  * forked child never affects the parent.
  */
 export async function resetSpecNamespace(narratorId: string): Promise<void> {
+	await assertSpecWritable(narratorId, "");
 	const namespace = await ensureNamespace(narratorId);
 	// The store owns the reset section: drop all tracked files (built-in paths revert
 	// to their defaults because readSpecFile falls back when there is no row), release
@@ -502,6 +538,7 @@ export const specVfsService = {
 	normalizeSpecPath,
 	ensureNamespace,
 	readSpecFile,
+	readSpecFileContentIfExists,
 	writeSpecFile,
 	deleteSpecFile,
 	listSpecFiles,

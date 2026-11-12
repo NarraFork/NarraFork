@@ -13,6 +13,7 @@ const oldPage = {
 };
 const box = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
 
+const Tabs = Object.assign(box, { List: box, Tab: box });
 mock.module("@mantine/core", () => ({
 	Alert: box,
 	Button: ({ children, onClick }: { children?: ReactNode; onClick?: () => void }) => (
@@ -24,11 +25,11 @@ mock.module("@mantine/core", () => ({
 	Loader: () => <div data-loader />,
 	Mark: box,
 	Pagination: box,
-	SegmentedControl: box,
 	Stack: box,
+	Tabs,
 	Text: box,
-	Title: box,
 }));
+mock.module("@tabler/icons-react", () => ({ IconArrowRight: () => null }));
 mock.module("react-i18next", () => ({
 	useTranslation: () => ({ t: (key: string) => key }),
 }));
@@ -50,6 +51,8 @@ mock.module("../../frontend/components/search/SessionResultCard", () => ({
 	),
 }));
 mock.module("../../frontend/components/search/SearchFilterBar", () => ({ SearchFilterBar: box }));
+mock.module("../../frontend/components/search/SearchQueryBox", () => ({ SearchQueryBox: box }));
+mock.module("../../frontend/components/nav/MobileNavButton", () => ({ MobileNavButton: box }));
 mock.module("../../frontend/hooks/useSearch", () => ({
 	SEARCH_PAGE_LIMIT: 20,
 	SEARCH_SECTION_ORDER: ["sessions", "knowledge"],

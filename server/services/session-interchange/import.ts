@@ -466,6 +466,8 @@ function createImportedSubagent(input: {
 			originToolCallId: input.originToolCallId,
 			subagentOriginKind: "tool",
 			cwd: input.parent.cwd,
+			// Its session's task backend (D31), as for a live subagent.
+			taskBackend: input.parent.taskBackend,
 			// A resumed child must run where its parent does, not fall back to the server.
 			defaultDeviceId: input.parent.defaultDeviceId ?? null,
 			// Access is delegated to the root, exactly as for a live subagent.
@@ -542,7 +544,9 @@ export async function importInterchangeSession(
 				originToolCallId,
 				historyToolUseId: sub.parentToolUseId,
 				subagentType,
-				ceiling: await compileDelegationCeiling(subagentType),
+				ceiling: await compileDelegationCeiling(subagentType, {
+					outlineSession: narrator.taskBackend === "outline",
+				}),
 				title: sub.title,
 			});
 			createdIds.push(subagentId);

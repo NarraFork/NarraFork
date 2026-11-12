@@ -43,6 +43,7 @@ import {
 	SnapshotCaptureReceiptService,
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
+import { extractSubagentToPrimary } from "./subagent-extract";
 import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { workspaceContextService } from "./workspace-context-service";
 import {
@@ -466,12 +467,20 @@ for (const kind of ["create", "subagent", "fork", "forkFromMessages"] as const) 
 				return narratorService.forkNarrator(narratorId, null, { inheritMode: "fresh" });
 			return narratorService.forkFromMessages(narratorId, [messageId]);
 		};
+		expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		await withProjectRetirement(projectId, async () => {
 			const before = changes();
 			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
 			expect(changes()).toBe(before);
+			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});
 		const created = await action();
+		if (kind !== "create") {
+			expect(created.replyContext).not.toBeNull();
+			expect(created.replyContext).toEqual(
+				(await narratorService.getById(narratorId)).replyContext,
+			);
+		}
 		otherNarrators.push(created.id);
 		expect(
 			db
@@ -483,23 +492,44 @@ for (const kind of ["create", "subagent", "fork", "forkFromMessages"] as const) 
 	});
 }
 
-for (const kind of ["create", "subagent"] as const) {
+for (const kind of ["create", "subagent", "extract"] as const) {
 	test(`actual ${kind} insert into a reserved checkout is rejected with zero SQL writes, then can retry`, async () => {
-		const action = () =>
-			kind === "create"
-				? narratorService.create({ cwd: path, title: "late independent cwd" })
-				: narratorService.createSubagent({
-						parentNarratorId: narratorId,
-						subagentOriginKind: "standalone",
+		const action = () => {
+			if (kind === "create")
+				return narratorService.create({ cwd: path, title: "late independent cwd" });
+			if (kind === "extract") return extractSubagentToPrimary(narratorId);
+			return narratorService.createSubagent({
+				parentNarratorId: narratorId,
+				subagentOriginKind: "standalone",
+				subagentType: "general",
+				cwd: path,
+			});
+		};
+		expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
+		await withProtectionReservation([{ path }], "retire during creation", async () => {
+			// Simulate a legacy source appearing after reservation; setup is not part of action's writes.
+			if (kind === "extract")
+				await db
+					.update(narrators)
+					.set({
+						type: "subagent",
+						variant: "subagent:general",
 						subagentType: "general",
 						cwd: path,
-					});
-		await withProtectionReservation([{ path }], "retire during creation", async () => {
+					})
+					.where(eq(narrators.id, narratorId));
 			const before = changes();
 			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
 			expect(changes()).toBe(before);
+			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});
 		const created = await action();
+		if (kind !== "create") {
+			expect(created.replyContext).not.toBeNull();
+			expect(created.replyContext).toEqual(
+				(await narratorService.getById(narratorId)).replyContext,
+			);
+		}
 		otherNarrators.push(created.id);
 		expect(
 			db.select({ cwd: narrators.cwd }).from(narrators).where(eq(narrators.id, created.id)).get()

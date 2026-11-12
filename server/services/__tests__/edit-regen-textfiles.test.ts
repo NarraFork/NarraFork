@@ -1,20 +1,24 @@
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	rmSync,
 	truncateSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isMediaContentBlock, mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { wavBytes, wavFile, webmBytes } from "../../../tests/fixtures/native-media";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
+import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
 
 // In-memory DB from real migrations (mirrors tests/setup.ts).
 const DRIZZLE_DIR = join(import.meta.dir, "..", "..", "..", "drizzle");
@@ -48,7 +52,9 @@ const {
 	resolveRequestedAttachmentKeys,
 	interruptAndWaitForIdle,
 } = await import("../narrator-session");
-const { setUploadsDirForTests } = await import("../../lib/uploads");
+const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
+	"../../lib/uploads"
+);
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -191,6 +197,236 @@ describe("user image metadata", () => {
 	});
 });
 
+describe("editAndRegenerate native media history", () => {
+	let cwd: string;
+	beforeEach(() => {
+		cwd = mkdtempSync(join(tmpdir(), "nf-edit-media-"));
+		setUploadsDirForTests(join(cwd, "uploads"));
+	});
+	afterEach(() => rmSync(cwd, { recursive: true, force: true }));
+	// These attachment edits intentionally leave workspace files untouched, just
+	// like the existing text-file harness. Real restores still require a confirmed
+	// plan and authenticated requester in the product service.
+	const editOptions = {
+		userId: "attachment-user",
+		revertFiles: false,
+		deferContinuation: true,
+	} as const;
+	async function blocks(): Promise<unknown[]> {
+		const content = (
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "m1") })
+		)?.contentJson;
+		return Array.isArray(content) ? content : [];
+	}
+	test("wording-only edits preserve native media ownership and explicit [] removes only refs", async () => {
+		const ref = await saveUploadedMedia("n1", wavFile());
+		seed(cwd, [{ ...mediaRefToContentBlock(ref) }, { type: "text", text: "before" }]);
+		expect(await editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).toMatchObject({
+			ok: true,
+		});
+		expect((await blocks()).filter(isMediaContentBlock)).toEqual([mediaRefToContentBlock(ref)]);
+		expect(
+			await editAndRegenerate("n1", "m1", "without", "en", false, {
+				...editOptions,
+				keepMediaIds: [],
+			}),
+		).toMatchObject({ ok: true });
+		expect((await blocks()).filter(isMediaContentBlock)).toEqual([]);
+		expect(getMediaPath("n1", ref.mediaId)).not.toBeNull();
+	});
+	test("media-only appended edit persists canonical content without starting a model", async () => {
+		seed(cwd, [{ type: "text", text: "before" }]);
+		expect(
+			await editAndRegenerate("n1", "m1", "", "en", false, {
+				...editOptions,
+				newMedia: [wavFile()],
+			}),
+		).toMatchObject({ ok: true });
+		const media = (await blocks()).filter(isMediaContentBlock);
+		expect(media).toHaveLength(1);
+		expect(media[0]).toMatchObject({
+			type: "audio",
+			mediaType: "audio/wav",
+			uploadNarratorId: "n1",
+			size: 60,
+		});
+	});
+	test("history edits allow ten retained plus new media and reject eleven without touching shared bytes", async () => {
+		const original = await saveUploadedMedia("n1", wavFile("original.wav"));
+		seed(cwd, [{ ...mediaRefToContentBlock(original) }]);
+		await editAndRegenerate("n1", "m1", "", "en", false, {
+			...editOptions,
+			newMedia: Array.from({ length: 9 }, (_, index) => wavFile(`added-${index}.wav`)),
+		});
+		const before = await blocks();
+		expect(before.filter(isMediaContentBlock)).toHaveLength(10);
+		const saved = readdirSync(join(cwd, "uploads", "n1", "media"));
+		await expect(
+			editAndRegenerate("n1", "m1", "", "en", false, {
+				...editOptions,
+				newMedia: [wavFile("eleventh.wav")],
+			}),
+		).rejects.toThrow("Maximum 10");
+		expect(await blocks()).toEqual(before);
+		expect(readdirSync(join(cwd, "uploads", "n1", "media"))).toEqual(saved);
+		expect(getMediaPath("n1", original.mediaId)).not.toBeNull();
+	});
+	test.each([
+		["audio", () => wavFile()],
+		[
+			"video",
+			() => new File([new Uint8Array(webmBytes([1]))], "clip.webm", { type: "video/webm" }),
+		],
+	] as const)("retained %s bytes count toward the final limit and removed media frees the budget", async (_, file) => {
+		const original = await saveUploadedMedia("n1", file());
+		const originalPath = getMediaPath("n1", original.mediaId);
+		if (!originalPath) throw new Error("Missing original media");
+		// Sparse retained bytes deliberately disagree with the persisted size.
+		truncateSync(originalPath, 100 * 1024 * 1024);
+		seed(cwd, [{ ...mediaRefToContentBlock(original) }, { type: "text", text: "before" }]);
+		const before = await blocks();
+		const mediaDir = join(cwd, "uploads", "n1", "media");
+		const saved = readdirSync(mediaDir);
+		const bytes = Buffer.alloc(29 * 1024 * 1024);
+		wavBytes().copy(bytes);
+		bytes.writeUInt32LE(bytes.length - 8, 4);
+		bytes.writeUInt32LE(bytes.length - 44, 40);
+		const added = new File([bytes], "added.wav", { type: "audio/wav" });
+		await expect(
+			editAndRegenerate("n1", "m1", "after", "en", false, {
+				...editOptions,
+				newMedia: [added],
+			}),
+		).rejects.toThrow("Combined attachments exceed the 128 MiB limit");
+		expect(await blocks()).toEqual(before);
+		expect(readdirSync(mediaDir)).toEqual(saved);
+		expect(
+			await editAndRegenerate("n1", "m1", "after", "en", false, {
+				...editOptions,
+				keepMediaIds: [],
+				newMedia: [added],
+			}),
+		).toMatchObject({ ok: true });
+		expect((await blocks()).filter(isMediaContentBlock)).toMatchObject([
+			{ filename: "added.wav", size: added.size, uploadNarratorId: "n1" },
+		]);
+		expect(Bun.file(originalPath).size).toBe(100 * 1024 * 1024);
+	});
+	test("shared history counts each source owner and media ID once, not once per reference", async () => {
+		const original = await saveUploadedMedia("n1", wavFile());
+		const originalPath = getMediaPath("n1", original.mediaId);
+		if (!originalPath) throw new Error("Missing original media");
+		truncateSync(originalPath, 64 * 1024 * 1024);
+		const block = mediaRefToContentBlock(original);
+		const { uploadNarratorId: _, ...legacyBlock } = block;
+		seed(cwd, [{ ...legacyBlock }, { ...block }]);
+		db.insert(narrators)
+			.values({ id: "n2", cwd, status: "idle", createdAt: now, updatedAt: now })
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({ id: "ref-n2-m1", narratorId: "n2", messageId: "m1", seq: 0, isCompact: 0 })
+			.run();
+		expect(
+			await editAndRegenerate("n2", "m1", "after", "en", false, {
+				...editOptions,
+				newMedia: [wavFile("added.wav")],
+			}),
+		).toMatchObject({ ok: true });
+		const childRef = await db.query.narratorMessageRefs.findFirst({
+			where: eq(narratorMessageRefs.narratorId, "n2"),
+		});
+		const childMessage = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, childRef?.messageId ?? ""),
+		});
+		expect((childMessage?.contentJson as unknown[]).filter(isMediaContentBlock)).toMatchObject([
+			{ mediaId: original.mediaId, uploadNarratorId: "n1" },
+			{ filename: "added.wav", uploadNarratorId: "n2" },
+		]);
+
+		// Identical IDs in different owners are different stored attachments.
+		const otherPath = join(cwd, "uploads", "n2", "media", `${original.mediaId}.wav`);
+		writeFileSync(otherPath, wavBytes());
+		truncateSync(otherPath, 65 * 1024 * 1024);
+		seed(cwd, [{ ...block }, { ...block, uploadNarratorId: "n2" }]);
+		await expect(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).rejects.toThrow(
+			"Combined attachments exceed the 128 MiB limit",
+		);
+	});
+	test("a large retained text file does not consume the inline media budget", async () => {
+		// Text files reach the model as paths, media as inline base64. A retained
+		// 200 MiB text attachment must not push a small new media file over the
+		// 128 MiB inline budget, though both still count toward the 2 GiB total.
+		const textPath = join(cwd, "big.log");
+		writeFileSync(textPath, "");
+		truncateSync(textPath, 200 * 1024 * 1024);
+		seed(cwd, [
+			{
+				type: "text_file",
+				fileId: "big",
+				filename: "big.log",
+				size: 200 * 1024 * 1024,
+				filePath: textPath,
+			},
+			{ type: "text", text: "before" },
+		]);
+		expect(
+			await editAndRegenerate("n1", "m1", "after", "en", false, {
+				...editOptions,
+				keepTextFilePaths: [textPath],
+				newMedia: [wavFile("added.wav")],
+			}),
+		).toMatchObject({ ok: true });
+		expect((await blocks()).filter(isMediaContentBlock)).toMatchObject([{ filename: "added.wav" }]);
+	});
+	test("retained images and media still share the 128 MiB inline budget", async () => {
+		// The counterpart of the test above: splitting the budgets must not let
+		// inline attachments escape the 128 MiB limit. Both are sparse-truncated to
+		// stay cheap; the check reads stat sizes before anything is copied.
+		const media = await saveUploadedMedia("n1", wavFile());
+		const mediaPath = getMediaPath("n1", media.mediaId);
+		if (!mediaPath) throw new Error("Missing media");
+		truncateSync(mediaPath, 70 * 1024 * 1024);
+		const image = await saveUploadedImage("n1", createPngFile("kept.png", 1, 1));
+		const imagePath = getImagePath("n1", image.imageId);
+		if (!imagePath) throw new Error("Missing image");
+		truncateSync(imagePath, 70 * 1024 * 1024);
+		seed(cwd, [
+			{ ...mediaRefToContentBlock(media) },
+			{ type: "image", imageId: image.imageId, filename: "kept.png", mediaType: "image/png" },
+			{ type: "text", text: "before" },
+		]);
+		const before = await blocks();
+		await expect(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).rejects.toThrow(
+			"Combined attachments exceed the 128 MiB limit",
+		);
+		expect(await blocks()).toEqual(before);
+	});
+	test("a later attachment write failure rolls back newly uploaded media and keeps old history", async () => {
+		seed(cwd, [{ type: "text", text: "before" }]);
+		const failing = new File(["text"], "fail.txt", { type: "text/plain" });
+		// Text attachments are written with `Bun.write(path, file)` (streamed, never
+		// `arrayBuffer()`), so the failure is injected at that write.
+		const realWrite = Bun.write;
+		const write = spyOn(Bun, "write").mockImplementation(async (...args) => {
+			if (args[1] === failing) throw new Error("media rollback");
+			return Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>;
+		});
+		try {
+			await expect(
+				editAndRegenerate("n1", "m1", "after", "en", false, {
+					...editOptions,
+					newMedia: [wavFile()],
+					newTextFiles: [failing],
+				}),
+			).rejects.toThrow("media rollback");
+		} finally {
+			write.mockRestore();
+		}
+		expect(readdirSync(join(cwd, "uploads", "n1", "media"))).toEqual([]);
+		expect(await blocks()).toEqual([{ type: "text", text: "before" }]);
+	});
+});
+
 describe("editAndRegenerate text_file management", () => {
 	let cwd: string;
 	beforeEach(() => {
@@ -248,7 +484,7 @@ describe("editAndRegenerate text_file management", () => {
 		const files = blocks.filter((b) => b.type === "text_file");
 		expect(files).toHaveLength(1);
 		expect(files[0].filename).toBe("fresh.md");
-		expect(String(files[0].filePath)).toContain(".narrafork/attached");
+		expect(String(files[0].filePath).replaceAll("\\", "/")).toContain(".narrafork/attached");
 		expect(readFileSync(String(files[0].filePath), "utf-8")).toBe("hello world");
 	});
 
@@ -327,26 +563,42 @@ describe("editAndRegenerate text_file management", () => {
 		const image = createPngFile("new.png", 1, 1);
 		const firstText = new File(["created"], "created.txt", { type: "text/plain" });
 		const failingText = new File(["fail"], "fail.txt", { type: "text/plain" });
-		Object.defineProperty(failingText, "arrayBuffer", {
-			value: async () => {
+		const realWrite = Bun.write;
+		let earlierWriteCompleted = false;
+		let failingWriteEntered = false;
+		const write = spyOn(Bun, "write").mockImplementation(async (...args) => {
+			if (args[1] === failingText) {
+				failingWriteEntered = true;
+				expect(earlierWriteCompleted).toBe(true);
 				throw new Error("synthetic write failure");
-			},
+			}
+			const result = await (Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>);
+			if (args[1] === firstText) {
+				if (typeof args[0] !== "string") throw new Error("Expected attachment path");
+				expect(readFileSync(args[0], "utf8")).toBe("created");
+				earlierWriteCompleted = true;
+			}
+			return result;
 		});
-
-		await expect(
-			editAndRegenerate("n1", "m1", "new", "en", false, {
-				userId: "attachment-user",
-				revertFiles: false,
-				keepImageIds: [],
-				keepTextFilePaths: [],
-				newImages: [image],
-				newTextFiles: [firstText, failingText],
-			}),
-		).rejects.toThrow("synthetic write failure");
-		const imageDir = join(uploadsRoot, "n1");
-		expect(existsSync(imageDir) ? readdirSync(imageDir) : []).toHaveLength(0);
-		const attachedDir = join(cwd, ".narrafork", "attached");
-		expect(existsSync(attachedDir) ? readdirSync(attachedDir) : []).toHaveLength(0);
+		try {
+			await expect(
+				editAndRegenerate("n1", "m1", "new", "en", false, {
+					userId: "attachment-user",
+					revertFiles: false,
+					keepImageIds: [],
+					keepTextFilePaths: [],
+					newImages: [image],
+					newTextFiles: [firstText, failingText],
+				}),
+			).rejects.toThrow("synthetic write failure");
+			expect(failingWriteEntered).toBe(true);
+			const imageDir = join(uploadsRoot, "n1");
+			expect(existsSync(imageDir) ? readdirSync(imageDir) : []).toHaveLength(0);
+			const attachedDir = join(cwd, ".narrafork", "attached");
+			expect(existsSync(attachedDir) ? readdirSync(attachedDir) : []).toHaveLength(0);
+		} finally {
+			write.mockRestore();
+		}
 	});
 
 	test("serializes concurrent edits before materializing the second upload", async () => {
@@ -364,42 +616,69 @@ describe("editAndRegenerate text_file management", () => {
 			markSecondEntered = resolve;
 		});
 		const firstFile = new File(["first"], "first.txt", { type: "text/plain" });
-		Object.defineProperty(firstFile, "arrayBuffer", {
-			value: async () => {
+		const secondFile = new File(["second"], "second.txt", { type: "text/plain" });
+		const realWrite = Bun.write;
+		const writes: string[] = [];
+		const write = spyOn(Bun, "write").mockImplementation(async (...args) => {
+			if (args[1] === firstFile) {
+				writes.push("first entered");
 				markFirstEntered();
 				await firstGate;
-				return new TextEncoder().encode("first").buffer;
-			},
-		});
-		const secondFile = new File(["second"], "second.txt", { type: "text/plain" });
-		Object.defineProperty(secondFile, "arrayBuffer", {
-			value: async () => {
+			}
+			if (args[1] === secondFile) {
+				writes.push("second entered");
 				markSecondEntered();
-				return new TextEncoder().encode("second").buffer;
-			},
+			}
+			const result = await (Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>);
+			if (args[1] === firstFile || args[1] === secondFile) {
+				const text = args[1] === firstFile ? "first" : "second";
+				if (typeof args[0] !== "string") throw new Error("Expected attachment path");
+				expect(readFileSync(args[0], "utf8")).toBe(text);
+				writes.push(`${text} written`);
+			}
+			return result;
 		});
-
-		const firstEdit = editAndRegenerate("n1", "m1", "first edit", "en", false, {
-			userId: "attachment-user",
-			revertFiles: false,
-			keepTextFilePaths: [],
-			newTextFiles: [firstFile],
-		});
-		await firstEntered;
-		const secondEdit = editAndRegenerate("n1", "m1", "second edit", "en", false, {
-			userId: "attachment-user",
-			revertFiles: false,
-			keepTextFilePaths: [],
-			newTextFiles: [secondFile],
-		});
-		const secondStartedBeforeRelease = await Promise.race([
-			secondEntered.then(() => true),
-			new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 30)),
-		]);
-		releaseFirst();
-		await Promise.allSettled([firstEdit, secondEdit]);
-
-		expect(secondStartedBeforeRelease).toBe(false);
+		const pending: Promise<unknown>[] = [];
+		try {
+			// Keep regeneration out of this lock test: a running first turn would
+			// reject the second edit before it ever reaches attachment materialization.
+			const firstEdit = editAndRegenerate("n1", "m1", "first edit", "en", false, {
+				userId: "attachment-user",
+				deferContinuation: true,
+				revertFiles: false,
+				keepTextFilePaths: [],
+				newTextFiles: [firstFile],
+			});
+			pending.push(firstEdit);
+			await firstEntered;
+			const secondEdit = editAndRegenerate("n1", "m1", "second edit", "en", false, {
+				userId: "attachment-user",
+				deferContinuation: true,
+				revertFiles: false,
+				keepTextFilePaths: [],
+				newTextFiles: [secondFile],
+			});
+			pending.push(secondEdit);
+			const secondStartedBeforeRelease = await Promise.race([
+				secondEntered.then(() => true),
+				new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 30)),
+			]);
+			expect(secondStartedBeforeRelease).toBe(false);
+			expect(writes).toEqual(["first entered"]);
+			releaseFirst();
+			const results = await Promise.allSettled(pending);
+			expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+			expect(writes).toEqual([
+				"first entered",
+				"first written",
+				"second entered",
+				"second written",
+			]);
+		} finally {
+			releaseFirst();
+			await Promise.allSettled(pending);
+			write.mockRestore();
+		}
 	});
 
 	test("copies a shared modern text attachment into the editing narrator cwd", async () => {
@@ -446,14 +725,21 @@ describe("editAndRegenerate text_file management", () => {
 		expect(readFileSync(String(copied?.filePath), "utf8")).toBe("shared content");
 	});
 
-	test("counts copied source bytes against the 128 MiB materialization limit", async () => {
+	test("counts copied source bytes against the 2 GiB materialization limit", async () => {
 		const parentCwd = mkdtempSync(join(tmpdir(), "nf-edit-large-parent-"));
 		const childCwd = mkdtempSync(join(tmpdir(), "nf-edit-large-child-"));
 		const sourcePath = join(parentCwd, "large.bin");
 		writeFileSync(sourcePath, "");
-		truncateSync(sourcePath, 129 * 1024 * 1024);
+		// Sparse on purpose: the ceiling is checked from the recorded sizes BEFORE
+		// anything is copied, so the test must not pay 2 GiB of real writes.
+		truncateSync(sourcePath, 2 * 1024 * 1024 * 1024 + 1);
 		seed(childCwd, [
-			{ type: "text_file", filename: "large.bin", size: 1, filePath: sourcePath },
+			{
+				type: "text_file",
+				filename: "large.bin",
+				size: 2 * 1024 * 1024 * 1024 + 1,
+				filePath: sourcePath,
+			},
 			{ type: "text", text: "old" },
 		]);
 		await expect(
@@ -462,7 +748,7 @@ describe("editAndRegenerate text_file management", () => {
 				revertFiles: false,
 				keepTextFilePaths: [sourcePath],
 			}),
-		).rejects.toThrow("attachments exceed the 128 MiB limit");
+		).rejects.toThrow("attachments exceed the 2 GiB limit");
 		expect(existsSync(join(childCwd, ".narrafork"))).toBe(false);
 	});
 });

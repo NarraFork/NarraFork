@@ -9,6 +9,7 @@ const MAX_VALIDATION_ISSUES = 20;
 const LOCAL_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
 const HOST_RESERVED_PREFIXES = new Set([
 	"__agg__",
+	"auto",
 	"__default__",
 	"__summary__",
 	"default",
@@ -29,6 +30,8 @@ export interface ProviderModelCapabilities {
 	tools: boolean;
 	parallelToolCalls?: boolean;
 	inputImages?: boolean;
+	inputAudio?: boolean;
+	inputVideo?: boolean;
 	reasoning?: boolean;
 	reasoningEfforts?: ProviderReasoningEffort[];
 	sessionMode: ProviderSessionMode;
@@ -54,6 +57,8 @@ export interface ProviderTypeCapabilities {
 	generate: boolean;
 	reasoningContinuation?: boolean;
 	inputImages?: boolean;
+	inputAudio?: boolean;
+	inputVideo?: boolean;
 	mayLeakXmlToolCalls?: boolean;
 }
 
@@ -407,6 +412,8 @@ function normalizeCapabilities(
 		generate: input?.generate ?? true,
 		reasoningContinuation: input?.reasoningContinuation,
 		inputImages: input?.inputImages,
+		inputAudio: input?.inputAudio === true,
+		inputVideo: input?.inputVideo === true,
 		mayLeakXmlToolCalls: input?.mayLeakXmlToolCalls,
 	};
 }
@@ -450,6 +457,8 @@ function normalizeModelDescriptor(model: ProviderModelDescriptor): ProviderModel
 			tools: capabilities.tools ?? false,
 			parallelToolCalls: capabilities.parallelToolCalls,
 			inputImages: capabilities.inputImages,
+			inputAudio: capabilities.inputAudio === true,
+			inputVideo: capabilities.inputVideo === true,
 			reasoning: capabilities.reasoning,
 			reasoningEfforts: capabilities.reasoningEfforts
 				? [...capabilities.reasoningEfforts]

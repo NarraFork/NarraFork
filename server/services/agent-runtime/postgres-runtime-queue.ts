@@ -1,3 +1,5 @@
+import { mailboxReplyContext } from "@shared/reply-context";
+
 /**
  * agent-runtime/postgres-runtime-queue.ts — the PostgreSQL production adapter for the
  * runtime queue (mailbox + publication outbox atomic write sections).
@@ -355,6 +357,7 @@ const releasedPayload = {
 	metadataJson: null,
 	payloadRefJson: null,
 	imagesJson: null,
+	mediaJson: null,
 	textFilePathsJson: null,
 	fileReferencesJson: null,
 	creatorJson: null,
@@ -408,6 +411,7 @@ function validatePgInput(input: MailboxInput) {
 	if (input.kind === "user_input") {
 		const refs = [
 			input.imagesJson,
+			input.mediaJson,
 			input.creatorJson,
 			input.textFilePathsJson,
 			input.fileReferencesJson,
@@ -745,6 +749,7 @@ export function createPostgresRuntimeQueue(
 				...(input.kind === "user_input"
 					? {
 							imagesJson: input.imagesJson,
+							mediaJson: input.mediaJson,
 							creatorJson: input.creatorJson,
 							textFilePathsJson: input.textFilePathsJson,
 							fileReferencesJson: input.fileReferencesJson,
@@ -1208,6 +1213,9 @@ export function createPostgresRuntimeQueue(
 			);
 		if (!refs[0])
 			throw new Error("Materializer did not persist the recipient ref in this transaction");
+		const replyContext = mailboxReplyContext(row);
+		if (replyContext)
+			await tx.update(narrators).set({ replyContext }).where(eq(narrators.id, row.narratorId));
 		const updated = await tx
 			.update(mailbox)
 			.set({
@@ -1939,6 +1947,7 @@ export function createPostgresRuntimeQueue(
 				byteSize: number;
 				payloadRefJson: string | null;
 				imagesJson: string | null;
+				mediaJson: string | null;
 				textFilePathsJson: string | null;
 				fileReferencesJson: string | null;
 				metadataJson: string;
@@ -1962,6 +1971,7 @@ export function createPostgresRuntimeQueue(
 						bufferedAt: now(),
 						updatedAt: now(),
 						imagesJson: patch.imagesJson,
+						mediaJson: patch.mediaJson,
 						textFilePathsJson: patch.textFilePathsJson,
 						fileReferencesJson: patch.fileReferencesJson,
 						metadataJson: patch.metadataJson,

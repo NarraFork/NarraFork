@@ -5,7 +5,7 @@ import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-ef
 import { IconAdjustmentsHorizontal, IconFolder, IconPaperclip } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useCreateNarrator } from "../../hooks/useNarrator";
@@ -17,6 +17,10 @@ import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api, isAbortError } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
+import {
+	subscribeDashboardComposerFocus,
+	takeDashboardComposerFocusRequest,
+} from "../../lib/dashboard-composer-focus";
 import { DirectoryBrowserModal } from "../common/DirectoryPicker";
 import {
 	CreateNarratorLazyModal,
@@ -158,6 +162,14 @@ export function DashboardComposer() {
 	const [hasText, setHasText] = useState(false);
 	const [sendingState, setSendingState] = useState<NarratorSendingState | null>(null);
 	const composerRef = useRef<NarratorComposerHandle>(null);
+	// The sidebar's "New session" asks for the cursor here, before or after this mounts.
+	useEffect(() => {
+		const take = () => {
+			if (takeDashboardComposerFocusRequest()) composerRef.current?.focus();
+		};
+		take();
+		return subscribeDashboardComposerFocus(take);
+	}, []);
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const sendingRef = useRef(false);
 	const sendAbortRef = useRef<AbortController | null>(null);
@@ -168,6 +180,8 @@ export function DashboardComposer() {
 	const {
 		attachedImages,
 		attachedTextFiles,
+		attachedMedia,
+		attachedMediaRef,
 		attachmentsHydrating,
 		attachmentsRestoreFailed,
 		retryAttachmentRestore,
@@ -176,6 +190,7 @@ export function DashboardComposer() {
 		dragCounterRef,
 		updateAttachedImages,
 		updateAttachedTextFiles,
+		updateAttachedMedia,
 		reconcileDocumentAssets,
 		clearAttachedFilesAndDraft,
 	} = useComposerAttachments({
@@ -190,6 +205,8 @@ export function DashboardComposer() {
 			sendingRef,
 			updateAttachedImages,
 			updateAttachedTextFiles,
+			updateAttachedMedia,
+			attachedMediaRef,
 			setIsDragging,
 			dragCounterRef,
 			captureInsertion: (origin) => composerRef.current?.captureAttachmentInsertion(origin),
@@ -197,7 +214,8 @@ export function DashboardComposer() {
 				composerRef.current?.insertAcceptedFiles(files, bookmark) ?? false,
 			t: tn,
 		});
-	const hasAttachments = attachedImages.length + attachedTextFiles.length > 0;
+	const hasAttachments =
+		attachedImages.length + attachedTextFiles.length + attachedMedia.length > 0;
 
 	// Every option below is a create-time one, so changing it invalidates a session
 	// left behind by a failed send — that session already carries the old value.
@@ -272,7 +290,12 @@ export function DashboardComposer() {
 					}),
 					composerDocument: undefined,
 				};
-		const files = snapshotComposerFiles(composerDocument, attachedImages, attachedTextFiles);
+		const files = snapshotComposerFiles(
+			composerDocument,
+			attachedImages,
+			attachedTextFiles,
+			attachedMedia,
+		);
 		if (!files || composer.hasMissingAssets()) {
 			notifications.show({
 				color: "red",
@@ -286,13 +309,14 @@ export function DashboardComposer() {
 				text: rawText,
 				imageCount: files.images.length,
 				textFileCount: files.textFiles.length,
+				mediaCount: files.media.length,
 				fileReferenceCount: fileReferences.length,
 			})
 		)
 			return;
 
 		sendingRef.current = true;
-		const attachmentCount = files.images.length + files.textFiles.length;
+		const attachmentCount = files.images.length + files.textFiles.length + files.media.length;
 		const abort = new AbortController();
 		sendAbortRef.current = abort;
 		setSendingState({
@@ -345,6 +369,7 @@ export function DashboardComposer() {
 			];
 			if (fileReferences.length > 0) args[7] = fileReferences;
 			if (composerDocument) args[10] = { composerDocument };
+			if (files.media.length) args[11] = files.media;
 			await api.sendNarratorMessage(...args);
 			composer.noteSent(text, fileReferences, composerDocument);
 			composer.clearTextAndDraft();
@@ -402,14 +427,16 @@ export function DashboardComposer() {
 					onPasteImages={handleComposerPasteImages}
 					attachedImages={attachedImages}
 					attachedTextFiles={attachedTextFiles}
+					attachedMedia={attachedMedia}
 					attachmentsHydrating={attachmentsHydrating}
 					attachmentsRestoreFailed={attachmentsRestoreFailed}
 					onRetryAttachments={retryAttachmentRestore}
 					restoredAttachmentResources={restoredAttachmentResources}
 					onDocumentAssetsChange={reconcileDocumentAssets}
-					onAttachmentsChange={(images, textFiles) => {
+					onAttachmentsChange={(images, textFiles, media) => {
 						updateAttachedImages(images);
 						updateAttachedTextFiles(textFiles);
+						updateAttachedMedia(media);
 					}}
 					controls={
 						<Tooltip label={tn("attachFile")}>

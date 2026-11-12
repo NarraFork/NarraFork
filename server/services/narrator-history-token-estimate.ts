@@ -12,9 +12,10 @@ import {
 } from "../lib/settings";
 import { isTopLevelMessage } from "./agent-runtime/history";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
-import { buildEffectiveSystemPrompt } from "./narrator-prompt";
+import { buildEffectiveSystemPrompt, taskSectionFor } from "./narrator-prompt";
 import { narratorService } from "./narrator-service";
 import { resolveSubagentModelForRun } from "./subagent-model";
+import { resolveTaskBackend } from "./task-source";
 
 export interface NarratorHistoryTokenEstimate {
 	promptTokens: number;
@@ -48,8 +49,7 @@ export async function estimateNarratorBuildHistoryTokens(
 	// This is compact-after display work, not a per-pass request statistic. Reuse only
 	// immutable, signed source rows; never cache provider packets/current input/attachments.
 	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
-		...options,
-		deadline,
+		signal: options.signal,
 	});
 	// Historical transcript mounting is top level even without a live delivery target.
 	const { readSessionOwnTurnPlacement } = await import("./narrator-session");
@@ -76,6 +76,10 @@ export async function estimateNarratorBuildHistoryTokens(
 		planFileId: narrator.planFileId ?? undefined,
 		replyInUserLanguage: false,
 		defaultSystemPrompt: settings.agent.defaultSystemPrompt,
+		taskSection: taskSectionFor(
+			await resolveTaskBackend(narratorId).catch(() => "spec" as const),
+			narrator.type,
+		),
 	});
 
 	const historyWithSystem = [...history];

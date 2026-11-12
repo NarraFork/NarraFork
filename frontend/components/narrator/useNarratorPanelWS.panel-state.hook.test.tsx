@@ -6,6 +6,7 @@ import type {
 } from "@frontend/lib/api/narrators";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import type { PendingPermission } from "@frontend/types/narrator";
+import { notifications } from "@mantine/notifications";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import { notifyManager, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import i18next from "i18next";
@@ -15,6 +16,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { customApiBalanceDisplayFor } from "./model/custom-api-usage-source";
 import { type UseNarratorPanelWSReturn, useNarratorPanelWS } from "./useNarratorPanelWS";
+import { findPendingForKey } from "./vlist/vlist-permission-match";
 
 type QuotaSettings = {
 	customApiQuotas: NonNullable<Parameters<typeof customApiBalanceDisplayFor>[0]["pushedQuotas"]>;
@@ -232,6 +234,73 @@ afterEach(async () => {
 	originals.clear();
 });
 
+describe("upstream timed wait notifications with the real WS hook", () => {
+	test.each([
+		["capacity", "capacity"],
+		["rate_limit", "rateLimit"],
+		["quota", "quotaExhausted"],
+	] as const)("%s keeps the wait reason through waiting and recovery", async (waitKind, prefix) => {
+		const show = spyOn(notifications, "show").mockReturnValue("notice");
+		const hide = spyOn(notifications, "hide").mockImplementation((id) => id);
+		restores.push(
+			() => show.mockRestore(),
+			() => hide.mockRestore(),
+		);
+		await render();
+		await event({
+			type: "model_unavailable_waiting",
+			waitKind,
+			model: "ocg:test",
+			quotaProvider: "opencode",
+			resumeAt: 123456,
+		});
+		expect(show.mock.calls.at(-1)?.[0]).toMatchObject({
+			title: `${prefix}WaitingTitle`,
+			autoClose: false,
+		});
+		expect(current.quotaWaitInfo).toMatchObject({ waitKind, resumeAt: 123456 });
+		await event({
+			type: "model_unavailable_recovered",
+			waitKind,
+			model: "ocg:test",
+			quotaProvider: "opencode",
+		});
+		expect(show.mock.calls.at(-1)?.[0]).toMatchObject({ title: `${prefix}RecoveredTitle` });
+		expect(current.quotaWaitInfo).toBeNull();
+		await event({
+			type: "model_unavailable_waiting",
+			waitKind,
+			model: "ocg:test",
+			resumeAt: 123456,
+		});
+		await event({ type: "status_change", status: "idle", substatus: ["error"] });
+		expect(current.quotaWaitInfo).toBeNull();
+		expect(hide).toHaveBeenCalledWith("model-unavailable-n1");
+	});
+
+	test("old quota/rateLimit events recover without claiming quota was restored", async () => {
+		const show = spyOn(notifications, "show").mockReturnValue("notice");
+		const hide = spyOn(notifications, "hide").mockImplementation((id) => id);
+		restores.push(
+			() => show.mockRestore(),
+			() => hide.mockRestore(),
+		);
+		await render();
+		await event({
+			type: "model_unavailable_waiting",
+			waitKind: "quota",
+			quotaBucket: "rateLimit",
+			message: "[prefill_cap_refused] the cell is at capacity",
+			model: "ocg:test",
+			resumeAt: 123456,
+		});
+		expect(current.quotaWaitInfo?.waitKind).toBe("capacity");
+		expect(show.mock.calls.at(-1)?.[0].title).toBe("capacityWaitingTitle");
+		await event({ type: "model_unavailable_recovered", waitKind: "quota", model: "ocg:test" });
+		expect(show.mock.calls.at(-1)?.[0].title).toBe("capacityRecoveredTitle");
+	});
+});
+
 describe("pushed custom API quota precedence with the real WS hook", () => {
 	test("a live push replaces the subscription and survives subsequent auto-balance polling", async () => {
 		quotaProviderId = "p1";
@@ -407,4 +476,106 @@ describe("mounted panel and real WS hook reconciliation", () => {
 			second.resolve(page(permissions(8, 32)));
 		});
 	}
+});
+
+describe("plan reflection handover with the real WS hook", () => {
+	for (const child of [false, true]) {
+		for (const stoppedFirst of [true, false]) {
+			test(`${child ? "child" : "primary"}: ${stoppedFirst ? "handover then permission" : "late handover"} uses only the durable approval id`, async () => {
+				connected = true;
+				const unrelated = permissions(1);
+				panelSpy.mockResolvedValue(page(unrelated));
+				await render();
+				const routing = {
+					ownerNarratorId: child ? "child-narrator" : narratorId,
+					...(child ? { subagentNarratorId: "child-narrator", parentToolUseId: "agent-call" } : {}),
+				};
+				const permission: PendingPermission = {
+					id: "durable-plan-call",
+					toolUseId: "plan-tool-use",
+					toolName: "ExitPlanMode",
+					inputJson: { mode: "outline" },
+					...routing,
+				};
+				const stopped = {
+					type: "plan_reflection_stopped",
+					requestId: "exit_plan_synthetic",
+					toolUseId: permission.toolUseId,
+					toolName: permission.toolName,
+					inputJson: permission.inputJson,
+					...routing,
+				};
+				if (stoppedFirst) {
+					await event(stopped);
+					// A stopped reflection is not an approval request, even with outline input.
+					expect(current.pendingPermissions).toEqual(unrelated);
+					expect(findPendingForKey("tool-plan-tool-use", current.pendingPermissions)).toBeNull();
+				}
+				panelSpy.mockResolvedValue(page([...unrelated, permission]));
+				await event({ type: "permission_request", request: permission });
+				await event(stopped); // A late/repeated handover must not recreate a synthetic gate.
+				expect(current.pendingPermissions).toEqual([...unrelated, permission]);
+				expect(findPendingForKey("tool-plan-tool-use", current.pendingPermissions)).toEqual(
+					permission,
+				);
+				await event({ type: "plan_reflection_resolved", requestId: stopped.requestId });
+				expect(current.pendingPermissions).toEqual([...unrelated, permission]);
+				await event({ type: "permission_resolved", requestId: permission.id, decision: "allow" });
+				expect(current.pendingPermissions).toEqual(unrelated);
+			});
+		}
+	}
+
+	test("handover refreshes the panel snapshot when the permission event is missed", async () => {
+		connected = true;
+		await render();
+		const permission: PendingPermission = {
+			id: "durable-plan-call",
+			toolUseId: "plan-tool-use",
+			toolName: "ExitPlanMode",
+			inputJson: { mode: "outline" },
+		};
+		panelSpy.mockResolvedValue(page([permission]));
+		await event({
+			type: "plan_reflection_stopped",
+			requestId: "exit_plan_synthetic",
+			toolUseId: permission.toolUseId,
+			toolName: permission.toolName,
+			inputJson: permission.inputJson,
+		});
+		expect(current.pendingPermissions).toEqual([]);
+		await retryTick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		expect(panelSpy.mock.calls[1]?.[1]?.fresh).toBe(true);
+		expect(current.pendingPermissions).toEqual([permission]);
+	});
+
+	test("reconnect restores the durable request when its permission event was missed", async () => {
+		connected = true;
+		await render();
+		await event({
+			type: "plan_reflection_stopped",
+			requestId: "exit_plan_synthetic",
+			toolUseId: "plan-tool-use",
+			toolName: "ExitPlanMode",
+			inputJson: { mode: "outline" },
+		});
+		expect(current.pendingPermissions).toEqual([]);
+		const permission: PendingPermission = {
+			id: "durable-plan-call",
+			toolUseId: "plan-tool-use",
+			toolName: "ExitPlanMode",
+			inputJson: { mode: "outline" },
+			suggestions: [
+				{ type: "plan_reflection", status: "awaiting_user", requestId: "exit_plan_synthetic" },
+			],
+		};
+		await connection(false);
+		panelSpy.mockResolvedValue(page([permission]));
+		await connection(true);
+		expect(findPendingForKey("tool-plan-tool-use", current.pendingPermissions)?.id).toBe(
+			permission.id,
+		);
+		expect(current.pendingPermissions).toEqual([permission]);
+	});
 });

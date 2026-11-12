@@ -67,6 +67,42 @@ describe("workspace details", () => {
 			"No worktrees",
 		]);
 	});
+	test("creation that also switched the directory says so, and a failed switch keeps its reason", () => {
+		const created = {
+			outcome: "created",
+			operationId: "private-id",
+			worktree: { path: "/repo/new", branch: "refs/heads/fix/new" },
+		};
+		expect(
+			rows(
+				detail(
+					"CreateWorktree",
+					{ branchName: "fix/new", destinationPath: "/repo/new", switchToWorktree: true },
+					{
+						...created,
+						switch: { switched: true },
+					},
+				),
+			).map((row) => row.text),
+		).toEqual(["Created", "fix/new · /repo/new", "Switched"]);
+		expect(
+			rows(
+				detail(
+					"CreateWorktree",
+					{ branchName: "fix/new", destinationPath: "/repo/new", switchToWorktree: true },
+					{
+						...created,
+						switch: {
+							switched: false,
+							error: { code: "WORKSPACE_CONTEXT_CONFLICT", message: "Workspace changed" },
+						},
+					},
+				),
+			).map((row) => row.text),
+		).toEqual(["Created", "fix/new · /repo/new", "Unchanged", "Workspace changed"]);
+		// No switch was requested: nothing extra is rendered.
+		expect(rows(detail("CreateWorktree", { branchName: "fix/new" }, created))).toHaveLength(2);
+	});
 	test("listing handles detached entries and truncation", () => {
 		expect(
 			rows(

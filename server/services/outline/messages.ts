@@ -38,6 +38,9 @@ export const OUTLINE_TEXT = {
 	/** A write by no session or person left a task to do instead of in progress. */
 	taskNotStarted:
 		"it would be in progress with nobody doing it (a write by no session), so it was left to do",
+	/** A revert (or bringing a task back) would have changed a lock its author may not: as it is. */
+	lockKept:
+		"only the person who locked it, a manager of the space or an admin may lock, unlock or change its lock: its lock was left as it is",
 	/** Summary of a compensating commit. */
 	revertSummary: (seq: number, summary: string) => `revert #${seq}: ${summary}`,
 
@@ -54,6 +57,12 @@ export const OUTLINE_TEXT = {
 	/** The block the lease job writes under a task in progress that nobody was holding. */
 	unclaimedReopened:
 		"This task was in progress, but no session or person was holding it; it is open again.",
+	/**
+	 * Summary of the commit that starts a session's next task when nothing of it is in progress
+	 * (§4.8). Written at the end of a turn whether or not a continuation follows.
+	 */
+	startedForSession: (address: string, narratorId: string) =>
+		`started ${address} for session ${narratorId}`,
 	/** Summary of a commit that only hands tasks over (their lease had run out). */
 	claimTakenOver: (addresses: readonly string[]) =>
 		`took over ${addresses.join(", ")} (the previous lease had run out)`,
@@ -80,6 +89,31 @@ export const OUTLINE_TEXT = {
 	sessionEndedSummary: (reason: "archived" | "deleted", n: number) =>
 		`session ${reason}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
 
+	/** A question block given a checkbox, or a task given a question. */
+	questionNotTask: (address: string) =>
+		`${address} is a question (asked with Ask); it cannot be a task too. Answer it, or withdraw it with Ask`,
+
+	/** An agent's write tried to lock or unlock (only people lock, through the page). */
+	lockDenied:
+		"only people lock or unlock a task (from the outline page); an agent cannot change a lock",
+	/** An agent's write tried to change a plan's state (the system keeps it: plan mode, approval). */
+	planStateDenied:
+		"a plan's state (planning, approved) is kept by plan mode; an agent cannot set or clear it",
+	/** Locking a task someone else locked. */
+	lockHeld: (address: string) =>
+		`${address} is locked by someone else; it has to be unlocked first (by them, a manager of the space or an admin) before anyone locks it again`,
+	/** Taking a lock away (unlocking, deleting the task, its checkbox) or changing it without the right to. */
+	unlockDenied: (address: string) =>
+		`${address} is locked (or would be, in someone else's name); only the person who locked it, a manager of the space or an admin may unlock it, change its lock, delete it or take its checkbox away`,
+	severalLockedPlans:
+		"the change touches several locked plans at once; change each plan in a call of its own",
+	pendingTooLarge: (ops: number, bytes: number) =>
+		`the change waiting for confirmation on this plan would grow past ${ops} operations or ${bytes} bytes of text; wait until it is confirmed or rejected`,
+	pendingFull: (max: number) =>
+		`the page already has ${max} changes waiting for confirmation; wait until some are decided`,
+	/** Summary of a commit that confirms a pending change. */
+	confirmSummary: (label: string, summary: string) => `confirm ${label}: ${summary}`,
+
 	/** Why a read or search was refused. */
 	errors: {
 		pageTooLarge: (pageId: string, max: number) =>
@@ -88,7 +122,28 @@ export const OUTLINE_TEXT = {
 		badTime: "not a valid time",
 		tooManySpaces: (max: number, got: number) =>
 			`a search covers at most ${max} spaces (got ${got})`,
+		/** An agent's write to the session's behavior page without the user turn's grant. */
+		behaviorPageReadonly:
+			"the behavior page of this session (alias behavior) holds the user's standing rules: you may write it only as the first tool call of a user turn in which the user asked you to record a rule",
+		/** An agent's write giving or taking the task page's alias, moving or deleting the page. */
+		tasksPageReserved:
+			"the task page of this session (alias tasks) is where people add their tasks: you may add and change blocks under it, but not give or take its alias, nor move or delete the page",
 	},
+	/** Summary of the commit that imports a session's old behavior fence into its page. */
+	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",
+	/** Summary of the commit that copies the behavior page into a fork. */
+	behaviorForkSummary: (from: string) => `copied the behavior page from session ${from}`,
+	/** Summaries of a plugin's commits for a session (`plugin-tasks.ts`, outline P2 PR 12a). */
+	pluginTaskAdded: (pluginId: string) => `plugin ${pluginId} added a task`,
+	pluginTaskStatus: (pluginId: string, address: string, status: string) =>
+		`plugin ${pluginId} set ${address} to ${status}`,
+	pluginTasksWritten: (pluginId: string) =>
+		`plugin ${pluginId} wrote its task list (spec://tasks.json)`,
+	pluginIndexWritten: (pluginId: string) => `plugin ${pluginId} wrote index.md (spec://index.md)`,
+	pluginRulesSet: (pluginId: string) => `plugin ${pluginId} updated its rules on this page`,
+	pluginRulesCleared: (pluginId: string) => `plugin ${pluginId} cleared its rules on this page`,
+	pluginSopMoved: (pluginId: string) =>
+		`moved plugin ${pluginId}'s rules from the old behavior fence (spec://behavior_fence) into this page`,
 } as const;
 
 export type OutlineRevertSkipReason = keyof typeof OUTLINE_TEXT.revertSkipped;
@@ -243,6 +298,15 @@ export const OUTLINE_TOOL_TEXT = {
 			`${n} more link targets were kept as written without resolving them`,
 		tooManyAliases: (prefix: string) =>
 			`the space has too many aliases starting with ${prefix} to number the next one; give the alias explicitly`,
+		/** An agent's hand-over ended the work on a task in progress (`write.ts`, `handed-over`). */
+		handedOver: (address: string) =>
+			`${address} was in progress and got a new assignee: it is back to to-do, so whoever takes it up claims it afresh`,
+		/** `@agent:name` names no session: written as a name, nobody is told. */
+		assigneeUnknown: (name: string) =>
+			`no session has the id or handle ${quoted(name)}: @agent:${name} was written as a label only. Nobody is told and nothing changes hands: a task of yours that is in progress is still in progress and still yours`,
+		/** `@agent:name` names a session that could not do the task. */
+		assigneeCannotWork: (name: string) =>
+			`the session @agent:${name} names cannot work in this space (it is archived, or the person it works for may not write here); nothing was written`,
 		taskPropsIgnored: (n: number) =>
 			`edit ${n}: depends:: and due:: belong to tasks and were left out on a block without a checkbox`,
 		samePageTitle: (title: string, addresses: readonly string[]) =>
@@ -313,5 +377,103 @@ export const OUTLINE_TOOL_TEXT = {
 		set: (sid: string, parts: readonly string[]) => `set [${sid}]: ${parts.join(", ")}`,
 		notesHeader: "Notes:",
 		hintsHeader: "Hints:",
+		/**
+		 * The note rules (`@shared/outline-note-structure`): what a call writes under a task. A
+		 * block is named `[id]` once written, and by its edit and first words when nothing was.
+		 */
+		noteRules: {
+			warnHeader:
+				"Note format: written, but under a task write conclusion → evidence → detail (a task folds to its title and one line). Restructure these with OutlineEdit:",
+			refusedHeader:
+				"Nothing was written: what this call writes under a task is far over the note limits. Under a task write conclusion → evidence → detail (a task folds to its title and one line):",
+			written: (id: string) => `[${id}]`,
+			unwritten: (n: number, excerpt: string) => `edit ${n}, the block starting «${excerpt}»`,
+			longTitle: (at: string, chars: number, lines: number, limit: number) =>
+				`${at} (a task's title) has ${chars} characters${lines > 1 ? ` on ${lines} lines` : ""}: a title is one line (at most ${limit} characters) saying what done means; put the rest in blocks under it.`,
+			longNote: (at: string, chars: number, limit: number) =>
+				`${at} has ${chars} characters directly under a task: a block there is read as one line (at most ${limit} characters) — a conclusion, or what a description or a brief opens with. Keep that line as the block's text and put the rest (the evidence, the details, the body of the brief) in blocks under it (indented items).`,
+			longDetail: (at: string, chars: number, limit: number) =>
+				`${at} has ${chars} characters: evidence or a detail is at most ${limit} characters; split it into several blocks, or put the finer parts under it.`,
+			flat: (at: string, children: number, limit: number, task: boolean) =>
+				`${at} gets ${children} blocks directly under it in this call: at most ${limit} on one level; ${task ? "group them under a few conclusions (subtasks under phases)" : "group them"}.`,
+			heading: (at: string) =>
+				`${at} is a heading under a task: make it a one-line conclusion (no #) and indent what follows under it; under a task the levels are the indentation.`,
+			more: (n: number) => `${n} more like these.`,
+			/** The refusal's last line: what happened to the rest, and what to do. */
+			refusedRecover:
+				"Send the call again with those blocks restructured; nothing of the call was written, and the rest of it was not checked further.",
+			/** A task ticked done or cancelled with no note under it. */
+			noResult: (id: string, cancelled: boolean, before: string | null, heading: string | null) =>
+				`[${id}] is ${cancelled ? "cancelled" : "done"} with ${heading ? `a heading ([${heading}]) where its result should be, so folded it shows that label` : "no result under it, so folded it shows only its title"}: add one line saying ${cancelled ? "why it was cancelled" : "what came of it"} as its first block ({ add: "${id}", markdown: "- …"${before ? `, before: "${before}"` : ""} }).`,
+			tidyLong: (id: string, blocks: readonly string[], more: number, limit: number) =>
+				`under the finished task [${id}], ${blocks.join(", ")}${more > 0 ? ` and ${more} more` : ""} ${blocks.length + more === 1 ? "is" : "are"} longer than a conclusion (at most ${limit} characters): compress each into one line with its evidence in blocks under it, and delete what only records the process.`,
+			tidyBlock: (id: string, chars: number | null) =>
+				chars === null ? `[${id}]` : `[${id}] (${chars} characters)`,
+			tidyFlat: (id: string, notes: number, more: boolean, limit: number) =>
+				`the finished task [${id}] has ${more ? `more than ${notes}` : notes} notes directly under it (at most ${limit} on one level): gather them under a few conclusions, the result first.`,
+		},
+		/** An edit some of whose operations were held for confirmation. */
+		heldEdit: (n: number, what: string, all: boolean) =>
+			`${n}. ${all ? "held for confirmation" : "held in part for confirmation"}: ${what}`,
+		nothingWrittenDirectly:
+			"Nothing was written directly: the change waits for confirmation (below).",
+		mixedDecisions: "confirm and reject go in a call of their own, without block edits",
+		pendingNewBlock: (ref: string, label: string, decider: string) =>
+			`${ref} is a block ${label} adds; it exists once ${decider} confirms ${label}, so nothing can be written under it or to it before`,
+	},
+
+	/** Changes to locked plans waiting for confirmation (design §2.6). */
+	pending: {
+		/** The decider, as marks and results name them. */
+		deciderPerson: (name: string | null, id: string) => (name ? name : `the person ${id}`),
+		deciderSession: (title: string | null, id: string) =>
+			title ? `the session ${quoted(title)} (${id})` : `the session ${id}`,
+		deciderEither: (person: string, delegate: string) =>
+			`${person} (or ${delegate} on their behalf)`,
+		markOwn: (label: string, _decider: string) =>
+			`pending ${label}: your proposed change, not confirmed yet`,
+		markOwnDeleted: (label: string, _decider: string, n: number) =>
+			`pending ${label}: you proposed deleting ${n === 1 ? "1 block" : `${n} blocks`} here, not confirmed yet`,
+		markOther: (label: string, _decider: string) =>
+			`pending ${label}: a change proposed here waits for confirmation`,
+		markOwnMerged: (label: string, _decider: string) =>
+			`pending ${label}: your proposed change, merged over changes made here since you proposed it; not confirmed yet`,
+		markOwnConflict: (label: string, _decider: string, detail: string) =>
+			`pending ${label}: changed since you proposed it, your change no longer applies here (${detail}); shown as it is now`,
+		/** After a read: this session's own open changes on the page. */
+		yours: (label: string, decider: string, since: "none" | "merged" | "conflict") =>
+			since === "conflict"
+				? `${label} is your change to this plan; blocks it changes were changed since you proposed it and part of it no longer applies (marked above, shown as they are now): it cannot be confirmed as it is. Propose those blocks again from the text as it is now (they merge into ${label}), or reject ${label} to withdraw it. It waits for ${decider}`
+				: since === "merged"
+					? `${label} is your change to this plan, shown above merged over changes made since you proposed it (marked); it waits for ${decider} to confirm (blocks it adds exist once confirmed)`
+					: `${label} is your change to this plan, shown above as you proposed it; it waits for ${decider} to confirm (blocks it adds exist once confirmed)`,
+		/** A change its proposer said nothing about, by its size. */
+		summaryOf: (n: number) => (n === 1 ? "1 change" : `${n} changes`),
+		/** After a read: changes waiting for this session's confirmation. */
+		forYou: (label: string, summary: string, by: string) =>
+			`${label} waits for your confirmation: ${summary} (proposed by ${by}); confirm with OutlineEdit { edits: [{ confirm: "${label}" }] }, or reject with { reject: "${label}", reason }`,
+		reportConfirmed: (label: string, by: string, seq: number | null) =>
+			`${label} was confirmed by ${by}${seq === null ? "" : ` (commit #${seq})`}: its changes are in the outline now`,
+		reportRejected: (label: string, by: string, reason: string | null) =>
+			`${label} was rejected by ${by}${reason ? `: ${reason}` : ""}`,
+		reportWithdrawn: (label: string, why: string) => `${label} was withdrawn: ${why}`,
+		whyUnlocked: "the plan was unlocked",
+		whyDeleted: "the locked task was deleted",
+		/** The result of an edit that was held. */
+		held: (label: string, n: number, root: string, decider: string, merged: boolean) =>
+			`Held for confirmation as ${label}: ${n === 1 ? "1 change" : `${n} changes`} to the locked plan ${root}, waiting for ${decider} to confirm${merged ? " (merged into the change this session had already proposed there)" : ""}.`,
+		heldWaiting: (tasks: readonly string[]) =>
+			`Tasks that wait for it: ${list(tasks, 10)}. Do not start them; carry on with work it does not affect.`,
+		heldCarryOn: "Carry on with work it does not affect.",
+		heldRead:
+			"Reading the plan shows your proposed version, marked ‹pending›. Blocks it adds exist once confirmed: write under them after that.",
+		confirmed: (label: string, seq: number | null, by: string) =>
+			seq === null
+				? `Confirmed ${label} (proposed by ${by}); the outline already read as it proposes, so no commit was written.`
+				: `Confirmed ${label} (proposed by ${by}): committed #${seq}.`,
+		rejected: (label: string) => `Rejected ${label}; its proposer is told on its next read.`,
+		withdrew: (label: string) => `Withdrew ${label}, which this session had proposed.`,
+		badLabel: (ref: string) =>
+			`${quoted(ref)} is not a pending change: name it as a read shows it, P and 8 characters (P1a2B3c4D)`,
 	},
 } as const;

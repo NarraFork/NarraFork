@@ -55,7 +55,11 @@ import {
 	nextHighlightRequestId,
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
-import { resolveFileBrowserPosition, resolveToolPlacement } from "../panels/tool-placement";
+import {
+	resolveFileBrowserPosition,
+	resolveToolPlacement,
+	WIDE_TOOL_PANEL_TYPES,
+} from "../panels/tool-placement";
 import {
 	dockPanelId,
 	fileDockPanelId,
@@ -307,7 +311,9 @@ export function NarratorDockProvider({
 			// open tool panel (panelType !== "chat").
 			const existingTool = api.panels.find((p) => {
 				const params = p.params as NarratorDockPanelParams | undefined;
-				return params && params.panelType !== "chat";
+				return (
+					params && params.panelType !== "chat" && !WIDE_TOOL_PANEL_TYPES.has(params.panelType)
+				);
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 
@@ -319,7 +325,20 @@ export function NarratorDockProvider({
 				hasSecondaryGroup: !!existingTool?.group,
 				hasChatPanel: !!chatPanel,
 				surfaceWidth: api.width,
+				surfaceHeight: api.height,
+				wide: WIDE_TOOL_PANEL_TYPES.has(type),
 			});
+
+			if (placement.mode === "split-above" && chatPanel) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT[type],
+					params,
+					initialHeight: placement.initialHeight,
+					position: { referencePanel: chatPanel.id, direction: "above" },
+				});
+				return;
+			}
 
 			if (placement.mode === "within-secondary" && existingTool?.group) {
 				// Subsequent tool panels: add as a tab within the existing secondary
@@ -392,7 +411,7 @@ export function NarratorDockProvider({
 
 			const existingSecondary = api.panels.find((panel) => {
 				const params = panel.params as NarratorDockPanelParams | undefined;
-				return params?.panelType !== "chat";
+				return params?.panelType !== "chat" && !WIDE_TOOL_PANEL_TYPES.has(params?.panelType ?? "");
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 			const params: NarratorDockPanelParams = {
@@ -491,7 +510,10 @@ export function NarratorDockProvider({
 
 			const existingSecondary = api.panels.find((panel) => {
 				const panelParams = panel.params as NarratorDockPanelParams | undefined;
-				return panelParams?.panelType !== "chat";
+				return (
+					panelParams?.panelType !== "chat" &&
+					!WIDE_TOOL_PANEL_TYPES.has(panelParams?.panelType ?? "")
+				);
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 			const params: NarratorDockPanelParams = {
@@ -563,7 +585,10 @@ export function NarratorDockProvider({
 
 			const existingSecondary = api.panels.find((panel) => {
 				const panelParams = panel.params as NarratorDockPanelParams | undefined;
-				return panelParams?.panelType !== "chat";
+				return (
+					panelParams?.panelType !== "chat" &&
+					!WIDE_TOOL_PANEL_TYPES.has(panelParams?.panelType ?? "")
+				);
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 			const params: KnowledgePanelParams = { panelType: "knowledge", entryId, scope };
@@ -624,7 +649,10 @@ export function NarratorDockProvider({
 			};
 			const existingSecondary = api.panels.find((panel) => {
 				const panelParams = panel.params as NarratorDockPanelParams | undefined;
-				return panelParams?.panelType !== "chat";
+				return (
+					panelParams?.panelType !== "chat" &&
+					!WIDE_TOOL_PANEL_TYPES.has(panelParams?.panelType ?? "")
+				);
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 			const placement = resolveToolPlacement({

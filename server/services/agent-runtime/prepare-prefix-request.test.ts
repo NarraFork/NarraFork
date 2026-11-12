@@ -10,6 +10,7 @@ import * as snapshots from "../narrator-prefix-snapshots";
 import { narratorService } from "../narrator-service";
 import { buildContextManagementHooks } from "../narrator-session";
 import { buildRuntimeHistory } from "./history";
+import * as historyRevision from "./model-history-revision";
 import * as preparation from "./prepare-prefix-request";
 
 const { narratorPersistence } = await import("../narrator-persistence");
@@ -200,6 +201,38 @@ describe("shared prefix request preparation", () => {
 		}
 	});
 
+	test("the request entry allows a source read to cross ten seconds and forwards only cancellation", async () => {
+		const narratorId = await narrator();
+		const controller = new AbortController();
+		const startedAt = Date.now();
+		let now = startedAt;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const realSignature = historyRevision.readSqliteModelHistorySignature;
+		const signature = spyOn(historyRevision, "readSqliteModelHistorySignature").mockImplementation(
+			(...args) => {
+				const result = realSignature(...args);
+				now += 11_000;
+				return result;
+			},
+		);
+		const read = spyOn(narratorService, "getModelHistorySinceLastCompact");
+		try {
+			const prepared = await preparation.preparePrefixRequest({
+				narratorId,
+				locale: "en",
+				getModel: () => "claude-sonnet-4",
+				getProvider: () => provider,
+				signal: controller.signal,
+			});
+			expect(now - startedAt).toBeGreaterThan(10_000);
+			expect(prepared.sourceMessages).toEqual([]);
+			expect(read).toHaveBeenCalledWith(narratorId, undefined, { signal: controller.signal });
+		} finally {
+			read.mockRestore();
+			signature.mockRestore();
+			clock.mockRestore();
+		}
+	});
 	test("real snapshot work exceeding ten seconds prepares first and later requests without losing summary metadata", async () => {
 		const narratorId = await narrator();
 		const controller = new AbortController();

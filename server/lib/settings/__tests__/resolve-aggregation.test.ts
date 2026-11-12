@@ -156,6 +156,14 @@ describe("resolveAggregation", () => {
 		expect(draft.agent.translationModel).toBe("__summary__");
 	});
 
+	test("a removed provider leaves the auto-excluded list, so a new one of that prefix joins auto", () => {
+		const draft = structuredClone(DEFAULTS);
+		draft.agent.autoExcludedProviders = ["removed", "kept"];
+
+		expect(purgeStaleAgentModelRefs(draft, (prefix) => prefix === "removed")).toBe(true);
+		expect(draft.agent.autoExcludedProviders).toEqual(["kept"]);
+	});
+
 	test("prompt optimize model defaults to dynamically following the summary model", () => {
 		expect(DEFAULTS.agent.promptOptimizeModel).toBe("__summary__");
 		settings.agent.defaultModel = "provDefault:model";

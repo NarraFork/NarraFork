@@ -154,7 +154,8 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		kind: "system-text",
 		label: "System card (multi-line text)",
 		lodSensitive: false,
-		measure: (d, w, l) => measureSystemTextCard((d as AnyData).kind, d as AnyData, w, l),
+		measure: (d, w, l, o) =>
+			measureSystemTextCard((d as AnyData).kind, d as AnyData, w, l, o as AnyData),
 	},
 	"knowledge-hint": {
 		kind: "knowledge-hint",
@@ -191,6 +192,12 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "Subagent recovery card",
 		lodSensitive: false,
 		measure: (d, w, l, o) => measureSubagentRecovery(d as AnyData, w, l, o as AnyData),
+	},
+	"auxiliary-content": {
+		kind: "auxiliary-content",
+		label: "Auxiliary content (shared tool-card presentation)",
+		lodSensitive: true,
+		measure: (d, w, l, o) => measureToolCall(d as AnyData, w, l, o as AnyData),
 	},
 	"tool-call": {
 		kind: "tool-call",

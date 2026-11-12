@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { eventBus } from "../../lib/event-bus";
 import { getNarraforkPath } from "../../lib/narrafork-home";
 import {
 	MAX_RECOVERY_MANIFEST_BYTES,
@@ -44,6 +45,105 @@ import {
 	writePlannedUpdateRecoverySnapshot,
 	writePreparedUpdateRecoverySnapshot,
 } from "../update-coordinator";
+
+describe("lifecycle status invalidation", () => {
+	beforeEach(resetUpdateCoordinationForTests);
+	afterEach(resetUpdateCoordinationForTests);
+
+	async function observe(run: (events: unknown[]) => Promise<void>) {
+		const events: unknown[] = [];
+		const changed = (event: { type: "system:lifecycle_changed" }) => events.push(event);
+		eventBus.on("system:lifecycle_changed", changed);
+		try {
+			await run(events);
+		} finally {
+			eventBus.off("system:lifecycle_changed", changed);
+		}
+	}
+	const flush = () => Bun.sleep(75);
+
+	test("ordinary idle activity and status reads never broadcast", async () => {
+		await observe(async (events) => {
+			const execution = tryAcquireFinalUpdateExecution("ordinary", "n");
+			execution?.setNarratorId("other");
+			const response = await beginNarratorResponseActivity("n");
+			const admission = beginToolStartAdmission("ordinary", "n", "tool");
+			if (admission.status === "granted") admission.grant.release();
+			const unregister = registerNarratorLoop("n", "en");
+			getUpdateCoordinationStatus();
+			execution?.release();
+			response.release();
+			unregister();
+			await flush();
+			expect(events).toEqual([]);
+		});
+	});
+
+	test("coalesces maintenance bursts and delivers final idle even before the timer fires", async () => {
+		await observe(async (events) => {
+			const execution = tryAcquireFinalUpdateExecution("ordinary", "n");
+			scheduleUpdate("next");
+			beginQuiescingTools();
+			execution?.release();
+			cancelScheduledUpdate();
+			failScheduledUpdate("cancelled", { cancelled: true });
+			await flush();
+			expect(getUpdateCoordinationStatus().phase).toBe("idle");
+			expect(events).toEqual([{ type: "system:lifecycle_changed" }]);
+			tryAcquireFinalUpdateExecution("ordinary")?.release();
+			await flush();
+			expect(events).toHaveLength(1);
+		});
+	});
+
+	test("notifies stage, cancellation, blocker identity, counts and paused gate changes", async () => {
+		await observe(async (events) => {
+			const execution = tryAcquireFinalUpdateExecution("ordinary", "n");
+			const response = await beginNarratorResponseActivity("n");
+			const admission = beginToolStartAdmission("ordinary", "n", "tool");
+			scheduleUpdate("next");
+			await flush();
+			expect(events).toHaveLength(1);
+			execution?.setNarratorId("changed");
+			await flush();
+			expect(events).toHaveLength(2);
+			execution?.setNarratorId("changed");
+			getUpdateCoordinationStatus();
+			await flush();
+			expect(events).toHaveLength(2);
+			beginQuiescingTools();
+			await flush();
+			expect(events).toHaveLength(3);
+			const abort = new AbortController();
+			const waiting = waitUntilUpdateGateOpens(abort.signal).catch(() => {});
+			const epoch = getUpdateCoordinationStatus().updateEpoch;
+			if (!epoch) throw new Error("Missing update epoch");
+			const activity = beginUpdatePreAdmissionActivity(epoch, "n", "paused");
+			await flush();
+			expect(events).toHaveLength(4);
+			abort.abort();
+			await waiting;
+			activity?.release();
+			response.release();
+			if (admission.status === "granted") admission.grant.release();
+			execution?.release();
+			await flush();
+			expect(events).toHaveLength(5);
+			cancelScheduledUpdate();
+			await flush();
+			expect(events).toHaveLength(6);
+			cancelScheduledUpdate();
+			await flush();
+			expect(events).toHaveLength(6);
+			markUpdateRestarting();
+			await flush();
+			expect(events).toHaveLength(7);
+			failScheduledUpdate("cancelled", { cancelled: true });
+			await flush();
+			expect(events).toHaveLength(8);
+		});
+	});
+});
 
 describe("update coordinator handoff", () => {
 	beforeEach(() => resetUpdateCoordinationForTests());

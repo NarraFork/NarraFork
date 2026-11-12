@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import type { ComposerDocument } from "@shared/composer-document";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import { eq } from "drizzle-orm";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
@@ -228,8 +228,59 @@ function state(id: string) {
 		.get();
 }
 function childMessages() {
-	return db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, "child")).all();
+	return db
+		.select()
+		.from(narratorMessages)
+		.where(eq(narratorMessages.narratorId, "child"))
+		.all()
+		.map((message) => ({
+			...message,
+			contentJson: readTestMessageContent(sqlite, message.id),
+		}));
 }
+
+test("consumes a pre-media positional projection from a persisted user queue", async () => {
+	const document: ComposerDocument = {
+		version: 1,
+		assets: [{ id: "f", kind: "textFile", name: "note.txt", size: 1, mimeType: "text/plain" }],
+		paragraphs: [
+			{
+				children: [
+					{ type: "text", text: "literal [audio #1: x] and [video #2: y] " },
+					{ type: "attachment", id: "fn", assetId: "f" },
+				],
+			},
+		],
+	};
+	const oldText = "literal [audio #1: x] and [video #2: y] [file #1: note.txt]";
+	const file = new File(["x"], "note.txt", { type: "text/plain" });
+	// New admission must not accept the old projection.
+	await expect(
+		queueUserInput("child", oldText, { composerDocument: document, textFiles: [file] }),
+	).rejects.toThrow("does not match");
+	const accepted = await queueUserInput("child", composerDocumentText(document).text, {
+		composerDocument: document,
+		textFiles: [file],
+	});
+	// Reproduce the exact text stored by the old positional composer.
+	db.update(narratorBufferedMessages)
+		.set({ text: oldText })
+		.where(eq(narratorBufferedMessages.id, accepted.id))
+		.run();
+	db.update(narrators)
+		.set({ status: "idle", cwd: process.env.HOME })
+		.where(eq(narrators.id, "child"))
+		.run();
+	const runs = await observeRunStarts();
+	try {
+		expect(await inbox.wakeInboxIfEligible("child")).toBe(true);
+		expect(state(accepted.id)?.lastError).toBeNull();
+		const message = childMessages().find((item) => item.contentText?.includes(oldText));
+		expect(message?.composerDocument).toEqual(document);
+	} finally {
+		runs.restore();
+	}
+});
 
 test("child list and summary never materialize the full staging document", async () => {
 	const document: ComposerDocument = {
@@ -986,6 +1037,7 @@ for (const narratorId of ["parent", "child"] as const) {
 					.where(eq(narratorMessages.id, required(part.messageId)))
 					.get(),
 			);
+			message.contentJson = readTestMessageContent(sqlite, message.id);
 			expect(message.narratorId).toBe(narratorId);
 			expect(message.parentToolUseId).toBe(subagent?.parentToolUseId ?? null);
 			expect(part.text).toBe(projectMessageSenderText(message, message.contentText ?? ""));

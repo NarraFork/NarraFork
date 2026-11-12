@@ -11,7 +11,6 @@ import {
 	workspacePanels,
 	workspaces,
 } from "../../db/schema";
-import type { WorkspacePanelMembershipWrite } from "../../services/recent-tabs-service";
 
 const { db, sqlite } = getTestDb();
 const broadcasts: Array<{ userId: string; event: Record<string, unknown> }> = [];
@@ -25,16 +24,12 @@ mock.module("../../websocket/narrator-ws", () => ({
 	getNarratorPresenceBatch: () => new Map(),
 }));
 
-const { dissolveOrphanWorkspaces, workspaceRoutes } = await import("../workspaces");
+const { workspaceRoutes } = await import("../workspaces");
 const { WORKSPACE_TREE_MAX_BYTES } = await import("../../lib/validators/workspaces");
 const { buildAppErrorResponse } = await import("../../lib/app-error-response");
-const {
-	applyWorkspaceMembershipProjection,
-	clearRecentTabs,
-	removeRecentTab,
-	restoreRecentTabs,
-	runExpiredRecentTabsWorkspaceCleanup,
-} = await import("../../services/recent-tabs-service");
+const { clearRecentTabs, listPage, removeRecentTab } = await import(
+	"../../services/recent-tabs-service"
+);
 const NOW = "2026-07-19T00:00:00.000Z";
 const app = new Hono();
 app.use("*", async (c, next) => {
@@ -70,6 +65,7 @@ function seedUser(): void {
 		.values({
 			userId: "workspace-user",
 			revision: 7,
+			foldersMigrated: true,
 			migratedAt: NOW,
 			createdAt: NOW,
 			updatedAt: NOW,
@@ -93,11 +89,12 @@ function seedWorkspace(id: string, tree = "{}"): void {
 function seedTab(input: {
 	id: string;
 	tabKey: string;
-	type: "workspace" | "narrator";
+	type: "workspace" | "narrator" | "folder";
 	entityId: string;
 	title: string;
 	sortOrder: number;
 	workspaceId?: string;
+	folderId?: string;
 	representedNarratorId?: string;
 }): void {
 	db.insert(userRecentTabs)
@@ -110,6 +107,7 @@ function seedTab(input: {
 			entityId: input.entityId,
 			representedNarratorId: input.representedNarratorId ?? null,
 			workspaceId: input.workspaceId ?? null,
+			folderId: input.folderId ?? null,
 			title: input.title,
 			lastVisitedAt: 100 - input.sortOrder,
 			sortOrder: input.sortOrder,
@@ -131,68 +129,171 @@ afterAll(() => {
 	mock.restore();
 });
 
-describe("workspace normalized recent-tabs consumers", () => {
-	it("keeps normalized references and dissolves only unreferenced workspaces", async () => {
+function seedNarrator(id: string): void {
+	db.insert(narrators).values({ id, title: id, createdAt: NOW, updatedAt: NOW }).run();
+}
+
+function readRevision(): number | undefined {
+	return db
+		.select({ revision: userRecentTabsMeta.revision })
+		.from(userRecentTabsMeta)
+		.where(eq(userRecentTabsMeta.userId, "workspace-user"))
+		.get()?.revision;
+}
+
+// The sidebar used to mirror workspace membership (a `workspace` header with the
+// members underneath). Folders replaced that grouping, so the two are now independent:
+// no workspace write may touch the sidebar, and no sidebar write may touch a workspace.
+describe("workspaces are independent of the sidebar", () => {
+	it("deleting a workspace leaves the sidebar alone", async () => {
 		seedUser();
-		seedWorkspace("workspace-kept");
-		seedWorkspace("workspace-orphan");
+		seedWorkspace("ws");
 		seedTab({
-			id: "tab-kept",
-			tabKey: "workspace:workspace-kept",
-			type: "workspace",
-			entityId: "workspace-kept",
-			title: "Kept workspace",
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
 			sortOrder: 0,
+			representedNarratorId: "n1",
 		});
 
-		expect(await dissolveOrphanWorkspaces()).toBe(1);
-		expect(db.select({ id: workspaces.id }).from(workspaces).orderBy(workspaces.id).all()).toEqual([
-			{ id: "workspace-kept" },
+		const response = await app.request("/workspaces/ws", { method: "DELETE" });
+
+		expect(response.status).toBe(200);
+		expect(db.select().from(workspaces).where(eq(workspaces.id, "ws")).get()).toBe(undefined);
+		expect(db.select({ tabKey: userRecentTabs.tabKey }).from(userRecentTabs).all()).toEqual([
+			{ tabKey: "narrator:n1" },
 		]);
+		expect(readRevision()).toBe(7);
+		expect(broadcasts.some(({ event }) => event.type === "user:recent_tabs_delta")).toBe(false);
 	});
 
-	it("deleting a workspace releases children and emits a revision delta", async () => {
+	it("adding and removing a narrator panel never changes the sidebar", async () => {
 		seedUser();
-		seedWorkspace("workspace-delete");
+		seedWorkspace("ws");
+		seedNarrator("n1");
 		seedTab({
-			id: "tab-header",
-			tabKey: "workspace:workspace-delete",
-			type: "workspace",
-			entityId: "workspace-delete",
-			title: "Delete workspace",
-			sortOrder: 0,
-		});
-		seedTab({
-			id: "tab-child",
-			tabKey: "narrator:workspace-child",
+			id: "tab-n1",
+			tabKey: "narrator:n1",
 			type: "narrator",
-			entityId: "workspace-child",
-			title: "Workspace child",
-			sortOrder: 1,
-			workspaceId: "workspace-delete",
-			representedNarratorId: "workspace-child",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 0,
+			representedNarratorId: "n1",
 		});
 
-		const response = await app.request("/workspaces/workspace-delete", { method: "DELETE" });
-		expect(response.status).toBe(200);
-		expect(db.select().from(workspaces).where(eq(workspaces.id, "workspace-delete")).get()).toBe(
-			undefined,
-		);
+		const created = (await (
+			await app.request("/workspaces/ws/panels", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+			})
+		).json()) as { panel: { id: string } };
+		await app.request(`/workspaces/ws/panels/${created.panel.id}`, { method: "DELETE" });
+
+		const tab = db
+			.select()
+			.from(userRecentTabs)
+			.where(eq(userRecentTabs.tabKey, "narrator:n1"))
+			.get();
+		expect(tab?.folderId).toBe(null);
+		expect(tab?.workspaceId).toBe(null);
+		expect(readRevision()).toBe(7);
+	});
+
+	it("closing a sidebar tab keeps the narrator's workspace panel", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		seedTab({
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 0,
+			representedNarratorId: "n1",
+		});
+		await app.request("/workspaces/ws/panels", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+		});
+		broadcasts.length = 0;
+
+		await removeRecentTab("workspace-user", "narrator", "n1", { storeUndo: true });
+
 		expect(
-			db
-				.select({ tabKey: userRecentTabs.tabKey, workspaceId: userRecentTabs.workspaceId })
-				.from(userRecentTabs)
-				.where(eq(userRecentTabs.userId, "workspace-user"))
-				.all(),
-		).toEqual([{ tabKey: "narrator:workspace-child", workspaceId: null }]);
-		expect(
-			db
-				.select({ revision: userRecentTabsMeta.revision })
-				.from(userRecentTabsMeta)
-				.where(eq(userRecentTabsMeta.userId, "workspace-user"))
-				.get()?.revision,
-		).toBe(8);
-		expect(broadcasts.some(({ event }) => event.type === "user:recent_tabs_delta")).toBe(true);
+			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
+		).toHaveLength(1);
+		expect(broadcasts.some(({ event }) => event.type === "workspace_changed")).toBe(false);
+	});
+
+	// Before folders, a cleared workspace group scheduled its workspace for deletion.
+	it("clearing inactive tabs never deletes a workspace", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		seedTab({
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 0,
+			representedNarratorId: "n1",
+		});
+
+		await clearRecentTabs("workspace-user", "inactive_narrators");
+
+		expect(db.select({ id: workspaces.id }).from(workspaces).all()).toEqual([{ id: "ws" }]);
+	});
+
+	// The one-time folder conversion turns a legacy `workspace` header into a folder with
+	// the same id. That must not cost the user the workspace itself.
+	it("converting a legacy workspace group keeps the workspace and its backfill source", async () => {
+		seedUser();
+		db.update(userRecentTabsMeta).set({ foldersMigrated: false }).run();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		seedNarrator("n2");
+		seedTab({
+			id: "tab-ws",
+			tabKey: "workspace:ws",
+			type: "workspace",
+			entityId: "ws",
+			title: "Legacy group",
+			sortOrder: 0,
+		});
+		for (const [index, id] of ["n1", "n2"].entries()) {
+			seedTab({
+				id: `tab-${id}`,
+				tabKey: `narrator:${id}`,
+				type: "narrator",
+				entityId: id,
+				title: id,
+				sortOrder: index + 1,
+				workspaceId: "ws",
+				representedNarratorId: id,
+			});
+		}
+
+		const page = await listPage("workspace-user", "work");
+
+		expect(page.items.map((tab) => [tab.type, tab.id, tab.folderId ?? null])).toEqual([
+			["folder", "ws", null],
+			["narrator", "n1", "ws"],
+			["narrator", "n2", "ws"],
+		]);
+		expect(page.items[0].title).toBe("Legacy group");
+		expect(db.select({ id: workspaces.id }).from(workspaces).all()).toEqual([{ id: "ws" }]);
+		// The frozen projection still recovers both narrators for a workspace that never
+		// had membership rows.
+		const opened = (await (await app.request("/workspaces/ws")).json()) as {
+			panels: Array<{ narratorId: string | null }>;
+		};
+		expect(opened.panels.map((panel) => panel.narratorId).sort()).toEqual(["n1", "n2"]);
 	});
 });
 
@@ -294,10 +395,6 @@ describe("workspace layout payload handling", () => {
 });
 
 describe("membership routes", () => {
-	function seedNarrator(id: string): void {
-		db.insert(narrators).values({ id, title: id, createdAt: NOW, updatedAt: NOW }).run();
-	}
-
 	// Opening a workspace must deliver membership and arrangement together. If a
 	// client could render the layout before knowing the member set, it would be
 	// able to display exactly the state this redesign removes.
@@ -350,45 +447,6 @@ describe("membership routes", () => {
 		).toHaveLength(1);
 	});
 
-	it("deletes a panel and releases its sidebar tab", async () => {
-		seedUser();
-		seedWorkspace("ws");
-		seedNarrator("n1");
-		seedTab({
-			id: "tab-n1",
-			tabKey: "narrator:n1",
-			type: "narrator",
-			entityId: "n1",
-			title: "n1",
-			sortOrder: 1,
-			workspaceId: "ws",
-			representedNarratorId: "n1",
-		});
-		const created = (await (
-			await app.request("/workspaces/ws/panels", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
-			})
-		).json()) as { panel: { id: string } };
-
-		const response = await app.request(`/workspaces/ws/panels/${created.panel.id}`, {
-			method: "DELETE",
-		});
-
-		expect(response.status).toBe(200);
-		expect(
-			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
-		).toHaveLength(0);
-		expect(
-			db
-				.select({ workspaceId: userRecentTabs.workspaceId })
-				.from(userRecentTabs)
-				.where(eq(userRecentTabs.tabKey, "narrator:n1"))
-				.get()?.workspaceId,
-		).toBe(null);
-	});
-
 	it("rejects a foreign workspace's panels as not found", async () => {
 		seedUser();
 		db.insert(users)
@@ -413,180 +471,6 @@ describe("membership routes", () => {
 
 		const response = await app.request("/workspaces/other-ws/panels");
 		expect(response.status).toBe(404);
-	});
-});
-
-describe("membership write atomicity", () => {
-	function seedNarrator(id: string): void {
-		db.insert(narrators).values({ id, title: id, createdAt: NOW, updatedAt: NOW }).run();
-	}
-
-	function panelRow(id: string, workspaceId: string, narratorId: string, sortOrder = 1000) {
-		return {
-			id,
-			workspaceId,
-			kind: "narrator" as const,
-			narratorId,
-			configJson: null,
-			sortOrder,
-			createdAt: new Date(NOW),
-			updatedAt: new Date(NOW),
-		};
-	}
-
-	function readRevision(): number | undefined {
-		return db
-			.select({ revision: userRecentTabsMeta.revision })
-			.from(userRecentTabsMeta)
-			.where(eq(userRecentTabsMeta.userId, "workspace-user"))
-			.get()?.revision;
-	}
-
-	// The projection already matches (the tab is attached), so no tab row changes —
-	// the membership write must STILL land, in its own transaction.
-	it("lands the membership row when the tab projection is already in place", async () => {
-		seedUser();
-		seedWorkspace("ws");
-		seedNarrator("n1");
-		// The workspace header tab must exist, or `regroupWorkspaces` treats the
-		// child as an orphan and detaches it — which would be a CHANGE, not the
-		// no-op branch this test is about.
-		seedTab({
-			id: "tab-ws",
-			tabKey: "workspace:ws",
-			type: "workspace",
-			entityId: "ws",
-			title: "ws",
-			sortOrder: 0,
-		});
-		seedTab({
-			id: "tab-n1",
-			tabKey: "narrator:n1",
-			type: "narrator",
-			entityId: "n1",
-			title: "n1",
-			sortOrder: 1,
-			workspaceId: "ws",
-			representedNarratorId: "n1",
-		});
-
-		const result = await applyWorkspaceMembershipProjection("workspace-user", {
-			narratorId: "n1",
-			workspaceId: "ws",
-			panelMembership: { action: "insert", row: panelRow("panel-n1", "ws", "n1") },
-		});
-
-		expect(result.changed).toBe(false);
-		expect(
-			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
-		).toHaveLength(1);
-		// A no-op projection bumps no revision and broadcasts nothing.
-		expect(readRevision()).toBe(7);
-		expect(broadcasts.some(({ event }) => event.type === "user:recent_tabs_delta")).toBe(false);
-	});
-
-	// A failure inside the declared write (here: the (workspace, narrator) unique
-	// index) must roll the WHOLE transaction back — tab rows, revision bump and
-	// broadcast included — not just skip the panel row.
-	it("rolls back the tab projection, revision and broadcast when the membership write fails", async () => {
-		seedUser();
-		seedWorkspace("ws");
-		seedNarrator("n1");
-		seedTab({
-			id: "tab-ws",
-			tabKey: "workspace:ws",
-			type: "workspace",
-			entityId: "ws",
-			title: "ws",
-			sortOrder: 0,
-		});
-		// The tab is NOT attached, so the projection would change rows this time.
-		seedTab({
-			id: "tab-n1",
-			tabKey: "narrator:n1",
-			type: "narrator",
-			entityId: "n1",
-			title: "n1",
-			sortOrder: 1,
-			representedNarratorId: "n1",
-		});
-		// A pre-existing row makes the declared insert violate the unique index
-		// mid-transaction, after the tab diff has already been applied.
-		db.insert(workspacePanels)
-			.values(panelRow("panel-existing", "ws", "n1"))
-			.run();
-
-		await expect(
-			applyWorkspaceMembershipProjection("workspace-user", {
-				narratorId: "n1",
-				workspaceId: "ws",
-				panelMembership: { action: "insert", row: panelRow("panel-dupe", "ws", "n1", 2000) },
-			}),
-		).rejects.toThrow();
-
-		expect(
-			db
-				.select({ workspaceId: userRecentTabs.workspaceId })
-				.from(userRecentTabs)
-				.where(eq(userRecentTabs.tabKey, "narrator:n1"))
-				.get()?.workspaceId,
-		).toBe(null);
-		expect(readRevision()).toBe(7);
-		expect(
-			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
-		).toHaveLength(1);
-		expect(broadcasts.some(({ event }) => event.type === "user:recent_tabs_delta")).toBe(false);
-	});
-
-	// Removing a panel whose row is already gone is a no-op write, not an error:
-	// the tab release is the intent and is idempotent.
-	it("releases the tab even when the membership row is already gone", async () => {
-		seedUser();
-		seedWorkspace("ws");
-		seedNarrator("n1");
-		seedTab({
-			id: "tab-ws",
-			tabKey: "workspace:ws",
-			type: "workspace",
-			entityId: "ws",
-			title: "ws",
-			sortOrder: 0,
-		});
-		seedTab({
-			id: "tab-n1",
-			tabKey: "narrator:n1",
-			type: "narrator",
-			entityId: "n1",
-			title: "n1",
-			sortOrder: 1,
-			workspaceId: "ws",
-			representedNarratorId: "n1",
-		});
-
-		const result = await applyWorkspaceMembershipProjection("workspace-user", {
-			narratorId: "n1",
-			workspaceId: null,
-			panelMembership: { action: "remove", panelId: "panel-never-existed" },
-		});
-
-		expect(result.changed).toBe(true);
-		expect(
-			db
-				.select({ workspaceId: userRecentTabs.workspaceId })
-				.from(userRecentTabs)
-				.where(eq(userRecentTabs.tabKey, "narrator:n1"))
-				.get()?.workspaceId,
-		).toBe(null);
-	});
-
-	// Compile-time negative test, enforced by `tsgo --noEmit`: the membership port
-	// takes DATA, so no function — sync or async — can be supplied as the write.
-	// This is what keeps the SQLite early-commit hazard inexpressible rather than
-	// merely unidiomatic.
-	it("statically refuses callback-shaped work", () => {
-		// @ts-expect-error — a callback is not a declarative membership write
-		const notAWrite: WorkspacePanelMembershipWrite = async () => {};
-		void notAWrite;
 	});
 });
 
@@ -781,223 +665,38 @@ describe("workspace change broadcasts", () => {
 	});
 });
 
-// Closing a workspace child's own narrator tab from the sidebar must remove its
-// membership row: the row is the authority, and leaving it behind would re-add
-// the panel to every open view of that workspace.
-describe("sidebar tab close cascades to workspace membership", () => {
-	function seedNarrator(id: string): void {
-		db.insert(narrators).values({ id, title: id, createdAt: NOW, updatedAt: NOW }).run();
-	}
-
-	function panelRow(id: string, workspaceId: string, narratorId: string) {
-		return {
-			id,
-			workspaceId,
-			kind: "narrator" as const,
-			narratorId,
-			configJson: null,
-			sortOrder: 1000,
-			createdAt: new Date(NOW),
-			updatedAt: new Date(NOW),
-		};
-	}
-
-	function workspaceChangedEvents(): Array<Record<string, unknown>> {
-		return broadcasts
-			.map(({ event }) => event)
-			.filter((event) => event.type === "workspace_changed");
-	}
-
-	function seedGroupedWorkspaceWithNarrator(): void {
+describe("legacy sidebar grouping is a one-time backfill source", () => {
+	// Before folders, removing a panel also cleared the tab's `workspace_id`. Now nothing
+	// writes the column, so the backfill must consume it — otherwise removing every
+	// panel would bring them all back on the next open.
+	it("removed panels stay removed after the legacy grouping filled them in", async () => {
 		seedUser();
 		seedWorkspace("ws");
 		seedNarrator("n1");
-		seedTab({
-			id: "tab-ws",
-			tabKey: "workspace:ws",
-			type: "workspace",
-			entityId: "ws",
-			title: "ws",
-			sortOrder: 0,
-		});
 		seedTab({
 			id: "tab-n1",
 			tabKey: "narrator:n1",
 			type: "narrator",
 			entityId: "n1",
 			title: "n1",
-			sortOrder: 1,
+			sortOrder: 0,
 			workspaceId: "ws",
 			representedNarratorId: "n1",
 		});
-		db.insert(workspacePanels)
-			.values(panelRow("panel-n1", "ws", "n1"))
-			.run();
-	}
 
-	it("closing a grouped narrator tab removes its panel membership and announces it", async () => {
-		seedGroupedWorkspaceWithNarrator();
-		broadcasts.length = 0;
-
-		const result = await removeRecentTab("workspace-user", "narrator", "n1");
-
-		expect(result.changed).toBe(true);
+		const first = (await (await app.request("/workspaces/ws")).json()) as {
+			panels: Array<{ id: string; narratorId: string | null }>;
+		};
+		expect(first.panels.map((panel) => panel.narratorId)).toEqual(["n1"]);
 		expect(
-			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
-		).toHaveLength(0);
-		expect(
-			db.select().from(userRecentTabs).where(eq(userRecentTabs.tabKey, "narrator:n1")).all(),
-		).toHaveLength(0);
-		expect(workspaceChangedEvents()).toEqual([
-			{ type: "workspace_changed", workspaceId: "ws", reason: "membership" },
-		]);
-	});
+			db.select({ workspaceId: userRecentTabs.workspaceId }).from(userRecentTabs).get()
+				?.workspaceId,
+		).toBe(null);
 
-	it("closing an UNGROUPED narrator tab announces nothing", async () => {
-		seedUser();
-		seedNarrator("n1");
-		seedTab({
-			id: "tab-n1",
-			tabKey: "narrator:n1",
-			type: "narrator",
-			entityId: "n1",
-			title: "n1",
-			sortOrder: 0,
-		});
-		broadcasts.length = 0;
-
-		await removeRecentTab("workspace-user", "narrator", "n1");
-
-		expect(workspaceChangedEvents()).toEqual([]);
-	});
-
-	// Undo restores the tab rows; the cascaded membership row must come back in
-	// the same transaction, or the restored tab would group under a workspace
-	// that no longer contains the narrator.
-	it("undoing a grouped narrator close restores the membership row and announces it", async () => {
-		seedGroupedWorkspaceWithNarrator();
-		broadcasts.length = 0;
-
-		const closed = await removeRecentTab("workspace-user", "narrator", "n1", {
-			storeUndo: true,
-		});
-		expect(closed.undoToken).toBeDefined();
-		expect(
-			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
-		).toHaveLength(0);
-		broadcasts.length = 0;
-
-		const restored = await restoreRecentTabs("workspace-user", { token: closed.undoToken });
-
-		expect(restored.changed).toBe(true);
-		const rows = db
-			.select()
-			.from(workspacePanels)
-			.where(eq(workspacePanels.workspaceId, "ws"))
-			.all();
-		expect(rows).toHaveLength(1);
-		expect(rows[0]?.narratorId).toBe("n1");
-		// The tab is back in the group.
-		expect(
-			db
-				.select({ workspaceId: userRecentTabs.workspaceId })
-				.from(userRecentTabs)
-				.where(eq(userRecentTabs.tabKey, "narrator:n1"))
-				.get()?.workspaceId,
-		).toBe("ws");
-		expect(workspaceChangedEvents()).toEqual([
-			{ type: "workspace_changed", workspaceId: "ws", reason: "membership" },
-		]);
-	});
-});
-
-// Every path that deletes a workspaces row must announce it, or a device holding
-// that workspace open refetches into a 404 and sits on its loader forever.
-describe("workspace deletion announcements beyond the route", () => {
-	function workspaceChangedEvents(): Array<Record<string, unknown>> {
-		return broadcasts
-			.map(({ event }) => event)
-			.filter((event) => event.type === "workspace_changed");
-	}
-
-	it("closing the workspace HEADER tab deletes the row and announces it", async () => {
-		seedUser();
-		seedWorkspace("ws");
-		seedTab({
-			id: "tab-ws",
-			tabKey: "workspace:ws",
-			type: "workspace",
-			entityId: "ws",
-			title: "ws",
-			sortOrder: 0,
-		});
-		broadcasts.length = 0;
-
-		// The route DELETE normally removes the row first; this covers the path
-		// where it did not (its failure is swallowed client-side) and the
-		// recent-tabs mutation is the one that actually deletes.
-		await removeRecentTab("workspace-user", "workspace", "ws");
-
-		expect(
-			db.select({ id: workspaces.id }).from(workspaces).where(eq(workspaces.id, "ws")).get(),
-		).toBe(undefined);
-		expect(workspaceChangedEvents()).toEqual([
-			{ type: "workspace_changed", workspaceId: "ws", reason: "deleted" },
-		]);
-	});
-
-	it("the deferred cleanup announces workspaces it deletes", async () => {
-		seedUser();
-		seedWorkspace("ws");
-		seedTab({
-			id: "tab-ws",
-			tabKey: "workspace:ws",
-			type: "workspace",
-			entityId: "ws",
-			title: "ws",
-			sortOrder: 0,
-		});
-		// A workspace unit with no active narrators is dropped by this scope; its
-		// deletion is deferred past the undo window.
-		const cleared = await clearRecentTabs("workspace-user", "inactive_narrators");
-		expect(cleared.removedCount).toBe(1);
-		expect(
-			db.select({ id: workspaces.id }).from(workspaces).where(eq(workspaces.id, "ws")).get(),
-		).toEqual({ id: "ws" });
-		broadcasts.length = 0;
-
-		const removed = await runExpiredRecentTabsWorkspaceCleanup(Date.now() + 60_000);
-
-		expect(removed).toBe(1);
-		expect(
-			db.select({ id: workspaces.id }).from(workspaces).where(eq(workspaces.id, "ws")).get(),
-		).toBe(undefined);
-		expect(workspaceChangedEvents()).toEqual([
-			{ type: "workspace_changed", workspaceId: "ws", reason: "deleted" },
-		]);
-	});
-
-	// The route DELETE and the recent-tabs mutation both delete the row and both
-	// announce it; with a header tab present the mutation wins, so the route must
-	// stay silent rather than emit a second frame.
-	it("route DELETE with a header tab announces exactly once", async () => {
-		seedUser();
-		seedWorkspace("ws");
-		seedTab({
-			id: "tab-ws",
-			tabKey: "workspace:ws",
-			type: "workspace",
-			entityId: "ws",
-			title: "ws",
-			sortOrder: 0,
-		});
-		broadcasts.length = 0;
-
-		const response = await app.request("/workspaces/ws", { method: "DELETE" });
-
-		expect(response.status).toBe(200);
-		expect(workspaceChangedEvents()).toEqual([
-			{ type: "workspace_changed", workspaceId: "ws", reason: "deleted" },
-		]);
+		await app.request(`/workspaces/ws/panels/${first.panels[0].id}`, { method: "DELETE" });
+		const second = (await (await app.request("/workspaces/ws")).json()) as {
+			panels: unknown[];
+		};
+		expect(second.panels).toEqual([]);
 	});
 });

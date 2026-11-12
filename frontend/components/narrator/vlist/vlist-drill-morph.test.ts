@@ -31,7 +31,9 @@ describe("buildDrillSnapshots", () => {
 		expect(snap?.drilled).toBe(false);
 		// 100 + 24.8 + live folded height / 2
 		expect(snap?.headerViewportTop).toBeCloseTo(100 + 24.8 + drillRowHeight() / 2, 5);
-		expect(drillRowHeight()).toBeCloseTo(DRILL_ROW_HEIGHT, 5);
+		// The live bare row: 120% of the frozen 18.8's xs line at the default setting.
+		expect(drillRowHeight()).toBeCloseTo(bareRowMetrics().height, 5);
+		expect(DRILL_ROW_HEIGHT).toBeCloseTo(18.8, 5);
 	});
 
 	it("drilled rows snapshot their card-header centre", () => {

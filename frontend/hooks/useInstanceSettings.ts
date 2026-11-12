@@ -41,10 +41,13 @@ export interface InstanceSettingsState {
 	projectDir: string;
 	// TLS
 	tlsEnabled: boolean;
+	tlsAutoReissue: boolean;
 	tlsCertFile: string;
 	tlsKeyFile: string;
 	tlsPassphrase: string;
 	tlsCaFile: string;
+	// Credential files (codex-credentials.json …) encrypted at rest
+	encryptSecrets: boolean;
 	// Update
 	updateSource: UpdateSource;
 	updateGithubRepository: string;
@@ -228,10 +231,12 @@ function makeDefaults(): InstanceSettingsState {
 		openBrowser: "app",
 		projectDir: "",
 		tlsEnabled: false,
+		tlsAutoReissue: true,
 		tlsCertFile: "",
 		tlsKeyFile: "",
 		tlsPassphrase: "",
 		tlsCaFile: "",
+		encryptSecrets: true,
 		updateSource: "github",
 		updateGithubRepository: DEFAULT_GITHUB_REPOSITORY,
 		updateServerUrl: "",
@@ -334,10 +339,12 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				openBrowser: settings.server?.openBrowser ?? "app",
 				projectDir: settings.paths?.defaultProjectDir ?? "",
 				tlsEnabled: settings.server?.tls?.enabled ?? false,
+				tlsAutoReissue: settings.server?.tls?.autoReissue ?? true,
 				tlsCertFile: settings.server?.tls?.certFile ?? "",
 				tlsKeyFile: settings.server?.tls?.keyFile ?? "",
 				tlsPassphrase: "",
 				tlsCaFile: settings.server?.tls?.caFile ?? "",
+				encryptSecrets: settings.secrets?.encrypt !== false,
 				updateSource: settings.update?.source ?? "github",
 				updateGithubRepository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 				updateServerUrl: settings.update?.serverUrl ?? "",
@@ -451,6 +458,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					openBrowser: state.openBrowser,
 					tls: {
 						enabled: state.tlsEnabled,
+						autoReissue: state.tlsAutoReissue,
 						certFile: state.tlsCertFile,
 						keyFile: state.tlsKeyFile,
 						...(state.tlsPassphrase && { passphrase: state.tlsPassphrase }),
@@ -458,6 +466,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					},
 				},
 				paths: { defaultProjectDir: state.projectDir },
+				secrets: { encrypt: state.encryptSecrets },
 				branding: {
 					// "" is meaningful for both fields ("clear it"), so they are always
 					// sent. Omitting a key would be read as "leave unchanged" by the

@@ -8,7 +8,15 @@ import {
 	spyOn,
 	test,
 } from "bun:test";
-import type { ShikiModule } from "@frontend/lib/shiki-loader";
+import * as shikiTokenCache from "@frontend/lib/shiki-token-cache";
+import {
+	createShikiTokenWorkerLoader,
+	type ShikiTokenWorkerPort,
+} from "@frontend/lib/shiki-token-worker-client";
+import type {
+	ShikiTokenWorkerRequest,
+	ShikiTokenWorkerResponse,
+} from "@frontend/lib/shiki-token-worker-protocol";
 import { MantineProvider } from "@mantine/core";
 import * as typography from "@shared/pretext-layout/typography";
 import { parseHTML } from "linkedom";
@@ -48,7 +56,7 @@ class TestResizeObserver {
 
 beforeAll(async () => {
 	disposeCanvas = installCanvasStub();
-	// Preparation must load after the canvas seam. No application module mocks.
+	// Preparation must load after the canvas seam. All rendered components stay real.
 	({ measureMarkdown } = await import("../measure/measure-markdown"));
 	({ RenderMarkdown, sameMarkdownRenderInputs } = await import("./RenderMarkdown"));
 });
@@ -386,23 +394,31 @@ describe("the mounted real RenderMarkdown memo", () => {
 		expect(overlay.hasAttribute("data-vlist-code-copy-touch")).toBe(true);
 	});
 	test("paints asynchronously resolved Shiki tokens through the real child external store", async () => {
-		const loader = await import("@frontend/lib/shiki-loader");
-		const cache = await import("@frontend/lib/shiki-token-cache");
-		cache.clearShikiTokenCache();
-		type HighlightResult = Awaited<ReturnType<ShikiModule["codeToTokens"]>>;
-		let finish: ((value: HighlightResult) => void) | undefined;
-		const pending = new Promise<HighlightResult>((resolve) => {
-			finish = resolve;
-		});
+		let request: Extract<ShikiTokenWorkerRequest, { type: "tokens" }> | undefined;
 		let highlights = 0;
-		const cachedLoader = spyOn(loader, "getCachedShiki").mockReturnValue({
-			bundledLanguages: { "memo-test": true },
-			codeToHtml: async () => "",
-			codeToTokens: () => {
+		const port: ShikiTokenWorkerPort = {
+			onmessage: null,
+			onerror: null,
+			postMessage(message) {
+				if (message.type === "boot") return;
 				highlights++;
-				return pending;
+				request = message;
 			},
-		});
+			terminate() {},
+		};
+		const cache = shikiTokenCache.createShikiTokenCache(
+			createShikiTokenWorkerLoader({
+				factory: () => port,
+				appBase: () => "https://memo.test/",
+			}),
+		);
+		// Bind the real child hook to an isolated real cache/Worker client. Bun must
+		// not boot a browser Worker or resurrect the retired UI-thread Shiki loader.
+		const bindings = [
+			spyOn(shikiTokenCache, "getShikiTokens").mockImplementation(cache.get),
+			spyOn(shikiTokenCache, "subscribeShikiTokens").mockImplementation(cache.subscribe),
+			spyOn(shikiTokenCache, "getShikiTokensVersion").mockImplementation(cache.getVersion),
+		];
 		try {
 			const code = "const asyncMemoResult = 42;";
 			const measured = measureMarkdown(`Intro\n\n\`\`\`memo-test\n${code}\n\`\`\``, 640);
@@ -412,21 +428,36 @@ describe("the mounted real RenderMarkdown memo", () => {
 			expect(line.textContent).toBe(code);
 			expect(line.querySelector("span[style*='color']")).toBeNull();
 			expect(highlights).toBe(1);
+			expect(request).toMatchObject({ code, lang: "memo-test" });
+			if (!request) throw new Error("Missing deferred Worker token request");
+			const tokenRequest = request;
+			expect(cache.getVersion()).toBe(0);
 			await render({ measured: { ...measured } });
+			expect(highlights).toBe(1);
 			await act(async () => {
-				if (!finish) throw new Error("Missing deferred highlighter resolver");
-				finish({ tokens: [[{ content: code, color: "#123456", offset: 0 }]] });
-				await pending;
+				await Promise.resolve();
+				port.onmessage?.({
+					data: {
+						type: "tokens",
+						id: tokenRequest.id,
+						tokens: [[{ content: code, color: "#123456" }]],
+					},
+				} as MessageEvent<ShikiTokenWorkerResponse>);
 			});
 			expect(node("[data-md-body]")).toBe(host);
 			expect(node("[data-vlist-code-line]")).toBe(line);
 			const colored = line.querySelector<HTMLElement>("span[style*='color']");
 			expect(colored?.textContent).toBe(code);
 			expect(colored?.style.color).toBe("#123456");
+			expect(cache.getVersion()).toBe(1);
+			expect(cache.get(code, "memo-test", tokenRequest.theme)).toEqual([
+				[{ content: code, color: "#123456" }],
+			]);
 			expect(highlights).toBe(1);
 		} finally {
-			cachedLoader.mockRestore();
-			cache.clearShikiTokenCache();
+			port.onerror?.({ message: "fixture cleanup" } as ErrorEvent);
+			for (const binding of bindings) binding.mockRestore();
+			cache.clear();
 		}
 	});
 	test("reads typography only on the parent's render, retaining font/spacing and measurement timing", async () => {

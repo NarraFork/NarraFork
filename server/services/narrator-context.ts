@@ -61,7 +61,7 @@ type CompactMessage = Partial<
 	id: string;
 	role: "assistant" | "disp" | "sys" | "system" | "user";
 	contentText: string | null;
-	toolCalls?: CompactToolCall[] | null;
+	toolCalls?: readonly CompactToolCall[] | null;
 };
 
 function compactSenderText(message: CompactMessage, text: string): string {

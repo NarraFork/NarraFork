@@ -25,7 +25,7 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 import type { ParentInboundMessage } from "../parent-inbound-queue";
 import type { PendingInjection } from "../parent-injection-queue";

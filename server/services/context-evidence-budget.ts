@@ -77,7 +77,7 @@ export class ContextEvidenceBudget {
 export function projectKnowledgeEvidence<
 	T extends { id: string; role: string; contentJson: unknown; contentText?: string | null },
 >(
-	messages: T[],
+	messages: readonly T[],
 	byteBudget: number,
 ): { messages: T[]; bytes: number; omittedMessageIds: string[] } {
 	const cap = boundedBytes(byteBudget);

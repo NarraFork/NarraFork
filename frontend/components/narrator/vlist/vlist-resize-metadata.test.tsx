@@ -25,6 +25,7 @@ import {
 import { retainKeysInPlace } from "./vlist-head-trim";
 import { pruneHeightOverrides } from "./vlist-height-overrides";
 import { createVListInteractionState, isFullPayloadRequestedRow } from "./vlist-interaction-state";
+import { useOutlineAskSlots } from "./vlist-outline-ask-bridge";
 import { usePermissionSlots, useTracePermissionSlots } from "./vlist-permission-bridge";
 import type { VListItem } from "./vlist-pipeline";
 import { resolveSpecTaskLiveGate } from "./vlist-spec-task-live";
@@ -60,6 +61,7 @@ const runtime = {
 			deps,
 		),
 	usePermissionSlots,
+	useOutlineAskSlots,
 	useTracePermissionSlots,
 	useVListTraceBindings,
 	computeToolRunFrames,
@@ -88,6 +90,7 @@ interface MetadataResult {
 	semanticItems: readonly VListItem[];
 	semanticManifestItems: NonNullable<PretextLayoutCoordinatorSnapshot["manifest"]>["items"];
 	permissionSlotByKey: ReturnType<typeof usePermissionSlots>;
+	outlineAskSlotByKey: ReturnType<typeof useOutlineAskSlots>;
 	tracePermissionSlotsByKey: ReturnType<typeof useTracePermissionSlots>;
 	traceBindingsByKey: ReturnType<typeof useVListTraceBindings>;
 	dynamicRowKeys: ReadonlySet<string>;
@@ -106,7 +109,10 @@ const metadataCode = `
 		const { narratorId, permCb, rowToolMetaIndex, reflectionIndex,
 			activeInteraction, tailMeta, selectionIndex, rowHandlers } = stable;
 		const isActive = false;
+		const enableOutlineAsk = true;
+		const dataSource = undefined;
 		${source.slice(geometryStart, geometryEnd)}
+		${declaration("outlineAskSlotByKey", "useOutlineAskSlots")}
 		${declaration("permissionSlotByKey", "usePermissionSlots")}
 		${declaration("tracePermissionSlotsByKey", "useTracePermissionSlots")}
 		${declaration("dynamicRowKeys", "useMemo")}
@@ -116,7 +122,7 @@ const metadataCode = `
 		${declaration("sourceIdsByKey", "useMemo")}
 		${declaration("traceBindingsByKey", "useVListTraceBindings")}
 		${declaration("openTargetState", "useMemo")}
-		return { semanticItems, semanticManifestItems, permissionSlotByKey,
+		return { semanticItems, semanticManifestItems, permissionSlotByKey, outlineAskSlotByKey,
 			tracePermissionSlotsByKey, dynamicRowKeys, effectiveHeightOverrides,
 			toolRunFrames, specTaskLiveGate, sourceIdsByKey, traceBindingsByKey, openTargetState };
 	};
@@ -283,6 +289,7 @@ describe("width previews retain production semantic metadata", () => {
 			expect(metadataRuns).toBe(runs + frame + 1);
 			for (const name of [
 				"permissionSlotByKey",
+				"outlineAskSlotByKey",
 				"tracePermissionSlotsByKey",
 				"traceBindingsByKey",
 				"dynamicRowKeys",

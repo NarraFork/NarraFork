@@ -6,9 +6,11 @@
  * test server's (`outline-dock.browser.test.ts`); live frames go over a plain WebSocket.
  */
 import "@mantine/core/styles.css";
+import "../../styles/safe-area.css";
 import { MantineProvider } from "@mantine/core";
 import type { ComposerDocument } from "@shared/composer-document";
 import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
+import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type AnyRouter,
@@ -25,6 +27,7 @@ import { I18nextProvider, initReactI18next } from "react-i18next";
 import { type OutlineOpener, useOutlineOpener } from "../../lib/outline-opener";
 import type { OutlinePanelState } from "../../lib/outline-panel";
 import outlineEn from "../../locales/en/outline.json";
+import outlineZh from "../../locales/zh-CN/outline.json";
 import { DockviewSurface } from "../dockview";
 import { InlineComposerEditor } from "../narrator/composer/InlineComposerEditor";
 import { dockPanelId } from "../narrator/dock/dock-panel-types";
@@ -35,9 +38,11 @@ import { liveSessionsOn, setLiveSessionGraceForTests } from "./editor/live-sessi
 import { overrideLiveTransportForTests } from "./editor/transport";
 
 const instance = i18next.createInstance();
-await instance
-	.use(initReactI18next)
-	.init({ lng: "en", resources: { en: { outline: outlineEn } }, react: { useSuspense: false } });
+await instance.use(initReactI18next).init({
+	lng: "en",
+	resources: { en: { outline: outlineEn }, "zh-CN": { outline: outlineZh } },
+	react: { useSuspense: false },
+});
 
 /** Sessions the server ended for this tab (a refused join among them), by close code. */
 const closedFrames: string[] = [];
@@ -138,24 +143,37 @@ function Surface() {
 	const dock = useNarratorDockContext();
 	opener = useOutlineOpener();
 	return (
-		<div style={{ height: 760, width: 1200 }}>
-			<DockviewSurface
-				apiRef={dock?.apiRef}
-				components={{
-					chat: ComposerPanel as React.FunctionComponent<IDockviewPanelProps>,
-					outline: OutlineDockPanel as React.FunctionComponent<IDockviewPanelProps>,
-				}}
-				onReady={(api) => {
-					dockApi = api;
-					api.addPanel({
-						id: dockPanelId("chat"),
-						component: "chat",
-						title: "Session",
-						params: { panelType: "chat", narratorId: "n-fixture" },
-					});
-				}}
-				defaultRenderer="always"
-			/>
+		<div className="nf-app-shell">
+			<main className="nf-app-shell-main" style={{ padding: "76px 16px 16px" }}>
+				<div
+					id="dock-host"
+					style={{
+						height: "calc(100% + 32px)",
+						margin: -16,
+						display: "flex",
+						flexDirection: "column",
+						overflow: "hidden",
+					}}
+				>
+					<DockviewSurface
+						apiRef={dock?.apiRef}
+						components={{
+							chat: ComposerPanel as React.FunctionComponent<IDockviewPanelProps>,
+							outline: OutlineDockPanel as React.FunctionComponent<IDockviewPanelProps>,
+						}}
+						onReady={(api) => {
+							dockApi = api;
+							api.addPanel({
+								id: dockPanelId("chat"),
+								component: "chat",
+								title: "Session",
+								params: { panelType: "chat", narratorId: "n-fixture" },
+							});
+						}}
+						defaultRenderer="always"
+					/>
+				</div>
+			</main>
 		</div>
 	);
 }
@@ -166,6 +184,7 @@ export function ready(): boolean {
 
 /** Mount the dock (composer only) with the outline API and live frames of the test server. */
 export function open(options: { wsUrl: string }): void {
+	document.documentElement.setAttribute("data-nf-authenticated-app-shell", "true");
 	transport = new SocketTransport(options.wsUrl);
 	overrideLiveTransportForTests(transport);
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -192,6 +211,62 @@ export function open(options: { wsUrl: string }): void {
 			</QueryClientProvider>
 		</I18nextProvider>,
 	);
+}
+
+/** Set the reader's typography (外观 · 排版), as the sliders do. */
+export function applyTypography(next: Partial<TypographySettings>): void {
+	setTypography(next);
+}
+
+/** What this browser remembers as recently opened (titles as stored). */
+export function recents(): Array<{ blockId: string; title: string }> {
+	try {
+		const stored = JSON.parse(localStorage.getItem("narrafork_outline_recents") ?? "[]");
+		return (Array.isArray(stored) ? stored : []).map((r) => ({
+			blockId: String(r.blockId),
+			title: String(r.title),
+		}));
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * How well an element's own colour (its icon strokes `currentColor`) stands against the page:
+ * the contrast ratio of its computed colour, with every opacity up to the root applied, on the
+ * page's background.
+ */
+export function contrastOnPage(selector: string): number | null {
+	const el = document.querySelector<HTMLElement>(selector);
+	if (!el) return null;
+	const parse = (color: string): [number, number, number, number] => {
+		const m = /rgba?\(([^)]+)\)/.exec(color);
+		const p = (m?.[1] ?? "")
+			.split(/[\s,/]+/)
+			.filter(Boolean)
+			.map(Number);
+		return [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 1];
+	};
+	const [pr, pg, pb] = parse(getComputedStyle(document.body).backgroundColor);
+	const [r, g, b, a] = parse(getComputedStyle(el).color);
+	let alpha = a;
+	for (let node: HTMLElement | null = el; node; node = node.parentElement)
+		alpha *= Number(getComputedStyle(node).opacity);
+	const over = [r, g, b].map((v, i) => v * alpha + ([pr, pg, pb][i] as number) * (1 - alpha));
+	const lum = (rgb: number[]) => {
+		const [x, y, z] = rgb.map((v) => {
+			const s = v / 255;
+			return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+		}) as [number, number, number];
+		return 0.2126 * x + 0.7152 * y + 0.0722 * z;
+	};
+	const [hi, lo] = [lum(over), lum([pr, pg, pb])].sort((x, y) => y - x) as [number, number];
+	return (hi + 0.05) / (lo + 0.05);
+}
+
+/** Switch the interface language (`en`, `zh-CN`). */
+export async function setLanguage(language: string): Promise<void> {
+	await instance.changeLanguage(language);
 }
 
 /** Open a place the way a tool card or a chat link does (Ctrl/Cmd: `newPanel`). */

@@ -493,6 +493,106 @@ for (const recovery of [false, true]) {
 	});
 }
 
+for (const recovery of [false, true])
+	for (const rawMedia of [false, true]) {
+		test(`${recovery ? "persisted recovery" : "denied retry"} replays ${rawMedia ? "raw media" : "media refs"}`, async () => {
+			const { saveUploadedMedia, deleteUploadedMedia } = await import("../../lib/media-uploads");
+			const { mediaRefToContentBlock } = await import("@shared/media-attachments");
+			const { resolveNativeMediaBlocks, toolMediaBlocks } = await import(
+				"../../lib/agent/native-media"
+			);
+			const bytes = Buffer.alloc(46);
+			bytes.write("RIFF", 0);
+			bytes.writeUInt32LE(38, 4);
+			bytes.write("WAVEfmt ", 8);
+			bytes.writeUInt32LE(16, 16);
+			bytes.writeUInt16LE(1, 20);
+			bytes.writeUInt16LE(1, 22);
+			bytes.writeUInt32LE(8000, 24);
+			bytes.writeUInt32LE(16000, 28);
+			bytes.writeUInt16LE(2, 32);
+			bytes.writeUInt16LE(16, 34);
+			bytes.write("data", 36);
+			bytes.writeUInt32LE(2, 40);
+			const saved = rawMedia
+				? undefined
+				: await saveUploadedMedia(ROOT, new File([bytes], "recovered.wav", { type: "audio/wav" }));
+			const row = await seedAwaitReexecution(recovery);
+			try {
+				const ref = saved ? mediaRefToContentBlock(saved) : undefined;
+				spyOn(executor, "executeTool").mockResolvedValue({
+					output: "recovered audio",
+					isError: false,
+					durationMs: 1,
+					metadata: { source: "recovery-test" },
+					...(ref
+						? { mediaRefs: [ref] }
+						: {
+								media: [
+									{
+										type: "audio" as const,
+										mediaType: "audio/wav",
+										filename: "recovered.wav",
+										base64: bytes.toString("base64"),
+									},
+								],
+							}),
+				});
+				const result = recovery
+					? await session.executePersistedToolCall({ narratorId: ROOT, toolCallId: row.toolCallId })
+					: await session.reExecuteDeniedToolCall(ROOT, row.toolUseId, "en", false, null, {
+							autoContinue: false,
+						});
+				expect(result).toEqual({ ok: true, shouldContinue: true });
+				const history = await narratorService.getModelHistorySinceLastCompact(ROOT);
+				const call = history
+					.flatMap((message) => message.toolCalls ?? [])
+					.find((item) => item.toolUseId === row.toolUseId);
+				// Bun's toMatchObject rewrites nested arrays containing asymmetric matchers.
+				// History output belongs to the source cache; assertions must not mutate it.
+				const outputBeforeAssertion = JSON.stringify(call?.outputJson);
+				expect(call?.outputJson).toEqual(
+					expect.objectContaining({
+						_text: "recovered audio",
+						_metadata: { source: "recovery-test" },
+						_media: [
+							ref ??
+								expect.objectContaining({
+									type: "audio",
+									mediaType: "audio/wav",
+									filename: "recovered.wav",
+									uploadNarratorId: ROOT,
+								}),
+						],
+					}),
+				);
+				expect(JSON.stringify(call?.outputJson)).toBe(outputBeforeAssertion);
+				expect(await resolveNativeMediaBlocks(toolMediaBlocks(call?.outputJson), ROOT)).toEqual([
+					expect.objectContaining({
+						type: "audio",
+						mediaType: "audio/wav",
+						base64: bytes.toString("base64"),
+					}),
+				]);
+			} finally {
+				if (saved) deleteUploadedMedia(ROOT, saved.mediaId);
+				const persisted = await db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, row.toolCallId),
+				});
+				for (const ref of toolMediaBlocks(persisted?.outputJson)) {
+					if (
+						ref &&
+						typeof ref === "object" &&
+						"mediaId" in ref &&
+						typeof ref.mediaId === "string" &&
+						ref.mediaId !== saved?.mediaId
+					)
+						deleteUploadedMedia(ROOT, ref.mediaId);
+				}
+			}
+		});
+	}
+
 test("parallel persisted recovery requests serialize execution without retaining the start mutex", async () => {
 	const first = await seedAwaitReexecution(true);
 	const second = await seedAwaitReexecution(true, "-second");

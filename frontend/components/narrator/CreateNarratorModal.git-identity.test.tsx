@@ -35,11 +35,25 @@ let identityQuery: {
 mock.module("@mantine/core", () => ({
 	Alert: box,
 	Badge: box,
+	Box: box,
 	Divider: box,
+	Loader: box,
+	SegmentedControl: box,
 	Group: box,
 	Stack: box,
 	Text: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
 	TextInput: box,
+	Textarea: box,
+	// TextareaOptimizeControls renders a Menu; the mock must expose it or the module
+	// fails to load before any assertion runs.
+	Menu: Object.assign(box, {
+		Target: box,
+		Dropdown: box,
+		Label: box,
+		Item: box,
+		Divider: box,
+	}),
+	NumberInput: box,
 	Tooltip: box,
 	ActionIcon: box,
 	Checkbox: box,
@@ -103,6 +117,8 @@ mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) 
 mock.module("@tanstack/react-query", () => ({
 	useQuery: () => ({ data: { paths: { defaultProjectDir: "/instance" }, agent: {} } }),
 	useQueryClient: () => ({ invalidateQueries }),
+	// The dialog's device list lives next to the workspace-context mutations.
+	useMutation: () => ({ mutate: mock(() => {}), reset: mock(() => {}), isPending: false }),
 }));
 mock.module("../../hooks/useModels", () => ({ useAllModels: () => ({ groupedModels: [] }) }));
 mock.module("../../hooks/useProjectDirStatus", () => ({
@@ -110,6 +126,15 @@ mock.module("../../hooks/useProjectDirStatus", () => ({
 }));
 mock.module("../../hooks/useNarrator", () => ({
 	useCreateNarrator: () => ({ mutate: create, isPending: false }),
+}));
+// The dialog reads the prompt library for its "insert from library" picker. An empty
+// library is enough here: this file is about git identity, and mocking the hook keeps
+// the component's query/mutation wiring out of this test's surface.
+mock.module("../../hooks/usePromptLibrary", () => ({
+	usePromptLibrary: () => ({ data: [], isLoading: false }),
+	useCreatePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
+	useUpdatePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
+	useDeletePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
 }));
 const mutation = { mutate: mock(() => {}), reset: mock(() => {}), isPending: false };
 mock.module("../../hooks/useFavoriteDirectories", () => ({
@@ -140,6 +165,9 @@ mock.module("../../hooks/useGitIdentities", () => ({
 }));
 mock.module("../../lib/api", () => ({
 	api: { getSettings: mock(() => {}), setNarratorGitIdentity },
+	// The modal reads the device list through the workspace-context hook, which pulls in
+	// the narrator socket manager; that module needs the session accessor at import time.
+	getToken: () => null,
 }));
 mock.module("../common/DirectoryPicker", () => ({ DirectoryPicker: box }));
 

@@ -57,6 +57,7 @@ describe("deny-set safety (risk #2 guard)", () => {
 			"ExitPlanConfirm",
 			"ExitPlanConfirmAndCompact",
 			"ExitPlanRevise",
+			"PlanReview",
 			"TaskReflectConfirm",
 			"TaskReflectRevise",
 			"Task",

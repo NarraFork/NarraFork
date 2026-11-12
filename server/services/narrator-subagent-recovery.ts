@@ -30,6 +30,7 @@
  * match nothing in the most common case.
  */
 
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -41,6 +42,7 @@ import {
 } from "../db/schema";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { queueContextCharacterRefresh } from "../lib/context-characters";
+import { ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -52,10 +54,13 @@ import {
 import type { Locale } from "../lib/prompt-i18n";
 import { controllerOf, RUNTIME_SOURCE_COLUMNS, runDeliverToOf } from "../lib/runtime-source";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { getExecutionOwner } from "./agent-runtime/ownership";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import { bodyColumns, fillBody } from "./narrator-body-reads";
+import { adoptHumanReplyContext } from "./narrator-reply-context";
 import { narratorService } from "./narrator-service";
+import { isNarratorRuntimeBusy, withNarratorStartAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
 import { registerAndPersistSubagentAlias } from "./subagent-alias";
@@ -491,8 +496,16 @@ export function resumeIncompleteAgentWorkForContinue(input: {
 	locale: Locale;
 	replyInUserLanguage: boolean;
 	userId?: string | null;
+	/** Only an explicit human recovery action may replace the recipient's reply policy. */
+	humanReplyContext?: ReplyContext;
 }): Promise<ResumeIncompleteAgentWorkResult> {
-	return recoveryLock.acquire(input.narratorId, () => prepareAndStartRecovery(input));
+	const acceptedInput = {
+		...input,
+		humanReplyContext: parseReplyContext(input.humanReplyContext) ?? undefined,
+	};
+	return recoveryLock.acquire(input.narratorId, () =>
+		withNarratorStartAdmission(input.narratorId, () => prepareAndStartRecovery(acceptedInput)),
+	);
 }
 
 async function prepareAndStartRecovery(input: {
@@ -500,8 +513,12 @@ async function prepareAndStartRecovery(input: {
 	locale: Locale;
 	replyInUserLanguage: boolean;
 	userId?: string | null;
+	humanReplyContext?: ReplyContext;
 }): Promise<ResumeIncompleteAgentWorkResult> {
 	const { narratorId } = input;
+	if (getExecutionOwner(narratorId) || isNarratorRuntimeBusy(narratorId)) {
+		throw new ValidationError("Cannot recover subagents while the narrator is already running");
+	}
 	const latest = await findLatestTopLevelMessage(narratorId);
 	if (!latest || latest.role !== "assistant") return { recovering: false, items: [] };
 
@@ -576,6 +593,14 @@ async function prepareAndStartRecovery(input: {
 			.map((candidate) => candidate.targetId),
 	});
 
+	try {
+		if (input.humanReplyContext) await adoptHumanReplyContext(narratorId, input.humanReplyContext);
+	} catch (error) {
+		registration.unregister();
+		throw error;
+	}
+	// Adopt once at accepted recovery admission, not after waiting: a newer queued
+	// human input must never be overwritten by this recovery's delayed continuation.
 	void runRecoveryStage(input, candidates, controller.signal)
 		.catch((err) => {
 			logger.error("Subagent recovery stage failed", {
@@ -1280,13 +1305,30 @@ export function buildRecoveryNotifyPrompt(entries: Array<{ alias: string }>): st
  * blocks, run them server-side, then continue ONCE so the model sees every
  * result in a single request.
  */
-export async function startRecoveryAwaitBatch(input: {
+export function startRecoveryAwaitBatch(
+	input: Parameters<typeof startRecoveryAwaitBatchUnlocked>[0],
+): Promise<{ messageId: string; toolUseIds: string[] }> {
+	const acceptedInput = {
+		...input,
+		humanReplyContext: parseReplyContext(input.humanReplyContext) ?? undefined,
+	};
+	return withNarratorStartAdmission(input.narratorId, () =>
+		startRecoveryAwaitBatchUnlocked(acceptedInput),
+	);
+}
+
+async function startRecoveryAwaitBatchUnlocked(input: {
 	narratorId: string;
 	aliases: string[];
 	locale: Locale;
 	replyInUserLanguage: boolean;
 	userId?: string | null;
+	humanReplyContext?: ReplyContext;
 }): Promise<{ messageId: string; toolUseIds: string[] }> {
+	if (getExecutionOwner(input.narratorId) || isNarratorRuntimeBusy(input.narratorId)) {
+		throw new ValidationError("Cannot recover subagents while the narrator is already running");
+	}
+	if (input.aliases.length === 0) throw new ValidationError("No subagents were resumed");
 	const { DEFAULT_AWAIT_TIMEOUT_MS } = await import("../lib/agent/tools/await");
 	const blocks = input.aliases.map((alias) => ({
 		type: "tool_use",
@@ -1358,6 +1400,14 @@ export async function startRecoveryAwaitBatch(input: {
 		undefined,
 		{ foregroundSubagentIds: [] },
 	);
+
+	try {
+		if (input.humanReplyContext)
+			await adoptHumanReplyContext(input.narratorId, input.humanReplyContext);
+	} catch (error) {
+		registration.unregister();
+		throw error;
+	}
 
 	void runRecoveryAwaitBatch(
 		{

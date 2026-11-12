@@ -319,6 +319,7 @@ browserTest(
 	<TextInput id="name" label="Name" bind="name" defaultValue="Ada" />
 	<Checkbox id="agree" label="Agree" bind="agree" />
 	<SegmentedControl bind="size" data={["S", "M", "L"]} defaultValue="M" />
+	<TextInput id="loose" label="Not bound" />
 	<div id="box" title={$name}>Hello {$name}</div>
 	<Text id="size">size {$size}</Text>
 	<Text id="state">agreed: {$agree}</Text>
@@ -346,6 +347,9 @@ browserTest(
 				if (label.textContent === "L") label.click();
 		});
 		await frame.waitForFunction(() => document.getElementById("size")?.textContent === "size L");
+		// A control without bind keeps what is typed, but is not one of the form's fields.
+		await frame.type("#loose", "kept");
+		expect(await frame.$eval("#loose", (node) => (node as HTMLInputElement).value)).toBe("kept");
 		await frame.click("#ask");
 		await page.waitForFunction(
 			() => (window as unknown as { actions: unknown[] }).actions.length >= 1,

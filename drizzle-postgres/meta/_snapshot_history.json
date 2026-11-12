@@ -384,6 +384,198 @@
 			"prevId": "87e33132-68f8-41ad-9605-925309958431",
 			"version": "7",
 			"snapshotDigest": "a3ae8c711d84cab6ccf2ae7ba7b631423d02e3b6e199ed36173704f6c682c43c"
+		},
+		{
+			"idx": 48,
+			"tag": "0048_native_media",
+			"id": "5ac21501-be67-4be3-b3bb-5bd339833e99",
+			"prevId": "39f50ea4-8ecc-468b-be8c-8acc9f70aa65",
+			"version": "7",
+			"snapshotDigest": "f559c560c98e635c863def71b296c8649698a49852ff7c371ca489677c2bf7ef"
+		},
+		{
+			"idx": 49,
+			"tag": "0049_narrator_task_backend",
+			"id": "297184e9-2ffa-48e9-b8e6-70237e9adde4",
+			"prevId": "5ac21501-be67-4be3-b3bb-5bd339833e99",
+			"version": "7",
+			"snapshotDigest": "133fc42c8b38a21c4d4e46fe8f5aac89b9bad0ad676506b1625f1a114cd4412c"
+		},
+		{
+			"idx": 50,
+			"tag": "0050_outline_pending",
+			"id": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
+			"prevId": "297184e9-2ffa-48e9-b8e6-70237e9adde4",
+			"version": "7",
+			"snapshotDigest": "ba7f5a65b94e9ea829eae70e55f875cab653e36e85c66a302d3b9c7f4b3ec002"
+		},
+		{
+			"idx": 51,
+			"tag": "0051_reply_context",
+			"id": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
+			"prevId": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
+			"version": "7",
+			"snapshotDigest": "878acdef2d1c086d9e32b2c5bd249e2a33127ed11420885ca2a3984f4ec3a056"
+		},
+		{
+			"idx": 52,
+			"tag": "0052_outline_task_board",
+			"id": "81304305-168a-41ef-8fc3-187e57817aed",
+			"prevId": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
+			"version": "7",
+			"snapshotDigest": "6cddaa095cef72401c984bc6a9d1e9f693d00c3bf7d94f54cca5b450de989d18"
+		},
+		{
+			"idx": 53,
+			"tag": "0053_api_request_decode_ms",
+			"id": "44e5308f-2856-4b61-8e5f-51d58efdb21a",
+			"prevId": "81304305-168a-41ef-8fc3-187e57817aed",
+			"version": "7",
+			"snapshotDigest": "ddaad2ec5041b072edaee21ed2ba84d6d293d1d8c27c8e96e43e8a868e332979"
+		},
+		{
+			"idx": 54,
+			"tag": "0054_outline_questions",
+			"id": "af2ae099-396f-4399-8676-928a7d7d4a6b",
+			"prevId": "44e5308f-2856-4b61-8e5f-51d58efdb21a",
+			"version": "7",
+			"snapshotDigest": "00c42b1563efcad59bf37322bb13e8df905ae5c417f5ca8a967cc70d0e87ae8b"
+		},
+		{
+			"idx": 55,
+			"tag": "0055_narrator_line_height_v2",
+			"id": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
+			"prevId": "af2ae099-396f-4399-8676-928a7d7d4a6b",
+			"version": "7",
+			"snapshotDigest": "f074f16d61810f35a714a5b6959a38c133e6571cce0d2838427076bf7cb4c513"
+		},
+		{
+			"idx": 56,
+			"tag": "0056_recent_tab_folders",
+			"id": "bda6d6c2-f7b5-4a64-853d-0c2f72edeb47",
+			"prevId": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
+			"version": "7",
+			"snapshotDigest": "0f1f2cce34e192cca32077bfa5248d291e67a2807bdfe03dda7d9d6727b87d2f"
+		},
+		{
+			"idx": 57,
+			"tag": "0057_outline_digests",
+			"id": "c8e93667-215c-4bc9-b8ec-84ecf074ef84",
+			"prevId": "bda6d6c2-f7b5-4a64-853d-0c2f72edeb47",
+			"version": "7",
+			"snapshotDigest": "fa50fc938d78a7f87584db4f4387ad57634c3269d42074070a53b08a9b6bc63e"
+		},
+		{
+			"idx": 58,
+			"tag": "0058_outline_task_seen",
+			"id": "1a1b92df-c79f-493f-972f-b5da55789ccd",
+			"prevId": "c8e93667-215c-4bc9-b8ec-84ecf074ef84",
+			"version": "7",
+			"snapshotDigest": "a72d6560eaf73674d8d5da3dd89f1ddb64eb93eb3906b2ad8b19c3d8ba45c882"
+		},
+		{
+			"idx": 59,
+			"tag": "0059_usage_daily",
+			"id": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
+			"prevId": "1a1b92df-c79f-493f-972f-b5da55789ccd",
+			"version": "7",
+			"snapshotDigest": "e2635f635c17f1f6f6742876063b58c9ac3734a9d0a99cf5a6437896cc49e6be"
+		},
+		{
+			"idx": 60,
+			"tag": "0060_add-question-reflection-override",
+			"id": "1ebab60c-5206-4565-af03-e1d8342147e0",
+			"prevId": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
+			"version": "7",
+			"snapshotDigest": "c72a83d718b1d4f06ffe3b3030fdc15a18f7d57aa67657a136f95ec545ff8b1e"
+		},
+		{
+			"idx": 61,
+			"tag": "0061_submission_author_read",
+			"id": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
+			"prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
+			"version": "7",
+			"snapshotDigest": "6ee0ea437708c2e7d7d59873f16084fed98d57e61226cc6433dbc6a6f6892f3a"
+		},
+		{
+			"idx": 62,
+			"tag": "0062_narrator_workspace_directories",
+			"id": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+			"prevId": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
+			"version": "7",
+			"snapshotDigest": "31d3a09f3fdf1de5e444e2b63fe1ab1e775ff1638f78e09dfe3e4eab62b397cb"
+		},
+		{
+			"idx": 63,
+			"tag": "0063_folder-git-identity-bindings",
+			"id": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+			"prevId": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+			"version": "7",
+			"snapshotDigest": "e5ad93f773a265a6d73fb349d4faec2da9c42df4c20b7f984bf2b589b6bf93c0"
+		},
+		{
+			"idx": 64,
+			"tag": "0064_recent-tab-archive-marks",
+			"id": "574502c1-4b4e-446a-8c02-1e2dd4beee29",
+			"prevId": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+			"version": "7",
+			"snapshotDigest": "35afd24fe71da1b35c8fc9fb75d252f93560e1549c4e18f1bd2594d3057d6f26"
+		},
+		{
+			"idx": 65,
+			"tag": "0065_workspace-auto-title",
+			"id": "0880024e-08f7-4aff-8440-7060586a6aaf",
+			"prevId": "574502c1-4b4e-446a-8c02-1e2dd4beee29",
+			"version": "7",
+			"snapshotDigest": "c487631ef1a8e05d2fabc5fef7a0e002a7c403bd6c2348d764e00df4df886753"
+		},
+		{
+			"idx": 66,
+			"tag": "0066_workspace-outline-title-invalidation",
+			"id": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
+			"prevId": "0880024e-08f7-4aff-8440-7060586a6aaf",
+			"version": "7",
+			"snapshotDigest": "ce03b5a8956b6c97e9d06ed31669097c7b9164e809a6b08f9d1ffa7d21ab8967"
+		},
+		{
+			"idx": 67,
+			"tag": "0067_recent_tabs_show_directory",
+			"id": "35748555-debf-4155-bbff-1561d3be9674",
+			"prevId": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
+			"version": "7",
+			"snapshotDigest": "5242c6a9221d16f37b4b7625885a40130b196ea3e981bebc793fd172d0bfd3bd"
+		},
+		{
+			"idx": 68,
+			"tag": "0068_narrator_status_and_list_indexes",
+			"id": "c62a7648-b67f-432a-b39e-aa9145a2c13d",
+			"prevId": "35748555-debf-4155-bbff-1561d3be9674",
+			"version": "7",
+			"snapshotDigest": "8095d9d83ee6cddc0b8294745aa438480a6c8cd8b763233c68c441f9ea9418af"
+		},
+		{
+			"idx": 69,
+			"tag": "0069_compact_auxiliary_content",
+			"id": "c15812ac-e414-43f9-aee6-4290c568a3e5",
+			"prevId": "c62a7648-b67f-432a-b39e-aa9145a2c13d",
+			"version": "7",
+			"snapshotDigest": "89744981af04caec2628e2dede2e7c090b4dd11e196d1550b9e63720306d1ab6"
+		},
+		{
+			"idx": 70,
+			"tag": "0070_outline_view_state_expanded",
+			"id": "1363fe77-68fa-4135-8d93-e64136d06a6d",
+			"prevId": "c15812ac-e414-43f9-aee6-4290c568a3e5",
+			"version": "7",
+			"snapshotDigest": "7379a2f3dd28adf689cf2d6a8247ebb4223bf3afab6df2c7128897259cc70896"
+		},
+		{
+			"idx": 71,
+			"tag": "0071_context_memories",
+			"id": "61415524-1b93-4e9d-8844-fc85e211847c",
+			"prevId": "1363fe77-68fa-4135-8d93-e64136d06a6d",
+			"version": "7",
+			"snapshotDigest": "58fa2fc5ec20b42cc52316f971853b80c3808b87e88b78b3c41826a8b5feda56"
 		}
 	]
 }

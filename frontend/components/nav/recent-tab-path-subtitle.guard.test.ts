@@ -1,11 +1,14 @@
 /**
- * Guards the recentTabs cwd subtitle against the leading-slash bidi bug.
+ * Guards the recentTabs working-directory display against the leading-slash bidi bug.
  *
- * The sidebar shows working directories with `direction: rtl` so long paths
- * ellipsize from the LEFT (keeping the tail that identifies the directory).
- * A bare RTL container reorders the leading `/` — Unicode Bidi treats it as a
- * neutral — so the path looks like `home/user/repo` with the root slash gone.
- * The fix is LTR isolation (`<bdo dir="ltr">` inside `LeftTruncatedPathText`).
+ * Rows used to show the cwd with `direction: rtl` so long paths ellipsized from the LEFT.
+ * A bare RTL container reorders the leading `/` (Unicode Bidi treats it as a neutral), so
+ * the path read `home/user/repo` with the root slash gone; the fix was LTR isolation
+ * (`<bdo dir="ltr">` inside `LeftTruncatedPathText`).
+ *
+ * Rows are one line by default. An appearance preference restores the cwd line using
+ * the shared left-truncating path component. The details card and touch menu still
+ * show the full, wrapped cwd as plain LTR text.
  *
  * Asserted against the source because RecentTabs is not unit-mountable here
  * (drag sensors, router, query cache), matching sibling source-guard suites.
@@ -16,31 +19,42 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const RECENT_TABS = readFileSync(join(import.meta.dir, "RecentTabs.tsx"), "utf8");
-const DIRECTORY_ROW = readFileSync(join(import.meta.dir, "RecentTabDirectoryRow.tsx"), "utf8");
+const DETAILS = readFileSync(join(import.meta.dir, "RecentTabDetailCard.tsx"), "utf8");
 const PATH_TEXT = readFileSync(join(import.meta.dir, "../common/TruncatedPath.tsx"), "utf8");
+const APPEARANCE = readFileSync(join(import.meta.dir, "../settings/AppearanceSection.tsx"), "utf8");
 
-describe("recentTabs working-directory subtitles", () => {
-	it("renders cwd through LeftTruncatedPathText (LTR-isolated left-ellipsis)", () => {
-		expect(RECENT_TABS).toContain("<LeftTruncatedPathText path={tab.subtitle}");
-		expect(DIRECTORY_ROW).toContain("<LeftTruncatedPathText path={path}");
+describe("recentTabs working-directory display", () => {
+	it("restores only directory subtitles behind the appearance preference", () => {
+		expect(RECENT_TABS).toContain(
+			"const showDirectory = userPrefs?.recentTabsShowDirectory ?? false",
+		);
+		expect(RECENT_TABS).toContain("showDirectory && hasDirectorySubtitle(tab) && tab.subtitle");
+		expect(RECENT_TABS).toContain(
+			'<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />',
+		);
+		expect(DETAILS).toContain("{tab.subtitle}");
 	});
 
-	it("keeps the LTR isolation unit inside the shared path text", () => {
-		// The bdo is what stops the leading "/" from being bidi-reordered away.
+	it("reads and writes the account preference rather than browser-local storage", () => {
+		expect(APPEARANCE).toContain("checked={userPrefs?.recentTabsShowDirectory ?? false}");
+		expect(APPEARANCE).toContain(
+			"updateUserPref.mutate({ recentTabsShowDirectory: e.currentTarget.checked })",
+		);
+		expect(APPEARANCE).not.toContain("narrafork_recent_tabs_show_directory");
+		expect(RECENT_TABS).not.toContain("narrafork_recent_tabs_show_directory");
+	});
+
+	it("uses the same title and optional directory in rows and drag overlays", () => {
+		expect(RECENT_TABS.match(/label=\{<RecentTabTitle tab=\{tab\} \/>\}/g)).toHaveLength(2);
+	});
+
+	it("the details show the path as plain LTR text, never through a bare rtl box", () => {
+		expect(DETAILS).not.toMatch(/direction:\s*"rtl"/);
+		expect(RECENT_TABS).not.toMatch(/direction:\s*"rtl"[\s\S]{0,80}\{tab\.subtitle\}/);
+	});
+
+	it("keeps the LTR isolation unit inside the shared path text for other callers", () => {
 		expect(PATH_TEXT).toContain('<bdo dir="ltr">');
 		expect(PATH_TEXT).toContain('direction: "rtl"');
-	});
-
-	it("no longer drops a raw subtitle into a bare rtl Text", () => {
-		// The exact shape of the regression: rtl styles with the path as direct content.
-		// Non-path subtitles (chapter titles) may still use a plain truncated Text.
-		expect(RECENT_TABS).not.toMatch(/direction:\s*tab\.type === "narrator" \? "rtl" : undefined/);
-		expect(RECENT_TABS).not.toMatch(/direction:\s*"rtl"[\s\S]{0,80}\{tab\.subtitle\}/);
-		expect(DIRECTORY_ROW).not.toMatch(/direction:\s*"rtl"[\s\S]{0,80}\{path\}/);
-	});
-
-	it("still left-truncates non-path subtitles as plain text", () => {
-		// Chapter titles etc. are not paths; they must not go through the path component.
-		expect(RECENT_TABS).toContain("hasDirectorySubtitle(tab)");
 	});
 });

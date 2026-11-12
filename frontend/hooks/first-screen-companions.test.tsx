@@ -28,6 +28,7 @@ const { createRoot } = await import("react-dom/client");
 const { api } = await import("../lib/api");
 const { useChatUnread } = await import("./useChat");
 const { useSpecTasks } = await import("./useSpec");
+const { useNarratorCurrentTask } = await import("./useTaskBoard");
 const { useNugQuota } = await import("../components/narrator/model/use-nug-quota");
 const providers = [{ id: "provider", prefix: "nug" }];
 let root: Root;
@@ -36,6 +37,7 @@ let container: HTMLElement;
 function Harness({ enabled }: { enabled?: boolean }) {
 	useChatUnread(enabled);
 	useSpecTasks("real-narrator", enabled);
+	useNarratorCurrentTask("real-narrator", enabled);
 	useNugQuota("nug:model", providers, enabled);
 	return null;
 }
@@ -56,6 +58,7 @@ beforeEach(() => {
 	root = createRoot(container);
 	spyOn(api, "getChatUnread").mockImplementation(() => new Promise<never>(() => {}));
 	spyOn(api, "readSpecTasks").mockImplementation(() => new Promise<never>(() => {}));
+	spyOn(api, "getNarratorCurrentTask").mockImplementation(() => new Promise<never>(() => {}));
 	spyOn(api, "nugGetQuotas").mockImplementation(() => new Promise<never>(() => {}));
 });
 afterEach(async () => {
@@ -77,16 +80,23 @@ test("optional enabled defers companion GETs but never unbinds the real Spec WS 
 	await flush();
 	expect(api.getChatUnread).not.toHaveBeenCalled();
 	expect(api.readSpecTasks).not.toHaveBeenCalled();
+	expect(api.getNarratorCurrentTask).not.toHaveBeenCalled();
 	expect(api.nugGetQuotas).not.toHaveBeenCalled();
 	expect([...subscriptions]).toContainEqual({
 		narratorIds: ["real-narrator"],
 		types: ["spec_changed"],
+	});
+	// The status bar's current task (the task source, outline P2 PR 5) subscribes at once too.
+	expect([...subscriptions]).toContainEqual({
+		narratorIds: ["real-narrator"],
+		types: ["outline_tasks_changed", "spec_changed"],
 	});
 	const before = [...subscriptions];
 	render(true);
 	await flush();
 	expect(api.getChatUnread).toHaveBeenCalledTimes(1);
 	expect(api.readSpecTasks).toHaveBeenCalledTimes(1);
+	expect(api.getNarratorCurrentTask).toHaveBeenCalledTimes(1);
 	expect(api.nugGetQuotas).toHaveBeenCalledTimes(1);
 	expect([...subscriptions]).toEqual(before);
 });

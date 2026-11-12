@@ -15,6 +15,7 @@ import type {
 import type { FileReference } from "@shared/file-reference";
 import type { GitWorkspaceSummary } from "@shared/git-workspace";
 import type { HumanAttentionPage } from "@shared/human-attention";
+import type { MediaRef } from "@shared/media-attachments";
 import type { NarratorNavigationSummary, NarratorPanelState } from "@shared/narrator-panel-state";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
@@ -26,6 +27,7 @@ import type { RequestRecordingDetail, SavedRecording } from "@shared/request-rec
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import i18next from "i18next";
 import { decodeBlockMessage, decodeBlockPage } from "../block-protocol";
 import { narratorLoadingMetrics } from "../narrator-loading-metrics";
 import { createSharedInflight, type SharedReadOptions } from "../shared-inflight";
@@ -36,10 +38,12 @@ import {
 	authorizedFetch,
 	clearTokenOnSessionFailure,
 	getToken,
+	postBodyWithProgress,
 	postFormDataWithProgress,
 	readFetchError,
 	request,
 } from "./client";
+import { mediaUploadError } from "./media-upload-validation";
 import type {
 	ApiEntity,
 	BlacklistCmd,
@@ -83,6 +87,7 @@ export interface ComposerDocumentDetail {
 		uploadNarratorId?: string;
 	}[];
 	textFiles?: { filename: string; size: number; filePath?: string; index?: number }[];
+	media?: MediaRef[];
 	text?: string;
 	fileReferences?: FileReference[];
 	bodyRevision?: number;
@@ -97,6 +102,20 @@ export type NarratorPanelStateResponse = NarratorPanelState<
 	PendingPermission,
 	BufferMessageSummary
 >;
+
+/** One selectable execution device, as reported before a session exists. */
+export interface WorkspaceDeviceListResponse {
+	devices: Array<
+		NarratorExecutionDevice & { ownedByActingUser?: boolean; scope: "global" | "project" }
+	>;
+}
+
+/** deviceId → its recorded working directory (see `shared/workspace-directories`). */
+export type WorkspaceDirectoryEntry = {
+	cwd: string;
+	pathFlavor: "posix" | "windows";
+};
+export type WorkspaceDirectoryMap = Record<string, WorkspaceDirectoryEntry>;
 
 export type NarratorDetail = ApiEntity & {
 	navigationSummary?: NarratorNavigationSummary;
@@ -659,6 +678,112 @@ function deleteBlocksById(narratorId: string, blockIds: string[]) {
 	});
 }
 
+/** Keep the buffered multipart body small; stream larger text files separately. */
+const STAGED_ATTACHMENT_THRESHOLD_BYTES = 16 * 1024 * 1024;
+
+interface StagedAttachmentRef {
+	uploadId: string;
+	/** Position in the original new text-file array, before size splitting. */
+	index: number;
+}
+
+/** Header values must remain byte-safe, including Unicode filenames. */
+function encodeFilenameHeader(name: string): string {
+	try {
+		return encodeURIComponent(name);
+	} catch {
+		return "attachment";
+	}
+}
+
+/** XHR supplies real upload progress for the streamed body. */
+async function stageAttachment(
+	narratorId: string,
+	file: File,
+	options?: { onProgress?: (fraction: number) => void; signal?: AbortSignal },
+): Promise<{ uploadId: string }> {
+	const token = getToken();
+	const headers: Record<string, string> = {
+		"Content-Type": "application/octet-stream",
+		"x-attachment-filename": encodeFilenameHeader(file.name),
+	};
+	if (file.type) headers["x-attachment-type"] = file.type;
+	if (token) headers.Authorization = `Bearer ${token}`;
+	const res = await postBodyWithProgress(
+		`${apiBase()}/narrator-attachments/${encodeURIComponent(narratorId)}`,
+		file,
+		{ headers, onProgress: options?.onProgress, signal: options?.signal },
+	);
+	if (!res.ok) {
+		const error = await readFetchError(res, "Attachment upload failed");
+		throw new ApiError(stagingErrorMessage(error.data.code, file, error.message), res.status, {
+			...error.data,
+		});
+	}
+	return (await res.json()) as { uploadId: string };
+}
+
+/**
+ * The send toast prints `err.message`, so the two refusals a user can act on are
+ * localized here, with the file name, instead of surfacing the server's English.
+ */
+function stagingErrorMessage(code: unknown, file: File, fallback: string): string {
+	if (code === "ATTACHMENT_TOO_LARGE")
+		return i18next.t("narrator:attachmentTooLargeForUpload", { name: file.name });
+	if (code === "ATTACHMENT_STAGING_FULL")
+		return i18next.t("narrator:attachmentStagingFull", { name: file.name });
+	return fallback;
+}
+
+/** Never delay cancellation/error recovery for cleanup; TTL reclaims missed deletes. */
+function discardStagedAttachments(narratorId: string, refs: readonly StagedAttachmentRef[]): void {
+	for (const ref of refs) {
+		void authorizedFetch(
+			`${apiBase()}/narrator-attachments/${encodeURIComponent(narratorId)}/${encodeURIComponent(ref.uploadId)}`,
+			{ method: "DELETE", signal: AbortSignal.timeout(2_000) },
+		).catch(() => {});
+	}
+}
+
+function splitAttachmentsBySize<T extends { size: number }>(
+	files: readonly T[],
+): { inline: T[]; streamed: T[] } {
+	const inline: T[] = [];
+	const streamed: T[] = [];
+	for (const file of files) {
+		(file.size > STAGED_ATTACHMENT_THRESHOLD_BYTES ? streamed : inline).push(file);
+	}
+	return { inline, streamed };
+}
+
+/** Sequential uploads share one progress range and retain original attachment positions. */
+async function stageLargeAttachments(
+	narratorId: string,
+	files: readonly File[],
+	options?: { onProgress?: (fraction: number) => void; signal?: AbortSignal },
+): Promise<StagedAttachmentRef[]> {
+	const { streamed } = splitAttachmentsBySize(files);
+	const totalBytes = streamed.reduce((total, file) => total + file.size, 0) || 1;
+	let completedBytes = 0;
+	const staged: StagedAttachmentRef[] = [];
+	try {
+		for (const [index, file] of files.entries()) {
+			if (file.size <= STAGED_ATTACHMENT_THRESHOLD_BYTES) continue;
+			const base = completedBytes;
+			const ref = await stageAttachment(narratorId, file, {
+				signal: options?.signal,
+				onProgress: (fraction) => options?.onProgress?.((base + fraction * file.size) / totalBytes),
+			});
+			staged.push({ uploadId: ref.uploadId, index });
+			completedBytes += file.size;
+		}
+		return staged;
+	} catch (error) {
+		discardStagedAttachments(narratorId, staged);
+		throw error;
+	}
+}
+
 export const narratorsApi = {
 	getRequestRecordingDetail: (narratorId: string, requestId: string, signal?: AbortSignal) =>
 		request<RequestRecordingDetail>(
@@ -913,15 +1038,46 @@ export const narratorsApi = {
 		relaxedPlan?: boolean;
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+		questionReflectionOverride?: "inherit" | "on" | "off";
 		autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 		behaviorFenceIntervalOverride?: number | null;
 		behaviorFenceAttachOverride?: "inherit" | "on" | "off";
 		cwd?: string;
+		/** Execution device the session starts on. Omit/"local" for this server. */
+		deviceId?: string | null;
 		title?: string;
 		makeNamed?: boolean;
 		handle?: string;
 		kind?: "knowledge" | "setup" | "bot";
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
+	/**
+	 * Devices this caller may start a session on.
+	 *
+	 * Creation needs the list before the narrator exists, so this cannot use the
+	 * per-narrator device endpoint. Authorization is the caller's own visibility, the
+	 * same list their tool routing uses.
+	 */
+	getWorkspaceDevices: (projectId?: string | null) => {
+		const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+		return request<WorkspaceDeviceListResponse>(`/narrators/workspace-devices${qs}`);
+	},
+	/**
+	 * List one level of a device directory before the session exists.
+	 *
+	 * Non-admins are confined to the device's declared workspace root; a refusal comes
+	 * back as 403 and never reaches the device.
+	 */
+	browseWorkspaceDirectory: (
+		deviceId: string,
+		path?: string,
+		opts?: { showHidden?: boolean; projectId?: string | null },
+	) => {
+		const params = new URLSearchParams({ deviceId });
+		if (path) params.set("path", path);
+		if (opts?.showHidden) params.set("showHidden", "1");
+		if (opts?.projectId) params.set("projectId", opts.projectId);
+		return request<RemoteDirectoryListing>(`/narrators/workspace-directory-browse?${params}`);
+	},
 	/**
 	 * Spawn a Setup Assistant narrator that installs the missing system
 	 * dependencies on this machine. Returns `created: false` when nothing
@@ -1178,6 +1334,8 @@ export const narratorsApi = {
 		text: string,
 		opts?: {
 			keepImageIds?: string[];
+			keepMediaIds?: string[];
+			newMedia?: File[];
 			keepTextFiles?: { index: number; filename: string }[];
 			newImages?: File[];
 			newTextFiles?: File[];
@@ -1185,13 +1343,25 @@ export const narratorsApi = {
 			composerDocument?: ComposerDocument;
 		},
 	) => {
+		const uploadError = mediaUploadError({
+			media: opts?.newMedia,
+			// Streamed text files never enter the multipart body this budget guards.
+			otherFiles: [
+				...(opts?.newImages ?? []),
+				...splitAttachmentsBySize(opts?.newTextFiles ?? []).inline,
+			],
+			text,
+			keptMediaCount: opts?.keepMediaIds?.length,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		const path = `/narrators/${narratorId}/buffer/${messageId}`;
-		if (!opts?.newImages?.length && !opts?.newTextFiles?.length) {
+		if (!opts?.newImages?.length && !opts?.newTextFiles?.length && !opts?.newMedia?.length) {
 			return request<{ ok: boolean }>(path, {
 				method: "PATCH",
 				body: JSON.stringify({
 					text,
 					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+					...(opts?.keepMediaIds ? { keepMediaIds: opts.keepMediaIds } : {}),
 					...(opts?.keepTextFiles ? { keepTextFiles: opts.keepTextFiles } : {}),
 					fileReferences: opts?.fileReferences,
 					composerDocument: opts?.composerDocument,
@@ -1201,6 +1371,7 @@ export const narratorsApi = {
 		const formData = new FormData();
 		formData.append("text", text);
 		if (opts.keepImageIds) formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
+		if (opts.keepMediaIds) formData.append("keepMediaIds", JSON.stringify(opts.keepMediaIds));
 		if (opts.keepTextFiles) formData.append("keepTextFiles", JSON.stringify(opts.keepTextFiles));
 		if (opts.fileReferences !== undefined) {
 			formData.append("fileReferences", JSON.stringify(opts.fileReferences));
@@ -1209,10 +1380,27 @@ export const narratorsApi = {
 			formData.append("composerDocument", JSON.stringify(opts.composerDocument));
 		}
 		for (const img of opts.newImages ?? []) formData.append("images", img);
-		for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
+		for (const media of opts.newMedia ?? []) formData.append("media", media);
+		// Large files are streamed first for the same reason as on the send path:
+		// the multipart body is what the server buffers in memory.
+		const { inline, streamed } = splitAttachmentsBySize(opts.newTextFiles ?? []);
+		for (const tf of inline) formData.append("textFiles", tf);
+		const staged = streamed.length
+			? await stageLargeAttachments(narratorId, opts.newTextFiles ?? [])
+			: [];
+		if (staged.length) {
+			formData.append("stagedAttachments", JSON.stringify(staged));
+		}
 		// Content-Type is left unset so the browser adds the multipart boundary.
-		const res = await authorizedFetch(`${apiBase()}${path}`, { method: "PATCH", body: formData });
+		let res: Response;
+		try {
+			res = await authorizedFetch(`${apiBase()}${path}`, { method: "PATCH", body: formData });
+		} catch (error) {
+			discardStagedAttachments(narratorId, staged);
+			throw error;
+		}
 		if (!res.ok) {
+			discardStagedAttachments(narratorId, staged);
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
@@ -1490,9 +1678,12 @@ export const narratorsApi = {
 			{ method: "DELETE" },
 		),
 	getNarratorExecutionDevices: (id: string) =>
-		request<{ defaultDeviceId: string | null; devices: NarratorExecutionDevice[] }>(
-			`/narrators/${id}/execution-devices`,
-		),
+		request<{
+			defaultDeviceId: string | null;
+			devices: NarratorExecutionDevice[];
+			/** Working directory recorded per device; absence means "not configured". */
+			directories?: WorkspaceDirectoryMap;
+		}>(`/narrators/${id}/execution-devices`),
 	/**
 	 * Browse one level of a device's filesystem through a narrator's device
 	 * authorization, so non-admin users can use the remote path picker.
@@ -1658,6 +1849,7 @@ export const narratorsApi = {
 		data: {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 			tasksReminderIntervalOverride?: number | null;
 		},
@@ -1710,7 +1902,16 @@ export const narratorsApi = {
 		interrupt?: boolean,
 		queueMode?: "turn" | "tool" | "interrupt",
 		options?: { composerDocument?: ComposerDocument },
+		media?: File[],
 	) => {
+		// Only files that ride inside the multipart body count against its budget;
+		// large text files are streamed ahead and never enter it.
+		const uploadError = mediaUploadError({
+			media,
+			otherFiles: [...(images ?? []), ...splitAttachmentsBySize(textFiles ?? []).inline],
+			text: message,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		if (queueMode !== undefined) {
 			priority = queueMode !== "turn";
 			interrupt = queueMode === "interrupt";
@@ -1723,15 +1924,37 @@ export const narratorsApi = {
 
 		const url = `${apiBase()}/narrators/${narratorId}/messages`;
 		let res: Response;
-		if (images?.length || textFiles?.length) {
+		let staged: StagedAttachmentRef[] = [];
+		if (images?.length || textFiles?.length || media?.length) {
+			// Large attachments are streamed first so the multipart body stays small:
+			// whatever is left in it is what the server buffers in memory. The staging
+			// calls and this request report progress as one continuous run, because to
+			// the user they are a single "sending" operation.
+			const { inline, streamed } = splitAttachmentsBySize(textFiles ?? []);
+			const streamedBytes = streamed.reduce((total, file) => total + file.size, 0);
+			const requestBytes = [...inline, ...(images ?? []), ...(media ?? [])].reduce(
+				(total, file) => total + file.size,
+				0,
+			);
+			const totalBytes = streamedBytes + requestBytes;
+			staged = streamed.length
+				? await stageLargeAttachments(narratorId, textFiles ?? [], {
+						signal,
+						onProgress: onUploadProgress
+							? (fraction) => onUploadProgress((fraction * streamedBytes) / (totalBytes || 1))
+							: undefined,
+					})
+				: [];
 			const formData = new FormData();
 			formData.append("message", message);
 			if (images) {
 				for (const img of images) formData.append("images", img);
 			}
-			if (textFiles) {
-				for (const tf of textFiles) formData.append("textFiles", tf);
+			for (const tf of inline) formData.append("textFiles", tf);
+			if (staged.length) {
+				formData.append("stagedAttachments", JSON.stringify(staged));
 			}
+			for (const file of media ?? []) formData.append("media", file);
 			if (priority) formData.append("priority", "true");
 			if (interrupt) formData.append("interrupt", "true");
 			if (queueMode !== undefined) formData.append("queueMode", queueMode);
@@ -1742,11 +1965,23 @@ export const narratorsApi = {
 				formData.append("composerDocument", JSON.stringify(options.composerDocument));
 			}
 			// Use XHR-backed upload so we can surface real upload progress to the UI.
-			res = await postFormDataWithProgress(url, formData, {
-				headers,
-				onProgress: onUploadProgress,
-				signal,
-			});
+			try {
+				res = await postFormDataWithProgress(url, formData, {
+					headers,
+					onProgress: onUploadProgress
+						? (fraction) =>
+								onUploadProgress(
+									totalBytes ? (streamedBytes + fraction * requestBytes) / totalBytes : fraction,
+								)
+						: undefined,
+					signal,
+				});
+			} catch (error) {
+				// The send failed, so nothing will claim these uploads. Dropping them now
+				// keeps the staging area from holding gigabytes until the TTL sweep.
+				discardStagedAttachments(narratorId, staged);
+				throw error;
+			}
 		} else {
 			headers["Content-Type"] = "application/json";
 			res = await fetch(url, {
@@ -1764,10 +1999,12 @@ export const narratorsApi = {
 			});
 		}
 		if (res.status === 401) {
+			discardStagedAttachments(narratorId, staged);
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);
 		}
 		if (!res.ok) {
+			discardStagedAttachments(narratorId, staged);
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
@@ -1888,6 +2125,8 @@ export const narratorsApi = {
 			scope?: RevertScope;
 			revertPlan?: RevertPlanConfirmation;
 			keepImageIds?: string[];
+			keepMediaIds?: string[];
+			newMedia?: File[];
 			newImages?: File[];
 			keepTextFilePaths?: string[];
 			newTextFiles?: File[];
@@ -1902,10 +2141,22 @@ export const narratorsApi = {
 		if (token) headers.Authorization = `Bearer ${token}`;
 		const inputBlockId = opts?.inputBlockId;
 
+		const uploadError = mediaUploadError({
+			media: opts?.newMedia,
+			// Streamed text files never enter the multipart body this budget guards.
+			otherFiles: [
+				...(opts?.newImages ?? []),
+				...splitAttachmentsBySize(opts?.newTextFiles ?? []).inline,
+			],
+			text: content,
+			keptMediaCount: opts?.keepMediaIds?.length,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		let body: BodyInit;
+		let staged: StagedAttachmentRef[] = [];
 		// Use multipart whenever new files (images or text files) are uploaded;
 		// kept-subset ids/paths ride along so the server drops removed attachments.
-		if (opts?.newImages?.length || opts?.newTextFiles?.length) {
+		if (opts?.newImages?.length || opts?.newTextFiles?.length || opts?.newMedia?.length) {
 			const formData = new FormData();
 			formData.append("content", content);
 			if (opts.skipRevert !== undefined) {
@@ -1916,6 +2167,7 @@ export const narratorsApi = {
 			if (opts.keepImageIds) {
 				formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
 			}
+			if (opts.keepMediaIds) formData.append("keepMediaIds", JSON.stringify(opts.keepMediaIds));
 			if (opts.keepTextFilePaths) {
 				formData.append("keepTextFilePaths", JSON.stringify(opts.keepTextFilePaths));
 			}
@@ -1926,7 +2178,17 @@ export const narratorsApi = {
 				formData.append("composerDocument", JSON.stringify(opts.composerDocument));
 			}
 			for (const img of opts.newImages ?? []) formData.append("images", img);
-			for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
+			for (const media of opts.newMedia ?? []) formData.append("media", media);
+			// Large files are streamed ahead of the request so the multipart body —
+			// the part the server buffers — stays small.
+			const { inline, streamed } = splitAttachmentsBySize(opts.newTextFiles ?? []);
+			for (const tf of inline) formData.append("textFiles", tf);
+			staged = streamed.length
+				? await stageLargeAttachments(narratorId, opts.newTextFiles ?? [])
+				: [];
+			if (staged.length) {
+				formData.append("stagedAttachments", JSON.stringify(staged));
+			}
 			body = formData;
 		} else {
 			headers["Content-Type"] = "application/json";
@@ -1936,6 +2198,7 @@ export const narratorsApi = {
 				...(opts?.scope ? { scope: opts.scope } : {}),
 				...(opts?.revertPlan ? { revertPlan: opts.revertPlan } : {}),
 				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+				...(opts?.keepMediaIds ? { keepMediaIds: opts.keepMediaIds } : {}),
 				...(opts?.keepTextFilePaths ? { keepTextFilePaths: opts.keepTextFilePaths } : {}),
 				fileReferences: opts?.fileReferences,
 				composerDocument: opts?.composerDocument,
@@ -1951,12 +2214,18 @@ export const narratorsApi = {
 				headers,
 				body,
 			},
-		);
+		).catch((error) => {
+			discardStagedAttachments(narratorId, staged);
+			throw error;
+		});
 		if (res.status === 401) {
+			discardStagedAttachments(narratorId, staged);
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);
 		}
 		if (!res.ok) {
+			// The rewrite was refused, so nothing will claim the staged uploads.
+			discardStagedAttachments(narratorId, staged);
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
@@ -2314,6 +2583,28 @@ export const narratorsApi = {
 		}),
 
 	// ── Prompt optimization ────────────────────────────────────────────────────
+
+	/**
+	 * Optimize prompt text that has no narrator yet (the "new session" dialog's
+	 * project-prompt box). Same styles and model as the composer's button, but there is
+	 * no session to authorize against or read conversation context from.
+	 */
+	optimizeDraftPrompt: (
+		text: string,
+		style: "clarify" | "concise" | "structured" | "translate_en",
+		options?: { signal?: AbortSignal },
+	) =>
+		request<{ text: string; model: string; reasoningSummary?: string }>(
+			// NOT under `/narrators`: that router resolves a `:id` for every sub-path it
+			// serves, so a narrator-less call there is read as a narrator id and answered
+			// with "Narrator not found". The draft route is its own group.
+			"/prompt-optimize/draft",
+			{
+				method: "POST",
+				body: JSON.stringify({ text, style }),
+				signal: options?.signal,
+			},
+		),
 
 	optimizePrompt: (
 		narratorId: string,

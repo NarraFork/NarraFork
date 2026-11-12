@@ -10,8 +10,14 @@ import {
 	PLUGIN_UI_RUNTIME_CSS_URL,
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
-import { CHROMIUM_PATHS } from "../shared/browser-paths";
 import { urlHost } from "../shared/server-host";
+import {
+	declaredBodyExceeds,
+	isStorageImportUpload,
+	MAX_IMPORT_BYTES,
+	MAX_ORDINARY_BODY_BYTES,
+} from "../shared/storage-transfer";
+import { isStreamingAttachmentUpload } from "../shared/text-file-types";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -46,13 +52,15 @@ import {
 } from "./lib/manager-control-server";
 import { readManagerToken } from "./lib/manager-token";
 import { mcpManager } from "./lib/mcp/manager";
-import { syncMcpTools } from "./lib/mcp/tool-bridge";
+import { prepareMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
-import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
+import { openFrontendOnce } from "./lib/open-frontend";
+import { IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
+import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "./lib/runtime-target";
 import {
 	registerGracefulShutdownHandler,
 	registerOperatorShutdownHandler,
@@ -62,19 +70,16 @@ import {
 import { reloadSettings, reloadSettingsIfChanged, settings } from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
-import { shellExecute } from "./lib/shell-exec";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
-import {
-	buildHealthPayload,
-	createStartupReadinessGate,
-	healthStatusCode,
-	shouldServeRequests,
-	shouldStartGatedBackgroundWork,
-} from "./lib/startup-readiness";
+import { buildHealthPayload, createStartupReadinessGate } from "./lib/startup-readiness";
+import { closeStartupStatus } from "./lib/startup-status";
+import { noPortAvailable, portUnavailable } from "./lib/startup-status/startup-problems";
+import { reissueBuiltinTlsOnStartup } from "./lib/tls";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
+import { terminateWindowsChildren } from "./lib/windows-child-job";
 import {
 	findExcludingRange,
 	formatPortRanges,
@@ -115,13 +120,16 @@ import {
 } from "./services/notification-center-maintenance";
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
+import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
 import { initKnowledgeNotify } from "./services/knowledge-notify";
 import { materializeLegacyDelegations } from "./services/legacy-delegation-materializer";
+import { setMigrationPgHandle } from "./services/migration-db";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -129,7 +137,10 @@ import {
 	getExternalWebSocketRolloutSettings,
 	isExternalWebSocketOriginAllowed,
 } from "./services/oauth-ws-ticket-service";
-import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
+import {
+	migrateReservedAutoPrefixOnStartup,
+	recoverProviderPrefixMigrationOnStartup,
+} from "./services/provider-prefix-migration-service";
 import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
 import {
 	type VerifiedPublicShare,
@@ -177,9 +188,24 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver({
 		),
 });
 
+// The startup migrations below read and rewrite narrator rows; give them the PG handle
+// before they run (composePostgresStores sets it again, harmlessly).
+if (postgresRuntime) setMigrationPgHandle(postgresRuntime.client.db);
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
-// A mismatched journal intentionally fails startup rather than serving mixed model references.
-recoverProviderPrefixMigrationOnStartup();
+// A journal that no longer matches the settings is kept and logged; startup continues.
+await recoverProviderPrefixMigrationOnStartup().catch((error) => {
+	logger.error("Could not recover an interrupted provider prefix migration", {
+		error: String(error),
+	});
+});
+// auto:<model> routing reads live source availability (Codex accounts, key cooldowns).
+installAutoRouteSignals();
+// `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
+// logged and leaves it working as an ordinary prefix, so startup never depends on it.
+// Runs on both backends (services/migration-db.ts picks the active handle).
+await migrateReservedAutoPrefixOnStartup().catch((error) => {
+	logger.error("Could not rename the provider prefixed `auto`", { error: String(error) });
+});
 
 // When the PostgreSQL backend is active, inject every PG-capable store from the single
 // composition seam — one runtime, one client, all-or-nothing. `./db` has already finished
@@ -315,12 +341,11 @@ let currentHost = await resolveManagerListenHost(
 );
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
-const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
+const isCompiledBinary = isCompiledRuntime();
 // Also treat as production when dist/frontend exists (handles Windows where
 // NODE_ENV=production inline syntax doesn't work)
-const hasFrontendBuild = existsSync(
-	resolve(import.meta.dir, "..", "dist", "frontend", "index.html"),
-);
+const hasFrontendBuild =
+	!isCompiledBinary && existsSync(resolve(import.meta.dir, "..", "dist", "frontend", "index.html"));
 const isProd = isCompiledBinary || process.env.NODE_ENV === "production" || hasFrontendBuild;
 
 // MIME type lookup for embedded static files
@@ -424,18 +449,18 @@ async function serveBrandedManifest(path: string, staticPath: string): Promise<R
 
 // Production: serve Vite build output via Hono
 if (isProd) {
-	// Try embedded assets only for compiled single-executable mode. Source runs
-	// (`bun run start`) should serve dist/frontend from disk so a later
-	// `bun run build` with new hashed asset names is visible without restart.
-	let hasEmbedded = false;
+	// Compiled processes only serve their frozen assets. Explicit source runs
+	// keep serving dist/frontend from disk so a later frontend build is visible.
 	if (isCompiledBinary) {
 		try {
 			// Dynamic import so it doesn't fail when the generated file doesn't exist (dev / bundle mode)
-			const generatedFrontendModulePath = "./generated/embedded-frontend";
-			const generatedModule = (await import(generatedFrontendModulePath)) as {
+			const generatedModule = (await import("@server/generated/embedded-frontend")) as {
 				embeddedAssets?: Record<string, string>;
 			};
-			const rawAssets = generatedModule.embeddedAssets ?? {};
+			if (!generatedModule.embeddedAssets) {
+				throw new Error("Embedded frontend asset map is unavailable in this build");
+			}
+			const rawAssets = generatedModule.embeddedAssets;
 			// Normalise keys: on Windows the build script may produce backslash
 			// keys (e.g. "/assets\\index-abc.js") — convert them to forward slashes
 			// so they match browser request paths.
@@ -444,49 +469,48 @@ if (isProd) {
 				embeddedAssets[key.replaceAll("\\", "/")] = value;
 			}
 			const indexPath = embeddedAssets["/index.html"];
-			if (indexPath) {
-				hasEmbedded = true;
-				logger.info("Serving frontend from embedded assets");
-
-				// Serve exact-match embedded files
-				app.use("*", async (c, next) => {
-					// Skip API and WebSocket routes
-					if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
-						return next();
-					}
-
-					const filePath = embeddedAssets[c.req.path];
-					if (filePath) {
-						const branded = await serveBrandedManifest(c.req.path, filePath);
-						if (branded) return branded;
-						const blob = Bun.file(filePath);
-						const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
-						return new Response(blob, {
-							headers: {
-								"Content-Type": mime,
-								"Cache-Control": getFrontendCacheControl(c.req.path),
-							},
-						});
-					}
-
-					// SPA catch-all: serve index.html for non-file routes
-					if (!c.req.path.includes(".")) {
-						return serveSpaIndex(Bun.file(indexPath), c.req.path);
-					}
-
-					return next();
-				});
+			if (!indexPath && !IS_LOCAL_RUNTIME) {
+				throw new Error("Embedded frontend index is unavailable in this build");
 			}
-		} catch (err) {
-			// Generated file doesn't exist — fall through to filesystem mode
-			logger.debug("Embedded frontend not available, falling back to filesystem", {
-				error: String(err),
+			// Local backend-only launches use Vite for navigation, but still serve
+			// their frozen brand/GenUI assets. Never borrow a checkout's dist.
+			logger.info("Serving frontend from embedded assets", { hasIndex: !!indexPath });
+
+			// Serve exact-match embedded files
+			app.use("*", async (c, next) => {
+				// Skip API and WebSocket routes
+				if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
+					return next();
+				}
+
+				const filePath = embeddedAssets[c.req.path];
+				if (filePath) {
+					const branded = await serveBrandedManifest(c.req.path, filePath);
+					if (branded) return branded;
+					const blob = Bun.file(filePath);
+					const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
+					return new Response(blob, {
+						headers: {
+							"Content-Type": mime,
+							"Cache-Control": getFrontendCacheControl(c.req.path),
+						},
+					});
+				}
+
+				// SPA catch-all: serve index.html for non-file routes
+				if (indexPath && !c.req.path.includes(".")) {
+					return serveSpaIndex(Bun.file(indexPath), c.req.path);
+				}
+
+				return next();
 			});
+		} catch (cause) {
+			throw new Error("Embedded frontend assets are unavailable in this build", { cause });
 		}
 	}
 
-	// Fallback: serve from filesystem (bundle mode or bun run start)
-	if (!hasEmbedded) {
+	// Mutable filesystem assets belong only to explicit source runs.
+	if (!isCompiledBinary) {
 		const staticDir = resolve(import.meta.dir, "..", "dist", "frontend");
 		logger.info(
 			`Static file serving: filesystem mode, dir=${staticDir}, exists=${existsSync(staticDir)}`,
@@ -534,16 +558,10 @@ if (isProd) {
 	}
 }
 
-// ── Windows: forcefully reclaim port from stale TCP connections ──────────────
-// Bun on Windows has known issues where the port isn't released after a crash
-// or unclean shutdown (see oven-sh/bun#12127, #18003, #26049).  Even after the
-// owning process exits, the port can remain in LISTENING state — netstat shows
-// a PID but taskkill says "process not found".  This is the Windows "ghost
-// port" problem: the original process is gone, but a related process (often
-// conhost.exe) still holds the inherited socket handle.
-//
-// Strategy: try to kill the PID from netstat.  If it's already gone, trace the
-// process tree via wmic to find the real handle holder and kill that.
+// ── Windows: own child processes ──────────────────────────────────────────────
+// Children that outlive an unclean exit keep files and ports busy, so the exit path ends the
+// whole tree below this process. Uses wmic, which recent Windows builds no longer ship; there
+// this finds nothing. A Job Object would replace it.
 type WindowsProcessInfo = {
 	pid: number;
 	caption: string;
@@ -567,160 +585,6 @@ function parseWmicProcessCsv(output: string): WindowsProcessInfo[] {
 		});
 	}
 	return processes;
-}
-
-function tryReclaimPort(targetPort: number): void {
-	if (!IS_WINDOWS) return;
-	try {
-		// netstat -ano gives lines like:
-		//   TCP    0.0.0.0:7778           0.0.0.0:0              LISTENING       12345
-		//   TCP    [::]:7778              [::]:0                 LISTENING       12345
-		const result = Bun.spawnSync(["netstat", "-ano"], {
-			stdout: "pipe",
-			stderr: "ignore",
-			windowsHide: true,
-		});
-		if (result.exitCode !== 0) return;
-		const output = new TextDecoder().decode(result.stdout);
-		const listeningPids = new Set<number>();
-		const portPattern = new RegExp(`:${targetPort}\\s`);
-		for (const line of output.split("\n")) {
-			if (!portPattern.test(line)) continue;
-			const parts = line.trim().split(/\s+/);
-			const pid = Number.parseInt(parts[parts.length - 1], 10);
-			const state = parts[3]; // LISTENING, ESTABLISHED, CLOSE_WAIT, FIN_WAIT_2, TIME_WAIT, etc.
-			if (state === "LISTENING" && pid > 0 && pid !== process.pid) {
-				listeningPids.add(pid);
-			}
-		}
-
-		for (const pid of listeningPids) {
-			killPortHolder(pid, targetPort);
-		}
-
-		if (listeningPids.size > 0) {
-			Bun.sleepSync(200);
-		}
-	} catch {
-		// netstat/tasklist not available — skip silently
-	}
-}
-
-/**
- * Try to kill a process holding a LISTENING socket. If the PID from netstat is
- * already gone (taskkill returns "not found"), trace the process tree via wmic
- * to find related processes (parent, siblings, children) that may still hold the
- * inherited socket handle, and kill those.
- *
- * SEE https://serverfault.com/questions/1169871/how-to-allocate-a-tcp-port-orphaned-by-a-non-existent-process-without-restarting
- */
-function killPortHolder(pid: number, port: number): void {
-	// Attempt 1: direct kill.
-	const directKill = Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], {
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
-	});
-	const stderr = new TextDecoder().decode(directKill.stderr).toLowerCase();
-	if (directKill.exitCode === 0) {
-		logger.warn(`Killed process (PID ${pid}) holding port ${port}`);
-		Bun.sleepSync(300);
-		return;
-	}
-
-	// If the process exists but we lack permissions, nothing more we can do.
-	if (!stderr.includes("not found")) return;
-
-	// Attempt 2: the PID is gone but the port is still held. Trace the parent
-	// process via wmic and kill related children (the real handle holder, often
-	// conhost.exe or similar).
-	logger.info(`PID ${pid} not found — tracing process tree to find port ${port} holder`);
-	try {
-		const childQuery = Bun.spawnSync(
-			[
-				"wmic",
-				"process",
-				"where",
-				`(ParentProcessId=${pid})`,
-				"get",
-				"Caption,ProcessId",
-				"/FORMAT:CSV",
-			],
-			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
-		);
-		const childOutput = new TextDecoder().decode(childQuery.stdout);
-		for (const line of childOutput.split("\n")) {
-			const cols = line.trim().split(",");
-			// CSV format: Node,Caption,ProcessId
-			if (cols.length < 3) continue;
-			const childPid = Number.parseInt(cols[cols.length - 1] ?? "", 10);
-			if (!childPid || childPid === process.pid) continue;
-			logger.warn(
-				`Killing child process ${cols[1]?.trim()} (PID ${childPid}) — likely holding port ${port}`,
-			);
-			try {
-				Bun.spawnSync(["taskkill", "/F", "/PID", String(childPid)], {
-					stdio: ["ignore", "ignore", "ignore"],
-					// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
-					windowsHide: true,
-				});
-			} catch {
-				// best effort
-			}
-		}
-
-		// Also check: maybe the ghost PID's parent spawned other children that
-		// inherited the handle. Look up the parent first.
-		const parentQuery = Bun.spawnSync(
-			["wmic", "process", "where", `(ProcessId=${pid})`, "get", "ParentProcessId", "/FORMAT:CSV"],
-			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
-		);
-		const parentOutput = new TextDecoder().decode(parentQuery.stdout);
-		for (const line of parentOutput.split("\n")) {
-			const cols = line.trim().split(",");
-			if (cols.length < 2) continue;
-			const parentPid = Number.parseInt(cols[cols.length - 1] ?? "", 10);
-			if (!parentPid || parentPid === process.pid || parentPid === pid) continue;
-
-			// Kill siblings (other children of the same parent).
-			const siblingQuery = Bun.spawnSync(
-				[
-					"wmic",
-					"process",
-					"where",
-					`(ParentProcessId=${parentPid})`,
-					"get",
-					"Caption,ProcessId",
-					"/FORMAT:CSV",
-				],
-				{ stdout: "pipe", stderr: "ignore", windowsHide: true },
-			);
-			const siblingOutput = new TextDecoder().decode(siblingQuery.stdout);
-			for (const sLine of siblingOutput.split("\n")) {
-				const sCols = sLine.trim().split(",");
-				if (sCols.length < 3) continue;
-				const sPid = Number.parseInt(sCols[sCols.length - 1] ?? "", 10);
-				if (!sPid || sPid === process.pid || sPid === pid) continue;
-				const sName = sCols[1]?.trim().toLowerCase() ?? "";
-				// Only kill known "handle holder" processes, not random siblings.
-				if (sName === "conhost.exe" || sName === "cmd.exe") {
-					logger.warn(`Killing sibling ${sName} (PID ${sPid}) — likely holding port ${port}`);
-					try {
-						Bun.spawnSync(["taskkill", "/F", "/PID", String(sPid)], {
-							stdio: ["ignore", "ignore", "ignore"],
-							// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
-							windowsHide: true,
-						});
-					} catch {
-						// best effort
-					}
-				}
-			}
-		}
-		Bun.sleepSync(300);
-	} catch {
-		// wmic not available or failed — skip
-	}
 }
 
 function getWindowsChildProcesses(parentPid: number): WindowsProcessInfo[] {
@@ -772,6 +636,10 @@ function collectWindowsDescendantPids(rootPid: number): WindowsProcessInfo[] {
 
 function killOwnWindowsChildProcesses(): void {
 	if (!IS_WINDOWS) return;
+	// Job Object + taskkill on the tracked roots needs no wmic (absent on recent Windows) and
+	// covers grandchildren. The wmic walk stays as a backstop for anything never tracked; on
+	// machines without wmic it simply finds nothing.
+	terminateWindowsChildren();
 	const descendants = collectWindowsDescendantPids(process.pid).sort(
 		(a, b) => (b.depth ?? 0) - (a.depth ?? 0),
 	);
@@ -872,6 +740,43 @@ function stopHttpListener(): void {
 
 let boundTlsConfig = settings.server.tls;
 
+const BODYLESS_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * `maxRequestBodySize` 是全局的，导入预览把它抬到 4 GB。
+ * 其它带正文的请求仍按 128 MB 拒绝：声明的 Content-Length 直接 413，
+ * 缺省或偏小的长度则在读流时计数，避免未声明长度的请求把 4 GB 吃满。
+ * WebSocket 升级在调用这里之前已经返回。
+ */
+function limitOrdinaryRequestBody(req: Request, url: URL): Request | Response {
+	if (isStorageImportUpload(req.method, url.pathname)) return req;
+	// 附件流式上传逐块落盘，并在 attachment-staging 里按实际字节数执行 1 GiB 上限，
+	// 在这里按 128 MB 截断会让大附件永远传不上去。
+	if (isStreamingAttachmentUpload(req.method, url.pathname)) return req;
+	if (BODYLESS_METHODS.has(req.method.toUpperCase())) return req;
+	if (declaredBodyExceeds(req.headers.get("content-length"), MAX_ORDINARY_BODY_BYTES)) {
+		return new Response("Request body too large", {
+			status: 413,
+			headers: { "content-type": "text/plain; charset=utf-8" },
+		});
+	}
+	if (!req.body) return req;
+	let seen = 0;
+	const limited = req.body.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				seen += chunk.byteLength;
+				if (seen > MAX_ORDINARY_BODY_BYTES) {
+					controller.error(new Error("Request body too large"));
+					return;
+				}
+				controller.enqueue(chunk);
+			},
+		}),
+	);
+	return new Request(req, { body: limited, duplex: "half" } as RequestInit);
+}
+
 function startServer(
 	listenPort: number,
 	tlsCfg: typeof settings.server.tls,
@@ -923,7 +828,7 @@ function startServer(
 						database: { backend: activeDatabaseBackend },
 					}),
 					{
-						status: healthStatusCode(startupReadiness.state, healthResponse.status),
+						status: healthResponse.status,
 						headers,
 					},
 				);
@@ -936,16 +841,9 @@ function startServer(
 			if (narratorWsRefusal) return narratorWsRefusal;
 
 			// Wait for recovery to reach a terminal outcome so restored narrators observe a
-			// consistent state, but never turn a recovery failure into a dead server: the
-			// frontend, auth and settings routes are what the user needs to repair whatever
-			// made recovery fail (e.g. a narrator pinned to a deleted provider prefix).
+			// consistent state. A recovery failure is scoped to its narrator and never
+			// closes the HTTP surface: the UI is what repairs that narrator's state.
 			await startupReadiness.barrier;
-			if (!shouldServeRequests(startupReadiness.state)) {
-				return new Response("Startup narrator recovery failed", {
-					status: 503,
-					headers: { "Retry-After": "5" },
-				});
-			}
 
 			if (url.pathname === "/ws/external/v1/narrators") {
 				const rollout = getExternalWebSocketRolloutSettings();
@@ -1117,7 +1015,9 @@ function startServer(
 				xRealIp: req.headers.get("x-real-ip"),
 				trustedProxyCidrs,
 			});
-			return app.fetch(req, {
+			const limited = limitOrdinaryRequestBody(req, url);
+			if (limited instanceof Response) return limited;
+			return app.fetch(limited, {
 				clientIp,
 				peerIp,
 				trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
@@ -1137,6 +1037,10 @@ function startServer(
 					port: listenPort,
 					hostname: host,
 					idleTimeout: 255,
+					// Bun 只能设一个全局请求体上限。导入预览要收最大 4 GB 的包，所以这里取
+					// MAX_IMPORT_BYTES；其它请求在 limitOrdinaryRequestBody 里按 128 MB 拒绝，
+					// 流式附件上传（≤ 1 GiB）在暂存层按实际字节自行限流。
+					maxRequestBodySize: MAX_IMPORT_BYTES,
 					tls,
 					fetch: fetchRequest,
 					websocket: wsHandlers,
@@ -1166,6 +1070,13 @@ function startServerWithHostFallback(listenPort: number) {
 	return startServer(listenPort, settings.server.tls, true);
 }
 
+// Refresh the built-in certificate before the listener reads it, without a restart.
+try {
+	await reissueBuiltinTlsOnStartup(settings.server.tls);
+} catch (error) {
+	logger.warn("Could not update TLS certificate on startup; check TLS settings", { error });
+}
+
 let actualPort = port;
 let _server: ReturnType<typeof startServer>;
 
@@ -1176,10 +1087,8 @@ let _server: ReturnType<typeof startServer>;
 const excludedPortRanges = readWindowsExcludedPortRanges();
 const excludedRangeForPort = findExcludingRange(port, excludedPortRanges);
 
-// Only meaningful when a real process holds the port; a reserved range has no owner to kill.
-if (!excludedRangeForPort) {
-	tryReclaimPort(port);
-}
+// The startup page holds the port until here; from now on the real server answers.
+await closeStartupStatus();
 
 if (portExplicit) {
 	// User explicitly specified a port — fail hard rather than silently moving it.
@@ -1187,32 +1096,13 @@ if (portExplicit) {
 		// Bun surfaces this bind failure asynchronously on Windows, where the catch below never
 		// runs and the process dies on an "Is port in use?" uncaught exception that points at the
 		// wrong cause. Report the real reason before touching Bun.serve().
-		const reserved = `${excludedRangeForPort.start}-${excludedRangeForPort.end}`;
-		logger.error(`Port ${port} is inside a Windows reserved TCP port range. Cannot start server.`, {
-			port,
-			reservedRange: reserved,
-			excludedRanges: formatPortRanges(excludedPortRanges),
-		});
-		console.error(
-			`\x1b[31mError: Port ${port} is reserved by Windows (excluded range ${reserved}).\x1b[0m\n` +
-				"No process is using it — the Windows TCP stack has reserved the range, and the reserved\n" +
-				"ranges change on every reboot. Inspect them with:\n" +
-				`  ${NETSH_EXCLUDED_PORT_COMMAND}\n` +
-				"Choose a port outside every listed range with --port=XXXX.",
-		);
-		process.exit(1);
+		throw portUnavailable(port, `${excludedRangeForPort.start}-${excludedRangeForPort.end}`);
 	}
 	try {
 		_server = startServerWithHostFallback(port);
 		actualPort = _server.port ?? port;
 	} catch (err) {
-		if (isListenerPortConflict(err)) {
-			logger.error(`Port ${port} is already in use. Cannot start server.`);
-			console.error(
-				`\x1b[31mError: Port ${port} is already in use.\x1b[0m\nPlease free the port or choose a different one with --port=XXXX.`,
-			);
-			process.exit(1);
-		}
+		if (isListenerPortConflict(err)) throw portUnavailable(port);
 		throw err;
 	}
 } else {
@@ -1254,18 +1144,10 @@ if (portExplicit) {
 		}
 	}
 	if (!started) {
-		const attempted = attemptedPorts.length > 0 ? attemptedPorts.join(", ") : String(port);
-		logger.error(`Could not find an available port (tried ${attempted}).`, {
-			excludedRanges: formatPortRanges(excludedPortRanges),
-		});
-		const reservedHint =
-			excludedPortRanges.length > 0
-				? `\nWindows reserved TCP ranges: ${formatPortRanges(excludedPortRanges)} (list them with ${NETSH_EXCLUDED_PORT_COMMAND}).`
-				: "";
-		console.error(
-			`\x1b[31mError: Could not find an available port (tried ${attempted}).\x1b[0m${reservedHint}\nPlease specify a port with --port=XXXX.`,
+		throw noPortAvailable(
+			attemptedPorts.length > 0 ? attemptedPorts.join(", ") : String(port),
+			excludedPortRanges.length > 0 ? formatPortRanges(excludedPortRanges) : undefined,
 		);
-		process.exit(1);
 	}
 }
 
@@ -1370,74 +1252,6 @@ startSettingsFileWatcher(() => {
 	reloadSettingsIfChanged();
 });
 
-/** Open a URL in the user's default browser. */
-function openInBrowser(url: string) {
-	// Windows 走 ShellExecuteW：不经 cmd start，避免偶尔闪出的控制台窗口。
-	if (IS_WINDOWS) {
-		if (shellExecute(url)) return;
-	}
-	try {
-		if (IS_MACOS) {
-			Bun.spawn(["open", url], { stdio: ["ignore", "ignore", "ignore"] });
-		} else if (!IS_WINDOWS) {
-			Bun.spawn(["xdg-open", url], { stdio: ["ignore", "ignore", "ignore"] });
-		}
-	} catch {
-		// Not critical — user can open manually
-	}
-}
-
-async function openAsApp(url: string) {
-	// Windows 上 Edge/Chrome 不在 PATH 里（Bun.which 找不到），按标准安装路径探测；
-	// 直接 spawn 绝对路径，避免经 cmd start 时参数被重新解析。
-	if (IS_WINDOWS) {
-		const browser = CHROMIUM_PATHS.find((path) => existsSync(path));
-		if (browser) {
-			try {
-				Bun.spawn([browser, `--app=${url}`], {
-					stdio: ["ignore", "ignore", "ignore"],
-					windowsHide: true,
-				});
-				return;
-			} catch {
-				// 落到默认浏览器兜底
-			}
-		}
-		openInBrowser(url);
-		return;
-	}
-
-	const candidates: { program: string; args: string[] }[] = IS_MACOS
-		? [
-				{ program: "open", args: ["-a", "Google Chrome", url, "--args", `--app=${url}`] },
-				{ program: "open", args: ["-a", "Microsoft Edge", url, "--args", `--app=${url}`] },
-				{ program: "open", args: ["-a", "Chromium", url, "--args", `--app=${url}`] },
-			]
-		: [
-				{ program: "google-chrome", args: [`--app=${url}`] },
-				{ program: "google-chrome-stable", args: [`--app=${url}`] },
-				{ program: "chromium", args: [`--app=${url}`] },
-				{ program: "chromium-browser", args: [`--app=${url}`] },
-				{ program: "microsoft-edge", args: [`--app=${url}`] },
-			];
-
-	for (const { program, args } of candidates) {
-		try {
-			const proc = Bun.spawn([program, ...args], {
-				stdio: ["ignore", "ignore", "ignore"],
-				windowsHide: true,
-			});
-			// Give it a moment to fail (e.g. command not found)
-			const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
-			const result = await Promise.race([proc.exited, timeout]);
-			if (result !== null && result !== 0) continue;
-			return;
-		} catch {}
-	}
-	// All --app candidates failed, fall back to default browser
-	openInBrowser(url);
-}
-
 // Print welcome banner to stdout & auto-open browser
 {
 	const { APP_VERSION, GIT_COMMIT } = await import("./lib/version");
@@ -1456,17 +1270,8 @@ async function openAsApp(url: string) {
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);
 	console.log(`  \x1b[2m➜\x1b[0m  mode: ${modeStr}`);
 	console.log("");
-
-	// 由管理器面板托管的实例：前端窗口交给面板打开 —— 它会先聚焦已有窗口，
-	// 这里再开一次就会重复弹窗（同一份逻辑不该有两份实现）。
-	if (process.env.NARRAFORK_MANAGER_MANAGED !== "1") {
-		const openMode = settings.server.openBrowser;
-		if (openMode === "app") {
-			openAsApp(url);
-		} else if (openMode === "browser") {
-			openInBrowser(url);
-		}
-	}
+	// No-op when the startup page already opened it.
+	openFrontendOnce(url);
 }
 
 // Verify database integrity in the background, now that the port is bound and requests are being
@@ -1504,12 +1309,16 @@ if (activeDatabaseBackend === "postgres") {
 	await materializeLegacyDelegations().catch((error) =>
 		logger.warn("Legacy delegation materialization failed", { error: String(error) }),
 	);
+	// The server is already serving here, so a failure is logged rather than thrown. It fails
+	// closed: a grant without its authority row is rejected as invalid_grant, and a resource
+	// without its binding is not listed for the client. The next startup retries the backfill.
 	try {
 		await backfillOAuthGrantAuthoritiesOnStartup();
 		await backfillIntegrationResourceBindingsOnStartup();
 	} catch (error) {
-		logger.error("OAuth/integration startup backfill failed", { error: String(error) });
-		throw error;
+		logger.error("OAuth/integration startup backfill failed; affected legacy grants stay denied", {
+			error: String(error),
+		});
 	}
 }
 
@@ -1556,15 +1365,10 @@ terminalService.recoverOnStartup().catch((err) => {
 });
 
 // Initialize external MCP servers
-mcpManager.onToolsChanged = () => syncMcpTools();
-mcpManager
-	.initialize()
-	.then(() => {
-		syncMcpTools();
-	})
-	.catch((err) => {
-		logger.error("MCP server initialization failed", { error: String(err) });
-	});
+mcpManager.prepareTools = prepareMcpTools;
+mcpManager.initialize().catch((err) => {
+	logger.error("MCP server initialization failed", { error: String(err) });
+});
 
 // Initialize the plugin control plane after core services are available. Plugin
 // activation is feature-flagged and must never prevent the core server from starting.
@@ -1623,7 +1427,7 @@ withBackgroundOccupancyInitialization(
 		for (const target of ordinaryRestart.manifest?.targets ?? [])
 			startupRecoveryNarratorIds.add(target.narratorId);
 		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
-		await recoverNarrators(protection);
+		await recoverNarrators(protection, { heldRunIds: ordinaryRestart.heldRunIds });
 		return { plannedUpdate, ordinaryRestart };
 	},
 	activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
@@ -1660,6 +1464,9 @@ withBackgroundOccupancyInitialization(
 					error: err instanceof Error ? err.message : String(err),
 				}),
 			);
+		void import("./services/storage-history-runtime")
+			.then(({ startStorageHistoryRetention }) => startStorageHistoryRetention())
+			.catch((err) => logger.warn("History retention did not start", { error: String(err) }));
 		if (completions.length) {
 			Promise.all(completions)
 				.then(() => {
@@ -1669,6 +1476,8 @@ withBackgroundOccupancyInitialization(
 				})
 				.catch(async (err) => {
 					const error = err instanceof Error ? err.message : String(err);
+					// The pass did not fully converge. Keep the diagnostic, but /api/health
+					// still answers 200 so this never disables unrelated UI features.
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
 					await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
@@ -1771,6 +1580,25 @@ import { startSessionCleanupTimer } from "./lib/auth";
 
 startSessionCleanupTimer();
 
+// Reclaim abandoned uploads without overlapping sweeps.
+import { sweepStagedAttachments } from "./lib/attachment-staging";
+
+let attachmentSweepRunning = false;
+setInterval(
+	async () => {
+		if (attachmentSweepRunning) return;
+		attachmentSweepRunning = true;
+		try {
+			await sweepStagedAttachments();
+		} catch (error) {
+			logger.warn("Attachment staging sweep failed", { error: String(error) });
+		} finally {
+			attachmentSweepRunning = false;
+		}
+	},
+	30 * 60 * 1000,
+).unref();
+
 // Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
 import {
 	startScheduledTaskScheduler,
@@ -1785,7 +1613,6 @@ void startupReadiness.barrier.then((recovery) => {
 			error: recovery.error,
 		});
 	}
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	startScheduledTaskScheduler();
 	// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
 	// must not keep update checkpoint scans or UI recovery cards looking "busy".
@@ -1803,7 +1630,6 @@ void startupReadiness.barrier.then((recovery) => {
 
 // Outline pages edited live when the previous process ended: commit what their logs hold.
 void startupReadiness.barrier.then((recovery) => {
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	import("./services/outline/live/registry")
 		.then(({ startLiveReplay }) => startLiveReplay())
 		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
@@ -1816,6 +1642,27 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/in-process")
 		.then(({ scheduleOutlineInProcessRebuild }) => scheduleOutlineInProcessRebuild())
 		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
+	// Outline reports: each person's day, made in the background (a sweep every 5 minutes,
+	// in bounded slices), and "today so far" when asked.
+	import("./services/outline/digest-job")
+		.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
+		.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
+	// Outline team events: a session is told when a task is assigned to it by name, when a
+	// prerequisite of its task ends, and when a task it created ends. The commits of the last
+	// minutes are pushed again in the background (what a stop between a commit and its rows left
+	// untold; a row written before is found and not written twice).
+	import("./services/outline/team-events")
+		.then(({ startOutlineTeamEvents, repushRecentOutlineTeamEvents }) => {
+			startOutlineTeamEvents();
+			return repushRecentOutlineTeamEvents();
+		})
+		.catch((err) => logger.warn("Outline team events failed to start", { error: String(err) }));
+	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
+	import("./services/outline/plugin-task-events")
+		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
+		.catch((err) =>
+			logger.warn("Outline plugin task events failed to start", { error: String(err) }),
+		);
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
@@ -1833,23 +1680,14 @@ void startupReadiness.barrier.then((recovery) => {
 			error: recovery.error,
 		});
 	}
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	gateway.start().catch((err) => {
 		logger.error("IM Gateway startup failed", { error: String(err) });
 	});
 });
 
-// Clean up orphan workspace records not referenced in any user's recentTabs
-import { dissolveOrphanWorkspaces } from "./routes/workspaces";
-
-dissolveOrphanWorkspaces()
-	.then((count) => {
-		if (count > 0) logger.info(`Dissolved ${count} orphan workspace(s)`);
-	})
-	.catch((err) => {
-		logger.warn("Orphan workspace cleanup failed", { error: String(err) });
-	});
-
+// No startup workspace cleanup: workspaces used to be deleted when no sidebar tab
+// referenced them, but the sidebar no longer lists workspaces at all (folders replaced
+// that grouping), so every workspace would look orphaned. They are deleted explicitly.
 // Register knowledge notification bridge (push publish/review state to reviewers + submitters)
 initKnowledgeNotify();
 
@@ -1867,6 +1705,10 @@ if (activeDatabaseBackend === "sqlite") {
 	});
 	// Re-derive which project every session belongs to, in bounded background pages.
 	void scheduleProjectIndexRebuild();
+	// Model aggregations become auto:/provider values; batched, logs and retries on failure.
+	// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
+	// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
+	void migrateAggregationsOnStartup();
 }
 
 // Establish client-egress relay channels for NUG providers configured with
@@ -2025,9 +1867,11 @@ async function performGracefulShutdown(
 			async () => {
 				const tasks = await import("./services/outline/tasks");
 				const inProcess = await import("./services/outline/in-process");
+				const digests = await import("./services/outline/digest-job");
 				await Promise.all([
 					inProcess.stopOutlineInProcessRebuild(),
 					tasks.stopOutlineTaskLeaseJob(),
+					digests.stopOutlineDigestJob(),
 				]);
 			},
 			5_000,
@@ -2038,6 +1882,9 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
+		// The built-in apikey-quota plugin's process is owned by the shared plugin runtime
+		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
+		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}

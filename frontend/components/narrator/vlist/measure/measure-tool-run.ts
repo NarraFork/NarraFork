@@ -76,7 +76,7 @@ import {
 	BARE_ROW_ICON,
 	BARE_ROW_PADDING_Y,
 	BARE_ROW_STATUS,
-	BARE_XS_LINE,
+	BARE_XS_LINE_BASELINE,
 	bareRowMetrics,
 } from "@shared/pretext-layout/row-metrics";
 // Type-only: the row identity the adapter attaches and the renderer consumes.
@@ -145,10 +145,10 @@ export const TRACE_CHEVRON = BARE_ROW_CHEVRON;
  * float gives 16.799999…; tests assert with toBeCloseTo. Browsers lay out this
  * fractional line box, so the raw value is the most faithful prediction.
  */
-export const TRACE_XS_LINE = BARE_XS_LINE;
+export const TRACE_XS_LINE_BASELINE = BARE_XS_LINE_BASELINE;
 
 /** Header row content lane: max(icon 16, xs line 16.8) = 16.8. */
-export const TRACE_HEADER_CONTENT = Math.max(TRACE_HEADER_ICON, TRACE_XS_LINE);
+export const TRACE_HEADER_CONTENT = Math.max(TRACE_HEADER_ICON, TRACE_XS_LINE_BASELINE);
 /** Header `<Group>` height: py*2 + content = 4 + 16.8 = 20.8. */
 export const TRACE_HEADER_GROUP_HEIGHT = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEADER_CONTENT;
 /** Collapsed (header-only) band height: outer py*2 + header group = 4 + 20.8 = 24.8. */
@@ -227,7 +227,7 @@ export const TRACE_ROW_HEIGHT = BARE_ROW_HEIGHT;
  * Standalone count line (ToolRunCountLine / ReasoningCountLine): a single
  * `<Group py={2}>` with NO outer Box wrapper → 4 + 16.8 = 20.8.
  */
-export const TRACE_COUNT_LINE_HEIGHT = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEADER_CONTENT;
+export const TRACE_COUNT_LINE_HEIGHT_BASELINE = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEADER_CONTENT;
 
 // ── Expandable body chrome (ReasoningStepsTrace) ─────────────────────────────
 /** Body `<Box py={2}>`. */
@@ -363,7 +363,7 @@ export interface TraceItemData {
 	 * Which card `card` holds. Absent means "tool-call", the overwhelmingly common
 	 * case — every pre-existing producer (and drill-down test) leaves it unset.
 	 */
-	cardKind?: "tool-call" | "subagent-card";
+	cardKind?: "tool-call" | "subagent-card" | "auxiliary-content";
 	/**
 	 * The adapter drilled this row open for a live permission request: its card hosts
 	 * the approve/deny form, so the row stays open for as long as the request does and
@@ -410,6 +410,8 @@ export interface TraceExpandState {
 // ── Measured-row / header / toggle descriptors ───────────────────────────────
 
 export interface MeasuredTraceHeader {
+	/** Auxiliary failures remain visible when their detail is folded. */
+	failureCount?: number;
 	/** Top offset (px) of the header Group (== outer top padding). */
 	top: number;
 	/** Header Group height (px) ≈ 20.8, or 0 when the band is not drawn. */
@@ -437,6 +439,8 @@ export interface MeasuredTraceHeader {
 }
 
 export interface MeasuredTraceToggle {
+	/** Failures among the earlier rows currently hidden by this toggle. */
+	failureCount?: number;
 	/** Top offset (px) of the "show earlier" row. */
 	top: number;
 	/** Row height (px) ≈ 18.8. */
@@ -516,7 +520,7 @@ export interface MeasuredTraceRow {
 	 */
 	cardMeasured: MeasuredToolCall | MeasuredSubagent | null;
 	/** Which card `cardMeasured` holds (meaningful only when it is non-null). */
-	cardKind: "tool-call" | "subagent-card";
+	cardKind: "tool-call" | "subagent-card" | "auxiliary-content";
 	/** Whether this row offers a drill-down (chevron present, card available). */
 	canDrillDown: boolean;
 	/** Top offset (px) where the body content begins (expanded only). */
@@ -711,6 +715,11 @@ export function measureCollapsibleTrace(
 	const hasToggleRow = rowsOpened && hiddenCount > 0;
 	const startIndex = showEarlier ? 0 : hiddenCount;
 	const visibleItems = rowsOpened ? items.slice(startIndex) : [];
+	const hasAuxiliary = items.some((item) => item.identity?.auxiliary === true);
+	const failed = (item: TraceItemData) => /^(fail|failed|error|timeout)$/.test(item.status ?? "");
+	const failureCount = hasAuxiliary ? items.filter(failed).length : 0;
+	const hiddenFailureCount =
+		hasAuxiliary && !showEarlier ? items.slice(0, startIndex).filter(failed).length : 0;
 
 	// ── Build the vertical block stack: header, [toggle], rows(+body), pad ──
 	const blocks: PreparedBlock[] = [];
@@ -735,6 +744,7 @@ export function measureCollapsibleTrace(
 				opened: itemsOpened,
 				label: data.headerLabel ?? "",
 				count: data.headerCount ?? "",
+				...(failureCount > 0 ? { failureCount } : {}),
 			},
 		),
 	);
@@ -827,13 +837,20 @@ export function measureCollapsibleTrace(
 		opened: itemsOpened,
 		label: data.headerLabel ?? "",
 		count: data.headerCount ?? "",
+		...(failureCount > 0 ? { failureCount } : {}),
 		variant,
 	};
 
 	let toggle: MeasuredTraceToggle | null = null;
 	if (hasToggleRow && toggleBlockIndex >= 0) {
 		const tf = frame.blocks[toggleBlockIndex]!;
-		toggle = { top: tf.top, height: tf.height, hiddenCount, showEarlier };
+		toggle = {
+			top: tf.top,
+			height: tf.height,
+			hiddenCount,
+			showEarlier,
+			...(hiddenFailureCount > 0 ? { failureCount: hiddenFailureCount } : {}),
+		};
 	}
 
 	const rows: MeasuredTraceRow[] = visibleItems.map((item, vi) => {
@@ -842,8 +859,8 @@ export function measureCollapsibleTrace(
 		const bf = frame.blocks[blockIndex]!;
 		const body = rowBodies[vi] ?? null;
 		const cardMeasured = rowCards[vi] ?? null;
-		const cardKind: "tool-call" | "subagent-card" =
-			item.cardKind === "subagent-card" ? "subagent-card" : "tool-call";
+		const cardKind: "tool-call" | "subagent-card" | "auxiliary-content" =
+			item.cardKind ?? "tool-call";
 		const expandable = isExpandable(item);
 		// A drilled-in row reports `expanded` too, so the renderer draws the open
 		// chevron and paints the body box for either kind of revealed content.
@@ -985,7 +1002,7 @@ export interface ActivityTraceItem {
 	 */
 	card?: ToolCallData | SubagentCardData;
 	/** Which card `card` holds; absent means "tool-call". */
-	cardKind?: "tool-call" | "subagent-card";
+	cardKind?: "tool-call" | "subagent-card" | "auxiliary-content";
 	/**
 	 * Markdown body for a REASONING-STEP row; null/absent → no body to reveal.
 	 *
@@ -1146,13 +1163,13 @@ export const MEASURE_TOOL_RUN_CONSTANTS = {
 	TRACE_CHEVRON,
 	TRACE_ROW_STATUS,
 	TRACE_ROW_GAP,
-	TRACE_XS_LINE,
+	TRACE_XS_LINE_BASELINE,
 	TRACE_HEADER_CONTENT,
 	TRACE_HEADER_GROUP_HEIGHT,
 	TRACE_HEADER_BAND_HEIGHT,
 	TRACE_ROW_CONTENT,
 	TRACE_ROW_HEIGHT,
-	TRACE_COUNT_LINE_HEIGHT,
+	TRACE_COUNT_LINE_HEIGHT_BASELINE,
 	TRACE_BODY_PADDING_Y,
 	TRACE_BODY_PADDING_LEFT,
 	TRACE_BODY_BORDER_LEFT,

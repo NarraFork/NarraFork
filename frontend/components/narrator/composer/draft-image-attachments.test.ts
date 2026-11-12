@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { IDBFactory } from "fake-indexeddb";
 import {
 	clearDraftImageAttachments,
 	DRAFT_ATTACHMENT_TTL_MS,
@@ -7,6 +8,7 @@ import {
 	loadDraftImageAttachments,
 	MAX_DRAFT_ATTACHMENT_BYTES,
 	MAX_DRAFT_ATTACHMENT_TOTAL_BYTES,
+	pruneDraftAttachments,
 	retainInterruptedDraftAttachments,
 	saveDraftImageAttachments,
 	setComposerAssetId,
@@ -132,6 +134,7 @@ describe("draft attachment storage failures", () => {
 		expect(await loadDraftImageAttachments("u", "absent")).toEqual({
 			images: [],
 			textFiles: [],
+			media: [],
 			droppedCount: 0,
 		});
 	});
@@ -142,6 +145,7 @@ describe("draft attachment storage failures", () => {
 		expect(await loadDraftImageAttachments("", "n")).toEqual({
 			images: [],
 			textFiles: [],
+			media: [],
 			droppedCount: 0,
 		});
 	});
@@ -254,7 +258,8 @@ describe("switch-interrupted attachment snapshots", () => {
 	});
 
 	test("an older pending save cannot overwrite a later retain, and ordinary save/read order stays intact", async () => {
-		installIndexedDbFacade();
+		const factory = new IDBFactory();
+		Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: factory });
 		const old = new File(["old"], "old.png", { type: "image/png" });
 		const current = new File(["new"], "new.png", { type: "image/png" });
 		const saving = saveDraftImageAttachments("u", "n", [old]);
@@ -265,6 +270,11 @@ describe("switch-interrupted attachment snapshots", () => {
 		const ordinaryRead = loadDraftImageAttachments("u", "ordinary");
 		expect((await ordinaryRead).images.map(getComposerAssetId)).toEqual([getComposerAssetId(old)]);
 		await ordinarySave;
+		await new Promise<void>((resolve, reject) => {
+			const request = factory.deleteDatabase("narrafork-draft-image-attachments");
+			request.onsuccess = () => resolve();
+			request.onerror = () => reject(request.error);
+		});
 	});
 
 	test("expires after the existing TTL; reads do not keep snapshots alive", async () => {
@@ -282,13 +292,16 @@ describe("switch-interrupted attachment snapshots", () => {
 	test("keeps at most eight snapshots, evicts oldest updates first and ignores reads for recency", async () => {
 		installIndexedDbFacade();
 		const file = new File(["draft"], "draft.log");
+		const replacement = new File(["updated"], "updated.log");
 		for (let index = 0; index < 8; index++) retainForTest("u", `n${index}`, [], [file]);
 		await loadDraftImageAttachments("u", "n1");
-		retainForTest("u", "n0", [], [file]);
+		retainForTest("u", "n0", [], [replacement]);
 		retainForTest("u", "n8", [], [file]);
 		expect((await loadDraftImageAttachments("u", "n1")).textFiles).toEqual([]);
 		for (const index of [0, 2, 3, 4, 5, 6, 7, 8]) {
-			expect((await loadDraftImageAttachments("u", `n${index}`)).textFiles[0]).toBe(file);
+			expect((await loadDraftImageAttachments("u", `n${index}`)).textFiles[0]).toBe(
+				index === 0 ? replacement : file,
+			);
 		}
 	});
 
@@ -310,6 +323,233 @@ describe("switch-interrupted attachment snapshots", () => {
 		retainForTest("u", "small", [], [file]);
 		expect((await loadDraftImageAttachments("u", "huge")).textFiles).toEqual([]);
 		expect((await loadDraftImageAttachments("u", "small")).textFiles[0]).toBe(file);
+	});
+});
+
+test("fake IndexedDB serializes overlapping read-write and read-only transactions", async () => {
+	const factory = new IDBFactory();
+	const db = await new Promise<IDBDatabase>((resolve, reject) => {
+		const request = factory.open("transaction-serialization", 1);
+		request.onupgradeneeded = () => request.result.createObjectStore("drafts");
+		request.onsuccess = () => resolve(request.result);
+		request.onerror = () => reject(request.error);
+	});
+	try {
+		const writer = db.transaction("drafts", "readwrite").objectStore("drafts");
+		const get = writer.get("key");
+		get.onsuccess = () => writer.put("saved", "key");
+		const reader = db.transaction("drafts", "readonly").objectStore("drafts").get("key");
+		const value = await new Promise<unknown>((resolve, reject) => {
+			reader.onsuccess = () => resolve(reader.result);
+			reader.onerror = () => reject(reader.error);
+		});
+		expect(value).toBe("saved");
+	} finally {
+		db.close();
+	}
+});
+
+describe("independent media draft budgets", () => {
+	test("IDB evicts media independently without discarding older images", async () => {
+		const { records } = installIndexedDbFacade();
+		const now = Date.now();
+		const image = new Blob(["image"], { type: "image/png" });
+		const audio = new Blob(["audio"], { type: "audio/wav" });
+		const oldKey = getDraftImageAttachmentKey("u", "old");
+		const newKey = getDraftImageAttachmentKey("u", "new");
+		const entry = (name: string, blob: Blob, size: number) => ({
+			name,
+			type: blob.type,
+			blob,
+			size,
+		});
+		records.set(oldKey, {
+			draftKey: oldKey,
+			updatedAtMs: now - 1,
+			images: [entry("old.png", image, 40 * 1024 * 1024)],
+			textFiles: [],
+			media: [entry("old.wav", audio, 100 * 1024 * 1024)],
+		});
+		records.set(newKey, {
+			draftKey: newKey,
+			updatedAtMs: now,
+			images: [],
+			textFiles: [],
+			media: [entry("new.wav", audio, 100 * 1024 * 1024)],
+		});
+		await pruneDraftAttachments(newKey);
+		const old = await loadDraftImageAttachments("u", "old");
+		expect(old.images.map((file) => file.name)).toEqual(["old.png"]);
+		expect(old.media).toEqual([]);
+		expect(old.droppedCount).toBe(1);
+		expect((await loadDraftImageAttachments("u", "new")).media.map((file) => file.name)).toEqual([
+			"new.wav",
+		]);
+	});
+
+	test("a media-only write does not prune an already over-budget protected image draft", async () => {
+		const { records } = installIndexedDbFacade();
+		const oldKey = getDraftImageAttachmentKey("u", "large-image");
+		const newKey = getDraftImageAttachmentKey("u", "media-only");
+		const image = new Blob(["image"], { type: "image/png" });
+		const audio = new Blob(["audio"], { type: "audio/wav" });
+		records.set(oldKey, {
+			draftKey: oldKey,
+			updatedAtMs: Date.now(),
+			images: [
+				{
+					name: "image.png",
+					type: image.type,
+					blob: image,
+					size: MAX_DRAFT_ATTACHMENT_TOTAL_BYTES + 1,
+				},
+			],
+		});
+		records.set(newKey, {
+			draftKey: newKey,
+			updatedAtMs: Date.now(),
+			images: [],
+			media: [{ name: "audio.wav", type: audio.type, blob: audio, size: audio.size }],
+		});
+		await pruneDraftAttachments(newKey);
+		expect((await loadDraftImageAttachments("u", "large-image")).images).toHaveLength(1);
+	});
+
+	test("updating media does not refresh stored image TTL", async () => {
+		const { records } = installIndexedDbFacade();
+		const image = new File(["image"], "image.png", { type: "image/png" });
+		const audio = new File(["audio"], "audio.wav", { type: "audio/wav" });
+		await saveDraftImageAttachments("u", "mixed", [image], [], [audio]);
+		const key = getDraftImageAttachmentKey("u", "mixed");
+		const record = records.get(key);
+		expect(record).toBeDefined();
+		if (!record) throw new Error("missing draft");
+		record.ordinaryUpdatedAtMs = Date.now() - DRAFT_ATTACHMENT_TTL_MS - 1;
+		await saveDraftImageAttachments(
+			"u",
+			"mixed",
+			[image],
+			[],
+			[new File(["new"], "new.wav", { type: "audio/wav" })],
+		);
+		const result = await loadDraftImageAttachments("u", "mixed");
+		expect(result.images).toEqual([]);
+		expect(result.media.map((file) => file.name)).toEqual(["new.wav"]);
+	});
+
+	test("restoring and repeatedly autosaving a mixed draft preserves category timestamps", async () => {
+		const { records } = installIndexedDbFacade();
+		const image = new File(["image"], "image.png", { type: "image/png" });
+		const audio = new File(["audio"], "audio.wav", { type: "audio/wav" });
+		await saveDraftImageAttachments("u", "mixed", [image], [], [audio]);
+		const key = getDraftImageAttachmentKey("u", "mixed");
+		const record = records.get(key);
+		if (!record) throw new Error("missing draft");
+		const ordinaryTime = Date.now() - 10_000;
+		const mediaTime = Date.now() - 5_000;
+		record.ordinaryUpdatedAtMs = ordinaryTime;
+		record.mediaUpdatedAtMs = mediaTime;
+
+		const restored = await loadDraftImageAttachments("u", "mixed");
+		await saveDraftImageAttachments(
+			"u",
+			"mixed",
+			restored.images,
+			restored.textFiles,
+			restored.media,
+		);
+		await saveDraftImageAttachments(
+			"u",
+			"mixed",
+			restored.images,
+			restored.textFiles,
+			restored.media,
+		);
+		expect(records.get(key)?.ordinaryUpdatedAtMs).toBe(ordinaryTime);
+		expect(records.get(key)?.mediaUpdatedAtMs).toBe(mediaTime);
+
+		const updatedMedia = [new File(["new"], "new.wav", { type: "audio/wav" })];
+		await saveDraftImageAttachments(
+			"u",
+			"mixed",
+			restored.images,
+			restored.textFiles,
+			updatedMedia,
+		);
+		const updatedMediaTime = records.get(key)?.mediaUpdatedAtMs;
+		expect(updatedMediaTime).not.toBe(mediaTime);
+		await saveDraftImageAttachments(
+			"u",
+			"mixed",
+			restored.images,
+			restored.textFiles,
+			updatedMedia,
+		);
+		expect(records.get(key)?.ordinaryUpdatedAtMs).toBe(ordinaryTime);
+		expect(records.get(key)?.mediaUpdatedAtMs).toBe(updatedMediaTime);
+	});
+
+	test("repeated interrupted snapshot saves do not refresh unchanged image TTL", async () => {
+		installIndexedDbFacade();
+		let now = Date.now();
+		nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+		const image = new File(["image"], "image.png", { type: "image/png" });
+		const audio = new File(["audio"], "audio.wav", { type: "audio/wav" });
+		const updatedAudio = new File(["new"], "new.wav", { type: "audio/wav" });
+		retainedOwners.push(["u", "mixed"]);
+		retainInterruptedDraftAttachments("u", "mixed", [image], [], [audio]);
+		now += DRAFT_ATTACHMENT_TTL_MS - 1;
+		const restored = await loadDraftImageAttachments("u", "mixed");
+		retainInterruptedDraftAttachments(
+			"u",
+			"mixed",
+			restored.images,
+			restored.textFiles,
+			restored.media,
+		);
+		retainInterruptedDraftAttachments("u", "mixed", [image], [], [updatedAudio]);
+		retainInterruptedDraftAttachments("u", "mixed", [image], [], [updatedAudio]);
+		now += 2;
+		const result = await loadDraftImageAttachments("u", "mixed");
+		expect(result.images).toEqual([]);
+		expect(result.media.map((file) => file.name)).toEqual(["new.wav"]);
+	});
+
+	test("updating interrupted media does not refresh image TTL", async () => {
+		installIndexedDbFacade();
+		let now = Date.now();
+		nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+		const image = new File(["image"], "image.png", { type: "image/png" });
+		const audio = new File(["audio"], "audio.wav", { type: "audio/wav" });
+		retainedOwners.push(["u", "mixed"]);
+		retainInterruptedDraftAttachments("u", "mixed", [image], [], [audio]);
+		now += DRAFT_ATTACHMENT_TTL_MS - 1;
+		retainInterruptedDraftAttachments(
+			"u",
+			"mixed",
+			[image],
+			[],
+			[new File(["new"], "new.wav", { type: "audio/wav" })],
+		);
+		now += 2;
+		const result = await loadDraftImageAttachments("u", "mixed");
+		expect(result.images).toEqual([]);
+		expect(result.media.map((file) => file.name)).toEqual(["new.wav"]);
+	});
+
+	test("interrupted media has a separate cap and preserves older image snapshots", async () => {
+		installIndexedDbFacade();
+		const image = new File(["image"], "image.png", { type: "image/png" });
+		const audio = new File(["audio"], "audio.wav", { type: "audio/wav" });
+		Object.defineProperty(audio, "size", { value: 100 * 1024 * 1024 });
+		retainedOwners.push(["u", "old"], ["u", "new"]);
+		retainInterruptedDraftAttachments("u", "old", [image], [], [audio]);
+		retainInterruptedDraftAttachments("u", "new", [], [], [audio]);
+		const old = await loadDraftImageAttachments("u", "old");
+		expect(old.images[0]).toBe(image);
+		expect(old.media).toEqual([]);
+		expect(old.droppedCount).toBe(1);
+		expect((await loadDraftImageAttachments("u", "new")).media[0]).toBe(audio);
 	});
 });
 

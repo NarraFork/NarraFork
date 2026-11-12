@@ -28,9 +28,16 @@ import {
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { handleLength, MIN_HANDLE_LENGTH } from "@shared/narrator-handle";
-import { IconFolder, IconGripVertical, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
+import {
+	IconFolder,
+	IconFolderOpen,
+	IconGripVertical,
+	IconStar,
+	IconStarFilled,
+	IconX,
+} from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
@@ -44,17 +51,29 @@ import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
 import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
+import { useWorkspaceDevices } from "../../hooks/useWorkspaceContext";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
+import { Z } from "../../lib/z-index";
 import { DirectoryPicker } from "../common/DirectoryPicker";
+import { DIRECTORY_BROWSER_MODAL_STYLES } from "../common/directory-browser-modal";
 import { resolveCwdPrefill } from "./composer/create-narrator-cwd-prefill";
 import {
 	resolveStartInPlanModePrefill,
 	shouldSendStartInPlanMode,
 } from "./composer/create-narrator-plan-mode-prefill";
+import { ProjectPromptModal } from "./ProjectPromptModal";
+
+const RemoteDirectoryBrowser = lazy(() =>
+	import("../permissions/RemoteDirectoryBrowser").then((module) => ({
+		default: module.RemoteDirectoryBrowser,
+	})),
+);
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+
+const LOCAL_DEVICE = "local";
 
 /** 选择它表示不写绑定，跟随本人的默认身份（与会话详情面板的哨兵值一致）。 */
 const FOLLOW_DEFAULT_GIT_IDENTITY = "__follow_default__";
@@ -176,12 +195,23 @@ export function CreateNarratorModalBody({
 	// or deleted one would just fail the create.
 	const { usablePath, needsChoice } = useProjectDirStatus();
 	const defaultProjectDir = usablePath ?? "";
+	const [promptEditorOpen, setPromptEditorOpen] = useState(false);
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
 	const reorderFavorites = useReorderFavoriteDirectories();
 
 	const [cwd, setCwd] = useState(initialCwd ?? "");
+	// Which execution device the session starts on. A remote device makes `cwd` a path
+	// on THAT machine, so the local picker (favorites, mkdir, drive list) does not apply.
+	const [deviceId, setDeviceId] = useState<string>(LOCAL_DEVICE);
+	const [remoteBrowserOpen, setRemoteBrowserOpen] = useState(false);
+	const workspaceDevicesQuery = useWorkspaceDevices(contextProjectId ?? null, opened);
+	const remoteDevices = (workspaceDevicesQuery.data?.devices ?? []).filter(
+		(device) => device.id !== LOCAL_DEVICE,
+	);
+	const selectedDevice = remoteDevices.find((device) => device.id === deviceId);
+	const isRemoteDevice = deviceId !== LOCAL_DEVICE;
 	const [selectedModel, setSelectedModel] = useState("");
 	// The switch starts as a placeholder for "follow agent.defaultStartInPlanMode".
 	// `startInPlanModeTouched` records an immediate user flip so a late-arriving
@@ -213,8 +243,11 @@ export function CreateNarratorModalBody({
 	const [handle, setHandle] = useState("");
 	const [activeId, setActiveId] = useState<string | null>(null);
 	// No directory typed and no usable default: the server would refuse, so ask up front.
-	// A project context supplies its own directory.
-	const directoryRequired = needsChoice && !cwd.trim() && !contextProjectId;
+	// A project context supplies its own directory — but only for the LOCAL device: a
+	// remote creation always needs an explicit path on that machine.
+	const directoryRequired = isRemoteDevice
+		? !cwd.trim()
+		: needsChoice && !cwd.trim() && !contextProjectId;
 
 	// Favorites list is a resizable region: defaults to ~5 rows, user can drag to adjust.
 	const FAV_LIST_DEFAULT_H = 165;
@@ -266,6 +299,13 @@ export function CreateNarratorModalBody({
 	// render or two late and a fires-once-on-open effect would miss it permanently.
 	const prefilledForOpenRef = useRef(false);
 	useEffect(() => {
+		if (isRemoteDevice) {
+			// The instance's default project directory is a path on THIS server; pre-filling
+			// it into a remote session would create it in a directory that does not exist
+			// there. Re-arm the prefill so switching back to local still adopts it.
+			prefilledForOpenRef.current = false;
+			return;
+		}
 		const decision = resolveCwdPrefill({
 			opened,
 			alreadyPrefilled: prefilledForOpenRef.current,
@@ -285,7 +325,7 @@ export function CreateNarratorModalBody({
 			setCwd(decision.value);
 			prefilledForOpenRef.current = true;
 		}
-	}, [opened, cwd, initialCwd, defaultProjectDir]);
+	}, [opened, cwd, initialCwd, defaultProjectDir, isRemoteDevice]);
 
 	// Same timing question as the cwd field: the settings query is often unresolved
 	// on the first open, so `defaultStartInPlanMode` arrives a render or two late.
@@ -355,6 +395,23 @@ export function CreateNarratorModalBody({
 		setActiveId(null);
 	}, []);
 
+	/**
+	 * Switching the execution device resets the directory field.
+	 *
+	 * A local path does not exist on another machine and a remote path does not exist
+	 * here, so carrying the value across the switch would pre-fill a directory the
+	 * create request must then reject.
+	 */
+	const handleDeviceChange = (nextDeviceId: string) => {
+		setDeviceId(nextDeviceId);
+		if (nextDeviceId === LOCAL_DEVICE) {
+			setCwd(initialCwd ?? defaultProjectDir ?? "");
+			return;
+		}
+		const device = remoteDevices.find((entry) => entry.id === nextDeviceId);
+		setCwd(device?.defaultCwd?.trim() ?? "");
+	};
+
 	const handleCreate = () => {
 		// Explicit boolean whenever the switch means something (user flipped it, or
 		// the instance default is showing on it). Omitting `false` would let the
@@ -367,6 +424,7 @@ export function CreateNarratorModalBody({
 		createNarrator.mutate(
 			{
 				...(cwd ? { cwd } : {}),
+				...(isRemoteDevice ? { deviceId } : {}),
 				...(contextProjectId ? { contextProjectId } : {}),
 				model: selectedModel || FOLLOW_DEFAULT_MODEL,
 				...(sendPlanMode ? { startInPlanMode } : {}),
@@ -415,6 +473,8 @@ export function CreateNarratorModalBody({
 
 	const resetForm = useCallback(() => {
 		setCwd("");
+		setDeviceId(LOCAL_DEVICE);
+		setRemoteBrowserOpen(false);
 		setSelectedModel("");
 		// Reset to "follow settings" — not a hard false preference. The next open
 		// re-adopts agent.defaultStartInPlanMode via the prefill effect.
@@ -426,6 +486,7 @@ export function CreateNarratorModalBody({
 		setBot(false);
 		setHandle("");
 		setSessionTitle("");
+		setPromptEditorOpen(false);
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
 	}, []);
 
@@ -489,73 +550,143 @@ export function CreateNarratorModalBody({
 
 	const directorySection = (
 		<>
-			{/* DirectoryPicker's inner TextInput carries style={{flex:1}} (for horizontal layouts).
-			    Wrap it so that flex:1 cannot stretch it vertically inside the flex-column left pane. */}
-			<div style={{ flexShrink: 0 }}>
-				<DirectoryPicker
-					label={t("workingDirectory")}
-					description={directoryRequired ? undefined : t("workingDirectoryHint")}
-					error={directoryRequired ? t("workingDirectoryRequired") : undefined}
-					placeholder={defaultProjectDir || undefined}
-					leftSection={<IconFolder size={16} />}
-					value={cwd}
-					onChange={setCwd}
-					rightSectionExtra={
-						cwd ? (
-							isFavorited ? (
-								<IconStarFilled size={16} style={{ color: "var(--mantine-color-yellow-5)" }} />
-							) : (
-								<Tooltip label={t("addToFavorites")}>
-									<ActionIcon
-										variant="subtle"
-										size="sm"
-										onClick={() => addFavorite.mutate({ path: cwd })}
-									>
-										<IconStar size={16} />
-									</ActionIcon>
-								</Tooltip>
-							)
-						) : null
-					}
-				/>
-			</div>
+			{/* Device first: it decides what the directory below even means. Local keeps the
+			    existing picker + favorites; a remote device gets a plain absolute-path field
+			    with the device's own directory browser, because a local path list would be
+			    meaningless there. */}
+			<Select
+				label={t("executionDevice")}
+				description={t("executionDeviceHint")}
+				data={[
+					{ value: LOCAL_DEVICE, label: t("executionDeviceLocal") },
+					...remoteDevices.map((device) => ({
+						value: device.id,
+						label: device.online ? device.name : `${device.name} · ${t("executionDeviceOffline")}`,
+						disabled: !device.online,
+					})),
+				]}
+				value={deviceId}
+				onChange={(value) => handleDeviceChange(value ?? LOCAL_DEVICE)}
+				allowDeselect={false}
+				comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
+				style={{ flexShrink: 0 }}
+			/>
 
-			{favorites?.length ? (
-				// Wide: favorites fills the rest of the column. Narrow: fixed height + drag-to-resize.
-				<Stack gap="xs" style={isWide ? { flex: 1, minHeight: 0 } : undefined}>
-					<Text size="xs" fw={500} c="dimmed">
-						{t("favoriteDirectories")}
-					</Text>
-					<div
-						style={
-							isWide
-								? { flex: 1, minHeight: 0, overflowY: "auto" }
-								: { height: favListHeight, overflowY: "auto" }
-						}
-					>
-						{favoritesDnd}
-					</div>
-					{!isWide && (
-						// Drag handle: resize the favorites list height (narrow layout only).
-						<button
-							type="button"
-							aria-label={t("resizeFavorites")}
-							title={t("resizeFavorites")}
-							onMouseDown={startFavResize}
-							style={{
-								height: 6,
-								padding: 0,
-								border: "none",
-								cursor: "ns-resize",
-								borderRadius: 3,
-								background: "var(--mantine-color-default-border)",
-								alignSelf: "stretch",
-							}}
-						/>
-					)}
+			{isRemoteDevice ? (
+				<Stack gap={6} style={{ flexShrink: 0 }}>
+					<TextInput
+						label={t("workingDirectory")}
+						description={t("workingDirectoryRemoteHint", {
+							device: selectedDevice?.name ?? deviceId,
+						})}
+						placeholder={selectedDevice?.defaultCwd ?? t("workingDirectoryPlaceholder")}
+						leftSection={<IconFolder size={16} />}
+						value={cwd}
+						onChange={(event) => setCwd(event.currentTarget.value)}
+						error={directoryRequired ? t("workingDirectoryRemoteRequired") : undefined}
+					/>
+					<Group gap="xs">
+						<Button
+							size="compact-xs"
+							variant="light"
+							leftSection={<IconFolderOpen size={14} />}
+							onClick={() => setRemoteBrowserOpen(true)}
+						>
+							{t("browseRemoteDirectory")}
+						</Button>
+						{selectedDevice?.defaultCwd ? (
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								onClick={() => setCwd(selectedDevice.defaultCwd ?? "")}
+							>
+								{t("useDeviceDefaultDirectory")}
+							</Button>
+						) : null}
+					</Group>
 				</Stack>
-			) : null}
+			) : (
+				<>
+					{/* DirectoryPicker's inner TextInput carries style={{flex:1}} (for horizontal layouts).
+				    Wrap it so that flex:1 cannot stretch it vertically inside the flex-column left pane. */}
+					<div style={{ flexShrink: 0 }}>
+						<DirectoryPicker
+							label={t("workingDirectory")}
+							description={directoryRequired ? undefined : t("workingDirectoryHint")}
+							error={directoryRequired ? t("workingDirectoryRequired") : undefined}
+							placeholder={defaultProjectDir || undefined}
+							leftSection={<IconFolder size={16} />}
+							value={cwd}
+							onChange={setCwd}
+							rightSectionExtra={
+								cwd ? (
+									isFavorited ? (
+										<IconStarFilled size={16} style={{ color: "var(--mantine-color-yellow-5)" }} />
+									) : (
+										<Tooltip label={t("addToFavorites")}>
+											<ActionIcon
+												variant="subtle"
+												size="sm"
+												onClick={() => addFavorite.mutate({ path: cwd })}
+											>
+												<IconStar size={16} />
+											</ActionIcon>
+										</Tooltip>
+									)
+								) : null
+							}
+						/>
+					</div>
+
+					{favorites?.length ? (
+						// Wide: favorites fills the rest of the column. Narrow: fixed height + drag-to-resize.
+						<Stack gap="xs" style={isWide ? { flex: 1, minHeight: 0 } : undefined}>
+							<Text size="xs" fw={500} c="dimmed">
+								{t("favoriteDirectories")}
+							</Text>
+							<div
+								style={
+									isWide
+										? { flex: 1, minHeight: 0, overflowY: "auto" }
+										: { height: favListHeight, overflowY: "auto" }
+								}
+							>
+								{favoritesDnd}
+							</div>
+							{!isWide && (
+								// Drag handle: resize the favorites list height (narrow layout only).
+								<button
+									type="button"
+									aria-label={t("resizeFavorites")}
+									title={t("resizeFavorites")}
+									onMouseDown={startFavResize}
+									style={{
+										height: 6,
+										padding: 0,
+										border: "none",
+										cursor: "ns-resize",
+										borderRadius: 3,
+										background: "var(--mantine-color-default-border)",
+										alignSelf: "stretch",
+									}}
+								/>
+							)}
+						</Stack>
+					) : null}
+				</>
+			)}
 		</>
+	);
+
+	const projectPromptSection = (
+		<Stack gap={6}>
+			<Button variant="light" disabled={!cwd.trim()} onClick={() => setPromptEditorOpen(true)}>
+				{t("projectPromptOpen")}
+			</Button>
+			<Text size="xs" c="dimmed">
+				{cwd.trim() ? t("projectPromptOpenHint") : t("projectPromptChooseDirectory")}
+			</Text>
+		</Stack>
 	);
 
 	const optionsSection = (
@@ -677,6 +808,8 @@ export function CreateNarratorModalBody({
 					if (e.currentTarget.checked) setKnowledgeSteward(false);
 				}}
 			/>
+
+			{projectPromptSection}
 		</>
 	);
 
@@ -727,7 +860,7 @@ export function CreateNarratorModalBody({
 					{tc("cancel")}
 				</Button>
 				<Button
-					onClick={handleCreate}
+					onClick={() => void handleCreate()}
 					loading={createNarrator.isPending}
 					disabled={
 						directoryRequired ||
@@ -738,6 +871,42 @@ export function CreateNarratorModalBody({
 					{t("createNarrator")}
 				</Button>
 			</Group>
+			{promptEditorOpen && cwd.trim() ? (
+				<ProjectPromptModal cwd={cwd} onClose={() => setPromptEditorOpen(false)} />
+			) : null}
+			{isRemoteDevice ? (
+				<Modal
+					opened={remoteBrowserOpen}
+					onClose={() => setRemoteBrowserOpen(false)}
+					title={t("browseRemoteDirectoryTitle", { device: selectedDevice?.name ?? deviceId })}
+					size="md"
+					// Opened from inside this modal: use the global modal token, not Mantine's
+					// base modal level, or the picker would render behind its parent.
+					zIndex={Z.modal}
+					styles={DIRECTORY_BROWSER_MODAL_STYLES}
+				>
+					{remoteBrowserOpen ? (
+						<Suspense fallback={null}>
+							<RemoteDirectoryBrowser
+								deviceLabel={selectedDevice?.name ?? deviceId}
+								initialPath={cwd.trim() || undefined}
+								listDirectory={(path, opts) =>
+									api.browseWorkspaceDirectory(deviceId, path, {
+										showHidden: opts.showHidden,
+										projectId: contextProjectId,
+									})
+								}
+								queryKey={["workspaceDeviceBrowse", deviceId, contextProjectId ?? null]}
+								onSelect={(path) => {
+									setCwd(path);
+									setRemoteBrowserOpen(false);
+								}}
+								onCancel={() => setRemoteBrowserOpen(false)}
+							/>
+						</Suspense>
+					) : null}
+				</Modal>
+			) : null}
 		</>
 	);
 }

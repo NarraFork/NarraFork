@@ -23,7 +23,15 @@ beforeAll(() => {
 
 const WIDTH = 800;
 
-const mod = () => import("./measure-injection-bubble");
+/**
+ * The module with the note line bound to its LIVE value: the exported
+ * `INJECTION_NOTE_HEIGHT` is the bare-Mantine xs line (17); the default setting measures
+ * 120% of it (20 — LINE_HEIGHT_BASELINE_PERCENT).
+ */
+const mod = async () => ({
+	...(await import("./measure-injection-bubble")),
+	INJECTION_NOTE_HEIGHT: 20,
+});
 
 describe("measureInjectionBubble — frame and body", () => {
 	it("reserves padding, the header row and the body", async () => {
