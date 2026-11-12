@@ -1,4 +1,4 @@
-import type { Server, ServerWebSocket } from "bun";
+import type { BunFile, Server, ServerWebSocket } from "bun";
 import {
 	generateIdentity,
 	hex,
@@ -26,6 +26,9 @@ export interface CoordinatorOptions {
 	authTimeoutMs?: number;
 	negotiationTimeoutMs?: number;
 	allowLocalhost?: boolean;
+	/** Non-loopback listeners require explicit opt-in and a complete TLS identity. */
+	allowPublicTls?: boolean;
+	tls?: { cert: string | BunFile; key: string | BunFile };
 	assetHandler?: (request: Request) => Response | undefined | Promise<Response | undefined>;
 	/** Lower values are useful for isolated overload tests. */
 	maxInstances?: number;
@@ -89,13 +92,18 @@ function take(budget: Bucket, max: number): boolean {
 /** A standalone, memory-only control plane. Never imports production routes or databases. */
 export async function startCoordinator(options: CoordinatorOptions = {}) {
 	const host = options.host ?? "127.0.0.1";
-	if (!options.allowLocalhost) {
-		throw new Error(
-			"M1 plaintext listener requires explicit allowLocalhost; use a TLS reverse proxy for deployment",
-		);
+	const tls = options.tls;
+	if (tls && (!tls.cert || !tls.key)) {
+		throw new Error("Coordinator TLS requires both cert and key");
 	}
-	if (!["127.0.0.1", "localhost", "::1"].includes(host)) {
-		throw new Error("M1 coordinator must bind loopback; public deployment is not enabled");
+	if (
+		!["127.0.0.1", "localhost", "::1"].includes(host) &&
+		!(options.allowPublicTls === true && tls?.cert && tls.key)
+	) {
+		throw new Error("Non-loopback coordinator requires allowPublicTls and TLS cert/key");
+	}
+	if (!tls && !options.allowLocalhost) {
+		throw new Error("Plaintext listener requires explicit allowLocalhost");
 	}
 	const leaseMs = (options.leaseSeconds ?? 75) * 1000;
 	const authMs = options.authTimeoutMs ?? 5000;
@@ -494,6 +502,7 @@ export async function startCoordinator(options: CoordinatorOptions = {}) {
 	const server: Server<Connection> = Bun.serve<Connection>({
 		hostname: host,
 		port: options.port ?? 0,
+		tls,
 		async fetch(request, bunServer) {
 			const path = new URL(request.url).pathname;
 			if (path === "/api" || path.startsWith("/api/") || path === "/ws" || path.startsWith("/ws/"))
@@ -633,7 +642,7 @@ export async function startCoordinator(options: CoordinatorOptions = {}) {
 	}
 	const timer = setInterval(sweep, Math.min(1000, leaseMs / 2));
 	timer.unref();
-	const origin = `http://${host === "::1" ? "[::1]" : host}:${server.port}`;
+	const origin = `${tls ? "https" : "http"}://${host === "::1" ? "[::1]" : host}:${server.port}`;
 	return {
 		server,
 		origin,

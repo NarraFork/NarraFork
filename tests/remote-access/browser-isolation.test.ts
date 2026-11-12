@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
-import type { SavedGrant } from "../../remote-prototype/client";
+import type { SavedGrant } from "../../shared/remote-access/browser-client";
 import vectors from "../../shared/remote-access/vectors.json";
 
 function browserExecutable(): string {
@@ -37,7 +37,7 @@ interface PageState {
 async function staticModules(): Promise<Map<string, string>> {
 	const modules = new Map<string, string>();
 	for (const [url, entrypoint] of [
-		["/client.js", "remote-prototype/client.ts"],
+		["/client.js", "shared/remote-access/browser-client.ts"],
 		["/identity.js", "shared/remote-access/identity.ts"],
 	] as const) {
 		const build = await Bun.build({ entrypoints: [entrypoint], target: "browser", format: "esm" });
@@ -134,7 +134,9 @@ describe("M1 real Chromium WebCrypto and independent origin storage", () => {
 				const identity = (await import(
 					identityPath
 				)) as typeof import("../../shared/remote-access/identity");
-				const client = (await import(clientPath)) as typeof import("../../remote-prototype/client");
+				const client = (await import(
+					clientPath
+				)) as typeof import("../../shared/remote-access/browser-client");
 				const pair = await identity.generateIdentity();
 				const grant: SavedGrant = {
 					instanceId: data.instanceId,
@@ -165,7 +167,9 @@ describe("M1 real Chromium WebCrypto and independent origin storage", () => {
 		await pageB.waitForFunction(() => !!(window as unknown as PageState).received);
 		await pageB.evaluate(async (businessToken) => {
 			const path = "/client.js";
-			const client = (await import(path)) as typeof import("../../remote-prototype/client");
+			const client = (await import(
+				path
+			)) as typeof import("../../shared/remote-access/browser-client");
 			const state = window as unknown as PageState;
 			if (!state.received) throw new Error("GRANT_REQUIRED");
 			await client.saveGrant(state.received);
@@ -248,7 +252,9 @@ describe("M1 real Chromium WebCrypto and independent origin storage", () => {
 		expect(pageA.browserContext()).toBe(pageB.browserContext());
 		await pageA.evaluate(async (id) => {
 			const path = "/client.js";
-			const client = (await import(path)) as typeof import("../../remote-prototype/client");
+			const client = (await import(
+				path
+			)) as typeof import("../../shared/remote-access/browser-client");
 			const grant = await client.loadGrant(id);
 			if (!grant) throw new Error("GRANT_REQUIRED");
 			localStorage.setItem("origin-marker", "only-origin-A");
@@ -263,7 +269,9 @@ describe("M1 real Chromium WebCrypto and independent origin storage", () => {
 			page.evaluate(async (id) => {
 				const clientPath = "/client.js";
 				const identityPath = "/identity.js";
-				const client = (await import(clientPath)) as typeof import("../../remote-prototype/client");
+				const client = (await import(
+					clientPath
+				)) as typeof import("../../shared/remote-access/browser-client");
 				const identity = (await import(
 					identityPath
 				)) as typeof import("../../shared/remote-access/identity");
@@ -334,14 +342,18 @@ describe("M1 real Chromium WebCrypto and independent origin storage", () => {
 	test("clearing A localStorage and saved grant leaves identical B credentials and key usable", async () => {
 		await pageA.evaluate(async (id) => {
 			const path = "/client.js";
-			const client = (await import(path)) as typeof import("../../remote-prototype/client");
+			const client = (await import(
+				path
+			)) as typeof import("../../shared/remote-access/browser-client");
 			localStorage.clear();
 			await client.forgetGrant(id);
 		}, vectors.instanceId);
 		await pageA.reload({ waitUntil: "domcontentloaded" });
 		const first = await pageA.evaluate(async (id) => {
 			const path = "/client.js";
-			const client = (await import(path)) as typeof import("../../remote-prototype/client");
+			const client = (await import(
+				path
+			)) as typeof import("../../shared/remote-access/browser-client");
 			return {
 				token: localStorage.getItem("business-token"),
 				grantMissing: (await client.loadGrant(id)) === undefined,
@@ -350,7 +362,9 @@ describe("M1 real Chromium WebCrypto and independent origin storage", () => {
 		const second = await pageB.evaluate(async (id) => {
 			const clientPath = "/client.js";
 			const identityPath = "/identity.js";
-			const client = (await import(clientPath)) as typeof import("../../remote-prototype/client");
+			const client = (await import(
+				clientPath
+			)) as typeof import("../../shared/remote-access/browser-client");
 			const identity = (await import(
 				identityPath
 			)) as typeof import("../../shared/remote-access/identity");

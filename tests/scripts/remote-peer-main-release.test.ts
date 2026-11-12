@@ -625,6 +625,8 @@ async function publisherFixture() {
 				return JSON.stringify({ object: { type: "commit", sha: workflowCommit } });
 			if (path.startsWith("compare/"))
 				return JSON.stringify({ status: "ahead", merge_base_commit: { sha: path.slice(8, 48) } });
+			if (path === `contents/shared/remote-access/frontend-capability.json?ref=${commit}`)
+				throw new Error("HTTP 404");
 			if (path === `contents/package.json?ref=${commit}`)
 				return contents({ version: "1.2.0", packageManager: "bun@1.4.3" });
 			if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)

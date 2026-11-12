@@ -7,6 +7,10 @@ import {
 	parseHelperDistributionDependencies,
 } from "../../shared/helper-distribution";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
+import {
+	parseRemoteFrontendCapability,
+	type RemoteFrontendCapability,
+} from "../../shared/remote-access/application";
 import { EXECUTOR_VERSION_RE } from "../../shared/remote-executor-manifest";
 import { parseRecoveryManifestVersions } from "../../shared/update-identity";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
@@ -77,6 +81,7 @@ const buildSourceSchema = z
 		runAttempt: id,
 		workflowCommit: sha,
 		controlArtifact: artifactIdentitySchema,
+		remoteFrontend: artifactIdentitySchema.optional(),
 		platforms: z
 			.array(
 				z
@@ -125,6 +130,7 @@ const planSchema = z
 		buildSource: buildSourceSchema.optional(),
 		componentEvidence: componentEvidenceSchema.optional(),
 		remotePeer: remotePeerReleasePlanSchema.optional(),
+		remoteFrontend: z.unknown().transform(parseRemoteFrontendCapability).optional(),
 		baselines: z
 			.array(
 				z
@@ -278,6 +284,14 @@ export function validateCiReleasePlan(value: unknown): CiReleasePlan {
 		const source = plan.buildSource;
 		const targets = new Set(source.platforms.map(({ target }) => target));
 		const artifactIds = new Set(source.platforms.map(({ artifact }) => artifact.id));
+		if (
+			Boolean(plan.remoteFrontend) !== Boolean(source.remoteFrontend) ||
+			(source.remoteFrontend &&
+				(source.remoteFrontend.size > 130 * 1024 ** 2 ||
+					source.remoteFrontend.id === source.controlArtifact.id ||
+					artifactIds.has(source.remoteFrontend.id)))
+		)
+			throw new Error("Missing or invalid frozen remote frontend build artifact");
 		if (
 			source.runId === plan.runId ||
 			![1, CI_RELEASE_TARGETS.length].includes(source.platforms.length) ||
@@ -471,6 +485,37 @@ async function readCommittedJson(
 	return JSON.parse(bytes.toString("utf8"));
 }
 
+/** Only a transport-confirmed 404 means historical absence. Parse/network failures stay fatal. */
+export async function readTargetRemoteFrontendCapability(
+	run: GhRunner,
+	commit: string,
+	repository: string,
+): Promise<RemoteFrontendCapability | undefined> {
+	let output: string;
+	try {
+		output = await run([
+			"api",
+			`repos/${repository}/contents/shared/remote-access/frontend-capability.json?ref=${commit}`,
+		]);
+	} catch (error) {
+		if (error instanceof Error && /\bHTTP 404\b/.test(error.message)) return undefined;
+		throw error;
+	}
+	if (Buffer.byteLength(output) > CI_API_MAX_BYTES)
+		throw new Error("Remote capability response too large");
+	const data = z
+		.object({
+			type: z.literal("file"),
+			encoding: z.literal("base64"),
+			size: z.number().int().positive().max(4096),
+			content: z.string().max(8192),
+		})
+		.parse(JSON.parse(output));
+	const bytes = Buffer.from(data.content, "base64");
+	if (bytes.length !== data.size) throw new Error("Committed remote capability size mismatch");
+	return parseRemoteFrontendCapability(JSON.parse(bytes.toString("utf8")));
+}
+
 async function targetIdentity(
 	run: GhRunner,
 	commit: string,
@@ -577,6 +622,9 @@ export async function createCiReleasePlan(
 	await assertCiMainAncestor(run, commit, repository, defaultBranch);
 	await assertCiMainAncestor(run, dispatch.workflowCommit, repository, defaultBranch);
 	const changelog = await targetIdentity(run, commit, releaseVersion, repository);
+	const remoteFrontend = options.indexOnly
+		? undefined
+		: await readTargetRemoteFrontendCapability(run, commit, repository);
 	if (options.sourceRunId === undefined || options.indexOnly) {
 		const releases = await listGitHubReleaseSummaries(run, repository);
 		if (options.indexOnly) {
@@ -625,6 +673,7 @@ export async function createCiReleasePlan(
 		changelog,
 		baselines: [],
 		...(componentEvidence === undefined ? {} : { componentEvidence }),
+		...(remoteFrontend === undefined ? {} : { remoteFrontend }),
 	});
 	validateCiComponentDependencies(plan, dependencies);
 	return plan;
@@ -661,6 +710,11 @@ export async function revalidateCiReleasePlan(
 	const changelog = await targetIdentity(run, plan.commit, plan.version, repository);
 	if (JSON.stringify(changelog) !== JSON.stringify(plan.changelog))
 		throw new Error("Release changelog changed");
+	if (!options.requireAlreadyPublished) {
+		const declaration = await readTargetRemoteFrontendCapability(run, plan.commit, repository);
+		if (!isDeepStrictEqual(declaration, plan.remoteFrontend))
+			throw new Error("Remote frontend declaration differs from frozen target");
+	}
 	const hasArtifactDependencies = Object.hasOwn(options, "helperDistribution");
 	if (!options.publish && !hasArtifactDependencies) return plan;
 	if (options.publish) await assertReleaseEnvironment(run, repository, defaultBranch);

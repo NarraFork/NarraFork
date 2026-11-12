@@ -25,6 +25,7 @@ import {
 	fetchDistributionAsset,
 	readDistributionJson,
 	readLocalDistributionJson,
+	verifyDistributionFile,
 	withDeadline,
 	writeDistributionJson,
 } from "./helper-distribution-runtime";
@@ -205,6 +206,56 @@ export interface RemotePeerArtifactLocation {
 	size: number;
 	sha256: string;
 }
+/** Offline inspection only. No manifest fetch, binary download or process launch. */
+export async function getInstalledRemotePeerBinary(
+	signal?: AbortSignal,
+): Promise<RemotePeerArtifactLocation | null> {
+	const expected = pin();
+	const platform = resolveRemotePeerPlatform(process.platform, process.arch);
+	if (!platform) return null;
+	const context = createDistributionContext(captureHelperSource());
+	const deadline = withDeadline(signal, 10_000);
+	try {
+		const value = await readLocalDistributionJson(
+			distributionPath(
+				context.source,
+				`${expected.tag}\0${expected.version}\0${expected.protocolVersion}\0manifest`,
+			),
+		);
+		const manifest = parseManifest(value, context);
+		const binding = freezeRemotePeerArtifact(manifest, platform);
+		const helperPlatform = platform.replace("amd64", "x64");
+		const path =
+			distributionPath(
+				context.source,
+				`${binding.tag}\0${binding.tag}\0${helperPlatform}\0${binding.filename}\0${binding.sha256}`,
+			) + (binding.filename.endsWith(".exe") ? ".exe" : "");
+		if (
+			!(await verifyDistributionFile(
+				path,
+				{ ...binding, platform: helperPlatform },
+				deadline.signal,
+			)) ||
+			!context.isCurrent()
+		)
+			return null;
+		return {
+			path,
+			filename: binding.filename,
+			version: binding.version,
+			protocolVersion: binding.protocolVersion,
+			platform,
+			size: binding.size,
+			sha256: binding.sha256,
+		};
+	} catch {
+		signal?.throwIfAborted();
+		return null;
+	} finally {
+		deadline.dispose();
+	}
+}
+
 /** Explicit acquisition only. Neither import, startup nor a status read invokes this function. */
 export async function ensureRemotePeerBinary(
 	platform: RemotePeerPlatform | undefined = undefined,

@@ -8,7 +8,7 @@ import { startFixture } from "../remote-prototype/fixture";
 const ROOT = resolve(import.meta.dir, "..");
 const MAX_OUTPUT = 1024 * 1024;
 
-async function buildPeer(output: string, signal?: AbortSignal): Promise<void> {
+export async function buildPeer(output: string, signal?: AbortSignal): Promise<void> {
 	const child = Bun.spawn(["go", "build", "-o", output, "./cmd/remote-peer"], {
 		cwd: join(ROOT, "remote-peer"),
 		stdout: "pipe",
@@ -244,7 +244,7 @@ export async function startPrototype(
 		})();
 		void errorTask.catch(() => {});
 		child.stdin.write(
-			`${JSON.stringify({ signalUrl: coordinator.signalUrl, bridgeUrl: fixture.bridgeUrl, bridgeSecret: fixture.bridgeSecret, statePath: join(directory, "peer-state.json"), stunUrls: options.stunUrls ?? [], allowLocalhost: true, leaseSeconds: options.leaseSeconds ?? 75 })}\n`,
+			`${JSON.stringify({ mode: "prototype", signalUrl: coordinator.signalUrl, bridgeUrl: fixture.bridgeUrl, bridgeSecret: fixture.bridgeSecret, statePath: join(directory, "peer-state.json"), stunUrls: options.stunUrls ?? [], allowLocalhost: true, leaseSeconds: options.leaseSeconds ?? 75 })}\n`,
 		);
 		let invitation: Invitation;
 		try {

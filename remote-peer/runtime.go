@@ -1,17 +1,23 @@
 package remotepeer
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -22,16 +28,35 @@ import (
 )
 
 type Config struct {
-	SignalURL      string   `json:"signalUrl"`
-	BridgeURL      string   `json:"bridgeUrl"`
-	BridgeSecret   string   `json:"bridgeSecret"`
-	StatePath      string   `json:"statePath"`
-	STUNURLs       []string `json:"stunUrls"`
-	AllowLocalhost bool     `json:"allowLocalhost"`
-	LeaseSeconds   int      `json:"leaseSeconds"`
+	Mode                  string          `json:"mode"`
+	IPCEpoch              string          `json:"-"`
+	BackendIdentity       BackendIdentity `json:"backendIdentity"`
+	RequestPolicy         []RequestRule   `json:"requestPolicy"`
+	SignalURL             string          `json:"signalUrl"`
+	SignalCAFile          string          `json:"signalCAFile,omitempty"`
+	BridgeURL             string          `json:"bridgeUrl"`
+	BridgeSecret          string          `json:"bridgeSecret"`
+	StatePath             string          `json:"statePath"`
+	STUNURLs              []string        `json:"stunUrls"`
+	ICEIPAllowlist        []string        `json:"iceIPAllowlist,omitempty"`
+	ICEInterfaceAllowlist []string        `json:"iceInterfaceAllowlist,omitempty"`
+	ICENetworkTypes       []string        `json:"iceNetworkTypes,omitempty"`
+	AllowLocalhost        bool            `json:"allowLocalhost"`
+	LeaseSeconds          int             `json:"leaseSeconds"`
 }
 
 func (c Config) Validate() error {
+	if c.Mode != "prototype" && c.Mode != "narrafork" {
+		return errors.New("mode_required")
+	}
+	if c.Mode == "narrafork" {
+		if !validIPCID(c.IPCEpoch) || !c.BackendIdentity.valid() {
+			return errors.New("backend_identity")
+		}
+		if err := validatePolicy(c.RequestPolicy); err != nil {
+			return err
+		}
+	}
 	u, e := url.Parse(c.BridgeURL)
 	if e != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.Port() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || len(c.BridgeSecret) < 32 {
 		return errors.New("bridge_config")
@@ -46,8 +71,30 @@ func (c Config) Validate() error {
 	if u.Scheme != "wss" && !(c.AllowLocalhost && u.Scheme == "ws" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost")) {
 		return errors.New("signal_tls")
 	}
-	if !filepath.IsAbs(c.StatePath) || strings.Contains(filepath.Clean(c.StatePath), string(os.PathSeparator)+".narrafork"+string(os.PathSeparator)) {
+	if !filepath.IsAbs(c.StatePath) || (c.Mode != "narrafork" && strings.Contains(filepath.Clean(c.StatePath), string(os.PathSeparator)+".narrafork"+string(os.PathSeparator))) {
 		return errors.New("isolated_state_required")
+	}
+	if len(c.SignalCAFile) > 4096 || strings.ContainsAny(c.SignalCAFile, "\r\n\x00") {
+		return errors.New("signal_ca_file")
+	}
+	if len(c.ICEIPAllowlist) > 64 || len(c.ICEInterfaceAllowlist) > 32 || len(c.ICENetworkTypes) > 2 {
+		return errors.New("ice_config_limit")
+	}
+	for _, ip := range c.ICEIPAllowlist {
+		addr, err := netip.ParseAddr(ip)
+		if err != nil || addr.Zone() != "" || addr.Unmap().IsUnspecified() || addr.Unmap().IsMulticast() {
+			return errors.New("ice_ip_allowlist")
+		}
+	}
+	for _, name := range c.ICEInterfaceAllowlist {
+		if name == "" || len(name) > 256 || strings.ContainsAny(name, "\r\n\x00") {
+			return errors.New("ice_interface_allowlist")
+		}
+	}
+	for _, network := range c.ICENetworkTypes {
+		if network != "udp4" && network != "udp6" {
+			return errors.New("ice_network_types")
+		}
 	}
 	if len(c.STUNURLs) > 4 {
 		return errors.New("stun_limit")
@@ -60,7 +107,109 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// signalTLSConfig extends system trust only for the signaling transport. Limit the
+// read before parsing and reject partial/mixed PEM bundles rather than accepting
+// the first usable certificate while silently ignoring malformed material.
+func (c Config) signalTLSConfig() (*tls.Config, error) {
+	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	if c.SignalCAFile == "" {
+		return config, nil
+	}
+	f, err := os.Open(c.SignalCAFile)
+	if err != nil {
+		return nil, errors.New("signal_ca_file")
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 65536 {
+		return nil, errors.New("signal_ca_file")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 65537))
+	if err != nil || len(data) > 65536 {
+		return nil, errors.New("signal_ca_file")
+	}
+	rest := bytes.TrimSpace(data)
+	if len(rest) == 0 {
+		return nil, errors.New("signal_ca_pem")
+	}
+	for len(rest) > 0 {
+		if !bytes.HasPrefix(rest, []byte("-----BEGIN CERTIFICATE-----")) {
+			return nil, errors.New("signal_ca_pem")
+		}
+		endMarker := []byte("-----END CERTIFICATE-----")
+		end := bytes.Index(rest, endMarker)
+		if end < 0 {
+			return nil, errors.New("signal_ca_pem")
+		}
+		end += len(endMarker)
+		block, remaining := pem.Decode(rest[:end])
+		if block == nil || len(bytes.TrimSpace(remaining)) != 0 || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return nil, errors.New("signal_ca_pem")
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return nil, errors.New("signal_ca_pem")
+		}
+		rest = bytes.TrimSpace(rest[end:])
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		return nil, errors.New("signal_ca_system_roots")
+	}
+	if !roots.AppendCertsFromPEM(data) {
+		return nil, errors.New("signal_ca_pem")
+	}
+	config.RootCAs = roots
+	return config, nil
+}
+
+// Empty allowlists preserve Pion's defaults; non-empty lists are exact local
+// interface/IP matches, not CIDRs or filters on server-reflexive public IPs.
+func (c Config) iceSettingEngine() webrtc.SettingEngine {
+	setting := webrtc.SettingEngine{}
+	setting.LoggerFactory = &logging.DefaultLoggerFactory{Writer: io.Discard, DefaultLogLevel: logging.LogLevelDisabled}
+	setting.SetSCTPMaxReceiveBufferSize(QueueBytes)
+	setting.SetSCTPMaxMessageSize(FrameBytes)
+	setting.SetIncludeLoopbackCandidate(c.AllowLocalhost)
+	if len(c.ICEIPAllowlist) > 0 {
+		ips := make(map[netip.Addr]bool, len(c.ICEIPAllowlist))
+		for _, ip := range c.ICEIPAllowlist {
+			addr, _ := netip.ParseAddr(ip) // Validate has already rejected invalid addresses.
+			ips[addr.Unmap()] = true
+		}
+		setting.SetIPFilter(func(ip net.IP) bool {
+			addr, ok := netip.AddrFromSlice(ip)
+			return ok && ips[addr.Unmap()]
+		})
+	}
+	if len(c.ICEInterfaceAllowlist) > 0 {
+		names := make(map[string]bool, len(c.ICEInterfaceAllowlist))
+		for _, name := range c.ICEInterfaceAllowlist {
+			names[name] = true
+		}
+		setting.SetInterfaceFilter(func(name string) bool { return names[name] })
+	}
+	if len(c.ICENetworkTypes) > 0 {
+		networks := make([]webrtc.NetworkType, 0, len(c.ICENetworkTypes))
+		for _, network := range c.ICENetworkTypes {
+			if network == "udp4" {
+				networks = append(networks, webrtc.NetworkTypeUDP4)
+			} else {
+				networks = append(networks, webrtc.NetworkTypeUDP6)
+			}
+		}
+		setting.SetNetworkTypes(networks)
+	}
+	return setting
+}
+
+type streamBudgets struct{ request, idle, stall, lifetime time.Duration }
+
+var defaultStreamBudgets = streamBudgets{30 * time.Second, 60 * time.Second, 30 * time.Second, 2 * time.Hour}
+
 type Runtime struct {
+	budgets               streamBudgets
+	policy                []*regexp.Regexp
+	closeOnce             sync.Once
 	cfg                   Config
 	store                 *Store
 	id, public            string
@@ -72,23 +221,50 @@ type Runtime struct {
 	epoch, coordinatorKey string
 	signalMu              sync.Mutex
 	emit                  func(any)
-	client                *http.Client
+	client                *http.Client // Loopback bridge only; never given custom signaling trust.
+	signalClient          *http.Client
 }
 
 func New(cfg Config, emit func(any)) (*Runtime, error) {
 	if e := cfg.Validate(); e != nil {
 		return nil, e
 	}
-	s, e := OpenStore(cfg.StatePath)
+	tlsConfig, e := cfg.signalTLSConfig()
 	if e != nil {
 		return nil, e
 	}
+	s, e := OpenRuntimeStore(cfg.StatePath, cfg.Mode == "narrafork")
+	if e != nil {
+		return nil, e
+	}
+	// Own the slices used asynchronously by peer negotiation.
+	cfg.STUNURLs = append([]string(nil), cfg.STUNURLs...)
+	cfg.ICEIPAllowlist = append([]string(nil), cfg.ICEIPAllowlist...)
+	cfg.ICEInterfaceAllowlist = append([]string(nil), cfg.ICEInterfaceAllowlist...)
+	cfg.ICENetworkTypes = append([]string(nil), cfg.ICENetworkTypes...)
+	policy := make([]*regexp.Regexp, len(cfg.RequestPolicy))
+	cfg.RequestPolicy = append([]RequestRule(nil), cfg.RequestPolicy...)
+	for i, rule := range cfg.RequestPolicy {
+		policy[i] = regexp.MustCompile(rule.Path)
+		cfg.RequestPolicy[i].Methods = append([]string(nil), rule.Methods...)
+	}
+	cfg.BackendIdentity.Capabilities = append([]string(nil), cfg.BackendIdentity.Capabilities...)
 	pub := PublicHex(&s.key.PublicKey)
 	id, _ := InstanceID(pub)
-	tr := &http.Transport{Proxy: nil, MaxConnsPerHost: 40, MaxIdleConnsPerHost: 8, ResponseHeaderTimeout: 15 * time.Second, DisableCompression: true, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}
-	return &Runtime{cfg: cfg, store: s, id: id, public: pub, peers: map[string]*Peer{}, pending: map[string]string{}, seen: map[string]int64{}, emit: emit, client: &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	tr := &http.Transport{Proxy: nil, MaxConnsPerHost: 40, MaxIdleConnsPerHost: 8, ResponseHeaderTimeout: 30 * time.Second, DisableCompression: true, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}
+	signalTransport := tr.Clone()
+	signalTransport.TLSClientConfig = tlsConfig
+	signalTransport.TLSHandshakeTimeout = 5 * time.Second
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &Runtime{cfg: cfg, budgets: defaultStreamBudgets, policy: policy, store: s, id: id, public: pub, peers: map[string]*Peer{}, pending: map[string]string{}, seen: map[string]int64{}, emit: emit,
+		client:       &http.Client{Transport: tr, CheckRedirect: noRedirect},
+		signalClient: &http.Client{Transport: signalTransport, CheckRedirect: noRedirect}}, nil
 }
 func (r *Runtime) Ready() error {
+	if r.cfg.Mode == "narrafork" {
+		r.event("ready", map[string]any{"instanceId": r.id, "publicKey": r.public})
+		return nil
+	}
 	i, secret, cap, e := r.store.Invite(time.Now())
 	if e != nil {
 		return e
@@ -98,21 +274,25 @@ func (r *Runtime) Ready() error {
 }
 func (r *Runtime) status(code string) { r.emit(map[string]any{"type": "status", "code": code}) }
 func (r *Runtime) Close() {
-	r.mu.Lock()
-	ps := make([]*Peer, 0, len(r.peers))
-	for _, p := range r.peers {
-		ps = append(ps, p)
-	}
-	r.mu.Unlock()
-	for _, p := range ps {
-		p.Close()
-	}
-	r.signalMu.Lock()
-	if r.signal != nil {
-		r.signal.CloseNow()
-	}
-	r.signalMu.Unlock()
-	r.client.CloseIdleConnections()
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		ps := make([]*Peer, 0, len(r.peers))
+		for _, p := range r.peers {
+			ps = append(ps, p)
+		}
+		r.mu.Unlock()
+		for _, p := range ps {
+			p.Close()
+		}
+		r.signalMu.Lock()
+		if r.signal != nil {
+			r.signal.CloseNow()
+		}
+		r.signalMu.Unlock()
+		r.client.CloseIdleConnections()
+		r.signalClient.CloseIdleConnections()
+		_ = r.store.Close()
+	})
 }
 func (r *Runtime) Revoke(id string) error {
 	if e := r.store.Revoke(id); e != nil {
@@ -212,9 +392,12 @@ func (r *Runtime) Run(ctx context.Context) {
 }
 func (r *Runtime) register(ctx context.Context) error {
 	dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
-	c, _, e := websocket.Dial(dctx, r.cfg.SignalURL, nil)
+	c, res, e := websocket.Dial(dctx, r.cfg.SignalURL, &websocket.DialOptions{HTTPClient: r.signalClient})
 	dcancel()
 	if e != nil {
+		if res != nil && res.Body != nil {
+			res.Body.Close()
+		}
 		return e
 	}
 	c.SetReadLimit(98304)
@@ -324,11 +507,39 @@ func (r *Runtime) register(ctx context.Context) error {
 		}
 	}
 }
+
+// validateOfferTicket performs only the bounded pre-authentication checks.
+// The coordinator issues 60-second tickets; tolerate at most five seconds of
+// future clock skew without accepting an already expired ticket. Signatures,
+// target authorization and replay protection remain mandatory in offer.
+func validateOfferTicket(s Signal, instanceID string, now time.Time) error {
+	t := s.Ticket
+	if ValidateSDP(s.Offer) != nil {
+		return errors.New("ticket_sdp")
+	}
+	if Hash(s.Offer) != t.OfferHash {
+		return errors.New("ticket_hash")
+	}
+	if t.InstanceID != instanceID {
+		return errors.New("ticket_identity")
+	}
+	if t.ExpiresAt <= now.Unix() {
+		return errors.New("ticket_expired")
+	}
+	if t.ExpiresAt > now.Add(65*time.Second).Unix() {
+		return errors.New("ticket_future")
+	}
+	if len(t.SessionID) < 16 || len(t.SessionID) > 128 {
+		return errors.New("ticket_session")
+	}
+	return nil
+}
+
 func (r *Runtime) offer(ctx context.Context, s Signal) error {
 	t := s.Ticket
 	now := time.Now()
-	if ValidateSDP(s.Offer) != nil || Hash(s.Offer) != t.OfferHash || t.InstanceID != r.id || t.ExpiresAt <= now.Unix() || t.ExpiresAt > now.Add(60*time.Second).Unix() || len(t.SessionID) < 16 || len(t.SessionID) > 128 {
-		return errors.New("ticket")
+	if err := validateOfferTicket(s, r.id, now); err != nil {
+		return err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -343,12 +554,7 @@ func (r *Runtime) offer(ctx context.Context, s Signal) error {
 	if len(r.seen) >= 1024 || r.seen[t.SessionID] != 0 || r.peers[t.SessionID] != nil || len(r.peers) >= 4 || (t.TargetKind == "invite" && r.pending[t.TargetID] != "") {
 		return errors.New("peer_limit")
 	}
-	setting := webrtc.SettingEngine{}
-	setting.LoggerFactory = &logging.DefaultLoggerFactory{Writer: io.Discard, DefaultLogLevel: logging.LogLevelDisabled}
-	setting.SetSCTPMaxReceiveBufferSize(QueueBytes)
-	setting.SetSCTPMaxMessageSize(FrameBytes)
-	setting.SetIncludeLoopbackCandidate(r.cfg.AllowLocalhost)
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(setting))
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(r.cfg.iceSettingEngine()))
 	servers := []webrtc.ICEServer{}
 	if len(r.cfg.STUNURLs) > 0 {
 		servers = append(servers, webrtc.ICEServer{URLs: r.cfg.STUNURLs})

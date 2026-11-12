@@ -75,6 +75,7 @@ jobs:
       smoke-only: ${{ steps.plan.outputs.smoke-only }}
       peer-action: ${{ steps.plan.outputs.peer-action }}
       peer-matrix: ${{ steps.plan.outputs.peer-matrix }}
+      remote-frontend: ${{ steps.plan.outputs.remote-frontend }}
     steps:
       - name: Require the trusted dispatch entry
         env:
@@ -265,6 +266,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       checkout-ref: ${{ needs.preflight.outputs.commit }}
+      release-version: ${{ needs.preflight.outputs.version }}
 
   build:
     name: Build (${{ matrix.target }})
@@ -398,13 +400,47 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  restore-remote-frontend:
+    name: Restore original remote frontend
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.restore-mode == 'false' && needs.preflight.outputs.build-reuse-mode == 'true' && needs.preflight.outputs.remote-frontend == 'true' && needs.preflight.outputs.smoke-only == 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+      - name: Restore frozen remote artifact without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun .ci-release/control/control.js restore-remote-frontend --plan=.ci-release/control/plan.json --output=.ci-release/remote-frontend
+      - name: Upload restored remote frontend
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: remote-frontend-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/remote-frontend/
+          if-no-files-found: error
+          retention-days: 30
+
   assemble:
     name: Assemble release bundle
-    needs: [preflight, verify, build, restore-platform, smoke]
+    needs: [preflight, verify, build, restore-platform, restore-remote-frontend, smoke]
     if: >-
       ${{ always() && !cancelled() && needs.preflight.result == 'success' &&
       needs.preflight.outputs.restore-mode == 'false' && needs.preflight.outputs.smoke-only == 'false' &&
       needs.smoke.result == 'success' &&
+      (needs.preflight.outputs.remote-frontend != 'true' || needs.preflight.outputs.build-reuse-mode != 'true' || needs.restore-remote-frontend.result == 'success') &&
       ((needs.preflight.outputs.build-reuse-mode == 'false' && needs.verify.result == 'success' && needs.build.result == 'success') ||
       (needs.preflight.outputs.build-reuse-mode == 'true' && needs.restore-platform.result == 'success')) }}
     runs-on: ubuntu-24.04
@@ -429,6 +465,12 @@ jobs:
         with:
           pattern: release-smoke-*-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/smoke-results/
+      - name: Download exact remote frontend artifact
+        if: ${{ needs.preflight.outputs.remote-frontend == 'true' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: remote-frontend-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/remote-frontend/
       - name: Prepare patch tool
         run: |
           sudo apt-get update
@@ -440,7 +482,7 @@ jobs:
         run: >-
           bun .ci-release/control/control.js assemble --plan=.ci-release/control/plan.json
           --platforms-dir=.ci-release/platforms --smoke-dir=.ci-release/smoke-results
-          --bundle-dir=.ci-release/bundle
+          --bundle-dir=.ci-release/bundle --remote-frontend-dir=.ci-release/remote-frontend
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         id: bundle
         with:
@@ -510,10 +552,11 @@ jobs:
 
   publish:
     name: Publish verified release
-    needs: [preflight, verify, build, restore-platform, smoke, assemble, restore, peer-build, peer-smoke, peer-assemble, peer-restore]
+    needs: [preflight, verify, build, restore-platform, restore-remote-frontend, smoke, assemble, restore, peer-build, peer-smoke, peer-assemble, peer-restore]
     if: >-
       ${{ always() && !cancelled() && inputs.publish && needs.preflight.result == 'success' &&
       needs.preflight.outputs.smoke-only == 'false' &&
+      (needs.preflight.outputs.restore-mode == 'true' || needs.preflight.outputs.remote-frontend != 'true' || needs.preflight.outputs.build-reuse-mode != 'true' || needs.restore-remote-frontend.result == 'success') &&
       ((needs.preflight.outputs.peer-action != 'build' && needs.preflight.outputs.peer-action != 'restore') ||
       (needs.preflight.outputs.peer-action == 'build' && needs.peer-build.result == 'success' && needs.peer-smoke.result == 'success' && needs.peer-assemble.result == 'success') ||
       (needs.preflight.outputs.peer-action == 'restore' && needs.peer-restore.result == 'success')) &&
@@ -578,7 +621,7 @@ jobs:
   gate:
     name: Release Gate
     if: ${{ always() }}
-    needs: [preflight, verify, build, restore-platform, smoke, assemble, restore, publish, peer-build, peer-smoke, peer-assemble, peer-restore]
+    needs: [preflight, verify, build, restore-platform, restore-remote-frontend, smoke, assemble, restore, publish, peer-build, peer-smoke, peer-assemble, peer-restore]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -600,6 +643,8 @@ jobs:
           BUILD_REUSE_MODE: ${{ needs.preflight.outputs.build-reuse-mode }}
           SMOKE_ONLY: ${{ needs.preflight.outputs.smoke-only }}
           RESTORE_PLATFORMS_RESULT: ${{ needs.restore-platform.result }}
+          REMOTE_FRONTEND_DECLARED: ${{ needs.preflight.outputs.remote-frontend }}
+          REMOTE_FRONTEND_RESTORE_RESULT: ${{ needs.restore-remote-frontend.result }}
           PUBLISH_REQUESTED: ${{ inputs.publish }}
           VERIFY_RESULT: ${{ needs.verify.result }}
           BUILD_RESULT: ${{ needs.build.result }}

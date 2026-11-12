@@ -1,3 +1,5 @@
+import { readBoundedBlob } from "@frontend/lib/bounded-blob";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { Box, Button, Text } from "@mantine/core";
 import { mediaModality } from "@shared/media-attachments";
 import {
@@ -95,13 +97,18 @@ function MediaAttachmentPreview({
 	useEffect(() => {
 		if (!request || previewUrl || !sourceUrl) return;
 		const controller = new AbortController();
+		const signal = REMOTE_BUILD
+			? AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)])
+			: controller.signal;
 		let objectUrl: string | undefined;
 		let disposed = false;
-		void authorizedFetch(sourceUrl, { signal: controller.signal })
+		void authorizedFetch(sourceUrl, { signal })
 			.then(async (response) => {
 				if (disposed) return;
 				if (!response.ok) throw new Error(`Media ${response.status}`);
-				const blob = await response.blob();
+				const blob = REMOTE_BUILD
+					? await readBoundedBlob(response, 8 * 1024 * 1024, signal)
+					: await response.blob();
 				if (disposed) return;
 				objectUrl = URL.createObjectURL(blob);
 				setLoaded({ url: objectUrl });

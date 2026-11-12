@@ -185,6 +185,7 @@ export async function smokeRemotePeerPlatform(
 		if ((await readdir(home)).length !== 0)
 			throw new Error("Remote-peer version query created state");
 		const config = {
+			mode: "prototype",
 			signalUrl: `ws://127.0.0.1:${server.port}/signal/instance`,
 			bridgeUrl: `http://127.0.0.1:${server.port}`,
 			bridgeSecret: "release-smoke-local-only-secret-00000000",
@@ -205,9 +206,12 @@ export async function smokeRemotePeerPlatform(
 			events.some((event) => event.type === "error")
 		)
 			throw new Error("Remote-peer control smoke did not become ready and shut down");
-		// Each control-lifecycle case owns a fresh identity. This is not a persisted-state
-		// restart/ACL acceptance test (the prototype Windows state policy is still separate).
-		const eofConfig = { ...config, statePath: join(home, "state-eof.json") };
+		// Legacy v1 diagnostics retain their isolated EOF case. New peers must reopen the
+		// SAME state on every native runner, including Windows; never hide an ACL failure.
+		const eofConfig =
+			identity.protocolVersion >= 2
+				? config
+				: { ...config, statePath: join(home, "state-eof.json") };
 		const eof = await execute([], `${JSON.stringify(eofConfig)}\n`, true);
 		if (
 			!eof
@@ -216,6 +220,77 @@ export async function smokeRemotePeerPlatform(
 				.some((line) => JSON.parse(line).type === "ready")
 		)
 			throw new Error("Remote-peer EOF smoke did not become ready and terminate");
+		if (identity.protocolVersion >= 2) {
+			const first = events.find((event) => event.type === "ready");
+			const reopened = eof
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line))
+				.find((event) => event.type === "ready");
+			if (!first?.instanceId || first.instanceId !== reopened?.instanceId)
+				throw new Error("Remote-peer state identity changed after reopening");
+			// Exercise the production private-directory/ACL path as well, not just the
+			// prototype protocol. This is an isolated identity fixture, not an NF release.
+			const epoch = "native_state_smoke";
+			const init = {
+				ipcVersion: 2,
+				epoch,
+				requestId: "initialize",
+				type: "init",
+				payload: {
+					config: {
+						...config,
+						mode: "narrafork",
+						statePath: join(home, "production", "state.json"),
+						leaseSeconds: 300,
+						backendIdentity: {
+							nfVersion: "1.0.0",
+							sourceCommit: identity.commit,
+							repository: "smoke/fixture",
+							bootstrapAbi: 1,
+							apiEpoch: 1,
+							wireVersion: 2,
+							capabilities: [],
+						},
+						requestPolicy: [
+							{
+								id: "smoke-health",
+								methods: ["GET"],
+								path: "^/api/health$",
+								phase: "ready",
+								profile: "request",
+								requestBytes: 1048576,
+								responseBytes: 1048576,
+							},
+						],
+					},
+				},
+			};
+			const shutdown = { ipcVersion: 2, epoch, requestId: "stop", type: "shutdown", payload: {} };
+			const input = `${JSON.stringify(init)}\n${JSON.stringify(shutdown)}\n`;
+			let previous: string | undefined;
+			for (let attempt = 0; attempt < 2; attempt++) {
+				const output = await execute([], input);
+				const messages = output
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				const ready = messages.find((message) => message.type === "ready");
+				if (
+					!ready ||
+					ready.ipcVersion !== 2 ||
+					ready.epoch !== epoch ||
+					typeof ready.payload?.instanceId !== "string" ||
+					messages.some(
+						(message) => message.type === "command.error" || message.payload?.pairingSecret,
+					)
+				)
+					throw new Error("Production remote-peer native state smoke failed");
+				if (previous && previous !== ready.payload.instanceId)
+					throw new Error("Production remote-peer identity changed after reopening");
+				previous = ready.payload.instanceId;
+			}
+		}
 	} finally {
 		stopServer();
 		await rm(home, { recursive: true, force: true });

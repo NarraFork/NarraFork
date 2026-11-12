@@ -62,6 +62,7 @@ describe("M1 real Chromium / Pion / isolated Bun bridge", () => {
 			state.signalMessages = [];
 			state.rtc = await module.PrototypeClient.connect(invitation, {
 				allowLocalhost: true,
+				mode: "prototype",
 				expectedInstanceId: invitation.instanceId,
 				persistGrant: true,
 				onGrant: (grant) => {
@@ -282,6 +283,7 @@ describe("M1 real Chromium / Pion / isolated Bun bridge", () => {
 				{
 					grant,
 					allowLocalhost: true,
+					mode: "prototype",
 					expectedInstanceId: original.instanceId,
 					persistGrant: false,
 				},
@@ -320,6 +322,7 @@ describe("M1 real Chromium / Pion / isolated Bun bridge", () => {
 				{
 					grant,
 					allowLocalhost: true,
+					mode: "prototype",
 					expectedInstanceId: original.instanceId,
 					persistGrant: false,
 				},

@@ -65,7 +65,7 @@ func main() {
 	var mu sync.Mutex
 	emit := func(v any) {
 		b, e := json.Marshal(v)
-		if e != nil || len(b) > 8192 {
+		if e != nil || len(b) > remotepeer.IPCMaxBytes {
 			return
 		}
 		mu.Lock()
@@ -74,21 +74,69 @@ func main() {
 	}
 	fail := func(code string) { emit(map[string]any{"type": "error", "code": code}) }
 	scan := bufio.NewScanner(os.Stdin)
-	scan.Buffer(make([]byte, 8192), 16384)
+	scan.Buffer(make([]byte, 8192), remotepeer.IPCMaxBytes+1)
 	if !scan.Scan() {
 		fail("config_missing")
 		return
 	}
 	var cfg remotepeer.Config
-	if json.Unmarshal(scan.Bytes(), &cfg) != nil {
+	init, ipcErr := remotepeer.ParseIPC(scan.Bytes())
+	production := ipcErr == nil
+	if production {
+		var payload struct {
+			Config remotepeer.Config `json:"config"`
+		}
+		if init.Type != "init" || json.Unmarshal(init.Payload, &payload) != nil || payload.Config.Mode != "narrafork" {
+			fail("config_invalid")
+			return
+		}
+		cfg = payload.Config
+		cfg.IPCEpoch = init.Epoch
+	} else if json.Unmarshal(scan.Bytes(), &cfg) != nil || cfg.Mode != "prototype" {
 		fail("config_invalid")
 		return
+	}
+	rawEmit := emit
+	var eventNumber uint64
+	if production {
+		var eventMu sync.Mutex
+		fail = func(code string) {
+			rawEmit(map[string]any{"ipcVersion": 2, "epoch": init.Epoch, "requestId": init.RequestID, "type": "command.error", "payload": map[string]any{"operation": "init", "code": code}})
+		}
+		emit = func(v any) {
+			eventMu.Lock()
+			defer eventMu.Unlock()
+			eventNumber++
+			m, ok := v.(map[string]any)
+			if !ok {
+				return
+			}
+			kind, _ := m["type"].(string)
+			payload, ok := m["payload"]
+			if !ok {
+				payload = map[string]any{}
+				for k, v := range m {
+					if k != "type" {
+						payload.(map[string]any)[k] = v
+					}
+				}
+			}
+			if kind == "error" {
+				kind = "status"
+			}
+			requestID := fmt.Sprintf("event-%d", eventNumber)
+			if kind == "ready" {
+				requestID = init.RequestID
+			}
+			rawEmit(map[string]any{"ipcVersion": 2, "epoch": init.Epoch, "requestId": requestID, "type": kind, "payload": payload})
+		}
 	}
 	r, e := remotepeer.New(cfg, emit)
 	if e != nil {
 		fail("config_rejected")
 		return
 	}
+	defer r.Close()
 	if e = r.Ready(); e != nil {
 		fail("state_failed")
 		return
@@ -97,6 +145,30 @@ func main() {
 	defer cancel()
 	go func() {
 		for scan.Scan() {
+			if production {
+				envelope, err := remotepeer.ParseIPC(scan.Bytes())
+				if err != nil || envelope.Epoch != init.Epoch {
+					cancel()
+					return
+				}
+				result := any(map[string]any{})
+				var commandErr error
+				if envelope.Type != "shutdown" {
+					result, commandErr = r.Command(envelope)
+				}
+				kind := "command.result"
+				payload := map[string]any{"operation": envelope.Type, "result": result}
+				if commandErr != nil {
+					kind = "command.error"
+					payload = map[string]any{"operation": envelope.Type, "code": "command_rejected"}
+				}
+				rawEmit(map[string]any{"ipcVersion": 2, "epoch": init.Epoch, "requestId": envelope.RequestID, "type": kind, "payload": payload})
+				if envelope.Type == "shutdown" {
+					cancel()
+					return
+				}
+				continue
+			}
 			var cmd struct {
 				Type    string `json:"type"`
 				GrantID string `json:"grantId"`

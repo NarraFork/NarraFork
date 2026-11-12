@@ -12,6 +12,7 @@ import {
 import {
 	prepareCiReleaseBuild,
 	restoreCiReleaseBuildPlatform,
+	restoreCiReleaseRemoteFrontend,
 } from "./lib/ci-release-build-restore";
 import { assembleReleaseBundle, verifyReleaseBundle } from "./lib/ci-release-bundle";
 import { timeReleasePhase } from "./lib/ci-release-io";
@@ -54,11 +55,19 @@ const FLAGS: Record<string, readonly string[]> = {
 		"smoke-target",
 	],
 	"restore-platform": ["plan", "target", "platform-dir"],
+	"restore-remote-frontend": ["plan", "output"],
 	"peer-build": ["plan", "platform", "output"],
 	"peer-smoke": ["plan", "platform", "output"],
 	"peer-assemble": ["plan", "native-dir", "output"],
 	"peer-restore": ["plan", "output"],
-	assemble: ["plan", "platforms-dir", "smoke-dir", "bundle-dir", "preview-dir"],
+	assemble: [
+		"plan",
+		"platforms-dir",
+		"smoke-dir",
+		"bundle-dir",
+		"preview-dir",
+		"remote-frontend-dir",
+	],
 	restore: ["tag", "source-run-id", "bundle-dir"],
 	"prepare-bridge": [],
 	mirror: [],
@@ -148,6 +157,14 @@ export function assertReleaseGate(env: NodeJS.ProcessEnv) {
 	const reverify = env.BUILD_REUSE_MODE === "true";
 	const diagnostic = env.SMOKE_ONLY === "true";
 	const recoveryGate = env.BUILD_REUSE_MODE !== undefined || env.SMOKE_ONLY !== undefined;
+	if (env.REMOTE_FRONTEND_DECLARED !== undefined) {
+		if (!["true", "false"].includes(env.REMOTE_FRONTEND_DECLARED))
+			throw new Error("Invalid remote frontend declaration gate");
+		const expected =
+			env.REMOTE_FRONTEND_DECLARED === "true" && reverify && !diagnostic ? "success" : "skipped";
+		if (env.REMOTE_FRONTEND_RESTORE_RESULT !== expected)
+			throw new Error("Unexpected remote frontend restore result");
+	}
 	for (const key of ["BUILD_REUSE_MODE", "SMOKE_ONLY"])
 		if (recoveryGate && !["true", "false"].includes(env[key] ?? ""))
 			throw new Error(`Invalid ${key}`);
@@ -252,6 +269,7 @@ function githubOptions(plan: CiReleasePlan, distDir: string) {
 		changelog: { ...plan.changelog },
 		requireBuildRepository: true,
 		componentEvidence: plan.componentEvidence,
+		remoteFrontend: plan.remoteFrontend,
 		platformSuffixes: new Map(CI_RELEASE_TARGETS.map((entry) => [entry.platform, entry.suffix])),
 	};
 }
@@ -406,9 +424,10 @@ export async function runCiRelease(argv: string[]) {
 									? plan.remotePeer.nativeContract
 									: PEER_NATIVE_MATRIX,
 						}),
+						"remote-frontend": String(Boolean(plan.remoteFrontend)),
 						"index-only": indexOnly,
 						"restore-mode": String(!!sourceRunId || indexOnly === "true"),
-						"build-reuse-mode": String(!!plan.buildSource),
+						"build-reuse-mode": String(!sourceRunId && !!plan.buildSource),
 						"smoke-only": String(!!recovery.smokeTarget),
 						"source-run-id": sourceRunId
 							? String(sourceRunId)
@@ -444,6 +463,17 @@ export async function runCiRelease(argv: string[]) {
 						);
 					else if (command === "peer-restore")
 						await restoreMainReleasePeer({ root, plan, output: destination, run, signal });
+					return;
+				}
+				if (command === "restore-remote-frontend") {
+					const plan = await readPlan(required(values, "plan"));
+					await restoreCiReleaseRemoteFrontend({
+						plan,
+						root,
+						destination: resolve(required(values, "output")),
+						signal,
+					});
+					await summary(`Restored original remote frontend for ${plan.tag}; no rebuild.`);
 					return;
 				}
 				if (command === "restore-platform") {
@@ -485,6 +515,9 @@ export async function runCiRelease(argv: string[]) {
 								platformsDir,
 								smokeDir,
 								bundleDir,
+								remoteFrontendDir: plan.remoteFrontend
+									? resolve(required(values, "remote-frontend-dir"))
+									: undefined,
 								signal: signal,
 							}),
 						signal,

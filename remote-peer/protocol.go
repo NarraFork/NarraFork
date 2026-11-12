@@ -11,7 +11,7 @@ import (
 )
 
 // ProtocolVersion identifies the remote-access wire protocol, not executor Device RPC.
-const ProtocolVersion = 1
+const ProtocolVersion = 2
 
 const (
 	FrameBytes  = 16384
@@ -124,6 +124,8 @@ func safeErrorCode(e error) string {
 		return "ok"
 	}
 	switch e.Error() {
+	case "auth_unavailable", "ticket_sdp", "ticket_hash", "ticket_identity", "ticket_expired", "ticket_future", "ticket_session":
+		return e.Error()
 	case "public_key", "frame", "control_size", "control_type", "trailing_json", "sdp_size", "candidate_limit", "relay_forbidden", "candidate_type", "path", "path_not_allowed", "ticket", "offer_auth", "peer_limit", "hello", "grant", "invite_invalid", "auth", "auth_status", "auth_role", "unauthorized", "unauthorized_path", "private_auth", "auth_mismatch", "socket", "socket_path", "socket_auth", "socket_limit", "socket_queue", "stream", "stream_limit", "sequence", "credit_or_size", "credit", "window", "receive_queue", "send_queue", "send_size", "send_credit", "headers", "method", "body_method", "channel_type", "gather_timeout":
 		return e.Error()
 	}

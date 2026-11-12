@@ -86,6 +86,10 @@ scripts/lib/*
 !scripts/lib/remote-peer-release-inputs.ts
 !scripts/lib/remote-peer-release-prepare.ts
 !scripts/lib/main-release-dispatch.ts
+# Dedicated remote frontend build/verification sources, not generated assets.
+!scripts/build-remote-frontend.ts
+!scripts/lib/remote-frontend*.ts
+!scripts/remote-host.ts
 remote-peer/dist/
 # WebRTC M1 entry points are source; private prototype runtime state is not.
 !scripts/webrtc-prototype.ts

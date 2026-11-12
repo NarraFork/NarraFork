@@ -1,6 +1,6 @@
-# WebRTC 远程访问设计（技术探索）
+# WebRTC 远程访问设计（M2 核心业务集成）
 
-状态：M1 隔离原型已通过本机闭环及 domepc/laptop 互换浏览器角色的公网 IPv6 UDP 直连验证；强制 IPv4 尚未打通，不能据此声称任意 NAT 均可用。当前增加 Go/Pion 组件的独立可选分发基础；仍未接入生产 NF 业务。操作与阶段边界见 [原型说明](WEBRTC_PROTOTYPE.md)。
+状态：M2 已接入真实 NF 的 opaque 会话、管理员密码/MFA、项目、叙述者聊天/审批、SSE 和小附件；采用同一业务源码的普通/远程双构建、精确后端版本选择与默认关闭的安装/配对管理。当前验证使用隔离 HOME/SQLite、自有 loopback 进程和 Chromium，不等于生产部署。M1 曾通过 domepc/laptop 公网 IPv6 UDP 直连实测；强制 IPv4 尚未打通，不能据此承诺任意 NAT 可达。历史记录保留在 [原型说明](WEBRTC_PROTOTYPE.md)。
 工作分支：`explore/webrtc-hole-punching`。
 
 ## 1. 目标与非目标
@@ -28,10 +28,10 @@
 ### 2.1 Go 组件独立分发
 
 - `remote-peer` 默认不嵌入 NF 主包，也不在普通 NF 启动时下载或运行。主包只记录可选组件的精确版本、协议版本和 tag；缺少声明的历史 NF 不以 APP_VERSION 猜测组件版本。
-- 后续管理员显式准备/启用远程访问时，通过 `ensureRemotePeerBinary` 获取当前平台已验证组件；当前仅提供分发基础，不伪装成真实业务已开放的安装开关。
+- 普通前端的“设置 → 远程访问”提供显式安装、启停、邀请及撤权；`ensureRemotePeerBinary` 只在管理员安装操作时获取已验证组件。默认关闭，普通启动与状态查询均不下载、不启动 peer。远程专用前端不开放此管理入口。
 - 使用独立 `remote-peer-v<version>` 产物，包含六种 GOOS/GOARCH 二进制、manifest 和许可附件；程序不塞进 NF 主包。下载选 GitHub 时二者从固定仓库获取；选镜像时二者均从该服务器获取，客户端冷缓存也不访问 GitHub，失败不回落 GitHub/上游。用户选择镜像即信任其发布清单，仍严格验证 size/SHA-256/架构/版本，不接受 unsigned tools 或任意 PATH 程序。
 - peer 随正常 NF 发布自动处理，不要求单独手动发组件：主 Release 冻结生产输入指纹及 pin，未变复用；新 pin 自动六平台构建、原生 smoke，在同次受保护 publisher 中先发布 peer 再发 NF。源码变了但仍使用已公开旧 pin 时要求正常更新组件版本，不覆写旧资产。独立 [remote-peer workflow](../.github/workflows/remote-peer-release.yml) 仅保留诊断/历史恢复入口；既有 executor workflow/toolchain/recipe 不变。
-- 该阶段只证明分发、版本检查和辅助进程 smoke；真实会话接入、Windows 身份状态持久化、完整浏览器兼容性仍按后续业务集成阶段验收。
+- Linux 原生 smoke 已覆盖同一身份状态重开；Windows 私有 DACL/状态锁实现与跨平台构建不等于 Windows 原生验收，后者仍由六平台 CI 验证。当前实现不触发实际发布。
 
 ## 3. 拓扑与部署
 
@@ -130,9 +130,9 @@ PoC 接口族：
 
 | 名称 | 用途 | 第一版可靠性 |
 |---|---|---|
-| `nf.control.v1` | hello/auth、请求头、状态、取消、信用更新 | 有序可靠 |
-| `nf.realtime.v1` | 逻辑 socket 生命周期、narrator/terminal/其他订阅的现有消息 | 有序可靠 |
-| `nf.bulk.v1` | 请求/响应 body、文件分块 | 有序可靠 |
+| `nf.control.v2` | hello/auth、请求头、状态、取消、信用更新 | 有序可靠 |
+| `nf.realtime.v2` | 逻辑 socket 生命周期与 narrator 核心订阅 | 有序可靠 |
+| `nf.bulk.v2` | 请求/响应 body、文件分块 | 有序可靠 |
 
 不能对 permission、审批、终端字符、消息增量随意使用不可靠通道。以后只有可完整覆盖旧值的状态快照才能考虑丢弃。多个 DataChannel 仍共享 SCTP/网络拥塞；分通道不等于带宽独立，发送调度必须优先 control/realtime，并限制 bulk 在途数据。
 
@@ -140,7 +140,7 @@ PoC 接口族：
 
 HTTP 语义：`request.open`（streamId/method/相对路径/允许头/hasBody）、等待 `request.accept` 后发送 body DATA、END；hasBody=false 隐式请求 EOF，不发送 bulk END；`response.open`（status/允许头）、DATA、END；`stream.cancel`、`stream.error`、`window.update`。客户端尽早返回 `Response` 和 `ReadableStream`，不是收齐 body 后再返回。AbortSignal 同时取消本地流和 B 的上游请求。保留业务错误码、session renewal、Content-Type、Content-Disposition 等端到端头；剔除 Host、Connection、Upgrade、Transfer-Encoding、任意代理头及内部桥接头。
 
-逻辑 socket：`socket.open` 指定允许的业务 WS 路径和 B 凭证；`socket.ready`/message/close/error 复用既有消息协议和恢复逻辑。DataChannel 连接成功不自动表示每个 socket 已授权。仅在 B 实际 WS upgrade 成功后报告 ready。
+逻辑 socket：`socket.open` 指定允许的业务 WS 路径和 B 凭证；`socket.ready`/message/close/error 复用既有消息协议和恢复逻辑。DataChannel 连接成功不自动表示每个 socket 已授权。仅在 B 实际 WS upgrade 成功后报告 ready。v2 的 text/binary 逻辑消息最多 2 MiB，使用独立 32-byte socket header 分成不超过 16 KiB 的帧；按 socket 有界重组、校验顺序并保留真实关闭码。每片进入已预留重组预算后归还 credit，避免大消息等待完整窗口而死锁。协议支持 binary 不代表本轮开放 outline/terminal。
 
 二进制 DATA 使用固定 24-byte 大端 header：magic(4)、version(1)、kind(1)、flags(2)、streamId(4)、sequence(4)、payloadBytes(4)、reserved(4)。session 由当前 peer 上下文绑定，断线重建不复用旧 streamId。每帧总长度不超过 16 KiB 且不超过协商的 SCTP maxMessageSize；协议版本、长度、序号或 credit 不合法即拒绝。字段类型、frame kind、控制消息 schema 与边界测试集中在 shared/remote-access/。
 
@@ -150,15 +150,15 @@ HTTP 语义：`request.open`（streamId/method/相对路径/允许头/hasBody）
 
 每 peer 应用发送/接收队列各最多 4 MiB，B 全局应用队列最多 32 MiB。DataChannel bufferedAmount 高水位 1 MiB、低水位 256 KiB；仅在低水位/credit 允许时继续读取上游。Pion 侧显式设置接收消息/缓冲上限，并验证浏览器协商效果，不能把应用计数当作整个 RTC 库的内存硬上限。
 
-常规请求 30 秒截止，认证 15 秒；显式流式任务不沿用普通 30 秒总期限，但设 credit 停滞 30 秒、无业务/心跳活动 60 秒、最大持续期 2 小时并可取消。stderr/status 单条 8 KiB、环形日志 1 MiB；慢请求、队列深度、RTC/辅助进程资源和事件循环延迟可观测，不记录正文/凭证/完整 SDP。
+常规请求 30 秒截止；配对后人机登录窗口最多 10 分钟，单次认证另有限时。只对服务端允许的 SSE 路由提供流策略：响应头/credit 停滞各 30 秒、无业务或心跳活动 60 秒、最大持续 2 小时、累计最多 64 MiB，可贯穿取消且不缓存完整流。stderr/status 有界并脱敏；不记录正文、凭证或完整 SDP。
 
 ## 7. B 的本机桥接与生命周期
 
 采用仅 127.0.0.1、随机端口的专用 Bun HTTP/WS listener。B 启动辅助进程时经受控 pipe 交付短期桥接 capability、监听地址和配置，不用 argv/env 暴露 secret；stdout 是有界版本化控制事件，stderr 为有界脱敏日志。
 
-此 listener 的每次请求、socket upgrade 均先校验桥接 capability、有效 peer/session/grant，以及阶段/路径允许表。Go 只能访问这个固定 listener；不能接收 C 指定的 scheme、host、端口或 redirect 目标。上游重定向不自动跟到其他 origin；作为 Response 返回客户端 transport 判定。
+此 listener 的每次请求、socket upgrade 均先校验进程 capability、peer context capability、epoch、grant/session 与阶段/路径允许表。Go 只访问固定 listener，不接受 C 指定的 scheme、host、端口或 redirect 目标。生产模式拒绝业务重定向；仅显式 prototype 模式保留原型的手动 Location 测试语义。
 
-从 [server/main.ts](server/main.ts#L864-L924) 提取共用请求分派/upgrade 边界，让公开 listener 和私有 listener 都保留 startup readiness、shutdown admission、request tracking、JWT 认证、WS handlers 及 BunFile 的 HTTP/Range 处理。不要在原型中无证据直接把所有路由交给 `app.fetch` 后假定行为等价。
+共用分派器位于 `server/http-dispatcher.ts`，公开 listener 与私有 listener 保留 readiness、shutdown admission、request tracking、真实 opaque session 鉴权、WS handlers 和 BunFile Range/HEAD 处理。原生 WS upgrade 使用 Bun 原始 Request，不能传重建的 Request。`/_nf/remote/session/introspect` 仅私有桥接可用，读取真实会话但不滑动续期；公开 `/api/auth/me` 不增加内部字段。存储故障关闭传输（1013），grant 终止为 1008，仅真实 session 失效使用 4001，避免误清有效凭证。
 
 私有入口设置由服务端验证的 `transport=webrtc`、peer/session/grant 上下文；不接受 C 自报 trustedProxy 或 clientIp。由于真实 TCP peer 是 loopback，远程登录/配对必须按 grant/browserKey/user 等身份维度额外限流，不能把所有异地用户当可信本机或仅计入 127.0.0.1。未来支持普通用户/终端前，专项确认 HTTP 与 WS 的逐资源授权一致。
 
@@ -173,13 +173,14 @@ A 失联、在线租约 TTL 到期或续租失败时，既有 RTC 及其业务�
 ```ts
 interface BusinessTransport {
   request(path: string, init?: RequestInit): Promise<Response>;
-  upload(path: string, body: FormData, options: UploadOptions): Promise<Response>;
+  upload(path: string, body: BodyInit, options?: BusinessUploadOptions): Promise<Response>;
   openSocket(path: string, credential: string): BusinessSocket;
-  capabilities: RemoteCapabilities;
 }
 ```
 
-请求 body 使用浏览器 Request 的序列化流处理 FormData/multipart 和二进制，不先完整收集到内存；保留生成的 Content-Type boundary。HEAD、204/304 等无 body 响应按原语义返回，SSE 分片不是事件边界，UTF-8 解码器须跨 chunk 保持状态。RTC body 流的 reader.cancel 与 AbortSignal 都通知 B 取消。所有 Location 以手动方式处理，不自动导航/请求 A 或其他内网服务。
+完整接口与 mount ABI 以 `shared/remote-access/business-transport.ts` 为准；构建常量与 alias 在编译期选择 transport 和未支持功能替代模块，不维护第二套聊天业务源码。
+
+请求 body 使用浏览器 Request 序列化 FormData/multipart，保留 Content-Type boundary；按协议预算传输，不转 Base64 大 JSON。HEAD、204/304 等无 body 响应保留语义。SSE 分片不是事件边界，UTF-8 解码器跨 chunk 保持状态。reader.cancel 与 AbortSignal 都通知 B 取消。生产 transport 不自动导航或请求重定向目标。
 
 `HttpTransport` 保留原 HTTP/WS；`WebRtcTransport` 实现上述协议。business request 与 static asset fetch 分开命名和职责，不全局 monkey-patch fetch/WebSocket。MVP 远程模式先连接、配对、版本协商、B 管理员登录，再挂载业务路由和 query hooks；本地模式保持原启动顺序。
 
@@ -191,20 +192,20 @@ capability gate 同时覆盖入口、后台 hooks、启动同步和服务端路�
 
 ## 9. PWA、资源与版本
 
-A 使用同一实例 origin 的标准 Manifest/Service Worker 缓存 shell；安装和离线启动不意味着能离线重建 RTC。连接由活动页面拥有，Service Worker 不能持有 RTCPeerConnection；网络切换/pageshow 后按实际连接状态恢复。
+M2 远程专用构建不注册 Service Worker/PWA；检测到已有控制页面的 SW 时拒绝启动。普通前端的 PWA 保持原样。连接由活动页面持有，不能宣称后台永驻或离线重建 RTC；远程 PWA/SW 资源桥留待专项设计。
 
-拆分两种版本检查：A 的 client manifest 检查壳/静态更新；B 的 peer hello/业务 health 检查 wire version、API/event schema epoch、应用 release version 与 capability。A 最新前端不得仅比较完整 build hash 就反复 reload 用户旧实例。M1/M2 先要求相同 wire/API epoch 且明确匹配的应用 release；未知/缺失协议标记或不匹配的 B 拒绝并提示在本地升级，不依赖 package semver 自动推断兼容。扩大兼容范围前建立经过 CI 验证的客户端/后端版本矩阵；保留兼容静态版本和选择加载器是后续能力，不承诺对任意历史版本兼容。
+轻量 bootstrap 先通过已验证 RTC hello 获取 **NF 应用** repository/release、bootstrap ABI、API epoch、wire version，再读取同 origin 的有界 catalog，选择显式兼容键映射的 immutable buildId。校验 manifest/hash 后在同一 document 加载业务 `mount`，保留既有 RTC。无匹配或禁用版本明确拒绝；不用 peer 版本代替 NF 版本，不取 latest、不猜 semver、不支持未经改造的历史 NF。普通/远程分别输出 `dist/frontend/` 与 `dist/frontend-remote/`；业务静态资源位于 `/remote/frontends/<buildId>/`。
 
 资源迁移：
 1. MVP：小图片、附件通过 transport 获取有界 Blob，组件使用 blob URL、卸载时 revoke；不是缓存私有内容到 A。
-2. 后续：Range/流式下载等用同源虚拟 resource URL，由 SW fetch handler 与活跃页面 MessageChannel 桥接至 transport。页面不在/无已授权 peer 时立即失败，不回落官方 network。设计超时、窗口 credit、Range/206/416、Content-Disposition 和内存限制。
+2. 本轮已验证小媒体的真实 206/416；大文件、持续流媒体、断点续传及同源虚拟资源 URL/SW 桥仍未开放，不能用小附件 Range 测试宣称完整媒体支持。
 3. 任意 iframe 内相对资源、插件 UI、Webview、匿名分享及外部服务不是上述桥接的自动收益，需独立 origin/sandbox/路由授权设计。在完整验证前禁用。
 
 passkey/SSO 原有 B origin/RP ID 不会自动迁移到官方 origin。MVP 仅允许密码与已适配的 TOTP/备份码认证，明确不提供远程 passkey、OIDC 和新用户注册。账户只有未支持的认证/MFA 方式时明确拒绝远程登录，不得跳过或降级 MFA。品牌 API、favicon、登录背景等启动资源同样要分类，不能连接前请求 A 的业务 URL。
 
 ## 10. 重连与写操作语义
 
-短暂 disconnected 先等待 5 秒；failed 或持续断连才进行有次数上限的 ICE restart，经 A 交换新代次 SDP。移动端挂起后重建可用连接，不能声称后台一直在线。
+M2 对短暂 disconnected 有界等待，持续失败后以已持久化 grant 重建 peer，并在新连接上重新认证；不是原连接 ICE restart。移动端挂起后仍须重新核验连接状态，不承诺后台一直在线。
 
 重建 peer 使用新 session/epoch；先重新验证 grant 和 B session，再重建逻辑 socket 并按原 cursor/seq 补齐事件。快照类数据重新查询；终端 scrollback 恢复不能重复发送键盘输入。
 
@@ -222,7 +223,7 @@ STUN 使用 coturn 的 stun-only 配置；默认不开放 TURN allocation，也�
 
 ## 12. 分阶段实施与完成条件
 
-### M1：独立技术原型（下一步建议实施范围）
+### M1：独立技术原型（已完成的历史验证）
 
 新增 isolated coordinator、Go peer、浏览器调试客户端及共享协议测试；使用专用 fixture 后端、独立 HOME/端口、测试邀请和 JWT，不改真实用户数据库，不接管运行中的实例。注册/配对、身份绑定、direct-only、预算、取消和基本背压在此阶段就验证，不先做无认证公网隧道。
 
@@ -230,7 +231,7 @@ STUN 使用 coturn 的 stun-only 配置；默认不开放 TURN allocation，也�
 
 ### M2：NarraFork 核心应用集成
 
-加入设置/配对管理、受保护 loopback listener、辅助进程生命周期；迁移 API client、narrator WS、SSE 和小图片附件；新增官方 remote bootstrap 模式、每实例 origin、版本协商及明确 capability UI。覆盖 B session renewal/revocation 和已有本地路径回归。端口暴露、静态资源旁路和敏感日志作为必测项目。
+已加入设置/配对管理、受保护 loopback listener、辅助进程生命周期、真实管理员 password/MFA、项目/叙述者聊天审批、SSE 和小附件。普通/远程编译目标共享业务组件，远程精确匹配 NF release 后加载独立模块；未适配能力在模块图、hooks 与服务端允许表同时阻断。验收分别覆盖真实 Go→NF app/SQLite 业务和 production UI 的零业务网络旁路；测试 provider 可替身，auth/routes 不替身。多版本静态包与正常发布集成属于本轮交付，实际公网部署仍不在授权范围。
 
 ### M3：核心业务完整性
 
@@ -289,7 +290,8 @@ Bun 子集测试使用 `bun test --isolate`；静态检查 `bunx tsgo --noEmit`�
 - [x] 已完成：源码与规范调查、前端子系统设计复核、身份/origin/协议/预算/分阶段设计。
 - [x] 后续已完成：M1 隔离原型、本机真实 Chromium/Pion/Bun 验收、Go race/vet、Windows/amd64 与 Darwin/arm64 交叉编译（不是原生运行）。
 - [x] 后续实测：独立 nug2 公网 WSS/STUN，domepc/laptop 互换浏览器角色均可经公网 IPv6 直连；双向业务、并行吞吐已验证，未走 EasyTier/TURN。强制 IPv4 失败并完成映射/过滤诊断，结果不推广到所有网络。
-- [ ] 未完成：IPv4 穿透增强、UDP 阻断专项、正式 PWA/生产应用集成、进程 RSS 压测与完整多平台原生运行；不得用原型或交叉编译结果替代。
+- [x] 后续 M2：真实 NF app/隔离数据库的核心业务、会话撤权/存储故障、条件编译与 production UI 资源边界验收；Linux peer 同状态重开 smoke。没有使用 fixture auth/routes 替代真实后端。
+- [ ] 未完成：IPv4 穿透增强、UDP 阻断专项、远程 PWA、非核心业务、进程 RSS 压测、完整多平台原生运行和正式公网部署；不得用本机核心业务或交叉编译结果替代。
 
 ### 发现的问题与修正
 

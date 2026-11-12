@@ -1,6 +1,6 @@
 import contract from "./contract.json";
 
-export const VERSION = 1;
+export const VERSION = 2;
 export const APP_VERSION = "prototype-1";
 export const LIMITS = Object.freeze(contract.limits);
 export const FRAME_DATA = 1;

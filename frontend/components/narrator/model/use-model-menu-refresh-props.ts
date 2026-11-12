@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -196,11 +197,11 @@ export function useModelMenuRefreshProps(nugProviderIdByPrefix: Record<string, s
 	}, [qc]);
 	const hasNugModelGroups = Object.keys(nugProviderIdByPrefix).length > 0;
 	return {
-		providerActions,
+		providerActions: REMOTE_BUILD ? {} : providerActions,
 		// Settings → Providers is an admin page.
-		...(isAdmin ? { onOpenProviderSettings } : {}),
+		...(!REMOTE_BUILD && isAdmin ? { onOpenProviderSettings } : {}),
 		// No NUG gateway in the picker → nothing to refresh, so don't even ask.
-		...(canRefreshNugModels && hasNugModelGroups
+		...(!REMOTE_BUILD && canRefreshNugModels && hasNugModelGroups
 			? { onPickerOpened: handleModelPickerOpened }
 			: {}),
 	};

@@ -423,7 +423,9 @@ describe("main.ts wiring (source-level; main.ts binds ports and cannot be import
 	const mainSource = readFileSync(resolve(REPO_ROOT, "server/main.ts"), "utf8");
 
 	test("health reports the active backend", () => {
-		expect(mainSource).toContain("database: { backend: activeDatabaseBackend }");
+		expect(mainSource).toContain("createServerRequestDispatcher({");
+		const dispatcherSource = readFileSync(resolve(REPO_ROOT, "server/http-dispatcher.ts"), "utf8");
+		expect(dispatcherSource).toContain("database: { backend: activeDatabaseBackend }");
 	});
 
 	test("the SQLite-only integrity probe is gated off the PostgreSQL backend", () => {

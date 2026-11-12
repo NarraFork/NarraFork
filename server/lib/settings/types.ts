@@ -1083,6 +1083,8 @@ export interface NarraForkSettings {
 		/** Automatically download updates when available. */
 		autoDownload: boolean;
 	};
+	/** Optional RTC access; secrets and state paths are never settings. */
+	remoteAccess?: import("../../../shared/remote-access/management").RemoteAccessSettings;
 	/** Application-level virtual network relay for Bun-to-Bun communication. */
 	vnet?: {
 		enabled: boolean;

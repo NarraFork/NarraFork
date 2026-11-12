@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
@@ -6,6 +6,7 @@ import {
 	REMOTE_PEER_MANIFEST_FILENAME,
 	REMOTE_PEER_PLATFORMS,
 	remotePeerPublishedFilename,
+	resolveRemotePeerPlatform,
 } from "../../../shared/remote-peer";
 import { REMOTE_PEER_DISTRIBUTION } from "../../../shared/remote-peer-distribution";
 import {
@@ -16,6 +17,7 @@ import {
 import {
 	ensureRemotePeerBinary,
 	freezeRemotePeerArtifact,
+	getInstalledRemotePeerBinary,
 	getRemotePeerManifest,
 	RemotePeerDistributionError,
 	resetRemotePeerManifestCache,
@@ -111,7 +113,7 @@ describe("optional remote peer binary acquisition", () => {
 		const result = await ensureRemotePeerBinary("linux-amd64", { fetcher: f.fetch });
 		paths.add(result.path);
 		expect(result.version).toBe(pin.version);
-		expect(result.protocolVersion).toBe(1);
+		expect(result.protocolVersion).toBe(pin.protocolVersion);
 		expect(result.path).toBe(binaryPath);
 		expect(readFileSync(result.path)).toEqual(binary);
 		expect(f.calls).toEqual([
@@ -120,6 +122,35 @@ describe("optional remote peer binary acquisition", () => {
 		]);
 		await ensureRemotePeerBinary("linux-amd64", { fetcher: f.fetch });
 		expect(f.calls).toHaveLength(2);
+	});
+	test("installed lookup stays offline both before and after explicit acquisition", async () => {
+		const f = fetcher();
+		const preconnect = globalThis.fetch.preconnect;
+		const network = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async () => {
+					throw new Error("Installed lookup must not access the network");
+				},
+				{ preconnect },
+			),
+		);
+		try {
+			expect(await getInstalledRemotePeerBinary()).toBeNull();
+			const installed = await ensureRemotePeerBinary("linux-amd64", { fetcher: f.fetch });
+			paths.add(installed.path);
+			const cached = await getInstalledRemotePeerBinary();
+			if (resolveRemotePeerPlatform(process.platform, process.arch) === "linux-amd64") {
+				expect(cached?.path).toBe(installed.path);
+				expect(cached?.protocolVersion).toBe(pin.protocolVersion);
+			} else {
+				// A cached artifact for another architecture must never become executable here.
+				expect(cached).toBeNull();
+			}
+			expect(f.calls).toHaveLength(2);
+			expect(network).not.toHaveBeenCalled();
+		} finally {
+			network.mockRestore();
+		}
 	});
 	test("manifest requests coalesce and bounded local manifest supports offline reads", async () => {
 		const f = fetcher();
@@ -154,7 +185,7 @@ describe("optional remote peer binary acquisition", () => {
 		[
 			"protocol",
 			(x: ReturnType<typeof envelope>) => {
-				x.manifest.protocolVersion = 2;
+				x.manifest.protocolVersion = pin.protocolVersion + 1;
 			},
 		],
 		[

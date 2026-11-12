@@ -1,14 +1,21 @@
 package remotepeer
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +25,120 @@ import (
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
+
+func TestSignalCAFileValidation(t *testing.T) {
+	server := httptest.NewTLSServer(http.NotFoundHandler())
+	defer server.Close()
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	for _, tc := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"empty", nil, "signal_ca_pem"},
+		{"garbage", []byte("not PEM"), "signal_ca_pem"},
+		{"invalid_der", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("invalid")}), "signal_ca_pem"},
+		{"malformed_then_valid", append([]byte("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n"), cert...), "signal_ca_pem"},
+		{"private_key", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("invalid")}), "signal_ca_pem"},
+		{"leading_junk", append([]byte("junk\n"), cert...), "signal_ca_pem"},
+		{"trailing_junk", append(append([]byte(nil), cert...), []byte("junk")...), "signal_ca_pem"},
+		{"mixed", append(append([]byte(nil), cert...), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("invalid")})...), "signal_ca_pem"},
+		{"oversize", bytes.Repeat([]byte(" "), 65537), "signal_ca_file"},
+		{"exact_limit", append(append([]byte(nil), cert...), bytes.Repeat([]byte(" "), 65536-len(cert))...), ""},
+		{"valid", cert, ""},
+		{"bundle", append(append([]byte(nil), cert...), cert...), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "ca.pem")
+			if err := os.WriteFile(path, tc.data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := Config{Mode: "prototype", SignalURL: "wss://example.test/signal/instance", SignalCAFile: path, BridgeURL: "http://127.0.0.1:1234", BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(dir, "state.json")}
+			r, err := New(cfg, func(any) {})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				return
+			}
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("got %v, want %s", err, tc.want)
+			}
+			if _, err := os.Stat(cfg.StatePath); !os.IsNotExist(err) {
+				t.Fatal("invalid CA must fail before state creation", err)
+			}
+		})
+	}
+	for _, path := range []string{t.TempDir(), filepath.Join(t.TempDir(), "missing.pem")} {
+		if _, err := (Config{Mode: "prototype", SignalCAFile: path}).signalTLSConfig(); err == nil || err.Error() != "signal_ca_file" {
+			t.Fatal("accepted unreadable CA", err)
+		}
+	}
+}
+
+func TestSignalCustomCAUsedByWSSOnly(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		c, err := websocket.Accept(w, req, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+		defer cancel()
+		// A known protocol error proves register reached a verified WSS peer.
+		_ = wsJSON(ctx, c, map[string]any{"type": "not_a_challenge"})
+		_, _, _ = c.Read(ctx)
+	}))
+	server.Config.ErrorLog = log.New(io.Discard, "", 0)
+	server.StartTLS()
+	defer server.Close()
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, caFile, signalURL string
+		verified                bool
+	}{
+		{"system_only_rejects", "", "wss" + strings.TrimPrefix(server.URL, "https") + "/signal/instance", false},
+		{"custom_ca_connects", caPath, "wss" + strings.TrimPrefix(server.URL, "https") + "/signal/instance", true},
+		{"wrong_hostname_rejected", caPath, strings.Replace("wss"+strings.TrimPrefix(server.URL, "https")+"/signal/instance", "127.0.0.1", "localhost", 1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Mode: "prototype", SignalURL: tc.signalURL, SignalCAFile: tc.caFile, BridgeURL: "http://127.0.0.1:1234", BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(t.TempDir(), "state.json")}
+			r, err := New(cfg, func(any) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			bridge := r.client.Transport.(*http.Transport)
+			signal := r.signalClient.Transport.(*http.Transport)
+			if bridge == signal || bridge.TLSClientConfig != nil || signal.TLSClientConfig == nil || signal.TLSClientConfig.MinVersion != tls.VersionTLS12 || signal.TLSClientConfig.InsecureSkipVerify {
+				t.Fatal("signaling trust leaked or TLS verification weakened")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			err = r.register(ctx)
+			if err == nil || (err.Error() == "challenge") != tc.verified {
+				t.Fatalf("WSS verification result: %v (verified=%v)", err, tc.verified)
+			}
+			if tc.name == "system_only_rejects" {
+				var unknown x509.UnknownAuthorityError
+				if !errors.As(err, &unknown) {
+					t.Fatal("must reject for untrusted CA, not a network/protocol failure", err)
+				}
+			}
+			if tc.name == "wrong_hostname_rejected" {
+				var mismatch x509.HostnameError
+				if !errors.As(err, &mismatch) {
+					t.Fatal("must retain TLS hostname verification", err)
+				}
+			}
+		})
+	}
+}
 
 func TestControlStrictBounded(t *testing.T) {
 	for _, s := range []string{`{"type":"auth","token":"x","target":"evil"}`, `{"type":"auth"} {}`, `{"type":"auth"} INVALID`, strings.Repeat(" ", FrameBytes+1), `{"type":"request.open","streamId":4294967296}`} {
@@ -194,6 +315,73 @@ func TestCancelledReceiptAndBodyLimit(t *testing.T) {
 	}
 }
 
+func TestOfferTicketClockBoundaries(t *testing.T) {
+	// Test both whole and fractional seconds against wire-format Unix seconds.
+	for _, nanos := range []int64{0, 999999999} {
+		now := time.Unix(1800000000, nanos)
+		base := Signal{Offer: "v=0\r\n", Ticket: Ticket{InstanceID: "instance", SessionID: strings.Repeat("s", 16), OfferHash: Hash("v=0\r\n")}}
+		for _, tc := range []struct {
+			offset int64
+			want   string
+		}{
+			{-1, "ticket_expired"},
+			{0, "ticket_expired"},
+			{1, ""},
+			{60, ""},
+			{61, ""},
+			{64, ""},
+			{65, ""},
+			{66, "ticket_future"},
+		} {
+			s := base
+			s.Ticket.ExpiresAt = now.Unix() + tc.offset
+			err := validateOfferTicket(s, "instance", now)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("nanos=%d offset=%d: %v", nanos, tc.offset, err)
+				}
+			} else if err == nil || err.Error() != tc.want || safeErrorCode(err) != tc.want {
+				t.Fatalf("nanos=%d offset=%d: got %v, want %s", nanos, tc.offset, err, tc.want)
+			}
+		}
+	}
+}
+
+func TestOfferTicketPreflightSafeErrors(t *testing.T) {
+	now := time.Unix(1800000000, 0)
+	base := Signal{Offer: "v=0\r\n", Ticket: Ticket{InstanceID: "instance", SessionID: strings.Repeat("s", 16), OfferHash: Hash("v=0\r\n"), ExpiresAt: now.Unix() + 60}}
+	for _, tc := range []struct {
+		name, want string
+		change     func(*Signal)
+	}{
+		{"sdp_empty", "ticket_sdp", func(s *Signal) { s.Offer = "" }},
+		{"sdp_relay", "ticket_sdp", func(s *Signal) { s.Offer = "v=0\na=candidate:1 1 UDP 1 127.0.0.1 1 typ relay" }},
+		{"hash", "ticket_hash", func(s *Signal) { s.Ticket.OfferHash = "secret-mismatched-hash" }},
+		{"identity", "ticket_identity", func(s *Signal) { s.Ticket.InstanceID = "secret-other-instance" }},
+		{"expired", "ticket_expired", func(s *Signal) { s.Ticket.ExpiresAt = now.Unix() }},
+		{"future", "ticket_future", func(s *Signal) { s.Ticket.ExpiresAt = now.Unix() + 66 }},
+		{"session_short", "ticket_session", func(s *Signal) { s.Ticket.SessionID = strings.Repeat("s", 15) }},
+		{"session_long", "ticket_session", func(s *Signal) { s.Ticket.SessionID = strings.Repeat("s", 129) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base
+			tc.change(&s)
+			err := validateOfferTicket(s, "instance", now)
+			if err == nil || err.Error() != tc.want || safeErrorCode(err) != tc.want {
+				t.Fatalf("got %v, want safe code %s", err, tc.want)
+			}
+			if safeErrorCode(errors.New(tc.want+": secret")) != "protocol_rejected" {
+				t.Fatal("safe error whitelist accepted appended sensitive content")
+			}
+		})
+	}
+	s := base
+	s.Ticket.SessionID = strings.Repeat("s", 128)
+	if err := validateOfferTicket(s, "instance", now); err != nil {
+		t.Fatal("maximum session length rejected", err)
+	}
+}
+
 func TestTicketOfferBinding(t *testing.T) {
 	r, done := testRuntime(t, func(http.ResponseWriter, *http.Request) {})
 	defer done()
@@ -224,6 +412,12 @@ func TestTicketOfferBinding(t *testing.T) {
 	}
 	if e := r.offer(context.Background(), Signal{Ticket: ticket, Offer: offer + "x", OfferSignature: sig}); e == nil {
 		t.Fatal("offer hash")
+	}
+	// Clock-skew tolerance must not weaken coordinator signature verification.
+	bad = ticket
+	bad.ExpiresAt = time.Now().Add(61 * time.Second).Unix()
+	if err := r.offer(context.Background(), Signal{Ticket: bad, Offer: offer, OfferSignature: sig}); err == nil || err.Error() != "offer_auth" {
+		t.Fatal("future-skew allowance bypassed ticket signature verification", err)
 	}
 	r.pending[i.ID] = "occupied"
 	if e := r.offer(context.Background(), Signal{Ticket: ticket, Offer: offer, OfferSignature: sig}); e == nil {
@@ -334,7 +528,7 @@ func TestLogicalSocketUpgradeAndEcho(t *testing.T) {
 		<-req.Context().Done()
 	}))
 	defer srv.Close()
-	r, e := New(Config{SignalURL: "ws://127.0.0.1:1/signal/instance", BridgeURL: srv.URL, BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(t.TempDir(), "state.json"), AllowLocalhost: true}, func(any) {})
+	r, e := New(Config{Mode: "prototype", SignalURL: "ws://127.0.0.1:1/signal/instance", BridgeURL: srv.URL, BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(t.TempDir(), "state.json"), AllowLocalhost: true}, func(any) {})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -371,7 +565,15 @@ func TestLogicalSocketUpgradeAndEcho(t *testing.T) {
 	if e = s.enqueue(`{"type":"ping"}`); e != nil {
 		t.Fatal(e)
 	}
-	await("socket.message")
+	select {
+	case v := <-p.priority:
+		f, err := DecodeSocketFrame(v.data)
+		if err != nil || !v.binary || string(f.Payload) != `{"type":"ping"}` || !f.End {
+			t.Fatal("socket binary framing", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("socket frame timeout")
+	}
 	s.close()
 	await("socket.close")
 	p.mu.Lock()

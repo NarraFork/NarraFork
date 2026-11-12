@@ -1,9 +1,13 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { QueryClientContext, useQuery } from "@tanstack/react-query";
 import { useCallback, useContext, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
 
 function outlineOn(data: unknown): boolean {
-	return (data as { outline?: { enabled?: unknown } } | undefined)?.outline?.enabled === true;
+	return (
+		!REMOTE_BUILD &&
+		(data as { outline?: { enabled?: unknown } } | undefined)?.outline?.enabled === true
+	);
 }
 
 /**
@@ -14,7 +18,11 @@ function outlineOn(data: unknown): boolean {
  * answer 404, and the pages and entry points hide themselves.
  */
 export function useOutlineEnabled(): { enabled: boolean; loading: boolean } {
-	const { data, isLoading } = useQuery({ queryKey: ["settings"], queryFn: api.getSettings });
+	const { data, isLoading } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		enabled: !REMOTE_BUILD,
+	});
 	return { enabled: outlineOn(data), loading: isLoading };
 }
 
@@ -32,7 +40,7 @@ export function useOutlineEnabledInCache(): boolean {
 		[client],
 	);
 	return useSyncExternalStore(
-		client ? subscribe : noSubscription,
+		!REMOTE_BUILD && client ? subscribe : noSubscription,
 		() => outlineOn(client?.getQueryData(["settings"])),
 		() => false,
 	);

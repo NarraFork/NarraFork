@@ -34,6 +34,7 @@ import {
 import { GenUICard } from "@frontend/components/gen-ui/GenUICard";
 import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { resolveServerUrl } from "@frontend/lib/base-path";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { useOutlineLinkProps } from "@frontend/lib/outline-opener";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
@@ -86,6 +87,7 @@ import {
 } from "@tabler/icons-react";
 import type { ComponentType, ReactNode } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { RemoteUnsupported } from "../../RemoteUnsupported";
 import { resolveToolRowStatusMark, TraceRowStatusGlyph } from "./trace-row-status";
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
@@ -1521,6 +1523,7 @@ export const __TEST__shareLinkForCopy = shareLinkForCopy;
 
 /** Action controls on a meta row: the share card's download + copy-link buttons. */
 function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: DetailLabels }) {
+	if (REMOTE_BUILD) return <RemoteUnsupported />;
 	return (
 		<Group gap="xs" wrap="nowrap" style={{ height: "100%", alignItems: "center" }}>
 			{actions.map((action) => {
@@ -1718,7 +1721,10 @@ function DetailBlocks({
 					) : null;
 					// A row/entry whose text is a link paints an anchor overlay so the
 					// measured line geometry stays authoritative.
-					const href = typeof data.href === "string" ? data.href : null;
+					const href =
+						typeof data.href === "string" && (!REMOTE_BUILD || /^https?:\/\//i.test(data.href))
+							? data.href
+							: null;
 					const dimmed = data.dimmed === true;
 					// A warning-toned error line is a DENIED PLAN's reviewer feedback: the
 					// user's own note back to the model, not a tool failure. The chunked
@@ -2119,7 +2125,9 @@ export function RenderToolBody({
 		[blocks, frame, contentWidth, frame.contentHeight, frame.usedWidth],
 	);
 	if (model.kind === "gen-ui")
-		return (
+		return REMOTE_BUILD ? (
+			<RemoteUnsupported />
+		) : (
 			<GenUICard
 				narratorId={narratorId}
 				file={model.file}

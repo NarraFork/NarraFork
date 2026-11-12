@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { generate } from "selfsigned";
 import {
 	type CoordinatorOptions,
 	startCoordinator,
@@ -21,6 +22,10 @@ type Coordinator = Awaited<ReturnType<typeof startCoordinator>>;
 type Message = Record<string, unknown>;
 const coordinators: Coordinator[] = [];
 const clients: Client[] = [];
+// lib.dom omits Bun's supported per-client TLS constructor overload.
+const BunWebSocket = WebSocket as typeof WebSocket & {
+	new (url: string, options?: Bun.WebSocketOptions): WebSocket;
+};
 
 class Client {
 	ws: WebSocket;
@@ -33,8 +38,8 @@ class Client {
 	}[] = [];
 	opened: Promise<void>;
 	closed: Promise<void>;
-	constructor(url: string) {
-		this.ws = new WebSocket(url);
+	constructor(url: string, trustedCert?: string) {
+		this.ws = new BunWebSocket(url, trustedCert ? { tls: { ca: trustedCert } } : undefined);
 		this.opened = new Promise((resolve, reject) => {
 			this.ws.addEventListener("open", () => resolve(), { once: true });
 			this.ws.addEventListener("error", () => reject(new Error("UPGRADE_FAILED")), { once: true });
@@ -99,10 +104,11 @@ async function register(
 	a: Coordinator,
 	identity?: Identity,
 	list?: Awaited<ReturnType<typeof discovery>>[],
+	trustedCert?: string,
 ) {
 	const discoveries = list ?? [await discovery()];
 	const key = identity ?? (await generateIdentity());
-	const client = new Client(a.signalUrl);
+	const client = new Client(a.signalUrl, trustedCert);
 	await client.opened;
 	const challenge = await client.next("challenge");
 	const signature = await sign(key.privateKey, "register", [
@@ -120,9 +126,10 @@ async function offer(
 	targetId = "invite-1",
 	sdp = SDP,
 	key?: Identity,
+	trustedCert?: string,
 ) {
 	const identity = key ?? (await generateIdentity());
-	const client = new Client(a.signalUrl.replace("/instance", "/browser"));
+	const client = new Client(a.signalUrl.replace("/instance", "/browser"), trustedCert);
 	await client.opened;
 	const message = {
 		type: "connect",
@@ -139,9 +146,17 @@ async function offer(
 	};
 	return { client, key: identity, message };
 }
-async function connected(a: Coordinator) {
-	const b = await register(a);
-	const c = await offer(a, String(b.registered.instanceId));
+async function connected(a: Coordinator, trustedCert?: string) {
+	const b = await register(a, undefined, undefined, trustedCert);
+	const c = await offer(
+		a,
+		String(b.registered.instanceId),
+		"test_capability",
+		"invite-1",
+		SDP,
+		undefined,
+		trustedCert,
+	);
 	c.client.send(c.message);
 	const request = await b.client.next("offer");
 	const ticket = request.ticket as Ticket;
@@ -179,6 +194,68 @@ describe("isolated coordinator control plane", () => {
 			a.publicKey,
 		);
 		expect((await fetch(`${a.origin}/signal/browser?token=not-allowed`)).status).toBe(400);
+	});
+
+	test("public bind requires explicit TLS opt-in and a complete certificate/key", async () => {
+		for (const host of ["0.0.0.0", "::", "192.0.2.1"]) {
+			for (const options of [
+				{},
+				{ allowLocalhost: true },
+				{ allowLocalhost: true, allowPublicTls: true },
+				{ tls: { cert: "certificate", key: "key" } },
+			]) {
+				await expect(startCoordinator({ host, ...options })).rejects.toThrow("Non-loopback");
+			}
+		}
+		for (const tls of [
+			{ cert: "certificate" },
+			{ key: "key" },
+			{ cert: "", key: "key" },
+			{ cert: "certificate", key: "" },
+		]) {
+			await expect(
+				startCoordinator({
+					host: "0.0.0.0",
+					allowLocalhost: true,
+					allowPublicTls: true,
+					tls: tls as CoordinatorOptions["tls"],
+				}),
+			).rejects.toThrow("TLS requires both cert and key");
+		}
+	});
+
+	test("opted-in TLS listener serves HTTPS assets and negotiates over WSS", async () => {
+		const pems = await generate([{ name: "commonName", value: "localhost" }], {
+			algorithm: "sha256",
+			extensions: [
+				{ name: "basicConstraints", cA: true },
+				{ name: "keyUsage", digitalSignature: true, keyEncipherment: true, keyCertSign: true },
+				{ name: "extKeyUsage", serverAuth: true },
+				{ name: "subjectAltName", altNames: [{ type: 7, ip: "127.0.0.1" }] },
+			],
+		});
+		const a = await coordinator({
+			host: "0.0.0.0",
+			allowLocalhost: false,
+			allowPublicTls: true,
+			tls: { cert: pems.cert, key: pems.private },
+			assetHandler: () => new Response("tls shell"),
+		});
+		expect(a.origin).toBe(`https://0.0.0.0:${a.server.port}`);
+		expect(a.signalUrl).toBe(`wss://0.0.0.0:${a.server.port}/signal/instance`);
+		// Trust this test's certificate only; no process/global trust overrides.
+		const origin = a.origin.replace("0.0.0.0", "127.0.0.1");
+		const tls = { ca: pems.cert };
+		expect(await (await fetch(origin, { tls })).text()).toBe("tls shell");
+		const forbidden = await fetch(`${origin}/api/auth/me`, { tls });
+		expect(forbidden.status).toBe(404);
+		expect(await forbidden.json()).toEqual({ error: "BUSINESS_ROUTES_FORBIDDEN" });
+		const { result, ticket } = await connected(
+			{ ...a, signalUrl: a.signalUrl.replace("0.0.0.0", "127.0.0.1") },
+			pems.cert,
+		);
+		expect(result.sessionId).toBe(ticket.sessionId);
+		expect(result.answer).toBe(ANSWER);
 	});
 
 	test("registers fingerprint, stores only bounded hashes, signs ticket and binds answer", async () => {

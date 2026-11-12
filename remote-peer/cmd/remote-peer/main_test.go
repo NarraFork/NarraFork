@@ -71,7 +71,7 @@ func TestVersionBinaryDoesNotReadStdinOrCreateState(t *testing.T) {
 		}
 		binary := filepath.Join(dir, name)
 		buildArgs := []string{"build", "-trimpath", "-buildvcs=false", "-o", binary}
-		want := versionInfo{"dev", "unknown", "unknown", 1, runtime.Version()}
+		want := versionInfo{"dev", "unknown", "unknown", 2, runtime.Version()}
 		if injected {
 			want.Version = "0.1.0-alpha.1"
 			want.Commit = strings.Repeat("a", 40)
@@ -120,7 +120,7 @@ func TestVersionBinaryDoesNotReadStdinOrCreateState(t *testing.T) {
 				t.Fatalf("version: %v, stderr=%q", err, stderr.String())
 			}
 			if len(args) == 1 {
-				if !strings.Contains(stdout.String(), "narrafork-remote-peer "+want.Version) || !strings.Contains(stdout.String(), "protocol 1") {
+				if !strings.Contains(stdout.String(), "narrafork-remote-peer "+want.Version) || !strings.Contains(stdout.String(), "protocol 2") {
 					t.Fatalf("human-readable version: %q", stdout.String())
 				}
 				continue

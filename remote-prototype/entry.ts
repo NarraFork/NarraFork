@@ -49,6 +49,7 @@ function connected(): PrototypeClient {
 }
 function options() {
 	return {
+		mode: "prototype" as const,
 		expectedInstanceId: expectedInput.value.trim() || undefined,
 		allowLocalhost: localInput.checked,
 		stunUrls: stunInput.value

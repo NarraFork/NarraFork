@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { Box, Button, Group, Loader, Modal, Text } from "@mantine/core";
 import {
 	SHARE_CONTENT_TIMEOUT_MS,
@@ -11,6 +12,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getShikiLang } from "../../../../lib/shiki-lang";
 import { useImageViewer } from "../../../common/image-viewer-context";
+import { RemoteUnsupported } from "../../RemoteUnsupported";
 import {
 	formatShareJson,
 	readShareHtml,
@@ -306,7 +308,9 @@ function SharePreviewBody({
 	);
 }
 
-export function ShareFilePreview({
+export const ShareFilePreview = REMOTE_BUILD ? RemoteUnsupported : LocalShareFilePreview;
+
+function LocalShareFilePreview({
 	preview,
 	height,
 	displayWidth,

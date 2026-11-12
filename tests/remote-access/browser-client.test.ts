@@ -18,6 +18,13 @@ import {
 	LIMITS,
 	VERSION,
 } from "../../shared/remote-access/protocol";
+import {
+	decodeSocketFrame,
+	encodeSocketFrame,
+	SOCKET_FRAGMENT_BYTES,
+	SOCKET_MESSAGE_BYTES,
+	SocketAssembly,
+} from "../../shared/remote-access/socket-frames";
 
 class FakeChannel extends EventTarget {
 	readyState: RTCDataChannelState = "open";
@@ -63,11 +70,12 @@ function setup(options: ConstructorParameters<typeof PrototypeTransport>[1] = {}
 	};
 	const transport = PrototypeTransport.fromChannels(
 		channels as unknown as ConstructorParameters<typeof PrototypeTransport>[0],
-		options,
+		{ mode: "prototype", ...options },
 	);
 	active.push(transport);
 	channels.control.control({
 		type: "hello.ready",
+		version: VERSION,
 		grantId: "grant",
 		discoveryCapability: "capability",
 		expiresAt: Math.floor(Date.now() / 1000) + 3600,
@@ -291,6 +299,42 @@ describe("browser HTTP frame and credit transport", () => {
 		frame(fixture.bulk, id, 0);
 		expect((await promise).body).toBeNull();
 	});
+	test("upload progress describes admitted bytes and reaches completion after END", async () => {
+		const fixture = setup();
+		await activate(fixture);
+		const progress: number[] = [];
+		fixture.control.onsend = (data) => {
+			if (typeof data !== "string") return;
+			const message = JSON.parse(data);
+			if (message.type === "request.open")
+				fixture.control.control({ type: "request.accept", streamId: message.streamId });
+		};
+		fixture.bulk.onsend = (data) => {
+			if (typeof data === "string") return;
+			const sent = decodeFrame(data);
+			if (sent.kind === FRAME_DATA)
+				fixture.control.control({
+					type: "window.update",
+					streamId: sent.streamId,
+					bytes: sent.payload.length,
+				});
+			else {
+				head(fixture.control, sent.streamId, 204);
+				frame(fixture.bulk, sent.streamId, 0);
+			}
+		};
+		const response = await fixture.transport.upload(
+			"/api/upload",
+			new Blob([new Uint8Array(100000)]),
+			{ onProgress: (fraction) => progress.push(fraction) },
+		);
+		await tick();
+		expect(response.status).toBe(204);
+		expect(progress[0]).toBe(0);
+		expect(progress.at(-1)).toBe(1);
+		expect(progress.some((fraction) => fraction > 0 && fraction < 1)).toBe(true);
+		expect(progress).toEqual([...progress].sort((a, b) => a - b));
+	});
 	test("consumer demand alone replenishes receive credit, excessive peer credit fails closed", async () => {
 		const fixture = setup();
 		await activate(fixture);
@@ -505,16 +549,24 @@ describe("browser authentication and logical sockets", () => {
 		expect(socket.readyState).toBe(socket.OPEN);
 		socket.send('{"type":"ping"}');
 		await tick();
-		expect(fixture.realtime.json().some((message) => message.type === "socket.send")).toBe(true);
+		const sent = fixture.realtime.sent.find((message) => typeof message !== "string") as Uint8Array;
+		expect(new TextDecoder().decode(decodeSocketFrame(sent).payload)).toBe('{"type":"ping"}');
 		let received = "";
 		socket.onmessage = (event) => {
 			received = event.data;
 		};
-		fixture.realtime.control({
-			type: "socket.message",
-			streamId: socket.streamId,
-			message: '{"type":"pong"}',
-		});
+		const payload = new TextEncoder().encode('{"type":"pong"}');
+		fixture.realtime.message(
+			encodeSocketFrame({
+				streamId: socket.streamId,
+				messageId: 1,
+				sequence: 0,
+				opcode: 1,
+				total: payload.length,
+				end: true,
+				payload,
+			}),
+		);
 		expect(received).toBe('{"type":"pong"}');
 		const connecting = fixture.transport.openSocket("/ws/narrator", "jwt");
 		connecting.close();
@@ -528,6 +580,159 @@ describe("browser authentication and logical sockets", () => {
 					(message) => message.type === "socket.close" && message.streamId === connecting.streamId,
 				),
 		).toBe(true);
+	});
+	test("2 MiB text and binary messages fragment across credit windows and preserve close codes", async () => {
+		const fixture = setup();
+		await activate(fixture);
+		const socket = fixture.transport.openSocket("/ws/narrator", "jwt");
+		fixture.realtime.control({ type: "socket.ready", streamId: socket.streamId });
+		await socket.ready;
+		const frames: ReturnType<typeof decodeSocketFrame>[] = [];
+		fixture.realtime.onsend = (data) => {
+			if (typeof data === "string") return;
+			const frame = decodeSocketFrame(data);
+			frames.push(frame);
+			if (frame.payload.length)
+				fixture.realtime.control({
+					type: "socket.window",
+					streamId: socket.streamId,
+					bytes: frame.payload.length,
+				});
+		};
+		const text = "x".repeat(SOCKET_MESSAGE_BYTES);
+		socket.send(text);
+		for (let i = 0; i < 30 && socket.bufferedAmount; i++) await tick();
+		expect(socket.bufferedAmount).toBe(0);
+		expect(frames.length).toBeGreaterThan(100);
+		expect(frames.reduce((total, frame) => total + frame.payload.length, 0)).toBe(
+			SOCKET_MESSAGE_BYTES,
+		);
+		expect(frames.at(-1)?.end).toBe(true);
+		let received: unknown;
+		socket.binaryType = "arraybuffer";
+		socket.onmessage = (event) => {
+			received = event.data;
+		};
+		const data = new Uint8Array(SOCKET_MESSAGE_BYTES).fill(200);
+		for (let offset = 0, sequence = 0; offset < data.length; sequence++) {
+			const payload = data.subarray(offset, offset + SOCKET_FRAGMENT_BYTES);
+			offset += payload.length;
+			fixture.realtime.message(
+				encodeSocketFrame({
+					streamId: socket.streamId,
+					messageId: 1,
+					sequence,
+					opcode: 2,
+					total: data.length,
+					end: offset === data.length,
+					payload,
+				}),
+			);
+			await tick();
+		}
+		expect(received).toBeInstanceOf(ArrayBuffer);
+		expect(new Uint8Array(received as ArrayBuffer)).toEqual(data);
+		expect(fixture.transport.queueBytes.incoming).toBe(0);
+		let code = 0;
+		socket.onclose = (event) => {
+			code = event.code;
+		};
+		fixture.realtime.control({
+			type: "socket.close",
+			streamId: socket.streamId,
+			code: 4001,
+			reason: "session_revoked",
+		});
+		expect(code).toBe(4001);
+	});
+	test("half-message close frees reservation and oversized or reordered assemblies fail", async () => {
+		const fixture = setup();
+		await activate(fixture);
+		const socket = fixture.transport.openSocket("/ws/narrator", "jwt");
+		fixture.realtime.control({ type: "socket.ready", streamId: socket.streamId });
+		await socket.ready;
+		fixture.realtime.message(
+			encodeSocketFrame({
+				streamId: socket.streamId,
+				messageId: 1,
+				sequence: 0,
+				opcode: 1,
+				total: SOCKET_MESSAGE_BYTES,
+				end: false,
+				payload: new Uint8Array([120]),
+			}),
+		);
+		expect(fixture.transport.queueBytes.incoming).toBe(SOCKET_MESSAGE_BYTES);
+		socket.close();
+		expect(fixture.transport.queueBytes.incoming).toBe(0);
+		let reserved = 0;
+		const assembly = new SocketAssembly(
+			(n) => {
+				reserved += n;
+			},
+			(n) => {
+				reserved -= n;
+			},
+			10,
+		);
+		const frame = {
+			streamId: 1,
+			messageId: 1,
+			sequence: 0,
+			opcode: 1 as const,
+			total: 100,
+			end: false,
+			payload: new Uint8Array([120]),
+		};
+		assembly.accept(frame, 0);
+		expect(() => assembly.accept({ ...frame, sequence: 1 }, 11)).toThrow("socket_sequence");
+		assembly.cancel();
+		expect(reserved).toBe(0);
+		expect(() => encodeSocketFrame({ ...frame, total: SOCKET_MESSAGE_BYTES + 1 })).toThrow(
+			"invalid_socket_frame",
+		);
+	});
+	test("production requires trusted identity and rejects ready identity drift", async () => {
+		const invalid = setup({ mode: undefined });
+		await expect(invalid.transport.paired).rejects.toThrow();
+		const channels = {
+			control: new FakeChannel(),
+			realtime: new FakeChannel(),
+			bulk: new FakeChannel(),
+		};
+		const client = PrototypeTransport.fromChannels(
+			channels as unknown as ConstructorParameters<typeof PrototypeTransport>[0],
+		);
+		active.push(client);
+		const identity = {
+			nfVersion: "1.2.3",
+			sourceCommit: "a".repeat(40),
+			repository: "owner/repo",
+			bootstrapAbi: 1,
+			apiEpoch: 1,
+			wireVersion: 2,
+			capabilities: ["projects"],
+		};
+		channels.control.control({
+			type: "hello.ready",
+			version: VERSION,
+			grantId: "grant",
+			expiresAt: Math.floor(Date.now() / 1000) + 3600,
+			backendIdentity: identity,
+		});
+		await client.paired;
+		expect(client.backendIdentity?.nfVersion).toBe("1.2.3");
+		const copy = client.backendIdentity;
+		if (copy) copy.nfVersion = "9.9.9";
+		expect(client.backendIdentity?.nfVersion).toBe("1.2.3");
+		const pending = client.authenticate("nfs_opaque");
+		await tick();
+		channels.control.control({
+			type: "ready",
+			version: VERSION,
+			backendIdentity: { ...identity, sourceCommit: "b".repeat(40) },
+		});
+		await expect(pending).rejects.toThrow("version_mismatch");
 	});
 	test("socket budget is eight and JSON control envelope is bounded", async () => {
 		const fixture = setup();

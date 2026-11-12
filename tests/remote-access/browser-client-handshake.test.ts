@@ -18,11 +18,12 @@ class Channel extends EventTarget {
 	}
 	send(data: unknown) {
 		this.sent.push(data);
-		if (this.label !== "nf.control.v1" || typeof data !== "string") return;
+		if (this.label !== "nf.control.v2" || typeof data !== "string") return;
 		const message = JSON.parse(data);
 		if (message.type === "hello")
 			this.receive({
 				type: "hello.ready",
+				version: VERSION,
 				grantId: "grant",
 				discoveryCapability: "discovery-grant",
 				expiresAt: Math.floor(Date.now() / 1000) + 3600,
@@ -155,6 +156,7 @@ async function fixture(mutate?: (answer: Record<string, unknown>) => void) {
 		return answer;
 	});
 	const options: ConnectOptions = {
+		mode: "prototype",
 		allowLocalhost: true,
 		expectedInstanceId: id,
 		persistGrant: false,
@@ -175,15 +177,15 @@ describe("browser signed nontrickle handshake", () => {
 		const client = await PrototypeClient.connect(data.invitation, data.options);
 		clients.push(client);
 		expect([...data.peer.channels.keys()]).toEqual([
-			"nf.control.v1",
-			"nf.realtime.v1",
-			"nf.bulk.v1",
+			"nf.control.v2",
+			"nf.realtime.v2",
+			"nf.bulk.v2",
 		]);
 		expect(data.signal.sent).toHaveLength(1);
 		expect(data.signal.sent[0]?.pairingSecret).toBeUndefined();
 		expect(data.signal.sent[0]?.token).toBeUndefined();
 		expect(typeof data.signal.sent[0]?.offerSignature).toBe("string");
-		const control = data.peer.channels.get("nf.control.v1");
+		const control = data.peer.channels.get("nf.control.v2");
 		expect(JSON.parse(String(control?.sent[0])).pairingSecret).toBe(data.invitation.pairingSecret);
 		await client.authenticate("secret-jwt");
 		expect(JSON.parse(String(control?.sent[1])).token).toBe("secret-jwt");
@@ -221,7 +223,7 @@ describe("browser signed nontrickle handshake", () => {
 		await expect(PrototypeClient.connect(data.invitation, data.options)).rejects.toThrow(
 			"relay_or_unknown_selected_pair",
 		);
-		expect(data.peer.channels.get("nf.control.v1")?.sent).toHaveLength(0);
+		expect(data.peer.channels.get("nf.control.v2")?.sent).toHaveLength(0);
 	});
 	test("negotiated SCTP smaller than contract frames is explicitly unsupported", async () => {
 		const data = await fixture();

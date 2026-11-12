@@ -20,6 +20,7 @@ import {
 	ReceiveWindow,
 	SendCredit,
 } from "../../shared/remote-access/protocol";
+import { decodeSocketFrame, encodeSocketFrame } from "../../shared/remote-access/socket-frames";
 import vectors from "../../shared/remote-access/vectors.json";
 
 describe("remote access cross-language protocol", () => {
@@ -60,6 +61,21 @@ describe("remote access cross-language protocol", () => {
 		const decoded = decodeFrame(unhex(vectors.frameHex));
 		expect(decoded.streamId).toBe(7);
 		expect(hex(decoded.payload)).toBe(vectors.frame.payloadHex);
+	});
+	test("v2 text/binary socket framing matches Go golden vector and rejects old wire", () => {
+		const expected = {
+			...vectors.socketFrame,
+			opcode: 2 as const,
+			payload: unhex(vectors.socketFrame.payloadHex),
+		};
+		expect(hex(encodeSocketFrame(expected))).toBe(vectors.socketFrameHex);
+		const frame = decodeSocketFrame(unhex(vectors.socketFrameHex));
+		expect(frame.opcode).toBe(2);
+		expect(frame.end).toBe(true);
+		expect(frame.total).toBe(3);
+		const old = unhex(vectors.socketFrameHex);
+		old[4] = 1;
+		expect(() => decodeSocketFrame(old)).toThrow("invalid_socket_frame");
 	});
 	test("malformed frames and oversized data are rejected before allocation", () => {
 		for (const offset of [0, 4, 5, 6, 16, 20]) {

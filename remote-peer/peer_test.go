@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -98,10 +99,14 @@ func TestTargetsHeadersConfig(t *testing.T) {
 		}
 	}
 	h, e := filteredHeaders([][2]string{{"Host", "evil"}, {"X-NarraFork-Bridge", "evil"}, {"X-Forwarded-For", "evil"}, {"Proxy-Authorization", "evil"}, {"Authorization", "Bearer jwt"}})
-	if e != nil || len(h) != 1 || h.Get("Authorization") != "Bearer jwt" {
+	if e == nil {
+		t.Fatal("forbidden headers accepted", h)
+	}
+	h, e = filteredHeaders([][2]string{{"Authorization", "Bearer jwt"}, {"X-File-Name", "%E4%B8%AD.txt"}})
+	if e != nil || len(h) != 2 {
 		t.Fatal(h, e)
 	}
-	cfg := Config{SignalURL: "ws://127.0.0.1:123/signal/instance", BridgeURL: "http://127.0.0.1:234", BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(t.TempDir(), "state.json"), AllowLocalhost: true}
+	cfg := Config{Mode: "prototype", SignalURL: "ws://127.0.0.1:123/signal/instance", BridgeURL: "http://127.0.0.1:234", BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(t.TempDir(), "state.json"), AllowLocalhost: true}
 	if e = cfg.Validate(); e != nil {
 		t.Fatal(e)
 	}
@@ -115,6 +120,151 @@ func TestTargetsHeadersConfig(t *testing.T) {
 		t.Fatal("bridge DNS")
 	}
 }
+func TestICEAndSignalConfigValidation(t *testing.T) {
+	base := Config{Mode: "prototype", SignalURL: "wss://example.test/signal/instance", BridgeURL: "http://127.0.0.1:1234", BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(t.TempDir(), "state.json")}
+	for _, tc := range []struct {
+		name   string
+		change func(*Config)
+		want   string
+	}{
+		{"public_plaintext", func(c *Config) { c.SignalURL = "ws://example.test/signal/instance"; c.AllowLocalhost = true }, "signal_tls"},
+		{"loopback_plaintext_disabled", func(c *Config) { c.SignalURL = "ws://127.0.0.1:1234/signal/instance" }, "signal_tls"},
+		{"relative_state", func(c *Config) { c.StatePath = "state.json" }, "isolated_state_required"},
+		{"production_state", func(c *Config) { c.StatePath = filepath.Join(t.TempDir(), ".narrafork", "state.json") }, "isolated_state_required"},
+		{"ca_nul", func(c *Config) { c.SignalCAFile = "ca\x00.pem" }, "signal_ca_file"},
+		{"ca_path_limit", func(c *Config) { c.SignalCAFile = strings.Repeat("x", 4097) }, "signal_ca_file"},
+		{"ip_limit", func(c *Config) { c.ICEIPAllowlist = make([]string, 65) }, "ice_config_limit"},
+		{"interface_limit", func(c *Config) { c.ICEInterfaceAllowlist = make([]string, 33) }, "ice_config_limit"},
+		{"network_limit", func(c *Config) { c.ICENetworkTypes = []string{"udp4", "udp6", "udp4"} }, "ice_config_limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.change(&cfg)
+			if err := cfg.Validate(); err == nil || err.Error() != tc.want {
+				t.Fatalf("got %v, want %s", err, tc.want)
+			}
+		})
+	}
+	for _, ip := range []string{"", "192.168.1.207/24", "example.test", "192.168.1.999", " 192.168.1.207", "fe80::1%eth0", "0.0.0.0", "::", "224.0.0.1", "ff02::1", "::ffff:0.0.0.0", "::ffff:224.0.0.1"} {
+		cfg := base
+		cfg.ICEIPAllowlist = []string{ip}
+		if err := cfg.Validate(); err == nil || err.Error() != "ice_ip_allowlist" {
+			t.Errorf("accepted invalid IP %q: %v", ip, err)
+		}
+	}
+	for _, name := range []string{"", "eth0\n", "eth\x000", strings.Repeat("x", 257)} {
+		cfg := base
+		cfg.ICEInterfaceAllowlist = []string{name}
+		if err := cfg.Validate(); err == nil || err.Error() != "ice_interface_allowlist" {
+			t.Errorf("accepted invalid interface %q: %v", name, err)
+		}
+	}
+	for _, network := range []string{"", "udp", "UDP4", "tcp4", "tcp6"} {
+		cfg := base
+		cfg.ICENetworkTypes = []string{network}
+		if err := cfg.Validate(); err == nil || err.Error() != "ice_network_types" {
+			t.Errorf("accepted invalid network %q: %v", network, err)
+		}
+	}
+	cfg := base
+	if err := json.Unmarshal([]byte(`{"iceIPAllowlist":["192.168.1.207","2001:db8::1"],"iceInterfaceAllowlist":["以太网"],"iceNetworkTypes":["udp4","udp6"]}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(cfg, func(any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	cfg.ICEIPAllowlist[0] = "10.126.0.1"
+	cfg.ICEInterfaceAllowlist[0] = "overlay"
+	cfg.ICENetworkTypes[0] = "udp6"
+	if r.cfg.ICEIPAllowlist[0] != "192.168.1.207" || r.cfg.ICEInterfaceAllowlist[0] != "以太网" || r.cfg.ICENetworkTypes[0] != "udp4" {
+		t.Fatal("runtime retains caller-owned mutable slices")
+	}
+}
+
+func TestICEAllowlistGathering(t *testing.T) {
+	// A real loopback candidate makes this independent of CI physical NIC names.
+	var loopbackName string
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, iface := range interfaces {
+		addresses, err := iface.Addrs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, address := range addresses {
+			ip, _, err := net.ParseCIDR(address.String())
+			if err == nil && ip.Equal(net.ParseIP("127.0.0.1")) {
+				loopbackName = iface.Name
+			}
+		}
+	}
+	if loopbackName == "" {
+		t.Fatal("IPv4 loopback required")
+	}
+	for _, tc := range []struct {
+		name            string
+		ips, interfaces []string
+		want            bool
+	}{
+		{"exact_ip", []string{"127.0.0.1"}, nil, true},
+		{"mapped_ipv4", []string{"::ffff:127.0.0.1"}, nil, true},
+		{"nonlocal_ip_excludes_all", []string{"192.0.2.1"}, nil, false},
+		{"exact_interface", []string{"127.0.0.1"}, []string{loopbackName}, true},
+		{"unknown_interface_excludes_all", []string{"127.0.0.1"}, []string{"nf-nonexistent-interface"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Mode: "prototype", AllowLocalhost: true, ICEIPAllowlist: tc.ips, ICEInterfaceAllowlist: tc.interfaces, ICENetworkTypes: []string{"udp4"}}
+			api := webrtc.NewAPI(webrtc.WithSettingEngine(cfg.iceSettingEngine()))
+			pc, err := api.NewPeerConnection(webrtc.Configuration{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pc.Close()
+			if _, err := pc.CreateDataChannel("control", nil); err != nil {
+				t.Fatal(err)
+			}
+			offer, err := pc.CreateOffer(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := webrtc.GatheringCompletePromise(pc)
+			if err := pc.SetLocalDescription(offer); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("ICE gather timeout")
+			}
+			sdp := pc.LocalDescription().SDP
+			if err := ValidateSDP(sdp); err != nil {
+				t.Fatal(err)
+			}
+			count := 0
+			for _, line := range strings.Split(sdp, "\n") {
+				if !strings.HasPrefix(line, "a=candidate:") {
+					continue
+				}
+				count++
+				fields := strings.Fields(line)
+				if len(fields) < 8 || fields[4] != "127.0.0.1" || !strings.EqualFold(fields[2], "udp") || fields[7] != "host" {
+					t.Fatal("unexpected IP/network/type candidate", line)
+				}
+			}
+			if (count > 0) != tc.want {
+				t.Fatalf("got %d candidates, want present=%v", count, tc.want)
+			}
+		})
+	}
+}
+
 func TestInviteAtomicReplay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	s, e := OpenStore(path)
@@ -177,7 +327,7 @@ func TestCreditSequence(t *testing.T) {
 func testRuntime(t *testing.T, handler http.HandlerFunc) (*Runtime, func()) {
 	t.Helper()
 	server := httptest.NewServer(handler)
-	r, e := New(Config{SignalURL: "ws://127.0.0.1:1/signal/instance", BridgeURL: server.URL, BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(t.TempDir(), "state.json"), AllowLocalhost: true}, func(any) {})
+	r, e := New(Config{Mode: "prototype", SignalURL: "ws://127.0.0.1:1/signal/instance", BridgeURL: server.URL, BridgeSecret: strings.Repeat("a", 32), StatePath: filepath.Join(t.TempDir(), "state.json"), AllowLocalhost: true}, func(any) {})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -291,9 +441,9 @@ func TestPionHTTPStreaming(t *testing.T) {
 	}
 	controls := make(chan map[string]any, 64)
 	frames := make(chan Frame, 128)
-	control, _ := client.CreateDataChannel("nf.control.v1", nil)
-	_, _ = client.CreateDataChannel("nf.realtime.v1", nil)
-	bulk, _ := client.CreateDataChannel("nf.bulk.v1", nil)
+	control, _ := client.CreateDataChannel("nf.control.v2", nil)
+	_, _ = client.CreateDataChannel("nf.realtime.v2", nil)
+	bulk, _ := client.CreateDataChannel("nf.bulk.v2", nil)
 	control.OnMessage(func(m webrtc.DataChannelMessage) {
 		var v map[string]any
 		if json.Unmarshal(m.Data, &v) == nil {

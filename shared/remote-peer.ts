@@ -10,7 +10,7 @@ export const REMOTE_PEER_PLATFORMS = [
 export type RemotePeerPlatform = (typeof REMOTE_PEER_PLATFORMS)[number];
 export const REMOTE_PEER_MANIFEST_FILENAME = "narrafork-remote-peer-manifest.json";
 export const REMOTE_PEER_LICENSE_FILES = ["remote-peer-LICENSES.txt"] as const;
-export const REMOTE_PEER_PROTOCOL_VERSION = 1;
+export const REMOTE_PEER_PROTOCOL_VERSION = 2;
 export const REMOTE_PEER_BINARY_MAX_BYTES = 32 * 1024 * 1024;
 export const REMOTE_PEER_MANIFEST_MAX_BYTES = 64 * 1024;
 export interface RemotePeerDistribution {

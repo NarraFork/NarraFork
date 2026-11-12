@@ -327,6 +327,8 @@ const externalWebSocketOriginSchema = z
  * Exported for tests: `update.serverUrl` is a code-delivery origin, so its https gate
  * is a security boundary rather than input hygiene and is asserted directly.
  */
+import { remoteAccessSettingsSchema } from "../lib/remote-access-config";
+
 export const updateSettingsSchema = z
 	.object({
 		// Optional request precondition, never a persisted setting.
@@ -753,6 +755,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		remoteAccess: remoteAccessSettingsSchema.optional(),
 		shares: z
 			.object({
 				defaultExpiryHours: z.number().int().min(1),

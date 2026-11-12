@@ -7,6 +7,7 @@ import {
 	unhex,
 } from "../shared/remote-access/identity";
 import { encodeFrame } from "../shared/remote-access/protocol";
+import { encodeSocketFrame } from "../shared/remote-access/socket-frames";
 
 // Publicly known scalar=1 is ONLY a cross-language test vector, never a runtime identity.
 const publicKey =
@@ -29,6 +30,26 @@ const label = "register";
 const fields = ["test-challenge", publicKey];
 const vectors = {
 	warning: "Public test key scalar=1; MUST NOT be used as runtime key",
+	socketFrameHex: hex(
+		encodeSocketFrame({
+			streamId: 9,
+			messageId: 1,
+			sequence: 0,
+			opcode: 2,
+			total: 3,
+			end: true,
+			payload: new Uint8Array([0, 128, 255]),
+		}),
+	),
+	socketFrame: {
+		streamId: 9,
+		messageId: 1,
+		sequence: 0,
+		opcode: 2,
+		total: 3,
+		end: true,
+		payloadHex: "0080ff",
+	},
 	publicKey,
 	instanceId: await instanceId(publicKey),
 	label,

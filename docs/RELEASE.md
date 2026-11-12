@@ -74,7 +74,24 @@ bun scripts/release.ts 0.6.1 --target=github --upload-only
 - 后续启用通过 `ensureRemotePeerBinary` 显式获取组件。GitHub直连从其 manifest/asset 下载；镜像模式从所选 serverUrl/product 获取二者，冷缓存也不请求 GitHub。按精确命名空间/tag/version/protocol/platform 及 size/SHA-256/架构验证；镜像失败只用同来源已验证缓存或明确失败，不回落 GitHub/官方仓库。
 - 同次主发布为新 peer 和 NF 保存各自 receipt；自动镜像先校验完整 receipt 集合，再分别同步，避免只镜像 NF 或互相覆盖。制作镜像的发布端可访问 GitHub，不要求下载主机具备此能力。镜像入库保留 metadata-only→binary 单调补齐与所有大小/数量限制。
 
-代码实现本身不触发发布；操作者照常发布 NF 时会自动处理所需 peer。真实发布仍只能在主仓库工作区或其受保护 CI 进行。当前 RTC 业务/安装 UI 尚未接入，独立包及发布能力不等于完整远程功能已上线。
+代码实现本身不触发发布；操作者照常发布 NF 时会自动处理所需 peer。真实发布仍只能在主仓库工作区或其受保护 CI 进行。M2 已接入真实核心业务与普通设置页的显式安装、启停、邀请/撤权；默认关闭，普通启动/状态查询零下载、零 peer 进程。实现及隔离验收不代表已部署官方远程服务，也不代表所有 NF 功能已支持远程。
+
+## 随正常 NF 发布的远程前端包（M2）
+
+远程前端不是另一个人工发布流程。主 Release plan 从精确 `target.commit` 读取 `shared/remote-access/frontend-capability.json` 并冻结；仅真实缺失声明的历史目标跳过，坏 JSON、未知契约或读取错误不得当成旧版本。声明目标经同一 reusable CI 构建普通与 remote 两个目标；普通 binary 仍只嵌入普通前端。
+
+同次 NF Release 额外发布：
+
+- `narrafork-<version>-remote-frontend.tar.gz`
+- `narrafork-<version>-remote-frontend.manifest.json`
+
+manifest 记录真实 NF release、仓库、source SHA、内容 buildId、bootstrap/API/wire 契约、入口/CSS 和完整文件大小/摘要。manifest 位于 archive 外，不做自哈希循环。预算为 manifest 1 MiB、archive 128 MiB、解包 512 MiB、单文件 64 MiB、文件数 4096；拒绝绝对/穿越路径、重复/大小写冲突、链接、特殊文件、未声明内容和坏摘要。
+
+CI 的 remote 产物按 run/attempt 封存；production UI 另供隔离浏览器网络边界测试。bundle 上限为 52 个文件，publisher 对 remote 两资产使用独立大小预算、私有快照与完整归档验证，缺一即失败。验证器封入可信 `control.js`，publisher 不安装依赖、不执行产物程序，也不依赖遗失的 worker 源文件。
+
+`source_run_id` 恢复原完整 bundle；`build_run_id` 重验路径冻结并下载原 remote artifact 的 ID/digest/size/run/attempt，不以当前源码重编补包。历史无 remote 的 plan 仍合法；已经公开的 Release 不补传、不覆盖资产。
+
+主程序 `SHA256SUMS`/`checksums.txt`、八平台 update-index v1 和主镜像 metadata/patch DTO 不加入 remote 两资产；新增 extra assets 不改变主镜像投影。本轮没有增加远程前端更新服务器镜像或自动公网部署。运营者使用 [构建指南](BUILD.md) 的独立 host CLI 导入多个 immutable 版本，并显式选择引导包/禁用记录；业务模块始终按 NF hello 精确选择，不按 peer pin 或 latest。
 
 ## GitHub Release CI
 
@@ -135,7 +152,7 @@ GitHub 是二进制、补丁、通道、摘要及说明的唯一权威。主程�
 - 不读取服务器版本列表、latest、fromVersion 元数据或旧二进制；历史不存在、版本号高低、旧补丁身份不再是上传门槛。无 patch 的 GitHub Release 可以成功 metadata-only。旧数据不扫描、迁移或删除。
 - 完整二进制只是 GitHub 下载描述。GitHub snapshot 中的历史条目不等于本地镜像了历史 patch；可用资产表只声明实际写入并校验的内容。服务器 latest 采用 canonical snapshot channel 指针，不通过历史记录的语义最大值选举。
 - 新镜像 API 按运营者配置的预期 GitHub 仓库验证 snapshot、tag、平台和文件身份。patch/辅助二进制真正流式计数/hash 后原子落盘，metadata 小请求分开提交，必要资产完成后才发布 snapshot/tag。辅助 projection 的可选 `binaries` 只含完整 manifest 对应的描述，不内嵌字节；最多16个、各32 MiB，沿用服务器磁盘配额/并发/空闲空间限制和单任务4 GiB预算。旧 metadata-only tag 可单调补入二进制；旧生产者重试不删除已有可用性，旧资产不扫描迁移。坏 hash、孤立 sidecar、截断、超限均拒绝；不能将错误伪装为无 patch。
-- 辅助客户端下载 manifest 仍只访问配置仓库固定 GitHub tag（及同仓库可信缓存）；镜像下载走 `/api/v3/products/<product>/mirror/tools/<kind>/<tag>/assets/<name>`，仅提交后的精确 tag 可见。字节校验失败、404或网络错误回退同仓库同 tag 的 GitHub，不回上游、不采用镜像 manifest 作为新权威；跨 origin 重定向拒绝，取消、整体 deadline、来源变更不启动 fallback。helper/executor 现有32 MiB、架构、协议、60/120秒客户端下载预算继续生效；一次操作冻结服务器/product/仓库与更新网络代理，安装票据保留原镜像身份。
+- 辅助客户端下载按配置选源：GitHub 模式访问固定仓库/tag；镜像模式的 manifest 与 binary 均走 `/api/v3/products/<product>/mirror/tools/<kind>/<tag>/assets/<name>`，仅提交后的精确 tag 可见，冷缓存也不请求 GitHub。坏 hash、404 或网络错误只允许使用同来源已验证缓存或明确失败，不回落 GitHub/上游。用户选择镜像即信任其清单，仍严格验证身份、大小、摘要及架构；拒绝跨 origin 重定向。helper/executor 现有 32 MiB、协议与 60/120 秒预算继续生效；操作冻结 server/product/repository/代理，安装票据保留镜像身份。主程序 patch/full 策略与辅助组件选源分开。
 - 镜像模式的客户端优先使用已镜像 direct patch；无适用 patch、base 不匹配、404/坏 hash、zstd 缺失或重建失败，转同一已选 GitHub 目标的 full，仍验 size/SHA512。用户取消和整体 deadline 不触发 fallback。不能靠跨源302让历史客户端获得该新行为，需要升级客户端与服务器协议。
 - **两种模式都不回传资产给 runner 做 hash 校验**：服务器负责流式大小/SHA256 校验及提交；direct 仅返回 `server-sha256` 小回执，旧服务器缺少该回执须升级，不恢复大文件 GET 兼容。必要的服务器本地提交复核仍保留。
 - receipt 区分 direct 的 `MIRRORED` / `METADATA_ONLY`、WebDAV 的 `STAGED_FOR_PULL`，以及 `SKIPPED_UNCONFIGURED` / `FAILED` 与部分完成。`verified` 表示服务器已校验，不再表示 runner 读回；WebDAV 暂存时该数组为空、`snapshotCommitted=false`。缺失 receipt 不等于成功。Core Gate 不看镜像结果。
@@ -217,7 +234,7 @@ runner 清理只在**该日期桶次日 UTC 零点 +7 天 +24 小时宽限 +10 �
 
 - rg 15.1.0 与 zstd 1.5.7 的六平台原始可执行文件、`helper-manifest-v1.json` 和许可附件放在同仓库不可变 `helpers-v1.0.0` Release。rg 由固定官方归档及归档/二进制双摘要制备；zstd 使用受控源码与工具链构建。新增 macOS zstd，Windows ARM64 使用原有确定性 recipe。Linux zstd 为 musl 静态包；rg Linux ARM64 是 glibc 包，不代表支持 Alpine/Termux。
 - executor 使用独立 `executor-v<组件版本>` Release 和 `narrafork-executor-manifest.json`。组件版本与协议由 `shared/component-versions.json` 显式锁定，不跟随主程序版本增长；例如主程序 0.9.2 或后续版本可以继续依赖 executor 0.9.1。仍校验外层仓库/tag/commit、组件版本、RPC 协议及六种 Go 平台，不通过 GitHub latest 选择工具，也不接受任意“同协议最新版”。两类辅助 Release 都不标记 latest、不写主 update-index、不占主程序资产预算。
-- 无论选择 GitHub 直连还是独立镜像，helper/executor 的权威都为配置的 canonical GitHub 仓库与固定tag，不使用 unsigned 旧tools接口、不默默回上游。fork 必须自行公开对应辅助 Release；独立服务器可承载 manifest/许可和经校验的真实二进制，选定镜像的客户端优先使用精确tag镜像，失败才转同仓库同tag GitHub。旧服务器/旧metadata-only镜像返回404时同样安全回退。
+- GitHub 模式从配置的 canonical 仓库固定 tag 获取 helper/executor；独立镜像模式则从选定服务器的精确 tag 获取 manifest、许可和二进制，不回退 GitHub/上游，也不使用 unsigned 旧 tools 接口。镜像运营者必须先升级支持该协议的服务器，并导入所需 `helpers-v1.0.0`、`executor-v<组件版本>` 资产；旧服务器或 metadata-only 镜像缺少资产时会明确失败，不能把 404 当作自动切源。fork 的发布端仍须自行公开对应辅助 Release，客户端选源与发布权威校验分开。
 - 系统 PATH 优先；托管缓存按来源/tag/版本/平台/摘要隔离，使用前核对 size/SHA256/架构。旧缓存仅可信摘要吻合才复制迁移，不删除旧文件。manifest 流式硬限 64 KiB/10 秒；helper 二进制 32 MiB/60 秒，executor 32 MiB/120 秒，父取消与独占 temp 清理贯穿下载。
 - executor 安装票据绑定选中的来源/tag/版本/平台/size/digest，下载不重新用最新 manifest 选包。目标机器从 NarraFork 获取验证后的产物，不接收服务端代理凭据。不安装系统包、不修改 PATH、不 sudo、不启动守护进程。
 - 新 build-info/sidecar/bundle 带 `helperDistribution` 依赖声明，构建开始时冻结，八平台必须一致；正常主程序 publisher 在远端写入前只读核验对应 helpers 和 executor 公开资产的完整集合、hash/size、许可及组件版本/协议。含独立组件配置的新目标还要比较实际 executor 构建输入，源码、依赖、生产嵌入资源、构建参数或固定 Go 工具链发生变化但未升级组件 pin 时拒绝复用；仅主程序、文档或纯测试变化不触发组件发布。build-only/dry-run 不因此联网或发布，旧 bundle 无声明时不凭当前代码编造新依赖；恢复原始 bundle 不采用控制脚本的当前 pin 改写旧产物。

@@ -1,4 +1,5 @@
 import { OutlineQuestionsForm } from "@frontend/components/outline/OutlineQuestions";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type ReactNode, useMemo } from "react";
 import type { MeasuredToolCall } from "./measure/measure-tool-call";
 import { toolUseIdFromSpecKey } from "./vlist-permission-match";
@@ -21,7 +22,7 @@ export function useOutlineAskSlots({
 }): ReadonlyMap<string, ReactNode> {
 	return useMemo(() => {
 		const slots = new Map<string, ReactNode>();
-		if (!enabled) return slots;
+		if (REMOTE_BUILD || !enabled) return slots;
 		for (const item of renderItems) {
 			if (item?.spec.kind !== "tool-call") continue;
 			if (!(item.measured as MeasuredToolCall).effectiveOpened) continue;

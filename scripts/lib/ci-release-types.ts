@@ -88,6 +88,8 @@ export interface CiReleaseArtifactIdentity {
 }
 /** Original build inputs; never a chain of re-verification runs. */
 export interface CiReleaseBuildSource {
+	/** Original remote artifact bound to this source run/attempt, never rebuilt on recovery. */
+	remoteFrontend?: CiReleaseArtifactIdentity;
 	runId: number;
 	runAttempt: number;
 	workflowCommit: string;
@@ -123,6 +125,8 @@ export interface CiReleasePlan {
 	componentEvidence?: CiReleaseComponentEvidence;
 	/** Optional for historical bundles; frozen before either NF or peer compilation. */
 	remotePeer?: RemotePeerReleasePlan;
+	/** Declaration read from the exact target commit; absent only for historical targets. */
+	remoteFrontend?: import("../../shared/remote-access/application").RemoteFrontendCapability;
 	/** Present only for native re-verification of byte-identical original builds. */
 	buildSource?: CiReleaseBuildSource;
 }

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -16,35 +18,42 @@ type incoming struct {
 	binary  bool
 }
 type outgoing struct {
-	channel string
-	data    []byte
-	binary  bool
+	queuedAt time.Time
+	channel  string
+	data     []byte
+	binary   bool
 }
 type Peer struct {
-	r                      *Runtime
-	pc                     *webrtc.PeerConnection
-	ticket                 Ticket
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	once                   sync.Once
-	mu                     sync.Mutex
-	channels               map[string]*webrtc.DataChannel
-	answerHash             string
-	grant                  string
-	token                  string
-	authExpires            int64
-	hello                  bool
-	authorized             bool
-	streams                map[uint32]*httpStream
-	retired                map[uint32]*httpStream
-	sockets                map[uint32]*logicalSocket
-	usedIDs                map[uint32]bool
-	inbox                  chan incoming
-	priority               chan outgoing
-	bulk                   chan outgoing
-	wake                   chan struct{}
-	queueMu                sync.Mutex
-	recvQueued, sendQueued int
+	r                            *Runtime
+	pc                           *webrtc.PeerConnection
+	ticket                       Ticket
+	ctx                          context.Context
+	cancel                       context.CancelFunc
+	once                         sync.Once
+	mu                           sync.Mutex
+	channels                     map[string]*webrtc.DataChannel
+	answerHash                   string
+	grant                        string
+	token                        string
+	authExpires                  int64
+	accepted                     bool
+	authAttempted                bool
+	contextID, contextCapability string
+	session                      SessionProjection
+	helloReady                   map[string]any
+	helloAt                      time.Time
+	hello                        bool
+	authorized                   bool
+	streams                      map[uint32]*httpStream
+	retired                      map[uint32]*httpStream
+	sockets                      map[uint32]*logicalSocket
+	usedIDs                      map[uint32]bool
+	inbox                        chan incoming
+	priority                     chan outgoing
+	bulk                         chan outgoing
+	wake                         chan struct{}
+	queueMu                      sync.Mutex
+	recvQueued, sendQueued       int
 }
 
 func newPeer(r *Runtime, pc *webrtc.PeerConnection, t Ticket) *Peer {
@@ -106,11 +115,14 @@ func (p *Peer) Close() {
 		if p.pc != nil {
 			_ = p.pc.Close()
 		}
+		if p.r.cfg.Mode == "narrafork" {
+			p.r.event("peer.closed", map[string]any{"peerId": p.ticket.SessionID})
+		}
 	})
 }
 func (p *Peer) attachChannel(dc *webrtc.DataChannel) {
 	label := dc.Label()
-	if (label != "nf.control.v1" && label != "nf.realtime.v1" && label != "nf.bulk.v1") || !dc.Ordered() || dc.MaxPacketLifeTime() != nil || dc.MaxRetransmits() != nil {
+	if (label != "nf.control.v2" && label != "nf.realtime.v2" && label != "nf.bulk.v2") || !dc.Ordered() || dc.MaxPacketLifeTime() != nil || dc.MaxRetransmits() != nil {
 		p.cancel()
 		return
 	}
@@ -136,7 +148,7 @@ func (p *Peer) attachChannel(dc *webrtc.DataChannel) {
 		if p.ctx.Err() != nil {
 			return
 		}
-		if len(m.Data) > FrameBytes || (label == "nf.bulk.v1" && m.IsString) || (label != "nf.bulk.v1" && !m.IsString) {
+		if len(m.Data) > FrameBytes || (label == "nf.bulk.v2" && m.IsString) || (label == "nf.control.v2" && !m.IsString) {
 			p.cancel()
 			return
 		}
@@ -157,19 +169,20 @@ func (p *Peer) attachChannel(dc *webrtc.DataChannel) {
 	})
 }
 func (p *Peer) queue(v outgoing) error {
+	v.queuedAt = time.Now()
 	if len(v.data) > FrameBytes {
 		return errors.New("send_size")
 	}
 	p.queueMu.Lock()
 	if p.sendQueued+len(v.data) > QueueBytes {
 		p.queueMu.Unlock()
-		p.Close()
+		p.cancel()
 		return errors.New("send_queue")
 	}
 	p.sendQueued += len(v.data)
 	p.queueMu.Unlock()
 	ch := p.priority
-	if v.channel == "nf.bulk.v1" {
+	if v.channel == "nf.bulk.v2" {
 		ch = p.bulk
 	}
 	select {
@@ -178,7 +191,7 @@ func (p *Peer) queue(v outgoing) error {
 	case ch <- v:
 		return nil
 	default:
-		p.Close()
+		p.cancel()
 		return errors.New("send_queue")
 	}
 }
@@ -187,14 +200,14 @@ func (p *Peer) control(v any) error {
 	if e != nil {
 		return e
 	}
-	return p.queue(outgoing{channel: "nf.control.v1", data: b})
+	return p.queue(outgoing{channel: "nf.control.v2", data: b})
 }
 func (p *Peer) realtime(v any) error {
 	b, e := json.Marshal(v)
 	if e != nil {
 		return e
 	}
-	return p.queue(outgoing{channel: "nf.realtime.v1", data: b})
+	return p.queue(outgoing{channel: "nf.realtime.v2", data: b})
 }
 func (p *Peer) send() {
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -205,7 +218,7 @@ func (p *Peer) send() {
 			pending = heldBulk
 			heldBulk = nil
 		}
-		if pending != nil && pending.channel == "nf.bulk.v1" {
+		if pending != nil && pending.channel == "nf.bulk.v2" {
 			select {
 			case v := <-p.priority:
 				heldBulk = pending
@@ -229,6 +242,10 @@ func (p *Peer) send() {
 					pending = &v
 				}
 			}
+		}
+		if time.Since(pending.queuedAt) > p.r.budgets.stall {
+			p.Close()
+			return
 		}
 		p.mu.Lock()
 		dc := p.channels[pending.channel]
@@ -266,14 +283,18 @@ func (p *Peer) receive() {
 		case m := <-p.inbox:
 			var e error
 			if m.binary {
-				e = p.receiveFrame(m.data)
+				if m.channel == "nf.realtime.v2" {
+					e = p.receiveSocketFrame(m.data)
+				} else {
+					e = p.receiveFrame(m.data)
+				}
 			} else {
 				var c Control
 				c, e = ParseControl(m.data)
 				if e == nil {
-					if m.channel == "nf.realtime.v1" && c.Type != "socket.send" && c.Type != "socket.close" && c.Type != "socket.open" {
+					if m.channel == "nf.realtime.v2" && c.Type != "socket.window" && c.Type != "socket.close" && c.Type != "socket.open" {
 						e = errors.New("channel_type")
-					} else if m.channel == "nf.control.v1" && c.Type == "socket.send" {
+					} else if m.channel == "nf.control.v2" && strings.HasPrefix(c.Type, "socket.") {
 						e = errors.New("channel_type")
 					} else {
 						e = p.handleControl(c)
@@ -303,13 +324,13 @@ func (p *Peer) watch() {
 			return
 		case <-ticker.C:
 			p.mu.Lock()
-			hello, auth, g, expiry := p.hello, p.authorized, p.grant, p.authExpires
+			hello, auth, g, expiry, helloAt, accepted := p.hello, p.authorized, p.grant, p.authExpires, p.helloAt, p.accepted
 			p.mu.Unlock()
 			if !hello && time.Since(start) > 20*time.Second {
 				p.Close()
 				return
 			}
-			if hello && !auth && time.Since(start) > 35*time.Second {
+			if hello && ((!auth && time.Since(helloAt) > 10*time.Minute) || (p.r.cfg.Mode == "narrafork" && !accepted && time.Since(helloAt) > 15*time.Second)) {
 				p.Close()
 				return
 			}
@@ -387,12 +408,28 @@ func (p *Peer) handleControl(c Control) error {
 		p.mu.Lock()
 		p.grant = g.ID
 		p.hello = true
+		p.helloAt = time.Now()
+		ready := map[string]any{"type": "hello.ready", "version": ProtocolVersion, "grantId": g.ID, "discoveryCapability": cap, "expiresAt": g.ExpiresAt}
+		if p.r.cfg.Mode == "narrafork" {
+			ready["backendIdentity"] = p.r.cfg.BackendIdentity
+			p.helloReady = ready
+		} else {
+			p.accepted = true
+		}
 		p.mu.Unlock()
 		p.r.discoveries()
-		return p.control(map[string]any{"type": "hello.ready", "grantId": g.ID, "discoveryCapability": cap, "expiresAt": g.ExpiresAt})
+		if p.r.cfg.Mode == "narrafork" {
+			if cap != "" {
+				p.r.event("grant.changed", map[string]any{"grantId": g.ID, "revoked": false})
+			}
+			p.r.event("peer.open", map[string]any{"peerId": p.ticket.SessionID, "instanceId": p.r.id, "grantId": g.ID, "clientPublicKey": g.PublicKey, "grantExpiresAt": g.ExpiresAt})
+			return nil
+		}
+		return p.control(ready)
 	case "auth":
 		p.mu.Lock()
-		hello := p.hello
+		hello := p.hello && (p.accepted || p.r.cfg.Mode == "prototype") && !p.authAttempted
+		p.authAttempted = true
 		p.mu.Unlock()
 		if !hello || len(c.Token) > 8192 {
 			return errors.New("auth")
@@ -406,6 +443,9 @@ func (p *Peer) handleControl(c Control) error {
 		p.authExpires = exp
 		p.authorized = true
 		p.mu.Unlock()
+		if p.r.cfg.Mode == "narrafork" {
+			return p.control(map[string]any{"type": "ready", "version": ProtocolVersion, "backendIdentity": p.r.cfg.BackendIdentity})
+		}
 		return p.control(map[string]any{"type": "ready", "version": ProtocolVersion, "apiVersion": 1, "appVersion": "prototype-1"})
 	default:
 		if !p.isAuthorized() && c.Type != "request.open" && c.Type != "window.update" && c.Type != "stream.cancel" {
@@ -438,20 +478,36 @@ func (p *Peer) handleControl(c Control) error {
 			return nil
 		case "socket.open":
 			return p.openSocket(c)
-		case "socket.send":
+		case "socket.window":
 			p.mu.Lock()
 			s := p.sockets[c.StreamID]
+			used := p.usedIDs[c.StreamID]
 			p.mu.Unlock()
-			if s == nil || len(c.Message) > FrameBytes-256 {
+			if s == nil {
+				if used {
+					return nil
+				}
 				return errors.New("socket")
 			}
-			return s.enqueue(c.Message)
+			return s.updateCredit(c.Bytes)
 		case "socket.close":
 			p.mu.Lock()
 			s := p.sockets[c.StreamID]
 			p.mu.Unlock()
 			if s != nil {
-				s.close()
+				if (c.Code != 1000 && (c.Code < 3000 || c.Code > 4999)) || len(c.Reason) > 123 {
+					return errors.New("socket_close")
+				}
+				s.mu.Lock()
+				s.closeCode = c.Code
+				s.closeReason = c.Reason
+				conn := s.conn
+				s.mu.Unlock()
+				if conn != nil {
+					go func() { _ = conn.Close(websocket.StatusCode(c.Code), c.Reason); s.close() }()
+				} else {
+					s.close()
+				}
 			}
 			return nil
 		default:

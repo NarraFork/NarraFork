@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import {
 	type QueryClient,
@@ -41,7 +42,7 @@ export function providerBalanceOptions(
 		},
 		select: (snapshot) =>
 			providerId && generation && snapshot?.generation === generation ? snapshot : undefined,
-		enabled: enabled && providerId != null && generation !== undefined,
+		enabled: !REMOTE_BUILD && enabled && providerId != null && generation !== undefined,
 		staleTime: (query) =>
 			query.state.data?.status === "unsupported" || query.state.data?.status === "error"
 				? Number.POSITIVE_INFINITY
@@ -82,7 +83,7 @@ export function providerBalanceProbeOptions(
 	}> | null = null;
 	return {
 		mutationFn: async () => {
-			if (!canProbe || !generation) return null;
+			if (REMOTE_BUILD || !canProbe || !generation) return null;
 			if (inFlight) return inFlight;
 			inFlight = client
 				.cancelQueries({ queryKey: providerBalanceKey(providerId, generation), exact: true })

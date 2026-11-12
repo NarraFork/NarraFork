@@ -198,6 +198,16 @@ export const DEFAULTS: NarraForkSettings = {
 		maxOutputChars: 24_000,
 	},
 	update: { ...DEFAULT_UPDATE_SETTINGS },
+	remoteAccess: {
+		enabled: false,
+		signalUrl: "",
+		stunUrls: [],
+		iceIPAllowlist: [],
+		iceInterfaceAllowlist: [],
+		iceNetworkTypes: ["udp4", "udp6"],
+		allowLocalhost: false,
+		leaseSeconds: 300,
+	},
 	vnet: {
 		enabled: true,
 		allowAnonymousRelay: false,
@@ -432,6 +442,20 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 
+	"remoteAccess.enabled": {
+		desc: "启用已安装并验证的远程访问组件；默认关闭，不自动下载。",
+		type: "boolean",
+	},
+	"remoteAccess.signalUrl": { desc: "显式配置的 WSS 信令协调服务地址。", type: "string" },
+	"remoteAccess.stunUrls": { desc: "STUN 地址列表；不支持 TURN 或业务中继。", type: "string[]" },
+	"remoteAccess.iceIPAllowlist": { desc: "限制 ICE 绑定的本机 IP 列表。", type: "string[]" },
+	"remoteAccess.iceInterfaceAllowlist": { desc: "限制 ICE 绑定的网络接口。", type: "string[]" },
+	"remoteAccess.iceNetworkTypes": { desc: "允许的 UDP 网络类型 udp4/udp6。", type: "string[]" },
+	"remoteAccess.allowLocalhost": {
+		desc: "仅用于显式本机测试的 loopback ICE 与 ws 信令选项。",
+		type: "boolean",
+	},
+	"remoteAccess.leaseSeconds": { desc: "信令发现租约秒数（60–3600）。", type: "number" },
 	// ── vnet ────────────────────────────────────────────────────────────
 	"vnet.enabled": {
 		desc: "启用应用层虚拟网络 relay。用于 Bun 应用间通过虚拟地址通信。",
