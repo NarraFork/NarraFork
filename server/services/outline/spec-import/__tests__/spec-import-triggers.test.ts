@@ -6,7 +6,10 @@
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  */
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { eq, inArray } from "drizzle-orm";
+import { db } from "../../../../db";
+import { narrators, specNamespaces, users } from "../../../../db/schema";
 import { DEFAULTS, settings } from "../../../../lib/settings";
 import { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, TEAM_SOP_PLUGIN_ID } from "../../../behavior-fence-sop";
 import { prepareOutlineRun } from "../../../narrator-session";
@@ -14,7 +17,7 @@ import type { ActiveNarrator } from "../../../narrator-session-state";
 import { readSpecTasksCompat } from "../../../plugin-spec-compat";
 import { readSpecFile, writeSpecFile } from "../../../spec-vfs-service";
 import { invalidateTaskBackend, taskSourceForNarrator } from "../../../task-source";
-import { beginSpecImport, waitForSpecImport } from "../../../task-source/backend";
+import { beginSpecImport, isSpecImporting, waitForSpecImport } from "../../../task-source/backend";
 import {
 	OUTLINE_BEHAVIOR_IMPORT_ACTOR,
 	resetOutlineBehaviorImport,
@@ -34,13 +37,45 @@ import {
 	importSpecAtRunStart,
 	requestSpecImport,
 	resetSpecImportRunTries,
-	runSpecImportPass,
+	runSpecImportPass as runGlobalSpecImportPass,
 	settleSpecImportRequests,
 	specImportStatus,
 } from "../triggers";
-import { backendOf, commitCount, makeSession, taskPage, writeNote, writeTasks } from "./fixtures";
+import {
+	backendOf,
+	commitCount,
+	makeSession as makeSessionFixture,
+	makeUser,
+	taskPage,
+	writeNote,
+	writeTasks,
+} from "./fixtures";
+
+const ownedSessionIds: string[] = [];
+const ownedUserIds = new Set<string>();
+const pendingPasses = new Set<ReturnType<typeof runGlobalSpecImportPass>>();
+
+/** Local ownership only: shared fixtures and the global candidate reader stay unchanged. */
+async function makeSession(options: Parameters<typeof makeSessionFixture>[0] = {}) {
+	const owner = options.owner === undefined ? await makeUser() : options.owner;
+	if (options.owner === undefined && owner !== null) ownedUserIds.add(owner);
+	const session = await makeSessionFixture({ ...options, owner });
+	ownedSessionIds.push(session.id);
+	return session;
+}
+
+/** Still the real all-namespace sweep; retain it if a failing case leaves an await in flight. */
+function runSpecImportPass(...args: Parameters<typeof runGlobalSpecImportPass>) {
+	const pass = runGlobalSpecImportPass(...args);
+	pendingPasses.add(pass);
+	const settled = () => pendingPasses.delete(pass);
+	void pass.then(settled, settled);
+	return pass;
+}
 
 beforeEach(() => {
+	expect(ownedSessionIds).toHaveLength(0);
+	expect(ownedUserIds.size).toBe(0);
 	settings.outline.enabled = true;
 	settings.outline.specImport = "auto";
 	invalidateTaskBackend();
@@ -48,6 +83,30 @@ beforeEach(() => {
 	resetSpecImportRunTries();
 	resetOutlineBehaviorImport();
 	resetOutlineFenceSopMove();
+});
+afterEach(async () => {
+	// Join the real sweeps/button imports before deleting anything they could still write.
+	await Promise.allSettled([...pendingPasses]);
+	await settleSpecImportRequests();
+	const ids = [...ownedSessionIds];
+	for (const id of ids) expect(isSpecImporting(id)).toBe(false);
+	// A child has a non-cascading parent FK. Spec namespaces, their revisions and the
+	// session outline spaces cascade from these exact owned narrators, never other cases.
+	for (const id of ids.reverse()) {
+		await db.delete(narrators).where(eq(narrators.id, id));
+		invalidateTaskBackend(id);
+	}
+	if (ids.length) {
+		expect(
+			await db
+				.select({ id: specNamespaces.id })
+				.from(specNamespaces)
+				.where(inArray(specNamespaces.narratorId, ids)),
+		).toEqual([]);
+	}
+	if (ownedUserIds.size) await db.delete(users).where(inArray(users.id, [...ownedUserIds]));
+	ownedSessionIds.length = 0;
+	ownedUserIds.clear();
 });
 afterAll(() => stopEditTextWorker());
 
@@ -114,14 +173,19 @@ describe("the idle job", () => {
 		const sub = await makeSession({ type: "subagent", root: a.id, owner: a.owner });
 		await writeTasks(sub.id, [{ text: "its own" }]);
 		const pass = await runSpecImportPass({ pauseMs: 0 });
-		expect(pass.imported).toBeGreaterThanOrEqual(2);
+		expect(pass).toEqual({ seen: 2, imported: 2, left: 0, givenUp: 0 });
 		expect(await backendOf(a.id)).toBe("outline");
 		expect(await backendOf(archived.id)).toBe("outline");
 		expect(await backendOf(sub.id)).toBe("spec");
-		// A second pass leaves what was imported alone. (A large session of an earlier case may
-		// be finished by it: an idle import gives way after its time budget, resumable.)
+		// The real global pass sees only this case's fixtures, including the subagent it skips.
+		// A second pass leaves the imported sessions alone; no earlier large fixture is visible.
 		const commits = [await commitCount(a.id), await commitCount(archived.id)];
-		await runSpecImportPass({ pauseMs: 0 });
+		expect(await runSpecImportPass({ pauseMs: 0 })).toEqual({
+			seen: 0,
+			imported: 0,
+			left: 0,
+			givenUp: 0,
+		});
 		expect([await commitCount(a.id), await commitCount(archived.id)]).toEqual(commits);
 	}, 30_000);
 
@@ -158,7 +222,7 @@ describe("the idle job", () => {
 		expect(specImportRecord(id)?.status).toBe("attention");
 		const commits = await commitCount(id);
 		const pass = await runSpecImportPass({ pauseMs: 0 });
-		expect(pass.givenUp).toBeGreaterThanOrEqual(1);
+		expect(pass).toEqual({ seen: 1, imported: 0, left: 0, givenUp: 1 });
 		expect(await commitCount(id)).toBe(commits);
 	});
 });
@@ -262,19 +326,25 @@ describe("plugins and the Spec panel during an import", () => {
 	test("a write is refused while it runs; a plugin's command waits for its end", async () => {
 		const { id } = await makeSession();
 		const end = beginSpecImport(id);
-		await expect(
-			writeSpecFile(id, "spec://notes.md", "late", { actor: "user", createdBy: "user" }),
-		).rejects.toMatchObject({ code: "SPEC_IMPORT_IN_PROGRESS" });
-		let waited = false;
-		const waiting = waitForSpecImport(id).then(() => {
-			waited = true;
-		});
-		await new Promise((resolve) => setImmediate(resolve));
-		expect(waited).toBe(false);
-		end();
-		await waiting;
-		expect(waited).toBe(true);
-		await writeSpecFile(id, "spec://notes.md", "now", { actor: "user", createdBy: "user" });
+		let waiting: Promise<void> | undefined;
+		try {
+			await expect(
+				writeSpecFile(id, "spec://notes.md", "late", { actor: "user", createdBy: "user" }),
+			).rejects.toMatchObject({ code: "SPEC_IMPORT_IN_PROGRESS" });
+			let waited = false;
+			waiting = waitForSpecImport(id).then(() => {
+				waited = true;
+			});
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(waited).toBe(false);
+			end();
+			await waiting;
+			expect(waited).toBe(true);
+			await writeSpecFile(id, "spec://notes.md", "now", { actor: "user", createdBy: "user" });
+		} finally {
+			end();
+			await waiting;
+		}
 	});
 });
 

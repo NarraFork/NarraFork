@@ -21,24 +21,31 @@ import {
 	EXECUTOR_PLATFORMS,
 	executorPublishedFilename,
 } from "../../shared/remote-executor";
+import {
+	REMOTE_PEER_MANIFEST_FILENAME,
+	REMOTE_PEER_PLATFORMS,
+	remotePeerPublishedFilename,
+} from "../../shared/remote-peer";
 import { WebDavClient } from "../../shared/webdav-transport";
 import { createApp } from "../../update-server/app";
 import { initConfig } from "../../update-server/lib/config";
-import { MirrorIngestService } from "../../update-server/services/mirror-ingest";
+import { MirrorIngestService, parseTools } from "../../update-server/services/mirror-ingest";
 import { MirrorRelayPuller } from "../../update-server/services/mirror-relay-pull";
 import { LocalStorage } from "../../update-server/storage/local";
 import { createWebDavFixture } from "../fixtures/webdav-fixture";
 import { commit, config, repository, sha } from "./mirror-fixture";
 
-function fixture(kind: "helpers" | "executor") {
+function fixture(kind: "helpers" | "executor" | "remote-peer", versionOverride?: string) {
 	const files = new Map<string, Buffer>();
 	const artifact = (name: string) => {
 		const content = Buffer.from(`${name}\n`);
 		files.set(name, content);
 		return { name, size: content.length, sha256: sha(content) };
 	};
-	const licenses = [artifact("LICENSE-test.txt")];
-	const tag = kind === "helpers" ? HELPER_RELEASE_TAG : "executor-v1.2.0";
+	const licenseName = kind === "remote-peer" ? "remote-peer-LICENSES.txt" : "LICENSE-test.txt";
+	const licenses = [artifact(licenseName)];
+	const version = versionOverride ?? (kind === "remote-peer" ? "0.1.0-alpha.1" : "1.2.0");
+	const tag = kind === "helpers" ? HELPER_RELEASE_TAG : `${kind}-v${version}`;
 	const manifest =
 		kind === "helpers"
 			? {
@@ -63,19 +70,30 @@ function fixture(kind: "helpers" | "executor") {
 					tag,
 					commit,
 					manifest: {
-						version: "1.2.0",
+						version,
 						protocolVersion: 1,
 						releasedAt: "2026-07-01T00:00:00Z",
 						platforms: Object.fromEntries(
-							EXECUTOR_PLATFORMS.map((platform) => {
-								const a = artifact(executorPublishedFilename("1.2.0", platform));
-								return [platform, { filename: a.name, size: a.size, sha256: a.sha256 }];
-							}),
+							(kind === "remote-peer" ? REMOTE_PEER_PLATFORMS : EXECUTOR_PLATFORMS).map(
+								(platform) => {
+									const a = artifact(
+										kind === "remote-peer"
+											? remotePeerPublishedFilename(version, platform)
+											: executorPublishedFilename(version, platform),
+									);
+									return [platform, { filename: a.name, size: a.size, sha256: a.sha256 }];
+								},
+							),
 						),
 					},
 					licenses,
 				};
-	const manifestName = kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME;
+	const manifestName =
+		kind === "helpers"
+			? HELPER_MANIFEST_FILENAME
+			: kind === "executor"
+				? EXECUTOR_MANIFEST_FILENAME
+				: REMOTE_PEER_MANIFEST_FILENAME;
 	files.set(manifestName, Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`));
 	const assets = [...files].map(([name, bytes], i) => ({
 		id: i + 1,
@@ -95,13 +113,13 @@ function fixture(kind: "helpers" | "executor") {
 				id: 9,
 				tag_name: tag,
 				draft: false,
-				prerelease: false,
+				prerelease: kind === "remote-peer" && version.includes("-"),
 				published_at: "2026-07-01T00:00:00Z",
 			});
 		if (path.includes("releases/9/assets?")) return JSON.stringify(assets);
 		if (path.includes("releases/assets/")) {
 			const asset = assets.find((a) => a.id === Number(path.split("/").at(-1)));
-			if (!asset || ![manifestName, "LICENSE-test.txt"].includes(asset.name))
+			if (!asset || ![manifestName, licenseName].includes(asset.name))
 				throw new Error("Full helper/executor download forbidden");
 			downloaded.push(asset.name);
 			return files.get(asset.name)?.toString("utf8") ?? "";
@@ -156,6 +174,8 @@ function fixture(kind: "helpers" | "executor") {
 	};
 	return {
 		options: { kind, repository, tag, config, run, http, downloadAsset },
+		manifestName,
+		licenseName,
 		assets,
 		files,
 		downloaded,
@@ -249,12 +269,143 @@ function concurrencyProbe(f: ReturnType<typeof fixture>, limit: number) {
 	};
 }
 describe("canonical auxiliary binary mirror", () => {
-	for (const kind of ["helpers", "executor"] as const)
+	for (const mode of [
+		"draft",
+		"unpublished",
+		"prerelease",
+		"origin",
+		"commit",
+		"tag",
+		"partial",
+		"missing-license",
+		"license-limit",
+		"metadata-count",
+		"metadata-digest",
+		"binary-digest",
+		"binary-limit",
+	] as const)
+		test(`remote-peer ${mode} refuses before binary transfer or mirror writes`, async () => {
+			const f = fixture("remote-peer");
+			const manifest = JSON.parse(f.files.get(f.manifestName)?.toString() ?? "null");
+			const updateAsset = (name: string, bytes: Buffer) => {
+				f.files.set(name, bytes);
+				const asset = f.assets.find((a) => a.name === name);
+				if (!asset) throw new Error("fixture asset missing");
+				asset.size = bytes.length;
+				asset.digest = `sha256:${sha(bytes)}`;
+			};
+			if (mode === "origin") manifest.repository = "upstream/project";
+			if (mode === "commit") manifest.commit = "f".repeat(40);
+			if (mode === "tag") manifest.tag = "executor-v0.1.0-alpha.1";
+			if (mode === "partial") delete manifest.manifest.platforms[REMOTE_PEER_PLATFORMS[0]];
+			if (mode === "metadata-count")
+				manifest.licenses = Array.from({ length: 16 }, () => ({ ...manifest.licenses[0] }));
+			if (mode === "license-limit") {
+				const bytes = Buffer.alloc(64 * 1024 + 1, 97);
+				updateAsset(f.licenseName, bytes);
+				Object.assign(manifest.licenses[0], { size: bytes.length, sha256: sha(bytes) });
+			}
+			if (mode === "binary-limit")
+				manifest.manifest.platforms[REMOTE_PEER_PLATFORMS[0]].size = 32 * 1024 * 1024 + 1;
+			updateAsset(f.manifestName, Buffer.from(JSON.stringify(manifest)));
+			if (mode === "missing-license")
+				f.assets.splice(
+					f.assets.findIndex((a) => a.name === f.licenseName),
+					1,
+				);
+			if (mode === "metadata-digest" || mode === "binary-digest") {
+				const name =
+					mode === "metadata-digest"
+						? f.manifestName
+						: manifest.manifest.platforms[REMOTE_PEER_PLATFORMS[0]].filename;
+				const asset = f.assets.find((a) => a.name === name);
+				if (!asset) throw new Error("fixture digest asset missing");
+				asset.digest = `sha256:${"f".repeat(64)}`;
+			}
+			const run = f.options.run;
+			f.options.run = async (args) => {
+				const raw = await run(args);
+				if (args[1].includes("releases/tags/")) {
+					const release = JSON.parse(raw);
+					if (mode === "draft") release.draft = true;
+					if (mode === "unpublished") release.published_at = null;
+					if (mode === "prerelease") release.prerelease = false;
+					return JSON.stringify(release);
+				}
+				return raw;
+			};
+			let downloads = 0;
+			f.options.downloadAsset = async () => {
+				downloads++;
+			};
+			await expect(mirrorPublishedGitHubRelease(f.options)).rejects.toThrow();
+			expect(downloads).toBe(0);
+			expect(f.requests).toHaveLength(0);
+		});
+	test("peer tag ingress uses shared version bounds without widening legacy component tags", () => {
+		for (const tag of [
+			`remote-peer-v0.1.0-${"R".repeat(59)}`,
+			"remote-peer-v0.1.0-alpha..RC1",
+			"remote-peer-v0.1.0-alpha/RC1",
+			"remote-peer-v0.1.0-alpha%2fRC1",
+			"Remote-peer-v0.1.0-alpha.RC1",
+			"executor-v0.1.0-alpha.RC1",
+		])
+			expect(() => parseTools({}, repository, "remote-peer", tag)).toThrow();
+		for (const kind of ["helpers", "executor"] as const) {
+			for (const version of ["0.1.0-alpha.RC1", `0.1.0-${"r".repeat(58)}`])
+				expect(() => parseTools({}, repository, kind, `${kind}-v${version}`)).toThrow(
+					"Invalid component identity",
+				);
+		}
+	});
+	test("remote-peer changed public prerelease summary is rejected before upload", async () => {
+		const f = fixture("remote-peer");
+		const run = f.options.run;
+		let queries = 0;
+		f.options.run = async (args) => {
+			const result = await run(args);
+			if (args[1].includes("releases/tags/") && ++queries === 2)
+				return JSON.stringify({ ...JSON.parse(result), prerelease: false });
+			return result;
+		};
+		await expect(mirrorPublishedGitHubRelease(f.options)).rejects.toThrow();
+		expect(f.requests).toHaveLength(0);
+	});
+	test("remote-peer projection preserves metadata-only compatibility and enforces exact complete descriptors", async () => {
+		const f = fixture("remote-peer");
+		await mirrorPublishedGitHubRelease(f.options);
+		const projection = parseTools(f.stored, repository, "remote-peer", f.options.tag);
+		expect(projection.binaries).toHaveLength(6);
+		expect(
+			parseTools({ ...projection, binaries: undefined }, repository, "remote-peer", f.options.tag)
+				.binaries,
+		).toBeUndefined();
+		for (const changed of [
+			{ ...projection, repository: "upstream/project" },
+			{ ...projection, kind: "executor" },
+			{ ...projection, tag: "executor-v0.1.0-alpha.1" },
+			{ ...projection, binaries: projection.binaries?.slice(1) },
+			{
+				...projection,
+				binaries: projection.binaries?.map((a) => ({ ...a, kind: "executor-binary" })),
+			},
+			{
+				...projection,
+				binaries: projection.binaries?.map((a) => ({ ...a, sha256: "f".repeat(64) })),
+			},
+			{ ...projection, assets: projection.assets.slice(0, 1) },
+			{ ...projection, assets: Array.from({ length: 17 }, () => projection.assets[0]) },
+		])
+			expect(() => parseTools(changed, repository, "remote-peer", f.options.tag)).toThrow();
+		expect(() => parseTools(projection, repository, "executor", f.options.tag)).toThrow("identity");
+	});
+	for (const kind of ["helpers", "executor", "remote-peer"] as const)
 		for (const transport of ["direct", "webdav"] as const)
 			test(`${kind} ${transport} failure cancels and joins in-flight uploads without commit or ready`, async () => {
 				const f = fixture(kind);
 				const binaries = f.assets.filter(
-					(a) => a.name !== "LICENSE-test.txt" && !a.name.endsWith(".json"),
+					(a) => a.name !== f.licenseName && !a.name.endsWith(".json"),
 				);
 				const successHash = binaries[0].digest.slice(7);
 				const failureHash = binaries[1].digest.slice(7);
@@ -345,10 +496,16 @@ describe("canonical auxiliary binary mirror", () => {
 				expect(paths.length).toBeLessThanOrEqual(4);
 				for (const path of paths) expect(existsSync(path)).toBe(false);
 			});
-	for (const kind of ["helpers", "executor"] as const)
+	for (const { kind, version } of [
+		{ kind: "helpers", version: undefined },
+		{ kind: "executor", version: undefined },
+		{ kind: "remote-peer", version: undefined },
+		{ kind: "remote-peer", version: "0.1.0-alpha.RC1" },
+		{ kind: "remote-peer", version: `0.1.0-${"r".repeat(58)}` },
+	] as const)
 		for (const transport of ["direct", "webdav"] as const)
 			for (const concurrency of [undefined, 8])
-				test(`${kind} ${transport} concurrency=${concurrency ?? "default"} real producer/server roundtrip exposes verified exact-tag bytes`, async () => {
+				test(`${kind} ${version ?? "default-version"} ${transport} concurrency=${concurrency ?? "default"} real producer/server roundtrip exposes verified exact-tag bytes`, async () => {
 					const directory = await mkdtemp(join(tmpdir(), "nf-tools-roundtrip-"));
 					let puller: MirrorRelayPuller | undefined;
 					try {
@@ -362,11 +519,41 @@ describe("canonical auxiliary binary mirror", () => {
 						const storage = new LocalStorage(join(directory, "data"));
 						const ingest = new MirrorIngestService(storage);
 						const app = createApp(storage, ingest);
-						const f = fixture(kind);
+						const f = fixture(kind, version);
+						if (kind === "remote-peer") {
+							if (version?.length === 64) expect(f.options.tag.length).toBeGreaterThan(64);
+							await ingest.commitTools(
+								"narrafork",
+								kind,
+								f.options.tag,
+								{
+									schemaVersion: 1,
+									repository,
+									kind,
+									tag: f.options.tag,
+									assets: [f.manifestName, f.licenseName].map((name) => {
+										const bytes = f.files.get(name) as Buffer;
+										return {
+											name,
+											size: bytes.length,
+											sha256: sha(bytes),
+											content: bytes.toString(),
+										};
+									}),
+								},
+								new AbortController().signal,
+							);
+							expect(
+								(await ingest.readTools("narrafork", kind, f.options.tag))?.binaries,
+							).toBeUndefined();
+							const unavailable = await app.request(
+								`/api/v3/products/narrafork/mirror/tools/${kind}/${f.options.tag}/assets/${remotePeerPublishedFilename(f.options.tag.slice("remote-peer-v".length), "linux-amd64")}`,
+							);
+							expect(unavailable.status).toBe(404);
+						}
 						const limit = Math.min(
 							concurrency ?? (transport === "direct" ? 2 : 3),
-							f.assets.filter((a) => a.name !== "LICENSE-test.txt" && !a.name.endsWith(".json"))
-								.length,
+							f.assets.filter((a) => a.name !== f.licenseName && !a.name.endsWith(".json")).length,
 						);
 						const probe = concurrencyProbe(f, limit);
 						const dav = createWebDavFixture();
@@ -435,6 +622,18 @@ describe("canonical auxiliary binary mirror", () => {
 						probe.verify(limit);
 						const projection = await ingest.readTools("narrafork", kind, f.options.tag);
 						expect(projection?.binaries?.length).toBe(kind === "helpers" ? 12 : 6);
+						if (kind === "remote-peer") {
+							await ingest.commitTools(
+								"narrafork",
+								kind,
+								f.options.tag,
+								{ ...projection, binaries: undefined },
+								new AbortController().signal,
+							);
+							expect(
+								(await ingest.readTools("narrafork", kind, f.options.tag))?.binaries,
+							).toHaveLength(6);
+						}
 						for (const binary of projection?.binaries ?? []) {
 							const response = await app.request(
 								`/api/v3/products/narrafork/mirror/tools/${kind}/${f.options.tag}/assets/${binary.name}`,
@@ -499,18 +698,13 @@ describe("canonical auxiliary binary mirror", () => {
 		).rejects.toThrow();
 		expect(f.requests).toHaveLength(0);
 	});
-	for (const kind of ["helpers", "executor"] as const)
+	for (const kind of ["helpers", "executor", "remote-peer"] as const)
 		test(`${kind} mirrors raw manifest/license metadata and separate streamed binaries`, async () => {
 			const f = fixture(kind);
 			const result = await mirrorPublishedGitHubRelease(f.options);
 			expect(result.status).toBe("MIRRORED");
 			expect(result.snapshotCommitted).toBe(true);
-			expect(f.downloaded.sort()).toEqual(
-				[
-					kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME,
-					"LICENSE-test.txt",
-				].sort(),
-			);
+			expect(f.downloaded.sort()).toEqual([f.manifestName, f.licenseName].sort());
 			expect(f.requests).toHaveLength(f.assets.length - 1);
 			const stored = f.stored as { assets: { name: string; content: string }[] };
 			expect(stored.assets).toHaveLength(2);
@@ -520,7 +714,7 @@ describe("canonical auxiliary binary mirror", () => {
 				expect(asset.content).toBe(bytes.toString("utf8"));
 			}
 		});
-	for (const kind of ["helpers", "executor"] as const) {
+	for (const kind of ["helpers", "executor", "remote-peer"] as const) {
 		test(`${kind} WebDAV staging is accepted bytes only, no server requests`, async () => {
 			const f = fixture(kind);
 			const dav = createWebDavFixture();

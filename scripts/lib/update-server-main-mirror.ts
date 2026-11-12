@@ -27,6 +27,7 @@ import {
 	currentPublicRelease,
 	matchPublicAsset,
 	mirrorGhRunner,
+	type PublicMirrorRelease,
 	publicTagCommit,
 	readIndexNotes,
 	readIndexSnapshot,
@@ -43,6 +44,7 @@ import {
 	mirrorUploadDiskBytes,
 	orderMirrorUploads,
 } from "./mirror-upload-pool";
+import type { PublicationReceipt } from "./publication-receipt";
 import { preparePublishedUpdateIndexRelease } from "./update-index-github";
 import {
 	BridgeHttpError,
@@ -60,7 +62,7 @@ export const MAIN_MIRROR_TOTAL_TIMEOUT_MS = 25 * 60_000;
 export const MIRROR_TOTAL_BYTES = 4 * 1024 ** 3;
 export interface IndependentMirrorReceipt {
 	schemaVersion: 1;
-	kind: "main" | "helpers" | "executor";
+	kind: "main" | "helpers" | "executor" | "remote-peer";
 	repository: string;
 	tag: string;
 	status:
@@ -78,6 +80,8 @@ export interface IndependentMirrorReceipt {
 	/** Exact committed assets verified by the update server, never runner readback. */
 	verified: string[];
 	snapshotCommitted: boolean;
+	/** Frozen successful publisher identity, when initiated from workflow receipts. */
+	publication?: { commit: string; releaseId: number; source: PublicationReceipt["source"] };
 	failureCode?: "FAILED_CONFIG" | "CANCELLED" | "MIRROR_FAILED" | "SERVER_RECEIPT_REQUIRED";
 }
 export class IndependentMirrorError extends Error {
@@ -124,7 +128,7 @@ export class IndependentMirrorError extends Error {
 	}
 }
 export interface MirrorPublishedOptions {
-	kind: "main" | "helpers" | "executor";
+	kind: "main" | "helpers" | "executor" | "remote-peer";
 	repository: string;
 	tag: string;
 	config?: UpdateServerMirrorConfig;
@@ -142,9 +146,43 @@ export interface MirrorPublishedOptions {
 	totalTimeoutMs?: number;
 	/** Complete tasks: direct defaults to 2 (old servers), WebDAV to 3; hard cap 8. */
 	uploadConcurrency?: number;
+	/** A verified workflow receipt freezes the exact public identity throughout producer execution. */
+	publication?: PublicationReceipt;
+	/** Multiple publications reserve one shared source-download + upload/count budget. */
+	reserveAssets?: (assets: { size: number }[]) => void;
+}
+export function assertMirrorPublicationIdentity(
+	options: MirrorPublishedOptions,
+	remote: PublicMirrorRelease,
+	commit: string,
+): void {
+	const expected = options.publication;
+	if (!expected) return;
+	if (
+		expected.repository.toLowerCase() !== options.repository.toLowerCase() ||
+		expected.kind !== options.kind ||
+		expected.tag !== options.tag ||
+		expected.commit !== commit ||
+		expected.releaseId !== remote.id ||
+		expected.assets.length !== remote.assets.length ||
+		expected.assets.some(
+			(asset) =>
+				!remote.assets.some(
+					(a) =>
+						a.id === asset.id &&
+						a.name === asset.name &&
+						a.size === asset.size &&
+						a.digest === asset.digest,
+				),
+		)
+	)
+		throw new Error("Public identity differs from frozen publication receipt");
 }
 export function mirrorReceipt(
-	options: Pick<MirrorPublishedOptions, "kind" | "repository" | "tag" | "transport">,
+	options: Pick<
+		MirrorPublishedOptions,
+		"kind" | "repository" | "tag" | "transport" | "publication"
+	>,
 ): IndependentMirrorReceipt {
 	return {
 		schemaVersion: 1,
@@ -157,6 +195,15 @@ export function mirrorReceipt(
 		uploaded: [],
 		verified: [],
 		snapshotCommitted: false,
+		...(options.publication
+			? {
+					publication: {
+						commit: options.publication.commit,
+						releaseId: options.publication.releaseId,
+						source: options.publication.source,
+					},
+				}
+			: {}),
 	};
 }
 function digest(bytes: string): string {
@@ -188,6 +235,7 @@ export async function mirrorPublishedMainRelease(
 		const run = mirrorGhRunner(options.run, signal);
 		const remote = await currentPublicRelease(run, options.repository, options.tag);
 		const commit = await publicTagCommit(run, options.repository, options.tag);
+		assertMirrorPublicationIdentity(options, remote, commit);
 		const verified = await preparePublishedUpdateIndexRelease({
 			repository: options.repository,
 			version,
@@ -216,6 +264,7 @@ export async function mirrorPublishedMainRelease(
 		const budget = options.maxTotalBytes ?? MIRROR_TOTAL_BYTES;
 		if (!Number.isSafeInteger(budget) || budget <= 0 || total > budget)
 			throw new Error("Independent mirror total byte budget exceeded");
+		options.reserveAssets?.(assets);
 		for (const asset of assets) if (asset.kind !== "notes") matchPublicAsset(remote, asset);
 		for (const asset of remote.assets) {
 			if (

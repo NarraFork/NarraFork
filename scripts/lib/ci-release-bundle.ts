@@ -15,6 +15,11 @@ import {
 	validateReleasePatchMetadata,
 } from "../../shared/release-patch";
 import { compareReleaseVersions } from "../../shared/release-version";
+import {
+	REMOTE_FRONTEND_ARCHIVE_MAX_BYTES,
+	REMOTE_FRONTEND_MANIFEST_MAX_BYTES,
+	remoteFrontendArtifactNames,
+} from "../../shared/remote-access/frontend-manifest";
 import { type BinaryMetadata, formatChecksumsReport, formatSha256Sums } from "./binary-metadata";
 import {
 	CI_BUNDLE_LIMIT,
@@ -86,7 +91,7 @@ const manifestSchema = z
 					.strict(),
 			)
 			.min(18)
-			.max(50),
+			.max(52),
 		smoke: z.array(smokeSchema).length(8),
 	})
 	.strict();
@@ -97,6 +102,8 @@ export interface AssembleReleaseBundleOptions {
 	targetHelperDistribution?: BinaryMetadata["helperDistribution"];
 	platformsDir: string;
 	smokeDir: string;
+	/** Exactly two previously built assets; never rebuild in the assembler. */
+	remoteFrontendDir?: string;
 	bundleDir: string;
 	signal?: AbortSignal;
 	/** Fixture injection only; defaults use bounded gh and actual file-to-file zstd. */
@@ -272,6 +279,8 @@ function patchName(plan: CiReleasePlan, baseline: CiReleaseBaseline): string {
 }
 
 function assetLimit(name: string): number {
+	if (name.endsWith("-remote-frontend.tar.gz")) return REMOTE_FRONTEND_ARCHIVE_MAX_BYTES;
+	if (name.endsWith("-remote-frontend.manifest.json")) return REMOTE_FRONTEND_MANIFEST_MAX_BYTES;
 	if (name.endsWith(".metadata.json") || name.endsWith(".meta.json")) return CI_METADATA_LIMIT;
 	if (name.endsWith(".zstd-patch")) return MAX_RELEASE_PATCH_BYTES;
 	if (name.endsWith("-SHA256SUMS") || name.endsWith("-checksums.txt")) return CI_TEXT_LIMIT;
@@ -346,13 +355,15 @@ async function verifyBundleContents(
 			"baselines",
 			"buildSource",
 			"componentEvidence",
+			"remoteFrontend",
+			"remotePeer",
 		] as const) {
 			if (!isDeepStrictEqual(plan[key], expected[key]))
 				throw new Error(`Bundle expected target identity mismatch: ${key}`);
 		}
 	}
 	const dist = join(bundleDir, "dist");
-	const names = await directoryEntries(dist, 51);
+	const names = await directoryEntries(dist, 53);
 	const listedNames = parsed.files.map((file) => file.name);
 	if (new Set(listedNames).size !== listedNames.length)
 		throw new Error("Duplicate manifest filenames");
@@ -466,6 +477,22 @@ async function verifyBundleContents(
 		allowed.add(name);
 		allowed.add(metadataName);
 	}
+	if (plan.remoteFrontend) {
+		const remote = remoteFrontendArtifactNames(plan.version);
+		allowed.add(remote.archive);
+		allowed.add(remote.manifest);
+		const { verifyRemoteFrontendArtifact } = await import("./remote-frontend-artifact");
+		await verifyRemoteFrontendArtifact(
+			dist,
+			{
+				repository: plan.repository,
+				version: plan.version,
+				commit: plan.commit,
+				capability: plan.remoteFrontend,
+			},
+			signal,
+		);
+	}
 	assertSameNames(names, [...allowed], "allowed release assets");
 	signal.throwIfAborted();
 	// Publisher dryRun snapshots assets into the system temporary filesystem.
@@ -481,6 +508,7 @@ async function verifyBundleContents(
 				version: plan.version,
 				repository: plan.repository,
 				commit: plan.commit,
+				remoteFrontend: plan.remoteFrontend,
 				platformSuffixes: new Map(
 					CI_RELEASE_TARGETS.map((entry) => [entry.platform, entry.suffix]),
 				),
@@ -778,7 +806,13 @@ async function assembleBundle(options: AssembleReleaseBundleOptions): Promise<Ci
 		if (!binary) throw new Error("Missing baseline platform");
 		return sum + Math.min(MAX_RELEASE_PATCH_BYTES, binary.size);
 	}, 0);
-	const outputBudget = fullBytes + patchBudget + CI_TEXT_LIMIT * 4;
+	const outputBudget =
+		fullBytes +
+		patchBudget +
+		CI_TEXT_LIMIT * 4 +
+		(plan.remoteFrontend
+			? REMOTE_FRONTEND_ARCHIVE_MAX_BYTES + REMOTE_FRONTEND_MANIFEST_MAX_BYTES
+			: 0);
 	// Account for both generation scratch and the publisher's second complete snapshot.
 	const required =
 		Math.max(outputBudget * 2, outputBudget + maxBase + maxFull * 2) + CI_DISK_RESERVE;
@@ -843,13 +877,42 @@ async function assembleBundle(options: AssembleReleaseBundleOptions): Promise<Ci
 		);
 		for (const baseline of plan.baselines)
 			await addPatch(options, baseline, binaries, dist, staging, signal);
+		if (plan.remoteFrontend) {
+			if (!options.remoteFrontendDir)
+				throw new Error("Declared remote frontend artifact is missing");
+			const names = Object.values(remoteFrontendArtifactNames(plan.version));
+			assertSameNames(
+				await directoryEntries(options.remoteFrontendDir, 3),
+				names,
+				"remote frontend assets",
+			);
+			const { verifyRemoteFrontendArtifact } = await import("./remote-frontend-artifact");
+			await verifyRemoteFrontendArtifact(
+				options.remoteFrontendDir,
+				{
+					repository: plan.repository,
+					version: plan.version,
+					commit: plan.commit,
+					capability: plan.remoteFrontend,
+				},
+				signal,
+			);
+			for (const name of names)
+				await copyReleaseFile(
+					join(options.remoteFrontendDir, name),
+					join(dist, name),
+					assetLimit(name),
+					signal,
+				);
+		} else if (options.remoteFrontendDir)
+			throw new Error("Historical plan cannot acquire a new remote frontend");
 		const files: CiReleaseManifest["files"] = [];
 		const hashDetails: ReleasePhaseDetails = { version: plan.version };
 		await timeReleasePhase(
 			"bundle.manifest.hash",
 			hashDetails,
 			async () => {
-				for (const name of await directoryEntries(dist, 51))
+				for (const name of await directoryEntries(dist, 53))
 					files.push({
 						name,
 						...(await hashReleaseFile(join(dist, name), assetLimit(name), signal)),

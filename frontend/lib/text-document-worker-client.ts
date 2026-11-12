@@ -2,7 +2,7 @@ import {
 	TEXT_DOCUMENT_PAGE_CHARS,
 	type TextDocumentRef,
 } from "@shared/pretext-layout/text-document";
-import { getAppBase } from "./base-path";
+import { getAssetBase } from "./base-path";
 import type { DocumentToken } from "./text-document-pure-core";
 import { type TextDocumentStore, textDocumentStore } from "./text-document-store";
 import {
@@ -276,7 +276,7 @@ export class TextDocumentWorkerClient {
 		private store = textDocumentStore,
 		factory: () => WorkerPort = () =>
 			new Worker(new URL("./text-document.worker.ts", import.meta.url), { type: "module" }),
-		appBase = () => new URL(getAppBase(), location.href).href,
+		appBase = () => new URL(getAssetBase(), location.href).href,
 		watchdogMs = TEXT_DOCUMENT_WORKER_WATCHDOG_MS,
 	) {
 		this.layout = new WorkerLane("layout", store, factory, appBase, watchdogMs);

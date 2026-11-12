@@ -12,8 +12,8 @@ import {
 	normalizeHelperSource,
 	parseHelperManifest,
 } from "../../shared/helper-distribution";
+import { isValidReleaseVersion } from "../../shared/release-version";
 import { matchesWindowsPeArch } from "../../shared/windows-pe";
-import { logger } from "./logger";
 import { createUpdateFetchContext, type UpdateFetchContext } from "./net/update-fetch";
 import { narraforkDir, settings } from "./settings";
 
@@ -29,40 +29,19 @@ export interface DistributionContext {
 }
 export function captureHelperSource(): HelperSource {
 	return normalizeHelperSource({
-		source: "github",
+		source: settings.update?.source,
 		githubRepository: settings.update?.githubRepository,
-		...(settings.update?.source === "update-server"
-			? {
-					mirror: {
-						serverUrl: settings.update.serverUrl || "https://narrafork-update.b.domexie.cn",
-						product: settings.update.product ?? "narrafork",
-					},
-				}
-			: {}),
+		serverUrl: settings.update?.serverUrl,
+		product: settings.update?.product,
 	});
 }
 export function createDistributionContext(
-	source: HelperSource & { repository?: string; product?: string } = captureHelperSource(),
+	source: HelperSource = captureHelperSource(),
 	fetcher?: DistributionFetch,
 	transport: UpdateFetchContext = createUpdateFetchContext(),
 ): DistributionContext {
-	// GitHub remains authority; the optional mirror only delivers verified executable bytes.
-	const frozen = Object.freeze(
-		normalizeHelperSource({
-			source: "github",
-			repository: source.repository ?? settings.update?.githubRepository,
-			...(source.source === "github" && source.mirror
-				? { mirror: source.mirror }
-				: source.source === "update-server"
-					? {
-							mirror: {
-								serverUrl: source.serverUrl,
-								product: source.product ?? settings.update?.product ?? "narrafork",
-							},
-						}
-					: {}),
-		}),
-	);
+	// Both metadata and executables belong exclusively to this frozen source.
+	const frozen = Object.freeze(normalizeHelperSource(source));
 	const identity = helperSourceIdentity(frozen);
 	return {
 		source: frozen,
@@ -85,9 +64,13 @@ export function distributionAssetUrl(source: HelperSource, tag: string, name: st
 		!/^[A-Za-z0-9._-]+$/.test(tag)
 	)
 		throw new Error("Invalid distribution asset");
-	if (source.source !== "github")
-		throw new Error("Auxiliary binaries require a configured GitHub repository");
-	return `https://github.com/${source.repository}/releases/download/${tag}/${name}`;
+	const normalized = normalizeHelperSource(source);
+	if (normalized.source === "github")
+		return `https://github.com/${normalized.repository}/releases/download/${tag}/${name}`;
+	const component = /^(helpers|executor|remote-peer)-v(.+)$/.exec(tag);
+	if (!component || !isValidReleaseVersion(component[2]))
+		throw new Error("Invalid pinned component mirror identity");
+	return `${normalized.serverUrl}/api/v3/products/${encodeURIComponent(normalized.product)}/mirror/tools/${component[1]}/${encodeURIComponent(tag)}/assets/${encodeURIComponent(name)}`;
 }
 export function withDeadline(
 	parent: AbortSignal | undefined,
@@ -127,7 +110,7 @@ export async function fetchDistributionAsset(
 		context,
 		distributionAssetUrl(context.source, tag, name),
 		signal,
-		true,
+		context.source.source === "github",
 	);
 }
 async function fetchDistributionUrl(
@@ -254,7 +237,6 @@ export async function getHelperManifest(
 	cancellationScope = "unscoped",
 ): Promise<HelperManifest | null> {
 	signal.throwIfAborted();
-	if (context.source.source !== "github") return null;
 	const source = context.source;
 	const key = `${context.key}\0${HELPER_RELEASE_TAG}`;
 	const cached = helperManifests.get(key);
@@ -387,64 +369,6 @@ export async function downloadDistributionFile(
 	expected: { size?: number; sha256?: string; platform?: string },
 	options: DistributionDownloadOptions,
 ): Promise<string> {
-	// A single overall budget covers mirror + GitHub; timeout/cancel never restarts it.
-	const deadline = withDeadline(options.signal, options.timeoutMs);
-	const frozenOptions = { ...options, signal: deadline.signal };
-	try {
-		if (
-			context.source.source === "github" &&
-			context.source.mirror &&
-			expected.sha256 &&
-			expected.size
-		) {
-			const started = Date.now();
-			try {
-				return await downloadDistributionAttempt(
-					context,
-					tag,
-					name,
-					path,
-					expected,
-					frozenOptions,
-					true,
-				);
-			} catch (error) {
-				deadline.signal.throwIfAborted();
-				if (
-					error instanceof Error &&
-					(error.name === "AbortError" || error.name === "TimeoutError")
-				)
-					throw error;
-				if (!options.allowFrozenSource && !context.isCurrent())
-					throw new Error("Distribution source changed");
-				logger.info("Component mirror failed; falling back to pinned GitHub asset", {
-					durationMs: Date.now() - started,
-					bytes: expected.size,
-				});
-			}
-		}
-		return await downloadDistributionAttempt(
-			context,
-			tag,
-			name,
-			path,
-			expected,
-			frozenOptions,
-			false,
-		);
-	} finally {
-		deadline.dispose();
-	}
-}
-async function downloadDistributionAttempt(
-	context: DistributionContext,
-	tag: string,
-	name: string,
-	path: string,
-	expected: { size?: number; sha256?: string; platform?: string },
-	options: DistributionDownloadOptions,
-	mirror: boolean,
-): Promise<string> {
 	const deadline = withDeadline(options.signal, options.timeoutMs);
 	const maxBytes = Math.min(options.maxBytes ?? HELPER_BINARY_MAX_BYTES, HELPER_BINARY_MAX_BYTES);
 	let temp: string | undefined;
@@ -454,24 +378,7 @@ async function downloadDistributionAttempt(
 		deadline.signal.throwIfAborted();
 		if (!Number.isFinite(maxBytes) || maxBytes < 1) throw new Error("Invalid binary size limit");
 		if (!expected.sha256 && !options.allowUnsigned) throw new Error("Unsigned distribution binary");
-		// Validate the same fixed tag/name for both delivery paths.
-		distributionAssetUrl(context.source, tag, name);
-		const delivery = context.source.source === "github" ? context.source.mirror : undefined;
-		if (
-			mirror &&
-			(!delivery || !/^(helpers|executor)-v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/.test(tag))
-		)
-			throw new Error("Invalid pinned component mirror identity");
-		const kind = tag.startsWith("helpers-v") ? "helpers" : "executor";
-		response =
-			mirror && delivery
-				? await fetchDistributionUrl(
-						context,
-						`${delivery.serverUrl}/api/v3/products/${encodeURIComponent(delivery.product)}/mirror/tools/${kind}/${encodeURIComponent(tag)}/assets/${encodeURIComponent(name)}`,
-						deadline.signal,
-						false,
-					)
-				: await fetchDistributionAsset(context, tag, name, deadline.signal);
+		response = await fetchDistributionAsset(context, tag, name, deadline.signal);
 		if (!response.ok || Number(response.headers.get("content-length")) > maxBytes)
 			throw new Error("Distribution binary unavailable/oversized");
 		reader = response.body?.getReader();

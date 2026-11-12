@@ -22,6 +22,7 @@ import {
 	prepareCiReleaseBuild,
 	REQUIRED_RELEASE_BUILD_SOURCE_CHECKS,
 	restoreCiReleaseBuildPlatform,
+	restoreCiReleaseRemoteFrontend,
 	validateCiReleaseBuildSource,
 } from "../../scripts/lib/ci-release-build-restore";
 import {
@@ -33,6 +34,9 @@ import {
 } from "../../scripts/lib/ci-release-types";
 
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+
+import { REMOTE_FRONTEND_CAPABILITY } from "../../shared/remote-access/application";
+import { remoteReleaseFixture } from "./remote-frontend-release.fixture";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -298,7 +302,10 @@ function fixture(supplied?: CiReleasePlan) {
 			else if (path.startsWith("compare/"))
 				value = { status: "ahead", merge_base_commit: { sha: path.slice(8, 48) } };
 			else if (path === `git/trees/${commit}`) value = { truncated: false, tree: [] };
-			else if (path === `contents/package.json?ref=${commit}`)
+			else if (path === `contents/shared/remote-access/frontend-capability.json?ref=${commit}`) {
+				if (!original.remoteFrontend) throw new Error("HTTP 404");
+				value = contents(original.remoteFrontend);
+			} else if (path === `contents/package.json?ref=${commit}`)
 				value = contents({ version: "1.2.0", packageManager: `bun@${CI_RELEASE_BUN}` });
 			else if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)
 				value = contents(basePlan.changelog);
@@ -443,6 +450,100 @@ describe("default artifact template isolation", () => {
 		expect(fresh.downloads).toEqual([900]);
 		noOwnedTemps(right);
 		noOwnedTemps(fresh);
+	});
+});
+
+async function addRemoteOriginal(state: ReturnType<typeof fixture>, sourceCommit = commit) {
+	state.original.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+	state.repackPlan();
+	const remote = await remoteReleaseFixture(state.root, {
+		...state.original,
+		commit: sourceCommit,
+	});
+	state.artifacts.push({
+		...structuredClone(state.artifacts[0]),
+		id: 950,
+		name: "remote-frontend-101-2",
+	});
+	state.entries.set(
+		950,
+		Object.values(remote.names).map((name) => ({
+			name,
+			bytes: readFileSync(join(remote.directory, name)),
+		})),
+	);
+	state.repack(950);
+	const build = state.jobs.find(
+		(job) => job.name === "Verify release source / Build and typecheck",
+	);
+	if (!build) throw new Error("Missing fixture build");
+	build.steps.push({ name: "Upload remote frontend", status: "completed", conclusion: "success" });
+	return remote;
+}
+describe("frozen original remote frontend recovery", () => {
+	test("freezes artifact ID/digest/size/run/attempt and restores original bytes without a build", async () => {
+		const state = fixture();
+		const remote = await addRemoteOriginal(state);
+		const plan = await prepare(state, "all");
+		const artifact = state.artifacts.find((item) => item.id === 950);
+		if (!artifact) throw new Error("Missing remote artifact fixture");
+		expect(plan.buildSource?.remoteFrontend).toEqual({
+			id: 950,
+			digest: artifact.digest,
+			size: artifact.size_in_bytes,
+		});
+		expect(plan.buildSource).toMatchObject({ runId: 101, runAttempt: 2, workflowCommit });
+		const destination = join(state.root, "remote-restored");
+		await restoreCiReleaseRemoteFrontend({
+			root: state.root,
+			plan,
+			destination,
+			run: state.run,
+			env: state.env,
+			fetch: state.fetch,
+		});
+		for (const name of Object.values(remote.names))
+			expect(readFileSync(join(destination, name))).toEqual(
+				readFileSync(join(remote.directory, name)),
+			);
+		expect(state.downloads.every((id) => id === 900 || id === 950)).toBe(true);
+	});
+	test("rejects missing remote artifact/proof and a changed frozen digest rather than rebuilding", async () => {
+		const state = fixture();
+		await addRemoteOriginal(state);
+		const plan = await prepare(state, "all");
+		const remote = state.artifacts.find((artifact) => artifact.id === 950);
+		if (!remote) throw new Error();
+		remote.digest = `sha256:${"0".repeat(64)}`;
+		await expect(
+			restoreCiReleaseRemoteFrontend({
+				root: state.root,
+				plan,
+				destination: join(state.root, "rejected"),
+				run: state.run,
+				env: state.env,
+				fetch: state.fetch,
+			}),
+		).rejects.toThrow("identity");
+		state.artifacts.splice(state.artifacts.indexOf(remote), 1);
+		await expect(prepare(state, "all")).rejects.toThrow("artifact missing");
+	});
+	test("valid transport digest cannot excuse remote manifest with another source commit", async () => {
+		const state = fixture();
+		await addRemoteOriginal(state, "d".repeat(40));
+		const plan = await prepare(state, "all");
+		const destination = join(state.root, "wrong-source");
+		await expect(
+			restoreCiReleaseRemoteFrontend({
+				root: state.root,
+				plan,
+				destination,
+				run: state.run,
+				env: state.env,
+				fetch: state.fetch,
+			}),
+		).rejects.toThrow("TARGET_MISMATCH");
+		expect(existsSync(destination)).toBe(false);
 	});
 });
 

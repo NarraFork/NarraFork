@@ -1,4 +1,5 @@
 import { fileReferenceApi } from "@frontend/lib/api/file-references";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { Z } from "@frontend/lib/z-index";
 import { Group, Paper, Text, UnstyledButton, useComputedColorScheme } from "@mantine/core";
 import {
@@ -58,6 +59,7 @@ export function FileReferencePopover({
 	const listRef = useRef<HTMLDivElement>(null);
 	const composingRef = useRef(false);
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		const textarea = textareaRef.current;
 		const start = () => {
 			composingRef.current = true;
@@ -82,7 +84,8 @@ export function FileReferencePopover({
 		!!query && !query.error && !!context && !!cacheScope && search.length > 0 && !selectionQuery;
 
 	useEffect(() => {
-		if (!canSearch) return;
+		if (REMOTE_BUILD) return;
+		if (REMOTE_BUILD || !canSearch) return;
 		const controller = new AbortController();
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		const timer = setTimeout(() => {
@@ -137,12 +140,14 @@ export function FileReferencePopover({
 		selected.key === queryKey ? Math.min(selected.index, Math.max(0, items.length - 1)) : 0;
 
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		listRef.current
 			?.querySelectorAll("[data-file-reference-item]")
 			[index]?.scrollIntoView?.({ block: "nearest" });
 	}, [index]);
 
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		const textarea = textareaRef.current;
 		if (!query || !textarea) return;
 		const handle = (event: KeyboardEvent) => {
@@ -178,7 +183,7 @@ export function FileReferencePopover({
 		return () => textarea.removeEventListener("keydown", handle, true);
 	}, [query, textareaRef, items, index, queryKey, onClose, onSelect, onNavigate]);
 
-	if (!query) return null;
+	if (REMOTE_BUILD || !query) return null;
 	const warning =
 		query.error === "queryTooLong"
 			? t("fileReferences.queryTooLong", { defaultValue: "文件查询过长，请缩小范围" })

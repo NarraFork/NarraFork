@@ -82,6 +82,7 @@ import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
 } from "./routes/public-narrator-shares";
+import { remoteAccessRoutes } from "./routes/remote-access";
 import { routineRoutes } from "./routes/routines";
 import { runtimeRoutes } from "./routes/runtime";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks";
@@ -422,6 +423,7 @@ app.route("/api/fs", fsPublicDownloadRoutes);
 // must opt into an explicitly mounted external route and can never fall through
 // to the internal UI/API surface.
 app.use("/api/*", requireSessionAuth);
+app.route("/api/remote-access", remoteAccessRoutes);
 
 // When git is not installed, only block routes that are known to execute git.
 // Most settings, account, AI provider, standalone narrator, search, upload, and

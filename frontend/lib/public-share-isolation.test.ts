@@ -69,7 +69,10 @@ describe("public narrator share entry isolation", () => {
 		expect(app).toContain("React.useSyncExternalStore(");
 		expect(app).toContain("history.subscribe(notify)");
 		expect(app).toMatch(/isPublicShare \? \(\s*routeContent\s*\) : \(\s*<>\s*<PluginThemeInjector/);
-		expect(app).toContain("!isPublicShare && <AppNotifications />");
+		expect(app).toContain("<CoreProviders notifications={!isPublicShare}>");
+		expect(entrySource("components/CoreProviders.tsx")).toContain(
+			"notifications && <AppNotifications />",
+		);
 	});
 });
 

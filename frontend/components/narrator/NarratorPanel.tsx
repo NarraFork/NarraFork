@@ -1,4 +1,5 @@
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import {
@@ -224,6 +225,7 @@ import {
 import { filePanelBaseName } from "./panels/panel-kind";
 import { preloadPendingPanelTail } from "./preload-panel-tail";
 import { compactProgressLabel } from "./progress-label";
+import { RemoteUnsupported } from "./RemoteUnsupported";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
 import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./scroll/swipeState";
@@ -240,25 +242,29 @@ import { useWorkspaceDock } from "./workspace/workspace-dock";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
-const SaveDumpModal = lazy(() =>
-	import("./SaveDumpModal").then((m) => ({ default: m.SaveDumpModal })),
-);
+const SaveDumpModal = REMOTE_BUILD
+	? RemoteUnsupported
+	: lazy(() => import("./SaveDumpModal").then((m) => ({ default: m.SaveDumpModal })));
 
-const NarratorDetailsPanel = lazy(() =>
-	import("./details/NarratorDetailsPanel").then((module) => ({
-		default: module.NarratorDetailsPanel,
-	})),
-);
+const NarratorDetailsPanel = REMOTE_BUILD
+	? RemoteUnsupported
+	: lazy(() =>
+			import("./details/NarratorDetailsPanel").then((module) => ({
+				default: module.NarratorDetailsPanel,
+			})),
+		);
 
-const SpecPanel = lazy(() =>
-	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
-);
+const SpecPanel = REMOTE_BUILD
+	? RemoteUnsupported
+	: lazy(() => import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })));
 // The drawer and dock use the same editor / binary-preview entry.
-const FilePanelContent = lazy(() =>
-	import("./file-panel/FilePanelContent").then((module) => ({
-		default: module.FilePanelContent,
-	})),
-);
+const FilePanelContent = REMOTE_BUILD
+	? RemoteUnsupported
+	: lazy(() =>
+			import("./file-panel/FilePanelContent").then((module) => ({
+				default: module.FilePanelContent,
+			})),
+		);
 
 // Flag-gated pretext virtualized list. Now the default renderer, but still lazily
 // imported so an explicit opt-out (Virtual OFF) never bundles vlist; the isolation
@@ -508,7 +514,7 @@ function NarratorPanelBody({
 	const executionDevicesQuery = useQuery({
 		queryKey: ["narratorExecutionDevices", narratorId],
 		queryFn: () => api.getNarratorExecutionDevices(narratorId),
-		enabled: !isWorkspacePreview,
+		enabled: !REMOTE_BUILD && !isWorkspacePreview,
 		// 设备列表变化缓慢, 60s 轮询足够
 		refetchInterval: 60_000,
 	});
@@ -646,7 +652,7 @@ function NarratorPanelBody({
 	// The panel is the phone's whole page (the route hands it the horizontal safe areas
 	// for exactly that case), so its header is the top of the screen and carries the
 	// menu button: phones have no header row of their own.
-	const showMobileNav = ownsHorizontalSafeArea && isMobileViewport;
+	const showMobileNav = !REMOTE_BUILD && ownsHorizontalSafeArea && isMobileViewport;
 
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
@@ -709,7 +715,7 @@ function NarratorPanelBody({
 	const commandCodeUsageQuery = useQuery({
 		queryKey: ["commandcode", "usage"],
 		queryFn: () => api.commandCodeUsage(),
-		enabled: commandCodeEnabled,
+		enabled: !REMOTE_BUILD && commandCodeEnabled,
 		refetchInterval: commandCodeEnabled ? 60_000 : false,
 	});
 	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
@@ -734,7 +740,7 @@ function NarratorPanelBody({
 	const { data: kimiUsagesData } = useQuery({
 		queryKey: ["kimi", "usages"],
 		queryFn: api.kimiGetUsages,
-		enabled: currentKimiProviderId != null && firstScreenActivity,
+		enabled: !REMOTE_BUILD && currentKimiProviderId != null && firstScreenActivity,
 		staleTime: 30_000,
 		refetchInterval: 60_000,
 	});
@@ -1532,10 +1538,12 @@ function NarratorPanelBody({
 	const [internalSpecOpen, setInternalSpecOpen] = useState(false);
 	const subagentInDock = !!dock && dock.narratorId !== narratorId;
 	const useDockSpec = !!dock && !subagentInDock;
-	const useInternalSpec = !useDockSpec && !onToggleSpecPanel && !isWorkspacePreview;
+	const useInternalSpec =
+		!REMOTE_BUILD && !useDockSpec && !onToggleSpecPanel && !isWorkspacePreview;
 	// Button availability mirrors the render conditions exactly: whenever a spec
 	// surface exists (dock / external / internal), the toolbar entry point exists.
-	const specToolAvailable = useDockSpec || !!onToggleSpecPanel || useInternalSpec;
+	const specToolAvailable =
+		!REMOTE_BUILD && (useDockSpec || !!onToggleSpecPanel || useInternalSpec);
 	const specToolOpened = useDockSpec
 		? dock.openToolTypes.has("spec")
 		: onToggleSpecPanel
@@ -1564,7 +1572,8 @@ function NarratorPanelBody({
 	// Dock tool panels are scoped to the base narrator in context; hide the button
 	// for pushed subagent views so the badge and opened panel never disagree.
 	const tasksPanelMatchesCurrentNarrator = !dock || dock.narratorId === narratorId;
-	const tasksButtonEnabled = !isWorkspacePreview && tasksPanelMatchesCurrentNarrator;
+	const tasksButtonEnabled =
+		!REMOTE_BUILD && !isWorkspacePreview && tasksPanelMatchesCurrentNarrator;
 	const {
 		supported: tasksSupported,
 		runningCount: tasksRunningCount,
@@ -1590,7 +1599,7 @@ function NarratorPanelBody({
 		[currentTaskData],
 	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
-	const terminalToolAvailable = !!dock || !!onToggleTerminal;
+	const terminalToolAvailable = !REMOTE_BUILD && (!!dock || !!onToggleTerminal);
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
 	const toggleTerminalTool = useCallback(() => {
 		if (dock) dock.toggleToolPanel("terminal");
@@ -1600,6 +1609,7 @@ function NarratorPanelBody({
 	// through the dock context (writes to the terminal panel if one is open).
 	const dockWriteTerminalStdin = dock?.writeTerminalStdin;
 	const effSendToTerminal = useMemo<((text: string) => void) | undefined>(() => {
+		if (REMOTE_BUILD) return undefined;
 		if (onSendToTerminal) return onSendToTerminal;
 		if (dock && terminalToolOpened && dockWriteTerminalStdin) return dockWriteTerminalStdin;
 		return undefined;
@@ -3203,24 +3213,29 @@ function NarratorPanelBody({
 					{...dropZoneProps}
 				>
 					{toolbarController.toolbarOverlays}
-					<DeviceDirectoryDialog
-						narratorId={narratorId}
-						deviceId={directoryDeviceId}
-						deviceName={
-							executionDevicesQuery.data?.devices.find((device) => device.id === directoryDeviceId)
-								?.name
-						}
-						onClose={closeDeviceDirectoryDialog}
-					/>
-					<NugRechargeDialog
-						opened={nugRechargeOpened}
-						narratorId={narratorId}
-						providerId={nugProviderInfo?.providerId ?? paymentRequired?.providerId ?? null}
-						providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
-						paymentRequired={paymentRequired}
-						onClose={closeNugRecharge}
-						onPaymentRequiredChange={setPaymentRequired}
-					/>
+					{!REMOTE_BUILD && (
+						<DeviceDirectoryDialog
+							narratorId={narratorId}
+							deviceId={directoryDeviceId}
+							deviceName={
+								executionDevicesQuery.data?.devices.find(
+									(device) => device.id === directoryDeviceId,
+								)?.name
+							}
+							onClose={closeDeviceDirectoryDialog}
+						/>
+					)}
+					{!REMOTE_BUILD && (
+						<NugRechargeDialog
+							opened={nugRechargeOpened}
+							narratorId={narratorId}
+							providerId={nugProviderInfo?.providerId ?? paymentRequired?.providerId ?? null}
+							providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
+							paymentRequired={paymentRequired}
+							onClose={closeNugRecharge}
+							onPaymentRequiredChange={setPaymentRequired}
+						/>
+					)}
 					{/* Drop overlay */}
 					<DropOverlay visible={isDragging} />
 					{/* Header — title-first arithmetic, single flex row, no flex fight:
@@ -3419,11 +3434,13 @@ function NarratorPanelBody({
 						onClose={closeCompactSummaryModal}
 					/>
 
-					<NarratorProjectSettingsModal
-						projectId={compatibilityProjectId}
-						opened={compatibilityOpen}
-						onClose={() => setCompatibilityOpen(false)}
-					/>
+					{!REMOTE_BUILD && (
+						<NarratorProjectSettingsModal
+							projectId={compatibilityProjectId}
+							opened={compatibilityOpen}
+							onClose={() => setCompatibilityOpen(false)}
+						/>
+					)}
 
 					<ContextThresholdSettingsModal
 						opened={contextThresholdSettingsOpened}
@@ -3440,7 +3457,7 @@ function NarratorPanelBody({
 					    driven by the `opened` prop, matching the terminal/spec drawers.
 					    All of the panel's data hooks are `opened`-gated, so a mounted-
 					    but-closed drawer fetches nothing. */}
-					{!dock && !onToggleDetailsPanel && (
+					{!REMOTE_BUILD && !dock && !onToggleDetailsPanel && (
 						<Suspense fallback={null}>
 							<NarratorDetailsPanel
 								opened={detailsOpened}
@@ -3785,7 +3802,7 @@ function NarratorPanelBody({
 								toolAvailable: terminalToolAvailable,
 								toolOpened: terminalToolOpened,
 								activeCount: activeTerminalCount,
-								onOpenPanel: onOpenTerminalPanel,
+								onOpenPanel: REMOTE_BUILD ? undefined : onOpenTerminalPanel,
 								onToggle: toggleTerminalTool,
 							},
 							promote: {
@@ -3927,7 +3944,7 @@ function NarratorPanelBody({
 					    Mounted only while a path is selected (and torn down on close), so a
 					    session that never opens a file pays nothing. Same viewer body the
 					    dock's `file` panel renders. */}
-					{internalFileViewerPath && (
+					{!REMOTE_BUILD && internalFileViewerPath && (
 						<Drawer
 							opened={fileDrawerVisible}
 							keepMounted
@@ -3977,7 +3994,7 @@ function NarratorPanelBody({
 						</Drawer>
 					)}
 					{/* The outline's off-dock host: opened only when no dock took the place. */}
-					{outlineDrawer && (
+					{!REMOTE_BUILD && outlineDrawer && (
 						<OutlineDrawerHost
 							state={outlineDrawer}
 							onChange={setOutlineDrawer}
@@ -3993,7 +4010,7 @@ function NarratorPanelBody({
 					 * point. Mounted only when this panel has no dock to put panels in, so
 					 * a desktop surface keeps using real dockview tabs.
 					 */}
-					{!dock && !isWorkspacePreview && (
+					{!REMOTE_BUILD && !dock && !isWorkspacePreview && (
 						<>
 							<MobileToolPanelHost
 								kind={mobileToolPanel}
