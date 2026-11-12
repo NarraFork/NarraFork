@@ -273,7 +273,7 @@ describe("N-R2-5: the turn-end note and the pre-idle drain", () => {
 			join(import.meta.dir, "../../agent-runtime/orchestrator.ts"),
 			"utf8",
 		);
-		const decide = source.indexOf("const turnEndNote = await decideOutlineTurnEndNote(active);");
+		const decide = source.indexOf("const turnEndNote = await decideOutlineTurnEndNote(active, {");
 		const drain = source.indexOf("const bgCompletionAfterIdle = await", decide);
 		const finalizing = source.indexOf("} else run.finalizing = true;", drain);
 		const idle = source.indexOf("await narratorService.compareAndSetStatus(", finalizing);

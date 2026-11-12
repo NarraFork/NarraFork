@@ -53,6 +53,7 @@ import {
 	runOutlineDigestSlice,
 	startOutlineDigestSweepForTests,
 } from "../digest-job";
+import { handoffOps, OUTLINE_HANDOFF_ACTOR } from "../handoff";
 import { listOutlineAttention } from "../inbox";
 import type { OutlineAskJson } from "../model";
 import { confirmOutlinePending, lockOutlineTask } from "../pending";
@@ -1083,6 +1084,66 @@ describe("reports: a session opened for a task (outline P2 PR 10c-1)", () => {
 		expect(d.other.map((o) => [o.event, o.actor.id])).toEqual([
 			["system", "outline-something-new"],
 		]);
+	}, 60_000);
+
+	test("a task given back unfinished with a handoff (PR 10c-2) is counted, not listed, and its handoff is not knowledge", async () => {
+		const ned = await person("ned", { timeZone: "UTC" });
+		const session = await narrator(ned.id);
+		const p = await project(ned.id);
+		const made = await write(
+			p.space,
+			{ kind: "human", id: ned.id },
+			ned.id,
+			"2026-12-07T08:00:00.000Z",
+			[
+				{ op: "insert", tempId: "page", parent: null, content: "Pool" },
+				{
+					op: "insert",
+					parent: { tempId: "page" },
+					content: "Pool task",
+					task: { status: "todo" },
+				},
+			],
+		);
+		const taskId = (made.results[1] as { blockId: string }).blockId;
+		await write(p.space, { kind: "agent", id: session }, ned.id, "2026-12-07T09:00:00.000Z", [
+			{ op: "setTask", block: { id: taskId }, task: { status: "doing" } },
+		]);
+		// The release's commit, as `release.ts` writes it (dated here, for the report's day).
+		await writeOutline(
+			{
+				spaceId: p.space.id,
+				ops: [
+					{ op: "setTask", block: { id: taskId }, task: { status: "todo" } },
+					...handoffOps({
+						taskBlockId: taskId,
+						epoch: 1,
+						narratorId: session,
+						title: "Refresh work",
+						at: new Date("2026-12-07T10:00:00.000Z"),
+						reason: "unfinished",
+						locale: "en",
+						notes: [],
+						steps: null,
+						directory: null,
+						reply: "Stopped at the second path.",
+					}),
+				],
+				actor: { kind: "system", id: OUTLINE_HANDOFF_ACTOR },
+				responsibleUserId: ned.id,
+			},
+			{ store, now: () => new Date("2026-12-07T10:00:00.000Z") },
+		);
+		await runJob("2026-12-08T08:00:00.000Z");
+		const day = (await dailies(ned.id)).find(
+			(d) => d.periodKey === "2026-12-07",
+		) as OutlineDigestRow;
+		const d = await detail(ned.id, day.id);
+		expect(d.other).toEqual([]);
+		expect(d.tasks.map((t) => t.event)).toEqual([]);
+		expect(d.knowledge.flatMap((k) => k.blocks.map((b) => b.title))).toEqual([]);
+		const space = d.spaces.find((s) => s.id === p.space.id);
+		expect(space).toMatchObject({ handedBack: 1, leaseReturned: 0 });
 	}, 60_000);
 });
 

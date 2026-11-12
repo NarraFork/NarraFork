@@ -53,6 +53,7 @@ function space(id: string, extra: Partial<OutlineDigestSpaceView> = {}): Outline
 		tasksCreated: 0,
 		tasksStarted: 0,
 		leaseReturned: 0,
+		handedBack: 0,
 		reviewComments: 0,
 		more: {},
 		...extra,
