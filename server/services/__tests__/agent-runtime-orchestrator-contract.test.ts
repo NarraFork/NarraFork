@@ -667,9 +667,7 @@ describe("outline task leases", () => {
 			// A pass before left its own word behind: the next pass never inherits it.
 			h.session._runInitiatedBy = "person";
 			h.session._runForTaskId = "task-1";
-			expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toBe(
-				undefined,
-			);
+			expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toBe(undefined);
 			expect(h.session._runInitiatedBy).toBeUndefined();
 			expect(h.session._runForTaskId).toBeUndefined();
 

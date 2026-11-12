@@ -89,6 +89,7 @@ const {
 	continueNarrator,
 	decideOutlineTurnEndNote,
 	prepareOutlineRun,
+	retryLastMessage,
 	sendMessage,
 	startSpecContinuationIfPossible,
 } = await import("../narrator-session");
@@ -1441,6 +1442,85 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 		expect(await stateOf(task.id)).toMatchObject({ status: "doing", holder: id, epoch: 2 });
 		await hourFrom(before);
 
+		expect(await handoffsUnder(task.id)).toHaveLength(1);
+	});
+
+	test("Retry is a person's: with nothing remembered of earlier runs, the task stays for the hour", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const { body } = await open(alice, task);
+		const id = body.narratorId;
+		await idle(id, 1);
+		const takeUp = async () => {
+			if ((await stateOf(task.id)).holder === id) return;
+			await asSession(p.space.id, id, alice, [
+				{ op: "setTask", block: { id: task.id }, task: { status: "doing" } },
+			]);
+		};
+		// The person's message: the session takes the task up, then the model request fails.
+		onTurn = async () => {
+			await takeUp();
+			throw new Error("the provider is down");
+		};
+		await sendMessage(id, "carry on with it", undefined, "en", false, null, alice);
+		await idle(id, 2);
+		expect(await stateOf(task.id)).toMatchObject({ status: "doing", holder: id, epoch: 2 });
+		onTurn = takeUp;
+		// Only the retry's own start decides now.
+		resetOutlinePersonRunEndsForTests();
+		resetOutlineGraceLeasesForTests();
+		const before = Date.now();
+		// The previous run's finalizer may still hold the session for a moment after it is idle.
+		let retried = false;
+		for (const deadline = Date.now() + 5_000; !retried && Date.now() < deadline; ) {
+			retried = (await retryLastMessage(id, "en", false, alice)).ok;
+			if (!retried) await Bun.sleep(5);
+		}
+		expect(retried).toBe(true);
+		await idle(id, 3);
+		expect(await stateOf(task.id)).toMatchObject({ status: "doing", holder: id, epoch: 2 });
+		const [claim] = await outlineStore.getTaskClaims([task.id]);
+		const lease = Date.parse(claim?.expiresAt as string) - before;
+		expect(lease).toBeGreaterThan(50 * 60_000);
+		expect(lease).toBeLessThan(70 * 60_000);
+		expect(await handoffsUnder(task.id)).toHaveLength(1);
+	});
+
+	test("a start nobody asked for (a plugin's, `explicitStart: false`) is the system's: an unfinished team task goes back at once", async () => {
+		settings.agent.autoContinuationMode = "protectedOnly";
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const plain = await narratorService.create({
+			contextProjectId: p.id,
+			cwd: p.dir,
+			ownerUserId: alice,
+			title: "Holder",
+			taskBackend: "outline",
+			startInPlanMode: false,
+		});
+		opened.push(plain.id);
+		// The session took the task up earlier; the plugin's start continues it.
+		await asSession(p.space.id, plain.id, alice, [
+			{ op: "setTask", block: { id: task.id }, task: { status: "doing" } },
+		]);
+		let during: Awaited<ReturnType<typeof stateOf>> | null = null;
+		onTurn = async () => {
+			during = await stateOf(task.id);
+		};
+		const started = await startSpecContinuationIfPossible(plain.id, "en", false, alice, {
+			preferTaskId: task.id,
+			explicitStart: false,
+		});
+		expect(started.started).toBe(true);
+		await idle(plain.id, 1);
+		expect(during).toMatchObject({ status: "doing", holder: plain.id });
+		expect(await stateOf(task.id)).toMatchObject({
+			status: "todo",
+			holder: null,
+			lastHolder: plain.id,
+		});
 		expect(await handoffsUnder(task.id)).toHaveLength(1);
 	});
 
