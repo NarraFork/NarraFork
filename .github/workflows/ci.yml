@@ -90,6 +90,11 @@ jobs:
         run: |
           test -f dist/frontend/index.html
           test -f frontend/routeTree.gen.ts
+      # Root tests import the extension's type-only API; its vscode types live here.
+      - name: Install VS Code extension type dependencies
+        run: bun install --cwd vscode-extension --frozen-lockfile
+      - name: Check TypeScript
+        run: bunx tsgo --noEmit
       # Historical target checkouts without a declaration must never execute a newer script.
       - name: Build declared remote frontend
         if: ${{ hashFiles('shared/remote-access/frontend-capability.json') != '' }}
@@ -99,13 +104,13 @@ jobs:
           BUILD_REPOSITORY: ${{ github.repository }}
         run: |
           VERSION="${RELEASE_VERSION:-$(bun --eval 'console.log((await Bun.file("package.json").json()).version)')}"
-          bun scripts/build-remote-frontend.ts --repository="$BUILD_REPOSITORY" --version="$VERSION" --commit="$SOURCE_COMMIT" --output=.ci-remote-frontend
+          bun scripts/build-remote-frontend.ts --repository="$BUILD_REPOSITORY" --version="$VERSION" --commit="$SOURCE_COMMIT" --output=dist/remote-frontend-artifact
       - name: Upload remote frontend
         if: ${{ hashFiles('shared/remote-access/frontend-capability.json') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: remote-frontend-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .ci-remote-frontend/
+          path: dist/remote-frontend-artifact/
           if-no-files-found: error
           retention-days: 30
       - name: Upload remote UI for isolated browser tests
@@ -116,11 +121,6 @@ jobs:
           path: dist/frontend-remote/
           if-no-files-found: error
           retention-days: 7
-      # Root tests import the extension's type-only API; its vscode types live here.
-      - name: Install VS Code extension type dependencies
-        run: bun install --cwd vscode-extension --frozen-lockfile
-      - name: Check TypeScript
-        run: bunx tsgo --noEmit
       - name: Upload frontend build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

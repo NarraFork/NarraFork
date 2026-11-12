@@ -98,6 +98,27 @@ describe("remote frontend release wiring", () => {
 				?.NF_REMOTE_PRODUCTION_TEST,
 		).toBe("1");
 	});
+	test("remote artifact producer and upload share a non-hidden directory", () => {
+		const steps = ci.jobs.build.steps ?? [];
+		const build = steps.find((step) => step.name === "Build declared remote frontend");
+		const upload = steps.find((step) => step.name === "Upload remote frontend");
+		const path = upload?.with?.path;
+		expect(typeof path).toBe("string");
+		if (typeof path !== "string") throw new Error("Missing remote artifact upload directory");
+		const directory = path.replace(/\/$/, "");
+		expect(directory.split("/").every((segment) => !!segment && !segment.startsWith("."))).toBe(
+			true,
+		);
+		expect(build?.run).toContain(`--output=${directory}`);
+		const typecheckIndex = steps.findIndex((step) => step.run === "bunx tsgo --noEmit");
+		expect(typecheckIndex).toBeGreaterThanOrEqual(0);
+		for (const [index, step] of steps.entries()) {
+			if (step.uses?.startsWith("actions/upload-artifact@"))
+				expect(index).toBeGreaterThan(typecheckIndex);
+		}
+		// Do not broadly enable uploading hidden content just to include these two public assets.
+		expect(upload?.with?.["include-hidden-files"]).not.toBe(true);
+	});
 	test("raw-build recovery restores exact artifacts without source builds; ordinary binary input stays ordinary", () => {
 		const job = release.jobs["restore-remote-frontend"];
 		expect(job.if).toContain("build-reuse-mode == 'true'");

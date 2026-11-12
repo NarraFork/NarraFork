@@ -21,6 +21,9 @@ on:
 permissions:
   contents: read
 
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
 concurrency:
   group: remote-peer-release
   cancel-in-progress: false
