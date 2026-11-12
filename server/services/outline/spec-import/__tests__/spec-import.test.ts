@@ -16,6 +16,7 @@ import { stopEditTextWorker } from "../../edit-text-runner";
 import { outlineStore } from "../../store";
 import { writeOutline } from "../../write";
 import { importSpecSession, resetSpecImportRecords, specImportRecord } from "../importer";
+import { OUTLINE_SPEC_IMPORT_ACTOR } from "../plan";
 import {
 	backendOf,
 	commitCount,
@@ -308,7 +309,7 @@ describe("the guard", () => {
 });
 
 describe("an attempt met again", () => {
-	test("a task deleted or reopened between attempts is put back before the session moves", async () => {
+	test("a task the import itself left deleted or drifted is put back before the session moves", async () => {
 		const { id } = await makeSession();
 		await writeTasks(id, [
 			{ text: "a", status: "doing" },
@@ -329,15 +330,15 @@ describe("an attempt met again", () => {
 		const before = await taskPage(id);
 		expect(before.map((t) => t.text)).toEqual(["a", "b", "c"]);
 		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
-		// What was in progress is to do until the move (nothing is claimed before it). Meanwhile
-		// someone set it to do again (nothing changes) and deleted a task.
+		// What was in progress is to do until the move (nothing is claimed before it). Versions
+		// only the import wrote (as an earlier attempt of it would): a task deleted, one reopened.
 		await writeOutline({
 			spaceId: space?.id as string,
 			ops: [
-				{ op: "setTask", block: { id: before[0]?.id as string }, task: { status: "todo" } },
+				{ op: "setTask", block: { id: before[2]?.id as string }, task: { status: "todo" } },
 				{ op: "delete", block: { id: before[1]?.id as string } },
 			],
-			actor: { kind: "system", id: "outline-task-lease" },
+			actor: { kind: "system", id: OUTLINE_SPEC_IMPORT_ACTOR },
 			responsibleUserId: null,
 		});
 		expect((await run(id)).status).toBe("imported");
@@ -349,6 +350,38 @@ describe("an attempt met again", () => {
 		]);
 		expect(after[0]?.holder).toBe(id);
 		expect(after.map((t) => t.id)).toEqual(before.map((t) => t.id));
+	});
+
+	test("a task someone else deleted or changed is left as they left it: nothing moves (12b review r2 SF2)", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "a" }, { text: "b" }, { text: "c", status: "done" }]);
+		const cut = new AbortController();
+		let commits = 0;
+		const off = onCommit(() => {
+			if (++commits === 2) cut.abort(new Error("cut"));
+		});
+		await importSpecSession(id, { trigger: "sweep", signal: cut.signal });
+		off();
+		const before = await taskPage(id);
+		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
+		await writeOutline({
+			spaceId: space?.id as string,
+			ops: [
+				{ op: "setTask", block: { id: before[2]?.id as string }, task: { status: "todo" } },
+				{ op: "delete", block: { id: before[1]?.id as string } },
+			],
+			actor: { kind: "system", id: "outline-task-lease" },
+			responsibleUserId: null,
+		});
+		const commitsBefore = await commitCount(id);
+		const outcome = await run(id);
+		expect(outcome).toMatchObject({ status: "failed", attention: true });
+		expect(await backendOf(id)).toBe("spec");
+		expect(await commitCount(id)).toBe(commitsBefore);
+		expect((await taskPage(id)).map((t) => [t.text, t.status])).toEqual([
+			["a", "todo"],
+			["c", "todo"],
+		]);
 	});
 
 	test("an imported task that no longer matches its source moves nothing (needs attention)", async () => {

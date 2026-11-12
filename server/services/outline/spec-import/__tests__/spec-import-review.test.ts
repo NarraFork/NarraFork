@@ -243,9 +243,10 @@ describe("what a person added to an earlier attempt's blocks (S2)", () => {
 		expect(outcome).toMatchObject({ status: "failed", attention: true });
 		expect(specImportRecord(id)?.reason).toEqual({ code: "kept_blocks", count: 1 });
 		expect(await backendOf(id)).toBe("spec");
+		// Nothing of the new revision beside it (review r2 NIT 3): only the kept task is there.
 		const tasks = await taskPage(id);
-		const kept = tasks.find((t) => t.id === old?.id);
-		expect(kept?.children).toEqual(["my own note, typed by a person"]);
+		expect(tasks.map((t) => t.id)).toEqual([old?.id]);
+		expect(tasks[0]?.children).toEqual(["my own note, typed by a person"]);
 		// The person moves their note out (here: deletes the old task after copying it): the
 		// next attempt goes through.
 		await writeOutline({
@@ -283,18 +284,36 @@ describe("what a person added to an earlier attempt's blocks (S2)", () => {
 		await writeNote(id, "plan.md", "step one\nstep two\n");
 		await writeNote(id, "other.md", "changed\n");
 		await writeNote(id, "edited.md", "changed too\n");
+		const commits = await commitCount(id);
 		expect(await run(id)).toMatchObject({ status: "failed", attention: true });
 		expect(specImportRecord(id)?.reason).toEqual({ code: "kept_blocks", count: 2 });
+		// The attempt wrote nothing (review r2 NIT 3): the person's work is kept, no new revision
+		// beside it, and the page only the import wrote waits for the next attempt.
+		expect(await commitCount(id)).toBe(commits);
 		const after = await pages(id);
 		const titled = (title: string) => after.filter((p) => p.title === title);
-		// Kept: the person's work, beside the new import.
-		expect(titled("plan.md").map((p) => p.blocks)).toContainEqual([
-			"step one",
-			"person's addition",
-		]);
-		expect(titled("edited.md").map((p) => p.blocks)).toContainEqual(["as a person wrote it"]);
-		// Gone: what only the import wrote.
-		expect(titled("other.md").map((p) => p.blocks)).toEqual([["changed"]]);
+		expect(titled("plan.md").map((p) => p.blocks)).toEqual([["step one", "person's addition"]]);
+		expect(titled("edited.md").map((p) => p.blocks)).toEqual([["as a person wrote it"]]);
+		expect(titled("other.md").map((p) => p.blocks)).toEqual([["untouched"]]);
+		// The person deletes their two pages (after taking what is theirs): the next attempt
+		// replaces the rest, once each.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{ op: "delete", block: { id: plan?.id as string } },
+				{ op: "delete", block: { id: edited?.id as string } },
+			],
+			actor: { kind: "human", id: owner as string },
+			responsibleUserId: owner,
+		});
+		expect((await run(id)).status).toBe("imported");
+		const done = await pages(id);
+		for (const [title, blocks] of [
+			["plan.md", ["step one\nstep two"]],
+			["other.md", ["changed"]],
+			["edited.md", ["changed too"]],
+		] as const)
+			expect(done.filter((p) => p.title === title).map((p) => p.blocks)).toEqual([[...blocks]]);
 	});
 
 	test("the index.md page goes when the file is gone or unreadable, when only the import wrote it", async () => {
@@ -321,6 +340,77 @@ describe("what a person added to an earlier attempt's blocks (S2)", () => {
 			expect((await run(id)).status).toBe("imported");
 			expect((await pages(id)).map((p) => p.sid)).not.toContain(specIndexSid());
 		}
+	});
+});
+
+describe("a person's edit under an earlier attempt's task (review r2 SF2)", () => {
+	test("rewritten and ticked before the move: not hidden by the import, and never deleted as its own", async () => {
+		const { id, owner } = await makeSession();
+		await writeTasks(id, [{ text: "original text" }]);
+		await cutAfter(id, 2);
+		const [task] = await taskPage(id);
+		const space = await spaceOf(id);
+		// A person rewrites the task and checks it done.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{
+					op: "update",
+					block: { id: task?.id as string },
+					content: "PERSON'S REWRITE with details",
+				},
+				{ op: "setTask", block: { id: task?.id as string }, task: { status: "done" } },
+			],
+			actor: { kind: "human", id: owner as string },
+			responsibleUserId: owner,
+		});
+		// The next attempt does not set the checkbox back as the import: verification fails.
+		let commits = await commitCount(id);
+		const second = await run(id);
+		expect(second).toMatchObject({ status: "failed", attention: true });
+		expect(specImportRecord(id)?.reason?.code).toBe("task_mismatch");
+		expect(await commitCount(id)).toBe(commits);
+		expect((await taskPage(id)).map((t) => [t.text, t.status])).toEqual([
+			["PERSON'S REWRITE with details", "done"],
+		]);
+		// tasks.json changes: the task is stale now, but a person wrote it, so it is kept and the
+		// attempt writes nothing.
+		resetSpecImportRecords();
+		await writeTasks(id, [{ text: "original text" }, { text: "added" }]);
+		commits = await commitCount(id);
+		const third = await run(id);
+		expect(third).toMatchObject({ status: "failed", attention: true });
+		expect(specImportRecord(id)?.reason).toEqual({ code: "kept_blocks", count: 1 });
+		expect(await commitCount(id)).toBe(commits);
+		expect(await backendOf(id)).toBe("spec");
+		expect((await taskPage(id)).map((t) => [t.id, t.text, t.status])).toEqual([
+			[task?.id, "PERSON'S REWRITE with details", "done"],
+		]);
+	});
+
+	test("a person's edit the import later wrote over still keeps the block (its history is read)", async () => {
+		const { id, owner } = await makeSession();
+		await writeTasks(id, [{ text: "t" }]);
+		await cutAfter(id, 2);
+		const [task] = await taskPage(id);
+		const space = await spaceOf(id);
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "setTask", block: { id: task?.id as string }, task: { status: "done" } }],
+			actor: { kind: "human", id: owner as string },
+			responsibleUserId: owner,
+		});
+		// As an older import would have healed it: the current version is the import's.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "setTask", block: { id: task?.id as string }, task: { status: "todo" } }],
+			actor: { kind: "system", id: "spec-import" },
+			responsibleUserId: owner,
+		});
+		await writeTasks(id, [{ text: "t" }, { text: "u" }]);
+		expect(await run(id)).toMatchObject({ status: "failed", attention: true });
+		expect(specImportRecord(id)?.reason).toEqual({ code: "kept_blocks", count: 1 });
+		expect((await taskPage(id)).map((t) => t.id)).toEqual([task?.id]);
 	});
 });
 

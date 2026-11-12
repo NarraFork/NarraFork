@@ -18,15 +18,16 @@
  *      is not imported (needs attention). History is not imported: the current state only.
  *   2. Takes away what an earlier, unfinished attempt wrote from a source that changed since
  *      (the import's short ids of another revision; see `plan.ts`; on the behavior page, the
- *      blocks of another fence text). Only what nobody but the import wrote: a block someone
- *      added to, moved or edited stays where it is, and the session is not moved until a person
- *      looks (needs attention).
+ *      blocks of another fence text). Only what nobody but the import ever wrote: when a block
+ *      someone added to, moved or edited (at any time) is among them, nothing is taken away or
+ *      written, and the session is not moved until a person looks (needs attention).
  *   3. Notes: every file but `tasks.json` and `behavior_fence` becomes a page (`plan.ts`), its
  *      text converted on the background text worker, as it is (nothing is scanned or repaired).
  *   4. Tasks: `tasks.json` onto the session's task page, in order, then the notes under them.
  *      What is in progress is written to do: nothing is claimed before the move. A task of an
- *      earlier attempt that was deleted since is brought back, and one whose checkbox drifted is
- *      set again: until the session is moved, these blocks are the import's.
+ *      earlier attempt that the import itself deleted or left drifted is brought back or set
+ *      again; one anyone else deleted or changed is left as they left it (step 5 then fails on
+ *      it), so no import version hides their change.
  *   5. Verifies the tasks one by one against the source (count, order, text, checkbox, created
  *      by a person, lock, notes). A mismatch moves nothing (needs attention).
  *   6. The behavior fence, once all of the above holds: its own text onto the behavior page with
@@ -82,8 +83,7 @@ import { OUTLINE_TASKS_PAGE_TITLE } from "../person-tasks";
 import { PluginTaskError, pluginBlockedNoteSid } from "../plugin-tasks";
 import { yieldToEventLoop } from "../session-scope";
 import { outlineStore } from "../store";
-import type { OutlineBlockMeta, OutlineSpaceRow } from "../store/port";
-import type { OutlineStructureRow } from "../store/read-port";
+import type { OutlineBlockMeta, OutlineCommitRow, OutlineSpaceRow } from "../store/port";
 import {
 	type OutlineBlockRef,
 	type OutlineCanonicalContent,
@@ -137,6 +137,10 @@ export const SPEC_IMPORT_LIMITS = {
 	staleSubtreeBlocks: 1600,
 	/** Distinct commits of one stale subtree looked up; more: kept (attention). */
 	staleCommits: 200,
+	/** Versions of one block read to see who ever wrote it; more: kept (attention). */
+	staleVersionsPerBlock: 64,
+	/** Versions of one stale subtree (or page) read in all; more: kept (attention). */
+	staleVersions: 4000,
 	/** Characters of a failure kept for the Spec panel. */
 	errorChars: 300,
 	/** Sessions whose last import is remembered (least recently touched dropped first). */
@@ -726,7 +730,7 @@ async function writeEverything(
 			(p) => specFileTag(narratorId, p.path, p.revisionId as string),
 		),
 	);
-	const kept = await removeStale(ctx, {
+	await removeStale(ctx, {
 		keepFileTags: keep,
 		taskSidPrefix: taskPlan?.sidPrefix ?? null,
 		fenceTag: fence ? behaviorImportTagOf(fence.own) : null,
@@ -779,12 +783,6 @@ async function writeEverything(
 			"tasks.json is not a valid task list: it was imported as a page, the session was not moved",
 			{ code: "broken_tasks" },
 		);
-	if (kept > 0)
-		throw new SpecImportAttention(
-			`${kept} block(s) an earlier, unfinished import wrote hold what someone added or changed since: they were kept; move what is yours out of them (or delete them), then import again`,
-			{ code: "kept_blocks", count: kept },
-		);
-
 	// Step 6, once everything above holds: the fence text goes onto the behavior page last, so an
 	// attempt that does not get this far leaves nothing of a fence that may still change.
 	if (fence?.own)
@@ -904,7 +902,10 @@ function giveWay(ctx: Context): void {
  * need. A node with no parent hangs from `root` (null: it is a page). What is there already is
  * skipped, and so is everything under a block deleted since (a person's choice), unless `heal`:
  * then a deleted block is brought back and a task that drifted from its plan is set again (the
- * tasks, which must be all there for the session to move).
+ * tasks, which must be all there for the session to move), but only when its current version is
+ * the import's own (12b review r2 SF2): what anyone else changed is left as they left it, so the
+ * verification that follows fails on it (needs attention) instead of an import version hiding
+ * it, which a later attempt would then delete as only the import's.
  */
 async function writeNodes(
 	ctx: Context,
@@ -918,6 +919,7 @@ async function writeNodes(
 		ctx.space,
 		nodes.map((node) => node.sid),
 	);
+	const healable = options.heal ? await importVersions(ctx.space, nodes, existing) : new Set();
 	const skipped = new Set<string>();
 	let ops: OutlineOp[] = [];
 	let canonical: Array<OutlineCanonicalContent | null> = [];
@@ -955,7 +957,7 @@ async function writeNodes(
 				...(node.task ? { task: node.task } : {}),
 			};
 		} else if (found.deleted) {
-			if (!options.heal) {
+			if (!options.heal || !healable.has(found.id)) {
 				skipped.add(node.sid);
 				continue;
 			}
@@ -966,7 +968,7 @@ async function writeNodes(
 				content: node.content,
 				...(node.task ? { task: node.task } : {}),
 			};
-		} else if (options.heal && node.task && drifted(found, node)) {
+		} else if (options.heal && node.task && drifted(found, node) && healable.has(found.id)) {
 			op = {
 				op: "setTask",
 				block: { id: found.id },
@@ -991,6 +993,32 @@ async function writeNodes(
 		bytes += size;
 	}
 	await flush();
+}
+
+/**
+ * Of the blocks `writeNodes` would heal (deleted, or a task that drifted), those whose current
+ * version one of the import's own commits wrote. Bounded: the nodes are the tasks of one
+ * `tasks.json` (at most 100, with their notes), their commits looked up 100 seqs at a time.
+ */
+async function importVersions(
+	space: OutlineSpaceRow,
+	nodes: readonly SpecImportNode[],
+	existing: ReadonlyMap<string, OutlineBlockMeta>,
+): Promise<Set<string>> {
+	const candidates: OutlineBlockMeta[] = [];
+	for (const node of nodes) {
+		const found = existing.get(node.sid);
+		if (found && (found.deleted || (node.task && drifted(found, node)))) candidates.push(found);
+	}
+	const out = new Set<string>();
+	if (candidates.length === 0) return out;
+	const seqs = [...new Set(candidates.map((meta) => meta.versionSeq))];
+	const ours = new Set<number>();
+	for (let i = 0; i < seqs.length; i += 100)
+		for (const row of await outlineStore.getCommitsBySeqs(space.id, seqs.slice(i, i + 100)))
+			if (isImportCommit(row)) ours.add(row.seq);
+	for (const meta of candidates) if (ours.has(meta.versionSeq)) out.add(meta.id);
+	return out;
 }
 
 /**
@@ -1045,9 +1073,10 @@ interface StaleBlock {
  * its pages of other file revisions (the `index.md` page when that file is gone), its blocks of
  * another `index.md` revision on the index page, and on the behavior page its blocks of another
  * fence text. Only the import's own short ids are looked at, only before the session is moved,
- * and only what nobody else wrote is taken away: a stale block someone added to, moved or edited
- * since ({@link onlyImportWrote}) is kept as it is, and counted (the caller does not move the
- * session then). Bounded reads; a page goes in a commit of its own. Returns how many were kept.
+ * and only what nobody else ever wrote is taken away: when any stale block holds what someone
+ * added, moved there or edited ({@link onlyImportWrote}), nothing is taken away or written and
+ * the attempt needs attention (`kept_blocks`), so the space shows the kept blocks and no new
+ * revision beside them. Bounded reads; a page goes in a commit of its own.
  */
 async function removeStale(
 	ctx: Context,
@@ -1059,7 +1088,7 @@ async function removeStale(
 		/** `index.md` is among the files read now. */
 		indexMd: boolean;
 	},
-): Promise<number> {
+): Promise<void> {
 	const { space } = ctx;
 	const limits = SPEC_IMPORT_LIMITS;
 	const stale: StaleBlock[] = [];
@@ -1138,11 +1167,18 @@ async function removeStale(
 		if (await onlyImportWrote(space, entry)) removable.push(entry);
 		else kept++;
 	}
-	if (kept > 0)
+	// Before anything is written (review r2 NIT 3): an attempt that cannot move the session leaves
+	// the space as it found it, rather than the new revision's blocks beside the kept ones.
+	if (kept > 0) {
 		logger.warn("Dynamic Spec import kept blocks of an earlier attempt that others wrote to", {
 			narratorId: ctx.session.narratorId,
 			kept,
 		});
+		throw new SpecImportAttention(
+			`${kept} block(s) an earlier, unfinished import wrote hold what someone added or changed since: they were kept; move what is yours out of them (or delete them), then import again`,
+			{ code: "kept_blocks", count: kept },
+		);
+	}
 	const summary = SPEC_IMPORT_TEXT[ctx.locale].summaryStale;
 	const blocks = removable.filter((entry) => !entry.page).map((entry) => entry.id);
 	for (let i = 0; i < blocks.length; i += limits.staleDeletesPerCommit) {
@@ -1156,58 +1192,92 @@ async function removeStale(
 	}
 	for (const entry of removable)
 		if (entry.page) await commit(ctx, [{ op: "delete", block: { id: entry.id } }], [null], summary);
-	return kept;
 }
 
 /**
- * Whether only the import wrote what is under `root` now, itself included: every live block's
- * current version was opened by one of the import's commits. A block someone added, moved there
- * or edited was not. Bounded: at most {@link SPEC_IMPORT_LIMITS.staleSubtreeBlocks} blocks read
- * without content, and {@link SPEC_IMPORT_LIMITS.staleCommits} commits by seq; past either, false
- * (kept: it cannot tell).
+ * Whether only the import ever wrote what is under `root` now, itself included: no version of a
+ * live block there was opened by any commit but the import's. A block someone added, moved there
+ * or edited was not (review S2), even when the import wrote a later version over theirs (12b
+ * review r2 SF2). A page is read through the versions recorded under it, so anything anyone else
+ * ever wrote on the page keeps it. Bounded: at most {@link SPEC_IMPORT_LIMITS.staleSubtreeBlocks}
+ * blocks read without content, {@link SPEC_IMPORT_LIMITS.staleVersionsPerBlock} versions of a
+ * block and {@link SPEC_IMPORT_LIMITS.staleVersions} in all, and
+ * {@link SPEC_IMPORT_LIMITS.staleCommits} commits by seq; past any, false (kept: it cannot tell).
  */
 async function onlyImportWrote(space: OutlineSpaceRow, root: StaleBlock): Promise<boolean> {
-	const limit = SPEC_IMPORT_LIMITS.staleSubtreeBlocks;
+	const limits = SPEC_IMPORT_LIMITS;
 	const seqs = new Set<number>([root.versionSeq]);
-	const add = (rows: ReadonlyArray<Pick<OutlineStructureRow, "versionSeq">>) => {
-		for (const row of rows) seqs.add(row.versionSeq);
-	};
+	let versionsRead = 0;
 	if (root.page) {
-		const { rows, truncated } = await outlineStore.listPageStructure(root.id, {
+		const { truncated } = await outlineStore.listPageStructure(root.id, {
 			asOf: null,
-			limit,
+			limit: limits.staleSubtreeBlocks,
 		});
 		if (truncated) return false;
-		add(rows);
+		// Every version recorded under the page, by seq: the import's commits only.
+		const pageRead = 500;
+		let afterSeq: number | undefined;
+		for (;;) {
+			const rows = await outlineStore.listPageVersions(root.id, { limit: pageRead, afterSeq });
+			versionsRead += rows.length;
+			if (versionsRead > limits.staleVersions) return false;
+			for (const row of rows) seqs.add(row.fromSeq);
+			if (seqs.size > limits.staleCommits) return false;
+			const last = rows[rows.length - 1];
+			// Rows past the last one's seq follow; the rest of its seq adds no new commit.
+			if (rows.length < pageRead || !last) break;
+			afterSeq = last.fromSeq;
+		}
 	} else {
+		const blocks = [root.id];
 		let level = [root.id];
-		let seen = 0;
 		while (level.length > 0) {
 			const next: string[] = [];
-			for (let i = 0; i < level.length; i += SPEC_IMPORT_LIMITS.sidLookup) {
+			for (let i = 0; i < level.length; i += limits.sidLookup) {
 				const children = await outlineStore.listChildMetas(
 					space.id,
-					level.slice(i, i + SPEC_IMPORT_LIMITS.sidLookup),
-					limit - seen + 1,
+					level.slice(i, i + limits.sidLookup),
+					limits.staleSubtreeBlocks - blocks.length + 1,
 				);
-				seen += children.length;
-				if (seen > limit) return false;
-				add(children);
-				next.push(...children.map((child) => child.id));
+				if (blocks.length + children.length > limits.staleSubtreeBlocks) return false;
+				for (const child of children) {
+					seqs.add(child.versionSeq);
+					blocks.push(child.id);
+					next.push(child.id);
+				}
 			}
 			level = next;
 		}
+		for (const id of blocks) {
+			const versions = await outlineStore.listBlockVersions(id, limits.staleVersionsPerBlock + 1);
+			if (versions.length > limits.staleVersionsPerBlock) return false;
+			versionsRead += versions.length;
+			if (versionsRead > limits.staleVersions) return false;
+			for (const version of versions) seqs.add(version.fromSeq);
+			if (seqs.size > limits.staleCommits) return false;
+		}
 	}
-	if (seqs.size > SPEC_IMPORT_LIMITS.staleCommits) return false;
+	return await allImportCommits(space, seqs);
+}
+
+/** Whether every commit of `seqs` in the space is one of the import's own. */
+async function allImportCommits(
+	space: OutlineSpaceRow,
+	seqs: ReadonlySet<number>,
+): Promise<boolean> {
 	const wanted = [...seqs];
 	let found = 0;
 	for (let i = 0; i < wanted.length; i += 100) {
 		for (const row of await outlineStore.getCommitsBySeqs(space.id, wanted.slice(i, i + 100))) {
-			if (row.actorKind !== "system" || !IMPORT_ACTORS.has(row.actorId)) return false;
+			if (!isImportCommit(row)) return false;
 			found++;
 		}
 	}
 	return found === wanted.length;
+}
+
+function isImportCommit(row: Pick<OutlineCommitRow, "actorKind" | "actorId">): boolean {
+	return row.actorKind === "system" && IMPORT_ACTORS.has(row.actorId);
 }
 
 /**
