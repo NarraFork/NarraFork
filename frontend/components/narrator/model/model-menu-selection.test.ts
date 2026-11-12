@@ -275,15 +275,24 @@ describe("grouping by vendor and by service", () => {
 		{ value: "relay:private-x", label: "Private", provider: "relay" },
 	];
 
-	test("a model shows once under its vendor; services keep only what auto does not list", () => {
-		const groups = groupModelOptions(options, "__default__");
-		expect([...groups.keys()]).toEqual(["__default__", "__auto__:gpt", "__auto__:", "relay"]);
-		expect(groups.get("relay")?.map((m) => m.value)).toEqual(["relay:private-x"]);
-		expect(groups.has("codex")).toBe(false);
+	test("auto rows group by vendor; every service keeps all of its models", () => {
+		const groups = groupModelOptions(options);
+		expect([...groups.keys()]).toEqual([
+			"__default__",
+			"__auto__:gpt",
+			"__auto__:",
+			"codex",
+			"relay",
+		]);
+		expect(groups.get("relay")?.map((m) => m.value)).toEqual([
+			"relay:gpt-5.5",
+			"relay:new-model",
+			"relay:private-x",
+		]);
 	});
 
-	test("the selected pin keeps its service row", () => {
-		const groups = groupModelOptions(options, "codex:gpt-5.5");
+	test("a service whose every model is listed by auto still has its group", () => {
+		const groups = groupModelOptions(options);
 		expect(groups.get("codex")?.map((m) => m.value)).toEqual(["codex:gpt-5.5"]);
 	});
 

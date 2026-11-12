@@ -534,13 +534,15 @@ describe("auto:<model> rows", () => {
 		expect(selected).toEqual(["codex:gpt-5.5", "auto:gpt-5.5"]);
 	});
 
-	test("a service does not list again a model its auto row already offers", async () => {
+	test("the provider view still lists a model its auto row also offers", async () => {
+		// The provider view renders no auto groups, so hiding covered models there would make
+		// them (and a service whose every model is covered) disappear from the picker.
 		const withDuplicate: ModelOption[] = [
 			...autoModels,
 			{ value: "a:gpt-5.5", label: "GPT-5.5 on A", provider: "a" },
 		];
 		await render("a:one", withDuplicate);
-		expect(host.textContent).not.toContain("GPT-5.5 on A");
+		expect(host.textContent).toContain("GPT-5.5 on A");
 		expect(host.textContent).toContain("One");
 	});
 
