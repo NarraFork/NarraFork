@@ -3824,10 +3824,19 @@ export async function prepareQueuedRunInput(
 > {
 	const id = active.narratorId;
 	if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
+	// Who starts the pass about to run (`ActiveNarrator._runInitiatedBy`, taken by the pass): a
+	// wake delivered here (an agent's message, a notice, a background result) is the system's; a
+	// person's queued message is theirs.
+	active._runInitiatedBy = undefined;
+	active._runForTaskId = undefined;
 	const delivered = await drainAndPersistPendingInjections(active);
-	if (delivered) return { text: "" };
+	if (delivered) {
+		active._runInitiatedBy = "system";
+		return { text: "" };
+	}
 	const row = await claimInboxHead(id, (candidate) => candidate.kind === "user_input");
 	if (!row) return;
+	active._runInitiatedBy = "person";
 	const first = projectMailboxUserMessage(row);
 	try {
 		if (first.executionIntent?.controlCommand) {

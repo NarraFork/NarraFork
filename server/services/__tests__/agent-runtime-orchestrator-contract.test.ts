@@ -660,6 +660,39 @@ describe("outline task leases", () => {
 					waiting.mockRestore();
 				}
 			});
+
+		test("the next pass of a run that waited (`prepareQueuedRunInput`): a wake delivered is the system's, a person's queued message theirs", async () => {
+			const session = await import("../narrator-session");
+			const h = fixture(profiles[0], []);
+			// A pass before left its own word behind: the next pass never inherits it.
+			h.session._runInitiatedBy = "person";
+			h.session._runForTaskId = "task-1";
+			expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toBe(
+				undefined,
+			);
+			expect(h.session._runInitiatedBy).toBeUndefined();
+			expect(h.session._runForTaskId).toBeUndefined();
+
+			const drain = spyOn(session, "drainAndPersistPendingInjections").mockResolvedValue(
+				"an agent's message",
+			);
+			try {
+				expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toEqual({
+					text: "",
+				});
+				expect(h.session._runInitiatedBy).toBe("system");
+			} finally {
+				drain.mockRestore();
+			}
+
+			const { enqueueBufferedMessage } = await import("../narrator-buffer");
+			expect((await enqueueBufferedMessage(h.session.narratorId, "one more thing")).ok).toBe(true);
+			h.session._runInitiatedBy = "system";
+			const input = await session.prepareQueuedRunInput(h.session, h.owner, h.runControl);
+			expect(input?.text ?? "").toContain("one more thing");
+			expect(h.session._runInitiatedBy).toBe("person");
+			h.session._runInitiatedBy = undefined;
+		});
 	});
 });
 
