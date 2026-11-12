@@ -855,6 +855,13 @@ describe("the turn-end note", () => {
 	});
 
 	test("spec sessions and subagents never get one", async () => {
+		// A spec session stays one at a run's start only while imports are not automatic (outline
+		// P2 PR 12b): with `auto` its run would import it first.
+		const specImport = settings.outline.specImport;
+		settings.outline.specImport = "manual";
+		restores.push(() => {
+			settings.outline.specImport = specImport;
+		});
 		const spec = await session({ backend: "spec" });
 		const specRun = await run(spec);
 		expect(specRun._outlineTurnStart).toBeUndefined();
@@ -981,6 +988,12 @@ describe("spec sessions are unchanged", () => {
 	});
 
 	test("a spec session's digest, fence and drain are read as before; its run prepares nothing", async () => {
+		// While imports are not automatic (outline P2 PR 12b: with `auto` the run imports it first).
+		const specImport = settings.outline.specImport;
+		settings.outline.specImport = "manual";
+		restores.push(() => {
+			settings.outline.specImport = specImport;
+		});
 		const id = await session({ backend: "spec" });
 		await writeSpecFile(id, "spec://behavior_fence", "Never force-push.", { actor: "user" });
 		const source = await taskSourceForNarrator(id);

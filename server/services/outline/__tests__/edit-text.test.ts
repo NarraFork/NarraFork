@@ -7,8 +7,10 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { normalizeBlock, serializeMarkdownOutline } from "@shared/outline";
 import { type EditTextJob, itemOutline, runEditTextJob } from "../edit-text";
 import {
+	OUTLINE_BACKGROUND_TEXT_LIMITS,
 	OUTLINE_EDIT_TEXT_LIMITS,
 	OutlineEditTextError,
+	processBackgroundText,
 	processEditText,
 	stopEditTextWorker,
 } from "../edit-text-runner";
@@ -248,5 +250,113 @@ describe("runner", () => {
 		const error = await pending.catch((e) => e);
 		expect(error).toBeInstanceOf(OutlineEditTextError);
 		expect(await processEditText(job, { worker: true })).toEqual(runEditTextJob(job));
+	});
+});
+
+describe("the background channel (the Dynamic Spec import's text)", () => {
+	const notes = [
+		"# Design",
+		"",
+		"A paragraph with [[not a link]] and - [ ] not a task.",
+		"",
+		"| a | b |",
+		"| --- | --- |",
+		"| 1 | 2 |",
+		"",
+		"## Details",
+		"",
+		...Array.from({ length: 400 }, (_, i) => `Line ${i} 的内容，带 **粗体** 和 \`code\`。\n`),
+	].join("\n");
+	const job: EditTextJob = { kind: "notes", text: notes, continued: "(cont.)" };
+
+	test("a whole file becomes blocks: headings hold their sections, nothing is outline syntax, nothing is lost", async () => {
+		const inline = runEditTextJob(job);
+		expect(Buffer.byteLength(notes)).toBeGreaterThan(OUTLINE_BACKGROUND_TEXT_LIMITS.inlineBytes);
+		const converted = await processBackgroundText(job);
+		expect(converted).toEqual(inline);
+		expect(converted.blocks).toHaveLength(1);
+		const [design] = converted.blocks;
+		expect(design?.content).toBe("# Design");
+		const texts = design?.children.map((c) => c.content) ?? [];
+		expect(texts[0]).toContain("not a task");
+		expect(texts[1]?.startsWith("| a | b |")).toBe(true);
+		const details = design?.children.find((c) => c.content === "## Details");
+		// Past a report's limit of blocks: every line is there.
+		expect(details?.children.length).toBe(400);
+		expect(converted.count).toBe(404);
+		for (const block of [design, ...(design?.children ?? []), ...(details?.children ?? [])]) {
+			expect(block?.links).toEqual([]);
+			expect(normalizeBlock(block?.content ?? "").content).toBe(block?.content ?? "");
+			expect(normalizeBlock(block?.content ?? "").children).toEqual([]);
+		}
+	});
+
+	test("what is not markdown becomes code blocks in its language, cut by lines", () => {
+		const text = Array.from({ length: 3000 }, (_, i) => `  "key_${i}": "*value* [[x]]",`).join(
+			"\n",
+		);
+		const converted = runEditTextJob({ kind: "notes", text, continued: "(cont.)", code: "json" });
+		expect(converted.blocks.length).toBeGreaterThan(1);
+		for (const block of converted.blocks) {
+			expect(block.content.startsWith("```json\n")).toBe(true);
+			expect(Buffer.byteLength(block.content)).toBeLessThanOrEqual(16 * 1024);
+			expect(block.links).toEqual([]);
+		}
+		const joined = converted.blocks
+			.map((b) => b.content.replace(/^```json\n/, "").replace(/\n```$/, ""))
+			.join("\n");
+		expect(joined).toBe(text);
+	});
+
+	test("it takes more than the interactive channel does, and refuses past its own limit", async () => {
+		const large = "x ".repeat(OUTLINE_EDIT_TEXT_LIMITS.maxBytes);
+		const big: EditTextJob = { kind: "notes", text: large, continued: "(cont.)", code: "text" };
+		expect(((await processEditText(big).catch((e) => e)) as OutlineEditTextError).code).toBe(
+			"OUTLINE_TEXT_TOO_LARGE",
+		);
+		expect((await processBackgroundText(big)).count).toBeGreaterThan(10);
+		const huge: EditTextJob = {
+			kind: "notes",
+			text: "x".repeat(OUTLINE_BACKGROUND_TEXT_LIMITS.maxBytes + 1),
+			continued: "",
+		};
+		expect(((await processBackgroundText(huge).catch((e) => e)) as OutlineEditTextError).code).toBe(
+			"OUTLINE_TEXT_TOO_LARGE",
+		);
+	});
+
+	test("a job that fails there fails: timed out, cancelled or crowded out, it is never run on the caller's thread", async () => {
+		// Past its time: rejected, the worker replaced, and the interactive channel untouched.
+		const late = await processBackgroundText(job, { timeoutMs: 1 }).catch((e) => e);
+		expect(late).toBeInstanceOf(OutlineEditTextError);
+		expect((late as OutlineEditTextError).code).toBe("OUTLINE_TEXT_TIMEOUT");
+		// Cancelled while queued or running.
+		const controller = new AbortController();
+		const pending = processBackgroundText(job, { signal: controller.signal });
+		controller.abort();
+		expect(await pending.catch((e) => e)).toBeInstanceOf(OutlineEditTextError);
+		// More waiting than it takes: refused, not queued, not run inline.
+		const many = Array.from({ length: OUTLINE_BACKGROUND_TEXT_LIMITS.maxQueued + 3 }, () =>
+			processBackgroundText(job).then(
+				() => "done",
+				(e: OutlineEditTextError) => e.code,
+			),
+		);
+		const results = await Promise.all(many);
+		expect(results.filter((r) => r === "OUTLINE_TEXT_BUSY").length).toBeGreaterThanOrEqual(1);
+		expect(results.filter((r) => r === "done").length).toBeGreaterThanOrEqual(1);
+		// A fresh worker serves the next job.
+		expect(await processBackgroundText(job)).toEqual(runEditTextJob(job));
+	});
+
+	test("a busy background channel does not hold up an interactive job", async () => {
+		const slow = processBackgroundText(job);
+		const small: EditTextJob = {
+			kind: "parse",
+			inputs: [{ mode: "outline", text: `- ${"item ".repeat(400)}` }],
+			labels: [],
+		};
+		expect(await processEditText(small, { worker: true })).toEqual(runEditTextJob(small));
+		await slow;
 	});
 });
