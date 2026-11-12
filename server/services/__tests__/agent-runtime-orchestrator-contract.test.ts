@@ -664,6 +664,8 @@ describe("outline task leases", () => {
 		test("the next pass of a run that waited (`prepareQueuedRunInput`): a wake delivered is the system's, a person's queued message theirs", async () => {
 			const session = await import("../narrator-session");
 			const h = fixture(profiles[0], []);
+			// Read afresh each time (a set value would narrow the property's type).
+			const initiatedBy = (): string | undefined => h.session._runInitiatedBy;
 			// A pass before left its own word behind: the next pass never inherits it.
 			h.session._runInitiatedBy = "person";
 			h.session._runForTaskId = "task-1";
@@ -678,7 +680,7 @@ describe("outline task leases", () => {
 				expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toEqual({
 					text: "",
 				});
-				expect(h.session._runInitiatedBy).toBe("system");
+				expect(initiatedBy()).toBe("system");
 			} finally {
 				drain.mockRestore();
 			}
@@ -688,7 +690,7 @@ describe("outline task leases", () => {
 			h.session._runInitiatedBy = "system";
 			const input = await session.prepareQueuedRunInput(h.session, h.owner, h.runControl);
 			expect(input?.text ?? "").toContain("one more thing");
-			expect(h.session._runInitiatedBy).toBe("person");
+			expect(initiatedBy()).toBe("person");
 			h.session._runInitiatedBy = undefined;
 		});
 	});
