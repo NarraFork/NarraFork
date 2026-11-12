@@ -37,9 +37,14 @@ import { OUTLINE_BEHAVIOR_ALIAS } from "../../model";
 import { addPersonTask } from "../../person-tasks";
 import { outlineStore } from "../../store";
 import { writeOutline } from "../../write";
-import { importSpecSession, resetSpecImportRecords, specImportRecord } from "../importer";
+import {
+	importSpecSession,
+	resetSpecImportRecords,
+	SpecImportPaused,
+	specImportRecord,
+} from "../importer";
 import { readSpecFilePointers, readSpecImportSession } from "../read-port";
-import { importSpecSessionIdle, specImportStatus } from "../triggers";
+import { importSpecSessionIdle, specImportStatus, watchSpecImportMessages } from "../triggers";
 import {
 	backendOf,
 	commitCount,
@@ -513,8 +518,8 @@ describe("the idle import gives way to its session (S4)", () => {
 		expect((await taskPage(id)).map((t) => [t.status, t.holder])).toEqual([["doing", id]]);
 	});
 
-	test("a message for the session arriving meanwhile makes it give way at once", async () => {
-		const { id } = await sessionWithNotes();
+	test("a person's message for the session arriving meanwhile makes it give way at once", async () => {
+		const { id, owner } = await sessionWithNotes();
 		let sent = false;
 		const off = onCommit(() => {
 			if (sent) return;
@@ -525,6 +530,7 @@ describe("the idle import gives way to its session (S4)", () => {
 					narratorId: id,
 					text: "hello",
 					seq: 1,
+					createdBy: owner,
 					bufferedAt: new Date().toISOString(),
 				})
 				.run();
@@ -540,6 +546,58 @@ describe("the idle import gives way to its session (S4)", () => {
 		// The message is the session's to take; once it has, the next round finishes.
 		await db.delete(narratorBufferedMessages).where(eq(narratorBufferedMessages.narratorId, id));
 		expect((await importSpecSessionIdle(id, "sweep")).status).toBe("imported");
+	});
+
+	test("a person's message gives way before any commit; a notice only after one (review r2 NIT 1)", async () => {
+		for (const urgent of [true, false]) {
+			const { id } = await sessionWithNotes();
+			const pause = new AbortController();
+			pause.abort(new SpecImportPaused("asked before the import began", urgent));
+			const outcome = await importSpecSession(id, { trigger: "sweep", pause: pause.signal });
+			expect(outcome).toEqual({ status: "busy" });
+			expect(await commitCount(id)).toBe(urgent ? 0 : 1);
+		}
+	});
+
+	test("what arrives is told apart: a person's input from a team or plugin notice", async () => {
+		const { id, owner } = await makeSession();
+		const queue = (values: { kind?: "user_input" | "agent_message"; createdBy?: string | null }) =>
+			db
+				.insert(narratorBufferedMessages)
+				.values({
+					id: generateId(),
+					narratorId: id,
+					text: "x",
+					seq: 1,
+					bufferedAt: new Date().toISOString(),
+					...values,
+				})
+				.run();
+		queue({ createdBy: owner });
+		const seen: boolean[] = [];
+		const waiters: Array<() => void> = [];
+		const stop = await watchSpecImportMessages(
+			id,
+			(person) => {
+				seen.push(person);
+				waiters.shift()?.();
+			},
+			1,
+		);
+		const next = () => new Promise<void>((resolve) => waiters.push(resolve));
+		try {
+			// Queued before it began: not news. A plugin's message, then a team notice: one notice.
+			let told = next();
+			queue({ createdBy: null });
+			await told;
+			queue({ kind: "agent_message", createdBy: null });
+			told = next();
+			queue({ createdBy: owner });
+			await told;
+			expect(seen).toEqual([false, true]);
+		} finally {
+			stop();
+		}
 	});
 });
 

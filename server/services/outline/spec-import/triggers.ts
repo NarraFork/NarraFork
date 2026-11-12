@@ -75,7 +75,7 @@ export const SPEC_IMPORT_JOB = {
 	manualBudgetMs: 30_000,
 	/** How often an idle import looks for a message that arrived for its session (it gives way). */
 	messageCheckMs: 250,
-	/** Queued messages of the session one look reads (ids only). */
+	/** Queued messages of the session one look reads (newest first; ids and who sent them). */
 	messageCheckRows: 50,
 } as const;
 
@@ -171,7 +171,10 @@ export function resetSpecImportRunTries(): void {
  * The import as the job and the button run it: on an idle session, without interrupting it, and
  * giving way to it ({@link SpecImportPaused}, outcome `busy`) when its time budget runs out or a
  * message for the session arrives meanwhile (the admission holds the session's messages until it
- * is released). What was written stays; the next attempt goes on from there.
+ * is released): a person's message at the next commit boundary, any other (a team or plugin
+ * notice) as the time budget, once the attempt made a commit (review r2 NIT 1), so a stream of
+ * notices cannot keep an import from ever getting anywhere. What was written stays; the next
+ * attempt goes on from there.
  */
 export async function importSpecSessionIdle(
 	narratorId: string,
@@ -182,10 +185,13 @@ export async function importSpecSessionIdle(
 	const budgetMs =
 		options.budgetMs ??
 		(trigger === "manual" ? SPEC_IMPORT_JOB.manualBudgetMs : SPEC_IMPORT_JOB.budgetMs);
-	const timer = setTimeout(
-		() => controller.abort(new SpecImportPaused(`its time budget of ${budgetMs} ms`)),
-		budgetMs,
-	);
+	// The first reason stands; a person's message makes a pause asked for already urgent.
+	const pause = (why: string, urgent: boolean) => {
+		const current: unknown = controller.signal.reason;
+		if (!controller.signal.aborted) controller.abort(new SpecImportPaused(why, urgent));
+		else if (urgent && current instanceof SpecImportPaused) current.urgent = true;
+	};
+	const timer = setTimeout(() => pause(`its time budget of ${budgetMs} ms`, false), budgetMs);
 	timer.unref?.();
 	let unwatch: (() => void) | null = null;
 	try {
@@ -195,9 +201,15 @@ export async function importSpecSessionIdle(
 			admit: async (id) => {
 				const release = await admitIdle(id);
 				try {
-					unwatch = await watchMessages(
+					unwatch = await watchSpecImportMessages(
 						id,
-						() => controller.abort(new SpecImportPaused("a message for the session arrived", true)),
+						(person) =>
+							pause(
+								person
+									? "a person's message for the session arrived"
+									: "a notice for the session arrived",
+								person,
+							),
 						options.messageCheckMs ?? SPEC_IMPORT_JOB.messageCheckMs,
 					);
 				} catch (error) {
@@ -216,24 +228,30 @@ export async function importSpecSessionIdle(
 }
 
 /**
- * Call `arrived` once a message is queued for the session that was not queued when this started
- * (ids only, a bounded read on the queue's index, every `everyMs`). The returned function stops
- * looking. On PostgreSQL the import takes no admission, so nothing waits on it: nothing to watch.
+ * Call `arrived` when a message is queued for the session that was not queued when this started
+ * (a bounded read on the queue's index, newest first, every `everyMs`): `person` when a person
+ * sent it (a user's input with its sender), else once for the first other one (a team or plugin
+ * notice). Looks on until a person's message arrived; the returned function stops looking. On
+ * PostgreSQL the import takes no admission, so nothing waits on it: nothing to watch.
  */
-async function watchMessages(
+export async function watchSpecImportMessages(
 	narratorId: string,
-	arrived: () => void,
+	arrived: (person: boolean) => void,
 	everyMs: number,
 ): Promise<() => void> {
 	if (outlineAccessBackend() === "postgres") return () => {};
-	const [{ db }, { narratorBufferedMessages }, { and, eq }] = await Promise.all([
+	const [{ db }, { narratorBufferedMessages }, { and, desc, eq }] = await Promise.all([
 		import("../../../db"),
 		import("../../../db/schema"),
 		import("drizzle-orm"),
 	]);
 	const queued = () =>
 		db
-			.select({ id: narratorBufferedMessages.id })
+			.select({
+				id: narratorBufferedMessages.id,
+				kind: narratorBufferedMessages.kind,
+				createdBy: narratorBufferedMessages.createdBy,
+			})
 			.from(narratorBufferedMessages)
 			.where(
 				and(
@@ -241,16 +259,20 @@ async function watchMessages(
 					eq(narratorBufferedMessages.state, "queued"),
 				),
 			)
+			.orderBy(desc(narratorBufferedMessages.arrivalSeq))
 			.limit(SPEC_IMPORT_JOB.messageCheckRows + 1)
-			.all()
-			.map((row) => row.id);
-	const before = new Set(queued());
+			.all();
+	const before = new Set(queued().map((row) => row.id));
+	let noticed = false;
 	const timer = setInterval(() => {
 		try {
-			const now = queued();
-			if (now.some((id) => !before.has(id))) {
+			const arrivedNow = queued().filter((row) => !before.has(row.id));
+			if (arrivedNow.some((row) => row.kind === "user_input" && row.createdBy !== null)) {
 				clearInterval(timer);
-				arrived();
+				arrived(true);
+			} else if (arrivedNow.length > 0 && !noticed) {
+				noticed = true;
+				arrived(false);
 			}
 		} catch (error) {
 			clearInterval(timer);

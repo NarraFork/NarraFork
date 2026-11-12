@@ -278,13 +278,14 @@ class SpecImportRetry extends Error {
  */
 export class SpecImportPaused extends Error {
 	/**
-	 * `urgent` (a message arrived): honoured at the next commit boundary. Otherwise (a time
-	 * budget) honoured once the attempt made a commit, so every attempt gets somewhere even when
-	 * converting one file takes longer than the budget.
+	 * `urgent` (a person's message arrived): honoured at the next commit boundary. Otherwise (a
+	 * time budget, a team or plugin notice) honoured once the attempt made a commit, so every
+	 * attempt gets somewhere even when converting one file takes longer than the budget. A pause
+	 * asked for already becomes urgent when a person's message arrives after it.
 	 */
 	constructor(
 		message: string,
-		readonly urgent = false,
+		public urgent = false,
 	) {
 		super(message);
 	}
