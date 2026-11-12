@@ -1558,22 +1558,33 @@ export async function outlineEdit(
 	if ("output" in outcome) return outcome.output;
 	if ("conflicts" in outcome) return await conflictOutput(scope, space, outcome.conflicts, meta);
 	if ("written" in outcome) {
-		// The hand-outs, now that the write is committed (outside the space's barrier: each is two
-		// commits of its own). One that fails is said beside its edit; the write stands.
+		// The hand-outs, now that the write is done (outside the space's barrier: each is two
+		// commits of its own; a write that only gave the assignee wrote nothing itself). One that
+		// fails is said beside its edit; the write stands.
 		const heldHere = new Set(outcome.written.pending?.opIndexes ?? []);
-		for (const handOut of outcome.written.commit ? outcome.handOuts : []) {
+		const handOutLines: string[] = [];
+		for (const handOut of outcome.handOuts) {
 			const edit = edits[handOut.edit];
 			const r = outcome.written.results[handOut.opIndex];
-			if (!edit || !r || heldHere.has(handOut.opIndex)) continue;
-			const task = scope.labelIn(space)(r.sid);
+			const block = r
+				? { id: r.blockId, sid: r.sid }
+				: edit?.located?.kind === "block"
+					? { id: edit.located.block.id, sid: edit.located.block.sid }
+					: null;
+			if (!edit || !block || heldHere.has(handOut.opIndex)) continue;
+			const task = scope.labelIn(space)(block.sid);
+			const say = (line: string) => {
+				edit.notes.push(line);
+				handOutLines.push(`${label(edit)}: ${line}`);
+			};
 			try {
 				const out = await handOutTask({
-					taskId: r.blockId,
+					taskId: block.id,
 					by: { kind: "session", narratorId: scope.narratorId, principal: await scope.principal() },
 					target: handOut.target,
 					store: scope.store,
 				});
-				edit.notes.push(
+				say(
 					OUTLINE_TOOL_TEXT.edit.handedOut(
 						task,
 						out.copy.address,
@@ -1586,7 +1597,7 @@ export async function outlineEdit(
 				// A refusal (`OutlineHandOutError`, a target that cannot work there) is told; anything
 				// else is a fault.
 				if (!(error instanceof AppError)) throw error;
-				edit.notes.push(OUTLINE_TOOL_TEXT.edit.handOutFailed(task, error.message));
+				say(OUTLINE_TOOL_TEXT.edit.handOutFailed(task, error.message));
 			}
 		}
 		const held = outcome.written.pending
@@ -1625,6 +1636,7 @@ export async function outlineEdit(
 			await mergedSection(scope, space, outcome.merged, scope.narratorId),
 			{
 				globalNotes,
+				handOutLines,
 				hints,
 				// A block of an edit held for confirmation does not exist yet: named by its edit.
 				noteLines:
@@ -2032,6 +2044,8 @@ function successOutput(
 	merged: MergedSection,
 	extra: {
 		globalNotes: string[];
+		/** What the call's hand-outs did (said on their own when the call wrote nothing else). */
+		handOutLines: string[];
 		hints: string[];
 		/** What the call wrote under tasks that is over the note rules (written all the same). */
 		noteLines: string[];
@@ -2048,7 +2062,11 @@ function successOutput(
 	const pendingMeta = pending ? { pending: outlinePendingLabel(pending.id) } : {};
 	if (!result.commit && !pending) {
 		return {
-			output: [OUTLINE_TOOL_TEXT.edit.noChange, ...merged.lines].join("\n"),
+			// The call only gave tasks of its own space to others: their hand-outs are what happened.
+			output: [
+				...(extra.handOutLines.length > 0 ? extra.handOutLines : [OUTLINE_TOOL_TEXT.edit.noChange]),
+				...merged.lines,
+			].join("\n"),
 			metadata: { ...extra.meta, commit: null, ...mergedMeta },
 		};
 	}

@@ -65,7 +65,7 @@ import { logger } from "@server/lib/logger";
 import { type LinkTarget, parseAddress } from "@shared/outline";
 import type { OutlineBoardHandOutRefusal } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
-import { readNarrator, readUserByUsername } from "./access-reads";
+import { readNarrator, readSessionWriteFacts, readUserByUsername } from "./access-reads";
 import { canSessionWorkIn, resolveAgentAssignee, sessionAssignee } from "./assignee";
 import { type DelegationLocale, delegationLocale } from "./delegation-text";
 import {
@@ -815,20 +815,41 @@ export function handOutRefusalText(error: OutlineHandOutError): string {
 }
 
 /**
- * Whether `principal` may hand out tasks of session space `space` (the board's 「交给团队」): the
- * checks of {@link handOutPlace}, answered without throwing.
+ * Of the given spaces, the session spaces whose tasks `principal` may hand out (the board's
+ * 「交给团队」): the checks of {@link handOutPlace} for many at once. The sessions' owners and
+ * projects in one read (`readSessionWriteFacts`), then the person's access once per project.
  */
-export async function mayHandOut(
+export async function handOutSessionSpaces(
 	principal: OutlinePrincipal,
-	space: OutlineSpaceRow,
-	options: { store?: OutlineStore } = {},
-): Promise<boolean> {
-	if (space.kind !== "session" || !space.narratorId) return false;
-	try {
-		await handOutPlace(space, { kind: "person", principal }, options);
-		return true;
-	} catch (error) {
-		if (error instanceof OutlineHandOutError) return false;
-		throw error;
+	spaces: readonly OutlineSpaceRow[],
+): Promise<Set<string>> {
+	const out = new Set<string>();
+	const sessions = spaces.filter((space) => space.kind === "session" && space.narratorId);
+	if (sessions.length === 0) return out;
+	const facts = await readSessionWriteFacts(sessions.map((space) => space.narratorId as string));
+	const writes = new Map<string, Promise<boolean>>();
+	for (const space of sessions) {
+		const fact = facts.get(space.narratorId as string);
+		if (!fact || fact.type === "subagent" || fact.ownerUserId !== principal.userId) continue;
+		const projectId = fact.gateProjectId;
+		if (!projectId) continue;
+		let verdict = writes.get(projectId);
+		if (!verdict) {
+			// Access to a project's space depends on its kind and project only.
+			verdict = canWriteSpace(principal, {
+				id: `pending:project:${projectId}`,
+				key: "",
+				kind: "project",
+				projectId,
+				narratorId: null,
+				ownerUserId: null,
+				nextSeq: 1,
+				createdAt: "",
+				inProcessEpoch: 0,
+			});
+			writes.set(projectId, verdict);
+		}
+		if (await verdict) out.add(space.id);
 	}
+	return out;
 }
