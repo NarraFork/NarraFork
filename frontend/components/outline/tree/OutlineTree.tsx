@@ -516,8 +516,10 @@ function OpenPage({
 	const { t, i18n } = useTranslation("outline");
 	const { step } = useTree();
 	const navigate = useOutlineNavigate();
+	// Everything the page holds, tasks included: reading the whole outline is reading what is
+	// being done too, folded so that what is finished takes one line.
 	const query = useOutlineBlock(spaceId, pageId, {
-		view: "facts",
+		view: "all",
 		blocks: OUTLINE_TREE_LIMITS.pageBlocks,
 		bytes: OUTLINE_TREE_LIMITS.pageBytes,
 	});
