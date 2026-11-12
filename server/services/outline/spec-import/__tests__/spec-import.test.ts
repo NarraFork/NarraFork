@@ -329,7 +329,8 @@ describe("an attempt met again", () => {
 		const before = await taskPage(id);
 		expect(before.map((t) => t.text)).toEqual(["a", "b", "c"]);
 		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
-		// Meanwhile: the lease job reopened what was in progress, and someone deleted a task.
+		// What was in progress is to do until the move (nothing is claimed before it). Meanwhile
+		// someone set it to do again (nothing changes) and deleted a task.
 		await writeOutline({
 			spaceId: space?.id as string,
 			ops: [

@@ -7,7 +7,7 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { settings } from "../../../../lib/settings";
+import { DEFAULTS, settings } from "../../../../lib/settings";
 import { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, TEAM_SOP_PLUGIN_ID } from "../../../behavior-fence-sop";
 import { prepareOutlineRun } from "../../../narrator-session";
 import type { ActiveNarrator } from "../../../narrator-session-state";
@@ -160,6 +160,27 @@ describe("the idle job", () => {
 		const pass = await runSpecImportPass({ pauseMs: 0 });
 		expect(pass.givenUp).toBeGreaterThanOrEqual(1);
 		expect(await commitCount(id)).toBe(commits);
+	});
+});
+
+describe("the shipped default", () => {
+	test("is manual: no run and no idle pass imports, the button does", async () => {
+		expect(DEFAULTS.outline.specImport).toBe("manual");
+		settings.outline.specImport = undefined;
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "a" }]);
+		expect(await importSpecAtRunStart(id, { subagentsRunning: () => false })).toBeNull();
+		expect(await runSpecImportPass({ pauseMs: 0 })).toEqual({
+			seen: 0,
+			imported: 0,
+			left: 0,
+			givenUp: 0,
+		});
+		expect(await backendOf(id)).toBe("spec");
+		expect((await specImportStatus(id)).mode).toBe("manual");
+		await requestSpecImport(id);
+		await settleSpecImportRequests();
+		expect(await backendOf(id)).toBe("outline");
 	});
 });
 
