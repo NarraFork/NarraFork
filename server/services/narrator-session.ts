@@ -9720,6 +9720,12 @@ export async function recoverOnStartup(
 		}
 	}
 	await backgroundTaskService.recoverStaleTasksAfterRestart(protection.backgroundTaskIds);
+	// After adoption: anything left in the service directory belongs to no running row.
+	void backgroundTaskService
+		.sweepOrphanedServiceArtifacts()
+		.catch((error) =>
+			logger.warn("Background service artifact sweep failed", { error: String(error) }),
+		);
 
 	// Defensive cleanup: strip transient "reflecting"/"reasoning" tags left on any
 	// resting narrator. These are mid-turn tags that must never survive a completed

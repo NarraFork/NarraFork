@@ -7,8 +7,9 @@ import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
 import { getHome } from "../../platform";
-import type { ExecHandle, ExecutionBackend } from "../execution/backend";
+import type { ExecHandle, ExecParams, ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
+import { DurableServiceHandle, removeServiceArtifacts } from "../execution/durable-service";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import {
@@ -171,7 +172,7 @@ export const REVIEW_READ_ONLY_BASH_DESCRIPTION =
 	"commands.";
 
 interface BashExecution {
-	start(signal: AbortSignal): Promise<ExecHandle>;
+	start(signal: AbortSignal, options?: Pick<ExecParams, "durableService">): Promise<ExecHandle>;
 	cancelUndispatched(): void;
 }
 
@@ -209,7 +210,7 @@ async function prepareBashExecution(
 		bashWindow = undefined;
 	};
 	return {
-		async start(signal) {
+		async start(signal, options) {
 			if (started) throw new Error("Bash execution was already dispatched");
 			started = true;
 			let handle: ExecHandle;
@@ -227,6 +228,7 @@ async function prepareBashExecution(
 					cwd,
 					signal,
 					env: env ?? undefined,
+					...(options?.durableService ? { durableService: options.durableService } : {}),
 				});
 			} catch (error) {
 				// LocalBackend rejects dispatch only before spawning. Asynchronous
@@ -937,132 +939,30 @@ async function _runInBackground(
 
 	// Fire-and-forget: spawn the process and collect output asynchronously
 	(async () => {
-		let timedOut = false;
 		try {
 			// Frozen backend/cwd/env and activity were captured before task creation.
 			// Do not resolve a second backend after the tool/HTTP request has returned.
 			ctx.signal.throwIfAborted();
-			const handle = await execution.start(bgAbort.signal);
-			let outputBytes = 0;
-			let outputTruncated = false;
-			const killFn = () => handle.kill();
-			backgroundTaskService.registerKillHandler(taskId, () => void killFn());
-
-			const bgDecoder = createStreamDecoder();
-			const appendOutput = (raw: Uint8Array) => {
-				if (outputTruncated) return;
-				const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-				const str = bgDecoder.write(chunk);
-				outputBytes += chunk.byteLength;
-				if (outputBytes > MAX_OUTPUT_BYTES) {
-					backgroundTaskService.appendOutput(
-						taskId,
-						`${str.slice(0, 200)}\n\n<bash_metadata>\nOutput truncated at ${(MAX_OUTPUT_BYTES / 1024 / 1024).toFixed(0)}MB limit\n</bash_metadata>`,
-					);
-					outputTruncated = true;
-					return;
-				}
-				if (str) backgroundTaskService.appendOutput(taskId, str);
-			};
-			handle.onData(appendOutput);
-
-			let watchdogKilled = false;
-			let exited = false;
-			void handle.exited.then(
-				() => {
-					exited = true;
-				},
-				() => {
-					exited = true;
-				},
+			// A service may outlive this server process (planned restart). Where the backend
+			// supports it, it writes to a log file and leaves a manifest so a restarted server
+			// can re-attach instead of reporting it failed.
+			const handle = await execution.start(
+				bgAbort.signal,
+				backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
 			);
-
-			const executionTimeout = createOptionalExecutionTimeout(
+			await monitorBackgroundBash({
+				taskId,
+				handle,
+				bgAbort,
+				backgroundKind,
 				timeoutMs,
-				"Background command timeout",
-			);
-			const onTimeout = () => {
-				if (timedOut) return;
-				timedOut = true;
-				backgroundTaskService.appendOutput(
-					taskId,
-					"\n\n<bash_metadata>\nBackground command timed out\n</bash_metadata>",
-				);
-				void killFn();
-			};
-			executionTimeout?.signal.addEventListener("abort", onTimeout, { once: true });
-			if (executionTimeout?.signal.aborted) onTimeout();
-
-			// Health watchdog: do not kill a quiet but healthy long-running command.
-			// Only terminate a local process whose PID disappeared while the handle
-			// still claims it has not exited. Remote handles rely on RPC liveness.
-			const watchdogTimer = setInterval(() => {
-				if (exited || handle.isExited()) return;
-				const pid = handle.pid;
-				if (pid == null) return;
-				try {
-					process.kill(pid, 0);
-				} catch (error) {
-					const code =
-						error && typeof error === "object" && "code" in error ? error.code : undefined;
-					if (code !== "ESRCH") return;
-					watchdogKilled = true;
-					void killFn();
-				}
-			}, WATCHDOG_INTERVAL_MS);
-
-			// Services are intentionally long-lived: drain their startup handoff, not their
-			// entire lifetime. The durable task and cancellation/output/exit monitoring now
-			// exist, so maintenance may proceed without marking the service completed or
-			// stopping it. Finite tasks still hold the lease through result persistence.
-			if (backgroundKind === "service") releaseUpdateLease();
-
-			let resolvedExitCode: number | null;
-			try {
-				resolvedExitCode = await handle.exited;
-			} finally {
-				clearInterval(watchdogTimer);
-				executionTimeout?.signal.removeEventListener("abort", onTimeout);
-				executionTimeout?.dispose();
-			}
-
-			// Flush bytes buffered inside the decoder (see foreground path).
-			if (!outputTruncated) {
-				const tail = bgDecoder.end();
-				if (tail) backgroundTaskService.appendOutput(taskId, tail);
-			}
-
-			const exitCode = resolvedExitCode ?? 1;
-			if (watchdogKilled) {
-				backgroundTaskService.appendOutput(
-					taskId,
-					"\n\n<bash_metadata>\nBackground command terminated by health watchdog\n</bash_metadata>",
-				);
-			} else if (!timedOut && handle.outputIncomplete?.()) {
-				backgroundTaskService.appendOutput(
-					taskId,
-					"\n\n<bash_metadata>\nOutput is incomplete: the device reached its output limit or a " +
-						"background process kept the output pipes open after the command exited\n</bash_metadata>",
-				);
-			}
-			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
-			const finalOutput = exitCode !== 0 ? `${output}\n[exit code: ${exitCode}]` : output;
-
-			if (bgAbort.signal.aborted || backgroundTaskService.isCancellationRequested(taskId)) {
-				await backgroundTaskService.markCancelled(taskId);
-			} else if (timedOut) {
-				await backgroundTaskService.markTimedOut(taskId, finalOutput, exitCode);
-			} else if (backgroundKind === "service") {
-				await backgroundTaskService.markFailed(
-					taskId,
-					`${finalOutput}\nBackground service exited unexpectedly (exit code: ${exitCode}).`,
-					exitCode,
-				);
-			} else if (exitCode === 0) {
-				await backgroundTaskService.markCompleted(taskId, finalOutput, exitCode);
-			} else {
-				await backgroundTaskService.markFailed(taskId, finalOutput, exitCode);
-			}
+				// Services are intentionally long-lived: drain their startup handoff, not their
+				// entire lifetime. The durable task and cancellation/output/exit monitoring now
+				// exist, so maintenance may proceed without marking the service completed or
+				// stopping it. Finite tasks still hold the lease through result persistence.
+				onMonitoring: backgroundKind === "service" ? releaseUpdateLease : undefined,
+				callerSignal: ctx.signal,
+			});
 		} catch (err) {
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
@@ -1072,11 +972,12 @@ async function _runInBackground(
 				backgroundTaskService.isCancellationRequested(taskId)
 			) {
 				await backgroundTaskService.markCancelled(taskId);
-			} else if (timedOut) {
-				await backgroundTaskService.markTimedOut(taskId, error);
 			} else {
 				await backgroundTaskService.markFailed(taskId, error);
 			}
+			// Dispatch failed before any process existed; drop a possibly created directory
+			// without holding the lease on filesystem cleanup.
+			if (backgroundKind === "service") void removeServiceArtifacts(taskId);
 		} finally {
 			releaseUpdateLease();
 		}
@@ -1094,4 +995,166 @@ async function _runInBackground(
 	}
 
 	return { output, title };
+}
+
+export interface MonitorBackgroundBashOptions {
+	taskId: string;
+	handle: ExecHandle;
+	bgAbort: AbortController;
+	backgroundKind: "task" | "service";
+	/** Remaining wall-clock budget; undefined means unlimited. */
+	timeoutMs: number | undefined;
+	/** Called once output/exit/cancellation monitoring is in place. */
+	onMonitoring?: () => void;
+	/** The launching tool call's signal; absent for a service adopted after restart. */
+	callerSignal?: AbortSignal;
+}
+
+/**
+ * Collect a running background command's output and settle its task row when it ends.
+ * Shared by fresh launches and by services a restarted server re-attached to.
+ */
+export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions): Promise<void> {
+	const { taskId, handle, bgAbort, backgroundKind, timeoutMs } = opts;
+	let timedOut = false;
+	try {
+		let outputBytes = 0;
+		let outputTruncated = false;
+		const killFn = () => handle.kill();
+		backgroundTaskService.registerKillHandler(taskId, () => void killFn());
+
+		const bgDecoder = createStreamDecoder();
+		const appendOutput = (raw: Uint8Array) => {
+			if (outputTruncated) return;
+			const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+			const str = bgDecoder.write(chunk);
+			outputBytes += chunk.byteLength;
+			if (outputBytes > MAX_OUTPUT_BYTES) {
+				backgroundTaskService.appendOutput(
+					taskId,
+					`${str.slice(0, 200)}\n\n<bash_metadata>\nOutput truncated at ${(MAX_OUTPUT_BYTES / 1024 / 1024).toFixed(0)}MB limit\n</bash_metadata>`,
+				);
+				outputTruncated = true;
+				return;
+			}
+			if (str) backgroundTaskService.appendOutput(taskId, str);
+		};
+		handle.onData(appendOutput);
+
+		let watchdogKilled = false;
+		let exited = false;
+		void handle.exited.then(
+			() => {
+				exited = true;
+			},
+			() => {
+				exited = true;
+			},
+		);
+
+		// An adopted service may already be past its budget: stop it right away.
+		const executionTimeout =
+			timeoutMs !== undefined && timeoutMs <= 0
+				? null
+				: createOptionalExecutionTimeout(timeoutMs, "Background command timeout");
+		const onTimeout = () => {
+			if (timedOut) return;
+			timedOut = true;
+			backgroundTaskService.appendOutput(
+				taskId,
+				"\n\n<bash_metadata>\nBackground command timed out\n</bash_metadata>",
+			);
+			void killFn();
+		};
+		executionTimeout?.signal.addEventListener("abort", onTimeout, { once: true });
+		if (executionTimeout?.signal.aborted || (timeoutMs !== undefined && timeoutMs <= 0))
+			onTimeout();
+
+		// Health watchdog: do not kill a quiet but healthy long-running command.
+		// Only terminate a local process whose PID disappeared while the handle
+		// still claims it has not exited. Remote handles rely on RPC liveness.
+		// A durable service handle checks its own liveness (pid + start token).
+		const watchdogTimer =
+			handle instanceof DurableServiceHandle
+				? null
+				: setInterval(() => {
+						if (exited || handle.isExited()) return;
+						const pid = handle.pid;
+						if (pid == null) return;
+						try {
+							process.kill(pid, 0);
+						} catch (error) {
+							const code =
+								error && typeof error === "object" && "code" in error ? error.code : undefined;
+							if (code !== "ESRCH") return;
+							watchdogKilled = true;
+							void killFn();
+						}
+					}, WATCHDOG_INTERVAL_MS);
+
+		opts.onMonitoring?.();
+
+		let resolvedExitCode: number | null;
+		try {
+			resolvedExitCode = await handle.exited;
+		} finally {
+			if (watchdogTimer) clearInterval(watchdogTimer);
+			executionTimeout?.signal.removeEventListener("abort", onTimeout);
+			executionTimeout?.dispose();
+		}
+
+		// Flush bytes buffered inside the decoder (see foreground path).
+		if (!outputTruncated) {
+			const tail = bgDecoder.end();
+			if (tail) backgroundTaskService.appendOutput(taskId, tail);
+		}
+
+		const exitCode = resolvedExitCode ?? 1;
+		if (watchdogKilled) {
+			backgroundTaskService.appendOutput(
+				taskId,
+				"\n\n<bash_metadata>\nBackground command terminated by health watchdog\n</bash_metadata>",
+			);
+		} else if (!timedOut && (handle as ExecHandle).outputIncomplete?.()) {
+			backgroundTaskService.appendOutput(
+				taskId,
+				"\n\n<bash_metadata>\nOutput is incomplete: the device reached its output limit or a " +
+					"background process kept the output pipes open after the command exited\n</bash_metadata>",
+			);
+		}
+		const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
+		const finalOutput = exitCode !== 0 ? `${output}\n[exit code: ${exitCode}]` : output;
+
+		if (bgAbort.signal.aborted || backgroundTaskService.isCancellationRequested(taskId)) {
+			await backgroundTaskService.markCancelled(taskId);
+		} else if (timedOut) {
+			await backgroundTaskService.markTimedOut(taskId, finalOutput, exitCode);
+		} else if (backgroundKind === "service") {
+			await backgroundTaskService.markFailed(
+				taskId,
+				`${finalOutput}\nBackground service exited unexpectedly (exit code: ${exitCode}).`,
+				exitCode,
+			);
+		} else if (exitCode === 0) {
+			await backgroundTaskService.markCompleted(taskId, finalOutput, exitCode);
+		} else {
+			await backgroundTaskService.markFailed(taskId, finalOutput, exitCode);
+		}
+		if (handle instanceof DurableServiceHandle) await removeServiceArtifacts(taskId);
+	} catch (err) {
+		const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
+		const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
+		if (
+			bgAbort.signal.aborted ||
+			opts.callerSignal?.aborted ||
+			backgroundTaskService.isCancellationRequested(taskId)
+		) {
+			await backgroundTaskService.markCancelled(taskId);
+		} else if (timedOut) {
+			await backgroundTaskService.markTimedOut(taskId, error);
+		} else {
+			await backgroundTaskService.markFailed(taskId, error);
+		}
+		if (handle instanceof DurableServiceHandle) await removeServiceArtifacts(taskId);
+	}
 }
