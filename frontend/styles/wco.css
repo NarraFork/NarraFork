@@ -25,7 +25,7 @@ html[data-nf-wco] {
  *   - Over the page: Main starts below a strip of the overlay's height, painted by
  *     `.nf-wco-main-strip`, so the window buttons never cover route content.
  *
- * Phones keep the header row and its own drag rules below.
+ * Narrow session/workspace windows also use their page-owned title-bar rows below.
  */
 html[data-nf-wco] .nf-nav-brand-row {
 	-webkit-app-region: drag;
@@ -42,11 +42,11 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 }
 
 /*
- * Phones / narrow windows keep the header row. It drags, except its two content
- * clusters, whose interactive children opt out individually (the mobile BrandTitle is
- * non-interactive). The wizard's full-width return button is a direct header child and
- * stays clickable. 48em is Mantine's `sm` breakpoint (MOBILE_VIEWPORT_MEDIA_QUERY in
- * lib/responsive.ts, the same boundary safe-area.css uses).
+ * Narrow shell-header content (including the wizard return bar) stays clear of the
+ * window controls. Page-owned session/workspace headers are handled at all widths below:
+ * the shell no longer renders a normal phone header. Legacy header clusters still drag
+ * with interactive children opting out. 48em is Mantine's `sm` breakpoint
+ * (MOBILE_VIEWPORT_MEDIA_QUERY in lib/responsive.ts).
  */
 @media not all and (min-width: 48em) {
 	html[data-nf-wco="right"] .nf-app-shell .mantine-AppShell-header {
@@ -128,90 +128,100 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
  * drag the window from their blank area, and the one at the right edge stays clear of
  * the window buttons (the left edge too, for buttons on the left over a collapsed rail).
  */
-@media (min-width: 48em) {
-	html[data-nf-wco] .nf-app-shell-main:has([data-nf-wco-titlebar]) .nf-wco-main-strip {
-		display: none;
-	}
+html[data-nf-wco] .nf-app-shell-main:has([data-nf-wco-titlebar]) .nf-wco-main-strip {
+	display: none;
+}
 
-	html[data-nf-wco] [data-nf-titlebar-row] {
-		-webkit-app-region: drag;
-		box-sizing: border-box;
-		min-height: var(--nf-wco-row-height);
-		height: var(--nf-wco-row-height);
-		flex-shrink: 0;
-		/* biome-ignore lint/complexity/noImportantStyles: chat and panel headers set their vertical padding inline; it must fit INSIDE the WCO height, not enlarge it */
-		padding-block: 0 !important;
-	}
+html[data-nf-wco] [data-nf-titlebar-row] {
+	-webkit-app-region: drag;
+	user-select: none;
+	box-sizing: border-box;
+	min-height: var(--nf-wco-row-height);
+	height: var(--nf-wco-row-height);
+	flex-shrink: 0;
+	/* biome-ignore lint/complexity/noImportantStyles: chat and panel headers set their vertical padding inline; it must fit INSIDE the WCO height, not enlarge it */
+	padding-block: 0 !important;
+}
 
-	html[data-nf-wco] .dv-tabs-and-actions-container[data-nf-titlebar-row] {
-		/* Dockview's tab content, actions and drop targets read this variable too. Changing
-		   only the outer strip's height leaves the tabs at the normal panel-header height. */
-		--dv-tabs-and-actions-container-height: var(--nf-wco-row-height);
-	}
+html[data-nf-wco] .dv-tabs-and-actions-container[data-nf-titlebar-row] {
+	/* Dockview's tab content, actions and drop targets read this variable too. Changing
+	   only the outer strip's height leaves the tabs at the normal panel-header height. */
+	--dv-tabs-and-actions-container-height: var(--nf-wco-row-height);
+}
 
-	/*
-	 * Controls inside a title-bar row stay clickable. The tab-overflow counter is a
-	 * bare div, so without an entry here the drag region swallows its clicks and
-	 * pressing it moves the window instead of opening the tab list.
-	 */
-	html[data-nf-wco] [data-nf-titlebar-row]
-		:is(
-			button,
-			a,
-			input,
-			select,
-			textarea,
-			[role="button"],
-			[role="tab"],
-			.dv-tab,
-			.dv-tabs-overflow-dropdown-root,
-			.dv-tabs-overflow-dropdown-default
-		) {
-		-webkit-app-region: no-drag;
-	}
+/*
+ * Controls inside a title-bar row stay clickable. The tab-overflow counter is a
+ * bare div, so without an entry here the drag region swallows its clicks and
+ * pressing it moves the window instead of opening the tab list.
+ */
+html[data-nf-wco] [data-nf-titlebar-row]
+	:is(
+		button,
+		a,
+		input,
+		select,
+		textarea,
+		[role="button"],
+		[role="tab"],
+		.dv-tab,
+		.dv-tabs-overflow-dropdown-root,
+		.dv-tabs-overflow-dropdown-default
+	) {
+	-webkit-app-region: no-drag;
+}
 
-	/*
-	 * A dockview tab strip's blank area (after the tabs) is the title bar's blank area:
-	 * it moves the window. Dockview makes it an HTML5 drag source (`draggable`, to move
-	 * the whole group), and the row's drag region alone did not cover it: a press there
-	 * started the group drag (its "Multiple Panels" ghost) instead of moving the window.
-	 * So it declares its own region and opts out of the HTML5 drag, in title-bar rows
-	 * only. Tabs still move panels.
-	 */
-	html[data-nf-wco] [data-nf-titlebar-row] .dv-void-container {
-		-webkit-app-region: drag;
-		-webkit-user-drag: none;
-	}
+html[data-nf-wco] [data-nf-titlebar-row] :is(input, textarea) {
+	user-select: text;
+}
 
-	/* The headers set their padding inline (narrator header, panel headers), hence the
-	   overrides; only the edge rows under the window buttons are affected. */
-	html[data-nf-wco="right"] [data-nf-titlebar-end] {
-		/* biome-ignore lint/complexity/noImportantStyles: beats the headers' inline padding, only under the WCO window buttons */
-		padding-inline-end: calc(var(--nf-wco-inset-right) + 8px) !important;
-	}
+/*
+ * A dockview tab strip's blank area (after the tabs) is the title bar's blank area:
+ * it moves the window. Dockview makes it an HTML5 drag source (`draggable`, to move
+ * the whole group), and the row's drag region alone did not cover it: a press there
+ * started the group drag (its "Multiple Panels" ghost) instead of moving the window.
+ * So it declares its own region and opts out of the HTML5 drag, in title-bar rows
+ * only. Tabs still move panels.
+ */
+html[data-nf-wco] [data-nf-titlebar-row] .dv-void-container {
+	-webkit-app-region: drag;
+	-webkit-user-drag: none;
+}
 
-	/* Dockview draws its bottom divider on tabs and the trailing void, not the strip
-	   itself (the active tab intentionally has no bottom line). WCO's reserved button
-	   padding is outside both, so continue the line through that padding only. */
-	html[data-nf-wco="right"] .dv-tabs-and-actions-container[data-nf-titlebar-end] {
-		position: relative;
-	}
+/* The headers set their padding inline (narrator header, panel headers), hence the
+   overrides; only the edge rows under the window buttons are affected. */
+html[data-nf-wco="right"] [data-nf-titlebar-end] {
+	/* biome-ignore lint/complexity/noImportantStyles: beats the headers' inline padding, only under the WCO window buttons */
+	padding-inline-end: calc(var(--nf-wco-inset-right) + 8px) !important;
+}
 
-	html[data-nf-wco="right"] .dv-tabs-and-actions-container[data-nf-titlebar-end]::after {
-		content: "";
-		position: absolute;
-		right: 0;
-		bottom: 0;
-		width: calc(var(--nf-wco-inset-right) + 8px);
-		height: 1px;
-		background: var(--mantine-color-default-border);
-		pointer-events: none;
-	}
+/* Dockview draws its bottom divider on tabs and the trailing void, not the strip
+   itself (the active tab intentionally has no bottom line). WCO's reserved button
+   padding is outside both, so continue the line through that padding only. */
+html[data-nf-wco="right"] .dv-tabs-and-actions-container[data-nf-titlebar-end] {
+	position: relative;
+}
 
+html[data-nf-wco="right"] .dv-tabs-and-actions-container[data-nf-titlebar-end]::after {
+	content: "";
+	position: absolute;
+	right: 0;
+	bottom: 0;
+	width: calc(var(--nf-wco-inset-right) + 8px);
+	height: 1px;
+	background: var(--mantine-color-default-border);
+	pointer-events: none;
+}
+
+html[data-nf-wco="left"] [data-nf-titlebar-start] {
+	--nf-titlebar-start-pad: calc(var(--nf-wco-inset-left) - var(--app-shell-navbar-width, 0px));
+	/* biome-ignore lint/complexity/noImportantStyles: beats the headers' inline padding, only under the WCO window buttons */
+	padding-inline-start: max(8px, calc(var(--nf-titlebar-start-pad) + 8px)) !important;
+}
+
+@media not all and (min-width: 48em) {
 	html[data-nf-wco="left"] [data-nf-titlebar-start] {
-		--nf-titlebar-start-pad: calc(var(--nf-wco-inset-left) - var(--app-shell-navbar-width, 0px));
-		/* biome-ignore lint/complexity/noImportantStyles: beats the headers' inline padding, only under the WCO window buttons */
-		padding-inline-start: max(8px, calc(var(--nf-titlebar-start-pad) + 8px)) !important;
+		/* The navbar is a hidden drawer here, not a column beside the title bar. */
+		--nf-titlebar-start-pad: var(--nf-wco-inset-left);
 	}
 }
 

@@ -3438,6 +3438,7 @@ class BackgroundTaskService {
 							toolCallId: backgroundTasks.toolCallId,
 							executionAttempt: backgroundTasks.executionAttempt,
 							command: backgroundTasks.command,
+							backgroundKind: backgroundTasks.backgroundKind,
 						})
 						.from(backgroundTasks)
 						.where(
@@ -3484,12 +3485,21 @@ class BackgroundTaskService {
 			// fall through and publish a different terminal for the same run.
 			restoredTerminals.add(task.id);
 		}
+		// Durable services survive a planned restart: re-attach to the ones still running,
+		// and settle the ones that ended while no server was watching from their own exit
+		// file instead of the generic "outcome unknown".
+		const settledServices = new Set<string>();
+		for (const task of scanned) {
+			if (task.type !== "bash" || task.backgroundKind !== "service") continue;
+			if (await this.recoverDurableService(task.id, task.parentNarratorId))
+				settledServices.add(task.id);
+		}
 		const staleTasks = scanned
-			.filter((task) => !restoredTerminals.has(task.id))
+			.filter((task) => !restoredTerminals.has(task.id) && !settledServices.has(task.id))
 			// Only an agent row can be protected — see the note above on why a bash row
 			// has no resume path to protect.
 			.filter((task) => task.type === "bash" || !protectedTaskIds.has(task.id));
-		if (staleTasks.length === 0) return nextPage();
+		if (staleTasks.length === 0) return settledServices.size + (await nextPage());
 
 		const now = new Date().toISOString();
 		// A transfer is the one kind that SURVIVES a restart. Its owning
@@ -3677,7 +3687,95 @@ class BackgroundTaskService {
 			// how an operator tells "work was destroyed" from "work is resumable".
 			transferPaused: transferIds.length,
 		});
-		return staleTasks.length + (await nextPage());
+		return staleTasks.length + settledServices.size + (await nextPage());
+	}
+
+	/**
+	 * Recover one `running` service row a previous server process left behind.
+	 *
+	 * Returns true when the row was handled here (re-attached, or settled from the service's
+	 * own exit record); false leaves it to the generic stale-task path — the service predates
+	 * durable services or its manifest was never written, so nothing proves its outcome.
+	 */
+	private async recoverDurableService(taskId: string, parentNarratorId: string): Promise<boolean> {
+		const durable = await import("../lib/agent/execution/durable-service");
+		if (!durable.isDurableServiceSupported()) return false;
+		let adopted: Awaited<ReturnType<typeof durable.adoptDurableService>>;
+		try {
+			adopted = await durable.adoptDurableService(taskId);
+		} catch (error) {
+			logger.warn("Background service adoption failed", { taskId, error: String(error) });
+			return false;
+		}
+		if (adopted) {
+			const { handle, manifest } = adopted;
+			const ctrl = new AbortController();
+			this.outputChunks.set(taskId, []);
+			this.outputByteCounts.set(taskId, 0);
+			this.parentNarratorCache.set(taskId, parentNarratorId);
+			this.registerAbortController(taskId, ctrl);
+			const remaining =
+				manifest.timeoutMs === undefined
+					? undefined
+					: manifest.startedAt + manifest.timeoutMs - Date.now();
+			const { monitorBackgroundBash } = await import("../lib/agent/tools/bash");
+			void monitorBackgroundBash({
+				taskId,
+				handle,
+				bgAbort: ctrl,
+				backgroundKind: "service",
+				timeoutMs: remaining,
+			}).catch((error) =>
+				logger.warn("Adopted background service monitor failed", {
+					taskId,
+					error: String(error),
+				}),
+			);
+			this.queueTaskUpsert(parentNarratorId, taskId);
+			logger.info("Re-attached background service after restart", {
+				taskId,
+				pid: manifest.pid,
+			});
+			return true;
+		}
+
+		const outcome = await durable.readOrphanedServiceOutcome(taskId);
+		if (!outcome.hasManifest || outcome.exitCode === null) {
+			// No proof of how it ended (legacy pipe-backed service, or killed before the
+			// wrapper could record a status). The generic path reports "outcome unknown".
+			await durable.removeServiceArtifacts(taskId);
+			return false;
+		}
+		this.parentNarratorCache.set(taskId, parentNarratorId);
+		const text =
+			`${outcome.logTail}\n[exit code: ${outcome.exitCode}]\n` +
+			`Background service exited while NarraFork was restarting (exit code: ${outcome.exitCode}).`;
+		await this.markFailed(taskId, text, outcome.exitCode);
+		await durable.removeServiceArtifacts(taskId);
+		return true;
+	}
+
+	/**
+	 * Remove leftover service directories that no running service row references (the row
+	 * was deleted, or a crash happened between settle and cleanup). Bounded and best effort.
+	 */
+	async sweepOrphanedServiceArtifacts(): Promise<void> {
+		const durable = await import("../lib/agent/execution/durable-service");
+		if (!durable.isDurableServiceSupported()) return;
+		if (resolveRuntimeQueueBackend() === "postgres") return;
+		const running = await db
+			.select({ id: backgroundTasks.id })
+			.from(backgroundTasks)
+			.where(
+				and(
+					eq(backgroundTasks.status, "running"),
+					eq(backgroundTasks.type, "bash"),
+					eq(backgroundTasks.backgroundKind, "service"),
+				),
+			)
+			.limit(1_000)
+			.all();
+		await durable.sweepServiceArtifacts(new Set(running.map((row) => row.id)));
 	}
 
 	/**
