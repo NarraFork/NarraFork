@@ -661,5 +661,13 @@ describe("交出去 through the board's route (outline P2 PR 10c-3)", () => {
 		expect(providerInputs[0]).toContain(body.handedOut.address);
 		expect(await state(task.blockId)).toMatchObject({ status: "todo", holder: null });
 		closeNarrator(target);
+		// Leave no claim on a lease behind (other files' lease-expiry cases scan them all).
+		const copy = await outlineStore.getBlock(body.handedOut.copyId);
+		await writeOutline({
+			spaceId: copy?.spaceId as string,
+			ops: [{ op: "setTask", block: { id: body.handedOut.copyId }, task: { status: "done" } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
 	});
 });
