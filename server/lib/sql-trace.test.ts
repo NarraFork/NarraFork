@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -68,9 +68,17 @@ describe("instrumentSqliteConnection", () => {
 	});
 
 	test("attributes statements to the active span with per-fingerprint aggregates", async () => {
+		// Reproduce the former n1 assertion's collision with a valid random span ID.
+		const random = spyOn(Math, "random").mockReturnValue(23 / 36);
+		try {
+			configureSqlTraceForTest({ mode: "summary", dir });
+		} finally {
+			random.mockRestore();
+		}
+		const boundValues = Array.from({ length: 3 }, (_, i) => `private-bound-value:${i}:do-not-log`);
 		const db = openDb();
 		await withSqlTraceSpan("http", "GET /api/x", { path: "/api/x" }, async () => {
-			for (let i = 0; i < 3; i++) db.query("INSERT INTO t (name) VALUES (?)").run(`n${i}`);
+			for (const value of boundValues) db.query("INSERT INTO t (name) VALUES (?)").run(value);
 			await Promise.resolve();
 			expect(db.query("SELECT * FROM t").all()).toHaveLength(3);
 			db.prepare("SELECT name FROM t WHERE id = ?").get(1);
@@ -89,8 +97,10 @@ describe("instrumentSqliteConnection", () => {
 		expect(insert?.rows).toBe(3);
 		const select = stmts.find((s) => catalog.get(s.h) === "SELECT * FROM t");
 		expect(select?.rows).toBe(3);
-		// Bound parameters never reach the output.
-		expect(JSON.stringify(records)).not.toContain("n1");
+		// Legitimate span IDs must not be mistaken for leaked bound parameters.
+		expect(records.some((r) => r.t === "span" && r.id === "n1")).toBe(true);
+		const output = JSON.stringify(records);
+		for (const value of boundValues) expect(output).not.toContain(value);
 	});
 
 	test("child spans carry their parent id and their own SQL", async () => {

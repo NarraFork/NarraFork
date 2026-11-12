@@ -30,9 +30,9 @@
  *     the cursor (a task ticked done, an indent under a closed block) keeps that block open while
  *     the cursor is in it and lets it close when the cursor leaves; folding a block around the
  *     cursor moves the cursor onto that block. While an input method composes, the block it
- *     composes in stays on screen whatever closes around it. A selection that reaches into a
- *     closed block never deletes what the block hides: the block opens first, so the reader sees
- *     what would go. A change by someone else that folds or adds rows above keeps the reader's
+ *     composes in stays on screen whatever closes around it. A text selection that reaches into
+ *     a closed block, or covers one, never deletes what the block hides: the block opens first,
+ *     so the reader sees what would go (rows deleted as blocks take what they hold). A change by someone else that folds or adds rows above keeps the reader's
  *     row where it is on screen.
  */
 import {
@@ -167,6 +167,9 @@ export function foldAttr(
 	const h = hidden ? FOLD_MARK_KEYS.map((key) => hidden[key]).join(",") : "";
 	return `${subtree ?? ""}|${p}|${h}`;
 }
+
+/** Transaction meta: whole blocks are deleted as blocks (a block selection), not as text. */
+const WHOLE_BLOCKS = "outlineWholeBlocks";
 
 export interface FoldChrome {
 	subtree: "expand" | "collapse" | null;
@@ -849,12 +852,14 @@ export class OutlineView implements CmdHost, ClientView {
 
 	/**
 	 * The reader folded somewhere else (another view of the page, the toolbar, the stored folding
-	 * arriving): this view follows, nothing is held open against it, and a cursor it hides moves
-	 * onto the nearest block still shown.
+	 * arriving): this view follows, and a cursor it hides moves onto the nearest block still
+	 * shown. A block kept open for the cursor stays open unless `action` closes it
+	 * ({@link pinsAfter}); without an action (another view's own folding, the stored folding),
+	 * it stays while the person is in this editor.
 	 */
-	foldChanged(): void {
+	foldChanged(action?: FoldAction): void {
 		if (this.destroyed) return;
-		this.caretPins = [];
+		this.caretPins = action ? this.pinsAfter(action) : this.pm.hasFocus() ? this.caretPins : [];
 		this.folding = true;
 		try {
 			this.sync();
@@ -1007,9 +1012,11 @@ export class OutlineView implements CmdHost, ClientView {
 		if (this.destroyed || !this.foldTree) return false;
 		// The reader's own folding is not held open against them: a block kept open for the
 		// cursor closes when they close it (nothing was stored for it, so nothing changes there).
-		const held = this.caretPins.length > 0;
-		if (!applyFoldAction(this.foldTree, this.foldView, action) && !held) return false;
-		this.caretPins = [];
+		// Folding anywhere else leaves it open: only the cursor leaving lets it go.
+		const pins = this.pinsAfter(action);
+		const released = pins.length !== this.caretPins.length;
+		if (!applyFoldAction(this.foldTree, this.foldView, action) && !released) return false;
+		this.caretPins = pins;
 		this.folding = true;
 		try {
 			this.sync();
@@ -1019,6 +1026,41 @@ export class OutlineView implements CmdHost, ClientView {
 		}
 		this.opts.onCollapse?.();
 		return true;
+	}
+
+	/**
+	 * The blocks still kept open for the cursor after the reader's `action`: one is let go only
+	 * when the action is about a block around it (the arrow or the quick control of the block
+	 * held open, or of one above it) or closes blocks page-wide. Folding elsewhere on the page,
+	 * opening, and bringing a block on screen leave it as it is.
+	 */
+	private pinsAfter(action: FoldAction): string[] {
+		const pins = this.caretPins;
+		if (pins.length === 0) return pins;
+		switch (action.kind) {
+			case "reveal":
+				return pins;
+			case "all":
+				return action.open ? pins : [];
+			case "closeAll":
+			case "level":
+				return [];
+			case "node":
+			case "subtree": {
+				const tree = this.foldTree;
+				if (!tree) return [];
+				const around = (pin: string) => {
+					for (
+						let at = tree.nodes.get(pin)?.parent ?? null;
+						at !== null;
+						at = tree.nodes.get(at)?.parent ?? null
+					)
+						if (at === action.id) return true;
+					return false;
+				};
+				return pins.filter((pin) => !around(pin));
+			}
+		}
 	}
 
 	/** Open or close one block (its arrow). */
@@ -1082,11 +1124,14 @@ export class OutlineView implements CmdHost, ClientView {
 	}
 
 	/**
-	 * Blocks a change would delete although the reader cannot see them: hidden under a closed
-	 * block that itself stays. (A closed block that goes as a whole — block selection, or a
-	 * selection from the start of its line on — takes what it holds with it, as it always did.)
+	 * Blocks a change would delete although the reader cannot see them. With a text selection
+	 * (`text`), every block hidden under a closed row that the change removes: whether the row
+	 * itself stays (the selection starts or ends inside its line) or goes with it (the selection
+	 * starts at the very start of its line, or covers the row from a row above — select all
+	 * too). Rows deleted as blocks (a block selection: `deleteBlocks`) take what they hold with
+	 * them, as they always did: only what hides under a closed block that stays counts then.
 	 */
-	private hiddenLoss(before: EditorState, after: PMNode): string[] {
+	private hiddenLoss(before: EditorState, after: PMNode, text: boolean): string[] {
 		const kept = new Set<string>();
 		after.descendants((n) => {
 			if (n.type === N.block) kept.add(n.attrs.id);
@@ -1096,7 +1141,7 @@ export class OutlineView implements CmdHost, ClientView {
 		// `closed`: the outermost closed block above (the row the reader sees).
 		const walk = (node: PMNode, closed: string | null) => {
 			const id = node.attrs.id as string;
-			if (closed !== null && !kept.has(id) && kept.has(closed)) lost.push(id);
+			if (closed !== null && !kept.has(id) && (text || kept.has(closed))) lost.push(id);
 			if (node.childCount < 2) return;
 			const under = closed ?? (node.attrs.collapsed ? id : null);
 			node.child(1).forEach((kid) => {
@@ -1136,7 +1181,7 @@ export class OutlineView implements CmdHost, ClientView {
 		const state = this.pm.state;
 		const sel = state.selection;
 		if (sel.empty || sel.$from.sameParent(sel.$to) || !this.client.editable) return false;
-		const lost = this.hiddenLoss(state, state.tr.deleteSelection().doc);
+		const lost = this.hiddenLoss(state, state.tr.deleteSelection().doc, !this.blockSel);
 		if (lost.length === 0) return false;
 		this.showBeforeDelete(lost);
 		if (collapse) {
@@ -1632,7 +1677,7 @@ export class OutlineView implements CmdHost, ClientView {
 			tr.setSelection(TextSelection.near(tr.doc.resolve(near), -1));
 		}
 		this.blockSel = null;
-		this.pm.dispatch(tr);
+		this.pm.dispatch(tr.setMeta(WHOLE_BLOCKS, true));
 		this.setBlockSelection(null);
 	}
 
@@ -1939,7 +1984,9 @@ export class OutlineView implements CmdHost, ClientView {
 			!before.selection.empty &&
 			!before.selection.$from.sameParent(before.selection.$to)
 		) {
-			const lost = this.hiddenLoss(before, state.doc);
+			// (Whole blocks deleted as blocks take what they hold: `deleteBlocks`.)
+			const text = !tr.getMeta(WHOLE_BLOCKS) && !this.blockSel;
+			const lost = this.hiddenLoss(before, state.doc, text);
 			if (lost.length > 0) {
 				this.stats.refused++;
 				this.pm.updateState(before);
