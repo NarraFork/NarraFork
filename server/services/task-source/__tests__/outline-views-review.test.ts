@@ -576,9 +576,9 @@ describe("N5: the turn-end note is written where the run goes idle", () => {
 			join(import.meta.dir, "../../agent-runtime/orchestrator.ts"),
 			"utf8",
 		);
-		const decide = source.indexOf("await decideOutlineTurnEndNote(active)");
+		const decide = source.indexOf("await decideOutlineTurnEndNote(active, {");
 		expect(decide).toBeGreaterThan(0);
-		expect(source.indexOf("await decideOutlineTurnEndNote(active)", decide + 1)).toBe(-1);
+		expect(source.indexOf("await decideOutlineTurnEndNote(active, {", decide + 1)).toBe(-1);
 		for (const before of [
 			'const continuationPrompt = await continueForSpec("spec", runState.hadError);',
 			"shouldResumeAfterCompact(",
