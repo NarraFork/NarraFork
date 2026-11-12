@@ -125,12 +125,45 @@ function abortError(): OutlineEditTextError {
 	return new OutlineEditTextError("OUTLINE_TEXT_FAILED", OUTLINE_TOOL_TEXT.textCancelled, 499);
 }
 
-interface EditTextChannel {
+export interface EditTextChannel {
 	run<J extends EditTextJob>(job: J, options?: EditTextRunOptions): Promise<EditTextResult<J>>;
 	stop(): void;
 }
 
-function createChannel(name: string, limits: EditTextChannelLimits): EditTextChannel {
+/** How a channel starts its worker: `connectCompiledWorker` on the edit-text worker entry. */
+export type EditTextWorkerConnect = (options: {
+	signal: AbortSignal;
+}) => Promise<{ worker: Worker }>;
+
+function connectEditTextWorker(options: { signal: AbortSignal }): Promise<{ worker: Worker }> {
+	return connectCompiledWorker(
+		compiledWorkerSpecifiers(
+			"services/outline/edit-text-worker.ts",
+			"./edit-text-worker.ts",
+			import.meta.url,
+		),
+		options,
+	);
+}
+
+/**
+ * A channel of its own, for fault-injection tests: `connect` stands for the worker start (one that
+ * rejects, never answers, or hands a worker that crashes or hangs). A job such a channel cannot
+ * run on its worker fails; nothing ever runs it on the caller's thread past the inline size.
+ */
+export function createEditTextChannel(
+	name: string,
+	limits: EditTextChannelLimits,
+	connect: EditTextWorkerConnect = connectEditTextWorker,
+): EditTextChannel {
+	return createChannel(name, limits, connect);
+}
+
+function createChannel(
+	name: string,
+	limits: EditTextChannelLimits,
+	connect: EditTextWorkerConnect = connectEditTextWorker,
+): EditTextChannel {
 	const state = hotSafe<ChannelState>(`narrafork.outline.editTextWorker${name}`, () => ({
 		worker: null,
 		starting: null,
@@ -175,28 +208,23 @@ function createChannel(name: string, limits: EditTextChannelLimits): EditTextCha
 	async function ensureWorker(): Promise<Worker> {
 		if (state.worker) return state.worker;
 		if (!state.starting) {
-			const starting = connectCompiledWorker(
-				compiledWorkerSpecifiers(
-					"services/outline/edit-text-worker.ts",
-					"./edit-text-worker.ts",
-					import.meta.url,
-				),
-				{ signal: AbortSignal.timeout(limits.startMs) },
-			).then(({ worker }) => {
-				if (state.starting !== starting) {
-					void worker.terminate();
-					throw new Error("outline text worker was replaced while starting");
-				}
-				state.worker = worker;
-				state.starting = null;
-				worker.unref();
-				worker.on("message", onMessage);
-				worker.on("error", (error: unknown) =>
-					onDeath(worker, error instanceof Error ? error : new Error(String(error))),
-				);
-				worker.on("exit", (code) => onDeath(worker, new Error(`worker exited (${code})`)));
-				return worker;
-			});
+			const starting = connect({ signal: AbortSignal.timeout(limits.startMs) }).then(
+				({ worker }) => {
+					if (state.starting !== starting) {
+						void worker.terminate();
+						throw new Error("outline text worker was replaced while starting");
+					}
+					state.worker = worker;
+					state.starting = null;
+					worker.unref();
+					worker.on("message", onMessage);
+					worker.on("error", (error: unknown) =>
+						onDeath(worker, error instanceof Error ? error : new Error(String(error))),
+					);
+					worker.on("exit", (code) => onDeath(worker, new Error(`worker exited (${code})`)));
+					return worker;
+				},
+			);
 			starting.catch(() => {
 				if (state.starting === starting) state.starting = null;
 			});
@@ -237,7 +265,7 @@ function createChannel(name: string, limits: EditTextChannelLimits): EditTextCha
 		};
 		task.timer = setTimeout(() => {
 			logger.warn("Outline edit text job timed out", {
-				channel: name === "" ? "interactive" : "background",
+				channel: name === "" ? "interactive" : name.replace(/^\./, ""),
 				bytes: editTextJobBytes(task.job),
 				elapsedMs: Math.round(performance.now() - started),
 			});
