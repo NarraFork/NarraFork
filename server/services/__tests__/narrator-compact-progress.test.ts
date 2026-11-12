@@ -404,4 +404,99 @@ describe("compact context occupancy bookkeeping", () => {
 		});
 		expect(row?.contextPercent).toBe(1.1);
 	});
+
+	async function compactWithEstimates(percent: () => number) {
+		spyOn(historyTokens, "estimateNarratorBuildHistoryTokens").mockImplementation(async () => ({
+			promptTokens: 500,
+			contextWindow: 10_000,
+			contextPercent: percent(),
+			turnUsage: { prompt_tokens: 500, input_tokens: 500, is_estimated: true },
+		}));
+		spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
+			summary: "Retained history summary",
+			contextPercent: 77,
+		});
+		await runCustomCompact(narratorId, "en");
+		const markers = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, narratorId),
+		});
+		const marker = markers.find((message) => message.id !== "m-occupancy");
+		expect(marker).toBeDefined();
+		return marker?.id ?? "";
+	}
+
+	test("an edit after later turns keeps the recorded after instead of measuring them", async () => {
+		// Once the narrator has moved on, its current history no longer describes this
+		// compact: re-measuring would publish an `after` that includes the later turns.
+		let percent = 5;
+		const messageId = await compactWithEstimates(() => percent);
+		const later = new Date(Date.now() + 60_000).toISOString();
+		db.insert(narratorMessages)
+			.values({
+				id: "m-later",
+				narratorId,
+				role: "user",
+				contentText: "A later turn",
+				contentJson: [{ type: "text", text: "A later turn" }],
+				createdAt: later,
+			})
+			.run();
+		sqlite.run(
+			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('r-later', ?, 'm-later', 100)",
+			[narratorId],
+		);
+
+		percent = 60;
+		await narratorService.updateCompactSummary(narratorId, messageId, "Edited summary");
+		await expect(refreshCompactContextPercentAfter(narratorId, messageId, "en")).resolves.toBe(
+			undefined,
+		);
+		expect(
+			(await narratorService.getCompactSummary(narratorId, messageId)).contextPercentAfter,
+		).toBe(5);
+	});
+
+	test("an edit copied on write re-measures the copy, never the row a fork still owns", async () => {
+		let percent = 5;
+		const messageId = await compactWithEstimates(() => percent);
+		const now = new Date().toISOString();
+		db.insert(narrators)
+			.values({
+				id: "n-fork",
+				type: "primary",
+				inheritMode: "full",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		sqlite.run(
+			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact) VALUES ('r-fork', 'n-fork', ?, 1, 1)",
+			[messageId],
+		);
+
+		percent = 1.1;
+		const editedId = await narratorService.updateCompactSummary(
+			narratorId,
+			messageId,
+			"A much shorter summary",
+		);
+		expect(editedId).not.toBe(messageId);
+		broadcasts = [];
+		await expect(refreshCompactContextPercentAfter(narratorId, editedId, "en")).resolves.toBe(1.1);
+
+		expect(
+			(await narratorService.getCompactSummary(narratorId, editedId)).contextPercentAfter,
+		).toBe(1.1);
+		// The fork's row keeps the occupancy measured when the compact ran.
+		expect((await narratorService.getCompactSummary("n-fork", messageId)).contextPercentAfter).toBe(
+			5,
+		);
+		const original = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+		});
+		expect(original?.contextPercent).toBe(5);
+		expect(
+			broadcasts.every((event) => (event.message as { id?: string } | undefined)?.id !== messageId),
+		).toBe(true);
+	});
 });

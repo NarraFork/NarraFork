@@ -3314,6 +3314,8 @@ export const narratorService = {
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),
 	deleteBlocks: narratorMessageQueries.deleteBlocks.bind(narratorMessageQueries),
 	updateCompactSummary: narratorMessageQueries.updateCompactSummary.bind(narratorMessageQueries),
+	isCompactAfterRemeasurable:
+		narratorMessageQueries.isCompactAfterRemeasurable.bind(narratorMessageQueries),
 	getPendingPermissions: narratorMessageQueries.getPendingPermissions.bind(narratorMessageQueries),
 
 	// ── Delegated methods (from narratorPersistence) ───────────────────────────

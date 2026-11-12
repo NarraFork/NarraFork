@@ -4816,13 +4816,19 @@ narratorRoutes.patch("/:id/compact/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 	const { summary } = await c.req.json();
 	if (!summary || typeof summary !== "string") throw new ValidationError("summary is required");
-	await narratorService.updateCompactSummary(narratorId, messageId, summary);
+	// A summary shared with a fork is copied on write, so the edit may land on a new row:
+	// re-measure that row, never the original the fork still owns.
+	const editedMessageId = await narratorService.updateCompactSummary(
+		narratorId,
+		messageId,
+		summary,
+	);
 	// An edited summary changes how much history the next request carries, and the editor
 	// refetches the detail as soon as this responds: re-measure before answering, or the
 	// client would read back the previous percentage.
 	const locale = await getUserLanguage(c.get("user").sub);
-	await refreshCompactContextPercentAfter(narratorId, messageId, locale);
-	return c.json({ ok: true });
+	await refreshCompactContextPercentAfter(narratorId, editedMessageId, locale);
+	return c.json({ ok: true, messageId: editedMessageId });
 });
 
 // Trigger manual compact

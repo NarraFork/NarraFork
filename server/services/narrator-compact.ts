@@ -736,12 +736,25 @@ export async function refreshCompactContextPercentAfter(
 	locale: Locale,
 ): Promise<number | undefined> {
 	try {
+		// The current history only describes this compact while it is still the latest
+		// boundary and nothing was added after it; otherwise keep the recorded value rather
+		// than overwrite it with an occupancy that includes later turns.
+		if (!(await narratorService.isCompactAfterRemeasurable(narratorId, messageId))) {
+			return undefined;
+		}
 		// The editor waits on this response, so keep the re-measure short: past a few seconds
 		// the stale-looking percentage is worth less than the save returning promptly.
 		const estimate = await estimateNarratorBuildHistoryTokens(narratorId, locale, {
 			deadline: Date.now() + 5_000,
 		});
-		if (estimate?.contextPercent == null) return undefined;
+		if (estimate?.contextPercent == null) {
+			logger.warn("Compact context occupancy unavailable after summary edit", {
+				narratorId,
+				messageId,
+				reason: estimate ? "no context window" : "estimate unavailable",
+			});
+			return undefined;
+		}
 		const updated = await narratorService.updateMessageHistoryTokenEstimate(
 			messageId,
 			narratorId,
@@ -750,7 +763,7 @@ export async function refreshCompactContextPercentAfter(
 		const marked = await narratorService.setCompactContextPercent(narratorId, messageId, {
 			after: estimate.contextPercent,
 		});
-		const message = marked ?? updated;
+		const message = marked ?? (updated?.seq != null ? updated : null);
 		if (message) {
 			broadcastToNarrator(narratorId, { type: "message_updated", narratorId, message });
 		}

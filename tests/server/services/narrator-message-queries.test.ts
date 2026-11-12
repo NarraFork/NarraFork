@@ -962,6 +962,52 @@ describe("narratorService message query regressions", () => {
 		expect(detail.contextPercentAfter).toBe(1.4);
 	});
 
+	it("does not borrow a before occupancy from across the previous compact", async () => {
+		seedBase();
+		insertMessage({
+			id: "old-turn",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "old" }],
+		});
+		await db
+			.update(narratorMessages)
+			.set({ contextPercent: 95 })
+			.where(eq(narratorMessages.id, "old-turn"));
+		insertMessage({
+			id: "first-target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "first" }],
+		});
+		const first = await narratorService.persistCompactingMessage("n1", "first-target", "blocking", {
+			model: "provider:model",
+			trigger: "manual",
+		});
+		// The summary model's own occupancy lands on the marker row: never a `before`.
+		await narratorService.finalizeCompactingMessage(first.id, "n1", "first summary", 62, {
+			mode: "blocking",
+		});
+		insertMessage({
+			id: "second-target",
+			seq: 10,
+			role: "user",
+			contentJson: [{ type: "text", text: "second" }],
+		});
+		const second = await narratorService.persistCompactingMessage(
+			"n1",
+			"second-target",
+			"blocking",
+			{ model: "provider:model", trigger: "manual" },
+		);
+		await narratorService.finalizeCompactingMessage(second.id, "n1", "second summary", 40, {
+			mode: "blocking",
+		});
+
+		const detail = await narratorService.getCompactSummary("n1", second.id);
+		expect(detail.contextPercentBefore).toBeUndefined();
+	});
+
 	it("rejects an old failed marker after a newer compact has succeeded", async () => {
 		seedBase();
 		insertMessage({
