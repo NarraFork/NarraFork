@@ -53,7 +53,9 @@ import { OUTLINE_DIGEST_SECTIONS } from "@shared/outline-digest";
 import { OUTLINE_HANDOFF_ACTOR } from "./handoff";
 import { readInProcess } from "./in-process";
 import {
+	commitPersonId,
 	OUTLINE_CHANGE,
+	OUTLINE_HAND_OUT_ACTOR,
 	type OutlineAskJson,
 	type OutlineSpaceKind,
 	type OutlineTaskJson,
@@ -119,6 +121,9 @@ const ROUTINE_SYSTEM_ACTORS = new Set([
 	"outline-task-start",
 	// A session opened for a task from the board: its claim, and a claim given back (P2 PR 10c-1).
 	"outline-task-open",
+	// A session's task handed out (P2 PR 10c-3): the copy is told as a task created by whoever
+	// handed it out (`commitActor`), not as a system commit.
+	OUTLINE_HAND_OUT_ACTOR,
 	"outline-questions",
 	"outline-live",
 	"outline-live-sync",
@@ -231,6 +236,20 @@ export function delegateConfirmationPerson(row: OutlinePendingHead): string | nu
 
 function actorOf(kind: string, id: string): OutlineDigestActor {
 	return { kind: kind === "human" || kind === "agent" ? kind : "system", id };
+}
+
+/**
+ * Who a commit's task change is told as made by: its actor, except a hand-out's (P2 PR 10c-3), a
+ * system commit made for whoever handed the task out: the person (`commitPersonId`), or the
+ * session it carries.
+ */
+function commitActor(commit: OutlineCommitRow): OutlineDigestActor {
+	if (commit.actorKind === "system" && commit.actorId === OUTLINE_HAND_OUT_ACTOR) {
+		const person = commitPersonId(commit);
+		if (person) return { kind: "human", id: person };
+		if (commit.narratorId) return { kind: "agent", id: commit.narratorId };
+	}
+	return actorOf(commit.actorKind, commit.actorId);
 }
 
 function claimActor(claim: OutlineTaskClaimRow | undefined): OutlineDigestActor | null {
@@ -513,7 +532,7 @@ export async function summarizeSpaceWindow(
 			at: commit.createdAt,
 			blockId: id,
 			pageId: lastVersion.pageId,
-			by: actorOf(commit.actorKind, commit.actorId),
+			by: commitActor(commit),
 			executor: null,
 			manager: after.manager ? actorOf(after.manager.kind, after.manager.id) : null,
 			goal: after.humanCreated === true,

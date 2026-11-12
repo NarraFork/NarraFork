@@ -79,6 +79,7 @@ import {
 	readSessionWriteFacts,
 } from "./access-reads";
 import { agentAssigneeName } from "./assignee";
+import { mayHandOut } from "./hand-out";
 import { handoffBlockIdsOf, previousSessionDirectory } from "./handoff";
 import {
 	OUTLINE_BEHAVIOR_ALIAS,
@@ -786,11 +787,19 @@ async function ownSections(
 		describe(ctx, shownOpen, { open: true, first: spaces[0]?.id ?? null }),
 		describe(ctx, shownFinished, { open: false }),
 	]);
+	// Session spaces whose tasks the person may hand out (「交给团队」, outline P2 PR 10c-3): a few
+	// keyed reads per writable session space (at most a page of them).
+	const handOut = new Set<string>();
+	for (const space of spaces) {
+		if (space.kind !== "session" || !writable.has(space.id)) continue;
+		if (await mayHandOut(ctx.principal, space, { store })) handOut.add(space.id);
+	}
 	const openBySpace = bySpace(open);
 	const finishedBySpace = bySpace(finished);
 	return spaces.map((space) => ({
 		space: described.get(space.id) as OutlineBoardSection["space"],
 		canWrite: writable.has(space.id),
+		...(handOut.has(space.id) ? { handOut: true as const } : {}),
 		role: "own" as const,
 		open: openBySpace.get(space.id) ?? [],
 		openTruncated: (openOf.get(space.id)?.length ?? 0) > limits.open,

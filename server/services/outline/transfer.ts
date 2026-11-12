@@ -79,6 +79,9 @@ export async function listTransferSessions(
 ): Promise<{ sessions: OutlineBoardTransferSession[]; truncated: boolean }> {
 	const projectId = await transferProjectOf(space);
 	if (!projectId) return { sessions: [], truncated: false };
+	// A task of a session space goes to another session as a copy in the project's space (a
+	// hand-out, outline P2 PR 10c-3): whether a session could work there is judged there.
+	const workSpace = space.kind === "session" ? await projectSpaceOrPending(projectId) : space;
 	const { sessions: limit, scanned, page } = OUTLINE_TRANSFER_LIMITS;
 	const sessions: OutlineBoardTransferSession[] = [];
 	let truncated = false;
@@ -89,7 +92,7 @@ export async function listTransferSessions(
 	const couldWork = (owner: string | null): Promise<boolean> => {
 		let verdict = owners.get(owner);
 		if (!verdict) {
-			verdict = canOwnerWorkIn(owner, space);
+			verdict = canOwnerWorkIn(owner, workSpace);
 			owners.set(owner, verdict);
 		}
 		return verdict;
@@ -118,6 +121,29 @@ export async function listTransferSessions(
 		if (offset + page >= scanned) truncated = true;
 	}
 	return { sessions, truncated };
+}
+
+/**
+ * The project's space, or what it will be when a hand-out creates it (its id starts with
+ * `pending:`): access to a space depends only on its kind and owner.
+ */
+export async function projectSpaceOrPending(
+	projectId: string,
+	store: OutlineStore = outlineStore,
+): Promise<OutlineSpaceRow> {
+	return (
+		(await store.findSpace({ kind: "project", projectId })) ?? {
+			id: `pending:project:${projectId}`,
+			key: "",
+			kind: "project",
+			projectId,
+			narratorId: null,
+			ownerUserId: null,
+			nextSeq: 1,
+			createdAt: "",
+			inProcessEpoch: 0,
+		}
+	);
 }
 
 /** Whether the person may write the session: a turn started on it runs on their behalf. */

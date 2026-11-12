@@ -135,6 +135,11 @@ export interface OutlineBoardSection {
 	/** Whether the caller may change tasks of this space (assign, transfer, reopen, finish). */
 	canWrite: boolean;
 	/**
+	 * A session space whose tasks the caller may hand out (outline P2 PR 10c-3): they own the
+	 * session, it has a main project, and they may write the project's space. Absent otherwise.
+	 */
+	handOut?: true;
+	/**
 	 * `own`: the space's tasks. `claimed`: only the tasks the board's session holds in a space
 	 * that is not its own (a session board).
 	 */
@@ -200,7 +205,12 @@ export type OutlineBoardAssignTarget =
 	 * To a session by name (「转交给会话」, outline P2 PR 10a): `@agent:<its id>`. A root session of
 	 * the task's project the caller may read, that could do the task.
 	 */
-	| { kind: "narrator"; narratorId: string };
+	| { kind: "narrator"; narratorId: string }
+	/**
+	 * To the team (「交给团队」, outline P2 PR 10c-3): a task of a session space is handed out as an
+	 * unassigned copy on its project's task page, which the original then waits for.
+	 */
+	| { kind: "team" };
 
 /** A session a task may be handed to (`GET /outline/tasks/:blockId/transfer-sessions`). */
 export interface OutlineBoardTransferSession {
@@ -254,7 +264,29 @@ export interface OutlineBoardTaskUpdateResponse {
 	started: boolean;
 	/** 「转交并开始」: why the session was not started (the hand-over was written all the same). */
 	notStarted?: OutlineBoardNotStarted;
+	/**
+	 * The task (of a session space) was handed out (outline P2 PR 10c-3): the copy on the project's
+	 * task page, which the task now waits for. `already`: it had been handed out before.
+	 */
+	handedOut?: { copyId: string; address: string; already?: true };
 }
+
+/**
+ * Why a task was not handed out (`details.reason`; `OUTLINE_HAND_OUT_*` codes): not a session
+ * space's task; the caller is not the session's owner (or the session); no project; the project's
+ * space is not writable; finished; in a plan not approved yet; someone else is doing it; changed
+ * since read; or the copy was made but the original could not be set to wait for it.
+ */
+export type OutlineBoardHandOutRefusal =
+	| "not_session_task"
+	| "not_owner"
+	| "no_project"
+	| "cannot_write_project"
+	| "finished"
+	| "planning"
+	| "held"
+	| "changed"
+	| "original_not_updated";
 
 /** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
 export interface OutlineBoardOpenSessionRequest {
