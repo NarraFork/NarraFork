@@ -562,6 +562,7 @@ describe("outline task leases", () => {
 				person: false,
 				reply: "finished",
 				forTaskId: "task-1",
+				personHourUntil: null,
 			});
 		});
 

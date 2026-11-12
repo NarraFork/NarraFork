@@ -82,6 +82,12 @@ export interface OutlineLeaseRunEnd {
 const lastPersonRunEnd = new Map<string, number>();
 const PERSON_RUN_ENDS_REMEMBERED = 2000;
 
+/** Whether the session's last person run ended within the hour (the turn-end note asks). */
+export function outlinePersonHourRunning(narratorId: string, nowMs = Date.now()): boolean {
+	const last = lastPersonRunEnd.get(narratorId);
+	return last !== undefined && nowMs - last < OUTLINE_TASK_GRACE_LEASE_MS;
+}
+
 /** Forget whose runs were a person's (tests: what a restart does). */
 export function resetOutlinePersonRunEndsForTests(): void {
 	lastPersonRunEnd.clear();
@@ -270,7 +276,16 @@ export function keepOutlineTaskLeases(
 				!(await (end.pending ? end.pending().catch(() => true) : false));
 			await settleOutlineTaskClaimsAtRunEnd(
 				narratorId,
-				{ natural, person, reply: end?.reply ?? null, forTaskId: end?.forTaskId ?? null },
+				{
+					natural,
+					person,
+					reply: end?.reply ?? null,
+					forTaskId: end?.forTaskId ?? null,
+					personHourUntil:
+						inPersonHour && lastPerson !== undefined
+							? lastPerson + OUTLINE_TASK_GRACE_LEASE_MS
+							: null,
+				},
 				{ now, ...store, isRunning: (id) => (running.get(id) ?? 0) > 0 },
 			);
 		} catch (error) {

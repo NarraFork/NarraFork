@@ -738,9 +738,112 @@ describe("the hour after a person's run is the person's", () => {
 		await run(s, 45 * 60_000, { natural: false, person: false });
 		expect((await stateOf(task)).expiresAt).toBe(hour);
 	});
+
+	describe("an hour a system run's end put the task on is not a person's", () => {
+		const cases: Array<[string, Parameters<typeof run>[2]]> = [
+			["work was pending", { natural: true, person: false, pending: async () => true }],
+			["the run failed or was stopped", { natural: false, person: false }],
+		];
+		for (const [name, first] of cases)
+			test(`${name}; the next system run that ends by itself gives the task back at once, with one handoff`, async () => {
+				const alice = await person();
+				const p = await project(alice);
+				const s = await session(alice, p.id);
+				const team = await tasks(p.space.id, alice, ["Fix the refresh logic"]);
+				const [task] = team.tasks as [string];
+				await start(p.space.id, s, [task]);
+				await run(s, 60_000, first);
+				// Kept (on an hour's lease), not given back.
+				expect(await stateOf(task)).toMatchObject({
+					status: "doing",
+					holder: s,
+					expiresAt: at(60_000 + OUTLINE_TASK_GRACE_LEASE_MS).toISOString(),
+				});
+				expect(await handoffsUnder(task)).toHaveLength(0);
+				await run(s, 5 * 60_000, { natural: true, person: false });
+				expect(await stateOf(task)).toMatchObject({ status: "todo", holder: null, epoch: 1 });
+				expect(await handoffsUnder(task)).toHaveLength(1);
+			});
+
+		test("a subagent's claims passed to its idle root; the root, woken by the result, ends by itself: given back at once", async () => {
+			const alice = await person();
+			const p = await project(alice);
+			const root = await session(alice, p.id);
+			const sub = await subagentOf(root, alice, p.id);
+			const team = await tasks(p.space.id, alice, ["Fix the refresh logic"]);
+			const [task] = team.tasks as [string];
+			await start(p.space.id, sub, [task]);
+			expect(await settle(sub, true)).toMatchObject({ grace: 1, released: 0 });
+			expect(await stateOf(task)).toMatchObject({ status: "doing", holder: root });
+			await run(root, 5 * 60_000, { natural: true, person: false });
+			expect(await stateOf(task)).toMatchObject({ status: "todo", holder: null, epoch: 1 });
+			expect(await handoffsUnder(task)).toHaveLength(1);
+		});
+	});
 });
 
 describe("a tree something else is at work in, or waits in, is kept", () => {
+	test("past the trees one run end looks into: what is not looked into is kept, not given back", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const other = await session(alice, p.id);
+		const count = OUTLINE_RELEASE_LIMITS.trees + 4;
+		const ops: OutlineOp[] = [{ op: "insert", tempId: "p", parent: null, content: "Tasks" }];
+		for (let i = 0; i < count; i++)
+			ops.push(
+				{
+					op: "insert",
+					tempId: `t${i}`,
+					parent: { tempId: "p" },
+					content: `task ${i}`,
+					task: { status: "todo" },
+				},
+				{
+					op: "insert",
+					parent: { tempId: `t${i}` },
+					content: `step ${i}`,
+					task: { status: "todo" },
+				},
+			);
+		const written = await human(p.space.id, alice, ops);
+		const ids = written.results.slice(1).map((r) => (r as { blockId: string }).blockId);
+		const tops = ids.filter((_, i) => i % 2 === 0);
+		await start(p.space.id, s, tops);
+		await start(
+			p.space.id,
+			other,
+			ids.filter((_, i) => i % 2 === 1),
+		);
+		expect(await settle(s, true)).toEqual({ kept: count, grace: 0, released: 0 });
+		for (const id of tops) expect(await stateOf(id)).toMatchObject({ status: "doing", holder: s });
+	});
+
+	test("a tree whose open tasks do not all fit in what one run end reads is kept", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(
+			p.space.id,
+			alice,
+			["Big"],
+			Array.from({ length: 6 }, (_, i) => `step ${i}`),
+		);
+		const [big] = team.tasks as [string];
+		await start(p.space.id, s, [big]);
+		const limits = OUTLINE_RELEASE_LIMITS as { treeTasks: number };
+		const saved = limits.treeTasks;
+		limits.treeTasks = 5;
+		try {
+			expect(await settle(s, true)).toEqual({ kept: 1, grace: 0, released: 0 });
+		} finally {
+			limits.treeTasks = saved;
+		}
+		expect(await stateOf(big)).toMatchObject({ status: "doing", holder: s });
+		// Within the limit, the same tree is given back.
+		expect(await settle(s, true)).toEqual({ kept: 0, grace: 0, released: 1 });
+	});
+
 	test("another session is doing a step under the held task", async () => {
 		const alice = await person();
 		const p = await project(alice);
@@ -925,7 +1028,7 @@ describe("cost and where it does not apply", () => {
 		expect(calls).toEqual(["getNarratorRoots", "listClaimedTasks", "getSpace", "renewTaskClaims"]);
 	});
 
-	test("more claims than one run end decides on: the first hundred are decided, and a line says so", async () => {
+	test("more claims than one run end decides on: a line says so; of the trees decided, those past the trees looked into are kept", async () => {
 		const alice = await person();
 		const p = await project(alice);
 		const s = await session(alice, p.id);
@@ -938,7 +1041,8 @@ describe("cost and where it does not apply", () => {
 		const info = spyOn(logger, "info");
 		try {
 			const result = await settle(s, true);
-			expect(result.released).toBe(OUTLINE_RELEASE_LIMITS.claims);
+			// A hundred decided, each its own tree: only the trees looked into can be given back.
+			expect(result.released).toBe(OUTLINE_RELEASE_LIMITS.trees);
 			expect(
 				info.mock.calls.filter(([message]) => String(message).includes("more claims than")),
 			).toHaveLength(1);

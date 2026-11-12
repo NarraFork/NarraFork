@@ -13,12 +13,16 @@
  *   | waiting for confirmation anywhere in its tree                     |                         |
  *   | a subagent of the session is doing a task under it (or it), or    | kept (idle lease)       |
  *   | another session is doing a task under it                          |                         |
- *   | of a project space, none of the above; the run ended `natural`    | given back at once      |
- *   | of a project space, none of the above; a person's run ended       | kept for an hour from   |
+ *   | of a project space, none of the above; the run ended `natural`,   | given back at once      |
+ *   | and the task is not on a person's hour                            |                         |
+ *   | of a project space, none of the above; a person's run ended       | a person's hour from    |
  *   |                                                                   | now, then the expiry job|
- *   | of a project space, none of the above; any other end              | kept until the hour it  |
- *   |                                                                   | is on ends (a new hour  |
- *   |                                                                   | when it is on none)     |
+ *   | of a project space, none of the above; any other end (a system    | the person's hour it is |
+ *   | run stopped, failed, or with work pending; or a `natural` end on  | on, unmoved; else an    |
+ *   | a person's hour)                                                  | hour's lease that is    |
+ *   |                                                                   | NOT a person's: the next|
+ *   |                                                                   | `natural` end gives it  |
+ *   |                                                                   | back at once            |
  *
  * `natural` is the runtime's word (`OutlineRunEnd`): the SYSTEM started the run (a continuation,
  * a wake, the session opened for the task), no person's message joined it, it ended by itself
@@ -32,6 +36,9 @@
  * either: remembered here per task ({@link graceLeases}, in memory, bounded), since a run renews
  * every lease while it goes. After a restart the memory is gone: the lease in the database is
  * what the expiry job reads, and a system run that then ends by itself gives the task back.
+ * Only a person's run starts such an hour: the hour's lease a system run's end puts a task on
+ * (stopped, failed, work pending, a subagent's claims passed to an idle root) is a plain lease,
+ * and the next system run that ends by itself gives the task back at once.
  *
  * WHOLE TREES. Tasks the session holds that are above one another are one group, and a group is
  * kept or given back together: a task kept under a task given back could not be worked by the
@@ -58,7 +65,7 @@
  * COST, once per run end: one indexed read of the session's claims (and nothing else when it
  * holds none); for project tasks, their ancestors by primary key level by level, the claims of
  * the session's subagents (bounded), one page-structure read per tree not kept already (at most
- * {@link OUTLINE_RELEASE_LIMITS.trees}; the rest are not looked into) with the claims and waits of
+ * {@link OUTLINE_RELEASE_LIMITS.trees}; the rest are kept) with the claims and waits of
  * the open tasks in it (bounded), one conditional write of the leases, and for tasks given back
  * the handoff's reads and one commit per space.
  */
@@ -101,9 +108,12 @@ export const OUTLINE_RELEASE_LIMITS = {
 	subagentClaims: 100,
 	/** Levels of ancestors read above the tasks held. */
 	depth: 64,
-	/** Trees looked into for other sessions' work and for questions (one page read each). */
+	/**
+	 * Trees looked into for other sessions' work and for questions (one page read each); the rest
+	 * are kept.
+	 */
 	trees: 20,
-	/** Open tasks of the trees whose claims and waits are read, in all. */
+	/** Open tasks of the trees whose claims and waits are read, in all; a tree past it is kept. */
 	treeTasks: 500,
 	/** Tasks whose hour is remembered (in memory). */
 	remembered: 2000,
@@ -119,6 +129,11 @@ export interface OutlineRunEnd {
 	reply?: string | null;
 	/** The task the run was started for (the session opened for it): where the reply belongs. */
 	forTaskId?: string | null;
+	/**
+	 * The run ended inside the hour of the session's last person run: when that hour ends (ms).
+	 * Tasks not on an hour of their own go on it (and it is remembered for them), not a new one.
+	 */
+	personHourUntil?: number | null;
 }
 
 export interface OutlineRunEndResult {
@@ -162,6 +177,12 @@ function graceOf(task: OutlineClaimedTask, root: string, nowMs: number): number 
 		return null;
 	}
 	return entry.until;
+}
+
+/** Whether a task is on a person's hour that has not ended (the turn-end note asks). */
+export function outlineTaskOnPersonHour(taskId: string, nowMs = Date.now()): boolean {
+	const entry = graceLeases.get(taskId);
+	return entry !== undefined && entry.until > nowMs;
 }
 
 /** Forget every remembered hour (tests: what a restart does). */
@@ -211,7 +232,12 @@ export async function settleOutlineTaskClaimsAtRunEnd(
 		narratorId,
 		how.natural ? "release" : how.person ? "hour" : "hold",
 		now,
-		{ ...options, reply: how.reply ?? null, forTaskId: how.forTaskId ?? null },
+		{
+			...options,
+			reply: how.reply ?? null,
+			forTaskId: how.forTaskId ?? null,
+			personHourUntil: how.person ? null : (how.personHourUntil ?? null),
+		},
 	);
 }
 
@@ -314,7 +340,9 @@ async function decide(
  * (the session waits for people there, even when the nearest task above is not one it holds).
  * One page-structure read per tree, at most {@link OUTLINE_RELEASE_LIMITS.trees}; the claims and
  * the waits of at most {@link OUTLINE_RELEASE_LIMITS.treeTasks} open tasks not held by the
- * session. Trees past the limits are not looked into.
+ * session. What is not known is kept: a tree past {@link OUTLINE_RELEASE_LIMITS.trees}, one that
+ * cannot be read or is on a page read truncated, and one whose open tasks did not all fit in
+ * {@link OUTLINE_RELEASE_LIMITS.treeTasks}.
  */
 async function treesInWork(
 	store: OutlineStore,
@@ -326,12 +354,19 @@ async function treesInWork(
 	const out = new Set<string>();
 	const groupOfTask = new Map<string, string>();
 	const subjects: OutlineTaskSubject[] = [];
+	for (const group of groups.slice(OUTLINE_RELEASE_LIMITS.trees)) out.add(group);
 	for (const group of groups.slice(0, OUTLINE_RELEASE_LIMITS.trees)) {
 		const subtree = await readSubtree(group, { store }).catch(() => null);
-		if (!subtree) continue;
+		if (!subtree || subtree.state.truncated) {
+			out.add(group);
+			continue;
+		}
 		for (const node of subtreeNodes(subtree.root).slice(1)) {
-			if (subjects.length >= OUTLINE_RELEASE_LIMITS.treeTasks) break;
 			if (!node.task || !isOpenTask(node.task) || heldIds.has(node.id)) continue;
+			if (subjects.length >= OUTLINE_RELEASE_LIMITS.treeTasks) {
+				out.add(group);
+				break;
+			}
 			groupOfTask.set(node.id, group);
 			subjects.push({ id: node.id, spaceId: subtree.state.space.id, taskJson: node.task });
 		}
@@ -368,6 +403,7 @@ async function settleRoot(
 		only?: ReadonlySet<string>;
 		reply?: string | null;
 		forTaskId?: string | null;
+		personHourUntil?: number | null;
 	},
 ): Promise<OutlineRunEndResult> {
 	const idle = end(now, OUTLINE_TASK_IDLE_LEASE_MS);
@@ -416,8 +452,16 @@ async function settleRoot(
 		// A run of the session started meanwhile: the tasks are its own again.
 		if (options.isRunning?.(root)) return { ...none, kept: all };
 		const fresh = nowMs + OUTLINE_TASK_GRACE_LEASE_MS;
+		const personHour =
+			options.personHourUntil != null && options.personHourUntil > nowMs
+				? options.personHourUntil
+				: null;
 		const untilOf = (task: OutlineClaimedTask): number =>
-			goingIds.has(task.block.id) ? nowMs : mode === "hour" ? fresh : (onHour(task) ?? fresh);
+			goingIds.has(task.block.id)
+				? nowMs
+				: mode === "hour"
+					? fresh
+					: (onHour(task) ?? personHour ?? fresh);
 		const written = await store.updateTaskClaims(
 			looseTasks.map((task) => ({
 				row: { ...task.claim, expiresAt: new Date(untilOf(task)).toISOString() },
@@ -425,8 +469,13 @@ async function settleRoot(
 			})),
 		);
 		if (!written) continue;
+		// Only a person's run starts a person's hour (or a run that ends inside one puts tasks on
+		// it). An hour's lease a system run put the task on otherwise (it stopped, failed, or had
+		// work pending) is not remembered: the next run that ends by itself gives the task back at
+		// once. A task already on a person's hour keeps its entry.
 		for (const task of held)
-			rememberGrace(task.block.id, { root, epoch: task.claim.epoch, until: untilOf(task) });
+			if (mode === "hour" || (personHour !== null && onHour(task) === null))
+				rememberGrace(task.block.id, { root, epoch: task.claim.epoch, until: untilOf(task) });
 		for (const task of going) graceLeases.delete(task.block.id);
 		const kept = Math.max(0, all - looseTasks.length);
 		if (going.length === 0) return { kept, grace: held.length, released: 0 };
