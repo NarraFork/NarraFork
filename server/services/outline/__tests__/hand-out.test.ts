@@ -143,10 +143,17 @@ async function sessionTask(space: OutlineSpaceRow, narratorId: string, owner: st
 		{ op: "insert", tempId: "page", parent: null, content: "Work" },
 		{
 			op: "insert",
+			sid: "prepDone1",
+			parent: { tempId: "page" },
+			content: "Prepare the fixtures",
+			task: { status: "done" },
+		},
+		{
+			op: "insert",
 			tempId: "t",
 			parent: { tempId: "page" },
 			content: "Port the parser",
-			task: { status: "doing" },
+			task: { status: "doing", depends: [{ target: "prepDone1", label: null }] },
 		},
 		{ op: "insert", parent: { tempId: "t" }, content: "The lexer is done; the grammar is next" },
 		{
@@ -164,7 +171,7 @@ async function sessionTask(space: OutlineSpaceRow, narratorId: string, owner: st
 			task: { status: "todo", depends: [{ target: "stepOne1", label: null }] },
 		},
 	]);
-	const task = written.results[1];
+	const task = written.results[2];
 	if (!task) throw new Error("seed");
 	return task;
 }
@@ -234,6 +241,8 @@ describe("handing a task out to the team", () => {
 			assignee: null,
 			manager: { kind: "agent", id: main },
 			claimable: true,
+			// A prerequisite written bare still names the session space's task.
+			depends: [{ target: `${sessionSpace.key}/prepDone1`, label: null }],
 		});
 		const rows = await subtreeRows(out.copy.id);
 		expect(rows.map((r) => r.content)).toEqual([
@@ -265,7 +274,10 @@ describe("handing a task out to the team", () => {
 		const original = await outlineStore.getBlock(task.blockId);
 		expect(original?.taskJson).toMatchObject({
 			status: "todo",
-			depends: [{ target: out.copy.address, label: null }],
+			depends: [
+				{ target: "prepDone1", label: null },
+				{ target: out.copy.address, label: null },
+			],
 		});
 		expect(out.versionSeq).toBe(original?.versionSeq as number);
 		const note = await outlineStore.getBlock(
@@ -310,11 +322,31 @@ describe("handing a task out to the team", () => {
 		expect(siblings.filter((s) => s.taskJson)).toHaveLength(1);
 		// The original holds one prerequisite and one note.
 		const original = await outlineStore.getBlock(task.blockId);
-		expect(original?.taskJson?.depends).toHaveLength(1);
+		expect(original?.taskJson?.depends).toHaveLength(2);
 		const notes = (await outlineStore.listChildMetas(sessionSpace.id, [task.blockId], 50)).filter(
 			(m) => isHandOutBlockId(m.id),
 		);
 		expect(notes).toHaveLength(1);
+
+		// The copy cancelled, the task handed out again: a new copy, without the first hand-out's
+		// note under the original.
+		const copyRow = await outlineStore.getBlock(a?.copy.id as string);
+		await writeOutline({
+			spaceId: copyRow?.spaceId as string,
+			ops: [{ op: "setTask", block: { id: copyRow?.id as string }, task: { status: "cancelled" } }],
+			actor: { kind: "human", id: owner.id },
+			responsibleUserId: owner.id,
+		});
+		const second = await handOutTask({
+			taskId: task.blockId,
+			by: person_(owner),
+			target: { kind: "team" },
+		});
+		expect(second.already).toBe(false);
+		expect(second.copy.id).not.toBe(a?.copy.id as string);
+		const copied = (await subtreeRows(second.copy.id)).map((r) => r.content);
+		expect(copied.some((text) => text.startsWith("Handed to the team"))).toBe(false);
+		expect(copied).toContain("The lexer is done; the grammar is next");
 	});
 
 	test("a second step that keeps failing is recorded under the copy; the next attempt finishes it without a second copy", async () => {
@@ -355,6 +387,7 @@ describe("handing a task out to the team", () => {
 		});
 		expect(done.copy.id).toBe(copyId);
 		expect((await outlineStore.getBlock(task.blockId))?.taskJson?.depends).toEqual([
+			{ target: "prepDone1", label: null },
 			{ target: done.copy.address, label: null },
 		]);
 	});
@@ -523,7 +556,7 @@ describe("handing a task out to the team", () => {
 
 		// Nothing reached the project.
 		expect((await outlineStore.getSpace(projectSpace.id))?.nextSeq).toBe(commitsBefore);
-		expect((await outlineStore.getBlock(task.blockId))?.taskJson?.depends).toBeUndefined();
+		expect((await outlineStore.getBlock(task.blockId))?.taskJson?.depends).toHaveLength(1);
 	});
 
 	test("a large task: at most the limit of blocks, breadth first, the rest counted in the provenance", async () => {
