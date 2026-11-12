@@ -31,7 +31,7 @@
  * Router-free, like the surface: links go through the host's renderer (`outline-nav.tsx`), so
  * the outline route and a dock panel show the same tree.
  */
-import { Alert, Anchor, Badge, Box, Button, Group, Loader, Text } from "@mantine/core";
+import { Alert, Anchor, Badge, Box, Button, Group, Loader, Paper, Text } from "@mantine/core";
 import { useElementSize } from "@mantine/hooks";
 import { blockTitle } from "@shared/outline";
 import {
@@ -80,10 +80,10 @@ import { reportLineDisplay } from "../../../lib/outline-report-line";
 import classes from "../Outline.module.css";
 import { OutlineBlockBody } from "../OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "../OutlineBlockTree";
-import { OutlineQuestionsSection } from "../OutlineQuestions";
+import { OutlineQuestionsForm } from "../OutlineQuestions";
 import { useOutlineSpaceName } from "../OutlineSpaceName";
 import { FOLD_ICONS } from "../outline-icons";
-import { OutlineLink, outlineBlockTarget, useOutlineNavigate } from "../outline-nav";
+import { OutlineLink, outlineBlockTarget } from "../outline-nav";
 import { OutlineViewState } from "../view-state";
 import {
 	type TreeHost,
@@ -157,6 +157,8 @@ function TreeRow({
 		<div
 			className={classes.treeRow}
 			role="treeitem"
+			// Focusable for assistive technology; the keyboard's tab stop is the title.
+			tabIndex={-1}
 			aria-level={depth + 1}
 			aria-expanded={open}
 			data-tree-node={nodeKey}
@@ -529,7 +531,6 @@ function OpenPage({
 }) {
 	const { t, i18n } = useTranslation("outline");
 	const { step, narrow, open: openState } = useTree();
-	const navigate = useOutlineNavigate();
 	// Shown: it counts toward the open pages' limits until it is not (its parent closed).
 	useEffect(() => openState.showPage(`page:${pageId}`), [openState, pageId]);
 	// Everything the page holds, tasks included: reading the whole outline is reading what is
@@ -565,22 +566,19 @@ function OpenPage({
 		[state],
 	);
 	// The count of unanswered questions on a closed row: they are opened in the tree, and the
-	// form that answers them comes up (the page's own, or the focused block's when deeper).
+	// form that answers them (those under the block the first is under) comes up in the page,
+	// without leaving the tree.
 	const host = useRef<HTMLDivElement>(null);
-	const [asking, setAsking] = useState<string[] | null>(null);
+	const [asking, setAsking] = useState<{ ids: string[]; under: string } | null>(null);
 	const onOpenQuestions = useCallback(
-		(ids: string[], under: string | null) => {
-			if (under && under !== pageId) {
-				navigate(outlineBlockTarget(spaceId, under));
-				return;
-			}
-			setAsking(ids);
-		},
-		[navigate, pageId, spaceId],
+		(ids: string[], under: string | null) => setAsking({ ids, under: under ?? pageId }),
+		[pageId],
 	);
 	// Once nothing is left to answer, the form goes (a later question does not bring it back).
-	const questions = useOutlineQuestions(asking ? pageId : null, asking !== null);
-	const answered = questions.isSuccess && (questions.data?.questions.length ?? 0) === 0;
+	const questions = useOutlineQuestions(asking?.under ?? null, asking !== null);
+	const answered =
+		questions.isSuccess &&
+		(questions.data?.questions ?? []).every((question) => question.state !== "open");
 	useEffect(() => {
 		if (answered) setAsking(null);
 	}, [answered]);
@@ -588,7 +586,7 @@ function OpenPage({
 		const root = host.current;
 		if (!asking || !root) return;
 		const focusForm = (): boolean => {
-			for (const id of asking) {
+			for (const id of asking.ids) {
 				const card = root.querySelector<HTMLElement>(`[data-testid="outline-question-${id}"]`);
 				if (!card) continue;
 				card.scrollIntoView({ block: "nearest" });
@@ -632,10 +630,10 @@ function OpenPage({
 	const body = root && root.content.trim() !== title.trim() ? root.content : null;
 	const partial = view.blocks.some((b) => b.hidden > 0) || view.pageTruncated;
 	return (
+		// biome-ignore lint/a11y/useSemanticElements: the open page's blocks, under its row
 		<div
 			ref={host}
 			className={classes.treePage}
-			// biome-ignore lint/a11y/useSemanticElements: the open page's blocks, under its row
 			role="group"
 			style={{ paddingInlineStart: pad }}
 			data-tree-page={pageId}
@@ -672,7 +670,9 @@ function OpenPage({
 				</Text>
 			)}
 			{asking && view.current && (
-				<OutlineQuestionsSection view={view} hideQuestionTitle={!!root?.question} />
+				<Paper withBorder p="sm" my="sm" ml={24} data-testid="outline-tree-questions">
+					<OutlineQuestionsForm blockId={asking.under} showOpenLink={false} />
+				</Paper>
 			)}
 		</div>
 	);
@@ -843,7 +843,6 @@ export function OutlineTree({ root, host = "page" }: OutlineTreeProps) {
 						</Button>
 					)}
 				</Group>
-				{/* biome-ignore lint/a11y/useSemanticElements: a tree of rows, not a list box */}
 				<div role="tree" aria-label={t("title")} onKeyDown={onTreeKeyDown}>
 					{root.kind === "all" ? (
 						<RootChildren />

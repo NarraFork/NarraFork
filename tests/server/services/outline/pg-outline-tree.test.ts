@@ -167,8 +167,8 @@ describe("PostgreSQL connected outline", () => {
 				.sort(byteDesc);
 			const never = ["B_", "c", "C"].map((i) => `s${i}`).sort(byteAsc);
 			expect(outcome.sessions).toEqual([...committed, ...never]);
-			for (const limit of [1, 2, 3, 4])
-				expect(outcome.bySize[limit] ?? null).toEqual(outcome.sessions);
+			const bySize = outcome.bySize as Record<number, string[]>;
+			for (const limit of [1, 2, 3, 4]) expect(bySize[limit]).toEqual(outcome.sessions as string[]);
 			expect(outcome.count).toBe(10);
 			expect(outcome.capped).toBe(4);
 			// Readable projects, latest commit first then by id; the archived one left out.

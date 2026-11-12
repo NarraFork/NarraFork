@@ -142,3 +142,61 @@ export function overflowsX(): boolean {
 export function text(): string {
 	return document.body.innerText;
 }
+
+/**
+ * The widest indentation of an open page's block rows: the page's own inset (the tree's levels)
+ * plus a row's indent.
+ */
+export function maxIndent(pageId: string): number {
+	const page = document.querySelector<HTMLElement>(`[data-tree-page="${pageId}"]`);
+	if (!page) return -1;
+	const inset = Number.parseFloat(getComputedStyle(page).paddingInlineStart) || 0;
+	let max = inset;
+	for (const row of page.querySelectorAll<HTMLElement>("[data-block-id]")) {
+		const indent = row.firstElementChild as HTMLElement | null;
+		max = Math.max(max, inset + (indent?.getBoundingClientRect().width ?? 0));
+	}
+	return max;
+}
+
+/** Open pages shown with their content, and those kept fresh by a subscription. */
+export function openPages(): { shown: string[]; live: string[] } {
+	const pages = [...document.querySelectorAll<HTMLElement>("[data-tree-page]")];
+	return {
+		shown: pages.map((p) => p.dataset.treePage ?? ""),
+		live: pages.filter((p) => p.dataset.live !== undefined).map((p) => p.dataset.treePage ?? ""),
+	};
+}
+
+/** The title of the focused element (keyboard navigation of the tree). */
+export function focusedTitle(): string | null {
+	const active = document.activeElement as HTMLElement | null;
+	return active?.matches("[data-tree-title]") ? (active.textContent ?? "") : null;
+}
+
+/** Focus the title of the row titled `title`. */
+export function focusTitle(title: string): boolean {
+	const element = [...document.querySelectorAll<HTMLElement>("[data-tree-title]")].find(
+		(e) => e.textContent === title,
+	);
+	element?.focus();
+	return element !== undefined && document.activeElement === element;
+}
+
+/** Type into a textarea or input as a person would (React sees the change). */
+export function type(selector: string, text: string): boolean {
+	const element = document.querySelector<HTMLTextAreaElement | HTMLInputElement>(selector);
+	if (!element) return false;
+	const proto =
+		element instanceof HTMLTextAreaElement
+			? HTMLTextAreaElement.prototype
+			: HTMLInputElement.prototype;
+	Object.getOwnPropertyDescriptor(proto, "value")?.set?.call(element, text);
+	element.dispatchEvent(new Event("input", { bubbles: true }));
+	return true;
+}
+
+export function activeInside(selector: string): boolean {
+	const host = document.querySelector(selector);
+	return !!host && host.contains(document.activeElement);
+}

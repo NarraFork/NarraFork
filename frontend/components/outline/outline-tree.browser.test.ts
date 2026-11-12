@@ -19,16 +19,21 @@ import { Hono } from "hono";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { db } from "../../../server/db";
 import { narrators, outlineViewState, projects, users } from "../../../server/db/schema";
+import { askTool } from "../../../server/lib/agent/tools/outline";
+import type { ToolContext } from "../../../server/lib/agent/types";
 import { AppError } from "../../../server/lib/errors";
 import { generateId } from "../../../server/lib/id";
 import { settings } from "../../../server/lib/settings";
 import { outlineRoutes } from "../../../server/routes/outline";
+import { setOutlineAnswerDelivery } from "../../../server/services/outline/questions";
 import {
 	ensurePersonalSpace,
 	ensureProjectSpace,
 	ensureSessionSpace,
 } from "../../../server/services/outline/spaces";
+import { outlineStore } from "../../../server/services/outline/store";
 import { writeOutline } from "../../../server/services/outline/write";
+import { eventually } from "./editor/outline-live-harness.browser-fixture";
 import type * as Fixture from "./outline-tree.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -45,6 +50,9 @@ let alice: string;
 let projectSpace: string;
 let sessionSpace: string;
 let taskPage: { pageId: string; idOf: (text: string) => string };
+let questionPage: { pageId: string; idOf: (text: string) => string };
+let raceSession: string;
+const notes: string[] = [];
 
 /** A session's task page: a task in progress with notes, finished tasks with their results. */
 const TASK_LINES = [
@@ -168,6 +176,10 @@ beforeAll(async () => {
 		.values({ id: alice, username: "alice", passwordHash: "x", role: "user", createdAt: NOW });
 	const personal = await ensurePersonalSpace(alice);
 	await seedPage(personal.id, "Reading list", ["Outline design notes"]);
+	// More pages than the tree shows open at once.
+	for (let i = 1; i <= 13; i++) {
+		notes.push((await seedPage(personal.id, `Note ${i}`, [`Line of note ${i}`])).pageId);
+	}
 	const projectId = generateId();
 	await db.insert(projects).values({
 		id: projectId,
@@ -201,6 +213,13 @@ beforeAll(async () => {
 	await seedPage(board.id, "Tasks", ["[x] Drag between columns"]);
 	sessionSpace = (await ensureSessionSpace(sessions[1] as string)).id;
 	taskPage = await seedPage(sessionSpace, "Tasks", TASK_LINES);
+	raceSession = sessions[1] as string;
+	questionPage = await seedPage(sessionSpace, "Questions", ["[/] Pick the export format"]);
+	setOutlineAnswerDelivery({
+		async deliver() {
+			return { written: true, woke: false };
+		},
+	});
 	if (SHOTS) mkdirSync(SHOTS, { recursive: true });
 }, 60_000);
 
@@ -209,6 +228,7 @@ beforeEach(() => {
 });
 
 afterAll(async () => {
+	setOutlineAnswerDelivery(null);
 	await browser?.close();
 	server?.stop(true);
 });
@@ -338,18 +358,14 @@ test("a page opens in place, read-only and folded by default; the folding is sto
 		taskPage.pageId,
 		done,
 	);
-	const end = Date.now() + 5000;
-	let stored: string[] = [];
-	while (Date.now() < end) {
-		const [row] = await db
-			.select()
-			.from(outlineViewState)
-			.where(eq(outlineViewState.pageBlockId, taskPage.pageId));
-		stored = row?.expandedJson ?? [];
-		if (stored.includes(done)) break;
-		await new Promise((r) => setTimeout(r, 50));
-	}
-	expect(stored).toContain(done);
+	const stored = async () =>
+		(
+			await db
+				.select()
+				.from(outlineViewState)
+				.where(eq(outlineViewState.pageBlockId, taskPage.pageId))
+		)[0]?.expandedJson ?? [];
+	await eventually(async () => (await stored()).includes(done), "the folding stored");
 
 	// The page's title focuses it (where the live editor is); the tree itself never navigates.
 	expect(await call(page, (f) => f.navigated().length)).toBe(0);
@@ -362,6 +378,13 @@ test("a page opens in place, read-only and folded by default; the folding is sto
 	).toBe(true);
 	const went = await call(page, (f) => f.navigated());
 	expect(went).toEqual([{ kind: "block", spaceId: sessionSpace, blockId: taskPage.pageId }]);
+	// Back to the page's default: nothing of the reader's is stored for it any more.
+	await page.evaluate((id) => {
+		document
+			.querySelector<HTMLButtonElement>(`[data-block-id="${id}"] [data-fold-toggle]`)
+			?.click();
+	}, done);
+	await eventually(async () => !(await stored()).includes(done), "the default stored");
 	await page.browserContext().close();
 }, 60_000);
 
@@ -412,6 +435,150 @@ test("in Chinese, dark, at 360 px: the same tree, nothing wider than the page", 
 	);
 	expect(await call(page, (f) => f.arrowsDrawn())).toBe(true);
 	expect(await call(page, (f) => f.overflowsX())).toBe(false);
+	// Narrow: the tree and the page together indent at most four levels, plus the one a page
+	// already that deep keeps so its rows still nest (12 px a level).
+	expect(await call(page, (f, id: string) => f.maxIndent(id), taskPage.pageId)).toBeLessThanOrEqual(
+		5 * 12,
+	);
 	await shot(page, "4-zh-dark-360");
+	await page.browserContext().close();
+}, 60_000);
+
+function toolCtx(): ToolContext {
+	return {
+		narratorId: raceSession,
+		cwd: "/",
+		signal: new AbortController().signal,
+		locale: "en",
+		userId: alice,
+		requestPermission: async () => ({ behavior: "allow" }),
+	} as ToolContext;
+}
+
+test("a closed row's question count opens the answer form in the tree; answering closes it", async () => {
+	// Asked under the task in progress of the Questions page.
+	const task = questionPage.idOf("Pick the export format");
+	const space = await outlineStore.getSpace(sessionSpace);
+	const block = await outlineStore.getBlock(task);
+	const asked = await askTool.execute(
+		{
+			under: `${space?.key}/${block?.sid}`,
+			questions: [{ question: "Which export format first?", recommend: "v2" }],
+		},
+		toolCtx(),
+	);
+	expect(asked.isError).toBeUndefined();
+	const [question] = asked.metadata?.blockIds as [string];
+
+	const page = await openTree({ target: { kind: "space", spaceId: sessionSpace } });
+	await until(
+		page,
+		"the Questions page",
+		(f, id: string) => f.rows().some((r) => r.key === `page:${id}`),
+		questionPage.pageId,
+	);
+	await call(
+		page,
+		(f, id: string) => f.click(`[data-tree-node="page:${id}"] [data-tree-toggle]`),
+		questionPage.pageId,
+	);
+	// An unanswered question is never folded away by default: its task is open.
+	await until(
+		page,
+		"the question's row",
+		(f, pageId: string, id: string) => f.blockRows(pageId).some((r) => r.id === id),
+		questionPage.pageId,
+		question,
+	);
+	// The reader closes the task: the row counts the question it hides.
+	await call(page, (f, id: string) => f.click(`[data-block-id="${id}"] [data-fold-toggle]`), task);
+	const chip = `[data-block-id="${task}"] [data-testid=outline-fold-hidden][data-kind=question]`;
+	await until(page, "the question count", (f, sel: string) => f.count(sel) === 1, chip);
+	await call(page, (f, sel: string) => f.click(sel), chip);
+	await until(
+		page,
+		"the answer form, focused",
+		(f, id: string) =>
+			f.count(`[data-testid=outline-tree-questions] [data-testid=outline-question-${id}]`) === 1 &&
+			f.activeInside(`[data-testid=outline-question-${id}]`),
+		question,
+	);
+	// The tree did not leave itself.
+	expect(await call(page, (f) => f.navigated().length)).toBe(0);
+	await call(
+		page,
+		(f, sel: string) => f.type(sel, "v2, then v1 if asked"),
+		`[data-testid=outline-question-${question}] textarea`,
+	);
+	await until(
+		page,
+		"submit enabled",
+		(f) => f.count("[data-testid=outline-questions-submit]:not(:disabled)") === 1,
+	);
+	await call(page, (f) => f.click("[data-testid=outline-questions-submit]"));
+	await until(page, "the form gone", (f) => f.count("[data-testid=outline-tree-questions]") === 0);
+	await page.browserContext().close();
+}, 60_000);
+
+test("at most 12 pages are open with content, the newest 8 kept fresh; hidden ones do not count", async () => {
+	const page = await openTree({ target: { kind: "home" } });
+	await until(page, "my space", hasRow, "My notes");
+	expect(await call(page, (f) => f.toggle("My notes"))).toBe(true);
+	for (let i = 1; i <= 13; i++) {
+		const title = `Note ${i}`;
+		await until(page, title, hasRow, title);
+		expect(await call(page, (f, t: string) => f.toggle(t), title)).toBe(true);
+		await until(
+			page,
+			`${title} open`,
+			(f, id: string) => f.openPages().shown.includes(id),
+			notes[i - 1],
+		);
+	}
+	const open = await call(page, (f) => f.openPages());
+	expect(open.shown).toHaveLength(12);
+	// The page opened longest ago closed; the newest eight are subscribed.
+	expect(open.shown).not.toContain(notes[0]);
+	expect(open.live).toHaveLength(8);
+	expect(new Set(open.live)).toEqual(new Set(notes.slice(5)));
+	expect((await call(page, (f) => f.rows())).find((r) => r.title === "Note 1")?.open).toBe(false);
+
+	// Closing my space hides its pages: they stay open but neither count nor subscribe.
+	expect(await call(page, (f) => f.toggle("My notes"))).toBe(true);
+	await until(page, "nothing shown", (f) => f.openPages().shown.length === 0);
+	expect(await call(page, (f) => f.toggle("NarraFork"))).toBe(true);
+	await until(page, "the project's page", hasRow, "Facts: the outline system");
+	expect(await call(page, (f) => f.toggle("Facts: the outline system"))).toBe(true);
+	await until(page, "the facts page shown and live", (f) => f.openPages().live.length === 1);
+	// Shown again: twelve and one is thirteen, so the oldest shown goes; still at most 8 live.
+	expect(await call(page, (f) => f.toggle("My notes"))).toBe(true);
+	await until(page, "twelve shown again", (f) => f.openPages().shown.length === 12);
+	expect((await call(page, (f) => f.openPages())).live).toHaveLength(8);
+	await page.browserContext().close();
+}, 60_000);
+
+test("the keyboard: one tab stop per row; arrows move, open and close", async () => {
+	const page = await openTree({ target: { kind: "home" } });
+	await until(page, "the project row", hasRow, "NarraFork");
+	expect(await call(page, (f) => f.count("[data-tree-toggle][tabindex='-1']"))).toBe(
+		await call(page, (f) => f.count("[data-tree-toggle]")),
+	);
+	expect(
+		await call(page, (f) => f.count("[role=tree] [role=treeitem][aria-level]")),
+	).toBeGreaterThan(0);
+	expect(await call(page, (f) => f.focusTitle("My notes"))).toBe(true);
+	await page.keyboard.press("ArrowDown");
+	expect(await call(page, (f) => f.focusedTitle())).toBe("NarraFork");
+	await page.keyboard.press("ArrowRight");
+	await until(page, "the project open", hasRow, "Facts: the outline system");
+	await page.keyboard.press("ArrowRight");
+	expect(await call(page, (f) => f.focusedTitle())).toBe("Facts: the outline system");
+	await page.keyboard.press("ArrowUp");
+	await page.keyboard.press("ArrowLeft");
+	await until(
+		page,
+		"the project closed",
+		(f) => !f.rows().some((r) => r.title === "Facts: the outline system"),
+	);
 	await page.browserContext().close();
 }, 60_000);
