@@ -1,7 +1,8 @@
 /**
  * The Spec panel's banner for a session that still keeps its tasks in Dynamic Spec while the
  * outline is on (outline P2 PR 12b): says the session will be imported, offers "Import now", and
- * shows how the last attempt went (running, failed with its reason and a retry, needs attention).
+ * shows how the last attempt went (running, busy, failed with its reason and a retry, needs
+ * attention). The reason is said in the reader's language from its code.
  * Nothing is drawn for a session that is not to be imported, or with imports switched off. Once
  * the session was moved the panel itself becomes the task board (`SpecPanel`).
  */
@@ -17,15 +18,21 @@ export function SpecImportBanner({ narratorId }: { narratorId: string }) {
 	if (!data || data.mode === "off" || !data.importable) return null;
 	const running = data.state === "running" || start.isPending;
 	const problem = !running && (data.state === "failed" || data.state === "attention");
+	const busy = !running && (data.state === "busy" || start.isError);
 	const message = running
 		? t("spec.specImportRunning")
 		: data.state === "attention"
 			? t("spec.specImportAttention")
 			: data.state === "failed"
 				? t("spec.specImportFailed")
-				: data.mode === "manual"
-					? t("spec.specImportManual")
-					: t("spec.specImportAuto");
+				: busy
+					? t("spec.specImportBusy")
+					: data.mode === "manual"
+						? t("spec.specImportManual")
+						: t("spec.specImportAuto");
+	const reason = data.reason
+		? t(`spec.specImportReason.${data.reason.code}`, { n: data.reason.count ?? 0 })
+		: t("spec.specImportReason.other");
 	return (
 		<Group
 			gap={8}
@@ -34,7 +41,7 @@ export function SpecImportBanner({ narratorId }: { narratorId: string }) {
 			wrap="nowrap"
 			align="flex-start"
 			data-testid="spec-import-banner"
-			data-state={running ? "running" : data.state}
+			data-state={running ? "running" : busy ? "busy" : data.state}
 			style={{
 				flexShrink: 0,
 				borderBottom: "1px solid var(--mantine-color-default-border)",
@@ -52,19 +59,14 @@ export function SpecImportBanner({ narratorId }: { narratorId: string }) {
 			</Box>
 			<Box style={{ flex: 1, minWidth: 0 }}>
 				<Text size="xs">{message}</Text>
-				{problem && data.error && (
+				{problem && (data.reason || data.error) && (
 					<Text
 						size="xs"
 						c="dimmed"
 						data-testid="spec-import-error"
 						style={{ overflowWrap: "anywhere" }}
 					>
-						{t("spec.specImportError", { error: data.error })}
-					</Text>
-				)}
-				{start.isError && !running && (
-					<Text size="xs" c="dimmed" data-testid="spec-import-request-error">
-						{t("spec.specImportBusy")}
+						{t("spec.specImportError", { error: reason })}
 					</Text>
 				)}
 			</Box>

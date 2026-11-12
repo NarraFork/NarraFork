@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import type { OutlineSpecImportStatus } from "@shared/outline-spec-import";
+import type { OutlineSpecImportReason, OutlineSpecImportStatus } from "@shared/outline-spec-import";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
@@ -34,6 +34,7 @@ const base: OutlineSpecImportStatus = {
 	canImport: true,
 	state: "idle",
 	error: null,
+	reason: null,
 	at: null,
 };
 
@@ -155,21 +156,63 @@ test("manual mode words it as an offer; a reader without write access gets no bu
 	expect(button()).toBeNull();
 });
 
-test("a failed attempt shows its reason and a retry; one needing attention says so", async () => {
-	await mount({ state: "failed", error: "The session's Dynamic Spec changed during the import" });
+test("a failed attempt shows its reason in the reader's language and a retry; one needing attention says so", async () => {
+	await mount({
+		state: "failed",
+		error: "The session's Dynamic Spec changed during the import",
+		reason: { code: "changed" },
+	});
 	await waitFor(() => banner() !== null);
 	expect(banner()?.getAttribute("data-state")).toBe("failed");
 	expect(banner()?.textContent).toContain(en.spec.specImportFailed);
 	expect(host.querySelector('[data-testid="spec-import-error"]')?.textContent).toContain(
-		"changed during the import",
+		en.spec.specImportReason.changed,
 	);
 	expect(button()?.textContent).toBe(en.spec.specImportRetry);
 	await act(async () => root?.unmount());
 	host.remove();
-	await mount({ state: "attention", error: "too many files" });
+	await mount({
+		state: "attention",
+		error: "The session holds more than 200 Dynamic Spec files",
+		reason: { code: "too_many_files", count: 200 },
+	});
 	await waitFor(() => banner() !== null);
 	expect(banner()?.textContent).toContain(en.spec.specImportAttention);
+	expect(banner()?.textContent).not.toContain("administrator");
+	expect(host.querySelector('[data-testid="spec-import-error"]')?.textContent).toContain(
+		en.spec.specImportReason.too_many_files.replace("{{n}}", "200"),
+	);
 	expect(button()?.textContent).toBe(en.spec.specImportRetry);
+	await act(async () => root?.unmount());
+	host.remove();
+	// A reason the panel does not know a code for is said generically, never in English only.
+	await mount({ state: "failed", error: "database is locked", reason: null });
+	await waitFor(() => banner() !== null);
+	expect(host.querySelector('[data-testid="spec-import-error"]')?.textContent).toContain(
+		en.spec.specImportReason.other,
+	);
+});
+
+test("a busy outcome of the button is remembered: the banner says the session was busy", async () => {
+	await mount({});
+	await waitFor(() => banner() !== null);
+	const spy = spyOn(api, "startSpecImport").mockImplementation(async () => {
+		starts++;
+		status = { ...status, state: "busy" };
+		return status;
+	});
+	restores.push(() => spy.mockRestore());
+	await act(async () => button()?.click());
+	await waitFor(() => banner()?.getAttribute("data-state") === "busy");
+	expect(banner()?.textContent).toContain(en.spec.specImportBusy);
+	expect(button()?.textContent).toBe(en.spec.specImportNow);
+	// Read again later (another tab, a reload): still busy, from the server's record.
+	await act(async () => root?.unmount());
+	host.remove();
+	await mount({ state: "busy" });
+	await waitFor(() => banner() !== null);
+	expect(banner()?.getAttribute("data-state")).toBe("busy");
+	expect(banner()?.textContent).toContain(en.spec.specImportBusy);
 });
 
 test("nothing is drawn for a session that is not to be imported, with imports off, or the outline off", async () => {
@@ -194,7 +237,9 @@ test("nothing is drawn for a session that is not to be imported, with imports of
 });
 
 test("every string exists in both languages", () => {
-	const keys = Object.keys(en.spec).filter((key) => key.startsWith("specImport"));
+	const keys = Object.keys(en.spec).filter(
+		(key) => key.startsWith("specImport") && key !== "specImportReason",
+	);
 	expect(keys.length).toBeGreaterThanOrEqual(9);
 	for (const key of keys) {
 		expect((zh.spec as unknown as Record<string, string>)[key]).toBeTruthy();
@@ -202,4 +247,32 @@ test("every string exists in both languages", () => {
 			(en.spec as unknown as Record<string, string>)[key],
 		);
 	}
+	// Every reason code the server sends (shared/outline-spec-import.ts), in both languages.
+	const codes: OutlineSpecImportReason["code"][] = [
+		"too_many_files",
+		"too_large",
+		"broken_tasks",
+		"task_mismatch",
+		"kept_blocks",
+		"fence_too_large",
+		"sop_too_large",
+		"not_started",
+		"changed",
+		"moved_elsewhere",
+		"off",
+		"other",
+	];
+	const enReasons = en.spec.specImportReason as Record<string, string>;
+	const zhReasons = zh.spec.specImportReason as Record<string, string>;
+	expect(Object.keys(enReasons).sort()).toEqual([...codes].sort());
+	expect(Object.keys(zhReasons).sort()).toEqual([...codes].sort());
+	for (const code of codes) {
+		expect(zhReasons[code]).toBeTruthy();
+		expect(zhReasons[code]).not.toBe(enReasons[code]);
+	}
+	// No tool for an administrator exists yet: nothing sends the reader to one.
+	const imports = [en.spec, zh.spec].map((spec) =>
+		Object.entries(spec).filter(([key]) => key.startsWith("specImport")),
+	);
+	expect(JSON.stringify(imports)).not.toMatch(/administrator|管理员/);
 });
