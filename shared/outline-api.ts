@@ -268,6 +268,14 @@ export interface OutlineViewBlock {
 	 * that session (absent otherwise, and past the containers one view names).
 	 */
 	reportFrom?: string;
+	/**
+	 * A read with `fold: "default"` left out blocks under this one because the row is closed (by
+	 * the page's default folding with the reader's own over it, `shared/outline-fold.ts`): how
+	 * many children it has in the view and how many blocks are under it, all levels. `childIds`
+	 * then holds only what its one preview line is read from. Opened by the reader, the page is
+	 * read again (their stored folding says it is open) and the blocks come with it.
+	 */
+	fold?: { kids: number; size: number };
 }
 
 export interface OutlineBlockViewResponse {
@@ -291,6 +299,11 @@ export interface OutlineBlockViewResponse {
 	blocks: OutlineViewBlock[];
 	hiddenByBudget: number;
 	hiddenByView: number;
+	/**
+	 * Blocks a read with `fold: "default"` left out because they are behind closed rows (not
+	 * counted in `hiddenByBudget`). Absent from a read without it.
+	 */
+	hiddenByFold?: number;
 	/** The page has more blocks than one read loads; some were left out. */
 	pageTruncated: boolean;
 	/**

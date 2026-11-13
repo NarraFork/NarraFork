@@ -185,7 +185,7 @@ import {
 	OUTLINE_TRANSFER_LIMITS,
 	startSessionOnTransferredTask,
 } from "../services/outline/transfer";
-import { readViewState, writeViewState } from "../services/outline/view-state";
+import { normalizeFolding, readViewState, writeViewState } from "../services/outline/view-state";
 import {
 	describeLocks,
 	describeSpaces,
@@ -463,6 +463,19 @@ outlineRoutes.get("/spaces/:spaceId/blocks/:blockId", async (c) => {
 			bytes: query.bytes ?? OUTLINE_VIEW_LIMITS.maxBytes,
 		},
 		narratorVisible: narratorVisibility(principal),
+		// The connected outline's pages: the reader's own stored folding of the page, by its
+		// primary key (theirs alone; reading it needs no more than reading the page).
+		...(query.fold === "default"
+			? {
+					fold: async (pageId: string) => {
+						const stored = await outlineStore.getViewState(principal.userId, pageId);
+						return normalizeFolding({
+							collapsed: stored?.collapsed ?? [],
+							expanded: stored?.expanded ?? [],
+						});
+					},
+				}
+			: {}),
 	});
 	if (!view) throw new NotFoundError("Outline block", blockId);
 	const locked = view.blocks.flatMap((b) => (b.lock ? [b.lock] : []));
