@@ -92,13 +92,24 @@ const unrelated = mock((..._args: unknown[]) => {
 const originalPlan = await import("../../scripts/lib/ci-release-plan");
 const originalGithub = await import("../../scripts/lib/github-release");
 const originalBaselines = await import("../../scripts/lib/github-release-baseline");
+const originalRestore = { ...(await import("../../scripts/lib/ci-release-restore")) };
+const unexpectedArchiveDownload = mock(
+	async (..._args: Parameters<typeof originalRestore.downloadArchive>) => {
+		throw new Error("Index preview must not download an artifact archive");
+	},
+);
 mock.module("../../scripts/lib/ci-release-plan", () => ({
 	...originalPlan,
 	validateCiReleasePlan: (value: CiReleasePlan) => value,
 	revalidateCiReleasePlan: revalidate,
 	createCiReleasePlan: unrelated,
 }));
-mock.module("../../scripts/lib/ci-release-restore", () => ({ restoreCiReleaseBundle: restore }));
+mock.module("../../scripts/lib/ci-release-restore", () => ({
+	...originalRestore,
+	// build-restore links this export even though index preview must never call it.
+	downloadArchive: unexpectedArchiveDownload,
+	restoreCiReleaseBundle: restore,
+}));
 mock.module("../../scripts/lib/ci-release-bundle", () => ({
 	verifyReleaseBundle: verify,
 	assembleReleaseBundle: unrelated,
@@ -140,6 +151,7 @@ beforeEach(() => {
 		indexWriter,
 		remote,
 		unrelated,
+		unexpectedArchiveDownload,
 	])
 		seam.mockClear();
 });
@@ -149,6 +161,7 @@ afterEach(() => {
 	if (previousOutput === undefined) delete process.env.GITHUB_OUTPUT;
 	else process.env.GITHUB_OUTPUT = previousOutput;
 	rmSync(root, { recursive: true, force: true });
+	expect(unexpectedArchiveDownload).not.toHaveBeenCalled();
 });
 afterAll(() => mock.restore());
 

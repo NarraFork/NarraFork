@@ -5,6 +5,9 @@ import { type GhRunner, validateGitHubRepository } from "./github-release";
 export const PUBLICATION_RECEIPT_PATH = "artifacts/publication/publication-receipt.json";
 export const MAIN_PUBLICATION_ARTIFACT = "main-publication-receipt";
 export const AUXILIARY_PUBLICATION_ARTIFACT = "auxiliary-publication-receipt";
+export const REMOTE_PEER_PUBLICATION_ARTIFACT = "remote-peer-publication-receipt";
+export const REMOTE_PEER_PUBLICATION_RECEIPT_PATH =
+	"artifacts/publication/remote-peer-publication-receipt.json";
 export interface PublicationAssetIdentity {
 	id: number;
 	name: string;
@@ -13,7 +16,7 @@ export interface PublicationAssetIdentity {
 }
 export interface PublicationReceipt {
 	schemaVersion: 1;
-	kind: "main" | "helpers" | "executor";
+	kind: "main" | "helpers" | "executor" | "remote-peer";
 	repository: string;
 	tag: string;
 	version: string;
@@ -63,6 +66,12 @@ export async function writePublicationReceipt(options: {
 	const positive = (n: unknown): n is number =>
 		typeof n === "number" && Number.isSafeInteger(n) && n > 0;
 	if (
+		(options.kind === "remote-peer" &&
+			(![".github/workflows/remote-peer-release.yml", ".github/workflows/release.yml"].includes(
+				options.source.workflowPath,
+			) ||
+				options.source.nativeProof !== "verified-original-bundle" ||
+				options.tag !== `remote-peer-v${options.version}`)) ||
 		!/^[a-f0-9]{40}$/.test(options.commit) ||
 		!positive(options.source.runId) ||
 		!positive(options.source.runAttempt) ||

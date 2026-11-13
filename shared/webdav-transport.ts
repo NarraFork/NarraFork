@@ -181,7 +181,7 @@ function pathParts(path: string, feed: string): string[] {
 	if (p.length > 1) check(p[1] === feed);
 	if (p.length > 2) check(p[2] === "ready" || p[2] === "batches");
 	if (p.length > 3) check(SEGMENT.test(p[3] ?? ""));
-	if (p.length > 4) check(["main", "helpers", "executor"].includes(p[4] ?? ""));
+	if (p.length > 4) check(["main", "helpers", "executor", "remote-peer"].includes(p[4] ?? ""));
 	if (p.length > 5) check(validDate(p[5] ?? ""));
 	if (p[2] === "ready") {
 		check(p.length <= 7);

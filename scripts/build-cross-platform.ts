@@ -13,6 +13,7 @@ import { join, relative } from "node:path";
 import { Worker } from "node:worker_threads";
 import { compiledWorkerBuildEntrypoints } from "../server/lib/compiled-worker";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
+import { REMOTE_PEER_DISTRIBUTION } from "../shared/remote-peer-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { assetsUnder, collectBuildModules, renderBuildInfo } from "./lib/build-materials";
@@ -189,6 +190,7 @@ const buildInfo = {
 	platform: "unknown",
 	repository: BUILD_REPOSITORY,
 	helperDistribution: HELPER_DISTRIBUTION,
+	remotePeerDistribution: REMOTE_PEER_DISTRIBUTION,
 };
 const generatedDir = join(ROOT, "server", "generated");
 mkdirSync(generatedDir, { recursive: true });

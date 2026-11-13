@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import { providerWaitKind, quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
@@ -78,6 +79,14 @@ const PANEL_EXCLUDED_EVENT_TYPES = [
 	"background_task_completed",
 	"background_task_failed",
 	"background_task_cancelled",
+	...(REMOTE_BUILD
+		? [
+				"git_status",
+				"terminal_count_changed",
+				"browser_session_count",
+				"browser_session_visual_change",
+			]
+		: []),
 ] as const;
 
 export interface ViewerInfo {

@@ -7,6 +7,7 @@ import {
 import { buildLicenseManifestFromDisk } from "../../server/lib/licenses/manifest";
 import type { HelperDistributionDependencies } from "../../shared/helper-distribution";
 import type { LocalizedValue } from "../../shared/i18n-locales";
+import type { RemotePeerDistribution } from "../../shared/remote-peer";
 import { renderBuiltinPluginModule } from "../generate-builtin-plugins";
 
 /** Shared by release and local builds; these functions never write into the checkout. */
@@ -57,6 +58,8 @@ export interface BuildInfo {
 	platform: string;
 	repository: string;
 	helperDistribution: HelperDistributionDependencies;
+	/** Frozen optional target declaration only; never inferred from NF's application version. */
+	remotePeerDistribution?: Readonly<RemotePeerDistribution>;
 }
 
 export function renderBuildInfo(info: BuildInfo): string {
@@ -65,6 +68,7 @@ export const buildCommit = ${JSON.stringify(info.commit)};
 export const buildPlatform = ${JSON.stringify(info.platform)};
 export const buildRepository = ${JSON.stringify(info.repository)};
 export const buildHelperDistribution = ${JSON.stringify(info.helperDistribution)};
+export const buildRemotePeerDistribution = ${JSON.stringify(info.remotePeerDistribution)};
 `;
 }
 

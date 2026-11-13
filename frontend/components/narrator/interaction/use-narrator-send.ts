@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import {
 	type ComposerDocument,
@@ -494,6 +495,18 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		composerDocument?: ComposerDocument,
 		media: File[] = [],
 	) => {
+		if (REMOTE_BUILD) {
+			// Leave 1 MiB for multipart boundaries, filenames and transport metadata.
+			const metadataBytes = new TextEncoder().encode(
+				JSON.stringify({ text: msg, fileReferences, composerDocument }),
+			).byteLength;
+			const fileBytes = [...images, ...textFiles, ...media].reduce(
+				(bytes, file) => bytes + file.size,
+				0,
+			);
+			if (metadataBytes + fileBytes > 7 * 1024 * 1024)
+				throw new Error(t("remote:attachmentTooLarge"));
+		}
 		if (interrupt) priority = true;
 		const optimisticBlocks: ContentBlock[] = [
 			...fileReferences.map((reference) => ({ type: "file_reference", reference })),
@@ -760,6 +773,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			canCancel: attachmentCount > 0,
 		});
 		try {
+			if (REMOTE_BUILD && isPlainCommand && /^\/(?:new|fork|save_dump)(?:\s|$)/i.test(msg)) {
+				throw new Error(t("remote:unsupported"));
+			}
 			// This one-shot control never becomes parent model input, even while busy.
 			const modelTraceText = composerDocument
 				? composerDocumentText({
@@ -770,6 +786,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					}).text.trim()
 				: msg;
 			if (/^\/modeltrace(?:\s|$)/i.test(modelTraceText)) {
+				if (REMOTE_BUILD) throw new Error(t("remote:unsupported"));
 				if (fileReferences.length) throw new Error(t("fileReferences.controlCommand"));
 				setSendingState({ attachmentCount: 0, progress: null, canCancel: false });
 				await startModelTrace(modelTraceText);
@@ -1057,6 +1074,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			setSendingState({ attachmentCount: 0, progress: null, canCancel: false });
 			void (async () => {
 				try {
+					if (REMOTE_BUILD && /^\/(?:new|fork|save_dump|modeltrace)(?:\s|$)/i.test(trimmed)) {
+						throw new Error(t("remote:unsupported"));
+					}
 					if (/^\/modeltrace(?:\s|$)/i.test(trimmed)) {
 						await startModelTrace(trimmed);
 						return;

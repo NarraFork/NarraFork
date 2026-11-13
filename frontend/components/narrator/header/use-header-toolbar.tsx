@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import {
 	type Dispatch,
 	type ReactNode,
@@ -137,6 +138,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 
 	const toolbarEntryEnabled = useCallback(
 		(id: NarratorToolbarId): boolean => {
+			if (REMOTE_BUILD && id !== "lodlevel") return false;
 			switch (id) {
 				case "tasks":
 					return tasksSupported && tasksButtonEnabled;
@@ -196,6 +198,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	/** Whether an entry's panel is currently open (drives the active styling). */
 	const toolbarEntryActive = useCallback(
 		(id: NarratorToolbarId): boolean => {
+			if (REMOTE_BUILD && id !== "lodlevel") return false;
 			switch (id) {
 				case "tasks":
 					return dock ? dock.openToolTypes.has("tasks") : mobileTasksOpen;
@@ -233,6 +236,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	 */
 	const activateToolbarEntry = useCallback(
 		(id: string) => {
+			if (REMOTE_BUILD && id !== "lodlevel") return;
 			switch (id) {
 				case "path-rules":
 					setPathRulesOpened(true);
@@ -298,6 +302,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	 */
 	const renderToolbarInlineOptions = useCallback(
 		(id: string, close: () => void): ReactNode => {
+			if (REMOTE_BUILD && id !== "lodlevel") return null;
 			switch (id) {
 				case "device":
 					return (
@@ -370,7 +375,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			toolbarSurfacedDefs,
 			toolbarTuckedDefs,
 			toolbarBottomDefs,
-			toolbarOverlays: (
+			toolbarOverlays: REMOTE_BUILD ? null : (
 				<PathRulesPopover
 					narratorId={narratorId}
 					t={t}
