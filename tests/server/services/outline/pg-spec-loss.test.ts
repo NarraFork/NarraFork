@@ -200,17 +200,36 @@ describe("PostgreSQL swallowed-content scan", () => {
 					const pass = await runSpecLossPass({ pauseMs: 0 });
 					const all = await specLossPage({ status: "open", narratorId: null, canAct: true });
 
-					// Imported, then attached to the file's page.
+					// Imported: the next pass attaches the finding to the file's page, once.
 					const imported = await importSpecSession(main.id, { trigger: "manual" });
-					const attached = await decideSpecLossFinding({
-						id: findingId,
-						narratorId: main.id,
-						action: "attach",
-						userId: main.owner,
-					});
-					const under = attached.blockId
+					const attachPass = await runSpecLossPass({ pauseMs: 0 });
+					const idlePass = await runSpecLossPass({ pauseMs: 0 });
+					const attached = (
+						await specLossPage({ status: "attached", narratorId: main.id, canAct: true })
+					).items[0];
+					const under = attached?.blockId
 						? await outlineStore.listChildren(attached.spaceId as string, attached.blockId, 10)
 						: [];
+					// Dismissed (only the attach wrote the block: it goes), then reopened (attached anew).
+					const dismissedAttached = await decideSpecLossFinding({
+						id: findingId,
+						narratorId: main.id,
+						action: "dismiss",
+						userId: main.owner,
+					});
+					const goneBlock = attached?.blockId
+						? (
+								await outlineStore.getBlockMetas(attached.spaceId as string, {
+									ids: [attached.blockId],
+								})
+							)[0]?.deleted
+						: null;
+					const reattached = await decideSpecLossFinding({
+						id: findingId,
+						narratorId: main.id,
+						action: "reopen",
+						userId: main.owner,
+					});
 					return {
 						backend: outlineAccessBackend(),
 						chain,
@@ -229,7 +248,12 @@ describe("PostgreSQL swallowed-content scan", () => {
 						all: all.items.map((item) => [item.narratorId, item.path, item.title]),
 						allScan: all.scan,
 						imported,
+						attachPass,
+						idlePass,
 						attached,
+						dismissedAttached,
+						goneBlock,
+						reattached,
 						under: under.map((block) => block.content),
 						main: main.id,
 						other: other.id,
@@ -282,14 +306,20 @@ describe("PostgreSQL swallowed-content scan", () => {
 			expect(ran.dismissed).toMatchObject({ status: "dismissed" });
 			expect(ran.countsDismissed).toEqual({ open: 0, attached: 0, dismissed: 1 });
 			expect(ran.reopened).toMatchObject({ status: "open", resolvedAt: null });
-			expect(ran.pass).toEqual({ sessions: 2, scanned: 1, found: 1, left: 0 });
+			expect(ran.pass).toEqual({ sessions: 2, scanned: 1, found: 1, attached: 0, left: 0 });
 			expect(new Set(ran.all.map((row) => row.join("|")))).toEqual(
 				new Set([`${ran.main}|design.md|spec loss`, `${ran.other}|notes.md|spec loss`]),
 			);
 			expect(ran.allScan).toMatchObject({ running: false });
 			expect(ran.imported).toMatchObject({ status: "imported" });
-			expect(ran.attached).toMatchObject({ status: "attached" });
-			expect(ran.attached.blockId).toBeString();
+			expect(ran.attachPass).toMatchObject({ attached: 1, left: 0 });
+			expect(ran.idlePass).toMatchObject({ attached: 0, left: 0 });
+			expect(ran.attached).toMatchObject({ status: "attached", attachNote: null });
+			expect(ran.attached?.blockId).toBeString();
+			expect(ran.dismissedAttached).toMatchObject({ status: "dismissed", blockId: null });
+			expect(ran.goneBlock).toBe(true);
+			expect(ran.reattached).toMatchObject({ status: "attached" });
+			expect(ran.reattached.blockId).not.toBe(ran.attached?.blockId as string);
 			expect(ran.under).toEqual([TABLE]);
 		},
 		RUN_TIMEOUT_MS,
