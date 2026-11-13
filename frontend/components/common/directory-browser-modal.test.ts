@@ -10,6 +10,7 @@ const MODAL_HOSTS = [
 	"./PathInputWithBrowse.tsx",
 	"./DirListEditor.tsx",
 	"../permissions/TargetPathInput.tsx",
+	"../narrator/header/DeviceDirectoryDialog.tsx",
 ] as const;
 
 const BROWSERS = ["./DirectoryPicker.tsx", "../permissions/RemoteDirectoryBrowser.tsx"] as const;
@@ -85,7 +86,7 @@ describe("directory browser modal sizing", () => {
 	});
 
 	test("every modal host shares one sizing source", async () => {
-		// Four separate components mount this browser. When each inlined its own body
+		// Several components mount this browser. When each inlined its own body
 		// styles, a sizing fix had to be repeated four times and silently regressed
 		// wherever it was missed.
 		for (const host of MODAL_HOSTS) {
