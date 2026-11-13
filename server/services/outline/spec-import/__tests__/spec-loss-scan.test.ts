@@ -46,7 +46,11 @@ import { outlineStore } from "../../store";
 import { writeOutline } from "../../write";
 import { reimportSpecSession, revertSpecImport } from "../admin";
 import { importSpecSession, resetSpecImportRecords } from "../importer";
-import { SPEC_LOSS_ATTACH_LIMITS, specLossBlockSid } from "../loss-attach";
+import {
+	attachSpecLossForSession,
+	SPEC_LOSS_ATTACH_LIMITS,
+	specLossBlockSid,
+} from "../loss-attach";
 import { decideSpecLossFinding, specLossDetail, specLossPage } from "../loss-findings";
 import {
 	requestSpecLossPass,
@@ -58,6 +62,7 @@ import {
 } from "../loss-scan";
 import { countSpecLossFindings, readSpecLossScan, readSpecRevisionChain } from "../loss-store";
 import { OUTLINE_SPEC_LOSS_ACTOR } from "../plan";
+import { readSpecImportSession } from "../read-port";
 import { readSpecImportState } from "../state";
 import { settleSpecImportRequests } from "../triggers";
 import { backendOf, commitCount, makeSession, makeUser, pages, writeTasks } from "./fixtures";
@@ -391,11 +396,30 @@ describe("the automatic attach", () => {
 		await runSpecLossPass({ pauseMs: 0 });
 		expect(await open(id)).toMatchObject([{ status: "open", attachNote: null, attachable: false }]);
 		expect(await commitCount(id)).toBe(0);
+		// Asked directly, the attach itself leaves a session in Dynamic Spec alone too.
+		const session = await readSpecImportSession(id);
+		if (!session) throw new Error("no session");
+		expect(await attachSpecLossForSession(session)).toEqual({ attached: 0, left: 0 });
+		expect((await open(id))[0]?.attachNote).toBeNull();
 		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
 			status: "imported",
 		});
 		await passes(async () => (await all(id, "attached")).length === 1);
 		expect((await designPage(id))?.blocks[0]).toContain("Possibly lost content");
+	});
+
+	test("moved back to Dynamic Spec before a pass got to it: left alone, also asked directly", async () => {
+		const { id, owner } = await imported();
+		await db.update(users).set({ role: "admin" }).where(eq(users.id, owner));
+		await revertSpecImport(id, owner);
+		const commits = await commitCount(id);
+		const session = await readSpecImportSession(id);
+		if (!session) throw new Error("no session");
+		expect(session.taskBackend).toBe("spec");
+		expect(await attachSpecLossForSession(session)).toEqual({ attached: 0, left: 0 });
+		await runSpecLossPass({ pauseMs: 0 });
+		expect(await commitCount(id)).toBe(commits);
+		expect(await open(id)).toMatchObject([{ status: "open", attachNote: null }]);
 	});
 
 	test("written but not recorded (a stop in between): recorded, never written twice", async () => {
