@@ -310,7 +310,11 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 			const owner = await ctx.user({ suffix: "-" });
 			expect(owner.username).toEndWith("-");
 			const admin = await ctx.user({ admin: true });
-			const session = await ctx.session({ owner: owner.id });
+			// Given by its owner to someone who cannot work in the session's space, a session's task
+			// is handed out to its project (P2 PR 10c-3): the admin is judged there too (their own
+			// grants, not an admin's reach), and answers as unknown.
+			const projectId = await ctx.project({ owner: owner.id });
+			const session = await ctx.session({ owner: owner.id, projectId });
 			const goal = await addPersonTask({
 				narratorId: session,
 				userId: owner.id,
@@ -587,6 +591,86 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 			expect(claimed?.space.id).toBe(projectSpace.id);
 			expect(titles(claimed?.open ?? [])).toEqual(["team task"]);
 			expect(claimed?.open[0]?.executor).toMatchObject({ kind: "session", narratorId: session });
+		},
+	},
+	{
+		name: "a session's task handed out to the team: a copy on the project's task page, the task waits for it, once",
+		async run(ctx) {
+			const owner = await ctx.user();
+			const projectId = await ctx.project({ owner: owner.id });
+			const session = await ctx.session({ owner: owner.id, projectId });
+			const space = await tasksOf(session);
+			const written = await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{ op: "insert", tempId: "t", parent: null, content: "Ship it", task: { status: "todo" } },
+					{ op: "insert", parent: { tempId: "t" }, content: "A step", task: { status: "todo" } },
+				],
+				actor: { kind: "agent", id: session },
+				narratorId: session,
+				responsibleUserId: owner.id,
+			});
+			const id = written.results[0]?.blockId as string;
+			const board = await readSessionTaskBoard(as(owner.id), session);
+			expect(board.sections[0]?.handOut).toBe(true);
+			const versionSeq = (await outlineStore.getBlock(id))?.versionSeq as number;
+			const out = await changePersonTask({
+				principal: as(owner.id),
+				blockId: id,
+				baseVersionSeq: versionSeq,
+				assign: { kind: "team" },
+			});
+			const copy = await outlineStore.getBlock(out.handedOut?.copy.id as string);
+			const projectSpace = await ensureProjectSpace(projectId);
+			expect(copy?.spaceId).toBe(projectSpace.id);
+			expect(copy?.taskJson).toMatchObject({ status: "todo", assignee: null, claimable: true });
+			const [page] = await outlineStore.findAliasOwners(projectSpace.id, [
+				OUTLINE_TASKS_PAGE_ALIAS,
+			]);
+			expect(copy?.parentId).toBe(page?.id);
+			expect((await outlineStore.getBlock(id))?.taskJson?.depends).toEqual([
+				{ target: out.handedOut?.copy.address as string, label: null },
+			]);
+			// Waiting for it on the session's board.
+			const after = await readSessionTaskBoard(as(owner.id), session);
+			expect(after.sections[0]?.open.find((t) => t.id === id)?.waiting?.prerequisites).toBe(1);
+			// The project's board offers the copy to nobody in particular.
+			const projectBoard = await readProjectTaskBoard(as(owner.id), projectId);
+			const pooled = projectBoard.sections[0]?.open.find((t) => t.id === copy?.id);
+			expect(pooled?.executor).toEqual({ kind: "none" });
+			// Again with the version read before: refused as changed, no second copy.
+			await expect(
+				changePersonTask({
+					principal: as(owner.id),
+					blockId: id,
+					baseVersionSeq: versionSeq,
+					assign: { kind: "team" },
+				}),
+			).rejects.toThrow(/changed since it was read/);
+			const siblings = await outlineStore.listChildMetas(projectSpace.id, [page?.id as string], 20);
+			expect(siblings.filter((m) => m.taskJson)).toHaveLength(1);
+
+			// Someone who may write the session already is given its task in place (owner decision
+			// 2026-11-13): no copy.
+			const mate = await ctx.user();
+			await ctx.grant(projectId, mate.id, "write");
+			await ctx.grantSession(session, mate.id, "write");
+			const step = written.results[1]?.blockId as string;
+			const inPlace = await changePersonTask({
+				principal: as(owner.id),
+				blockId: step,
+				baseVersionSeq: (await outlineStore.getBlock(step))?.versionSeq as number,
+				assign: { kind: "user", username: mate.username },
+			});
+			expect(inPlace.handedOut).toBeUndefined();
+			expect((await outlineStore.getBlock(step))?.taskJson?.assignee).toBe(
+				`human:${mate.username}`,
+			);
+			expect(
+				(await outlineStore.listChildMetas(projectSpace.id, [page?.id as string], 20)).filter(
+					(m) => m.taskJson,
+				),
+			).toHaveLength(1);
 		},
 	},
 	{

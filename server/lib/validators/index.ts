@@ -159,6 +159,7 @@ export {
 	humanAttentionListQuerySchema,
 	migrateBrokenModelNarratorsSchema,
 	narratorExportQuerySchema,
+	narratorExportTurnsQuerySchema,
 	narratorGrantCreateSchema,
 	narratorGrantUpdateSchema,
 	narratorHandleSchema,

@@ -1251,7 +1251,11 @@ outlineRoutes.post("/tasks/seen", bodyLimit({ maxSize: 16 * 1024 }), async (c) =
  * back to the session; with `start`, the session whose space holds it starts on it when idle,
  * which takes write access to that session (403 otherwise, before anything changes). Write
  * access to the task's space (404 when it cannot be read); 409 when the task changed since it
- * was read.
+ * was read. A task of a session space given to the team, or by the session's owner to someone who
+ * cannot work in the session space, is handed out (outline P2 PR 10c-3, owner decision
+ * 2026-11-13): `handedOut` names the copy; refused (403/409, `details.reason`) when the caller is
+ * not the session's owner, the session has no project, the project's space is not theirs to
+ * write, or the task's open copy is someone else's. Anyone who can work there is assigned in place.
  */
 outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async (c) => {
 	const principal = principalOf(c);
@@ -1279,7 +1283,7 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 				: null;
 	if (input.start && !(startable && (await holds(principal, "write", { narrator: startable }))))
 		throw new ForbiddenError("You cannot start this session");
-	const { result } = await changePersonTask({
+	const { result, handedOut } = await changePersonTask({
 		principal,
 		blockId,
 		baseVersionSeq: input.baseVersionSeq,
@@ -1288,22 +1292,40 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 	});
 	let started = false;
 	let notStarted: OutlineBoardTaskUpdateResponse["notStarted"];
-	if (startable && (await resolveTaskBackend(startable.id)) === "outline") {
+	// A task handed out to a person or the team: nothing is started (the copy waits in the pool,
+	// or for its person; the original waits for the copy).
+	// A copy handed to the session is started only when it is that session's (an existing copy
+	// is re-assigned to it, or refused).
+	const copyAssignee = handedOut
+		? ((await outlineStore.getBlock(handedOut.copy.id))?.taskJson?.assignee ?? null)
+		: null;
+	const startsHere = !handedOut || (handedTo !== null && copyAssignee === `agent:${handedTo.id}`);
+	if (startsHere && startable && (await resolveTaskBackend(startable.id)) === "outline") {
 		if (handedTo) {
-			// Decided before anything is claimed; a start that declines gives the claim back.
+			// Decided before anything is claimed; a start that declines gives the claim back. A task
+			// of a session space was handed out: the session starts on the copy.
 			const outcome = await startSessionOnTransferredTask({
 				narratorId: handedTo.id,
 				userId: principal.userId,
-				blockId,
+				blockId: handedOut?.copy.id ?? blockId,
 			});
 			started = outcome.started;
 			notStarted = outcome.notStarted;
 		} else started = await startSessionOn(startable.id, principal.userId, blockId);
 	}
 	const body: OutlineBoardTaskUpdateResponse = {
-		versionSeq: result?.commit?.seq ?? null,
+		versionSeq: handedOut ? handedOut.versionSeq : (result?.commit?.seq ?? null),
 		started,
 		...(notStarted ? { notStarted } : {}),
+		...(handedOut
+			? {
+					handedOut: {
+						copyId: handedOut.copy.id,
+						address: handedOut.copy.address,
+						...(handedOut.already ? { already: true as const } : {}),
+					},
+				}
+			: {}),
 	};
 	return c.json(body);
 });

@@ -613,12 +613,31 @@
 			"assignUser": "交给其他人…",
 			"assignSession": "交回本会话",
 			"transferSession": "转交给会话…",
+			"handToTeam": "交给团队",
 			"usernamePlaceholder": "用户名",
 			"assign": "转交",
 			"open": "在大纲里打开",
 			"failed": "修改任务失败",
 			"conflict": "任务刚被改过，看板已重新加载。",
 			"updated": "任务已更新"
+		},
+		"handOut": {
+			"toTeam": "已交给团队：项目的任务页上有一份副本（{{address}}），这个任务等它完成。",
+			"toOthers": "已交出：项目的任务页上有一份副本（{{address}}），这个任务等它完成。",
+			"failed": "没能交出这个任务",
+			"refused": {
+				"not_session_task": "只有会话自己空间里的任务可以交出去。",
+				"not_owner": "只有会话的所有者可以交出它的任务。",
+				"no_project": "这个会话不属于任何项目，没有地方可交。",
+				"cannot_write_project": "你不能写这个项目的任务，副本没法放过去。",
+				"finished": "任务已经结束了。",
+				"planning": "任务在一个还没批准的计划里。",
+				"locked": "任务在有人锁定的计划里。",
+				"held": "别人正在做这个任务。",
+				"changed": "任务刚被改过，看板已重新加载。",
+				"already_handed_out": "这个任务已经交给别人了，副本正在做。",
+				"original_not_updated": "副本已经建好，但没能把这个任务改成等它；副本下面记了一句。"
+			}
 		},
 		"transfer": {
 			"note": "旧会话带着以前的上下文；一般让新会话做更合适。",
