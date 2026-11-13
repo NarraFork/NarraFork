@@ -197,6 +197,38 @@ describe("pure helper distribution contract", () => {
 			}),
 		).toThrow();
 	});
+	test("mirror identity binds server, product and offline repository namespace", () => {
+		const source = normalizeHelperSource({
+			source: "update-server",
+			serverUrl: "https://mirror.example/base///",
+			product: "narrafork",
+			repository: "Fork/Repo",
+		});
+		expect(source).toEqual({
+			source: "update-server",
+			serverUrl: "https://mirror.example/base",
+			product: "narrafork",
+			repository: "fork/repo",
+		});
+		const identity = helperSourceIdentity(source);
+		for (const patch of [
+			{ source: "github" },
+			{ serverUrl: "https://other.example" },
+			{ product: "another" },
+			{ repository: "other/repo" },
+		])
+			expect(helperSourceIdentity(normalizeHelperSource({ ...source, ...patch }))).not.toBe(
+				identity,
+			);
+		expect(() => normalizeHelperSource({ ...source, product: "../escape" })).toThrow();
+		expect(() =>
+			normalizeHelperSource({
+				source: "github",
+				repository: "fork/repo",
+				mirror: { serverUrl: "https://mirror.example", product: "narrafork" },
+			}),
+		).toThrow("Legacy helper mirror source");
+	});
 	test("executor wrapper requires exact version, protocol and all six platforms", () => {
 		const version = "0.5.24";
 		const value = {

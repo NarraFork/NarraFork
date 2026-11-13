@@ -1,7 +1,7 @@
 /**
  * Queries and live updates of the read-only outline pages.
  */
-
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import type {
 	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
@@ -62,7 +62,7 @@ export function useOutlineSpaces(enabled: boolean) {
 			api.listOutlineSpaces({ cursor: pageParam, limit: OUTLINE_VIEW_LIMITS.defaultListPage }),
 		initialPageParam: null as string | null,
 		getNextPageParam: (page) => page.nextCursor,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 	});
 }
 
@@ -76,7 +76,7 @@ export function useOutlineTree(enabled = true) {
 		queryFn: ({ pageParam }) => api.getOutlineTree({ cursor: pageParam }),
 		initialPageParam: null as string | null,
 		getNextPageParam: (page) => page.nextCursor,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -93,7 +93,7 @@ export function useOutlineTreeSpaces(
 		queryFn: ({ pageParam }) => api.listOutlineTreeSpaces(group, { cursor: pageParam }),
 		initialPageParam: null as string | null,
 		getNextPageParam: (page) => page.nextCursor,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -116,7 +116,7 @@ export function useOutlineSpace(spaceId: string, enabled = true) {
 	return useQuery({
 		queryKey: outlineKeys.space(spaceId),
 		queryFn: () => api.getOutlineSpace(spaceId),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -130,7 +130,7 @@ export function useOutlineSpaceParent(spaceId: string, enabled = true) {
 	return useQuery({
 		queryKey: ["outline", "space-parent", spaceId] as const,
 		queryFn: async () => (await api.getOutlineSpace(spaceId)).space.parent ?? null,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 		staleTime: 5 * 60_000,
 	});
@@ -146,7 +146,7 @@ export function useOutlinePages(spaceId: string, enabled = true) {
 			}),
 		initialPageParam: null as string | null,
 		getNextPageParam: (page) => page.nextCursor,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -177,7 +177,7 @@ export function useOutlineBlock(
 			...(bytes !== undefined ? [bytes] : []),
 		],
 		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks, bytes }),
-		enabled: options.enabled ?? true,
+		enabled: !REMOTE_BUILD && (options.enabled ?? true),
 		retry: false,
 		// A view as of a commit never changes; the current one is refreshed by the subscription.
 		staleTime: asOf === undefined ? 0 : Number.POSITIVE_INFINITY,
@@ -202,7 +202,11 @@ export function useOutlineSeed(
 	enabled: boolean,
 	onRead?: (read: OutlineBlockViewResponse) => void,
 ) {
-	return useQuery({ ...outlineSeedQuery(spaceId, blockId, onRead), enabled, retry: false });
+	return useQuery({
+		...outlineSeedQuery(spaceId, blockId, onRead),
+		enabled: !REMOTE_BUILD && enabled,
+		retry: false,
+	});
 }
 
 function outlineSeedQuery(
@@ -236,6 +240,7 @@ export function prefetchOutlineSeed(
 	blockId: string,
 	onRead?: (read: OutlineBlockViewResponse) => void,
 ) {
+	if (REMOTE_BUILD) return;
 	void queryClient.prefetchQuery({ ...outlineSeedQuery(spaceId, blockId, onRead), retry: false });
 }
 
@@ -253,6 +258,7 @@ export function useOutlineViewStateSync(
 	state: OutlineViewState | null,
 ): void {
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (!pageId || !state || state.pageId !== pageId) return;
 		let disposed = false;
 		let touched = false;
@@ -308,7 +314,7 @@ export function useOutlineTimeline(spaceId: string, pageId: string | undefined) 
 			}),
 		initialPageParam: null as number | null,
 		getNextPageParam: (page) => page.nextBefore,
-		enabled: !!pageId,
+		enabled: !REMOTE_BUILD && !!pageId,
 		retry: false,
 	});
 }
@@ -323,7 +329,7 @@ export function useOutlineBlockHistory(spaceId: string, blockId: string, enabled
 			}),
 		initialPageParam: null as number | null,
 		getNextPageParam: (page) => page.nextBefore,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -332,7 +338,7 @@ export function useOutlineBacklinks(spaceId: string, blockId: string, enabled: b
 	return useQuery({
 		queryKey: outlineKeys.backlinks(spaceId, blockId),
 		queryFn: () => api.getOutlineBacklinks(spaceId, blockId),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -342,7 +348,7 @@ export function useOutlineSearch(q: string, spaceId: string | null, enabled: boo
 	return useQuery({
 		queryKey: outlineKeys.search(trimmed, spaceId),
 		queryFn: () => api.searchOutline({ q: trimmed, spaceId: spaceId ?? undefined }),
-		enabled: enabled && trimmed.length > 0,
+		enabled: !REMOTE_BUILD && enabled && trimmed.length > 0,
 		retry: false,
 		placeholderData: (previous) => previous,
 	});
@@ -373,12 +379,17 @@ function outlineQuestionsQuery(blockId: string) {
 }
 
 export function useOutlineQuestions(blockId: string | null, enabled = true) {
-	return useQuery({ ...outlineQuestionsQuery(blockId ?? ""), enabled: enabled && !!blockId });
+	return useQuery({
+		...outlineQuestionsQuery(blockId ?? ""),
+		enabled: !REMOTE_BUILD && enabled && !!blockId,
+	});
 }
 
 /** An Ask card reads its own roots, never an older task's entire question history. */
 export function useOutlineQuestionGroups(blockIds: readonly string[]) {
-	return useQueries({ queries: [...new Set(blockIds)].map(outlineQuestionsQuery) });
+	return useQueries({
+		queries: REMOTE_BUILD ? [] : [...new Set(blockIds)].map(outlineQuestionsQuery),
+	});
 }
 
 /** Share the existing page subscriptions with the editor; no polling or second socket. */
@@ -395,7 +406,7 @@ export function useOutlineQuestionsLive(
 		...new Map(groups.map(({ group }) => [group.pageId, [group.pageId, group.spaceId]])).values(),
 	]);
 	useEffect(() => {
-		if (!enabled) return;
+		if (REMOTE_BUILD || !enabled) return;
 		const unsubscribe = (JSON.parse(pages) as [string, string][]).map(([pageId, spaceId]) => {
 			let seen = -1;
 			return pageSubscriptions().subscribe(pageId, (hint) => {
@@ -433,7 +444,7 @@ export function useOutlineDigest(enabled = true) {
 	return useQuery({
 		queryKey: outlineKeys.digest(),
 		queryFn: () => api.getOutlineDigest(),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -466,7 +477,7 @@ export function useOutlinePagePending(spaceId: string, pageId: string | undefine
 	return useQuery({
 		queryKey: outlineKeys.pagePending(spaceId, pageId ?? ""),
 		queryFn: () => api.getOutlinePagePending(spaceId, pageId as string),
-		enabled: enabled && !!pageId,
+		enabled: !REMOTE_BUILD && enabled && !!pageId,
 		// The live editor folds by the unanswered questions in it: a failed read is tried again.
 		retry: 2,
 		staleTime: 5_000,
@@ -484,7 +495,7 @@ export function useOutlineReportAuthors(spaceId: string, ids: readonly string[],
 	return useQuery({
 		queryKey: [...outlineKeys.all, "report-authors", spaceId, asked.join(",")],
 		queryFn: async () => (await api.getOutlineReportAuthors(spaceId, asked)).authors,
-		enabled: enabled && asked.length > 0,
+		enabled: !REMOTE_BUILD && enabled && asked.length > 0,
 		retry: false,
 		staleTime: 60_000,
 	});
@@ -495,7 +506,7 @@ export function useOutlinePendingDetail(pendingId: string | null) {
 	return useQuery({
 		queryKey: outlineKeys.pending(pendingId ?? ""),
 		queryFn: () => api.getOutlinePending(pendingId as string),
-		enabled: !!pendingId,
+		enabled: !REMOTE_BUILD && !!pendingId,
 		retry: false,
 	});
 }
@@ -555,6 +566,7 @@ export function useOutlinePageLive(
 	// the space's last commit as of the read).
 	shownSeq.current = Math.max(view?.seq ?? -1, view?.space.lastSeq ?? -1);
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (!spaceId || !pageId) return;
 		return pageSubscriptions().subscribe(pageId, (hint) => {
 			if (hint.kind === "subscribed" || hint.kind === "changed") {
@@ -656,7 +668,7 @@ export function useOutlineTreePageLive(
 		fetching,
 	};
 	useEffect(() => {
-		if (!enabled || !spaceId || !pageId) return;
+		if (REMOTE_BUILD || !enabled || !spaceId || !pageId) return;
 		const refresher = treePageRefresher(
 			queryClient,
 			spaceId,
@@ -695,7 +707,7 @@ export function useOutlinePlanDiff(
 	const query = useQuery({
 		queryKey: ["outline", "plan-diff", spaceId, blockId, from],
 		queryFn: () => api.getOutlinePlanDiff(spaceId, blockId, from),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 		staleTime: 5_000,
 	});
@@ -703,6 +715,7 @@ export function useOutlinePlanDiff(
 	state.current.shown = query.data?.toSeq ?? -1;
 	state.current.fetching = query.isFetching;
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (!enabled) return;
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const check = () => {

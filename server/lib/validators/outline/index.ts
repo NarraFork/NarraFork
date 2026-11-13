@@ -6,6 +6,7 @@ import {
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
+import { OUTLINE_SPEC_IMPORT_ADMIN_STATES } from "@shared/outline-spec-import";
 import { OUTLINE_TASK_BOARD_LIMITS } from "@shared/outline-task-board";
 import { z } from "zod";
 
@@ -238,3 +239,13 @@ export const outlinePlanDecisionSchema = z
 		compactAfter: z.boolean().optional(),
 	})
 	.strict();
+
+/**
+ * The admin page of the Dynamic Spec import (outline P2 PR 12b2,
+ * `GET /api/admin/outline/spec-import`): one state's sessions, a page at a time.
+ */
+export const outlineSpecImportAdminQuerySchema = z.object({
+	state: z.enum(OUTLINE_SPEC_IMPORT_ADMIN_STATES).default("attention"),
+	cursor: cursorSchema.optional(),
+	limit: limitSchema(50).default(20),
+});

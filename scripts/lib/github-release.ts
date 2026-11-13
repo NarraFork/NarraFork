@@ -19,8 +19,14 @@ import {
 	validateReleasePatchMetadata,
 } from "../../shared/release-patch";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
+import {
+	REMOTE_FRONTEND_ARCHIVE_MAX_BYTES,
+	REMOTE_FRONTEND_MANIFEST_MAX_BYTES,
+	remoteFrontendArtifactNames,
+} from "../../shared/remote-access/frontend-manifest";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import { type BinaryMetadata, formatChecksumsReport, formatSha256Sums } from "./binary-metadata";
+import { copyReleaseFile } from "./ci-release-io";
 import type { ComponentReleaseEvidence } from "./component-release-inputs";
 
 const MAX_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
@@ -201,6 +207,8 @@ interface RemoteRelease {
 }
 
 export interface GitHubReleaseOptions {
+	/** Exact target declaration; never inferred from the publisher checkout. */
+	remoteFrontend?: import("../../shared/remote-access/application").RemoteFrontendCapability;
 	distDir: string;
 	version: string;
 	repository?: string;
@@ -452,6 +460,27 @@ async function stageAssets(options: GitHubReleaseOptions, directory: string): Pr
 		await writeFile(path, content);
 		const identity = await fileIdentity(path, MAX_TEXT_BYTES);
 		assets.push({ name, path, size: identity.size, sha256: identity.sha256 });
+	}
+	if (options.remoteFrontend) {
+		const { verifyRemoteFrontendArtifact } = await import("./remote-frontend-artifact");
+		const target = {
+			repository: options.repository ?? DEFAULT_GITHUB_REPOSITORY,
+			version: options.version,
+			commit: options.commit,
+			capability: options.remoteFrontend,
+		};
+		await verifyRemoteFrontendArtifact(options.distDir, target, options.signal);
+		const names = remoteFrontendArtifactNames(options.version);
+		for (const [name, maximum] of [
+			[names.archive, REMOTE_FRONTEND_ARCHIVE_MAX_BYTES],
+			[names.manifest, REMOTE_FRONTEND_MANIFEST_MAX_BYTES],
+		] as const) {
+			const path = join(directory, name);
+			await copyReleaseFile(join(options.distDir, name), path, maximum, options.signal);
+			const hash = await fileIdentity(path, maximum);
+			assets.push({ name, path, size: hash.size, sha256: hash.sha256 });
+		}
+		await verifyRemoteFrontendArtifact(directory, target, options.signal);
 	}
 	if (assets.length > MAX_ASSETS) throw new Error("Release asset limit exceeded");
 	return assets;

@@ -56,6 +56,8 @@ export interface HelperDistributionDependencies {
 }
 export interface ComponentVersions {
 	executor: { version: string; protocolVersion: number };
+	/** Optional independently downloaded RTC helper; not a main-release prerequisite. */
+	remotePeer?: { version: string; protocolVersion: number };
 }
 
 function validProtocolVersion(value: unknown): value is number {
@@ -64,7 +66,7 @@ function validProtocolVersion(value: unknown): value is number {
 
 /** Read a target commit's pin as data, never by executing that commit's code. */
 export function parseComponentVersions(value: unknown): ComponentVersions {
-	const record = object(value, ["executor"]);
+	const record = object(value, ["executor", "remotePeer"]);
 	const executor = object(record.executor, ["version", "protocolVersion"]);
 	if (
 		typeof executor.version !== "string" ||
@@ -73,14 +75,33 @@ export function parseComponentVersions(value: unknown): ComponentVersions {
 		!validProtocolVersion(executor.protocolVersion)
 	)
 		throw new Error("Invalid component version configuration");
+	let remotePeer: ComponentVersions["remotePeer"];
+	if (Object.hasOwn(record, "remotePeer")) {
+		const peer = object(record.remotePeer, ["version", "protocolVersion"]);
+		if (
+			typeof peer.version !== "string" ||
+			peer.version.length > 64 ||
+			!isValidReleaseVersion(peer.version) ||
+			!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(peer.version) ||
+			!validProtocolVersion(peer.protocolVersion)
+		)
+			throw new Error("Invalid remote peer component version configuration");
+		remotePeer = { version: peer.version, protocolVersion: peer.protocolVersion };
+	}
 	return {
 		executor: { version: executor.version, protocolVersion: executor.protocolVersion },
+		...(remotePeer ? { remotePeer } : {}),
 	};
 }
 
 const componentPin = parseComponentVersions(componentVersions);
-export const COMPONENT_VERSIONS: Readonly<{ executor: Readonly<ComponentVersions["executor"]> }> =
-	Object.freeze({ executor: Object.freeze(componentPin.executor) });
+export const COMPONENT_VERSIONS: Readonly<{
+	executor: Readonly<ComponentVersions["executor"]>;
+	remotePeer?: Readonly<NonNullable<ComponentVersions["remotePeer"]>>;
+}> = Object.freeze({
+	executor: Object.freeze(componentPin.executor),
+	...(componentPin.remotePeer ? { remotePeer: Object.freeze(componentPin.remotePeer) } : {}),
+});
 export const EXECUTOR_RELEASE_VERSION = COMPONENT_VERSIONS.executor.version;
 export const HELPER_EXECUTOR_PROTOCOL_VERSION = COMPONENT_VERSIONS.executor.protocolVersion;
 
@@ -122,36 +143,26 @@ export function createHelperDistributionDependencies(
 	});
 }
 export type HelperSource =
-	| { source: "github"; repository: string; mirror?: { serverUrl: string; product: string } }
-	| { source: "update-server"; serverUrl: string };
+	| { source: "github"; repository: string }
+	| { source: "update-server"; serverUrl: string; product: string; repository: string };
 export function normalizeHelperSource(input: {
 	source?: string;
 	githubRepository?: string;
 	repository?: string;
 	serverUrl?: string;
-	mirror?: { serverUrl: string; product: string };
+	product?: string;
+	/** Old GitHub-authority mirror bindings must be selected again, never reinterpreted. */
+	mirror?: unknown;
 }): HelperSource {
-	if (input.source === undefined || input.source === "github") {
-		const repository = input.repository ?? input.githubRepository ?? BUILD_GITHUB_REPOSITORY;
-		if (!isValidGitHubRepository(repository)) throw new Error("Invalid helper repository");
-		let mirror: { serverUrl: string; product: string } | undefined;
-		if (input.mirror) {
-			if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.mirror.product))
-				throw new Error("Invalid helper mirror product");
-			const server = normalizeHelperSource({
-				source: "update-server",
-				serverUrl: input.mirror.serverUrl,
-			});
-			if (server.source !== "update-server") throw new Error("Invalid helper mirror");
-			mirror = Object.freeze({ serverUrl: server.serverUrl, product: input.mirror.product });
-		}
-		return {
-			source: "github",
-			repository: repository.toLowerCase(),
-			...(mirror ? { mirror } : {}),
-		};
-	}
+	if (Object.hasOwn(input, "mirror"))
+		throw new Error("Legacy helper mirror source; select a fresh distribution source");
+	const repository = input.repository ?? input.githubRepository ?? BUILD_GITHUB_REPOSITORY;
+	if (!isValidGitHubRepository(repository)) throw new Error("Invalid helper repository");
+	if (input.source === undefined || input.source === "github")
+		return { source: "github", repository: repository.toLowerCase() };
 	if (input.source !== "update-server") throw new Error("Invalid helper source");
+	const product = input.product ?? "narrafork";
+	if (!/^[A-Za-z0-9_-]{1,64}$/.test(product)) throw new Error("Invalid helper mirror product");
 	const url = new URL(input.serverUrl?.trim() || "https://narrafork-update.b.domexie.cn");
 	if (
 		(url.protocol !== "https:" && url.protocol !== "http:") ||
@@ -162,13 +173,19 @@ export function normalizeHelperSource(input: {
 	) {
 		throw new Error("Invalid helper server URL");
 	}
-	return { source: "update-server", serverUrl: url.href.replace(/\/+$/, "") };
+	return {
+		source: "update-server",
+		serverUrl: url.href.replace(/\/+$/, ""),
+		product,
+		// In mirror mode this is an offline logical namespace, not a network authority.
+		repository: repository.toLowerCase(),
+	};
 }
 export function helperSourceIdentity(source: HelperSource): string {
 	const normalized = normalizeHelperSource(source);
 	return normalized.source === "github"
-		? `github:${normalized.repository}${normalized.mirror ? `\0mirror:${normalized.mirror.serverUrl}\0${normalized.mirror.product}` : ""}`
-		: `update-server:${normalized.serverUrl}`;
+		? `github:${normalized.repository}`
+		: `update-server:${normalized.serverUrl}\0${normalized.product}\0${normalized.repository}`;
 }
 export function getHelperAssetName(tool: HelperTool, platform: HelperPlatform): string {
 	if (!HELPER_TOOLS.includes(tool) || !HELPER_PLATFORMS.includes(platform))

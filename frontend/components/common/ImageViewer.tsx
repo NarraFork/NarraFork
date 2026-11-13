@@ -1,3 +1,5 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
 import { ActionIcon, Menu, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
@@ -94,6 +96,7 @@ export function ImageViewer({
 		setMenu({ x: e.clientX, y: e.clientY });
 	}, []);
 
+	if (REMOTE_BUILD && !isRemoteInlineImage(options.src)) return <span>{options.alt ?? ""}</span>;
 	return (
 		<PanZoomStage
 			key={options.src}

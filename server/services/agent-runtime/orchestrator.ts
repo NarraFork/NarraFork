@@ -1024,6 +1024,13 @@ export async function runAgentLoopUnlocked(
 				},
 			);
 			const outlineEditCore = taskBackend === "outline" && freshNarrator.type !== "subagent";
+			// A root session the Dynamic Spec import moved: its `spec://` calls are told where the
+			// old files went (outline P2 PR 12b2). One cached primary-key read per session.
+			const specImported =
+				outlineEditCore &&
+				(await import("../outline/spec-import/state").then(({ isSpecImportedSession }) =>
+					isSpecImportedSession(narratorId),
+				));
 			{
 				if (active._workspaceInstallFailed)
 					throw new Error("Workspace context installation requires session recovery");
@@ -1941,6 +1948,7 @@ export async function runAgentLoopUnlocked(
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
 				taskBackend,
+				specImported,
 				bot: isBotNarrator(freshNarrator.traits),
 				narratorId,
 				conversationId: active.conversationId,

@@ -83,6 +83,100 @@ function gateEnv(restore: boolean, publish: boolean): NodeJS.ProcessEnv {
 	};
 }
 
+describe("remote frontend release wiring", () => {
+	test("only declared target checkouts build remote assets with frozen identity and run production browser checks", () => {
+		const build = ci.jobs.build.steps?.find(
+			(step) => step.name === "Build declared remote frontend",
+		);
+		expect(build?.if).toContain("frontend-capability.json");
+		for (const flag of ["--repository=", "--version=", "--commit=", "--output="])
+			expect(build?.run).toContain(flag);
+		expect(build?.env?.SOURCE_COMMIT).toContain("inputs.checkout-ref");
+		expect(release.jobs.verify.with?.["release-version"]).toContain("preflight.outputs.version");
+		expect(
+			ci.jobs.tests.steps?.find((step) => step.name === "Run repository tests")?.env
+				?.NF_REMOTE_PRODUCTION_TEST,
+		).toBe("1");
+	});
+	test("remote artifact producer and upload share a non-hidden directory", () => {
+		const steps = ci.jobs.build.steps ?? [];
+		const build = steps.find((step) => step.name === "Build declared remote frontend");
+		const upload = steps.find((step) => step.name === "Upload remote frontend");
+		const path = upload?.with?.path;
+		expect(typeof path).toBe("string");
+		if (typeof path !== "string") throw new Error("Missing remote artifact upload directory");
+		const directory = path.replace(/\/$/, "");
+		expect(directory.split("/").every((segment) => !!segment && !segment.startsWith("."))).toBe(
+			true,
+		);
+		expect(build?.run).toContain(`--output=${directory}`);
+		const typecheckIndex = steps.findIndex((step) => step.run === "bunx tsgo --noEmit");
+		expect(typecheckIndex).toBeGreaterThanOrEqual(0);
+		for (const [index, step] of steps.entries()) {
+			if (step.uses?.startsWith("actions/upload-artifact@"))
+				expect(index).toBeGreaterThan(typecheckIndex);
+		}
+		// Do not broadly enable uploading hidden content just to include these two public assets.
+		expect(upload?.with?.["include-hidden-files"]).not.toBe(true);
+	});
+	test("raw-build recovery restores exact artifacts without source builds; ordinary binary input stays ordinary", () => {
+		const job = release.jobs["restore-remote-frontend"];
+		expect(job.if).toContain("build-reuse-mode == 'true'");
+		expect(job.if).toContain("remote-frontend == 'true'");
+		const code = job.steps?.map((step) => step.run ?? "").join("\n") ?? "";
+		expect(code).toContain("restore-remote-frontend");
+		expect(code).not.toContain("build-remote-frontend");
+		expect(code).not.toContain("bun install");
+		expect(release.jobs.assemble.needs).toContain("restore-remote-frontend");
+		expect(
+			release.jobs.assemble.steps?.find(
+				(step) => step.name === "Download exact remote frontend artifact",
+			)?.with?.name,
+		).toBe(`remote-frontend-${expression("github.run_id")}-${expression("github.run_attempt")}`);
+		expect(
+			release.jobs.build.steps
+				?.filter((step) => step.with?.path === "dist/frontend/")
+				.map((step) => step.with?.name),
+		).toEqual(["ci-frontend"]);
+	});
+	test("a declared raw-build recovery cannot publish with failed or skipped remote restore", () => {
+		const env = {
+			...gateEnv(false, false),
+			BUILD_REUSE_MODE: "true",
+			VERIFY_RESULT: "skipped",
+			BUILD_RESULT: "skipped",
+			RESTORE_PLATFORMS_RESULT: "success",
+			REMOTE_FRONTEND_DECLARED: "true",
+			REMOTE_FRONTEND_RESTORE_RESULT: "success",
+		};
+		expect(() => assertReleaseGate(env)).not.toThrow();
+		for (const result of ["failed", "skipped", "cancelled", ""])
+			expect(() => assertReleaseGate({ ...env, REMOTE_FRONTEND_RESTORE_RESULT: result })).toThrow(
+				"remote frontend",
+			);
+		expect(() =>
+			assertReleaseGate({
+				...env,
+				REMOTE_FRONTEND_DECLARED: "false",
+				REMOTE_FRONTEND_RESTORE_RESULT: "skipped",
+			}),
+		).not.toThrow();
+	});
+	test("trusted publisher control bundles the verifier without worker files or dependency installation", async () => {
+		const built = await Bun.build({
+			entrypoints: [join(root, "scripts/ci-release.ts")],
+			target: "bun",
+			format: "esm",
+		});
+		expect(built.success).toBe(true);
+		expect(built.outputs).toHaveLength(1);
+		expect(built.outputs[0].size).toBeLessThan(3 * 1024 ** 2);
+		const source = await built.outputs[0].text();
+		expect(source).toContain("REMOTE_FRONTEND");
+		expect(source).not.toContain('new URL("./remote-frontend-archive-worker.ts"');
+	}, 30_000);
+});
+
 describe("CI component read transport", () => {
 	test("read budgets reach the cancellable transport while uploads retain the ordinary runner", async () => {
 		const parent = new AbortController();
@@ -658,6 +752,23 @@ describe("release dependency graph conditions execute against each recovery mode
 			needs[name] = { result, outputs: {} };
 		return needs;
 	}
+	test("declared remote restore participates only in raw-build recovery, not original full-bundle recovery", () => {
+		for (const mode of ["fresh", "single", "all", "bundle"] as const) {
+			const needs = context(mode);
+			needs.preflight.outputs["remote-frontend"] = "true";
+			needs["restore-remote-frontend"] = {
+				result: mode === "all" ? "success" : "skipped",
+				outputs: {},
+			};
+			expect(eligibleJob("restore-remote-frontend", needs, true)).toBe(mode === "all");
+			expect(eligibleJob("publish", needs, true)).toBe(mode !== "single");
+			if (mode === "all") {
+				needs["restore-remote-frontend"].result = "failure";
+				expect(eligibleJob("assemble", needs, true)).toBe(false);
+				expect(eligibleJob("publish", needs, true)).toBe(false);
+			}
+		}
+	});
 	for (const mode of ["fresh", "single", "all", "bundle"] as const)
 		test(`skipped job propagation and publisher eligibility are correct for ${mode}`, () => {
 			const needs = context(mode);

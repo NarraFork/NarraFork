@@ -18,6 +18,7 @@ import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import type { MediaContentBlock, NativeMediaInput } from "@shared/media-attachments";
 import { logger } from "../logger";
 import {
+	getOutlineSpecMovedHint,
 	getOutlineSpecUnavailableHint,
 	getToolMessage,
 	getToolMessageWithParams,
@@ -777,15 +778,20 @@ export function getReflectionToolRejection(
  * outline session has no Dynamic Spec (plan §3), so instead of reading or writing one it can no
  * longer see, the call is answered with where its tasks, notes and behavior boundary are. That
  * includes `spec://behavior_fence`: the session's boundary is the behavior page of its session
- * space (plan PR 4), which the system keeps in its context. Spec sessions pass.
+ * space (plan PR 4), which the system keeps in its context. Spec sessions pass. A session the
+ * Dynamic Spec import moved (`specImported`) is told where its old files went instead.
  */
 export function getOutlineSpecRejection(
 	tu: AgentToolUse,
-	config: Pick<AgentConfig, "taskBackend" | "locale">,
+	config: Pick<AgentConfig, "taskBackend" | "locale" | "specImported">,
 ): ToolExecResult | undefined {
 	if (config.taskBackend !== "outline" || !toolNamesSpecPath(tu.name, tu.input)) return undefined;
+	const locale = (config.locale as Locale) ?? "en";
 	return {
-		output: getOutlineSpecUnavailableHint((config.locale as Locale) ?? "en"),
+		// A session the import moved: where its old files went (outline P2 PR 12b2).
+		output: config.specImported
+			? getOutlineSpecMovedHint(locale)
+			: getOutlineSpecUnavailableHint(locale),
 		isError: true,
 		durationMs: 0,
 	};

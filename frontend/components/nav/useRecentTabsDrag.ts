@@ -9,6 +9,7 @@ import {
 } from "@dnd-kit/core";
 import type { QueryClient } from "@tanstack/react-query";
 import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invalidateNarratorGitIdentities } from "../../hooks/git-identity-query-keys";
 import type { RecentTab } from "../../hooks/recent-tabs-utils";
 import { applyRecentTabsDelta, refreshRecentTabsLoadedWindow } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
@@ -402,6 +403,8 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 				signal,
 			);
 			const applied = applyRecentTabsDelta(qc, result);
+			// Folder membership may have changed, and with it the git identity a session follows.
+			void invalidateNarratorGitIdentities(qc);
 			if (applied.gaps.length > 0 || applied.backfill.length > 0) {
 				await awaitSubmission(
 					refreshRecentTabsLoadedWindow(qc, {

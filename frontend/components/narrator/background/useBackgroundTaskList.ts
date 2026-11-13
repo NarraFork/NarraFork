@@ -14,6 +14,7 @@
  * frames. There is deliberately NO `refetchInterval` anywhere in it.
  */
 
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import type { BackgroundTaskListDelta, BackgroundTaskListItem } from "@shared/background-task-list";
 import { BACKGROUND_TASK_LIST_PAGE_SIZE } from "@shared/background-task-list";
 import { readToolProgressPayload, type ToolProgressPayload } from "@shared/tool-progress";
@@ -89,7 +90,7 @@ export function useBackgroundTaskList(
 			}),
 		initialPageParam: null as string | null,
 		getNextPageParam: (lastPage) => lastPage.nextCursor,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		// Steady state is delta-driven. A timer here would reintroduce exactly the
 		// traffic this hook exists to remove.
 		refetchInterval: false,
@@ -201,6 +202,7 @@ export function useBackgroundTaskList(
 
 	// --- WS wiring ---------------------------------------------------------
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (!enabled || !narratorId) return;
 		const subscription = narratorWSManager.subscribe([narratorId], { kind: "list" });
 

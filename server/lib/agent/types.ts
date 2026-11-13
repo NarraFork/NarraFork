@@ -1037,6 +1037,12 @@ export interface AgentConfig {
 	 */
 	taskBackend?: "spec" | "outline";
 	/**
+	 * With `taskBackend` `outline`: the session is one the Dynamic Spec import moved into the
+	 * outline (outline P2 PR 12b2), so a `spec://` call is answered with where its old tasks,
+	 * notes and behavior boundary went.
+	 */
+	specImported?: boolean;
+	/**
 	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
 	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read
 	 * when the message is delivered.

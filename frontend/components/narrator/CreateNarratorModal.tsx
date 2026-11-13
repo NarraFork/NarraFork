@@ -46,7 +46,11 @@ import {
 	useFavoriteDirectories,
 	useReorderFavoriteDirectories,
 } from "../../hooks/useFavoriteDirectories";
-import { narratorGitIdentityQueryKey, useGitIdentities } from "../../hooks/useGitIdentities";
+import {
+	narratorGitIdentityQueryKey,
+	useFolderGitIdentity,
+	useGitIdentities,
+} from "../../hooks/useGitIdentities";
 import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
@@ -62,6 +66,7 @@ import {
 	resolveStartInPlanModePrefill,
 	shouldSendStartInPlanMode,
 } from "./composer/create-narrator-plan-mode-prefill";
+import { followIdentityKind } from "./details/git-identity-follow-label";
 import { ProjectPromptModal } from "./ProjectPromptModal";
 
 const RemoteDirectoryBrowser = lazy(() =>
@@ -93,6 +98,13 @@ export interface CreateNarratorModalProps {
 	initialCwd?: string;
 	/** Explicit project membership; a directory alone never implies a project. */
 	contextProjectId?: string;
+	/**
+	 * 侧栏文件夹 id：从这个文件夹里新建会话时传入。
+	 *
+	 * 会话自身不写 git 身份 pick，运行时按「会话 → 文件夹 → 全局」解析，所以这里只需
+	 * 让选择器说清"跟随"跟的是哪一条。
+	 */
+	gitIdentityFolderId?: string;
 }
 
 function FavoriteItemContent({
@@ -180,6 +192,7 @@ export function CreateNarratorModalBody({
 	onCreated,
 	initialCwd,
 	contextProjectId,
+	gitIdentityFolderId,
 }: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
@@ -240,6 +253,13 @@ export function CreateNarratorModalBody({
 	} = useGitIdentities(gitIdentityVisibility.createModal);
 	const gitIdentities = gitIdentityList ?? [];
 	const defaultGitIdentity = gitIdentities.find((identity) => identity.isDefault);
+	// 从文件夹里新建："跟随"跟的是该文件夹的 git 身份（运行时按 会话→文件夹→全局 解析）。
+	const { data: folderGitIdentity } = useFolderGitIdentity(
+		opened && gitIdentityVisibility.createModal ? (gitIdentityFolderId ?? null) : null,
+	);
+	const folderIdentity = folderGitIdentity?.selectedId
+		? folderGitIdentity.identities.find((identity) => identity.id === folderGitIdentity.selectedId)
+		: undefined;
 	const [handle, setHandle] = useState("");
 	const [activeId, setActiveId] = useState<string | null>(null);
 	// No directory typed and no usable default: the server would refuse, so ask up front.
@@ -719,11 +739,15 @@ export function CreateNarratorModalBody({
 								value: FOLLOW_DEFAULT_GIT_IDENTITY,
 								label: gitIdentitiesLoading
 									? t("common:loading")
-									: defaultGitIdentity
-										? t("narrator:details.gitIdentityFollowDefault", {
-												name: defaultGitIdentity.name,
+									: followIdentityKind(folderIdentity, defaultGitIdentity) === "folder"
+										? t("narrator:details.gitIdentityFollowFolder", {
+												name: folderIdentity?.name,
 											})
-										: t("narrator:details.gitIdentityFollowDefaultPlain"),
+										: defaultGitIdentity
+											? t("narrator:details.gitIdentityFollowDefault", {
+													name: defaultGitIdentity.name,
+												})
+											: t("narrator:details.gitIdentityFollowDefaultPlain"),
 							},
 							...gitIdentities.map((identity) => ({
 								value: identity.id,

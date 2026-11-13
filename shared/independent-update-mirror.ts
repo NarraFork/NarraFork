@@ -23,7 +23,8 @@ export type MirrorAssetKind =
 	| "patch-meta"
 	| "notes"
 	| "helpers-binary"
-	| "executor-binary";
+	| "executor-binary"
+	| "remote-peer-binary";
 export interface MirrorAssetDescriptor extends UpdateIndexAsset {
 	kind: MirrorAssetKind;
 	version: string;
@@ -60,7 +61,7 @@ function repo(value: unknown, expected: string) {
 	);
 }
 export function mirrorAssetLimit(kind: MirrorAssetKind): number {
-	return kind === "helpers-binary" || kind === "executor-binary"
+	return kind === "helpers-binary" || kind === "executor-binary" || kind === "remote-peer-binary"
 		? HELPER_BINARY_MAX_BYTES
 		: kind === "patch"
 			? MAX_RELEASE_PATCH_BYTES
@@ -84,6 +85,7 @@ export function parseMirrorAssetDescriptor(value: unknown): MirrorAssetDescripto
 			"notes",
 			"helpers-binary",
 			"executor-binary",
+			"remote-peer-binary",
 		].includes(String(a.kind)),
 		"asset kind (main binaries prohibited)",
 	);

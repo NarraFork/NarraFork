@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { useDisclosure } from "@mantine/hooks";
 import { useEffect } from "react";
 import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
@@ -55,7 +56,8 @@ export function useNarratorQuota({
 	const nugBalanceNumber =
 		nugProviderInfo?.providerId && quotaBalance != null ? Number(quotaBalance) : Number.NaN;
 	const shouldShowNugRechargeButton = Boolean(
-		nugProviderInfo?.providerId &&
+		!REMOTE_BUILD &&
+			nugProviderInfo?.providerId &&
 			(paymentRequired || !Number.isFinite(nugBalanceNumber) || nugBalanceNumber <= 0),
 	);
 	const shouldShowNugRechargeInQuotaDetails = Boolean(
@@ -89,7 +91,7 @@ export function useNarratorQuota({
 	const [nugRechargeOpened, { open: openNugRecharge, close: closeNugRecharge }] =
 		useDisclosure(false);
 	useEffect(() => {
-		if (paymentRequired) openNugRecharge();
+		if (!REMOTE_BUILD && paymentRequired) openNugRecharge();
 	}, [openNugRecharge, paymentRequired]);
 
 	return {

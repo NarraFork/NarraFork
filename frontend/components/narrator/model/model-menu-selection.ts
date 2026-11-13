@@ -258,20 +258,13 @@ export function autoChoiceReason(
 /**
  * Group the picker's options: auto models by vendor family, everything else by service.
  *
- * A `<prefix>:<model>` that some auto row already lists as a source is left out of its
- * service group, so a model shows once, under its family, with its services one level
- * down. Services keep the models no auto row covers (outside the catalog, or excluded
- * from auto), which can only be chosen by naming the service. The currently selected value
- * is never dropped, so the selection always has a row to center on.
+ * Every service keeps all of its models, including those an auto row also lists as a
+ * source. The two never share one list: the model view shows only auto rows (through
+ * ModelSourceBrowser) and the provider view shows only service groups, so dropping a
+ * covered model from its service would remove it from the provider view altogether, and
+ * a service whose every model is in the catalog would vanish from the picker.
  */
-export function groupModelOptions(
-	options: readonly ModelOption[],
-	currentValue: string,
-): Map<string, ModelOption[]> {
-	const coveredByAuto = new Set<string>();
-	for (const option of options) {
-		for (const source of option.autoSources ?? []) coveredByAuto.add(source.value);
-	}
+export function groupModelOptions(options: readonly ModelOption[]): Map<string, ModelOption[]> {
 	const groups = new Map<string, ModelOption[]>();
 	const push = (key: string, option: ModelOption) => {
 		const list = groups.get(key);
@@ -283,10 +276,7 @@ export function groupModelOptions(
 			push(`${AUTO_FAMILY_GROUP_PREFIX}${option.family ?? ""}`, option);
 			continue;
 		}
-		const provider = option.provider ?? "unknown";
-		const isService = !provider.startsWith("__");
-		if (isService && coveredByAuto.has(option.value) && option.value !== currentValue) continue;
-		push(provider, option);
+		push(option.provider ?? "unknown", option);
 	}
 	return groups;
 }

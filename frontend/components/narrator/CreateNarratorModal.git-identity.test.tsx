@@ -156,6 +156,8 @@ mock.module("../../hooks/useGitIdentities", () => ({
 		enabledSeen.push(enabled);
 		return identityQuery;
 	},
+	// 从文件夹新建时才查询；这些用例都不带文件夹目标。
+	useFolderGitIdentity: () => ({ data: undefined }),
 	narratorGitIdentityQueryKey: (narratorId: string) => [
 		"auth",
 		"git-identities",

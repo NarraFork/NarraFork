@@ -28,6 +28,23 @@ const options = (fixture: ReturnType<typeof mirrorFixture>) => ({
 	downloadAsset: fixture.downloadAsset,
 });
 describe("canonical independent main mirror", () => {
+	test("remote frontend release extras are ignored without extending main mirror or index DTOs", async () => {
+		const f = mirrorFixture();
+		const originalIndex = structuredClone(f.index);
+		for (const [index, suffix] of ["tar.gz", "manifest.json"].entries())
+			f.assets.push({
+				id: 900 + index,
+				name: `narrafork-${f.release.version}-remote-frontend.${suffix}`,
+				size: 12,
+				digest: `sha256:${"c".repeat(64)}`,
+				state: "uploaded",
+			});
+		const receipt = await mirrorPublishedGitHubRelease(options(f));
+		expect(receipt.status).toBe("MIRRORED");
+		expect(f.committed?.index).toEqual(originalIndex);
+		expect(f.committed?.assets.some((asset) => asset.name.includes("remote-frontend"))).toBe(false);
+		expect(f.downloaded.some((id) => id >= 900)).toBe(false);
+	});
 	test("explicit overall deadline reaches main download instead of restarting the default budget", async () => {
 		const f = mirrorFixture(true);
 		const downloadAsset = async ({ signal }: { signal?: AbortSignal }) =>

@@ -1956,12 +1956,19 @@ export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
 
 /**
  * At the start of a run: import a session that still keeps its tasks in Dynamic Spec (outline P2
- * PR 12b, `spec-import/triggers.ts`). Then, for an outline session: move the old behavior fence's text to the
+ * PR 12b, `spec-import/triggers.ts`). Then, for an outline session: tell it once where its Dynamic
+ * Spec went when the import moved it (PR 12b2, `spec-import/notice.ts`), move the old behavior fence's text to the
  * session's behavior page (once; `importOutlineBehaviorFence`) and a plugin's SOP left in it to the
  * plugin's block there (once; `moveOutlineFenceSop`, outline P2 PR 12a), then note where the run
  * starts for the turn-end note (the completed tool count and the revision of the open tasks).
  * Spec sessions only resolve their (cached) backend. Never rejects.
  */
+/** Whether the Dynamic Spec import moved this session into the outline (outline P2 PR 12b2). */
+async function isSpecImportedSession(narratorId: string): Promise<boolean> {
+	const { isSpecImportedSession: read } = await import("./outline/spec-import/state");
+	return await read(narratorId);
+}
+
 export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 	active._outlineTurnStart = undefined;
 	try {
@@ -1975,6 +1982,9 @@ export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 		if ((await resolveTaskBackend(active.narratorId)) !== "outline") return;
 		const { readTaskSession } = await import("./task-source/backend");
 		if ((await readTaskSession(active.narratorId))?.subagent === true) return;
+		// Moved by the import: one history row tells the model where its spec went (PR 12b2).
+		const { deliverSpecImportNotice } = await import("./outline/spec-import/notice");
+		await deliverSpecImportNotice(active.narratorId);
 		const { importOutlineBehaviorFence } = await import("./task-source/outline-behavior");
 		await importOutlineBehaviorFence(active.narratorId, active.locale);
 		// A plugin's SOP the old fence still holds moves to its block on the page (PR 12a).
@@ -6714,10 +6724,12 @@ async function reExecuteDeniedToolCallUnlocked(
 					narratorId,
 					active._currentUserId ?? null,
 				);
+				const taskBackend = await resolveTaskBackend(narratorId).catch(() => "spec" as const);
 				const config: import("../lib/agent").AgentConfig = {
 					narratorId,
 					runtimePolicy,
-					taskBackend: await resolveTaskBackend(narratorId).catch(() => "spec" as const),
+					taskBackend,
+					specImported: taskBackend === "outline" && (await isSpecImportedSession(narratorId)),
 					systemPrompt: active.systemPrompt ?? undefined,
 					permissionMode: oauthRuntime?.permissionMode ?? narrator.permissionMode ?? "default",
 					planMode: !oauthRuntime && isPlanModeTrait(narrator.traits),
@@ -10188,6 +10200,7 @@ export {
 	compactLocks,
 	isCompactInProgress,
 	markCompactAsBlocking,
+	refreshCompactContextPercentAfter,
 	retryFailedCompact,
 	runCustomCompact,
 	runSegmentCompact,

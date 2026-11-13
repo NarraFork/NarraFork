@@ -25,7 +25,7 @@ const DISCOVERY_MAX_BUCKETS = 12;
 const DISCOVERY_TIMEOUT_MS = 60_000;
 const JOB_TIMEOUT_MS = 25 * 60_000;
 const MAX_JOB_BYTES = 4 * 1024 ** 3;
-const KINDS: RelayKind[] = ["main", "helpers", "executor"];
+const KINDS: RelayKind[] = ["main", "helpers", "executor", "remote-peer"];
 const HASH = /^[a-f0-9]{64}$/;
 type Phase = "COMMITTED" | "STALE" | "CONFLICT" | "RETRY";
 interface Entry {

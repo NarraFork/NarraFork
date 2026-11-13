@@ -2,7 +2,8 @@
  * The Spec panel's banner for a session that still keeps its tasks in Dynamic Spec while the
  * outline is on (outline P2 PR 12b): says the session will be imported, offers "Import now", and
  * shows how the last attempt went (running, busy, failed with its reason and a retry, needs
- * attention). The reason is said in the reader's language from its code.
+ * attention, moved back to Dynamic Spec by an administrator). The reason is said in the reader's
+ * language from its code.
  * Nothing is drawn for a session that is not to be imported, or with imports switched off. Once
  * the session was moved the panel itself becomes the task board (`SpecPanel`).
  */
@@ -19,17 +20,20 @@ export function SpecImportBanner({ narratorId }: { narratorId: string }) {
 	const running = data.state === "running" || start.isPending;
 	const problem = !running && (data.state === "failed" || data.state === "attention");
 	const busy = !running && (data.state === "busy" || start.isError);
+	const reverted = !running && data.state === "reverted";
 	const message = running
 		? t("spec.specImportRunning")
-		: data.state === "attention"
-			? t("spec.specImportAttention")
-			: data.state === "failed"
-				? t("spec.specImportFailed")
-				: busy
-					? t("spec.specImportBusy")
-					: data.mode === "manual"
-						? t("spec.specImportManual")
-						: t("spec.specImportAuto");
+		: reverted
+			? t("spec.specImportReverted")
+			: data.state === "attention"
+				? t("spec.specImportAttention")
+				: data.state === "failed"
+					? t("spec.specImportFailed")
+					: busy
+						? t("spec.specImportBusy")
+						: data.mode === "manual"
+							? t("spec.specImportManual")
+							: t("spec.specImportAuto");
 	const reason = data.reason
 		? t(`spec.specImportReason.${data.reason.code}`, { n: data.reason.count ?? 0 })
 		: t("spec.specImportReason.other");

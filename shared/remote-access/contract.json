@@ -1,0 +1,179 @@
+{
+	"version": 2,
+	"appVersion": "prototype-1",
+	"limits": {
+		"frameBytes": 16384,
+		"headerBytes": 24,
+		"controlBytes": 16384,
+		"signalBytes": 98304,
+		"sdpBytes": 65536,
+		"candidateBytes": 2048,
+		"candidates": 128,
+		"windowBytes": 65536,
+		"queueBytes": 4194304,
+		"globalQueueBytes": 33554432,
+		"jsonBytes": 1048576,
+		"fileBytes": 8388608,
+		"socketMessageBytes": 2097152,
+		"streamBytes": 67108864,
+		"streams": 32,
+		"sockets": 8,
+		"peers": 4
+	},
+	"frame": {
+		"magicHex": "4e464443",
+		"endianness": "big",
+		"fields": [
+			"magic:u32",
+			"version:u8",
+			"kind:u8",
+			"flags:u16",
+			"streamId:u32",
+			"sequence:u32",
+			"payloadBytes:u32",
+			"reserved:u32"
+		],
+		"kinds": { "data": 1, "end": 2 },
+		"flags": 0,
+		"reserved": 0
+	},
+	"socketFrame": {
+		"magicHex": "4e465753",
+		"headerBytes": 32,
+		"endianness": "big",
+		"fields": [
+			"magic:u32",
+			"version:u8",
+			"opcode:u8",
+			"flags:u16",
+			"streamId:u32",
+			"messageId:u32",
+			"sequence:u32",
+			"totalBytes:u32",
+			"payloadBytes:u32",
+			"reserved:u32"
+		],
+		"opcodes": { "text": 1, "binary": 2 },
+		"endFlag": 1,
+		"reserved": 0,
+		"ordering": "messageId starts at 1 per socket and increments at complete message; sequence starts at 0 per message. End flag iff accumulated bytes equal total. One assembly per socket, 30s deadline. Total storage reserved before accepting first fragment. Credit returned after each fragment is copied into reserved assembly, never waiting for full-message completion. Empty messages carry one END fragment. Closing cancels partial assemblies."
+	},
+	"crypto": {
+		"curve": "P-256",
+		"publicKey": "SEC1 uncompressed 65 bytes lowercase hex",
+		"signature": "64 bytes r||s lowercase hex ECDSA SHA-256",
+		"hash": "SHA-256 lowercase hex",
+		"instanceId": "lowercase base32 no padding of SHA256(public key bytes)",
+		"transcript": "UTF8(narrafork-remote-v1\\0) followed by uint32 big-endian length-prefixed UTF8(label), then length-prefixed UTF8(each field); signaling signature domain is unchanged; DataChannel wire version is v2",
+		"labels": {
+			"register": ["challenge", "publicKey"],
+			"offer": ["instanceId", "targetId", "clientPublicKey", "offerHash"],
+			"ticket": [
+				"instanceId",
+				"leaseEpoch",
+				"sessionId",
+				"clientPublicKey",
+				"offerHash",
+				"expiresAt",
+				"targetKind",
+				"targetId"
+			],
+			"answer": ["instanceId", "sessionId", "clientPublicKey", "offerHash", "answerHash"],
+			"hello": ["instanceId", "sessionId", "offerHash", "answerHash", "nonce", "clientPublicKey"]
+		}
+	},
+	"channels": ["nf.control.v2", "nf.realtime.v2", "nf.bulk.v2"],
+	"control": {
+		"hello": {
+			"type": "hello",
+			"nonce": "random hex",
+			"signature": "hello transcript signature",
+			"pairingSecret": "first pair only"
+		},
+		"hello.ready": {
+			"type": "hello.ready",
+			"version": 2,
+			"grantId": "opaque",
+			"discoveryCapability": "first-pair grant capability",
+			"expiresAt": "Unix seconds",
+			"backendIdentity": "RemoteBackendIdentity; required in narrafork mode, absent in explicit prototype mode"
+		},
+		"auth": { "type": "auth", "token": "opaque NF session; never persisted by Go" },
+		"ready": {
+			"type": "ready",
+			"version": 2,
+			"backendIdentity": "same verified identity as hello.ready; prototype alone uses apiVersion:1,appVersion:prototype-1"
+		},
+		"request.open": {
+			"type": "request.open",
+			"streamId": "uint32",
+			"method": "HTTP method",
+			"path": "relative /api/ path",
+			"headers": "[name,value][]",
+			"hasBody": "boolean"
+		},
+		"request.accept": {
+			"type": "request.accept",
+			"streamId": "uint32",
+			"profile": "request|sse; selected only by trusted NF policy"
+		},
+		"response.open": {
+			"type": "response.open",
+			"streamId": "uint32",
+			"status": "HTTP status",
+			"headers": "[name,value][]"
+		},
+		"window.update": {
+			"type": "window.update",
+			"streamId": "uint32",
+			"bytes": "positive consumed bytes"
+		},
+		"stream.cancel": { "type": "stream.cancel", "streamId": "uint32" },
+		"stream.error": { "type": "stream.error", "streamId": "uint32", "code": "bounded code" },
+		"socket.open": {
+			"type": "socket.open",
+			"streamId": "uint32",
+			"path": "/ws/narrator",
+			"token": "bound NF session"
+		},
+		"socket.ready": { "type": "socket.ready", "streamId": "uint32" },
+		"socket.window": {
+			"type": "socket.window",
+			"streamId": "uint32",
+			"bytes": "positive fragment bytes copied to reserved assembly"
+		},
+		"socket.close": {
+			"type": "socket.close",
+			"streamId": "uint32",
+			"code": "real websocket close code",
+			"reason": "UTF8 <=123 bytes"
+		},
+		"peer.error": { "type": "peer.error", "code": "bounded code" }
+	},
+	"ordering": "All channels ordered/reliable. HTTP request.accept precedes request body. Response frames can precede response.open across channels. hasBody:false is implicit EOF. Socket frames and socket lifecycle controls share realtime ordering. No silent drop, automatic write replay, HTTP fallback or TURN.",
+	"budgets": {
+		"loginMs": 600000,
+		"requestMs": 30000,
+		"responseHeaderMs": 30000,
+		"sseIdleMs": 60000,
+		"stallMs": 30000,
+		"sseLifetimeMs": 7200000
+	},
+	"ipc": {
+		"version": 2,
+		"schema": "ipc.ts",
+		"envelope": ["ipcVersion", "epoch", "requestId", "type", "payload"],
+		"init": "payload.config; no argv secrets",
+		"ready": "identity only; no implicit production invitation",
+		"peer.open": "after durable grant, before login; peer.accept supplies contextId/contextCapability and matching backendIdentity"
+	},
+	"bridge": {
+		"processHeader": "X-NarraFork-Bridge",
+		"epochHeader": "X-NarraFork-Remote-Epoch",
+		"contextHeader": "X-NarraFork-Remote-Context",
+		"capabilityHeader": "X-NarraFork-Remote-Capability",
+		"auth": "POST /_nf/remote/session/introspect {token} -> RemoteSessionProjection; read-only; no public /me in production",
+		"socket": "/ws/narrator?token=opaque-session; private headers inserted by Go",
+		"headers": "bounded real headers, no cookies, proxy/forwarded headers, browser Host/Origin, bridge secrets or redirects"
+	}
+}

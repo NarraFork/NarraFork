@@ -97,6 +97,29 @@ describe("configured streamed object budgets", () => {
 		});
 });
 describe("WebDAV config and namespace fencing", () => {
+	test("remote-peer has an exact namespace without admitting arbitrary kind or path segments", async () => {
+		const fixture = createWebDavFixture();
+		const client = new WebDavClient(config, { fetchImpl: fixture.fetchImpl });
+		const peerObjects = objects.replace("/main/", "/remote-peer/");
+		const peerDay = day.replace("/main/", "/remote-peer/");
+		await client.ensureCollection(peerObjects, signal());
+		await client.ensureCollection(peerDay, signal());
+		const bytes = new TextEncoder().encode("canonical peer fixture");
+		expect(await client.put(`${peerObjects}/${hash}`, bytes, digest(bytes), signal())).toBe(
+			"created",
+		);
+		expect(await client.getBytes(`${peerObjects}/${hash}`, 100, signal())).toEqual(bytes);
+		const calls = fixture.requests.length;
+		for (const path of [
+			peerDay.replace("/remote-peer/", "/arbitrary/"),
+			peerDay.replace("/remote-peer/", "/remote-peer-other/"),
+			peerDay.replace("/remote-peer/", "/remote-peer%2fmain/"),
+			`${peerDay}/../${hash}.json`,
+			`${peerObjects}/../${hash}`,
+		])
+			await expect(client.getBytes(path, 100, signal())).rejects.toBeInstanceOf(WebDavError);
+		expect(fixture.requests).toHaveLength(calls);
+	});
 	test("validates HTTPS, isolated feed and exact mutually-exclusive credential shape", () => {
 		expect(validateWebDavConfig({ ...config, url: config.url.slice(0, -1) }).url).toBe(config.url);
 		expect(

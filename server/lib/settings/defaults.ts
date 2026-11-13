@@ -42,8 +42,9 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	outline: {
 		enabled: false,
-		// Owner decision pending: "manual" until imports are switched on for everyone ("auto").
-		specImport: "manual",
+		// Owner decision 2026-11-12: "auto" once the import state, the model's notice, the admin
+		// tools and the read-only line on the old files exist (outline P2 PR 12b2).
+		specImport: "auto",
 	},
 	requestEvidence: {
 		ringEnabled: true,
@@ -148,6 +149,13 @@ export const DEFAULTS: NarraForkSettings = {
 		jwtSecret: "",
 		registrationOpen: true,
 		trustedProxyCidrs: ["127.0.0.0/8", "::1/128"],
+		// Only the two fields that mean anything before the admin fills the rest in.
+		// Every other LDAP field stays optional so a fresh install carries no
+		// half-configured directory.
+		ldap: {
+			enabled: false,
+			url: "",
+		},
 	},
 	oauth: {
 		externalWebSocket: {
@@ -200,6 +208,16 @@ export const DEFAULTS: NarraForkSettings = {
 		maxOutputChars: 24_000,
 	},
 	update: { ...DEFAULT_UPDATE_SETTINGS },
+	remoteAccess: {
+		enabled: false,
+		signalUrl: "",
+		stunUrls: [],
+		iceIPAllowlist: [],
+		iceInterfaceAllowlist: [],
+		iceNetworkTypes: ["udp4", "udp6"],
+		allowLocalhost: false,
+		leaseSeconds: 300,
+	},
 	vnet: {
 		enabled: true,
 		allowAnonymousRelay: false,
@@ -412,9 +430,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "true / false，默认 false",
 	},
 	"outline.specImport": {
-		desc: "大纲开关打开后，还在用 Dynamic Spec（spec://）记任务的旧会话怎样导入大纲。导入把会话当前的 spec 文件、任务和行为边界写进会话的大纲空间，逐条核对后把会话改成用大纲记任务；Dynamic Spec 的数据保留不删。manual：只在 Spec 面板点「现在导入」时导入；auto：另外在会话下一次开始运行前（小会话）和后台在会话空闲时导入；off：不导入。",
+		desc: "大纲开关打开后，还在用 Dynamic Spec（spec://）记任务的旧会话怎样导入大纲。导入把会话当前的 spec 文件、任务和行为边界写进会话的大纲空间，逐条核对后把会话改成用大纲记任务；Dynamic Spec 的数据保留不删。auto（默认）：在会话下一次开始运行前（小会话）和后台在会话空闲时导入，也可以在 Spec 面板点「现在导入」；manual：只在 Spec 面板点「现在导入」（或管理员在设置页「大纲导入」重导）时导入；off：不导入。导入的状态、需要处理的会话、按会话重导和退回见设置页「大纲导入」。",
 		type: "string",
-		valid: "auto / manual / off，默认 manual",
+		valid: "auto / manual / off，默认 auto",
 	},
 
 	// ── plugins ─────────────────────────────────────────────────────────
@@ -439,6 +457,20 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 
+	"remoteAccess.enabled": {
+		desc: "启用已安装并验证的远程访问组件；默认关闭，不自动下载。",
+		type: "boolean",
+	},
+	"remoteAccess.signalUrl": { desc: "显式配置的 WSS 信令协调服务地址。", type: "string" },
+	"remoteAccess.stunUrls": { desc: "STUN 地址列表；不支持 TURN 或业务中继。", type: "string[]" },
+	"remoteAccess.iceIPAllowlist": { desc: "限制 ICE 绑定的本机 IP 列表。", type: "string[]" },
+	"remoteAccess.iceInterfaceAllowlist": { desc: "限制 ICE 绑定的网络接口。", type: "string[]" },
+	"remoteAccess.iceNetworkTypes": { desc: "允许的 UDP 网络类型 udp4/udp6。", type: "string[]" },
+	"remoteAccess.allowLocalhost": {
+		desc: "仅用于显式本机测试的 loopback ICE 与 ws 信令选项。",
+		type: "boolean",
+	},
+	"remoteAccess.leaseSeconds": { desc: "信令发现租约秒数（60–3600）。", type: "number" },
 	// ── vnet ────────────────────────────────────────────────────────────
 	"vnet.enabled": {
 		desc: "启用应用层虚拟网络 relay。用于 Bun 应用间通过虚拟地址通信。",
@@ -860,6 +892,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"auth.trustedProxyCidrs": {
 		desc: "认证限流可信任的反向代理 IP/CIDR。仅这些代理提供的 X-Forwarded-For 或 X-Real-IP 会用于识别客户端；默认只信任本机回环代理。",
 		type: "string[]",
+	},
+	"auth.ldap.enabled": {
+		desc: "是否启用 LDAP / Active Directory 目录认证。开启后，本地密码校验失败的登录会回退到目录校验；本地账户仍是授权主体（角色、会话、第二因素不变）。",
+		type: "boolean",
+	},
+	"auth.ldap.url": {
+		desc: "LDAP 服务器地址，形如 ldaps://dc1.corp.example.com:636 或 ldap://dc1.corp.example.com:389。地址中不要包含凭据或基准 DN。",
+		type: "string",
 	},
 
 	// ── oauth.externalWebSocket ─────────────────────────────────────────

@@ -362,7 +362,14 @@ export async function setOutlinePluginRules(args: {
 export async function writeImportedFenceSop(
 	session: PluginTaskSession,
 	sop: string,
-	options: { store?: OutlineStore } = {},
+	options: {
+		store?: OutlineStore;
+		/**
+		 * Replace a block the plugin holds already (the import after a move back to Dynamic Spec,
+		 * outline P2 PR 12b2: the fence's SOP is newer then). Unchanged rules write nothing.
+		 */
+		replace?: boolean;
+	} = {},
 ): Promise<boolean> {
 	const store = options.store ?? outlineStore;
 	if (!sop.trim()) return false;
@@ -370,7 +377,8 @@ export async function writeImportedFenceSop(
 		const space = await store.findSpace({ kind: "session", narratorId: session.narratorId });
 		const sid = pluginRulesSid(TEAM_SOP_PLUGIN_ID);
 		const [held] = space ? await store.getBlockMetas(space.id, { sids: [sid] }) : [];
-		if (held) return false;
+		// A block someone deleted stays deleted.
+		if (held && (options.replace !== true || held.deleted)) return false;
 		// Whole, as `moveOutlineFenceSop` writes it: the session's first run as an outline session
 		// drops the SOP from the fence once this block holds it, so nothing may be cut here (the
 		// old command's limit is for what a plugin writes from now on).

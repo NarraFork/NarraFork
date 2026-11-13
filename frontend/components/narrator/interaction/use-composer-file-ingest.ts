@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import {
 	MAX_MEDIA_ATTACHMENTS,
@@ -333,7 +334,10 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 					: kind === "image"
 						? MAX_IMAGE_SIZE
 						: MAX_TEXT_FILE_SIZE;
-			if (file.size > max || (kind === "media" && !file.size)) {
+			if (
+				file.size > (REMOTE_BUILD ? Math.min(max, 7 * 1024 * 1024) : max) ||
+				(kind === "media" && !file.size)
+			) {
 				notifications.show({
 					title: optionsRef.current.t(
 						kind === "media"

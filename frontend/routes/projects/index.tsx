@@ -1,8 +1,7 @@
 import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
-import { statusRegistry } from "@frontend/lib/status-registry";
+import { ProjectSummaryCard } from "@frontend/components/project/ProjectSummaryCard";
 import {
 	Alert,
-	Badge,
 	Button,
 	Card,
 	Code,
@@ -20,7 +19,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertCircle } from "@tabler/icons-react";
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { lazy, Suspense, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
@@ -231,30 +230,7 @@ function ProjectListPage() {
 							<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
 								{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 								{displayedProjects.map((project: any) => (
-									<Card
-										key={project.id}
-										shadow="sm"
-										padding="lg"
-										radius="md"
-										withBorder
-										component={Link}
-										to="/projects/$projectId"
-										// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-										params={{ projectId: project.id } as any}
-										style={{ textDecoration: "none" }}
-									>
-										<Group justify="space-between" mb="xs">
-											<Text fw={500}>{project.name}</Text>
-											<Badge color={statusRegistry.projectStatus(project.status).color}>
-												{tc(statusRegistry.projectStatus(project.status).i18nKey)}
-											</Badge>
-										</Group>
-										{project.description && (
-											<Text size="sm" c="dimmed" lineClamp={2}>
-												{project.description}
-											</Text>
-										)}
-									</Card>
+									<ProjectSummaryCard key={project.id} project={project} />
 								))}
 							</SimpleGrid>
 							{hiddenProjectCount > 0 && (

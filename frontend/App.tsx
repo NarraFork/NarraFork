@@ -28,9 +28,7 @@
  * behaviour — with no error message, because the app still works. `app-hmr-boundary.test.ts`
  * asserts both halves of this invariant.
  */
-import { AppNotifications } from "@frontend/components/AppNotifications";
-import { ConfirmDialogProvider } from "@frontend/components/common/ConfirmDialogProvider";
-import { ImageViewerProvider } from "@frontend/components/common/ImageViewerProvider";
+import { CoreProviders } from "@frontend/components/CoreProviders";
 import type {
 	PluginDockPanelParams,
 	PluginUiContext,
@@ -54,15 +52,7 @@ import { useBranding } from "@frontend/hooks/useBranding";
 import { useGitBadgeRefresh } from "@frontend/hooks/useGit";
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
-import {
-	Center,
-	Loader,
-	MantineProvider,
-	useComputedColorScheme,
-	v8CssVariablesResolver,
-} from "@mantine/core";
-import { DatesProvider } from "@mantine/dates";
-import { QueryClientProvider } from "@tanstack/react-query";
+import { Center, Loader, useComputedColorScheme } from "@mantine/core";
 import { createRouter, type RouterHistory, RouterProvider } from "@tanstack/react-router";
 import React from "react";
 import {
@@ -72,7 +62,6 @@ import {
 import { isPublicNarratorSharePath } from "./lib/app-path-classify";
 import { getRouterBasepath } from "./lib/base-path";
 import i18n from "./lib/i18n";
-import { mantineTheme } from "./lib/mantine-theme";
 import { queryClient } from "./lib/query-client";
 import { routeTree } from "./routeTree.gen";
 
@@ -317,28 +306,15 @@ export function App({ history }: { history: RouterHistory }) {
 	);
 
 	return (
-		<MantineProvider
-			theme={mantineTheme}
-			defaultColorScheme="auto"
-			cssVariablesResolver={v8CssVariablesResolver}
-		>
-			<DatesProvider settings={{ firstDayOfWeek: 1 }}>
-				<ConfirmDialogProvider>
-					<ImageViewerProvider>
-						{!isPublicShare && <AppNotifications />}
-						<QueryClientProvider client={queryClient}>
-							{isPublicShare ? (
-								routeContent
-							) : (
-								<>
-									<PluginThemeInjector />
-									<PluginRuntimeShell>{routeContent}</PluginRuntimeShell>
-								</>
-							)}
-						</QueryClientProvider>
-					</ImageViewerProvider>
-				</ConfirmDialogProvider>
-			</DatesProvider>
-		</MantineProvider>
+		<CoreProviders notifications={!isPublicShare}>
+			{isPublicShare ? (
+				routeContent
+			) : (
+				<>
+					<PluginThemeInjector />
+					<PluginRuntimeShell>{routeContent}</PluginRuntimeShell>
+				</>
+			)}
+		</CoreProviders>
 	);
 }

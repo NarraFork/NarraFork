@@ -250,7 +250,7 @@ function modulesReachableFromEntry(): string[] {
 }
 
 /**
- * Component modules `App.tsx` mounts DIRECTLY.
+ * Component modules mounted by `App.tsx` or its shared `CoreProviders` boundary.
  *
  * These sit on the app shell's own propagation path: an invalid boundary in any of them
  * turns edits anywhere upstream into full page reloads. Each one listed here had exactly
@@ -259,7 +259,17 @@ function modulesReachableFromEntry(): string[] {
  *
  * Paths are relative to `frontend/`.
  */
+const CORE_PROVIDER_COMPONENT_MODULES = new Set([
+	"components/AppNotifications.tsx",
+	"components/common/ConfirmDialogProvider.tsx",
+	"components/common/ImageViewerProvider.tsx",
+]);
+const CORE_PROVIDERS_TSX = readFileSync(
+	join(FRONTEND_ROOT, "components/CoreProviders.tsx"),
+	"utf8",
+);
 const APP_SHELL_COMPONENT_MODULES = [
+	"components/CoreProviders.tsx",
 	"components/AppNotifications.tsx",
 	"components/common/ConfirmDialogProvider.tsx",
 	"components/common/ImageViewerProvider.tsx",
@@ -284,8 +294,9 @@ describe("app-shell component modules are valid Fast Refresh boundaries", () => 
 			// components are handed to `createRouter` as plain option values
 			// (`defaultErrorComponent: RouteChunkErrorBoundary`) — still mounted by the shell,
 			// just not through a tag.
+			const owner = CORE_PROVIDER_COMPONENT_MODULES.has(modulePath) ? CORE_PROVIDERS_TSX : APP_TSX;
 			const used = components.some(
-				(name) => APP_TSX.includes(`<${name}`) || APP_TSX.includes(`: ${name},`),
+				(name) => owner.includes(`<${name}`) || owner.includes(`: ${name},`),
 			);
 			expect(
 				used,

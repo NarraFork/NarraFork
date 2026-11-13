@@ -14,9 +14,16 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; each case makes its own project.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { eq, inArray, or } from "drizzle-orm";
 import { db } from "../../../db";
-import { narrators, projects, userPreferences, users } from "../../../db/schema";
+import {
+	narrators,
+	outlineSpaces,
+	outlineTaskClaims,
+	projects,
+	userPreferences,
+	users,
+} from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import { logger } from "../../../lib/logger";
 import { settings } from "../../../lib/settings";
@@ -31,9 +38,10 @@ import {
 	OUTLINE_HANDOFF_LIMITS,
 } from "../handoff";
 import {
-	keepOutlineTaskLeases,
 	outlineLeaseKeepersOf,
+	outlineRunEndsSettled,
 	resetOutlinePersonRunEndsForTests,
+	keepOutlineTaskLeases as startLeaseKeeper,
 } from "../lease-keeper";
 import {
 	OUTLINE_TASK_GRACE_LEASE_MS,
@@ -54,6 +62,7 @@ import { sqliteOutlineStore as store } from "../store/sqlite-store";
 import {
 	expireOutlineTaskLeases,
 	OUTLINE_LEASE_ACTOR,
+	OUTLINE_TASK_LIMITS,
 	resetOutlineLeaseExpiryBackoffForTests,
 } from "../tasks";
 import { type OutlineOp, writeOutline } from "../write";
@@ -61,15 +70,60 @@ import { type OutlineOp, writeOutline } from "../write";
 const NOW = "2026-11-11T08:12:00.000Z";
 const at = (ms: number) => new Date(Date.parse(NOW) + ms);
 const enabled = settings.outline.enabled;
+const ownedPeople = new Set<string>();
+const ownedProjects = new Set<string>();
+const ownedSessions: string[] = [];
+const ownedKeepers = new Set<ReturnType<typeof startLeaseKeeper>>();
+
+function keepOutlineTaskLeases(...args: Parameters<typeof startLeaseKeeper>) {
+	const keeper = startLeaseKeeper(...args);
+	ownedKeepers.add(keeper);
+	return keeper;
+}
 
 beforeEach(() => {
+	expect(ownedPeople.size + ownedProjects.size + ownedSessions.length + ownedKeepers.size).toBe(0);
 	settings.outline.enabled = true;
 	// What a fresh process knows: nobody's hour, nobody's last run.
 	resetOutlineGraceLeasesForTests();
 	resetOutlinePersonRunEndsForTests();
+	resetOutlineLeaseExpiryBackoffForTests();
 });
-afterEach(() => {
-	settings.outline.enabled = enabled;
+afterEach(async () => {
+	try {
+		const stopped = await Promise.allSettled([...ownedKeepers].map((keeper) => keeper.stop()));
+		await Promise.all(ownedSessions.map((id) => outlineRunEndsSettled(id)));
+		for (const id of ownedSessions) expect(outlineLeaseKeepersOf(id)).toBe(0);
+		// Projects/users retain their spaces on deletion, and claim holders have no FK.
+		// Purge only this case's spaces first: their blocks and claims cascade together.
+		const ownedSpace = or(
+			inArray(outlineSpaces.projectId, [...ownedProjects]),
+			inArray(outlineSpaces.narratorId, ownedSessions),
+			inArray(outlineSpaces.ownerUserId, [...ownedPeople]),
+		);
+		if (ownedSpace && (ownedProjects.size || ownedSessions.length || ownedPeople.size))
+			await db.delete(outlineSpaces).where(ownedSpace);
+		if (ownedSessions.length) {
+			expect(
+				await db
+					.select({ id: outlineTaskClaims.taskBlockId })
+					.from(outlineTaskClaims)
+					.where(inArray(outlineTaskClaims.holderNarratorId, ownedSessions)),
+			).toEqual([]);
+			for (const id of [...ownedSessions].reverse())
+				await db.delete(narrators).where(eq(narrators.id, id));
+		}
+		if (ownedProjects.size)
+			await db.delete(projects).where(inArray(projects.id, [...ownedProjects]));
+		if (ownedPeople.size) await db.delete(users).where(inArray(users.id, [...ownedPeople]));
+		ownedKeepers.clear();
+		ownedSessions.length = 0;
+		ownedProjects.clear();
+		ownedPeople.clear();
+		expect(stopped.filter((result) => result.status === "rejected")).toEqual([]);
+	} finally {
+		settings.outline.enabled = enabled;
+	}
 });
 
 async function person(language?: string): Promise<string> {
@@ -81,6 +135,7 @@ async function person(language?: string): Promise<string> {
 		role: "user",
 		createdAt: NOW,
 	});
+	ownedPeople.add(id);
 	if (language)
 		await db
 			.insert(userPreferences)
@@ -99,6 +154,7 @@ async function project(owner: string, gitPath = "/srv/project") {
 		createdAt: NOW,
 		updatedAt: NOW,
 	});
+	ownedProjects.add(id);
 	return { id, space: await ensureProjectSpace(id) };
 }
 
@@ -120,6 +176,7 @@ async function session(
 		updatedAt: NOW,
 		...extra,
 	});
+	ownedSessions.push(id);
 	return id;
 }
 
@@ -1048,6 +1105,11 @@ describe("cost and where it does not apply", () => {
 			const result = await settle(s, true);
 			// A hundred decided, each its own tree: only the trees looked into can be given back.
 			expect(result.released).toBe(OUTLINE_RELEASE_LIMITS.trees);
+			const kept = await store.listClaimedTasks(s, OUTLINE_RELEASE_LIMITS.claims);
+			expect(kept).toHaveLength(team.tasks.length - OUTLINE_RELEASE_LIMITS.trees);
+			expect(
+				kept.every(({ claim }) => claim.expiresAt === leaseEnd(OUTLINE_TASK_IDLE_LEASE_MS)),
+			).toBe(true);
 			expect(
 				info.mock.calls.filter(([message]) => String(message).includes("more claims than")),
 			).toHaveLength(1);
@@ -1114,12 +1176,16 @@ describe("cost and where it does not apply", () => {
 				holder: s,
 				expiresAt: leaseEnd(OUTLINE_TASK_IDLE_LEASE_MS),
 			});
+			const cutoff = at(60_000 + OUTLINE_TASK_IDLE_LEASE_MS).toISOString();
+			// The real job's default page contains this case's claim, not an arbitrary
+			// 100 of the expired claims earlier cases used to leave behind.
+			const candidates = await store.listExpiredTaskClaims(cutoff, OUTLINE_TASK_LIMITS.expiryBatch);
+			expect(candidates.map(({ claim }) => claim.taskBlockId)).toEqual([task]);
 			const done = await expireOutlineTaskLeases({
 				store,
 				now: at(60_000 + OUTLINE_TASK_IDLE_LEASE_MS),
 			});
-			// (With what earlier cases left on the idle lease.)
-			expect(done.reopened).toBeGreaterThanOrEqual(1);
+			expect(done).toEqual({ reopened: 1, skipped: 0, failed: 0 });
 			expect(await stateOf(task)).toMatchObject({ status: "todo", holder: null });
 		} finally {
 			bindNarratorMessageRefs(undefined);

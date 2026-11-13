@@ -17,7 +17,10 @@ import {
 	mirrorUploadConcurrency,
 	validateMirrorJobTimeoutMs,
 } from "../../shared/mirror-relay";
+import { isValidReleaseVersion } from "../../shared/release-version";
 import { EXECUTOR_MANIFEST_FILENAME } from "../../shared/remote-executor";
+import { REMOTE_PEER_MANIFEST_FILENAME } from "../../shared/remote-peer";
+import { parseRemotePeerReleaseManifest } from "../../shared/remote-peer-manifest";
 import { downloadReleaseAsset, hashReleaseFile, timeReleasePhase } from "./ci-release-io";
 import {
 	currentPublicRelease,
@@ -38,6 +41,7 @@ import {
 } from "./mirror-upload-pool";
 import { UpdateServerMirrorHttp } from "./update-server-bridge-http";
 import {
+	assertMirrorPublicationIdentity,
 	IndependentMirrorError,
 	type IndependentMirrorReceipt,
 	type MirrorPublishedOptions,
@@ -64,13 +68,23 @@ export async function mirrorPublishedToolsRelease(
 	let directory: string | undefined;
 	try {
 		const kind = options.kind;
-		if (kind !== "helpers" && kind !== "executor") throw new Error("Invalid auxiliary mirror kind");
-		if (!new RegExp(`^${kind}-v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?$`).test(options.tag))
+		if (kind !== "helpers" && kind !== "executor" && kind !== "remote-peer")
+			throw new Error("Invalid auxiliary mirror kind");
+		if (
+			!options.tag.startsWith(`${kind}-v`) ||
+			!isValidReleaseVersion(options.tag.slice(`${kind}-v`.length))
+		)
 			throw new Error("Exact public component tag required");
 		const run = mirrorGhRunner(options.run, signal);
 		const remote = await currentPublicRelease(run, options.repository, options.tag);
 		const commit = await publicTagCommit(run, options.repository, options.tag);
-		const name = kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME;
+		assertMirrorPublicationIdentity(options, remote, commit);
+		const name =
+			kind === "helpers"
+				? HELPER_MANIFEST_FILENAME
+				: kind === "executor"
+					? EXECUTOR_MANIFEST_FILENAME
+					: REMOTE_PEER_MANIFEST_FILENAME;
 		const manifestAsset = remote.assets.find((a) => a.name === name);
 		if (!manifestAsset || manifestAsset.size > 64 * 1024)
 			throw new Error("Missing/bounded public component manifest required");
@@ -92,14 +106,26 @@ export async function mirrorPublishedToolsRelease(
 		const manifest =
 			kind === "helpers"
 				? parseHelperManifest(raw, { repository: options.repository, commit, tag: options.tag })
-				: parseExecutorReleaseManifest(raw, {
-						repository: options.repository,
-						commit,
-						tag: options.tag,
-						version: options.tag.slice("executor-v".length),
-						protocolVersion: raw.manifest?.protocolVersion,
-					});
+				: kind === "executor"
+					? parseExecutorReleaseManifest(raw, {
+							repository: options.repository,
+							commit,
+							tag: options.tag,
+							version: options.tag.slice("executor-v".length),
+							protocolVersion: raw.manifest?.protocolVersion,
+						})
+					: parseRemotePeerReleaseManifest(raw, {
+							repository: options.repository,
+							commit,
+							tag: options.tag,
+							version: options.tag.slice("remote-peer-v".length),
+							protocolVersion: raw.manifest?.protocolVersion,
+						});
 		const version = options.tag.slice(`${kind}-v`.length);
+		if (kind === "remote-peer" && remote.prerelease !== version.includes("-"))
+			throw new Error("Public remote peer prerelease identity mismatch");
+		if (manifest.licenses.length + 1 > 16)
+			throw new Error("Auxiliary metadata count exceeds 16 files");
 		const binaries: MirrorAssetDescriptor[] = (
 			"files" in manifest
 				? manifest.files
@@ -131,6 +157,7 @@ export async function mirrorPublishedToolsRelease(
 			2 * [...assets, ...binaries].reduce((sum, a) => sum + a.size, 0) > budget
 		)
 			throw new Error("Auxiliary mirror total byte budget exceeded");
+		options.reserveAssets?.([...assets, ...binaries]);
 		if (options.dryRun) {
 			receipt.status = "DRY_RUN";
 			return receipt;
@@ -150,6 +177,7 @@ export async function mirrorPublishedToolsRelease(
 			const current = await currentPublicRelease(run, options.repository, options.tag);
 			if (
 				current.id !== remote.id ||
+				(kind === "remote-peer" && current.prerelease !== remote.prerelease) ||
 				JSON.stringify(current.assets) !== JSON.stringify(remote.assets)
 			)
 				throw new Error("Auxiliary public assets changed");

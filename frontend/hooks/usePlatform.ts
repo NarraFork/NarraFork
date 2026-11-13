@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
@@ -22,7 +23,8 @@ import { api } from "../lib/api";
  *
  * So the getters are gone and what they returned is stated directly. Hook names and
  * return shapes are unchanged, so call sites still read `.supported` / `.reason` and can
- * keep rendering their unsupported states — those branches are simply unreachable now.
+ * keep rendering unsupported states. Remote builds now have a real, compile-time signal:
+ * unbridged resource capabilities fail closed without depending on cached settings or health.
  *
  * Adding a real capability means adding a real signal: have `/api/health` report the
  * specific thing, read it here, and gate on it. Do not reintroduce a blanket
@@ -123,6 +125,10 @@ export interface ContainerBrowserToolAutoEnableCapability {
  * render it when a capability is unsupported.
  */
 const SUPPORTED: { supported: boolean; reason?: string } = Object.freeze({ supported: true });
+const LOCAL_ONLY = Object.freeze({
+	supported: !REMOTE_BUILD,
+	...(REMOTE_BUILD ? { reason: "This feature is unavailable in remote access." } : {}),
+});
 
 function useHealthQuery() {
 	return useQuery({
@@ -174,11 +180,11 @@ const FILE_SYSTEM_CAPABILITY: {
 	preview: FileSystemFeatureCapability;
 	reveal: FileSystemFeatureCapability;
 } = Object.freeze({
-	browse: SUPPORTED,
-	shortcuts: SUPPORTED,
-	mkdir: SUPPORTED,
-	preview: SUPPORTED,
-	reveal: SUPPORTED,
+	browse: LOCAL_ONLY,
+	shortcuts: LOCAL_ONLY,
+	mkdir: LOCAL_ONLY,
+	preview: LOCAL_ONLY,
+	reveal: LOCAL_ONLY,
 });
 
 export function useFileSystemCapability(): typeof FILE_SYSTEM_CAPABILITY {
@@ -209,7 +215,7 @@ const TERMINAL_CAPABILITY: {
 } = Object.freeze({ supported: true });
 
 export function useTerminalCapability(): typeof TERMINAL_CAPABILITY {
-	return TERMINAL_CAPABILITY;
+	return REMOTE_BUILD ? LOCAL_ONLY : TERMINAL_CAPABILITY;
 }
 
 // === update ===
@@ -282,6 +288,7 @@ const CONTAINERS_SUPPORTED: ContainersCapability = Object.freeze({ supported: tr
 export function useContainersCapability(): ContainersCapability {
 	const { data } = useHealthQuery();
 	const environment = data?.runtimeEnvironment;
+	if (REMOTE_BUILD) return LOCAL_ONLY;
 	if (environment && !environment.containerSupport) {
 		return {
 			supported: false,
@@ -311,7 +318,7 @@ const NARRATOR_BROWSER_SESSIONS_CAPABILITY: {
 } = Object.freeze({ supported: true });
 
 export function useNarratorBrowserSessionsCapability(): typeof NARRATOR_BROWSER_SESSIONS_CAPABILITY {
-	return NARRATOR_BROWSER_SESSIONS_CAPABILITY;
+	return REMOTE_BUILD ? LOCAL_ONLY : NARRATOR_BROWSER_SESSIONS_CAPABILITY;
 }
 
 /**
@@ -688,7 +695,16 @@ const SHARE_CAPABILITY: {
 });
 
 export function useShareCapability(): typeof SHARE_CAPABILITY {
-	return SHARE_CAPABILITY;
+	return REMOTE_BUILD
+		? {
+				...SHARE_CAPABILITY,
+				createSupported: false,
+				publicDownloadSupported: false,
+				previewSupported: false,
+				ephemeralOnlySupported: false,
+				previewReason: LOCAL_ONLY.reason,
+			}
+		: SHARE_CAPABILITY;
 }
 
 // === providers ===
@@ -719,14 +735,14 @@ export function useProviderModelRefreshCapability(_provider: ProviderCapabilityK
 	supported: boolean;
 	reason?: string;
 } {
-	return SUPPORTED;
+	return LOCAL_ONLY;
 }
 
 export function useProviderQuotaCapability(_provider: ProviderCapabilityKey): {
 	supported: boolean;
 	reason?: string;
 } {
-	return SUPPORTED;
+	return LOCAL_ONLY;
 }
 
 export function useProviderAgentModeCapability(_provider: ProviderCapabilityKey): {

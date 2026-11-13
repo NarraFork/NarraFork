@@ -9,24 +9,30 @@
  */
 
 import type { GitIdentity } from "@frontend/lib/api/auth";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
+import {
+	folderGitIdentityQueryKey,
+	GIT_IDENTITIES_QUERY_KEY,
+	invalidateNarratorGitIdentities,
+	narratorGitIdentityQueryKey,
+} from "./git-identity-query-keys";
+
+export { folderGitIdentityQueryKey, narratorGitIdentityQueryKey };
 
 export interface NarratorGitIdentityState {
 	/** The caller's own identities, in the order the settings page shows them. */
 	identities: GitIdentity[];
 	/** The identity the caller picked for this narrator, or null when they made no pick. */
 	selectedId: string | null;
+	/** The pick of the sidebar folder this narrator sits in, which applies when it has none. */
+	folderSelectedId?: string | null;
 }
 
-const IDENTITIES_KEY = ["auth", "git-identities"] as const;
-
-/** Query key for one caller's pick on one narrator. Shared by the details panel and create flow. */
-export function narratorGitIdentityQueryKey(narratorId: string) {
-	return [...IDENTITIES_KEY, "narrator", narratorId] as const;
-}
+const IDENTITIES_KEY = GIT_IDENTITIES_QUERY_KEY;
 
 /** Every identity write reports the same way: a toast naming what the server refused. */
 function useIdentityWriteFailure(): (error: unknown) => void {
@@ -46,7 +52,7 @@ export function useGitIdentities(enabled = true) {
 		queryKey: IDENTITIES_KEY,
 		queryFn: () => api.listGitIdentities(),
 		staleTime: 30_000,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 	});
 }
 
@@ -55,7 +61,7 @@ export function useNarratorGitIdentity(narratorId: string | null) {
 	return useQuery({
 		queryKey: narratorGitIdentityQueryKey(narratorId ?? ""),
 		queryFn: () => api.getNarratorGitIdentity(narratorId as string),
-		enabled: !!narratorId,
+		enabled: !REMOTE_BUILD && !!narratorId,
 		staleTime: 30_000,
 	});
 }
@@ -109,17 +115,12 @@ export function useSetNarratorGitIdentity(narratorId: string) {
 	});
 }
 
-/** Query key for one caller's pick on one sidebar folder. */
-export function folderGitIdentityQueryKey(folderId: string) {
-	return [...IDENTITIES_KEY, "folder", folderId] as const;
-}
-
 /** The caller's pick for one sidebar folder, together with the identities to choose from. */
 export function useFolderGitIdentity(folderId: string | null) {
 	return useQuery({
 		queryKey: folderGitIdentityQueryKey(folderId ?? ""),
 		queryFn: () => api.getFolderGitIdentity(folderId as string),
-		enabled: !!folderId,
+		enabled: !REMOTE_BUILD && !!folderId,
 		staleTime: 30_000,
 	});
 }
@@ -133,7 +134,12 @@ export function useSetFolderGitIdentity(folderId: string) {
 	const onError = useIdentityWriteFailure();
 	return useMutation({
 		mutationFn: (identityId: string | null) => api.setFolderGitIdentity(folderId, identityId),
-		onSuccess: () => qc.invalidateQueries({ queryKey: folderGitIdentityQueryKey(folderId) }),
+		onSuccess: () =>
+			Promise.all([
+				qc.invalidateQueries({ queryKey: folderGitIdentityQueryKey(folderId) }),
+				// Sessions in this folder that follow it now follow a different identity.
+				invalidateNarratorGitIdentities(qc),
+			]),
 		onError,
 	});
 }

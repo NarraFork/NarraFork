@@ -3920,6 +3920,42 @@ export const outlineDigests = pgTable(
 	],
 );
 
+export const outlineSpecImports = pgTable(
+	"outline_spec_imports",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		status: text("status").notNull(),
+		trigger: text("trigger"),
+		attempts: integer("attempts").notNull().default(0),
+		lastErrorCode: text("last_error_code"),
+		lastErrorCount: integer("last_error_count"),
+		lastErrorDetail: text("last_error_detail"),
+		attentionReason: text("attention_reason"),
+		switchCount: integer("switch_count").notNull().default(0),
+		switchedAt: text("switched_at"),
+		noticeSwitch: integer("notice_switch").notNull().default(0),
+		spaceId: text("space_id"),
+		taskPageId: text("task_page_id"),
+		fenceRevisionId: text("fence_revision_id"),
+		tasks: integer("tasks"),
+		pages: integer("pages"),
+		revertCount: integer("revert_count").notNull().default(0),
+		revertedAt: text("reverted_at"),
+		revertedBy: text("reverted_by"),
+		revertSourceKey: text("revert_source_key"),
+		revertNoteIds: text("revert_note_ids"),
+		lastActor: text("last_actor"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_outline_spec_imports_status").on(table.status, table.updatedAt, table.narratorId),
+	],
+);
+
 export const scheduledTasks = pgTable(
 	"scheduled_tasks",
 	{
@@ -4377,8 +4413,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 141,
-  "columnCount": 1866,
+  "tableCount": 142,
+  "columnCount": 1890,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -26800,6 +26836,259 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "\"seen_at\" IS NULL"
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineSpecImports",
+      "name": "outline_spec_imports",
+      "columns": [
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_spec_imports_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "trigger",
+          "name": "trigger",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attempts",
+          "name": "attempts",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "lastErrorCode",
+          "name": "last_error_code",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastErrorCount",
+          "name": "last_error_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastErrorDetail",
+          "name": "last_error_detail",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attentionReason",
+          "name": "attention_reason",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "switchCount",
+          "name": "switch_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "switchedAt",
+          "name": "switched_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "noticeSwitch",
+          "name": "notice_switch",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "taskPageId",
+          "name": "task_page_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "fenceRevisionId",
+          "name": "fence_revision_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "tasks",
+          "name": "tasks",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "pages",
+          "name": "pages",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revertCount",
+          "name": "revert_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "revertedAt",
+          "name": "reverted_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revertedBy",
+          "name": "reverted_by",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revertSourceKey",
+          "name": "revert_source_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revertNoteIds",
+          "name": "revert_note_ids",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastActor",
+          "name": "last_actor",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_spec_imports_status",
+          "columns": [
+            "status",
+            "updatedAt",
+            "narratorId"
+          ],
+          "unique": false
         }
       ],
       "checks": [],

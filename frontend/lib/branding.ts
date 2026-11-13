@@ -21,6 +21,8 @@ import {
 	type ResolvedBranding,
 	resolveBranding,
 } from "@shared/branding";
+import { assetUrl } from "./base-path";
+import { REMOTE_BUILD } from "./build-target";
 
 /** Keys are read verbatim by the inline script in index.html — keep them in sync. */
 export const BRAND_NAME_STORAGE_KEY = "narrafork_brand_name";
@@ -61,6 +63,7 @@ const listeners = new Set<BrandingListener>();
 let current: ResolvedBranding = readStoredBranding();
 
 function readStoredBranding(): ResolvedBranding {
+	if (REMOTE_BUILD) return resolveBranding(undefined);
 	try {
 		return resolveBranding({
 			name: localStorage.getItem(BRAND_NAME_STORAGE_KEY) ?? undefined,
@@ -95,11 +98,13 @@ function writeStoredBranding(branding: ResolvedBranding): void {
 
 /** URL for the tab favicon under the current branding. */
 export function brandFaviconUrl(branding: ResolvedBranding = current): string {
+	if (REMOTE_BUILD) return assetUrl(DEFAULT_FAVICON_URL);
 	return branding.iconColor === DEFAULT_BRAND_ICON_COLOR ? DEFAULT_FAVICON_URL : BRAND_FAVICON_URL;
 }
 
 /** URL for the notification icon under the current branding. */
 export function brandNotificationIconUrl(branding: ResolvedBranding = current): string {
+	if (REMOTE_BUILD) return assetUrl(DEFAULT_NOTIFICATION_ICON_URL);
 	return branding.iconColor === DEFAULT_BRAND_ICON_COLOR
 		? DEFAULT_NOTIFICATION_ICON_URL
 		: BRAND_NOTIFICATION_ICON_URL;
@@ -118,6 +123,7 @@ function setLinkHref(selector: string, href: string): void {
  * Idempotent, so it is safe to call on every query settle.
  */
 export function applyBranding(input: Partial<ResolvedBranding> | undefined): ResolvedBranding {
+	if (REMOTE_BUILD) return current;
 	const branding = resolveBranding(input);
 	// Unchanged means "do not replace the snapshot object and do not notify".
 	// `getCurrentBranding` backs a `useSyncExternalStore` snapshot, so handing back
