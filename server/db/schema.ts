@@ -6389,6 +6389,77 @@ export const outlineSpecImports = sqliteTable(
 	],
 );
 
+/**
+ * Content a save from the old Spec panel may have swallowed (outline P2 PR 12c;
+ * `server/services/outline/spec-import/loss-scan.ts`): one row per place, found by a read-only
+ * scan of a session's Dynamic Spec revisions and shown to an administrator and the session's
+ * owner. Nothing is repaired from it automatically; a person attaches it to the imported page or
+ * dismisses it.
+ *
+ *   - `id` follows from (session, path, the revision before the save), so a scan run again adds
+ *     nothing twice and never changes what a person decided.
+ *   - `before_revision_id` still held the content, `after_revision_id` is the person's save that
+ *     no longer does; plain text, no foreign keys: the row outlives the spec revisions.
+ *   - `kinds`: JSON, how many structures of each kind were lost (`{"table":2}`).
+ *   - `excerpt`: JSON, the lost source text (bounded; `truncated` when it was cut). Never read by
+ *     a list, only by one finding's detail.
+ *   - `status`: `open`, `attached` (a person put it on the imported page: `block_id`), `dismissed`.
+ */
+export const outlineSpecLossFindings = sqliteTable(
+	"outline_spec_loss_findings",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		path: text("path").notNull(),
+		beforeRevisionId: text("before_revision_id").notNull(),
+		afterRevisionId: text("after_revision_id").notNull(),
+		beforeAt: text("before_at"),
+		savedAt: text("saved_at"),
+		kinds: text("kinds").notNull(),
+		items: integer("items").notNull().default(0),
+		excerpt: text("excerpt").notNull(),
+		truncated: integer("truncated").notNull().default(0),
+		status: text("status", { enum: ["open", "attached", "dismissed"] })
+			.notNull()
+			.default("open"),
+		blockId: text("block_id"),
+		resolvedBy: text("resolved_by"),
+		resolvedAt: text("resolved_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		// The admin page: one status, newest first, and its bounded count.
+		index("idx_outline_spec_loss_findings_status").on(table.status, table.createdAt, table.id),
+		// The Spec panel: one session's findings of one status.
+		index("idx_outline_spec_loss_findings_narrator").on(
+			table.narratorId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
+	],
+);
+
+/**
+ * Which sessions the swallowed-content scan looked at (outline P2 PR 12c): one row per session,
+ * with the digest of the Dynamic Spec file pointers it read (`source_key`: an unchanged session is
+ * not scanned again), how many of a person's saves it compared, how many places it found, and
+ * `note` when it could not look at everything (`budget`, `files`, `findings`).
+ */
+export const outlineSpecLossScans = sqliteTable("outline_spec_loss_scans", {
+	narratorId: text("narrator_id")
+		.primaryKey()
+		.references(() => narrators.id, { onDelete: "cascade" }),
+	sourceKey: text("source_key").notNull(),
+	saves: integer("saves").notNull().default(0),
+	findings: integer("findings").notNull().default(0),
+	note: text("note"),
+	scannedAt: text("scanned_at").notNull(),
+});
+
 // === scheduled tasks ===
 // A scheduled task periodically starts a narrator with a preset prompt. The schedule is
 // always stored as a cron expression (the UI may generate it from friendly presets). At

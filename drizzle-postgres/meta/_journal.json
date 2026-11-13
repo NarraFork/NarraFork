@@ -505,6 +505,13 @@
 			"when": 1794473785466,
 			"tag": "0071_outline_spec_imports",
 			"breakpoints": true
+		},
+		{
+			"idx": 72,
+			"version": "7",
+			"when": 1794532549224,
+			"tag": "0072_outline_spec_loss",
+			"breakpoints": true
 		}
   ]
 }
