@@ -9,11 +9,24 @@ type ConnectedSettings = NarraForkSettings & {
 	tokendance: NonNullable<NarraForkSettings["tokendance"]>;
 };
 
+/** 连接记录现在存在平台实例自己的 config 上（`agent.platformInstances`）。 */
 function config(): ConnectedSettings {
 	return {
 		tokendance: { apiKey: "test-key", disabled: false, generation: 1 },
-		agent: { hiddenModels: ["other:keep-hidden"] },
-	} as ConnectedSettings;
+		agent: {
+			hiddenModels: ["other:keep-hidden"],
+			platformInstances: [
+				{
+					id: "platform-tokendance",
+					platform: "tokendance",
+					suffix: "",
+					prefix: "tokendance",
+					disabled: false,
+					config: { apiKey: "test-key", disabled: false, generation: 1 },
+				},
+			],
+		},
+	} as unknown as ConnectedSettings;
 }
 
 describe("TokenDance fixed collection snapshot", () => {
@@ -73,7 +86,9 @@ describe("TokenDance fixed collection snapshot", () => {
 	});
 	test("disconnected installations and legacy manual prefixes remain untouched", () => {
 		const settings = config();
-		settings.tokendance.apiKey = "";
+		// 连接记录在实例 config 上：没 apiKey 就是没连接。
+		const instance = settings.agent.platformInstances?.[0];
+		if (instance) instance.config = {};
 		settings.agent.hiddenModels?.push("tokendance:manual-model");
 		const before = structuredClone(settings);
 		expect(initializeTokenDanceModelCollection(settings)).toBe(false);

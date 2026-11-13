@@ -32,7 +32,7 @@ export interface ProviderCardProps {
 	onToggleDisabled: () => void;
 	onRefresh?: () => void;
 	onOpenConfig: () => void;
-	/** 删除按钮（草稿，保存后才落库）；平台/插件供应商不传。 */
+	/** 删除按钮（草稿，保存后才落库）；插件供应商等不支持删除的来源不传。 */
 	onDelete?: () => void;
 	isSelected?: boolean;
 }
@@ -61,6 +61,8 @@ export const ProviderCard = React.memo(function ProviderCard({
 
 	const isHighlighted = Boolean(isSelected || isHovered);
 	const hasMore = visibleCount > previewModels.length;
+	// 平台卡片删的是一条实例，其余删的是一个供应商：两处各有各的叫法。
+	const deleteLabel = type === "platform" ? t("platformInstanceDelete") : t("providerDelete");
 
 	return (
 		<Card
@@ -140,13 +142,13 @@ export const ProviderCard = React.memo(function ProviderCard({
 								aria-label={disabled ? t("overviewEnable") : t("overviewDisable")}
 							/>
 							{onDelete && (
-								<Tooltip label={t("providerDelete")}>
+								<Tooltip label={deleteLabel}>
 									<ActionIcon
 										size="sm"
 										color="red"
 										variant="subtle"
 										disabled={controlsDisabled}
-										aria-label={t("providerDelete")}
+										aria-label={deleteLabel}
 										onClick={(event) => {
 											event.stopPropagation();
 											onDelete();
