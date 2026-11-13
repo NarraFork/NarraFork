@@ -94,6 +94,7 @@ function keySlots(settings: NarraForkSettings): KeySlot[] {
 			owner: platformInstanceKeyOwner(instance.id),
 			pooled: false,
 			holder: instance.config,
+			field: "apiKey",
 			required: false,
 		});
 	}
