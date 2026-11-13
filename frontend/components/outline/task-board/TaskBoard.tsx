@@ -110,6 +110,7 @@ const HAND_OUT_REFUSALS = new Set([
 	"locked",
 	"held",
 	"changed",
+	"already_handed_out",
 	"original_not_updated",
 ]);
 
@@ -994,8 +995,8 @@ function TaskRow({
 											>
 												{t("board.action.assignUser")}
 											</Menu.Item>
-											{/* A session space's task goes to the team, or to another session, as a copy
-											    in the project (handed out, outline P2 PR 10c-3). */}
+											{/* A session space's task goes to the team as a copy in the project (handed
+											    out, outline P2 PR 10c-3): only its owner, who may write the project. */}
 											{sessionSpace && section?.handOut && (
 												<Menu.Item
 													leftSection={<IconUsersGroup size={14} />}
@@ -1005,15 +1006,15 @@ function TaskRow({
 													{t("board.action.handToTeam")}
 												</Menu.Item>
 											)}
-											{(!sessionSpace || section?.handOut) && (
-												<Menu.Item
-													leftSection={<IconArrowsExchange size={14} />}
-													onClick={() => setAssigning("session")}
-													data-testid="task-action-transfer"
-												>
-													{t("board.action.transferSession")}
-												</Menu.Item>
-											)}
+											{/* In place to a session that can work in the space; to others as a copy,
+											    which the server lists only for the owner. */}
+											<Menu.Item
+												leftSection={<IconArrowsExchange size={14} />}
+												onClick={() => setAssigning("session")}
+												data-testid="task-action-transfer"
+											>
+												{t("board.action.transferSession")}
+											</Menu.Item>
 											{task.assignee && (
 												<Menu.Item
 													leftSection={<IconArrowBackUp size={14} />}

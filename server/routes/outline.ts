@@ -1212,10 +1212,11 @@ outlineRoutes.post("/tasks/seen", bodyLimit({ maxSize: 16 * 1024 }), async (c) =
  * back to the session; with `start`, the session whose space holds it starts on it when idle,
  * which takes write access to that session (403 otherwise, before anything changes). Write
  * access to the task's space (404 when it cannot be read); 409 when the task changed since it
- * was read. A task of a session space given to anyone but the session and its owner, or to the
- * team, is handed out (outline P2 PR 10c-3): `handedOut` names the copy; refused (403/409,
- * `details.reason`) when the caller is not the session's owner, the session has no project, or
- * the project's space is not theirs to write.
+ * was read. A task of a session space given to the team, or by the session's owner to someone who
+ * cannot work in the session space, is handed out (outline P2 PR 10c-3, owner decision
+ * 2026-11-13): `handedOut` names the copy; refused (403/409, `details.reason`) when the caller is
+ * not the session's owner, the session has no project, the project's space is not theirs to
+ * write, or the task's open copy is someone else's. Anyone who can work there is assigned in place.
  */
 outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async (c) => {
 	const principal = principalOf(c);
@@ -1254,7 +1255,12 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 	let notStarted: OutlineBoardTaskUpdateResponse["notStarted"];
 	// A task handed out to a person or the team: nothing is started (the copy waits in the pool,
 	// or for its person; the original waits for the copy).
-	const startsHere = !handedOut || handedTo !== null;
+	// A copy handed to the session is started only when it is that session's (an existing copy
+	// is re-assigned to it, or refused).
+	const copyAssignee = handedOut
+		? ((await outlineStore.getBlock(handedOut.copy.id))?.taskJson?.assignee ?? null)
+		: null;
+	const startsHere = !handedOut || (handedTo !== null && copyAssignee === `agent:${handedTo.id}`);
 	if (startsHere && startable && (await resolveTaskBackend(startable.id)) === "outline") {
 		if (handedTo) {
 			// Decided before anything is claimed; a start that declines gives the claim back. A task

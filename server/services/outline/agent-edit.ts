@@ -1415,9 +1415,9 @@ export async function outlineEdit(
 				}
 			}
 
-			// A task of the session's own space given to someone other than the session and its
-			// owner is handed out (outline P2 PR 10c-3): the assignee leaves this write, and a copy
-			// goes to the project's task page after it, which the task then waits for.
+			// A task of the session's own space given to someone who cannot work in that space is
+			// handed out (outline P2 PR 10c-3, owner decision 2026-11-13): the assignee leaves this
+			// write, and a copy goes to the project's task page after it, which the task waits for.
 			const handOutPlan = await planAgentHandOuts({
 				space,
 				by: {
@@ -1427,6 +1427,13 @@ export async function outlineEdit(
 				},
 				ops,
 				assigneeBefore: (blockId) => current.get(blockId)?.taskJson?.assignee,
+				// The copy is this turn's write to the project's space: its scope decides (read-only
+				// and plan mode write their own session space only), and the session must read it.
+				checkWriter: async (projectSpace) => {
+					const refusal = await scope.writeRefusal(projectSpace);
+					if (refusal) return refusalText(refusal, "project/");
+					return (await scope.canRead(projectSpace)) ? null : refusalText("missing", "project/");
+				},
 				store: scope.store,
 			});
 			if ("refused" in handOutPlan) return { output: failed(handOutPlan.refused) };

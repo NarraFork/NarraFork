@@ -275,8 +275,9 @@ export interface OutlineBoardTaskUpdateResponse {
  * Why a task was not handed out (`details.reason`; `OUTLINE_HAND_OUT_*` codes): not a session
  * space's task; the caller is not the session's owner (or the session); no project; the project's
  * space is not writable; finished; in a plan not approved yet; in a tree a person locked (an
- * agent's hand-out); someone else is doing it; changed since read; or the copy was made but the
- * original could not be set to wait for it.
+ * agent's hand-out); someone else is doing it; changed since read; its open copy is someone else's
+ * (and not the caller's to re-assign); or the copy was made but the original could not be set to
+ * wait for it.
  */
 export type OutlineBoardHandOutRefusal =
 	| "not_session_task"
@@ -288,6 +289,7 @@ export type OutlineBoardHandOutRefusal =
 	| "locked"
 	| "held"
 	| "changed"
+	| "already_handed_out"
 	| "original_not_updated";
 
 /** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */

@@ -18,6 +18,7 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own world.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { db } from "../../../db";
 import { aclGrants, narrators, projects, users } from "../../../db/schema";
 import { outlineEditTool, outlineReadTool } from "../../../lib/agent/tools/outline";
@@ -119,9 +120,12 @@ async function world() {
 	const owner = await person("lead");
 	const projectId = await project(owner.id);
 	const main = await session(owner.id, projectId, { title: "Main" });
-	const other = await session(owner.id, projectId, { title: "Other" });
+	// A teammate's session: it may write the project, not the main session's (private) space.
+	const peer = await person("peer");
+	await grant(projectId, peer.id, "write");
+	const other = await session(peer.id, projectId, { title: "Other" });
 	const sessionSpace = await ensureSessionSpace(main);
-	return { owner, projectId, main, other, sessionSpace };
+	return { owner, peer, projectId, main, other, sessionSpace };
 }
 
 function asAgent(space: OutlineSpaceRow, narratorId: string, owner: string, ops: OutlineOp[]) {
@@ -280,9 +284,7 @@ describe("handing a task out to the team", () => {
 			],
 		});
 		expect(out.versionSeq).toBe(original?.versionSeq as number);
-		const note = await outlineStore.getBlock(
-			handOutBlockId("note", task.blockId, before?.versionSeq as number),
-		);
+		const note = await outlineStore.getBlock(handOutBlockId("note", out.copy.id, 0));
 		expect(note?.parentId).toBe(task.blockId);
 		expect(note?.content).toBe(
 			`Handed to the team: [[${out.copy.address}]] (this task waits for it)`,
@@ -346,6 +348,11 @@ describe("handing a task out to the team", () => {
 		expect(second.copy.id).not.toBe(a?.copy.id as string);
 		const copied = (await subtreeRows(second.copy.id)).map((r) => r.content);
 		expect(copied.some((text) => text.startsWith("Handed to the team"))).toBe(false);
+		// The first copy ended: it is not a prerequisite of the second.
+		const secondCopy = await outlineStore.getBlock(second.copy.id);
+		expect(secondCopy?.taskJson?.depends?.map((d) => d.target)).toEqual([
+			`${sessionSpace.key}/prepDone1`,
+		]);
 		expect(copied).toContain("The lexer is done; the grammar is next");
 	});
 
@@ -374,7 +381,7 @@ describe("handing a task out to the team", () => {
 		expect((error as OutlineHandOutError).reason).toBe("original_not_updated");
 		expect((error as OutlineHandOutError).statusCode).toBe(500);
 		const copyId = handOutBlockId("copy", task.blockId, version);
-		const failed = await outlineStore.getBlock(handOutBlockId("failed", task.blockId, version));
+		const failed = await outlineStore.getBlock(handOutBlockId("failed", copyId, 0));
 		expect(failed?.parentId).toBe(copyId);
 		expect(failed?.content).toContain(`[[${sessionSpace.key}/${task.sid}]]`);
 		// The original is as it was.
@@ -386,6 +393,8 @@ describe("handing a task out to the team", () => {
 			target: { kind: "team" },
 		});
 		expect(done.copy.id).toBe(copyId);
+		// The failure note went with the success.
+		expect((await outlineStore.getBlock(handOutBlockId("failed", copyId, 0)))?.deleted).toBe(true);
 		expect((await outlineStore.getBlock(task.blockId))?.taskJson?.depends).toEqual([
 			{ target: "prepDone1", label: null },
 			{ target: done.copy.address, label: null },
@@ -913,5 +922,425 @@ describe("team events and the digest", () => {
 		expect(created).toContainEqual({ kind: "human", id: owner.id });
 		expect(created).toContainEqual({ kind: "agent", id: main });
 		expect(summary.other).toEqual([]);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review round 1 (and the owner's decision of 2026-11-13: 「能写就原地指派」)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function agentCtx(narratorId: string, userId: string): ToolContext {
+	return {
+		narratorId,
+		cwd: "/",
+		signal: new AbortController().signal,
+		locale: "en",
+		userId,
+		requestPermission: async () => ({ behavior: "allow" }),
+	} as ToolContext;
+}
+const sidsOf = (output: string) =>
+	[...output.matchAll(/^\s*- \[([A-Za-z0-9/]+)\]/gm)].map((m) => m[1] as string);
+
+/** The hand-out copies on the project's task page. */
+async function copiesOn(projectId: string) {
+	const ps = await ensureProjectSpace(projectId);
+	const [page] = await outlineStore.findAliasOwners(ps.id, [OUTLINE_TASKS_PAGE_ALIAS]);
+	if (!page) return [];
+	return (await outlineStore.listChildMetas(ps.id, [page.id], 100)).filter(
+		(m) => isHandOutBlockId(m.id) && m.taskJson,
+	);
+}
+
+async function narratorGrant(narratorId: string, userId: string, capability: "read" | "write") {
+	await db.insert(aclGrants).values({
+		id: generateId(),
+		scopeType: "narrator",
+		scopeId: narratorId,
+		principalType: "user",
+		principalId: userId,
+		capability,
+		createdAt: NOW,
+	});
+}
+
+describe("in place when the target can work in the session's space (owner decision)", () => {
+	test("the board: a co-writer of the session, the co-writer's 「交给我」, a session of the same person", async () => {
+		const { owner, projectId, main, sessionSpace } = await world();
+		const cowriter = await person("cowriter");
+		await grant(projectId, cowriter.id, "write");
+		await narratorGrant(main, cowriter.id, "write");
+		const sibling = await session(owner.id, projectId, { title: "Sibling" });
+		const version = async (id: string) => (await outlineStore.getBlock(id))?.versionSeq as number;
+		const written = await asAgent(sessionSpace, main, owner.id, [
+			{ op: "insert", parent: null, content: "One", task: { status: "todo" } },
+			{ op: "insert", parent: null, content: "Two", task: { status: "todo" } },
+			{ op: "insert", parent: null, content: "Three", task: { status: "todo" } },
+		]);
+		const [one, two, three] = written.results.map((r) => r.blockId) as [string, string, string];
+		const asOwner = { userId: owner.id, isAdmin: false };
+		const byName = await changePersonTask({
+			principal: asOwner,
+			blockId: one,
+			baseVersionSeq: await version(one),
+			assign: { kind: "user", username: cowriter.username },
+		});
+		expect(byName.handedOut).toBeUndefined();
+		expect((await outlineStore.getBlock(one))?.taskJson?.assignee).toBe(
+			`human:${cowriter.username}`,
+		);
+		const me = await changePersonTask({
+			principal: { userId: cowriter.id, isAdmin: false },
+			blockId: two,
+			baseVersionSeq: await version(two),
+			assign: { kind: "me" },
+		});
+		expect(me.handedOut).toBeUndefined();
+		expect((await outlineStore.getBlock(two))?.taskJson?.assignee).toBe(
+			`human:${cowriter.username}`,
+		);
+		const toSibling = await changePersonTask({
+			principal: asOwner,
+			blockId: three,
+			baseVersionSeq: await version(three),
+			assign: { kind: "narrator", narratorId: sibling },
+		});
+		expect(toSibling.handedOut).toBeUndefined();
+		expect((await outlineStore.getBlock(three))?.taskJson?.assignee).toBe(`agent:${sibling}`);
+		expect(await copiesOn(projectId)).toHaveLength(0);
+
+		// Someone other than the owner giving it to someone who cannot work there: refused in
+		// place, as before (never a hand-out, never a 403 of the hand-out's).
+		const outsider = await person("outsider");
+		await grant(projectId, outsider.id, "write");
+		await expect(
+			changePersonTask({
+				principal: { userId: cowriter.id, isAdmin: false },
+				blockId: one,
+				baseVersionSeq: await version(one),
+				assign: { kind: "user", username: outsider.username },
+			}),
+		).rejects.toThrow(/can work on this task/);
+		// 「交给团队」 stays the owner's.
+		await expect(
+			changePersonTask({
+				principal: { userId: cowriter.id, isAdmin: false },
+				blockId: one,
+				baseVersionSeq: await version(one),
+				assign: { kind: "team" },
+			}),
+		).rejects.toThrow(/Only the session's owner/);
+		expect(await copiesOn(projectId)).toHaveLength(0);
+	});
+
+	test("an agent: @agent:<a session that can write the space> and @human:<a co-writer> are written in place", async () => {
+		const { owner, projectId, main, sessionSpace } = await world();
+		const cowriter = await person("cowriter");
+		await grant(projectId, cowriter.id, "write");
+		await narratorGrant(main, cowriter.id, "write");
+		const sibling = await session(owner.id, projectId, { title: "Sibling" });
+		const c = agentCtx(main, owner.id);
+		const added = await outlineEditTool.execute(
+			{ edits: [{ add: "session/", markdown: "- Work\n  - [ ] A\n  - [ ] B" }] },
+			c,
+		);
+		const [page, a, b] = sidsOf(added.output) as [string, string, string];
+		await outlineReadTool.execute({ address: page, view: "all" }, c);
+		const out = await outlineEditTool.execute(
+			{
+				edits: [
+					{ set: a, assignee: `@agent:${sibling}` },
+					{ set: b, assignee: `@human:${cowriter.username}` },
+				],
+			},
+			c,
+		);
+		expect(out.isError).toBeFalsy();
+		expect(out.output).not.toContain("handed out");
+		const rows = await outlineStore.getBlockMetas(sessionSpace.id, { sids: [a, b] });
+		expect(rows.map((r) => r.taskJson?.assignee).sort()).toEqual(
+			[`agent:${sibling}`, `human:${cowriter.username}`].sort(),
+		);
+		expect(await copiesOn(projectId)).toHaveLength(0);
+	});
+
+	test("another session writing in the first one's space is not normalised: it assigns in place, or is refused as before (S3)", async () => {
+		const { owner, projectId, main, other } = await world();
+		const sibling = await session(owner.id, projectId, { title: "Sibling" });
+		const cMain = agentCtx(main, owner.id);
+		const added = await outlineEditTool.execute(
+			{ edits: [{ add: "session/", markdown: "- Work\n  - [ ] Port the parser" }] },
+			cMain,
+		);
+		const [, parser] = sidsOf(added.output) as [string, string];
+		const space = await ensureSessionSpace(main);
+		const cSibling = agentCtx(sibling, owner.id);
+		await outlineReadTool.execute({ address: `${space.key}/${parser}`, view: "all" }, cSibling);
+		const mine = await outlineEditTool.execute(
+			{ edits: [{ set: `${space.key}/${parser}`, assignee: `@agent:${sibling}` }] },
+			cSibling,
+		);
+		expect(mine.isError).toBeFalsy();
+		expect(mine.output).not.toContain("handed out");
+		expect(
+			(await outlineStore.getBlockMetas(space.id, { sids: [parser] }))[0]?.taskJson?.assignee,
+		).toBe(`agent:${sibling}`);
+		// A session that cannot work in that space: the in-place check refuses it, no hand-out.
+		await outlineReadTool.execute({ address: `${space.key}/${parser}`, view: "all" }, cSibling);
+		const refused = await outlineEditTool.execute(
+			{ edits: [{ set: `${space.key}/${parser}`, assignee: `@agent:${other}` }] },
+			cSibling,
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain("cannot work in this space");
+		expect(await copiesOn(projectId)).toHaveLength(0);
+	});
+});
+
+describe("review round 1", () => {
+	test("B1: read-only and plan mode may not hand out (the copy is a write to the project); in place still works", async () => {
+		const { owner, projectId, main, other } = await world();
+		const c = agentCtx(main, owner.id);
+		const added = await outlineEditTool.execute(
+			{
+				edits: [{ add: "session/", markdown: "- Work\n  - [ ] Port the parser\n  - [ ] Tidy up" }],
+			},
+			c,
+		);
+		const [page, parser, tidy] = sidsOf(added.output) as [string, string, string];
+		const space = await ensureSessionSpace(main);
+		for (const mode of [
+			{ permissionMode: "readOnly" as const, traits: [] as string[] },
+			{ permissionMode: "default" as const, traits: ["plan"] },
+		]) {
+			await db.update(narrators).set(mode).where(eq(narrators.id, main));
+			await outlineReadTool.execute({ address: page, view: "all" }, c);
+			const handed = await outlineEditTool.execute(
+				{ edits: [{ set: parser, assignee: `@agent:${other}` }] },
+				c,
+			);
+			expect(handed.isError).toBe(true);
+			expect(handed.output).toContain("Nothing was written");
+			expect(handed.output).toContain("in read-only and plan mode OutlineEdit writes only");
+			expect(await copiesOn(projectId)).toHaveLength(0);
+			expect(
+				(await outlineStore.getBlockMetas(space.id, { sids: [parser] }))[0]?.taskJson?.assignee,
+			).toBeNull();
+		}
+		// Its own person, in place, in its own space: still written in plan mode.
+		await outlineReadTool.execute({ address: page, view: "all" }, c);
+		const own = await outlineEditTool.execute(
+			{ edits: [{ set: tidy, assignee: `@human:${owner.username}` }] },
+			c,
+		);
+		expect(own.isError).toBeFalsy();
+	});
+
+	test("S1: handed to the team, then to a person: the owner re-assigns the copy; an agent with another target, or a copy in progress, is refused", async () => {
+		const { owner, peer, projectId, main, other, sessionSpace } = await world();
+		const task = await sessionTask(sessionSpace, main, owner.id);
+		const first = await handOutTask({
+			taskId: task.blockId,
+			by: person_(owner),
+			target: { kind: "team" },
+		});
+		const toPeer = await handOutTask({
+			taskId: task.blockId,
+			by: person_(owner),
+			target: { kind: "person", userId: peer.id, username: peer.username },
+		});
+		expect(toPeer).toMatchObject({ already: true, reassigned: true, copy: { id: first.copy.id } });
+		const copy = await outlineStore.getBlock(first.copy.id);
+		expect(copy?.taskJson?.assignee).toBe(`human:${peer.username}`);
+		expect(copy?.taskJson?.claimable).toBeUndefined();
+		const note = await outlineStore.getBlock(handOutBlockId("note", first.copy.id, 0));
+		expect(note?.content).toBe(
+			`Handed to @human:${peer.username}: [[${first.copy.address}]] (this task waits for it)`,
+		);
+		expect(await copiesOn(projectId)).toHaveLength(1);
+
+		// The session itself, to another target: refused, nothing changes.
+		const bySession = {
+			kind: "session" as const,
+			narratorId: main,
+			principal: { userId: owner.id, isAdmin: false },
+		};
+		let reason: string | null = null;
+		try {
+			await handOutTask({ taskId: task.blockId, by: bySession, target: { kind: "team" } });
+		} catch (error) {
+			reason = (error as OutlineHandOutError).reason;
+			expect((error as OutlineHandOutError).statusCode).toBe(409);
+			expect((error as OutlineHandOutError).copy?.address).toBe(first.copy.address);
+		}
+		expect(reason).toBe("already_handed_out");
+		// The same target again: the copy, nothing written.
+		expect(
+			await handOutTask({
+				taskId: task.blockId,
+				by: bySession,
+				target: { kind: "person", userId: peer.id, username: peer.username },
+			}),
+		).toMatchObject({ already: true, copy: { id: first.copy.id } });
+		// The copy in progress: not re-assigned under whoever is doing it.
+		const projectSpace = await ensureProjectSpace(projectId);
+		await asAgent(projectSpace, other, peer.id, [
+			{ op: "setTask", block: { id: first.copy.id }, task: { status: "doing" } },
+		]);
+		await expect(
+			handOutTask({ taskId: task.blockId, by: person_(owner), target: { kind: "team" } }),
+		).rejects.toThrow(/handed out already/);
+		expect((await outlineStore.getBlock(first.copy.id))?.taskJson?.assignee).toBe(
+			`human:${peer.username}`,
+		);
+	});
+
+	test("S2: step 2 failed, the original edited: the next hand-out finds the copy by its provenance, makes no second one, and the failure note goes", async () => {
+		const { owner, projectId, main, sessionSpace } = await world();
+		const task = await sessionTask(sessionSpace, main, owner.id);
+		const failing = (async () => {
+			throw new OutlineBusyError(sessionSpace.id, 1);
+		}) as unknown as typeof writeOutline;
+		await expect(
+			handOutTask({
+				taskId: task.blockId,
+				by: person_(owner),
+				target: { kind: "team" },
+				writeOriginal: failing,
+			}),
+		).rejects.toThrow(/could not be set to wait/);
+		const [stray] = await copiesOn(projectId);
+		await asAgent(sessionSpace, main, owner.id, [
+			{ op: "update", block: { id: task.blockId }, content: "Port the parser, edited" },
+		]);
+		const out = await handOutTask({
+			taskId: task.blockId,
+			by: person_(owner),
+			target: { kind: "team" },
+		});
+		expect(out.copy.id).toBe(stray?.id as string);
+		expect(await copiesOn(projectId)).toHaveLength(1);
+		expect((await outlineStore.getBlock(handOutBlockId("failed", out.copy.id, 0)))?.deleted).toBe(
+			true,
+		);
+		expect((await outlineStore.getBlock(task.blockId))?.taskJson?.depends?.at(-1)?.target).toBe(
+			out.copy.address,
+		);
+	});
+
+	test("S5: the steps under the original that the session is doing go back to do with it", async () => {
+		const { owner, main, sessionSpace } = await world();
+		const written = await asAgent(sessionSpace, main, owner.id, [
+			{ op: "insert", tempId: "t", parent: null, content: "Big job", task: { status: "doing" } },
+			{ op: "insert", parent: { tempId: "t" }, content: "Step one", task: { status: "doing" } },
+		]);
+		const [root, step] = written.results.map((r) => r.blockId) as [string, string];
+		expect((await outlineStore.getTaskClaims([step]))[0]?.holderNarratorId).toBe(main);
+		await handOutTask({ taskId: root, by: person_(owner), target: { kind: "team" } });
+		expect((await outlineStore.getBlock(step))?.taskJson?.status).toBe("todo");
+		expect((await outlineStore.getTaskClaims([step]))[0]?.holderNarratorId ?? null).toBeNull();
+		expect((await outlineStore.getBlock(root))?.taskJson?.status).toBe("todo");
+	});
+
+	test("S6: a new task under a locked goal given to someone who cannot work in the space: refused, not silently held without its assignee", async () => {
+		const { owner, projectId, main, other } = await world();
+		const goal = await addPersonTask({
+			narratorId: main,
+			userId: owner.id,
+			text: "Ship it",
+			lock: true,
+		});
+		const c = agentCtx(main, owner.id);
+		const goalSid = (await outlineStore.getBlock(goal.blockId))?.sid as string;
+		await outlineReadTool.execute({ address: goalSid, view: "all" }, c);
+		const out = await outlineEditTool.execute(
+			{ edits: [{ add: goalSid, markdown: `- [ ] Write the notes @agent:${other}` }] },
+			c,
+		);
+		expect(out.isError).toBe(true);
+		expect(out.output).toContain("a plan a person locked");
+		expect(await copiesOn(projectId)).toHaveLength(0);
+	});
+
+	test("S7: links in the copied text to copied blocks point to their copies; others stay", async () => {
+		const { owner, projectId, main, sessionSpace } = await world();
+		const c = agentCtx(main, owner.id);
+		const added = await outlineEditTool.execute(
+			{
+				edits: [
+					{
+						add: "session/",
+						markdown:
+							"- Background facts\n- Work\n  - [ ] Port the parser\n    - See [[Background facts]] and [[Port the lexer]]\n    - [ ] Port the lexer",
+					},
+				],
+			},
+			c,
+		);
+		expect(added.isError).toBeFalsy();
+		const [facts, , parser] = sidsOf(added.output) as string[];
+		const parserRow = (
+			await outlineStore.getBlockMetas(sessionSpace.id, { sids: [parser as string] })
+		)[0];
+		const out = await handOutTask({
+			taskId: parserRow?.id as string,
+			by: person_(owner),
+			target: { kind: "team" },
+		});
+		const projectSpace = await ensureProjectSpace(projectId);
+		const rows = await subtreeRows(out.copy.id);
+		const lexerCopy = rows.find((r) => r.content === "Port the lexer");
+		const lexerCopySid = (await outlineStore.getBlock(lexerCopy?.id as string))?.sid;
+		const noteCopy = rows.find((r) => r.content.startsWith("See "));
+		expect(noteCopy?.content).toBe(
+			`See [[${sessionSpace.key}/${facts}]] and [[${projectSpace.key}/${lexerCopySid}]]`,
+		);
+	});
+
+	test("nits: the owner doing it is not someone else; a target session keeping Dynamic Spec, or a name that cannot be an assignee, is refused; a step's person who cannot work in the project is dropped and counted", async () => {
+		const { owner, projectId, main, sessionSpace } = await world();
+		// The owner holds it (a person's claim).
+		const held = await writeOutline({
+			spaceId: sessionSpace.id,
+			ops: [
+				{ op: "insert", tempId: "t", parent: null, content: "Mine", task: { status: "doing" } },
+				{
+					op: "insert",
+					parent: { tempId: "t" },
+					content: "A step for someone",
+					task: { status: "todo", assignee: "human:nobody-at-all" },
+				},
+			],
+			actor: { kind: "human", id: owner.id },
+			responsibleUserId: owner.id,
+		});
+		const id = held.results[0]?.blockId as string;
+		const out = await handOutTask({ taskId: id, by: person_(owner), target: { kind: "team" } });
+		const rows = await subtreeRows(out.copy.id);
+		expect(rows[1]?.content).toContain("1 step lost its assignee");
+		expect(rows.find((r) => r.content === "A step for someone")?.task).toMatchObject({
+			assignee: null,
+		});
+		expect((await outlineStore.getBlock(id))?.taskJson?.status).toBe("todo");
+
+		const spec = await session(owner.id, projectId, { title: "Spec", taskBackend: "spec" });
+		const another = await asAgent(sessionSpace, main, owner.id, [
+			{ op: "insert", parent: null, content: "Another", task: { status: "todo" } },
+		]);
+		const anotherId = another.results[0]?.blockId as string;
+		await expect(
+			handOutTask({
+				taskId: anotherId,
+				by: person_(owner),
+				target: { kind: "session", narratorId: spec },
+			}),
+		).rejects.toThrow(/This session cannot work on this task/);
+		await expect(
+			handOutTask({
+				taskId: anotherId,
+				by: person_(owner),
+				target: { kind: "person", userId: owner.id, username: "bad name!" },
+			}),
+		).rejects.toThrow(/cannot be named as an assignee/);
 	});
 });
