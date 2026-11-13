@@ -175,6 +175,7 @@ mock.module("../../hooks/useGitIdentities", () => ({
 		isLoading: false,
 		isError: false,
 	}),
+	useFolderGitIdentity: () => ({ data: undefined }),
 	narratorGitIdentityQueryKey: (id: string) => ["narrator", id, "gitIdentity"],
 }));
 mock.module("../../hooks/useWorkspaceContext", () => ({

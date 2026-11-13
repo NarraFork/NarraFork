@@ -3,6 +3,7 @@ import { Collapse, Group, Stack, Text, UnstyledButton } from "@mantine/core";
 import { IconBrandGithub, IconCheck, IconChevronDown } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { followIdentityKind } from "../narrator/details/git-identity-follow-label";
 
 /**
  * The "Git commit identity" submenu shared by a narrator tab and a sidebar folder.
@@ -18,6 +19,7 @@ import { useTranslation } from "react-i18next";
 export function GitIdentityMenuList({
 	identities,
 	selectedId,
+	followIdentity,
 	isLoading,
 	expanded,
 	onToggle,
@@ -26,6 +28,8 @@ export function GitIdentityMenuList({
 	identities: GitIdentity[];
 	/** The pick for this object, or null when it follows the default. */
 	selectedId: string | null;
+	/** 会话没有 pick 时跟随的文件夹身份；文件夹菜单自己就是被跟随者，不传。 */
+	followIdentity?: GitIdentity | null;
 	isLoading: boolean;
 	/** 展开状态由外层持有，好让数据查询等到真正打开子菜单才发。 */
 	expanded: boolean;
@@ -88,9 +92,11 @@ export function GitIdentityMenuList({
 							{row(
 								selectedId === null,
 								() => onChoose(null),
-								defaultIdentity
-									? t("dockTabs.gitIdentityFollowDefault", { name: defaultIdentity.name })
-									: t("dockTabs.gitIdentityFollowDefaultPlain"),
+								followIdentityKind(followIdentity, defaultIdentity) === "folder"
+									? t("dockTabs.gitIdentityFollowFolder", { name: followIdentity?.name })
+									: defaultIdentity
+										? t("dockTabs.gitIdentityFollowDefault", { name: defaultIdentity.name })
+										: t("dockTabs.gitIdentityFollowDefaultPlain"),
 							)}
 							{identities.map((identity) =>
 								row(

@@ -120,6 +120,7 @@ import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
 } from "../lib/file-reference-input";
+import { getNarratorFolderIdForUser } from "../lib/git-identity";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -305,6 +306,7 @@ import {
 	rebuildDeviceFileState,
 } from "../services/file-state-rebuild";
 import {
+	getFolderGitIdentityPick,
 	getNarratorGitIdentityPick,
 	listUserGitIdentities,
 	setNarratorGitIdentityPick,
@@ -5342,11 +5344,16 @@ narratorRoutes.patch("/:id/default-device", async (c) => {
 narratorRoutes.get("/:id/git-identity", async (c) => {
 	const userId = c.get("user").sub;
 	const narratorId = c.req.param("id");
-	const [identities, selectedId] = await Promise.all([
+	const [identities, selectedId, folderId] = await Promise.all([
 		listUserGitIdentities(userId),
 		getNarratorGitIdentityPick(userId, narratorId),
+		getNarratorFolderIdForUser(narratorId, userId),
 	]);
-	return c.json({ identities, selectedId });
+	// 会话自己没有 pick 时会跟随它所在的侧栏文件夹：UI 要说清跟的是哪一条身份。
+	const folderSelectedId = folderId
+		? await getFolderGitIdentityPick(userId, folderId).catch(() => null)
+		: null;
+	return c.json({ identities, selectedId, folderSelectedId });
 });
 
 narratorRoutes.put("/:id/git-identity", async (c) => {
