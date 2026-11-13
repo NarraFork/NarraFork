@@ -635,10 +635,54 @@ describe("交出去 through the board's route (outline P2 PR 10c-3)", () => {
 		expect((await outlineStore.getBlock(lonely.blockId))?.taskJson?.depends).toBeUndefined();
 	});
 
-	test("「转交并开始」 on a session's task: the other session starts on the copy, and the original waits", async () => {
+	/** A teammate's session in the project: it cannot write `owner`'s session spaces. */
+	async function teammateSession(owner: string, projectId: string, title: string) {
+		const mate = await person();
+		const target = await session(mate, projectId, { continuation: "off", title });
+		for (const [scopeType, scopeId, principalId] of [
+			["project", projectId, mate],
+			// The owner may start it (a turn on their behalf).
+			["narrator", target, owner],
+		] as const)
+			await db.insert(aclGrants).values({
+				id: generateId(),
+				scopeType,
+				scopeId,
+				principalType: "user",
+				principalId,
+				capability: "write",
+				createdAt: NOW,
+			});
+		return target;
+	}
+
+	test("a session of the same person can work in the space: 「转交并开始」 is in place, no copy", async () => {
 		const { owner, projectId } = await world();
 		const main = await session(owner, projectId, { title: "Main" });
-		const target = await session(owner, projectId, { continuation: "off", title: "Target" });
+		const sibling = await session(owner, projectId, { continuation: "off", title: "Sibling" });
+		const task = await sessionTask(main, owner, "Tidy the notes");
+		const response = await transfer(owner, task, {
+			assign: { kind: "narrator", narratorId: sibling },
+			start: true,
+		});
+		const body = (await response.json()) as { started: boolean; handedOut?: unknown };
+		expect(body.handedOut).toBeUndefined();
+		expect(body.started).toBe(true);
+		await waitIdleAfterTurns(sibling, 1);
+		expect(await state(task.blockId)).toMatchObject({ assignee: `agent:${sibling}` });
+		closeNarrator(sibling);
+		await writeOutline({
+			spaceId: (await outlineStore.getBlock(task.blockId))?.spaceId as string,
+			ops: [{ op: "setTask", block: { id: task.blockId }, task: { status: "done" } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+	});
+
+	test("「转交并开始」 to a session that cannot write the space: it starts on the copy, and the original waits; never on a copy that is not its own", async () => {
+		const { owner, projectId } = await world();
+		const main = await session(owner, projectId, { title: "Main" });
+		const target = await teammateSession(owner, projectId, "Target");
 		const task = await sessionTask(main, owner, "Profile the importer");
 		const listed = await call(owner, "GET", `/outline/tasks/${task.blockId}/transfer-sessions`);
 		expect(await listed.json()).toMatchObject({ sessions: [{ narratorId: target }] });
@@ -661,6 +705,19 @@ describe("交出去 through the board's route (outline P2 PR 10c-3)", () => {
 		expect(providerInputs[0]).toContain(body.handedOut.address);
 		expect(await state(task.blockId)).toMatchObject({ status: "todo", holder: null });
 		closeNarrator(target);
+		// Handed again, to another session, while the target is doing it: refused, nothing started.
+		const third = await teammateSession(owner, projectId, "Third");
+		const again = await transfer(
+			owner,
+			{
+				blockId: task.blockId,
+				versionSeq: (await outlineStore.getBlock(task.blockId))?.versionSeq as number,
+			},
+			{ assign: { kind: "narrator", narratorId: third }, start: true },
+		);
+		expect(again.status).toBe(409);
+		expect(await again.text()).toContain("handed out already");
+		expect(providerInputs).toHaveLength(1);
 		// Leave no claim on a lease behind (other files' lease-expiry cases scan them all).
 		const copy = await outlineStore.getBlock(body.handedOut.copyId);
 		await writeOutline({

@@ -322,7 +322,7 @@ test("中文、暗色、360 px: the item, the notice; the menu inside the viewpo
 	}
 }, 60_000);
 
-test("not offered without a project or to someone who does not own the session; a task changed meanwhile is refused with its reason", async () => {
+test("not offered without a project or to someone who does not own the session (they assign in place); a task changed meanwhile is refused with its reason", async () => {
 	// A session of no project: nowhere to hand it to.
 	const loner = await world({ project: false });
 	const { page, errors } = await openPage(900);
@@ -330,13 +330,13 @@ test("not offered without a project or to someone who does not own the session; 
 		await mount(page, loner.narratorId, { scheme: "light", width: 720, language: "en" });
 		const menu = await openMenu(page, "Port the parser");
 		expect(menu?.items.map((i) => i.id)).not.toContain("task-action-team");
-		expect(menu?.items.map((i) => i.id)).not.toContain("task-action-transfer");
 		expect(errors).toEqual([]);
 	} finally {
 		await page.browserContext().close();
 	}
 
-	// A teammate who may write the session: changes it, does not hand it out.
+	// A teammate who may write the session: offered what assigns in place, never 「交给团队」 (the
+	// owner's); 「交给我」 gives it to them where it is, no copy (owner decision 2026-11-13).
 	const w = await world();
 	const bob = await user("bob");
 	for (const [scopeType, scopeId] of [
@@ -358,7 +358,12 @@ test("not offered without a project or to someone who does not own the session; 
 		const menu = await openMenu(theirs.page, "Port the parser");
 		const ids = menu?.items.map((i) => i.id) ?? [];
 		expect(ids).toContain("task-action-done");
+		expect(ids).toContain("task-action-me");
 		expect(ids).not.toContain("task-action-team");
+		await call(theirs.page, (f) => f.click("[data-testid=task-action-me]"));
+		await until(theirs.page, "handed to bob, in place", (f) =>
+			(f.row("Port the parser")?.text ?? "").includes("@human:bob"),
+		);
 		expect(theirs.errors).toEqual([]);
 	} finally {
 		await theirs.page.browserContext().close();

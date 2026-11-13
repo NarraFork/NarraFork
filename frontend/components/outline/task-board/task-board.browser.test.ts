@@ -334,23 +334,13 @@ test("a session's board: add, finish, reopen, hand over and back, confirm a goal
 }, 90_000);
 
 test("a session's board: reject a goal's completion, hand to a username, cancel and fold", async () => {
-	// Handed to someone, a session's task goes to its project as a copy (P2 PR 10c-3): the session
-	// is in a project, and Bob may write the project, so he can be handed its tasks.
-	const projectId = generateId();
-	await db.insert(projects).values({
-		id: projectId,
-		name: "Review project",
-		ownerUserId: alice,
-		visibility: "private",
-		createdAt: NOW,
-		updatedAt: NOW,
-	});
-	const id = await session({ title: "Review work", projectId });
+	const id = await session({ title: "Review work" });
 	const space = await ensureSessionSpace(id);
+	// Bob may write the session: he can be handed its tasks.
 	await db.insert(aclGrants).values({
 		id: generateId(),
-		scopeType: "project",
-		scopeId: projectId,
+		scopeType: "narrator",
+		scopeId: id,
 		principalType: "user",
 		principalId: bob,
 		capability: "write",
@@ -426,21 +416,16 @@ test("a session's board: reject a goal's completion, hand to a username, cancel 
 			bobName,
 		);
 		await page.click("[data-testid=task-assign-submit]");
-		// Handed out: a copy for Bob on the project's task page; the task stays with the session,
-		// waiting for the copy.
-		const deadline = Date.now() + 10_000;
-		while (!(await taskByTitle(space.id, "Review the PR"))?.taskJson?.depends) {
-			if (Date.now() > deadline) throw new Error("not handed out");
-			await Bun.sleep(20);
-		}
-		const original = (await taskByTitle(space.id, "Review the PR"))?.taskJson;
-		expect(original?.assignee ?? null).toBeNull();
-		const copyAddress = original?.depends?.[0]?.target ?? "";
-		const projectSpace = await ensureProjectSpace(projectId);
-		expect(copyAddress.startsWith(`${projectSpace.key}/`)).toBe(true);
-		const copy = await outlineStore.getBlockBySid(projectSpace.id, copyAddress.split("/")[1] ?? "");
-		expect(copy?.taskJson?.assignee).toBe(`human:${bobName}`);
-		expect(await call(page, (f) => f.row("Review the PR")?.group)).toBe("This session");
+		await until(
+			page,
+			"handed to Bob",
+			(f, name: string) => f.row("Review the PR")?.group === name,
+			10_000,
+			bobName,
+		);
+		expect((await taskByTitle(space.id, "Review the PR"))?.taskJson?.assignee).toBe(
+			`human:${bobName}`,
+		);
 
 		// Cancel one: it goes under Cancelled, folded until opened.
 		await act(page, "Drop the flag", "task-action-cancel");

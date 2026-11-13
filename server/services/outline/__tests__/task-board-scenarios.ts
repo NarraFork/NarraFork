@@ -310,8 +310,9 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 			const owner = await ctx.user({ suffix: "-" });
 			expect(owner.username).toEndWith("-");
 			const admin = await ctx.user({ admin: true });
-			// Given to someone else, a session's task is handed out to its project (P2 PR 10c-3):
-			// the admin is judged against the project's space, the same answer as unknown.
+			// Given by its owner to someone who cannot work in the session's space, a session's task
+			// is handed out to its project (P2 PR 10c-3): the admin is judged there too (their own
+			// grants, not an admin's reach), and answers as unknown.
 			const projectId = await ctx.project({ owner: owner.id });
 			const session = await ctx.session({ owner: owner.id, projectId });
 			const goal = await addPersonTask({
@@ -648,6 +649,28 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 			).rejects.toThrow(/changed since it was read/);
 			const siblings = await outlineStore.listChildMetas(projectSpace.id, [page?.id as string], 20);
 			expect(siblings.filter((m) => m.taskJson)).toHaveLength(1);
+
+			// Someone who may write the session already is given its task in place (owner decision
+			// 2026-11-13): no copy.
+			const mate = await ctx.user();
+			await ctx.grant(projectId, mate.id, "write");
+			await ctx.grantSession(session, mate.id, "write");
+			const step = written.results[1]?.blockId as string;
+			const inPlace = await changePersonTask({
+				principal: as(owner.id),
+				blockId: step,
+				baseVersionSeq: (await outlineStore.getBlock(step))?.versionSeq as number,
+				assign: { kind: "user", username: mate.username },
+			});
+			expect(inPlace.handedOut).toBeUndefined();
+			expect((await outlineStore.getBlock(step))?.taskJson?.assignee).toBe(
+				`human:${mate.username}`,
+			);
+			expect(
+				(await outlineStore.listChildMetas(projectSpace.id, [page?.id as string], 20)).filter(
+					(m) => m.taskJson,
+				),
+			).toHaveLength(1);
 		},
 	},
 	{
