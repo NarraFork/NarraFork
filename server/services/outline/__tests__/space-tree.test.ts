@@ -457,7 +457,9 @@ describe("what a row says (readability F)", () => {
 		expect(mine?.waiting).toBe(2);
 		expect(mine?.doing).toBe(2);
 		expect(mine?.summary?.kind).toBe("doing");
-		expect(["Fix the refresh race", "Add the regression test"]).toContain(mine?.summary?.text ?? "");
+		expect(["Fix the refresh race", "Add the regression test"]).toContain(
+			mine?.summary?.text ?? "",
+		);
 
 		// The reader may read the session, not write it: the question put to them is not theirs
 		// to answer there, so nothing waits; the row says read-only.
@@ -481,10 +483,9 @@ describe("what a row says (readability F)", () => {
 			{ task: "doing", title: "Doing now" },
 			{ note: "Outline phase two: tasks and teams", alias: "summary" },
 		]);
-		await work(b.space, me, [
-			{ task: "done", title: "Finished first" },
-			{ task: "cancelled", title: `Finished last ${"x".repeat(200)}` },
-		]);
+		// (Two commits: within one, which task finished last is not said.)
+		await work(b.space, me, [{ task: "done", title: "Finished first" }]);
+		await work(b.space, me, [{ task: "cancelled", title: `Finished last ${"x".repeat(200)}` }]);
 		await work(c.space, me, [{ task: "todo", title: "Nothing started" }]);
 		const loose = await get<OutlineTreeSpacesResponse>(me, "/tree/loose");
 		const by = new Map(loose.spaces.map((space) => [space.id, space]));
