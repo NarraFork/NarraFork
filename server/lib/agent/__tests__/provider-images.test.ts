@@ -217,6 +217,9 @@ describe("OpenAI Images transport", () => {
 	});
 });
 
+/** 账号池的亲和键带实例前缀，两个 Codex 实例的同一会话不会抢占同一条绑定。 */
+const codexAffinity = (session: string) => `codex\0${session}`;
+
 function codexProvider(authMode: "oauth" | "agent_identity" = "oauth") {
 	const provider = new CodexProvider({ useWebSocket: true });
 	const sessions: Array<string | undefined> = [];
@@ -260,7 +263,7 @@ describe("Codex Images credentials", () => {
 			const { provider, sessions } = codexProvider(authMode);
 			const result = await provider.generateImage(params());
 			expect(result).toEqual({ response, credentialId: "codex-image-account" });
-			expect(sessions).toEqual(["image-session"]);
+			expect(sessions).toEqual([codexAffinity("image-session")]);
 			expect(calls).toHaveLength(1);
 			expect(calls[0].url).toBe("https://chatgpt.com/backend-api/codex/images/generations");
 			const headers = new Headers(calls[0].init.headers);
@@ -281,7 +284,7 @@ describe("Codex Images credentials", () => {
 		const { provider, sessions } = codexProvider();
 		await expect(provider.generateImage(params())).rejects.toThrow("[connection_reset]");
 		expect(calls).toHaveLength(1);
-		expect(sessions).toEqual(["image-session"]);
+		expect(sessions).toEqual([codexAffinity("image-session")]);
 	});
 });
 
