@@ -39,6 +39,8 @@ import {
 } from "../../../../server/services/outline/spec-import/loss-scan";
 import {
 	countSpecLossFindings,
+	listSpecLossAttached,
+	noteSpecLossAttachFailure,
 	readSpecLossScan,
 	readSpecRevisionChain,
 } from "../../../../server/services/outline/spec-import/loss-store";
@@ -156,6 +158,8 @@ describe("PostgreSQL swallowed-content scan", () => {
 				const wasEnabled = settings.outline.enabled;
 				settings.outline.enabled = true;
 				settings.outline.specImport = "manual";
+				// The seeded saves count as made with the old editor.
+				settings.outline.specLossCutoff = "2999-01-01T00:00:00.000Z";
 				try {
 					const pg = client.db;
 					const main = await seedSession(pg);
@@ -197,8 +201,29 @@ describe("PostgreSQL swallowed-content scan", () => {
 						{ content: `${TABLE}\n`, by: "assistant" },
 						{ content: "gone\n", by: "user" },
 					]);
+					// It also lost task items (listed only), and a save after the cutoff is not looked at.
+					await seedHistory(pg, other.namespaceId, "todo.md", [
+						{ content: "- [ ] one\n- [ ] two\n", by: "assistant" },
+						{ content: "- one\n- two\n", by: "user" },
+					]);
+					const late = await seedHistory(pg, other.namespaceId, "late.md", [
+						{ content: `${TABLE}\n`, by: "assistant" },
+						{ content: "gone\n", by: "user" },
+					]);
+					await client.sql`update spec_file_revisions set created_at = '2999-06-01T00:00:00.000Z' where id = ${late[1] as string}`;
 					const pass = await runSpecLossPass({ pauseMs: 0 });
 					const all = await specLossPage({ status: "open", narratorId: null, canAct: true });
+					const otherOpen = (
+						await specLossPage({ status: "open", narratorId: other.id, canAct: true })
+					).items;
+					const listed = otherOpen.find((item) => item.path === "todo.md");
+					// An attach that keeps failing: counted, then given up.
+					const failing = otherOpen.find((item) => item.path === "notes.md")?.id as string;
+					const failures = [
+						await noteSpecLossAttachFailure(failing, 3),
+						await noteSpecLossAttachFailure(failing, 3),
+						await noteSpecLossAttachFailure(failing, 3),
+					];
 
 					// Imported: the next pass attaches the finding to the file's page, once.
 					const imported = await importSpecSession(main.id, { trigger: "manual" });
@@ -207,6 +232,11 @@ describe("PostgreSQL swallowed-content scan", () => {
 					const attached = (
 						await specLossPage({ status: "attached", narratorId: main.id, canAct: true })
 					).items[0];
+					const attachedRows = await listSpecLossAttached(main.id, 5);
+					const attachedAfter = await listSpecLossAttached(main.id, 5, {
+						createdAt: attachedRows[0]?.createdAt as string,
+						id: attachedRows[0]?.id as string,
+					});
 					const under = attached?.blockId
 						? await outlineStore.listChildren(attached.spaceId as string, attached.blockId, 10)
 						: [];
@@ -254,6 +284,10 @@ describe("PostgreSQL swallowed-content scan", () => {
 						dismissedAttached,
 						goneBlock,
 						reattached,
+						listed,
+						failures,
+						attachedRows,
+						attachedAfter,
 						under: under.map((block) => block.content),
 						main: main.id,
 						other: other.id,
@@ -306,10 +340,18 @@ describe("PostgreSQL swallowed-content scan", () => {
 			expect(ran.dismissed).toMatchObject({ status: "dismissed" });
 			expect(ran.countsDismissed).toEqual({ open: 0, attached: 0, dismissed: 1 });
 			expect(ran.reopened).toMatchObject({ status: "open", resolvedAt: null });
-			expect(ran.pass).toEqual({ sessions: 2, scanned: 1, found: 1, attached: 0, left: 0 });
+			expect(ran.pass).toEqual({ sessions: 2, scanned: 1, found: 2, attached: 0, left: 0 });
 			expect(new Set(ran.all.map((row) => row.join("|")))).toEqual(
-				new Set([`${ran.main}|design.md|spec loss`, `${ran.other}|notes.md|spec loss`]),
+				new Set([
+					`${ran.main}|design.md|spec loss`,
+					`${ran.other}|notes.md|spec loss`,
+					`${ran.other}|todo.md|spec loss`,
+				]),
 			);
+			expect(ran.listed).toMatchObject({ kinds: { taskItem: 2 }, attachNote: "list_only" });
+			expect(ran.failures).toEqual(["failed", "failed", "gave_up"]);
+			expect(ran.attachedRows).toMatchObject([{ blockId: ran.attached?.blockId, attachSeq: 0 }]);
+			expect(ran.attachedAfter).toEqual([]);
 			expect(ran.allScan).toMatchObject({ running: false });
 			expect(ran.imported).toMatchObject({ status: "imported" });
 			expect(ran.attachPass).toMatchObject({ attached: 1, left: 0 });

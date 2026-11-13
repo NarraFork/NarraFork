@@ -1058,7 +1058,7 @@ describe("saves after the scan first ran here are not looked at", () => {
 		};
 		const first = await specLossCutoff({ now: () => new Date("2026-11-13T08:00:00.000Z"), save });
 		expect(first).toBe("2026-11-13T08:00:00.000Z");
-		expect(settings.outline.specLossCutoff).toBe(first);
+		expect(settings.outline.specLossCutoff as string | undefined).toBe(first);
 		expect(saved).toBe(1);
 		const again = await specLossCutoff({ now: () => new Date("2027-01-01T00:00:00.000Z"), save });
 		expect(again).toBe(first);
@@ -1072,7 +1072,7 @@ describe("saves after the scan first ran here are not looked at", () => {
 			},
 		});
 		expect(kept).toBe("2026-11-14T00:00:00.000Z");
-		expect(settings.outline.specLossCutoff).toBe(kept);
+		expect(settings.outline.specLossCutoff as string | undefined).toBe(kept);
 	});
 
 	test("a person's save made after it is a deliberate edit: not found; one before it is", async () => {
@@ -1359,7 +1359,7 @@ describe("attaches that do not go through", () => {
 				.select({ status: outlineSpecLossFindings.status })
 				.from(outlineSpecLossFindings)
 				.where(eq(outlineSpecLossFindings.id, made.findingId));
-			expect(row?.status).toBe(status);
+			expect(row?.status as string).toBe(status);
 		}
 		// The import over: the decision goes through.
 		expect(
