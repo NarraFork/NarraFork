@@ -1354,6 +1354,7 @@ export const userPreferences = pgTable("user_preferences", {
 		.notNull()
 		.default(false),
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
+	hiddenPluginOverlays: text("hidden_plugin_overlays").notNull().default("[]"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
 	outlineDigestTimeZone: text("outline_digest_time_zone"),
@@ -4378,7 +4379,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 141,
-  "columnCount": 1866,
+  "columnCount": 1867,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -12090,6 +12091,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"{}\"",
           "defaultExpression": "\"{}\""
+        },
+        {
+          "property": "hiddenPluginOverlays",
+          "name": "hidden_plugin_overlays",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"[]\"",
+          "defaultExpression": "\"[]\""
         },
         {
           "property": "traits",

@@ -1,0 +1,14 @@
+/*
+ * The overlay dismiss control is always present while an overlay is, so it stays faint
+ * until hovered or focused. Never fully transparent: someone stuck under a full-screen
+ * overlay has to be able to find it.
+ */
+.dismiss {
+	opacity: 0.45;
+	transition: opacity 0.15s;
+}
+
+.dismiss:hover,
+.dismiss:focus-visible {
+	opacity: 1;
+}

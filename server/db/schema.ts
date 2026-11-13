@@ -2434,6 +2434,15 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 */
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
 	/**
+	 * Plugin ids whose `overlay` views this user has hidden (JSON string array).
+	 *
+	 * Overlays are shown by default once an admin installs the plugin; this is the
+	 * per-person opt-out, so one colleague hiding a desktop pet does not hide it for the
+	 * whole instance. Stored per account rather than in the browser so the choice
+	 * follows the person across devices and survives a reload.
+	 */
+	hiddenPluginOverlays: text("hidden_plugin_overlays").notNull().default("[]"),
+	/**
 	 * User layer of the layered trait system — the lowest-priority layer, applied
 	 * to every narrator the user acts on. Same encoding as `narrators.traits`.
 	 * Resolved per acting user at request time, mirroring how `fastModeDefault`

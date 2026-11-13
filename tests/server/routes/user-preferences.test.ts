@@ -237,6 +237,83 @@ describe("local access preference", () => {
 	});
 });
 
+describe("plugin overlay visibility preference", () => {
+	async function setHidden(pluginId: string, hidden: boolean) {
+		return requestJson("/plugin-overlays", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ pluginId, hidden }),
+		});
+	}
+
+	it("shows every overlay by default, with and without a stored row", async () => {
+		seedUser();
+		expect((await requestJson("/")).body).toMatchObject({ hiddenPluginOverlays: [] });
+	});
+
+	it("hides and re-shows one plugin without touching the others", async () => {
+		seedUser();
+		const first = await setHidden("com.example.pet", true);
+		expect(first).toEqual({ status: 200, body: { hiddenPluginOverlays: ["com.example.pet"] } });
+		await setHidden("com.example.clock", true);
+		// Re-hiding is idempotent: the id is not stored twice.
+		await setHidden("com.example.pet", true);
+		expect((await requestJson("/")).body).toMatchObject({
+			hiddenPluginOverlays: ["com.example.pet", "com.example.clock"],
+		});
+		await setHidden("com.example.pet", false);
+		expect((await requestJson("/")).body).toMatchObject({
+			hiddenPluginOverlays: ["com.example.clock"],
+		});
+	});
+
+	it("survives unrelated preference writes and stays scoped to its user", async () => {
+		seedPreferences([]);
+		await setHidden("com.example.pet", true);
+		const saved = await requestJson("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ wordWrapCode: false }),
+		});
+		expect(saved.body).toMatchObject({ hiddenPluginOverlays: ["com.example.pet"] });
+		db.insert(users)
+			.values({
+				id: "other-user",
+				username: "other-user",
+				passwordHash: "test",
+				role: "user",
+				createdAt: NOW,
+			})
+			.run();
+		authUser.sub = "other-user";
+		expect((await requestJson("/")).body).toMatchObject({ hiddenPluginOverlays: [] });
+	});
+
+	it("rejects malformed plugin ids and non-boolean flags", async () => {
+		seedUser();
+		for (const body of [
+			{ pluginId: "Not A Plugin", hidden: true },
+			{ pluginId: "com.example.pet", hidden: "true" },
+			{ pluginId: "com.example.pet" },
+			{ pluginId: "com.example.pet", hidden: true, extra: 1 },
+		]) {
+			// This bare test app has no global error handler, so only the status is asserted.
+			const response = await app.request("/plugin-overlays", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			expect(response.status).not.toBe(200);
+		}
+		expect((await requestJson("/")).body).toMatchObject({ hiddenPluginOverlays: [] });
+	});
+
+	it("reads a corrupted column back as hiding nothing", async () => {
+		seedPreferences([], { hiddenPluginOverlays: "not json" });
+		expect((await requestJson("/")).body).toMatchObject({ hiddenPluginOverlays: [] });
+	});
+});
+
 describe("instance setup wizard completion", () => {
 	async function patch(body: Record<string, unknown>) {
 		return requestJson("/", {

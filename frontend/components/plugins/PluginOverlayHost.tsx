@@ -24,11 +24,19 @@
  *
  * FAILURE BEHAVIOUR
  * Without bounds the overlay is decorative. Bounds can cover the viewport, so a
- * host-owned dismiss button always sits above every overlay. Recovery never relies
+ * host-owned dismiss control always sits above every overlay. Recovery never relies
  * on a plugin responding, or on arbitrary size limits that penalize other widgets.
+ *
+ * WHO DECIDES WHAT IS SHOWN
+ * An admin installs the plugin, and the overlay then shows for everyone by default.
+ * Each person can hide it for themselves: the dismiss control hides every overlay on
+ * screen, and Settings → Appearance toggles them per plugin. Both write the same
+ * per-user preference, so the choice survives a reload and never affects colleagues.
  */
 
-import { Button } from "@mantine/core";
+import { ActionIcon, Tooltip } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
+import { IconEyeOff } from "@tabler/icons-react";
 import {
 	type PointerEvent as ReactPointerEvent,
 	useCallback,
@@ -40,9 +48,11 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { usePluginOverlayVisibility } from "../../hooks/usePluginOverlayVisibility";
 import { buildPluginDockPanelParams } from "./PluginContributionPicker";
 import { pluginContributionStore } from "./PluginContributionStore";
 import { type PluginDockPanelHostApi, PluginDockPanelView } from "./PluginDockPanel";
+import classes from "./PluginOverlayHost.module.css";
 import { PluginUiSurfaceProvider } from "./PluginUiSurfaceContext";
 import { type PluginOverlayBounds, pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
 import { useOptionalPluginUiRuntime } from "./plugin-ui-runtime-context";
@@ -85,7 +95,6 @@ function selectOverlayContributions(
 
 export function PluginOverlayHost() {
 	const { t } = useTranslation("plugins");
-	const [hidden, setHidden] = useState(false);
 	const runtime = useOptionalPluginUiRuntime();
 	const contributionSnapshot = useSyncExternalStore(
 		pluginContributionStore.subscribe,
@@ -106,9 +115,16 @@ export function PluginOverlayHost() {
 		}
 	}, [contributionSnapshot.status]);
 
-	const overlays = useMemo(
+	const declared = useMemo(
 		() => selectOverlayContributions(contributionSnapshot.contributions),
 		[contributionSnapshot.contributions],
+	);
+	// Only ask for preferences once some overlay exists: this host is mounted app-wide,
+	// including before sign-in, and most instances have no overlay plugin at all.
+	const visibility = usePluginOverlayVisibility({ enabled: declared.length > 0 });
+	const overlays = useMemo(
+		() => declared.filter((contribution) => !visibility.hidden.has(contribution.pluginId)),
+		[declared, visibility.hidden],
 	);
 
 	useEffect(() => {
@@ -122,9 +138,19 @@ export function PluginOverlayHost() {
 	const disabled =
 		typeof window !== "undefined" &&
 		new URLSearchParams(window.location.search).get("nfNoOverlay") === "1";
-	if (disabled || hidden) return null;
+	if (disabled) return null;
+	// Wait for the preference before mounting anything, so an overlay this person hid
+	// does not flash up (and start its plugin session) on every page load.
+	if (!runtime || !visibility.settled || overlays.length === 0) return null;
 
-	if (!runtime || overlays.length === 0) return null;
+	const hideAll = () => {
+		const pluginIds = [...new Set(overlays.map((contribution) => contribution.pluginId))];
+		for (const pluginId of pluginIds) visibility.setHidden(pluginId, true);
+		notifications.show({
+			message: t("overlayHiddenNotice"),
+			autoClose: 6000,
+		});
+	};
 
 	// Portal both the layers and their escape hatch together: ancestor transforms or
 	// stacking contexts must not place a plugin above the host's dismiss control.
@@ -145,26 +171,29 @@ export function PluginOverlayHost() {
 					/>
 				);
 			})}
-			<Button
-				data-plugin-overlay-dismiss=""
-				size="compact-xs"
-				onClick={() => {
-					setHidden(true);
-					for (const contribution of overlays) {
-						const id = overlayInstanceId(contribution);
-						pluginOverlayBoundsStore.clear(id);
-						runtime.disposeSession(id);
-					}
-				}}
-				style={{
-					position: "fixed",
-					right: "max(12px, env(safe-area-inset-right))",
-					bottom: "max(12px, env(safe-area-inset-bottom))",
-					zIndex: OVERLAY_Z_INDEX + 1,
-				}}
-			>
-				{t("hideOverlays")}
-			</Button>
+			{/*
+			 * Deliberately small and quiet: it is always present while an overlay is, so it
+			 * must not cover the app's own bottom-right controls (styling in the module).
+			 */}
+			<Tooltip label={t("hideOverlays")} position="left" withArrow>
+				<ActionIcon
+					data-plugin-overlay-dismiss=""
+					aria-label={t("hideOverlays")}
+					variant="default"
+					size="sm"
+					radius="xl"
+					onClick={hideAll}
+					className={classes.dismiss}
+					style={{
+						position: "fixed",
+						right: "max(6px, env(safe-area-inset-right))",
+						bottom: "max(6px, env(safe-area-inset-bottom))",
+						zIndex: OVERLAY_Z_INDEX + 1,
+					}}
+				>
+					<IconEyeOff size={14} />
+				</ActionIcon>
+			</Tooltip>
 		</>,
 		document.body,
 	);
@@ -223,6 +252,20 @@ function PluginOverlayLayer({
 			});
 		},
 		[runtime, panelInstanceId],
+	);
+
+	// Hiding this plugin (from the dismiss control or the settings page) unmounts the
+	// layer: release its session and hit region too, not just the iframe. The runtime
+	// value changes identity on every provider render, so it is read through a ref —
+	// depending on it would run this cleanup each render and dispose a live session.
+	const runtimeRef = useRef(runtime);
+	runtimeRef.current = runtime;
+	useEffect(
+		() => () => {
+			pluginOverlayBoundsStore.clear(panelInstanceId);
+			runtimeRef.current?.disposeSession(panelInstanceId);
+		},
+		[panelInstanceId],
 	);
 
 	const capturedPointer = useRef<number | null>(null);

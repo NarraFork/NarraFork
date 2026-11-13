@@ -568,6 +568,14 @@
 			"prevId": "c15812ac-e414-43f9-aee6-4290c568a3e5",
 			"version": "7",
 			"snapshotDigest": "7379a2f3dd28adf689cf2d6a8247ebb4223bf3afab6df2c7128897259cc70896"
+		},
+		{
+			"idx": 71,
+			"tag": "0071_plugin-overlay-preferences",
+			"id": "0c49a536-fc06-4e11-910d-f0f4d011cf4e",
+			"prevId": "1363fe77-68fa-4135-8d93-e64136d06a6d",
+			"version": "7",
+			"snapshotDigest": "3861f221e3589d36136721ff456e74072f2e4bcad38610bc7e5e11844ef12075"
 		}
 	]
 }

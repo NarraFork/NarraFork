@@ -13,6 +13,7 @@ import {
 } from "@shared/recent-tabs";
 import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
+import { pluginIdSchema } from "../plugins/manifest";
 import { commandSchema, localeSchema } from "./common";
 import { outlineDigestTimeSchema, outlineDigestTimeZoneSchema } from "./outline/digest";
 
@@ -231,6 +232,21 @@ export const updateUserPreferencesSchema = z.object({
 /**
  * 写入某个叙述者的大纲标签排布。数组设上限，避免偏好字段被当作无界存储。
  */
+/** Upper bound on remembered hidden overlays: a preference, not unbounded storage. */
+export const MAX_HIDDEN_PLUGIN_OVERLAYS = 200;
+
+/**
+ * Show or hide one plugin's `overlay` views for the calling user. A single-plugin patch
+ * (rather than replacing the whole list) so two tabs toggling different plugins cannot
+ * overwrite each other.
+ */
+export const pluginOverlayVisibilityPatchSchema = z
+	.object({
+		pluginId: pluginIdSchema,
+		hidden: z.boolean(),
+	})
+	.strict();
+
 export const specTabLayoutPatchSchema = z.object({
 	narratorId: z.string().min(1).max(64),
 	order: z.array(z.string().min(1).max(256)).max(100),

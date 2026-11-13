@@ -391,6 +391,8 @@ export const settingsApi = {
 			};
 			/** 大纲标签排布（JSON: { [narratorId]: { order, pinned } }）。 */
 			specTabLayout: Record<string, unknown>;
+			/** Plugin ids whose overlay views this user has hidden (shown by default). */
+			hiddenPluginOverlays: string[];
 			/** 提交身份入口的显示位置：会话右键菜单 / 新建会话弹窗（跟账号走）。 */
 			gitIdentityContextMenu: boolean;
 			gitIdentityCreateModal: boolean;
@@ -596,5 +598,11 @@ export const settingsApi = {
 		request<{ ok: boolean }>("/user-preferences/spec-tab-layout", {
 			method: "PATCH",
 			body: JSON.stringify({ narratorId, ...layout }),
+		}),
+	/** Show or hide one plugin's overlay views for the current user only. */
+	setPluginOverlayHidden: (pluginId: string, hidden: boolean) =>
+		request<{ hiddenPluginOverlays: string[] }>("/user-preferences/plugin-overlays", {
+			method: "PATCH",
+			body: JSON.stringify({ pluginId, hidden }),
 		}),
 };
