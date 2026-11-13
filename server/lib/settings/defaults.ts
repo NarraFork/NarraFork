@@ -434,6 +434,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string",
 		valid: "auto / manual / off，默认 auto",
 	},
+	"outline.specLossCutoff": {
+		desc: "「旧 Spec 面板可能吞掉的内容」排查第一次在本机运行的时间（系统内部使用，由排查自己写入，不要手动修改）。这个时间之后人在 Spec 面板的保存用的是修复后的编辑器，删掉的内容算有意删除，排查不再看。",
+		type: "string",
+	},
 
 	// ── plugins ─────────────────────────────────────────────────────────
 	"requestEvidence.ringEnabled": {

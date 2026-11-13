@@ -130,3 +130,148 @@ export interface OutlineSpecImportRevertResult {
 	/** Tasks the session held in the outline, reopened at once. */
 	released: number;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Content the old Spec panel may have swallowed (outline P2 PR 12c)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Where a finding stands: `open` (not on the page: not attached yet, or it could not be),
+ * `attached` (on the file's imported page, as a block of its own), `dismissed` (a person said it
+ * is nothing; its block is taken away when nobody else wrote in it).
+ */
+export const OUTLINE_SPEC_LOSS_STATUSES = ["open", "attached", "dismissed"] as const;
+
+export type OutlineSpecLossStatus = (typeof OUTLINE_SPEC_LOSS_STATUSES)[number];
+
+export type OutlineSpecLossAttachNote =
+	| "no_page"
+	| "page_cap"
+	| "session_cap"
+	| "restored"
+	| "failed"
+	| "gave_up"
+	| "reattach_cap"
+	| "list_only"
+	| "rule_page"
+	| "fork"
+	| "block_deleted";
+
+/**
+ * The short id of a block an attach wrote: `sl` and fourteen hex digits. On a session's behavior
+ * page such a block, with what is under it, is never shown to the model, never read into the spec
+ * fence and never copied to a fork: that page is read as standing rules. Content a person
+ * attached there through the confirmation is written under {@link isSpecLossRuleSid} instead.
+ */
+export function isSpecLossAttachSid(sid: string): boolean {
+	return /^sl[0-9a-f]{14}$/.test(sid);
+}
+
+/** The short id of lost content a person put on the behavior page, confirming it is a rule. */
+export function isSpecLossRuleSid(sid: string): boolean {
+	return /^sr[0-9a-f]{14}$/.test(sid);
+}
+
+/** `SpecLossKind` of `shared/spec-content-loss.ts`, restated for the API. */
+export type OutlineSpecLossKind =
+	| "table"
+	| "html"
+	| "image"
+	| "taskItem"
+	| "footnote"
+	| "frontMatter";
+
+/**
+ * One place where a save from the old Spec panel may have swallowed content: the file, the save,
+ * and how many structures of each kind the revision before it held that the save and the current
+ * revision do not. The lost text itself is read with the finding's detail only.
+ */
+export interface OutlineSpecLossFinding {
+	id: string;
+	narratorId: string;
+	/** The session's title (lists of several sessions show it). */
+	title: string | null;
+	path: string;
+	/** When the person saved (ISO time; null when not recorded). */
+	savedAt: string | null;
+	kinds: Partial<Record<OutlineSpecLossKind, number>>;
+	/** The excerpt kept does not hold everything that was lost. */
+	truncated: boolean;
+	status: OutlineSpecLossStatus;
+	/**
+	 * The block on the imported page, in the session's space: of an `attached` finding, and of a
+	 * `dismissed` one whose block was kept because someone else wrote in it.
+	 */
+	blockId: string | null;
+	/**
+	 * Why an `open` finding is not on the page (null: not tried yet):
+	 * - `list_only`: it is not tables (only tables are attached automatically); a person may attach it;
+	 * - `rule_page`: it is of the behavior fence, whose page the agent reads as rules: never
+	 *   attached automatically, and by a person only through a confirmation that says so;
+	 * - `fork`: the save was made in the session this one was forked from; attached there only;
+	 * - `no_page`: the file's imported page is not there;
+	 * - `page_cap` / `session_cap`: more findings than are attached to one page, or for one
+	 *   session in one pass, automatically (the latter are attached by a later pass);
+	 * - `restored`: the file's current revision holds the content again;
+	 * - `failed`: the attach did not succeed (tried again by a later pass);
+	 * - `gave_up`: it failed several times and is not tried again: it needs a person;
+	 * - `reattach_cap`: its block was removed by system writes several times; not attached again.
+	 * Of a `dismissed` finding only `block_deleted`: nobody dismissed it, its block was deleted on
+	 * the page (which is how a person disposes of it there).
+	 */
+	attachNote: OutlineSpecLossAttachNote | null;
+	/**
+	 * The finding is of the behavior fence: attaching it puts it on the page the agent reads as
+	 * its rules, so the request must carry `confirmRule` (asked of the person first).
+	 */
+	rulePage: boolean;
+	spaceId: string | null;
+	resolvedAt: string | null;
+	createdAt: string;
+	/**
+	 * An `open` finding of a session whose tasks are in the outline: a person may ask for it to
+	 * be put on the file's imported page (it may still be refused: the page was deleted).
+	 */
+	attachable: boolean;
+}
+
+/** The lost text, in pieces of one kind each, as it stood before the save. */
+export interface OutlineSpecLossDetail extends OutlineSpecLossFinding {
+	parts: Array<{ kind: OutlineSpecLossKind; text: string }>;
+}
+
+/** How the scan is doing (administrators). */
+export interface OutlineSpecLossScanStatus {
+	running: boolean;
+	/** The last pass that ended in this process: when, and what it did. */
+	lastPass: {
+		at: string;
+		/** Sessions looked at (unchanged ones are skipped, not counted in `scanned`). */
+		sessions: number;
+		scanned: number;
+		found: number;
+		/** Findings put on their imported pages. */
+		attached: number;
+		/** Sessions left for the next pass. */
+		left: number;
+	} | null;
+}
+
+export interface OutlineSpecLossPage {
+	items: OutlineSpecLossFinding[];
+	next: string | null;
+	/** Findings per status, each counted up to `countCap`. */
+	counts: Record<OutlineSpecLossStatus, number>;
+	countCap: number;
+	/** The reader may attach and dismiss (write access to the session, or an administrator). */
+	canAct: boolean;
+	/** Administrators' list only. */
+	scan?: OutlineSpecLossScanStatus;
+}
+
+/**
+ * What a person asks about one finding: `dismiss` (open or attached), `reopen` (a dismissed one;
+ * it is attached again when a pass would attach it; otherwise it is listed), `attach` (an open
+ * one: the automatic attach left it out, or never attaches its kind).
+ */
+export type OutlineSpecLossAction = "attach" | "dismiss" | "reopen";
