@@ -171,16 +171,28 @@ jobs:
         run: test -f dist/frontend/index.html
       - name: Install test system dependencies
         run: |
-          # Use an independent Ubuntu mirror during Canonical DNS outages.
-          # Keep Ubuntu's signed repository metadata and all package verification enabled.
-          sudo python3 - <<'PY'
+          # Try independent mirrors without weakening signed metadata/package verification.
+          apt_options=(-o Acquire::ForceIPv4=true -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+          installed=false
+          for mirror in https://archive.ubuntu.com/ubuntu/ https://azure.archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/; do
+            sudo env UBUNTU_MIRROR="$mirror" python3 - <<'PY'
+          import os
+          import re
           from pathlib import Path
           path = Path("/etc/apt/sources.list.d/ubuntu.sources")
           sources = path.read_text()
-          path.write_text(sources.replace("mirror+file:/etc/apt/apt-mirrors.txt", "https://mirrors.edge.kernel.org/ubuntu/"))
+          path.write_text(re.sub(r"(?m)^URIs:.*$", "URIs: " + os.environ["UBUNTU_MIRROR"], sources))
           PY
-          sudo apt-get update
-          sudo apt-get install --yes zstd podman git ripgrep acl python3
+            if sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update &&
+              sudo apt-get "${apt_options[@]}" install --yes zstd podman git ripgrep acl python3; then
+              installed=true
+              break
+            fi
+          done
+          if [[ "$installed" != true ]]; then
+            printf 'Unable to install test dependencies from any configured Ubuntu mirror\n' >&2
+            exit 1
+          fi
           command -v zstd
           zstd --version
           command -v podman

@@ -21,6 +21,11 @@ export interface UsageData {
 	cacheCreation5mInputTokens?: number;
 	cacheCreation1hInputTokens?: number;
 	reasoningTokens?: number;
+	/**
+	 * Whether the provider's usage carried cache counters. Stored as
+	 * `api_requests.cache_usage_reported`; undefined means the adapter cannot tell.
+	 */
+	cacheReported?: boolean;
 }
 
 export function buildUsageDataFromSnapshot(snapshot?: {
@@ -32,6 +37,7 @@ export function buildUsageDataFromSnapshot(snapshot?: {
 	cacheCreation5mTokens?: number;
 	cacheCreation1hTokens?: number;
 	reasoningTokens?: number;
+	cacheReported?: boolean;
 }): UsageData | null {
 	if (!snapshot) return null;
 	if (
@@ -59,6 +65,7 @@ export function buildUsageDataFromSnapshot(snapshot?: {
 		cacheCreation5mInputTokens: snapshot.cacheCreation5mTokens ?? 0,
 		cacheCreation1hInputTokens: snapshot.cacheCreation1hTokens ?? 0,
 		reasoningTokens: snapshot.reasoningTokens ?? 0,
+		...(snapshot.cacheReported !== undefined && { cacheReported: snapshot.cacheReported }),
 	};
 }
 
@@ -208,6 +215,10 @@ export function extractAnthropicUsage(usage: {
 		cacheCreationInputTokens: usage.cache_creation_input_tokens || 0,
 		cacheCreation5mInputTokens: cache5m,
 		cacheCreation1hInputTokens: cache1h,
+		cacheReported:
+			usage.cache_read_input_tokens != null ||
+			usage.cache_creation_input_tokens != null ||
+			cacheCreation != null,
 	};
 }
 
@@ -288,5 +299,6 @@ export function extractOpenAIUsage(usage: {
 			usage.output_tokens_details?.reasoning_tokens ??
 			usage.completion_tokens_details?.reasoning_tokens ??
 			0,
+		cacheReported: cachedInputTokens !== undefined || cacheCreationInputTokens !== undefined,
 	};
 }

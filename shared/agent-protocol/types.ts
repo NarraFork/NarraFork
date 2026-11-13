@@ -298,6 +298,12 @@ export interface ParsedStreamEvent {
 		cacheCreationInputTokens?: number;
 		cacheCreation5mTokens?: number;
 		cacheCreation1hTokens?: number;
+		/**
+		 * Whether the upstream response carried cache counters at all. `false` means the
+		 * provider reported usage without them (zeros above are fillers, not misses);
+		 * absent means this adapter does not know. Feeds the cache hit rate denominator.
+		 */
+		cacheReported?: boolean;
 		/** Provider-specific effective context window used for this usage snapshot. */
 		contextWindow?: number;
 	};

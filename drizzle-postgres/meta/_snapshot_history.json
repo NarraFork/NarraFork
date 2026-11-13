@@ -579,11 +579,11 @@
 		},
 		{
 			"idx": 72,
-			"tag": "0072_outline_spec_loss",
-			"id": "82458f42-8b9f-4109-ad9a-25efd456c082",
+			"tag": "0072_api_request_cache_usage_reported",
+			"id": "11493ae9-9036-4353-b911-18624a649666",
 			"prevId": "c8a9eeba-aacb-4856-b151-f491477a6d62",
 			"version": "7",
-			"snapshotDigest": "555e158501ff931c4a7eaba04532cf107f97a0722d83a9a5e92b79e22b063d58"
+			"snapshotDigest": "a99655ddcd191560e9e7b012214cf92ec9efa813515a472cd06bed4251eb15d6"
 		}
 	]
 }
