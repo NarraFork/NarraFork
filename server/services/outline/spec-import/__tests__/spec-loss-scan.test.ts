@@ -47,6 +47,7 @@ import {
 	outlineSpecLossFindings,
 	outlineSpecLossScans,
 	specFileRevisions,
+	specNamespaces,
 	users,
 } from "../../../../db/schema";
 import { AppError } from "../../../../lib/errors";
@@ -136,8 +137,11 @@ beforeEach(async () => {
 	resetSpecLossScanState();
 	// The saves these cases make count as made with the old editor (before the scan first ran).
 	settings.outline.specLossCutoff = FAR;
-	// Passes walk every session: earlier cases' rows would be scanned again.
+	// A pass walks every spec namespace of the database. Earlier cases' sessions are taken out of
+	// its way (their namespaces, with their revisions), so a pass does this case's work only and
+	// its duration does not grow with the number of cases before it.
 	await db.delete(outlineSpecLossScans);
+	await db.delete(specNamespaces);
 });
 afterAll(async () => {
 	await settleSpecLossPass();
@@ -969,6 +973,17 @@ describe("the behavior fence is never attached by a pass", () => {
 		const after = await behaviorView(id);
 		expect(after).toContain("deploy freely");
 		expect(after).not.toContain("force-push");
+		// The content is a rule; the block's own line, which speaks to the person, is not.
+		const header = (await outlineStore.getBlock(result.blockId as string))?.content ?? "";
+		expect(header).toContain("Possibly lost content");
+		expect(after).not.toContain("Possibly lost content");
+		expect(after).not.toContain("delete this block");
+		// A fork copies the block whole (its view leaves the header out the same way).
+		const fork = await makeSession({ owner, backend: "outline" });
+		expect(await copyOutlineBehaviorPage(id, fork.id)).toBe(true);
+		const forkView = await behaviorView(fork.id);
+		expect(forkView).toContain("deploy freely");
+		expect(forkView).not.toContain("Possibly lost content");
 		// Dismissed and reopened: listed again; it takes the confirmation again.
 		await decideSpecLossFinding({
 			id: tables?.id as string,
@@ -1303,6 +1318,33 @@ describe("attaches that do not go through", () => {
 			{ id: findingId, attachNote: "block_deleted" },
 		]);
 		expect((await designPage(id))?.blocks[0]).not.toContain("Possibly lost content");
+	});
+
+	test("a block someone else wrote under the attach's short id is not adopted", async () => {
+		const { id, owner, findingId } = await imported({ language: "en" });
+		const spaceId = await spaceOf(id);
+		const page = await designPage(id);
+		// Short ids may be chosen by a writer: an agent's block under the one the attach would use.
+		await writeOutline({
+			spaceId,
+			ops: [
+				{
+					op: "insert",
+					sid: specLossBlockSid(findingId),
+					parent: { sid: page?.sid as string },
+					content: "not the lost table",
+				},
+			],
+			actor: { kind: "narrator", id },
+			responsibleUserId: owner,
+		});
+		const commits = await commitCount(id);
+		const session = await readSpecImportSession(id);
+		if (!session) throw new Error("no session");
+		expect(await attachSpecLossForSession(session)).toEqual({ attached: 0, left: 1 });
+		expect(await all(id, "attached")).toEqual([]);
+		expect((await open(id))[0]).toMatchObject({ attachNote: "failed", blockId: null });
+		expect(await commitCount(id)).toBe(commits);
 	});
 
 	test("the session's backend is read again before attaching: a stale listing writes nothing", async () => {

@@ -43,8 +43,12 @@
  * page by itself; should one stand here all the same, it and what is under it are left out of
  * everything that reads the page as rules ({@link dropSpecLossAttachBlocks}): the view shown to
  * the model, the text put ahead of the spec fence, and a fork's copy. A rule a person deleted on
- * purpose must not apply again because a check found it. Content a person attached here through
- * the confirmation that says so is an ordinary block (`sr…`) and is read.
+ * purpose must not apply again because a check found it. That holds for an `sl…` block a person
+ * moved onto this page by hand too: to make its content a rule, move the content out of the
+ * block, or attach the finding through the confirmation. Content a person attached here through
+ * the confirmation is under an `sr…` block: the content is read as rules and copied by a fork;
+ * the block's own line speaks to the person (what this is, that it may be moved or deleted) and
+ * is not a rule, so what is shown to the model has the content in its place (`rulesOnly`).
  */
 import { createHash } from "node:crypto";
 import { hotSafe } from "@server/lib/hot-safe";
@@ -55,7 +59,7 @@ import {
 	getUserLanguage,
 	type Locale,
 } from "@server/lib/prompt-i18n";
-import { isSpecLossAttachSid } from "@shared/outline-spec-import";
+import { isSpecLossAttachSid, isSpecLossRuleSid } from "@shared/outline-spec-import";
 import { splitBehaviorFence } from "../behavior-fence-sop";
 import { readNarrator } from "../outline/access-reads";
 import type { EditTextItem } from "../outline/edit-text";
@@ -112,18 +116,30 @@ export async function findBehaviorPage(
 /**
  * Take the swallowed-content scan's attach blocks, with what is under them, out of a behavior
  * page's tree as it was just read (see the module header); the tree is the caller's own, built
- * for this read. How many subtrees were taken out.
+ * for this read. `rulesOnly` (what the model is shown): the header of content a person confirmed
+ * as rules is replaced by what is under it. How many subtrees were taken out.
  */
-export function dropSpecLossAttachBlocks(root: OutlineNode): number {
+export function dropSpecLossAttachBlocks(
+	root: OutlineNode,
+	options: { rulesOnly?: boolean } = {},
+): number {
 	let dropped = 0;
 	const walk = [root];
 	for (let i = 0; i < walk.length; i++) {
 		const node = walk[i] as OutlineNode;
-		const kept = node.children.filter((child) => !isSpecLossAttachSid(child.sid));
-		if (kept.length !== node.children.length) {
-			dropped += node.children.length - kept.length;
-			node.children = kept;
+		const kept: OutlineNode[] = [];
+		for (const child of node.children) {
+			if (isSpecLossAttachSid(child.sid)) dropped++;
+			else if (options.rulesOnly && isSpecLossRuleSid(child.sid)) {
+				// Its children stand where it stood.
+				for (const under of child.children) {
+					under.parent = node;
+					under.parentId = node.id;
+					kept.push(under);
+				}
+			} else kept.push(child);
 		}
+		node.children = kept;
 		walk.push(...kept);
 	}
 	return dropped;

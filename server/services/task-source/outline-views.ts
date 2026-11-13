@@ -921,7 +921,8 @@ async function renderBehaviorPage(
 	const { state, root } = subtree;
 	// Content the swallowed-content scan attached is never shown as a rule (outline P2 PR 12c): a
 	// rule a person removed must not apply again because a check found it.
-	dropSpecLossAttachBlocks(root);
+	// Of content a person confirmed as rules, the content only: its header speaks to the person.
+	dropSpecLossAttachBlocks(root, { rulesOnly: true });
 	const min = OUTLINE_VIEW_LIMITS.behaviorBlockMinChars;
 	const order = breadthFirst(root, "all", maxBlocks);
 	// A character is at most three UTF-8 bytes in the text a page holds.

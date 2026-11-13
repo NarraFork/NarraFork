@@ -12,7 +12,9 @@
  * BEHAVIOR FENCE is ever attached by a pass, whatever its kind: its page is shown to the model as
  * standing rules, so a rule a person removed would apply again. A person may attach it there,
  * through a confirmation that says the agent will read it as a rule; that block gets its own kind
- * of short id (`sr…`). Any other attach block (`sl…`) on the behavior page is left out of what
+ * of short id (`sr…`); what is under it is read as rules, while its header line, which speaks to
+ * the person ("possibly lost content … move it back or delete this block"), is not shown to the
+ * model. Any other attach block (`sl…`) on the behavior page is left out of what
  * the model is shown and of what a fork copies (`task-source/outline-behavior.ts`). A finding a
  * fork inherited (the save was made in the session it was forked from) is attached in that
  * session only and listed in the fork.
@@ -47,7 +49,9 @@
  * IDEMPOTENT
  *
  * The block's short id follows from (finding, its attach sequence): an attach that wrote the
- * block and did not get to record it finds the block and records it, never a second one. When
+ * block and did not get to record it finds the block and records it, never a second one (only a
+ * block this module created is taken for it: a block someone else wrote under that short id is
+ * not adopted, and the attach fails). When
  * that unrecorded block was deleted by a person or an agent meanwhile, it is not written again:
  * the finding is dismissed (`block_deleted`).
  *
@@ -337,6 +341,20 @@ async function deleterOf(
 }
 
 /**
+ * A live block that holds an attach's short id is taken for the attach's own only when this
+ * module created it: a short id may be chosen by whoever writes a block, and a block someone else
+ * put under that id is not the finding's. Rejects otherwise (the attach fails; nothing is
+ * recorded as attached).
+ */
+async function adopted(space: OutlineSpaceRow, blockId: string): Promise<string> {
+	const [first] = await outlineStore.listBlockVersions(blockId, 1);
+	const [commit] = first ? await outlineStore.getCommitsBySeqs(space.id, [first.fromSeq]) : [];
+	if (commit?.actorKind !== "system" || commit.actorId !== OUTLINE_SPEC_LOSS_ACTOR)
+		throw new Error("spec loss attach: a block it did not write holds its short id");
+	return blockId;
+}
+
+/**
  * Attach one finding (see the module header). `auto`: the pass's attach, only of what a pass
  * attaches, with the restored check, the page cap and the re-attach cap; a person's own request
  * has none of them. Rejects when the conversion or the write fails (nothing is written then).
@@ -360,7 +378,7 @@ async function attachOne(
 		sids: [specLossBlockSid(row.id, seq, rule)],
 	});
 	// Written before and not recorded (the process stopped in between): that block is the one.
-	if (written && !written.deleted) return { blockId: written.id };
+	if (written && !written.deleted) return { blockId: await adopted(space, written.id) };
 	if (options.auto) {
 		if (written?.deleted) {
 			// Written, not recorded, and deleted since by a person or an agent: disposed of.
@@ -379,7 +397,7 @@ async function attachOne(
 		[written] = await outlineStore.getBlockMetas(space.id, {
 			sids: [specLossBlockSid(row.id, seq, rule)],
 		});
-		if (written && !written.deleted) return { blockId: written.id };
+		if (written && !written.deleted) return { blockId: await adopted(space, written.id) };
 		if (written) throw new Error("spec loss attach: the next block was deleted meanwhile");
 	}
 	const owner = options.userId ?? ctx.session.ownerUserId;
