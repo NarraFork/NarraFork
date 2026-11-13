@@ -43,6 +43,7 @@ import {
 } from "../read/acl-sql";
 import type { OutlineSpaceKind } from "./model";
 import { chunked, type OutlineSpaceRow } from "./store/port";
+import { sqliteTaskPredicateText } from "./store/sqlite-store";
 
 type Row = Record<string, unknown>;
 
@@ -950,12 +951,15 @@ export async function readOutlineTreeSpaceFacts(
 ): Promise<Map<string, OutlineTreeSpaceFacts>> {
 	const out = new Map<string, OutlineTreeSpaceFacts>();
 	const pg = executor().dialect === "postgres";
-	// The partial indexes' own predicates, word for word, so each subquery is served by its index.
-	const status = pg
-		? `(b."task_json"::jsonb #>> '{status}')`
-		: `json_extract(b."task_json", '$.status')`;
-	const lock = pg ? `(b."task_json"::jsonb #>> '{lock}')` : `json_extract(b."task_json", '$.lock')`;
-	const live = pg ? `b."deleted" = FALSE` : `b."deleted" = 0`;
+	// The partial indexes' own predicates, word for word, so each subquery is served by its
+	// index: the JSON reads are each backend's own (SQLite's are kept with its store).
+	const { status, lock, live } = pg
+		? {
+				status: `(b."task_json"::jsonb #>> '{status}')`,
+				lock: `(b."task_json"::jsonb #>> '{lock}')`,
+				live: `b."deleted" = FALSE`,
+			}
+		: sqliteTaskPredicateText("b");
 	const doing = sql.raw(
 		`${live} AND (${status} = 'doing' OR (${status} = 'todo' AND ${lock} IS NOT NULL)) AND ${status} = 'doing'`,
 	);

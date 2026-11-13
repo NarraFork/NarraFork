@@ -93,13 +93,12 @@
 	min-width: 3em;
 }
 
-/* "Show in the outline tree", at the end of the bar: an icon, always drawn. */
+/* "Show in the outline tree", among the page's controls beside the bar: an icon, always drawn. */
 .crumbLocate {
 	flex: none;
 	display: inline-flex;
 	align-items: center;
-	margin-inline-start: 4px;
-	padding: 2px;
+	padding: 4px;
 	border-radius: var(--mantine-radius-sm);
 	color: var(--mantine-color-dimmed);
 }

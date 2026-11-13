@@ -26,27 +26,20 @@ type Ancestor = OutlineBlockViewResponse["path"][number];
  *
  * One line, always: crumbs truncate, and a deep path folds its middle into a "…" menu
  * (`planCrumbs`).
- *
- * `locate` (readability F): the bar ends with "show in the outline tree" — the reader is taken
- * to the tree, where what this block is under opens and the tree scrolls to it.
  */
 export function OutlineBreadcrumbs({
 	view,
 	search,
 	path,
-	locate,
 }: {
 	view: OutlineBlockViewResponse;
 	search: OutlineBlockSearch;
 	path?: OutlineBlockViewResponse["path"];
-	/** The focused block, and the host whose tree shows it (the outline page, a dock panel). */
-	locate?: { host: TreeHost; blockId: string; title: string };
 }) {
 	const { t, i18n } = useTranslation("outline");
 	const spaceName = useOutlineSpaceName();
 	const parent = useOutlineSpaceParent(view.space.id, view.space.kind === "session").data;
-	const above = path ?? view.path;
-	const plan = planCrumbs(above);
+	const plan = planCrumbs(path ?? view.path);
 	const targetOf = (ancestor: Ancestor) =>
 		outlineBlockTarget(view.space.id, ancestor.id, search.view, search.asOf);
 	// An ancestor that is a subagent report's container reads as on its own page.
@@ -139,35 +132,53 @@ export function OutlineBreadcrumbs({
 					{crumb(ancestor, ancestor.id === lastId)}
 				</Fragment>
 			))}
-			{locate && (
-				<OutlineLink
-					to={{ kind: "home" }}
-					className={classes.crumbLocate}
-					aria-label={t("tree.locate")}
-					title={t("tree.locate")}
-					data-testid="outline-locate"
-					onClick={(event) => {
-						// Only a plain click goes to this host's tree (a new tab has its own).
-						if (
-							event.button !== 0 ||
-							event.ctrlKey ||
-							event.metaKey ||
-							event.shiftKey ||
-							event.altKey
-						)
-							return;
-						requestTreeLocate(locate.host, {
-							spaceId: view.space.id,
-							pageId: above[0]?.id ?? locate.blockId,
-							blockId: locate.blockId,
-							pathIds: above.map((ancestor) => ancestor.id),
-							pageTitle: above[0]?.title ?? locate.title,
-						});
-					}}
-				>
-					<IconBinaryTree2 size={14} />
-				</OutlineLink>
-			)}
 		</nav>
+	);
+}
+
+/**
+ * "Show in the outline tree" (readability F), beside the bar, among the page's controls: the
+ * reader is taken to the tree, where what this block is under opens and the tree scrolls to it.
+ * Not a crumb and not in the bar: the crumbs' one line is theirs alone.
+ */
+export function OutlineLocateLink({
+	view,
+	path,
+	host,
+	blockId,
+	title,
+}: {
+	view: OutlineBlockViewResponse;
+	path?: OutlineBlockViewResponse["path"];
+	/** The host whose tree shows it (the outline page, a dock panel). */
+	host: TreeHost;
+	/** The focused block and its title. */
+	blockId: string;
+	title: string;
+}) {
+	const { t } = useTranslation("outline");
+	const above = path ?? view.path;
+	return (
+		<OutlineLink
+			to={{ kind: "home" }}
+			className={classes.crumbLocate}
+			aria-label={t("tree.locate")}
+			title={t("tree.locate")}
+			data-testid="outline-locate"
+			onClick={(event) => {
+				// Only a plain click goes to this host's tree (a new tab has its own).
+				if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey)
+					return;
+				requestTreeLocate(host, {
+					spaceId: view.space.id,
+					pageId: above[0]?.id ?? blockId,
+					blockId,
+					pathIds: above.map((ancestor) => ancestor.id),
+					pageTitle: above[0]?.title ?? title,
+				});
+			}}
+		>
+			<IconBinaryTree2 size={16} />
+		</OutlineLink>
 	);
 }

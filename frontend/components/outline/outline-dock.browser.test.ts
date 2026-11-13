@@ -1124,11 +1124,7 @@ test("the breadcrumbs stay on one line in a narrow panel: ancestors only, the mi
 				const tops = new Set(items.map((el) => Math.round(el.getBoundingClientRect().top / 4)));
 				const first = items[0]?.getBoundingClientRect();
 				return {
-					// The crumbs (the bar's last control, "show in the outline tree", is not one).
-					links: [...nav.querySelectorAll("a:not([data-testid=outline-locate])")].map(
-						(a) => a.textContent?.trim() ?? "",
-					),
-					locate: nav.querySelector("a[data-testid=outline-locate]") === nav.lastElementChild,
+					links: [...nav.querySelectorAll("a")].map((a) => a.textContent?.trim() ?? ""),
 					// One line: every crumb and separator starts on the same row…
 					rows: tops.size,
 					// …and the bar is no taller than a line and a half of its first crumb.
@@ -1149,13 +1145,7 @@ test("the breadcrumbs stay on one line in a narrow panel: ancestors only, the mi
 		expect(shown?.links.slice(0, 1)).toEqual(["Outline"]);
 		expect(shown?.links.slice(2)).toEqual(["Tidy page", DEEP_TITLES[3] as string]);
 		expect(shown?.links).not.toContain(DEEP_TITLES[4] as string);
-		expect(shown).toMatchObject({
-			rows: 1,
-			oneLine: true,
-			inside: true,
-			surfaceScrolls: false,
-			locate: true,
-		});
+		expect(shown).toMatchObject({ rows: 1, oneLine: true, inside: true, surfaceScrolls: false });
 		expect(shown?.cut).toBeGreaterThan(0);
 
 		// The fold lists what it stands for, outermost first, and each entry focuses its block.
@@ -1177,8 +1167,24 @@ test("the breadcrumbs stay on one line in a narrow panel: ancestors only, the mi
 			(f) => f.outlinePanels()[0]?.title === "Level two is long as well and would not fit either",
 		);
 		expect((await call(page, (f) => f.outlinePanels()))[0]?.params.blockId).toBe(tidy.deep[1]);
-		// One level up there is less to fold: page and parent, no "…".
-		expect((await bar())?.links.slice(2)).toEqual(["Tidy page", DEEP_TITLES[0] as string]);
+		// One level up there is less to fold: page and parent, no "…". (The bar follows the read
+		// of the newly focused block, which may land a moment after the panel's title.)
+		const wanted = ["Tidy page", DEEP_TITLES[0] as string];
+		const deadline = Date.now() + 10_000;
+		while (
+			Date.now() < deadline &&
+			JSON.stringify((await bar())?.links.slice(2)) !== JSON.stringify(wanted)
+		) {
+			await page.waitForFunction(() => new Promise((r) => requestAnimationFrame(() => r(true))));
+		}
+		expect((await bar())?.links.slice(2)).toEqual(wanted);
+		// The page's "show in the outline tree" is among its controls, not in the bar.
+		expect(
+			await page.evaluate(() => {
+				const link = document.querySelector("[data-testid=outline-locate]");
+				return !!link && !link.closest("[data-testid=outline-crumbs]");
+			}),
+		).toBe(true);
 		expect(await page.$("[data-testid=outline-crumbs-more]")).toBeNull();
 		expect((await bar())?.rows).toBe(1);
 		expect(errors).toEqual([]);
