@@ -34,6 +34,8 @@ import {
 	desc,
 	eq,
 	gt,
+	inArray,
+	isNull,
 	lt,
 	ne,
 	or,
@@ -1164,6 +1166,85 @@ function publicTraitsResponse(traits: unknown): string[] {
 	return redactInternalTraits(traits);
 }
 
+/**
+ * 每个主会话最多带出的顺便提问子会话行数。列表只在主项下面挂几行，正常量级是个位数；
+ * 这个上限只用来防无上限查询，超出时按最近更新截断。总行数 = 本页主项数 × 该值。
+ */
+const ASK_IN_PASSING_CHILD_ROWS_PER_PARENT = 20;
+
+/**
+ * 当前页主会话各自挂着的顺便提问子会话。
+ *
+ * 行结构与主项一致（`publicNarratorResponse`），但不参与终端、容器与观众统计——那些
+ * 徽章对缩进的一行没有意义。`readableWhere` 必须是调用方那条可见性谓词，否则会把调用
+ * 方无权读取的顺便提问一起带出来。
+ */
+async function askInPassingChildrenByParent(
+	parentIds: string[],
+	archived: boolean,
+	readableWhere: ReturnType<typeof narratorReadableWhere>,
+) {
+	const rows =
+		parentIds.length === 0
+			? []
+			: await db.query.narrators.findMany({
+					columns: { runtimeRegistrationJson: false },
+					where: and(
+						eq(narrators.isAskInPassing, true),
+						inArray(narrators.parentNarratorId, parentIds),
+						archived ? eq(narrators.status, "archived") : ne(narrators.status, "archived"),
+						readableWhere,
+					),
+					orderBy: [desc(narrators.updatedAt), desc(narrators.id)],
+					limit: parentIds.length * ASK_IN_PASSING_CHILD_ROWS_PER_PARENT,
+				});
+	const byParent = new Map<string, (typeof rows)[number][]>();
+	for (const row of rows) {
+		const parentId = row.parentNarratorId;
+		if (!parentId) continue;
+		const siblings = byParent.get(parentId);
+		if (siblings) siblings.push(row);
+		else byParent.set(parentId, [row]);
+	}
+	return byParent;
+}
+
+/** 级联归档/解除归档每批处理多少个顺便提问子会话。 */
+const ASK_IN_PASSING_CASCADE_BATCH = 200;
+
+/**
+ * 列表里这条顺便提问会话该挂在谁下面。
+ *
+ * 在顺便提问会话里再顺便提问时，新会话要拍平到最外层的那条会话：列表的子项只有一层，
+ * 嵌套会让它因为父项本身不在顶层而完全不显示。
+ */
+export function askInPassingListParentId(
+	source: { isAskInPassing: boolean | null; parentNarratorId: string | null } | null | undefined,
+	sourceId: string,
+) {
+	return source?.isAskInPassing ? (source.parentNarratorId ?? sourceId) : sourceId;
+}
+
+/**
+ * 主会话归档/解除归档时要连带的那批顺便提问子会话。
+ *
+ * 只取状态还需要翻转的那些：归档时排除已归档的，解除归档时只取归档中的。调用方处理
+ * 完一批，下一批的查询就自然不含它们了，所以这既是分批上限也是一次收集全部的方式。
+ */
+function pendingAskInPassingCascade(id: string, target: "archived" | "active") {
+	return db
+		.select({ id: narrators.id, title: narrators.title })
+		.from(narrators)
+		.where(
+			and(
+				eq(narrators.isAskInPassing, true),
+				eq(narrators.parentNarratorId, id),
+				target === "archived" ? ne(narrators.status, "archived") : eq(narrators.status, "archived"),
+			),
+		)
+		.limit(ASK_IN_PASSING_CASCADE_BATCH);
+}
+
 // List narrators (paginated)
 narratorRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
@@ -1192,11 +1273,24 @@ narratorRoutes.get("/", async (c) => {
 	// page: filtering afterwards would break `LIMIT limit + 1` as the "hasMore"
 	// signal and make `totalCount` count narrators the caller cannot see. Returns
 	// undefined for admins, which `and(...)` treats as no extra restriction.
+	const readableWhere = narratorReadableWhere(narratorPrincipalOf(c));
+	// 顺便提问会话只在「它的父会话也在同一批列表里」时挂到父下面。父被删掉（parent 置空），
+	// 或父的状态与本列表不符（父已归档、子还没归档这类历史数据）时它自己占一行，否则它会
+	// 从这两个列表里同时消失。父的 id 是主键，这条 EXISTS 是逐行的主键查找。
+	const parentInSameList =
+		status === "archived"
+			? sql`exists (select 1 from narrators p where p.id = ${narrators.parentNarratorId} and p.status = 'archived')`
+			: sql`exists (select 1 from narrators p where p.id = ${narrators.parentNarratorId} and p.status <> 'archived')`;
 	const conditions = [
 		eq(narrators.variant, "primary"),
 		// 系统内部叙述者（ModelTrace 舱）不进列表，只能从自己的入口凭 id 打开。
 		eq(narrators.hiddenFromLists, false),
-		narratorReadableWhere(narratorPrincipalOf(c)),
+		or(
+			ne(narrators.isAskInPassing, true),
+			isNull(narrators.parentNarratorId),
+			sql`not (${parentInSameList})`,
+		),
+		readableWhere,
 	];
 
 	if (status === "archived") {
@@ -1366,6 +1460,13 @@ narratorRoutes.get("/", async (c) => {
 	const presenceMap = getNarratorPresenceBatch(narratorIds);
 	const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
 
+	// 顺便提问子会话跟着主项走，不单独分页；归档页只挂已归档的那些。
+	const askInPassingChildren = await askInPassingChildrenByParent(
+		narratorIds,
+		status === "archived",
+		readableWhere,
+	);
+
 	// Batch fetch active background task counts (subagents + bash + transfers).
 	// Lazy import matches the other background-task routes in this file.
 	let backgroundTaskCounts:
@@ -1396,6 +1497,9 @@ narratorRoutes.get("/", async (c) => {
 		containerCount: containerCounts.get(n.id)?.total ?? 0,
 		runningContainerCount: containerCounts.get(n.id)?.running ?? 0,
 		viewers: presenceMap.get(n.id) ?? [],
+		askInPassingSessions: (askInPassingChildren.get(n.id) ?? []).map((child) =>
+			publicNarratorResponse(child),
+		),
 	}));
 
 	return c.json({ items, hasMore, nextCursor, totalCount });
@@ -5876,13 +5980,54 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 	await narratorService.getById(id);
 	// 归档会删掉侧栏那一行（连同它所在的文件夹）。先记住位置，撤销归档时才放得回去。
 	const { rememberArchivedTabPlacement } = await import("../services/recent-tabs-service");
-	await rememberArchivedTabPlacement(c.get("user").sub, id);
 	// HTTP write ACL and Agent controller authorization share the same mechanism:
 	// end the complete run (including a hold), then archive any kind of session.
 	const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
+
+	// 顺便提问子会话跟主会话绑在一起，归档主会话就把它们一起归档。
+	const archivedChildIds: string[] = [];
+	for (;;) {
+		const batch = await pendingAskInPassingCascade(id, "archived");
+		if (batch.length === 0) break;
+		for (const child of batch) {
+			await rememberArchivedTabPlacement(c.get("user").sub, child.id);
+			const childResult = await interruptAndArchiveSubagent(child.id);
+			// 子会话刚被别处删掉不算失败：主会话的归档不该被它挡住。
+			if (!childResult.ok && childResult.error !== "not_found") {
+				throw new ValidationError(childResult.error ?? "Failed to archive narrator");
+			}
+			archivedChildIds.push(child.id);
+		}
+		if (batch.length < ASK_IN_PASSING_CASCADE_BATCH) break;
+	}
+
+	await rememberArchivedTabPlacement(c.get("user").sub, id);
 	const result = await interruptAndArchiveSubagent(id);
 	if (!result.ok && result.error === "not_found") throw new NotFoundError("Narrator", id);
 	if (!result.ok) throw new ValidationError(result.error ?? "Failed to archive narrator");
+	return c.json({ ok: true, archivedChildIds });
+});
+
+// Unarchive narrator
+narratorRoutes.patch("/:id/unarchive", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	// 位置还留着、文件夹也还在时，直接回到它原来所在的那一层。
+	const { restoreArchivedTabPlacement } = await import("../services/recent-tabs-service");
+
+	// 主会话回到列表时，绑在它身上的顺便提问也一起回来。
+	for (;;) {
+		const batch = await pendingAskInPassingCascade(id, "active");
+		if (batch.length === 0) break;
+		for (const child of batch) {
+			await narratorService.updateStatus(child.id, "idle");
+			await restoreArchivedTabPlacement(c.get("user").sub, child.id, child.title ?? child.id);
+		}
+		if (batch.length < ASK_IN_PASSING_CASCADE_BATCH) break;
+	}
+
+	await narratorService.updateStatus(id, "idle");
+	await restoreArchivedTabPlacement(c.get("user").sub, id, narrator.title ?? id);
 	return c.json({ ok: true });
 });
 
@@ -6159,6 +6304,14 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	// Auto-generate title from the question (truncate to 80 chars, take first line)
 	const title = question.replace(/\n.*/s, "").slice(0, 80);
 
+	// 在顺便提问会话里再顺便提问时，把新会话挂到最外层的那条会话下：列表里的子项只有
+	// 一层，嵌套会让它因为父项本身不在顶层而彻底不显示。fork 的上下文仍来自源会话。
+	const source = await db.query.narrators.findFirst({
+		columns: { isAskInPassing: true, parentNarratorId: true },
+		where: eq(narrators.id, id),
+	});
+	const listParentId = askInPassingListParentId(source, id);
+
 	// Fork narrator from the source recorded in the pending card (single source of truth)
 	const newNarrator = await narratorService.forkNarrator(id, sourceMessageUuid, {
 		inheritMode: "full",
@@ -6174,7 +6327,12 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const aipTraits = addTrait(parseTraits(newNarrator.traits), "ask-in-passing");
 	await db
 		.update(narrators)
-		.set({ permissionMode: "readOnly", isAskInPassing: true, traits: aipTraits })
+		.set({
+			permissionMode: "readOnly",
+			isAskInPassing: true,
+			traits: aipTraits,
+			...(listParentId === id ? {} : { parentNarratorId: listParentId }),
+		})
 		.where(eq(narrators.id, newNarrator.id));
 
 	// Send the user's question to the new narrator.

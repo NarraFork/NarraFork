@@ -57,6 +57,7 @@
 	"dragToSidebar": "拖到侧栏排序，或拖到某个工作区加入其中",
 	"archive": "归档",
 	"unarchive": "取消归档",
+	"askInPassingSessions": "顺便提问（{{count}}）",
 	"archivedNarrators": "已归档叙述者",
 	"viewArchived": "查看已归档",
 	"backToNarrators": "返回叙述者列表",
