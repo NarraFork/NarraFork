@@ -25,7 +25,7 @@ import {
 	useQueryClient,
 } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { OutlineViewState } from "../components/outline/view-state";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
@@ -161,6 +161,11 @@ export function useOutlineBlock(
 		blocks?: number;
 		/** Byte budget (the server's default when absent). */
 		bytes?: number;
+		/**
+		 * Leave out what is behind closed rows (the connected outline's pages): the server folds
+		 * by the page's default with the reader's stored folding over it.
+		 */
+		fold?: "default";
 		enabled?: boolean;
 		/**
 		 * Keep showing the previous read of the same space while another block loads: the live
@@ -169,14 +174,15 @@ export function useOutlineBlock(
 		keepSpace?: boolean;
 	},
 ) {
-	const { asOf, view, blocks, bytes, keepSpace } = options;
+	const { asOf, view, blocks, bytes, fold, keepSpace } = options;
 	return useQuery({
 		queryKey: [
 			...outlineKeys.block(spaceId, blockId, asOf ?? null, view),
 			blocks ?? null,
 			...(bytes !== undefined ? [bytes] : []),
+			...(fold ? [fold] : []),
 		],
-		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks, bytes }),
+		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks, bytes, fold }),
 		enabled: !REMOTE_BUILD && (options.enabled ?? true),
 		retry: false,
 		// A view as of a commit never changes; the current one is refreshed by the subscription.
@@ -248,23 +254,60 @@ export function prefetchOutlineSeed(
 const loadedViewStates = new WeakSet<OutlineViewState>();
 
 /**
+ * Whether a surface's view state holds what is stored for the person:
+ *   - `pending`: the stored state is being read; what the surface has is not theirs yet;
+ *   - `applied`: it holds the stored state (or nothing was stored), with their changes on top;
+ *   - `unseen`: the read failed: the stored state is not known here.
+ * Nothing is written before `applied` (a state that never saw the stored one would replace it),
+ * and anything that folds on the reader's behalf (not by their own hand) waits for it too.
+ */
+export type OutlineViewStateSync = "pending" | "applied" | "unseen";
+const viewStateSync = new WeakMap<OutlineViewState, OutlineViewStateSync>();
+/** View states changed while their stored state was not read yet: written once it is. */
+const heldViewStateWrites = new WeakSet<OutlineViewState>();
+/** View states whose direction the person changed before the stored one arrived. */
+const earlyLayouts = new WeakSet<OutlineViewState>();
+
+/**
  * Keep a surface's folding and mind-map direction of a page in step with the person's stored
  * view state (`/api/outline/view-state/:pageId`, design §7.1): read once when the page is first
- * shown (unless the person already folded something here), and written back, debounced, after
- * every change. Failures are quiet: the view state is the person's convenience, kept locally.
+ * shown, and written back, debounced, after every change.
+ *
+ * THE STORED STATE IS NEVER REPLACED UNREAD. A write replaces the whole row, so none is sent
+ * until the stored state has been read: a change made meanwhile is kept and written after. When
+ * the stored state arrives after such a change it is laid UNDER it: the stored folding, then
+ * the blocks the person opened or closed here on top (and their direction, if they chose one).
+ * When the read fails, nothing is written for this surface (its folding lasts for the session);
+ * the next time the page is shown the read is made again.
+ *
+ * Other failures are quiet: the view state is the person's convenience, kept locally.
  */
 export function useOutlineViewStateSync(
 	pageId: string | undefined,
 	state: OutlineViewState | null,
-): void {
+): OutlineViewStateSync {
+	const [sync, setSync] = useState<OutlineViewStateSync>(
+		() => (state && viewStateSync.get(state)) || "pending",
+	);
 	useEffect(() => {
 		if (REMOTE_BUILD) return;
 		if (!pageId || !state || state.pageId !== pageId) return;
-		let disposed = false;
-		let touched = false;
+		// (Also after this run of the effect was disposed: the state object outlives it, and the
+		// read is made once per object.)
+		const settle = (value: OutlineViewStateSync) => {
+			viewStateSync.set(state, value);
+			setSync(value);
+		};
+		setSync(viewStateSync.get(state) ?? "pending");
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const write = () => {
 			timer = null;
+			const known = viewStateSync.get(state);
+			if (known !== "applied") {
+				// Not read yet: held until it is. Read failed: not written at all.
+				if (known !== "unseen") heldViewStateWrites.add(state);
+				return;
+			}
 			// Block ids only (the server refuses anything else); the last write of the page wins.
 			// What the reader opened and what they closed share one limit.
 			const ok = (ids: Iterable<string>) =>
@@ -279,7 +322,7 @@ export function useOutlineViewStateSync(
 		};
 		const off = state.on((part) => {
 			if (part !== "collapsed" && part !== "layout") return;
-			touched = true;
+			if (part === "layout" && viewStateSync.get(state) !== "applied") earlyLayouts.add(state);
 			if (timer) clearTimeout(timer);
 			timer = setTimeout(write, OUTLINE_VIEW_STATE_LIMITS.writeDebounceMs);
 		});
@@ -288,13 +331,42 @@ export function useOutlineViewStateSync(
 			api
 				.getOutlineViewState(pageId)
 				.then((stored) => {
-					if (disposed || touched || stored.updatedAt === null) return;
-					state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
+					// What the surface holds now is what the person did here before this arrived
+					// (it started empty): it goes on top of what is stored.
+					const opened = [...state.expanded];
+					const closed = [...state.collapsed];
+					const early = opened.length > 0 || closed.length > 0 || earlyLayouts.has(state);
+					if (stored.updatedAt !== null) {
+						const layout = earlyLayouts.has(state) ? state.layout : stored.layout;
+						if (early) {
+							const expanded = new Set(stored.expanded ?? []);
+							const collapsed = new Set(stored.collapsed);
+							for (const id of opened) {
+								expanded.add(id);
+								collapsed.delete(id);
+							}
+							for (const id of closed) {
+								collapsed.add(id);
+								expanded.delete(id);
+							}
+							state.applyStored(collapsed, expanded, layout);
+						} else {
+							state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
+						}
+					}
+					earlyLayouts.delete(state);
+					settle("applied");
+					// A change made (or a write held) meanwhile is written now, over what was read.
+					if (heldViewStateWrites.delete(state) || (early && timer === null)) write();
 				})
-				.catch(() => loadedViewStates.delete(state));
+				.catch(() => {
+					// Read again the next time the page is shown; nothing is written meanwhile.
+					loadedViewStates.delete(state);
+					heldViewStateWrites.delete(state);
+					settle("unseen");
+				});
 		}
 		return () => {
-			disposed = true;
 			off();
 			if (timer) {
 				clearTimeout(timer);
@@ -302,6 +374,7 @@ export function useOutlineViewStateSync(
 			}
 		};
 	}, [pageId, state]);
+	return sync;
 }
 
 export function useOutlineTimeline(spaceId: string, pageId: string | undefined) {
@@ -340,6 +413,29 @@ export function useOutlineBacklinks(spaceId: string, blockId: string, enabled: b
 		queryFn: () => api.getOutlineBacklinks(spaceId, blockId),
 		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
+	});
+}
+
+/**
+ * A search a page at a time (the search drawn as a tree, `tree/OutlineSearchTree.tsx`): the next
+ * page is read only when the reader asks, and a search never reaches past what the server ranks.
+ */
+export function useOutlineSearchPages(q: string, spaceId: string | null, enabled: boolean) {
+	const trimmed = q.trim();
+	return useInfiniteQuery({
+		queryKey: [...outlineKeys.search(trimmed, spaceId), "pages"],
+		queryFn: ({ pageParam }) =>
+			api.searchOutline({
+				q: trimmed,
+				spaceId: spaceId ?? undefined,
+				cursor: pageParam ?? undefined,
+			}),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor ?? null,
+		enabled: !REMOTE_BUILD && enabled && trimmed.length > 0,
+		retry: false,
+		// Keeps the tree drawn while the next keystroke's search is read.
+		placeholderData: (previous) => previous,
 	});
 }
 

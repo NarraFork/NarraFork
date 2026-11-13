@@ -625,6 +625,9 @@ export function OutlineBlockTree({
 				if (!block) return null;
 				const preview = row.preview;
 				const text = preview ? byId.get(preview.textId) : undefined;
+				// A row a folded read left blocks out under (`fold: "default"`): how much is behind
+				// it is what the server counted, not what this read holds.
+				const cut = block.fold && !row.node.open ? block.fold : null;
 				return (
 					<OutlineRow
 						key={block.id}
@@ -636,10 +639,10 @@ export function OutlineBlockTree({
 						open={row.node.open}
 						previewKind={preview?.kind ?? null}
 						previewText={text ? foldPreviewLine(blockTitle(text.content)) : ""}
-						previewRest={preview?.rest ?? 0}
-						previewTotal={preview?.total ?? 0}
-						previewMore={preview?.more ?? false}
-						subtree={row.subtree}
+						previewRest={cut ? cut.kids - 1 : (preview?.rest ?? 0)}
+						previewTotal={cut ? cut.size : (preview?.total ?? 0)}
+						previewMore={cut ? cut.size > 1 : (preview?.more ?? false)}
+						subtree={row.subtree ?? (cut && cut.size > cut.kids ? "expand" : null)}
 						hidden={row.hidden ? FOLD_MARK_KEYS.map((k) => row.hidden?.[k] ?? 0).join(",") : ""}
 						factsView={view.view === "facts"}
 						spaceId={view.space.id}
