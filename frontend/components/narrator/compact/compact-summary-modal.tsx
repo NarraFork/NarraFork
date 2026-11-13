@@ -84,6 +84,16 @@ export const COMPACT_SUMMARY_FOOTER_STYLE = {
 	padding: "var(--mantine-spacing-sm) var(--mantine-spacing-md)",
 };
 
+/**
+ * Context occupancy is an estimate that routinely carries a long tail (`0.9545%`), and the
+ * lifecycle line is a label, not a measurement: one decimal reads, five do not.
+ */
+function formatCompactPercent(value: unknown): string {
+	return typeof value === "number" && Number.isFinite(value)
+		? String(Math.round(value * 10) / 10)
+		: "-";
+}
+
 export type CompactSummaryKind = "context" | "segment";
 
 export interface CompactSummaryModalTarget {
@@ -726,8 +736,8 @@ export function CompactSummaryModal({
 							{t("compactLifecycleMeta", {
 								mode: compactDetail.mode ?? "-",
 								trigger: compactDetail.trigger ?? "-",
-								before: compactDetail.contextPercentBefore ?? "-",
-								after: compactDetail.contextPercentAfter ?? "-",
+								before: formatCompactPercent(compactDetail.contextPercentBefore),
+								after: formatCompactPercent(compactDetail.contextPercentAfter),
 							})}
 						</Text>
 						{compactDetail.summary && <MarkdownContent text={compactDetail.summary} />}
@@ -845,8 +855,8 @@ export function CompactSummaryModal({
 									{t("compactLifecycleMeta", {
 										mode: compactDetail.mode ?? "-",
 										trigger: compactDetail.trigger ?? "-",
-										before: compactDetail.contextPercentBefore ?? "-",
-										after: compactDetail.contextPercentAfter ?? "-",
+										before: formatCompactPercent(compactDetail.contextPercentBefore),
+										after: formatCompactPercent(compactDetail.contextPercentAfter),
 									})}
 								</Text>
 								{compactDetail.attempts.length > 0 && (
