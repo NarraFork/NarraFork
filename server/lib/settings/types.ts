@@ -90,6 +90,21 @@ export interface CustomApiProviderConfig {
 	customUserAgent?: string;
 	/** Additional request headers injected on outbound requests. */
 	extraHeaders?: Record<string, string>;
+	/**
+	 * Interface root used only by the site-account credit query (`/api/user/self`).
+	 *
+	 * Separate from `baseUrl` on purpose: several presets keep `/v1` in the inference base URL,
+	 * and `{baseUrl}/api/user/self` would resolve to `/v1/api/user/self` and 404. Empty means
+	 * "derive it from `baseUrl`", with `/v1` and trailing slashes stripped.
+	 */
+	quotaSiteUrl?: string;
+	/**
+	 * Site system access token (the one issued by the site console), not the inference
+	 * `sk-` key: `sk-` keys are rejected by `/api/user/self` with 401.
+	 */
+	quotaAccessToken?: string;
+	/** Site user id, sent as the `New-Api-User` header. */
+	quotaUserId?: string;
 }
 
 /**
@@ -661,10 +676,21 @@ export interface NarraForkSettings {
 		 * Master switch, off by default while the feature is built: when off the outline agent
 		 * tools are not offered, its routes answer 404 and navigation hides it. When on, root
 		 * sessions created from then on keep their tasks in the outline (`narrators.task_backend`
-		 * `outline`); existing sessions keep Dynamic Spec. Turned off again, every session reads
-		 * as a spec session until it is back on (`services/task-source`).
+		 * `outline`); existing sessions keep Dynamic Spec until they are imported into the outline
+		 * (`specImport`), which moves them to it and leaves their Dynamic Spec rows in place.
+		 * Turned off again, every session reads as a spec session until it is back on
+		 * (`services/task-source`).
 		 */
 		enabled: boolean;
+		/**
+		 * How sessions that still keep their tasks in Dynamic Spec are imported into the outline
+		 * (outline P2 PR 12b), while `enabled` is on: their current spec files, tasks and behavior
+		 * fence are written into the session space, checked one by one, and the session is moved
+		 * to the outline (its Dynamic Spec rows stay). `manual` (the default): only from the Spec
+		 * panel's button. `auto`: also before a small session's next run and by a background job
+		 * while sessions are idle. `off`: not at all.
+		 */
+		specImport?: "auto" | "manual" | "off";
 	};
 	/** Plugin subsystem settings. */
 	/** Request evidence (ring recording + auto-pin); read live for each provider request. */
@@ -1083,6 +1109,8 @@ export interface NarraForkSettings {
 		/** Automatically download updates when available. */
 		autoDownload: boolean;
 	};
+	/** Optional RTC access; secrets and state paths are never settings. */
+	remoteAccess?: import("../../../shared/remote-access/management").RemoteAccessSettings;
 	/** Application-level virtual network relay for Bun-to-Bun communication. */
 	vnet?: {
 		enabled: boolean;

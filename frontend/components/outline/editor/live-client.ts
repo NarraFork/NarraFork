@@ -181,6 +181,12 @@ export interface Peer {
 	color: string;
 	editing: boolean;
 	sel: LiveSelWire | null;
+	/**
+	 * An agent the server shows (outline P2 PR 10b): a session at work on this page. Its session id
+	 * and, for a subagent, its session's title, only when this person may read that session (its
+	 * name is empty otherwise).
+	 */
+	agent?: { narratorId: string | null; session: string | null };
 }
 
 export type LiveStatus =
@@ -256,6 +262,8 @@ export class LiveClient {
 	awaiting: PendingTx[] = [];
 	readonly views = new Set<ClientView>();
 	readonly presence = new Map<number, Peer>();
+	/** Agents present beyond those the server lists (P2 PR 10b). */
+	agentsMore = 0;
 	undoStack: Step[] = [];
 	redoStack: Step[] = [];
 	status: LiveStatus = "connecting";
@@ -972,7 +980,7 @@ export class LiveClient {
 	}
 
 	private applyPeers(peers: readonly LivePeerWire[] | undefined): void {
-		for (const [pno, userId, name, color, mode] of peers ?? []) {
+		for (const [pno, userId, name, color, mode, kind, narratorId, session] of peers ?? []) {
 			if (pno === this.me) continue;
 			const prior = this.presence.get(pno);
 			this.presence.set(pno, {
@@ -982,6 +990,9 @@ export class LiveClient {
 				color,
 				editing: mode === "e",
 				sel: prior?.sel ?? null,
+				...(kind === "a"
+					? { agent: { narratorId: narratorId || null, session: session || null } }
+					: {}),
 			});
 		}
 	}
@@ -1072,6 +1083,7 @@ export class LiveClient {
 		this.canWrite = head.w;
 		this.presence.clear();
 		this.applyPeers(head.peers);
+		this.agentsMore = head.am ?? 0;
 		for (const [pno, sel] of head.cur ?? []) {
 			const p = this.presence.get(pno);
 			if (p) p.sel = sel;
@@ -1270,6 +1282,7 @@ export class LiveClient {
 
 	private onPresence(head: LivePresenceDown): void {
 		this.applyPeers(head.peers);
+		if (head.am !== undefined) this.agentsMore = head.am;
 		for (const pno of head.gone ?? []) this.presence.delete(pno);
 		for (const [pno, sel] of head.cur ?? []) {
 			const p = this.presence.get(pno);

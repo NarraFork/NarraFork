@@ -72,7 +72,7 @@ export interface DownloadHelperBinaryOptions {
 	context?: DistributionContext;
 	/** Executor tickets may retain their immutable chosen source after settings change. */
 	allowFrozenSource?: boolean;
-	/** Only executor distribution sets this; CLI helpers always use the fixed catalog tag. */
+	/** Executor/RTC components set their exact tag; CLI tools use the fixed catalog tag. */
 	tag?: string;
 }
 interface SelectedHelper {
@@ -96,7 +96,6 @@ async function selectHelper(
 	let name = spec.toolName;
 	let sha256 = spec.expectedSha256;
 	let size = spec.expectedSize;
-	if (context.source.source !== "github") return null;
 	const tag = options.tag ?? HELPER_RELEASE_TAG;
 	let version = "legacy";
 	if (!options.tag) {

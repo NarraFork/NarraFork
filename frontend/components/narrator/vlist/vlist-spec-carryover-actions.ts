@@ -17,6 +17,11 @@
  *   - dismissal is a server delete that broadcasts `messages_deleted`, which the
  *     shell already turns into a structural document reload
  *
+ * In a session whose tasks live in the outline (outline P2 PR 12a) the cards are history: only
+ * "View tasks" stays live (it opens the Spec panel, which is the task board there); "Clear" and
+ * "Reset Spec" get no handler, so they paint disabled in place, with a hint saying why (the
+ * server refuses those writes anyway).
+ *
  * Kept as its own module (like vlist-user-bubble-header) so the wiring is
  * unit-testable without pulling the whole shell into the test graph.
  */
@@ -85,6 +90,8 @@ export function resolveSpecCarryoverActions(
 export function useSpecCarryoverActions(
 	narratorId: string,
 	onViewTasks: () => void,
+	/** The session's task backend, when known: an outline session's cards are read-only. */
+	taskBackend?: "spec" | "outline",
 ): SpecCarryoverActionsResolver {
 	const { t } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
@@ -134,20 +141,23 @@ export function useSpecCarryoverActions(
 		[confirm, narratorId, qc, t],
 	);
 
+	const readOnlyHint = taskBackend === "outline" ? t("specCarryoverOutlineReadonly") : undefined;
 	return useMemo(() => {
 		const cache = new Map<string, SpecCarryoverActions>();
 		return (messageId: string | undefined) => {
 			if (!messageId) return undefined;
 			const cached = cache.get(messageId);
 			if (cached) return cached;
-			const actions: SpecCarryoverActions = {
-				onViewTasks,
-				onClearTasks: () => void runAction(messageId, "clear"),
-				onResetSpec: () => void runAction(messageId, "reset"),
-				busy: busy?.messageId === messageId ? busy.action : null,
-			};
+			const actions: SpecCarryoverActions = readOnlyHint
+				? { onViewTasks, readOnlyHint }
+				: {
+						onViewTasks,
+						onClearTasks: () => void runAction(messageId, "clear"),
+						onResetSpec: () => void runAction(messageId, "reset"),
+						busy: busy?.messageId === messageId ? busy.action : null,
+					};
 			cache.set(messageId, actions);
 			return actions;
 		};
-	}, [busy, onViewTasks, runAction]);
+	}, [busy, onViewTasks, runAction, readOnlyHint]);
 }

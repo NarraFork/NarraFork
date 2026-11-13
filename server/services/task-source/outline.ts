@@ -202,10 +202,29 @@ async function completionsAwaited(entries: readonly OpenEntry[]): Promise<Set<st
  * The open person-created tasks that drive `protectedOnly` (D27a): all of them except those whose
  * completion only waits for the person to confirm it (outline P2 PR 5). The agent has done its
  * part there, so continuing would only run a pass saying everything waits.
+ *
+ * Also counted (outline P2 PR 10c-1, D54): a task of a PROJECT space this session holds. It is the
+ * team's work the session was given (a person opened the session for it from the board, or
+ * assigned it) or took up, not work it found for itself in its own space, so the default mode
+ * keeps going on it. The spaces' kinds are one keyed read each, of the few spaces it holds in.
  */
-async function protectedOpen(read: OpenRead): Promise<OpenEntry[]> {
+async function protectedOpen(read: OpenRead, current: OutlineSession): Promise<OpenEntry[]> {
 	// Every person's work read, not only the first entries (review round 1 S3).
-	const entries = read.personWork;
+	const entries = [...read.personWork];
+	const listed = new Set(entries.map((entry) => entry.ref.blockId));
+	const held = read.entries.filter(
+		(entry) =>
+			!listed.has(entry.ref.blockId) &&
+			entry.ref.spaceId !== current.spaceId &&
+			current.sessionNarratorId !== null &&
+			entry.ref.claim?.holderNarratorId === current.sessionNarratorId,
+	);
+	const kinds = new Map<string, string | null>();
+	for (const entry of held) {
+		if (!kinds.has(entry.ref.spaceId))
+			kinds.set(entry.ref.spaceId, (await outlineStore.getSpace(entry.ref.spaceId))?.kind ?? null);
+		if (kinds.get(entry.ref.spaceId) === "project") entries.push(entry);
+	}
 	const awaited = await completionsAwaited(entries);
 	return awaited.size === 0 ? entries : entries.filter((e) => !awaited.has(e.ref.blockId));
 }
@@ -313,11 +332,20 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			// A tree (a goal with steps, a plan): its first step that can start is started too, and
 			// named (D48 Q2: continue from the first startable task of the tree being worked).
 			if (wanted?.ref.container && !firstUnder(tree, preferTaskId, "doing")) {
+				// Steps of the session's own space; and, when the named task is one of another space
+				// this session holds (a project task a session was opened for, outline P2 PR 10c-1),
+				// its steps there too. A task of another space that was not named is never started
+				// for the session, held or not.
+				const heldElsewhere =
+					wanted.ref.spaceId !== current.spaceId &&
+					current.sessionNarratorId !== null &&
+					wanted.ref.claim?.holderNarratorId === current.sessionNarratorId;
 				const steps = tree.entries.filter(
 					(entry) =>
 						entry.status === "todo" &&
 						!entry.ref.container &&
-						entry.ref.spaceId === current.spaceId &&
+						(entry.ref.spaceId === current.spaceId ||
+							(heldElsewhere && entry.ref.spaceId === wanted.ref.spaceId)) &&
 						entry.ref.taskAncestorIds.includes(preferTaskId),
 				);
 				for (const next of steps.slice(0, OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts)) {
@@ -358,7 +386,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			preferTaskId && tree
 				? (firstUnder(tree, preferTaskId, "doing") ?? firstUnder(tree, preferTaskId, "blocked"))
 				: (firstOf(read, "doing") ?? firstOf(read, "blocked"));
-		const protectedOpenCount = (await protectedOpen(read)).length;
+		const protectedOpenCount = (await protectedOpen(read, current)).length;
 		if (!chosen) return { openTask: null, protectedOpenCount };
 		const text = (await titlesOf([chosen])).get(chosen.ref.blockId) ?? chosen.ref.sid;
 		const openTask: ContinuationTask = remember(
@@ -493,18 +521,29 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		currentTask: () => single("doing"),
 		nextTask: () => single("todo"),
 		async openTasks(): Promise<OpenTaskList> {
-			const read = await readOpen(await session());
+			const current = await session();
+			const read = await readOpen(current);
 			// The list is a prefix in document order (its readers show fewer: the interrupt guard
 			// eight); the revision key still covers every task read.
 			const listed = read.entries.slice(0, OUTLINE_TASK_SOURCE_LIMITS.openTasks);
 			const titles = await titlesOf(listed);
+			// Which of them are team tasks (of a project space): one read per other space.
+			const kinds = new Map<string, string | null>();
+			for (const { ref } of listed)
+				if (ref.spaceId !== current.spaceId && !kinds.has(ref.spaceId))
+					kinds.set(ref.spaceId, (await outlineStore.getSpace(ref.spaceId))?.kind ?? null);
 			return {
-				tasks: listed.map((entry) => toView(entry, titles)),
+				tasks: listed.map((entry) => {
+					const view = toView(entry, titles);
+					if (kinds.get(entry.ref.spaceId) === "project") view.teamTaskId = entry.ref.blockId;
+					return view;
+				}),
 				revision: revisionOf(read),
 			};
 		},
 		async protectedOpenCount() {
-			return (await protectedOpen(await readOpen(await session()))).length;
+			const current = await session();
+			return (await protectedOpen(await readOpen(current), current)).length;
 		},
 		async statusBar(viewerUserId: string | null): Promise<StatusBarView> {
 			const read = await readOpen(await session());

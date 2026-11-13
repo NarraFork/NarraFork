@@ -447,6 +447,7 @@ export interface SubagentCardData {
 }
 
 export interface SubagentMeasureOpts {
+	compactAuxiliaryContent?: boolean;
 	/** Whether this is a recent card (L5 layering). Default true. */
 	isRecent?: boolean;
 	/** User/soleInRun expand state (L1-L3 + L5-recent). Default false. */
@@ -597,6 +598,7 @@ function measureWrappedText(text: string, innerWidth: number, className: string)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface SubagentExpandInput {
+	compactAuxiliaryContent?: boolean;
 	isActive: boolean;
 	hasSelfPermission: boolean;
 	pendingPermissionCount: number;
@@ -615,6 +617,12 @@ export interface SubagentExpandInput {
 export function resolveSubagentExpanded(lod: RenderLod, input: SubagentExpandInput): boolean {
 	const lodExempt = input.isActive || input.hasSelfPermission || input.pendingPermissionCount > 0;
 	if (lodExempt || input.lodUserOverride) return true;
+	if (input.compactAuxiliaryContent) {
+		if (input.userCollapsed) return false;
+		if (lod >= 5) return true;
+		if (lod === 4) return input.isRecent && input.opened;
+		return false;
+	}
 	if (lod === 1) return false;
 	// L2–L5 stay expanded regardless of recency, unless the reader folds the card.
 	return !input.userCollapsed;
@@ -643,10 +651,11 @@ export function measureSubagentCard(
 	const pendingCount =
 		data.pendingPermissions?.length ?? Math.max(0, opts.pendingPermissionCount ?? 0);
 	const isRecent = opts.isRecent ?? true;
-	const opened = opts.opened ?? false;
+	const opened = opts.opened ?? opts.compactAuxiliaryContent === true;
 	const inRun = opts.inRun === true;
 
 	const effectiveExpanded = resolveSubagentExpanded(lod, {
+		compactAuxiliaryContent: opts.compactAuxiliaryContent,
 		isActive,
 		hasSelfPermission,
 		pendingPermissionCount: pendingCount,

@@ -56,7 +56,8 @@ export async function verifyMirrorAsset(
 	if (
 		asset.kind !== "patch" &&
 		asset.kind !== "helpers-binary" &&
-		asset.kind !== "executor-binary"
+		asset.kind !== "executor-binary" &&
+		asset.kind !== "remote-peer-binary"
 	) {
 		const bytes = await readMirrorBounded(stream, asset.size, signal);
 		if (

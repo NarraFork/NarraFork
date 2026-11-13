@@ -311,6 +311,8 @@ export interface ToolLoadingEpoch {
 	target?: string;
 	/** The wire protocol the epoch opened on; absent on epochs written before it was recorded. */
 	protocol?: ModelProtocol;
+	/** {@link EpochRecord.baselineDisplays}. */
+	baselineDisplays?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -363,6 +365,14 @@ export interface EpochRecord {
 	compactMessageId?: string | null;
 	baseToolNames?: string[];
 	strategy?: ToolLoadingStrategy;
+	/**
+	 * Reader-only summaries of context parts as the prefix baseline held them (`ContextPart.display`,
+	 * by key; `null` for a part the baseline went without): what the epoch's FIRST `context_update`
+	 * row of such a part is compared with to say what changed (`context-display-refiners.ts`).
+	 * Never part of the prefix, its hashes or anything the model reads. Absent on epochs written
+	 * before it existed: their first row has nothing to compare with.
+	 */
+	baselineDisplays?: Record<string, unknown>;
 }
 
 /** The epoch a stored element opens: a marker `{type:"epoch"}` or a compact with `epoch`. */
@@ -391,6 +401,11 @@ export function epochRecordOf(block: unknown): EpochRecord | undefined {
 		...(typeof epoch.strategy === "string"
 			? { strategy: epoch.strategy as ToolLoadingStrategy }
 			: {}),
+		...(epoch.baselineDisplays &&
+		typeof epoch.baselineDisplays === "object" &&
+		!Array.isArray(epoch.baselineDisplays)
+			? { baselineDisplays: epoch.baselineDisplays as Record<string, unknown> }
+			: {}),
 	};
 }
 
@@ -415,6 +430,7 @@ export function latestToolLoadingEpoch(
 				strategy: epoch.strategy,
 				...(epoch.target ? { target: epoch.target } : {}),
 				...(epoch.protocol ? { protocol: epoch.protocol } : {}),
+				...(epoch.baselineDisplays ? { baselineDisplays: epoch.baselineDisplays } : {}),
 			};
 	}
 	return undefined;

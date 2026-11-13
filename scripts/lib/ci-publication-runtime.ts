@@ -3,6 +3,12 @@ import { updateServerChildEnvironment } from "../../shared/update-server-child-e
 import type { GhRunner } from "./github-release";
 
 const TIMEOUT = 15 * 60_000;
+/** Created only after the subprocess's first diagnostic passes strict gh api validation. */
+export class PublicationGhApiError extends Error {
+	constructor(readonly status: number) {
+		super(`GitHub publication subprocess failed (HTTP ${status})`);
+	}
+}
 /** All publisher stages share one workflow-created deadline, not fresh per-stage budgets. */
 export function ciPublicationDeadlineSignal(
 	env: NodeJS.ProcessEnv,
@@ -168,6 +174,7 @@ export async function runPublicationProcess(
 					: operation
 						? ` (${operation}; exit=${closed.value.code ?? "signal"}${diagnosticStatus ? `; status=${diagnosticStatus}` : ""}${cause ? `; cause=${cause}` : ""})`
 						: "";
+			if (status !== undefined) throw new PublicationGhApiError(status);
 			throw new Error(`GitHub publication subprocess failed${detail}`);
 		}
 		return stdout.value;

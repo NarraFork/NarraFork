@@ -8,6 +8,7 @@ import { hotSafe, hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { currentSqlTraceSpan, runInSqlTraceSpan, startSqlTraceSpan } from "../lib/sql-trace";
 import type { VNetClientMessage } from "../lib/vnet/types";
 import {
 	type DeviceWSData,
@@ -93,6 +94,12 @@ const activeWebSocketHandlers = new Set<Promise<void>>();
 
 function trackWebSocketHandler(work: Promise<void>, onError: (error: unknown) => void): void {
 	const tracked = work.catch(onError);
+	// The message's SQL trace span (see `message()`) ends once its handler has settled.
+	const sqlSpan = currentSqlTraceSpan();
+	if (sqlSpan?.kind === "ws" && !sqlSpan.claimed) {
+		sqlSpan.claimed = true;
+		void tracked.then(() => sqlSpan.end());
+	}
 	activeWebSocketHandlers.add(tracked);
 	void tracked.then(
 		() => activeWebSocketHandlers.delete(tracked),
@@ -500,6 +507,75 @@ export function closeAllConnections() {
 
 // === Bun WebSocket handlers ===
 
+/** Route one parsed JSON frame to its channel handler. */
+function dispatchParsedMessage(
+	ws: ServerWebSocket<WSData>,
+	channel: WSData["channel"],
+	parsed: unknown,
+): void {
+	if (channel === "narrator") {
+		trackWebSocketHandler(
+			handleNarratorWS.message(
+				ws as ServerWebSocket<WSData & { channel: "narrator" }>,
+				parsed as NarratorClientMessage,
+			),
+			(err) => {
+				logger.warn("Narrator WS message handler error", { error: String(err) });
+				try {
+					ws.send(JSON.stringify({ type: "error", message: "Internal error" }));
+				} catch {
+					// connection may be dead
+				}
+			},
+		);
+	} else if (channel === "external-narrator") {
+		trackWebSocketHandler(
+			handleExternalNarratorWS.message(ws as ExternalNarratorWS, parsed),
+			(err) => {
+				logger.warn("External narrator WS message handler error", { error: String(err) });
+				try {
+					ws.send(
+						JSON.stringify({
+							type: "error",
+							code: "INTERNAL_ERROR",
+							message: "Internal error",
+						}),
+					);
+				} catch {
+					// connection may be dead
+				}
+			},
+		);
+	} else if (channel === "terminal") {
+		trackWebSocketHandler(
+			Promise.resolve(
+				handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed),
+			),
+			(err) => logger.warn("Terminal WS message handler error", { error: String(err) }),
+		);
+	} else if (channel === "vnet") {
+		trackWebSocketHandler(
+			handleVNetWS.message(
+				ws as ServerWebSocket<WSData & { channel: "vnet" }>,
+				parsed as VNetClientMessage,
+			),
+			(err) => {
+				logger.warn("VNet WS message handler error", { error: String(err) });
+				try {
+					ws.send(JSON.stringify({ type: "error", message: "Internal error" }));
+				} catch {
+					// connection may be dead
+				}
+			},
+		);
+	} else if (channel === "device") {
+		trackWebSocketHandler(
+			handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
+			(err) => logger.warn("Device WS message handler error", { error: String(err) }),
+		);
+	}
+}
+
 export const wsHandlers = {
 	open(ws: ServerWebSocket<WSData>) {
 		if (!acceptingWebSocketMessages) {
@@ -674,67 +750,13 @@ export const wsHandlers = {
 			return;
 		}
 
-		if (channel === "narrator") {
-			trackWebSocketHandler(
-				handleNarratorWS.message(
-					ws as ServerWebSocket<WSData & { channel: "narrator" }>,
-					parsed as NarratorClientMessage,
-				),
-				(err) => {
-					logger.warn("Narrator WS message handler error", { error: String(err) });
-					try {
-						ws.send(JSON.stringify({ type: "error", message: "Internal error" }));
-					} catch {
-						// connection may be dead
-					}
-				},
-			);
-		} else if (channel === "external-narrator") {
-			trackWebSocketHandler(
-				handleExternalNarratorWS.message(ws as ExternalNarratorWS, parsed),
-				(err) => {
-					logger.warn("External narrator WS message handler error", { error: String(err) });
-					try {
-						ws.send(
-							JSON.stringify({
-								type: "error",
-								code: "INTERNAL_ERROR",
-								message: "Internal error",
-							}),
-						);
-					} catch {
-						// connection may be dead
-					}
-				},
-			);
-		} else if (channel === "terminal") {
-			trackWebSocketHandler(
-				Promise.resolve(
-					handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed),
-				),
-				(err) => logger.warn("Terminal WS message handler error", { error: String(err) }),
-			);
-		} else if (channel === "vnet") {
-			trackWebSocketHandler(
-				handleVNetWS.message(
-					ws as ServerWebSocket<WSData & { channel: "vnet" }>,
-					parsed as VNetClientMessage,
-				),
-				(err) => {
-					logger.warn("VNet WS message handler error", { error: String(err) });
-					try {
-						ws.send(JSON.stringify({ type: "error", message: "Internal error" }));
-					} catch {
-						// connection may be dead
-					}
-				},
-			);
-		} else if (channel === "device") {
-			trackWebSocketHandler(
-				handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
-				(err) => logger.warn("Device WS message handler error", { error: String(err) }),
-			);
-		}
+		const messageType = (parsed as { type?: unknown }).type;
+		const sqlSpan = startSqlTraceSpan(
+			"ws",
+			`ws ${channel} ${typeof messageType === "string" ? messageType.slice(0, 64) : "?"}`,
+		);
+		runInSqlTraceSpan(sqlSpan, () => dispatchParsedMessage(ws, channel, parsed));
+		if (sqlSpan && !sqlSpan.claimed) sqlSpan.end();
 	},
 
 	/** The socket's send buffer drained: outline live sessions resume a participant that lagged. */

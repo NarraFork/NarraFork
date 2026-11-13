@@ -1,21 +1,26 @@
 /**
  * Queries and live updates of the read-only outline pages.
  */
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import type {
 	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
+	OutlineQuestionGroupResponse,
 	OutlineSpaceSummary,
 	OutlineViewMode,
 } from "@shared/outline-api";
 import {
 	OUTLINE_BLOCK_ID_RE,
+	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
+import { boundedFoldView } from "@shared/outline-fold";
 import {
 	type QueryClient,
 	useInfiniteQuery,
 	useMutation,
+	useQueries,
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
@@ -24,7 +29,7 @@ import { useCallback, useEffect, useRef } from "react";
 import type { OutlineViewState } from "../components/outline/view-state";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
-import { OutlinePageSubscriptions } from "../lib/outline-page-subscription";
+import { type OutlinePageHint, OutlinePageSubscriptions } from "../lib/outline-page-subscription";
 
 export { useOutlineEnabled } from "./useOutlineEnabled";
 
@@ -46,6 +51,8 @@ export const outlineKeys = {
 	pending: (pendingId: string) => ["outline", "pending-detail", pendingId] as const,
 	questions: (blockId: string) => ["outline", "questions", blockId] as const,
 	digest: () => ["outline", "digest"] as const,
+	tree: () => ["outline", "tree"] as const,
+	treeSpaces: (group: string) => ["outline", "tree", group] as const,
 };
 
 export function useOutlineSpaces(enabled: boolean) {
@@ -55,7 +62,39 @@ export function useOutlineSpaces(enabled: boolean) {
 			api.listOutlineSpaces({ cursor: pageParam, limit: OUTLINE_VIEW_LIMITS.defaultListPage }),
 		initialPageParam: null as string | null,
 		getNextPageParam: (page) => page.nextCursor,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
+	});
+}
+
+/**
+ * The connected outline's root (`/outline/tree`): my space and the project spaces, a page at a
+ * time. Not refreshed by commits: the tree does not reorder while it is read (design §4.2).
+ */
+export function useOutlineTree(enabled = true) {
+	return useInfiniteQuery({
+		queryKey: outlineKeys.tree(),
+		queryFn: ({ pageParam }) => api.getOutlineTree({ cursor: pageParam }),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor,
+		enabled: !REMOTE_BUILD && enabled,
+		retry: false,
+	});
+}
+
+/** A group of the connected outline (a project's sessions, the loose ones, the orphaned). */
+export function useOutlineTreeSpaces(
+	group: { kind: "project"; projectId: string } | { kind: "loose" | "orphaned" },
+	enabled: boolean,
+) {
+	return useInfiniteQuery({
+		queryKey: outlineKeys.treeSpaces(
+			group.kind === "project" ? `project:${group.projectId}` : group.kind,
+		),
+		queryFn: ({ pageParam }) => api.listOutlineTreeSpaces(group, { cursor: pageParam }),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor,
+		enabled: !REMOTE_BUILD && enabled,
+		retry: false,
 	});
 }
 
@@ -65,7 +104,10 @@ export function useEnsurePersonalOutlineSpace() {
 	return useMutation({
 		mutationFn: () => api.ensurePersonalOutlineSpace(),
 		onSuccess: (result) => {
-			if (result.created) void queryClient.invalidateQueries({ queryKey: outlineKeys.spaces() });
+			if (result.created) {
+				void queryClient.invalidateQueries({ queryKey: outlineKeys.spaces() });
+				void queryClient.invalidateQueries({ queryKey: outlineKeys.tree() });
+			}
 		},
 	});
 }
@@ -74,8 +116,23 @@ export function useOutlineSpace(spaceId: string, enabled = true) {
 	return useQuery({
 		queryKey: outlineKeys.space(spaceId),
 		queryFn: () => api.getOutlineSpace(spaceId),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
+	});
+}
+
+/**
+ * Where a session space hangs (its project's space, `parent`), for the breadcrumbs: its own key,
+ * so the commit hints that refresh a space's reads do not read it again; a session's project
+ * rarely changes, and a stale crumb only links to a space that still checks access.
+ */
+export function useOutlineSpaceParent(spaceId: string, enabled = true) {
+	return useQuery({
+		queryKey: ["outline", "space-parent", spaceId] as const,
+		queryFn: async () => (await api.getOutlineSpace(spaceId)).space.parent ?? null,
+		enabled: !REMOTE_BUILD && enabled,
+		retry: false,
+		staleTime: 5 * 60_000,
 	});
 }
 
@@ -89,7 +146,7 @@ export function useOutlinePages(spaceId: string, enabled = true) {
 			}),
 		initialPageParam: null as string | null,
 		getNextPageParam: (page) => page.nextCursor,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -102,6 +159,8 @@ export function useOutlineBlock(
 		view: OutlineViewMode;
 		/** Block budget: the live editor shows the blocks itself and reads only the root. */
 		blocks?: number;
+		/** Byte budget (the server's default when absent). */
+		bytes?: number;
 		enabled?: boolean;
 		/**
 		 * Keep showing the previous read of the same space while another block loads: the live
@@ -110,11 +169,15 @@ export function useOutlineBlock(
 		keepSpace?: boolean;
 	},
 ) {
-	const { asOf, view, blocks, keepSpace } = options;
+	const { asOf, view, blocks, bytes, keepSpace } = options;
 	return useQuery({
-		queryKey: [...outlineKeys.block(spaceId, blockId, asOf ?? null, view), blocks ?? null],
-		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks }),
-		enabled: options.enabled ?? true,
+		queryKey: [
+			...outlineKeys.block(spaceId, blockId, asOf ?? null, view),
+			blocks ?? null,
+			...(bytes !== undefined ? [bytes] : []),
+		],
+		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks, bytes }),
+		enabled: !REMOTE_BUILD && (options.enabled ?? true),
 		retry: false,
 		// A view as of a commit never changes; the current one is refreshed by the subscription.
 		staleTime: asOf === undefined ? 0 : Number.POSITIVE_INFINITY,
@@ -139,7 +202,11 @@ export function useOutlineSeed(
 	enabled: boolean,
 	onRead?: (read: OutlineBlockViewResponse) => void,
 ) {
-	return useQuery({ ...outlineSeedQuery(spaceId, blockId, onRead), enabled, retry: false });
+	return useQuery({
+		...outlineSeedQuery(spaceId, blockId, onRead),
+		enabled: !REMOTE_BUILD && enabled,
+		retry: false,
+	});
 }
 
 function outlineSeedQuery(
@@ -173,6 +240,7 @@ export function prefetchOutlineSeed(
 	blockId: string,
 	onRead?: (read: OutlineBlockViewResponse) => void,
 ) {
+	if (REMOTE_BUILD) return;
 	void queryClient.prefetchQuery({ ...outlineSeedQuery(spaceId, blockId, onRead), retry: false });
 }
 
@@ -190,6 +258,7 @@ export function useOutlineViewStateSync(
 	state: OutlineViewState | null,
 ): void {
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (!pageId || !state || state.pageId !== pageId) return;
 		let disposed = false;
 		let touched = false;
@@ -197,11 +266,15 @@ export function useOutlineViewStateSync(
 		const write = () => {
 			timer = null;
 			// Block ids only (the server refuses anything else); the last write of the page wins.
-			const collapsed = [...state.collapsed]
-				.filter((id) => OUTLINE_BLOCK_ID_RE.test(id))
-				.slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed);
+			// What the reader opened and what they closed share one limit.
+			const ok = (ids: Iterable<string>) =>
+				new Set([...ids].filter((id) => OUTLINE_BLOCK_ID_RE.test(id)));
+			const folding = boundedFoldView(
+				{ expanded: ok(state.expanded), collapsed: ok(state.collapsed) },
+				OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+			);
 			void api
-				.putOutlineViewState(pageId, { collapsed, layout: state.layout })
+				.putOutlineViewState(pageId, { ...folding, layout: state.layout })
 				.catch(() => undefined);
 		};
 		const off = state.on((part) => {
@@ -216,7 +289,7 @@ export function useOutlineViewStateSync(
 				.getOutlineViewState(pageId)
 				.then((stored) => {
 					if (disposed || touched || stored.updatedAt === null) return;
-					state.applyStored(stored.collapsed, stored.layout);
+					state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
 				})
 				.catch(() => loadedViewStates.delete(state));
 		}
@@ -241,7 +314,7 @@ export function useOutlineTimeline(spaceId: string, pageId: string | undefined) 
 			}),
 		initialPageParam: null as number | null,
 		getNextPageParam: (page) => page.nextBefore,
-		enabled: !!pageId,
+		enabled: !REMOTE_BUILD && !!pageId,
 		retry: false,
 	});
 }
@@ -256,7 +329,7 @@ export function useOutlineBlockHistory(spaceId: string, blockId: string, enabled
 			}),
 		initialPageParam: null as number | null,
 		getNextPageParam: (page) => page.nextBefore,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -265,7 +338,7 @@ export function useOutlineBacklinks(spaceId: string, blockId: string, enabled: b
 	return useQuery({
 		queryKey: outlineKeys.backlinks(spaceId, blockId),
 		queryFn: () => api.getOutlineBacklinks(spaceId, blockId),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -275,7 +348,7 @@ export function useOutlineSearch(q: string, spaceId: string | null, enabled: boo
 	return useQuery({
 		queryKey: outlineKeys.search(trimmed, spaceId),
 		queryFn: () => api.searchOutline({ q: trimmed, spaceId: spaceId ?? undefined }),
-		enabled: enabled && trimmed.length > 0,
+		enabled: !REMOTE_BUILD && enabled && trimmed.length > 0,
 		retry: false,
 		placeholderData: (previous) => previous,
 	});
@@ -295,15 +368,62 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 	void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
 }
 
-/** The questions under a block, with who may answer which (the inbox, the side panel). */
+/** A question root, or all questions under a task. */
+function outlineQuestionsQuery(blockId: string) {
+	return {
+		queryKey: outlineKeys.questions(blockId),
+		queryFn: () => api.getOutlineQuestions(blockId),
+		retry: false as const,
+		staleTime: 5_000,
+	};
+}
+
 export function useOutlineQuestions(blockId: string | null, enabled = true) {
 	return useQuery({
-		queryKey: outlineKeys.questions(blockId ?? ""),
-		queryFn: () => api.getOutlineQuestions(blockId as string),
-		enabled: enabled && !!blockId,
-		retry: false,
-		staleTime: 5_000,
+		...outlineQuestionsQuery(blockId ?? ""),
+		enabled: !REMOTE_BUILD && enabled && !!blockId,
 	});
+}
+
+/** An Ask card reads its own roots, never an older task's entire question history. */
+export function useOutlineQuestionGroups(blockIds: readonly string[]) {
+	return useQueries({
+		queries: REMOTE_BUILD ? [] : [...new Set(blockIds)].map(outlineQuestionsQuery),
+	});
+}
+
+/** Share the existing page subscriptions with the editor; no polling or second socket. */
+/**
+ * Keep the questions shown fresh through their pages' subscriptions. `enabled` false: the host
+ * keeps them fresh itself (a page open in the connected outline, which re-reads that page only).
+ */
+export function useOutlineQuestionsLive(
+	groups: readonly OutlineQuestionGroupResponse[],
+	enabled = true,
+) {
+	const client = useQueryClient();
+	const pages = JSON.stringify([
+		...new Map(groups.map(({ group }) => [group.pageId, [group.pageId, group.spaceId]])).values(),
+	]);
+	useEffect(() => {
+		if (REMOTE_BUILD || !enabled) return;
+		const unsubscribe = (JSON.parse(pages) as [string, string][]).map(([pageId, spaceId]) => {
+			let seen = -1;
+			return pageSubscriptions().subscribe(pageId, (hint) => {
+				if (
+					hint.kind === "denied" ||
+					((hint.kind === "subscribed" || hint.kind === "changed") && hint.seq > seen)
+				) {
+					if (hint.kind !== "denied") seen = hint.seq;
+					invalidateOutlineSpace(client, spaceId);
+					void client.invalidateQueries({ queryKey: ["human-attention"] });
+				}
+			});
+		});
+		return () => {
+			for (const dispose of unsubscribe) dispose();
+		};
+	}, [client, pages, enabled]);
 }
 
 /** Answer questions of one space at once; questions, views and the inbox re-read after. */
@@ -324,7 +444,7 @@ export function useOutlineDigest(enabled = true) {
 	return useQuery({
 		queryKey: outlineKeys.digest(),
 		queryFn: () => api.getOutlineDigest(),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 	});
 }
@@ -357,9 +477,27 @@ export function useOutlinePagePending(spaceId: string, pageId: string | undefine
 	return useQuery({
 		queryKey: outlineKeys.pagePending(spaceId, pageId ?? ""),
 		queryFn: () => api.getOutlinePagePending(spaceId, pageId as string),
-		enabled: enabled && !!pageId,
-		retry: false,
+		enabled: !REMOTE_BUILD && enabled && !!pageId,
+		// The live editor folds by the unanswered questions in it: a failed read is tried again.
+		retry: 2,
 		staleTime: 5_000,
+	});
+}
+
+/**
+ * Who wrote the subagent reports with these container ids, for a reader who may be told: the
+ * live editor's report lines say 「来自 …」. At most the first
+ * {@link OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds} containers are asked for (the rest show the
+ * time alone); a session's title rarely changes, so the answer is kept for a while.
+ */
+export function useOutlineReportAuthors(spaceId: string, ids: readonly string[], enabled = true) {
+	const asked = ids.slice(0, OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds);
+	return useQuery({
+		queryKey: [...outlineKeys.all, "report-authors", spaceId, asked.join(",")],
+		queryFn: async () => (await api.getOutlineReportAuthors(spaceId, asked)).authors,
+		enabled: !REMOTE_BUILD && enabled && asked.length > 0,
+		retry: false,
+		staleTime: 60_000,
 	});
 }
 
@@ -368,7 +506,7 @@ export function useOutlinePendingDetail(pendingId: string | null) {
 	return useQuery({
 		queryKey: outlineKeys.pending(pendingId ?? ""),
 		queryFn: () => api.getOutlinePending(pendingId as string),
-		enabled: !!pendingId,
+		enabled: !REMOTE_BUILD && !!pendingId,
 		retry: false,
 	});
 }
@@ -428,6 +566,7 @@ export function useOutlinePageLive(
 	// the space's last commit as of the read).
 	shownSeq.current = Math.max(view?.seq ?? -1, view?.space.lastSeq ?? -1);
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (!spaceId || !pageId) return;
 		return pageSubscriptions().subscribe(pageId, (hint) => {
 			if (hint.kind === "subscribed" || hint.kind === "changed") {
@@ -444,6 +583,106 @@ export function useOutlinePageLive(
 			}
 		});
 	}, [spaceId, pageId, queryClient]);
+}
+
+/** How long a burst of commits to a page open in the connected outline is gathered. */
+export const TREE_PAGE_REFRESH_MS = 300;
+
+/**
+ * The refresh of ONE page open in the connected outline (`tree/OutlineTree.tsx`): a hint of its
+ * page subscription re-reads that page's current block view and nothing else, so a commit to
+ * one page does not reload every page open in the same space (or its page list). A burst of
+ * hints is one read: hints raise the newest seq wanted, and a short timer compares it with what
+ * is shown once no read is in flight. Losing access re-reads too (the server answers 404).
+ */
+export function treePageRefresher(
+	queryClient: QueryClient,
+	spaceId: string,
+	pageId: string,
+	read: () => { shown: number; fetching: boolean },
+	delayMs = TREE_PAGE_REFRESH_MS,
+	/** Also when the page is read again (the answer form the page shows, its questions). */
+	onRefresh?: () => void,
+): { hint: (hint: OutlinePageHint) => void; dispose: () => void } {
+	let wanted = -1;
+	let force = false;
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	const refetch = () =>
+		void queryClient.invalidateQueries({
+			queryKey: outlineKeys.blocks(spaceId),
+			// This page's current view only (views as of a commit never change).
+			predicate: (query) => query.queryKey[3] === pageId && query.queryKey[4] === null,
+		});
+	const check = () => {
+		timer = null;
+		const now = read();
+		if (!force && wanted <= now.shown) return;
+		if (now.fetching) {
+			timer = setTimeout(check, delayMs);
+			return;
+		}
+		force = false;
+		refetch();
+		onRefresh?.();
+	};
+	const schedule = () => {
+		timer ??= setTimeout(check, delayMs);
+	};
+	return {
+		hint(hint) {
+			if (hint.kind === "subscribed" || hint.kind === "changed") {
+				if (hint.seq <= wanted) return;
+				wanted = hint.seq;
+				schedule();
+			} else if (hint.kind === "denied" || hint.kind === "pending") {
+				// A change waiting for confirmation marks blocks; access lost answers 404.
+				force = true;
+				schedule();
+			}
+		},
+		dispose() {
+			if (timer !== null) clearTimeout(timer);
+			timer = null;
+		},
+	};
+}
+
+/**
+ * Keep a page open in the connected outline fresh (see {@link treePageRefresher}); `enabled`
+ * false: no subscription (the page shows the read it has).
+ */
+export function useOutlineTreePageLive(
+	view: Pick<OutlineBlockViewResponse, "pageId" | "seq" | "space"> | undefined,
+	fetching: boolean,
+	enabled: boolean,
+	onRefresh?: () => void,
+): void {
+	const queryClient = useQueryClient();
+	const refreshed = useRef(onRefresh);
+	refreshed.current = onRefresh;
+	const spaceId = view?.space.id;
+	const pageId = view?.pageId;
+	const state = useRef({ shown: -1, fetching: false });
+	state.current = {
+		shown: Math.max(view?.seq ?? -1, view?.space.lastSeq ?? -1),
+		fetching,
+	};
+	useEffect(() => {
+		if (REMOTE_BUILD || !enabled || !spaceId || !pageId) return;
+		const refresher = treePageRefresher(
+			queryClient,
+			spaceId,
+			pageId,
+			() => state.current,
+			TREE_PAGE_REFRESH_MS,
+			() => refreshed.current?.(),
+		);
+		const unsubscribe = pageSubscriptions().subscribe(pageId, refresher.hint);
+		return () => {
+			unsubscribe();
+			refresher.dispose();
+		};
+	}, [enabled, spaceId, pageId, queryClient]);
 }
 
 /** How long a burst of commits is gathered before the plan's diff is read again. */
@@ -468,7 +707,7 @@ export function useOutlinePlanDiff(
 	const query = useQuery({
 		queryKey: ["outline", "plan-diff", spaceId, blockId, from],
 		queryFn: () => api.getOutlinePlanDiff(spaceId, blockId, from),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
 		staleTime: 5_000,
 	});
@@ -476,6 +715,7 @@ export function useOutlinePlanDiff(
 	state.current.shown = query.data?.toSeq ?? -1;
 	state.current.fetching = query.isFetching;
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (!enabled) return;
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const check = () => {

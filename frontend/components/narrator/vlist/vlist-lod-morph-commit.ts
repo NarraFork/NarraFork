@@ -1,6 +1,7 @@
 import { DRILL_MORPH_X_OFFSET } from "./vlist-drill-morph";
 import { drillBorderKeyframesFrom, drillTailKeyframesFrom } from "./vlist-drill-morph-motion";
 import { cssAttrEscape } from "./vlist-exact-layout";
+import { revealKeyframes } from "./vlist-fold-motion";
 import { buildLodSnapshots, diffLodSnapshots } from "./vlist-lod-morph";
 import { createLodMorphFrameBaseline, type LodMorphFramePair } from "./vlist-lod-morph-frame";
 import {
@@ -14,6 +15,16 @@ import { LOD_MOTION_DURATION_MS, lodScope, type MotionScheduler } from "./vlist-
 import type { VisualStateStore } from "./vlist-visual-state";
 
 type Slot<T> = { current: T };
+
+/**
+ * The bubble forms of a message whose compact form is a one-line trace row.
+ *
+ * A card that a row turns into starts folded, i.e. about one line tall, so sliding it
+ * into place is the whole transition. A bubble is many lines tall: shown at full height
+ * at the row's old position it would cover its neighbours for the duration, so it is
+ * un-clipped from the row's height instead (see the reveal op below).
+ */
+const BUBBLE_KINDS: ReadonlySet<string> = new Set(["communication-bubble", "injection-bubble"]);
 
 export interface LodMorphCommitSource extends LodMorphGeometryInput {
 	readonly scrollTop: number;
@@ -152,6 +163,25 @@ export function commitLodMorph(
 					resolve: () => host.querySelector<HTMLElement>("[data-nf-card-surface]"),
 					keyframes: (previous: { progress: number } | null) =>
 						drillBorderKeyframesFrom(kind, previous),
+				},
+			];
+		}),
+		LOD_MOTION_DURATION_MS,
+	);
+	// Row → bubble: grow the bubble out of the line it replaces. Played on the row's inner
+	// content box (the one that is exactly the layout height tall), so it shares no node
+	// and no property with the slide above.
+	playback.motion.push(
+		plans.flatMap((plan) => {
+			if (!plan.fade || !BUBBLE_KINDS.has(plan.toKind)) return [];
+			const from = before.get(plan.unitId);
+			const to = after.get(plan.unitId);
+			if (!from || !to || to.height - from.height < 1) return [];
+			return [
+				{
+					scope: `${lodScope(plan.unitId)}:reveal`,
+					resolve: () => resolveHost(plan.unitId)?.querySelector<HTMLElement>("[data-nf-row-body]"),
+					keyframes: revealKeyframes(to.height - from.height),
 				},
 			];
 		}),

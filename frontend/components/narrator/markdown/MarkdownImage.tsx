@@ -1,4 +1,6 @@
 import { fileReferenceApi, localFileImagePreview } from "@frontend/lib/api/file-references";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
 import { getFileReferenceImageMimeType } from "@shared/file-reference-image";
 import { fileTargetFromHref } from "@shared/markdown-file-path";
 import { useEffect, useState } from "react";
@@ -17,7 +19,7 @@ export function MarkdownImage({ src, alt, title }: { src?: string; alt?: string;
 
 	useEffect(() => {
 		setImage(null);
-		if (!path || !deviceId || !getFileReferenceImageMimeType(path)) return;
+		if (REMOTE_BUILD || !path || !deviceId || !getFileReferenceImageMimeType(path)) return;
 		// A remote path must never fall back to reading the server's filesystem.
 		if (!narratorId && deviceId !== "local") return;
 		const controller = new AbortController();
@@ -44,7 +46,15 @@ export function MarkdownImage({ src, alt, title }: { src?: string; alt?: string;
 		};
 	}, [deviceId, path, narratorId, key]);
 
-	const url = external ? src : image?.key === key ? image.url : undefined;
+	const url = REMOTE_BUILD
+		? src && isRemoteInlineImage(src)
+			? src
+			: undefined
+		: external
+			? src
+			: image?.key === key
+				? image.url
+				: undefined;
 	if (!url) return <span title={title}>{alt}</span>;
 	return (
 		<img src={url} alt={alt ?? ""} title={title} style={{ maxWidth: "100%", height: "auto" }} />

@@ -5,11 +5,12 @@
  * For the default setting and for 115% font / 110% line height / +2% letter spacing:
  *
  *   - the live editor, the mind map's nodes and the read-only tree (history) paint each role —
- *     body, page title, headings, inline code, code block — with exactly the size, line box and
- *     letter spacing the transcript measures that role with (`typographyMetrics()` /
- *     `headingMetrics()`, read in the page);
+ *     body, page title, inline code, code block — with exactly the size, line box and letter
+ *     spacing the transcript measures that role with (`typographyMetrics()` /
+ *     `headingMetrics()`, read in the page); a markdown heading inside a block is body text in
+ *     bold, so the page title is the largest text on the page;
  *   - the mind map, which measures its nodes with pretext before drawing them, draws every node
- *     at the height it measured (`nodeAccuracy`), its frame (arrow, bullet, checkbox) at the width
+ *     at the height it measured (`nodeAccuracy`), its frame (arrow and one marker) at the width
  *     it measured, and no node's text overflows its box — including after the setting changed
  *     while the page was open (cache keys, Worker requests and the line box all follow the
  *     setting);
@@ -134,7 +135,9 @@ async function expectEditor(e: MapEditor, x: Expected): Promise<void> {
 	const pm = ".nf-outline-editor .nf-outline-scroller .ProseMirror";
 	await expectRole(e, `${pm} > .ob-block > .ob-content > :first-child`, x.h3, "title");
 	await expectRole(e, `${pm} .ob-children .ob-block > .ob-content > p`, x.body, "body");
-	await expectRole(e, `${pm} .ob-content h2`, x.h2, "heading");
+	// A heading inside a block is body text in bold: the page title is the largest text.
+	await expectRole(e, `${pm} .ob-content h2`, x.body, "heading");
+	expect(x.h3.size, "the page title is larger than a nested heading").toBeGreaterThan(x.body.size);
 	await expectRole(e, `${pm} .ob-content p code`, x.code, "inline code");
 	await expectRole(e, `${pm} .ob-content pre`, x.codeBlock, "code block");
 	await expectFrameIcons(e, "outline", "editor");
@@ -148,7 +151,7 @@ async function expectMap(e: MapEditor, x: Expected, label: string): Promise<void
 	await e.call((f) => f.mapFlush());
 	await frames(e);
 	await expectRole(e, ".mm-node .mm-body > p", x.body, `${label} node body`);
-	await expectRole(e, ".mm-node .mm-body > h2", x.h2, `${label} node heading`);
+	await expectRole(e, ".mm-node .mm-body > h2", x.body, `${label} node heading`);
 	const accuracy = await e.call((f) => f.nodeAccuracy());
 	expect(accuracy.checked, label).toBeGreaterThanOrEqual(LINES.length);
 	// Measured with pretext, drawn by CSS: the same height, to the pixel.
@@ -201,7 +204,7 @@ for (const [name, setting] of Object.entries(SETTINGS)) {
 		await frames(e);
 		await expectRole(e, ".nf-type-scope h3", x.h3, "tree title");
 		await expectRole(e, "[data-block-id] .nf-type-scope", x.body, "tree body");
-		await expectRole(e, "[data-block-id] .nf-type-scope h2", x.h2, "tree heading");
+		await expectRole(e, "[data-block-id] .nf-type-scope h2", x.body, "tree heading");
 		await expectRole(e, "[data-block-id] .nf-type-scope code", x.code, "tree inline code");
 		await shoot(e, `after-outline-tree-${name}`);
 		expect(e.errors).toEqual([]);

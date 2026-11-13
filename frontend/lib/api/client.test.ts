@@ -284,6 +284,27 @@ describe("endSession", () => {
 		);
 	});
 
+	for (const outcome of ["success", "failure"] as const) {
+		test(`a delayed ${outcome} logout cannot clear a newer session`, async () => {
+			installMapLocalStorage();
+			let complete!: () => void;
+			const response = new Promise<Response>((resolve, reject) => {
+				complete = () => {
+					if (outcome === "success") resolve(new Response(null, { status: 200 }));
+					else reject(new TypeError("Connection closed"));
+				};
+			});
+			globalThis.fetch = (async () => response) as unknown as typeof fetch;
+			setToken(opaqueToken("old"));
+			const pending = endSession();
+			expect(getToken()).toBeNull();
+			const replacement = opaqueToken("new");
+			setToken(replacement);
+			complete();
+			await pending;
+			expect(getToken()).toBe(replacement);
+		});
+	}
 	test("sends nothing when there is no session", () => {
 		installMapLocalStorage();
 		let called = false;

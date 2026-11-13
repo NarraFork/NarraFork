@@ -127,6 +127,11 @@ export function assetUrl(path: string): string {
 	return joinBase(path);
 }
 
+/** Static resources may have a different base from routes and business APIs. */
+export function getAssetBase(): string {
+	return getAppBase();
+}
+
 /**
  * The router basepath, in the form TanStack Router expects: no trailing slash, and
  * `""` (not `"/"`) at the root.

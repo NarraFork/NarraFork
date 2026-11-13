@@ -328,16 +328,36 @@ function decodeProviderTool(id: string, raw: RawBlock): ToolBlock | undefined {
 		};
 	}
 	const result: Record<string, unknown> = {};
-	for (const key of ["revisedPrompt", "savedPath", "width", "height", "result"]) {
+	for (const key of [
+		"revisedPrompt",
+		"savedPath",
+		"partialSavedPath",
+		"partialImageIndex",
+		"width",
+		"height",
+		"result",
+		"status",
+		"error",
+		"errorCode",
+	]) {
 		if (raw[key] !== undefined) result[key] = raw[key];
 	}
+	const hasImage = !!(string(raw.result)?.trim() || string(raw.savedPath)?.trim());
+	const status = string(raw.status) || (hasImage ? "completed" : undefined);
+	if (status) result.status = status;
+	const phase: BlockPhase =
+		status === "failed" || status === "cancelled" || status === "incomplete"
+			? "failed"
+			: status === "in_progress" || status === "generating"
+				? "open"
+				: "done";
 	return {
 		id,
 		kind: "tool",
 		subtype: "image_generation",
 		wireId,
 		ordinal: 0,
-		phase: "done",
+		phase,
 		payload: { input: {}, executor: "provider", issuer: "model", result: {} },
 		providerMeta: { result },
 	};

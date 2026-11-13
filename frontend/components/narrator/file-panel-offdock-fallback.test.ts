@@ -31,6 +31,25 @@ const VIEWER_HOOK = readFileSync(
 	"utf8",
 );
 
+function declarationExpression(name: string): string {
+	const expression = new RegExp(`const ${name}\\s*=\\s*([^;]+);`).exec(VIEWER_HOOK)?.[1];
+	if (!expression) throw new Error(`File-viewer capability declaration missing: ${name}`);
+	return expression;
+}
+const internalViewerEnabled = new Function(
+	"REMOTE_BUILD",
+	"dockOpenFilePanel",
+	"isWorkspacePreview",
+	`return Boolean(${declarationExpression("useInternalViewer")});`,
+) as (remote: boolean, hasDock: boolean, preview: boolean) => boolean;
+const referenceViewerEnabled = new Function(
+	"REMOTE_BUILD",
+	"dockOpenFilePanel",
+	"isWorkspacePreview",
+	"useInternalViewer",
+	`return Boolean(${declarationExpression("canOpenReferencedFile")});`,
+) as (remote: boolean, hasDock: boolean, preview: boolean, internal: boolean) => boolean;
+
 describe("off-dock file viewer fallback", () => {
 	it("keeps the dock panel as the preferred route", () => {
 		// A dockview host must still open a real tab beside the chat rather than a
@@ -41,9 +60,9 @@ describe("off-dock file viewer fallback", () => {
 	});
 
 	it("falls back to the internal drawer when there is no dock", () => {
-		expect(VIEWER_HOOK).toContain(
-			"const useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview;",
-		);
+		expect(internalViewerEnabled(false, false, false)).toBe(true);
+		expect(internalViewerEnabled(false, true, false)).toBe(false);
+		expect(internalViewerEnabled(true, false, false)).toBe(false);
 		expect(VIEWER_HOOK).toMatch(
 			/if \(useInternalViewer\)[\s\S]*?setInternalFileViewerPath\(filePath\);/,
 		);
@@ -52,18 +71,34 @@ describe("off-dock file viewer fallback", () => {
 	it("still leaves workspace previews without a viewer", () => {
 		// Previews stay lightweight (same rule as the internal spec drawer), so their
 		// rows hide the affordance instead of opening a drawer inside a thumbnail.
-		expect(VIEWER_HOOK).toMatch(/useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview/);
-		// The panel's own affordance gate must keep the preview exclusion too — the
-		// hook returning a handler is not enough if the panel offered it anyway.
-		expect(VIEWER_HOOK).toContain(
-			"const canOpenReferencedFile = !isWorkspacePreview && (!!dockOpenFilePanel || useInternalViewer);",
-		);
+		for (const remote of [false, true]) {
+			for (const hasDock of [false, true]) {
+				expect(internalViewerEnabled(remote, hasDock, true)).toBe(false);
+				// The reference affordance must reject previews even if a host or a stale
+				// internal-viewer flag is present, not merely rely on the fallback route.
+				expect(referenceViewerEnabled(remote, hasDock, true, true)).toBe(false);
+			}
+		}
+		expect(referenceViewerEnabled(false, true, false, false)).toBe(true);
+		expect(referenceViewerEnabled(false, false, false, true)).toBe(true);
+		expect(referenceViewerEnabled(false, false, false, false)).toBe(false);
+		expect(referenceViewerEnabled(true, true, false, true)).toBe(false);
 	});
 
 	it("mounts the drawer only while a path is selected", () => {
 		// Mounted-on-demand and torn down on close: a session that never opens a file
 		// must not pay for the viewer's module graph.
-		expect(PANEL).toContain("{internalFileViewerPath && (");
+		const gate = /\{\s*(!REMOTE_BUILD\s*&&\s*internalFileViewerPath)\s*&&\s*\(/.exec(PANEL)?.[1];
+		if (!gate) throw new Error("Remote-gated internal file-viewer drawer missing");
+		const drawerMounted = new Function(
+			"REMOTE_BUILD",
+			"internalFileViewerPath",
+			`return Boolean(${gate});`,
+		) as (remote: boolean, path: string | null) => boolean;
+		expect(drawerMounted(false, "/work/readme.md")).toBe(true);
+		expect(drawerMounted(false, null)).toBe(false);
+		expect(drawerMounted(false, "")).toBe(false);
+		expect(drawerMounted(true, "/work/readme.md")).toBe(false);
 		expect(PANEL).toContain("onClose={() => setInternalFileViewerPath(null)}");
 	});
 

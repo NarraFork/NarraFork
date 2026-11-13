@@ -541,6 +541,54 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 });
 
 describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
+	it("preserves native image terminal diagnostics through live frames and reconnect snapshots", async () => {
+		await withStream(async (h) => {
+			// Keep the image offscreen: this checks the real transport/state chain,
+			// while the image render contract separately exercises preview painting.
+			await h.showOnlyKeys([]);
+			await h.frame({
+				type: "image_generation",
+				id: "native",
+				status: "generating",
+				partialSavedPath: "/partial.png",
+				width: 512,
+				height: 256,
+			});
+			await h.raf();
+			await h.frame({
+				type: "image_generation",
+				id: "native",
+				status: "failed",
+				error: "upstream rejected",
+				errorCode: "policy",
+			});
+			await h.raf();
+			expect(messageBody(h.live())[0]).toMatchObject({
+				status: "failed",
+				error: "upstream rejected",
+				errorCode: "policy",
+				partialSavedPath: "/partial.png",
+				width: 512,
+				height: 256,
+			});
+			for (const status of ["failed", "cancelled", "incomplete"]) {
+				const block = {
+					type: "image_generation",
+					id: "native",
+					status,
+					error: "snapshot detail",
+					errorCode: "snapshot_code",
+					partialSavedPath: "/partial.png",
+					savedPath: "/final.png",
+					width: 512,
+					height: 256,
+				};
+				await h.frame({ type: "streaming_snapshot", streamingBlocks: [block], toolChunks: [] });
+				await h.raf();
+				expect(messageBody(h.live())[0]).toMatchObject(block);
+			}
+		});
+	});
 	it("keeps actual request identity through live deltas and checkpoint projection", async () => {
 		await withStream(async (h) => {
 			await h.frame({ type: "streaming_identity", model: "gpt-actual", provider: "openai" });

@@ -70,6 +70,7 @@ export const ADMIN_PATHS: ReadonlySet<string> = new Set([
 	"/settings/proxy",
 	"/settings/workspace",
 	"/settings/server",
+	"/settings/remote-access",
 	// Models and agent defaults are instance-wide (PATCH /api/settings), not per-user.
 	"/settings/models",
 	"/settings/agent",
@@ -132,6 +133,7 @@ const instanceItems: readonly SettingsNavItem[] = [
 	{ to: "/settings/proxy", labelKey: "proxyManagementSection", Icon: IconShield },
 	{ to: "/settings/workspace", labelKey: "workspaceAndContainersSection", Icon: IconBox },
 	{ to: "/settings/server", labelKey: "serverAndSystemSection", Icon: IconServer },
+	{ to: "/settings/remote-access", labelKey: "remoteAccessSection", Icon: IconPlugConnected },
 	{ to: "/settings/authentication", labelKey: "authenticationSection", Icon: IconKey },
 	{ to: "/settings/oauth-apps", labelKey: "oauthAppsSection", Icon: IconApps },
 	{ to: "/settings/users", labelKey: "usersSection", Icon: IconUsers },

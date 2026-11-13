@@ -2002,7 +2002,7 @@ export const narratorsApi = {
 			}
 		} else {
 			headers["Content-Type"] = "application/json";
-			res = await fetch(url, {
+			res = await authorizedFetch(url, {
 				method: "POST",
 				headers,
 				body: JSON.stringify({
@@ -2223,7 +2223,7 @@ export const narratorsApi = {
 			});
 		}
 
-		const res = await fetch(
+		const res = await authorizedFetch(
 			inputBlockId
 				? `${apiBase()}/narrators/${narratorId}/blocks/${encodeURIComponent(inputBlockId)}/edit-and-regenerate`
 				: `${apiBase()}/narrators/${narratorId}/edit-and-regenerate/${messageId}`,

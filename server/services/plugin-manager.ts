@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { BUILTIN_PLUGIN_ROOTS, resolveBuiltinPluginRoots } from "@server/builtin-plugins/registry";
 import { db } from "@server/db";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
@@ -36,6 +37,11 @@ import {
 } from "./plugin-catalog";
 import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
 import { PluginContributionRegistry } from "./plugin-contribution-registry";
+import {
+	type PluginHealthMetrics,
+	type PluginHealthRegistry,
+	pluginHealthRegistry,
+} from "./plugin-health";
 import type { PluginHostRuntimeBindingInput, PluginHostServices } from "./plugin-host-services";
 import {
 	isStableInstallationId,
@@ -206,6 +212,8 @@ export interface PluginManagerOptions {
 	packageStore?: PluginPackageStoreLike;
 	catalog?: PluginCatalogLike;
 	stateStore?: PluginStateStore;
+	/** Call-level health accounting; defaults to the shared registry runtimes report to. */
+	healthRegistry?: PluginHealthRegistry;
 	permissionStore?: PluginPermissionStore;
 	integrationAuthorityService?: PluginIntegrationAuthorityService;
 	hostServices?: PluginHostServices;
@@ -273,10 +281,14 @@ export interface PluginPermissionMutationResult {
 
 export interface PluginManagerStatus extends PluginStateRecord {
 	installed: boolean;
+	/** Shipped with the application: no install step, no package-store record, no grant. */
+	builtin: boolean;
 	featureDisabled: boolean;
 	packageStatus?: PluginPackageSummary["status"];
 	manifest?: PluginPackageSummary["manifest"];
 	contributions: PluginCatalogPlugin["contributions"];
+	/** Call-level health, from the same registry external plugins report to. */
+	health?: PluginHealthMetrics[];
 	diagnostics: Array<
 		| PluginCatalogPlugin["diagnostics"][number]
 		| PluginCatalogSnapshot["diagnostics"][number]
@@ -483,8 +495,14 @@ export class PluginManager {
 	readonly root: string;
 	readonly disabled: boolean;
 	readonly packageStore: PluginPackageStoreLike;
-	readonly catalog: PluginCatalogLike;
+	/**
+	 * Not readonly: a compiled binary only knows where the builtin packages live after the
+	 * embedded copies are written out, which is async and therefore happens at the start of
+	 * `initializeInternal` rather than in the constructor.
+	 */
+	catalog: PluginCatalogLike;
 	readonly stateStore: PluginStateStore;
+	readonly healthRegistry: PluginHealthRegistry;
 	readonly permissionStore: PluginPermissionStore;
 	readonly integrationAuthorityService: PluginIntegrationAuthorityService;
 	readonly hostServices: PluginHostServices;
@@ -511,13 +529,18 @@ export class PluginManager {
 	private initializePromise?: Promise<PluginManagerStatus[]>;
 	private initialized = false;
 	private shuttingDown = false;
+	/** True when the caller supplied its own catalog, so builtin roots must not be re-resolved. */
+	private readonly catalogInjected: boolean;
 
 	constructor(options: PluginManagerOptions = {}) {
 		const root = resolve(options.root ?? options.packageStore?.root ?? getNarraforkPath("plugins"));
 		this.root = root;
 		this.disabled = options.disabled ?? true;
 		this.packageStore = options.packageStore ?? new PluginPackageStore(root);
-		this.catalog = options.catalog ?? new PluginCatalog(root);
+		this.catalog =
+			options.catalog ?? new PluginCatalog({ root, builtinRoots: BUILTIN_PLUGIN_ROOTS });
+		this.catalogInjected = options.catalog !== undefined;
+		this.healthRegistry = options.healthRegistry ?? pluginHealthRegistry;
 		this.stateStore = options.stateStore ?? new PluginStateStore(root);
 		this.permissionStore =
 			options.permissionStore ??
@@ -1461,6 +1484,16 @@ export class PluginManager {
 	}
 
 	private async initializeInternal(): Promise<PluginManagerStatus[]> {
+		// In a compiled binary the builtin packages have no directory on disk until the embedded
+		// copies are written out. Constructing the catalog needs those paths, but the constructor
+		// is synchronous, so the swap happens here — before anything reads the catalog. An
+		// injected catalog (tests, tests-only wiring) is left alone.
+		if (!this.catalogInjected) {
+			const builtinRoots = await resolveBuiltinPluginRoots();
+			if (builtinRoots !== BUILTIN_PLUGIN_ROOTS) {
+				this.catalog = new PluginCatalog({ root: this.root, builtinRoots });
+			}
+		}
 		const snapshot = await this.stateStore.initialize();
 		await this.permissionStore.initialize();
 		if (this.packageStore.cleanupStaging) {
@@ -1522,6 +1555,12 @@ export class PluginManager {
 			const packageSummary = currentPackage(plugin);
 			const currentState =
 				stateById.get(pluginId) ?? createPluginStateRecord(pluginId, this.timestamp());
+			// A builtin plugin ships enabled: it is part of the application, not something an
+			// admin installed, so there is no moment at which someone opted in. Its state
+			// record is created implicitly here (no install step) and from then on is the same
+			// record enable/disable operate on — an explicit disable is respected and sticky.
+			const freshBuiltin = !stateById.has(pluginId) && plugin?.builtin === true;
+			if (freshBuiltin) currentState.desiredState = "enabled";
 			const nextCurrent = plugin?.current ?? currentState.current;
 			const next: PluginStateRecord = {
 				...currentState,
@@ -1582,7 +1621,27 @@ export class PluginManager {
 		for (const state of reconciled) {
 			if (!state.current) continue;
 			try {
-				const { permissions } = await this.resolveInstallationContext(state);
+				let authorityState = state;
+				const plugin = this.catalogPlugin(state.pluginId);
+				const shippedPackage = currentPackage(plugin);
+				if (
+					!stateById.has(state.pluginId) &&
+					plugin?.builtin === true &&
+					shippedPackage?.status === "compatible" &&
+					state.desiredState === "enabled"
+				) {
+					// Builtins have no install operation to seed their first authority. Use the
+					// same manifest-to-grant path once, before an empty authority is persisted.
+					// Existing records, including explicit revocations, are never re-seeded.
+					const manifest = await this.readPackageManifest(shippedPackage);
+					authorityState = {
+						...state,
+						grants: seedGrantsFromManifest(state.grants, manifest.permissions.host, {
+							pluginId: state.pluginId,
+						}),
+					};
+				}
+				const { permissions } = await this.resolveInstallationContext(authorityState);
 				await this.syncPermissionSummary(state.pluginId, permissions);
 			} catch (error) {
 				await this.stateStore.updateState(state.pluginId, {
@@ -2792,10 +2851,14 @@ export class PluginManager {
 			);
 		}
 		const installationId = randomUUID();
+		// A nonexistent legacy source would create an empty permission set and shadow the
+		// initial manifest grants. Migrate only an actual legacy authority or mirror.
 		const legacyInstallationId =
 			legacyActive.length === 1
 				? (legacyActive[0].installationId as string)
-				: (state.current?.hash ?? undefined);
+				: state.current && (await this.permissionStore.hasSet(pluginId, state.current.hash))
+					? state.current.hash
+					: undefined;
 		logger.info("Allocated stable plugin installation identity", {
 			pluginId,
 			installationId,
@@ -3306,6 +3369,16 @@ export class PluginManager {
 		return status;
 	}
 
+	/**
+	 * Call-level health for one plugin, from the same registry runtimes and tool calls report
+	 * into. Only surfaces that have actually recorded something are returned, so an untouched
+	 * plugin reports no health rather than fabricated zeros.
+	 */
+	private healthMetrics(pluginId: string): PluginHealthMetrics[] | undefined {
+		const metrics = this.healthRegistry.metrics().filter((entry) => entry.pluginId === pluginId);
+		return metrics.length > 0 ? metrics : undefined;
+	}
+
 	private async buildStatus(pluginId: string): Promise<PluginManagerStatus | undefined> {
 		const state = await this.stateStore.getState(pluginId);
 		const plugin = this.catalogPlugin(pluginId);
@@ -3316,10 +3389,12 @@ export class PluginManager {
 		return {
 			...effectiveState,
 			installed: Boolean(packageSummary),
+			builtin: plugin?.builtin === true,
 			featureDisabled: this.disabled,
 			packageStatus: packageSummary?.status,
 			manifest: packageSummary?.manifest,
 			contributions: plugin?.contributions ?? [],
+			health: this.healthMetrics(pluginId),
 			diagnostics: [
 				...(this.catalogSnapshot?.diagnostics ?? []),
 				...(plugin?.diagnostics ?? []),

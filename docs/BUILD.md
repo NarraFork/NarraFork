@@ -35,6 +35,39 @@ bun run build:linux-arm64
 
 `--platform=` 支持完整后缀（`darwin-arm64`、`linux-x64`、`windows-x64`）或短别名前缀（`windows`/`linux`/`darwin` 匹配对应 `*-*`）；裸 `arm64` 不会命中。
 
+## 本机稳定运行
+
+`bun run start` 和 `bun run start:dev` 先构建本机单文件运行产物，再从该产物启动后端。
+主程序、Worker、迁移及原生依赖固定在同一次构建中；启动后对源码执行 rebase，不会改变后续新建 Worker 使用的代码。
+`start` 使用已构建的 `dist/frontend`；`start:dev` 保留源码 Vite 前端及原端口（前端 41221、后端默认 7778），不要求先构建整站前端。
+显式 `dev` / `dev:all` / `dev:cold` 仍是源码开发模式，不提供这层隔离。
+
+构建不会发布版本，也不会重启或接管已有服务。迁移由新后端取得实例锁后使用内嵌材料执行，不再在启动前单独运行源码迁移。
+构建失败即停止，不回退源码或某个旧版本。构建期间应避免修改源码；运行版本固定不等于构建输入自动取得了 Git 快照。
+
+### 构建一次，多次启动
+
+每次构建输出独占路径以及耗时、产物大小。**日常重启建议复用该路径，代码变更后再构建**：
+
+```sh
+# 只构建后端，用于与 Vite 搭配
+bun run build:runtime
+bun run start:dev --runtime="<构建输出的可执行文件绝对路径>"
+
+# 连同已有的静态前端一起构建
+bun run build
+bun run build:runtime --frontend
+bun run start --runtime="<构建输出的可执行文件绝对路径>"
+```
+
+`--runtime` 明确选择已有产物，跳过编译；找不到该文件会报错，不自动换一个版本。
+后端参数可继续传递，例如 `--no-auto-resume`。不要为了测试上述命令而停止承载会话的服务器；验证请使用独立 HOME、端口和数据库。
+
+产物位于 `NARRAFORK_HOME/runtime/<buildId>/`（默认 `~/.narrafork/runtime/`），成功构建后不自动覆盖或删除。
+保留正在使用的版本及需要回退的版本；确认某版本已不被服务、维护子进程或启动配置引用后，才手动删除其整个独占目录。
+不要删除正在运行的版本，即使后端已经启动，后续 Worker 和维护子进程仍可能需要它。
+本机产物不走正式发行版的自动替换更新；源码更新后重新构建并由操作员选择切换时机。
+
 ## 构建流程
 
 构建脚本 `scripts/build-cross-platform.ts` 执行以下步骤：
@@ -77,7 +110,36 @@ bun scripts/build-cross-platform.ts --platform=linux-arm64
 
 普通本地 build 只产出 full 和 metadata，不枚举 dist 猜旧基线生成 patch。生产 patch 由 GitHub Release CI 使用此前已公开的原始 GitHub binary/sidecar 单次生成并重建验证；本地上传现存 patch 也须证明公开基线身份，离线无证据时明确拒绝该 patch 而不偷偷联网。独立更新服务器只在 GitHub Release/index 完成后镜像 metadata/当前 patch，不参与构建、补包或主发布门禁。默认 direct，可显式配置 WebDAV 暂存后由服务器主动拉取；两种方式都由服务器校验大小/SHA256，不回传资产给 runner。WebDAV 的 `STAGED_FOR_PULL` 仅表示已暂存，不等于服务器已导入，配置与保留期见 [RELEASE.md](RELEASE.md)。
 
-辅助工具通过独立 `.github/workflows/helpers-release.yml` 构建并原生 smoke，不加入主程序资产；即使应用 metadata 选择独立镜像，helper/executor binary 仍取固定 GitHub tag。rg/zstd 各覆盖六平台；Linux zstd 使用固定 Alpine 镜像摘要及源码摘要的 musl 静态 recipe，Windows ARM64 复用固定 llvm-mingw recipe，macOS 原生构建。不要恢复 `Alpine latest`、未经摘要校验的 musl.cc 工具链或 `-march=native`。发布细节、许可附件和显式触发步骤见 [RELEASE.md](RELEASE.md)。
+辅助工具通过独立 `.github/workflows/helpers-release.yml` 构建并原生 smoke，不加入主程序资产；helper/executor/remote-peer 下载选 GitHub 时使用固定仓库/tag，选独立镜像时 manifest 与 binary 都从该镜像获取，冷缓存也不访问 GitHub，镜像失败不回落 GitHub。rg/zstd 各覆盖六平台；Linux zstd 使用固定 Alpine 镜像摘要及源码摘要的 musl 静态 recipe，Windows ARM64 复用固定 llvm-mingw recipe，macOS 原生构建。不要恢复 `Alpine latest`、未经摘要校验的 musl.cc 工具链或 `-march=native`。发布细节、许可附件和显式触发步骤见 [RELEASE.md](RELEASE.md)。
+
+## 远程专用前端与本地静态托管（M2）
+
+同一业务源码有两个编译目标：`bun run build` 保持普通 HTTP/WS 前端和 `dist/frontend/`；`bun run build:remote:assets` 生成 `dist/frontend-remote/`，不含普通启动、PWA/插件 host 或未适配的终端/outline 等模块。远程业务不回退普通 HTTP。
+
+```bash
+# 构建远程资源并打包；不会发布、推送或启动 NF
+bun run build:remote --output=dist/remote-package
+# 已有最新远程资源时可只打包
+bun scripts/build-remote-frontend.ts --skip-build --output=dist/remote-package
+```
+
+产物为 `narrafork-<version>-remote-frontend.tar.gz` 与同名前缀 `.manifest.json`。版本取当前 package，仓库身份沿用构建来源规则，commit 默认取完整 HEAD；CI 显式冻结目标 SHA。开发工作区的未提交构建不能当成该 SHA 的已发布源码证明。重复相同产物可复用；同版本不同内容请换输出目录，不覆盖已有资产。归档不包含 Vite 的私有源码模块图和开发 metadata。
+
+导入使用独立 CLI 校验摘要、文件清单、预算与安全 tar 路径后原子安装；不在 NF 请求线程解压。下面只启动本机静态 host，不包含信令服务或公网部署：
+
+```bash
+VERSION="$(bun --eval 'console.log((await Bun.file("package.json").json()).version)')"
+bun scripts/remote-host.ts import --store=.narrafork/remote-host --manifest="dist/remote-package/narrafork-${VERSION}-remote-frontend.manifest.json"
+# build-id 替换为导入结果中的实际 64 位摘要；引导包必须显式指定，不自动取 latest
+bun scripts/remote-host.ts bootstrap --store=.narrafork/remote-host --build-id="<build-id>"
+bun scripts/remote-host.ts serve --store=.narrafork/remote-host --hostname=127.0.0.1 --port=8787
+```
+
+不同兼容身份的包可重复导入同一 store；`catalog` 查看清单，`disable --build-id="<build-id>"` 停用，`--disabled=false` 显式恢复。禁止覆盖既有 buildId。运行中的库实例对新导入内容须显式调用 `host.reload()` 完成验证后才服务；改变引导包配置须重新创建独立 host，不能借此重启正在运行的 NF。遗留 `.remote-host.lock` 不自动抢占，需操作者先确认原进程已经停止。
+
+`remote-host/index.ts` 的 `createRemoteHost().assetHandler` 可接入协调服务的 `assetHandler`。业务 `/api/*`、`/ws/*` 和未知静态 chunk 均拒绝，不代理 NF；普通深链只返回轻量引导页。浏览器从可信 RTC hello 取得 **NF 应用版本** 后选择精确匹配模块，未知/禁用版本不回退 latest。实际浏览器使用需要每实例独立 HTTPS origin 与 WSS 信令；localhost 仅用于显式隔离测试。公网监听额外要求 `--allow-public-tls`、`--tls-cert`、`--tls-key` 和 `--instance-domain`，本轮未实际部署。
+
+真实 NF 管理入口在普通前端“设置 → 远程访问”：先显式安装匹配 peer，配置协调服务/STUN，再启用并创建邀请；默认关闭，状态查询不会下载或启动进程。配对后仍须管理员密码及既有 MFA。支持项目、叙述者聊天/审批、SSE 和有界小附件；未适配功能明确禁用。
 
 ## 交叉编译说明
 
@@ -169,4 +231,6 @@ chmod +x dist/narrafork-*
 - `bun run build:cross --platform=linux-x64` — 构建指定平台
 - `bun run build:update-server` — 构建更新服务器
 - `bun run build:android-rootfs` — 构建 Android rootfs
-- `bun run start` — 生产模式运行（跑迁移 + 后端 + 静态前端，不编译独立二进制）
+- `bun run build:runtime` — 构建本机冻结后端；加 `--frontend` 嵌入已有静态前端
+- `bun run start` — 构建并运行本机产物及静态前端；`--runtime=<path>` 复用已构建版本
+- `bun run start:dev` — 冻结后端搭配源码 Vite；同样支持 `--runtime=<path>`

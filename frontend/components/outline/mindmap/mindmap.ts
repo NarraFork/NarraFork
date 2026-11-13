@@ -28,6 +28,7 @@ import {
 	layoutTree,
 	planVisible,
 } from "@shared/outline/layout";
+import { buildFoldTree, type FoldTree, foldSubtreeControl } from "@shared/outline-fold";
 import type { LiveTaskChar } from "@shared/outline-live-protocol";
 import { getTypographyRevision, onTypographyChange } from "@shared/pretext-layout/typography";
 import type { Command } from "prosemirror-state";
@@ -35,6 +36,8 @@ import { ensureTypographyCssVars } from "../../../lib/typography-css-vars";
 import { pinchStep, wheelZoomFactor, zoomAround } from "../../common/pan-zoom-math";
 import {
 	applyChrome,
+	type BlockMark,
+	chromeText,
 	createGutter,
 	type Gutter,
 	type MentionResolver,
@@ -55,6 +58,7 @@ import {
 	toggleTask,
 } from "../editor/commands";
 import type { LiveClient, SelInfo } from "../editor/live-client";
+import { liveFoldSource, liveUnderTask } from "../editor/live-fold";
 import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "../editor/view";
 import type { OutlineViewState } from "../view-state";
 import {
@@ -111,6 +115,15 @@ export interface MapHost {
 	focusBlock(id: string): void;
 	focusUp(): void;
 	toggleCollapse(id: string): void;
+	/** Make sure a block shows its children (one is about to be added or dropped into it). */
+	openBlock(id: string): void;
+	/** Everything inside a block: opened, or back to the default view (Alt on its arrow). */
+	toggleSubtree(id: string, open: boolean): void;
+	/**
+	 * The page's marks as the outline folds by them (a question waiting for an answer holds the
+	 * blocks above it open), and whether the page's summary arrived.
+	 */
+	foldMarks(): { marks: ReadonlyMap<string, BlockMark>; known: boolean };
 	/** Keys shared by the outline, the map and node editors (collapse all, levels, …). */
 	surfaceKeys(): Record<string, Command>;
 	restoreSel(sel: SelInfo): boolean;
@@ -183,6 +196,8 @@ export class MindMapView {
 	info = new Map<string, NInfo>();
 	order: string[] = [];
 	rootId = "";
+	/** The tree with what is open, as the last layout worked it out (`@shared/outline-fold`). */
+	foldTree: FoldTree | null = null;
 	readonly els = new Map<string, NodeEl>();
 	/** Nodes that must have DOM while a transition runs. */
 	readonly force = new Set<string>();
@@ -426,7 +441,22 @@ export class MindMapView {
 			const kids = v.children(id);
 			return facts ? kids.filter((k) => !v.get(k)?.task) : kids;
 		};
-		const collapsedOf = (id: string) => st.collapsed.has(id);
+		// What is open: the page's default view with the reader's folding over it, as the
+		// outline (`@shared/outline-fold`). A closed node carries a count badge.
+		const tree = buildFoldTree(
+			liveFoldSource(client, {
+				marks: this.host.foldMarks().marks,
+				questionsKnown: this.host.foldMarks().known,
+				...(facts ? { omit: (id) => !!v.get(id)?.task } : {}),
+			}),
+			{ rootId, rootDetail: liveUnderTask(client, rootId) },
+			st,
+		);
+		this.foldTree = tree;
+		const collapsedOf = (id: string) => {
+			const node = tree.nodes.get(id);
+			return node !== undefined && node.kids.length > 0 && !node.open;
+		};
 		const plan = planVisible({
 			rootId,
 			children: kidsOf,
@@ -440,7 +470,10 @@ export class MindMapView {
 		const ed = this.editing;
 		const gen = getTypographyRevision();
 		const make = (id: string, parent: string | null, index: number): LayoutNode => {
-			const content = client.textOf(id);
+			// A subagent report's container line is measured and drawn as people read it (their
+			// language and time zone); editing the node shows the stored text.
+			const stored = client.textOf(id);
+			const content = chromeText.reportLine(stored, id) ?? stored;
 			const task = v.get(id)?.task ?? null;
 			const allKids = kidsOf(id);
 			const collapsed = id !== rootId && collapsedOf(id) && allKids.length > 0;
@@ -794,7 +827,7 @@ export class MindMapView {
 		const badge = document.createElement("span");
 		badge.className = "mm-more";
 		if (more) el.append(body);
-		else el.append(g.el, body, badge);
+		else el.append(g.el, body, g.zoom, badge);
 		return { el, g, body, badge, key: "", x: Number.NaN, y: Number.NaN, w: -1 };
 	}
 
@@ -919,7 +952,7 @@ export class MindMapView {
 		ne.body.replaceChildren();
 		const view = new OutlineView(this.client, { kind: "node", blockId: id }, ne.body, {
 			lens: this.host.lens(),
-			collapsed: this.host.state.collapsed,
+			fold: this.host.state,
 			keys: this.host.surfaceKeys(),
 			resolveMention: this.host.resolveMention,
 			restoreSel: (sel) => this.host.restoreSel(sel),
@@ -1046,10 +1079,21 @@ export class MindMapView {
 		return p?.blockId ?? null;
 	}
 
+	/** Fold a node: one level, or (with Alt) everything inside it, as the outline's arrow. */
+	private fold(id: string, everything: boolean): void {
+		const node = this.foldTree?.nodes.get(id);
+		if (everything && node) {
+			const control = foldSubtreeControl(node);
+			if (control) this.host.toggleSubtree(id, control === "expand");
+			return;
+		}
+		this.host.toggleCollapse(id);
+	}
+
 	/** Tab: a new last child, edited at once. */
 	cmdAddChild(id: string): void {
 		if (isMore(id)) return;
-		if (this.host.state.collapsed.has(id)) this.host.toggleCollapse(id);
+		this.host.openBlock(id);
 		const nid = this.runCmd(id, (v) => addChild(v));
 		if (nid && nid !== id) {
 			this.flush();
@@ -1119,8 +1163,7 @@ export class MindMapView {
 	}
 
 	cmdDrop(id: string, target: string, where: DropWhere): void {
-		if (where === "child" && this.host.state.collapsed.has(target))
-			this.host.toggleCollapse(target);
+		if (where === "child") this.host.openBlock(target);
 		this.runCmd(id, () => moveBlockTo(id, target, where));
 		this.flush();
 		this.select(id);
@@ -1264,7 +1307,8 @@ export class MindMapView {
 				return;
 			case " ":
 				handled();
-				if (this.info.get(id)?.hasKids && id !== this.rootId) this.host.toggleCollapse(id);
+				// Space folds the node; with Alt, everything inside it (as its arrow does).
+				if (this.info.get(id)?.hasKids && id !== this.rootId) this.fold(id, e.altKey);
 				return;
 			case "Delete":
 			case "Backspace":
@@ -1336,7 +1380,10 @@ export class MindMapView {
 		const target = e.target as HTMLElement;
 		const id = this.nodeIdAt(target);
 		// Inside the node being edited, the editor handles the pointer itself.
-		if (this.editing && id === this.editing.id && !target.closest(".ob-gutter")) return;
+		// The frame: the gutter before the body and, on a task, the focus handle after it.
+		const zoom = target.closest(".ob-zoom");
+		const frame = zoom ?? target.closest(".ob-gutter");
+		if (this.editing && id === this.editing.id && !frame) return;
 		this.pointers.set(e.pointerId, p);
 		if (this.pointers.size === 2) {
 			// A second finger: pinch.
@@ -1351,10 +1398,10 @@ export class MindMapView {
 			return;
 		}
 		if (this.pointers.size > 2) return;
-		if (id && target.closest(".ob-gutter")) {
+		if (id && frame) {
 			e.preventDefault();
-			if (target.closest(".ob-arrow")) this.host.toggleCollapse(id);
-			else if (target.closest(".ob-bullet")) {
+			if (target.closest(".ob-arrow")) this.fold(id, e.altKey);
+			else if (zoom || target.closest(".ob-bullet")) {
 				if (id === this.rootId) this.host.focusUp();
 				else this.host.focusBlock(id);
 			} else if (target.closest(".ob-check")) this.cmdCycleTask(id);

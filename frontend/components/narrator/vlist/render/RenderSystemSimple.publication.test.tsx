@@ -66,6 +66,7 @@ const toggles: RowToggles = {
 	onToggleTranslation: noop,
 	onTogglePrompt: noop,
 	onToggleFileChanges: noop,
+	onPlanTree: noop,
 };
 const labels = { reasoning: { reasoning: "Reasoning", thinking: "Thinking" } } as VListRenderLabels;
 

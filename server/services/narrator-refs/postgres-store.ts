@@ -1,4 +1,18 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notExists, or, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gt,
+	gte,
+	inArray,
+	isNotNull,
+	isNull,
+	lt,
+	notExists,
+	or,
+	sql,
+} from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { alias } from "drizzle-orm/pg-core";
 import { withPgRetry } from "../../db/pg-retry";
@@ -326,6 +340,32 @@ export function createPostgresNarratorMessageRefsPort(db: BunSQLDatabase): Narra
 		});
 	}
 	return {
+		async lastServedProvider(narratorId, options) {
+			return atomic("narratorRefs.lastServedProvider", options, async (tx) => {
+				const [compact] = await tx
+					.select({ seq: refs.seq })
+					.from(refs)
+					.where(and(eq(refs.narratorId, narratorId), eq(refs.isCompact, 1)))
+					.orderBy(desc(refs.seq))
+					.limit(1);
+				const [row] = await tx
+					.select({ provider: messages.provider })
+					.from(refs)
+					.innerJoin(messages, eq(messages.id, refs.messageId))
+					.where(
+						and(
+							eq(refs.narratorId, narratorId),
+							eq(messages.narratorId, narratorId),
+							eq(messages.role, "assistant"),
+							isNotNull(messages.provider),
+							compact ? gt(refs.seq, compact.seq) : undefined,
+						),
+					)
+					.orderBy(desc(refs.seq))
+					.limit(1);
+				return row?.provider ?? undefined;
+			});
+		},
 		async creator(userId) {
 			return atomic("narratorRefs.creator", undefined, async (tx) => {
 				const [row] = await tx

@@ -41,6 +41,7 @@ import {
 	type OutlineViewBlock,
 	type OutlineViewMode,
 } from "@shared/outline-api";
+import { isOutlineReportBlockId, isOutlineReportContainer } from "@shared/outline-report-line";
 import type { OutlinePrincipal } from "./access";
 import { readDisplayNames } from "./access-reads";
 import {
@@ -51,6 +52,7 @@ import {
 } from "./model";
 import { loadBodies, loadBodiesWithin, readPageTimeline, readSubtree } from "./read";
 import { clampBudget, type OutlineBudget } from "./render";
+import { readReportAuthors } from "./report-authors";
 import { isOrphanedSpace } from "./spaces";
 import { outlineStore } from "./store";
 import type { OutlineCommitRow, OutlineSpaceRow, OutlineStore } from "./store/port";
@@ -282,6 +284,14 @@ export async function readBlockView(
 		{ narratorVisible: request.narratorVisible },
 	);
 
+	// Who wrote each subagent report shown (its container line says it), for a reader who may
+	// read that session.
+	const reportFrom = await readReportAuthors(
+		state.space.id,
+		shown.filter((node) => isOutlineReportBlockId(node.id)),
+		{ narratorVisible: request.narratorVisible, store },
+	);
+
 	let hiddenByView = 0;
 	const blocks: OutlineViewBlock[] = shown.map((node) => {
 		const children = kids.get(node) ?? [];
@@ -330,6 +340,7 @@ export async function readBlockView(
 			),
 			lock: locks.get(node.id) ?? null,
 			pending: markedOf.get(node.id) ?? [],
+			...(reportFrom.has(node.id) ? { reportFrom: reportFrom.get(node.id) } : {}),
 		};
 	});
 	if (view === "facts") {
@@ -344,6 +355,9 @@ export async function readBlockView(
 		seq: state.seq,
 		current: state.current,
 		view,
+		rootInTask: path.some(
+			(node) => node.task !== null || isOutlineReportContainer(node.id, node.content ?? ""),
+		),
 		path: path.map((node) => ({
 			id: node.id,
 			sid: node.sid,

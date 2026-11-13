@@ -339,6 +339,22 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 					[elsewhere.id, there.results[0]?.blockId as string],
 				].sort(bySpaceThenId),
 			);
+			// A page's own open questions, newest first, whatever else the space has open: every
+			// level under the page, not the other pages', the other spaces', deleted or answered ones.
+			const onPage = [q1, q1a, q2, q3, q1b] as string[];
+			const pageRead = await ctx.store.listOpenQuestionBlocksOnPage(s.space.id, s.page, 50);
+			expect([...pageRead].sort()).toEqual([...onPage].sort());
+			expect(await ctx.store.listOpenQuestionBlocksOnPage(s.space.id, s.fact, 50)).toEqual([
+				onFact as string,
+			]);
+			expect(await ctx.store.listOpenQuestionBlocksOnPage(s.space.id, top as string, 50)).toEqual([
+				top as string,
+			]);
+			expect((await ctx.store.listOpenQuestionBlocksOnPage(s.space.id, s.page, 2)).length).toBe(2);
+			expect(await ctx.store.listOpenQuestionBlocksOnPage(elsewhere.id, s.page, 50)).toEqual([]);
+			expect(await ctx.store.listOpenQuestionBlocksOnPage(s.space.id, "no-such-page", 50)).toEqual(
+				[],
+			);
 			const { groups, truncated } = await listQuestionGroupsForUser(s.person, { store: ctx.store });
 			expect(truncated).toBe(false);
 			const byGroup = new Map(groups.map((g) => [g.groupBlockId, g]));
@@ -386,6 +402,12 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 					(g) => g.groupBlockId,
 				),
 			).not.toContain(s.task);
+			// Answered ones are no longer the page's open questions; a deleted one goes too.
+			expect(await ctx.store.listOpenQuestionBlocksOnPage(s.space.id, s.page, 50)).toEqual([
+				q3 as string,
+			]);
+			await personWrites(ctx, s.space, s.person, [{ op: "delete", block: { id: q3 as string } }]);
+			expect(await ctx.store.listOpenQuestionBlocksOnPage(s.space.id, s.page, 50)).toEqual([]);
 			checkSpaceInvariants(await ctx.dump(s.space.id));
 		},
 	},

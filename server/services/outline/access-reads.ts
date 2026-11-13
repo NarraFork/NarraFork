@@ -93,6 +93,15 @@ async function all(query: SQL): Promise<Row[]> {
 	return await executor().all(query);
 }
 
+/**
+ * One statement through the executor, for the few modules that keep their own dialect-neutral
+ * SQL next to what they read it for (the Dynamic Spec import's reads, `spec-import/read-port.ts`).
+ * The same rules hold for them: small, indexed, bounded, every value a bound parameter.
+ */
+export async function runOutlineAccessQuery(query: SQL): Promise<Row[]> {
+	return await all(query);
+}
+
 function text(row: Row, column: string): string {
 	const value = row[column];
 	if (typeof value !== "string") throw new Error(`outline access read: ${column} is not text`);
@@ -150,6 +159,45 @@ export async function readNarrator(id: string): Promise<NarratorAccessRow | null
 		aclRootNarratorId: textOrNull(row, "acl_root_narrator_id"),
 		contextProjectId: textOrNull(row, "context_project_id"),
 	};
+}
+
+/** What a handoff says of the session that held a task (`handoff.ts`). */
+export interface NarratorHandoffRow {
+	id: string;
+	title: string | null;
+	ownerUserId: string | null;
+	visibility: string;
+	cwd: string | null;
+	contextProjectId: string | null;
+}
+
+/** Sessions by id, as a handoff names them (primary keys, chunked). */
+export async function readNarratorHandoffRows(
+	ids: readonly string[],
+): Promise<Map<string, NarratorHandoffRow>> {
+	const out = new Map<string, NarratorHandoffRow>();
+	for (const chunk of chunked([...new Set(ids)])) {
+		const rows = await all(sql`
+			select id, title, owner_user_id, visibility, cwd, context_project_id
+			from narrators where id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows)
+			out.set(text(row, "id"), {
+				id: text(row, "id"),
+				title: textOrNull(row, "title"),
+				ownerUserId: textOrNull(row, "owner_user_id"),
+				visibility: text(row, "visibility"),
+				cwd: textOrNull(row, "cwd"),
+				contextProjectId: textOrNull(row, "context_project_id"),
+			});
+	}
+	return out;
+}
+
+/** A project's working directory (`git_path`), or null. */
+export async function readProjectDir(projectId: string): Promise<string | null> {
+	const rows = await all(sql`select git_path from projects where id = ${projectId} limit 1`);
+	return rows[0] ? textOrNull(rows[0], "git_path")?.trim() || null : null;
 }
 
 /**
@@ -235,6 +283,112 @@ export async function readProjectName(id: string): Promise<string | null> {
 export async function readNarratorTitle(id: string): Promise<string | null> {
 	const rows = await all(sql`select title from narrators where id = ${id} limit 1`);
 	return rows[0] ? textOrNull(rows[0], "title") : null;
+}
+
+/**
+ * What a session's team activity starts from (outline P2 PR 10b): when the session was made, its
+ * handle (an `@agent:<handle>` assignee names it), and when its latest finished run ended (the
+ * run index `idx_turns_narrator_started`, newest first; a running one is skipped). Null when the
+ * narrator does not exist.
+ */
+export async function readTeamActivityFacts(
+	narratorId: string,
+): Promise<{ createdAt: string; handle: string | null; lastRunEndedAt: string | null } | null> {
+	const rows = await all(sql`
+		select created_at, handle from narrators where id = ${narratorId} limit 1
+	`);
+	const row = rows[0];
+	if (!row) return null;
+	const runs = await all(sql`
+		select ended_at from narrator_turns
+		where narrator_id = ${narratorId} and ended_at is not null
+		order by started_at desc limit 1
+	`);
+	return {
+		createdAt: text(row, "created_at"),
+		handle: textOrNull(row, "handle"),
+		lastRunEndedAt: runs[0] ? textOrNull(runs[0], "ended_at") : null,
+	};
+}
+
+/**
+ * The session a handle names (`@agent:<handle>`, outline P2 PR 10a): the narrator holding the
+ * folded handle (the unique index `idx_narrators_handle_fold`), with its type. Null when nobody
+ * holds it.
+ */
+export async function readNarratorByHandleFold(
+	folded: string,
+): Promise<{ id: string; type: string } | null> {
+	if (!folded) return null;
+	const rows = await all(sql`
+		select id, type from narrators where handle_fold = ${folded} limit 1
+	`);
+	const row = rows[0];
+	return row ? { id: text(row, "id"), type: text(row, "type") } : null;
+}
+
+/**
+ * What decides whether a team event may wake a session (outline P2 PR 10a): its status, whether
+ * it is in plan mode (the `plan` trait), how its last run stopped, and its handle. By primary
+ * key; null when the narrator does not exist.
+ */
+export async function readNarratorWakeFacts(narratorId: string): Promise<{
+	status: string;
+	planMode: boolean;
+	lastStopReason: string | null;
+	handle: string | null;
+} | null> {
+	const rows = await all(sql`
+		select status, traits, last_stop_reason, handle from narrators
+		where id = ${narratorId} limit 1
+	`);
+	const row = rows[0];
+	if (!row) return null;
+	// `traits` is JSON text on SQLite and jsonb on PostgreSQL.
+	const raw = row.traits;
+	let traits: unknown = raw;
+	if (typeof raw === "string") {
+		try {
+			traits = JSON.parse(raw);
+		} catch {
+			traits = [];
+		}
+	}
+	return {
+		status: text(row, "status"),
+		planMode: Array.isArray(traits) && traits.includes("plan"),
+		lastStopReason: textOrNull(row, "last_stop_reason"),
+		handle: textOrNull(row, "handle"),
+	};
+}
+
+/**
+ * Running state of narrators for the live editor's agent presence (outline P2 PR 10b): status,
+ * title, type and session root, by primary key, chunked. Missing narrators are left out.
+ */
+export async function readNarratorPresence(
+	ids: readonly string[],
+): Promise<
+	Map<string, { status: string; title: string | null; subagent: boolean; root: string | null }>
+> {
+	const out = new Map<
+		string,
+		{ status: string; title: string | null; subagent: boolean; root: string | null }
+	>();
+	for (const chunk of chunked([...new Set(ids)])) {
+		const rows = await all(sql`
+			select id, status, title, type, acl_root_narrator_id from narrators
+			where id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows)
+			out.set(text(row, "id"), {
+				status: text(row, "status"),
+				title: textOrNull(row, "title"),
+				subagent: textOrNull(row, "type") === "subagent",
+				root: textOrNull(row, "acl_root_narrator_id"),
+			});
+	}
+	return out;
 }
 
 export async function readUserExists(id: string): Promise<boolean> {
@@ -574,6 +728,237 @@ export async function readProjectSessionSpacePage(
 		limit ${options.limit}
 	`);
 	return rows.map(toSpace);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The connected outline (readability E)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A space as the connected outline lists it: with the time of its latest commit. */
+export interface OutlineTreeSpaceRow extends OutlineSpaceRow {
+	lastCommitAt: string | null;
+}
+
+/** Where a page of the connected outline ended: the last row's commit time and id. */
+export interface OutlineTreeCursor {
+	lastCommitAt: string | null;
+	id: string;
+}
+
+/**
+ * One group of the connected outline:
+ *   - `projects`: the spaces of projects the principal can read, archived projects left out;
+ *   - `project`: the session spaces of the sessions whose project is this one (the session's
+ *     project by the one shared rule, `narratorProjectIdText`: a session is listed under one
+ *     project only, never under those it is merely linked to);
+ *   - `loose`: the session spaces that hang under no listed project space: the session has no
+ *     project, its project has no space, or the principal cannot read the project;
+ *   - `orphaned`: spaces whose project or owner is gone (admins only; the caller checks).
+ *
+ * Every session space is in at most one of `project` and `loose`. Archived sessions are in
+ * neither, as on the task board; nor are the sessions of an archived project (listed under it
+ * when the project is opened by URL, not among the loose ones).
+ */
+export type OutlineTreeScope =
+	| { kind: "projects" }
+	| { kind: "project"; projectId: string }
+	| { kind: "loose" }
+	| { kind: "orphaned" };
+
+/**
+ * The scope's FROM and WHERE: readability is the project and narrator lists' own predicates, so
+ * the filter runs in SQL before any LIMIT and a page is never short because rows were dropped
+ * after it. Admins read every project and session.
+ */
+function treeScopeSql(
+	principal: { userId: string; isAdmin: boolean },
+	scope: OutlineTreeScope,
+): { from: SQL; where: SQL } {
+	const spaces = sql`outline_spaces s`;
+	if (scope.kind === "orphaned") {
+		return {
+			from: spaces,
+			where: sql`(
+				(s.kind = 'project' and s.project_id is null)
+				or (s.kind = 'personal' and s.owner_user_id is null)
+				or (s.kind = 'session' and s.narrator_id is null)
+			)`,
+		};
+	}
+	if (scope.kind === "projects") {
+		// Archived projects are not listed (their spaces stay reachable by URL and search).
+		const active = sql`exists (
+			select 1 from projects ap where ap.id = s.project_id and ap.status <> 'archived'
+		)`;
+		return {
+			from: spaces,
+			where: principal.isAdmin
+				? sql`s.kind = 'project' and ${active}`
+				: sql`s.kind = 'project' and ${active} and ${bindPlaceholders(
+						projectReadableForIdText("s.project_id"),
+						principal.userId,
+					)}`,
+		};
+	}
+	const from = sql`outline_spaces s join narrators n on n.id = s.narrator_id`;
+	const readable = principal.isAdmin
+		? sql``
+		: sql`and ${bindPlaceholders(narratorReadableText("n"), principal.userId)}`;
+	const projectId = sql.raw(narratorProjectIdText("n"));
+	if (scope.kind === "project") {
+		// The candidates come from the link index and the explicit project column, each bounded
+		// by the project's sessions; the shared rule then says which of them are the project's.
+		return {
+			from,
+			where: sql`s.kind = 'session'
+				and s.narrator_id in (
+					select npl.narrator_id from narrator_project_links npl
+					where npl.project_id = ${scope.projectId} and npl.role = 'primary'
+					union
+					select n2.id from narrators n2 where n2.context_project_id = ${scope.projectId}
+				)
+				and ${projectId} = ${scope.projectId}
+				and n.status <> 'archived'
+				${readable}`,
+		};
+	}
+	const listed = principal.isAdmin
+		? sql``
+		: sql`and ${bindPlaceholders(projectReadableForIdText("ps.project_id"), principal.userId)}`;
+	return {
+		from,
+		where: sql`s.kind = 'session'
+			and n.status <> 'archived'
+			${readable}
+			and not exists (
+				select 1 from outline_spaces ps
+				where ps.kind = 'project' and ps.project_id = ${projectId}
+				${listed}
+			)
+			and not exists (
+				select 1 from projects ap where ap.id = ${projectId} and ap.status = 'archived'
+			)`,
+	};
+}
+
+function toTreeSpace(row: Row): OutlineTreeSpaceRow {
+	return { ...toSpace(row), lastCommitAt: textOrNull(row, "last_commit_at") };
+}
+
+const TREE_COLUMNS = sql.raw(
+	"s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq, " +
+		"s.in_process_epoch, s.created_at, s.last_commit_at",
+);
+
+/**
+ * A page of one group of the connected outline, latest commit first: by `last_commit_at`
+ * descending then id descending (the order of `idx_outline_spaces_last_commit` read backwards),
+ * and after those the spaces never committed to (or not stamped yet) by id. Strictly after
+ * `after` in that order when given; at most `limit` rows, in at most two statements.
+ *
+ * A space committed to between two pages moves to the front: a later page may then not show it,
+ * and never shows a space twice. The tree is read again from the top to see it.
+ */
+export async function readOutlineTreeSpacePage(
+	principal: { userId: string; isAdmin: boolean },
+	scope: OutlineTreeScope,
+	options: { after?: OutlineTreeCursor | null; limit: number },
+): Promise<OutlineTreeSpaceRow[]> {
+	const { from, where } = treeScopeSql(principal, scope);
+	// Byte order on both backends, so a cursor means the same thing on either.
+	const pg = executor().dialect === "postgres";
+	const id = pg ? sql.raw(`s.id collate "C"`) : sql.raw("s.id");
+	const at = pg ? sql.raw(`s.last_commit_at collate "C"`) : sql.raw("s.last_commit_at");
+	const after = options.after ?? null;
+	const out: OutlineTreeSpaceRow[] = [];
+	if (!after || after.lastCommitAt !== null) {
+		const seek = after
+			? sql`and (${at} < ${after.lastCommitAt}
+					or (s.last_commit_at = ${after.lastCommitAt} and ${id} < ${after.id}))`
+			: sql``;
+		const rows = await all(sql`
+			select ${TREE_COLUMNS} from ${from}
+			where ${where} and s.last_commit_at is not null ${seek}
+			order by ${at} desc, ${id} desc
+			limit ${options.limit}
+		`);
+		for (const row of rows) out.push(toTreeSpace(row));
+	}
+	if (out.length < options.limit) {
+		const seek = after && after.lastCommitAt === null ? sql`and ${id} > ${after.id}` : sql``;
+		const rows = await all(sql`
+			select ${TREE_COLUMNS} from ${from}
+			where ${where} and s.last_commit_at is null ${seek}
+			order by ${id}
+			limit ${options.limit - out.length}
+		`);
+		for (const row of rows) out.push(toTreeSpace(row));
+	}
+	return out;
+}
+
+/** How many spaces a group of the connected outline has, counted up to `cap` and no further. */
+export async function countOutlineTreeSpaces(
+	principal: { userId: string; isAdmin: boolean },
+	scope: OutlineTreeScope,
+	cap: number,
+): Promise<number> {
+	const { from, where } = treeScopeSql(principal, scope);
+	const rows = await all(sql`
+		select count(*) as n from (select 1 as one from ${from} where ${where} limit ${cap}) t
+	`);
+	return Number(rows[0]?.n ?? 0);
+}
+
+/** A session a task may be handed to on the board (outline P2 PR 10a). */
+export interface TransferSessionRow {
+	id: string;
+	title: string | null;
+	handle: string | null;
+	ownerUserId: string | null;
+}
+
+/**
+ * The root sessions of a project a task could be handed to, as the board's 「转交给会话」 lists
+ * them: sessions of the project (as {@link readProjectSessionSpacePage} counts them), not
+ * archived, not subagents, keeping their tasks in the outline, that the principal can read (the
+ * narrator list's predicate, in SQL before the LIMIT; admins read every one). Named sessions
+ * (with a handle) first, then the most recently active; `limit` rows after `offset`. With
+ * `onlyId`: that one session, when it passes the same predicate (what a hand-over to it is
+ * checked with). Whether each could work in the task's space is the caller's check
+ * (`canSessionWorkIn`).
+ */
+export async function readProjectTransferSessions(
+	principal: { userId: string; isAdmin: boolean },
+	projectId: string,
+	options: { limit: number; offset?: number; onlyId?: string },
+): Promise<TransferSessionRow[]> {
+	const visible = principal.isAdmin
+		? sql``
+		: sql`and ${bindPlaceholders(narratorReadableText("n"), principal.userId)}`;
+	const rows = await all(sql`
+		select n.id, n.title, n.handle, n.owner_user_id
+		from narrators n
+		where n.id in (
+				select npl.narrator_id from narrator_project_links npl where npl.project_id = ${projectId}
+				union
+				select n2.id from narrators n2 where n2.context_project_id = ${projectId}
+			)
+			and n.status <> 'archived'
+			and n.type <> 'subagent'
+			and n.task_backend = 'outline'
+			${options.onlyId !== undefined ? sql`and n.id = ${options.onlyId}` : sql``}
+			${visible}
+		order by (case when n.handle is null then 1 else 0 end),
+			coalesce(n.last_message_at, n.updated_at) desc, n.id
+		limit ${options.limit} offset ${Math.max(0, options.offset ?? 0)}
+	`);
+	return rows.map((row) => ({
+		id: text(row, "id"),
+		title: textOrNull(row, "title"),
+		handle: textOrNull(row, "handle"),
+		ownerUserId: textOrNull(row, "owner_user_id"),
+	}));
 }
 
 /** What a session's write rule is decided from, for many sessions at once (the task board). */

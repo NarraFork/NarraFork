@@ -12,6 +12,7 @@ import { logger } from "./logger";
 
 export type NarraForkEvent =
 	| { type: "auth:changed"; userId?: string }
+	| { type: "auth:session_extended"; sessionId: string; userId: string; expiresAt: number }
 	// Invalidation only: lifecycle details are fetched through the authorized status API.
 	| { type: "system:lifecycle_changed" }
 	| { type: "git:workspace_invalidated"; queryKey: string }
@@ -430,6 +431,33 @@ export type NarraForkEvent =
 			pageIds: string[];
 			actorKind: "human" | "agent" | "system";
 			actorId: string;
+			/**
+			 * The session the commit was written for: `outline_commits.narrator_id`, or the agent
+			 * itself when a write left it out; the session a system write was made for; null for a
+			 * person's commit and a system job. What the live editor shows an agent's cursor from
+			 * (outline P2 PR 10b).
+			 * Optional only so events built before it existed (tests) still type-check.
+			 */
+			narratorId?: string | null;
+	  }
+	| {
+			/**
+			 * Tasks of an outline root session changed in one commit of its session space (outline P2
+			 * PR 12a, `outline/plugin-task-events.ts`): what plugins follow a session's tasks by (the
+			 * public topic `narrafork.narrator.tasks.changed`, and `narrafork.narrator.spec.changed`
+			 * while the old commands last). Ids and statuses only; `deleted` / `none` for a task deleted
+			 * or no longer a task. At most 50 changes; `truncated` when the commit made more.
+			 */
+			type: "outline:session_tasks_changed";
+			narratorId: string;
+			spaceKey: string;
+			seq: number;
+			actorKind: "human" | "agent" | "system";
+			changes: Array<{
+				blockId: string;
+				status: "todo" | "doing" | "done" | "cancelled" | "deleted" | "none";
+			}>;
+			truncated: boolean;
 	  }
 	| {
 			/**

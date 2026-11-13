@@ -13,7 +13,13 @@ import {
 	parseMirrorSnapshot,
 } from "../../shared/independent-update-mirror";
 import { MAX_MIRROR_UPLOAD_CONCURRENCY, mirrorTransferTimeoutMs } from "../../shared/mirror-relay";
+import { isValidReleaseVersion } from "../../shared/release-version";
 import { EXECUTOR_MANIFEST_FILENAME } from "../../shared/remote-executor";
+import { REMOTE_PEER_MANIFEST_FILENAME } from "../../shared/remote-peer";
+import {
+	parseRemotePeerReleaseManifest,
+	parseRemotePeerReleaseTag,
+} from "../../shared/remote-peer-manifest";
 import { parseUpdateIndex } from "../../shared/update-index";
 import type { UpdateIndexV1 } from "../../shared/update-index-types";
 import { getConfig } from "../lib/config";
@@ -44,7 +50,7 @@ export interface MirrorToolsReceipt {
 	schemaVersion: 1;
 	verification: "server-sha256";
 	repository: string;
-	kind: "helpers" | "executor";
+	kind: "helpers" | "executor" | "remote-peer";
 	tag: string;
 	verified: MirrorVerifiedAsset[];
 }
@@ -78,7 +84,7 @@ interface ToolAsset extends MirrorVerifiedAsset {
 interface ToolProjection {
 	schemaVersion: 1;
 	repository: string;
-	kind: "helpers" | "executor";
+	kind: "helpers" | "executor" | "remote-peer";
 	tag: string;
 	assets: ToolAsset[];
 	/** Descriptors only; executable bytes are separate streamed objects. */
@@ -95,15 +101,25 @@ function fingerprint(index: UpdateIndexV1, version: string): string | undefined 
 	return target ? digest(target) : undefined;
 }
 function checkToolsIdentity(kind: string, tag: string) {
-	if (!/^(helpers|executor)$/.test(kind) || !/^[a-z0-9.-]{1,64}$/.test(tag))
+	if (kind === "remote-peer") {
+		parseRemotePeerReleaseTag(tag);
+		return;
+	}
+	if (
+		!/^(helpers|executor)$/.test(kind) ||
+		!/^[a-z0-9.-]{1,64}$/.test(tag) ||
+		!tag.startsWith(`${kind}-v`) ||
+		!isValidReleaseVersion(tag.slice(`${kind}-v`.length))
+	)
 		throw new Error("Invalid component identity");
 }
 export function parseTools(
 	input: unknown,
 	repository: string,
-	kind: "helpers" | "executor",
+	kind: "helpers" | "executor" | "remote-peer",
 	tag: string,
 ): ToolProjection {
+	checkToolsIdentity(kind, tag);
 	const encoded = JSON.stringify(input);
 	if (!encoded || Buffer.byteLength(encoded) > STATE_LIMIT)
 		throw new Error("Component metadata byte limit");
@@ -151,19 +167,31 @@ export function parseTools(
 			throw new Error("Component metadata size/hash mismatch");
 		return { ...summary(a), content: a.content };
 	});
-	const manifestName = kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME;
+	const manifestName =
+		kind === "helpers"
+			? HELPER_MANIFEST_FILENAME
+			: kind === "executor"
+				? EXECUTOR_MANIFEST_FILENAME
+				: REMOTE_PEER_MANIFEST_FILENAME;
 	const manifestAsset = assets.find((a) => a.name === manifestName);
 	if (!manifestAsset) throw new Error(`Required ${manifestName} missing`);
 	const value = JSON.parse(manifestAsset.content);
 	const manifest =
 		kind === "helpers"
 			? parseHelperManifest(value, { repository, tag })
-			: parseExecutorReleaseManifest(value, {
-					repository,
-					tag,
-					version: tag.replace(/^executor-v/, ""),
-					protocolVersion: value?.manifest?.protocolVersion,
-				});
+			: kind === "executor"
+				? parseExecutorReleaseManifest(value, {
+						repository,
+						tag,
+						version: tag.slice("executor-v".length),
+						protocolVersion: value?.manifest?.protocolVersion,
+					})
+				: parseRemotePeerReleaseManifest(value, {
+						repository,
+						tag,
+						version: tag.slice("remote-peer-v".length),
+						protocolVersion: value?.manifest?.protocolVersion,
+					});
 	if (
 		assets.length !== manifest.licenses.length + 1 ||
 		new Set(assets.map((a) => a.name)).size !== assets.length
@@ -425,7 +453,7 @@ export class MirrorIngestService {
 
 	public async readTools(
 		product: string,
-		kind: "helpers" | "executor",
+		kind: "helpers" | "executor" | "remote-peer",
 		tag: string,
 	): Promise<ToolProjection | null> {
 		const repo = this.repository(product);
@@ -447,7 +475,7 @@ export class MirrorIngestService {
 
 	public async commitTools(
 		product: string,
-		kind: "helpers" | "executor",
+		kind: "helpers" | "executor" | "remote-peer",
 		tag: string,
 		input: unknown,
 		signal: AbortSignal,

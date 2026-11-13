@@ -49,7 +49,11 @@ export function ready(): boolean {
 	return true;
 }
 
-/** The panel's keyboard navigation of the waiting request (no composer text). */
+/**
+ * The panel's keyboard navigation of the waiting request (no composer text), and a stand-in for
+ * the composer: an empty textarea whose Enter it hands over as the real one does (its own
+ * handler prevents the newline; the panel's shortcut then decides).
+ */
 function KeyboardHost({
 	permission,
 	children,
@@ -57,7 +61,11 @@ function KeyboardHost({
 	permission: PendingPermission;
 	children: ReactNode;
 }) {
-	const composerRef = useRef<NarratorComposerHandle | null>(null);
+	const textarea = useRef<HTMLTextAreaElement | null>(null);
+	const composerRef = useRef<NarratorComposerHandle | null>({
+		ownsTextarea: (el: unknown) => el === textarea.current,
+		isTextEmpty: () => !textarea.current?.value,
+	} as unknown as NarratorComposerHandle);
 	const { permEnterHintCtxValue } = usePermissionFocusNav({
 		pendingPermissionId: permission.id,
 		pendingPermissionToolName: permission.toolName,
@@ -65,8 +73,32 @@ function KeyboardHost({
 		composerRef,
 	});
 	return (
-		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>{children}</PermEnterHintCtx.Provider>
+		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
+			{children}
+			<textarea
+				ref={textarea}
+				data-testid="composer"
+				aria-label="composer"
+				onKeyDown={(e) => {
+					if (e.key === "Enter" && !e.shiftKey && !e.currentTarget.value) e.preventDefault();
+				}}
+			/>
+		</PermEnterHintCtx.Provider>
 	);
+}
+
+/** What the plain permission form decided (`decision:feedback`), in order. */
+const decided: string[] = [];
+
+export function decisions(): string[] {
+	return [...decided];
+}
+
+/** The focused element's text (a button's label without the ⏎ hint), or null for the page. */
+export function focusedLabel(): string | null {
+	const el = document.activeElement as HTMLElement | null;
+	if (!el || el === document.body) return null;
+	return el.textContent?.replace("⏎", "").trim() ?? "";
 }
 
 /** Mount the approval form of one waiting plan (under the panel's keyboard navigation). */
@@ -83,16 +115,20 @@ export function open(permission: PendingPermission, options: { keyboard?: boolea
 					<div style={{ maxWidth: 720, padding: 16, boxSizing: "border-box" }}>
 						{options.keyboard ? (
 							<KeyboardHost permission={permission}>
-								<InlinePermission permission={permission} />
+								<InlinePermission permission={permission} onDecision={record} />
 							</KeyboardHost>
 						) : (
-							<InlinePermission permission={permission} />
+							<InlinePermission permission={permission} onDecision={record} />
 						)}
 					</div>
 				</QueryClientProvider>
 			</MantineProvider>
 		</I18nextProvider>,
 	);
+}
+
+function record(_id: string, decision: "allow" | "deny", feedback?: string): void {
+	decided.push(`${decision}:${feedback ?? ""}`);
 }
 
 export function socketConnected(): boolean {

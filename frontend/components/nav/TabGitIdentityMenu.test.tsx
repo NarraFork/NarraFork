@@ -6,7 +6,7 @@
  * and opens in place — the pick itself is covered by the hook and server tests.
  */
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import {
 	defaultScheduler,
@@ -26,9 +26,19 @@ let root: Root | undefined;
 let client: QueryClient | undefined;
 let restoreDom: (() => void) | undefined;
 const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
+const animationFrames = new Map<number, ReturnType<typeof setTimeout>>();
+let nextAnimationFrame = 0;
+
+function cancelPendingAnimationFrames() {
+	for (const timer of animationFrames.values()) clearTimeout(timer);
+	animationFrames.clear();
+}
 
 async function cleanup() {
 	try {
+		// Collapse schedules nested frames without cancelling them on unmount. Stop those
+		// owned by this fixture before asynchronous cleanup can restore/remove window.
+		cancelPendingAnimationFrames();
 		await act(async () => {
 			root?.unmount();
 			root = undefined;
@@ -46,6 +56,8 @@ async function cleanup() {
 			}
 		});
 	} finally {
+		// Also cancel frames created while unmounting or draining store notifications.
+		cancelPendingAnimationFrames();
 		for (const timer of notificationTimers.keys()) clearTimeout(timer);
 		notificationTimers.clear();
 		notifyManager.setScheduler(defaultScheduler);
@@ -68,8 +80,20 @@ async function mount() {
 		Node: window.Node,
 		Event: window.Event,
 		getComputedStyle: () => ({ getPropertyValue: () => "" }),
-		requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(callback, 0),
-		cancelAnimationFrame: (id: number) => clearTimeout(id),
+		requestAnimationFrame: (callback: FrameRequestCallback) => {
+			const id = ++nextAnimationFrame;
+			const timer = setTimeout(() => {
+				animationFrames.delete(id);
+				callback(performance.now());
+			}, 0);
+			animationFrames.set(id, timer);
+			return id;
+		},
+		cancelAnimationFrame: (id: number) => {
+			const timer = animationFrames.get(id);
+			if (timer !== undefined) clearTimeout(timer);
+			animationFrames.delete(id);
+		},
 		IS_REACT_ACT_ENVIRONMENT: true,
 	};
 	const previous = new Map(
@@ -145,6 +169,26 @@ describe("tab git identity menu", () => {
 		// this pins down is the toggle — and that expanding it does not dismiss the menu,
 		// which would make the entry unusable.
 		expect(closeCount()).toBe(0);
+	});
+
+	it("cancels unrun animation frames before restoring the DOM globals", async () => {
+		await mount();
+		let delivered = false;
+		const frame = window.requestAnimationFrame(() => {
+			delivered = true;
+			window.requestAnimationFrame(() => {});
+		});
+		const timer = animationFrames.get(frame);
+		expect(timer).toBeDefined();
+		const cancel = spyOn(globalThis, "clearTimeout");
+		try {
+			await cleanup();
+			expect(cancel).toHaveBeenCalledWith(timer);
+			expect(animationFrames.size).toBe(0);
+			expect(delivered).toBe(false);
+		} finally {
+			cancel.mockRestore();
+		}
 	});
 
 	it("drains queued React notifications before restoring the DOM globals", async () => {

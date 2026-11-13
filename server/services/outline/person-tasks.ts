@@ -30,7 +30,9 @@
  * CHANGING (the board)
  * --------------------
  * Finish, cancel or reopen a task; hand it to a person (`@human:name`, who must be able to write
- * its space) or back to the session (no assignee). A task in progress that someone else is doing
+ * its space), to a session by name (`@agent:<its id>`, 「转交给会话」, outline P2 PR 10a: a root
+ * session that could do the task, `transfer.ts`) or back to the session (no assignee). A task in
+ * progress that someone else is doing
  * is stopped in the same commit (back to to-do, which releases the claim): handing it on means
  * the previous executor no longer does it. Every change is a person's commit, based on the
  * version the board read, so a change made since is refused (409) and the board reads again.
@@ -43,11 +45,13 @@ import {
 } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
 import { readDisplayNames, readUserByUsername } from "./access-reads";
-import { OUTLINE_TASKS_PAGE_ALIAS } from "./model";
+import { sessionAssignee } from "./assignee";
+import { OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
 import { resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
 import { OUTLINE_PAGE_HEAD_CHARS } from "./store/read-port";
+import { isTransferSession } from "./transfer";
 import { type OutlineTaskPatch, type OutlineWriteResult, writeOutline } from "./write";
 
 export { OUTLINE_TASKS_PAGE_ALIAS };
@@ -79,7 +83,11 @@ export interface PersonTaskAdded {
 /** Adds of one session, one at a time (dedupe reads and the write must not interleave). */
 const adding = new Map<string, Promise<unknown>>();
 
-async function oneAtATime<T>(key: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * Run `fn` after every add of session `key` before it (a person's here, a plugin's in
+ * `plugin-tasks.ts`): the dedupe read and the write of one add never interleave with another's.
+ */
+export async function oneAtATime<T>(key: string, fn: () => Promise<T>): Promise<T> {
 	const before = adding.get(key) ?? Promise.resolve();
 	const run = before.catch(() => {}).then(fn);
 	const settled = run.catch(() => {});
@@ -108,12 +116,12 @@ function bodyKey(content: string): string {
 }
 
 /** The body a task written from `text` gets: its block, and the blocks split off it in order. */
-interface TaskBody {
+export interface TaskBody {
 	first: string;
 	rest: string[];
 }
 
-function bodyFromText(text: string): TaskBody {
+export function bodyFromText(text: string): TaskBody {
 	const normalized = normalizeBlock(text);
 	const rest: string[] = [];
 	const walk = (nodes: readonly BlockNode[]) => {
@@ -214,13 +222,16 @@ export async function addPersonTask(args: {
 	});
 }
 
-/** A task directly on the task page with this body that is not cancelled, if any. */
-async function findSameTask(
+/**
+ * A task directly under `pageId` (the task page, or the parent a plugin names) with this body that
+ * is not cancelled, if any.
+ */
+export async function findSameTask(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
 	pageId: string,
 	body: TaskBody,
-): Promise<{ id: string; sid: string; locked: boolean } | null> {
+): Promise<{ id: string; sid: string; locked: boolean; task: OutlineTaskJson } | null> {
 	const children = (await store.listLastChildMetas(space.id, pageId, DEDUPE_SCAN)).filter(
 		(meta) => meta.taskJson && meta.taskJson.status !== "cancelled",
 	);
@@ -239,8 +250,13 @@ async function findSameTask(
 		})
 		.slice(0, DEDUPE_FULL_READS);
 	for (const child of matching) {
-		if (await sameBody(store, child.id, body))
-			return { id: child.id, sid: child.sid, locked: !!child.taskJson?.lock };
+		if ((await sameBody(store, child.id, body)) && child.taskJson)
+			return {
+				id: child.id,
+				sid: child.sid,
+				locked: !!child.taskJson.lock,
+				task: child.taskJson,
+			};
 	}
 	return null;
 }
@@ -316,8 +332,18 @@ export async function changePersonTask(args: {
 	if (args.assign) {
 		const assignee = await assigneeOf(principal, space, args.assign);
 		if (assignee !== (task.assignee ?? null)) patch.assignee = assignee;
-		// Handed on: whoever is doing it now stops (to-do releases the claim, write.ts).
-		if (task.status === "doing" && patch.status === undefined && patch.assignee !== undefined)
+		// Handed on: whoever is doing it now stops (to-do releases the claim, write.ts), unless
+		// the session it is handed to is the one doing it.
+		const kept =
+			args.assign.kind === "narrator" &&
+			task.status === "doing" &&
+			(await heldBySession(store, block.id, args.assign.narratorId));
+		if (
+			task.status === "doing" &&
+			patch.status === undefined &&
+			patch.assignee !== undefined &&
+			!kept
+		)
 			patch.status = "todo";
 	}
 	if (Object.keys(patch).length === 0) return { result: null, space };
@@ -340,13 +366,37 @@ export async function changePersonTask(args: {
 	return { result, space };
 }
 
-/** The assignee a hand-over writes: `human:name` of someone who can write the space, or none. */
+/** Whether session `narratorId` (or a subagent of it) holds the task, its lease running. */
+async function heldBySession(
+	store: OutlineStore,
+	taskId: string,
+	narratorId: string,
+): Promise<boolean> {
+	const [claim] = await store.getTaskClaims([taskId]);
+	const holder = claim?.holderNarratorId ?? null;
+	if (!claim || holder === null) return false;
+	if (claim.expiresAt !== null && claim.expiresAt <= new Date().toISOString()) return false;
+	return ((await store.getNarratorRoots([holder])).get(holder)?.root ?? holder) === narratorId;
+}
+
+/**
+ * The assignee a hand-over writes: `human:name` of someone who can write the space,
+ * `agent:<id>` of a session that could do the task, or none.
+ */
 async function assigneeOf(
 	principal: OutlinePrincipal,
 	space: OutlineSpaceRow,
 	target: OutlineBoardAssignTarget,
 ): Promise<string | null> {
 	if (target.kind === "session") return null;
+	if (target.kind === "narrator") {
+		// A session the board's picker would list (`transfer.ts`: a root session of the task's
+		// project that keeps its tasks in the outline, is not archived, that the person may read
+		// and that could do the task there). Any other is the same answer as an unknown one.
+		if (!(await isTransferSession(principal, space, target.narratorId)))
+			throw new ValidationError("This session cannot work on this task");
+		return sessionAssignee(target.narratorId);
+	}
 	if (target.kind === "me") {
 		const name = (await readDisplayNames({ userIds: [principal.userId] })).users.get(
 			principal.userId,

@@ -34,6 +34,9 @@ import {
 
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
+import { REMOTE_FRONTEND_CAPABILITY } from "../../shared/remote-access/application";
+import { remoteReleaseFixture } from "./remote-frontend-release.fixture";
+
 const roots: string[] = [];
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -267,6 +270,10 @@ function fixture(releasePlan: CiReleasePlan = plan, declareHelpers = false) {
 					],
 				});
 			if (path === `git/blobs/${configSha}`) return config.toString("base64");
+			if (path === `contents/shared/remote-access/frontend-capability.json?ref=${commit}`) {
+				if (!releasePlan.remoteFrontend) throw new Error("HTTP 404");
+				return contents(releasePlan.remoteFrontend);
+			}
 			if (path === `contents/package.json?ref=${commit}`)
 				return contents({ version: releasePlan.version, packageManager: `bun@${CI_RELEASE_BUN}` });
 			if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)
@@ -297,6 +304,34 @@ function options(state: ReturnType<typeof fixture>) {
 		fetch: state.fetch,
 	};
 }
+
+describe("remote pair retained in source_run_id bundle", () => {
+	test("restores both remote assets verbatim with the original full bundle and unchanged binary sums", async () => {
+		const declared = { ...plan, remoteFrontend: REMOTE_FRONTEND_CAPABILITY };
+		const state = fixture(declared);
+		const sums = readFileSync(join(state.bundle, "dist", `narrafork-${plan.version}-SHA256SUMS`));
+		const remote = await remoteReleaseFixture(state.root, declared, join(state.bundle, "dist"));
+		for (const name of Object.values(remote.names)) {
+			const bytes = readFileSync(join(remote.directory, name));
+			state.manifest.files.push({
+				name,
+				size: bytes.length,
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+				sha512: createHash("sha512").update(bytes).digest("base64"),
+			});
+		}
+		state.repack();
+		const restored = await restoreCiReleaseBundle(options(state));
+		expect(restored.plan.remoteFrontend).toEqual(REMOTE_FRONTEND_CAPABILITY);
+		for (const name of Object.values(remote.names))
+			expect(readFileSync(join(restored.destination, "dist", name))).toEqual(
+				readFileSync(join(remote.directory, name)),
+			);
+		expect(
+			readFileSync(join(restored.destination, "dist", `narrafork-${plan.version}-SHA256SUMS`)),
+		).toEqual(sums);
+	});
+});
 
 describe("CI immutable release bundle restoration", () => {
 	test("restores independently pinned build-only bundle bytes without inventing publication evidence", async () => {

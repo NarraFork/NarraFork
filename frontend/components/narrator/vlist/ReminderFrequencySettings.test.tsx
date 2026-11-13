@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { api } from "@frontend/lib/api";
 import { MantineProvider, Popover } from "@mantine/core";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	defaultScheduler,
+	notifyManager,
+	QueryClient,
+	QueryClientProvider,
+} from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -19,6 +24,7 @@ await i18n.init({
 let root: Root;
 let qc: QueryClient;
 const globals = new Map<string, PropertyDescriptor | undefined>();
+const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 /** Undoes the shared-prototype geometry stubs installed in beforeEach. */
 let restoreGeometry: (() => void) | undefined;
 let makeEvent: (name: string) => Event;
@@ -103,6 +109,14 @@ beforeEach(() => {
 		Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
 	}
 	Object.assign(window, { getComputedStyle: computedStyle, matchMedia });
+	// Keep asynchronous delivery, but drain callbacks while their React window still exists.
+	notifyManager.setScheduler((callback) => {
+		const timer = setTimeout(() => {
+			notificationTimers.delete(timer);
+			callback();
+		}, 0);
+		notificationTimers.set(timer, callback);
+	});
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
@@ -125,18 +139,35 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-	await act(async () => root.unmount());
-	qc.clear();
-	getSettings.mockRestore();
-	updateSettings.mockRestore();
-	updateReflection.mockRestore();
-	for (const [key, descriptor] of globals) {
-		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-		else Reflect.deleteProperty(globalThis, key);
+	try {
+		await act(async () => {
+			root.unmount();
+			await qc.cancelQueries();
+			qc.clear();
+			while (notificationTimers.size) {
+				for (const [timer, callback] of [...notificationTimers]) {
+					clearTimeout(timer);
+					notificationTimers.delete(timer);
+					callback();
+				}
+				await Promise.resolve();
+			}
+		});
+	} finally {
+		for (const timer of notificationTimers.keys()) clearTimeout(timer);
+		notificationTimers.clear();
+		notifyManager.setScheduler(defaultScheduler);
+		getSettings.mockRestore();
+		updateSettings.mockRestore();
+		updateReflection.mockRestore();
+		for (const [key, descriptor] of globals) {
+			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+			else Reflect.deleteProperty(globalThis, key);
+		}
+		globals.clear();
+		restoreGeometry?.();
+		restoreGeometry = undefined;
 	}
-	globals.clear();
-	restoreGeometry?.();
-	restoreGeometry = undefined;
 });
 
 async function render(source: string, narratorId: string | undefined = "owner") {

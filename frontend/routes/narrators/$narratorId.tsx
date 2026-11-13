@@ -485,7 +485,7 @@ function NarratorDetailPage() {
 	// The page root mounts once the narrator has loaded (the skeleton is returned before
 	// it) and again on every switch to another session, so the title-bar marks follow the
 	// element rather than a ref object.
-	const titlebarRootRef = useWcoTitlebarRows(!isMobile && !narratorLoading && !!narrator);
+	const titlebarRootRef = useWcoTitlebarRows(!narratorLoading && !!narrator);
 	// Ref for drag-to-split drop zone detection, and the title-bar root.
 	const mergedRef = useCallback(
 		(el: HTMLDivElement | null) => {
@@ -543,8 +543,8 @@ function NarratorDetailPage() {
 		>
 			<Box
 				ref={mergedRef}
-				// Desktop WCO: this page's top row of headers is the window title bar.
-				data-nf-wco-titlebar={!isMobile || undefined}
+				// WCO stays active when a desktop window uses the narrow/mobile layout.
+				data-nf-wco-titlebar
 				h={APP_SHELL_FULL_BLEED_HEIGHT}
 				mx="calc(var(--mantine-spacing-md) * -1)"
 				my="calc(var(--mantine-spacing-md) * -1)"

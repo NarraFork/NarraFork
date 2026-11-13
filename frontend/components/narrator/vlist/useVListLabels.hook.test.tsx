@@ -114,6 +114,7 @@ describe("useVListLabels summary labels", () => {
 				for (const key of SUMMARY_KEYS) {
 					expect(bundle[key]).toBe(i18n.t(key, { count: "{count}" }));
 				}
+				expect(bundle.status_fail).toBe(i18n.t("traceRowMark.failed"));
 				expect(bundle.contextAskOutputChars).toContain("{count}");
 				expect(bundle.contextAskQuestions).toContain("{count}");
 			}

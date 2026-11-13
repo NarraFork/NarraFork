@@ -29,7 +29,7 @@
  * injection seam `createShikiThemeEnsurer` uses in shiki-loader.ts.
  */
 
-import { getAppBase } from "./base-path";
+import { getAssetBase } from "./base-path";
 import { createShikiTokenWorkerLoader } from "./shiki-token-worker-client";
 import { normalizeThemedTokens, type ShikiToken } from "./shiki-token-worker-protocol";
 
@@ -231,7 +231,7 @@ const loadShikiTokens: ShikiTokenLoader = canUseTokenWorker
 	? createShikiTokenWorkerLoader({
 			factory: () =>
 				new Worker(new URL("./shiki-token.worker.ts", import.meta.url), { type: "module" }),
-			appBase: () => new URL(getAppBase(), location.href).href,
+			appBase: () => new URL(getAssetBase(), location.href).href,
 		})
 	: async () => null;
 

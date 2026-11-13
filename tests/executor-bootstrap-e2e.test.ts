@@ -1,12 +1,12 @@
 /**
  * End-to-end check of the executor distribution path.
  *
- * Serves a canonical GitHub release fixture over scratch HTTP, then exercises the
- * NarraFork side: manifest fetch, proxied download with a one-time ticket, and
- * install-script generation. Verifies the script's own integrity checks against
- * the bytes actually served.
+ * Serves the selected mirror's exact pinned manifest and binary endpoints over
+ * scratch HTTP, then exercises the real bootstrap routes, bound tickets and
+ * install-script integrity. Mirror mode must never contact GitHub; an explicit
+ * GitHub-mode regression separately covers the unchanged canonical URLs.
  */
-import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +32,18 @@ import { settings } from "../server/lib/settings";
 import { BUILD_EXECUTOR_DISTRIBUTION } from "../server/lib/version";
 
 const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
+const EXECUTOR_TAG = BUILD_EXECUTOR_DISTRIBUTION.tag;
+const REPOSITORY = "fixture/bootstrap";
+const PRODUCT = "bootstrap-e2e";
+const BINARY_FILENAME = `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`;
+const GITHUB_PREFIX = `https://github.com/${REPOSITORY}/releases/download/${EXECUTOR_TAG}/`;
+const outboundRequests: string[] = [];
+const servedPaths: string[] = [];
+let expectedRequestSource: "github" | "update-server" = "update-server";
+let unavailableAsset: "manifest" | "binary" | null = null;
+function mirrorAssetPath(filename: string): string {
+	return `/api/v3/products/${encodeURIComponent(PRODUCT)}/mirror/tools/executor/${encodeURIComponent(EXECUTOR_TAG)}/assets/${encodeURIComponent(filename)}`;
+}
 
 import { setOutboundFetchOverrideForTest } from "../server/lib/net/outbound-fetch";
 import {
@@ -61,60 +73,92 @@ beforeAll(async () => {
 	scratchDir = mkdtempSync(join(tmpdir(), "nf-executor-e2e-"));
 	const manifest = buildExecutorManifest({
 		version: EXECUTOR_VERSION,
-		protocolVersion: 1,
+		protocolVersion: BUILD_EXECUTOR_DISTRIBUTION.protocolVersion,
 		releasedAt: new Date().toISOString(),
 		artifacts: EXECUTOR_PLATFORMS.map((platform) => ({ platform, bytes: new Uint8Array(BINARY) })),
 	});
-	const tag = `executor-v${EXECUTOR_VERSION}`;
-	const prefix = `https://github.com/fixture/bootstrap/releases/download/${tag}/`;
 	const envelope = {
 		schemaVersion: 1,
-		repository: "fixture/bootstrap",
-		tag,
+		repository: REPOSITORY,
+		tag: EXECUTOR_TAG,
 		commit: "a".repeat(40),
 		manifest,
 		licenses: [{ name: "LICENSE.txt", size: 10, sha256: "a".repeat(64) }],
 	};
 	updateServer = Bun.serve({
+		hostname: "127.0.0.1",
 		port: 0,
 		fetch: (request) => {
-			const filename = new URL(request.url).pathname.split("/").at(-1);
-			if (filename === EXECUTOR_MANIFEST_FILENAME) return Response.json(envelope);
-			if (filename === `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`)
-				return new Response(BINARY);
+			const path = new URL(request.url).pathname;
+			servedPaths.push(path);
+			if (path === mirrorAssetPath(EXECUTOR_MANIFEST_FILENAME))
+				return unavailableAsset === "manifest"
+					? new Response(null, { status: 404 })
+					: Response.json(envelope);
+			if (path === mirrorAssetPath(BINARY_FILENAME))
+				return unavailableAsset === "binary"
+					? new Response(null, { status: 404 })
+					: new Response(BINARY);
 			return new Response(null, { status: 404 });
 		},
 	});
 	const baseUrl = `http://localhost:${updateServer.port}`;
 	setOutboundFetchOverrideForTest(async (input, init) => {
 		const url = String(input);
-		expect(url).toStartWith(prefix); // Never visit metadata mirror unsigned-tools endpoints.
-		const response = await fetch(`${baseUrl}/${new URL(url).pathname.split("/").at(-1)}`, init);
+		outboundRequests.push(url);
+		const filename = new URL(url).pathname.split("/").at(-1);
+		if (filename !== EXECUTOR_MANIFEST_FILENAME && filename !== BINARY_FILENAME)
+			throw new Error(`Unexpected executor asset request: ${url}`);
+		const expected =
+			expectedRequestSource === "github"
+				? `${GITHUB_PREFIX}${filename}`
+				: `${baseUrl}${mirrorAssetPath(filename)}`;
+		expect(url).toBe(expected);
+		const response = await fetch(`${baseUrl}${mirrorAssetPath(filename)}`, init);
 		return new Response(response.body, { status: response.status, headers: response.headers });
 	});
-	settings.update = {
-		...originalUpdate,
-		source: "update-server",
-		githubRepository: "fixture/bootstrap",
-		serverUrl: baseUrl,
-		proxy: { mode: "direct" },
-	};
-	resetExecutorManifestCache();
-	resetExecutorTickets();
-	resetExecutorBootstrapRateLimit();
-	rmSync(HELPER_BIN_DIR, { recursive: true, force: true });
-	mkdirSync(HELPER_BIN_DIR, { recursive: true });
 });
 
 beforeEach(() => {
 	if (!updateServer) throw new Error("Missing scratch server");
+	expectedRequestSource = "update-server";
+	unavailableAsset = null;
+	outboundRequests.length = 0;
+	servedPaths.length = 0;
+	resetExecutorManifestCache();
+	resetExecutorTickets();
+	resetExecutorBootstrapRateLimit();
+	// Each case starts cold, so a verified cache cannot hide an incorrect source/endpoint.
+	rmSync(HELPER_BIN_DIR, { recursive: true, force: true });
+	mkdirSync(HELPER_BIN_DIR, { recursive: true });
 	settings.update = {
 		...originalUpdate,
 		source: "update-server",
-		githubRepository: "fixture/bootstrap",
+		githubRepository: REPOSITORY,
+		product: PRODUCT,
 		serverUrl: `http://localhost:${updateServer.port}`,
 		proxy: { mode: "direct" },
 	};
+});
+afterEach(() => {
+	if (expectedRequestSource === "update-server") {
+		if (!updateServer) throw new Error("Missing scratch server");
+		const baseUrl = `http://localhost:${updateServer.port}`;
+		expect(
+			outboundRequests.some(
+				(url) =>
+					new URL(url).hostname === "github.com" ||
+					new URL(url).hostname.endsWith(".githubusercontent.com"),
+			),
+		).toBe(false);
+		expect(
+			outboundRequests.every(
+				(url) =>
+					url === `${baseUrl}${mirrorAssetPath(EXECUTOR_MANIFEST_FILENAME)}` ||
+					url === `${baseUrl}${mirrorAssetPath(BINARY_FILENAME)}`,
+			),
+		).toBe(true);
+	}
 });
 afterAll(() => {
 	updateServer?.stop(true);
@@ -144,7 +188,7 @@ function bootstrapApp() {
 	return app;
 }
 
-test("mirror-metadata mode downloads pinned GitHub executor bytes and serves the immutable ticket", async () => {
+test("mirror mode fetches the pinned manifest and binary without GitHub and serves the bound ticket", async () => {
 	const manifest = await getExecutorManifest({ forceRefresh: true });
 	expect(manifest?.version).toBe(EXECUTOR_VERSION);
 	expect(manifest?.platforms["linux-amd64"]?.sha256).toBe(SHA256);
@@ -162,17 +206,90 @@ test("mirror-metadata mode downloads pinned GitHub executor bytes and serves the
 	// The bytes a target machine receives must match the published digest exactly.
 	expect(createHash("sha256").update(served).digest("hex")).toBe(SHA256);
 	expect(download.headers.get("x-executor-sha256")).toBe(SHA256);
+	expect(download.headers.get("x-executor-version")).toBe(EXECUTOR_VERSION);
+	expect(download.headers.get("content-length")).toBe(String(BINARY.length));
+	if (!updateServer) throw new Error("Missing scratch server");
+	expect(outboundRequests).toEqual([
+		`http://localhost:${updateServer.port}${mirrorAssetPath(EXECUTOR_MANIFEST_FILENAME)}`,
+		`http://localhost:${updateServer.port}${mirrorAssetPath(BINARY_FILENAME)}`,
+	]);
+	expect(servedPaths).toEqual([
+		mirrorAssetPath(EXECUTOR_MANIFEST_FILENAME),
+		mirrorAssetPath(BINARY_FILENAME),
+	]);
 
 	// A retry is allowed (a dropped download must not force a new install command),
 	// but the budget is finite.
 	for (let attempt = 0; attempt < 4; attempt++) {
-		expect(
-			(await app.request(`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`)).status,
-		).toBe(200);
+		const retry = await app.request(`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`);
+		expect(retry.status).toBe(200);
+		expect(Buffer.from(await retry.arrayBuffer())).toEqual(BINARY);
 	}
 	expect(
 		(await app.request(`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`)).status,
 	).toBe(403);
+});
+
+test("an unavailable mirror manifest fails without a GitHub fallback", async () => {
+	unavailableAsset = "manifest";
+	expect(await getExecutorManifest({ forceRefresh: true })).toBeNull();
+	if (!updateServer) throw new Error("Missing scratch server");
+	expect(outboundRequests).toEqual([
+		`http://localhost:${updateServer.port}${mirrorAssetPath(EXECUTOR_MANIFEST_FILENAME)}`,
+	]);
+});
+
+test("an unavailable mirror binary makes the real bootstrap route fail without GitHub", async () => {
+	unavailableAsset = "binary";
+	const ticket = await issueBoundTicket();
+	const response = await bootstrapApp().request(
+		`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`,
+	);
+	expect(response.status).toBe(503);
+	expect((await response.json()).error).toContain("selected source");
+	if (!updateServer) throw new Error("Missing scratch server");
+	expect(outboundRequests).toEqual([
+		`http://localhost:${updateServer.port}${mirrorAssetPath(EXECUTOR_MANIFEST_FILENAME)}`,
+		`http://localhost:${updateServer.port}${mirrorAssetPath(BINARY_FILENAME)}`,
+	]);
+});
+
+test("a ticket remains bound to the mirror artifact when current update settings switch to GitHub", async () => {
+	const ticket = await issueBoundTicket();
+	const current = settings.update;
+	if (!current) throw new Error("Missing update settings");
+	settings.update = { ...current, source: "github" };
+	const response = await bootstrapApp().request(
+		`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`,
+	);
+	expect(response.status).toBe(200);
+	expect(Buffer.from(await response.arrayBuffer())).toEqual(BINARY);
+	expect(response.headers.get("x-executor-sha256")).toBe(SHA256);
+	// The transport expectation remains the original mirror; a ticket cannot silently repin.
+	if (!updateServer) throw new Error("Missing scratch server");
+	expect(outboundRequests).toEqual([
+		`http://localhost:${updateServer.port}${mirrorAssetPath(EXECUTOR_MANIFEST_FILENAME)}`,
+		`http://localhost:${updateServer.port}${mirrorAssetPath(BINARY_FILENAME)}`,
+	]);
+});
+
+test("the default GitHub source still fetches its canonical pinned manifest and binary", async () => {
+	const current = settings.update;
+	if (!current) throw new Error("Missing update settings");
+	settings.update = { ...current };
+	delete settings.update.source;
+	expectedRequestSource = "github";
+	const ticket = await issueBoundTicket();
+	const response = await bootstrapApp().request(
+		`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`,
+	);
+	expect(response.status).toBe(200);
+	expect(Buffer.from(await response.arrayBuffer())).toEqual(BINARY);
+	expect(response.headers.get("x-executor-sha256")).toBe(SHA256);
+	expect(outboundRequests).toEqual([
+		`${GITHUB_PREFIX}${EXECUTOR_MANIFEST_FILENAME}`,
+		`${GITHUB_PREFIX}${BINARY_FILENAME}`,
+	]);
 });
 
 test("the install endpoint serves the exact script attached to the ticket", async () => {
@@ -182,7 +299,7 @@ test("the install endpoint serves the exact script attached to the ticket", asyn
 	const manifest = await getExecutorManifest();
 	const entry = manifest?.platforms["linux-amd64"];
 	expect(entry).toBeTruthy();
-	if (!entry || !manifest) return;
+	if (!entry || !manifest) throw new Error("Missing compatible executor manifest entry");
 
 	const ticket = await issueBoundTicket();
 	const generated = buildExecutorInstallScript({
@@ -226,7 +343,7 @@ test("the generated install script verifies the digest of what is actually serve
 	const manifest = await getExecutorManifest();
 	const entry = manifest?.platforms["linux-amd64"];
 	expect(entry).toBeTruthy();
-	if (!entry || !manifest) return;
+	if (!entry || !manifest) throw new Error("Missing compatible executor manifest entry");
 
 	const ticket = await issueBoundTicket();
 	const generated = buildExecutorInstallScript({
@@ -244,8 +361,17 @@ test("the generated install script verifies the digest of what is actually serve
 		ticket: ticket.ticket,
 	});
 
-	// The digest baked into the script is the digest of the real published bytes.
-	expect(generated.script).toContain(SHA256);
+	// Compare the generated check against the bytes served by this exact bound ticket,
+	// not merely a second copy of the manifest fixture's expected digest.
+	const download = await bootstrapApp().request(
+		`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`,
+	);
+	expect(download.status).toBe(200);
+	const served = Buffer.from(await download.arrayBuffer());
+	expect(served).toEqual(BINARY);
+	const servedSha256 = createHash("sha256").update(served).digest("hex");
+	expect(servedSha256).toBe(SHA256);
+	expect(generated.script).toContain(servedSha256);
 	expect(generated.script).toContain(
 		`https://nf.example.com/api/executor/download/linux-amd64?ticket=${ticket.ticket}`,
 	);

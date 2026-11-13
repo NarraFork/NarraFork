@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type ResolvedBranding, resolveBranding } from "@shared/branding";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useSyncExternalStore } from "react";
@@ -18,6 +19,7 @@ export function useBranding(): ResolvedBranding {
 	const { data } = useQuery({
 		queryKey: ["branding"],
 		queryFn: api.getBranding,
+		enabled: !REMOTE_BUILD,
 		// Branding changes only when an admin edits settings, and the settings save
 		// invalidates this key directly — so background refetching would be pure
 		// overhead on a value fetched by every page load.

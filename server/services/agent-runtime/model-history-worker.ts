@@ -2,6 +2,8 @@
 
 import { Database } from "bun:sqlite";
 import { SQL } from "bun";
+import { safeSqliteCode, workerFailureDetails } from "../../lib/db-worker/failure";
+import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { type ModelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import {
 	type ModelHistoryCounters,
@@ -115,9 +117,14 @@ self.onmessage = async (event: MessageEvent<Request | { type: "ack" }>) => {
 		const message = error instanceof Error ? error.message : "";
 		postMessage({
 			type: "error",
+			code: request.backend === "sqlite" ? safeSqliteCode(error) : undefined,
+			diagnostic: workerFailureDetails(error, false),
 			message: message.startsWith("Model history")
 				? message
 				: "Model history read-only worker failed",
 		});
 	}
 };
+
+// Identity is embedded in this worker's code, never copied from the parent's request/environment.
+postMessage({ type: "ready", buildId: RUNTIME_BUILD_ID });

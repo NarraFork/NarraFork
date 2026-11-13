@@ -684,7 +684,9 @@ export type NarratorServerMessage =
 			type: "image_generation";
 			narratorId: string;
 			id: string;
-			status: "in_progress" | "generating" | "completed";
+			status: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			partialImageIndex?: number;
 			partialSavedPath?: string;
@@ -989,6 +991,8 @@ export type NarratorServerMessage =
 						type: "image_generation";
 						id: string;
 						status: string;
+						error?: string;
+						errorCode?: string;
 						revisedPrompt?: string;
 						result?: string;
 						partialImageIndex?: number;
@@ -1261,7 +1265,7 @@ export type NarratorServerMessage =
 			path: string;
 			revisionId: string | null;
 			updatedBy: "user" | "assistant" | "system";
-			source: "ui" | "tool" | "task_create" | "reset";
+			source: "ui" | "tool" | "task_create" | "reset" | "import";
 	  }
 	| {
 			/**

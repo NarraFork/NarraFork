@@ -28,6 +28,8 @@ import { WCO_ATTRIBUTE } from "./wco";
 export const WCO_TITLEBAR_ROW_SELECTOR =
 	"[data-narrator-header-layout], .nf-panel-header, .dv-tabs-and-actions-container, [data-nf-titlebar-candidate]";
 
+export const WCO_BELOW_CONTROLS_ATTRIBUTE = "data-nf-wco-below-controls";
+
 const MARKS = ["data-nf-titlebar-row", "data-nf-titlebar-end", "data-nf-titlebar-start"] as const;
 /** Sub-pixel layout tolerance. */
 const EDGE_EPSILON_PX = 1;
@@ -57,7 +59,9 @@ function apply(root: HTMLElement): void {
 		// A tab strip nested in a hidden group, or a header of a parked panel.
 		const rect = el.getBoundingClientRect();
 		const marks =
-			rect.height > 0 ? titlebarMarksFor(rect, rootRect) : { row: false, end: false, start: false };
+			rect.height > 0 && !el.closest(`[${WCO_BELOW_CONTROLS_ATTRIBUTE}]`)
+				? titlebarMarksFor(rect, rootRect)
+				: { row: false, end: false, start: false };
 		el.toggleAttribute("data-nf-titlebar-row", marks.row);
 		el.toggleAttribute("data-nf-titlebar-end", marks.end);
 		el.toggleAttribute("data-nf-titlebar-start", marks.start);
@@ -99,7 +103,12 @@ export function useWcoTitlebarRows(enabled: boolean): (el: HTMLElement | null) =
 		resize?.observe(root);
 		// Panels mount, split and move without the root resizing.
 		const mutations = new MutationObserver(schedule);
-		mutations.observe(root, { childList: true, subtree: true });
+		mutations.observe(root, {
+			childList: true,
+			subtree: true,
+			attributes: true,
+			attributeFilter: [WCO_BELOW_CONTROLS_ATTRIBUTE],
+		});
 		// The overlay turning on or off (fullscreen, display-mode change).
 		const overlay = new MutationObserver(schedule);
 		overlay.observe(html, { attributes: true, attributeFilter: [WCO_ATTRIBUTE] });

@@ -264,6 +264,12 @@ test("a session's board: add, finish, reopen, hand over and back, confirm a goal
 			"task-badge-human",
 			"task-badge-locked",
 		]);
+		// The lock is said by the outline's chip for that state: its icon, then who locked it.
+		expect(await call(page, (f) => f.statusChips())).toContainEqual({
+			status: "locked",
+			text: expect.stringContaining("Locked"),
+			icon: true,
+		});
 		const goal = await taskByTitle(space.id, "Ship the release");
 		expect(goal?.taskJson).toMatchObject({
 			humanCreated: true,
@@ -432,6 +438,50 @@ test("a session's board: reject a goal's completion, hand to a username, cancel 
 		expect(await call(page, (f) => f.row("Drop the flag"))).toBeNull();
 		await page.click("[data-testid=task-board-cancelled-toggle]");
 		await until(page, "unfolded", (f) => f.row("Drop the flag")?.status === "cancelled");
+
+		// Every status group is headed by its state's badge: an icon on a tinted background (the
+		// one a task's checkbox is drawn as in the outline), in both schemes and languages.
+		const colours: Record<string, string> = {};
+		for (const scheme of ["light", "dark"] as const) {
+			await page.evaluate(
+				(s) => document.documentElement.setAttribute("data-mantine-color-scheme", s),
+				scheme,
+			);
+			for (const [language, cancelled] of [
+				["en", "Cancelled"],
+				["zh-CN", "取消"],
+			] as const) {
+				await call(page, (f, l: string) => f.setLanguage(l), language);
+				await until(
+					page,
+					`the board in ${language}`,
+					(f, word: string) =>
+						f.statusBadges().some((b) => b.group === "cancelled" && b.heading.includes(word)),
+					10_000,
+					cancelled,
+				);
+				const badges = await call(page, (f) => f.statusBadges());
+				expect(badges.length).toBeGreaterThanOrEqual(2);
+				for (const badge of badges) {
+					expect(badge, `${scheme} ${language} ${badge.group}`).toMatchObject({
+						status: badge.group,
+						badge: true,
+						tinted: true,
+					});
+					expect(badge.shapes).toBeGreaterThan(0);
+					// The heading says the state in words; the badge adds no character to it.
+					expect(badge.heading).not.toMatch(/[☐☑✓✗◐●○]/);
+				}
+				// Not one look for all: no two statuses share an icon shape (to do and cancelled
+				// share a colour, so the shape is what tells them apart).
+				const statuses = new Set(badges.map((b) => b.group));
+				expect(statuses.size).toBeGreaterThanOrEqual(2);
+				expect(new Set(badges.map((b) => b.icon)).size).toBe(statuses.size);
+				colours[scheme] = badges.find((b) => b.group === "cancelled")?.color ?? "";
+			}
+		}
+		expect(colours.light).not.toBe(colours.dark);
+		await call(page, (f) => f.setLanguage("en"));
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();
@@ -476,7 +526,8 @@ test("a project's board: readable sessions only, grouped by executor, no actions
 		const rows = await call(reader.page, (f) => f.rows());
 		expect(rows.map((r) => [r.title, r.group]).sort()).toEqual([
 			["Shared task", "Shared session"],
-			["Team task", "Unassigned"],
+			// A project's unassigned tasks are "Ready to start" (outline P2 PR 10c-1).
+			["Team task", "Ready to start"],
 		]);
 		// A reader may open a task but not change it.
 		await reader.page.click(

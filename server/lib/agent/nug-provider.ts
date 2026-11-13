@@ -1,4 +1,5 @@
 import type { NativeMediaInput } from "@shared/media-attachments";
+import { parseModelId } from "@shared/model-id";
 import { resolveProxyForUrl } from "../net/proxy";
 import {
 	getNugCachedModelHash,
@@ -32,6 +33,8 @@ import type {
 	DbMessage,
 	GenerateMetaResult,
 	GenerateOptions,
+	ImageGenerationRequest,
+	ImageGenerationResponse,
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
@@ -525,6 +528,23 @@ export class NugProvider implements ProviderAdapter {
 
 		// Retry once with full inline payloads restored.
 		yield* runOnce();
+	}
+
+	async generateImage(params: ImageGenerationRequest): Promise<ImageGenerationResponse> {
+		if (!params.chatModel) {
+			throw new Error("NUG image generation requires the current chat model route");
+		}
+		const meta = this.resolveMeta(params.chatModel);
+		const delegate = this.createDelegate(meta);
+		if (!delegate.generateImage) {
+			throw new Error("NUG image generation requires an OpenAI-shaped channel");
+		}
+		const parsedModel = parseModelId(params.model);
+		const imageModel =
+			parsedModel.provider === this.config.prefix ? parsedModel.model : params.model;
+		// Keep an explicit image route; only bare image IDs inherit the chat channel.
+		const model = parseModelId(imageModel).provider ? imageModel : `${meta.channel}:${imageModel}`;
+		return delegate.generateImage({ ...params, model });
 	}
 
 	async generate(text: string, model: string): Promise<string> {

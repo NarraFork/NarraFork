@@ -30,8 +30,11 @@ import {
 	runGh,
 	validateGitHubRepository,
 } from "../../scripts/lib/github-release";
+import { prepareUpdateIndexRelease } from "../../scripts/lib/update-index";
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 import { MAX_RELEASE_PATCH_BYTES, type ReleasePatchMetadata } from "../../shared/release-patch";
+import { REMOTE_FRONTEND_CAPABILITY } from "../../shared/remote-access/application";
+import { remoteReleaseFixture } from "./remote-frontend-release.fixture";
 
 const roots: string[] = [];
 const commit = "a".repeat(40);
@@ -467,6 +470,73 @@ describe("read-only repair after beta promotion", () => {
 		).rejects.toThrow("already-public");
 		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
 		expect(gh.release).toBeNull();
+	});
+});
+
+describe("same-release immutable remote frontend assets", () => {
+	test("uploads the exact pair while binary checksum and main update-index stay byte-identical", async () => {
+		const f = fixture();
+		const before = await prepareUpdateIndexRelease({
+			...f.options,
+			repository: DEFAULT_GITHUB_REPOSITORY,
+			publishedAt: "2026-11-10T00:00:00.000Z",
+		});
+		const sums = readFileSync(join(f.root, `narrafork-${f.options.version}-SHA256SUMS`));
+		const remote = await remoteReleaseFixture(
+			f.root,
+			{ repository: DEFAULT_GITHUB_REPOSITORY, version: f.options.version, commit },
+			f.root,
+		);
+		f.options.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+		const github = fakeGitHub(f.options);
+		const result = await publishGitHubRelease({ ...f.options, run: github.run });
+		expect(result.assets).toContain(remote.names.archive);
+		expect(result.assets).toContain(remote.names.manifest);
+		for (const name of Object.values(remote.names))
+			expect(github.contents.get(name)).toEqual(readFileSync(join(f.root, name)));
+		expect(readFileSync(join(f.root, `narrafork-${f.options.version}-SHA256SUMS`))).toEqual(sums);
+		expect(
+			(
+				await prepareUpdateIndexRelease({
+					...f.options,
+					repository: DEFAULT_GITHUB_REPOSITORY,
+					publishedAt: "2026-11-10T00:00:00.000Z",
+				})
+			).release,
+		).toEqual(before.release);
+		expect(github.release?.draft).toBe(false);
+	});
+	for (const missing of ["archive", "manifest"] as const)
+		test(`declared ${missing} missing prevents any publication API call`, async () => {
+			const f = fixture();
+			const remote = await remoteReleaseFixture(
+				f.root,
+				{ repository: DEFAULT_GITHUB_REPOSITORY, version: f.options.version, commit },
+				f.root,
+			);
+			f.options.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+			rmSync(join(f.root, remote.names[missing]));
+			const github = fakeGitHub(f.options);
+			await expect(publishGitHubRelease({ ...f.options, run: github.run })).rejects.toThrow();
+			expect(github.calls).toEqual([]);
+		});
+	test("an already public release missing a remote asset cannot be supplemented", async () => {
+		const f = fixture();
+		const remote = await remoteReleaseFixture(
+			f.root,
+			{ repository: DEFAULT_GITHUB_REPOSITORY, version: f.options.version, commit },
+			f.root,
+		);
+		f.options.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+		const github = fakeGitHub(f.options);
+		await publishGitHubRelease({ ...f.options, run: github.run });
+		if (!github.release) throw new Error("Missing published fixture");
+		github.release.assets = github.release.assets.filter(
+			(asset) => asset.name !== remote.names.manifest,
+		);
+		github.calls.length = 0;
+		await expect(publishGitHubRelease({ ...f.options, run: github.run })).rejects.toThrow();
+		expect(github.calls.every((call) => call[0] === "api" && !call.includes("POST"))).toBe(true);
 	});
 });
 

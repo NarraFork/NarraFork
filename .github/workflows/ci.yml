@@ -11,6 +11,11 @@ on:
         description: Exact source commit supplied by the release workflow
         required: true
         type: string
+      release-version:
+        description: Frozen release version (empty for standalone CI)
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -22,6 +27,9 @@ concurrency:
 defaults:
   run:
     shell: bash
+
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
 
 jobs:
   static-checks:
@@ -87,6 +95,32 @@ jobs:
         run: bun install --cwd vscode-extension --frozen-lockfile
       - name: Check TypeScript
         run: bunx tsgo --noEmit
+      # Historical target checkouts without a declaration must never execute a newer script.
+      - name: Build declared remote frontend
+        if: ${{ hashFiles('shared/remote-access/frontend-capability.json') != '' }}
+        env:
+          SOURCE_COMMIT: ${{ inputs.checkout-ref || github.sha }}
+          RELEASE_VERSION: ${{ inputs.release-version }}
+          BUILD_REPOSITORY: ${{ github.repository }}
+        run: |
+          VERSION="${RELEASE_VERSION:-$(bun --eval 'console.log((await Bun.file("package.json").json()).version)')}"
+          bun scripts/build-remote-frontend.ts --repository="$BUILD_REPOSITORY" --version="$VERSION" --commit="$SOURCE_COMMIT" --output=dist/remote-frontend-artifact
+      - name: Upload remote frontend
+        if: ${{ hashFiles('shared/remote-access/frontend-capability.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: remote-frontend-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/remote-frontend-artifact/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload remote UI for isolated browser tests
+        if: ${{ hashFiles('shared/remote-access/frontend-capability.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-frontend-remote
+          path: dist/frontend-remote/
+          if-no-files-found: error
+          retention-days: 7
       - name: Upload frontend build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -127,10 +161,24 @@ jobs:
         with:
           name: ci-frontend
           path: dist/frontend/
+      - name: Download remote UI for isolated browser tests
+        if: ${{ hashFiles('shared/remote-access/frontend-capability.json') != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-frontend-remote
+          path: dist/frontend-remote/
       - name: Verify downloaded build
         run: test -f dist/frontend/index.html
       - name: Install test system dependencies
         run: |
+          # Use an independent Ubuntu mirror during Canonical DNS outages.
+          # Keep Ubuntu's signed repository metadata and all package verification enabled.
+          sudo python3 - <<'PY'
+          from pathlib import Path
+          path = Path("/etc/apt/sources.list.d/ubuntu.sources")
+          sources = path.read_text()
+          path.write_text(sources.replace("mirror+file:/etc/apt/apt-mirrors.txt", "https://mirrors.edge.kernel.org/ubuntu/"))
+          PY
           sudo apt-get update
           sudo apt-get install --yes zstd podman git ripgrep acl python3
           command -v zstd
@@ -210,6 +258,8 @@ jobs:
       - name: Verify test preload isolation
         run: bun test --isolate tests/preload-isolation.test.ts
       - name: Run repository tests
+        env:
+          NF_REMOTE_PRODUCTION_TEST: '1'
         run: >-
           bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${{ matrix.shard }}/4
           --parallel=2 --timings=artifacts/ci-test-timings.json --update-timings
