@@ -304,3 +304,13 @@ export function useUpdateAuthConfig() {
 		},
 	});
 }
+
+/**
+ * Probe the LDAP directory without saving. Deliberately not cached and never invalidating
+ * the config: a test says nothing about what is stored.
+ */
+export function useTestLdap() {
+	return useMutation({
+		mutationFn: api.testLdap,
+	});
+}

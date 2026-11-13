@@ -90,29 +90,40 @@ func renameConditionalHandle(f *os.File, destination string) error {
 		return err
 	}
 	destination = filepath.Join(parent, filepath.Base(destination))
-	name, err := windows.UTF16FromString(destination)
+	buf, err := buildConditionalWindowsRenameInfo(destination)
 	if err != nil {
 		return err
 	}
+	return setConditionalWindowsFileInformation(f, windows.FileRenameInfo, buf)
+}
+
+type conditionalWindowsRenameInfo struct {
+	Replace uint32
+	Root    windows.Handle
+	Length  uint32
+	Name    uint16
+}
+
+func buildConditionalWindowsRenameInfo(destination string) ([]byte, error) {
+	name, err := windows.UTF16FromString(destination)
+	if err != nil {
+		return nil, err
+	}
 	if len(name) > 32768 {
-		return fmt.Errorf("rename destination exceeds Windows path limit")
+		return nil, fmt.Errorf("rename destination exceeds Windows path limit")
 	}
-	name = name[:len(name)-1]
-	type renameInfo struct {
-		Replace uint32
-		Root    windows.Handle
-		Length  uint32
-		Name    uint16
-	}
-	offset := int(unsafe.Offsetof(renameInfo{}.Name))
+	offset := int(unsafe.Offsetof(conditionalWindowsRenameInfo{}.Name))
+	// Win32 FILE_RENAME_INFO.FileName is NUL-terminated, unlike the counted
+	// NT rename path. Include the terminator in the buffer, not FileNameLength;
+	// allocator alignment padding is not a reliable substitute for it.
 	size := offset + len(name)*2
 	// FILE_RENAME_INFO contains a native HANDLE and needs native alignment.
 	backing := make([]uint64, (size+7)/8)
 	buf := unsafe.Slice((*byte)(unsafe.Pointer(&backing[0])), size)
-	info := (*renameInfo)(unsafe.Pointer(&buf[0]))
-	info.Length = uint32(len(name) * 2)
+	info := (*conditionalWindowsRenameInfo)(unsafe.Pointer(&buf[0]))
+	info.Length = uint32((len(name) - 1) * 2)
 	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[offset])), len(name)), name)
-	return setConditionalWindowsFileInformation(f, windows.FileRenameInfo, buf)
+	return buf, nil
 }
 
 // The backup name must not be published in a writable directory: ReplaceFileW

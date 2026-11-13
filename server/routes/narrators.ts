@@ -120,6 +120,7 @@ import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
 } from "../lib/file-reference-input";
+import { getNarratorFolderIdForUser } from "../lib/git-identity";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -305,6 +306,7 @@ import {
 	rebuildDeviceFileState,
 } from "../services/file-state-rebuild";
 import {
+	getFolderGitIdentityPick,
 	getNarratorGitIdentityPick,
 	listUserGitIdentities,
 	setNarratorGitIdentityPick,
@@ -425,6 +427,7 @@ import {
 	readSessionDeliverTo,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
+	refreshCompactContextPercentAfter,
 	reorderBufferedMessages,
 	reprocessAllPendingPermissions,
 	resolveNarratorDefaultDeviceRequest,
@@ -4815,8 +4818,19 @@ narratorRoutes.patch("/:id/compact/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 	const { summary } = await c.req.json();
 	if (!summary || typeof summary !== "string") throw new ValidationError("summary is required");
-	await narratorService.updateCompactSummary(narratorId, messageId, summary);
-	return c.json({ ok: true });
+	// A summary shared with a fork is copied on write, so the edit may land on a new row:
+	// re-measure that row, never the original the fork still owns.
+	const editedMessageId = await narratorService.updateCompactSummary(
+		narratorId,
+		messageId,
+		summary,
+	);
+	// An edited summary changes how much history the next request carries, and the editor
+	// refetches the detail as soon as this responds: re-measure before answering, or the
+	// client would read back the previous percentage.
+	const locale = await getUserLanguage(c.get("user").sub);
+	await refreshCompactContextPercentAfter(narratorId, editedMessageId, locale);
+	return c.json({ ok: true, messageId: editedMessageId });
 });
 
 // Trigger manual compact
@@ -5342,11 +5356,16 @@ narratorRoutes.patch("/:id/default-device", async (c) => {
 narratorRoutes.get("/:id/git-identity", async (c) => {
 	const userId = c.get("user").sub;
 	const narratorId = c.req.param("id");
-	const [identities, selectedId] = await Promise.all([
+	const [identities, selectedId, folderId] = await Promise.all([
 		listUserGitIdentities(userId),
 		getNarratorGitIdentityPick(userId, narratorId),
+		getNarratorFolderIdForUser(narratorId, userId),
 	]);
-	return c.json({ identities, selectedId });
+	// 会话自己没有 pick 时会跟随它所在的侧栏文件夹：UI 要说清跟的是哪一条身份。
+	const folderSelectedId = folderId
+		? await getFolderGitIdentityPick(userId, folderId).catch(() => null)
+		: null;
+	return c.json({ identities, selectedId, folderSelectedId });
 });
 
 narratorRoutes.put("/:id/git-identity", async (c) => {

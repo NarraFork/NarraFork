@@ -293,6 +293,19 @@ async function cachedFolderPick(folderId: string, userId: string): Promise<GitId
 /**
  * Which sidebar folder this narrator currently sits in, for this user.
  *
+ * Exposed for the pick UI: a session that has no pick of its own follows its folder,
+ * so the selection has to say WHICH folder it follows.
+ */
+export function getNarratorFolderIdForUser(
+	narratorId: string,
+	userId: string,
+): Promise<string | null> {
+	return cachedNarratorFolder(narratorId, userId);
+}
+
+/**
+ * Which sidebar folder this narrator currently sits in, for this user.
+ *
  * Cached separately from identities: moving a session between folders is a layout change,
  * and the TTL bounds how long the old folder's identity can still apply.
  */
