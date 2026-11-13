@@ -910,6 +910,93 @@ export async function countOutlineTreeSpaces(
 	return Number(rows[0]?.n ?? 0);
 }
 
+/** What a row of the connected outline says of its space (readability F), before any text. */
+export interface OutlineTreeSpaceFacts {
+	/** Open questions of the space put to the person, on live blocks, counted up to the cap. */
+	waiting: number;
+	/** Live tasks in progress, counted up to the cap. */
+	doing: number;
+	/** The task in progress changed last (among the first `cap` the index gives), if any. */
+	doingId: string | null;
+	/** The task finished last (done or cancelled), if any. */
+	finishedId: string | null;
+	/** The live block with the alias `summary`, if any. */
+	summaryId: string | null;
+}
+
+/** The alias of the block a space's one-line summary is written in. */
+export const OUTLINE_SUMMARY_ALIAS = "summary";
+
+/**
+ * The facts of the rows of one page of the connected outline, in ONE statement for the whole
+ * page (the caller chunks a longer list): per space, two counts that stop at `cap` and three
+ * point picks, each on its own index:
+ *   - the space's open questions (`idx_outline_questions_space_open`), those put to the person;
+ *   - its tasks in progress (`idx_outline_blocks_active_tasks`, the first `cap` rows);
+ *   - its task finished last (`idx_outline_blocks_finished_tasks`, read backwards);
+ *   - its block aliased `summary` (`uq_outline_blocks_space_alias`).
+ *
+ * The caller passes only spaces the person may read (the rows it has just listed): nothing here
+ * decides access, and nothing is read of any other space. No content is read.
+ */
+export async function readOutlineTreeSpaceFacts(
+	userId: string,
+	spaceIds: readonly string[],
+	cap: number,
+): Promise<Map<string, OutlineTreeSpaceFacts>> {
+	const out = new Map<string, OutlineTreeSpaceFacts>();
+	const pg = executor().dialect === "postgres";
+	// The partial indexes' own predicates, word for word, so each subquery is served by its index.
+	const status = pg
+		? `(b."task_json"::jsonb #>> '{status}')`
+		: `json_extract(b."task_json", '$.status')`;
+	const lock = pg ? `(b."task_json"::jsonb #>> '{lock}')` : `json_extract(b."task_json", '$.lock')`;
+	const live = pg ? `b."deleted" = FALSE` : `b."deleted" = 0`;
+	const doing = sql.raw(
+		`${live} AND (${status} = 'doing' OR (${status} = 'todo' AND ${lock} IS NOT NULL)) AND ${status} = 'doing'`,
+	);
+	const finished = sql.raw(`${status} IN ('done', 'cancelled') AND ${live}`);
+	const liveBlock = sql.raw(live);
+	for (const ids of chunked([...new Set(spaceIds)])) {
+		const rows = await all(sql`
+			select s.id,
+				(select count(*) from (
+					select 1 as one from outline_questions q join outline_blocks b on b.id = q.block_id
+					where q.space_id = s.id and q.state = 'open' and q.to_user_id = ${userId}
+						and ${liveBlock}
+					limit ${cap}
+				) t) as waiting,
+				(select count(*) from (
+					select 1 as one from outline_blocks b where b.space_id = s.id and ${doing}
+					limit ${cap}
+				) t) as doing,
+				(select t.id from (
+					select b.id, b.version_seq from outline_blocks b
+					where b.space_id = s.id and ${doing}
+					limit ${cap}
+				) t order by t.version_seq desc, t.id desc limit 1) as doing_id,
+				(select b.id from outline_blocks b
+					where b.space_id = s.id and ${finished}
+					order by b.version_seq desc, b.id desc limit 1) as finished_id,
+				(select b.id from outline_blocks b
+					where b.space_id = s.id and b.alias = ${OUTLINE_SUMMARY_ALIAS} and ${liveBlock}
+					limit 1) as summary_id
+			from outline_spaces s
+			where s.id in (${idList(ids)})
+		`);
+		for (const row of rows) {
+			out.set(text(row, "id"), {
+				waiting: Number(row.waiting ?? 0),
+				doing: Number(row.doing ?? 0),
+				doingId: textOrNull(row, "doing_id"),
+				finishedId: textOrNull(row, "finished_id"),
+				summaryId: textOrNull(row, "summary_id"),
+			});
+		}
+	}
+	return out;
+}
+
 /** A session a task may be handed to on the board (outline P2 PR 10a). */
 export interface TransferSessionRow {
 	id: string;

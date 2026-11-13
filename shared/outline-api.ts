@@ -101,7 +101,19 @@ export const OUTLINE_TREE_LIMITS = {
 	pageBytes: 64 * 1024,
 	/** A group counts its spaces up to this many (shown as one less with a plus beyond). */
 	countCap: 100,
+	/** Characters of a space row's one-line summary. */
+	summaryChars: 80,
 } as const;
+
+/**
+ * What a space row says in one line: the task being done there (`doing`), else the task finished
+ * last (`finished`); a block the space's writers gave the alias `summary` comes before both
+ * (`note`). The first line of that block, cut to {@link OUTLINE_TREE_LIMITS.summaryChars}.
+ */
+export interface OutlineTreeSpaceSummaryLine {
+	kind: "doing" | "finished" | "note";
+	text: string;
+}
 
 /** A space as a row of the connected outline. */
 export interface OutlineTreeSpace extends OutlineSpaceSummary {
@@ -112,6 +124,21 @@ export interface OutlineTreeSpace extends OutlineSpaceSummary {
 	 * {@link OUTLINE_TREE_LIMITS.countCap}.
 	 */
 	sessions?: number;
+	/**
+	 * Whether the caller may change the space (a row of a space they may only read says so).
+	 * Absent from an older server: not known, nothing is said.
+	 */
+	canWrite?: boolean;
+	/**
+	 * Open questions in the space that are put to the caller and that they may answer now, counted
+	 * up to {@link OUTLINE_TREE_LIMITS.countCap}: what waits for them. Zero where they may not
+	 * write (nobody answers there).
+	 */
+	waiting?: number;
+	/** Tasks in progress in the space, counted up to {@link OUTLINE_TREE_LIMITS.countCap}. */
+	doing?: number;
+	/** The row's one line; null or absent: nothing to say. */
+	summary?: OutlineTreeSpaceSummaryLine | null;
 }
 
 /** The root of the connected outline: the caller's own space, then a page of project spaces. */
