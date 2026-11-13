@@ -115,7 +115,11 @@
 			"authorizeNotGranted": "未授予",
 			"authorizeConfirm": "确认",
 			"authorizeSkip": "保持全部",
-			"authorizeBusy": "应用中…"
+			"authorizeBusy": "应用中…",
+			"overlayNoticeTitle": "此插件会覆盖在整个应用上方",
+			"overlayNotice": "插件启用后，它的浮层会对所有用户显示。每个人都可以在 设置 → 外观 中为自己隐藏。",
+			"installedTitle": "{{name}} 已安装",
+			"overlayAcknowledge": "知道了"
 		},
 		"permissionPrompt": {
 			"title": "「{{plugin}}」请求新的能力授权",
@@ -273,5 +277,10 @@
 			"uninstalled": "插件 {{name}} 已卸载。",
 			"operationFailed": "插件操作失败。"
 		}
+	},
+	"overlayHiddenNotice": "已为你隐藏插件浮层，可在 设置 → 外观 中重新打开。",
+	"overlaySettings": {
+		"title": "插件浮层",
+		"description": "这些插件会在整个应用上方绘制内容。隐藏只影响你自己的账号。"
 	}
 }

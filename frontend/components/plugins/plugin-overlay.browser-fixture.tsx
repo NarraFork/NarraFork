@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { usePluginOverlayVisibility } from "../../hooks/usePluginOverlayVisibility";
 import i18n from "../../lib/i18n";
 import { mantineTheme } from "../../lib/mantine-theme";
 import pluginStrings from "../../locales/en/plugins.json";
@@ -17,6 +18,8 @@ import type { PluginContributionRecord } from "./types";
 
 export interface OverlayBrowserControls {
 	reload: (index?: number) => void;
+	/** The per-user preference write behind the Settings → Appearance switch. */
+	setOverlayHidden: (pluginId: string, hidden: boolean) => void;
 	remove: (kind: "disabled" | "uninstalled") => void;
 	inspect: () => {
 		sessions: { id: string; status: string; backendId?: string }[];
@@ -50,12 +53,14 @@ const instanceId = (index = 0) => `overlay:${records[index].pluginId}:pet`;
 
 function Fixture() {
 	const runtime = usePluginUiRuntime();
+	const { setHidden } = usePluginOverlayVisibility();
 	const [clicks, setClicks] = useState(0);
 	useEffect(() => {
 		// Only drive public production operations; never write the bounds store or
 		// fake a session/port. Tests read state to verify the real lifecycle cleanup.
 		window.overlayFixture = {
 			reload: (index = 0) => runtime.reloadSession(instanceId(index)),
+			setOverlayHidden: setHidden,
 			remove: (kind) =>
 				pluginContributionStore.applyRecords(
 					kind === "disabled"
@@ -71,7 +76,7 @@ function Fixture() {
 				bounds: Object.keys(pluginOverlayBoundsStore.getSnapshot()),
 			}),
 		};
-	}, [runtime]);
+	}, [runtime, setHidden]);
 	return (
 		<>
 			<button

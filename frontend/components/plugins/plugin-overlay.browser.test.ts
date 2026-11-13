@@ -40,6 +40,9 @@ let releaseMissing: (() => void) | undefined;
 const revoked = new Set<string>();
 const sessions = new Map<string, { pluginId: string; generation: number }>();
 const generations = new Map<string, number>();
+// The per-user "hidden overlays" preference, as the real server stores it.
+const hiddenOverlays = new Set<string>();
+const preferenceWrites: { pluginId: string; hidden: boolean }[] = [];
 
 function pluginEntry(pluginId: string, generation: number) {
 	return `(() => {
@@ -111,6 +114,16 @@ beforeAll(async () => {
 					assetToken: "fixture-asset-token-1234567890",
 				});
 			}
+			if (path === "/api/user-preferences/plugin-overlays" && request.method === "PATCH") {
+				const body = (await request.json()) as { pluginId: string; hidden: boolean };
+				preferenceWrites.push(body);
+				if (body.hidden) hiddenOverlays.add(body.pluginId);
+				else hiddenOverlays.delete(body.pluginId);
+				return Response.json({ hiddenPluginOverlays: [...hiddenOverlays] });
+			}
+			if (path === "/api/user-preferences" && request.method === "GET") {
+				return Response.json({ hiddenPluginOverlays: [...hiddenOverlays] });
+			}
 			if (path.startsWith("/api/plugins/ui/sessions/") && request.method === "DELETE") {
 				revoked.add(path.split("/").at(-1) ?? "");
 				return Response.json({ ok: true });
@@ -167,6 +180,16 @@ async function open(scenario: string, hits = 1, noOverlay = false) {
 	page.on("pageerror", (error) => {
 		if (errors.length < 8) errors.push(String(error).slice(0, 1_000));
 	});
+	page.on("response", (response) => {
+		if (response.status() >= 400 && errors.length < 8) {
+			errors.push(`${response.status()} ${new URL(response.url()).pathname}`);
+		}
+	});
+	page.on("console", (message) => {
+		if (message.type() === "error" && errors.length < 8) {
+			errors.push(message.text().slice(0, 1_000));
+		}
+	});
 	page.setDefaultTimeout(5_000);
 	await page.setViewport({ width: 800, height: 600 });
 	await page.goto(
@@ -179,11 +202,17 @@ async function open(scenario: string, hits = 1, noOverlay = false) {
 		throw new Error(`Fixture failed to mount: ${errors.join("; ")}`, { cause: error });
 	}
 	if (hits) {
-		await page.waitForFunction(
-			(count) => document.querySelectorAll("[data-plugin-overlay-hit]").length === count,
-			{},
-			hits,
-		);
+		try {
+			await page.waitForFunction(
+				(count) => document.querySelectorAll("[data-plugin-overlay-hit]").length === count,
+				{},
+				hits,
+			);
+		} catch (error) {
+			throw new Error(`Overlay hit regions never appeared: ${errors.join("; ")}`, {
+				cause: error,
+			});
+		}
 	}
 }
 
@@ -258,10 +287,54 @@ for (const input of ["mouse", "keyboard"]) {
 				state.sessions.every((session) => !!session.backendId && revoked.has(session.backendId)),
 			);
 			await clickUnderlay();
+
+			// The dismissal is the person's saved preference, not tab state: every
+			// overlay plugin on screen was hidden, and a reload brings none back nor
+			// starts a single plugin session for them.
+			const pluginIds = [`fixture-full-${input}-0`, `fixture-full-${input}-1`];
+			await waitForStub(() => pluginIds.every((id) => hiddenOverlays.has(id)));
+			await page.close();
+			const before = sessions.size;
+			await open(`full-${input}`, 0);
+			await clickUnderlay(400, 200, "1");
+			expect(
+				await page.$$eval(
+					"[data-plugin-overlay], [data-plugin-overlay-dismiss]",
+					(elements) => elements.length,
+				),
+			).toBe(0);
+			expect(sessions.size).toBe(before);
 		},
 		20_000,
 	);
 }
+
+browserTest(
+	"re-showing a hidden plugin's overlay mounts it again without a reload",
+	async () => {
+		hiddenOverlays.add("fixture-reshow-0");
+		const before = sessions.size;
+		await open("reshow", 0);
+		expect(await page.$$eval("[data-plugin-overlay]", (elements) => elements.length)).toBe(0);
+		expect(sessions.size).toBe(before);
+		// Same write the Settings → Appearance switch makes, through the production hook.
+		await page.evaluate(() => window.overlayFixture.setOverlayHidden("fixture-reshow-0", false));
+		await page.waitForFunction(
+			() => document.querySelectorAll("[data-plugin-overlay-hit]").length === 1,
+		);
+		expect(hiddenOverlays.has("fixture-reshow-0")).toBe(false);
+		// And hiding it again from settings tears the session down, not just the iframe.
+		const shown = await page.evaluate(() => window.overlayFixture.inspect().sessions[0]?.backendId);
+		await page.evaluate(() => window.overlayFixture.setOverlayHidden("fixture-reshow-0", true));
+		await page.waitForFunction(() => !document.querySelector("[data-plugin-overlay]"));
+		expect(await page.evaluate(() => window.overlayFixture.inspect())).toEqual({
+			sessions: [],
+			bounds: [],
+		});
+		await waitForStub(() => !!shown && revoked.has(shown));
+	},
+	20_000,
+);
 
 browserTest(
 	"normal hit regions pass outside clicks through and crash restores underlying input",

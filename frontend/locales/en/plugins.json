@@ -115,7 +115,11 @@
 			"authorizeNotGranted": "Not granted",
 			"authorizeConfirm": "Confirm",
 			"authorizeSkip": "Keep all",
-			"authorizeBusy": "Applying…"
+			"authorizeBusy": "Applying…",
+			"overlayNoticeTitle": "This plugin draws over the whole app",
+			"overlayNotice": "Its overlay appears for every user as soon as the plugin is enabled. Each person can hide it for themselves in Settings → Appearance.",
+			"installedTitle": "{{name}} installed",
+			"overlayAcknowledge": "Got it"
 		},
 		"permissionPrompt": {
 			"title": "\"{{plugin}}\" is requesting a new capability grant",
@@ -273,5 +277,10 @@
 			"uninstalled": "Plugin {{name}} uninstalled.",
 			"operationFailed": "Plugin operation failed."
 		}
+	},
+	"overlayHiddenNotice": "Plugin overlays hidden for you. Turn them back on in Settings → Appearance.",
+	"overlaySettings": {
+		"title": "Plugin overlays",
+		"description": "These plugins draw over the whole app. Hiding one only affects your own account."
 	}
 }
