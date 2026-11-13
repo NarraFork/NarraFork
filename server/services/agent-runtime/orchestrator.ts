@@ -2828,6 +2828,11 @@ export async function runAgentLoopUnlocked(
 				if (placement) {
 					const payment = result.paymentRequired;
 					for (const recipient of [narratorId, placement.parentNarratorId]) {
+						// The parent copy is tagged like every other dual-broadcast frame: a
+						// child running out of balance must not make the parent page open its
+						// own recharge dialog.
+						const isParentCopy =
+							recipient === placement.parentNarratorId && recipient !== narratorId;
 						broadcastToNarrator(recipient, {
 							type: "payment_required",
 							narratorId: recipient,
@@ -2836,6 +2841,7 @@ export async function runAgentLoopUnlocked(
 							balance: payment.balance,
 							required: payment.required,
 							resumeAction: payment.resumeAction,
+							...(isParentCopy && { isSubagent: true }),
 						});
 					}
 				}
