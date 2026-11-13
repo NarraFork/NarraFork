@@ -118,7 +118,9 @@ describe("balance request headers and transport policy", () => {
 	});
 
 	test("standard bearer is present without custom overrides", () => {
-		expect(balanceRequestHeaders(config, true).get("authorization")).toBe("Bearer private-api-key");
+		expect(balanceRequestHeaders(config, "provider-key").get("authorization")).toBe(
+			"Bearer private-api-key",
+		);
 	});
 
 	test("metadata drops every custom header and credential, not just Authorization", async () => {
@@ -143,7 +145,7 @@ describe("balance request headers and transport policy", () => {
 				},
 			},
 		);
-		await request("https://balance-transport.invalid/deployment/api/status", false);
+		await request("https://balance-transport.invalid/deployment/api/status", "none");
 		expect([...headers.entries()]).toEqual([["accept", "application/json"]]);
 	});
 
@@ -168,7 +170,7 @@ describe("balance request headers and transport policy", () => {
 					"X-End-To-End": "preserved",
 				},
 			},
-			true,
+			"provider-key",
 		);
 		for (const name of names) expect(headers.has(name)).toBe(false);
 		expect(headers.get("X-End-To-End")).toBe("preserved");
@@ -188,7 +190,7 @@ describe("balance request headers and transport policy", () => {
 					"X-End-To-End": "preserved",
 				},
 			},
-			true,
+			"provider-key",
 		);
 		expect(headers.has("connection")).toBe(false);
 		expect(headers.has("x-hop-one")).toBe(false);
@@ -481,6 +483,83 @@ describe("HTTP and payload classification", () => {
 			name: "BalanceProbeRequestError",
 			kind: "transient",
 			message: "Balance request failed",
+		});
+	});
+});
+
+describe("site-account authentication", () => {
+	// The site root is a different host than the inference base URL, as on some relay deployments.
+	const siteConfig: CustomApiProviderConfig = {
+		...config,
+		baseUrl: "https://inference.invalid/v1",
+		quotaSiteUrl: "https://site.invalid",
+		quotaAccessToken: "site-access-token",
+		quotaUserId: "4242",
+	};
+	const siteEndpoint = "https://site.invalid/api/user/self";
+	const siteRequest = (fetch: Fetch) =>
+		createBalanceRequest(siteConfig, new AbortController().signal, { fetch });
+
+	test("sends the site token and the New-Api-User header, never the inference key", async () => {
+		let headers = new Headers();
+		await siteRequest(async (_url, init) => {
+			headers = new Headers(init?.headers);
+			return jsonResponse({ success: true, data: { quota: 1, used_quota: 0 } });
+		})(siteEndpoint, "site-token");
+		expect(headers.get("authorization")).toBe("Bearer site-access-token");
+		expect(headers.get("new-api-user")).toBe("4242");
+		expect([...headers.values()]).not.toContain("Bearer private-api-key");
+	});
+
+	test("allows the separately configured site origin and nothing else", async () => {
+		let seen = "";
+		const request = siteRequest(async (url) => {
+			seen = String(url);
+			return jsonResponse();
+		});
+		await request(siteEndpoint, "site-token");
+		expect(seen).toBe(siteEndpoint);
+		await expect(
+			request("https://other.invalid/api/user/self", "site-token"),
+		).rejects.toMatchObject({ kind: "unsupported" });
+	});
+
+	test("keeps rejecting an arbitrary origin when no site root is configured", async () => {
+		await expect(
+			requestWith(async () => jsonResponse())("https://other.invalid/api/user/self"),
+		).rejects.toMatchObject({ kind: "unsupported" });
+	});
+
+	test.each([401, 403])("HTTP %s is a deterministic auth failure", async (status) => {
+		await expect(
+			siteRequest(async () => new Response(null, { status }))(siteEndpoint, "site-token"),
+		).rejects.toMatchObject({ kind: "auth" });
+	});
+
+	test.each([429, 500, 503])("HTTP %s is transient for the site endpoint", async (status) => {
+		await expect(
+			siteRequest(async () => new Response(null, { status }))(siteEndpoint, "site-token"),
+		).rejects.toMatchObject({ kind: "transient" });
+	});
+
+	test.each([400, 404, 422])("HTTP %s is a deterministic invalid answer", async (status) => {
+		await expect(
+			siteRequest(async () => new Response(null, { status }))(siteEndpoint, "site-token"),
+		).rejects.toMatchObject({ kind: "invalid_response" });
+	});
+
+	test("a non-JSON 200 is a deterministic invalid answer for the site endpoint", async () => {
+		await expect(
+			siteRequest(
+				async () =>
+					new Response("<html>gateway</html>", { headers: { "content-type": "text/html" } }),
+			)(siteEndpoint, "site-token"),
+		).rejects.toMatchObject({ kind: "invalid_response" });
+		const json = siteRequest(
+			async () => new Response("{not json", { headers: { "content-type": "application/json" } }),
+		);
+		await expect(json(siteEndpoint, "site-token")).rejects.toMatchObject({
+			kind: "invalid_response",
 		});
 	});
 });

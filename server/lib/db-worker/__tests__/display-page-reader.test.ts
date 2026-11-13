@@ -231,7 +231,7 @@ function controlledDisplaySettlement() {
 		terminated = false;
 		constructor() {
 			super();
-			queueMicrotask(() => this.emit({ type: "ready" }));
+			queueMicrotask(() => this.emit({ type: "ready", buildId: null }));
 		}
 		emit(data: DbWorkerOutbound): void {
 			const event = new MessageEvent("message", { data });

@@ -1,0 +1,8 @@
+{
+	"schemaVersion": 1,
+	"buildMode": "remote",
+	"bootstrapAbi": 1,
+	"apiEpoch": 1,
+	"wireVersion": 2,
+	"compatibility": "exact-release"
+}

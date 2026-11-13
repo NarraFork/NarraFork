@@ -232,12 +232,14 @@ export function NavTopSection({
 					label={t(storedCollapsed ? "expandSidebar" : "collapseSidebar")}
 					position="right"
 					openDelay={400}
+					disabled={isMobile}
 				>
 					<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
 						<BrandTitle
 							ref={brandRef}
 							order={4}
-							onClick={onToggleCollapsed}
+							// Narrow windows own a drawer, not the desktop collapse preference.
+							onClick={isMobile ? onNavigate : onToggleCollapsed}
 							className="nf-nav-brand"
 							style={{
 								cursor: "pointer",

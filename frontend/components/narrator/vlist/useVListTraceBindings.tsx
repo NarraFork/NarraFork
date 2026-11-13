@@ -1,4 +1,8 @@
 import type { ToolCallDetailRef } from "@frontend/lib/api/narrators";
+import {
+	coerceInjectionTarget,
+	type InjectionTarget,
+} from "@shared/pretext-layout/injection-target";
 import type { AdapterTraceRowIdentity } from "@shared/pretext-layout/segment-adapter";
 import { useMemo, useRef } from "react";
 import {
@@ -10,6 +14,7 @@ import { TraceRowInteraction } from "../trace/TraceRowInteraction";
 import type { TraceRowIdentity } from "../trace/trace-row-identity";
 import type { MeasuredCollapsibleTrace, MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
+import { VListRowInteraction } from "./VListRowInteraction";
 import {
 	resolveTraceRowCardData,
 	resolveTraceRowIdentity,
@@ -17,6 +22,7 @@ import {
 	TRACE_KINDS,
 	TRACE_ROW_INTERACTION_KINDS,
 } from "./vlist-exact-row-state";
+import { resolveInjectionOpener } from "./vlist-injection-header";
 import type { VListItem } from "./vlist-pipeline";
 import {
 	buildRowCtxActions,
@@ -53,6 +59,8 @@ const MESSAGE_HANDLERS = [
 	"onEditMessage",
 ] as const;
 const TOOL_HANDLERS = [
+	"onOpenKnowledgeEntry",
+	"onOpenSpecFile",
 	"onViewSubagentSession",
 	"onDetachSubagent",
 	"onDetachBash",
@@ -62,6 +70,7 @@ const TOOL_HANDLERS = [
 const BOUND_HANDLERS = [...MESSAGE_HANDLERS, ...TOOL_HANDLERS];
 
 interface RowProjection {
+	auxiliary?: { title: string; text: string; target?: InjectionTarget };
 	identity: TraceRowIdentity | null;
 	toolDetailRef: ToolCallDetailRef | undefined;
 	toolMeta: VListToolMeta | undefined;
@@ -94,6 +103,9 @@ function sameIdentity(a: TraceRowIdentity | null, b: TraceRowIdentity | null): b
 function sameProjection(a: RowProjection, b: RowProjection): boolean {
 	return (
 		sameIdentity(a.identity, b.identity) &&
+		a.auxiliary?.title === b.auxiliary?.title &&
+		a.auxiliary?.text === b.auxiliary?.text &&
+		JSON.stringify(a.auxiliary?.target) === JSON.stringify(b.auxiliary?.target) &&
 		sameToolMeta(a.toolMeta, b.toolMeta) &&
 		a.toolDetailRef?.toolCallId === b.toolDetailRef?.toolCallId &&
 		a.toolDetailRef?.messageId === b.toolDetailRef?.messageId &&
@@ -176,12 +188,21 @@ function projectRow(
 				executionAttempt: detailRef.executionAttempt,
 			}
 		: undefined;
-	return {
-		identity,
-		toolMeta,
-		toolDetailRef,
-		handlers: projectHandlers(identity, toolMeta, rowHandlers),
-	};
+	const auxiliary =
+		adapterIdentity?.auxiliary === true
+			? {
+					title: adapterIdentity.source || "message",
+					text: adapterIdentity.modelFacing || "",
+					target: coerceInjectionTarget(adapterIdentity.target),
+				}
+			: undefined;
+	const handlers = projectHandlers(identity, toolMeta, rowHandlers);
+	if (auxiliary?.target?.kind === "narrator")
+		handlers.onViewSubagentSession = rowHandlers?.onViewSubagentSession;
+	if (auxiliary?.target?.kind === "knowledge")
+		handlers.onOpenKnowledgeEntry = rowHandlers?.onOpenKnowledgeEntry;
+	if (auxiliary?.target?.kind === "spec") handlers.onOpenSpecFile = rowHandlers?.onOpenSpecFile;
+	return { identity, toolMeta, toolDetailRef, handlers, auxiliary };
 }
 
 /** These closures retain only one group's small semantic snapshots and actual functions. */
@@ -190,7 +211,34 @@ function bindGroup(narratorId: string, rows: Map<string, BoundRow>): TraceGroupB
 		rowInteraction: (row, rowBody) => {
 			const projected = rows.get(row.key);
 			if (!projected?.identity || !projected.actions) return null;
-			const { identity, actions, handlers, toolDetailRef } = projected;
+			const { identity, actions, handlers, toolDetailRef, auxiliary } = projected;
+			if (auxiliary) {
+				const openSource = auxiliary.target
+					? resolveInjectionOpener(auxiliary.target, {
+							onOpenNarrator: handlers.onViewSubagentSession,
+							onOpenKnowledge: handlers.onOpenKnowledgeEntry,
+							onOpenSpec: handlers.onOpenSpecFile,
+						})
+					: undefined;
+				const contentActions = openSource ? { ...actions, onJumpToSource: openSource } : actions;
+				return (
+					<MessageContextMenuCtx.Provider value={contentActions}>
+						<VListRowInteraction
+							blockId={identity.blockId}
+							messageId={identity.messageId}
+							blockIndex={identity.blockIndex}
+							blockIndices={identity.blockIndices}
+							copyText={identity.copyText}
+							actions={contentActions}
+							inspectContent={
+								auxiliary.text ? { title: auxiliary.title, text: auxiliary.text } : undefined
+							}
+						>
+							{rowBody}
+						</VListRowInteraction>
+					</MessageContextMenuCtx.Provider>
+				);
+			}
 			return (
 				<MessageContextMenuCtx.Provider value={actions}>
 					<TraceRowInteraction

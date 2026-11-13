@@ -9,6 +9,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { parseClaudeCodeSession } from "@shared/session-interchange/claude-code/parse";
 import { parseCodexSession } from "@shared/session-interchange/codex/parse";
 import type { InterchangeSession } from "@shared/session-interchange/model";
+import { clearedToolOutput, historyClearedText } from "@shared/storage-retention";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narratorMessages, narratorToolCalls, users } from "../../db/schema";
@@ -121,6 +122,60 @@ async function importFixture(tag: string) {
 	});
 }
 
+async function importRetentionFixture(tag: string) {
+	const base = fixture(tag);
+	const oldTools = ["Write", "Edit", "StructSed", "GenUI"];
+	return importInterchangeSession(
+		{
+			...base,
+			subagents: [],
+			messages: [
+				{
+					role: "assistant",
+					timestamp: "2026-01-01T00:00:01.000Z",
+					blocks: [
+						{ type: "text", text: "old assistant prose" },
+						...oldTools.map((name) => ({
+							type: "tool_use" as const,
+							id: `${name}-${tag}`,
+							name,
+							input: {},
+						})),
+					],
+				},
+				...oldTools.map((name) => ({
+					role: "tool_result" as const,
+					timestamp: "2026-01-01T00:00:02.000Z",
+					toolUseId: `${name}-${tag}`,
+					output: "old-ledger-output-secret",
+					isError: false,
+				})),
+				{
+					role: "assistant",
+					timestamp: "2026-01-01T00:00:03.000Z",
+					blocks: [
+						{ type: "text", text: "recent assistant prose" },
+						{
+							type: "tool_use",
+							id: `live-${tag}`,
+							name: "Bash",
+							input: { command: "recent command" },
+						},
+					],
+				},
+				{
+					role: "tool_result",
+					timestamp: "2026-01-01T00:00:04.000Z",
+					toolUseId: `live-${tag}`,
+					output: "recent output",
+					isError: false,
+				},
+			],
+		},
+		{ ownerUserId: USER, source: { format: "claude-code" } },
+	);
+}
+
 function lines(content: string): string[] {
 	return content.split("\n").filter(Boolean);
 }
@@ -206,6 +261,113 @@ describe("narratorToInterchange", () => {
 });
 
 describe("exportNarratorSession", () => {
+	test("cleared tool pairs export as text without their retained replay input", async () => {
+		const imported = await importRetentionFixture(`cleared-${TAG}`);
+		const tools = await db
+			.select()
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.narratorId, imported.narratorId));
+		for (const tool of tools) {
+			if (tool.toolName === "Bash") continue;
+			await db
+				.update(narratorToolCalls)
+				.set({
+					inputJson: {
+						file_path: "/private/retained-session-secret",
+						content: "retained-session-secret",
+					},
+					outputJson: clearedToolOutput("2026-07-17T12:00:00.000Z"),
+				})
+				.where(eq(narratorToolCalls.id, tool.id));
+		}
+		// Legacy calls may exist only in the ledger, without a content tool_use block.
+		const [oldMessage] = await db
+			.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, imported.narratorId))
+			.orderBy(narratorMessages.createdAt)
+			.limit(1);
+		expect(oldMessage).toBeDefined();
+		await db
+			.update(narratorMessages)
+			.set({
+				contentJson: (oldMessage?.contentJson as Array<{ name?: string }>).filter(
+					(block) => block.name !== "GenUI",
+				),
+			})
+			.where(eq(narratorMessages.id, oldMessage?.id ?? ""));
+		const session = await narratorToInterchange(imported.narratorId);
+		const calls = session.messages.flatMap((message) =>
+			message.role === "assistant"
+				? message.blocks.filter((block) => block.type === "tool_use")
+				: [],
+		);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.type === "tool_use" && calls[0].name).toBe("Bash");
+		expect(session.messages.filter((message) => message.role === "tool_result")).toHaveLength(1);
+		for (const format of ["claude-code", "codex"] as const) {
+			const result = await exportNarratorSession(imported.narratorId, { format });
+			const content = result.files.map((file) => file.content).join("\n");
+			expect(content).not.toContain("retained-session-secret");
+			expect(content).not.toContain("old-ledger-output-secret");
+			for (const name of ["Write", "Edit", "StructSed", "GenUI"]) {
+				expect(content).toContain(`[Tool details cleared: ${name}]`);
+			}
+			const parsed =
+				format === "claude-code"
+					? parseClaudeCodeSession({ main: lines(result.files[0]?.content ?? "") })
+					: parseCodexSession({ main: lines(result.files[0]?.content ?? "") });
+			expect(parsed.messages.filter((message) => message.role === "tool_result")).toHaveLength(1);
+			expect(JSON.stringify(parsed)).toContain("recent command");
+			expect(JSON.stringify(parsed)).toContain("recent output");
+		}
+		expect(
+			JSON.stringify(
+				await db
+					.select({ input: narratorToolCalls.inputJson })
+					.from(narratorToolCalls)
+					.where(eq(narratorToolCalls.narratorId, imported.narratorId)),
+			),
+		).toContain("retained-session-secret");
+	});
+
+	test.each([
+		"cleared",
+		"suppressed",
+	] as const)("%s message bodies never replay their old tool ledger", async (kind) => {
+		const imported = await importRetentionFixture(`${kind}-body-${TAG}`);
+		const [oldMessage] = await db
+			.select({ id: narratorMessages.id })
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, imported.narratorId))
+			.orderBy(narratorMessages.createdAt)
+			.limit(1);
+		const text = kind === "cleared" ? "[History cleared]" : "new human edit";
+		const contentJson =
+			kind === "cleared"
+				? [historyClearedText("2026-07-17T12:00:00.000Z")]
+				: [{ type: "text", text, historyToolsSuppressed: true }];
+		await db
+			.update(narratorMessages)
+			.set({ contentJson, contentText: text })
+			.where(eq(narratorMessages.id, oldMessage?.id ?? ""));
+		for (const format of ["claude-code", "codex"] as const) {
+			const result = await exportNarratorSession(imported.narratorId, { format });
+			const content = result.files.map((file) => file.content).join("\n");
+			expect(content).toContain(text);
+			expect(content).not.toContain("old-ledger-output-secret");
+			expect(content).not.toContain("old assistant prose");
+			expect(content).toContain("recent assistant prose");
+			expect(content).toContain("recent command");
+			expect(content).toContain("recent output");
+			const parsed =
+				format === "claude-code"
+					? parseClaudeCodeSession({ main: lines(result.files[0]?.content ?? "") })
+					: parseCodexSession({ main: lines(result.files[0]?.content ?? "") });
+			expect(parsed.messages.filter((message) => message.role === "tool_result")).toHaveLength(1);
+		}
+	});
+
 	test("Claude Code: files parse back with the same conversation and sidechain", async () => {
 		const imported = await importFixture(`cc-${TAG}`);
 		const result = await exportNarratorSession(imported.narratorId, { format: "claude-code" });

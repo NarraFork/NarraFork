@@ -1,0 +1,49 @@
+.panel {
+	min-width: 0;
+	container-type: inline-size;
+}
+
+.header {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) auto;
+	grid-template-areas: "identity summary actions";
+	align-items: start;
+	gap: var(--mantine-spacing-xs);
+}
+
+.identity {
+	grid-area: identity;
+}
+
+/* SVGs and controls must keep their intrinsic size, even in a narrow dock. */
+.identity > *,
+.actions > * {
+	flex-shrink: 0;
+}
+
+.actions {
+	grid-area: actions;
+	min-width: 0;
+}
+
+.summary {
+	grid-area: summary;
+	min-width: 0;
+	max-width: 100%;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.preview {
+	overflow-wrap: anywhere;
+}
+
+/* Use the panel width, not the viewport: desktop dock columns can be narrow too. */
+@container (max-width: 30rem) {
+	.header {
+		grid-template-columns: auto minmax(0, 1fr);
+		grid-template-areas:
+			"identity actions"
+			"summary summary";
+	}
+}

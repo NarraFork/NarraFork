@@ -67,6 +67,8 @@ export async function editorDraftBrowserAcceptance(
 		void dialog.accept();
 	});
 	await ready();
+	// Monaco views can mount before async ACL/IndexedDB draft discovery finishes.
+	await wait(() => window.__editorCache.snapshot().drafts.metadataReads >= 2);
 	const initial = await state();
 	expect(initial.registry.tabs).toBe(1000);
 	expect(initial.monacoModels).toBe(1);

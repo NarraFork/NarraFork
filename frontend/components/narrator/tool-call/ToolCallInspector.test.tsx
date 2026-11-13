@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { clearedToolOutput } from "@shared/storage-retention";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
@@ -10,6 +11,8 @@ import { I18nextProvider } from "react-i18next";
 import { useToolCallDetail } from "../../../hooks/useNarrator";
 import { toolCallDetailQueryKey } from "../../../lib/api/narrators";
 import en from "../../../locales/en/narrator.json";
+import settingsEn from "../../../locales/en/settings.json";
+import settingsZh from "../../../locales/zh-CN/settings.json";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { TraceRowInteraction } from "../trace/TraceRowInteraction";
@@ -174,6 +177,82 @@ async function render(props: Props | Props[]) {
 	);
 	await flush();
 }
+
+test.each([
+	"en",
+	"zh-CN",
+])("cleared native tool payloads render one short localized notice in %s", async (language) => {
+	const labels = language === "en" ? settingsEn : settingsZh;
+	i18n.addResourceBundle(language, "settings", labels, true, true);
+	await i18n.changeLanguage(language);
+	try {
+		for (const clearedBy of ["native-output", "dto"] as const) {
+			await render({
+				...base,
+				detail: {
+					toolName: "Write",
+					status: "completed",
+					// Replaying file history can retain necessary inputs internally. Even a
+					// large body must never mount the input viewer or its expansion controls.
+					inputJson: {
+						file_path: "/private/replay-ledger.txt",
+						content: "INTERNAL_REPLAY_INPUT_SECRET".repeat(4_000),
+					},
+					...(clearedBy === "native-output"
+						? { outputJson: clearedToolOutput("2026-01-01T00:00:00.000Z") }
+						: { payloadCleared: true, outputJson: "INTERNAL_REPLAY_OUTPUT_SECRET" }),
+				},
+			});
+			expect(document.body.textContent).toContain(labels.storageToolDetailsCleared);
+			for (const hidden of [
+				"INTERNAL_REPLAY_INPUT_SECRET",
+				"INTERNAL_REPLAY_OUTPUT_SECRET",
+				"/private/replay-ledger.txt",
+				"_payloadClearedAt",
+				"[Tool details cleared]",
+				"toolCallInspector.input",
+				"toolCallInspector.output",
+				"toolCallInspector.truncatedPreview",
+				"toolCallInspector.copyInput",
+				"toolCallInspector.copyOutput",
+			]) {
+				expect(document.body.textContent).not.toContain(hidden);
+			}
+			// Only the tool-use ID copy remains; neither payload has a copy action.
+			expect(document.querySelectorAll("button svg.tabler-icon-copy")).toHaveLength(1);
+			expect(calls).toHaveLength(0);
+		}
+	} finally {
+		await i18n.changeLanguage("en");
+	}
+});
+
+test("a cleared list-row marker suppresses stale cached inputs and never requests full payloads", async () => {
+	i18n.addResourceBundle("en", "settings", settingsEn, true, true);
+	const ref = { toolCallId: "cleared-replay-row", messageId: "cleared-replay-message" };
+	client.setQueryData(toolCallDetailQueryKey(base.narratorId, base.toolUseId ?? "", ref), {
+		id: ref.toolCallId,
+		messageId: ref.messageId,
+		toolName: "Write",
+		payloadCleared: false,
+		inputJson: { content: "STALE_PRE_CLEANUP_INPUT_SECRET" },
+		outputJson: "STALE_PRE_CLEANUP_OUTPUT_SECRET",
+	});
+	await render({
+		...base,
+		initialToolCall: {
+			id: ref.toolCallId,
+			messageId: ref.messageId,
+			toolName: "Write",
+			outputJson: clearedToolOutput("2026-01-01T00:00:00.000Z"),
+		},
+	});
+	expect(document.body.textContent).toContain(settingsEn.storageToolDetailsCleared);
+	expect(document.body.textContent).not.toContain("STALE_PRE_CLEANUP_INPUT_SECRET");
+	expect(document.body.textContent).not.toContain("STALE_PRE_CLEANUP_OUTPUT_SECRET");
+	expect(document.querySelectorAll("button svg.tabler-icon-copy")).toHaveLength(1);
+	expect(calls).toHaveLength(0);
+});
 
 describe("ToolCallInspector timing", () => {
 	test("separates streaming, pre-execution wait and measured file operation", async () => {

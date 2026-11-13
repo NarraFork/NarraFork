@@ -53,6 +53,7 @@ function canReuseRow({ props, skipReuse }: WindowRowProjection): boolean {
 		props.item.spec.opts?.streamingContent === true ||
 		props.animateStreaming ||
 		props.permissionSlot != null ||
+		props.outlineAskSlot != null ||
 		props.editorSlot != null ||
 		props.onUnknownHeight != null ||
 		(props.traceRowPermissionSlots?.size ?? 0) > 0 ||

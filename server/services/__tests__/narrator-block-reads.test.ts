@@ -101,6 +101,7 @@ function driftBlocks(id: string): void {
 }
 
 beforeEach(() => {
+	settings.narratorBlocks.compactJson = false;
 	cleanDb(sqlite);
 	sqlite.run("INSERT INTO narrators (id, title, created_at, updated_at) VALUES ('n1', 'N', ?, ?)", [
 		NOW,

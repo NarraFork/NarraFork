@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ZodError } from "zod";
 import { blockIdAt } from "../../tests/block-ids";
+import { readTestMessageContent } from "../../tests/setup";
 import {
 	narratorBlacklistDirs,
 	narratorMessageRefs,
@@ -31,7 +32,7 @@ import { permissionPolicyChanges } from "./permission-rule-service";
 import { getWorkspaceDirectories, workspaceContextService } from "./workspace-context-service";
 
 // Test preload gives this real SQLite DB a temporary, process-isolated home.
-const { db } = await import("../db");
+const { db, sqlite } = await import("../db");
 const { narratorRoutes } = await import("../routes/narrators");
 function app(actor: string) {
 	const routes = new Hono();
@@ -162,7 +163,9 @@ describe("real SQLite workspace CAS", () => {
 		const reminder = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.narratorId, id),
 		});
-		expect(JSON.stringify(reminder?.contentJson)).toContain(join(root, "new"));
+		expect(JSON.stringify(readTestMessageContent(sqlite, reminder?.id ?? ""))).toContain(
+			join(root, "new"),
+		);
 	});
 	test("production HTTP and model device switches publish CAS identities and preserve frozen children", async () => {
 		const devices = [
@@ -771,11 +774,9 @@ describe("history-only HTTP actions after a workspace switch", () => {
 					? [f.user, f.answer, f.later, f.workspaceReminder]
 					: [f.user, f.answer, f.workspaceReminder],
 			);
-			const remaining = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, f.answer),
-				columns: { contentJson: true },
-			});
-			expect(remaining?.contentJson).toEqual([{ type: "text", text: "keep this text" }]);
+			expect(readTestMessageContent(sqlite, f.answer)).toEqual([
+				{ type: "text", text: "keep this text" },
+			]);
 		}
 		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
 		await assertFiles(f);

@@ -9,6 +9,7 @@
  * the new head in the list is what makes the page read it again.
  */
 
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
 import type { OutlineDigestHead } from "@shared/outline-digest";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -44,7 +45,7 @@ export function wasUndoneHere(commitId: string | null): boolean {
 
 /** The person's reports, newest day first; `poll` while a "today so far" is awaited. */
 export function useOutlineReportList(options: { enabled?: boolean; poll?: boolean } = {}) {
-	const enabled = options.enabled ?? true;
+	const enabled = !REMOTE_BUILD && (options.enabled ?? true);
 	const client = useQueryClient();
 	useEffect(() => {
 		if (!enabled) return;
@@ -74,7 +75,7 @@ export function useOutlineReport(head: Pick<OutlineDigestHead, "id" | "createdAt
 	return useQuery({
 		queryKey: outlineReportKeys.detail(head?.id ?? "", head?.createdAt ?? ""),
 		queryFn: () => api.getOutlineReport(head?.id as string),
-		enabled: head !== null,
+		enabled: !REMOTE_BUILD && head !== null,
 		retry: false,
 		staleTime: 60_000,
 	});

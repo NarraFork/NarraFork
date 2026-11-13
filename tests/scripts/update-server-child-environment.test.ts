@@ -516,6 +516,8 @@ async function restoreFixture(f: Awaited<ReturnType<typeof sandbox>>) {
 			return JSON.stringify({ status: "ahead", merge_base_commit: { sha: path.slice(8, 48) } });
 		if (path === "git/ref/tags/v2.0.0")
 			return JSON.stringify({ object: { type: "commit", sha: commit } });
+		if (path === `contents/shared/remote-access/frontend-capability.json?ref=${commit}`)
+			throw new Error("HTTP 404");
 		if (path === `contents/package.json?ref=${commit}`)
 			return contents({ version: "2.0.0", packageManager: `bun@${CI_RELEASE_BUN}` });
 		if (path === `contents/changelogs/v2.0.0.json?ref=${commit}`)

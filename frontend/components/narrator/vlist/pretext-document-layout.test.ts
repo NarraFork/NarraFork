@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { historyClearedText } from "@shared/storage-retention";
 import type { NarratorMsg } from "../narrator-panel-types";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -36,6 +37,65 @@ function message(id: string, seq: number, role: "user" | "assistant", text: stri
 		[{ type: "text", text }],
 	) as unknown as NarratorMsg;
 }
+
+describe("compact auxiliary layout", () => {
+	const event = rowWithElements(
+		{ ...message("background-event", 12, "assistant", ""), role: "sys", origin: "system" },
+		[
+			{
+				type: "system_injection",
+				source: "bg_bash",
+				modelText: "original model input",
+				body: {
+					kind: "tasksDone",
+					flavor: "bash",
+					items: [
+						{
+							id: "build-job",
+							title: "Build",
+							status: "completed",
+							preview: "log line\n".repeat(80),
+						},
+					],
+				},
+			},
+		],
+	) as unknown as NarratorMsg;
+	const build = (lod: 2 | 3 | 5, compact = true, open = false) =>
+		buildPretextDocumentLayout([event], {
+			layoutRevision: "auxiliary-layout",
+			documentRevision: 1,
+			lod,
+			contentWidth: 640,
+			widthBucket: "640",
+			compactAuxiliaryContent: compact,
+			isRowExpanded: () => open,
+		});
+
+	it("uses one short trace row rather than a log bubble and retains exact source ownership", () => {
+		const compact = build(2);
+		expect(compact.items[0]?.spec.kind).toBe("activity-trace");
+		expect(compact.items[0]?.measured.height).toBeLessThan(70);
+		expect(compact.manifest.items[0]?.sourceMessageIds).toEqual(["background-event"]);
+		const legacy = build(2, false);
+		expect(legacy.items[0]?.spec.kind).toBe("injection-bubble");
+		expect(legacy.items[0]?.measured.height).toBeGreaterThan(200);
+	});
+
+	it("keeps content identity across LOD and opens the same auxiliary card inside a trace", () => {
+		const folded = build(2);
+		const row = (folded.items[0]?.measured as MeasuredCollapsibleTrace).rows[0];
+		const detailed = build(5);
+		expect(detailed.items[0]?.spec.kind).toBe("auxiliary-content");
+		expect(detailed.items[0]?.spec.unitId).toBe(row?.unitId);
+		expect(detailed.manifest.items[0]?.sourceMessageIds).toEqual(["background-event"]);
+		const opened = build(2, true, true);
+		const openRow = (opened.items[0]?.measured as MeasuredCollapsibleTrace).rows[0];
+		expect(openRow?.cardKind).toBe("auxiliary-content");
+		expect(openRow?.cardMeasured?.height).toBeGreaterThan(100);
+		expect(build(3).items[0]?.measured.height).toBeLessThan(100);
+	});
+});
 
 function historyFixture(count: number): NarratorMsg[] {
 	return Array.from({ length: count }, (_, index) => {
@@ -486,6 +546,77 @@ describe("buildPretextDocumentLayout", () => {
 		});
 	});
 
+	it.each([
+		"user",
+		"assistant",
+		"compact",
+		"segment_compact",
+	] as const)("localizes native %s history tombstones before both measurement and rendering without mutating protocol rows", (kind) => {
+		const marker = historyClearedText("2026-01-01T00:00:00.000Z");
+		const element =
+			kind === "user" || kind === "assistant"
+				? { ...marker }
+				: {
+						type: kind,
+						subtype: "plan",
+						status: "completed",
+						historyClearVersion: 1,
+						historyClearedAt: marker.historyClearedAt,
+						summary: marker.text,
+					};
+		const source = rowWithElements(
+			{
+				...message(`cleared-${kind}`, 1, "assistant", marker.text),
+				role: kind === "user" ? "user" : kind === "assistant" ? "assistant" : "system",
+			},
+			[element],
+		) as unknown as NarratorMsg;
+		const nativeBlocks = source.blocks;
+		const build = (language: string, label: string) =>
+			buildPretextDocumentLayout([source], {
+				layoutRevision: `cleared-${kind}`,
+				documentRevision: 1,
+				lod: 5,
+				widthBucket: "300",
+				contentWidth: 300,
+				labelsRevision: language,
+				labels: { historyCleared: label },
+				isExpanded: () => true,
+			});
+		const english = build("en", "History cleared");
+		const chinese = build("zh-CN", "历史已清理");
+		const projected = JSON.stringify(
+			chinese.items.map(({ spec, measured }) => ({ data: spec.data, measured })),
+		);
+		expect(projected).toContain("历史已清理");
+		expect(projected).not.toContain("[History cleared]");
+		expect(chinese.items.map(({ spec }) => spec.key)).toEqual(
+			english.items.map(({ spec }) => spec.key),
+		);
+		expect(chinese.items[0].measured).not.toBe(english.items[0].measured);
+		expect(source.blocks).toBe(nativeBlocks);
+		expect(messageBody(source)[0]).toEqual(element);
+		expect(source.contentText).toBe("[History cleared]");
+		const rebuilt = build("zh-CN", "历史已清理");
+		expect(rebuilt.items[0].measured).toBe(chinese.items[0].measured);
+	});
+
+	it("does not translate ordinary user text that resembles a history tombstone", () => {
+		const source = message("ordinary-marker-quote", 1, "user", "[History cleared]");
+		const result = buildPretextDocumentLayout([source], {
+			layoutRevision: "ordinary-marker-quote",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "300",
+			contentWidth: 300,
+			labelsRevision: "zh-CN",
+			labels: { historyCleared: "历史已清理" },
+		});
+		const projected = JSON.stringify(result.items.map(({ spec }) => spec.data));
+		expect(projected).toContain("[History cleared]");
+		expect(projected).not.toContain("历史已清理");
+	});
+
 	it("is deterministic for a 95-message mixed history with long, tool, compact, and tail content", () => {
 		const input = historyFixture(95);
 		const options = {
@@ -655,6 +786,18 @@ describe("buildPretextDocumentLayout", () => {
 		const afterKeys = after.manifest.items.map((item) => item.itemKey);
 		expect(afterKeys.some((key) => key.includes("tu-b"))).toBe(true);
 		expect(afterKeys.some((key) => key.startsWith("tool-tu-a"))).toBe(false);
+	});
+
+	it("pins nothing in an outline session (PR 12a): its old tasks card folds like any call", () => {
+		const messages = [message("m0", 0, "user", "hello"), tasksToolMessage("m1", 1, "tu-only")];
+		const pinned = buildPretextDocumentLayout(messages, { ...PIN_OPTIONS, lod: 2 as const });
+		expect(pinned.manifest.items.some((i) => i.itemKey.startsWith("tool-tu-only"))).toBe(true);
+		const unpinned = buildPretextDocumentLayout(messages, {
+			...PIN_OPTIONS,
+			lod: 2 as const,
+			pinLatestSpecTasks: false,
+		});
+		expect(unpinned.manifest.items.some((i) => i.itemKey.startsWith("tool-tu-only"))).toBe(false);
 	});
 
 	it("leaves a document with no tasks write untouched (nothing pinned)", () => {

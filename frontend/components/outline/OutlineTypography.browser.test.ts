@@ -5,11 +5,12 @@
  * For the default setting and for 115% font / 110% line height / +2% letter spacing:
  *
  *   - the live editor, the mind map's nodes and the read-only tree (history) paint each role —
- *     body, page title, headings, inline code, code block — with exactly the size, line box and
- *     letter spacing the transcript measures that role with (`typographyMetrics()` /
- *     `headingMetrics()`, read in the page);
+ *     body, page title, inline code, code block — with exactly the size, line box and letter
+ *     spacing the transcript measures that role with (`typographyMetrics()` /
+ *     `headingMetrics()`, read in the page); a markdown heading inside a block is body text in
+ *     bold, so the page title is the largest text on the page;
  *   - the mind map, which measures its nodes with pretext before drawing them, draws every node
- *     at the height it measured (`nodeAccuracy`), its frame (arrow, bullet, checkbox) at the width
+ *     at the height it measured (`nodeAccuracy`), its frame (arrow and one marker) at the width
  *     it measured, and no node's text overflows its box — including after the setting changed
  *     while the page was open (cache keys, Worker requests and the line box all follow the
  *     setting);
@@ -26,6 +27,7 @@ import { mkdirSync } from "node:fs";
 import { eq, max } from "drizzle-orm";
 import { db } from "../../../server/db";
 import { outlineCommits } from "../../../server/db/schema";
+import { writeOutline } from "../../../server/services/outline/write";
 import { seedPage } from "./editor/outline-live-harness.browser-fixture";
 import {
 	type MapEditor,
@@ -133,20 +135,23 @@ async function expectEditor(e: MapEditor, x: Expected): Promise<void> {
 	const pm = ".nf-outline-editor .nf-outline-scroller .ProseMirror";
 	await expectRole(e, `${pm} > .ob-block > .ob-content > :first-child`, x.h3, "title");
 	await expectRole(e, `${pm} .ob-children .ob-block > .ob-content > p`, x.body, "body");
-	await expectRole(e, `${pm} .ob-content h2`, x.h2, "heading");
+	// A heading inside a block is body text in bold: the page title is the largest text.
+	await expectRole(e, `${pm} .ob-content h2`, x.body, "heading");
+	expect(x.h3.size, "the page title is larger than a nested heading").toBeGreaterThan(x.body.size);
 	await expectRole(e, `${pm} .ob-content p code`, x.code, "inline code");
 	await expectRole(e, `${pm} .ob-content pre`, x.codeBlock, "code block");
 	await expectFrameIcons(e, "outline", "editor");
 }
 
 async function expectMap(e: MapEditor, x: Expected, label: string): Promise<void> {
+	await e.call((f) => f.mapTypographySettled());
 	await e.call((f) => f.setView("map"));
 	await settled(e);
 	await e.call((f) => f.mapFit());
 	await e.call((f) => f.mapFlush());
 	await frames(e);
 	await expectRole(e, ".mm-node .mm-body > p", x.body, `${label} node body`);
-	await expectRole(e, ".mm-node .mm-body > h2", x.h2, `${label} node heading`);
+	await expectRole(e, ".mm-node .mm-body > h2", x.body, `${label} node heading`);
 	const accuracy = await e.call((f) => f.nodeAccuracy());
 	expect(accuracy.checked, label).toBeGreaterThanOrEqual(LINES.length);
 	// Measured with pretext, drawn by CSS: the same height, to the pixel.
@@ -199,7 +204,7 @@ for (const [name, setting] of Object.entries(SETTINGS)) {
 		await frames(e);
 		await expectRole(e, ".nf-type-scope h3", x.h3, "tree title");
 		await expectRole(e, "[data-block-id] .nf-type-scope", x.body, "tree body");
-		await expectRole(e, "[data-block-id] .nf-type-scope h2", x.h2, "tree heading");
+		await expectRole(e, "[data-block-id] .nf-type-scope h2", x.body, "tree heading");
 		await expectRole(e, "[data-block-id] .nf-type-scope code", x.code, "tree inline code");
 		await shoot(e, `after-outline-tree-${name}`);
 		expect(e.errors).toEqual([]);
@@ -275,27 +280,132 @@ const SWEEP_LINES = [
 	"[x] ## 结论与后续",
 ];
 
-test("a measuring Worker that never answers does not leave the map moving", async () => {
-	const { pageId } = await seedPage(h, "重试按钮排查", LINES);
+test("a hung Worker releases the UI hold without exact UI measuring, and recovers in a Worker", async () => {
+	const { pageId, ids } = await seedPage(h, "重试按钮排查", LINES);
 	const e = await openHost(h, "page", pageId, { width: 960, height: 760 });
 	await e.call((f) => f.prewarmDone());
-	// In the outline view the map measures nothing itself: the whole page goes to the Worker.
+	const misses = (await e.call((f) => f.mapStats())).measure.misses;
+	// The whole page goes to the Worker; the UI must not take over after the hold deadline.
 	await e.call((f) => f.hangWorker());
 	await e.call((f, s) => f.applyTypography(s as never), { fontScalePercent: 115 });
 	expect(await e.call((f) => f.mapTypographyPending())).toBe(true);
 	// The setting rests (300 ms), the page goes to the Worker, and no answer comes: the map
-	// stops waiting after PREWARM_HOLD_MS (1.5 s), and measures what is left when shown.
+	// stops waiting after PREWARM_HOLD_MS (1.5 s), keeping fixed/previous geometry.
 	await new Promise((r) => setTimeout(r, 300 + 1500 + 300));
 	expect(await e.call((f) => f.mapTypographyPending())).toBe(false);
 	await e.call((f) => f.setView("map"));
 	await settled(e);
 	await e.call((f) => f.mapFlush());
+	const stats = await e.call((f) => f.mapStats());
+	expect(stats.provisional).toBeGreaterThan(0);
+	expect(stats.measure.misses).toBe(misses);
+	expect(await e.call((f) => f.mapSlotMismatches())).toBe(0);
+	// Selection, editing and switching views remain usable while exact geometry is unavailable.
+	await e.call((f, id) => f.mapSelect(id as never), ids[0]);
+	await e.page.keyboard.press("F2");
+	await e.page.keyboard.type("worker-hung-edit");
+	await e.page.keyboard.press("Escape");
+	expect(await e.call((f, id) => f.client().textOf(id as never), ids[0])).toContain(
+		"worker-hung-edit",
+	);
+	await e.call((f) => f.restoreWorker());
+	await e.call((f) => f.mapFit());
+	await e.call((f) => f.mapFlush());
 	const acc = await e.call((f) => f.nodeAccuracy());
 	expect(acc.checked).toBeGreaterThan(0);
 	expect(acc.maxDiffH).toBeLessThanOrEqual(1);
-	expect(acc.overH).toBe(0);
+	expect((await e.call((f) => f.mapStats())).provisional).toBe(0);
+	expect((await e.call((f) => f.mapStats())).measure.misses).toBe(misses);
+	await e.call((f) => f.setView("outline"));
+	await settled(e);
 	expect(e.errors).toEqual([]);
 }, 60_000);
+
+for (const fault of ["disabled", "construct", "send", "error", "partial"] as const) {
+	test(`${fault} Worker keeps usable placeholders and never measures on the UI thread`, async () => {
+		const { pageId } = await seedPage(h, `Worker ${fault}`, LINES);
+		const e = await openHost(h, "page", pageId, { width: 960, height: 760 });
+		await e.call((f) => f.prewarmDone());
+		const before = (await e.call((f) => f.mapStats())).measure.misses;
+		if (fault === "disabled") await e.call((f) => f.disableWorker());
+		else await e.call((f, mode) => f.failWorker(mode as never), fault);
+		await e.call((f) => f.mapTypographySettled());
+		await e.call((f) => f.setView("map"));
+		await settled(e);
+		await e.call((f) => f.mapFlush());
+		const provisional = await e.call((f) => f.mapStats());
+		expect(provisional.measure.misses).toBe(before);
+		expect(provisional.provisional).toBeGreaterThan(0);
+		expect(provisional.nodesInDom).toBeGreaterThan(0);
+		expect(await e.call((f) => f.mapSlotMismatches())).toBe(0);
+		await e.call((f) => f.restoreWorker());
+		await e.call((f) => f.mapFit());
+		await e.call((f) => f.mapFlush());
+		expect((await e.call((f) => f.mapStats())).provisional).toBe(0);
+		expect((await e.call((f) => f.nodeAccuracy())).maxDiffH).toBeLessThanOrEqual(1);
+		expect((await e.call((f) => f.mapStats())).measure.misses).toBe(before);
+		expect(e.errors).toEqual([]);
+	}, 60_000);
+}
+
+for (const scenario of ["healthy", "partial", "occupied"] as const) {
+	test(`budget-limited nodes continue after ${scenario} Worker replies without retrying failures`, async () => {
+		const { pageId } = await seedPage(h, `Budget ${scenario}`, []);
+		const ids: string[] = [];
+		// More than two Worker windows: the initial view prewarm cannot hide a missed layout slice.
+		// Stay within both the 16 KiB per-body and 128 KiB per-write limits.
+		for (let at = 0; at < 160; at += 8) {
+			const result = await writeOutline({
+				spaceId: h.space.id,
+				actor: { kind: "human", id: h.owner },
+				responsibleUserId: h.owner,
+				ops: Array.from({ length: 8 }, (_, i) => ({
+					op: "insert",
+					parent: { id: pageId },
+					content: `${at + i}${"x".repeat(16_000)}`,
+				})),
+			});
+			ids.push(...result.results.map((row) => row.blockId));
+		}
+		const e = await openHost(h, "page", pageId, { noWorker: true, width: 960, height: 760 });
+		const misses = (await e.call((f) => f.mapStats())).measure.misses;
+		await e.call(
+			(f, partial) => f.controlMeasureWorker(partial as boolean),
+			scenario === "partial",
+		);
+		if (scenario === "occupied") await e.call((f) => f.occupyMeasureBudget());
+		await e.call((f) => f.setView("map"));
+		await frames(e, 3);
+		const expectedKeys = ids.length + 1 + (scenario === "occupied" ? 30 : 0);
+		const first = await e.call((f) => f.controlledMeasureState());
+		expect(first.posted).toBeGreaterThan(0);
+		expect(first.posted).toBeLessThan(expectedKeys);
+		await frames(e, 3);
+		expect((await e.call((f) => f.controlledMeasureState())).posted).toBe(first.posted);
+		const expectedPlaceholders = scenario === "partial" ? 1 : 0;
+		for (let wave = 0; wave < 8; wave++) {
+			await e.call((f) => f.releaseMeasurements());
+			await frames(e, 3);
+			const state = await e.call((f) => f.controlledMeasureState());
+			const stats = await e.call((f) => f.mapStats());
+			if (
+				state.unique >= expectedKeys &&
+				state.waiting === 0 &&
+				stats.provisional === expectedPlaceholders
+			)
+				break;
+		}
+		const finished = await e.call((f) => f.controlledMeasureState());
+		expect(finished.unique).toBe(expectedKeys);
+		expect(finished.posted).toBe(finished.unique);
+		expect(finished.waiting).toBe(0);
+		expect((await e.call((f) => f.mapStats())).provisional).toBe(expectedPlaceholders);
+		await frames(e, 4);
+		expect((await e.call((f) => f.controlledMeasureState())).posted).toBe(finished.posted);
+		expect((await e.call((f) => f.mapStats())).measure.misses).toBe(misses);
+		expect(e.errors).toEqual([]);
+	}, 60_000);
+}
 
 test("every node is drawn at its measured height across font × letter spacing × line height", async () => {
 	const { pageId } = await seedPage(h, "排版扫描 sweep", SWEEP_LINES);
@@ -309,7 +419,7 @@ test("every node is drawn at its measured height across font × letter spacing �
 			for (const lineHeightScalePercent of [60, 100, 185]) {
 				const setting = { fontScalePercent, letterSpacingPercent, lineHeightScalePercent };
 				await e.call((f, s) => f.applyTypography(s as never), setting);
-				// Skip the settle wait (the Worker round trip): every node is measured now.
+				// Skip the debounce, not the Worker: await exact isolated sizes for this setting.
 				await e.call((f) => f.mapTypographySettled());
 				await e.call((f) => f.mapFit());
 				await e.call((f) => f.mapFlush());

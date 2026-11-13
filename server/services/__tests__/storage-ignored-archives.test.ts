@@ -10,9 +10,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { STORAGE_CATEGORY_KEYS } from "@shared/storage-categories";
 import { generateId } from "../../lib/id";
 import { getNarraforkPath } from "../../lib/narrafork-home";
-import { scanStorage } from "../storage-service";
+import { scanStorageCategory } from "../storage-service";
 
 const SECRET = "API_TOKEN=super-secret\n";
 
@@ -41,12 +42,11 @@ describe("storage scan", () => {
 		seedArchive();
 		seedArchive();
 
-		// `scanStorage` streams progress and yields the result as the generator's return
-		// value, so it has to be driven to completion rather than awaited.
-		const scan = scanStorage();
-		let next = await scan.next();
-		while (!next.done) next = await scan.next();
-		const category = next.value.categories.find((c) => c.key === "dormantIgnored");
+		// The full scanner iterates this registry; keep its registration covered without
+		// waiting for unrelated container discovery or database measurements.
+		expect(STORAGE_CATEGORY_KEYS).toContain("dormantIgnored");
+		const category = await scanStorageCategory("dormantIgnored");
+		expect(category.key).toBe("dormantIgnored");
 
 		// Without a category of its own this directory's bytes were in no total at all,
 		// which is how it grew unnoticed.

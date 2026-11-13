@@ -2,14 +2,14 @@ name: Independent update server mirror
 
 on:
   workflow_run:
-    workflows: [Release, Auxiliary helpers and executor release]
+    workflows: [Release, Auxiliary helpers and executor release, Remote peer release]
     types: [completed]
   workflow_dispatch:
     inputs:
       kind:
-        description: Mirror main metadata/patches or helper/executor binaries of a public release
+        description: Mirror main metadata/patches or helper/executor/remote-peer public binaries
         type: choice
-        options: [main, helpers, executor]
+        options: [main, helpers, executor, remote-peer]
         required: true
       tag:
         description: Exact already-public tag; never builds or publishes GitHub assets
@@ -18,7 +18,7 @@ on:
 
 # Optional repository/Environment variables: upload concurrency 1–8 (direct=2, DAV=3),
 # total 1–300 minutes; streamed DAV object 1–60.
-# Empty values retain main=25, helpers/executor=120, object=15 minute defaults.
+# Empty values retain main=25, helpers/executor/remote-peer=120, object=15 minute defaults.
 permissions:
   contents: read
   actions: read
@@ -26,6 +26,9 @@ permissions:
 concurrency:
   group: independent-update-server-mirror
   cancel-in-progress: false
+
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
 
 jobs:
   preflight:
@@ -41,6 +44,8 @@ jobs:
     outputs:
       eligible: ${{ steps.qualified.outputs.eligible }}
       artifact-name: ${{ steps.trigger.outputs.artifact_name }}
+      peer-artifact-name: ${{ steps.trigger.outputs.peer_artifact_name }}
+      peer-receipt: ${{ steps.trigger.outputs.peer_receipt }}
       source-run-id: ${{ steps.trigger.outputs.run_id }}
       control-sha: ${{ steps.control.outputs.sha }}
     steps:
@@ -66,6 +71,14 @@ jobs:
           run-id: ${{ steps.trigger.outputs.run_id }}
           github-token: ${{ github.token }}
           path: artifacts/source-publication
+      # A normal Release may publish both NF and peer. Never merge two artifact directories.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: github.event_name == 'workflow_run' && steps.trigger.outputs.peer_receipt == 'true'
+        with:
+          name: ${{ steps.trigger.outputs.peer_artifact_name }}
+          run-id: ${{ steps.trigger.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: artifacts/source-peer-publication
       - name: Verify receipt data and current public authority before independent approval
         id: qualified
         if: steps.trigger.outputs.eligible == 'true'
@@ -73,7 +86,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
-            bun scripts/mirror-update-server.ts --verify-trigger-receipt --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json
+            bun scripts/mirror-update-server.ts --verify-trigger-receipt --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json --peer-receipt-file=artifacts/source-peer-publication/remote-peer-publication-receipt.json
           else
             printf 'eligible=true\n' >> "$GITHUB_OUTPUT"
           fi
@@ -103,6 +116,13 @@ jobs:
           run-id: ${{ needs.preflight.outputs.source-run-id }}
           github-token: ${{ github.token }}
           path: artifacts/source-publication
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: github.event_name == 'workflow_run' && needs.preflight.outputs.peer-receipt == 'true'
+        with:
+          name: ${{ needs.preflight.outputs.peer-artifact-name }}
+          run-id: ${{ needs.preflight.outputs.source-run-id }}
+          github-token: ${{ github.token }}
+          path: artifacts/source-peer-publication
       - name: Validate explicit transport without probing or fallback
         env:
           NF_MIRROR_TRANSPORT: ${{ vars.NF_MIRROR_TRANSPORT || 'direct' }}
@@ -121,7 +141,7 @@ jobs:
           MIRROR_TAG: ${{ inputs.tag }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
-            bun scripts/mirror-update-server.ts --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json
+            bun scripts/mirror-update-server.ts --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json --peer-receipt-file=artifacts/source-peer-publication/remote-peer-publication-receipt.json
           else
             bun scripts/mirror-update-server.ts --kind="$MIRROR_KIND" --tag="$MIRROR_TAG"
           fi
@@ -143,7 +163,7 @@ jobs:
           MIRROR_TAG: ${{ inputs.tag }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
-            bun scripts/mirror-update-server.ts --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json
+            bun scripts/mirror-update-server.ts --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json --peer-receipt-file=artifacts/source-peer-publication/remote-peer-publication-receipt.json
           else
             bun scripts/mirror-update-server.ts --kind="$MIRROR_KIND" --tag="$MIRROR_TAG"
           fi
@@ -152,6 +172,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: independent-mirror-receipt-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/mirror/receipt.json
+          path: artifacts/mirror/
           if-no-files-found: warn
           retention-days: 30

@@ -1,4 +1,5 @@
 import type * as Monaco from "monaco-editor/editor/editor.api";
+import { installMonacoWorkerPolicy, observeMonacoStandaloneWorkers } from "./monaco-worker-policy";
 
 export type MonacoAPI = typeof Monaco;
 let pending: Promise<MonacoAPI> | undefined;
@@ -18,7 +19,14 @@ export function loadMonaco(): Promise<MonacoAPI> {
 					name: "narrafork-monaco-editor",
 				}),
 		};
+		// getWorker throwing is insufficient: Monaco catches it and otherwise runs synchronously.
+		// Patch the shared failure boundary before editor.api can expose ANY service/createWebWorker.
+		const { EditorWorkerClient } = await import(
+			"monaco-editor/editor/browser/services/editorWorkerService"
+		);
+		installMonacoWorkerPolicy(EditorWorkerClient);
 		const api = await import("monaco-editor/editor/editor.api");
+		observeMonacoStandaloneWorkers(api.editor);
 		// Only editing features. No find UI, diagnostics, TS server or semantic token workers.
 		await Promise.all([
 			import("monaco-editor/features/clipboard/register"),

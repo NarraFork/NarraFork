@@ -33,7 +33,9 @@ describe("PostgreSQL narrator WebSocket admission", () => {
 	});
 
 	test("runs the Bun upgrade gate before OAuth, JWT, user lookup, or server.upgrade effects", async () => {
-		const source = await Bun.file(new URL("../../main.ts", import.meta.url)).text();
+		const main = await Bun.file(new URL("../../main.ts", import.meta.url)).text();
+		expect(main).toContain("createServerRequestDispatcher({");
+		const source = await Bun.file(new URL("../../http-dispatcher.ts", import.meta.url)).text();
 		const gate = source.indexOf("const narratorWsRefusal = narratorWebSocketBackendRefusal(");
 		expect(gate).toBeGreaterThan(-1);
 		for (const laterEffect of [

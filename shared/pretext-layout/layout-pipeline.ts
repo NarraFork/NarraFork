@@ -14,6 +14,7 @@
  * arithmetic). The only inputs are data + width + lod + scroll offsets.
  */
 
+import type { PlanTreeView } from "../outline-plan-tree";
 import type { VListElementKind } from "./element-kinds";
 import type { MeasuredElement, RenderLod } from "./prepared-block";
 import {
@@ -48,6 +49,8 @@ export interface VListLayoutResult {
 }
 
 export interface ComputeLayoutOptions {
+	/** Account display preference; absent keeps compatibility for pure/preview callers. */
+	compactAuxiliaryContent?: boolean;
 	/** Available content width (px) for each element. */
 	contentWidth: number;
 	/** Render LOD (height master switch). */
@@ -76,6 +79,8 @@ export interface ComputeLayoutOptions {
 	isPromptOpen?: (key: string) => boolean;
 	/** Reader expanded a subagent card's file-change list (its own fold). */
 	isFileChangesOpen?: (key: string) => boolean;
+	/** The reader's view of an outline plan card's tree (undefined: the overview). */
+	planTreeView?: (key: string) => PlanTreeView | undefined;
 	/** L5 recency window for tool/subagent cards. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -109,6 +114,7 @@ export interface ComputeLayoutOptions {
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
 	/** First-frame layout of a live InlinePermission form (see AdapterContext). */
 	resolvePermissionFormPrediction?: (toolUseId: string | undefined) => unknown;
 	/** Painted height of that form once mounted (see AdapterContext). */
@@ -171,6 +177,7 @@ export function computePretextVListLayout(
 	measureElement: MeasureElement,
 ): VListLayoutResult {
 	const ctx: AdapterContext = {
+		compactAuxiliaryContent: opts.compactAuxiliaryContent,
 		lod: opts.lod,
 		isExpanded: opts.isExpanded,
 		isTextExpanded: opts.isTextExpanded,
@@ -181,6 +188,7 @@ export function computePretextVListLayout(
 		showOriginal: opts.showOriginal,
 		isPromptOpen: opts.isPromptOpen,
 		isFileChangesOpen: opts.isFileChangesOpen,
+		planTreeView: opts.planTreeView,
 		recentMessageIds: opts.recentMessageIds,
 		viewportHeight: opts.viewportHeight,
 		labels: opts.labels,
@@ -192,6 +200,7 @@ export function computePretextVListLayout(
 		canOfferProviderFix: opts.canOfferProviderFix,
 		canOfferModelTest: opts.canOfferModelTest,
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
+		resolveQuestionStatus: opts.resolveQuestionStatus,
 		resolvePermissionFormPrediction: opts.resolvePermissionFormPrediction,
 		resolvePermissionFormHeight: opts.resolvePermissionFormHeight,
 		resolveLatestSpecTasksToolUseId: opts.resolveLatestSpecTasksToolUseId,

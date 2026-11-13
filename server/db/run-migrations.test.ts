@@ -656,30 +656,26 @@ describe("hash-based migration self-heal", () => {
 		return folder;
 	}
 
-	test("recognizes a ledger written from CRLF migration files (Windows checkout)", async () => {
-		// The reported incident: a database migrated from a CRLF checkout recorded every hash over
-		// CRLF text. An LF build then saw nothing as applied, replayed the whole journal and failed
-		// on the model-history contract row it had already inserted.
+	test.each([
+		"CRLF to LF",
+		"LF to CRLF",
+	] as const)("recognizes migration ledger line endings: %s (Windows checkout)", async (direction) => {
+		// Each direction replays the complete real history on a fresh DB. Keeping
+		// them independent gives each real migration its normal test budget rather
+		// than charging two cold, growing-history replays to one five-second case.
 		const folder = crlfMigrationsFolder();
 		try {
 			sqlite = new Database(":memory:");
-			applyPendingMigrationsByHash(sqlite, folder);
+			if (direction === "CRLF to LF") applyPendingMigrationsByHash(sqlite, folder);
+			else await runMigrations(sqlite);
 			const before = hashCount(sqlite);
 			expect(before).toBe(readMigrationFiles({ migrationsFolder: folder }).length);
 
-			await runMigrations(sqlite);
+			// A differently-ended build must recognize the ledger, not replay its
+			// model-history contract inserts or stamp a second copy of each hash.
+			if (direction === "CRLF to LF") await runMigrations(sqlite);
+			else applyPendingMigrationsByHash(sqlite, folder);
 			expect(hashCount(sqlite)).toBe(before);
-
-			// And the reverse: an LF ledger read by a CRLF build.
-			const lf = new Database(":memory:");
-			try {
-				await runMigrations(lf);
-				const lfCount = hashCount(lf);
-				applyPendingMigrationsByHash(lf, folder);
-				expect(hashCount(lf)).toBe(lfCount);
-			} finally {
-				lf.close();
-			}
 		} finally {
 			rmSync(folder, { recursive: true, force: true });
 		}
@@ -1992,6 +1988,8 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 	test("replays the entire journal against an already-final schema without failing", async () => {
 		const folder = preRetirementJournal();
 		sqlite = new Database(":memory:");
+		// Apple's SQLite defaults this to ON; assert the replay restores it, not a platform default.
+		const legacyAlterTableBefore = sqlite.prepare("PRAGMA legacy_alter_table").get();
 		applyPendingMigrationsByHash(sqlite, folder);
 		sqlite.run("PRAGMA foreign_keys=ON");
 
@@ -2071,7 +2069,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		}
 		expect(sqlite.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
 		expect(sqlite.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
-		expect(sqlite.prepare("PRAGMA legacy_alter_table").get()).toEqual({ legacy_alter_table: 0 });
+		expect(sqlite.prepare("PRAGMA legacy_alter_table").get()).toEqual(legacyAlterTableBefore);
 		const changesBefore = sqlite.prepare("SELECT total_changes() AS changes").get();
 		applyPendingMigrationsByHash(sqlite, folder);
 		expect(sqlite.prepare("SELECT total_changes() AS changes").get()).toEqual(changesBefore);

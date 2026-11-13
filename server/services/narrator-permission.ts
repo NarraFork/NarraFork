@@ -6651,6 +6651,13 @@ export async function resolvePermission(
 		});
 		return false;
 	}
+	// A person decides inside the run: it counts as a person's run (outline P2 PR 10c-2), for the
+	// session asking and for the one its request shows on (a subagent's parent).
+	if (decidedBy === "user")
+		for (const id of new Set([pending.narratorId, pending.broadcastTargetId])) {
+			const asking = activeNarrators.get(id);
+			if (asking) asking._runPersonActed = true;
+		}
 
 	if (pending.toolName === "RequestPermissionRule") {
 		const state = permissionRuleRequestPauses.get(requestId);

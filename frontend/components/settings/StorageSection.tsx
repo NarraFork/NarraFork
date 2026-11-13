@@ -1,4 +1,5 @@
 import {
+	Accordion,
 	ActionIcon,
 	Alert,
 	Badge,
@@ -42,9 +43,7 @@ import {
 } from "../../hooks/usePlatform";
 import {
 	api,
-	type DatabaseCleanupApiRequestSample,
 	type DatabaseCleanupBlockedItem,
-	type DatabaseCleanupExecutionResult,
 	type DatabaseCleanupNarratorSample,
 	type DatabaseCleanupPreviewResult,
 	type DatabaseCleanupTarget,
@@ -101,12 +100,6 @@ function isNarratorSample(
 	return sample.type === "narrator";
 }
 
-function isApiRequestSample(
-	sample: DatabaseCleanupPreviewResult["samples"][number],
-): sample is DatabaseCleanupApiRequestSample {
-	return sample.type === "apiRequest";
-}
-
 const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	database: <IconDatabase size={18} />,
 	uploads: <IconPhoto size={18} />,
@@ -155,23 +148,10 @@ function formatScanDetail(
 // Nested rows need a subtle tint that differs from the card body in both color schemes.
 const NESTED_ROW_BG = "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-6))";
 
-const DATABASE_TARGET_DEFAULT_DAYS: Record<
-	Exclude<DatabaseCleanupTarget, "archivedSessions">,
-	number
-> = {
-	staleSessions: 90,
-	toolCallPayloads: 180,
-};
+type SessionCleanupTarget = Extract<DatabaseCleanupTarget, "archivedSessions" | "staleSessions">;
 
-const DATABASE_TARGET_DAY_OPTIONS: Record<
-	Exclude<DatabaseCleanupTarget, "archivedSessions">,
-	string[]
-> = {
-	staleSessions: ["30", "90", "180", "365"],
-	// No option below 90 days: these payloads are what the execution log shows, and a
-	// short window would erase the recent history an administrator actually consults.
-	toolCallPayloads: ["90", "180", "365", "730"],
-};
+const STALE_SESSION_DEFAULT_DAYS = 90;
+const STALE_SESSION_DAY_OPTIONS = ["30", "90", "180", "365"];
 
 interface CleanupTarget {
 	key: string;
@@ -191,7 +171,7 @@ const CLEANUP_TARGETS: CleanupTarget[] = [
 	{ key: "containers", target: "containers", labelKey: "storageCleanupContainers" },
 ];
 
-export function StorageSection() {
+export function StorageSection({ refreshToken = 0 }: { refreshToken?: number }) {
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
 	const rawDatabaseCapability = useDatabaseCapability();
@@ -263,11 +243,6 @@ export function StorageSection() {
 					supported: false,
 					reason: storageHealthDisabledReason,
 				},
-				toolCallPayloads: {
-					...rawDatabaseCleanupCapabilities.toolCallPayloads,
-					supported: false,
-					reason: storageHealthDisabledReason,
-				},
 			};
 	const rawDatabasePreviewCapability = useStorageDatabasePreviewCapability();
 	const databasePreviewCapability = storageHealthReady
@@ -276,14 +251,13 @@ export function StorageSection() {
 	const scanDisabledReason =
 		storageHealthDisabledReason ?? scanReason ?? t("storageScanUnsupported");
 	const [scanResult, setScanResult] = useState<StorageScanResult | null>(null);
+	const refreshedToken = useRef(0);
 	const [tab, setTab] = useState<string>("summary");
 	const [categoryJobs, setCategoryJobs] = useState<StorageCategoryJobState[]>([]);
 	const toastedErrors = useRef(new Set<string>());
 	const [cleaningTarget, setCleaningTarget] = useState<string | null>(null);
-	const [databaseTarget, setDatabaseTarget] = useState<DatabaseCleanupTarget | null>(null);
-	const [databaseOlderThanDays, setDatabaseOlderThanDays] = useState<number>(
-		DATABASE_TARGET_DEFAULT_DAYS.staleSessions,
-	);
+	const [databaseTarget, setDatabaseTarget] = useState<SessionCleanupTarget | null>(null);
+	const [databaseOlderThanDays, setDatabaseOlderThanDays] = useState(STALE_SESSION_DEFAULT_DAYS);
 	const [databasePreview, setDatabasePreview] = useState<DatabaseCleanupPreviewResult | null>(null);
 	const [databasePreviewLoading, setDatabasePreviewLoading] = useState(false);
 	const [databasePreviewError, setDatabasePreviewError] = useState<string | null>(null);
@@ -543,6 +517,16 @@ export function StorageSection() {
 		}
 	};
 
+	// A retention job can finish while this page is open or away. Refresh only the
+	// database category; cleanup itself never depends on having scanned it first.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: handleScan is the current render's handler; the token is the trigger
+	useEffect(() => {
+		if (!refreshToken || refreshedToken.current === refreshToken) return;
+		if (!storageHealthReady || !scanSupported || categoryRunning("database")) return;
+		refreshedToken.current = refreshToken;
+		void handleScan(["database"]);
+	}, [refreshToken, storageHealthReady, scanSupported, categoryJobs]);
+
 	const handleCancelScan = async (categories?: StorageCategoryKey[]) => {
 		try {
 			const res = await api.cancelStorageScan(categories);
@@ -678,7 +662,7 @@ export function StorageSection() {
 		}
 	};
 
-	const openDatabasePreview = (target: DatabaseCleanupTarget) => {
+	const openDatabasePreview = (target: SessionCleanupTarget) => {
 		if (!storageHealthReady || !databasePreviewCapability.supported) {
 			notifications.show({ color: "yellow", message: databasePreviewDisabledReason });
 			return;
@@ -687,9 +671,7 @@ export function StorageSection() {
 		setDatabasePreview(null);
 		setDatabasePreviewError(null);
 		if (target === "staleSessions") {
-			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.staleSessions);
-		} else if (target === "toolCallPayloads") {
-			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.toolCallPayloads);
+			setDatabaseOlderThanDays(STALE_SESSION_DEFAULT_DAYS);
 		}
 	};
 
@@ -717,7 +699,7 @@ export function StorageSection() {
 				target: databaseTarget,
 				olderThanDays: databaseTarget === "archivedSessions" ? undefined : databaseOlderThanDays,
 			});
-			const cleanedCount = getDatabaseCleanupCount(result);
+			const cleanedCount = result.counts.sessions;
 			if (!result.changed || cleanedCount === 0) {
 				notifications.show({
 					color: "blue",
@@ -862,25 +844,15 @@ export function StorageSection() {
 						days: databaseDetails.cleanupCandidates.staleSessions.retentionDays ?? 90,
 					}),
 				},
-				{
-					target: "toolCallPayloads" as const,
-					summary: databaseDetails.cleanupCandidates.toolCallPayloads,
-					description: t("storageDatabaseToolCallPayloadsDesc", {
-						days: databaseDetails.cleanupCandidates.toolCallPayloads.retentionDays ?? 180,
-					}),
-				},
 			]
 		: [];
 
-	const retentionOptions =
-		databaseTarget && databaseTarget !== "archivedSessions"
-			? DATABASE_TARGET_DAY_OPTIONS[databaseTarget].map((days) => ({
-					value: days,
-					label: t("storageDatabaseOlderThanDaysOption", { days }),
-				}))
-			: [];
+	const retentionOptions = STALE_SESSION_DAY_OPTIONS.map((days) => ({
+		value: days,
+		label: t("storageDatabaseOlderThanDaysOption", { days }),
+	}));
 
-	const databasePreviewCount = databasePreview ? getDatabaseCleanupCount(databasePreview) : 0;
+	const databasePreviewCount = databasePreview?.counts.sessions ?? 0;
 	const databaseCleanupCapability = databaseTarget
 		? databaseCleanupCapabilities[databaseTarget]
 		: undefined;
@@ -1368,77 +1340,81 @@ export function StorageSection() {
 															)}
 														</Stack>
 													)}
-													{databaseUsageCategories.length > 0 && <Divider />}
-													<Stack gap="xs">
-														{databaseRows.map((row) => (
-															<Paper
-																key={row.target}
-																p="xs"
-																radius="sm"
-																bg={NESTED_ROW_BG}
-																withBorder
-															>
-																<Group
-																	justify="space-between"
-																	align="flex-start"
-																	gap="sm"
-																	wrap="nowrap"
-																>
-																	<div style={{ flex: 1, minWidth: 0 }}>
-																		<Group gap="xs" wrap="wrap">
-																			<Text size="sm" fw={500}>
-																				{getDatabaseTargetLabel(row.target)}
-																			</Text>
-																			<Badge size="xs" variant="light" color="blue">
-																				{formatBytes(row.summary.approxBytes)}
-																			</Badge>
-																		</Group>
-																		<Text size="xs" c="dimmed">
-																			{row.description}
-																		</Text>
-																		<Group gap="xs" mt={4} wrap="wrap">
-																			<Text size="xs" c="dimmed">
-																				{row.target === "toolCallPayloads"
-																					? t("storageDatabaseSummaryToolCalls", {
-																							count: row.summary.count,
-																						})
-																					: t("storageDatabaseSummarySessions", {
-																							count: row.summary.count,
-																						})}
-																			</Text>
-																			{row.summary.oldestAt && (
-																				<Text size="xs" c="dimmed">
-																					{t("storageDatabaseSummaryOldest", {
-																						time: formatDateTime(row.summary.oldestAt),
-																					})}
-																				</Text>
-																			)}
-																			{row.summary.blockedCount > 0 && (
-																				<Text size="xs" c="yellow">
-																					{t("storageDatabaseSummaryBlocked", {
-																						count: row.summary.blockedCount,
-																					})}
-																				</Text>
-																			)}
-																		</Group>
-																	</div>
-																	<Button
-																		size="xs"
-																		variant="light"
-																		onClick={() => openDatabasePreview(row.target)}
-																		disabled={!databasePreviewCapability.supported}
-																		title={
-																			!databasePreviewCapability.supported
-																				? databasePreviewDisabledReason
-																				: undefined
-																		}
-																	>
-																		{t("storageDatabasePreview")}
-																	</Button>
-																</Group>
-															</Paper>
-														))}
-													</Stack>
+													<Accordion variant="default">
+														<Accordion.Item value="legacy-sessions">
+															<Accordion.Control>
+																{t("storageRetentionSessionMaintenance")}
+															</Accordion.Control>
+															<Accordion.Panel>
+																<Stack gap="xs">
+																	{databaseRows.map((row) => (
+																		<Paper
+																			key={row.target}
+																			p="xs"
+																			radius="sm"
+																			bg={NESTED_ROW_BG}
+																			withBorder
+																		>
+																			<Group
+																				justify="space-between"
+																				align="flex-start"
+																				gap="sm"
+																				wrap="nowrap"
+																			>
+																				<div style={{ flex: 1, minWidth: 0 }}>
+																					<Group gap="xs" wrap="wrap">
+																						<Text size="sm" fw={500}>
+																							{getDatabaseTargetLabel(row.target)}
+																						</Text>
+																						<Badge size="xs" variant="light" color="blue">
+																							{formatBytes(row.summary.approxBytes)}
+																						</Badge>
+																					</Group>
+																					<Text size="xs" c="dimmed">
+																						{row.description}
+																					</Text>
+																					<Group gap="xs" mt={4} wrap="wrap">
+																						<Text size="xs" c="dimmed">
+																							{t("storageDatabaseSummarySessions", {
+																								count: row.summary.count,
+																							})}
+																						</Text>
+																						{row.summary.oldestAt && (
+																							<Text size="xs" c="dimmed">
+																								{t("storageDatabaseSummaryOldest", {
+																									time: formatDateTime(row.summary.oldestAt),
+																								})}
+																							</Text>
+																						)}
+																						{row.summary.blockedCount > 0 && (
+																							<Text size="xs" c="yellow">
+																								{t("storageDatabaseSummaryBlocked", {
+																									count: row.summary.blockedCount,
+																								})}
+																							</Text>
+																						)}
+																					</Group>
+																				</div>
+																				<Button
+																					size="xs"
+																					variant="light"
+																					onClick={() => openDatabasePreview(row.target)}
+																					disabled={!databasePreviewCapability.supported}
+																					title={
+																						!databasePreviewCapability.supported
+																							? databasePreviewDisabledReason
+																							: undefined
+																					}
+																				>
+																					{t("storageDatabasePreview")}
+																				</Button>
+																			</Group>
+																		</Paper>
+																	))}
+																</Stack>
+															</Accordion.Panel>
+														</Accordion.Item>
+													</Accordion>
 												</>
 											)}
 										</Stack>
@@ -1464,7 +1440,7 @@ export function StorageSection() {
 				centered
 			>
 				<Stack gap="md">
-					{databaseTarget && databaseTarget !== "archivedSessions" && (
+					{databaseTarget === "staleSessions" && (
 						<Select
 							label={t("storageDatabaseOlderThanDays")}
 							data={retentionOptions}
@@ -1538,47 +1514,37 @@ export function StorageSection() {
 							</Group>
 
 							<Group gap="xs" wrap="wrap">
-								{databasePreview.target === "toolCallPayloads" ? (
+								<Text size="sm" c="dimmed">
+									{t("storageDatabaseCountsSessions", {
+										count: databasePreview.counts.sessions,
+									})}
+								</Text>
+								<Text size="sm" c="dimmed">
+									{t("storageDatabaseCountsNarrators", {
+										count: databasePreview.counts.narrators,
+									})}
+								</Text>
+								<Text size="sm" c="dimmed">
+									{t("storageDatabaseCountsMessages", {
+										count: databasePreview.counts.messages,
+									})}
+								</Text>
+								<Text size="sm" c="dimmed">
+									{t("storageDatabaseCountsToolCalls", {
+										count: databasePreview.counts.toolCalls,
+									})}
+								</Text>
+								<Text size="sm" c="dimmed">
+									{t("storageDatabaseCountsApiRequests", {
+										count: databasePreview.counts.apiRequests,
+									})}
+								</Text>
+								{databasePreview.counts.descendantNarrators > 0 && (
 									<Text size="sm" c="dimmed">
-										{t("storageDatabaseCountsToolCallPayloads", {
-											count: databasePreview.counts.toolCalls,
+										{t("storageDatabaseCountsDescendants", {
+											count: databasePreview.counts.descendantNarrators,
 										})}
 									</Text>
-								) : (
-									<>
-										<Text size="sm" c="dimmed">
-											{t("storageDatabaseCountsSessions", {
-												count: databasePreview.counts.sessions,
-											})}
-										</Text>
-										<Text size="sm" c="dimmed">
-											{t("storageDatabaseCountsNarrators", {
-												count: databasePreview.counts.narrators,
-											})}
-										</Text>
-										<Text size="sm" c="dimmed">
-											{t("storageDatabaseCountsMessages", {
-												count: databasePreview.counts.messages,
-											})}
-										</Text>
-										<Text size="sm" c="dimmed">
-											{t("storageDatabaseCountsToolCalls", {
-												count: databasePreview.counts.toolCalls,
-											})}
-										</Text>
-										<Text size="sm" c="dimmed">
-											{t("storageDatabaseCountsApiRequests", {
-												count: databasePreview.counts.apiRequests,
-											})}
-										</Text>
-										{databasePreview.counts.descendantNarrators > 0 && (
-											<Text size="sm" c="dimmed">
-												{t("storageDatabaseCountsDescendants", {
-													count: databasePreview.counts.descendantNarrators,
-												})}
-											</Text>
-										)}
-									</>
 								)}
 							</Group>
 
@@ -1587,9 +1553,7 @@ export function StorageSection() {
 							{databasePreview.samples.length > 0 ? (
 								<Stack gap="xs">
 									<Text fw={500} size="sm">
-										{databasePreview.target === "toolCallPayloads"
-											? t("storageDatabaseSampleToolCalls")
-											: t("storageDatabaseSampleSessions")}
+										{t("storageDatabaseSampleSessions")}
 									</Text>
 									<Stack gap="xs" style={{ maxHeight: 260, overflow: "auto" }}>
 										{databasePreview.samples.map((sample) =>
@@ -1627,31 +1591,6 @@ export function StorageSection() {
 														</div>
 														<Badge variant="light" color="blue">
 															{formatBytes(sample.approxBytes ?? 0)}
-														</Badge>
-													</Group>
-												</Paper>
-											) : isApiRequestSample(sample) ? (
-												<Paper key={sample.id} p="xs" withBorder>
-													<Group justify="space-between" align="flex-start" wrap="nowrap">
-														<div style={{ flex: 1, minWidth: 0 }}>
-															<Text size="sm" fw={500} truncate>
-																{sample.narratorTitle || sample.narratorId || sample.id.slice(0, 8)}
-															</Text>
-															<Group gap="xs" wrap="wrap" mt={4}>
-																<Text size="xs" c="dimmed">
-																	{t("storageDatabaseCreatedAt", {
-																		time: formatDateTime(sample.createdAt),
-																	})}
-																</Text>
-															</Group>
-															{fallbackDiagnosticMessage(sample) && (
-																<Text size="xs" c="orange" mt={4}>
-																	{fallbackDiagnosticMessage(sample)}
-																</Text>
-															)}
-														</div>
-														<Badge variant="light" color="blue">
-															{formatBytes(sample.approxBytes)}
 														</Badge>
 													</Group>
 												</Paper>
@@ -1714,18 +1653,8 @@ export function StorageSection() {
 		</>
 	);
 
-	function getDatabaseTargetLabel(target: DatabaseCleanupTarget): string {
+	function getDatabaseTargetLabel(target: SessionCleanupTarget): string {
 		return t(`storageDatabaseTarget_${target}`);
-	}
-
-	function getDatabaseCleanupCount(
-		result: DatabaseCleanupPreviewResult | DatabaseCleanupExecutionResult,
-	): number {
-		// Tool-call payloads are counted by ROW, not by session: the rows survive and only
-		// their payload columns are cleared, so `counts.sessions` would always be 0 and the
-		// confirm button would look like there was nothing to do.
-		if (result.target === "toolCallPayloads") return result.counts.toolCalls;
-		return result.counts.sessions;
 	}
 
 	function formatBlockedReason(item: DatabaseCleanupBlockedItem): string {

@@ -1,6 +1,10 @@
 import { basename, isAbsolute, normalize, parse } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import { isCompiledRuntime } from "../lib/runtime-target";
+
+/** Private subprocess entry; index.ts dispatches before importing the application. */
+export const FILE_CHANGE_PHYSICAL_AUDIT_WORKER_FLAG = "--file-change-physical-audit-worker";
 
 export const FILE_CHANGE_PHYSICAL_AUDIT_LIMITS = Object.freeze({
 	blobBytes: FILE_CHANGE_LIMITS.blobBytes,
@@ -218,13 +222,18 @@ function clearWaiting(job: Job): void {
 	if (job.abort) job.signal?.removeEventListener("abort", job.abort);
 }
 async function runWorker(job: Job): Promise<FileChangePhysicalAuditSummary> {
-	// Source-only internal maintenance step. Never accidentally launch a compiled
-	// NarraFork application binary as a child server. Bundled worker packaging is not wired.
-	if (
-		!/^bun(?:-debug)?(?:\.exe)?$/.test(basename(process.execPath)) ||
-		import.meta.url.includes("$bunfs")
-	)
+	const compiled = isCompiledRuntime();
+	if (!compiled && !/^bun(?:-debug)?(?:\.exe)?$/.test(basename(process.execPath)))
 		return stopped("unsupported_runtime");
+	// The compiled app dispatches this private flag before importing main/DB/HTTP.
+	// Keep a separate OS process: closing SQLite FDs or forced cancellation must
+	// never affect the server's locks and connections.
+	const command = compiled
+		? [process.execPath, FILE_CHANGE_PHYSICAL_AUDIT_WORKER_FLAG]
+		: [
+				process.execPath,
+				fileURLToPath(new URL("./file-change-physical-audit-worker.ts", import.meta.url)),
+			];
 	return new Promise((resolve) => {
 		let result: FileChangePhysicalAuditSummary | undefined;
 		let reason: string | undefined;
@@ -251,48 +260,42 @@ async function runWorker(job: Job): Promise<FileChangePhysicalAuditSummary> {
 			}, 50);
 		};
 		try {
-			worker = Bun.spawn(
-				[
-					process.execPath,
-					fileURLToPath(new URL("./file-change-physical-audit-worker.ts", import.meta.url)),
-				],
-				{
-					stdin: "ignore",
-					stdout: "ignore",
-					stderr: "ignore",
-					windowsHide: true,
-					ipc(message: unknown) {
-						// Private IPC carries bounded JSON, never stdout, raw bodies or dumped arguments.
-						if (
-							typeof message !== "string" ||
-							Buffer.byteLength(message) > job.request.budget.summaryBytes
+			worker = Bun.spawn(command, {
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+				windowsHide: true,
+				ipc(message: unknown) {
+					// Private IPC carries bounded JSON, never stdout, raw bodies or dumped arguments.
+					if (
+						typeof message !== "string" ||
+						Buffer.byteLength(message) > job.request.budget.summaryBytes
+					) {
+						stop("worker_protocol");
+						return;
+					}
+					try {
+						const data = JSON.parse(message);
+						if (data.type === "summary") result = data.value;
+						else if (
+							data.type === "progress" &&
+							Buffer.byteLength(message) <= LIMITS.progressBytes
 						) {
-							stop("worker_protocol");
-							return;
-						}
-						try {
-							const data = JSON.parse(message);
-							if (data.type === "summary") result = data.value;
-							else if (
-								data.type === "progress" &&
-								Buffer.byteLength(message) <= LIMITS.progressBytes
-							) {
-								progress = data.value;
-								if (performance.now() - lastProgress >= LIMITS.progressIntervalMs) {
-									lastProgress = performance.now();
-									try {
-										job.onProgress?.({ ...data.value });
-									} catch {
-										/* advisory only */
-									}
+							progress = data.value;
+							if (performance.now() - lastProgress >= LIMITS.progressIntervalMs) {
+								lastProgress = performance.now();
+								try {
+									job.onProgress?.({ ...data.value });
+								} catch {
+									/* advisory only */
 								}
-							} else stop("worker_protocol");
-						} catch {
-							stop("worker_protocol");
-						}
-					},
+							}
+						} else stop("worker_protocol");
+					} catch {
+						stop("worker_protocol");
+					}
 				},
-			);
+			});
 		} catch {
 			resolve(stopped("worker_start_failed"));
 			return;

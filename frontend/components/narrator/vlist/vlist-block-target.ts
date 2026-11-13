@@ -53,6 +53,7 @@ const NON_INTERACTIVE_KINDS = new Set<VListElementKind>([
 
 /** Single-message content kinds whose blockIndex is encoded as a `-b{n}` suffix. */
 const BLOCK_INDEXED_KINDS = new Set<VListElementKind>([
+	"auxiliary-content",
 	"markdown",
 	"reasoning",
 	"reasoning-steps",

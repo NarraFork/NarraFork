@@ -9,6 +9,7 @@
  */
 
 import type { GitIdentity } from "@frontend/lib/api/auth";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
@@ -46,7 +47,7 @@ export function useGitIdentities(enabled = true) {
 		queryKey: IDENTITIES_KEY,
 		queryFn: () => api.listGitIdentities(),
 		staleTime: 30_000,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 	});
 }
 
@@ -55,7 +56,7 @@ export function useNarratorGitIdentity(narratorId: string | null) {
 	return useQuery({
 		queryKey: narratorGitIdentityQueryKey(narratorId ?? ""),
 		queryFn: () => api.getNarratorGitIdentity(narratorId as string),
-		enabled: !!narratorId,
+		enabled: !REMOTE_BUILD && !!narratorId,
 		staleTime: 30_000,
 	});
 }
@@ -119,7 +120,7 @@ export function useFolderGitIdentity(folderId: string | null) {
 	return useQuery({
 		queryKey: folderGitIdentityQueryKey(folderId ?? ""),
 		queryFn: () => api.getFolderGitIdentity(folderId as string),
-		enabled: !!folderId,
+		enabled: !REMOTE_BUILD && !!folderId,
 		staleTime: 30_000,
 	});
 }

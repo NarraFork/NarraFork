@@ -83,14 +83,39 @@ interface Task {
 	onAbort?: () => void;
 }
 
-const state = hotSafe("narrafork.outline.editTextWorker", () => ({
-	worker: null as Worker | null,
-	starting: null as Promise<Worker> | null,
-	queue: [] as Task[],
-	active: null as Task | null,
-	idle: null as ReturnType<typeof setTimeout> | null,
-	nextId: 0,
-}));
+interface ChannelState {
+	worker: Worker | null;
+	starting: Promise<Worker> | null;
+	queue: Task[];
+	active: Task | null;
+	idle: ReturnType<typeof setTimeout> | null;
+	nextId: number;
+}
+
+export interface EditTextChannelLimits {
+	inlineBytes: number;
+	maxBytes: number;
+	timeoutMs: number;
+	maxQueued: number;
+	idleMs: number;
+	startMs: number;
+}
+
+/**
+ * The background channel (outline P2 PR 12b): a worker of its own for large batch work (the
+ * import of Dynamic Spec files), so a file of a megabyte never holds up an agent's `OutlineEdit`
+ * on the interactive worker above, and is never refused for the interactive size limit. One job
+ * at a time, few waiting; the same rules otherwise (a job that runs too long ends its worker,
+ * nothing ever falls back to the caller's thread past the inline size).
+ */
+export const OUTLINE_BACKGROUND_TEXT_LIMITS = {
+	inlineBytes: 1024,
+	maxBytes: 1024 * 1024,
+	timeoutMs: 30_000,
+	maxQueued: 2,
+	idleMs: 30_000,
+	startMs: 5_000,
+} as const;
 
 function timeoutError(ms: number): OutlineEditTextError {
 	return new OutlineEditTextError("OUTLINE_TEXT_TIMEOUT", OUTLINE_TOOL_TEXT.textTimeout(ms), 504);
@@ -100,131 +125,221 @@ function abortError(): OutlineEditTextError {
 	return new OutlineEditTextError("OUTLINE_TEXT_FAILED", OUTLINE_TOOL_TEXT.textCancelled, 499);
 }
 
-function stopWorker(): void {
-	const worker = state.worker;
-	state.worker = null;
-	state.starting = null;
-	if (worker) void worker.terminate();
+export interface EditTextChannel {
+	run<J extends EditTextJob>(job: J, options?: EditTextRunOptions): Promise<EditTextResult<J>>;
+	stop(): void;
 }
 
-function settle(task: Task, error: Error | null, value?: unknown): void {
-	if (task.timer) clearTimeout(task.timer);
-	if (task.onAbort) task.signal?.removeEventListener("abort", task.onAbort);
-	if (state.active === task) state.active = null;
-	if (error) task.reject(error);
-	else task.resolve(value);
-	pump();
-}
+/** How a channel starts its worker: `connectCompiledWorker` on the edit-text worker entry. */
+export type EditTextWorkerConnect = (options: {
+	signal: AbortSignal;
+}) => Promise<{ worker: Worker }>;
 
-function onMessage(message: { id?: number; result?: unknown; error?: string }): void {
-	const task = state.active;
-	if (!task || message.id !== task.id) return;
-	if (typeof message.error === "string") {
-		settle(task, new OutlineEditTextError("OUTLINE_TEXT_FAILED", message.error, 500));
-	} else settle(task, null, message.result);
-}
-
-function onDeath(worker: Worker, error: Error): void {
-	if (state.worker !== worker) return;
-	state.worker = null;
-	state.starting = null;
-	const task = state.active;
-	if (task) settle(task, new OutlineEditTextError("OUTLINE_TEXT_FAILED", error.message, 500));
-}
-
-async function ensureWorker(): Promise<Worker> {
-	if (state.worker) return state.worker;
-	if (!state.starting) {
-		const starting = connectCompiledWorker(
-			compiledWorkerSpecifiers(
-				"services/outline/edit-text-worker.ts",
-				"./edit-text-worker.ts",
-				import.meta.url,
-			),
-			{ signal: AbortSignal.timeout(OUTLINE_EDIT_TEXT_LIMITS.startMs) },
-		).then(({ worker }) => {
-			if (state.starting !== starting) {
-				void worker.terminate();
-				throw new Error("outline text worker was replaced while starting");
-			}
-			state.worker = worker;
-			state.starting = null;
-			worker.unref();
-			worker.on("message", onMessage);
-			worker.on("error", (error: unknown) =>
-				onDeath(worker, error instanceof Error ? error : new Error(String(error))),
-			);
-			worker.on("exit", (code) => onDeath(worker, new Error(`worker exited (${code})`)));
-			return worker;
-		});
-		starting.catch(() => {
-			if (state.starting === starting) state.starting = null;
-		});
-		state.starting = starting;
-	}
-	return await state.starting;
-}
-
-function pump(): void {
-	if (state.active) return;
-	const task = state.queue.shift();
-	if (!task) {
-		if (state.worker && !state.idle) {
-			state.idle = setTimeout(() => {
-				state.idle = null;
-				if (!state.active && state.queue.length === 0) stopWorker();
-			}, OUTLINE_EDIT_TEXT_LIMITS.idleMs);
-			state.idle.unref?.();
-		}
-		return;
-	}
-	if (state.idle) {
-		clearTimeout(state.idle);
-		state.idle = null;
-	}
-	if (task.signal?.aborted) {
-		task.reject(abortError());
-		pump();
-		return;
-	}
-	state.active = task;
-	const started = performance.now();
-	// The job runs synchronously on the worker: giving up on it means ending the thread.
-	const abandon = (error: Error) => {
-		if (state.active !== task) return;
-		stopWorker();
-		settle(task, error);
-	};
-	task.timer = setTimeout(() => {
-		logger.warn("Outline edit text job timed out", {
-			bytes: editTextJobBytes(task.job),
-			elapsedMs: Math.round(performance.now() - started),
-		});
-		abandon(timeoutError(task.timeoutMs));
-	}, task.timeoutMs);
-	if (task.signal) {
-		task.onAbort = () => abandon(abortError());
-		task.signal.addEventListener("abort", task.onAbort, { once: true });
-	}
-	ensureWorker().then(
-		(worker) => {
-			if (state.active !== task) return;
-			const request: EditTextWorkerRequest = { action: "run", id: task.id, job: task.job };
-			worker.postMessage(request);
-		},
-		(error: unknown) => {
-			if (state.active !== task) return;
-			settle(
-				task,
-				new OutlineEditTextError(
-					"OUTLINE_TEXT_FAILED",
-					error instanceof Error ? error.message : String(error),
-					500,
-				),
-			);
-		},
+function connectEditTextWorker(options: { signal: AbortSignal }): Promise<{ worker: Worker }> {
+	return connectCompiledWorker(
+		compiledWorkerSpecifiers(
+			"services/outline/edit-text-worker.ts",
+			"./edit-text-worker.ts",
+			import.meta.url,
+		),
+		options,
 	);
 }
+
+/**
+ * A channel of its own, for fault-injection tests: `connect` stands for the worker start (one that
+ * rejects, never answers, or hands a worker that crashes or hangs). A job such a channel cannot
+ * run on its worker fails; nothing ever runs it on the caller's thread past the inline size.
+ */
+export function createEditTextChannel(
+	name: string,
+	limits: EditTextChannelLimits,
+	connect: EditTextWorkerConnect = connectEditTextWorker,
+): EditTextChannel {
+	return createChannel(name, limits, connect);
+}
+
+function createChannel(
+	name: string,
+	limits: EditTextChannelLimits,
+	connect: EditTextWorkerConnect = connectEditTextWorker,
+): EditTextChannel {
+	const state = hotSafe<ChannelState>(`narrafork.outline.editTextWorker${name}`, () => ({
+		worker: null,
+		starting: null,
+		queue: [],
+		active: null,
+		idle: null,
+		nextId: 0,
+	}));
+
+	function stopWorker(): void {
+		const worker = state.worker;
+		state.worker = null;
+		state.starting = null;
+		if (worker) void worker.terminate();
+	}
+
+	function settle(task: Task, error: Error | null, value?: unknown): void {
+		if (task.timer) clearTimeout(task.timer);
+		if (task.onAbort) task.signal?.removeEventListener("abort", task.onAbort);
+		if (state.active === task) state.active = null;
+		if (error) task.reject(error);
+		else task.resolve(value);
+		pump();
+	}
+
+	function onMessage(message: { id?: number; result?: unknown; error?: string }): void {
+		const task = state.active;
+		if (!task || message.id !== task.id) return;
+		if (typeof message.error === "string") {
+			settle(task, new OutlineEditTextError("OUTLINE_TEXT_FAILED", message.error, 500));
+		} else settle(task, null, message.result);
+	}
+
+	function onDeath(worker: Worker, error: Error): void {
+		if (state.worker !== worker) return;
+		state.worker = null;
+		state.starting = null;
+		const task = state.active;
+		if (task) settle(task, new OutlineEditTextError("OUTLINE_TEXT_FAILED", error.message, 500));
+	}
+
+	async function ensureWorker(): Promise<Worker> {
+		if (state.worker) return state.worker;
+		if (!state.starting) {
+			const starting = connect({ signal: AbortSignal.timeout(limits.startMs) }).then(
+				({ worker }) => {
+					if (state.starting !== starting) {
+						void worker.terminate();
+						throw new Error("outline text worker was replaced while starting");
+					}
+					state.worker = worker;
+					state.starting = null;
+					worker.unref();
+					worker.on("message", onMessage);
+					worker.on("error", (error: unknown) =>
+						onDeath(worker, error instanceof Error ? error : new Error(String(error))),
+					);
+					worker.on("exit", (code) => onDeath(worker, new Error(`worker exited (${code})`)));
+					return worker;
+				},
+			);
+			starting.catch(() => {
+				if (state.starting === starting) state.starting = null;
+			});
+			state.starting = starting;
+		}
+		return await state.starting;
+	}
+
+	function pump(): void {
+		if (state.active) return;
+		const task = state.queue.shift();
+		if (!task) {
+			if (state.worker && !state.idle) {
+				state.idle = setTimeout(() => {
+					state.idle = null;
+					if (!state.active && state.queue.length === 0) stopWorker();
+				}, limits.idleMs);
+				state.idle.unref?.();
+			}
+			return;
+		}
+		if (state.idle) {
+			clearTimeout(state.idle);
+			state.idle = null;
+		}
+		if (task.signal?.aborted) {
+			task.reject(abortError());
+			pump();
+			return;
+		}
+		state.active = task;
+		const started = performance.now();
+		// The job runs synchronously on the worker: giving up on it means ending the thread.
+		const abandon = (error: Error) => {
+			if (state.active !== task) return;
+			stopWorker();
+			settle(task, error);
+		};
+		task.timer = setTimeout(() => {
+			logger.warn("Outline edit text job timed out", {
+				channel: name === "" ? "interactive" : name.replace(/^\./, ""),
+				bytes: editTextJobBytes(task.job),
+				elapsedMs: Math.round(performance.now() - started),
+			});
+			abandon(timeoutError(task.timeoutMs));
+		}, task.timeoutMs);
+		if (task.signal) {
+			task.onAbort = () => abandon(abortError());
+			task.signal.addEventListener("abort", task.onAbort, { once: true });
+		}
+		ensureWorker().then(
+			(worker) => {
+				if (state.active !== task) return;
+				const request: EditTextWorkerRequest = { action: "run", id: task.id, job: task.job };
+				worker.postMessage(request);
+			},
+			(error: unknown) => {
+				if (state.active !== task) return;
+				settle(
+					task,
+					new OutlineEditTextError(
+						"OUTLINE_TEXT_FAILED",
+						error instanceof Error ? error.message : String(error),
+						500,
+					),
+				);
+			},
+		);
+	}
+
+	async function run<J extends EditTextJob>(
+		job: J,
+		options: EditTextRunOptions = {},
+	): Promise<EditTextResult<J>> {
+		const bytes = editTextJobBytes(job);
+		if (bytes > limits.maxBytes) {
+			throw new OutlineEditTextError(
+				"OUTLINE_TEXT_TOO_LARGE",
+				OUTLINE_TOOL_TEXT.textTooLarge(bytes, limits.maxBytes),
+				413,
+			);
+		}
+		options.signal?.throwIfAborted();
+		if (options.worker === false || (options.worker === undefined && bytes <= limits.inlineBytes)) {
+			return runEditTextJob(job);
+		}
+		if (state.queue.length >= limits.maxQueued) {
+			throw new OutlineEditTextError("OUTLINE_TEXT_BUSY", OUTLINE_TOOL_TEXT.textBusy, 503);
+		}
+		return await new Promise<EditTextResult<J>>((resolve, reject) => {
+			state.queue.push({
+				id: ++state.nextId,
+				job,
+				timeoutMs: options.timeoutMs ?? limits.timeoutMs,
+				signal: options.signal,
+				resolve: resolve as (value: unknown) => void,
+				reject,
+			});
+			pump();
+		});
+	}
+
+	return {
+		run,
+		stop() {
+			const task = state.active;
+			stopWorker();
+			if (task) settle(task, abortError());
+		},
+	};
+}
+
+// The interactive channel keeps the state key it always had (hot reload finds its worker).
+const interactive = createChannel("", OUTLINE_EDIT_TEXT_LIMITS);
+const background = createChannel(".background", OUTLINE_BACKGROUND_TEXT_LIMITS);
 
 /**
  * Run a job inline or on the worker (see the module header). Rejects with
@@ -235,40 +350,23 @@ export async function processEditText<J extends EditTextJob>(
 	job: J,
 	options: EditTextRunOptions = {},
 ): Promise<EditTextResult<J>> {
-	const bytes = editTextJobBytes(job);
-	if (bytes > OUTLINE_EDIT_TEXT_LIMITS.maxBytes) {
-		throw new OutlineEditTextError(
-			"OUTLINE_TEXT_TOO_LARGE",
-			OUTLINE_TOOL_TEXT.textTooLarge(bytes, OUTLINE_EDIT_TEXT_LIMITS.maxBytes),
-			413,
-		);
-	}
-	options.signal?.throwIfAborted();
-	if (
-		options.worker === false ||
-		(options.worker === undefined && bytes <= OUTLINE_EDIT_TEXT_LIMITS.inlineBytes)
-	) {
-		return runEditTextJob(job);
-	}
-	if (state.queue.length >= OUTLINE_EDIT_TEXT_LIMITS.maxQueued) {
-		throw new OutlineEditTextError("OUTLINE_TEXT_BUSY", OUTLINE_TOOL_TEXT.textBusy, 503);
-	}
-	return await new Promise<EditTextResult<J>>((resolve, reject) => {
-		state.queue.push({
-			id: ++state.nextId,
-			job,
-			timeoutMs: options.timeoutMs ?? OUTLINE_EDIT_TEXT_LIMITS.timeoutMs,
-			signal: options.signal,
-			resolve: resolve as (value: unknown) => void,
-			reject,
-		});
-		pump();
-	});
+	return await interactive.run(job, options);
 }
 
-/** Stop the worker now (tests, shutdown). Jobs in flight fail. */
+/**
+ * Run a job on the background channel ({@link OUTLINE_BACKGROUND_TEXT_LIMITS}): batch work that
+ * must not wait on, or hold up, the interactive worker. Rejects as {@link processEditText} does;
+ * a failure is the caller's to retry later, never to run on its own thread.
+ */
+export async function processBackgroundText<J extends EditTextJob>(
+	job: J,
+	options: EditTextRunOptions = {},
+): Promise<EditTextResult<J>> {
+	return await background.run(job, options);
+}
+
+/** Stop the workers now (tests, shutdown). Jobs in flight fail. */
 export function stopEditTextWorker(): void {
-	const task = state.active;
-	stopWorker();
-	if (task) settle(task, abortError());
+	interactive.stop();
+	background.stop();
 }

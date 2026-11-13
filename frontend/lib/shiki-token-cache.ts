@@ -29,9 +29,7 @@
  * injection seam `createShikiThemeEnsurer` uses in shiki-loader.ts.
  */
 
-import type { BundledLanguage } from "shiki";
-import { getAppBase } from "./base-path";
-import { getCachedShiki, loadShiki } from "./shiki-loader";
+import { getAssetBase } from "./base-path";
 import { createShikiTokenWorkerLoader } from "./shiki-token-worker-client";
 import { normalizeThemedTokens, type ShikiToken } from "./shiki-token-worker-protocol";
 
@@ -219,15 +217,6 @@ export function createShikiTokenCache(
 	};
 }
 
-/** Main-thread loader: the shared fine-grained Shiki core. Fallback only in a browser. */
-const loadShikiTokensOnMainThread: ShikiTokenLoader = async (code, lang, theme) => {
-	const cachedShiki = getCachedShiki();
-	const shiki = cachedShiki ?? (await loadShiki());
-	if (!shiki || !(lang in shiki.bundledLanguages)) return null;
-	const result = await shiki.codeToTokens(code, { lang: lang as BundledLanguage, theme });
-	return normalizeThemedTokens(result.tokens);
-};
-
 /**
  * A Vite build/dev page, not bun test or SSR-shaped tooling: there `Worker` may
  * exist (Bun has one) but a spawned module Worker would outlive the test process.
@@ -242,10 +231,9 @@ const loadShikiTokens: ShikiTokenLoader = canUseTokenWorker
 	? createShikiTokenWorkerLoader({
 			factory: () =>
 				new Worker(new URL("./shiki-token.worker.ts", import.meta.url), { type: "module" }),
-			appBase: () => new URL(getAppBase(), location.href).href,
-			fallback: loadShikiTokensOnMainThread,
+			appBase: () => new URL(getAssetBase(), location.href).href,
 		})
-	: loadShikiTokensOnMainThread;
+	: async () => null;
 
 const sharedCache = createShikiTokenCache(loadShikiTokens, {
 	// One re-render of the subscribed painters per frame, however many highlights landed.

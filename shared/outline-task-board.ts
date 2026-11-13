@@ -30,12 +30,17 @@ export const OUTLINE_TASK_BOARD_LIMITS = {
 	maxUsernameChars: 128,
 	/** Tasks one "seen" request (「新完成」, outline P2 PR 9b) names at most. */
 	seenPerRequest: 100,
+	/** Characters of the note a person adds when opening a session for a task (P2 PR 10c-1). */
+	maxOpenNoteChars: 4000,
+	/** Bytes of the request that opens a session for a task. */
+	openSessionBodyBytes: 64 * 1024,
 } as const;
 
 /**
  * Who does a task, as the board groups it:
- *   - `session`: a session holds it (its claim, lease running or lapsed), or it is an open task of
- *     the session's own space that nobody else is assigned (the session will take it up);
+ *   - `session`: a session holds it (its claim, lease running or lapsed), or it is handed to a
+ *     session by its id (`@agent:<session id>`, 「转交给会话」), or it is an open task of the
+ *     session's own space that nobody else is assigned (the session will take it up);
  *   - `human`: a person holds it, or it is assigned to a person (`@human:name`);
  *   - `agent`: assigned by name to an agent (`@agent:name`) that holds nothing yet;
  *   - `none`: nobody (an unassigned task of a project space).
@@ -92,6 +97,26 @@ export interface OutlineBoardTask {
 	 * reader has not seen on a board since (`POST /outline/tasks/seen`). Absent otherwise.
 	 */
 	newlyDone?: true;
+	/**
+	 * The reader may open a new session for it now (outline P2 PR 10c-1, D54): an open task of a
+	 * project space that is to do, that nobody holds, that does not wait, is not in a plan being
+	 * planned and is not assigned to a person; the reader may create sessions in the project and
+	 * write its space; the project has a working directory and the session runtime runs here.
+	 * Absent otherwise (the server decides again when asked).
+	 */
+	openSession?: true;
+	/**
+	 * 「有交接 · N 次」 (outline P2 PR 10c-2): how many times a session gave this open task of a
+	 * project space back unfinished, leaving a handoff under it (at most the newest 20 claim
+	 * generations are counted). Absent: never.
+	 */
+	handoffs?: number;
+	/**
+	 * With `openSession` and a handoff: the directory of the session that last held the task, as
+	 * a path inside the project's directory, when it still exists. The form offers to open the new
+	 * session there (`previousDirectory` of the request). Absent otherwise.
+	 */
+	previousDirectory?: string;
 }
 
 export interface OutlineBoardSpace {
@@ -170,7 +195,43 @@ export type OutlineBoardAssignTarget =
 	| { kind: "me" }
 	| { kind: "user"; username: string }
 	/** Back to the session: no assignee. */
-	| { kind: "session" };
+	| { kind: "session" }
+	/**
+	 * To a session by name (「转交给会话」, outline P2 PR 10a): `@agent:<its id>`. A root session of
+	 * the task's project the caller may read, that could do the task.
+	 */
+	| { kind: "narrator"; narratorId: string };
+
+/** A session a task may be handed to (`GET /outline/tasks/:blockId/transfer-sessions`). */
+export interface OutlineBoardTransferSession {
+	narratorId: string;
+	title: string | null;
+	/** A named session's handle: named sessions come first. */
+	handle?: string;
+	/** The caller may write the session: 「转交并开始」 is theirs to ask. */
+	canStart: boolean;
+}
+
+export interface OutlineBoardTransferSessionsResponse {
+	sessions: OutlineBoardTransferSession[];
+	/** The project has (or may have) more sessions that could take it than the board offers. */
+	truncated: boolean;
+	/** How many the board offers at most. */
+	limit: number;
+}
+
+/**
+ * Why 「转交并开始」 handed the task over but did not start the session: it is running; it is in
+ * plan mode; its continuation mode would not continue on this task; the task is finished; or the
+ * start declined all the same.
+ */
+export type OutlineBoardNotStarted =
+	| "finished"
+	| "busy"
+	| "plan_mode"
+	| "continuation_off"
+	| "continuation_mode"
+	| "not_started";
 
 /** A person's change to one task on the board. */
 export interface OutlineBoardTaskUpdateRequest {
@@ -180,8 +241,9 @@ export interface OutlineBoardTaskUpdateRequest {
 	status?: "todo" | "done" | "cancelled";
 	assign?: OutlineBoardAssignTarget;
 	/**
-	 * Start the session whose space holds the task right away when it is idle ("Reopen and
-	 * start", Q5). Only for a task of a session space.
+	 * Start a session on the task right away when it is idle. With `assign` to a session
+	 * (`narrator`): that session (「转交并开始」). Otherwise the session whose space holds the task
+	 * ("Reopen and start", Q5), only for a task of a session space.
 	 */
 	start?: boolean;
 }
@@ -190,7 +252,53 @@ export interface OutlineBoardTaskUpdateResponse {
 	/** The task's new `version_seq`, or null when nothing changed. */
 	versionSeq: number | null;
 	started: boolean;
+	/** 「转交并开始」: why the session was not started (the hand-over was written all the same). */
+	notStarted?: OutlineBoardNotStarted;
 }
+
+/** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
+export interface OutlineBoardOpenSessionRequest {
+	/** The task's `version_seq` as the board read it; a change since then is refused (409). */
+	baseVersionSeq: number;
+	/** The session's model; absent follows the default, as creating any session does. */
+	model?: string;
+	/** A working directory other than the project's. */
+	cwd?: string;
+	/**
+	 * Open the session in the directory of the session that last held the task (the server finds
+	 * it; refused with `no_directory` when there is none any more). `cwd` is then ignored.
+	 */
+	previousDirectory?: boolean;
+	/** The person's own note, added to the session's opening brief as it is. */
+	note?: string;
+}
+
+export interface OutlineBoardOpenSessionResponse {
+	narratorId: string;
+	/** The session's first turn was started. */
+	started: boolean;
+	/** The claim generation the session holds the task at. */
+	epoch: number;
+	/** The session a click just before this one opened: nothing new was created. */
+	already?: true;
+}
+
+/** Why a session was not opened (`details.reason` of the 409; `OUTLINE_TASK_SESSION_*` codes). */
+export type OutlineBoardOpenSessionRefusal =
+	| "finished"
+	| "planning"
+	| "prerequisites"
+	| "people"
+	| "confirmation"
+	| "assigned_to_person"
+	| "unavailable"
+	| "not_project_task"
+	| "no_directory"
+	| "in_progress"
+	| "claimed"
+	| "unreadable"
+	| "changed"
+	| "start_failed";
 
 /**
  * The reader saw these tasks marked 「新完成」 on a board, each at the version shown (outline P2

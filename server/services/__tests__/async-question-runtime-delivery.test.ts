@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -319,6 +319,16 @@ describe("async question receipt runtime adoption", () => {
 		expect(await drainAndPersistPendingInjections(active())).toBeNull();
 		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 	});
+	test("a person's answer taken up marks the run as a person's (outline P2 PR 10c-2); other drains do not", async () => {
+		const idle = active();
+		expect(await drainAndPersistPendingInjections(idle)).toBeNull();
+		expect(idle._runPersonActed).toBeUndefined();
+		const text = persistAnswer();
+		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
+		const running = active();
+		expect(await drainAndPersistPendingInjections(running)).toContain(text);
+		expect(running._runPersonActed).toBe(true);
+	});
 	test("receipt landing between the pre-pass drain and history read is not supplied twice", async () => {
 		const text = persistAnswer();
 		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
@@ -466,6 +476,7 @@ describe("async question receipt runtime adoption", () => {
 			.where(eq(narratorMessages.id, answer.record.answerMessageId))
 			.get();
 		if (!row) throw new Error("receipt missing");
+		row.contentJson = readTestMessageContent(sqlite, row.id);
 		const replay = [
 			{
 				...row,
@@ -561,6 +572,7 @@ describe("async question receipt runtime adoption", () => {
 			.where(eq(narratorMessages.id, answer.record.answerMessageId))
 			.get();
 		if (!row) throw new Error("receipt missing");
+		row.contentJson = readTestMessageContent(sqlite, row.id);
 		const { questionModelReceipts } = await import("../agent-runtime/history");
 		const receipts = questionModelReceipts([row]);
 		const evidence = await captureAwaitRequests(running, question.id, [1, 1], receipts);

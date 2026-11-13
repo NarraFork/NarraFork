@@ -39,7 +39,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 } from "../../../db/schema";
-import { runReadTask, WorkersUnavailableError } from "../../../lib/db-worker/pool";
+import { runReadTask } from "../../../lib/db-worker/pool";
 import {
 	SELECT_ROWS_MAX_ROWS,
 	type SelectRowsParams,
@@ -165,24 +165,20 @@ function inlineValues(text: string, params: Array<string | number>): unknown[][]
 	return sqlite.query(text).values(...params) as unknown[][];
 }
 
-/** A read on the worker pool; inline when there is no file to open there or no worker. */
+/** Large pages must stay off-thread; unavailable workers fail the read without re-reading inline. */
 async function workerValues(
 	text: string,
 	params: Array<string | number>,
 	maxRows: number,
 ): Promise<unknown[][]> {
 	const file = sqlite.filename;
-	if (!file || file === ":memory:" || sqlite.inTransaction) return inlineValues(text, params);
+	if (!file || file === ":memory:" || sqlite.inTransaction)
+		throw new Error("Large Outline page reads require a committed file-backed database");
 	const task: SelectRowsParams = { kind: "selectRows", sql: text, params, maxRows };
-	try {
-		const result = await runReadTask<SelectRowsResult>(file, task, {
-			timeoutMs: WORKER_TIMEOUT_MS,
-		});
-		return result.rows;
-	} catch (error) {
-		if (error instanceof WorkersUnavailableError) return inlineValues(text, params);
-		throw error;
-	}
+	const result = await runReadTask<SelectRowsResult>(file, task, {
+		timeoutMs: WORKER_TIMEOUT_MS,
+	});
+	return result.rows;
 }
 
 /**
@@ -638,24 +634,31 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return out.slice(0, query.limit);
 	},
 
-	async listLinksTo(targets, spaceIds, limit) {
+	async listLinksTo(targets, spaceIds, limit, options) {
 		const out: OutlineLinkRow[] = [];
 		if (targets.length === 0) return out;
-		const target = or(
-			...targets.map((t) =>
-				and(
-					eq(outlineLinks.targetKind, t.targetKind),
-					eq(outlineLinks.targetRef, t.targetRef),
-					t.spaceId === undefined ? undefined : eq(outlineLinks.spaceId, t.spaceId),
+		const kinds = options?.kinds;
+		if (kinds && kinds.length === 0) return out;
+		const target = and(
+			or(
+				...targets.map((t) =>
+					and(
+						eq(outlineLinks.targetKind, t.targetKind),
+						eq(outlineLinks.targetRef, t.targetRef),
+						t.spaceId === undefined ? undefined : eq(outlineLinks.spaceId, t.spaceId),
+					),
 				),
 			),
+			isNull(outlineLinks.toSeq),
+			kinds ? inArray(outlineLinks.kind, [...kinds]) : undefined,
 		);
-		for (const spaces of chunked(spaceIds)) {
+		// Any space: one read by the target index.
+		for (const spaces of spaceIds === null ? [null] : chunked(spaceIds)) {
 			if (out.length >= limit) break;
 			const rows = db
 				.select()
 				.from(outlineLinks)
-				.where(and(target, isNull(outlineLinks.toSeq), inArray(outlineLinks.spaceId, spaces)))
+				.where(spaces === null ? target : and(target, inArray(outlineLinks.spaceId, spaces)))
 				.orderBy(asc(outlineLinks.id))
 				.limit(limit - out.length)
 				.all();

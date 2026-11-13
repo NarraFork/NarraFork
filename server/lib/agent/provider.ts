@@ -37,6 +37,7 @@ import { CodexProvider } from "./codex-provider";
 import { buildCommandCodeProvider } from "./commandcode-provider";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
+import type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import { PooledProvider, usableProviderKeys, withProviderKey } from "./pooled-provider";
@@ -56,6 +57,7 @@ import { TokenDanceProvider } from "./tokendance-provider";
 // layer and bundled plugin code can use them without importing anything under
 // `server/`. Re-exported here to keep existing host import paths working.
 
+export type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
 export type {
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
@@ -283,6 +285,12 @@ export interface ProviderAdapter {
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */
 	generate(text: string, model: string): Promise<string>;
+
+	/**
+	 * Send one image generation request without replay/failover. Returns an unconsumed
+	 * response, including non-2xx; the caller owns streaming, limits, and error parsing.
+	 */
+	generateImage?(params: ImageGenerationRequest): Promise<ImageGenerationResponse>;
 
 	/**
 	 * Like generate() but also returns contextUsagePercentage if available.

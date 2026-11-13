@@ -27,6 +27,7 @@ import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
 import { readActivePluginThemeKey } from "@frontend/lib/plugin-theme-pref-store";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
+import "@frontend/styles/scrollbars.css";
 import "@frontend/styles/nav-collapsed.css";
 import "@frontend/styles/safe-area.css";
 // WCO (installed-PWA title-bar fusion): gated entirely on html[data-nf-wco].

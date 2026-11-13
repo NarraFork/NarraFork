@@ -20,6 +20,43 @@ describe("buildTailMeta", () => {
 		expect(meta.lastRealMessage).toEqual({ id: "a1", role: "assistant" });
 	});
 
+	for (const role of ["user", "assistant", "sys"]) {
+		it(`preserves the ${role} tail behind hidden epoch markers`, () => {
+			const messages: TailMetaMessage[] = [
+				{ id: "turn", role },
+				rowWithElements({ id: "epoch-1", role: "system" }, [{ type: "epoch" }]),
+				rowWithElements({ id: "epoch-2", role: "system" }, [{ type: "epoch" }]),
+				rowWithElements({ id: "error", role: "system" }, [{ type: "error" }]),
+				{ id: OPTS.streamingMsgId, role: "assistant" },
+			];
+			const meta = buildTailMeta(messages, OPTS);
+			// Retry sees the unanswered user; Continue retains assistant/injection tails.
+			expect(meta.lastRealMessage).toEqual({ id: "turn", role });
+			expect(meta.lastUserMessageId).toBe(role === "user" ? "turn" : undefined);
+		});
+	}
+
+	it("has no conversation tail when only an epoch marker exists", () => {
+		const meta = buildTailMeta(
+			[rowWithElements({ id: "epoch", role: "system" }, [{ type: "epoch" }])],
+			OPTS,
+		);
+		expect(meta.lastRealMessage).toBeNull();
+		expect(meta.lastUserMessageId).toBeUndefined();
+	});
+
+	it("does not skip a compact boundary along with hidden epoch markers", () => {
+		const meta = buildTailMeta(
+			[
+				{ id: "user", role: "user" },
+				rowWithElements({ id: "compact", role: "system" }, [{ type: "compact" }]),
+				rowWithElements({ id: "epoch", role: "system" }, [{ type: "epoch" }]),
+			],
+			OPTS,
+		);
+		expect(meta.lastRealMessage).toEqual({ id: "compact", role: "system" });
+	});
+
 	it("finds the last user message id, skipping optimistic ids", () => {
 		const messages: TailMetaMessage[] = [
 			{ id: "u1", role: "user" },

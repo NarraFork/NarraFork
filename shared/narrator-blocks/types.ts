@@ -145,6 +145,8 @@ export interface ToolPayload {
 	executor: "local" | "provider";
 	issuer: "model" | "user";
 	result?: ToolResult;
+	/** Durable retention tombstone: display the receipt, never replay half a call/result. */
+	payloadCleared?: boolean;
 }
 
 export interface ContextPayload {

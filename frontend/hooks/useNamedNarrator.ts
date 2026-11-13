@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
@@ -8,6 +9,7 @@ export function useNamedNarrators() {
 	return useQuery({
 		queryKey: ["named-narrators"],
 		queryFn: () => api.listNamedNarrators(),
+		enabled: !REMOTE_BUILD,
 		gcTime: NAMED_NARRATOR_GC_TIME_MS,
 		staleTime: 30_000,
 	});

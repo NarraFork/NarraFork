@@ -30,8 +30,6 @@ export interface ShikiTokenWorkerLoaderOptions {
 	factory: () => ShikiTokenWorkerPort;
 	/** Absolute, trailing-slash app mount URL the Worker resolves grammars against. */
 	appBase: () => string;
-	/** Main-thread loader used once the Worker cannot start at all. */
-	fallback: ShikiTokenLoader;
 	maxInFlight?: number;
 	/** Queued requests beyond this drop the OLDEST (resolved as null). */
 	maxQueued?: number;
@@ -62,17 +60,6 @@ export function createShikiTokenWorkerLoader(
 	let disabled = false;
 	let nextId = 1;
 
-	const runFallback = (job: Job) => {
-		let request: Promise<ShikiToken[][] | null>;
-		try {
-			request = options.fallback(job.code, job.lang, job.theme);
-		} catch {
-			job.resolve(null);
-			return;
-		}
-		request.then(job.resolve, () => job.resolve(null));
-	};
-
 	const terminate = () => {
 		const current = worker;
 		worker = null;
@@ -94,12 +81,11 @@ export function createShikiTokenWorkerLoader(
 		return jobs;
 	};
 
-	// The Worker itself cannot run (blocked, unsupported): keep highlighting on the
-	// main thread rather than silently losing colours for the session.
+	// No Worker means plain text. Tokenization must never move to the UI thread.
 	const disable = () => {
 		disabled = true;
 		terminate();
-		for (const job of [...reclaimInFlight(), ...queue.splice(0)]) runFallback(job);
+		for (const job of [...reclaimInFlight(), ...queue.splice(0)]) job.resolve(null);
 	};
 
 	const port = (): ShikiTokenWorkerPort => {
@@ -110,8 +96,9 @@ export function createShikiTokenWorkerLoader(
 			settle(packet.id, packet.type === "tokens" ? packet.tokens : null);
 		};
 		created.onerror = disable;
-		created.postMessage({ type: "boot", assetBase: options.appBase() });
+		// Own the port before boot: a throwing postMessage must still terminate it.
 		worker = created;
+		created.postMessage({ type: "boot", assetBase: options.appBase() });
 		return created;
 	};
 
@@ -157,7 +144,7 @@ export function createShikiTokenWorkerLoader(
 	}
 
 	return (code, lang, theme) => {
-		if (disabled) return options.fallback(code, lang, theme);
+		if (disabled) return Promise.resolve(null);
 		return new Promise((resolve) => {
 			queue.push({ code, lang, theme, resolve });
 			// Rows scrolled past long ago would only delay the visible ones. A dropped

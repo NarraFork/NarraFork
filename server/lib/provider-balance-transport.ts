@@ -1,6 +1,11 @@
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
-import { BalanceProbeRequestError, type BalanceRequest } from "./provider-balance-adapters";
+import {
+	type BalanceAuth,
+	type BalanceFailureKind,
+	BalanceProbeRequestError,
+	type BalanceRequest,
+} from "./provider-balance-adapters";
 import type { CustomApiProviderConfig } from "./settings";
 import { getHttpUserAgent, resolveHttpUserAgent } from "./user-agent";
 
@@ -55,19 +60,30 @@ const HOP_BY_HOP_HEADERS = new Set([
 	"te",
 ]);
 
-export function balanceRequestHeaders(
-	config: CustomApiProviderConfig,
-	authenticated: boolean,
-): Headers {
+export function balanceRequestHeaders(config: CustomApiProviderConfig, auth: BalanceAuth): Headers {
+	const userAgent = resolveHttpUserAgent({
+		mode: config.userAgentMode,
+		custom: config.customUserAgent,
+		fallback: getHttpUserAgent(),
+	});
 	// Public site metadata must not receive even a credential-bearing custom header.
-	if (!authenticated) return new Headers({ Accept: "application/json" });
+	if (auth === "none") return new Headers({ Accept: "application/json" });
+	/**
+	 * The site-account query authenticates as the *site*, not as the inference key. It also
+	 * deliberately carries none of the provider's custom headers: those are tuned for the
+	 * inference endpoint and may name a different credential or host.
+	 */
+	if (auth === "site-token") {
+		return new Headers({
+			Authorization: `Bearer ${config.quotaAccessToken?.trim() ?? ""}`,
+			"New-Api-User": config.quotaUserId?.trim() ?? "",
+			"User-Agent": userAgent,
+			Accept: "application/json",
+		});
+	}
 	const headers = new Headers({
 		Authorization: `Bearer ${config.apiKey}`,
-		"User-Agent": resolveHttpUserAgent({
-			mode: config.userAgentMode,
-			custom: config.customUserAgent,
-			fallback: getHttpUserAgent(),
-		}),
+		"User-Agent": userAgent,
 	});
 	const extra = new Headers(config.extraHeaders);
 	const blocked = new Set(HOP_BY_HOP_HEADERS);
@@ -83,6 +99,42 @@ export function balanceRequestHeaders(
 	return headers;
 }
 
+/**
+ * Origins this provider may be asked for a balance.
+ *
+ * The inference base URL is the historical single answer. A separately configured site root is
+ * its own origin (a site's dashboard API and its inference endpoints can be different hosts), so it
+ * is allowed as a second, explicit destination — never an arbitrary one.
+ */
+function allowedOrigins(config: CustomApiProviderConfig): Set<string> {
+	const origins = new Set<string>();
+	for (const value of [config.baseUrl, config.quotaSiteUrl]) {
+		if (typeof value !== "string" || value.length === 0) continue;
+		try {
+			origins.add(new URL(value).origin);
+		} catch {
+			// An unusable URL contributes no origin; the caller reports invalid_configuration.
+		}
+	}
+	return origins;
+}
+
+/**
+ * Map a non-2xx answer onto a failure kind.
+ *
+ * The legacy endpoints keep their original reading (404/405 means "no such endpoint here").
+ * The site-account endpoint is a fixed path, so a 404 there means the site root is wrong, and
+ * 401/403 mean the token or user id was rejected — both deterministic, never retried blindly.
+ */
+function statusFailureKind(status: number, auth: BalanceAuth): BalanceFailureKind {
+	if (auth === "site-token") {
+		if (status === 401 || status === 403) return "auth";
+		if (status === 429 || status >= 500) return "transient";
+		return "invalid_response";
+	}
+	return status === 404 || status === 405 ? "unsupported" : "transient";
+}
+
 export function createBalanceRequest(
 	config: CustomApiProviderConfig,
 	roundSignal: AbortSignal,
@@ -92,10 +144,11 @@ export function createBalanceRequest(
 	} = {},
 ): BalanceRequest {
 	const fetcher = options.fetch ?? outboundFetch;
-	return async (url, authenticated = true) => {
+	const origins = allowedOrigins(config);
+	return async (url, auth = "provider-key") => {
 		const target = new URL(url);
 		if (
-			target.origin !== new URL(config.baseUrl).origin ||
+			!origins.has(target.origin) ||
 			target.username ||
 			target.password ||
 			target.search ||
@@ -118,7 +171,7 @@ export function createBalanceRequest(
 					url,
 					{
 						method: "GET",
-						headers: balanceRequestHeaders(config, authenticated),
+						headers: balanceRequestHeaders(config, auth),
 						redirect: "error",
 						signal,
 					},
@@ -132,13 +185,14 @@ export function createBalanceRequest(
 				(late) => void late.body?.cancel().catch(() => {}),
 			);
 			if (!response.ok) {
-				throw new BalanceProbeRequestError(
-					response.status === 404 || response.status === 405 ? "unsupported" : "transient",
-				);
+				throw new BalanceProbeRequestError(statusFailureKind(response.status, auth));
 			}
 			const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
 			if (contentType && contentType !== "application/json" && !contentType.endsWith("+json")) {
-				throw new BalanceProbeRequestError("unsupported");
+				// On a fixed site path a non-JSON 200 is a wrong answer, not a missing endpoint.
+				throw new BalanceProbeRequestError(
+					auth === "site-token" ? "invalid_response" : "unsupported",
+				);
 			}
 			const declaredLength = Number(response.headers.get("content-length"));
 			if (declaredLength > BALANCE_MAX_RESPONSE_BYTES) {
@@ -170,7 +224,9 @@ export function createBalanceRequest(
 				try {
 					return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
 				} catch {
-					throw new BalanceProbeRequestError("unsupported");
+					throw new BalanceProbeRequestError(
+						auth === "site-token" ? "invalid_response" : "unsupported",
+					);
 				}
 			} finally {
 				signal.removeEventListener("abort", cancel);

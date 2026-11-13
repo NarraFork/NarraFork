@@ -2,6 +2,8 @@ import {
 	copyGeneratedImageToClipboard,
 	fetchImageBlob,
 } from "../components/narrator/composer/image-clipboard";
+import { REMOTE_BUILD } from "./build-target";
+import { isRemoteInlineImage } from "./remote-resource-policy";
 
 export interface ImageActionSource {
 	/** Directly-displayable URL (blob:/data:/http(s)/relative /api path). */
@@ -65,6 +67,9 @@ export async function downloadImageSource(
 ): Promise<void> {
 	const requested = source.filename?.split(/[\\/]/).pop()?.trim() || "image";
 	const direct = source.imageSrc?.trim();
+	if (REMOTE_BUILD && (!direct || !isRemoteInlineImage(direct))) {
+		throw new Error("REMOTE_RESOURCE_UNSUPPORTED");
+	}
 
 	// Blob/data/same-origin URLs are already browser-downloadable. Trigger them in
 	// the click handler instead of waiting for a fetch, which can lose user activation.

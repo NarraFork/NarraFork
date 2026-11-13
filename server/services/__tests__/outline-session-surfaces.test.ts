@@ -2,17 +2,19 @@
  * What an outline session (task backend `outline`, outline P2 PR 3 and PR 4) gets besides its
  * task source: the system prompt's task section, `spec://` closed to its tools (the behavior
  * fence included since PR 4: its boundary is the behavior page), no taskReflection, Dynamic Spec
- * writes refused from every other path (the Spec panel, `/goal`'s writer, plugins) except the
- * plugins' SOP channel of the fence, the backend each creation path gives, and no outline tools
- * by default for its subagents (R16). Spec sessions keep what they had.
+ * writes refused from every other path (the Spec panel, `/goal`'s writer), a plugin's spec
+ * commands converted onto the outline (PR 12a; a subagent's task commands refused, its fence its
+ * own), the backend each creation path gives, and no outline tools by default for its subagents
+ * (R16). Spec sessions keep what they had.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  * `outline.enabled` is set before each case (the preload restores settings after it).
  */
 import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { db } from "../../db";
-import { narrators } from "../../db/schema";
+import { readTestMessageContent } from "../../../tests/setup";
+import { db, sqlite } from "../../db";
+import { narratorMessages, narrators, specNamespaces } from "../../db/schema";
 import { shouldRunTaskReflection } from "../../lib/agent/loop";
 import { executeTool, getOutlineSpecRejection } from "../../lib/agent/tool-executor";
 import { grantBehaviorFenceEdit } from "../../lib/agent/tools/behavior-fence-grant";
@@ -40,6 +42,7 @@ import * as accessReads from "../outline/access-reads";
 import {
 	appendProtectedSpecTask,
 	clearSpecTasks,
+	deleteSpecFile,
 	readSpecFile,
 	readTasksFileForNarrator,
 	resetSpecNamespace,
@@ -124,6 +127,18 @@ describe("system prompt: the task section", () => {
 			expect(text).not.toContain("tasks.json");
 		}
 		expect(getOutlineTaskSystemReminder("zh-CN")).toContain("三条约定");
+		// A team task that cannot be finished is handed off in writing first (P2 PR 10c-2).
+		// Worded for both ends of a run: with a person in the conversation the task stays.
+		const en = getOutlineTaskSystemReminder("en");
+		expect(en).toContain(
+			"If you must stop with one unfinished and nobody is waiting on you in this conversation, leave a note under it before you end",
+		);
+		expect(en).toContain("The system may hand the task to a new session");
+		expect(en).not.toContain("puts the task back");
+		const zh = getOutlineTaskSystemReminder("zh-CN");
+		expect(zh).toContain("这个对话里又没有人在等你，结束前在任务下留一段说明");
+		expect(zh).toContain("系统可能把任务交给一个新会话");
+		expect(zh).not.toContain("系统会把任务放回待办");
 		expect(taskSectionFor("spec", "primary")).toBe("spec");
 		expect(taskSectionFor("spec", "subagent")).toBe("spec");
 		expect(taskSectionFor("outline", "primary")).toBe("outline");
@@ -255,6 +270,8 @@ describe("Dynamic Spec writes from other paths", () => {
 		);
 		expectRefused(await refusal(clearSpecTasks(id)));
 		expectRefused(await refusal(resetSpecNamespace(id)));
+		// Deleting a note too (PR 12a: it was the one spec write without the check).
+		expectRefused(await refusal(deleteSpecFile(id, "spec://notes.md")));
 		expectRefused(await refusal(appendProtectedSpecTask(id, "Ship it")));
 		// The person writes the boundary in the outline now (plan PR 4).
 		expectRefused(
@@ -269,15 +286,72 @@ describe("Dynamic Spec writes from other paths", () => {
 		expect((await readSpecFile(spec, "spec://behavior_fence")).content).toBe("Never force-push.");
 	});
 
-	test("plugin task commands are refused, its fence command works", async () => {
+	test("plugin commands are converted onto the outline; a subagent's tasks are refused, its fence is its own", async () => {
 		const id = await session();
-		expectRefused(await refusal(addSpecTaskForPlugin(id, "Report back")));
-		expectRefused(await refusal(writeSpecForPlugin(id, "spec://tasks.json", '{"tasks":[]}')));
-		// Reading the task list too: an empty list would read as an idle member.
-		expectRefused(await refusal(readSpecTasksForPlugin(id)));
+		// PR 12a: the task commands work on the session's outline tasks, nothing reaches the spec.
+		expect((await addSpecTaskForPlugin(id, "Report back")).added).toBe(true);
+		expect((await readSpecTasksForPlugin(id)).compiled.tasks.map((t) => t.text)).toEqual([
+			"Report back",
+		]);
+		await writeSpecForPlugin(
+			id,
+			"spec://tasks.json",
+			'{"tasks":[{"text":"Report back","status":"doing"}]}',
+		);
+		expect((await readSpecTasksForPlugin(id)).compiled.currentTask?.text).toBe("Report back");
 		await setSpecBehaviorFenceForPlugin(id, "Report to the lead.", "upsert");
-		expect((await readSpecFile(id, "spec://behavior_fence")).content).toContain(
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).not.toContain(
 			"Report to the lead.",
+		);
+		settings.outline.enabled = false;
+		expect(JSON.parse((await readTasksFileForNarrator(id)).content).tasks).toEqual([]);
+		settings.outline.enabled = true;
+
+		// A subagent has no tasks of its own (D27c); a plugin's temporary worker keeps its SOP in
+		// its own fence.
+		const sub = generateId();
+		await db.insert(narrators).values({
+			id: sub,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: id,
+			aclRootNarratorId: id,
+			taskBackend: "outline",
+			status: "idle",
+			createdAt: NOW,
+			updatedAt: NOW,
+		});
+		expectRefused(await refusal(addSpecTaskForPlugin(sub, "Report back")));
+		expectRefused(await refusal(writeSpecForPlugin(sub, "spec://tasks.json", '{"tasks":[]}')));
+		// Reading the task list too: an empty list would read as an idle member.
+		expectRefused(await refusal(readSpecTasksForPlugin(sub)));
+		await setSpecBehaviorFenceForPlugin(sub, "Report to the lead.", "upsert");
+		expect((await readSpecFile(sub, "spec://behavior_fence")).content).toContain(
+			"Report to the lead.",
+		);
+	});
+
+	test("clearing the context leaves no spec card in an outline session, and makes no spec namespace", async () => {
+		const outline = await session();
+		await narratorService.insertSpecClearedCarryoverCard(outline);
+		expect(
+			await db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, outline)),
+		).toEqual([]);
+		expect(
+			await db.select().from(specNamespaces).where(eq(specNamespaces.narratorId, outline)),
+		).toEqual([]);
+		// A spec session with tasks still gets its card.
+		const spec = await session("spec");
+		await appendProtectedSpecTask(spec, "Ship it");
+		await narratorService.insertSpecClearedCarryoverCard(spec);
+		const cards = await db
+			.select({ id: narratorMessages.id })
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, spec));
+		expect(cards.length).toBeGreaterThan(0);
+		// The body lives in the block store, not in `contentJson`.
+		expect(JSON.stringify(cards.map((card) => readTestMessageContent(sqlite, card.id)))).toContain(
+			"spec_context_cleared",
 		);
 	});
 

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="referrer" content="no-referrer">
+	<title>NarraFork RTC M1 独立调试</title>
+	<style>
+		:root { color-scheme: dark; font-family: system-ui, sans-serif; }
+		body { max-width: 900px; margin: 2rem auto; padding: 1rem; background: #161922; color: #e6e8ef; }
+		textarea, input { display: block; box-sizing: border-box; width: 100%; margin: .4rem 0 1rem; padding: .7rem; background: #242938; color: inherit; border: 1px solid #5b6480; }
+		button { padding: .6rem 1rem; margin: .2rem; cursor: pointer; }
+		pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 30rem; overflow: auto; background: #242938; padding: 1rem; }
+		.note { color: #bac3d8; }
+	</style>
+</head>
+<body>
+	<h1>RTC M1 独立调试客户端</h1>
+	<p class="note">仅用于隔离 fixture，不加载生产 App。无 TURN、HTTP 回退、ICE restart、PWA 或自动写操作重试。官方提供的 JavaScript 仍属于信任边界；不向协调服务提交配对秘密和业务 JWT。</p>
+	<label for="invitation">粘贴本地生成的邀请 JSON（或使用邀请 fragment；读取后立即移除）</label>
+	<textarea id="invitation" rows="7" autocomplete="off" spellcheck="false"></textarea>
+	<label for="expected">附加实例指纹（localhost 测试必填，不会覆盖真实实例子域）</label>
+	<input id="expected" autocomplete="off" spellcheck="false">
+	<label><input id="localhost" type="checkbox" style="display:inline;width:auto">显式允许 localhost 开发环境</label>
+	<label for="stun">STUN URLs（逗号分隔，可空；仅 stun/stuns）</label>
+	<input id="stun" placeholder="stun:stun.example.org:3478" spellcheck="false">
+	<button id="connect" type="button">配对连接</button>
+	<button id="reconnect" type="button">使用本 origin 保存的 grant 重连</button>
+	<button id="disconnect" type="button">断开</button>
+	<hr>
+	<label for="token">B 的业务 JWT（仅通过直连通道传输）</label>
+	<input id="token" type="password" autocomplete="off">
+	<button id="authenticate" type="button">管理员认证</button>
+	<button id="fixture-login" type="button">隔离 fixture 登录</button>
+	<button id="projects" type="button">读取项目列表</button>
+	<button id="sse" type="button">流式 SSE / UTF-8</button>
+	<button id="socket" type="button">逻辑 socket 订阅</button>
+	<button id="stats" type="button">双候选直连统计</button>
+	<button id="blob" type="button">下载 128KiB 小资源 / revoke</button>
+	<label for="upload">上传小文件（multipart，整体 ≤8MiB，含 boundary 开销）</label>
+	<input id="upload" type="file">
+	<button id="send-upload" type="button">上传</button>
+	<button id="cancel" type="button">取消当前资源请求</button>
+	<p id="state" role="status">尚未连接</p>
+	<pre id="output" aria-live="polite"></pre>
+	<script type="module" src="./client.js"></script>
+</body>
+</html>

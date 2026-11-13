@@ -9,6 +9,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { headingMetrics, typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
 import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
 import { installCanvasStub } from "../../narrator/vlist/measure/test-canvas-stub";
+import { parseToPM } from "../editor/convert";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -18,11 +19,15 @@ const {
 	bodySize,
 	checkIconPx,
 	clearMeasureCache,
+	frameTail,
 	frameWidth,
 	hasMeasured,
 	MAP_FONT_FAMILY,
 	mapType,
+	measureBody,
 	measureKey,
+	measureStats,
+	storeMeasured,
 	NODE,
 	nodeSize,
 } = await import("./measure");
@@ -33,10 +38,34 @@ beforeEach(() => {
 });
 
 const plain = (ref: string, label: string | null) => label ?? ref;
+// Tests explicitly exercise the same pure core that production runs only in the Worker.
+const measuredSize = (content: string) => measureBody(parseToPM(content).node);
 const LARGER = { fontScalePercent: 115, lineHeightScalePercent: 110, letterSpacingPercent: 2 };
 
 describe("mind-map node typography", () => {
-	it("measures with the conversation's body, heading and code metrics", () => {
+	it("serves cold bodies as fixed placeholders without exact measuring or caching fake sizes", () => {
+		const before = measureStats.misses;
+		const cold = bodySize("## [[target|标题]] `code` Mixed 文本".repeat(100), plain);
+		expect(cold).toEqual({ w: NODE.maxBody, h: mapType().lineH });
+		expect(bodySize("short")).toEqual(cold);
+		expect(hasMeasured("short")).toBe(false);
+		expect(measureStats.misses).toBe(before);
+		const key = measureKey("short", plain).key;
+		storeMeasured([[key, 80, 48]]);
+		expect(bodySize("short")).toEqual({ w: 80, h: 48 });
+		expect(measureStats.misses).toBe(before);
+	});
+
+	it("collects mention dependencies without parsing and resolves by identity, not position", () => {
+		const { labels } = measureKey(
+			"`[[fake]]` [[a\\*b|甲]] [[real|乙]]",
+			(ref, label) => `${ref}:${label}`,
+		);
+		expect(labels[JSON.stringify(["a*b", "甲"])]).toBe("a*b:甲");
+		expect(labels[JSON.stringify(["real", "乙"])]).toBe("real:乙");
+	});
+
+	it("measures with the conversation's body and code metrics", () => {
 		const m = typographyMetrics();
 		const t = mapType();
 		expect(t.px).toBe(m.size.sm);
@@ -45,19 +74,25 @@ describe("mind-map node typography", () => {
 		expect(t.codeFont).toContain(`${m.size.xs}px`);
 		expect(t.codeBlockFont).toContain(`${m.codeSize}px`);
 		expect(t.codeBlockLineH).toBe(m.line.code);
-		for (const level of [1, 2, 3] as const) {
-			expect(t.heading[level]).toEqual({
-				px: headingMetrics(level).size,
-				lineH: headingMetrics(level).lineHeight,
-			});
+	});
+
+	it("measures a heading inside a node as body text in bold: never larger than a task's title", () => {
+		const t = mapType();
+		// The conversation's headings are larger than its body: that size is not used here.
+		expect(headingMetrics(1).size).toBeGreaterThan(t.px);
+		for (const level of [1, 2, 3]) {
+			const heading = measuredSize(`${"#".repeat(level)} Delivery and conclusions`);
+			expect(heading.h).toBe(t.lineH);
+			// The same width as the same words in bold body text, whatever the level.
+			expect(heading.w).toBe(measuredSize("**Delivery and conclusions**").w);
 		}
 	});
 
 	it("gives a one-line body, a heading and a code block their line boxes", () => {
 		const t = mapType();
-		expect(bodySize("短句 short").h).toBe(t.lineH);
-		expect(bodySize("## 结论").h).toBe(t.heading[2].lineH);
-		expect(bodySize("```\na\nb\n```").h).toBe(2 * t.codeBlockLineH + 8);
+		expect(measuredSize("短句 short").h).toBe(t.lineH);
+		expect(measuredSize("## 结论").h).toBe(t.lineH);
+		expect(measuredSize("```\na\nb\n```").h).toBe(2 * t.codeBlockLineH + 8);
 		// A node is never shorter than one body line plus its frame.
 		expect(nodeSize({ w: 10, h: 0 }, false).h).toBe(NODE.padY * 2 + t.lineH + NODE.border * 2);
 	});
@@ -66,7 +101,12 @@ describe("mind-map node typography", () => {
 		// `--nf-outline-icon` (outline-icons.css): body + 2, between 12 and 24 (16 by default).
 		expect(checkIconPx()).toBe(16);
 		expect(frameWidth(false)).toBe(NODE.gutter);
-		expect(frameWidth(true)).toBe(NODE.gutter + 16 + NODE.checkGap);
+		// One marker: a task's checkbox column stands where the bullet would be, after the arrow.
+		expect(frameWidth(true)).toBe(NODE.part + 16 + NODE.checkGap);
+		expect(frameWidth(true)).toBe(frameWidth(false) - NODE.part + 16 + NODE.checkGap);
+		// The focus handle the bullet would be follows a task's body.
+		expect(frameTail(false)).toBe(0);
+		expect(frameTail(true)).toBe(NODE.part);
 		const widthOf = (task: boolean) => nodeSize({ w: 100, h: 0 }, task).w;
 		expect(widthOf(true) - widthOf(false)).toBe(16 + NODE.checkGap);
 		setTypography(LARGER);
@@ -78,12 +118,12 @@ describe("mind-map node typography", () => {
 	});
 
 	it("follows a change of setting at measure time", () => {
-		const before = bodySize("背景：用户中断回合后没有重试按钮。Mixed English 与中文混排。");
+		const before = measuredSize("背景：用户中断回合后没有重试按钮。Mixed English 与中文混排。");
 		setTypography(LARGER);
 		const t = mapType();
 		expect(t.px).toBeCloseTo(16.1, 10);
 		expect(t.lineH).toBe(typographyMetrics().line.body);
-		const after = bodySize("背景：用户中断回合后没有重试按钮。Mixed English 与中文混排。");
+		const after = measuredSize("背景：用户中断回合后没有重试按钮。Mixed English 与中文混排。");
 		expect(after.h % t.lineH).toBe(0);
 		expect(after.h).toBeGreaterThan(before.h);
 	});
@@ -106,13 +146,13 @@ describe("mind-map node typography", () => {
 		expect(spaced - unspaced.maxLineWidth).toBeCloseTo([...text].length * spacing, 5);
 		// …so a node measures what pretext measures, with nothing added on top (adding the
 		// trailing unit again made nodes taller or shorter than drawn).
-		expect(bodySize(text).w).toBeCloseTo(spaced, 5);
+		expect(measuredSize(text).w).toBeCloseTo(spaced, 5);
 		setTypography({ letterSpacingPercent: -5 });
 		const tight = measureRichInlineStats(
 			prepareRichInline([{ text, font, letterSpacing: -0.7 }]),
 			10_000,
 		).maxLineWidth;
-		expect(bodySize(text).w).toBeCloseTo(tight, 5);
+		expect(measuredSize(text).w).toBeCloseTo(tight, 5);
 	});
 
 	it("measures a code block line with the same spacing arithmetic", async () => {
@@ -123,7 +163,7 @@ describe("mind-map node typography", () => {
 		const natural = measureNaturalWidth(
 			prepareWithSegments(line, font, { letterSpacing: 1.1 }), // 10% of 11px
 		);
-		expect(bodySize(`\`\`\`\n${line}\n\`\`\``).w).toBeCloseTo(
+		expect(measuredSize(`\`\`\`\n${line}\n\`\`\``).w).toBeCloseTo(
 			Math.min(NODE.maxBody, natural + 16),
 			5,
 		);
@@ -144,7 +184,7 @@ describe("mind-map node typography", () => {
 				prepareRichInline([{ text, font, letterSpacing }]),
 				10_000,
 			).maxLineWidth;
-			expect(bodySize(text).w).toBeCloseTo(plainWidth, 5);
+			expect(measuredSize(text).w).toBeCloseTo(plainWidth, 5);
 		}
 	});
 
@@ -169,7 +209,7 @@ describe("mind-map node typography", () => {
 		);
 		expect(split.lineCount).toBe(2);
 		// …while the browser wraps before `code`: the second line then overflows into a third.
-		expect(bodySize(`${before}\`code\`${after}`).h).toBe(3 * t.lineH);
+		expect(measuredSize(`${before}\`code\`${after}`).h).toBe(3 * t.lineH);
 	});
 
 	it("leaves the punctuation after a chip wider than a line in the text", async () => {
@@ -190,12 +230,12 @@ describe("mind-map node typography", () => {
 			NODE.maxBody,
 		);
 		expect(asText.lineCount).toBe(2);
-		expect(bodySize(`\`${chip}\`${tail}`).h).toBe(2 * t.lineH);
+		expect(measuredSize(`\`${chip}\`${tail}`).h).toBe(2 * t.lineH);
 	});
 
 	it("keys the cache by the setting, and drops it when the setting changes", () => {
 		const key = measureKey("同一段文字", plain).key;
-		bodySize("同一段文字");
+		storeMeasured([[key, 100, 24]]);
 		expect(hasMeasured("同一段文字")).toBe(true);
 		setTypography(LARGER);
 		expect(measureKey("同一段文字", plain).key).not.toBe(key);

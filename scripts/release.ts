@@ -12,6 +12,7 @@ import { isValidReleaseVersion } from "../shared/release-version";
 import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import { publishGitHubRelease, validateGitHubRepository } from "./lib/github-release";
 import { validatePublishedPatchSources } from "./lib/local-github-patch-source";
+import { dispatchMainRelease, releaseSourceDeclaresRemotePeer } from "./lib/main-release-dispatch";
 import { getUnexpectedReleaseChanges, resolveGitCommit } from "./lib/release-git";
 import { resolvePlatformSuffixes } from "./lib/stable-baseline-patch";
 import { prepareUpdateIndexRelease } from "./lib/update-index";
@@ -109,7 +110,7 @@ if (!version) {
 	console.error("  --upload-only         Mirror compatibility alias (no dist); GitHub uses dist");
 	console.error("  --index-only          GitHub read-only online repair; no dist/build required");
 	console.error("  --publish-index       With --index-only, explicitly write the metadata branch");
-	console.error("  --skip-build          GitHub only: use existing dist");
+	console.error("  --skip-build          GitHub local preview/legacy only: use existing dist");
 	console.error("  --changelog=<file>    GitHub only: localized release notes");
 	process.exit(1);
 }
@@ -248,6 +249,27 @@ if (!dryRun && (!indexOnly || publishIndex)) {
 	}
 }
 
+// Reject unsupported delegated-publication options before package writes or Git commits.
+if (!dryRun && !indexOnly) {
+	try {
+		const source =
+			resolveGitCommit(ROOT, `refs/tags/v${version}`) ?? resolveGitCommit(ROOT, "HEAD");
+		if (
+			source &&
+			releaseSourceDeclaresRemotePeer(ROOT, source) &&
+			(platformArg || changelogArg || skipBuild)
+		)
+			throw new Error(
+				"A normal release with remote-peer uses the complete native CI matrix and committed changelogs/v<version>.json; --platform/--changelog/--skip-build are local preview or legacy options only",
+			);
+	} catch (error) {
+		console.error(
+			`Release option preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		process.exit(1);
+	}
+}
+
 // ── Step 1: Version bump ────────────────────────────────────────────────────
 if (!uploadOnly) {
 	const pkg = JSON.parse(readFileSync(PKG_PATH, "utf-8"));
@@ -290,6 +312,71 @@ if (!uploadOnly && !dryRun) {
 		}
 	} catch (err) {
 		console.error(`Git release commit failed: ${err}`);
+		process.exit(1);
+	}
+}
+
+// A real release with an optional peer uses the ordinary protected main CI run.
+// This is deliberately after the mirror/index/dry-run boundaries and source commit,
+// but before local product compilation: the main plan freezes peer identity first.
+if (!dryRun && !indexOnly) {
+	try {
+		const tagRef = `refs/tags/v${version}`;
+		const sourceCommit = resolveGitCommit(ROOT, tagRef) ?? resolveGitCommit(ROOT, "HEAD");
+		if (!sourceCommit) throw new Error("Cannot resolve release source");
+		if (releaseSourceDeclaresRemotePeer(ROOT, sourceCommit)) {
+			if (platformArg || changelogArg || skipBuild)
+				throw new Error(
+					"A normal release with remote-peer uses the complete native CI matrix and committed changelogs/v<version>.json; --platform/--changelog are local preview options only",
+				);
+			if (!uploadOnly) {
+				const head = resolveGitCommit(ROOT, "HEAD");
+				if (!head || head !== sourceCommit || getUnexpectedReleaseChanges(ROOT).length > 0)
+					throw new Error("Release source must be a clean HEAD before delegating to main CI");
+				const existing = resolveGitCommit(ROOT, tagRef);
+				if (existing && existing !== head) throw new Error("Existing NF tag does not match HEAD");
+				if (!existing) {
+					execFileSync("git", ["tag", `v${version}`], {
+						cwd: ROOT,
+						stdio: "inherit",
+						timeout: 10_000,
+					});
+					console.log(
+						`Tagged source v${version}; native build and peer release are handled by main CI`,
+					);
+				}
+			}
+			console.log(
+				"Normal NF publication uses main Release CI; remote-peer updates are automatic, with no separate component publish command. Local dist is not uploaded on this path.",
+			);
+			const controller = new AbortController();
+			const cancel = () =>
+				controller.abort(
+					new Error("Release wait cancelled; inspect the existing Actions run before retrying"),
+				);
+			process.once("SIGINT", cancel);
+			process.once("SIGTERM", cancel);
+			try {
+				const receipt = await dispatchMainRelease({
+					repository: githubRepository,
+					version,
+					commit: sourceCommit,
+					signal: controller.signal,
+					log: console.log,
+				});
+				console.log(
+					`Main release run ${receipt.runId} succeeded: NF and any updated remote-peer were published by the same protected flow`,
+				);
+			} finally {
+				process.removeListener("SIGINT", cancel);
+				process.removeListener("SIGTERM", cancel);
+			}
+			process.exit(0);
+		}
+	} catch (error) {
+		console.error(
+			`Main release delegation failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
 		process.exit(1);
 	}
 }

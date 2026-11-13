@@ -1,6 +1,7 @@
 /**
  * One person's view state of one page (design §6.10, §7.1 `outline_view_state`): which blocks
- * they folded and which way their mind map grows. Personal: never part of the block model, never
+ * they closed and which they opened (a page folds some by default, `shared/outline-fold.ts`), and
+ * which way their mind map grows. Personal: never part of the block model, never
  * a commit, invisible to everyone else, and the same on every device they use.
  *
  * Reading and writing need read access to the page's space (PR5's `canReadSpace`): folding a
@@ -9,8 +10,9 @@
  *
  * Bounded, because any reader may write one for every page they can read:
  *   - folded ids must look like block ids (`OUTLINE_BLOCK_ID_RE`), at most
- *     `OUTLINE_VIEW_STATE_LIMITS.maxCollapsed`, and only those that are live blocks of the page
- *     are kept (looked up by primary key, in `OUTLINE_SQL_CHUNK` ids per statement);
+ *     `OUTLINE_VIEW_STATE_LIMITS.maxCollapsed` in both sets together, and only those that are
+ *     live blocks of the page are kept (looked up by primary key, in `OUTLINE_SQL_CHUNK` ids per
+ *     statement);
  *   - one row per person and page, read and written by its primary key, and at most
  *     `maxPagesPerUser` rows per person: writing another page drops their least recently written
  *     one in the same transaction.
@@ -43,17 +45,38 @@ async function readablePage(
 	return { id: block.id, spaceId: space.id };
 }
 
-/** Folded ids without duplicates, in their order, within the limits. */
-export function normalizeCollapsed(ids: readonly string[]): string[] {
+/** Block ids without duplicates, in their order, within the limits (at most `max`). */
+export function normalizeCollapsed(
+	ids: readonly string[],
+	max: number = OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+): string[] {
 	const out: string[] = [];
 	const seen = new Set<string>();
 	for (const id of ids) {
-		if (out.length >= OUTLINE_VIEW_STATE_LIMITS.maxCollapsed) break;
+		if (out.length >= max) break;
 		if (!OUTLINE_BLOCK_ID_RE.test(id) || seen.has(id)) continue;
 		seen.add(id);
 		out.push(id);
 	}
 	return out;
+}
+
+/**
+ * The two sets of a view state within the one limit they share (`maxCollapsed` ids together):
+ * what the reader opened first, then what they closed. A block in both is one they opened (the
+ * page reads it so, `shared/outline-fold.ts`).
+ */
+export function normalizeFolding(input: {
+	collapsed: readonly string[];
+	expanded: readonly string[];
+}): { collapsed: string[]; expanded: string[] } {
+	const expanded = normalizeCollapsed(input.expanded);
+	const opened = new Set(expanded);
+	const collapsed = normalizeCollapsed(
+		input.collapsed.filter((id) => !opened.has(id)),
+		OUTLINE_VIEW_STATE_LIMITS.maxCollapsed - expanded.length,
+	);
+	return { collapsed, expanded };
 }
 
 /** The person's view state of a page (the defaults when never written); null: no such page. */
@@ -67,40 +90,53 @@ export async function readViewState(
 	const row = await store.getViewState(principal.userId, page.id);
 	return {
 		pageId: page.id,
-		collapsed: row ? normalizeCollapsed(row.collapsed) : [],
+		...normalizeFolding({ collapsed: row?.collapsed ?? [], expanded: row?.expanded ?? [] }),
 		layout: row?.layout ?? "right",
 		updatedAt: row?.updatedAt ?? null,
 	};
 }
 
-/** Replace the person's view state of a page; null: no such page (nothing written). */
+/**
+ * Replace the person's view state of a page; null: no such page (nothing written). Without
+ * `expanded` (a client from before the default folding) the stored one is kept, less the blocks
+ * that client closed.
+ */
 export async function writeViewState(
 	principal: OutlinePrincipal,
 	pageId: string,
-	input: { collapsed: readonly string[]; layout: OutlineMapLayout },
+	input: { collapsed: readonly string[]; expanded?: readonly string[]; layout: OutlineMapLayout },
 	options: { store?: OutlineStore; now?: string } = {},
 ): Promise<OutlineViewStateResponse | null> {
 	const store = options.store ?? outlineStore;
 	const page = await readablePage(principal, pageId, store);
 	if (!page) return null;
 	const updatedAt = options.now ?? new Date().toISOString();
-	const wanted = normalizeCollapsed(input.collapsed);
+	let expandedInput = input.expanded;
+	if (expandedInput === undefined) {
+		// An older client knows one set only: what it says is closed is closed.
+		const closed = new Set(input.collapsed);
+		const stored = (await store.getViewState(principal.userId, page.id))?.expanded ?? [];
+		expandedInput = stored.filter((id) => !closed.has(id));
+	}
+	const wanted = normalizeFolding({ collapsed: input.collapsed, expanded: expandedInput });
 	// Only live blocks of this page (by primary key; other spaces' ids are not found).
 	const onPage = new Set(
-		(await store.getBlockMetas(page.spaceId, { ids: wanted }))
+		(await store.getBlockMetas(page.spaceId, { ids: [...wanted.expanded, ...wanted.collapsed] }))
 			.filter((b) => b.pageId === page.id && !b.deleted)
 			.map((b) => b.id),
 	);
-	const collapsed = wanted.filter((id) => onPage.has(id));
+	const collapsed = wanted.collapsed.filter((id) => onPage.has(id));
+	const expanded = wanted.expanded.filter((id) => onPage.has(id));
 	await store.putViewState(
 		{
 			userId: principal.userId,
 			pageBlockId: page.id,
 			collapsed,
+			expanded,
 			layout: input.layout,
 			updatedAt,
 		},
 		OUTLINE_VIEW_STATE_LIMITS.maxPagesPerUser,
 	);
-	return { pageId: page.id, collapsed, layout: input.layout, updatedAt };
+	return { pageId: page.id, collapsed, expanded, layout: input.layout, updatedAt };
 }

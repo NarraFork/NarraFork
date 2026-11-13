@@ -74,6 +74,7 @@ export const createWorkspaceSchema = z.object({
  */
 export const updateWorkspaceSchema = z.object({
 	title: z.string().max(200).optional(),
+	expectedTitleRevision: z.number().int().min(0).optional(),
 });
 
 // === Membership (workspace_panels) ===

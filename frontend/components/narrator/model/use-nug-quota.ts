@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
 import { api } from "../../../lib/api";
@@ -52,7 +53,7 @@ export function useNugQuota(
 	const { data: nugQuotasData } = useQuery({
 		queryKey: ["nug", "quotas"],
 		queryFn: api.nugGetQuotas,
-		enabled: enabled && hasNugProviders,
+		enabled: !REMOTE_BUILD && enabled && hasNugProviders,
 		staleTime: 30_000,
 	});
 	const missingCurrentNugQuota = Boolean(
@@ -61,7 +62,7 @@ export function useNugQuota(
 	const { data: currentNugQuotaData } = useQuery({
 		queryKey: ["nug", "quota", nugProviderConfig?.id],
 		queryFn: () => api.nugGetQuota(nugProviderConfig?.id ?? ""),
-		enabled: enabled && missingCurrentNugQuota,
+		enabled: !REMOTE_BUILD && enabled && missingCurrentNugQuota,
 		staleTime: 30_000,
 	});
 
@@ -87,7 +88,7 @@ export function useNugQuota(
 	}, [currentNugQuotaData, nugProviderConfig?.id, qc]);
 
 	return useMemo(() => {
-		if (!nugProviderConfig) return null;
+		if (REMOTE_BUILD || !nugProviderConfig) return null;
 		const quota = nugQuotasData?.[nugProviderConfig.id] ?? currentNugQuotaData;
 		const rawDetailedQuotaBalance = quota?.detailedQuotaBalance;
 		const detailedQuotaBalance = rawDetailedQuotaBalance?.trim() ? rawDetailedQuotaBalance : null;
