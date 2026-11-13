@@ -89,6 +89,23 @@ async function verifySecondFactor(input: StepUpInput): Promise<boolean> {
 }
 
 /**
+ * Prove the first factor: the account's local password, or — for an account whose only
+ * credential is the directory — the same password checked against the LDAP server.
+ *
+ * Directory-only accounts have no usable local password (it is a random, unguessable
+ * hash), so without this fallback the whole step-up flow would be closed to them: they
+ * could never export credentials. The fallback runs only when the local check fails, so a
+ * local password never triggers a directory round trip.
+ */
+async function verifyPassword(userId: string, password: string): Promise<boolean> {
+	const passwordHash = await authSessionStore.findPasswordHash(userId);
+	if (passwordHash && (await Bun.password.verify(password, passwordHash))) return true;
+	// Lazy import keeps `ldapts` out of the process for instances without a directory.
+	const { ldapAuthService } = await import("./ldap-auth-service");
+	return ldapAuthService.verifyLinkedUserPassword(userId, password);
+}
+
+/**
  * Check password + second factor and issue a grant. Failures share the login MFA
  * attempt budget, so step-up cannot be used to brute-force a code.
  */
@@ -112,8 +129,7 @@ export async function verifyStepUp(
 	}
 	let settled = false;
 	try {
-		const passwordHash = await authSessionStore.findPasswordHash(input.userId);
-		const passwordOk = !!passwordHash && (await Bun.password.verify(input.password, passwordHash));
+		const passwordOk = await verifyPassword(input.userId, input.password);
 		// Only spend a backup code once the password is known to be right.
 		const ok = passwordOk && (await verifySecondFactor(input));
 		if (!ok) {

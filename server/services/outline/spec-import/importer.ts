@@ -56,6 +56,7 @@
  * While it runs, Dynamic Spec writes to the session are refused and plugins' commands wait
  * (`task-source/backend.ts`).
  */
+import { createHash } from "node:crypto";
 import { hotSafe } from "@server/lib/hot-safe";
 import { getUserLanguage } from "@server/lib/i18n";
 import { logger } from "@server/lib/logger";
@@ -96,6 +97,7 @@ import {
 	isImportSid,
 	type NormalizedTaskText,
 	OUTLINE_SPEC_IMPORT_ACTOR,
+	OUTLINE_SPEC_REVERT_ACTOR,
 	planSpecFile,
 	planSpecTasks,
 	SPEC_IMPORT_TEXT,
@@ -116,6 +118,13 @@ import {
 	type SpecImportSession,
 	switchSessionToOutline,
 } from "./read-port";
+import {
+	cachedSpecImportState,
+	readSpecImportState,
+	resetSpecImportStateCache,
+	type SpecImportState,
+	writeSpecImportState,
+} from "./state";
 
 export const SPEC_IMPORT_LIMITS = {
 	/** Current files of one session imported; more is not imported at all. */
@@ -144,11 +153,10 @@ export const SPEC_IMPORT_LIMITS = {
 	staleVersions: 4000,
 	/** Characters of a failure kept for the Spec panel. */
 	errorChars: 300,
-	/** Sessions whose last import is remembered (least recently touched dropped first). */
-	remembered: 4096,
 } as const;
 
-export type SpecImportTrigger = "run" | "sweep" | "manual";
+/** `admin`: an administrator's re-import (the only trigger that moves a moved-back session). */
+export type SpecImportTrigger = "run" | "sweep" | "manual" | "admin";
 
 type SpecImportMode = "auto" | "manual" | "off";
 
@@ -179,7 +187,11 @@ export type SpecImportOutcome =
 			commits: number;
 	  }
 	/** Nothing to do: `reason` says why the session is not one the import moves. */
-	| { status: "skipped"; reason: "outline" | "subagent" | "external" | "missing" | "off" }
+	| {
+			status: "skipped";
+			/** `reverted`: an administrator moved it back to Dynamic Spec; only they import it again. */
+			reason: "outline" | "subagent" | "external" | "missing" | "off" | "reverted";
+	  }
 	/**
 	 * The session is running, or another import of it is, or the import gave way to the session
 	 * (its time budget, a message for it; {@link SpecImportPaused}): what it wrote stays, and the
@@ -192,13 +204,16 @@ export type SpecImportOutcome =
 	 */
 	| { status: "failed"; error: string; attention: boolean };
 
-/** The last import of a session, as the Spec panel shows it. Kept in memory (see `rememberedOf`). */
+/** The last import of a session, as the Spec panel shows it (from `state.ts`). */
 export interface SpecImportRecord {
-	/** `busy`: the session was busy, or the import gave way to it; another attempt will go on. */
-	status: "running" | "imported" | "failed" | "attention" | "busy";
+	/**
+	 * `busy`: the session was busy, or the import gave way to it; another attempt will go on.
+	 * `reverted`: an administrator moved the session back to Dynamic Spec.
+	 */
+	status: "running" | "imported" | "failed" | "attention" | "busy" | "reverted";
 	trigger: SpecImportTrigger;
 	at: string;
-	/** Attempts in this process that failed (the idle job gives up after a few). */
+	/** Failed attempts since the last success (the automatic triggers give up after a few). */
 	failures: number;
 	/** Why the last attempt did not move the session (English, as logged). */
 	error?: string;
@@ -209,36 +224,65 @@ export interface SpecImportRecord {
 }
 
 /**
- * Remembered per process: the result of an import is in the outline itself (the session's
- * column, its blocks), and what failed is found again by the next attempt, so nothing is stored.
- * After a restart a session that needed attention is tried again (a bounded number of times).
+ * The imports running in this process. What they did is persisted (`state.ts`): the result of an
+ * import is in the outline itself (the session's column, its blocks), and the table keeps how the
+ * last attempt went, so attempt limits, a session that needs attention and a move back survive a
+ * restart.
  */
-const records = hotSafe(
-	"narrafork.outline.specImport.records",
-	() => new Map<string, SpecImportRecord>(),
-);
 const running = hotSafe(
 	"narrafork.outline.specImport.running",
 	() => new Map<string, Promise<SpecImportOutcome>>(),
 );
 
-function remember(narratorId: string, record: SpecImportRecord): void {
-	records.delete(narratorId);
-	records.set(narratorId, record);
-	while (records.size > SPEC_IMPORT_LIMITS.remembered) {
-		const oldest = records.keys().next().value;
-		if (oldest === undefined) break;
-		records.delete(oldest);
-	}
+/** Whether an import of the session runs in this process now. */
+export function isSpecImportRunning(narratorId: string): boolean {
+	return running.has(narratorId);
 }
 
+function recordOf(state: SpecImportState): SpecImportRecord | null {
+	if (state.status === "idle") return null;
+	return {
+		status: state.status === "running" && !running.has(state.narratorId) ? "busy" : state.status,
+		trigger: (state.trigger ?? "manual") as SpecImportTrigger,
+		at: state.updatedAt,
+		failures: state.attempts,
+		...(state.error ? { error: state.error } : {}),
+		...(state.reason ? { reason: state.reason } : {}),
+		...(state.tasks !== null ? { tasks: state.tasks } : {}),
+		...(state.pages !== null ? { pages: state.pages } : {}),
+	};
+}
+
+/** The last import of a session as cached (sync; the cache holds what this process read or wrote). */
 export function specImportRecord(narratorId: string): SpecImportRecord | null {
-	return records.get(narratorId) ?? null;
+	const state = cachedSpecImportState(narratorId);
+	return state ? recordOf(state) : null;
 }
 
-/** Forget what is remembered (tests). */
+/** The last import of a session (one primary-key read when not cached). */
+export async function readSpecImportRecord(narratorId: string): Promise<SpecImportRecord | null> {
+	const state = await readSpecImportState(narratorId);
+	return state ? recordOf(state) : null;
+}
+
+/** Forget what is cached (tests: what a restart does; the table keeps the rows). */
 export function resetSpecImportRecords(): void {
-	records.clear();
+	resetSpecImportStateCache();
+}
+
+/** Persist a state write, never rejecting: the import's own outcome does not depend on it. */
+async function persist(
+	narratorId: string,
+	update: Parameters<typeof writeSpecImportState>[1],
+): Promise<void> {
+	try {
+		await writeSpecImportState(narratorId, update);
+	} catch (error) {
+		logger.warn("Could not record the state of a Dynamic Spec import", {
+			narratorId,
+			error: String(error),
+		});
+	}
 }
 
 /** Why a session is not imported, or null when it is one the import moves. */
@@ -320,7 +364,7 @@ export interface SpecImportOptions {
 
 /**
  * Import a session's Dynamic Spec and move it to the outline (see the module header). Never
- * rejects: what happened is the outcome, remembered for the Spec panel.
+ * rejects: what happened is the outcome, recorded for the Spec panel (`state.ts`).
  */
 export async function importSpecSession(
 	narratorId: string,
@@ -328,29 +372,35 @@ export async function importSpecSession(
 ): Promise<SpecImportOutcome> {
 	if (specImportMode() === "off") return { status: "skipped", reason: "off" };
 	const current = running.get(narratorId);
-	if (current) return options.trigger === "manual" ? await current : { status: "busy" };
+	if (current)
+		return options.trigger === "manual" || options.trigger === "admin"
+			? await current
+			: { status: "busy" };
 	const run = attempt(narratorId, options).finally(() => running.delete(narratorId));
 	running.set(narratorId, run);
 	return await run;
 }
 
 async function attempt(narratorId: string, options: SpecImportOptions): Promise<SpecImportOutcome> {
-	const previous = records.get(narratorId);
 	let release: (() => void) | null = null;
 	let unguard: (() => void) | null = null;
 	let touched = false;
 	const started = performance.now();
 	try {
+		const previous = await readSpecImportState(narratorId);
 		const session = await readSpecImportSession(narratorId);
 		const skip = specImportSkipReason(session);
 		if (skip || !session) return { status: "skipped", reason: skip ?? "missing" };
+		// Moved back by an administrator: only an administrator's re-import moves it again.
+		if (previous?.status === "reverted" && options.trigger !== "admin")
+			return { status: "skipped", reason: "reverted" };
 		const pointers = session.namespaceId ? await readSpecFilePointers(session.namespaceId) : [];
 		if (options.smallOnly && tooLargeFor(pointers, options.smallOnly)) return { status: "busy" };
 		if (options.admit) {
 			try {
 				release = await options.admit(narratorId);
 			} catch {
-				rememberBusy(narratorId, options.trigger, previous);
+				await persistBusy(narratorId, options.trigger, previous);
 				return { status: "busy" };
 			}
 		}
@@ -359,21 +409,14 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 		// The move claims tasks: the lease keeper looks at the session again (its end, too).
 		forgetSpecImportLeftover(narratorId);
 		touched = true;
-		remember(narratorId, {
+		await persist(narratorId, {
 			status: "running",
 			trigger: options.trigger,
-			at: new Date().toISOString(),
-			failures: previous?.failures ?? 0,
+			reason: null,
+			error: null,
+			attentionReason: null,
 		});
-		const outcome = await run(session, pointers, options);
-		remember(narratorId, {
-			status: "imported",
-			trigger: options.trigger,
-			at: new Date().toISOString(),
-			failures: 0,
-			tasks: outcome.tasks,
-			pages: outcome.pages,
-		});
+		const outcome = await run(session, pointers, options, previous);
 		logger.info("Dynamic Spec session imported into the outline", {
 			narratorId,
 			trigger: options.trigger,
@@ -381,16 +424,18 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 			pages: outcome.pages,
 			commits: outcome.commits,
 			unreadable: outcome.unreadable,
+			movedForward: outcome.movedForward,
 			elapsedMs: Math.round(performance.now() - started),
 		});
-		return outcome;
+		const { movedForward: _, ...result } = outcome;
+		return result;
 	} catch (error) {
 		if (
 			error instanceof SpecImportPaused ||
 			(options.signal?.aborted === true && options.signal.reason instanceof SpecImportPaused)
 		) {
 			const reason = error instanceof SpecImportPaused ? error : options.signal?.reason;
-			rememberBusy(narratorId, options.trigger, previous);
+			await persistBusy(narratorId, options.trigger, null);
 			logger.info("Dynamic Spec import gave way to its session; the next attempt goes on", {
 				narratorId,
 				trigger: options.trigger,
@@ -408,14 +453,14 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 			0,
 			SPEC_IMPORT_LIMITS.errorChars,
 		);
-		remember(narratorId, {
+		await persist(narratorId, (current) => ({
 			status: attention ? "attention" : "failed",
 			trigger: options.trigger,
-			at: new Date().toISOString(),
-			failures: (previous?.failures ?? 0) + 1,
+			attempts: (current?.attempts ?? 0) + 1,
 			error: message,
 			reason,
-		});
+			attentionReason: attention ? reason.code : null,
+		}));
 		logger.warn("Dynamic Spec import did not move a session", {
 			narratorId,
 			trigger: options.trigger,
@@ -430,18 +475,18 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 	}
 }
 
-/** A busy attempt: remembered as such, counting nothing against the session. */
-function rememberBusy(
+/**
+ * A busy attempt: recorded as such, counting nothing against the session. A session an
+ * administrator moved back stays so when its re-import could not even start (the session was
+ * busy): the next re-import, not an automatic trigger, picks it up.
+ */
+async function persistBusy(
 	narratorId: string,
 	trigger: SpecImportTrigger,
-	previous: SpecImportRecord | undefined,
-): void {
-	remember(narratorId, {
-		status: "busy",
-		trigger,
-		at: new Date().toISOString(),
-		failures: previous?.failures ?? 0,
-	});
+	previous: SpecImportState | null,
+): Promise<void> {
+	if (previous?.status === "reverted") return;
+	await persist(narratorId, { status: "busy", trigger, reason: null, error: null });
 }
 
 /** The files the import reads content of: live, written, readable. */
@@ -466,6 +511,11 @@ interface Context {
 	signal: AbortSignal | undefined;
 	pause: AbortSignal | undefined;
 	commits: number;
+	/**
+	 * The session was moved back to Dynamic Spec since its last switch (12b2 review S3): its
+	 * fence's plugin SOP may have changed there, so it replaces the plugin's block on the page.
+	 */
+	afterRevert: boolean;
 }
 
 /** What the steps before the move leave for it. */
@@ -476,39 +526,75 @@ interface Written {
 	start: string[];
 }
 
+/** What {@link run} hands back: the outcome, and whether the session was only moved forward. */
+type RunOutcome = Extract<SpecImportOutcome, { status: "imported" }> & { movedForward: boolean };
+
+/**
+ * A digest of the session's Dynamic Spec file pointers: equal digests, the same files at the same
+ * revisions. Kept when an administrator moves the session back (`revert.ts`).
+ */
+export function specPointersDigest(pointers: readonly SpecImportFilePointer[]): string {
+	return createHash("sha256").update(pointerKey(pointers)).digest("hex");
+}
+
 async function run(
 	session: SpecImportSession,
 	pointers: readonly SpecImportFilePointer[],
 	options: SpecImportOptions,
-): Promise<Extract<SpecImportOutcome, { status: "imported" }>> {
+	previous: SpecImportState | null,
+): Promise<RunOutcome> {
 	const { narratorId } = session;
 	const files = importable(pointers);
 	const unreadable = pointers.filter((p) => p.revisionId === null).length;
-	if (pointers.length >= SPEC_IMPORT_READ_LIMITS.files || files.length > SPEC_IMPORT_LIMITS.files)
-		throw new SpecImportAttention(
-			`The session holds more than ${SPEC_IMPORT_LIMITS.files} Dynamic Spec files`,
-			{ code: "too_many_files", count: SPEC_IMPORT_LIMITS.files },
-		);
-	if (
-		tooLargeFor(pointers, { files: SPEC_IMPORT_LIMITS.files, chars: SPEC_IMPORT_LIMITS.totalChars })
-	)
-		throw new SpecImportAttention(
-			`The session's Dynamic Spec files hold more than ${SPEC_IMPORT_LIMITS.totalChars} characters`,
-			{ code: "too_large", count: SPEC_IMPORT_LIMITS.totalChars },
-		);
-
-	let written: Written = { tasks: 0, pages: 0, start: [] };
+	// Moved back by an administrator and its Dynamic Spec not changed since: the outline still
+	// holds what the session had there (and what it did after the first move), so the move is
+	// made again without writing anything (12b2).
+	const movedForward =
+		previous?.revertSourceKey !== null &&
+		previous?.revertSourceKey !== undefined &&
+		previous.revertSourceKey === specPointersDigest(pointers);
+	let written: Written = {
+		tasks: movedForward ? (previous?.tasks ?? 0) : 0,
+		pages: movedForward ? (previous?.pages ?? 0) : 0,
+		start: [],
+	};
 	let ctx: Context | null = null;
-	if (files.length > 0) {
-		const locale: Locale = session.ownerUserId
-			? await getUserLanguage(session.ownerUserId).catch(() => "en" as const)
-			: "en";
-		const space = await outlineStore.ensureSpace(
-			{ kind: "session", narratorId },
-			new Date().toISOString(),
-		);
-		ctx = { session, space, locale, signal: options.signal, pause: options.pause, commits: 0 };
-		written = await writeEverything(ctx, files);
+	if (!movedForward) {
+		if (pointers.length >= SPEC_IMPORT_READ_LIMITS.files || files.length > SPEC_IMPORT_LIMITS.files)
+			throw new SpecImportAttention(
+				`The session holds more than ${SPEC_IMPORT_LIMITS.files} Dynamic Spec files`,
+				{ code: "too_many_files", count: SPEC_IMPORT_LIMITS.files },
+			);
+		if (
+			tooLargeFor(pointers, {
+				files: SPEC_IMPORT_LIMITS.files,
+				chars: SPEC_IMPORT_LIMITS.totalChars,
+			})
+		)
+			throw new SpecImportAttention(
+				`The session's Dynamic Spec files hold more than ${SPEC_IMPORT_LIMITS.totalChars} characters`,
+				{ code: "too_large", count: SPEC_IMPORT_LIMITS.totalChars },
+			);
+		if (files.length > 0) {
+			const locale: Locale = session.ownerUserId
+				? await getUserLanguage(session.ownerUserId).catch(() => "en" as const)
+				: "en";
+			const space = await outlineStore.ensureSpace(
+				{ kind: "session", narratorId },
+				new Date().toISOString(),
+			);
+			ctx = {
+				session,
+				space,
+				locale,
+				signal: options.signal,
+				pause: options.pause,
+				commits: 0,
+				afterRevert:
+					previous?.status === "reverted" || (previous?.revertSourceKey ?? null) !== null,
+			};
+			written = await writeEverything(ctx, files);
+		}
 	}
 
 	// Moved only when what was read is still what is there, and the outline still on.
@@ -524,6 +610,17 @@ async function run(
 	}
 	await move(ctx, narratorId, written.start);
 	invalidateTaskBackend(narratorId);
+	await recordSwitch(session, options.trigger, {
+		ctx,
+		previous,
+		fenceRevisionId: files.find((p) => p.path === "behavior_fence")?.revisionId ?? null,
+		tasks: written.tasks,
+		pages: written.pages,
+		// Nothing to tell a session that never wrote to Dynamic Spec.
+		notice: files.length > 0,
+	});
+	if (previous && previous.revertNoteIds.length > 0)
+		await removeRevertNotes(session, previous.revertNoteIds);
 	await afterMove(session, options);
 	return {
 		status: "imported",
@@ -531,7 +628,109 @@ async function run(
 		pages: written.pages,
 		unreadable,
 		commits: ctx?.commits ?? 0,
+		movedForward,
 	};
+}
+
+/**
+ * The switch, recorded (12b2): the state row says `imported`, counts one more switch (the model's
+ * notice is derived from it; `notice` false records it as told), and keeps where the import
+ * landed and the old fence revision it read, for the Spec panel and a move back.
+ */
+async function recordSwitch(
+	session: SpecImportSession,
+	trigger: SpecImportTrigger,
+	landed: {
+		ctx: Context | null;
+		previous: SpecImportState | null;
+		fenceRevisionId: string | null;
+		tasks: number;
+		pages: number;
+		notice: boolean;
+	},
+): Promise<void> {
+	const { narratorId } = session;
+	let spaceId = landed.ctx?.space.id ?? landed.previous?.spaceId ?? null;
+	let taskPageId = landed.previous?.taskPageId ?? null;
+	try {
+		const space =
+			landed.ctx?.space ?? (await outlineStore.findSpace({ kind: "session", narratorId }));
+		if (space) {
+			spaceId = space.id;
+			const [page] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
+			taskPageId = page?.id ?? null;
+		}
+	} catch (error) {
+		logger.warn("Could not read where an imported session's tasks landed", {
+			narratorId,
+			error: String(error),
+		});
+	}
+	await persist(narratorId, (current) => {
+		const switchCount = (current?.switchCount ?? 0) + 1;
+		return {
+			status: "imported",
+			trigger,
+			attempts: 0,
+			reason: null,
+			error: null,
+			attentionReason: null,
+			switchCount,
+			switchedAt: new Date().toISOString(),
+			noticeSwitch: landed.notice ? (current?.noticeSwitch ?? 0) : switchCount,
+			spaceId,
+			taskPageId,
+			fenceRevisionId: landed.fenceRevisionId,
+			tasks: landed.tasks,
+			pages: landed.pages,
+			revertSourceKey: null,
+			revertNoteIds: [],
+		};
+	});
+}
+
+/**
+ * Take away the markers a move back wrote (12b2) once the session is in the outline again: each
+ * only when nobody but the system wrote it or anything under it (else it stays, as someone's).
+ * Never rejects.
+ */
+async function removeRevertNotes(
+	session: SpecImportSession,
+	noteIds: readonly string[],
+): Promise<void> {
+	const { narratorId } = session;
+	try {
+		const space = await outlineStore.findSpace({ kind: "session", narratorId });
+		if (!space) return;
+		const metas = (await outlineStore.getBlockMetas(space.id, { ids: [...noteIds] })).filter(
+			(meta) => !meta.deleted,
+		);
+		const removable: OutlineBlockMeta[] = [];
+		for (const meta of metas)
+			if (await onlyImportWrote(space, { id: meta.id, versionSeq: meta.versionSeq, page: false }))
+				removable.push(meta);
+		if (removable.length === 0) return;
+		const locale: Locale = session.ownerUserId
+			? await getUserLanguage(session.ownerUserId).catch(() => "en" as const)
+			: "en";
+		await writeOutline({
+			spaceId: space.id,
+			ops: removable.map((meta) => ({
+				op: "delete" as const,
+				block: { id: meta.id },
+				baseVersionSeq: meta.versionSeq,
+			})),
+			actor: { kind: "system", id: OUTLINE_SPEC_REVERT_ACTOR },
+			responsibleUserId: session.ownerUserId,
+			narratorId,
+			summary: SPEC_IMPORT_TEXT[locale].summaryRevertNotesRemoved,
+		});
+	} catch (error) {
+		logger.warn("Could not remove the markers of a move back to Dynamic Spec", {
+			narratorId,
+			error: String(error),
+		});
+	}
 }
 
 /**
@@ -800,6 +999,9 @@ async function writeEverything(
 			await writeImportedFenceSop(
 				{ narratorId, ownerUserId: session.ownerUserId, locale },
 				fence.sop,
+				// After a move back the fence's SOP is the current one (a plugin wrote it there
+				// meanwhile): it replaces the block, whole, or the import needs attention.
+				{ replace: ctx.afterRevert },
 			);
 		} catch (error) {
 			if (error instanceof PluginTaskError && error.publicCode === "PAYLOAD_TOO_LARGE")
@@ -1065,6 +1267,8 @@ async function ensureTasksPage(ctx: Context): Promise<string> {
 const IMPORT_ACTORS: ReadonlySet<string> = new Set([
 	OUTLINE_SPEC_IMPORT_ACTOR,
 	OUTLINE_BEHAVIOR_IMPORT_ACTOR,
+	// The markers a move back to Dynamic Spec left (12b2).
+	OUTLINE_SPEC_REVERT_ACTOR,
 ]);
 
 interface StaleBlock {

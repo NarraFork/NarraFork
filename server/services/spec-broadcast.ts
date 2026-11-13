@@ -9,7 +9,7 @@ import type { SpecResolvedFile } from "./spec-vfs-service";
 export function broadcastSpecChanged(
 	narratorId: string,
 	file: Pick<SpecResolvedFile, "uri" | "path" | "revisionId">,
-	source: "ui" | "tool" | "task_create" | "import",
+	source: "ui" | "tool" | "task_create" | "import" | "revert",
 	updatedBy: "user" | "assistant" | "system" = "assistant",
 ): void {
 	broadcastToNarrator(narratorId, {

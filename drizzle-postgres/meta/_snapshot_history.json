@@ -571,11 +571,19 @@
 		},
 		{
 			"idx": 71,
-			"tag": "0071_api_request_cache_usage_reported",
-			"id": "816f6bf7-1c8f-4e47-a22b-e9f2878bed22",
+			"tag": "0071_outline_spec_imports",
+			"id": "c8a9eeba-aacb-4856-b151-f491477a6d62",
 			"prevId": "1363fe77-68fa-4135-8d93-e64136d06a6d",
 			"version": "7",
-			"snapshotDigest": "f6372ac92494e9fc9bf8fabc2cc54a4ad0c7f404caeb1cdb4f0b07f7f836e5d3"
+			"snapshotDigest": "f9e7d6b4fe840ad6f7991ac9c622049d233e972f53c6a99dd3cfd665a4b201f7"
+		},
+		{
+			"idx": 72,
+			"tag": "0072_api_request_cache_usage_reported",
+			"id": "11493ae9-9036-4353-b911-18624a649666",
+			"prevId": "c8a9eeba-aacb-4856-b151-f491477a6d62",
+			"version": "7",
+			"snapshotDigest": "a99655ddcd191560e9e7b012214cf92ec9efa813515a472cd06bed4251eb15d6"
 		}
 	]
 }

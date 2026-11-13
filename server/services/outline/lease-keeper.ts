@@ -33,6 +33,9 @@
  * nothing for it and puts nothing on the idle lease, so the claim runs out and the expiry job
  * reopens the task, instead of a session that is not an outline session keeping it for good. (Its
  * claims elsewhere, if any, run out with it in that case; the next import starts the tasks again.)
+ * A session an administrator moved back to Dynamic Spec (outline P2 PR 12b2) is treated the same
+ * way for all its claims, in any space: the move back let them go, and nothing renews one that
+ * slipped through.
  * That a spec session holds nothing of the kind is remembered for a while
  * ({@link OUTLINE_LEASE_LEFTOVER_CACHE}), so the renewals of an ordinary Dynamic Spec session do
  * not look at its space and claims each time; an import of the session forgets it
@@ -137,6 +140,10 @@ export function forgetSpecImportLeftover(narratorId: string): void {
 async function holdsImportLeftover(narratorId: string, store?: OutlineStore): Promise<boolean> {
 	const session = await readTaskSession(narratorId);
 	if (session?.backend !== "spec" || session.subagent) return false;
+	// Moved back to Dynamic Spec by an administrator (12b2): its claims, wherever they are, were
+	// let go then; none it may still hold is renewed or kept (one cached primary-key read).
+	const { readSpecImportState } = await import("./spec-import/state");
+	if ((await readSpecImportState(narratorId))?.status === "reverted") return true;
 	const cachedAt = noLeftover.get(narratorId);
 	if (cachedAt !== undefined && Date.now() - cachedAt < OUTLINE_LEASE_LEFTOVER_CACHE.ttlMs)
 		return false;

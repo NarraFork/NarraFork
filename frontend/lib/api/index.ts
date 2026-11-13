@@ -84,11 +84,14 @@ export const api = {
 
 export {
 	type AdminAuthConfig,
+	type AdminLdapConfig,
 	type AdminOidcProvider,
 	type AdminWebauthnConfig,
 	type CreatedRegistrationCode,
 	isMfaChallenge,
 	isPasskeySupported,
+	type LdapProbeResult,
+	type LdapProbeStage,
 	type LoginResult,
 	type LoginSession,
 	type MfaChallenge,

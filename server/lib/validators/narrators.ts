@@ -649,6 +649,17 @@ export const narratorExportQuerySchema = z.object({
 	scope: z.enum(["full", "visible"]).default("visible"),
 	includeToolIO: exportBooleanSchema.default(true),
 	lang: z.enum(["en", "zh-CN"]).default("en"),
+	/** `1,2,3-10,15,21`；省略表示导出当前 scope 的全部消息。 */
+	range: z
+		.string()
+		.max(512)
+		.optional()
+		.transform((value) => value ?? ""),
+});
+
+/** 导出范围选择弹窗读取的轮次摘要；scope 与导出保持一致。 */
+export const narratorExportTurnsQuerySchema = z.object({
+	scope: z.enum(["full", "visible"]).default("visible"),
 });
 
 /**

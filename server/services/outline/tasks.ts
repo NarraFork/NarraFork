@@ -33,6 +33,7 @@
  */
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
+import type { Locale } from "@server/lib/prompt-i18n";
 import { compareOrderKeys, isAlias, parseAddress, serializeBody } from "@shared/outline";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { readDisplayNames } from "./access-reads";
@@ -220,13 +221,32 @@ export function outlineSessionEndedNote(
 	narratorId: string,
 	title: string | null,
 	reason: OutlineSessionEnd,
+	locale: Locale = "en",
 ): string {
+	if (reason === "reverted") {
+		const text = OUTLINE_SESSION_REVERTED_NOTE[locale === "zh-CN" ? "zh-CN" : "en"];
+		return sessionNote(text.lead(title), narratorId, text.tail);
+	}
 	return sessionNote(
 		OUTLINE_TEXT.sessionEnded.lead(reason, title),
 		narratorId,
 		OUTLINE_TEXT.sessionEnded.tail,
 	);
 }
+
+/** The note under a task reopened because its session was moved back to Dynamic Spec (12b2). */
+const OUTLINE_SESSION_REVERTED_NOTE = {
+	en: {
+		lead: (title: string | null) =>
+			`An administrator moved the previous executor's session back to Dynamic Spec (session ${title ? `"${title}" ` : ""}`,
+		tail: "); the task is open again.",
+	},
+	"zh-CN": {
+		lead: (title: string | null) =>
+			`管理员把之前执行它的会话退回了 Dynamic Spec（会话 ${title ? `「${title}」` : ""}`,
+		tail: "），任务重新开放。",
+	},
+} as const;
 
 function sessionNote(lead: string, narratorId: string, tail: string): string {
 	return serializeBody({
@@ -391,7 +411,11 @@ export async function reopenUnclaimedOutlineTasks(
 	);
 }
 
-export type OutlineSessionEnd = "archived" | "deleted";
+/**
+ * Why a session's claims are let go at once: it was archived or deleted, or (outline P2 PR 12b2)
+ * an administrator moved it back to Dynamic Spec, where it no longer works on outline tasks.
+ */
+export type OutlineSessionEnd = "archived" | "deleted" | "reverted";
 
 /**
  * A session was archived or deleted: what it and its subagents hold is let go at once, not when
@@ -411,7 +435,15 @@ export type OutlineSessionEnd = "archived" | "deleted";
 export async function releaseOutlineSessionTaskClaims(
 	narratorId: string,
 	reason: OutlineSessionEnd,
-	options: { store?: OutlineStore; now?: Date; title?: string | null } = {},
+	options: {
+		store?: OutlineStore;
+		now?: Date;
+		title?: string | null;
+		/** The note's language (the move back writes the owner's; the others English). */
+		locale?: Locale;
+		/** The system actor of the commits (the lease job's by default). */
+		actor?: string;
+	} = {},
 ): Promise<OutlineLeaseExpiryResult> {
 	const store = options.store ?? outlineStore;
 	const nowDate = options.now ?? new Date();
@@ -432,7 +464,7 @@ export async function releaseOutlineSessionTaskClaims(
 				options.title !== undefined
 					? options.title
 					: ((await holderNames([narratorId])).get(narratorId) ?? null);
-			note = outlineSessionEndedNote(narratorId, title, reason);
+			note = outlineSessionEndedNote(narratorId, title, reason, options.locale);
 		}
 		const sessions = [narratorId, ...new Set(held.map((e) => e.claim.holderNarratorId as string))];
 		const done = await reopenTasks(
@@ -443,7 +475,11 @@ export async function releaseOutlineSessionTaskClaims(
 				note: note as string,
 			})),
 			nowDate,
-			{ sessions, summary: (n) => OUTLINE_TEXT.sessionEndedSummary(reason, n) },
+			{
+				sessions,
+				summary: (n) => OUTLINE_TEXT.sessionEndedSummary(reason, n),
+				...(options.actor ? { actor: options.actor } : {}),
+			},
 		);
 		result.reopened += done.reopened;
 		result.skipped += done.skipped;

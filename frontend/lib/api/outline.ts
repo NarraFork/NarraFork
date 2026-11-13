@@ -35,7 +35,12 @@ import type {
 	OutlineDigestNowResponse,
 	OutlineDigestUndoResponse,
 } from "@shared/outline-digest";
-import type { OutlineSpecImportStatus } from "@shared/outline-spec-import";
+import type {
+	OutlineSpecImportAdminPage,
+	OutlineSpecImportAdminState,
+	OutlineSpecImportRevertResult,
+	OutlineSpecImportStatus,
+} from "@shared/outline-spec-import";
 import type {
 	NarratorCurrentTaskResponse,
 	OutlineBoardAddRequest,
@@ -250,6 +255,27 @@ export const outlineApi = {
 	/** Start the import of a session's Dynamic Spec now. */
 	startSpecImport: (narratorId: string) =>
 		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`, {
+			method: "POST",
+		}),
+	/** The import's admin page (administrators): one state's sessions, a page at a time. */
+	getSpecImportAdminPage: (query: {
+		state: OutlineSpecImportAdminState;
+		cursor?: string | null;
+		limit?: number;
+	}) => {
+		const params = new URLSearchParams({ state: query.state });
+		if (query.cursor) params.set("cursor", query.cursor);
+		if (query.limit) params.set("limit", String(query.limit));
+		return request<OutlineSpecImportAdminPage>(`/admin/outline/spec-import?${params.toString()}`);
+	},
+	/** An administrator imports a session again (attention and failed attempts cleared). */
+	reimportSpecSession: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/admin/outline/spec-import/${enc(narratorId)}/reimport`, {
+			method: "POST",
+		}),
+	/** An administrator moves a session the import moved back to Dynamic Spec. */
+	revertSpecImport: (narratorId: string) =>
+		request<OutlineSpecImportRevertResult>(`/admin/outline/spec-import/${enc(narratorId)}/revert`, {
 			method: "POST",
 		}),
 	/** A person adds a task to a session. */

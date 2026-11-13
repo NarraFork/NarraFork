@@ -58,6 +58,12 @@ export const SPEC_IMPORT_PLAN_LIMITS = {
 /** The system actor of the import's commits. */
 export const OUTLINE_SPEC_IMPORT_ACTOR = "spec-import";
 
+/**
+ * The system actor of an administrator's move back to Dynamic Spec (outline P2 PR 12b2): its
+ * marker blocks on the task and behavior pages. The import counts them as its own content.
+ */
+export const OUTLINE_SPEC_REVERT_ACTOR = "spec-import-revert";
+
 export const SPEC_IMPORT_TEXT: Record<
 	Locale,
 	{
@@ -71,6 +77,10 @@ export const SPEC_IMPORT_TEXT: Record<
 		summaryTasksPage: string;
 		summaryStart: (n: number) => string;
 		summaryGiveBack: (n: number) => string;
+		/** 12b2: an administrator's move back to Dynamic Spec, and its markers. */
+		summaryRevert: string;
+		summaryRevertNotesRemoved: string;
+		revertNote: (day: string, page: "tasks" | "behavior") => string;
 	}
 > = {
 	en: {
@@ -87,6 +97,10 @@ export const SPEC_IMPORT_TEXT: Record<
 			`Moved from Dynamic Spec: ${n} task${n === 1 ? "" : "s"} in progress, started again by the session`,
 		summaryGiveBack: (n) =>
 			`The import from Dynamic Spec did not finish: ${n} task${n === 1 ? "" : "s"} back to do`,
+		summaryRevert: "An administrator moved this session back to Dynamic Spec",
+		summaryRevertNotesRemoved: "The session is in the outline again: the move-back notes removed",
+		revertNote: (day, page) =>
+			`On ${day} an administrator moved this session back to Dynamic Spec: the session no longer reads its ${page === "tasks" ? "tasks" : "behavior boundary"} here. What is here was kept, nothing was deleted; changes made here from now on do not reach Dynamic Spec.`,
 	},
 	"zh-CN": {
 		blocked: "受阻（导入前在 Dynamic Spec 里的状态）",
@@ -99,6 +113,10 @@ export const SPEC_IMPORT_TEXT: Record<
 		summaryTasksPage: "Dynamic Spec 导入用的任务页",
 		summaryStart: (n) => `从 Dynamic Spec 切换过来：${n} 个进行中的任务由会话重新开始`,
 		summaryGiveBack: (n) => `Dynamic Spec 导入没有完成：${n} 个任务退回待办`,
+		summaryRevert: "管理员把这个会话退回了 Dynamic Spec",
+		summaryRevertNotesRemoved: "会话又回到大纲：删掉退回时留下的说明",
+		revertNote: (day, page) =>
+			`${day} 管理员把这个会话退回了 Dynamic Spec：会话不再读这里的${page === "tasks" ? "任务" : "行为边界"}。这里的内容都保留了，没有删除；之后在这里的改动不会回到 Dynamic Spec。`,
 	},
 };
 

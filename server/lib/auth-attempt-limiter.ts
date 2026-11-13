@@ -360,6 +360,21 @@ export interface AuthAttemptLease {
 
 export type AuthAttemptDecision = AuthAttemptBlocked | AuthAttemptLease;
 
+export interface PasswordAttemptLease extends AuthAttemptLease {
+	/**
+	 * Give the bcrypt concurrency slot back before the attempt settles.
+	 *
+	 * The slot bounds CPU-heavy hashing only. A caller that goes on to wait on network I/O
+	 * (the LDAP fallback) must release it first, or a few slow remote checks would hold
+	 * every slot and answer all other logins with `AUTH_BUSY`. The failure-budget
+	 * reservations are unaffected and still settle through `failure`/`success`/`cancel`.
+	 * Idempotent.
+	 */
+	releaseHashSlot(): void;
+}
+
+export type PasswordAttemptDecision = AuthAttemptBlocked | PasswordAttemptLease;
+
 function blockedFrom(
 	status: BucketStatus,
 	scope: "subject" | "source" | "none",
@@ -497,7 +512,7 @@ export class AuthAttemptLimiter {
 		};
 	}
 
-	beginPassword(identifier: string, sourceIp: string): AuthAttemptDecision {
+	beginPassword(identifier: string, sourceIp: string): PasswordAttemptDecision {
 		const account = fingerprintAuthIdentifier(identifier);
 		const pair = `${account}:${sourceIp}`;
 		const accountStatus = this.passwordAccounts.peek(account);
@@ -560,6 +575,7 @@ export class AuthAttemptLimiter {
 		};
 		return {
 			allowed: true,
+			releaseHashSlot: releaseHash,
 			failure: () => finish("failure"),
 			success: () => {
 				finish("success");

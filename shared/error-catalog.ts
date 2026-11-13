@@ -140,6 +140,39 @@ export const ERROR_CATALOG = {
 		en: "This session's Dynamic Spec is being imported into the outline. Try again in a moment.",
 	},
 	/**
+	 * A Dynamic Spec write for a session the import moved into the outline (outline P2 PR 12b2):
+	 * the same behaviour as {@link SPEC_IN_OUTLINE_SESSION} (its code), worded for the old files.
+	 */
+	SPEC_MOVED_TO_OUTLINE: {
+		status: 409,
+		code: "SPEC_OUTLINE_SESSION",
+		en: "This session's Dynamic Spec was moved into the outline, so its old files are read-only. Its tasks are on the session's task page in the outline, its notes on outline pages and its behavior boundary on the behavior page.",
+	},
+	/** An administrator's move back to Dynamic Spec for a session no import moved (12b2). */
+	SPEC_IMPORT_NOT_REVERTIBLE: {
+		status: 409,
+		code: "SPEC_IMPORT_NOT_REVERTIBLE",
+		en: "Only a session the import moved into the outline can be moved back to Dynamic Spec, and only once per move.",
+	},
+	/** The session (or one of its subagents) is running: the move back waits for it (12b2). */
+	SPEC_IMPORT_SESSION_BUSY: {
+		status: 409,
+		code: "SPEC_IMPORT_SESSION_BUSY",
+		en: "The session is running. Try again when it is idle.",
+	},
+	/** An administrator's re-import while imports are switched off (`outline.specImport`). */
+	SPEC_IMPORT_OFF: {
+		status: 409,
+		code: "SPEC_IMPORT_OFF",
+		en: "Imports from Dynamic Spec are switched off (outline.specImport is off, or the outline is off).",
+	},
+	/** A re-import of a session the import does not move (an outline session, a subagent). */
+	SPEC_IMPORT_NOT_IMPORTABLE: {
+		status: 409,
+		code: "SPEC_IMPORT_NOT_IMPORTABLE",
+		en: "This session is not one the import moves: it is not a main session that still keeps its tasks in Dynamic Spec.",
+	},
+	/**
 	 * `/goal` sent to a subagent of such a session: the goal is a task of the session, and an
 	 * outline subagent has no tasks of its own (D27c).
 	 */

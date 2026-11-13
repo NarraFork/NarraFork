@@ -168,6 +168,14 @@ export async function assertSpecWritable(
  */
 export async function assertSpecTasksUsed(narratorId: string): Promise<void> {
 	if ((await readTaskBackend(narratorId)) === "outline") {
+		// A session the import moved: the refusal says its old files are read-only and where
+		// their content is now (outline P2 PR 12b2); same code, so callers behave the same.
+		const session = await readTaskSession(narratorId).catch(() => null);
+		const root = session?.subagent ? null : (session?.sessionNarratorId ?? narratorId);
+		if (root) {
+			const { isSpecImportedSession } = await import("../outline/spec-import/state");
+			if (await isSpecImportedSession(root)) throw catalogError("SPEC_MOVED_TO_OUTLINE");
+		}
 		throw catalogError("SPEC_IN_OUTLINE_SESSION");
 	}
 }
