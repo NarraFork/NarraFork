@@ -1170,9 +1170,13 @@ outlineRoutes.get("/narrators/:narratorId/spec-import", async (c) => {
 	const principal = principalOf(c);
 	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
 	const { specImportStatus } = await import("../services/outline/spec-import/triggers");
+	const status = await specImportStatus(narrator.id);
 	const body: OutlineSpecImportStatus = {
-		...(await specImportStatus(narrator.id)),
-		canImport: await holds(principal, "write", { narrator }),
+		...status,
+		// A session an administrator moved back is imported again by an administrator only (12b2).
+		canImport:
+			(status.state !== "reverted" || principal.isAdmin) &&
+			(await holds(principal, "write", { narrator })),
 	};
 	return c.json(body);
 });
@@ -1180,16 +1184,20 @@ outlineRoutes.get("/narrators/:narratorId/spec-import", async (c) => {
 /**
  * "Import now" (and its retry): starts the import of the session and answers at once (202) with
  * its state; the import itself runs in the background, on the session while it is idle. Write
- * access to the session. With imports switched off (`outline.specImport`) nothing is started.
+ * access to the session. With imports switched off (`outline.specImport`) nothing is started,
+ * nor for a session an administrator moved back to Dynamic Spec unless the caller is an
+ * administrator (outline P2 PR 12b2).
  */
 outlineRoutes.post("/narrators/:narratorId/spec-import", async (c) => {
 	const principal = principalOf(c);
 	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
 	if (!(await holds(principal, "write", { narrator }))) throw new ForbiddenError();
 	const { requestSpecImport } = await import("../services/outline/spec-import/triggers");
+	// An administrator here re-imports as from the admin page: a moved-back session too (12b2).
+	const status = await requestSpecImport(narrator.id, { admin: principal.isAdmin });
 	const body: OutlineSpecImportStatus = {
-		...(await requestSpecImport(narrator.id)),
-		canImport: true,
+		...status,
+		canImport: status.state !== "reverted" || principal.isAdmin,
 	};
 	return c.json(body, 202);
 });

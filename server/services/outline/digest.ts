@@ -59,7 +59,7 @@ import {
 	type OutlineTaskJson,
 } from "./model";
 import { OUTLINE_PLAN_ACTOR, OUTLINE_PLAN_REVIEW_ACTOR } from "./plans";
-import { OUTLINE_SPEC_IMPORT_ACTOR } from "./spec-import/plan";
+import { OUTLINE_SPEC_IMPORT_ACTOR, OUTLINE_SPEC_REVERT_ACTOR } from "./spec-import/plan";
 import type { OutlineRangeChange, OutlineVersionMeta } from "./store/digest-port";
 import type {
 	OutlineCommitRow,
@@ -127,6 +127,9 @@ const ROUTINE_SYSTEM_ACTORS = new Set([
 	// Old sessions' Dynamic Spec brought into the outline (P2 PR 12b): one session's import is
 	// several commits and many sessions are imported in a day, none of it anyone's work that day.
 	OUTLINE_SPEC_IMPORT_ACTOR,
+	// An administrator's move back to Dynamic Spec (P2 PR 12b2): its markers and the tasks it let
+	// go, bookkeeping of a decision made on the admin page, not anyone's work in the space.
+	OUTLINE_SPEC_REVERT_ACTOR,
 ]);
 
 /** A commit of the Dynamic Spec import: what it writes is where its tasks start from, not news. */

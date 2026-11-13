@@ -568,6 +568,14 @@
 			"prevId": "c15812ac-e414-43f9-aee6-4290c568a3e5",
 			"version": "7",
 			"snapshotDigest": "7379a2f3dd28adf689cf2d6a8247ebb4223bf3afab6df2c7128897259cc70896"
+		},
+		{
+			"idx": 71,
+			"tag": "0071_outline_spec_imports",
+			"id": "c8a9eeba-aacb-4856-b151-f491477a6d62",
+			"prevId": "1363fe77-68fa-4135-8d93-e64136d06a6d",
+			"version": "7",
+			"snapshotDigest": "f9e7d6b4fe840ad6f7991ac9c622049d233e972f53c6a99dd3cfd665a4b201f7"
 		}
 	]
 }

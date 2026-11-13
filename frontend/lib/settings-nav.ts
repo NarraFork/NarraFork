@@ -1,5 +1,6 @@
 import {
 	IconApps,
+	IconArrowsExchange,
 	IconBell,
 	IconBox,
 	IconBrain,
@@ -83,6 +84,8 @@ export const ADMIN_PATHS: ReadonlySet<string> = new Set([
 	"/settings/usage",
 	"/settings/execution-log",
 	"/settings/plugins",
+	// The Dynamic Spec import's admin page (outline P2 PR 12b2).
+	"/settings/outline-import",
 ]);
 
 /** Exact match or sub-path of an admin-only page (e.g. /settings/plugins/:id). */
@@ -141,6 +144,7 @@ const instanceItems: readonly SettingsNavItem[] = [
 	{ to: "/settings/storage", labelKey: "storageSection", Icon: IconDatabase },
 	{ to: "/settings/runtime", labelKey: "runtimeSection", Icon: IconPlayerPlay },
 	{ to: "/settings/plugins", labelKey: "pluginsSection", Icon: IconPuzzle },
+	{ to: "/settings/outline-import", labelKey: "outlineImportSection", Icon: IconArrowsExchange },
 	{ to: "/settings/usage", labelKey: "usageSection", Icon: IconReceipt2 },
 	{ to: "/settings/execution-log", labelKey: "executionLogSection", Icon: IconHistory },
 	{ to: "/settings/about", labelKey: "versionSection", Icon: IconInfoCircle },

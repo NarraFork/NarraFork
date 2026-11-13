@@ -9,20 +9,28 @@
  *      and once per process: anything else is left to the idle job, and this run goes on as a
  *      Dynamic Spec run.
  *   2. THE IDLE JOB ({@link startSpecImportJob}): a while after the server started, and then at
- *      intervals, the spec namespaces are walked page by page on their primary key, one session
- *      at a time with a pause between them. A session is taken without interrupting it (the
+ *      intervals, the spec namespaces are walked page by page on their primary key, sessions in
+ *      use first and archived ones after them, one session at a time with a pause between them,
+ *      at most {@link SPEC_IMPORT_JOB.importsPerPass} imports a pass; a pass cut short by that
+ *      limit (or stopped) leaves where it was, and the next goes on from there, wrapping to the
+ *      start after the end, so sessions that stay busy cannot keep later ones from being reached. A session is taken without interrupting it (the
  *      admission a file revert takes, which also covers its subagents): a busy one is skipped and
  *      met again on the next pass. The admission holds the session's messages, so an import holds
  *      it at most {@link SPEC_IMPORT_JOB.budgetMs} and gives way at once when a message for it
  *      arrives (`busy`; the next pass goes on where it stopped). A session that failed
- *      {@link SPEC_IMPORT_JOB.attempts} times in this process, or needs attention, is left to the
- *      button.
+ *      {@link SPEC_IMPORT_JOB.attempts} times, needs attention or was moved back by an
+ *      administrator is left to the button (or the administrator).
  *   3. THE BUTTON ({@link requestSpecImport}): the Spec panel's "Import now" (and its retry). The
  *      request only starts the import and answers at once; the panel reads the state
  *      ({@link specImportStatus}) and hears `spec_changed` when the session was moved.
  *
- * `outline.specImport` chooses: `auto` all three, `manual` (the shipped default, `DEFAULTS`) the
- * button only (the job runs but finds nothing to do), `off` none.
+ * `outline.specImport` chooses: `auto` all three, `manual` the button only (the job runs but
+ * finds nothing to do), `off` none. The shipped default is the one in `DEFAULTS`.
+ *
+ * How each session's last attempt went is persisted (`state.ts`, outline P2 PR 12b2): the first
+ * two triggers leave alone a session that needs attention, failed
+ * {@link SPEC_IMPORT_JOB.attempts} times, or was moved back to Dynamic Spec by an administrator,
+ * also after a restart ({@link leftAlone}).
  *
  * On PostgreSQL the session runtime does not run, so there is nothing to wait for: the job and the
  * button import without an admission, and no run starts one.
@@ -34,14 +42,15 @@ import { readTaskSession } from "../../task-source/backend";
 import { outlineAccessBackend } from "../access-reads";
 import {
 	importSpecSession,
+	readSpecImportRecord,
 	type SpecImportOutcome,
 	SpecImportPaused,
 	type SpecImportRecord,
 	specImportMode,
-	specImportRecord,
 	specImportSkipReason,
 } from "./importer";
 import { readSpecImportSession, readSpecNamespacePage } from "./read-port";
+import { readSpecImportState, type SpecImportState } from "./state";
 
 /** What a session may hold to be imported at the start of a run. */
 export const SPEC_IMPORT_RUN_LIMITS = {
@@ -59,11 +68,16 @@ export const SPEC_IMPORT_JOB = {
 	firstPassMs: 60_000,
 	/** Between sessions of a pass. */
 	pauseMs: 200,
+	/**
+	 * Imports one pass tries at most (sessions in use before archived ones); past it the pass
+	 * ends and the next comes after `retryPassMs`.
+	 */
+	importsPerPass: 50,
 	/** After a pass that left sessions behind (busy, failed). */
 	retryPassMs: 10 * 60_000,
 	/** After a pass that left none: new spec sessions are rare (a plugin's recruits, forks). */
 	idlePassMs: 60 * 60_000,
-	/** Failed attempts of one session in this process after which the job leaves it alone. */
+	/** Failed attempts of one session after which the automatic triggers leave it alone. */
 	attempts: 3,
 	/**
 	 * How long one idle import may hold its session (it holds the session's revert admission, so
@@ -133,6 +147,9 @@ export async function importSpecAtRunStart(
 		if (triedAtRun.has(narratorId)) return null;
 		if (options.subagentsRunning()) return null;
 		triedAtRun.add(narratorId);
+		// What earlier attempts left (persisted, 12b2): a session that needs attention, failed too
+		// often or was moved back by an administrator is not tried here.
+		if (leftAlone(await readSpecImportState(narratorId))) return null;
 		while (triedAtRun.size > SPEC_IMPORT_RUN_LIMITS.remembered) {
 			const oldest = triedAtRun.values().next().value;
 			if (oldest === undefined) break;
@@ -162,6 +179,20 @@ export async function importSpecAtRunStart(
 	}
 }
 
+/**
+ * Whether the automatic triggers leave a session alone (12b2: read from the persisted state, so
+ * this holds across restarts): it needs attention, failed {@link SPEC_IMPORT_JOB.attempts} times,
+ * or an administrator moved it back to Dynamic Spec. The button and an administrator's re-import
+ * still import it.
+ */
+export function leftAlone(state: SpecImportState | null): boolean {
+	return (
+		state?.status === "attention" ||
+		state?.status === "reverted" ||
+		(state?.status === "failed" && state.attempts >= SPEC_IMPORT_JOB.attempts)
+	);
+}
+
 /** Forget which sessions were tried at a run start (tests). */
 export function resetSpecImportRunTries(): void {
 	triedAtRun.clear();
@@ -178,13 +209,13 @@ export function resetSpecImportRunTries(): void {
  */
 export async function importSpecSessionIdle(
 	narratorId: string,
-	trigger: "sweep" | "manual",
+	trigger: "sweep" | "manual" | "admin",
 	options: { budgetMs?: number; messageCheckMs?: number } = {},
 ): Promise<SpecImportOutcome> {
 	const controller = new AbortController();
 	const budgetMs =
 		options.budgetMs ??
-		(trigger === "manual" ? SPEC_IMPORT_JOB.manualBudgetMs : SPEC_IMPORT_JOB.budgetMs);
+		(trigger === "sweep" ? SPEC_IMPORT_JOB.budgetMs : SPEC_IMPORT_JOB.manualBudgetMs);
 	// The first reason stands; a person's message makes a pause asked for already urgent.
 	const pause = (why: string, urgent: boolean) => {
 		const current: unknown = controller.signal.reason;
@@ -292,21 +323,31 @@ export interface SpecImportStatus {
 	mode: "auto" | "manual" | "off";
 	/** The session is one the import moves: a root session still in Dynamic Spec. */
 	importable: boolean;
-	/** `idle`: not tried in this process (or the session is not importable). */
+	/** `idle`: never tried (or the session is not importable). */
 	state: "idle" | SpecImportRecord["status"];
 	/** Why the last attempt did not move the session (English, as logged). */
 	error: string | null;
 	/** The same, for the Spec panel to say in the reader's language. */
 	reason: OutlineSpecImportReason | null;
 	at: string | null;
+	/** Failed attempts since the last success. */
+	attempts: number;
+	/** When an import last moved the session to the outline (null: never). */
+	switchedAt: string | null;
+	/** Where it landed: the session space and its task page (the read-only line's link). */
+	spaceId: string | null;
+	taskPageId: string | null;
+	/** When an administrator last moved it back to Dynamic Spec. */
+	revertedAt: string | null;
 }
 
-/** One primary-key read and what this process remembers. */
+/** One primary-key read of the session, and its import state (cached, else one more). */
 export async function specImportStatus(narratorId: string): Promise<SpecImportStatus> {
 	const mode = specImportMode();
 	const session = await readSpecImportSession(narratorId);
 	const importable = mode !== "off" && specImportSkipReason(session) === null;
-	const record = specImportRecord(narratorId);
+	const state = await readSpecImportState(narratorId);
+	const record = await readSpecImportRecord(narratorId);
 	return {
 		mode,
 		importable,
@@ -314,6 +355,11 @@ export async function specImportStatus(narratorId: string): Promise<SpecImportSt
 		error: record?.error ?? null,
 		reason: record?.reason ?? null,
 		at: record?.at ?? null,
+		attempts: state?.attempts ?? 0,
+		switchedAt: state?.switchedAt ?? null,
+		spaceId: state?.spaceId ?? null,
+		taskPageId: state?.taskPageId ?? null,
+		revertedAt: state?.revertedAt ?? null,
 	};
 }
 
@@ -321,14 +367,22 @@ const manual = hotSafe("narrafork.outline.specImport.manual", () => new Set<Prom
 
 /**
  * Trigger 3: start the import of a session now and answer at once with its state. The caller has
- * checked that the person may write the session.
+ * checked that the person may write the session. A session an administrator moved back to
+ * Dynamic Spec is imported again only by an administrator (`admin`: the admin page's re-import,
+ * which also clears attention and the failed attempts first, `admin.ts`).
  */
-export async function requestSpecImport(narratorId: string): Promise<SpecImportStatus> {
+export async function requestSpecImport(
+	narratorId: string,
+	options: { admin?: boolean } = {},
+): Promise<SpecImportStatus> {
 	const before = await specImportStatus(narratorId);
 	if (!before.importable || before.state === "running") return before;
-	const run = importSpecSessionIdle(narratorId, "manual").catch((error: unknown) =>
+	if (before.state === "reverted" && !options.admin) return before;
+	const trigger = options.admin ? "admin" : "manual";
+	const run = importSpecSessionIdle(narratorId, trigger).catch((error: unknown) =>
 		logger.warn("Dynamic Spec import from the Spec panel failed", {
 			narratorId,
+			trigger,
 			error: String(error),
 		}),
 	);
@@ -374,38 +428,73 @@ const job: {
  * session in hand.
  */
 export async function runSpecImportPass(
-	options: { stop?: () => boolean; pauseMs?: number } = {},
+	options: { stop?: () => boolean; pauseMs?: number; maxImports?: number } = {},
 ): Promise<SpecImportPass> {
 	const pass: SpecImportPass = { seen: 0, imported: 0, left: 0, givenUp: 0 };
-	let cursor: string | null = null;
-	for (;;) {
-		if (options.stop?.() || specImportMode() !== "auto") break;
-		const page = await readSpecNamespacePage(cursor);
-		for (const session of page.sessions) {
-			if (options.stop?.()) break;
-			if (specImportSkipReason(session) !== null) continue;
-			pass.seen++;
-			const record = specImportRecord(session.narratorId);
-			if (
-				record?.status === "attention" ||
-				(record?.status === "failed" && record.failures >= SPEC_IMPORT_JOB.attempts)
-			) {
-				pass.givenUp++;
-				continue;
+	const maxImports = options.maxImports ?? SPEC_IMPORT_JOB.importsPerPass;
+	let attempts = 0;
+	// Where the last pass stopped (round 2 review): sessions that stay busy early in the order
+	// cannot keep later ones from being reached. The end of the walk wraps to its start.
+	const from = { ...passPosition };
+	// Sessions in use first, archived ones after them (review NIT): two walks over the same pages.
+	for (const archived of [false, true]) {
+		if (from.archived && !archived) continue;
+		let cursor: string | null = from.archived === archived ? from.after : null;
+		/** The namespace before the session in hand: a pass cut short resumes at that session. */
+		let before = cursor;
+		const stopAt = (): SpecImportPass => {
+			passPosition.archived = archived;
+			passPosition.after = before;
+			return pass;
+		};
+		for (;;) {
+			if (options.stop?.() || specImportMode() !== "auto") return stopAt();
+			const page = await readSpecNamespacePage(cursor);
+			for (const session of page.sessions) {
+				if (options.stop?.()) return stopAt();
+				const skip = session.archived !== archived || specImportSkipReason(session) !== null;
+				if (!skip) {
+					pass.seen++;
+					if (leftAlone(await readSpecImportState(session.narratorId))) pass.givenUp++;
+					else {
+						// At most so many imports a pass: the next one goes on from this session.
+						if (attempts >= maxImports) {
+							pass.left++;
+							return stopAt();
+						}
+						attempts++;
+						const outcome = await importSpecSessionIdle(session.narratorId, "sweep");
+						if (outcome.status === "imported") pass.imported++;
+						else if (outcome.status === "failed" && outcome.attention) pass.givenUp++;
+						else if (outcome.status !== "skipped") pass.left++;
+						await new Promise<void>((resolve) => {
+							const timer = setTimeout(resolve, options.pauseMs ?? SPEC_IMPORT_JOB.pauseMs);
+							timer.unref?.();
+						});
+					}
+				}
+				before = session.namespaceId;
 			}
-			const outcome = await importSpecSessionIdle(session.narratorId, "sweep");
-			if (outcome.status === "imported") pass.imported++;
-			else if (outcome.status === "failed" && outcome.attention) pass.givenUp++;
-			else if (outcome.status !== "skipped") pass.left++;
-			await new Promise<void>((resolve) => {
-				const timer = setTimeout(resolve, options.pauseMs ?? SPEC_IMPORT_JOB.pauseMs);
-				timer.unref?.();
-			});
+			if (page.next === null) break;
+			cursor = page.next;
 		}
-		if (page.next === null) break;
-		cursor = page.next;
 	}
+	// The whole walk done: the next pass starts over.
+	passPosition.archived = false;
+	passPosition.after = null;
 	return pass;
+}
+
+/** Where the idle job's next pass starts (in memory: a restart starts over). */
+const passPosition = hotSafe("narrafork.outline.specImport.passPosition", () => ({
+	archived: false,
+	after: null as string | null,
+}));
+
+/** Start the next pass at the beginning (tests). */
+export function resetSpecImportPassPosition(): void {
+	passPosition.archived = false;
+	passPosition.after = null;
 }
 
 function schedule(ms: number): void {

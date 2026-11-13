@@ -6331,6 +6331,64 @@ export const outlineDigests = sqliteTable(
 	],
 );
 
+// === outline_spec_imports ===
+/**
+ * The import of a session's Dynamic Spec into the outline (outline P2 PR 12b2): one row per root
+ * session that an import was tried for, or that was moved back to Dynamic Spec. No row: never
+ * tried. The source of truth for the Spec panel's banner, the automatic triggers' attempt limits
+ * (which survive restarts), the model's one notice per switch and the admin page; the service
+ * keeps an in-memory cache only (`services/outline/spec-import/state.ts`). Small rows: ids,
+ * codes, counts and times; `last_error_detail` is at most 300 characters.
+ *
+ *   - `status`: `idle`, `running` (read back after a restart as `busy`), `imported`, `failed`,
+ *     `attention`, `busy`, `reverted` (an administrator moved the session back to Dynamic Spec).
+ *   - `attempts`: failed attempts since the last success or an administrator's re-import.
+ *   - `switch_count`: how often an import moved the session to the outline; `notice_switch` the
+ *     switch whose notice the session's history holds (the notice's id is derived from it).
+ *   - `space_id`, `task_page_id`, `fence_revision_id`: where the import landed, and the old fence
+ *     revision it read (restored when the session is moved back).
+ *   - `revert_*`: the last move back, who made it, a digest of the Dynamic Spec file pointers
+ *     then (an unchanged spec is moved forward again without writing) and the marker blocks it
+ *     wrote (JSON array of block ids).
+ */
+export const outlineSpecImports = sqliteTable(
+	"outline_spec_imports",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		status: text("status", {
+			enum: ["idle", "running", "imported", "failed", "attention", "busy", "reverted"],
+		}).notNull(),
+		trigger: text("trigger"),
+		attempts: integer("attempts").notNull().default(0),
+		lastErrorCode: text("last_error_code"),
+		lastErrorCount: integer("last_error_count"),
+		lastErrorDetail: text("last_error_detail"),
+		attentionReason: text("attention_reason"),
+		switchCount: integer("switch_count").notNull().default(0),
+		switchedAt: text("switched_at"),
+		noticeSwitch: integer("notice_switch").notNull().default(0),
+		spaceId: text("space_id"),
+		taskPageId: text("task_page_id"),
+		fenceRevisionId: text("fence_revision_id"),
+		tasks: integer("tasks"),
+		pages: integer("pages"),
+		revertCount: integer("revert_count").notNull().default(0),
+		revertedAt: text("reverted_at"),
+		revertedBy: text("reverted_by"),
+		revertSourceKey: text("revert_source_key"),
+		revertNoteIds: text("revert_note_ids"),
+		lastActor: text("last_actor"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		// The admin page: by state, most recently changed first, and the bounded counts per state.
+		index("idx_outline_spec_imports_status").on(table.status, table.updatedAt, table.narratorId),
+	],
+);
+
 // === scheduled tasks ===
 // A scheduled task periodically starts a narrator with a preset prompt. The schedule is
 // always stored as a cron expression (the UI may generate it from friendly presets). At

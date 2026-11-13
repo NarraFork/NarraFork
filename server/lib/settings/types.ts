@@ -732,9 +732,10 @@ export interface NarraForkSettings {
 		 * How sessions that still keep their tasks in Dynamic Spec are imported into the outline
 		 * (outline P2 PR 12b), while `enabled` is on: their current spec files, tasks and behavior
 		 * fence are written into the session space, checked one by one, and the session is moved
-		 * to the outline (its Dynamic Spec rows stay). `manual` (the default): only from the Spec
-		 * panel's button. `auto`: also before a small session's next run and by a background job
-		 * while sessions are idle. `off`: not at all.
+		 * to the outline (its Dynamic Spec rows stay). `auto` (the default, outline P2 PR 12b2):
+		 * before a small session's next run, by a background job while sessions are idle, and from
+		 * the Spec panel's button. `manual`: only from the button (and an administrator's
+		 * re-import). `off`: not at all.
 		 */
 		specImport?: "auto" | "manual" | "off";
 	};

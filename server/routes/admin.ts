@@ -34,10 +34,14 @@ import { terminalService } from "../services/terminal-service";
 import { releaseUserForeignKeys } from "../services/user-deletion";
 import { ProcessSnapshot } from "../terminal/dtach-service";
 import { getExternalNarratorConnectionSnapshot } from "../websocket/oauth-connection-registry";
+import { outlineSpecImportAdminRoutes } from "./admin-outline-spec-import";
 
 export const adminRoutes = new Hono();
 
 adminRoutes.use("*", requireAuth, requireAdmin);
+
+// The Dynamic Spec import's admin page and its actions (outline P2 PR 12b2).
+adminRoutes.route("/outline/spec-import", outlineSpecImportAdminRoutes);
 
 adminRoutes.get("/users", async (c) => {
 	const allUsers = await db.query.users.findMany({
