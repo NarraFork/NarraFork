@@ -184,6 +184,15 @@ export const ERROR_CATALOG = {
 		code: "SPEC_LOSS_NO_PAGE",
 		en: "The page this file was imported to is not there (it was deleted, or the file was never imported), so the content cannot be attached. It can still be read and copied here.",
 	},
+	/**
+	 * Attaching possibly lost content of the behavior fence without the person's confirmation
+	 * (12c): the behavior page is shown to the agent as standing rules.
+	 */
+	SPEC_LOSS_RULE_CONFIRM: {
+		status: 409,
+		code: "SPEC_LOSS_RULE_CONFIRM",
+		en: "This content was removed from the session's behavior rules. Attached to the behavior page, the agent reads it as a rule again. Confirm that this is what you want.",
+	},
 	/** A re-import of a session the import does not move (an outline session, a subagent). */
 	SPEC_IMPORT_NOT_IMPORTABLE: {
 		status: 409,

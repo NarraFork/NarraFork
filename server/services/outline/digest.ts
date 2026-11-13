@@ -139,8 +139,9 @@ const ROUTINE_SYSTEM_ACTORS = new Set([
 	// An administrator's move back to Dynamic Spec (P2 PR 12b2): its markers and the tasks it let
 	// go, bookkeeping of a decision made on the admin page, not anyone's work in the space.
 	OUTLINE_SPEC_REVERT_ACTOR,
-	// Possibly lost Dynamic Spec content a person attached to its imported page (P2 PR 12c): old
-	// content shown where it belongs (owner decision D52: on the page only), not work of the day.
+	// Possibly lost Dynamic Spec content attached to its imported page, by the scan's pass or
+	// because a person asked, and its removal on a dismissal (P2 PR 12c): old content shown where
+	// it belongs (owner decision D52: on the page only), not work of the day.
 	OUTLINE_SPEC_LOSS_ACTOR,
 ]);
 

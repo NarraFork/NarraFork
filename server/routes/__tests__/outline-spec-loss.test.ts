@@ -11,6 +11,8 @@
  *    (403); a writer decides; someone who cannot read the session gets 404; a finding of another
  *    session is 404 under this one;
  *  - lists never carry the lost text; bad input is 400; a second decision is 409 with its code;
+ *  - a finding of the behavior fence is attached only with `confirmRule` (409 with its code
+ *    otherwise, on both routes); every decision is 409 while an import works on the session;
  *  - with the outline off the routes are a plain 404.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`.
@@ -45,6 +47,7 @@ import { readSpecLossScan } from "../../services/outline/spec-import/loss-store"
 import { readSpecImportSession } from "../../services/outline/spec-import/read-port";
 import { writeSpecFile } from "../../services/spec-vfs-service";
 import { invalidateTaskBackend } from "../../services/task-source";
+import { beginSpecImport } from "../../services/task-source/backend";
 import { outlineSpecImportAdminRoutes } from "../admin-outline-spec-import";
 import { outlineRoutes } from "../outline";
 
@@ -124,6 +127,8 @@ beforeEach(async () => {
 	invalidateTaskBackend();
 	resetSpecImportRecords();
 	resetSpecLossScanState();
+	// The saves of these cases count as made with the old editor.
+	settings.outline.specLossCutoff = "2999-01-01T00:00:00.000Z";
 	await db.delete(outlineSpecLossScans);
 });
 afterAll(async () => {
@@ -333,6 +338,88 @@ describe("a session's routes", () => {
 		);
 		expect(reopened.body.status).toBe("attached");
 		expect(reopened.body.blockId).toBeString();
+	});
+
+	test("a finding of the behavior fence: attach is 409 until the request carries the confirmation; 409 while an import runs", async () => {
+		const { id, owner } = await makeSession();
+		const userId = owner as string;
+		await writeSpecFile(id, "spec://tasks.json", JSON.stringify({ tasks: [{ text: "a" }] }), {
+			actor: "agent",
+			createdBy: "assistant",
+		});
+		await writeSpecFile(id, "spec://behavior_fence", `Rules\n\n${TABLE}\n`, {
+			actor: "user",
+			createdBy: "user",
+		});
+		await writeSpecFile(id, "spec://behavior_fence", "Rules\n", {
+			actor: "user",
+			createdBy: "user",
+		});
+		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
+			status: "imported",
+		});
+		await scanSpecSessionLossById(id);
+		const session = await readSpecImportSession(id);
+		if (!session) throw new Error("no session");
+		// A pass attaches nothing of it.
+		expect(await attachSpecLossForSession(session)).toEqual({ attached: 0, left: 0 });
+		const base = `/outline/narrators/${id}/spec-import/loss`;
+		const page = await call<OutlineSpecLossPage>(userId, "user", "GET", `${base}?status=open`);
+		const finding = page.body.items[0];
+		expect(finding).toMatchObject({
+			path: "behavior_fence",
+			attachNote: "rule_page",
+			rulePage: true,
+			attachable: true,
+		});
+		const post = (body: unknown) =>
+			call<OutlineSpecLossFinding & { messageCode?: string }>(
+				userId,
+				"user",
+				"POST",
+				`${base}/${finding?.id}`,
+				body,
+			);
+		const refused = await post({ action: "attach" });
+		expect(refused.status).toBe(409);
+		expect(refused.body.messageCode).toBe("SPEC_LOSS_RULE_CONFIRM");
+		expect((await post({ action: "attach", confirmRule: false })).status).toBe(409);
+		expect((await post({ action: "attach", confirmRule: "yes" })).status).toBe(400);
+		// An import working on the session: not now, whatever is asked.
+		const end = beginSpecImport(id);
+		try {
+			for (const body of [{ action: "attach", confirmRule: true }, { action: "dismiss" }]) {
+				const busy = await post(body);
+				expect(busy.status).toBe(409);
+				expect(busy.body.messageCode).toBe("SPEC_IMPORT_IN_PROGRESS");
+			}
+		} finally {
+			end();
+		}
+		const attached = await post({ action: "attach", confirmRule: true });
+		expect(attached.status).toBe(200);
+		expect(attached.body).toMatchObject({ status: "attached", rulePage: true });
+		// The admin route asks for the confirmation as well.
+		const admin = await makeAdmin();
+		await post({ action: "dismiss" });
+		await call(admin, "admin", "POST", `${ADMIN}/loss/${finding?.id}`, { action: "reopen" });
+		const adminRefused = await call<{ messageCode: string }>(
+			admin,
+			"admin",
+			"POST",
+			`${ADMIN}/loss/${finding?.id}`,
+			{ action: "attach" },
+		);
+		expect(adminRefused.status).toBe(409);
+		expect(adminRefused.body.messageCode).toBe("SPEC_LOSS_RULE_CONFIRM");
+		const adminAttached = await call<OutlineSpecLossFinding>(
+			admin,
+			"admin",
+			"POST",
+			`${ADMIN}/loss/${finding?.id}`,
+			{ action: "attach", confirmRule: true },
+		);
+		expect(adminAttached.body).toMatchObject({ status: "attached" });
 	});
 
 	test("a reader who may not write reads the findings and decides nothing", async () => {

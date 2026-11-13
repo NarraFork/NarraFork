@@ -16,7 +16,11 @@ import type {
 	OutlineSpecLossStatus,
 } from "@shared/outline-spec-import";
 import { OUTLINE_SPEC_LOSS_STATUSES } from "@shared/outline-spec-import";
-import { isSpecLossKind, type SpecLossExcerptPart } from "@shared/spec-content-loss";
+import {
+	isSpecLossKind,
+	SPEC_LOSS_FENCE_PATH,
+	type SpecLossExcerptPart,
+} from "@shared/spec-content-loss";
 import { sql } from "drizzle-orm";
 import { runOutlineAccessQuery } from "../access-reads";
 
@@ -51,7 +55,35 @@ const ATTACH_NOTES: readonly OutlineSpecLossAttachNote[] = [
 	"session_cap",
 	"restored",
 	"failed",
+	"gave_up",
+	"reattach_cap",
+	"list_only",
+	"rule_page",
+	"fork",
+	"block_deleted",
 ];
+
+/**
+ * Why a finding is never attached by a pass, or null when it may be (owner decision 2026-11-13:
+ * 「只自动贴表格，其余只列出」):
+ *   - `rule_page`: it is of the behavior fence. That page is shown to the model as standing rules,
+ *     so putting a removed rule back would make it apply again; only a person may, through a
+ *     confirmation that says so;
+ *   - `fork`: the save was made in the session this one was forked from; it is attached there,
+ *     once, and only listed in every fork;
+ *   - `list_only`: it holds something other than tables (task items, images, HTML, footnotes,
+ *     front matter): removals on purpose cannot be told from losses often enough.
+ */
+export function specLossListedNote(finding: {
+	path: string;
+	kinds: Partial<Record<OutlineSpecLossKind, number>>;
+	inherited: boolean;
+}): "rule_page" | "fork" | "list_only" | null {
+	if (finding.path === SPEC_LOSS_FENCE_PATH) return "rule_page";
+	if (finding.inherited) return "fork";
+	const kinds = Object.entries(finding.kinds).filter(([, n]) => (n ?? 0) > 0);
+	return kinds.length > 0 && kinds.every(([kind]) => kind === "table") ? null : "list_only";
+}
 
 function attachNoteOf(value: string | null): OutlineSpecLossAttachNote | null {
 	return ATTACH_NOTES.find((note) => note === value) ?? null;
@@ -96,6 +128,8 @@ export function specLossExcerptParts(value: string | null): SpecLossExcerptPart[
 /** A revision without its content. */
 export interface SpecRevisionMeta {
 	id: string;
+	/** The namespace (session) the revision was written in. */
+	namespaceId: string | null;
 	parentRevisionId: string | null;
 	createdBy: string;
 	createdAt: string | null;
@@ -111,20 +145,24 @@ export interface SpecRevisionMeta {
 export async function readSpecRevisionChain(revisionId: string): Promise<SpecRevisionMeta[]> {
 	const limit = SPEC_LOSS_STORE_LIMITS.chainPage;
 	const rows = await runOutlineAccessQuery(sql`
-		with recursive chain (id, parent_revision_id, created_by, created_at, chars, depth) as (
-			select r.id, r.parent_revision_id, r.created_by, r.created_at, length(r.content), 0
+		with recursive chain (
+			id, namespace_id, parent_revision_id, created_by, created_at, chars, depth
+		) as (
+			select r.id, r.namespace_id, r.parent_revision_id, r.created_by, r.created_at,
+				length(r.content), 0
 			from spec_file_revisions r where r.id = ${revisionId}
 			union all
-			select p.id, p.parent_revision_id, p.created_by, p.created_at, length(p.content),
-				c.depth + 1
+			select p.id, p.namespace_id, p.parent_revision_id, p.created_by, p.created_at,
+				length(p.content), c.depth + 1
 			from spec_file_revisions p join chain c on p.id = c.parent_revision_id
 			where c.depth < ${limit - 1}
 		)
-		select id, parent_revision_id, created_by, created_at, chars, depth
+		select id, namespace_id, parent_revision_id, created_by, created_at, chars, depth
 		from chain order by depth limit ${limit}
 	`);
 	return rows.map((row) => ({
 		id: String(row.id),
+		namespaceId: str(row, "namespace_id"),
 		parentRevisionId: str(row, "parent_revision_id"),
 		createdBy: str(row, "created_by") ?? "",
 		createdAt: str(row, "created_at"),
@@ -194,24 +232,28 @@ export interface NewSpecLossFinding {
 	items: number;
 	parts: SpecLossExcerptPart[];
 	truncated: boolean;
+	/** The save was made in the session this one was forked from. */
+	inherited: boolean;
 }
 
 /**
- * Record a finding unless it is recorded already (its id follows from the session, the path and
- * the revision before the save): what a person decided about it is never touched. True when the
- * row is new.
+ * Record a finding unless it is recorded already (its id follows from the session, the path, the
+ * revision before the save and whether it is the tables or the rest): what a person decided about
+ * it is never touched. A finding no pass attaches says so from the start
+ * ({@link specLossListedNote}). True when the row is new.
  */
 export async function insertSpecLossFinding(finding: NewSpecLossFinding): Promise<boolean> {
 	const now = new Date().toISOString();
 	const rows = await runOutlineAccessQuery(sql`
 		insert into outline_spec_loss_findings (
 			id, narrator_id, path, before_revision_id, after_revision_id, before_at, saved_at,
-			kinds, items, excerpt, truncated, status, created_at, updated_at
+			kinds, items, excerpt, truncated, status, attach_note, inherited, created_at, updated_at
 		) values (
 			${finding.id}, ${finding.narratorId}, ${finding.path}, ${finding.beforeRevisionId},
 			${finding.afterRevisionId}, ${finding.beforeAt}, ${finding.savedAt},
 			${JSON.stringify(finding.kinds)}, ${finding.items}, ${JSON.stringify(finding.parts)},
-			${finding.truncated ? 1 : 0}, 'open', ${now}, ${now}
+			${finding.truncated ? 1 : 0}, 'open', ${specLossListedNote(finding)},
+			${finding.inherited ? 1 : 0}, ${now}, ${now}
 		)
 		on conflict (id) do nothing
 		returning id
@@ -225,6 +267,10 @@ export interface SpecLossFindingRow extends OutlineSpecLossFinding {
 	afterRevisionId: string;
 	resolvedBy: string | null;
 	attachSeq: number;
+	/** Automatic attaches that failed. */
+	attachAttempts: number;
+	/** The save was made in the session this one was forked from. */
+	inherited: boolean;
 	/** The session's task backend now. */
 	taskBackend: string | null;
 	ownerUserId: string | null;
@@ -234,8 +280,8 @@ export interface SpecLossFindingRow extends OutlineSpecLossFinding {
 
 const LIST_COLUMNS = sql`
 	f.id, f.narrator_id, f.path, f.before_revision_id, f.after_revision_id, f.saved_at, f.kinds,
-	f.truncated, f.status, f.block_id, f.attach_note, f.attach_seq, f.resolved_by, f.resolved_at,
-	f.created_at,
+	f.truncated, f.status, f.block_id, f.attach_note, f.attach_seq, f.attach_attempts, f.inherited,
+	f.resolved_by, f.resolved_at, f.created_at,
 	n.title, n.task_backend, n.owner_user_id,
 	(select sp.id from outline_spaces sp
 		where sp.narrator_id = f.narrator_id and sp.kind = 'session' limit 1) as space_id
@@ -245,17 +291,22 @@ function findingOf(row: Row): SpecLossFindingRow {
 	const status = str(row, "status");
 	const taskBackend = str(row, "task_backend");
 	const open = status === "open";
+	const note = attachNoteOf(str(row, "attach_note"));
+	const path = str(row, "path") ?? "";
 	return {
 		id: String(row.id),
 		narratorId: String(row.narrator_id),
 		title: str(row, "title"),
-		path: str(row, "path") ?? "",
+		path,
 		savedAt: str(row, "saved_at"),
 		kinds: kindsOf(str(row, "kinds")),
 		truncated: num(row, "truncated") !== 0,
 		status: isSpecLossStatus(status) ? status : "open",
 		blockId: str(row, "block_id"),
-		attachNote: open ? attachNoteOf(str(row, "attach_note")) : null,
+		// Of an open finding: why it is not on the page. Of a dismissed one: only that its block was
+		// deleted on the page (nobody pressed "dismiss").
+		attachNote: open || (status === "dismissed" && note === "block_deleted") ? note : null,
+		rulePage: path === SPEC_LOSS_FENCE_PATH,
 		spaceId: str(row, "space_id"),
 		resolvedAt: str(row, "resolved_at"),
 		createdAt: str(row, "created_at") ?? "",
@@ -264,6 +315,8 @@ function findingOf(row: Row): SpecLossFindingRow {
 		afterRevisionId: str(row, "after_revision_id") ?? "",
 		resolvedBy: str(row, "resolved_by"),
 		attachSeq: num(row, "attach_seq"),
+		attachAttempts: num(row, "attach_attempts"),
+		inherited: num(row, "inherited") !== 0,
 		taskBackend,
 		ownerUserId: str(row, "owner_user_id"),
 		parts: specLossExcerptParts(str(row, "excerpt")),
@@ -343,8 +396,8 @@ export async function countSpecLossFindings(
 
 /**
  * The finding goes from one of `from` to `to`, only while it is still one of `from` (someone else,
- * or a pass, may have changed it meanwhile). `blockId` undefined keeps the block recorded. False
- * when nothing changed.
+ * or a pass, may have changed it meanwhile). `blockId` undefined keeps the block recorded; `note`
+ * is why it stands there (none unless given). False when nothing changed.
  */
 export async function setSpecLossFindingStatus(args: {
 	id: string;
@@ -353,6 +406,7 @@ export async function setSpecLossFindingStatus(args: {
 	/** The person deciding; null: the scan's own attach. */
 	userId: string | null;
 	blockId?: string | null;
+	note?: OutlineSpecLossAttachNote | null;
 }): Promise<boolean> {
 	const now = new Date().toISOString();
 	const decided = args.to === "dismissed";
@@ -363,8 +417,9 @@ export async function setSpecLossFindingStatus(args: {
 	const block = args.blockId === undefined ? sql`block_id` : sql`${args.blockId}`;
 	const rows = await runOutlineAccessQuery(sql`
 		update outline_spec_loss_findings set
-			status = ${args.to}, block_id = ${block}, attach_note = null,
+			status = ${args.to}, block_id = ${block}, attach_note = ${args.note ?? null},
 			resolved_by = ${decided ? args.userId : null}, resolved_at = ${decided ? now : null},
+			attach_attempts = ${sql.raw(args.to === "open" ? "0" : "attach_attempts")},
 			updated_at = ${now}
 		where id = ${args.id} and status in (${from})
 		returning id
@@ -381,6 +436,27 @@ export async function setSpecLossAttachNote(
 		update outline_spec_loss_findings set attach_note = ${note}, updated_at = ${new Date().toISOString()}
 		where id = ${id} and status = 'open'
 	`);
+}
+
+/**
+ * An automatic attach of an open finding failed: counted, and after `max` failures the finding is
+ * left to a person (`gave_up`; no pass lists it again). The note it carries now; null when it is
+ * not open any more.
+ */
+export async function noteSpecLossAttachFailure(
+	id: string,
+	max: number,
+): Promise<"failed" | "gave_up" | null> {
+	const rows = await runOutlineAccessQuery(sql`
+		update outline_spec_loss_findings set
+			attach_attempts = attach_attempts + 1,
+			attach_note = case when attach_attempts + 1 >= ${max} then 'gave_up' else 'failed' end,
+			updated_at = ${new Date().toISOString()}
+		where id = ${id} and status = 'open'
+		returning attach_note
+	`);
+	const note = rows[0] ? str(rows[0], "attach_note") : null;
+	return note === "failed" || note === "gave_up" ? note : null;
 }
 
 /**
@@ -415,8 +491,10 @@ export async function countSpecLossAttached(
 }
 
 /**
- * The session's open findings a pass attaches, oldest first, with their excerpts: the ones not
- * tried yet and the ones a later pass tries again (`session_cap`, `failed`). At most `limit`.
+ * The session's open findings a pass attaches, with their excerpts: the ones not tried yet and
+ * the ones a later pass tries again (`session_cap`, `failed`), those that failed least first (so
+ * findings that keep failing never hold up the others), then oldest first. At most `limit`. A
+ * finding with any other note is not listed: it is left to a person.
  */
 export async function listSpecLossToAttach(
 	narratorId: string,
@@ -427,7 +505,7 @@ export async function listSpecLossToAttach(
 		from outline_spec_loss_findings f join narrators n on n.id = f.narrator_id
 		where f.narrator_id = ${narratorId} and f.status = 'open'
 			and (f.attach_note is null or f.attach_note in ('session_cap', 'failed'))
-		order by f.created_at, f.id
+		order by f.attach_attempts, f.created_at, f.id
 		limit ${limit}
 	`);
 	return rows.map(findingOf);
@@ -441,15 +519,28 @@ export async function markSpecLossSessionCap(narratorId: string): Promise<void> 
 	`);
 }
 
-/** The session's attached findings (id and block), at most `limit`. */
+/**
+ * The session's attached findings (id, block, attach sequence), oldest first, at most `limit`,
+ * after `after` when given.
+ */
 export async function listSpecLossAttached(
 	narratorId: string,
 	limit: number,
-): Promise<Array<{ id: string; blockId: string | null }>> {
+	after: SpecLossCursor | null = null,
+): Promise<Array<{ id: string; blockId: string | null; attachSeq: number; createdAt: string }>> {
+	const from = after
+		? sql`and (created_at > ${after.createdAt}
+			or (created_at = ${after.createdAt} and id > ${after.id}))`
+		: sql``;
 	const rows = await runOutlineAccessQuery(sql`
-		select id, block_id from outline_spec_loss_findings
-		where narrator_id = ${narratorId} and status = 'attached'
+		select id, block_id, attach_seq, created_at from outline_spec_loss_findings
+		where narrator_id = ${narratorId} and status = 'attached' ${from}
 		order by created_at, id limit ${limit}
 	`);
-	return rows.map((row) => ({ id: String(row.id), blockId: str(row, "block_id") }));
+	return rows.map((row) => ({
+		id: String(row.id),
+		blockId: str(row, "block_id"),
+		attachSeq: num(row, "attach_seq"),
+		createdAt: str(row, "created_at") ?? "",
+	}));
 }

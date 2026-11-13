@@ -5,7 +5,8 @@
  * writes this module's two tables (`loss-store.ts`); it never writes Dynamic Spec and never
  * repairs anything. A pass then hands the open findings of imported sessions to
  * `loss-attach.ts`, which puts each on its file's imported page as a block of its own (owner
- * decision D52: on the page only; no notice, no digest line). What a person does about a
+ * decision D52: on the page only; no notice, no digest line), which attaches the findings of
+ * tables and leaves the rest listed (owner decision 2026-11-13). What a person does about a
  * finding is `loss-findings.ts`.
  *
  * WHAT IT LOOKS AT
@@ -14,11 +15,18 @@
  * still keep Dynamic Spec or were imported. Of each, the markdown files and the behavior fence
  * (`isSpecLossPath`). For a file, the revisions before its current one along
  * `parent_revision_id` (so revisions a fork shares with its parent are followed), and of those
- * the saves a PERSON made (`created_by = 'user'`: the Spec panel). Each such save is compared
+ * the saves a PERSON made (`created_by = 'user'`: the Spec panel) BEFORE THE CUTOFF
+ * ({@link specLossCutoff}: the first time the scan ran on this instance, kept in the settings).
+ * The scan ships after the editor was fixed, so a later save was made with the fixed editor and
+ * what it removed was removed on purpose. Each such save is compared
  * with the revision before it and with the current one (`shared/spec-content-loss.ts`); the
  * structures are extracted on the background text worker, never on this thread beyond the
  * channel's inline size. A worker that fails leaves the session unscanned: it is tried again by
- * a later pass, a few times a process, and nothing is computed here instead.
+ * a later pass, a few times a process, and nothing is computed here instead. A save's lost
+ * tables are one finding and everything else it lost another, so what a pass attaches (tables)
+ * and what is only listed never share a row. A save made in the session this one was forked from
+ * (its revision belongs to another namespace) is recorded as inherited: listed here, attached
+ * only there.
  *
  * WHEN
  *
@@ -41,6 +49,7 @@ import { createHash } from "node:crypto";
 import { catalogError } from "@server/lib/errors";
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
+import { settings } from "@server/lib/settings";
 import type { OutlineSpecLossScanStatus } from "@shared/outline-spec-import";
 import {
 	buildSpecLossExcerpt,
@@ -51,7 +60,7 @@ import {
 } from "@shared/spec-content-loss";
 import { OUTLINE_BACKGROUND_TEXT_LIMITS, processBackgroundText } from "../edit-text-runner";
 import { specImportMode, specPointersDigest } from "./importer";
-import { attachSpecLossForSession } from "./loss-attach";
+import { attachSpecLossForSession, resetSpecLossAttachState } from "./loss-attach";
 import {
 	insertSpecLossFinding,
 	readSpecLossScan,
@@ -114,16 +123,49 @@ export function isSpecLossSession(session: SpecImportSession | null): session is
 	);
 }
 
-/** A finding's id: the same place found again is the same row. */
+/**
+ * A finding's id: the same place found again is the same row. A save's lost tables (`table`) and
+ * whatever else it lost (`other`) are two findings.
+ */
 export function specLossFindingId(
 	narratorId: string,
 	path: string,
 	beforeRevisionId: string,
+	group: "table" | "other" = "table",
 ): string {
 	const digest = createHash("sha256")
-		.update([narratorId, path, beforeRevisionId].join("\u0000"))
+		.update(
+			[narratorId, path, beforeRevisionId, ...(group === "table" ? [] : [group])].join("\u0000"),
+		)
 		.digest("hex");
 	return `lf${digest.slice(0, 22)}`;
+}
+
+/**
+ * The moment after which a person's saves are not looked at: the first time the scan ran on this
+ * instance (`outline.specLossCutoff`), set and saved by the first call. Saved through the
+ * settings module, loaded on demand (`save` replaces that: tests). When saving fails the moment
+ * still holds for this process, and the next process sets a later one (it then looks at a few
+ * more saves, never fewer).
+ */
+export async function specLossCutoff(
+	options: { now?: () => Date; save?: () => void | Promise<void> } = {},
+): Promise<string> {
+	const stored = settings.outline.specLossCutoff;
+	if (typeof stored === "string" && Number.isFinite(Date.parse(stored))) return stored;
+	const at = (options.now?.() ?? new Date()).toISOString();
+	settings.outline.specLossCutoff = at;
+	try {
+		if (options.save) await options.save();
+		else (await import("@server/lib/settings")).saveSettings(settings);
+		logger.info("Swallowed-content scan: saves after this moment are not looked at", { at });
+	} catch (error) {
+		logger.warn("Swallowed-content scan: the cutoff could not be saved", {
+			at,
+			error: String(error),
+		});
+	}
+	return at;
 }
 
 function yieldToEventLoop(): Promise<void> {
@@ -162,8 +204,9 @@ export interface SpecLossScanResult {
 export async function scanSpecSessionLoss(
 	session: SpecImportSession,
 	pointers: readonly SpecImportFilePointer[],
-	options: { signal?: AbortSignal } = {},
+	options: { signal?: AbortSignal; cutoff?: string } = {},
 ): Promise<SpecLossScanResult> {
+	const cutoff = Date.parse(options.cutoff ?? (await specLossCutoff()));
 	const result: SpecLossScanResult = { saves: 0, findings: 0, added: 0, note: null };
 	let chars = 0;
 	/** The structures of the few revisions last read: a save's parent is often the next save. */
@@ -195,8 +238,11 @@ export async function scanSpecSessionLoss(
 		for (let i = 0; i + 1 < chain.length && pairs.length < SPEC_LOSS_LIMITS.userSaves; i++) {
 			const after = chain[i] as SpecRevisionMeta;
 			const before = chain[i + 1] as SpecRevisionMeta;
+			if (after.createdBy !== "user") continue;
+			// Saved after the scan first ran here: with the fixed editor, so a deliberate edit.
+			if (Date.parse(after.createdAt ?? "") > cutoff) continue;
 			// A revision before it with nothing in it had nothing to lose.
-			if (after.createdBy === "user" && before.chars > 0) pairs.push([after, before]);
+			if (before.chars > 0) pairs.push([after, before]);
 		}
 		if (pairs.length === 0) continue;
 		const current = await itemsOf(pointer.revisionId as string);
@@ -214,26 +260,34 @@ export async function scanSpecSessionLoss(
 			if (has === null) continue;
 			const lost = lostSpecItems(had, has, current);
 			if (lost.length === 0) continue;
-			if (result.findings >= SPEC_LOSS_LIMITS.findings) {
-				result.note = "findings";
-				break scan;
+			// The save was made in the session this one was forked from: listed here only.
+			const inherited = after.namespaceId !== null && after.namespaceId !== session.namespaceId;
+			// The tables are one finding (a pass attaches it), the rest another (listed).
+			for (const group of ["table", "other"] as const) {
+				const part = lost.filter((item) => (item.kind === "table") === (group === "table"));
+				if (part.length === 0) continue;
+				if (result.findings >= SPEC_LOSS_LIMITS.findings) {
+					result.note = "findings";
+					break scan;
+				}
+				const excerpt = buildSpecLossExcerpt(part, SPEC_LOSS_LIMITS.excerptBytes);
+				result.findings++;
+				const added = await insertSpecLossFinding({
+					id: specLossFindingId(session.narratorId, pointer.path, before.id, group),
+					narratorId: session.narratorId,
+					path: pointer.path,
+					beforeRevisionId: before.id,
+					afterRevisionId: after.id,
+					beforeAt: before.createdAt,
+					savedAt: after.createdAt,
+					kinds: specLossKindCounts(part),
+					items: part.length,
+					parts: excerpt.parts,
+					truncated: excerpt.truncated,
+					inherited,
+				});
+				if (added) result.added++;
 			}
-			const excerpt = buildSpecLossExcerpt(lost, SPEC_LOSS_LIMITS.excerptBytes);
-			result.findings++;
-			const added = await insertSpecLossFinding({
-				id: specLossFindingId(session.narratorId, pointer.path, before.id),
-				narratorId: session.narratorId,
-				path: pointer.path,
-				beforeRevisionId: before.id,
-				afterRevisionId: after.id,
-				beforeAt: before.createdAt,
-				savedAt: after.createdAt,
-				kinds: specLossKindCounts(lost),
-				items: lost.length,
-				parts: excerpt.parts,
-				truncated: excerpt.truncated,
-			});
-			if (added) result.added++;
 		}
 		await yieldToEventLoop();
 	}
@@ -253,7 +307,11 @@ export interface SpecLossPass {
 	found: number;
 	/** Findings put on their imported pages (`loss-attach.ts`). */
 	attached: number;
-	/** Sessions left for the next pass: not reached, their scan failed, or attaches wait. */
+	/**
+	 * Sessions a later pass still has work for: not reached, a scan that failed and is tried
+	 * again, attaches that wait. Not the ones given up on (a scan or an attach that failed too
+	 * often): those need a person, and no pass comes back sooner for them.
+	 */
 	left: number;
 }
 
@@ -289,6 +347,7 @@ export function resetSpecLossScanState(): void {
 	job.failures.clear();
 	job.lastPass = null;
 	job.halt = false;
+	resetSpecLossAttachState();
 }
 
 /**
@@ -357,8 +416,11 @@ export async function runSpecLossPass(
 			if (isSpecLossSession(session)) {
 				pass.sessions++;
 				const failed = job.failures.get(session.narratorId) ?? 0;
-				if (failed >= SPEC_LOSS_LIMITS.attempts) pass.left++;
-				else if (pass.scanned >= maxScans) {
+				// Its scan failed too often: left alone for this process, and not counted as left
+				// (the job would come back every few minutes for a session it never scans).
+				if (failed >= SPEC_LOSS_LIMITS.attempts) {
+					/* nothing */
+				} else if (pass.scanned >= maxScans) {
 					// Cut short: the next pass goes on from this session.
 					pass.left++;
 					job.after = before;
@@ -376,8 +438,9 @@ export async function runSpecLossPass(
 							});
 						}
 					} catch (error) {
-						// Not scanned: a later pass tries again. Nothing is computed here instead.
-						pass.left++;
+						// Not scanned: a later pass tries again, a few times. Nothing is computed here
+						// instead.
+						if (failed + 1 < SPEC_LOSS_LIMITS.attempts) pass.left++;
 						job.failures.set(session.narratorId, failed + 1);
 						logger.warn("Swallowed-content scan of a session failed", {
 							narratorId: session.narratorId,
@@ -385,8 +448,9 @@ export async function runSpecLossPass(
 						});
 					}
 				}
-				// What was found, now or by an earlier pass, goes onto the imported pages (only for a
-				// session whose tasks are in the outline; bounded per session and per page).
+				// The tables found, now or by an earlier pass, go onto the imported pages (only for a
+				// session whose tasks are in the outline, which the attach reads again; bounded per
+				// session and per page).
 				if (session.taskBackend === "outline") {
 					const run = await attachSpecLossForSession(session);
 					pass.attached += run.attached;
@@ -465,8 +529,9 @@ export function specLossScanStatus(): OutlineSpecLossScanStatus {
 export function requestSpecLossPass(): OutlineSpecLossScanStatus {
 	if (!specLossScanEnabled()) throw catalogError("SPEC_IMPORT_OFF");
 	if (job.running === null) {
-		// Asked for by a person: sessions whose scans failed before are tried again.
+		// Asked for by a person: sessions whose scans or attaches failed before are tried again.
 		job.failures.clear();
+		resetSpecLossAttachState();
 		startPass().catch((error: unknown) =>
 			logger.warn("Swallowed-content scan pass failed", { error: String(error) }),
 		);

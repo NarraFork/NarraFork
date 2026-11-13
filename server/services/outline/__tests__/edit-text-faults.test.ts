@@ -213,6 +213,8 @@ describe("the swallowed-content scan over a failing background channel", () => {
 		invalidateTaskBackend();
 		resetSpecImportRecords();
 		resetSpecLossScanState();
+		// The saves of these cases count as made with the old editor.
+		settings.outline.specLossCutoff = "2999-01-01T00:00:00.000Z";
 	});
 
 	async function swallowedSession(): Promise<string> {
@@ -234,9 +236,15 @@ describe("the swallowed-content scan over a failing background channel", () => {
 		try {
 			await expect(scanSpecSessionLossById(id)).rejects.toThrow("timed out");
 			expect(await readSpecLossScan(id)).toBeNull();
-			// A pass counts it as left, and stops trying after a few failures in this process.
-			for (let n = 0; n < SPEC_LOSS_LIMITS.attempts + 1; n++)
+			// A pass counts it as left while it is tried again (the direct scan above was not a
+			// pass's), and stops trying after a few failures in this process: then it is not work
+			// left, so the job does not come back every few minutes for a session it never scans.
+			for (let n = 1; n < SPEC_LOSS_LIMITS.attempts; n++)
 				expect((await runSpecLossPass({ pauseMs: 0 })).left).toBeGreaterThanOrEqual(1);
+			expect((await runSpecLossPass({ pauseMs: 0 })).left).toBe(0);
+			const calls = background.mock.calls.length;
+			expect((await runSpecLossPass({ pauseMs: 0 })).left).toBe(0);
+			expect(background.mock.calls.length).toBe(calls);
 			expect(await readSpecLossScan(id)).toBeNull();
 			expect(background).toHaveBeenCalled();
 			expect(extract).not.toHaveBeenCalled();

@@ -266,4 +266,9 @@ export const outlineSpecLossQuerySchema = z.object({
 
 export const outlineSpecLossActionSchema = z.object({
 	action: z.enum(["attach", "dismiss", "reopen"]),
+	/**
+	 * With `attach` of a finding of the behavior fence: the person confirmed that the agent will
+	 * read the content as a rule. Refused without it.
+	 */
+	confirmRule: z.boolean().optional(),
 });

@@ -1234,8 +1234,10 @@ outlineRoutes.get("/narrators/:narratorId/spec-import/loss/:findingId", async (c
 /**
  * A person's decision about one finding: `attach` puts the lost text on the file's imported page
  * (one block at its top; nothing else is changed), `dismiss` says it was removed on purpose,
- * `reopen` undoes a dismissal. Write access to the session. 409 when it was decided already or
- * cannot be attached (the session is not imported, or the page is gone).
+ * `reopen` undoes a dismissal. Write access to the session. 409 when it was decided already,
+ * cannot be attached (the session is not imported, or the page is gone), an import is working on
+ * the session, or it is of the behavior fence and `confirmRule` is not set (the agent reads that
+ * page as its rules: the person is asked first).
  */
 outlineRoutes.post(
 	"/narrators/:narratorId/spec-import/loss/:findingId",
@@ -1251,6 +1253,7 @@ outlineRoutes.post(
 				id: idParam(c, "findingId"),
 				narratorId: narrator.id,
 				action: input.action,
+				confirmRule: input.confirmRule,
 				userId: principal.userId,
 			}),
 		);

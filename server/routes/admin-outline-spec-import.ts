@@ -10,7 +10,8 @@
  *
  *   GET  /loss                       one status's findings of every session, and the scan's state
  *   GET  /loss/:findingId            one finding with the lost text
- *   POST /loss/:findingId            a decision: attach to the imported page, dismiss, reopen
+ *   POST /loss/:findingId            a decision: attach to the imported page (`confirmRule` for
+ *                                    the behavior page), dismiss, reopen
  *   POST /loss-scan                  start a scan pass in the background (202)
  *
  * A session's owner keeps the Spec panel's "Import now" and its retry
@@ -77,6 +78,7 @@ outlineSpecImportAdminRoutes.post("/loss/:findingId", bodyLimit({ maxSize: 1024 
 			id: findingId,
 			narratorId: null,
 			action: parsed.data.action,
+			confirmRule: parsed.data.confirmRule,
 			userId: c.get("user").sub,
 		}),
 	);

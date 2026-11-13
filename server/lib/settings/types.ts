@@ -738,6 +738,13 @@ export interface NarraForkSettings {
 		 * re-import). `off`: not at all.
 		 */
 		specImport?: "auto" | "manual" | "off";
+		/**
+		 * When the swallowed-content scan (outline P2 PR 12c) first ran on this instance (ISO time;
+		 * written by the scan, not meant to be edited). The scan ships after the Spec panel's editor
+		 * was fixed, so a person's save made after this moment was made with the fixed editor: what
+		 * it removed was removed on purpose, and the scan does not look at it.
+		 */
+		specLossCutoff?: string;
 	};
 	/** Plugin subsystem settings. */
 	/** Request evidence (ring recording + auto-pin); read live for each provider request. */
