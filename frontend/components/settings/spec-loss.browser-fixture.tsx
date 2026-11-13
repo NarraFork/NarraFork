@@ -56,6 +56,10 @@ let root: Root | null = null;
 const LEFT_OUT: Record<number, "page_cap" | "no_page"> = { 27: "page_cap", 30: "no_page" };
 /** The attached finding whose block someone wrote in: a dismissal keeps it. */
 export const KEPT = "f003";
+/** A finding of the behavior fence, one that is not tables, and one whose block was deleted. */
+export const RULE = "f901";
+export const LISTED = "f902";
+export const DELETED = "f903";
 
 function finding(n: number, extra: Partial<OutlineSpecLossFinding> = {}): OutlineSpecLossFinding {
 	const narratorId = `s${String((n % 3) + 1).padStart(3, "0")}`;
@@ -77,6 +81,7 @@ function finding(n: number, extra: Partial<OutlineSpecLossFinding> = {}): Outlin
 		attachNote: imported ? leftOut : null,
 		spaceId: "space-1",
 		resolvedAt: null,
+		rulePage: false,
 		createdAt: new Date(Date.parse(NOW) - n * 60_000).toISOString(),
 		attachable: imported && !attached,
 		...extra,
@@ -89,6 +94,40 @@ function seed(): void {
 	findings.set(
 		"f900",
 		finding(900, { id: "f900", status: "dismissed", blockId: null, attachable: false }),
+	);
+	// Of the imported session, what no pass attaches: content removed from the behavior rules,
+	// and content that is not tables. And one whose block was deleted on the page.
+	const listed = { narratorId: NARRATOR, status: "open", blockId: null, attachable: true } as const;
+	findings.set(
+		RULE,
+		finding(901, {
+			...listed,
+			id: RULE,
+			path: "behavior_fence",
+			kinds: { table: 1 },
+			attachNote: "rule_page",
+			rulePage: true,
+		}),
+	);
+	findings.set(
+		LISTED,
+		finding(902, {
+			...listed,
+			id: LISTED,
+			kinds: { taskItem: 2, image: 1 },
+			attachNote: "list_only",
+		}),
+	);
+	findings.set(
+		DELETED,
+		finding(903, {
+			id: DELETED,
+			narratorId: NARRATOR,
+			status: "dismissed",
+			blockId: null,
+			attachable: false,
+			attachNote: "block_deleted",
+		}),
 	);
 	scan = {
 		running: false,
@@ -128,10 +167,13 @@ api.getSpecLossDetail = async (_narratorId, findingId) => {
 	};
 };
 
-api.decideSpecLoss = async (_narratorId, findingId, action) => {
-	calls.push(`${action}:${findingId}`);
+api.decideSpecLoss = async (_narratorId, findingId, action, options = {}) => {
+	calls.push(`${action}:${findingId}${options.confirmRule ? ":rule" : ""}`);
 	const entry = findings.get(findingId);
 	if (!entry) throw new Error("no such finding");
+	// As the server: nothing goes onto the behavior page without the person's confirmation.
+	if (action === "attach" && entry.rulePage && !options.confirmRule)
+		throw new Error("SPEC_LOSS_RULE_CONFIRM");
 	const imported = entry.narratorId === NARRATOR;
 	// Dismissed: the block goes, unless someone wrote in it. Reopened: attached again when the
 	// session was imported.

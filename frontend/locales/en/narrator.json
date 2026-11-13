@@ -2385,7 +2385,7 @@
 			"noticeDecided": "Content a save from the old Spec editor may have lost in this session: all dismissed ({{n}}).",
 			"noticeShow": "Show",
 			"noticeHide": "Hide",
-			"explain": "Until it was fixed (2026-10-26), saving from the Spec panel's editor dropped tables and rewrote images, HTML, task items, footnotes and front matter. A scan looks for content the version before a save held that the save, and the file as it is now, do not. Once the session is imported into the outline, each such piece is attached at the top of the page its file became, as a block of its own; nothing else on the page is changed. Move it back into the text or delete the block as you see fit. Content you removed on purpose is found too: dismiss it and its block goes.",
+			"explain": "Until it was fixed (2026-10-26), saving from the Spec panel's editor dropped tables and rewrote images, HTML, task items, footnotes and front matter. A scan looks at the saves made before it first ran here, for content the version before a save held that the save, and the file as it is now, do not. Lost tables are attached by themselves once the session is imported into the outline: at the top of the page their file became, as a block of their own; nothing else on the page is changed. Everything else is only listed here, because it is often something you removed on purpose: attach it yourself if it was lost. Nothing is ever attached to the behavior page by itself. Content you removed on purpose is found too: dismiss it, and a block attached for it goes.",
 			"status": {
 				"open": "Not attached",
 				"attached": "Attached",
@@ -2413,6 +2413,9 @@
 			"hide": "Hide the content",
 			"attach": "Attach to the imported page",
 			"attachTitle": "Attach this content to the imported page?",
+			"attachRule": "Attach as a rule",
+			"attachRuleTitle": "Attach this to the behavior page?",
+			"attachRuleConfirm": "This content was removed from the session's behavior rules by a save. The behavior page is what the agent reads as its standing rules: once attached there, the agent follows this content as a rule again. Attach it only if it was lost by mistake, not if you removed it on purpose.",
 			"attachConfirm": "One block is added at the top of the outline page {{path}} was imported to, with the lost content under it as it stood before the save. Nothing else on the page changes. Move it back into the text, or delete the block, as you see fit.",
 			"dismiss": "Dismiss",
 			"reopen": "Reopen",
@@ -2429,7 +2432,7 @@
 			"untitled": "Untitled session",
 			"admin": {
 				"title": "Content the old Spec editor may have lost",
-				"description": "A background scan looks through the sessions' Dynamic Spec history (read-only), attaches what it finds to the imported pages (at most 20 per page, 10 per session at a time) and lists it here and in each session's Spec panel. It appears nowhere else: not in import notices, not in reports.",
+				"description": "A background scan looks through the sessions' Dynamic Spec history (read-only). Lost tables are attached to the imported pages (at most 20 per page, 10 per session at a time). Other kinds of content, and anything removed from a session's behavior rules, are only listed, here and in each session's Spec panel, until a person attaches them. It appears nowhere else: not in import notices, not in reports.",
 				"scanNow": "Scan now",
 				"scanStarted": "The scan was started. It runs in the background.",
 				"scanRunning": "A scan is running.",
@@ -2444,7 +2447,13 @@
 				"page_cap": "Not attached automatically: the page already carries 20 attached pieces. Attach it yourself if it matters, or dismiss it.",
 				"session_cap": "Not attached yet: at most 10 are attached for a session at a time; a later scan attaches it.",
 				"restored": "Not attached: the file as it is now holds this content again.",
-				"failed": "The attach did not succeed; a later scan tries again."
+				"failed": "The attach did not succeed; a later scan tries again (3 times at most).",
+				"gave_up": "Attaching it failed 3 times and is not tried again. Attach it yourself, or dismiss it.",
+				"reattach_cap": "Its block was removed by system writes several times, so it is not attached again by itself. Attach it yourself if it matters.",
+				"list_only": "Listed only: just tables are attached by themselves. Attach it yourself if it was lost, or dismiss it if you removed it on purpose.",
+				"rule_page": "Listed only: this was removed from the session's behavior rules. It is never attached by itself, because the agent would follow it as a rule again.",
+				"fork": "Listed only: the save was made in the session this one was forked from, and the content is attached there. Attach it here too if you need it.",
+				"block_deleted": "Its block was deleted on the page, so this counts as dismissed."
 			},
 			"dismissTitle": "Dismiss this content?",
 			"dismissConfirm": "The block attached to the page of {{path}} is removed, unless someone edited it or wrote under it: then it stays as it is. The page's own content does not change. You can reopen the finding later."

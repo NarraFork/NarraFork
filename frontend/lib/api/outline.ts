@@ -306,11 +306,20 @@ export const outlineApi = {
 	/** One finding with the lost text. */
 	getSpecLossDetail: (narratorId: string | null, findingId: string) =>
 		request<OutlineSpecLossDetail>(`${specLossBase(narratorId)}/${enc(findingId)}`),
-	/** A person's decision about one finding: attach to the imported page, dismiss, reopen. */
-	decideSpecLoss: (narratorId: string | null, findingId: string, action: OutlineSpecLossAction) =>
+	/**
+	 * A person's decision about one finding: attach to the imported page, dismiss, reopen.
+	 * `confirmRule`: with an attach of a finding of the behavior fence, the person confirmed that
+	 * the agent will read the content as a rule (the server refuses the attach without it).
+	 */
+	decideSpecLoss: (
+		narratorId: string | null,
+		findingId: string,
+		action: OutlineSpecLossAction,
+		options: { confirmRule?: boolean } = {},
+	) =>
 		request<OutlineSpecLossFinding>(`${specLossBase(narratorId)}/${enc(findingId)}`, {
 			method: "POST",
-			body: JSON.stringify({ action }),
+			body: JSON.stringify({ action, ...(options.confirmRule ? { confirmRule: true } : {}) }),
 		}),
 	/** An administrator starts a scan pass (answered at once; it runs in the background). */
 	startSpecLossScan: () =>

@@ -61,8 +61,15 @@ export function useSpecLossDetail(narratorId: string | null, findingId: string, 
 export function useDecideSpecLoss(narratorId: string | null) {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: (input: { findingId: string; action: OutlineSpecLossAction }) =>
-			api.decideSpecLoss(narratorId, input.findingId, input.action),
+		mutationFn: (input: {
+			findingId: string;
+			action: OutlineSpecLossAction;
+			/** The person confirmed that the agent reads the behavior page as rules. */
+			confirmRule?: boolean;
+		}) =>
+			api.decideSpecLoss(narratorId, input.findingId, input.action, {
+				confirmRule: input.confirmRule,
+			}),
 		// Also after a refusal: someone else decided, the list is out of date.
 		// The lists and counts of every scope (the admin page and the session's panel show the
 		// same finding); the lost text itself never changes.

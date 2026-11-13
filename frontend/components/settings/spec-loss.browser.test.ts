@@ -182,9 +182,9 @@ test("the admin section: the scan, the findings a page at a time, why not attach
 		expect(await text(page, '[data-testid="spec-loss-scan-status"]')).toContain(
 			"Sessions looked at: 12; new findings: 3; attached: 2.",
 		);
-		await chipText(page, "open", `${en.status.open} (23)`);
+		await chipText(page, "open", `${en.status.open} (25)`);
 		await chipText(page, "attached", `${en.status.attached} (9)`);
-		await chipText(page, "dismissed", `${en.status.dismissed} (1)`);
+		await chipText(page, "dismissed", `${en.status.dismissed} (2)`);
 		expect((await rows(page)).length).toBe(20);
 		await noSidewaysScroll(page);
 		await shot(page, `loss-admin-${width}-${scheme}`);
@@ -192,7 +192,7 @@ test("the admin section: the scan, the findings a page at a time, why not attach
 		// The next page.
 		await page.click('[data-testid="spec-loss-more"]');
 		await page.waitForFunction(
-			() => document.querySelectorAll('[data-testid="spec-loss-row"]').length === 23,
+			() => document.querySelectorAll('[data-testid="spec-loss-row"]').length === 25,
 		);
 		expect(await page.$('[data-testid="spec-loss-more"]')).toBeNull();
 
@@ -343,7 +343,7 @@ test("the admin section: the scan, the findings a page at a time, why not attach
 	const { page, errors } = await open(360, { view: "admin", lang: "zh-CN", scheme: "dark" });
 	await page.waitForSelector('[data-testid="spec-loss-row"]');
 	expect(await text(page, '[data-testid="spec-loss-admin"]')).toContain(zh.admin.title);
-	await chipText(page, "open", `${zh.status.open} (23)`);
+	await chipText(page, "open", `${zh.status.open} (25)`);
 	expect(await text(page, '[data-finding="f001"] [data-testid="spec-loss-what"]')).toContain(
 		zh.kind.table_other.replace("{{count}}", "2"),
 	);
@@ -365,12 +365,12 @@ test("the Spec panel: one line with the numbers, the list on demand; read-only f
 		);
 		const line = (attached: number, left: number) =>
 			en.notice.replace("{{attached}}", String(attached)).replace("{{open}}", String(left));
-		expect(await text(page, '[data-testid="spec-loss-notice"]')).toContain(line(9, 2));
+		expect(await text(page, '[data-testid="spec-loss-notice"]')).toContain(line(9, 4));
 		expect(await page.$('[data-testid="spec-loss-row"]')).toBeNull();
 		await page.click('[data-testid="spec-loss-notice-toggle"]');
 		// The ones that are not attached first.
 		await page.waitForFunction(
-			() => document.querySelectorAll('[data-testid="spec-loss-row"]').length === 2,
+			() => document.querySelectorAll('[data-testid="spec-loss-row"]').length === 4,
 		);
 		expect(await text(page, '[data-testid="spec-loss-notice"]')).toContain(en.explain);
 		await chip(page, "attached");
@@ -389,7 +389,7 @@ test("the Spec panel: one line with the numbers, the list on demand; read-only f
 			(wanted) =>
 				document.querySelector('[data-testid="spec-loss-notice"]')?.textContent?.includes(wanted),
 			{},
-			line(8, 2),
+			line(8, 4),
 		);
 		expect(await calls(page)).toEqual(["dismiss:f000"]);
 		expect(errors).toEqual([]);
@@ -432,3 +432,75 @@ test("the Spec panel: one line with the numbers, the list on demand; read-only f
 		await page.close();
 	}
 }, 60_000);
+
+test("what no pass attaches: the behavior page asks with its own warning; other kinds are listed; a deleted block is said", async () => {
+	for (const [lang, strings, scheme] of [
+		["en", en, "light"],
+		["zh-CN", zh, "dark"],
+	] as const) {
+		const { page, errors } = await open(360, { view: "admin", lang, scheme });
+		await page.waitForSelector('[data-testid="spec-loss-row"]');
+		await page.click('[data-testid="spec-loss-more"]');
+		const rule = '[data-finding="f901"]';
+		const listed = '[data-finding="f902"]';
+		await page.waitForSelector(rule);
+		// Each says why it is only listed.
+		expect(await text(page, `${rule} [data-testid="spec-loss-why"]`)).toBe(strings.why.rule_page);
+		expect(await text(page, `${listed} [data-testid="spec-loss-why"]`)).toBe(strings.why.list_only);
+		expect(await text(page, `${rule} [data-testid="spec-loss-path"]`)).toBe("behavior_fence");
+		await noSidewaysScroll(page);
+		await shot(page, `loss-listed-360-${scheme}-${lang}`);
+
+		// The behavior page: a warning of its own; cancelling asks the server nothing.
+		await page.click(`${rule} [data-testid="spec-loss-attach"]`);
+		await page.waitForSelector('[role="dialog"]');
+		const warning = await text(page, '[role="dialog"]');
+		expect(warning).toContain(strings.attachRuleTitle);
+		expect(warning).toContain(strings.attachRuleConfirm);
+		expect(warning).not.toContain(strings.attachTitle);
+		await noSidewaysScroll(page);
+		await shot(page, `loss-rule-confirm-360-${scheme}-${lang}`);
+		const labels = await page.$$eval('[role="dialog"] button', (els) =>
+			els.map((el) => el.textContent),
+		);
+		const cancelLabel = labels.find((label) => label && label !== strings.attachRule);
+		if (!cancelLabel) throw new Error(`No cancel button in ${labels.join(", ")}`);
+		await pressInDialog(page, cancelLabel);
+		await dialogGone(page);
+		expect(await calls(page)).toEqual([]);
+		expect(await page.$(rule)).not.toBeNull();
+		// Confirmed: the request says so.
+		await page.click(`${rule} [data-testid="spec-loss-attach"]`);
+		await page.waitForSelector('[role="dialog"]');
+		await pressInDialog(page, strings.attachRule);
+		await page.waitForFunction((selector) => !document.querySelector(selector), {}, rule);
+		await dialogGone(page);
+		expect(await calls(page)).toEqual(["attach:f901:rule"]);
+
+		// Content that is not tables: the ordinary question, no rule confirmation sent.
+		await toastsGone(page);
+		await page.click(`${listed} [data-testid="spec-loss-attach"]`);
+		await page.waitForSelector('[role="dialog"]');
+		const question = await text(page, '[role="dialog"]');
+		expect(question).toContain(strings.attachTitle);
+		expect(question).not.toContain(strings.attachRuleConfirm);
+		await pressInDialog(page, strings.attach);
+		await page.waitForFunction((selector) => !document.querySelector(selector), {}, listed);
+		await dialogGone(page);
+		expect(await calls(page)).toEqual(["attach:f901:rule", "attach:f902"]);
+
+		// A finding whose block was deleted on the page: dismissed, and it says how.
+		await chip(page, "dismissed");
+		const deleted = '[data-finding="f903"]';
+		await page.waitForSelector(`${deleted}[data-status="dismissed"]`);
+		expect(await text(page, `${deleted} [data-testid="spec-loss-why"]`)).toBe(
+			strings.why.block_deleted,
+		);
+		// One a person dismissed says nothing more.
+		expect(await page.$('[data-finding="f900"] [data-testid="spec-loss-why"]')).toBeNull();
+		expect(await page.$(`${deleted} [data-testid="spec-loss-reopen"]`)).not.toBeNull();
+		await noSidewaysScroll(page);
+		expect(errors).toEqual([]);
+		await page.close();
+	}
+}, 90_000);

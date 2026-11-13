@@ -1,14 +1,17 @@
 /**
  * Content a save from the old Spec panel may have swallowed (outline P2 PR 12c): the findings of
- * the background scan. The server attaches each to its file's imported page as a block of its
- * own (and shows it nowhere else); here people see where each finding stands and decide about
- * one at a time. Nothing of a page's own content is ever changed.
+ * the background scan. The server attaches the findings of tables to their file's imported page,
+ * each as a block of its own, and only lists the rest (owner decision 2026-11-13); here people
+ * see where each finding stands and decide about one at a time. Nothing of a page's own content
+ * is ever changed.
  *
  *   - {@link SpecLossFindings}: one status's findings a page at a time, of one session
  *     (`narratorId`) or of every session (the admin page; rows then name their session). Each row
  *     shows the file, when it was saved, what kinds of content were lost and, when it is not on
  *     the page, why; and offers: read the lost text, open its block, dismiss it (asked first when
- *     a block goes with it), reopen a dismissed one, or attach one the automatic attach left out.
+ *     a block goes with it), reopen a dismissed one, or attach one that is not on its page. A
+ *     finding of the behavior fence would go onto the page the agent reads as its rules: its
+ *     attach asks with a warning of its own, and only then tells the server the person confirmed.
  *     Rows wrap, so the list holds at a phone's width.
  *   - {@link SpecLossNotice}: the Spec panel's one line when the session has findings, opening
  *     the same list in place.
@@ -159,9 +162,9 @@ function SpecLossRow({
 	const [shown, setShown] = useState(false);
 	const detail = useSpecLossDetail(scope, item.id, shown);
 	const decide = useDecideSpecLoss(scope);
-	const act = (action: "attach" | "dismiss" | "reopen") =>
+	const act = (action: "attach" | "dismiss" | "reopen", confirmRule = false) =>
 		decide.mutate(
-			{ findingId: item.id, action },
+			{ findingId: item.id, action, ...(confirmRule ? { confirmRule } : {}) },
 			{
 				onSuccess: (after) =>
 					notifications.show({
@@ -180,8 +183,9 @@ function SpecLossRow({
 	const kinds = KINDS.filter((kind) => (item.kinds[kind] ?? 0) > 0)
 		.map((kind) => t(`spec.loss.kind.${kind}`, { count: item.kinds[kind] ?? 0 }))
 		.join(t("spec.loss.kindSeparator"));
-	// Why an open finding is not on its page.
-	const why = !item.attachable ? "not_imported" : (item.attachNote ?? "pending");
+	// Why an open finding is not on its page (of a dismissed one: only that its block was deleted).
+	const why =
+		item.status === "open" && !item.attachable ? "not_imported" : (item.attachNote ?? "pending");
 	const blockHref =
 		item.spaceId && item.blockId
 			? outlineTargetHref({ kind: "block", spaceId: item.spaceId, blockId: item.blockId })
@@ -239,8 +243,15 @@ function SpecLossRow({
 					.filter(Boolean)
 					.join(" · ")}
 			</Text>
-			{item.status === "open" && (
-				<Text size="xs" c="dimmed" mt={2} data-testid="spec-loss-why" data-note={why}>
+			{(item.status === "open" || item.attachNote === "block_deleted") && (
+				<Text
+					size="xs"
+					c="dimmed"
+					mt={2}
+					style={{ overflowWrap: "anywhere" }}
+					data-testid="spec-loss-why"
+					data-note={why}
+				>
 					{t(`spec.loss.why.${why}`)}
 				</Text>
 			)}
@@ -264,14 +275,21 @@ function SpecLossRow({
 						disabled={!item.attachable}
 						loading={decide.isPending && decide.variables?.action === "attach"}
 						onClick={async () => {
-							if (
-								await confirm({
-									title: t("spec.loss.attachTitle"),
-									message: t("spec.loss.attachConfirm", { path: item.path }),
-									confirmLabel: t("spec.loss.attach"),
-								})
-							)
-								act("attach");
+							// The behavior page is read by the agent as rules: said before anything is asked
+							// of the server, which refuses the attach without the confirmation.
+							const asked = item.rulePage
+								? {
+										title: t("spec.loss.attachRuleTitle"),
+										message: t("spec.loss.attachRuleConfirm"),
+										confirmLabel: t("spec.loss.attachRule"),
+										confirmColor: "orange",
+									}
+								: {
+										title: t("spec.loss.attachTitle"),
+										message: t("spec.loss.attachConfirm", { path: item.path }),
+										confirmLabel: t("spec.loss.attach"),
+									};
+							if (await confirm(asked)) act("attach", item.rulePage);
 						}}
 						data-testid="spec-loss-attach"
 					>
