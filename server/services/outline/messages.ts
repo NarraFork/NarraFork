@@ -301,6 +301,18 @@ export const OUTLINE_TOOL_TEXT = {
 		/** An agent's hand-over ended the work on a task in progress (`write.ts`, `handed-over`). */
 		handedOver: (address: string) =>
 			`${address} was in progress and got a new assignee: it is back to to-do, so whoever takes it up claims it afresh`,
+		/** A task of the session's own space given to someone else was handed out (P2 PR 10c-3). */
+		handedOut: (task: string, copy: string, assignee: string | null, omitted: number) =>
+			`${task} was handed out: its copy ${copy} is on the project's task page${
+				assignee ? `, assigned to @${assignee}` : ", in the team's pool (nobody assigned)"
+			}${
+				omitted > 0
+					? `, without ${omitted} block${omitted === 1 ? "" : "s"} under it (too large)`
+					: ""
+			}. ${task} stays yours, now waiting for the copy (depends::); you are told when the copy is done or cancelled, then check it and tick ${task}`,
+		/** The hand-out after the write failed; the write stands. */
+		handOutFailed: (task: string, reason: string) =>
+			`${task} was not handed out: ${reason}. The rest of the call was written; the task has no new assignee`,
 		/** `@agent:name` names no session: written as a name, nobody is told. */
 		assigneeUnknown: (name: string) =>
 			`no session has the id or handle ${quoted(name)}: @agent:${name} was written as a label only. Nobody is told and nothing changes hands: a task of yours that is in progress is still in progress and still yours`,

@@ -51,12 +51,12 @@ async function disabledText(): Promise<string> {
 }
 
 /**
- * Whether this session may write only its own outline space: read-only mode, strict plan mode
- * (relaxed planning keeps the session's mode), or a read-only capability ceiling. Read live, as
- * the notification service does, so a mode switched mid-turn applies at once.
+ * Why this session may write only its own outline space, or null: read-only mode (or a read-only
+ * capability ceiling), or strict plan mode (relaxed planning keeps the session's mode). Read
+ * live, as the notification service does, so a mode switched mid-turn applies at once.
  */
-async function writesLimitedToSessionSpace(ctx: ToolContext): Promise<boolean> {
-	if (ctx.runtimePolicy?.tools.readOnly || ctx.runtimePolicy?.readOnlyGitShell) return true;
+async function sessionSpaceOnlyReason(ctx: ToolContext): Promise<"readOnly" | "plan" | null> {
+	if (ctx.runtimePolicy?.tools.readOnly || ctx.runtimePolicy?.readOnlyGitShell) return "readOnly";
 	const [{ db }, { narrators }, { eq }, { isPlanModeTrait }, { resolveEffectiveRelaxedPlan }] =
 		await Promise.all([
 			import("@server/db"),
@@ -74,12 +74,11 @@ async function writesLimitedToSessionSpace(ctx: ToolContext): Promise<boolean> {
 		.from(narrators)
 		.where(eq(narrators.id, ctx.narratorId))
 		.limit(1);
-	if (!row) return true;
-	return (
-		row.permissionMode === "readOnly" ||
-		(isPlanModeTrait(row.traits) &&
-			!resolveEffectiveRelaxedPlan(row.permissionMode, row.relaxedPlan))
-	);
+	if (!row || row.permissionMode === "readOnly") return "readOnly";
+	return isPlanModeTrait(row.traits) &&
+		!resolveEffectiveRelaxedPlan(row.permissionMode, row.relaxedPlan)
+		? "plan"
+		: null;
 }
 
 /**
@@ -117,10 +116,12 @@ async function callProvenance(
 
 async function openScope(ctx: ToolContext, forWrite: boolean): Promise<Scope> {
 	const { OutlineAgentScope } = await import("../../../services/outline/agent-scope");
+	const limit = forWrite ? await sessionSpaceOnlyReason(ctx) : null;
 	return await OutlineAgentScope.open({
 		narratorId: ctx.narratorId,
 		userId: ctx.userId ?? null,
-		sessionSpaceOnly: forWrite ? await writesLimitedToSessionSpace(ctx) : false,
+		sessionSpaceOnly: limit !== null,
+		planMode: limit === "plan",
 	});
 }
 
@@ -362,6 +363,7 @@ edits, in order, each one of:
 - { delete: <block> }: the block and everything under it.
 - { set: <block>, checkbox?, assignee?, alias? }: checkbox " " todo, "/" doing, "x" done, "-" cancelled, "none" makes a task a plain block; assignee agent:name, human:name or null; alias Q17, "Q?" (next free number) or null.
 Markdown outline: every list item is a block, indentation nests; \`- [ ] task @agent:name\` is a task; \`depends:: [[…]]\`, \`due:: 2026-11-01\`, \`alias:: Q?\`, \`tags:: [[…]]\` lines under an item are properties. Link with [[title]], [[alias]] or [[key/id]]; links are stored as addresses, so renaming never breaks them, and blocks added in one call can link to each other by title. Text copied from OutlineRead works as is: the ids after bullets and the ‹…› notes are dropped. Lists or extra paragraphs inside one item become child blocks; the result says what was split.
+Work for the team goes on the project's task page (project/tasks; a page with alias:: tasks when there is none): to put a task in the pool, add it there and give your own task depends:: [[it]], and giving a task of this session's own space to a session or person who cannot work in that space (@agent:…, @human:…) hands a copy out there the same way, your task then waiting for it.
 <block>, <parent>: an id, key/id, an alias or a title. message: a short summary for the timeline.
 Notes under a task go conclusion first: a block directly under a task is one conclusion in one line (at most ${OUTLINE_NOTE_RULES.noteChars} characters), its evidence and details go in blocks under it (at most ${OUTLINE_NOTE_RULES.detailChars} characters each, at most ${OUTLINE_NOTE_RULES.maxChildren} blocks on one level), with no headings and no record of the process; a task's title is one line (at most ${OUTLINE_NOTE_RULES.titleChars} characters). When you tick a task done or cancelled, its first block should say the result in one line. The result says which blocks you wrote are over these limits and how to restructure them; a write far over them may be refused.
 Locked plans: a task tree a person locked takes changes to its plan (its steps, their text and order, its background, cancelling a step, the whole plan done) as proposals waiting for their confirmation; the rest of the call is written. The result names the proposal (P and 8 characters) and the tasks waiting for it: do other work meanwhile; reading the plan shows your proposed version. Progress, findings, ticking steps and splitting a step into sub-steps are written directly. A session the locker named confirms with { confirm: "P…" } or rejects with { reject: "P…", reason }, in a call of their own; never its own proposals (rejecting your own withdraws it).
