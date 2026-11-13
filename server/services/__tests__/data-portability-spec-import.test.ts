@@ -157,3 +157,50 @@ describe("data portability · Dynamic Spec 导入状态", () => {
 		expect(stateRows()).toBe(1);
 	});
 });
+
+describe("data portability · 被吞内容排查（outline P2 PR 12c）", () => {
+	const lossRows = () =>
+		["outline_spec_loss_findings", "outline_spec_loss_scans"].map((table) =>
+			Number((sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n),
+		);
+	function insertLoss(narratorId: string) {
+		sqlite.run(
+			`INSERT INTO outline_spec_loss_findings
+				(id, narrator_id, path, before_revision_id, after_revision_id, kinds, excerpt,
+				status, created_at, updated_at)
+			VALUES (?, ?, 'design.md', 'r1', 'r2', '{"table":1}', '[]', 'dismissed', ?, ?)`,
+			[`lf-${narratorId}`, narratorId, "2026-11-13T00:00:00Z", "2026-11-13T00:00:00Z"],
+		);
+		sqlite.run(
+			`INSERT INTO outline_spec_loss_scans (narrator_id, source_key, scanned_at)
+			VALUES (?, 'k', ?)`,
+			[narratorId, "2026-11-13T00:00:00Z"],
+		);
+	}
+
+	test("不在快照里；覆盖会话不动本机的记录和人的决定", async () => {
+		const exported = Object.values(SNAPSHOT_TABLES).flat();
+		expect(exported).not.toContain("outline_spec_loss_findings");
+		expect(exported).not.toContain("outline_spec_loss_scans");
+		insertNarrator("n-loss", "spec");
+		const zip = await exportZip();
+		sqlite.run(`UPDATE narrators SET task_backend = 'outline' WHERE id = 'n-loss'`);
+		insertLoss("n-loss");
+		const preview = await previewImport(zip, "export.zip");
+		const result = await applyImport(preview.token, { conflictDefault: "overwrite" });
+		expect(result.sessionsOverwritten).toBe(1);
+		expect(lossRows()).toEqual([1, 1]);
+		expect(
+			sqlite.prepare(`SELECT status FROM outline_spec_loss_findings`).get() as { status: string },
+		).toEqual({ status: "dismissed" });
+	});
+
+	test("清空会话：记录一起清掉；只清请求不动", async () => {
+		insertNarrator("n-loss-clear", "spec");
+		insertLoss("n-loss-clear");
+		await clearData("requests");
+		expect(lossRows()).toEqual([1, 1]);
+		await clearData("sessions");
+		expect(lossRows()).toEqual([0, 0]);
+	});
+});

@@ -166,6 +166,33 @@ export const ERROR_CATALOG = {
 		code: "SPEC_IMPORT_OFF",
 		en: "Imports from Dynamic Spec are switched off (outline.specImport is off, or the outline is off).",
 	},
+	/** A finding of the swallowed-content scan that someone decided already (12c). */
+	SPEC_LOSS_DECIDED: {
+		status: 409,
+		code: "SPEC_LOSS_DECIDED",
+		en: "Someone already decided about this possibly lost content. Reload the list.",
+	},
+	/** Attaching possibly lost content for a session whose tasks are still in Dynamic Spec (12c). */
+	SPEC_LOSS_NOT_IMPORTED: {
+		status: 409,
+		code: "SPEC_LOSS_NOT_IMPORTED",
+		en: "This session still keeps Dynamic Spec, so there is no imported page to attach the content to. Import the session first; the content can be read here meanwhile.",
+	},
+	/** Attaching possibly lost content when the file's imported page is not there (12c). */
+	SPEC_LOSS_NO_PAGE: {
+		status: 409,
+		code: "SPEC_LOSS_NO_PAGE",
+		en: "The page this file was imported to is not there (it was deleted, or the file was never imported), so the content cannot be attached. It can still be read and copied here.",
+	},
+	/**
+	 * Attaching possibly lost content of the behavior fence without the person's confirmation
+	 * (12c): the behavior page is shown to the agent as standing rules.
+	 */
+	SPEC_LOSS_RULE_CONFIRM: {
+		status: 409,
+		code: "SPEC_LOSS_RULE_CONFIRM",
+		en: "This content was removed from the session's behavior rules. Attached to the behavior page, the agent reads it as a rule again. Confirm that this is what you want.",
+	},
 	/** A re-import of a session the import does not move (an outline session, a subagent). */
 	SPEC_IMPORT_NOT_IMPORTABLE: {
 		status: 409,

@@ -35,6 +35,20 @@
  * without checkboxes, breadth first, at most {@link OUTLINE_BEHAVIOR_LIMITS.forkBlocks} blocks
  * with a note when cut, with its short ids (design §2.5: fork = copy). The rest of the session
  * space is not copied (as in PR 3).
+ *
+ * WHAT IS NEVER READ AS A RULE
+ * ----------------------------
+ * The swallowed-content scan (outline P2 PR 12c) attaches content a Spec panel save may have lost
+ * to imported pages as blocks of its own (`sl…` short ids). Nothing attaches such a block to this
+ * page by itself; should one stand here all the same, it and what is under it are left out of
+ * everything that reads the page as rules ({@link dropSpecLossAttachBlocks}): the view shown to
+ * the model, the text put ahead of the spec fence, and a fork's copy. A rule a person deleted on
+ * purpose must not apply again because a check found it. That holds for an `sl…` block a person
+ * moved onto this page by hand too: to make its content a rule, move the content out of the
+ * block, or attach the finding through the confirmation. Content a person attached here through
+ * the confirmation is under an `sr…` block: the content is read as rules and copied by a fork;
+ * the block's own line speaks to the person (what this is, that it may be moved or deleted) and
+ * is not a rule, so what is shown to the model has the content in its place (`rulesOnly`).
  */
 import { createHash } from "node:crypto";
 import { hotSafe } from "@server/lib/hot-safe";
@@ -45,6 +59,7 @@ import {
 	getUserLanguage,
 	type Locale,
 } from "@server/lib/prompt-i18n";
+import { isSpecLossAttachSid, isSpecLossRuleSid } from "@shared/outline-spec-import";
 import { splitBehaviorFence } from "../behavior-fence-sop";
 import { readNarrator } from "../outline/access-reads";
 import type { EditTextItem } from "../outline/edit-text";
@@ -55,7 +70,7 @@ import { loadBodiesWithin, readSubtree } from "../outline/read";
 import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
 import type { OutlineBlockMeta, OutlineStore } from "../outline/store/port";
-import { breadthFirst, subtreeNodes } from "../outline/tree";
+import { breadthFirst, type OutlineNode, subtreeNodes } from "../outline/tree";
 import { type OutlineCanonicalContent, type OutlineOp, writeOutline } from "../outline/write";
 import { specVfsService, writeSpecFile } from "../spec-vfs-service";
 import { readTaskSession } from "./backend";
@@ -96,6 +111,38 @@ export async function findBehaviorPage(
 	if (!owner) return null;
 	const [meta] = await store.getBlockMetas(spaceId, { ids: [owner.id] });
 	return meta && !meta.deleted && meta.parentId === null ? meta : null;
+}
+
+/**
+ * Take the swallowed-content scan's attach blocks, with what is under them, out of a behavior
+ * page's tree as it was just read (see the module header); the tree is the caller's own, built
+ * for this read. `rulesOnly` (what the model is shown): the header of content a person confirmed
+ * as rules is replaced by what is under it. How many subtrees were taken out.
+ */
+export function dropSpecLossAttachBlocks(
+	root: OutlineNode,
+	options: { rulesOnly?: boolean } = {},
+): number {
+	let dropped = 0;
+	const walk = [root];
+	for (let i = 0; i < walk.length; i++) {
+		const node = walk[i] as OutlineNode;
+		const kept: OutlineNode[] = [];
+		for (const child of node.children) {
+			if (isSpecLossAttachSid(child.sid)) dropped++;
+			else if (options.rulesOnly && isSpecLossRuleSid(child.sid)) {
+				// Its children stand where it stood.
+				for (const under of child.children) {
+					under.parent = node;
+					under.parentId = node.id;
+					kept.push(under);
+				}
+			} else kept.push(child);
+		}
+		node.children = kept;
+		walk.push(...kept);
+	}
+	return dropped;
 }
 
 /**
@@ -527,6 +574,8 @@ export async function copyOutlineBehaviorPage(
 		if (!page) return false;
 		const subtree = await readSubtree(page.id);
 		if (!subtree) return false;
+		// Possibly lost content attached by the scan is not a rule: a fork does not inherit it.
+		dropSpecLossAttachBlocks(subtree.root);
 		// One operation is kept for the note a cut copy ends with.
 		const room = OUTLINE_BEHAVIOR_LIMITS.forkBlocks - 1;
 		const order = breadthFirst(subtree.root, "all", room);
