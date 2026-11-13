@@ -613,12 +613,31 @@
 			"assignUser": "Hand to someone…",
 			"assignSession": "Hand back to the session",
 			"transferSession": "Hand to a session…",
+			"handToTeam": "Hand to the team",
 			"usernamePlaceholder": "Username",
 			"assign": "Hand over",
 			"open": "Open in the outline",
 			"failed": "Could not change the task",
 			"conflict": "The task changed meanwhile; the board was reloaded.",
 			"updated": "Task updated"
+		},
+		"handOut": {
+			"toTeam": "Handed to the team: a copy is on the project's task page ({{address}}). This task waits for it.",
+			"toOthers": "Handed out: a copy is on the project's task page ({{address}}). This task waits for it.",
+			"failed": "Could not hand the task out",
+			"refused": {
+				"not_session_task": "Only a task of a session's own space is handed out.",
+				"not_owner": "Only the session's owner can hand its tasks out.",
+				"no_project": "The session belongs to no project, so there is nowhere to hand the task to.",
+				"cannot_write_project": "You cannot write the project's tasks, where the copy would go.",
+				"finished": "The task is finished already.",
+				"planning": "The task is part of a plan that is not approved yet.",
+				"locked": "The task is in a plan a person locked.",
+				"held": "Someone else is doing the task.",
+				"changed": "The task changed meanwhile; the board was reloaded.",
+				"already_handed_out": "The task was handed out already to someone else, and its copy is in progress.",
+				"original_not_updated": "The copy was made, but this task could not be set to wait for it. A note under the copy says so."
+			}
 		},
 		"transfer": {
 			"note": "An existing session brings its earlier context along. A new session is usually the better choice.",

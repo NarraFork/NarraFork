@@ -197,6 +197,7 @@ export const outlineBoardTaskUpdateBodySchema = z
 				}),
 				z.object({ kind: z.literal("session") }),
 				z.object({ kind: z.literal("narrator"), narratorId: outlineIdSchema }),
+				z.object({ kind: z.literal("team") }),
 			])
 			.optional(),
 		start: z.boolean().optional(),

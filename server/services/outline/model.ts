@@ -99,6 +99,30 @@ export const OUTLINE_BEHAVIOR_ALIAS = "behavior";
  */
 export const OUTLINE_TASKS_PAGE_ALIAS = "tasks";
 
+/** The system actor of a hand-out's commits (outline P2 PR 10c-3, `hand-out.ts`). */
+export const OUTLINE_HAND_OUT_ACTOR = "outline-hand-out";
+
+/**
+ * The person whose commit this is: a person's own, or a hand-out a person made on the board (a
+ * system commit of {@link OUTLINE_HAND_OUT_ACTOR} for them, carrying no session). Null for any
+ * other commit: a session's, or the system's.
+ */
+export function commitPersonId(commit: {
+	actorKind: string;
+	actorId: string;
+	narratorId: string | null;
+	responsibleUserId: string | null;
+}): string | null {
+	if (commit.actorKind === "human") return commit.actorId;
+	if (
+		commit.actorKind === "system" &&
+		commit.actorId === OUTLINE_HAND_OUT_ACTOR &&
+		commit.narratorId === null
+	)
+		return commit.responsibleUserId;
+	return null;
+}
+
 /**
  * `edit` is every ordinary write; `revert` and `import` are written by their own paths; `confirm`
  * is a pending change taking effect (`pending.ts`): its actor is the proposer, its responsible
