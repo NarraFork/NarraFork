@@ -6411,6 +6411,13 @@ export const outlineSpecImports = sqliteTable(
  *     (on the file's imported page: `block_id`), `dismissed` (a person's decision).
  *   - `attach_seq`: how often it was attached anew after its block was deleted; the block's short
  *     id follows from (`id`, `attach_seq`), so no attach is ever written twice.
+ *   - `attach_attempts`: automatic attaches that failed; after a few the finding is left to a
+ *     person (`attach_note` `gave_up`) and no pass tries it again.
+ *   - `inherited`: 1 when the save was made in the session this one was forked from (the revision
+ *     belongs to another namespace): listed here, attached only in the session of the save.
+ *
+ * Only findings of tables are attached automatically (owner decision 2026-11-13); the other
+ * kinds, and everything of the behavior fence, are listed and attached when a person asks.
  */
 export const outlineSpecLossFindings = sqliteTable(
 	"outline_spec_loss_findings",
@@ -6434,6 +6441,8 @@ export const outlineSpecLossFindings = sqliteTable(
 		blockId: text("block_id"),
 		attachNote: text("attach_note"),
 		attachSeq: integer("attach_seq").notNull().default(0),
+		attachAttempts: integer("attach_attempts").notNull().default(0),
+		inherited: integer("inherited").notNull().default(0),
 		resolvedBy: text("resolved_by"),
 		resolvedAt: text("resolved_at"),
 		createdAt: text("created_at").notNull(),
