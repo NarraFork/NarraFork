@@ -1,6 +1,6 @@
 {
-  "id": "c8a9eeba-aacb-4856-b151-f491477a6d62",
-  "prevId": "1363fe77-68fa-4135-8d93-e64136d06a6d",
+  "id": "11493ae9-9036-4353-b911-18624a649666",
+  "prevId": "c8a9eeba-aacb-4856-b151-f491477a6d62",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -604,6 +604,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": 0
+        },
+        "cache_usage_reported": {
+          "name": "cache_usage_reported",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": false
         },
         "ttft_ms": {
           "name": "ttft_ms",

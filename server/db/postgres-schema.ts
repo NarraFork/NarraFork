@@ -2155,6 +2155,7 @@ export const apiRequests = pgTable(
 		cacheCreation5mTokens: integer("cache_creation_5m_tokens").notNull().default(0),
 		cacheCreation1hTokens: integer("cache_creation_1h_tokens").notNull().default(0),
 		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		cacheUsageReported: boolean("cache_usage_reported"),
 		ttftMs: integer("ttft_ms"),
 		durationMs: integer("duration_ms"),
 		decodeMs: integer("decode_ms"),
@@ -4414,7 +4415,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 142,
-  "columnCount": 1890,
+  "columnCount": 1891,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -16510,6 +16511,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "0",
           "defaultExpression": "0"
+        },
+        {
+          "property": "cacheUsageReported",
+          "name": "cache_usage_reported",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "ttftMs",

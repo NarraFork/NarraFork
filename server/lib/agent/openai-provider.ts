@@ -155,6 +155,7 @@ function parsedUsageToUsageData(
 		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
 		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
+		...(usage.cacheReported !== undefined && { cacheReported: usage.cacheReported }),
 	};
 }
 
@@ -182,6 +183,13 @@ function openAIUsageToParsedUsage(
 	}
 	if (normalized.cacheCreationInputTokens !== undefined) {
 		merged.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
+	}
+	// Relays that omit prompt/input token details leave both counters undefined. Only a
+	// prompt count without them proves absence; output-only partials stay unknown.
+	if (merged.cachedInputTokens !== undefined || merged.cacheCreationInputTokens !== undefined) {
+		merged.cacheReported = true;
+	} else if (merged.promptTokens != null) {
+		merged.cacheReported = false;
 	}
 	if (
 		usage.output_tokens_details?.reasoning_tokens != null ||
