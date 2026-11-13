@@ -68,6 +68,7 @@ export const outlineSearchQuerySchema = z.object({
 	q: z.string().trim().min(1).max(500),
 	spaceId: outlineIdSchema.optional(),
 	limit: limitSchema(OUTLINE_VIEW_LIMITS.maxSearch).optional(),
+	cursor: cursorSchema.optional(),
 });
 
 /**

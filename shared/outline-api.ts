@@ -374,12 +374,24 @@ export interface OutlineSearchHitView {
 	snippet: string;
 	/** Titles of the ancestors, the page first. */
 	path: string[];
+	/**
+	 * Ids of those ancestors, the page first: the rows a search drawn as a tree hangs the hit
+	 * under, and what "locate in the tree" opens. Absent from an older server.
+	 */
+	pathIds?: string[];
 	/** A task, under one, or session notes. */
 	process: boolean;
 }
 
 export interface OutlineSearchResponse {
 	hits: OutlineSearchHitView[];
+	/**
+	 * Pass back as `cursor` for the next page of the same search; null (or absent, an older
+	 * server) when there is none. A search reaches at most the candidates one search ranks.
+	 */
+	nextCursor?: string | null;
+	/** The spaces of this page's hits (all readable by the caller), for their rows. */
+	spaces?: OutlineSpaceSummary[];
 }
 
 export interface OutlineRevertResponse {
