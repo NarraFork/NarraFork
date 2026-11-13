@@ -146,15 +146,24 @@ export function OutlineBreadcrumbs({
 					aria-label={t("tree.locate")}
 					title={t("tree.locate")}
 					data-testid="outline-locate"
-					onClick={() =>
+					onClick={(event) => {
+						// Only a plain click goes to this host's tree (a new tab has its own).
+						if (
+							event.button !== 0 ||
+							event.ctrlKey ||
+							event.metaKey ||
+							event.shiftKey ||
+							event.altKey
+						)
+							return;
 						requestTreeLocate(locate.host, {
 							spaceId: view.space.id,
 							pageId: above[0]?.id ?? locate.blockId,
 							blockId: locate.blockId,
 							pathIds: above.map((ancestor) => ancestor.id),
 							pageTitle: above[0]?.title ?? locate.title,
-						})
-					}
+						});
+					}}
 				>
 					<IconBinaryTree2 size={14} />
 				</OutlineLink>

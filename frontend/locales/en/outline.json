@@ -720,6 +720,8 @@
 			"finished": "Finished: {{text}}"
 		},
 		"locate": "Show in the outline tree",
+		"locateFailed": "Could not show it in the tree: it may be gone, or past what one read of its page holds.",
+		"dismiss": "Dismiss",
 		"search": {
 			"label": "Search results",
 			"hint": "Matches with what they are under. Open a match to see it in the tree.",

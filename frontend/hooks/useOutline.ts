@@ -25,7 +25,7 @@ import {
 	useQueryClient,
 } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { OutlineViewState } from "../components/outline/view-state";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
@@ -254,6 +254,18 @@ export function prefetchOutlineSeed(
 const loadedViewStates = new WeakSet<OutlineViewState>();
 
 /**
+ * Whether a surface's view state holds what is stored for the person:
+ *   - `pending`: the stored state is being read; what the surface has is not theirs yet;
+ *   - `applied`: it holds the stored state (or nothing was stored), with their changes since;
+ *   - `unseen`: the read failed, or the person folded something before it arrived, so the
+ *     stored state was never laid under what the surface has.
+ * Anything that folds or writes on the reader's behalf (not by their own hand) waits for
+ * `applied`: acting earlier would write a state that never saw the stored one over it.
+ */
+export type OutlineViewStateSync = "pending" | "applied" | "unseen";
+const viewStateSync = new WeakMap<OutlineViewState, OutlineViewStateSync>();
+
+/**
  * Keep a surface's folding and mind-map direction of a page in step with the person's stored
  * view state (`/api/outline/view-state/:pageId`, design §7.1): read once when the page is first
  * shown (unless the person already folded something here), and written back, debounced, after
@@ -262,10 +274,20 @@ const loadedViewStates = new WeakSet<OutlineViewState>();
 export function useOutlineViewStateSync(
 	pageId: string | undefined,
 	state: OutlineViewState | null,
-): void {
+): OutlineViewStateSync {
+	const [sync, setSync] = useState<OutlineViewStateSync>(
+		() => (state && viewStateSync.get(state)) || "pending",
+	);
 	useEffect(() => {
 		if (REMOTE_BUILD) return;
 		if (!pageId || !state || state.pageId !== pageId) return;
+		// (Also after this run of the effect was disposed: the state object outlives it, and the
+		// read is made once per object.)
+		const settle = (value: OutlineViewStateSync) => {
+			viewStateSync.set(state, value);
+			setSync(value);
+		};
+		setSync(viewStateSync.get(state) ?? "pending");
 		let disposed = false;
 		let touched = false;
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -294,10 +316,18 @@ export function useOutlineViewStateSync(
 			api
 				.getOutlineViewState(pageId)
 				.then((stored) => {
-					if (disposed || touched || stored.updatedAt === null) return;
+					if (stored.updatedAt === null) return settle("applied");
+					// Folded before the stored state arrived (by the person, or in a run of this
+					// effect that is gone): what the surface has stays, the stored one unseen.
+					const folded = state.expanded.size > 0 || state.collapsed.size > 0;
+					if (touched || (disposed && folded)) return settle("unseen");
 					state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
+					settle("applied");
 				})
-				.catch(() => loadedViewStates.delete(state));
+				.catch(() => {
+					loadedViewStates.delete(state);
+					settle("unseen");
+				});
 		}
 		return () => {
 			disposed = true;
@@ -308,6 +338,7 @@ export function useOutlineViewStateSync(
 			}
 		};
 	}, [pageId, state]);
+	return sync;
 }
 
 export function useOutlineTimeline(spaceId: string, pageId: string | undefined) {

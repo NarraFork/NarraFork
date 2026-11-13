@@ -240,9 +240,34 @@ describe("PostgreSQL connected outline", () => {
 			expect(outcome.orphaned).toBe(0);
 			// What a row says: live blocks only, the reader's own open questions, the latest picks.
 			expect(outcome.facts).toEqual({
-				sa_b: { waiting: 1, doing: 2, doingId: "t2", finishedId: "t5", summaryId: "n1" },
-				saB: { waiting: 0, doing: 0, doingId: null, finishedId: "x1", summaryId: null },
-				sAA: { waiting: 0, doing: 0, doingId: null, finishedId: null, summaryId: null },
+				sa_b: {
+					waiting: 1,
+					waitingBlockId: "q1",
+					waitingPageId: "q1",
+					doing: 2,
+					doingId: "t2",
+					// The task done last; the cancelled one after it is not it.
+					finishedId: "t4",
+					summaryId: "n1",
+				},
+				saB: {
+					waiting: 0,
+					waitingBlockId: null,
+					waitingPageId: null,
+					doing: 0,
+					doingId: null,
+					finishedId: "x1",
+					summaryId: null,
+				},
+				sAA: {
+					waiting: 0,
+					waitingBlockId: null,
+					waitingPageId: null,
+					doing: 0,
+					doingId: null,
+					finishedId: null,
+					summaryId: null,
+				},
 			});
 			expect(outcome.cappedDoing).toBe(1);
 		},

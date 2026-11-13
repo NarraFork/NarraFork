@@ -23,6 +23,8 @@ export interface TreeLocateTarget {
 	pathIds: readonly string[];
 	/** The page's title, for its row when the tree has not listed it yet. */
 	pageTitle: string;
+	/** The block is a question for the reader: once shown, its answer form opens in the tree. */
+	answer?: boolean;
 }
 
 /** How long a request waits for a tree to mount. */
@@ -57,6 +59,11 @@ export interface LocatePlan {
 	 * tree's root) or a group's key. Null: the space is the tree's root or always listed.
 	 */
 	pinIn: string | null;
+	/**
+	 * The session's project space must be pinned at the tree's root too: the root lists projects
+	 * a page at a time, and the session's may be past what it has loaded.
+	 */
+	pinParentAtRoot: boolean;
 }
 
 /**
@@ -73,21 +80,27 @@ export function locateKeys(
 ): LocatePlan | null {
 	const page = `page:${pageId}`;
 	if (root) {
-		if (root.spaceId === space.id) return { keys: [page], pinIn: null };
+		if (root.spaceId === space.id) return { keys: [page], pinIn: null, pinParentAtRoot: false };
 		// A session of the project the tree is rooted at.
 		if (space.kind === "session" && parent && parent.spaceId === root.spaceId) {
 			const group = `group:sessions:${parent.projectId}`;
-			return { keys: [group, `space:${space.id}`, page], pinIn: group };
+			return { keys: [group, `space:${space.id}`, page], pinIn: group, pinParentAtRoot: false };
 		}
 		return null;
 	}
 	const own = `space:${space.id}`;
-	if (space.orphaned) return { keys: ["group:orphaned", own, page], pinIn: "group:orphaned" };
-	if (space.kind === "personal") return space.mine ? { keys: [own, page], pinIn: null } : null;
-	if (space.kind === "project") return { keys: [own, page], pinIn: "root" };
+	if (space.orphaned)
+		return { keys: ["group:orphaned", own, page], pinIn: "group:orphaned", pinParentAtRoot: false };
+	if (space.kind === "personal")
+		return space.mine ? { keys: [own, page], pinIn: null, pinParentAtRoot: false } : null;
+	if (space.kind === "project") return { keys: [own, page], pinIn: "root", pinParentAtRoot: false };
 	if (parent) {
 		const group = `group:sessions:${parent.projectId}`;
-		return { keys: [`space:${parent.spaceId}`, group, own, page], pinIn: group };
+		return {
+			keys: [`space:${parent.spaceId}`, group, own, page],
+			pinIn: group,
+			pinParentAtRoot: true,
+		};
 	}
-	return { keys: ["group:loose", own, page], pinIn: "group:loose" };
+	return { keys: ["group:loose", own, page], pinIn: "group:loose", pinParentAtRoot: false };
 }

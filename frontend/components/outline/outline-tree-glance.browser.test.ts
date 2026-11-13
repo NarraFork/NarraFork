@@ -30,6 +30,8 @@ import {
 	ensureProjectSpace,
 	ensureSessionSpace,
 } from "../../../server/services/outline/spaces";
+import { outlineStore } from "../../../server/services/outline/store";
+import { writeViewState } from "../../../server/services/outline/view-state";
 import { type OutlineOp, writeOutline } from "../../../server/services/outline/write";
 import type * as Fixture from "./outline-tree.browser-fixture";
 
@@ -51,6 +53,16 @@ let bigPage: string;
 let personalSpace: string;
 const big = { firstDone: "", open: "", openNote: "", deepTask: "", deepNote: "", deepHit: "" };
 let factHit = "";
+let projectId = "";
+let decisions = { pageId: "", a: "" };
+const deep = { hit: "" };
+let questions: string[] = [];
+/** The test server's hold on the reader's view state: writes counted, reads held, writes failed. */
+const viewState = {
+	puts: 0,
+	hold: null as Promise<void> | null,
+	failPut: false,
+};
 
 async function write(spaceId: string, author: string, ops: OutlineOp[]): Promise<string[]> {
 	const written = await writeOutline({
@@ -75,6 +87,15 @@ function api() {
 			: Response.json({ error: String(error) }, { status: 500 }),
 	);
 	app.get("/api/settings", (c) => c.json({ outline: { enabled: true } }));
+	app.use("/api/outline/view-state/*", async (c, next) => {
+		if (c.req.method === "PUT") {
+			viewState.puts++;
+			if (viewState.failPut) return c.json({ error: "held" }, 500);
+		} else if (viewState.hold) {
+			await viewState.hold;
+		}
+		await next();
+	});
 	app.route("/api/outline", outlineRoutes);
 	return app;
 }
@@ -154,7 +175,7 @@ beforeAll(async () => {
 			content: `Note ${String(i + 1).padStart(2, "0")}`,
 		})),
 	);
-	const projectId = generateId();
+	projectId = generateId();
 	await db.insert(projects).values({
 		id: projectId,
 		name: "Atlas",
@@ -175,6 +196,19 @@ beforeAll(async () => {
 		{ op: "insert", parent: { tempId: "p" }, content: "The zebracorn index is rebuilt nightly" },
 	]);
 	factHit = facts[2] as string;
+	// A page the reader folded themselves: a fact (open by default) they closed.
+	const decided = await write(projectSpace, alice, [
+		{ op: "insert", tempId: "p", parent: null, content: "Decisions" },
+		{ op: "insert", tempId: "a", parent: { tempId: "p" }, content: "Decision A" },
+		{ op: "insert", parent: { tempId: "a" }, content: "Why A, first" },
+		{ op: "insert", parent: { tempId: "a" }, content: "Why A, second" },
+	]);
+	decisions = { pageId: decided[0] as string, a: decided[1] as string };
+	await writeViewState({ userId: alice, isAdmin: false }, decisions.pageId, {
+		collapsed: [decisions.a],
+		expanded: [],
+		layout: "right",
+	});
 
 	// Someone else's session of the project, readable through the project, not writable.
 	const spike = await session("Bob's spike", bob, projectId, "project");
@@ -227,6 +261,7 @@ beforeAll(async () => {
 		},
 	]);
 	tasksPage = tasks[0] as string;
+	questions = [tasks[4] as string, tasks[5] as string];
 
 	// A big task page: finished tasks with long notes, and the open work last.
 	const done = (n: number, notes: number, deepAt = -1): OutlineOp[] => [
@@ -256,9 +291,18 @@ beforeAll(async () => {
 				]
 			: []),
 	];
+	// Four closed levels down a finished task: its note, a detail, a detail of that, the block.
+	const nested: OutlineOp[] = [
+		{ op: "insert", tempId: "x1", parent: { tempId: "d5n2" }, content: "Why the queue" },
+		{ op: "insert", tempId: "x2", parent: { tempId: "x1" }, content: "Measured twice" },
+		{ op: "insert", tempId: "x3", parent: { tempId: "x2" }, content: "Second run" },
+		{ op: "insert", parent: { tempId: "x3" }, content: "The quokkafish trace says so" },
+	];
 	const first: OutlineOp[] = [{ op: "insert", tempId: "p", parent: null, content: "Big tasks" }];
 	for (let n = 1; n <= 12; n++) first.push(...done(n, 14, n === 3 ? 7 : -1));
+	first.push(...nested);
 	const firstIds = await write(raceSpace, alice, first);
+	deep.hit = firstIds.at(-1) as string;
 	bigPage = firstIds[0] as string;
 	big.firstDone = firstIds[1] as string;
 	// Task 3: after the page (1) and tasks 1 and 2 (15 each).
@@ -414,6 +458,23 @@ test("a space's row: what waits for the reader first, what is in progress, one l
 	expect(await call(page, (f) => f.ariaOwnedWell())).toBe(true);
 	expect(await call(page, (f) => f.hoverRules())).toEqual([]);
 	await shot(page, "1-session-rows-counts");
+
+	// "Waiting for you" is a button: it shows the first question in the tree, with its form.
+	expect(await call(page, (f) => f.count("button[data-tree-count=waiting]"))).toBe(1);
+	expect(await call(page, (f) => f.click("button[data-tree-count=waiting]"))).toBe(true);
+	await until(
+		page,
+		"a question located",
+		(f, ids: string[]) => ids.includes(f.located()?.id ?? ""),
+		// (Asked in one commit: either is the oldest.)
+		questions,
+	);
+	await until(
+		page,
+		"its answer form",
+		(f) => f.count("[data-testid=outline-tree-questions]") === 1,
+	);
+	expect(await call(page, (f) => f.navigated().length)).toBe(0);
 	await page.browserContext().close();
 }, 60_000);
 
@@ -611,6 +672,163 @@ test("Alt+Enter on a row: everything inside it, a level at a time; on a page, al
 	await page.browserContext().close();
 }, 60_000);
 
+const storedFolding = async (pageId: string) => {
+	const row = await outlineStore.getViewState(alice, pageId);
+	return { collapsed: row?.collapsed ?? [], expanded: row?.expanded ?? [] };
+};
+
+async function openDecisions(page: Page) {
+	await toggle(page, "Atlas");
+	await togglePage(page, decisions.pageId);
+	await until(
+		page,
+		"the page's blocks",
+		(f, id: string) => f.blockRows(id).length > 0,
+		decisions.pageId,
+	);
+}
+
+const closedRow = (f: typeof Fixture, pageId: string, id: string) =>
+	f.blockRows(pageId).some((r) => r.id === id && r.fold === "closed");
+
+test("opening a page keeps what the reader stored: nothing is written before it is read", async () => {
+	viewState.puts = 0;
+	const page = await openTree({ target: { kind: "home" } });
+	await openDecisions(page);
+	// The row the reader closed is closed here too, once their folding has been read.
+	await until(page, "the stored folding applied", closedRow, decisions.pageId, decisions.a);
+	expect(await storedFolding(decisions.pageId)).toEqual({
+		collapsed: [decisions.a],
+		expanded: [],
+	});
+	expect(viewState.puts).toBe(0);
+	await page.browserContext().close();
+}, 60_000);
+
+test("the same while the stored folding is slow to arrive", async () => {
+	viewState.puts = 0;
+	let release = () => {};
+	viewState.hold = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	try {
+		const page = await openTree({ target: { kind: "home" } });
+		await openDecisions(page);
+		// The read is folded by the stored state; the page's own state has not arrived: the row
+		// shows open over the one block that came. Nothing may be written from that.
+		await until(
+			page,
+			"the row as the default has it",
+			(f, pageId: string, id: string) =>
+				f.blockRows(pageId).some((r) => r.id === id && r.fold === "open"),
+			decisions.pageId,
+			decisions.a,
+		);
+		// A round trip later (anything sent before it has reached the server), still nothing.
+		await page.evaluate(() => fetch("/api/settings").then((r) => r.json()));
+		expect(viewState.puts).toBe(0);
+		release();
+		viewState.hold = null;
+		await until(page, "the stored folding applied", closedRow, decisions.pageId, decisions.a);
+		await page.evaluate(() => fetch("/api/settings").then((r) => r.json()));
+		expect(viewState.puts).toBe(0);
+		expect(await storedFolding(decisions.pageId)).toEqual({
+			collapsed: [decisions.a],
+			expanded: [],
+		});
+		// Opened by the reader now: stored, with what was there, and its blocks read.
+		await page.evaluate((id) => {
+			document
+				.querySelector<HTMLButtonElement>(`[data-block-id="${id}"] [data-fold-toggle]`)
+				?.click();
+		}, decisions.a);
+		await until(
+			page,
+			"its blocks",
+			(f, id: string) => f.blockRows(id).length === 3,
+			decisions.pageId,
+		);
+		expect((await storedFolding(decisions.pageId)).collapsed).toEqual([]);
+		// Put back as the reader had it, for the tests after this one.
+		await writeViewState({ userId: alice, isAdmin: false }, decisions.pageId, {
+			collapsed: [decisions.a],
+			expanded: [],
+			layout: "right",
+		});
+		await page.browserContext().close();
+	} finally {
+		release();
+		viewState.hold = null;
+	}
+}, 60_000);
+
+test("a block behind four closed rows is located: every ancestor opened in one stored folding", async () => {
+	const page = await openTree({ target: { kind: "home" } }, { width: 1100, height: 700 });
+	await until(page, "the project row", hasRow, "Atlas");
+	await type(page, "quokkafish");
+	await until(page, "the match", (f) => f.searchRows().filter((r) => r.hit).length === 1);
+	viewState.puts = 0;
+	expect(await call(page, (f, id: string) => f.chooseHit(id), deep.hit)).toBe(true);
+	await until(page, "the match located", (f, id: string) => f.located()?.id === id, deep.hit);
+	expect((await call(page, (f) => f.located()))?.inView).toBe(true);
+	expect(await call(page, (f) => f.count("[data-testid=outline-locate-failed]"))).toBe(0);
+	// One stored folding brought it (the usual delayed write of the same may follow).
+	expect(viewState.puts).toBeLessThanOrEqual(2);
+	await page.browserContext().close();
+}, 60_000);
+
+test("a row whose blocks cannot be brought says so, with the way to the page", async () => {
+	viewState.failPut = true;
+	try {
+		const page = await openTree({ target: { kind: "home" } });
+		await toggle(page, "Atlas");
+		await toggle(page, "Sessions (2)");
+		await toggle(page, "Fix the refresh race");
+		await togglePage(page, bigPage);
+		await until(page, "the page's blocks", (f, id: string) => f.blockRows(id).length > 0, bigPage);
+		const stuck = `[data-tree-page="${bigPage}"] [data-tree-partial="stuck"]`;
+		expect(await call(page, (f, sel: string) => f.count(sel), stuck)).toBe(0);
+		const task9 = await page.evaluate(() => {
+			const row = [...document.querySelectorAll<HTMLElement>("[data-block-id]")].find((r) =>
+				r.textContent?.includes("Finished task 9"),
+			);
+			row?.querySelector<HTMLButtonElement>("[data-fold-toggle]")?.click();
+			return row?.dataset.blockId ?? "";
+		});
+		expect(task9).not.toBe("");
+		// The folding could not be stored, so the read still leaves the blocks out: the page
+		// says it shows only part, and links to the page focused.
+		await until(page, "the note", (f, sel: string) => f.count(sel) === 1, stuck);
+		expect(await call(page, (f, sel: string) => f.count(`${sel} a`), stuck)).toBe(1);
+		await page.browserContext().close();
+	} finally {
+		viewState.failPut = false;
+	}
+}, 60_000);
+
+test("what cannot be located is said, not waited for in silence", async () => {
+	const page = await openTree({ target: { kind: "space", spaceId: personalSpace } });
+	await until(page, "a page of my space", hasRow, "Note 01");
+	await call(
+		page,
+		(f, target: Parameters<typeof Fixture.requestLocate>[0]) => f.requestLocate(target),
+		{
+			spaceId: "nosuchspace",
+			pageId: "nosuchpage",
+			blockId: "nosuchpage",
+			pathIds: [],
+			pageTitle: "",
+		},
+	);
+	await page.evaluate(() =>
+		(window as unknown as FixtureWindow).fixture.open({ target: { kind: "home" } }),
+	);
+	await until(page, "the note", (f) => f.count("[data-testid=outline-locate-failed]") === 1);
+	expect(await call(page, (f) => f.click("[data-testid=outline-locate-failed] button"))).toBe(true);
+	await until(page, "dismissed", (f) => f.count("[data-testid=outline-locate-failed]") === 0);
+	await page.browserContext().close();
+}, 60_000);
+
 test("in Chinese, dark, at 360 px: the rows say the same, nothing wider than the page", async () => {
 	const page = await openTree(
 		{ target: { kind: "home" }, lang: "zh-CN", scheme: "dark" },
@@ -637,5 +855,45 @@ test("in Chinese, dark, at 360 px: the rows say the same, nothing wider than the
 	await until(page, "the matches", (f) => f.searchRows().filter((r) => r.hit).length === 2);
 	expect(await call(page, (f) => f.overflowsX())).toBe(false);
 	await shot(page, "4b-zh-dark-360-search");
+	await page.browserContext().close();
+}, 60_000);
+
+test("a session is located although its project is past the first page of the root", async () => {
+	// Thirty projects committed to after Atlas: the root's first page ends before it.
+	for (let i = 0; i < 30; i++) {
+		const id = generateId();
+		await db.insert(projects).values({
+			id,
+			name: `Filler ${String(i + 1).padStart(2, "0")}`,
+			ownerUserId: alice,
+			visibility: "private",
+			createdAt: NOW,
+			updatedAt: NOW,
+		});
+		const space = await ensureProjectSpace(id);
+		await write(space.id, alice, [{ op: "insert", parent: null, content: "Notes" }]);
+	}
+	const page = await openTree({ target: { kind: "space", spaceId: personalSpace } });
+	await until(page, "a page of my space", hasRow, "Note 01");
+	await call(
+		page,
+		(f, target: Parameters<typeof Fixture.requestLocate>[0]) => f.requestLocate(target),
+		{ spaceId: raceSpace, pageId: tasksPage, blockId: tasksPage, pathIds: [], pageTitle: "Tasks" },
+	);
+	await page.evaluate(() =>
+		(window as unknown as FixtureWindow).fixture.open({ target: { kind: "home" } }),
+	);
+	await until(page, "the fillers", hasRow, "Filler 30");
+	await until(
+		page,
+		"the page's row located",
+		(f, key: string) => f.located()?.id === key,
+		`page:${tasksPage}`,
+	);
+	const rows = await call(page, (f) => f.rows());
+	// Its project is shown (pinned first among the projects), once.
+	expect(rows.filter((r) => r.title === "Atlas")).toHaveLength(1);
+	expect(rows.filter((r) => r.kind === "space" && r.title.startsWith("Filler"))).toHaveLength(30);
+	expect(await call(page, (f) => f.count("[data-testid=outline-locate-failed]"))).toBe(0);
 	await page.browserContext().close();
 }, 60_000);

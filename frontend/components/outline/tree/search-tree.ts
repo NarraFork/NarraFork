@@ -81,9 +81,9 @@ export function buildSearchTree(
 		// Without ids (an older server) the hit hangs under its space, its path said in words.
 		const ids = hit.pathIds?.length === hit.path.length ? hit.pathIds : [];
 		for (let i = 0; i < ids.length; i++) {
-			at = child(at, ids[i] as string, hit.path[i] ?? "", i === 0);
+			at = child(at, ids[i] as string, hit.path[i] ?? "", ids[i] === hit.pageId);
 		}
-		const node = child(at, hit.blockId, hit.title, ids.length === 0 && hit.pageId === hit.blockId);
+		const node = child(at, hit.blockId, hit.title, hit.blockId === hit.pageId);
 		node.hit = hit;
 		if (hit.title) node.title = hit.title;
 	}

@@ -918,7 +918,10 @@ export interface OutlineTreeSpaceFacts {
 	doing: number;
 	/** The task in progress changed last (among the first `cap` the index gives), if any. */
 	doingId: string | null;
-	/** The task finished last (done or cancelled), if any. */
+	/** The oldest of those questions and the page it is on, if any: where the reader answers. */
+	waitingBlockId: string | null;
+	waitingPageId: string | null;
+	/** The task done last, if any (a cancelled task is not something finished). */
 	finishedId: string | null;
 	/** The live block with the alias `summary`, if any. */
 	summaryId: string | null;
@@ -933,7 +936,8 @@ export const OUTLINE_SUMMARY_ALIAS = "summary";
  * point picks, each on its own index:
  *   - the space's open questions (`idx_outline_questions_space_open`), those put to the person;
  *   - its tasks in progress (`idx_outline_blocks_active_tasks`, the first `cap` rows);
- *   - its task finished last (`idx_outline_blocks_finished_tasks`, read backwards);
+ *   - its task done last (`idx_outline_blocks_finished_tasks`, read backwards past the
+ *     cancelled ones);
  *   - its block aliased `summary` (`uq_outline_blocks_space_alias`).
  *
  * The caller passes only spaces the person may read (the rows it has just listed): nothing here
@@ -955,7 +959,11 @@ export async function readOutlineTreeSpaceFacts(
 	const doing = sql.raw(
 		`${live} AND (${status} = 'doing' OR (${status} = 'todo' AND ${lock} IS NOT NULL)) AND ${status} = 'doing'`,
 	);
-	const finished = sql.raw(`${status} IN ('done', 'cancelled') AND ${live}`);
+	const finished = sql.raw(`${status} IN ('done', 'cancelled') AND ${live} AND ${status} = 'done'`);
+	const firstQuestion = (column: string) => sql`(
+		select ${sql.raw(column)} from outline_questions q join outline_blocks b on b.id = q.block_id
+		where q.space_id = s.id and q.state = 'open' and q.to_user_id = ${userId} and ${liveBlock}
+		order by q.created_at, q.block_id limit 1)`;
 	const liveBlock = sql.raw(live);
 	for (const ids of chunked([...new Set(spaceIds)])) {
 		const rows = await all(sql`
@@ -966,6 +974,8 @@ export async function readOutlineTreeSpaceFacts(
 						and ${liveBlock}
 					limit ${cap}
 				) t) as waiting,
+				${firstQuestion("q.block_id")} as waiting_block_id,
+				${firstQuestion("b.page_id")} as waiting_page_id,
 				(select count(*) from (
 					select 1 as one from outline_blocks b where b.space_id = s.id and ${doing}
 					limit ${cap}
@@ -988,6 +998,8 @@ export async function readOutlineTreeSpaceFacts(
 			out.set(text(row, "id"), {
 				waiting: Number(row.waiting ?? 0),
 				doing: Number(row.doing ?? 0),
+				waitingBlockId: textOrNull(row, "waiting_block_id"),
+				waitingPageId: textOrNull(row, "waiting_page_id"),
 				doingId: textOrNull(row, "doing_id"),
 				finishedId: textOrNull(row, "finished_id"),
 				summaryId: textOrNull(row, "summary_id"),

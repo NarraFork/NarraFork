@@ -22,7 +22,7 @@
  * WHAT A ROW SAYS (readability F): whether the person may write the space, how many questions
  * there wait for THEM (open, put to them, and theirs to answer: none where they may not write),
  * how many tasks are in progress, and one line (the block aliased `summary`, else the task being
- * done, else the one finished last). All of it is of spaces the listing has just returned, so of
+ * done, else the one done last; a cancelled task is never it). All of it is of spaces the listing has just returned, so of
  * spaces the person may read; a space they cannot read has no row and adds to no count.
  *
  * COST: the root is one indexed page of project spaces (`OUTLINE_TREE_LIMITS.projects`), the
@@ -144,6 +144,10 @@ async function describeTreeSpaces(
 			canWrite,
 			// Only the person asked answers, and only while they may write the space.
 			waiting: canWrite ? (fact?.waiting ?? 0) : 0,
+			waitingAt:
+				canWrite && fact?.waitingBlockId && fact.waitingPageId
+					? { pageId: fact.waitingPageId, blockId: fact.waitingBlockId }
+					: null,
 			doing: fact?.doing ?? 0,
 			summary: pick && text ? { kind: pick.kind, text } : null,
 		});

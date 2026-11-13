@@ -125,22 +125,34 @@ function SearchRow({
 				style={{ paddingInlineStart: indent }}
 			>
 				<span className={classes.toggle}>
-					{/* Always drawn: a row without children has nothing to open, and says so. */}
-					<button
-						type="button"
-						tabIndex={-1}
-						className={`${classes.toggleButton} mantine-focus-auto`}
-						aria-expanded={parent ? open : undefined}
-						aria-label={`${action} · ${title}`}
-						title={action}
-						disabled={!parent}
-						data-tree-toggle=""
-						onClick={(event) => {
-							if (plainClick(event)) onToggle(rowKey);
-						}}
-					>
-						<Arrow size={14} />
-					</button>
+					{/* Always drawn. A row with nothing under it has nothing to open: its arrow is
+					    faint and says nothing to assistive technology. */}
+					{parent ? (
+						<button
+							type="button"
+							tabIndex={-1}
+							className={`${classes.toggleButton} mantine-focus-auto`}
+							aria-expanded={open}
+							aria-label={`${action} · ${title}`}
+							title={action}
+							data-tree-toggle=""
+							onClick={(event) => {
+								if (plainClick(event)) onToggle(rowKey);
+							}}
+						>
+							<Arrow size={14} />
+						</button>
+					) : (
+						<span
+							className={classes.toggleButton}
+							style={{ opacity: 0.35, cursor: "default" }}
+							aria-hidden="true"
+							data-tree-toggle=""
+							data-tree-leaf=""
+						>
+							<Arrow size={14} />
+						</span>
+					)}
 				</span>
 				<span className={classes.treeIcon} aria-hidden="true">
 					{icon}

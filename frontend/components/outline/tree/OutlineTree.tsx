@@ -122,14 +122,17 @@ import {
 	captureTreeAnchor,
 	readTreeAnchor,
 	restoreTreeAnchor,
+	scrollParentOf,
 	TREE_SCROLL_WAIT_MS,
 	writeTreeAnchor,
 } from "./tree-scroll";
 
 /** Reads one "everything inside" may follow (each brings the next level of what was left out). */
 const OPEN_INSIDE_READS = 4;
-/** Steps one locate takes inside a page (each may be one read) before settling for its page. */
-const LOCATE_STEPS = 8;
+/** How long a locate waits for its row before saying it could not be shown. */
+const LOCATE_WAIT_MS = 10_000;
+/** Reads one locate waits for inside a page before settling for the page's row. */
+const LOCATE_READS = 4;
 /** Tree levels indentation grows for; deeper rows line up with the last. */
 const MAX_TREE_INDENT = 4;
 /** Below this width the tree is narrow: smaller steps (a phone, a narrow dock panel). */
@@ -181,8 +184,13 @@ interface TreeContextValue {
 	narrow: boolean;
 	pins: TreePins;
 	locate: ActiveLocate | null;
-	/** The located block is on screen (or cannot be brought there): the request is done. */
-	finishLocate: (nonce: number) => void;
+	/**
+	 * The request is done: the block is on screen (`found`), or it could not be brought there
+	 * (the tree says so in a line).
+	 */
+	finishLocate: (nonce: number, found?: boolean) => void;
+	/** Locate a block from inside the tree (a row's "waiting for you"). */
+	locateTo: (target: TreeLocateTarget) => void;
 	/** The tree's element (rows are found in it by their key). */
 	rootRef: { readonly current: HTMLDivElement | null };
 	/** Nodes whose rows open as they load, one level down (Alt+Enter on a closed node). */
@@ -439,13 +447,14 @@ function notFound(error: unknown): boolean {
 function SpaceNode({ space, depth }: { space: OutlineTreeSpace; depth: number }) {
 	const { t } = useTranslation("outline");
 	const spaceName = useOutlineSpaceName();
-	const { narrow } = useTree();
+	const { narrow, locateTo } = useTree();
 	const key = `space:${space.id}`;
 	const [open, toggle] = useNodeOpen(key);
 	const Icon = SPACE_ICON[space.kind];
 	const waiting = space.waiting ?? 0;
 	const doing = space.doing ?? 0;
 	const waitingText = treeCountLabel(waiting, OUTLINE_TREE_LIMITS.countCap);
+	const asks = waiting > 0 ? (space.waitingAt ?? null) : null;
 	return (
 		<TreeRow
 			nodeKey={key}
@@ -478,6 +487,24 @@ function SpaceNode({ space, depth }: { space: OutlineTreeSpace; depth: number })
 					{/* What waits for the reader comes first. */}
 					{waiting > 0 && (
 						<Badge
+							// The first question waiting for the reader there: shown in the tree, its
+							// answer form with it. (An older server does not say where: no button.)
+							{...(asks
+								? {
+										component: "button" as const,
+										type: "button" as const,
+										style: { cursor: "pointer" },
+										onClick: () =>
+											locateTo({
+												spaceId: space.id,
+												pageId: asks.pageId,
+												blockId: asks.blockId,
+												pathIds: [],
+												pageTitle: "",
+												answer: true,
+											}),
+									}
+								: {})}
 							size="xs"
 							variant="light"
 							color="teal"
@@ -809,7 +836,11 @@ function OpenPage({
 	}, [queryClient]);
 	// The reader's folding of the page: their own, stored per page.
 	const [state] = useState(() => new OutlineViewState(pageId));
-	useOutlineViewStateSync(pageId, state);
+	// Until the stored folding is under what this page shows, nothing folds or writes on the
+	// reader's behalf: the server folded the read by the STORED state, and a state that never
+	// saw it would be written over it.
+	const sync = useOutlineViewStateSync(pageId, state);
+	const stored = sync === "applied";
 	const [version, bump] = useReducer((n: number) => n + 1, 0);
 	useEffect(
 		() =>
@@ -847,7 +878,7 @@ function OpenPage({
 	// them. The same rows left out twice means the server will not bring them (the view state's
 	// own limits): they keep their link to the page focused.
 	const missing = useMemo(() => {
-		if (!view || !foldTree) return "";
+		if (!view || !foldTree || !stored) return "";
 		return view.blocks
 			.filter((block) => {
 				if (!block.fold) return false;
@@ -856,8 +887,10 @@ function OpenPage({
 			})
 			.map((block) => block.id)
 			.join(",");
-	}, [view, foldTree]);
+	}, [view, foldTree, stored]);
 	const askedFor = useRef("");
+	// Between storing the folding and the read that follows it.
+	const [storing, setStoring] = useState(false);
 	const alive = useRef(true);
 	useEffect(
 		() => () => {
@@ -873,6 +906,7 @@ function OpenPage({
 		}
 		if (fetching || askedFor.current === missing) return;
 		askedFor.current = missing;
+		setStoring(true);
 		const ok = (ids: Iterable<string>) =>
 			new Set([...ids].filter((id) => OUTLINE_BLOCK_ID_RE.test(id)));
 		const folding = boundedFoldView(
@@ -888,6 +922,9 @@ function OpenPage({
 					queryKey: outlineKeys.blocks(spaceId),
 					predicate: (q) => q.queryKey[3] === pageId && q.queryKey[4] === null,
 				});
+			})
+			.finally(() => {
+				if (alive.current) setStoring(false);
 			});
 	}, [missing, fetching, state, pageId, spaceId, queryClient]);
 	// A read arrived: what was asked to open whole opens in what came with it.
@@ -908,11 +945,11 @@ function OpenPage({
 	useEffect(() => commands.register(pageId, askAll), [commands, pageId]);
 	const allDone = useRef(0);
 	useEffect(() => {
-		if (allAsked === allDone.current || !foldTree) return;
+		if (allAsked === allDone.current || !foldTree || sync === "pending") return;
 		allDone.current = allAsked;
 		const control = foldPageControl(foldTree, fold);
 		if (control) onFold(foldTree, { kind: "all", open: control === "expand" });
-	}, [allAsked, foldTree, fold, onFold]);
+	}, [allAsked, foldTree, fold, onFold, sync]);
 	// The count of unanswered questions on a closed row: they are opened in the tree, and the
 	// form that answers them (those under the block the first is under) comes up in the page,
 	// without leaving the tree.
@@ -959,18 +996,25 @@ function OpenPage({
 		};
 	}, [asking]);
 
-	// Locating a block of this page: open what it is under, as far as the read has it (a folded
-	// read brings the next level each time an ancestor opens), then scroll to its row.
+	// Locating a block of this page: everything it is under is opened at once (its ancestors by
+	// id, in the read or not), so one stored folding and one read bring it however many closed
+	// rows it was behind; then its row is scrolled to. A read that still does not hold it (the
+	// budget) settles for the page's row.
 	const locating = locate && locate.pageId === pageId && locate.blockId !== pageId ? locate : null;
-	const locateSteps = useRef({ nonce: 0, left: 0 });
+	const locateReads = useRef<{ nonce: number; left: number; seen: unknown }>({
+		nonce: 0,
+		left: 0,
+		seen: null,
+	});
 	useEffect(() => {
-		if (!locating || !foldTree || !view) return;
-		if (locateSteps.current.nonce !== locating.nonce) {
-			locateSteps.current = { nonce: locating.nonce, left: LOCATE_STEPS };
+		if (!locating || !foldTree || !view || sync === "pending") return;
+		const at = locateReads.current;
+		if (at.nonce !== locating.nonce) {
+			locateReads.current = { nonce: locating.nonce, left: LOCATE_READS, seen: null };
 		}
-		const done = (row: HTMLElement | null) => {
+		const done = (row: HTMLElement | null, found: boolean) => {
 			if (row) showLocated(row);
-			finishLocate(locating.nonce);
+			finishLocate(locating.nonce, found);
 		};
 		const pageRow = () =>
 			host.current
@@ -982,25 +1026,43 @@ function OpenPage({
 			for (const row of host.current?.querySelectorAll<HTMLElement>("[data-block-id]") ?? []) {
 				if (row.dataset.blockId === locating.blockId) found = row;
 			}
-			done(found ?? pageRow());
+			if (found && locating.answer) onOpenQuestions([locating.blockId], node.parent);
+			done(found ?? pageRow(), found !== null);
 			return;
 		}
-		if (locateSteps.current.left-- <= 0) return done(pageRow());
 		if (node) {
+			// In the read, behind closed rows: open them.
 			state.fold(foldTree, { kind: "reveal", id: locating.blockId });
 			return;
 		}
-		// Not in the read: open its ancestors that are.
+		if (fetching || storing || missing !== "") return;
+		// Not in this read. Each read is one try; the first opens every ancestor by id.
+		if (locateReads.current.seen === view) return;
+		locateReads.current.seen = view;
+		if (locateReads.current.left-- <= 0) return done(pageRow(), false);
 		let changed = false;
 		for (const id of locating.pathIds) {
-			const above = foldTree.nodes.get(id);
-			if (above && above.parent !== null && above.kids.length > 0 && !above.open) {
-				changed = state.fold(foldTree, { kind: "node", id, open: true }) || changed;
-			}
+			if (id === pageId || state.expanded.has(id)) continue;
+			state.expanded.add(id);
+			state.collapsed.delete(id);
+			changed = true;
 		}
-		// Nothing left to open and nothing being read: it is past what one read holds.
-		if (!changed && !fetching && missing === "") done(pageRow());
-	}, [locating, foldTree, view, state, fetching, missing, finishLocate]);
+		if (changed) state.noteCollapsed();
+		// Nothing left to open: it is past what one read holds.
+		else done(pageRow(), false);
+	}, [
+		locating,
+		foldTree,
+		view,
+		state,
+		fetching,
+		missing,
+		finishLocate,
+		sync,
+		pageId,
+		onOpenQuestions,
+		storing,
+	]);
 
 	const pad = indentOf(depth, step);
 	if (query.isLoading) {
@@ -1022,8 +1084,19 @@ function OpenPage({
 	const root = view.blocks.find((b) => b.id === view.rootId);
 	const title = root ? blockTitle(root.content) : "";
 	const body = root && root.content.trim() !== title.trim() ? root.content : null;
-	// What a closed row holds back is not "more than fits": opening the row reads it.
-	const partial = view.blocks.some((b) => b.hidden > 0 && !b.fold) || view.pageTruncated;
+	// What a closed row holds back is not "more than fits": opening the row reads it. A row that
+	// is open and still without its blocks (they were asked for and did not come, or the stored
+	// folding could not be laid under this page) is: the page focused shows them.
+	const stuck =
+		!fetching &&
+		!storing &&
+		view.blocks.some((b) => {
+			if (!b.fold || b.hidden <= 0) return false;
+			const node = foldTree?.nodes.get(b.id);
+			return !!node && node.open && node.visible;
+		}) &&
+		(sync === "unseen" || (missing !== "" && askedFor.current === missing));
+	const partial = view.blocks.some((b) => b.hidden > 0 && !b.fold) || view.pageTruncated || stuck;
 	return (
 		<div
 			ref={host}
@@ -1055,7 +1128,7 @@ function OpenPage({
 				}}
 			/>
 			{partial && (
-				<Text size="xs" c="dimmed" mt={2} pl={24} data-tree-partial="">
+				<Text size="xs" c="dimmed" mt={2} pl={24} data-tree-partial={stuck ? "stuck" : ""}>
 					{t("tree.partial", { count: view.blocks.length })}{" "}
 					<OutlineLink to={outlineBlockTarget(spaceId, pageId)} className={classes.more}>
 						{t("tree.openPage")}
@@ -1284,7 +1357,8 @@ const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home
  * Keep the tree where the reader left it (`tree-scroll.ts`): the anchor is taken as the tree
  * goes (it unmounts, or a search is drawn in its place), and put back when the tree mounts or is
  * shown again, once its row has loaded; the reader scrolling (or locating a block) first wins.
- * No listener on the window or the document: the tree may be one of several on screen.
+ * Listens only on the tree and on what scrolls it (never the window or the document: the tree
+ * may be one of several on screen).
  */
 function useTreeScroll(
 	rootRef: { readonly current: HTMLDivElement | null },
@@ -1313,8 +1387,9 @@ function useTreeScroll(
 		const tree = rootRef.current;
 		const anchor = hidden ? null : readTreeAnchor(name);
 		if (!tree || !anchor || skipped.current) return;
-		// What the reader scrolls with reaches the tree's own document element.
-		const surface = tree.ownerDocument.documentElement;
+		// The reader scrolling themselves: a wheel or a touch over what scrolls the tree, a
+		// scrolling key in the tree.
+		const scroller = scrollParentOf(tree);
 		const stop = whenThere(
 			tree,
 			() => (restoreTreeAnchor(tree, anchor) ? tree : null),
@@ -1328,13 +1403,13 @@ function useTreeScroll(
 		};
 		const off = () => {
 			stop();
-			surface.removeEventListener("wheel", cancel);
-			surface.removeEventListener("touchmove", cancel);
-			surface.removeEventListener("keydown", cancel);
+			scroller.removeEventListener("wheel", cancel);
+			scroller.removeEventListener("touchmove", cancel);
+			tree.removeEventListener("keydown", cancel);
 		};
-		surface.addEventListener("wheel", cancel, { passive: true });
-		surface.addEventListener("touchmove", cancel, { passive: true });
-		surface.addEventListener("keydown", cancel);
+		scroller.addEventListener("wheel", cancel, { passive: true });
+		scroller.addEventListener("touchmove", cancel, { passive: true });
+		tree.addEventListener("keydown", cancel);
 		return off;
 	}, [rootRef, name, hidden]);
 }
@@ -1362,17 +1437,24 @@ export function OutlineTree({
 		nonce: 0,
 		target: null,
 	});
-	const finishLocate = useCallback((nonce: number) => {
+	// The last request could not be shown: said in a line until the next one, or dismissed.
+	const [failed, setFailed] = useState(false);
+	const finishLocate = useCallback((nonce: number, found = true) => {
 		setLocate((now) => (now?.nonce === nonce ? null : now));
-		if (latest.current.nonce === nonce) setSettled(latest.current.target);
+		if (latest.current.nonce !== nonce) return;
+		setSettled(latest.current.target);
+		if (!found) setFailed(true);
 	}, []);
 	const queryClient = useQueryClient();
 	const rootSpace = root.kind === "space" ? root.space : null;
 	const rootSpaceId = rootSpace?.id ?? null;
 	const rootProjectId = rootSpace?.projectId ?? null;
-	// A request left by a focused page, taken once as the tree mounts; else what the host asks.
-	const [waiting] = useState(() => takeTreeLocate(host));
-	const target = asked ?? waiting;
+	// A request left by a focused page, taken once as the tree mounts; then whatever is asked
+	// last, by the host (a search hit) or from inside the tree (a row's "waiting for you").
+	const [target, setTarget] = useState<TreeLocateTarget | null>(() => takeTreeLocate(host));
+	useEffect(() => {
+		if (asked) setTarget(asked);
+	}, [asked]);
 	// Where the space hangs (one read of it, one of its project's space for a session), the
 	// nodes to open, and its rows pinned where their lists may not have loaded them.
 	useEffect(() => {
@@ -1380,6 +1462,13 @@ export function OutlineTree({
 		let cancelled = false;
 		const mine = latest.current.nonce + 1;
 		latest.current = { nonce: mine, target };
+		setFailed(false);
+		const giveUp = () => {
+			if (cancelled) return;
+			setPins(NO_PINS);
+			setSettled(target);
+			setFailed(true);
+		};
 		void (async () => {
 			try {
 				const space = (
@@ -1390,6 +1479,7 @@ export function OutlineTree({
 					})
 				).space;
 				let parent: { spaceId: string; projectId: string } | null = null;
+				let parentSpace: OutlineSpaceSummary | null = null;
 				if (space.kind === "session" && space.parent) {
 					const parentId = space.parent.spaceId;
 					const project = (
@@ -1399,7 +1489,10 @@ export function OutlineTree({
 							staleTime: 60_000,
 						})
 					).space;
-					if (project.projectId) parent = { spaceId: project.id, projectId: project.projectId };
+					if (project.projectId) {
+						parent = { spaceId: project.id, projectId: project.projectId };
+						parentSpace = project;
+					}
 				}
 				if (cancelled) return;
 				const plan = locateKeys(
@@ -1408,11 +1501,16 @@ export function OutlineTree({
 					target.pageId,
 					rootSpaceId ? { spaceId: rootSpaceId, projectId: rootProjectId } : null,
 				);
-				if (!plan) return setSettled(target);
+				if (!plan) return giveUp();
+				// One set of pins per request: the space's own row, and (a session) its project's
+				// at the root, wherever their lists have not loaded them.
+				const spaces = new Map<string, OutlineTreeSpace>();
+				if (plan.pinIn) spaces.set(plan.pinIn, { ...space, lastCommitAt: null });
+				if (plan.pinParentAtRoot && parentSpace) {
+					spaces.set("root", { ...parentSpace, lastCommitAt: null });
+				}
 				setPins({
-					spaces: plan.pinIn
-						? new Map([[plan.pinIn, { ...space, lastCommitAt: null }]])
-						: new Map(),
+					spaces,
 					pages: new Map([
 						[
 							target.spaceId,
@@ -1430,15 +1528,15 @@ export function OutlineTree({
 				setLocate({ ...target, nonce: mine });
 			} catch {
 				// The space cannot be read (any more): there is nothing to locate.
-				if (!cancelled) setSettled(target);
+				giveUp();
 			}
 		})();
 		return () => {
 			cancelled = true;
 		};
 	}, [target, queryClient, open, rootSpaceId, rootProjectId]);
-	// The page itself is located by its row; a block by its page's read (`OpenPage`), which may
-	// never mount (the page is gone): the request then ends by itself.
+	// The page itself is located by its row; a block by its page's read (`OpenPage`). Either may
+	// never come (the page is gone, a list did not load): the request then ends, and says so.
 	useEffect(() => {
 		const tree = rootRef.current;
 		if (!locate || !tree) return;
@@ -1449,9 +1547,9 @@ export function OutlineTree({
 			() => (ownRow ? rowOf(tree, key) : null),
 			(row) => {
 				if (row) showLocated(row);
-				finishLocate(locate.nonce);
+				finishLocate(locate.nonce, row !== null);
 			},
-			ownRow ? 8000 : 20_000,
+			LOCATE_WAIT_MS,
 		);
 	}, [locate, finishLocate]);
 	useTreeScroll(
@@ -1461,7 +1559,18 @@ export function OutlineTree({
 		locate !== null || (target !== null && target !== settled),
 	);
 	const value = useMemo(
-		() => ({ open, step, narrow, pins, locate, finishLocate, rootRef, wishes, commands }),
+		() => ({
+			open,
+			step,
+			narrow,
+			pins,
+			locate,
+			finishLocate,
+			locateTo: setTarget,
+			rootRef,
+			wishes,
+			commands,
+		}),
 		[open, step, narrow, pins, locate, finishLocate, wishes, commands],
 	);
 	const anyOpen = useSyncExternalStore(open.subscribe, () => open.snapshot().length > 0);
@@ -1486,6 +1595,7 @@ export function OutlineTree({
 							color="gray"
 							onClick={() => {
 								wishes.clear();
+								setPins(NO_PINS);
 								open.clear();
 							}}
 							data-testid="outline-tree-collapse-all"
@@ -1494,6 +1604,14 @@ export function OutlineTree({
 						</Button>
 					)}
 				</Group>
+				{failed && (
+					<Text size="xs" c="dimmed" mb={4} role="status" data-testid="outline-locate-failed">
+						{t("tree.locateFailed")}{" "}
+						<Anchor component="button" type="button" size="xs" onClick={() => setFailed(false)}>
+							{t("tree.dismiss")}
+						</Anchor>
+					</Text>
+				)}
 				<div role="tree" aria-label={t("title")} onKeyDown={onTreeKeyDown}>
 					{root.kind === "all" ? (
 						<RootChildren />

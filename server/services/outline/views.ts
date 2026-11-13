@@ -436,8 +436,10 @@ function foldedOrder(input: {
 		{
 			children: (id) => childrenOf(id).map((child) => child.id),
 			task: (id) => node(id)?.task?.status ?? null,
-			// By id only (content is not read yet): a row the client alone takes for a report is
-			// read whole and folded there.
+			// By id only (content is not read yet). A container that only its line says is one
+			// (a copy, a test page) folds here by what else it is: closed over its first block
+			// when it is a detail, open when it is a fact. The client, which has the line, then
+			// folds what was read as a report.
 			report: (id) => isOutlineReportBlockId(id),
 			marks: (id) => {
 				const at = node(id);

@@ -122,10 +122,13 @@ describe("locating in the tree", () => {
 		expect(locateKeys(session, { spaceId: "PS", projectId: "P" }, "pg", null)).toEqual({
 			keys: ["space:PS", "group:sessions:P", "space:S", "page:pg"],
 			pinIn: "group:sessions:P",
+			// The project's own row too: the root may not have loaded it.
+			pinParentAtRoot: true,
 		});
 		expect(locateKeys(session, null, "pg", null)).toEqual({
 			keys: ["group:loose", "space:S", "page:pg"],
 			pinIn: "group:loose",
+			pinParentAtRoot: false,
 		});
 		const project = {
 			id: "PS",
@@ -137,6 +140,7 @@ describe("locating in the tree", () => {
 		expect(locateKeys(project, null, "pg", null)).toEqual({
 			keys: ["space:PS", "page:pg"],
 			pinIn: "root",
+			pinParentAtRoot: false,
 		});
 		const mine = {
 			id: "M",
@@ -161,7 +165,11 @@ describe("locating in the tree", () => {
 			orphaned: false,
 		} as const;
 		const root = { spaceId: "PS", projectId: "P" };
-		expect(locateKeys(project, null, "pg", root)).toEqual({ keys: ["page:pg"], pinIn: null });
+		expect(locateKeys(project, null, "pg", root)).toEqual({
+			keys: ["page:pg"],
+			pinIn: null,
+			pinParentAtRoot: false,
+		});
 		const session = {
 			id: "S",
 			kind: "session",

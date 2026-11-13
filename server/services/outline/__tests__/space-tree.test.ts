@@ -20,7 +20,11 @@ import { AppError } from "../../../lib/errors";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { outlineRoutes } from "../../../routes/outline";
-import { readOutlineTreeSpaceFacts, readOutlineTreeSpacePage } from "../access-reads";
+import {
+	readOutlineTreeSpaceFacts,
+	readOutlineTreeSpacePage,
+	setOutlineAccessExecutor,
+} from "../access-reads";
 import { ensurePersonalSpace, ensureProjectSpace, ensureSessionSpace } from "../spaces";
 import { writeOutline } from "../write";
 
@@ -441,7 +445,7 @@ describe("what a row says (readability F)", () => {
 		const p = await project(owner);
 		await grant("project", p.id, reader);
 		const s = await session(owner, { projectId: p.id, visibility: "project" });
-		await work(s.space, owner, [
+		const made = await work(s.space, owner, [
 			{ task: "doing", title: "Fix the refresh race" },
 			{ task: "doing", title: "Add the regression test" },
 			{ task: "todo", title: "Later" },
@@ -455,6 +459,8 @@ describe("what a row says (readability F)", () => {
 		const mine = forOwner.spaces[0];
 		expect(mine?.canWrite).toBe(true);
 		expect(mine?.waiting).toBe(2);
+		// Where the count takes them: the oldest question put to them, and its page.
+		expect(mine?.waitingAt).toEqual({ pageId: made[0] as string, blockId: made[5] as string });
 		expect(mine?.doing).toBe(2);
 		expect(mine?.summary?.kind).toBe("doing");
 		expect(["Fix the refresh race", "Add the regression test"]).toContain(
@@ -470,10 +476,11 @@ describe("what a row says (readability F)", () => {
 		const theirs = forReader.spaces[0];
 		expect(theirs?.canWrite).toBe(false);
 		expect(theirs?.waiting).toBe(0);
+		expect(theirs?.waitingAt).toBeNull();
 		expect(theirs?.doing).toBe(2);
 	});
 
-	test("the line: a block aliased summary first, else the task being done, else the one finished last", async () => {
+	test("the line: a block aliased summary first, else the task being done, else the one done last; never a cancelled one", async () => {
 		const me = await user();
 		const a = await session(me);
 		const b = await session(me);
@@ -484,8 +491,11 @@ describe("what a row says (readability F)", () => {
 			{ note: "Outline phase two: tasks and teams", alias: "summary" },
 		]);
 		// (Two commits: within one, which task finished last is not said.)
-		await work(b.space, me, [{ task: "done", title: "Finished first" }]);
-		await work(b.space, me, [{ task: "cancelled", title: `Finished last ${"x".repeat(200)}` }]);
+		await work(b.space, me, [{ task: "done", title: "Done first" }]);
+		await work(b.space, me, [{ task: "done", title: `Done last ${"x".repeat(200)}` }]);
+		await work(b.space, me, [{ task: "cancelled", title: "Cancelled after both" }]);
+		const onlyCancelled = await session(me);
+		await work(onlyCancelled.space, me, [{ task: "cancelled", title: "Dropped" }]);
 		await work(c.space, me, [{ task: "todo", title: "Nothing started" }]);
 		const loose = await get<OutlineTreeSpacesResponse>(me, "/tree/loose");
 		const by = new Map(loose.spaces.map((space) => [space.id, space]));
@@ -494,7 +504,8 @@ describe("what a row says (readability F)", () => {
 			text: "Outline phase two: tasks and teams",
 		});
 		expect(by.get(b.space)?.summary?.kind).toBe("finished");
-		expect(by.get(b.space)?.summary?.text.startsWith("Finished last")).toBe(true);
+		expect(by.get(b.space)?.summary?.text.startsWith("Done last")).toBe(true);
+		expect(by.get(onlyCancelled.space)?.summary).toBeNull();
 		expect(Array.from(by.get(b.space)?.summary?.text ?? "").length).toBe(80);
 		expect(by.get(c.space)?.summary).toBeNull();
 		expect(by.get(c.space)?.doing).toBe(0);
@@ -553,29 +564,32 @@ describe("what a row says (readability F)", () => {
 		expect(JSON.stringify(root)).not.toContain("Secret work");
 	});
 
-	test("each subquery of the row facts is served by an index, never a scan of blocks", async () => {
+	test("each subquery of the statement the row facts emit is served by an index, never a scan", async () => {
 		const me = await user();
 		const a = await session(me);
-		const plan = db.all<{ detail: string }>(sql`explain query plan
-			select s.id,
-				(select count(*) from (
-					select 1 as one from outline_questions q join outline_blocks b on b.id = q.block_id
-					where q.space_id = s.id and q.state = 'open' and q.to_user_id = ${me} and b."deleted" = 0
-					limit 100) t) as waiting,
-				(select count(*) from (
-					select 1 as one from outline_blocks b where b.space_id = s.id
-						and b."deleted" = 0 AND (json_extract(b."task_json", '$.status') = 'doing' OR (json_extract(b."task_json", '$.status') = 'todo' AND json_extract(b."task_json", '$.lock') IS NOT NULL)) AND json_extract(b."task_json", '$.status') = 'doing'
-					limit 100) t) as doing,
-				(select b.id from outline_blocks b where b.space_id = s.id
-					and json_extract(b."task_json", '$.status') IN ('done', 'cancelled') AND b."deleted" = 0
-					order by b.version_seq desc, b.id desc limit 1) as finished_id,
-				(select b.id from outline_blocks b where b.space_id = s.id and b.alias = 'summary'
-					and b."deleted" = 0 limit 1) as summary_id
-			from outline_spaces s where s.id in (${a.space})`);
-		const details = plan.map((row) => row.detail).join("\n");
+		const b = await session(me);
+		// The plan of the statement itself, as the executor receives it.
+		const plans: string[] = [];
+		setOutlineAccessExecutor({
+			dialect: "sqlite",
+			async all(query) {
+				const plan = db.all<{ detail: string }>(sql`explain query plan ${query}`);
+				plans.push(plan.map((row) => row.detail).join("\n"));
+				return db.all(query);
+			},
+		});
+		try {
+			await readOutlineTreeSpaceFacts(me, [a.space, b.space], 100);
+		} finally {
+			setOutlineAccessExecutor(undefined);
+		}
+		expect(plans).toHaveLength(1);
+		const details = plans[0] as string;
 		expect(details).not.toMatch(/SCAN (b|q|outline_blocks|outline_questions)\b/);
-		expect(details).toContain("idx_outline_questions_space_open");
-		expect(details).toContain("idx_outline_blocks_active_tasks");
+		// The questions (count, first block, its page), the tasks in progress (count and pick),
+		// the task done last, the summary block.
+		expect(details.match(/idx_outline_questions_space_open/g)?.length).toBe(3);
+		expect(details.match(/idx_outline_blocks_active_tasks/g)?.length).toBe(2);
 		expect(details).toContain("idx_outline_blocks_finished_tasks");
 		expect(details).toContain("uq_outline_blocks_space_alias");
 	});

@@ -106,8 +106,8 @@ export const OUTLINE_TREE_LIMITS = {
 } as const;
 
 /**
- * What a space row says in one line: the task being done there (`doing`), else the task finished
- * last (`finished`); a block the space's writers gave the alias `summary` comes before both
+ * What a space row says in one line: the task being done there (`doing`), else the task done
+ * last (`finished`; never a cancelled one); a block the space's writers gave the alias `summary` comes before both
  * (`note`). The first line of that block, cut to {@link OUTLINE_TREE_LIMITS.summaryChars}.
  */
 export interface OutlineTreeSpaceSummaryLine {
@@ -135,6 +135,11 @@ export interface OutlineTreeSpace extends OutlineSpaceSummary {
 	 * write (nobody answers there).
 	 */
 	waiting?: number;
+	/**
+	 * The oldest of those questions and the page it is on: where the count takes the reader.
+	 * Null when nothing waits; absent from an older server.
+	 */
+	waitingAt?: { pageId: string; blockId: string } | null;
 	/** Tasks in progress in the space, counted up to {@link OUTLINE_TREE_LIMITS.countCap}. */
 	doing?: number;
 	/** The row's one line; null or absent: nothing to say. */
