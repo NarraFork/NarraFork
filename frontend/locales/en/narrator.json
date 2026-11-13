@@ -2360,6 +2360,63 @@
 		"specImportMovedTitle": "This session's Dynamic Spec was moved into the outline.",
 		"specImportMovedBody": "These old files are read-only and no longer updated; its tasks, notes and behavior boundary are in the outline now.",
 		"specImportMovedOpen": "Open the task page",
+		"loss": {
+			"notice": "A save from the old Spec editor may have lost content in this session: {{n}} to decide.",
+			"noticeDecided": "Content a save from the old Spec editor may have lost in this session: all decided ({{n}}).",
+			"noticeShow": "Show",
+			"noticeHide": "Hide",
+			"explain": "Until it was fixed (2026-10-26), saving from the Spec panel's editor dropped tables and rewrote images, HTML, task items, footnotes and front matter. These are the places a scan found: content the version before a save held that the save, and the file as it is now, do not. Content you removed on purpose is listed too: dismiss it. Nothing is changed automatically.",
+			"status": {
+				"open": "To decide",
+				"attached": "Attached",
+				"dismissed": "Dismissed"
+			},
+			"kind": {
+				"table_one": "{{count}} table",
+				"table_other": "{{count}} tables",
+				"html_one": "{{count}} piece of HTML",
+				"html_other": "{{count}} pieces of HTML",
+				"image_one": "{{count}} image",
+				"image_other": "{{count}} images",
+				"taskItem_one": "{{count}} task item",
+				"taskItem_other": "{{count}} task items",
+				"footnote_one": "{{count}} footnote",
+				"footnote_other": "{{count}} footnotes",
+				"frontMatter_one": "front matter",
+				"frontMatter_other": "front matter"
+			},
+			"kindSeparator": ", ",
+			"savedAt": "saved {{date}}",
+			"lost": "lost: {{kinds}}",
+			"truncated": "too long to keep whole: only the beginning was kept",
+			"notImported": "This session still keeps Dynamic Spec. Once it is imported into the outline the content can be attached to the file's page; it can be read and copied here meanwhile.",
+			"view": "Show the lost content",
+			"hide": "Hide the content",
+			"attach": "Attach to the imported page",
+			"attachTitle": "Attach this content to the imported page?",
+			"attachConfirm": "One block is added at the top of the outline page {{path}} was imported to, with the lost content under it as it stood before the save. Nothing else on the page changes. Move it back into the text, or delete the block, as you see fit.",
+			"dismiss": "Dismiss",
+			"reopen": "Reopen",
+			"openBlock": "Open the attached block",
+			"done": {
+				"attach": "Attached to the imported page.",
+				"dismiss": "Dismissed.",
+				"reopen": "Reopened."
+			},
+			"empty": "Nothing here.",
+			"more": "Load more",
+			"untitled": "Untitled session",
+			"admin": {
+				"title": "Content the old Spec editor may have lost",
+				"description": "A background scan looks through the sessions' Dynamic Spec history (read-only) and lists what it finds here and in each session's Spec panel. Each finding is decided by a person: attach it to the imported page, or dismiss it.",
+				"scanNow": "Scan now",
+				"scanStarted": "The scan was started. It runs in the background.",
+				"scanRunning": "A scan is running.",
+				"scanLast": "Last scan: {{date}}. Sessions looked at: {{scanned}}; new findings: {{found}}.",
+				"scanLeft": "Left for the next scan: {{left}}.",
+				"scanNever": "No scan has finished since the server started. One runs by itself shortly after start and then every hour."
+			}
+		},
 		"specImportBusy": "The session was busy, so the import stopped for now and keeps what it wrote. Import again when the session is idle.",
 		"specImportError": "Reason: {{error}}",
 		"specImportReason": {

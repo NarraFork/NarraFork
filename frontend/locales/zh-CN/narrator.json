@@ -2357,6 +2357,63 @@
 		"specImportMovedTitle": "这个会话的 Dynamic Spec 已搬进大纲。",
 		"specImportMovedBody": "下面的旧文件只读、不再更新；任务、笔记和行为边界现在都在大纲里。",
 		"specImportMovedOpen": "打开任务页",
+		"loss": {
+			"notice": "有 {{n}} 处内容可能在旧 Spec 编辑器保存时丢了。",
+			"noticeDecided": "旧 Spec 编辑器保存时可能丢失的内容：{{n}} 处，都已处理。",
+			"noticeShow": "查看",
+			"noticeHide": "收起",
+			"explain": "修复之前（2026-10-26），在 Spec 面板的编辑器里保存会丢掉表格，并改写图片、HTML、任务项、脚注和 front matter。下面是排查找到的地方：某次保存的上一版里有、那次保存之后没有、文件现在的版本里也没有的内容。你有意删掉的内容也会列出来，忽略即可。系统不会自动改动任何内容。",
+			"status": {
+				"open": "待处理",
+				"attached": "已附到页上",
+				"dismissed": "已忽略"
+			},
+			"kind": {
+				"table_one": "{{count}} 张表格",
+				"table_other": "{{count}} 张表格",
+				"html_one": "{{count}} 处 HTML",
+				"html_other": "{{count}} 处 HTML",
+				"image_one": "{{count}} 张图片",
+				"image_other": "{{count}} 张图片",
+				"taskItem_one": "{{count}} 个任务项",
+				"taskItem_other": "{{count}} 个任务项",
+				"footnote_one": "{{count}} 处脚注",
+				"footnote_other": "{{count}} 处脚注",
+				"frontMatter_one": "front matter",
+				"frontMatter_other": "front matter"
+			},
+			"kindSeparator": "、",
+			"savedAt": "{{date}} 保存",
+			"lost": "丢失：{{kinds}}",
+			"truncated": "内容太长，只保留了开头一部分",
+			"notImported": "这个会话还在用 Dynamic Spec。导入大纲以后才能把内容附到文件的导入页上；这期间可以在这里查看、复制。",
+			"view": "查看丢失的内容",
+			"hide": "收起内容",
+			"attach": "附到导入页",
+			"attachTitle": "把这处内容附到导入页？",
+			"attachConfirm": "会在 {{path}} 导入成的大纲页最前面加一个块，下面是这处内容在那次保存之前的原样。页上其他内容不变。要挪回正文还是删掉这一块，由你决定。",
+			"dismiss": "忽略",
+			"reopen": "重新打开",
+			"openBlock": "打开附上去的块",
+			"done": {
+				"attach": "已附到导入页。",
+				"dismiss": "已忽略。",
+				"reopen": "已重新打开。"
+			},
+			"empty": "没有记录。",
+			"more": "加载更多",
+			"untitled": "未命名会话",
+			"admin": {
+				"title": "旧 Spec 编辑器可能吞掉的内容",
+				"description": "后台排查会只读地翻看各会话的 Dynamic Spec 历史，把找到的地方列在这里，也列在各会话的 Spec 面板里。每一处都由人决定：附到导入页，或者忽略。",
+				"scanNow": "立即排查",
+				"scanStarted": "已开始排查，在后台进行。",
+				"scanRunning": "正在排查。",
+				"scanLast": "上一轮排查：{{date}}，查了 {{scanned}} 个会话，新发现 {{found}} 处。",
+				"scanLeft": "还有 {{left}} 个会话留到下一轮。",
+				"scanNever": "服务启动以来还没有排查完一轮。启动后不久会自动排查一次，之后每小时一次。"
+			}
+		},
 		"specImportBusy": "会话正忙，导入先停下了，已经写入的内容保留。会话空闲时再导入。",
 		"specImportError": "原因：{{error}}",
 		"specImportReason": {
