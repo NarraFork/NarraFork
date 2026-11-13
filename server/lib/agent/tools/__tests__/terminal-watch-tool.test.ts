@@ -474,12 +474,14 @@ describe("Terminal tool watches", () => {
 		}
 	});
 
-	test("horizontal reflow expires the physical-row frontier instead of replaying an old marker", async () => {
+	test("horizontal reflow preserves the last observation without replaying an old marker", async () => {
 		emit(`${"x".repeat(70)} READY old`);
 		await run({ action: "read" });
 		await buffer.resize(160, 24);
 		const result = await run({ action: "watch", pattern: "READY" });
-		expect(result.output).toContain("Matching scope: new output from now");
+		expect(result.output).toContain(
+			"Matching scope: since the last successful read/write snapshot",
+		);
 		await Bun.sleep(300);
 		expect((await watchRows())[0]?.status).toBe("running");
 		emit("\r\nREADY after reflow\r\n");
@@ -493,7 +495,9 @@ describe("Terminal tool watches", () => {
 		await buffer.resize(160, 24);
 		await buffer.resize(80, 24);
 		const result = await run({ action: "watch", pattern: "READY" });
-		expect(result.output).toContain("Matching scope: new output from now");
+		expect(result.output).toContain(
+			"Matching scope: since the last successful read/write snapshot",
+		);
 		await Bun.sleep(300);
 		expect((await watchRows())[0]?.status).toBe("running");
 		emit("\r\nREADY after resize round trip\r\n");
@@ -503,32 +507,33 @@ describe("Terminal tool watches", () => {
 	test.each([
 		["current paragraph", `${"x".repeat(70)} READY old`],
 		["observed tail paragraph", `first\r\n${"x".repeat(70)} READY old\x1b[1A`],
-	])("an active watch fails safely when narrowing its %s", async (_label, oldText) => {
+	])("an active watch survives narrowing its %s without matching history", async (_label, oldText) => {
 		emit(oldText);
 		await run({ action: "read" });
 		await run({ action: "watch", pattern: "READY" });
 		await buffer.resize(40, 24);
 		notifyTerminalOutput(TERMINAL);
-		const done = await waitForWatchStatus();
-		expect(done?.status).toBe("failed");
-		expect(done?.output).toContain("layout changed");
-		expect(done?.output).toContain("do not resend input");
-		expect(activeWatchIds(TERMINAL)).toEqual([]);
+		await Bun.sleep(600);
+		expect((await watchRows())[0]?.status).toBe("running");
+		expect(activeWatchIds(TERMINAL)).toHaveLength(1);
+		emit("\r\nREADY after narrowing\r\n");
+		expect((await waitForWatchStatus())?.status).toBe("completed");
 	});
 
-	test("an active watch cannot survive a horizontal layout ABA", async () => {
+	test("an active watch survives a horizontal layout ABA without matching history", async () => {
 		emit(`first\r\n${"x".repeat(70)} READY old\x1b[1A`);
 		await run({ action: "read" });
 		await run({ action: "watch", pattern: "READY" });
 		await buffer.resize(40, 24);
 		await buffer.resize(80, 24);
-		await endWatchesForBuffer(TERMINAL, buffer, "active layout ABA regression ended");
-		const done = await waitForWatchStatus();
-		expect(done?.status).toBe("failed");
-		expect(done?.output).toContain("layout changed");
+		notifyTerminalOutput(TERMINAL);
+		await Bun.sleep(600);
+		expect((await watchRows())[0]?.status).toBe("running");
+		emit("\r\nREADY after layout ABA\r\n");
+		expect((await waitForWatchStatus())?.status).toBe("completed");
 	});
 
-	test("a resize during asynchronous watch registration cannot adopt a stale frontier", async () => {
+	test("a resize during asynchronous watch registration preserves the historical frontier", async () => {
 		emit(`first\r\n${"x".repeat(70)} READY old\x1b[1A`);
 		await run({ action: "read" });
 		const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
@@ -539,12 +544,139 @@ describe("Terminal tool watches", () => {
 			},
 		);
 		try {
-			await run({ action: "watch", pattern: "READY" });
-			const done = await waitForWatchStatus();
-			expect(done?.status).toBe("failed");
-			expect(done?.output).toContain("layout changed");
+			expect((await run({ action: "watch", pattern: "READY" })).isError).toBeFalsy();
+			await Bun.sleep(600);
+			expect((await watchRows())[0]?.status).toBe("running");
+			emit("\r\nREADY after registration\r\n");
+			expect((await waitForWatchStatus())?.status).toBe("completed");
 		} finally {
 			registration.mockRestore();
+		}
+	});
+
+	test.each([
+		160, 40,
+	])("last_observation retains unread READY across resize to %s columns", async (cols) => {
+		emit("\r\x1b[2Kworking");
+		await run({ action: "read" });
+		emit(`\r\x1b[2K${"x".repeat(60)} READY unread`);
+		await buffer.resize(cols, 24);
+		if (cols === 40) expect(await buffer.getContents()).not.toContain("READY");
+		const result = await run({ action: "watch", pattern: "READY" });
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("since the last successful read/write snapshot");
+		const done = await waitForWatchStatus();
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("READY unread");
+	});
+
+	test("output and resize during asynchronous watch registration still complete the watch", async () => {
+		await run({ action: "read" });
+		const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
+		const registration = spyOn(backgroundTaskService, "createBashTask").mockImplementationOnce(
+			async (input) => {
+				emit(`\r\x1b[2K${"x".repeat(60)} READY during registration`);
+				await buffer.resize(40, 24);
+				return create(input);
+			},
+		);
+		try {
+			expect((await run({ action: "watch", pattern: "READY" })).isError).toBeFalsy();
+			expect((await waitForWatchStatus())?.status).toBe("completed");
+		} finally {
+			registration.mockRestore();
+		}
+	});
+
+	test("an active watch matches unchecked output saved before narrowing clips it", async () => {
+		await run({ action: "watch", pattern: "READY" });
+		// Do not notify: resize must retain output before any scheduled watch check sees it.
+		buffer.append(`\r\x1b[2K${"x".repeat(60)} READY unchecked`);
+		await buffer.resize(40, 24);
+		expect(await buffer.getContents()).not.toContain("READY");
+		notifyTerminalOutput(TERMINAL);
+		const done = await waitForWatchStatus();
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("READY unchecked");
+	});
+
+	test("a partial new literal survives a resize between RE and ADY", async () => {
+		emit("\r\x1b[2K");
+		await run({ action: "watch", pattern: "READY" });
+		emit("RE");
+		await Bun.sleep(600);
+		expect((await watchRows())[0]?.status).toBe("running");
+		await buffer.resize(40, 24);
+		emit("ADY\r\n");
+		expect((await waitForWatchStatus())?.status).toBe("completed");
+	});
+
+	test("start_at now ignores READY in historical layout frames", async () => {
+		await run({ action: "read" });
+		emit(`\r\x1b[2K${"x".repeat(60)} READY before resize`);
+		await buffer.resize(40, 24);
+		await buffer.resize(80, 24);
+		const result = await run({ action: "watch", pattern: "READY", start_at: "now" });
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("Matching scope: new output from now");
+		await Bun.sleep(600);
+		expect((await watchRows())[0]?.status).toBe("running");
+		emit("\r\nREADY genuinely new\r\n");
+		expect((await waitForWatchStatus())?.status).toBe("completed");
+	});
+
+	test("notify_on excludes a READY command echo across resize before registration", async () => {
+		const gate = pauseNextObservation();
+		const pending = run({ action: "write", input: "echo READY later\n", notify_on: "READY" });
+		try {
+			await gate.waitForCapture();
+			await buffer.resize(12, 24);
+			gate.release();
+			const result = await pending;
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("Watching terminal");
+			await Bun.sleep(600);
+			expect((await watchRows())[0]?.status).toBe("running");
+			emit("\r\nREADY\r\n");
+			expect((await waitForWatchStatus())?.status).toBe("completed");
+		} finally {
+			gate.release();
+			await pending.catch(() => {});
+		}
+	});
+
+	test("cancelling a resized watch disposes its observation and releases its markers", async () => {
+		await run({ action: "read" });
+		const clone = buffer.cloneReadCursor.bind(buffer);
+		const dispose = mock(() => {});
+		let cursor: ReturnType<BufferManager["cloneReadCursor"]>;
+		const cloned = spyOn(buffer, "cloneReadCursor").mockImplementationOnce((source) => {
+			cursor = clone(source);
+			if (cursor) {
+				const release = cursor.dispose.bind(cursor);
+				cursor.dispose = () => {
+					dispose();
+					release();
+				};
+			}
+			return cursor;
+		});
+		try {
+			await run({ action: "watch", pattern: "NEVER" });
+			await buffer.resize(40, 24);
+			const [task] = await watchRows();
+			expect(task?.status).toBe("running");
+			expect(cursor).toBeDefined();
+			if (!task) throw new Error("Watch was not registered");
+			await backgroundTaskService.cancel(task.id);
+			expect(dispose).toHaveBeenCalledTimes(1);
+			expect(cursor?.marker.isDisposed).toBe(true);
+			expect(cursor?.observedEndMarker?.isDisposed ?? true).toBe(true);
+			expect(activeWatchIds(TERMINAL)).toEqual([]);
+			await buffer.resize(80, 24);
+			expect(dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			cloned.mockRestore();
 		}
 	});
 
@@ -570,9 +702,9 @@ describe("Terminal tool watches", () => {
 	test("notify_on cannot claim an immediate match after its echo buffer changes", async () => {
 		respond = () => "READY\r\nuser@host:~$ ";
 		const source = buffer;
-		const read = source.readFromMarker.bind(source);
-		const changed = spyOn(source, "readFromMarker").mockImplementation(async (marker) => {
-			const result = await read(marker);
+		const read = source.readCursor.bind(source);
+		const changed = spyOn(source, "readCursor").mockImplementation(async (cursor) => {
+			const result = await read(cursor);
 			buffer = new BufferManager(`${TERMINAL}-new-echo`, 80, 24);
 			fixtureBuffers.add(buffer);
 			buffer.append("different connection> ");
