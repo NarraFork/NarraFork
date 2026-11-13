@@ -112,6 +112,7 @@ function cellsOf(line: string): string[] {
 /** A fence line: its marker, and what follows it (a closing fence has nothing after it). */
 const FENCE_RE = /^[ \t>]*(`{3,}|~{3,})(.*)$/;
 const HTML_TAG_RE = /<(\/?)([A-Za-z][A-Za-z0-9-]{0,40})((?:\s[^<>]*)?)>/g;
+const HTML_CLOSING_RE = /<\/([A-Za-z][A-Za-z0-9-]{0,40})/g;
 const HTML_BLOCK_START_RE = /^[ \t>]*(<\/?[A-Za-z][A-Za-z0-9-]*(\s|\/?>|$)|<!--)/;
 const TASK_ITEM_RE = /^[ \t>]*(?:[-*+]|\d{1,9}[.)])[ \t]+\[[ xX]\][ \t]+(.*)$/;
 const LIST_ITEM_RE = /^[ \t>]*(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)/;
@@ -120,7 +121,8 @@ const FOOTNOTE_DEF_RE = /^[ \t>]*\[\^([^\][\s]{1,200})\]:/;
 const FOOTNOTE_REF_RE = /\[\^([^\][\s]{1,200})\](?!:)/g;
 const INLINE_CODE_RE = /`[^`\n]*`/g;
 const BRACKET_RE = /[[\]]/g;
-const FRONT_MATTER_KEY_RE = /^[A-Za-z_][\w .-]{0,80}:(\s|$)/;
+// A key in any script (`标题: x`).
+const FRONT_MATTER_KEY_RE = /^[\p{L}_][\p{L}\p{N}_ .-]{0,80}:(\s|$)/u;
 
 /** Lines of a leading front matter looked through for its closing line. */
 const FRONT_MATTER_MAX_LINES = 400;
@@ -157,7 +159,9 @@ const HTML_NAMES = new Set(
  */
 function hasRealHtml(text: string, around: string): boolean {
 	if (text.includes("<!--")) return true;
-	let lower: string | null = null;
+	// The names closed anywhere in `around`, collected once: a block of many unclosed tags is
+	// read twice, not once per tag.
+	let closed: Set<string> | null = null;
 	for (const match of text.matchAll(HTML_TAG_RE)) {
 		const at = match.index ?? 0;
 		// `\<br>` is an escaped bracket, not a tag.
@@ -171,8 +175,12 @@ function hasRealHtml(text: string, around: string): boolean {
 		}
 		if (HTML_VOID.has(name)) return true;
 		if (attrs.trimEnd().endsWith("/") || /[A-Za-z_:][\w:.-]*\s*=/.test(attrs)) return true;
-		lower ??= around.toLowerCase();
-		if (lower.includes(`</${name}`)) return true;
+		if (closed === null) {
+			closed = new Set();
+			for (const closing of around.matchAll(HTML_CLOSING_RE))
+				closed.add((closing[1] as string).toLowerCase());
+		}
+		if (closed.has(name)) return true;
 	}
 	return false;
 }
@@ -249,9 +257,14 @@ function isFrontMatterBody(lines: readonly string[]): boolean {
 
 /**
  * The structures of a markdown text the old editor could lose, in document order. One pass over
- * its lines; code is skipped (fenced, and indented blocks outside lists). Linear in the text.
+ * its lines; code is skipped (fenced, and indented blocks outside lists). Linear in the text: a
+ * run of lines is read as one HTML block at most once.
  */
-export function extractSpecLossItems(source: string): SpecLossItem[] {
+export function extractSpecLossItems(
+	source: string,
+	/** Counts the work done, for tests of its bounds: blocks of lines read as one HTML block. */
+	probe?: { htmlBlocks: number },
+): SpecLossItem[] {
 	// A byte order mark is not part of the first line.
 	const text = source.charCodeAt(0) === 0xfeff ? source.slice(1) : source;
 	const lines = text.split(/\r?\n/);
@@ -280,6 +293,9 @@ export function extractSpecLossItems(source: string): SpecLossItem[] {
 	let blankBefore = true;
 	let inList = false;
 	let indented = false;
+	// The line after the HTML block last looked at: lines before it are not a block's start again
+	// (a block that is not HTML is read once, then line by line).
+	let blockSeen = 0;
 	while (i < lines.length) {
 		const line = lines[i] as string;
 		const fenceMatch = FENCE_RE.exec(line);
@@ -336,10 +352,12 @@ export function extractSpecLossItems(source: string): SpecLossItem[] {
 		}
 		const bare = line.replace(INLINE_CODE_RE, "");
 		const scan = bare.length > LINE_SCAN_MAX ? bare.slice(0, LINE_SCAN_MAX) : bare;
-		if (HTML_BLOCK_START_RE.test(scan)) {
+		if (i >= blockSeen && HTML_BLOCK_START_RE.test(scan)) {
 			// An HTML block: up to the next blank line.
 			let end = i + 1;
 			while (end < lines.length && (lines[end] as string).trim() !== "") end++;
+			blockSeen = end;
+			if (probe) probe.htmlBlocks++;
 			const raw = lines.slice(i, end).join("\n");
 			const block = end === i + 1 ? scan : raw.replace(INLINE_CODE_RE, "").replace(/\n/g, " ");
 			if (hasRealHtml(block.slice(0, LINE_SCAN_MAX), block)) {

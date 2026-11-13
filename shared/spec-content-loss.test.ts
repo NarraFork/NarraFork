@@ -66,11 +66,27 @@ describe("extractSpecLossItems", () => {
 		expect(kinds("<my-widget></my-widget>")).toEqual(["html"]);
 	});
 
+	test("a run of lines that opens like HTML and is not is read as a block once, not once per line", () => {
+		// Thousands of unclosed tags, no blank line: one block, found not to be HTML, then lines.
+		const lines = Array.from({ length: 4000 }, (_, n) => `<b>line ${n} <i>and more`);
+		const probe = { htmlBlocks: 0 };
+		expect(extractSpecLossItems(lines.join("\n"), probe)).toEqual([]);
+		expect(probe.htmlBlocks).toBe(1);
+		// Two such runs, and one that is HTML: three blocks.
+		probe.htmlBlocks = 0;
+		const text = `${lines.slice(0, 50).join("\n")}\n\n${lines.slice(0, 50).join("\n")}\n\n<div>\nx\n</div>`;
+		expect(extractSpecLossItems(text, probe).map((item) => item.kind)).toEqual(["html"]);
+		expect(probe.htmlBlocks).toBe(3);
+		// A closing tag far down the block still makes its opening line's block HTML.
+		expect(kinds(`<b>start\n${"text\n".repeat(200)}end</b>`)).toEqual(["html"]);
+	});
+
 	test("front matter is key lines after a leading ---, not a rule the document opens with", () => {
 		expect(kinds("---\n# Title\n\ntext\n\n---\nrest")).toEqual([]);
 		expect(kinds(`---\n# Title\n\n${TABLE}\n\n---\nrest`)).toEqual(["table"]);
 		expect(kinds("---\ntitle: x\ntags:\n  - a\n- b\n# note\n---\nbody")).toEqual(["frontMatter"]);
 		expect(kinds("---\r\ntitle: x\r\n---\r\nbody")).toEqual(["frontMatter"]);
+		expect(kinds("---\n标题: 设计\n作者: 某人\n---\n正文")).toEqual(["frontMatter"]);
 		// A byte order mark before it.
 		expect(kinds("\ufeff---\ntitle: x\n---\nbody")).toEqual(["frontMatter"]);
 	});
