@@ -9,7 +9,14 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { eq, inArray } from "drizzle-orm";
 import { db } from "../../../../db";
-import { narrators, specNamespaces, users } from "../../../../db/schema";
+import {
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	specNamespaces,
+	users,
+} from "../../../../db/schema";
 import { DEFAULTS, settings } from "../../../../lib/settings";
 import { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, TEAM_SOP_PLUGIN_ID } from "../../../behavior-fence-sop";
 import { prepareOutlineRun } from "../../../narrator-session";
@@ -92,6 +99,14 @@ afterEach(async () => {
 	await settleSpecImportRequests();
 	const ids = [...ownedSessionIds];
 	for (const id of ids) expect(isSpecImporting(id)).toBe(false);
+	// History rows reference their narrator without cascade (the notice a moved session gets at
+	// its next run, outline P2 PR 12b2): deleted first, for these owned narrators only, as the
+	// narrator service's delete does.
+	if (ids.length) {
+		await db.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.narratorId, ids));
+		await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.narratorId, ids));
+		await db.delete(narratorMessages).where(inArray(narratorMessages.narratorId, ids));
+	}
 	// A child has a non-cascading parent FK. Spec namespaces, their revisions and the
 	// session outline spaces cascade from these exact owned narrators, never other cases.
 	for (const id of ids.reverse()) {
