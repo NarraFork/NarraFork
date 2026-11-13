@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as tokenCache from "@frontend/lib/shiki-token-cache";
 import { MantineProvider } from "@mantine/core";
 import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
@@ -326,4 +327,53 @@ describe("tool bodies use one permanent viewport", () => {
 		expect(port("input.plan")).toBe(viewport);
 		expect(viewport.textContent).toContain("# Plan");
 	});
+});
+
+it("keeps streaming tool-parameter colours and the viewport while the next highlight is pending", async () => {
+	const pending = new Map<string, (tokens: tokenCache.ShikiToken[][]) => void>();
+	const cache = tokenCache.createShikiTokenCache(
+		(code) => new Promise((resolve) => pending.set(code, resolve)),
+	);
+	const spies = [
+		spyOn(tokenCache, "getShikiTokens").mockImplementation(cache.get),
+		spyOn(tokenCache, "subscribeShikiTokens").mockImplementation(cache.subscribe),
+		spyOn(tokenCache, "getShikiTokensVersion").mockImplementation(cache.getVersion),
+	];
+	const prefix = "const value = ";
+	const full = `${prefix}42;`;
+	const streaming = (text: string) =>
+		card({
+			isStreaming: true,
+			inputJson: {
+				_streamingFilePath: "/src/value.ts",
+				_streamingFieldName: "content",
+				_streamingFieldValue: text,
+			},
+		});
+	try {
+		await render(streaming(prefix));
+		const viewport = port("input.content");
+		const resolvePrefix = pending.get(prefix);
+		expect(resolvePrefix).toBeDefined();
+		await act(async () => resolvePrefix?.([[{ content: prefix, color: "#ff7b72" }]]));
+		const colored = viewport.querySelector('span[style*="#ff7b72"]');
+		expect(colored?.textContent).toBe(prefix);
+
+		await render(streaming(full));
+		expect(port("input.content")).toBe(viewport);
+		expect(viewport.textContent).toBe(full);
+		expect(viewport.contains(colored)).toBe(true);
+		expect(colored?.getAttribute("style")).toContain("#ff7b72");
+
+		// Input completion keeps the same content, even if its highlight is still pending.
+		await render(card({ inputJson: { file_path: "/src/value.ts", content: full } }));
+		expect(viewport.textContent).toBe(full);
+		expect(viewport.contains(colored)).toBe(true);
+		const resolveFull = pending.get(full);
+		expect(resolveFull).toBeDefined();
+		await act(async () => resolveFull?.([[{ content: full, color: "#a5d6ff" }]]));
+		expect(viewport.querySelector('span[style*="#a5d6ff"]')?.textContent).toBe(full);
+	} finally {
+		for (const spy of spies) spy.mockRestore();
+	}
 });

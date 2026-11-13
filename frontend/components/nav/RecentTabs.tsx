@@ -1,5 +1,6 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
+import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import {
@@ -63,12 +64,17 @@ import {
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
+import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import { CreateNarratorLazyModal } from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
-import { type RecentTabCardActions, RecentTabDetailCard } from "./RecentTabDetailCard";
+import {
+	type RecentTabCardActions,
+	RecentTabDetailCard,
+	useRecentTabHoverEnabled,
+} from "./RecentTabDetailCard";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import { RecentTabFolderEditModal } from "./RecentTabFolderEditModal";
 import {
@@ -97,6 +103,7 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  * reload. Importers must reach the logic module directly.
  */
 import { stripKey } from "./recent-tab-keyboard-nav";
+import { newSessionTargetFor } from "./recent-tab-new-session";
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
@@ -118,8 +125,8 @@ const RecentTabsDragContext = React.createContext<
 >({ pending: false, consumeClick: () => false });
 
 /**
- * The list's hover-card store; null on touch, where rows report no hover and the
- * details are shown at the top of the row menu instead.
+ * The list's hover-card store; null on touch or narrow viewports, where rows report
+ * no hover and the details are shown at the top of the row menu instead.
  */
 const RecentTabHoverContext = React.createContext<RecentTabHoverStore | null>(null);
 
@@ -466,6 +473,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const { removeTab, moveTab, pinTab, updateFolder, dissolveFolder, clearTabs } = recentTabs;
 	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	const [hoverStore] = useState(createRecentTabHoverStore);
+	const hoverEnabled = useRecentTabHoverEnabled(hoverStore, isTouch);
 	const sectionState = filter === "project" ? recentTabs.projects : recentTabs.work;
 	const tabs = sectionState.tabs;
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -523,9 +531,11 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const [editFolder, setEditFolder] = useState<RecentTab | null>(null);
 
 	// Open the shell before resolving cwd; only a resolved target mounts the form body.
+	// 文件夹目标没有目录要解析，`folderId` 表示"建完把新会话放进去"。
 	const [newNarratorTarget, setNewNarratorTarget] = useState<{
-		narratorId: string;
+		narratorId?: string;
 		cwd?: string;
+		folderId?: string;
 	} | null>(null);
 	const newNarratorTargetRef = useRef(newNarratorTarget);
 	newNarratorTargetRef.current = newNarratorTarget;
@@ -747,11 +757,17 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const newNarratorHereFor = useCallback(
 		async (tab: RecentTab) => {
 			if (!requireSetup()) return;
-			const narratorId = getRecentTabNarratorId(tab);
-			if (!narratorId) {
-				notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+			const sessionTarget = newSessionTargetFor(tab);
+			if (!sessionTarget) return;
+			// 文件夹没有目录要解析：直接用弹窗的默认预填，建完再归入这个文件夹。
+			if ("folderId" in sessionTarget) {
+				newNarratorRequestRef.current += 1;
+				const folderTarget = { folderId: sessionTarget.folderId };
+				newNarratorTargetRef.current = folderTarget;
+				setNewNarratorTarget(folderTarget);
 				return;
 			}
+			const { narratorId } = sessionTarget;
 			const request = ++newNarratorRequestRef.current;
 			const target = { narratorId };
 			newNarratorTargetRef.current = target;
@@ -778,19 +794,35 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	}, [ctxMenu, newNarratorHereFor]);
 
 	const handleNewNarratorHereCreated = useCallback(
-		(data: CreateNarratorResult) => {
+		// The modal closes (clearing `newNarratorTarget`) before it reports creation, so the
+		// folder comes from the call site's closure rather than from state.
+		(data: CreateNarratorResult, folderId?: string) => {
 			closeNewNarratorHere();
-			addRecentTab({
+			void addRecentTab({
 				type: "narrator",
 				id: data.id,
 				title: data.title,
 				subtitle: data.cwd,
 				status: data.status,
+			}).then(() => {
+				if (!folderId) return;
+				// The upsert strips `folderId`, so membership is a separate move. Going through the
+				// tab mutation keeps the row from flashing at top level until the WS delta lands.
+				moveTab(
+					`narrator:${data.id}`,
+					{ folderId },
+					{
+						// The session exists either way; say so, or the modal's "follow the folder"
+						// identity would silently not apply.
+						onError: () =>
+							notifications.show({ color: "orange", message: t("newNarratorJoinFolderFailed") }),
+					},
+				);
 			});
 			navigate({ to: `/narrators/${data.id}` });
 			onNavigate?.();
 		},
-		[navigate, onNavigate, closeNewNarratorHere],
+		[navigate, onNavigate, closeNewNarratorHere, moveTab, t],
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
@@ -1185,7 +1217,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			})()
 		: [...pinnedRows, ...unpinnedRows].findIndex((row) => tabSortId(row.tab) === ctxUnitKey) === 0;
 	return (
-		<RecentTabHoverContext.Provider value={isTouch ? null : hoverStore}>
+		<RecentTabHoverContext.Provider value={hoverEnabled ? hoverStore : null}>
 			<RecentTabsDragContext.Provider value={dragInteraction}>
 				<DndContext
 					sensors={drag.sensors}
@@ -1270,7 +1302,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								onReveal={handleReveal}
 								canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
 								onNewNarratorHere={handleNewNarratorHere}
-								canNewNarratorHere={ctxTab.type === "narrator" || ctxTab.type === "subagent"}
+								canNewNarratorHere={newSessionTargetFor(ctxTab) !== null}
+								newNarratorHereLabel={ctxIsFolder ? t("newNarratorInFolder") : t("newNarratorHere")}
 								onCopyCwd={handleCopyCwd}
 								canCopyCwd={["narrator", "subagent"].includes(ctxTab.type)}
 								onOpenInWindow={handleOpenInWindow}
@@ -1293,7 +1326,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								onLeaveFolder={ctxInFolder ? handleLeaveFolder : null}
 								gitIdentityNarratorId={ctxTab.type === "narrator" ? ctxTab.id : null}
 								gitIdentityFolderId={ctxIsFolder ? ctxTab.id : null}
-								detailsTab={isTouch && !ctxIsFolder ? ctxTab : null}
+								detailsTab={!hoverEnabled && !ctxIsFolder ? ctxTab : null}
 								t={t}
 							/>
 						)}
@@ -1352,10 +1385,14 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 						/>
 						<CreateNarratorLazyModal
 							opened={newNarratorTarget !== null}
-							busy={newNarratorTarget?.cwd == null}
+							// Busy only while a session target's directory is resolving; folders open directly.
+							busy={newNarratorTarget?.narratorId != null && newNarratorTarget.cwd == null}
 							initialCwd={newNarratorTarget?.cwd}
+							// 从文件夹里新建时，弹窗要说清 git 身份跟的是这个文件夹。
+							gitIdentityFolderId={newNarratorTarget?.folderId}
 							onClose={closeNewNarratorHere}
-							onCreated={handleNewNarratorHereCreated}
+							// 闭包捕获本次打开时的目标：onCreated 触发时状态已被清空。
+							onCreated={(data) => handleNewNarratorHereCreated(data, newNarratorTarget?.folderId)}
 						/>
 					</Box>
 					{/* Keep preview rows outside the measured source container. */}
@@ -1364,7 +1401,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 					</DragOverlay>
 				</DndContext>
 			</RecentTabsDragContext.Provider>
-			{!isTouch && (
+			{hoverEnabled && (
 				<RecentTabDetailCard store={hoverStore} tabs={tabs} actions={cardActions} t={t} />
 			)}
 		</RecentTabHoverContext.Provider>
@@ -1503,12 +1540,19 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 	);
 }
 
-/** A row's only text: its title on one line. Everything else is in the details card. */
+/** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
 function RecentTabTitle({ tab }: { tab: RecentTab }) {
+	const { data: userPrefs } = useUserPreferences();
+	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
 	return (
-		<Text size="sm" truncate>
-			{tab.title}
-		</Text>
+		<Stack gap={0} style={{ minWidth: 0 }}>
+			<Text size="sm" truncate>
+				{tab.title}
+			</Text>
+			{showDirectory && hasDirectorySubtitle(tab) && tab.subtitle && (
+				<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
+			)}
+		</Stack>
 	);
 }
 

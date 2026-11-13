@@ -2,6 +2,105 @@ import { describe, expect, test } from "bun:test";
 import { isPreferOpenTool, prefersOpenToolCategory } from "./prefer-open-tool";
 
 describe("prefer-open-tool", () => {
+	test("compact policy folds answered questions and finished plans, not async acknowledgements", () => {
+		const policy = { compactAuxiliaryContent: true };
+		expect(isPreferOpenTool({ toolName: "AskUserQuestion", status: "running" }, policy)).toBe(true);
+		expect(
+			isPreferOpenTool(
+				{
+					toolName: "AskUserQuestion",
+					status: "success",
+					inputJson: { answers: { topic: "yes" } },
+				},
+				policy,
+			),
+		).toBe(false);
+		expect(
+			isPreferOpenTool(
+				{ toolName: "AskUserQuestion", status: "success", inputJson: { async: true } },
+				policy,
+			),
+		).toBe(true);
+		expect(
+			isPreferOpenTool(
+				{
+					toolName: "AskUserQuestion",
+					status: "success",
+					inputJson: { async: true, answers: { topic: "yes" } },
+				},
+				policy,
+			),
+		).toBe(false);
+		expect(isPreferOpenTool({ toolName: "ExitPlanMode", status: "success" }, policy)).toBe(false);
+		expect(isPreferOpenTool({ toolName: "ExitPlanMode", status: "pending" }, policy)).toBe(true);
+		expect(isPreferOpenTool({ toolName: "ExitPlanMode", status: "success" })).toBe(true);
+	});
+
+	test("only authoritative question terminal states retire async answer surfaces", () => {
+		const tool = { toolName: "AskUserQuestion", status: "success", inputJson: { async: true } };
+		for (const questionStatus of [
+			"open",
+			"answered",
+			"dismissed",
+			"withdrawn",
+			"resolved",
+			"unknown",
+			undefined,
+		]) {
+			expect(isPreferOpenTool(tool, { compactAuxiliaryContent: true, questionStatus })).toBe(
+				questionStatus === "open" || questionStatus === "unknown" || questionStatus === undefined,
+			);
+			expect(isPreferOpenTool(tool, { compactAuxiliaryContent: false, questionStatus })).toBe(true);
+		}
+	});
+
+	test("compact GenUI keeps actual UI and live forms but folds inspection/status receipts", () => {
+		for (const action of ["render", "show", "inspect", "kit_status", "create", "kit_build"]) {
+			expect(
+				isPreferOpenTool(
+					{ toolName: "GenUI", status: "success", inputJson: { action } },
+					{ compactAuxiliaryContent: true },
+				),
+			).toBe(action === "render" || action === "show");
+			expect(
+				isPreferOpenTool({ toolName: "GenUI", status: "success", inputJson: { action } }),
+			).toBe(true);
+		}
+		expect(
+			isPreferOpenTool(
+				{ toolName: "GenUI", status: "running", inputJson: { action: "render", wait: true } },
+				{ compactAuxiliaryContent: true },
+			),
+		).toBe(true);
+		expect(
+			isPreferOpenTool(
+				{ toolName: "GenUI", status: "running", inputJson: { action: "kit_build" } },
+				{ compactAuxiliaryContent: true },
+			),
+		).toBe(true);
+	});
+
+	test("completed GenUI calls still expose pending kit confirmation in persisted result metadata", () => {
+		expect(
+			isPreferOpenTool(
+				{
+					toolName: "GenUI",
+					status: "success",
+					inputJson: { action: "kit_build" },
+					outputJson: {
+						_metadata: {
+							genUiKit: {
+								state: "unbuilt",
+								request: { id: "request", kind: "build", state: "pending" },
+							},
+						},
+					},
+				},
+				{ compactAuxiliaryContent: true },
+			),
+		).toBe(true);
+	});
+
 	test("AskUserQuestion and ExitPlanMode are prefer-open", () => {
 		expect(isPreferOpenTool({ toolName: "AskUserQuestion" })).toBe(true);
 		expect(isPreferOpenTool({ toolName: "ExitPlanMode" })).toBe(true);
@@ -17,6 +116,23 @@ describe("prefer-open-tool", () => {
 			}
 		}
 		expect(isPreferOpenTool({ toolName: "Await", status: "running" })).toBe(false);
+	});
+
+	test("Outline Ask prefers only question-creating calls", () => {
+		expect(
+			isPreferOpenTool({ toolName: "Ask", inputJson: { questions: [{ question: "Why?" }] } }),
+		).toBe(true);
+		for (const inputJson of [
+			undefined,
+			{},
+			{ questions: [] },
+			{ withdraw: ["Q1"] },
+			{ answered: [{ question: "Q1", answer: "yes" }] },
+			{ questions: [{ question: "Why?" }], withdraw: ["Q1"] },
+		]) {
+			expect(isPreferOpenTool({ toolName: "Ask", inputJson })).toBe(false);
+		}
+		expect(prefersOpenToolCategory("outline")).toBe(false);
 	});
 
 	test("EnterPlanMode and ordinary tools are not", () => {

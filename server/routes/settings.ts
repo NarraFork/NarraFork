@@ -108,6 +108,7 @@ import { speechSettingsPatchSchema } from "../lib/validators/speech";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
+import { isApikeyQuotaCapabilityEnabled } from "../services/apikey-quota-plugin-engine";
 import {
 	CodexImageGenerationFixError,
 	disableCodexImageGenerationForPrefix,
@@ -185,6 +186,9 @@ const customApiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
+	quotaSiteUrl: z.string().max(2048).optional(),
+	quotaAccessToken: z.string().max(4096).optional(),
+	quotaUserId: z.string().max(128).optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -327,6 +331,8 @@ const externalWebSocketOriginSchema = z
  * Exported for tests: `update.serverUrl` is a code-delivery origin, so its https gate
  * is a security boundary rather than input hygiene and is asserted directly.
  */
+import { remoteAccessSettingsSchema } from "../lib/remote-access-config";
+
 export const updateSettingsSchema = z
 	.object({
 		// Optional request precondition, never a persisted setting.
@@ -779,6 +785,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		remoteAccess: remoteAccessSettingsSchema.optional(),
 		shares: z
 			.object({
 				defaultExpiryHours: z.number().int().min(1),
@@ -1049,6 +1056,19 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 	}
 }
 
+/**
+ * The `auth` block as every authenticated client may see it.
+ *
+ * Same masking as `maskAuthSettings`, minus the LDAP directory: its server address,
+ * service-account DN and search base are internal topology that the login form never
+ * needs, and this payload is readable by any signed-in user. The administrator's own
+ * view comes from `GET /api/admin/auth-config`.
+ */
+function publicAuthSettings(auth: NarraForkSettings["auth"]) {
+	const { ldap: _directory, ...rest } = maskAuthSettings(auth);
+	return rest;
+}
+
 async function buildSettingsResponse(
 	source: NarraForkSettings,
 	extra?: { serverRestarting?: boolean; newUrl?: string },
@@ -1067,6 +1087,9 @@ async function buildSettingsResponse(
 		tokendance: getTokenDanceConnection(),
 		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		providerBalanceGenerations: getProviderBalanceGenerations(),
+		// The capability itself is owned by the apikey-quota plugin, so the provider page needs to
+		// know whether it is on before rendering the site-quota inputs and the balance row.
+		providerBalanceCapability: { enabled: await isApikeyQuotaCapabilityEnabled() },
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1077,7 +1100,7 @@ async function buildSettingsResponse(
 					}
 				: undefined,
 		},
-		auth: maskAuthSettings(source.auth),
+		auth: publicAuthSettings(source.auth),
 		// 平台实例的 key 与 API key 类供应商同样只回传脱敏值。
 		agent: {
 			...safeSource.agent,
@@ -1087,6 +1110,7 @@ async function buildSettingsResponse(
 		customApiProviders: (source.customApiProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+			quotaAccessToken: p.quotaAccessToken ? maskApiKey(p.quotaAccessToken) : "",
 		})),
 		openaiProviders: (source.openaiProviders ?? []).map((p) => ({
 			...p,
@@ -1815,6 +1839,13 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			for (const p of normalizedCustomApiProviders) {
 				if (p.apiKey?.startsWith("*")) {
 					p.apiKey = findExistingCustomApiKey(p.id);
+				}
+				// The site access token is a credential of its own: a masked display value must
+				// keep the stored token instead of overwriting it with the mask.
+				if (p.quotaAccessToken?.startsWith("*")) {
+					p.quotaAccessToken =
+						currentCustomApiProviders.find((candidate) => candidate.id === p.id)
+							?.quotaAccessToken ?? "";
 				}
 			}
 			validated.customApiProviders = normalizedCustomApiProviders;

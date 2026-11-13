@@ -804,4 +804,47 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 			expect(ownerBoard.sections.every((s) => s.canWrite)).toBe(true);
 		},
 	},
+	{
+		name: "a task handed to a session by its id is shown as that session only to a viewer who may read it",
+		async run(ctx) {
+			const owner = await ctx.user();
+			const reader = await ctx.user();
+			const projectId = await ctx.project({ owner: owner.id });
+			await ctx.grant(projectId, reader.id, "write");
+			const space = await ensureProjectSpace(projectId);
+			// The owner's private session: the other writer of the project cannot read it.
+			const session = await ctx.session({ owner: owner.id, projectId });
+			await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{
+						op: "insert",
+						parent: null,
+						content: "Handed over",
+						task: { status: "todo", assignee: `agent:${session}` },
+					},
+					{
+						op: "insert",
+						parent: null,
+						content: "A label",
+						task: { status: "todo", assignee: "agent:w-auth" },
+					},
+				],
+				// Anyone who writes the space can type any id there.
+				actor: { kind: "human", id: reader.id },
+				responsibleUserId: reader.id,
+			});
+			const executors = async (userId: string) => {
+				const board = await readProjectTaskBoard(as(userId), projectId);
+				const section = board.sections.find((sec) => sec.space.id === space.id);
+				return new Map(section?.open.map((task) => [task.title, task.executor]));
+			};
+			const forOwner = await executors(owner.id);
+			expect(forOwner.get("Handed over")).toMatchObject({ kind: "session", narratorId: session });
+			expect(forOwner.get("A label")).toEqual({ kind: "agent", name: "w-auth" });
+			// Who cannot read the session sees the name as written: no session, no title.
+			const forReader = await executors(reader.id);
+			expect(forReader.get("Handed over")).toEqual({ kind: "agent", name: session });
+		},
+	},
 ];

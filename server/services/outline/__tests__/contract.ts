@@ -1877,6 +1877,7 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				userId: me,
 				pageBlockId: one,
 				collapsed: ["a", "b", "长 id"],
+				expanded: ["opened-1", "opened-2"],
 				layout: "down" as const,
 				updatedAt: NOW,
 			};
@@ -1886,6 +1887,7 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 			const later = {
 				...row,
 				collapsed: ["c"],
+				expanded: [],
 				layout: "right" as const,
 				updatedAt: "2026-10-27T00:00:00.000Z",
 			};
@@ -1896,11 +1898,22 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 			expect(await ctx.store.getViewState(me, two)).toBeNull();
 			await ctx.store.putViewState({ ...row, userId: other, collapsed: [] }, 500);
 			expect((await ctx.store.getViewState(other, one))?.collapsed).toEqual([]);
+			// What a person opened is their own too, and is replaced with the row.
+			expect((await ctx.store.getViewState(other, one))?.expanded).toEqual([
+				"opened-1",
+				"opened-2",
+			]);
 			expect((await ctx.store.getViewState(me, one))?.collapsed).toEqual(["c"]);
+			expect((await ctx.store.getViewState(me, one))?.expanded).toEqual([]);
 			// A large list round-trips.
 			const many = Array.from({ length: 2000 }, (_, i) => `block-${i}`);
-			await ctx.store.putViewState({ ...row, pageBlockId: two, collapsed: many }, 500);
+			const opened = Array.from({ length: 2000 }, (_, i) => `opened-${i}`);
+			await ctx.store.putViewState(
+				{ ...row, pageBlockId: two, collapsed: many, expanded: opened },
+				500,
+			);
 			expect((await ctx.store.getViewState(me, two))?.collapsed).toEqual(many);
+			expect((await ctx.store.getViewState(me, two))?.expanded).toEqual(opened);
 			// At most `keepPerUser` pages per person: a write drops their least recently written
 			// pages, never another person's.
 			const more = await write(ctx, space, [

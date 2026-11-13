@@ -139,6 +139,22 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 		descriptorId: "narrator.spec_write",
 		visibility: "integration",
 	},
+	"command.narrator.tasks_read": {
+		descriptorId: "narrator.tasks.read",
+		visibility: "integration",
+	},
+	"command.narrator.task_add": {
+		descriptorId: "narrator.task.add",
+		visibility: "integration",
+	},
+	"command.narrator.task_set_status": {
+		descriptorId: "narrator.task.set_status",
+		visibility: "integration",
+	},
+	"command.narrator.behavior_rules_set": {
+		descriptorId: "narrator.behavior_rules.set",
+		visibility: "integration",
+	},
 	"command.narrator.interrupt": {
 		descriptorId: "narrator.interrupt",
 		visibility: "integration",

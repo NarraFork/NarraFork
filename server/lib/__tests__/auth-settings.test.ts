@@ -88,4 +88,38 @@ describe("maskAuthSettings", () => {
 		expect(masked.oidcProviders).toBeUndefined();
 		expect(masked.registrationOpen).toBe(false);
 	});
+
+	test("masks the LDAP service-account password and keeps the rest", () => {
+		const masked = maskAuthSettings({
+			...auth,
+			ldap: {
+				enabled: true,
+				url: "ldaps://dc1.corp.example.com:636",
+				bindDn: "cn=svc,dc=example,dc=com",
+				bindPassword: "the-real-bind-password",
+				searchBase: "dc=example,dc=com",
+			},
+		});
+		expect(masked.ldap?.bindPassword).toBe("********word");
+		expect(JSON.stringify(masked)).not.toContain("the-real-bind-password");
+		// Everything an admin needs to see to edit the form stays readable.
+		expect(masked.ldap?.url).toBe("ldaps://dc1.corp.example.com:636");
+		expect(masked.ldap?.bindDn).toBe("cn=svc,dc=example,dc=com");
+		expect(masked.ldap?.searchBase).toBe("dc=example,dc=com");
+		expect(masked.ldap?.enabled).toBe(true);
+	});
+
+	test("the masked LDAP password is recognized as masked on write", () => {
+		const masked = maskAuthSettings({
+			...auth,
+			ldap: { enabled: true, url: "ldaps://dc1", bindPassword: "the-real-bind-password" },
+		});
+		// Sending the redacted value back must not overwrite the stored secret.
+		expect(isMaskedSecret(masked.ldap?.bindPassword)).toBe(true);
+	});
+
+	test("leaves the ldap block absent when no directory is configured", () => {
+		const masked = maskAuthSettings(auth);
+		expect(masked.ldap).toBeUndefined();
+	});
 });

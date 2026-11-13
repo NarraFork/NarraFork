@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { api } from "../lib/api";
@@ -25,7 +26,7 @@ export function useNarratorTerminals(narratorId: string) {
 
 	// Invalidate when this narrator's terminal count changes
 	useEffect(() => {
-		if (!narratorId) return;
+		if (REMOTE_BUILD || !narratorId) return;
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: [narratorId], types: ["terminal_count_changed"] },
 			() => {
@@ -38,7 +39,7 @@ export function useNarratorTerminals(narratorId: string) {
 	return useQuery({
 		queryKey: ["terminals", { narratorId }],
 		queryFn: () => api.listTerminalsByNarrator(narratorId),
-		enabled: !!narratorId,
+		enabled: !REMOTE_BUILD && !!narratorId,
 		gcTime: TERMINALS_QUERY_GC_TIME_MS,
 	});
 }
@@ -66,7 +67,10 @@ export function useCreateNarratorTerminal(narratorId: string) {
 export function useDeleteNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (id: string) => api.deleteTerminal(id),
+		mutationFn: (id: string) =>
+			REMOTE_BUILD
+				? Promise.reject(new Error("Terminal runtime is not supported"))
+				: api.deleteTerminal(id),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["terminals", { narratorId }] });
 		},
@@ -76,7 +80,10 @@ export function useDeleteNarratorTerminal(narratorId: string) {
 export function useRenameTerminal(key: { narratorId?: string }) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({ id, name }: { id: string; name: string }) => api.renameTerminal(id, name),
+		mutationFn: ({ id, name }: { id: string; name: string }) =>
+			REMOTE_BUILD
+				? Promise.reject(new Error("Terminal runtime is not supported"))
+				: api.renameTerminal(id, name),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["terminals", key] });
 		},

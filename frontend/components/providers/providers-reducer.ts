@@ -217,6 +217,12 @@ function normalizeCustomApiProvider(
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
+		// Site-account credit query. This list is explicit, so a field missing here is dropped on
+		// every state rebuild — the inputs would then look read-only, because each keystroke is
+		// wiped by the next normalize pass.
+		quotaSiteUrl: provider.quotaSiteUrl,
+		quotaAccessToken: provider.quotaAccessToken,
+		quotaUserId: provider.quotaUserId,
 		disabled: provider.disabled ?? false,
 	};
 }

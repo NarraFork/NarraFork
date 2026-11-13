@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { Box, Button, Group, Text } from "@mantine/core";
 import { useDisclosure, useFocusTrap, useMergedRef } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -36,6 +37,7 @@ import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
+import { enterOwnedByTarget } from "../interaction/enter-ownership";
 import type { AskSelectionInput } from "../interaction/use-ask-selection-in-passing";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
@@ -1431,6 +1433,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		const [dismissedFileQuery, setDismissedFileQuery] = useState<string | null>(null);
 		const fileQuery = useMemo(() => {
+			if (REMOTE_BUILD) return null;
 			if (
 				!editorFocused ||
 				mentionCaret === null ||
@@ -1639,13 +1642,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				)
 					return;
 				const target = e.target instanceof Element ? e.target : null;
-				if (
-					target?.closest(
-						'input, textarea, select, button, a[href], summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="menu"], [role="listbox"], [role="dialog"], [role="alertdialog"], .xterm',
-					) ||
-					doc.querySelector('[aria-modal="true"]')
-				)
-					return;
+				// The same rule as the waiting permission's Enter shortcut (`enter-ownership.ts`).
+				if (enterOwnedByTarget(target, doc)) return;
 				const panel = textarea.closest("[data-narrator-panel]");
 				if (target && target !== doc.body && target !== doc.documentElement) {
 					if (!panel?.contains(target)) return;
@@ -1991,7 +1989,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 								</Button>
 							)}
 							<TextareaOptimizeControls
-								optimizeAvailable={!draft || !!draft.sessionId}
+								optimizeAvailable={!REMOTE_BUILD && (!draft || !!draft.sessionId)}
 								disabled={!bodyText.trim() || optimizeHook.loading || sending}
 								loading={optimizeHook.loading}
 								withContext={optimizeHook.withContext}

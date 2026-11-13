@@ -71,6 +71,9 @@ on:
       - "bun.lock"
       - ".github/workflows/remote-executor.yml"
 
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
 jobs:
   executor-go:
     name: Go tests, vet, and cross-build

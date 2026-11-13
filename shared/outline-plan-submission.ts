@@ -110,3 +110,17 @@ export function outlinePlanSubmissionOf(
 		review: reviewOf(input?._planReview),
 	};
 }
+
+/**
+ * Whether an ExitPlanMode input is an outline plan's (outline P2 PR 8): the model declares
+ * `mode: "outline"` (any case, spaces around it), or the server's resolution wrote `_planRoot`.
+ * A plan file's input has neither. The tool card and the inbox both read a plan as its outline
+ * by this.
+ */
+export function isOutlinePlanInput(inputJson: unknown): boolean {
+	if (!inputJson || typeof inputJson !== "object" || Array.isArray(inputJson)) return false;
+	const input = inputJson as Record<string, unknown>;
+	const root = input._planRoot;
+	if (root && typeof root === "object" && !Array.isArray(root)) return true;
+	return typeof input.mode === "string" && input.mode.trim().toLowerCase() === "outline";
+}

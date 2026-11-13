@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import { providerWaitKind, quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
@@ -78,6 +79,14 @@ const PANEL_EXCLUDED_EVENT_TYPES = [
 	"background_task_completed",
 	"background_task_failed",
 	"background_task_cancelled",
+	...(REMOTE_BUILD
+		? [
+				"git_status",
+				"terminal_count_changed",
+				"browser_session_count",
+				"browser_session_visual_change",
+			]
+		: []),
 ] as const;
 
 export interface ViewerInfo {
@@ -1023,30 +1032,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removePendingPermission(requestId);
 			},
 			onPlanReflectionStarted: () => {},
-			onPlanReflectionStopped: ({
-				requestId,
-				toolUseId,
-				toolName,
-				inputJson,
-				reason,
-				parentToolUseId,
-				subagentNarratorId,
-				ownerNarratorId,
-			}) => {
-				const existing = pendingPermsByRequestIdRef.current.get(requestId);
-				upsertPendingPermission({
-					...(existing ?? {}),
-					id: requestId,
-					toolName,
-					toolUseId,
-					parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
-					subagentNarratorId: subagentNarratorId ?? existing?.subagentNarratorId,
-					ownerNarratorId: ownerNarratorId ?? existing?.ownerNarratorId,
-					inputJson: existing?.inputJson ?? inputJson ?? {},
-					decisionReason: reason ?? existing?.decisionReason,
-					suggestions: [{ type: "plan_reflection", status: "awaiting_user", requestId, reason }],
-				});
-				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
+			onPlanReflectionStopped: ({ requestId }) => {
+				// A plan reflection's exit_plan_* id is a synthetic gate, not a permission
+				// row. Handover retires it before registering the real permission_request.
+				// Keeping both ids makes the tool card pick the synthetic one first and
+				// submit an approval whose owner no longer exists. Only the real request
+				// (or its durable panel snapshot) may supply the approval form.
+				clearReflectionProgress(requestId);
+				removePendingPermission(requestId);
+				requestPanelReconcileRef.current();
 			},
 			onPlanReflectionResolved: ({ requestId }) => {
 				clearReflectionProgress(requestId);

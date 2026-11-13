@@ -257,3 +257,60 @@ export function convertReport(input: ReportInput): ReportConversion {
 		omittedBytes: all - result.bytes + unparsed,
 	};
 }
+
+/** A whole text as blocks, nothing left out (the import of Dynamic Spec files, `spec-import/`). */
+export interface NotesConversion {
+	blocks: ReportBlock[];
+	/** Blocks in `blocks`, at every depth. */
+	count: number;
+	/** UTF-8 bytes of their content. */
+	bytes: number;
+}
+
+export interface NotesInput extends ReportInput {
+	/**
+	 * Not markdown (a `.json`, `.yaml` file): the text becomes code blocks in this language, cut
+	 * by lines so each fits a block.
+	 */
+	code?: string | null;
+}
+
+/** A code fence's language: what a fence line may carry. */
+function fenceLang(lang: string): string {
+	return /^[A-Za-z0-9_+-]{1,20}$/.test(lang) ? lang : "";
+}
+
+/**
+ * Converts a whole text as {@link convertReport} does (headings hold their sections, nothing is
+ * outline syntax, a large block is cut into consecutive blocks), without its limits: the caller
+ * bounds the input and writes the blocks in as many commits as they need. Nothing is dropped.
+ */
+export function convertNotes(input: NotesInput): NotesConversion {
+	let tree: Sized[];
+	if (input.code !== undefined && input.code !== null) {
+		const lang = fenceLang(input.code);
+		const fence = "`".repeat(Math.max(3, longestRun(input.text, "`") + 1));
+		const lines = input.text
+			.replace(/\n+$/, "")
+			.split("\n")
+			.flatMap((line) => (utf8(line) > PIECE_BYTES ? hardPieces(line, PIECE_BYTES) : [line]));
+		tree = linePieces(lines, PIECE_BYTES).map((piece) => {
+			const content = normalizeBlock(`${fence}${lang}\n${piece.join("\n")}\n${fence}`).content;
+			return { content, bytes: utf8(content), children: [] };
+		});
+	} else tree = sized(parseMarkdownSections(input.text, { literal: true }), input.continued);
+	let count = 0;
+	let bytes = 0;
+	const walk = (nodes: readonly Sized[]): ReportBlock[] =>
+		nodes.map((node) => {
+			count++;
+			bytes += node.bytes;
+			return {
+				content: node.content,
+				links: bodyLinks(parseBlock(node.content).body),
+				children: walk(node.children),
+			};
+		});
+	const blocks = walk(tree);
+	return { blocks, count, bytes };
+}

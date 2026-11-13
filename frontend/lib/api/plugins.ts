@@ -148,6 +148,18 @@ export interface PluginRuntimeDiagnostics {
  * Bounded list item returned by `GET /api/plugins`.
  * Contains sanitized summaries only — no manifests, no raw stderr.
  */
+export interface PluginHealthSummary {
+	surface?: "runtime" | "provider" | "tool" | "event";
+	state?: "closed" | "open" | "half-open";
+	requests?: number;
+	successes?: number;
+	failures?: number;
+	consecutiveFailures?: number;
+	lastSuccessAt?: string;
+	lastFailureAt?: string;
+	averageDurationMs?: number;
+}
+
 export interface PluginSummary {
 	pluginId: string;
 	displayName?: string;
@@ -155,6 +167,8 @@ export interface PluginSummary {
 	version?: string;
 	hash?: string;
 	status?: string;
+	/** Shipped with the application: no install step, no package-store record, no grant. */
+	builtin?: boolean;
 	desiredState?: PluginDesiredState;
 	runtimeState?: PluginRuntimeState;
 	compatibility?: PluginCompatibilityState;
@@ -162,6 +176,7 @@ export interface PluginSummary {
 	diagnosticCount?: number;
 	diagnostics?: PluginDiagnostic[];
 	contributions?: PluginContributionSummary[];
+	health?: PluginHealthSummary[];
 	crashCount?: number;
 	restartCount?: number;
 	consecutiveFailures?: number;

@@ -243,10 +243,10 @@ export function getRunDeliveryHint(
 	const callerWaiting = cancelWith?.narratorId === deliverTo.narratorId;
 	if (locale === "zh-CN") {
 		return `结果交付：本次运行结束后，最终结果会自动返回给叙述者 ${target}，无需用 Send 重复发送最终结论。
-${callerWaiting ? "该调用方正在等待最终结果；优先完成任务并返回结果，无需发送中间进度。" : `需要汇报实质进度或阻碍时，向明确目标发送，例如 Send({ id: ${target}, message: "已完成 X，正在做 Y" })；保持简洁，不要刷屏。`}
+${callerWaiting ? "该调用方正在等待最终结果；优先完成任务并返回结果，无需发送中间进度。" : `只有对方需要据此行动时才发消息：一项发现、一个阻碍，或需要对方决定的问题。例如 Send({ id: ${target}, message: "迁移脚本在 0041 处失败：列 owner_id 已存在。需要你决定是跳过还是改名。", show_to_user: true })。show_to_user: true 用于用户会想完整读到的消息（发现、结论、阻碍）；例行协调不设。“已收到”“仍在进行”这类消息不带新信息，不要发。`}
 只想从其他代理已有的持久化上下文获取定向答案时，使用 ContextAsk；它不会给目标发消息、唤醒、中断或修改其上下文。只有传递新信息、要求或修正时才使用 Send。`;
 	}
 	return `Result delivery: when this run finishes, its final result is returned automatically to narrator ${target}; do not Send the final conclusion redundantly.
-${callerWaiting ? "That caller is waiting for the final result; prioritize completing the task and returning the result rather than interim progress." : `For meaningful progress or blockers, address the recipient explicitly, e.g. Send({ id: ${target}, message: "Finished X, now working on Y" }); keep it concise and avoid status spam.`}
+${callerWaiting ? "That caller is waiting for the final result; prioritize completing the task and returning the result rather than interim progress." : `Send a message only when the recipient needs it in order to act: a finding, a blocker, or a question it must decide. For example, Send({ id: ${target}, message: "The migration fails at 0041: column owner_id already exists. Decide whether I should skip it or rename the column.", show_to_user: true }). Set show_to_user: true on messages the user would want to read in full (findings, conclusions, blockers) and leave it unset for routine coordination. Messages such as "received" or "still working" carry nothing new, so leave them unsent.`}
 For a targeted answer from another agent's existing persisted context, use ContextAsk. It does not message, wake, interrupt, or modify the target; use Send only to deliver new information, requirements, or corrections.`;
 }

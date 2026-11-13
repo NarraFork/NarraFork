@@ -102,7 +102,7 @@ export const DELEGATION_TEXT = {
 		unreadable: "(a block this session cannot read)",
 		truncated: "…",
 		closing:
-			"When you are done, reply with a report: what you did, your conclusions, the evidence (file:line, the commands you ran and their results), what is left undone, and what needs a person's decision.",
+			"When you are done, reply with a report, conclusion first. Open with the conclusion in at most three sentences: what you did and what you found. Then the evidence (file:line, the commands you ran and their results). Last, what is left undone and what needs a person's decision. Do not retell the process, and do not divide the report into major sections with headings: the report is attached under the task and shown folded to its first paragraph.",
 	},
 
 	// ── The note added to a delegated subagent's result. ──
@@ -115,7 +115,7 @@ export const DELEGATION_TEXT = {
 		tail: "</outline_report>",
 		blocks: (n: number) => (n === 1 ? "1 block" : `${n} blocks`),
 		current: (task: string, report: string, blocks: string) =>
-			`The report is attached under the task ${task} as ${report} (${blocks}). The task is still in progress and yours: read the report, write a line or two of summary under the task, use Ask for anything a person must decide, and add what is left as subtasks; tick the task done if it meets its acceptance, otherwise delegate it again or do it yourself.`,
+			`The report is attached under the task ${task} as ${report} (${blocks}). The task is still in progress and yours: read the report, write its conclusion in one line as the first block under the task (evidence in blocks under that line), use Ask for anything a person must decide, and add what is left as subtasks; tick the task done if it meets its acceptance, otherwise delegate it again or do it yourself.`,
 		doneBySubagent: (task: string, report: string, blocks: string) =>
 			`The subagent ticked the task ${task} done itself. Its report is attached under the task as ${report} (${blocks}); if the task does not meet its acceptance, reopen it.`,
 		late: {
@@ -204,3 +204,52 @@ export const DELEGATION_BLOCK_TEXT: Record<
 		omitted: (kib) => `其余约 ${kib} KiB 没有挂回，原文是子代理会话的最后一条回复。`,
 	},
 };
+
+/**
+ * Text of the opening brief of a session opened to do a task (outline P2 PR 10c-1,
+ * `task-session.ts`): what the new session's model reads as the first row of its history.
+ * English, like the delegation's instructions (the task's own words stay as written). Nothing here
+ * depends on the time or on a lease: the same task state renders the same bytes.
+ */
+export const TASK_BRIEF_TEXT = {
+	/** After the title and the goals above the task. */
+	head: (address: string, epoch: number) => [
+		`Address: \`${address}\` · claimed for this session (claim generation ${epoch})`,
+		"This is the opening brief of a session opened to do this task. The system put it together from the outline as it was when the session was opened; it is not what a person said, and it is not updated afterwards.",
+	],
+	/** The handoffs of the sessions that had the task before (outline P2 PR 10c-2). */
+	handoff: "## Handoff from the previous session",
+	handoffNote: (times: number) =>
+		`This task was given back unfinished ${times === 1 ? "once" : `${times} times`}. The newest handoff follows; continue from it rather than starting over.`,
+	handoffNotes: "The notes it points to, in full:",
+	handoffNoteAt: (address: string) => `- \`${address}\``,
+	handoffEarlier: "Earlier handoffs (their first lines):",
+	background: "## Background (the tasks above this one)",
+	ancestor: (title: string) => `- ${title}`,
+	siblings: "  - Its tasks, with this one among them:",
+	sibling: (title: string, status: string, self: boolean) =>
+		`    - ${title} (${status})${self ? " ← this task" : ""}`,
+	facts: "## Facts the task links to",
+	/** Above a target as read (its own first line is its title). */
+	fact: (address: string) => `### \`${address}\``,
+	/** A target that did not fit: its title and address only. */
+	factLine: (title: string, address: string) => `- ${title} (\`${address}\`): not shown here`,
+	/** A target the session may not read: no title, no address. */
+	factUnreadable: "- (a block this session cannot read)",
+	pages: "## Pages of the project's outline",
+	pagesNote:
+		"A map, not the content: each page with the first lines of what it holds. Read a page with OutlineRead before relying on it.",
+	page: (title: string, address: string, linked: boolean) =>
+		`- ${title} (\`${address}\`)${linked ? " · linked from the task" : ""}`,
+	pageLine: (text: string) => `  - ${text}`,
+	more: (n: number) => `- … ${n} more`,
+	/** The last section: how the session works on the task and how it ends (design §B.4). */
+	rules: [
+		"## How to work on this task",
+		"- The task is yours: the system claimed it for this session, and it is in progress. Its state from now on is in your current tasks; read anything again, or anything not shown here, with OutlineRead <address>.",
+		"- Do this task and its steps, and nothing beyond them. As you go, record what you find under the task with OutlineEdit: the conclusion first, the evidence under it, the details one level further down.",
+		"- When it is done: tick the task `[x]` and leave one result line under it (the conclusion first).",
+		"- When a person must decide something: put the question with Ask and leave the task in progress. It stays yours, and this session is woken when the answer comes.",
+		"- When you cannot finish it: write a handoff note under the task saying where you stopped (what is done, what comes next, which branch and commit hold the code), then end your turn. Do not set the task back to `[ ]` yourself: whoever continues the task picks it up from your note.",
+	],
+} as const;

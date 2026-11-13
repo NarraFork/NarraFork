@@ -63,6 +63,7 @@ describe("bounded mirror timeout configuration", () => {
 		expect(mirrorJobTimeoutMs("main")).toBe(25 * 60_000);
 		expect(mirrorJobTimeoutMs("helpers")).toBe(120 * 60_000);
 		expect(mirrorJobTimeoutMs("executor")).toBe(120 * 60_000);
+		expect(mirrorJobTimeoutMs("remote-peer")).toBe(120 * 60_000);
 		expect(mirrorJobTimeoutMs("main", "300")).toBe(300 * 60_000);
 		expect(mirrorTransferTimeoutMs()).toBe(15 * 60_000);
 		expect(mirrorTransferTimeoutMs("60")).toBe(60 * 60_000);
@@ -87,6 +88,23 @@ describe("bounded mirror timeout configuration", () => {
 	});
 });
 describe("relay signed control envelope", () => {
+	test("remote-peer signed relay binds its own kind and tag without weakening payload limits", () => {
+		const m: RelayReadyManifest = {
+			...ready(),
+			kind: "remote-peer",
+			tag: "remote-peer-v0.1.0-alpha.1",
+		};
+		const result = createRelayReady(m, key);
+		expect(parseRelayReady(result.bytes, key, expected(m, result.manifestHash))).toEqual(m);
+		for (const tag of ["executor-v0.1.0-alpha.1", "helpers-v1.0.0", "v0.1.0-alpha.1"])
+			expect(() => createRelayReady({ ...m, tag }, key)).toThrow();
+		expect(() =>
+			createRelayReady({ ...m, payload: { ...m.payload, size: MAX_RELAY_PAYLOAD_BYTES + 1 } }, key),
+		).toThrow();
+		expect(() =>
+			parseRelayReady(result.bytes, key, { ...expected(m, result.manifestHash), kind: "executor" }),
+		).toThrow();
+	});
 	test("roundtrips exact manifest bytes, not the large independent payload", () => {
 		const m = ready();
 		m.payload.size = MAX_RELAY_PAYLOAD_BYTES;

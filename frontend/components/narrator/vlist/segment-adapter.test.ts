@@ -1131,7 +1131,7 @@ describe("adaptSegment — assistant message", () => {
 	// The header status line wraps together with the revisedPrompt, so its text is
 	// measured — it must come from the adapter (ctx.labels), not the render layer.
 	it("composes the image_generation header statusText from status + labels", () => {
-		const statusText = (status: string | undefined, ctx: AdapterContext) =>
+		const statusText = (status: string | undefined, ctx: AdapterContext, savedPath?: string) =>
 			(
 				adaptSegment(
 					{
@@ -1141,7 +1141,7 @@ describe("adaptSegment — assistant message", () => {
 								id: `gen-${status ?? "none"}`,
 								role: "assistant",
 							},
-							[{ type: "image_generation", ...(status ? { status } : {}) }],
+							[{ type: "image_generation", savedPath, ...(status ? { status } : {}) }],
 						),
 					},
 					ctx,
@@ -1154,15 +1154,18 @@ describe("adaptSegment — assistant message", () => {
 				imageGenerated: "已生成图片",
 				imageGenerating: "正在生成图片…",
 				imageGenerationPreparing: "准备生成图片…",
+				imageGenerationNoImage: "未获得图片",
 			},
 		};
 		expect(statusText("generating", zh)).toBe("正在生成图片…");
 		expect(statusText("in_progress", zh)).toBe("准备生成图片…");
-		expect(statusText("completed", zh)).toBe("已生成图片");
-		// A persisted block has no status at all — that reads as "generated".
-		expect(statusText(undefined, zh)).toBe("已生成图片");
+		expect(statusText("completed", zh, "/final.png")).toBe("已生成图片");
+		// Legacy success requires a final artifact, not merely absent status.
+		expect(statusText(undefined, zh, "/final.png")).toBe("已生成图片");
+		expect(statusText(undefined, zh)).toBe("未获得图片");
+		expect(statusText("completed", zh)).toBe("未获得图片");
 		// No injected labels → English fallbacks (never a raw key).
-		expect(statusText("completed", CTX)).toBe("Generated image");
+		expect(statusText("completed", CTX, "/final.png")).toBe("Generated image");
 	});
 
 	it("omits statusText for non-generation media blocks", () => {

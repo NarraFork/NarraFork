@@ -6,8 +6,10 @@
  * independently, while they share the page's live session.
  *
  *   - `focus`: the focused block (the route's block; the page itself when unfocused);
- *   - `collapsed`: folded blocks — personal, never part of the block model or a commit; stored
- *     per person and page in `outline_view_state` (`useOutlineViewStateSync`);
+ *   - `collapsed` and `expanded`: the reader's own folding over what a page folds by default
+ *     (`@shared/outline-fold`): the blocks they closed that are open by default, and the ones
+ *     they opened that are closed by default — personal, never part of the block model or a
+ *     commit; stored per person and page in `outline_view_state` (`useOutlineViewStateSync`);
  *   - `caret`: where the cursor is (block and offsets in the block's editor content; -1 for the
  *     whole block), or the selected node in the mind map (offsets -2: only the block is known);
  *   - `blocks`: the block selection (Esc in the outline, Shift-click in the map), in order;
@@ -19,6 +21,7 @@
  * Listeners hear which part changed. Pure state; no DOM.
  */
 import type { OutlineMapLayout } from "@shared/outline-api";
+import { applyFoldAction, type FoldAction, type FoldTree } from "@shared/outline-fold";
 
 export interface OutlineCaret {
 	blockId: string;
@@ -50,6 +53,7 @@ export type OutlineViewStatePart =
 export class OutlineViewState {
 	focus: string;
 	readonly collapsed = new Set<string>();
+	readonly expanded = new Set<string>();
 	caret: OutlineCaret | null = null;
 	blocks: string[] = [];
 	anchor: OutlineViewportAnchor | null = null;
@@ -76,22 +80,15 @@ export class OutlineViewState {
 		this.emit("focus");
 	}
 
-	toggleCollapsed(id: string): void {
-		if (this.collapsed.has(id)) this.collapsed.delete(id);
-		else this.collapsed.add(id);
-		this.emit("collapsed");
-	}
-
-	/** Fold or unfold many at once (collapse all, expand to a level). */
-	setCollapsed(ids: Iterable<string>, collapsed: boolean): void {
-		let changed = false;
-		for (const id of ids) {
-			if (collapsed === this.collapsed.has(id)) continue;
-			if (collapsed) this.collapsed.add(id);
-			else this.collapsed.delete(id);
-			changed = true;
-		}
-		if (changed) this.emit("collapsed");
+	/**
+	 * Change the folding by `action` on the tree a view shows (`@shared/outline-fold`); true when
+	 * it changed (listeners hear "collapsed"). With `quiet`, the caller re-projects its views
+	 * first and then says so itself (`noteCollapsed`).
+	 */
+	fold(tree: FoldTree, action: FoldAction, quiet = false): boolean {
+		if (!applyFoldAction(tree, this, action)) return false;
+		if (!quiet) this.emit("collapsed");
+		return true;
 	}
 
 	/** Note that a view changed the folding itself (it already re-projected). */
@@ -127,9 +124,15 @@ export class OutlineViewState {
 	}
 
 	/** Folding and direction as stored for the person (replaces both; one "stored" event). */
-	applyStored(collapsed: Iterable<string>, layout: OutlineMapLayout): void {
+	applyStored(
+		collapsed: Iterable<string>,
+		expanded: Iterable<string>,
+		layout: OutlineMapLayout,
+	): void {
 		this.collapsed.clear();
 		for (const id of collapsed) this.collapsed.add(id);
+		this.expanded.clear();
+		for (const id of expanded) this.expanded.add(id);
 		this.layout = layout;
 		this.emit("stored");
 	}
@@ -139,6 +142,7 @@ export class OutlineViewState {
 		return {
 			focus: this.focus,
 			collapsed: [...this.collapsed].sort(),
+			expanded: [...this.expanded].sort(),
 			caret: this.caret ? { ...this.caret } : null,
 			blocks: [...this.blocks],
 			anchor: this.anchor ? { ...this.anchor } : null,

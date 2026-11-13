@@ -151,7 +151,7 @@ export function createMirrorRoutes(
 	routes.get("/:product/mirror/tools/:kind/:tag", async (c) => {
 		const metadata = await ingest.readTools(
 			c.req.param("product") as string,
-			c.req.param("kind") as "helpers" | "executor",
+			c.req.param("kind") as "helpers" | "executor" | "remote-peer",
 			c.req.param("tag") as string,
 		);
 		return metadata ? c.json(metadata) : c.json({ error: "Component metadata unavailable" }, 404);
@@ -159,9 +159,22 @@ export function createMirrorRoutes(
 	routes.get("/:product/mirror/tools/:kind/:tag/assets/:name", async (c) => {
 		const metadata = await ingest.readTools(
 			c.req.param("product") as string,
-			c.req.param("kind") as "helpers" | "executor",
+			c.req.param("kind") as "helpers" | "executor" | "remote-peer",
 			c.req.param("tag") as string,
 		);
+		// readTools revalidates the bounded stored projection, including every declared
+		// manifest/license byte length and SHA-256. Never serve undeclared storage paths.
+		const text = metadata?.assets.find((a) => a.name === c.req.param("name"));
+		if (text)
+			return new Response(text.content, {
+				headers: {
+					"Content-Type": text.name.endsWith(".json")
+						? "application/json; charset=utf-8"
+						: "text/plain; charset=utf-8",
+					"Content-Length": String(text.size),
+					"X-Content-Type-Options": "nosniff",
+				},
+			});
 		const asset = metadata?.binaries?.find((a) => a.name === c.req.param("name"));
 		if (!asset || (await storage.getFileSize(objectPath(asset.sha256))) !== asset.size)
 			return c.json({ error: "Committed component binary unavailable" }, 404);
@@ -184,7 +197,7 @@ export function createMirrorRoutes(
 		return c.json(
 			await ingest.commitTools(
 				c.req.param("product") as string,
-				c.req.param("kind") as "helpers" | "executor",
+				c.req.param("kind") as "helpers" | "executor" | "remote-peer",
 				c.req.param("tag") as string,
 				input,
 				signal,

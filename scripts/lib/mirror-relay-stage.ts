@@ -73,7 +73,11 @@ export class MirrorRelayStage {
 	private payloadReady = false;
 	private retention: MirrorRelayStageResult["retention"] = "RETENTION_INCOMPLETE";
 	constructor(
-		identity: { kind: "main" | "helpers" | "executor"; repository: string; tag: string },
+		identity: {
+			kind: "main" | "helpers" | "executor" | "remote-peer";
+			repository: string;
+			tag: string;
+		},
 		private readonly options: MirrorRelayStageOptions,
 		private readonly signal: AbortSignal,
 	) {

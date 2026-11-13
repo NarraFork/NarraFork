@@ -210,8 +210,9 @@ export function ModelMenuItems({
 	useEffect(() => {
 		if (opened) onPickerOpenedRef.current?.();
 	}, [opened]);
-	// Auto models by vendor family; a service keeps only the models no auto row lists.
-	const groups = groupModelOptions(allModels, currentModel || "");
+	// Auto models by vendor family; every service keeps all of its models (the provider view
+	// does not render auto groups, so a covered model must stay under its service).
+	const groups = groupModelOptions(allModels);
 	const provLabels: Record<string, string> = {
 		openai: "OpenAI",
 		...providerLabels,

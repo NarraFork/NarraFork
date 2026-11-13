@@ -65,7 +65,7 @@ import {
 	encodeFileBytes,
 	normalizeLineEndings,
 } from "../encoding";
-import { trackFileChange } from "../track-file-change";
+import { trackFileChange, withOverlapHint } from "../track-file-change";
 import {
 	applyCommand,
 	changeLineStats,
@@ -882,7 +882,7 @@ export const structSedTool: ToolDefinition = {
 		).then(async (result) => {
 			if (result.metadata?.diskOutcome === "applied") {
 				const { linesAdded, linesRemoved } = result.metadata;
-				await trackFileChange(
+				const hint = await trackFileChange(
 					ctx,
 					ioPath,
 					"edit",
@@ -890,8 +890,9 @@ export const structSedTool: ToolDefinition = {
 					typeof linesAdded === "number" && typeof linesRemoved === "number"
 						? { added: linesAdded, removed: linesRemoved }
 						: null,
-					{ evidenceRecorded: false, toolName: "StructSed" },
+					{ evidenceRecorded: false, toolName: "StructSed", hint: true },
 				);
+				return withOverlapHint(result, hint);
 			}
 			return result;
 		});

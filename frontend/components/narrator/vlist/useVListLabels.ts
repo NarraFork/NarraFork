@@ -31,6 +31,8 @@ import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { diffStatsLabels } from "./render/diff-stats-text";
+import type { PlanTreeLabels } from "./render/PlanTreeBody";
 
 /**
  * Literal placeholder passed as i18next's `count` so plural selection resolves
@@ -149,6 +151,12 @@ export interface VListRenderLabels {
 			thinkingChars: (chars: number) => string;
 			outputChars: (chars: number) => string;
 		};
+		/**
+		 * An outline plan's tree (ExitPlanMode of an outline session): its toolbar line, folds,
+		 * quick controls and clamped texts. Render-only: each sits in a fixed line or a tooltip
+		 * (the preview's measured labels are the adapter's `planTreeDetails*`).
+		 */
+		planTree: PlanTreeLabels;
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: {
@@ -304,11 +312,17 @@ export function reflectionTitleLabels(t: (key: string) => string): Record<string
 export function useVListLabels(): VListLabels {
 	const { t } = useTranslation("narrator");
 	const { t: tCommon } = useTranslation("common");
+	// The tool cards' figures name "tasks ticked done" by the task status's own name (translated
+	// once per language, like every label here).
+	useMemo(() => {
+		diffStatsLabels.done = t("sidecar.taskNotice.statusDone");
+	}, [t]);
 
 	const adapterLabels = useMemo<Record<string, string>>(
 		() => ({
 			historyCleared: t("historyCleared"),
 			toolDetailsCleared: t("toolDetailsCleared"),
+			status_fail: t("traceRowMark.failed"),
 			// ── compact / segment-compact indicator lines ───────────────────────────
 			compacting: t("compacting"),
 			compacted: t("compacted"),
@@ -363,6 +377,10 @@ export function useVListLabels(): VListLabels {
 			imageGenerated: t("imageGenerated"),
 			imageGenerating: t("imageGenerating"),
 			imageGenerationPreparing: t("imageGenerationPreparing"),
+			imageGenerationFailed: t("imageGenerationFailed"),
+			imageGenerationCancelled: t("imageGenerationCancelled"),
+			imageGenerationIncomplete: t("imageGenerationIncomplete"),
+			imageGenerationNoImage: t("imageGenerationNoImage"),
 			// ── web_search header status ─────────────────────────────────────────────
 			webSearched: t("webSearched"),
 			webSearching: t("webSearching"),
@@ -429,6 +447,9 @@ export function useVListLabels(): VListLabels {
 			liveOutputChars: t("liveOutputChars", { count: COUNT_PLACEHOLDER }),
 			askAnswerPrefix: t("askAnswerPrefix"),
 			askCustomAnswerPrefix: t("askCustomAnswerPrefix"),
+			// An outline plan's preview line (「还有 N 条 ▸」): measured, it shares the line.
+			planTreeDetailsMore: t("outlinePlan.tree.detailsMore", { n: "{n}" }),
+			planTreeDetailsOne: t("outlinePlan.tree.detailsOne"),
 			specProtectedBadge: t("specProtectedBadge"),
 			specGoalAddedBadge: t("specGoalAddedBadge"),
 			specGoalExistsBadge: t("specGoalExistsBadge"),
@@ -571,6 +592,10 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceOutlineTurnEnd: t("sidecar.sources.outline_task_turn_end"),
 			sidecarSourceOutlineTaskEdit: t("sidecar.sources.outline_task_edit"),
 			sidecarSourceOutlineTaskFinished: t("sidecar.sources.outline_task_finished"),
+			sidecarSourceOutlineTeamActivity: t("sidecar.sources.outline_team_activity"),
+			sidecarSourceOutlineTeam: t("sidecar.sources.outline_team"),
+			sidecarSourceOutlineTaskBrief: t("sidecar.sources.outline_task_brief"),
+			sidecarSourceSpecImport: t("sidecar.sources.spec_import"),
 			contextViewsUpdated: t("sidecar.contextViews.updated", { parts: "{parts}" }),
 			// ── task notices (`shared/pretext-layout/task-notice.ts`) ────────────────
 			taskNoticeStatusTodo: t("sidecar.taskNotice.statusTodo"),
@@ -596,6 +621,19 @@ export function useVListLabels(): VListLabels {
 				status: "{status}",
 				reason: "{reason}",
 			}),
+			taskNoticeChangeNotes: t("sidecar.taskNotice.changeNotes", { n: "{n}" }),
+			taskNoticeChangeReports: t("sidecar.taskNotice.changeReports", { n: "{n}" }),
+			taskNoticeChangeAnswers: t("sidecar.taskNotice.changeAnswers", { n: "{n}" }),
+			taskNoticeChangeClaimable: t("sidecar.taskNotice.changeClaimable"),
+			taskNoticeChangeOverlap: t("sidecar.taskNotice.changeOverlap", { path: "{path}" }),
+			taskNoticeChangeOverlapHidden: t("sidecar.taskNotice.changeOverlapHidden"),
+			taskNoticeChangeAssignedHere: t("sidecar.taskNotice.changeAssignedHere"),
+			taskNoticeChangeUnblockedDone: t("sidecar.taskNotice.changeUnblockedDone"),
+			taskNoticeChangeUnblockedCancelled: t("sidecar.taskNotice.changeUnblockedCancelled"),
+			taskNoticeChangeStillWaiting: t("sidecar.taskNotice.changeStillWaiting"),
+			taskNoticeChangeCreated: t("sidecar.taskNotice.changeCreated"),
+			taskNoticeActivityTitle: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
+			taskNoticeTeamTitle: t("sidecar.taskNotice.teamTitle", { who: "{who}", n: "{n}" }),
 			taskNoticeJoin: t("sidecar.taskNotice.join"),
 			taskNoticeWhoJoin: t("sidecar.taskNotice.whoJoin"),
 			taskNoticeEditedTitle: t("sidecar.taskNotice.editedTitle", { who: "{who}", n: "{n}" }),
@@ -608,6 +646,28 @@ export function useVListLabels(): VListLabels {
 			taskNoticeMoreRowAtLeast: t("sidecar.taskNotice.moreRowAtLeast", { n: "{n}" }),
 			taskNoticeViewTitle: t("sidecar.taskNotice.viewTitle"),
 			taskNoticeViewEmpty: t("sidecar.taskNotice.viewEmpty"),
+			taskNoticeViewCurrent: t("sidecar.taskNotice.viewCurrent"),
+			taskNoticeViewRefreshed: t("sidecar.taskNotice.viewRefreshed"),
+			taskNoticeViewChangedOne: t("sidecar.taskNotice.viewChangedOne"),
+			taskNoticeViewChanged: t("sidecar.taskNotice.viewChanged", { n: "{n}" }),
+			taskNoticeViewDid_done: t("sidecar.taskNotice.viewDid_done", { title: "{title}" }),
+			taskNoticeViewDid_started: t("sidecar.taskNotice.viewDid_started", { title: "{title}" }),
+			taskNoticeViewDid_cancelled: t("sidecar.taskNotice.viewDid_cancelled", { title: "{title}" }),
+			taskNoticeViewDid_returned: t("sidecar.taskNotice.viewDid_returned", { title: "{title}" }),
+			taskNoticeViewDid_delegated: t("sidecar.taskNotice.viewDid_delegated", { title: "{title}" }),
+			taskNoticeViewDid_waiting: t("sidecar.taskNotice.viewDid_waiting", { title: "{title}" }),
+			taskNoticeViewDid_unblocked: t("sidecar.taskNotice.viewDid_unblocked", { title: "{title}" }),
+			taskNoticeViewDid_added: t("sidecar.taskNotice.viewDid_added", { title: "{title}" }),
+			taskNoticeViewDid_requeued: t("sidecar.taskNotice.viewDid_requeued", { title: "{title}" }),
+			taskNoticeViewDid_removed: t("sidecar.taskNotice.viewDid_removed", { title: "{title}" }),
+			taskNoticeViewDid_unlisted: t("sidecar.taskNotice.viewDid_unlisted", { title: "{title}" }),
+			taskNoticeViewDid_renamed: t("sidecar.taskNotice.viewDid_renamed", { title: "{title}" }),
+			taskNoticeViewDidJoin: t("sidecar.taskNotice.viewDidJoin"),
+			taskNoticeViewDidMore: t("sidecar.taskNotice.viewDidMore", { list: "{list}", n: "{n}" }),
+			taskNoticeViewNoteReturned: t("sidecar.taskNotice.viewNoteReturned"),
+			taskNoticeViewNoteRemoved: t("sidecar.taskNotice.viewNoteRemoved"),
+			taskNoticeViewNoteUnlisted: t("sidecar.taskNotice.viewNoteUnlisted"),
+			taskNoticeViewNoteRenamed: t("sidecar.taskNotice.viewNoteRenamed"),
 			taskNoticeCountDoing: t("sidecar.taskNotice.countDoing", { n: "{n}" }),
 			taskNoticeCountWaiting: t("sidecar.taskNotice.countWaiting", { n: "{n}" }),
 			taskNoticeCountDelegated: t("sidecar.taskNotice.countDelegated", { n: "{n}" }),
@@ -617,6 +677,8 @@ export function useVListLabels(): VListLabels {
 			outlineTaskTurnEndHeading: t("sidecar.taskNotice.turnEndHeading"),
 			outlineTaskEditedHeading: t("sidecar.taskNotice.editedHeading", { n: "{n}" }),
 			outlineTaskFinishedHeading: t("sidecar.taskNotice.finishedHeading", { n: "{n}" }),
+			outlineTaskActivityHeading: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
+			outlineTaskTeamHeading: t("sidecar.taskNotice.teamHeading", { n: "{n}" }),
 			outlineTaskMore: t("sidecar.taskNotice.moreRow", { n: "{n}" }),
 			// ── outline tool cards (`shared/pretext-layout/outline-tool-card.ts`) ─────────
 			outlineSpaceOwnSession: t("outlineCard.spaceOwnSession"),
@@ -831,6 +893,28 @@ export function useVListLabels(): VListLabels {
 					thinkingChars: (chars: number) => t("reflectionThinkingChars", { count: chars }),
 					outputChars: (chars: number) => t("reflectionOutputChars", { count: chars }),
 				},
+				planTree: {
+					overview: (count: number) => t("outlinePlan.tree.overview", { count }),
+					overviewAll: (count: number) => t("outlinePlan.tree.overviewAll", { count }),
+					expandAll: t("outlinePlan.tree.expandAll"),
+					collapseAll: t("outlinePlan.tree.collapseAll"),
+					expand: t("outlinePlan.tree.expand"),
+					collapse: t("outlinePlan.tree.collapse"),
+					altHint: t("outlinePlan.tree.altHint"),
+					subtree: (title: string) => t("outlinePlan.tree.subtree", { title }),
+					subtreeExpand: t("outlinePlan.tree.subtreeExpand"),
+					subtreeCollapse: t("outlinePlan.tree.subtreeCollapse"),
+					showInside: t("outlinePlan.tree.showInside"),
+					showWhole: t("outlinePlan.tree.showWhole"),
+					showLess: t("outlinePlan.tree.showLess"),
+					more: (count: number) => t("outlinePlan.tree.more", { count }),
+					status: {
+						todo: t("sidecar.taskNotice.statusTodo"),
+						doing: t("sidecar.taskNotice.statusDoing"),
+						done: t("sidecar.taskNotice.statusDone"),
+						cancelled: t("sidecar.taskNotice.statusCancelled"),
+					},
+				},
 			},
 			toolCallGroup: {
 				label: t("toolCalls"),
@@ -942,6 +1026,7 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 	switch (kind) {
 		case "reasoning":
 			return labels.reasoning;
+		case "auxiliary-content":
 		case "tool-call":
 			return labels.toolCall;
 		case "activity-trace":

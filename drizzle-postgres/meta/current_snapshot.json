@@ -1,6 +1,6 @@
 {
-  "id": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
-  "prevId": "0880024e-08f7-4aff-8440-7060586a6aaf",
+  "id": "c8a9eeba-aacb-4856-b151-f491477a6d62",
+  "prevId": "1363fe77-68fa-4135-8d93-e64136d06a6d",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -15425,6 +15425,21 @@
           "method": "btree",
           "with": {}
         },
+        "idx_narrators_status": {
+          "name": "idx_narrators_status",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_narrators_owner": {
           "name": "idx_narrators_owner",
           "columns": [
@@ -15505,6 +15520,45 @@
           "columns": [
             {
               "expression": "variant",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_variant_list": {
+          "name": "idx_narrators_variant_list",
+          "columns": [
+            {
+              "expression": "variant",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "hidden_from_lists",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -19236,6 +19290,209 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.outline_spec_imports": {
+      "name": "outline_spec_imports",
+      "schema": "",
+      "columns": {
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "trigger": {
+          "name": "trigger",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "last_error_code": {
+          "name": "last_error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_error_count": {
+          "name": "last_error_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_error_detail": {
+          "name": "last_error_detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attention_reason": {
+          "name": "attention_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "switch_count": {
+          "name": "switch_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "switched_at": {
+          "name": "switched_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "notice_switch": {
+          "name": "notice_switch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "space_id": {
+          "name": "space_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "task_page_id": {
+          "name": "task_page_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fence_revision_id": {
+          "name": "fence_revision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "tasks": {
+          "name": "tasks",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "pages": {
+          "name": "pages",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "revert_count": {
+          "name": "revert_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "reverted_at": {
+          "name": "reverted_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reverted_by": {
+          "name": "reverted_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "revert_source_key": {
+          "name": "revert_source_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "revert_note_ids": {
+          "name": "revert_note_ids",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_actor": {
+          "name": "last_actor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_outline_spec_imports_status": {
+          "name": "idx_outline_spec_imports_status",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "outline_spec_imports_narrator_id_narrators_id_fk": {
+          "name": "outline_spec_imports_narrator_id_narrators_id_fk",
+          "tableFrom": "outline_spec_imports",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.outline_task_claims": {
       "name": "outline_task_claims",
       "schema": "",
@@ -19481,6 +19738,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'::text"
+        },
+        "expanded_json": {
+          "name": "expanded_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "layout": {
           "name": "layout",
@@ -24484,6 +24747,13 @@
           "notNull": true,
           "default": true
         },
+        "compact_auxiliary_content": {
+          "name": "compact_auxiliary_content",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
         "terminal_theme": {
           "name": "terminal_theme",
           "type": "text",
@@ -24538,6 +24808,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'"
+        },
+        "recent_tabs_show_directory": {
+          "name": "recent_tabs_show_directory",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         },
         "add_subagent_to_recent_tabs": {
           "name": "add_subagent_to_recent_tabs",

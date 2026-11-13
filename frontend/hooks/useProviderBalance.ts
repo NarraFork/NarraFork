@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import {
 	type QueryClient,
@@ -19,7 +20,11 @@ function invalidateSettings(client: QueryClient) {
 
 export function providerBalancePollInterval(snapshot: ProviderBalanceSnapshot | null | undefined) {
 	if (!snapshot || snapshot.status === "pending" || snapshot.status === "probing") return 2_000;
-	return snapshot.status === "supported" ? 60_000 : false;
+	if (snapshot.status === "supported") return 60_000;
+	// A disabled capability plugin is the one terminal state an administrator can undo, so
+	// it keeps a slow poll: re-enabling the plugin must restore the value by itself.
+	if (snapshot.error === "plugin_not_enabled") return 30_000;
+	return false;
 }
 
 export function providerBalanceOptions(
@@ -41,7 +46,7 @@ export function providerBalanceOptions(
 		},
 		select: (snapshot) =>
 			providerId && generation && snapshot?.generation === generation ? snapshot : undefined,
-		enabled: enabled && providerId != null && generation !== undefined,
+		enabled: !REMOTE_BUILD && enabled && providerId != null && generation !== undefined,
 		staleTime: (query) =>
 			query.state.data?.status === "unsupported" || query.state.data?.status === "error"
 				? Number.POSITIVE_INFINITY
@@ -82,7 +87,7 @@ export function providerBalanceProbeOptions(
 	}> | null = null;
 	return {
 		mutationFn: async () => {
-			if (!canProbe || !generation) return null;
+			if (REMOTE_BUILD || !canProbe || !generation) return null;
 			if (inFlight) return inFlight;
 			inFlight = client
 				.cancelQueries({ queryKey: providerBalanceKey(providerId, generation), exact: true })
@@ -126,4 +131,23 @@ export function useProbeProviderBalance(
 		[client, providerId, generation, canProbe],
 	);
 	return useMutation(options);
+}
+
+/**
+ * Whether the quota-query capability is switched on.
+ *
+ * The capability belongs to the `apikey-quota` plugin, so an administrator disabling it must
+ * remove the provider page's balance row and site-quota inputs rather than leave controls on
+ * screen that cannot work. Shares the `["settings"]` cache with the rest of the page, so this
+ * costs no extra request, and an unknown answer counts as enabled (the safe direction).
+ */
+export function useProviderBalanceCapability(): boolean {
+	const { data: settings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		staleTime: 30_000,
+	});
+	const capability = (settings as { providerBalanceCapability?: { enabled?: unknown } } | undefined)
+		?.providerBalanceCapability;
+	return capability?.enabled !== false;
 }

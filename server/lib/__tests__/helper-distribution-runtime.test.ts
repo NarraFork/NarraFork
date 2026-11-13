@@ -38,6 +38,7 @@ import { getCliHelperSpec } from "../helper-binary-platform";
 import {
 	createDistributionContext,
 	DISTRIBUTION_CACHE_DIR,
+	downloadDistributionFile,
 	fetchDistributionAsset,
 	resetHelperDistributionCache,
 } from "../helper-distribution-runtime";
@@ -394,7 +395,7 @@ describe("source-bound helper runtime", () => {
 			),
 		).rejects.toThrow("limit");
 	});
-	test("mirror selection retains GitHub manifest authority and consumes exact-tag helper binary", async () => {
+	test("mirror selection gets both manifest and binary from its exact-tag assets", async () => {
 		settings.update = {
 			...(settings.update ?? originalUpdate),
 			source: "update-server",
@@ -405,25 +406,34 @@ describe("source-bound helper runtime", () => {
 		const path = await downloadHelperBinary(value, { fetcher: routes(calls) });
 		expect(path).not.toBeNull();
 		expect(calls).toEqual([
-			`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/helper-manifest-v1.json`,
+			`https://legacy.example/api/v3/products/narrafork/mirror/tools/helpers/${HELPER_RELEASE_TAG}/assets/helper-manifest-v1.json`,
 			`https://legacy.example/api/v3/products/narrafork/mirror/tools/helpers/${HELPER_RELEASE_TAG}/assets/zstd-linux-x64`,
 		]);
 		const context = createDistributionContext({
 			source: "update-server",
 			repository: "fork/repo",
 			serverUrl: "https://legacy.example",
+			product: "narrafork",
 		});
 		expect(context.source).toEqual({
-			source: "github",
+			source: "update-server",
 			repository: "fork/repo",
-			mirror: { serverUrl: "https://legacy.example", product: "narrafork" },
+			serverUrl: "https://legacy.example",
+			product: "narrafork",
 		});
 		expect(context.isCurrent()).toBe(true);
 	});
 });
-describe("verified component mirror fallback", () => {
-	for (const mode of ["missing", "hash", "truncated", "architecture", "redirect"] as const) {
-		test(`${mode} mirror falls back to same repository and pinned helper tag`, async () => {
+describe("independent component mirror fails closed", () => {
+	for (const mode of [
+		"missing",
+		"hash",
+		"truncated",
+		"architecture",
+		"redirect",
+		"github-redirect",
+	] as const) {
+		test(`${mode} mirror failure never requests GitHub`, async () => {
 			settings.update = { ...(settings.update ?? originalUpdate), source: "update-server" };
 			const calls: string[] = [];
 			const path = await downloadHelperBinary(spec(), {
@@ -432,10 +442,15 @@ describe("verified component mirror fallback", () => {
 					if (url.endsWith(".json")) return Response.json(manifest());
 					if (url.startsWith("https://personal.example/")) {
 						if (mode === "missing") return new Response(null, { status: 404 });
-						if (mode === "redirect")
+						if (mode === "redirect" || mode === "github-redirect")
 							return new Response(null, {
 								status: 302,
-								headers: { location: "https://evil.example/binary" },
+								headers: {
+									location:
+										mode === "github-redirect"
+											? "https://github.com/fork/repo/releases/download/helpers-v1.0.0/zstd-linux-x64"
+											: "https://evil.example/binary",
+								},
 							});
 						const bytes = binary(mode === "architecture" ? "linux-arm64" : "linux-x64");
 						if (mode === "hash") bytes[90] = 1;
@@ -444,13 +459,10 @@ describe("verified component mirror fallback", () => {
 					return new Response(binary("linux-x64"));
 				},
 			});
-			expect(path).not.toBeNull();
-			expect(calls).toHaveLength(3);
-			expect(calls[0]).toStartWith("https://github.com/fork/repo/");
+			expect(path).toBeNull();
+			expect(calls).toHaveLength(2);
+			expect(calls.every((url) => url.startsWith("https://personal.example/"))).toBe(true);
 			expect(calls[1]).toContain(`/mirror/tools/helpers/${HELPER_RELEASE_TAG}/assets/`);
-			expect(calls[2]).toBe(
-				`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/zstd-linux-x64`,
-			);
 			expect(readdirSync(DISTRIBUTION_CACHE_DIR).some((f) => f.endsWith(".tmp"))).toBe(false);
 		});
 	}
@@ -498,8 +510,76 @@ describe("verified component mirror fallback", () => {
 		const context = createDistributionContext();
 		settings.update = { ...(settings.update ?? originalUpdate), product: "another" };
 		expect(context.isCurrent()).toBe(false);
-		expect(context.source).toMatchObject({ mirror: { product: "narrafork" } });
+		expect(context.source).toMatchObject({ source: "update-server", product: "narrafork" });
 	});
+});
+describe("remote-peer exact-tag mirror dispatch", () => {
+	for (const mode of [
+		"mirror",
+		"missing",
+		"hash",
+		"redirect",
+		"cancel",
+		"deadline",
+		"source-change",
+	] as const)
+		test(`${mode} preserves pinned peer identity without upstream fallback`, async () => {
+			settings.update = { ...(settings.update ?? originalUpdate), source: "update-server" };
+			const calls: string[] = [];
+			const bytes = binary("linux-x64");
+			const tag = "remote-peer-v0.1.0-alpha.1";
+			const name = "narrafork-remote-peer-0.1.0-alpha.1-linux-amd64";
+			const path = join(DISTRIBUTION_CACHE_DIR, `peer-${mode}`);
+			const controller = new AbortController();
+			const context = createDistributionContext(undefined, async (url) => {
+				calls.push(url);
+				if (url.startsWith("https://personal.example/")) {
+					if (mode === "missing") return new Response(null, { status: 404 });
+					if (mode === "hash") return new Response(Buffer.alloc(bytes.length, 1));
+					if (mode === "redirect")
+						return new Response(null, {
+							status: 302,
+							headers: { location: "https://evil.example/peer" },
+						});
+					if (mode === "cancel") controller.abort(new Error("peer cancelled"));
+					if (mode === "source-change") {
+						settings.update = {
+							...(settings.update ?? originalUpdate),
+							githubRepository: "changed/repo",
+						};
+						return new Response(null, { status: 404 });
+					}
+					if (mode === "deadline" || mode === "cancel") return new Response(new ReadableStream());
+				}
+				return new Response(bytes);
+			});
+			const result = downloadDistributionFile(
+				context,
+				tag,
+				name,
+				path,
+				{ size: bytes.length, sha256: digest(bytes), platform: "linux-amd64" },
+				{ signal: controller.signal, timeoutMs: 75 },
+			);
+			if (mode !== "mirror") await expect(result).rejects.toThrow();
+			else expect(await result).toBe(path);
+			expect(calls[0]).toBe(
+				`https://personal.example/api/v3/products/narrafork/mirror/tools/remote-peer/${tag}/assets/${name}`,
+			);
+			expect(calls).toHaveLength(1);
+			expect(
+				calls.some(
+					(url) =>
+						url.startsWith("https://evil.example/") ||
+						url.includes("/executor/") ||
+						url.includes("/NarraFork/NarraFork/"),
+				),
+			).toBe(false);
+			expect(
+				existsSync(DISTRIBUTION_CACHE_DIR) &&
+					readdirSync(DISTRIBUTION_CACHE_DIR).some((file) => file.endsWith(".tmp")),
+			).toBe(false);
+		});
 });
 describe("executor build identity integration", () => {
 	// Deliberately differ from the current pin, including after future component bumps.
@@ -674,14 +754,21 @@ describe("executor pinned ticket distribution", () => {
 			});
 			if (!resolved) throw new Error("Missing executor manifest");
 			const binding = freezeExecutorArtifact(resolved, "linux-amd64");
-			// A caller-owned nested mirror object must not mutate an already issued ticket.
-			if (binding.source.source === "github" && binding.source.mirror)
-				binding.source = { ...binding.source, mirror: { ...binding.source.mirror } };
+			// A caller-owned source object must not mutate an already issued ticket.
 			const ticket = issueExecutorTicket("linux-amd64", { artifact: binding });
-			if (binding.source.source === "github" && binding.source.mirror)
-				binding.source.mirror.serverUrl = "https://tampered.example";
+			if (binding.source.source === "update-server") {
+				binding.source.serverUrl = "https://tampered.example";
+				binding.source.product = "tampered";
+			}
+			binding.source.repository = "tampered/repo";
 			binding.sha256 = "d".repeat(64);
-			settings.update = { ...(settings.update ?? originalUpdate), githubRepository: "other/repo" };
+			settings.update = {
+				...(settings.update ?? originalUpdate),
+				source: delivery === "github" ? "update-server" : "github",
+				serverUrl: "https://new-server.example",
+				product: "new-product",
+				githubRepository: "other/repo",
+			};
 			const redemption = redeemExecutorTicket(ticket.ticket, "linux-amd64", "binary");
 			expect(redemption.artifact?.sha256).toBe(digest(binary("linux-x64")));
 			if (!redemption.artifact) throw new Error("Missing ticket binding");
@@ -694,7 +781,11 @@ describe("executor pinned ticket distribution", () => {
 			});
 			expect(result.sha256).toBe(digest(binary("linux-x64")));
 			expect(calls).toHaveLength(2);
-			expect(calls[0]).toContain(`/fork/repo/releases/download/executor-v${EXECUTOR_VERSION}/`);
+			expect(calls[0]).toContain(
+				delivery === "github"
+					? `/fork/repo/releases/download/executor-v${EXECUTOR_VERSION}/`
+					: `/mirror/tools/executor/executor-v${EXECUTOR_VERSION}/assets/`,
+			);
 			expect(calls[1]).toContain(
 				delivery === "github"
 					? `/fork/repo/releases/download/executor-v${EXECUTOR_VERSION}/`

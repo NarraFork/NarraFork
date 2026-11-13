@@ -701,6 +701,8 @@ export const narrators = sqliteTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		// Startup recovery and legacy backfills look up active/legacy rows by status.
+		index("idx_narrators_status").on(table.status),
 		// FK covering index for user deletion, and the lookup behind "my narrators".
 		index("idx_narrators_owner").on(table.ownerUserId),
 		// Leads the visibility predicate pushed down into the paginated list query.
@@ -713,6 +715,16 @@ export const narrators = sqliteTable(
 		// Dependents of a policy source (permission-mode propagation, deletion guard).
 		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
+		// List pages filter by variant + hidden + status before ordering by recency, and count
+		// the same predicate per tab. Covering all three avoids a per-row filter over the
+		// whole variant bucket (measured: ~10ms -> <1ms for both the count and the page).
+		index("idx_narrators_variant_list").on(
+			table.variant,
+			table.hiddenFromLists,
+			table.status,
+			table.updatedAt,
+			table.id,
+		),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 		// 一个模型只有一个 ModelTrace 舱；SQLite 的唯一索引允许多个 NULL。
@@ -2285,6 +2297,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
 	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(true),
+	/** Account-wide transcript display preference; false preserves the original cards. */
+	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
+		.notNull()
+		.default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**
@@ -2326,6 +2342,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	/** Block spacing (markdown block margins + transcript item gaps) multiplier. */
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	/** 最近标签中的会话是否显示工作目录；按账号同步，默认隐藏。 */
+	recentTabsShowDirectory: integer("recent_tabs_show_directory", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),
@@ -6206,7 +6226,12 @@ export const outlineLiveUpdates = sqliteTable(
 );
 
 // === outline_view_state ===
-/** Per user and page: collapsed blocks and the mind-map layout direction. Not part of history. */
+/**
+ * Per user and page: the reader's own folding and the mind-map layout direction. Not part of
+ * history. A page folds some blocks by default (`shared/outline-fold.ts`): `collapsed_json` holds
+ * the blocks the reader closed that are open by default, `expanded_json` those they opened that
+ * are closed by default.
+ */
 export const outlineViewState = sqliteTable(
 	"outline_view_state",
 	{
@@ -6218,6 +6243,8 @@ export const outlineViewState = sqliteTable(
 			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
 		/** Ids of the collapsed blocks. */
 		collapsedJson: text("collapsed_json", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/** Ids of the blocks the reader opened; null (a row written before the column): none. */
+		expandedJson: text("expanded_json", { mode: "json" }).$type<string[]>(),
 		layout: text("layout", { enum: ["right", "down"] })
 			.notNull()
 			.default("right"),
@@ -6301,6 +6328,64 @@ export const outlineDigests = sqliteTable(
 		uniqueIndex("uq_outline_digests_user_period").on(table.userId, table.kind, table.periodKey),
 		// A person's unread reports: the inbox row.
 		index("idx_outline_digests_unseen").on(table.userId).where(sql`"seen_at" IS NULL`),
+	],
+);
+
+// === outline_spec_imports ===
+/**
+ * The import of a session's Dynamic Spec into the outline (outline P2 PR 12b2): one row per root
+ * session that an import was tried for, or that was moved back to Dynamic Spec. No row: never
+ * tried. The source of truth for the Spec panel's banner, the automatic triggers' attempt limits
+ * (which survive restarts), the model's one notice per switch and the admin page; the service
+ * keeps an in-memory cache only (`services/outline/spec-import/state.ts`). Small rows: ids,
+ * codes, counts and times; `last_error_detail` is at most 300 characters.
+ *
+ *   - `status`: `idle`, `running` (read back after a restart as `busy`), `imported`, `failed`,
+ *     `attention`, `busy`, `reverted` (an administrator moved the session back to Dynamic Spec).
+ *   - `attempts`: failed attempts since the last success or an administrator's re-import.
+ *   - `switch_count`: how often an import moved the session to the outline; `notice_switch` the
+ *     switch whose notice the session's history holds (the notice's id is derived from it).
+ *   - `space_id`, `task_page_id`, `fence_revision_id`: where the import landed, and the old fence
+ *     revision it read (restored when the session is moved back).
+ *   - `revert_*`: the last move back, who made it, a digest of the Dynamic Spec file pointers
+ *     then (an unchanged spec is moved forward again without writing) and the marker blocks it
+ *     wrote (JSON array of block ids).
+ */
+export const outlineSpecImports = sqliteTable(
+	"outline_spec_imports",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		status: text("status", {
+			enum: ["idle", "running", "imported", "failed", "attention", "busy", "reverted"],
+		}).notNull(),
+		trigger: text("trigger"),
+		attempts: integer("attempts").notNull().default(0),
+		lastErrorCode: text("last_error_code"),
+		lastErrorCount: integer("last_error_count"),
+		lastErrorDetail: text("last_error_detail"),
+		attentionReason: text("attention_reason"),
+		switchCount: integer("switch_count").notNull().default(0),
+		switchedAt: text("switched_at"),
+		noticeSwitch: integer("notice_switch").notNull().default(0),
+		spaceId: text("space_id"),
+		taskPageId: text("task_page_id"),
+		fenceRevisionId: text("fence_revision_id"),
+		tasks: integer("tasks"),
+		pages: integer("pages"),
+		revertCount: integer("revert_count").notNull().default(0),
+		revertedAt: text("reverted_at"),
+		revertedBy: text("reverted_by"),
+		revertSourceKey: text("revert_source_key"),
+		revertNoteIds: text("revert_note_ids"),
+		lastActor: text("last_actor"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		// The admin page: by state, most recently changed first, and the bounded counts per state.
+		index("idx_outline_spec_imports_status").on(table.status, table.updatedAt, table.narratorId),
 	],
 );
 

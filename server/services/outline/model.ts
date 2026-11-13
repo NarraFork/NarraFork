@@ -183,6 +183,15 @@ export const OUTLINE_TASK_LEASE = {
  */
 export const OUTLINE_TASK_IDLE_LEASE_MS = 24 * 60 * 60_000;
 
+/**
+ * How long a session keeps an unfinished task of a project space once a run of it ended that a
+ * person started, was stopped, or failed (outline P2 PR 10c-2, D54): the person may carry on in
+ * that session, and its next run renews the lease back to the running one. Left alone, the expiry
+ * job gives the task back with a handoff note when this runs out. A run the system started that
+ * ended by itself gives such a task back at once (`release.ts`).
+ */
+export const OUTLINE_TASK_GRACE_LEASE_MS = 60 * 60_000;
+
 /** The end of a lease taken or renewed at `now` (ISO time): a running session's by default. */
 export function outlineLeaseEnd(now: string, leaseMs: number = OUTLINE_TASK_LEASE.leaseMs): string {
 	return new Date(Date.parse(now) + leaseMs).toISOString();

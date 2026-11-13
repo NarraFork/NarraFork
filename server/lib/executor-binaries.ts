@@ -62,8 +62,6 @@ function assertCompatibility(manifest: ExecutorManifest): void {
 		throw new ExecutorDistributionError("Executor binary exceeds size limit");
 }
 function parseManifest(value: unknown, source: HelperSource, tag: string): ExecutorManifest {
-	if (source.source !== "github")
-		throw new ExecutorDistributionError("Executor requires GitHub authority");
 	const manifest = parseExecutorReleaseManifest(value, {
 		repository: source.repository,
 		tag,
@@ -231,11 +229,7 @@ export async function ensureExecutorBinary(
 		},
 	});
 	assertCompatibility(check);
-	if (
-		binding.platform !== platform ||
-		binding.source.source !== "github" ||
-		binding.tag !== executorTag
-	)
+	if (binding.platform !== platform || binding.tag !== executorTag)
 		throw new ExecutorDistributionError("Executor binding mismatch");
 	const downloaded = await downloadHelperBinary(
 		{

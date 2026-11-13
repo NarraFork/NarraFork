@@ -239,11 +239,16 @@ export interface OutlineReadPort {
 	): Promise<string[]>;
 	/** Live blocks matching a full-text query, best first, at most `query.limit`. */
 	searchBlocks(query: OutlineSearchQuery): Promise<OutlineSearchRow[]>;
-	/** Open links to any of the targets, written in one of `spaceIds`, at most `limit`. */
+	/**
+	 * Open links to any of the targets, written in one of `spaceIds` (null: in any space, for a
+	 * system read that tells nobody what it found), only of `kinds` when given, at most `limit`.
+	 * By the target index (`idx_outline_links_target`).
+	 */
 	listLinksTo(
 		targets: readonly OutlineLinkTargetRef[],
-		spaceIds: readonly string[],
+		spaceIds: readonly string[] | null,
 		limit: number,
+		options?: { kinds?: readonly OutlineLinkKind[] },
 	): Promise<OutlineLinkRow[]>;
 	/**
 	 * Live pages of a space in sibling order (order key, then id, bytewise), after the page

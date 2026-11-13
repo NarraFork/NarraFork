@@ -186,6 +186,7 @@ function toViewState(row: ViewStateSelect): OutlineViewStateRow {
 		userId: row.userId,
 		pageBlockId: row.pageBlockId,
 		collapsed: Array.isArray(row.collapsedJson) ? row.collapsedJson : [],
+		expanded: Array.isArray(row.expandedJson) ? row.expandedJson : [],
 		layout: row.layout === "down" ? "down" : "right",
 		updatedAt: row.updatedAt,
 	};
@@ -921,12 +922,18 @@ export const sqliteOutlineStore: OutlineStore = {
 							userId: row.userId,
 							pageBlockId: row.pageBlockId,
 							collapsedJson: row.collapsed,
+							expandedJson: row.expanded,
 							layout: row.layout,
 							updatedAt: row.updatedAt,
 						})
 						.onConflictDoUpdate({
 							target: [outlineViewState.userId, outlineViewState.pageBlockId],
-							set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
+							set: {
+								collapsedJson: row.collapsed,
+								expandedJson: row.expanded,
+								layout: row.layout,
+								updatedAt: row.updatedAt,
+							},
 						})
 						.run();
 					// The person's oldest pages beyond the cap: their rows are found by the primary
@@ -1293,6 +1300,25 @@ export const sqliteOutlineStore: OutlineStore = {
 			out.push(...rows.map(({ rank: _rank, ...row }) => toQuestion(row)));
 		}
 		return out;
+	},
+
+	async listOpenQuestionBlocksOnPage(spaceId, pageId, limit) {
+		return db
+			.select({ id: outlineQuestions.blockId })
+			.from(outlineQuestions)
+			.innerJoin(outlineBlocks, eq(outlineBlocks.id, outlineQuestions.blockId))
+			.where(
+				and(
+					eq(outlineQuestions.spaceId, spaceId),
+					sql`${outlineQuestions.state} = 'open'`,
+					eq(outlineBlocks.pageId, pageId),
+					eq(outlineBlocks.deleted, false),
+				),
+			)
+			.orderBy(desc(outlineQuestions.createdAt), asc(outlineQuestions.blockId))
+			.limit(limit)
+			.all()
+			.map((row) => row.id);
 	},
 
 	async listOpenQuestionsForUser(userId, limit) {

@@ -36,6 +36,14 @@ beforeAll(() => {
 	g.window = win;
 	g.document = win.document;
 	g.navigator = win.navigator;
+	// The read-only buttons' hint is a Mantine Tooltip, whose positioning library reads the
+	// platform: neither linkedom's navigator nor the runtime's (which may stay global) has one.
+	for (const nav of [win.navigator, globalThis.navigator]) {
+		for (const key of ["platform", "userAgent"] as const) {
+			if (nav && typeof (nav as unknown as Record<string, unknown>)[key] !== "string")
+				Object.defineProperty(nav, key, { value: "linux", configurable: true });
+		}
+	}
 	g.HTMLElement = win.HTMLElement;
 	g.Element = win.Element;
 	g.Node = win.Node;
@@ -162,6 +170,47 @@ describe("spec carryover card — buttons invoke the injected actions", () => {
 		const { buttons, unmount } = renderSpecCard(CARRYOVER);
 		expect(buttons).toHaveLength(3);
 		for (const button of buttons) expect(button.hasAttribute("disabled")).toBe(true);
+		unmount();
+	});
+
+	it("an outline session's card (PR 12a): clear and reset disabled in place with a hint, view tasks live", () => {
+		const calls: string[] = [];
+		const live = renderSpecCard(CARRYOVER, {
+			onViewTasks: () => calls.push("view"),
+			onClearTasks: () => calls.push("clear"),
+			onResetSpec: () => calls.push("reset"),
+		});
+		const liveLabels = live.buttons.map((b) => b.textContent);
+		live.unmount();
+		const { buttons, unmount } = renderSpecCard(CARRYOVER, {
+			onViewTasks: () => calls.push("view"),
+			readOnlyHint: "Tasks are in the outline now",
+		});
+		// Same three buttons, same labels, in the same order: nothing the measure pass reserved moves.
+		expect(buttons.map((b) => b.textContent)).toEqual(liveLabels);
+		expect(buttons[0]?.hasAttribute("disabled")).toBe(false);
+		for (const button of buttons.slice(1)) {
+			// Disabled the way a hover still reaches (Mantine's `data-disabled`), announced as such.
+			expect(button.hasAttribute("data-disabled")).toBe(true);
+			expect(button.getAttribute("aria-disabled")).toBe("true");
+			expect(button.hasAttribute("disabled")).toBe(false);
+		}
+		for (const button of buttons) act(() => button.click());
+		expect(calls).toEqual(["view"]);
+		unmount();
+	});
+
+	it("a hint without missing handlers changes nothing", () => {
+		const calls: string[] = [];
+		const { buttons, unmount } = renderSpecCard(CARRYOVER, {
+			onViewTasks: () => calls.push("view"),
+			onClearTasks: () => calls.push("clear"),
+			onResetSpec: () => calls.push("reset"),
+			readOnlyHint: "unused",
+		});
+		for (const button of buttons) expect(button.hasAttribute("data-disabled")).toBe(false);
+		for (const button of buttons) act(() => button.click());
+		expect(calls).toEqual(["view", "clear", "reset"]);
 		unmount();
 	});
 

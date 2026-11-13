@@ -328,12 +328,20 @@ export const narrators = pgTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		index("idx_narrators_status").on(table.status),
 		index("idx_narrators_owner").on(table.ownerUserId),
 		index("idx_narrators_visibility").on(table.visibility),
 		index("idx_narrators_write_audience").on(table.writeAudience),
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
 		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
+		index("idx_narrators_variant_list").on(
+			table.variant,
+			table.hiddenFromLists,
+			table.status,
+			table.updatedAt,
+			table.id,
+		),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 		uniqueIndex("idx_narrators_modeltrace_key").on(table.modeltraceKey),
@@ -1303,6 +1311,7 @@ export const userPreferences = pgTable("user_preferences", {
 	replyInUserLanguage: boolean("reply_in_user_language").notNull().default(true),
 	showTokenUsage: boolean("show_token_usage").notNull().default(false),
 	showOutputStats: boolean("show_output_stats").notNull().default(true),
+	compactAuxiliaryContent: boolean("compact_auxiliary_content").notNull().default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	narratorFontScalePercent: integer("narrator_font_scale_percent").notNull().default(100),
@@ -1313,6 +1322,7 @@ export const userPreferences = pgTable("user_preferences", {
 	narratorLineHeightV2Percent: integer("narrator_line_height_v2_percent"),
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	recentTabsShowDirectory: boolean("recent_tabs_show_directory").notNull().default(false),
 	addSubagentToRecentTabs: boolean("add_subagent_to_recent_tabs").notNull().default(true),
 	recentTabsGroupMode: text("recent_tabs_group_mode").notNull().default("flat"),
 	notifyOnDone: boolean("notify_on_done").notNull().default(true),
@@ -3855,6 +3865,7 @@ export const outlineViewState = pgTable(
 			.notNull()
 			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
 		collapsedJson: jsonText("collapsed_json").notNull().default(sql.raw("'[]'::text")),
+		expandedJson: jsonText("expanded_json"),
 		layout: text("layout").notNull().default("right"),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -3906,6 +3917,42 @@ export const outlineDigests = pgTable(
 	(table) => [
 		uniqueIndex("uq_outline_digests_user_period").on(table.userId, table.kind, table.periodKey),
 		index("idx_outline_digests_unseen").on(table.userId).where(sql.raw('"seen_at" IS NULL')),
+	],
+);
+
+export const outlineSpecImports = pgTable(
+	"outline_spec_imports",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		status: text("status").notNull(),
+		trigger: text("trigger"),
+		attempts: integer("attempts").notNull().default(0),
+		lastErrorCode: text("last_error_code"),
+		lastErrorCount: integer("last_error_count"),
+		lastErrorDetail: text("last_error_detail"),
+		attentionReason: text("attention_reason"),
+		switchCount: integer("switch_count").notNull().default(0),
+		switchedAt: text("switched_at"),
+		noticeSwitch: integer("notice_switch").notNull().default(0),
+		spaceId: text("space_id"),
+		taskPageId: text("task_page_id"),
+		fenceRevisionId: text("fence_revision_id"),
+		tasks: integer("tasks"),
+		pages: integer("pages"),
+		revertCount: integer("revert_count").notNull().default(0),
+		revertedAt: text("reverted_at"),
+		revertedBy: text("reverted_by"),
+		revertSourceKey: text("revert_source_key"),
+		revertNoteIds: text("revert_note_ids"),
+		lastActor: text("last_actor"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_outline_spec_imports_status").on(table.status, table.updatedAt, table.narratorId),
 	],
 );
 
@@ -4366,8 +4413,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 141,
-  "columnCount": 1863,
+  "tableCount": 142,
+  "columnCount": 1890,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -6295,6 +6342,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_narrators_status",
+          "columns": [
+            "status"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_narrators_owner",
           "columns": [
             "ownerUserId"
@@ -6333,6 +6387,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_variant_updated",
           "columns": [
             "variant",
+            "updatedAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_variant_list",
+          "columns": [
+            "variant",
+            "hiddenFromLists",
+            "status",
             "updatedAt",
             "id"
           ],
@@ -11625,6 +11690,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "true"
         },
         {
+          "property": "compactAuxiliaryContent",
+          "name": "compact_auxiliary_content",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "true",
+          "defaultExpression": "true"
+        },
+        {
           "property": "terminalTheme",
           "name": "terminal_theme",
           "kind": "text",
@@ -11709,6 +11786,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"[]\"",
           "defaultExpression": "\"[]\""
+        },
+        {
+          "property": "recentTabsShowDirectory",
+          "name": "recent_tabs_show_directory",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         },
         {
           "property": "addSubagentToRecentTabs",
@@ -26447,6 +26536,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "sql.raw(\"'[]'::text\")"
         },
         {
+          "property": "expandedJson",
+          "name": "expanded_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "layout",
           "name": "layout",
           "kind": "text",
@@ -26737,6 +26836,259 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "\"seen_at\" IS NULL"
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineSpecImports",
+      "name": "outline_spec_imports",
+      "columns": [
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_spec_imports_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "trigger",
+          "name": "trigger",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attempts",
+          "name": "attempts",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "lastErrorCode",
+          "name": "last_error_code",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastErrorCount",
+          "name": "last_error_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastErrorDetail",
+          "name": "last_error_detail",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attentionReason",
+          "name": "attention_reason",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "switchCount",
+          "name": "switch_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "switchedAt",
+          "name": "switched_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "noticeSwitch",
+          "name": "notice_switch",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "taskPageId",
+          "name": "task_page_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "fenceRevisionId",
+          "name": "fence_revision_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "tasks",
+          "name": "tasks",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "pages",
+          "name": "pages",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revertCount",
+          "name": "revert_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "revertedAt",
+          "name": "reverted_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revertedBy",
+          "name": "reverted_by",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revertSourceKey",
+          "name": "revert_source_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revertNoteIds",
+          "name": "revert_note_ids",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastActor",
+          "name": "last_actor",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_spec_imports_status",
+          "columns": [
+            "status",
+            "updatedAt",
+            "narratorId"
+          ],
+          "unique": false
         }
       ],
       "checks": [],

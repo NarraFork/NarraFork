@@ -499,7 +499,7 @@ export interface InjectionNavigation {
  * The `switch` is exhaustive on purpose: adding a target kind must be a compile error
  * here rather than a row that silently stops being clickable.
  */
-function resolveInjectionOpener(
+export function resolveInjectionOpener(
 	target: InjectionTarget,
 	navigation: InjectionNavigation | undefined,
 ): (() => void) | undefined {

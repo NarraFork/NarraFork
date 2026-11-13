@@ -14,33 +14,93 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import outlineEn from "../../../locales/en/outline.json";
+import outlineZh from "../../../locales/zh-CN/outline.json";
 import { ProjectTaskBoard, SessionTaskBoard } from "./TaskBoardViews";
 
 const instance = i18next.createInstance();
-await instance
-	.use(initReactI18next)
-	.init({ lng: "en", resources: { en: { outline: outlineEn } }, react: { useSuspense: false } });
+await instance.use(initReactI18next).init({
+	lng: "en",
+	resources: { en: { outline: outlineEn }, "zh-CN": { outline: outlineZh } },
+	react: { useSuspense: false },
+});
 
 let root: Root | null = null;
 let queryClient: QueryClient | null = null;
 const opened: string[] = [];
+const openedSessions: string[] = [];
+let mounted: React.ReactNode = null;
+/** The board's frame: its width (px) and color scheme. */
+const frame: { width: number; scheme: "light" | "dark" } = { width: 720, scheme: "light" };
 
-function mount(node: React.ReactNode): void {
-	queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	root?.unmount();
-	root = createRoot(document.getElementById("root") as HTMLElement);
+function render(): void {
+	if (!root || !queryClient) return;
 	root.render(
 		<I18nextProvider i18n={instance}>
 			<QueryClientProvider client={queryClient}>
-				<MantineProvider>
-					<div style={{ width: 720, padding: 12 }}>{node}</div>
+				<MantineProvider forceColorScheme={frame.scheme}>
+					<div
+						data-testid="board-frame"
+						style={{ width: frame.width, maxWidth: "100%", padding: 12, boxSizing: "border-box" }}
+					>
+						{mounted}
+					</div>
 				</MantineProvider>
 			</QueryClientProvider>
 		</I18nextProvider>,
 	);
 }
 
+function mount(node: React.ReactNode): void {
+	queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	root?.unmount();
+	root = createRoot(document.getElementById("root") as HTMLElement);
+	mounted = node;
+	render();
+}
+
 const onOpenTask = (task: OutlineBoardTask) => opened.push(task.id);
+const onOpenSession = (narratorId: string) => openedSessions.push(narratorId);
+
+/** Set the frame's width and color scheme; the board keeps its state. */
+export function setFrame(width: number, scheme: "light" | "dark"): void {
+	frame.width = width;
+	frame.scheme = scheme;
+	render();
+}
+
+/** Sessions the board asked its host to open. */
+export function openedSessionIds(): string[] {
+	return [...openedSessions];
+}
+
+/** Re-read every board (what the timer and window focus do in the app). */
+export async function refreshBoards(): Promise<void> {
+	await queryClient?.invalidateQueries({ queryKey: ["task-board"] });
+}
+
+/**
+ * Whether the element a selector names (the first) lies within the viewport's width, and the
+ * page does not scroll sideways: a layout check that does not depend on the fonts installed.
+ */
+export function fitsWidth(selector: string): { found: boolean; inside: boolean; scrolls: boolean } {
+	const element = document.querySelector<HTMLElement>(selector);
+	const rect = element?.getBoundingClientRect();
+	return {
+		found: !!rect,
+		inside: !!rect && rect.left >= -0.5 && rect.right <= window.innerWidth + 0.5,
+		scrolls: document.documentElement.scrollWidth > window.innerWidth + 1,
+	};
+}
+
+/** An attribute of the element a selector names (the first), or null. */
+export function attr(selector: string, name: string): string | null {
+	return document.querySelector(selector)?.getAttribute(name) ?? null;
+}
+
+/** The text of the element a selector names (the first), or null. */
+export function text(selector: string): string | null {
+	return document.querySelector(selector)?.textContent ?? null;
+}
 
 export function ready(): boolean {
 	return true;
@@ -54,7 +114,13 @@ export function openSession(narratorId: string): void {
 
 /** Mount a project's board (the project page's Tasks view). */
 export function openProject(projectId: string): void {
-	mount(<ProjectTaskBoard projectId={projectId} onOpenTask={onOpenTask} />);
+	mount(
+		<ProjectTaskBoard
+			projectId={projectId}
+			onOpenTask={onOpenTask}
+			onOpenSession={onOpenSession}
+		/>,
+	);
 }
 
 /** Whether the narrator socket is connected. */
@@ -78,6 +144,57 @@ export function rows(): Array<{ title: string; status: string; group: string; ba
 		badges: [...row.querySelectorAll<HTMLElement>("[data-testid^=task-badge-]")].map(
 			(badge) => badge.dataset.testid ?? "",
 		),
+	}));
+}
+
+/** Switch the interface language (`en`, `zh-CN`). */
+export async function setLanguage(language: string): Promise<void> {
+	await instance.changeLanguage(language);
+}
+
+/**
+ * The badge of each status group the board shows: which state it draws, whether it is an icon on
+ * a tinted background, and the group's heading beside it.
+ */
+export function statusBadges(): Array<{
+	group: string;
+	status: string | null;
+	badge: boolean;
+	/** The icon's Tabler class (`tabler-icon-<name>`). */
+	icon: string;
+	shapes: number;
+	tinted: boolean;
+	color: string;
+	heading: string;
+}> {
+	return [...document.querySelectorAll<HTMLElement>("[data-testid=task-board-status]")].map(
+		(group) => {
+			const svg = group.querySelector<SVGSVGElement>("svg.nf-status");
+			const cs = svg ? getComputedStyle(svg) : null;
+			const rgba = /rgba?\(([^)]+)\)|color\(srgb ([^)]+)\)/.exec(cs?.backgroundColor ?? "");
+			const parts = (rgba?.[1] ?? rgba?.[2] ?? "").split(/[\s,/]+/).filter(Boolean);
+			return {
+				group: group.dataset.status ?? "",
+				status: svg?.dataset.status ?? null,
+				badge: !!svg,
+				icon:
+					(svg?.getAttribute("class") ?? "").split(" ").find((c) => c.startsWith("tabler-icon-")) ??
+					"",
+				shapes: svg?.childElementCount ?? 0,
+				tinted: parts.length >= 4 && Number(parts[3]) > 0.05 && Number(parts[3]) < 0.5,
+				color: cs?.color ?? "",
+				heading: svg?.parentElement?.textContent ?? "",
+			};
+		},
+	);
+}
+
+/** The state chips (words with the state's icon) the board shows: which state, their words. */
+export function statusChips(): Array<{ status: string; text: string; icon: boolean }> {
+	return [...document.querySelectorAll<HTMLElement>("[data-status-chip]")].map((chip) => ({
+		status: chip.dataset.statusChip ?? "",
+		text: chip.textContent ?? "",
+		icon: chip.querySelector("svg") !== null,
 	}));
 }
 

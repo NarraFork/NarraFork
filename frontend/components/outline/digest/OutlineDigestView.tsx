@@ -39,6 +39,8 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
 import { useUndoOutlineDecision, wasUndoneHere } from "../../../hooks/useOutlineReports";
 import { formatLocaleTime } from "../../../lib/intl-format";
+import { reportLineDisplay } from "../../../lib/outline-report-line";
+import { OutlineStatusChip } from "../OutlineStatusIcon";
 import { OutlineHrefLink, OutlineLink, type OutlineTarget } from "../outline-nav";
 import {
 	commitPath,
@@ -116,6 +118,15 @@ export function useDigestSpaceLabel(): (
 
 const wrap = { overflowWrap: "anywhere", minWidth: 0 } as const;
 
+/**
+ * A block's title as the report shows it. A subagent report's container line reads in the
+ * reader's language and time zone, as on the page it links to; any other title is as it is.
+ */
+function blockTitle(ctx: ItemContext, title: string | null): string {
+	if (!title) return ctx.t("report.untitled");
+	return reportLineDisplay(title, { t: ctx.t as never, locale: ctx.lang }) ?? title;
+}
+
 function TitleLink({
 	ctx,
 	title,
@@ -125,7 +136,7 @@ function TitleLink({
 	title: string | null;
 	target: OutlineTarget | null;
 }) {
-	const text = title || ctx.t("report.untitled");
+	const text = blockTitle(ctx, title);
 	if (!target)
 		return (
 			<Text size="sm" fw={500} style={wrap}>
@@ -540,11 +551,11 @@ function KnowledgeItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestKno
 											onClick={() => ctx.onOpen?.()}
 											data-testid="outline-report-block-link"
 										>
-											{block.title || t("report.untitled")}
+											{blockTitle(ctx, block.title)}
 										</Anchor>
 									) : (
 										<Text size="xs" style={wrap}>
-											{block.title || t("report.untitled")}
+											{blockTitle(ctx, block.title)}
 										</Text>
 									)}
 									{block.deleted && (
@@ -563,8 +574,6 @@ function KnowledgeItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestKno
 }
 
 const TASK_COLOR = {
-	done: "green",
-	cancelled: "gray",
 	reopened: "yellow",
 	assigned: "violet",
 } as const;
@@ -582,17 +591,22 @@ function TaskItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestTaskView
 			space={item.link.spaceId}
 			badges={
 				<>
-					<Tag color={TASK_COLOR[item.event]}>{t(`report.task.${item.event}`)}</Tag>
+					{item.event === "done" || item.event === "cancelled" ? (
+						// A task's state: the outline's chip for it (the state's icon, then the words).
+						<OutlineStatusChip status={item.event}>
+							{t(`report.task.${item.event}`)}
+						</OutlineStatusChip>
+					) : (
+						<Tag color={TASK_COLOR[item.event]}>{t(`report.task.${item.event}`)}</Tag>
+					)}
 					{item.newlyDoneForYou && (
-						<Badge
-							size="xs"
+						<OutlineStatusChip
+							status="newly_done"
 							variant="filled"
-							color="teal"
-							tt="none"
 							data-testid="outline-report-newly-done"
 						>
 							{t("report.task.newlyDone")}
-						</Badge>
+						</OutlineStatusChip>
 					)}
 					{item.forYou && item.event !== "assigned" && (
 						<Tag color="grape">{t("report.task.yours")}</Tag>
@@ -829,6 +843,9 @@ export function OutlineDigestView({
 		!compact &&
 			tallies.leaseReturned > 0 &&
 			t("report.tally.leaseReturned", { count: tallies.leaseReturned }),
+		!compact &&
+			tallies.handedBack > 0 &&
+			t("report.tally.handedBack", { count: tallies.handedBack }),
 		!compact &&
 			tallies.deletedFacts > 0 &&
 			t("report.tally.deletedFacts", { count: tallies.deletedFacts }),

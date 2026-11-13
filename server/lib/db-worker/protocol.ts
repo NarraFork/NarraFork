@@ -274,6 +274,8 @@ export interface DbWorkerRequest {
 	requestId: string;
 	dbPath: string;
 	params: DbReadTaskParams;
+	/** SQL trace span that issued the task; the worker attributes its SQL to a child span. */
+	traceParent?: string;
 }
 
 export interface DbWorkerShutdown {
@@ -289,6 +291,8 @@ export type DbWorkerInbound = DbWorkerRequest | DbWorkerShutdown | DbWorkerCance
 
 export interface DbWorkerReady {
 	type: "ready";
+	/** null is source development; frozen runtimes require an exact identity. */
+	buildId: string | null;
 }
 
 export interface DbWorkerProgress {
@@ -314,6 +318,7 @@ export interface DbWorkerFailure {
 	message: string;
 	/** Task-specific fail-closed diagnostics; never contains raw JSON. */
 	code?: string;
+	diagnostic?: ReturnType<typeof import("./failure").workerFailureDetails>;
 }
 
 export type DbWorkerOutbound = DbWorkerReady | DbWorkerProgress | DbWorkerSuccess | DbWorkerFailure;

@@ -143,6 +143,44 @@ describe("Agent task tool", () => {
 		expect(runCalls[0]).toMatchObject({ userId: "user-42" });
 	});
 
+	// Models that fill every optional parameter with "" (observed via a completions
+	// relay) must launch in prompt mode, not be routed into outline delegation.
+	test("empty-string task falls through to prompt-mode launch", async () => {
+		runCalls.length = 0;
+		const ctx: ToolContext = {
+			narratorId: "parent-narrator",
+			cwd: "/worktree",
+			signal: new AbortController().signal,
+			locale: "en",
+			currentToolUseId: "agent-tool-use-3",
+			toolCallBinding: { toolCallId: "agent-row-3", attempt: 1 },
+			userId: "user-42",
+			updateExecutionLease: {
+				kind: "resumable",
+				setNarratorId: mock(() => {}),
+				transfer: mock(() => true),
+				release: mock(() => {}),
+			},
+			requestPermission: async () => ({ behavior: "allow" }),
+		};
+
+		const result = await agentTool.execute(
+			{
+				prompt: "inspect with empty optional params",
+				subagent_type: "general",
+				task: "",
+				archive: "",
+				unarchive: "",
+				model: "",
+			},
+			ctx,
+		);
+
+		expect(result.isError).toBeFalsy();
+		expect(String(result.output)).not.toContain("Agent task error");
+		expect(runCalls).toHaveLength(1);
+	});
+
 	// The tool used to re-write the runner's `<subagent_id>` tag to swap in an
 	// alias. The runner now emits the alias itself, so a second rewrite here would
 	// only be able to corrupt it — the output must pass through verbatim.

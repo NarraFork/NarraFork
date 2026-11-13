@@ -1,3 +1,6 @@
+import { readBoundedBlob } from "@frontend/lib/bounded-blob";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
 import { ApiError, authorizedFetch, readFetchError } from "../../../lib/api";
 import { apiUrl, isApiUrl, resolveServerUrl } from "../../../lib/base-path";
 
@@ -83,12 +86,22 @@ export async function fetchImageBlob({
 	if (!source) throw new Error("No image source");
 	const needsAuth = savedPathSource != null || isApiUrl(source);
 
-	const response = needsAuth ? await authorizedFetch(source) : await fetch(source);
+	if (REMOTE_BUILD && (savedPathSource || (!needsAuth && !isRemoteInlineImage(source)))) {
+		throw new Error("Image source is unavailable in remote access");
+	}
+	const signal = AbortSignal.timeout(15_000);
+	const response = needsAuth
+		? await authorizedFetch(source, { signal })
+		: await fetch(source, { signal });
 	if (!response.ok) {
 		const error = await readFetchError(response, `HTTP ${response.status}`);
 		throw new ApiError(error.message, response.status, error.data);
 	}
-	const blob = await response.blob();
+	const blob = await readBoundedBlob(
+		response,
+		REMOTE_BUILD ? 8 * 1024 * 1024 : MAX_IMAGE_CLIPBOARD_BLOB_BYTES,
+		signal,
+	);
 	assertBlobSafe(blob);
 	if (blob.type.startsWith("image/")) return blob;
 	return new Blob([blob], { type: "image/png" });
@@ -234,7 +247,8 @@ async function buildSelectionImageSource(
 	}
 	try {
 		const display = normalizeImageSrc(options.imageSrc);
-		if (isInlineImageDataUrl(display)) return display;
+		if (isInlineImageDataUrl(display) && (!REMOTE_BUILD || isRemoteInlineImage(display)))
+			return display;
 	} catch {
 		// 非法 data URL 不能拿来充选区。
 	}

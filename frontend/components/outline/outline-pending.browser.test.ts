@@ -511,8 +511,8 @@ test("the facts view's in-progress marker lists the open tasks under a fact and 
 				),
 			),
 		).toEqual([
-			["In progress", "tabler-icon tabler-icon-square-half", "Check quoting"],
-			["To do", "tabler-icon tabler-icon-square", "Encoding"],
+			["In progress", "tabler-icon tabler-icon-circle-half-2 nf-status", "Check quoting"],
+			["To do", "tabler-icon tabler-icon-circle nf-status", "Encoding"],
 		]);
 		await call(
 			page,

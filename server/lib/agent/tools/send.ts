@@ -12,6 +12,15 @@ const USER_TARGET_DESCRIPTION =
 	"they ever see (Markdown renders, up to 32,000 characters). Use it alone: no agent " +
 	"targets, replyTo, doInterrupt, resume or model.";
 
+const SHOW_TO_USER_DESCRIPTION =
+	"Agent messages only. The person watching this session skims it in an overview where an " +
+	"agent message collapses to one line. Set true when they would want to read this message " +
+	"in full without opening it: a finding, a conclusion, a decision, a blocker, or a hand-off " +
+	"of results. Leave it unset for routine coordination such as assigning or adjusting work. " +
+	"It changes only how the message is displayed: every message stays expandable, and " +
+	"delivery, permissions and the text the recipient reads are the same either way. " +
+	"Ignored for Send({ user }), which always posts to the person's chat.";
+
 const RESUME_DESCRIPTION =
 	"Direct child subagents only: restart a target whose last turn ended with an error. Agent " +
 	"messages alone never restart such a subagent (Send then reports status `blocked` and the " +
@@ -47,6 +56,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 			items: { type: "string" },
 		},
 		message: { description: "Message to send to the target subagent(s).", type: "string" },
+		show_to_user: { description: SHOW_TO_USER_DESCRIPTION, type: "boolean" },
 		doInterrupt: {
 			description:
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
@@ -74,11 +84,18 @@ export const sendTool: ToolDefinition = {
 		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
 		'Subagents may also report progress to the narrator that launched them via "parent" (or "main"). Ordinary asynchronous messages may mix parent and sibling targets in one call; aliases for the same recipient are deduplicated. ' +
 		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. Each target is accepted independently after whole-call authorization; partial failures preserve successful deliveries. " +
+		"Every message wakes its recipient and costs it a turn, so send one only when it carries " +
+		"something the recipient needs in order to act: new information, a changed requirement, a " +
+		'concrete correction, a finding, or a blocker. Acknowledgements, thanks, "still working" ' +
+		"updates and status checks carry none of that, so leave them unsent; to learn what another " +
+		"agent knows or is doing, use ContextAsk, and to wait for its result, use Await. An Await " +
+		"timeout is not a reason to message the agent. Put everything the recipient needs into one " +
+		"message rather than several short ones. " +
+		"The person watching this session skims agent messages as one-line summaries. When a " +
+		"message is one they would want to read in full (a finding, a conclusion, a decision, a " +
+		"blocker, a hand-off of results), set show_to_user: true; routine coordination leaves it " +
+		"unset. It affects display only. " +
 		"Messages have a 256 KiB UTF-8 body limit; larger content must use a file reference or summary. " +
-		"Send may wake the recipient's session and trigger an unnecessary extra agent turn, so send messages only when genuinely necessary. " +
-		"Do not send agents courtesy acknowledgements, redundant progress updates, or messages merely to check status. " +
-		"Use Send for new information, changed requirements, or concrete corrections—not for routine " +
-		"status checks after an Await timeout. Repeated messages can distract a working subagent. " +
 		"Set doInterrupt=true only when the current work must stop immediately; never use it merely " +
 		"because a short wait timed out or you are impatient. " +
 		"Send never waits for an answer: a recipient answers with its own Send, which arrives as a " +
@@ -102,6 +119,7 @@ export const sendTool: ToolDefinition = {
 			.optional()
 			.describe("Target subagent titles, aliases, or unique ID prefixes."),
 		message: z.string().describe("Message to send to the target subagent(s)."),
+		show_to_user: z.boolean().optional().describe(SHOW_TO_USER_DESCRIPTION),
 		user: z.string().optional().describe(USER_TARGET_DESCRIPTION),
 		doInterrupt: z
 			.boolean()
@@ -121,12 +139,14 @@ export const sendTool: ToolDefinition = {
 			name?: string;
 			names?: string[];
 			message?: string;
+			show_to_user?: boolean;
 			user?: string;
 			doInterrupt?: boolean;
 			resume?: boolean;
 			model?: string;
 		};
-		if (raw.user !== undefined) return sendToUser(raw, ctx);
+		// Weak models fill optional strings with ""; only a non-empty user selects bot mode.
+		if (raw.user?.trim()) return sendToUser(raw, ctx);
 		if (!raw.message?.trim()) {
 			return { output: "Error: message is required.", isError: true };
 		}
@@ -145,6 +165,7 @@ export const sendTool: ToolDefinition = {
 				name: raw.name,
 				names: raw.names,
 				message: raw.message,
+				showToUser: raw.show_to_user ?? false,
 				doInterrupt: raw.doInterrupt,
 				resume: raw.resume,
 				model: raw.model,
@@ -225,7 +246,7 @@ async function sendToUser(
 	if (raw.id || raw.ids?.length || raw.name || raw.names?.length) {
 		return { output: "Send error: `user` cannot be combined with agent targets.", isError: true };
 	}
-	if (raw.resume || raw.model !== undefined) {
+	if (raw.resume || raw.model?.trim()) {
 		return {
 			output: "Send error: `user` cannot be combined with resume or model.",
 			isError: true,

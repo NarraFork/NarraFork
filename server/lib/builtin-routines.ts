@@ -61,6 +61,17 @@ export interface BuiltinRoutine {
 export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 	// ── Tools (optional agent tools) ─────────────────────────────────────
 	{
+		id: "image_gen",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "ImageGen",
+			descriptionEn:
+				"Generate images with a selected image model; recover saved responses without generating again",
+			descriptionZh: "使用指定绘图模型生成图片；从已保存响应恢复产物，无需重新生成",
+		},
+	},
+	{
 		id: "terminal",
 		type: "tool",
 		category: "tools",

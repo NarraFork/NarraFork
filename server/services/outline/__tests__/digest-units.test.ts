@@ -249,6 +249,7 @@ function summary(over: Partial<OutlineSpaceSummary> = {}): OutlineSpaceSummary {
 		tasksCreated: 0,
 		tasksStarted: 0,
 		leaseReturned: 0,
+		handedBack: 0,
 		plans: [],
 		reviewComments: 0,
 		questions: [],

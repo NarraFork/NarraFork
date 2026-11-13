@@ -120,6 +120,7 @@ import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
 } from "../lib/file-reference-input";
+import { getNarratorFolderIdForUser } from "../lib/git-identity";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -213,6 +214,7 @@ import {
 	humanAttentionListQuerySchema,
 	migrateBrokenModelNarratorsSchema,
 	narratorExportQuerySchema,
+	narratorExportTurnsQuerySchema,
 	narratorGrantCreateSchema,
 	narratorGrantUpdateSchema,
 	narratorTransferOwnerSchema,
@@ -305,6 +307,7 @@ import {
 	rebuildDeviceFileState,
 } from "../services/file-state-rebuild";
 import {
+	getFolderGitIdentityPick,
 	getNarratorGitIdentityPick,
 	listUserGitIdentities,
 	setNarratorGitIdentityPick,
@@ -352,7 +355,12 @@ import {
 	restoreNarratorDraftPrevious,
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
-import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
+import {
+	buildExportFileName,
+	listNarratorExportTurns,
+	resolveSelectedTurns,
+	streamNarratorExport,
+} from "../services/narrator-export";
 import { getNarratorGitSummary } from "../services/narrator-git-summary";
 import {
 	countNarratorMessageRefs,
@@ -425,6 +433,7 @@ import {
 	readSessionDeliverTo,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
+	refreshCompactContextPercentAfter,
 	reorderBufferedMessages,
 	reprocessAllPendingPermissions,
 	resolveNarratorDefaultDeviceRequest,
@@ -4168,6 +4177,21 @@ narratorRoutes.get("/:id/search", async (c) => {
 });
 
 /**
+ * 导出范围选择弹窗的数据：与导出同一 scope 的轮次摘要。
+ *
+ * 弹窗只列"将要导出的那份内容"里的轮次，所以选到的轮次一定导得出来。客户端关掉弹窗
+ * 时请求被中止，遍历随之停下，不会在主线程上空跑完整段会话。
+ */
+narratorRoutes.get("/:id/export-turns", async (c) => {
+	const parsed = narratorExportTurnsQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const id = c.req.param("id");
+	// 先确认会话存在，再走可能很长的遍历。
+	await narratorService.getById(id);
+	return c.json(await listNarratorExportTurns(id, parsed.data.scope, c.req.raw.signal));
+});
+
+/**
  * Download this narrator's transcript as Markdown or JSON.
  *
  * Streamed rather than buffered: a long history is tens of MB, and serializing it
@@ -4180,12 +4204,15 @@ narratorRoutes.get("/:id/export", async (c) => {
 	const parsed = narratorExportQuerySchema.safeParse(c.req.query());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const options = parsed.data;
+	// 范围在这里挡掉：导出是一份要下载的文件，格式错误不该变成"导出了全部"。
+	// 与服务层共用同一个校验，响应开始前就以 400 失败。
+	resolveSelectedTurns(options.range);
 
 	// Resolve the narrator up front so a bad id is a clean 404 rather than an
 	// attachment whose body happens to contain an error.
 	const narrator = await narratorService.getById(id);
 
-	const fileName = buildExportFileName(narrator.title, options.format);
+	const fileName = buildExportFileName(narrator.title, options.format, new Date(), options.range);
 	// One controller shared by start() and cancel(): a client that closes the tab
 	// mid-download must stop the paging loop, not leave it querying into a void.
 	const abort = new AbortController();
@@ -4815,8 +4842,19 @@ narratorRoutes.patch("/:id/compact/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 	const { summary } = await c.req.json();
 	if (!summary || typeof summary !== "string") throw new ValidationError("summary is required");
-	await narratorService.updateCompactSummary(narratorId, messageId, summary);
-	return c.json({ ok: true });
+	// A summary shared with a fork is copied on write, so the edit may land on a new row:
+	// re-measure that row, never the original the fork still owns.
+	const editedMessageId = await narratorService.updateCompactSummary(
+		narratorId,
+		messageId,
+		summary,
+	);
+	// An edited summary changes how much history the next request carries, and the editor
+	// refetches the detail as soon as this responds: re-measure before answering, or the
+	// client would read back the previous percentage.
+	const locale = await getUserLanguage(c.get("user").sub);
+	await refreshCompactContextPercentAfter(narratorId, editedMessageId, locale);
+	return c.json({ ok: true, messageId: editedMessageId });
 });
 
 // Trigger manual compact
@@ -5342,11 +5380,16 @@ narratorRoutes.patch("/:id/default-device", async (c) => {
 narratorRoutes.get("/:id/git-identity", async (c) => {
 	const userId = c.get("user").sub;
 	const narratorId = c.req.param("id");
-	const [identities, selectedId] = await Promise.all([
+	const [identities, selectedId, folderId] = await Promise.all([
 		listUserGitIdentities(userId),
 		getNarratorGitIdentityPick(userId, narratorId),
+		getNarratorFolderIdForUser(narratorId, userId),
 	]);
-	return c.json({ identities, selectedId });
+	// 会话自己没有 pick 时会跟随它所在的侧栏文件夹：UI 要说清跟的是哪一条身份。
+	const folderSelectedId = folderId
+		? await getFolderGitIdentityPick(userId, folderId).catch(() => null)
+		: null;
+	return c.json({ identities, selectedId, folderSelectedId });
 });
 
 narratorRoutes.put("/:id/git-identity", async (c) => {

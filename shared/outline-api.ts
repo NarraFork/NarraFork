@@ -77,6 +77,63 @@ export interface OutlineSpaceSummary {
 export interface OutlineSpaceDetail extends OutlineSpaceSummary {
 	/** Whether the caller may change the space (and revert its commits). */
 	canWrite: boolean;
+	/**
+	 * A session space's place in the connected outline: the space of the session's project, when
+	 * that space exists and the caller may read the project. Absent or null otherwise (the session
+	 * belongs to no project, or the caller reads it without reading its project).
+	 */
+	parent?: { spaceId: string; label: string | null } | null;
+}
+
+/**
+ * The connected outline (`GET /outline/tree…`): limits of each listing. A node's children are
+ * read when it is opened, a page at a time; nothing here returns block content.
+ */
+export const OUTLINE_TREE_LIMITS = {
+	/** Project spaces per page of the tree's root. */
+	projects: 30,
+	/** Session spaces per page of a group. */
+	sessions: 20,
+	/** Pages of a space per page of its list. */
+	pages: 50,
+	/** Blocks and UTF-8 bytes one opened page reads; what is beyond is read by focusing it. */
+	pageBlocks: 200,
+	pageBytes: 64 * 1024,
+	/** A group counts its spaces up to this many (shown as one less with a plus beyond). */
+	countCap: 100,
+} as const;
+
+/** A space as a row of the connected outline. */
+export interface OutlineTreeSpace extends OutlineSpaceSummary {
+	/** When the space was last committed to; null when never, or not stamped yet. */
+	lastCommitAt: string | null;
+	/**
+	 * A project space: how many session spaces of the project the caller may read, counted up to
+	 * {@link OUTLINE_TREE_LIMITS.countCap}.
+	 */
+	sessions?: number;
+}
+
+/** The root of the connected outline: the caller's own space, then a page of project spaces. */
+export interface OutlineTreeResponse {
+	/** The caller's personal space; null when it does not exist yet, and on later pages. */
+	personal: OutlineTreeSpace | null;
+	/** Project spaces the caller may read, latest commit first. */
+	projects: OutlineTreeSpace[];
+	nextCursor: string | null;
+	/**
+	 * Session spaces the caller may read that hang under no listed project space, and (admins)
+	 * spaces whose owner is gone: counted up to {@link OUTLINE_TREE_LIMITS.countCap}. Zero on
+	 * later pages.
+	 */
+	loose: number;
+	orphaned: number;
+}
+
+/** A page of the session spaces of one group of the connected outline. */
+export interface OutlineTreeSpacesResponse {
+	spaces: OutlineTreeSpace[];
+	nextCursor: string | null;
 }
 
 export interface OutlineSpaceListResponse {
@@ -179,6 +236,11 @@ export interface OutlineViewBlock {
 	 * it (a mark only).
 	 */
 	pending: string[];
+	/**
+	 * On a subagent report's container: the subagent's session title, when the reader may read
+	 * that session (absent otherwise, and past the containers one view names).
+	 */
+	reportFrom?: string;
 }
 
 export interface OutlineBlockViewResponse {
@@ -191,6 +253,11 @@ export interface OutlineBlockViewResponse {
 	current: boolean;
 	/** The view applied: `all` when the root is a task or under one. */
 	view: OutlineViewMode;
+	/**
+	 * The root is under a task or inside a subagent report: its blocks are details, folded by
+	 * default (`shared/outline-fold.ts`). Absent from an older server: false.
+	 */
+	rootInTask?: boolean;
 	/** The root's ancestors, the page first. */
 	path: Array<{ id: string; sid: string; title: string }>;
 	/** The blocks shown, the root first, breadth first. */
@@ -327,7 +394,8 @@ export type OutlineMapLayout = "right" | "down";
  * Limits of `GET/PUT /api/outline/view-state/:pageId`: one person's folding and mind-map
  * direction of one page (design §7.1 `outline_view_state`). Folding is personal and never part
  * of the block model; a page shows at most `maxCollapsed` blocks per view (design §7.2), so more
- * folded ids than that are never needed.
+ * folded ids than that are never needed. `maxCollapsed` bounds the blocks the reader closed and
+ * the blocks they opened TOGETHER (`shared/outline-fold.ts`): one budget, not one each.
  */
 export const OUTLINE_VIEW_STATE_LIMITS = {
 	maxCollapsed: 2000,
@@ -350,7 +418,10 @@ export const OUTLINE_BLOCK_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 /** One person's view state of one page; defaults when they never changed it. */
 export interface OutlineViewStateResponse {
 	pageId: string;
+	/** Blocks the reader closed that the page shows open by default. */
 	collapsed: string[];
+	/** Blocks the reader opened that the page folds by default (`shared/outline-fold.ts`). */
+	expanded: string[];
 	layout: OutlineMapLayout;
 	/** When it was last written; null for the defaults. */
 	updatedAt: string | null;
@@ -358,6 +429,8 @@ export interface OutlineViewStateResponse {
 
 export interface OutlineViewStatePutRequest {
 	collapsed: string[];
+	/** Left out (a client from before the default folding): what is stored is kept. */
+	expanded?: string[];
 	layout: OutlineMapLayout;
 }
 
@@ -368,6 +441,8 @@ export interface OutlineViewStatePutRequest {
 export const OUTLINE_PENDING_API_LIMITS = {
 	/** Tasks one "in progress" marker lists. */
 	inProgressItems: 10,
+	/** Unanswered questions of a page its summary names (the newest). */
+	openQuestions: 200,
 	/** Characters of a rejection's reason. */
 	maxReasonChars: 500,
 } as const;
@@ -413,6 +488,23 @@ export interface OutlinePagePendingResponse {
 	pending: OutlinePendingSummary[];
 	/** Locked tasks of the page. */
 	locks: OutlineLockView[];
+	/**
+	 * Blocks of the page that are questions put to a person and not answered yet (the newest
+	 * {@link OUTLINE_PENDING_API_LIMITS.openQuestions}): the blocks above them are not folded by
+	 * default, and a row the reader folded counts the ones it hides. Absent from an older server.
+	 */
+	questions?: string[];
+}
+
+/** Limits of `GET /spaces/:spaceId/report-authors`: who wrote the subagent reports of a page. */
+export const OUTLINE_REPORT_AUTHORS_API_LIMITS = {
+	/** Report containers one request names. */
+	maxIds: 20,
+} as const;
+
+/** The subagent's session title by report container, for those the reader may be told. */
+export interface OutlineReportAuthorsResponse {
+	authors: Record<string, string>;
 }
 
 /** One block of a pending change: as proposed against, as proposed, and as it is now. */

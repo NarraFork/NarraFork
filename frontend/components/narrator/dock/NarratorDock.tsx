@@ -14,6 +14,7 @@ import { dockPanelId } from "./dock-panel-types";
 import { useNarratorDockContext } from "./NarratorDockContext";
 import type { DockDevice } from "./narrator-dock-layout";
 import { applyNarratorDockLayout, saveNarratorDockLayout } from "./narrator-dock-layout";
+import { bindNarratorDockWco } from "./narrator-dock-wco";
 import { narratorDockComponents, narratorDockTabComponents } from "./panels";
 
 const SAVE_DEBOUNCE_MS = 400;
@@ -82,6 +83,7 @@ export function NarratorDock({ device, thresholds }: NarratorDockProps) {
 			syncChatGroupHeader(api);
 			refreshOpenToolTypes();
 			disposablesRef.current = [
+				...(device === "desktop" ? [bindNarratorDockWco(api, dockPanelId("chat"))] : []),
 				api.onDidLayoutChange(() => {
 					persist();
 					syncChatGroupHeader(api);

@@ -64,6 +64,9 @@ concurrency:
   group: plugin-platform-acceptance-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
 jobs:
   contract-tests:
     name: Plugin contract and vertical-slice tests

@@ -68,6 +68,12 @@ scripts/lib/*
 !scripts/lib/github-release-baseline.ts
 !scripts/lib/github-release-summary.ts
 !scripts/lib/build-repository.ts
+# Local immutable runtime builds reuse release materials without publishing.
+!scripts/build-runtime.ts
+!scripts/lib/build-materials.ts
+!scripts/lib/compiled-build.ts
+!scripts/lib/runtime-compiler.ts
+!scripts/lib/runtime-build-process.ts
 !scripts/lib/update-index*.ts
 # Protected CI update-server bridge and immutable mirror restoration.
 !scripts/lib/update-server-bridge-*.ts
@@ -81,6 +87,20 @@ scripts/lib/*
 # executor, and its manifest builder is imported by scripts/lib/__tests__ and by
 # tests/executor-bootstrap-e2e.test.ts, so both must be in the repo.
 !scripts/release-executor.ts
+# Optional RTC component release sources; binaries stay outside the NF main bundle.
+!scripts/lib/remote-peer-build.ts
+!scripts/lib/remote-peer-release-inputs.ts
+!scripts/lib/remote-peer-release-prepare.ts
+!scripts/lib/main-release-dispatch.ts
+# Dedicated remote frontend build/verification sources, not generated assets.
+!scripts/build-remote-frontend.ts
+!scripts/lib/remote-frontend*.ts
+!scripts/remote-host.ts
+remote-peer/dist/
+# WebRTC M1 entry points are source; private prototype runtime state is not.
+!scripts/webrtc-prototype.ts
+!scripts/generate-webrtc-vectors.ts
+.webrtc-prototype-*/
 # Native Windows ARM64 helper acquisition/cross-build must survive a fresh clone.
 !scripts/prepare-windows-arm64-helpers.ts
 !scripts/prepare-ripgrep-helpers.ts
@@ -127,6 +147,9 @@ drizzle-postgres/meta/_generation.lock/
 drizzle-postgres/meta/_generation_pending.json
 # Canonical SQLite schema generation must be reproducible in fresh clones.
 !scripts/generate-sqlite-migrations.ts
+# The builtin plugin embedding is produced by this script at build time, so a fresh clone
+# (and the cross-platform build that calls it) must have it.
+!scripts/generate-builtin-plugins.ts
 !scripts/check-sqlite-migration-assets.ts
 !scripts/finalize-sqlite-resource-migration.ts
 !scripts/lib/__tests__/finalize-sqlite-resource-migration.test.ts

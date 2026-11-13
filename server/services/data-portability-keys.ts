@@ -7,8 +7,9 @@
  * a step-up check; importing needs the passphrase.
  *
  * Keys are grouped by the exporting instance's owner id: a custom API provider by its id
- * (all its keys, in priority order), NUG providers, TokenDance and Command Code by their
- * namespaced owner ids (one key each). Search providers are not part of a data export.
+ * (all its inference keys, in priority order), site tokens, NUG providers, TokenDance and
+ * Command Code by their namespaced owner ids (one key each). Search providers are not part
+ * of a data export.
  */
 import type { CredentialNetwork } from "@shared/credential-network";
 import { type BundleContents, openBundle, sealBundle } from "../lib/credential-transfer/bundle";
@@ -18,6 +19,7 @@ import {
 	COMMAND_CODE_KEY_OWNER,
 	nugKeyOwner,
 	platformInstanceKeyOwner,
+	quotaKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "../lib/settings/provider-keys-projection";
 
@@ -48,6 +50,7 @@ function ownersOf(providers: ProviderSection): string[] {
 			: [];
 	return [
 		...ids(providers.customApiProviders, (id) => id),
+		...ids(providers.customApiProviders, quotaKeyOwner),
 		...ids(providers.nugProviders, nugKeyOwner),
 		...(providers.tokendance ? [TOKENDANCE_KEY_OWNER] : []),
 		...(providers.commandCode ? [COMMAND_CODE_KEY_OWNER] : []),
@@ -83,7 +86,10 @@ export function collectProviderKeys(providers: ProviderSection): ExportedKeys {
 export function withoutKeys(providers: ProviderSection): ProviderSection {
 	const blank = (list: unknown) =>
 		Array.isArray(list)
-			? list.map((entry) => ({ ...(entry as Record<string, unknown>), apiKey: "" }))
+			? list.map((entry) => {
+					const { quotaAccessToken: _token, ...rest } = entry as Record<string, unknown>;
+					return { ...rest, apiKey: "" };
+				})
 			: list;
 	const out: ProviderSection = { ...providers };
 	if ("customApiProviders" in out) out.customApiProviders = blank(out.customApiProviders);
@@ -156,14 +162,15 @@ export async function openProviderKeys(text: string, passphrase: string): Promis
 export function withFirstKeys(providers: ProviderSection, keys: ExportedKeys): ProviderSection {
 	const out = structuredClone(providers);
 	const first = (owner: string) => keys.get(owner)?.[0]?.apiKey;
-	const fill = (list: unknown, owner: (id: string) => string) => {
+	const fill = (list: unknown, owner: (id: string) => string, field = "apiKey") => {
 		if (!Array.isArray(list)) return;
 		for (const entry of list as Array<Record<string, unknown>>) {
 			const key = typeof entry.id === "string" ? first(owner(entry.id)) : undefined;
-			if (key) entry.apiKey = key;
+			if (key) entry[field] = key;
 		}
 	};
 	fill(out.customApiProviders, (id) => id);
+	fill(out.customApiProviders, quotaKeyOwner, "quotaAccessToken");
 	fill(out.nugProviders, nugKeyOwner);
 	const tokendance = first(TOKENDANCE_KEY_OWNER);
 	if (tokendance && out.tokendance && typeof out.tokendance === "object") {
@@ -198,6 +205,9 @@ export function restoreExtraKeys(
 	const store = getProviderKeyStore();
 	const result = { imported: 0, failed: 0 };
 	for (const [incomingId, localId] of added) {
+		// The site's single token was stored by settings under the remapped quota owner.
+		// Count it only for added providers, never merge it into the inference-key list.
+		if (keys.get(quotaKeyOwner(incomingId))?.length) result.imported += 1;
 		const list = keys.get(incomingId);
 		if (!list?.length) continue;
 		const stored = store.list(localId);

@@ -33,10 +33,13 @@
  */
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
+import type { Locale } from "@server/lib/prompt-i18n";
 import { compareOrderKeys, isAlias, parseAddress, serializeBody } from "@shared/outline";
+import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { readDisplayNames } from "./access-reads";
 import { OutlineLeaseNotExpiredError } from "./errors";
 import { isOutlineEnabled } from "./feature";
+import { type OutlineHandoffSubject, planOutlineHandoffs } from "./handoff";
 import { OUTLINE_TEXT } from "./messages";
 import {
 	OUTLINE_LIMITS,
@@ -218,13 +221,32 @@ export function outlineSessionEndedNote(
 	narratorId: string,
 	title: string | null,
 	reason: OutlineSessionEnd,
+	locale: Locale = "en",
 ): string {
+	if (reason === "reverted") {
+		const text = OUTLINE_SESSION_REVERTED_NOTE[locale === "zh-CN" ? "zh-CN" : "en"];
+		return sessionNote(text.lead(title), narratorId, text.tail);
+	}
 	return sessionNote(
 		OUTLINE_TEXT.sessionEnded.lead(reason, title),
 		narratorId,
 		OUTLINE_TEXT.sessionEnded.tail,
 	);
 }
+
+/** The note under a task reopened because its session was moved back to Dynamic Spec (12b2). */
+const OUTLINE_SESSION_REVERTED_NOTE = {
+	en: {
+		lead: (title: string | null) =>
+			`An administrator moved the previous executor's session back to Dynamic Spec (session ${title ? `"${title}" ` : ""}`,
+		tail: "); the task is open again.",
+	},
+	"zh-CN": {
+		lead: (title: string | null) =>
+			`管理员把之前执行它的会话退回了 Dynamic Spec（会话 ${title ? `「${title}」` : ""}`,
+		tail: "），任务重新开放。",
+	},
+} as const;
 
 function sessionNote(lead: string, narratorId: string, tail: string): string {
 	return serializeBody({
@@ -299,19 +321,59 @@ export async function expireOutlineTaskLeases(
 	const names = await holderNames([
 		...new Set(expired.map((e) => e.claim.holderNarratorId as string)),
 	]);
+	// A task of a project space comes back with a handoff, as one given back at a run's end does
+	// (outline P2 PR 10c-2); any other task with the plain note.
+	const handoffs = await leaseHandoffs(store, expired, nowDate);
 	return await reopenTasks(
 		store,
 		expired.map(({ claim, spaceId }) => {
 			const holder = claim.holderNarratorId as string;
+			const handoff = handoffs.get(claim.taskBlockId);
 			return {
 				taskBlockId: claim.taskBlockId,
 				spaceId,
 				note: outlineLeaseExpiredNote(holder, names.get(holder) ?? null),
+				...(handoff ? { ops: handoff.ops, clearAssignee: handoff.clearAssignee } : {}),
 			};
 		}),
 		nowDate,
 		{ summary: OUTLINE_TEXT.leaseExpiredSummary },
 	);
+}
+
+/**
+ * Whether sessions run on this store (they do not on PostgreSQL): where they do not, nothing of
+ * the release and handoff of outline P2 PR 10c-2 happens, and the lease job writes what it
+ * always wrote. A binding that cannot be resolved counts as "no".
+ */
+export function outlineSessionsRunHere(): boolean {
+	try {
+		return !getNarratorMessageRefsPort();
+	} catch {
+		return false;
+	}
+}
+
+/** The handoffs of expired claims on tasks of project spaces; none when they cannot be planned. */
+async function leaseHandoffs(
+	store: OutlineStore,
+	expired: ReadonlyArray<{ claim: OutlineTaskClaimRow; spaceId: string }>,
+	at: Date,
+): Promise<Awaited<ReturnType<typeof planOutlineHandoffs>>> {
+	if (!outlineSessionsRunHere()) return new Map();
+	try {
+		const spaces = new Map<string, OutlineSpaceRow | null>();
+		for (const spaceId of new Set(expired.map((e) => e.spaceId)))
+			spaces.set(spaceId, await store.getSpace(spaceId));
+		const subjects = expired.flatMap(({ claim, spaceId }): OutlineHandoffSubject[] => {
+			const space = spaces.get(spaceId);
+			return space?.kind === "project" ? [{ claim, space }] : [];
+		});
+		return await planOutlineHandoffs(store, subjects, { reason: "lease", at });
+	} catch (error) {
+		logger.warn("Outline lease expiry: handoffs unavailable", { error: String(error) });
+		return new Map();
+	}
 }
 
 /** Where the next scan for tasks nobody holds starts (in memory; a restart starts over). */
@@ -349,7 +411,11 @@ export async function reopenUnclaimedOutlineTasks(
 	);
 }
 
-export type OutlineSessionEnd = "archived" | "deleted";
+/**
+ * Why a session's claims are let go at once: it was archived or deleted, or (outline P2 PR 12b2)
+ * an administrator moved it back to Dynamic Spec, where it no longer works on outline tasks.
+ */
+export type OutlineSessionEnd = "archived" | "deleted" | "reverted";
 
 /**
  * A session was archived or deleted: what it and its subagents hold is let go at once, not when
@@ -369,7 +435,15 @@ export type OutlineSessionEnd = "archived" | "deleted";
 export async function releaseOutlineSessionTaskClaims(
 	narratorId: string,
 	reason: OutlineSessionEnd,
-	options: { store?: OutlineStore; now?: Date; title?: string | null } = {},
+	options: {
+		store?: OutlineStore;
+		now?: Date;
+		title?: string | null;
+		/** The note's language (the move back writes the owner's; the others English). */
+		locale?: Locale;
+		/** The system actor of the commits (the lease job's by default). */
+		actor?: string;
+	} = {},
 ): Promise<OutlineLeaseExpiryResult> {
 	const store = options.store ?? outlineStore;
 	const nowDate = options.now ?? new Date();
@@ -390,7 +464,7 @@ export async function releaseOutlineSessionTaskClaims(
 				options.title !== undefined
 					? options.title
 					: ((await holderNames([narratorId])).get(narratorId) ?? null);
-			note = outlineSessionEndedNote(narratorId, title, reason);
+			note = outlineSessionEndedNote(narratorId, title, reason, options.locale);
 		}
 		const sessions = [narratorId, ...new Set(held.map((e) => e.claim.holderNarratorId as string))];
 		const done = await reopenTasks(
@@ -401,7 +475,11 @@ export async function releaseOutlineSessionTaskClaims(
 				note: note as string,
 			})),
 			nowDate,
-			{ sessions, summary: (n) => OUTLINE_TEXT.sessionEndedSummary(reason, n) },
+			{
+				sessions,
+				summary: (n) => OUTLINE_TEXT.sessionEndedSummary(reason, n),
+				...(options.actor ? { actor: options.actor } : {}),
+			},
 		);
 		result.reopened += done.reopened;
 		result.skipped += done.skipped;
@@ -470,11 +548,18 @@ function resting(taskId: string, nowMs: number): boolean {
 	return (expiryBackoff.get(taskId)?.until ?? 0) > nowMs;
 }
 
-interface Reopening {
+export interface Reopening {
 	taskBlockId: string;
 	spaceId: string;
 	/** The block written last under the task: why it is open again. */
 	note: string;
+	/**
+	 * Written in place of `note` (a handoff, `handoff.ts`; none at all for a task under another
+	 * one given back with it). When they cannot be written, the task is reopened without them.
+	 */
+	ops?: readonly OutlineOp[];
+	/** The task's assignment (to the session giving it back, by name) is cleared with it. */
+	clearAssignee?: boolean;
 }
 
 /**
@@ -484,7 +569,7 @@ interface Reopening {
  * is written task by task, a task that cannot take its note is reopened without it, and one that
  * cannot be reopened at all is left alone for a while (`failed`, logged once).
  */
-async function reopenTasks(
+export async function reopenTasks(
 	store: OutlineStore,
 	items: readonly Reopening[],
 	nowDate: Date,
@@ -492,6 +577,10 @@ async function reopenTasks(
 		/** Sessions whose claims are released whatever their lease (archived or deleted). */
 		sessions?: readonly string[];
 		summary: (n: number) => string;
+		/** The system actor of the commits; the lease job's by default. */
+		actor?: string;
+		/** The person the commits are written for (a session's owner giving its tasks back). */
+		responsibleUserId?: string | null;
 	},
 ): Promise<OutlineLeaseExpiryResult> {
 	const now = nowDate.toISOString();
@@ -507,9 +596,10 @@ async function reopenTasks(
 			const setTodo: OutlineOp = {
 				op: "setTask",
 				block: { id: item.taskBlockId },
-				task: { status: "todo" },
+				task: { status: "todo", ...(item.clearAssignee ? { assignee: null } : {}) },
 			};
 			if (!withNote) return [setTodo];
+			if (item.ops) return [setTodo, ...item.ops];
 			return [
 				setTodo,
 				{
@@ -524,8 +614,8 @@ async function reopenTasks(
 			{
 				spaceId,
 				ops,
-				actor: { kind: "system", id: OUTLINE_LEASE_ACTOR },
-				responsibleUserId: null,
+				actor: { kind: "system", id: how.actor ?? OUTLINE_LEASE_ACTOR },
+				responsibleUserId: how.responsibleUserId ?? null,
 				summary: how.summary(batch.length),
 			},
 			{

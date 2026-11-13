@@ -25,8 +25,9 @@ const PANEL = readFileSync(join(import.meta.dir, "NarratorPanel.tsx"), "utf8");
 
 /** The drawer block, so these assertions cannot pass by matching another drawer. */
 const DRAWER = (() => {
-	const start = PANEL.indexOf("{internalFileViewerPath && (");
-	if (start === -1) throw new Error("internal file viewer drawer not found");
+	const gate = /\{\s*!REMOTE_BUILD\s*&&\s*internalFileViewerPath\s*&&\s*\(/.exec(PANEL);
+	if (!gate) throw new Error("remote-gated internal file viewer drawer not found");
+	const start = gate.index;
 	const end = PANEL.indexOf("</Drawer>", start);
 	if (end === -1) throw new Error("drawer end not found");
 	return PANEL.slice(start, end);

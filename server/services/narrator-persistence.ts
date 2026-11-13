@@ -1938,6 +1938,69 @@ const sqliteNarratorPersistence = {
 		);
 	},
 
+	/**
+	 * Record the context-window occupancy a compact marker actually changed.
+	 *
+	 * `before` is the narrator's own history footprint when the compact started and
+	 * `after` the footprint once the summary was committed. Both are display metadata
+	 * only — they never feed the agent loop — so a declined write costs a label, not a
+	 * compact. The summary model's own request occupancy is a different number (a
+	 * different model's window) and must never be stored here.
+	 */
+	async setCompactContextPercent(
+		narratorId: string,
+		messageId: string,
+		patch: { before?: number | null; after?: number | null },
+	) {
+		const before =
+			typeof patch.before === "number" && Number.isFinite(patch.before) ? patch.before : undefined;
+		const after =
+			typeof patch.after === "number" && Number.isFinite(patch.after) ? patch.after : undefined;
+		if (before == null && after == null) return null;
+		return db.transaction((tx) => {
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns({ id: true, contentJson: true }),
+						where: and(
+							eq(narratorMessages.id, messageId),
+							eq(narratorMessages.narratorId, narratorId),
+							eq(narratorMessages.role, "system"),
+						),
+					})
+					.sync(),
+			);
+			if (!msg) return null;
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+					columns: { seq: true },
+				})
+				.sync();
+			if (!ref) return null;
+
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const index = blocks.findIndex((block) => parseCompactMessageBlock(block) != null);
+			if (index < 0) return null;
+			const nextBlocks = [...blocks];
+			nextBlocks[index] = {
+				...(blocks[index] as Record<string, unknown>),
+				...(before != null ? { contextPercentBefore: before } : {}),
+				...(after != null ? { contextPercentAfter: after } : {}),
+			};
+			const written = writeEnvelopeBody(tx, messageId, nextBlocks, {
+				set: { contextCharsJson: measureMessageCharacters("system", nextBlocks) },
+				where: eq(narratorMessages.narratorId, narratorId),
+			});
+			if (!written) return null;
+			const updated = readEnvelope(tx, messageId);
+			return updated ? { ...updated, seq: ref.seq } : null;
+		});
+	},
+
 	async prepareFailedCompactRetry(narratorId: string, messageId: string, model?: string) {
 		const now = new Date().toISOString();
 		const selectedModel = model?.trim() || settings.agent.summaryModel;
@@ -2260,7 +2323,12 @@ const sqliteNarratorPersistence = {
 			);
 			const compactBlock = {
 				...finished,
-				...(status === "compacted" ? { summary, contextPercentAfter: contextPercent } : {}),
+				// `contextPercent` is what the summary model's own request occupied on ITS
+				// window — not what this compact left in the narrator's. The real `after` is
+				// estimated from the rebuilt history once the summary is committed and is
+				// written back through `setCompactContextPercent`; storing the summary model's
+				// number here would publish a percentage of the wrong window.
+				...(status === "compacted" ? { summary } : {}),
 				...(status === "compacted" && options?.epoch ? { epoch: options.epoch } : {}),
 			};
 			const failureText = truncateCompactError(options?.error ?? "Compact failed");
@@ -2550,10 +2618,16 @@ const sqliteNarratorPersistence = {
 			| {
 					type: "image_generation";
 					id: string;
+					status?: string;
+					error?: string;
+					errorCode?: string;
 					revisedPrompt?: string;
 					outputIndex?: number;
 					savedPath?: string;
 					result?: string;
+					partialSavedPath?: string;
+					partialImageIndex?: number;
+					partialImageB64?: string;
 					width?: number;
 					height?: number;
 			  },

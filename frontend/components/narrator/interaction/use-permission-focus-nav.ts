@@ -1,6 +1,7 @@
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
+import { enterOwnedByTarget, inActivePermButtonBar } from "./enter-ownership";
 
 /** Value shape published on PermEnterHintCtx (see tool-call-contexts). */
 export interface PermEnterHintCtxValue {
@@ -136,6 +137,18 @@ export function usePermissionFocusNav(
 			}
 
 			if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
+				// Enter belongs to the permission where nothing else owns it: the page itself, the
+				// empty composer (whose own handler prevents the newline and hands it over), and the
+				// permission's own button row — there it runs the highlighted decision whichever
+				// button has the focus (the row keeps the two together, `PermButtonBar`), and the
+				// native click of the focused one is prevented. Any other control — a plan tree's
+				// toggle, "View changes", a link, a tab — keeps its Enter, as does a key a handler
+				// already took, and everything while a modal dialog is open.
+				const composer = !!target && !!composerRef.current?.ownsTextarea(target);
+				if (!composer && !inActivePermButtonBar(target)) {
+					if (e.defaultPrevented) return;
+					if (enterOwnedByTarget(target, document)) return;
+				}
 				const action = permActionsRef.current[effectiveFocusIndex];
 				if (!action) return;
 				e.preventDefault();

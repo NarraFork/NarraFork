@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
 	type MirrorSnapshotV1,
+	mirrorAssetLimit,
 	mirrorAssetsForTarget,
 	parseMirrorAssetDescriptor,
 	parseMirrorAvailability,
@@ -99,6 +100,25 @@ test("raw asset admission rejects full binary kinds, traversal and per-kind byte
 			size: 1024 * 1024 + 1,
 		}),
 	).toThrow();
+});
+test("remote peer binaries retain the shared 32 MiB limit and mandatory canonical descriptors", () => {
+	const asset = {
+		kind: "remote-peer-binary" as const,
+		name: "narrafork-remote-peer-0.1.0-alpha.1-linux-amd64",
+		version: "0.1.0-alpha.1",
+		platform: "linux-amd64",
+		size: 32 * 1024 * 1024,
+		sha256: "a".repeat(64),
+	};
+	expect(mirrorAssetLimit("remote-peer-binary")).toBe(32 * 1024 * 1024);
+	expect(parseMirrorAssetDescriptor(asset)).toEqual(asset);
+	for (const change of [
+		{ size: asset.size + 1 },
+		{ kind: "remote-peer" },
+		{ platform: undefined },
+		{ sha256: "" },
+	])
+		expect(() => parseMirrorAssetDescriptor({ ...asset, ...change })).toThrow();
 });
 test("availability permits an empty local projection but rejects invented/mismatched assets and authorities", () => {
 	const s = fixture();

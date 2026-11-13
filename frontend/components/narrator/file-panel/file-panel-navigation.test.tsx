@@ -140,7 +140,18 @@ describe("isolated child file navigation", () => {
 		);
 		expect(panel).toContain("const navigation = useFilePanelNavigationReceiver();");
 		expect(panel).toContain("const dockOpenFilePanel = navigation.openFilePanel;");
-		expect(panel).toContain("const useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview;");
+		const gate = /const useInternalViewer\s*=\s*([^;]+);/.exec(panel)?.[1];
+		if (!gate) throw new Error("Internal file-viewer capability gate missing");
+		const internalViewerEnabled = new Function(
+			"REMOTE_BUILD",
+			"dockOpenFilePanel",
+			"isWorkspacePreview",
+			`return Boolean(${gate});`,
+		) as (remote: boolean, host: FilePanelOpener | undefined, preview: boolean) => boolean;
+		expect(internalViewerEnabled(false, undefined, false)).toBe(true);
+		expect(internalViewerEnabled(false, undefined, true)).toBe(false);
+		expect(internalViewerEnabled(false, (() => {}) as FilePanelOpener, false)).toBe(false);
+		expect(internalViewerEnabled(true, undefined, false)).toBe(false);
 		expect(panel).toContain("fileReferenceApi.resolve(narratorId, [target], controller.signal)");
 	});
 });

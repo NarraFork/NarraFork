@@ -214,6 +214,21 @@ describe("measureReasoningCountLine (L1/L2) — single fixed row", () => {
 });
 
 describe("measureActivityTrace (L1/L2)", () => {
+	it("keeps auxiliary failures discoverable behind both folds without expanding their logs", async () => {
+		const { measureActivityTrace } = await liveToolRun();
+		const items = toolRows(12).map((row, index) => ({
+			...row,
+			status: index === 0 ? "fail" : "success",
+			identity: { messageId: `event-${index}`, blockIndex: 0, auxiliary: true as const },
+		}));
+		const folded = measureActivityTrace(items, 600, { collapsed: true });
+		expect(folded.header.failureCount).toBe(1);
+		expect(folded.rows).toHaveLength(0);
+		const visible = measureActivityTrace(items, 600);
+		expect(visible.toggle?.failureCount).toBe(1);
+		expect(visible.rows).toHaveLength(10);
+		expect(visible.rows.every((row) => !row.expanded)).toBe(true);
+	});
 	it("L2 (default) → min(N,10) rows and NO header band", async () => {
 		// The band is dropped once the rows are on screen: "Activity · 0 reasoning · 4
 		// tools" above four rows that each name their own tool is a fixed per-turn cost

@@ -295,6 +295,7 @@ export const OUTLINE_TASK_SOURCE_SCENARIOS: OutlineScenario[] = [
 			const parser = await taskState(id, "Write the parser");
 			const waiting = await taskState(id, "Waiting on access");
 			const printer = await taskState(id, "Write the printer");
+			const docs = await taskState(id, "Write the docs");
 			const pre = prerequisites.get(id);
 			const source = await taskSourceForNarrator(id);
 			expect(await source.contextParts("en")).toEqual([
@@ -317,6 +318,13 @@ export const OUTLINE_TASK_SOURCE_SCENARIOS: OutlineScenario[] = [
 						waiting: [{ address: waiting.address, title: "Waiting on access" }],
 						next: [{ address: printer.address, title: "Write the printer" }],
 						counts: { doing: 1, waiting: 1, todo: 2 },
+						// Every open task by address under its state (the unlisted to-do too): what
+						// the view's next update is compared with to say what changed.
+						states: {
+							doing: [parser.address],
+							waiting: [waiting.address],
+							todo: [printer.address, docs.address],
+						},
 					},
 				},
 			]);

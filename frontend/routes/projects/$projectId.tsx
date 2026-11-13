@@ -1,7 +1,7 @@
+import { ProjectSessionList } from "@frontend/components/project/ProjectSessionList";
 import {
 	Alert,
 	Button,
-	Card,
 	Group,
 	Loader,
 	SegmentedControl,
@@ -12,14 +12,13 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconListTree } from "@tabler/icons-react";
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Component, lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import { installProjectAccessListener } from "../../hooks/useProjectAccess";
 import { useProject } from "../../hooks/useProjects";
-import { api } from "../../lib/api";
 import { describeApiError } from "../../lib/api-error";
 import { useOpenOutlinePage } from "../../lib/outline-router";
 
@@ -75,16 +74,6 @@ function ProjectPage() {
 		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
 		onError: (error) =>
 			notifications.show({ color: "red", message: describeApiError(error, t).message }),
-	});
-	const sessions = useInfiniteQuery({
-		queryKey: ["narrators", "project", projectId],
-		queryFn: ({ pageParam }) =>
-			api.listNarratorsPaginated({ projectId, limit: 30, cursor: pageParam }),
-		initialPageParam: undefined as string | undefined,
-		getNextPageParam: (page) => page.nextCursor ?? undefined,
-		// The request needs only projectId; start it in parallel with the project detail.
-		enabled: !project.isError,
-		gcTime: 60_000,
 	});
 	if (project.isError || (!project.isLoading && !project.data))
 		return <Alert color="red">{t("compatibility.unavailable")}</Alert>;
@@ -148,54 +137,15 @@ function ProjectPage() {
 									view: "all",
 								})
 							}
+							onOpenSession={(narratorId) =>
+								void navigate({ to: "/narrators/$narratorId", params: { narratorId } })
+							}
 						/>
 					</Suspense>
 				</ProjectToolsBoundary>
 			)}
 			{!showTasks && <Title order={4}>{t("compatibility.sessions")}</Title>}
-			{!showTasks && sessions.isLoading && <Loader size="sm" />}
-			{!showTasks && sessions.isError && (
-				<Alert color="red">{t("compatibility.sessionsUnavailable")}</Alert>
-			)}
-			{!showTasks &&
-				!sessions.isError &&
-				sessions.data?.pages
-					.flatMap((page) => page.items)
-					.map((session) => (
-						<Card key={session.id} withBorder>
-							<Group justify="space-between">
-								<Stack gap={2}>
-									<Text>{session.title || session.id}</Text>
-									<Text size="xs" c="dimmed">
-										{session.cwd}
-									</Text>
-								</Stack>
-								<Link
-									to="/narrators/$narratorId"
-									params={{ narratorId: session.id }}
-									style={{ textDecoration: "none" }}
-								>
-									<Button component="span" variant="light">
-										{t("compatibility.openSession")}
-									</Button>
-								</Link>
-							</Group>
-						</Card>
-					))}
-			{!showTasks &&
-				sessions.isSuccess &&
-				sessions.data.pages.every((page) => page.items.length === 0) && (
-					<Text c="dimmed">{t("compatibility.noSessions")}</Text>
-				)}
-			{!showTasks && sessions.hasNextPage && (
-				<Button
-					variant="light"
-					loading={sessions.isFetchingNextPage}
-					onClick={() => void sessions.fetchNextPage()}
-				>
-					{t("compatibility.loadMore")}
-				</Button>
-			)}
+			{!showTasks && <ProjectSessionList projectId={projectId} enabled={!project.isError} />}
 			<details onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
 				<summary>{t("advancedSettings")}</summary>
 				{settingsOpen && (

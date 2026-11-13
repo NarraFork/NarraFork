@@ -1180,6 +1180,9 @@ async function applySpecForkCarryover(
  */
 async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void> {
 	try {
+		// An outline session's tasks are not in Dynamic Spec (outline P2 PR 12a): a card would
+		// point at spec tasks it does not use (and reading them would create a spec namespace).
+		if ((await readTaskBackend(narratorId)) === "outline") return;
 		const summary = await specVfsService.summarizeSpecTasks(narratorId);
 		if (summary.total <= 0) return;
 		await narratorPersistence.persistDisplayMessage(narratorId, "", [
@@ -3314,6 +3317,8 @@ export const narratorService = {
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),
 	deleteBlocks: narratorMessageQueries.deleteBlocks.bind(narratorMessageQueries),
 	updateCompactSummary: narratorMessageQueries.updateCompactSummary.bind(narratorMessageQueries),
+	isCompactAfterRemeasurable:
+		narratorMessageQueries.isCompactAfterRemeasurable.bind(narratorMessageQueries),
 	getPendingPermissions: narratorMessageQueries.getPendingPermissions.bind(narratorMessageQueries),
 
 	// ── Delegated methods (from narratorPersistence) ───────────────────────────
@@ -3322,6 +3327,7 @@ export const narratorService = {
 	persistSystemMessage: narratorPersistence.persistSystemMessage.bind(narratorPersistence),
 	persistDisplayMessage: narratorPersistence.persistDisplayMessage.bind(narratorPersistence),
 	persistCompactingMessage: narratorPersistence.persistCompactingMessage.bind(narratorPersistence),
+	setCompactContextPercent: narratorPersistence.setCompactContextPercent.bind(narratorPersistence),
 	prepareFailedCompactRetry:
 		narratorPersistence.prepareFailedCompactRetry.bind(narratorPersistence),
 	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),

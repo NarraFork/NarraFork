@@ -18,6 +18,7 @@ import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import type { MediaContentBlock, NativeMediaInput } from "@shared/media-attachments";
 import { logger } from "../logger";
 import {
+	getOutlineSpecMovedHint,
 	getOutlineSpecUnavailableHint,
 	getToolMessage,
 	getToolMessageWithParams,
@@ -31,6 +32,7 @@ import {
 	toolNamesSpecPath,
 	toolSpecPathError,
 } from "../spec-uri";
+import { withSqlTraceSpan } from "../sql-trace";
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
@@ -92,6 +94,8 @@ export interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Already saved image assets; never re-decode these through the upload lane. */
+	imageRefs?: ToolResult["imageRefs"];
 	media?: NativeMediaInput[];
 	mediaRefs?: MediaContentBlock[];
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
@@ -774,24 +778,40 @@ export function getReflectionToolRejection(
  * outline session has no Dynamic Spec (plan §3), so instead of reading or writing one it can no
  * longer see, the call is answered with where its tasks, notes and behavior boundary are. That
  * includes `spec://behavior_fence`: the session's boundary is the behavior page of its session
- * space (plan PR 4), which the system keeps in its context. Spec sessions pass.
+ * space (plan PR 4), which the system keeps in its context. Spec sessions pass. A session the
+ * Dynamic Spec import moved (`specImported`) is told where its old files went instead.
  */
 export function getOutlineSpecRejection(
 	tu: AgentToolUse,
-	config: Pick<AgentConfig, "taskBackend" | "locale">,
+	config: Pick<AgentConfig, "taskBackend" | "locale" | "specImported">,
 ): ToolExecResult | undefined {
 	if (config.taskBackend !== "outline" || !toolNamesSpecPath(tu.name, tu.input)) return undefined;
+	const locale = (config.locale as Locale) ?? "en";
 	return {
-		output: getOutlineSpecUnavailableHint((config.locale as Locale) ?? "en"),
+		// A session the import moved: where its old files went (outline P2 PR 12b2).
+		output: config.specImported
+			? getOutlineSpecMovedHint(locale)
+			: getOutlineSpecUnavailableHint(locale),
 		isError: true,
 		durationMs: 0,
 	};
 }
 
-export async function executeTool(
+export function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
+): Promise<ToolExecResult> {
+	// SQL tracing (NF_SQL_TRACE): statements run by this tool call are attributed to it.
+	return withSqlTraceSpan("tool", `tool ${tu.name}`, { narratorId: config.narratorId }, () =>
+		executeToolUntraced(tu, config, options),
+	);
+}
+
+async function executeToolUntraced(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	options: ExecuteToolOptions,
 ): Promise<ToolExecResult> {
 	const reflectionRejection = getReflectionToolRejection(tu, config);
 	if (reflectionRejection) {
@@ -1774,6 +1794,7 @@ export async function executeTool(
 							pipelineCapturedBytes: captured.capture.bytes,
 						}),
 						images: result.images,
+						imageRefs: result.imageRefs,
 						media: result.media,
 						mediaRefs: result.mediaRefs,
 						updatedInput: redirectedInput,
@@ -1795,6 +1816,7 @@ export async function executeTool(
 					completedAt: Date.now(),
 					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
+					imageRefs: result.imageRefs,
 					media: result.media,
 					mediaRefs: result.mediaRefs,
 					updatedInput: redirectedInput,
@@ -1813,6 +1835,7 @@ export async function executeTool(
 				completedAt: Date.now(),
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
+				imageRefs: result.imageRefs,
 				media: result.media,
 				mediaRefs: result.mediaRefs,
 				updatedInput: redirectedInput,

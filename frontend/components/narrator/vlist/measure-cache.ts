@@ -31,6 +31,7 @@
  */
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import { type PlanTreeView, planTreeViewSignature } from "@shared/outline-plan-tree";
 import type { MeasuredElement } from "./prepared-block";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,6 +61,11 @@ export function retainedBodySourceChars(value: unknown): number {
 	chars += typeof preview?.sourceText === "string" ? preview.sourceText.length : 0;
 	for (const key of ["displayText", "sourceText"] as const)
 		chars += typeof item[key] === "string" ? item[key].length : 0;
+	// An outline plan's tree retains its plan's markdown (the viewer's, the tree parsed from it).
+	if (model?.kind === "plan-tree") {
+		const markdown = model.markdown as { text?: unknown } | undefined;
+		chars += typeof markdown?.text === "string" ? markdown.text.length : 0;
+	}
 	if (model?.kind === "capped") {
 		chars += typeof model.text === "string" ? model.text.length : 0;
 		const doc = model.diffDocument as
@@ -294,6 +300,10 @@ export function extractDataRevision(data: unknown): string | undefined {
 		"createdAt",
 	] as const) {
 		if (typeof d[key] === "string") rev += `|${key}:${textSignature(d[key])}`;
+	}
+	if (d.contentRole === "auxiliary") {
+		rev += `|aux:${String(d.sourceStatus ?? "")}:${textSignature(String(d.toolName ?? ""))}:${textSignature(String(d.summary ?? ""))}:${String(d.category ?? "")}`;
+		rev += `|at:${JSON.stringify(d.target ?? null)}`;
 	}
 	if (d.creator && typeof d.creator === "object") {
 		const creator = d.creator as Record<string, unknown>;
@@ -567,6 +577,13 @@ function traceRevision(d: Record<string, unknown>): string {
 		// identity the moment its turn persists, and a stale entry would serve rows with
 		// no `data-nf-unit`, silently costing exactly the morph it exists to enable.
 		if (typeof r.unitId === "string") rev += `|tu:${r.unitId}`;
+		if (typeof r.cardKind === "string") rev += `|tck:${r.cardKind}`;
+		if (r.identity && typeof r.identity === "object") {
+			const auxiliary = r.identity as Record<string, unknown>;
+			if (auxiliary.auxiliary === true) {
+				rev += `|aux:${textSignature(String(auxiliary.modelFacing ?? ""))}:${JSON.stringify(auxiliary.target ?? null)}`;
+			}
+		}
 		if (typeof r.title === "string") rev += `|tt:${textSignature(r.title)}`;
 		if (typeof r.status === "string") rev += `|ts:${r.status}`;
 		// A gate's status is height-neutral but PAINTED from the cached payload (it picks
@@ -613,6 +630,9 @@ function traceRevision(d: Record<string, unknown>): string {
 		if (r.card != null && typeof r.card === "object") {
 			const card = r.card as Record<string, unknown>;
 			if (typeof card.status === "string") rev += `|tds:${card.status}`;
+			if (card.contentRole === "auxiliary") {
+				rev += `|auxcard:${textSignature(String(card.toolName ?? ""))}:${textSignature(String(card.summary ?? ""))}:${String(card.category ?? "")}:${String(card.sourceStatus ?? "")}`;
+			}
 			// The live form's reserve: appears/disappears with the request and grows
 			// with the painted height, while status and key can stay put.
 			rev += permissionFormRevision(card.permissionForm);
@@ -990,6 +1010,19 @@ function leafTextRevision(d: Record<string, unknown>): string {
 			})
 			.join(";")}`;
 	}
+	// An outline plan's tree (plan readability): its rows follow the plan's text (the markdown
+	// it was parsed from), the reader's view of it (which nodes, subtrees and texts are open) and
+	// the preview labels. O(1) in the plan: the text is sampled, the view is what the reader
+	// clicked.
+	if (d.kind === "plan-tree") {
+		const markdown = d.markdown as { text?: unknown } | undefined;
+		rev += `|ptx:${textSignature(String(markdown?.text ?? ""))}`;
+		const view = d.view as PlanTreeView | undefined;
+		if (view) rev += `|ptv:${planTreeViewSignature(view)}`;
+		// The preview's labels share its line: a different language lays it out again.
+		const labels = d.labels as { more?: unknown; one?: unknown } | undefined;
+		if (labels) rev += `|ptl:${String(labels.more)}|${String(labels.one)}`;
+	}
 	// A change list (outline cards): one fixed line per row, so the row count above sets the
 	// height, but the rows' words, links and chips are painted from the cached payload and can
 	// change at the same count (a display landing on a live patch). Bounded: at most 24 short rows.
@@ -1057,6 +1090,7 @@ function leafTextRevision(d: Record<string, unknown>): string {
 			const e = entry as Record<string, unknown>;
 			if (typeof e.title === "string") rev += `|et:${textSignature(e.title)}`;
 			if (typeof e.snippet === "string") rev += `|es:${textSignature(e.snippet)}`;
+			if (e.target) rev += `|etarget:${JSON.stringify(e.target)}`;
 		}
 	}
 	// Ask replay: an AskUserQuestion card keeps its spec.key across the whole

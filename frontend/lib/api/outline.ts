@@ -14,6 +14,7 @@ import type {
 	OutlinePlanDecisionResponse,
 	OutlinePlanDiffResponse,
 	OutlineQuestionGroupResponse,
+	OutlineReportAuthorsResponse,
 	OutlineResolveResponse,
 	OutlineRevertResponse,
 	OutlineSearchResponse,
@@ -22,6 +23,8 @@ import type {
 	OutlineSpaceListResponse,
 	OutlineSpaceResolveResponse,
 	OutlineTimelineResponse,
+	OutlineTreeResponse,
+	OutlineTreeSpacesResponse,
 	OutlineViewMode,
 	OutlineViewStatePutRequest,
 	OutlineViewStateResponse,
@@ -33,14 +36,23 @@ import type {
 	OutlineDigestUndoResponse,
 } from "@shared/outline-digest";
 import type {
+	OutlineSpecImportAdminPage,
+	OutlineSpecImportAdminState,
+	OutlineSpecImportRevertResult,
+	OutlineSpecImportStatus,
+} from "@shared/outline-spec-import";
+import type {
 	NarratorCurrentTaskResponse,
 	OutlineBoardAddRequest,
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardOpenSessionRequest,
+	OutlineBoardOpenSessionResponse,
 	OutlineBoardSeenRequest,
 	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
 	OutlineBoardTaskUpdateResponse,
+	OutlineBoardTransferSessionsResponse,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { request } from "./client";
@@ -75,12 +87,25 @@ export const outlineApi = {
 		}),
 	getOutlineSpace: (spaceId: string) =>
 		request<OutlineSpaceDetailResponse>(`/outline/spaces/${enc(spaceId)}`),
+	/** The connected outline's root: my space, a page of project spaces, the groups' counts. */
+	getOutlineTree: (params: { cursor?: string | null }) =>
+		request<OutlineTreeResponse>(`/outline/tree${query(params)}`),
+	/** A page of a project's sessions, or of a group's spaces, in the connected outline. */
+	listOutlineTreeSpaces: (
+		group: { kind: "project"; projectId: string } | { kind: "loose" | "orphaned" },
+		params: { cursor?: string | null },
+	) =>
+		request<OutlineTreeSpacesResponse>(
+			group.kind === "project"
+				? `/outline/tree/projects/${enc(group.projectId)}/sessions${query(params)}`
+				: `/outline/tree/${group.kind}${query(params)}`,
+		),
 	listOutlinePages: (spaceId: string, params: { cursor?: string | null; limit?: number }) =>
 		request<OutlinePageListResponse>(`/outline/spaces/${enc(spaceId)}/pages${query(params)}`),
 	getOutlineBlock: (
 		spaceId: string,
 		blockId: string,
-		params: { asOf?: number; view?: OutlineViewMode; blocks?: number },
+		params: { asOf?: number; view?: OutlineViewMode; blocks?: number; bytes?: number },
 	) =>
 		request<OutlineBlockViewResponse>(
 			`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}${query(params)}`,
@@ -122,6 +147,11 @@ export const outlineApi = {
 		request<OutlineRevertResponse>(`/outline/commits/${enc(commitId)}/revert`, {
 			method: "POST",
 		}),
+	/** Who wrote the subagent reports with these container ids (the names the caller may see). */
+	getOutlineReportAuthors: (spaceId: string, ids: readonly string[]) =>
+		request<OutlineReportAuthorsResponse>(
+			`/outline/spaces/${enc(spaceId)}/report-authors${query({ ids: ids.join(",") })}`,
+		),
 	/** What waits for confirmation on a page, and its locked tasks. */
 	getOutlinePagePending: (spaceId: string, pageId: string) =>
 		request<OutlinePagePendingResponse>(
@@ -219,6 +249,35 @@ export const outlineApi = {
 		request<OutlineBoardFinishedResponse>(
 			`/outline/spaces/${enc(spaceId)}/tasks/finished${query({ cursor })}`,
 		),
+	/** Whether a session's Dynamic Spec is to be imported into the outline, and how that went. */
+	getSpecImportStatus: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`),
+	/** Start the import of a session's Dynamic Spec now. */
+	startSpecImport: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`, {
+			method: "POST",
+		}),
+	/** The import's admin page (administrators): one state's sessions, a page at a time. */
+	getSpecImportAdminPage: (query: {
+		state: OutlineSpecImportAdminState;
+		cursor?: string | null;
+		limit?: number;
+	}) => {
+		const params = new URLSearchParams({ state: query.state });
+		if (query.cursor) params.set("cursor", query.cursor);
+		if (query.limit) params.set("limit", String(query.limit));
+		return request<OutlineSpecImportAdminPage>(`/admin/outline/spec-import?${params.toString()}`);
+	},
+	/** An administrator imports a session again (attention and failed attempts cleared). */
+	reimportSpecSession: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/admin/outline/spec-import/${enc(narratorId)}/reimport`, {
+			method: "POST",
+		}),
+	/** An administrator moves a session the import moved back to Dynamic Spec. */
+	revertSpecImport: (narratorId: string) =>
+		request<OutlineSpecImportRevertResult>(`/admin/outline/spec-import/${enc(narratorId)}/revert`, {
+			method: "POST",
+		}),
 	/** A person adds a task to a session. */
 	addBoardTask: (narratorId: string, body: OutlineBoardAddRequest) =>
 		request<OutlineBoardAddResponse>(`/outline/narrators/${enc(narratorId)}/tasks`, {
@@ -229,6 +288,17 @@ export const outlineApi = {
 	updateBoardTask: (blockId: string, body: OutlineBoardTaskUpdateRequest) =>
 		request<OutlineBoardTaskUpdateResponse>(`/outline/tasks/${enc(blockId)}`, {
 			method: "PATCH",
+			body: JSON.stringify(body),
+		}),
+	/** The sessions a task may be handed to on the board (「转交给会话…」). */
+	getTransferSessions: (blockId: string) =>
+		request<OutlineBoardTransferSessionsResponse>(
+			`/outline/tasks/${enc(blockId)}/transfer-sessions`,
+		),
+	/** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
+	openTaskSession: (blockId: string, body: OutlineBoardOpenSessionRequest) =>
+		request<OutlineBoardOpenSessionResponse>(`/outline/tasks/${enc(blockId)}/open-session`, {
+			method: "POST",
 			body: JSON.stringify(body),
 		}),
 	/**

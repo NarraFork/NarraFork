@@ -1,18 +1,24 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getNarraforkPath } from "../narrafork-home";
+import * as providerKeys from "../provider-keys";
 import { getProviderKeyStore, ProviderKeyStore } from "../provider-keys";
 import { readSecretJSON } from "../secret-store";
-import { saveSettings, settings } from "../settings";
+import { reloadSettings, saveSettings, settings } from "../settings";
 import {
 	absorbProviderKeys,
 	COMMAND_CODE_KEY_OWNER,
+	hydrateProviderKeys,
 	nugKeyOwner,
 	platformInstanceKeyOwner,
+	pruneProviderKeys,
+	quotaKeyOwner,
 	searchKeyOwner,
+	syncProviderKeys,
 	TOKENDANCE_KEY_OWNER,
+	withoutProviderKeys,
 } from "../settings/provider-keys-projection";
 import type {
 	CustomApiProviderConfig,
@@ -129,6 +135,176 @@ describe("settings projection", () => {
 		} finally {
 			saveSettings({ ...settings, customApiProviders: saved });
 			getProviderKeyStore().removeProvider("projA");
+		}
+	});
+
+	test("site tokens are encrypted separately, reload and never join the inference key pool", () => {
+		const saved = structuredClone(settings.customApiProviders);
+		const id = "quotaEncrypted";
+		const owner = quotaKeyOwner(id);
+		const store = getProviderKeyStore();
+		const keyPath = getNarraforkPath("provider-keys.json");
+		try {
+			saveSettings({
+				...settings,
+				customApiProviders: [{ ...provider(id, "sk-inference"), quotaAccessToken: "site-secret" }],
+			});
+			const disk = JSON.parse(readFileSync(getNarraforkPath("settings.json"), "utf8"));
+			expect(disk.customApiProviders[0]).not.toHaveProperty("quotaAccessToken");
+			expect(JSON.stringify(disk)).not.toContain("site-secret");
+			const encrypted = readFileSync(keyPath, "utf8");
+			expect(JSON.parse(encrypted).format).toBe("narrafork.secret.v1");
+			expect(encrypted).not.toContain("site-secret");
+			expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-secret");
+			expect(new ProviderKeyStore(keyPath).firstKey(owner)).toBe("site-secret");
+			expect(store.list(owner).map((key) => key.apiKey)).toEqual(["site-secret"]);
+
+			store.add(id, { apiKey: "sk-backup" });
+			expect(store.list(id).map((key) => key.apiKey)).toEqual(["sk-inference", "sk-backup"]);
+			expect(absorbProviderKeys(disk)).toBe(false);
+			expect(disk.customApiProviders[0].quotaAccessToken).toBe("site-secret");
+			expect(reloadSettings().customApiProviders?.[0]?.quotaAccessToken).toBe("site-secret");
+
+			saveSettings({
+				...settings,
+				customApiProviders: [
+					{ ...provider(id, "sk-inference"), quotaAccessToken: "site-secret-rotated" },
+				],
+			});
+			expect(store.list(owner).map((key) => key.apiKey)).toEqual(["site-secret-rotated"]);
+			expect(store.list(id).map((key) => key.apiKey)).toEqual(["sk-inference", "sk-backup"]);
+			expect(reloadSettings().customApiProviders?.[0]?.quotaAccessToken).toBe(
+				"site-secret-rotated",
+			);
+		} finally {
+			saveSettings({ ...settings, customApiProviders: saved });
+			store.removeProvider(id);
+			store.removeProvider(owner);
+		}
+	});
+
+	test("legacy plaintext site tokens migrate on reload even without an inference key", () => {
+		const saved = structuredClone(settings);
+		const id = "quotaLegacy";
+		const store = getProviderKeyStore();
+		const settingsPath = getNarraforkPath("settings.json");
+		try {
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					...settings,
+					customApiProviders: [{ ...provider(id, ""), quotaAccessToken: "legacy-site-secret" }],
+				}),
+			);
+			expect(reloadSettings().customApiProviders?.[0]?.quotaAccessToken).toBe("legacy-site-secret");
+			expect(store.firstKey(quotaKeyOwner(id))).toBe("legacy-site-secret");
+			expect(store.list(id)).toEqual([]);
+			expect(readFileSync(settingsPath, "utf8")).not.toContain("legacy-site-secret");
+			expect(readFileSync(getNarraforkPath("provider-keys.json"), "utf8")).not.toContain(
+				"legacy-site-secret",
+			);
+			expect(reloadSettings().customApiProviders?.[0]?.quotaAccessToken).toBe("legacy-site-secret");
+		} finally {
+			saveSettings(saved);
+			store.removeProvider(id);
+			store.removeProvider(quotaKeyOwner(id));
+		}
+	});
+
+	test("site tokens follow secrets.encrypt when disabled and switched in both directions", () => {
+		const saved = structuredClone(settings);
+		const id = "quotaEncryptionSwitch";
+		const owner = quotaKeyOwner(id);
+		const keyPath = getNarraforkPath("provider-keys.json");
+		const store = getProviderKeyStore();
+		try {
+			saveSettings({ ...settings, secrets: { encrypt: false } });
+			saveSettings({
+				...settings,
+				customApiProviders: [{ ...provider(id, "sk-switch"), quotaAccessToken: "site-switch" }],
+			});
+			for (const encrypt of [false, true, false]) {
+				saveSettings({ ...settings, secrets: { encrypt } });
+				const disk = readFileSync(keyPath, "utf8");
+				expect(disk.includes("site-switch")).toBe(!encrypt);
+				expect(Array.isArray(JSON.parse(disk))).toBe(!encrypt);
+				expect(readFileSync(getNarraforkPath("settings.json"), "utf8")).not.toContain(
+					"site-switch",
+				);
+				expect(new ProviderKeyStore(keyPath).firstKey(owner)).toBe("site-switch");
+				expect(reloadSettings().customApiProviders?.[0]?.quotaAccessToken).toBe("site-switch");
+			}
+		} finally {
+			saveSettings(saved);
+			store.removeProvider(id);
+			store.removeProvider(owner);
+		}
+	});
+
+	test("clearing or deleting a site token cannot resurrect it on reload or provider recreation", () => {
+		const saved = structuredClone(settings.customApiProviders);
+		const id = "quotaClear";
+		const owner = quotaKeyOwner(id);
+		const store = getProviderKeyStore();
+		try {
+			for (const cleared of ["", undefined]) {
+				saveSettings({
+					...settings,
+					customApiProviders: [{ ...provider(id, "sk-keep"), quotaAccessToken: "site-clear" }],
+				});
+				saveSettings({
+					...settings,
+					customApiProviders: [{ ...provider(id, "sk-keep"), quotaAccessToken: cleared }],
+				});
+				expect(store.list(owner)).toEqual([]);
+				expect(store.firstKey(id)).toBe("sk-keep");
+				expect(settings.customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
+				expect(reloadSettings().customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
+			}
+			saveSettings({
+				...settings,
+				customApiProviders: [{ ...provider(id, "sk-keep"), quotaAccessToken: "site-deleted" }],
+			});
+			saveSettings({ ...settings, customApiProviders: [] });
+			expect(store.list(owner)).toEqual([]);
+			reloadSettings();
+			saveSettings({ ...settings, customApiProviders: [provider(id, "sk-keep")] });
+			expect(reloadSettings().customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
+		} finally {
+			saveSettings({ ...settings, customApiProviders: saved });
+			store.removeProvider(id);
+			store.removeProvider(owner);
+		}
+	});
+
+	test("unreadable credential files preserve legacy site tokens and cannot be overwritten", () => {
+		const { path } = freshStore();
+		const foreign = JSON.stringify({
+			format: "narrafork.secret.v1",
+			cipher: "aes-256-gcm",
+			iv: "x",
+			tag: "x",
+			data: "x",
+		});
+		writeFileSync(path, foreign);
+		const broken = new ProviderKeyStore(path);
+		const projectionStore = spyOn(providerKeys, "getProviderKeyStore").mockReturnValue(broken);
+		const loaded = {
+			customApiProviders: [
+				{ ...provider("quotaBlocked", "sk-blocked"), quotaAccessToken: "site-blocked" },
+			],
+		} as NarraForkSettings;
+		try {
+			expect(absorbProviderKeys(loaded)).toBe(false);
+			syncProviderKeys(loaded);
+			hydrateProviderKeys(loaded);
+			pruneProviderKeys(loaded, { ...loaded, customApiProviders: [] });
+			expect(withoutProviderKeys(loaded)).toBe(loaded);
+			expect(loaded.customApiProviders?.[0]?.quotaAccessToken).toBe("site-blocked");
+			expect(loaded.customApiProviders?.[0]?.apiKey).toBe("sk-blocked");
+			expect(readFileSync(path, "utf8")).toBe(foreign);
+		} finally {
+			projectionStore.mockRestore();
 		}
 	});
 

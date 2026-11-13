@@ -5,7 +5,8 @@
  * The panel's params ARE its state (`lib/outline-panel.ts`): every navigation inside it writes
  * them, so the layout restores the same focus, view and time, and the URL never changes. The tab
  * is named after what loaded and that name is not stored: a restored panel says "Outline" until
- * it has read its place, and keeps saying so when it cannot. The page is live only while the
+ * it has read its place, and keeps saying so when it cannot. The header under the tab always says
+ * "Outline": a page's title is shown twice at most (the tab, the page's own title). The page is live only while the
  * panel is on screen (`OutlineSurface`); a background tab shows it read only. Links
  * Ctrl/Cmd-clicked open another panel through the surface's opener; "open in outline page"
  * leaves for the outline route. Whether the person may see anything is the outline routes'
@@ -15,7 +16,7 @@
 import { ActionIcon, Center, Loader, Tooltip } from "@mantine/core";
 import { IconExternalLink, IconListTree } from "@tabler/icons-react";
 import type { IDockviewPanelProps } from "dockview-react";
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useLayoutEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineOpener } from "../../../lib/outline-opener";
 import {
@@ -45,12 +46,9 @@ export function OutlineDockPanel(props: IDockviewPanelProps<OutlinePanelParams>)
 	const generic = t("title");
 
 	// The tab's name: what loaded, else the generic name (a restored panel has no stored title,
-	// so dockview shows its id until this runs).
-	const [title, setTitle] = useState(api.title ?? "");
-	useEffect(() => {
-		const subscription = api.onDidTitleChange(() => setTitle(api.title ?? ""));
-		return () => subscription.dispose();
-	}, [api]);
+	// so dockview shows its id until this runs). The panel's own header does not repeat it: the
+	// tab and the page title already say which page this is, so the header says what the panel
+	// is ("Outline") and carries its actions.
 	useLayoutEffect(() => {
 		if (!api.title || api.title === api.id) api.setTitle(generic);
 	}, [api, generic]);
@@ -86,7 +84,7 @@ export function OutlineDockPanel(props: IDockviewPanelProps<OutlinePanelParams>)
 
 	return (
 		<ToolPanelShell
-			title={title && title !== api.id ? title : generic}
+			title={generic}
 			icon={<IconListTree size={16} color="var(--mantine-color-indigo-4)" />}
 			actions={
 				<Tooltip label={t("panel.openPage")} withinPortal>
