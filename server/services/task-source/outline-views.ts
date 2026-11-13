@@ -84,6 +84,7 @@ import { isClaimLive } from "../outline/tasks";
 import { breadthFirst, type OutlineNode } from "../outline/tree";
 import { readTaskSession } from "./backend";
 import {
+	dropSpecLossAttachBlocks,
 	findBehaviorPage,
 	graphemeBoundary,
 	importLeftover,
@@ -918,6 +919,9 @@ async function renderBehaviorPage(
 	const subtree = await readSubtree(pageId);
 	if (!subtree) return null;
 	const { state, root } = subtree;
+	// Content the swallowed-content scan attached is never shown as a rule (outline P2 PR 12c): a
+	// rule a person removed must not apply again because a check found it.
+	dropSpecLossAttachBlocks(root);
 	const min = OUTLINE_VIEW_LIMITS.behaviorBlockMinChars;
 	const order = breadthFirst(root, "all", maxBlocks);
 	// A character is at most three UTF-8 bytes in the text a page holds.

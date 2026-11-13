@@ -149,7 +149,28 @@ export type OutlineSpecLossAttachNote =
 	| "page_cap"
 	| "session_cap"
 	| "restored"
-	| "failed";
+	| "failed"
+	| "gave_up"
+	| "reattach_cap"
+	| "list_only"
+	| "rule_page"
+	| "fork"
+	| "block_deleted";
+
+/**
+ * The short id of a block an attach wrote: `sl` and fourteen hex digits. On a session's behavior
+ * page such a block, with what is under it, is never shown to the model, never read into the spec
+ * fence and never copied to a fork: that page is read as standing rules. Content a person
+ * attached there through the confirmation is written under {@link isSpecLossRuleSid} instead.
+ */
+export function isSpecLossAttachSid(sid: string): boolean {
+	return /^sl[0-9a-f]{14}$/.test(sid);
+}
+
+/** The short id of lost content a person put on the behavior page, confirming it is a rule. */
+export function isSpecLossRuleSid(sid: string): boolean {
+	return /^sr[0-9a-f]{14}$/.test(sid);
+}
 
 /** `SpecLossKind` of `shared/spec-content-loss.ts`, restated for the API. */
 export type OutlineSpecLossKind =
@@ -184,13 +205,26 @@ export interface OutlineSpecLossFinding {
 	blockId: string | null;
 	/**
 	 * Why an `open` finding is not on the page (null: not tried yet):
+	 * - `list_only`: it is not tables (only tables are attached automatically); a person may attach it;
+	 * - `rule_page`: it is of the behavior fence, whose page the agent reads as rules: never
+	 *   attached automatically, and by a person only through a confirmation that says so;
+	 * - `fork`: the save was made in the session this one was forked from; attached there only;
 	 * - `no_page`: the file's imported page is not there;
 	 * - `page_cap` / `session_cap`: more findings than are attached to one page, or for one
 	 *   session in one pass, automatically (the latter are attached by a later pass);
 	 * - `restored`: the file's current revision holds the content again;
-	 * - `failed`: the attach did not succeed (tried again by a later pass).
+	 * - `failed`: the attach did not succeed (tried again by a later pass);
+	 * - `gave_up`: it failed several times and is not tried again: it needs a person;
+	 * - `reattach_cap`: its block was removed by system writes several times; not attached again.
+	 * Of a `dismissed` finding only `block_deleted`: nobody dismissed it, its block was deleted on
+	 * the page (which is how a person disposes of it there).
 	 */
 	attachNote: OutlineSpecLossAttachNote | null;
+	/**
+	 * The finding is of the behavior fence: attaching it puts it on the page the agent reads as
+	 * its rules, so the request must carry `confirmRule` (asked of the person first).
+	 */
+	rulePage: boolean;
 	spaceId: string | null;
 	resolvedAt: string | null;
 	createdAt: string;
@@ -237,6 +271,7 @@ export interface OutlineSpecLossPage {
 
 /**
  * What a person asks about one finding: `dismiss` (open or attached), `reopen` (a dismissed one;
- * it is attached again), `attach` (an open one the automatic attach left out).
+ * it is attached again when a pass would attach it; otherwise it is listed), `attach` (an open
+ * one: the automatic attach left it out, or never attaches its kind).
  */
 export type OutlineSpecLossAction = "attach" | "dismiss" | "reopen";
