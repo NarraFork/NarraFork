@@ -1335,7 +1335,7 @@ describe("attaches that do not go through", () => {
 					content: "not the lost table",
 				},
 			],
-			actor: { kind: "narrator", id },
+			actor: { kind: "agent", id },
 			responsibleUserId: owner,
 		});
 		const commits = await commitCount(id);
