@@ -341,7 +341,7 @@
 	},
 	{
 		"name": "golang.org/x/crypto (remote-peer)",
-		"version": "0.48.0",
+		"version": "0.52.0",
 		"license": "BSD-3-Clause",
 		"author": "The Go Authors",
 		"repository": "https://github.com/golang/crypto",
@@ -350,7 +350,7 @@
 	},
 	{
 		"name": "golang.org/x/net (remote-peer)",
-		"version": "0.50.0",
+		"version": "0.54.0",
 		"license": "BSD-3-Clause",
 		"author": "The Go Authors",
 		"repository": "https://github.com/golang/net",
@@ -359,7 +359,7 @@
 	},
 	{
 		"name": "golang.org/x/sys (remote-peer)",
-		"version": "0.41.0",
+		"version": "0.45.0",
 		"license": "BSD-3-Clause",
 		"author": "The Go Authors",
 		"repository": "https://github.com/golang/sys",
