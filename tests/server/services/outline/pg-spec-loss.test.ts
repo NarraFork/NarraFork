@@ -253,22 +253,23 @@ describe("PostgreSQL swallowed-content scan", () => {
 			if (!outcome || typeof outcome !== "object" || !("scan" in outcome)) {
 				throw new Error(`PostgreSQL harness did not run: ${JSON.stringify(outcome)}`);
 			}
-			expect(outcome.backend).toBe("postgres");
-			expect(outcome.chain.map((r) => [r.id, r.createdBy, r.chars])).toEqual([
-				[outcome.design[2] as string, "assistant", 16],
-				[outcome.design[1] as string, "user", 10],
-				[outcome.design[0] as string, "assistant", 10 + TABLE.length + 2],
+			const ran = outcome as Extract<typeof outcome, { main: string }>;
+			expect(ran.backend).toBe("postgres");
+			expect(ran.chain.map((r) => [r.id, r.createdBy, r.chars])).toEqual([
+				[ran.design[2] as string, "assistant", 16],
+				[ran.design[1] as string, "user", 10],
+				[ran.design[0] as string, "assistant", 10 + TABLE.length + 2],
 			]);
-			expect(outcome.chain[2]?.parentRevisionId).toBeNull();
-			expect(outcome.chain[0]?.createdAt).toBe("2026-10-22T00:00:00.000Z");
-			expect(outcome.missing).toEqual([]);
-			expect(outcome.scan).toEqual({ saves: 1, findings: 1, added: 1, note: null });
-			expect(outcome.again).toBe("skipped");
-			expect(outcome.forced).toEqual({ saves: 1, findings: 1, added: 0, note: null });
-			expect(outcome.scanRow).toMatchObject({ saves: 1, findings: 1, note: null });
-			expect(outcome.page.counts).toEqual({ open: 1, attached: 0, dismissed: 0 });
-			expect(outcome.page.items[0]).toMatchObject({
-				narratorId: outcome.main,
+			expect(ran.chain[2]?.parentRevisionId).toBeNull();
+			expect(ran.chain[0]?.createdAt).toBe("2026-10-22T00:00:00.000Z");
+			expect(ran.missing).toEqual([]);
+			expect(ran.scan).toEqual({ saves: 1, findings: 1, added: 1, note: null });
+			expect(ran.again).toBe("skipped");
+			expect(ran.forced).toEqual({ saves: 1, findings: 1, added: 0, note: null });
+			expect(ran.scanRow).toMatchObject({ saves: 1, findings: 1, note: null });
+			expect(ran.page.counts).toEqual({ open: 1, attached: 0, dismissed: 0 });
+			expect(ran.page.items[0]).toMatchObject({
+				narratorId: ran.main,
 				title: "spec loss",
 				path: "design.md",
 				kinds: { table: 1 },
@@ -277,19 +278,19 @@ describe("PostgreSQL swallowed-content scan", () => {
 				truncated: false,
 				attachable: false,
 			});
-			expect(outcome.detail.parts).toEqual([{ kind: "table", text: TABLE }]);
-			expect(outcome.dismissed).toMatchObject({ status: "dismissed" });
-			expect(outcome.countsDismissed).toEqual({ open: 0, attached: 0, dismissed: 1 });
-			expect(outcome.reopened).toMatchObject({ status: "open", resolvedAt: null });
-			expect(outcome.pass).toEqual({ sessions: 2, scanned: 1, found: 1, left: 0 });
-			expect(new Set(outcome.all.map((row) => row.join("|")))).toEqual(
-				new Set([`${outcome.main}|design.md|spec loss`, `${outcome.other}|notes.md|spec loss`]),
+			expect(ran.detail.parts).toEqual([{ kind: "table", text: TABLE }]);
+			expect(ran.dismissed).toMatchObject({ status: "dismissed" });
+			expect(ran.countsDismissed).toEqual({ open: 0, attached: 0, dismissed: 1 });
+			expect(ran.reopened).toMatchObject({ status: "open", resolvedAt: null });
+			expect(ran.pass).toEqual({ sessions: 2, scanned: 1, found: 1, left: 0 });
+			expect(new Set(ran.all.map((row) => row.join("|")))).toEqual(
+				new Set([`${ran.main}|design.md|spec loss`, `${ran.other}|notes.md|spec loss`]),
 			);
-			expect(outcome.allScan).toMatchObject({ running: false });
-			expect(outcome.imported).toMatchObject({ status: "imported" });
-			expect(outcome.attached).toMatchObject({ status: "attached" });
-			expect(outcome.attached.blockId).toBeString();
-			expect(outcome.under).toEqual([TABLE]);
+			expect(ran.allScan).toMatchObject({ running: false });
+			expect(ran.imported).toMatchObject({ status: "imported" });
+			expect(ran.attached).toMatchObject({ status: "attached" });
+			expect(ran.attached.blockId).toBeString();
+			expect(ran.under).toEqual([TABLE]);
 		},
 		RUN_TIMEOUT_MS,
 	);
