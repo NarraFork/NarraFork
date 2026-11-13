@@ -153,7 +153,7 @@ import { commitSeqAt } from "../services/outline/read";
 import { readReportAuthors } from "../services/outline/report-authors";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
-import { OUTLINE_SEARCH_LIMITS, searchOutline } from "../services/outline/search";
+import { OUTLINE_SEARCH_LIMITS, searchOutlinePage } from "../services/outline/search";
 import {
 	listOutlineTreeSpaces,
 	readOutlineTree,
@@ -185,7 +185,7 @@ import {
 	OUTLINE_TRANSFER_LIMITS,
 	startSessionOnTransferredTask,
 } from "../services/outline/transfer";
-import { readViewState, writeViewState } from "../services/outline/view-state";
+import { normalizeFolding, readViewState, writeViewState } from "../services/outline/view-state";
 import {
 	describeLocks,
 	describeSpaces,
@@ -463,6 +463,19 @@ outlineRoutes.get("/spaces/:spaceId/blocks/:blockId", async (c) => {
 			bytes: query.bytes ?? OUTLINE_VIEW_LIMITS.maxBytes,
 		},
 		narratorVisible: narratorVisibility(principal),
+		// The connected outline's pages: the reader's own stored folding of the page, by its
+		// primary key (theirs alone; reading it needs no more than reading the page).
+		...(query.fold === "default"
+			? {
+					fold: async (pageId: string) => {
+						const stored = await outlineStore.getViewState(principal.userId, pageId);
+						return normalizeFolding({
+							collapsed: stored?.collapsed ?? [],
+							expanded: stored?.expanded ?? [],
+						});
+					},
+				}
+			: {}),
 	});
 	if (!view) throw new NotFoundError("Outline block", blockId);
 	const locked = view.blocks.flatMap((b) => (b.lock ? [b.lock] : []));
@@ -584,14 +597,15 @@ outlineRoutes.get("/search", async (c) => {
 	const spaceIds = query.spaceId
 		? [(await readableSpace(principal, query.spaceId)).id]
 		: await readableSpaceIds(principal);
-	const hits = await searchOutline({
+	const page = await searchOutlinePage({
 		query: query.q,
 		spaceIds,
 		contextSpaceId: query.spaceId ?? null,
 		limit: query.limit ?? OUTLINE_VIEW_LIMITS.defaultSearch,
+		offset: query.cursor ? decodeSearchCursor(query.cursor) : 0,
 	});
 	const body: OutlineSearchResponse = {
-		hits: hits.map((hit) => ({
+		hits: page.hits.map((hit) => ({
 			blockId: hit.blockId,
 			spaceId: hit.spaceId,
 			pageId: hit.pageId,
@@ -600,11 +614,28 @@ outlineRoutes.get("/search", async (c) => {
 			title: hit.title,
 			snippet: hit.snippet,
 			path: hit.path,
+			pathIds: hit.pathIds,
 			process: hit.process,
 		})),
+		nextCursor:
+			page.nextOffset === null
+				? null
+				: Buffer.from(String(page.nextOffset), "utf8").toString("base64url"),
+		// Spaces searched are spaces the person may read, so these are theirs to see named.
+		spaces: await describeSpaces(principal, page.spaces),
 	};
 	return c.json(body);
 });
+
+/** A search cursor: a position in the ranked list, within what one search ranks. */
+function decodeSearchCursor(cursor: string): number {
+	const text = Buffer.from(cursor, "base64url").toString("utf8");
+	const offset = /^\d{1,4}$/.test(text) ? Number(text) : Number.NaN;
+	if (!Number.isSafeInteger(offset) || offset > OUTLINE_SEARCH_LIMITS.candidates * 2) {
+		throw new ValidationError("Invalid cursor");
+	}
+	return offset;
+}
 
 /** A space named by key or by id, if the person may read it; null otherwise. */
 async function readableSpaceNamed(

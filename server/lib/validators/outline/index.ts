@@ -48,6 +48,8 @@ export const outlineBlockViewQuerySchema = z
 		view: z.enum(["facts", "all"]).optional(),
 		blocks: limitSchema(OUTLINE_VIEW_LIMITS.maxBlocks).optional(),
 		bytes: limitSchema(OUTLINE_VIEW_LIMITS.maxBytes).optional(),
+		/** Leave out what is behind rows closed by default and by the reader (the tree's pages). */
+		fold: z.literal("default").optional(),
 	})
 	.refine((query) => query.asOf === undefined || query.at === undefined, {
 		message: "asOf and at are exclusive",
@@ -66,6 +68,7 @@ export const outlineSearchQuerySchema = z.object({
 	q: z.string().trim().min(1).max(500),
 	spaceId: outlineIdSchema.optional(),
 	limit: limitSchema(OUTLINE_VIEW_LIMITS.maxSearch).optional(),
+	cursor: cursorSchema.optional(),
 });
 
 /**
