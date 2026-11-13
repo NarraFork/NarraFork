@@ -104,6 +104,47 @@ describe("decodeLegacyContent: assistant steps", () => {
 		expect(envelope.toolOutputs).toEqual({ toolu_1: { status: "success", output: "file body" } });
 	});
 
+	test("reasoning replay arrays survive JSON decoding without becoming display text", () => {
+		const openai = {
+			itemId: "rs-1",
+			textFormat: "mixed",
+			reasoningEncryptedContent: " cipher\r\n ",
+			reasoningContent: [
+				{ type: "reasoning_text", text: " 正文\r\n\u0000e\u0301 " },
+				{ type: "reasoning_text", text: "" },
+				{ type: "reasoning_text", text: "正文二\\n" },
+			],
+			reasoningSummary: [
+				{ type: "summary_text", text: " 摘要二\r\n" },
+				{ type: "summary_text", text: "摘要一\t" },
+			],
+		};
+		const envelope = decodeLegacyContent(
+			row({
+				role: "assistant",
+				contentJson: JSON.parse(
+					JSON.stringify([
+						{
+							type: "reasoning",
+							text: "visible summary",
+							providerMetadata: { openai, signatureSource: "openai:test" },
+						},
+					]),
+				),
+			}),
+		);
+		const block = envelope.blocks[0];
+		if (block.kind !== "reasoning") throw new Error("Expected a reasoning block");
+		expect(block).toMatchObject({
+			kind: "reasoning",
+			payload: { parts: [{ type: "text", text: "visible summary" }] },
+		});
+		expect(block.providerMeta).toEqual({
+			source: "openai:test",
+			wire: { openai },
+		});
+	});
+
 	test("a call without a terminal ledger attempt stays open and invisible", () => {
 		const envelope = decodeLegacyContent(
 			row({
