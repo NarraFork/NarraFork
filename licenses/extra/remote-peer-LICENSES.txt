@@ -384,6 +384,24 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ----- END VERBATIM -----
 
 === Source 20 ===
+Module: golang.org/x/sys
+Version: v0.45.0
+Upstream: https://github.com/golang/sys
+Source file: LICENSE
+License / notice: BSD-3-Clause
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 21 ===
+Module: golang.org/x/sys
+Version: v0.45.0
+Upstream: https://github.com/golang/sys
+Source file: PATENTS
+License / notice: BSD-3-Clause
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+
+=== Source 22 ===
 Module: github.com/google/uuid
 Version: v1.6.0
 Upstream: https://github.com/google/uuid
@@ -421,7 +439,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ----- END VERBATIM -----
 
-=== Source 21 ===
+=== Source 23 ===
 Module: github.com/pion/datachannel
 Version: v1.6.3
 Upstream: https://github.com/pion/datachannel
@@ -430,7 +448,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 22 ===
+=== Source 24 ===
 Module: github.com/pion/dtls/v3
 Version: v3.1.10
 Upstream: https://github.com/pion/dtls
@@ -439,7 +457,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 23 ===
+=== Source 25 ===
 Module: github.com/pion/ice/v4
 Version: v4.4.7
 Upstream: https://github.com/pion/ice
@@ -448,7 +466,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 24 ===
+=== Source 26 ===
 Module: github.com/pion/interceptor
 Version: v0.1.49
 Upstream: https://github.com/pion/interceptor
@@ -457,7 +475,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 25 ===
+=== Source 27 ===
 Module: github.com/pion/mdns/v2
 Version: v2.2.2
 Upstream: https://github.com/pion/mdns
@@ -489,7 +507,7 @@ SOFTWARE.
 
 ----- END VERBATIM -----
 
-=== Source 26 ===
+=== Source 28 ===
 Module: github.com/pion/randutil
 Version: v0.1.0
 Upstream: https://github.com/pion/randutil
@@ -521,7 +539,7 @@ SOFTWARE.
 
 ----- END VERBATIM -----
 
-=== Source 27 ===
+=== Source 29 ===
 Module: github.com/pion/rtcp
 Version: v1.2.19
 Upstream: https://github.com/pion/rtcp
@@ -530,7 +548,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 28 ===
+=== Source 30 ===
 Module: github.com/pion/rtp
 Version: v1.10.5
 Upstream: https://github.com/pion/rtp
@@ -550,7 +568,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ----- END VERBATIM -----
 
-=== Source 29 ===
+=== Source 31 ===
 Module: github.com/pion/sctp
 Version: v1.12.0
 Upstream: https://github.com/pion/sctp
@@ -559,7 +577,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 30 ===
+=== Source 32 ===
 Module: github.com/pion/sdp/v3
 Version: v3.0.20
 Upstream: https://github.com/pion/sdp
@@ -568,7 +586,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 31 ===
+=== Source 33 ===
 Module: github.com/pion/srtp/v3
 Version: v3.1.3
 Upstream: https://github.com/pion/srtp
@@ -577,7 +595,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 32 ===
+=== Source 34 ===
 Module: github.com/pion/stun/v4
 Version: v4.0.1
 Upstream: https://github.com/pion/stun
@@ -586,7 +604,7 @@ License / notice: MIT AND BSD-3-Clause
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 33 ===
+=== Source 35 ===
 Module: github.com/pion/stun/v4
 Version: v4.0.1
 Upstream: https://github.com/pion/stun
@@ -599,7 +617,7 @@ Source SHA-256: a432957d21745499063512eb345d76bac3fbdeeeba8c8480e0001c9d5755b2b0
 
 ----- END VERBATIM -----
 
-=== Source 34 ===
+=== Source 36 ===
 Module: github.com/pion/transport/v5
 Version: v5.1.1
 Upstream: https://github.com/pion/transport
@@ -608,7 +626,7 @@ License / notice: MIT AND BSD-3-Clause
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 35 ===
+=== Source 37 ===
 Module: github.com/pion/transport/v5
 Version: v5.1.1
 Upstream: https://github.com/pion/transport
@@ -623,7 +641,7 @@ Source SHA-256: 4f6e5aeb3c8aa598c5e6cfe8a4bee06ab1b7f866a419acaa452f9555a104eefc
 
 ----- END VERBATIM -----
 
-=== Source 36 ===
+=== Source 38 ===
 Module: github.com/pion/turn/v5
 Version: v5.1.2
 Upstream: https://github.com/pion/turn
@@ -632,7 +650,7 @@ License / notice: MIT
 Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
 Verbatim text: see Source 19 (byte-identical original, including attribution).
 
-=== Source 37 ===
+=== Source 39 ===
 Module: github.com/wlynxg/anet
 Version: v0.0.5
 Upstream: https://github.com/wlynxg/anet
@@ -671,7 +689,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ----- END VERBATIM -----
 
-=== Source 38 ===
+=== Source 40 ===
 Module: github.com/wlynxg/anet
 Version: v0.0.5
 Upstream: https://github.com/wlynxg/anet
@@ -685,55 +703,37 @@ Source SHA-256: d9a162759d7edf6b1e8c40b592853f2f6242b42533efae5d3cc3d9125fc582ca
 
 ----- END VERBATIM -----
 
-=== Source 39 ===
-Module: golang.org/x/crypto
-Version: v0.48.0
-Upstream: https://github.com/golang/crypto
-Source file: LICENSE
-License / notice: BSD-3-Clause
-Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
-Verbatim text: see Source 1 (byte-identical original, including attribution).
-
-=== Source 40 ===
-Module: golang.org/x/crypto
-Version: v0.48.0
-Upstream: https://github.com/golang/crypto
-Source file: PATENTS
-License / notice: BSD-3-Clause
-Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
-Verbatim text: see Source 2 (byte-identical original, including attribution).
-
 === Source 41 ===
-Module: golang.org/x/net
-Version: v0.50.0
-Upstream: https://github.com/golang/net
+Module: golang.org/x/crypto
+Version: v0.52.0
+Upstream: https://github.com/golang/crypto
 Source file: LICENSE
 License / notice: BSD-3-Clause
 Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
 Verbatim text: see Source 1 (byte-identical original, including attribution).
 
 === Source 42 ===
-Module: golang.org/x/net
-Version: v0.50.0
-Upstream: https://github.com/golang/net
+Module: golang.org/x/crypto
+Version: v0.52.0
+Upstream: https://github.com/golang/crypto
 Source file: PATENTS
 License / notice: BSD-3-Clause
 Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
 Verbatim text: see Source 2 (byte-identical original, including attribution).
 
 === Source 43 ===
-Module: golang.org/x/sys
-Version: v0.41.0
-Upstream: https://github.com/golang/sys
+Module: golang.org/x/net
+Version: v0.54.0
+Upstream: https://github.com/golang/net
 Source file: LICENSE
 License / notice: BSD-3-Clause
 Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
 Verbatim text: see Source 1 (byte-identical original, including attribution).
 
 === Source 44 ===
-Module: golang.org/x/sys
-Version: v0.41.0
-Upstream: https://github.com/golang/sys
+Module: golang.org/x/net
+Version: v0.54.0
+Upstream: https://github.com/golang/net
 Source file: PATENTS
 License / notice: BSD-3-Clause
 Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
