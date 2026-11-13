@@ -31,13 +31,18 @@ import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { stopEditTextWorker } from "../../services/outline/edit-text-runner";
 import { makeSession, makeUser } from "../../services/outline/spec-import/__tests__/fixtures";
-import { resetSpecImportRecords } from "../../services/outline/spec-import/importer";
+import {
+	importSpecSession,
+	resetSpecImportRecords,
+} from "../../services/outline/spec-import/importer";
+import { attachSpecLossForSession } from "../../services/outline/spec-import/loss-attach";
 import {
 	resetSpecLossScanState,
 	scanSpecSessionLossById,
 	settleSpecLossPass,
 } from "../../services/outline/spec-import/loss-scan";
 import { readSpecLossScan } from "../../services/outline/spec-import/loss-store";
+import { readSpecImportSession } from "../../services/outline/spec-import/read-port";
 import { writeSpecFile } from "../../services/spec-vfs-service";
 import { invalidateTaskBackend } from "../../services/task-source";
 import { outlineSpecImportAdminRoutes } from "../admin-outline-spec-import";
@@ -280,6 +285,54 @@ describe("a session's routes", () => {
 			{ action: "reopen" },
 		);
 		expect(reopened.body.status).toBe("open");
+	});
+
+	test("an imported session: the attached finding is dismissed and reopened through the route", async () => {
+		const { id, owner } = await scanned({ scan: false });
+		await writeSpecFile(id, "spec://tasks.json", JSON.stringify({ tasks: [{ text: "a" }] }), {
+			actor: "agent",
+			createdBy: "assistant",
+		});
+		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
+			status: "imported",
+		});
+		await scanSpecSessionLossById(id);
+		const session = await readSpecImportSession(id);
+		if (!session) throw new Error("no session");
+		expect(await attachSpecLossForSession(session)).toEqual({ attached: 1, left: 0 });
+		const base = `/outline/narrators/${id}/spec-import/loss`;
+		const page = await call<OutlineSpecLossPage>(owner, "user", "GET", `${base}?status=attached`);
+		expect(page.body.counts).toEqual({ open: 0, attached: 1, dismissed: 0 });
+		const finding = page.body.items[0];
+		expect(finding?.blockId).toBeString();
+		expect(finding?.spaceId).toBeString();
+		// Attached already: a person's attach has nothing to do.
+		const attach = await call<{ messageCode: string }>(
+			owner,
+			"user",
+			"POST",
+			`${base}/${finding?.id}`,
+			{ action: "attach" },
+		);
+		expect(attach.status).toBe(409);
+		expect(attach.body.messageCode).toBe("SPEC_LOSS_DECIDED");
+		const dismissed = await call<OutlineSpecLossFinding>(
+			owner,
+			"user",
+			"POST",
+			`${base}/${finding?.id}`,
+			{ action: "dismiss" },
+		);
+		expect(dismissed.body).toMatchObject({ status: "dismissed", blockId: null });
+		const reopened = await call<OutlineSpecLossFinding>(
+			owner,
+			"user",
+			"POST",
+			`${base}/${finding?.id}`,
+			{ action: "reopen" },
+		);
+		expect(reopened.body.status).toBe("attached");
+		expect(reopened.body.blockId).toBeString();
 	});
 
 	test("a reader who may not write reads the findings and decides nothing", async () => {

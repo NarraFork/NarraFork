@@ -34,6 +34,7 @@ import {
 	writeTasks,
 } from "../spec-import/__tests__/fixtures";
 import { importSpecSession, resetSpecImportRecords } from "../spec-import/importer";
+import { attachSpecLossForSession } from "../spec-import/loss-attach";
 import { decideSpecLossFinding, specLossPage } from "../spec-import/loss-findings";
 import {
 	resetSpecLossScanState,
@@ -42,6 +43,7 @@ import {
 	scanSpecSessionLossById,
 } from "../spec-import/loss-scan";
 import { readSpecLossScan } from "../spec-import/loss-store";
+import { readSpecImportSession } from "../spec-import/read-port";
 
 const LIMITS: EditTextChannelLimits = {
 	inlineBytes: 1024,
@@ -281,8 +283,21 @@ describe("the swallowed-content scan over a failing background channel", () => {
 				(await specLossPage({ status: "open", narratorId: id, canAct: true })).items,
 			).toHaveLength(1);
 			expect(inline).not.toHaveBeenCalled();
+			// The pass's own attach: noted as failed on the finding, nothing written, tried again.
+			const session = await readSpecImportSession(id);
+			if (!session) throw new Error("no session");
+			expect(await attachSpecLossForSession(session)).toEqual({ attached: 0, left: 1 });
+			expect(await commitCount(id)).toBe(commits);
+			const [open] = (await specLossPage({ status: "open", narratorId: id, canAct: true })).items;
+			expect(open).toMatchObject({ status: "open", attachNote: "failed" });
+			expect(inline).not.toHaveBeenCalled();
 		} finally {
 			background.mockRestore();
 		}
+		// The worker is back: the next pass's attach succeeds.
+		const session = await readSpecImportSession(id);
+		if (!session) throw new Error("no session");
+		expect(await attachSpecLossForSession(session)).toEqual({ attached: 1, left: 0 });
+		expect(await commitCount(id)).toBe(commits + 1);
 	});
 });

@@ -111,6 +111,12 @@ describe("lostSpecItems", () => {
 		expect(found.map((item) => item.raw)).toEqual([other]);
 	});
 
+	test("what the save still held is not its loss, also when the current revision lacks it", () => {
+		const other = "| x |\n|---|\n| y |";
+		const found = lost(`${TABLE}\n\n${other}`, TABLE, "nothing left");
+		expect(found.map((item) => item.raw)).toEqual([other]);
+	});
+
 	test("the same table twice, one dropped: one loss", () => {
 		expect(lost(`${TABLE}\n\n${TABLE}`, TABLE)).toHaveLength(1);
 	});
