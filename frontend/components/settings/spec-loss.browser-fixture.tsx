@@ -52,8 +52,18 @@ let canAct = true;
 export const calls: string[] = [];
 let root: Root | null = null;
 
+/** Findings of the imported session that are not on the page, and why. */
+const LEFT_OUT: Record<number, "page_cap" | "no_page"> = { 27: "page_cap", 30: "no_page" };
+/** The attached finding whose block someone wrote in: a dismissal keeps it. */
+export const KEPT = "f003";
+
 function finding(n: number, extra: Partial<OutlineSpecLossFinding> = {}): OutlineSpecLossFinding {
 	const narratorId = `s${String((n % 3) + 1).padStart(3, "0")}`;
+	// The first session was imported: its findings are on their pages, but for two. The others
+	// still keep Dynamic Spec, so theirs wait.
+	const imported = narratorId === NARRATOR;
+	const leftOut = LEFT_OUT[n] ?? null;
+	const attached = imported && leftOut === null;
 	return {
 		id: `f${String(n).padStart(3, "0")}`,
 		narratorId,
@@ -62,24 +72,27 @@ function finding(n: number, extra: Partial<OutlineSpecLossFinding> = {}): Outlin
 		savedAt: "2026-10-20T09:30:00.000Z",
 		kinds: n % 2 ? { table: 2, image: 1 } : { table: 1 },
 		truncated: n === 2,
-		status: "open",
-		blockId: null,
+		status: attached ? "attached" : "open",
+		blockId: attached ? `block-${n}` : null,
+		attachNote: imported ? leftOut : null,
 		spaceId: "space-1",
 		resolvedAt: null,
 		createdAt: new Date(Date.parse(NOW) - n * 60_000).toISOString(),
-		// The first session was imported; the others still keep Dynamic Spec.
-		attachable: narratorId === NARRATOR,
+		attachable: imported && !attached,
 		...extra,
 	};
 }
 
 function seed(): void {
 	findings = new Map();
-	for (let n = 0; n < 26; n++) findings.set(finding(n).id, finding(n));
-	findings.set("f900", finding(900, { id: "f900", status: "dismissed", attachable: false }));
+	for (let n = 0; n < 32; n++) findings.set(finding(n).id, finding(n));
+	findings.set(
+		"f900",
+		finding(900, { id: "f900", status: "dismissed", blockId: null, attachable: false }),
+	);
 	scan = {
 		running: false,
-		lastPass: { at: NOW, sessions: 40, scanned: 12, found: 3, left: 0 },
+		lastPass: { at: NOW, sessions: 40, scanned: 12, found: 3, attached: 2, left: 0 },
 	};
 	calls.length = 0;
 }
@@ -119,12 +132,21 @@ api.decideSpecLoss = async (_narratorId, findingId, action) => {
 	calls.push(`${action}:${findingId}`);
 	const entry = findings.get(findingId);
 	if (!entry) throw new Error("no such finding");
+	const imported = entry.narratorId === NARRATOR;
+	// Dismissed: the block goes, unless someone wrote in it. Reopened: attached again when the
+	// session was imported.
+	const onPage = action === "attach" || (action === "reopen" && imported);
 	const next: OutlineSpecLossFinding = {
 		...entry,
-		status: action === "attach" ? "attached" : action === "dismiss" ? "dismissed" : "open",
-		blockId: action === "attach" ? "block-1" : null,
-		resolvedAt: action === "reopen" ? null : NOW,
-		attachable: action === "reopen" && entry.narratorId === NARRATOR,
+		status: onPage ? "attached" : action === "dismiss" ? "dismissed" : "open",
+		blockId: onPage
+			? (entry.blockId ?? "block-new")
+			: action === "dismiss" && findingId === KEPT
+				? entry.blockId
+				: null,
+		attachNote: null,
+		resolvedAt: action === "dismiss" ? NOW : null,
+		attachable: false,
 	};
 	findings.set(findingId, next);
 	return next;

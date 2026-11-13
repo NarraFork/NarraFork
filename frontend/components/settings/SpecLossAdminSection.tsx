@@ -70,6 +70,7 @@ export function SpecLossAdminSection() {
 										date: formatLocaleDateTime(scan.lastPass.at, undefined, i18n.language),
 										scanned: scan.lastPass.scanned,
 										found: scan.lastPass.found,
+										attached: scan.lastPass.attached,
 									}),
 									scan.lastPass.left > 0
 										? t("spec.loss.admin.scanLeft", { left: scan.lastPass.left })

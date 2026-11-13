@@ -3,17 +3,20 @@
  * Spec panel's notice, at a phone's width and a desktop's, light and dark, English and Chinese.
  *
  * What must hold:
- *  - the admin section says how the scan is doing, starts one on "Scan now" (asked once), and
- *    lists the findings of one status a page at a time, each with its session, file and what was
- *    lost; a finding of a session still in Dynamic Spec cannot be attached and says why;
+ *  - the admin section says how the scan is doing (with what it attached), starts one on "Scan
+ *    now" (asked once), and lists the findings of one status a page at a time, each with its
+ *    session, file and what was lost;
+ *  - a finding that is not on its page says why: the session is still in Dynamic Spec (nothing
+ *    to attach to, no attach offered), the page's cap, a page that is gone;
  *  - the lost content is read on demand, in a box that scrolls by itself;
- *  - attaching asks first (cancelling does nothing), then asks the server once; the finding
- *    leaves the open list and is listed as attached with a link to its block; dismissing asks the
- *    server once, and a dismissed finding can be reopened;
- *  - the Spec panel of a session with findings shows one line with their number and the same
- *    list on demand, on the task board of an imported session and over the files of one that
- *    still keeps Dynamic Spec; a reader who may not write gets no decision buttons; a session
- *    without findings has no line;
+ *  - a person's attach of a left-out finding asks first (cancelling does nothing), then asks the
+ *    server once; an attached finding links to its block and is dismissed after a question (its
+ *    block goes with it), an open one without; a dismissal that kept the block says so and
+ *    still links to it; a dismissed finding can be reopened;
+ *  - the Spec panel of a session with findings shows one line with how many are attached and
+ *    how many are not, and the same list on demand, on the task board of an imported session and
+ *    over the files of one that still keeps Dynamic Spec; a reader who may not write gets no
+ *    decision buttons; a session without findings has no line;
  *  - nothing scrolls sideways at 360 px.
  *
  * The suite owns only an ephemeral static server and browser; the API is the fixture's
@@ -156,7 +159,19 @@ async function pressInDialog(page: Page, label: string): Promise<void> {
 	await button.click();
 }
 
-test("the admin section: the scan, the findings a page at a time, read, attach, dismiss, reopen", async () => {
+async function chip(page: Page, status: "open" | "attached" | "dismissed"): Promise<void> {
+	await page.click(`[data-testid="spec-loss-status-${status}"] label`);
+}
+
+const chipText = (page: Page, status: string, label: string) =>
+	page.waitForFunction(
+		(selector, wanted) => document.querySelector(selector)?.textContent === wanted,
+		{},
+		`[data-testid="spec-loss-status-${status}"]`,
+		label,
+	);
+
+test("the admin section: the scan, the findings a page at a time, why not attached, read, attach, dismiss, reopen", async () => {
 	for (const [width, scheme] of [
 		[360, "light"],
 		[1280, "dark"],
@@ -164,14 +179,12 @@ test("the admin section: the scan, the findings a page at a time, read, attach, 
 		const { page, errors } = await open(width, { view: "admin", lang: "en", scheme });
 		await page.waitForSelector('[data-testid="spec-loss-row"]');
 		expect(await text(page, '[data-testid="spec-loss-admin"]')).toContain(en.admin.title);
-		const status = await text(page, '[data-testid="spec-loss-scan-status"]');
-		expect(status).toContain("Sessions looked at: 12; new findings: 3.");
-		expect(await text(page, '[data-testid="spec-loss-status-open"]')).toBe(
-			`${en.status.open} (26)`,
+		expect(await text(page, '[data-testid="spec-loss-scan-status"]')).toContain(
+			"Sessions looked at: 12; new findings: 3; attached: 2.",
 		);
-		expect(await text(page, '[data-testid="spec-loss-status-dismissed"]')).toBe(
-			`${en.status.dismissed} (1)`,
-		);
+		await chipText(page, "open", `${en.status.open} (23)`);
+		await chipText(page, "attached", `${en.status.attached} (9)`);
+		await chipText(page, "dismissed", `${en.status.dismissed} (1)`);
 		expect((await rows(page)).length).toBe(20);
 		await noSidewaysScroll(page);
 		await shot(page, `loss-admin-${width}-${scheme}`);
@@ -179,7 +192,7 @@ test("the admin section: the scan, the findings a page at a time, read, attach, 
 		// The next page.
 		await page.click('[data-testid="spec-loss-more"]');
 		await page.waitForFunction(
-			() => document.querySelectorAll('[data-testid="spec-loss-row"]').length === 26,
+			() => document.querySelectorAll('[data-testid="spec-loss-row"]').length === 23,
 		);
 		expect(await page.$('[data-testid="spec-loss-more"]')).toBeNull();
 
@@ -201,7 +214,7 @@ test("the admin section: the scan, the findings a page at a time, read, attach, 
 
 		// f001 is of a session still in Dynamic Spec: it says so and cannot be attached.
 		const spec = '[data-finding="f001"]';
-		expect(await text(page, `${spec} [data-testid="spec-loss-not-imported"]`)).toBe(en.notImported);
+		expect(await text(page, `${spec} [data-testid="spec-loss-why"]`)).toBe(en.why.not_imported);
 		expect(
 			await page.$eval(
 				`${spec} [data-testid="spec-loss-attach"]`,
@@ -211,10 +224,14 @@ test("the admin section: the scan, the findings a page at a time, read, attach, 
 		expect(await text(page, `${spec} [data-testid="spec-loss-what"]`)).toContain(
 			"lost: 2 tables, 1 image",
 		);
+		// Of the imported session, two were left out, each with its reason.
+		expect(await text(page, '[data-finding="f030"] [data-testid="spec-loss-why"]')).toBe(
+			en.why.no_page,
+		);
+		const row = '[data-finding="f027"]';
+		expect(await text(page, `${row} [data-testid="spec-loss-why"]`)).toBe(en.why.page_cap);
 
-		// f000 is of the imported session. Its lost content, on demand.
-		const row = '[data-finding="f000"]';
-		expect(await page.$(`${row} [data-testid="spec-loss-not-imported"]`)).toBeNull();
+		// Its lost content, on demand.
 		await page.click(`${row} [data-testid="spec-loss-view"]`);
 		await page.waitForFunction(
 			(selector) => document.querySelector(`${selector} pre`)?.textContent?.includes("alpha"),
@@ -238,60 +255,85 @@ test("the admin section: the scan, the findings a page at a time, read, attach, 
 		await noSidewaysScroll(page);
 		await shot(page, `loss-admin-detail-${width}-${scheme}`);
 
-		// Attach: asked first; cancelling does nothing.
+		// A person's attach of what was left out: asked first; cancelling does nothing.
 		await page.click(`${row} [data-testid="spec-loss-attach"]`);
 		await page.waitForSelector('[role="dialog"]');
 		const dialog = await text(page, '[role="dialog"]');
 		expect(dialog).toContain(en.attachTitle);
 		expect(dialog).toContain("Nothing else on the page changes");
 		await noSidewaysScroll(page);
-		const cancel = (await page.$$('[role="dialog"] button')).at(-2);
 		const labels = await page.$$eval('[role="dialog"] button', (els) =>
 			els.map((el) => el.textContent),
 		);
 		const cancelLabel = labels.find((label) => label && label !== en.attach);
-		if (!cancel || !cancelLabel) throw new Error(`No cancel button in ${labels.join(", ")}`);
+		if (!cancelLabel) throw new Error(`No cancel button in ${labels.join(", ")}`);
 		await pressInDialog(page, cancelLabel);
 		await dialogGone(page);
-		expect(await calls(page)).toEqual(["scan", "detail:f000"]);
+		expect(await calls(page)).toEqual(["scan", "detail:f027"]);
 
 		await page.click(`${row} [data-testid="spec-loss-attach"]`);
 		await page.waitForSelector('[role="dialog"]');
 		await pressInDialog(page, en.attach);
 		await page.waitForFunction((selector) => !document.querySelector(selector), {}, row);
 		await dialogGone(page);
-		expect(await calls(page)).toEqual(["scan", "detail:f000", "attach:f000"]);
-		await page.waitForFunction(
-			(label) =>
-				document.querySelector('[data-testid="spec-loss-status-attached"]')?.textContent === label,
-			{},
-			`${en.status.attached} (1)`,
-		);
+		expect(await calls(page)).toEqual(["scan", "detail:f027", "attach:f027"]);
+		await chipText(page, "attached", `${en.status.attached} (10)`);
 
-		// Dismiss another: asked once, no dialog.
+		// An open finding is dismissed without a question: there is no block to go with it.
 		await toastsGone(page);
 		await page.click('[data-finding="f002"] [data-testid="spec-loss-dismiss"]');
 		await page.waitForFunction(() => !document.querySelector('[data-finding="f002"]'));
 		expect((await calls(page)).at(-1)).toBe("dismiss:f002");
 
-		// Attached: listed with a link to its block, nothing more to decide.
-		await page.click('[data-testid="spec-loss-status-attached"] label');
-		await page.waitForSelector(`${row}[data-status="attached"]`);
+		// Attached: a link to its block; no attach; dismissed after a question.
+		await chip(page, "attached");
+		const on = '[data-finding="f000"]';
+		await page.waitForSelector(`${on}[data-status="attached"]`);
 		expect(
-			await page.$eval(`${row} [data-testid="spec-loss-open-block"]`, (el) =>
+			await page.$eval(`${on} [data-testid="spec-loss-open-block"]`, (el) =>
 				el.getAttribute("href"),
 			),
-		).toEndWith("/outline/space-1/block-1");
-		expect(await page.$(`${row} [data-testid="spec-loss-attach"]`)).toBeNull();
-		expect(await page.$(`${row} [data-testid="spec-loss-dismiss"]`)).toBeNull();
-
-		// Dismissed: can be reopened.
-		await page.click('[data-testid="spec-loss-status-dismissed"] label');
-		await page.waitForSelector('[data-finding="f002"][data-status="dismissed"]');
+		).toEndWith("/outline/space-1/block-0");
+		expect(await page.$(`${on} [data-testid="spec-loss-attach"]`)).toBeNull();
+		expect(await page.$(`${on} [data-testid="spec-loss-why"]`)).toBeNull();
 		await toastsGone(page);
-		await page.click('[data-finding="f002"] [data-testid="spec-loss-reopen"]');
-		await page.waitForFunction(() => !document.querySelector('[data-finding="f002"]'));
-		expect((await calls(page)).at(-1)).toBe("reopen:f002");
+		await page.click(`${on} [data-testid="spec-loss-dismiss"]`);
+		await page.waitForSelector('[role="dialog"]');
+		const question = await text(page, '[role="dialog"]');
+		expect(question).toContain(en.dismissTitle);
+		expect(question).toContain("unless someone edited it or wrote under it");
+		await noSidewaysScroll(page);
+		await pressInDialog(page, en.dismiss);
+		await page.waitForFunction((selector) => !document.querySelector(selector), {}, on);
+		await dialogGone(page);
+		expect((await calls(page)).at(-1)).toBe("dismiss:f000");
+
+		// One whose block someone wrote in: dismissed, the block kept, and said so.
+		await toastsGone(page);
+		await page.click('[data-finding="f003"] [data-testid="spec-loss-dismiss"]');
+		await page.waitForSelector('[role="dialog"]');
+		await pressInDialog(page, en.dismiss);
+		await page.waitForFunction(
+			(message) => document.body.textContent?.includes(message),
+			{},
+			en.done.dismissKept,
+		);
+		await dialogGone(page);
+
+		// Dismissed: the kept block is still linked; either can be reopened.
+		await chip(page, "dismissed");
+		await page.waitForSelector('[data-finding="f003"][data-status="dismissed"]');
+		expect(
+			await page.$eval('[data-finding="f003"] [data-testid="spec-loss-open-block"]', (el) =>
+				el.getAttribute("href"),
+			),
+		).toEndWith("/outline/space-1/block-3");
+		expect(await page.$(`${on} [data-testid="spec-loss-open-block"]`)).toBeNull();
+		expect(await page.$(`${on} [data-testid="spec-loss-dismiss"]`)).toBeNull();
+		await toastsGone(page);
+		await page.click(`${on} [data-testid="spec-loss-reopen"]`);
+		await page.waitForFunction((selector) => !document.querySelector(selector), {}, on);
+		expect((await calls(page)).at(-1)).toBe("reopen:f000");
 		await noSidewaysScroll(page);
 		expect(errors).toEqual([]);
 		await page.close();
@@ -301,50 +343,53 @@ test("the admin section: the scan, the findings a page at a time, read, attach, 
 	const { page, errors } = await open(360, { view: "admin", lang: "zh-CN", scheme: "dark" });
 	await page.waitForSelector('[data-testid="spec-loss-row"]');
 	expect(await text(page, '[data-testid="spec-loss-admin"]')).toContain(zh.admin.title);
-	expect(await text(page, '[data-testid="spec-loss-status-open"]')).toBe(`${zh.status.open} (26)`);
+	await chipText(page, "open", `${zh.status.open} (23)`);
 	expect(await text(page, '[data-finding="f001"] [data-testid="spec-loss-what"]')).toContain(
 		zh.kind.table_other.replace("{{count}}", "2"),
+	);
+	expect(await text(page, '[data-finding="f001"] [data-testid="spec-loss-why"]')).toBe(
+		zh.why.not_imported,
 	);
 	await noSidewaysScroll(page);
 	await shot(page, "loss-admin-360-dark-zh");
 	expect(errors).toEqual([]);
 	await page.close();
-}, 90_000);
+}, 120_000);
 
-test("the Spec panel: one line with the number, the list on demand; read-only for a reader; none without findings", async () => {
-	// An imported session, on its task board: its findings can be attached.
+test("the Spec panel: one line with the numbers, the list on demand; read-only for a reader; none without findings", async () => {
+	// An imported session, on its task board: most of its findings are on their pages.
 	{
 		const { page, errors } = await open(360, { view: "panel", lang: "en", scheme: "light" });
 		await page.waitForSelector(
 			'[data-testid="outline-tasks-panel"] [data-testid="spec-loss-notice"]',
 		);
-		const mine = 9; // f000, f003, … f024 are the first session's.
-		expect(await text(page, '[data-testid="spec-loss-notice"]')).toContain(
-			en.notice.replace("{{n}}", String(mine)),
-		);
+		const line = (attached: number, left: number) =>
+			en.notice.replace("{{attached}}", String(attached)).replace("{{open}}", String(left));
+		expect(await text(page, '[data-testid="spec-loss-notice"]')).toContain(line(9, 2));
 		expect(await page.$('[data-testid="spec-loss-row"]')).toBeNull();
 		await page.click('[data-testid="spec-loss-notice-toggle"]');
+		// The ones that are not attached first.
 		await page.waitForFunction(
-			(n) => document.querySelectorAll('[data-testid="spec-loss-row"]').length === n,
-			{},
-			mine,
+			() => document.querySelectorAll('[data-testid="spec-loss-row"]').length === 2,
 		);
 		expect(await text(page, '[data-testid="spec-loss-notice"]')).toContain(en.explain);
+		await chip(page, "attached");
+		await page.waitForFunction(
+			() => document.querySelectorAll('[data-testid="spec-loss-row"]').length === 9,
+		);
 		expect(
-			await page.$eval(
-				'[data-finding="f000"] [data-testid="spec-loss-attach"]',
-				(el) => (el as HTMLButtonElement).disabled,
-			),
-		).toBe(false);
+			await page.$('[data-finding="f000"] [data-testid="spec-loss-open-block"]'),
+		).not.toBeNull();
 		await noSidewaysScroll(page);
 		await shot(page, "loss-panel-board-360-light");
-		await toastsGone(page);
 		await page.click('[data-finding="f000"] [data-testid="spec-loss-dismiss"]');
+		await page.waitForSelector('[role="dialog"]');
+		await pressInDialog(page, en.dismiss);
 		await page.waitForFunction(
-			(line) =>
-				document.querySelector('[data-testid="spec-loss-notice"]')?.textContent?.includes(line),
+			(wanted) =>
+				document.querySelector('[data-testid="spec-loss-notice"]')?.textContent?.includes(wanted),
 			{},
-			en.notice.replace("{{n}}", String(mine - 1)),
+			line(8, 2),
 		);
 		expect(await calls(page)).toEqual(["dismiss:f000"]);
 		expect(errors).toEqual([]);
@@ -365,8 +410,8 @@ test("the Spec panel: one line with the number, the list on demand; read-only fo
 		await page.waitForSelector('[data-testid="spec-loss-row"]');
 		expect(await page.$('[data-testid="spec-loss-attach"]')).toBeNull();
 		expect(await page.$('[data-testid="spec-loss-dismiss"]')).toBeNull();
-		expect(await page.$('[data-testid="spec-loss-not-imported"]')).toBeNull();
-		// Reading the lost content is still offered.
+		// Why it is not on a page is said to a reader too, and the content can be read.
+		expect(await text(page, '[data-testid="spec-loss-why"]')).toBe(zh.why.not_imported);
 		expect(await text(page, '[data-testid="spec-loss-view"]')).toBe(zh.view);
 		await noSidewaysScroll(page);
 		await shot(page, "loss-panel-files-1280-dark-zh");
