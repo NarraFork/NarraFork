@@ -5,7 +5,7 @@ import {
 	SESSION_TOKEN_TTL_SECONDS,
 } from "@shared/session-auth";
 import type { AuthSessionRecord } from "../services/auth/session-store";
-import { authSessionStore } from "../services/auth/store";
+import { authMfaStore, authSessionStore } from "../services/auth/store";
 import { registrationAccountStore as accountStore } from "../services/registration/store";
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
 import { randomAvatarColor } from "./avatar-colors";
@@ -373,8 +373,98 @@ export async function buildSessionResult(userId: string): Promise<LoginSuccess> 
 }
 
 /**
+ * Finish a login whose identity is already proven: apply the second-factor gate, then
+ * issue the session.
+ *
+ * Shared by the local password path and the LDAP fallback so both answer the client with
+ * the same two shapes and the same MFA rules. `mfaEnabled` is passed in because the two
+ * paths read it from different places — the password path already has it from the
+ * credential lookup, the directory path has to ask the MFA store.
+ */
+async function completeLogin(
+	userId: string,
+	mfaEnabled: boolean,
+): Promise<LoginSuccess | MfaChallenge> {
+	// Gate on a second factor only when the user has opted into MFA. Merely
+	// having a passkey (a passwordless login method) or a dormant TOTP secret
+	// does NOT force a second step — `users.mfaEnabled` is the explicit switch.
+	// The available methods still depend on which factors are actually enrolled.
+	if (mfaEnabled) {
+		// Lazy import: the MFA service pulls in otpauth, which must not load for
+		// plain JWT verify/create consumers.
+		const { mfaService } = await import("../services/mfa-service");
+		const [totpActive, hasPasskey] = await Promise.all([
+			mfaService.isTotpActive(userId),
+			mfaService.hasAnyPasskey(userId),
+		]);
+		const methods: MfaChallenge["methods"] = [];
+		if (totpActive) methods.push("totp", "backup_code");
+		if (hasPasskey) methods.push("passkey");
+		// Defensive: if MFA is flagged on but no usable factor remains, fall
+		// through to a normal session rather than locking the user out.
+		if (methods.length > 0) {
+			const mfaToken = await issueMfaToken(userId);
+			return { mfaRequired: true, mfaToken, methods };
+		}
+	}
+
+	return buildSessionResult(userId);
+}
+
+/**
+ * Offer a password that failed local verification to the configured LDAP directory.
+ *
+ * Returns the local user id the directory authenticated, or null when the directory
+ * answered "wrong credentials" (or no directory is configured) — the caller then fails
+ * the attempt exactly as it would for a local mismatch.
+ *
+ * A directory that cannot be reached throws `LDAP_UNAVAILABLE` (503) instead of
+ * returning null: an outage is not a wrong password, and reporting it as one sends
+ * people hunting for a password they know is right.
+ */
+async function tryDirectoryLogin(
+	username: string,
+	password: string,
+	sourceIp: string,
+): Promise<string | null> {
+	// Lazy import: `ldapts` must not load for instances that never enable LDAP, and the
+	// login route is on the hot path of every session.
+	const ldap = await import("../services/ldap-auth-service");
+	if (!ldap.ldapAuthService.isEnabled()) return null;
+
+	const outcome = await ldap.ldapAuthService.authenticate(username, password);
+	if (outcome.kind === "invalid") {
+		logger.warn("Failed LDAP login attempt", {
+			accountFingerprint: fingerprintAuthIdentifier(username),
+			sourceIp,
+			reason: "invalid_credentials",
+		});
+		return null;
+	}
+	if (outcome.kind === "unavailable") {
+		logger.error("LDAP directory unavailable during login", { sourceIp, reason: outcome.reason });
+		throw new AppError("The directory server is currently unavailable", 503, "LDAP_UNAVAILABLE");
+	}
+
+	// The password is right. Binding/creating the local account is a policy decision that
+	// may still refuse (`LDAP_ACCOUNT_REQUIRED`), which propagates to the client with its
+	// own status — and, because the credential was valid, must not spend the failure budget.
+	const resolved = await ldap.ldapAuthService.resolveLocalUser(outcome.entry);
+	logger.info("LDAP login succeeded", {
+		userId: resolved.userId,
+		sourceIp,
+		outcome: resolved.outcome,
+	});
+	return resolved.userId;
+}
+
+/**
  * Verify username + password. When the account has an active second factor,
  * return an MFA challenge (no session token yet) instead of a session result.
+ *
+ * Order: local bcrypt first (the account's own password always wins), then the directory
+ * when one is configured and the local check failed. The user sees one form and one
+ * error; nothing tells them which of the two answered.
  */
 export async function loginUser(
 	username: string,
@@ -396,49 +486,63 @@ export async function loginUser(
 			password,
 			user?.passwordHash ?? INVALID_LOGIN_PADDING_HASH,
 		);
-		if (!valid || !user) {
-			const after = attempt.failure();
+		// The bcrypt slot bounds hashing CPU, not the attempt. Free it before the directory
+		// fallback waits on the network, so slow or unreachable LDAP cannot hold every slot
+		// and answer all other logins (the local administrator's included) with AUTH_BUSY.
+		attempt.releaseHashSlot();
+
+		if (valid && user) {
+			attempt.success();
 			attemptCompleted = true;
-			logger.warn("Failed password login attempt", {
-				userId: user?.id,
-				accountFingerprint: fingerprintAuthIdentifier(username),
-				sourceIp,
-				remaining: after.remaining,
-				locked: after.locked,
-			});
-			if (after.locked) {
-				throw new RateLimitError("LOGIN_THROTTLED", after.retryAfterMs);
-			}
-			throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
+			return completeLogin(user.id, user.mfaEnabled);
 		}
 
-		attempt.success();
+		// Local password did not match (or no such local account). Try the directory —
+		// one credential, two verifiers, a single failure budget for the whole attempt.
+		let directoryUserId: string | null;
+		try {
+			directoryUserId = await tryDirectoryLogin(username, password, sourceIp);
+		} catch (error) {
+			if (error instanceof AppError && error.code === "LDAP_UNAVAILABLE") {
+				// The local verifier has already rejected this password, so the guess is spent
+				// whatever the directory's state. Refunding it on an outage would let anyone
+				// guess local passwords — the administrator's included — without a budget for
+				// as long as the directory is down: 503 means "wrong", 200 means "right".
+				const after = attempt.failure();
+				attemptCompleted = true;
+				logger.warn("Failed password login attempt", {
+					userId: user?.id,
+					accountFingerprint: fingerprintAuthIdentifier(username),
+					sourceIp,
+					remaining: after.remaining,
+					locked: after.locked,
+					reason: "directory_unavailable",
+				});
+				if (after.locked) {
+					throw new RateLimitError("LOGIN_THROTTLED", after.retryAfterMs);
+				}
+			}
+			throw error;
+		}
+		if (directoryUserId) {
+			attempt.success();
+			attemptCompleted = true;
+			return completeLogin(directoryUserId, await authMfaStore.findMfaEnabled(directoryUserId));
+		}
+
+		const after = attempt.failure();
 		attemptCompleted = true;
-
-		// Gate on a second factor only when the user has opted into MFA. Merely
-		// having a passkey (a passwordless login method) or a dormant TOTP secret
-		// does NOT force a second step — `users.mfaEnabled` is the explicit switch.
-		// The available methods still depend on which factors are actually enrolled.
-		if (user.mfaEnabled) {
-			// Lazy import: the MFA service pulls in otpauth, which must not load for
-			// plain JWT verify/create consumers.
-			const { mfaService } = await import("../services/mfa-service");
-			const [totpActive, hasPasskey] = await Promise.all([
-				mfaService.isTotpActive(user.id),
-				mfaService.hasAnyPasskey(user.id),
-			]);
-			const methods: MfaChallenge["methods"] = [];
-			if (totpActive) methods.push("totp", "backup_code");
-			if (hasPasskey) methods.push("passkey");
-			// Defensive: if MFA is flagged on but no usable factor remains, fall
-			// through to a normal session rather than locking the user out.
-			if (methods.length > 0) {
-				const mfaToken = await issueMfaToken(user.id);
-				return { mfaRequired: true, mfaToken, methods };
-			}
+		logger.warn("Failed password login attempt", {
+			userId: user?.id,
+			accountFingerprint: fingerprintAuthIdentifier(username),
+			sourceIp,
+			remaining: after.remaining,
+			locked: after.locked,
+		});
+		if (after.locked) {
+			throw new RateLimitError("LOGIN_THROTTLED", after.retryAfterMs);
 		}
-
-		return buildSessionResult(user.id);
+		throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
 	} catch (error) {
 		if (!attemptCompleted) attempt.cancel();
 		throw error;

@@ -39,16 +39,19 @@ export function isMaskedSecret(value: string | undefined | null): boolean {
  * Produce a client-safe view of the auth settings:
  *  - `jwtSecret` removed entirely;
  *  - each OIDC provider's `clientSecret` masked;
+ *  - the LDAP service-account `bindPassword` masked (the `ldap` block stays absent
+ *    when the instance has no directory configured);
  *  - all non-secret fields (issuer, clientId, scopes, …) and webauthn config
  *    preserved as-is.
  */
 export function maskAuthSettings(auth: AuthSettings): Omit<AuthSettings, "jwtSecret"> {
-	const { jwtSecret: _jwtSecret, oidcProviders, ...rest } = auth;
+	const { jwtSecret: _jwtSecret, oidcProviders, ldap, ...rest } = auth;
 	return {
 		...rest,
 		oidcProviders: oidcProviders?.map((p) => ({
 			...p,
 			clientSecret: maskSecret(p.clientSecret),
 		})),
+		ldap: ldap ? { ...ldap, bindPassword: maskSecret(ldap.bindPassword) } : undefined,
 	};
 }

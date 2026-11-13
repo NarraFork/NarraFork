@@ -3,16 +3,21 @@
  * resulting grant works once, for one session and one purpose.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { randomBytes } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { Secret, TOTP } from "otpauth";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { users } from "../../db/schema";
+import { userIdentities, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { LDAP_PROVIDER_ID } from "../../lib/ldap/protocol";
+import { settings } from "../../lib/settings";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
 const { mfaService } = await import("../mfa-service");
+const { setLdapClientFactoryForTests } = await import("../ldap-auth-service");
 const { consumeStepUp, resetStepUpForTests, STEP_UP_PURPOSES, stepUpMethods, verifyStepUp } =
 	await import("../step-up-service");
 const { stepUpSchema } = await import("../../lib/validators/auth");
@@ -100,5 +105,92 @@ describe("step-up verification", () => {
 
 	test("the route accepts exactly the purposes the service grants", () => {
 		expect([...stepUpSchema.shape.purpose.options].sort()).toEqual([...STEP_UP_PURPOSES].sort());
+	});
+
+	test("an LDAP-only account steps up with its directory password", async () => {
+		await seedUser(true);
+		// Directory-only accounts carry a random, unguessable local hash: no local password
+		// can ever match, so without the directory fallback this account could never export
+		// its credentials.
+		await db
+			.update(users)
+			.set({ passwordHash: await Bun.password.hash(randomBytes(32).toString("hex")) })
+			.where(eq(users.id, userId));
+		await db.insert(userIdentities).values({
+			id: generateId(),
+			userId,
+			provider: LDAP_PROVIDER_ID,
+			subject: "grace",
+			createdAt: new Date().toISOString(),
+		});
+		settings.auth.ldap = {
+			enabled: true,
+			url: "ldaps://dc1.corp.example.com:636",
+			searchBase: "dc=example,dc=com",
+		};
+		const calls: string[] = [];
+		setLdapClientFactoryForTests(() => ({
+			async authenticate(username, password) {
+				calls.push(`${username}:${password}`);
+				return password === "directory-password"
+					? ({ kind: "ok", entry: { dn: "uid=grace", id: "grace" } } as const)
+					: ({ kind: "invalid" } as const);
+			},
+			async probe() {
+				return { stage: "ok", ok: true, message: "ok" };
+			},
+			async close() {},
+		}));
+		try {
+			// A local password would not work; the directory's does.
+			await expect(
+				verifyStepUp({
+					...base(),
+					password: "not-the-directory-one",
+					method: "totp",
+					code: code(),
+				}),
+			).rejects.toMatchObject({ code: "STEP_UP_FAILED" });
+
+			const grant = await verifyStepUp({
+				...base(),
+				password: "directory-password",
+				method: "totp",
+				code: code(),
+			});
+			expect(grant.token).toStartWith("nfsu_");
+			expect(calls).toEqual(["grace:not-the-directory-one", "grace:directory-password"]);
+		} finally {
+			setLdapClientFactoryForTests(undefined);
+			settings.auth.ldap = { enabled: false, url: "" };
+		}
+	});
+
+	test("a local password never triggers a directory round trip", async () => {
+		await seedUser(true);
+		settings.auth.ldap = {
+			enabled: true,
+			url: "ldaps://dc1.corp.example.com:636",
+			searchBase: "dc=example,dc=com",
+		};
+		const calls: string[] = [];
+		setLdapClientFactoryForTests(() => ({
+			async authenticate(username) {
+				calls.push(username);
+				return { kind: "invalid" } as const;
+			},
+			async probe() {
+				return { stage: "ok", ok: true, message: "ok" };
+			},
+			async close() {},
+		}));
+		try {
+			const grant = await verifyStepUp({ ...base(), method: "totp", code: code() });
+			expect(grant.token).toStartWith("nfsu_");
+			expect(calls).toEqual([]);
+		} finally {
+			setLdapClientFactoryForTests(undefined);
+			settings.auth.ldap = { enabled: false, url: "" };
+		}
 	});
 });

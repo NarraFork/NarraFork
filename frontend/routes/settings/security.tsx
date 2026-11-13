@@ -22,6 +22,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { isDirectoryIdentityProvider } from "@shared/identity-providers";
 import {
 	IconCheck,
 	IconCopy,
@@ -498,7 +499,10 @@ function downloadBackupCodes(codes: string[]) {
 	URL.revokeObjectURL(url);
 }
 
-/** SSO identity management: link new providers, list and unlink existing ones. */
+/**
+ * Identity management: link new SSO providers, list and unlink existing ones, and show a
+ * read-only directory binding when the account signs in through LDAP.
+ */
 function IdentitiesSection() {
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
@@ -509,9 +513,13 @@ function IdentitiesSection() {
 
 	const providers = providersData?.providers ?? [];
 	const identities = identitiesData?.identities ?? [];
+	// A directory binding is the account's login credential, not a federation link: it is
+	// listed so the person can see where their password comes from, but never unlinked.
+	const directoryIdentities = identities.filter((i) => isDirectoryIdentityProvider(i.provider));
+	const linkableIdentities = identities.filter((i) => !isDirectoryIdentityProvider(i.provider));
 
-	// SSO is only relevant when at least one provider is configured.
-	if (providers.length === 0) return null;
+	// Nothing to manage: no provider configured and no directory binding on this account.
+	if (providers.length === 0 && directoryIdentities.length === 0) return null;
 
 	const providerName = (id: string) => providers.find((p) => p.id === id)?.name ?? id;
 
@@ -543,15 +551,30 @@ function IdentitiesSection() {
 				<Box style={{ flex: 1 }}>
 					<Text fw={600}>{t("ssoTitle")}</Text>
 					<Text size="sm" c="dimmed" mt={4} maw={520}>
-						{t("ssoDescription")}
+						{providers.length > 0 ? t("ssoDescription") : t("ldapIdentityDescription")}
 					</Text>
 
 					{isLoading ? (
 						<Loader size="sm" mt="md" />
 					) : (
 						<Stack gap="xs" mt="md">
+							{directoryIdentities.map((identity) => (
+								<Group key={identity.id} justify="space-between" wrap="nowrap">
+									<Box>
+										<Text size="sm">{t("ldapIdentityLabel")}</Text>
+										<Text size="xs" c="dimmed">
+											{identity.displayName
+												? `${identity.displayName} · ${identity.subject}`
+												: identity.subject}
+										</Text>
+										<Text size="xs" c="dimmed">
+											{t("ldapIdentityManaged")}
+										</Text>
+									</Box>
+								</Group>
+							))}
 							{providers.map((p) => {
-								const linked = identities.filter((i) => i.provider === p.id);
+								const linked = linkableIdentities.filter((i) => i.provider === p.id);
 								if (linked.length > 0) {
 									return linked.map((identity) => (
 										<Group key={identity.id} justify="space-between" wrap="nowrap">
@@ -587,7 +610,7 @@ function IdentitiesSection() {
 								);
 							})}
 							{/* Identities whose provider is no longer configured. */}
-							{identities
+							{linkableIdentities
 								.filter((i) => !providers.some((p) => p.id === i.provider))
 								.map((identity) => (
 									<Group key={identity.id} justify="space-between" wrap="nowrap">

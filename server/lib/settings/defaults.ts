@@ -148,6 +148,13 @@ export const DEFAULTS: NarraForkSettings = {
 		jwtSecret: "",
 		registrationOpen: true,
 		trustedProxyCidrs: ["127.0.0.0/8", "::1/128"],
+		// Only the two fields that mean anything before the admin fills the rest in.
+		// Every other LDAP field stays optional so a fresh install carries no
+		// half-configured directory.
+		ldap: {
+			enabled: false,
+			url: "",
+		},
 	},
 	oauth: {
 		externalWebSocket: {
@@ -884,6 +891,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"auth.trustedProxyCidrs": {
 		desc: "认证限流可信任的反向代理 IP/CIDR。仅这些代理提供的 X-Forwarded-For 或 X-Real-IP 会用于识别客户端；默认只信任本机回环代理。",
 		type: "string[]",
+	},
+	"auth.ldap.enabled": {
+		desc: "是否启用 LDAP / Active Directory 目录认证。开启后，本地密码校验失败的登录会回退到目录校验；本地账户仍是授权主体（角色、会话、第二因素不变）。",
+		type: "boolean",
+	},
+	"auth.ldap.url": {
+		desc: "LDAP 服务器地址，形如 ldaps://dc1.corp.example.com:636 或 ldap://dc1.corp.example.com:389。地址中不要包含凭据或基准 DN。",
+		type: "string",
 	},
 
 	// ── oauth.externalWebSocket ─────────────────────────────────────────
