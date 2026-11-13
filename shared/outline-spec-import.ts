@@ -130,3 +130,85 @@ export interface OutlineSpecImportRevertResult {
 	/** Tasks the session held in the outline, reopened at once. */
 	released: number;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Content the old Spec panel may have swallowed (outline P2 PR 12c)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** What a person decided about a finding: nothing yet, put on the imported page, or dismissed. */
+export const OUTLINE_SPEC_LOSS_STATUSES = ["open", "attached", "dismissed"] as const;
+
+export type OutlineSpecLossStatus = (typeof OUTLINE_SPEC_LOSS_STATUSES)[number];
+
+/** `SpecLossKind` of `shared/spec-content-loss.ts`, restated for the API. */
+export type OutlineSpecLossKind =
+	| "table"
+	| "html"
+	| "image"
+	| "taskItem"
+	| "footnote"
+	| "frontMatter";
+
+/**
+ * One place where a save from the old Spec panel may have swallowed content: the file, the save,
+ * and how many structures of each kind the revision before it held that the save and the current
+ * revision do not. The lost text itself is read with the finding's detail only.
+ */
+export interface OutlineSpecLossFinding {
+	id: string;
+	narratorId: string;
+	/** The session's title (lists of several sessions show it). */
+	title: string | null;
+	path: string;
+	/** When the person saved (ISO time; null when not recorded). */
+	savedAt: string | null;
+	kinds: Partial<Record<OutlineSpecLossKind, number>>;
+	/** The excerpt kept does not hold everything that was lost. */
+	truncated: boolean;
+	status: OutlineSpecLossStatus;
+	/** `attached`: the block on the imported page, in the session's space. */
+	blockId: string | null;
+	spaceId: string | null;
+	resolvedAt: string | null;
+	createdAt: string;
+	/**
+	 * The session's tasks are in the outline, so the lost content can be put on the file's
+	 * imported page (it may still be refused: the page was deleted).
+	 */
+	attachable: boolean;
+}
+
+/** The lost text, in pieces of one kind each, as it stood before the save. */
+export interface OutlineSpecLossDetail extends OutlineSpecLossFinding {
+	parts: Array<{ kind: OutlineSpecLossKind; text: string }>;
+}
+
+/** How the scan is doing (administrators). */
+export interface OutlineSpecLossScanStatus {
+	running: boolean;
+	/** The last pass that ended in this process: when, and what it did. */
+	lastPass: {
+		at: string;
+		/** Sessions looked at (unchanged ones are skipped, not counted in `scanned`). */
+		sessions: number;
+		scanned: number;
+		found: number;
+		/** Sessions left for the next pass. */
+		left: number;
+	} | null;
+}
+
+export interface OutlineSpecLossPage {
+	items: OutlineSpecLossFinding[];
+	next: string | null;
+	/** Findings per status, each counted up to `countCap`. */
+	counts: Record<OutlineSpecLossStatus, number>;
+	countCap: number;
+	/** The reader may attach and dismiss (write access to the session, or an administrator). */
+	canAct: boolean;
+	/** Administrators' list only. */
+	scan?: OutlineSpecLossScanStatus;
+}
+
+/** A person's decision about one finding. */
+export type OutlineSpecLossAction = "attach" | "dismiss" | "reopen";

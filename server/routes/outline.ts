@@ -107,6 +107,8 @@ import {
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
+	outlineSpecLossActionSchema,
+	outlineSpecLossQuerySchema,
 	outlineTaskBoardQuerySchema,
 	outlineTreeQuerySchema,
 	outlineViewStatePutSchema,
@@ -1201,6 +1203,59 @@ outlineRoutes.post("/narrators/:narratorId/spec-import", async (c) => {
 	};
 	return c.json(body, 202);
 });
+
+/**
+ * Content a save from the old Spec panel may have swallowed in this session (outline P2 PR 12c):
+ * what the background scan recorded, a page of one status at a time, without the lost text.
+ * Read access; `canAct` says whether the reader may decide about a finding (write access).
+ */
+outlineRoutes.get("/narrators/:narratorId/spec-import/loss", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	const query = parse(outlineSpecLossQuerySchema, c.req.query());
+	const { specLossPage } = await import("../services/outline/spec-import/loss-findings");
+	return c.json(
+		await specLossPage({
+			...query,
+			narratorId: narrator.id,
+			canAct: await holds(principal, "write", { narrator }),
+		}),
+	);
+});
+
+/** One finding of the session with the lost text, as it stood before the save. Read access. */
+outlineRoutes.get("/narrators/:narratorId/spec-import/loss/:findingId", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	const { specLossDetail } = await import("../services/outline/spec-import/loss-findings");
+	return c.json(await specLossDetail(idParam(c, "findingId"), narrator.id));
+});
+
+/**
+ * A person's decision about one finding: `attach` puts the lost text on the file's imported page
+ * (one block at its top; nothing else is changed), `dismiss` says it was removed on purpose,
+ * `reopen` undoes a dismissal. Write access to the session. 409 when it was decided already or
+ * cannot be attached (the session is not imported, or the page is gone).
+ */
+outlineRoutes.post(
+	"/narrators/:narratorId/spec-import/loss/:findingId",
+	bodyLimit({ maxSize: 1024 }),
+	async (c) => {
+		const principal = principalOf(c);
+		const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+		if (!(await holds(principal, "write", { narrator }))) throw new ForbiddenError();
+		const input = parse(outlineSpecLossActionSchema, await c.req.json().catch(() => ({})));
+		const { decideSpecLossFinding } = await import("../services/outline/spec-import/loss-findings");
+		return c.json(
+			await decideSpecLossFinding({
+				id: idParam(c, "findingId"),
+				narratorId: narrator.id,
+				action: input.action,
+				userId: principal.userId,
+			}),
+		);
+	},
+);
 
 /**
  * The person saw tasks marked 「新完成」 on a board (outline P2 PR 9b): each is recorded at the

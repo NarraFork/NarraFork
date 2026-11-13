@@ -6,7 +6,10 @@ import {
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
-import { OUTLINE_SPEC_IMPORT_ADMIN_STATES } from "@shared/outline-spec-import";
+import {
+	OUTLINE_SPEC_IMPORT_ADMIN_STATES,
+	OUTLINE_SPEC_LOSS_STATUSES,
+} from "@shared/outline-spec-import";
 import { OUTLINE_TASK_BOARD_LIMITS } from "@shared/outline-task-board";
 import { z } from "zod";
 
@@ -248,4 +251,18 @@ export const outlineSpecImportAdminQuerySchema = z.object({
 	state: z.enum(OUTLINE_SPEC_IMPORT_ADMIN_STATES).default("attention"),
 	cursor: cursorSchema.optional(),
 	limit: limitSchema(50).default(20),
+});
+
+/**
+ * Content the old Spec panel may have swallowed (outline P2 PR 12c): one status's findings, a
+ * page at a time (a session's, or the admin page's), and a person's decision about one.
+ */
+export const outlineSpecLossQuerySchema = z.object({
+	status: z.enum(OUTLINE_SPEC_LOSS_STATUSES).default("open"),
+	cursor: cursorSchema.optional(),
+	limit: limitSchema(50).default(20),
+});
+
+export const outlineSpecLossActionSchema = z.object({
+	action: z.enum(["attach", "dismiss", "reopen"]),
 });

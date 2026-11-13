@@ -64,6 +64,12 @@ export const OUTLINE_SPEC_IMPORT_ACTOR = "spec-import";
  */
 export const OUTLINE_SPEC_REVERT_ACTOR = "spec-import-revert";
 
+/**
+ * The system actor of possibly lost content a person attached to its imported page (outline P2
+ * PR 12c, `loss-findings.ts`). NOT the import's own: a later import keeps what it wrote.
+ */
+export const OUTLINE_SPEC_LOSS_ACTOR = "spec-import-check";
+
 export const SPEC_IMPORT_TEXT: Record<
 	Locale,
 	{

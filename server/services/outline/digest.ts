@@ -59,7 +59,11 @@ import {
 	type OutlineTaskJson,
 } from "./model";
 import { OUTLINE_PLAN_ACTOR, OUTLINE_PLAN_REVIEW_ACTOR } from "./plans";
-import { OUTLINE_SPEC_IMPORT_ACTOR, OUTLINE_SPEC_REVERT_ACTOR } from "./spec-import/plan";
+import {
+	OUTLINE_SPEC_IMPORT_ACTOR,
+	OUTLINE_SPEC_LOSS_ACTOR,
+	OUTLINE_SPEC_REVERT_ACTOR,
+} from "./spec-import/plan";
 import type { OutlineRangeChange, OutlineVersionMeta } from "./store/digest-port";
 import type {
 	OutlineCommitRow,
@@ -130,6 +134,9 @@ const ROUTINE_SYSTEM_ACTORS = new Set([
 	// An administrator's move back to Dynamic Spec (P2 PR 12b2): its markers and the tasks it let
 	// go, bookkeeping of a decision made on the admin page, not anyone's work in the space.
 	OUTLINE_SPEC_REVERT_ACTOR,
+	// Possibly lost Dynamic Spec content a person attached to its imported page (P2 PR 12c): old
+	// content shown where it belongs (owner decision D52: on the page only), not work of the day.
+	OUTLINE_SPEC_LOSS_ACTOR,
 ]);
 
 /** A commit of the Dynamic Spec import: what it writes is where its tasks start from, not news. */
