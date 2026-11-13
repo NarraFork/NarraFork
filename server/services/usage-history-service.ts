@@ -51,7 +51,7 @@ interface CostCoverage {
 	partialRequestCount: number;
 }
 
-import { and, desc, eq, gte, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, gte, isNull, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
 	/** Historical owner; __unattributed__ selects requests with no recorded owner. */
@@ -73,15 +73,23 @@ export interface UsageHistoryFilters {
 /**
  * 命中率 = 缓存读取 / 总输入（读取 + 写入 + 未缓存输入）。
  *
- * 参与条件是"这条请求有任何缓存活动"（读到过或写过），而不是"读到过缓存"：
- *   - `cached = 0` 但写过缓存的请求是真实未命中（新会话首轮、缓存过期重建），必须进分母；
- *   - 读写全为 0 的是根本不上报缓存的 provider，算进来只会把比率压低。
- * 这样命中率与页面上并列的读/写/输入能对上（都只覆盖有缓存活动的那批请求）。
+ * 哪些请求进分母，看 `cache_usage_reported`（provider 的 usage 里有没有缓存计数字段）：
+ *   - true：上报了缓存计数，即使读写都是 0 也是真实未命中（新会话首轮、缓存过期、
+ *     OpenAI 系没有写入计数的未命中），必须进分母；
+ *   - false：provider 没上报缓存计数，读写列里的 0 只是占位，排除；
+ *   - null：旧记录或适配器无法判断。`cached_input_tokens` 等是 NOT NULL DEFAULT 0
+ *     （见 drizzle/0180），区分不了，只能退回"有缓存读或写才算"的启发式。
  *
- * 注意不能靠 `IS NULL` 判断"未上报"：`cached_input_tokens` 在库里是 DEFAULT 0 NOT NULL
- * （见 drizzle/0180），未上报与上报 0 无法区分。
+ * 并列展示的读取/写入总量与这里的分子、写入部分一致（被排除的请求读写本就为 0）；
+ * 并列的"输入"总量包含未参与请求的输入，两者不要求相等。
  */
-const reportsCacheUsage = sql`(coalesce(${apiRequests.cachedInputTokens}, 0) > 0 or coalesce(${apiRequests.cacheCreationInputTokens}, 0) > 0)`;
+const reportsCacheUsage = or(
+	eq(apiRequests.cacheUsageReported, true),
+	and(
+		isNull(apiRequests.cacheUsageReported),
+		or(gt(apiRequests.cachedInputTokens, 0), gt(apiRequests.cacheCreationInputTokens, 0)),
+	),
+);
 
 const cacheHitRateSelection = {
 	cacheHitRateReadTokens: sql<number>`coalesce(sum(case when ${reportsCacheUsage} then coalesce(${apiRequests.cachedInputTokens}, 0) else 0 end), 0)`,

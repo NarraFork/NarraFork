@@ -38,7 +38,7 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 
 	const cacheWriteTooltip = `5m: ${cacheCreation5mTokens.compact} (${cacheCreation5mTokens.exact}) · 1h: ${cacheCreation1hTokens.compact} (${cacheCreation1hTokens.exact})`;
 
-	// 服务端按全部请求计算：读取 /（读取 + 写入 + 未缓存输入），可与下面的 token 数字对上。
+	// 服务端只统计上报了缓存计数的请求：读取 /（读取 + 写入 + 未缓存输入）；见 usage-history-service。
 	const cacheHitRatePercent = stats.cacheHitRate == null ? null : stats.cacheHitRate * 100;
 	const cacheHitRate =
 		cacheHitRatePercent === null

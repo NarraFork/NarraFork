@@ -833,6 +833,8 @@ export type AgentEvent =
 				cacheCreationInputTokens?: number;
 				cacheCreation5mTokens?: number;
 				cacheCreation1hTokens?: number;
+				/** See ParsedStreamEvent.usage.cacheReported. */
+				cacheReported?: boolean;
 			};
 			ttftMs?: number;
 			durationMs?: number;

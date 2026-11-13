@@ -225,7 +225,71 @@ describe("cache hit rate eligibility", () => {
 			.run();
 	}
 
-	test("summary and time buckets include every request with cache activity, ignoring ordinary totals", async () => {
+	test("reported cache counters decide eligibility; zero-cache misses count, unreported rows do not", async () => {
+		db.insert(apiRequests)
+			.values([
+				{
+					// OpenAI 系没有写入计数：上报了 cached=0 的未命中必须进分母。
+					id: "openai-miss",
+					createdAt,
+					provider: "openai",
+					model: "gpt",
+					inputTokens: 5000,
+					cachedInputTokens: 0,
+					cacheUsageReported: true,
+				},
+				{
+					id: "openai-hit",
+					createdAt,
+					provider: "openai",
+					model: "gpt",
+					inputTokens: 2000,
+					cachedInputTokens: 3000,
+					cacheUsageReported: true,
+				},
+				{
+					// 中转没带缓存字段：0 只是占位，不进分母。
+					id: "relay-unreported",
+					createdAt,
+					provider: "relay",
+					model: "gpt",
+					inputTokens: 7000,
+					cacheUsageReported: false,
+				},
+				{
+					// 旧记录：退回"有缓存读写才算"。
+					id: "legacy-write",
+					createdAt,
+					provider: "legacy",
+					model: "claude",
+					inputTokens: 100,
+					cacheCreationInputTokens: 900,
+				},
+				{
+					id: "legacy-silent",
+					createdAt,
+					provider: "legacy",
+					model: "claude",
+					inputTokens: 4000,
+				},
+			])
+			.run();
+		const stats = await service.getUsageStats(filters);
+		expect(stats).toMatchObject({
+			cacheHitRateReadTokens: 3000,
+			cacheHitRateInputTokens: 5000 + 5000 + 1000,
+		});
+		expect(stats.cacheHitRate).toBeCloseTo(3000 / 11000);
+		expect(
+			(await service.getUsageStats({ ...filters, provider: "openai" })).cacheHitRate,
+		).toBeCloseTo(0.3);
+		expect(
+			(await service.getUsageStats({ ...filters, provider: "relay" })).cacheHitRate,
+		).toBeNull();
+		expect((await service.getUsageStats({ ...filters, provider: "legacy" })).cacheHitRate).toBe(0);
+	});
+
+	test("legacy rows: summary and time buckets include every request with cache activity, ignoring ordinary totals", async () => {
 		seedCacheRequests();
 		const stats = await service.getUsageStats(filters);
 		// 参与分母：cache-large 1600 + cache-small 100 + zero-cache 13000 + write-only 34000。

@@ -3711,6 +3711,10 @@ export const apiRequests = sqliteTable(
 		cacheCreation5mTokens: integer("cache_creation_5m_tokens").notNull().default(0),
 		cacheCreation1hTokens: integer("cache_creation_1h_tokens").notNull().default(0),
 		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		// provider 的 usage 是否带了缓存计数字段（哪怕是 0）。cached/creation 列是 NOT NULL DEFAULT 0，
+		// 分不清"上报了 0"（真实未命中）和"根本没上报"，命中率靠这一列区分。
+		// null = 旧记录或该适配器无法判断，命中率退回"有缓存读写才算"的启发式。
+		cacheUsageReported: integer("cache_usage_reported", { mode: "boolean" }),
 		// 性能指标
 		ttftMs: integer("ttft_ms"), // Time to first token
 		durationMs: integer("duration_ms"), // 总耗时

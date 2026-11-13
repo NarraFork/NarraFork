@@ -498,6 +498,13 @@
 			"when": 1794365828817,
 			"tag": "0070_outline_view_state_expanded",
 			"breakpoints": true
+		},
+		{
+			"idx": 71,
+			"version": "7",
+			"when": 1794531377215,
+			"tag": "0071_api_request_cache_usage_reported",
+			"breakpoints": true
 		}
   ]
 }

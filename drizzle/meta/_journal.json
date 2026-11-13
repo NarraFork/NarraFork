@@ -1779,6 +1779,13 @@
       "when": 1794365827385,
       "tag": "0253_outline_view_state_expanded",
       "breakpoints": true
+    },
+    {
+      "idx": 254,
+      "version": "6",
+      "when": 1794531370978,
+      "tag": "0254_tired_mimic",
+      "breakpoints": true
     }
   ]
 }
