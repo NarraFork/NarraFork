@@ -1,3 +1,5 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
 import type {
 	ComposerAsset,
 	ComposerDocument,
@@ -252,6 +254,7 @@ function warnSlowComposer(
 
 function safeImageSource(resource: File | string | undefined): string | undefined {
 	if (typeof resource !== "string") return undefined;
+	if (REMOTE_BUILD) return isRemoteInlineImage(resource) ? resource : undefined;
 	if (resource.startsWith("blob:") || /^\/api\//.test(resource)) return resource;
 	return undefined;
 }

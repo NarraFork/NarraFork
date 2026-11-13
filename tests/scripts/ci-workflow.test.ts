@@ -143,7 +143,21 @@ describe("generic CI workflow", () => {
 			for (const valueStep of value.steps) {
 				expect(valueStep["continue-on-error"]).toBeUndefined();
 				const isReport = id === "tests" && valueStep.uses === pins.upload;
-				expect(valueStep.if).toBe(isReport ? expression("always()") : undefined);
+				const isDeclaredRemoteAsset =
+					(id === "build" &&
+						[
+							"Build declared remote frontend",
+							"Upload remote frontend",
+							"Upload remote UI for isolated browser tests",
+						].includes(valueStep.name ?? "")) ||
+					(id === "tests" && valueStep.name === "Download remote UI for isolated browser tests");
+				expect(valueStep.if).toBe(
+					isReport
+						? expression("always()")
+						: isDeclaredRemoteAsset
+							? expression("hashFiles('shared/remote-access/frontend-capability.json') != ''")
+							: undefined,
+				);
 				if (valueStep.uses) {
 					expect(valueStep.uses).toMatch(/^[\w-]+\/[\w-]+@[a-f0-9]{40}$/);
 					expect(Object.values(pins)).toContain(valueStep.uses);
@@ -383,7 +397,10 @@ describe("generic CI workflow", () => {
 			(value) => !!value.run?.includes("test -f frontend/routeTree.gen.ts"),
 		);
 		const typecheck = command("build", "bunx tsgo --noEmit");
-		const upload = step("build", (value) => value.uses === pins.upload);
+		const upload = step(
+			"build",
+			(value) => value.uses === pins.upload && value.with?.name === "ci-frontend",
+		);
 		expect(steps.indexOf(build)).toBeLessThan(steps.indexOf(verify));
 		expect(verify.run).toContain("test -f dist/frontend/index.html");
 		expect(steps.indexOf(verify)).toBeLessThan(steps.indexOf(typecheck));

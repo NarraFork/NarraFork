@@ -8,7 +8,7 @@ export const MAX_RELAY_READY_BYTES = 8 * 1024;
 export const MAX_RELAY_PAYLOAD_BYTES = 1024 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHA = /^[a-f0-9]{64}$/;
-export type RelayKind = "main" | "helpers" | "executor";
+export type RelayKind = "main" | "helpers" | "executor" | "remote-peer";
 export const MAX_MIRROR_UPLOAD_CONCURRENCY = 8;
 export const DEFAULT_MIRROR_UPLOAD_CONCURRENCY = 3;
 export const DEFAULT_MIRROR_DIRECT_UPLOAD_CONCURRENCY = 2;
@@ -78,7 +78,7 @@ function segment(value: unknown): asserts value is string {
 	check(typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value));
 }
 function kind(value: unknown): asserts value is RelayKind {
-	check(value === "main" || value === "helpers" || value === "executor");
+	check(value === "main" || value === "helpers" || value === "executor" || value === "remote-peer");
 }
 function timestamp(value: unknown): number {
 	check(typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value));

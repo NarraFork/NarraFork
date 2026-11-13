@@ -96,7 +96,7 @@ resource.setrlimit(resource.RLIMIT_CPU, (900, 900))
 archive, destination, maximum = sys.argv[1], sys.argv[2], int(sys.argv[3])
 with zipfile.ZipFile(archive) as bundle:
     entries = bundle.infolist()
-    if len(entries) > 202: raise ValueError('bundle entry limit')
+    if len(entries) > 54: raise ValueError('bundle entry limit')
     seen = set()
     total = 0
     for entry in entries:
@@ -110,7 +110,7 @@ with zipfile.ZipFile(archive) as bundle:
         if entry.is_dir() or kind not in (0, stat.S_IFREG): raise ValueError('nonregular bundle entry')
         if name != 'manifest.json' and not re.fullmatch(r'dist/[A-Za-z0-9][A-Za-z0-9._-]{0,199}', name):
             raise ValueError('unsafe bundle path')
-        limit = 1024 * 1024 if name == 'manifest.json' else 1024 ** 3
+        limit = 1024 * 1024 if name == 'manifest.json' or name.endswith('-remote-frontend.manifest.json') else (128 * 1024 ** 2 if name.endswith('-remote-frontend.tar.gz') else 1024 ** 3)
         if entry.file_size < 1 or entry.file_size > limit: raise ValueError('bundle file size limit')
         total += entry.file_size
         if total + os.stat(archive).st_size > maximum: raise ValueError('bundle extraction budget')
@@ -380,6 +380,12 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 		) {
 			throw new Error("Bundle manifest does not match source run provenance");
 		}
+		if (
+			plan.remoteFrontend &&
+			plan.buildSource &&
+			!successfulSourceJobs(jobs, ["Restore original remote frontend"])
+		)
+			throw new Error("Remote frontend restore proof missing from source attempt");
 		if (plan.buildSource) {
 			if (!reverifyJobs || plan.buildSource.platforms.length !== CI_RELEASE_TARGETS.length)
 				throw new Error("Re-verification bundle lacks this attempt's complete native proof");

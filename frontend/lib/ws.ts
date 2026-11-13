@@ -17,6 +17,7 @@
  */
 
 import { assetUrl } from "@frontend/lib/base-path";
+import type { BusinessSocket } from "@shared/remote-access/business-transport";
 
 declare const __DEV_VITE_PORT__: string | undefined;
 declare const __DEV_BACKEND_PORT__: string | undefined;
@@ -63,18 +64,21 @@ function isLocalViteDirect(vitePort: string): boolean {
  * Detaches all handlers first, then either closes immediately (if OPEN) or
  * waits for the connection to open before closing (if CONNECTING).
  */
-export function safeCloseWs(ws: WebSocket | null, beforeClose?: (ws: WebSocket) => void): void {
+export function safeCloseWs(
+	ws: BusinessSocket | null,
+	beforeClose?: (ws: BusinessSocket) => void,
+): void {
 	if (!ws) return;
 	ws.onmessage = null;
 	ws.onerror = null;
-	if (ws.readyState === WebSocket.CONNECTING) {
+	if (ws.readyState === 0) {
 		// Wait for the connection to establish, then close it cleanly
 		ws.onopen = () => ws.close();
 		ws.onclose = null;
 	} else {
 		ws.onopen = null;
 		ws.onclose = null;
-		if (ws.readyState === WebSocket.OPEN) {
+		if (ws.readyState === 1) {
 			beforeClose?.(ws);
 		}
 		ws.close();

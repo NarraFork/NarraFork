@@ -180,10 +180,10 @@ for (const delivery of ["github", "update-server"] as const) {
 					(name) => name.endsWith(".exe") || name.endsWith(".tmp"),
 				),
 			).toEqual([]);
+			const selectedBase = delivery === "update-server" ? mirrorBase : releaseBase;
 			expect(calls).toEqual([
-				`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
-				...(delivery === "update-server" ? [`${mirrorBase}${spec.toolName}`] : []),
-				`${releaseBase}${spec.toolName}`,
+				`${selectedBase}${HELPER_MANIFEST_FILENAME}`,
+				`${selectedBase}${spec.toolName}`,
 			]);
 		});
 		test("downloads native ARM64 even when legacy x64 cache exists", async () => {
@@ -204,9 +204,10 @@ for (const delivery of ["github", "update-server"] as const) {
 			if (!path) throw new Error("Native ARM64 helper must be downloaded");
 			expect(path).toEndWith(".exe");
 			expect(await Bun.file(path).bytes()).toEqual(Uint8Array.from(pe(0xaa64)));
+			const selectedBase = delivery === "update-server" ? mirrorBase : releaseBase;
 			expect(calls).toEqual([
-				`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
-				`${delivery === "update-server" ? mirrorBase : releaseBase}${spec.toolName}`,
+				`${selectedBase}${HELPER_MANIFEST_FILENAME}`,
+				`${selectedBase}${spec.toolName}`,
 			]);
 			expect(await downloadHelperBinary(spec)).toBe(path);
 			expect(calls.length).toBe(2);
@@ -237,13 +238,12 @@ for (const delivery of ["github", "update-server"] as const) {
 				await downloadHelperBinary(spec, { maxBytes: 64, bypassFailureCache: true }),
 			).toBeNull();
 			expect(cancelled).toEqual([
-				...(delivery === "update-server" ? [`${mirrorBase}${spec.toolName}`] : []),
-				`${releaseBase}${spec.toolName}`,
+				`${delivery === "update-server" ? mirrorBase : releaseBase}${spec.toolName}`,
 			]);
+			const selectedBase = delivery === "update-server" ? mirrorBase : releaseBase;
 			expect(calls).toEqual([
-				`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
-				...(delivery === "update-server" ? [`${mirrorBase}${spec.toolName}`] : []),
-				`${releaseBase}${spec.toolName}`,
+				`${selectedBase}${HELPER_MANIFEST_FILENAME}`,
+				`${selectedBase}${spec.toolName}`,
 			]);
 			expect(existsSync(join(HELPER_BIN_DIR, spec.cachedName))).toBe(false);
 			expect(
@@ -255,36 +255,38 @@ for (const delivery of ["github", "update-server"] as const) {
 	});
 }
 
-for (const failure of ["missing", "corrupt"] as const) {
-	test(`native ARM64 uses the same pinned GitHub asset after a ${failure} mirror response`, async () => {
+for (const failure of ["manifest-missing", "missing", "corrupt"] as const) {
+	test(`native ARM64 rejects a ${failure} mirror response without GitHub fallback or cached binaries`, async () => {
 		selectDelivery("update-server");
 		const payload = pe(0xaa64);
 		const damaged = Uint8Array.from(payload);
 		damaged[200] = 1;
 		const calls: string[] = [];
+		const spec = getCliHelperSpec("zstd", "win32", "arm64");
+		if (!spec) throw new Error("Missing spec");
 		globalThis.fetch = (async (input: RequestInfo | URL) => {
 			const url = String(input);
 			calls.push(url);
-			if (url === `${releaseBase}${HELPER_MANIFEST_FILENAME}`)
-				return Response.json(catalog(payload));
-			if (url.startsWith(mirrorBase))
+			if (url === `${mirrorBase}${HELPER_MANIFEST_FILENAME}`)
+				return failure === "manifest-missing"
+					? new Response(null, { status: 404 })
+					: Response.json(catalog(payload));
+			if (url === `${mirrorBase}${spec.toolName}`)
 				return failure === "missing" ? new Response(null, { status: 404 }) : new Response(damaged);
-			return new Response(Uint8Array.from(payload));
+			throw new Error("Selected mirror must never contact GitHub or another component endpoint");
 		}) as unknown as typeof fetch;
-		const spec = getCliHelperSpec("zstd", "win32", "arm64");
-		if (!spec) throw new Error("Missing spec");
-		const path = await downloadHelperBinary(spec, { bypassFailureCache: true });
-		expect(path).not.toBeNull();
-		if (!path) throw new Error("Pinned GitHub fallback must preserve native ARM64 support");
-		expect(isWindowsPeFile(path, "arm64")).toBe(true);
-		expect(await Bun.file(path).bytes()).toEqual(Uint8Array.from(payload));
+		expect(await downloadHelperBinary(spec, { bypassFailureCache: true })).toBeNull();
 		expect(calls).toEqual([
-			`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
-			`${mirrorBase}${spec.toolName}`,
-			`${releaseBase}${spec.toolName}`,
+			`${mirrorBase}${HELPER_MANIFEST_FILENAME}`,
+			...(failure === "manifest-missing" ? [] : [`${mirrorBase}${spec.toolName}`]),
 		]);
+		expect(calls.some((url) => new URL(url).hostname === "github.com")).toBe(false);
+		expect(existsSync(join(HELPER_BIN_DIR, spec.cachedName))).toBe(false);
+		const directory = join(HELPER_BIN_DIR, "distribution");
 		expect(
-			readdirSync(join(HELPER_BIN_DIR, "distribution")).filter((name) => name.endsWith(".tmp")),
+			existsSync(directory)
+				? readdirSync(directory).filter((name) => name.endsWith(".exe") || name.endsWith(".tmp"))
+				: [],
 		).toEqual([]);
 	});
 }

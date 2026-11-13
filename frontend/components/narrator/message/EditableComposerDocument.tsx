@@ -1,4 +1,6 @@
 import { usePromptOptimize } from "@frontend/hooks/usePromptOptimize";
+import { readBoundedBlob } from "@frontend/lib/bounded-blob";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { ActionIcon, Box, Button, Group, Modal, Stack, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { ComposerDocument } from "@shared/composer-document";
@@ -15,7 +17,7 @@ import { IconPaperclip } from "@tabler/icons-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { clearTokenOnSessionFailure, getToken, getUploadedImageUrl } from "../../../lib/api";
+import { authorizedFetch, clearTokenOnSessionFailure, getUploadedImageUrl } from "../../../lib/api";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
@@ -201,44 +203,26 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 			next.set(id, "kept-image");
 			if (!resource.imageId || !resource.uploadNarratorId) continue;
 			jobs.push(async () => {
-				const token = getToken();
-				const response = await fetch(
+				const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]);
+				const response = await authorizedFetch(
 					getUploadedImageUrl(
 						resource.uploadNarratorId ?? "",
 						resource.imageId ?? "",
 						props.narratorId,
 					),
-					{
-						headers: token ? { Authorization: `Bearer ${token}` } : {},
-						signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
-					},
+					{ signal },
 				);
 				if (!response.ok) {
-					await clearTokenOnSessionFailure(response);
+					await clearTokenOnSessionFailure(response.clone());
 					return;
 				}
-				const reader = response.body?.getReader();
-				if (!reader) return;
-				const chunks: Uint8Array<ArrayBuffer>[] = [];
-				let size = 0;
-				try {
-					while (true) {
-						const result = await reader.read();
-						if (result.done) break;
-						size += result.value.byteLength;
-						if (size > MAX_IMAGE_CLIPBOARD_BLOB_BYTES) {
-							await reader.cancel();
-							return;
-						}
-						chunks.push(new Uint8Array(result.value));
-					}
-				} finally {
-					reader.releaseLock();
-				}
-				if (controller.signal.aborted) return;
-				const url = URL.createObjectURL(
-					new Blob(chunks, { type: response.headers.get("content-type") ?? resource.mimeType }),
+				const blob = await readBoundedBlob(
+					response,
+					REMOTE_BUILD ? 8 * 1024 * 1024 : MAX_IMAGE_CLIPBOARD_BLOB_BYTES,
+					signal,
 				);
+				if (controller.signal.aborted) return;
+				const url = URL.createObjectURL(blob);
 				urls.push(url);
 				setResources((previous) => new Map(previous).set(id, url));
 			});
@@ -292,7 +276,7 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 					if (
 						!Object.hasOwn(MEDIA_MIME_TO_EXT, file.type) ||
 						!file.size ||
-						file.size > MAX_MEDIA_FILE_SIZE ||
+						file.size > (REMOTE_BUILD ? 7 * 1024 * 1024 : MAX_MEDIA_FILE_SIZE) ||
 						mediaCount >= MAX_MEDIA_ATTACHMENTS
 					) {
 						notifications.show({
@@ -310,11 +294,16 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 					}
 					mediaCount++;
 				} else if (image) {
-					if (file.size > MAX_IMAGE_SIZE || images >= MAX_QUEUED_IMAGES) {
+					if (
+						file.size >
+							(REMOTE_BUILD ? Math.min(MAX_IMAGE_SIZE, 7 * 1024 * 1024) : MAX_IMAGE_SIZE) ||
+						images >= MAX_QUEUED_IMAGES
+					) {
 						notifications.show({
 							color: "yellow",
 							message:
-								file.size > MAX_IMAGE_SIZE
+								file.size >
+								(REMOTE_BUILD ? Math.min(MAX_IMAGE_SIZE, 7 * 1024 * 1024) : MAX_IMAGE_SIZE)
 									? t("imageTooLarge")
 									: t("editTooManyImages", { max: MAX_QUEUED_IMAGES }),
 						});
@@ -331,7 +320,8 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 				} else {
 					if (
 						!isTextFile(file.name) ||
-						file.size > MAX_TEXT_FILE_SIZE ||
+						file.size >
+							(REMOTE_BUILD ? Math.min(MAX_TEXT_FILE_SIZE, 7 * 1024 * 1024) : MAX_TEXT_FILE_SIZE) ||
 						texts >= MAX_QUEUED_TEXT_FILES
 					) {
 						notifications.show({
@@ -339,7 +329,10 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 							title: t(
 								!isTextFile(file.name)
 									? "unsupportedFileType"
-									: file.size > MAX_TEXT_FILE_SIZE
+									: file.size >
+											(REMOTE_BUILD
+												? Math.min(MAX_TEXT_FILE_SIZE, 7 * 1024 * 1024)
+												: MAX_TEXT_FILE_SIZE)
 										? "textFileTooLarge"
 										: "editTooManyFiles",
 								{ max: MAX_QUEUED_TEXT_FILES },
@@ -528,6 +521,7 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 							</ActionIcon>
 						</Tooltip>
 						<TextareaOptimizeControls
+							optimizeAvailable={!REMOTE_BUILD}
 							disabled={
 								props.disabled ||
 								addingFiles ||

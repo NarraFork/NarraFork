@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.9.13",
+	"version": "0.9.14",
 	"private": true,
 	"license": "MPL-2.0",
 	"packageManager": "bun@1.4.3",
@@ -123,6 +123,8 @@
 		"approve": "bun server/scripts/approve-all.ts",
 		"sql:report": "bun scripts/sql-trace-report.ts",
 		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts && bun scripts/generate-builtin-plugins.ts",
+		"build:remote": "bun scripts/build-remote-frontend.ts",
+		"build:remote:assets": "bunx vite build --config frontend/vite.remote.config.ts",
 		"build:cross": "bun scripts/build-cross-platform.ts",
 		"build:update-server": "bun scripts/build-update-server.ts",
 		"build:linux": "bun scripts/build-cross-platform.ts --platform=linux",

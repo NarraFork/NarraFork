@@ -45,6 +45,7 @@ const EXPECTED_INSTANCE = [
 	"/settings/proxy",
 	"/settings/workspace",
 	"/settings/server",
+	"/settings/remote-access",
 	"/settings/authentication",
 	"/settings/oauth-apps",
 	"/settings/users",

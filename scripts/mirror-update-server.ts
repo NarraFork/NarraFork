@@ -1,5 +1,5 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
 	mirrorJobTimeoutMs,
@@ -11,14 +11,15 @@ import { validateWebDavConfig } from "../shared/webdav-transport";
 import { resolveMirrorRelayConfig, resolveMirrorTransport } from "./lib/mirror-relay-stage";
 import {
 	readMirrorDataFile,
-	resolveMirrorWorkflowTrigger,
-	verifyMirrorPublicationReceipt,
+	readMirrorPublicationReceiptSet,
+	resolveMirrorWorkflowTriggers,
 	verifyProtectedMirrorEnvironment,
 } from "./lib/mirror-workflow";
 import { resolveUpdateServerMirrorConfig } from "./lib/update-server-bridge-http";
 import {
 	IndependentMirrorError,
 	type IndependentMirrorReceipt,
+	MIRROR_TOTAL_BYTES,
 	type MirrorPublishedOptions,
 	mirrorPublishedMainRelease,
 	mirrorReceipt,
@@ -77,6 +78,92 @@ export async function mirrorPublishedGitHubRelease(
 		? mirrorPublishedMainRelease(options)
 		: mirrorPublishedToolsRelease(options);
 }
+/** A multi-publication run cannot overwrite one component's result with another. */
+export function mirrorPublicationReceiptPath(
+	path: string,
+	kind: MirrorPublishedOptions["kind"],
+	multiple: boolean,
+): string {
+	return multiple ? join(dirname(path), kind, basename(path)) : path;
+}
+/** Sequential producers share the same count, byte budget and absolute deadline, including failures. */
+export async function mirrorPublishedGitHubReleaseSet(
+	targets: MirrorPublishedOptions[],
+	mirror = mirrorPublishedGitHubRelease,
+): Promise<IndependentMirrorReceipt[]> {
+	if (
+		!targets.length ||
+		targets.length > 2 ||
+		new Set(targets.map((target) => target.kind)).size !== targets.length
+	)
+		throw new Error("Invalid mirror publication target set");
+	const timeout = Math.min(
+		...targets.map((target) =>
+			validateMirrorJobTimeoutMs(target.totalTimeoutMs ?? mirrorJobTimeoutMs(target.kind)),
+		),
+	);
+	const signal = AbortSignal.any([
+		AbortSignal.timeout(timeout),
+		...targets.flatMap((target) => (target.signal ? [target.signal] : [])),
+	]);
+	const maximumBytes = Math.min(
+		MIRROR_TOTAL_BYTES,
+		...targets.map((target) => target.maxTotalBytes ?? MIRROR_TOTAL_BYTES),
+	);
+	let count = 0;
+	let bytes = 0;
+	const receipts: IndependentMirrorReceipt[] = [];
+	for (const target of targets) {
+		const options: MirrorPublishedOptions = {
+			...target,
+			signal,
+			totalTimeoutMs: timeout,
+			reserveAssets: (assets) => {
+				const amount = 2 * assets.reduce((sum, asset) => sum + asset.size, 0);
+				if (
+					!Number.isSafeInteger(maximumBytes) ||
+					maximumBytes < 1 ||
+					!Number.isSafeInteger(amount) ||
+					amount < 1 ||
+					assets.some((asset) => !Number.isSafeInteger(asset.size) || asset.size < 1) ||
+					count + assets.length > 200 ||
+					bytes + amount > maximumBytes
+				)
+					throw new Error("Shared mirror publication asset/byte budget exceeded");
+				count += assets.length;
+				bytes += amount;
+				target.reserveAssets?.(assets);
+			},
+		};
+		try {
+			signal.throwIfAborted();
+			receipts.push(await mirror(options));
+		} catch (error) {
+			receipts.push(
+				error instanceof IndependentMirrorError
+					? error.receipt
+					: {
+							...mirrorReceipt(options),
+							failureCode: signal.aborted ? "CANCELLED" : "MIRROR_FAILED",
+						},
+			);
+			if (error instanceof IndependentMirrorError && error.transportDiagnostic) {
+				try {
+					console.error(
+						JSON.stringify({
+							event: "mirror.transport.failure",
+							transport: options.transport,
+							...error.transportDiagnostic,
+						}),
+					);
+				} catch {
+					// Best-effort diagnostics cannot replace either independent result.
+				}
+			}
+		}
+	}
+	return receipts;
+}
 async function output(values: Record<string, string>) {
 	if (!process.env.GITHUB_OUTPUT) return;
 	for (const [key, value] of Object.entries(values)) {
@@ -95,6 +182,7 @@ async function main() {
 			"resolve-trigger": { type: "boolean" },
 			"event-file": { type: "string" },
 			"receipt-file": { type: "string" },
+			"peer-receipt-file": { type: "string" },
 			"verify-trigger-receipt": { type: "boolean" },
 			"receipt-output": { type: "string", default: "artifacts/mirror/receipt.json" },
 		},
@@ -105,19 +193,25 @@ async function main() {
 	const event = values["event-file"]
 		? await readMirrorDataFile(values["event-file"], 256 * 1024)
 		: undefined;
-	let trigger: Awaited<ReturnType<typeof resolveMirrorWorkflowTrigger>>;
+	let triggers: Awaited<ReturnType<typeof resolveMirrorWorkflowTriggers>> = [];
 	if (event && process.env.GITHUB_EVENT_NAME === "workflow_run") {
-		trigger = await resolveMirrorWorkflowTrigger(event, repository);
+		triggers = await resolveMirrorWorkflowTriggers(event, repository);
 		if (values["resolve-trigger"]) {
-			if (trigger) await verifyProtectedMirrorEnvironment(repository);
+			if (triggers.length) await verifyProtectedMirrorEnvironment(repository);
 			await output(
-				trigger
-					? { eligible: "true", artifact_name: trigger.artifactName, run_id: String(trigger.runId) }
+				triggers.length
+					? {
+							eligible: "true",
+							artifact_name: triggers[0].artifactName,
+							run_id: String(triggers[0].runId),
+							peer_receipt: triggers.length === 2 ? "true" : "false",
+							...(triggers[1] ? { peer_artifact_name: triggers[1].artifactName } : {}),
+						}
 					: { eligible: "false" },
 			);
 			return;
 		}
-		if (!trigger || !values["receipt-file"])
+		if (!triggers.length || !values["receipt-file"])
 			throw new Error("Successful source publication receipt required");
 	} else if (values["resolve-trigger"]) {
 		const e = event as { repository?: { full_name: string; default_branch: string } };
@@ -133,36 +227,45 @@ async function main() {
 	}
 	let kind = values.kind;
 	let tag = values.tag;
-	if (trigger) {
-		const receipt = await verifyMirrorPublicationReceipt(
-			await readMirrorDataFile(values["receipt-file"] as string),
-			trigger,
-		);
-		if (values["verify-trigger-receipt"]) {
-			await output({ eligible: "true" });
-			return;
-		}
-		kind = receipt.kind;
-		tag = receipt.tag;
+	const publications = triggers.length
+		? await readMirrorPublicationReceiptSet(triggers, {
+				receiptFile: values["receipt-file"],
+				peerReceiptFile: values["peer-receipt-file"],
+			})
+		: [];
+	if (values["verify-trigger-receipt"]) {
+		if (!publications.length) throw new Error("Successful source publication receipt required");
+		await output({ eligible: "true" });
+		return;
 	}
-	if (!["main", "helpers", "executor"].includes(kind ?? "") || !tag)
+	if (publications.length) {
+		kind = publications[0].kind;
+		tag = publications[0].tag;
+	}
+	if (!["main", "helpers", "executor", "remote-peer"].includes(kind ?? "") || !tag)
 		throw new Error(
-			"Use --kind=main|helpers|executor --tag=exact-public-tag --repository=owner/repo",
+			"Use --kind=main|helpers|executor|remote-peer --tag=exact-public-tag --repository=owner/repo",
 		);
 	const controller = new AbortController();
 	const cancel = () => controller.abort();
 	process.once("SIGINT", cancel);
 	process.once("SIGTERM", cancel);
-	let signal: AbortSignal = controller.signal;
 	const options: MirrorPublishedOptions = {
 		kind: kind as MirrorPublishedOptions["kind"],
 		repository,
 		tag,
 		dryRun: values["dry-run"],
-		signal,
+		signal: controller.signal,
 	};
-	let receipt = mirrorReceipt(options);
-	let failed = false;
+	let targets = publications.length
+		? publications.map((publication) => ({
+				...options,
+				kind: publication.kind,
+				tag: publication.tag,
+				publication,
+			}))
+		: [options];
+	let receipts: IndependentMirrorReceipt[] = [];
 	try {
 		try {
 			options.transport = resolveMirrorTransport(process.env);
@@ -175,8 +278,6 @@ async function main() {
 				process.env.NF_MIRROR_TOTAL_TIMEOUT_MINUTES,
 			);
 			mirrorTransferTimeoutMs(process.env.NF_MIRROR_TRANSFER_TIMEOUT_MINUTES);
-			signal = AbortSignal.any([controller.signal, AbortSignal.timeout(options.totalTimeoutMs)]);
-			options.signal = signal;
 			if (options.transport === "webdav") {
 				options.relay = values["dry-run"] ? undefined : resolveMirrorRelayConfig(process.env);
 			} else {
@@ -184,45 +285,42 @@ async function main() {
 					? undefined
 					: resolveUpdateServerMirrorConfig(process.env);
 			}
-			receipt = mirrorReceipt(options);
+			targets = targets.map((target) => ({
+				...options,
+				kind: target.kind,
+				tag: target.tag,
+				publication: target.publication,
+			}));
 		} catch {
-			throw new IndependentMirrorError({ ...receipt, failureCode: "FAILED_CONFIG" });
+			receipts = targets.map((target) => ({
+				...mirrorReceipt({ ...target, transport: options.transport }),
+				failureCode: "FAILED_CONFIG",
+			}));
 		}
-		receipt = await mirrorPublishedGitHubRelease(options);
-	} catch (error) {
-		failed = true;
-		receipt =
-			error instanceof IndependentMirrorError
-				? error.receipt
-				: { ...receipt, failureCode: signal.aborted ? "CANCELLED" : "MIRROR_FAILED" };
-		if (error instanceof IndependentMirrorError && error.transportDiagnostic) {
-			try {
-				console.error(
-					JSON.stringify({
-						event: "mirror.transport.failure",
-						transport: receipt.transport,
-						...error.transportDiagnostic,
-					}),
-				);
-			} catch {
-				// Best-effort logging must not replace the failure or prevent its receipt.
-			}
-		}
+		if (!receipts.length) receipts = await mirrorPublishedGitHubReleaseSet(targets);
 	} finally {
 		process.removeListener("SIGINT", cancel);
 		process.removeListener("SIGTERM", cancel);
-		const path = values["receipt-output"] as string;
-		await mkdir(dirname(path), { recursive: true });
-		await writeFile(path, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+		for (const receipt of receipts) {
+			const path = mirrorPublicationReceiptPath(
+				values["receipt-output"] as string,
+				receipt.kind,
+				receipts.length > 1,
+			);
+			await mkdir(dirname(path), { recursive: true });
+			await writeFile(path, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+		}
 	}
-	console.log(
-		`Independent mirror: ${receipt.status}${receipt.failureCode ? `/${receipt.failureCode}` : ""}; uploaded=${receipt.uploaded.length}; server-verified=${receipt.verified.length}; transport=${receipt.transport}${receipt.relay ? `; retention=${receipt.relay.retention}; expires=${receipt.relay.expiresAt}` : ""}; GitHub publication unchanged`,
-	);
-	if (receipt.failureCode === "SERVER_RECEIPT_REQUIRED")
-		console.error(
-			"Upgrade update server for server-sha256 verification/commit receipts; asset GET fallback is disabled",
+	for (const receipt of receipts) {
+		console.log(
+			`Independent mirror ${receipt.kind}/${receipt.tag}: ${receipt.status}${receipt.failureCode ? `/${receipt.failureCode}` : ""}; uploaded=${receipt.uploaded.length}; server-verified=${receipt.verified.length}; transport=${receipt.transport}${receipt.relay ? `; retention=${receipt.relay.retention}; expires=${receipt.relay.expiresAt}` : ""}; GitHub publication unchanged`,
 		);
-	if (failed) process.exitCode = 1;
+		if (receipt.failureCode === "SERVER_RECEIPT_REQUIRED")
+			console.error(
+				"Upgrade update server for server-sha256 verification/commit receipts; asset GET fallback is disabled",
+			);
+		if (receipt.status === "FAILED") process.exitCode = 1;
+	}
 }
 if (import.meta.main)
 	main().catch(() => {

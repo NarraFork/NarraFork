@@ -36,12 +36,10 @@ const ORIGINAL_UPDATE = settings.update ?? {
 	autoDownload: false,
 };
 const SOURCE = {
-	source: "github",
+	source: "update-server",
 	repository: "fixture/executor-tests",
-	mirror: {
-		serverUrl: "https://mirror-unused.example",
-		product: ORIGINAL_UPDATE.product ?? "narrafork",
-	},
+	serverUrl: "https://mirror-unused.example",
+	product: ORIGINAL_UPDATE.product ?? "narrafork",
 } as const;
 const MANIFEST_PATH = distributionPath(
 	SOURCE,

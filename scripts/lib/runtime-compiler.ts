@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import {
+	closeSync,
+	constants,
+	existsSync,
+	fstatSync,
+	lstatSync,
+	openSync,
+	readFileSync,
+	readSync,
+} from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { BunPlugin } from "bun";
 import {
@@ -7,11 +16,71 @@ import {
 	PLUGIN_UI_RUNTIME_JS_PATH,
 } from "../../frontend/plugin-runtime/paths";
 import { compiledWorkerBuildEntrypoints } from "../../server/lib/compiled-worker";
-import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
-import { assetsUnder, collectBuildModules } from "./build-materials";
+import {
+	createHelperDistributionDependencies,
+	parseComponentVersions,
+} from "../../shared/helper-distribution";
+import { createRemotePeerDistribution } from "../../shared/remote-peer-distribution";
+import { assetsUnder, type BuildInfo, collectBuildModules } from "./build-materials";
 import { resolveBuildGitHubRepository } from "./build-repository";
 import { nativeTarget, readNativeFile, validatePtyDependency } from "./ci-build-native";
 import { COMPILED_BUILD_OPTIONS, runtimeBuildDefines } from "./compiled-build";
+
+/** Read the target checkout as bounded data, never execute its pin module or substitute control-tree pins. */
+export function runtimeComponentDistributions(
+	root: string,
+): Pick<BuildInfo, "helperDistribution" | "remotePeerDistribution"> {
+	const path = join(root, "shared/component-versions.json");
+	let file: number;
+	let declaredFileObserved = false;
+	try {
+		const parent = lstatSync(dirname(path));
+		if (!parent.isDirectory() || parent.isSymbolicLink())
+			throw new Error("Runtime component declarations require a regular source directory");
+		const before = lstatSync(path);
+		if (!before.isFile() || before.isSymbolicLink() || before.size > 64 * 1024)
+			throw new Error("Invalid runtime component declaration file");
+		declaredFileObserved = true;
+		file = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+		try {
+			const stat = fstatSync(file);
+			if (
+				!stat.isFile() ||
+				stat.ino !== before.ino ||
+				stat.dev !== before.dev ||
+				stat.size > 64 * 1024
+			)
+				throw new Error("Runtime component declarations changed while opening");
+			const bytes = Buffer.alloc(64 * 1024 + 1);
+			let length = 0;
+			while (length < bytes.length) {
+				const count = readSync(file, bytes, length, bytes.length - length, null);
+				if (!count) break;
+				length += count;
+			}
+			if (length > 64 * 1024) throw new Error("Runtime component declarations exceed 64 KiB");
+			const components = parseComponentVersions(
+				JSON.parse(bytes.subarray(0, length).toString("utf8")),
+			);
+			return {
+				helperDistribution: createHelperDistributionDependencies(
+					components.executor.version,
+					components.executor.protocolVersion,
+				),
+				remotePeerDistribution: createRemotePeerDistribution(components.remotePeer),
+			};
+		} finally {
+			closeSync(file);
+		}
+	} catch (error) {
+		if (declaredFileObserved || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		// Preserve legacy helper compatibility, but absence must never select today's optional peer.
+		return {
+			helperDistribution: createHelperDistributionDependencies(),
+			remotePeerDistribution: undefined,
+		};
+	}
+}
 
 export function runtimeAssets(root: string, frontend: boolean): Map<string, string> {
 	const built = join(root, "dist/frontend");
@@ -123,7 +192,7 @@ async function compileApplication(
 		commit,
 		platform: `${process.platform === "win32" ? "win" : process.platform}-${process.arch}`,
 		repository,
-		helperDistribution: createHelperDistributionDependencies(),
+		...runtimeComponentDistributions(root),
 	});
 	modules.set("parcel-native-loader.ts", localParcelLoader(root));
 	await compileRuntimeBundle({

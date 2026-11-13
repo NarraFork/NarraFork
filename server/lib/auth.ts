@@ -88,6 +88,12 @@ export async function extendSessionToken(payload: SessionPayload): Promise<void>
 	const expiresAt = slidExpiry(payload.sessionStart, nowSeconds());
 	if (expiresAt <= payload.exp) return;
 	await authSessionStore.extendSession(payload.sid, expiresAt);
+	eventBus.emit({
+		type: "auth:session_extended",
+		sessionId: payload.sid,
+		userId: payload.sub,
+		expiresAt,
+	});
 }
 
 /** Revoke the one session a request authenticated with (logout). */

@@ -16,6 +16,7 @@
  * the one line.
  */
 
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import {
 	ActionIcon,
 	Alert,
@@ -123,7 +124,7 @@ export function OutlinePlanApproval({
 	const [error, setError] = useState<string | null>(null);
 	const opener = useOutlineOpener();
 	const narratorId = permission.ownerNarratorId ?? "";
-	const delegates = useDelegateOptions(narratorId, lockOpen && !readOnly);
+	const delegates = useDelegateOptions(narratorId, !REMOTE_BUILD && lockOpen && !readOnly);
 	const root = submission?.root;
 	const review = submission?.review ?? null;
 	const diff = useOutlinePlanDiff(
@@ -197,8 +198,10 @@ export function OutlinePlanApproval({
 			) {
 				setError(t("outlinePlan.changed"));
 				closeLock();
-				setDiffOpen(true);
-				void diff.refetch();
+				if (!REMOTE_BUILD) {
+					setDiffOpen(true);
+					void diff.refetch();
+				}
 			} else {
 				setError(`${t("outlinePlan.failed")}: ${err instanceof Error ? err.message : String(err)}`);
 			}
@@ -327,55 +330,56 @@ export function OutlinePlanApproval({
 				>
 					{narrow ? shortSummary : fullSummary}
 				</Text>
-				{narrow ? (
-					<>
-						<Tooltip label={t("outlinePlan.viewChanges")} withinPortal>
-							<ActionIcon
+				{!REMOTE_BUILD &&
+					(narrow ? (
+						<>
+							<Tooltip label={t("outlinePlan.viewChanges")} withinPortal>
+								<ActionIcon
+									size="xs"
+									variant="subtle"
+									aria-label={t("outlinePlan.viewChanges")}
+									onClick={() => setDiffOpen(true)}
+									data-testid="outline-plan-view-changes"
+								>
+									<IconListDetails size={14} />
+								</ActionIcon>
+							</Tooltip>
+							<Tooltip label={t("outlinePlan.openInOutline")} withinPortal>
+								<ActionIcon
+									size="xs"
+									variant="subtle"
+									aria-label={t("outlinePlan.openInOutline")}
+									onClick={openInOutline}
+									data-testid="outline-plan-open"
+								>
+									<IconExternalLink size={14} />
+								</ActionIcon>
+							</Tooltip>
+						</>
+					) : (
+						<>
+							<Anchor
+								component="button"
+								type="button"
 								size="xs"
-								variant="subtle"
-								aria-label={t("outlinePlan.viewChanges")}
 								onClick={() => setDiffOpen(true)}
+								style={{ flexShrink: 0 }}
 								data-testid="outline-plan-view-changes"
 							>
-								<IconListDetails size={14} />
-							</ActionIcon>
-						</Tooltip>
-						<Tooltip label={t("outlinePlan.openInOutline")} withinPortal>
-							<ActionIcon
+								{t("outlinePlan.viewChanges")}
+							</Anchor>
+							<Anchor
+								component="button"
+								type="button"
 								size="xs"
-								variant="subtle"
-								aria-label={t("outlinePlan.openInOutline")}
 								onClick={openInOutline}
+								style={{ flexShrink: 0 }}
 								data-testid="outline-plan-open"
 							>
-								<IconExternalLink size={14} />
-							</ActionIcon>
-						</Tooltip>
-					</>
-				) : (
-					<>
-						<Anchor
-							component="button"
-							type="button"
-							size="xs"
-							onClick={() => setDiffOpen(true)}
-							style={{ flexShrink: 0 }}
-							data-testid="outline-plan-view-changes"
-						>
-							{t("outlinePlan.viewChanges")}
-						</Anchor>
-						<Anchor
-							component="button"
-							type="button"
-							size="xs"
-							onClick={openInOutline}
-							style={{ flexShrink: 0 }}
-							data-testid="outline-plan-open"
-						>
-							{t("outlinePlan.openInOutline")}
-						</Anchor>
-					</>
-				)}
+								{t("outlinePlan.openInOutline")}
+							</Anchor>
+						</>
+					))}
 			</Group>
 			{submission.summary && (
 				<Text size="xs" mb={4} truncate="end" data-testid="outline-plan-agent-summary">
@@ -413,39 +417,41 @@ export function OutlinePlanApproval({
 					registerActions={isActive ? registerActions : noop}
 				/>
 			)}
-			<OutlinePlanDiffModal
-				opened={diffOpen}
-				onClose={closeDiff}
-				title={root.title}
-				diff={diff.data}
-				loading={diff.isLoading}
-				error={diff.error}
-				review={review}
-				onOpenReview={review ? () => openBlock(review.blockId) : undefined}
-				footer={
-					<Stack gap="xs">
-						{error && (
-							<Text size="xs" c="orange">
-								{error}
-							</Text>
-						)}
-						{!readOnly && (
-							<Checkbox
-								size="xs"
-								label={t("outlinePlan.compact")}
-								checked={compact}
-								onChange={(e) => setCompact(e.currentTarget.checked)}
-							/>
-						)}
-						<Group justify="space-between" wrap="wrap">
-							<Button size="xs" variant="subtle" color="gray" onClick={openInOutline}>
-								{t("outlinePlan.openInOutline")}
-							</Button>
-							{readOnly ? null : decisionButtons}
-						</Group>
-					</Stack>
-				}
-			/>
+			{!REMOTE_BUILD && (
+				<OutlinePlanDiffModal
+					opened={diffOpen}
+					onClose={closeDiff}
+					title={root.title}
+					diff={diff.data}
+					loading={diff.isLoading}
+					error={diff.error}
+					review={review}
+					onOpenReview={review ? () => openBlock(review.blockId) : undefined}
+					footer={
+						<Stack gap="xs">
+							{error && (
+								<Text size="xs" c="orange">
+									{error}
+								</Text>
+							)}
+							{!readOnly && (
+								<Checkbox
+									size="xs"
+									label={t("outlinePlan.compact")}
+									checked={compact}
+									onChange={(e) => setCompact(e.currentTarget.checked)}
+								/>
+							)}
+							<Group justify="space-between" wrap="wrap">
+								<Button size="xs" variant="subtle" color="gray" onClick={openInOutline}>
+									{t("outlinePlan.openInOutline")}
+								</Button>
+								{readOnly ? null : decisionButtons}
+							</Group>
+						</Stack>
+					}
+				/>
+			)}
 			<Modal
 				opened={lockOpen}
 				onClose={closeLock}
@@ -455,18 +461,20 @@ export function OutlinePlanApproval({
 			>
 				<Stack gap="sm" data-testid="outline-plan-lock-modal">
 					<Text size="sm">{t("outlinePlan.lockExplain")}</Text>
-					<Select
-						size="xs"
-						label={t("outlinePlan.delegateLabel")}
-						placeholder={t("outlinePlan.delegatePlaceholder")}
-						data={delegates}
-						value={delegate}
-						onChange={setDelegate}
-						clearable
-						searchable
-						comboboxProps={{ withinPortal: true }}
-						data-testid="outline-plan-delegate"
-					/>
+					{!REMOTE_BUILD && (
+						<Select
+							size="xs"
+							label={t("outlinePlan.delegateLabel")}
+							placeholder={t("outlinePlan.delegatePlaceholder")}
+							data={delegates}
+							value={delegate}
+							onChange={setDelegate}
+							clearable
+							searchable
+							comboboxProps={{ withinPortal: true }}
+							data-testid="outline-plan-delegate"
+						/>
+					)}
 					<Checkbox
 						size="xs"
 						label={t("outlinePlan.compact")}
