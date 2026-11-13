@@ -1457,4 +1457,19 @@ describe("review round 2", () => {
 			(await outlineStore.getBlock(out.handedOut?.copy.id as string))?.taskJson?.assignee,
 		).toBe(`agent:${wide}`);
 	});
+
+	test("a session that may write the project but not read it cannot be given the copy", async () => {
+		const { owner, peer, projectId, main, sessionSpace } = await world();
+		// The peer's session is public: its readers are not all the (private) project's.
+		const open = await session(peer.id, projectId, { title: "Open", visibility: "public" });
+		const task = await sessionTask(sessionSpace, main, owner.id);
+		await expect(
+			handOutTask({
+				taskId: task.blockId,
+				by: person_(owner),
+				target: { kind: "session", narratorId: open },
+			}),
+		).rejects.toThrow(/This session cannot work on this task/);
+		expect(await copiesOn(projectId)).toHaveLength(0);
+	});
 });
