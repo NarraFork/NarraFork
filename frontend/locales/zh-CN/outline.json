@@ -732,6 +732,8 @@
 		"waiting": "等你回答 {{n}}",
 		"waitingLabel_one": "{{count}} 个提问等你回答",
 		"waitingLabel_other": "{{count}} 个提问等你回答",
+		"waitingAction_one": "回答 {{count}} 个等你回答的提问",
+		"waitingAction_other": "回答 {{count}} 个等你回答的提问",
 		"doingLabel_one": "{{count}} 项任务进行中",
 		"doingLabel_other": "{{count}} 项任务进行中",
 		"summary": {

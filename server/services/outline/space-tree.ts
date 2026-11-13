@@ -127,7 +127,11 @@ async function describeTreeSpaces(
 	);
 	// Bounded prefixes, never whole bodies.
 	const heads = await outlineStore.getContentHeads(
-		picks.flatMap((pick) => (pick ? [pick.id] : [])),
+		[
+			...picks.flatMap((pick) => (pick ? [pick.id] : [])),
+			// The page a waiting question is on, by title (its row when the list has not got it).
+			...rows.flatMap((row) => facts.get(row.id)?.waitingPageId ?? []),
+		],
 		OUTLINE_PAGE_HEAD_CHARS,
 	);
 	const out: OutlineTreeSpace[] = [];
@@ -146,7 +150,11 @@ async function describeTreeSpaces(
 			waiting: canWrite ? (fact?.waiting ?? 0) : 0,
 			waitingAt:
 				canWrite && fact?.waitingBlockId && fact.waitingPageId
-					? { pageId: fact.waitingPageId, blockId: fact.waitingBlockId }
+					? {
+							pageId: fact.waitingPageId,
+							blockId: fact.waitingBlockId,
+							pageTitle: summaryText(heads.get(fact.waitingPageId)) ?? "",
+						}
 					: null,
 			doing: fact?.doing ?? 0,
 			summary: pick && text ? { kind: pick.kind, text } : null,

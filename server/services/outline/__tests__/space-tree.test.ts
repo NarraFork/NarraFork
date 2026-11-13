@@ -460,7 +460,10 @@ describe("what a row says (readability F)", () => {
 		expect(mine?.canWrite).toBe(true);
 		expect(mine?.waiting).toBe(2);
 		// Where the count takes them: the oldest question put to them, and its page.
-		expect(mine?.waitingAt).toEqual({ pageId: made[0] as string, blockId: made[5] as string });
+		expect(mine?.waitingAt?.pageId).toBe(made[0] as string);
+		expect(mine?.waitingAt?.pageTitle).toBe("Work");
+		// (Asked in one commit: either of the two is the oldest.)
+		expect([made[5], made[6]]).toContain(mine?.waitingAt?.blockId ?? "");
 		expect(mine?.doing).toBe(2);
 		expect(mine?.summary?.kind).toBe("doing");
 		expect(["Fix the refresh race", "Add the regression test"]).toContain(

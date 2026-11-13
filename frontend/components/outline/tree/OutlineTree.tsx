@@ -500,7 +500,7 @@ function SpaceNode({ space, depth }: { space: OutlineTreeSpace; depth: number })
 												pageId: asks.pageId,
 												blockId: asks.blockId,
 												pathIds: [],
-												pageTitle: "",
+												pageTitle: asks.pageTitle ?? "",
 												answer: true,
 											}),
 									}
@@ -510,8 +510,10 @@ function SpaceNode({ space, depth }: { space: OutlineTreeSpace; depth: number })
 							color="teal"
 							tt="none"
 							leftSection={<QUESTION_ICON.Icon size={10} aria-hidden />}
-							title={t("tree.waitingLabel", { count: waiting })}
-							aria-label={t("tree.waitingLabel", { count: waiting })}
+							title={t(asks ? "tree.waitingAction" : "tree.waitingLabel", { count: waiting })}
+							aria-label={t(asks ? "tree.waitingAction" : "tree.waitingLabel", {
+								count: waiting,
+							})}
 							data-tree-count="waiting"
 						>
 							{narrow ? waitingText : t("tree.waiting", { n: waitingText })}
@@ -1036,19 +1038,24 @@ function OpenPage({
 			return;
 		}
 		if (fetching || storing || missing !== "") return;
-		// Not in this read. Each read is one try; the first opens every ancestor by id.
-		if (locateReads.current.seen === view) return;
+		// Not in this read, and nothing is being read. Each read is one try: it opens every
+		// ancestor that is closed (those the read does not hold are behind a closed row, so
+		// they are opened by id; one open by default is left alone). Tried on this read
+		// already, or nothing left to open: the block is past what one read holds (the
+		// budget, not the folding), which is said at once.
+		if (locateReads.current.seen === view) return done(pageRow(), false);
 		locateReads.current.seen = view;
 		if (locateReads.current.left-- <= 0) return done(pageRow(), false);
 		let changed = false;
 		for (const id of locating.pathIds) {
 			if (id === pageId || state.expanded.has(id)) continue;
+			const above = foldTree.nodes.get(id);
+			if (above && (above.open || above.kids.length === 0) && !above.report) continue;
 			state.expanded.add(id);
 			state.collapsed.delete(id);
 			changed = true;
 		}
 		if (changed) state.noteCollapsed();
-		// Nothing left to open: it is past what one read holds.
 		else done(pageRow(), false);
 	}, [
 		locating,
@@ -1096,6 +1103,8 @@ function OpenPage({
 			return !!node && node.open && node.visible;
 		}) &&
 		(sync === "unseen" || (missing !== "" && askedFor.current === missing));
+	// (`unseen`: the stored folding could not be read, so nothing is written for this page and
+	// the server keeps folding by what is stored.)
 	const partial = view.blocks.some((b) => b.hidden > 0 && !b.fold) || view.pageTruncated || stuck;
 	return (
 		<div

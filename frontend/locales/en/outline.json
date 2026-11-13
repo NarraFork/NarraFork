@@ -732,6 +732,8 @@
 		"waiting": "{{n}} waiting for you",
 		"waitingLabel_one": "{{count}} question waiting for your answer",
 		"waitingLabel_other": "{{count}} questions waiting for your answer",
+		"waitingAction_one": "Answer {{count}} waiting question",
+		"waitingAction_other": "Answer {{count}} waiting questions",
 		"doingLabel_one": "{{count}} task in progress",
 		"doingLabel_other": "{{count}} tasks in progress",
 		"summary": {

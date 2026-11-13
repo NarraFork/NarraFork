@@ -139,7 +139,7 @@ export interface OutlineTreeSpace extends OutlineSpaceSummary {
 	 * The oldest of those questions and the page it is on: where the count takes the reader.
 	 * Null when nothing waits; absent from an older server.
 	 */
-	waitingAt?: { pageId: string; blockId: string } | null;
+	waitingAt?: { pageId: string; blockId: string; pageTitle?: string } | null;
 	/** Tasks in progress in the space, counted up to {@link OUTLINE_TREE_LIMITS.countCap}. */
 	doing?: number;
 	/** The row's one line; null or absent: nothing to say. */

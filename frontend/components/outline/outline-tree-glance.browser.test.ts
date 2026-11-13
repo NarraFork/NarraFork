@@ -33,6 +33,7 @@ import {
 import { outlineStore } from "../../../server/services/outline/store";
 import { writeViewState } from "../../../server/services/outline/view-state";
 import { type OutlineOp, writeOutline } from "../../../server/services/outline/write";
+import { eventually } from "./editor/outline-live-harness.browser-fixture";
 import type * as Fixture from "./outline-tree.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -62,6 +63,7 @@ const viewState = {
 	puts: 0,
 	hold: null as Promise<void> | null,
 	failPut: false,
+	failGet: false,
 };
 
 async function write(spaceId: string, author: string, ops: OutlineOp[]): Promise<string[]> {
@@ -91,8 +93,9 @@ function api() {
 		if (c.req.method === "PUT") {
 			viewState.puts++;
 			if (viewState.failPut) return c.json({ error: "held" }, 500);
-		} else if (viewState.hold) {
-			await viewState.hold;
+		} else {
+			if (viewState.hold) await viewState.hold;
+			if (viewState.failGet) return c.json({ error: "held" }, 500);
 		}
 		await next();
 	});
@@ -759,6 +762,91 @@ test("the same while the stored folding is slow to arrive", async () => {
 	} finally {
 		release();
 		viewState.hold = null;
+	}
+}, 60_000);
+
+test("folding before the stored state arrives lays it under what the reader did, and writes after", async () => {
+	const mine = { userId: alice, isAdmin: false };
+	await writeViewState(mine, bigPage, { collapsed: [big.open], expanded: [], layout: "right" });
+	viewState.puts = 0;
+	let release = () => {};
+	viewState.hold = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	try {
+		const page = await openTree({ target: { kind: "home" } });
+		await toggle(page, "Atlas");
+		await toggle(page, "Sessions (2)");
+		await toggle(page, "Fix the refresh race");
+		await togglePage(page, bigPage);
+		await until(page, "the page's blocks", (f, id: string) => f.blockRows(id).length > 0, bigPage);
+		// The reader opens a finished task while their stored folding is still on its way.
+		await page.evaluate((id) => {
+			document
+				.querySelector<HTMLButtonElement>(`[data-block-id="${id}"] [data-fold-toggle]`)
+				?.click();
+		}, big.firstDone);
+		await page.evaluate(() => fetch("/api/settings").then((r) => r.json()));
+		expect(viewState.puts).toBe(0);
+		release();
+		viewState.hold = null;
+		// What they stored is kept, with what they just did on top; and the task's blocks come.
+		await eventually(async () => {
+			const stored = await storedFolding(bigPage);
+			return stored.collapsed.includes(big.open) && stored.expanded.includes(big.firstDone);
+		}, "the stored folding with the reader's change on top");
+		await until(
+			page,
+			"the open work closed as stored, the finished task's notes read",
+			(f, pageId: string, open: string, done: string) => {
+				const rows = f.blockRows(pageId);
+				return (
+					rows.some((r) => r.id === open && r.fold === "closed") &&
+					rows.some((r) => r.id === done && r.fold === "open") &&
+					rows.length === 17 + 1 + 14
+				);
+			},
+			bigPage,
+			big.open,
+			big.firstDone,
+		);
+		await page.browserContext().close();
+	} finally {
+		release();
+		viewState.hold = null;
+		await writeViewState(mine, bigPage, { collapsed: [], expanded: [], layout: "right" });
+	}
+}, 60_000);
+
+test("when the stored folding cannot be read, nothing is written over it", async () => {
+	viewState.puts = 0;
+	viewState.failGet = true;
+	try {
+		const page = await openTree({ target: { kind: "home" } });
+		await openDecisions(page);
+		// The reader folds here (the row shows open: its stored folding never came).
+		await page.evaluate((id) => {
+			document
+				.querySelector<HTMLButtonElement>(`[data-block-id="${id}"] [data-fold-toggle]`)
+				?.click();
+		}, decisions.a);
+		await until(page, "folded locally", closedRow, decisions.pageId, decisions.a);
+		// Leaving the page writes at once whatever is waiting to be written: nothing is.
+		await page.evaluate(
+			(spaceId) =>
+				(window as unknown as FixtureWindow).fixture.open({ target: { kind: "space", spaceId } }),
+			personalSpace,
+		);
+		await until(page, "away", (f) => f.count("[data-testid=outline-space-home]") === 1);
+		await page.evaluate(() => fetch("/api/settings").then((r) => r.json()));
+		expect(viewState.puts).toBe(0);
+		expect(await storedFolding(decisions.pageId)).toEqual({
+			collapsed: [decisions.a],
+			expanded: [],
+		});
+		await page.browserContext().close();
+	} finally {
+		viewState.failGet = false;
 	}
 }, 60_000);
 

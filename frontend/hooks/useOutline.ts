@@ -256,20 +256,31 @@ const loadedViewStates = new WeakSet<OutlineViewState>();
 /**
  * Whether a surface's view state holds what is stored for the person:
  *   - `pending`: the stored state is being read; what the surface has is not theirs yet;
- *   - `applied`: it holds the stored state (or nothing was stored), with their changes since;
- *   - `unseen`: the read failed, or the person folded something before it arrived, so the
- *     stored state was never laid under what the surface has.
- * Anything that folds or writes on the reader's behalf (not by their own hand) waits for
- * `applied`: acting earlier would write a state that never saw the stored one over it.
+ *   - `applied`: it holds the stored state (or nothing was stored), with their changes on top;
+ *   - `unseen`: the read failed: the stored state is not known here.
+ * Nothing is written before `applied` (a state that never saw the stored one would replace it),
+ * and anything that folds on the reader's behalf (not by their own hand) waits for it too.
  */
 export type OutlineViewStateSync = "pending" | "applied" | "unseen";
 const viewStateSync = new WeakMap<OutlineViewState, OutlineViewStateSync>();
+/** View states changed while their stored state was not read yet: written once it is. */
+const heldViewStateWrites = new WeakSet<OutlineViewState>();
+/** View states whose direction the person changed before the stored one arrived. */
+const earlyLayouts = new WeakSet<OutlineViewState>();
 
 /**
  * Keep a surface's folding and mind-map direction of a page in step with the person's stored
  * view state (`/api/outline/view-state/:pageId`, design §7.1): read once when the page is first
- * shown (unless the person already folded something here), and written back, debounced, after
- * every change. Failures are quiet: the view state is the person's convenience, kept locally.
+ * shown, and written back, debounced, after every change.
+ *
+ * THE STORED STATE IS NEVER REPLACED UNREAD. A write replaces the whole row, so none is sent
+ * until the stored state has been read: a change made meanwhile is kept and written after. When
+ * the stored state arrives after such a change it is laid UNDER it: the stored folding, then
+ * the blocks the person opened or closed here on top (and their direction, if they chose one).
+ * When the read fails, nothing is written for this surface (its folding lasts for the session);
+ * the next time the page is shown the read is made again.
+ *
+ * Other failures are quiet: the view state is the person's convenience, kept locally.
  */
 export function useOutlineViewStateSync(
 	pageId: string | undefined,
@@ -288,11 +299,15 @@ export function useOutlineViewStateSync(
 			setSync(value);
 		};
 		setSync(viewStateSync.get(state) ?? "pending");
-		let disposed = false;
-		let touched = false;
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const write = () => {
 			timer = null;
+			const known = viewStateSync.get(state);
+			if (known !== "applied") {
+				// Not read yet: held until it is. Read failed: not written at all.
+				if (known !== "unseen") heldViewStateWrites.add(state);
+				return;
+			}
 			// Block ids only (the server refuses anything else); the last write of the page wins.
 			// What the reader opened and what they closed share one limit.
 			const ok = (ids: Iterable<string>) =>
@@ -307,7 +322,7 @@ export function useOutlineViewStateSync(
 		};
 		const off = state.on((part) => {
 			if (part !== "collapsed" && part !== "layout") return;
-			touched = true;
+			if (part === "layout" && viewStateSync.get(state) !== "applied") earlyLayouts.add(state);
 			if (timer) clearTimeout(timer);
 			timer = setTimeout(write, OUTLINE_VIEW_STATE_LIMITS.writeDebounceMs);
 		});
@@ -316,21 +331,42 @@ export function useOutlineViewStateSync(
 			api
 				.getOutlineViewState(pageId)
 				.then((stored) => {
-					if (stored.updatedAt === null) return settle("applied");
-					// Folded before the stored state arrived (by the person, or in a run of this
-					// effect that is gone): what the surface has stays, the stored one unseen.
-					const folded = state.expanded.size > 0 || state.collapsed.size > 0;
-					if (touched || (disposed && folded)) return settle("unseen");
-					state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
+					// What the surface holds now is what the person did here before this arrived
+					// (it started empty): it goes on top of what is stored.
+					const opened = [...state.expanded];
+					const closed = [...state.collapsed];
+					const early = opened.length > 0 || closed.length > 0 || earlyLayouts.has(state);
+					if (stored.updatedAt !== null) {
+						const layout = earlyLayouts.has(state) ? state.layout : stored.layout;
+						if (early) {
+							const expanded = new Set(stored.expanded ?? []);
+							const collapsed = new Set(stored.collapsed);
+							for (const id of opened) {
+								expanded.add(id);
+								collapsed.delete(id);
+							}
+							for (const id of closed) {
+								collapsed.add(id);
+								expanded.delete(id);
+							}
+							state.applyStored(collapsed, expanded, layout);
+						} else {
+							state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
+						}
+					}
+					earlyLayouts.delete(state);
 					settle("applied");
+					// A change made (or a write held) meanwhile is written now, over what was read.
+					if (heldViewStateWrites.delete(state) || (early && timer === null)) write();
 				})
 				.catch(() => {
+					// Read again the next time the page is shown; nothing is written meanwhile.
 					loadedViewStates.delete(state);
+					heldViewStateWrites.delete(state);
 					settle("unseen");
 				});
 		}
 		return () => {
-			disposed = true;
 			off();
 			if (timer) {
 				clearTimeout(timer);
