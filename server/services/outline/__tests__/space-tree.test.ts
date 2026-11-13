@@ -457,7 +457,7 @@ describe("what a row says (readability F)", () => {
 		expect(mine?.waiting).toBe(2);
 		expect(mine?.doing).toBe(2);
 		expect(mine?.summary?.kind).toBe("doing");
-		expect(["Fix the refresh race", "Add the regression test"]).toContain(mine?.summary?.text);
+		expect(["Fix the refresh race", "Add the regression test"]).toContain(mine?.summary?.text ?? "");
 
 		// The reader may read the session, not write it: the question put to them is not theirs
 		// to answer there, so nothing waits; the row says read-only.

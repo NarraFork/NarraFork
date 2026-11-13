@@ -1,19 +1,20 @@
 /**
- * Outline home: search across every readable space, then the whole outline as one connected tree
+ * Outline home: search across every readable space (drawn as a tree of the matches with what
+ * they are under, in the tree's place while a query is typed; a match is then shown in the tree
+ * itself), and the whole outline as one connected tree
  * (`tree/OutlineTree.tsx`): the pages visited recently in this browser, my space, the projects
  * and their sessions, each opened in place. The reader's personal space is created on the first
  * visit. Router-free: links go through the host's renderer (`outline-nav.tsx`), so the
  * outline route and a dock panel show the same home.
  */
-import { Alert, Badge, Box, Group, Loader, Stack, Text, TextInput, Title } from "@mantine/core";
+import { Box, Stack, Text, TextInput, Title } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
 import { IconSearch } from "@tabler/icons-react";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useOutlineSearch } from "../../hooks/useOutline";
-import classes from "./Outline.module.css";
-import { OutlineLink, outlineBlockTarget } from "./outline-nav";
+import { OutlineSearchTree } from "./tree/OutlineSearchTree";
 import { OutlineTree } from "./tree/OutlineTree";
+import type { TreeLocateTarget } from "./tree/tree-locate";
 
 const TREE_ROOT = { kind: "all" } as const;
 
@@ -31,7 +32,9 @@ export function OutlineHome({
 	const { t } = useTranslation("outline");
 	const [query, setQuery] = useState("");
 	const [debounced] = useDebouncedValue(query, 250);
-	const search = useOutlineSearch(debounced, null, true);
+	const searching = debounced.trim() !== "" && query.trim() !== "";
+	// A match chosen in the search: the search goes, and the tree shows the match where it is.
+	const [locate, setLocate] = useState<TreeLocateTarget | null>(null);
 
 	return (
 		<Stack gap="lg">
@@ -50,54 +53,27 @@ export function OutlineHome({
 					aria-label={t("home.searchPlaceholder")}
 					value={query}
 					onChange={(event) => setQuery(event.currentTarget.value)}
+					onKeyDown={(event) => {
+						if (event.key === "Escape" && query !== "") setQuery("");
+					}}
+					data-testid="outline-search-input"
 				/>
-				{debounced.trim() && (
-					<Stack gap={2} mt="xs">
-						{search.isFetching && !search.data && <Loader size="xs" />}
-						{search.isError && (
-							<Alert color="red" variant="light">
-								{t("loadFailed")}
-							</Alert>
-						)}
-						{search.data && search.data.hits.length === 0 && (
-							<Text size="sm" c="dimmed">
-								{t("home.noResults")}
-							</Text>
-						)}
-						{search.data?.hits.map((hit) => (
-							<OutlineLink
-								key={hit.blockId}
-								to={outlineBlockTarget(hit.spaceId, hit.blockId)}
-								className={classes.listItem}
-							>
-								<Group gap={6} wrap="nowrap">
-									<Text size="sm" fw={500} className={classes.ellipsis}>
-										{hit.title || hit.address}
-									</Text>
-									{hit.process && (
-										<Badge size="xs" variant="light" color="yellow" tt="none">
-											{t("home.process")}
-										</Badge>
-									)}
-								</Group>
-								{hit.path.length > 0 && (
-									<Text size="xs" c="dimmed" className={classes.ellipsis}>
-										{hit.path.join(" › ")}
-									</Text>
-								)}
-								{hit.snippet !== hit.title && (
-									<Text size="xs" c="dimmed" lineClamp={2}>
-										{hit.snippet}
-									</Text>
-								)}
-							</OutlineLink>
-						))}
-					</Stack>
-				)}
 			</Box>
 
-			{/* The whole outline as one tree (readability E): my space, projects, their sessions. */}
-			<OutlineTree root={TREE_ROOT} host={host} />
+			{/* The search drawn as a tree: the matches with what they are under (readability F). */}
+			{searching && (
+				<OutlineSearchTree
+					query={debounced}
+					spaceId={null}
+					onLocate={(target) => {
+						setQuery("");
+						setLocate(target);
+					}}
+				/>
+			)}
+			{/* The whole outline as one tree (readability E): my space, projects, their sessions.
+			    Kept while a search is drawn in its place, so it comes back as it was. */}
+			<OutlineTree root={TREE_ROOT} host={host} locate={locate} hidden={searching} />
 		</Stack>
 	);
 }

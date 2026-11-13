@@ -553,7 +553,12 @@ function SurfaceBody({
 		content = (
 			<>
 				<div className={classes.toolbar}>
-					<OutlineBreadcrumbs view={view} search={linkSearch} path={crumbPath} />
+					<OutlineBreadcrumbs
+						view={view}
+						search={linkSearch}
+						path={crumbPath}
+						locate={{ host: layout, blockId, title: rootTitle }}
+					/>
 					<Group gap="xs" wrap="nowrap">
 						{history && (
 							<Group gap={2} wrap="nowrap">

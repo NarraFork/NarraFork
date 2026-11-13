@@ -1,5 +1,6 @@
 import { Menu, UnstyledButton } from "@mantine/core";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
+import { IconBinaryTree2 } from "@tabler/icons-react";
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineSpaceParent } from "../../hooks/useOutline";
@@ -9,6 +10,8 @@ import type { OutlineBlockSearch } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
+import { requestTreeLocate } from "./tree/tree-locate";
+import type { TreeHost } from "./tree/tree-open-state";
 
 type Ancestor = OutlineBlockViewResponse["path"][number];
 
@@ -23,20 +26,27 @@ type Ancestor = OutlineBlockViewResponse["path"][number];
  *
  * One line, always: crumbs truncate, and a deep path folds its middle into a "…" menu
  * (`planCrumbs`).
+ *
+ * `locate` (readability F): the bar ends with "show in the outline tree" — the reader is taken
+ * to the tree, where what this block is under opens and the tree scrolls to it.
  */
 export function OutlineBreadcrumbs({
 	view,
 	search,
 	path,
+	locate,
 }: {
 	view: OutlineBlockViewResponse;
 	search: OutlineBlockSearch;
 	path?: OutlineBlockViewResponse["path"];
+	/** The focused block, and the host whose tree shows it (the outline page, a dock panel). */
+	locate?: { host: TreeHost; blockId: string; title: string };
 }) {
 	const { t, i18n } = useTranslation("outline");
 	const spaceName = useOutlineSpaceName();
 	const parent = useOutlineSpaceParent(view.space.id, view.space.kind === "session").data;
-	const plan = planCrumbs(path ?? view.path);
+	const above = path ?? view.path;
+	const plan = planCrumbs(above);
 	const targetOf = (ancestor: Ancestor) =>
 		outlineBlockTarget(view.space.id, ancestor.id, search.view, search.asOf);
 	// An ancestor that is a subagent report's container reads as on its own page.
@@ -129,6 +139,26 @@ export function OutlineBreadcrumbs({
 					{crumb(ancestor, ancestor.id === lastId)}
 				</Fragment>
 			))}
+			{locate && (
+				<OutlineLink
+					to={{ kind: "home" }}
+					className={classes.crumbLocate}
+					aria-label={t("tree.locate")}
+					title={t("tree.locate")}
+					data-testid="outline-locate"
+					onClick={() =>
+						requestTreeLocate(locate.host, {
+							spaceId: view.space.id,
+							pageId: above[0]?.id ?? locate.blockId,
+							blockId: locate.blockId,
+							pathIds: above.map((ancestor) => ancestor.id),
+							pageTitle: above[0]?.title ?? locate.title,
+						})
+					}
+				>
+					<IconBinaryTree2 size={14} />
+				</OutlineLink>
+			)}
 		</nav>
 	);
 }

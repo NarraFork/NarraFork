@@ -161,6 +161,11 @@ export function useOutlineBlock(
 		blocks?: number;
 		/** Byte budget (the server's default when absent). */
 		bytes?: number;
+		/**
+		 * Leave out what is behind closed rows (the connected outline's pages): the server folds
+		 * by the page's default with the reader's stored folding over it.
+		 */
+		fold?: "default";
 		enabled?: boolean;
 		/**
 		 * Keep showing the previous read of the same space while another block loads: the live
@@ -169,14 +174,15 @@ export function useOutlineBlock(
 		keepSpace?: boolean;
 	},
 ) {
-	const { asOf, view, blocks, bytes, keepSpace } = options;
+	const { asOf, view, blocks, bytes, fold, keepSpace } = options;
 	return useQuery({
 		queryKey: [
 			...outlineKeys.block(spaceId, blockId, asOf ?? null, view),
 			blocks ?? null,
 			...(bytes !== undefined ? [bytes] : []),
+			...(fold ? [fold] : []),
 		],
-		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks, bytes }),
+		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks, bytes, fold }),
 		enabled: !REMOTE_BUILD && (options.enabled ?? true),
 		retry: false,
 		// A view as of a commit never changes; the current one is refreshed by the subscription.
@@ -340,6 +346,29 @@ export function useOutlineBacklinks(spaceId: string, blockId: string, enabled: b
 		queryFn: () => api.getOutlineBacklinks(spaceId, blockId),
 		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
+	});
+}
+
+/**
+ * A search a page at a time (the search drawn as a tree, `tree/OutlineSearchTree.tsx`): the next
+ * page is read only when the reader asks, and a search never reaches past what the server ranks.
+ */
+export function useOutlineSearchPages(q: string, spaceId: string | null, enabled: boolean) {
+	const trimmed = q.trim();
+	return useInfiniteQuery({
+		queryKey: [...outlineKeys.search(trimmed, spaceId), "pages"],
+		queryFn: ({ pageParam }) =>
+			api.searchOutline({
+				q: trimmed,
+				spaceId: spaceId ?? undefined,
+				cursor: pageParam ?? undefined,
+			}),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor ?? null,
+		enabled: !REMOTE_BUILD && enabled && trimmed.length > 0,
+		retry: false,
+		// Keeps the tree drawn while the next keystroke's search is read.
+		placeholderData: (previous) => previous,
 	});
 }
 

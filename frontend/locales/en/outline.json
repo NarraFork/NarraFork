@@ -709,6 +709,23 @@
 		"gone": "No longer available.",
 		"partial_one": "Showing the first {{count}} block of this page here.",
 		"partial_other": "Showing the first {{count}} blocks of this page here.",
-		"openPage": "Open the page"
+		"openPage": "Open the page",
+		"waiting": "{{n}} waiting for you",
+		"waitingLabel_one": "{{count}} question waiting for your answer",
+		"waitingLabel_other": "{{count}} questions waiting for your answer",
+		"doingLabel_one": "{{count}} task in progress",
+		"doingLabel_other": "{{count}} tasks in progress",
+		"summary": {
+			"doing": "Doing: {{text}}",
+			"finished": "Finished: {{text}}"
+		},
+		"locate": "Show in the outline tree",
+		"search": {
+			"label": "Search results",
+			"hint": "Matches with what they are under. Open a match to see it in the tree.",
+			"locate": "Show in the tree: {{title}}",
+			"more": "More matches ▸",
+			"untitled": "Untitled"
+		}
 	}
 }

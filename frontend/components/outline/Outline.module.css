@@ -93,6 +93,17 @@
 	min-width: 3em;
 }
 
+/* "Show in the outline tree", at the end of the bar: an icon, always drawn. */
+.crumbLocate {
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	margin-inline-start: 4px;
+	padding: 2px;
+	border-radius: var(--mantine-radius-sm);
+	color: var(--mantine-color-dimmed);
+}
+
 .crumbSeparator {
 	flex: none;
 	color: var(--mantine-color-dimmed);
@@ -629,6 +640,10 @@
 	min-width: 0;
 }
 
+.tree[hidden] {
+	display: none;
+}
+
 .treeRow {
 	display: flex;
 	align-items: center;
@@ -647,7 +662,7 @@
 
 .treeTitle {
 	flex: 0 1 auto;
-	min-width: 0;
+	min-width: 2em;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
@@ -668,6 +683,85 @@
 	cursor: pointer;
 	font-family: inherit;
 	text-align: start;
+	color: var(--mantine-color-dimmed);
+}
+
+/*
+ * A space's one line: what is being done there. Beside the title it takes what room is left and
+ * truncates; where the tree is narrow it is a line of its own under the row.
+ */
+.treeSummary,
+.treeSummaryLine {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	min-width: 0;
+	font-size: var(--mantine-font-size-xs);
+	color: var(--mantine-color-dimmed);
+}
+
+.treeSummary {
+	flex: 1 1 0;
+	padding-inline-start: 8px;
+}
+
+.treeSummaryLine {
+	min-height: 18px;
+	padding-inline-end: 4px;
+}
+
+/* A located row (a block of an open page, a page's row, a search hit's place): marked briefly. */
+.tree [data-located] {
+	border-radius: var(--mantine-radius-sm);
+	background: var(--mantine-color-indigo-light);
+	animation: nf-outline-located 2.4s ease-out;
+}
+
+@keyframes nf-outline-located {
+	0%,
+	60% {
+		background: var(--mantine-color-indigo-light);
+	}
+	100% {
+		background: transparent;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.tree [data-located] {
+		animation: none;
+	}
+}
+
+/* A search drawn as a tree: a hit's snippet under its row, its terms marked. */
+.treeSnippet {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: var(--mantine-font-size-xs);
+	color: var(--mantine-color-dimmed);
+}
+
+.treeSnippet mark,
+.treeTitle mark {
+	padding: 0;
+	border-radius: 2px;
+	color: inherit;
+	background: var(--mantine-color-yellow-light);
+}
+
+.treeHitTitle {
+	padding: 0;
+	border: 0;
+	background: none;
+	cursor: pointer;
+	font-family: inherit;
+	text-align: start;
+}
+
+.treePathTitle {
+	font-weight: 400;
 	color: var(--mantine-color-dimmed);
 }
 

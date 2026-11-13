@@ -105,7 +105,13 @@ export const outlineApi = {
 	getOutlineBlock: (
 		spaceId: string,
 		blockId: string,
-		params: { asOf?: number; view?: OutlineViewMode; blocks?: number; bytes?: number },
+		params: {
+			asOf?: number;
+			view?: OutlineViewMode;
+			blocks?: number;
+			bytes?: number;
+			fold?: "default";
+		},
 	) =>
 		request<OutlineBlockViewResponse>(
 			`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}${query(params)}`,
@@ -130,7 +136,7 @@ export const outlineApi = {
 		request<OutlineTimelineResponse>(
 			`/outline/spaces/${enc(spaceId)}/pages/${enc(pageId)}/commits${query(params)}`,
 		),
-	searchOutline: (params: { q: string; spaceId?: string; limit?: number }) =>
+	searchOutline: (params: { q: string; spaceId?: string; limit?: number; cursor?: string }) =>
 		request<OutlineSearchResponse>(`/outline/search${query(params)}`),
 	/** Where a reference (`ref`, within `space` when bare) or a commit seq of `space` points. */
 	resolveOutline: (params: { ref?: string; space?: string; commit?: number }) =>

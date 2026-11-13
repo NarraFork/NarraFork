@@ -709,6 +709,23 @@
 		"gone": "已不可查看。",
 		"partial_one": "这里只显示这一页的前 {{count}} 块。",
 		"partial_other": "这里只显示这一页的前 {{count}} 块。",
-		"openPage": "打开这一页"
+		"openPage": "打开这一页",
+		"waiting": "等你回答 {{n}}",
+		"waitingLabel_one": "{{count}} 个提问等你回答",
+		"waitingLabel_other": "{{count}} 个提问等你回答",
+		"doingLabel_one": "{{count}} 项任务进行中",
+		"doingLabel_other": "{{count}} 项任务进行中",
+		"summary": {
+			"doing": "正在做：{{text}}",
+			"finished": "刚完成：{{text}}"
+		},
+		"locate": "在大纲树里定位",
+		"search": {
+			"label": "搜索结果",
+			"hint": "命中的内容和它们的上级。点一条命中，在树里定位到它。",
+			"locate": "在树里定位：{{title}}",
+			"more": "更多匹配 ▸",
+			"untitled": "无标题"
+		}
 	}
 }
