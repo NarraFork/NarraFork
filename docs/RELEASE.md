@@ -35,6 +35,12 @@
 - 版本严格匹配 `x.y.0` 时为 stable，其他版本为 beta；beta 映射为 GitHub prerelease，不标记 latest。双语 changelog 写入 Release body。
 - 普通发布的 `--dry-run` 不进行任何 GitHub 调用；仍构建并验证本地产物和有界索引记录，不 commit/tag/upload/publish。可加 `--upload-only --dry-run` 只验证已有构建。`--index-only` 是独立的只读在线修复预览：读取已公开 Release，不依赖本地 dist，不 build/upload/publish；只有额外指定 `--publish-index` 才更新元数据分支，不能与 `--dry-run` 同用。
 
+### Windows 管理器更新交接
+
+Windows 替换程序由旧服务通过 `CreateProcessW` 直接启动，显式设置 `CREATE_BREAKAWAY_FROM_JOB`，使用独立 Unicode 环境块，不继承句柄或控制台，不再经过 `cmd /c start`。单独使用 Bun `detached: true` / `unref()` 不足以脱离服务的嵌套 Job。这让新管理器及其服务在旧管理器退出后继续运行；原生创建失败时会明确报告，不回落到会被连带结束的启动方式。本修复针对 NarraFork 自身的嵌套 Job；第三方宿主的外层 Job 仍可能保留生命周期约束，不保证脱离任意外部限制。非 Windows 继续使用 Bun detached；普通托管后端的生命周期和原有认证关闭、实例锁及恢复清单协议不变。
+
+**首次升级限制：** 0.9.13 / 0.9.14 等仍采用旧启动逻辑的已安装版本，更新到包含本修复的版本时，发起端仍是旧代码，新管理器和服务仍可能被旧管理器连带结束。下载完成后需手动启动新版本 exe；只有运行修复版之后发起的后续更新才使用新的 breakaway 交接路径。不要把“更新包下载成功”当成新版已启动，也不要在旧服务尚未退出时强制终止它。手动启动与自动更新的会话恢复资格仍遵循各自既有协议，不保证手动启动自动消费计划更新恢复清单。
+
 ### 更新与辅助工具的网络代理
 
 网络代理页集中管理“软件更新与辅助工具”，覆盖 GitHub 索引/REST、sidecar、说明、完整包、patch，以及 rg/zstd/executor manifest 和二进制。对应设置只有 `update.proxy`：缺省或 `mode:"default"` 继承全局，也可单独选择 `direct`、`system`、`custom`。全局默认直连；system 使用进程启动时记录的环境代理，自定义支持 HTTP(S) 代理，非法配置不会静默改成直连。更新设置页链接同一管理入口，不存在两份覆盖值。

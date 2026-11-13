@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExecHandle } from "../backend";
@@ -42,14 +42,29 @@ function spawnService(taskId: string, command: string) {
 
 describe.skipIf(!supported)("durable background services", () => {
 	test("streams output from the log file and reports the exit code", async () => {
-		const handle = await spawnService("svc_exit", "echo hello; echo oops >&2; exit 3");
+		const release = join(home, "svc_exit.release");
+		rmSync(release, { force: true });
+		const handle = await spawnService(
+			"svc_exit",
+			"echo hello; echo oops >&2; i=0; while [ ! -f svc_exit.release ] && [ $i -lt 1000 ]; do i=$((i+1)); sleep 0.01; done; [ -f svc_exit.release ] || exit 124; exit 3",
+		);
 		const output = collect(handle);
-		expect(await handle.exited).toBe(3);
-		expect(output()).toContain("hello");
-		expect(output()).toContain("oops");
-		const outcome = await durable.readOrphanedServiceOutcome("svc_exit");
-		expect(outcome.exitCode).toBe(3);
-		expect(outcome.hasManifest).toBe(true);
+		try {
+			// A command that exits immediately may be gone before its start token can be read,
+			// legitimately leaving no manifest. Keep it alive until spawn has persisted one.
+			expect(await durable.readManifest("svc_exit")).not.toBeNull();
+			writeFileSync(release, "release");
+			expect(await handle.exited).toBe(3);
+			expect(output()).toContain("hello");
+			expect(output()).toContain("oops");
+			const outcome = await durable.readOrphanedServiceOutcome("svc_exit");
+			expect(outcome.exitCode).toBe(3);
+			expect(outcome.hasManifest).toBe(true);
+		} finally {
+			await handle.kill();
+			await handle.exited;
+			rmSync(release, { force: true });
+		}
 	});
 
 	test("a new handle re-attaches to a running service and sees its exit", async () => {

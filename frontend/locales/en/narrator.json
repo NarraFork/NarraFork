@@ -936,6 +936,8 @@
 	"permissionTargetSummaryDevice": "Applies to {{device}}",
 	"permissionTargetSummaryOauth": "Applies to an OAuth device group",
 	"permissionBrowseDeviceTitle": "Browsing {{device}}",
+	"permissionBrowseGoPath": "Go",
+	"permissionBrowseNoMatches": "No matching directories.",
 	"permissionBrowseNoSubdirectories": "No subdirectories here.",
 	"permissionBrowseTruncated": "Listing truncated; type a longer path to narrow it down.",
 	"permissionDeviceBrowseHint": "Type to autocomplete, or browse the device's directories.",
