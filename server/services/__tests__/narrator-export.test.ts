@@ -15,6 +15,7 @@
  *   - lazily-forked history is reachable without materializing (writing) refs
  */
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { TURN_RANGE_MAX_TURNS } from "@shared/export-turn-range";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "@shared/gen-ui-public";
 import { clearedToolOutput } from "@shared/storage-retention";
 import { eq } from "drizzle-orm";
@@ -1341,10 +1342,164 @@ describe("导出消息范围", () => {
 		});
 	});
 
-	test("范围串坏掉时导出全部，而不是产出一份空文件", async () => {
+	test("范围串坏掉或过大时拒绝导出，而不是悄悄导出全部", async () => {
 		await seedTurns();
-		const md = await collect("n1", { format: "markdown", range: "oops" });
-		expect(md).toContain("TURN1-USER");
-		expect(md).toContain("TURN3-ASSISTANT");
+		await expect(collect("n1", { format: "markdown", range: "oops" })).rejects.toThrow(
+			"Invalid export message range",
+		);
+		await expect(
+			collect("n1", { format: "markdown", range: `1-${TURN_RANGE_MAX_TURNS + 1}` }),
+		).rejects.toThrow(String(TURN_RANGE_MAX_TURNS));
+	});
+
+	/**
+	 * 弹窗里的 `#N` 必须就是导出的第 N 轮：逐轮导出，断言拿到的正是弹窗给这一轮的预览。
+	 */
+	async function expectPickerMatchesExport(scope: "visible" | "full") {
+		const list = await listNarratorExportTurns("n1", scope);
+		expect(list.turns.length).toBeGreaterThan(0);
+		for (const item of list.turns) {
+			const md = await collect("n1", { format: "markdown", scope, range: String(item.turn) });
+			if (item.userPreview) expect(md).toContain(item.userPreview);
+			if (item.assistantPreview) expect(md).toContain(item.assistantPreview);
+			for (const other of list.turns) {
+				if (other.turn === item.turn) continue;
+				if (other.userPreview) expect(md).not.toContain(other.userPreview);
+			}
+		}
+		return list;
+	}
+
+	test("scope 以助手消息开头时，前导内容自成第 1 轮，弹窗与导出轮号一致", async () => {
+		seedNarrator();
+		const rows: Array<[string, "user" | "assistant"]> = [
+			["LEAD-ASSISTANT", "assistant"],
+			["T1-USER", "user"],
+			["T1-ASSISTANT", "assistant"],
+			["T2-USER", "user"],
+		];
+		for (const [index, [text, role]] of rows.entries()) {
+			await seedMessage({ id: text, narratorId: "n1", seq: index + 1, role, contentText: text });
+		}
+		const list = await expectPickerMatchesExport("visible");
+		expect(list.turns.map((turn) => [turn.turn, turn.userPreview])).toEqual([
+			[1, ""],
+			[2, "T1-USER"],
+			[3, "T2-USER"],
+		]);
+		const md = await collect("n1", { format: "markdown", range: "1" });
+		expect(md).toContain("LEAD-ASSISTANT");
+		expect(md).not.toContain("T1-USER");
+	});
+
+	test("压缩标记不算轮次：full scope 以压缩标记开头时轮号不错位", async () => {
+		seedNarrator();
+		await seedMessage({
+			id: "CMP",
+			narratorId: "n1",
+			seq: 1,
+			role: "system",
+			contentText: "COMPACT-SUMMARY",
+			isCompact: true,
+		});
+		await seedMessage({
+			id: "A-USER",
+			narratorId: "n1",
+			seq: 2,
+			role: "user",
+			contentText: "A-USER",
+		});
+		await seedMessage({
+			id: "B-USER",
+			narratorId: "n1",
+			seq: 3,
+			role: "user",
+			contentText: "B-USER",
+		});
+		const list = await expectPickerMatchesExport("full");
+		expect(list.turns.map((turn) => [turn.turn, turn.userPreview])).toEqual([
+			[1, "A-USER"],
+			[2, "B-USER"],
+		]);
+	});
+
+	test("visible scope 压缩点之后先是助手续写时，弹窗与导出轮号一致", async () => {
+		seedNarrator();
+		await seedMessage({
+			id: "OLD-USER",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "OLD-USER",
+		});
+		await seedMessage({
+			id: "CMP",
+			narratorId: "n1",
+			seq: 2,
+			role: "system",
+			contentText: "COMPACT-SUMMARY",
+			isCompact: true,
+		});
+		await seedMessage({ id: "CONT", narratorId: "n1", seq: 3, contentText: "CONTINUATION" });
+		await seedMessage({
+			id: "N-USER",
+			narratorId: "n1",
+			seq: 4,
+			role: "user",
+			contentText: "N-USER",
+		});
+		await expectPickerMatchesExport("visible");
+	});
+
+	test("部分导出在文件头与 JSON 元数据里都标明了范围", async () => {
+		await seedTurns();
+		const md = await collect("n1", { format: "markdown", range: "2-3", lang: "zh-CN" });
+		expect(md).toContain("这是部分导出");
+		expect(md).toContain("2-3");
+		const json = JSON.parse(await collect("n1", { format: "json", range: "2" }));
+		expect(json.narrafork.rangeNote).toContain("turns 2");
+		const full = await collect("n1", { format: "markdown" });
+		expect(full).not.toContain("Partial export");
+	});
+
+	test("文件名带上所选轮次", () => {
+		const at = new Date("2026-01-02T03:04:05Z");
+		expect(buildExportFileName("t", "markdown", at, "1-3,5").ascii).toMatch(/-turns-1-3_5\.md$/);
+		expect(buildExportFileName("t", "markdown", at).ascii).not.toContain("turns");
+	});
+
+	test("带 GenUI 私有卡片的消息在轮次预览里只给公开摘要", async () => {
+		seedNarrator();
+		await seedMessage({
+			id: "P-USER",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "PUBLIC-QUESTION",
+		});
+		await seedMessage({
+			id: "P-ASSISTANT",
+			narratorId: "n1",
+			seq: 2,
+			contentText: "SECRET-UI-TEXT",
+		});
+		await seedToolCall({
+			id: "ui-row",
+			narratorId: "n1",
+			messageId: "P-ASSISTANT",
+			toolUseId: "ui-use",
+			toolName: "GenUI",
+		});
+		const list = await listNarratorExportTurns("n1", "visible");
+		expect(JSON.stringify(list)).not.toContain("SECRET-UI-TEXT");
+		expect(list.turns[0].assistantPreview).toBe(GEN_UI_PUBLIC_SUMMARY);
+	});
+
+	test("中止信号会停下轮次扫描", async () => {
+		await seedTurns();
+		const controller = new AbortController();
+		controller.abort();
+		const list = await listNarratorExportTurns("n1", "visible", controller.signal);
+		expect(list.turns).toEqual([]);
 	});
 });

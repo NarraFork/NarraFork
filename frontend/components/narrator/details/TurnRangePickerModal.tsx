@@ -21,7 +21,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -63,13 +63,21 @@ export function TurnRangePickerModal({
 }) {
 	const { t } = useTranslation("narrator");
 	const scope = fullHistory ? "full" : "visible";
+	const queryClient = useQueryClient();
+	const queryKey = ["narrator-export-turns", narratorId, scope] as const;
 	const { data, isLoading, isError } = useQuery({
-		queryKey: ["narrator-export-turns", narratorId, scope],
-		queryFn: () => api.getNarratorExportTurns(narratorId, scope),
+		queryKey,
+		queryFn: ({ signal }) => api.getNarratorExportTurns(narratorId, scope, signal),
 		enabled: opened,
-		// 弹窗反复开关不该重复走一遍轮次扫描。
-		staleTime: 5 * 60_000,
+		// 弹窗反复开关不该重复走一遍轮次扫描；但缓存不能太久：期间若发生压缩，visible
+		// scope 的轮号会从压缩点重新数起，旧列表就对不上导出了。
+		staleTime: 30_000,
 	});
+	// 关掉弹窗时中止还在跑的轮次扫描，服务端随请求中止停下遍历。
+	const close = () => {
+		void queryClient.cancelQueries({ queryKey });
+		onClose();
+	};
 	const turns = data?.turns ?? [];
 	const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
 	const [visibleCount, setVisibleCount] = useState(TURN_PAGE_SIZE);
@@ -90,9 +98,14 @@ export function TurnRangePickerModal({
 		const next = new Set(selected);
 		const anchor = lastPicked.current;
 		if (shiftKey && anchor !== null) {
+			// Shift 区间跟随被点那一轮的新状态：点未选中的就整段选上，点已选中的就整段取消。
+			const select = !selected.has(turn);
 			const from = Math.min(anchor, turn);
 			const to = Math.max(anchor, turn);
-			for (let index = from; index <= to; index += 1) next.add(index);
+			for (let index = from; index <= to; index += 1) {
+				if (select) next.add(index);
+				else next.delete(index);
+			}
 		} else if (next.has(turn)) {
 			next.delete(turn);
 		} else {
@@ -112,7 +125,7 @@ export function TurnRangePickerModal({
 	};
 
 	return (
-		<Modal opened={opened} onClose={onClose} title={t("details.exportRangePickerTitle")} size="lg">
+		<Modal opened={opened} onClose={close} title={t("details.exportRangePickerTitle")} size="lg">
 			<Stack gap="sm">
 				<Group grow align="flex-start">
 					<Select
@@ -247,7 +260,7 @@ export function TurnRangePickerModal({
 					<Text size="xs" c="dimmed" style={{ flex: 1 }}>
 						{formatTurnRange(rangesFromTurns(selected)) || t("details.exportRangePlaceholder")}
 					</Text>
-					<UnstyledButton onClick={onClose}>
+					<UnstyledButton onClick={close}>
 						<Text size="sm" fw={600} c="indigo">
 							{t("details.exportRangeDone")}
 						</Text>

@@ -7,8 +7,10 @@ import { Input, Pill, PillsInput, Text } from "@mantine/core";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	expandTurnRange,
 	formatTurnRange,
 	parseTurnRange,
+	TURN_RANGE_MAX_TURNS,
 	type TurnRange,
 } from "../../../../shared/export-turn-range";
 
@@ -23,19 +25,34 @@ export function TurnRangeInput({
 }) {
 	const { t } = useTranslation("narrator");
 	const [draft, setDraft] = useState("");
+	// 没能并进范围的输入要当场说出来：留在框里却不生效，导出时会被悄悄忽略。
+	const [draftError, setDraftError] = useState<string | null>(null);
 	const ranges = parseTurnRange(value);
 	const invalid = ranges === null;
 
-	const apply = (next: readonly TurnRange[]) => {
+	/** 合并后超过上限的范围服务端会拒绝（400），在这里就挡住。 */
+	const apply = (next: readonly TurnRange[]): boolean => {
+		if (!expandTurnRange(next)) {
+			setDraftError(t("details.exportRangeTooLarge", { max: TURN_RANGE_MAX_TURNS }));
+			return false;
+		}
 		onChange(formatTurnRange(next));
 		setDraft("");
+		setDraftError(null);
+		return true;
 	};
 
 	const appendDraft = () => {
 		const raw = draft.trim();
-		if (!raw) return;
+		if (!raw) {
+			setDraftError(null);
+			return;
+		}
 		const parsed = parseTurnRange(raw);
-		if (!parsed) return;
+		if (!parsed) {
+			setDraftError(t("details.exportRangeInvalid"));
+			return;
+		}
 		// 合并交给 formatTurnRange/parseTurnRange：重叠与相邻会自己并起来。
 		apply([...(ranges ?? []), ...parsed]);
 	};
@@ -43,7 +60,7 @@ export function TurnRangeInput({
 	return (
 		<Input.Wrapper
 			label={t("details.exportRange")}
-			error={invalid ? t("details.exportRangeInvalid") : undefined}
+			error={invalid ? t("details.exportRangeInvalid") : (draftError ?? undefined)}
 		>
 			<PillsInput disabled={disabled}>
 				{!invalid &&
@@ -61,7 +78,10 @@ export function TurnRangeInput({
 					value={draft}
 					placeholder={ranges?.length ? "" : t("details.exportRangePlaceholder")}
 					disabled={disabled}
-					onChange={(event) => setDraft(event.currentTarget.value)}
+					onChange={(event) => {
+						setDraft(event.currentTarget.value);
+						setDraftError(null);
+					}}
 					onKeyDown={(event) => {
 						if (event.key !== "Enter" && event.key !== ",") return;
 						event.preventDefault();
@@ -74,7 +94,7 @@ export function TurnRangeInput({
 						const parsed = parseTurnRange(text);
 						if (!parsed) return;
 						event.preventDefault();
-						apply([...(ranges ?? []), ...parsed]);
+						if (!apply([...(ranges ?? []), ...parsed])) setDraft(text);
 					}}
 				/>
 			</PillsInput>

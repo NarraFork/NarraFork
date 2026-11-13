@@ -48,6 +48,7 @@ const CLEARED_EXPORT_TOOL_SQL = sql.raw(clearedToolOutputSql("narrator_tool_call
 
 import { db, sqlite } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { blockBodies, bodySql, readBodies } from "../lib/narrator-bodies";
 import { assembledBodyLengthSql } from "../lib/narrator-body-length";
@@ -1132,6 +1133,7 @@ type LabelKey =
 	| "statsChildMessagesOmitted"
 	| "statsChildMessagesTruncated"
 	| "earlierHistoryOmitted"
+	| "rangeSelected"
 	| "complete"
 	| "incomplete";
 
@@ -1172,6 +1174,8 @@ const LABELS: Record<NarratorExportLang, Record<LabelKey, string>> = {
 		statsChildMessagesTruncated: "Truncated subagent messages",
 		earlierHistoryOmitted:
 			"**This is not the full history.** Messages older than the most recent compact point were not exported. Re-export with the full-history option to include them.",
+		rangeSelected:
+			"**Partial export.** Only turns {range} were exported (a turn is one user message and the replies that follow it).",
 		complete: "Export complete.",
 		incomplete: "**Export incomplete** — it stopped early: {reason}",
 	},
@@ -1208,6 +1212,7 @@ const LABELS: Record<NarratorExportLang, Record<LabelKey, string>> = {
 		statsChildMessagesTruncated: "被截断的子代理消息",
 		earlierHistoryOmitted:
 			"**这不是完整历史。** 最近一次压缩点之前的消息未被导出。如需包含，请勾选完整历史选项重新导出。",
+		rangeSelected: "**这是部分导出。** 只导出了第 {range} 轮（一轮 = 一条用户消息及其后的回复）。",
 		complete: "导出完成。",
 		incomplete: "**导出未完成** —— 提前结束：{reason}",
 	},
@@ -1502,8 +1507,12 @@ export function buildExportFileName(
 	title: string | null | undefined,
 	format: NarratorExportFormat,
 	now = new Date(),
+	range?: string,
 ): { ascii: string; utf8: string } {
 	const ext = format === "json" ? "json" : "md";
+	// 部分导出在文件名上就要看得出来；区间串只含数字、逗号和连字符，换成文件名安全的写法。
+	const rangeText = (range ?? "").replace(/\s+/g, "").replace(/,/g, "_").slice(0, 40);
+	const rangeSuffix = /^[0-9_-]+$/.test(rangeText) ? `-turns-${rangeText}` : "";
 	const stamp = now.toISOString().replace(/[:-]/g, "").replace("T", "-").slice(0, 13);
 
 	// Control characters, quotes, backslashes and path separators are removed
@@ -1528,8 +1537,8 @@ export function buildExportFileName(
 			.replace(/^-|-$/g, "") || "narrator";
 
 	return {
-		ascii: `narrafork-${cleanedAscii}-${stamp}.${ext}`,
-		utf8: `narrafork-${cleanedUtf8}-${stamp}.${ext}`,
+		ascii: `narrafork-${cleanedAscii}-${stamp}${rangeSuffix}.${ext}`,
+		utf8: `narrafork-${cleanedUtf8}-${stamp}${rangeSuffix}.${ext}`,
 	};
 }
 
@@ -1603,6 +1612,10 @@ function markdownHeader(
 		// Only shown when history was genuinely left out, so it stays a real signal
 		// rather than boilerplate readers learn to skip.
 		...(earlierHistoryOmitted ? [`> ${label(lang, "earlierHistoryOmitted")}`, ""] : []),
+		// 选了范围的文件只是会话的一部分，开头就要说清，不能被当成完整存档。
+		...(options.range?.trim()
+			? [`> ${label(lang, "rangeSelected", { range: options.range.trim() })}`, ""]
+			: []),
 		"---",
 		"",
 	];
@@ -1638,20 +1651,6 @@ function markdownFooter(
 	return lines.join("\n");
 }
 
-/**
- * Stream the transcript as a sequence of string chunks.
- *
- * Failure contract: a mid-stream error is caught, not rethrown. Both formats are
- * closed off properly and marked incomplete — JSON stays parseable with
- * `"complete": false` plus an `error` object, Markdown gets an explicit "export
- * incomplete" footer. Rethrowing would leave a JSON file that cannot be parsed
- * at all while the browser still reported a successful download.
- *
- * A client disconnect is different: the caller aborts the signal, paging stops,
- * and whatever reached the disk is truncated at an arbitrary point. That is
- * detectable (no sentinel / parse failure) and nothing further can be written to
- * a closed connection anyway.
- */
 /** 轮次摘要里每条消息保留的字符数：弹窗只用来辨认，不展示正文。 */
 const TURN_PREVIEW_CHARS = 200;
 
@@ -1662,19 +1661,37 @@ const TURN_PREVIEW_CHARS = 200;
 const TURN_INDEX_PAGE_REFS = 500;
 
 /**
+ * 轮号计数器：轮次索引与导出共用，保证弹窗里的 `#N` 就是导出时的第 N 轮。
+ *
+ * - 压缩标记不属于任何一轮（返回 `null`，不推进轮号）。
+ * - 第一条计入的消息无论角色都开启第 1 轮：scope 不以用户消息开头时（如压缩点之后
+ *   先是助手续写），这些前导内容自成第 1 轮。
+ * - 之后每条用户消息开启新的一轮，助手/工具消息跟着所在轮。
+ */
+export function createTurnCounter(): (role: string, isCompactMarker: boolean) => number | null {
+	let turn = 0;
+	return (role, isCompactMarker) => {
+		if (isCompactMarker) return null;
+		if (turn === 0 || role === "user") turn += 1;
+		return turn;
+	};
+}
+
+/**
  * 导出范围 → 轮号集合；`null` 表示不限制。
  *
- * 路由已经校验过一次，这里兜底：串坏掉或展开过大时宁可导出全部，也不要悄悄产出
- * 一份空文件。
+ * 范围写坏或展开过大时直接抛 `ValidationError`：导出是一份要下载的文件，宁可失败，
+ * 也不能悄悄变成"导出了全部"。路由层会先挡一次，这里防的是其他调用方。
  */
-function resolveSelectedTurns(range?: string): Set<number> | null {
+export function resolveSelectedTurns(range?: string): Set<number> | null {
 	if (!range?.trim()) return null;
 	const parsed = parseTurnRange(range);
-	if (!parsed || parsed.length === 0) return null;
+	if (!parsed || parsed.length === 0) throw new ValidationError("Invalid export message range");
 	const turns = expandTurnRange(parsed);
 	if (!turns) {
-		logger.warn("Narrator export range exceeds the turn limit; exporting every turn", { range });
-		return null;
+		throw new ValidationError(
+			`Export message range selects more than ${TURN_RANGE_MAX_TURNS} turns`,
+		);
 	}
 	return turns;
 }
@@ -1687,22 +1704,24 @@ export interface ExportTurnSummary {
 }
 
 /**
- * 选择弹窗用的轮次索引：与导出同一套 scope，只读预览。
+ * 选择弹窗用的轮次索引：与导出同一套 scope、同一个轮号计数器，只读预览。
  *
  * 不读 `content_json`：一页几十条消息的正文可以到几 MB，而这里只需要"这是哪一轮"。
+ * 带 GenUI 私有卡片的消息与导出一样不暴露正文，只给公开摘要。
  */
 export async function listNarratorExportTurns(
 	narratorId: string,
 	scope: NarratorExportScope,
+	signal?: AbortSignal,
 ): Promise<{ turns: ExportTurnSummary[]; truncated: boolean }> {
 	const transcript = await resolveTranscriptScope(narratorId, scope);
 	const turns: ExportTurnSummary[] = [];
-	let current: ExportTurnSummary | null = null;
+	const nextTurn = createTurnCounter();
 
 	for await (const page of iterateNarratorTranscript(
 		narratorId,
 		transcript,
-		undefined,
+		signal,
 		TURN_INDEX_PAGE_REFS,
 	)) {
 		if (page.refs.length === 0) continue;
@@ -1710,28 +1729,18 @@ export async function listNarratorExportTurns(
 		for (const ref of page.refs) {
 			const row = summaries.get(ref.messageId);
 			if (!row) continue;
-			if (row.role === "user") {
+			const turn = nextTurn(row.role, ref.isCompact === 1);
+			if (turn === null) continue;
+			if (turn > turns.length) {
 				if (turns.length >= TURN_RANGE_MAX_TURNS) return { turns, truncated: true };
-				current = {
-					turn: turns.length + 1,
-					userPreview: row.preview,
+				turns.push({
+					turn,
+					userPreview: row.role === "user" ? row.preview : "",
 					assistantPreview: null,
 					createdAt: row.createdAt,
-				};
-				turns.push(current);
-				continue;
+				});
 			}
-			// 会话不是以用户消息开头时，前导内容算第 1 轮。
-			if (!current) {
-				if (turns.length >= TURN_RANGE_MAX_TURNS) return { turns, truncated: true };
-				current = {
-					turn: 1,
-					userPreview: "",
-					assistantPreview: null,
-					createdAt: row.createdAt,
-				};
-				turns.push(current);
-			}
+			const current = turns[turns.length - 1];
 			if (row.role === "assistant" && !current.assistantPreview) {
 				current.assistantPreview = row.preview;
 			}
@@ -1749,13 +1758,38 @@ async function loadTurnSummaries(
 			id: narratorMessages.id,
 			role: narratorMessages.role,
 			createdAt: narratorMessages.createdAt,
+			hasPrivateUi: messageHasPrivateUi,
 			preview: sql<string>`substr(coalesce(${narratorMessages.contentText}, ''), 1, ${TURN_PREVIEW_CHARS})`,
 		})
 		.from(narratorMessages)
 		.where(inArray(narratorMessages.id, messageIds));
-	return new Map(rows.map((row) => [row.id, row]));
+	return new Map(
+		rows.map((row) => [
+			row.id,
+			{
+				role: row.role,
+				createdAt: row.createdAt,
+				// 与 `projectExportMessages` 同一边界：私有卡片的正文不进预览。
+				preview: row.hasPrivateUi ? GEN_UI_PUBLIC_SUMMARY : row.preview,
+			},
+		]),
+	);
 }
 
+/**
+ * Stream the transcript as a sequence of string chunks.
+ *
+ * Failure contract: a mid-stream error is caught, not rethrown. Both formats are
+ * closed off properly and marked incomplete — JSON stays parseable with
+ * `"complete": false` plus an `error` object, Markdown gets an explicit "export
+ * incomplete" footer. Rethrowing would leave a JSON file that cannot be parsed
+ * at all while the browser still reported a successful download.
+ *
+ * A client disconnect is different: the caller aborts the signal, paging stops,
+ * and whatever reached the disk is truncated at an arbitrary point. That is
+ * detectable (no sentinel / parse failure) and nothing further can be written to
+ * a closed connection anyway.
+ */
 export async function* streamNarratorExport(
 	narratorId: string,
 	options: NarratorExportOptions,
@@ -1775,8 +1809,8 @@ export async function* streamNarratorExport(
 	let failure: string | null = null;
 	let lastSeq = 0;
 	const selectedTurns = resolveSelectedTurns(options.range);
-	/** 当前轮号：遇到用户消息才推进，助手/工具消息跟着所在轮。 */
-	let turn = 0;
+	/** 与轮次索引共用的计数器，弹窗里的 `#N` 与这里的第 N 轮是同一轮。 */
+	const nextTurn = createTurnCounter();
 
 	const header = await loadHeader(narratorId);
 
@@ -1813,6 +1847,11 @@ export async function* streamNarratorExport(
 				? {
 						scopeNote:
 							'scope="visible" was used: messages older than the most recent compact point are NOT in this file. Re-export with scope="full" for the complete history.',
+					}
+				: {}),
+			...(options.range?.trim()
+				? {
+						rangeNote: `Partial export: only turns ${options.range.trim()} are in this file. A turn is one user message and the replies that follow it.`,
 					}
 				: {}),
 		})},\n"narrator": ${JSON.stringify(header)},\n"messages": [`;
@@ -1858,11 +1897,9 @@ export async function* streamNarratorExport(
 			);
 
 			for (const message of assembled) {
-				if (!message.isCompactMarker && message.row.role === "user") {
-					turn = turn === 0 ? 1 : turn + 1;
-				}
+				const turn = nextTurn(message.row.role, message.isCompactMarker);
 				// 选了范围就只输出选中轮次；压缩标记不属于任何一轮，一并跳过。
-				if (selectedTurns && (message.isCompactMarker || !selectedTurns.has(turn))) continue;
+				if (selectedTurns && (turn === null || !selectedTurns.has(turn))) continue;
 				if (isJson) {
 					yield `${first ? "\n" : ",\n"}${JSON.stringify(jsonMessage(message, options.includeToolIO))}`;
 					first = false;

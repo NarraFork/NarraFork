@@ -1207,7 +1207,7 @@ export const narratorsApi = {
 	 *
 	 * `scope` 与导出保持一致：弹窗只列将要导出的那份内容里的轮次。
 	 */
-	getNarratorExportTurns: (id: string, scope: "full" | "visible") =>
+	getNarratorExportTurns: (id: string, scope: "full" | "visible", signal?: AbortSignal) =>
 		request<{
 			turns: Array<{
 				turn: number;
@@ -1216,7 +1216,7 @@ export const narratorsApi = {
 				createdAt: string;
 			}>;
 			truncated: boolean;
-		}>(`/narrators/${id}/export-turns?scope=${scope}`),
+		}>(`/narrators/${id}/export-turns?scope=${scope}`, { signal }),
 	getToolCallDetail: (
 		narratorId: string,
 		toolUseId: string,
