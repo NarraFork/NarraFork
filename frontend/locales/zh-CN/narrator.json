@@ -935,6 +935,8 @@
 	"permissionTargetSummaryDevice": "适用于 {{device}}",
 	"permissionTargetSummaryOauth": "适用于 OAuth 设备组",
 	"permissionBrowseDeviceTitle": "正在浏览 {{device}}",
+	"permissionBrowseGoPath": "跳转",
+	"permissionBrowseNoMatches": "没有匹配的目录。",
 	"permissionBrowseNoSubdirectories": "此处没有子目录。",
 	"permissionBrowseTruncated": "目录过多已截断，请输入更精确的路径。",
 	"permissionDeviceBrowseHint": "输入可自动补全，也可浏览该设备的目录。",
