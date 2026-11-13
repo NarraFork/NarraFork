@@ -1,9 +1,12 @@
 /**
  * The swallowed-content scan (outline P2 PR 12c; PR 12 design §2.9, owner decision D52): finds
  * the places where a save from the old Spec panel may have swallowed content, and records them
- * for people to look at. READ-ONLY DETECTION: it reads Dynamic Spec revisions and writes its own
- * two tables (`loss-store.ts`); it never writes Dynamic Spec, never writes the outline, and never
- * repairs anything. What a person does about a finding is `loss-findings.ts`.
+ * for people to look at. READ-ONLY DETECTION: scanning a session reads Dynamic Spec revisions and
+ * writes this module's two tables (`loss-store.ts`); it never writes Dynamic Spec and never
+ * repairs anything. A pass then hands the open findings of imported sessions to
+ * `loss-attach.ts`, which puts each on its file's imported page as a block of its own (owner
+ * decision D52: on the page only; no notice, no digest line). What a person does about a
+ * finding is `loss-findings.ts`.
  *
  * WHAT IT LOOKS AT
  *
@@ -48,6 +51,7 @@ import {
 } from "@shared/spec-content-loss";
 import { OUTLINE_BACKGROUND_TEXT_LIMITS, processBackgroundText } from "../edit-text-runner";
 import { specImportMode, specPointersDigest } from "./importer";
+import { attachSpecLossForSession } from "./loss-attach";
 import {
 	insertSpecLossFinding,
 	readSpecLossScan,
@@ -247,7 +251,9 @@ export interface SpecLossPass {
 	scanned: number;
 	/** New findings. */
 	found: number;
-	/** Sessions left for the next pass: not reached, or their scan failed. */
+	/** Findings put on their imported pages (`loss-attach.ts`). */
+	attached: number;
+	/** Sessions left for the next pass: not reached, their scan failed, or attaches wait. */
 	left: number;
 }
 
@@ -333,7 +339,7 @@ export async function scanSpecSessionLossById(
 export async function runSpecLossPass(
 	options: { stop?: () => boolean; pauseMs?: number; maxScans?: number } = {},
 ): Promise<SpecLossPass> {
-	const pass: SpecLossPass = { sessions: 0, scanned: 0, found: 0, left: 0 };
+	const pass: SpecLossPass = { sessions: 0, scanned: 0, found: 0, attached: 0, left: 0 };
 	const maxScans = options.maxScans ?? SPEC_LOSS_JOB.scansPerPass;
 	let cursor = job.after;
 	let before = cursor;
@@ -378,6 +384,14 @@ export async function runSpecLossPass(
 							error: String(error),
 						});
 					}
+				}
+				// What was found, now or by an earlier pass, goes onto the imported pages (only for a
+				// session whose tasks are in the outline; bounded per session and per page).
+				if (session.taskBackend === "outline") {
+					const run = await attachSpecLossForSession(session);
+					pass.attached += run.attached;
+					if (run.left > 0) pass.left++;
+					if (run.attached > 0) await yieldToEventLoop();
 				}
 			}
 			before = session.namespaceId;

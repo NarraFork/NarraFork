@@ -10,6 +10,7 @@
  * the LENGTH of each only. Nothing here writes Dynamic Spec or the outline.
  */
 import type {
+	OutlineSpecLossAttachNote,
 	OutlineSpecLossFinding,
 	OutlineSpecLossKind,
 	OutlineSpecLossStatus,
@@ -42,6 +43,18 @@ function num(row: Row, column: string): number {
 
 export function isSpecLossStatus(value: unknown): value is OutlineSpecLossStatus {
 	return (OUTLINE_SPEC_LOSS_STATUSES as readonly unknown[]).includes(value);
+}
+
+const ATTACH_NOTES: readonly OutlineSpecLossAttachNote[] = [
+	"no_page",
+	"page_cap",
+	"session_cap",
+	"restored",
+	"failed",
+];
+
+function attachNoteOf(value: string | null): OutlineSpecLossAttachNote | null {
+	return ATTACH_NOTES.find((note) => note === value) ?? null;
 }
 
 function kindsOf(value: string | null): Partial<Record<OutlineSpecLossKind, number>> {
@@ -211,6 +224,7 @@ export interface SpecLossFindingRow extends OutlineSpecLossFinding {
 	beforeRevisionId: string;
 	afterRevisionId: string;
 	resolvedBy: string | null;
+	attachSeq: number;
 	/** The session's task backend now. */
 	taskBackend: string | null;
 	ownerUserId: string | null;
@@ -220,7 +234,8 @@ export interface SpecLossFindingRow extends OutlineSpecLossFinding {
 
 const LIST_COLUMNS = sql`
 	f.id, f.narrator_id, f.path, f.before_revision_id, f.after_revision_id, f.saved_at, f.kinds,
-	f.truncated, f.status, f.block_id, f.resolved_by, f.resolved_at, f.created_at,
+	f.truncated, f.status, f.block_id, f.attach_note, f.attach_seq, f.resolved_by, f.resolved_at,
+	f.created_at,
 	n.title, n.task_backend, n.owner_user_id,
 	(select sp.id from outline_spaces sp
 		where sp.narrator_id = f.narrator_id and sp.kind = 'session' limit 1) as space_id
@@ -240,6 +255,7 @@ function findingOf(row: Row): SpecLossFindingRow {
 		truncated: num(row, "truncated") !== 0,
 		status: isSpecLossStatus(status) ? status : "open",
 		blockId: str(row, "block_id"),
+		attachNote: open ? attachNoteOf(str(row, "attach_note")) : null,
 		spaceId: str(row, "space_id"),
 		resolvedAt: str(row, "resolved_at"),
 		createdAt: str(row, "created_at") ?? "",
@@ -247,6 +263,7 @@ function findingOf(row: Row): SpecLossFindingRow {
 		beforeRevisionId: str(row, "before_revision_id") ?? "",
 		afterRevisionId: str(row, "after_revision_id") ?? "",
 		resolvedBy: str(row, "resolved_by"),
+		attachSeq: num(row, "attach_seq"),
 		taskBackend,
 		ownerUserId: str(row, "owner_user_id"),
 		parts: specLossExcerptParts(str(row, "excerpt")),
@@ -325,25 +342,114 @@ export async function countSpecLossFindings(
 }
 
 /**
- * A person's decision: the finding goes from `from` to `to`, only while it is still `from`
- * (someone else may have decided meanwhile). False when nothing changed.
+ * The finding goes from one of `from` to `to`, only while it is still one of `from` (someone else,
+ * or a pass, may have changed it meanwhile). `blockId` undefined keeps the block recorded. False
+ * when nothing changed.
  */
 export async function setSpecLossFindingStatus(args: {
 	id: string;
-	from: OutlineSpecLossStatus;
+	from: readonly OutlineSpecLossStatus[];
 	to: OutlineSpecLossStatus;
-	userId: string;
+	/** The person deciding; null: the scan's own attach. */
+	userId: string | null;
 	blockId?: string | null;
 }): Promise<boolean> {
 	const now = new Date().toISOString();
-	const open = args.to === "open";
+	const decided = args.to === "dismissed";
+	const from = sql.join(
+		args.from.map((status) => sql`${status}`),
+		sql`, `,
+	);
+	const block = args.blockId === undefined ? sql`block_id` : sql`${args.blockId}`;
 	const rows = await runOutlineAccessQuery(sql`
 		update outline_spec_loss_findings set
-			status = ${args.to}, block_id = ${args.blockId ?? null},
-			resolved_by = ${open ? null : args.userId}, resolved_at = ${open ? null : now},
+			status = ${args.to}, block_id = ${block}, attach_note = null,
+			resolved_by = ${decided ? args.userId : null}, resolved_at = ${decided ? now : null},
 			updated_at = ${now}
-		where id = ${args.id} and status = ${args.from}
+		where id = ${args.id} and status in (${from})
 		returning id
 	`);
 	return rows.length > 0;
+}
+
+/** Why an open finding is not on the page (while it is still open). */
+export async function setSpecLossAttachNote(
+	id: string,
+	note: OutlineSpecLossAttachNote,
+): Promise<void> {
+	await runOutlineAccessQuery(sql`
+		update outline_spec_loss_findings set attach_note = ${note}, updated_at = ${new Date().toISOString()}
+		where id = ${id} and status = 'open'
+	`);
+}
+
+/**
+ * The finding's block was deleted and it is attached anew: its next short id. Only from `from`,
+ * so two attaches at once take the same one. The sequence now.
+ */
+export async function bumpSpecLossAttachSeq(id: string, from: number): Promise<number> {
+	await runOutlineAccessQuery(sql`
+		update outline_spec_loss_findings set attach_seq = ${from + 1}
+		where id = ${id} and attach_seq = ${from}
+	`);
+	const rows = await runOutlineAccessQuery(sql`
+		select attach_seq from outline_spec_loss_findings where id = ${id} limit 1
+	`);
+	return rows[0] ? num(rows[0], "attach_seq") : from + 1;
+}
+
+/** How many findings are attached to the page of `path` in the session, counted up to `cap`. */
+export async function countSpecLossAttached(
+	narratorId: string,
+	path: string,
+	cap: number,
+): Promise<number> {
+	const rows = await runOutlineAccessQuery(sql`
+		select count(*) as n from (
+			select 1 as one from outline_spec_loss_findings
+			where narrator_id = ${narratorId} and status = 'attached' and path = ${path}
+			limit ${cap}
+		) t
+	`);
+	return rows[0] ? num(rows[0], "n") : 0;
+}
+
+/**
+ * The session's open findings a pass attaches, oldest first, with their excerpts: the ones not
+ * tried yet and the ones a later pass tries again (`session_cap`, `failed`). At most `limit`.
+ */
+export async function listSpecLossToAttach(
+	narratorId: string,
+	limit: number,
+): Promise<SpecLossFindingRow[]> {
+	const rows = await runOutlineAccessQuery(sql`
+		select ${LIST_COLUMNS}, f.excerpt
+		from outline_spec_loss_findings f join narrators n on n.id = f.narrator_id
+		where f.narrator_id = ${narratorId} and f.status = 'open'
+			and (f.attach_note is null or f.attach_note in ('session_cap', 'failed'))
+		order by f.created_at, f.id
+		limit ${limit}
+	`);
+	return rows.map(findingOf);
+}
+
+/** The open findings a pass has not tried become `session_cap`: one statement. */
+export async function markSpecLossSessionCap(narratorId: string): Promise<void> {
+	await runOutlineAccessQuery(sql`
+		update outline_spec_loss_findings set attach_note = 'session_cap'
+		where narrator_id = ${narratorId} and status = 'open' and attach_note is null
+	`);
+}
+
+/** The session's attached findings (id and block), at most `limit`. */
+export async function listSpecLossAttached(
+	narratorId: string,
+	limit: number,
+): Promise<Array<{ id: string; blockId: string | null }>> {
+	const rows = await runOutlineAccessQuery(sql`
+		select id, block_id from outline_spec_loss_findings
+		where narrator_id = ${narratorId} and status = 'attached'
+		order by created_at, id limit ${limit}
+	`);
+	return rows.map((row) => ({ id: String(row.id), blockId: str(row, "block_id") }));
 }

@@ -1,5 +1,5 @@
 {
-  "id": "927a3f8c-a8ed-4c70-b42d-1353c39156bb",
+  "id": "82458f42-8b9f-4109-ad9a-25efd456c082",
   "prevId": "c8a9eeba-aacb-4856-b151-f491477a6d62",
   "version": "7",
   "dialect": "postgresql",
@@ -19577,6 +19577,19 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "attach_note": {
+          "name": "attach_note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attach_seq": {
+          "name": "attach_seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "resolved_by": {
           "name": "resolved_by",

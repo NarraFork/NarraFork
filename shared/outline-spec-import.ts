@@ -135,10 +135,21 @@ export interface OutlineSpecImportRevertResult {
 // Content the old Spec panel may have swallowed (outline P2 PR 12c)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** What a person decided about a finding: nothing yet, put on the imported page, or dismissed. */
+/**
+ * Where a finding stands: `open` (not on the page: not attached yet, or it could not be),
+ * `attached` (on the file's imported page, as a block of its own), `dismissed` (a person said it
+ * is nothing; its block is taken away when nobody else wrote in it).
+ */
 export const OUTLINE_SPEC_LOSS_STATUSES = ["open", "attached", "dismissed"] as const;
 
 export type OutlineSpecLossStatus = (typeof OUTLINE_SPEC_LOSS_STATUSES)[number];
+
+export type OutlineSpecLossAttachNote =
+	| "no_page"
+	| "page_cap"
+	| "session_cap"
+	| "restored"
+	| "failed";
 
 /** `SpecLossKind` of `shared/spec-content-loss.ts`, restated for the API. */
 export type OutlineSpecLossKind =
@@ -166,14 +177,26 @@ export interface OutlineSpecLossFinding {
 	/** The excerpt kept does not hold everything that was lost. */
 	truncated: boolean;
 	status: OutlineSpecLossStatus;
-	/** `attached`: the block on the imported page, in the session's space. */
+	/**
+	 * The block on the imported page, in the session's space: of an `attached` finding, and of a
+	 * `dismissed` one whose block was kept because someone else wrote in it.
+	 */
 	blockId: string | null;
+	/**
+	 * Why an `open` finding is not on the page (null: not tried yet):
+	 * - `no_page`: the file's imported page is not there;
+	 * - `page_cap` / `session_cap`: more findings than are attached to one page, or for one
+	 *   session in one pass, automatically (the latter are attached by a later pass);
+	 * - `restored`: the file's current revision holds the content again;
+	 * - `failed`: the attach did not succeed (tried again by a later pass).
+	 */
+	attachNote: OutlineSpecLossAttachNote | null;
 	spaceId: string | null;
 	resolvedAt: string | null;
 	createdAt: string;
 	/**
-	 * The session's tasks are in the outline, so the lost content can be put on the file's
-	 * imported page (it may still be refused: the page was deleted).
+	 * An `open` finding of a session whose tasks are in the outline: a person may ask for it to
+	 * be put on the file's imported page (it may still be refused: the page was deleted).
 	 */
 	attachable: boolean;
 }
@@ -193,6 +216,8 @@ export interface OutlineSpecLossScanStatus {
 		sessions: number;
 		scanned: number;
 		found: number;
+		/** Findings put on their imported pages. */
+		attached: number;
 		/** Sessions left for the next pass. */
 		left: number;
 	} | null;
@@ -210,5 +235,8 @@ export interface OutlineSpecLossPage {
 	scan?: OutlineSpecLossScanStatus;
 }
 
-/** A person's decision about one finding. */
+/**
+ * What a person asks about one finding: `dismiss` (open or attached), `reopen` (a dismissed one;
+ * it is attached again), `attach` (an open one the automatic attach left out).
+ */
 export type OutlineSpecLossAction = "attach" | "dismiss" | "reopen";

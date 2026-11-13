@@ -13,10 +13,18 @@
  *    shares with its parent;
  *  - a pass walks the sessions the scan looks at (no subagents), a few at a time, and goes on
  *    where it stopped; nothing runs while imports are switched off;
- *  - attach puts the lost text on the file's imported page as one block at the top (nothing else
- *    changes), only for an imported session whose page is there; dismiss and reopen only change
- *    the finding; a finding decided already cannot be decided again; another session's finding
- *    is not found.
+ *  - a pass attaches the findings of an IMPORTED session to the file's page, one block at the top
+ *    with the lost text under it and nothing else changed, once (also after a stop between the
+ *    write and its record); a session still in Dynamic Spec waits until a pass after its import;
+ *  - not attached: content the current revision holds again, more than the cap per session in a
+ *    pass (attached by later passes), more than the cap per page (left to a person), a page that
+ *    is gone;
+ *  - a block a system commit deleted is attached anew; one a person deleted stays deleted;
+ *  - dismiss takes the block away when only the attach wrote it and keeps one someone wrote in;
+ *    reopen attaches again; a person's attach is the retry of what was left out; a finding is
+ *    not decided twice; another session's finding is not found;
+ *  - a re-import after a move back is not held up by attached blocks, which follow to the new
+ *    page.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  */
@@ -27,6 +35,7 @@ import {
 	outlineSpecLossFindings,
 	outlineSpecLossScans,
 	specFileRevisions,
+	users,
 } from "../../../../db/schema";
 import { AppError } from "../../../../lib/errors";
 import { settings } from "../../../../lib/settings";
@@ -35,7 +44,9 @@ import { invalidateTaskBackend } from "../../../task-source";
 import { stopEditTextWorker } from "../../edit-text-runner";
 import { outlineStore } from "../../store";
 import { writeOutline } from "../../write";
+import { reimportSpecSession, revertSpecImport } from "../admin";
 import { importSpecSession, resetSpecImportRecords } from "../importer";
+import { SPEC_LOSS_ATTACH_LIMITS, specLossBlockSid } from "../loss-attach";
 import { decideSpecLossFinding, specLossDetail, specLossPage } from "../loss-findings";
 import {
 	requestSpecLossPass,
@@ -47,6 +58,8 @@ import {
 } from "../loss-scan";
 import { countSpecLossFindings, readSpecLossScan, readSpecRevisionChain } from "../loss-store";
 import { OUTLINE_SPEC_LOSS_ACTOR } from "../plan";
+import { readSpecImportState } from "../state";
+import { settleSpecImportRequests } from "../triggers";
 import { backendOf, commitCount, makeSession, makeUser, pages, writeTasks } from "./fixtures";
 
 const TABLE = "| name | value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |";
@@ -96,6 +109,7 @@ beforeEach(async () => {
 });
 afterAll(async () => {
 	await settleSpecLossPass();
+	await settleSpecImportRequests();
 	stopEditTextWorker();
 });
 
@@ -131,7 +145,7 @@ describe("the scan", () => {
 		expect((await specLossDetail(finding?.id as string, id)).parts[0]?.text).toBe(TABLE);
 	});
 
-	test("it only reads: no spec revision and no outline commit is written", async () => {
+	test("scanning only reads: no spec revision and no outline commit is written", async () => {
 		const { id } = await makeSession();
 		await writeTasks(id, [{ text: "a task" }]);
 		await swallowed(id);
@@ -255,7 +269,12 @@ describe("passes", () => {
 		// Everything scanned and unchanged: a full pass scans nothing.
 		for (let pass = 0; pass < 50; pass++)
 			if ((await runSpecLossPass({ pauseMs: 0 })).left === 0) break;
-		expect(await runSpecLossPass({ pauseMs: 0 })).toMatchObject({ scanned: 0, found: 0, left: 0 });
+		expect(await runSpecLossPass({ pauseMs: 0 })).toMatchObject({
+			scanned: 0,
+			found: 0,
+			attached: 0,
+			left: 0,
+		});
 	});
 
 	test("switched off: a pass does nothing and none can be asked for", async () => {
@@ -266,6 +285,7 @@ describe("passes", () => {
 			sessions: 0,
 			scanned: 0,
 			found: 0,
+			attached: 0,
 			left: 0,
 		});
 		expect(await code(async () => requestSpecLossPass())).toBe("SPEC_IMPORT_OFF");
@@ -286,105 +306,374 @@ describe("passes", () => {
 	});
 });
 
-describe("what a person does about a finding", () => {
-	async function imported() {
-		const owner = await makeUser("zh-CN");
-		const { id } = await makeSession({ owner });
-		await writeTasks(id, [{ text: "a task" }]);
-		await swallowed(id);
-		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
-			status: "imported",
-		});
-		expect(await backendOf(id)).toBe("outline");
-		await scanSpecSessionLossById(id);
-		const [finding] = await open(id);
-		return { id, owner, findingId: finding?.id as string };
+/** Passes until this case's sessions have nothing left to attach (other cases' are in the way). */
+async function passes(done: () => Promise<boolean>): Promise<void> {
+	for (let n = 0; n < 60; n++) {
+		await runSpecLossPass({ pauseMs: 0 });
+		if (await done()) return;
 	}
+	throw new Error("the passes did not get there");
+}
 
-	test("attach: one block at the top of the file's page, the lost text under it", async () => {
-		const { id, owner, findingId } = await imported();
-		const before = (await pages(id)).find((page) => page.title === "design.md");
-		const after = await decideSpecLossFinding({
-			id: findingId,
-			narratorId: id,
-			action: "attach",
-			userId: owner,
-		});
-		expect(after).toMatchObject({ status: "attached", attachable: false });
-		expect(after.blockId).toBeTruthy();
-		expect(after.spaceId).toBeTruthy();
-		const page = (await pages(id)).find((p) => p.title === "design.md");
+async function all(narratorId: string, status: "open" | "attached" | "dismissed") {
+	return (await specLossPage({ status, narratorId, limit: 50, canAct: true })).items;
+}
+
+async function spaceOf(narratorId: string): Promise<string> {
+	const space = await outlineStore.findSpace({ kind: "session", narratorId });
+	return space?.id as string;
+}
+
+const designPage = async (narratorId: string, title = "design.md") =>
+	(await pages(narratorId)).find((page) => page.title === title);
+
+/** An imported session whose owner's save dropped a table, scanned (nothing attached yet). */
+async function imported(options: { language?: "en" | "zh-CN" } = {}) {
+	const owner = await makeUser(options.language ?? "zh-CN");
+	const { id } = await makeSession({ owner });
+	await writeTasks(id, [{ text: "a task" }]);
+	await swallowed(id);
+	expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({ status: "imported" });
+	expect(await backendOf(id)).toBe("outline");
+	await scanSpecSessionLossById(id);
+	const [finding] = await open(id);
+	return { id, owner, findingId: finding?.id as string };
+}
+
+/** The same, with the finding attached by a pass. */
+async function attached(options: { language?: "en" | "zh-CN" } = {}) {
+	const made = await imported(options);
+	await passes(async () => (await all(made.id, "attached")).length === 1);
+	const [finding] = await all(made.id, "attached");
+	return { ...made, blockId: finding?.blockId as string };
+}
+
+describe("the automatic attach", () => {
+	test("a pass puts the finding on the file's page: one block at the top, the lost text under it", async () => {
+		const { id, owner } = await imported();
+		const before = await designPage(id);
+		const commits = await commitCount(id);
+		await passes(async () => (await all(id, "attached")).length === 1);
+		const [finding] = await all(id, "attached");
+		expect(finding).toMatchObject({ status: "attached", attachNote: null, attachable: false });
+		expect(finding?.spaceId).toBe(await spaceOf(id));
+		const page = await designPage(id);
 		// The page's own blocks are as they were, after the one new block.
 		expect(page?.blocks.slice(1)).toEqual(before?.blocks as string[]);
 		expect(page?.blocks[0]).toContain("可能丢失的内容");
 		expect(page?.blocks[0]).toContain("1 张表格");
-		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
-		const under = await outlineStore.listChildren(space?.id as string, after.blockId as string, 50);
-		const text = under.map((block) => block.content).join("\n");
-		for (const cell of ["name", "value", "alpha", "beta"]) expect(text).toContain(cell);
-		const block = await outlineStore.getBlock(after.blockId as string);
-		const commit = (await outlineStore.listCommits(space?.id as string, { limit: 50 })).at(-1);
+		const under = await outlineStore.listChildren(
+			await spaceOf(id),
+			finding?.blockId as string,
+			50,
+		);
 		// The table is one table block, as the import writes tables.
 		expect(under.map((b) => b.content)).toEqual([TABLE]);
-		expect(block?.spaceId).toBe(space?.id as string);
+		const commit = (await outlineStore.listCommits(await spaceOf(id), { limit: 50 })).at(-1);
 		expect(commit).toMatchObject({
 			actorKind: "system",
 			actorId: OUTLINE_SPEC_LOSS_ACTOR,
 			responsibleUserId: owner,
 		});
-		// Decided: not again, by anyone.
-		for (const action of ["attach", "dismiss", "reopen"] as const)
-			expect(
-				await code(() =>
-					decideSpecLossFinding({ id: findingId, narratorId: id, action, userId: owner }),
-				),
-			).toBe("SPEC_LOSS_DECIDED");
+		expect(await commitCount(id)).toBe(commits + 1);
+		// Once: later passes write nothing.
+		await runSpecLossPass({ pauseMs: 0 });
+		await runSpecLossPass({ pauseMs: 0 });
+		expect(await commitCount(id)).toBe(commits + 1);
 		expect(await countSpecLossFindings(id)).toEqual({ open: 0, attached: 1, dismissed: 0 });
 	});
 
-	test("attach is refused while the session keeps Dynamic Spec, and when the page is gone", async () => {
-		const spec = await makeSession();
-		await swallowed(spec.id);
-		await scanSpecSessionLossById(spec.id);
-		const [specFinding] = await open(spec.id);
-		expect(
-			await code(() =>
-				decideSpecLossFinding({
-					id: specFinding?.id as string,
-					narratorId: spec.id,
-					action: "attach",
-					userId: spec.owner as string,
-				}),
-			),
-		).toBe("SPEC_LOSS_NOT_IMPORTED");
+	test("a session still in Dynamic Spec waits; a pass after its import attaches", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "a task" }]);
+		await swallowed(id);
+		await passes(async () => (await readSpecLossScan(id)) !== null);
+		await runSpecLossPass({ pauseMs: 0 });
+		expect(await open(id)).toMatchObject([{ status: "open", attachNote: null, attachable: false }]);
+		expect(await commitCount(id)).toBe(0);
+		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
+			status: "imported",
+		});
+		await passes(async () => (await all(id, "attached")).length === 1);
+		expect((await designPage(id))?.blocks[0]).toContain("Possibly lost content");
+	});
 
+	test("written but not recorded (a stop in between): recorded, never written twice", async () => {
+		const { id, findingId, blockId } = await attached();
+		const commits = await commitCount(id);
+		await db
+			.update(outlineSpecLossFindings)
+			.set({ status: "open", blockId: null })
+			.where(eq(outlineSpecLossFindings.id, findingId));
+		await passes(async () => (await all(id, "attached")).length === 1);
+		expect((await all(id, "attached"))[0]?.blockId).toBe(blockId);
+		expect(await commitCount(id)).toBe(commits);
+		const [block] = await outlineStore.getBlockMetas(await spaceOf(id), {
+			sids: [specLossBlockSid(findingId)],
+		});
+		expect(block?.id).toBe(blockId);
+	});
+
+	test("the current revision holds the content again: not attached, and said so", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "a task" }]);
+		await swallowed(id);
+		await scanSpecSessionLossById(id);
+		expect(await open(id)).toHaveLength(1);
+		// Put back before the import.
+		await write(id, "design.md", WITH_TABLE, "assistant");
+		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
+			status: "imported",
+		});
+		const commits = await commitCount(id);
+		await passes(async () => (await open(id))[0]?.attachNote === "restored");
+		expect(await commitCount(id)).toBe(commits);
+		expect(await countSpecLossFindings(id)).toEqual({ open: 1, attached: 0, dismissed: 0 });
+		// Not tried again by later passes.
+		await runSpecLossPass({ pauseMs: 0 });
+		expect(await commitCount(id)).toBe(commits);
+	});
+
+	test("so many a session in one pass, the rest by later passes", async () => {
+		const perPass = SPEC_LOSS_ATTACH_LIMITS.perSessionPass;
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "a task" }]);
+		for (let n = 0; n < perPass + 2; n++) await swallowed(id, `note-${n}.md`);
+		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
+			status: "imported",
+		});
+		await scanSpecSessionLossById(id);
+		const commits = await commitCount(id);
+		const first = await runSpecLossPass({ pauseMs: 0 });
+		expect(first.left).toBeGreaterThanOrEqual(1);
+		expect(await countSpecLossFindings(id)).toEqual({ open: 2, attached: perPass, dismissed: 0 });
+		expect(await commitCount(id)).toBe(commits + perPass);
+		expect((await open(id)).map((f) => f.attachNote)).toEqual(["session_cap", "session_cap"]);
+		await passes(async () => (await open(id)).length === 0);
+		expect(await countSpecLossFindings(id)).toEqual({
+			open: 0,
+			attached: perPass + 2,
+			dismissed: 0,
+		});
+	});
+
+	test("so many on one page; more are left to a person, who may still attach one", async () => {
+		const perPage = SPEC_LOSS_ATTACH_LIMITS.perPage;
+		const total = perPage + 2;
+		const owner = await makeUser("en");
+		const { id } = await makeSession({ owner });
+		await writeTasks(id, [{ text: "a task" }]);
+		const table = (n: number) => `| t${n} |\n| --- |\n| v${n} |`;
+		const doc = (from: number) =>
+			`# Many\n\n${Array.from({ length: total - from }, (_, k) => table(from + k)).join("\n\n")}\n`;
+		await write(id, "many.md", doc(0), "assistant");
+		// Each save of the person drops one more table.
+		for (let n = 1; n <= total; n++) await write(id, "many.md", doc(n), "user");
+		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
+			status: "imported",
+		});
+		expect(await scanSpecSessionLossById(id)).toMatchObject({ findings: total });
+		await passes(
+			async () => (await open(id)).filter((f) => f.attachNote === "page_cap").length === 2,
+		);
+		expect(await countSpecLossFindings(id)).toEqual({ open: 2, attached: perPage, dismissed: 0 });
+		const commits = await commitCount(id);
+		await runSpecLossPass({ pauseMs: 0 });
+		expect(await commitCount(id)).toBe(commits);
+		// A person asks for one of them.
+		const [left] = await open(id);
+		const result = await decideSpecLossFinding({
+			id: left?.id as string,
+			narratorId: id,
+			action: "attach",
+			userId: owner,
+		});
+		expect(result).toMatchObject({ status: "attached", attachNote: null });
+		expect(await commitCount(id)).toBe(commits + 1);
+	}, 30_000);
+
+	test("the page is gone: said so, and a person's attach is refused with the reason", async () => {
 		const { id, owner, findingId } = await imported();
-		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
-		const page = (await pages(id)).find((p) => p.title === "design.md");
+		const page = await designPage(id);
 		await writeOutline({
-			spaceId: space?.id as string,
+			spaceId: await spaceOf(id),
 			ops: [{ op: "delete", block: { sid: page?.sid as string } }],
 			actor: { kind: "human", id: owner },
 			responsibleUserId: owner,
 		});
 		const commits = await commitCount(id);
+		await passes(async () => (await open(id))[0]?.attachNote === "no_page");
+		expect(await commitCount(id)).toBe(commits);
 		expect(
 			await code(() =>
 				decideSpecLossFinding({ id: findingId, narratorId: id, action: "attach", userId: owner }),
 			),
 		).toBe("SPEC_LOSS_NO_PAGE");
 		expect(await commitCount(id)).toBe(commits);
-		expect((await open(id))[0]?.status).toBe("open");
 		// The text can still be read.
 		expect((await specLossDetail(findingId, id)).parts[0]?.text).toBe(TABLE);
 	});
 
-	test("dismiss and reopen change the finding only; another session's is not found", async () => {
+	test("a block a system commit deleted is attached anew; one a person deleted stays deleted", async () => {
+		const bySystem = await attached();
+		await writeOutline({
+			spaceId: await spaceOf(bySystem.id),
+			ops: [{ op: "delete", block: { id: bySystem.blockId } }],
+			actor: { kind: "system", id: "plugin:some.plugin" },
+			responsibleUserId: bySystem.owner,
+		});
+		await passes(async () => {
+			const [finding] = await all(bySystem.id, "attached");
+			return finding !== undefined && finding.blockId !== bySystem.blockId;
+		});
+		const [again] = await all(bySystem.id, "attached");
+		const [block] = await outlineStore.getBlockMetas(await spaceOf(bySystem.id), {
+			ids: [again?.blockId as string],
+		});
+		expect(block).toMatchObject({ deleted: false, sid: specLossBlockSid(bySystem.findingId, 1) });
+		expect((await designPage(bySystem.id))?.blocks[0]).toContain("可能丢失的内容");
+
+		const byPerson = await attached();
+		await writeOutline({
+			spaceId: await spaceOf(byPerson.id),
+			ops: [{ op: "delete", block: { id: byPerson.blockId } }],
+			actor: { kind: "human", id: byPerson.owner },
+			responsibleUserId: byPerson.owner,
+		});
+		const commits = await commitCount(byPerson.id);
+		await runSpecLossPass({ pauseMs: 0 });
+		await runSpecLossPass({ pauseMs: 0 });
+		expect(await commitCount(byPerson.id)).toBe(commits);
+		expect((await all(byPerson.id, "attached"))[0]?.blockId).toBe(byPerson.blockId);
+		expect((await designPage(byPerson.id))?.blocks[0]).not.toContain("可能丢失的内容");
+	});
+
+	test("a re-import after a move back is not held up by the attached block, which follows to the new page", async () => {
+		const { id, owner, findingId, blockId } = await attached();
+		await db.update(users).set({ role: "admin" }).where(eq(users.id, owner));
+		const oldPage = await designPage(id);
+		await revertSpecImport(id, owner);
+		// Moved back: the block stays where it is, the finding stays attached.
+		await runSpecLossPass({ pauseMs: 0 });
+		expect((await all(id, "attached"))[0]?.blockId).toBe(blockId);
+		// The session works in Dynamic Spec again: the file changes (the table still gone).
+		await write(id, "design.md", `${WITHOUT_TABLE}\nmore\n`, "assistant");
+		await reimportSpecSession(id, owner);
+		await settleSpecImportRequests();
+		expect((await readSpecImportState(id))?.status).toBe("imported");
+		expect(await backendOf(id)).toBe("outline");
+		await passes(async () => {
+			const [finding] = await all(id, "attached");
+			return finding !== undefined && finding.blockId !== blockId;
+		});
+		const page = await designPage(id);
+		expect(page?.blocks[0]).toContain("可能丢失的内容");
+		// The page of the file's new revision, not the one the block was on.
+		expect(page?.sid).not.toBe(oldPage?.sid as string);
+		expect((await all(id, "attached"))[0]?.id).toBe(findingId);
+	});
+});
+
+describe("what a person does about a finding", () => {
+	test("dismiss takes the block away when only the attach wrote it; reopen attaches again", async () => {
+		const { id, owner, findingId, blockId } = await attached();
+		const before = await designPage(id);
+		const dismissed = await decideSpecLossFinding({
+			id: findingId,
+			narratorId: id,
+			action: "dismiss",
+			userId: owner,
+		});
+		expect(dismissed).toMatchObject({ status: "dismissed", blockId: null });
+		expect(dismissed.resolvedAt).toBeTruthy();
+		const page = await designPage(id);
+		expect(page?.blocks).toEqual(before?.blocks.slice(1) as string[]);
+		const [gone] = await outlineStore.getBlockMetas(await spaceOf(id), { ids: [blockId] });
+		expect(gone?.deleted).toBe(true);
+		expect(await outlineStore.listChildren(await spaceOf(id), blockId, 10)).toEqual([]);
+		// Dismissed: passes leave it alone.
+		const commits = await commitCount(id);
+		await runSpecLossPass({ pauseMs: 0 });
+		expect(await commitCount(id)).toBe(commits);
+		expect(
+			await code(() =>
+				decideSpecLossFinding({ id: findingId, narratorId: id, action: "dismiss", userId: owner }),
+			),
+		).toBe("SPEC_LOSS_DECIDED");
+		expect(
+			await code(() =>
+				decideSpecLossFinding({ id: findingId, narratorId: id, action: "attach", userId: owner }),
+			),
+		).toBe("SPEC_LOSS_DECIDED");
+
+		const reopened = await decideSpecLossFinding({
+			id: findingId,
+			narratorId: null,
+			action: "reopen",
+			userId: owner,
+		});
+		expect(reopened).toMatchObject({ status: "attached", resolvedAt: null });
+		expect(reopened.blockId).not.toBe(blockId);
+		expect(await designPage(id)).toEqual(before);
+		expect(
+			await code(() =>
+				decideSpecLossFinding({ id: findingId, narratorId: id, action: "reopen", userId: owner }),
+			),
+		).toBe("SPEC_LOSS_DECIDED");
+	});
+
+	test("dismiss keeps a block someone wrote in, and the finding is dismissed all the same", async () => {
+		for (const change of ["child", "edit"] as const) {
+			const { id, owner, findingId, blockId } = await attached();
+			await writeOutline({
+				spaceId: await spaceOf(id),
+				ops: [
+					change === "child"
+						? { op: "insert", parent: { id: blockId }, content: "my note about this table" }
+						: { op: "update", block: { id: blockId }, content: "I looked at this" },
+				],
+				actor: { kind: "human", id: owner },
+				responsibleUserId: owner,
+			});
+			const commits = await commitCount(id);
+			const dismissed = await decideSpecLossFinding({
+				id: findingId,
+				narratorId: id,
+				action: "dismiss",
+				userId: owner,
+			});
+			expect(dismissed).toMatchObject({ status: "dismissed", blockId });
+			expect(await commitCount(id)).toBe(commits);
+			const [kept] = await outlineStore.getBlockMetas(await spaceOf(id), { ids: [blockId] });
+			expect(kept?.deleted).toBe(false);
+			// Reopened: the block that is there is the one, nothing is written.
+			const reopened = await decideSpecLossFinding({
+				id: findingId,
+				narratorId: id,
+				action: "reopen",
+				userId: owner,
+			});
+			expect(reopened).toMatchObject({ status: "attached", blockId });
+			expect(await commitCount(id)).toBe(commits);
+		}
+	});
+
+	test("a session still in Dynamic Spec: dismiss and reopen change the finding only; attach is refused", async () => {
 		const { id, owner } = await makeSession();
 		await swallowed(id);
 		await scanSpecSessionLossById(id);
 		const [finding] = await open(id);
 		const findingId = finding?.id as string;
+		expect(
+			await code(() =>
+				decideSpecLossFinding({
+					id: findingId,
+					narratorId: id,
+					action: "attach",
+					userId: owner as string,
+				}),
+			),
+		).toBe("SPEC_LOSS_NOT_IMPORTED");
 		const other = await makeSession();
 		expect(
 			await code(() =>
@@ -404,22 +693,18 @@ describe("what a person does about a finding", () => {
 			userId: owner as string,
 		});
 		expect(dismissed).toMatchObject({ status: "dismissed" });
-		expect(dismissed.resolvedAt).toBeTruthy();
 		const [row] = await db
 			.select()
 			.from(outlineSpecLossFindings)
 			.where(eq(outlineSpecLossFindings.id, findingId));
 		expect(row).toMatchObject({ status: "dismissed", resolvedBy: owner });
-		expect(
-			(await specLossPage({ status: "dismissed", narratorId: id, canAct: true })).items,
-		).toHaveLength(1);
 		const reopened = await decideSpecLossFinding({
 			id: findingId,
 			narratorId: null,
 			action: "reopen",
 			userId: owner as string,
 		});
-		expect(reopened).toMatchObject({ status: "open", resolvedAt: null });
+		expect(reopened).toMatchObject({ status: "open", resolvedAt: null, attachNote: null });
 		expect(await commitCount(id)).toBe(0);
 	});
 
@@ -446,8 +731,13 @@ describe("what a person does about a finding", () => {
 		expect(new Set([...first.items, ...second.items].map((item) => item.path))).toEqual(
 			new Set(["a.md", "b.md", "c.md"]),
 		);
-		const all = await specLossPage({ status: "open", narratorId: null, limit: 50, canAct: true });
-		expect(all.scan).toMatchObject({ running: false });
-		expect(all.items.some((item) => item.narratorId === id)).toBe(true);
+		const everyone = await specLossPage({
+			status: "open",
+			narratorId: null,
+			limit: 50,
+			canAct: true,
+		});
+		expect(everyone.scan).toMatchObject({ running: false });
+		expect(everyone.items.some((item) => item.narratorId === id)).toBe(true);
 	});
 });

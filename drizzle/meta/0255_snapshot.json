@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "09bece0f-43ae-4000-a2e9-943cc438a79c",
+  "id": "bfa404b0-8ac8-4268-9e52-c85aec57bd4c",
   "prevId": "34cd43ab-2abb-4cd2-89d6-6867131afc6e",
   "tables": {
     "acl_events": {
@@ -16205,6 +16205,21 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "attach_note": {
+          "name": "attach_note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "attach_seq": {
+          "name": "attach_seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
         },
         "resolved_by": {
           "name": "resolved_by",

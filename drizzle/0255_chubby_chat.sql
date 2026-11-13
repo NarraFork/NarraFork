@@ -14,6 +14,8 @@ CREATE TABLE `outline_spec_loss_findings` (
 	`truncated` integer DEFAULT 0 NOT NULL,
 	`status` text DEFAULT 'open' NOT NULL,
 	`block_id` text,
+	`attach_note` text,
+	`attach_seq` integer DEFAULT 0 NOT NULL,
 	`resolved_by` text,
 	`resolved_at` text,
 	`created_at` text NOT NULL,

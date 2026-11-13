@@ -580,10 +580,10 @@
 		{
 			"idx": 72,
 			"tag": "0072_outline_spec_loss",
-			"id": "927a3f8c-a8ed-4c70-b42d-1353c39156bb",
+			"id": "82458f42-8b9f-4109-ad9a-25efd456c082",
 			"prevId": "c8a9eeba-aacb-4856-b151-f491477a6d62",
 			"version": "7",
-			"snapshotDigest": "8d406e8e70d2776722d6b7b183eda3712e947e6328c7baec919e9e153048037d"
+			"snapshotDigest": "555e158501ff931c4a7eaba04532cf107f97a0722d83a9a5e92b79e22b063d58"
 		}
 	]
 }

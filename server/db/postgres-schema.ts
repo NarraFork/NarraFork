@@ -3974,6 +3974,8 @@ export const outlineSpecLossFindings = pgTable(
 		truncated: integer("truncated").notNull().default(0),
 		status: text("status").notNull().default("open"),
 		blockId: text("block_id"),
+		attachNote: text("attach_note"),
+		attachSeq: integer("attach_seq").notNull().default(0),
 		resolvedBy: text("resolved_by"),
 		resolvedAt: text("resolved_at"),
 		createdAt: text("created_at").notNull(),
@@ -4460,7 +4462,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 144,
-  "columnCount": 1913,
+  "columnCount": 1915,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -27276,6 +27278,26 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "attachNote",
+          "name": "attach_note",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attachSeq",
+          "name": "attach_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         },
         {
           "property": "resolvedBy",

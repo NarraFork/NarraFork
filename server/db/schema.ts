@@ -6393,8 +6393,8 @@ export const outlineSpecImports = sqliteTable(
  * Content a save from the old Spec panel may have swallowed (outline P2 PR 12c;
  * `server/services/outline/spec-import/loss-scan.ts`): one row per place, found by a read-only
  * scan of a session's Dynamic Spec revisions and shown to an administrator and the session's
- * owner. Nothing is repaired from it automatically; a person attaches it to the imported page or
- * dismisses it.
+ * owner. The lost content is attached to the file's imported page as a block of its own (owner
+ * decision D52: on the page only); nothing of the page's own content is ever repaired from it.
  *
  *   - `id` follows from (session, path, the revision before the save), so a scan run again adds
  *     nothing twice and never changes what a person decided.
@@ -6403,7 +6403,10 @@ export const outlineSpecImports = sqliteTable(
  *   - `kinds`: JSON, how many structures of each kind were lost (`{"table":2}`).
  *   - `excerpt`: JSON, the lost source text (bounded; `truncated` when it was cut). Never read by
  *     a list, only by one finding's detail.
- *   - `status`: `open`, `attached` (a person put it on the imported page: `block_id`), `dismissed`.
+ *   - `status`: `open` (not on the page: `attach_note` says why once that was tried), `attached`
+ *     (on the file's imported page: `block_id`), `dismissed` (a person's decision).
+ *   - `attach_seq`: how often it was attached anew after its block was deleted; the block's short
+ *     id follows from (`id`, `attach_seq`), so no attach is ever written twice.
  */
 export const outlineSpecLossFindings = sqliteTable(
 	"outline_spec_loss_findings",
@@ -6425,6 +6428,8 @@ export const outlineSpecLossFindings = sqliteTable(
 			.notNull()
 			.default("open"),
 		blockId: text("block_id"),
+		attachNote: text("attach_note"),
+		attachSeq: integer("attach_seq").notNull().default(0),
 		resolvedBy: text("resolved_by"),
 		resolvedAt: text("resolved_at"),
 		createdAt: text("created_at").notNull(),
