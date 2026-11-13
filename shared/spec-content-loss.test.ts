@@ -42,6 +42,7 @@ describe("extractSpecLossItems", () => {
 		// After the list ended, an indented block is code again.
 		expect(kinds("- item\n\ntext\n\n    |a|b|\n    |-|-|\n")).toEqual([]);
 		// ```js inside an open ``` fence is content, it does not close the fence.
+		expect(kinds("```\n```js\n|a|b|\n|-|-|\n```\n")).toEqual([]);
 		expect(kinds("```\n```js\n|a|b|\n|-|-|\n```\n\n|x|y|\n|-|-|\n")).toEqual(["table"]);
 		expect(
 			extractSpecLossItems("````\n```js\n|a|b|\n|-|-|\n```\n````\n|x|y|\n|-|-|\n").map(
@@ -55,7 +56,9 @@ describe("extractSpecLossItems", () => {
 		expect(kinds("Use Array<string> and Map<K, V> and a < b > c and <https://x.y>")).toEqual([]);
 		expect(kinds("the <title> of the page, the <code> to run")).toEqual([]);
 		expect(kinds("use `<div>` here")).toEqual([]);
+		expect(kinds("a <file>path</file> b, and vector<i>, and \\<br> escaped")).toEqual([]);
 		expect(kinds("x <br> y")).toEqual(["html"]);
+		expect(kinds("one line<br>the next")).toEqual(["html"]);
 		expect(kinds("a <span>b</span> c")).toEqual(["html"]);
 		expect(kinds('<div align="center">\ntext')).toEqual(["html"]);
 		expect(kinds("<details>\n<summary>more</summary>\nbody\n</details>")).toEqual(["html"]);
@@ -192,6 +195,8 @@ describe("lostSpecItems", () => {
 	test("two tables made one with every row kept is no loss; a row gone is", () => {
 		const two = "|a|b|\n|-|-|\n|1|2|\n\n|a|b|\n|-|-|\n|3|4|\n";
 		expect(lost(two, "|a|b|\n|-|-|\n|1|2|\n|3|4|\n")).toEqual([]);
+		// Also when the file as it is now no longer holds them: the save did not lose them.
+		expect(lost(two, "|a|b|\n|-|-|\n|1|2|\n|3|4|\n", "nothing left")).toEqual([]);
 		// The rows are in the file's current table again: not lost either.
 		expect(lost(two, "|a|b|\n|-|-|\n|1|2|\n", "|a|b|\n|-|-|\n|3|4|\n|1|2|\n")).toEqual([]);
 		expect(lost(two, "|a|b|\n|-|-|\n|1|2|\n").map((item) => item.raw)).toEqual([

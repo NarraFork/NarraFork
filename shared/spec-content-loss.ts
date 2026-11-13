@@ -160,7 +160,8 @@ function hasRealHtml(text: string, around: string): boolean {
 	let lower: string | null = null;
 	for (const match of text.matchAll(HTML_TAG_RE)) {
 		const at = match.index ?? 0;
-		if (at > 0 && /[A-Za-z0-9_\\]/.test(text[at - 1] as string)) continue;
+		// `\<br>` is an escaped bracket, not a tag.
+		if (at > 0 && text[at - 1] === "\\") continue;
 		const name = (match[2] as string).toLowerCase();
 		if (!HTML_NAMES.has(name) && !name.includes("-")) continue;
 		const attrs = match[3] ?? "";
