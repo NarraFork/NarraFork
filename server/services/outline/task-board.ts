@@ -789,16 +789,14 @@ async function ownSections(
 	]);
 	// Session spaces whose tasks the person may hand out (「交给团队」, outline P2 PR 10c-3): one
 	// read for all of them, and the person's access once per project.
-	const handOut = await handOutSessionSpaces(
-		ctx.principal,
-		spaces.filter((space) => writable.has(space.id)),
-	);
+	const { handOut, inProject } = await handOutSessionSpaces(ctx.principal, spaces, writable);
 	const openBySpace = bySpace(open);
 	const finishedBySpace = bySpace(finished);
 	return spaces.map((space) => ({
 		space: described.get(space.id) as OutlineBoardSection["space"],
 		canWrite: writable.has(space.id),
 		...(handOut.has(space.id) ? { handOut: true as const } : {}),
+		...(inProject.has(space.id) ? { inProject: true as const } : {}),
 		role: "own" as const,
 		open: openBySpace.get(space.id) ?? [],
 		openTruncated: (openOf.get(space.id)?.length ?? 0) > limits.open,

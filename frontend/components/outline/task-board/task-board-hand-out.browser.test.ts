@@ -330,6 +330,7 @@ test("not offered without a project or to someone who does not own the session (
 		await mount(page, loner.narratorId, { scheme: "light", width: 720, language: "en" });
 		const menu = await openMenu(page, "Port the parser");
 		expect(menu?.items.map((i) => i.id)).not.toContain("task-action-team");
+		expect(menu?.items.map((i) => i.id)).not.toContain("task-action-transfer");
 		expect(errors).toEqual([]);
 	} finally {
 		await page.browserContext().close();
@@ -359,6 +360,7 @@ test("not offered without a project or to someone who does not own the session (
 		const ids = menu?.items.map((i) => i.id) ?? [];
 		expect(ids).toContain("task-action-done");
 		expect(ids).toContain("task-action-me");
+		expect(ids).toContain("task-action-transfer");
 		expect(ids).not.toContain("task-action-team");
 		await call(theirs.page, (f) => f.click("[data-testid=task-action-me]"));
 		await until(theirs.page, "handed to bob, in place", (f) =>

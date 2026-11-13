@@ -84,6 +84,7 @@ import {
 import { OUTLINE_HAND_OUT_ACTOR, OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
 import { assigneeLabel, OUTLINE_TASKS_PAGE_TITLE, oneAtATime } from "./person-tasks";
 import { loadBodiesWithin, readSubtree } from "./read";
+import { canSessionReadSpace } from "./session-scope";
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineSpaceRow, OutlineStore } from "./store/port";
 import { isFinishedTask, isOpenTask, isPlanningRoot } from "./task-json";
@@ -198,11 +199,12 @@ export class OutlineHandOutError extends AppError {
 export interface OutlineHandOutResult {
 	/** The copy (an existing one when `already`). */
 	copy: { id: string; sid: string; address: string; spaceId: string };
-	/**
-	 * The task depended on an open copy of itself already: no second copy. With `reassigned`, the
-	 * copy was given to the new target (its owner on the board); otherwise nothing was written.
-	 */
+	/** The task depended on an open copy of itself already: no second copy. */
 	already: boolean;
+	/**
+	 * An existing copy (one the task waited on, or one an earlier attempt made) was given to this
+	 * hand-out's target by the session's owner. Without it and with `already`, nothing was written.
+	 */
 	reassigned?: true;
 	/** Blocks under the original left out of the copy (past the limits). */
 	omitted: number;
@@ -315,7 +317,10 @@ export async function checkHandOutTarget(
 		throw new ValidationError("This session cannot work on this task");
 }
 
-/** A live root session keeping its tasks in the outline whose person may write `space`. */
+/**
+ * A live root session keeping its tasks in the outline whose person may write `space`, and which
+ * may read it.
+ */
 async function isOutlineSessionThatCanWorkIn(
 	narratorId: string,
 	space: OutlineSpaceRow,
@@ -325,7 +330,10 @@ async function isOutlineSessionThatCanWorkIn(
 	if (!session || session.archived) return false;
 	const { resolveTaskBackend } = await import("../task-source");
 	if ((await resolveTaskBackend(session.narratorId)) !== "outline") return false;
-	return await canSessionWorkIn(session.narratorId, space);
+	return (
+		(await canSessionWorkIn(session.narratorId, space)) &&
+		(await canSessionReadSpace(session.narratorId, space).catch(() => false))
+	);
 }
 
 /**
@@ -343,7 +351,14 @@ export async function canWorkInSessionSpace(
 		return await canWriteSpace({ userId: target.userId, isAdmin: false }, space);
 	if (space.narratorId === target.narratorId) return true;
 	const session = await resolveAgentAssignee(sessionAssignee(target.narratorId), options);
-	return !!session && !session.archived && (await canSessionWorkIn(session.narratorId, space));
+	// It must be able to read the space as well as write it (a session's read scope is narrower
+	// than its person's: everyone who reads the session must be able to read what it reads).
+	return (
+		!!session &&
+		!session.archived &&
+		(await canSessionWorkIn(session.narratorId, space)) &&
+		(await canSessionReadSpace(session.narratorId, space).catch(() => false))
+	);
 }
 
 /** The person `username` names, as a hand-out target; null when nobody has it. */
@@ -751,6 +766,14 @@ async function handOutOne(args: Parameters<typeof handOutTask>[0]): Promise<Outl
 	if (copy?.deleted) copy = null;
 	copy ??= await strayCopyOf(store, original, space, place.projectSpace);
 	let omitted = 0;
+	let reassigned = false;
+	if (copy && !copyIsFor(copy, args.target)) {
+		// A copy an earlier attempt made for another target: given to this one by the owner on the
+		// board (while nobody does it), refused otherwise, as for a copy the original waits on.
+		await reassignCopy({ store, existing: copy, original, space, place, args, locale, nowIso });
+		copy = await store.getBlock(copy.id);
+		reassigned = true;
+	}
 	if (!copy) {
 		const projectSpace = place.projectSpace.id.startsWith("pending:")
 			? await store.ensureSpace({ kind: "project", projectId: place.projectId }, nowIso)
@@ -791,6 +814,7 @@ async function handOutOne(args: Parameters<typeof handOutTask>[0]): Promise<Outl
 	const result = (versionSeq: number): OutlineHandOutResult => ({
 		copy: { id: made.id, sid: made.sid, address: copyAddress, spaceId: place.projectSpace.id },
 		already: false,
+		...(reassigned ? { reassigned: true as const } : {}),
 		omitted,
 		versionSeq,
 	});
@@ -1054,11 +1078,13 @@ export async function planAgentHandOuts(args: {
 	assigneeBefore: (blockId: string) => string | null | undefined;
 	/** Why this turn may not write the project's space (its scope's refusal), or null. */
 	checkWriter: (projectSpace: OutlineSpaceRow) => Promise<string | null>;
+	/** A strict plan-mode turn: a draft, whose assignees stay labels where they are. */
+	draft?: boolean;
 	store?: OutlineStore;
 }): Promise<{ handOuts: AgentHandOut[] } | { refused: string[] }> {
 	const { space, ops } = args;
 	const store = args.store ?? outlineStore;
-	if (space.kind !== "session" || !space.narratorId) return { handOuts: [] };
+	if (space.kind !== "session" || !space.narratorId || args.draft) return { handOuts: [] };
 	const sessionId = space.narratorId;
 	const writerRoot =
 		(await store.getNarratorRoots([args.by.narratorId])).get(args.by.narratorId)?.root ??
@@ -1099,18 +1125,17 @@ export async function planAgentHandOuts(args: {
 		}
 		// A name nobody has, or someone who can work in this space: assigned in place.
 		if (!target || (await canWorkInSessionSpace(target, space, { store }))) continue;
-		// In a plan being planned or a tree a person locked: refused before anything is written
-		// (a new task there would be held as a proposal and lose its assignee unseen).
+		// In a plan being planned: a draft, its assignee a label in place (handed out when someone
+		// gives the step to them again after approval). In a tree a person locked: refused before
+		// anything is written (a new task there would be held as a proposal and lose its assignee
+		// unseen).
 		const anchor = anchorOf(op);
 		if (anchor) {
 			const chain = await readSubtree(anchor, { store });
 			const nodes = chain ? [chain.root, ...chain.path] : [];
-			const refusal = nodes.some((node) => isPlanningRoot(node.task))
-				? "planning"
-				: nodes.some((node) => !!node.task?.lock)
-					? "locked"
-					: null;
-			if (refusal) return { refused: [handOutRefusalText(new OutlineHandOutError(refusal))] };
+			if (nodes.some((node) => isPlanningRoot(node.task))) continue;
+			if (nodes.some((node) => !!node.task?.lock))
+				return { refused: [handOutRefusalText(new OutlineHandOutError("locked"))] };
 		}
 		found.push({ opIndex, target });
 	}
@@ -1164,24 +1189,30 @@ export function handOutRefusalText(error: OutlineHandOutError): string {
 }
 
 /**
- * Of the given spaces, the session spaces whose tasks `principal` may hand out (the board's
- * 「交给团队」): the checks of {@link handOutPlace} for many at once. The sessions' owners and
- * projects in one read (`readSessionWriteFacts`), then the person's access once per project.
+ * Of the given session spaces, those whose session belongs to a project (`inProject`: its tasks
+ * may go to the project's sessions), and of those writable by `principal` (`writable`), the ones
+ * whose tasks `principal` may hand out (`handOut`, the board's 「交给团队」): the checks of
+ * {@link handOutPlace} for many at once. The sessions' owners and projects in one read
+ * (`readSessionWriteFacts`), then the person's access once per project.
  */
 export async function handOutSessionSpaces(
 	principal: OutlinePrincipal,
 	spaces: readonly OutlineSpaceRow[],
-): Promise<Set<string>> {
-	const out = new Set<string>();
+	writable: ReadonlySet<string>,
+): Promise<{ handOut: Set<string>; inProject: Set<string> }> {
+	const handOut = new Set<string>();
+	const inProject = new Set<string>();
 	const sessions = spaces.filter((space) => space.kind === "session" && space.narratorId);
-	if (sessions.length === 0) return out;
+	if (sessions.length === 0) return { handOut, inProject };
 	const facts = await readSessionWriteFacts(sessions.map((space) => space.narratorId as string));
 	const writes = new Map<string, Promise<boolean>>();
 	for (const space of sessions) {
 		const fact = facts.get(space.narratorId as string);
-		if (!fact || fact.type === "subagent" || fact.ownerUserId !== principal.userId) continue;
-		const projectId = fact.gateProjectId;
-		if (!projectId) continue;
+		const projectId = fact?.gateProjectId ?? null;
+		if (!fact || !projectId) continue;
+		inProject.add(space.id);
+		if (!writable.has(space.id) || fact.type === "subagent") continue;
+		if (fact.ownerUserId !== principal.userId) continue;
 		let verdict = writes.get(projectId);
 		if (!verdict) {
 			// Access to a project's space depends on its kind and project only.
@@ -1198,7 +1229,7 @@ export async function handOutSessionSpaces(
 			});
 			writes.set(projectId, verdict);
 		}
-		if (await verdict) out.add(space.id);
+		if (await verdict) handOut.add(space.id);
 	}
-	return out;
+	return { handOut, inProject };
 }

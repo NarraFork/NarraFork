@@ -140,6 +140,11 @@ export interface OutlineBoardSection {
 	 */
 	handOut?: true;
 	/**
+	 * A session space whose session belongs to a project: its tasks may be handed to the project's
+	 * sessions (「转交给会话…」). Absent otherwise (and for any other space).
+	 */
+	inProject?: true;
+	/**
 	 * `own`: the space's tasks. `claimed`: only the tasks the board's session holds in a space
 	 * that is not its own (a session board).
 	 */

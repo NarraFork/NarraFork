@@ -1434,6 +1434,8 @@ export async function outlineEdit(
 					if (refusal) return refusalText(refusal, "project/");
 					return (await scope.canRead(projectSpace)) ? null : refusalText("missing", "project/");
 				},
+				// A plan-mode turn is a draft: its assignees stay labels in place.
+				draft: scope.ctx.planMode === true,
 				store: scope.store,
 			});
 			if ("refused" in handOutPlan) return { output: failed(handOutPlan.refused) };

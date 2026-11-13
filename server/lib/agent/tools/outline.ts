@@ -51,12 +51,12 @@ async function disabledText(): Promise<string> {
 }
 
 /**
- * Whether this session may write only its own outline space: read-only mode, strict plan mode
- * (relaxed planning keeps the session's mode), or a read-only capability ceiling. Read live, as
- * the notification service does, so a mode switched mid-turn applies at once.
+ * Why this session may write only its own outline space, or null: read-only mode (or a read-only
+ * capability ceiling), or strict plan mode (relaxed planning keeps the session's mode). Read
+ * live, as the notification service does, so a mode switched mid-turn applies at once.
  */
-async function writesLimitedToSessionSpace(ctx: ToolContext): Promise<boolean> {
-	if (ctx.runtimePolicy?.tools.readOnly || ctx.runtimePolicy?.readOnlyGitShell) return true;
+async function sessionSpaceOnlyReason(ctx: ToolContext): Promise<"readOnly" | "plan" | null> {
+	if (ctx.runtimePolicy?.tools.readOnly || ctx.runtimePolicy?.readOnlyGitShell) return "readOnly";
 	const [{ db }, { narrators }, { eq }, { isPlanModeTrait }, { resolveEffectiveRelaxedPlan }] =
 		await Promise.all([
 			import("@server/db"),
@@ -74,12 +74,11 @@ async function writesLimitedToSessionSpace(ctx: ToolContext): Promise<boolean> {
 		.from(narrators)
 		.where(eq(narrators.id, ctx.narratorId))
 		.limit(1);
-	if (!row) return true;
-	return (
-		row.permissionMode === "readOnly" ||
-		(isPlanModeTrait(row.traits) &&
-			!resolveEffectiveRelaxedPlan(row.permissionMode, row.relaxedPlan))
-	);
+	if (!row || row.permissionMode === "readOnly") return "readOnly";
+	return isPlanModeTrait(row.traits) &&
+		!resolveEffectiveRelaxedPlan(row.permissionMode, row.relaxedPlan)
+		? "plan"
+		: null;
 }
 
 /**
@@ -117,10 +116,12 @@ async function callProvenance(
 
 async function openScope(ctx: ToolContext, forWrite: boolean): Promise<Scope> {
 	const { OutlineAgentScope } = await import("../../../services/outline/agent-scope");
+	const limit = forWrite ? await sessionSpaceOnlyReason(ctx) : null;
 	return await OutlineAgentScope.open({
 		narratorId: ctx.narratorId,
 		userId: ctx.userId ?? null,
-		sessionSpaceOnly: forWrite ? await writesLimitedToSessionSpace(ctx) : false,
+		sessionSpaceOnly: limit !== null,
+		planMode: limit === "plan",
 	});
 }
 

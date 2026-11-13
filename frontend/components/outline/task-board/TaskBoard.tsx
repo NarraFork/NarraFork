@@ -1007,14 +1007,17 @@ function TaskRow({
 												</Menu.Item>
 											)}
 											{/* In place to a session that can work in the space; to others as a copy,
-											    which the server lists only for the owner. */}
-											<Menu.Item
-												leftSection={<IconArrowsExchange size={14} />}
-												onClick={() => setAssigning("session")}
-												data-testid="task-action-transfer"
-											>
-												{t("board.action.transferSession")}
-											</Menu.Item>
+											    which the server lists only for the owner. A session of no project has
+											    no sessions to give it to. */}
+											{(!sessionSpace || section?.inProject) && (
+												<Menu.Item
+													leftSection={<IconArrowsExchange size={14} />}
+													onClick={() => setAssigning("session")}
+													data-testid="task-action-transfer"
+												>
+													{t("board.action.transferSession")}
+												</Menu.Item>
+											)}
 											{task.assignee && (
 												<Menu.Item
 													leftSection={<IconArrowBackUp size={14} />}
