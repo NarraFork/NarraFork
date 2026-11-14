@@ -3,6 +3,7 @@ import type { PersistedRecentTab, RecentTabsMutationResult } from "@shared/recen
 import { Hono } from "hono";
 import { userPreferences, userRecentTabs, users } from "../../../server/db/schema";
 import type { SessionPayload } from "../../../server/lib/auth";
+import { eventBus } from "../../../server/lib/event-bus";
 import { updateUserPreferencesSchema } from "../../../server/lib/validators/settings";
 import { cleanDb, getTestDb } from "../../setup";
 
@@ -106,6 +107,159 @@ afterAll(() => {
 	mock.module("../../../server/lib/settings", () => realSettingsModule);
 	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+});
+
+describe("account appearance preferences", () => {
+	async function patch(appearancePreferences: unknown, rest: Record<string, unknown> = {}) {
+		return requestJson("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ appearancePreferences, ...rest }),
+		});
+	}
+
+	it("returns an object before any row and after an unrelated first save", async () => {
+		seedUser();
+		expect((await requestJson("/")).body).toMatchObject({ appearancePreferences: {} });
+		expect((await patch(undefined, { wordWrapCode: false })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({ appearancePreferences: {} });
+	});
+
+	it("preserves false, zero and empty strings on first insert and subsequent reads", async () => {
+		seedUser();
+		const values = { narrafork_oled: false, narrafork_blur_in_ms: 0, pluginTheme: "" };
+		const saved = await patch(values);
+		expect(saved.status).toBe(200);
+		expect(saved.body).toMatchObject({ appearancePreferences: values });
+		expect((await requestJson("/")).body).toMatchObject({ appearancePreferences: values });
+		const stored = sqlite
+			.query<{ appearance_preferences: string }, []>(
+				"SELECT appearance_preferences FROM user_preferences",
+			)
+			.get();
+		expect(stored?.appearance_preferences).toBe(JSON.stringify(values));
+	});
+
+	it("merges only changed keys and keeps them across empty and unrelated PATCH requests", async () => {
+		seedPreferences([], {
+			appearancePreferences: JSON.stringify({ colorScheme: "dark", narrafork_oled: true }),
+		});
+		expect((await patch({ colorScheme: "light" })).status).toBe(200);
+		expect((await patch({})).status).toBe(200);
+		expect((await patch(undefined, { wordWrapCode: false })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({
+			appearancePreferences: { colorScheme: "light", narrafork_oled: true },
+			wordWrapCode: false,
+		});
+	});
+
+	it("serializes concurrent first writes instead of losing different keys", async () => {
+		seedUser();
+		const responses = await Promise.all([
+			patch({ colorScheme: "dark" }),
+			patch({ narrafork_oled: true }),
+			patch({ narrafork_blur_in_ms: 0 }),
+		]);
+		expect(responses.map(({ status }) => status)).toEqual([200, 200, 200]);
+		expect((await requestJson("/")).body).toMatchObject({
+			appearancePreferences: { colorScheme: "dark", narrafork_oled: true, narrafork_blur_in_ms: 0 },
+		});
+	});
+
+	it("does not read or overwrite another account's values", async () => {
+		seedUser();
+		expect((await patch({ colorScheme: "dark" })).status).toBe(200);
+		db.insert(users)
+			.values({
+				id: "other-user",
+				username: "other-user",
+				passwordHash: "x",
+				role: "user",
+				createdAt: NOW,
+			})
+			.run();
+		authUser.sub = "other-user";
+		expect((await requestJson("/")).body).toMatchObject({ appearancePreferences: {} });
+		expect((await patch({ colorScheme: "light" })).status).toBe(200);
+		authUser.sub = "user-1";
+		expect((await requestJson("/")).body).toMatchObject({
+			appearancePreferences: { colorScheme: "dark" },
+		});
+	});
+
+	it("rejects unknown keys, local runtime gates, existing account columns, rules and bad values", () => {
+		for (const value of [
+			null,
+			[],
+			"{}",
+			{ unknown: true },
+			{ deviceId: "browser" },
+			{ narrafork_fullscreen: true },
+			{ narrafork_wakelock: true },
+			{ narrafork_mock_stream: true },
+			{ narrafork_unified_morph: false },
+			{ language: "en" },
+			{ terminalFontSize: 14 },
+			{ colorScheme: "sepia" },
+			{ narrafork_oled: "false" },
+			{ narrafork_oled: { mode: "sync" } },
+			{ narrafork_blur_in_ms: -1 },
+			{ narrafork_blur_in_ms: 2001 },
+			{ narrafork_blur_in_ms: 1.5 },
+			{ narrafork_blur_in_ms: Number.NaN },
+			{ narrafork_stream_token_ms: 5001 },
+			{ narrafork_stream_token_ms: Number.POSITIVE_INFINITY },
+			{ pluginTheme: "x".repeat(257) },
+			JSON.parse('{"__proto__":true}'),
+		]) {
+			expect(updateUserPreferencesSchema.safeParse({ appearancePreferences: value }).success).toBe(
+				false,
+			);
+		}
+		for (const value of [
+			{},
+			{ narrafork_stream_token_ms: 5000 },
+			{ pluginTheme: "x".repeat(256) },
+		]) {
+			expect(updateUserPreferencesSchema.safeParse({ appearancePreferences: value }).success).toBe(
+				true,
+			);
+		}
+	});
+
+	it("never exposes malformed or unvalidated persisted JSON", async () => {
+		seedPreferences([], { appearancePreferences: '{"deviceId":"secret"}' });
+		expect((await requestJson("/")).body).toMatchObject({ appearancePreferences: {} });
+		expect((await patch({ colorScheme: "dark" })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({
+			appearancePreferences: { colorScheme: "dark" },
+		});
+	});
+
+	it("emits a data-free account invalidation only after the preference write is visible", async () => {
+		seedUser();
+		const events: unknown[] = [];
+		const handler = (event: { type: "user_preferences:changed"; userId: string }) => {
+			events.push({
+				event,
+				stored: sqlite
+					.query("SELECT appearance_preferences FROM user_preferences WHERE user_id = ?")
+					.get(event.userId),
+			});
+		};
+		eventBus.on("user_preferences:changed", handler);
+		try {
+			expect((await patch({ narrafork_oled: true })).status).toBe(200);
+			expect(events).toEqual([
+				{
+					event: { type: "user_preferences:changed", userId: "user-1" },
+					stored: { appearance_preferences: '{"narrafork_oled":true}' },
+				},
+			]);
+		} finally {
+			eventBus.off("user_preferences:changed", handler);
+		}
+	});
 });
 
 describe("auxiliary content display preference", () => {

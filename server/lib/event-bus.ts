@@ -12,6 +12,8 @@ import { logger } from "./logger";
 
 export type NarraForkEvent =
 	| { type: "auth:changed"; userId?: string }
+	/** Account-scoped invalidation only; no preference values or device metadata. */
+	| { type: "user_preferences:changed"; userId: string }
 	| { type: "auth:session_extended"; sessionId: string; userId: string; expiresAt: number }
 	// Invalidation only: lifecycle details are fetched through the authorized status API.
 	| { type: "system:lifecycle_changed" }

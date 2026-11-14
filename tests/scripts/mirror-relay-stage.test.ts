@@ -148,11 +148,11 @@ describe("WebDAV relay producer", () => {
 		expect(result.verification).toBe("pending-server-pull");
 		expect(result.snapshotCommitted).toBe(false);
 		expect(result.verified).toEqual([]);
-		expect(result.uploaded).toHaveLength(4);
+		expect(result.uploaded).toHaveLength(5);
 		expect(result.relay?.retention).toBe("COMPLETE");
 		expect(result.relay?.expiresAt).toBe("2026-10-22T12:00:00.000Z");
 		expect(github.httpCalls).toHaveLength(0);
-		expect(github.downloaded).toHaveLength(1);
+		expect(github.downloaded).toHaveLength(2);
 		expect(f.dav.requests.some((r) => r.method === "GET")).toBe(false);
 		const puts = f.dav.requests.filter((r) => r.method === "PUT");
 		expect(puts.at(-1)?.path).toContain("/ready/");
