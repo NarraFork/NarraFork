@@ -6,8 +6,16 @@
 export const DB_SNAPSHOT_WORKER_FLAG = "--narrafork-db-snapshot";
 export const DB_SNAPSHOT_SOURCE_ENV = "NARRAFORK_SNAPSHOT_SOURCE";
 export const DB_SNAPSHOT_OUTPUT_ENV = "NARRAFORK_SNAPSHOT_OUTPUT";
-/** `requests,sessions` 的子集；缺省表示两类都要。 */
+/** `requests,sessions` 的子集；缺省表示两类都要。单独的 `outline` 是另一种快照，见下。 */
 export const DB_SNAPSHOT_KINDS_ENV = "NARRAFORK_SNAPSHOT_KINDS";
+/**
+ * 大纲整表拷贝（`services/outline/history-backup.ts`）：把源库里所有 `outline_*` 普通表原样复制
+ * 到一个新库，逐表核对行数。不与 requests / sessions 混用，也不走导入流程；全文索引的虚表及其
+ * 影子表是派生数据，不复制。
+ */
+export const DB_SNAPSHOT_OUTLINE_KIND = "outline";
+/** 大纲整表拷贝里戳记表（`backup_stamp`）的格式号；读的人只认自己懂的格式。 */
+export const OUTLINE_BACKUP_FORMAT = 1;
 
 /**
  * 导入会读的表（外加 settings 里的 providers）。快照只带它们。
@@ -36,4 +44,7 @@ export const SNAPSHOT_TABLES = {
 export interface SnapshotBuildResult {
 	ok: boolean;
 	error?: string;
+	/** 大纲整表拷贝：复制了几张表、共多少行（已逐表核对）。 */
+	tables?: number;
+	rows?: number;
 }

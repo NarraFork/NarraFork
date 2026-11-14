@@ -12,8 +12,10 @@
 import { Database } from "bun:sqlite";
 import {
 	DB_SNAPSHOT_KINDS_ENV,
+	DB_SNAPSHOT_OUTLINE_KIND,
 	DB_SNAPSHOT_OUTPUT_ENV,
 	DB_SNAPSHOT_SOURCE_ENV,
+	OUTLINE_BACKUP_FORMAT,
 	SNAPSHOT_TABLES,
 	type SnapshotBuildResult,
 } from "./snapshot-protocol";
@@ -36,10 +38,134 @@ function selectedTables(): { all: string[]; copied: string[] } {
 	};
 }
 
+/** 一个事务里写入的行数：够大以摊薄提交开销，够小以免占住内存。 */
+const OUTLINE_COPY_BATCH = 5000;
+
+/**
+ * 大纲整表拷贝：`outline_*` 的每张普通表（虚表和它的影子表除外）原样进新库。
+ *
+ * 源库用**只读连接**打开，这个进程因此没有任何办法写主库；表清单和所有表都在同一个读事务里
+ * 读，所以是同一时刻的。最后写两张「戳记」表（`backup_stamp`、`backup_spaces`），没有戳记的文件
+ * 不算拷完。行经由本进程逐批写进新库（不是 `ATTACH` 后 `INSERT … SELECT`：那需要一个可写的
+ * 连接挂着主库）。复制后逐表核对行数，对不上就算失败。不建索引和约束：这份文件是给人留底的。
+ */
+function buildOutlineCopy(source: string, output: string): SnapshotBuildResult {
+	let src: Database | undefined;
+	let out: Database | undefined;
+	try {
+		src = new Database(source, { readonly: true });
+		out = new Database(output);
+		const from = src;
+		const to = out;
+		let rows = 0;
+		let tables: string[] = [];
+		// One read transaction for everything, the list of tables included, so the copy is of
+		// one moment. While it is open the main process cannot recycle its WAL file (it keeps
+		// growing, by what is written meanwhile, until this process is done); nothing is lost and
+		// writers are not blocked.
+		from.run("BEGIN");
+		try {
+			const named = from
+				.query(
+					"SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name LIKE 'outline!_%' ESCAPE '!' ORDER BY name",
+				)
+				.all() as Array<{ name: string; sql: string | null }>;
+			const virtual = named
+				.filter((table) => /^\s*CREATE\s+VIRTUAL\s+TABLE/i.test(table.sql ?? ""))
+				.map((table) => table.name);
+			tables = named
+				.map((table) => table.name)
+				.filter((name) => /^[a-z0-9_]+$/.test(name))
+				.filter((name) => !virtual.some((v) => name === v || name.startsWith(`${v}_`)));
+			if (tables.length === 0) return { ok: false, error: "no outline tables in the source" };
+			for (const table of tables) {
+				const columns = from.query(`PRAGMA table_info(${table})`).all() as Array<{
+					name: string;
+					type: string;
+				}>;
+				const quoted = columns.map((column) => `"${column.name.replaceAll('"', '""')}"`);
+				to.run(
+					`CREATE TABLE ${table} (${columns
+						.map(
+							(column, i) => `${quoted[i]} ${/^[A-Za-z ]*$/.test(column.type) ? column.type : ""}`,
+						)
+						.join(", ")})`,
+				);
+				const insert = to.prepare(
+					`INSERT INTO ${table} VALUES (${columns.map(() => "?").join(", ")})`,
+				);
+				const writeBatch = to.transaction((batch: unknown[][]) => {
+					for (const row of batch) insert.run(...(row as never[]));
+				});
+				let batch: unknown[][] = [];
+				let copied = 0;
+				for (const row of from.query(`SELECT ${quoted.join(", ")} FROM ${table}`).iterate()) {
+					batch.push(Object.values(row as Record<string, unknown>));
+					if (batch.length >= OUTLINE_COPY_BATCH) {
+						writeBatch(batch);
+						copied += batch.length;
+						batch = [];
+					}
+				}
+				writeBatch(batch);
+				copied += batch.length;
+				const had = from.query(`SELECT count(*) AS n FROM ${table}`).get() as { n: number };
+				const landed = to.query(`SELECT count(*) AS n FROM ${table}`).get() as { n: number };
+				if (landed.n !== had.n || copied !== had.n)
+					throw new Error(`row count of ${table} differs: ${landed.n} copied of ${had.n}`);
+				rows += landed.n;
+			}
+		} finally {
+			from.run("COMMIT");
+		}
+		// The stamp, written last: a file without it is not a finished copy. It says what was
+		// copied from where, and for each space the seq it stood at and its blocks, so a later
+		// reader can tell whether the copy is of the database it has and how current it is.
+		to.transaction(() => {
+			to.run(
+				"CREATE TABLE backup_spaces (space_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL, blocks INTEGER NOT NULL)",
+			);
+			if (tables.includes("outline_spaces")) {
+				to.run(
+					tables.includes("outline_blocks")
+						? `INSERT INTO backup_spaces
+								SELECT s.id, s.next_seq, COALESCE(c.n, 0) FROM outline_spaces s
+								LEFT JOIN (SELECT space_id, count(*) AS n FROM outline_blocks
+									GROUP BY space_id) c ON c.space_id = s.id`
+						: "INSERT INTO backup_spaces SELECT id, next_seq, 0 FROM outline_spaces",
+				);
+			}
+			to.run(
+				"CREATE TABLE backup_stamp (format INTEGER NOT NULL, source_path TEXT NOT NULL, created_at TEXT NOT NULL, tables INTEGER NOT NULL, rows INTEGER NOT NULL, spaces INTEGER NOT NULL)",
+			);
+			to.run(
+				"INSERT INTO backup_stamp SELECT ?, ?, ?, ?, ?, (SELECT count(*) FROM backup_spaces)",
+				[OUTLINE_BACKUP_FORMAT, source, new Date().toISOString(), tables.length, rows],
+			);
+		})();
+		return { ok: true, tables: tables.length, rows };
+	} catch (error) {
+		return { ok: false, error: String(error).slice(0, 500) };
+	} finally {
+		try {
+			out?.close();
+		} catch {
+			// 关闭失败不影响结果判定
+		}
+		try {
+			src?.close();
+		} catch {
+			// 同上
+		}
+	}
+}
+
 function build(): SnapshotBuildResult {
 	const source = process.env[DB_SNAPSHOT_SOURCE_ENV]?.trim();
 	const output = process.env[DB_SNAPSHOT_OUTPUT_ENV]?.trim();
 	if (!source || !output) return { ok: false, error: "missing snapshot paths" };
+	if (process.env[DB_SNAPSHOT_KINDS_ENV]?.trim() === DB_SNAPSHOT_OUTLINE_KIND)
+		return buildOutlineCopy(source, output);
 
 	const { all, copied } = selectedTables();
 	if (copied.length === 0) return { ok: false, error: "nothing selected" };

@@ -1,6 +1,6 @@
 {
-  "id": "0037af1a-0d86-4ddd-9499-9a605cce1179",
-  "prevId": "11493ae9-9036-4353-b911-18624a649666",
+  "id": "407a309f-7e0a-4573-842a-f58767b8af6d",
+  "prevId": "5c6280b8-c028-4e92-b199-ec6aec85bda1",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -17545,6 +17545,168 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.outline_block_edges": {
+      "name": "outline_block_edges",
+      "schema": "",
+      "columns": {
+        "parent_key": {
+          "name": "parent_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "block_id": {
+          "name": "block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "from_seq": {
+          "name": "from_seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "to_seq": {
+          "name": "to_seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "order_key": {
+          "name": "order_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_outline_edges_block": {
+          "name": "idx_outline_edges_block",
+          "columns": [
+            {
+              "expression": "block_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "from_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_edges_open": {
+          "name": "idx_outline_edges_open",
+          "columns": [
+            {
+              "expression": "parent_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "order_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "block_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "from_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"to_seq\" IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_edges_closed": {
+          "name": "idx_outline_edges_closed",
+          "columns": [
+            {
+              "expression": "parent_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "to_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "from_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "order_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "block_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"to_seq\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "outline_block_edges_block_id_outline_blocks_id_fk": {
+          "name": "outline_block_edges_block_id_outline_blocks_id_fk",
+          "tableFrom": "outline_block_edges",
+          "tableTo": "outline_blocks",
+          "columnsFrom": [
+            "block_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "outline_block_edges_parent_key_block_id_from_seq_pk": {
+          "name": "outline_block_edges_parent_key_block_id_from_seq_pk",
+          "columns": [
+            "parent_key",
+            "block_id",
+            "from_seq"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.outline_block_versions": {
       "name": "outline_block_versions",
       "schema": "",
@@ -19084,6 +19246,20 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "history_floor_seq": {
+          "name": "history_floor_seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "edges_ready": {
+          "name": "edges_ready",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         }
       },
       "indexes": {
@@ -19098,6 +19274,22 @@
             }
           ],
           "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_spaces_edges_pending": {
+          "name": "idx_outline_spaces_edges_pending",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"edges_ready\" = FALSE",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -19779,6 +19971,53 @@
         }
       },
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.outline_subtree_changes": {
+      "name": "outline_subtree_changes",
+      "schema": "",
+      "columns": {
+        "ancestor_id": {
+          "name": "ancestor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "seq": {
+          "name": "seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "outline_subtree_changes_ancestor_id_outline_blocks_id_fk": {
+          "name": "outline_subtree_changes_ancestor_id_outline_blocks_id_fk",
+          "tableFrom": "outline_subtree_changes",
+          "tableTo": "outline_blocks",
+          "columnsFrom": [
+            "ancestor_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "outline_subtree_changes_ancestor_id_seq_pk": {
+          "name": "outline_subtree_changes_ancestor_id_seq_pk",
+          "columns": [
+            "ancestor_id",
+            "seq"
+          ]
+        }
+      },
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},

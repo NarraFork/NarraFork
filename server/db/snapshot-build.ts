@@ -5,6 +5,7 @@ import { WorkerHandle } from "../lib/worker-runtime/lifecycle";
 import { TaskQueue } from "../lib/worker-runtime/queue";
 import {
 	DB_SNAPSHOT_KINDS_ENV,
+	DB_SNAPSHOT_OUTLINE_KIND,
 	DB_SNAPSHOT_OUTPUT_ENV,
 	DB_SNAPSHOT_SOURCE_ENV,
 	DB_SNAPSHOT_WORKER_FLAG,
@@ -64,18 +65,27 @@ export function closeSnapshotBuilds(): Promise<void> {
 	return owner.closing;
 }
 
-/** Never copies/compacts on the HTTP thread, including when creation or shutdown fails. */
+/**
+ * Never copies/compacts on the HTTP thread, including when creation or shutdown fails.
+ * `outline` asks for the other kind of snapshot instead (every `outline_*` table, whole, row
+ * counts checked) and resolves with what was copied.
+ */
 export async function buildSnapshotInSubprocess(input: {
 	sourcePath: string;
 	outputPath: string;
 	requests: boolean;
 	sessions: boolean;
+	outline?: boolean;
 	timeoutMs?: number;
 	signal?: AbortSignal;
-}): Promise<void> {
-	const kinds = [input.requests ? "requests" : "", input.sessions ? "sessions" : ""]
-		.filter(Boolean)
-		.join(",");
+}): Promise<SnapshotBuildResult> {
+	if (input.outline && (input.requests || input.sessions))
+		throw new Error("an outline copy is not combined with an export snapshot");
+	const kinds = input.outline
+		? DB_SNAPSHOT_OUTLINE_KIND
+		: [input.requests ? "requests" : "", input.sessions ? "sessions" : ""]
+				.filter(Boolean)
+				.join(",");
 	if (!kinds) throw new Error("snapshot requested with nothing selected");
 	const bytes = Buffer.byteLength(input.sourcePath) + Buffer.byteLength(input.outputPath);
 	if (bytes > MAX_INPUT_BYTES) throw new Error("snapshot input limit exceeded");
@@ -121,6 +131,7 @@ export async function buildSnapshotInSubprocess(input: {
 			throw new Error(
 				`snapshot builder failed (exit ${exitCode}): ${report?.error ?? "no report"}`,
 			);
+		return report;
 	} finally {
 		clearTimeout(timer);
 		permit.signal.removeEventListener("abort", stop);

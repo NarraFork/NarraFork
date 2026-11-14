@@ -21,6 +21,7 @@ import { OutlineConflictError, OutlineWriteError, type OutlineWriteErrorCode } f
 import { contentLinks, dependsLinks, linkKey, tagLinks } from "../links";
 import { OUTLINE_CHANGE, OUTLINE_LIMITS, type OutlineTaskJson } from "../model";
 import { revertCommit } from "../revert";
+import type { OutlineEdgeRow, OutlineHistoryState } from "../store/history-port";
 import {
 	type OutlineBlockRow,
 	type OutlineCommitPlan,
@@ -49,6 +50,12 @@ export interface SpaceDump {
 	commits: OutlineCommitRow[];
 	/** Claim rows of the space's blocks. */
 	claims: OutlineTaskClaimRow[];
+	/** Placement rows of the space's blocks (`outline_block_edges`). */
+	edges: OutlineEdgeRow[];
+	/** Change marks on the space's blocks (`outline_subtree_changes`). */
+	marks: Array<{ ancestorId: string; seq: number }>;
+	/** The space's history floor and whether its placements are built. */
+	history: OutlineHistoryState;
 }
 
 export interface OutlineContractContext {
@@ -78,6 +85,11 @@ export interface OutlineContractContext {
 	resetInProcess(spaceId: string): Promise<void>;
 	/** Delete the claim rows of tasks (a task in progress written before claims existed). */
 	forgetClaims(taskBlockIds: readonly string[]): Promise<void>;
+	/**
+	 * Make a space look written before placements existed: no placement and no change mark of
+	 * its blocks, not marked ready, floor 0 (what the migration leaves behind).
+	 */
+	forgetHistory(spaceId: string): Promise<void>;
 }
 
 export interface ContractCase {
@@ -232,6 +244,8 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 
 	checkInProcess(dump);
 	checkClaims(dump);
+	checkPlacements(dump);
+	checkChangeMarks(dump);
 
 	// Open links: exactly what the current state produces (tags are only in the links table,
 	// so they are taken from the open tag rows themselves).
@@ -251,6 +265,127 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 	for (const link of links) {
 		if (link.toSeq !== null) expect(link.toSeq).toBeGreaterThan(link.fromSeq);
 	}
+}
+
+const edgeKey = (e: OutlineEdgeRow) =>
+	`${e.blockId}\u0000${e.fromSeq}\u0000${e.toSeq}\u0000${e.parentKey}\u0000${e.orderKey}`;
+
+/** How much of the placements {@link checkPlacements} could compare with the version rows. */
+export type PlacementsChecked =
+	/** The whole table equals the replay of the versions (a space whose whole history is kept). */
+	| "all"
+	/** From the space's floor on (a converted space: nothing is known of placements before it). */
+	| "from-floor"
+	/** Nothing against the versions: the space's placements are not built yet. */
+	| "not-ready";
+
+/**
+ * Placements (`outline_block_edges`) agree with the blocks and their versions. Always: a
+ * block's placements never overlap, at most one is open, an open one is its block's row (its
+ * parent, the space for a top-level block, and its order key), and a deleted block has none
+ * open. Once the space is ready: every live block has its open placement, and the table, from
+ * the space's floor on, is exactly what replaying the version rows gives (the whole table when
+ * the floor is 0). Returns which of these the space's state allowed.
+ */
+export function checkPlacements(dump: SpaceDump): PlacementsChecked {
+	const ready = dump.history.edgesReady;
+	const byBlock = new Map<string, OutlineEdgeRow[]>();
+	for (const edge of dump.edges) {
+		const list = byBlock.get(edge.blockId);
+		if (list) list.push(edge);
+		else byBlock.set(edge.blockId, [edge]);
+	}
+	for (const block of dump.blocks) {
+		const list = (byBlock.get(block.id) ?? []).sort((a, b) => a.fromSeq - b.fromSeq);
+		list.forEach((edge, i) => {
+			const next = list[i + 1];
+			if (edge.toSeq !== null) expect(edge.toSeq).toBeGreaterThan(edge.fromSeq);
+			if (next) {
+				expect(edge.toSeq).not.toBeNull();
+				expect(next.fromSeq).toBeGreaterThanOrEqual(edge.toSeq as number);
+			}
+		});
+		const open = list.filter((edge) => edge.toSeq === null).map((e) => [e.parentKey, e.orderKey]);
+		const own = [[block.parentId ?? dump.space.id, block.orderKey]];
+		// Not ready: a live block may still be waiting for its placement, but one it has is right.
+		const want = block.deleted ? [] : ready || open.length > 0 ? own : [];
+		expect({ block: block.id, open }).toEqual({ block: block.id, open: want });
+	}
+	// Every placement is of a block of the space.
+	const ids = new Set(dump.blocks.map((b) => b.id));
+	for (const edge of dump.edges) expect(ids.has(edge.blockId)).toBe(true);
+	if (!ready) return "not-ready";
+
+	// The replay of the version rows, then both sides cut at the floor: what was placed where
+	// from the floor on. (Before it a converted space has one placement per block, from seq 0.)
+	const floor = dump.history.floorSeq;
+	const replayed: OutlineEdgeRow[] = [];
+	const versionsOf = new Map<string, OutlineVersionRow[]>();
+	for (const v of dump.versions) {
+		const list = versionsOf.get(v.blockId);
+		if (list) list.push(v);
+		else versionsOf.set(v.blockId, [v]);
+	}
+	for (const list of versionsOf.values()) {
+		list.sort((a, b) => a.fromSeq - b.fromSeq);
+		let current: OutlineEdgeRow | null = null;
+		for (const v of list) {
+			const parentKey = v.parentId ?? dump.space.id;
+			const same =
+				current !== null &&
+				!v.deleted &&
+				current.parentKey === parentKey &&
+				current.orderKey === v.orderKey;
+			if (same) continue;
+			if (current) current.toSeq = v.fromSeq;
+			current = v.deleted
+				? null
+				: { parentKey, blockId: v.blockId, fromSeq: v.fromSeq, toSeq: null, orderKey: v.orderKey };
+			if (current) replayed.push(current);
+		}
+	}
+	const fromFloor = (edges: readonly OutlineEdgeRow[]) =>
+		edges
+			.filter((edge) => edge.toSeq === null || edge.toSeq > floor)
+			.map((edge) => edgeKey({ ...edge, fromSeq: Math.max(edge.fromSeq, floor) }))
+			.sort();
+	expect(fromFloor(dump.edges)).toEqual(fromFloor(replayed));
+	return floor > 0 ? "from-floor" : "all";
+}
+
+/**
+ * Change marks (`outline_subtree_changes`) are exactly the ancestors, before and after, of the
+ * blocks each commit gave a version: walked up the version rows' parents as of the seq before
+ * and as of the seq itself (deleted blocks on the way included, as the store walks them). Only
+ * commits after the history floor are checked: a space converted from older content has no
+ * marks for what came before.
+ */
+export function checkChangeMarks(dump: SpaceDump): void {
+	const versionsOf = new Map<string, OutlineVersionRow[]>();
+	for (const v of dump.versions) {
+		const list = versionsOf.get(v.blockId);
+		if (list) list.push(v);
+		else versionsOf.set(v.blockId, [v]);
+	}
+	const parentAt = (blockId: string, seq: number): string | null =>
+		versionAt(versionsOf.get(blockId) ?? [], seq)?.parentId ?? null;
+	const want = new Set<string>();
+	for (const v of dump.versions) {
+		const seq = v.fromSeq;
+		if (seq <= dump.history.floorSeq) continue;
+		for (const at of [seq - 1, seq]) {
+			let current = parentAt(v.blockId, at);
+			for (let depth = 0; current !== null; depth++) {
+				expect(depth).toBeLessThan(10_000);
+				want.add(`${current}\u0000${seq}`);
+				current = parentAt(current, at);
+			}
+		}
+	}
+	const have = dump.marks
+		.filter((m) => m.seq > dump.history.floorSeq)
+		.map((m) => `${m.ancestorId}\u0000${m.seq}`);
+	expect(have.sort()).toEqual([...want].sort());
 }
 
 /**

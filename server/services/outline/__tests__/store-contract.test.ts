@@ -6,25 +6,29 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own spaces.
  */
 import { describe, expect, test } from "bun:test";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
 import {
 	narrators,
+	outlineBlockEdges,
 	outlineBlocks,
 	outlineBlockVersions,
 	outlineCommits,
 	outlineLinks,
 	outlineSpaces,
+	outlineSubtreeChanges,
 	outlineTaskClaims,
 	projects,
 	users,
 } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
+import type { OutlineEdgeRow } from "../store/history-port";
 import { chunked, type OutlineVersionRow } from "../store/port";
 import { MAIN_THREAD_PAGE_ROWS } from "../store/sqlite-read";
 import { sqliteOutlineStore } from "../store/sqlite-store";
 import { OUTLINE_STORE_CONTRACT } from "./contract";
 import { OUTLINE_DIGEST_CONTRACT, type OutlineDigestContractContext } from "./digest-contract";
+import { OUTLINE_HISTORY_CONTRACT } from "./history-contract";
 import { OUTLINE_PENDING_CONTRACT } from "./pending-contract";
 import { OUTLINE_QUESTION_CONTRACT } from "./question-contract";
 import { OUTLINE_READ_CONTRACT } from "./read-contract";
@@ -80,17 +84,36 @@ const ctx: OutlineDigestContractContext = {
 			await db.select().from(outlineBlocks).where(eq(outlineBlocks.spaceId, spaceId))
 		).map((b) => ({ ...b, taskJson: b.taskJson ?? null }));
 		const versions: OutlineVersionRow[] = [];
+		const edges: OutlineEdgeRow[] = [];
+		const marks: Array<{ ancestorId: string; seq: number }> = [];
 		for (const ids of chunked(blocks.map((b) => b.id))) {
 			const rows = await db
 				.select()
 				.from(outlineBlockVersions)
 				.where(inArray(outlineBlockVersions.blockId, ids));
 			for (const v of rows) versions.push({ ...v, taskJson: v.taskJson ?? null });
+			edges.push(
+				...(await db
+					.select()
+					.from(outlineBlockEdges)
+					.where(inArray(outlineBlockEdges.blockId, ids))),
+			);
+			marks.push(
+				...(await db
+					.select()
+					.from(outlineSubtreeChanges)
+					.where(inArray(outlineSubtreeChanges.ancestorId, ids))),
+			);
 		}
+		const history = (await sqliteOutlineStore.getHistoryStates([spaceId])).get(spaceId);
+		if (!history) throw new Error(`no history state for ${spaceId}`);
 		return {
 			space,
 			blocks,
 			versions,
+			edges,
+			marks,
+			history,
 			links: await db.select().from(outlineLinks).where(eq(outlineLinks.spaceId, spaceId)),
 			commits: await db
 				.select()
@@ -114,6 +137,15 @@ const ctx: OutlineDigestContractContext = {
 		await db
 			.delete(outlineTaskClaims)
 			.where(inArray(outlineTaskClaims.taskBlockId, [...taskBlockIds]));
+	},
+	async forgetHistory(spaceId) {
+		const blocks = sql`(SELECT id FROM outline_blocks WHERE space_id = ${spaceId})`;
+		db.run(sql`DELETE FROM outline_block_edges WHERE block_id IN ${blocks}`);
+		db.run(sql`DELETE FROM outline_subtree_changes WHERE ancestor_id IN ${blocks}`);
+		await db
+			.update(outlineSpaces)
+			.set({ edgesReady: false, historyFloorSeq: 0 })
+			.where(eq(outlineSpaces.id, spaceId));
 	},
 	async setLastCommitAt(spaceId, value) {
 		await db
@@ -160,6 +192,12 @@ describe("outline question contract (SQLite)", () => {
 describe("outline digest contract (SQLite)", () => {
 	for (const contractCase of OUTLINE_DIGEST_CONTRACT) {
 		test(contractCase.name, () => contractCase.run(ctx), 120_000);
+	}
+});
+
+describe("outline history contract (SQLite)", () => {
+	for (const contractCase of OUTLINE_HISTORY_CONTRACT) {
+		test(contractCase.name, () => contractCase.run(ctx), 300_000);
 	}
 });
 

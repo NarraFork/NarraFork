@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 144 tables and 1918 columns including the outline's swallowed-content scan", () => {
-		expect(target.tables.length).toBe(144);
+	test("covers 146 tables and 1927 columns including the outline's placement edges", () => {
+		expect(target.tables.length).toBe(146);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -569,7 +569,9 @@ describe("real schema parity", () => {
 		// Cache hit rate eligibility adds api_requests.cache_usage_reported (nullable).
 		// The swallowed-content scan (outline P2 PR 12c) adds outline_spec_loss_findings (21) and
 		// outline_spec_loss_scans (6).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1918);
+		// The pageless outline's history (H1) adds outline_block_edges (5), outline_subtree_changes
+		// (2), outline_spaces.history_floor_seq and outline_spaces.edges_ready.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1927);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({
