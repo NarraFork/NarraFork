@@ -4,23 +4,29 @@
  *
  *   - Structure: confirmed (what the server acknowledged) + pending (applied optimistically,
  *     not acknowledged yet) = visible. The server orders, checks and commits each structural
- *     transaction; a refused one is dropped and the page is rebuilt from a fresh snapshot (the
- *     whole Yjs document too, so nothing of the refused change lingers), then the pending
+ *     transaction; a refused one is dropped and the page is rebuilt from a fresh snapshot (every
+ *     text document too, so nothing of the refused change lingers), then the pending
  *     transactions the server had not applied are replayed on the new state: only the refused
  *     one is lost, and nothing the server already has is applied twice.
- *   - Text: one Yjs document; every block's `Y.Text` exists from the snapshot on (the server
- *     creates them all when the session opens; a new block's text is created by its creator in
- *     the same transaction).
- *   - Undo (design §6.6): one stack; a step is a transaction (typing in one block within a
- *     second merges); text through a `Y.UndoManager` that tracks only local changes, so only
- *     one's own edits are undone; structure through inverse operations.
- *   - Reconnect: the client resumes the same server session with its state vector and gets
- *     exactly what it lacks, then re-sends what the server had not processed. When the session
- *     is gone (the server restarted, or it closed while this client was away) it starts over
- *     from a snapshot. Every join names the session the client was in; the answer says which of
- *     its transactions the page applied (`tx`) and has safely (`dur`): those are not replayed,
- *     and applied ones not yet safe wait in {@link LiveClient.awaiting} for their
- *     acknowledgement.
+ *   - Text: per block (`shared/outline-live-text.ts`). A block's text is a plain string (its
+ *     seed, from the snapshot) until someone changes it; then it is a Yjs document of that block
+ *     alone, made here from the seed exactly as every other end makes it, whoever is first. A
+ *     new block starts from the empty text, and its creator's content goes in as a change. So a
+ *     block's text does not depend on where the block sits, and nothing races its creation.
+ *   - Undo (design §6.6): ONE stack over all blocks; a step is a transaction (typing in one
+ *     block within a second merges). A step records what it used: the inverse structural
+ *     operations, and for each block whose text it changed, that block's undo manager's stack
+ *     item (each block has its own `Y.UndoManager`, tracking only local changes, so only one's
+ *     own edits are undone; one manager cannot span documents). Undoing a step applies its
+ *     inverse operations and undoes exactly its items, never another step's ({@link popExactly});
+ *     the step going the other way records the items that made.
+ *   - Reconnect: the client resumes the same server session with the state vector of every
+ *     document it holds and gets exactly what it lacks, then re-sends what the server had not
+ *     processed. When the session is gone (the server restarted, or it closed while this client
+ *     was away) it starts over from a snapshot. Every join names the session the client was in;
+ *     the answer says which of its transactions the page applied (`tx`) and has safely (`dur`):
+ *     those are not replayed, and applied ones not yet safe wait in
+ *     {@link LiveClient.awaiting} for their acknowledgement.
  *   - Presence: who is here and where their cursors are, as Yjs relative positions; sent at
  *     most every {@link OUTLINE_LIVE_LIMITS.presenceIntervalMs}, never stored.
  *
@@ -36,8 +42,12 @@ import {
 } from "@shared/outline";
 import {
 	decodeLiveFrame,
+	decodeLiveSeed,
+	decodeLiveTexts,
 	encodeLiveFrame,
+	encodeLiveTexts,
 	LIVE_FRAME,
+	LIVE_TEXT_KIND,
 	type LiveBatchHead,
 	type LiveBlockWire,
 	type LiveCloseCode,
@@ -53,8 +63,17 @@ import {
 	type LiveRejectHead,
 	type LiveSelWire,
 	type LiveTaskChar,
+	type LiveTextEntry,
 	OUTLINE_LIVE_LIMITS,
+	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
+import {
+	hasPendingStructs,
+	LIVE_TEXT_SEED_CLIENT,
+	type LiveTextDoc,
+	mergeTextUpdates,
+	seededTextDoc,
+} from "@shared/outline-live-text";
 import * as Y from "yjs";
 import { type BlockRec, type ClientOp, keyBetweenLoose, Store, wireOp } from "./store";
 import {
@@ -65,16 +84,17 @@ import {
 	type UnsavedReason,
 } from "./unsaved-texts";
 
-/** Origin of the editor's own text changes (tracked by the undo manager). */
+/** Origin of the editor's own text changes (tracked by the block's undo manager). */
 export const LOCAL = { origin: "local" };
 /** Origin of replayed changes after a rebuild (sent, not undoable). */
 export const REPLAY = { origin: "replay" };
 /** Origin of everything that came from the server. */
 export const REMOTE = { origin: "remote" };
 /**
- * Origin of a new block's text being created (sent, not undoable). Undo removes and restores the
- * block through the structure; if the undo manager owned the text's creation, undoing it would
- * replace the text with a copy, and redoing later typing would land in the discarded one.
+ * Origin of a new block's initial text (sent, not undoable). Undo removes and restores the block
+ * through the structure, and its text stays in its document meanwhile; if the undo manager owned
+ * the initial text, undoing the creation would empty the block's document under the structure's
+ * feet.
  */
 export const CREATE = { origin: "create" };
 
@@ -151,11 +171,25 @@ export interface CommitInput {
 	view: ClientView | null;
 }
 
+/** A change to one block's document, as its update. */
+interface TextUpdate {
+	id: string;
+	update: Uint8Array;
+}
+
+/** A block's document here: with its undo manager once the person changed its text. */
+interface BlockText extends LiveTextDoc {
+	um: Y.UndoManager | null;
+}
+
+/** An item of a block's undo manager's stack (opaque; compared by identity). */
+type StackItem = Y.UndoManager["undoStack"][number];
+
 interface PendingTx {
 	n: number;
 	ops: ClientOp[];
-	/** The transaction's Yjs update (null until sent for a text batch being collected). */
-	update: Uint8Array[];
+	/** The transaction's text updates, in the order made. */
+	update: TextUpdate[];
 	/** Text before and after, per block, for replay after a rebuild. */
 	bodies: Map<string, { before: string; after: string }>;
 	structural: boolean;
@@ -165,8 +199,11 @@ interface PendingTx {
 
 interface Step {
 	inverse: ClientOp[];
-	usedUndoManager: boolean;
-	umBefore: number;
+	/**
+	 * The text this step changed: block → the item on that block's undo manager's stack (its
+	 * undo stack for a step on the undo stack, its redo stack for one on the redo stack).
+	 */
+	texts: Map<string, StackItem>;
 	selBefore: SelInfo | null;
 	selAfter: SelInfo | null;
 	kind: string;
@@ -247,9 +284,10 @@ function storeFromSnapshot(pageId: string, blocks: readonly LiveBlockWire[]): St
 }
 
 export class LiveClient {
-	doc!: Y.Doc;
-	texts!: Y.Map<Y.Text>;
-	um!: Y.UndoManager;
+	/** Seed text of blocks nobody changed yet (a block here has no document). */
+	private readonly plain = new Map<string, string>();
+	/** Documents of the blocks whose text changed, here or elsewhere. */
+	private readonly docs = new Map<string, BlockText>();
 	confirmed: Store;
 	visible: Store;
 	pending: PendingTx[] = [];
@@ -303,8 +341,10 @@ export class LiveClient {
 	private handle: number | null = null;
 	private n = 0;
 	private ackedTx = 0;
+	/** Told every text update made here, with its block and origin (measurements). */
+	onTextUpdate: ((id: string, update: Uint8Array, origin: unknown) => void) | null = null;
 	private textCache = new Map<string, string>();
-	private outY: Uint8Array[] = [];
+	private outY: TextUpdate[] = [];
 	private originView: ClientView | null = null;
 	private undoing = false;
 	private typingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -343,11 +383,12 @@ export class LiveClient {
 	) {
 		this.confirmed = new Store(pageId);
 		this.visible = new Store(pageId);
-		this.createDoc();
 		this.off.push(transport.onFrame((frame) => this.receive(frame)));
 		this.off.push(
 			transport.onConnectionChange((connected) => {
 				if (this.disposed) return;
+				// A client the server no longer speaks to stays closed: a reload is the only way on.
+				if (connected && this.closeCode === "outdated") return;
 				if (connected) this.join();
 				else {
 					this.setStatus(this.status === "closed" ? "closed" : "offline");
@@ -429,64 +470,129 @@ export class LiveClient {
 			this.transport.releaseHandle(this.handle);
 			this.handle = null;
 		}
-		this.um.destroy();
-		this.doc.destroy();
+		this.dropTexts();
 		this.views.clear();
 		this.listeners.clear();
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
-	// The document
+	// Text: a plain seed per block, a document once it changes
 	// ─────────────────────────────────────────────────────────────────────────
 
-	private createDoc(): void {
-		this.doc = new Y.Doc();
-		this.texts = this.doc.getMap<Y.Text>("texts");
-		this.um = new Y.UndoManager(this.texts, {
+	/** Forget every text (a rebuild takes them from the snapshot again). */
+	private dropTexts(): void {
+		for (const t of this.docs.values()) {
+			t.um?.destroy();
+			t.doc.destroy();
+		}
+		this.docs.clear();
+		this.plain.clear();
+		this.textCache.clear();
+	}
+
+	/**
+	 * A block's document, made on first use from its seed text (the empty text for a block
+	 * without one: a new block). Every end makes it from the same text, so it is the same
+	 * document wherever it is made first.
+	 */
+	private textDoc(id: string): BlockText {
+		const existing = this.docs.get(id);
+		if (existing) return existing;
+		const made: BlockText = { ...seededTextDoc(this.plain.get(id) ?? ""), um: null };
+		this.plain.delete(id);
+		this.docs.set(id, made);
+		made.doc.on("update", (update: Uint8Array, origin: unknown) => {
+			if (origin === REMOTE) return;
+			this.outY.push({ id, update });
+			this.onTextUpdate?.(id, update, origin);
+		});
+		made.text.observe((event, txn) => {
+			const local = txn.origin === LOCAL || txn.origin === REPLAY || txn.origin === CREATE;
+			this.textCache.delete(id);
+			if (local) {
+				for (const v of this.views) if (v !== this.originView) v.noteTextReset(id);
+			} else {
+				const delta = event.delta as DeltaOp[];
+				for (const v of this.views) v.noteDelta(id, delta);
+			}
+		});
+		return made;
+	}
+
+	/** The block's undo manager (made with the person's first change to its text). */
+	private umOf(t: BlockText): Y.UndoManager {
+		t.um ??= new Y.UndoManager(t.text, {
 			trackedOrigins: new Set([LOCAL]),
 			captureTimeout: 1e12,
 		});
-		this.doc.on("update", (update: Uint8Array, origin: unknown) => {
-			if (origin === REMOTE) return;
-			this.outY.push(update);
-		});
-		this.texts.observeDeep((events, txn) => {
-			const local = txn.origin === LOCAL || txn.origin === REPLAY || txn.origin === CREATE;
-			for (const ev of events) {
-				if (ev.target === this.texts) {
-					for (const key of (ev as Y.YMapEvent<Y.Text>).keysChanged) {
-						this.textCache.delete(key);
-						for (const v of this.views) if (!(local && v === this.originView)) v.noteTextReset(key);
-					}
-					continue;
-				}
-				if (!(ev.target instanceof Y.Text)) continue;
-				const id = (ev.target as unknown as { _item?: { parentSub?: string | null } })._item
-					?.parentSub;
-				if (!id) continue;
-				this.textCache.delete(id);
-				if (local) {
-					for (const v of this.views) if (v !== this.originView) v.noteTextReset(id);
-				} else {
-					const delta = ev.delta as DeltaOp[];
-					for (const v of this.views) v.noteDelta(id, delta);
-				}
-			}
-		});
+		return t.um;
 	}
 
-	ytext(id: string): Y.Text | undefined {
-		const t = this.texts.get(id);
-		return t instanceof Y.Text ? t : undefined;
+	/** Give a block without a document its seed text. */
+	private setPlain(id: string, text: string, except: ClientView | null = null): void {
+		if (this.docs.has(id)) return;
+		const had = this.plain.get(id);
+		this.plain.set(id, text);
+		if (had === text) return;
+		this.textCache.delete(id);
+		for (const v of this.views) if (v !== except) v.noteTextReset(id);
+	}
+
+	/** Whether the block has a text here (a block the page or a local change brought). */
+	hasText(id: string): boolean {
+		return this.docs.has(id) || this.plain.has(id);
+	}
+
+	/** Blocks with a document (diagnostics, tests, measurements). */
+	get textDocs(): number {
+		return this.docs.size;
+	}
+
+	/**
+	 * A block's document as diagnostics and tests compare it across ends: its whole state, and
+	 * whether an update that names items it lacks is stuck in it. Null without a document.
+	 */
+	textState(id: string): { state: Uint8Array; stuck: boolean } | null {
+		const t = this.docs.get(id);
+		return t ? { state: Y.encodeStateAsUpdate(t.doc), stuck: hasPendingStructs(t.doc) } : null;
 	}
 
 	textOf(id: string): string {
 		const c = this.textCache.get(id);
 		if (c !== undefined) return c;
-		const t = this.ytext(id);
-		const s = t ? t.toString() : "";
-		if (t) this.textCache.set(id, s);
+		const t = this.docs.get(id);
+		const s = t ? t.text.toString() : this.plain.get(id);
+		if (s === undefined) return "";
+		this.textCache.set(id, s);
 		return s;
+	}
+
+	/** Text entries from the server: seed texts and updates of documents. */
+	private applyTexts(body: Uint8Array): void {
+		if (body.length === 0) return;
+		const entries = decodeLiveTexts(body);
+		if (!entries) {
+			this.log.push("a frame's text could not be read");
+			return;
+		}
+		for (const e of entries) {
+			if (e.kind === LIVE_TEXT_KIND.seed) {
+				const seed = decodeLiveSeed(e.data);
+				if (seed === null) this.log.push(`the text of ${e.id} could not be read`);
+				else this.setPlain(e.id, seed);
+			} else if (e.kind === LIVE_TEXT_KIND.update)
+				Y.applyUpdate(this.textDoc(e.id).doc, e.data, REMOTE);
+		}
+	}
+
+	/** A resuming join's body: the state vector of every document held, or null when too many. */
+	private heldVectors(): Uint8Array | null {
+		if (this.docs.size > OUTLINE_LIVE_LIMITS.maxClientTextEntries) return null;
+		const entries: LiveTextEntry[] = [];
+		for (const [id, t] of this.docs)
+			entries.push({ id, kind: LIVE_TEXT_KIND.vector, data: Y.encodeStateVector(t.doc) });
+		const body = encodeLiveTexts(entries);
+		return body.length > OUTLINE_LIVE_LIMITS.maxClientFrameBytes - 1024 ? null : body;
 	}
 
 	newId(): string {
@@ -527,20 +633,24 @@ export class LiveClient {
 			this.confirmed.put({ ...rec });
 			this.visible.put(rec);
 		}
-		this.doc.transact(() => {
-			for (const b of blocks) {
-				const t = this.ytext(b.id);
-				if (!t) this.texts.set(b.id, new Y.Text(b.content));
-				else {
-					const cur = t.toString();
-					// Typed in meanwhile: kept (the snapshot's merge decides).
-					if (cur === b.content || this.seedTexts.get(b.id) !== cur) continue;
-					t.delete(0, t.length);
-					t.insert(0, b.content);
-				}
-				this.seedTexts.set(b.id, b.content);
+		for (const b of blocks) {
+			if (this.hasText(b.id)) {
+				const cur = this.textOf(b.id);
+				// Typed in meanwhile: kept (the snapshot's merge decides).
+				if (cur === b.content || this.seedTexts.get(b.id) !== cur) continue;
 			}
-		}, REMOTE);
+			const t = this.docs.get(b.id);
+			if (!t) this.setPlain(b.id, b.content);
+			else {
+				// A document from the read's text (typed in and taken back): it goes with the
+				// snapshot, so the newer read just replaces its text.
+				t.doc.transact(() => {
+					t.text.delete(0, t.text.length);
+					t.text.insert(0, b.content);
+				}, REMOTE);
+			}
+			this.seedTexts.set(b.id, b.content);
+		}
 		const first = !this.seeded;
 		this.seeded = true;
 		this.syncViews(null);
@@ -577,8 +687,10 @@ export class LiveClient {
 		// After the first join the server always learns the session this client was in, so its
 		// answer says which of the client's transactions the page has, snapshot or not.
 		const known = this.epoch !== 0;
-		const resume = known && this.ready && !this.resetting;
+		// Too many documents to name in one frame: a snapshot instead.
+		const held = known && this.ready && !this.resetting ? this.heldVectors() : null;
 		const head: LiveJoinHead = {
+			v: OUTLINE_LIVE_PROTOCOL_VERSION,
 			page: this.pageId,
 			mode: this.mode,
 			key: this.key,
@@ -588,7 +700,7 @@ export class LiveClient {
 							epoch: this.epoch,
 							op: this.opSeq,
 							tx: this.ackedTx,
-							...(resume ? {} : { reset: true }),
+							...(held ? {} : { reset: true }),
 						},
 					}
 				: {}),
@@ -599,7 +711,7 @@ export class LiveClient {
 				kind: LIVE_FRAME.join,
 				handle: this.handle,
 				head,
-				...(resume ? { body: Y.encodeStateVector(this.doc) } : {}),
+				...(held ? { body: held } : {}),
 			}),
 		);
 	}
@@ -626,9 +738,8 @@ export class LiveClient {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	private writeBody(b: BodyChange, origin: unknown): { before: string; after: string } | null {
-		const t = this.ytext(b.id);
-		if (!t) return null;
-		const cur = t.toString();
+		if (!this.hasText(b.id)) return null;
+		const cur = this.textOf(b.id);
 		if (cur === b.md && !b.hunks) return null;
 		const hunks =
 			b.hunks ??
@@ -637,7 +748,11 @@ export class LiveClient {
 				return h ? [h] : [];
 			})();
 		if (hunks.length === 0) return null;
-		this.doc.transact(() => {
+		const made = this.textDoc(b.id);
+		const t = made.text;
+		// The block's undo manager must be there before the change it is to record.
+		if (origin === LOCAL) this.umOf(made);
+		made.doc.transact(() => {
 			// Last first, so earlier offsets hold; hunks at one offset in reverse too (an insertion
 			// before a deletion there must be applied after it), as `applyHunks` reads them.
 			for (const h of [...hunks].sort((x, y) => x.start - y.start).reverse()) {
@@ -647,6 +762,20 @@ export class LiveClient {
 		}, origin);
 		this.textCache.delete(b.id);
 		return { before: cur, after: t.toString() };
+	}
+
+	/**
+	 * A new block's text: its document starts from the empty text (as every other end's will)
+	 * and takes the content as a change that is sent and not undoable.
+	 */
+	private createText(id: string, content: string, origin: unknown): void {
+		if (content.length === 0) {
+			this.setPlain(id, "", this.originView);
+			return;
+		}
+		const made = this.textDoc(id);
+		made.doc.transact(() => made.text.insert(0, content), origin);
+		this.textCache.delete(id);
 	}
 
 	/** One local transaction: structure, text, an undo step, sent to the server. */
@@ -675,11 +804,10 @@ export class LiveClient {
 			step.time = now;
 			step.selAfter = input.selAfter;
 		} else {
-			this.um.stopCapturing();
+			this.closeCaptures();
 			step = {
 				inverse: [],
-				usedUndoManager: false,
-				umBefore: this.um.undoStack.length,
+				texts: new Map(),
 				selBefore: input.selBefore,
 				selAfter: input.selAfter,
 				kind: input.kind,
@@ -697,15 +825,9 @@ export class LiveClient {
 			if (this.visible.alive(id)?.question) withdrawn++;
 		};
 		try {
-			const created = input.ops.filter((op) => op.t === "i" && !this.ytext(op.id));
-			if (created.length > 0) {
-				// New blocks' texts are created by their creator, in the same transaction.
-				this.doc.transact(() => {
-					for (const op of created) {
-						if (op.t === "i") this.texts.set(op.id, new Y.Text(op.content));
-					}
-				}, CREATE);
-			}
+			// New blocks' texts are created by their creator, in the same transaction.
+			for (const op of input.ops)
+				if (op.t === "i" && !this.hasText(op.id)) this.createText(op.id, op.content, CREATE);
 			for (const op of input.ops) {
 				if (op.t === "d") {
 					// A deleted block takes its whole live subtree, including blocks the view does
@@ -726,15 +848,23 @@ export class LiveClient {
 				this.textCache.delete(op.id);
 			}
 			for (const b of input.bodies) {
+				const before = this.docs.get(b.id)?.um?.undoStack.length ?? 0;
 				const change = this.writeBody(b, LOCAL);
 				if (change) bodies.set(b.id, change);
+				// What the block's undo manager recorded of it: a new item, which this step undoes.
+				// (Typing on in a merged step grows the item the step already has; a change that
+				// changed nothing leaves no item, and the one on top belongs to an earlier step.)
+				const um = this.docs.get(b.id)?.um;
+				if (um && um.undoStack.length > before) {
+					step.texts.set(b.id, um.undoStack[um.undoStack.length - 1] as StackItem);
+					this.capturing.add(um);
+				}
 			}
 		} finally {
 			this.originView = null;
 		}
 		step.inverse = [...inverses, ...step.inverse];
-		if (this.um.undoStack.length > step.umBefore) step.usedUndoManager = true;
-		this.redoStack = [];
+		this.dropRedo();
 		this.enqueue(ops, bodies, ops.length > 0);
 		this.syncViews(input.view);
 		if (withdrawn > 0) {
@@ -752,7 +882,7 @@ export class LiveClient {
 		const update = this.outY;
 		this.outY = [];
 		if (ops.length === 0 && update.length === 0) return;
-		const bytes = update.reduce((n, u) => n + u.length, 0);
+		const bytes = update.reduce((n, u) => n + u.update.length, 0);
 		const tail = this.pending[this.pending.length - 1];
 		if (!structural && tail && !tail.structural && !tail.sent) {
 			// Typing joins the batch being collected.
@@ -789,8 +919,13 @@ export class LiveClient {
 		if (this.status !== "live" || this.handle === null || this.resetting) return;
 		for (const tx of this.pending) {
 			if (tx.sent) continue;
-			const body = tx.update.length > 1 ? Y.mergeUpdates(tx.update) : tx.update[0];
-			if (tx.update.length > 1 && body) tx.update = [body];
+			if (tx.update.length > 1) tx.update = mergedUpdates(tx.update);
+			const body =
+				tx.update.length > 0
+					? encodeLiveTexts(
+							tx.update.map((u) => ({ id: u.id, kind: LIVE_TEXT_KIND.update, data: u.update })),
+						)
+					: undefined;
 			const frame = tx.structural
 				? encodeLiveFrame({
 						kind: LIVE_FRAME.tx,
@@ -853,12 +988,29 @@ export class LiveClient {
 		return this.undoing;
 	}
 
+	/** Undo managers whose top item is still open (typing on would grow it). */
+	private readonly capturing = new Set<Y.UndoManager>();
+
+	/** The next text change of any block starts a new item on its undo manager. */
+	private closeCaptures(): void {
+		for (const um of this.capturing) um.stopCapturing();
+		this.capturing.clear();
+	}
+
+	/** A new change: what was undone can no longer be redone, in any block. */
+	private dropRedo(): void {
+		for (const step of this.redoStack)
+			for (const id of step.texts.keys()) this.docs.get(id)?.um?.clear(false, true);
+		this.redoStack = [];
+	}
+
 	/** Apply a step's inverse; returns the step that goes the other way. */
 	private replay(step: Step, dir: "undo" | "redo"): Step {
-		this.um.stopCapturing();
+		this.closeCaptures();
 		this.undoing = true;
 		const ops: ClientOp[] = [];
 		const inverses: ClientOp[] = [];
+		const texts = new Map<string, StackItem>();
 		try {
 			for (const op of step.inverse) {
 				if (!this.validLocally(op)) {
@@ -870,9 +1022,12 @@ export class LiveClient {
 				ops.push(op);
 				this.textCache.delete(op.id);
 			}
-			if (step.usedUndoManager) {
-				if (dir === "undo") this.um.undo();
-				else this.um.redo();
+			for (const [id, item] of step.texts) {
+				const um = this.docs.get(id)?.um;
+				const made = um ? popExactly(um, dir, item) : null;
+				if (made) texts.set(id, made);
+				else this.log.push(`${dir} changed nothing in ${id}: its text was changed since`);
+				this.textCache.delete(id);
 			}
 		} finally {
 			this.undoing = false;
@@ -883,8 +1038,7 @@ export class LiveClient {
 		if (sel) sel.view.restoreSelection(sel);
 		return {
 			inverse: inverses,
-			usedUndoManager: step.usedUndoManager,
-			umBefore: 0,
+			texts,
 			selBefore: step.selAfter,
 			selAfter: step.selBefore,
 			kind: "struct",
@@ -918,8 +1072,16 @@ export class LiveClient {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	private relOf(blockId: string, offset: number): LivePosWire {
-		const t = this.ytext(blockId);
-		if (!t || offset >= t.length) return [blockId, null];
+		const t = this.docs.get(blockId)?.text;
+		if (!t) {
+			// No document: its text is the one seed item every end would make, so the position
+			// is known without making it.
+			const seed = this.plain.get(blockId) ?? "";
+			return offset >= seed.length
+				? [blockId, null]
+				: [blockId, [LIVE_TEXT_SEED_CLIENT, Math.max(0, offset), 0]];
+		}
+		if (offset >= t.length) return [blockId, null];
 		const rel = Y.relativePositionToJSON(
 			Y.createRelativePositionFromTypeIndex(t, Math.max(0, offset)),
 		) as { item?: { client: number; clock: number } | null; assoc?: number };
@@ -929,12 +1091,21 @@ export class LiveClient {
 	/** A peer's position as a block and a source offset, or null when it no longer resolves. */
 	resolvePos(pos: LivePosWire): { blockId: string; offset: number } | null {
 		const [blockId, rel] = pos;
-		const t = this.ytext(blockId);
-		if (!t || !this.visible.alive(blockId)) return null;
+		if (!this.hasText(blockId) || !this.visible.alive(blockId)) return null;
+		const made = this.docs.get(blockId);
+		if (!made) {
+			const seed = this.plain.get(blockId) ?? "";
+			if (rel === null) return { blockId, offset: seed.length };
+			// A position in the seed item; one in a change this end has not received yet waits.
+			return rel[0] === LIVE_TEXT_SEED_CLIENT && rel[1] >= 0 && rel[1] < seed.length
+				? { blockId, offset: rel[1] }
+				: null;
+		}
+		const t = made.text;
 		if (rel === null) return { blockId, offset: t.length };
 		const abs = Y.createAbsolutePositionFromRelativePosition(
 			Y.createRelativePositionFromJSON({ item: { client: rel[0], clock: rel[1] }, assoc: rel[2] }),
-			this.doc,
+			made.doc,
 		);
 		if (!abs || abs.type !== t) return null;
 		return { blockId, offset: abs.index };
@@ -1006,11 +1177,6 @@ export class LiveClient {
 		for (const tx of this.pending) for (const op of tx.ops) v.apply(op);
 		this.visible = v;
 		this.textCache.clear();
-	}
-
-	private applyRemoteY(update: Uint8Array): void {
-		if (update.length === 0) return;
-		Y.applyUpdate(this.doc, update, REMOTE);
 	}
 
 	receive(frame: LiveFrame): void {
@@ -1129,12 +1295,13 @@ export class LiveClient {
 		const first = !this.ready;
 		// Everything local goes: a fresh document from the snapshot (a refused change must not
 		// linger in it), then this client's unacknowledged changes are replayed on top.
-		this.um.destroy();
-		this.doc.destroy();
-		this.createDoc();
+		this.dropTexts();
+		this.capturing.clear();
 		this.outY = [];
-		this.applyRemoteY(body);
+		this.applyTexts(body);
 		this.confirmed = storeFromSnapshot(this.pageId, head.blocks ?? []);
+		// A block the snapshot sent no text for has the empty text.
+		for (const b of head.blocks ?? []) if (!this.hasText(b[0])) this.plain.set(b[0], "");
 		this.pending = [];
 		this.visible = this.confirmed.clone();
 		this.textCache.clear();
@@ -1168,9 +1335,11 @@ export class LiveClient {
 			const created = new Set<string>();
 			for (const op of tx.ops) {
 				if (!this.validLocally(op)) continue;
-				if (op.t === "i" && !this.ytext(op.id)) {
+				if (op.t === "i" && !this.confirmed.get(op.id)) {
 					const text = tx.bodies.get(op.id)?.after ?? op.content;
-					this.doc.transact(() => this.texts.set(op.id, new Y.Text(text)), REPLAY);
+					// A text the page already has for it is what a refused attempt left: replaced.
+					if (!this.hasText(op.id)) this.createText(op.id, text, REPLAY);
+					else this.writeBody({ id: op.id, md: text }, REPLAY);
 					created.add(op.id);
 				}
 				this.visible.apply(op, (id) => this.textOf(id));
@@ -1178,9 +1347,8 @@ export class LiveClient {
 			}
 			for (const [id, { before, after }] of tx.bodies) {
 				if (created.has(id)) continue;
-				const t = this.ytext(id);
-				if (!t || !this.visible.alive(id)) continue;
-				const current = t.toString();
+				if (!this.hasText(id) || !this.visible.alive(id)) continue;
+				const current = this.textOf(id);
 				const r = merge3(before, after, current, { lenient: true });
 				if (!r.ok || r.result === current) continue;
 				const change = this.writeBody({ id, md: r.result, hunks: r.patch }, REPLAY);
@@ -1219,14 +1387,19 @@ export class LiveClient {
 		for (const tx of this.pending) tx.sent = false;
 		if (head.blocks) this.confirmed = storeFromSnapshot(this.pageId, head.blocks);
 		else for (const c of head.ops ?? []) this.applyCommit(c);
-		this.applyRemoteY(body);
+		this.applyTexts(body);
+		for (const b of head.blocks ?? []) if (!this.hasText(b[0])) this.plain.set(b[0], "");
 		this.rebuildVisible();
 		this.syncViews(null);
 	}
 
 	private applyCommit(commit: LiveCommitWire, own = false): void {
 		const before = own ? null : this.cursorBlocks();
-		for (const op of commit.ops) this.confirmed.apply(op);
+		for (const op of commit.ops) {
+			this.confirmed.apply(op);
+			// A block that arrives with no text entry has the empty text.
+			if (op.t === "i" && !this.hasText(op.id)) this.plain.set(op.id, "");
+		}
 		this.opSeq = Math.max(this.opSeq, commit.o);
 		if (before && commit.ops.some((op) => op.t === "d")) this.noteDeletion(before, commit);
 	}
@@ -1252,9 +1425,10 @@ export class LiveClient {
 		}
 		for (const c of head?.c ?? []) commits.push({ o: c.o, apply: () => this.applyCommit(c) });
 		commits.sort((a, b) => a.o - b.o);
+		// Text first: a block a commit of this frame adds has its seed text in the same frame.
+		this.applyTexts(body);
 		for (const c of commits) c.apply();
 		this.rebuildVisible();
-		this.applyRemoteY(body);
 		this.checkStall();
 		if (commits.length > 0 || body.length > 0) this.syncViews(null);
 	}
@@ -1295,9 +1469,10 @@ export class LiveClient {
 	private onClosed(code: LiveCloseCode): void {
 		this.closeCode = code;
 		if (code !== "ended" && code !== "unavailable") {
-			// Closed for good (refused after typing on the read, access gone, too large): nothing
-			// not acknowledged can be sent any more. Kept for the person at once, while the page
-			// turns read only.
+			// Closed for good (refused after typing on the read, access gone, too large, or this
+			// client is of another protocol version than the server: `outdated`): nothing not
+			// acknowledged can be sent any more. Kept for the person at once, while the page turns
+			// read only (and, outdated, asks for a reload; this client does not join again).
 			this.keepUnsaved(this.provisional ? "refused" : "not_sent", [
 				...this.awaiting,
 				...this.pending,
@@ -1531,6 +1706,45 @@ export class LiveClient {
 		walk(rootId, 0);
 		return lines.join("\n");
 	}
+}
+
+/** A transaction's text updates with each block's merged into one. */
+function mergedUpdates(updates: readonly TextUpdate[]): TextUpdate[] {
+	const byId = new Map<string, Uint8Array[]>();
+	for (const u of updates) {
+		const list = byId.get(u.id);
+		if (list) list.push(u.update);
+		else byId.set(u.id, [u.update]);
+	}
+	return [...byId].map(([id, list]) => ({ id, update: mergeTextUpdates(list) }));
+}
+
+/**
+ * Undo (or redo) exactly one item of a block's undo manager, and return the item that takes it
+ * back (on the manager's other stack), or null when it changed nothing.
+ *
+ * `Y.UndoManager.undo()` pops items until one changes something: when the top item's text was
+ * since removed by someone else, it would go on and undo the NEXT item, which belongs to an
+ * earlier step of the editor's stack. So the item is undone alone: the others are taken off the
+ * stack for the call and put back. An item no longer on the stack (the manager dropped it)
+ * changes nothing.
+ */
+function popExactly(um: Y.UndoManager, dir: "undo" | "redo", item: StackItem): StackItem | null {
+	const stack = dir === "undo" ? um.undoStack : um.redoStack;
+	const other = dir === "undo" ? um.redoStack : um.undoStack;
+	const at = stack.lastIndexOf(item);
+	if (at < 0) return null;
+	const above = stack.splice(at + 1);
+	const below = stack.splice(0, at);
+	const before = other.length;
+	try {
+		if (dir === "undo") um.undo();
+		else um.redo();
+	} finally {
+		stack.unshift(...below);
+		stack.push(...above);
+	}
+	return other.length > before ? (other[other.length - 1] as StackItem) : null;
 }
 
 /** Whether typing continues where it left off (unknown without a cursor: assumed so). */

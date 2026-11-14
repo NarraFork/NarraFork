@@ -1931,7 +1931,7 @@ export class OutlineView implements CmdHost, ClientView {
 	): BodyChange | null {
 		const current = this.client.textOf(id);
 		const shadow = this.nodeCache.get(id)?.content;
-		if (shadow === undefined || shadow === current || !this.client.ytext(id)) {
+		if (shadow === undefined || shadow === current || !this.client.hasText(id)) {
 			return md === current ? null : { id, md };
 		}
 		if (md === shadow) return null;

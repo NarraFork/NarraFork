@@ -30,13 +30,15 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	decodeLiveFrame,
 	encodeLiveFrame,
+	encodeLiveTexts,
 	LIVE_FRAME,
+	LIVE_TEXT_KIND,
 	type LiveBlockWire,
 	type LiveFrame,
 	type LiveJoinedHead,
 	OUTLINE_LIVE_LIMITS,
+	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
-import * as Y from "yjs";
 import { LiveClient, type LiveTransport, type SeedBlock } from "./live-client";
 import {
 	acquireLiveSession,
@@ -133,13 +135,11 @@ function read(): SeedBlock[] {
 
 /** The page's snapshot: A and B (or only those named) under the page. */
 function joined(handle: number, head: Partial<LiveJoinedHead> = {}, ids: string[] = [A, B]) {
-	const doc = new Y.Doc();
-	const map = doc.getMap<Y.Text>("texts");
 	const texts: Record<string, string> = { [PAGE]: "Page", [A]: "Alpha", [B]: "Bee" };
 	const blocks: LiveBlockWire[] = [[PAGE, -1, "a0", "p1", ""]];
-	map.set(PAGE, new Y.Text("Page"));
+	const sent: Record<string, string> = { [PAGE]: "Page" };
 	ids.forEach((id, i) => {
-		map.set(id, new Y.Text(texts[id] ?? ""));
+		sent[id] = texts[id] ?? "";
 		blocks.push([id, 0, `a${i}`, id === A ? "a1" : "b1", ""]);
 	});
 	const answer: LiveJoinedHead = {
@@ -153,7 +153,18 @@ function joined(handle: number, head: Partial<LiveJoinedHead> = {}, ids: string[
 		peers: [],
 		...head,
 	};
-	return { kind: LIVE_FRAME.joined, handle, head: answer, body: Y.encodeStateAsUpdate(doc) };
+	return { kind: LIVE_FRAME.joined, handle, head: answer, body: seeds(sent) };
+}
+
+/** A snapshot's body: every block's text as its seed (nobody has changed any yet). */
+function seeds(texts: Record<string, string>): Uint8Array {
+	return encodeLiveTexts(
+		Object.entries(texts).map(([id, t]) => ({
+			id,
+			kind: LIVE_TEXT_KIND.seed,
+			data: new TextEncoder().encode(t),
+		})),
+	);
 }
 
 const type = (client: LiveClient, id: string, md: string) =>
@@ -363,6 +374,55 @@ describe("typing that cannot reach the page outlives its session", () => {
 	});
 });
 
+describe("a client of another protocol version than the server", () => {
+	test("told `outdated` while live with typing on its way: the typing is kept, the session is closed for good, and nothing joins again when the socket comes back", () => {
+		const { transport, sent, deliver, setConnected } = socket();
+		const client = new LiveClient(transport, PAGE, "edit");
+		const handle = sent[0]?.handle as number;
+		// Every join names the version this client speaks.
+		expect((sent[0]?.head as { v?: number }).v).toBe(OUTLINE_LIVE_PROTOCOL_VERSION);
+		deliver(joined(handle));
+		type(client, A, "Alpha typed before the upgrade");
+		const events: string[] = [];
+		client.on((event) => events.push(event));
+		deliver({ kind: LIVE_FRAME.closed, handle, head: { code: "outdated" } });
+		expect(client.status).toBe("closed");
+		expect(client.closeCode).toBe("outdated");
+		expect(client.editable).toBe(false);
+		expect(events).toContain("closed");
+		expect(unsavedTextsOf(PAGE)).toMatchObject([
+			{ blockId: A, text: "Alpha typed before the upgrade", base: "Alpha", reason: "not_sent" },
+		]);
+		// The socket drops and comes back (the server restarted): no join, no retry.
+		const joins = () => sent.filter((f) => f.kind === LIVE_FRAME.join).length;
+		const before = joins();
+		setConnected(false);
+		setConnected(true);
+		expect(joins()).toBe(before);
+		expect(client.status).toBe("closed");
+		client.dispose();
+		// Kept once, not again at dispose.
+		expect(unsavedTextsOf(PAGE)).toHaveLength(1);
+	});
+
+	test("told `outdated` at its first join, with typing on the read: kept as refused", () => {
+		const { transport, sent, deliver } = socket();
+		const client = new LiveClient(transport, PAGE, "edit");
+		client.seed(read());
+		type(client, B, "Bee typed on the read");
+		deliver({
+			kind: LIVE_FRAME.closed,
+			handle: sent[0]?.handle as number,
+			head: { code: "outdated" },
+		});
+		expect(client.closeCode).toBe("outdated");
+		expect(unsavedTextsOf(PAGE)).toMatchObject([
+			{ blockId: B, text: "Bee typed on the read", reason: "refused" },
+		]);
+		client.dispose();
+	});
+});
+
 describe("a session with typing not acknowledged", () => {
 	test("is not dropped to make room for other pages; joins again and sends it (probe P5)", async () => {
 		setLiveSessionGraceForTests(20);
@@ -477,13 +537,11 @@ describe("a session with typing not acknowledged", () => {
 		const deadHandle = s.joinOf(PAGE)?.handle as number;
 		const fineHandle = s.joinOf("page-0000002")?.handle as number;
 		s.deliver(joined(deadHandle));
-		const two = new Y.Doc();
-		two.getMap<Y.Text>("texts").set("page-0000002", new Y.Text("Page two"));
 		s.deliver({
 			kind: LIVE_FRAME.joined,
 			handle: fineHandle,
 			head: { ...joined(fineHandle).head, blocks: [["page-0000002", -1, "a0", "p2", ""]] },
-			body: Y.encodeStateAsUpdate(two),
+			body: seeds({ "page-0000002": "Page two" }),
 		});
 		type(dead.client, A, "Alpha sent into the void");
 		type(fine.client, "page-0000002", "Page two typed");

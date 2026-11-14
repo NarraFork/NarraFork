@@ -3,7 +3,8 @@
  * the deleted ones it has seen), with what the database holds for each.
  *
  * Between two lane tasks it matches the blocks table for the page, except that a block's text
- * may be ahead in the session's Yjs document (`dbContent` is what the database has).
+ * may be ahead in the block's text document (`dbContent` is what the database has, and the live
+ * text of every block that has no document).
  */
 import { compareOrderKeys } from "@shared/outline";
 import {

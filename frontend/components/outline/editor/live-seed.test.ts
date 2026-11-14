@@ -22,12 +22,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
 	decodeLiveFrame,
+	decodeLiveSeed,
+	decodeLiveTexts,
 	encodeLiveFrame,
+	encodeLiveTexts,
 	LIVE_FRAME,
+	LIVE_TEXT_KIND,
 	type LiveBlockWire,
 	type LiveFrame,
 	type LiveJoinedHead,
 } from "@shared/outline-live-protocol";
+import { hasPendingStructs, seededTextDoc } from "@shared/outline-live-text";
 import * as Y from "yjs";
 import { LiveClient, type LiveTransport, type SeedBlock } from "./live-client";
 import {
@@ -105,16 +110,38 @@ function read(texts: Partial<Record<string, string>> = {}): SeedBlock[] {
 	];
 }
 
+/** A snapshot's body: every block's text as its seed (nobody has changed any yet). */
+function seeds(texts: Record<string, string>): Uint8Array {
+	return encodeLiveTexts(
+		Object.entries(texts).map(([id, t]) => ({
+			id,
+			kind: LIVE_TEXT_KIND.seed,
+			data: new TextEncoder().encode(t),
+		})),
+	);
+}
+
+/**
+ * A block's text on the server after a client's frame: the document the server makes from the
+ * seed its snapshot sent, with the frame's update of that block applied.
+ */
+function serverText(snapshot: Uint8Array, sent: Uint8Array, id: string): string {
+	const seed = decodeLiveTexts(snapshot)?.find((e) => e.id === id);
+	const { doc, text } = seededTextDoc(seed ? (decodeLiveSeed(seed.data) ?? "") : "");
+	for (const e of decodeLiveTexts(sent) ?? []) {
+		expect(e.kind).toBe(LIVE_TEXT_KIND.update);
+		if (e.id === id) Y.applyUpdate(doc, e.data);
+	}
+	return text.toString();
+}
+
 /** The server's snapshot of the same page, with these texts. */
 function joined(
 	handle: number,
 	texts: Partial<Record<string, string>> = {},
 	head: Partial<LiveJoinedHead> = {},
 ) {
-	const doc = new Y.Doc();
-	const map = doc.getMap<Y.Text>("texts");
 	const all: Record<string, string> = { [PAGE]: "Page", [B]: "Bee", [A]: "Alpha", [C]: "Child" };
-	for (const [id, t] of Object.entries({ ...all, ...texts })) map.set(id, new Y.Text(t));
 	const blocks: LiveBlockWire[] = [
 		[PAGE, -1, "a0", "p1", ""],
 		[B, 0, "a0", "b1", ""],
@@ -132,7 +159,12 @@ function joined(
 		peers: [],
 		...head,
 	};
-	return { kind: LIVE_FRAME.joined, handle, head: answer, body: Y.encodeStateAsUpdate(doc) };
+	return {
+		kind: LIVE_FRAME.joined,
+		handle,
+		head: answer,
+		body: seeds({ ...all, ...texts } as Record<string, string>),
+	};
 }
 
 const type = (client: LiveClient, id: string, md: string) =>
@@ -213,10 +245,29 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		expect(client.visible.children(PAGE)).toEqual([B, A]);
 		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.update]);
 		// What is sent is a change of the server's document, not of the seed's.
-		const server = new Y.Doc();
-		Y.applyUpdate(server, answer.body);
-		Y.applyUpdate(server, sent[1]?.body as Uint8Array);
-		expect(server.getMap<Y.Text>("texts").get(B)?.toString()).toBe("Busy Bee and more");
+		expect(serverText(answer.body, sent[1]?.body as Uint8Array, B)).toBe("Busy Bee and more");
+	});
+
+	test("a seed text starting with U+FEFF is taken as it is: the document made here is the server's", async () => {
+		const { transport, sent, deliver } = socket();
+		const client = new LiveClient(transport, PAGE, "edit");
+		const bom = "\uFEFFBee with a mark";
+		const answer = joined(sent[0]?.handle as number, { [B]: bom });
+		deliver(answer);
+		expect(client.textOf(B)).toBe(bom);
+		expect(client.textOf(B).length).toBe(bom.length);
+		type(client, B, `${bom}!`);
+		// Typing goes out a moment later (batched).
+		for (let i = 0; i < 100 && sent.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.update]);
+		// The update fits the document the server makes from the same seed, at the same place.
+		expect(serverText(answer.body, sent[1]?.body as Uint8Array, B)).toBe(`${bom}!`);
+		// No update is stuck: it named only items the seed made.
+		const seed = decodeLiveTexts(answer.body)?.find((e) => e.id === B);
+		const server = seededTextDoc(decodeLiveSeed(seed?.data as Uint8Array) as string);
+		for (const e of decodeLiveTexts(sent[1]?.body as Uint8Array) ?? [])
+			Y.applyUpdate(server.doc, e.data);
+		expect(hasPendingStructs(server.doc)).toBe(false);
 	});
 
 	test("no longer allowed to write when the snapshot arrives: nothing is sent, the typing is kept to copy", () => {
@@ -288,10 +339,6 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		type(client, C, "Child with my words");
 		const handle = sent[0]?.handle as number;
 		// Someone deleted C (under A) before the snapshot.
-		const doc = new Y.Doc();
-		const map = doc.getMap<Y.Text>("texts");
-		for (const [id, t] of Object.entries({ [PAGE]: "Page", [B]: "Bee", [A]: "Alpha" }))
-			map.set(id, new Y.Text(t));
 		const blocks: LiveBlockWire[] = [
 			[PAGE, -1, "a0", "p1", ""],
 			[B, 0, "a0", "b1", ""],
@@ -301,7 +348,7 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 			kind: LIVE_FRAME.joined,
 			handle,
 			head: { epoch: 7, mode: "reset", w: true, op: 0, tx: 0, me: 1, blocks, peers: [] },
-			body: Y.encodeStateAsUpdate(doc),
+			body: seeds({ [PAGE]: "Page", [B]: "Bee", [A]: "Alpha" }),
 		});
 		expect(client.ready).toBe(true);
 		expect(client.visible.alive(C)).toBeUndefined();
@@ -337,10 +384,6 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		const client = new LiveClient(transport, PAGE, "edit");
 		client.seed(read());
 		type(client, C, "Child with my words");
-		const doc = new Y.Doc();
-		const map = doc.getMap<Y.Text>("texts");
-		for (const [id, t] of Object.entries({ [PAGE]: "Page", [B]: "Bee" }))
-			map.set(id, new Y.Text(t));
 		deliver({
 			kind: LIVE_FRAME.joined,
 			handle: sent[0]?.handle as number,
@@ -357,7 +400,7 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 				],
 				peers: [],
 			},
-			body: Y.encodeStateAsUpdate(doc),
+			body: seeds({ [PAGE]: "Page", [B]: "Bee" }),
 		});
 		const [entry] = unsavedTextsOf(PAGE);
 		expect(entry?.restore).toEqual({ parentId: PAGE, task: null });
@@ -423,10 +466,7 @@ describe("a session let go before it was live", () => {
 		expect(liveSessionsOn(transport)).toEqual([]);
 		expect(unsavedTextsOf(PAGE)).toEqual([]);
 		// What went out is the typed text on the server's document.
-		const server = new Y.Doc();
-		Y.applyUpdate(server, answer.body);
-		Y.applyUpdate(server, sent[1]?.body as Uint8Array);
-		expect(server.getMap<Y.Text>("texts").get(B)?.toString()).toBe("Bee typed fast");
+		expect(serverText(answer.body, sent[1]?.body as Uint8Array, B)).toBe("Bee typed fast");
 	});
 
 	test("a live session still gets the grace period", async () => {
