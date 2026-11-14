@@ -2030,7 +2030,7 @@
 	"tlsCertSans": "当前证书包含：{{sans}}",
 	"tlsAutoSansNote": "签发时自动包含：{{sans}}",
 	"tlsAutoReissue": "启动时自动更新证书",
-	"tlsAutoReissueDesc": "本机 IP 变化时自动重新签发，保留原 CA。",
+	"tlsAutoReissueDesc": "本机 IP 变化、证书有效期超过 825 天，或剩余不足 30 天时，自动重新签发内置证书，保留原 CA。",
 	"tlsDownloadCa": "下载 CA 证书",
 	"tlsCaDownloadError": "CA 证书下载失败",
 	"tlsRegenerateCa": "重新生成 CA",

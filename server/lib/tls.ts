@@ -29,12 +29,19 @@ const SAN_SIDECAR_FILE = "san-list.json";
  * Desktop browsers do not enforce the cap, so an oversized leaf is invisible
  * on the machine that issued it and only breaks mobile access. 397 days keeps
  * a comfortable margin under 825 while still giving a year-plus lifetime.
+ * Startup also rewrites an already installed builtin leaf when its lifetime
+ * exceeds 825 days or fewer than 30 days remain before notAfter.
  *
  * @see https://support.apple.com/en-us/HT210176
  */
 const CERT_VALIDITY_DAYS = 397;
 const CA_VALIDITY_YEARS = 20;
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** NotAfter − NotBefore. Apple rejects a TLS leaf longer than this. */
+const APPLE_MAX_CERT_LIFETIME_MS = 825 * DAY_MS;
+/** Reissue once remaining life is under this, including a notAfter already past. */
+const CERT_RENEW_BEFORE_MS = 30 * DAY_MS;
 /** Also the zod `.max()` in routes/tls.ts — keep the two from drifting apart. */
 export const MAX_CUSTOM_SANS = 50;
 
@@ -373,7 +380,11 @@ function normalizeSan(name: string): string {
 	return isIP(name) === 6 ? new URL(`http://[${name}]`).hostname : name.toLowerCase();
 }
 
-/** Run once before binding HTTPS; never replace external certificates or rotate a CA. */
+/**
+ * Run once before binding HTTPS. Never replaces external certificates or rotates a CA.
+ * Reissues the builtin leaf when its SANs no longer match, when NotAfter − NotBefore
+ * is more than 825 days, or when fewer than 30 days remain before notAfter.
+ */
 export async function reissueBuiltinTlsOnStartup(tls: TlsConfig | undefined): Promise<boolean> {
 	if (!tls?.enabled || tls.autoReissue === false) return false;
 	const { certPath, keyPath, caCertPath, caKeyPath } = getTlsPaths();
@@ -394,11 +405,27 @@ export async function reissueBuiltinTlsOnStartup(tls: TlsConfig | undefined): Pr
 
 	const current = new Set((parseCertFile(certPem)?.sans ?? []).map(normalizeSan));
 	const expected = new Set([...getAutoSans(), ...readCustomSans()].map(normalizeSan));
-	if (current.size === expected.size && [...expected].every((san) => current.has(san))) {
-		return false;
-	}
+	const sansChanged = !(
+		current.size === expected.size && [...expected].every((san) => current.has(san))
+	);
+	const notBeforeMs = Date.parse(cert.validFrom);
+	const notAfterMs = Date.parse(cert.validTo);
+	const lifetimeMs = notAfterMs - notBeforeMs;
+	// Unparseable dates cannot be shown to be inside the cap, so renew them.
+	const lifetimeTooLong = !(
+		Number.isFinite(lifetimeMs) && lifetimeMs <= APPLE_MAX_CERT_LIFETIME_MS
+	);
+	const needsRenewal = !(
+		Number.isFinite(notAfterMs) && notAfterMs - Date.now() >= CERT_RENEW_BEFORE_MS
+	);
+	if (!sansChanged && !lifetimeTooLong && !needsRenewal) return false;
+
 	await issueServerCert();
-	logger.info("TLS certificate updated on startup: SANs changed (CA preserved)");
+	const reasons: string[] = [];
+	if (sansChanged) reasons.push("SANs changed");
+	if (lifetimeTooLong) reasons.push("lifetime exceeds Apple's 825-day cap");
+	if (needsRenewal) reasons.push("remaining life is under 30 days");
+	logger.info(`TLS certificate updated on startup: ${reasons.join("; ")} (CA preserved)`);
 	return true;
 }
 
