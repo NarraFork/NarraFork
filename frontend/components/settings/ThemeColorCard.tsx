@@ -63,27 +63,53 @@ function NeutralSwatch({
 	const canvas = preview.ink["ink-950"];
 	const pane = preview.ink["ink-900"];
 	const rule = preview.ink["ink-700"];
+	const text = preview.ink["ink-100"];
+	const muted = preview.ink["ink-300"];
+
 	return (
 		<UnstyledButton
 			onClick={onSelect}
 			disabled={disabled}
 			aria-pressed={selected}
+			title={`${label} · ${canvas} / ${pane}`}
 			style={{ opacity: disabled ? 0.45 : 1 }}
 		>
 			<Stack gap={4} align="center">
+				{/*
+				 * A flat two-tone chip reads as "a black square": canvas and panel differ by
+				 * 1.1–1.2:1, which is invisible at thumbnail size. Showing a miniature window —
+				 * panel inset on the canvas, with a text bar and a muted bar inside — is what
+				 * makes the hierarchy (and the tint) legible before you commit to it.
+				 */}
 				<Box
 					style={{
-						width: 56,
-						height: 38,
+						width: 72,
+						height: 52,
 						borderRadius: 6,
-						overflow: "hidden",
 						background: canvas,
-						border: `1px solid ${selected ? preview.accent[6] : rule}`,
+						border: `1px solid ${rule}`,
 						outline: selected ? `2px solid ${preview.accent[6]}` : undefined,
 						outlineOffset: 1,
+						padding: 5,
 					}}
 				>
-					<Box style={{ height: "50%", background: pane, borderBottom: `1px solid ${rule}` }} />
+					<Box
+						style={{
+							width: "100%",
+							height: "100%",
+							borderRadius: 4,
+							background: pane,
+							border: `1px solid ${rule}`,
+							padding: 5,
+							display: "flex",
+							flexDirection: "column",
+							gap: 4,
+							justifyContent: "center",
+						}}
+					>
+						<Box style={{ height: 4, width: "70%", borderRadius: 2, background: text }} />
+						<Box style={{ height: 3, width: "90%", borderRadius: 2, background: muted }} />
+					</Box>
 				</Box>
 				<Text size="xs" c={selected ? undefined : "dimmed"}>
 					{label}

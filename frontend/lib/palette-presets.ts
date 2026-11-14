@@ -116,27 +116,27 @@ export function oklchToHex(L: number, C: number, H: number): string {
 
 /** Steps measured from the current palette (`styles/tokens.css`), kept in OKLCH. */
 const INK_STEPS: ReadonlyArray<{ token: string; L: number; C: number }> = [
-	{ token: "ink-950", L: 0.163, C: 0.0136 },
-	{ token: "ink-900", L: 0.231, C: 0.0185 },
-	{ token: "ink-850", L: 0.269, C: 0.0178 },
-	{ token: "ink-800", L: 0.317, C: 0.0265 },
-	{ token: "ink-700", L: 0.371, C: 0.0275 },
-	{ token: "ink-600", L: 0.544, C: 0.037 },
-	{ token: "ink-300", L: 0.662, C: 0.0287 },
-	{ token: "ink-200", L: 0.803, C: 0.0229 },
-	{ token: "ink-100", L: 0.939, C: 0.0116 },
+	{ token: "ink-950", L: 0.179, C: 0.0041 },
+	{ token: "ink-900", L: 0.252, C: 0.0058 },
+	{ token: "ink-850", L: 0.283, C: 0.007 },
+	{ token: "ink-800", L: 0.312, C: 0.0083 },
+	{ token: "ink-700", L: 0.347, C: 0.0103 },
+	{ token: "ink-600", L: 0.563, C: 0.0196 },
+	{ token: "ink-300", L: 0.769, C: 0.0096 },
+	{ token: "ink-200", L: 0.826, C: 0.009 },
+	{ token: "ink-100", L: 0.949, C: 0.0029 },
 ];
 
 const PAPER_STEPS: ReadonlyArray<{ token: string; L: number; C: number }> = [
-	{ token: "paper-50", L: 0.976, C: 0.0029 },
-	{ token: "paper-0", L: 1.0, C: 0.0 },
-	{ token: "paper-100", L: 0.957, C: 0.0063 },
-	{ token: "paper-200", L: 0.936, C: 0.0104 },
-	{ token: "paper-300", L: 0.899, C: 0.0151 },
-	{ token: "paper-500", L: 0.631, C: 0.0333 },
-	{ token: "paper-600", L: 0.515, C: 0.0282 },
-	{ token: "paper-700", L: 0.407, C: 0.0294 },
-	{ token: "paper-900", L: 0.209, C: 0.019 },
+	{ token: "paper-50", L: 0.956, C: 0.004 },
+	{ token: "paper-0", L: 0.991, C: 0.0013 },
+	{ token: "paper-100", L: 0.932, C: 0.0054 },
+	{ token: "paper-200", L: 0.91, C: 0.0068 },
+	{ token: "paper-300", L: 0.887, C: 0.0095 },
+	{ token: "paper-500", L: 0.559, C: 0.0195 },
+	{ token: "paper-600", L: 0.502, C: 0.0136 },
+	{ token: "paper-700", L: 0.371, C: 0.0147 },
+	{ token: "paper-900", L: 0.241, C: 0.0097 },
 ];
 
 /** Mantine's own indigo ramp in OKLCH — the proven accent shape, re-hueable. */
@@ -246,12 +246,19 @@ function buildLadder(
 	hue: number,
 	chromaScale: number,
 	rules: ReadonlyArray<ContrastRule>,
+	chromaFloor: number,
 ): Record<string, string> {
 	const colors = new Map<string, string>();
 	const tones = new Map<string, { C: number; H: number }>();
 	const worked = steps.map((s) => ({ ...s }));
 	for (const step of worked) {
-		const C = step.C * chromaScale;
+		/*
+		 * The default ladder is nearly neutral (C ≈ 0.004 on the canvas), so multiplying it
+		 * by a preset's strength alone produces differences nobody can see — the swatches all
+		 * read as black. The floor gives each preset a visible tint without touching the
+		 * lightness ladder (contrast is still guaranteed by the rules below).
+		 */
+		const C = Math.max(step.C, chromaFloor) * chromaScale;
 		tones.set(step.token, { C, H: hue });
 		colors.set(step.token, oklchToHex(step.L, C, hue));
 	}
@@ -483,13 +490,24 @@ export function resolvePalette(choice: PaletteChoice): ResolvedPalette {
 		ink = { ...DEFAULT_INK };
 		paper = { ...DEFAULT_PAPER };
 	} else if (choice.neutral === "custom" && isHex(choice.neutralCustom)) {
-		const { H } = hexToOklch(choice.neutralCustom);
-		ink = buildLadder(INK_STEPS, H, CUSTOM_CHROMA, INK_RULES);
-		paper = buildLadder(PAPER_STEPS, H, CUSTOM_CHROMA, PAPER_RULES);
+		const picked = hexToOklch(choice.neutralCustom);
+		// A grey pick has no meaningful hue (H is numerical noise), so it must stay neutral
+		// instead of picking up a tint from the chroma floor.
+		const strength = picked.C < 0.002 ? 0 : CUSTOM_CHROMA;
+		ink = buildLadder(INK_STEPS, picked.H, strength, INK_RULES, 0.012);
+		paper = buildLadder(PAPER_STEPS, picked.H, strength, PAPER_RULES, 0.006);
 	} else {
 		const preset = NEUTRAL_PRESETS.find((p) => p.id === choice.neutral) ?? NEUTRAL_PRESETS[0];
-		ink = buildLadder(INK_STEPS, preset.hue, preset.chroma, INK_RULES);
-		paper = buildLadder(PAPER_STEPS, preset.hue, preset.chroma, PAPER_RULES);
+		if (preset.literal) {
+			// Hand-tuned palettes (GitHub, Catppuccin, the old default) are used verbatim:
+			// generating them from hue/chroma would reproduce an approximation instead of
+			// the design system the user picked.
+			ink = { ...preset.literal.ink };
+			paper = { ...preset.literal.paper };
+		} else {
+			ink = buildLadder(INK_STEPS, preset.hue, preset.chroma, INK_RULES, 0.012);
+			paper = buildLadder(PAPER_STEPS, preset.hue, preset.chroma, PAPER_RULES, 0.006);
+		}
 	}
 
 	// Two rungs below the canvas, used only by Mantine's filled variants (`dark.8/9`).

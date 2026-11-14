@@ -72,6 +72,44 @@ describe("palette presets", () => {
 		}
 	});
 
+	test("hand-tuned presets are used verbatim, not regenerated", () => {
+		// Regression: the literal branch was once missing, so GitHub/Catppuccin/classic were
+		// silently regenerated from their hue and came out as three identical near-blacks.
+		expect(resolvePalette({ ...DEFAULT_PALETTE, neutral: "classic" }).ink["ink-950"]).toBe(
+			"#0b0e14",
+		);
+		expect(resolvePalette({ ...DEFAULT_PALETTE, neutral: "github" }).ink["ink-950"]).toBe(
+			"#0a0d12",
+		);
+		expect(resolvePalette({ ...DEFAULT_PALETTE, neutral: "catppuccin" }).ink["ink-950"]).toBe(
+			"#0a0a12",
+		);
+	});
+
+	test("presets carry a visible tint in the expected direction", () => {
+		const canvas = (id: Parameters<typeof resolvePalette>[0]["neutral"]) =>
+			hexToOklch(resolvePalette({ ...DEFAULT_PALETTE, neutral: id }).ink["ink-950"]);
+		// Grey preset: no chroma at all.
+		expect(canvas("graphite").C).toBeLessThan(0.002);
+		// Warm presets sit around hue ~70°, cool ones around ~250–280°.
+		expect(canvas("warm").H).toBeGreaterThan(40);
+		expect(canvas("warm").H).toBeLessThan(120);
+		expect(canvas("tokyo").H).toBeGreaterThan(240);
+		expect(canvas("tokyo").H).toBeLessThan(300);
+		// ...and the tint has to be strong enough to see, not merely non-zero.
+		expect(canvas("tokyo").C).toBeGreaterThan(0.008);
+		expect(canvas("forest").C).toBeGreaterThan(0.008);
+	});
+
+	test("a grey custom pick stays neutral", () => {
+		const grey = resolvePalette({
+			...DEFAULT_PALETTE,
+			neutral: "custom",
+			neutralCustom: "#808080",
+		});
+		expect(hexToOklch(grey.ink["ink-950"]).C).toBeLessThan(0.002);
+	});
+
 	test("custom neutral takes the hue but not the user's brightness", () => {
 		// A near-black and a near-white pick must both produce the same surface luminance
 		// ladder, otherwise picking a colour would also silently change the contrast design.
