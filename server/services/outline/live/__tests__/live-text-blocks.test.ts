@@ -694,7 +694,10 @@ describe("one undo stack over the blocks", () => {
 		await waitFor(() => a.ready && b.ready, 3000, "joined");
 		await settle();
 		const made = a.newId();
-		const k = keyBetween(a.visible.get(first)?.orderKey ?? null, a.visible.get(second)?.orderKey);
+		const k = keyBetween(
+			a.visible.get(first)?.orderKey ?? null,
+			a.visible.get(second)?.orderKey ?? null,
+		);
 		struct(a, [{ t: "i", id: made, p: pageId, k, content: "" }]);
 		type(a, made, "new");
 		await settle();
@@ -953,7 +956,7 @@ describe("the log and its replay", () => {
 				t: "i",
 				id: made,
 				p: pageId,
-				k: keyBetween(a.visible.get(empty)?.orderKey, null),
+				k: keyBetween(a.visible.get(empty)?.orderKey ?? null, null),
 				content: "made",
 			},
 		]);
@@ -1008,7 +1011,7 @@ describe("the log and its replay", () => {
 					t: "i",
 					id: made,
 					p: pageId,
-					k: keyBetween(a.visible.get(block)?.orderKey, null),
+					k: keyBetween(a.visible.get(block)?.orderKey ?? null, null),
 					content: " here",
 				},
 			],
