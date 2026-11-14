@@ -365,7 +365,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 === Source 19 ===
 Module: github.com/pion/webrtc/v4
-Version: v4.2.23
+Version: v4.2.26
 Upstream: https://github.com/pion/webrtc
 Source file: LICENSE
 License / notice: MIT
@@ -450,7 +450,7 @@ Verbatim text: see Source 19 (byte-identical original, including attribution).
 
 === Source 24 ===
 Module: github.com/pion/dtls/v3
-Version: v3.1.10
+Version: v3.1.15
 Upstream: https://github.com/pion/dtls
 Source file: LICENSE
 License / notice: MIT
@@ -459,7 +459,7 @@ Verbatim text: see Source 19 (byte-identical original, including attribution).
 
 === Source 25 ===
 Module: github.com/pion/ice/v4
-Version: v4.4.7
+Version: v4.4.8
 Upstream: https://github.com/pion/ice
 Source file: LICENSE
 License / notice: MIT
@@ -468,7 +468,7 @@ Verbatim text: see Source 19 (byte-identical original, including attribution).
 
 === Source 26 ===
 Module: github.com/pion/interceptor
-Version: v0.1.49
+Version: v0.1.51
 Upstream: https://github.com/pion/interceptor
 Source file: LICENSE
 License / notice: MIT
@@ -541,7 +541,7 @@ SOFTWARE.
 
 === Source 29 ===
 Module: github.com/pion/rtcp
-Version: v1.2.19
+Version: v1.2.20
 Upstream: https://github.com/pion/rtcp
 Source file: LICENSE
 License / notice: MIT
@@ -550,7 +550,7 @@ Verbatim text: see Source 19 (byte-identical original, including attribution).
 
 === Source 30 ===
 Module: github.com/pion/rtp
-Version: v1.10.5
+Version: v1.10.6
 Upstream: https://github.com/pion/rtp
 Source file: LICENSE
 License / notice: MIT
@@ -619,7 +619,7 @@ Source SHA-256: a432957d21745499063512eb345d76bac3fbdeeeba8c8480e0001c9d5755b2b0
 
 === Source 36 ===
 Module: github.com/pion/transport/v5
-Version: v5.1.1
+Version: v5.1.4
 Upstream: https://github.com/pion/transport
 Source file: LICENSE
 License / notice: MIT AND BSD-3-Clause
@@ -628,7 +628,7 @@ Verbatim text: see Source 19 (byte-identical original, including attribution).
 
 === Source 37 ===
 Module: github.com/pion/transport/v5
-Version: v5.1.1
+Version: v5.1.4
 Upstream: https://github.com/pion/transport
 Source file: utils/xor/xor_generic.go:1-4 (verbatim source notice)
 License / notice: BSD-3-Clause; full Go license reproduced in the Go standard-library section
@@ -643,7 +643,7 @@ Source SHA-256: 4f6e5aeb3c8aa598c5e6cfe8a4bee06ab1b7f866a419acaa452f9555a104eefc
 
 === Source 38 ===
 Module: github.com/pion/turn/v5
-Version: v5.1.2
+Version: v5.1.3
 Upstream: https://github.com/pion/turn
 Source file: LICENSE
 License / notice: MIT
