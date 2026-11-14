@@ -34,6 +34,7 @@ describe("platform credential files", () => {
 	test.each([
 		["settings.json", "the JWT signing secret"],
 		["codex-credentials.json", "provider credentials"],
+		["search-provider-secrets.json", "sensitive search request headers"],
 		["update-server.json", "the release upload token"],
 		["update-server-test.json", "the test upload token"],
 	])("refuses %s (%s)", (name) => {

@@ -10,12 +10,15 @@ const testHome = mkdtempSync(join(tmpdir(), "narrafork-portability-keys-"));
 process.env.NARRAFORK_HOME = testHome;
 
 const { sqlite } = await import("../../db");
-const { saveSettings, settings } = await import("../../lib/settings");
+const { reloadSettings, saveSettings, settings } = await import("../../lib/settings");
 const { getProviderKeyStore } = await import("../../lib/provider-keys");
 const { applyImport, clearData, exportData, getPreview, previewImport } = await import(
 	"../data-portability"
 );
-const { quotaKeyOwner } = await import("../../lib/settings/provider-keys-projection");
+const { nugKeyOwner, nugOAuthKeyOwner, quotaKeyOwner } = await import(
+	"../../lib/settings/provider-keys-projection"
+);
+const { sealProviderKeys, SEALED_KEYS_ENTRY } = await import("../data-portability-keys");
 const archiver = (await import("archiver")).default;
 
 afterAll(() => {
@@ -47,13 +50,14 @@ const apiProvider = (
 	defaultModel: "",
 	...(quotaAccessToken ? { quotaAccessToken } : {}),
 });
-const nug = (id: string, prefix: string, apiKey: string) => ({
+const nug = (id: string, prefix: string, apiKey: string, oauthClientSecret?: string) => ({
 	id,
 	name: prefix,
 	prefix,
 	apiKey,
 	baseUrl: "http://nug.example",
 	defaultModel: "kiro:claude-opus-4.6",
+	...(oauthClientSecret ? { oauthClientSecret } : {}),
 });
 
 function toArrayBuffer(buffer: Buffer): ArrayBuffer {
@@ -93,7 +97,7 @@ async function exportFromSource(): Promise<Buffer> {
 		customApiProviders: [
 			apiProvider("relay-id", "relay", "sk-first", "https://relay.example/v1", "site-relay-secret"),
 		],
-		nugProviders: [nug("nug-id", "gw", "nug-secret")],
+		nugProviders: [nug("nug-id", "gw", "nug-secret", "oauth-secret")],
 		tokendance: "td-secret",
 	});
 	const store = getProviderKeyStore();
@@ -104,8 +108,19 @@ async function exportFromSource(): Promise<Buffer> {
 }
 
 /** A real version-1 archive from before sealed credentials and site-token projection. */
-async function legacyExport(providers: ReturnType<typeof apiProvider>[]): Promise<Buffer> {
+async function legacyExport(
+	providers: ReturnType<typeof apiProvider>[],
+	nugProviders: ReturnType<typeof nug>[] = [],
+	version = 1,
+): Promise<Buffer> {
 	const path = join(testHome, "legacy-providers.zip");
+	const sealed =
+		version === 2
+			? await sealProviderKeys(
+					new Map(nugProviders.map((p) => [nugKeyOwner(p.id), [{ apiKey: p.apiKey }]])),
+					PASSPHRASE,
+				)
+			: undefined;
 	await new Promise<void>((resolve, reject) => {
 		const output = createWriteStream(path);
 		const archive = archiver("zip");
@@ -113,8 +128,15 @@ async function legacyExport(providers: ReturnType<typeof apiProvider>[]): Promis
 		output.on("error", reject);
 		archive.on("error", reject);
 		archive.pipe(output);
-		archive.append(JSON.stringify({ version: 1 }), { name: "manifest.json" });
-		archive.append(JSON.stringify({ customApiProviders: providers }), { name: "providers.json" });
+		archive.append(JSON.stringify({ version }), { name: "manifest.json" });
+		archive.append(
+			JSON.stringify({
+				customApiProviders: providers,
+				nugProviders: nugProviders.map((p) => ({ ...p, apiKey: sealed ? "" : p.apiKey })),
+			}),
+			{ name: "providers.json" },
+		);
+		if (sealed) archive.append(sealed, { name: SEALED_KEYS_ENTRY });
 		void archive.finalize();
 	});
 	return readFile(path);
@@ -125,6 +147,81 @@ beforeEach(() => {
 });
 
 describe("provider keys in a data export", () => {
+	test("old v1/v2 archives with inline NUG OAuth secrets remain importable", async () => {
+		for (const version of [1, 2]) {
+			setProviders({});
+			const zip = await legacyExport(
+				[],
+				[nug("legacy-nug", "legacygw", "legacy-nug-api", "legacy-oauth")],
+				version,
+			);
+			const preview = await previewImport(toArrayBuffer(zip), "legacy-nug.zip");
+			await applyImport(preview.token, {
+				conflictDefault: "skip",
+				...(version === 2 ? { passphrase: PASSPHRASE } : {}),
+			});
+			expect(settings.nugProviders?.[0]?.apiKey).toBe("legacy-nug-api");
+			expect(settings.nugProviders?.[0]?.oauthClientSecret).toBe("legacy-oauth");
+			expect(getProviderKeyStore().firstKey(nugOAuthKeyOwner("legacy-nug"))).toBe("legacy-oauth");
+		}
+	});
+
+	test("NUG OAuth secrets follow ID/prefix remaps but never overwrite skipped local providers", async () => {
+		const zip = await exportFromSource();
+		for (const apiKey of ["nug-secret", "local-nug-key"]) {
+			setProviders({ nugProviders: [nug("nug-id", "gw", apiKey, "oauth-local")] });
+			const preview = await previewImport(toArrayBuffer(zip), "remapped-nug.zip");
+			await applyImport(preview.token, { conflictDefault: "skip", passphrase: PASSPHRASE });
+			const local = settings.nugProviders?.find((p) => p.id === "nug-id");
+			expect(local?.oauthClientSecret).toBe("oauth-local");
+			expect(getProviderKeyStore().firstKey(nugOAuthKeyOwner("nug-id"))).toBe("oauth-local");
+			const imported = settings.nugProviders?.find((p) => p.prefix === "gw-2");
+			if (apiKey === "nug-secret") {
+				expect(imported).toBeUndefined();
+			} else {
+				if (!imported) throw new Error("Expected the remapped NUG provider");
+				expect(imported.id).not.toBe("nug-id");
+				expect(imported.oauthClientSecret).toBe("oauth-secret");
+				expect(getProviderKeyStore().firstKey(nugOAuthKeyOwner(imported.id))).toBe("oauth-secret");
+			}
+		}
+	});
+
+	test("clearing model providers removes NUG OAuth owners without touching surviving search secrets", async () => {
+		const savedSearch = structuredClone(settings.search);
+		try {
+			for (const target of ["providers", "all"] as const) {
+				setProviders({ nugProviders: [nug("clear-nug", "cleargw", "clear-api", "clear-oauth")] });
+				saveSettings({
+					...settings,
+					search: {
+						channels: [],
+						...settings.search,
+						customProviders: [
+							{
+								id: "keep-search",
+								name: "Keep",
+								protocol: "tavily",
+								baseUrl: "https://search.example",
+								apiKey: "search-keep-key",
+								headers: { Authorization: "search-keep-secret" },
+							},
+						],
+					},
+				});
+				await clearData(target);
+				expect(getProviderKeyStore().list(nugOAuthKeyOwner("clear-nug"))).toEqual([]);
+				expect(settings.nugProviders).toEqual([]);
+				expect(reloadSettings().search?.customProviders[0].headers).toEqual({
+					Authorization: "search-keep-secret",
+				});
+				expect(settings.search?.customProviders[0].apiKey).toBe("search-keep-key");
+			}
+		} finally {
+			saveSettings({ ...settings, search: savedSearch });
+		}
+	});
+
 	test("providers.json carries no key; the archive is version 2 with sealed keys", async () => {
 		const zip = await exportFromSource();
 		const preview = await previewImport(toArrayBuffer(zip), "keys.zip");
@@ -135,6 +232,7 @@ describe("provider keys in a data export", () => {
 			"sk-second",
 			"sk-third",
 			"nug-secret",
+			"oauth-secret",
 			"td-secret",
 			"site-relay-secret",
 		]) {
@@ -143,7 +241,10 @@ describe("provider keys in a data export", () => {
 			expect(stored.sealedKeys ?? "").not.toContain(secret);
 		}
 		expect(stored.version).toBe(2);
-		expect(stored.sealedKeyCount).toBe(4);
+		expect(stored.sealedKeyCount).toBe(5);
+		expect((stored.providers.nugProviders as Array<Record<string, unknown>>)[0]).not.toHaveProperty(
+			"oauthClientSecret",
+		);
 		expect(
 			(stored.providers.customApiProviders as Array<Record<string, unknown>>)[0],
 		).not.toHaveProperty("quotaAccessToken");
@@ -160,11 +261,13 @@ describe("provider keys in a data export", () => {
 					"site-unsealed-secret",
 				),
 			],
+			nugProviders: [nug("plain-nug", "plainnug", "nug-unsealed", "oauth-unsealed")],
 		});
 		const zip = await readFile((await exportData(providersOnly)).zipPath);
 		const stored = getPreview((await previewImport(toArrayBuffer(zip), "plain.zip")).token);
 		expect(JSON.stringify(stored.providers)).not.toContain("sk-first");
 		expect(JSON.stringify(stored.providers)).not.toContain("site-unsealed-secret");
+		expect(JSON.stringify(stored.providers)).not.toContain("oauth-unsealed");
 		expect(stored.sealedKeys).toBeUndefined();
 		expect(stored.version).toBe(1);
 		setProviders({});
@@ -172,6 +275,8 @@ describe("provider keys in a data export", () => {
 		const result = await applyImport(preview.token, { conflictDefault: "skip" });
 		expect(settings.customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
 		expect(getProviderKeyStore().list(quotaKeyOwner("relay-id"))).toEqual([]);
+		expect(settings.nugProviders?.[0]).not.toHaveProperty("oauthClientSecret");
+		expect(getProviderKeyStore().list(nugOAuthKeyOwner("plain-nug"))).toEqual([]);
 		expect(result.keysImported).toBe(0);
 	});
 
@@ -196,7 +301,11 @@ describe("provider keys in a data export", () => {
 		]);
 		expect(settings.nugProviders?.find((p) => p.prefix === "gw")?.apiKey).toBe("nug-secret");
 		expect(settings.tokendance?.apiKey).toBe("td-secret");
-		expect(result.keysImported).toBe(6);
+		expect(settings.nugProviders?.find((p) => p.prefix === "gw")?.oauthClientSecret).toBe(
+			"oauth-secret",
+		);
+		expect(keysOf(nugOAuthKeyOwner("nug-id")).map((key) => key.apiKey)).toEqual(["oauth-secret"]);
+		expect(result.keysImported).toBe(7);
 		expect(result.keysFailed).toBe(0);
 	});
 
