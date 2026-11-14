@@ -327,13 +327,18 @@ function checkPlans(parent: string = wide): void {
 		],
 		[
 			SQLITE_CHANGED_CHILDREN_OPEN,
-			[SPACE, parent, asOf, lastSeq, "", "", 51],
+			[SPACE, parent, asOf, lastSeq, "", "", 51, lastSeq],
 			/SEARCH e USING INDEX idx_outline_edges_open \(parent_key=\? AND \(order_key,block_id\)>\(\?,\?\)\)/,
 		],
 		[
+			SQLITE_CHANGED_CHILDREN_OPEN,
+			[SPACE, parent, asOf, lastSeq, "", "", 51, lastSeq],
+			/SEARCH e USING COVERING INDEX idx_outline_edges_closed \(parent_key=\? AND to_seq>\?\)/,
+		],
+		[
 			SQLITE_CHANGED_CHILDREN_CLOSED,
-			[SPACE, parent, asOf, lastSeq, asOf, Number.MAX_SAFE_INTEGER, 51, "", ""],
-			/SEARCH e USING COVERING INDEX idx_outline_edges_closed \(parent_key=\? AND \(to_seq,from_seq,order_key,block_id\)>\(\?,\?,\?,\?\)\)/,
+			[SPACE, parent, asOf, lastSeq, asOf, Number.MAX_SAFE_INTEGER, 51, "", "", lastSeq],
+			/SEARCH e USING COVERING INDEX idx_outline_edges_closed \(parent_key=\? AND \(to_seq,from_seq,order_key,block_id\)>\(\?,\?,\?,\?\)/,
 		],
 		[
 			SQLITE_BACKFILL_SCAN,

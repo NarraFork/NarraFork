@@ -41,6 +41,8 @@ import {
 	type OutlineVersionRow,
 } from "../../../../server/services/outline/store/port";
 import {
+	pgChangedChildrenLeft,
+	pgChangedChildrenThere,
 	pgLevelAsOf,
 	pgLevelNow,
 	pgMarkAncestorsSql,
@@ -346,6 +348,13 @@ describe("PostgreSQL outline store", () => {
 						};
 						const store = createPostgresOutlineStore(client.db);
 						const twenty = Array.from({ length: 20 }, (_, i) => `top${i + 1}`);
+						const changedRange = {
+							spaceId: "plan-space",
+							parentKey: "top7",
+							after: 3,
+							upTo: 5,
+							pin: 5,
+						};
 						const level = await store.listLevel("plan-space", "top7", { asOf: 3, limit: 50 });
 						const subtree = await store.listSubtreeAt("plan-space", "top7", {
 							asOf: 3,
@@ -389,6 +398,14 @@ describe("PostgreSQL outline store", () => {
 							level: await planOf(pgLevelAsOf("plan-space", ["top7"], 3, null, 51)),
 							levels: await planOf(pgLevelAsOf("plan-space", twenty, 3, null, 801)),
 							now: await planOf(pgLevelNow("plan-space", twenty, null, 801)),
+							changedThere: await planOf(pgChangedChildrenThere(changedRange, null, 201)),
+							changedLeft: await planOf(
+								pgChangedChildrenLeft(
+									changedRange,
+									{ toSeq: 3, fromSeq: 2147483647, orderKey: "", blockId: "" },
+									201,
+								),
+							),
 							marks: await planOf(pgMarkAncestorsSql(["kid1", "kid2", "kid3"], 7, 4001)),
 							subtreeNow: (
 								await store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 })
@@ -425,6 +442,23 @@ describe("PostgreSQL outline store", () => {
 			for (const node of nowBlocks) {
 				expect(node["Node Type"]).toMatch(/^Index (Only )?Scan$/);
 				expect(node["Index Name"]).toBe("idx_outline_blocks_children");
+			}
+			// Changed children: each part through its by-parent index, in the index's order (no
+			// sort of everything the parent held), the placements never scanned whole.
+			for (const [nodes, index] of [
+				[outcome.changedThere, "idx_outline_edges_open"],
+				[outcome.changedThere, "idx_outline_edges_closed"],
+				[outcome.changedLeft, "idx_outline_edges_closed"],
+			] as const) {
+				const placements = nodes.filter((n) => n["Relation Name"] === "outline_block_edges");
+				expect(placements.length).toBeGreaterThan(0);
+				for (const node of placements) expect(node["Node Type"]).not.toBe("Seq Scan");
+				expect(nodes.map((n) => n["Index Name"])).toContain(index);
+				expect(
+					nodes
+						.map((n) => n["Index Name"])
+						.filter((name) => name === "outline_block_edges_parent_key_block_id_from_seq_pk"),
+				).toEqual([]);
 			}
 			for (const nodes of [outcome.level, outcome.levels]) {
 				const on = (relation: string) => nodes.filter((n) => n["Relation Name"] === relation);
@@ -472,6 +506,8 @@ interface PlanOutcome {
 	level: PlanNode[];
 	levels: PlanNode[];
 	now: PlanNode[];
+	changedThere: PlanNode[];
+	changedLeft: PlanNode[];
 	marks: PlanNode[];
 	subtreeNow: number;
 	levelRows: number;

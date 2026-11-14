@@ -658,6 +658,21 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 				cursor = batch.nextSid;
 			}
 			expect(await ctx.store.finishEdgeBackfill(space.id)).toBeNull();
+			// Commits that landed during the conversion left marks at or below the floor; a
+			// timeline starts above it.
+			expect(after.marks.some((m) => m.ancestorId === ids[0] && m.seq <= floor)).toBe(true);
+			expect(
+				await ctx.store.listSubtreeChangeSeqs(space.id, ids[0] as string, { limit: 100 }),
+			).toEqual([]);
+			const under = await write(ctx, space, [
+				{ op: "insert", parent: { id: ids[0] as string }, content: "under the root, later" },
+			]);
+			expect(
+				await ctx.store.listSubtreeChangeSeqs(space.id, ids[0] as string, { limit: 100 }),
+			).toEqual([under.commit?.seq as number]);
+			expect(
+				await ctx.store.listSubtreeChangeSeqs(space.id, ids[0] as string, { after: 0, limit: 100 }),
+			).toEqual([under.commit?.seq as number]);
 			await write(ctx, space, [{ op: "insert", parent: null, content: "after the conversion" }]);
 			const later = await ctx.dump(space.id);
 			expect(later.history.floorSeq).toBe(floor);
@@ -670,7 +685,7 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 				sorted(await treeByLevels(ctx, space.id, null, 5)),
 			);
 			const levelsAtFloor = await treeByLevels(ctx, space.id, floor, 5);
-			expect(levelsAtFloor.size).toBe(later.blocks.filter((b) => !b.deleted).length - 1);
+			expect(levelsAtFloor.size).toBe(later.blocks.filter((b) => !b.deleted).length - 2);
 
 			// A space that is waiting is listed (by id, paged) until it is done.
 			const waiting = await personalSpace(ctx);
@@ -736,6 +751,94 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 				backup: "/somewhere/outline-before-pageless.db",
 			});
 			expect(checkPlacements(await ctx.dump(waiting.id))).toBe("from-floor");
+		},
+	},
+	{
+		name: "compare: commits landing between pages neither repeat a changed child nor drop one",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const made = await write(ctx, space, [
+				{ op: "insert", tempId: "p", parent: null, content: "parent" },
+				...Array.from({ length: 12 }, (_, i) => ({
+					op: "insert" as const,
+					parent: { tempId: "p" },
+					content: `child ${i}`,
+				})),
+				// Two that had left before the range starts mattering to the first part.
+				{ op: "insert", tempId: "gone", parent: { tempId: "p" }, content: "leaves early" },
+			]);
+			const [p, ...rest] = made.results.map((r) => r.blockId) as [string, ...string[]];
+			const kids = rest.slice(0, 12);
+			const gone = rest[12] as string;
+			await write(
+				ctx,
+				space,
+				kids.map((id, i) => ({
+					op: "update" as const,
+					block: { id },
+					content: `child ${i}, edited`,
+				})),
+			);
+			await write(ctx, space, [{ op: "delete", block: { id: gone } }]);
+			const range = { after: 1, upTo: 3 };
+			const want = [...kids, gone].sort();
+
+			const first = await ctx.store.listChangedChildren(space.id, p, { ...range, limit: 5 });
+			expect(first.rows).toHaveLength(5);
+			expect(first.next).not.toBeNull();
+			const seen = first.rows.map((r) => r.blockId);
+			const unseen = kids.filter((id) => !seen.includes(id));
+			// Meanwhile: a child already returned leaves, two not yet returned leave (moved,
+			// deleted), one is reordered, and a new one arrives.
+			await write(ctx, space, [
+				{ op: "move", block: { id: seen[0] as string }, parent: null },
+				{ op: "move", block: { id: unseen[0] as string }, parent: null },
+			]);
+			await write(ctx, space, [
+				{ op: "delete", block: { id: unseen[1] as string } },
+				{
+					op: "move",
+					block: { id: unseen[2] as string },
+					parent: { id: p },
+					position: { first: true },
+				},
+				{ op: "insert", parent: { id: p }, content: "arrived after the first page" },
+			]);
+			const rows = [...first.rows];
+			let cursor = first.next;
+			for (let guard = 0; cursor !== null; guard++) {
+				expect(guard).toBeLessThan(20);
+				const page = await ctx.store.listChangedChildren(space.id, p, {
+					...range,
+					cursor,
+					limit: 2,
+				});
+				rows.push(...page.rows);
+				cursor = page.next;
+			}
+			// Each placement once, every child of the range, nothing that came after the first page.
+			const keys = rows.map((r) => `${r.blockId}:${r.fromSeq}`);
+			expect(new Set(keys).size).toBe(keys.length);
+			expect(rows.map((r) => r.blockId).sort()).toEqual(want);
+			// A read started now, of the same range, finds the same children.
+			const again: string[] = [];
+			let next: OutlineChangedChildCursor | null = null;
+			do {
+				const page = await ctx.store.listChangedChildren(space.id, p, {
+					...range,
+					cursor: next,
+					limit: 4,
+				});
+				again.push(...page.rows.map((r) => r.blockId));
+				next = page.next;
+			} while (next !== null);
+			expect(again.sort()).toEqual(want);
+			// A page of nothing is not a page.
+			for (const limit of [0, -1, 0.5]) {
+				await expect(
+					ctx.store.listChangedChildren(space.id, p, { ...range, limit }),
+				).rejects.toThrow(RangeError);
+			}
 		},
 	},
 	{

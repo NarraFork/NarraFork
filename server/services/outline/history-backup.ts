@@ -18,19 +18,25 @@
  * ---------------------
  * Not a file's name. A copy found in the directory is used only if it validates
  * ({@link readOutlineBackup}: it opens, holds `outline_blocks` and a stamp of a format this code
- * knows, and its stamp agrees with itself), was made from THIS database file, and, for every
- * space the caller is about to convert, stands at that space's seq now (so nothing written since
- * is missing from it). Anything else is treated as absent, left where it is, and a new copy
- * is written under a name of its own. {@link backupOutlineTablesFresh} skips the search and
- * always writes a new one: for a caller about to delete what the copy holds.
+ * knows, and its stamp agrees with itself), was made from THIS database file, and holds every
+ * space the caller is about to convert at a seq no later than that space's now: a copy of this
+ * database's own past. That is enough for a conversion that deletes nothing (what was written
+ * since is still in the database), and it means a conversion resumed after more commits does
+ * not write a second full copy. Of several such copies the one stamped latest is used.
+ * Anything else is treated as absent, left where it is, and a new copy is written under a name
+ * of its own. {@link backupOutlineTablesFresh} skips the search and always writes a new one:
+ * for a caller about to delete what the copy holds, which needs it current.
  *
  * Nothing here deletes or rewrites the database, and nothing removes a copy once made, valid or
  * not: how long it is kept is the owner's decision. Only this module's own `.partial` files
- * (left by a copy that was interrupted) are removed. Before copying, the free space of the
- * directory is compared with the size of the database (more than the copy can need).
+ * (left by a copy that was interrupted) are removed. A copy is not started into a directory
+ * with less than {@link OUTLINE_BACKUP_MIN_FREE_BYTES} free; beyond that floor the copy itself
+ * is the test (the outline's tables may be a small part of a large database, so the database's
+ * size says nothing): when the disk fills, the process fails, the partial file is removed and
+ * the caller tries again later.
  */
 import { Database } from "bun:sqlite";
-import { mkdir, readdir, rename, rm, stat, statfs } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, statfs } from "node:fs/promises";
 import { join } from "node:path";
 import { sqlite } from "@server/db";
 import { buildSnapshotInSubprocess } from "@server/db/snapshot-build";
@@ -46,6 +52,8 @@ const SUFFIX = ".db";
 const PARTIAL = ".partial";
 /** A large outline is copied row by row in another process: allow it half an hour. */
 const COPY_TIMEOUT_MS = 30 * 60_000;
+/** Free space below which no copy is started. */
+export const OUTLINE_BACKUP_MIN_FREE_BYTES = 64 * 1024 * 1024;
 /** Spaces looked up in a copy between two yields to the event loop. */
 const CHECK_CHUNK = 500;
 
@@ -69,7 +77,7 @@ export interface OutlineBackupResult {
 	stamp: OutlineBackupStamp;
 }
 
-/** The directory has less free space than the database is large: no copy was attempted. */
+/** The directory has too little free space to start a copy: none was attempted. */
 export class OutlineBackupSpaceError extends Error {
 	constructor(
 		readonly directory: string,
@@ -77,7 +85,7 @@ export class OutlineBackupSpaceError extends Error {
 		readonly freeBytes: number,
 	) {
 		super(
-			`not enough free space in ${directory} to copy the outline's tables: ${freeBytes} bytes free, the database is ${neededBytes} bytes`,
+			`not enough free space in ${directory} to copy the outline's tables: ${freeBytes} bytes free, at least ${neededBytes} wanted`,
 		);
 		this.name = "OutlineBackupSpaceError";
 	}
@@ -128,8 +136,8 @@ export function readOutlineBackup(path: string): OutlineBackupStamp | null {
 }
 
 /**
- * Whether a validated copy is of `sourcePath` and holds every space of `expect` at the seq
- * given (its `next_seq` then equals the space's now): nothing of those spaces is newer than it.
+ * Whether a validated copy is of `sourcePath` and holds every space of `expect` at a seq no
+ * later than the one given (the space's now): a copy of this database as it was.
  */
 async function covers(
 	path: string,
@@ -145,7 +153,7 @@ async function covers(
 		let checked = 0;
 		for (const [spaceId, nextSeq] of expect) {
 			const row = lookup.values(spaceId)[0] as [number] | undefined;
-			if (!row || Number(row[0]) !== nextSeq) return false;
+			if (!row || Number(row[0]) > nextSeq) return false;
 			if (++checked % CHECK_CHUNK === 0) await yieldToEventLoop();
 		}
 		return true;
@@ -168,11 +176,13 @@ async function namesIn(directory: string): Promise<string[]> {
 	}
 }
 
-async function sizeOf(path: string): Promise<number> {
+async function freeBytesOf(directory: string): Promise<number | null> {
 	try {
-		return (await stat(path)).size;
+		const fs = await statfs(directory);
+		return Number(fs.bavail) * Number(fs.bsize);
 	} catch {
-		return 0;
+		// A file system that does not say: the copy itself will tell.
+		return null;
 	}
 }
 
@@ -182,8 +192,9 @@ async function sizeOf(path: string): Promise<number> {
  * resolve with the validated copy.
  *
  * Unless `fresh`, a copy already in the directory is returned instead when it validates, was
- * made from `sourcePath`, and holds every space of `expect` at the seq given there (see the
- * module header); `expect` left out accepts any valid copy of this database.
+ * made from `sourcePath`, and holds every space of `expect` at a seq no later than the one
+ * given there (see the module header); `expect` left out accepts any valid copy of this
+ * database. Of several, the one stamped latest.
  *
  * Rejects, having left no file with a final name, when there is not enough free space
  * ({@link OutlineBackupSpaceError}), the copy could not be made, or it does not validate.
@@ -197,6 +208,8 @@ export async function backupOutlineTables(options: {
 	fresh?: boolean;
 	now?: Date;
 	signal?: AbortSignal;
+	/** Free bytes of a directory, null when unknown (tests inject it). */
+	freeBytes?: (directory: string) => Promise<number | null>;
 }): Promise<OutlineBackupResult> {
 	const { sourcePath, directory } = options;
 	await mkdir(directory, { recursive: true });
@@ -208,34 +221,28 @@ export async function backupOutlineTables(options: {
 	}
 	const finished = names.filter((n) => ours(n) && n.endsWith(SUFFIX)).sort();
 	if (!options.fresh) {
-		// Newest first: the one most likely to be current.
-		for (const name of [...finished].reverse()) {
+		const usable: OutlineBackupResult[] = [];
+		for (const name of finished) {
 			const path = join(directory, name);
 			const stamp = readOutlineBackup(path);
 			if (!stamp) {
 				logger.warn(
 					"Outline backup: a file with a copy's name is not a finished copy; left as is",
-					{
-						path,
-					},
+					{ path },
 				);
 				continue;
 			}
 			if (await covers(path, stamp, sourcePath, options.expect ?? new Map()))
-				return { path, created: false, stamp };
+				usable.push({ path, created: false, stamp });
 		}
+		// The latest by its own stamp (names say nothing: `-2` sorts before `.db`).
+		usable.sort((a, b) => (a.stamp.createdAt < b.stamp.createdAt ? 1 : -1));
+		if (usable[0]) return usable[0];
 	}
 
-	// More than the copy can need: the outline's tables are part of the database.
-	const needed = (await sizeOf(sourcePath)) + (await sizeOf(`${sourcePath}-wal`));
-	let free: number | null = null;
-	try {
-		const fs = await statfs(directory);
-		free = Number(fs.bavail) * Number(fs.bsize);
-	} catch {
-		// A file system that does not say: the copy itself will tell.
-	}
-	if (free !== null && free < needed) throw new OutlineBackupSpaceError(directory, needed, free);
+	const free = await (options.freeBytes ?? freeBytesOf)(directory);
+	if (free !== null && free < OUTLINE_BACKUP_MIN_FREE_BYTES)
+		throw new OutlineBackupSpaceError(directory, OUTLINE_BACKUP_MIN_FREE_BYTES, free);
 
 	const date = (options.now ?? new Date()).toISOString().slice(0, 10);
 	let name = `${PREFIX}${date}${SUFFIX}`;
@@ -266,13 +273,15 @@ export async function backupOutlineTables(options: {
 
 /**
  * A new, validated copy whatever copies exist: for a caller about to delete what it holds (the
- * final conversion). An existing copy is neither reused nor touched.
+ * final conversion), which needs the copy to be of the database as it is now. An existing copy
+ * is neither reused nor touched.
  */
 export function backupOutlineTablesFresh(options: {
 	sourcePath: string;
 	directory: string;
 	now?: Date;
 	signal?: AbortSignal;
+	freeBytes?: (directory: string) => Promise<number | null>;
 }): Promise<OutlineBackupResult> {
 	return backupOutlineTables({ ...options, fresh: true });
 }
@@ -281,7 +290,7 @@ export function backupOutlineTablesFresh(options: {
  * The backup step of the conversion for a store, or null when the store has no database file of
  * ours to copy: PostgreSQL is backed up by whoever operates it, and an in-memory SQLite
  * database (tests) has nothing to keep. The step asks for a copy that holds every space still
- * to be converted as it stands now.
+ * to be converted (as it stands now, or as it stood: see the module header).
  */
 export function outlineBackupFor(
 	store: OutlineStore,

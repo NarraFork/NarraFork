@@ -104,7 +104,7 @@ function parentList(keys: readonly string[]): SQL {
 	return sql`(SELECT * FROM (VALUES ${sql.join(
 		keys.map((key, i) => sql`(${text(key)}, ${int(i)})`),
 		sql`, `,
-	)}) given(key, ord) OFFSET 0)`;
+	)}) given(key, ord) ORDER BY ord OFFSET 0)`;
 }
 
 /** One parent key the planner cannot look at; see {@link parentList}. */
@@ -152,7 +152,7 @@ export function pgLevelAsOf(
 				) u
 				ORDER BY u.order_key COLLATE "C", u.id COLLATE "C" LIMIT ${int(limit)}
 			) e
-			LIMIT ${int(limit)}
+			ORDER BY p.ord, e.order_key COLLATE "C", e.id COLLATE "C" LIMIT ${int(limit)}
 		) s
 		JOIN LATERAL (
 			SELECT y.sid FROM outline_blocks y
@@ -193,7 +193,7 @@ export function pgLevelNow(
 			? sql`SELECT e.*, 0 AS ord FROM (${page(sql`c.parent_id IS NULL`)}) e`
 			: sql`SELECT e.*, p.ord FROM ${parentList(parentIds)} p(key, ord)
 				CROSS JOIN LATERAL (${page(sql`c.parent_id = p.key`)}) e
-				LIMIT ${int(limit)}`;
+				ORDER BY p.ord, e.order_key COLLATE "C", e.id COLLATE "C" LIMIT ${int(limit)}`;
 	return sql`
 		SELECT b.id, b.sid, b.parent_id, b.order_key, b.alias, b.task_json, b.version_seq,
 			b.ask_json, k.yes IS NOT NULL AS has_children
@@ -203,6 +203,77 @@ export function pgLevelNow(
 			WHERE c.space_id = ${text(spaceId)} AND c.parent_id = b.id AND NOT c.deleted LIMIT 1
 		) k ON true
 		${LEVEL_ORDER(sql`b`)}`;
+}
+
+interface ChangedRange {
+	spaceId: string;
+	parentKey: string;
+	after: number;
+	/** At most `pin`. */
+	upTo: number;
+	/** The space's latest seq when the read's first page was read. */
+	pin: number;
+}
+
+function changedParts(range: ChangedRange) {
+	const { spaceId, parentKey, after, upTo } = range;
+	return {
+		self: sql`EXISTS (SELECT 1 FROM outline_block_versions v WHERE v.block_id = c.block_id
+			AND v.from_seq > ${int(after)} AND v.from_seq <= ${int(upTo)})`,
+		below: sql`EXISTS (SELECT 1 FROM outline_subtree_changes t
+			WHERE t.ancestor_id = c.block_id AND t.seq > ${int(after)} AND t.seq <= ${int(upTo)})`,
+		inSpace: sql`(${text(parentKey)} = ${text(spaceId)} OR EXISTS (
+			SELECT 1 FROM outline_blocks p
+			WHERE p.id = ${text(parentKey)} AND p.space_id = ${text(spaceId)}))`,
+	};
+}
+
+/**
+ * The changed children that were under the parent at the read's pin, after `from`, at most
+ * `limit`: those still there and those that have left since the pin, merged. Each part in its
+ * index's own order (the columns' collation), so a page stops at its limit; the cursor never
+ * leaves this backend.
+ */
+export function pgChangedChildrenThere(
+	range: ChangedRange,
+	from: { orderKey: string; blockId: string } | null,
+	limit: number,
+): SQL {
+	const { self, below, inSpace } = changedParts(range);
+	const part = (source: SQL): SQL => sql`(
+		SELECT c.block_id, c.from_seq, c.to_seq, c.order_key, ${self} AS self, ${below} AS below
+		FROM ${source}
+			${from ? sql`AND (c.order_key, c.block_id) > (${text(from.orderKey)}, ${text(from.blockId)})` : sql``}
+			AND ${inSpace}
+			AND (c.from_seq > ${int(range.after)} OR ${self} OR ${below})
+		ORDER BY c.order_key, c.block_id LIMIT ${int(limit)})`;
+	return sql`
+		SELECT u.block_id, u.from_seq, u.to_seq, u.order_key, u.self, u.below FROM (
+			${part(openUnder(unseen(range.parentKey), range.upTo))}
+			UNION ALL
+			${part(closedUnder(unseen(range.parentKey), range.pin, range.upTo))}
+		) u
+		ORDER BY u.order_key, u.block_id LIMIT ${int(limit)}`;
+}
+
+/** The changed children that left the parent in `(after, pin]`, by when, after `from`. */
+export function pgChangedChildrenLeft(
+	range: ChangedRange,
+	from: { toSeq: number; fromSeq: number; orderKey: string; blockId: string },
+	limit: number,
+): SQL {
+	const { self, below, inSpace } = changedParts(range);
+	return sql`
+		SELECT c.block_id, c.from_seq, c.to_seq, c.order_key, ${self} AS self, ${below} AS below
+		FROM outline_block_edges c
+		WHERE c.parent_key = ${unseen(range.parentKey)} AND c.to_seq IS NOT NULL
+			AND (c.to_seq, c.from_seq, c.order_key, c.block_id) > (${int(from.toSeq)},
+				CAST(${Math.min(from.fromSeq, 2147483647)} AS integer), ${text(from.orderKey)},
+				${text(from.blockId)})
+			AND c.to_seq <= ${int(range.pin)} AND c.from_seq <= ${int(range.upTo)} AND ${inSpace}
+			AND (c.from_seq > ${int(range.after)} OR c.to_seq <= ${int(range.upTo)}
+				OR ${self} OR ${below})
+		ORDER BY c.to_seq, c.from_seq, c.order_key, c.block_id LIMIT ${int(limit)}`;
 }
 
 /**
@@ -284,17 +355,22 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 	 * Whether the space can answer a read that looks back to `seq` (null: only needs its
 	 * placements); throws when it cannot, false when there is no such space.
 	 */
-	const readable = async (spaceId: string, seq: number | null): Promise<boolean> => {
-		const [row] = await rowsOf<{ history_floor_seq: number | string; edges_ready: boolean }>(sql`
-			SELECT history_floor_seq, edges_ready FROM outline_spaces WHERE id = ${text(spaceId)}
+	const readable = async (
+		spaceId: string,
+		seq: number | null,
+	): Promise<{ floorSeq: number; latestSeq: number } | null> => {
+		const [row] = await rowsOf<{
+			history_floor_seq: number | string;
+			edges_ready: boolean;
+			next_seq: number | string;
+		}>(sql`
+			SELECT history_floor_seq, edges_ready, next_seq FROM outline_spaces
+			WHERE id = ${text(spaceId)}
 		`);
-		if (!row) return false;
-		assertHistoryReadable(
-			spaceId,
-			{ floorSeq: Number(row.history_floor_seq), edgesReady: row.edges_ready === true },
-			seq,
-		);
-		return true;
+		if (!row) return null;
+		const floorSeq = Number(row.history_floor_seq);
+		assertHistoryReadable(spaceId, { floorSeq, edgesReady: row.edges_ready === true }, seq);
+		return { floorSeq, latestSeq: Number(row.next_seq) - 1 };
 	};
 
 	/**
@@ -421,15 +497,9 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 		},
 
 		async listChangedChildren(spaceId, parentId, { after, upTo, cursor, limit }) {
-			if (!(await readable(spaceId, after)) || upTo <= after) return { rows: [], next: null };
+			const state = await readable(spaceId, after);
+			if (!state || upTo <= after) return { rows: [], next: null };
 			const parentKey = parentId ?? spaceId;
-			const self = sql`EXISTS (SELECT 1 FROM outline_block_versions v WHERE v.block_id = c.block_id
-				AND v.from_seq > ${int(after)} AND v.from_seq <= ${int(upTo)})`;
-			const below = sql`EXISTS (SELECT 1 FROM outline_subtree_changes t
-				WHERE t.ancestor_id = c.block_id AND t.seq > ${int(after)} AND t.seq <= ${int(upTo)})`;
-			const inSpace = sql`(${text(parentKey)} = ${text(spaceId)} OR EXISTS (
-				SELECT 1 FROM outline_blocks p
-				WHERE p.id = ${text(parentKey)} AND p.space_id = ${text(spaceId)}))`;
 			const read = async (statement: SQL): Promise<OutlineChangedChildRow[]> =>
 				(
 					await rowsOf<{
@@ -448,45 +518,30 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 					self: row.self === true,
 					below: row.below === true,
 				}));
-			// Each part in its index's own order (the columns' collation), so a page stops at its
-			// limit; the cursor never leaves this backend.
+			const range = (pin: number): ChangedRange => ({
+				spaceId,
+				parentKey,
+				after,
+				upTo: Math.min(upTo, pin),
+				pin,
+			});
 			return pageChangedChildren(
-				(from, room) =>
-					read(sql`
-						SELECT c.block_id, c.from_seq, c.to_seq, c.order_key, ${self} AS self,
-							${below} AS below
-						FROM ${openUnder(unseen(parentKey), upTo)}
-							${from ? sql`AND (c.order_key, c.block_id) > (${text(from.orderKey)}, ${text(from.blockId)})` : sql``}
-							AND ${inSpace}
-							AND (c.from_seq > ${int(after)} OR ${self} OR ${below})
-						ORDER BY c.order_key, c.block_id LIMIT ${int(room)}
-					`),
-				(from, room) =>
-					read(sql`
-						SELECT c.block_id, c.from_seq, c.to_seq, c.order_key, ${self} AS self,
-							${below} AS below
-						FROM outline_block_edges c
-						WHERE c.parent_key = ${unseen(parentKey)} AND c.to_seq IS NOT NULL
-							AND (c.to_seq, c.from_seq, c.order_key, c.block_id) > (${int(from.toSeq)},
-								CAST(${Math.min(from.fromSeq, 2147483647)} AS integer), ${text(from.orderKey)},
-								${text(from.blockId)})
-							AND c.from_seq <= ${int(upTo)} AND ${inSpace}
-							AND (c.from_seq > ${int(after)} OR c.to_seq <= ${int(upTo)} OR ${self} OR ${below})
-						ORDER BY c.to_seq, c.from_seq, c.order_key, c.block_id LIMIT ${int(room)}
-					`),
-				{ after, cursor, limit },
+				(pin, from, room) => read(pgChangedChildrenThere(range(pin), from, room)),
+				(pin, from, room) => read(pgChangedChildrenLeft(range(pin), from, room)),
+				{ after, latestSeq: state.latestSeq, cursor, limit },
 			);
 		},
 
 		async listSubtreeChangeSeqs(spaceId, blockId, { before, after, limit }) {
-			if (!(await readable(spaceId, null))) return [];
+			const state = await readable(spaceId, null);
+			if (!state) return [];
 			const rows = await rowsOf<{ seq: number | string }>(sql`
 				SELECT seq FROM outline_subtree_changes
 				WHERE ancestor_id = ${text(blockId)}
 					AND EXISTS (SELECT 1 FROM outline_blocks p
 						WHERE p.id = ${text(blockId)} AND p.space_id = ${text(spaceId)})
 					${before === null || before === undefined ? sql`` : sql`AND seq < ${int(before)}`}
-					AND seq > ${int(after ?? -1)}
+					AND seq > ${int(Math.max(after ?? -1, state.floorSeq))}
 				ORDER BY seq DESC LIMIT ${int(Math.max(0, Math.floor(limit)))}
 			`);
 			return rows.map((row) => Number(row.seq));

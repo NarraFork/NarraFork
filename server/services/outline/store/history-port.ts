@@ -49,6 +49,11 @@
  * each), and SQLite lists every child of every row it returns. One bounded read per level
  * costs what it returns on both.
  *
+ * FOR THE CALLER OF A SUBTREE AS OF A SEQ (H2): keep such a read on the main thread at 800
+ * rows or fewer. Measured on SQLite, 100,000 blocks: 800 rows 8 to 14 ms; 2,000 rows 27 to 39 ms
+ * at p50 and 40 to 53 ms at p95 (each row costs its block, its version and two child probes).
+ * A larger one belongs on the read workers.
+ *
  * This file imports nothing dialect-specific.
  */
 import type { OutlineSpaceRow } from "./port";
@@ -111,15 +116,19 @@ export interface OutlineChangedChildRow extends OutlineSubtreeChange {
 }
 
 /**
- * Where a changed-children read continues. The read goes through the children still there
- * (`open`, in sibling order) and then through those that left (by when they left), each in the
- * order of its index, so a page costs what it looks at and not the whole level. The values are
- * the last row's; the order within a part is the backend's own, so a cursor goes back only to
- * the backend that made it.
+ * Where a changed-children read continues. A read is of the space as it stood when its first
+ * page was read (`pin`, the space's latest seq then), so commits that land between pages
+ * neither repeat a child nor drop one. It goes through the children that were there at `pin`
+ * (`open`, in sibling order), then through those that had left by then (by when they left),
+ * each in the order of its index, so a page costs what it looks at and not the whole level.
+ * The other values are the last row's; the order within a part is the backend's own, so a
+ * cursor goes back only to the backend that made it.
  */
 export interface OutlineChangedChildCursor {
+	/** The space's latest seq when the first page was read. */
+	pin: number;
 	open: boolean;
-	/** Of the last row when it had left; otherwise where the second part starts. */
+	/** Of the last row of the second part; otherwise where that part starts. */
 	toSeq: number;
 	fromSeq: number;
 	orderKey: string;
@@ -230,11 +239,14 @@ export interface OutlineHistoryPort {
 	): Promise<OutlineSubtreeChange[]>;
 	/**
 	 * The children one parent (`null`: the space's top level) had during `(after, upTo]` that
-	 * differ between its two ends, after `cursor`, at most `limit`, in no order a caller should
-	 * rely on; `next` is where the following read continues. Comparing two seqs walks down with it: only a child
-	 * with `below` set needs its own level read. Looks at the parent's children that are there
-	 * now and at those that left after `after`, with two index probes each. Refused like
-	 * {@link findSubtreeChanges}.
+	 * differ between its two ends, after `cursor`, at most `limit` (at least 1), in no order a
+	 * caller should rely on; `next` is where the following read continues. Comparing two seqs
+	 * walks down with it: only a child with `below` set needs its own level read. All pages of
+	 * one read see the space as it stood at the first (the cursor carries that seq): a commit
+	 * landing between pages neither repeats a placement nor drops one, and what it adds is not
+	 * part of the read (`upTo` beyond that seq counts as that seq). Looks at the parent's
+	 * children that were there then and at those that left after `after`, with two index probes
+	 * each. Refused like {@link findSubtreeChanges}.
 	 */
 	listChangedChildren(
 		spaceId: string,
@@ -249,9 +261,10 @@ export interface OutlineHistoryPort {
 	/**
 	 * Seqs of the commits that changed anything that was under a block of the space, newest
 	 * first, in `after < seq < before`, at most `limit`: the block's timeline, together with its
-	 * own versions (`listBlockHistory`). One range read on the marks' primary key. There are no
-	 * marks at or below the space's floor, so the list simply ends there. Refused when the space
-	 * is not ready; a block of another space has none.
+	 * own versions (`listBlockHistory`). One range read on the marks' primary key. Only seqs
+	 * above the space's floor are returned (commits that landed while the space was being
+	 * converted left marks at or below it, and nothing below the floor is history): the list
+	 * ends there. Refused when the space is not ready; a block of another space has none.
 	 */
 	listSubtreeChangeSeqs(
 		spaceId: string,
@@ -312,59 +325,85 @@ export async function readSubtreeByLevels(
 }
 
 /** Before every child that left after `after`: where the second part of a read starts. */
-function closedStart(after: number): OutlineChangedChildCursor {
-	return { open: false, toSeq: after, fromSeq: Number.MAX_SAFE_INTEGER, orderKey: "", blockId: "" };
+function closedStart(pin: number, after: number): OutlineChangedChildCursor {
+	return {
+		pin,
+		open: false,
+		toSeq: after,
+		fromSeq: Number.MAX_SAFE_INTEGER,
+		orderKey: "",
+		blockId: "",
+	};
 }
 
 /**
- * One page of changed children, for both backends: `readOpen` and `readClosed` return the
- * differing children after a cursor, in their index's order, at most `limit`.
+ * One page of changed children, for both backends. `readOpen` returns the differing children
+ * that were under the parent at `pin` (whether or not they have left since), `readClosed` those
+ * that left in `(after, pin]`; each after a cursor, in an order of its own, at most `limit`.
+ * `latestSeq` is the space's latest seq now: a first page pins the read to it.
  */
 export async function pageChangedChildren(
 	readOpen: (
+		pin: number,
 		after: OutlineChangedChildCursor | null,
 		limit: number,
 	) => Promise<OutlineChangedChildRow[]>,
 	readClosed: (
+		pin: number,
 		after: OutlineChangedChildCursor,
 		limit: number,
 	) => Promise<OutlineChangedChildRow[]>,
-	options: { after: number; cursor?: OutlineChangedChildCursor | null; limit: number },
+	options: {
+		after: number;
+		latestSeq: number;
+		cursor?: OutlineChangedChildCursor | null;
+		limit: number;
+	},
 ): Promise<{ rows: OutlineChangedChildRow[]; next: OutlineChangedChildCursor | null }> {
-	const max = Math.max(0, Math.floor(options.limit));
+	const max = Math.floor(options.limit);
+	if (!(max >= 1)) throw new RangeError("listChangedChildren needs a limit of at least 1");
 	const cursor = options.cursor ?? null;
+	const pin = cursor?.pin ?? options.latestSeq;
 	const rows: OutlineChangedChildRow[] = [];
+	let fromOpen = 0;
 	let openDone = cursor !== null && !cursor.open;
 	if (!openDone) {
-		const found = await readOpen(cursor, max + 1);
-		for (const row of found) rows.push(row);
-		openDone = found.length <= max;
-	}
-	if (openDone && rows.length <= max) {
-		const from = cursor !== null && !cursor.open ? cursor : closedStart(options.after);
-		for (const row of await readClosed(from, max - rows.length + 1)) rows.push(row);
-	}
-	if (rows.length <= max) return { rows, next: null };
-	const kept = rows.slice(0, max);
-	const last = kept.at(-1);
-	if (!last) return { rows: kept, next: cursor };
-	const next: OutlineChangedChildCursor =
-		last.toSeq !== null
-			? {
-					open: false,
-					toSeq: last.toSeq,
+		const found = await readOpen(pin, cursor, max + 1);
+		if (found.length > max) {
+			const kept = found.slice(0, max);
+			const last = kept[max - 1] as OutlineChangedChildRow;
+			return {
+				rows: kept,
+				next: {
+					pin,
+					open: true,
+					toSeq: 0,
 					fromSeq: last.fromSeq,
 					orderKey: last.orderKey,
 					blockId: last.blockId,
-				}
-			: openDone
-				? closedStart(options.after)
-				: {
-						open: true,
-						toSeq: 0,
-						fromSeq: last.fromSeq,
-						orderKey: last.orderKey,
-						blockId: last.blockId,
-					};
-	return { rows: kept, next };
+				},
+			};
+		}
+		for (const row of found) rows.push(row);
+		fromOpen = found.length;
+		openDone = true;
+	}
+	const from = cursor !== null && !cursor.open ? cursor : closedStart(pin, options.after);
+	for (const row of await readClosed(pin, from, max - rows.length + 1)) rows.push(row);
+	if (rows.length <= max) return { rows, next: null };
+	const kept = rows.slice(0, max);
+	const last = kept[max - 1] as OutlineChangedChildRow;
+	// The page ends with the first part's last row: the second part starts at its beginning.
+	if (max <= fromOpen) return { rows: kept, next: closedStart(pin, options.after) };
+	return {
+		rows: kept,
+		next: {
+			pin,
+			open: false,
+			toSeq: last.toSeq as number,
+			fromSeq: last.fromSeq,
+			orderKey: last.orderKey,
+			blockId: last.blockId,
+		},
+	};
 }

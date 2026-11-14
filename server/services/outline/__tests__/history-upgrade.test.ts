@@ -22,6 +22,8 @@ import { closeSnapshotBuilds } from "../../../db/snapshot-build";
 import {
 	backupOutlineTables,
 	backupOutlineTablesFresh,
+	OUTLINE_BACKUP_MIN_FREE_BYTES,
+	OutlineBackupSpaceError,
 	readOutlineBackup,
 } from "../history-backup";
 import { convertOutlineHistory } from "../history-convert";
@@ -540,16 +542,39 @@ describe("outline pageless upgrade (golden)", () => {
 			now: today,
 		});
 		expect(again).toMatchObject({ path: first.path, created: false });
-		// A space has moved on since (or is not in it): the copy is stale for it, a new one is made.
-		const moved = new Map(seqs).set("space-a", (seqs.get("space-a") as number) + 1);
+		// The spaces have moved on since (a conversion resumed after more commits, four times):
+		// the copy is of this database's past, which is enough; no second copy is written.
+		const listing = (await readdir(directory)).sort();
+		const moved = new Map(seqs);
+		for (let resume = 1; resume <= 4; resume++) {
+			moved.set("space-a", (seqs.get("space-a") as number) + resume);
+			moved.set("space-b", (seqs.get("space-b") as number) + 2 * resume);
+			const resumed = await backupOutlineTables({
+				sourcePath: dbPath,
+				directory,
+				expect: moved,
+				now: today,
+			});
+			expect(resumed).toMatchObject({ path: first.path, created: false });
+		}
+		expect((await readdir(directory)).sort()).toEqual(listing);
+		// A copy that is ahead of the database, or lacks a space asked for, is not its past.
+		const behind = new Map(seqs).set("space-a", (seqs.get("space-a") as number) - 1);
 		const newer = await backupOutlineTables({
 			sourcePath: dbPath,
 			directory,
-			expect: moved,
+			expect: behind,
 			now: today,
 		});
 		expect(newer.created).toBe(true);
 		expect(newer.path).toBe(join(directory, "outline-before-pageless-2026-11-14-3.db"));
+		const unknown = await backupOutlineTables({
+			sourcePath: dbPath,
+			directory,
+			expect: new Map(seqs).set("space-new", 1),
+			now: today,
+		});
+		expect(unknown.created).toBe(true);
 		// A copy of another database file is not a copy of this one.
 		const elsewhere = join(root, "elsewhere.db");
 		writeFileSync(elsewhere, readFileSync(dbPath));
@@ -565,6 +590,35 @@ describe("outline pageless upgrade (golden)", () => {
 			[...before, fresh.path.slice(directory.length + 1)].sort(),
 		);
 		expect(readOutlineBackup(fresh.path)).toEqual(fresh.stamp);
+		// Of several usable copies the one stamped latest is used, whatever its name sorts as.
+		const chosen = await backupOutlineTables({ sourcePath: dbPath, directory, expect: seqs });
+		expect(chosen).toMatchObject({ path: fresh.path, created: false });
+
+		// Too little room to start: refused before anything is written, and the reason says so.
+		const cramped = join(root, "backups-cramped");
+		let refused: unknown;
+		try {
+			await backupOutlineTables({
+				sourcePath: dbPath,
+				directory: cramped,
+				freeBytes: async () => OUTLINE_BACKUP_MIN_FREE_BYTES - 1,
+			});
+		} catch (error) {
+			refused = error;
+		}
+		expect(refused).toBeInstanceOf(OutlineBackupSpaceError);
+		expect((refused as OutlineBackupSpaceError).freeBytes).toBe(OUTLINE_BACKUP_MIN_FREE_BYTES - 1);
+		expect(await readdir(cramped)).toEqual([]);
+		// The floor is fixed: a database far larger than the free space is not a reason to
+		// refuse (its outline may be small), and an unknown free space is not one either.
+		for (const free of [OUTLINE_BACKUP_MIN_FREE_BYTES, null]) {
+			const made = await backupOutlineTablesFresh({
+				sourcePath: dbPath,
+				directory: cramped,
+				freeBytes: async () => free,
+			});
+			expect(made.created).toBe(true);
+		}
 
 		// Stopped while it is being made: no file with a final name, no partial left.
 		const stopped = join(root, "backups-stopped");

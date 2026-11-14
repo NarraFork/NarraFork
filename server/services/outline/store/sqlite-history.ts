@@ -155,34 +155,43 @@ export const SQLITE_SUBTREE_CHANGE = `SELECT ${SELF_CHANGED("?1", "?2", "?3")},
 	${BELOW_CHANGED("?1", "?2", "?3")} WHERE ${IN_SPACE("?1", "?4")}`;
 
 const CHANGED_COLUMNS = `e.block_id, e.from_seq, e.to_seq, e.order_key,
-		${SELF_CHANGED("e.block_id", "?3", "?4")}, ${BELOW_CHANGED("e.block_id", "?3", "?4")}`;
+		${SELF_CHANGED("e.block_id", "?3", "?4")} AS self,
+		${BELOW_CHANGED("e.block_id", "?3", "?4")} AS below`;
 const CHANGED = `${SELF_CHANGED("e.block_id", "?3", "?4")}
 			OR ${BELOW_CHANGED("e.block_id", "?3", "?4")}`;
 /** A parent that is not the space `?1` itself must be a block of it. */
 const PARENT_IN_SPACE = `(?2 = ?1 OR ${IN_SPACE("?2", "?1")})`;
 
-/**
- * The children still under the parent key `?2` that differ between the ends of `(?3, ?4]`
- * (they arrived in it, changed, or something under them did), in sibling order after the
- * cursor `(?5, ?6)`, at most `?7`. One statement, no subquery: it reads the open placements in
- * their index's order and stops at the limit.
- */
-export const SQLITE_CHANGED_CHILDREN_OPEN = `SELECT ${CHANGED_COLUMNS}
-	FROM ${OPEN("?2", "?4")}
-		AND (e.order_key, e.block_id) > (?5, ?6) AND ${PARENT_IN_SPACE}
-		AND (e.from_seq > ?3 OR ${CHANGED})
-	ORDER BY e.order_key, e.block_id LIMIT ?7`;
+const CHANGED_THERE = (source: string) =>
+	`SELECT * FROM (SELECT ${CHANGED_COLUMNS} FROM ${source}
+			AND (e.order_key, e.block_id) > (?5, ?6) AND ${PARENT_IN_SPACE}
+			AND (e.from_seq > ?3 OR ${CHANGED})
+		ORDER BY e.order_key, e.block_id LIMIT ?7)`;
 
 /**
- * The children that left the parent key `?2` after `?3` and were there by `?4`, in the order
- * they left, after the cursor `(?5, ?6, ?8, ?9)` (to seq, from seq, order key, block id), at
- * most `?7`. The cursor of a first read is `(?3, the largest integer, '', '')`.
+ * The children that were under the parent key `?2` at the seq `?8` (the read's pin) and differ
+ * between the ends of `(?3, ?4]` (they arrived in it, changed, or something under them did), in
+ * sibling order after the cursor `(?5, ?6)`, at most `?7`; `?4` is at most `?8`. Two reads
+ * merged, as for a level: those still there (in their index's order, stopping at the limit) and
+ * those that have left since the pin (few: what commits closed while the read was paged).
+ */
+export const SQLITE_CHANGED_CHILDREN_OPEN = `SELECT block_id, from_seq, to_seq, order_key, self, below
+	FROM (${CHANGED_THERE(OPEN("?2", "?4"))}
+		UNION ALL
+		${CHANGED_THERE(CLOSED("?2", "?8", "?4"))})
+	ORDER BY order_key, block_id LIMIT ?7`;
+
+/**
+ * The children that left the parent key `?2` in `(?3, ?10]` (`?10`: the read's pin) and were
+ * there by `?4`, in the order they left, after the cursor `(?5, ?6, ?8, ?9)` (to seq, from seq,
+ * order key, block id), at most `?7`. The cursor of a first read is
+ * `(?3, the largest integer, '', '')`.
  */
 export const SQLITE_CHANGED_CHILDREN_CLOSED = `SELECT ${CHANGED_COLUMNS}
 	FROM outline_block_edges e INDEXED BY idx_outline_edges_closed
 	WHERE e.parent_key = ?2 AND e.to_seq IS NOT NULL
 		AND (e.to_seq, e.from_seq, e.order_key, e.block_id) > (?5, ?6, ?8, ?9)
-		AND e.from_seq <= ?4 AND ${PARENT_IN_SPACE}
+		AND e.to_seq <= ?10 AND e.from_seq <= ?4 AND ${PARENT_IN_SPACE}
 		AND (e.from_seq > ?3 OR e.to_seq <= ?4 OR ${CHANGED})
 	ORDER BY e.to_seq, e.from_seq, e.order_key, e.block_id LIMIT ?7`;
 
@@ -285,17 +294,18 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 	 * Whether the space can answer a read that looks back to `seq` (null: only needs its
 	 * placements); throws when it cannot, false when there is no such space.
 	 */
-	const readable = (spaceId: string, seq: number | null): boolean => {
-		const row = values("SELECT history_floor_seq, edges_ready FROM outline_spaces WHERE id = ?1", [
-			spaceId,
-		])[0] as [number, number] | undefined;
-		if (!row) return false;
-		assertHistoryReadable(
-			spaceId,
-			{ floorSeq: Number(row[0]), edgesReady: Number(row[1]) !== 0 },
-			seq,
-		);
-		return true;
+	const readable = (
+		spaceId: string,
+		seq: number | null,
+	): { floorSeq: number; latestSeq: number } | null => {
+		const row = values(
+			"SELECT history_floor_seq, edges_ready, next_seq FROM outline_spaces WHERE id = ?1",
+			[spaceId],
+		)[0] as [number, number, number] | undefined;
+		if (!row) return null;
+		const floorSeq = Number(row[0]);
+		assertHistoryReadable(spaceId, { floorSeq, edgesReady: Number(row[1]) !== 0 }, seq);
+		return { floorSeq, latestSeq: Number(row[2]) - 1 };
 	};
 
 	/** The children of several parents, one seek per parent, at most `limit` rows in all. */
@@ -377,7 +387,8 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 		},
 
 		async listChangedChildren(spaceId, parentId, { after, upTo, cursor, limit }) {
-			if (!readable(spaceId, after) || upTo <= after) return { rows: [], next: null };
+			const state = readable(spaceId, after);
+			if (!state || upTo <= after) return { rows: [], next: null };
 			const parentKey = parentId ?? spaceId;
 			const toRows = (found: unknown[][]): OutlineChangedChildRow[] =>
 				(found as Array<[string, number, number | null, string, number, number]>).map((row) => ({
@@ -389,42 +400,46 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 					below: Number(row[5]) !== 0,
 				}));
 			return pageChangedChildren(
-				async (from, room) =>
+				async (pin, from, room) =>
 					toRows(
 						values(SQLITE_CHANGED_CHILDREN_OPEN, [
 							spaceId,
 							parentKey,
 							after,
-							upTo,
+							Math.min(upTo, pin),
 							from?.orderKey ?? "",
 							from?.blockId ?? "",
 							room,
+							pin,
 						]),
 					),
-				async (from, room) =>
+				async (pin, from, room) =>
 					toRows(
 						values(SQLITE_CHANGED_CHILDREN_CLOSED, [
 							spaceId,
 							parentKey,
 							after,
-							upTo,
+							Math.min(upTo, pin),
 							from.toSeq,
 							from.fromSeq,
 							room,
 							from.orderKey,
 							from.blockId,
+							pin,
 						]),
 					),
-				{ after, cursor, limit },
+				{ after, latestSeq: state.latestSeq, cursor, limit },
 			);
 		},
 
 		async listSubtreeChangeSeqs(spaceId, blockId, { before, after, limit }) {
-			if (!readable(spaceId, null)) return [];
+			const state = readable(spaceId, null);
+			if (!state) return [];
 			const rows = values(SQLITE_SUBTREE_CHANGE_SEQS, [
 				blockId,
 				before ?? Number.MAX_SAFE_INTEGER,
-				after ?? -1,
+				// Nothing at or below the floor is history, whatever marks are there.
+				Math.max(after ?? -1, state.floorSeq),
 				Math.max(0, Math.floor(limit)),
 				spaceId,
 			]) as Array<[number]>;
