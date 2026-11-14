@@ -24,7 +24,6 @@ import "@frontend/styles/tokens.css";
 // scroll container they sit in. Global because every `marks` slider needs it —
 // see the stylesheet header.
 import "@frontend/styles/mantine-slider-marks.css";
-import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
 /*
  * The plain store, NOT `hooks/usePluginThemes`.
  *
@@ -33,6 +32,8 @@ import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
  * updates and has no importer above it, editing any of them would reload the page. See
  * `lib/plugin-theme-pref-store.ts` for the full explanation.
  */
+import { applyInitialPalette } from "@frontend/lib/palette-apply";
+import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
 import { readActivePluginThemeKey } from "@frontend/lib/plugin-theme-pref-store";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
@@ -99,6 +100,12 @@ function applyInitialPluginTheme() {
 async function bootstrap() {
 	const isPublicShare = isPublicNarratorSharePath(window.location.pathname, getRouterBasepath());
 	if (!isPublicShare) applyInitialPluginTheme();
+	/*
+	 * Same reason as the plugin theme above: write the stored palette before the first paint.
+	 * React re-applies it on mount, but by then a full reload would already have flashed the
+	 * default colours.
+	 */
+	if (!isPublicShare) applyInitialPalette();
 	/*
 	 * Session handoff with an editor host that embeds this app (the VS Code extension).
 	 *
