@@ -40,15 +40,69 @@ afterAll(async () => {
 	if (root) await rm(root, { recursive: true, force: true });
 });
 
-type Fault = "none" | "create" | "startup" | "unresponsive";
+type Fault =
+	| "none"
+	| "create"
+	| "startup"
+	| "unresponsive"
+	| "close-after-response"
+	| "close-before-request"
+	| "close-without-result";
 async function run(source: string, fault: Fault = "none", wallMs = 2000) {
 	// Deliberately NOT a Podman isolation test: fixture cgroup files allow the
 	// production broker to run outside a container. Only bootstrap/VM/thread mechanics
 	// are asserted; effective container policy is covered by the opt-in Podman suite.
 	const prefix = `const nativeFile=Bun.file; Bun.file=(path,...args)=>({"/sys/fs/cgroup/memory.max":"268435456","/sys/fs/cgroup/pids.max":"32","/sys/fs/cgroup/cpu.max":"100000 100000"}[path]===undefined ? nativeFile(path,...args) : {text:async()=>({"/sys/fs/cgroup/memory.max":"268435456","/sys/fs/cgroup/pids.max":"32","/sys/fs/cgroup/cpu.max":"100000 100000"}[path])});
-const NativeWorker=globalThis.Worker; globalThis.Worker=class extends NativeWorker { constructor(url,options){ if(${JSON.stringify(fault)}==="create") throw Error("fixture creation failed"); if(${JSON.stringify(fault)}==="startup") url=URL.createObjectURL(new Blob(['throw Error("fixture startup failed")'])); if(${JSON.stringify(fault)}==="unresponsive") url=URL.createObjectURL(new Blob(['self.onmessage=()=>{}'])); super(url,options); this.addEventListener("close",()=>process.stderr.write("fixture-native-exit\\n"),{once:true}); }};\n`;
+let fixtureDeadline;
+if(${JSON.stringify(fault)}==="close-without-result"){
+ const nativeSetTimeout=globalThis.setTimeout;
+ globalThis.setTimeout=(callback,ms,...args)=>{
+  if(ms===${wallMs}) fixtureDeadline=callback;
+  return nativeSetTimeout(callback,ms,...args);
+ };
+}
+const NativeWorker=globalThis.Worker; globalThis.Worker=class extends NativeWorker { constructor(url,options){ if(${JSON.stringify(fault)}==="create") throw Error("fixture creation failed"); if(${JSON.stringify(fault)}==="startup") url=URL.createObjectURL(new Blob(['throw Error("fixture startup failed")'])); if(${JSON.stringify(fault)}==="unresponsive") url=URL.createObjectURL(new Blob(['self.onmessage=()=>{}'])); super(url,options); if(${JSON.stringify(fault)}==="close-without-result") this.addEventListener("message",event=>{if(event.data?.type==="result"){event.stopImmediatePropagation();process.stderr.write("fixture-result-withheld\\n");if(!fixtureDeadline) throw Error("fixture outer deadline was not registered");fixtureDeadline();}}); this.addEventListener("close",()=>process.stderr.write("fixture-native-exit\\n"),{once:true}); }};\n`;
+	// In this test-owned subprocess only, hold the broker at the publication signal
+	// until the real Worker has consumed the final response and closed the mailbox.
+	// This is an event handshake, not a scheduling delay or execution fallback.
+	// The request-read variant returns one pre-close snapshot from isClosed(),
+	// modeling a close between that observation and takeRequest()'s next atomic read.
+	// Documented mailbox ABI: close=2, request signal=6, response state/signal/seq=9/10/11.
+	const coordinatedClose =
+		fault === "close-after-response" || fault === "close-before-request"
+			? `const nativeNotify=Atomics.notify, nativeWait=Atomics.wait, nativeLoad=Atomics.load;
+let finalClosed=false, consumed=false, staleRead=false;
+Atomics.load=(header,slot)=>{
+ const value=nativeLoad(header,slot);
+ if(finalClosed && slot===9 && value===0) consumed=true;
+ if(${JSON.stringify(fault)}==="close-before-request" && consumed && slot===2 && value>0 && !staleRead){
+  staleRead=true;
+  process.stderr.write("fixture-close-before-request\\n");
+  return 0;
+ }
+ return value;
+};
+Atomics.notify=(header,slot,count)=>{
+ const finalResponse=slot===10 && nativeLoad(header,11)===3 && !finalClosed;
+ const notified=nativeNotify(header,slot,count);
+ if(finalResponse){
+  const end=Date.now()+${wallMs};
+  while(nativeLoad(header,2)===0){
+   const signal=nativeLoad(header,6);
+   if(nativeLoad(header,2)!==0) break;
+   const remaining=end-Date.now();
+   if(remaining<=0) throw Error("fixture Worker did not close its mailbox");
+   nativeWait(header,6,signal,remaining);
+  }
+  if(nativeLoad(header,9)!==0) throw Error("fixture final response was not consumed");
+  finalClosed=true;
+  process.stderr.write("fixture-close-after-response\\n");
+ }
+ return notified;
+};\n`
+			: "";
 	const script = join(root, `run-${crypto.randomUUID()}.mjs`);
-	await writeFile(script, prefix + (await Bun.file(bootstrap).text()));
+	await writeFile(script, prefix + coordinatedClose + (await Bun.file(bootstrap).text()));
 	const handle = WorkerHandle.subprocess([process.execPath, script], {
 		cwd,
 		env: { PATH: process.env.PATH, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" },
@@ -124,6 +178,48 @@ describe("minified compiled bootstrap outside the repository", () => {
 		expect(result.result).toMatchObject({ ok: true, value: [[1], [2], [3]] });
 		expect(result.exit).toBe(0);
 		expect(result.stderr).toBe("fixture-native-exit\n");
+	});
+	test("a final response consumed and closed before publication returns still delivers the Worker result", async () => {
+		const result = await run("return [1,2,3].map(n=>catalog.read(n));", "close-after-response");
+		expect(result.ready).toBe(1);
+		expect(result.calls).toBe(3);
+		expect(result.stderr).toBe("fixture-close-after-response\nfixture-native-exit\n");
+		expect(result.result).toMatchObject({ ok: true, value: [[1], [2], [3]] });
+		expect(result.exit).toBe(0);
+	});
+	test("closure between the pump's open check and request read still awaits the real result", async () => {
+		const result = await run("return [1,2,3].map(n=>catalog.read(n));", "close-before-request");
+		expect(result.ready).toBe(1);
+		expect(result.calls).toBe(3);
+		expect(result.stderr).toBe(
+			"fixture-close-after-response\nfixture-close-before-request\nfixture-native-exit\n",
+		);
+		expect(result.result).toMatchObject({ ok: true, value: [[1], [2], [3]] });
+		expect(result.exit).toBe(0);
+	});
+	test("closure during a request read preserves the Worker's structured failure", async () => {
+		const result = await run(
+			'[1,2,3].map(n=>catalog.read(n)); throw new Error("fixture script failed");',
+			"close-before-request",
+		);
+		expect(result.calls).toBe(3);
+		expect(result.stderr).toBe(
+			"fixture-close-after-response\nfixture-close-before-request\nfixture-native-exit\n",
+		);
+		expect(result.result).toMatchObject({
+			ok: false,
+			error: { code: "SCRIPT_ERROR", message: "fixture script failed", fatal: true },
+		});
+		expect(result.exit).toBe(0);
+	});
+	test("a closed mailbox without a Worker result fails at the outer deadline", async () => {
+		// Advance the actual registered outer deadline only after withholding the
+		// real result, so slow startup cannot accidentally satisfy this assertion.
+		const result = await run('return "MUST_NOT_FABRICATE_SUCCESS";', "close-without-result");
+		expect(result.stderr).toBe("fixture-result-withheld\nfixture-native-exit\n");
+		expect(result.result).toMatchObject({ ok: false, error: { code: "DEADLINE", fatal: true } });
+		expect(result.result?.value).toBeUndefined();
+		expect(result.exit).toBe(0);
 	});
 	test("Handle, Worker, host environment, network and code-generation capabilities never enter the VM", async () => {
 		const result = await run(
