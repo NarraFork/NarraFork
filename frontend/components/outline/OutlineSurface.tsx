@@ -88,6 +88,7 @@ import { useNarratorPanelVisible } from "../narrator/narrator-panel-visibility";
 import type { EditSurface } from "./edit-surface";
 import type { BlockMark } from "./editor/chrome";
 import { liveSessionIfReady } from "./editor/live-sessions";
+import { OutdatedNotice } from "./editor/OutdatedNotice";
 import {
 	OutlineEditor,
 	type OutlineFocusInfo,
@@ -647,9 +648,11 @@ function SurfaceBody({
 						{fallback === "tab_limit" && (
 							<TabLimitNotice transport={liveTransport()} onRetry={() => setFallback(null)} />
 						)}
+						{fallback === "outdated" && <OutdatedNotice />}
 						{fallback !== null &&
 							fallback !== "too_large" &&
 							fallback !== "access_denied" &&
+							fallback !== "outdated" &&
 							fallback !== "tab_limit" && (
 								<Alert variant="light" color="gray" py={6} mb="xs">
 									<Group gap="xs" wrap="wrap">

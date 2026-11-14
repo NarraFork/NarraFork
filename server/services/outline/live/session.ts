@@ -59,6 +59,7 @@ import {
 	decodeLiveTexts,
 	encodeLiveFrame,
 	encodeLiveHead,
+	encodeLiveSeed,
 	encodeLiveTexts,
 	isLiveTaskChar,
 	LIVE_FRAME,
@@ -161,6 +162,14 @@ export const OUTLINE_LIVE_BOUNDS = {
 	 * writer could otherwise grow them without bound. Participants rejoin at once.
 	 */
 	maxDocBytes: 16 * 1024 * 1024,
+	/**
+	 * What one text document is charged against {@link maxDocBytes} when it is made, whatever
+	 * its text: a document of a block costs about 4.1 KB of heap here (measured: 2,000 documents
+	 * with their handlers, 1 to 43 characters each), and a client holds one more with an undo
+	 * manager (about 2.9 KB more). So a session holds at most `maxDocBytes / docCostBytes`
+	 * documents (4,096), deleted blocks' included, before it starts afresh.
+	 */
+	docCostBytes: 4096,
 	/** Failed commits of a block as code after which it is no longer retried (until edited). */
 	maxCommitFailures: 3,
 	/** A socket buffering more than this gets no more frames until it drains and rejoins. */
@@ -401,7 +410,7 @@ export class LivePage {
 	private bytesSinceCompact = 0;
 	/** Base64 bytes of the last snapshot row. */
 	private snapshotBytes = 0;
-	/** Bytes of updates the document took in since the session opened (see `maxDocBytes`). */
+	/** Bytes charged since the session opened: updates taken in, documents made (`charge`). */
 	private docBytes = 0;
 	private restartRequested = false;
 	/** Structural transactions whose change is applied but held back from the log. */
@@ -500,26 +509,20 @@ export class LivePage {
 		const seed = this.mirror.get(id)?.dbContent ?? "";
 		const made = seededTextDoc(seed);
 		this.docs.set(id, made);
+		// A document is kept until the session ends, also when its block is deleted: each one
+		// counts against the session's bound.
+		this.charge(OUTLINE_LIVE_BOUNDS.docCostBytes);
 		if (seed.length > 0)
 			this.pendingRows.push({
 				actorKind: "system",
 				actorId: LIVE_LOG_ACTOR,
 				id,
 				kind: LIVE_TEXT_KIND.seed,
-				data: utf8.encode(seed),
+				data: encodeLiveSeed(seed),
 			});
 		made.doc.on("update", (update: Uint8Array, origin: unknown) => {
 			if (this.closed) return;
-			this.docBytes += update.length;
-			if (this.docBytes > OUTLINE_LIVE_BOUNDS.maxDocBytes && !this.restartRequested) {
-				// Everything is committed and the participants rejoin a fresh session.
-				this.restartRequested = true;
-				logger.warn("Outline live documents grew past their bound; restarting the session", {
-					pageId: this.pageId,
-					bytes: this.docBytes,
-				});
-				this.onEnd(this, "ended", false);
-			}
+			this.charge(update.length);
 			const from = origin instanceof Participant ? origin.pno : 0;
 			this.windowUpdates.push({ from, id, kind: LIVE_TEXT_KIND.update, data: update });
 			this.scheduleBroadcast();
@@ -538,6 +541,23 @@ export class LivePage {
 			if (txn.origin instanceof Participant) this.markDirty(id, txn.origin.userId);
 		});
 		return made;
+	}
+
+	/**
+	 * Count bytes against the session's bound ({@link OUTLINE_LIVE_BOUNDS.maxDocBytes}). Past it
+	 * the session ends: everything is committed, the participants rejoin a fresh one, which has
+	 * the page's live blocks as plain text again and no document (none of a deleted block's).
+	 */
+	private charge(bytes: number): void {
+		this.docBytes += bytes;
+		if (this.docBytes <= OUTLINE_LIVE_BOUNDS.maxDocBytes || this.restartRequested) return;
+		this.restartRequested = true;
+		logger.warn("Outline live documents grew past their bound; restarting the session", {
+			pageId: this.pageId,
+			bytes: this.docBytes,
+			documents: this.docs.size,
+		});
+		this.onEnd(this, "ended", false);
 	}
 
 	/** Whether the session holds a text for the block (a document, or the page's block). */
@@ -581,7 +601,7 @@ export class LivePage {
 			out.push({ id, kind: LIVE_TEXT_KIND.update, data: Y.encodeStateAsUpdate(t.doc) });
 		for (const b of this.mirror.all()) {
 			if (b.dbContent.length === 0 || this.docs.has(b.id)) continue;
-			out.push({ id: b.id, kind: LIVE_TEXT_KIND.seed, data: utf8.encode(b.dbContent) });
+			out.push({ id: b.id, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed(b.dbContent) });
 		}
 		return out;
 	}
@@ -599,7 +619,7 @@ export class LivePage {
 			if (at <= op || this.docs.has(id)) continue;
 			const content = this.mirror.get(id)?.dbContent ?? "";
 			if (content.length > 0)
-				out.push({ id, kind: LIVE_TEXT_KIND.seed, data: utf8.encode(content) });
+				out.push({ id, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed(content) });
 		}
 		try {
 			for (const [id, t] of this.docs) {
@@ -1478,8 +1498,10 @@ export class LivePage {
 	}
 
 	/**
-	 * The text entries of a participant's frame: updates only, each of a block the session has
-	 * a text for or (a structural transaction) one the transaction inserts. Null otherwise.
+	 * The text entries of a participant's frame: updates only, one a block, each of a live block,
+	 * of a block that already has a document (typing that crossed its block's deletion), or (a
+	 * structural transaction) of one the transaction inserts or restores. Null otherwise: text
+	 * never makes a document for a block that is gone or that the page never had.
 	 */
 	private parseTexts(body: Uint8Array, inserted?: ReadonlySet<string>): LiveTextEntry[] | null {
 		const entries = decodeLiveTexts(body, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
@@ -1487,7 +1509,7 @@ export class LivePage {
 		const seen = new Set<string>();
 		for (const e of entries) {
 			if (e.kind !== LIVE_TEXT_KIND.update || seen.has(e.id)) return null;
-			if (!this.hasText(e.id) && !inserted?.has(e.id)) return null;
+			if (!this.mirror.alive(e.id) && !this.docs.has(e.id) && !inserted?.has(e.id)) return null;
 			seen.add(e.id);
 		}
 		return entries;
@@ -2207,7 +2229,14 @@ export class LivePage {
 			await this.persistNow();
 			this.scheduleBroadcast();
 		} finally {
+			// Left here only by something unexpected thrown above: the text is taken back, and
+			// the rows held back (a new document's seed among them) still reach the log.
+			for (const u of undos) u.undo();
 			dropUndos();
+			if (held.length > 0) {
+				this.pendingRows = [...held, ...this.pendingRows];
+				this.schedulePersist();
+			}
 			this.holding--;
 		}
 	}
@@ -2500,7 +2529,7 @@ export class LivePage {
 							from: 0,
 							id: v.blockId,
 							kind: LIVE_TEXT_KIND.seed,
-							data: utf8.encode(content),
+							data: encodeLiveSeed(content),
 						});
 						this.scheduleBroadcast();
 					}

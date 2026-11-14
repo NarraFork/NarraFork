@@ -27,8 +27,8 @@
  */
 import { logger } from "@server/lib/logger";
 import { merge3 } from "@shared/outline";
-import { LIVE_TEXT_KIND } from "@shared/outline-live-protocol";
-import { type LiveTextDoc, seededTextDoc } from "@shared/outline-live-text";
+import { decodeLiveSeed, LIVE_TEXT_KIND } from "@shared/outline-live-protocol";
+import { hasPendingStructs, type LiveTextDoc, seededTextDoc } from "@shared/outline-live-text";
 import * as Y from "yjs";
 import { OUTLINE_LIMITS } from "../model";
 import { outlineStore } from "../store";
@@ -141,6 +141,10 @@ export async function replayLiveEpochDetailed(
 	const destroy = () => {
 		for (const t of docs.values()) t.doc.destroy();
 	};
+	/** Blocks whose base is only assumed empty: no seed row for their document was read yet. */
+	const assumed = new Set<string>();
+	/** Updates waiting in a document for items it lacks: the row of the person who made them. */
+	const waiting = new Map<string, OutlineLiveUpdateRow>();
 	let first = true;
 	try {
 		for (const row of rows) {
@@ -156,6 +160,7 @@ export async function replayLiveEpochDetailed(
 				// intents (`i`) written with them: an intent is resolved only by a later row.
 				for (const [id, content] of Object.entries(parsed.b ?? {})) {
 					base.set(id, content);
+					assumed.delete(id);
 					intents.delete(id);
 				}
 				for (const id of parsed.x ?? []) intents.delete(id);
@@ -169,16 +174,32 @@ export async function replayLiveEpochDetailed(
 			if (!entries) throw new Error("not a per-block text row");
 			for (const e of entries) {
 				if (e.kind === LIVE_TEXT_KIND.seed) {
-					if (docs.has(e.id)) continue;
 					// What the database held when the document was made.
-					const seed = decoder.decode(e.data);
-					docOf(e.id, seed);
-					if (!base.has(e.id)) base.set(e.id, seed);
+					const seed = decodeLiveSeed(e.data);
+					if (seed === null) throw new Error("a seed text is not UTF-8");
+					const existing = docs.get(e.id);
+					if (!existing) docOf(e.id, seed);
+					else {
+						// The seed after an update of its document (a session writes it before; a
+						// log is still read whatever order its rows come in): the document takes
+						// the seed's item now, and the updates that waited for it go in, as their
+						// author's.
+						const made = seededTextDoc(seed);
+						Y.applyUpdate(existing.doc, Y.encodeStateAsUpdate(made.doc), waiting.get(e.id) ?? row);
+						made.doc.destroy();
+					}
+					if (!base.has(e.id) || assumed.delete(e.id)) base.set(e.id, seed);
 				} else {
 					// A document the log has no seed for started from the empty text (an empty
 					// block, or one made in the session); in the snapshot it comes whole.
-					if (!first && !docs.has(e.id) && !base.has(e.id)) base.set(e.id, "");
-					Y.applyUpdate(docOf(e.id).doc, e.data, row);
+					if (!first && !docs.has(e.id) && !base.has(e.id)) {
+						base.set(e.id, "");
+						assumed.add(e.id);
+					}
+					const t = docOf(e.id);
+					Y.applyUpdate(t.doc, e.data, row);
+					if (!hasPendingStructs(t.doc)) waiting.delete(e.id);
+					else if (row.actorKind === "human") waiting.set(e.id, row);
 				}
 			}
 			if (first) {
@@ -189,6 +210,18 @@ export async function replayLiveEpochDetailed(
 		}
 	} catch (error) {
 		logger.warn("Outline live log unreadable; kept", { pageId, epoch, error: String(error) });
+		destroy();
+		return { outcome: "kept", keys };
+	}
+	// An update still waiting for items no row brought: the document's text is not what was
+	// typed. Nothing is committed from such a log, and it is not dropped.
+	const stuck = [...docs].filter(([, t]) => hasPendingStructs(t.doc)).map(([id]) => id);
+	if (stuck.length > 0) {
+		logger.warn("Outline live log incomplete (updates without the items they name); kept", {
+			pageId,
+			epoch,
+			blocks: stuck.slice(0, 20),
+		});
 		destroy();
 		return { outcome: "kept", keys };
 	}

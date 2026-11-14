@@ -42,6 +42,7 @@ import {
 } from "@shared/outline";
 import {
 	decodeLiveFrame,
+	decodeLiveSeed,
 	decodeLiveTexts,
 	encodeLiveFrame,
 	encodeLiveTexts,
@@ -386,6 +387,8 @@ export class LiveClient {
 		this.off.push(
 			transport.onConnectionChange((connected) => {
 				if (this.disposed) return;
+				// A client the server no longer speaks to stays closed: a reload is the only way on.
+				if (connected && this.closeCode === "outdated") return;
 				if (connected) this.join();
 				else {
 					this.setStatus(this.status === "closed" ? "closed" : "offline");
@@ -573,8 +576,11 @@ export class LiveClient {
 			return;
 		}
 		for (const e of entries) {
-			if (e.kind === LIVE_TEXT_KIND.seed) this.setPlain(e.id, utf8.decode(e.data));
-			else if (e.kind === LIVE_TEXT_KIND.update)
+			if (e.kind === LIVE_TEXT_KIND.seed) {
+				const seed = decodeLiveSeed(e.data);
+				if (seed === null) this.log.push(`the text of ${e.id} could not be read`);
+				else this.setPlain(e.id, seed);
+			} else if (e.kind === LIVE_TEXT_KIND.update)
 				Y.applyUpdate(this.textDoc(e.id).doc, e.data, REMOTE);
 		}
 	}
@@ -1463,9 +1469,10 @@ export class LiveClient {
 	private onClosed(code: LiveCloseCode): void {
 		this.closeCode = code;
 		if (code !== "ended" && code !== "unavailable") {
-			// Closed for good (refused after typing on the read, access gone, too large): nothing
-			// not acknowledged can be sent any more. Kept for the person at once, while the page
-			// turns read only.
+			// Closed for good (refused after typing on the read, access gone, too large, or this
+			// client is of another protocol version than the server: `outdated`): nothing not
+			// acknowledged can be sent any more. Kept for the person at once, while the page turns
+			// read only (and, outdated, asks for a reload; this client does not join again).
 			this.keepUnsaved(this.provisional ? "refused" : "not_sent", [
 				...this.awaiting,
 				...this.pending,
@@ -1700,8 +1707,6 @@ export class LiveClient {
 		return lines.join("\n");
 	}
 }
-
-const utf8 = new TextDecoder();
 
 /** A transaction's text updates with each block's merged into one. */
 function mergedUpdates(updates: readonly TextUpdate[]): TextUpdate[] {

@@ -22,6 +22,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
 	decodeLiveFrame,
+	decodeLiveSeed,
 	decodeLiveTexts,
 	encodeLiveFrame,
 	encodeLiveTexts,
@@ -31,7 +32,7 @@ import {
 	type LiveFrame,
 	type LiveJoinedHead,
 } from "@shared/outline-live-protocol";
-import { seededTextDoc } from "@shared/outline-live-text";
+import { hasPendingStructs, seededTextDoc } from "@shared/outline-live-text";
 import * as Y from "yjs";
 import { LiveClient, type LiveTransport, type SeedBlock } from "./live-client";
 import {
@@ -126,7 +127,7 @@ function seeds(texts: Record<string, string>): Uint8Array {
  */
 function serverText(snapshot: Uint8Array, sent: Uint8Array, id: string): string {
 	const seed = decodeLiveTexts(snapshot)?.find((e) => e.id === id);
-	const { doc, text } = seededTextDoc(seed ? new TextDecoder().decode(seed.data) : "");
+	const { doc, text } = seededTextDoc(seed ? (decodeLiveSeed(seed.data) ?? "") : "");
 	for (const e of decodeLiveTexts(sent) ?? []) {
 		expect(e.kind).toBe(LIVE_TEXT_KIND.update);
 		if (e.id === id) Y.applyUpdate(doc, e.data);
@@ -245,6 +246,28 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.update]);
 		// What is sent is a change of the server's document, not of the seed's.
 		expect(serverText(answer.body, sent[1]?.body as Uint8Array, B)).toBe("Busy Bee and more");
+	});
+
+	test("a seed text starting with U+FEFF is taken as it is: the document made here is the server's", async () => {
+		const { transport, sent, deliver } = socket();
+		const client = new LiveClient(transport, PAGE, "edit");
+		const bom = "\uFEFFBee with a mark";
+		const answer = joined(sent[0]?.handle as number, { [B]: bom });
+		deliver(answer);
+		expect(client.textOf(B)).toBe(bom);
+		expect(client.textOf(B).length).toBe(bom.length);
+		type(client, B, `${bom}!`);
+		// Typing goes out a moment later (batched).
+		for (let i = 0; i < 100 && sent.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.update]);
+		// The update fits the document the server makes from the same seed, at the same place.
+		expect(serverText(answer.body, sent[1]?.body as Uint8Array, B)).toBe(`${bom}!`);
+		// No update is stuck: it named only items the seed made.
+		const seed = decodeLiveTexts(answer.body)?.find((e) => e.id === B);
+		const server = seededTextDoc(decodeLiveSeed(seed?.data as Uint8Array) as string);
+		for (const e of decodeLiveTexts(sent[1]?.body as Uint8Array) ?? [])
+			Y.applyUpdate(server.doc, e.data);
+		expect(hasPendingStructs(server.doc)).toBe(false);
 	});
 
 	test("no longer allowed to write when the snapshot arrives: nothing is sent, the typing is kept to copy", () => {

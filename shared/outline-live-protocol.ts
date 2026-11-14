@@ -42,7 +42,11 @@
 
 /**
  * The protocol's version, named by every join. A client of another version is told its session
- * is `outdated` (it reloads to get the matching code); nothing is negotiated.
+ * is `outdated` and nothing is negotiated: the client keeps what it typed for the person (the
+ * unsaved-text store), does not join again, and the page says it must be reloaded
+ * (`OutlineSurface`). A client older than version 2 does not know the code: it takes it as a
+ * session closed for good, keeps the typing the same way and shows that live editing is
+ * unavailable.
  */
 export const OUTLINE_LIVE_PROTOCOL_VERSION = 2;
 
@@ -314,7 +318,7 @@ export type LiveCloseCode =
 	| "too_large"
 	/** The session was closed (shutdown); join again later. */
 	| "ended"
-	/** The client speaks another protocol version: it must be reloaded. */
+	/** The client speaks another protocol version: the page says to reload; no retry. */
 	| "outdated";
 
 export interface LiveClosedHead {
@@ -497,6 +501,27 @@ export interface LiveTextEntry {
 	data: Uint8Array;
 }
 
+/** Reads text exactly as written: malformed UTF-8 is an error, a leading U+FEFF is text. */
+const exactDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/** A `seed` entry's payload: the block's text as UTF-8. */
+export function encodeLiveSeed(text: string): Uint8Array {
+	return encoder.encode(text);
+}
+
+/**
+ * The text of a `seed` entry, exactly as the other end holds it (a document made from a text
+ * that differs by one character, a dropped byte order mark say, is another document). Null when
+ * it is not UTF-8.
+ */
+export function decodeLiveSeed(data: Uint8Array): string | null {
+	try {
+		return exactDecoder.decode(data);
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Encode text entries as a frame body:
  *   varuint  bytes of the block id      …  the id (UTF-8)
@@ -562,7 +587,7 @@ export function decodeLiveTexts(
 			return null;
 		let id: string;
 		try {
-			id = decoder.decode(bytes.subarray(at, at + idLength));
+			id = exactDecoder.decode(bytes.subarray(at, at + idLength));
 		} catch {
 			return null;
 		}

@@ -37,6 +37,7 @@ import {
 	type LiveFrame,
 	type LiveJoinedHead,
 	OUTLINE_LIVE_LIMITS,
+	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
 import { LiveClient, type LiveTransport, type SeedBlock } from "./live-client";
 import {
@@ -370,6 +371,55 @@ describe("typing that cannot reach the page outlives its session", () => {
 		expect(unsavedTextsOf(PAGE)).toMatchObject([
 			{ blockId: B, text: "Bee typed offline", reason: "not_sent" },
 		]);
+	});
+});
+
+describe("a client of another protocol version than the server", () => {
+	test("told `outdated` while live with typing on its way: the typing is kept, the session is closed for good, and nothing joins again when the socket comes back", () => {
+		const { transport, sent, deliver, setConnected } = socket();
+		const client = new LiveClient(transport, PAGE, "edit");
+		const handle = sent[0]?.handle as number;
+		// Every join names the version this client speaks.
+		expect((sent[0]?.head as { v?: number }).v).toBe(OUTLINE_LIVE_PROTOCOL_VERSION);
+		deliver(joined(handle));
+		type(client, A, "Alpha typed before the upgrade");
+		const events: string[] = [];
+		client.on((event) => events.push(event));
+		deliver({ kind: LIVE_FRAME.closed, handle, head: { code: "outdated" } });
+		expect(client.status).toBe("closed");
+		expect(client.closeCode).toBe("outdated");
+		expect(client.editable).toBe(false);
+		expect(events).toContain("closed");
+		expect(unsavedTextsOf(PAGE)).toMatchObject([
+			{ blockId: A, text: "Alpha typed before the upgrade", base: "Alpha", reason: "not_sent" },
+		]);
+		// The socket drops and comes back (the server restarted): no join, no retry.
+		const joins = () => sent.filter((f) => f.kind === LIVE_FRAME.join).length;
+		const before = joins();
+		setConnected(false);
+		setConnected(true);
+		expect(joins()).toBe(before);
+		expect(client.status).toBe("closed");
+		client.dispose();
+		// Kept once, not again at dispose.
+		expect(unsavedTextsOf(PAGE)).toHaveLength(1);
+	});
+
+	test("told `outdated` at its first join, with typing on the read: kept as refused", () => {
+		const { transport, sent, deliver } = socket();
+		const client = new LiveClient(transport, PAGE, "edit");
+		client.seed(read());
+		type(client, B, "Bee typed on the read");
+		deliver({
+			kind: LIVE_FRAME.closed,
+			handle: sent[0]?.handle as number,
+			head: { code: "outdated" },
+		});
+		expect(client.closeCode).toBe("outdated");
+		expect(unsavedTextsOf(PAGE)).toMatchObject([
+			{ blockId: B, text: "Bee typed on the read", reason: "refused" },
+		]);
+		client.dispose();
 	});
 });
 

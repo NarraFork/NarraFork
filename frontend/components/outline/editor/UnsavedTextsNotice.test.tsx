@@ -19,6 +19,7 @@ mock.module("react-i18next", () => ({
 
 const { UnsavedTextsNotice } = await import("./UnsavedTextsNotice");
 const { TabLimitNotice } = await import("./TabLimitNotice");
+const { OutdatedNotice } = await import("./OutdatedNotice");
 const { clearUnsavedTextsForTests, keepUnsavedTexts, markUnsavedAdding, unsavedTextsOf } =
 	await import("./unsaved-texts");
 const { acquireLiveSession, releaseLiveSession, retainLiveSession } = await import(
@@ -134,5 +135,26 @@ describe("the tab-limit notice", () => {
 		expect(shown).toMatch(
 			/editor\.tabLimitWaiting\{&quot;count&quot;:1,&quot;seconds&quot;:(119|120)\}/,
 		);
+	});
+});
+
+describe("the notice of an editor older than the server (`outdated`)", () => {
+	test("says to reload and offers only that: no try again", () => {
+		const shown = html(<OutdatedNotice onReload={() => {}} />);
+		expect(shown).toContain('data-testid="outline-outdated"');
+		expect(shown).toContain("editor.outdated");
+		expect(shown).toContain('data-testid="outline-outdated-reload"');
+		expect(shown).toContain("editor.reload");
+		expect(shown).not.toContain("editor.retry");
+	});
+
+	test("both languages have its strings", async () => {
+		for (const lang of ["en", "zh-CN"]) {
+			const strings = (await import(`../../../locales/${lang}/outline.json`)).default as {
+				editor: Record<string, string>;
+			};
+			expect(strings.editor.outdated?.length ?? 0).toBeGreaterThan(10);
+			expect(strings.editor.reload?.length ?? 0).toBeGreaterThan(1);
+		}
 	});
 });

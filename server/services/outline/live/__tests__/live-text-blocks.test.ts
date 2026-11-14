@@ -23,7 +23,12 @@
  *    block's document first;
  *  - a crash is replayed from per-block log rows, also after a refused transaction left its
  *    items in a document; a log of the format before this one is kept, not misread;
- *  - a client of another protocol version is told so.
+ *  - a client of another protocol version is told so;
+ *  - documents count against the session's bound, also those of deleted blocks: a session that
+ *    made too many starts afresh without them, and text never makes a document for a block that
+ *    is gone;
+ *  - a log is replayed whatever order a document's seed and updates come in, and a log with an
+ *    update whose items no row brings is kept, not committed in part.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; each test makes its own pages.
  */
@@ -34,12 +39,16 @@ import { keyBetween } from "@shared/outline";
 import {
 	decodeLiveFrame,
 	decodeLiveTexts,
+	encodeLiveSeed,
+	encodeLiveTexts,
 	LIVE_FRAME,
 	LIVE_TEXT_KIND,
 	type LiveFrame,
 	type LiveSelWire,
+	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
+import { seededTextDoc } from "@shared/outline-live-text";
 import { and, eq } from "drizzle-orm";
 import * as Y from "yjs";
 import { db } from "../../../../db";
@@ -49,7 +58,7 @@ import { settings } from "../../../../lib/settings";
 import { ensureProjectSpace } from "../../spaces";
 import { outlineStore } from "../../store";
 import type { OutlineSpaceRow } from "../../store/port";
-import { writeOutline } from "../../write";
+import { type OutlineOp, writeOutline } from "../../write";
 import {
 	abandonLiveSessionForTests,
 	closeAllLiveSessions,
@@ -61,8 +70,10 @@ import {
 import { replayLiveEpoch } from "../replay";
 import {
 	decodeLogTexts,
+	encodeLogTexts,
 	LIVE_SYNC_ACTOR,
 	type LivePage,
+	OUTLINE_LIVE_BOUNDS,
 	OUTLINE_LIVE_HOOKS,
 	OUTLINE_LIVE_TIMING,
 } from "../session";
@@ -71,6 +82,8 @@ import { client, kids, settle, struct, TestLink, TestSocket, type, waitFor } fro
 const NOW = "2026-11-14T00:00:00.000Z";
 const saved = { ...OUTLINE_LIVE_TIMING };
 const savedHooks = { ...OUTLINE_LIVE_HOOKS };
+const savedBounds = { ...OUTLINE_LIVE_BOUNDS };
+const savedEntries = OUTLINE_LIVE_LIMITS.maxClientTextEntries;
 
 let owner: string;
 let writer: string;
@@ -207,6 +220,8 @@ beforeEach(() => {
 
 afterEach(async () => {
 	Object.assign(OUTLINE_LIVE_HOOKS, savedHooks);
+	Object.assign(OUTLINE_LIVE_BOUNDS, savedBounds);
+	(OUTLINE_LIVE_LIMITS as { maxClientTextEntries: number }).maxClientTextEntries = savedEntries;
 	for (const c of clients.splice(0)) c.dispose();
 	for (const l of links.splice(0)) if (l.connected) l.disconnect();
 	await closeAllLiveSessions("ended");
@@ -1112,7 +1127,6 @@ describe("the protocol's version", () => {
 		const s = session(pageId);
 		const p = [...s.participants.values()][0];
 		if (!p) throw new Error("no participant");
-		const { encodeLiveTexts } = await import("@shared/outline-live-protocol");
 		const doc = new Y.Doc();
 		doc.getText("t").insert(0, "stray");
 		const update = Y.encodeStateAsUpdate(doc);
@@ -1142,6 +1156,290 @@ describe("the protocol's version", () => {
 	});
 });
 
+describe("documents count against the session's bound", () => {
+	test("blocks made and deleted over and over: the session starts afresh before its documents pile up, and the fresh one has none of a deleted block", async () => {
+		const { pageId, ids } = await page(["stays"]);
+		const stays = ids[0] as string;
+		// Room for 256 documents (the real bound gives 4,096).
+		OUTLINE_LIVE_BOUNDS.maxDocBytes = 256 * OUTLINE_LIVE_BOUNDS.docCostBytes;
+		const most = OUTLINE_LIVE_BOUNDS.maxDocBytes / OUTLINE_LIVE_BOUNDS.docCostBytes;
+		const a = open(link(owner), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		const epochs = new Set<number>([session(pageId).epoch]);
+		let peak = 0;
+		let made = 0;
+		for (let round = 0; round < 20; round++) {
+			// 100 one-character blocks, each with a document of its own, then all deleted.
+			const last = a.visible.children(pageId).at(-1) as string;
+			let key = a.visible.get(last)?.orderKey ?? null;
+			const ops: ClientOp[] = [];
+			for (let i = 0; i < 100; i++) {
+				key = keyBetween(key, null);
+				ops.push({ t: "i", id: a.newId(), p: pageId, k: key, content: "x" });
+			}
+			struct(a, ops);
+			made += ops.length;
+			await waitFor(() => a.status === "live", 20_000, "live");
+			await settle(30, 20_000);
+			peak = Math.max(peak, liveSessionOf(pageId)?.textDocs ?? 0, a.textDocs);
+			struct(
+				a,
+				a.visible
+					.children(pageId)
+					.filter((id) => id !== stays)
+					.map((id) => ({ t: "d" as const, id })),
+			);
+			await waitFor(() => a.status === "live", 20_000, "live");
+			await settle(30, 20_000);
+			const now = liveSessionOf(pageId);
+			if (now) epochs.add(now.epoch);
+			peak = Math.max(peak, now?.textDocs ?? 0, a.textDocs);
+		}
+		expect(made).toBe(2000);
+		expect(a.outline()).toBe("- stays");
+		expect(await dbOutline(pageId)).toBe("- stays");
+		// One transaction may take the session past the bound before it ends: 100 documents here.
+		expect(peak).toBeLessThanOrEqual(most + 100);
+		// The session started afresh several times instead of holding 2,000 documents.
+		expect(epochs.size).toBeGreaterThanOrEqual(4);
+		// A fresh session holds no document of a deleted block: force one more start and look.
+		const before = session(pageId).epoch;
+		OUTLINE_LIVE_BOUNDS.maxDocBytes = 1;
+		type(a, stays, "!");
+		await waitFor(() => liveSessionOf(pageId)?.epoch !== before, 20_000, "the session ended");
+		OUTLINE_LIVE_BOUNDS.maxDocBytes = savedBounds.maxDocBytes;
+		await waitFor(() => liveSessionOf(pageId) !== undefined && a.status === "live", 20_000);
+		await settle(30, 20_000);
+		const fresh = session(pageId);
+		expect(fresh.textDocIds.every((id) => fresh.mirror.alive(id) !== undefined)).toBe(true);
+		expect(fresh.textDocs).toBeLessThanOrEqual(1);
+		expect(a.textDocs).toBeLessThanOrEqual(1);
+		expect(a.textOf(stays)).toBe("stays!");
+		expect(await content(stays)).toBe("stays!");
+	}, 120_000);
+
+	test("text makes no document for a block that is gone; typing that crossed the deletion of a block with a document still lands", async () => {
+		const { pageId, ids } = await page(["typed in", "never typed in", "keep"]);
+		const [typedIn, untouched] = ids as [string, string, string];
+		const la = link(owner);
+		const lb = link(writer);
+		const a = open(la, pageId);
+		const b = open(lb, pageId);
+		await waitFor(() => a.ready && b.ready, 3000, "joined");
+		type(a, typedIn, "!");
+		await settle();
+		// A's next keystrokes are on their way while B deletes both blocks.
+		la.hold(true);
+		type(a, typedIn, "?");
+		struct(b, [
+			{ t: "d", id: typedIn },
+			{ t: "d", id: untouched },
+		]);
+		await settle();
+		la.hold(false);
+		await settle(60);
+		// The block had a document: the keystroke went into it, nothing was refused.
+		expect(a.stats.rejects).toBe(0);
+		expect(session(pageId).textOf(typedIn)).toBe("typed in!?");
+		expect(session(pageId).textDocIds).toEqual([typedIn]);
+		// Text for the deleted block nobody had typed in would make a document for it: refused.
+		const s = session(pageId);
+		const p = [...s.participants.values()].find((x) => x.userId === owner);
+		if (!p) throw new Error("no participant");
+		const made = seededTextDoc("never typed in");
+		const vector = Y.encodeStateVector(made.doc);
+		made.text.insert(0, "late ");
+		s.handleUpdate(
+			p,
+			p.lastTx + 1,
+			encodeLiveTexts([
+				{
+					id: untouched,
+					kind: LIVE_TEXT_KIND.update,
+					data: Y.encodeStateAsUpdate(made.doc, vector),
+				},
+			]),
+		);
+		expect(p.blocked).toBe(true);
+		expect(s.textDocIds).toEqual([typedIn]);
+		await settle(60);
+		expect(a.stats.rejects).toBe(1);
+		expect(a.outline()).toBe("- keep");
+		expect(b.outline()).toBe("- keep");
+		// Bringing the block back (undoing the delete) may carry text for it again.
+		expect(b.undo()).toBe(true);
+		await settle();
+		type(a, untouched, " now");
+		await settle();
+		expect(b.textOf(untouched)).toBe("never typed in now");
+		expectSameTexts(pageId, [a, b]);
+	});
+
+	test("a client holding more documents than a join may name comes back with a snapshot, its unsent typing kept", async () => {
+		const { pageId, ids } = await page(Array.from({ length: 30 }, (_, i) => `block ${i}`));
+		const la = link(owner);
+		const lb = link(writer);
+		const a = open(la, pageId);
+		const b = open(lb, pageId);
+		await waitFor(() => a.ready && b.ready, 3000, "joined");
+		for (const id of ids) edit(a, id, `${a.textOf(id)}!`);
+		await settle(40, 10_000);
+		expect(b.textDocs).toBe(30);
+		(OUTLINE_LIVE_LIMITS as { maxClientTextEntries: number }).maxClientTextEntries = 10;
+		lb.disconnect();
+		type(b, ids[3] as string, "?");
+		type(a, ids[3] as string, "A", 0);
+		await settle();
+		lb.reconnect();
+		await waitFor(() => b.status === "live", 5000, "live again");
+		await settle(60, 10_000);
+		// Not a resume: the page again, and what was typed offline merged onto it.
+		expect(b.stats.resumes).toBe(0);
+		expect(b.stats.rebuilds).toBe(0);
+		expect(b.textOf(ids[3] as string)).toBe("Ablock 3!?");
+		expect(a.textOf(ids[3] as string)).toBe("Ablock 3!?");
+		expectSameTexts(pageId, [a, b]);
+	});
+});
+
+describe("a log read in any order", () => {
+	const b64 = (data: Uint8Array) => Buffer.from(data).toString("base64");
+	const left = (pageId: string, epoch: number) =>
+		db
+			.select()
+			.from(outlineLiveUpdates)
+			.where(and(eq(outlineLiveUpdates.pageBlockId, pageId), eq(outlineLiveUpdates.epoch, epoch)))
+			.all().length;
+
+	test("an update row before its block's seed row: the text is committed, as its author's", async () => {
+		const { pageId, ids } = await page(["x"]);
+		const block = ids[0] as string;
+		const { doc, text } = seededTextDoc("x");
+		const vector = Y.encodeStateVector(doc);
+		text.insert(1, " hello");
+		const typed = Y.encodeStateAsUpdate(doc, vector);
+		const epoch = 515_151;
+		const at = new Date().toISOString();
+		const row = (
+			seq: number,
+			data: Uint8Array,
+			actorKind: "human" | "system",
+			actorId: string,
+		) => ({
+			pageBlockId: pageId,
+			epoch,
+			seq,
+			updateB64: b64(data),
+			actorKind,
+			actorId,
+			createdAt: at,
+		});
+		await outlineStore.appendLiveUpdates([
+			row(0, encodeLogTexts([]), "system", "outline-live"),
+			row(
+				1,
+				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.update, data: typed }]),
+				"human",
+				owner,
+			),
+			row(
+				2,
+				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed("x") }]),
+				"system",
+				"outline-live",
+			),
+		]);
+		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await content(block)).toBe("x hello");
+		expect(left(pageId, epoch)).toBe(0);
+		expect((await outlineStore.getBlock(block))?.authorId).toBe(owner);
+	});
+
+	test("the same, with the database changed since: the seed is the base the typing is merged from", async () => {
+		const { pageId, ids } = await page(["x"]);
+		const block = ids[0] as string;
+		const { doc, text } = seededTextDoc("x");
+		const vector = Y.encodeStateVector(doc);
+		text.insert(1, " hello");
+		const typed = Y.encodeStateAsUpdate(doc, vector);
+		const epoch = 515_152;
+		const at = new Date().toISOString();
+		await outlineStore.appendLiveUpdates(
+			[
+				encodeLogTexts([]),
+				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.update, data: typed }]),
+				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed("x") }]),
+			].map((data, seq) => ({
+				pageBlockId: pageId,
+				epoch,
+				seq,
+				updateB64: b64(data),
+				actorKind: seq === 1 ? ("human" as const) : ("system" as const),
+				actorId: seq === 1 ? owner : "outline-live",
+				createdAt: at,
+			})),
+		);
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "update", block: { id: block }, content: "agent: x" }],
+			actor: { kind: "agent", id: "n" },
+			responsibleUserId: owner,
+		});
+		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await content(block)).toBe("agent: x hello");
+	});
+
+	test("an update whose items no row brings: nothing is committed and the log is kept", async () => {
+		const { pageId, ids } = await page(["x", "y"]);
+		const [block, other] = ids as [string, string];
+		const { doc, text } = seededTextDoc("x");
+		const vector = Y.encodeStateVector(doc);
+		text.insert(1, " hello");
+		const typed = Y.encodeStateAsUpdate(doc, vector);
+		const fine = seededTextDoc("y");
+		const fineVector = Y.encodeStateVector(fine.doc);
+		fine.text.insert(1, " fine");
+		const epoch = 515_153;
+		const at = new Date().toISOString();
+		await outlineStore.appendLiveUpdates(
+			[
+				encodeLogTexts([]),
+				// The seed of `block` is missing; `other` is whole.
+				encodeLogTexts([{ id: other, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed("y") }]),
+				encodeLogTexts([
+					{ id: block, kind: LIVE_TEXT_KIND.update, data: typed },
+					{
+						id: other,
+						kind: LIVE_TEXT_KIND.update,
+						data: Y.encodeStateAsUpdate(fine.doc, fineVector),
+					},
+				]),
+			].map((data, seq) => ({
+				pageBlockId: pageId,
+				epoch,
+				seq,
+				updateB64: b64(data),
+				actorKind: seq === 2 ? ("human" as const) : ("system" as const),
+				actorId: seq === 2 ? owner : "outline-live",
+				createdAt: at,
+			})),
+		);
+		expect(await replayLiveEpoch(pageId, epoch)).toBe("kept");
+		expect(await content(block)).toBe("x");
+		expect(await content(other)).toBe("y");
+		expect(left(pageId, epoch)).toBe(3);
+		// The page is still editable, and the log still there afterwards.
+		const a = open(link(owner), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		type(a, block, "!");
+		await settle();
+		await flushed(pageId);
+		expect(await content(block)).toBe("x!");
+		expect(left(pageId, epoch)).toBe(3);
+		await db.delete(outlineLiveUpdates).where(eq(outlineLiveUpdates.pageBlockId, pageId));
+	});
+});
+
 /** A small deterministic generator (mulberry32). */
 function rng(seed: number): () => number {
 	let t = seed >>> 0;
@@ -1157,7 +1455,7 @@ describe("documents made lazily on every end converge (seeded, bounded)", () => 
 	const ALPHABET = "abcdefghij 大纲块*`";
 
 	/** One random step of one person: mostly text in a random block, undo and redo, some structure. */
-	function step(c: LiveClient, pageId: string, r: () => number): void {
+	function step(c: LiveClient, pageId: string, r: () => number, alphabet = ALPHABET): void {
 		if (!c.editable) return;
 		const live = [...c.visible.blocks.values()].filter(
 			(b) => c.visible.inPage(b.id) && b.id !== pageId,
@@ -1181,7 +1479,7 @@ describe("documents made lazily on every end converge (seeded, bounded)", () => 
 			i >= 0 && i < sibs.length ? (c.visible.get(sibs[i] as string)?.orderKey ?? null) : null;
 		if (roll < 0.62) {
 			const pos = Math.floor(r() * (text.length + 1));
-			const ch = ALPHABET[Math.floor(r() * ALPHABET.length)] as string;
+			const ch = alphabet[Math.floor(r() * alphabet.length)] as string;
 			const md = text.slice(0, pos) + ch + text.slice(pos);
 			// Half as typing (merging steps), half as steps of their own.
 			if (r() < 0.5) type(c, b.id, ch, pos);
@@ -1231,9 +1529,9 @@ describe("documents made lazily on every end converge (seeded, bounded)", () => 
 		}
 	}
 
-	for (const seed of [3, 17, 29, 101, 257, 4099]) {
-		test(`seed ${seed}: three people, holds, reconnects and an agent`, async () => {
-			const { pageId, ids } = await page(
+	for (const seed of [5, 11, 23, 77, 131, 911, 2024, 7001]) {
+		test(`seed ${seed}: three people, holds, reconnects and an agent that also inserts, deletes and moves`, async () => {
+			const { pageId } = await page(
 				Array.from({ length: 10 }, (_, i) => `block ${i} ${"lorem ".repeat(i % 3)}`.trim()),
 			);
 			const r = rng(seed);
@@ -1251,20 +1549,38 @@ describe("documents made lazily on every end converge (seeded, bounded)", () => 
 				} else if (dice < 0.1) {
 					if (l.connected) l.disconnect();
 					else l.reconnect();
-				} else if (dice < 0.125) {
-					// An agent rewrites a random block the database has (maybe one nobody typed in).
-					const target = ids[Math.floor(r() * ids.length)] as string;
-					const row = await outlineStore.getBlock(target);
-					if (row && !row.deleted)
+				} else if (dice < 0.2) {
+					// An agent at work on what the database holds: a new block, another text, a
+					// block deleted or moved under another (maybe one nobody typed in).
+					const { blocks } = await outlineStore.listPageBlocks(pageId, 10_000);
+					const live = blocks.filter((x) => x.id !== pageId);
+					const pick = live[Math.floor(r() * live.length)];
+					const what = r();
+					const ops: OutlineOp[] = [];
+					if (what < 0.35 || !pick) {
+						const parent = pick && r() < 0.5 ? pick.id : pageId;
+						ops.push({ op: "insert", parent: { id: parent }, content: `agent block ${n}` });
+					} else if (what < 0.6) {
+						ops.push({
+							op: "update",
+							block: { id: pick.id },
+							content: `${pick.content} [agent ${n}]`,
+						});
+					} else if (what < 0.8 && live.length > 5) {
+						ops.push({ op: "delete", block: { id: pick.id } });
+					} else {
+						const other = live[Math.floor(r() * live.length)];
+						if (other && other.id !== pick.id)
+							ops.push({ op: "move", block: { id: pick.id }, parent: { id: other.id } });
+					}
+					if (ops.length > 0)
 						await writeOutline({
 							spaceId: space.id,
-							ops: [
-								{ op: "update", block: { id: target }, content: `${row.content} [agent ${n}]` },
-							],
+							ops,
 							actor: { kind: "agent", id: "stress-agent" },
 							responsibleUserId: owner,
 						}).catch(() => {
-							// Refused while someone's text is being committed: fine.
+							// Refused (a cycle, a block just deleted, text being committed): fine.
 						});
 				}
 				step(c, pageId, r);
@@ -1312,6 +1628,51 @@ describe("documents made lazily on every end converge (seeded, bounded)", () => 
 			await flushed(pageId);
 			expect(await dbOutline(pageId)).toBe(end[0] as string);
 		}, 90_000);
+	}
+	/**
+	 * A model of one person's undo stack: the page as it was after each step. Every undo must
+	 * show the page of the step before, every redo the page of the step after, however the steps
+	 * mix blocks, typing that merges, and structure.
+	 */
+	for (const seed of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+		test(`model seed ${seed}: one person, every undo and redo lands on the recorded page of that step`, async () => {
+			const { pageId } = await page(Array.from({ length: 8 }, (_, i) => `block${i}`));
+			const r = rng(seed);
+			const c = open(link(owner), pageId);
+			await waitFor(() => c.ready, 3000, "joined");
+			const states: string[] = [c.outline()];
+			for (let n = 0; n < 160; n++) {
+				const before = c.undoStack.length;
+				// Going forward: the roll that picks the kind of step never picks undo or redo.
+				let calls = 0;
+				// (Plain letters only: text the page would normalize differently when it commits
+				// it would change under the recorded pages.)
+				step(c, pageId, () => (++calls === 2 ? 0.34 + r() * 0.66 : r()), "abcdefghij大纲块");
+				expect(c.undoStack.length).toBeGreaterThanOrEqual(before);
+				// A step merged into the one before (typing on) replaces that step's page.
+				states[c.undoStack.length] = c.outline();
+				states.length = c.undoStack.length + 1;
+				if (n % 10 === 0) await settle();
+			}
+			await settle(40, 10_000);
+			expect(c.stats.rejects).toBe(0);
+			const top = c.undoStack.length;
+			expect(top).toBeGreaterThan(40);
+			expect(c.outline()).toBe(states[top] as string);
+			// Down and up twice: before and after the server has seen the undos.
+			for (let pass = 0; pass < 2; pass++) {
+				while (c.undo()) expect(c.outline()).toBe(states[c.undoStack.length] as string);
+				expect(c.undoStack.length).toBe(0);
+				await settle(40, 10_000);
+				while (c.redo()) expect(c.outline()).toBe(states[c.undoStack.length] as string);
+				expect(c.undoStack.length).toBe(top);
+				await settle(40, 10_000);
+			}
+			expect(c.stats.rejects).toBe(0);
+			expectSameTexts(pageId, [c]);
+			await flushed(pageId);
+			expect(await dbOutline(pageId)).toBe(states[top] as string);
+		}, 60_000);
 	}
 });
 

@@ -411,8 +411,9 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 		warnRarely("Outline live join with an invalid handle ignored", { handle });
 		return;
 	}
-	// A client of another protocol version (a page loaded before an upgrade) cannot be served:
-	// it is told so, keeps what it typed for the person and is reloaded.
+	// A client of another protocol version (a page loaded before an upgrade) cannot be served
+	// and is told so. What it does then is its own code's doing: this version's client keeps
+	// what was typed for the person and asks for a reload (`live-client.ts`, `OutlineSurface`).
 	if (
 		handle !== 0 &&
 		(frame.head as { v?: unknown } | null)?.v !== OUTLINE_LIVE_PROTOCOL_VERSION &&

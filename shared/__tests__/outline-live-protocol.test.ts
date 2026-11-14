@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
 	decodeLiveFrame,
+	decodeLiveSeed,
 	decodeLiveTexts,
 	encodeLiveFrame,
 	encodeLiveHead,
+	encodeLiveSeed,
 	encodeLiveTexts,
 	isLiveFrame,
 	isLiveHandle,
@@ -165,6 +167,28 @@ describe("text entries (protocol version 2)", () => {
 			encodeLiveFrame({ kind: LIVE_FRAME.update, handle: 1, n: 3, body }),
 		);
 		expect(decodeLiveTexts(frame?.body as Uint8Array)).toHaveLength(4);
+	});
+
+	test("a seed text is read exactly as written: a leading U+FEFF stays, malformed UTF-8 is refused", () => {
+		for (const text of ["", "plain", "\uFEFFwith a mark", "\uFEFF", "中\uFEFF间", "😀 astral"]) {
+			const [entry] =
+				decodeLiveTexts(
+					encodeLiveTexts([
+						{ id: "block-0001", kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed(text) },
+					]),
+				) ?? [];
+			const back = decodeLiveSeed(entry?.data as Uint8Array);
+			expect(back).toBe(text);
+			expect(back?.length).toBe(text.length);
+		}
+		expect(decodeLiveSeed(new Uint8Array([0x61, 0xff, 0x62]))).toBeNull();
+		// A block id is read the same way.
+		const ids = decodeLiveTexts(
+			encodeLiveTexts([
+				{ id: "\uFEFFodd-id", kind: LIVE_TEXT_KIND.update, data: new Uint8Array(0) },
+			]),
+		);
+		expect(ids?.[0]?.id).toBe("\uFEFFodd-id");
 	});
 
 	test("malformed bodies do not decode: truncated, unknown kind, bad id, too many entries", () => {
