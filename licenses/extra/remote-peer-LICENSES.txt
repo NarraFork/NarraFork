@@ -385,7 +385,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 === Source 20 ===
 Module: golang.org/x/sys
-Version: v0.45.0
+Version: v0.50.0
 Upstream: https://github.com/golang/sys
 Source file: LICENSE
 License / notice: BSD-3-Clause
@@ -394,7 +394,7 @@ Verbatim text: see Source 1 (byte-identical original, including attribution).
 
 === Source 21 ===
 Module: golang.org/x/sys
-Version: v0.45.0
+Version: v0.50.0
 Upstream: https://github.com/golang/sys
 Source file: PATENTS
 License / notice: BSD-3-Clause
