@@ -592,6 +592,14 @@
 			"prevId": "11493ae9-9036-4353-b911-18624a649666",
 			"version": "7",
 			"snapshotDigest": "9b69bab6d6b1864e335e6d5a067c9e052ba4ea869b1eb384e715818ce611ca83"
+		},
+		{
+			"idx": 74,
+			"tag": "0074_appearance_preferences",
+			"id": "4732deae-5c40-46e7-a744-98ff336e40ad",
+			"prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+			"version": "7",
+			"snapshotDigest": "b02e691735cb67b24ad5b98b24178b943fbd422bf13078b91535370a06c13829"
 		}
 	]
 }
