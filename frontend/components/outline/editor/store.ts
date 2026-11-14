@@ -1,6 +1,7 @@
 /**
  * The editor's copy of a page's structure (the block model is the truth, design §6.7): id,
- * parent, sibling order key, checkbox. Text is not here: it lives in the page's Yjs document.
+ * parent, sibling order key, checkbox. Text is not here: each block's text lives in a document
+ * of its own (`live-client.ts`), whatever the block's place in this structure.
  *
  * Operations return their inverse, which the undo stack keeps. Ported from the editor prototype
  * (`prototypes/outline-editor/src/model/store.ts`), with content moved out to Yjs.
@@ -26,7 +27,7 @@ export interface BlockRec {
 
 /**
  * A structural operation as the editor makes it: the wire operation, and for an insert the
- * new block's initial text (which goes into the Yjs document, never into the operation).
+ * new block's initial text (which goes into the block's text document, never into the operation).
  */
 export type ClientOp =
 	| (Extract<LiveOp, { t: "i" }> & { content: string })

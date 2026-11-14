@@ -10,7 +10,7 @@
 
 import { heapStats } from "bun:jsc";
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { LIVE_FRAME } from "@shared/outline-live-protocol";
+import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
 import { db } from "../../../../db";
 import { projects, users } from "../../../../db/schema";
 import { generateId } from "../../../../lib/id";
@@ -18,8 +18,8 @@ import { settings } from "../../../../lib/settings";
 import { ensureProjectSpace } from "../../spaces";
 import type { OutlineSpaceRow } from "../../store/port";
 import { writeOutline } from "../../write";
-import { closeAllLiveSessions, liveSessionOf } from "../registry";
-import { client, forget, settle, TestLink, type, waitFor } from "./harness";
+import { closeAllLiveSessions, joinLive, liveSessionOf, releaseLiveSocket } from "../registry";
+import { client, forget, settle, TestLink, TestSocket, type, waitFor } from "./harness";
 
 const BENCH = process.env.NF_OUTLINE_LIVE_BENCH === "1";
 const NOW = "2026-11-14T00:00:00.000Z";
@@ -69,7 +69,8 @@ test.skipIf(!BENCH)(
 		const pageIds: string[] = [];
 		const firstBlock: string[] = [];
 		const ROUNDS = 5;
-		for (let round = 0; round < ROUNDS; round++) {
+		// Twice the pages: half are opened by a bare socket (the session alone), half by a client.
+		for (let round = 0; round < 2 * ROUNDS; round++) {
 			let pageId = "";
 			for (let at = 0; at < BLOCKS - 1; at += 150) {
 				const n = Math.min(150, BLOCKS - 1 - at);
@@ -96,10 +97,37 @@ test.skipIf(!BENCH)(
 			}
 			pageIds.push(pageId);
 		}
+		// The session alone: a socket that only records the answer, no client engine.
+		const sessionMs: number[] = [];
+		const sessionHeap: number[] = [];
+		for (let round = ROUNDS; round < 2 * ROUNDS; round++) {
+			const pageId = pageIds[round] as string;
+			const answers: LiveFrame[] = [];
+			const socket = new TestSocket(owner, "bare", (f) => {
+				const d = decodeLiveFrame(f);
+				if (d) answers.push(d);
+			});
+			const h0 = heapMB();
+			const t0 = performance.now();
+			await joinLive(socket, {
+				kind: LIVE_FRAME.join,
+				handle: 1,
+				n: 0,
+				// `v` is the protocol version (ignored by a server that does not know the field).
+				head: { v: 2, page: pageId, mode: "edit", key: `benchkey${round}0` },
+				body: new Uint8Array(0),
+			});
+			sessionMs.push(performance.now() - t0);
+			expect(answers[0]?.kind).toBe(LIVE_FRAME.joined);
+			answers.length = 0;
+			socket.sent.length = 0;
+			sessionHeap.push(heapMB() - h0);
+			expect(liveSessionOf(pageId)).toBeDefined();
+			releaseLiveSocket(socket);
+		}
 		const openMs: number[] = [];
 		const snapshotBytes: number[] = [];
 		const serverHeap: number[] = [];
-		const clientHeap: number[] = [];
 		const typed: number[] = [];
 		for (let round = 0; round < ROUNDS; round++) {
 			const pageId = pageIds[round] as string;
@@ -125,20 +153,23 @@ test.skipIf(!BENCH)(
 			forget(c);
 			link.disconnect();
 			await settle();
-			clientHeap.push(heapMB() - h0);
 		}
 		const med = (v: number[]) =>
 			+([...v].sort((a, b) => a - b)[Math.floor(v.length / 2)] ?? 0).toFixed(1);
 		console.log(
 			`LIVE-TEXT-BENCH ${JSON.stringify({
 				blocks: BLOCKS,
+				sessionOpenAndSnapshotMs: {
+					median: med(sessionMs),
+					all: sessionMs.map((x) => +x.toFixed(1)),
+				},
+				sessionHeapMB: { median: med(sessionHeap), all: sessionHeap.map((x) => +x.toFixed(2)) },
 				joinToReadyMs: { median: med(openMs), all: openMs.map((x) => +x.toFixed(1)) },
 				firstSnapshotKB: med(snapshotBytes.map((b) => b / 1024)),
-				sessionPlusClientHeapMB: {
+				sessionAndClientHeapMB: {
 					median: med(serverHeap),
 					all: serverHeap.map((x) => +x.toFixed(1)),
 				},
-				sessionAloneHeapMB: { median: med(clientHeap), all: clientHeap.map((x) => +x.toFixed(1)) },
 				type200Ms: med(typed),
 			})}`,
 		);

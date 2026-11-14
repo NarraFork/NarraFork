@@ -842,15 +842,15 @@ export class LiveClient {
 				this.textCache.delete(op.id);
 			}
 			for (const b of input.bodies) {
+				const before = this.docs.get(b.id)?.um?.undoStack.length ?? 0;
 				const change = this.writeBody(b, LOCAL);
-				if (!change) continue;
-				bodies.set(b.id, change);
-				// What the block's undo manager recorded of it: the item this step undoes. (Typing
-				// on in a merged step grows the item it already has.)
+				if (change) bodies.set(b.id, change);
+				// What the block's undo manager recorded of it: a new item, which this step undoes.
+				// (Typing on in a merged step grows the item the step already has; a change that
+				// changed nothing leaves no item, and the one on top belongs to an earlier step.)
 				const um = this.docs.get(b.id)?.um;
-				const item = um?.undoStack[um.undoStack.length - 1];
-				if (um && item) {
-					step.texts.set(b.id, item);
+				if (um && um.undoStack.length > before) {
+					step.texts.set(b.id, um.undoStack[um.undoStack.length - 1] as StackItem);
 					this.capturing.add(um);
 				}
 			}

@@ -140,9 +140,12 @@ export interface OutlineCommitRow {
 }
 
 /**
- * One row of a page's live session log (`outline_live_updates`): a Yjs update as base64. Seq 0 of
- * an epoch, or the first row after a compaction, is a full snapshot of the session's document;
- * the rows after it are increments. Replaying an epoch's rows in seq order rebuilds the document.
+ * One row of a page's live session log (`outline_live_updates`), base64: text entries naming
+ * their blocks (`encodeLogTexts` in `live/session.ts`: a block's seed text, or a Yjs update of
+ * that block's document), or a JSON sync row. Seq 0 of an epoch, or the first row after a
+ * compaction, holds every text document of the session whole; the rows after it are increments.
+ * Replaying an epoch's rows in seq order rebuilds each block's document. The table's schema
+ * comment (`update_b64` "is the Yjs update") predates this format; the column is unchanged.
  */
 export interface OutlineLiveUpdateRow {
 	pageBlockId: string;

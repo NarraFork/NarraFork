@@ -1,10 +1,11 @@
 /**
  * Where a write made outside a page's live session meets the session.
  *
- * While a page is being edited live, its text lives in the session (a Yjs document) and reaches
- * the blocks table a few seconds later. A write from anywhere else (an agent's `OutlineEdit`, a
- * revert, any future HTTP write) must not plan against stale content, and must not be lost when
- * the session writes next. So such a write runs behind the session's barrier:
+ * While a page is being edited live, its text lives in the session (a Yjs document per block
+ * someone typed in) and reaches the blocks table a few seconds later. A write from anywhere else
+ * (an agent's `OutlineEdit`, a revert, any future HTTP write) must not plan against stale
+ * content, and must not be lost when the session writes next. So such a write runs behind the
+ * session's barrier:
  *
  *   1. the session's lane for the space is taken: no live edit of the space is applied meanwhile;
  *   2. every live session of the space writes its unflushed edits as commits first, so the
