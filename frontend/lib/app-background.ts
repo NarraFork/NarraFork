@@ -23,8 +23,17 @@
  * cannot close the declaration.
  */
 
+export type BackgroundSource = "url" | "file";
+
+import { hideWallpaper, showWallpaper, type WallpaperResult } from "./wallpaper-layer";
+import { loadWallpaperBlob } from "./wallpaper-store";
+
 export interface BackgroundChoice {
 	enabled: boolean;
+	/** A remote URL, or a file previously saved in IndexedDB. */
+	source: BackgroundSource;
+	/** Display name of the picked file (file source only, for the UI). */
+	fileName?: string;
 	url: string;
 	/** Pane opacity, percent. Higher = more opaque = less wallpaper visible. */
 	opacity: number;
@@ -36,6 +45,7 @@ export interface BackgroundChoice {
 
 export const DEFAULT_BACKGROUND: BackgroundChoice = {
 	enabled: false,
+	source: "url",
 	url: "",
 	opacity: 80,
 	scrim: 40,
@@ -76,12 +86,15 @@ function clamp(value: unknown, min: number, max: number, fallback: number): numb
 export function parseBackgroundChoice(raw: unknown): BackgroundChoice {
 	if (!raw || typeof raw !== "object") return { ...DEFAULT_BACKGROUND };
 	const value = raw as Partial<Record<keyof BackgroundChoice, unknown>>;
+	const source: BackgroundSource = value.source === "file" ? "file" : "url";
 	const url = typeof value.url === "string" ? value.url.trim().slice(0, MAX_URL_LENGTH) : "";
-	const usable = Boolean(url) && checkBackgroundUrl(url).ok;
+	const usable = source === "file" ? true : Boolean(url) && checkBackgroundUrl(url).ok;
 	return {
 		// An unusable URL cannot be "enabled": otherwise a bad paste silently blanks the UI.
 		enabled: usable ? Boolean(value.enabled) : false,
-		url: usable ? url : "",
+		source,
+		...(typeof value.fileName === "string" ? { fileName: value.fileName.slice(0, 120) } : {}),
+		url: source === "file" ? "" : usable ? url : "",
 		opacity: clamp(value.opacity, MIN_OPACITY, 100, DEFAULT_BACKGROUND.opacity),
 		scrim: clamp(value.scrim, 0, 90, DEFAULT_BACKGROUND.scrim),
 		blur: clamp(value.blur, 0, 24, DEFAULT_BACKGROUND.blur),
@@ -163,8 +176,44 @@ export function applyBackground(root: HTMLElement, choice: BackgroundChoice): vo
 	);
 }
 
-/** Apply the stored background before the first paint (called from main.tsx). */
+/**
+ * Resolve the configured source into an actual image and put it on screen.
+ *
+ * Remote URLs go straight to an `<img>` (no Referer, see `wallpaper-layer.ts`); a picked
+ * file is read back out of IndexedDB and served through an object URL this module owns.
+ * Returns "error" when the image could not be loaded, which is the settings card's cue to
+ * say so instead of leaving a silent flat background.
+ */
+export async function syncWallpaperLayer(choice: BackgroundChoice): Promise<WallpaperResult> {
+	if (!choice.enabled) {
+		hideWallpaper();
+		return "ok";
+	}
+	if (choice.source === "file") {
+		const blob = await loadWallpaperBlob();
+		if (!blob) {
+			hideWallpaper();
+			return "error";
+		}
+		return showWallpaper(
+			{ src: URL.createObjectURL(blob), blur: choice.blur },
+			{ objectUrl: true },
+		);
+	}
+	if (!checkBackgroundUrl(choice.url).ok) {
+		hideWallpaper();
+		return "error";
+	}
+	return showWallpaper({ src: choice.url.trim(), blur: choice.blur });
+}
+
+/**
+ * Apply the stored background as early as possible. The surface variables are synchronous
+ * (so the first paint already has the right translucency); the image itself is async.
+ */
 export function applyInitialBackground(): void {
 	if (typeof document === "undefined") return;
-	applyBackground(document.documentElement, readStoredBackground());
+	const choice = readStoredBackground();
+	applyBackground(document.documentElement, choice);
+	void syncWallpaperLayer(choice);
 }

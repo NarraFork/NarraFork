@@ -54,15 +54,15 @@ describe("background image", () => {
 		expect(parseBackgroundChoice(null)).toEqual(DEFAULT_BACKGROUND);
 		expect(
 			parseBackgroundChoice({ enabled: true, url: "javascript:alert(1)", opacity: 999, scrim: -5 }),
-		).toEqual({ ...DEFAULT_BACKGROUND, opacity: 100, scrim: 0 });
+		).toEqual({ ...DEFAULT_BACKGROUND, opacity: 100, scrim: 0, enabled: false, url: "" });
 		expect(
 			parseBackgroundChoice({ enabled: true, url: "https://x.test/a.png", opacity: 1 }),
 		).toEqual({
+			...DEFAULT_BACKGROUND,
 			enabled: true,
+			source: "url",
 			url: "https://x.test/a.png",
 			opacity: MIN_OPACITY,
-			scrim: DEFAULT_BACKGROUND.scrim,
-			blur: DEFAULT_BACKGROUND.blur,
 		});
 	});
 
@@ -70,6 +70,7 @@ describe("background image", () => {
 		const root = stubRoot() as ReturnType<typeof stubRoot>;
 		applyBackground(root as unknown as HTMLElement, {
 			enabled: true,
+			source: "url",
 			url: "https://example.com/wall paper.png",
 			opacity: 80,
 			scrim: 60,

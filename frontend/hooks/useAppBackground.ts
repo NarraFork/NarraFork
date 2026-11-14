@@ -5,13 +5,14 @@
  * stable reference between renders, so the parsed object is cached keyed by the raw string.
  */
 
-import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import {
 	applyBackground,
 	BACKGROUND_PREF_KEY,
 	DEFAULT_BACKGROUND,
 	parseBackgroundChoice,
 	subscribeBackground,
+	syncWallpaperLayer,
 	writeStoredBackground,
 } from "../lib/app-background";
 
@@ -43,10 +44,28 @@ export function useAppBackground() {
 		writeStoredBackground(next);
 	}, []);
 
+	const [status, setStatus] = useState<"idle" | "loading" | "ok" | "error">("idle");
+
 	useEffect(() => {
 		if (typeof document === "undefined") return;
 		applyBackground(document.documentElement, choice);
+		let cancelled = false;
+		if (!choice.enabled) {
+			setStatus("idle");
+			void syncWallpaperLayer(choice);
+			return;
+		}
+		setStatus("loading");
+		void syncWallpaperLayer(choice).then((result) => {
+			// The async load can finish after the user changed the preference; ignoring the
+			// stale result keeps the error state from sticking to a newer, valid choice.
+			if (cancelled) return;
+			setStatus(result === "ok" ? "ok" : "error");
+		});
+		return () => {
+			cancelled = true;
+		};
 	}, [choice]);
 
-	return { choice, setChoice };
+	return { choice, setChoice, status };
 }

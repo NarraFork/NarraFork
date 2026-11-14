@@ -1,22 +1,22 @@
 /**
- * Wallpaper layer: paints the user's image behind the app, blurred, under a scrim, with the
- * surface colours turned translucent so it reads through.
+ * Wallpaper layer + translucent surfaces.
  *
  * ## Structure
  *
- *   body        → the picture, plus a scrim gradient over it (fixed, covers the viewport)
- *   #root       → the base surface colour, translucent, `backdrop-filter` blurs the picture
- *   panels      → `--mantine-color-default`, a step more opaque than the base
+ *   #nf-wallpaper (fixed, z-index -1)   <img> with the picture, blurred
+ *                                       ::after with the scrim on top of it
+ *   #root                               base surface colour, translucent
+ *   panels                              `--mantine-color-default`, a step more opaque
  *
- * The picture must live on `body`, not on a `html::before` pseudo-element: a negatively
- * stacked pseudo-element on the root element is painted below the canvas and never shows.
- * `backdrop-filter` on `#root` is what makes the picture soft — a sharp photo behind text
- * is unreadable regardless of how the panels are tuned.
+ * The picture is an `<img>`, not a CSS background: wallpaper hosts commonly answer 403 when
+ * a `Referer` header is present, and only an `<img referrerpolicy="no-referrer">` can load
+ * without one (see `lib/wallpaper-layer.ts`). Keeping it an element also means a failed load
+ * can be detected and reported instead of silently painting nothing.
  *
  * ## Specificity
  *
  * Mantine sets `--mantine-color-body` on `:root[data-mantine-color-scheme="dark"]` (0,2,0).
- * A plain `html[data-nf-bg="on"]` selector (0,1,1) loses to it and the shell then paints an
+ * A plain `html[data-nf-bg="on"]` selector (0,1,1) loses to it, and the shell then paints an
  * opaque background over the picture — the image loads, stacks, and stays invisible. Matching
  * the scheme attribute too (0,3,0) is what makes the override stick.
  */
@@ -54,17 +54,46 @@
 
 html[data-nf-bg="on"] body {
 	background-color: transparent;
-	background-image:
-		linear-gradient(var(--nf-bg-scrim-color), var(--nf-bg-scrim-color)), var(--nf-bg-image);
-	background-size: cover, cover;
-	background-position: center, center;
-	background-repeat: no-repeat, no-repeat;
-	/* Fixed so a long transcript scrolls over a still picture instead of dragging it. */
-	background-attachment: fixed, fixed;
 }
 
 html[data-nf-bg="on"] #root {
 	background: var(--mantine-color-body);
 	min-height: 100vh;
-	backdrop-filter: blur(var(--nf-bg-blur, 10px));
+	/*
+	 * NO `backdrop-filter` here. It would make #root a containing block for every
+	 * `position: fixed` descendant, so floating buttons, toasts and toolbars inside the app
+	 * would anchor to the shell instead of the viewport and visibly jump. The picture is
+	 * blurred on its own `<img>` instead — same look, no layout side effects.
+	 */
+}
+
+#nf-wallpaper {
+	position: fixed;
+	inset: 0;
+	z-index: -1;
+	overflow: hidden;
+	pointer-events: none;
+	background: var(--nf-canvas-base);
+}
+
+/* A failed image must not leave the shell looking broken; it just falls back to the colour. */
+#nf-wallpaper[data-state="error"] {
+	display: none;
+}
+
+#nf-wallpaper > img {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	display: block;
+	filter: blur(var(--nf-bg-blur, 10px));
+	/* Oversized so the blur has pixels to sample at the edges. */
+	transform: scale(1.06);
+}
+
+#nf-wallpaper::after {
+	content: "";
+	position: absolute;
+	inset: 0;
+	background: var(--nf-bg-scrim-color);
 }

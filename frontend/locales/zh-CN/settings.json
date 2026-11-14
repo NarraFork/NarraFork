@@ -3102,5 +3102,12 @@
 	"bgPrivacy": "图片由远端服务器提供：离线或地址失效时会退回纯色背景。遮罩越强，文字越清楚。",
 	"bgBlur": "模糊",
 	"bgBlurSharp": "清晰",
-	"bgBlurSoft": "柔和"
+	"bgBlurSoft": "柔和",
+	"bgSourceUrl": "网络地址",
+	"bgSourceFile": "本地文件",
+	"bgPickFile": "选择图片",
+	"bgNoFile": "还没有选择文件",
+	"bgLoadFailed": "这张图没能加载",
+	"bgLoadFailedHint": "图床可能开了防盗链（会拒绝来自其他站点的请求），或者地址已失效。换成本地文件最稳。",
+	"bgLocalPrivacy": "图片只存在这个浏览器里，不会上传，也不依赖网络。"
 }

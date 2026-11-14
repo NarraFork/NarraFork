@@ -3102,5 +3102,12 @@
 	"bgPrivacy": "Fetched from the remote host: offline or a dead link falls back to the solid colour. A stronger scrim keeps text readable.",
 	"bgBlur": "Blur",
 	"bgBlurSharp": "Sharp",
-	"bgBlurSoft": "Soft"
+	"bgBlurSoft": "Soft",
+	"bgSourceUrl": "Remote URL",
+	"bgSourceFile": "Local file",
+	"bgPickFile": "Choose image",
+	"bgNoFile": "No file selected yet",
+	"bgLoadFailed": "This image could not be loaded",
+	"bgLoadFailedHint": "The host may block hotlinking (requests from other sites) or the link is dead. A local file always works.",
+	"bgLocalPrivacy": "The image stays in this browser: no upload, no network."
 }
