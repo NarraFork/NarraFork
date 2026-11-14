@@ -59,8 +59,8 @@ export {
 	verifyPreparedMainMirror,
 } from "./update-server-main-mirror-history";
 export const MAIN_MIRROR_TOTAL_TIMEOUT_MS = 25 * 60_000;
-/** Source download + upload: at most 4GiB of original assets, matching relay job capacity. */
-export const MIRROR_TOTAL_BYTES = 8 * 1024 ** 3;
+/** Default and hard bound: 32GiB bidirectional, at most 16GiB of original assets. */
+export const MIRROR_TOTAL_BYTES = 32 * 1024 ** 3;
 export const MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS = 25 * 60_000;
 export interface IndependentMirrorReceipt {
 	schemaVersion: 1;

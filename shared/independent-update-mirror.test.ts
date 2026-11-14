@@ -79,6 +79,22 @@ test("pure mirror schema is bound to configured repo, target and complete exact 
 	}
 	expect(() => parseMirrorSnapshot(value, "")).toThrow("unconfigured");
 });
+test.each([
+	1024 ** 3 + 1,
+	4 * 1024 ** 3,
+])("canonical mirror snapshots accept full descriptors up to 4 GiB: %s", (size) => {
+	const legacy = fixture();
+	legacy.index.releases[0].files[0].size = size;
+	const value: MirrorSnapshotV2 = {
+		...legacy,
+		schemaVersion: 2,
+		assets: mirrorAssetsForTarget(legacy.index, legacy.targetVersion, 2),
+	};
+	expect(parseMirrorSnapshot(value, value.repository)).toEqual(value);
+	const tooLarge = structuredClone(value);
+	tooLarge.index.releases[0].files[0].size = MAX_MIRROR_MAIN_BINARY_BYTES + 1;
+	expect(() => parseMirrorSnapshot(tooLarge, value.repository)).toThrow("size");
+});
 test("v2 requires exact full-binary projection while v1 remains metadata-only", () => {
 	const old = fixture();
 	const full: MirrorSnapshotV2 = {
@@ -95,7 +111,8 @@ test("v2 requires exact full-binary projection while v1 remains metadata-only", 
 	expect(() => parseMirrorSnapshot({ ...full, schemaVersion: 1 }, old.repository)).toThrow(
 		"complete",
 	);
-	expect(mirrorAssetLimit("main-binary")).toBe(1024 ** 3);
+	expect(mirrorAssetLimit("main-binary")).toBe(4 * 1024 ** 3);
+	expect(mirrorAssetLimit("patch")).toBe(512 * 1024 ** 2);
 	expect(
 		parseMirrorAssetDescriptor({ ...full.assets[0], size: MAX_MIRROR_MAIN_BINARY_BYTES }).size,
 	).toBe(MAX_MIRROR_MAIN_BINARY_BYTES);

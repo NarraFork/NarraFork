@@ -1,12 +1,14 @@
 import { lstat, mkdir, mkdtemp, realpath, rm, statfs } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { remoteFrontendArtifactNames } from "../../shared/remote-access/frontend-manifest";
 import { validateSmokeMetadata } from "../smoke-release-binary";
 import { runPublicationProcess as runBridgeProcess } from "./ci-publication-runtime";
 import {
 	CI_DISK_RESERVE,
 	CI_METADATA_LIMIT,
+	CI_PLATFORM_ARTIFACT_LIMIT,
 	CI_TEXT_LIMIT,
 	hashReleaseFile,
 	readReleaseText,
@@ -37,8 +39,8 @@ import { restoreRemotePeerReleasePlan } from "./remote-peer-release-prepare";
 
 const TIMEOUT = 15 * 60_000;
 const CONTROL_LIMIT = 4 * 1024 ** 2;
-const BINARY_LIMIT = 1024 ** 3;
-const PLATFORM_LIMIT = BINARY_LIMIT + 2 * 1024 ** 2;
+const BINARY_LIMIT = MAX_RELEASE_BINARY_BYTES;
+const PLATFORM_LIMIT = CI_PLATFORM_ARTIFACT_LIMIT;
 const UPLOAD_ACTION = "Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
@@ -151,12 +153,13 @@ const EXTRACT = `
 import json, os, resource, shutil, stat, sys, zipfile
 resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 ** 2, 512 * 1024 ** 2))
 resource.setrlimit(resource.RLIMIT_CPU, (900, 900))
-archive, destination, mode, binary = sys.argv[1:]
+archive, destination, mode, binary, binary_limit, reserve = sys.argv[1:]
+binary_limit, reserve = int(binary_limit), int(reserve)
 control = mode == 'control'
 remote = mode == 'remote'
 allowed = {'plan.json', 'control.js'} if control else ({binary + '.tar.gz', binary + '.manifest.json'} if remote else {binary, binary + '.metadata.json'})
 required = {'plan.json'} if control else allowed
-maximum = 4 * 1024 ** 2 if control else (129 * 1024 ** 2 if remote else 1024 ** 3 + 65536)
+maximum = 4 * 1024 ** 2 if control else (129 * 1024 ** 2 if remote else binary_limit + 65536)
 with zipfile.ZipFile(archive) as bundle:
     entries = bundle.infolist()
     if len(entries) < 1 or len(entries) > 2: raise ValueError('archive entry limit')
@@ -169,13 +172,13 @@ with zipfile.ZipFile(archive) as bundle:
         kind = stat.S_IFMT(entry.external_attr >> 16)
         if entry.flag_bits & 1 or entry.is_dir() or kind not in (0, stat.S_IFREG):
             raise ValueError('nonregular or encrypted archive entry')
-        limit = (1024 * 1024 if name == 'plan.json' else 3 * 1024 ** 2) if control else ((1024 ** 2 if name.endswith('.manifest.json') else 128 * 1024 ** 2) if remote else (65536 if name.endswith('.metadata.json') else 1024 ** 3))
+        limit = (1024 * 1024 if name == 'plan.json' else 3 * 1024 ** 2) if control else ((1024 ** 2 if name.endswith('.manifest.json') else 128 * 1024 ** 2) if remote else (65536 if name.endswith('.metadata.json') else binary_limit))
         if entry.file_size < 1 or entry.file_size > limit:
             raise ValueError('archive entry size limit')
         total += entry.file_size
         if total > maximum: raise ValueError('archive inflated size limit')
     if not required.issubset(seen): raise ValueError('missing archive inputs')
-    if shutil.disk_usage(destination).free < total + 4 * 1024 ** 3:
+    if shutil.disk_usage(destination).free < total + reserve:
         raise ValueError('insufficient disk space')
     written = 0
     for entry in entries:
@@ -205,12 +208,26 @@ async function extract(
 	options: ReturnType<typeof boundedOptions>,
 ) {
 	await mkdir(destination);
-	await runBridgeProcess("python3", ["-I", "-c", EXTRACT, archive, destination, mode, binary], {
-		timeoutMs: TIMEOUT,
-		maximumOutputBytes: CI_TEXT_LIMIT,
-		signal: options.signal,
-		environment: options.env,
-	});
+	await runBridgeProcess(
+		"python3",
+		[
+			"-I",
+			"-c",
+			EXTRACT,
+			archive,
+			destination,
+			mode,
+			binary,
+			String(BINARY_LIMIT),
+			String(CI_DISK_RESERVE),
+		],
+		{
+			timeoutMs: TIMEOUT,
+			maximumOutputBytes: CI_TEXT_LIMIT,
+			signal: options.signal,
+			environment: options.env,
+		},
+	);
 }
 
 /** Linux/Ubuntu control path only: never fall back to a replace-capable rename. */

@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { type FileHandle, link, mkdtemp, open, rm, statfs } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { hashReleaseFile } from "./ci-release-io";
 
 export interface UpdateServerBridgeConfig {
@@ -83,7 +84,7 @@ interface BodyOptions {
 }
 
 function boundedLimit(value: number): number {
-	if (!Number.isSafeInteger(value) || value <= 0 || value > 1024 ** 3)
+	if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_RELEASE_BINARY_BYTES)
 		throw new Error("Invalid bridge byte limit");
 	return value;
 }

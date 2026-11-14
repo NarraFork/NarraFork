@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import { mirrorAssetsForTarget } from "../../../shared/independent-update-mirror";
+import { MAX_RELEASE_BINARY_BYTES } from "../../../shared/release-patch";
 import type { UpdateSourceIdentity } from "../../../shared/update-identity";
 import {
 	mergeUpdateIndex,
@@ -658,6 +659,54 @@ describe("canonical mirror recovery capabilities", () => {
 });
 
 describe("canonical mirror actual file pipeline", () => {
+	test.each([
+		1024 ** 3 + 1,
+		MAX_RELEASE_BINARY_BYTES,
+	])("verified full descriptors up to 4 GiB reach only the selected mirror: %s", async (size) => {
+		binaryMetadataChanges = { size };
+		const catalog = index();
+		catalog.releases[0].files[0].size = size;
+		catalog.releases[0].files[0].patches = [];
+		const fetcher: UpdateFetchContext = {
+			...transport,
+			fetch: async (url) => {
+				calls.push(url);
+				expect(new URL(url).origin).toBe(identity.serverUrl);
+				if (url === `${baseUrl}/index`) return Response.json(catalog);
+				if (url === sidecarUrl()) return streamed(binarySidecar());
+				return new Response(null, { status: 404 });
+			},
+		};
+		const checked = await checkMirrorUpdate(identity, currentVersion, fetcher);
+		expect(checked.strategy).toBe("full");
+		expect(checked.downloadSize).toBe(size);
+		if (!checked.releaseInfo) throw new Error("Missing mirror release");
+		await expect(
+			downloadMirrorBinary(
+				checked.releaseInfo,
+				outputPath,
+				{ signal: AbortSignal.timeout(1000) },
+				fetcher,
+			),
+		).rejects.toThrow("404");
+		expect(calls.filter((url) => url === fullUrl)).toHaveLength(1);
+		await clean(false);
+	});
+	test("over-4 GiB full descriptors are refused before sidecar or payload requests", async () => {
+		const catalog = index();
+		catalog.releases[0].files[0].size = MAX_RELEASE_BINARY_BYTES + 1;
+		await expect(
+			checkMirrorUpdate(identity, currentVersion, {
+				...transport,
+				fetch: async (url) => {
+					calls.push(url);
+					expect(url).toBe(`${baseUrl}/index`);
+					return Response.json(catalog);
+				},
+			}),
+		).rejects.toThrow("size");
+		expect(calls).toEqual([`${baseUrl}/index`]);
+	});
 	test("the check's actual overall deadline stops optional probes instead of returning full", async () => {
 		const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
 		const timeout = spyOn(AbortSignal, "timeout").mockImplementation((ms) =>

@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdir, open, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,7 +29,7 @@ import {
 } from "../shared/remote-executor";
 import { mergeUpdateIndex, type UpdateIndexRelease } from "../shared/update-index";
 import { createApp } from "../update-server/app";
-import { initConfig } from "../update-server/lib/config";
+import { getConfig, initConfig } from "../update-server/lib/config";
 import { MirrorIngestError, MirrorIngestService } from "../update-server/services/mirror-ingest";
 import { LocalStorage } from "../update-server/storage/local";
 
@@ -598,6 +599,136 @@ test("cancelled full-binary commit verification never upgrades a legacy marker a
 			reading.mockRestore();
 		}
 		expect((await commit(ctx, full)).status).toBe(200);
+	});
+});
+
+test("HTTP mirror admits exact 4GiB main and 512MiB patch descriptors without truncating headers", async () => {
+	await withServer(async (ctx) => {
+		const current = fixture();
+		const binary = { ...fullSnapshot(current.snapshot).assets[0], size: 4 * 1024 ** 3 };
+		const patch = {
+			...(current.snapshot.assets.find((a) => a.kind === "patch") as MirrorAssetDescriptor),
+			size: 512 * 1024 ** 2,
+		};
+		// A failing injected storage boundary proves admission without allocating a huge body
+		// or pretending that unverified bytes produced a successful receipt.
+		const saving = spyOn(ctx.storage, "saveVerifiedFile").mockImplementation(
+			async (_path, body) => {
+				await body.cancel();
+				throw new Error("fixture storage boundary");
+			},
+		);
+		try {
+			for (const asset of [binary, patch]) {
+				for (const [size, length, admitted] of [
+					[asset.size, asset.size, true],
+					[asset.size + 1, asset.size + 1, false],
+					[asset.size, asset.size - 1, false],
+				] as const) {
+					saving.mockClear();
+					const response = await ctx.app.request(`${ctx.url}/assets/${asset.sha256}`, {
+						method: "PUT",
+						headers: {
+							...headers(ctx.token, { ...asset, size }),
+							"content-length": String(length),
+						},
+						body: new Uint8Array([1]),
+					});
+					expect(response.status).toBe(400);
+					expect(saving.mock.calls).toHaveLength(admitted ? 1 : 0);
+					if (admitted) {
+						expect(saving.mock.calls[0][2].size).toBe(size);
+						expect((await response.json()).error).toBe("fixture storage boundary");
+					}
+				}
+			}
+			expect((await ctx.app.request(`${ctx.url}/index`)).status).toBe(404);
+			expect(await ctx.storage.listFiles("mirror-objects")).toEqual([]);
+		} finally {
+			saving.mockRestore();
+		}
+	});
+});
+
+for (const [name, limits, expectedQuota, expectedFree] of [
+	["default", undefined, 32 * 1024 ** 3, 256 * 1024 ** 2],
+	["partial operator config", { minFreeBytes: 0 }, 32 * 1024 ** 3, 0],
+	["hard cap", { quotaBytes: 64 * 1024 ** 3 }, 32 * 1024 ** 3, 256 * 1024 ** 2],
+	["smaller operator quota", { quotaBytes: 1 }, 1, 256 * 1024 ** 2],
+] as const) {
+	test(`mirror 32GiB storage budget preserves ${name}`, async () => {
+		await withServer(
+			async (ctx) => {
+				if (!limits) expect(getConfig().mirrorLimits?.quotaBytes).toBe(32 * 1024 ** 3);
+				const binary = { ...fullSnapshot(fixture().snapshot).assets[0], size: 4 * 1024 ** 3 };
+				const saving = spyOn(ctx.storage, "saveVerifiedFile").mockImplementation(
+					async (_path, body) => {
+						await body.cancel();
+						throw new Error("fixture storage boundary");
+					},
+				);
+				try {
+					await expect(
+						ctx.ingest.ingestAsset(
+							"narrafork",
+							binary,
+							new ReadableStream(),
+							AbortSignal.timeout(5000),
+						),
+					).rejects.toThrow("fixture storage boundary");
+					expect(saving.mock.calls[0][2].quotaBytes).toBe(expectedQuota);
+					expect(saving.mock.calls[0][2].minFreeBytes).toBe(expectedFree);
+				} finally {
+					saving.mockRestore();
+				}
+			},
+			{ mirrorLimits: limits },
+		);
+	});
+}
+
+test("4GiB sparse local object keeps precise streamed download length and slices above signed 32-bit offsets", async () => {
+	await withServer(async (ctx) => {
+		const size = 4 * 1024 ** 3;
+		const binary = { ...fullSnapshot(fixture().snapshot).assets[0], size };
+		const path = `mirror-objects/${binary.sha256}`;
+		const directory = join(ctx.root, "data", "mirror-objects");
+		await mkdir(directory, { recursive: true });
+		const file = await open(join(ctx.root, "data", path), "wx");
+		const tail = Buffer.from("sparse tail");
+		try {
+			await file.truncate(size);
+			await file.write(tail, 0, tail.length, size - tail.length);
+		} finally {
+			await file.close();
+		}
+		expect((await stat(join(ctx.root, "data", path))).blocks * 512).toBeLessThan(1024 ** 2);
+		expect(await ctx.storage.getFileSize(path)).toBe(size);
+		const slice = await ctx.storage.getFileSliceStream(path, size - tail.length, size - 1);
+		expect(await new Response(slice).text()).toBe(tail.toString());
+		// Inject only the catalog lookup: exercise the real disk reader and HTTP body wrapper,
+		// without claiming this deliberately sparse fixture passed SHA256 verification.
+		const reading = spyOn(ctx.ingest, "readMain").mockResolvedValue({
+			index: fixture().snapshot.index,
+			assets: [binary],
+		});
+		const buffering = spyOn(ctx.storage, "getFile");
+		try {
+			const response = await ctx.app.request(`${ctx.url}/assets/${binary.sha256}`);
+			expect(response.status).toBe(200);
+			expect(response.headers.get("content-length")).toBe("4294967296");
+			const reader = response.body?.getReader();
+			if (!reader) throw new Error("Expected streamed body");
+			const chunk = await reader.read();
+			expect(chunk.done).toBe(false);
+			expect(chunk.value?.byteLength).toBeGreaterThan(0);
+			expect(chunk.value?.byteLength).toBeLessThanOrEqual(1024 ** 2);
+			await reader.cancel();
+			expect(buffering.mock.calls).toHaveLength(0);
+		} finally {
+			reading.mockRestore();
+			buffering.mockRestore();
+		}
 	});
 });
 

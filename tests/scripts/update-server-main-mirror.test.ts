@@ -4,6 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CI_RELEASE_TARGETS } from "../../scripts/lib/ci-release-types";
 import {
 	resolveUpdateServerMirrorConfig,
 	UpdateServerMirrorHttp,
@@ -15,6 +16,7 @@ import {
 	prepareUpdateServerMainMirror,
 } from "../../scripts/lib/update-server-main-mirror";
 import { mirrorPublishedGitHubRelease } from "../../scripts/mirror-update-server";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { mergeUpdateIndex } from "../../shared/update-index";
 import { WebDavClient } from "../../shared/webdav-transport";
 import { createApp } from "../../update-server/app";
@@ -298,6 +300,81 @@ describe("canonical independent main mirror", () => {
 		const f = mirrorFixture(false);
 		await mirrorPublishedGitHubRelease(options(f));
 		expect(f.ghCalls.every((args) => args[1].startsWith(`repos/${repository}/`))).toBe(true);
+	});
+	function declaredBinaryFixture(size: number, count = 1) {
+		const f = mirrorFixture(false, false);
+		const file = f.release.files[0];
+		const original = JSON.parse(f.raw.get(file.metadata.name)?.toString() ?? "{}");
+		f.release.files = CI_RELEASE_TARGETS.slice(0, count).map((target) => {
+			const name = `narrafork-${f.release.version}-${target.suffix}`;
+			const raw = Buffer.from(
+				JSON.stringify({
+					...original,
+					name,
+					size,
+					platform: target.platform,
+					target: `bun-${target.target}`,
+				}),
+			);
+			f.raw.set(`${name}.metadata.json`, raw);
+			return {
+				...file,
+				name,
+				size,
+				platform: target.platform,
+				metadata: { name: `${name}.metadata.json`, size: raw.length, sha256: sha(raw) },
+			};
+		});
+		f.assets.splice(
+			0,
+			f.assets.length,
+			...f.release.files.flatMap((file, index) => [
+				{
+					id: 2 * index + 1,
+					name: file.name,
+					size: file.size,
+					digest: `sha256:${file.sha256}`,
+					state: "uploaded",
+				},
+				{
+					id: 2 * index + 2,
+					...file.metadata,
+					digest: `sha256:${file.metadata.sha256}`,
+					state: "uploaded",
+				},
+			]),
+		);
+		f.index = mergeUpdateIndex(null, f.release, repository, f.release.publishedAt);
+		return f;
+	}
+	for (const size of [1024 ** 3 + 1, MAX_RELEASE_BINARY_BYTES])
+		test(`dry-run permits a ${size} byte full descriptor without fetching payload`, async () => {
+			const f = declaredBinaryFixture(size);
+			expect((await mirrorPublishedGitHubRelease({ ...options(f), dryRun: true })).status).toBe(
+				"DRY_RUN",
+			);
+			expect(f.downloaded).toHaveLength(0);
+			expect(f.httpCalls).toHaveLength(0);
+		});
+	test("five individually valid 4GiB full assets exceed the 32GiB bidirectional hard budget", async () => {
+		const fitting = declaredBinaryFixture(1024 ** 3 + 1, 5);
+		expect((await mirrorPublishedGitHubRelease({ ...options(fitting), dryRun: true })).status).toBe(
+			"DRY_RUN",
+		);
+		const f = declaredBinaryFixture(MAX_RELEASE_BINARY_BYTES, 5);
+		expect(MIRROR_TOTAL_BYTES).toBe(32 * 1024 ** 3);
+		await expect(
+			mirrorPublishedGitHubRelease({ ...options(f), dryRun: true }),
+		).rejects.toBeInstanceOf(IndependentMirrorError);
+		expect(f.downloaded).toHaveLength(0);
+		expect(f.httpCalls).toHaveLength(0);
+	});
+	test("4GiB plus one byte full descriptor is rejected before payload", async () => {
+		const f = declaredBinaryFixture(MAX_RELEASE_BINARY_BYTES);
+		f.index.releases[0].files[0].size = MAX_RELEASE_BINARY_BYTES + 1;
+		await expect(mirrorPublishedGitHubRelease({ ...options(f), dryRun: true })).rejects.toThrow();
+		expect(f.downloaded).toHaveLength(0);
+		expect(f.httpCalls).toHaveLength(0);
 	});
 	test("total byte budget rejects before download, with no server mutation", async () => {
 		const f = mirrorFixture();

@@ -12,6 +12,8 @@ import {
 	UpdateServerBridgeHttp,
 } from "../../scripts/lib/update-server-bridge-http";
 
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
+
 const TOKEN = "test-only-secret-do-not-log";
 const config = { serverUrl: "https://bridge.example", token: TOKEN };
 const roots: string[] = [];
@@ -69,6 +71,32 @@ describe("explicit bridge configuration", () => {
 });
 
 describe("bounded bridge HTTP", () => {
+	test("stream budgets allow above 1GiB and 4GiB without allocating their declared limit", async () => {
+		let calls = 0;
+		const bytes = Buffer.from("tiny streamed fixture");
+		const client = http(() => {
+			calls++;
+			return new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(bytes);
+						controller.close();
+					},
+				}),
+			);
+		});
+		for (const maxBytes of [1024 ** 3 + 1, MAX_RELEASE_BINARY_BYTES]) {
+			const result = await client.readHash("/api/v3/products/narrafork/mirror/asset", { maxBytes });
+			expect(result.size).toBe(bytes.length);
+			expect(result.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+		}
+		await expect(
+			client.readHash("/api/v3/products/narrafork/mirror/asset", {
+				maxBytes: MAX_RELEASE_BINARY_BYTES + 1,
+			}),
+		).rejects.toThrow("byte limit");
+		expect(calls).toBe(2);
+	});
 	test("public reads omit authorization; explicit read uses bearer and no redirect", async () => {
 		const requests: RequestInit[] = [];
 		const client = http((_url, init) => {

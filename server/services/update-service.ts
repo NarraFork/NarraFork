@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { inArray } from "drizzle-orm";
-import type { GithubPatchStep } from "../../shared/release-patch";
+import { type GithubPatchStep, MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import {
 	isLegacyMirrorSourceIdentity,
 	type PreparedUpdateIdentity,
@@ -246,7 +246,7 @@ const PLACED_UPDATE_INFO_PATH = join(UPDATE_DIR, "placed-update.json");
 /** Recovery manifest name, owned by update-coordinator; cleanup must never delete it. */
 const RECOVERY_SNAPSHOT_FILE_NAME = "planned-update-recovery.json";
 const PLACED_UPDATE_INFO_FILE_NAME = "placed-update.json";
-const MAX_BINARY_BYTES = 1024 * 1024 * 1024;
+const MAX_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
 const REPLACEMENT_HANDOFF_WATCHDOG_MS = 75_000;
 const CHECKPOINT_MAX_ROUNDS = 8;
 const CHECKPOINT_REQUIRED_STABLE_PASSES = 2;

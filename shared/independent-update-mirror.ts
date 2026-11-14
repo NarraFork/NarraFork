@@ -1,6 +1,6 @@
 import { isValidGitHubRepository } from "./github-repository";
 import { HELPER_BINARY_MAX_BYTES } from "./helper-distribution";
-import { MAX_RELEASE_PATCH_BYTES } from "./release-patch";
+import { MAX_RELEASE_BINARY_BYTES, MAX_RELEASE_PATCH_BYTES } from "./release-patch";
 import { isValidReleaseVersion } from "./release-version";
 import { parseUpdateIndex, updateJsonBytes } from "./update-index";
 import type { UpdateIndexAsset, UpdateIndexV1 } from "./update-index-types";
@@ -9,7 +9,7 @@ export const MIRROR_PROTOCOL_VERSION = 1;
 export const MAX_MIRROR_SNAPSHOT_BYTES = 320 * 1024;
 export const MAX_MIRROR_METADATA_BYTES = 64 * 1024;
 export const MAX_MIRROR_ASSETS = 145;
-export const MAX_MIRROR_MAIN_BINARY_BYTES = 1024 ** 3;
+export const MAX_MIRROR_MAIN_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
 export const MIRROR_MAIN_TRANSFER_TIMEOUT_MS = 15 * 60_000;
 export const MIRROR_MAIN_COMMIT_TIMEOUT_MS = 25 * 60_000;
 export const MIRROR_ASSET_HEADERS = {

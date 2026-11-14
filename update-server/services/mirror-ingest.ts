@@ -24,7 +24,7 @@ import {
 } from "../../shared/remote-peer-manifest";
 import { parseUpdateIndex } from "../../shared/update-index";
 import type { UpdateIndexV1 } from "../../shared/update-index-types";
-import { getConfig } from "../lib/config";
+import { getConfig, MAX_MIRROR_STORAGE_BYTES } from "../lib/config";
 import { logger } from "../lib/logger";
 import type { StorageBackend } from "../storage/types";
 import { objectPath, validateMirrorMetadata, verifyMirrorAsset } from "./mirror-ingest-io";
@@ -390,7 +390,10 @@ export class MirrorIngestService {
 				sha256: asset.sha256,
 				signal,
 				timeoutMs: Math.min(limits?.uploadTimeoutMs ?? timeoutMs, timeoutMs),
-				quotaBytes: Math.min(limits?.quotaBytes ?? 8 * 1024 ** 3, 8 * 1024 ** 3),
+				quotaBytes: Math.min(
+					limits?.quotaBytes ?? MAX_MIRROR_STORAGE_BYTES,
+					MAX_MIRROR_STORAGE_BYTES,
+				),
 				minFreeBytes: Math.max(limits?.minFreeBytes ?? 256 * 1024 ** 2, 0),
 			});
 			signal.throwIfAborted();

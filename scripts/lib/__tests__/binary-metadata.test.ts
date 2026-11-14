@@ -1,12 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
+import { join } from "node:path";
 import {
 	COMPONENT_VERSIONS,
 	createHelperDistributionDependencies,
 } from "../../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../../shared/release-patch";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../../../shared/update-identity";
 import {
 	type BinaryMetadata,
+	computeBinaryMetadata,
 	computeBinaryMetadataFromBuffer,
 	formatChecksumsReport,
 	formatMetadataJson,
@@ -20,6 +24,67 @@ const INPUT = {
 	commit: "abc1234",
 	buildDate: "2026-01-02T03:04:05.000Z",
 };
+
+const roots: string[] = [];
+afterEach(() => {
+	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+function binaryPath() {
+	const root = fs.mkdtempSync(join(process.cwd(), ".narrafork/binary-metadata-"));
+	roots.push(root);
+	return join(root, "narrafork-0.5.0-linux-x64");
+}
+
+describe("computeBinaryMetadata chunked CLI hashing", () => {
+	test("fixed-size reads preserve byte-for-byte metadata and explicit dependency declarations", () => {
+		const path = binaryPath();
+		const bytes = Buffer.alloc(600 * 1024 + 13, 0x71);
+		fs.writeFileSync(path, bytes);
+		const input = {
+			...INPUT,
+			helperDistribution: createHelperDistributionDependencies(),
+			recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
+		};
+		const read = spyOn(fs, "readSync");
+		try {
+			expect(computeBinaryMetadata(path, input)).toEqual(
+				computeBinaryMetadataFromBuffer("narrafork-0.5.0-linux-x64", bytes, input),
+			);
+			expect(read.mock.calls.length).toBe(4);
+			for (const call of read.mock.calls)
+				expect((call[1] as Uint8Array).byteLength).toBe(256 * 1024);
+		} finally {
+			read.mockRestore();
+		}
+	});
+	test("oversized sparse binary fails before reading any payload", () => {
+		const path = binaryPath();
+		fs.writeFileSync(path, "");
+		fs.truncateSync(path, MAX_RELEASE_BINARY_BYTES + 1);
+		const read = spyOn(fs, "readSync");
+		try {
+			expect(() => computeBinaryMetadata(path, INPUT)).toThrow("size");
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+		}
+	});
+	test("read failure closes the pinned file descriptor", () => {
+		const path = binaryPath();
+		fs.writeFileSync(path, "binary");
+		const read = spyOn(fs, "readSync").mockImplementation(() => {
+			throw new Error("fixture read failure");
+		});
+		const close = spyOn(fs, "closeSync");
+		try {
+			expect(() => computeBinaryMetadata(path, INPUT)).toThrow("fixture read failure");
+			expect(close).toHaveBeenCalledTimes(1);
+		} finally {
+			read.mockRestore();
+			close.mockRestore();
+		}
+	});
+});
 
 describe("computeBinaryMetadataFromBuffer", () => {
 	test("computes correct size and both digests", () => {
