@@ -351,7 +351,7 @@ describe("Appearance sync controls", () => {
 		const expected = APPEARANCE_KEYS.filter(
 			(key) => !["narrafork_mock_stream", "narrafork_unified_morph"].includes(key),
 		);
-		expect(keys.toSorted()).toEqual(expected.toSorted());
+		expect([...keys].sort()).toEqual([...expected].sort());
 		expect(new Set(keys).size).toBe(keys.length);
 		const firstInput = container.querySelector<HTMLInputElement>("input");
 		expect(firstInput?.type).toBe("checkbox");
