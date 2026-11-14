@@ -12,7 +12,11 @@ import { expect } from "bun:test";
 import { OutlineWriteError } from "../errors";
 import { convertOutlineHistory } from "../history-convert";
 import { OUTLINE_CHANGE, type OutlineTaskJson } from "../model";
-import { OutlineHistoryUnavailableError, type OutlineLevelCursor } from "../store/history-port";
+import {
+	type OutlineChangedChildCursor,
+	OutlineHistoryUnavailableError,
+	type OutlineLevelCursor,
+} from "../store/history-port";
 import {
 	OUTLINE_HISTORY_LIMITS,
 	OUTLINE_PLACEMENT_FLAGS,

@@ -648,10 +648,10 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// placement, typed with the driver's `Database` so the upgrade test can run the conversion
 	// against a database file of its own. The PostgreSQL store answers the same port
 	// (`postgres-history.ts`).
-	"server/services/outline/store/sqlite-history.ts": ["driver", "handle"],
+	"server/services/outline/store/sqlite-history.ts": ["driver", "handle", "indexHint"],
 	// The copy of the outline's tables before the placement conversion is of the SQLite file
 	// (its path is the connection's); PostgreSQL is backed up by whoever operates it.
-	"server/services/outline/history-backup.ts": ["handle"],
+	"server/services/outline/history-backup.ts": ["driver", "handle", "sqliteCatalog"],
 	"server/services/parent-injection-queue.ts": ["json1"],
 	// SQLite-gated project indexing uses connection change counters only to invalidate
 	// per-pass caches; a PostgreSQL implementation must provide its own revision signal.

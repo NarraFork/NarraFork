@@ -47,11 +47,20 @@ export const OUTLINE_HISTORY_CONVERT = {
 } as const;
 
 /** Timings of the conversion's retries. Mutable only so tests can change them. */
-export const OUTLINE_HISTORY_CONVERT_TIMING: Record<"retryMinMs" | "retryMaxMs", number> = {
+export const OUTLINE_HISTORY_CONVERT_TIMING: Record<
+	"retryMinMs" | "retryMaxMs" | "maxRetries",
+	number
+> = {
 	/** A run that left spaces (an error, a failed copy) runs again after this, doubling… */
 	retryMinMs: 30_000,
-	/** …up to this. */
+	/** …up to this… */
 	retryMaxMs: 10 * 60_000,
+	/**
+	 * …and at most this many times in a row (about an hour and a half in all). After that the
+	 * process stops trying and says so; the next start tries again. A copy that cannot be made
+	 * (no room, a file system that refuses) is not something to retry forever.
+	 */
+	maxRetries: 12,
 };
 
 /** What the conversion needs of a store. */
@@ -82,7 +91,7 @@ export interface OutlineHistoryConvertOptions {
 	 * copy's path (null: this store has nothing to copy). A rejection stops the run before any
 	 * space is touched. Called only when a space is waiting.
 	 */
-	backup?: (() => Promise<string | null>) | null;
+	backup?: ((signal?: AbortSignal) => Promise<string | null>) | null;
 	signal?: AbortSignal;
 	/** Blocks per transaction (tests lower it). */
 	rows?: number;
@@ -147,7 +156,7 @@ export async function convertOutlineHistory(
 		});
 		if (spaces.length > 0 && !copied) {
 			// The copy comes first: a failure here leaves every space as it was.
-			if (options.backup) result.backup = await options.backup();
+			if (options.backup) result.backup = await options.backup(options.signal);
 			copied = true;
 		}
 		for (const space of spaces) {
@@ -182,6 +191,9 @@ export async function convertOutlineHistory(
 let running: Promise<OutlineHistoryConvertResult | null> | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let retryMs = 0;
+let retries = 0;
+/** Aborts the run in progress: its batches, and the copy the other process is making. */
+let abort: AbortController | null = null;
 
 function runAgainIn(delayMs: number): void {
 	if (stopping || timer) return;
@@ -195,32 +207,53 @@ function runAgainIn(delayMs: number): void {
 /**
  * The startup run for the process's store (one at a time). A run that left spaces, could not
  * make the copy or failed is tried again later, backing off from
- * {@link OUTLINE_HISTORY_CONVERT_TIMING.retryMinMs}. Resolves with the run's result (null when
- * it failed).
+ * {@link OUTLINE_HISTORY_CONVERT_TIMING.retryMinMs}, at most
+ * {@link OUTLINE_HISTORY_CONVERT_TIMING.maxRetries} times in a row. Resolves with the run's
+ * result (null when it failed).
  */
 export function scheduleOutlineHistoryConversion(): Promise<OutlineHistoryConvertResult | null> {
 	if (running) return running;
 	if (stopping) return Promise.resolve(null);
 	const store = outlineStore;
+	const controller = new AbortController();
+	abort = controller;
 	const run = (async () => {
 		let result: OutlineHistoryConvertResult | null = null;
 		try {
-			result = await convertOutlineHistory({ store, backup: outlineBackupFor(store) });
+			result = await convertOutlineHistory({
+				store,
+				backup: outlineBackupFor(store),
+				signal: controller.signal,
+			});
 			if (result.spaces || result.left)
 				logger.info("Outline placements built for spaces written before them", { ...result });
 		} catch (error) {
-			logger.warn("Outline placement conversion did not run", { error: String(error) });
+			if (!stopping)
+				logger.warn("Outline placement conversion did not run", { error: String(error) });
 		}
-		if (!stopping && (result === null || result.left > 0)) {
-			retryMs = Math.min(
-				OUTLINE_HISTORY_CONVERT_TIMING.retryMaxMs,
-				retryMs > 0 ? retryMs * 2 : OUTLINE_HISTORY_CONVERT_TIMING.retryMinMs,
+		if (stopping) return result;
+		if (result !== null && result.left === 0) {
+			retryMs = 0;
+			retries = 0;
+			return result;
+		}
+		if (retries >= OUTLINE_HISTORY_CONVERT_TIMING.maxRetries) {
+			logger.error(
+				"Outline placement conversion gave up for this run of the server; spaces written before placements stay unconverted until the next start",
+				{ retries },
 			);
-			runAgainIn(retryMs);
-		} else retryMs = 0;
+			return result;
+		}
+		retries++;
+		retryMs = Math.min(
+			OUTLINE_HISTORY_CONVERT_TIMING.retryMaxMs,
+			retryMs > 0 ? retryMs * 2 : OUTLINE_HISTORY_CONVERT_TIMING.retryMinMs,
+		);
+		runAgainIn(retryMs);
 		return result;
 	})().finally(() => {
 		running = null;
+		if (abort === controller) abort = null;
 	});
 	running = run;
 	return run;
@@ -228,16 +261,21 @@ export function scheduleOutlineHistoryConversion(): Promise<OutlineHistoryConver
 
 /**
  * Stop for shutdown: no run starts from now on, a scheduled one is cancelled, and a run in
- * progress ends after the batch it is on. Resolves when it has ended.
+ * progress is aborted: it ends after the batch it is on, and a copy being made in the other
+ * process is stopped (its partial file removed) rather than waited for. Resolves when the run
+ * has ended.
  */
 export async function stopOutlineHistoryConversion(): Promise<void> {
 	stopping = true;
 	if (timer) clearTimeout(timer);
 	timer = null;
+	abort?.abort();
 	await running?.catch(() => {});
 }
 
 /** Test hook: allow runs again after a stop. */
 export function resumeOutlineHistoryConversionForTests(): void {
 	stopping = false;
+	retryMs = 0;
+	retries = 0;
 }

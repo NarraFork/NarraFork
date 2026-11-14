@@ -19,7 +19,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyPendingMigrationsByHash } from "../../../db/run-migrations";
 import { closeSnapshotBuilds } from "../../../db/snapshot-build";
-import { backupOutlineTables } from "../history-backup";
+import {
+	backupOutlineTables,
+	backupOutlineTablesFresh,
+	readOutlineBackup,
+} from "../history-backup";
 import { convertOutlineHistory } from "../history-convert";
 import type { OutlineLevelCursor } from "../store/history-port";
 import { createSqliteOutlineHistory } from "../store/sqlite-history";
@@ -289,6 +293,9 @@ describe("outline pageless upgrade (golden)", () => {
 			const before = new Map(kept.map((t) => [t, tableDump(database, t, order[t])]));
 			const viewStateBefore = tableDump(database, "outline_view_state", "user_id");
 			const inode = statSync(dbPath).ino;
+			const nextSeqBefore = new Map(
+				database.query("SELECT id, next_seq FROM outline_spaces").values() as [string, number][],
+			);
 
 			// ── the upgrade: the rest of the migrations ──────────────────────────────
 			applyPendingMigrationsByHash(database, MIGRATIONS);
@@ -358,8 +365,24 @@ describe("outline pageless upgrade (golden)", () => {
 						)
 						.values() as [string][]
 				).map(([name]) => name);
-				expect(copied).toEqual(source);
+				// Every outline table, and the stamp the copy wrote last.
+				expect(copied.filter((name) => !name.startsWith("backup_"))).toEqual(source);
 				expect(copied).toContain("outline_spec_imports");
+				expect(readOutlineBackup(interrupted.backup as string)).toMatchObject({
+					format: 1,
+					sourcePath: dbPath,
+					tables: source.length,
+					spaces: 3,
+				});
+				expect(
+					copy
+						.query("SELECT space_id, next_seq, blocks FROM backup_spaces ORDER BY space_id")
+						.values(),
+				).toEqual([
+					["space-a", nextSeqBefore.get("space-a") as number, 700],
+					["space-b", nextSeqBefore.get("space-b") as number, 45],
+					["space-empty", 1, 0],
+				]);
 			} finally {
 				copy.close();
 			}
@@ -454,7 +477,7 @@ describe("outline pageless upgrade (golden)", () => {
 			// The copy is kept, and asked for again it is found, not rewritten.
 			const copyStat = statSync(interrupted.backup as string);
 			const found = await backupOutlineTables({ sourcePath: dbPath, directory: backups });
-			expect(found).toEqual({ path: interrupted.backup as string, created: false });
+			expect(found).toMatchObject({ path: interrupted.backup as string, created: false });
 			expect(statSync(found.path).mtimeMs).toBe(copyStat.mtimeMs);
 		} finally {
 			database.close();
@@ -468,4 +491,88 @@ describe("outline pageless upgrade (golden)", () => {
 		).rejects.toThrow(/snapshot builder failed/);
 		expect(await readdir(directory)).toEqual([]);
 	});
+
+	test("only a validated copy of this database, current for the spaces asked, counts as a copy", async () => {
+		const dbPath = join(root, "narrafork.db");
+		const directory = join(root, "backups-judged");
+		mkdirSync(directory);
+		const today = new Date("2026-11-14T10:00:00.000Z");
+		// Files with a copy's name that are not copies: empty, a database without a stamp, and a
+		// partial file of an earlier day.
+		const empty = join(directory, "outline-before-pageless-2026-11-14.db");
+		writeFileSync(empty, "");
+		const bare = join(directory, "outline-before-pageless-2026-11-13.db");
+		const unstamped = new Database(bare);
+		unstamped.run("CREATE TABLE outline_blocks (id TEXT)");
+		unstamped.close();
+		const stalePartial = join(directory, "outline-before-pageless-2026-11-01.db.partial");
+		writeFileSync(stalePartial, "half a copy");
+		const mine = join(directory, "notes.partial");
+		writeFileSync(mine, "not this module's file");
+		expect(readOutlineBackup(empty)).toBeNull();
+		expect(readOutlineBackup(bare)).toBeNull();
+		expect(readOutlineBackup(join(directory, "missing.db"))).toBeNull();
+
+		const first = await backupOutlineTables({ sourcePath: dbPath, directory, now: today });
+		// A new copy under a name of its own; the impostors are left exactly as they were.
+		expect(first.created).toBe(true);
+		expect(first.path).toBe(join(directory, "outline-before-pageless-2026-11-14-2.db"));
+		expect(first.stamp).toMatchObject({ format: 1, sourcePath: dbPath, spaces: 3 });
+		expect(statSync(empty).size).toBe(0);
+		expect(readOutlineBackup(bare)).toBeNull();
+		expect((await readdir(directory)).sort()).toEqual([
+			"notes.partial",
+			"outline-before-pageless-2026-11-13.db",
+			"outline-before-pageless-2026-11-14-2.db",
+			"outline-before-pageless-2026-11-14.db",
+		]);
+
+		const source = new Database(dbPath, { readonly: true });
+		const seqs = new Map(
+			source.query("SELECT id, next_seq FROM outline_spaces").values() as [string, number][],
+		);
+		source.close();
+		// Current for the spaces asked: found, not made again.
+		const again = await backupOutlineTables({
+			sourcePath: dbPath,
+			directory,
+			expect: seqs,
+			now: today,
+		});
+		expect(again).toMatchObject({ path: first.path, created: false });
+		// A space has moved on since (or is not in it): the copy is stale for it, a new one is made.
+		const moved = new Map(seqs).set("space-a", (seqs.get("space-a") as number) + 1);
+		const newer = await backupOutlineTables({
+			sourcePath: dbPath,
+			directory,
+			expect: moved,
+			now: today,
+		});
+		expect(newer.created).toBe(true);
+		expect(newer.path).toBe(join(directory, "outline-before-pageless-2026-11-14-3.db"));
+		// A copy of another database file is not a copy of this one.
+		const elsewhere = join(root, "elsewhere.db");
+		writeFileSync(elsewhere, readFileSync(dbPath));
+		const other = await backupOutlineTables({ sourcePath: elsewhere, directory, now: today });
+		expect(other.created).toBe(true);
+		expect(other.stamp.sourcePath).toBe(elsewhere);
+		// Fresh: always a new one, whatever is there; the others stay.
+		const before = (await readdir(directory)).sort();
+		const fresh = await backupOutlineTablesFresh({ sourcePath: dbPath, directory, now: today });
+		expect(fresh.created).toBe(true);
+		expect(before).not.toContain(fresh.path.slice(directory.length + 1));
+		expect((await readdir(directory)).sort()).toEqual(
+			[...before, fresh.path.slice(directory.length + 1)].sort(),
+		);
+		expect(readOutlineBackup(fresh.path)).toEqual(fresh.stamp);
+
+		// Stopped while it is being made: no file with a final name, no partial left.
+		const stopped = join(root, "backups-stopped");
+		const stop = new AbortController();
+		stop.abort();
+		await expect(
+			backupOutlineTables({ sourcePath: dbPath, directory: stopped, signal: stop.signal }),
+		).rejects.toThrow();
+		expect(await readdir(stopped)).toEqual([]);
+	}, 120_000);
 });

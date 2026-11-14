@@ -14,6 +14,8 @@ export const DB_SNAPSHOT_KINDS_ENV = "NARRAFORK_SNAPSHOT_KINDS";
  * 影子表是派生数据，不复制。
  */
 export const DB_SNAPSHOT_OUTLINE_KIND = "outline";
+/** 大纲整表拷贝里戳记表（`backup_stamp`）的格式号；读的人只认自己懂的格式。 */
+export const OUTLINE_BACKUP_FORMAT = 1;
 
 /**
  * 导入会读的表（外加 settings 里的 providers）。快照只带它们。
