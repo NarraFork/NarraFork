@@ -34,7 +34,7 @@
 :root[data-mantine-color-scheme][data-nf-bg="on"] {
 	--nf-bg-scrim-color: color-mix(
 		in srgb,
-		var(--nf-canvas-base) var(--nf-bg-scrim, 40%),
+		var(--nf-canvas-base) var(--nf-bg-scrim-effective, 40%),
 		transparent
 	);
 	/*
@@ -43,11 +43,39 @@
 	 * translucent dialog over a wallpaper is unreadable. The shell gets its transparency
 	 * from the `#root` rule below instead, which is scoped to the app surface only.
 	 */
+	/*
+	 * Scheme-adjusted weights. The slider expresses "how present the wallpaper is" for the
+	 * dark scheme; a light scheme needs more separation to stay readable, because a photo
+	 * behind near-white surfaces is otherwise washed out to invisibility.
+	 *
+	 * These are computed here (not in JS) so they follow a light/dark switch without
+	 * re-applying anything.
+	 */
+	--nf-bg-pane-effective: var(--nf-bg-pane-opacity, 80%);
+	--nf-bg-body-effective: var(--nf-bg-body-opacity, 62%);
+	--nf-bg-scrim-effective: var(--nf-bg-scrim, 40%);
+
 	--mantine-color-default: color-mix(
 		in srgb,
-		var(--nf-pane-base) var(--nf-bg-pane-opacity, 80%),
+		var(--nf-pane-base) var(--nf-bg-pane-effective),
 		transparent
 	);
+}
+
+:root[data-mantine-color-scheme="light"][data-nf-bg="on"] {
+	--nf-bg-pane-effective: calc(var(--nf-bg-pane-opacity, 80%) + 10%);
+	--nf-bg-body-effective: calc(var(--nf-bg-body-opacity, 62%) + 12%);
+	--nf-bg-scrim-effective: calc(var(--nf-bg-scrim, 40%) + 12%);
+}
+
+/*
+ * Hard floor: the moment the attribute is set (before the image layer even exists, and
+ * after a failed load) the page canvas must be the theme colour, not the browser default
+ * white. Without this, a failing image on the light scheme left the whole shell washed out
+ * because body is transparent and the shell only supplies 62% of a colour over nothing.
+ */
+html[data-nf-bg="on"] {
+	background: var(--nf-canvas-base);
 }
 
 html[data-nf-bg="on"] body {
@@ -75,11 +103,6 @@ html[data-nf-bg="on"] #root {
 	background: var(--nf-canvas-base);
 }
 
-/* A failed image must not leave the shell looking broken; it just falls back to the colour. */
-#nf-wallpaper[data-state="error"] {
-	display: none;
-}
-
 #nf-wallpaper > img {
 	width: 100%;
 	height: 100%;
@@ -88,6 +111,15 @@ html[data-nf-bg="on"] #root {
 	filter: blur(var(--nf-bg-blur, 10px));
 	/* Oversized so the blur has pixels to sample at the edges. */
 	transform: scale(1.06);
+}
+
+/*
+ * A failed image must not leave the shell looking broken — but it must not be hidden either:
+ * the layer also paints the canvas colour behind the translucent shell. Hiding it here was
+ * exactly what washed the UI out when a load failed on the light scheme.
+ */
+#nf-wallpaper[data-state="error"] > img {
+	visibility: hidden;
 }
 
 #nf-wallpaper::after {

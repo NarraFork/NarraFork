@@ -16,6 +16,7 @@ import {
 import { clearWallpaperBlob, saveWallpaperBlob } from "@frontend/lib/wallpaper-store";
 import {
 	Alert,
+	Badge,
 	Box,
 	Button,
 	FileButton,
@@ -149,6 +150,36 @@ export function BackgroundCard() {
 					)}
 				</Group>
 			)}
+
+			{/* A one-line state readout: without it a failed load is indistinguishable from
+			    "the wallpaper is too subtle to see", which is exactly the confusion this card
+			    caused before. */}
+			<Group gap={6}>
+				<Text size="xs" c="dimmed">
+					{t("bgStatus")}
+				</Text>
+				<Badge
+					size="xs"
+					variant="light"
+					color={
+						status === "ok"
+							? "green"
+							: status === "error"
+								? "red"
+								: status === "loading"
+									? "gray"
+									: "gray"
+					}
+				>
+					{status === "ok"
+						? t("bgStatusLoaded")
+						: status === "error"
+							? t("bgStatusFailed")
+							: status === "loading"
+								? t("bgStatusLoading")
+								: t("bgStatusOff")}
+				</Badge>
+			</Group>
 
 			{status === "error" ? (
 				<Alert

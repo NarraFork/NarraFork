@@ -3110,5 +3110,10 @@
 	"bgLoadFailed": "This image could not be loaded",
 	"bgLoadFailedHint": "The host may block hotlinking (requests from other sites) or the link is dead. A local file always works.",
 	"bgLocalPrivacy": "The image stays in this browser: no upload, no network.",
-	"bgReload": "Reload"
+	"bgReload": "Reload",
+	"bgStatus": "Status",
+	"bgStatusLoaded": "Loaded",
+	"bgStatusFailed": "Failed",
+	"bgStatusLoading": "Loading",
+	"bgStatusOff": "Off"
 }
