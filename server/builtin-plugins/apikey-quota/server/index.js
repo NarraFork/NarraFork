@@ -4,10 +4,10 @@
  * Owns the "how do I ask a relay for this key's allowance, and how do I read the answer"
  * half of provider balance querying. The host keeps provider config, credential storage,
  * scheduling, caching, DTOs and HTTP routes; it calls this process once per query through
- * `tools.invoke` (`query-balance`).
+ * `commands.invoke` (`query-balance`).
  *
  * Standalone by design: no imports from the host, no host storage/secrets/config access.
- * The API key arrives in the tool input for that one call and is never written anywhere.
+ * The API key arrives in the command input for that one call and is never written anywhere.
  *
  * Protocol knowledge here mirrors `server/lib/provider-balance-adapters.ts` +
  * `server/lib/provider-balance-transport.ts` at the time of extraction (NarraFork 0.9.x).
@@ -609,9 +609,9 @@ export async function refreshProviderBalance(input, signal, fetcher) {
 	}
 }
 
-// --- Tool handler ---
+// --- Command handler ---
 
-export function parseToolInput(raw) {
+export function parseCommandInput(raw) {
 	if (!record(raw)) throw new ProbeRequestError("unsupported");
 	const mode = raw.mode === "refresh" ? "refresh" : raw.mode === "probe" ? "probe" : null;
 	if (!mode) throw new ProbeRequestError("unsupported");
@@ -652,65 +652,41 @@ export function parseToolInput(raw) {
 	return input;
 }
 
-/**
- * Tool outcomes travel in a successful RPC response with an explicit `status`, so a
- * protocol-level answer ("this relay has no allowance endpoint", "the request failed") is
- * never confused with transport/runtime failure ("the plugin is not running"). Only the
- * latter is a JSON-RPC error, and the host treats it as "plugin unavailable".
- */
 async function queryBalance(rawInput, signal) {
-	const input = parseToolInput(rawInput);
+	const input = parseCommandInput(rawInput);
 	if (input.mode === "probe") {
 		let found;
 		try {
-			// A configured site account is authoritative: the inference-key endpoints would
-			// answer a different question, so they are not consulted as a fallback.
+			// Site-account credit is authoritative; never substitute inference-key quota.
 			found = hasSiteQuotaConfig(input)
 				? await probeSiteQuota(input, signal)
 				: await probeProviderBalance(input, signal);
 		} catch (error) {
-			const kind = error instanceof ProbeRequestError ? error.kind : "transient";
-			return failure(kind);
+			return failure(error instanceof ProbeRequestError ? error.kind : "transient");
 		}
-		if (!found) {
-			return {
-				output: JSON.stringify({ status: "unsupported" }),
-				metadata: { status: "unsupported" },
-			};
-		}
+		if (!found) return { output: { status: "unsupported" } };
 		return {
-			output: JSON.stringify({
+			output: {
 				status: "ok",
 				adapter: found.adapter,
 				root: found.root,
 				balance: found.balance,
-			}),
-			title: "API key quota",
-			metadata: { status: "ok", adapter: found.adapter },
+			},
 		};
 	}
-	let balance;
 	try {
-		balance =
+		const balance =
 			input.adapter === NEW_API_USER_ADAPTER
 				? await refreshSiteQuota(input, signal)
 				: await refreshProviderBalance(input, signal);
+		return { output: { status: "ok", balance } };
 	} catch (error) {
-		const kind = error instanceof ProbeRequestError ? error.kind : "transient";
-		return failure(kind);
+		return failure(error instanceof ProbeRequestError ? error.kind : "transient");
 	}
-	return {
-		output: JSON.stringify({ status: "ok", balance }),
-		title: "API key quota",
-		metadata: { status: "ok", adapter: input.adapter },
-	};
 }
 
 function failure(kind) {
-	return {
-		output: JSON.stringify({ status: "failed", kind }),
-		metadata: { status: "failed" },
-	};
+	return { output: { status: "failed", kind } };
 }
 
 // --- RPC plumbing (Content-Length framed JSON-RPC over stdio) ---
@@ -776,22 +752,22 @@ function reject(id, code, message, data) {
 	send({ jsonrpc: "2.0", id, error: { code, message, ...(data === undefined ? {} : { data }) } });
 }
 
-async function invokeTool(id, params) {
+async function invokeCommand(id, params) {
 	if (!active) {
 		reject(id, -32009, "Plugin is not active", { code: "PLUGIN_UNAVAILABLE" });
 		return;
 	}
 	if (!record(params) || params.contributionId !== "query-balance") {
-		reject(id, -32602, "Unknown tool contribution", { code: "INVALID_PARAMS" });
+		reject(id, -32602, "Unknown command contribution", { code: "INVALID_PARAMS" });
 		return;
 	}
 	const controller = new AbortController();
 	inFlight.set(id, controller);
 	try {
 		const result = await queryBalance(params.input, controller.signal);
-		respond(id, result);
+		if (!controller.signal.aborted) respond(id, result);
 	} catch (error) {
-		// Only malformed input reaches here; fixed codes only, never upstream text.
+		if (controller.signal.aborted) return;
 		const detail =
 			error instanceof ProbeRequestError
 				? { code: "BALANCE_UNSUPPORTED" }
@@ -834,8 +810,8 @@ function handleRequest(message) {
 				generation,
 			});
 			return;
-		case "tools.invoke":
-			void invokeTool(message.id, params);
+		case "commands.invoke":
+			void invokeCommand(message.id, params);
 			return;
 		case "cancel": {
 			const target = record(params)?.requestId;
@@ -869,6 +845,10 @@ function handleRequest(message) {
 
 function handleMessage(message) {
 	if (!record(message) || message.jsonrpc !== "2.0" || typeof message.method !== "string") return;
+	if (message.method === "$/cancelRequest") {
+		inFlight.get(record(message.params)?.requestId)?.abort();
+		return;
+	}
 	if (!("id" in message)) return;
 	handleRequest(message);
 }
