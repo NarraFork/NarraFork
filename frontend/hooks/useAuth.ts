@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ApiError, api, endSession, getToken, setToken } from "../lib/api";
 import { isMfaChallenge, type LoginResult, type LoginSession } from "../lib/api/auth";
@@ -5,8 +6,13 @@ import { assetUrl } from "../lib/base-path";
 import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
 
 /** Establish a session from a login/verify result: store token, seed cache, set language. */
-async function applySession(qc: QueryClient, data: LoginSession): Promise<void> {
-	setToken(data.token);
+export async function applySession(qc: QueryClient, data: LoginSession): Promise<void> {
+	if (REMOTE_BUILD) {
+		const { establishRemoteSession } = await import("@frontend/remote/session");
+		await establishRemoteSession(data, setToken);
+	} else {
+		setToken(data.token);
+	}
 	// Seed the user cache immediately so AuthenticatedLayout won't flash.
 	qc.setQueryData(["auth", "me"], data.user);
 	try {
@@ -296,5 +302,15 @@ export function useUpdateAuthConfig() {
 			// SSO provider list on the login page may have changed.
 			qc.invalidateQueries({ queryKey: ["auth", "sso-providers"] });
 		},
+	});
+}
+
+/**
+ * Probe the LDAP directory without saving. Deliberately not cached and never invalidating
+ * the config: a test says nothing about what is stored.
+ */
+export function useTestLdap() {
+	return useMutation({
+		mutationFn: api.testLdap,
 	});
 }

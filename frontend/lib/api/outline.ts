@@ -23,6 +23,8 @@ import type {
 	OutlineSpaceListResponse,
 	OutlineSpaceResolveResponse,
 	OutlineTimelineResponse,
+	OutlineTreeResponse,
+	OutlineTreeSpacesResponse,
 	OutlineViewMode,
 	OutlineViewStatePutRequest,
 	OutlineViewStateResponse,
@@ -33,6 +35,18 @@ import type {
 	OutlineDigestNowResponse,
 	OutlineDigestUndoResponse,
 } from "@shared/outline-digest";
+import type {
+	OutlineSpecImportAdminPage,
+	OutlineSpecImportAdminState,
+	OutlineSpecImportRevertResult,
+	OutlineSpecImportStatus,
+	OutlineSpecLossAction,
+	OutlineSpecLossDetail,
+	OutlineSpecLossFinding,
+	OutlineSpecLossPage,
+	OutlineSpecLossScanStatus,
+	OutlineSpecLossStatus,
+} from "@shared/outline-spec-import";
 import type {
 	NarratorCurrentTaskResponse,
 	OutlineBoardAddRequest,
@@ -61,6 +75,12 @@ function query(params: Record<string, string | number | undefined | null>): stri
 
 const enc = encodeURIComponent;
 
+/** Where the swallowed-content findings are read: a session's, or the admin page's (all). */
+const specLossBase = (narratorId: string | null) =>
+	narratorId
+		? `/outline/narrators/${enc(narratorId)}/spec-import/loss`
+		: "/admin/outline/spec-import/loss";
+
 export const outlineApi = {
 	listOutlineSpaces: (params: {
 		kind?: OutlineSpaceKind;
@@ -79,12 +99,31 @@ export const outlineApi = {
 		}),
 	getOutlineSpace: (spaceId: string) =>
 		request<OutlineSpaceDetailResponse>(`/outline/spaces/${enc(spaceId)}`),
+	/** The connected outline's root: my space, a page of project spaces, the groups' counts. */
+	getOutlineTree: (params: { cursor?: string | null }) =>
+		request<OutlineTreeResponse>(`/outline/tree${query(params)}`),
+	/** A page of a project's sessions, or of a group's spaces, in the connected outline. */
+	listOutlineTreeSpaces: (
+		group: { kind: "project"; projectId: string } | { kind: "loose" | "orphaned" },
+		params: { cursor?: string | null },
+	) =>
+		request<OutlineTreeSpacesResponse>(
+			group.kind === "project"
+				? `/outline/tree/projects/${enc(group.projectId)}/sessions${query(params)}`
+				: `/outline/tree/${group.kind}${query(params)}`,
+		),
 	listOutlinePages: (spaceId: string, params: { cursor?: string | null; limit?: number }) =>
 		request<OutlinePageListResponse>(`/outline/spaces/${enc(spaceId)}/pages${query(params)}`),
 	getOutlineBlock: (
 		spaceId: string,
 		blockId: string,
-		params: { asOf?: number; view?: OutlineViewMode; blocks?: number },
+		params: {
+			asOf?: number;
+			view?: OutlineViewMode;
+			blocks?: number;
+			bytes?: number;
+			fold?: "default";
+		},
 	) =>
 		request<OutlineBlockViewResponse>(
 			`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}${query(params)}`,
@@ -109,7 +148,7 @@ export const outlineApi = {
 		request<OutlineTimelineResponse>(
 			`/outline/spaces/${enc(spaceId)}/pages/${enc(pageId)}/commits${query(params)}`,
 		),
-	searchOutline: (params: { q: string; spaceId?: string; limit?: number }) =>
+	searchOutline: (params: { q: string; spaceId?: string; limit?: number; cursor?: string }) =>
 		request<OutlineSearchResponse>(`/outline/search${query(params)}`),
 	/** Where a reference (`ref`, within `space` when bare) or a commit seq of `space` points. */
 	resolveOutline: (params: { ref?: string; space?: string; commit?: number }) =>
@@ -228,6 +267,71 @@ export const outlineApi = {
 		request<OutlineBoardFinishedResponse>(
 			`/outline/spaces/${enc(spaceId)}/tasks/finished${query({ cursor })}`,
 		),
+	/** Whether a session's Dynamic Spec is to be imported into the outline, and how that went. */
+	getSpecImportStatus: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`),
+	/** Start the import of a session's Dynamic Spec now. */
+	startSpecImport: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/outline/narrators/${enc(narratorId)}/spec-import`, {
+			method: "POST",
+		}),
+	/** The import's admin page (administrators): one state's sessions, a page at a time. */
+	getSpecImportAdminPage: (query: {
+		state: OutlineSpecImportAdminState;
+		cursor?: string | null;
+		limit?: number;
+	}) => {
+		const params = new URLSearchParams({ state: query.state });
+		if (query.cursor) params.set("cursor", query.cursor);
+		if (query.limit) params.set("limit", String(query.limit));
+		return request<OutlineSpecImportAdminPage>(`/admin/outline/spec-import?${params.toString()}`);
+	},
+	/** An administrator imports a session again (attention and failed attempts cleared). */
+	reimportSpecSession: (narratorId: string) =>
+		request<OutlineSpecImportStatus>(`/admin/outline/spec-import/${enc(narratorId)}/reimport`, {
+			method: "POST",
+		}),
+	/** An administrator moves a session the import moved back to Dynamic Spec. */
+	revertSpecImport: (narratorId: string) =>
+		request<OutlineSpecImportRevertResult>(`/admin/outline/spec-import/${enc(narratorId)}/revert`, {
+			method: "POST",
+		}),
+	/**
+	 * Content the old Spec panel may have swallowed (outline P2 PR 12c): one status's findings, a
+	 * page at a time. Of one session with `narratorId`; of every session without (administrators).
+	 */
+	getSpecLossPage: (
+		narratorId: string | null,
+		query: { status: OutlineSpecLossStatus; cursor?: string | null; limit?: number },
+	) => {
+		const params = new URLSearchParams({ status: query.status });
+		if (query.cursor) params.set("cursor", query.cursor);
+		if (query.limit) params.set("limit", String(query.limit));
+		return request<OutlineSpecLossPage>(`${specLossBase(narratorId)}?${params.toString()}`);
+	},
+	/** One finding with the lost text. */
+	getSpecLossDetail: (narratorId: string | null, findingId: string) =>
+		request<OutlineSpecLossDetail>(`${specLossBase(narratorId)}/${enc(findingId)}`),
+	/**
+	 * A person's decision about one finding: attach to the imported page, dismiss, reopen.
+	 * `confirmRule`: with an attach of a finding of the behavior fence, the person confirmed that
+	 * the agent will read the content as a rule (the server refuses the attach without it).
+	 */
+	decideSpecLoss: (
+		narratorId: string | null,
+		findingId: string,
+		action: OutlineSpecLossAction,
+		options: { confirmRule?: boolean } = {},
+	) =>
+		request<OutlineSpecLossFinding>(`${specLossBase(narratorId)}/${enc(findingId)}`, {
+			method: "POST",
+			body: JSON.stringify({ action, ...(options.confirmRule ? { confirmRule: true } : {}) }),
+		}),
+	/** An administrator starts a scan pass (answered at once; it runs in the background). */
+	startSpecLossScan: () =>
+		request<OutlineSpecLossScanStatus>("/admin/outline/spec-import/loss-scan", {
+			method: "POST",
+		}),
 	/** A person adds a task to a session. */
 	addBoardTask: (narratorId: string, body: OutlineBoardAddRequest) =>
 		request<OutlineBoardAddResponse>(`/outline/narrators/${enc(narratorId)}/tasks`, {

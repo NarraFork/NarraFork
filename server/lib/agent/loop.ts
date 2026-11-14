@@ -4225,6 +4225,7 @@ async function* agentLoopInMetadataSnapshot(
 						cacheCreationInputTokens?: number;
 						cacheCreation5mTokens?: number;
 						cacheCreation1hTokens?: number;
+						cacheReported?: boolean;
 				  }
 				| undefined;
 			let requestContextPercent: number | undefined;
@@ -5953,6 +5954,11 @@ async function* agentLoopInMetadataSnapshot(
 									parsed.usage.cacheCreation5mTokens ?? previousUsage?.cacheCreation5mTokens,
 								cacheCreation1hTokens:
 									parsed.usage.cacheCreation1hTokens ?? previousUsage?.cacheCreation1hTokens,
+								// Sticky: a later counter-less delta cannot retract cache fields seen earlier.
+								cacheReported:
+									previousUsage?.cacheReported === true || parsed.usage.cacheReported === true
+										? true
+										: (parsed.usage.cacheReported ?? previousUsage?.cacheReported),
 							};
 							const contextWindow =
 								parsed.usage.contextWindow ??

@@ -17,6 +17,9 @@
  * - 新增 NOT NULL 且无默认值的列会让旧快照导入缺列（列交集只能拷贝双方都有的列），
  *   需要补默认值或拒绝旧版本；
  * - 新增需要「清空」的数据需在 `clearData` 对应分支处理；
+ * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话改了 task_backend 时删掉它的行，清空会话时一起清；
+ * - 被吞内容排查的两张表（`outline_spec_loss_findings` / `outline_spec_loss_scans`，12c）也不导出：
+ *   说的是本机 spec 修订的事（spec 表不导出），覆盖会话不动它们，清空会话时一起清；
  * - 改完跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
  * 详见 docs/DATA_PORTABILITY.md。
  */
@@ -55,6 +58,8 @@ import {
 	withFirstKeys,
 	withoutKeys,
 } from "@server/services/data-portability-keys";
+import { resetSpecImportStateCache } from "@server/services/outline/spec-import/state";
+import { invalidateTaskBackend } from "@server/services/task-source/backend";
 import { addImportedRequestsToUsageDaily } from "@server/services/usage-daily";
 import {
 	MAX_IMPORT_BYTES,
@@ -1156,7 +1161,21 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					}
 					// 覆盖只更新会话行本身：删掉本地 refs/tool_calls 会级联抹掉其它表对它们的引用，
 					// 也会丢掉导出之后本地新增的历史。合并语义不删除本地数据。
+					const backendBefore = (
+						sqlite.prepare(`SELECT task_backend FROM main.narrators WHERE id = ?`).get(id) as
+							| { task_backend: string | null }
+							| undefined
+					)?.task_backend;
 					sqlite.run(`UPDATE main.narrators SET ${columnAssignments} WHERE id = ?`, [id]);
+					// The Dynamic Spec import's state (outline P2 PR 12b2) is not exported: it relates
+					// this machine's spec rows to its outline content. Kept while the incoming row keeps
+					// the session's task backend (an administrator's move back stays decided); dropped
+					// when it brings another one, derived again by the next attempt.
+					sqlite.run(
+						`DELETE FROM main.outline_spec_imports WHERE narrator_id = ?
+						AND (SELECT task_backend FROM main.narrators WHERE id = ?) IS NOT ?`,
+						[id, id, backendBefore ?? null],
+					);
 					// Workspaces are local UI state, not snapshot tables. Imported session titles
 					// still invalidate any candidate generated from their previous metadata.
 					sqlite.run(
@@ -1293,7 +1312,12 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		}
 	}
 
-	if (options.include?.sessions ?? true) invalidateGitIdentityCache();
+	if (options.include?.sessions ?? true) {
+		invalidateGitIdentityCache();
+		// Overwritten sessions may bring another task backend; their import state was dropped.
+		invalidateTaskBackend();
+		resetSpecImportStateCache();
+	}
 
 	// The key store is a file outside the SQLite transaction, so the remaining keys are
 	// written only once the transaction committed. The first key of each provider (and the
@@ -1749,6 +1773,11 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				sqlite.run(`DELETE FROM recent_tab_archive_marks`);
 				// Unlike narrator picks, folder picks have no narrator FK to cascade through.
 				sqlite.run(`DELETE FROM folder_git_identity_bindings`);
+				// The Dynamic Spec import's state (outline P2 PR 12b2); the narrator FK cascades too.
+				sqlite.run(`DELETE FROM outline_spec_imports`);
+				// What the swallowed-content scan recorded about these sessions (outline P2 PR 12c).
+				sqlite.run(`DELETE FROM outline_spec_loss_findings`);
+				sqlite.run(`DELETE FROM outline_spec_loss_scans`);
 				sqlite.run(`DELETE FROM narrators`);
 				deleted.sessions = Number(before.n);
 			}
@@ -1790,7 +1819,11 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 			}
 		});
 		transaction();
-		if (clearSessions) invalidateGitIdentityCache();
+		if (clearSessions) {
+			invalidateGitIdentityCache();
+			invalidateTaskBackend();
+			resetSpecImportStateCache();
+		}
 	}
 
 	return { target, deleted };

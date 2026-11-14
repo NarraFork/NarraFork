@@ -1,0 +1,759 @@
+NarraFork remote-peer: independent distribution third-party materials
+
+Scope: Go 1.26.1 standard library (including its bundled vendor packages) and all 23 modules required by remote-peer/go.mod, as locked by go.sum.
+These components are compiled into the separately downloaded remote-peer, not embedded in the NarraFork main executable.
+Test-only modules appearing only in go.sum (testify and yaml) are not linked or distributed.
+CGO is disabled. BoringSSL, Go build tools, Pion test-wasm/examples/testdata are not part of these six peer binaries.
+
+All license and notice bodies below are copied verbatim from the installed Go 1.26.1 source or locked module source cache. Exact byte-identical materials are explicitly mapped to their first full-text section, without merging different authors or years. SHA-256 identifies each original body or indicated original source-line excerpt.
+The additional Go-authored Pion and anet notices accompany the complete Go BSD license; the fiat-crypto notices accompany the standard-library notice.
+
+Review note: Pion interceptor/pkg/twcc/arrival_time_map.go declares MIT but describes an adaptation of Chrome/WebRTC. The module supplies no separate WebRTC notice; this upstream attribution question remains subject to review, not a claim of independently verified legal compliance.
+
+=== Source 1 ===
+Module: Go standard library
+Version: go1.26.1
+Upstream: https://github.com/golang/go/tree/go1.26.1
+Source file: LICENSE
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+----- BEGIN VERBATIM -----
+Copyright 2009 The Go Authors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google LLC nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+----- END VERBATIM -----
+
+=== Source 2 ===
+Module: Go standard library
+Version: go1.26.1
+Upstream: https://github.com/golang/go/tree/go1.26.1
+Source file: PATENTS
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+----- BEGIN VERBATIM -----
+Additional IP Rights Grant (Patents)
+
+"This implementation" means the copyrightable works distributed by
+Google as part of the Go project.
+
+Google hereby grants to You a perpetual, worldwide, non-exclusive,
+no-charge, royalty-free, irrevocable (except as stated in this section)
+patent license to make, have made, use, offer to sell, sell, import,
+transfer and otherwise run, modify and propagate the contents of this
+implementation of Go, where such license applies only to those patent
+claims, both currently owned or controlled by Google and acquired in
+the future, licensable by Google that are necessarily infringed by this
+implementation of Go.  This grant does not include claims that would be
+infringed only as a consequence of further modification of this
+implementation.  If you or your agent or exclusive licensee institute or
+order or agree to the institution of patent litigation against any
+entity (including a cross-claim or counterclaim in a lawsuit) alleging
+that this implementation of Go or any code incorporated within this
+implementation of Go constitutes direct or contributory patent
+infringement, or inducement of patent infringement, then any patent
+rights granted to you under this License for this implementation of Go
+shall terminate as of the date such litigation is filed.
+
+----- END VERBATIM -----
+
+=== Source 3 ===
+Module: Go standard-library vendor/golang.org/x/crypto
+Version: v0.46.1-0.20251210140736-7dacc380ba00
+Upstream: https://github.com/golang/crypto
+Source file: src/vendor/golang.org/x/crypto/LICENSE
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 4 ===
+Module: Go standard-library vendor/golang.org/x/crypto
+Version: v0.46.1-0.20251210140736-7dacc380ba00
+Upstream: https://github.com/golang/crypto
+Source file: src/vendor/golang.org/x/crypto/PATENTS
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+
+=== Source 5 ===
+Module: Go standard-library vendor/golang.org/x/net
+Version: v0.47.1-0.20251128220604-7c360367ab7e
+Upstream: https://github.com/golang/net
+Source file: src/vendor/golang.org/x/net/LICENSE
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 6 ===
+Module: Go standard-library vendor/golang.org/x/net
+Version: v0.47.1-0.20251128220604-7c360367ab7e
+Upstream: https://github.com/golang/net
+Source file: src/vendor/golang.org/x/net/PATENTS
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+
+=== Source 7 ===
+Module: Go standard-library vendor/golang.org/x/sys
+Version: v0.39.0
+Upstream: https://github.com/golang/sys
+Source file: src/vendor/golang.org/x/sys/LICENSE
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 8 ===
+Module: Go standard-library vendor/golang.org/x/sys
+Version: v0.39.0
+Upstream: https://github.com/golang/sys
+Source file: src/vendor/golang.org/x/sys/PATENTS
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+
+=== Source 9 ===
+Module: Go standard-library vendor/golang.org/x/text
+Version: v0.32.0
+Upstream: https://github.com/golang/text
+Source file: src/vendor/golang.org/x/text/LICENSE
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 10 ===
+Module: Go standard-library vendor/golang.org/x/text
+Version: v0.32.0
+Upstream: https://github.com/golang/text
+Source file: src/vendor/golang.org/x/text/PATENTS
+License / notice: BSD-3-Clause; PATENTS is the additional IP rights grant
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+
+=== Source 11 ===
+Module: Go standard library: fiat-crypto generated field/scalar arithmetic
+Version: v0.0.9 (Go 1.26.1)
+Upstream: https://github.com/mit-plv/fiat-crypto
+Source file: src/crypto/internal/fips140/nistec/fiat/README
+License / notice: BSD-1-Clause
+Source SHA-256: 2edb21e35fbd9a239a91dfeb724a02315aff85492aa72824bbb4ac8910da94ac
+----- BEGIN VERBATIM -----
+The code in this package was autogenerated by the fiat-crypto project
+at version v0.0.9 from a formally verified model, and by the addchain
+project at a recent tip version.
+
+    docker build -t fiat-crypto:v0.0.9 .
+    go install github.com/mmcloughlin/addchain/cmd/addchain@v0.3.1-0.20211027081849-6a7d3decbe08
+    ../../../../../bin/go run generate.go
+
+fiat-crypto code comes under the following license.
+
+    Copyright (c) 2015-2020 The fiat-crypto Authors. All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+        1. Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+
+    THIS SOFTWARE IS PROVIDED BY the fiat-crypto authors "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+    THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+    PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL Berkeley Software Design,
+    Inc. BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The authors are listed at
+
+    https://github.com/mit-plv/fiat-crypto/blob/master/AUTHORS
+
+----- END VERBATIM -----
+
+=== Source 12 ===
+Module: Go standard library: fiat-crypto scalar arithmetic
+Version: v0.0.9 (Go 1.26.1)
+Upstream: https://github.com/mit-plv/fiat-crypto
+Source file: src/crypto/internal/fips140/edwards25519/scalar.go:29-54 (verbatim source notice)
+License / notice: BSD-1-Clause
+Source SHA-256: 0c4211885ddb2070c2e61d172c1970817a416ce824f955bfc6c37fe830dcd204
+----- BEGIN VERBATIM -----
+// The field implementation in scalar_fiat.go is generated by the fiat-crypto
+// project (https://github.com/mit-plv/fiat-crypto) at version v0.0.9 (23d2dbc)
+// from a formally verified model.
+//
+// fiat-crypto code comes under the following license.
+//
+//     Copyright (c) 2015-2020 The fiat-crypto Authors. All rights reserved.
+//
+//     Redistribution and use in source and binary forms, with or without
+//     modification, are permitted provided that the following conditions are
+//     met:
+//
+//         1. Redistributions of source code must retain the above copyright
+//         notice, this list of conditions and the following disclaimer.
+//
+//     THIS SOFTWARE IS PROVIDED BY the fiat-crypto authors "AS IS"
+//     AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+//     THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+//     PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL Berkeley Software Design,
+//     Inc. BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+//     EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+//     PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+//     PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+//     LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+//     NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+//     SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+----- END VERBATIM -----
+
+=== Source 13 ===
+Module: Go standard library math: SunPro fdlibm
+Version: Go 1.26.1 source
+Upstream: https://github.com/golang/go/tree/go1.26.1/src/math
+Source file: src/math/sqrt.go:12-19 (verbatim source notice)
+License / notice: LicenseRef-Sun-fdlibm
+Source SHA-256: f301cd665c42a9203d6385ca288f0d2b51abb8155063558b14a75e482501f684
+----- BEGIN VERBATIM -----
+// ====================================================
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//
+// Developed at SunPro, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice
+// is preserved.
+// ====================================================
+
+----- END VERBATIM -----
+
+=== Source 14 ===
+Module: Go standard library math: Sun fdlibm exponential
+Version: Go 1.26.1 source
+Upstream: https://github.com/golang/go/tree/go1.26.1/src/math
+Source file: src/math/exp.go:28-34 (verbatim source notice)
+License / notice: LicenseRef-Sun-fdlibm
+Source SHA-256: 0386866357bd2a404977ca365e17d5ba8ab27650f6e5fdffe5348d9380ff1874
+----- BEGIN VERBATIM -----
+// ====================================================
+// Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved.
+//
+// Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice
+// is preserved.
+// ====================================================
+
+----- END VERBATIM -----
+
+=== Source 15 ===
+Module: Go standard library math: SunSoft fdlibm
+Version: Go 1.26.1 source
+Upstream: https://github.com/golang/go/tree/go1.26.1/src/math
+Source file: src/math/cbrt.go:10-17 (verbatim source notice)
+License / notice: LicenseRef-Sun-fdlibm
+Source SHA-256: 773323f4b12573d59e6a6cbd9a967b4613f39fc2bb699b477041c808f1503bc1
+----- BEGIN VERBATIM -----
+// ====================================================
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//
+// Developed at SunSoft, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice
+// is preserved.
+// ====================================================
+
+----- END VERBATIM -----
+
+=== Source 16 ===
+Module: Go standard library math: Cephes Math Library
+Version: Go 1.26.1 source
+Upstream: https://github.com/golang/go/tree/go1.26.1/src/math
+Source file: src/math/atan.go:36-52 (verbatim source notice)
+License / notice: LicenseRef-Cephes
+Source SHA-256: dcf382b0efb2735ac2a64e0e0a3c98b99d95e059979965aee4f6bddf553a7b7f
+----- BEGIN VERBATIM -----
+// Cephes Math Library Release 2.8:  June, 2000
+// Copyright 1984, 1987, 1989, 1992, 2000 by Stephen L. Moshier
+//
+// The readme file at http://netlib.sandia.gov/cephes/ says:
+//    Some software in this archive may be from the book _Methods and
+// Programs for Mathematical Functions_ (Prentice-Hall or Simon & Schuster
+// International, 1989) or from the Cephes Mathematical Library, a
+// commercial product. In either event, it is copyrighted by the author.
+// What you see here may be used freely but it comes with no support or
+// guarantee.
+//
+//   The two known misprints in the book are repaired here in the
+// source listings for the gamma function and the incomplete beta
+// integral.
+//
+//   Stephen L. Moshier
+//   moshier@na-net.ornl.gov
+
+----- END VERBATIM -----
+
+=== Source 17 ===
+Module: github.com/coder/websocket
+Version: v1.8.14
+Upstream: https://github.com/coder/websocket
+Source file: LICENSE.txt
+License / notice: ISC
+Source SHA-256: cc0975a5f6305145bdd7b41ce9479632fdac3870e6ac4281f28017f18c767c4e
+----- BEGIN VERBATIM -----
+Copyright (c) 2025 Coder
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+----- END VERBATIM -----
+
+=== Source 18 ===
+Module: github.com/pion/logging
+Version: v0.2.4
+Upstream: https://github.com/pion/logging
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 87272dba8c4fcf57101a3195f4f53f7b010b6e153b9b0977bb1a3f91acddf691
+----- BEGIN VERBATIM -----
+MIT License
+
+Copyright (c) 2023 The Pion community <https://pion.ly>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+----- END VERBATIM -----
+
+=== Source 19 ===
+Module: github.com/pion/webrtc/v4
+Version: v4.2.23
+Upstream: https://github.com/pion/webrtc
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+----- BEGIN VERBATIM -----
+MIT License
+
+Copyright (c) 2026 The Pion community <https://pion.ly>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+----- END VERBATIM -----
+
+=== Source 20 ===
+Module: golang.org/x/sys
+Version: v0.45.0
+Upstream: https://github.com/golang/sys
+Source file: LICENSE
+License / notice: BSD-3-Clause
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 21 ===
+Module: golang.org/x/sys
+Version: v0.45.0
+Upstream: https://github.com/golang/sys
+Source file: PATENTS
+License / notice: BSD-3-Clause
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+
+=== Source 22 ===
+Module: github.com/google/uuid
+Version: v1.6.0
+Upstream: https://github.com/google/uuid
+Source file: LICENSE
+License / notice: BSD-3-Clause
+Source SHA-256: 0a8d61ed3cbfd5312326e8126c31ce9c627a283adc99131b56896d29ada04b2d
+----- BEGIN VERBATIM -----
+Copyright (c) 2009,2014 Google Inc. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+----- END VERBATIM -----
+
+=== Source 23 ===
+Module: github.com/pion/datachannel
+Version: v1.6.3
+Upstream: https://github.com/pion/datachannel
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 24 ===
+Module: github.com/pion/dtls/v3
+Version: v3.1.10
+Upstream: https://github.com/pion/dtls
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 25 ===
+Module: github.com/pion/ice/v4
+Version: v4.4.7
+Upstream: https://github.com/pion/ice
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 26 ===
+Module: github.com/pion/interceptor
+Version: v0.1.49
+Upstream: https://github.com/pion/interceptor
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 27 ===
+Module: github.com/pion/mdns/v2
+Version: v2.2.2
+Upstream: https://github.com/pion/mdns
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 83e4dd21429a91fb7cea67a476032a9641425e5355df2e0f589a738b6ec9fd2c
+----- BEGIN VERBATIM -----
+MIT License
+
+Copyright (c) 2018 
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----- END VERBATIM -----
+
+=== Source 28 ===
+Module: github.com/pion/randutil
+Version: v0.1.0
+Upstream: https://github.com/pion/randutil
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: badaf9bc72e71d5a70e7604c636b5b7adf79b9cafc188688438105d2b1e54722
+----- BEGIN VERBATIM -----
+MIT License
+
+Copyright (c) 2020 Pion
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----- END VERBATIM -----
+
+=== Source 29 ===
+Module: github.com/pion/rtcp
+Version: v1.2.19
+Upstream: https://github.com/pion/rtcp
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 30 ===
+Module: github.com/pion/rtp
+Version: v1.10.5
+Upstream: https://github.com/pion/rtp
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: b85dcd3e453d05982552c52b5fc9e0bdd6d23c6f8e844b984a88af32570b0cc0
+----- BEGIN VERBATIM -----
+MIT License
+
+Copyright (c) <year> <copyright holders>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+----- END VERBATIM -----
+
+=== Source 31 ===
+Module: github.com/pion/sctp
+Version: v1.12.0
+Upstream: https://github.com/pion/sctp
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 32 ===
+Module: github.com/pion/sdp/v3
+Version: v3.0.20
+Upstream: https://github.com/pion/sdp
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 33 ===
+Module: github.com/pion/srtp/v3
+Version: v3.1.3
+Upstream: https://github.com/pion/srtp
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 34 ===
+Module: github.com/pion/stun/v4
+Version: v4.0.1
+Upstream: https://github.com/pion/stun
+Source file: LICENSE
+License / notice: MIT AND BSD-3-Clause
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 35 ===
+Module: github.com/pion/stun/v4
+Version: v4.0.1
+Upstream: https://github.com/pion/stun
+Source file: internal/hmac/hmac.go:1-2 (verbatim source notice)
+License / notice: BSD-3-Clause; full Go license reproduced in the Go standard-library section
+Source SHA-256: a432957d21745499063512eb345d76bac3fbdeeeba8c8480e0001c9d5755b2b0
+----- BEGIN VERBATIM -----
+// SPDX-FileCopyrightText: 2009 The Go Authors. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+
+----- END VERBATIM -----
+
+=== Source 36 ===
+Module: github.com/pion/transport/v5
+Version: v5.1.1
+Upstream: https://github.com/pion/transport
+Source file: LICENSE
+License / notice: MIT AND BSD-3-Clause
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 37 ===
+Module: github.com/pion/transport/v5
+Version: v5.1.1
+Upstream: https://github.com/pion/transport
+Source file: utils/xor/xor_generic.go:1-4 (verbatim source notice)
+License / notice: BSD-3-Clause; full Go license reproduced in the Go standard-library section
+Source SHA-256: 4f6e5aeb3c8aa598c5e6cfe8a4bee06ab1b7f866a419acaa452f9555a104eefc
+----- BEGIN VERBATIM -----
+// SPDX-FileCopyrightText: 2013 The Go Authors. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
+----- END VERBATIM -----
+
+=== Source 38 ===
+Module: github.com/pion/turn/v5
+Version: v5.1.2
+Upstream: https://github.com/pion/turn
+Source file: LICENSE
+License / notice: MIT
+Source SHA-256: 6483daf6c8aa2c8192528e60be098aa82dd18f6d7b96dc8246f4f7c3333fbf3f
+Verbatim text: see Source 19 (byte-identical original, including attribution).
+
+=== Source 39 ===
+Module: github.com/wlynxg/anet
+Version: v0.0.5
+Upstream: https://github.com/wlynxg/anet
+Source file: LICENSE
+License / notice: BSD-3-Clause
+Source SHA-256: 6b8970dbe36fe214fd02b438c06daee19897708e435d761ecd18adc9ef7e7a05
+----- BEGIN VERBATIM -----
+BSD 3-Clause License
+
+Copyright (c) 2023, wlynxg
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+----- END VERBATIM -----
+
+=== Source 40 ===
+Module: github.com/wlynxg/anet
+Version: v0.0.5
+Upstream: https://github.com/wlynxg/anet
+Source file: netlink_android.go:1-3 (verbatim source notice)
+License / notice: BSD-3-Clause; full Go license reproduced in the Go standard-library section
+Source SHA-256: d9a162759d7edf6b1e8c40b592853f2f6242b42533efae5d3cc3d9125fc582ca
+----- BEGIN VERBATIM -----
+// Copyright 2011 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+----- END VERBATIM -----
+
+=== Source 41 ===
+Module: golang.org/x/crypto
+Version: v0.52.0
+Upstream: https://github.com/golang/crypto
+Source file: LICENSE
+License / notice: BSD-3-Clause
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 42 ===
+Module: golang.org/x/crypto
+Version: v0.52.0
+Upstream: https://github.com/golang/crypto
+Source file: PATENTS
+License / notice: BSD-3-Clause
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+
+=== Source 43 ===
+Module: golang.org/x/net
+Version: v0.54.0
+Upstream: https://github.com/golang/net
+Source file: LICENSE
+License / notice: BSD-3-Clause
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 44 ===
+Module: golang.org/x/net
+Version: v0.54.0
+Upstream: https://github.com/golang/net
+Source file: PATENTS
+License / notice: BSD-3-Clause
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+
+=== Source 45 ===
+Module: golang.org/x/time
+Version: v0.14.0
+Upstream: https://github.com/golang/time
+Source file: LICENSE
+License / notice: BSD-3-Clause
+Source SHA-256: 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+Verbatim text: see Source 1 (byte-identical original, including attribution).
+
+=== Source 46 ===
+Module: golang.org/x/time
+Version: v0.14.0
+Upstream: https://github.com/golang/time
+Source file: PATENTS
+License / notice: BSD-3-Clause
+Source SHA-256: 96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc
+Verbatim text: see Source 2 (byte-identical original, including attribution).
+

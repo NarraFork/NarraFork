@@ -3318,6 +3318,8 @@ export const narratorService = {
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),
 	deleteBlocks: narratorMessageQueries.deleteBlocks.bind(narratorMessageQueries),
 	updateCompactSummary: narratorMessageQueries.updateCompactSummary.bind(narratorMessageQueries),
+	isCompactAfterRemeasurable:
+		narratorMessageQueries.isCompactAfterRemeasurable.bind(narratorMessageQueries),
 	getPendingPermissions: narratorMessageQueries.getPendingPermissions.bind(narratorMessageQueries),
 
 	// ── Delegated methods (from narratorPersistence) ───────────────────────────
@@ -3326,6 +3328,7 @@ export const narratorService = {
 	persistSystemMessage: narratorPersistence.persistSystemMessage.bind(narratorPersistence),
 	persistDisplayMessage: narratorPersistence.persistDisplayMessage.bind(narratorPersistence),
 	persistCompactingMessage: narratorPersistence.persistCompactingMessage.bind(narratorPersistence),
+	setCompactContextPercent: narratorPersistence.setCompactContextPercent.bind(narratorPersistence),
 	prepareFailedCompactRetry:
 		narratorPersistence.prepareFailedCompactRetry.bind(narratorPersistence),
 	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),

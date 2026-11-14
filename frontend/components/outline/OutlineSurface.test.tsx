@@ -52,6 +52,8 @@ mock.module("../../hooks/useOutline", () => ({
 		return { data: shown, isLoading: false, error: null };
 	},
 	useOutlinePageLive: () => {},
+	// The breadcrumbs' project crumb (a session space's parent).
+	useOutlineSpaceParent: () => idle,
 	useOutlineViewStateSync: () => {},
 	useOutlineSearch: () => idle,
 	useOutlineSeed: () => idle,
@@ -347,7 +349,8 @@ describe("hosting rules", () => {
 
 	test("nothing under components/outline listens on the window or the document", () => {
 		const offenders = sources.filter((path) =>
-			/(window|document)\.(addEventListener|onkeydown|onkeyup|onpaste|oncopy)/.test(
+			// (Nor through the document element or an element's own document.)
+			/(window|document|documentElement|ownerDocument|defaultView)\.(addEventListener|onkeydown|onkeyup|onpaste|oncopy)/.test(
 				readFileSync(path, "utf8"),
 			),
 		);

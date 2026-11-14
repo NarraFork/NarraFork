@@ -590,13 +590,25 @@ authRoutes.get("/me/identities", requireSessionAuth, async (c) => {
 	return c.json({ identities });
 });
 
-/** Unlink an SSO identity from the current user. */
+/**
+ * Unlink an SSO identity from the current user.
+ *
+ * A directory identity is refused: it is not a federation link the person chose but the
+ * credential that signs them in, and dropping it would lock them out of their own account.
+ */
 authRoutes.delete("/me/identities/:id", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const id = c.req.param("id");
 	if (!id) throw new ValidationError("Identity id is required");
-	const ok = await ssoService.unlink(payload.sub, id);
-	if (!ok) throw new AppError("Identity not found", 404, "NOT_FOUND");
+	const result = await ssoService.unlink(payload.sub, id);
+	if (result === "not_found") throw new AppError("Identity not found", 404, "NOT_FOUND");
+	if (result === "managed") {
+		throw new AppError(
+			"This identity is the account's LDAP login and cannot be unlinked",
+			400,
+			"LDAP_IDENTITY_MANAGED",
+		);
+	}
 	logger.info("SSO identity unlinked", { userId: payload.sub });
 	return c.json({ ok: true });
 });

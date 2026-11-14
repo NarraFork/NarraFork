@@ -1,5 +1,6 @@
 import {
 	IconApps,
+	IconArrowsExchange,
 	IconBell,
 	IconBox,
 	IconBrain,
@@ -70,6 +71,7 @@ export const ADMIN_PATHS: ReadonlySet<string> = new Set([
 	"/settings/proxy",
 	"/settings/workspace",
 	"/settings/server",
+	"/settings/remote-access",
 	// Models and agent defaults are instance-wide (PATCH /api/settings), not per-user.
 	"/settings/models",
 	"/settings/agent",
@@ -82,6 +84,8 @@ export const ADMIN_PATHS: ReadonlySet<string> = new Set([
 	"/settings/usage",
 	"/settings/execution-log",
 	"/settings/plugins",
+	// The Dynamic Spec import's admin page (outline P2 PR 12b2).
+	"/settings/outline-import",
 ]);
 
 /** Exact match or sub-path of an admin-only page (e.g. /settings/plugins/:id). */
@@ -133,6 +137,7 @@ const instanceItems: readonly SettingsNavItem[] = [
 	{ to: "/settings/proxy", labelKey: "proxyManagementSection", Icon: IconShield },
 	{ to: "/settings/workspace", labelKey: "workspaceAndContainersSection", Icon: IconBox },
 	{ to: "/settings/server", labelKey: "serverAndSystemSection", Icon: IconServer },
+	{ to: "/settings/remote-access", labelKey: "remoteAccessSection", Icon: IconPlugConnected },
 	{ to: "/settings/authentication", labelKey: "authenticationSection", Icon: IconKey },
 	{ to: "/settings/oauth-apps", labelKey: "oauthAppsSection", Icon: IconApps },
 	{ to: "/settings/users", labelKey: "usersSection", Icon: IconUsers },
@@ -140,6 +145,7 @@ const instanceItems: readonly SettingsNavItem[] = [
 	{ to: "/settings/storage", labelKey: "storageSection", Icon: IconDatabase },
 	{ to: "/settings/runtime", labelKey: "runtimeSection", Icon: IconPlayerPlay },
 	{ to: "/settings/plugins", labelKey: "pluginsSection", Icon: IconPuzzle },
+	{ to: "/settings/outline-import", labelKey: "outlineImportSection", Icon: IconArrowsExchange },
 	{ to: "/settings/usage", labelKey: "usageSection", Icon: IconReceipt2 },
 	{ to: "/settings/execution-log", labelKey: "executionLogSection", Icon: IconHistory },
 	{ to: "/settings/about", labelKey: "versionSection", Icon: IconInfoCircle },

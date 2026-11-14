@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 141 tables and 1866 columns including the outline view state's opened blocks", () => {
-		expect(target.tables.length).toBe(141);
+	test("covers 144 tables and 1918 columns including the outline's swallowed-content scan", () => {
+		expect(target.tables.length).toBe(144);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -565,7 +565,11 @@ describe("real schema parity", () => {
 		// Workspace auto titles add title_source and title_revision (2).
 		// Recent-tab directory visibility adds one account-scoped user preference.
 		// The outline's default folding adds outline_view_state.expanded_json (nullable).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1866);
+		// The Dynamic Spec import's state (outline P2 PR 12b2) adds outline_spec_imports (24).
+		// Cache hit rate eligibility adds api_requests.cache_usage_reported (nullable).
+		// The swallowed-content scan (outline P2 PR 12c) adds outline_spec_loss_findings (21) and
+		// outline_spec_loss_scans (6).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1918);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({

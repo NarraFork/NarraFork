@@ -20,11 +20,20 @@
  */
 
 import { useUploadCapability } from "@frontend/hooks/usePlatform";
-import { clearTokenOnSessionFailure, getToken, getUploadedImageUrl } from "@frontend/lib/api";
+import {
+	authorizedFetch,
+	clearTokenOnSessionFailure,
+	getUploadedImageUrl,
+} from "@frontend/lib/api";
 import { apiUrl, resolveServerUrl } from "@frontend/lib/base-path";
+import { readBoundedBlob } from "@frontend/lib/bounded-blob";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
+import { resolveRemoteRequestRule } from "@shared/remote-access/request-policy";
 import { useCallback, useEffect, useState } from "react";
 import { useImageViewer } from "../../../common/image-viewer-context";
 import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../composer/image-clipboard";
+import { RemoteUnsupported } from "../../RemoteUnsupported";
 
 /** Cap a preview blob so a runaway file never balloons memory (25 MB). */
 const MAX_PREVIEW_BLOB_BYTES = 25 * 1024 * 1024;
@@ -164,11 +173,26 @@ export function useResolvedImageSrc(
 	 * symptom is a flash of broken image plus a pointless request — degraded rather than
 	 * broken, which is exactly why it would never get reported.
 	 */
-	const rawDirect = ref?.previewUrl ? resolveServerUrl(ref.previewUrl) : null;
-	const filePath = ref?.filePath;
+	const previewUrl = ref?.previewUrl;
+	const rawDirect =
+		previewUrl && (!REMOTE_BUILD || isRemoteInlineImage(previewUrl))
+			? resolveServerUrl(previewUrl)
+			: null;
+	const filePath = REMOTE_BUILD ? undefined : ref?.filePath;
 	const imageId = ref?.imageId;
 	const uploadNarratorId = ref?.uploadNarratorId ?? narratorId;
-	const fetchUrl = ref?.fetchUrl;
+	const candidateFetchUrl = ref?.fetchUrl ?? (REMOTE_BUILD ? previewUrl : undefined);
+	const fetchRule =
+		REMOTE_BUILD && candidateFetchUrl
+			? resolveRemoteRequestRule("GET", candidateFetchUrl, "ready")
+			: null;
+	const fetchUrl = REMOTE_BUILD
+		? fetchRule?.id === "uploaded-image"
+			? candidateFetchUrl
+			: undefined
+		: candidateFetchUrl;
+	const unsupportedSource =
+		REMOTE_BUILD && !rawDirect && !fetchUrl && !(imageId && uploadNarratorId);
 	const identity = sourceIdentity(rawDirect, filePath, imageId, uploadNarratorId, fetchUrl);
 	// Failures recorded for a DIFFERENT image must not suppress this one's sources.
 	const failedSrcs = failed?.identity === identity ? failed.srcs : NO_FAILED_SOURCES;
@@ -205,21 +229,29 @@ export function useResolvedImageSrc(
 		} else if (fetchUrl) {
 			url = apiUrl(fetchUrl);
 		}
-		if (!url) return;
+		if (!url) {
+			setBlobUrl(null);
+			setError(REMOTE_BUILD && !!previewUrl);
+			return;
+		}
 
 		let cancelled = false;
 		let objectUrl: string | null = null;
-		const headers: Record<string, string> = {};
-		const token = getToken();
-		if (token) headers.Authorization = `Bearer ${token}`;
+		const controller = new AbortController();
+		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]);
+		setBlobUrl(null);
 		setError(false);
-		fetch(url, { headers })
+		authorizedFetch(url, { signal })
 			.then(async (res) => {
 				if (!res.ok) {
-					await clearTokenOnSessionFailure(res);
+					await clearTokenOnSessionFailure(res.clone());
 					throw new Error(`Request failed (${res.status})`);
 				}
-				return res.blob();
+				return readBoundedBlob(
+					res,
+					REMOTE_BUILD ? 8 * 1024 * 1024 : MAX_PREVIEW_BLOB_BYTES,
+					signal,
+				);
 			})
 			.then((blob) => {
 				if (cancelled) return;
@@ -232,9 +264,10 @@ export function useResolvedImageSrc(
 			});
 		return () => {
 			cancelled = true;
+			controller.abort();
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [direct, filePath, imageId, uploadNarratorId, narratorId, fetchUrl, supported]);
+	}, [direct, filePath, imageId, uploadNarratorId, narratorId, fetchUrl, supported, previewUrl]);
 
 	const src = direct ?? blobUrl;
 	/**
@@ -263,7 +296,7 @@ export function useResolvedImageSrc(
 		});
 	}, [src, identity]);
 
-	return { src, error: resolvedError, onLoadError };
+	return { src, error: resolvedError || unsupportedSource, onLoadError };
 }
 
 /** The exact display rectangle a measure layer reserved via `fitImageBox`. */
@@ -401,6 +434,8 @@ export function VListImage({
 					}
 					loading="lazy"
 				/>
+			) : REMOTE_BUILD && error ? (
+				<RemoteUnsupported />
 			) : null}
 		</div>
 	);

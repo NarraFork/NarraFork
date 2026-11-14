@@ -58,8 +58,12 @@ for (const [name, value] of [
 		}
 	});
 
-function sourceFixture(main = true) {
-	const path = main ? ".github/workflows/release.yml" : ".github/workflows/helpers-release.yml";
+function sourceFixture(main = true, peer = false) {
+	const path = main
+		? ".github/workflows/release.yml"
+		: peer
+			? ".github/workflows/remote-peer-release.yml"
+			: ".github/workflows/helpers-release.yml";
 	const source = {
 		id: 123,
 		run_attempt: 2,
@@ -84,7 +88,9 @@ function sourceFixture(main = true) {
 	const jobs = (
 		main
 			? ["Publish verified release", "Release Gate"]
-			: ["Publish approved helper draft", "Auxiliary Release Gate"]
+			: peer
+				? ["Publish approved remote peer draft", "Remote Peer Release Gate"]
+				: ["Publish approved helper draft", "Auxiliary Release Gate"]
 	).map((name) => ({ name, status: "completed", conclusion: "success" }));
 	const state = { artifacts: [artifact], jobs, protection: true };
 	const calls: string[][] = [];
@@ -116,6 +122,21 @@ describe("independent mirror trigger provenance", () => {
 			expect(result?.runAttempt).toBe(2);
 			expect(f.calls.some((c) => c[1].includes("/attempts/2/jobs?"))).toBe(true);
 		});
+	test("peer source requires its dedicated workflow and publisher/gate names", async () => {
+		const f = sourceFixture(false, true);
+		expect((await resolveMirrorWorkflowTrigger(f.event, repository, f.run))?.artifactName).toBe(
+			f.artifact.name,
+		);
+		f.state.jobs[0].name = "Publish approved helper draft";
+		await expect(resolveMirrorWorkflowTrigger(f.event, repository, f.run)).rejects.toThrow(
+			"publisher",
+		);
+		f.state.jobs[0].name = "Publish approved remote peer draft";
+		f.source.path = ".github/workflows/other-release.yml";
+		await expect(resolveMirrorWorkflowTrigger(f.event, repository, f.run)).rejects.toThrow(
+			"Untrusted",
+		);
+	});
 	test("build-only success without publication receipt is not eligible and never requests approval", async () => {
 		const f = sourceFixture();
 		f.state.artifacts = [];
@@ -213,60 +234,102 @@ describe("independent mirror trigger provenance", () => {
 		f.publicRelease.draft = true;
 		await expect(verifyMirrorPublicationReceipt(receipt, trigger, run)).rejects.toThrow("public");
 	});
-	test("auxiliary publisher B/attempt is bound independently of its original build A/attempt", async () => {
-		const s = sourceFixture(false);
-		const trigger = await resolveMirrorWorkflowTrigger(s.event, repository, s.run);
-		if (!trigger) throw new Error("missing auxiliary trigger");
-		const tag = "helpers-v1.0.0";
-		const asset = {
-			id: 7,
-			name: "helper-manifest-v1.json",
-			size: 7,
-			digest: `sha256:${"a".repeat(64)}`,
-			state: "uploaded",
-		};
-		const receipt = {
-			schemaVersion: 1,
-			kind: "helpers",
-			repository,
-			tag,
-			version: "1.0.0",
-			commit,
-			releaseId: 17,
-			assets: [{ id: asset.id, name: asset.name, size: asset.size, digest: asset.digest }],
-			source: {
-				runId: 123,
-				runAttempt: 2,
-				workflowPath: ".github/workflows/helpers-release.yml",
-				nativeProof: "verified-original-bundle",
-			},
-			buildSource: {
-				runId: 11,
-				runAttempt: 1,
-				workflowPath: ".github/workflows/helpers-release.yml",
-				bundleArtifactId: 55,
-				nativeProof: "verified-original-bundle",
-			},
-		};
-		const run = async (args: string[]) => {
-			if (args[1].includes("git/ref/tags/"))
-				return JSON.stringify({ ref: `refs/tags/${tag}`, object: { sha: commit, type: "commit" } });
-			if (args[1].includes("releases/tags/"))
-				return JSON.stringify({
-					id: 17,
-					tag_name: tag,
-					draft: false,
-					published_at: "2026-07-01T00:00:00Z",
-				});
-			if (args[1].includes("releases/17/assets?")) return JSON.stringify([asset]);
-			throw new Error("Unexpected auxiliary receipt request");
-		};
-		expect((await verifyMirrorPublicationReceipt(receipt, trigger, run)).source.runId).toBe(123);
-		receipt.source.runId = 11;
-		await expect(verifyMirrorPublicationReceipt(receipt, trigger, run)).rejects.toThrow(
-			"provenance",
-		);
-	});
+	for (const kind of ["helpers", "executor", "remote-peer"] as const)
+		test(`${kind} publisher B/attempt is bound independently of original build A/attempt and other workflows`, async () => {
+			const peer = kind === "remote-peer";
+			const s = sourceFixture(false, peer);
+			const trigger = await resolveMirrorWorkflowTrigger(s.event, repository, s.run);
+			if (!trigger) throw new Error("missing auxiliary trigger");
+			const version = peer ? "0.1.0-alpha.1" : "1.0.0";
+			const tag = `${kind}-v${version}`;
+			const workflowPath = s.source.path;
+			const asset = {
+				id: 7,
+				name: peer ? "narrafork-remote-peer-manifest.json" : "helper-manifest-v1.json",
+				size: 7,
+				digest: `sha256:${"a".repeat(64)}`,
+				state: "uploaded",
+			};
+			const receipt = {
+				schemaVersion: 1,
+				kind,
+				repository,
+				tag,
+				version,
+				commit,
+				releaseId: 17,
+				assets: [{ id: asset.id, name: asset.name, size: asset.size, digest: asset.digest }],
+				source: {
+					runId: 123,
+					runAttempt: 2,
+					workflowPath,
+					nativeProof: "verified-original-bundle",
+				},
+				buildSource: {
+					runId: 11,
+					runAttempt: 1,
+					workflowPath,
+					bundleArtifactId: 55,
+					nativeProof: "verified-original-bundle",
+				},
+			};
+			const run = async (args: string[]) => {
+				if (args[1].includes("git/ref/tags/"))
+					return JSON.stringify({
+						ref: `refs/tags/${tag}`,
+						object: { sha: commit, type: "commit" },
+					});
+				if (args[1].includes("releases/tags/"))
+					return JSON.stringify({
+						id: 17,
+						tag_name: tag,
+						draft: false,
+						prerelease: peer,
+						published_at: "2026-07-01T00:00:00Z",
+					});
+				if (args[1].includes("releases/17/assets?")) return JSON.stringify([asset]);
+				throw new Error("Unexpected auxiliary receipt request");
+			};
+			expect((await verifyMirrorPublicationReceipt(receipt, trigger, run)).source.runId).toBe(123);
+			for (const invalid of [
+				{ ...receipt, repository: "attacker/fork" },
+				{ ...receipt, tag: `${kind === "executor" ? "helpers" : "executor"}-v${version}` },
+				{
+					...receipt,
+					source: { ...receipt.source, workflowPath: ".github/workflows/arbitrary.yml" },
+				},
+				{
+					...receipt,
+					buildSource: { ...receipt.buildSource, workflowPath: ".github/workflows/arbitrary.yml" },
+				},
+				{
+					...receipt,
+					kind: peer ? "executor" : "remote-peer",
+					tag: `${peer ? "executor" : "remote-peer"}-v${version}`,
+				},
+			])
+				await expect(verifyMirrorPublicationReceipt(invalid, trigger, run)).rejects.toThrow();
+			if (peer) {
+				await expect(
+					verifyMirrorPublicationReceipt(
+						{
+							...receipt,
+							source: { ...receipt.source, workflowPath: ".github/workflows/helpers-release.yml" },
+							buildSource: {
+								...receipt.buildSource,
+								workflowPath: ".github/workflows/helpers-release.yml",
+							},
+						},
+						{ ...trigger, workflowPath: ".github/workflows/helpers-release.yml" },
+						run,
+					),
+				).rejects.toThrow("provenance");
+			}
+			receipt.source.runId = 11;
+			await expect(verifyMirrorPublicationReceipt(receipt, trigger, run)).rejects.toThrow(
+				"provenance",
+			);
+		});
 	test("workflow mode steps do not cross-inject direct and relay secrets", () => {
 		const workflow = readFileSync(
 			new URL("../../.github/workflows/update-server-mirror.yml", import.meta.url),
@@ -295,7 +358,10 @@ describe("independent mirror trigger provenance", () => {
 			new URL("../../.github/workflows/update-server-mirror.yml", import.meta.url),
 			"utf8",
 		);
+		expect(() => Bun.YAML.parse(workflow)).not.toThrow();
 		expect(workflow).toContain("vars.NF_MIRROR_ENABLED == 'true'");
+		expect(workflow).toContain("Remote peer release");
+		expect(workflow).toContain("options: [main, helpers, executor, remote-peer]");
 		expect(workflow).toMatch(/NF_UPDATE_SERVER: \$\{\{ vars\.NF_UPDATE_SERVER \}\}/);
 		expect(workflow).toMatch(/NF_UPDATE_TOKEN: \$\{\{ secrets\.NF_UPDATE_TOKEN \}\}/);
 		expect(workflow).not.toContain("secrets.NF_UPDATE_SERVER");
@@ -314,5 +380,15 @@ describe("independent mirror trigger provenance", () => {
 		expect(workflow).not.toContain("control.js");
 		expect(workflow).not.toContain("zstd");
 		expect(workflow).toContain("artifacts/source-publication/publication-receipt.json");
+		expect(workflow).toMatch(
+			/peer-artifact-name: \$\{\{ steps\.trigger\.outputs\.peer_artifact_name \}\}/,
+		);
+		expect(workflow).toContain("needs.preflight.outputs.peer-receipt == 'true'");
+		expect(workflow).toContain("path: artifacts/source-peer-publication");
+		expect(workflow).toContain(
+			"--peer-receipt-file=artifacts/source-peer-publication/remote-peer-publication-receipt.json",
+		);
+		expect(workflow).toContain("path: artifacts/mirror/");
+		expect(workflow).not.toContain("merge-multiple: true");
 	});
 });

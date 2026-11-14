@@ -1,3 +1,5 @@
+import { onTokenChange } from "@frontend/lib/api/client";
+import { readBoundedBlob } from "@frontend/lib/bounded-blob";
 import { useEffect, useState } from "react";
 import { authorizedFetch, clearTokenOnSessionFailure, getAvatarUrl } from "../lib/api";
 import { useUploadCapability } from "./usePlatform";
@@ -14,6 +16,14 @@ const AVATAR_FETCH_TIMEOUT_MS = 30_000;
 const cache = new Map<string, CacheEntry>();
 /** In-flight fetches to avoid duplicate requests. */
 const pending = new Map<string, Promise<string | null>>();
+const controllers = new Set<AbortController>();
+onTokenChange((token) => {
+	if (token) return;
+	for (const controller of controllers) controller.abort();
+	for (const entry of cache.values()) URL.revokeObjectURL(entry.blobUrl);
+	cache.clear();
+	pending.clear();
+});
 
 function cacheKey(userId: string, avatarImageId: string): string {
 	return `${userId}:${avatarImageId}`;
@@ -36,6 +46,7 @@ export function fetchAvatarBlobUrl(userId: string, avatarImageId: string): Promi
 	if (existing) return existing;
 
 	const controller = new AbortController();
+	controllers.add(controller);
 	const timeout = setTimeout(() => controller.abort(), AVATAR_FETCH_TIMEOUT_MS);
 
 	const promise = authorizedFetch(getAvatarUrl(userId, avatarImageId), {
@@ -46,10 +57,10 @@ export function fetchAvatarBlobUrl(userId: string, avatarImageId: string): Promi
 				await clearTokenOnSessionFailure(res);
 				return null;
 			}
-			return res.blob();
+			return readBoundedBlob(res, MAX_AVATAR_BLOB_BYTES, controller.signal);
 		})
 		.then((blob) => {
-			if (!blob || blob.size > MAX_AVATAR_BLOB_BYTES) return null;
+			if (controller.signal.aborted || !blob || blob.size > MAX_AVATAR_BLOB_BYTES) return null;
 
 			// Race guard: another fetch may have populated the cache while this
 			// request was in flight. Reuse that URL and do not create an orphan URL.
@@ -66,7 +77,8 @@ export function fetchAvatarBlobUrl(userId: string, avatarImageId: string): Promi
 		.catch(() => null)
 		.finally(() => {
 			clearTimeout(timeout);
-			pending.delete(key);
+			controllers.delete(controller);
+			if (pending.get(key) === promise) pending.delete(key);
 		});
 
 	pending.set(key, promise);

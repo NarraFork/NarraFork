@@ -15,7 +15,7 @@ test("generated memory migration is additive, indexed and preserves existing row
 			INSERT INTO narrators VALUES ('n');
 			INSERT INTO legacy_messages VALUES ('before', '既有内容');`);
 		const sql = readFileSync(
-			new URL("../../drizzle/0254_context_memories.sql", import.meta.url),
+			new URL("../../drizzle/0257_context_memories.sql", import.meta.url),
 			"utf8",
 		);
 		db.exec(sql);

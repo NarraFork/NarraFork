@@ -47,13 +47,18 @@ interface SpecActions {
 	useInternalSpec: boolean;
 }
 const reveal = mock((_narratorId: string, _uri: string) => {});
-const useSpecActions = new Function(
-	"useCallback",
-	"useRef",
-	"useState",
-	"revealSpecFile",
-	`${hookCode}\nreturn useSpecActions;`,
-)(useCallback, useRef, useState, reveal) as (options: SpecOptions) => SpecActions;
+function buildSpecActions(remoteBuild: boolean) {
+	return new Function(
+		"useCallback",
+		"useRef",
+		"useState",
+		"revealSpecFile",
+		"REMOTE_BUILD",
+		`${hookCode}\nreturn useSpecActions;`,
+	)(useCallback, useRef, useState, reveal, remoteBuild) as (options: SpecOptions) => SpecActions;
+}
+const useSpecActions = buildSpecActions(false);
+const useRemoteSpecActions = buildSpecActions(true);
 
 let root: Root;
 let actions: SpecActions;
@@ -67,8 +72,9 @@ const Row = memo(({ open }: { open: (uri: string) => void }) => {
 		</button>
 	);
 });
-function Probe(options: SpecOptions) {
-	actions = useSpecActions(options);
+function Probe({ remoteBuild = false, ...options }: SpecOptions & { remoteBuild?: boolean }) {
+	const useActions = remoteBuild ? useRemoteSpecActions : useSpecActions;
+	actions = useActions(options);
 	return <Row open={actions.handleOpenSpecFile} />;
 }
 
@@ -96,9 +102,17 @@ afterEach(async () => {
 	originals.clear();
 });
 
-async function render(options: Partial<SpecOptions> = {}) {
+async function render(options: Partial<SpecOptions> = {}, remoteBuild = false) {
 	await act(async () => {
-		root.render(<Probe dock={null} narratorId="parent" isWorkspacePreview={false} {...options} />);
+		root.render(
+			<Probe
+				dock={null}
+				narratorId="parent"
+				isWorkspacePreview={false}
+				remoteBuild={remoteBuild}
+				{...options}
+			/>,
+		);
 	});
 }
 
@@ -207,5 +221,20 @@ describe("NarratorPanel Spec row actions", () => {
 		await render({ isWorkspacePreview: true });
 		expect(actions.specToolAvailable).toBe(false);
 		expect(actions.useInternalSpec).toBe(false);
+	});
+
+	test("remote mode never offers an internal, dock or legacy Spec surface", async () => {
+		const toggle = mock(() => {});
+		for (const options of [
+			{},
+			{ dock: makeDock() },
+			{ onToggleSpecPanel: toggle, specPanelOpen: false },
+		]) {
+			await render(options, true);
+			expect(actions.specToolAvailable).toBe(false);
+			expect(actions.useInternalSpec).toBe(false);
+		}
+		expect(toggle).not.toHaveBeenCalled();
+		expect(reveal).not.toHaveBeenCalled();
 	});
 });

@@ -41,6 +41,8 @@ This session keeps its notes and tasks in the outline: read with OutlineRead and
 2. When you start a task, tick it in progress; when it is done, tick it done. When a person has to decide something, ask them and give your recommendation.
 3. When a tool says a change was handed to someone for confirmation, do the parts it does not affect first.
 
+A task of a project's space is the team's. If you must stop with one unfinished and nobody is waiting on you in this conversation, leave a note under it before you end: where you stopped, what comes next, which branch and commit hold the code. The system may hand the task to a new session, which continues from your note; do not set it back to \`[ ]\` yourself.
+
 Standing rules of behavior are not tasks. They live on this session's behavior page (alias \`behavior\` in \`session/\`). When the user asks you to record one, write it to that page with OutlineEdit (create the page with \`alias:: behavior\` if there is none), and only as the first tool call of that user turn; at any other time the page is read-only to you. This session has no \`spec://\`: the \`spec://\` paths the file tools mention do not apply here.
 
 The system keeps two views in your context and updates them when they change: this session's current tasks (\`outline.tasks\`) and its behavior boundary (\`outline.behavior\`, which you must always follow).
@@ -52,6 +54,8 @@ The system keeps two views in your context and updates them when they change: th
 1. 以后还用得到的写进大纲：结论、决定、坑、计划。写在手头的任务下面，按「结论 → 依据 → 细节」：任务下第一层每块是一行结论（不超过 ${noteChars} 字）；依据（文件:行、跑过的命令和结果）写成这条结论的子块，细节再往下一层（每块不超过 ${detailChars} 字，一层不超过 ${maxChildren} 块）。不写过程（先看了什么、又试了什么）：过程在会话记录里。不用 markdown 标题，层次用缩进表达。任务标题只写一行（不超过 ${titleChars} 字），说清做成什么算完成。完成的任务收起后只显示标题和它下面的第一行，所以勾完成时，任务下第一块要是一行结果。
 2. 开始做一个任务就把它勾成进行中，做完勾成完成；需要人决定的，提问并附上你的建议。
 3. 工具说改动「已交给某人确认」时，先做不受影响的部分。
+
+项目空间里的任务是团队的。如果不得不停下而任务还没做完，这个对话里又没有人在等你，结束前在任务下留一段说明：停在哪、下一步是什么、代码在哪个分支哪个提交。系统可能把任务交给一个新会话，由它照你的说明接着做；不要自己把它改回 \`[ ]\`。
 
 长期的行为规则不是任务，它们在本会话的行为边界页里（\`session/\` 中别名为 \`behavior\` 的页）。用户要求你记下一条时，用 OutlineEdit 写进这一页（还没有这一页就新建，并写上 \`alias:: behavior\`），而且只能作为该用户回合的第一个工具调用；其他时候这一页对你只读。本会话没有 \`spec://\`：文件工具说明里提到的 \`spec://\` 路径在这里都不适用。
 
@@ -466,6 +470,58 @@ const specUnavailable: LocalizedValue<string> = {
 /** What a tool call naming a `spec://` path gets in an outline session. */
 export function getOutlineSpecUnavailableHint(locale: Locale): string {
 	return pickLocalizedValue(specUnavailable, locale);
+}
+
+const specMoved: LocalizedValue<string> = {
+	en: "spec:// no longer applies in this session: its Dynamic Spec was moved into the outline. Its tasks are on the task page session/tasks, its old spec:// files are outline pages in session/ (titled by their file name), and its behavior boundary is the behavior page session/behavior. Read with OutlineRead or OutlineSearch and write with OutlineEdit. Nothing was read or written.",
+	"zh-CN":
+		"本会话不再使用 spec://：它的 Dynamic Spec 已搬进大纲。任务在任务页 session/tasks，原来的 spec:// 文件是 session/ 里的大纲页（以文件名为标题），行为边界是行为边界页 session/behavior。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写。本次没有读写任何内容。",
+};
+
+/**
+ * What a tool call naming a `spec://` path gets in a session the import moved into the outline
+ * (outline P2 PR 12b2): where each kind of its old content is now.
+ */
+export function getOutlineSpecMovedHint(locale: Locale): string {
+	return pickLocalizedValue(specMoved, locale);
+}
+
+// ─── The Dynamic Spec import's notice to the model (outline P2 PR 12b2) ───
+
+/** One page an import wrote from a Dynamic Spec file. */
+export interface SpecImportNoticePage {
+	/** The file it came from (its page title). */
+	title: string;
+	/** `session/<sid>`. */
+	address: string;
+}
+
+/**
+ * The one history row a session gets after the import moved it into the outline: where its
+ * tasks, notes and behavior boundary are now, and that `spec://` no longer applies. At most
+ * `pages.length` page lines (the caller bounds them); `morePages` counts the rest.
+ */
+export function getSpecImportNotice(
+	input: { tasks: number; pages: readonly SpecImportNoticePage[]; morePages: number },
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const lines = input.pages.map((page) => `- spec://${page.title} → ${page.address}`);
+	if (input.morePages > 0)
+		lines.push(
+			zh
+				? `- 另有 ${input.morePages} 页，用 OutlineRead 读 session/ 查看`
+				: `- ${input.morePages} more pages; read session/ with OutlineRead`,
+		);
+	const notes =
+		lines.length > 0
+			? zh
+				? `\n\n原来的 spec:// 文件现在是这些大纲页：\n${lines.join("\n")}`
+				: `\n\nThe old spec:// files are now these outline pages:\n${lines.join("\n")}`
+			: "";
+	return zh
+		? `系统通知（不是用户发言）：本会话的 Dynamic Spec 已搬进大纲。任务现在在任务页 session/tasks（导入了 ${input.tasks} 个），行为边界是行为边界页 session/behavior，系统会把当前任务和行为边界放在你的上下文里。${notes}\n\n本会话不再使用 spec://：读用 OutlineRead 或 OutlineSearch，写用 OutlineEdit（任务是带复选框的块）。旧的 Dynamic Spec 文件保留，只读，不再更新。`
+		: `System notice (not the user speaking): this session's Dynamic Spec was moved into the outline. Its tasks are now on the task page session/tasks (${input.tasks} imported), and its behavior boundary is the behavior page session/behavior; the system keeps the current tasks and the behavior boundary in your context.${notes}\n\nspec:// no longer applies in this session: read with OutlineRead or OutlineSearch, write with OutlineEdit (a task is a checkbox block). The old Dynamic Spec files are kept read-only and are no longer updated.`;
 }
 
 // ─── People's changes to the session's tasks (outline P2 PR 5) ───

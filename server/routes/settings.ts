@@ -331,6 +331,8 @@ const externalWebSocketOriginSchema = z
  * Exported for tests: `update.serverUrl` is a code-delivery origin, so its https gate
  * is a security boundary rather than input hygiene and is asserted directly.
  */
+import { remoteAccessSettingsSchema } from "../lib/remote-access-config";
+
 export const updateSettingsSchema = z
 	.object({
 		// Optional request precondition, never a persisted setting.
@@ -766,6 +768,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		remoteAccess: remoteAccessSettingsSchema.optional(),
 		shares: z
 			.object({
 				defaultExpiryHours: z.number().int().min(1),
@@ -946,6 +949,19 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 	}
 }
 
+/**
+ * The `auth` block as every authenticated client may see it.
+ *
+ * Same masking as `maskAuthSettings`, minus the LDAP directory: its server address,
+ * service-account DN and search base are internal topology that the login form never
+ * needs, and this payload is readable by any signed-in user. The administrator's own
+ * view comes from `GET /api/admin/auth-config`.
+ */
+function publicAuthSettings(auth: NarraForkSettings["auth"]) {
+	const { ldap: _directory, ...rest } = maskAuthSettings(auth);
+	return rest;
+}
+
 async function buildSettingsResponse(
 	source: NarraForkSettings,
 	extra?: { serverRestarting?: boolean; newUrl?: string },
@@ -977,7 +993,7 @@ async function buildSettingsResponse(
 					}
 				: undefined,
 		},
-		auth: maskAuthSettings(source.auth),
+		auth: publicAuthSettings(source.auth),
 		// Multi-provider — mask all keys
 		customApiProviders: (source.customApiProviders ?? []).map((p) => ({
 			...p,

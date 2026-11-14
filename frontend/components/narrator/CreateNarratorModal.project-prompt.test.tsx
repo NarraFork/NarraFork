@@ -142,6 +142,7 @@ mock.module("../../hooks/useGitIdentityVisibility", () => ({
 }));
 mock.module("../../hooks/useGitIdentities", () => ({
 	useGitIdentities: () => ({ data: [], isLoading: false, isError: false }),
+	useFolderGitIdentity: () => ({ data: undefined }),
 	narratorGitIdentityQueryKey: (id: string) => ["auth", "git-identities", "narrator", id],
 }));
 mock.module("../../lib/api", () => ({

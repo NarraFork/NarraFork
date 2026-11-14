@@ -32,6 +32,14 @@ import {
 	EXECUTOR_MANIFEST_FILENAME,
 	executorPublishedFilename,
 } from "../../shared/remote-executor";
+import {
+	isRemotePeerPlatform,
+	REMOTE_PEER_MANIFEST_FILENAME,
+	REMOTE_PEER_PLATFORMS,
+	type RemotePeerPlatform,
+	remotePeerPublishedFilename,
+} from "../../shared/remote-peer";
+import { parseRemotePeerReleaseManifest } from "../../shared/remote-peer-manifest";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import { createPublicationGhRunner, runPublicationProcess } from "./ci-publication-runtime";
 import { assertCiMainAncestor, assertReleaseEnvironment, parseCiId } from "./ci-release-plan";
@@ -46,15 +54,45 @@ import {
 	smokeHelperPlatform,
 } from "./helper-build";
 import {
-	EXECUTOR_LICENSE_FILES,
-	HELPER_LICENSE_FILES,
 	type HelperReleaseKind,
 	helperFileIdentity,
+	helperReleaseIsPrerelease,
+	helperReleaseLicenseFiles,
+	helperReleaseTag,
 	publishHelperRelease,
 	resolveHelperTagCommit,
 	validateHelperReleaseBundle,
 } from "./helper-release";
 import { writePublicationReceipt } from "./publication-receipt";
+import { buildRemotePeerPlatform, smokeRemotePeerPlatform } from "./remote-peer-build";
+import { compareRemotePeerRecipeIdentity } from "./remote-peer-release-inputs";
+
+export type AuxiliaryPlatform = HelperPlatform | RemotePeerPlatform;
+export function helperReleaseWorkflowPath(kind: HelperReleaseKind): string {
+	switch (kind) {
+		case "helpers":
+		case "executor":
+			return ".github/workflows/helpers-release.yml";
+		case "remote-peer":
+			return ".github/workflows/remote-peer-release.yml";
+		default:
+			throw new Error("Unknown helper release kind");
+	}
+}
+function releasePlatforms(kind: HelperReleaseKind): readonly AuxiliaryPlatform[] {
+	return kind === "remote-peer" ? REMOTE_PEER_PLATFORMS : HELPER_PLATFORMS;
+}
+function releaseAssetNames(plan: HelperReleasePlan, platform: AuxiliaryPlatform): string[] {
+	if (!releasePlatforms(plan.kind).includes(platform))
+		throw new Error("Release kind/platform mismatch");
+	if (plan.kind === "remote-peer")
+		return [remotePeerPublishedFilename(plan.version, platform as RemotePeerPlatform)];
+	if (plan.kind === "helpers")
+		return HELPER_TOOLS.map((tool) => getHelperAssetName(tool, platform as HelperPlatform));
+	if (plan.kind === "executor")
+		return [executorPublishedFilename(plan.version, executorPlatform(platform as HelperPlatform))];
+	throw new Error("Unknown helper release kind");
+}
 
 export interface HelperReleasePlan {
 	schemaVersion: 1;
@@ -146,11 +184,12 @@ export async function planHelperRelease(
 	const readGit = options.git ?? git;
 	const repository = environment.GITHUB_REPOSITORY ?? "";
 	validateGitHubRepository(repository);
-	if (kind !== "helpers" && kind !== "executor") throw new Error("Unknown helper release kind");
+	if (kind !== "helpers" && kind !== "executor" && kind !== "remote-peer")
+		throw new Error("Unknown helper release kind");
 	if (
 		kind === "helpers"
 			? tag !== HELPER_RELEASE_TAG
-			: !/^executor-v\d+\.\d+\.\d+(?:-[A-Za-z0-9._-]+)?$/.test(tag)
+			: !new RegExp(`^${kind}-v\\d+\\.\\d+\\.\\d+(?:-[A-Za-z0-9._-]+)?$`).test(tag)
 	)
 		throw new Error("Invalid helper release tag");
 	if (sourceRunId && !/^[1-9]\d{0,19}$/.test(sourceRunId))
@@ -165,15 +204,33 @@ export async function planHelperRelease(
 		throw new Error("Tag commit mismatch");
 	readGit(root, ["merge-base", "--is-ancestor", commit, `refs/remotes/origin/${defaultBranch}`]);
 	await assertCiMainAncestor(run, commit, repository, defaultBranch);
-	const version = kind === "executor" ? tag.slice("executor-v".length) : HELPER_CATALOG_VERSION;
-	const protocol = readGit(root, [
-		"show",
-		`${commit}:remote-executor/internal/rpc/protocol.go`,
-	]).match(/\bProtocolVersion\s*=\s*(\d+)/);
+	const version = kind === "helpers" ? HELPER_CATALOG_VERSION : tag.slice(`${kind}-v`.length);
+	const protocolPath =
+		kind === "remote-peer" ? "remote-peer/protocol.go" : "remote-executor/internal/rpc/protocol.go";
+	const protocol = readGit(root, ["show", `${commit}:${protocolPath}`]).match(
+		/\bProtocolVersion\s*=\s*(\d+)/,
+	);
 	if (!protocol) throw new Error("Missing executor protocol version");
 	const protocolVersion = Number(protocol[1]);
 	if (!Number.isSafeInteger(protocolVersion) || protocolVersion <= 0)
 		throw new Error("Invalid executor protocol version");
+	if (kind === "remote-peer") {
+		const components = parseComponentVersions(
+			JSON.parse(readGit(root, ["show", `${commit}:shared/component-versions.json`])),
+		);
+		if (!components.remotePeer || components.remotePeer.version !== version)
+			throw new Error("Remote-peer tag must match the source component version");
+		if (components.remotePeer.protocolVersion !== protocolVersion)
+			throw new Error("Remote-peer component protocol must match the source wire protocol");
+		if (!sourceRunId)
+			await compareRemotePeerRecipeIdentity({
+				commit,
+				controlCommit: environment.GITHUB_SHA as string,
+				readSource: (sourceCommit, path) => readGit(root, ["show", `${sourceCommit}:${path}`]),
+				signal: options.signal,
+				deadline: options.deadline,
+			});
+	}
 	if (kind === "executor") {
 		// Check the exact path in the target tree. Only proven absence is legacy;
 		// corrupt JSON, failed git reads and malformed tree output must fail closed.
@@ -233,14 +290,12 @@ export async function readHelperReleasePlan(path: string): Promise<HelperRelease
 	if (
 		value.schemaVersion !== 1 ||
 		typeof value.publish !== "boolean" ||
-		!["helpers", "executor"].includes(value.kind) ||
+		!["helpers", "executor", "remote-peer"].includes(value.kind) ||
 		!/^[0-9a-f]{40}$/.test(value.commit) ||
 		!/^[0-9a-f]{40}$/.test(value.controlCommit) ||
 		!Number.isSafeInteger(value.protocolVersion) ||
 		value.protocolVersion < 1 ||
-		(value.kind === "helpers"
-			? value.tag !== HELPER_RELEASE_TAG
-			: value.tag !== `executor-v${value.version}`)
+		value.tag !== helperReleaseTag(value.kind, value.version)
 	)
 		throw new Error("Invalid helper release plan");
 	if (
@@ -256,15 +311,35 @@ export async function readHelperReleasePlan(path: string): Promise<HelperRelease
 export async function buildHelperReleasePlatform(
 	root: string,
 	plan: HelperReleasePlan,
-	platform: HelperPlatform,
+	platform: AuxiliaryPlatform,
 	cache: string,
 	output: string,
+	signal?: AbortSignal,
 ): Promise<void> {
-	if (!HELPER_PLATFORMS.includes(platform) || git(root, ["rev-parse", "HEAD"]) !== plan.commit)
+	if (
+		!releasePlatforms(plan.kind).includes(platform) ||
+		git(root, ["rev-parse", "HEAD"]) !== plan.commit
+	)
 		throw new Error("Build platform/source mismatch");
-	if (plan.kind === "helpers")
-		await prepareHelperPlatform(platform, resolve(cache), resolve(output));
-	else await buildExecutorPlatform(root, platform, resolve(output), plan.version, plan.commit);
+	if (plan.kind === "remote-peer")
+		await buildRemotePeerPlatform(
+			root,
+			platform as RemotePeerPlatform,
+			resolve(output),
+			plan,
+			signal,
+		);
+	else if (plan.kind === "helpers")
+		await prepareHelperPlatform(platform as HelperPlatform, resolve(cache), resolve(output));
+	else if (plan.kind === "executor")
+		await buildExecutorPlatform(
+			root,
+			platform as HelperPlatform,
+			resolve(output),
+			plan.version,
+			plan.commit,
+		);
+	else throw new Error("Unknown helper release kind");
 }
 async function smokeExecutor(
 	plan: HelperReleasePlan,
@@ -364,15 +439,17 @@ async function smokeExecutor(
 }
 export async function smokeHelperReleasePlatform(
 	plan: HelperReleasePlan,
-	platform: HelperPlatform,
+	platform: AuxiliaryPlatform,
 	output: string,
+	signal?: AbortSignal,
 ): Promise<void> {
-	if (plan.kind === "helpers") await smokeHelperPlatform(platform, output);
-	else await smokeExecutor(plan, platform, output);
-	const names =
-		plan.kind === "helpers"
-			? HELPER_TOOLS.map((tool) => getHelperAssetName(tool, platform))
-			: [executorPublishedFilename(plan.version, executorPlatform(platform))];
+	const names = releaseAssetNames(plan, platform);
+	if (plan.kind === "remote-peer") {
+		if (!isRemotePeerPlatform(platform)) throw new Error("Remote-peer platform mismatch");
+		await smokeRemotePeerPlatform(platform, output, plan, signal);
+	} else if (plan.kind === "helpers") await smokeHelperPlatform(platform as HelperPlatform, output);
+	else if (plan.kind === "executor") await smokeExecutor(plan, platform as HelperPlatform, output);
+	else throw new Error("Unknown helper release kind");
 	const files = await Promise.all(names.map((name) => helperFileIdentity(join(output, name))));
 	for (const name of await readdir(output))
 		if (!names.includes(name)) await rm(join(output, name), { force: true });
@@ -389,7 +466,7 @@ export async function assembleHelperReleaseBundle(
 ): Promise<void> {
 	await mkdir(output, { recursive: false });
 	const files = [];
-	for (const platform of HELPER_PLATFORMS) {
+	for (const platform of releasePlatforms(plan.kind)) {
 		const dir = join(nativeDir, `helper-native-${platform}`);
 		const receipt = JSON.parse(await readFile(join(dir, "receipt.json"), "utf8"));
 		if (
@@ -401,10 +478,7 @@ export async function assembleHelperReleaseBundle(
 			receipt.protocolVersion !== plan.protocolVersion
 		)
 			throw new Error("Native receipt identity mismatch");
-		const names =
-			plan.kind === "helpers"
-				? HELPER_TOOLS.map((tool) => getHelperAssetName(tool, platform))
-				: [executorPublishedFilename(plan.version, executorPlatform(platform))];
+		const names = releaseAssetNames(plan, platform);
 		if (receipt.files?.length !== names.length || (await readdir(dir)).length !== names.length + 1)
 			throw new Error("Unexpected native artifact set");
 		for (const name of names) {
@@ -416,7 +490,7 @@ export async function assembleHelperReleaseBundle(
 			files.push({ ...actual, platform });
 		}
 	}
-	const licenseNames = plan.kind === "helpers" ? HELPER_LICENSE_FILES : EXECUTOR_LICENSE_FILES;
+	const licenseNames = helperReleaseLicenseFiles(plan.kind);
 	const licenses = [];
 	for (const name of licenseNames) {
 		await copyFile(join(root, "licenses", "extra", name), join(output, name));
@@ -445,10 +519,36 @@ export async function assembleHelperReleaseBundle(
 			join(output, HELPER_MANIFEST_FILENAME),
 			`${JSON.stringify(manifest, null, 2)}\n`,
 		);
-	} else {
+	} else if (plan.kind === "remote-peer") {
+		const outer = parseRemotePeerReleaseManifest(
+			{
+				...identity,
+				manifest: {
+					version: plan.version,
+					protocolVersion: plan.protocolVersion,
+					releasedAt: "1970-01-01T00:00:00Z",
+					platforms: Object.fromEntries(
+						files.map((file) => [
+							file.platform,
+							{
+								filename: file.name,
+								size: file.size,
+								sha256: file.sha256,
+							},
+						]),
+					),
+				},
+			},
+			{ ...identity, version: plan.version, protocolVersion: plan.protocolVersion },
+		);
+		await writeFile(
+			join(output, REMOTE_PEER_MANIFEST_FILENAME),
+			`${JSON.stringify(outer, null, 2)}\n`,
+		);
+	} else if (plan.kind === "executor") {
 		const artifacts = await Promise.all(
 			files.map(async (file) => ({
-				platform: executorPlatform(file.platform),
+				platform: executorPlatform(file.platform as HelperPlatform),
 				bytes: await readFile(join(output, file.name)),
 			})),
 		);
@@ -466,7 +566,7 @@ export async function assembleHelperReleaseBundle(
 			join(output, EXECUTOR_MANIFEST_FILENAME),
 			`${JSON.stringify(outer, null, 2)}\n`,
 		);
-	}
+	} else throw new Error("Unknown helper release kind");
 	await validateHelperReleaseBundle({ ...plan, bundleDir: output });
 }
 interface HelperSourceRun {
@@ -492,7 +592,7 @@ export function validateHelperSourceRun(
 		(plan.sourceRunId !== currentRunId && run.status !== "completed") ||
 		run.event !== "workflow_dispatch" ||
 		run.head_repository?.full_name?.toLowerCase() !== plan.repository.toLowerCase() ||
-		run.path !== ".github/workflows/helpers-release.yml" ||
+		run.path !== helperReleaseWorkflowPath(plan.kind) ||
 		run.head_branch !== plan.defaultBranch ||
 		!/^[0-9a-f]{40}$/.test(run.head_sha) ||
 		!Number.isInteger(run.run_attempt) ||
@@ -515,10 +615,14 @@ export function validateHelperSourceJobs(value: unknown, source: HelperSourceRun
 		response.total_count > 100
 	)
 		throw new Error("Invalid helper source jobs");
+	// Source paths are fixed by kind before reaching this function; never accept arbitrary workflows.
+	const peer = source.path === helperReleaseWorkflowPath("remote-peer");
+	if (!peer && source.path !== helperReleaseWorkflowPath("helpers"))
+		throw new Error("Untrusted auxiliary source workflow");
 	const required = [
-		"Helper preflight",
-		"Assemble exact helper bundle",
-		...HELPER_PLATFORMS.flatMap((platform) => [
+		peer ? "Remote peer preflight" : "Helper preflight",
+		peer ? "Assemble exact remote peer bundle" : "Assemble exact helper bundle",
+		...(peer ? REMOTE_PEER_PLATFORMS : HELPER_PLATFORMS).flatMap((platform) => [
 			`Build (${platform})`,
 			`Native smoke (${platform})`,
 		]),
@@ -764,13 +868,13 @@ export async function publishHelperReleasePlan(
 				source: {
 					runId: parseCiId(env.GITHUB_RUN_ID),
 					runAttempt: parseCiId(env.GITHUB_RUN_ATTEMPT),
-					workflowPath: ".github/workflows/helpers-release.yml",
+					workflowPath: helperReleaseWorkflowPath(plan.kind),
 					nativeProof: "verified-original-bundle" as const,
 				},
 				buildSource: {
 					runId: parseCiId(plan.sourceRunId === "" ? env.GITHUB_RUN_ID : plan.sourceRunId),
 					runAttempt: parseCiId(options.sourceRunAttempt),
-					workflowPath: ".github/workflows/helpers-release.yml",
+					workflowPath: helperReleaseWorkflowPath(plan.kind),
 					...(options.bundleArtifactId
 						? { bundleArtifactId: parseCiId(options.bundleArtifactId) }
 						: {}),
@@ -828,7 +932,7 @@ export async function verifyPublicHelperRelease(
 	if (
 		release.tag_name !== plan.tag ||
 		release.draft !== false ||
-		release.prerelease !== false ||
+		release.prerelease !== helperReleaseIsPrerelease(plan.kind, plan.version) ||
 		!Array.isArray(release.assets)
 	)
 		throw new Error("Mirror requires an already-public helper release");

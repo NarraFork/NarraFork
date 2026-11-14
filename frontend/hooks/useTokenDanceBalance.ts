@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { formatLocaleNumber } from "../lib/intl-format";
@@ -23,7 +24,7 @@ export function useTokenDanceBalance(generation: number | undefined, enabled = t
 	const query = useQuery({
 		queryKey: ["tokendance", "balance", generation],
 		queryFn: ({ signal }) => api.tokenDanceBalance({ signal }),
-		enabled: enabled && generation !== undefined,
+		enabled: !REMOTE_BUILD && enabled && generation !== undefined,
 		staleTime: 30_000,
 		refetchInterval: (query) => {
 			if (!enabled || generation === undefined) return false;

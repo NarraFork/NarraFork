@@ -27,6 +27,9 @@ import {
 } from "../../scripts/lib/ci-release-types";
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
+import { REMOTE_FRONTEND_CAPABILITY } from "../../shared/remote-access/application";
+import { remoteReleaseFixture } from "./remote-frontend-release.fixture";
+
 const roots: string[] = [];
 let infoCalls: unknown[][] = [];
 let restoreInfo: (() => void) | undefined;
@@ -356,6 +359,48 @@ describe("bounded production gh asset streaming with a local fixture executable"
 			).rejects.toThrow();
 			expect(await readFile(outputPath, "utf8")).toBe("existing");
 		});
+	});
+});
+
+describe("remote frontend bundle contract", () => {
+	test("seals the exact two assets and binds declaration to expected target", async () => {
+		const f = await fixture();
+		f.plan.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+		const remote = await remoteReleaseFixture(f.root, f.plan);
+		const manifest = await assembleReleaseBundle({
+			...f.options,
+			remoteFrontendDir: remote.directory,
+		});
+		expect(manifest.files).toHaveLength(20);
+		for (const name of Object.values(remote.names))
+			expect(await readFile(join(f.options.bundleDir, "dist", name))).toEqual(
+				await readFile(join(remote.directory, name)),
+			);
+		expect((await verifyReleaseBundle(f.options.bundleDir, f.plan)).plan.remoteFrontend).toEqual(
+			REMOTE_FRONTEND_CAPABILITY,
+		);
+		await expect(
+			verifyReleaseBundle(f.options.bundleDir, { ...f.plan, remoteFrontend: undefined }),
+		).rejects.toThrow("remoteFrontend");
+	});
+	test("declared target cannot seal without artifacts and historical target cannot acquire them", async () => {
+		const f = await fixture();
+		f.plan.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+		await expect(assembleReleaseBundle(f.options)).rejects.toThrow("artifact is missing");
+		f.plan.remoteFrontend = undefined;
+		const remote = await remoteReleaseFixture(f.root, f.plan);
+		await expect(
+			assembleReleaseBundle({ ...f.options, remoteFrontendDir: remote.directory }),
+		).rejects.toThrow("Historical plan");
+	});
+	test("remote corruption and a self-consistently rehashed wrong source commit cannot pass restore", async () => {
+		const f = await fixture();
+		f.plan.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+		const remote = await remoteReleaseFixture(f.root, f.plan);
+		await assembleReleaseBundle({ ...f.options, remoteFrontendDir: remote.directory });
+		await writeFile(join(f.options.bundleDir, "dist", remote.names.archive), "broken");
+		await refreshFileRecord(f, remote.names.archive);
+		await expect(verifyReleaseBundle(f.options.bundleDir, f.plan)).rejects.toThrow();
 	});
 });
 

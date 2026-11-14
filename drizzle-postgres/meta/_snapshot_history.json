@@ -571,11 +571,35 @@
 		},
 		{
 			"idx": 71,
-			"tag": "0071_context_memories",
-			"id": "61415524-1b93-4e9d-8844-fc85e211847c",
+			"tag": "0071_outline_spec_imports",
+			"id": "c8a9eeba-aacb-4856-b151-f491477a6d62",
 			"prevId": "1363fe77-68fa-4135-8d93-e64136d06a6d",
 			"version": "7",
-			"snapshotDigest": "58fa2fc5ec20b42cc52316f971853b80c3808b87e88b78b3c41826a8b5feda56"
+			"snapshotDigest": "f9e7d6b4fe840ad6f7991ac9c622049d233e972f53c6a99dd3cfd665a4b201f7"
+		},
+		{
+			"idx": 72,
+			"tag": "0072_api_request_cache_usage_reported",
+			"id": "11493ae9-9036-4353-b911-18624a649666",
+			"prevId": "c8a9eeba-aacb-4856-b151-f491477a6d62",
+			"version": "7",
+			"snapshotDigest": "a99655ddcd191560e9e7b012214cf92ec9efa813515a472cd06bed4251eb15d6"
+		},
+		{
+			"idx": 73,
+			"tag": "0073_outline_spec_loss",
+			"id": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+			"prevId": "11493ae9-9036-4353-b911-18624a649666",
+			"version": "7",
+			"snapshotDigest": "9b69bab6d6b1864e335e6d5a067c9e052ba4ea869b1eb384e715818ce611ca83"
+		},
+		{
+			"idx": 74,
+			"tag": "0074_context_memories",
+			"id": "bfeb9071-e41b-44be-9238-ff5c6ed22395",
+			"prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+			"version": "7",
+			"snapshotDigest": "2f9615aa7667bca312f6f251de1a9317324a0fbc8fee214b0c85d292dabf33eb"
 		}
 	]
 }

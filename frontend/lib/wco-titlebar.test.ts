@@ -49,7 +49,8 @@ describe("WCO title-bar rows", () => {
 		const page = await Bun.file(
 			new URL("../routes/narrators/$narratorId.tsx", import.meta.url),
 		).text();
-		expect(page).toContain("data-nf-wco-titlebar=");
+		expect(page).toMatch(/data-nf-wco-titlebar\s/);
+		expect(page).toContain("useWcoTitlebarRows(!narratorLoading && !!narrator)");
 		// A ref callback, so the marks follow the root across session switches (the page
 		// remounts its root per session); a ref object kept the detached first root.
 		expect(page).toContain("useWcoTitlebarRows(");

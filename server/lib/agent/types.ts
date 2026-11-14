@@ -834,6 +834,8 @@ export type AgentEvent =
 				cacheCreationInputTokens?: number;
 				cacheCreation5mTokens?: number;
 				cacheCreation1hTokens?: number;
+				/** See ParsedStreamEvent.usage.cacheReported. */
+				cacheReported?: boolean;
 			};
 			ttftMs?: number;
 			durationMs?: number;
@@ -1039,6 +1041,12 @@ export interface AgentConfig {
 	 * instead, and taskReflection never runs. Absent means spec.
 	 */
 	taskBackend?: "spec" | "outline";
+	/**
+	 * With `taskBackend` `outline`: the session is one the Dynamic Spec import moved into the
+	 * outline (outline P2 PR 12b2), so a `spec://` call is answered with where its old tasks,
+	 * notes and behavior boundary went.
+	 */
+	specImported?: boolean;
 	/**
 	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
 	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read

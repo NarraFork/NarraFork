@@ -16,6 +16,8 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
 import { Divider } from "@mantine/core";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { Fragment, useMemo } from "react";
@@ -158,7 +160,9 @@ function ImageFixedView({
 	const data = block.data ?? {};
 	// A caller-provided resolver wins (test/injection); otherwise VListImage
 	// resolves the src itself (previewUrl → uploads blob by id + narratorId).
-	const injected = resolveImageSrc?.(block.tag, data) ?? null;
+	const candidate = resolveImageSrc?.(block.tag, data) ?? null;
+	const injected =
+		candidate && (!REMOTE_BUILD || isRemoteInlineImage(candidate)) ? candidate : null;
 	const filename = typeof data.filename === "string" ? data.filename : "image";
 	// When the measure layer had intrinsic dimensions it reserved the aspect-
 	// fitted box and stashed the exact display geometry here; the paint must
@@ -430,7 +434,9 @@ function ImageAreaView({
 	const data = (block.kind === "fixed" || block.kind === "unknown" ? block.data : undefined) ?? {};
 	// Caller-provided resolver wins; otherwise VListImage resolves it (data-url
 	// result / previewUrl / uploads blob).
-	const injected = resolveImageSrc?.(tag, data) ?? null;
+	const candidate = resolveImageSrc?.(tag, data) ?? null;
+	const injected =
+		candidate && (!REMOTE_BUILD || isRemoteInlineImage(candidate)) ? candidate : null;
 
 	return (
 		<div

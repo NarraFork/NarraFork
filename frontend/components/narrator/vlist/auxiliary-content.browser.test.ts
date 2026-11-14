@@ -237,6 +237,44 @@ for (const width of [320, 390]) {
 		});
 	}
 
+	for (const scene of ["send", "inbound"] as const) {
+		for (const lod of [3, 4, 5] as const) {
+			test(`L${lod} ${width}px: every ${scene} message is a bubble, whatever show_to_user says`, async () => {
+				const value = await render({ scene, width, lod });
+				assertGeometry(value);
+				const kind = scene === "send" ? "communication-bubble" : "injection-bubble";
+				// No trace and no tool card: all three messages paint as bubbles, in order.
+				expect(value.cards.map((card) => card.kind)).toEqual([kind, kind, kind]);
+				const prefix = scene === "send" ? "internal" : "received";
+				const intended = scene === "send" ? "reader-intended-true" : "received-intended-true";
+				expect(value.cards[0]?.text).toContain(`${prefix}-explicit-false`);
+				expect(value.cards[1]?.text).toContain(`${prefix}-default`);
+				expect(value.cards[2]?.text).toContain(intended);
+				await screenshot(`L${lod}-${scene}-bubbles-${width}`);
+			});
+		}
+		test(`${width}px: ${scene} rows at L2 and bubbles at L3 carry the same pairing identity`, async () => {
+			const folded = await render({ scene, width, lod: 2 });
+			const rowIds = folded.cards
+				.filter((card) => card.kind === "activity-trace")
+				.flatMap((card) => card.traceRows.map((row) => row.unitId));
+			expect(rowIds).toHaveLength(2);
+			const expanded = await render({ scene, width, lod: 3 });
+			// The two internal messages are the first two bubbles; each pairs with its row.
+			expect(expanded.cards.slice(0, 2).map((card) => card.unitId)).toEqual(rowIds);
+		});
+	}
+
+	test(`${width}px: background results stay tool rows at L3, only messages become bubbles`, async () => {
+		const value = await render({ scene: "grouped", width, lod: 3 });
+		assertGeometry(value);
+		expect(value.cards.map((card) => card.kind)).toEqual([
+			"auxiliary-content",
+			"communication-bubble",
+			"auxiliary-content",
+		]);
+	});
+
 	for (const lod of [2, 5] as const) {
 		test(`L${lod} ${width}px: knowledge detail opens its exact target only when the host can open it`, async () => {
 			await render({ scene: "knowledge", width, lod, knowledgeOpener: true });

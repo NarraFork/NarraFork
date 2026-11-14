@@ -35,6 +35,20 @@
  * without checkboxes, breadth first, at most {@link OUTLINE_BEHAVIOR_LIMITS.forkBlocks} blocks
  * with a note when cut, with its short ids (design §2.5: fork = copy). The rest of the session
  * space is not copied (as in PR 3).
+ *
+ * WHAT IS NEVER READ AS A RULE
+ * ----------------------------
+ * The swallowed-content scan (outline P2 PR 12c) attaches content a Spec panel save may have lost
+ * to imported pages as blocks of its own (`sl…` short ids). Nothing attaches such a block to this
+ * page by itself; should one stand here all the same, it and what is under it are left out of
+ * everything that reads the page as rules ({@link dropSpecLossAttachBlocks}): the view shown to
+ * the model, the text put ahead of the spec fence, and a fork's copy. A rule a person deleted on
+ * purpose must not apply again because a check found it. That holds for an `sl…` block a person
+ * moved onto this page by hand too: to make its content a rule, move the content out of the
+ * block, or attach the finding through the confirmation. Content a person attached here through
+ * the confirmation is under an `sr…` block: the content is read as rules and copied by a fork;
+ * the block's own line speaks to the person (what this is, that it may be moved or deleted) and
+ * is not a rule, so what is shown to the model has the content in its place (`rulesOnly`).
  */
 import { createHash } from "node:crypto";
 import { hotSafe } from "@server/lib/hot-safe";
@@ -45,6 +59,7 @@ import {
 	getUserLanguage,
 	type Locale,
 } from "@server/lib/prompt-i18n";
+import { isSpecLossAttachSid, isSpecLossRuleSid } from "@shared/outline-spec-import";
 import { splitBehaviorFence } from "../behavior-fence-sop";
 import { readNarrator } from "../outline/access-reads";
 import type { EditTextItem } from "../outline/edit-text";
@@ -55,7 +70,7 @@ import { loadBodiesWithin, readSubtree } from "../outline/read";
 import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
 import type { OutlineBlockMeta, OutlineStore } from "../outline/store/port";
-import { breadthFirst, subtreeNodes } from "../outline/tree";
+import { breadthFirst, type OutlineNode, subtreeNodes } from "../outline/tree";
 import { type OutlineCanonicalContent, type OutlineOp, writeOutline } from "../outline/write";
 import { specVfsService, writeSpecFile } from "../spec-vfs-service";
 import { readTaskSession } from "./backend";
@@ -96,6 +111,38 @@ export async function findBehaviorPage(
 	if (!owner) return null;
 	const [meta] = await store.getBlockMetas(spaceId, { ids: [owner.id] });
 	return meta && !meta.deleted && meta.parentId === null ? meta : null;
+}
+
+/**
+ * Take the swallowed-content scan's attach blocks, with what is under them, out of a behavior
+ * page's tree as it was just read (see the module header); the tree is the caller's own, built
+ * for this read. `rulesOnly` (what the model is shown): the header of content a person confirmed
+ * as rules is replaced by what is under it. How many subtrees were taken out.
+ */
+export function dropSpecLossAttachBlocks(
+	root: OutlineNode,
+	options: { rulesOnly?: boolean } = {},
+): number {
+	let dropped = 0;
+	const walk = [root];
+	for (let i = 0; i < walk.length; i++) {
+		const node = walk[i] as OutlineNode;
+		const kept: OutlineNode[] = [];
+		for (const child of node.children) {
+			if (isSpecLossAttachSid(child.sid)) dropped++;
+			else if (options.rulesOnly && isSpecLossRuleSid(child.sid)) {
+				// Its children stand where it stood.
+				for (const under of child.children) {
+					under.parent = node;
+					under.parentId = node.id;
+					kept.push(under);
+				}
+			} else kept.push(child);
+		}
+		node.children = kept;
+		walk.push(...kept);
+	}
+	return dropped;
 }
 
 /**
@@ -168,8 +215,26 @@ interface ImportNode {
  * Longer than the 8 characters drawn ids have, so they never collide with one.
  */
 function importSids(text: string): { page: string; block: (n: number) => string } {
-	const tag = createHash("sha256").update(text).digest("hex").slice(0, 10);
+	const tag = behaviorImportTag(text);
 	return { page: `fp${tag}`, block: (n) => `fi${tag}${n.toString(36)}` };
+}
+
+function behaviorImportTag(text: string): string {
+	return createHash("sha256").update(text).digest("hex").slice(0, 10);
+}
+
+/**
+ * The fence text a block of the behavior page was imported from, as a tag: the same for every
+ * block an import of one text wrote, compared with {@link behaviorImportTagOf}. Null for a block
+ * no import wrote.
+ */
+export function behaviorImportTagOfSid(sid: string): string | null {
+	return /^fi([0-9a-f]{10})[0-9a-z]+$/.exec(sid)?.[1] ?? null;
+}
+
+/** The tag of the blocks an import of the fence text `own` writes (null: it writes none). */
+export function behaviorImportTagOf(own: string): string | null {
+	return own ? behaviorImportTag(own) : null;
 }
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -253,13 +318,51 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 	// Asked once per process from here on, whatever happens: a failed import is not retried on
 	// every run (the behavior view shows the fence text that stayed behind instead).
 	nothingToImport.add(narratorId);
+	if ((await importBehaviorFenceText(narratorId, locale, fence.own)) === "nothing")
+		return "nothing";
+
+	// The page holds the text now; the fence keeps only the plugin's channel. It is read again
+	// right before the write so a plugin SOP update that landed during the import is kept. The
+	// fence's own text is compared without whitespace: the plugin's update rejoins the text
+	// around an SOP in the middle of the fence without the blank line it had, and that must not
+	// leave the moved text behind to be imported again (glued) after a restart. Own text that
+	// really changed meanwhile is left alone (the view shows it, a later run imports it).
+	const current = await readOldBehaviorFence(narratorId);
+	if (squeezed(current.own) !== squeezed(fence.own)) return "imported";
+	await writeSpecFile(narratorId, BEHAVIOR_FENCE_URI, current.sopSections, {
+		actor: "system",
+		createdBy: "system",
+		pluginSop: true,
+	});
+	return "imported";
+}
+
+/**
+ * Write a fence's own text `own` (everything but the plugin's SOP) onto the session's behavior
+ * page, as described in the module header; the fence itself is neither read nor rewritten. What
+ * the import of a whole Dynamic Spec session calls before it moves the session to the outline
+ * (outline P2 PR 12b, which reads the fence through its own port): the short ids follow from the
+ * text, so the session's first run as an outline session finds the text there and only empties
+ * the fence. Rejects when a commit fails (what was not written is kept for the behavior view).
+ */
+export async function importBehaviorFenceText(
+	narratorId: string,
+	locale: Locale,
+	own: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<"imported" | "nothing"> {
+	const { signal } = options;
+	const fence = { own };
 	leftovers.delete(narratorId);
 	if (!fence.own) return "nothing";
-	const [parsed] = await processEditText({
-		kind: "parse",
-		inputs: [{ mode: "outline", text: fence.own }],
-		labels: [],
-	});
+	const [parsed] = await processEditText(
+		{
+			kind: "parse",
+			inputs: [{ mode: "outline", text: fence.own }],
+			labels: [],
+		},
+		{ signal },
+	);
 	// Rules are not tasks: every item becomes a plain block (a checkbox in the old fence is
 	// dropped, so nothing on the page starts or continues), and the properties (aliases,
 	// prerequisites, dates) are left out so nothing can collide. An item longer than a block may
@@ -306,10 +409,13 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 			job.push(node);
 			bytes += size;
 		}
-		const normalized = await processEditText({
-			kind: "normalize",
-			contents: job.map((node) => node.content),
-		});
+		const normalized = await processEditText(
+			{
+				kind: "normalize",
+				contents: job.map((node) => node.content),
+			},
+			{ signal },
+		);
 		job.forEach((node, n) => {
 			const entry = normalized[n];
 			if (entry && entry.split.length === 0) {
@@ -392,6 +498,8 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 				inThisCommit.add(node.sid);
 				bytes += size;
 			}
+			// Checked between commits: a commit is whole, what follows is written by the next run.
+			signal?.throwIfAborted();
 			const result = await writeOutline(
 				{
 					spaceId: space.id,
@@ -421,20 +529,6 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 	// not show the moved text a second time. (The commits marked the cached views stale; when
 	// none landed, nothing reached the page and the leftover is the fence's whole text.)
 	leftovers.set(narratorId, { own: fence.own, text: "" });
-
-	// The page holds the text now; the fence keeps only the plugin's channel. It is read again
-	// right before the write so a plugin SOP update that landed during the import is kept. The
-	// fence's own text is compared without whitespace: the plugin's update rejoins the text
-	// around an SOP in the middle of the fence without the blank line it had, and that must not
-	// leave the moved text behind to be imported again (glued) after a restart. Own text that
-	// really changed meanwhile is left alone (the view shows it, a later run imports it).
-	const current = await readOldBehaviorFence(narratorId);
-	if (squeezed(current.own) !== squeezed(fence.own)) return "imported";
-	await writeSpecFile(narratorId, BEHAVIOR_FENCE_URI, current.sopSections, {
-		actor: "system",
-		createdBy: "system",
-		pluginSop: true,
-	});
 	return "imported";
 }
 
@@ -480,6 +574,8 @@ export async function copyOutlineBehaviorPage(
 		if (!page) return false;
 		const subtree = await readSubtree(page.id);
 		if (!subtree) return false;
+		// Possibly lost content attached by the scan is not a rule: a fork does not inherit it.
+		dropSpecLossAttachBlocks(subtree.root);
 		// One operation is kept for the note a cut copy ends with.
 		const room = OUTLINE_BEHAVIOR_LIMITS.forkBlocks - 1;
 		const order = breadthFirst(subtree.root, "all", room);

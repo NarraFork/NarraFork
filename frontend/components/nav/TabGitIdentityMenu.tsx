@@ -20,10 +20,15 @@ export function TabGitIdentityMenu({
 	const [expanded, setExpanded] = useState(false);
 	const { data, isLoading } = useNarratorGitIdentity(expanded ? narratorId : null);
 	const setPick = useSetNarratorGitIdentity(narratorId);
+	// 会话自己没有 pick 时跟随所在文件夹，菜单要说清跟的是哪一条。
+	const folderIdentity = data?.folderSelectedId
+		? data.identities.find((identity) => identity.id === data.folderSelectedId)
+		: undefined;
 	return (
 		<GitIdentityMenuList
 			identities={data?.identities ?? []}
 			selectedId={data?.selectedId ?? null}
+			followIdentity={folderIdentity}
 			isLoading={isLoading}
 			expanded={expanded}
 			onToggle={() => setExpanded((open) => !open)}

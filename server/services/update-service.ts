@@ -43,7 +43,7 @@ import { managerChildTokenEnv } from "../lib/manager-token";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { createUpdateFetchContext, type UpdateFetchContext } from "../lib/net/update-fetch";
-import { replacementLaunchArgs } from "../lib/replacement-launch";
+import { replacementLaunchArgs, spawnReplacementProcess } from "../lib/replacement-launch";
 import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "../lib/runtime-target";
 import {
 	beginGracefulRestartSession,
@@ -1887,46 +1887,23 @@ async function drainAndSpawnPreparedUpdate(options: {
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_NONCE: session.markerNonce,
 		};
-		const isWindows = process.platform === "win32";
 		const launchArgs = replacementLaunchArgs(process.argv.slice(2), {
 			platform: process.platform,
 			managerManaged: process.env.NARRAFORK_MANAGER_MANAGED === "1",
 		});
-		const proc = isWindows
-			? Bun.spawn(
-					[
-						process.env.ComSpec || "cmd.exe",
-						"/d",
-						"/c",
-						"start",
-						"",
-						"/D",
-						process.cwd(),
-						options.newExecPath,
-						...launchArgs,
-					],
-					{
-						cwd: process.cwd(),
-						env,
-						stdio: ["ignore", "ignore", "ignore"],
-						windowsHide: true,
-					},
-				)
-			: Bun.spawn([options.newExecPath, ...launchArgs], {
-					cwd: process.cwd(),
-					env,
-					detached: true,
-					stdio: ["ignore", "ignore", "ignore"],
-				});
-		(proc as { unref?: () => void }).unref?.();
+		const replacementPid = spawnReplacementProcess({
+			execPath: options.newExecPath,
+			args: launchArgs,
+			cwd: process.cwd(),
+			env,
+		});
 
 		logger.info("Update replacement server spawned after scheduled drain", {
 			oldExecPath: options.execPath,
 			newExecPath: options.newExecPath,
 			targetVersion: options.targetVersion,
-			replacementPid: isWindows ? undefined : proc.pid,
-			launcherPid: isWindows ? proc.pid : undefined,
-			launchMode: isWindows ? "cmd-start" : "detached",
+			replacementPid,
+			launchMode: process.platform === "win32" ? "windows-breakaway" : "detached",
 			handoffUrl: session.url,
 			markerPath: session.markerPath,
 		});

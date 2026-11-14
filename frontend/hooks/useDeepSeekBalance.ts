@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type QueryClient, queryOptions, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
@@ -21,7 +22,7 @@ export function deepSeekBalanceOptions(
 			return balance ?? null;
 		},
 		select: (balance) => (balance && balance.generation === generation ? balance : undefined),
-		enabled: enabled && providerId != null && generation !== undefined,
+		enabled: !REMOTE_BUILD && enabled && providerId != null && generation !== undefined,
 		staleTime: 30_000,
 		refetchInterval: 60_000,
 	});

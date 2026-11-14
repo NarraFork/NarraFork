@@ -1,6 +1,6 @@
 import { apiUrl } from "@frontend/lib/base-path";
+import { businessTransport } from "@frontend/lib/business-transport";
 import { isSessionInvalidResponse } from "@shared/session-auth";
-import { leaveForStartupPageIfStarting } from "../pwa";
 
 /**
  * The API root, resolved against the app's mount prefix.
@@ -83,16 +83,27 @@ export function clearToken(): void {
  * The revocation is fire-and-forget with `keepalive`, because callers navigate away
  * immediately. If it never arrives, the session still expires on its own.
  */
-export function endSession(): void {
+export function endSession(): Promise<void> {
 	const token = getToken();
-	if (token) {
-		void fetch(apiUrl("/api/auth/logout"), {
+	// Clear synchronously so no new queries can race logout; revocation is bounded
+	// and cleanup runs even when the backend closes RTC before returning headers.
+	clearToken();
+	if (!token) return Promise.resolve();
+	return businessTransport
+		.request(apiUrl("/api/auth/logout"), {
 			method: "POST",
 			headers: { Authorization: `Bearer ${token}` },
+			signal: AbortSignal.timeout(3_000),
 			keepalive: true,
-		}).catch(() => {});
-	}
-	clearToken();
+		})
+		.then(
+			() => {},
+			() => {},
+		)
+		.finally(() => {
+			// A newer login may have arrived while this older revocation was in flight.
+			if (getToken() === token) clearToken();
+		});
 }
 
 /**
@@ -133,8 +144,7 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
 	if (token && !headers.has("Authorization")) {
 		headers.set("Authorization", `Bearer ${token}`);
 	}
-	const response = await fetch(input, { ...init, headers });
-	leaveForStartupPageIfStarting(response);
+	const response = await businessTransport.request(String(input), { ...init, headers });
 	return response;
 }
 
@@ -348,8 +358,7 @@ export async function request<T>(
 	if (token) {
 		headers.Authorization = `Bearer ${token}`;
 	}
-	const response = await fetch(apiUrl(path), { ...fetchOptions, headers });
-	leaveForStartupPageIfStarting(response);
+	const response = await businessTransport.request(apiUrl(path), { ...fetchOptions, headers });
 	// Apply the same byte budget before parsing either success or error bodies.
 	const boundedText =
 		maxResponseBytes == null
@@ -385,21 +394,6 @@ export async function request<T>(
 	throw new ApiError(errorText || "Invalid response", response.status, { error: errorText });
 }
 
-/** HTTP statuses that must not carry a body when constructing a Response. */
-const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
-
-function parseRawHeaders(raw: string): Headers {
-	const headers = new Headers();
-	for (const line of raw.trim().split(/[\r\n]+/)) {
-		const idx = line.indexOf(":");
-		if (idx <= 0) continue;
-		const key = line.slice(0, idx).trim();
-		const value = line.slice(idx + 1).trim();
-		if (key) headers.append(key, value);
-	}
-	return headers;
-}
-
 interface UploadProgressOptions {
 	headers?: Record<string, string>;
 	onProgress?: (fraction: number) => void;
@@ -412,61 +406,15 @@ function postWithProgress(
 	body: Blob | FormData,
 	options?: UploadProgressOptions,
 ): Promise<Response> {
-	return new Promise((resolve, reject) => {
-		const signal = options?.signal;
-		if (signal?.aborted) {
-			reject(new ApiError("Upload cancelled", 0, { code: "UPLOAD_ABORTED" }));
-			return;
-		}
-
-		const xhr = new XMLHttpRequest();
-		xhr.open("POST", url);
-
-		if (options?.headers) {
-			for (const [key, value] of Object.entries(options.headers)) {
-				// Skip Content-Type so the browser sets the multipart boundary.
-				if (body instanceof FormData && key.toLowerCase() === "content-type") continue;
-				xhr.setRequestHeader(key, value);
+	return businessTransport
+		.upload(String(resolveApiInput(url)), body, options)
+		.catch((error: unknown) => {
+			if (error instanceof DOMException && error.name === "AbortError") {
+				throw new ApiError("Upload cancelled", 0, { code: "UPLOAD_ABORTED" });
 			}
-		}
-
-		const onProgress = options?.onProgress;
-		if (onProgress) {
-			xhr.upload.onprogress = (event) => {
-				if (event.lengthComputable && event.total > 0) {
-					onProgress(event.loaded / event.total);
-				}
-			};
-		}
-
-		const onAbort = () => xhr.abort();
-		if (signal) signal.addEventListener("abort", onAbort);
-		const cleanup = () => {
-			if (signal) signal.removeEventListener("abort", onAbort);
-		};
-
-		xhr.onload = () => {
-			cleanup();
-			const status = xhr.status;
-			const headers = parseRawHeaders(xhr.getAllResponseHeaders());
-			const body = NULL_BODY_STATUSES.has(status) ? null : xhr.responseText;
-			resolve(new Response(body, { status, statusText: xhr.statusText, headers }));
-		};
-		xhr.onerror = () => {
-			cleanup();
-			reject(new ApiError("Network request failed", 0));
-		};
-		xhr.ontimeout = () => {
-			cleanup();
-			reject(new ApiError("Request timed out", 0));
-		};
-		xhr.onabort = () => {
-			cleanup();
-			reject(new ApiError("Upload cancelled", 0, { code: "UPLOAD_ABORTED" }));
-		};
-
-		xhr.send(body);
-	});
+			if (error instanceof ApiError) throw error;
+			throw new ApiError(error instanceof Error ? error.message : "Network request failed", 0);
+		});
 }
 
 /** Let the browser choose the multipart Content-Type and boundary. */

@@ -46,6 +46,7 @@ const EXPECTED_INSTANCE = [
 	"/settings/proxy",
 	"/settings/workspace",
 	"/settings/server",
+	"/settings/remote-access",
 	"/settings/authentication",
 	"/settings/oauth-apps",
 	"/settings/users",
@@ -54,6 +55,8 @@ const EXPECTED_INSTANCE = [
 	"/settings/runtime",
 	// Instance-level; the mobile picker used to list it under personal.
 	"/settings/plugins",
+	// The Dynamic Spec import's admin page (outline P2 PR 12b2).
+	"/settings/outline-import",
 	"/settings/usage",
 	// Previously missing from the mobile picker entirely.
 	"/settings/execution-log",

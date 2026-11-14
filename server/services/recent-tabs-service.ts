@@ -37,7 +37,7 @@ import {
 	type RecentTabsSection,
 	type RecentTabType,
 } from "@shared/recent-tabs";
-import { and, asc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narrators,
@@ -1413,18 +1413,27 @@ export async function restoreRecentTabs(
 	return mutate(userId, () => ({ tabs: normalized }));
 }
 
+/**
+ * Page position in the `(pinned DESC, sort_order, tab_key)` order. `p` is optional only so a
+ * cursor issued before it existed decodes; such a cursor is answered as stale.
+ */
 interface CursorPayload {
 	s: RecentTabsSection;
 	r: number;
+	p?: 0 | 1;
 	o: number;
 	k: string;
 }
 
 function encodeCursor(row: RecentTabRow, section: RecentTabsSection, revision: number): string {
-	return Buffer.from(
-		JSON.stringify({ s: section, r: revision, o: row.sortOrder, k: row.tabKey }),
-		"utf8",
-	).toString("base64url");
+	const payload: CursorPayload = {
+		s: section,
+		r: revision,
+		p: row.pinned ? 1 : 0,
+		o: row.sortOrder,
+		k: row.tabKey,
+	};
+	return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
 }
 
 function decodeCursor(cursor: string | undefined): CursorPayload | null {
@@ -1435,6 +1444,7 @@ function decodeCursor(cursor: string | undefined): CursorPayload | null {
 			(parsed?.s !== "projects" && parsed?.s !== "work") ||
 			typeof parsed?.r !== "number" ||
 			!Number.isInteger(parsed.r) ||
+			(parsed?.p !== undefined && parsed.p !== 0 && parsed.p !== 1) ||
 			typeof parsed?.o !== "number" ||
 			!Number.isInteger(parsed.o) ||
 			typeof parsed?.k !== "string"
@@ -1447,6 +1457,17 @@ function decodeCursor(cursor: string | undefined): CursorPayload | null {
 	}
 }
 
+/** Rows strictly after `cursor` in the `(pinned DESC, sort_order, tab_key)` page order. */
+function afterCursorWhere(cursor: CursorPayload & { p: 0 | 1 }) {
+	const laterInZone = or(
+		gt(userRecentTabs.sortOrder, cursor.o),
+		and(eq(userRecentTabs.sortOrder, cursor.o), gt(userRecentTabs.tabKey, cursor.k)),
+	);
+	return cursor.p === 1
+		? or(and(eq(userRecentTabs.pinned, true), laterInZone), eq(userRecentTabs.pinned, false))
+		: and(eq(userRecentTabs.pinned, false), laterInZone);
+}
+
 export async function listPage(
 	userId: string,
 	section: RecentTabsSection,
@@ -1456,7 +1477,7 @@ export async function listPage(
 	return userPreferencesLock.acquire(userId, async () => {
 		const revision = ensureMigratedLocked(userId);
 		const decoded = decodeCursor(cursor);
-		if (decoded && (decoded.s !== section || decoded.r !== revision)) {
+		if (decoded && (decoded.s !== section || decoded.r !== revision || decoded.p === undefined)) {
 			throw new AppError(
 				"Recent-tabs cursor is stale; reload the section from the first page",
 				409,
@@ -1471,16 +1492,22 @@ export async function listPage(
 			EXCLUDE_REMOVED_TAB_TYPES,
 		);
 		const cursorWhere = decoded
-			? or(
-					gt(userRecentTabs.sortOrder, decoded.o),
-					and(eq(userRecentTabs.sortOrder, decoded.o), gt(userRecentTabs.tabKey, decoded.k)),
-				)
+			? afterCursorWhere(decoded as CursorPayload & { p: 0 | 1 })
 			: undefined;
+		// The pinned block is the head of the list by definition, so the page order says so
+		// directly instead of trusting every stored sort key to agree. `regroupFolders` keeps
+		// the stored order in the same shape, which makes this the stored order whenever the
+		// list was last written by current code. Bounded: one user's section holds at most
+		// RECENT_TABS_STORAGE_LIMIT rows, read through the (user, section, ...) index.
 		const topLevelRows = db
 			.select()
 			.from(userRecentTabs)
 			.where(cursorWhere ? and(baseWhere, cursorWhere) : baseWhere)
-			.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
+			.orderBy(
+				desc(userRecentTabs.pinned),
+				asc(userRecentTabs.sortOrder),
+				asc(userRecentTabs.tabKey),
+			)
 			.limit(pageLimit + 1)
 			.all();
 		const hasMore = topLevelRows.length > pageLimit;

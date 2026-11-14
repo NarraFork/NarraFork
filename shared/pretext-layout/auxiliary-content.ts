@@ -117,13 +117,14 @@ function short(value: unknown): string {
 function hasHumanSource(msg: AuxiliaryMessage): boolean {
 	return msg.origin === "user" || (msg.role === "user" && !msg.origin);
 }
-function isAuxiliaryBlock(block: AuxiliaryBlock): boolean {
+function isAuxiliaryBlock(block: AuxiliaryBlock, communication: boolean): boolean {
 	if (block.status === "pending" || block.status === "awaiting_confirmation") return false;
 	if (block.type === "knowledge_hint") return true;
 	if (block.type !== "system_injection" || !AUXILIARY_SOURCES.has(text(block.source))) return false;
 	const body = readSideCarBody(block);
 	if (COMMUNICATION_SOURCES.has(text(block.source))) {
 		return (
+			communication &&
 			body?.kind === "messages" &&
 			body.items.length > 0 &&
 			body.items.every(
@@ -138,12 +139,20 @@ function isAuxiliaryBlock(block: AuxiliaryBlock): boolean {
 	);
 }
 
-/** Shared classifier for grouping, standalone adaptation and recency. No prose projection. */
+/**
+ * Shared classifier for grouping, standalone adaptation and recency. No prose projection.
+ *
+ * `communication: false` leaves agent messages out, so they keep their bubbles: the
+ * adapter passes it from L3 up (see `compactsCommunication`). Grouping and recency
+ * describe the L1/L2 fold and keep the default.
+ */
 export function auxiliaryContentViews(
 	msg: AuxiliaryMessage,
 	visibleBlockIndices?: readonly number[],
+	opts?: { communication?: boolean },
 ): AuxiliaryContentProjection[] {
 	if (hasHumanSource(msg)) return [];
+	const communication = opts?.communication !== false;
 	const blocks = messageBody(msg);
 	const visible = visibleBlockIndices ? new Set(visibleBlockIndices) : undefined;
 	const views = [...contextBlockViews(blocks), ...injectionBlockViews(blocks)];
@@ -151,7 +160,7 @@ export function auxiliaryContentViews(
 	const seen = new Set<number>();
 	for (const view of views) {
 		const block = { ...blocks[view.blockIndex], ...view.block } as AuxiliaryBlock;
-		if (seen.has(view.blockIndex) || !isAuxiliaryBlock(block)) continue;
+		if (seen.has(view.blockIndex) || !isAuxiliaryBlock(block, communication)) continue;
 		// A filtered segment owns the structured block, not a coincidental companion.
 		if (visible && !visible.has(view.blockIndex)) continue;
 		seen.add(view.blockIndex);
@@ -164,6 +173,7 @@ export function auxiliaryContentViews(
 	}
 	// Attribution is authoritative; no sender/type guessing from legacy prose.
 	if (
+		communication &&
 		result.length === 0 &&
 		msg.origin === "assistant" &&
 		(msg.originLabel === "agentMessage" || msg.originLabel?.startsWith("agentMessage:")) &&

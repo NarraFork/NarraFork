@@ -1,4 +1,4 @@
-import { parseCompactMessageBlock } from "@shared/compact-message";
+import { normalizeCompactAttempts, parseCompactMessageBlock } from "@shared/compact-message";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
 import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
@@ -4683,7 +4683,12 @@ const narratorMessageQueriesUnlocked = {
 			const msg = fillBody(
 				tx.query.narratorMessages
 					.findFirst({
-						...bodyColumns(),
+						...bodyColumns({
+							id: true,
+							contentJson: true,
+							tokensIn: true,
+							contextPercent: true,
+						}),
 						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
 					})
 					.sync(),
@@ -4719,6 +4724,59 @@ const narratorMessageQueriesUnlocked = {
 			const latestAttempt = compactBlock.attempts?.at(-1);
 			const live =
 				compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
+
+			// Display fallbacks for markers written before both ends of the occupancy pair
+			// were recorded. A marker without `before` inherits the last real occupancy its
+			// history carried; a marker without `after` inherits its own row only when that
+			// row came from the post-compact estimate — the summary model's own request
+			// occupancy also lands in this column, and that is a percentage of a different
+			// window, so it must not be shown as the narrator's occupancy.
+			// The search stops at the previous compact boundary: anything older belongs to a
+			// different context, and compact markers themselves (system rows) may carry the
+			// summary model's own occupancy. Bounding it also keeps this read small.
+			const previousCompactSeq = (() => {
+				if (compactBlock.contextPercentBefore != null) return null;
+				return (
+					tx
+						.select({ seq: narratorMessageRefs.seq })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.isCompact, 1),
+								lt(narratorMessageRefs.seq, ref.seq),
+							),
+						)
+						.orderBy(desc(narratorMessageRefs.seq))
+						.limit(1)
+						.get()?.seq ?? null
+				);
+			})();
+			const contextPercentBefore =
+				compactBlock.contextPercentBefore ??
+				tx
+					.select({ contextPercent: narratorMessages.contextPercent })
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							lt(narratorMessageRefs.seq, ref.seq),
+							...(previousCompactSeq != null
+								? [gt(narratorMessageRefs.seq, previousCompactSeq)]
+								: []),
+							ne(narratorMessages.role, "system"),
+							isNotNull(narratorMessages.contextPercent),
+						),
+					)
+					.orderBy(desc(narratorMessageRefs.seq))
+					.limit(1)
+					.get()?.contextPercent ??
+				undefined;
+			const contextPercentAfter =
+				compactBlock.contextPercentAfter ??
+				(msg.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined);
+
 			return {
 				status: compactBlock.status,
 				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
@@ -4747,8 +4805,8 @@ const narratorMessageQueriesUnlocked = {
 							: undefined,
 				mode: compactBlock.mode,
 				trigger: compactBlock.trigger,
-				contextPercentBefore: compactBlock.contextPercentBefore,
-				contextPercentAfter: compactBlock.contextPercentAfter,
+				contextPercentBefore,
+				contextPercentAfter,
 				attempts: compactBlock.attempts ?? [],
 				canRetry,
 			};
@@ -5241,6 +5299,71 @@ const narratorMessageQueriesUnlocked = {
 				messageDeleted: deletedMessages.has(target.messageId),
 			})),
 		};
+	},
+
+	/**
+	 * Whether a committed compact's `after` occupancy can still be re-measured from the
+	 * narrator's current history: only while it is the latest compact boundary and nothing
+	 * has been added after it since it finished. Otherwise the current estimate would
+	 * measure later turns (or a different compact) and no longer describe this one.
+	 */
+	async isCompactAfterRemeasurable(narratorId: string, messageId: string): Promise<boolean> {
+		return db.transaction((tx) => {
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+						eq(narratorMessageRefs.isCompact, 1),
+					),
+					columns: { seq: true },
+				})
+				.sync();
+			if (!ref) return false;
+			const newerCompact = tx
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.isCompact, 1),
+						gt(narratorMessageRefs.seq, ref.seq),
+					),
+				)
+				.limit(1)
+				.get();
+			if (newerCompact) return false;
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns({ id: true, contentJson: true, createdAt: true }),
+						where: eq(narratorMessages.id, messageId),
+					})
+					.sync(),
+			);
+			if (!msg) return false;
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+			if (compactBlock?.status !== "compacted") return false;
+			// Messages kept after the boundary predate the compact; anything created after it
+			// finished is new history the original estimate never saw.
+			const finishedAt =
+				normalizeCompactAttempts(compactBlock.attempts).at(-1)?.finishedAt ?? msg.createdAt;
+			const newer = tx
+				.select({ id: narratorMessages.id })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						gt(narratorMessageRefs.seq, ref.seq),
+						gt(narratorMessages.createdAt, finishedAt),
+					),
+				)
+				.limit(1)
+				.get();
+			return !newer;
+		});
 	},
 
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {

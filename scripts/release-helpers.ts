@@ -10,12 +10,14 @@ import {
 	HELPER_RELEASE_TAG,
 	type HelperPlatform,
 } from "../shared/helper-distribution";
+import { isRemotePeerPlatform } from "../shared/remote-peer";
 import {
 	ciPublicationDeadlineSignal,
 	createPublicationGhRunner,
 } from "./lib/ci-publication-runtime";
 import { timeReleasePhase } from "./lib/ci-release-io";
 import {
+	type AuxiliaryPlatform,
 	assembleHelperReleaseBundle,
 	assertHelperReleaseGate,
 	buildHelperReleasePlatform,
@@ -101,19 +103,20 @@ export function parseHelperReleaseArguments(args: string[]): {
 		if (publish !== "true" && publish !== "false") throw new Error("Expected --publish=true|false");
 		const kind = options.get("kind");
 		const tag = options.get("tag");
-		if (kind !== "helpers" && kind !== "executor")
-			throw new Error("preflight requires --kind=helpers|executor");
+		if (kind !== "helpers" && kind !== "executor" && kind !== "remote-peer")
+			throw new Error("preflight requires --kind=helpers|executor|remote-peer");
 		if (
 			!tag ||
 			(kind === "helpers"
 				? tag !== HELPER_RELEASE_TAG
-				: !/^executor-v\d+\.\d+\.\d+(?:-[A-Za-z0-9._-]+)?$/.test(tag))
+				: !new RegExp(`^${kind}-v\\d+\\.\\d+\\.\\d+(?:-[A-Za-z0-9._-]+)?$`).test(tag))
 		)
 			throw new Error("preflight requires a valid fixed --tag");
 	}
 	if (
 		(command === "build" || command === "smoke") &&
-		!HELPER_PLATFORMS.includes(options.get("platform") as HelperPlatform)
+		!HELPER_PLATFORMS.includes(options.get("platform") as HelperPlatform) &&
+		!isRemotePeerPlatform(options.get("platform") ?? "")
 	)
 		throw new Error(`${command} requires a supported --platform`);
 	for (const name of ["source-run-id", "source-run-attempt", "bundle-artifact-id"]) {
@@ -177,14 +180,14 @@ async function runHelperReleaseCommand(args: string[], signal: AbortSignal): Pro
 			planPath,
 			await planHelperRelease(root, option("kind"), option("tag"), option("source-run-id"), {
 				publish: option("publish", "false") === "true",
+				signal,
 			}),
 		);
 		return;
 	}
 	const plan = await readHelperReleasePlan(planPath);
 	if (command === "build" || command === "smoke") {
-		const platform = option("platform") as HelperPlatform;
-		if (!HELPER_PLATFORMS.includes(platform)) throw new Error("Invalid native helper platform");
+		const platform = option("platform") as AuxiliaryPlatform;
 		if (command === "build")
 			await buildHelperReleasePlatform(
 				root,
@@ -192,8 +195,9 @@ async function runHelperReleaseCommand(args: string[], signal: AbortSignal): Pro
 				platform,
 				resolve(root, option("cache", ".helper-release/cache")),
 				output,
+				signal,
 			);
-		else await smokeHelperReleasePlatform(plan, platform, output);
+		else await smokeHelperReleasePlatform(plan, platform, output, signal);
 	} else if (command === "assemble") {
 		await assembleHelperReleaseBundle(
 			root,

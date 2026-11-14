@@ -1,0 +1,1 @@
+ALTER TABLE "api_requests" ADD COLUMN "cache_usage_reported" boolean;
