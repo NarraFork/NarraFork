@@ -245,8 +245,9 @@ export function createMailbox(limits: MailboxLimits, buffers?: MailboxBuffers): 
 		) {
 			protocol("Mailbox frame changed while writing");
 		}
+		// READY commits publication. The peer may consume and close as soon as it
+		// is notified; that normal completion must not retroactively fail this write.
 		signal(header, slot);
-		checkOpen();
 	}
 
 	function take(
