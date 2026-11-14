@@ -99,6 +99,20 @@
 	--nf-danger-graphic-dark: #f0555a;
 	--nf-danger-graphic-light: #c2262b;
 
+	/*
+	 * Diff hunk headers. Shared by the transcript diff and the git split view, which had
+	 * drifted into two copies of the same six colours.
+	 */
+	--nf-diff-hunk-text-light: #59636e;
+	--nf-diff-hunk-text-dark: #9198a1;
+	--nf-diff-hunk-bg-light: #ddf4ff;
+	--nf-diff-hunk-bg-dark: #121d2f;
+	--nf-diff-hunk-line-light: #c6e6ff;
+	--nf-diff-hunk-line-dark: #1f2a37;
+
+	/* Text painted on a caller-supplied solid colour (peer avatars, outline chips). */
+	--nf-on-solid: #ffffff;
+
 	/* ---- radius: by role, not by size ---- */
 	--nf-radius-plane: 0;
 	--nf-radius-control: var(--mantine-radius-sm); /* 4px */
@@ -205,6 +219,10 @@
 	--nf-wait-graphic: var(--nf-wait-graphic-light);
 	--nf-attention-graphic: var(--nf-attention-graphic-light);
 	--nf-danger-graphic: var(--nf-danger-graphic-light);
+
+	--nf-diff-hunk-text: var(--nf-diff-hunk-text-light);
+	--nf-diff-hunk-bg: var(--nf-diff-hunk-bg-light);
+	--nf-diff-hunk-line: var(--nf-diff-hunk-line-light);
 }
 
 :root[data-mantine-color-scheme="dark"] {
@@ -231,6 +249,10 @@
 	--nf-wait-graphic: var(--nf-wait-graphic-dark);
 	--nf-attention-graphic: var(--nf-attention-graphic-dark);
 	--nf-danger-graphic: var(--nf-danger-graphic-dark);
+
+	--nf-diff-hunk-text: var(--nf-diff-hunk-text-dark);
+	--nf-diff-hunk-bg: var(--nf-diff-hunk-bg-dark);
+	--nf-diff-hunk-line: var(--nf-diff-hunk-line-dark);
 }
 
 @media (prefers-reduced-motion: reduce) {

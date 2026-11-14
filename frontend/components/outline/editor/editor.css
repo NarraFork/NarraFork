@@ -644,7 +644,7 @@
 	left: -1px;
 	font-size: 10px;
 	line-height: 1.2;
-	color: #fff;
+	color: var(--nf-on-solid);
 	background: var(--peer);
 	padding: 0 3px;
 	border-radius: 2px;

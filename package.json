@@ -122,6 +122,7 @@
 	},
 	"scripts": {
 		"approve": "bun server/scripts/approve-all.ts",
+		"check:tokens": "bun scripts/check-style-tokens.ts",
 		"sql:report": "bun scripts/sql-trace-report.ts",
 		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts && bun scripts/generate-builtin-plugins.ts",
 		"build:remote": "bun scripts/build-remote-frontend.ts",

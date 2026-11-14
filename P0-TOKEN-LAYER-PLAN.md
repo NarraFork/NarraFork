@@ -524,3 +524,52 @@ PR1 的验收方式是"零变化"：先合并、观察一个版本，确认无�
 建议改成：
 
 > 表面阶梯保持克制（≥1.12:1 只用于分组），真正的边界交给 `rule`（≈1.6:1）与 `rule-strong`（≥3:1，符合 WCAG 1.4.11）。深色下硬拉底色对比会让界面发灰。
+
+---
+
+## 10. 实施记录（已完成）
+
+| 提交 | 内容 |
+|---|---|
+| `957268e94` | PR1：`tokens.css` 落地 + `main.tsx` 导入顺序（零视觉变化） |
+| `853a4c580` | PR2a：ink 深色色阶 + CJK 字体栈 + 语义层按 scheme 拆分 |
+| （本次） | PR2b：字面量迁移；PR3：守卫脚本 + CI + 对比度校验 |
+
+### 10.1 本轮实际改动
+
+- **字面量迁移**：diff hunk 配色从两处重复（`DiffContent.tsx`、`GitSplitDiff.module.css`）收敛为
+  `--nf-diff-hunk-*`；outline 里 4 处「白字压在调用方传入的颜色上」改为 `--nf-on-solid`；
+  终端分栏手柄色改用 `--mantine-primary-color-filled`；`index.html` / `vite.config.ts` /
+  `useAuthenticatedAppearance.ts` 的 theme-color 与新画布色对齐（`#0b0e14` / `#f6f7f9`）。
+- **守卫脚本** `scripts/check-style-tokens.ts`：
+  - 先剥注释再扫描，避免把 `React #185` 这类引用当成颜色；
+  - `var(--x, #fallback)` 放行（这类兜底只有在变量缺失时才会用到）；
+  - 白名单按文件/目录给出理由；
+  - **对比度门槛**一并校验（13 组，正文/元信息 ≥4.5、可交互边界 ≥3、主按钮白字 ≥4.5）；
+  - `fontSize` 数字先只告警（存量 48 处），`FONT_SIZE_IS_AN_ERROR` 一个开关即可转成硬失败。
+- **CI**：`biome check` 之后新增 `bun run check:tokens`。
+- **`.gitignore`**：`scripts/*` 是黑名单 + 白名单结构，新脚本被默认忽略；已补
+  `!scripts/check-style-tokens.ts`，否则 CI 上根本没有这个文件。
+
+### 10.2 验收证据
+
+```
+bun run check:tokens        1513 files scanned, 0 colour violations, 48 font-size warnings
+                            contrast: 13/13 pass
+biome                       0 error / 551 warning（与改动前一致）
+tsgo                        仅 vscode-extension 缺 @types/vscode（既有）
+bun test --isolate frontend/components/plugins/host-tokens.test.ts   12 pass
+bun test --isolate frontend/lib/mantine-theme.test.tsx               1 pass
+```
+
+浏览器实测（headless Chrome，读 `getComputedStyle`）：
+
+| 场景 | `--nf-surface-canvas` | 结论 |
+|---|---|---|
+| 深色默认 | `#0b0e14` | 新 ink 画布 |
+| 浅色 | `#f6f7f9` | 新 paper 画布 |
+| OLED | `#000000` | 跟随 Mantine 覆写 ✓ |
+| 模拟插件主题 | `#123456` | 跟随 `--mantine-*` 覆写 ✓ |
+
+守卫脚本做了故障注入验证：写入一个 `#ff00aa` 的字面量 → 退出码 1 且精确定位到行；
+注释里的 `#185` 与 `var(..., #1a1b1e)` 兜底不误报；清理后退出码 0。
