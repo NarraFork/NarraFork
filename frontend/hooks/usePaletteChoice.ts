@@ -8,12 +8,14 @@
 
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import {
+	accentRampOverride,
 	applyPalette,
 	PALETTE_PREF_KEY,
 	subscribePalette,
 	writeStoredPalette,
 } from "../lib/palette-apply";
 import { DEFAULT_PALETTE, parsePaletteChoice, resolvePalette } from "../lib/palette-presets";
+import { readActivePluginThemeKey, subscribePluginThemePref } from "../lib/plugin-theme-pref-store";
 
 let cachedRaw: string | null = null;
 let cachedChoice = { ...DEFAULT_PALETTE };
@@ -39,6 +41,11 @@ function safeParse(raw: string): unknown {
 /** The resolved palette, for callers that need the accent ramp. */
 export function usePaletteChoice() {
 	const choice = useSyncExternalStore(subscribePalette, readSnapshot, () => DEFAULT_PALETTE);
+	const pluginThemeKey = useSyncExternalStore(
+		subscribePluginThemePref,
+		readActivePluginThemeKey,
+		() => null,
+	);
 
 	const setChoice = useCallback((next: Parameters<typeof writeStoredPalette>[0]) => {
 		writeStoredPalette(next);
@@ -46,10 +53,14 @@ export function usePaletteChoice() {
 
 	useEffect(() => {
 		if (typeof document === "undefined") return;
-		applyPalette(document.documentElement, choice);
-	}, [choice]);
+		applyPalette(document.documentElement, choice, pluginThemeKey);
+	}, [choice, pluginThemeKey]);
 
 	const resolved = useMemo(() => resolvePalette(choice), [choice]);
+	const accentOverride = useMemo(
+		() => accentRampOverride(choice, pluginThemeKey),
+		[choice, pluginThemeKey],
+	);
 
-	return { choice, setChoice, resolved };
+	return { choice, setChoice, resolved, accentOverride };
 }

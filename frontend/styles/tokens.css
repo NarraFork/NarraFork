@@ -160,19 +160,12 @@
 
 :root[data-mantine-color-scheme="light"] {
 	/*
-	 * Light-scheme slots that Mantine cannot reach through the palette: `body` is
-	 * hardcoded to `#fff` and the rest come from the `gray` ramp, whose steps miss AA
-	 * (`dimmed` = gray-6 is 3.87:1). These selectors have the same specificity Mantine
-	 * uses (0,2,0), so they stay below OLED and plugin themes (both 0,3,0), which must
-	 * keep winning.
+	 * Color-scheme only. Do not retint `--mantine-color-body` / `dimmed` here: with no
+	 * saved palette the light scheme must stay on Mantine's own values (`body` #fff,
+	 * `dimmed` gray-6). A chosen preset writes those variables from `palette-apply.ts`,
+	 * on a selector that loses to OLED.
 	 */
 	color-scheme: light;
-	--mantine-color-body: var(--nf-paper-50);
-	--mantine-color-default: var(--nf-paper-0);
-	--mantine-color-default-hover: var(--nf-paper-100);
-	--mantine-color-dimmed: var(--nf-paper-600);
-	--mantine-color-placeholder: var(--nf-paper-600);
-	--mantine-color-text: var(--nf-paper-900);
 }
 
 /*

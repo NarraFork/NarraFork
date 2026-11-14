@@ -109,7 +109,7 @@ export function useAuthenticatedAppearance(prefs: ReturnType<typeof useUserPrefe
 
 	// Sync theme-color meta tag with actual background color
 	useEffect(() => {
-		const color = computedScheme === "dark" ? (oledMode ? "#000000" : "#0b0e14") : "#f6f7f9";
+		const color = computedScheme === "dark" ? (oledMode ? "#000000" : "#1a1b1e") : "#ffffff";
 		for (const el of document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')) {
 			el.setAttribute("content", color);
 		}

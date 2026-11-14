@@ -3072,6 +3072,7 @@
 	"paletteReset": "Reset to default",
 	"palettePluginThemeNotice": "A plugin theme is active, so theme colour is paused. Disable the plugin theme to use it.",
 	"palettePresetDefault": "Default",
+	"palettePresetSlate": "Slate",
 	"palettePresetGraphite": "Graphite",
 	"palettePresetMidnight": "Midnight",
 	"palettePresetTokyo": "Tokyo",

@@ -23,6 +23,7 @@ import { useTranslation } from "react-i18next";
 
 const NEUTRAL_LABEL: Record<NeutralPresetId, string> = {
 	default: "palettePresetDefault",
+	slate: "palettePresetSlate",
 	graphite: "palettePresetGraphite",
 	midnight: "palettePresetMidnight",
 	tokyo: "palettePresetTokyo",

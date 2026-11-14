@@ -25,20 +25,23 @@ export function CoreProviders({
 	 * the old hue (a blue "green" button on hover). Rebuilding the theme is allowed to
 	 * re-render; picking a colour is a rare, deliberate action.
 	 *
-	 * The neutral surfaces are NOT part of this: they ride on CSS variables written by
-	 * `usePaletteChoice`, which costs no re-render at all.
+	 * `accentOverride` is null for the stock indigo ramp and while a plugin theme is on,
+	 * so neither case replaces Mantine's own primary. Neutrals are a stylesheet written
+	 * by `usePaletteChoice`, not inline styles, so OLED keeps `dark-*`.
 	 */
-	const { resolved } = usePaletteChoice();
+	const { accentOverride } = usePaletteChoice();
 	// Applying the wallpaper is an effect, not a value: subscribing here (rather than only
 	// in the settings card) is what keeps it live on every route.
 	useAppBackground();
 	const theme = useMemo(
 		() =>
-			createTheme({
-				...mantineTheme,
-				colors: { ...mantineTheme.colors, indigo: resolved.accent },
-			}),
-		[resolved.accent],
+			accentOverride
+				? createTheme({
+						...mantineTheme,
+						colors: { ...mantineTheme.colors, indigo: accentOverride },
+					})
+				: mantineTheme,
+		[accentOverride],
 	);
 
 	return (

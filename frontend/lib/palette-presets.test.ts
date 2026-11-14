@@ -14,12 +14,22 @@ import {
 const HEX = /^#[0-9a-f]{6}$/;
 
 describe("palette presets", () => {
-	test("default is the literal token palette", () => {
+	test("default is the stock Mantine ramp, not slate", () => {
 		const { ink, paper, accent } = resolvePalette(DEFAULT_PALETTE);
+		expect(ink["ink-950"]).toBe("#242424");
+		expect(ink["ink-900"]).toBe("#2e2e2e");
+		expect(paper["paper-0"]).toBe("#ffffff");
+		expect(paper["paper-600"]).toBe("#868e96");
+		expect(accent[6]).toBe("#4c6ef5");
+		expect(ink["ink-950"]).not.toBe("#111113");
+	});
+
+	test("slate is the radix ladder and is not the default", () => {
+		const { ink, paper } = resolvePalette({ ...DEFAULT_PALETTE, neutral: "slate" });
 		expect(ink["ink-950"]).toBe("#111113");
 		expect(ink["ink-900"]).toBe("#212225");
+		expect(ink["ink-980"]).toBe("#0d0d0f");
 		expect(paper["paper-50"]).toBe("#f0f0f3");
-		expect(accent[6]).toBe("#4c6ef5");
 	});
 
 	test("every preset keeps the surface hierarchy and the contrast floors", () => {
@@ -30,6 +40,13 @@ describe("palette presets", () => {
 			});
 			for (const value of [...Object.values(ink), ...Object.values(paper)]) {
 				expect(value).toMatch(HEX);
+			}
+			if (preset.id === "default") {
+				// Stock gray-6 on white is the current light dimmed colour and is below AA.
+				// Default must keep that ramp rather than quietly lifting it.
+				expect(ink["ink-950"]).toBe("#242424");
+				expect(paper["paper-600"]).toBe("#868e96");
+				continue;
 			}
 			// Dark: darker step first; the ladder must stay ordered.
 			const order = ["ink-950", "ink-900", "ink-850", "ink-800", "ink-700", "ink-600"];

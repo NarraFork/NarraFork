@@ -6,6 +6,7 @@ import {
 	MIN_OPACITY,
 	parseBackgroundChoice,
 	switchBackgroundSource,
+	wallpaperSourceKey,
 } from "./app-background";
 
 function stubRoot() {
@@ -65,6 +66,41 @@ describe("background image", () => {
 			url: "https://x.test/a.png",
 			opacity: MIN_OPACITY,
 		});
+	});
+
+	test("a stored file source keeps the network URL and switching back restores it", () => {
+		const parsed = parseBackgroundChoice({
+			enabled: true,
+			source: "file",
+			fileName: "wall.png",
+			url: "https://x.test/a.png",
+			opacity: 70,
+			scrim: 10,
+			blur: 4,
+		});
+		expect(parsed.url).toBe("https://x.test/a.png");
+		expect(parsed.source).toBe("file");
+		expect(parsed.enabled).toBe(true);
+		expect(parsed.blur).toBe(4);
+		const back = switchBackgroundSource(parsed, "url");
+		expect(back.source).toBe("url");
+		expect(back.url).toBe("https://x.test/a.png");
+		expect(back.enabled).toBe(true);
+	});
+
+	test("blur is not part of the wallpaper load key", () => {
+		const base = {
+			...DEFAULT_BACKGROUND,
+			enabled: true,
+			source: "url" as const,
+			url: "https://x.test/a.png",
+			blur: 0,
+		};
+		expect(wallpaperSourceKey(base)).toBe(wallpaperSourceKey({ ...base, blur: 24 }));
+		expect(wallpaperSourceKey(base)).toBe(wallpaperSourceKey({ ...base, opacity: 90, scrim: 5 }));
+		expect(wallpaperSourceKey(base)).not.toBe(
+			wallpaperSourceKey({ ...base, url: "https://x.test/b.png" }),
+		);
 	});
 
 	test("switching source keeps the other source's configuration", () => {

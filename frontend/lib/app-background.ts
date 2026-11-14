@@ -101,13 +101,17 @@ export function parseBackgroundChoice(raw: unknown): BackgroundChoice {
 	const value = raw as Partial<Record<keyof BackgroundChoice, unknown>>;
 	const source: BackgroundSource = value.source === "file" ? "file" : "url";
 	const url = typeof value.url === "string" ? value.url.trim().slice(0, MAX_URL_LENGTH) : "";
-	const usable = source === "file" ? true : Boolean(url) && checkBackgroundUrl(url).ok;
+	const urlOk = Boolean(url) && checkBackgroundUrl(url).ok;
+	// A file source has no URL of its own, but the previously saved network address must
+	// survive the round trip. Dropping it here is what made "switch back to URL" come up empty
+	// after a refresh or a slider edit.
+	const usable = source === "file" ? true : urlOk;
 	return {
 		// An unusable URL cannot be "enabled": otherwise a bad paste silently blanks the UI.
 		enabled: usable ? Boolean(value.enabled) : false,
 		source,
 		...(typeof value.fileName === "string" ? { fileName: value.fileName.slice(0, 120) } : {}),
-		url: source === "file" ? "" : usable ? url : "",
+		url: urlOk ? url : "",
 		opacity: clamp(value.opacity, MIN_OPACITY, 100, DEFAULT_BACKGROUND.opacity),
 		scrim: clamp(value.scrim, 0, 90, DEFAULT_BACKGROUND.scrim),
 		blur: clamp(value.blur, 0, 24, DEFAULT_BACKGROUND.blur),
@@ -232,15 +236,24 @@ export function applyBackground(root: HTMLElement, choice: BackgroundChoice): vo
 let appliedKey: string | null = null;
 let inFlight: Promise<WallpaperResult> | null = null;
 
-function wallpaperKey(choice: BackgroundChoice): string {
+/**
+ * Identity of the image request. Blur, opacity and scrim are CSS and must not be here:
+ * putting blur in the key re-fetched the image on every slider tick and raced the
+ * previous load/error listeners on the shared `<img>`.
+ */
+export function wallpaperSourceKey(choice: BackgroundChoice): string {
 	return JSON.stringify({
 		enabled: choice.enabled,
 		source: choice.source,
 		url: choice.url,
-		fileName: choice.fileName,
-		blur: choice.blur,
+		fileName: choice.fileName ?? "",
 		reloadKey: choice.reloadKey ?? 0,
 	});
+}
+
+/** True when `choice` would not start a new image load. */
+export function wallpaperSourceUnchanged(choice: BackgroundChoice): boolean {
+	return choice.enabled && wallpaperSourceKey(choice) === appliedKey;
 }
 
 export async function syncWallpaperLayer(choice: BackgroundChoice): Promise<WallpaperResult> {
@@ -250,7 +263,7 @@ export async function syncWallpaperLayer(choice: BackgroundChoice): Promise<Wall
 		hideWallpaper();
 		return "ok";
 	}
-	const key = wallpaperKey(choice);
+	const key = wallpaperSourceKey(choice);
 	// Already applied (or applying) this exact configuration: share the result instead of
 	// creating a second object URL / issuing a second request.
 	if (key === appliedKey) return inFlight ?? "ok";
@@ -278,10 +291,7 @@ async function applyWallpaperSource(choice: BackgroundChoice): Promise<Wallpaper
 		case "file": {
 			const blob = await loadWallpaperBlob();
 			if (!blob) return "error";
-			return showWallpaper(
-				{ src: URL.createObjectURL(blob), blur: choice.blur },
-				{ objectUrl: true },
-			);
+			return showWallpaper({ src: URL.createObjectURL(blob) }, { objectUrl: true });
 		}
 		default: {
 			if (!checkBackgroundUrl(choice.url).ok) return "error";
@@ -289,7 +299,7 @@ async function applyWallpaperSource(choice: BackgroundChoice): Promise<Wallpaper
 			if (choice.reloadKey) {
 				src += `${src.includes("?") ? "&" : "?"}nf_reload=${choice.reloadKey}`;
 			}
-			return showWallpaper({ src, blur: choice.blur });
+			return showWallpaper({ src });
 		}
 	}
 }

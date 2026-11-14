@@ -364,8 +364,8 @@ function webManifestAsset(appName: string, shortName: string): Plugin {
 		// Deliberately the dark UI background, not the brand accent: browsers paint
 		// these across the PWA status bar and splash screen, so an accent colour would
 		// introduce the app with a screen that does not match it.
-		theme_color: "#0b0e14",
-		background_color: "#0b0e14",
+		theme_color: "#1a1b1e",
+		background_color: "#1a1b1e",
 		display: "standalone",
 		// Prefer WCO for installed desktop PWAs: the OS window controls become a
 		// floating overlay and the page paints the whole title-bar strip, so our

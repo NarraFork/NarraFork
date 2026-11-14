@@ -56,40 +56,6 @@ export const mantineTheme = createTheme({
 			"#425572",
 			"#314056",
 		],
-		/*
-		 * The dark-scheme neutral ramp, blue-cast rather than pure grey.
-		 *
-		 * Every dark-mode default in Mantine reads a slot out of this array, so this is
-		 * the single lever that retunes the whole scheme — `Card`, `Paper`, `Input`,
-		 * `Table`, `Divider`, `Text c="dimmed"` and the rest follow without touching a
-		 * component:
-		 *
-		 *   0 text · 2 dimmed · 3 placeholder · 4 borders · 5 hover
-		 *   6 default surface · 7 body · 8/9 filled variants
-		 *
-		 * The reason for a blue cast: the content is code, diffs, terminals and logs,
-		 * which already live in a terminal palette. A flat grey shell next to it reads
-		 * as a different material. Saturation is kept around 4–6% so it never competes
-		 * with the indigo primary.
-		 *
-		 * Slot 4 is deliberately 3.46:1 against slot 6 — Mantine reuses one variable for
-		 * both decorative card borders and input boundaries, so the accessible choice
-		 * (WCAG 1.4.11 wants ≥3:1 for control boundaries) is also the one that outlines
-		 * cards a little more than before. If that turns out too heavy in practice, the
-		 * knob is this one entry.
-		 */
-		dark: [
-			"#edeef0",
-			"#c3c6cc",
-			"#b0b4ba",
-			"#9aa0a8",
-			"#6e7681",
-			"#2e3135",
-			"#212225",
-			"#111113",
-			"#0d0d0f",
-			"#09090b",
-		],
 	},
 	components: {
 		NavLink: {

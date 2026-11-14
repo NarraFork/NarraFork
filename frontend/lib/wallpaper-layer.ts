@@ -22,7 +22,6 @@ const LAYER_ID = "nf-wallpaper";
 
 export interface WallpaperLayerParams {
 	src: string;
-	blur: number;
 }
 
 function ensureLayer(): { wrapper: HTMLDivElement; img: HTMLImageElement } {
@@ -60,7 +59,8 @@ export async function showWallpaper(
 ): Promise<WallpaperResult> {
 	if (typeof document === "undefined") return "unsupported";
 	const { wrapper, img } = ensureLayer();
-	wrapper.style.setProperty("--nf-bg-blur", `${Math.max(0, params.blur)}px`);
+	// Blur is `--nf-bg-blur` on `<html>`, inherited by the image. Setting it on the
+	// wrapper would pin a stale value and force a reload to change it.
 
 	const loaded = await new Promise<boolean>((resolve) => {
 		const onLoad = () => resolve(true);

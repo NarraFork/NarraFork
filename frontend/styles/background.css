@@ -22,13 +22,13 @@
  */
 
 :root {
-	--nf-canvas-base: var(--nf-paper-50);
-	--nf-pane-base: var(--nf-paper-0);
-}
-
-:root[data-mantine-color-scheme="dark"] {
-	--nf-canvas-base: var(--nf-ink-950);
-	--nf-pane-base: var(--nf-ink-900);
+	/*
+	 * Follow the live Mantine surfaces. Pointing these at the slate `--nf-ink-*` /
+	 * `--nf-paper-*` literals would recolor the shell even when the user has not picked
+	 * a palette. A chosen preset rewrites the Mantine variables, so the shell follows.
+	 */
+	--nf-canvas-base: var(--mantine-color-body);
+	--nf-pane-base: var(--mantine-color-default);
 }
 
 :root[data-mantine-color-scheme][data-nf-bg="on"] {

@@ -14,6 +14,7 @@ import {
 	readStoredBackground,
 	subscribeBackground,
 	syncWallpaperLayer,
+	wallpaperSourceUnchanged,
 	writeStoredBackground,
 } from "../lib/app-background";
 
@@ -63,7 +64,10 @@ export function useAppBackground() {
 			void syncWallpaperLayer(choice);
 			return;
 		}
-		setStatus("loading");
+		// Opacity, scrim and blur only change CSS variables. Starting a load (or flipping
+		// the badge to "loading") would re-request the image and race the previous listeners.
+		const reused = wallpaperSourceUnchanged(choice);
+		if (!reused) setStatus("loading");
 		/*
 		 * Never let a wallpaper failure escape into React: this effect runs in the provider
 		 * that wraps every route, so an unhandled throw here blanks the whole app. A broken

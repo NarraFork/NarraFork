@@ -16,11 +16,12 @@
  * varying only H/C keeps every hierarchy relationship intact, and the contrast pass below
  * then nudges the few steps whose Y drifted out of tolerance.
  *
- * ## The default preset is literal, not generated
+ * ## The default preset is the stock Mantine ramp
  *
- * `default` returns the exact token values from `styles/tokens.css`. Regenerating them
- * would round-trip through OKLCH and land a shade off, which would make "reset to
- * default" visibly different from a fresh install.
+ * `default` is not injected. With nothing saved, the app keeps Mantine 9's own dark
+ * scale and light body/dimmed. `slate` is the Radix ladder from `styles/tokens.css`,
+ * and it is applied only after the user picks it. Regenerating that ladder through
+ * OKLCH would land a shade off the tokens.
  */
 
 /** Contrast helpers. `#rrggbb` only; the palette never produces shorthand. */
@@ -153,8 +154,8 @@ const ACCENT_STEPS: ReadonlyArray<{ L: number; C: number }> = [
 	{ L: 0.484, C: 0.188 },
 ];
 
-/** Literal palette, so `default` is byte-identical to `tokens.css`. */
-const DEFAULT_INK: Record<string, string> = {
+/** Radix slate ladder. Byte-identical to `styles/tokens.css`. Applied only as the `slate` preset. */
+const SLATE_INK: Record<string, string> = {
 	"ink-980": "#0d0d0f",
 	"ink-990": "#09090b",
 	"ink-950": "#111113",
@@ -168,7 +169,7 @@ const DEFAULT_INK: Record<string, string> = {
 	"ink-100": "#edeef0",
 };
 
-const DEFAULT_PAPER: Record<string, string> = {
+const SLATE_PAPER: Record<string, string> = {
 	"paper-50": "#f0f0f3",
 	"paper-0": "#fcfcfd",
 	"paper-100": "#e8e8ec",
@@ -285,6 +286,7 @@ function buildAccent(hue: number, chromaScale: number): AccentRamp {
 
 export type NeutralPresetId =
 	| "default"
+	| "slate"
 	| "graphite"
 	| "midnight"
 	| "tokyo"
@@ -311,8 +313,51 @@ export interface NeutralPreset {
 	literal?: { ink: Record<string, string>; paper: Record<string, string> };
 }
 
+/**
+ * Mantine 9's built-in dark scale and light surfaces. Preview only: `applyPalette`
+ * does not write these, so OLED and a fresh install stay on the stylesheet.
+ */
+const STOCK_INK: Record<string, string> = {
+	"ink-990": "#141414",
+	"ink-980": "#1f1f1f",
+	"ink-950": "#242424",
+	"ink-900": "#2e2e2e",
+	"ink-850": "#3b3b3b",
+	"ink-800": "#424242",
+	"ink-700": "#696969",
+	"ink-600": "#828282",
+	"ink-300": "#b8b8b8",
+	"ink-200": "#c9c9c9",
+	"ink-100": "#c9c9c9",
+};
+
+const STOCK_PAPER: Record<string, string> = {
+	"paper-50": "#ffffff",
+	"paper-0": "#ffffff",
+	"paper-100": "#f8f9fa",
+	"paper-200": "#f1f3f5",
+	"paper-300": "#e9ecef",
+	"paper-500": "#adb5bd",
+	"paper-600": "#868e96",
+	"paper-700": "#495057",
+	"paper-900": "#000000",
+};
+
 export const NEUTRAL_PRESETS: ReadonlyArray<NeutralPreset> = [
-	{ id: "default", hue: 264, chroma: 1 },
+	{
+		id: "default",
+		hue: 0,
+		chroma: 0,
+		/** Stock Mantine 9. Not injected; reset means "remove the override". */
+		literal: { ink: STOCK_INK, paper: STOCK_PAPER },
+	},
+	{
+		id: "slate",
+		hue: 264,
+		chroma: 1,
+		/** Radix slate, the ladder declared in `styles/tokens.css`. */
+		literal: { ink: SLATE_INK, paper: SLATE_PAPER },
+	},
 	{ id: "graphite", hue: 250, chroma: 0 },
 	{ id: "midnight", hue: 265, chroma: 1.25 },
 	{ id: "tokyo", hue: 278, chroma: 1.6 },
@@ -323,7 +368,7 @@ export const NEUTRAL_PRESETS: ReadonlyArray<NeutralPreset> = [
 		id: "classic",
 		hue: 264,
 		chroma: 1,
-		/** The blue-black default before the Radix-based palette landed. Kept so the previous look stays one click away. */
+		/** Blue-black draft from the token work. Not the stock Mantine gray a fresh install paints. */
 		literal: {
 			ink: {
 				"ink-950": "#0b0e14",
@@ -486,10 +531,7 @@ export function resolvePalette(choice: PaletteChoice): ResolvedPalette {
 	let ink: Record<string, string>;
 	let paper: Record<string, string>;
 
-	if (choice.neutral === "default") {
-		ink = { ...DEFAULT_INK };
-		paper = { ...DEFAULT_PAPER };
-	} else if (choice.neutral === "custom" && isHex(choice.neutralCustom)) {
+	if (choice.neutral === "custom" && isHex(choice.neutralCustom)) {
 		const picked = hexToOklch(choice.neutralCustom);
 		// A grey pick has no meaningful hue (H is numerical noise), so it must stay neutral
 		// instead of picking up a tint from the chroma floor.
@@ -512,10 +554,11 @@ export function resolvePalette(choice: PaletteChoice): ResolvedPalette {
 
 	// Two rungs below the canvas, used only by Mantine's filled variants (`dark.8/9`).
 	// Derived from the canvas so a custom hue does not leave those slots on the old blue.
-	if (choice.neutral !== "default") {
+	// Literals that already name them (stock, slate) are kept verbatim.
+	if (!ink["ink-980"] || !ink["ink-990"]) {
 		const deepest = hexToOklch(ink["ink-950"]);
-		ink["ink-980"] = oklchToHex(deepest.L * 0.877, deepest.C, deepest.H);
-		ink["ink-990"] = oklchToHex(deepest.L * 0.742, deepest.C, deepest.H);
+		if (!ink["ink-980"]) ink["ink-980"] = oklchToHex(deepest.L * 0.877, deepest.C, deepest.H);
+		if (!ink["ink-990"]) ink["ink-990"] = oklchToHex(deepest.L * 0.742, deepest.C, deepest.H);
 	}
 
 	let accent: AccentRamp;
