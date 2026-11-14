@@ -17,6 +17,34 @@ import {
 	initDeviceConnectionService,
 } from "../services/device-connection-service";
 import { hashDeviceToken } from "../services/device-service";
+import type { EditorDocumentService } from "../services/editor-document-service";
+
+/** Fixture-owned server resources are separate from the browser realm's released leases. */
+export async function drainNativeEditorService(
+	service: EditorDocumentService,
+	deadlineAt = Date.now() + 5000,
+) {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			service.dispose(),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() => {
+						reject(
+							new Error(
+								`Native editor service cleanup did not settle: ${JSON.stringify(service.diagnostics)}`,
+							),
+						);
+					},
+					Math.max(0, deadlineAt - Date.now()),
+				);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 /** Test-only Host guard; independent --server peers, Git, workers and Chrome remain legal. */
 export function denyHostEditorHelpers() {
