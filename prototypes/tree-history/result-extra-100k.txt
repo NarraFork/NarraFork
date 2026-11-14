@@ -1,0 +1,10 @@
+first 800 blocks of s2000, current, breadth first                p50    2.96  p95    4.82  max    4.82 ms  800
+first 800 blocks of s2000, as of T, with content                 p50    5.89  p95    8.04  max    8.12 ms  800
+first 800 blocks of s10000, current, breadth first               p50    5.28  p95    7.90  max    8.03 ms  800
+first 800 blocks of s10000, as of T, with content                p50    5.02  p95    6.49  max    6.63 ms  800
+first 800 blocks of s20000, current, breadth first               p50    8.42  p95   12.39  max   12.99 ms  800
+first 800 blocks of s20000, as of T, with content                p50    5.79  p95    7.88  max   10.25 ms  800
+one-block content commit, today's rows                           p50   0.106  p95   0.291 ms  (0.0 touch rows per commit)
+one-block content commit, + touch rows for the ancestors         p50   0.149  p95   0.350 ms  (2.7 touch rows per commit)
+one-block content commit, today's rows (again)                   p50   0.105  p95   0.269 ms  (0.0 touch rows per commit)
+one-block content commit, + touch rows (again)                   p50   0.153  p95   0.390 ms  (2.6 touch rows per commit)

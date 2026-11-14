@@ -1,0 +1,88 @@
+=== space-1m.db: 1000000 blocks, 4150640 commits, 10040672 versions, 1459931 edges, 27848386 touch rows ===
+-- 50-block window (page block + its first 50 children, with content) of a typical page, 528 blocks
+P  page structure as of T + 51 contents                    p50    2.52  p95    6.27  max    15.9 ms  n=60  534 rows read
+A  children by (parent_id, from_seq, to_seq)               p50    0.37  p95    0.60  max    1.16 ms  n=200  50 rows
+A' edges + one version seek per block                      p50    0.29  p95    0.56  max    1.16 ms  n=200  50 rows
+-- 50-block window (page block + its first 50 children, with content) of the 2,000-block page, 2129 blocks
+P  page structure as of T + 51 contents                    p50    24.8  p95    46.2  max    92.0 ms  n=60  2135 rows read
+A  children by (parent_id, from_seq, to_seq)               p50    1.74  p95    3.02  max    4.26 ms  n=200  50 rows
+A' edges + one version seek per block                      p50    0.36  p95    0.46  max    1.06 ms  n=200  50 rows
+-- 50-block window (page block + its first 50 children, with content) of the 10,000-block page, 10142 blocks
+P  page structure as of T + 51 contents                    p50    93.4  p95   157.5  max   200.3 ms  n=60  10001 rows read
+A  children by (parent_id, from_seq, to_seq)               p50    7.26  p95    8.96  max    12.3 ms  n=200  50 rows
+A' edges + one version seek per block                      p50    0.61  p95    0.69  max    1.35 ms  n=200  50 rows
+-- hot parent: 50 children typed in again and again; the 60-block page holds 50872 versions
+P  page structure as of T                                  p50    3.34  p95    3.94  max    4.40 ms  n=60  59 rows
+A  children by (parent_id, from_seq, to_seq)               p50    3.24  p95    3.92  max    4.26 ms  n=60  50 rows
+A' edges + one version seek per block                      p50    0.23  p95    0.34  max    0.84 ms  n=200  50 rows
+-- subtree of 2000 blocks (structure, tree built in JS)
+P  current rows by page_id                                 p50    2.93  p95    3.61  max    3.70 ms  n=40  2129 rows
+-  current rows, recursive over the children index         p50    8.46  p95    9.27  max    9.38 ms  n=40  2053 rows
+P  as of T by (page_id, from_seq, to_seq)                  p50    22.5  p95    30.1  max    30.5 ms  n=40  2137 rows
+A  as of T, recursive by (parent_id, from_seq, to_seq)     p50    24.6  p95    29.7  max    31.7 ms  n=40  2061 rows
+A' as of T, recursive over edges (ids, parents, order)     p50    5.60  p95    6.67  max    7.46 ms  n=40  2069 rows
+A' as of T, edges + version seek per block (as today's row) p50    25.5  p95    30.5  max    30.6 ms  n=40  2063 rows
+=  content of 800 blocks by exact version (all schemes)    p50    2.88  p95    3.77  max    3.77 ms  n=20  81609 chars
+-- subtree of 10000 blocks (structure, tree built in JS)
+P  current rows by page_id                                 p50    12.8  p95    18.4  max    18.4 ms  n=20  10142 rows
+-  current rows, recursive over the children index         p50    72.4  p95    83.0  max    83.0 ms  n=20  10019 rows
+P  as of T by (page_id, from_seq, to_seq)                  p50    96.0  p95   203.4  max   203.4 ms  n=20  10199 rows
+A  as of T, recursive by (parent_id, from_seq, to_seq)     p50   117.4  p95   141.7  max   141.7 ms  n=20  10107 rows
+A' as of T, recursive over edges (ids, parents, order)     p50    49.7  p95    59.8  max    59.8 ms  n=20  10056 rows
+A' as of T, edges + version seek per block (as today's row) p50   132.4  p95   153.6  max   153.6 ms  n=20  10092 rows
+=  content of 800 blocks by exact version (all schemes)    p50    2.68  p95    3.66  max    3.66 ms  n=20  79395 chars
+-- subtree of 20000 blocks (structure, tree built in JS)
+P  current rows by page_id                                 p50    31.1  p95    34.9  max    34.9 ms  n=20  19595 rows
+-  current rows, recursive over the children index         p50   127.4  p95   148.6  max   148.6 ms  n=20  19292 rows
+P  as of T by (page_id, from_seq, to_seq)                  p50   183.9  p95   338.7  max   338.7 ms  n=20  19602 rows
+A  as of T, recursive by (parent_id, from_seq, to_seq)     p50   215.8  p95   268.0  max   268.0 ms  n=20  19335 rows
+A' as of T, recursive over edges (ids, parents, order)     p50    81.1  p95    83.7  max    83.7 ms  n=20  19444 rows
+A' as of T, edges + version seek per block (as today's row) p50   252.8  p95   292.5  max   292.5 ms  n=20  19442 rows
+=  content of 800 blocks by exact version (all schemes)    p50    2.62  p95    4.17  max    4.17 ms  n=20  80437 chars
+-- subtree of 100000 blocks (structure, tree built in JS)
+P  current rows by page_id                                 p50   129.3  p95   156.5  max   156.5 ms  n=20  91988 rows
+-  current rows, recursive over the children index         p50   603.8  p95   896.5  max   896.5 ms  n=20  90120 rows
+P  as of T by (page_id, from_seq, to_seq)                  p50   784.4  p95  1169.0  max  1169.0 ms  n=20  92688 rows
+A  as of T, recursive by (parent_id, from_seq, to_seq)     p50   934.6  p95  1007.1  max  1007.1 ms  n=20  90435 rows
+A' as of T, recursive over edges (ids, parents, order)     p50   375.3  p95   430.7  max   430.7 ms  n=20  90711 rows
+A' as of T, edges + version seek per block (as today's row) p50  1107.8  p95  1176.1  max  1176.1 ms  n=20  90607 rows
+=  content of 800 blocks by exact version (all schemes)    p50    2.56  p95    2.69  max    2.69 ms  n=20  83979 chars
+-- diff of the 2000-block subtree between T and T-1000
+P  two page reads, compared by id                          p50    43.4  p95    45.6  max    46.6 ms  n=40  4 changed
+A' two reads (edges + version seek), compared by id        p50    52.9  p95    62.2  max    62.7 ms  n=40  6 changed
+B  descent over edges, skipping untouched subtrees         p50    1.69  p95    2.47  max    2.50 ms  n=40  0 changed, 1 seek
+D  versions of the 1000 commits, each placed by walking up p50    52.6  p95    64.3  max    68.2 ms  n=40  1 changed of 2408 versions in range
+-- diff of the 10000-block subtree between T and T-1000
+P  two page reads, compared by id                          p50   191.2  p95   222.5  max   222.5 ms  n=15  22 changed
+A' two reads (edges + version seek), compared by id        p50   259.1  p95   293.4  max   293.4 ms  n=15  40 changed
+B  descent over edges, skipping untouched subtrees         p50    15.1  p95    18.4  max    18.4 ms  n=15  21 changed, 2384 edges looked at
+D  versions of the 1000 commits, each placed by walking up p50    47.1  p95    59.6  max    59.6 ms  n=15  7 changed of 2586 versions in range
+-- diff of the 100000-block subtree between T and T-1000
+P  two page reads, compared by id                          p50  1539.6  p95  1610.2  max  1610.2 ms  n=15  350 changed
+A' two reads (edges + version seek), compared by id        p50  2306.6  p95  2455.5  max  2455.5 ms  n=15  203 changed
+B  descent over edges, skipping untouched subtrees         p50   157.9  p95   185.3  max   185.3 ms  n=15  138 changed, 26968 edges looked at
+D  versions of the 1000 commits, each placed by walking up p50    49.6  p95    61.5  max    61.5 ms  n=15  147 changed of 2730 versions in range
+-- timeline (newest 50 commits that touched a subtree), block history, one commit's delta
+P  timeline of typical by (page_id, from_seq)              p50    0.01  p95    0.03  max    0.04 ms  n=100  51
+B  timeline of typical by touch(ancestor, seq) + own versions p50    0.01  p95    0.02  max    0.07 ms  n=100  66
+P  timeline of s2000 by (page_id, from_seq)                p50    0.01  p95    0.02  max    0.04 ms  n=100  51
+B  timeline of s2000 by touch(ancestor, seq) + own versions p50    0.02  p95    0.03  max    0.23 ms  n=100  102
+P  timeline of s10000 by (page_id, from_seq)               p50    0.02  p95    0.02  max    1.00 ms  n=100  51
+B  timeline of s10000 by touch(ancestor, seq) + own versions p50    0.02  p95    0.02  max    0.26 ms  n=100  64
+P  timeline of s100000 by (page_id, from_seq)              p50    0.02  p95    0.03  max    0.49 ms  n=100  51
+B  timeline of s100000 by touch(ancestor, seq) + own versions p50    0.02  p95    0.05  max    0.32 ms  n=100  65
+=  history of one block (50 versions, all schemes)         p50    0.16  p95    0.78  max    1.72 ms  n=300  4
+=  the versions one commit wrote (a timeline step)         p50    0.02  p95    0.17  max    0.26 ms  n=300  2
+-- aggregates under a subtree: tasks in progress, now
+-  walk the 2000-block subtree and count                   p50    4.71  p95    5.63  max    5.63 ms  n=20  193
+-  walk the 10000-block subtree and count                  p50    42.0  p95    49.7  max    49.7 ms  n=20  899
+-  walk the 100000-block subtree and count                 p50   427.6  p95   444.2  max   444.2 ms  n=5  6973
+-- move a subtree under a block of another page (committed, WAL, synchronous NORMAL)
+A' move   2000 blocks: 0.65 ms (max 9.87); 6 rows written
+A' move  20000 blocks: 0.27 ms (max 0.50); 6 rows written
+A' move 100000 blocks: 0.31 ms (max 0.54); 6 rows written
+A' move  10000 blocks: 0.22 ms (max 0.38); 6 rows written
+P  move   2000 blocks: collect 11.0 ms + write 2045.6 ms; 2053 version rows, 2053 rows closed, 2053 block rows
+P  move  20000 blocks: collect 101.5 ms + write 6546.9 ms; 19292 version rows, 19292 rows closed, 19292 block rows
+P  move 100000 blocks: collect 523.2 ms + write 18720.2 ms; 90120 version rows, 90120 rows closed, 90120 block rows
+P  move  10000 blocks: collect 72.2 ms + write 1801.0 ms; 10019 version rows, 10019 rows closed, 10019 block rows

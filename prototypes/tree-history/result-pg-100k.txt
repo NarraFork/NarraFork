@@ -1,0 +1,59 @@
+-- 50-block window of typical
+P  whole page structure as of T (contents not included)        p50     1.60 p95     2.22 max     2.70 ms  n=40  (457 rows)
+A  children by (parent_id, from_seq, to_seq), with content     p50     0.26 p95     0.35 max     0.52 ms  n=200  (50 rows)
+A' edges + version seek per block, with content                p50     0.28 p95     0.47 max     0.74 ms  n=200  (50 rows)
+-- 50-block window of s2000
+P  whole page structure as of T (contents not included)        p50    13.36 p95    18.79 max    18.86 ms  n=40  (1973 rows)
+A  children by (parent_id, from_seq, to_seq), with content     p50     1.43 p95     1.66 max     2.20 ms  n=200  (50 rows)
+A' edges + version seek per block, with content                p50     0.46 p95     0.85 max     1.04 ms  n=200  (50 rows)
+-- 50-block window of s10000
+P  whole page structure as of T (contents not included)        p50    71.65 p95   104.94 max   114.27 ms  n=40  (9641 rows)
+A  children by (parent_id, from_seq, to_seq), with content     p50     6.30 p95     8.99 max    13.18 ms  n=200  (50 rows)
+A' edges + version seek per block, with content                p50     1.01 p95     1.22 max     1.53 ms  n=200  (50 rows)
+-- hot parent
+P  page structure as of T                                      p50     7.63 p95     8.87 max    10.84 ms  n=40  (63 rows)
+A  children by (parent_id, from_seq, to_seq)                   p50     4.88 p95     6.07 max     8.06 ms  n=40  (50 rows)
+A' edges + version seek per block                              p50     0.56 p95     0.79 max     1.01 ms  n=200  (50 rows)
+-- subtree s2000
+P  current rows by page_id                                     p50     0.94 p95     1.08 max     1.14 ms  n=20  (1948 rows)
+-  current rows, recursive over the children index             p50     8.66 p95     9.89 max    10.17 ms  n=20  (1899 rows)
+P  as of T by (page_id, from_seq, to_seq)                      p50    15.16 p95    16.40 max    16.51 ms  n=20  (1964 rows)
+A  as of T, recursive by (parent_id, from_seq, to_seq)         p50    49.51 p95    58.73 max    72.96 ms  n=20  (1912 rows)
+A' as of T, recursive over edges                               p50     5.51 p95     6.71 max     6.87 ms  n=20  (1912 rows)
+A' as of T, edges + version seek per block                     p50    14.39 p95    21.23 max    21.44 ms  n=20  (1912 rows)
+P  timeline by (page_id, from_seq)                             p50     0.06 p95     0.18 max     0.23 ms  n=100  (51 rows)
+B  timeline by touch(ancestor, seq)                            p50     0.04 p95     0.09 max     0.25 ms  n=100  (51 rows)
+-- subtree s10000
+P  current rows by page_id                                     p50     2.97 p95     3.13 max     3.17 ms  n=20  (9601 rows)
+-  current rows, recursive over the children index             p50    37.04 p95    45.78 max    48.12 ms  n=20  (9438 rows)
+P  as of T by (page_id, from_seq, to_seq)                      p50    75.90 p95    95.56 max   106.89 ms  n=20  (9636 rows)
+A  as of T, recursive by (parent_id, from_seq, to_seq)         p50   173.65 p95   252.53 max   280.18 ms  n=20  (9471 rows)
+A' as of T, recursive over edges                               p50    22.89 p95    23.86 max    23.92 ms  n=20  (9471 rows)
+A' as of T, edges + version seek per block                     p50    61.82 p95    66.33 max    82.86 ms  n=20  (9471 rows)
+P  timeline by (page_id, from_seq)                             p50     0.06 p95     0.10 max     0.19 ms  n=100  (51 rows)
+B  timeline by touch(ancestor, seq)                            p50     0.04 p95     0.06 max     0.10 ms  n=100  (51 rows)
+-- subtree s20000
+P  current rows by page_id                                     p50     4.08 p95     4.23 max     4.56 ms  n=20  (18579 rows)
+-  current rows, recursive over the children index             p50    65.61 p95    99.88 max   103.22 ms  n=20  (18311 rows)
+P  as of T by (page_id, from_seq, to_seq)                      p50    93.76 p95   105.59 max   108.66 ms  n=20  (18715 rows)
+A  as of T, recursive by (parent_id, from_seq, to_seq)         p50   307.14 p95   416.91 max   420.28 ms  n=20  (18439 rows)
+A' as of T, recursive over edges                               p50    44.68 p95    52.34 max    52.48 ms  n=20  (18439 rows)
+A' as of T, edges + version seek per block                     p50   122.12 p95   139.94 max   145.32 ms  n=20  (18439 rows)
+P  timeline by (page_id, from_seq)                             p50     0.07 p95     0.12 max     0.27 ms  n=100  (51 rows)
+B  timeline by touch(ancestor, seq)                            p50     0.04 p95     0.06 max     0.11 ms  n=100  (51 rows)
+Time: 39399.763 ms (00:39.400)
+ gist_size 
+-----------
+ 99 MB
+(1 row)
+
+A  GiST (parent_id, seq range): hot parent                     p50     0.41 p95     0.55 max     0.73 ms  n=100  (50 rows)
+A  GiST (parent_id, seq range): children of s2000              p50     1.10 p95     1.31 max     1.71 ms  n=100  (50 rows)
+A  GiST (parent_id, seq range): children of s10000             p50     3.88 p95     4.62 max     6.62 ms  n=100  (50 rows)
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Index Scan using idx_v_parent_gist on versions v
+   Index Cond: ((parent_id = 'x'::text) AND (int4range(from_seq, to_seq) @> 5))
+   Filter: (deleted = 0)
+(3 rows)
+

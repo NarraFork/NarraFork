@@ -1,0 +1,8 @@
+first 800 blocks of s2000, current, breadth first                p50    3.23  p95    4.57  max    6.98 ms  800
+first 800 blocks of s2000, as of T, with content                 p50    7.15  p95   10.18  max   10.18 ms  800
+first 800 blocks of s10000, current, breadth first               p50    5.92  p95    7.10  max    7.63 ms  800
+first 800 blocks of s10000, as of T, with content                p50    6.95  p95    8.03  max    8.20 ms  800
+first 800 blocks of s20000, current, breadth first               p50    8.50  p95    9.66  max   13.60 ms  800
+first 800 blocks of s20000, as of T, with content                p50    7.58  p95    9.35  max   10.08 ms  800
+first 800 blocks of s100000, current, breadth first              p50   43.71  p95   52.77  max   57.95 ms  800
+first 800 blocks of s100000, as of T, with content               p50   12.35  p95   15.42  max   16.94 ms  800
