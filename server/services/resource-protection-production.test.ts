@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,9 +10,8 @@ import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { FileWorktreeJournal, type WorktreeJournalRecord } from "./narrator-worktree-journal";
-import { maintainProtectionIndex } from "./resource-protection-index";
+import * as protectionIndex from "./resource-protection-index";
 import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
-import { withShadowCreationReservation } from "./worktree-lifecycle-guard";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 test("production cold snapshot survives history beyond the former global inventory budget", async () => {
@@ -36,9 +35,21 @@ test("production cold snapshot survives history beyond the former global invento
 			await db.insert(narrators).values(rows);
 		}
 
+		for (const deviceId of ["local", "remote-fixture"]) {
+			const id = generateId();
+			ids.push(id);
+			await db.insert(narrators).values({
+				id,
+				title: "root cwd is a reference, not exclusive cache ownership",
+				cwd: "/",
+				defaultDeviceId: deviceId,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			});
+		}
 		let ready = false;
 		for (let page = 0; page < 128; page++) {
-			await maintainProtectionIndex(performance.now() + 2000);
+			await protectionIndex.maintainProtectionIndex(performance.now() + 2000);
 			const incomplete = sqlite
 				.query(`SELECT 1 FROM resource_protection_sources
 				WHERE (source_id = '' AND complete = 0) OR (source_id != '' AND dirty = 1)
@@ -57,15 +68,30 @@ test("production cold snapshot survives history beyond the former global invento
 			WHERE source = 'narrator' AND alias_sensitive = 1`)
 				.get()?.n,
 		).toBe(0);
-		const before = sqlite.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n;
-		expect(
-			await withShadowCreationReservation(
-				{ deviceId: "local", path: treeSnapshotPhysicalDir("local", root) },
-				async () => "clear",
-			),
-		).toBe("clear");
-		expect(sqlite.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n).toBe(before);
-		expect(await worktreeTreeSnapshot.tryCaptureHot(root)).toMatch(/^[a-f0-9]{40,64}$/);
+		const heads = () =>
+			sqlite
+				.query(`SELECT source, revision, cursor, complete
+			FROM resource_protection_sources WHERE source_id='' ORDER BY source`)
+				.all();
+		const before = heads();
+		const readClaims = spyOn(protectionIndex, "readProtectionClaims").mockImplementation(
+			async () => {
+				throw new Error("Cold capture must not inspect global resource inventory");
+			},
+		);
+		try {
+			expect(await worktreeTreeSnapshot.tryCaptureHot(root)).toMatch(/^[a-f0-9]{40,64}$/);
+			expect(readClaims).not.toHaveBeenCalled();
+			expect(heads()).toEqual(before);
+			expect(
+				await db
+					.select()
+					.from(worktreeTreeSnapshots)
+					.where(eq(worktreeTreeSnapshots.worktreePath, root)),
+			).toHaveLength(1);
+		} finally {
+			readClaims.mockRestore();
+		}
 	} finally {
 		for (let offset = 0; offset < ids.length; offset += 50)
 			await db.delete(narrators).where(inArray(narrators.id, ids.slice(offset, offset + 50)));
@@ -105,6 +131,7 @@ test("production journal handles idempotency and results without writing resourc
 		},
 	};
 	const before = sqlite.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n;
+	const snapshotRoot = await mkdtemp(join(tmpdir(), "nf-journal-cold-snapshot-"));
 	try {
 		expect((await journal.claim(narratorId, requestId, record)).fresh).toBe(true);
 		await expect(
@@ -133,13 +160,20 @@ test("production journal handles idempotency and results without writing resourc
 		expect(await journal.read(narratorId, requestId)).toEqual(finished);
 		// A request interrupted during file save is not an instance-wide resource lock.
 		await writeFile(temporary, "partial save");
-		expect(
-			await withShadowCreationReservation(
-				{ deviceId: "local", path: getNarraforkPath("unrelated-shadow", narratorId) },
-				async () => "clear",
-			),
-		).toBe("clear");
 		expect(sqlite.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n).toBe(before);
+		await writeFile(join(snapshotRoot, "observed.txt"), "snapshot remains available\n");
+		const readClaims = spyOn(protectionIndex, "readProtectionClaims").mockImplementation(
+			async () => {
+				throw new Error("Journal retry metadata must not become a snapshot inventory barrier");
+			},
+		);
+		try {
+			expect(await worktreeTreeSnapshot.capture(snapshotRoot)).toMatch(/^[a-f0-9]{40,64}$/);
+			expect(readClaims).not.toHaveBeenCalled();
+			expect(await journal.read(narratorId, requestId)).toEqual(finished);
+		} finally {
+			readClaims.mockRestore();
+		}
 		expect(
 			sqlite
 				.query(`SELECT 1 FROM resource_protection_sources
@@ -147,6 +181,11 @@ test("production journal handles idempotency and results without writing resourc
 				.get(filePath),
 		).toBeNull();
 	} finally {
+		await db
+			.delete(worktreeTreeSnapshots)
+			.where(eq(worktreeTreeSnapshots.worktreePath, snapshotRoot));
+		await rm(treeSnapshotPhysicalDir("local", snapshotRoot), { recursive: true, force: true });
+		await rm(snapshotRoot, { recursive: true, force: true });
 		await rm(filePath, { force: true });
 		await rm(temporary, { force: true });
 	}

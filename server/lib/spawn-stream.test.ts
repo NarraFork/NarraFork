@@ -1,4 +1,4 @@
-import { describe, expect, setDefaultTimeout, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { safeSpawn } from "./spawn";
 
 // Windows may perform the one-time inheritable-handle scan before the first spawn.
@@ -88,4 +88,60 @@ describe("safeSpawn opt-in streaming", () => {
 			}),
 		).rejects.toThrow("parse failed");
 	});
+});
+
+describe("safeSpawn capture failures wait for real producer exit", () => {
+	for (const pipe of ["stdout", "stderr"] as const) {
+		test(`${pipe} reader failure kills and awaits the non-streaming producer`, async () => {
+			const script =
+				'process.on("SIGTERM", () => setTimeout(() => process.exit(0), 100)); process.stdout.write("ready"); process.stderr.write("ready"); setInterval(() => {}, 1000)';
+			const original = Bun.spawn;
+			let producer: ReturnType<typeof Bun.spawn> | undefined;
+			let exited = false;
+			let killed = false;
+			const spawn = spyOn(Bun, "spawn").mockImplementation((command, options?) => {
+				const proc = original(command as never, options as never) as ReturnType<typeof Bun.spawn>;
+				if (!Array.isArray(command) || command[2] !== script) return proc;
+				producer = proc;
+				void proc.exited.then(() => {
+					exited = true;
+				});
+				const actual = proc[pipe] as ReadableStream<Uint8Array>;
+				const failed = new ReadableStream<Uint8Array>({
+					async pull(controller) {
+						const reader = actual.getReader();
+						try {
+							await reader.read();
+						} finally {
+							reader.releaseLock();
+						}
+						controller.error(new Error(`${pipe} read failed`));
+					},
+				});
+				return new Proxy(proc, {
+					get(target, property) {
+						if (property === pipe) return failed;
+						if (property === "kill")
+							return (...args: Parameters<typeof proc.kill>) => {
+								killed = true;
+								return proc.kill(...args);
+							};
+						return Reflect.get(target, property, target);
+					},
+				});
+			});
+			try {
+				await expect(safeSpawn({ cmd: child(script), timeout: 5000 })).rejects.toThrow(
+					`${pipe} read failed`,
+				);
+				expect(killed).toBe(true);
+				expect(exited).toBe(true);
+				expect(producer?.exitCode).not.toBeNull();
+			} finally {
+				spawn.mockRestore();
+				if (producer?.exitCode === null) producer.kill("SIGKILL");
+				await producer?.exited;
+			}
+		});
+	}
 });

@@ -36,6 +36,36 @@ describe("target path semantics", () => {
 		);
 	});
 
+	test("POSIX contains() distinguishes dot-prefixed names from parent components", () => {
+		expect(posixPathSemantics.contains("/work", "/work")).toBe(true);
+		expect(posixPathSemantics.contains("/work", "/work/..cache/file.ts")).toBe(true);
+		expect(posixPathSemantics.contains("/work", "/work/.../file.ts")).toBe(true);
+		expect(posixPathSemantics.contains("/work", "/work/..\\outside")).toBe(true);
+		expect(posixPathSemantics.contains("/work", "/work/..")).toBe(false);
+		expect(posixPathSemantics.contains("/work", "/work/../outside/file.ts")).toBe(false);
+		expect(posixPathSemantics.contains("/work", "/work/..cache/../../outside")).toBe(false);
+	});
+
+	test("Windows contains() checks parent components, drives, and UNC shares", () => {
+		expect(windowsPathSemantics.contains("C:\\Work", "c:/work/..cache/file.ts")).toBe(true);
+		expect(windowsPathSemantics.contains("C:\\Work", "C:\\Work\\...\\file.ts")).toBe(true);
+		expect(windowsPathSemantics.contains("C:\\Work", "C:\\Work\\..")).toBe(false);
+		expect(windowsPathSemantics.contains("C:\\Work", "C:\\Work\\..\\outside")).toBe(false);
+		expect(windowsPathSemantics.contains("C:\\Work", "D:\\Work\\file.ts")).toBe(false);
+		expect(
+			windowsPathSemantics.contains(
+				"\\\\Server\\Share\\Work",
+				"//server/share/work/..cache/file.ts",
+			),
+		).toBe(true);
+		expect(windowsPathSemantics.contains("\\\\Server\\Share", "\\\\Server\\Other\\file.ts")).toBe(
+			false,
+		);
+		expect(windowsPathSemantics.contains("\\\\Server\\Share", "\\\\Other\\Share\\file.ts")).toBe(
+			false,
+		);
+	});
+
 	test("Windows contains() is case-insensitive", () => {
 		// Parent and child differ only in case — must return true
 		expect(windowsPathSemantics.contains("C:\\Data", "c:\\data\\file.ts")).toBe(true);
@@ -57,6 +87,9 @@ describe("target path semantics", () => {
 		expect(specPathSemantics.dirname("spec://tasks.json")).toBe("spec://");
 		expect(specPathSemantics.contains("spec://notes", "spec://notes/draft.md")).toBe(true);
 		expect(specPathSemantics.contains("spec://notes", "spec://notebook/draft.md")).toBe(false);
+		expect(specPathSemantics.contains("spec://notes", "spec://notes/..cache/draft.md")).toBe(true);
+		expect(specPathSemantics.contains("spec://notes", "spec://notes/../draft.md")).toBe(false);
+		expect(specPathSemantics.contains("spec://notes", "spec://notes/..")).toBe(false);
 		expect(specPathSemantics.relative("spec://notes", "spec://notes/draft.md")).toBe("draft.md");
 	});
 

@@ -7,10 +7,11 @@ import {
 	type ProtectionSource,
 	protectionSources,
 	protectionTables,
+	type ReceiptProjectionProgress,
+	receiptProjectionPrefix,
 } from "../db/resource-protection-index";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { hotSafe } from "../lib/hot-safe";
-import { normalizePathForComparison } from "../lib/platform-path";
 import { worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
 import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import type { LifecycleTarget, ResourceClaim } from "./worktree-lifecycle-guard";
@@ -83,7 +84,7 @@ export async function canonicalProtectionAdmissionPath(path: string): Promise<st
 	throw new Error("Resource path ancestry exceeded budget");
 }
 export async function canonicalProtectionPath(path: string): Promise<string> {
-	return normalizePathForComparison(await canonicalProtectionAdmissionPath(path));
+	return localPathSemantics.identityKey(await canonicalProtectionAdmissionPath(path));
 }
 
 type SourceState = {
@@ -99,6 +100,8 @@ type PathRow = {
 };
 type IndexedClaim = {
 	claim: ResourceClaim;
+	/** Immutable receipt upgrades retain the original serialized source evidence. */
+	claimJson?: string;
 	/** Canonical logical reference; claim.shadowKey retains the persisted physical hash input. */
 	shadowKey?: string;
 	canonicalPath: string | null;
@@ -119,17 +122,19 @@ function receiptClaim(record: unknown, id: string): ResourceClaim {
 		Object.hasOwn(row, "__proto__") ||
 		Object.hasOwn(row, "version") ||
 		!validText(row.destination) ||
-		!isAbsolute(row.destination) ||
 		!validText(row.repositoryKey) ||
 		!row.repositoryKey.trim() ||
 		(Object.hasOwn(row, "deviceId") &&
 			(typeof row.deviceId !== "string" || !/^[-A-Za-z0-9_]{1,128}$/.test(row.deviceId)))
 	)
 		throw new Error("Invalid receipt");
+	const deviceId = (row.deviceId as string | undefined) ?? "local";
+	if (deviceId === "local" && !isAbsolute(row.destination)) throw new Error("Invalid receipt");
+	treeSnapshotKey(deviceId, row.destination);
 	return {
 		kind: "receipt",
 		id,
-		deviceId: (row.deviceId as string | undefined) ?? "local",
+		deviceId,
 		path: row.destination,
 		repositoryKey: row.repositoryKey,
 	};
@@ -209,14 +214,11 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				throw new Error("Legacy claim device is unverifiable");
 		for (const path of [row.cwd, contextCwd])
 			if (path !== null && !validText(path)) throw new Error("Legacy claim cwd is unverifiable");
-		const rawDevice =
-			row.cwd && isAbsolute(row.cwd)
-				? "local"
-				: (row.default_device_id ?? contextDevice ?? "local");
-		const effectiveDevice =
-			contextDevice ??
-			(row.default_device_id && row.default_device_id !== "local" ? null : "local");
-		if (contextCwd && !effectiveDevice) throw new Error("Legacy context device is unverifiable");
+		// A committed context names the execution device; cwd/default_device_id also
+		// describe that device, not a second local workspace. Absolute POSIX syntax
+		// says nothing about ownership. Pre-context rows retain the explicit default
+		// device, with null meaning local under the genuine legacy contract.
+		const deviceId = contextDevice ?? row.default_device_id ?? "local";
 		const base = {
 			kind: "narrator" as const,
 			id: row.id,
@@ -226,8 +228,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		if (row.cwd)
 			claims.push({
 				...base,
-				path: rawDevice === "local" ? localPathSemantics.resolve(process.cwd(), row.cwd) : row.cwd,
-				deviceId: rawDevice,
+				path: deviceId === "local" ? localPathSemantics.resolve(process.cwd(), row.cwd) : row.cwd,
+				deviceId,
 			});
 		if (contextCwd) {
 			const repositoryKey = context?.git?.repositoryKey;
@@ -235,11 +237,9 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				throw new Error("Invalid repository key");
 			claims.push({
 				...base,
-				deviceId: effectiveDevice ?? "local",
+				deviceId,
 				path:
-					effectiveDevice === "local"
-						? localPathSemantics.resolve(process.cwd(), contextCwd)
-						: contextCwd,
+					deviceId === "local" ? localPathSemantics.resolve(process.cwd(), contextCwd) : contextCwd,
 				...(repositoryKey ? { repositoryKey } : {}),
 			});
 		}
@@ -271,7 +271,9 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			canonicalPath,
 			deviceId,
 			alias:
-				canonicalPath !== normalizePathForComparison(path) || metadata?.isSymbolicLink() ? 1 : 0,
+				canonicalPath !== localPathSemantics.identityKey(path) || metadata?.isSymbolicLink()
+					? 1
+					: 0,
 		};
 	}
 	async function indexed(
@@ -286,8 +288,15 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		if (shadowKey) {
 			const parts = shadowKey.split("\0");
 			const [deviceId, logicalPath] = parts;
-			if (parts.length !== 2 || !deviceId || !logicalPath || !isAbsolute(logicalPath))
+			if (
+				parts.length !== 2 ||
+				!deviceId ||
+				!logicalPath ||
+				(deviceId === "local" && !isAbsolute(logicalPath))
+			)
 				throw new Error("Invalid shadow reference");
+			// Snapshot identity validates remote absolute grammar without resolving it on the host.
+			treeSnapshotKey(deviceId, logicalPath);
 			const reference = { ...claim, path: undefined };
 			const logical = await indexedPath(reference, logicalPath, deviceId, deadline, signal);
 			const physical = await indexedPath(
@@ -349,7 +358,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 						old[i]?.canonical_path === row.canonicalPath &&
 						old[i]?.shadow_key === (row.shadowKey ?? null) &&
 						old[i]?.alias_sensitive === row.alias &&
-						old[i]?.claim_json === JSON.stringify(row.claim),
+						old[i]?.claim_json === (row.claimJson ?? JSON.stringify(row.claim)),
 				);
 			if (!state.dirty && unchanged) return true;
 			database
@@ -377,7 +386,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 						row.shadowKey ?? null,
 						row.claim.scopeProjectId ?? null,
 						row.alias,
-						JSON.stringify(row.claim),
+						row.claimJson ?? JSON.stringify(row.claim),
 					);
 			return true;
 		})();
@@ -466,6 +475,103 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			check(deadline, signal); // Retry bad finals after reaching EOF, without starving later files.
 		}
 	}
+	/** Rebuild derived identities from durable pins, never from mutable journal files. */
+	async function reprojectReceiptPins(
+		progress: ReceiptProjectionProgress,
+		initialCursor: string,
+		deadline: number,
+		signal?: AbortSignal,
+	) {
+		let expectedCursor = initialCursor;
+		const advance = (state: { source_id: string; revision: number; dirty: number }) => {
+			const cursor =
+				receiptProjectionPrefix + JSON.stringify({ ...progress, after: state.source_id });
+			const result = database
+				.query(`UPDATE resource_protection_sources
+				SET cursor = ?, revision = revision + 1
+				WHERE source = 'receipt' AND source_id = '' AND cursor = ? AND complete = 0
+				AND EXISTS (SELECT 1 FROM resource_protection_sources
+					WHERE source = 'receipt' AND source_id = ? AND revision = ? AND dirty = ?)`)
+				.run(cursor, expectedCursor, state.source_id, state.revision, state.dirty);
+			if (result.changes !== 1) throw new Error("Receipt projection cursor or pin changed");
+			expectedCursor = cursor;
+		};
+		const states = database
+			.query(`SELECT source_id, revision, dirty FROM resource_protection_sources
+			WHERE source = 'receipt' AND source_id > ? ORDER BY source_id LIMIT ?`)
+			.all(progress.after, PAGE) as { source_id: string; revision: number; dirty: number }[];
+		for (const state of states) {
+			check(deadline, signal);
+			if (state.dirty) {
+				// Keep the import retry pending, but commit this skipped prefix as well.
+				progress.complete = 0;
+				advance(state);
+				continue;
+			}
+			const saved = database
+				.query(`SELECT ${smallText("claim_json", MAX_ROW_BYTES)} AS claim_json,
+				${smallText("device_id", 256)} AS device_id, ${smallText("canonical_path")} AS canonical_path
+				FROM resource_protection_paths WHERE source = 'receipt' AND source_id = ?
+				ORDER BY slot LIMIT ?`)
+				.all(state.source_id, PAGE + 1) as {
+				claim_json: string;
+				device_id: string;
+				canonical_path: string | null;
+			}[];
+			if (saved.length > PAGE) throw new Error("Receipt projection exceeds row budget");
+			const rows: IndexedClaim[] = [];
+			const claims = new Map<string, ResourceClaim>();
+			for (const entry of saved) {
+				requireSmall(entry);
+				if (claims.has(entry.claim_json)) continue;
+				const claim = JSON.parse(entry.claim_json) as ResourceClaim;
+				if (claim?.kind !== "receipt" || claim.id !== state.source_id)
+					throw new Error("Invalid persisted receipt claim");
+				claims.set(entry.claim_json, claim);
+				rows.push(
+					...(await indexed(claim, deadline, signal)).map((row) => ({
+						...row,
+						claimJson: entry.claim_json,
+					})),
+				);
+			}
+			for (const entry of saved) {
+				const claim = claims.get(entry.claim_json);
+				if (
+					!claim?.shadowKey ||
+					entry.canonical_path === null ||
+					rows.some(
+						(row) => row.deviceId === entry.device_id && row.canonicalPath === entry.canonical_path,
+					)
+				)
+					continue;
+				// A receipt is immutable historical evidence. Its v1 physical hash may
+				// differ from the corrected logical key; retain that old footprint as a
+				// direct path alongside the original shadow claim, never a second shadow slot.
+				const footprint = {
+					...claim,
+					shadowKey: undefined,
+					deviceId: entry.device_id,
+					path: entry.canonical_path,
+				};
+				rows.push(...(await indexed(footprint, deadline, signal)));
+			}
+			if (!save("receipt", state.source_id, state.revision, rows))
+				throw new Error("Receipt pin changed during projection");
+			// Save/CAS stays per pin. A cursor failure may repeat this pin, never undo it;
+			// an interrupted page must not repeat its already-committed expensive prefix.
+			advance({ ...state, dirty: 0 });
+		}
+		check(deadline, signal);
+		if (states.length < PAGE) {
+			const result = database
+				.query(`UPDATE resource_protection_sources
+				SET cursor = ?, complete = ?, revision = revision + 1
+				WHERE source = 'receipt' AND source_id = '' AND cursor = ? AND complete = 0`)
+				.run(progress.cursor, progress.complete, expectedCursor);
+			if (result.changes !== 1) throw new Error("Receipt projection cursor changed");
+		}
+	}
 	async function runLegacyImport(deadline: number, signal?: AbortSignal) {
 		const progress = database
 			.query(
@@ -473,6 +579,15 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			)
 			.get() as { cursor: string | null; complete: number } | null;
 		if (!progress) throw new Error("Protection triggers not installed");
+		if (progress.cursor?.startsWith(receiptProjectionPrefix)) {
+			await reprojectReceiptPins(
+				JSON.parse(progress.cursor.slice(receiptProjectionPrefix.length)),
+				progress.cursor,
+				deadline,
+				signal,
+			);
+			return;
+		}
 		if (progress.complete) return;
 		if (progress.cursor !== "eof") {
 			if (!receiptEntries) {
@@ -589,7 +704,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				for (const { id } of ids)
 					database
 						.query(`INSERT INTO resource_protection_sources (source, source_id)
-					VALUES (?, ?) ON CONFLICT DO NOTHING`)
+					VALUES (?, ?) ON CONFLICT(source, source_id) DO UPDATE
+					SET revision = revision + 1, dirty = 1`)
 						.run(source, id);
 				database
 					.query(
@@ -643,18 +759,23 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				values: [device, target.repositoryKey],
 			});
 		if (target.path) {
+			const separator = device === "local" && process.platform === "win32" ? "\\" : "/";
 			let path = target.path;
 			for (let depth = 0; depth < 65; depth++) {
 				queries.push({ clause: "device_id = ? AND canonical_path = ?", values: [device, path] });
-				const parent = normalizePathForComparison(dirname(path));
+				const parent = localPathSemantics.identityKey(dirname(path));
 				if (parent === path) break;
 				if (depth === 64) throw new Error("Target ancestry exceeds budget");
 				path = parent;
 			}
-			const prefix = target.path.endsWith("/") ? target.path : `${target.path}/`;
+			const prefix = target.path.endsWith(separator) ? target.path : target.path + separator;
 			queries.push({
 				clause: "device_id = ? AND canonical_path >= ? AND canonical_path < ?",
-				values: [device, prefix, `${prefix.slice(0, -1)}0`],
+				values: [
+					device,
+					prefix,
+					prefix.slice(0, -1) + String.fromCharCode(separator.charCodeAt(0) + 1),
+				],
 				pathOrder: true,
 			});
 		}
@@ -671,9 +792,11 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			return !!(
 				a &&
 				b &&
-				(a === b ||
-					a.startsWith(b.endsWith("/") ? b : `${b}/`) ||
-					b.startsWith(a.endsWith("/") ? a : `${a}/`))
+				(row.deviceId === "local"
+					? localPathSemantics.contains(a, b) || localPathSemantics.contains(b, a)
+					: a === b ||
+						a.startsWith(b.endsWith("/") ? b : `${b}/`) ||
+						b.startsWith(a.endsWith("/") ? a : `${a}/`))
 			);
 		});
 	}
@@ -719,6 +842,9 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			);
 		const initialVersion = version();
 		const bootstrapKeys = new Set(bootstrapOverlay.map(({ source, id }) => `${source}\0${id}`));
+		const rebuildingSources = new Set(
+			progress.filter((state) => !state.complete).map((state) => state.source),
+		);
 		function candidateClaim(row: PathRow): ResourceClaim {
 			const saved = database
 				.query(`SELECT ${smallText("claim_json", MAX_ROW_BYTES)} AS claim_json FROM resource_protection_paths
@@ -731,6 +857,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		// LIMIT is applied to raw indexed candidates, never after a dirty-row anti-join.
 		function skipCandidate(row: PathRow): boolean {
 			if (row.source === "receipt") return !includeLegacyReceipts;
+			if (rebuildingSources.has(row.source)) return true;
 			return !!(
 				database
 					.query("SELECT dirty FROM resource_protection_sources WHERE source = ? AND source_id = ?")
