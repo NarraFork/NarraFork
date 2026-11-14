@@ -85,11 +85,14 @@ export function BackgroundCard() {
 		await saveWallpaperBlob(file);
 		setTouched(false);
 		// Keep the URL: switching back to "Remote URL" must not lose the address.
+		// reloadKey changes even when the file name is identical, otherwise picking a
+		// different image with the same name would reuse the dedupe key and never refresh.
 		setChoice({
 			...choice,
 			source: "file",
 			fileName: file.name,
 			enabled: true,
+			reloadKey: Date.now(),
 		});
 	};
 

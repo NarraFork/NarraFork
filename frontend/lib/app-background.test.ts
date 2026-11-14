@@ -96,6 +96,34 @@ describe("background image", () => {
 		expect(switchBackgroundSource(DEFAULT_BACKGROUND, "url").enabled).toBe(false);
 	});
 
+	test("a local-file wallpaper marks the shell even though it has no URL", () => {
+		// Regression: the usability check only looked at `url`, so a file source (empty url)
+		// removed the data attribute — the image loaded but sat behind an opaque shell.
+		const root = stubRoot() as ReturnType<typeof stubRoot>;
+		applyBackground(root as unknown as HTMLElement, {
+			enabled: true,
+			source: "file",
+			fileName: "wall.png",
+			url: "",
+			opacity: 68,
+			scrim: 20,
+			blur: 6,
+		});
+		expect(root.attr("data-nf-bg")).toBe("on");
+		expect(root.get("--nf-bg-pane-opacity")).toBe("68%");
+
+		const noFile = stubRoot() as ReturnType<typeof stubRoot>;
+		applyBackground(noFile as unknown as HTMLElement, {
+			enabled: true,
+			source: "file",
+			url: "",
+			opacity: 68,
+			scrim: 20,
+			blur: 6,
+		});
+		expect(noFile.attr("data-nf-bg")).toBeUndefined();
+	});
+
 	test("applying writes the variables, clearing removes them", () => {
 		const root = stubRoot() as ReturnType<typeof stubRoot>;
 		applyBackground(root as unknown as HTMLElement, {

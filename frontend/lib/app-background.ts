@@ -185,7 +185,12 @@ function cssUrl(url: string): string {
 }
 
 export function applyBackground(root: HTMLElement, choice: BackgroundChoice): void {
-	const usable = choice.enabled && checkBackgroundUrl(choice.url).ok;
+	// Validity depends on the source: a file wallpaper has no URL at all, and testing the
+	// (empty) URL here used to strip `data-nf-bg`, leaving the shell opaque — the picture
+	// loaded but was painted behind an opaque body, so file wallpapers never appeared.
+	const usable =
+		choice.enabled &&
+		(choice.source === "file" ? Boolean(choice.fileName) : checkBackgroundUrl(choice.url).ok);
 	if (!usable) {
 		root.removeAttribute("data-nf-bg");
 		root.style.removeProperty("--nf-bg-image");
@@ -216,33 +221,77 @@ export function applyBackground(root: HTMLElement, choice: BackgroundChoice): vo
  * Returns "error" when the image could not be loaded, which is the settings card's cue to
  * say so instead of leaving a silent flat background.
  */
+/**
+ * Dedupe key for the last applied configuration, plus the in-flight promise.
+ *
+ * The hook is mounted twice (the app shell and the settings card), and the boot path calls
+ * this once more — so without deduplication a local-file wallpaper creates a fresh object
+ * URL per call and revokes the one the other call is still loading, which surfaces as a
+ * broken/blank image. Remote URLs also get requested twice.
+ */
+let appliedKey: string | null = null;
+let inFlight: Promise<WallpaperResult> | null = null;
+
+function wallpaperKey(choice: BackgroundChoice): string {
+	return JSON.stringify({
+		enabled: choice.enabled,
+		source: choice.source,
+		url: choice.url,
+		fileName: choice.fileName,
+		blur: choice.blur,
+		reloadKey: choice.reloadKey ?? 0,
+	});
+}
+
 export async function syncWallpaperLayer(choice: BackgroundChoice): Promise<WallpaperResult> {
 	if (!choice.enabled) {
+		appliedKey = null;
+		inFlight = null;
 		hideWallpaper();
 		return "ok";
 	}
-	if (choice.source === "file") {
-		const blob = await loadWallpaperBlob();
-		if (!blob) {
-			hideWallpaper();
-			return "error";
+	const key = wallpaperKey(choice);
+	// Already applied (or applying) this exact configuration: share the result instead of
+	// creating a second object URL / issuing a second request.
+	if (key === appliedKey) return inFlight ?? "ok";
+
+	appliedKey = key;
+	const run = applyWallpaperSource(choice)
+		.then((result) => {
+			// A failure must stay retryable: clear the key so a later caller re-runs it.
+			if (result !== "ok" && appliedKey === key) appliedKey = null;
+			return result;
+		})
+		.catch((error) => {
+			if (appliedKey === key) appliedKey = null;
+			throw error;
+		})
+		.finally(() => {
+			if (inFlight === run) inFlight = null;
+		});
+	inFlight = run;
+	return run;
+}
+
+async function applyWallpaperSource(choice: BackgroundChoice): Promise<WallpaperResult> {
+	switch (choice.source) {
+		case "file": {
+			const blob = await loadWallpaperBlob();
+			if (!blob) return "error";
+			return showWallpaper(
+				{ src: URL.createObjectURL(blob), blur: choice.blur },
+				{ objectUrl: true },
+			);
 		}
-		return showWallpaper(
-			{ src: URL.createObjectURL(blob), blur: choice.blur },
-			{ objectUrl: true },
-		);
+		default: {
+			if (!checkBackgroundUrl(choice.url).ok) return "error";
+			let src = choice.url.trim();
+			if (choice.reloadKey) {
+				src += `${src.includes("?") ? "&" : "?"}nf_reload=${choice.reloadKey}`;
+			}
+			return showWallpaper({ src, blur: choice.blur });
+		}
 	}
-	if (!checkBackgroundUrl(choice.url).ok) {
-		hideWallpaper();
-		return "error";
-	}
-	let src = choice.url.trim();
-	if (choice.reloadKey) {
-		// A reload must actually re-request the bytes; hosts commonly serve a cached copy
-		// for the same URL, which looks like "the retry did nothing".
-		src += `${src.includes("?") ? "&" : "?"}nf_reload=${choice.reloadKey}`;
-	}
-	return showWallpaper({ src, blur: choice.blur });
 }
 
 /**
