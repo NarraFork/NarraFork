@@ -2041,7 +2041,7 @@
 	"tlsCertSans": "Current certificate includes: {{sans}}",
 	"tlsAutoSansNote": "Automatically included when issuing: {{sans}}",
 	"tlsAutoReissue": "Automatically update certificate on startup",
-	"tlsAutoReissueDesc": "Re-issue when local IPs change, keeping the existing CA.",
+	"tlsAutoReissueDesc": "Re-issue the built-in certificate when local IPs change, its lifetime exceeds 825 days, or fewer than 30 days remain. The existing CA is kept.",
 	"tlsDownloadCa": "Download CA Certificate",
 	"tlsCaDownloadError": "Failed to download the CA certificate",
 	"tlsRegenerateCa": "Regenerate CA",
