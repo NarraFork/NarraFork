@@ -4,16 +4,25 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
+import {
+	MAX_MIRROR_MAIN_BINARY_BYTES,
+	mirrorAssetLimit,
+} from "../shared/independent-update-mirror";
 import { addToken, initConfig } from "../update-server/lib/config";
 import { createReleaseRoutes } from "../update-server/routes/releases";
 import type { StorageBackend } from "../update-server/storage/types";
 import type { ReleaseMeta, ZstdPatchMeta } from "../update-server/types";
 
-test("production HTTP entry admits bounded streaming patches up to 512 MiB", () => {
-	// app.request bypasses Bun.serve admission, so route tests alone cannot catch
-	// an entry-point limit that rejects canonical patches before streaming validation.
+test("production HTTP entry admits 1 GiB binaries while patches remain bounded to 512 MiB", () => {
+	// app.request bypasses Bun.serve admission. The entry must admit full binaries;
+	// authenticated streaming validation still enforces each asset kind's smaller limit.
 	const entry = readFileSync(new URL("../update-server/index.ts", import.meta.url), "utf8");
-	expect(entry).toMatch(/Bun\.serve\(\{[\s\S]*?maxRequestBodySize:\s*512\s*\*\s*1024\s*\*\s*1024/);
+	expect(entry).toMatch(
+		/Bun\.serve\(\{[\s\S]*?maxRequestBodySize:\s*MAX_MIRROR_MAIN_BINARY_BYTES\b/,
+	);
+	expect(MAX_MIRROR_MAIN_BINARY_BYTES).toBe(1024 ** 3);
+	expect(mirrorAssetLimit("main-binary")).toBe(MAX_MIRROR_MAIN_BINARY_BYTES);
+	expect(mirrorAssetLimit("patch")).toBe(512 * 1024 ** 2);
 });
 
 class MemoryStorage implements StorageBackend {
