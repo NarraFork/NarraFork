@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { LocalBackend } from "../local-backend";
 import { backendDirname, resolveBackendPath } from "../path-resolve";
 import { posixPathSemantics, specPathSemantics, windowsPathSemantics } from "../path-semantics";
@@ -131,4 +131,20 @@ describe("LocalBackend path identity", () => {
 			true,
 		);
 	});
+});
+
+test("LocalBackend keeps existing and missing volume-root identities fully absolute", async () => {
+	const backend = new LocalBackend();
+	// Probe metadata only: never create or register volume roots for fixture cleanup.
+	for (const root of new Set([parse(process.cwd()).root, parse(tmpdir()).root])) {
+		const existing = await backend.resolvePathIdentity(root);
+		expect(existing.exists).toBe(true);
+		expect(backend.paths.isAbsolute(existing.canonicalPath)).toBe(true);
+		expect(backend.paths.equals(existing.canonicalPath, root)).toBe(true);
+		const path = join(root, `nf-uncreated-root-probe-${crypto.randomUUID()}`);
+		const missing = await backend.resolvePathIdentity(path);
+		expect(missing.exists).toBe(false);
+		expect(backend.paths.isAbsolute(missing.canonicalPath)).toBe(true);
+		expect(backend.paths.equals(missing.canonicalPath, path)).toBe(true);
+	}
 });

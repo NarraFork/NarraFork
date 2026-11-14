@@ -78,6 +78,13 @@ test("production cold snapshot survives history beyond the former global invento
 			WHERE p.source = 'narrator' AND n.title = 'root cwd is a reference, not exclusive cache ownership'`)
 				.get()?.n,
 		).toBe(2);
+		// Volume roots must also keep a stable identity, not become drive-relative aliases.
+		expect(
+			sqlite
+				.query<{ n: number }, []>(`SELECT count(*) AS n FROM resource_protection_paths
+			WHERE source = 'narrator' AND alias_sensitive = 1`)
+				.get()?.n,
+		).toBe(0);
 		const heads = () =>
 			sqlite
 				.query(`SELECT source, revision, cursor, complete

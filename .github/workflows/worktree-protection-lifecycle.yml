@@ -7,6 +7,8 @@ on:
     paths:
       - "server/db/resource-protection-index.ts"
       - "server/lib/agent/execution/path-semantics.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/platform-path*.ts"
       - "server/lib/agent/execution/__tests__/path-semantics.test.ts"
       - "server/lib/spawn*.ts"
       - "server/services/resource-protection*.ts"
@@ -29,6 +31,8 @@ on:
     paths:
       - "server/db/resource-protection-index.ts"
       - "server/lib/agent/execution/path-semantics.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/platform-path*.ts"
       - "server/lib/agent/execution/__tests__/path-semantics.test.ts"
       - "server/lib/spawn*.ts"
       - "server/services/resource-protection*.ts"
@@ -81,6 +85,7 @@ jobs:
       - name: Verify lifecycle, compatibility, and real process cleanup
         run: >-
           bun test --isolate
+          server/lib/platform-path.test.ts
           server/lib/agent/execution/__tests__/path-semantics.test.ts
           server/services/tree-snapshot-paths.test.ts
           server/services/resource-protection-index.test.ts

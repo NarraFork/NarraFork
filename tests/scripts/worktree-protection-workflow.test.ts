@@ -28,6 +28,7 @@ const workflowPath = ".github/workflows/worktree-protection-lifecycle.yml";
 const workflow = Bun.YAML.parse(readFileSync(join(root, workflowPath), "utf8")) as Workflow;
 const lane = workflow.jobs.lifecycle;
 const relatedTests = [
+	"server/lib/platform-path.test.ts",
 	"server/lib/agent/execution/__tests__/path-semantics.test.ts",
 	"server/services/tree-snapshot-paths.test.ts",
 	"server/services/resource-protection-index.test.ts",
@@ -74,6 +75,8 @@ describe("worktree protection lifecycle CI", () => {
 				workflowPath,
 				"server/db/resource-protection-index.ts",
 				"server/lib/agent/execution/path-semantics.ts",
+				"server/lib/agent/execution/local-backend.ts",
+				"server/lib/platform-path.ts",
 				"server/lib/spawn.ts",
 				"server/services/resource-protection-index.ts",
 				"server/services/tree-snapshot-paths.ts",

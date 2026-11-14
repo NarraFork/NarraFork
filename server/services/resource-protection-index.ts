@@ -12,6 +12,7 @@ import {
 } from "../db/resource-protection-index";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { hotSafe } from "../lib/hot-safe";
+import { normalizeRealpathResult } from "../lib/platform-path";
 import { worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
 import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import type { LifecycleTarget, ResourceClaim } from "./worktree-lifecycle-guard";
@@ -62,7 +63,7 @@ export async function canonicalProtectionAdmissionPath(path: string): Promise<st
 	const suffix: string[] = [];
 	for (let depth = 0; depth < 64; depth++) {
 		try {
-			return resolve(await realpath(current), ...suffix);
+			return resolve(normalizeRealpathResult(await realpath(current)), ...suffix);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			const node = await lstat(current).catch((cause) => {

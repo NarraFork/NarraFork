@@ -24,7 +24,7 @@ import { guardDiskWrite } from "../../disk-safety";
 import { hotSafe } from "../../hot-safe";
 import { envWithAmbientProxy } from "../../net/proxy-env";
 import { getHome, IS_WINDOWS } from "../../platform";
-import { pathsEqualForOS } from "../../platform-path";
+import { normalizeRealpathResult, pathsEqualForOS } from "../../platform-path";
 import { resolveRgPath } from "../../ripgrep";
 import { loadSettings } from "../../settings";
 import { clearInheritableHandlesBeforeSpawn } from "../../win-handle-guard";
@@ -230,7 +230,8 @@ async function resolvePosixCanonicalPath(inputPath: string): Promise<string> {
 }
 
 async function resolveCanonicalPath(inputPath: string): Promise<string> {
-	if (IS_WINDOWS || !inputPath.includes("\\")) return realpath(inputPath);
+	if (IS_WINDOWS || !inputPath.includes("\\"))
+		return normalizeRealpathResult(await realpath(inputPath));
 	try {
 		return await realpath(inputPath);
 	} catch {

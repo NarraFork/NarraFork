@@ -42,6 +42,12 @@ export function resolvePath(...segments: string[]): string {
 	return toForwardSlash(normalize(resolve(...segments)));
 }
 
+/** Bun can return `C:` for realpath(`C:\\`). Apply only to filesystem results,
+ * never raw user input, where a bare drive is legitimately drive-relative. */
+export function normalizeRealpathResult(path: string, platform = process.platform): string {
+	return platform === "win32" && /^[a-z]:$/i.test(path) ? `${path}${win32.sep}` : path;
+}
+
 /**
  * Normalize a path for string comparison.
  * On Windows (or Windows-style paths), comparisons should be case-insensitive.
