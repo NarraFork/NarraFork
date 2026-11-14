@@ -8,26 +8,28 @@
  * placements of the parents it names, not by the size of a subtree or the number of text
  * versions under it.
  *
- * JOIN ORDER IS PINNED. A level or subtree as of a seq is "the placements valid then, each
- * joined to the block's version valid then". Left to itself the planner has turned that round
+ * JOIN ORDER IS PINNED. A level as of a seq is "the placements valid then, each joined to the
+ * block's version valid then". Left to itself the planner has turned that round
  * (scan the versions, probe the placements), which is 10 to 20 times slower; so the placements
  * are an inner SELECT with the limit, and the joins after it are `CROSS JOIN`s, which SQLite
- * never reorders. `store/__tests__/history-plan.guard.test.ts` reads the plans.
+ * never reorders. `__tests__/history-plan.guard.test.ts` reads the plans.
  *
  * The statements are exported (text only) for that guard, and the port is built by
  * {@link createSqliteOutlineHistory} from a database handle so the upgrade test can run the
  * conversion against a database file of its own.
  */
 import type { Database } from "bun:sqlite";
+import { sqlite } from "../../../db";
 import type { OutlineAskJson, OutlineSpaceKind, OutlineTaskJson } from "../model";
-import type {
-	OutlineChangedChildRow,
-	OutlineEdgeRow,
-	OutlineHistoryPort,
-	OutlineHistoryState,
-	OutlineLevelCursor,
-	OutlineLevelRow,
-	OutlineSubtreeChange,
+import {
+	type OutlineChangedChildRow,
+	type OutlineEdgeRow,
+	type OutlineHistoryPort,
+	type OutlineHistoryState,
+	type OutlineLevelCursor,
+	type OutlineLevelRow,
+	type OutlineSubtreeChange,
+	readSubtreeByLevels,
 } from "./history-port";
 import { chunked, type OutlineSpaceRow } from "./port";
 
@@ -105,42 +107,6 @@ export const SQLITE_LEVEL_AS_OF = `SELECT ${AS_OF_COLUMNS}
 	${AS_OF_JOINS}
 	ORDER BY s.order_key, s.id`;
 
-/**
- * The blocks under the parent key `?2` as of `?3`, breadth first, at most `?4`. The recursion
- * walks placements only and stops at the limit; the versions are joined to what it returned.
- */
-export const SQLITE_SUBTREE_AS_OF = `WITH RECURSIVE sub(id, parent_key, order_key, depth) AS (
-		SELECT e.block_id, e.parent_key, e.order_key, 0 FROM outline_block_edges e
-		WHERE e.parent_key = ?2 AND ${VALID("e")}
-		UNION ALL
-		SELECT e.block_id, e.parent_key, e.order_key, sub.depth + 1
-		FROM sub CROSS JOIN outline_block_edges e ON e.parent_key = sub.id AND ${VALID("e")})
-	SELECT ${AS_OF_COLUMNS}
-	FROM (SELECT id, parent_key, order_key, depth FROM sub LIMIT ?4) s
-	${AS_OF_JOINS}
-	ORDER BY s.depth`;
-
-const subtreeNow = (root: string) => `WITH RECURSIVE
-	sub(id, sid, parent_id, order_key, alias, task_json, version_seq, ask_json, depth) AS (
-		SELECT b.id, b.sid, b.parent_id, b.order_key, b.alias, b.task_json, b.version_seq, b.ask_json,
-			0
-		FROM outline_blocks b WHERE b.space_id = ?1 AND ${root} AND b.deleted = 0
-		UNION ALL
-		SELECT b.id, b.sid, b.parent_id, b.order_key, b.alias, b.task_json, b.version_seq, b.ask_json,
-			sub.depth + 1
-		FROM sub CROSS JOIN outline_blocks b
-			ON b.space_id = ?1 AND b.parent_id = sub.id AND b.deleted = 0)
-	SELECT s.id, s.sid, s.parent_id, s.order_key, s.alias, s.task_json, s.version_seq, s.ask_json,
-		EXISTS (SELECT 1 FROM outline_blocks c
-			WHERE c.space_id = ?1 AND c.parent_id = s.id AND c.deleted = 0)
-	FROM (SELECT * FROM sub LIMIT ?3) s
-	ORDER BY s.depth`;
-
-/** The live blocks under the block `?2` now, breadth first, at most `?3`. */
-export const SQLITE_SUBTREE_NOW = subtreeNow("b.parent_id = ?2");
-/** The live blocks of the space `?1` now, breadth first, at most `?3` (`?2` bound to null). */
-export const SQLITE_SUBTREE_NOW_TOP = subtreeNow("b.parent_id IS NULL AND ?2 IS NULL");
-
 /** Where the block `?1` sat as of `?2`. */
 export const SQLITE_PLACEMENT_AS_OF = `SELECT parent_key, block_id, from_seq, to_seq, order_key
 	FROM outline_block_edges
@@ -195,6 +161,33 @@ export const SQLITE_BACKFILL_INSERT = `INSERT INTO outline_block_edges
 		AND NOT EXISTS (SELECT 1 FROM outline_block_edges e
 			WHERE e.block_id = b.id AND e.to_seq IS NULL)`;
 
+/**
+ * The commit's change marks (`sqlite-store.ts` runs it inside the commit's section): every
+ * ancestor of the blocks whose ids stand at {@link SQLITE_IDS_SLOT}, as the tree is when it
+ * runs, marked at `seq`; ancestors marked at `seq` already are left out before the limit. The
+ * walk goes up the blocks' parent column by primary key, and the `CROSS JOIN` keeps it that
+ * way round (the other way would scan the blocks for every step).
+ */
+export function sqliteMarkAncestorsSql(seq: number, limit: number): string {
+	if (!Number.isSafeInteger(seq) || !Number.isSafeInteger(limit))
+		throw new Error("change marks need an integer seq and limit");
+	return `WITH RECURSIVE up(id) AS (
+			SELECT parent_id FROM outline_blocks
+			WHERE id IN (${SQLITE_IDS_SLOT}) AND parent_id IS NOT NULL
+			UNION
+			SELECT b.parent_id FROM up CROSS JOIN outline_blocks b
+				ON b.id = up.id WHERE b.parent_id IS NOT NULL
+		)
+		INSERT INTO outline_subtree_changes (ancestor_id, seq)
+		SELECT up.id, ${seq} FROM up
+		WHERE NOT EXISTS (SELECT 1 FROM outline_subtree_changes m
+			WHERE m.ancestor_id = up.id AND m.seq = ${seq})
+		LIMIT ${limit}
+		RETURNING 1`;
+}
+/** Where the bound ids go in {@link sqliteMarkAncestorsSql}. */
+export const SQLITE_IDS_SLOT = "/*ids*/";
+
 const FIRST: OutlineLevelCursor = { orderKey: "", id: "" };
 
 type SpaceValues = [
@@ -243,6 +236,21 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 		return (rows as LevelValues[]).map(toLevel);
 	};
 
+	/** The children of several parents, one seek per parent, at most `limit` rows in all. */
+	const levels = (
+		spaceId: string,
+		parentIds: readonly (string | null)[],
+		asOf: number | null,
+		limit: number,
+	): OutlineLevelRow[] => {
+		const rows: OutlineLevelRow[] = [];
+		for (const parentId of new Set(parentIds)) {
+			if (rows.length >= limit) break;
+			for (const row of level(spaceId, parentId, asOf, FIRST, limit - rows.length)) rows.push(row);
+		}
+		return rows;
+	};
+
 	return {
 		async listLevel(spaceId, parentId, { asOf, after, limit }) {
 			const max = Math.max(0, Math.floor(limit));
@@ -255,28 +263,16 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 
 		async listLevels(spaceId, parentIds, { asOf, limit }) {
 			const max = Math.max(0, Math.floor(limit));
-			const rows: OutlineLevelRow[] = [];
-			for (const parentId of new Set(parentIds)) {
-				// One seek per parent, stopping one row past what is left of the limit.
-				for (const row of level(spaceId, parentId, asOf, FIRST, max - rows.length + 1))
-					rows.push(row);
-				if (rows.length > max) return { rows: rows.slice(0, max), truncated: true };
-			}
-			return { rows, truncated: false };
+			const rows = levels(spaceId, parentIds, asOf, max + 1);
+			return { rows: rows.slice(0, max), truncated: rows.length > max };
 		},
 
 		async listSubtreeAt(spaceId, rootId, { asOf, limit }) {
-			const max = Math.max(0, Math.floor(limit));
-			const rows = (
-				asOf === null
-					? values(rootId === null ? SQLITE_SUBTREE_NOW_TOP : SQLITE_SUBTREE_NOW, [
-							spaceId,
-							rootId,
-							max + 1,
-						])
-					: values(SQLITE_SUBTREE_AS_OF, [spaceId, rootId ?? spaceId, asOf, max + 1])
-			) as LevelValues[];
-			return { rows: rows.slice(0, max).map(toLevel), truncated: rows.length > max };
+			return readSubtreeByLevels(
+				async (parentIds, room) => levels(spaceId, parentIds, asOf, room),
+				rootId,
+				limit,
+			);
 		},
 
 		async getPlacementsAt(blockIds, asOf) {
@@ -415,3 +411,6 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 		},
 	};
 }
+
+/** The port over the application's connection. */
+export const sqliteOutlineHistory: OutlineHistoryPort = createSqliteOutlineHistory(() => sqlite);

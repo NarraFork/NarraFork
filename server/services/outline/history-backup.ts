@@ -91,7 +91,7 @@ export async function backupOutlineTables(options: {
 
 /**
  * The backup step of the conversion for a store, or null when the store has no database file of
- * ours to copy: PostgreSQL is backed up by whoever operates it (`docs/`), and an in-memory
+ * ours to copy: PostgreSQL is backed up by whoever operates it, and an in-memory
  * SQLite database (tests) has nothing to keep.
  */
 export function outlineBackupFor(store: OutlineStore): (() => Promise<string | null>) | null {

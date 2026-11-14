@@ -107,7 +107,7 @@ import {
 	writesAsExpected,
 } from "./port";
 import { createPostgresOutlineDigests } from "./postgres-digest";
-import { createPostgresOutlineHistory } from "./postgres-history";
+import { createPostgresOutlineHistory, pgMarkAncestorsSql } from "./postgres-history";
 import { createPostgresOutlineReads } from "./postgres-read";
 
 /** Transaction handle as produced by `db.transaction(async (tx) => …)`. */
@@ -423,21 +423,7 @@ async function markAncestors(
 ): Promise<number> {
 	let added = 0;
 	for (const chunk of chunked(ids)) {
-		const rows = await tx.execute(sql`
-			WITH RECURSIVE up(id) AS (
-				SELECT parent_id FROM outline_blocks
-				WHERE id IN (${idList(chunk)}) AND parent_id IS NOT NULL
-				UNION
-				SELECT b.parent_id FROM up JOIN outline_blocks b ON b.id = up.id
-				WHERE b.parent_id IS NOT NULL
-			)
-			INSERT INTO outline_subtree_changes (ancestor_id, seq)
-			SELECT up.id, CAST(${seq} AS integer) FROM up
-			WHERE NOT EXISTS (SELECT 1 FROM outline_subtree_changes m
-				WHERE m.ancestor_id = up.id AND m.seq = CAST(${seq} AS integer))
-			LIMIT CAST(${room - added + 1} AS integer)
-			RETURNING 1
-		`);
+		const rows = await tx.execute(pgMarkAncestorsSql(chunk, seq, room - added + 1));
 		added += (rows as unknown as unknown[]).length;
 		if (added > room) break;
 	}

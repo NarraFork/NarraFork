@@ -533,7 +533,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"errorCode",
 	],
 	// 固定表清单的构建同样放在独立进程：`INSERT … SELECT` 与 `VACUUM` 都是 O(数据量) 的同步操作。
-	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
+	// 大纲整表拷贝（只读连接逐表复制）按 `sqlite_master` 找出 `outline_*` 的普通表。
+	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum", "sqliteCatalog"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
@@ -643,6 +644,14 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// The open-task read names the partial index's own predicate (`json_extract` of the task
 	// status) so SQLite uses it; the PostgreSQL store spells the same predicate with `#>>`.
 	"server/services/outline/store/sqlite-store.ts": ["json1"],
+	// The SQLite side of `outline/store/history-port.ts`: cached raw statements for the reads by
+	// placement, typed with the driver's `Database` so the upgrade test can run the conversion
+	// against a database file of its own. The PostgreSQL store answers the same port
+	// (`postgres-history.ts`).
+	"server/services/outline/store/sqlite-history.ts": ["driver", "handle"],
+	// The copy of the outline's tables before the placement conversion is of the SQLite file
+	// (its path is the connection's); PostgreSQL is backed up by whoever operates it.
+	"server/services/outline/history-backup.ts": ["handle"],
 	"server/services/parent-injection-queue.ts": ["json1"],
 	// SQLite-gated project indexing uses connection change counters only to invalidate
 	// per-pass caches; a PostgreSQL implementation must provide its own revision signal.

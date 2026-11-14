@@ -25,7 +25,13 @@
  * per chunk of ids. A read as of a seq looks at every placement the parent ever had (at most
  * `OUTLINE_LIMITS.maxSiblings` live at a time, plus those that left), not at the text versions
  * under it. The statements that join placements to versions pin their join order (SQLite:
- * `CROSS JOIN`; PostgreSQL: `LATERAL`), and `store/__tests__` holds a plan guard for each.
+ * `CROSS JOIN`; PostgreSQL: `LATERAL`), and each backend's tests read the plans.
+ *
+ * NO RECURSIVE READ. A subtree is read level by level, not by one recursive statement over the
+ * placements: measured on 100,000 blocks, PostgreSQL computes a whole level before the limit
+ * applies (260 to 370 ms for 800 rows of a space whose 200 top-level blocks have 500 children
+ * each), and SQLite lists every child of every row it returns. One bounded read per level
+ * costs what it returns on both.
  *
  * This file imports nothing dialect-specific.
  */
@@ -125,17 +131,12 @@ export interface OutlineHistoryPort {
 	/**
 	 * The live blocks under a root (`null`: the whole space), breadth first, now or as of a seq,
 	 * the root itself left out: at most `limit` rows, `truncated` when the subtree holds more.
-	 * Breadth first means a level is whole before the next one starts; with `truncated`, the
-	 * deepest level returned may be cut anywhere (siblings of one parent included), so a caller
-	 * that needs whole levels reads the parents of the last level again with {@link listLevels}.
-	 * One recursive statement over the placements (or, for now, the blocks' children index),
-	 * which stops at the limit: its cost follows the rows returned, not the size of the subtree.
+	 * Breadth first means a level is whole before the next one starts, each parent's children
+	 * together and in sibling order; with `truncated`, only the parent of the last row may be
+	 * cut short. Read one level at a time ({@link readSubtreeByLevels}), every read stopping at
+	 * what is left of the limit and skipping the blocks known to have no children: its cost
+	 * follows the rows returned, not the size of the subtree or of the levels it starts.
 	 */
-	listSubtreeAt(
-		spaceId: string,
-		rootId: string | null,
-		options: { asOf: number | null; limit: number },
-	): Promise<{ rows: OutlineLevelRow[]; truncated: boolean }>;
 	/**
 	 * Where each block sat as of a seq (`null`: now): its parent key (the space id for a
 	 * top-level block) and order key. Blocks that were not in the tree then (not created yet,
@@ -205,4 +206,27 @@ export interface OutlineHistoryPort {
 	 * marked already (or is gone).
 	 */
 	finishEdgeBackfill(spaceId: string): Promise<number | null>;
+}
+
+/**
+ * A subtree read one level at a time, for both backends: `readLevels` returns the children of
+ * the given parents (each parent's together, in sibling order), at most `limit` rows in all.
+ * Parents whose row says they have no children are not asked. At most one read per level of
+ * the tree (and per chunk of parents).
+ */
+export async function readSubtreeByLevels(
+	readLevels: (parentIds: readonly (string | null)[], limit: number) => Promise<OutlineLevelRow[]>,
+	rootId: string | null,
+	limit: number,
+): Promise<{ rows: OutlineLevelRow[]; truncated: boolean }> {
+	const max = Math.max(0, Math.floor(limit));
+	const rows: OutlineLevelRow[] = [];
+	let frontier: Array<string | null> = [rootId];
+	while (frontier.length > 0) {
+		const found = await readLevels(frontier, max - rows.length + 1);
+		for (const row of found) rows.push(row);
+		if (rows.length > max) return { rows: rows.slice(0, max), truncated: true };
+		frontier = found.filter((row) => row.hasChildren).map((row) => row.id);
+	}
+	return { rows, truncated: false };
 }

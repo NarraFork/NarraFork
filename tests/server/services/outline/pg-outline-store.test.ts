@@ -14,7 +14,7 @@
  *   - the harness owns and removes its database.
  */
 import { describe, expect, it } from "bun:test";
-import { eq, inArray, sql } from "drizzle-orm";
+import { eq, inArray, type SQL, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { ensurePgFts } from "../../../../server/db/pg-fts";
 import { createPostgresClient } from "../../../../server/db/postgres-client";
@@ -40,6 +40,11 @@ import {
 	type OutlineLinkRow,
 	type OutlineVersionRow,
 } from "../../../../server/services/outline/store/port";
+import {
+	pgLevelAsOf,
+	pgLevelNow,
+	pgMarkAncestorsSql,
+} from "../../../../server/services/outline/store/postgres-history";
 import { createPostgresOutlineStore } from "../../../../server/services/outline/store/postgres-store";
 import { withPostgres } from "../../../db/pg-test-harness";
 import { migrationSql } from "../read/pg-parity-matrix";
@@ -274,4 +279,180 @@ describe("PostgreSQL outline store", () => {
 		},
 		RUN_TIMEOUT_MS,
 	);
+
+	it(
+		"reads by placement keep their join order on analyzed data (plan guard)",
+		async () => {
+			const sqls = await migrationSql();
+			const outcome = await withPostgres(async ({ exec, port, credentials }) => {
+				for (const statement of sqls) {
+					const applied = await exec(statement);
+					if (applied.code !== 0) return { error: applied.stderr.slice(0, 400) };
+				}
+				// 200 top-level blocks with 500 children each, five versions a block; analyzed, so the
+				// planner chooses from real statistics (on empty tables everything is a scan).
+				const seeded = await exec(`
+					INSERT INTO outline_spaces (id, key, kind, next_seq, created_at, edges_ready)
+						VALUES ('plan-space', 'plan', 'personal', 6, '2026-11-14T00:00:00.000Z', true);
+					INSERT INTO outline_commits (id, space_id, seq, kind, actor_kind, actor_id, created_at, summary)
+						VALUES ('plan-commit', 'plan-space', 1, 'edit', 'human', 'u', '2026-11-14T00:00:00.000Z', 's');
+					INSERT INTO outline_blocks (id, space_id, sid, parent_id, page_id, order_key, content,
+						content_hash, author_kind, author_id, version_seq)
+					SELECT 'top' || g, 'plan-space', 'st' || g, NULL, 'top' || g, 'a' || lpad(g::text, 6, '0'),
+						'text', 'h', 'human', 'u', 5 FROM generate_series(1, 200) g;
+					INSERT INTO outline_blocks (id, space_id, sid, parent_id, page_id, order_key, content,
+						content_hash, author_kind, author_id, version_seq)
+					SELECT 'kid' || g, 'plan-space', 'sk' || g, 'top' || (1 + g % 200), 'top' || (1 + g % 200),
+						'a' || lpad(g::text, 6, '0'), 'text', 'h', 'human', 'u', 5
+					FROM generate_series(1, 100000) g;
+					INSERT INTO outline_block_versions (block_id, from_seq, to_seq, commit_id, page_id,
+						parent_id, order_key, content, content_hash, change_flags, deleted)
+					SELECT b.id, v, CASE WHEN v = 5 THEN NULL ELSE v + 1 END, 'plan-commit', b.page_id,
+						b.parent_id, b.order_key, 'text', 'h', 2, false
+					FROM outline_blocks b, generate_series(1, 5) v WHERE b.space_id = 'plan-space';
+					INSERT INTO outline_block_edges (parent_key, block_id, from_seq, to_seq, order_key)
+					SELECT COALESCE(parent_id, space_id), id, 1, NULL, order_key
+					FROM outline_blocks WHERE space_id = 'plan-space';
+					ANALYZE outline_blocks; ANALYZE outline_block_versions; ANALYZE outline_block_edges;
+				`);
+				if (seeded.code !== 0) return { error: seeded.stderr.slice(0, 400) };
+				const client = createPostgresClient({
+					driver: "bun-sql",
+					url: urlFor(port, credentials),
+					max: 2,
+					connectTimeout: 10,
+				});
+				try {
+					const planOf = async (statement: SQL) => {
+						const rows = (await client.db.execute(
+							sql`EXPLAIN (FORMAT JSON) ${statement}`,
+						)) as unknown as Array<Record<string, unknown>>;
+						const raw = Object.values(rows[0] ?? {})[0];
+						const parsed = (typeof raw === "string" ? JSON.parse(raw) : raw) as Array<{
+							Plan: PlanNode;
+						}>;
+						const nodes: PlanNode[] = [];
+						const walk = (node: PlanNode) => {
+							nodes.push(node);
+							for (const child of node.Plans ?? []) walk(child);
+						};
+						walk((parsed[0] as { Plan: PlanNode }).Plan);
+						return nodes;
+					};
+					const store = createPostgresOutlineStore(client.db);
+					const twenty = Array.from({ length: 20 }, (_, i) => `top${i + 1}`);
+					const level = await store.listLevel("plan-space", "top7", { asOf: 3, limit: 50 });
+					const subtree = await store.listSubtreeAt("plan-space", "top7", {
+						asOf: 3,
+						limit: 800,
+					});
+					// Printed only: what a screen costs over a pooled local connection.
+					const timings: string[] = [];
+					const time = async (name: string, fn: () => Promise<unknown>) => {
+						for (let i = 0; i < 3; i++) await fn();
+						const samples: number[] = [];
+						for (let i = 0; i < 30; i++) {
+							const started = performance.now();
+							await fn();
+							samples.push(performance.now() - started);
+						}
+						samples.sort((a, b) => a - b);
+						timings.push(
+							`  ${name}: ${(samples[15] as number).toFixed(2)} / ${(samples[28] as number).toFixed(2)} ms`,
+						);
+					};
+					await time("level as of a seq, 50 of 500 children", () =>
+						store.listLevel("plan-space", "top7", { asOf: 3, limit: 50 }),
+					);
+					await time("level now, 50 of 500 children", () =>
+						store.listLevel("plan-space", "top7", { asOf: null, limit: 50 }),
+					);
+					await time("subtree as of a seq, 800 of the whole space", () =>
+						store.listSubtreeAt("plan-space", null, { asOf: 3, limit: 800 }),
+					);
+					await time("subtree now, 800 of the whole space", () =>
+						store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 }),
+					);
+					await time("levels as of a seq, 20 parents, 800 rows", () =>
+						store.listLevels("plan-space", twenty, { asOf: 3, limit: 800 }),
+					);
+					return {
+						timings,
+						level: await planOf(pgLevelAsOf("plan-space", ["top7"], 3, null, 51)),
+						levels: await planOf(pgLevelAsOf("plan-space", twenty, 3, null, 801)),
+						now: await planOf(pgLevelNow("plan-space", twenty, null, 801)),
+						marks: await planOf(pgMarkAncestorsSql(["kid1", "kid2", "kid3"], 7, 4001)),
+						subtreeNow: (await store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 }))
+							.rows.length,
+						levelRows: level.rows.length,
+						levelNext: level.next !== null,
+						subtreeRows: subtree.rows.length,
+					};
+				} finally {
+					await client.close();
+				}
+			});
+			if (!outcome || typeof outcome !== "object" || !("level" in outcome)) {
+				throw new Error(`PostgreSQL harness did not run: ${JSON.stringify(outcome)}`);
+			}
+			expect(outcome.levelRows).toBe(50);
+			expect(outcome.levelNext).toBe(true);
+			expect(outcome.subtreeRows).toBe(500);
+			console.log(
+				`[outline history timings, PostgreSQL, 100,200 blocks] p50 / p95\n${outcome.timings.join("\n")}`,
+			);
+			expect(outcome.subtreeNow).toBe(800);
+			// A commit's walk up the parents: one primary-key probe a step, the blocks never scanned.
+			const up = outcome.marks.filter((n) => n["Relation Name"] === "outline_blocks");
+			expect(up.length).toBeGreaterThan(0);
+			for (const node of up) {
+				expect(node["Node Type"]).toMatch(/^(Index (Only )?Scan|Bitmap Heap Scan)$/);
+				if (node["Index Name"]) expect(node["Index Name"]).toBe("outline_blocks_pkey");
+			}
+			// Now: the children index by parent, the blocks never scanned whole.
+			const nowBlocks = outcome.now.filter((n) => n["Relation Name"] === "outline_blocks");
+			expect(nowBlocks.length).toBeGreaterThan(0);
+			for (const node of nowBlocks) {
+				expect(node["Node Type"]).toMatch(/^Index (Only )?Scan$/);
+				expect(node["Index Name"]).toBe("idx_outline_blocks_children");
+			}
+			for (const nodes of [outcome.level, outcome.levels]) {
+				const on = (relation: string) => nodes.filter((n) => n["Relation Name"] === relation);
+				// The placements are found by parent on their primary key, never scanned whole.
+				const edges = on("outline_block_edges");
+				expect(edges.length).toBeGreaterThan(0);
+				// Nor are the blocks: each is fetched by primary key.
+				for (const node of on("outline_blocks")) {
+					expect(node["Node Type"]).toMatch(/^Index (Only )?Scan$/);
+					expect(node["Index Name"]).toBe("outline_blocks_pkey");
+				}
+				for (const node of edges) {
+					expect(node["Node Type"]).not.toBe("Seq Scan");
+					expect(String(node["Index Cond"] ?? node["Recheck Cond"] ?? "")).toContain("parent_key");
+				}
+				// The version of each block is one backward seek on the versions' primary key, inside
+				// the lateral's LIMIT: the versions are never the driving side.
+				const versions = on("outline_block_versions");
+				expect(versions.length).toBeGreaterThan(0);
+				for (const node of versions) {
+					expect(node["Node Type"]).toMatch(/^Index (Only )?Scan$/);
+					expect(node["Index Name"]).toBe("outline_block_versions_block_id_from_seq_pk");
+					expect(node["Scan Direction"]).toBe("Backward");
+					expect(String(node["Index Cond"])).toContain("block_id");
+				}
+			}
+		},
+		RUN_TIMEOUT_MS,
+	);
 });
+
+/** A node of `EXPLAIN (FORMAT JSON)`. */
+interface PlanNode {
+	"Node Type": string;
+	"Relation Name"?: string;
+	"Index Name"?: string;
+	"Index Cond"?: string;
+	"Recheck Cond"?: string;
+	"Scan Direction"?: string;
+	Plans?: PlanNode[];
+}

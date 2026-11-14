@@ -6004,7 +6004,7 @@ export const outlineBlockVersions = sqliteTable(
  * older than the table: it holds from before the space's history floor.
  *
  * A plain rowid table: drizzle-orm has no `WITHOUT ROWID`, so the primary key is a separate
- * index (measured in `store/__tests__/history-size.test.ts`).
+ * index (measured in `services/outline/__tests__/history-plan.guard.test.ts`).
  */
 export const outlineBlockEdges = sqliteTable(
 	"outline_block_edges",

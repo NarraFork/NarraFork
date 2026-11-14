@@ -32,7 +32,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
-import { db, sqlite } from "../../../db";
+import { db } from "../../../db";
 import {
 	narrators,
 	outlineBlocks,
@@ -99,7 +99,7 @@ import {
 	writesAsExpected,
 } from "./port";
 import { sqliteOutlineDigests } from "./sqlite-digest";
-import { createSqliteOutlineHistory } from "./sqlite-history";
+import { SQLITE_IDS_SLOT, sqliteMarkAncestorsSql, sqliteOutlineHistory } from "./sqlite-history";
 import { sqliteOutlineReads } from "./sqlite-read";
 
 /**
@@ -315,29 +315,18 @@ function idList(ids: readonly string[]): SQL {
 
 /**
  * Mark every ancestor of `ids` as the tree is at this point of the section (called before the
- * commit's block changes and again after them), each `(ancestor, seq)` once. The walk goes up
- * the blocks' parent column by primary key (the join order pinned), whether or not a block on
- * the way is deleted. Ancestors marked already are left out before the limit, which is one past
- * what is left of the commit's allowance; returns how many rows it added.
+ * commit's block changes and again after them), each `(ancestor, seq)` once, whether or not a
+ * block on the way up is deleted (the statement is `sqliteMarkAncestorsSql`). Ancestors marked
+ * already are left out before the limit, which is one past what is left of the commit's
+ * allowance; returns how many rows it added.
  */
 function markAncestors(tx: Tx, ids: readonly string[], seq: number, room: number): number {
 	let added = 0;
 	for (const chunk of chunked(ids)) {
-		added += tx.all(sql`
-			WITH RECURSIVE up(id) AS (
-				SELECT parent_id FROM outline_blocks
-				WHERE id IN (${idList(chunk)}) AND parent_id IS NOT NULL
-				UNION
-				SELECT b.parent_id FROM up CROSS JOIN outline_blocks b
-					ON b.id = up.id WHERE b.parent_id IS NOT NULL
-			)
-			INSERT INTO outline_subtree_changes (ancestor_id, seq)
-			SELECT up.id, ${seq} FROM up
-			WHERE NOT EXISTS (SELECT 1 FROM outline_subtree_changes m
-				WHERE m.ancestor_id = up.id AND m.seq = ${seq})
-			LIMIT ${room - added + 1}
-			RETURNING 1
-		`).length;
+		const [head, tail] = sqliteMarkAncestorsSql(seq, room - added + 1).split(SQLITE_IDS_SLOT);
+		added += tx.all(
+			sql`${sql.raw(head as string)}${idList(chunk)}${sql.raw(tail as string)}`,
+		).length;
 		if (added > room) break;
 	}
 	return added;
@@ -676,7 +665,7 @@ export const sqliteOutlineStore: OutlineStore = {
 	backendId: "sqlite",
 	...sqliteOutlineReads,
 	...sqliteOutlineDigests,
-	...createSqliteOutlineHistory(() => sqlite),
+	...sqliteOutlineHistory,
 
 	async ensureSpace(scope, now) {
 		for (let attempt = 0; attempt < SPACE_KEY_ATTEMPTS; attempt++) {
