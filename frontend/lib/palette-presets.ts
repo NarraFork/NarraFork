@@ -155,29 +155,29 @@ const ACCENT_STEPS: ReadonlyArray<{ L: number; C: number }> = [
 
 /** Literal palette, so `default` is byte-identical to `tokens.css`. */
 const DEFAULT_INK: Record<string, string> = {
-	"ink-980": "#08090f",
-	"ink-990": "#05070a",
-	"ink-950": "#0b0e14",
-	"ink-900": "#191d26",
-	"ink-850": "#22262f",
-	"ink-800": "#2c3240",
-	"ink-700": "#39404f",
-	"ink-600": "#657086",
-	"ink-300": "#8a93a5",
-	"ink-200": "#b7bfce",
-	"ink-100": "#e7ebf3",
+	"ink-980": "#0d0d0f",
+	"ink-990": "#09090b",
+	"ink-950": "#111113",
+	"ink-900": "#212225",
+	"ink-850": "#272a2d",
+	"ink-800": "#2e3135",
+	"ink-700": "#363a3f",
+	"ink-600": "#6e7681",
+	"ink-300": "#b0b4ba",
+	"ink-200": "#c3c6cc",
+	"ink-100": "#edeef0",
 };
 
 const DEFAULT_PAPER: Record<string, string> = {
-	"paper-50": "#f6f7f9",
-	"paper-0": "#ffffff",
-	"paper-100": "#eef1f5",
-	"paper-200": "#e6eaf1",
-	"paper-300": "#d8dee8",
-	"paper-500": "#7e8a9e",
-	"paper-600": "#5e6878",
-	"paper-700": "#414a5a",
-	"paper-900": "#141821",
+	"paper-50": "#f0f0f3",
+	"paper-0": "#fcfcfd",
+	"paper-100": "#e8e8ec",
+	"paper-200": "#e0e1e6",
+	"paper-300": "#d9d9e0",
+	"paper-500": "#6f7480",
+	"paper-600": "#60646c",
+	"paper-700": "#3c4048",
+	"paper-900": "#1c2024",
 };
 
 const DEFAULT_ACCENT: readonly string[] = [
@@ -283,14 +283,25 @@ export type NeutralPresetId =
 	| "tokyo"
 	| "warm"
 	| "forest"
-	| "contrast";
+	| "contrast"
+	| "classic"
+	| "github"
+	| "catppuccin";
 
 export interface NeutralPreset {
 	id: NeutralPresetId;
-	/** Hue in OKLCH degrees. */
+	/** Hue in OKLCH degrees. Ignored when `literal` is present. */
 	hue: number;
-	/** Multiplier on the measured chroma; 0 gives a pure grey. */
+	/** Multiplier on the measured chroma; 0 gives a pure grey. Ignored with `literal`. */
 	chroma: number;
+	/**
+	 * A hand-tuned ladder taken from an established design system. Used verbatim so the
+	 * product looks like the reference rather than an approximation of it. Values were
+	 * checked against the same contrast floors as the generated palettes — the two
+	 * exceptions are documented at the preset (border weights were raised to reach 3:1,
+	 * because Radix and Catppuccin ship deliberately faint borders).
+	 */
+	literal?: { ink: Record<string, string>; paper: Record<string, string> };
 }
 
 export const NEUTRAL_PRESETS: ReadonlyArray<NeutralPreset> = [
@@ -301,6 +312,105 @@ export const NEUTRAL_PRESETS: ReadonlyArray<NeutralPreset> = [
 	{ id: "warm", hue: 70, chroma: 1.1 },
 	{ id: "forest", hue: 160, chroma: 1.1 },
 	{ id: "contrast", hue: 264, chroma: 0.9 },
+	{
+		id: "classic",
+		hue: 264,
+		chroma: 1,
+		/** The blue-black default before the Radix-based palette landed. Kept so the previous look stays one click away. */
+		literal: {
+			ink: {
+				"ink-950": "#0b0e14",
+				"ink-900": "#191d26",
+				"ink-850": "#22262f",
+				"ink-800": "#2c3240",
+				"ink-700": "#39404f",
+				"ink-600": "#657086",
+				"ink-300": "#8a93a5",
+				"ink-200": "#b7bfce",
+				"ink-100": "#e7ebf3",
+			},
+			paper: {
+				"paper-50": "#f6f7f9",
+				"paper-0": "#ffffff",
+				"paper-100": "#eef1f5",
+				"paper-200": "#e6eaf1",
+				"paper-300": "#d8dee8",
+				"paper-500": "#7e8a9e",
+				"paper-600": "#5e6878",
+				"paper-700": "#414a5a",
+				"paper-900": "#141821",
+			},
+		},
+	},
+	{
+		id: "github",
+		hue: 220,
+		chroma: 0.5,
+		/**
+		 * GitHub Primer dark / light. Two deliberate changes: the canvas is one step darker
+		 * (1.09 → 1.12) so panels clear the separation floor, and the border moved from
+		 * #30363d to an accessible 3.77:1. Everything else is Primer verbatim.
+		 */
+		literal: {
+			ink: {
+				"ink-950": "#0a0d12",
+				"ink-900": "#161b22",
+				"ink-850": "#21262d",
+				"ink-800": "#262c35",
+				"ink-700": "#30363d",
+				"ink-600": "#6e7681",
+				"ink-300": "#8b949e",
+				"ink-200": "#c9d1d9",
+				"ink-100": "#e6edf3",
+			},
+			paper: {
+				"paper-50": "#f6f8fa",
+				"paper-0": "#ffffff",
+				"paper-100": "#eaeef2",
+				"paper-200": "#e1e4e8",
+				"paper-300": "#d0d7de",
+				"paper-500": "#8c959f",
+				"paper-600": "#59636e",
+				"paper-700": "#424a53",
+				"paper-900": "#1f2328",
+			},
+		},
+	},
+	{
+		id: "catppuccin",
+		hue: 260,
+		chroma: 0.6,
+		/**
+		 * Catppuccin Mocha / Latte. Canvas nudged one step darker (1.07 → 1.12) and the
+		 * overlay/rule split apart so the ladder stays monotonic. Latte's text ramp misses AA on its own surface
+		 * (`subtext0` is 4.37:1), so muted/secondary/text were shifted one step darker;
+		 * the border likewise raised to 3.31:1.
+		 */
+		literal: {
+			ink: {
+				"ink-950": "#0a0a12",
+				"ink-900": "#181825",
+				"ink-850": "#1e1e2e",
+				"ink-800": "#26263a",
+				"ink-700": "#313244",
+				"ink-600": "#6c7086",
+				"ink-300": "#7f849c",
+				"ink-200": "#a6adc8",
+				"ink-100": "#cdd6f4",
+			},
+			paper: {
+				"paper-50": "#e6e9ef",
+				"paper-0": "#eff1f5",
+				"paper-100": "#dce0e8",
+				"paper-200": "#ccd0da",
+				"paper-300": "#bcc0cc",
+				"paper-500": "#7b83a1",
+				"paper-600": "#5c5f77",
+				"paper-700": "#4c4f69",
+				"paper-900": "#363a52",
+			},
+		},
+	},
 ];
 
 export type AccentPresetId = "indigo" | "blue" | "teal" | "green" | "amber" | "violet" | "rose";

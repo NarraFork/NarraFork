@@ -3084,5 +3084,8 @@
 	"paletteAccentGreen": "Green",
 	"paletteAccentAmber": "Amber",
 	"paletteAccentViolet": "Violet",
-	"paletteAccentRose": "Rose"
+	"paletteAccentRose": "Rose",
+	"palettePresetGithub": "GitHub",
+	"palettePresetCatppuccin": "Catppuccin",
+	"palettePresetClassic": "Classic"
 }

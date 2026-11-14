@@ -3084,5 +3084,8 @@
 	"paletteAccentGreen": "绿",
 	"paletteAccentAmber": "琥珀",
 	"paletteAccentViolet": "紫",
-	"paletteAccentRose": "玫红"
+	"paletteAccentRose": "玫红",
+	"palettePresetGithub": "GitHub",
+	"palettePresetCatppuccin": "Catppuccin",
+	"palettePresetClassic": "经典蓝黑"
 }

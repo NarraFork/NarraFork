@@ -29,6 +29,9 @@ const NEUTRAL_LABEL: Record<NeutralPresetId, string> = {
 	warm: "palettePresetWarm",
 	forest: "palettePresetForest",
 	contrast: "palettePresetContrast",
+	classic: "palettePresetClassic",
+	github: "palettePresetGithub",
+	catppuccin: "palettePresetCatppuccin",
 };
 
 const ACCENT_LABEL: Record<AccentPresetId, string> = {

@@ -72,23 +72,23 @@ export const mantineTheme = createTheme({
 		 * as a different material. Saturation is kept around 4–6% so it never competes
 		 * with the indigo primary.
 		 *
-		 * Slot 4 is deliberately 3.39:1 against slot 6 — Mantine reuses one variable for
+		 * Slot 4 is deliberately 3.46:1 against slot 6 — Mantine reuses one variable for
 		 * both decorative card borders and input boundaries, so the accessible choice
 		 * (WCAG 1.4.11 wants ≥3:1 for control boundaries) is also the one that outlines
 		 * cards a little more than before. If that turns out too heavy in practice, the
 		 * knob is this one entry.
 		 */
 		dark: [
-			"#e7ebf3",
-			"#c3cad8",
-			"#8a93a5",
-			"#79839a",
-			"#657086",
-			"#2c3240",
-			"#191d26",
-			"#0b0e14",
-			"#08090f",
-			"#05070a",
+			"#edeef0",
+			"#c3c6cc",
+			"#b0b4ba",
+			"#9aa0a8",
+			"#6e7681",
+			"#2e3135",
+			"#212225",
+			"#111113",
+			"#0d0d0f",
+			"#09090b",
 		],
 	},
 	components: {

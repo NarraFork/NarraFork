@@ -43,26 +43,26 @@
 
 :root {
 	/* ---- palette: dark ink (blue-cast neutral, not grey) ---- */
-	--nf-ink-950: #0b0e14;
-	--nf-ink-900: #191d26;
-	--nf-ink-850: #22262f;
-	--nf-ink-800: #2c3240;
-	--nf-ink-700: #39404f;
-	--nf-ink-600: #657086;
-	--nf-ink-300: #8a93a5;
-	--nf-ink-200: #b7bfce;
-	--nf-ink-100: #e7ebf3;
+	--nf-ink-950: #111113;
+	--nf-ink-900: #212225;
+	--nf-ink-850: #272a2d;
+	--nf-ink-800: #2e3135;
+	--nf-ink-700: #363a3f;
+	--nf-ink-600: #6e7681;
+	--nf-ink-300: #b0b4ba;
+	--nf-ink-200: #c3c6cc;
+	--nf-ink-100: #edeef0;
 
 	/* ---- palette: light paper ---- */
-	--nf-paper-50: #f6f7f9;
-	--nf-paper-0: #ffffff;
-	--nf-paper-100: #eef1f5;
-	--nf-paper-200: #e6eaf1;
-	--nf-paper-300: #d8dee8;
-	--nf-paper-500: #7e8a9e;
-	--nf-paper-600: #5e6878;
-	--nf-paper-700: #414a5a;
-	--nf-paper-900: #141821;
+	--nf-paper-50: #f0f0f3;
+	--nf-paper-0: #fcfcfd;
+	--nf-paper-100: #e8e8ec;
+	--nf-paper-200: #e0e1e6;
+	--nf-paper-300: #d9d9e0;
+	--nf-paper-500: #6f7480;
+	--nf-paper-600: #60646c;
+	--nf-paper-700: #3c4048;
+	--nf-paper-900: #1c2024;
 
 	/*
 	 * Action: what the user can do (primary buttons, focus, current selection).

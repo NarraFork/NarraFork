@@ -16,9 +16,9 @@ const HEX = /^#[0-9a-f]{6}$/;
 describe("palette presets", () => {
 	test("default is the literal token palette", () => {
 		const { ink, paper, accent } = resolvePalette(DEFAULT_PALETTE);
-		expect(ink["ink-950"]).toBe("#0b0e14");
-		expect(ink["ink-900"]).toBe("#191d26");
-		expect(paper["paper-50"]).toBe("#f6f7f9");
+		expect(ink["ink-950"]).toBe("#111113");
+		expect(ink["ink-900"]).toBe("#212225");
+		expect(paper["paper-50"]).toBe("#f0f0f3");
 		expect(accent[6]).toBe("#4c6ef5");
 	});
 

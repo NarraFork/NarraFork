@@ -218,3 +218,21 @@ P1 就能满足「几个预设 + 自己设置」的大部分诉求，P3 是很�
 - `bun test --isolate frontend/lib/palette-presets.test.ts`：7 项，380 断言（7 套预设 × 对比度门槛、12 种色相的自定义、极端输入 #000/#fff/#ff0、解析容错、OKLCH 往返）
 - headless Chrome 实测：预设 `tokyo` + 强调色 `teal` → `--nf-ink-950=#0c0d17`、`--mantine-color-dark-7` 同步、`--mantine-primary-color-filled=#107a7a`、按钮实际渲染 `rgb(16,122,122)`；恢复默认后全部回滚
 - `check:tokens` 通过；biome 0 error / 551 warning；tsgo 仅剩既有 1 个 vscode 错误
+
+### 10.1 默认调色板换成 Radix Slate（2026-11）
+
+反馈「默认色不好看」后，调研了三个有对比度体系支撑的方案并全部做成预设：
+
+| 来源 | 特点 | 落点 |
+|---|---|---|
+| **Radix Colors**（slate） | 12 阶语义化、专为 UI 设计、对比度经过验证 | **成为新默认** |
+| GitHub Primer | 开发者最眼熟，面板层次偏克制 | 预设 `github` |
+| Catppuccin（Mocha / Latte） | 社区流行，柔和 | 预设 `catppuccin` |
+
+采用的改动（不是照抄）：
+
+1. **边框换成可达 3:1 的权重**。Radix 第 7 阶在深色下只有 1.72:1，Catppuccin Latte 的边框 2.99:1、`subtext0` 4.37:1——直接照搬会踩我们自己的门槛，所以边框/文字各上调一档（Radix 3.46:1，Catppuccin 3.31:1 / 5.53:1）。
+2. **画布压暗一档**。GitHub（1.09:1）和 Catppuccin（1.07:1）的面板与画布太接近，按我们的「面板要浮起来」标准压到 1.12:1。
+3. 旧配色保留为预设 `classic`，一键切回。
+
+新默认的关键数值（相对面板 `#212225`）：正文 13.70:1、元信息 7.64:1、控件边界 3.46:1、面板/画布 1.19:1。
