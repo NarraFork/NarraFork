@@ -43,7 +43,7 @@ import {
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
 import { extractSubagentToPrimary } from "./subagent-extract";
-import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
+import { snapshotPathIdentity, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { workspaceContextService } from "./workspace-context-service";
 import {
 	inspect,
@@ -136,7 +136,7 @@ beforeEach(async () => {
 	// Reset only this isolated test's compatibility lifetime, including invalid old fixtures.
 	sqlite.exec(`DELETE FROM resource_protection_paths WHERE source = 'receipt';
 		DELETE FROM resource_protection_sources WHERE source = 'receipt' AND source_id != ''`);
-	temporary = await mkdtemp(join(tmpdir(), "nf-lifecycle-guard-"));
+	temporary = await realpath(await mkdtemp(join(tmpdir(), "nf-lifecycle-guard-")));
 	path = join(temporary, ".worktrees", "legacy-Ab1234");
 	const home = join(temporary, "home");
 	await mkdir(path, { recursive: true });
@@ -163,7 +163,9 @@ beforeEach(async () => {
 afterEach(async () => {
 	mock.restore();
 	writeClaimCache.clearClaims(path);
-	await db.delete(worktreeTreeSnapshots).where(eq(worktreeTreeSnapshots.worktreePath, path));
+	await db
+		.delete(worktreeTreeSnapshots)
+		.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(path)));
 	await db
 		.delete(narratorWorktreeResources)
 		.where(eq(narratorWorktreeResources.repositoryKey, "fixture-repository"));
@@ -386,7 +388,7 @@ for (const cwd of [0, false, "", [], {}]) {
 for (const gitPathNull of [false, true]) {
 	for (const state of ["ready", "preparing", "unknown"] as const) {
 		test(`project scope protects ${state} external/different-repo owner-deleted resources with gitPath ${gitPathNull ? "NULL" : "present"}`, async () => {
-			const external = await mkdtemp(join(tmpdir(), "nf-lifecycle-external-"));
+			const external = await realpath(await mkdtemp(join(tmpdir(), "nf-lifecycle-external-")));
 			otherRoots.push(external);
 			const binary = Buffer.from([0, 255, 128, 13, 10, 0, 42]);
 			await writeFile(join(external, "marker.bin"), binary);
@@ -551,7 +553,7 @@ test("project deletion does not claim unrelated same-repository resources or dep
 		timeout: 5000,
 		maxOutputBytes: 2048,
 	});
-	const foreign = await mkdtemp(join(tmpdir(), "nf-git-poison-"));
+	const foreign = await realpath(await mkdtemp(join(tmpdir(), "nf-git-poison-")));
 	otherRoots.push(foreign);
 	await spawn.safeSpawn({
 		cmd: ["git", "-C", foreign, "init"],
@@ -717,14 +719,19 @@ for (const malformed of [
 async function shadowBirthFixture() {
 	const dir = treeSnapshotPhysicalDir("local", path);
 	const home = process.env.NARRAFORK_HOME;
-	if (process.env.NARRAFORK_TEST !== "1" || !home || !dir.startsWith(`${home}/`))
+	if (
+		process.env.NARRAFORK_TEST !== "1" ||
+		!home ||
+		localPathSemantics.equals(home, dir) ||
+		!localPathSemantics.contains(home, dir)
+	)
 		throw new Error("Shadow birth fixture escaped isolated home");
 	expect(fs.existsSync(dir)).toBe(false);
 	otherRoots.push(dir);
 	await db.insert(worktreeTreeSnapshots).values({
 		id: generateId(),
 		deviceId: "local",
-		worktreePath: path,
+		worktreePath: snapshotPathIdentity(path),
 		treeHash: "a".repeat(40),
 		createdAt: new Date().toISOString(),
 	});
@@ -745,7 +752,7 @@ async function shadowBirthFixture() {
 		const hashes = db
 			.select({ hash: worktreeTreeSnapshots.treeHash })
 			.from(worktreeTreeSnapshots)
-			.where(eq(worktreeTreeSnapshots.worktreePath, path))
+			.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(path)))
 			.all()
 			.map((row) => row.hash);
 		expect(hashes).toContain("a".repeat(40));

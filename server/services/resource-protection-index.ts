@@ -214,11 +214,22 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				throw new Error("Legacy claim device is unverifiable");
 		for (const path of [row.cwd, contextCwd])
 			if (path !== null && !validText(path)) throw new Error("Legacy claim cwd is unverifiable");
-		// A committed context names the execution device; cwd/default_device_id also
-		// describe that device, not a second local workspace. Absolute POSIX syntax
-		// says nothing about ownership. Pre-context rows retain the explicit default
-		// device, with null meaning local under the genuine legacy contract.
+		if (contextCwd && !contextDevice && row.default_device_id && row.default_device_id !== "local")
+			throw new Error("Legacy context device is unverifiable");
 		const deviceId = contextDevice ?? row.default_device_id ?? "local";
+		// Modern switches commit cwd/context together. The older SwitchDevice left
+		// an absolute host cwd untouched while committing a different remote context;
+		// require that inconsistent pair AND matching explicit remote devices before
+		// retaining its local owner. Absolute syntax alone never proves local ownership.
+		const legacyHostCwd =
+			row.cwd !== null &&
+			isAbsolute(row.cwd) &&
+			contextCwd !== null &&
+			row.cwd !== contextCwd &&
+			contextDevice !== null &&
+			contextDevice !== "local" &&
+			row.default_device_id === contextDevice;
+		const rawDevice = legacyHostCwd ? "local" : deviceId;
 		const base = {
 			kind: "narrator" as const,
 			id: row.id,
@@ -228,8 +239,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		if (row.cwd)
 			claims.push({
 				...base,
-				path: deviceId === "local" ? localPathSemantics.resolve(process.cwd(), row.cwd) : row.cwd,
-				deviceId,
+				path: rawDevice === "local" ? localPathSemantics.resolve(process.cwd(), row.cwd) : row.cwd,
+				deviceId: rawDevice,
 			});
 		if (contextCwd) {
 			const repositoryKey = context?.git?.repositoryKey;

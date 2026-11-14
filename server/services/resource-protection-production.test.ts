@@ -1,8 +1,8 @@
 import { expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { narrators, worktreeTreeSnapshots } from "../db/schema";
@@ -11,12 +11,12 @@ import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { FileWorktreeJournal, type WorktreeJournalRecord } from "./narrator-worktree-journal";
 import * as protectionIndex from "./resource-protection-index";
-import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
+import { snapshotPathIdentity, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 test("production cold snapshot survives history beyond the former global inventory budget", async () => {
 	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Isolated database required");
-	const root = await mkdtemp(join(tmpdir(), "nf-protection-scale-"));
+	const root = await realpath(await mkdtemp(join(tmpdir(), "nf-protection-scale-")));
 	const ids: string[] = [];
 	try {
 		await writeFile(join(root, "marker.txt"), "snapshot must remain available\n");
@@ -41,7 +41,7 @@ test("production cold snapshot survives history beyond the former global invento
 			await db.insert(narrators).values({
 				id,
 				title: "root cwd is a reference, not exclusive cache ownership",
-				cwd: "/",
+				cwd: deviceId === "local" ? parse(root).root : "/",
 				defaultDeviceId: deviceId,
 				createdAt: new Date().toISOString(),
 				updatedAt: new Date().toISOString(),
@@ -87,7 +87,7 @@ test("production cold snapshot survives history beyond the former global invento
 				await db
 					.select()
 					.from(worktreeTreeSnapshots)
-					.where(eq(worktreeTreeSnapshots.worktreePath, root)),
+					.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(root))),
 			).toHaveLength(1);
 		} finally {
 			readClaims.mockRestore();
@@ -95,7 +95,9 @@ test("production cold snapshot survives history beyond the former global invento
 	} finally {
 		for (let offset = 0; offset < ids.length; offset += 50)
 			await db.delete(narrators).where(inArray(narrators.id, ids.slice(offset, offset + 50)));
-		await db.delete(worktreeTreeSnapshots).where(eq(worktreeTreeSnapshots.worktreePath, root));
+		await db
+			.delete(worktreeTreeSnapshots)
+			.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(root)));
 		await rm(treeSnapshotPhysicalDir("local", root), { recursive: true, force: true });
 		await rm(root, { recursive: true, force: true });
 	}
@@ -131,7 +133,7 @@ test("production journal handles idempotency and results without writing resourc
 		},
 	};
 	const before = sqlite.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n;
-	const snapshotRoot = await mkdtemp(join(tmpdir(), "nf-journal-cold-snapshot-"));
+	const snapshotRoot = await realpath(await mkdtemp(join(tmpdir(), "nf-journal-cold-snapshot-")));
 	try {
 		expect((await journal.claim(narratorId, requestId, record)).fresh).toBe(true);
 		await expect(
@@ -183,7 +185,7 @@ test("production journal handles idempotency and results without writing resourc
 	} finally {
 		await db
 			.delete(worktreeTreeSnapshots)
-			.where(eq(worktreeTreeSnapshots.worktreePath, snapshotRoot));
+			.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(snapshotRoot)));
 		await rm(treeSnapshotPhysicalDir("local", snapshotRoot), { recursive: true, force: true });
 		await rm(snapshotRoot, { recursive: true, force: true });
 		await rm(filePath, { force: true });
@@ -192,7 +194,7 @@ test("production journal handles idempotency and results without writing resourc
 });
 
 test("current journal replays legacy requests but never rewrites the legacy namespace", async () => {
-	const root = await mkdtemp(join(tmpdir(), "nf-journal-upgrade-"));
+	const root = await realpath(await mkdtemp(join(tmpdir(), "nf-journal-upgrade-")));
 	const legacy = new FileWorktreeJournal(join(root, "legacy"));
 	const current = new FileWorktreeJournal(join(root, "current"), join(root, "legacy"));
 	const record: WorktreeJournalRecord = {
@@ -252,7 +254,7 @@ test("current journal replays legacy requests but never rewrites the legacy name
 });
 
 test("real startup resumes legacy import after a process exits without manual maintenance", async () => {
-	const root = await mkdtemp(join(tmpdir(), "nf-protection-startup-"));
+	const root = await realpath(await mkdtemp(join(tmpdir(), "nf-protection-startup-")));
 	const home = join(root, "home");
 	const directory = join(home, "worktree-requests");
 	await mkdir(directory, { recursive: true });
@@ -269,7 +271,7 @@ test("real startup resumes legacy import after a process exits without manual ma
 		}
 		const script = `
 			const { sqlite, markDatabaseCleanShutdown, releaseDatabaseInstanceLockOnly } = await import("./server/db/index.ts");
-			const { readProtectionClaims } = await import("./server/services/resource-protection-index.ts");
+			const { canonicalProtectionPath, readProtectionClaims } = await import("./server/services/resource-protection-index.ts");
 			const phase = process.env.PROTECTION_STARTUP_PHASE;
 			const deadline = Date.now() + 20000;
 			while (Date.now() < deadline) {
@@ -282,7 +284,8 @@ test("real startup resumes legacy import after a process exits without manual ma
 					process.exit(0);
 				}
 				if (phase === "resume" && progress.complete) {
-					const result = await readProtectionClaims([{ path: process.env.PROTECTION_STARTUP_TARGET }], performance.now() + 5000);
+					const target = await canonicalProtectionPath(process.env.PROTECTION_STARTUP_TARGET);
+					const result = await readProtectionClaims([{ path: target }], performance.now() + 5000);
 					let protectedTarget = false;
 					for await (const claim of result.claims) if (claim.kind === "receipt") protectedTarget = true;
 					console.log("STARTUP_RESULT " + JSON.stringify({ complete: result.complete, pins: pins.length, protectedTarget }));

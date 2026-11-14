@@ -15,6 +15,7 @@ on:
       - "server/services/worktree-tree-snapshot*.ts"
       - "server/services/snapshot-*.ts"
       - "server/services/narrator-tree-snapshot-hooks*.ts"
+      - "server/services/narrator-worktree-resources.test.ts"
       - "server/services/__tests__/subagent-tree-snapshot-hooks.test.ts"
       - "server/services/tool-edit-preview.ts"
       - "server/services/__tests__/tool-edit-preview.test.ts"
@@ -36,6 +37,7 @@ on:
       - "server/services/worktree-tree-snapshot*.ts"
       - "server/services/snapshot-*.ts"
       - "server/services/narrator-tree-snapshot-hooks*.ts"
+      - "server/services/narrator-worktree-resources.test.ts"
       - "server/services/__tests__/subagent-tree-snapshot-hooks.test.ts"
       - "server/services/tool-edit-preview.ts"
       - "server/services/__tests__/tool-edit-preview.test.ts"
@@ -83,6 +85,7 @@ jobs:
           server/services/tree-snapshot-paths.test.ts
           server/services/resource-protection-index.test.ts
           server/services/resource-protection-production.test.ts
+          server/services/narrator-worktree-resources.test.ts
           server/services/worktree-lifecycle-guard.test.ts
           server/services/worktree-lifecycle-guard.integration.test.ts
           server/services/worktree-tree-snapshot.test.ts

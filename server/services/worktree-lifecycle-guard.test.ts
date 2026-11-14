@@ -677,7 +677,7 @@ describe("same-process reservation and workspace admission", () => {
 		expect(() => assertWorkspaceAdmission(target)).not.toThrow();
 	}, 6000);
 	test("late registry/switch commit is rejected until retirement releases; retry succeeds", async () => {
-		const { guard } = fixture();
+		const { ports, guard } = fixture();
 		let enter!: () => void;
 		let release!: () => void;
 		const entered = new Promise<void>((resolve) => {
@@ -696,26 +696,28 @@ describe("same-process reservation and workspace admission", () => {
 			expect(() => assertWorkspaceAdmission({ path: "/real/worktree/nested" })).toThrow(
 				ResourceProtectionError,
 			);
-			await expect(withWorkspaceAdmission(target, register)).rejects.toBeInstanceOf(
-				ResourceProtectionError,
-			);
+			await expect(
+				withLifecycleGuardPorts(ports, () => withWorkspaceAdmission(target, register)),
+			).rejects.toBeInstanceOf(ResourceProtectionError);
 			expect(register).toHaveBeenCalledTimes(0);
 		} finally {
 			release();
 			await retirement;
 		}
-		await withWorkspaceAdmission(target, register);
+		await withLifecycleGuardPorts(ports, () => withWorkspaceAdmission(target, register));
 		expect(register).toHaveBeenCalledTimes(1);
 	});
 	test("claim commit in flight blocks retirement before durable registration exists", async () => {
-		const { guard } = fixture();
-		await withWorkspaceAdmission(target, async () => {
-			const destroy = mock(async () => undefined);
-			await expect(
-				guard.withProtectionReservation([target], "retire", destroy),
-			).rejects.toBeInstanceOf(ResourceProtectionError);
-			expect(destroy).toHaveBeenCalledTimes(0);
-		});
+		const { ports, guard } = fixture();
+		await withLifecycleGuardPorts(ports, () =>
+			withWorkspaceAdmission(target, async () => {
+				const destroy = mock(async () => undefined);
+				await expect(
+					guard.withProtectionReservation([target], "retire", destroy),
+				).rejects.toBeInstanceOf(ResourceProtectionError);
+				expect(destroy).toHaveBeenCalledTimes(0);
+			}),
+		);
 	});
 	test("nested sink reuses reservation without reentrant mutex deadlock", async () => {
 		const { guard } = fixture();

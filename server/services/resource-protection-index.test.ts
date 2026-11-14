@@ -34,15 +34,30 @@ const deadline = () => performance.now() + 15_000;
 function changes() {
 	return (database.query("SELECT total_changes() AS n").get() as { n: number }).n;
 }
-async function claims(
-	targets: LifecycleTarget[],
-	includeLegacyReceipts = true,
+async function collectClaims(
+	result: Awaited<ReturnType<typeof service.read>>,
 ): Promise<ResourceClaim[]> {
-	const result = await service.read(targets, deadline(), undefined, includeLegacyReceipts);
 	if (!result.complete) throw new Error("incomplete");
 	const resultClaims: ResourceClaim[] = [];
 	for await (const claim of result.claims) resultClaims.push(claim);
 	return resultClaims;
+}
+async function claims(
+	targets: LifecycleTarget[],
+	includeLegacyReceipts = true,
+): Promise<ResourceClaim[]> {
+	// The index consumes comparison identities already canonicalized by its guard.
+	const canonicalTargets = await Promise.all(
+		targets.map(async (target) => ({
+			...target,
+			...(target.path && (target.deviceId ?? "local") === "local"
+				? { path: await canonicalProtectionPath(target.path) }
+				: {}),
+		})),
+	);
+	return collectClaims(
+		await service.read(canonicalTargets, deadline(), undefined, includeLegacyReceipts),
+	);
 }
 async function bootstrap() {
 	for (let attempt = 0; attempt < 1000; attempt++) {
@@ -72,7 +87,7 @@ function receipt(destination: string): WorktreeJournalRecord {
 }
 
 beforeEach(async () => {
-	root = await mkdtemp(join(tmpdir(), "nf-protection-index-"));
+	root = await canonicalProtectionPath(await mkdtemp(join(tmpdir(), "nf-protection-index-")));
 	receipts = join(root, "worktree-requests");
 	database = new Database(":memory:");
 	database.exec(`
@@ -302,6 +317,45 @@ describe("resource protection reverse index", () => {
 		expect(remaining("resource_protection_sources")).toBe(0);
 		expect(await claims([{ path: old }])).toEqual([]);
 	});
+	test("guard-canonicalized parent aliases and native case identities reach fresh and clean claims without writes", async () => {
+		const physical = join(root, "Physical-Root");
+		const alias = join(root, "Visible-Alias");
+		await mkdir(physical);
+		await symlink(physical, alias, process.platform === "win32" ? "junction" : "dir");
+		const raw = join(alias, "Checkout");
+		await mkdir(raw);
+		narrator("parent-alias", raw);
+		const requested = process.platform === "win32" ? raw.toUpperCase() : raw;
+		const canonical = await canonicalProtectionPath(requested);
+		const read = spyOn(service, "read");
+		try {
+			const before = changes();
+			expect(
+				(await claims([{ path: requested }], false)).some(
+					(claim) => claim.id === "parent-alias" && claim.path === raw,
+				),
+			).toBe(true);
+			expect(read.mock.calls[0]?.[0]).toEqual([{ path: canonical }]);
+			expect(changes()).toBe(before);
+			await bootstrap();
+			const warm = changes();
+			expect(
+				(await claims([{ path: requested }])).some(
+					(claim) => claim.id === "parent-alias" && claim.path === raw,
+				),
+			).toBe(true);
+			expect(read.mock.calls.at(-1)?.[0]).toEqual([{ path: canonical }]);
+			expect(changes()).toBe(warm);
+			expect(
+				database
+					.query(`SELECT canonical_path, alias_sensitive FROM resource_protection_paths
+				WHERE source='narrator' AND source_id='parent-alias'`)
+					.get(),
+			).toEqual({ canonical_path: canonical, alias_sensitive: 1 });
+		} finally {
+			read.mockRestore();
+		}
+	});
 	test("warm known aliases are revalidated without maintenance writes", async () => {
 		const one = join(root, "one"),
 			two = join(root, "two"),
@@ -354,7 +408,7 @@ describe("resource protection reverse index", () => {
 	test("unrelated writes do not invalidate clear; index publication does", async () => {
 		narrator("n", root);
 		await bootstrap();
-		const unrelated = [{ path: join(root, "..", "unrelated") }];
+		const unrelated = [{ path: await canonicalProtectionPath(join(root, "..", "unrelated")) }];
 		const result = await service.read(unrelated, deadline());
 		database.query("UPDATE narrators SET title='chat only' WHERE id='n'").run();
 		const found: ResourceClaim[] = [];
@@ -556,22 +610,25 @@ describe("device ownership and native path identities", () => {
 				git: { repositoryKey: "remote-repository" },
 			});
 			database.query("UPDATE narrators SET workspace_revision=4 WHERE id='remote'").run();
+			const localTargets = [{ path: root }, { path: await canonicalProtectionPath(resolve("/")) }];
 			const realpath = spyOn(fs, "realpath").mockImplementation(async () => {
 				throw new Error("Remote cwd must not touch the host filesystem");
 			});
 			try {
 				const before = changes();
-				expect(await claims([{ path: root }], false)).toEqual([]);
-				expect(await claims([{ path: "/" }], false)).toEqual([]);
+				for (const target of localTargets)
+					expect(
+						await collectClaims(await service.read([target], deadline(), undefined, false)),
+					).toEqual([]);
+				const remote = await claims([{ deviceId: "remote-device", path }], false);
+				expect(remote.length).toBeGreaterThan(0);
 				expect(
-					(await claims([{ deviceId: "remote-device", path }], false)).every(
-						(claim) => claim.deviceId === "remote-device" && claim.revision === 4,
-					),
+					remote.every((claim) => claim.deviceId === "remote-device" && claim.revision === 4),
 				).toBe(true);
 				expect(changes()).toBe(before);
 				await bootstrap();
-				expect(await claims([{ path: root }])).toEqual([]);
-				expect(await claims([{ path: "/" }])).toEqual([]);
+				for (const target of localTargets)
+					expect(await collectClaims(await service.read([target], deadline()))).toEqual([]);
 				expect(
 					(await claims([{ deviceId: "remote-device", repositoryKey: "remote-repository" }])).map(
 						(claim) => claim.id,
@@ -582,23 +639,81 @@ describe("device ownership and native path identities", () => {
 				realpath.mockRestore();
 			}
 		});
-	test("an explicit default device owns pre-context cwd and fills a context's absent device", async () => {
-		for (const [id, context] of [
-			["pre-context", undefined],
-			["partial-context", { cwd: "/" }],
-		] as const) {
-			narrator(id, "/", context);
-			database.query("UPDATE narrators SET default_device_id='remote-device' WHERE id=?").run(id);
-		}
+	test("an explicit default device owns pre-context cwd without inventing a local root", async () => {
+		narrator("pre-context", "/");
+		database
+			.query("UPDATE narrators SET default_device_id='remote-device' WHERE id='pre-context'")
+			.run();
 		await bootstrap();
 		expect(await claims([{ path: root }])).toEqual([]);
 		expect(await claims([{ path: "/" }])).toEqual([]);
 		const found = await claims([{ deviceId: "remote-device", path: "/" }]);
-		expect(new Set(found.map((claim) => claim.id))).toEqual(
-			new Set(["pre-context", "partial-context"]),
-		);
+		expect(found.map((claim) => claim.id)).toEqual(["pre-context"]);
 		expect(found.every((claim) => claim.deviceId === "remote-device")).toBe(true);
 	});
+	for (const cwd of [".", "/"]) {
+		test(`remote default cannot prove a context's absent device even when cwd matches: ${cwd}`, async () => {
+			narrator("ambiguous", cwd, { cwd });
+			database
+				.query("UPDATE narrators SET default_device_id='remote-device' WHERE id='ambiguous'")
+				.run();
+			const before = changes();
+			await expect(claims([{ path: root }], false)).rejects.toThrow(
+				"Legacy context device is unverifiable",
+			);
+			expect(changes()).toBe(before);
+			await service.maintain(deadline());
+			expect(
+				database
+					.query(`SELECT dirty FROM resource_protection_sources
+				WHERE source='narrator' AND source_id='ambiguous'`)
+					.get(),
+			).toEqual({ dirty: 1 });
+			await expect(claims([{ deviceId: "remote-device", path: cwd }], false)).rejects.toThrow(
+				"unverifiable",
+			);
+		});
+	}
+	for (const remoteCwd of ["./remote-context", "/remote/workspace", "C:\\Remote\\Workspace"])
+		test(`a distinct legacy remote context retains the previous absolute host owner: ${remoteCwd}`, async () => {
+			const host = join(root, "previous-host-workspace");
+			const context = { cwd: remoteCwd, deviceId: "remote-device", revision: 3 };
+			narrator("legacy-switched", host, context);
+			database
+				.query(`UPDATE narrators SET default_device_id='remote-device', workspace_revision=3
+			WHERE id='legacy-switched'`)
+				.run();
+			const before = changes();
+			expect(await claims([{ path: host }], false)).toEqual([
+				{
+					kind: "narrator",
+					id: "legacy-switched",
+					revision: 3,
+					deviceId: "local",
+					path: host,
+				},
+			]);
+			expect(
+				(await claims([{ deviceId: "remote-device", path: context.cwd }], false)).map(
+					(claim) => claim.path,
+				),
+			).toEqual([context.cwd]);
+			expect(changes()).toBe(before);
+			await bootstrap();
+			expect((await claims([{ path: host }])).map((claim) => claim.deviceId)).toEqual(["local"]);
+			expect(await claims([{ path: "/" }])).toHaveLength(1); // A real host reference, not a fabricated root claim.
+			expect(
+				database
+					.query(
+						"SELECT cwd, default_device_id, workspace_context FROM narrators WHERE id='legacy-switched'",
+					)
+					.get(),
+			).toEqual({
+				cwd: host,
+				default_device_id: "remote-device",
+				workspace_context: JSON.stringify(context),
+			});
+		});
 	test("a committed context device wins over a stale default without a fabricated local claim", async () => {
 		narrator("remote", root, { cwd: "/", deviceId: "context-device" });
 		database.query("UPDATE narrators SET default_device_id='stale-device' WHERE id='remote'").run();

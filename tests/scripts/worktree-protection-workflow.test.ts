@@ -32,6 +32,7 @@ const relatedTests = [
 	"server/services/tree-snapshot-paths.test.ts",
 	"server/services/resource-protection-index.test.ts",
 	"server/services/resource-protection-production.test.ts",
+	"server/services/narrator-worktree-resources.test.ts",
 	"server/services/worktree-lifecycle-guard.test.ts",
 	"server/services/worktree-lifecycle-guard.integration.test.ts",
 	"server/services/worktree-tree-snapshot.test.ts",

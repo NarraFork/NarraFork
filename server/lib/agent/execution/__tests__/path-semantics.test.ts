@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalBackend } from "../local-backend";
@@ -106,17 +107,15 @@ describe("target path semantics", () => {
 
 describe("LocalBackend path identity", () => {
 	test("resolves existing and missing create paths through canonical ancestors", async () => {
-		const base = mkdtempSync(join(tmpdir(), "narrafork-path-identity-"));
-		roots.push(base);
+		const created = mkdtempSync(join(tmpdir(), "narrafork-path-identity-"));
+		roots.push(created);
+		// Compare canonical identities, not macOS /var or Windows 8.3 temp aliases.
+		// Match the backend's async realpath API; realpathSync can retain those aliases.
+		const base = await realpath(created);
 		const realRoot = join(base, "real");
 		const linkedRoot = join(base, "linked");
 		mkdirSync(realRoot);
-		try {
-			symlinkSync(realRoot, linkedRoot, process.platform === "win32" ? "junction" : "dir");
-		} catch (error) {
-			if (process.platform === "win32") return;
-			throw error;
-		}
+		symlinkSync(realRoot, linkedRoot, process.platform === "win32" ? "junction" : "dir");
 
 		const backend = new LocalBackend();
 		const existing = await backend.resolvePathIdentity(linkedRoot);
