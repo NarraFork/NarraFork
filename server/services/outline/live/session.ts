@@ -16,25 +16,27 @@
  *   - Text: a participant's updates (one per block it changed) are applied at once and
  *     broadcast to the others within {@link OUTLINE_LIVE_TIMING.broadcastMs}, merged per block
  *     with everything else of that window (`Y.mergeUpdates`), never echoed to their sender (who
- *     gets the transaction number back instead). Changed blocks are committed as the editor's own human commits a little later
- *     (after {@link OUTLINE_LIVE_TIMING.flushIdleMs} of quiet, at most
- *     {@link OUTLINE_LIVE_TIMING.flushMaxMs} after the first change), normalized off the main
- *     thread when large (`normalize.ts`).
- *   - Structure: a structural transaction (insert, move, delete, checkbox, plus the Yjs update
- *     of the same keystroke) is checked against the mirror, written as one commit through
- *     `writeOutline`, then broadcast in canonical form. A refused transaction is rolled back
- *     (its text part by undoing it in each block's document) and every later frame of that participant is dropped until it
- *     joins again; the client rebuilds its document and replays its own later changes.
+ *     gets the transaction number back instead). Changed blocks are committed as the editor's
+ *     own human commits a little later (after {@link OUTLINE_LIVE_TIMING.flushIdleMs} of quiet,
+ *     at most {@link OUTLINE_LIVE_TIMING.flushMaxMs} after the first change), normalized off the
+ *     main thread when large (`normalize.ts`).
+ *   - Structure: a structural transaction (insert, move, delete, checkbox, plus the text
+ *     updates of the same keystroke) is checked against the mirror, written as one commit
+ *     through `writeOutline`, then broadcast in canonical form. A refused transaction is rolled
+ *     back (its text part by undoing it in each block's document) and every later frame of that
+ *     participant is dropped until it joins again; the client rebuilds its documents and replays
+ *     its own later changes.
  *   - Writes from outside (agents, reverts) reach the session through the barrier
  *     (`live-barrier.ts`): unflushed text is committed first, then the outside commit is read
  *     back (its block versions) and pushed in as a remote change, merged into the live text.
  *   - Every text update is also appended to `outline_live_updates` within
  *     {@link OUTLINE_LIVE_TIMING.persistMs} (a snapshot of every document first, increments
  *     after, each block's seed text before its first update, compacted once the increments
- *     outweigh a snapshot; the row format is {@link encodeLogTexts}). A participant's transactions are acknowledged only
- *     once the log (or the page) has them: after a crash, what was acknowledged is replayed
- *     from the log (a startup job, or the next join), and what was not is still held by its
- *     client, which replays it into the next session. Every join after a client's first names
+ *     outweigh a snapshot; the row format is {@link encodeLogTexts}). A participant's
+ *     transactions are acknowledged only once the log (or the page) has them: after a crash,
+ *     what was acknowledged is replayed from the log (a startup job, or the next join), and what
+ *     was not is still held by its client, which replays it into the next session. Every join
+ *     after a client's first names
  *     the session it was in, and the answer says which of its transactions the page applied
  *     (`tx`) and which of those are safe in the log or committed (`dur`): the client forgets
  *     the latter, keeps the rest of what was applied unsent until acknowledged, and replays

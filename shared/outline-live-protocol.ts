@@ -55,7 +55,7 @@ export const OUTLINE_LIVE_MAGIC = 0xb1;
 export const OUTLINE_LIVE_MAX_HANDLE = 255;
 
 export const LIVE_FRAME = {
-	/** C→S: join a page. Head {@link LiveJoinHead}; body: on resume, a `vector` entry per held document. */
+	/** C→S: join a page. Head {@link LiveJoinHead}; body: on resume, a `vector` per document. */
 	join: 0x01,
 	/** C→S: leave. */
 	leave: 0x02,
@@ -65,9 +65,9 @@ export const LIVE_FRAME = {
 	tx: 0x04,
 	/** C→S: own selection. Head {@link LivePresenceUp}. */
 	selection: 0x05,
-	/** S→C: joined. Head {@link LiveJoinedHead}; body = every text (reset) or what is missing (resume). */
+	/** S→C: joined. Head {@link LiveJoinedHead}; body = every text (reset) or what is missing. */
 	joined: 0x81,
-	/** S→C: coalesced changes. `n` = ack; head {@link LiveBatchHead} or none; body = text entries. */
+	/** S→C: coalesced changes. `n` = ack; head {@link LiveBatchHead} or none; body = texts. */
 	batch: 0x82,
 	/** S→C: a transaction was refused; `n` = it. Later ones from this client were dropped. */
 	reject: 0x83,
@@ -208,9 +208,9 @@ export interface LiveJoinHead {
 	key: string;
 	/**
 	 * The session this client was in before (sent on every join after the first). Without
-	 * `reset` the client asks to resume it (the body names the documents it holds); with `reset` it wants a
-	 * snapshot. Either way the answer says which of its transactions of that session the page
-	 * already has (`tx`, `dur`), so the client neither loses nor repeats them.
+	 * `reset` the client asks to resume it (the body names the documents it holds); with `reset`
+	 * it wants a snapshot. Either way the answer says which of its transactions of that session
+	 * the page already has (`tx`, `dur`), so the client neither loses nor repeats them.
 	 */
 	resume?: { epoch: number; op: number; tx: number; reset?: boolean };
 }

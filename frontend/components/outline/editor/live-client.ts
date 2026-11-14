@@ -21,12 +21,12 @@
  *     inverse operations and undoes exactly its items, never another step's ({@link popExactly});
  *     the step going the other way records the items that made.
  *   - Reconnect: the client resumes the same server session with the state vector of every
- *     document it holds and gets exactly what it lacks, then re-sends what the server had not processed. When the session
- *     is gone (the server restarted, or it closed while this client was away) it starts over
- *     from a snapshot. Every join names the session the client was in; the answer says which of
- *     its transactions the page applied (`tx`) and has safely (`dur`): those are not replayed,
- *     and applied ones not yet safe wait in {@link LiveClient.awaiting} for their
- *     acknowledgement.
+ *     document it holds and gets exactly what it lacks, then re-sends what the server had not
+ *     processed. When the session is gone (the server restarted, or it closed while this client
+ *     was away) it starts over from a snapshot. Every join names the session the client was in;
+ *     the answer says which of its transactions the page applied (`tx`) and has safely (`dur`):
+ *     those are not replayed, and applied ones not yet safe wait in
+ *     {@link LiveClient.awaiting} for their acknowledgement.
  *   - Presence: who is here and where their cursors are, as Yjs relative positions; sent at
  *     most every {@link OUTLINE_LIVE_LIMITS.presenceIntervalMs}, never stored.
  *
