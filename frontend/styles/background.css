@@ -63,9 +63,15 @@
 }
 
 :root[data-mantine-color-scheme="light"][data-nf-bg="on"] {
-	--nf-bg-pane-effective: calc(var(--nf-bg-pane-opacity, 80%) + 10%);
+	/*
+	 * A light scheme needs a different split, and not just "more of everything": cards at
+	 * 90% over a bright photo read as dirty grey, while the background keeps the photo. So
+	 * panels go almost opaque (crisp UI), the shell keeps enough transparency for the photo,
+	 * and the scrim goes DOWN — adding scrim on a light theme only washes the picture out.
+	 */
+	--nf-bg-pane-effective: calc(var(--nf-bg-pane-opacity, 80%) + 16%);
 	--nf-bg-body-effective: calc(var(--nf-bg-body-opacity, 62%) + 12%);
-	--nf-bg-scrim-effective: calc(var(--nf-bg-scrim, 40%) + 12%);
+	--nf-bg-scrim-effective: calc(var(--nf-bg-scrim, 40%) - 10%);
 }
 
 /*

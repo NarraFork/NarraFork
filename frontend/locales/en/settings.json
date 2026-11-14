@@ -3115,5 +3115,10 @@
 	"bgStatusLoaded": "Loaded",
 	"bgStatusFailed": "Failed",
 	"bgStatusLoading": "Loading",
-	"bgStatusOff": "Off"
+	"bgStatusOff": "Off",
+	"bgStrength": "Strength",
+	"bgStrengthSubtle": "Subtle",
+	"bgStrengthMedium": "Medium",
+	"bgStrengthStrong": "Strong",
+	"bgStrengthCustom": "Custom"
 }

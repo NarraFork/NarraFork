@@ -3115,5 +3115,10 @@
 	"bgStatusLoaded": "已加载",
 	"bgStatusFailed": "加载失败",
 	"bgStatusLoading": "加载中",
-	"bgStatusOff": "未启用"
+	"bgStatusOff": "未启用",
+	"bgStrength": "强度",
+	"bgStrengthSubtle": "淡",
+	"bgStrengthMedium": "中",
+	"bgStrengthStrong": "浓",
+	"bgStrengthCustom": "自定义"
 }

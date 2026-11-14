@@ -33,12 +33,37 @@ import { IconAlertTriangle, IconPhoto, IconRefresh, IconX } from "@tabler/icons-
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+/** Quick presets for the three sliders, so "make it visible" is one click. */
+const STRENGTHS = {
+	subtle: { opacity: 88, scrim: 58, blur: 14 },
+	medium: { opacity: 78, scrim: 32, blur: 9 },
+	strong: { opacity: 62, scrim: 12, blur: 4 },
+} as const;
+
+type StrengthKey = keyof typeof STRENGTHS;
+
+function pickStrength(choice: { opacity: number; scrim: number }): StrengthKey | "custom" {
+	for (const [key, value] of Object.entries(STRENGTHS) as [
+		StrengthKey,
+		typeof STRENGTHS.subtle,
+	][]) {
+		if (
+			Math.abs(choice.opacity - value.opacity) <= 3 &&
+			Math.abs(choice.scrim - value.scrim) <= 5
+		) {
+			return key;
+		}
+	}
+	return "custom";
+}
+
 export function BackgroundCard() {
 	const { t } = useTranslation("settings");
 	const { choice, setChoice, status, reload } = useAppBackground();
 	const [draft, setDraft] = useState(choice.url);
 	const [touched, setTouched] = useState(false);
 
+	const strength = pickStrength(choice);
 	const check = checkBackgroundUrl(draft);
 	const showUrlError = touched && draft.trim().length > 0 && !check.ok;
 	const errorMessage =
@@ -192,6 +217,27 @@ export function BackgroundCard() {
 					<Text size="xs">{t("bgLoadFailedHint")}</Text>
 				</Alert>
 			) : null}
+
+			<Group gap="xs" align="center">
+				<Text size="xs" c="dimmed">
+					{t("bgStrength")}
+				</Text>
+				<SegmentedControl
+					size="xs"
+					value={strength}
+					onChange={(value) => {
+						if (value === "custom") return;
+						const preset = STRENGTHS[value as StrengthKey];
+						setChoice({ ...choice, ...preset, enabled: true });
+					}}
+					data={[
+						{ value: "subtle", label: t("bgStrengthSubtle") },
+						{ value: "medium", label: t("bgStrengthMedium") },
+						{ value: "strong", label: t("bgStrengthStrong") },
+						...(strength === "custom" ? [{ value: "custom", label: t("bgStrengthCustom") }] : []),
+					]}
+				/>
+			</Group>
 
 			<SimpleGrid cols={{ base: 1, sm: 3 }} spacing="md" verticalSpacing="xs">
 				<Box>
