@@ -20,6 +20,13 @@
 import { logger } from "../logger";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
 import { getProviderKeyStore, type ProviderKey } from "../provider-keys";
+import {
+	isPoolCooldownActive,
+	type PoolCooldown,
+	type PoolCooldownReason,
+	poolFailureState,
+	selectPoolEntry,
+} from "./credential-pool";
 import { SessionAffinity } from "./session-affinity";
 
 export { withProviderKey } from "../provider-keys";
@@ -42,14 +49,9 @@ import { ApiError } from "./types";
 const MINUTE = 60_000;
 const STICKY_LIMIT = 5_000;
 
-export type KeyCooldownReason = "rate_limited" | "quota" | "forbidden";
+export type KeyCooldownReason = PoolCooldownReason;
 
-interface Cooldown {
-	until: number;
-	reason: KeyCooldownReason;
-}
-
-const cooldowns = new Map<string, Cooldown>();
+const cooldowns = new Map<string, PoolCooldown>();
 /** `${providerId}\0${session}` → key id; the key this session last used (no expiry). */
 const sticky = new SessionAffinity<string>({ maxEntries: STICKY_LIMIT });
 
@@ -57,9 +59,9 @@ const sticky = new SessionAffinity<string>({ maxEntries: STICKY_LIMIT });
  * Why a key is resting, if it is: a recent failure, or a usage window the quota cache
  * has seen used up (until it resets). For selection and the key list.
  */
-export function keyCooldown(keyId: string, now = Date.now()): Cooldown | undefined {
+export function keyCooldown(keyId: string, now = Date.now()): PoolCooldown | undefined {
 	const cooldown = cooldowns.get(keyId);
-	const failed = cooldown && cooldown.until > now ? cooldown : undefined;
+	const failed = isPoolCooldownActive(cooldown?.until, now) ? cooldown : undefined;
 	const exhausted = keyQuotaBlockedUntil(keyId, now);
 	if (exhausted !== undefined && exhausted > (failed?.until ?? 0)) {
 		return { until: exhausted, reason: "quota" };
@@ -84,21 +86,15 @@ export function selectProviderKey(
 	exclude?: ReadonlySet<string>,
 	now = Date.now(),
 ): ProviderKey | undefined {
-	const keys = usableProviderKeys(providerId).filter((key) => !exclude?.has(key.id));
-	if (keys.length === 0) return undefined;
-	const ready = keys.filter((key) => !keyCooldown(key.id, now));
 	const stickyKey = session ? `${providerId}\0${session}` : undefined;
-	const pinned = stickyKey ? sticky.get(stickyKey, now) : undefined;
-	const chosen =
-		ready.find((key) => key.id === pinned) ??
-		ready[0] ??
-		[...keys].sort(
-			(a, b) => (keyCooldown(a.id, now)?.until ?? 0) - (keyCooldown(b.id, now)?.until ?? 0),
-		)[0];
-	if (stickyKey && chosen) {
-		// set() refreshes the binding and prunes past the cap.
-		sticky.set(stickyKey, chosen.id, now);
-	}
+	const chosen = selectPoolEntry(getProviderKeyStore().list(providerId), {
+		now,
+		exclude,
+		stickyId: stickyKey ? sticky.get(stickyKey, now) : undefined,
+		cooldownUntil: (key) => keyCooldown(key.id, now)?.until,
+		fallbackToCooling: true,
+	});
+	if (stickyKey && chosen) sticky.set(stickyKey, chosen.id, now);
 	return chosen;
 }
 
@@ -137,28 +133,28 @@ export function classifyKeyFault(err: unknown): KeyFault | null {
 	}
 }
 
-/** Apply a fault to a key. Returns whether another key should be tried. */
 export function reportKeyFault(key: ProviderKey, err: unknown, now = Date.now()): boolean {
 	const fault = classifyKeyFault(err);
 	if (!fault) return false;
-	if (fault.kind === "invalid") {
+	const failure = poolFailureState(fault, 0, 1, now);
+	if (failure.disabledReason === "invalid") {
 		try {
 			getProviderKeyStore().update(key.id, { disabled: true, disabledReason: "invalid" });
 		} catch {
-			// The key file is unreadable: keep the key in rotation rather than fail here.
+			// The key file is unreadable: do not overwrite it to persist the disable.
 			cooldowns.set(key.id, { until: now + 10 * MINUTE, reason: "forbidden" });
 		}
 		logger.warn("Provider key rejected by upstream; turned off", {
 			providerId: key.providerId,
 			keyId: key.id,
 		});
-	} else {
-		cooldowns.set(key.id, { until: now + fault.ms, reason: fault.reason });
+	} else if (failure.cooldown) {
+		cooldowns.set(key.id, failure.cooldown);
 		logger.info("Provider key cooling down", {
 			providerId: key.providerId,
 			keyId: key.id,
-			reason: fault.reason,
-			seconds: Math.round(fault.ms / 1000),
+			reason: failure.cooldown.reason,
+			seconds: Math.round((failure.cooldown.until - now) / 1000),
 		});
 	}
 	return true;

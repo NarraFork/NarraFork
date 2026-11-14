@@ -7,11 +7,11 @@
  * cannot be read, nothing moves and settings.json keeps its keys as before.
  *
  * Covered fields: the `apiKey` of custom API providers, NUG providers, TokenDance, Command
- * Code and custom search providers, plus custom API providers' `quotaAccessToken`. Custom
- * API providers own their inference keys under their own id (they can hold several, see
- * agent/pooled-provider.ts); all other credentials hold one key each, under a namespaced
- * owner id. Site tokens never join the inference pool. NUG OAuth client secrets and search
- * provider headers stay in settings.json for now.
+ * Code and custom search providers, custom API providers' `quotaAccessToken`, and NUG's
+ * `oauthClientSecret`. Custom API providers own their inference keys under their own id
+ * (they can hold several, see agent/pooled-provider.ts); all other credentials hold one key
+ * each, under a namespaced owner id. Site tokens and OAuth secrets never join that pool.
+ * Search headers live separately in search-header-secrets.ts.
  */
 import { getProviderKeyStore } from "../provider-keys";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
@@ -21,6 +21,7 @@ import type { NarraForkSettings } from "./types";
 export const TOKENDANCE_KEY_OWNER = "builtin:tokendance";
 export const COMMAND_CODE_KEY_OWNER = "builtin:CommandCode";
 export const nugKeyOwner = (providerId: string) => `nug:${providerId}`;
+export const nugOAuthKeyOwner = (providerId: string) => `nug-oauth:${providerId}`;
 export const searchKeyOwner = (providerId: string) => `search:${providerId}`;
 export const quotaKeyOwner = (providerId: string) => `quota:${providerId}`;
 
@@ -30,8 +31,8 @@ interface KeySlot {
 	owner: string;
 	/** Custom API providers keep their extra keys when the slot goes away (see the route). */
 	pooled: boolean;
-	holder: { apiKey?: string; quotaAccessToken?: string };
-	field: "apiKey" | "quotaAccessToken";
+	holder: { apiKey?: string; quotaAccessToken?: string; oauthClientSecret?: string };
+	field: "apiKey" | "quotaAccessToken" | "oauthClientSecret";
 	/** The field is required on this holder, so "no key" is "" rather than absent. */
 	required: boolean;
 }
@@ -55,6 +56,13 @@ function keySlots(settings: NarraForkSettings): KeySlot[] {
 			holder,
 			field: "apiKey",
 			required: true,
+		});
+		slots.push({
+			owner: nugOAuthKeyOwner(holder.id),
+			pooled: false,
+			holder,
+			field: "oauthClientSecret",
+			required: false,
 		});
 	}
 	if (settings.tokendance) {
@@ -152,7 +160,10 @@ export function withoutProviderKeys(settings: NarraForkSettings): NarraForkSetti
 		openaiProviders: blank(settings.openaiProviders),
 		anthropicProviders: blank(settings.anthropicProviders),
 		geminiProviders: blank(settings.geminiProviders),
-		nugProviders: blank(settings.nugProviders),
+		nugProviders: settings.nugProviders?.map(({ oauthClientSecret: _secret, ...entry }) => ({
+			...entry,
+			apiKey: "",
+		})),
 		...(settings.tokendance ? { tokendance: { ...settings.tokendance, apiKey: "" } } : {}),
 		...(settings.commandCode ? { commandCode: omit(settings.commandCode) } : {}),
 		...(settings.search

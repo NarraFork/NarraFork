@@ -44,6 +44,7 @@ import { saveSettings, settings } from "@server/lib/settings";
 import {
 	COMMAND_CODE_KEY_OWNER,
 	nugKeyOwner,
+	nugOAuthKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "@server/lib/settings/provider-keys-projection";
 import type { NarraForkSettings } from "@server/lib/settings/types";
@@ -1566,8 +1567,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			if (key === "customApiProviders" && incomingId) {
 				addedCustomApiProviders.set(incomingId, String(copy.id));
 			}
-			// A NUG provider's key is stored by the settings save under its (possibly new) id.
-			if (key === "nugProviders" && incomingId) addedSingleKeyOwners.add(nugKeyOwner(incomingId));
+			// NUG credentials were filled before the merge, so settings saves both under the new id.
+			if (key === "nugProviders" && incomingId) {
+				addedSingleKeyOwners.add(nugKeyOwner(incomingId));
+				addedSingleKeyOwners.add(nugOAuthKeyOwner(incomingId));
+			}
 			// 重名 → 自动追加「-副本」（多次重复时继续加编号）
 			const name = String(copy.name ?? "导入的供应商");
 			if (existingNames.has(name)) {
