@@ -32,7 +32,6 @@ const FONT_SIZE_IS_AN_ERROR = false;
  * grows without justification is the same as having no check at all.
  */
 const ALLOWED: ReadonlyArray<{ path: string; reason: string }> = [
-	{ path: "mock/", reason: "design-review mockups; candidates are literal by definition" },
 	{ path: "styles/tokens.css", reason: "the palette itself" },
 	{ path: "lib/mantine-theme.ts", reason: "Mantine palette consumed by tokens.css" },
 	{
