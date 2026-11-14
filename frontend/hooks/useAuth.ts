@@ -1,10 +1,12 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type ApiError, api, endSession, getToken, setToken } from "../lib/api";
+import { api, endSession, getToken, setToken } from "../lib/api";
 import { isMfaChallenge, type LoginResult, type LoginSession } from "../lib/api/auth";
 import { appearanceStore } from "../lib/appearance-preference-store";
 import { assetUrl } from "../lib/base-path";
 import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
+
+export { useCurrentUser } from "./useCurrentUser";
 
 /** Establish a session from a login/verify result: store token, seed cache, set language. */
 export async function applySession(qc: QueryClient, data: LoginSession): Promise<void> {
@@ -32,22 +34,6 @@ export function useAuthStatus() {
 		queryFn: api.authStatus,
 		retry: false,
 		staleTime: 60_000,
-	});
-}
-
-export function useCurrentUser() {
-	return useQuery({
-		queryKey: ["auth", "me"],
-		queryFn: api.me,
-		enabled: !!getToken(),
-		retry: (failureCount, error) => {
-			// Don't retry auth failures or missing user, but retry transient server errors.
-			// 401 = token invalid/expired; 404 = user deleted (DB wipe) while token still valid.
-			const status = (error as ApiError)?.status;
-			if (status === 401 || status === 404) return false;
-			return failureCount < 3;
-		},
-		staleTime: 30_000,
 	});
 }
 
