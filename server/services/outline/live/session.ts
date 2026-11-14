@@ -554,6 +554,20 @@ export class LivePage {
 		return this.docs.size;
 	}
 
+	/** Blocks that have a document (diagnostics and tests). */
+	get textDocIds(): string[] {
+		return [...this.docs.keys()];
+	}
+
+	/**
+	 * A block's document as diagnostics and tests compare it across ends: its whole state, and
+	 * whether an update that names items it lacks is stuck in it. Null without a document.
+	 */
+	textState(id: string): { state: Uint8Array; stuck: boolean } | null {
+		const t = this.docs.get(id);
+		return t ? { state: Y.encodeStateAsUpdate(t.doc), stuck: hasPendingStructs(t.doc) } : null;
+	}
+
 	/**
 	 * Every text of the session, as a snapshot carries it: each document's whole state, and the
 	 * seed text of every other block the session knows (deleted ones too: undoing a delete

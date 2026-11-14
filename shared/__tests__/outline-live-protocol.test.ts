@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
 	decodeLiveFrame,
+	decodeLiveTexts,
 	encodeLiveFrame,
 	encodeLiveHead,
+	encodeLiveTexts,
 	isLiveFrame,
 	isLiveHandle,
 	isLiveTaskChar,
@@ -10,12 +12,14 @@ import {
 	LIVE_PEER_PALETTE,
 	LIVE_STATUS_OF_TASK,
 	LIVE_TASK_OF_STATUS,
+	LIVE_TEXT_KIND,
 	type LiveRejectHead,
 	livePeerColor,
 	OUTLINE_LIVE_AGENT_PNO_BASE,
 	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_MAGIC,
 	OUTLINE_LIVE_MAX_HANDLE,
+	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "../outline-live-protocol";
 
 describe("live frames", () => {
@@ -137,5 +141,57 @@ describe("agents in presence (P2 PR 10b)", () => {
 		expect(OUTLINE_LIVE_AGENT_PNO_BASE).toBeGreaterThan(
 			OUTLINE_LIVE_LIMITS.editorsPerPage + OUTLINE_LIVE_LIMITS.viewersPerPage,
 		);
+	});
+});
+
+describe("text entries (protocol version 2)", () => {
+	test("entries round trip in order, payloads as views; an empty body is no entries", () => {
+		const entries = [
+			{ id: "block-0001", kind: LIVE_TEXT_KIND.seed, data: new TextEncoder().encode("大纲 text") },
+			{ id: "block-0002", kind: LIVE_TEXT_KIND.update, data: new Uint8Array(300).fill(7) },
+			{ id: "块", kind: LIVE_TEXT_KIND.vector, data: new Uint8Array(0) },
+			{ id: "block-0001", kind: LIVE_TEXT_KIND.update, data: new Uint8Array([0, 0]) },
+		];
+		const body = encodeLiveTexts(entries);
+		const back = decodeLiveTexts(body);
+		expect(back?.map((e) => [e.id, e.kind, [...e.data]])).toEqual(
+			entries.map((e) => [e.id, e.kind, [...e.data]]),
+		);
+		expect(back?.[1]?.data.buffer).toBe(body.buffer);
+		expect(encodeLiveTexts([])).toHaveLength(0);
+		expect(decodeLiveTexts(new Uint8Array(0))).toEqual([]);
+		// Carried as a frame's body unchanged.
+		const frame = decodeLiveFrame(
+			encodeLiveFrame({ kind: LIVE_FRAME.update, handle: 1, n: 3, body }),
+		);
+		expect(decodeLiveTexts(frame?.body as Uint8Array)).toHaveLength(4);
+	});
+
+	test("malformed bodies do not decode: truncated, unknown kind, bad id, too many entries", () => {
+		const body = encodeLiveTexts([
+			{ id: "block-0001", kind: LIVE_TEXT_KIND.update, data: new Uint8Array([1, 2, 3]) },
+			{ id: "block-0002", kind: LIVE_TEXT_KIND.update, data: new Uint8Array([4]) },
+		]);
+		for (let cut = 1; cut < body.length; cut++) {
+			// A cut at an entry boundary is a shorter list; anywhere else it is malformed.
+			const decoded = decodeLiveTexts(body.subarray(0, cut));
+			if (decoded !== null) expect(decoded).toHaveLength(1);
+		}
+		const kind = body.slice();
+		kind[1 + "block-0001".length] = 9;
+		expect(decodeLiveTexts(kind)).toBeNull();
+		expect(decodeLiveTexts(new Uint8Array([0, LIVE_TEXT_KIND.update, 0]))).toBeNull();
+		expect(decodeLiveTexts(new Uint8Array([2, 0xff, 0xfe, LIVE_TEXT_KIND.update, 0]))).toBeNull();
+		const long = encodeLiveTexts([
+			{
+				id: "x".repeat(OUTLINE_LIVE_LIMITS.maxTextIdBytes + 1),
+				kind: LIVE_TEXT_KIND.update,
+				data: new Uint8Array(0),
+			},
+		]);
+		expect(decodeLiveTexts(long)).toBeNull();
+		expect(decodeLiveTexts(body, 1)).toBeNull();
+		expect(decodeLiveTexts(body, 2)).toHaveLength(2);
+		expect(OUTLINE_LIVE_PROTOCOL_VERSION).toBe(2);
 	});
 });

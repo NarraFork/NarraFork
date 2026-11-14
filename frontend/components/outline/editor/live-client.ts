@@ -67,6 +67,7 @@ import {
 	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
 import {
+	hasPendingStructs,
 	LIVE_TEXT_SEED_CLIENT,
 	type LiveTextDoc,
 	mergeTextUpdates,
@@ -542,6 +543,15 @@ export class LiveClient {
 	/** Blocks with a document (diagnostics, tests, measurements). */
 	get textDocs(): number {
 		return this.docs.size;
+	}
+
+	/**
+	 * A block's document as diagnostics and tests compare it across ends: its whole state, and
+	 * whether an update that names items it lacks is stuck in it. Null without a document.
+	 */
+	textState(id: string): { state: Uint8Array; stuck: boolean } | null {
+		const t = this.docs.get(id);
+		return t ? { state: Y.encodeStateAsUpdate(t.doc), stuck: hasPendingStructs(t.doc) } : null;
 	}
 
 	textOf(id: string): string {
