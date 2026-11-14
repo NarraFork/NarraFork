@@ -44,6 +44,17 @@
 
 交付物：1 个新样式文件 + 1 个主题文件补丁 + 1 个守卫脚本 + 3 个 PR。
 
+### 0.3 实现期间发现的两个浏览器事实（改变了写法）
+
+用 headless Chrome 探测真实计算值（`getComputedStyle`）时发现，方案里原计划依赖 `light-dark()` 来写语义层，**在 Chromium 上不成立**：
+
+| 事实 | 探测结果 | 影响 | 采用的写法 |
+|---|---|---|---|
+| `light-dark()` 写在**自定义属性**里时永远取第一个（浅色）分支 | `color-scheme` 计算值为 `dark`，但 `--x: light-dark(#111, #eee)` 报 `#111` | 整个语义层会静默用浅色值 | 语义 token 按 scheme **各写一遍**，不用 `light-dark()` |
+| `light-dark()` 写在**普通属性**里时，若 `color-scheme` 来自 `var()`，仍按浅色解析 | `getComputedStyle(...).colorScheme === "dark"`，但 `background: light-dark(#121212, #fefefe)` 渲染成 `#fefefe` | 仓库现有的 `light-dark()` 用法（`components/git/GitSplitDiff.module.css`）在深色下会拿到浅色分支 | token 层用**字面量**声明 `color-scheme: dark/light`（Mantine 用的是 `var(--mantine-color-scheme)`，不生效） |
+
+第二条同时解释了为什么 `tokens.css` 里要显式写 `color-scheme`：即使不去覆盖 Mantine，也要让普通属性里的 `light-dark()` 正常工作。这两点都写进了 `tokens.css` 的注释。
+
 ---
 
 ## 1. 现状（实测，作为设计前提）
@@ -254,6 +265,9 @@ P0 只定义三档时长（120 / 180 / 240ms）+ 一条缓动，并把 `prefers-
 
 > **PR1 落 palette 段、标量段与语义层**（语义层只读 `--mantine-*`，不覆写，无视觉影响）；
 > 两段「语义槽位」（`--mantine-color-*` 覆写）属于 **PR2**。这里给出完整形态是为了让 review 一次看到终态。
+>
+> 实际落地的文件与下面这版有两处不同，原因见 §0.3（`light-dark()` 在自定义属性里不可用、
+> `color-scheme` 必须写字面量）：语义 token 按 scheme 各写一遍；`color-scheme` 显式声明。
 
 ```css
 /*
@@ -384,18 +398,20 @@ P0 只定义三档时长（120 / 180 / 240ms）+ 一条缓动，并把 `prefers-
 }
 ```
 
-### 5.2 主题文件：PR1 不动
+### 5.2 主题文件：PR1 不动，PR2 接主题
 
-**修正（实现时发现）**：初版说 PR1 顺带接上 `fontFamily`。这不成立——字体栈一换就在 Linux 上真实改变渲染（Mantine 默认栈含 Roboto/Helvetica，我们的栈含 Noto CJK SC），不满足「零视觉变化」。所以 PR1 **`mantine-theme.ts` 一行不改**，字体栈接入归 PR2：
+**修正（实现时发现）**：初版说 PR1 顺带接上 `fontFamily`。这不成立——字体栈一换就在 Linux 上真实改变渲染（Mantine 默认栈含 Roboto/Helvetica，我们的栈含 Noto CJK SC），不满足「零视觉变化」。所以 PR1 **`mantine-theme.ts` 一行不改**，字体栈与深色色阶在 PR2 接：
 
 ```ts
-// PR2 才加：
+// PR2：
 export const mantineTheme = createTheme({
 	// ...
 	fontFamily: "var(--nf-font-ui)",
 	fontFamilyMonospace: "var(--nf-font-mono)",
-	// fontSizes / lineHeights / radius / spacing 仍然不传：
-	// 传了就等于改刻度（见自审 #1、#2）
+	// 深色中性色阶（0=text · 2=dimmed · 3=placeholder · 4=border · 5=hover
+	//              6=default · 7=body），见文件内注释
+	colors: { dark: [/* ink 阶 10 档 */] },
+	// fontSizes / lineHeights / spacing 仍然不传：传了就等于改刻度
 });
 ```
 

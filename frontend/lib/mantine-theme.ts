@@ -13,6 +13,16 @@ import { createTheme } from "@mantine/core";
 export const mantineTheme = createTheme({
 	primaryColor: "indigo",
 	defaultRadius: "sm",
+	/*
+	 * Both families resolve through `styles/tokens.css`. They are `var()` references rather
+	 * than literals so the CJK ordering (English first, then PingFang / YaHei / Noto, which
+	 * matters for mixed Chinese/English copy at small sizes) lives in one place with the
+	 * rest of the palette. `fontSizes` / `lineHeights` / `spacing` are deliberately NOT set
+	 * here: overrides that merely restate Mantine's defaults still shift the scale, and that
+	 * is a separate, visually reviewable change.
+	 */
+	fontFamily: "var(--nf-font-ui)",
+	fontFamilyMonospace: "var(--nf-font-mono)",
 	colors: {
 		/*
 		 * Blue-toned neutral for "the system is waiting on itself" states — e.g. a
@@ -45,6 +55,40 @@ export const mantineTheme = createTheme({
 			"#556c8e",
 			"#425572",
 			"#314056",
+		],
+		/*
+		 * The dark-scheme neutral ramp, blue-cast rather than pure grey.
+		 *
+		 * Every dark-mode default in Mantine reads a slot out of this array, so this is
+		 * the single lever that retunes the whole scheme — `Card`, `Paper`, `Input`,
+		 * `Table`, `Divider`, `Text c="dimmed"` and the rest follow without touching a
+		 * component:
+		 *
+		 *   0 text · 2 dimmed · 3 placeholder · 4 borders · 5 hover
+		 *   6 default surface · 7 body · 8/9 filled variants
+		 *
+		 * The reason for a blue cast: the content is code, diffs, terminals and logs,
+		 * which already live in a terminal palette. A flat grey shell next to it reads
+		 * as a different material. Saturation is kept around 4–6% so it never competes
+		 * with the indigo primary.
+		 *
+		 * Slot 4 is deliberately 3.39:1 against slot 6 — Mantine reuses one variable for
+		 * both decorative card borders and input boundaries, so the accessible choice
+		 * (WCAG 1.4.11 wants ≥3:1 for control boundaries) is also the one that outlines
+		 * cards a little more than before. If that turns out too heavy in practice, the
+		 * knob is this one entry.
+		 */
+		dark: [
+			"#e7ebf3",
+			"#c3cad8",
+			"#8a93a5",
+			"#79839a",
+			"#657086",
+			"#2c3240",
+			"#191d26",
+			"#0b0e14",
+			"#08090f",
+			"#05070a",
 		],
 	},
 	components: {

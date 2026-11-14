@@ -129,13 +129,61 @@
 	--nf-ease: cubic-bezier(0.2, 0, 0, 1);
 }
 
-/* ---- semantic layer ---- */
+/*
+ * `color-scheme` is declared literally, NOT left to Mantine's
+ * `color-scheme: var(--mantine-color-scheme)`.
+ *
+ * Chromium does not honour that indirection when resolving `light-dark()`: the computed
+ * `color-scheme` still reads `dark`, but every `light-dark()` below resolves to its light
+ * branch, so the whole semantic layer would silently paint light-mode colours on a dark
+ * page. Verified in a headless Chrome probe (`getComputedStyle(...).colorScheme === "dark"`
+ * while `light-dark(#121212, #fefefe)` painted `#fefefe`). Declaring the literal value in
+ * a later rule fixes it and keeps this file independent of Mantine's internals.
+ */
+:root[data-mantine-color-scheme="dark"] {
+	color-scheme: dark;
+}
+
+:root[data-mantine-color-scheme="light"] {
+	/*
+	 * Light-scheme slots that Mantine cannot reach through the palette: `body` is
+	 * hardcoded to `#fff` and the rest come from the `gray` ramp, whose steps miss AA
+	 * (`dimmed` = gray-6 is 3.87:1). These selectors have the same specificity Mantine
+	 * uses (0,2,0), so they stay below OLED and plugin themes (both 0,3,0), which must
+	 * keep winning.
+	 */
+	color-scheme: light;
+	--mantine-color-body: var(--nf-paper-50);
+	--mantine-color-default: var(--nf-paper-0);
+	--mantine-color-default-hover: var(--nf-paper-100);
+	--mantine-color-dimmed: var(--nf-paper-600);
+	--mantine-color-placeholder: var(--nf-paper-600);
+	--mantine-color-text: var(--nf-paper-900);
+}
+
+/*
+ * ---- semantic layer ----
+ *
+ * Written twice — once per scheme — instead of with `light-dark()`.
+ *
+ * `light-dark()` inside a CUSTOM PROPERTY does not follow the colour scheme in Chromium:
+ * it resolves to its first (light) branch in both schemes, while the same function in a
+ * normal property (e.g. `border: 1px solid light-dark(a, b)`) resolves correctly. Probed
+ * in headless Chrome: with `color-scheme: dark` computed on <html>,
+ * `--x: light-dark(#111, #eee)` reported `#111`. Duplicating the block is the portable
+ * fix; it also keeps each scheme readable on its own.
+ *
+ * `--nf-surface-canvas` / `--nf-surface` / `--nf-line-strong` / `--nf-text` /
+ * `--nf-text-muted` read Mantine's variables, not the palette, so OLED and plugin themes
+ * still reach every consumer through them.
+ */
 :root {
+	color-scheme: light;
+
 	--nf-surface-canvas: var(--mantine-color-body);
 	--nf-surface: var(--mantine-color-default);
-	--nf-surface-raised: light-dark(var(--nf-paper-100), var(--nf-ink-850));
-	--nf-surface-overlay: light-dark(var(--nf-paper-200), var(--nf-ink-800));
-
+	--nf-surface-raised: var(--nf-paper-100);
+	--nf-surface-overlay: var(--nf-paper-200);
 	/*
 	 * Derived from the Mantine border variable rather than the palette so it follows OLED
 	 * and plugin themes; mixed with the surface to land at the decorative weight (~2:1).
@@ -144,25 +192,45 @@
 	--nf-line-strong: var(--mantine-color-default-border);
 
 	--nf-text: var(--mantine-color-text);
-	--nf-text-secondary: light-dark(var(--nf-paper-700), var(--nf-ink-200));
+	--nf-text-secondary: var(--nf-paper-700);
 	--nf-text-muted: var(--mantine-color-dimmed);
 
-	--nf-action: light-dark(var(--nf-action-fill-light), var(--nf-action-fill-dark));
-	--nf-action-hover: light-dark(
-		var(--nf-action-fill-hover-light),
-		var(--nf-action-fill-hover-dark)
-	);
-	--nf-action-label: light-dark(var(--nf-action-text-light), var(--nf-action-text-dark));
-	--nf-action-subtle: light-dark(var(--nf-action-subtle-light), var(--nf-action-subtle-dark));
+	--nf-action: var(--nf-action-fill-light);
+	--nf-action-hover: var(--nf-action-fill-hover-light);
+	--nf-action-label: var(--nf-action-text-light);
+	--nf-action-subtle: var(--nf-action-subtle-light);
 
-	--nf-live-graphic: light-dark(var(--nf-live-graphic-light), var(--nf-live-graphic-dark));
-	--nf-live-text: light-dark(var(--nf-live-text-light), var(--nf-live-text-dark));
-	--nf-wait-graphic: light-dark(var(--nf-wait-graphic-light), var(--nf-wait-graphic-dark));
-	--nf-attention-graphic: light-dark(
-		var(--nf-attention-graphic-light),
-		var(--nf-attention-graphic-dark)
-	);
-	--nf-danger-graphic: light-dark(var(--nf-danger-graphic-light), var(--nf-danger-graphic-dark));
+	--nf-live-graphic: var(--nf-live-graphic-light);
+	--nf-live-text: var(--nf-live-text-light);
+	--nf-wait-graphic: var(--nf-wait-graphic-light);
+	--nf-attention-graphic: var(--nf-attention-graphic-light);
+	--nf-danger-graphic: var(--nf-danger-graphic-light);
+}
+
+:root[data-mantine-color-scheme="dark"] {
+	color-scheme: dark;
+
+	--nf-surface-canvas: var(--mantine-color-body);
+	--nf-surface: var(--mantine-color-default);
+	--nf-surface-raised: var(--nf-ink-850);
+	--nf-surface-overlay: var(--nf-ink-800);
+	--nf-line: color-mix(in srgb, var(--mantine-color-default-border) 62%, var(--nf-surface));
+	--nf-line-strong: var(--mantine-color-default-border);
+
+	--nf-text: var(--mantine-color-text);
+	--nf-text-secondary: var(--nf-ink-200);
+	--nf-text-muted: var(--mantine-color-dimmed);
+
+	--nf-action: var(--nf-action-fill-dark);
+	--nf-action-hover: var(--nf-action-fill-hover-dark);
+	--nf-action-label: var(--nf-action-text-dark);
+	--nf-action-subtle: var(--nf-action-subtle-dark);
+
+	--nf-live-graphic: var(--nf-live-graphic-dark);
+	--nf-live-text: var(--nf-live-text-dark);
+	--nf-wait-graphic: var(--nf-wait-graphic-dark);
+	--nf-attention-graphic: var(--nf-attention-graphic-dark);
+	--nf-danger-graphic: var(--nf-danger-graphic-dark);
 }
 
 @media (prefers-reduced-motion: reduce) {
