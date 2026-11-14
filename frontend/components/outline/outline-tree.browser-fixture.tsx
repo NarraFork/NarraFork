@@ -15,6 +15,7 @@ import outlineEn from "../../locales/en/outline.json";
 import outlineZh from "../../locales/zh-CN/outline.json";
 import { OutlineView } from "./OutlineView";
 import type { OutlineTarget } from "./outline-nav";
+import { requestTreeLocate, type TreeLocateTarget } from "./tree/tree-locate";
 
 const i18n = createInstance();
 await i18n.init({
@@ -87,8 +88,8 @@ export function toggle(title: string): boolean {
 }
 
 /** Every row has its arrow, drawn (not hover-only). */
-export function arrowsDrawn(): boolean {
-	const rows = [...document.querySelectorAll<HTMLElement>("[data-tree-node]")];
+export function arrowsDrawn(within = "body"): boolean {
+	const rows = [...document.querySelectorAll<HTMLElement>(`${within} [data-tree-node]`)];
 	return (
 		rows.length > 0 &&
 		rows.every((row) => {
@@ -218,4 +219,160 @@ export function ariaOwnedWell(): boolean {
 		if (page !== "page" && !items(group)) return false;
 	}
 	return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Readability F: what a row says, the search drawn as a tree, locating, scrolling
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** What each space row says: its counts, its one line, whether it is marked read only. */
+export function glance(): Array<{
+	title: string;
+	waiting: string | null;
+	doing: string | null;
+	readOnly: boolean;
+	summary: string | null;
+	/** What comes first in the row's end: `waiting`, `doing`, or neither. */
+	first: string | null;
+}> {
+	return [...document.querySelectorAll<HTMLElement>("[data-tree-kind=space]")].map((row) => {
+		const item = row.closest("[role=treeitem]");
+		return {
+			title: row.querySelector<HTMLElement>("[data-tree-title]")?.textContent ?? "",
+			waiting: row.querySelector<HTMLElement>("[data-tree-count=waiting]")?.textContent ?? null,
+			doing: row.querySelector<HTMLElement>("[data-tree-count=doing]")?.textContent ?? null,
+			readOnly: row.querySelector("[data-tree-read-only]") !== null,
+			summary:
+				item?.querySelector<HTMLElement>(
+					":scope > * [data-tree-summary], :scope > [data-tree-summary]",
+				)?.textContent ?? null,
+			first: row.querySelector<HTMLElement>("[data-tree-count]")?.dataset.treeCount ?? null,
+		};
+	});
+}
+
+/** The rows of the search drawn as a tree: level, kind, title, whether a hit, marked words. */
+export function searchRows(): Array<{
+	level: number;
+	kind: string;
+	title: string;
+	hit: string | null;
+	marks: string[];
+}> {
+	const tree = document.querySelector("[data-testid=outline-search-tree]");
+	if (!tree) return [];
+	return [...tree.querySelectorAll<HTMLElement>("[data-tree-node]")].map((row) => {
+		const item = row.closest<HTMLElement>("[role=treeitem]");
+		const snippet = item?.querySelector<HTMLElement>(":scope > [data-search-snippet]");
+		return {
+			level: Number(item?.getAttribute("aria-level") ?? 0),
+			kind: row.dataset.treeKind ?? "",
+			title: row.querySelector<HTMLElement>("[data-tree-title]")?.textContent ?? "",
+			hit: row.dataset.searchHit ?? null,
+			marks: [...row.querySelectorAll("mark"), ...(snippet?.querySelectorAll("mark") ?? [])].map(
+				(mark) => mark.textContent ?? "",
+			),
+		};
+	});
+}
+
+/** Choose a hit of the search (its title: "show in the tree"). */
+export function chooseHit(blockId: string): boolean {
+	const row = document.querySelector<HTMLElement>(`[data-search-hit="${blockId}"]`);
+	const title = row?.querySelector<HTMLElement>("[data-tree-title]");
+	title?.click();
+	return !!title;
+}
+
+/** Whether the tree itself (not the search) is shown. */
+export function treeShown(): boolean {
+	const tree = document.querySelector<HTMLElement>("[data-testid=outline-tree]");
+	return !!tree && !tree.hidden && tree.offsetParent !== null;
+}
+
+/** The located row, if one is marked: a block's id or a node's key, and whether it is in view. */
+export function located(): { id: string; inView: boolean } | null {
+	const row = document.querySelector<HTMLElement>("[data-located]");
+	if (!row) return null;
+	const box = row.getBoundingClientRect();
+	return {
+		id: row.dataset.blockId ?? row.dataset.treeNode ?? "",
+		inView: box.top >= 0 && box.bottom <= window.innerHeight && box.height > 0,
+	};
+}
+
+/** Whether a block's row is drawn in an open page. */
+export function hasBlock(pageId: string, blockId: string): boolean {
+	return blockRows(pageId).some((row) => row.id === blockId);
+}
+
+/** As a focused page asks for it: the request waits for the tree that mounts next. */
+export function requestLocate(target: TreeLocateTarget): void {
+	requestTreeLocate("page", target);
+}
+
+export function scrollY(): number {
+	return Math.round(window.scrollY);
+}
+
+export function scrollToY(y: number): number {
+	window.scrollTo(0, y);
+	return Math.round(window.scrollY);
+}
+
+/** The first tree row at or below the top of the view: its key and where its top is. */
+export function topRow(): { key: string; top: number } | null {
+	for (const row of document.querySelectorAll<HTMLElement>(
+		"[data-testid=outline-tree] [data-tree-node]",
+	)) {
+		const box = row.getBoundingClientRect();
+		if (box.height > 0 && box.bottom > 0) {
+			return { key: row.dataset.treeNode ?? "", top: Math.round(box.top) };
+		}
+	}
+	return null;
+}
+
+/** The scroll anchor kept for the home tree of the outline page, as stored. */
+export function storedAnchor(): string | null {
+	return sessionStorage.getItem("narrafork_outline_tree_scroll:page:all");
+}
+
+/** The labels of a page's preview lines, by the block they belong to. */
+export function previewLabels(pageId: string): Record<string, string> {
+	const page = document.querySelector(`[data-tree-page="${pageId}"]`);
+	const out: Record<string, string> = {};
+	for (const line of page?.querySelectorAll<HTMLElement>("[data-fold-preview]") ?? []) {
+		out[line.dataset.foldOf ?? ""] =
+			line.querySelector<HTMLElement>("[data-fold-preview-label]")?.textContent ?? "";
+	}
+	return out;
+}
+
+/** Whether an open page says it shows only part of itself. */
+export function partial(pageId: string): boolean {
+	return document.querySelector(`[data-tree-page="${pageId}"] [data-tree-partial]`) !== null;
+}
+
+/** Any `:hover` rule in the page's stylesheets that names a part of the tree (there must be none). */
+export function hoverRules(): string[] {
+	const out: string[] = [];
+	for (const sheet of document.styleSheets) {
+		let rules: CSSRuleList;
+		try {
+			rules = sheet.cssRules;
+		} catch {
+			continue;
+		}
+		for (const rule of rules) {
+			const selector = (rule as CSSStyleRule).selectorText ?? "";
+			if (
+				selector.includes(":hover") &&
+				/tree(Row|Title|Summary|Snippet|Hit|Meta|Note)/.test(selector)
+			) {
+				out.push(selector);
+			}
+		}
+	}
+	return out;
 }

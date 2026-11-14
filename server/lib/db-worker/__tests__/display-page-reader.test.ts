@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Worker as NodeWorker } from "node:worker_threads";
 import { getTableColumns } from "drizzle-orm";
 import { narratorMessages, narratorToolCalls } from "../../../db/schema";
 import {
@@ -12,6 +14,8 @@ import {
 	readNarratorDisplayMessages,
 } from "../../../services/narrator-display-page-reader";
 import { AppError } from "../../errors";
+import { logger } from "../../logger";
+import { WorkerHandle } from "../../worker-runtime/lifecycle";
 import {
 	DISPLAY_PAGE_LIMITS,
 	type DisplayPageMessagesParams,
@@ -157,7 +161,7 @@ function removeSlowDisplayFixture(): void {
 	writer.run("ALTER TABLE display_messages_source RENAME TO narrator_messages");
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	directory = mkdtempSync(join(tmpdir(), "narrafork-display-page-"));
 	dbPath = join(directory, "fixture.db");
 	writer = new Database(dbPath);
@@ -167,18 +171,18 @@ beforeEach(() => {
 	previousWorker = process.env.NARRAFORK_DB_WORKER;
 	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
 	delete process.env.NARRAFORK_DB_WORKER;
-	resetDbWorkerPoolForTest();
+	await resetDbWorkerPoolForTest();
 });
 
-afterEach(() => {
-	shutdownDbWorkerPool();
+afterEach(async () => {
+	await shutdownDbWorkerPool();
 	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
 	else process.env.NARRAFORK_DB_WORKER = previousWorker;
 	writer.close();
 	rmSync(directory, { recursive: true, force: true });
-});
+}, 30_000);
 
 const read = (
 	ids = ["message-1"],
@@ -216,7 +220,6 @@ function controlledDisplaySettlement() {
 	const originalNow = Date.now;
 	const originalSetTimeout = globalThis.setTimeout;
 	const originalClearTimeout = globalThis.clearTimeout;
-	const OriginalWorker = globalThis.Worker;
 	let now = 10_000;
 	type ManualTimer = { callback: () => void; delay: number; cleared: boolean };
 	const timers: ManualTimer[] = [];
@@ -224,19 +227,15 @@ function controlledDisplaySettlement() {
 	const task = new Promise<ControlledWorker>((resolve) => {
 		resolveTask = resolve;
 	});
-	class ControlledWorker extends EventTarget {
-		onmessage: ((event: MessageEvent<DbWorkerOutbound>) => unknown) | null = null;
-		onerror: ((event: ErrorEvent) => unknown) | null = null;
+	class ControlledWorker extends EventEmitter {
 		requestId = "";
 		terminated = false;
 		constructor() {
 			super();
 			queueMicrotask(() => this.emit({ type: "ready", buildId: null }));
 		}
-		emit(data: DbWorkerOutbound): void {
-			const event = new MessageEvent("message", { data });
-			this.dispatchEvent(event);
-			this.onmessage?.(event);
+		emit(event: string | symbol | DbWorkerOutbound, ...args: unknown[]): boolean {
+			return typeof event === "object" ? super.emit("message", event) : super.emit(event, ...args);
 		}
 		postMessage(message: DbWorkerInbound): void {
 			if (message.type === "task") {
@@ -246,6 +245,7 @@ function controlledDisplaySettlement() {
 		}
 		terminate(): void {
 			this.terminated = true;
+			this.emit("exit", 0);
 		}
 	}
 	Date.now = () => now;
@@ -263,7 +263,11 @@ function controlledDisplaySettlement() {
 		if (timer) timer.cleared = true;
 		else originalClearTimeout(handle);
 	}) as typeof clearTimeout;
-	globalThis.Worker = ControlledWorker as unknown as typeof Worker;
+	const workerFactory = spyOn(WorkerHandle, "thread").mockImplementation(() => {
+		const worker = new ControlledWorker();
+		const exited = new Promise<number>((resolve) => worker.once("exit", resolve));
+		return new WorkerHandle(worker as unknown as NodeWorker, exited, () => worker.terminate());
+	});
 	return {
 		task,
 		advance: (milliseconds: number) => {
@@ -275,13 +279,13 @@ function controlledDisplaySettlement() {
 			timer.cleared = true;
 			timer.callback();
 		},
-		restore: () => {
+		restore: async () => {
 			// Pool-owned fake handles must be cleared while our clearTimeout still knows them.
-			shutdownDbWorkerPool();
+			await shutdownDbWorkerPool();
 			Date.now = originalNow;
 			globalThis.setTimeout = originalSetTimeout;
 			globalThis.clearTimeout = originalClearTimeout;
-			globalThis.Worker = OriginalWorker;
+			workerFactory.mockRestore();
 		},
 	};
 }
@@ -323,7 +327,7 @@ test("display settlement maps the pool watchdog winning before the outer timer t
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 		expect(clock.activeTimers()).toHaveLength(0);
 	} finally {
-		clock.restore();
+		await clock.restore();
 	}
 });
 
@@ -345,7 +349,7 @@ test("display settlement rejects late success even when the public timer callbac
 		expect(signal.reason).toMatchObject({ statusCode: 504, code: "DISPLAY_PAGE_DEADLINE" });
 		expect(clock.activeTimers()).toHaveLength(0);
 	} finally {
-		clock.restore();
+		await clock.restore();
 	}
 });
 
@@ -366,7 +370,7 @@ test("display settlement accepts success before the absolute cutoff and removes 
 		expect(signal.aborted).toBe(false);
 		expect(clock.activeTimers()).toHaveLength(0);
 	} finally {
-		clock.restore();
+		await clock.restore();
 	}
 });
 
@@ -398,7 +402,7 @@ test("display settlement rechecks the deadline after result validation crosses t
 		expect(signal.aborted).toBe(true);
 		expect(clock.activeTimers()).toHaveLength(0);
 	} finally {
-		clock.restore();
+		await clock.restore();
 	}
 });
 
@@ -424,7 +428,7 @@ test("display settlement preserves a cancellation that happened before the late 
 		expect(signal.reason).toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
 		expect(clock.activeTimers()).toHaveLength(0);
 	} finally {
-		clock.restore();
+		await clock.restore();
 	}
 });
 
@@ -484,12 +488,59 @@ test("display settlement keeps real early and late failure codes instead of cloc
 				if (entry.error instanceof AppError) expect(actual).toBe(entry.error);
 				expect(clock.activeTimers()).toHaveLength(0);
 			} finally {
-				clock.restore();
+				await clock.restore();
 			}
 		}
 	}
 });
 
+test.each([
+	false,
+	true,
+])("display failure diagnostics never expose driver data or change the 503 when sink throws=%s", async (throws) => {
+	const secret = "PRIVATE_DRIVER_SENTINEL /private/display.db";
+	const original = Object.assign(new Error(secret), {
+		code: "PRIVATE_CODE /private/query",
+		name: secret,
+	});
+	original.stack = `Error: ${secret}\n    at /private/worker-entry.ts:7:4`;
+	const warn = spyOn(logger, "warn").mockImplementation(() => {
+		if (throws) throw new Error("PRIVATE_LOG_FAILURE");
+	});
+	try {
+		const port: NarratorDisplayPagePort = {
+			execution: "off-main",
+			async readMessages() {
+				throw original;
+			},
+		};
+		const actual = await failureOf(
+			readNarratorDisplayMessages({ backend: "postgres", port }, ["message-1"], { ioBudget: 32 }),
+		);
+		expect(actual).toMatchObject({ statusCode: 503, code: "DISPLAY_PAGE_READER_UNAVAILABLE" });
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0]?.[0]).toBe("History display read failed");
+		expect(warn.mock.calls[0]?.[1]).toMatchObject({ kind: "display-page", outcome: "error" });
+		const logged = JSON.stringify(warn.mock.calls);
+		for (const value of [
+			"PRIVATE_DRIVER_SENTINEL",
+			"PRIVATE_CODE",
+			"PRIVATE_LOG_FAILURE",
+			"/private/",
+			"worker-entry.ts",
+		])
+			expect(logged).not.toContain(value);
+		for (const value of Object.values(warn.mock.calls[0]?.[1] ?? {}))
+			expect(
+				value === undefined ||
+					typeof value === "string" ||
+					typeof value === "number" ||
+					typeof value === "boolean",
+			).toBe(true);
+	} finally {
+		warn.mockRestore();
+	}
+});
 describe("real readonly display page worker", () => {
 	test("explicit DTO columns stay field-compatible with Drizzle, without importing it into the worker", () => {
 		expect(DISPLAY_MESSAGE_COLUMNS.map((column) => column.field).sort()).toEqual(
@@ -969,6 +1020,9 @@ describe("real readonly display page worker", () => {
 		expect(getDbWorkerPoolStats().busy).toBe(1);
 		controller.abort();
 		expect(await task).toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
+		// HTTP detaches immediately; synchronous SQLite may still be unwinding in its thread.
+		// Only the awaited close barrier proves the DB connection and permit were released.
+		await shutdownDbWorkerPool();
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 		expect(getDbWorkerPoolStats().busy).toBe(0);
 		removeSlowDisplayFixture();
@@ -985,6 +1039,7 @@ describe("real readonly display page worker", () => {
 			code: "DISPLAY_PAGE_DEADLINE",
 		});
 		expect(Date.now() - started).toBeLessThan(1500);
+		await shutdownDbWorkerPool();
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 		removeSlowDisplayFixture();

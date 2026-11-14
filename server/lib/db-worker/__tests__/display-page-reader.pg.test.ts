@@ -26,7 +26,7 @@ test("PG display port invalid URL/connection errors never expose credential sent
 	const secret = "PG_DISPLAY_SECRET_SENTINEL";
 	const previous = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
-	resetDbWorkerPoolForTest();
+	await resetDbWorkerPoolForTest();
 	try {
 		for (const url of [`not-a-url-${secret}`, `postgres://user:${secret}@127.0.0.1:1/invalid`]) {
 			const failure = await failureOf(
@@ -52,7 +52,7 @@ test("PG display port invalid URL/connection errors never expose credential sent
 		expect(failure).toMatchObject({ code: "DISPLAY_PAGE_READER_UNAVAILABLE" });
 		expect(String((failure as Error).message)).not.toContain(secret);
 	} finally {
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 		else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previous;
 	}
@@ -64,7 +64,7 @@ test("PG display port invalid URL/connection errors never expose credential sent
 		let callbackError: unknown;
 		const previous = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
-		resetDbWorkerPoolForTest();
+		await resetDbWorkerPoolForTest();
 		try {
 			const result = await withPostgres(async ({ port, credentials }) => {
 				const url = `postgres://${encodeURIComponent(credentials.user)}:${encodeURIComponent(credentials.password)}@127.0.0.1:${port}/${credentials.database}`;
@@ -329,7 +329,7 @@ test("PG display port invalid URL/connection errors never expose credential sent
 			if (callbackError) throw callbackError;
 			expect(result.status).toBe("verified");
 		} finally {
-			shutdownDbWorkerPool();
+			await shutdownDbWorkerPool();
 			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 			else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previous;
 		}

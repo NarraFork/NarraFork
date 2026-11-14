@@ -728,6 +728,27 @@
 		"gone": "已不可查看。",
 		"partial_one": "这里只显示这一页的前 {{count}} 块。",
 		"partial_other": "这里只显示这一页的前 {{count}} 块。",
-		"openPage": "打开这一页"
+		"openPage": "打开这一页",
+		"waiting": "等你回答 {{n}}",
+		"waitingLabel_one": "{{count}} 个提问等你回答",
+		"waitingLabel_other": "{{count}} 个提问等你回答",
+		"waitingAction_one": "回答 {{count}} 个等你回答的提问",
+		"waitingAction_other": "回答 {{count}} 个等你回答的提问",
+		"doingLabel_one": "{{count}} 项任务进行中",
+		"doingLabel_other": "{{count}} 项任务进行中",
+		"summary": {
+			"doing": "正在做：{{text}}",
+			"finished": "已完成：{{text}}"
+		},
+		"locate": "在大纲树里定位",
+		"locateFailed": "没能在树里定位到它：它可能已经不在，或者超出了这一页一次读取的范围。",
+		"dismiss": "知道了",
+		"search": {
+			"label": "搜索结果",
+			"hint": "命中的内容和它们的上级。点一条命中，在树里定位到它。",
+			"locate": "在树里定位：{{title}}",
+			"more": "更多匹配 ▸",
+			"untitled": "无标题"
+		}
 	}
 }

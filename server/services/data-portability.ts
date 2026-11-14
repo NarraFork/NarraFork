@@ -18,6 +18,8 @@
  *   需要补默认值或拒绝旧版本；
  * - 新增需要「清空」的数据需在 `clearData` 对应分支处理；
  * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话改了 task_backend 时删掉它的行，清空会话时一起清；
+ * - 被吞内容排查的两张表（`outline_spec_loss_findings` / `outline_spec_loss_scans`，12c）也不导出：
+ *   说的是本机 spec 修订的事（spec 表不导出），覆盖会话不动它们，清空会话时一起清；
  * - 改完跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
  * 详见 docs/DATA_PORTABILITY.md。
  */
@@ -42,6 +44,7 @@ import { saveSettings, settings } from "@server/lib/settings";
 import {
 	COMMAND_CODE_KEY_OWNER,
 	nugKeyOwner,
+	nugOAuthKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "@server/lib/settings/provider-keys-projection";
 import type { NarraForkSettings } from "@server/lib/settings/types";
@@ -1564,8 +1567,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			if (key === "customApiProviders" && incomingId) {
 				addedCustomApiProviders.set(incomingId, String(copy.id));
 			}
-			// A NUG provider's key is stored by the settings save under its (possibly new) id.
-			if (key === "nugProviders" && incomingId) addedSingleKeyOwners.add(nugKeyOwner(incomingId));
+			// NUG credentials were filled before the merge, so settings saves both under the new id.
+			if (key === "nugProviders" && incomingId) {
+				addedSingleKeyOwners.add(nugKeyOwner(incomingId));
+				addedSingleKeyOwners.add(nugOAuthKeyOwner(incomingId));
+			}
 			// 重名 → 自动追加「-副本」（多次重复时继续加编号）
 			const name = String(copy.name ?? "导入的供应商");
 			if (existingNames.has(name)) {
@@ -1767,6 +1773,9 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				sqlite.run(`DELETE FROM folder_git_identity_bindings`);
 				// The Dynamic Spec import's state (outline P2 PR 12b2); the narrator FK cascades too.
 				sqlite.run(`DELETE FROM outline_spec_imports`);
+				// What the swallowed-content scan recorded about these sessions (outline P2 PR 12c).
+				sqlite.run(`DELETE FROM outline_spec_loss_findings`);
+				sqlite.run(`DELETE FROM outline_spec_loss_scans`);
 				sqlite.run(`DELETE FROM narrators`);
 				deleted.sessions = Number(before.n);
 			}

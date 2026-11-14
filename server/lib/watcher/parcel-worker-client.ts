@@ -1,11 +1,80 @@
+import { fileURLToPath } from "node:url";
 import { logger } from "../logger";
 import { envWithAmbientProxy } from "../net/proxy-env";
+import { WorkerHandle } from "../worker-runtime/lifecycle";
+import { TaskQueue } from "../worker-runtime/queue";
 import type { IFileChange } from "./types";
 import {
 	WATCHER_WORKER_FLAG,
 	type WatcherParentMessage,
 	type WatcherWorkerMessage,
 } from "./worker-protocol";
+
+type WatcherHealthCode =
+	| "native_disabled"
+	| "unwatch_failed"
+	| "ready"
+	| "stdout_read_failed"
+	| "stderr_read_failed"
+	| "stderr_output"
+	| "invalid_message"
+	| "worker_log"
+	| "worker_error"
+	| "exited"
+	| "resubscribed"
+	| "resubscribe_failed"
+	| "session_disabled"
+	| "stopped"
+	| "all_stopped"
+	| "subscribe_skipped"
+	| "subscribed"
+	| "event_overflow"
+	| "inotify_limit"
+	| "fd_limit"
+	| "unavailable"
+	| "restart_requested"
+	| "restart_failed"
+	| "restart_exhausted"
+	| "root_deleted"
+	| "root_reappeared"
+	| "resume_failed"
+	| "suspend_watch_failed";
+
+/** Native watcher health never forwards worker log bodies, paths or error text to server logs. */
+export function reportWatcherHealth(
+	code: WatcherHealthCode,
+	level: "debug" | "info" | "warn" | "error" = "debug",
+	counts: {
+		bytes?: number;
+		active?: number;
+		restartAttempts?: number;
+		restart?: number;
+		pending?: number;
+		count?: number;
+		pid?: number;
+		fatal?: boolean;
+	} = {},
+): void {
+	const data: Record<string, string | number | boolean> = { code };
+	for (const key of [
+		"bytes",
+		"active",
+		"restartAttempts",
+		"restart",
+		"pending",
+		"count",
+		"pid",
+	] as const) {
+		const value = counts[key];
+		if (typeof value === "number" && Number.isFinite(value)) data[key] = value;
+	}
+	if (typeof counts.fatal === "boolean") data.fatal = counts.fatal;
+	try {
+		logger[level]("Parcel watcher health", data);
+	} catch {
+		/* Advisory only; never skip stop/exit. */
+	}
+}
 
 export interface WorkerSubscription {
 	unsubscribe(): Promise<void>;
@@ -49,7 +118,11 @@ function buildWorkerCommand(): string[] {
 	if (isCompiledRuntime()) {
 		return [process.execPath, WATCHER_WORKER_FLAG];
 	}
-	return [process.execPath, "server/index.ts", WATCHER_WORKER_FLAG];
+	return [
+		process.execPath,
+		fileURLToPath(new URL("../../index.ts", import.meta.url)),
+		WATCHER_WORKER_FLAG,
+	];
 }
 
 /**
@@ -147,7 +220,15 @@ export class ParcelWorkerClient {
 	private readyWaiter: ReadyWaiter | undefined;
 	private readonly pending = new Map<string, PendingRequest>();
 	private readonly active = new Map<string, ActiveWatchRequest>();
-	private writeQueue: Promise<void> = Promise.resolve();
+	private readonly writes = new TaskQueue({
+		concurrency: 1,
+		maxQueued: 64,
+		maxQueuedBytes: 4 * 1024 * 1024,
+	});
+	private handle: WorkerHandle<ReturnType<typeof Bun.spawn>> | undefined;
+	private shutdownPromise: Promise<void> | undefined;
+	private readers: Promise<void> = Promise.resolve();
+	private restartTimer: ReturnType<typeof setTimeout> | undefined;
 	private shuttingDown = false;
 	private restartAttempts = 0;
 	private disabledReason: string | undefined;
@@ -161,9 +242,7 @@ export class ParcelWorkerClient {
 		if (!isNativeWatcherEnabled()) {
 			if (!nativeWatcherDisabledLogged) {
 				nativeWatcherDisabledLogged = true;
-				logger.warn("[ParcelWatcher] native worker disabled; using fallback polling", {
-					enableWith: `${ENABLE_NATIVE_WATCHER_ENV}=1`,
-				});
+				reportWatcherHealth("native_disabled", "warn");
 			}
 			throw new Error("native watcher disabled");
 		}
@@ -192,28 +271,38 @@ export class ParcelWorkerClient {
 				UNWATCH_ACK_TIMEOUT_MS,
 				`unwatch ${rootPath}`,
 			);
-		} catch (error) {
-			logger.debug("[ParcelWatcher] worker unwatch failed", {
-				path: rootPath,
-				error: String(error),
-			});
+		} catch {
+			reportWatcherHealth("unwatch_failed");
 		}
 	}
 
-	async shutdown(): Promise<void> {
+	shutdown(): Promise<void> {
+		if (this.shutdownPromise) return this.shutdownPromise;
 		this.shuttingDown = true;
+		clearTimeout(this.restartTimer);
+		this.restartTimer = undefined;
 		this.active.clear();
+		this.rejectReady(new Error("watcher worker shutting down"));
 		this.clearAllPending(new Error("watcher worker shutting down"));
-
-		if (this.proc) {
+		const handle = this.handle;
+		// Arm escalation before any potentially blocked stdin flush/startup wait.
+		const timer = setTimeout(() => this.killWorker(), 500);
+		this.shutdownPromise = (async () => {
 			try {
-				await this.send({ type: "shutdown" });
-			} catch {
-				// ignored: worker may already be gone
+				if (handle) {
+					await Promise.race([this.send({ type: "shutdown" }).catch(() => {}), handle.exited]);
+					this.closeStdin();
+				}
+				const drained = this.writes.close();
+				await this.startPromise?.catch(() => {});
+				if (handle) await handle.exited;
+				await drained;
+				await this.readers;
+			} finally {
+				clearTimeout(timer);
 			}
-			this.closeStdin();
-			setTimeout(() => this.killWorker(), 500);
-		}
+		})();
+		return this.shutdownPromise;
 	}
 
 	/**
@@ -260,6 +349,7 @@ export class ParcelWorkerClient {
 	}
 
 	private async ensureStarted(): Promise<void> {
+		if (this.shuttingDown) throw new Error("watcher worker shutting down");
 		if (this.proc) return;
 		if (this.disabledReason) {
 			throw new Error(`native watcher disabled for this session: ${this.disabledReason}`);
@@ -274,7 +364,7 @@ export class ParcelWorkerClient {
 
 	private async startWorker(): Promise<void> {
 		const command = buildWorkerCommand();
-		this.shuttingDown = false;
+		if (this.shuttingDown) throw new Error("watcher worker shutting down");
 
 		const readyPromise = new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -284,7 +374,7 @@ export class ParcelWorkerClient {
 		});
 
 		try {
-			this.proc = Bun.spawn(command, {
+			const handle = WorkerHandle.subprocess(command, {
 				cwd: process.cwd(),
 				env: cloneEnv(),
 				stdin: "pipe",
@@ -292,20 +382,25 @@ export class ParcelWorkerClient {
 				stderr: "pipe",
 				windowsHide: true,
 			});
+			this.handle = handle;
+			this.proc = handle.resource;
 		} catch (error) {
-			this.readyWaiter = undefined;
+			this.rejectReady(error instanceof Error ? error : new Error(String(error)));
+			await readyPromise.catch(() => {});
 			throw error;
 		}
 
 		const proc = this.proc;
-		void this.readStdout(proc.stdout as ReadableStream<Uint8Array> | null, proc);
-		void this.readStderr(proc.stderr as ReadableStream<Uint8Array> | null, proc);
-		void proc.exited.then((code) => this.handleExit(proc, code));
+		this.readers = Promise.all([
+			this.readStdout(proc.stdout as ReadableStream<Uint8Array> | null, proc),
+			this.readStderr(proc.stderr as ReadableStream<Uint8Array> | null, proc),
+		]).then(() => {});
+		void this.handle?.exited.then((code) => this.handleExit(proc, code));
 
 		try {
 			await readyPromise;
 			this.restartAttempts = 0;
-			logger.debug("[ParcelWatcher] worker process ready", { pid: proc.pid, command });
+			reportWatcherHealth("ready", "debug", { pid: proc.pid });
 		} catch (error) {
 			this.disableForSession(String(error));
 			throw error;
@@ -326,6 +421,11 @@ export class ParcelWorkerClient {
 				const { done, value } = await reader.read();
 				if (done) break;
 				buffer += decoder.decode(value, { stream: true });
+				if (Buffer.byteLength(buffer) > 1024 * 1024) {
+					this.disableForSession("worker line limit exceeded");
+					await reader.cancel().catch(() => {});
+					return;
+				}
 				let newlineIndex = buffer.indexOf("\n");
 				while (newlineIndex >= 0) {
 					const line = buffer.slice(0, newlineIndex).trim();
@@ -336,9 +436,9 @@ export class ParcelWorkerClient {
 			}
 			buffer += decoder.decode();
 			if (buffer.trim()) this.handleLine(buffer.trim());
-		} catch (error) {
+		} catch {
 			if (this.proc === proc && !this.shuttingDown) {
-				logger.warn("[ParcelWatcher] worker stdout reader failed", { error: String(error) });
+				reportWatcherHealth("stdout_read_failed", "warn");
 			}
 		} finally {
 			reader.releaseLock();
@@ -359,19 +459,26 @@ export class ParcelWorkerClient {
 				const { done, value } = await reader.read();
 				if (done) break;
 				buffer += decoder.decode(value, { stream: true });
+				if (Buffer.byteLength(buffer) > 1024 * 1024) {
+					this.disableForSession("worker line limit exceeded");
+					await reader.cancel().catch(() => {});
+					return;
+				}
 				let newlineIndex = buffer.indexOf("\n");
 				while (newlineIndex >= 0) {
 					const line = buffer.slice(0, newlineIndex).trim();
 					buffer = buffer.slice(newlineIndex + 1);
-					if (line) logger.debug(line);
+					if (line)
+						reportWatcherHealth("stderr_output", "debug", { bytes: Buffer.byteLength(line) });
 					newlineIndex = buffer.indexOf("\n");
 				}
 			}
 			buffer += decoder.decode();
-			if (buffer.trim()) logger.debug(buffer.trim());
-		} catch (error) {
+			if (buffer.trim())
+				reportWatcherHealth("stderr_output", "debug", { bytes: Buffer.byteLength(buffer) });
+		} catch {
 			if (this.proc === proc && !this.shuttingDown) {
-				logger.warn("[ParcelWatcher] worker stderr reader failed", { error: String(error) });
+				reportWatcherHealth("stderr_read_failed", "warn");
 			}
 		} finally {
 			reader.releaseLock();
@@ -382,18 +489,15 @@ export class ParcelWorkerClient {
 		let message: WatcherWorkerMessage;
 		try {
 			message = JSON.parse(line) as WatcherWorkerMessage;
-		} catch (error) {
-			logger.warn("[ParcelWatcher] invalid worker message", { line, error: String(error) });
+		} catch {
+			reportWatcherHealth("invalid_message", "warn", { bytes: Buffer.byteLength(line) });
 			return;
 		}
 
 		switch (message.type) {
 			case "ready":
 				this.resolveReady();
-				logger.debug("[ParcelWatcher] worker reported ready", {
-					pid: message.pid,
-					backend: message.backend,
-				});
+				reportWatcherHealth("ready", "debug", { pid: message.pid });
 				break;
 			case "watch_ack":
 			case "unwatch_ack":
@@ -404,20 +508,23 @@ export class ParcelWorkerClient {
 				this.onEvents(message.path, message.events);
 				break;
 			case "log": {
-				const level = message.level === "trace" ? "debug" : message.level;
-				logger[level](message.message, message.data ?? {});
+				const level =
+					message.level === "error"
+						? "error"
+						: message.level === "warn"
+							? "warn"
+							: message.level === "info"
+								? "info"
+								: "debug";
+				reportWatcherHealth("worker_log", level, { bytes: Buffer.byteLength(message.message) });
 				break;
 			}
 			case "error":
 				if (message.requestId) {
 					this.rejectPending(message.requestId, new Error(message.error));
 				} else {
-					logger.warn("[ParcelWatcher] worker error", {
-						id: message.id,
-						error: message.error,
-						fatal: message.fatal,
-					});
-					this.onUnavailable(message.error);
+					reportWatcherHealth("worker_error", "warn", { fatal: message.fatal });
+					this.notifyUnavailable(message.error);
 					if (message.fatal) this.killWorker();
 				}
 				break;
@@ -429,6 +536,7 @@ export class ParcelWorkerClient {
 		timeoutMs: number,
 		description: string,
 	): Promise<WatcherWorkerMessage> {
+		if (this.pending.size >= 64) return Promise.reject(new Error("watcher request queue full"));
 		const promise = new Promise<WatcherWorkerMessage>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(requestId);
@@ -496,34 +604,41 @@ export class ParcelWorkerClient {
 
 	private async send(message: WatcherParentMessage): Promise<void> {
 		const data = encodeWorkerCommand(message);
-		const next = this.writeQueue
-			.catch(() => {})
-			.then(async () => {
-				const stdin = this.getFileSink();
+		if (data.byteLength > 1024 * 1024) throw new Error("watcher command limit exceeded");
+		const handle = this.handle;
+		await this.writes.run(
+			async () => {
+				if (!handle || this.handle !== handle)
+					throw new Error("watcher process no longer available");
+				const stdin = asWorkerStdinSink(handle.resource.stdin);
 				if (!stdin) throw new Error("watcher worker stdin is not available");
-				await writeFileSinkCommand(stdin, data);
-			});
-		this.writeQueue = next;
-		return next;
+				await Promise.race([
+					writeFileSinkCommand(stdin, data),
+					handle.exited.then(() => {
+						throw new Error("watcher process exited during write");
+					}),
+				]);
+			},
+			{ bytes: data.byteLength, deadlineAt: Infinity },
+		);
 	}
 
 	private handleExit(proc: ReturnType<typeof Bun.spawn>, code: number): void {
 		if (this.proc !== proc) return;
-		this.proc = undefined;
-		this.writeQueue = Promise.resolve();
 		this.closeStdin();
+		this.proc = undefined;
+		this.handle = undefined;
 		this.rejectReady(new Error(`watcher worker exited before ready with code ${code}`));
 		this.clearAllPending(new Error(`watcher worker exited with code ${code}`));
 
 		if (this.shuttingDown) return;
 
 		const reason = `watcher worker exited with code ${code}`;
-		logger.warn("[ParcelWatcher] worker process exited", {
-			code,
+		reportWatcherHealth("exited", "warn", {
 			active: this.active.size,
 			restartAttempts: this.restartAttempts,
 		});
-		this.onUnavailable(reason);
+		this.notifyUnavailable(reason);
 
 		if (
 			this.active.size > 0 &&
@@ -531,7 +646,8 @@ export class ParcelWorkerClient {
 			this.restartAttempts < MAX_WORKER_RESTARTS
 		) {
 			this.restartAttempts++;
-			setTimeout(() => {
+			this.restartTimer = setTimeout(() => {
+				this.restartTimer = undefined;
 				void this.resubscribeAll();
 			}, WORKER_RESTART_DELAY_MS);
 		}
@@ -546,32 +662,34 @@ export class ParcelWorkerClient {
 				if (!this.active.has(request.rootPath)) continue;
 				await this.sendWatch(request.rootPath, request.ignore, WATCH_ACK_TIMEOUT_MS);
 			}
-			logger.info("[ParcelWatcher] worker restarted and subscriptions restored", {
-				count: requests.length,
-			});
+			reportWatcherHealth("resubscribed", "info", { count: requests.length });
 		} catch (error) {
-			logger.warn("[ParcelWatcher] worker resubscribe failed", { error: String(error) });
-			this.onUnavailable(String(error));
+			reportWatcherHealth("resubscribe_failed", "warn");
+			this.notifyUnavailable(String(error));
 		}
 	}
 
 	private disableForSession(reason: string): void {
 		if (this.disabledReason) return;
 		this.disabledReason = reason;
-		logger.warn("[ParcelWatcher] native worker disabled for this session", { reason });
+		reportWatcherHealth("session_disabled", "warn");
 		this.clearAllPending(new Error(`native watcher disabled for this session: ${reason}`));
-		this.onUnavailable(reason);
+		this.notifyUnavailable(reason);
 		this.killWorker();
 	}
 
-	private killWorker(): void {
-		const proc = this.proc;
-		if (!proc) return;
-		this.closeStdin();
+	private notifyUnavailable(reason: string): void {
 		try {
-			proc.kill();
+			this.onUnavailable(reason);
 		} catch {
-			// already gone
+			/* Advisory callback cannot skip kill/restart. */
 		}
+	}
+
+	private killWorker(): void {
+		const handle = this.handle;
+		if (!handle) return;
+		this.closeStdin();
+		void handle.close().catch(() => {});
 	}
 }

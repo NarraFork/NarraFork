@@ -17,7 +17,10 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { FileReferenceContext } from "@shared/file-reference";
+import { decodeLegacyContent } from "@shared/narrator-blocks/decode";
 import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { OutputContentAccumulator } from "../../lib/agent/output-content";
+import { toTurns } from "../../lib/agent/projection/turns";
 import type { AgentConfig, AgentEvent, ContentBlock } from "../../lib/agent/types";
 import type { EventHandlerContext } from "../narrator-event-handler";
 
@@ -545,6 +548,80 @@ describe("identified content checkpoints through the real event consumer", () =>
 			{
 				role: "user",
 				parts: [{ functionResponse: { name: "Read", response: { output: "file content" } } }],
+			},
+		]);
+	});
+
+	test("late accumulator metadata preserves replay arrays through storage and canonical projection", async () => {
+		seedNarrator();
+		const ctx = makeContext();
+		const content = new OutputContentAccumulator();
+		const lane = { blockId: "rs-1", outputIndex: 0 };
+		const openai = {
+			itemId: "rs-1",
+			textFormat: "mixed" as const,
+			reasoningContent: [
+				{ type: "reasoning_text" as const, text: " 正文\r\n\u0000e\u0301 " },
+				{ type: "reasoning_text" as const, text: "" },
+				{ type: "reasoning_text" as const, text: "正文二\\n" },
+			],
+			reasoningSummary: [
+				{ type: "summary_text" as const, text: " 摘要二\r\n" },
+				{ type: "summary_text" as const, text: "摘要一\t" },
+			],
+		};
+		content.append("reasoning", "visible summary", lane, {
+			openai,
+			signatureSource: "openai:test",
+		});
+		for (const event of content.boundary({ kind: "reasoning", phase: "complete", ...lane })) {
+			await processEvent(event, ctx);
+		}
+		const messageId = ctx.getPartialMessageId() as string;
+		expect(storedBlocks(messageId)[0].providerMetadata).toEqual({
+			openai,
+			signatureSource: "openai:test",
+		});
+
+		const lateOpenai = { ...openai, reasoningEncryptedContent: " cipher\r\n " };
+		const updates = [
+			...content.reasoningMetadata(
+				{ openai: { reasoningEncryptedContent: lateOpenai.reasoningEncryptedContent } },
+				lane,
+			),
+		];
+		expect(updates).toHaveLength(1);
+		for (const event of updates) await processEvent(event, ctx);
+		const restored = storedBlocks(messageId);
+		expect(restored[0].providerMetadata).toEqual({
+			openai: lateOpenai,
+			signatureSource: "openai:test",
+		});
+		const envelope = decodeLegacyContent({
+			id: messageId,
+			role: "assistant",
+			contentJson: restored,
+			contentText: null,
+			parentToolUseId: null,
+		});
+		const history = toTurns([JSON.parse(JSON.stringify(envelope))], {
+			strict: true,
+			reasoningSource: "openai:test",
+		});
+		expect(history.turns).toEqual([
+			{
+				kind: "assistant",
+				envelopeId: messageId,
+				items: [
+					{
+						kind: "reasoning",
+						blockId: envelope.blocks[0].id,
+						text: "visible summary",
+						sameSource: true,
+						credentials: { openai: lateOpenai },
+						source: "openai:test",
+					},
+				],
 			},
 		]);
 	});

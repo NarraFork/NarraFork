@@ -39,6 +39,7 @@
 | 跳过会话 | 不导入该会话的消息、引用、工具调用、消息块，以及 `narrator_id` 指向它的请求 |
 | 覆盖会话 | 保留会话行（`narrator_messages.narrator_id` 是 NOT NULL，删行会失败），用导入行 `UPDATE` 各列。子行按主键合并，不删除本地的引用、工具调用或消息块。例外：`task_backend` 变了时删掉该会话在 `outline_spec_imports` 的行（见下） |
 | Dynamic Spec 导入状态 `outline_spec_imports` | **不导出**。它说的是本机 spec 行和本机大纲内容之间的关系，而 spec 表和大纲表都不导出，带过去的行会指向那边没有的空间、任务页、spec 修订，`reverted` 还会挡住那边的导入。`narrators.task_backend` 随会话行照旧复制。覆盖本地会话时，导入行带来的 `task_backend` 和本地不同才删掉它的状态行（下次尝试重新得出）；相同就保留（管理员的退回决定不丢）。导入后清任务后端与导入状态的缓存 |
+| 被吞内容排查 `outline_spec_loss_findings` / `outline_spec_loss_scans` | **不导出**。记录的是本机 spec 修订里「旧 Spec 面板保存后可能丢失的内容」和哪些会话查过；spec 表不导出，带过去的行对不上那边的修订，那边的排查会自己重新得出。覆盖本地会话时**不动**这两张表（数据导入不改本机的 spec 行，记录仍然成立，人的处理决定也保留） |
 | 消息 `narrator_messages` | `INSERT OR IGNORE`（主键相同的消息被复用，保持 fork 共享语义，不覆盖其它会话内容） |
 | 引用 / 工具调用 | `INSERT OR IGNORE` |
 | 消息块 `narrator_blocks` | `INSERT OR IGNORE`。`body_rows_only = 1` 时正文只在块行里，旧包没有这张表时跳过 |
@@ -63,7 +64,7 @@
 - 分项：`requests`（删 `api_requests` 与按天汇总它的 `usage_daily`）、`sessions`（删会话及其消息/引用/工具调用，
   消息块随消息级联删除；并把 `terminals` / `benchmark_task_results` 的 `narrator_id` 置空，
   保留这些数据本体，同时清空不随会话外键级联的 `folder_git_identity_bindings`，以及
-  Dynamic Spec 导入状态 `outline_spec_imports`，它有会话外键级联，仍显式删除）、
+  Dynamic Spec 导入状态 `outline_spec_imports` 和被吞内容排查的 `outline_spec_loss_findings` / `outline_spec_loss_scans`，它们有会话外键级联，仍显式删除）、
   `providers`（清空全部供应商配置：含平台实例、隐藏模型、逐模型协议与自定义模型；
   **不清模型自定义参数**（`overrides.json`），那里是用户手写的数据）。
 - 全量：以上全部。

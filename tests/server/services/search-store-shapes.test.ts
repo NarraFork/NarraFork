@@ -704,7 +704,7 @@ describe("real worker transport preserves the search store contract", () => {
 		seedTimeCorpus("messages");
 		const directory = mkdtempSync(join(tmpdir(), "narrafork-search-store-worker-"));
 		const dbPath = join(directory, "fixture.db");
-		resetDbWorkerPoolForTest();
+		await resetDbWorkerPoolForTest();
 		try {
 			await Bun.write(dbPath, sqlite.serialize());
 			const workerStore = createSqliteSearchStore(createSqliteSearchQueryExecutor(dbPath));
@@ -750,7 +750,7 @@ describe("real worker transport preserves the search store contract", () => {
 				await searchStore.listShadowedEntryIds(shadow),
 			);
 		} finally {
-			shutdownDbWorkerPool();
+			await shutdownDbWorkerPool();
 			rmSync(directory, { recursive: true, force: true });
 		}
 	}, 30_000);

@@ -345,13 +345,24 @@ describe("stripProviderMetadata", () => {
 		expect(stripped[0].contentJson[0].text).toBe("the visible reasoning body");
 	});
 
-	test("drops replay metadata even when there is no ciphertext to flag", () => {
-		const stripped = stripProviderMetadata([
-			reasoningMessage([
-				{ type: "reasoning", text: "body", providerMetadata: { openai: { itemId: "r-1" } } },
-			]),
+	test("drops replay arrays even when there is no ciphertext to flag", () => {
+		const providerMetadata = {
+			openai: {
+				itemId: "r-1",
+				textFormat: "mixed",
+				reasoningContent: [{ type: "reasoning_text", text: "private native body\r\n" }],
+				reasoningSummary: [{ type: "summary_text", text: "replay-only summary\t" }],
+			},
+		};
+		const original = reasoningMessage([
+			{ type: "reasoning", text: "visible body", providerMetadata },
 		]);
-		expect(stripped[0].contentJson[0].providerMetadata).toBeUndefined();
+		const before = JSON.stringify(original);
+		const stripped = stripProviderMetadata([original]);
+		expect(stripped[0].contentJson[0]).toEqual({ type: "reasoning", text: "visible body" });
+		expect(JSON.stringify(stripped)).not.toContain("private native body");
+		expect(JSON.stringify(stripped)).not.toContain("replay-only summary");
+		expect(JSON.stringify(original)).toBe(before);
 	});
 
 	test("leaves blocks without provider metadata untouched by reference", () => {

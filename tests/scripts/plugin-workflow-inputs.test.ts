@@ -8,7 +8,7 @@ import { isolatedSmokeEnvironment } from "../../scripts/smoke-plugin-ui";
 type Step = { run?: string; if?: string; "continue-on-error"?: boolean };
 type Workflow = {
 	on: { push: { paths: string[] }; pull_request: { paths: string[] } };
-	jobs: Record<string, { steps: Step[] }>;
+	jobs: Record<string, { steps: Step[]; strategy?: { matrix: { os: string[] } } }>;
 };
 const root = resolve(import.meta.dir, "../..");
 const workflow = Bun.YAML.parse(
@@ -61,6 +61,30 @@ describe("plugin acceptance workflow inputs", () => {
 				step.run?.includes("server/lib/agent/execution/__tests__/local-backend-read.test.ts"),
 			),
 		).toBe(true);
+	});
+
+	test("the Windows Job proof and compiled launcher run alongside every existing security test", () => {
+		const lane = workflow.jobs["cross-platform-security"];
+		expect(lane?.strategy?.matrix.os).toContain("windows-latest");
+		const step = lane?.steps.find((entry) => entry.run?.includes("bun test --isolate"));
+		expect(step).toBeDefined();
+		expect(step?.if).toBeUndefined();
+		expect(step?.["continue-on-error"]).not.toBe(true);
+		for (const path of [
+			"server/lib/agent/execution/__tests__/local-backend-read.test.ts",
+			"tests/server/services/plugin-manager.test.ts",
+			"server/services/__tests__/plugin-podman-runner.test.ts",
+			"server/services/__tests__/plugin-process-runner.test.ts",
+			"server/services/__tests__/plugin-signature.test.ts",
+			"server/services/__tests__/plugin-sbom.test.ts",
+			"tests/server/services/plugin-runtime-windows-job.test.ts",
+			"server/lib/plugins/windows-plugin-launcher.compiled.test.ts",
+		]) {
+			expect(step?.run).toContain(path);
+			expect(existingInput(path)).toBe(true);
+		}
+		for (const event of ["push", "pull_request"] as const)
+			expect(workflow.on[event].paths).toContain("server/lib/plugins/**");
 	});
 
 	test("a no-op panel drag cannot pass just because its textarea sentinel survived", () => {

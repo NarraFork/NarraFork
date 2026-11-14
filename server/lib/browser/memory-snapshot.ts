@@ -1,9 +1,10 @@
 import { unlink } from "node:fs/promises";
-import { Worker } from "node:worker_threads";
-import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../compiled-worker";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "../compiled-worker";
 import { isCompiledRuntime } from "../runtime-target";
+import { WorkerCleanupError, type WorkerHandle } from "../worker-runtime/lifecycle";
+import type { TaskQueuePermit } from "../worker-runtime/queue";
+import { memoryDiagnosticQueue, trackMemoryDiagnostic, waitForMemory } from "./memory-job";
 import {
-	boundedCleanup,
 	SNAPSHOT_CLEANUP_MS,
 	SNAPSHOT_MAX_BYTES,
 	SnapshotError,
@@ -13,6 +14,8 @@ import type { SnapshotRequest } from "./memory-snapshot-worker";
 
 export interface HeapSnapshotOptions extends SnapshotRequest {
 	signal: AbortSignal;
+	/** Retain session/diagnostic ownership if the bounded response precedes physical cleanup. */
+	onCleanup?: (cleanup: Promise<void>) => void;
 }
 export function snapshotWorkerSpecifiers(
 	compiled = isCompiledRuntime(),
@@ -29,13 +32,6 @@ type SnapshotReply =
 	| { kind: "ready" }
 	| { kind: "done"; fileSize: number }
 	| { kind: "failed"; stage: SnapshotStage };
-export interface SnapshotWorker {
-	on(event: "message", listener: (message: SnapshotReply) => void): unknown;
-	on(event: "error" | "exit", listener: () => void): unknown;
-	removeAllListeners(): unknown;
-	postMessage(value: unknown): void;
-	terminate(): Promise<number>;
-}
 const STAGES = new Set<SnapshotStage>([
 	"busy",
 	"input",
@@ -51,18 +47,16 @@ const STAGES = new Set<SnapshotStage>([
 	"timeout",
 	"worker",
 ]);
-let snapshotActive = false;
 
-/** Test seam also exercises real admission, cancellation and startup candidate fallback. */
+/** Public queue owns admission; the connector/handle own readiness and actual native exit. */
 export function createSnapshotExporter(
 	dependencies: {
-		spawn?: (specifier: string) => SnapshotWorker;
 		specifiers?: () => string[];
 		unlink?: (path: string) => Promise<void>;
+		cleanupMs?: number;
 	} = {},
 ) {
 	return async (opts: HeapSnapshotOptions): Promise<{ fileSize: number }> => {
-		if (snapshotActive) throw new SnapshotError("busy");
 		if (
 			!opts.targetId ||
 			!opts.wsEndpoint ||
@@ -74,111 +68,169 @@ export function createSnapshotExporter(
 		)
 			throw new SnapshotError("input");
 		if (opts.signal.aborted) throw new SnapshotError("cancelled");
-		snapshotActive = true;
-		let worker: SnapshotWorker | undefined;
+		const controller = new AbortController();
+		const abort = () => controller.abort();
+		opts.signal.addEventListener("abort", abort, { once: true });
+		let complete!: () => void;
+		const done = new Promise<void>((resolve) => {
+			complete = resolve;
+		});
+		try {
+			trackMemoryDiagnostic({ controller, done });
+		} catch {
+			opts.signal.removeEventListener("abort", abort);
+			throw new SnapshotError("busy");
+		}
+		let permit: TaskQueuePermit | undefined;
+		let handle: WorkerHandle<import("node:worker_threads").Worker> | undefined;
+		let startup: Promise<unknown> | undefined;
 		let dispatched = false;
 		let success = false;
+		let result: { fileSize: number } | undefined;
+		let failure: unknown;
+		let cleanupTimedOut = false;
 		const deadline = Date.now() + opts.timeoutMs;
-		const { signal, ...request } = opts;
+		let timedOut = false;
+		const deadlineTimer = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, opts.timeoutMs);
+		const cleanupMs = dependencies.cleanupMs ?? SNAPSHOT_CLEANUP_MS;
+		const signal = controller.signal;
+		const { signal: _signal, onCleanup: _cleanup, ...request } = opts;
 		request.maxBytes = Math.min(request.maxBytes, SNAPSHOT_MAX_BYTES);
+		let removeListeners = () => {};
 		try {
-			for (const specifier of (dependencies.specifiers ?? snapshotWorkerSpecifiers)()) {
-				if (signal.aborted) throw new SnapshotError("cancelled");
-				if (Date.now() >= deadline) throw new SnapshotError("timeout");
-				try {
-					worker = (dependencies.spawn ?? ((path) => new Worker(workerEntryFromSpecifier(path))))(
-						specifier,
-					);
-					const current = worker;
-					const result = await new Promise<{ fileSize: number }>((resolve, reject) => {
-						let settled = false;
-						const finish = (error?: SnapshotError, fileSize?: number) => {
-							if (settled) return;
-							settled = true;
-							clearTimeout(timer);
-							signal.removeEventListener("abort", abort);
-							current.removeAllListeners();
-							if (error) reject(error);
-							else resolve({ fileSize: fileSize as number });
-						};
-						const abort = () => finish(new SnapshotError("cancelled"));
-						const timer = setTimeout(
-							() => finish(new SnapshotError("timeout")),
-							deadline - Date.now(),
-						);
-						signal.addEventListener("abort", abort, { once: true });
-						current.on("message", (message) => {
-							if (settled) return;
-							if (message?.kind === "ready" && !dispatched) {
-								dispatched = true;
-								try {
-									current.postMessage({ kind: "start", opts: request });
-								} catch {
-									finish(new SnapshotError("worker"));
-								}
-							} else if (message?.kind === "done" && dispatched) {
-								if (
-									Number.isSafeInteger(message.fileSize) &&
-									message.fileSize > 0 &&
-									message.fileSize <= request.maxBytes
-								)
-									finish(undefined, message.fileSize);
-								else finish(new SnapshotError("worker"));
-							} else if (message?.kind === "failed") {
-								finish(new SnapshotError(STAGES.has(message.stage) ? message.stage : "worker"));
-							}
-						});
-						current.on("error", () => finish(new SnapshotError("startup")));
-						current.on("exit", () => finish(new SnapshotError(dispatched ? "worker" : "startup")));
-						if (signal.aborted) abort();
-					});
-					success = true;
-					return result;
-				} catch (error) {
-					if (worker) {
-						await stopWorker(worker);
-						worker = undefined;
-					}
-					if (dispatched || signal.aborted || Date.now() >= deadline)
-						throw error instanceof SnapshotError ? error : new SnapshotError("worker");
-				}
-			}
-			throw new SnapshotError("startup");
-		} finally {
 			try {
-				if (worker) await stopWorker(worker);
-				if (!success && dispatched) {
-					const remove = dependencies.unlink ?? unlink;
-					await boundedCleanup(() =>
-						Promise.all([
+				permit = await memoryDiagnosticQueue.acquire({ signal, deadlineAt: deadline });
+			} catch {
+				throw new SnapshotError(signal.aborted ? "cancelled" : "busy");
+			}
+			if (signal.aborted) throw new SnapshotError(timedOut ? "timeout" : "cancelled");
+			startup = connectCompiledWorker((dependencies.specifiers ?? snapshotWorkerSpecifiers)(), {
+				signal,
+				deadlineAt: deadline,
+				timeoutMs: opts.timeoutMs,
+				sendPing: false,
+				isReady: (message) => (message as SnapshotReply)?.kind === "ready",
+			}).then(
+				(connected) => {
+					handle = connected.handle;
+					return connected;
+				},
+				(error) => {
+					if (error instanceof WorkerCleanupError) handle = error.handle as typeof handle;
+					throw error;
+				},
+			);
+			try {
+				await waitForMemory(startup, signal);
+			} catch {
+				throw new SnapshotError(
+					timedOut
+						? "timeout"
+						: signal.aborted
+							? "cancelled"
+							: Date.now() >= deadline
+								? "timeout"
+								: "startup",
+				);
+			}
+			if (signal.aborted) throw new SnapshotError(timedOut ? "timeout" : "cancelled");
+			if (!handle) throw new SnapshotError("startup");
+			const worker = handle.resource;
+			result = await new Promise<{ fileSize: number }>((resolve, reject) => {
+				let settled = false;
+				const finish = (error?: SnapshotError, fileSize?: number) => {
+					if (settled) return;
+					settled = true;
+					removeListeners();
+					if (error) reject(error);
+					else resolve({ fileSize: fileSize as number });
+				};
+				const cancelled = () => finish(new SnapshotError(timedOut ? "timeout" : "cancelled"));
+				const timer = setTimeout(
+					() => finish(new SnapshotError("timeout")),
+					Math.max(1, deadline - Date.now()),
+				);
+				const message = (reply: SnapshotReply) => {
+					if (reply?.kind === "done") {
+						if (
+							Number.isSafeInteger(reply.fileSize) &&
+							reply.fileSize > 0 &&
+							reply.fileSize <= request.maxBytes
+						)
+							finish(undefined, reply.fileSize);
+						else finish(new SnapshotError("worker"));
+					} else if (reply?.kind === "failed")
+						finish(new SnapshotError(STAGES.has(reply.stage) ? reply.stage : "worker"));
+				};
+				const failure = () => finish(new SnapshotError("worker"));
+				removeListeners = () => {
+					clearTimeout(timer);
+					signal.removeEventListener("abort", cancelled);
+					worker.off("message", message);
+					worker.off("error", failure);
+					worker.off("exit", failure);
+				};
+				worker.on("message", message);
+				worker.on("error", failure);
+				worker.on("exit", failure);
+				signal.addEventListener("abort", cancelled, { once: true });
+				try {
+					dispatched = true;
+					worker.postMessage({ kind: "start", opts: request });
+				} catch {
+					failure();
+				}
+				if (signal.aborted) cancelled();
+			});
+			success = true;
+		} catch (error) {
+			failure = error;
+		} finally {
+			clearTimeout(deadlineTimer);
+			removeListeners();
+			const cleanup = (async () => {
+				try {
+					await startup?.catch(() => {});
+					if (handle) {
+						try {
+							handle.resource.postMessage({ kind: "cancel" });
+						} catch {}
+						// Grace is bounded, native termination is not confused with its response budget.
+						await waitForMemory(handle.exited, AbortSignal.timeout(cleanupMs)).catch(() => {});
+						await handle.close().catch(() => {});
+						await handle.exited;
+					}
+					if (!success && dispatched) {
+						const remove = dependencies.unlink ?? unlink;
+						await Promise.all([
 							remove(`${opts.savePath}.partial`).catch(() => {}),
 							remove(opts.savePath).catch(() => {}),
-						]),
-					);
+						]);
+					}
+				} finally {
+					opts.signal.removeEventListener("abort", abort);
+					permit?.release();
+					complete();
 				}
-			} finally {
-				snapshotActive = false;
+			})();
+			opts.onCleanup?.(cleanup);
+			try {
+				await waitForMemory(cleanup, AbortSignal.timeout(cleanupMs * 3));
+			} catch {
+				if (success) {
+					success = false;
+					cleanupTimedOut = true;
+				}
 			}
 		}
+		if (cleanupTimedOut) throw new SnapshotError("timeout");
+		if (!success) throw failure;
+		if (!result) throw new SnapshotError("worker");
+		return result;
 	};
-}
-
-async function stopWorker(worker: SnapshotWorker): Promise<void> {
-	worker.removeAllListeners();
-	// Never surface raw worker exceptions (they may contain endpoints or heap data).
-	worker.on("error", () => {});
-	try {
-		worker.postMessage({ kind: "cancel" });
-	} catch {}
-	await new Promise<void>((resolve) => {
-		const timer = setTimeout(resolve, SNAPSHOT_CLEANUP_MS);
-		worker.on("exit", () => {
-			clearTimeout(timer);
-			resolve();
-		});
-	});
-	await boundedCleanup(() => worker.terminate());
-	worker.removeAllListeners();
 }
 
 export const exportHeapSnapshot = createSnapshotExporter();

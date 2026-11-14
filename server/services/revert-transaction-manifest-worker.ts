@@ -25,6 +25,10 @@ import {
 	isSnapshotSelectionComplete,
 	type RevertSelectionResult,
 } from "./revert-selection-service";
+import {
+	REVERT_MANIFEST_WORKER_VERSION,
+	type TransactionManifestWorkerRequest,
+} from "./revert-transaction-worker-protocol";
 
 /** Private worker protocol. Raw manifests never get parsed/stringified on the HTTP thread. */
 export interface TransactionManifestFile extends AppendRevertPlanFile {
@@ -60,25 +64,40 @@ export type TransactionManifestRequest =
 			acceptSnapshotRestore?: true;
 	  };
 
+const readyMessage = {
+	type: "revert-manifest-worker-ready",
+	version: REVERT_MANIFEST_WORKER_VERSION,
+} as const;
 const port = parentPort;
 if (port) {
-	port.on("message", (request: TransactionManifestRequest) => {
+	port.on("message", (packet: unknown) => {
+		if (!packet || typeof packet !== "object") {
+			port.postMessage({ error: "INVALID_MANIFEST" });
+			return;
+		}
+		if ("action" in packet && packet.action === "ping") {
+			port.postMessage(readyMessage);
+			return;
+		}
+		const { requestId, request } = packet as TransactionManifestWorkerRequest;
 		try {
+			check(typeof requestId === "string" && !!request, "INVALID_MANIFEST");
 			if (request.action === "compare") {
 				check(equal(request.fixed, request.current), "SELECTION_STALE");
-				port.postMessage({ value: true });
+				port.postMessage({ requestId, value: true });
 			} else if (request.action === "entrypoint") {
 				validateEntrypoint(request);
-				port.postMessage({ value: true });
-			} else port.postMessage({ value: validate(request) });
+				port.postMessage({ requestId, value: true });
+			} else port.postMessage({ requestId, value: validate(request) });
 		} catch (error) {
 			port.postMessage({
+				requestId,
 				error: error instanceof Error ? error.message.slice(0, 128) : "INVALID_MANIFEST",
 			});
 		}
 	});
 	// The caller may probe compiled entry paths, but must never dispatch before this handshake.
-	port.postMessage({ type: "revert-manifest-worker-ready", version: 1 });
+	port.postMessage(readyMessage);
 }
 
 /** Also works for terminal journals: applying twice cannot bypass the original UI consent. */

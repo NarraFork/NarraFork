@@ -19,33 +19,47 @@
  * where it is listed because the person may read it. A session the person reads without reading
  * its project is listed among the other sessions, without the project's name.
  *
+ * WHAT A ROW SAYS (readability F): whether the person may write the space, how many questions
+ * there wait for THEM (open, put to them, and theirs to answer: none where they may not write),
+ * how many tasks are in progress, and one line (the block aliased `summary`, else the task being
+ * done, else the one done last; a cancelled task is never it). All of it is of spaces the listing has just returned, so of
+ * spaces the person may read; a space they cannot read has no row and adds to no count.
+ *
  * COST: the root is one indexed page of project spaces (`OUTLINE_TREE_LIMITS.projects`), the
  * names of what they belong to, three bounded counts, and one bounded count per listed project
- * (its sessions, up to `countCap` rows each), yielding to the event loop between slices.
+ * (its sessions, up to `countCap` rows each), yielding to the event loop between slices. The
+ * rows' facts are one statement per page of rows (`readOutlineTreeSpaceFacts`), their lines one
+ * read of bounded content prefixes, and the write check the ordinary one per row, in the same
+ * slices.
  */
 import { ValidationError } from "@server/lib/errors";
+import { blockTitle } from "@shared/outline";
 import {
 	OUTLINE_TREE_LIMITS,
 	type OutlineSpaceDetail,
 	type OutlineTreeResponse,
 	type OutlineTreeSpace,
+	type OutlineTreeSpaceSummaryLine,
 	type OutlineTreeSpacesResponse,
 } from "@shared/outline-api";
 import { resolveNarratorProjectId } from "../narrator-project";
-import { type OutlinePrincipal, projectUsersWith } from "./access";
+import { canWriteSpace, type OutlinePrincipal, projectUsersWith } from "./access";
 import {
 	countOutlineTreeSpaces,
 	type OutlineTreeCursor,
 	type OutlineTreeScope,
 	type OutlineTreeSpaceRow,
 	readNarrator,
+	readOutlineTreeSpaceFacts,
 	readOutlineTreeSpacePage,
 	readProject,
 	readProjectName,
 } from "./access-reads";
 import { yieldToEventLoop } from "./session-scope";
 import { findPersonalSpace, findProjectSpace } from "./spaces";
+import { outlineStore } from "./store";
 import type { OutlineSpaceRow } from "./store/port";
+import { OUTLINE_PAGE_HEAD_CHARS } from "./store/read-port";
 import { describeSpaces } from "./views";
 
 /** Projects whose sessions are counted between two yields to the event loop. */
@@ -77,15 +91,76 @@ function decodeCursor(cursor: string): OutlineTreeCursor {
 	throw new ValidationError("Invalid cursor");
 }
 
+/** A block's first line as a row's one line; null when there is nothing to say. */
+function summaryText(head: string | undefined): string | null {
+	const line = blockTitle(head ?? "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (line === "") return null;
+	const chars = Array.from(line);
+	return chars.length <= OUTLINE_TREE_LIMITS.summaryChars
+		? line
+		: `${chars.slice(0, OUTLINE_TREE_LIMITS.summaryChars - 1).join("")}…`;
+}
+
+/**
+ * The rows of spaces the listing returned (so: spaces the person may read), with what each says.
+ */
 async function describeTreeSpaces(
 	principal: OutlinePrincipal,
 	rows: readonly OutlineTreeSpaceRow[],
 ): Promise<OutlineTreeSpace[]> {
 	const described = await describeSpaces(principal, rows);
-	return described.map((space, i) => ({
-		...space,
-		lastCommitAt: rows[i]?.lastCommitAt ?? null,
-	}));
+	const facts = await readOutlineTreeSpaceFacts(
+		principal.userId,
+		rows.map((row) => row.id),
+		OUTLINE_TREE_LIMITS.countCap,
+	);
+	const picks = rows.map(
+		(row): { kind: OutlineTreeSpaceSummaryLine["kind"]; id: string } | null => {
+			const fact = facts.get(row.id);
+			if (fact?.summaryId) return { kind: "note", id: fact.summaryId };
+			if (fact?.doingId) return { kind: "doing", id: fact.doingId };
+			if (fact?.finishedId) return { kind: "finished", id: fact.finishedId };
+			return null;
+		},
+	);
+	// Bounded prefixes, never whole bodies.
+	const heads = await outlineStore.getContentHeads(
+		[
+			...picks.flatMap((pick) => (pick ? [pick.id] : [])),
+			// The page a waiting question is on, by title (its row when the list has not got it).
+			...rows.flatMap((row) => facts.get(row.id)?.waitingPageId ?? []),
+		],
+		OUTLINE_PAGE_HEAD_CHARS,
+	);
+	const out: OutlineTreeSpace[] = [];
+	for (let i = 0; i < described.length; i++) {
+		if (i > 0 && i % COUNT_SLICE === 0) await yieldToEventLoop();
+		const row = rows[i] as OutlineTreeSpaceRow;
+		const fact = facts.get(row.id);
+		const pick = picks[i] ?? null;
+		const text = pick ? summaryText(heads.get(pick.id)) : null;
+		const canWrite = await canWriteSpace(principal, row);
+		out.push({
+			...(described[i] as OutlineTreeSpace),
+			lastCommitAt: row.lastCommitAt,
+			canWrite,
+			// Only the person asked answers, and only while they may write the space.
+			waiting: canWrite ? (fact?.waiting ?? 0) : 0,
+			waitingAt:
+				canWrite && fact?.waitingBlockId && fact.waitingPageId
+					? {
+							pageId: fact.waitingPageId,
+							blockId: fact.waitingBlockId,
+							pageTitle: summaryText(heads.get(fact.waitingPageId)) ?? "",
+						}
+					: null,
+			doing: fact?.doing ?? 0,
+			summary: pick && text ? { kind: pick.kind, text } : null,
+		});
+	}
+	return out;
 }
 
 async function page(

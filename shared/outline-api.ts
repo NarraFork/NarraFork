@@ -101,7 +101,19 @@ export const OUTLINE_TREE_LIMITS = {
 	pageBytes: 64 * 1024,
 	/** A group counts its spaces up to this many (shown as one less with a plus beyond). */
 	countCap: 100,
+	/** Characters of a space row's one-line summary. */
+	summaryChars: 80,
 } as const;
+
+/**
+ * What a space row says in one line: the task being done there (`doing`), else the task done
+ * last (`finished`; never a cancelled one); a block the space's writers gave the alias `summary` comes before both
+ * (`note`). The first line of that block, cut to {@link OUTLINE_TREE_LIMITS.summaryChars}.
+ */
+export interface OutlineTreeSpaceSummaryLine {
+	kind: "doing" | "finished" | "note";
+	text: string;
+}
 
 /** A space as a row of the connected outline. */
 export interface OutlineTreeSpace extends OutlineSpaceSummary {
@@ -112,6 +124,26 @@ export interface OutlineTreeSpace extends OutlineSpaceSummary {
 	 * {@link OUTLINE_TREE_LIMITS.countCap}.
 	 */
 	sessions?: number;
+	/**
+	 * Whether the caller may change the space (a row of a space they may only read says so).
+	 * Absent from an older server: not known, nothing is said.
+	 */
+	canWrite?: boolean;
+	/**
+	 * Open questions in the space that are put to the caller and that they may answer now, counted
+	 * up to {@link OUTLINE_TREE_LIMITS.countCap}: what waits for them. Zero where they may not
+	 * write (nobody answers there).
+	 */
+	waiting?: number;
+	/**
+	 * The oldest of those questions and the page it is on: where the count takes the reader.
+	 * Null when nothing waits; absent from an older server.
+	 */
+	waitingAt?: { pageId: string; blockId: string; pageTitle?: string } | null;
+	/** Tasks in progress in the space, counted up to {@link OUTLINE_TREE_LIMITS.countCap}. */
+	doing?: number;
+	/** The row's one line; null or absent: nothing to say. */
+	summary?: OutlineTreeSpaceSummaryLine | null;
 }
 
 /** The root of the connected outline: the caller's own space, then a page of project spaces. */
@@ -241,6 +273,14 @@ export interface OutlineViewBlock {
 	 * that session (absent otherwise, and past the containers one view names).
 	 */
 	reportFrom?: string;
+	/**
+	 * A read with `fold: "default"` left out blocks under this one because the row is closed (by
+	 * the page's default folding with the reader's own over it, `shared/outline-fold.ts`): how
+	 * many children it has in the view and how many blocks are under it, all levels. `childIds`
+	 * then holds only what its one preview line is read from. Opened by the reader, the page is
+	 * read again (their stored folding says it is open) and the blocks come with it.
+	 */
+	fold?: { kids: number; size: number };
 }
 
 export interface OutlineBlockViewResponse {
@@ -264,6 +304,11 @@ export interface OutlineBlockViewResponse {
 	blocks: OutlineViewBlock[];
 	hiddenByBudget: number;
 	hiddenByView: number;
+	/**
+	 * Blocks a read with `fold: "default"` left out because they are behind closed rows (not
+	 * counted in `hiddenByBudget`). Absent from a read without it.
+	 */
+	hiddenByFold?: number;
 	/** The page has more blocks than one read loads; some were left out. */
 	pageTruncated: boolean;
 	/**
@@ -334,12 +379,24 @@ export interface OutlineSearchHitView {
 	snippet: string;
 	/** Titles of the ancestors, the page first. */
 	path: string[];
+	/**
+	 * Ids of those ancestors, the page first: the rows a search drawn as a tree hangs the hit
+	 * under, and what "locate in the tree" opens. Absent from an older server.
+	 */
+	pathIds?: string[];
 	/** A task, under one, or session notes. */
 	process: boolean;
 }
 
 export interface OutlineSearchResponse {
 	hits: OutlineSearchHitView[];
+	/**
+	 * Pass back as `cursor` for the next page of the same search; null (or absent, an older
+	 * server) when there is none. A search reaches at most the candidates one search ranks.
+	 */
+	nextCursor?: string | null;
+	/** The spaces of this page's hits (all readable by the caller), for their rows. */
+	spaces?: OutlineSpaceSummary[];
 }
 
 export interface OutlineRevertResponse {

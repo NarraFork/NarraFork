@@ -57,9 +57,9 @@ function forbidMainThreadPayloadReads() {
 	});
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	mock.restore();
-	pool.resetDbWorkerPoolForTest();
+	await pool.resetDbWorkerPoolForTest();
 	delete process.env.NARRAFORK_DB_WORKER;
 	home = mkdtempSync(join(tmpdir(), "narrafork-cleanup-workers-"));
 	homes.push(home);
@@ -84,9 +84,9 @@ beforeEach(() => {
 	`);
 	spyOn(connection, "getDbPath").mockReturnValue(dbPath);
 });
-afterEach(() => {
+afterEach(async () => {
 	mock.restore();
-	pool.shutdownDbWorkerPool();
+	await pool.shutdownDbWorkerPool();
 	sqlite.close();
 	if (savedWorkerSetting === undefined) delete process.env.NARRAFORK_DB_WORKER;
 	else process.env.NARRAFORK_DB_WORKER = savedWorkerSetting;

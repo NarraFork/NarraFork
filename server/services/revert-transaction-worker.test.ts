@@ -1,19 +1,27 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { on } from "node:events";
 import { watch } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
+import { connectCompiledWorker } from "../lib/compiled-worker";
 import { logger } from "../lib/logger";
+import * as sqlTrace from "../lib/sql-trace";
+import { WorkerHandle } from "../lib/worker-runtime/lifecycle";
 import type { RevertJournalOperation } from "./revert-mutation-journal";
 import type { RevertSelectionResult } from "./revert-selection-service";
 import type { TransactionManifestRequest } from "./revert-transaction-manifest-worker";
 import {
+	closeRevertManifestWorkers,
 	RevertTransactionError,
+	resetRevertManifestWorkersForTests,
 	revertManifestWorkerSpecifiers,
 	runRevertManifestWorker,
 } from "./revert-transaction-worker";
+import { REVERT_MANIFEST_WORKER_VERSION } from "./revert-transaction-worker-protocol";
 
 // The compare action tests exact equality, independent of selection schema validation.
 const selection = { metadataDigest: "fixed" } as RevertSelectionResult;
@@ -23,16 +31,21 @@ const request: TransactionManifestRequest = {
 	current: selection,
 };
 const realWorker = new URL("./revert-transaction-manifest-worker.ts", import.meta.url).href;
-const ready = 'parentPort.postMessage({ type: "revert-manifest-worker-ready", version: 1 });';
+const ready = `parentPort.postMessage({ type: "revert-manifest-worker-ready", version: ${REVERT_MANIFEST_WORKER_VERSION} });`;
 let root: string;
 let warn: ReturnType<typeof spyOn<typeof logger, "warn">>;
+let create: ReturnType<typeof spyOn<typeof WorkerHandle, "thread">>;
 
 beforeEach(async () => {
+	await resetRevertManifestWorkersForTests();
 	root = await mkdtemp(join(tmpdir(), "revert-worker-test-"));
 	warn = spyOn(logger, "warn").mockImplementation(() => {});
+	create = spyOn(WorkerHandle, "thread");
 });
 afterEach(async () => {
+	await closeRevertManifestWorkers();
 	warn.mockRestore();
+	create.mockRestore();
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -42,6 +55,25 @@ async function fixture(name: string, source: string): Promise<string> {
 	return pathToFileURL(path).href;
 }
 const signal = () => AbortSignal.timeout(10_000);
+
+// Bun 1.4.3 async matchers can starve native messages on a reused thread.
+// Await normally first, retaining an explicit fulfillment/rejection assertion.
+async function settled(pending: Promise<unknown>) {
+	const result = await pending.then(
+		(value: unknown) => ({ rejected: false, value }),
+		(value: unknown) => ({ rejected: true, value }),
+	);
+	return {
+		get error() {
+			expect(result.rejected).toBe(true);
+			return expect(result.value);
+		},
+		get value() {
+			expect(result.rejected).toBe(false);
+			return expect(result.value);
+		},
+	};
+}
 
 describe("revert manifest worker resolution", () => {
 	test("source uses TypeScript; compiled builds probe bounded JavaScript entries", () => {
@@ -104,41 +136,47 @@ describe("snapshot consent bound to original selector", () => {
 
 	test("snapshot entrypoint refuses absent/false confirmation, accepts literal true", async () => {
 		const input = entrypoint();
-		await expect(runRevertManifestWorker(input, signal())).rejects.toMatchObject({
+		(await settled(runRevertManifestWorker(input, signal()))).error.toMatchObject({
 			code: "REVERT_TRANSACTION_SNAPSHOT_CONFIRMATION_REQUIRED",
 		});
-		await expect(
-			runRevertManifestWorker(
-				{ ...input, acceptSnapshotRestore: false } as unknown as TransactionManifestRequest,
-				signal(),
-			),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_SNAPSHOT_CONFIRMATION_REQUIRED" });
-		await expect(
-			runRevertManifestWorker({ ...input, acceptSnapshotRestore: true }, signal()),
-		).resolves.toBe(true);
+		(
+			await settled(
+				runRevertManifestWorker(
+					{ ...input, acceptSnapshotRestore: false } as unknown as TransactionManifestRequest,
+					signal(),
+				),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_SNAPSHOT_CONFIRMATION_REQUIRED" });
+		(
+			await settled(runRevertManifestWorker({ ...input, acceptSnapshotRestore: true }, signal()))
+		).value.toBe(true);
 		const { expectedAction: _action, ...internal } = input;
-		await expect(runRevertManifestWorker(internal, signal())).rejects.toMatchObject({
+		(await settled(runRevertManifestWorker(internal, signal()))).error.toMatchObject({
 			code: "REVERT_TRANSACTION_SNAPSHOT_CONFIRMATION_REQUIRED",
 		});
 	});
 
 	test("entrypoint validates bound mode and UI action even when request digest is valid", async () => {
-		await expect(
-			runRevertManifestWorker(
-				{ ...entrypoint("automatic"), acceptSnapshotRestore: true },
-				signal(),
-			),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_RECOVERY_MODE" });
-		await expect(
-			runRevertManifestWorker(
-				{
-					...entrypoint("snapshot", "rollback_to_block"),
-					expectedAction: "rollback_to_block",
-					acceptSnapshotRestore: true,
-				},
-				signal(),
-			),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_ACTION_MISMATCH" });
+		(
+			await settled(
+				runRevertManifestWorker(
+					{ ...entrypoint("automatic"), acceptSnapshotRestore: true },
+					signal(),
+				),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_RECOVERY_MODE" });
+		(
+			await settled(
+				runRevertManifestWorker(
+					{
+						...entrypoint("snapshot", "rollback_to_block"),
+						expectedAction: "rollback_to_block",
+						acceptSnapshotRestore: true,
+					},
+					signal(),
+				),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_ACTION_MISMATCH" });
 	});
 
 	test("unknown UI action cannot inherit delete_tool_block's selector semantics", async () => {
@@ -149,24 +187,26 @@ describe("snapshot consent bound to original selector", () => {
 		const bytes = Buffer.from(JSON.stringify(selector));
 		const hash = (value: Uint8Array | string) => createHash("sha256").update(value).digest("hex");
 		const digest = hash(bytes);
-		await expect(
-			runRevertManifestWorker(
-				{
-					...input,
-					raw: { bytes, ref: { algorithm: "sha256", digest, sizeBytes: bytes.byteLength } },
-					operation: {
-						...input.operation,
-						kind: "history_delete",
-						selectorBlobDigest: digest,
-						requestDigest: hash(
-							JSON.stringify({ version: 1, owner: selector.owner, request: selector.request }),
-						),
+		(
+			await settled(
+				runRevertManifestWorker(
+					{
+						...input,
+						raw: { bytes, ref: { algorithm: "sha256", digest, sizeBytes: bytes.byteLength } },
+						operation: {
+							...input.operation,
+							kind: "history_delete",
+							selectorBlobDigest: digest,
+							requestDigest: hash(
+								JSON.stringify({ version: 1, owner: selector.owner, request: selector.request }),
+							),
+						},
+						acceptSnapshotRestore: true,
 					},
-					acceptSnapshotRestore: true,
-				},
-				signal(),
-			),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_ACTION_MISMATCH" });
+					signal(),
+				),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_ACTION_MISMATCH" });
 	});
 
 	test("altering only the frozen selector mode cannot bypass the original request digest", async () => {
@@ -175,53 +215,221 @@ describe("snapshot consent bound to original selector", () => {
 		delete selector.request.recoveryMode;
 		const bytes = Buffer.from(JSON.stringify(selector));
 		const digest = createHash("sha256").update(bytes).digest("hex");
-		await expect(
-			runRevertManifestWorker(
-				{
-					...input,
-					raw: { bytes, ref: { algorithm: "sha256", digest, sizeBytes: bytes.byteLength } },
-					operation: { ...input.operation, selectorBlobDigest: digest },
-				},
-				signal(),
-			),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_ORIGINAL_REQUEST_DIGEST" });
+		(
+			await settled(
+				runRevertManifestWorker(
+					{
+						...input,
+						raw: { bytes, ref: { algorithm: "sha256", digest, sizeBytes: bytes.byteLength } },
+						operation: { ...input.operation, selectorBlobDigest: digest },
+					},
+					signal(),
+				),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_ORIGINAL_REQUEST_DIGEST" });
 	});
 });
 
 describe("revert manifest worker lifecycle", () => {
 	test("real source worker acknowledges readiness before comparing", async () => {
-		await expect(runRevertManifestWorker<boolean>(request, signal())).resolves.toBe(true);
+		(await settled(runRevertManifestWorker<boolean>(request, signal()))).value.toBe(true);
+		expect(warn).not.toHaveBeenCalled();
+	});
+	test("timing logs retain pool, RPC and SQL parent correlation without the request body", async () => {
+		const specifier = await fixture(
+			"timing-reply",
+			`parentPort.on("message", (packet) => {
+	 parentPort.postMessage({ requestId: packet.requestId, value: true });
+	});
+	${ready}`,
+		);
+		const parent = spyOn(sqlTrace, "currentSqlTraceSpan").mockReturnValue({
+			id: "existing-sql-parent",
+		} as sqlTrace.SqlTraceSpan);
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		try {
+			expect(await runRevertManifestWorker(request, signal(), { specifiers: [specifier] })).toBe(
+				true,
+			);
+			expect(info).toHaveBeenCalledTimes(1);
+			const details = info.mock.calls[0]?.[1];
+			expect(details).toMatchObject({
+				pool: "revert-manifest",
+				action: "compare",
+				requestId: expect.any(String),
+				parentTraceId: "existing-sql-parent",
+				outcome: "ok",
+				reused: false,
+				queueMs: 0,
+			});
+			for (const phase of ["readyMs", "execMs", "closeMs", "totalMs"]) {
+				expect(Number.isFinite(details?.[phase])).toBe(true);
+				expect(Number(details?.[phase])).toBeGreaterThanOrEqual(0);
+			}
+			expect(details).not.toHaveProperty("request");
+			expect(JSON.stringify(details)).not.toContain("metadataDigest");
+		} finally {
+			info.mockRestore();
+			parent.mockRestore();
+		}
+	});
+	test("real worker echoes independent IDs across a validation failure and the next task", async () => {
+		const connected = await connectCompiledWorker([realWorker], {
+			signal: signal(),
+			isReady: (message) =>
+				!!message &&
+				typeof message === "object" &&
+				"type" in message &&
+				message.type === "revert-manifest-worker-ready" &&
+				"version" in message &&
+				message.version === REVERT_MANIFEST_WORKER_VERSION,
+		});
+		const replies = on(connected.worker, "message", { signal: signal() });
+		const exchange = async (requestId: string, input: TransactionManifestRequest) => {
+			connected.worker.postMessage({ requestId, request: input });
+			for (;;) {
+				const { value, done } = await replies.next();
+				if (done) throw new Error("manifest worker reply stream ended");
+				const [reply] = value;
+				if (reply?.requestId === requestId) return reply;
+			}
+		};
+		try {
+			connected.worker.postMessage({ action: "ping" });
+			expect(
+				await exchange("first-task", {
+					...request,
+					current: { ...selection, metadataDigest: "changed" },
+				}),
+			).toEqual({ requestId: "first-task", error: "SELECTION_STALE" });
+			expect(await exchange("next-task", request)).toEqual({
+				requestId: "next-task",
+				value: true,
+			});
+		} finally {
+			await replies.return?.();
+			await connected.handle.close();
+		}
+	});
+	test("old success and error frames cannot settle a matching request", async () => {
+		const specifier = await fixture(
+			"old-replies",
+			`parentPort.on("message", (packet) => {
+	 parentPort.postMessage({ requestId: "old-task", value: "wrong" });
+	 parentPort.postMessage({ requestId: "old-task", error: "SELECTION_STALE" });
+	 parentPort.postMessage({ requestId: packet.requestId, value: "matching" });
+	});
+	${ready}`,
+		);
+		expect(
+			await runRevertManifestWorker<string>(request, signal(), { specifiers: [specifier] }),
+		).toBe("matching");
+		expect(warn).not.toHaveBeenCalled();
+	});
+	test("identical domain requests still receive independent RPC IDs", async () => {
+		const specifier = await fixture(
+			"echo-request-id",
+			`parentPort.on("message", (packet) => {
+	 parentPort.postMessage({ requestId: packet.requestId, value: packet.requestId });
+	});
+	${ready}`,
+		);
+		const first = await runRevertManifestWorker<string>(request, signal(), {
+			specifiers: [specifier],
+		});
+		const next = await runRevertManifestWorker<string>(request, signal(), {
+			specifiers: [specifier],
+		});
+		expect(first).toHaveLength(21);
+		expect(next).toHaveLength(21);
+		expect(next).not.toBe(first);
+	});
+	test("duplicate ready control frames never dispatch the business task twice", async () => {
+		const specifier = await fixture(
+			"duplicate-ready",
+			`parentPort.on("message", (packet) => {
+	 ${ready}
+	 parentPort.postMessage({ requestId: packet.requestId, value: true });
+	});
+	${ready}
+	${ready}`,
+		);
+		const original = Worker.prototype.postMessage;
+		let dispatches = 0;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (args[0] && typeof args[0] === "object" && "requestId" in args[0]) dispatches++;
+			return original.apply(this, args);
+		});
+		try {
+			expect(
+				await runRevertManifestWorker<boolean>(request, signal(), { specifiers: [specifier] }),
+			).toBe(true);
+			expect(dispatches).toBe(1);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test("an old success followed by exit fails without replaying on another entry", async () => {
+		const marker = join(root, "executions");
+		const specifier = await fixture(
+			"old-reply-then-exit",
+			`import { appendFileSync } from "node:fs";
+	parentPort.on("message", () => {
+	 appendFileSync(${JSON.stringify(marker)}, "x");
+	 parentPort.postMessage({ requestId: "old-task", value: true });
+	 process.exit(1);
+	});
+	${ready}`,
+		);
+		(
+			await settled(
+				runRevertManifestWorker(request, signal(), { specifiers: [specifier, realWorker] }),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_EXITED" });
+		expect(await readFile(marker, "utf8")).toBe("x");
 		expect(warn).not.toHaveBeenCalled();
 	});
 	test("missing pre-ready entry can fall through to the real worker", async () => {
-		await expect(
-			runRevertManifestWorker(request, signal(), {
-				specifiers: [pathToFileURL(join(root, "missing.ts")).href, realWorker],
-			}),
-		).resolves.toBe(true);
-		expect(warn).toHaveBeenCalledTimes(1);
+		(
+			await settled(
+				runRevertManifestWorker(request, signal(), {
+					specifiers: [pathToFileURL(join(root, "missing.ts")).href, realWorker],
+				}),
+			)
+		).value.toBe(true);
+		expect(create).toHaveBeenCalledTimes(2);
+		expect(warn).not.toHaveBeenCalled();
 	});
 	test("startup probing is bounded to three candidates", async () => {
 		const missing = pathToFileURL(join(root, "missing.ts")).href;
-		await expect(
-			runRevertManifestWorker(request, signal(), {
-				specifiers: [missing, missing, missing, realWorker],
-			}),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_FAILED" });
-		expect(warn).toHaveBeenCalledTimes(3);
+		(
+			await settled(
+				runRevertManifestWorker(request, signal(), {
+					specifiers: [missing, missing, missing, realWorker],
+				}),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_FAILED" });
+		expect(create).toHaveBeenCalledTimes(3);
+		expect(create.mock.calls.every(([entry]) => String(entry) === missing)).toBe(true);
+		expect(warn).toHaveBeenCalledTimes(1);
 	});
 	test("synchronous entry errors are sanitized and can probe the next entry", async () => {
-		await expect(
-			runRevertManifestWorker(request, signal(), { specifiers: ["not-a-url", realWorker] }),
-		).resolves.toBe(true);
-		expect(warn).toHaveBeenCalledTimes(1);
+		(
+			await settled(
+				runRevertManifestWorker(request, signal(), { specifiers: ["not-a-url", realWorker] }),
+			)
+		).value.toBe(true);
+		expect(warn).not.toHaveBeenCalled();
 	});
 	test("startup exceptions are logged with bounded details, not exposed to callers", async () => {
 		const secret = `${root}/${"sensitive".repeat(300)}`;
 		const specifier = await fixture("startup-error", `throw new Error(${JSON.stringify(secret)});`);
-		await expect(
-			runRevertManifestWorker(request, signal(), { specifiers: [specifier] }),
-		).rejects.toMatchObject({
+		(
+			await settled(runRevertManifestWorker(request, signal(), { specifiers: [specifier] }))
+		).error.toMatchObject({
 			code: "REVERT_TRANSACTION_MANIFEST_WORKER_FAILED",
 			message: "Local revert transaction refused: MANIFEST_WORKER_FAILED",
 		});
@@ -233,9 +441,9 @@ describe("revert manifest worker lifecycle", () => {
 	});
 	test("early exit is refused without hanging", async () => {
 		const specifier = await fixture("early-exit", "parentPort.close();");
-		await expect(
-			runRevertManifestWorker(request, signal(), { specifiers: [specifier] }),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_EXITED" });
+		(
+			await settled(runRevertManifestWorker(request, signal(), { specifiers: [specifier] }))
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_EXITED" });
 	});
 	test("no request is dispatched before a valid readiness handshake", async () => {
 		const marker = join(root, "dispatched");
@@ -245,9 +453,9 @@ describe("revert manifest worker lifecycle", () => {
 parentPort.on("message", () => writeFileSync(${JSON.stringify(marker)}, "dispatched"));
 parentPort.postMessage({ value: true });`,
 		);
-		await expect(
-			runRevertManifestWorker(request, signal(), { specifiers: [specifier] }),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_PROTOCOL" });
+		(
+			await settled(runRevertManifestWorker(request, signal(), { specifiers: [specifier] }))
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_PROTOCOL" });
 		expect(await Bun.file(marker).exists()).toBe(false);
 	});
 	test("startup timeout terminates the worker without dispatch", async () => {
@@ -257,9 +465,14 @@ parentPort.postMessage({ value: true });`,
 			`import { writeFileSync } from "node:fs";
 parentPort.on("message", () => writeFileSync(${JSON.stringify(marker)}, "dispatched"));`,
 		);
-		await expect(
-			runRevertManifestWorker(request, signal(), { specifiers: [specifier], readyTimeoutMs: 100 }),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_TIMEOUT" });
+		(
+			await settled(
+				runRevertManifestWorker(request, signal(), {
+					specifiers: [specifier],
+					readyTimeoutMs: 100,
+				}),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_WORKER_TIMEOUT" });
 		expect(await Bun.file(marker).exists()).toBe(false);
 	});
 	test("an already-cancelled request never starts a worker", async () => {
@@ -270,45 +483,68 @@ parentPort.on("message", () => writeFileSync(${JSON.stringify(marker)}, "dispatc
 writeFileSync(${JSON.stringify(marker)}, "started");`,
 		);
 		const reason = new Error("cancelled before start");
-		await expect(
-			runRevertManifestWorker(request, AbortSignal.abort(reason), { specifiers: [specifier] }),
-		).rejects.toBe(reason);
+		(
+			await settled(
+				runRevertManifestWorker(request, AbortSignal.abort(reason), { specifiers: [specifier] }),
+			)
+		).error.toBe(reason);
 		expect(await Bun.file(marker).exists()).toBe(false);
 		expect(warn).not.toHaveBeenCalled();
 	});
 	test("cancellation during startup does not try the next candidate", async () => {
 		const specifier = await fixture("waiting", 'parentPort.on("message", () => {});');
-		await expect(
-			runRevertManifestWorker(request, AbortSignal.timeout(100), {
-				specifiers: [specifier, realWorker],
-			}),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_CANCELLED" });
+		(
+			await settled(
+				runRevertManifestWorker(request, AbortSignal.timeout(100), {
+					specifiers: [specifier, realWorker],
+				}),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_MANIFEST_CANCELLED" });
+		expect(create).toHaveBeenCalledTimes(1);
 		expect(warn).not.toHaveBeenCalled();
 	});
 	test("real validation rejection is returned, not retried", async () => {
-		await expect(
-			runRevertManifestWorker(
-				{ ...request, current: { ...selection, metadataDigest: "changed" } },
-				signal(),
-				{ specifiers: [realWorker, realWorker] },
-			),
-		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_SELECTION_STALE" });
+		(
+			await settled(
+				runRevertManifestWorker(
+					{ ...request, current: { ...selection, metadataDigest: "changed" } },
+					signal(),
+					{ specifiers: [realWorker, realWorker] },
+				),
+			)
+		).error.toMatchObject({ code: "REVERT_TRANSACTION_SELECTION_STALE" });
 		expect(warn).not.toHaveBeenCalled();
 	});
-	for (const kind of ["validation", "crash", "exit", "malformed", "sensitive-error"] as const) {
+	for (const kind of [
+		"validation",
+		"crash",
+		"exit",
+		"malformed",
+		"array",
+		"empty-id",
+		"missing-id",
+		"bad-id",
+		"sensitive-error",
+	] as const) {
 		test(`post-ready ${kind} failure never dispatches twice`, async () => {
 			const marker = join(root, "executions");
 			const action = {
-				validation: 'parentPort.postMessage({ error: "SELECTION_STALE" });',
+				validation:
+					'parentPort.postMessage({ requestId: message.requestId, error: "SELECTION_STALE" });',
 				crash: 'throw new Error("crashed after dispatch");',
 				exit: "process.exit(1);",
 				malformed: "parentPort.postMessage(null);",
-				"sensitive-error": `parentPort.postMessage({ error: ${JSON.stringify(`${root}/private manifest text`)} });`,
+				array:
+					"parentPort.postMessage(Object.assign([], { requestId: message.requestId, value: true }));",
+				"empty-id": 'parentPort.postMessage({ requestId: "", value: true });',
+				"missing-id": "parentPort.postMessage({ value: true });",
+				"bad-id": "parentPort.postMessage({ requestId: 42, value: true });",
+				"sensitive-error": `parentPort.postMessage({ requestId: message.requestId, error: ${JSON.stringify(`${root}/private manifest text`)} });`,
 			}[kind];
 			const specifier = await fixture(
 				kind,
 				`import { appendFileSync } from "node:fs";
-parentPort.on("message", () => {
+parentPort.on("message", (message) => {
  appendFileSync(${JSON.stringify(marker)}, "x");
  ${action}
 });
@@ -319,15 +555,22 @@ ${ready}`,
 				crash: "MANIFEST_WORKER_FAILED",
 				exit: "MANIFEST_WORKER_EXITED",
 				malformed: "MANIFEST_WORKER_PROTOCOL",
+				array: "MANIFEST_WORKER_PROTOCOL",
+				"empty-id": "MANIFEST_WORKER_PROTOCOL",
+				"missing-id": "MANIFEST_WORKER_PROTOCOL",
+				"bad-id": "MANIFEST_WORKER_PROTOCOL",
 				"sensitive-error": "INVALID_MANIFEST",
 			}[kind];
-			await expect(
-				runRevertManifestWorker(request, signal(), { specifiers: [specifier, specifier] }),
-			).rejects.toMatchObject({
+			(
+				await settled(
+					runRevertManifestWorker(request, signal(), { specifiers: [specifier, specifier] }),
+				)
+			).error.toMatchObject({
 				code: `REVERT_TRANSACTION_${code}`,
 				message: `Local revert transaction refused: ${code}`,
 			});
 			expect(await readFile(marker, "utf8")).toBe("x");
+			expect(create).toHaveBeenCalledTimes(1);
 			expect(warn).not.toHaveBeenCalled();
 		});
 	}
@@ -344,13 +587,16 @@ ${ready}`,
 parentPort.on("message", () => appendFileSync(${JSON.stringify(marker)}, "x"));
 ${ready}`,
 			);
-			await expect(
-				runRevertManifestWorker(request, AbortSignal.any([controller.signal, signal()]), {
-					specifiers: [specifier, specifier],
-				}),
-			).rejects.toBeInstanceOf(RevertTransactionError);
+			(
+				await settled(
+					runRevertManifestWorker(request, AbortSignal.any([controller.signal, signal()]), {
+						specifiers: [specifier, specifier],
+					}),
+				)
+			).error.toBeInstanceOf(RevertTransactionError);
 			expect(controller.signal.aborted).toBe(true);
 			expect(await readFile(marker, "utf8")).toBe("x");
+			expect(create).toHaveBeenCalledTimes(1);
 			expect(warn).not.toHaveBeenCalled();
 		} finally {
 			watcher.close();

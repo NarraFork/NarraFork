@@ -3,18 +3,18 @@
  *
  * VS Code runs @parcel/watcher in a separate file-watcher process. NarraFork
  * follows the same safety boundary: the main server never loads the native
- * addon directly. It talks to `parcel-watcher-worker.ts` via JSONL and falls
- * back to git-status polling when the worker is disabled or unhealthy.
+ * addon directly. It talks to `parcel-watcher-worker.ts` via JSONL and reports
+ * an unavailable backend to its owner; it does not perform a recursive local fallback.
  */
 
 import { type Stats, unwatchFile, watchFile } from "node:fs";
 
-import { logger } from "../logger";
 import { coalesceEvents } from "./event-coalescer";
 import { DEFAULT_EXCLUDES, isIgnoredEventPath } from "./parcel-ignore";
 import {
 	isNativeWatcherEnabled,
 	ParcelWorkerClient,
+	reportWatcherHealth,
 	type WorkerSubscription,
 } from "./parcel-worker-client";
 import { FileChangeType, type IFileChange } from "./types";
@@ -259,7 +259,7 @@ export class ParcelRecursiveWatcher {
 		if (instance) {
 			this.instances.delete(rootPath);
 			await instance.stop();
-			logger.debug("[ParcelWatcher] stopped", { path: rootPath });
+			reportWatcherHealth("stopped");
 		} else {
 			await this.workerClient.unwatch(rootPath);
 		}
@@ -279,10 +279,12 @@ export class ParcelRecursiveWatcher {
 			stops.push(instance.stop());
 		}
 		await Promise.allSettled(stops);
-		await this.workerClient.shutdown().catch(() => {});
-
-		this.throttledEmitter.dispose();
-		logger.debug("[ParcelWatcher] all watchers shut down");
+		try {
+			await this.workerClient.shutdown();
+		} finally {
+			this.throttledEmitter.dispose();
+		}
+		reportWatcherHealth("all_stopped");
 	}
 
 	// ── Internal ──────────────────────────────────────────────────────────
@@ -295,7 +297,7 @@ export class ParcelRecursiveWatcher {
 		const ignore = [...DEFAULT_EXCLUDES, ...extraExcludes];
 
 		if (!isNativeWatcherEnabled()) {
-			logger.debug("[ParcelWatcher] skipped native worker subscribe", { path: rootPath, restarts });
+			reportWatcherHealth("subscribe_skipped", "debug", { restart: restarts });
 			this.handleBackendUnavailable("native watcher disabled");
 			return;
 		}
@@ -320,10 +322,7 @@ export class ParcelRecursiveWatcher {
 				instance.handleEvents(pendingEvents);
 			}
 
-			logger.debug("[ParcelWatcher] started", {
-				path: rootPath,
-				restarts,
-			});
+			reportWatcherHealth("subscribed", "debug", { restart: restarts });
 		} catch (error) {
 			this.onError(rootPath, extraExcludes, error, restarts);
 		}
@@ -358,10 +357,7 @@ export class ParcelRecursiveWatcher {
 
 		const worked = this.throttledEmitter.work(coalesced);
 		if (!worked) {
-			logger.warn("[ParcelWatcher] event buffer overflow, some events dropped", {
-				path: rootPath,
-				pending: this.throttledEmitter.pending,
-			});
+			reportWatcherHealth("event_overflow", "warn", { pending: this.throttledEmitter.pending });
 		}
 
 		if (rootDeleted) {
@@ -380,14 +376,14 @@ export class ParcelRecursiveWatcher {
 		if (msg.includes("No space left on device") || msg.includes("ENOSPC")) {
 			if (!this.enospcWarned) {
 				this.enospcWarned = true;
-				logger.error("[ParcelWatcher] inotify limit reached (ENOSPC)", { path: rootPath });
+				reportWatcherHealth("inotify_limit", "error");
 			}
 			this.handleBackendUnavailable(msg);
 			return;
 		}
 
 		if (msg.includes("EMFILE")) {
-			logger.error("[ParcelWatcher] too many open files (EMFILE)", { path: rootPath });
+			reportWatcherHealth("fd_limit", "error");
 			this.handleBackendUnavailable(msg);
 			return;
 		}
@@ -397,17 +393,13 @@ export class ParcelRecursiveWatcher {
 			msg.includes("disabled for this session") ||
 			msg.includes("timed out")
 		) {
-			logger.warn("[ParcelWatcher] native backend unavailable", { path: rootPath, error: msg });
+			reportWatcherHealth("unavailable", "warn");
 			this.handleBackendUnavailable(msg);
 			return;
 		}
 
 		if (restarts < MAX_RESTARTS) {
-			logger.warn("[ParcelWatcher] restarting after error", {
-				path: rootPath,
-				error: msg,
-				restart: restarts + 1,
-			});
+			reportWatcherHealth("restart_requested", "warn", { restart: restarts + 1 });
 
 			const instance = this.instances.get(rootPath);
 			if (instance) {
@@ -417,25 +409,23 @@ export class ParcelRecursiveWatcher {
 
 			setTimeout(() => {
 				if (this.requestedPaths.has(rootPath) && !this.instances.has(rootPath)) {
-					this.startWatching(rootPath, extraExcludes, restarts + 1).catch((err) => {
-						logger.error("[ParcelWatcher] restart failed", {
-							path: rootPath,
-							error: String(err),
-						});
+					this.startWatching(rootPath, extraExcludes, restarts + 1).catch(() => {
+						reportWatcherHealth("restart_failed", "error");
 					});
 				}
 			}, 800);
 		} else {
-			logger.error("[ParcelWatcher] gave up restarting after max attempts", {
-				path: rootPath,
-				error: msg,
-			});
+			reportWatcherHealth("restart_exhausted", "error");
 			this.handleBackendUnavailable(msg);
 		}
 	}
 
 	private handleBackendUnavailable(reason: string): void {
-		this.onBackendUnavailable?.(reason);
+		try {
+			this.onBackendUnavailable?.(reason);
+		} catch {
+			/* Advisory callback only. */
+		}
 	}
 
 	/**
@@ -444,7 +434,7 @@ export class ParcelRecursiveWatcher {
 	 * Code's `BaseWatcher.suspendWatchRequest` pattern.
 	 */
 	private onRootDeleted(rootPath: string): void {
-		logger.warn("[ParcelWatcher] watched root deleted, suspending", { path: rootPath });
+		reportWatcherHealth("root_deleted", "warn");
 
 		const instance = this.instances.get(rootPath);
 		if (instance) {
@@ -454,14 +444,11 @@ export class ParcelRecursiveWatcher {
 
 		const callback = (curr: Stats, _prev: Stats) => {
 			if (curr.ctimeMs !== 0 || curr.ino !== 0) {
-				logger.info("[ParcelWatcher] watched root reappeared, resuming", { path: rootPath });
+				reportWatcherHealth("root_reappeared", "info");
 				this.unsuspend(rootPath);
 				if (!this.requestedPaths.has(rootPath)) return;
-				this.startWatching(rootPath, [], 0).catch((err) => {
-					logger.error("[ParcelWatcher] failed to resume after root reappeared", {
-						path: rootPath,
-						error: String(err),
-					});
+				this.startWatching(rootPath, [], 0).catch(() => {
+					reportWatcherHealth("resume_failed", "error");
 				});
 			}
 		};
@@ -469,11 +456,8 @@ export class ParcelRecursiveWatcher {
 		try {
 			watchFile(rootPath, { persistent: false, interval: SUSPENDED_POLL_INTERVAL }, callback);
 			this.suspended.set(rootPath, {});
-		} catch (error) {
-			logger.warn("[ParcelWatcher] fs.watchFile() failed for suspended path", {
-				path: rootPath,
-				error: String(error),
-			});
+		} catch {
+			reportWatcherHealth("suspend_watch_failed", "warn");
 		}
 	}
 
