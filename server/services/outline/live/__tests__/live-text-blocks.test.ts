@@ -25,8 +25,8 @@
  *    items in a document; a log of the format before this one is kept, not misread;
  *  - a client of another protocol version is told so;
  *  - documents count against the session's bound, also those of deleted blocks: a session that
- *    made too many starts afresh without them, and text never makes a document for a block that
- *    is gone;
+ *    made too many starts afresh without them; typing that crosses its block's deletion is
+ *    taken (never a reason to refuse a frame), text for a block the page never had is not;
  *  - a log is replayed whatever order a document's seed and updates come in, and a log with an
  *    update whose items no row brings is kept, not committed in part.
  *
@@ -1218,61 +1218,68 @@ describe("documents count against the session's bound", () => {
 		expect(await content(stays)).toBe("stays!");
 	}, 120_000);
 
-	test("text makes no document for a block that is gone; typing that crossed the deletion of a block with a document still lands", async () => {
-		const { pageId, ids } = await page(["typed in", "never typed in", "keep"]);
-		const [typedIn, untouched] = ids as [string, string, string];
+	test("first keystrokes in a block nobody typed in cross its deletion: the frame is taken, the edit of a live block in it lands, and the typist's undo history stays", async () => {
+		const { pageId, ids } = await page(["one", "two", "three"]);
+		const [one, two] = ids as [string, string, string];
 		const la = link(owner);
-		const lb = link(writer);
 		const a = open(la, pageId);
-		const b = open(lb, pageId);
+		const b = open(link(writer), pageId);
 		await waitFor(() => a.ready && b.ready, 3000, "joined");
-		type(a, typedIn, "!");
+		// A has some undo history.
+		edit(a, one, "one!");
+		edit(a, one, "one!!");
 		await settle();
-		// A's next keystrokes are on their way while B deletes both blocks.
+		// B deletes `two` (no document anywhere) while A's frame is on its way: A's first
+		// keystrokes in `two`, and an edit of the live block `one`.
 		la.hold(true);
-		type(a, typedIn, "?");
-		struct(b, [
-			{ t: "d", id: typedIn },
-			{ t: "d", id: untouched },
-		]);
+		struct(b, [{ t: "d", id: two }]);
 		await settle();
+		type(a, two, " typed by A");
+		edit(a, one, "one!!!");
+		const before = a.undoStack.length;
+		expect(before).toBe(4);
 		la.hold(false);
-		await settle(60);
-		// The block had a document: the keystroke went into it, nothing was refused.
+		await settle(60, 10_000);
 		expect(a.stats.rejects).toBe(0);
-		expect(session(pageId).textOf(typedIn)).toBe("typed in!?");
-		expect(session(pageId).textDocIds).toEqual([typedIn]);
-		// Text for the deleted block nobody had typed in would make a document for it: refused.
+		expect(a.stats.rebuilds).toBe(0);
+		expect(a.undoStack.length).toBe(before);
+		expect(a.textOf(one)).toBe("one!!!");
+		expect(b.textOf(one)).toBe("one!!!");
+		expect(session(pageId).textOf(one)).toBe("one!!!");
+		expect(a.outline()).toBe("- one!!!\n- three");
+		expect(b.outline()).toBe("- one!!!\n- three");
+		// The deleted block's document was made (and counted); its text never reaches the page.
+		expect(new Set(session(pageId).textDocIds)).toEqual(new Set([one, two]));
+		expectSameTexts(pageId, [a, b]);
+		await flushed(pageId);
+		expect(await dbOutline(pageId)).toBe("- one!!!\n- three");
+		expect((await outlineStore.getBlock(two))?.content).toBe("two");
+		// The history still works, and bringing the block back shows what was typed into it.
+		expect(a.undo()).toBe(true);
+		await settle();
+		expect(b.textOf(one)).toBe("one!!");
+		expect(b.undo()).toBe(true);
+		await settle();
+		expect(a.outline()).toBe("- one!!\n- two typed by A\n- three");
+		// A block the page never had still gets no document.
 		const s = session(pageId);
 		const p = [...s.participants.values()].find((x) => x.userId === owner);
 		if (!p) throw new Error("no participant");
-		const made = seededTextDoc("never typed in");
-		const vector = Y.encodeStateVector(made.doc);
-		made.text.insert(0, "late ");
+		const stray = seededTextDoc("");
+		stray.text.insert(0, "stray");
 		s.handleUpdate(
 			p,
 			p.lastTx + 1,
 			encodeLiveTexts([
 				{
-					id: untouched,
+					id: "no-such-block-0002",
 					kind: LIVE_TEXT_KIND.update,
-					data: Y.encodeStateAsUpdate(made.doc, vector),
+					data: Y.encodeStateAsUpdate(stray.doc),
 				},
 			]),
 		);
 		expect(p.blocked).toBe(true);
-		expect(s.textDocIds).toEqual([typedIn]);
-		await settle(60);
-		expect(a.stats.rejects).toBe(1);
-		expect(a.outline()).toBe("- keep");
-		expect(b.outline()).toBe("- keep");
-		// Bringing the block back (undoing the delete) may carry text for it again.
-		expect(b.undo()).toBe(true);
-		await settle();
-		type(a, untouched, " now");
-		await settle();
-		expect(b.textOf(untouched)).toBe("never typed in now");
-		expectSameTexts(pageId, [a, b]);
+		expect(s.textDocIds).not.toContain("no-such-block-0002");
 	});
 
 	test("a client holding more documents than a join may name comes back with a snapshot, its unsent typing kept", async () => {

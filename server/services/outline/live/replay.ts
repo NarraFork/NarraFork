@@ -78,7 +78,8 @@ export interface ReplayResult {
 	changes?: RecoveredChange[];
 }
 
-const decoder = new TextDecoder();
+/** Sync rows are JSON as written: malformed UTF-8 makes the log unreadable (kept). */
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpdateRow[] | null> {
 	const rows: OutlineLiveUpdateRow[] = [];

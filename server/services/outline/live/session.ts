@@ -1498,10 +1498,11 @@ export class LivePage {
 	}
 
 	/**
-	 * The text entries of a participant's frame: updates only, one a block, each of a live block,
-	 * of a block that already has a document (typing that crossed its block's deletion), or (a
-	 * structural transaction) of one the transaction inserts or restores. Null otherwise: text
-	 * never makes a document for a block that is gone or that the page never had.
+	 * The text entries of a participant's frame: updates only, one a block, each of a block the
+	 * session knows, deleted or not (typing may cross its block's deletion, and refusing it
+	 * would take the whole frame and the typist's undo history with it), or (a structural
+	 * transaction) of one the transaction inserts. Null otherwise: a block the page never had
+	 * gets no document. Every document made counts against the session's bound (`charge`).
 	 */
 	private parseTexts(body: Uint8Array, inserted?: ReadonlySet<string>): LiveTextEntry[] | null {
 		const entries = decodeLiveTexts(body, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
@@ -1509,7 +1510,7 @@ export class LivePage {
 		const seen = new Set<string>();
 		for (const e of entries) {
 			if (e.kind !== LIVE_TEXT_KIND.update || seen.has(e.id)) return null;
-			if (!this.mirror.alive(e.id) && !this.docs.has(e.id) && !inserted?.has(e.id)) return null;
+			if (!this.hasText(e.id) && !inserted?.has(e.id)) return null;
 			seen.add(e.id);
 		}
 		return entries;
