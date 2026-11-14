@@ -270,14 +270,25 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 const edgeKey = (e: OutlineEdgeRow) =>
 	`${e.blockId}\u0000${e.fromSeq}\u0000${e.toSeq}\u0000${e.parentKey}\u0000${e.orderKey}`;
 
+/** How much of the placements {@link checkPlacements} could compare with the version rows. */
+export type PlacementsChecked =
+	/** The whole table equals the replay of the versions (a space whose whole history is kept). */
+	| "all"
+	/** From the space's floor on (a converted space: nothing is known of placements before it). */
+	| "from-floor"
+	/** Nothing against the versions: the space's placements are not built yet. */
+	| "not-ready";
+
 /**
- * Placements (`outline_block_edges`) agree with the blocks and their versions: a block's
- * placements never overlap, a live block's open one is its row's parent (the space for a
- * top-level block) and order key, a deleted block has none open; and, for a space whose whole
- * history is kept, the table is exactly what replaying the version rows gives.
+ * Placements (`outline_block_edges`) agree with the blocks and their versions. Always: a
+ * block's placements never overlap, at most one is open, an open one is its block's row (its
+ * parent, the space for a top-level block, and its order key), and a deleted block has none
+ * open. Once the space is ready: every live block has its open placement, and the table, from
+ * the space's floor on, is exactly what replaying the version rows gives (the whole table when
+ * the floor is 0). Returns which of these the space's state allowed.
  */
-export function checkPlacements(dump: SpaceDump): void {
-	if (!dump.history.edgesReady) return;
+export function checkPlacements(dump: SpaceDump): PlacementsChecked {
+	const ready = dump.history.edgesReady;
 	const byBlock = new Map<string, OutlineEdgeRow[]>();
 	for (const edge of dump.edges) {
 		const list = byBlock.get(edge.blockId);
@@ -294,18 +305,20 @@ export function checkPlacements(dump: SpaceDump): void {
 				expect(next.fromSeq).toBeGreaterThanOrEqual(edge.toSeq as number);
 			}
 		});
-		const open = list.filter((edge) => edge.toSeq === null);
-		expect({ block: block.id, open: open.map((e) => [e.parentKey, e.orderKey]) }).toEqual({
-			block: block.id,
-			open: block.deleted ? [] : [[block.parentId ?? dump.space.id, block.orderKey]],
-		});
+		const open = list.filter((edge) => edge.toSeq === null).map((e) => [e.parentKey, e.orderKey]);
+		const own = [[block.parentId ?? dump.space.id, block.orderKey]];
+		// Not ready: a live block may still be waiting for its placement, but one it has is right.
+		const want = block.deleted ? [] : ready || open.length > 0 ? own : [];
+		expect({ block: block.id, open }).toEqual({ block: block.id, open: want });
 	}
 	// Every placement is of a block of the space.
 	const ids = new Set(dump.blocks.map((b) => b.id));
 	for (const edge of dump.edges) expect(ids.has(edge.blockId)).toBe(true);
+	if (!ready) return "not-ready";
 
-	// A converted space starts at its floor: the versions before it say nothing of placements.
-	if (dump.history.floorSeq > 0 || dump.edges.some((edge) => edge.fromSeq === 0)) return;
+	// The replay of the version rows, then both sides cut at the floor: what was placed where
+	// from the floor on. (Before it a converted space has one placement per block, from seq 0.)
+	const floor = dump.history.floorSeq;
 	const replayed: OutlineEdgeRow[] = [];
 	const versionsOf = new Map<string, OutlineVersionRow[]>();
 	for (const v of dump.versions) {
@@ -331,7 +344,13 @@ export function checkPlacements(dump: SpaceDump): void {
 			if (current) replayed.push(current);
 		}
 	}
-	expect(dump.edges.map(edgeKey).sort()).toEqual(replayed.map(edgeKey).sort());
+	const fromFloor = (edges: readonly OutlineEdgeRow[]) =>
+		edges
+			.filter((edge) => edge.toSeq === null || edge.toSeq > floor)
+			.map((edge) => edgeKey({ ...edge, fromSeq: Math.max(edge.fromSeq, floor) }))
+			.sort();
+	expect(fromFloor(dump.edges)).toEqual(fromFloor(replayed));
+	return floor > 0 ? "from-floor" : "all";
 }
 
 /**

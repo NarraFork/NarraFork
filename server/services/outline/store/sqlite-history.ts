@@ -22,6 +22,7 @@ import type { Database } from "bun:sqlite";
 import { sqlite } from "../../../db";
 import type { OutlineAskJson, OutlineSpaceKind, OutlineTaskJson } from "../model";
 import {
+	assertHistoryReadable,
 	type OutlineChangedChildRow,
 	type OutlineEdgeRow,
 	type OutlineHistoryPort,
@@ -29,6 +30,7 @@ import {
 	type OutlineLevelCursor,
 	type OutlineLevelRow,
 	type OutlineSubtreeChange,
+	pageChangedChildren,
 	readSubtreeByLevels,
 } from "./history-port";
 import { chunked, type OutlineSpaceRow } from "./port";
@@ -87,34 +89,56 @@ const AS_OF_JOINS = `CROSS JOIN outline_blocks b ON b.id = s.id AND b.space_id =
 		AND v.from_seq = (SELECT max(x.from_seq) FROM outline_block_versions x
 			WHERE x.block_id = s.id AND x.from_seq <= ?3)`;
 
-const AS_OF_COLUMNS = `s.id, b.sid, CASE WHEN s.parent_key = ?1 THEN NULL ELSE s.parent_key END,
-		s.order_key, v.alias, v.task_json, v.from_seq, v.ask_json,
-		EXISTS (SELECT 1 FROM outline_block_edges c
-			WHERE c.parent_key = s.id AND c.from_seq <= ?3 AND (c.to_seq IS NULL OR c.to_seq > ?3))`;
+/**
+ * The placements under the parent key `parent` valid at the seq `at`, as two reads that never
+ * look at a child that left at or before `at`: the children still there (in sibling order, so
+ * a limit stops the read), and those that left after `at`. `INDEXED BY` pins each to its index:
+ * the statement fails to prepare rather than fall back to scanning everything the parent held.
+ */
+const OPEN = (parent: string, at: string) =>
+	`outline_block_edges e INDEXED BY idx_outline_edges_open
+		WHERE e.parent_key = ${parent} AND e.to_seq IS NULL AND e.from_seq <= ${at}`;
+const CLOSED = (parent: string, at: string, from: string) =>
+	`outline_block_edges e INDEXED BY idx_outline_edges_closed
+		WHERE e.parent_key = ${parent} AND e.to_seq > ${at} AND e.from_seq <= ${from}`;
 
-/** Placements valid at `?3`. */
-const VALID = (alias: string) =>
-	`${alias}.from_seq <= ?3 AND (${alias}.to_seq IS NULL OR ${alias}.to_seq > ?3)`;
+const HAD_CHILDREN = `(EXISTS (SELECT 1 FROM ${OPEN("s.id", "?3")})
+			OR EXISTS (SELECT 1 FROM ${CLOSED("s.id", "?3", "?3")}))`;
+
+const AS_OF_COLUMNS = `s.id, b.sid, CASE WHEN s.parent_key = ?1 THEN NULL ELSE s.parent_key END,
+		s.order_key, v.alias, v.task_json, v.from_seq, v.ask_json, ${HAD_CHILDREN}`;
+
+const LEVEL_PART = (source: string) =>
+	`SELECT * FROM (SELECT e.block_id AS id, e.parent_key, e.order_key FROM ${source}
+			AND (e.order_key, e.block_id) > (?4, ?5)
+		ORDER BY e.order_key, e.block_id LIMIT ?6)`;
 
 /**
  * The children of the parent key `?2` (a block's id, or the space's) as of `?3`, after the
- * cursor `(?4, ?5)`, at most `?6`.
+ * cursor `(?4, ?5)`, at most `?6`: the first `?6` of each of the two reads, merged.
  */
 export const SQLITE_LEVEL_AS_OF = `SELECT ${AS_OF_COLUMNS}
-	FROM (SELECT e.block_id AS id, e.parent_key, e.order_key FROM outline_block_edges e
-		WHERE e.parent_key = ?2 AND ${VALID("e")} AND (e.order_key, e.block_id) > (?4, ?5)
-		ORDER BY e.order_key, e.block_id LIMIT ?6) s
+	FROM (SELECT id, parent_key, order_key FROM (
+			${LEVEL_PART(OPEN("?2", "?3"))}
+			UNION ALL
+			${LEVEL_PART(CLOSED("?2", "?3", "?3"))})
+		ORDER BY order_key, id LIMIT ?6) s
 	${AS_OF_JOINS}
 	ORDER BY s.order_key, s.id`;
 
-/** Where the block `?1` sat as of `?2`. */
+const IN_SPACE = (block: string, space: string) =>
+	`EXISTS (SELECT 1 FROM outline_blocks p WHERE p.id = ${block} AND p.space_id = ${space})`;
+
+/** Where the block `?1` of the space `?3` sat as of `?2`. */
 export const SQLITE_PLACEMENT_AS_OF = `SELECT parent_key, block_id, from_seq, to_seq, order_key
 	FROM outline_block_edges
 	WHERE block_id = ?1 AND from_seq <= ?2 AND (to_seq IS NULL OR to_seq > ?2)
+		AND ${IN_SPACE("?1", "?3")}
 	ORDER BY from_seq DESC LIMIT 1`;
-/** Where the block `?1` sits now. */
+/** Where the block `?1` of the space `?2` sits now. */
 export const SQLITE_PLACEMENT_NOW = `SELECT parent_key, block_id, from_seq, to_seq, order_key
-	FROM outline_block_edges WHERE block_id = ?1 AND to_seq IS NULL LIMIT 1`;
+	FROM outline_block_edges
+	WHERE block_id = ?1 AND to_seq IS NULL AND ${IN_SPACE("?1", "?2")} LIMIT 1`;
 
 const SELF_CHANGED = (id: string, after: string, upTo: string) =>
 	`EXISTS (SELECT 1 FROM outline_block_versions v
@@ -123,31 +147,52 @@ const BELOW_CHANGED = (id: string, after: string, upTo: string) =>
 	`EXISTS (SELECT 1 FROM outline_subtree_changes t
 		WHERE t.ancestor_id = ${id} AND t.seq > ${after} AND t.seq <= ${upTo})`;
 
-/** Whether the block `?1`, or anything that was under it, changed in `(?2, ?3]`. */
+/**
+ * Whether the block `?1` of the space `?4`, or anything that was under it, changed in
+ * `(?2, ?3]`; no row for a block of another space.
+ */
 export const SQLITE_SUBTREE_CHANGE = `SELECT ${SELF_CHANGED("?1", "?2", "?3")},
-	${BELOW_CHANGED("?1", "?2", "?3")}`;
+	${BELOW_CHANGED("?1", "?2", "?3")} WHERE ${IN_SPACE("?1", "?4")}`;
+
+const CHANGED_COLUMNS = `e.block_id, e.from_seq, e.to_seq, e.order_key,
+		${SELF_CHANGED("e.block_id", "?3", "?4")}, ${BELOW_CHANGED("e.block_id", "?3", "?4")}`;
+const CHANGED = `${SELF_CHANGED("e.block_id", "?3", "?4")}
+			OR ${BELOW_CHANGED("e.block_id", "?3", "?4")}`;
+/** A parent that is not the space `?1` itself must be a block of it. */
+const PARENT_IN_SPACE = `(?2 = ?1 OR ${IN_SPACE("?2", "?1")})`;
 
 /**
- * The children the parent key `?2` had in `(?3, ?4]` that differ between its ends, after the
- * cursor `(?5, ?6)` by (block id, from seq), at most `?7`. A parent that is not the space `?1`
- * itself must be a block of it.
+ * The children still under the parent key `?2` that differ between the ends of `(?3, ?4]`
+ * (they arrived in it, changed, or something under them did), in sibling order after the
+ * cursor `(?5, ?6)`, at most `?7`. One statement, no subquery: it reads the open placements in
+ * their index's order and stops at the limit.
  */
-export const SQLITE_CHANGED_CHILDREN = `SELECT block_id, from_seq, to_seq, order_key, self, below
-	FROM (SELECT e.block_id, e.from_seq, e.to_seq, e.order_key,
-			${SELF_CHANGED("e.block_id", "?3", "?4")} AS self,
-			${BELOW_CHANGED("e.block_id", "?3", "?4")} AS below
-		FROM outline_block_edges e
-		WHERE e.parent_key = ?2 AND e.from_seq <= ?4 AND (e.to_seq IS NULL OR e.to_seq > ?3)
-			AND (e.block_id, e.from_seq) > (?5, ?6)
-			AND (?2 = ?1 OR EXISTS (SELECT 1 FROM outline_blocks p
-				WHERE p.id = ?2 AND p.space_id = ?1))
-		ORDER BY e.block_id, e.from_seq)
-	WHERE self OR below OR from_seq > ?3 OR (to_seq IS NOT NULL AND to_seq <= ?4)
-	ORDER BY block_id, from_seq LIMIT ?7`;
+export const SQLITE_CHANGED_CHILDREN_OPEN = `SELECT ${CHANGED_COLUMNS}
+	FROM ${OPEN("?2", "?4")}
+		AND (e.order_key, e.block_id) > (?5, ?6) AND ${PARENT_IN_SPACE}
+		AND (e.from_seq > ?3 OR ${CHANGED})
+	ORDER BY e.order_key, e.block_id LIMIT ?7`;
 
-/** Seqs of the commits that changed anything under the block `?1`, in `?3 < seq < ?2`. */
+/**
+ * The children that left the parent key `?2` after `?3` and were there by `?4`, in the order
+ * they left, after the cursor `(?5, ?6, ?8, ?9)` (to seq, from seq, order key, block id), at
+ * most `?7`. The cursor of a first read is `(?3, the largest integer, '', '')`.
+ */
+export const SQLITE_CHANGED_CHILDREN_CLOSED = `SELECT ${CHANGED_COLUMNS}
+	FROM outline_block_edges e INDEXED BY idx_outline_edges_closed
+	WHERE e.parent_key = ?2 AND e.to_seq IS NOT NULL
+		AND (e.to_seq, e.from_seq, e.order_key, e.block_id) > (?5, ?6, ?8, ?9)
+		AND e.from_seq <= ?4 AND ${PARENT_IN_SPACE}
+		AND (e.from_seq > ?3 OR e.to_seq <= ?4 OR ${CHANGED})
+	ORDER BY e.to_seq, e.from_seq, e.order_key, e.block_id LIMIT ?7`;
+
+/**
+ * Seqs of the commits that changed anything under the block `?1` of the space `?5`, in
+ * `?3 < seq < ?2`.
+ */
 export const SQLITE_SUBTREE_CHANGE_SEQS = `SELECT seq FROM outline_subtree_changes
-	WHERE ancestor_id = ?1 AND seq < ?2 AND seq > ?3 ORDER BY seq DESC LIMIT ?4`;
+	WHERE ancestor_id = ?1 AND seq < ?2 AND seq > ?3 AND ${IN_SPACE("?1", "?5")}
+	ORDER BY seq DESC LIMIT ?4`;
 
 /** The next sids of a space after `?2`, in sid order (the space-and-sid unique index). */
 export const SQLITE_BACKFILL_SCAN = `SELECT sid FROM outline_blocks
@@ -236,6 +281,23 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 		return (rows as LevelValues[]).map(toLevel);
 	};
 
+	/**
+	 * Whether the space can answer a read that looks back to `seq` (null: only needs its
+	 * placements); throws when it cannot, false when there is no such space.
+	 */
+	const readable = (spaceId: string, seq: number | null): boolean => {
+		const row = values("SELECT history_floor_seq, edges_ready FROM outline_spaces WHERE id = ?1", [
+			spaceId,
+		])[0] as [number, number] | undefined;
+		if (!row) return false;
+		assertHistoryReadable(
+			spaceId,
+			{ floorSeq: Number(row[0]), edgesReady: Number(row[1]) !== 0 },
+			seq,
+		);
+		return true;
+	};
+
 	/** The children of several parents, one seek per parent, at most `limit` rows in all. */
 	const levels = (
 		spaceId: string,
@@ -254,6 +316,7 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 	return {
 		async listLevel(spaceId, parentId, { asOf, after, limit }) {
 			const max = Math.max(0, Math.floor(limit));
+			if (asOf !== null && !readable(spaceId, asOf)) return { rows: [], next: null };
 			const rows = level(spaceId, parentId, asOf, after ?? FIRST, max + 1);
 			if (rows.length <= max) return { rows, next: null };
 			const kept = rows.slice(0, max);
@@ -263,11 +326,13 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 
 		async listLevels(spaceId, parentIds, { asOf, limit }) {
 			const max = Math.max(0, Math.floor(limit));
+			if (asOf !== null && !readable(spaceId, asOf)) return { rows: [], truncated: false };
 			const rows = levels(spaceId, parentIds, asOf, max + 1);
 			return { rows: rows.slice(0, max), truncated: rows.length > max };
 		},
 
 		async listSubtreeAt(spaceId, rootId, { asOf, limit }) {
+			if (asOf !== null && !readable(spaceId, asOf)) return { rows: [], truncated: false };
 			return readSubtreeByLevels(
 				async (parentIds, room) => levels(spaceId, parentIds, asOf, room),
 				rootId,
@@ -275,13 +340,14 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 			);
 		},
 
-		async getPlacementsAt(blockIds, asOf) {
+		async getPlacementsAt(spaceId, blockIds, asOf) {
 			const out: OutlineEdgeRow[] = [];
+			if (!readable(spaceId, asOf)) return out;
 			for (const id of new Set(blockIds)) {
 				const row = (
 					asOf === null
-						? values(SQLITE_PLACEMENT_NOW, [id])
-						: values(SQLITE_PLACEMENT_AS_OF, [id, asOf])
+						? values(SQLITE_PLACEMENT_NOW, [id, spaceId])
+						: values(SQLITE_PLACEMENT_AS_OF, [id, asOf, spaceId])
 				)[0] as [string, string, number, number | null, string] | undefined;
 				if (!row) continue;
 				out.push({
@@ -295,11 +361,14 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 			return out;
 		},
 
-		async findSubtreeChanges(blockIds, { after, upTo }) {
+		async findSubtreeChanges(spaceId, blockIds, { after, upTo }) {
 			const out: OutlineSubtreeChange[] = [];
-			if (upTo <= after) return out;
+			if (!readable(spaceId, after) || upTo <= after) return out;
 			for (const blockId of new Set(blockIds)) {
-				const row = values(SQLITE_SUBTREE_CHANGE, [blockId, after, upTo])[0] as [number, number];
+				const row = values(SQLITE_SUBTREE_CHANGE, [blockId, after, upTo, spaceId])[0] as
+					| [number, number]
+					| undefined;
+				if (!row) continue;
 				const self = Number(row[0]) !== 0;
 				const below = Number(row[1]) !== 0;
 				if (self || below) out.push({ blockId, self, below });
@@ -308,38 +377,56 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 		},
 
 		async listChangedChildren(spaceId, parentId, { after, upTo, cursor, limit }) {
-			const max = Math.max(0, Math.floor(limit));
-			if (upTo <= after) return { rows: [], next: null };
-			const found = values(SQLITE_CHANGED_CHILDREN, [
-				spaceId,
-				parentId ?? spaceId,
-				after,
-				upTo,
-				cursor?.blockId ?? "",
-				cursor?.fromSeq ?? -1,
-				max + 1,
-			]) as Array<[string, number, number | null, string, number, number]>;
-			const rows: OutlineChangedChildRow[] = found.slice(0, max).map((row) => ({
-				blockId: row[0],
-				fromSeq: Number(row[1]),
-				toSeq: row[2] === null ? null : Number(row[2]),
-				orderKey: row[3],
-				self: Number(row[4]) !== 0,
-				below: Number(row[5]) !== 0,
-			}));
-			const last = rows.at(-1);
-			return {
-				rows,
-				next: found.length > max && last ? { blockId: last.blockId, fromSeq: last.fromSeq } : null,
-			};
+			if (!readable(spaceId, after) || upTo <= after) return { rows: [], next: null };
+			const parentKey = parentId ?? spaceId;
+			const toRows = (found: unknown[][]): OutlineChangedChildRow[] =>
+				(found as Array<[string, number, number | null, string, number, number]>).map((row) => ({
+					blockId: row[0],
+					fromSeq: Number(row[1]),
+					toSeq: row[2] === null ? null : Number(row[2]),
+					orderKey: row[3],
+					self: Number(row[4]) !== 0,
+					below: Number(row[5]) !== 0,
+				}));
+			return pageChangedChildren(
+				async (from, room) =>
+					toRows(
+						values(SQLITE_CHANGED_CHILDREN_OPEN, [
+							spaceId,
+							parentKey,
+							after,
+							upTo,
+							from?.orderKey ?? "",
+							from?.blockId ?? "",
+							room,
+						]),
+					),
+				async (from, room) =>
+					toRows(
+						values(SQLITE_CHANGED_CHILDREN_CLOSED, [
+							spaceId,
+							parentKey,
+							after,
+							upTo,
+							from.toSeq,
+							from.fromSeq,
+							room,
+							from.orderKey,
+							from.blockId,
+						]),
+					),
+				{ after, cursor, limit },
+			);
 		},
 
-		async listSubtreeChangeSeqs(blockId, { before, after, limit }) {
+		async listSubtreeChangeSeqs(spaceId, blockId, { before, after, limit }) {
+			if (!readable(spaceId, null)) return [];
 			const rows = values(SQLITE_SUBTREE_CHANGE_SEQS, [
 				blockId,
 				before ?? Number.MAX_SAFE_INTEGER,
 				after ?? -1,
 				Math.max(0, Math.floor(limit)),
+				spaceId,
 			]) as Array<[number]>;
 			return rows.map((row) => Number(row[0]));
 		},

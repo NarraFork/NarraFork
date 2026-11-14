@@ -314,6 +314,10 @@ describe("PostgreSQL outline store", () => {
 					INSERT INTO outline_block_edges (parent_key, block_id, from_seq, to_seq, order_key)
 					SELECT COALESCE(parent_id, space_id), id, 1, NULL, order_key
 					FROM outline_blocks WHERE space_id = 'plan-space';
+					-- Churn: every one of the 100,000 children also stood under top7 once, long ago.
+					INSERT INTO outline_block_edges (parent_key, block_id, from_seq, to_seq, order_key)
+					SELECT 'top7', id, 0, 1, order_key FROM outline_blocks
+					WHERE space_id = 'plan-space' AND parent_id IS NOT NULL AND parent_id <> 'top7';
 					ANALYZE outline_blocks; ANALYZE outline_block_versions; ANALYZE outline_block_edges;
 				`);
 					if (seeded.code !== 0) return { error: seeded.stderr.slice(0, 400) };
@@ -374,6 +378,9 @@ describe("PostgreSQL outline store", () => {
 						await time("subtree now, 800 of the whole space", () =>
 							store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 }),
 						);
+						await time("changed children of top7, 200 rows", () =>
+							store.listChangedChildren("plan-space", "top7", { after: 3, upTo: 5, limit: 200 }),
+						);
 						await time("levels as of a seq, 20 parents, 800 rows", () =>
 							store.listLevels("plan-space", twenty, { asOf: 3, limit: 800 }),
 						);
@@ -429,6 +436,16 @@ describe("PostgreSQL outline store", () => {
 					expect(node["Node Type"]).toMatch(/^Index (Only )?Scan$/);
 					expect(node["Index Name"]).toBe("outline_blocks_pkey");
 				}
+				// And only through the two by-parent indexes: the primary key would read every child
+				// the parent ever had (top7 has 500 now and had 99,500 more).
+				const indexes = nodes
+					.map((n) => n["Index Name"])
+					.filter(
+						(name) => name?.includes("outline_block_edges") || name?.includes("outline_edges"),
+					);
+				expect(indexes.length).toBeGreaterThan(0);
+				for (const name of indexes)
+					expect(["idx_outline_edges_open", "idx_outline_edges_closed"]).toContain(name as string);
 				for (const node of edges) {
 					expect(node["Node Type"]).not.toBe("Seq Scan");
 					expect(String(node["Index Cond"] ?? node["Recheck Cond"] ?? "")).toContain("parent_key");

@@ -12,7 +12,7 @@ import { expect } from "bun:test";
 import { OutlineWriteError } from "../errors";
 import { convertOutlineHistory } from "../history-convert";
 import { OUTLINE_CHANGE, type OutlineTaskJson } from "../model";
-import type { OutlineLevelCursor } from "../store/history-port";
+import { OutlineHistoryUnavailableError, type OutlineLevelCursor } from "../store/history-port";
 import {
 	OUTLINE_HISTORY_LIMITS,
 	OUTLINE_PLACEMENT_FLAGS,
@@ -233,6 +233,17 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 						wantKids(parent),
 					);
 				}
+				// Parents come in the order asked, wherever the top level stands among them.
+				const asked = [...some.slice(0, 2), null, ...some.slice(2)];
+				const mixed = await ctx.store.listLevels(space.id, asked, { asOf: seq, limit: 10_000 });
+				expect(mixed.rows.map((r) => r.id)).toEqual(asked.flatMap((parent) => wantKids(parent)));
+				const mixedNow = await ctx.store.listLevels(space.id, asked, {
+					asOf: null,
+					limit: 10_000,
+				});
+				expect(
+					mixedNow.rows.map((r) => r.parentId).filter((parent, i, all) => parent !== all[i - 1]),
+				).toEqual(asked.filter((parent) => mixedNow.rows.some((r) => r.parentId === parent)));
 				// Rows of one parent come together.
 				const order = levels.rows.map((r) => r.parentId);
 				expect(order.filter((p, i) => i === 0 || p !== order[i - 1]).length).toBe(
@@ -244,7 +255,7 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 					let current: string | null = start;
 					for (let guard = 0; current !== null; guard++) {
 						expect(guard).toBeLessThan(1000);
-						const [placement] = await ctx.store.getPlacementsAt([current], seq);
+						const [placement] = await ctx.store.getPlacementsAt(space.id, [current], seq);
 						const parent: string | null = (want.get(current) as Placed).parentId;
 						expect(placement?.parentKey).toBe(parent ?? space.id);
 						current = parent;
@@ -265,8 +276,9 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 			);
 			// A deleted block has no placement now, and had none once it was deleted.
 			const dump = await ctx.dump(space.id);
+			expect(checkPlacements(dump)).toBe("all");
 			const gone = dump.blocks.filter((b) => b.deleted).map((b) => b.id);
-			expect(await ctx.store.getPlacementsAt(gone, null)).toEqual([]);
+			expect(await ctx.store.getPlacementsAt(space.id, gone, null)).toEqual([]);
 			// Another space's parent has no children here.
 			const other = await personalSpace(ctx);
 			const top = [...now].find(([, p]) => p.parentId === null && p.hasChildren)?.[0];
@@ -294,7 +306,7 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 				const b = snapshots.get(s2) as Map<string, SnapshotEntry>;
 				const both = [...a.keys()].filter((id) => b.has(id));
 				const found = new Map(
-					(await ctx.store.findSubtreeChanges(both, { after: s1, upTo: s2 })).map((c) => [
+					(await ctx.store.findSubtreeChanges(space.id, both, { after: s1, upTo: s2 })).map((c) => [
 						c.blockId,
 						c,
 					]),
@@ -336,16 +348,16 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 				const got: number[] = [];
 				let before: number | null = null;
 				for (;;) {
-					const page = await ctx.store.listSubtreeChangeSeqs(id, { before, limit: 2 });
+					const page = await ctx.store.listSubtreeChangeSeqs(space.id, id, { before, limit: 2 });
 					got.push(...page);
 					if (page.length < 2) break;
 					before = page.at(-1) as number;
 				}
 				expect(got).toEqual(want);
 				const floor = want.at(-1) as number;
-				expect(await ctx.store.listSubtreeChangeSeqs(id, { after: floor, limit: 100 })).toEqual(
-					want.slice(0, -1),
-				);
+				expect(
+					await ctx.store.listSubtreeChangeSeqs(space.id, id, { after: floor, limit: 100 }),
+				).toEqual(want.slice(0, -1));
 			}
 		},
 	},
@@ -364,7 +376,7 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 				const walked = new Set<string | null>([null]);
 				for (let at = 0; at < queue.length; at++) {
 					const parentId = queue[at] as string | null;
-					let cursor: { blockId: string; fromSeq: number } | null = null;
+					let cursor: OutlineChangedChildCursor | null = null;
 					for (;;) {
 						const page = await ctx.store.listChangedChildren(space.id, parentId, {
 							after: s1,
@@ -529,8 +541,8 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 			const afterDelete = await edgesOf();
 			expect(afterDelete.open).toHaveLength(5 - 1);
 			expect(afterDelete.all.filter((e) => e.toSeq === seq5)).toHaveLength(SIZE + 1);
-			expect(await ctx.store.getPlacementsAt([a, groups[0] as string], null)).toEqual([]);
-			expect((await ctx.store.getPlacementsAt([a], seq5 - 1))[0]?.parentKey).toBe(c);
+			expect(await ctx.store.getPlacementsAt(space.id, [a, groups[0] as string], null)).toEqual([]);
+			expect((await ctx.store.getPlacementsAt(space.id, [a], seq5 - 1))[0]?.parentKey).toBe(c);
 			const back = await write(ctx, space, [
 				{ op: "restore", block: { id: a }, parent: null, position: { last: true } },
 			]);
@@ -573,7 +585,9 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 				floorSeq: 0,
 				edgesReady: false,
 			});
-			expect((await ctx.dump(space.id)).edges).toEqual([]);
+			const bare = await ctx.dump(space.id);
+			expect(bare.edges).toEqual([]);
+			expect(checkPlacements(bare)).toBe("not-ready");
 
 			// Commits land between batches: a move, a delete, a restore, an insert, a text change.
 			// (`ids` is the root, then k0…k39: k39 under k7, k38 a leaf under k6, k2 deleted above.)
@@ -613,7 +627,7 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 
 			const after = await ctx.dump(space.id);
 			expect(after.history).toEqual({ floorSeq: after.space.nextSeq - 1, edgesReady: true });
-			checkPlacements(after);
+			expect(checkPlacements(after)).toBe("from-floor");
 			// What the conversion placed holds since before the history; what a commit placed
 			// during it starts at that commit. Nobody is placed twice.
 			expect(after.edges.filter((e) => e.toSeq === null)).toHaveLength(
@@ -646,7 +660,7 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 			expect(later.edges.filter((e) => e.fromSeq === 0)).toEqual(
 				after.edges.filter((e) => e.fromSeq === 0),
 			);
-			checkPlacements(later);
+			expect(checkPlacements(later)).toBe("from-floor");
 			// History from the floor on reads by placement like any other.
 			expect(sorted(await treeByLevels(ctx, space.id, later.space.nextSeq - 1, 5))).toEqual(
 				sorted(await treeByLevels(ctx, space.id, null, 5)),
@@ -717,7 +731,107 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 				left: 0,
 				backup: "/somewhere/outline-before-pageless.db",
 			});
-			checkPlacements(await ctx.dump(waiting.id));
+			expect(checkPlacements(await ctx.dump(waiting.id))).toBe("from-floor");
+		},
+	},
+	{
+		name: "refusals: a read below the floor, or of a space whose placements are not built, is refused; every read stays in its space",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const made = await write(ctx, space, [
+				{ op: "insert", tempId: "p", parent: null, content: "page" },
+				{ op: "insert", tempId: "a", parent: { tempId: "p" }, content: "A" },
+				{ op: "insert", tempId: "b", parent: { tempId: "a" }, content: "B" },
+			]);
+			const [p, a, b] = made.results.map((r) => r.blockId) as [string, string, string];
+			await write(ctx, space, [{ op: "update", block: { id: b }, content: "B, rewritten" }]);
+			await write(ctx, space, [{ op: "move", block: { id: b }, parent: { id: p } }]);
+			const refused = async (
+				read: () => Promise<unknown>,
+				reason: "not-ready" | "before-floor",
+			): Promise<void> => {
+				let error: unknown;
+				try {
+					await read();
+				} catch (caught) {
+					error = caught;
+				}
+				expect(error).toBeInstanceOf(OutlineHistoryUnavailableError);
+				expect((error as OutlineHistoryUnavailableError).reason).toBe(reason);
+				expect((error as OutlineHistoryUnavailableError).spaceId).toBe(space.id);
+			};
+			/** Every read that looks at placements or marks, looking back to `seq`. */
+			const reads = (seq: number): Array<() => Promise<unknown>> => [
+				() => ctx.store.listLevel(space.id, null, { asOf: seq, limit: 5 }),
+				() => ctx.store.listLevel(space.id, p, { asOf: seq, limit: 5 }),
+				() => ctx.store.listLevels(space.id, [null, p], { asOf: seq, limit: 5 }),
+				() => ctx.store.listSubtreeAt(space.id, null, { asOf: seq, limit: 5 }),
+				() => ctx.store.getPlacementsAt(space.id, [a], seq),
+				() => ctx.store.findSubtreeChanges(space.id, [p, a], { after: seq, upTo: seq + 1 }),
+				() =>
+					ctx.store.listChangedChildren(space.id, null, { after: seq, upTo: seq + 1, limit: 5 }),
+			];
+
+			// Before the conversion: nothing by placement is answered, at any seq; the tree now is.
+			await ctx.forgetHistory(space.id);
+			for (const read of reads(3)) await refused(read, "not-ready");
+			await refused(() => ctx.store.getPlacementsAt(space.id, [a], null), "not-ready");
+			await refused(() => ctx.store.listSubtreeChangeSeqs(space.id, p, { limit: 5 }), "not-ready");
+			expect(
+				(await ctx.store.listLevel(space.id, null, { asOf: null, limit: 5 })).rows.map((r) => r.id),
+			).toEqual([p]);
+			expect(
+				(await ctx.store.listSubtreeAt(space.id, null, { asOf: null, limit: 5 })).rows,
+			).toHaveLength(3);
+
+			// After it: the floor is readable, anything below it is refused, never answered.
+			await convertOutlineHistory({
+				store: {
+					listSpacesPendingEdges: async () => [space],
+					backfillEdges: ctx.store.backfillEdges.bind(ctx.store),
+					finishEdgeBackfill: ctx.store.finishEdgeBackfill.bind(ctx.store),
+				},
+			});
+			const floor = (await ctx.store.getHistoryStates([space.id])).get(space.id)
+				?.floorSeq as number;
+			expect(floor).toBe(3);
+			for (const seq of [0, 1, floor - 1]) {
+				for (const read of reads(seq)) await refused(read, "before-floor");
+			}
+			await write(ctx, space, [{ op: "update", block: { id: b }, content: "B, after the floor" }]);
+			for (const read of reads(floor)) await read();
+			expect(
+				(await ctx.store.listLevel(space.id, p, { asOf: floor, limit: 5 })).rows
+					.map((r) => r.id)
+					.sort(),
+			).toEqual([a, b].sort());
+			expect(
+				await ctx.store.findSubtreeChanges(space.id, [p, a, b], { after: floor, upTo: floor + 1 }),
+			).toEqual(
+				expect.arrayContaining([
+					{ blockId: p, self: false, below: true },
+					{ blockId: b, self: true, below: false },
+				]),
+			);
+			// The timeline simply ends at the floor: there are no marks before it.
+			expect(await ctx.store.listSubtreeChangeSeqs(space.id, p, { limit: 10 })).toEqual([
+				floor + 1,
+			]);
+
+			// Another space sees none of these blocks through any read that names blocks.
+			const other = await personalSpace(ctx);
+			await write(ctx, other, [{ op: "insert", parent: null, content: "elsewhere" }]);
+			expect(await ctx.store.getPlacementsAt(other.id, [a, b], null)).toEqual([]);
+			expect(await ctx.store.getPlacementsAt(other.id, [a, b], 1)).toEqual([]);
+			expect(await ctx.store.findSubtreeChanges(other.id, [p, b], { after: 0, upTo: 99 })).toEqual(
+				[],
+			);
+			expect(await ctx.store.listSubtreeChangeSeqs(other.id, p, { limit: 10 })).toEqual([]);
+			// A space that does not exist has nothing, and is not an error.
+			expect(await ctx.store.listLevel("no-such-space", null, { asOf: 1, limit: 5 })).toEqual({
+				rows: [],
+				next: null,
+			});
 		},
 	},
 	{

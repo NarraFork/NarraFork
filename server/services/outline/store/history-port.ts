@@ -13,19 +13,35 @@
  *     every block a commit gave a version. A block with no version of its own and no mark in
  *     `(after, upTo]` has the same subtree at both seqs.
  *
- * WHAT A CALLER MUST CHECK FIRST
- * ------------------------------
- * The edges of a space written before the tables existed are built by a one-time conversion
- * (`services/outline/history-convert.ts`). Until it has finished a space
- * ({@link OutlineHistoryState.edgesReady}), reads by placement of that space are incomplete and
- * must not be used. And no read here knows the space's history floor: a read as of a seq below
- * {@link OutlineHistoryState.floorSeq} is the caller's to refuse ("history starts later").
+ * A READ THAT CANNOT BE RIGHT IS REFUSED, NOT ANSWERED
+ * ---------------------------------------------------
+ * The placements of a space written before the tables existed are built by a one-time
+ * conversion (`services/outline/history-convert.ts`), and nothing is known of a space before
+ * its history floor. A read that would need either rejects with
+ * {@link OutlineHistoryUnavailableError} instead of returning a tree that looks plausible:
  *
+ *   - `not-ready`: the space's placements are not built yet
+ *     ({@link OutlineHistoryState.edgesReady} false). Every read of placements or marks.
+ *   - `before-floor`: the seq asked for (`asOf`, or the `after` end of a range) is below
+ *     {@link OutlineHistoryState.floorSeq}. The floor itself is readable: it is the tree as the
+ *     conversion found it.
+ * Reads of the current tree (`asOf` null on a level or a subtree) come from the blocks' own
+ * index and are never refused. Every read names its space, and sees only that space's blocks.
+ *
+ * WHAT IT COSTS
+ * -------------
  * Every method is bounded: a hard row limit, a cursor where a level can be long, one statement
- * per chunk of ids. A read as of a seq looks at every placement the parent ever had (at most
- * `OUTLINE_LIMITS.maxSiblings` live at a time, plus those that left), not at the text versions
- * under it. The statements that join placements to versions pin their join order (SQLite:
- * `CROSS JOIN`; PostgreSQL: `LATERAL`), and each backend's tests read the plans.
+ * per chunk of ids. A level as of a seq reads the parent's children that are still there a page
+ * at a time, in sibling order (`idx_outline_edges_open`), and those that left AFTER that seq
+ * (`idx_outline_edges_closed`); children that came and went before it are never looked at, nor
+ * are the text versions under the parent. What remains: a read as of a seq long ago looks at
+ * every child that left since. The statements that join placements to versions pin their join
+ * order and their indexes (SQLite: `CROSS JOIN`, `INDEXED BY`; PostgreSQL: `LATERAL`), and
+ * each backend's tests read the plans.
+ *
+ * WRITERS (H3): one commit marks at most `OUTLINE_HISTORY_LIMITS.maxChangeMarks` ancestors
+ * (`port.ts`). A compensating commit that restores many blocks spread over separate deep
+ * chains must be split by the ancestors it marks as well as by the rows it writes.
  *
  * NO RECURSIVE READ. A subtree is read level by level, not by one recursive statement over the
  * placements: measured on 100,000 blocks, PostgreSQL computes a whole level before the limit
@@ -94,10 +110,54 @@ export interface OutlineChangedChildRow extends OutlineSubtreeChange {
 	orderKey: string;
 }
 
-/** Where a changed-children read continues: after this placement, by (block id, from seq). */
+/**
+ * Where a changed-children read continues. The read goes through the children still there
+ * (`open`, in sibling order) and then through those that left (by when they left), each in the
+ * order of its index, so a page costs what it looks at and not the whole level. The values are
+ * the last row's; the order within a part is the backend's own, so a cursor goes back only to
+ * the backend that made it.
+ */
 export interface OutlineChangedChildCursor {
-	blockId: string;
+	open: boolean;
+	/** Of the last row when it had left; otherwise where the second part starts. */
+	toSeq: number;
 	fromSeq: number;
+	orderKey: string;
+	blockId: string;
+}
+
+/** Why a read by placement or by change mark cannot be answered; see the header. */
+export class OutlineHistoryUnavailableError extends Error {
+	constructor(
+		readonly spaceId: string,
+		readonly reason: "not-ready" | "before-floor",
+		/** The space's history floor. */
+		readonly floorSeq: number,
+		/** The seq the read asked for; null when it asked for none. */
+		readonly seq: number | null,
+	) {
+		super(
+			reason === "not-ready"
+				? `the placements of outline space ${spaceId} are not built yet`
+				: `outline space ${spaceId} keeps no history before seq ${floorSeq} (asked for ${seq})`,
+		);
+		this.name = "OutlineHistoryUnavailableError";
+	}
+}
+
+/**
+ * Refuse a read the space's state cannot answer: `seq` is the oldest seq the read looks at
+ * (null: it only needs the placements to be there). Shared by both backends.
+ */
+export function assertHistoryReadable(
+	spaceId: string,
+	state: OutlineHistoryState,
+	seq: number | null,
+): void {
+	if (!state.edgesReady)
+		throw new OutlineHistoryUnavailableError(spaceId, "not-ready", state.floorSeq, seq);
+	if (seq !== null && seq < state.floorSeq)
+		throw new OutlineHistoryUnavailableError(spaceId, "before-floor", state.floorSeq, seq);
 }
 
 /** Rows one placement backfill transaction scans at most. */
@@ -110,6 +170,7 @@ export interface OutlineHistoryPort {
 	 * placements of that parent, each joined to the block's version valid then). After `after`
 	 * when given, at most `limit` rows; `next` is where the following read continues, null when
 	 * the level ended. A parent of another space, deleted, or unknown has no children here.
+	 * As of a seq: refused when the space is not ready or the seq is below its floor.
 	 */
 	listLevel(
 		spaceId: string,
@@ -120,8 +181,9 @@ export interface OutlineHistoryPort {
 	 * The live children of several parents at once (`null` among them: the top level), now or as
 	 * of a seq: what opening several rows of a lazily loaded tree reads. Rows come grouped by
 	 * parent, each parent's in sibling order, at most `limit` in all; `truncated` when there are
-	 * more, and then only the parent of the last row may be cut short. One statement per 500
-	 * parents.
+	 * more, and then only the parent of the last row may be cut short. Parents come in the
+	 * order given (each once), `null` where it stands. One statement per 500 parents. Refused
+	 * like {@link listLevel}.
 	 */
 	listLevels(
 		spaceId: string,
@@ -136,6 +198,7 @@ export interface OutlineHistoryPort {
 	 * cut short. Read one level at a time ({@link readSubtreeByLevels}), every read stopping at
 	 * what is left of the limit and skipping the blocks known to have no children: its cost
 	 * follows the rows returned, not the size of the subtree or of the levels it starts.
+	 * Refused like {@link listLevel}.
 	 */
 	listSubtreeAt(
 		spaceId: string,
@@ -143,26 +206,35 @@ export interface OutlineHistoryPort {
 		options: { asOf: number | null; limit: number },
 	): Promise<{ rows: OutlineLevelRow[]; truncated: boolean }>;
 	/**
-	 * Where each block sat as of a seq (`null`: now): its parent key (the space id for a
-	 * top-level block) and order key. Blocks that were not in the tree then (not created yet,
-	 * deleted) are left out. One backward seek on the block's placements each: walking up from a
-	 * block to the space as of a seq is one call per level.
+	 * Where each of a space's blocks sat as of a seq (`null`: now): its parent key (the space
+	 * id for a top-level block) and order key. Blocks that were not in the tree then (not
+	 * created yet, deleted) and blocks of other spaces are left out. One backward seek on the
+	 * block's placements each: walking up from a block to the space as of a seq is one call per
+	 * level. Refused when the space is not ready, or `asOf` is below its floor.
 	 */
-	getPlacementsAt(blockIds: readonly string[], asOf: number | null): Promise<OutlineEdgeRow[]>;
+	getPlacementsAt(
+		spaceId: string,
+		blockIds: readonly string[],
+		asOf: number | null,
+	): Promise<OutlineEdgeRow[]>;
 	/**
-	 * Which of the blocks changed, themselves or anywhere below, in `(after, upTo]`. Blocks with
-	 * neither are left out: their subtrees are the same at both seqs. Two index probes per block.
+	 * Which of a space's blocks changed, themselves or anywhere below, in `(after, upTo]`.
+	 * Blocks with neither (and blocks of other spaces) are left out: their subtrees are the same
+	 * at both seqs. Two index probes per block. Refused when the space is not ready, or `after`
+	 * is below its floor.
 	 */
 	findSubtreeChanges(
+		spaceId: string,
 		blockIds: readonly string[],
 		range: { after: number; upTo: number },
 	): Promise<OutlineSubtreeChange[]>;
 	/**
 	 * The children one parent (`null`: the space's top level) had during `(after, upTo]` that
-	 * differ between its two ends, by (block id, from seq) after `cursor`, at most `limit`; `next`
-	 * is where the following read continues. Comparing two seqs walks down with it: only a child
-	 * with `below` set needs its own level read. Looks at every placement the parent had in the
-	 * range, with two index probes each.
+	 * differ between its two ends, after `cursor`, at most `limit`, in no order a caller should
+	 * rely on; `next` is where the following read continues. Comparing two seqs walks down with it: only a child
+	 * with `below` set needs its own level read. Looks at the parent's children that are there
+	 * now and at those that left after `after`, with two index probes each. Refused like
+	 * {@link findSubtreeChanges}.
 	 */
 	listChangedChildren(
 		spaceId: string,
@@ -175,11 +247,14 @@ export interface OutlineHistoryPort {
 		},
 	): Promise<{ rows: OutlineChangedChildRow[]; next: OutlineChangedChildCursor | null }>;
 	/**
-	 * Seqs of the commits that changed anything that was under a block, newest first, in
-	 * `after < seq < before`, at most `limit`: the block's timeline, together with its own
-	 * versions (`listBlockHistory`). One range read on the marks' primary key.
+	 * Seqs of the commits that changed anything that was under a block of the space, newest
+	 * first, in `after < seq < before`, at most `limit`: the block's timeline, together with its
+	 * own versions (`listBlockHistory`). One range read on the marks' primary key. There are no
+	 * marks at or below the space's floor, so the list simply ends there. Refused when the space
+	 * is not ready; a block of another space has none.
 	 */
 	listSubtreeChangeSeqs(
+		spaceId: string,
 		blockId: string,
 		options: { before?: number | null; after?: number; limit: number },
 	): Promise<number[]>;
@@ -234,4 +309,62 @@ export async function readSubtreeByLevels(
 		frontier = found.filter((row) => row.hasChildren).map((row) => row.id);
 	}
 	return { rows, truncated: false };
+}
+
+/** Before every child that left after `after`: where the second part of a read starts. */
+function closedStart(after: number): OutlineChangedChildCursor {
+	return { open: false, toSeq: after, fromSeq: Number.MAX_SAFE_INTEGER, orderKey: "", blockId: "" };
+}
+
+/**
+ * One page of changed children, for both backends: `readOpen` and `readClosed` return the
+ * differing children after a cursor, in their index's order, at most `limit`.
+ */
+export async function pageChangedChildren(
+	readOpen: (
+		after: OutlineChangedChildCursor | null,
+		limit: number,
+	) => Promise<OutlineChangedChildRow[]>,
+	readClosed: (
+		after: OutlineChangedChildCursor,
+		limit: number,
+	) => Promise<OutlineChangedChildRow[]>,
+	options: { after: number; cursor?: OutlineChangedChildCursor | null; limit: number },
+): Promise<{ rows: OutlineChangedChildRow[]; next: OutlineChangedChildCursor | null }> {
+	const max = Math.max(0, Math.floor(options.limit));
+	const cursor = options.cursor ?? null;
+	const rows: OutlineChangedChildRow[] = [];
+	let openDone = cursor !== null && !cursor.open;
+	if (!openDone) {
+		const found = await readOpen(cursor, max + 1);
+		for (const row of found) rows.push(row);
+		openDone = found.length <= max;
+	}
+	if (openDone && rows.length <= max) {
+		const from = cursor !== null && !cursor.open ? cursor : closedStart(options.after);
+		for (const row of await readClosed(from, max - rows.length + 1)) rows.push(row);
+	}
+	if (rows.length <= max) return { rows, next: null };
+	const kept = rows.slice(0, max);
+	const last = kept.at(-1);
+	if (!last) return { rows: kept, next: cursor };
+	const next: OutlineChangedChildCursor =
+		last.toSeq !== null
+			? {
+					open: false,
+					toSeq: last.toSeq,
+					fromSeq: last.fromSeq,
+					orderKey: last.orderKey,
+					blockId: last.blockId,
+				}
+			: openDone
+				? closedStart(options.after)
+				: {
+						open: true,
+						toSeq: 0,
+						fromSeq: last.fromSeq,
+						orderKey: last.orderKey,
+						blockId: last.blockId,
+					};
+	return { rows: kept, next };
 }

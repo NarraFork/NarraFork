@@ -1,6 +1,6 @@
 {
-  "id": "5c6280b8-c028-4e92-b199-ec6aec85bda1",
-  "prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+  "id": "407a309f-7e0a-4573-842a-f58767b8af6d",
+  "prevId": "5c6280b8-c028-4e92-b199-ec6aec85bda1",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -17598,6 +17598,80 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_edges_open": {
+          "name": "idx_outline_edges_open",
+          "columns": [
+            {
+              "expression": "parent_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "order_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "block_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "from_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"to_seq\" IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_edges_closed": {
+          "name": "idx_outline_edges_closed",
+          "columns": [
+            {
+              "expression": "parent_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "to_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "from_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "order_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "block_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"to_seq\" IS NOT NULL",
           "concurrently": false,
           "method": "btree",
           "with": {}

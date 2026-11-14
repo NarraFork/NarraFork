@@ -6021,6 +6021,16 @@ export const outlineBlockEdges = sqliteTable(
 		primaryKey({ columns: [table.parentKey, table.blockId, table.fromSeq] }),
 		// A block's placements (its open one, its parent as of a seq); also the FK's index.
 		index("idx_outline_edges_block").on(table.blockId, table.fromSeq),
+		// A parent's children that are still there, in sibling order: a level as of a seq reads
+		// them a page at a time, whatever the number of children that came and went.
+		index("idx_outline_edges_open")
+			.on(table.parentKey, table.orderKey, table.blockId, table.fromSeq)
+			.where(sql`"to_seq" IS NULL`),
+		// A parent's children that left, by when: a read as of a seq looks only at those that
+		// left after it, not at everything the parent ever held. Holds every column the reads need.
+		index("idx_outline_edges_closed")
+			.on(table.parentKey, table.toSeq, table.fromSeq, table.orderKey, table.blockId)
+			.where(sql`"to_seq" IS NOT NULL`),
 	],
 );
 

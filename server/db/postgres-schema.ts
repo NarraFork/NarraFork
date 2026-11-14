@@ -3719,6 +3719,12 @@ export const outlineBlockEdges = pgTable(
 	},
 	(table) => [
 		index("idx_outline_edges_block").on(table.blockId, table.fromSeq),
+		index("idx_outline_edges_open")
+			.on(table.parentKey, table.orderKey, table.blockId, table.fromSeq)
+			.where(sql.raw('"to_seq" IS NULL')),
+		index("idx_outline_edges_closed")
+			.on(table.parentKey, table.toSeq, table.fromSeq, table.orderKey, table.blockId)
+			.where(sql.raw('"to_seq" IS NOT NULL')),
 		primaryKey({ columns: [table.parentKey, table.blockId, table.fromSeq] }),
 	],
 );
@@ -25869,6 +25875,29 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "fromSeq"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_outline_edges_open",
+          "columns": [
+            "parentKey",
+            "orderKey",
+            "blockId",
+            "fromSeq"
+          ],
+          "unique": false,
+          "predicate": "\"to_seq\" IS NULL"
+        },
+        {
+          "name": "idx_outline_edges_closed",
+          "columns": [
+            "parentKey",
+            "toSeq",
+            "fromSeq",
+            "orderKey",
+            "blockId"
+          ],
+          "unique": false,
+          "predicate": "\"to_seq\" IS NOT NULL"
         }
       ],
       "checks": [],

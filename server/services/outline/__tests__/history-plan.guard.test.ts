@@ -30,7 +30,8 @@ import {
 	createSqliteOutlineHistory,
 	SQLITE_BACKFILL_INSERT,
 	SQLITE_BACKFILL_SCAN,
-	SQLITE_CHANGED_CHILDREN,
+	SQLITE_CHANGED_CHILDREN_CLOSED,
+	SQLITE_CHANGED_CHILDREN_OPEN,
 	SQLITE_LEVEL_AS_OF,
 	SQLITE_LEVEL_NOW,
 	SQLITE_LEVEL_NOW_TOP,
@@ -49,6 +50,8 @@ let database: Database;
 let wide = "";
 let big = "";
 let hot = "";
+/** A block with 2,000 children now, to which the churn test adds children that came and went. */
+let churn = "";
 let lastSeq = 0;
 let edgeRows = 0;
 let markRows = 0;
@@ -149,6 +152,8 @@ function seed(): void {
 		wide = tops[0] as string;
 		big = tops[1] as string;
 		hot = tops[2] as string;
+		churn = tops[3] as string;
+		for (let i = 0; i < 2000; i++) create(churn);
 		for (let i = 0; i < 5000; i++) create(wide);
 		// A subtree of 20,000: fan-out 20, three levels and a bit.
 		const level = [big];
@@ -159,7 +164,7 @@ function seed(): void {
 		const hotKids: string[] = [];
 		for (let i = 0; i < 50; i++) hotKids.push(create(hot));
 		// The rest: under a random earlier block of the ordinary part, mostly near the top.
-		const ordinary = tops.slice(3);
+		const ordinary = tops.slice(4);
 		while (ids.length < BLOCKS) {
 			const parent = ordinary[Math.floor(rnd() ** 2 * ordinary.length)] as string;
 			const made = create(parent);
@@ -172,6 +177,7 @@ function seed(): void {
 		for (let round = 0; round < 300; round++) for (const kid of hotKids) rewrite(kid);
 		for (const blockId of ids) {
 			if (rnd() >= 0.1 || blockId === wide || blockId === big || blockId === hot) continue;
+			if (parentOf.get(blockId) === churn) continue;
 			const parent = parentOf.get(blockId);
 			if (parent === null || parent === undefined) continue;
 			seq++;
@@ -207,6 +213,11 @@ beforeAll(() => {
 		ancestor_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (ancestor_id, seq)) WITHOUT ROWID`);
 	const started = performance.now();
 	seed();
+	// A fresh connection for the tests: setup leaves a statement of its own unfinished on this
+	// one, which would keep a later write (ANALYZE) from committing.
+	database.close();
+	database = new Database(join(root, "bench.db"));
+	database.run("PRAGMA cache_size = -16000");
 	console.log(
 		`[outline history bench] seeded ${BLOCKS} blocks, ${edgeRows} placements, ${markRows} mark writes, ${lastSeq} commits in ${Math.round(performance.now() - started)} ms`,
 	);
@@ -225,9 +236,14 @@ const BASE_TABLES = [
 ];
 
 function planOf(text: string, params: Array<string | number | null>): string[] {
-	return (
-		database.query(`EXPLAIN QUERY PLAN ${text}`).all(...params) as Array<{ detail: string }>
-	).map((row) => row.detail);
+	// Prepared and finalized here: an EXPLAIN of an INSERT is left unfinished by a cached
+	// statement, and a later write on the connection then never commits.
+	const statement = database.prepare(`EXPLAIN QUERY PLAN ${text}`);
+	try {
+		return (statement.all(...params) as Array<{ detail: string }>).map((row) => row.detail);
+	} finally {
+		statement.finalize();
+	}
 }
 
 /** No base table is scanned: every access to one is a SEARCH on an index or a primary key. */
@@ -250,14 +266,24 @@ function lineOf(plan: readonly string[], pattern: RegExp): number {
 	return at;
 }
 
-function checkPlans(): void {
+function checkPlans(parent: string = wide): void {
 	const asOf = Math.floor(lastSeq / 2);
 	// A level as of a seq: placements by parent, then the block, then its version, by key.
-	const level = planOf(SQLITE_LEVEL_AS_OF, [SPACE, wide, asOf, "", "", 51]);
+	const level = planOf(SQLITE_LEVEL_AS_OF, [SPACE, parent, asOf, "", "", 51]);
 	expectNoScan(level);
+	// The children still there, in sibling order from the cursor on; those that left, by when.
 	const edges = lineOf(
 		level,
-		/SEARCH e USING (COVERING )?INDEX sqlite_autoindex_outline_block_edges_1 \(parent_key=\?\)/,
+		/SEARCH e USING INDEX idx_outline_edges_open \(parent_key=\? AND \(order_key,block_id\)>\(\?,\?\)\)/,
+	);
+	lineOf(
+		level,
+		/SEARCH e USING COVERING INDEX idx_outline_edges_closed \(parent_key=\? AND to_seq>\?\)/,
+	);
+	// Nothing reads the placements through their primary key: that is the scan of everything
+	// a parent ever held.
+	expect(level.filter((line) => line.includes("sqlite_autoindex_outline_block_edges_1"))).toEqual(
+		[],
 	);
 	const block = lineOf(level, /SEARCH b USING INDEX sqlite_autoindex_outline_blocks_1 \(id=\?\)/);
 	const version = lineOf(
@@ -285,24 +311,29 @@ function checkPlans(): void {
 	for (const [text, params, pattern] of [
 		[
 			SQLITE_PLACEMENT_AS_OF,
-			[big, asOf],
+			[big, asOf, SPACE],
 			/USING INDEX idx_outline_edges_block \(block_id=\? AND from_seq<\?\)/,
 		],
-		[SQLITE_PLACEMENT_NOW, [big], /USING INDEX idx_outline_edges_block \(block_id=\?\)/],
+		[SQLITE_PLACEMENT_NOW, [big, SPACE], /USING INDEX idx_outline_edges_block \(block_id=\?\)/],
 		[
 			SQLITE_SUBTREE_CHANGE,
-			[big, asOf, lastSeq],
+			[big, asOf, lastSeq, SPACE],
 			/SEARCH t USING COVERING INDEX sqlite_autoindex_outline_subtree_changes_1 \(ancestor_id=\? AND seq>\? AND seq<\?\)/,
 		],
 		[
 			SQLITE_SUBTREE_CHANGE_SEQS,
-			[big, lastSeq + 1, 0, 51],
+			[big, lastSeq + 1, 0, 51, SPACE],
 			/USING COVERING INDEX sqlite_autoindex_outline_subtree_changes_1 \(ancestor_id=\? AND seq>\? AND seq<\?\)/,
 		],
 		[
-			SQLITE_CHANGED_CHILDREN,
-			[SPACE, wide, asOf, lastSeq, "", -1, 51],
-			/SEARCH e USING INDEX sqlite_autoindex_outline_block_edges_1 \(parent_key=\? AND \(block_id,from_seq\)>\(\?,\?\)\)/,
+			SQLITE_CHANGED_CHILDREN_OPEN,
+			[SPACE, parent, asOf, lastSeq, "", "", 51],
+			/SEARCH e USING INDEX idx_outline_edges_open \(parent_key=\? AND \(order_key,block_id\)>\(\?,\?\)\)/,
+		],
+		[
+			SQLITE_CHANGED_CHILDREN_CLOSED,
+			[SPACE, parent, asOf, lastSeq, asOf, Number.MAX_SAFE_INTEGER, 51, "", ""],
+			/SEARCH e USING COVERING INDEX idx_outline_edges_closed \(parent_key=\? AND \(to_seq,from_seq,order_key,block_id\)>\(\?,\?,\?,\?\)\)/,
 		],
 		[
 			SQLITE_BACKFILL_SCAN,
@@ -409,6 +440,10 @@ describe("outline history: plans, size and timings on 100,000 blocks", () => {
 				`  both, plain: ${mib(plainEdges + plainMarks)} MiB = ${(((plainEdges + plainMarks) / versions) * 100).toFixed(1)}% of the versions table with its indexes (${mib(versions)} MiB); WITHOUT ROWID would be ${mib(wrEdges + wrMarks)} MiB = ${(((wrEdges + wrMarks) / versions) * 100).toFixed(1)}%`,
 			].join("\n"),
 		);
+		const byParent = size("idx_outline_edges_open") + size("idx_outline_edges_closed");
+		console.log(
+			`  the two by-parent indexes of the placements: ${mib(byParent)} MiB (${row(byParent, edges)} B/row: open ${mib(size("idx_outline_edges_open"))} MiB, closed ${mib(size("idx_outline_edges_closed"))} MiB), on top of the above`,
+		);
 		// A plain table keeps the key twice (the row and its index): more than the twin, and not
 		// absurdly more.
 		expect(plainEdges).toBeGreaterThan(wrEdges);
@@ -416,6 +451,84 @@ describe("outline history: plans, size and timings on 100,000 blocks", () => {
 		expect(plainEdges / wrEdges).toBeLessThan(3);
 		expect(plainMarks / wrMarks).toBeLessThan(3);
 	});
+
+	test("churn: children that came and went do not slow a level down (0 / 100,000 / 500,000 departed)", async () => {
+		const store = createSqliteOutlineHistory(() => database);
+		const rnd = mulberry32(99);
+		// A connection of its own for the writes, as another process would have.
+		const writer = new Database(join(root, "bench.db"));
+		const insert = writer.prepare(
+			`INSERT INTO outline_block_edges (parent_key, block_id, from_seq, to_seq, order_key)
+				 VALUES (?, ?, ?, ?, ?)`,
+		);
+		let departed = 0;
+		/** Children of the churn parent that were there for one commit, spread over the history. */
+		const depart = writer.transaction((upTo: number) => {
+			for (; departed < upTo; departed++) {
+				const from = 1 + Math.floor(rnd() * (lastSeq - 2));
+				insert.run(
+					churn,
+					`gone-${String(departed).padStart(16, "0")}`,
+					from,
+					from + 1,
+					`a${String(Math.floor(rnd() * 1e8)).padStart(8, "0")}`,
+				);
+			}
+		});
+		const lines: string[] = [];
+		const recent: Array<Record<string, number>> = [];
+		for (const n of [0, 100_000, 500_000]) {
+			depart(n);
+			if (n > 0) writer.run("ANALYZE outline_block_edges");
+			checkPlans(churn);
+			const measured: Record<string, number> = {};
+			const run = async (name: string, runs: number, fn: () => Promise<unknown>) => {
+				const t = await timed(runs, fn);
+				measured[name] = t[1];
+				lines.push(`  ${String(n).padStart(7)} departed, ${name}: ${ms(t)}`);
+			};
+			await run("level as of the latest seq, 50 of 2,000", 60, () =>
+				store.listLevel(SPACE, churn, { asOf: lastSeq, limit: 50 }),
+			);
+			await run("subtree as of the latest seq, 800 of 2,000", 40, () =>
+				store.listSubtreeAt(SPACE, churn, { asOf: lastSeq, limit: 800 }),
+			);
+			await run("changed children, last 1,000 commits, 200 rows", 40, () =>
+				store.listChangedChildren(SPACE, churn, {
+					after: lastSeq - 1000,
+					upTo: lastSeq,
+					limit: 200,
+				}),
+			);
+			recent.push({ ...measured });
+			// What is not bounded, stated: a read as of a seq long ago looks at every child
+			// that left since (here half of the departed).
+			await run("level as of the middle of the history, 50 rows", 20, () =>
+				store.listLevel(SPACE, churn, { asOf: Math.floor(lastSeq / 2), limit: 50 }),
+			);
+		}
+		writer.close();
+		console.log(["[outline history churn] p50 / p95", ...lines].join("\n"));
+		// The same rows whatever left before.
+		const level = await store.listLevel(SPACE, churn, { asOf: lastSeq, limit: 5000 });
+		expect(level.rows).toHaveLength(2000);
+		expect(level.rows.every((r) => !r.id.startsWith("gone-"))).toBe(true);
+		// Reads of the recent past cost the same with half a million departed children as with
+		// none (within noise): a generous ceiling that the scan of everything a parent ever
+		// held (65 to 100 ms here) cannot meet.
+		const [none, , most] = recent as [
+			Record<string, number>,
+			Record<string, number>,
+			Record<string, number>,
+		];
+		for (const name of Object.keys(none)) {
+			expect({ name, p95: most[name] as number }).toEqual({
+				name,
+				p95: expect.any(Number),
+			});
+			expect(most[name] as number).toBeLessThan(Math.max(10, (none[name] as number) * 4));
+		}
+	}, 300_000);
 
 	test("timings of the reads (printed), bounded whatever the subtree's size", async () => {
 		const store = createSqliteOutlineHistory(() => database);
@@ -456,16 +569,16 @@ describe("outline history: plans, size and timings on 100,000 blocks", () => {
 			(r) => r.id,
 		);
 		await run("changed or not, 20 blocks, a range of half the history", 100, () =>
-			store.findSubtreeChanges(kids, { after: Math.floor(lastSeq / 2), upTo: lastSeq }),
+			store.findSubtreeChanges(SPACE, kids, { after: Math.floor(lastSeq / 2), upTo: lastSeq }),
 		);
 		await run("changed children of a parent of 5,000, last 1,000 commits, 200 rows", 60, () =>
 			store.listChangedChildren(SPACE, wide, { after: lastSeq - 1000, upTo: lastSeq, limit: 200 }),
 		);
 		await run("timeline of a block, 50 newest change seqs", 100, () =>
-			store.listSubtreeChangeSeqs(big, { limit: 50 }),
+			store.listSubtreeChangeSeqs(SPACE, big, { limit: 50 }),
 		);
 		await run("placement of a block as of a seq (one step up)", 200, (i) =>
-			store.getPlacementsAt([kids[i % kids.length] as string], seqAt()),
+			store.getPlacementsAt(SPACE, [kids[i % kids.length] as string], seqAt()),
 		);
 		console.log(
 			[
