@@ -553,6 +553,35 @@ describe("one undo stack over the blocks", () => {
 		expect(await dbOutline(pageId)).toBe("- p\n- q\n- r");
 	});
 
+	test("a change right after a redo is a step of its own, in the same block", async () => {
+		const { pageId, ids } = await page(["p", "q"]);
+		const [p, q] = ids as [string, string];
+		const a = open(link(owner), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		edit(a, p, "p1");
+		a.undo();
+		a.redo();
+		// The block's undo manager must not fold this into the step just redone.
+		edit(a, p, "p12");
+		type(a, p, "34");
+		edit(a, q, "q1");
+		expect(a.outline()).toBe("- p1234\n- q1");
+		const back: string[] = [];
+		while (a.undo()) back.push(a.outline());
+		expect(back).toEqual(["- p1234\n- q", "- p12\n- q", "- p1\n- q", "- p\n- q"]);
+		a.redo();
+		a.redo();
+		expect(a.outline()).toBe("- p12\n- q");
+		type(a, p, "!");
+		expect(a.redo()).toBe(false);
+		a.undo();
+		expect(a.outline()).toBe("- p12\n- q");
+		a.undo();
+		expect(a.outline()).toBe("- p1\n- q");
+		await settle();
+		expectSameTexts(pageId, [a]);
+	});
+
 	test("typing in one block merges into one step; another block or a structural change starts a new one", async () => {
 		const { pageId, ids } = await page(["m", "n"]);
 		const [m, n] = ids as [string, string];
@@ -909,6 +938,50 @@ describe("the log and its replay", () => {
 		};
 		expect((await commitOf(one))?.actorId).toBe(owner);
 		expect((await commitOf(two))?.actorId).toBe(writer);
+	});
+
+	test("typing in an empty block and in a block made in the session is replayed onto what the database holds then", async () => {
+		const { pageId, ids } = await page(["", "after"]);
+		const [empty] = ids as [string, string];
+		OUTLINE_LIVE_TIMING.flushIdleMs = 60_000;
+		OUTLINE_LIVE_TIMING.flushMaxMs = 60_000;
+		const a = open(link(owner), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		const made = a.newId();
+		struct(a, [
+			{
+				t: "i",
+				id: made,
+				p: pageId,
+				k: keyBetween(a.visible.get(empty)?.orderKey, null),
+				content: "made",
+			},
+		]);
+		await settle();
+		expect(await content(made)).toBe("made");
+		// Typed and never committed: in an empty block (no seed text) and in the new one.
+		type(a, empty, "typed");
+		type(a, made, " more");
+		await settle();
+		await persistAllLiveSessions();
+		const epoch = session(pageId).epoch;
+		abandonLiveSessionForTests(pageId);
+		// After the crash someone else writes both blocks before the replay.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{ op: "update", block: { id: empty }, content: "agent wrote here" },
+				{ op: "update", block: { id: made }, content: "agent: made" },
+			],
+			actor: { kind: "agent", id: "n" },
+			responsibleUserId: owner,
+		});
+		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		// Both the outside text and the typed text are there.
+		const merged = await content(empty);
+		expect(merged).toContain("agent wrote here");
+		expect(merged).toContain("typed");
+		expect(await content(made)).toBe("agent: made more");
 	});
 
 	test("a refused transaction leaves its items in the document and in the log, so typing next to them survives a crash", async () => {

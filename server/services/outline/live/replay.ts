@@ -174,7 +174,12 @@ export async function replayLiveEpochDetailed(
 					const seed = decoder.decode(e.data);
 					docOf(e.id, seed);
 					if (!base.has(e.id)) base.set(e.id, seed);
-				} else Y.applyUpdate(docOf(e.id).doc, e.data, row);
+				} else {
+					// A document the log has no seed for started from the empty text (an empty
+					// block, or one made in the session); in the snapshot it comes whole.
+					if (!first && !docs.has(e.id) && !base.has(e.id)) base.set(e.id, "");
+					Y.applyUpdate(docOf(e.id).doc, e.data, row);
+				}
 			}
 			if (first) {
 				// The snapshot: its texts are the base wherever no sync row says otherwise.
