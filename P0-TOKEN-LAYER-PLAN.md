@@ -573,3 +573,13 @@ bun test --isolate frontend/lib/mantine-theme.test.tsx               1 pass
 
 守卫脚本做了故障注入验证：写入一个 `#ff00aa` 的字面量 → 退出码 1 且精确定位到行；
 注释里的 `#185` 与 `var(..., #1a1b1e)` 兜底不误报；清理后退出码 0。
+
+### 10.3 已知差距（不阻塞本轮验收）
+
+1. **浅色模式的控件边框仍是 Mantine 默认**：浅色下 `--paper-border-color` / `--input-bd` 读的是
+   `gray-3` / `gray-4`（约 1.5:1），没有经过 `--mantine-color-default-border`。要修必须在
+   `components.*` 层覆盖 Input/Paper 的 `borderColor`，而 Mantine 的错误态也走同一个变量，
+   风险是把校验红边一并盖掉。留作独立 PR，带表单错误态回归测试。
+2. **48 处内联 `fontSize` 数字**仍未迁移到字号刻度（守卫只告警）。它们与「正文该用哪一档」的
+   用法迁移是同一件事，建议和 P2 一起做。
+3. `MediaAttachment` 的 `#111` 信件式留边在深浅两套下都保持一个固定观影底色，已列入白名单。
