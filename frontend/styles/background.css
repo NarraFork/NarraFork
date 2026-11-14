@@ -34,7 +34,7 @@
 :root[data-mantine-color-scheme][data-nf-bg="on"] {
 	--nf-bg-scrim-color: color-mix(
 		in srgb,
-		var(--nf-canvas-base) var(--nf-bg-scrim-effective, 20%),
+		var(--nf-bg-scrim-tinted, var(--nf-canvas-base)) var(--nf-bg-scrim-effective, 20%),
 		transparent
 	);
 	/*
@@ -58,13 +58,13 @@
 
 	--mantine-color-default: color-mix(
 		in srgb,
-		var(--nf-pane-base) var(--nf-bg-pane-effective),
+		var(--nf-bg-pane-tinted, var(--nf-pane-base)) var(--nf-bg-pane-effective),
 		transparent
 	);
 
 	--mantine-color-body: color-mix(
 		in srgb,
-		var(--nf-canvas-base) var(--nf-bg-body-effective),
+		var(--nf-bg-canvas-tinted, var(--nf-canvas-base)) var(--nf-bg-body-effective),
 		transparent
 	);
 	/* Dockview seeds its own variable from the body colour; keep them in sync. */
@@ -78,9 +78,18 @@
 	 * panels go almost opaque (crisp UI), the shell keeps enough transparency for the photo,
 	 * and the scrim goes DOWN — adding scrim on a light theme only washes the picture out.
 	 */
-	--nf-bg-pane-effective: calc(var(--nf-bg-pane-opacity, 68%) + 16%);
-	--nf-bg-body-effective: calc(var(--nf-bg-body-opacity, 50%) + 12%);
-	--nf-bg-scrim-effective: calc(var(--nf-bg-scrim, 20%) - 10%);
+	--nf-bg-pane-effective: calc(var(--nf-bg-pane-opacity, 68%) + 6%);
+	--nf-bg-body-effective: calc(var(--nf-bg-body-opacity, 50%) + 2%);
+	--nf-bg-scrim-effective: calc(var(--nf-bg-scrim, 20%) - 6%);
+	/*
+	 * Whiteness, not transparency, is what a bright photo exposes: at 74% the panels are
+	 * still near-white because the paper base is near-white. Even at full transparency a
+	 * white-background photo reads white, so the surfaces themselves take a few percent of
+	 * ink — enough to stop the glare, still clearly a light theme (panel text keeps ~13:1).
+	 */
+	--nf-bg-pane-tinted: color-mix(in srgb, var(--nf-pane-base) 92%, var(--nf-ink-950));
+	--nf-bg-canvas-tinted: color-mix(in srgb, var(--nf-canvas-base) 95%, var(--nf-ink-950));
+	--nf-bg-scrim-tinted: color-mix(in srgb, var(--nf-canvas-base) 85%, var(--nf-ink-950));
 }
 
 /*
