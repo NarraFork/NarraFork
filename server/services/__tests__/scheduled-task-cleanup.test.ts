@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -11,6 +11,7 @@ import {
 	scheduledTaskRuns,
 	scheduledTasks,
 	terminals,
+	users,
 } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
@@ -25,7 +26,7 @@ const realSession = { ...(await import("../narrator-session")) };
 mock.module("../narrator-session", () => ({
 	...realSession,
 	isLoopRunning: (id: string) => runningLoops.has(id),
-	sendMessage: async () => {
+	sendScheduledTaskMessage: async () => {
 		if (failDispatch) throw new Error("dispatch failed");
 	},
 }));
@@ -41,15 +42,34 @@ const { scheduledTaskRoutes } = await import("../../routes/scheduled-tasks");
 const taskIds: string[] = [];
 const narratorIds: string[] = [];
 const old = new Date(Date.now() - 60 * 86_400_000).toISOString();
+const principal = { userId: generateId(), isAdmin: false };
+const outsiderId = generateId();
+beforeAll(async () => {
+	for (const id of [principal.userId, outsiderId])
+		await db.insert(users).values({
+			id,
+			username: `retention-${id}`,
+			passwordHash: "test",
+			role: "user",
+			createdAt: new Date().toISOString(),
+		});
+});
+afterAll(async () => {
+	for (const id of [principal.userId, outsiderId]) await db.delete(users).where(eq(users.id, id));
+	mock.module("../narrator-session", () => realSession);
+});
 
 async function task(policy: ScheduledTaskCleanupPolicy = { mode: "none" }) {
-	const row = await scheduledTaskService.create({
-		name: "retention test",
-		prompt: "noop",
-		cronExpr: "0 9 * * *",
-		enabled: false,
-		cleanupPolicy: policy,
-	});
+	const row = await scheduledTaskService.create(
+		{
+			name: "retention test",
+			prompt: "noop",
+			cronExpr: "0 9 * * *",
+			enabled: false,
+			cleanupPolicy: policy,
+		},
+		principal,
+	);
 	taskIds.push(row.id);
 	return row;
 }
@@ -62,6 +82,7 @@ async function narrator(
 	await db.insert(narrators).values({
 		id,
 		scheduledTaskId: taskId,
+		ownerUserId: principal.userId,
 		traits: taskId ? ["standalone", "scheduled"] : ["standalone"],
 		createdAt: old,
 		updatedAt: old,
@@ -93,7 +114,15 @@ afterEach(async () => {
 		for (const n of spawned) if (await exists(n.id)) await narratorService.remove(n.id);
 	}
 	for (const id of narratorIds.splice(0)) if (await exists(id)) await narratorService.remove(id);
-	for (const id of taskIds.splice(0)) await scheduledTaskService.delete(id);
+	for (const id of taskIds.splice(0)) {
+		const row = await scheduledTaskService.get(id);
+		if (row?.activeRunId)
+			await (await import("../scheduled-task-run-service")).finalizeScheduledRun(
+				row.activeRunId,
+				"interrupted",
+			);
+		await scheduledTaskService.delete(id, principal);
+	}
 });
 
 describe("task-scoped narrator retention", () => {
@@ -132,7 +161,7 @@ describe("task-scoped narrator retention", () => {
 		for (const id of ids.slice(0, 3)) expect(await exists(id)).toBe(false);
 		for (const id of ids.slice(3)) expect(await exists(id)).toBe(true);
 		expect(await exists(child)).toBe(false);
-		expect((await scheduledTaskService.listRuns(t.id)).runs).toHaveLength(1);
+		expect((await scheduledTaskService.listRuns(t.id, { principal })).runs).toHaveLength(1);
 	});
 
 	test("olderThanDays protects recent creation, recent activity and recent descendants", async () => {
@@ -369,7 +398,7 @@ describe("task-scoped narrator retention", () => {
 			failDispatch = fail;
 			const t = await task({ mode: "keepLatestN", keepLatestN: 1 });
 			const previous = await narrator(t.id);
-			await scheduledTaskService.runTask(t.id, { manual: true });
+			await scheduledTaskService.runTask(t.id, { manual: true, principal });
 			expect(await exists(previous)).toBe(false);
 			const owned = await db.query.narrators.findMany({
 				where: eq(narrators.scheduledTaskId, t.id),
@@ -377,14 +406,14 @@ describe("task-scoped narrator retention", () => {
 			});
 			expect(owned).toHaveLength(1);
 			expect(owned[0]?.traits).toContain("scheduled");
-			expect((await scheduledTaskService.get(t.id))?.lastStatus).toBe(fail ? "failed" : "success");
+			expect((await scheduledTaskService.get(t.id))?.lastStatus).toBe(fail ? "failed" : "running");
 		}
 	});
 
 	test("deleting the task detaches provenance but preserves its sessions", async () => {
 		const t = await task();
 		const id = await narrator(t.id);
-		await scheduledTaskService.delete(t.id);
+		await scheduledTaskService.delete(t.id, principal);
 		taskIds.splice(taskIds.indexOf(t.id), 1);
 		expect(await exists(id)).toBe(true);
 		expect(
@@ -398,7 +427,7 @@ describe("task-scoped narrator retention", () => {
 		let role: "user" | "admin" = "user";
 		const app = new Hono();
 		app.use("*", async (c, next) => {
-			c.set("user", { sub: "not-the-owner", role, iat: 0, exp: 0 });
+			c.set("user", { sub: outsiderId, role, iat: 0, exp: 0 });
 			await next();
 		});
 		app.onError((err, c) =>
@@ -408,7 +437,7 @@ describe("task-scoped narrator retention", () => {
 			),
 		);
 		app.route("/tasks", scheduledTaskRoutes);
-		expect((await app.request(`/tasks/${t.id}/cleanup`, { method: "POST" })).status).toBe(403);
+		expect((await app.request(`/tasks/${t.id}/cleanup`, { method: "POST" })).status).toBe(404);
 		expect(
 			(
 				await app.request(`/tasks/${t.id}`, {
@@ -417,9 +446,10 @@ describe("task-scoped narrator retention", () => {
 					body: JSON.stringify({ cleanupPolicy: { mode: "none" } }),
 				})
 			).status,
-		).toBe(403);
+		).toBe(404);
 		expect(await exists(id)).toBe(true);
 		role = "admin";
+		await db.update(users).set({ role }).where(eq(users.id, outsiderId));
 		const response = await app.request(`/tasks/${t.id}/cleanup`, { method: "POST" });
 		expect(response.status).toBe(200);
 		expect((await response.json()).deletedRoots).toBe(1);

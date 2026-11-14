@@ -19,7 +19,7 @@ import {
 } from "@shared/notification-center";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
-import { narrators, projects, users } from "../db/schema";
+import { narrators, projects, scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -27,6 +27,7 @@ import { logger } from "../lib/logger";
 import { notificationMarkReadSchema } from "../lib/validators/notifications";
 import { narratorReadableWhere } from "./narrator-acl";
 import { narratorProjectIdColumn } from "./narrator-project";
+import { taskReadableWhere } from "./scheduled-task-acl";
 
 export type {
 	NotificationKind,
@@ -122,11 +123,22 @@ export function parseNotificationLink(raw: unknown): NotificationLink {
 	if (value.type === "narrator" && isId(value.narratorId)) {
 		return { type: "narrator", narratorId: value.narratorId };
 	}
+	if (
+		value.type === "scheduled_task" &&
+		isId(value.taskId) &&
+		(value.runId === undefined || isId(value.runId))
+	) {
+		return {
+			type: "scheduled_task",
+			taskId: value.taskId,
+			...(value.runId ? { runId: value.runId as string } : {}),
+		};
+	}
 	return { type: "unavailable" };
 }
 
 function isNotificationKind(value: unknown): value is NotificationKind {
-	return value === "chat_message" || value === "permission_request";
+	return value === "chat_message" || value === "permission_request" || value === "scheduled_task";
 }
 
 function chunks<T>(items: T[]): T[][] {
@@ -199,7 +211,10 @@ export interface RecordNotificationInput {
 }
 
 /** Best-effort projection: storage or downstream listener failures never undo the source write. */
-export async function recordNotifications(inputs: RecordNotificationInput[]): Promise<void> {
+export async function recordNotifications(
+	inputs: RecordNotificationInput[],
+	onInserted?: (input: RecordNotificationInput) => void,
+): Promise<void> {
 	if (!Array.isArray(inputs) || inputs.length === 0) return;
 	if (inputs.length > NOTIFICATION_FANOUT_MAX_RECIPIENTS) {
 		logger.warn("notification-center: fan-out truncated", { requested: inputs.length });
@@ -228,6 +243,7 @@ export async function recordNotifications(inputs: RecordNotificationInput[]): Pr
 				) ON CONFLICT (user_id, kind, source_key) DO NOTHING
 			`);
 			if ((db.all<{ count: number }>(sql`SELECT changes() AS count`)[0]?.count ?? 0) > 0) {
+				onInserted?.(input);
 				const kinds = touched.get(input.userId) ?? new Set<NotificationKind>();
 				kinds.add(input.kind);
 				touched.set(input.userId, kinds);
@@ -235,11 +251,21 @@ export async function recordNotifications(inputs: RecordNotificationInput[]): Pr
 		} catch (error) {
 			logger.warn("notification-center: record failed", {
 				userId: input.userId,
-				error: String(error),
+				// A DB error can contain SQL parameters. Scheduled alerts never log source text.
+				...(input.kind === "scheduled_task" ? {} : { error: String(error) }),
 			});
 		}
 	}
 	for (const [userId, kinds] of touched) notifyNotificationCenterChanged(userId, [...kinds]);
+}
+
+/** A durable insert is the delivery claim: duplicate intents never send channels twice. */
+export async function recordNotificationOnce(input: RecordNotificationInput): Promise<boolean> {
+	let inserted = false;
+	await recordNotifications([input], () => {
+		inserted = true;
+	});
+	return inserted;
 }
 
 interface MessageSource {
@@ -278,6 +304,58 @@ interface PermissionSource {
 	decidedAt: string | null;
 }
 
+async function loadScheduledTaskSources(
+	rows: NotificationRow[],
+	principal: { userId: string; isAdmin: boolean },
+) {
+	const links = new Map<string, Extract<NotificationLink, { type: "scheduled_task" }>>();
+	for (const row of rows) {
+		if (row.kind !== "scheduled_task") continue;
+		try {
+			const link = parseNotificationLink(JSON.parse(row.link_json));
+			if (link.type === "scheduled_task") links.set(row.id, link);
+		} catch {
+			/* malformed sources remain unavailable */
+		}
+	}
+	const visibleTasks = new Set<string>();
+	for (const batch of chunks([...new Set([...links.values()].map((link) => link.taskId))])) {
+		const tasks = await db
+			.select({ id: scheduledTasks.id })
+			.from(scheduledTasks)
+			.where(and(inArray(scheduledTasks.id, batch), taskReadableWhere(principal)))
+			.limit(NOTIFICATION_SQL_BATCH_SIZE);
+		for (const task of tasks) visibleTasks.add(task.id);
+	}
+	const runs = new Map<string, { taskId: string; status: string }>();
+	const runIds = [...links.values()].flatMap((link) =>
+		link.runId && visibleTasks.has(link.taskId) ? [link.runId] : [],
+	);
+	for (const batch of chunks([...new Set(runIds)])) {
+		const found = await db
+			.select({
+				id: scheduledTaskRuns.id,
+				taskId: scheduledTaskRuns.taskId,
+				status: scheduledTaskRuns.status,
+			})
+			.from(scheduledTaskRuns)
+			.where(inArray(scheduledTaskRuns.id, batch))
+			.limit(NOTIFICATION_SQL_BATCH_SIZE);
+		for (const run of found) runs.set(run.id, run);
+	}
+	const sources = new Map<string, { link: NotificationLink; sourceState: "active" | "resolved" }>();
+	for (const [id, link] of links) {
+		if (!visibleTasks.has(link.taskId)) continue;
+		const run = link.runId ? runs.get(link.runId) : undefined;
+		if (link.runId && (!run || run.taskId !== link.taskId)) continue;
+		sources.set(id, {
+			link,
+			sourceState: run?.status === "blocked" || run?.status === "running" ? "active" : "resolved",
+		});
+	}
+	return sources;
+}
+
 async function deriveActivities(userId: string, now: number): Promise<NotificationListItem[]> {
 	const started = performance.now();
 	const rows = await loadWindow(userId, now);
@@ -299,6 +377,9 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 		where: eq(users.id, userId),
 		columns: { role: true },
 	});
+	const scheduledSources = principal
+		? await loadScheduledTaskSources(rows, { userId, isAdmin: principal.role === "admin" })
+		: new Map();
 	const contexts = new Map<
 		string,
 		{
@@ -377,6 +458,15 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 					link: { type: "narrator", narratorId: tool.narratorId },
 				});
 			}
+		}
+		if (row.kind === "scheduled_task") {
+			const source = scheduledSources.get(row.id);
+			if (source)
+				Object.assign(item, source, {
+					title: row.title,
+					preview: row.preview,
+					sourceKey: row.source_key,
+				});
 		}
 		const members = grouped.get(key) ?? [];
 		members.push(item);

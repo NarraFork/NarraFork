@@ -1078,6 +1078,15 @@ const onStartupRecoveryTargetsDiscovered = (ids: readonly string[]): void => {
 // the background after that queue is mounted.
 withBackgroundOccupancyInitialization(
 	async () => {
+		// Before mounting ANY replay/continuation owner: scheduled business work is
+		// never automatically repeated when its previous terminal is unknown.
+		if (activeDatabaseBackend === "sqlite") {
+			const { setScheduledRunNotifier } = await import("./services/scheduled-task-run-service");
+			setScheduledRunNotifier(
+				(await import("./services/scheduled-task-notify")).notifyScheduledRunChanged,
+			);
+			await (await import("./services/scheduled-task-run-tracker")).recoverScheduledRuns();
+		}
 		const plannedUpdate = await getPlannedUpdateStartupProtection({
 			claimAuthorization: automaticResumeEnabled(),
 			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
@@ -1120,10 +1129,19 @@ withBackgroundOccupancyInitialization(
 		// All sources are now registered. New preparation can reserve them without
 		// waiting for an Agent, Await, or human approval to finish (or even mount).
 		finishRecoveryDiscovery();
+		const recoveryCandidates = new Set(startupRecoveryNarratorIds);
+		const allowedRecovery =
+			activeDatabaseBackend === "sqlite"
+				? await (
+						await import("./services/scheduled-task-run-tracker")
+					).filterScheduledRecoveryNarrators(recoveryCandidates)
+				: undefined;
 		const recoveryHandles = automaticResumeEnabled()
 			? await Promise.all([
-					restoreNarratorsAfterPlannedUpdate(plannedUpdate),
-					restoreOrdinaryRestartRecovery(ordinaryRestart),
+					restoreNarratorsAfterPlannedUpdate(plannedUpdate, {
+						includedNarratorIds: allowedRecovery,
+					}),
+					restoreOrdinaryRestartRecovery(ordinaryRestart, { includedNarratorIds: allowedRecovery }),
 				])
 			: [];
 		const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));

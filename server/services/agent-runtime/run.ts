@@ -46,6 +46,7 @@ import { broadcastToNarrator } from "../../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator } from "../narrator-session-state";
 import { withNarratorStartAdmission, withNarratorWorkAdmission } from "../narrator-session-state";
+import { getRegisteredScheduledRun } from "../scheduled-run-registry";
 import {
 	type ExecutionOwner,
 	getRunControl,
@@ -72,6 +73,9 @@ export interface StartNarratorRunRequest {
 	images?: ImageRef[];
 	media?: MediaRef[];
 	replyInUserLanguage?: boolean;
+	/** Trusted scheduled dispatch identity; never accepted from model/tool input. */
+	scheduledRunId?: string;
+	initiatedBy?: "person" | "system";
 	/** An already prepared session (an input path persisted the user turn into it). */
 	active?: ActiveNarrator;
 	/**
@@ -435,6 +439,23 @@ async function executeRun(
 		run.deliverTo = deliverTo;
 		run.cancelWith = binding.cancelWith;
 		run.deadlineAt = binding.deadlineAt;
+		const scheduled = getRegisteredScheduledRun(id);
+		if (req.recovered && scheduled?.recoveredAt) {
+			const { finalizeScheduledRun } = await import("../scheduled-task-run-service");
+			await finalizeScheduledRun(scheduled.runId, "interrupted", {
+				errorKind: "restart",
+				error: "Scheduled runs are not replayed after restart without an exact terminal receipt",
+			});
+			await settleStatus(id, deliverTo, { ...notStarted, interrupted: true });
+			return { ...notStarted, interrupted: true };
+		}
+		const { attachScheduledRuntimeRun } = await import("../scheduled-task-run-service");
+		await attachScheduledRuntimeRun({
+			narratorId: id,
+			run,
+			scheduledRunId: req.scheduledRunId,
+			initiatedBy: req.initiatedBy,
+		});
 		if (deliverTo)
 			await announceRunToDestination(id, source, deliverTo, principal).catch((error) =>
 				logger.debug("Run announcement skipped", { id, error: String(error) }),

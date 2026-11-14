@@ -4,6 +4,8 @@ import { getBuiltinRoutine, getBuiltinToolNames } from "../../../builtin-routine
 import { OPTIONAL_TOOLS } from "../index";
 import { scheduledTaskTool } from "../scheduled-task";
 import { isScheduledTaskReadAction, SCHEDULED_TASK_ACTIONS } from "../scheduled-task-actions";
+import { previewScheduledTask } from "../scheduled-task-policy";
+import { caller } from "./scheduled-task-fixtures";
 
 describe("ScheduledTask registration", () => {
 	test("is optional and off by default", () => {
@@ -23,7 +25,7 @@ describe("ScheduledTask registration", () => {
 	 */
 	test("every action is classified as read or mutating", () => {
 		const reads = SCHEDULED_TASK_ACTIONS.filter(isScheduledTaskReadAction);
-		expect(reads).toEqual(["list", "get", "runs"]);
+		expect(reads).toEqual(["list", "get", "runs", "preview"]);
 		const mutating = SCHEDULED_TASK_ACTIONS.filter((a) => !isScheduledTaskReadAction(a));
 		expect(mutating).toEqual(["create", "update", "enable", "disable", "delete", "run_now"]);
 	});
@@ -73,32 +75,30 @@ describe("ScheduledTask argument validation", () => {
 		expect(result.output).toContain("task.prompt");
 	});
 
-	test("rejects a syntactically valid cron that never fires", async () => {
-		const result = await run({
-			action: "create",
-			// Feb 30th parses but has no next run; croner returns null instead of throwing.
-			task: { name: "Never", cronExpr: "0 0 30 2 *", prompt: "hi" },
-		});
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("Invalid cron expression");
+	test("rejects a syntactically valid cron that never fires", () => {
+		// Feb 30th parses but has no next run.
+		expect(() => previewScheduledTask({ cronExpr: "0 0 30 2 *", timezone: "UTC" })).toThrow(
+			"Invalid cron expression",
+		);
 	});
 
-	test("rejects an unknown timezone", async () => {
-		const result = await run({
-			action: "create",
-			task: { name: "Bad tz", cronExpr: "0 9 * * *", prompt: "hi", timezone: "Mars/Olympus" },
-		});
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("Mars/Olympus");
+	test("rejects an unknown timezone", () => {
+		expect(() =>
+			previewScheduledTask({ cronExpr: "0 9 * * *", timezone: "Mars/Olympus" }),
+		).toThrow();
 	});
 
-	test("project runContext names the specific missing id", async () => {
-		const result = await run({
-			action: "create",
-			task: { name: "In project", cronExpr: "0 9 * * *", prompt: "hi", runContext: "project" },
-		});
+	test("project runContext requires a writable project", async () => {
+		const fixture = await caller();
+		const result = await scheduledTaskTool.execute(
+			{
+				action: "create",
+				task: { name: "In project", cronExpr: "0 9 * * *", prompt: "hi", runContext: "project" },
+			},
+			fixture.ctx,
+		);
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("projectId");
+		expect(result.output).toContain("Project");
 	});
 
 	test("the removed chapter runContext is refused", async () => {

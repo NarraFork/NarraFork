@@ -65,6 +65,12 @@ export function NotificationCenterDrawerBody({
 		if (!target) return;
 		if (target.type === "chat_room")
 			void navigate({ to: "/messages", search: { room: target.roomId } });
+		else if (target.type === "scheduled_task")
+			void navigate({
+				to: "/scheduled-tasks/$taskId",
+				params: { taskId: target.taskId },
+				search: { runId: target.runId },
+			});
 		else void navigate({ to: "/narrators/$narratorId", params: { narratorId: target.narratorId } });
 		onClose();
 	};
@@ -106,7 +112,7 @@ export function NotificationCenterDrawerBody({
 								data-testid="notification-filter-control"
 								aria-label={t("notificationFilterLabel")}
 							>
-								{(["all", "messages", "permissions"] as const).map((value) => (
+								{(["all", "messages", "permissions", "scheduled_tasks"] as const).map((value) => (
 									<Button
 										key={value}
 										size="compact-sm"
@@ -120,7 +126,9 @@ export function NotificationCenterDrawerBody({
 												? "notificationFilterAll"
 												: value === "messages"
 													? "notificationFilterMessages"
-													: "notificationFilterPermissions",
+													: value === "scheduled_tasks"
+														? "notificationFilterScheduledTasks"
+														: "notificationFilterPermissions",
 										)}
 									</Button>
 								))}

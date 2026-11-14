@@ -1,3 +1,4 @@
+import { ManagedTaskBanner } from "@frontend/components/scheduled-tasks/ManagedTaskBanner";
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { Alert, Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
@@ -556,6 +557,13 @@ function NarratorDetailPage() {
 					isolation: "isolate",
 				}}
 			>
+				{typeof narrator.scheduledTaskId === "string" && narrator.scheduledTaskId && (
+					<ManagedTaskBanner
+						key={narrator.scheduledTaskId}
+						taskId={narrator.scheduledTaskId}
+						model={typeof narrator.model === "string" ? narrator.model : null}
+					/>
+				)}
 				<FocusChatHost
 					narratorId={narratorId}
 					isMobile={isMobile}

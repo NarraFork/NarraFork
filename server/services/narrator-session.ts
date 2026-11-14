@@ -97,7 +97,10 @@ import {
 	parseTraits,
 	redactDraftTraits,
 } from "../lib/narrator-utils";
-import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
+import {
+	isPermissionMode,
+	normalizeLegacyPlanPreviousPermissionMode,
+} from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
 import { getToolMessage, getUserLanguage, type Locale } from "../lib/prompt-i18n";
@@ -281,6 +284,7 @@ import {
 	withNarratorStartAdmission,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
+import { getRegisteredScheduledRun, scheduledRunModelOverride } from "./scheduled-run-registry";
 
 export type { PersistedUserImageBlock };
 // Re-exported so existing imports (tests, other services) keep working; the
@@ -1595,11 +1599,13 @@ async function createNarrator(
 	// Resolve the channel lock before following defaults or a policy source: either may
 	// resolve to auto:, and an evicted runtime must keep this session's own warm source.
 	const stickyProvider = await lastServedProvider(narratorId);
+	const selectedModel =
+		scheduledRunModelOverride(narratorId) ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
 	const inheritedModel =
-		narrator.model === FOLLOW_PARENT_MODEL
+		selectedModel === FOLLOW_PARENT_MODEL
 			? await resolveSubagentModelForRun(narrator, undefined, stickyProvider)
 			: null;
-	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
+	const narratorModelRef = inheritedModel?.modelRef ?? selectedModel;
 	const narratorModel =
 		inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef, stickyProvider);
 	const narratorProvider = resolveProvider(narratorModel);
@@ -1612,9 +1618,9 @@ async function createNarrator(
 		_persistedConversationId: effectiveConversationId ?? null,
 		cwd: narratorCwd,
 		_modelRef: narratorModelRef,
-		_modelSelectionRef: narrator.model ?? FOLLOW_DEFAULT_MODEL,
+		_modelSelectionRef: selectedModel,
 		_modelSourceNarratorId:
-			narrator.model === FOLLOW_PARENT_MODEL ? policySourceIdOf(narrator) : undefined,
+			selectedModel === FOLLOW_PARENT_MODEL ? policySourceIdOf(narrator) : undefined,
 		_inheritedReasoningEffort: inheritedModel?.reasoningEffort,
 		_sourceReasoningEffort: inheritedModel?.parentReasoningEffort,
 		_settingsRevision: getSettingsRevision(),
@@ -3429,6 +3435,8 @@ export async function runAgentLoop(
 	const narratorId = active.narratorId;
 	if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
 		recoveryStart?.resolveAdmission(false);
+		if (options.scheduledRunId)
+			throw new ValidationError("Scheduled dispatch lost execution admission");
 		return { started: false };
 	}
 	const { startNarratorRun } = await import("./agent-runtime/run");
@@ -3449,10 +3457,13 @@ export async function runAgentLoop(
 			images,
 			active,
 			...options,
+			initiatedBy: initiatedBy ?? "person",
 			...(recoveryStart ? { admission: recoveryStart } : {}),
 		});
 		if (!handle.started) {
 			forget();
+			if (options.scheduledRunId)
+				throw new ValidationError("Scheduled dispatch lost execution admission");
 			return { started: false };
 		}
 		await handle.completion;
@@ -3519,6 +3530,9 @@ async function feedMessageUnlocked(
 		bufferedOwner?: ExecutionOwner;
 		/** Prepare a fresh pass of the already-owned run without starting another run. */
 		prepareOnly?: boolean;
+		/** Trusted dispatch metadata, set only by sendScheduledTaskMessage. */
+		scheduledRunId?: string;
+		scheduledNudge?: boolean;
 		/** Run relations for a recovered/continued run (see StartNarratorRunRequest). */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
@@ -3729,6 +3743,14 @@ async function feedMessageUnlocked(
 		if (accepted.executionIntent?.modelOverride) {
 			await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
 		}
+		if (internalOptions?.scheduledRunId) {
+			await (await import("./scheduled-task-run-service")).bindScheduledRunTrigger(
+				internalOptions.scheduledRunId,
+				narratorId,
+				userMsg.id,
+				internalOptions.scheduledNudge,
+			);
+		}
 	} catch (error) {
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
 		if (
@@ -3813,6 +3835,7 @@ async function feedMessageUnlocked(
 		// Start agent loop in background
 		const terminal = runAgentLoop(active, input.text, input.images, {
 			...internalOptions?.run,
+			scheduledRunId: internalOptions?.scheduledRunId,
 			...(userId !== undefined ? { principal: userId } : {}),
 			prePromptBashCommand: input.prePromptBashCommand,
 			media,
@@ -3821,7 +3844,8 @@ async function feedMessageUnlocked(
 			// restart or an update (`recovered`, a planned update's token) sends its own "continue"
 			// through here: not a person's, unless it adopts a message a person queued.
 			initiatedBy:
-				(internalOptions?.run?.recovered || recoveryStart) && !internalOptions?.bufferedId
+				(internalOptions?.scheduledRunId || internalOptions?.run?.recovered || recoveryStart) &&
+				!internalOptions?.bufferedId
 					? "system"
 					: "person",
 		});
@@ -3874,6 +3898,7 @@ export async function prepareQueuedRunInput(
 	active._runInitiatedBy = "person";
 	const first = projectMailboxUserMessage(row);
 	try {
+		await (await import("./scheduled-task-run-service")).endScheduledRunForHumanInput(id);
 		if (first.executionIntent?.controlCommand) {
 			const message = await persistClaimedUserInput({
 				claim: inboxClaim(row),
@@ -4464,6 +4489,120 @@ export async function sendMessage(
 		});
 	}
 	return userMsg;
+}
+
+/** Synchronize only a trusted, idle scheduled target; hard runtime ceilings are never edited. */
+export async function prepareScheduledTaskSession(input: {
+	runId: string;
+	narratorId: string;
+	userId: string | null;
+	nudge?: boolean;
+}) {
+	return withNarratorStartAdmission(input.narratorId, async () => {
+		const registration = getRegisteredScheduledRun(input.narratorId);
+		if (registration?.runId !== input.runId || registration.ownerUserId !== input.userId)
+			throw new ValidationError("Scheduled run registration or execution principal changed");
+		if (isNarratorRuntimeBusy(input.narratorId) || isLoopRunning(input.narratorId))
+			throw new ValidationError("Narrator is already running");
+		if (input.nudge) {
+			registration.reportOnly = true;
+			return registration;
+		}
+		if (!isPermissionMode(registration.permissionMode))
+			throw new ValidationError("Invalid scheduled task permission mode");
+		const before = await narratorService.getById(input.narratorId);
+		const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
+		// Only the soft plan state is cleared. Encoded runtime-policy traits, device
+		// grants, disabled tools, registration ceilings and blacklist rows stay intact.
+		const plan = await exitNarratorPlanMode(input.narratorId);
+		await narratorService.updatePermissionMode(input.narratorId, registration.permissionMode);
+		await updateNarratorPermissionMode(input.narratorId, registration.permissionMode);
+		if (registration.systemPrompt !== undefined)
+			await db
+				.update(narrators)
+				.set({
+					systemPrompt: registration.systemPrompt,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, input.narratorId));
+		if (registration.modelPolicy === "sync") {
+			const model = registration.model ?? FOLLOW_DEFAULT_MODEL;
+			await narratorService.updateModel(input.narratorId, model);
+			updateNarratorModel(input.narratorId, model);
+		}
+		// Reassemble the prefix from the synchronized row, not a cached human prompt.
+		const cached = activeNarrators.get(input.narratorId);
+		if (cached) disposeInactiveNarratorSession(input.narratorId, cached);
+		broadcastToNarrator(input.narratorId, {
+			type: "permission_mode_changed",
+			narratorId: input.narratorId,
+			permissionMode: registration.permissionMode,
+		});
+		if (plan.changed)
+			broadcastToNarrator(input.narratorId, {
+				type: "plan_mode_changed",
+				narratorId: input.narratorId,
+				planMode: false,
+				traits: redactDraftTraits(plan.traits),
+			});
+		if (registration.permissionMode === "bypassPermissions" && !before.relaxedPlan)
+			broadcastToNarrator(input.narratorId, {
+				type: "relaxed_plan_changed",
+				narratorId: input.narratorId,
+				relaxedPlan: true,
+			});
+		return registration;
+	});
+}
+
+/** Safe object-shaped scheduled dispatch: persistence and exact binding precede execution. */
+export async function sendScheduledTaskMessage(input: {
+	runId: string;
+	narratorId: string;
+	prompt: string;
+	userId: string | null;
+	locale?: Locale;
+	nudge?: boolean;
+}): Promise<typeof narratorMessages.$inferSelect> {
+	return withNarratorStartAdmission(input.narratorId, async () => {
+		const registration = await prepareScheduledTaskSession(input);
+		const result = await feedMessageUnlocked(
+			input.narratorId,
+			input.prompt,
+			undefined,
+			input.locale ?? "en",
+			false,
+			undefined,
+			input.userId,
+			undefined,
+			undefined,
+			{
+				scheduledRunId: input.runId,
+				scheduledNudge: input.nudge,
+				run: {
+					binding: {
+						principal: { userId: input.userId },
+						...(registration.deadlineAt ? { deadlineAt: registration.deadlineAt } : {}),
+					},
+				},
+			},
+			{ origin: "system", originLabel: "scheduledTask" },
+		);
+		void result.terminal?.catch(async (error) => {
+			const { finalizeScheduledRun } = await import("./scheduled-task-run-service");
+			await finalizeScheduledRun(input.runId, "failed", {
+				errorKind: "dispatch",
+				error: String(error),
+			});
+		});
+		if (!result.userBroadcasted)
+			broadcastToNarrator(input.narratorId, {
+				type: "user_message",
+				narratorId: input.narratorId,
+				message: fileReferenceMessageForDisplay(result.userMsg),
+			});
+		return result.userMsg;
+	});
 }
 
 /** Trusted human entry; automation must use sendMessage without this wrapper. */
@@ -5725,6 +5864,8 @@ export async function startInjectionContinuationIfPossible(
 			principal: executionPrincipal?.userId,
 			// A person's answer (an asynchronous question) wakes the session on their behalf.
 			initiatedBy: executionPrincipal ? "person" : "system",
+			// Answering the scheduled run's own wait continues it, unlike a new chat message.
+			scheduledRunId: executionPrincipal ? getRegisteredScheduledRun(narratorId)?.runId : undefined,
 		}).catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (injection)", {
 				narratorId,
@@ -9466,6 +9607,9 @@ export async function settleNarratorRuntimeModel(active: ActiveNarrator): Promis
  */
 export function updateNarratorModel(narratorId: string, model: string): void {
 	const active = activeNarrators.get(narratorId);
+	// A saved human preference remains saved; the scheduled run overlays only its
+	// live model. There is deliberately no restore write that could undo that choice.
+	model = scheduledRunModelOverride(narratorId) ?? model;
 	if (active?.alive) {
 		inheritedModelRuntime.select(active, model || FOLLOW_DEFAULT_MODEL);
 		if (model === FOLLOW_PARENT_MODEL) {

@@ -182,6 +182,11 @@ import {
 	validatePermissionRuleRequestApproval,
 } from "./permission-rule-request-service";
 import { broadcastReflectionFrame } from "./reflection-broadcast";
+import {
+	scheduledBlockReason,
+	UNATTENDED_PERMISSION_MESSAGE,
+	unattendedPermissionDecision,
+} from "./scheduled-run-registry";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 
@@ -1097,7 +1102,7 @@ export function resolvePermissionDecision(
 	// below them a mutation would be auto-allowed and the classification would never
 	// run. An unclassified action is treated as mutating so a future action stays gated
 	// until it is listed as a read.
-	if (toolName === "ScheduledTask") {
+	if (toolName === "ScheduledTask" || toolName === "ScheduledTaskAdmin") {
 		if (isScheduledTaskReadAction(input.action)) return "allow";
 		if (effectiveMode === "readOnly" || effectiveMode === "dontAsk") return "deny";
 		return "ask";
@@ -1262,6 +1267,7 @@ function resolveBlacklistDecision(
 }
 
 const ALWAYS_ALLOW_TOOLS = [
+	"ScheduledTaskReport",
 	"EnterPlanMode",
 	"WebSearch",
 	"Await",
@@ -1334,6 +1340,9 @@ const READ_ONLY_TOOLS = [
  * decision below already splits `Agent` by `subagent_type` and Bash by its parsed command.
  */
 function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
+	if (toolName === "ScheduledTaskReport") return true;
+	if (toolName === "ScheduledTask" || toolName === "ScheduledTaskAdmin")
+		return isScheduledTaskReadAction(input.action);
 	if (READ_ONLY_TOOLS.includes(toolName)) return true;
 	if (toolName === "Notification") return input.action === "list_channels";
 	if (toolName === "GenUI") return isGenUiReadAction(input.action);
@@ -5050,7 +5059,9 @@ export async function recheckFinalToolExecutionPermission(
 					analysis.nonWhitelisted.length > 0 ||
 					analysis.dangerousPatterns.length > 0 ||
 					analysis.hasEnvInjection)) ||
-			(["GenUI", "Notification", "ScheduledTask", "Worktree"].includes(check.toolName) &&
+			(["GenUI", "Notification", "ScheduledTask", "ScheduledTaskAdmin", "Worktree"].includes(
+				check.toolName,
+			) &&
 				!isReadOnlyCall(check.toolName, check.input)))
 	)
 		finalPermissionDeny("read-only capability ceiling");
@@ -5096,10 +5107,24 @@ export async function recheckFinalToolExecutionPermission(
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
 				});
+	const scheduled = await (await import("./scheduled-task-run-service")).lookupScheduledRun(
+		check.narratorId,
+	);
+	if (scheduled?.reportOnly && check.toolName !== "ScheduledTaskReport")
+		finalPermissionDeny("scheduled result reminder may only report its outcome");
+	const scheduledApproval =
+		!constraint &&
+		scheduled &&
+		((scheduled.onBlocked === "auto" &&
+			check.toolName === "ExitPlanMode" &&
+			isPlanModeTrait(before.narrator.traits)) ||
+			(["ScheduledTask", "ScheduledTaskAdmin"].includes(check.toolName) &&
+				check.input.action === "disable" &&
+				check.input.id === scheduled.taskId));
 	if (
 		decision === "deny" ||
 		decision === "fatal" ||
-		(decision === "ask" && before.call.decidedBy === "auto")
+		(decision === "ask" && before.call.decidedBy === "auto" && !scheduledApproval)
 	) {
 		finalPermissionDeny("current policy no longer authorizes the original automatic approval");
 	}
@@ -5271,6 +5296,30 @@ export async function handlePermission(
 		? false
 		: resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
 	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
+	const scheduledRunService = await import("./scheduled-task-run-service");
+	const scheduledRun = await scheduledRunService.lookupScheduledRun(narratorId);
+	// These paths can return before ordinary permission evaluation (async Ask and
+	// rule requests included). Denial only: never elevate a capability or whitelist.
+	if (
+		scheduledRun &&
+		((scheduledRun.reportOnly && toolName !== "ScheduledTaskReport") ||
+			(scheduledRun.onBlocked === "auto" &&
+				["AskUserQuestion", OUTLINE_ASK_TOOL, "EnterPlanMode", "RequestPermissionRule"].includes(
+					toolName,
+				)))
+	) {
+		await scheduledRunService.recordScheduledAutoHandled(
+			scheduledRun.runId,
+			scheduledBlockReason(toolName) as "question" | "plan" | "permission",
+			toolName,
+		);
+		return {
+			behavior: "deny",
+			message: scheduledRun.reportOnly
+				? "This follow-up may only call ScheduledTaskReport. Do not repeat or continue business operations."
+				: UNATTENDED_PERMISSION_MESSAGE,
+		};
+	}
 
 	if (toolName === "RequestPermissionRule") {
 		if (runtimeConstraint || reviewReadOnlyBash || !binding || !executionContext) {
@@ -5591,6 +5640,26 @@ export async function handlePermission(
 		}
 	}
 
+	if (toolName === "ScheduledTask" || toolName === "ScheduledTaskAdmin") {
+		try {
+			const { resolveScheduledTaskApproval } = await import(
+				"../lib/agent/tools/scheduled-task-policy"
+			);
+			const resolved = await resolveScheduledTaskApproval(
+				{
+					narratorId,
+					userId: activeNarrators.get(narratorId)?._currentUserId ?? undefined,
+					cwd,
+					locale,
+				},
+				effectiveInput,
+				toolName,
+			);
+			effectiveInput = resolved.input;
+		} catch (error) {
+			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
+		}
+	}
 	// Redirects and plan canonicalization must be persisted before any approval is exposed.
 	await options?.onInputResolved?.(effectiveInput);
 
@@ -5932,6 +6001,30 @@ export async function handlePermission(
 			bashAnalysis,
 		});
 	}
+	if (scheduledRun && !runtimeConstraint) {
+		const selfDisable =
+			decision === "ask" &&
+			["ScheduledTask", "ScheduledTaskAdmin"].includes(toolName) &&
+			effectiveInput.action === "disable" &&
+			effectiveInput.id === scheduledRun.taskId;
+		const automated = selfDisable
+			? "allow"
+			: unattendedPermissionDecision({
+					onBlocked: scheduledRun.onBlocked,
+					toolName,
+					decision,
+					isPlanMode,
+				});
+		if (automated) {
+			await scheduledRunService.recordScheduledAutoHandled(
+				scheduledRun.runId,
+				scheduledBlockReason(toolName) as "question" | "plan" | "permission",
+				`${toolName}: ${automated}`,
+			);
+			decision = automated;
+			if (automated === "deny") permMeta.blacklistReason = UNATTENDED_PERMISSION_MESSAGE;
+		}
+	}
 	if (decision === "allow") {
 		logger.debug("Permission auto-allowed", { narratorId, toolName, toolUseId, permMode });
 		await db
@@ -6079,6 +6172,21 @@ export async function handlePermission(
 		};
 	}
 
+	// A plan soft-deny may have become an ask after the ordinary decision. Never
+	// let that final escalation create a human wait in auto mode.
+	if (scheduledRun?.onBlocked === "auto") {
+		await scheduledRunService.recordScheduledAutoHandled(
+			scheduledRun.runId,
+			"permission",
+			toolName,
+		);
+		return { behavior: "deny", message: UNATTENDED_PERMISSION_MESSAGE };
+	}
+	if (scheduledRun)
+		await scheduledRunService.markScheduledRunBlocked(
+			scheduledRun.runId,
+			scheduledBlockReason(toolName),
+		);
 	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
 		where: and(eq(narratorToolCalls.id, permissionToolCallId)),
 	});
@@ -7308,6 +7416,18 @@ export async function stopDangerReflectionLoop(
 ): Promise<boolean> {
 	const pause = pendingDangerReflections.get(requestId);
 	if (!pause) return abortPersistedDangerReflectionWithoutRuntime(requestId, reason);
+	const scheduledService = await import("./scheduled-task-run-service");
+	const scheduled = await scheduledService.lookupScheduledRun(pause.narratorId);
+	if (scheduled?.onBlocked === "auto") {
+		await scheduledService.recordScheduledAutoHandled(
+			scheduled.runId,
+			"permission",
+			pause.toolName,
+		);
+		pause.reflectionAbortController?.abort();
+		return cancelDangerReflection(requestId, UNATTENDED_PERMISSION_MESSAGE, "user");
+	}
+	if (scheduled) await scheduledService.markScheduledRunBlocked(scheduled.runId, "permission");
 
 	const message = reason?.trim() || "Danger reflection stopped by user; awaiting user decision";
 	pause.reflectionStoppedByUser = true;

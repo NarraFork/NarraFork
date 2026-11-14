@@ -1800,6 +1800,20 @@
       "when": 1794560562801,
       "tag": "0256_outline_spec_loss",
       "breakpoints": true
+    },
+    {
+      "idx": 257,
+      "version": "6",
+      "when": 1794615053118,
+      "tag": "0257_scheduled_tasks_redesign",
+      "breakpoints": true
+    },
+    {
+      "idx": 258,
+      "version": "6",
+      "when": 1794673977350,
+      "tag": "0258_scheduled_run_admission",
+      "breakpoints": true
     }
   ]
 }

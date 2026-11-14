@@ -1,6 +1,6 @@
 {
-  "id": "0037af1a-0d86-4ddd-9499-9a605cce1179",
-  "prevId": "11493ae9-9036-4353-b911-18624a649666",
+  "id": "ff7e0c27-74cd-4fc5-a4f0-84d6f4158061",
+  "prevId": "a8ad426b-536f-46f7-b7fa-77520e3c4e38",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -22553,11 +22553,30 @@
           "primaryKey": false,
           "notNull": false
         },
+        "error_kind": {
+          "name": "error_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "run_context": {
           "name": "run_context",
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "scheduled_for": {
+          "name": "scheduled_for",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "trigger": {
+          "name": "trigger",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'schedule'"
         },
         "manual": {
           "name": "manual",
@@ -22565,6 +22584,85 @@
           "primaryKey": false,
           "notNull": true,
           "default": false
+        },
+        "trigger_message_id": {
+          "name": "trigger_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "logical_run_id": {
+          "name": "logical_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "model": {
+          "name": "model",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "block_reason": {
+          "name": "block_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "blocked_at": {
+          "name": "blocked_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "outcome_summary": {
+          "name": "outcome_summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "outcome_reported_at": {
+          "name": "outcome_reported_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "auto_handled": {
+          "name": "auto_handled",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "nudged": {
+          "name": "nudged",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "missed_count": {
+          "name": "missed_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deadline_at": {
+          "name": "deadline_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stats": {
+          "name": "stats",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "started_at": {
           "name": "started_at",
@@ -22627,6 +22725,27 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_scheduled_task_runs_status": {
+          "name": "idx_scheduled_task_runs_status",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -22678,6 +22797,63 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "schedule": {
+          "name": "schedule",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "schedule_kind": {
+          "name": "schedule_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fired_count": {
+          "name": "fired_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "schedule_revision": {
+          "name": "schedule_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "schedule_cursor_at": {
+          "name": "schedule_cursor_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "active_run_id": {
+          "name": "active_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "pause_reason": {
+          "name": "pause_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "consecutive_failures": {
+          "name": "consecutive_failures",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "timezone": {
           "name": "timezone",
@@ -22756,8 +22932,92 @@
           "primaryKey": false,
           "notNull": false
         },
+        "model_policy": {
+          "name": "model_policy",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'follow'"
+        },
+        "on_blocked": {
+          "name": "on_blocked",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'auto'"
+        },
+        "blocked_wait_minutes": {
+          "name": "blocked_wait_minutes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 30
+        },
+        "max_run_minutes": {
+          "name": "max_run_minutes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 60
+        },
+        "notify_on_success": {
+          "name": "notify_on_success",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "owner_user_id": {
+          "name": "owner_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_by": {
           "name": "created_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "creator_kind": {
+          "name": "creator_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'user'"
+        },
+        "creator_narrator_id": {
+          "name": "creator_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "creator_message_id": {
+          "name": "creator_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "creator_tool_call_id": {
+          "name": "creator_tool_call_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "creator_tool_use_id": {
+          "name": "creator_tool_use_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "creator_snapshot": {
+          "name": "creator_snapshot",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_modified_by": {
+          "name": "last_modified_by",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -22780,6 +23040,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "last_run_id": {
+          "name": "last_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "last_status": {
           "name": "last_status",
           "type": "text",
@@ -22788,6 +23054,18 @@
         },
         "last_error": {
           "name": "last_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_outcome": {
+          "name": "last_outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_summary": {
+          "name": "last_summary",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -22872,6 +23150,21 @@
           "method": "btree",
           "with": {}
         },
+        "idx_scheduled_tasks_owner": {
+          "name": "idx_scheduled_tasks_owner",
+          "columns": [
+            {
+              "expression": "owner_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_scheduled_tasks_reuse_narrator": {
           "name": "idx_scheduled_tasks_reuse_narrator",
           "columns": [
@@ -22923,6 +23216,19 @@
           "tableTo": "narrators",
           "columnsFrom": [
             "reuse_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "scheduled_tasks_owner_user_id_users_id_fk": {
+          "name": "scheduled_tasks_owner_user_id_users_id_fk",
+          "tableFrom": "scheduled_tasks",
+          "tableTo": "users",
+          "columnsFrom": [
+            "owner_user_id"
           ],
           "columnsTo": [
             "id"

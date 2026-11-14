@@ -592,6 +592,22 @@
 			"prevId": "11493ae9-9036-4353-b911-18624a649666",
 			"version": "7",
 			"snapshotDigest": "9b69bab6d6b1864e335e6d5a067c9e052ba4ea869b1eb384e715818ce611ca83"
+		},
+		{
+			"idx": 74,
+			"tag": "0074_scheduled_tasks_redesign",
+			"id": "a8ad426b-536f-46f7-b7fa-77520e3c4e38",
+			"prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+			"version": "7",
+			"snapshotDigest": "6c80711e3a3556a4d6f96df23b8381077129548d4eb4498a633bd11af7ed74d3"
+		},
+		{
+			"idx": 75,
+			"tag": "0075_scheduled_run_admission",
+			"id": "ff7e0c27-74cd-4fc5-a4f0-84d6f4158061",
+			"prevId": "a8ad426b-536f-46f7-b7fa-77520e3c4e38",
+			"version": "7",
+			"snapshotDigest": "1cdbc3411866666ac1ec6d294026680a5da343f77d4732330abcb0107742cee1"
 		}
 	]
 }

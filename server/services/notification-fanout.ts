@@ -34,6 +34,7 @@ import {
 	syncChatNotificationReads,
 } from "./notification-center-service";
 import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import { notifyScheduledTaskTransferred } from "./scheduled-task-notify";
 
 export type { NotificationKind, NotificationLink, RecordNotificationInput };
 export { NOTIFICATION_FANOUT_MAX_RECIPIENTS, NOTIFICATION_PREVIEW_MAX_LENGTH };
@@ -397,11 +398,16 @@ export function initNotificationFanout(): void {
 			}
 		});
 	};
+	const scheduledTransfer = (event: { taskId: string }) => {
+		guard("scheduled_task:transferred", () => notifyScheduledTaskTransferred(event.taskId));
+	};
+	eventBus.on("scheduled_task:transferred", scheduledTransfer);
 	eventBus.on("chat:message_created", created);
 	eventBus.on("chat:room_read", read);
 	eventBus.on("chat:message_deleted", deleted);
 	eventBus.on("narrator:permission_request", permission);
 	subscriptions.dispose = () => {
+		eventBus.off("scheduled_task:transferred", scheduledTransfer);
 		eventBus.off("chat:message_created", created);
 		eventBus.off("chat:room_read", read);
 		eventBus.off("chat:message_deleted", deleted);

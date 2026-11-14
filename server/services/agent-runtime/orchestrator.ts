@@ -225,6 +225,7 @@ import {
 	outlinePersonHourRunning,
 } from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
+import { scheduledRunModelOverride } from "../scheduled-run-registry";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
@@ -662,6 +663,9 @@ export async function runAgentLoopUnlocked(
 			throw error;
 		}
 		if (buffered) {
+			await (await import("../scheduled-task-run-service")).endScheduledRunForHumanInput(
+				narratorId,
+			);
 			personSpoke = true;
 			const bufferedClaim = buffered._mailboxClaim;
 			if (!bufferedClaim) throw new Error("Claimed buffered input missing mailbox claim");
@@ -1177,8 +1181,10 @@ export async function runAgentLoopUnlocked(
 
 			// The row is authoritative, including a pin made after the executor built
 			// its one-time snapshot. initialModel only identifies the initial history.
-			const modelSelectionRef = freshNarrator.model ?? FOLLOW_DEFAULT_MODEL;
+			const scheduledModel = scheduledRunModelOverride(narratorId, run?.logicalRunId);
+			const modelSelectionRef = scheduledModel ?? freshNarrator.model ?? FOLLOW_DEFAULT_MODEL;
 			if (
+				scheduledModel === undefined &&
 				active._modelRefreshVersion !== modelVersionBeforeLoad &&
 				active._modelSelectionRef !== undefined
 			) {

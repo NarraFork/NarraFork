@@ -2,6 +2,7 @@ import {
 	ActionIcon,
 	Badge,
 	Button,
+	Checkbox,
 	Group,
 	Loader,
 	Modal,
@@ -15,7 +16,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconLock, IconPencil, IconPlus, IconSelector, IconTrash } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -45,6 +46,19 @@ function SettingsUsersPage() {
 	const [editPassword, setEditPassword] = useState("");
 	const [aclUser, setAclUser] = useState<{ id: string; username: string } | null>(null);
 	const [createOpen, setCreateOpen] = useState(false);
+	const [deletingUser, setDeletingUser] = useState<{ id: string; username: string } | null>(null);
+	const [confirmTaskTransfer, setConfirmTaskTransfer] = useState(false);
+	const transferPreview = useInfiniteQuery({
+		queryKey: ["admin", "users", deletingUser?.id, "scheduled-tasks-transfer-preview"],
+		queryFn: ({ pageParam }) =>
+			api.previewUserScheduledTaskTransfer(deletingUser?.id ?? "", pageParam),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		enabled: user?.role === "admin" && !!deletingUser,
+		gcTime: SETTINGS_USERS_QUERY_GC_TIME_MS,
+		staleTime: 0,
+	});
+	const tasksToTransfer = transferPreview.data?.pages.flatMap((page) => page.items) ?? [];
 
 	const { data: users, isLoading: usersLoading } = useQuery({
 		queryKey: ["admin", "users"],
@@ -61,8 +75,18 @@ function SettingsUsersPage() {
 	});
 
 	const deleteUser = useMutation({
-		mutationFn: api.deleteUser,
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["admin", "users"] }),
+		mutationFn: ({ id, transferScheduledTasks }: { id: string; transferScheduledTasks: boolean }) =>
+			api.deleteUser(id, { transferScheduledTasks }),
+		onSuccess: () => {
+			void qc.invalidateQueries({ queryKey: ["admin", "users"] });
+			void qc.invalidateQueries({ queryKey: ["scheduled-tasks"] });
+			void qc.invalidateQueries({ queryKey: ["narrators"] });
+			setDeletingUser(null);
+		},
+		onError: () => {
+			setConfirmTaskTransfer(false);
+			void transferPreview.refetch();
+		},
 	});
 
 	const updateAdminSettings = useMutation({
@@ -204,14 +228,11 @@ function SettingsUsersPage() {
 													<ActionIcon
 														color="red"
 														variant="subtle"
-														onClick={async () => {
-															if (
-																await confirm({
-																	message: t("confirmDeleteUser", { username: u.username }),
-																})
-															) {
-																deleteUser.mutate(u.id);
-															}
+														aria-label={t("delete")}
+														onClick={() => {
+															deleteUser.reset();
+															setConfirmTaskTransfer(false);
+															setDeletingUser(u);
 														}}
 														loading={deleteUser.isPending}
 													>
@@ -227,6 +248,95 @@ function SettingsUsersPage() {
 					)}
 				</Stack>
 			</Paper>
+
+			<Modal
+				opened={!!deletingUser}
+				onClose={() => {
+					if (!deleteUser.isPending) setDeletingUser(null);
+				}}
+				title={t("deleteUserTitle")}
+				closeOnClickOutside={!deleteUser.isPending}
+				closeOnEscape={!deleteUser.isPending}
+				withCloseButton={!deleteUser.isPending}
+			>
+				<Stack>
+					<Text size="sm">{t("confirmDeleteUser", { username: deletingUser?.username })}</Text>
+					{transferPreview.isPending && (
+						<Text size="sm" role="status">
+							{t("loading")}
+						</Text>
+					)}
+					{transferPreview.isError && (
+						<Stack gap="xs">
+							<Text c="red" size="sm" role="alert">
+								{t("deleteUserScheduledTasksLoadFailed")}
+							</Text>
+							<Button variant="default" onClick={() => void transferPreview.refetch()}>
+								{t("retry")}
+							</Button>
+						</Stack>
+					)}
+					{tasksToTransfer.length > 0 && (
+						<Stack gap="xs">
+							<Text size="sm">{t("deleteUserScheduledTasksIntro")}</Text>
+							<Stack gap="xs" mah={220} style={{ overflowY: "auto" }}>
+								{tasksToTransfer.map((task) => (
+									<Text key={task.id} size="sm" style={{ overflowWrap: "anywhere" }}>
+										{task.name}
+									</Text>
+								))}
+							</Stack>
+							{transferPreview.hasNextPage && (
+								<Button
+									variant="subtle"
+									loading={transferPreview.isFetchingNextPage}
+									onClick={() => void transferPreview.fetchNextPage()}
+								>
+									{t("deleteUserScheduledTasksMore")}
+								</Button>
+							)}
+							<Checkbox
+								label={t("deleteUserScheduledTasksConfirm")}
+								checked={confirmTaskTransfer}
+								disabled={deleteUser.isPending}
+								onChange={(event) => setConfirmTaskTransfer(event.currentTarget.checked)}
+							/>
+						</Stack>
+					)}
+					{deleteUser.isError && (
+						<Text c="red" size="sm" role="alert">
+							{deleteUser.error.message}
+						</Text>
+					)}
+					<Group justify="flex-end">
+						<Button
+							variant="default"
+							disabled={deleteUser.isPending}
+							onClick={() => setDeletingUser(null)}
+						>
+							{t("cancel")}
+						</Button>
+						<Button
+							color="red"
+							loading={deleteUser.isPending}
+							disabled={
+								!transferPreview.isSuccess ||
+								transferPreview.isFetching ||
+								(tasksToTransfer.length > 0 && !confirmTaskTransfer)
+							}
+							onClick={() => {
+								if (deletingUser)
+									deleteUser.mutate({
+										id: deletingUser.id,
+										transferScheduledTasks: confirmTaskTransfer,
+									});
+							}}
+						>
+							{t("delete")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
 
 			<CreateUserModal opened={createOpen} onClose={() => setCreateOpen(false)} />
 
