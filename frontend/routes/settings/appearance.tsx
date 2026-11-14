@@ -1,8 +1,9 @@
-import { Stack, Switch, Title } from "@mantine/core";
+import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { AppearanceSection } from "../../components/settings/AppearanceSection";
+import { AppearanceSwitch } from "../../components/settings/AppearanceSyncControl";
 import { useLocalNumberPref, useLocalPref } from "../../hooks/useLocalPref";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 
@@ -60,7 +61,8 @@ function SettingsAppearancePage() {
 				setLodAltGesture={setLodAltGesture}
 			/>
 			{/* TEMPORARY debug toggle (mock stream harness). Delete with ../mock/. */}
-			<Switch
+			<AppearanceSwitch
+				preferenceKey="narrafork_mock_stream"
 				label={t("mockStreamPanel")}
 				description={t("mockStreamPanelDesc")}
 				checked={mockStream}

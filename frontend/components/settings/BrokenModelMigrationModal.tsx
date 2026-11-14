@@ -49,7 +49,7 @@ export interface BrokenModelMigrationModalProps {
 export function BrokenModelMigrationModal({ opened, onClose }: BrokenModelMigrationModalProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 	const [targetModel, setTargetModel] = useState<string | null>(null);
 	const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 	const [lastResult, setLastResult] = useState<{ migrated: number; skipped: number } | null>(null);
@@ -176,6 +176,7 @@ export function BrokenModelMigrationModal({ opened, onClose }: BrokenModelMigrat
 						label={t("brokenModelMigrationTargetModel")}
 						data={modelOptions}
 						searchable
+						filter={modelOptionsFilter}
 						limit={MODEL_SELECT_OPTION_LIMIT}
 						value={targetModel}
 						onChange={setTargetModel}

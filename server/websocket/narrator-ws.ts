@@ -1541,6 +1541,13 @@ export function broadcastToUser(userId: string, data: NarratorServerMessage): vo
 	}
 }
 
+// Kept separate so hot-loading this bridge into an existing server registers it once.
+if (hotOnce("narrafork.userPreferencesWs.listenersRegistered")) {
+	eventBus.on("user_preferences:changed", ({ userId }) => {
+		broadcastToUser(userId, { type: "user_preferences_changed" });
+	});
+}
+
 let humanAttentionBroadcastTimer: ReturnType<typeof setTimeout> | undefined;
 /** When the pending wake-up fires (epoch ms). */
 let humanAttentionDueAt = 0;

@@ -21,7 +21,7 @@ import {
 	IconSearch,
 	IconSettings,
 } from "@tabler/icons-react";
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	AGG_MODEL_PREFIX,
@@ -32,6 +32,7 @@ import {
 	type ModelOption,
 	parseAggModelValue,
 } from "../../../lib/constants";
+import { createModelQueryMatcher, createModelSearchIndex } from "../../../lib/model-search";
 import { formatCountdown } from "../../../lib/relative-time";
 import { ModelSourceBrowser } from "./ModelSourceBrowser";
 import { modelInheritanceLabel } from "./model-inheritance-label";
@@ -212,22 +213,25 @@ export function ModelMenuItems({
 	}, [opened]);
 	// Auto models by vendor family; every service keeps all of its models (the provider view
 	// does not render auto groups, so a covered model must stay under its service).
-	const groups = groupModelOptions(allModels);
-	const provLabels: Record<string, string> = {
-		openai: "OpenAI",
-		...providerLabels,
-		__default__: t("modelGroupDefault"),
-		__summary__: t("modelGroupSummary"),
-		__auto__: t("modelGroupAuto"),
-		__agg__: t("modelGroupAggregations"),
-	};
-	for (const key of groups.keys()) {
-		if (!key.startsWith(AUTO_FAMILY_GROUP_PREFIX)) continue;
-		const family = key.slice(AUTO_FAMILY_GROUP_PREFIX.length);
-		provLabels[key] = family
-			? t("modelGroupFamily", { family: familyLabel(family) })
-			: t("modelGroupFamilyOther");
-	}
+	const groups = useMemo(() => groupModelOptions(allModels), [allModels]);
+	const provLabels = useMemo<Record<string, string>>(() => {
+		const labels: Record<string, string> = {
+			openai: "OpenAI",
+			...providerLabels,
+			__default__: t("modelGroupDefault"),
+			__summary__: t("modelGroupSummary"),
+			__auto__: t("modelGroupAuto"),
+			__agg__: t("modelGroupAggregations"),
+		};
+		for (const key of groups.keys()) {
+			if (!key.startsWith(AUTO_FAMILY_GROUP_PREFIX)) continue;
+			const family = key.slice(AUTO_FAMILY_GROUP_PREFIX.length);
+			labels[key] = family
+				? t("modelGroupFamily", { family: familyLabel(family) })
+				: t("modelGroupFamilyOther");
+		}
+		return labels;
+	}, [groups, providerLabels, t]);
 	// The auto row a pinned source belongs to: `codex:gpt-5.5` sits under `auto:gpt-5.5`
 	// when that row lists it, so the picker can show the pin inside its model.
 	const autoRowOfSource = new Map<string, string>();
@@ -243,38 +247,28 @@ export function ModelMenuItems({
 	// Default, Summary, and Aggregations stay pinned at the top. Every provider
 	// group is sorted alphabetically by its display label.
 	const entries = orderModelGroupEntries([...groups.entries()], (prov) => provLabels[prov] ?? prov);
-	const normalizedFilter = filter.trim().toLowerCase();
-	const filteredEntries = normalizedFilter
+	// Share the metadata/role index with the Selects; only translated headers are
+	// menu-specific. Normalize the catalog once and the query once per render.
+	const searchIndex = useMemo(
+		() =>
+			createModelSearchIndex(
+				[...groups.entries()].flatMap(([prov, models]) =>
+					models.map((model) => ({ ...model, group: provLabels[prov] ?? prov })),
+				),
+				{ providerLabels: provLabels, defaultModelValue, summaryModelValue },
+			),
+		[groups, provLabels, defaultModelValue, summaryModelValue],
+	);
+	const matchesQuery = createModelQueryMatcher(filter);
+	const filteredEntries = filter.trim()
 		? entries
-				.map(([prov, models]) => {
-					const providerLabel = provLabels[prov] ?? prov;
-					const filteredModels = models.filter((m) => {
-						const roleTargetValue =
-							m.provider === "__default__"
-								? defaultModelValue
-								: m.provider === "__summary__"
-									? summaryModelValue
-									: null;
-						const haystack = [
-							m.label,
-							m.value,
-							m.provider ?? "",
-							providerLabel,
-							roleTargetValue ?? "",
-							modelProviderPrefix(roleTargetValue) ?? "",
-							m.rateMultiplier != null ? String(m.rateMultiplier) : "",
-							// An auto row is found by the services that serve it, too.
-							...(m.autoSources ?? []).flatMap((source) => [
-								source.value,
-								provLabels[source.provider] ?? source.provider,
-							]),
-						]
-							.join(" ")
-							.toLowerCase();
-						return haystack.includes(normalizedFilter);
-					});
-					return [prov, filteredModels] as const;
-				})
+				.map(
+					([prov, models]) =>
+						[
+							prov,
+							models.filter((model) => matchesQuery(searchIndex.get(model.value) ?? "")),
+						] as const,
+				)
 				.filter(([, models]) => models.length > 0)
 		: entries;
 	// For aggregation selection check: parse current model to see if it's an aggregation
