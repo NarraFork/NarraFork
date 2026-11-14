@@ -814,6 +814,17 @@
 	"runtimeVNetUdpEnabled": "enabled",
 	"runtimeVNetUdpDisabled": "disabled",
 	"appearanceSection": "Appearance",
+	"appearanceSyncFailed": "Appearance settings applied locally, but could not sync to your account",
+	"appearanceSync": {
+		"custom": "Custom sync",
+		"account": "Account sync",
+		"local": "Local only",
+		"default": "default",
+		"fixed": "fixed",
+		"loading": "loading",
+		"toAccount": "sync to account",
+		"toLocal": "keep local"
+	},
 	"serverAndSystemSection": "Server & System",
 	"sessionSubSection": "Session",
 	"debugSubSection": "Debug",

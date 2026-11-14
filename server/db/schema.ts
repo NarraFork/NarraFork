@@ -2301,6 +2301,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
 		.notNull()
 		.default(true),
+	/** Validated, previously-local presentation values only; never client scope rules. */
+	appearancePreferences: text("appearance_preferences").notNull().default("{}"),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**

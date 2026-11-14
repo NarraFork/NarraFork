@@ -814,6 +814,17 @@
 	"runtimeVNetUdpEnabled": "已启用",
 	"runtimeVNetUdpDisabled": "已禁用",
 	"appearanceSection": "外观与界面",
+	"appearanceSyncFailed": "外观设置已在本地生效，暂未同步到账号",
+	"appearanceSync": {
+		"custom": "自定义同步",
+		"account": "账号同步",
+		"local": "仅本地",
+		"default": "默认",
+		"fixed": "固定",
+		"loading": "加载中",
+		"toAccount": "同步到账号",
+		"toLocal": "仅保留本地"
+	},
 	"serverAndSystemSection": "服务器与系统",
 	"sessionSubSection": "会话",
 	"debugSubSection": "调试",

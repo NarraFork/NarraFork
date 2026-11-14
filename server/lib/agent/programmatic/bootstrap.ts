@@ -204,7 +204,16 @@ async function brokerMain(
 					await observedChange;
 					continue;
 				}
-				const request = mailbox.takeRequest();
+				let request: ReturnType<typeof mailbox.takeRequest>;
+				try {
+					request = mailbox.takeRequest();
+				} catch (error) {
+					// A normal completion can close between isClosed() and this read.
+					// Only the structured result (or the outer deadline) settles the run.
+					if ((error as { code?: string }).code === "MAILBOX_CLOSED" && mailbox.isClosed())
+						continue;
+					throw error;
+				}
 				if (!request) {
 					await mailbox
 						.waitForRequest(Math.min(100, Math.max(1, deadline - Date.now())))
