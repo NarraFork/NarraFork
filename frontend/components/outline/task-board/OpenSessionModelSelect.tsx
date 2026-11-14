@@ -20,13 +20,14 @@ export default function OpenSessionModelSelect({
 	value: string;
 	onChange: (model: string) => void;
 }) {
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 	return (
 		<Select
 			size="xs"
 			label={label}
 			data={groupedModels}
 			searchable
+			filter={modelOptionsFilter}
 			limit={MODEL_SELECT_OPTION_LIMIT}
 			value={value || FOLLOW_DEFAULT_MODEL}
 			onChange={(next) => onChange(!next || next === FOLLOW_DEFAULT_MODEL ? "" : next)}

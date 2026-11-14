@@ -28,6 +28,7 @@ import {
 import { useAllModels } from "../../hooks/useModels";
 import { formatCompactNumber } from "../../lib/compact-number";
 import { formatLocaleDate, formatLocaleDateTime } from "../../lib/intl-format";
+import { createModelQueryMatcher, createModelSearchIndex } from "../../lib/model-search";
 import { ModelOverrideEditor, OriginBadge } from "./ModelOverrideEditor";
 
 function CatalogStatusCard() {
@@ -142,7 +143,7 @@ function customized(info: ModelDescription | undefined): boolean {
 /** The catalog's state, and every configured model with what is in effect for it. */
 export function ModelCatalogSection() {
 	const { t } = useTranslation("settings");
-	const { visibleModels } = useAllModels();
+	const { visibleModels, providerLabels } = useAllModels();
 	const [search, setSearch] = useState("");
 	const [onlyCustomized, setOnlyCustomized] = useState(false);
 	const [editing, setEditing] = useState<string>();
@@ -151,14 +152,18 @@ export function ModelCatalogSection() {
 		[visibleModels],
 	);
 	const descriptions = useModelDescriptions(values);
-	const query = search.trim().toLowerCase();
+	const searchIndex = useMemo(
+		() => createModelSearchIndex(visibleModels, { providerLabels }),
+		[visibleModels, providerLabels],
+	);
+	const matchesQuery = createModelQueryMatcher(search);
 	const rows = values
 		.map((value, index) => ({ value, info: descriptions[index]?.data }))
 		.filter(
 			({ value, info }) =>
-				(!query ||
-					value.toLowerCase().includes(query) ||
-					info?.catalogName?.toLowerCase().includes(query)) &&
+				matchesQuery(
+					`${searchIndex.get(value) ?? value.toLowerCase()} ${info?.catalogName?.toLowerCase() ?? ""}`,
+				) &&
 				(!onlyCustomized || customized(info)),
 		);
 	return (
