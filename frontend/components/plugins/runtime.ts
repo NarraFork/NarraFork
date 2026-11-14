@@ -335,6 +335,9 @@ export class PluginUiSession {
 			entryUrl: this.contribution.entryUrl,
 			styleUrl: this.contribution.styleUrl,
 			title: this.contribution.title,
+			// Presentation follows the host-constructed binding, not plugin view state or metadata.
+			transparent:
+				this.params.binding.kind === "host-surface" && this.params.binding.surface === "overlay",
 			...(usesHostRuntime
 				? {
 						/*
@@ -418,6 +421,23 @@ export class PluginUiSession {
 				const requestId = this.readRequestId(parsed.data.params);
 				if (requestId) this.inFlight.get(requestId)?.abort();
 				return;
+			}
+			const params = parsed.data.params;
+			if (
+				parsed.data.method === "plugin.lifecycle" &&
+				params &&
+				typeof params === "object" &&
+				!Array.isArray(params) &&
+				params.state === "crashed"
+			) {
+				// Asset/runtime load errors arrive after the handshake already marked us ready.
+				// Use the same crash path as transport failures so pending work and host-owned
+				// interaction state are cleaned up, rather than leaving an invisible ready panel.
+				this.crash(
+					typeof params.reason === "string" && params.reason
+						? params.reason
+						: "Plugin UI reported a crash",
+				);
 			}
 			this.options.onNotification?.(this.params, parsed.data);
 			return;

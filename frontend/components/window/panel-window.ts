@@ -31,6 +31,7 @@ import {
 	resolveCanonicalPluginUiSessionContext,
 } from "../plugins/PluginUiSurfaceContext";
 import {
+	HOST_SURFACE_VALUES,
 	jsonByteLength,
 	type PluginDockPanelParams,
 	parsePluginDockPanelParams,
@@ -49,7 +50,10 @@ const contextIdSchema = z
 	.regex(/^[A-Za-z0-9._:-]+$/);
 const pluginWindowHostContextSchema = z
 	.object({
-		surface: z.enum(["focus", "workspace", "director", "settings", "provider-settings"]),
+		// Shared with the panel-binding schema so a surface added there cannot be
+		// rejected here. An `overlay` view is never openable in a window (it has no dock
+		// panel to detach), but parsing its descriptor must not be the thing that says so.
+		surface: z.enum(HOST_SURFACE_VALUES),
 		workspaceId: contextIdSchema.optional(),
 		narratorId: contextIdSchema.optional(),
 		projectId: contextIdSchema.optional(),

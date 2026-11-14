@@ -600,6 +600,14 @@
 			"prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
 			"version": "7",
 			"snapshotDigest": "b02e691735cb67b24ad5b98b24178b943fbd422bf13078b91535370a06c13829"
+		},
+		{
+			"idx": 75,
+			"tag": "0075_plugin_overlay_preferences",
+			"id": "247a3c32-d37e-4ac1-8c2d-f1c176eb47a4",
+			"prevId": "4732deae-5c40-46e7-a744-98ff336e40ad",
+			"version": "7",
+			"snapshotDigest": "924477a94066dad819736d414a88c27485b0f83025ccce1c18e0c9e5431c8759"
 		}
 	]
 }

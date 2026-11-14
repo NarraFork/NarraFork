@@ -94,6 +94,25 @@ export interface PluginUiHostLocalRouterOptions {
 	 * cannot live here because the router does not know the plugin's providers.
 	 */
 	testModel?: (pluginId: string, model: string, prompt?: string) => Promise<JsonValue>;
+	/**
+	 * Record the interactive rectangle of an `overlay` view and answer with the
+	 * applied rect plus the viewport size.
+	 *
+	 * Wired by the runtime provider (which clamps to the viewport and feeds the
+	 * overlay host). Left unwired on hosts that never mount an overlay layer, so the
+	 * method reports NOT_SUPPORTED and a plugin can feature-detect it.
+	 */
+	overlaySetBounds?: (
+		panelInstanceId: string,
+		bounds: { x: number; y: number; width: number; height: number },
+	) => {
+		x: number;
+		y: number;
+		width: number;
+		height: number;
+		viewportWidth: number;
+		viewportHeight: number;
+	};
 }
 
 export interface PluginUiNotificationInput {
@@ -182,6 +201,8 @@ function dispatchHostLocal(
 			return providerModelsChanged(params, options, method);
 		case "models.test":
 			return modelsTest(params, request, options, method);
+		case "overlay.setBounds":
+			return overlaySetBounds(params, request, options, method);
 		case "panel.setBadge":
 		case "panel.setDirty":
 			throw notSupported(method);
@@ -388,4 +409,52 @@ function modelsTest(
 	}
 	// Prefix scoping is the implementation's job (see the options contract).
 	return options.testModel(params.pluginId, model, prompt);
+}
+
+/** Upper bound on one reported overlay rectangle, so a bad caller cannot ask for absurd numbers. */
+const OVERLAY_BOUNDS_MAX = 100_000;
+
+function readBoundedNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * `overlay.setBounds` — where an overlay view wants to be interactive.
+ *
+ * Only an `overlay` binding may call it. The check reads the *host-constructed*
+ * params, never the plugin's payload, so it cannot be forged from inside the
+ * iframe; and even a successful call can only place a hit region for the caller's
+ * own `panelInstanceId`, which no other view renders.
+ */
+function overlaySetBounds(
+	params: PluginDockPanelParams,
+	request: UiRpcRequest,
+	options: PluginUiHostLocalRouterOptions,
+	method: string,
+): JsonValue {
+	if (!options.overlaySetBounds) throw notSupported(method);
+	if (params.binding.kind !== "host-surface" || params.binding.surface !== "overlay") {
+		throw new PluginUiHostError(
+			"NOT_SUPPORTED",
+			"overlay.setBounds is only available to overlay views",
+			{ retryable: false },
+		);
+	}
+	if (!isRecord(request.params)) throw invalidParams("overlay.setBounds requires an object");
+	const x = readBoundedNumber(request.params.x);
+	const y = readBoundedNumber(request.params.y);
+	const width = readBoundedNumber(request.params.width);
+	const height = readBoundedNumber(request.params.height);
+	if (x === undefined || y === undefined || width === undefined || height === undefined) {
+		throw invalidParams("overlay.setBounds requires finite x, y, width and height");
+	}
+	if (width < 0 || height < 0 || width > OVERLAY_BOUNDS_MAX || height > OVERLAY_BOUNDS_MAX) {
+		throw invalidParams("overlay.setBounds width/height are out of range");
+	}
+	return options.overlaySetBounds(params.panelInstanceId, {
+		x,
+		y,
+		width,
+		height,
+	}) as unknown as JsonValue;
 }

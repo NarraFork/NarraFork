@@ -75,6 +75,11 @@ const SURFACE_ALLOWED_SCOPES: Record<PluginUiHostSurface, ReadonlySet<string>> =
 	director: new Set(["global", "workspace"]),
 	settings: new Set(["global"]),
 	"provider-settings": new Set(["global"]),
+	// Never asked for by a picker (there is no "add an overlay panel" flow, and this
+	// component is only rendered with a dock surface), but the record is exhaustive
+	// over `PluginUiHostSurface`, and leaving it out would be a silent hole if a
+	// future surface ever did get a picker.
+	overlay: new Set(["global"]),
 };
 
 function statusColor(availability: PluginContributionRecord["availability"]): string {

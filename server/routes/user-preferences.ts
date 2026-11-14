@@ -19,8 +19,10 @@ import {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createRecentTabFolderSchema,
+	MAX_HIDDEN_PLUGIN_OVERLAYS,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
+	pluginOverlayVisibilityPatchSchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
@@ -385,7 +387,15 @@ function serializeUserPreferences(
 		navLayout: parseJsonObject(pref.navLayout),
 		narratorToolbarLayout: parseJsonObject(pref.narratorToolbarLayout),
 		specTabLayout: parseJsonObject(pref.specTabLayout),
+		hiddenPluginOverlays: parseHiddenPluginOverlays(pref.hiddenPluginOverlays),
 	};
+}
+
+/** Stored ids, tolerating a malformed column (it only ever reads back as "hide nothing"). */
+function parseHiddenPluginOverlays(value: unknown): string[] {
+	return parseJsonArray(value)
+		.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 256)
+		.slice(0, MAX_HIDDEN_PLUGIN_OVERLAYS);
 }
 
 userPreferencesRoutes.get("/", async (c) => {
@@ -410,6 +420,7 @@ userPreferencesRoutes.get("/", async (c) => {
 			navLayout: {},
 			narratorToolbarLayout: {},
 			specTabLayout: {},
+			hiddenPluginOverlays: [],
 		});
 	}
 
@@ -860,6 +871,47 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
  * 写入某个叙述者的大纲标签排布。整张映射按 narratorId 合并写入，
  * 其他叙述者的记录不受影响。
  */
+/**
+ * Show or hide one plugin's overlay views for the calling user only.
+ *
+ * Overlays appear by default once a plugin is installed; this is the personal opt-out.
+ * Hiding the newest id first and capping the list keeps the column bounded even if a
+ * client loops; the oldest remembered ids fall off, which at worst re-shows an overlay
+ * of a plugin the person hid long ago.
+ */
+userPreferencesRoutes.patch("/plugin-overlays", async (c) => {
+	const userId = c.get("user").sub;
+	const parsed = pluginOverlayVisibilityPatchSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const { pluginId, hidden } = parsed.data;
+	const now = new Date().toISOString();
+	const id = generateId();
+
+	const next = await userPreferencesLock.acquire(userId, async () => {
+		const existing = await db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { hiddenPluginOverlays: true },
+		});
+		const others = parseHiddenPluginOverlays(existing?.hiddenPluginOverlays).filter(
+			(stored) => stored !== pluginId,
+		);
+		const ids = (hidden ? [pluginId, ...others] : others).slice(0, MAX_HIDDEN_PLUGIN_OVERLAYS);
+		const json = JSON.stringify(ids);
+		sqlite.run(
+			`INSERT INTO user_preferences (id, user_id, hidden_plugin_overlays, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT (user_id) DO UPDATE SET
+			   hidden_plugin_overlays = ?,
+			   updated_at = ?`,
+			[id, userId, json, now, now, json, now],
+		);
+		return ids;
+	});
+
+	return c.json({ hiddenPluginOverlays: next });
+});
+
 userPreferencesRoutes.patch("/spec-tab-layout", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = specTabLayoutPatchSchema.safeParse(await c.req.json());

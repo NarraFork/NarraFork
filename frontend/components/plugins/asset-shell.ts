@@ -23,6 +23,8 @@ export interface PluginAssetShellOptions {
 	styleUrl?: string;
 	/** Panel title shown by the built-in loading splash (before the plugin script takes over). */
 	title?: string;
+	/** Host-owned overlay presentation: transparent document with no loading splash. */
+	transparent?: boolean;
 	defaultTimeoutMs?: number;
 	/**
 	 * Shared host runtime (React + Mantine) to load before the plugin entry.
@@ -309,6 +311,10 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     }),
     notifications: Object.freeze({ show: (input) => request("notifications.show", input) }),
     ui: Object.freeze({ openExternal: (input) => request("ui.openExternal", input) }),
+    // Overlay views only: declare the rectangle that should receive pointer input.
+    // Resolves with the applied (viewport-clamped) rectangle and the viewport size —
+    // the iframe cannot measure the host document, so this answer is its only view of it.
+    overlay: Object.freeze({ setBounds: (input) => request("overlay.setBounds", input) }),
     // Language. Theme needs no API at all: the host rewrites the token style element and the
     // browser recalculates. Text cannot work that way -- a string already in the DOM can only
     // be replaced by the plugin -- which is why this side needs an onChange hook.
@@ -495,8 +501,17 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 	// as soon as it runs (plugin UIs render their own content); the splash is
 	// deliberately inline/CSP-safe (style-src 'unsafe-inline').
 	const splashTitle = options.title ? escapeAttribute(options.title) : "Plugin panel";
-	const splash = `<div id="plugin-shell-splash" style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--mantine-color-body,#1a1b1e);color:var(--mantine-color-dimmed,#909296);font-family:var(--mantine-font-family,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif);font-size:13px;"><div style="width:20px;height:20px;border:2px solid var(--mantine-color-default-border,#373a40);border-top-color:var(--mantine-primary-color-5,#4c6ef5);border-radius:50%;animation:plugin-shell-spin .9s linear infinite;"></div><div>${splashTitle}</div></div><style>@keyframes plugin-shell-spin{to{transform:rotate(360deg)}}</style>`;
-	return `<!doctype html><html data-mantine-color-scheme="${escapeAttribute(options.colorScheme ?? "dark")}"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}</style></head><body>${splash}<script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
+	const splash = options.transparent
+		? ""
+		: `<div id="plugin-shell-splash" style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--mantine-color-body,#1a1b1e);color:var(--mantine-color-dimmed,#909296);font-family:var(--mantine-font-family,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif);font-size:13px;"><div style="width:20px;height:20px;border:2px solid var(--mantine-color-default-border,#373a40);border-top-color:var(--mantine-primary-color-5,#4c6ef5);border-radius:50%;animation:plugin-shell-spin .9s linear infinite;"></div><div>${splashTitle}</div></div><style>@keyframes plugin-shell-spin{to{transform:rotate(360deg)}}</style>`;
+	// The shared Mantine stylesheet also paints body. Keep the document transparent even
+	// after that stylesheet loads; plugin content can still paint its own root/controls.
+	// A mismatched iframe/root color scheme forces an opaque UA canvas even with
+	// transparent backgrounds. Negotiate with the embedding page in both themes.
+	const backgroundCss = options.transparent
+		? ":root{color-scheme:light dark!important;}html,body{background:transparent!important;}"
+		: "";
+	return `<!doctype html><html data-mantine-color-scheme="${escapeAttribute(options.colorScheme ?? "dark")}"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}${backgroundCss}</style></head><body>${splash}<script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
 }
 
 export function createPluginNonce(): string {

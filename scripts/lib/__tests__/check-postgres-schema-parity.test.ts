@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 144 tables and 1919 columns including account appearance preferences", () => {
+	test("covers 144 tables and 1920 columns including account appearance preferences", () => {
 		expect(target.tables.length).toBe(144);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -570,7 +570,8 @@ describe("real schema parity", () => {
 		// The swallowed-content scan (outline P2 PR 12c) adds outline_spec_loss_findings (21) and
 		// outline_spec_loss_scans (6).
 		// Account appearance preferences add one bounded JSON text column.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1919);
+		// Per-user plugin overlay visibility adds user_preferences.hidden_plugin_overlays.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1920);
 		expect(
 			target.tables
 				.find((table) => table.name === "user_preferences")

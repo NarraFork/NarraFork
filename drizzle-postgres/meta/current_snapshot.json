@@ -1,6 +1,6 @@
 {
-  "id": "4732deae-5c40-46e7-a744-98ff336e40ad",
-  "prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+  "id": "247a3c32-d37e-4ac1-8c2d-f1c176eb47a4",
+  "prevId": "4732deae-5c40-46e7-a744-98ff336e40ad",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -25315,6 +25315,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'{}'"
+        },
+        "hidden_plugin_overlays": {
+          "name": "hidden_plugin_overlays",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'"
         },
         "traits": {
           "name": "traits",
