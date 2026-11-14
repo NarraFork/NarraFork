@@ -34,14 +34,15 @@
 :root[data-mantine-color-scheme][data-nf-bg="on"] {
 	--nf-bg-scrim-color: color-mix(
 		in srgb,
-		var(--nf-canvas-base) var(--nf-bg-scrim-effective, 40%),
+		var(--nf-canvas-base) var(--nf-bg-scrim-effective, 20%),
 		transparent
 	);
 	/*
-	 * Only the panels are made translucent here. `--mantine-color-body` is deliberately left
-	 * alone: modals, menus, dropdowns and tooltips portal to <body> and paint with it, and a
-	 * translucent dialog over a wallpaper is unreadable. The shell gets its transparency
-	 * from the `#root` rule below instead, which is scoped to the app surface only.
+	 * BOTH surface variables go translucent. `--mantine-color-body` is the one that matters
+	 * most: dockview's group view (the narrator page) and dozens of internal surfaces paint
+	 * with it, so leaving it opaque hid the wallpaper on exactly that route while every other
+	 * page showed it. Overlays portalled to <body> are re-opaque below by ARIA role, which is
+	 * a stable attribute — Mantine's generated class names are not.
 	 */
 	/*
 	 * Scheme-adjusted weights. The slider expresses "how present the wallpaper is" for the
@@ -51,15 +52,23 @@
 	 * These are computed here (not in JS) so they follow a light/dark switch without
 	 * re-applying anything.
 	 */
-	--nf-bg-pane-effective: var(--nf-bg-pane-opacity, 80%);
-	--nf-bg-body-effective: var(--nf-bg-body-opacity, 62%);
-	--nf-bg-scrim-effective: var(--nf-bg-scrim, 40%);
+	--nf-bg-pane-effective: var(--nf-bg-pane-opacity, 68%);
+	--nf-bg-body-effective: var(--nf-bg-body-opacity, 50%);
+	--nf-bg-scrim-effective: var(--nf-bg-scrim, 20%);
 
 	--mantine-color-default: color-mix(
 		in srgb,
 		var(--nf-pane-base) var(--nf-bg-pane-effective),
 		transparent
 	);
+
+	--mantine-color-body: color-mix(
+		in srgb,
+		var(--nf-canvas-base) var(--nf-bg-body-effective),
+		transparent
+	);
+	/* Dockview seeds its own variable from the body colour; keep them in sync. */
+	--dv-group-view-background-color: var(--mantine-color-body);
 }
 
 :root[data-mantine-color-scheme="light"][data-nf-bg="on"] {
@@ -69,9 +78,9 @@
 	 * panels go almost opaque (crisp UI), the shell keeps enough transparency for the photo,
 	 * and the scrim goes DOWN — adding scrim on a light theme only washes the picture out.
 	 */
-	--nf-bg-pane-effective: calc(var(--nf-bg-pane-opacity, 80%) + 16%);
-	--nf-bg-body-effective: calc(var(--nf-bg-body-opacity, 62%) + 12%);
-	--nf-bg-scrim-effective: calc(var(--nf-bg-scrim, 40%) - 10%);
+	--nf-bg-pane-effective: calc(var(--nf-bg-pane-opacity, 68%) + 16%);
+	--nf-bg-body-effective: calc(var(--nf-bg-body-opacity, 50%) + 12%);
+	--nf-bg-scrim-effective: calc(var(--nf-bg-scrim, 20%) - 10%);
 }
 
 /*
@@ -84,13 +93,24 @@ html[data-nf-bg="on"] {
 	background: var(--nf-canvas-base);
 }
 
+/*
+ * Floating layers must stay opaque: they appear over the page (often over the picture) and
+ * carry dense text. ARIA roles survive component restyling, Mantine class names do not.
+ */
+html[data-nf-bg="on"] [role="dialog"],
+html[data-nf-bg="on"] [role="menu"],
+html[data-nf-bg="on"] [role="listbox"],
+html[data-nf-bg="on"] [role="tooltip"] {
+	background-color: var(--nf-pane-base);
+}
+
 html[data-nf-bg="on"] body {
 	background-color: transparent;
 }
 
 html[data-nf-bg="on"] #root {
 	/* The shell itself, not the global surface variable — see the note above. */
-	background: color-mix(in srgb, var(--nf-canvas-base) var(--nf-bg-body-opacity, 62%), transparent);
+	background: color-mix(in srgb, var(--nf-canvas-base) var(--nf-bg-body-opacity, 50%), transparent);
 	min-height: 100vh;
 	/*
 	 * NO `backdrop-filter` here. It would make #root a containing block for every

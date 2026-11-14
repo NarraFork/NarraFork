@@ -54,9 +54,15 @@ export const DEFAULT_BACKGROUND: BackgroundChoice = {
 	enabled: false,
 	source: "url",
 	url: "",
-	opacity: 80,
-	scrim: 40,
-	blur: 10,
+	/*
+	 * Deliberately on the visible side. The earlier defaults (80 / 40 / 10) were tuned for
+	 * "does not disturb the UI", which on a light theme with a bright photo read as "the
+	 * wallpaper is not working at all". Stronger defaults make the feature obviously alive;
+	 * the strength control dials it back in one click.
+	 */
+	opacity: 68,
+	scrim: 20,
+	blur: 6,
 };
 
 /** Panel opacity never goes below this: below it, text over a photo stops being readable. */

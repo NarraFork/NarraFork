@@ -336,3 +336,19 @@ curl 带 localhost Referer → 403
 同时加了「强度：淡 / 中 / 浓」快捷档（一键设定 不透明度/遮罩/模糊 三个值），不必为了"看得见"逐个拖滑杆。
 
 > 排查方式记录：在隔离库中建临时账号 → 用 `/api/auth/login` 取 token → 页面写入 localStorage 后用带 user-data-dir 的 headless Chrome 截图。用完删除账号与种子页。
+
+### 11.11 只有会话页不显示壁纸
+
+根因：会话页由 **dockview** 承载，面板背景来自 `--dv-group-view-background-color`，该变量在
+`components/dockview/theme.css` 里被设成 `var(--mantine-color-body)`。而我为了修"弹窗透明"，
+把 `--mantine-color-body` 改成了**不透明**——于是仪表盘（透明容器）能看到壁纸，会话页（dockview 面板）
+被整块盖住。全仓另有约 35 处组件直接以 `--mantine-color-body` 作背景，同理。
+
+修法：
+1. `--mantine-color-body` 重新半透明，并同步 `--dv-group-view-background-color`；
+2. 弹层改由 **ARIA 角色**钉成不透明（`[role="dialog"|"menu"|"listbox"|"tooltip"]`）——
+   角色属性是稳定契约，Mantine 生成的类名不是；
+3. 默认值上调到 68% / 20% / 6px：之前的 80/40/10 是按"尽量不打扰 UI"调的，在浅色 + 亮照片下
+   等同于"没生效"。强度档可以一键收回。
+
+验证：在真实会话页截图，浅色与深色下壁纸均可见，弹窗仍不透明。
