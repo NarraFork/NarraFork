@@ -349,6 +349,30 @@ describe("reissueBuiltinTlsOnStartup", () => {
 		const legacy = await generateSelfSignedCert();
 		expectBackdated(readFileSync(legacy.certPath, "utf8"), started, Date.now());
 	});
+
+	test("issued leaf lifetime stays within Apple's 825-day cap", async () => {
+		// iOS 13+/macOS 10.15+ reject TLS leaves valid for more than 825 days,
+		// including ones chaining to a user-installed and trusted root. A longer
+		// leaf breaks Safari on those platforms while looking fine on desktop,
+		// so guard the cap rather than the exact constant.
+		const APPLE_MAX_DAYS = 825;
+
+		const issued = await issueServerCert([]);
+		const leaf = new X509Certificate(readFileSync(issued.certPath, "utf8"));
+		const lifetimeDays =
+			(Date.parse(leaf.validTo) - Date.parse(leaf.validFrom)) / (24 * 60 * 60 * 1000);
+
+		expect(lifetimeDays).toBeLessThanOrEqual(APPLE_MAX_DAYS);
+		// Still long enough that routine use does not mean constant reissuance.
+		expect(lifetimeDays).toBeGreaterThan(365);
+
+		const legacy = await generateSelfSignedCert();
+		const legacyLeaf = new X509Certificate(readFileSync(legacy.certPath, "utf8"));
+		const legacyDays =
+			(Date.parse(legacyLeaf.validTo) - Date.parse(legacyLeaf.validFrom)) / (24 * 60 * 60 * 1000);
+		expect(legacyDays).toBeLessThanOrEqual(APPLE_MAX_DAYS);
+		expect(legacyDays).toBeGreaterThan(365);
+	});
 });
 
 describe("getTlsStatus on an empty directory", () => {

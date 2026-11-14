@@ -15,7 +15,24 @@ const CA_CERT_FILE = "ca.pem";
 const CA_KEY_FILE = "ca-key.pem";
 const SAN_SIDECAR_FILE = "san-list.json";
 
-const CERT_VALIDITY_YEARS = 10;
+/**
+ * Server certificate lifetime, in days.
+ *
+ * Apple caps TLS server certificates issued after 2019-07-01 at 825 days on
+ * iOS 13+/iPadOS 13+/macOS 10.15+, and that cap applies even when the issuing
+ * root is user-installed and explicitly trusted. A longer-lived leaf makes
+ * Safari reject the connection on every visit — the user sees a "this
+ * connection is not private" interstitial that has to be dismissed by hand,
+ * and Service Worker requests fail outright with `Load failed` because
+ * WebKit validates them strictly and does not inherit the manual override.
+ *
+ * Desktop browsers do not enforce the cap, so an oversized leaf is invisible
+ * on the machine that issued it and only breaks mobile access. 397 days keeps
+ * a comfortable margin under 825 while still giving a year-plus lifetime.
+ *
+ * @see https://support.apple.com/en-us/HT210176
+ */
+const CERT_VALIDITY_DAYS = 397;
 const CA_VALIDITY_YEARS = 20;
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 /** Also the zod `.max()` in routes/tls.ts — keep the two from drifting apart. */
@@ -288,7 +305,7 @@ export async function issueServerCert(customSans?: string[]): Promise<IssuedServ
 
 	const now = new Date();
 	const expiresAt = new Date(now);
-	expiresAt.setFullYear(expiresAt.getFullYear() + CERT_VALIDITY_YEARS);
+	expiresAt.setDate(expiresAt.getDate() + CERT_VALIDITY_DAYS);
 	// A leaf may not outlive its issuer.
 	if (expiresAt > caNotAfter) expiresAt.setTime(caNotAfter.getTime());
 
@@ -446,7 +463,7 @@ export async function generateSelfSignedCert(): Promise<GeneratedCert> {
 
 	const now = new Date();
 	const expiresAt = new Date(now);
-	expiresAt.setFullYear(expiresAt.getFullYear() + CERT_VALIDITY_YEARS);
+	expiresAt.setDate(expiresAt.getDate() + CERT_VALIDITY_DAYS);
 
 	const attrs = [
 		{ name: "commonName", value: "NarraFork" },
