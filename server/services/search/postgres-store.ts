@@ -373,6 +373,7 @@ function collectionClause(collectionId: string | undefined, params: Params): str
 function toKnowledgeRow(row: Row, fromDraft: boolean, snippet: string): KnowledgeSearchRow {
 	return {
 		id: strOr(row, "id", ""),
+		...(!fromDraft ? { entryRevisionId: str(row, "current_revision_id") } : {}),
 		collectionId: str(row, "collection_id"),
 		...(str(row, "personal_entry_id")
 			? { personalEntryId: strOr(row, "personal_entry_id", "") }
@@ -800,7 +801,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				const snippet = snippetSql("f.current_content", terms, KNOWLEDGE_SNIPPET, params);
 				const rank = rankSql(columns, params.add(query.indexText));
 				const rows = await run(
-					`SELECT ${KNOWLEDGE_ENTRY_COLUMNS}, ${snippet} AS snippet_raw, ${rank} AS rank_score
+					`SELECT ${KNOWLEDGE_ENTRY_COLUMNS}, e.current_revision_id, ${snippet} AS snippet_raw, ${rank} AS rank_score
 					 FROM search_knowledge_entries f
 					 JOIN knowledge_entries e ON e.id = f.id
 					 WHERE ${where} ${scope}
@@ -824,7 +825,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				? `e.current_keywords ILIKE ${pattern} ESCAPE '\\'`
 				: `(e.title ILIKE ${pattern} ESCAPE '\\' OR e.current_content ILIKE ${pattern} ESCAPE '\\')`;
 			const rows = await run(
-				`SELECT ${KNOWLEDGE_ENTRY_COLUMNS},
+				`SELECT ${KNOWLEDGE_ENTRY_COLUMNS}, e.current_revision_id,
 					substr(COALESCE(e.current_content, e.title), 1, ${PREVIEW_CHARS}) AS snippet_raw
 				 FROM knowledge_entries e
 				 WHERE (${raw} = '' OR ${matchExpr}) ${scope}

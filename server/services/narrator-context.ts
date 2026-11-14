@@ -1,3 +1,4 @@
+import { type ContextWorkState, renderContextWorkState } from "@shared/context-work-state";
 import { type SummaryRetryInfo, summaryGenerate } from "../lib/agent";
 import {
 	isContextOverflowMessage,
@@ -12,6 +13,7 @@ import {
 	getSummaryModelContextWindowDetail,
 	type ModelContextWindowSource,
 } from "../lib/settings/provider";
+import { captureContextWorkState } from "./context-work-state";
 import { narratorService } from "./narrator-service";
 import { taskSourceForNarrator } from "./task-source";
 
@@ -236,7 +238,10 @@ export const narratorContext = {
 			await narratorService.getModelHistorySinceLastCompact(narratorId, SUMMARY_MAX_MESSAGES),
 		);
 
-		if (messages.length === 0 && !narrator.contextSummary) return "No conversation history.";
+		const workState = await captureContextWorkState(narratorId, narrator, messages);
+		if (messages.length === 0 && !narrator.contextSummary) {
+			return `No conversation history.\n\n${renderContextWorkState(workState, locale)}`;
+		}
 
 		const questionIds = questionToolUseIds(messages);
 		let conversationText = messages
@@ -276,13 +281,19 @@ export const narratorContext = {
 				userId: options?.userId,
 			});
 
-			return result.text || "Failed to generate summary.";
+			if (!result.text?.trim()) {
+				if (options?.throwOnFailure) {
+					throw new Error("Context summary generation returned an empty summary.");
+				}
+				return "";
+			}
+			return `${result.text}\n\n${renderContextWorkState(workState, locale)}`;
 		} catch (err) {
 			logger.error("Context summary generation failed", { narratorId, error: String(err) });
 			if (options?.throwOnFailure) {
 				throw err;
 			}
-			return "Context summary generation failed. Starting fresh.";
+			return "";
 		}
 	},
 
@@ -314,6 +325,7 @@ export const narratorContext = {
 		summary: string;
 		contextPercent?: number;
 		contextWindowSource?: ModelContextWindowSource;
+		workState?: ContextWorkState;
 	}> {
 		if (signal?.aborted) throw new DOMException("Compact summary aborted", "AbortError");
 		const messages = projectAskUserQuestionMessagesForModel(
@@ -323,8 +335,10 @@ export const narratorContext = {
 		// Fetch narrator early — needed for contextSummary chaining
 		const narrator = await narratorService.getById(narratorId);
 
+		const workState = await captureContextWorkState(narratorId, narrator, messages);
+		if (signal?.aborted) throw new DOMException("Compact summary aborted", "AbortError");
 		if (messages.length === 0 && !narrator.contextSummary) {
-			return { summary: "No conversation history." };
+			return { summary: "No conversation history.", workState };
 		}
 
 		// ── Build per-message compact text entries ──
@@ -434,7 +448,7 @@ export const narratorContext = {
 			onRetryScheduled,
 			userId,
 		);
-		return { ...result, contextWindowSource };
+		return { ...result, contextWindowSource, workState };
 	},
 
 	async _summarizeChunkSequence(

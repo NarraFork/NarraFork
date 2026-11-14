@@ -73,6 +73,7 @@ import { sqlite } from "../db";
 import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
 import { SNAPSHOT_TABLES } from "../db/snapshot-protocol";
+import { importContextMemoryTables } from "./data-portability-memory";
 
 /** Archives without sealed provider keys; every version of this importer reads them. */
 const PLAIN_EXPORT_VERSION = 1;
@@ -779,6 +780,8 @@ const IMPORTED_TABLES = [
 	"narrator_tool_calls",
 	"narrator_blocks",
 	"narrator_text_snapshots",
+	"context_memories",
+	"context_memory_events",
 	"recent_tab_archive_marks",
 	"folder_git_identity_bindings",
 	"api_requests",
@@ -1213,6 +1216,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				});
 				copyTable(attachName, "folder_git_identity_bindings");
 				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
+				importContextMemoryTables(sqlite, attachName, excludedNarrators);
 				if (
 					counts.sessionsInserted + counts.sessionsOverwritten > 0 &&
 					tableColumns(attachName, "narrator_text_snapshots").includes("sha256")
@@ -1765,6 +1769,8 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				sqlite.run(
 					`UPDATE benchmark_task_results SET narrator_id = NULL WHERE narrator_id IS NOT NULL`,
 				);
+				// Memories belong to the session export group; deleting them cascades their audit.
+				sqlite.run(`DELETE FROM context_memories`);
 				sqlite.run(`DELETE FROM narrator_message_refs`);
 				sqlite.run(`DELETE FROM narrator_tool_calls`);
 				sqlite.run(`DELETE FROM narrator_messages`);

@@ -1,5 +1,8 @@
+import { renderPrefixPrompt } from "@shared/prefix-context";
 import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
+import { settings } from "../../lib/settings";
+import { ContextEvidenceBudget, projectKnowledgeEvidence } from "../context-evidence-budget";
 import {
 	currentCompactMessageId,
 	optionalToolDescription,
@@ -36,15 +39,23 @@ export interface PreparePrefixRequestOptions<
 		identity: RequestModelIdentity,
 		replyContext: ReplyContext,
 	) => Promise<Prompt>;
+	/** Revocable observations collected after reconciliation; never stored in an epoch. */
+	getRequestContext?: (allowance: { byteBudget: number }) => Promise<string>;
+	/** Shared with user-message injection and concurrent tool-output scans. */
+	evidenceBudget?: ContextEvidenceBudget;
 }
 
 export interface PreparedPrefixRequest<Prompt extends RequestPrefixPrompt = RequestPrefixPrompt>
 	extends RequestModelIdentity {
 	/** Exact builder result used for reconciliation, including caller-owned summary metadata. */
 	prompt?: Prompt;
+	/** Effective request prompt, including freshly checked nonpersistent observations. */
+	systemPrompt?: string;
 	reconciled?: ReconciledEpoch;
 	toolLoading?: RuntimeHistoryOptions["toolLoading"];
 	sourceMessages: SourceMessages;
+	/** Do not re-add these optional rows from a live pending-input queue. */
+	omittedOptionalMessageIds: readonly string[];
 }
 
 /**
@@ -73,16 +84,45 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 			signal,
 		});
 	};
+	const evidenceBudget =
+		options.evidenceBudget ??
+		new ContextEvidenceBudget(() => settings.agent.contextEvidenceBudgetBytes);
+	let omittedOptionalMessageIds: readonly string[] = [];
+	const projectHistory = (source: SourceMessages) => {
+		evidenceBudget.reset();
+		const projected = projectKnowledgeEvidence(source, evidenceBudget.knowledgeAllowance);
+		evidenceBudget.reset(projected.bytes);
+		omittedOptionalMessageIds = projected.omittedMessageIds;
+		return projected.messages;
+	};
+	const requestPrompt = async (base: string | undefined) => {
+		if (base === undefined || !options.getRequestContext) return base;
+		const heading = "\n\n## Request-local observations\n\n";
+		const reservation = evidenceBudget.reserve("memory", evidenceBudget.remaining);
+		try {
+			const byteBudget = reservation.byteBudget - Buffer.byteLength(heading, "utf8");
+			if (byteBudget <= 0) return base;
+			signal?.throwIfAborted();
+			const context = await options.getRequestContext({ byteBudget });
+			signal?.throwIfAborted();
+			return context && reservation.commit(heading + context) ? base + heading + context : base;
+		} finally {
+			reservation.release();
+		}
+	};
 	for (;;) {
 		signal?.throwIfAborted();
 		const capturedLoading = options.getToolLoading?.(identity);
 		if (!capturedLoading) {
 			// Compatibility for standalone callers without loading-aware prefix epochs.
-			const sourceMessages = await readHistory();
+			const sourceMessages = projectHistory(await readHistory());
 			const prompt = await options.buildPrefixPrompt?.(identity, replyContext);
 			await options.ensureRequestIdentity?.();
 			signal?.throwIfAborted();
-			return { ...identity, sourceMessages, prompt };
+			const systemPrompt = await requestPrompt(
+				prompt ? renderPrefixPrompt(prompt.contract, prompt.parts) : undefined,
+			);
+			return { ...identity, sourceMessages, prompt, systemPrompt, omittedOptionalMessageIds };
 		}
 		// Production reconciliation reads its own authoritative source under the queue.
 		// Only the older tool-only API needs a caller-supplied history view.
@@ -112,7 +152,9 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 			signal?.throwIfAborted();
 			if (reconciled.changed) sourceMessages = await readHistory();
 			else sourceMessages = reconciled.sourceMessages ?? sourceMessages ?? (await readHistory());
+			sourceMessages = projectHistory(sourceMessages);
 			await options.ensureRequestIdentity?.();
+			const systemPrompt = await requestPrompt(reconciled.systemPrompt);
 			if (
 				prompt?.compactMessageId !== undefined &&
 				prompt.compactMessageId !== (await currentCompactMessageId(narratorId))
@@ -122,9 +164,11 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 			return {
 				...identity,
 				prompt,
+				systemPrompt,
 				reconciled,
 				toolLoading: { ...capturedLoading, ...reconciled.loading, epoch: reconciled.epoch },
 				sourceMessages,
+				omittedOptionalMessageIds,
 			};
 		} catch (error) {
 			if (!(error instanceof PrefixContextChangedError)) throw error;

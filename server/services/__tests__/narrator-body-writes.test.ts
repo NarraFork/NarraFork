@@ -7,6 +7,7 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createContextWorkState } from "@shared/context-work-state";
 import { assembleContent } from "@shared/narrator-blocks/storage";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 
@@ -240,6 +241,76 @@ describe("store writes read the rows", () => {
 		expect(assembled(marker.id)).toEqual(done?.contentJson as unknown[]);
 	});
 
+	test("a compact atomically persists observed work state with its handoff summary", async () => {
+		await narratorStore.appendInput("n1", "before the compact");
+		const marker = await narratorPersistence.persistCompactingMessage("n1");
+		const workState = createContextWorkState({
+			narratorId: "n1",
+			capturedAt: NOW,
+			workspace: { cwd: null, deviceId: null, revision: null, projectId: null },
+			tasks: {
+				revision: "tasks-v1",
+				tasks: [{ text: "Keep unfinished work", status: "doing", protected: true }],
+			},
+			receipts: [],
+		});
+		const done = await narratorPersistence.finalizeCompactingMessage(
+			marker.id,
+			"n1",
+			"model prose",
+			undefined,
+			{ workState },
+		);
+		expect(done?.contentJson).toEqual([
+			expect.objectContaining({
+				status: "compacted",
+				workState,
+				summary: expect.stringContaining("Keep unfinished work"),
+			}),
+		]);
+		expect(assembled(marker.id)).toEqual(done?.contentJson as unknown[]);
+		const row = sqlite.prepare("SELECT context_summary FROM narrators WHERE id = ?").get("n1") as {
+			context_summary: string;
+		};
+		expect(row.context_summary).toContain("not authorization");
+		expect(row.context_summary).toContain("model prose");
+	});
+
+	test("invalid or cross-narrator work state cannot advance a compact marker", async () => {
+		await narratorStore.appendInput("n1", "before the compact");
+		const marker = await narratorPersistence.persistCompactingMessage("n1");
+		const before = assembled(marker.id);
+		const state = createContextWorkState({
+			narratorId: "n2",
+			capturedAt: NOW,
+			workspace: { cwd: null, deviceId: null, revision: null, projectId: null },
+			tasks: null,
+			receipts: [],
+		});
+		for (const workState of [
+			state,
+			{ ...state, version: 2 },
+			{ ...state, narratorId: "n1", permissions: "all" },
+		]) {
+			await expect(
+				narratorPersistence.finalizeCompactingMessage(marker.id, "n1", "summary", undefined, {
+					workState,
+				} as never),
+			).rejects.toThrow(/work.state/i);
+			expect(assembled(marker.id)).toEqual(before);
+		}
+	});
+
+	test("an empty successful summary never commits a compact boundary", async () => {
+		await narratorStore.appendInput("n1", "before the compact");
+		const marker = await narratorPersistence.persistCompactingMessage("n1");
+		const before = assembled(marker.id);
+		await expect(
+			narratorPersistence.finalizeCompactingMessage(marker.id, "n1", "   "),
+		).rejects.toThrow(/empty summary/i);
+		expect(assembled(marker.id)).toEqual(before);
+	});
+
 	test("a finalize whose marker moved on loses the compare-and-set", async () => {
 		await narratorStore.appendInput("n1", "before the compact");
 		const marker = await narratorPersistence.persistCompactingMessage("n1");
@@ -252,6 +323,105 @@ describe("store writes read the rows", () => {
 		expect(assembled(marker.id)).toEqual([
 			expect.objectContaining({ status: "compacted", summary: "first" }),
 		]);
+	});
+
+	test("a segment compact retains work state and rejects empty or invalid handoffs", async () => {
+		const input = await narratorStore.appendInput("n1", "hidden");
+		const { message } = await narratorPersistence.persistSegmentCompactMarker("n1", [input.id]);
+		const before = assembled(message.id);
+		await expect(narratorPersistence.finalizeSegmentCompact(message.id, "n1", " ")).rejects.toThrow(
+			/empty summary/i,
+		);
+		expect(assembled(message.id)).toEqual(before);
+		const workState = createContextWorkState({
+			narratorId: "n1",
+			capturedAt: NOW,
+			workspace: { cwd: null, deviceId: null, revision: null, projectId: null },
+			tasks: null,
+			receipts: [],
+		});
+		await expect(
+			narratorPersistence.finalizeSegmentCompact(message.id, "n1", "summary", undefined, {
+				workState: { ...workState, narratorId: "n2" },
+			}),
+		).rejects.toThrow(/work.state/i);
+		expect(assembled(message.id)).toEqual(before);
+		const done = await narratorPersistence.finalizeSegmentCompact(
+			message.id,
+			"n1",
+			"summary",
+			undefined,
+			{ workState },
+		);
+		expect(done?.contentJson).toEqual([
+			expect.objectContaining({
+				status: "compacted",
+				workState,
+				summary: expect.stringContaining("not authorization"),
+			}),
+		]);
+	});
+
+	test("a finished segment rejects late success and failure writes", async () => {
+		const input = await narratorStore.appendInput("n1", "hidden");
+		const { message } = await narratorPersistence.persistSegmentCompactMarker("n1", [input.id]);
+		expect(
+			await narratorPersistence.finalizeSegmentCompact(message.id, "n1", "first"),
+		).not.toBeNull();
+		const before = assembled(message.id);
+		expect(await narratorPersistence.finalizeSegmentCompact(message.id, "n1", "late")).toBeNull();
+		expect(
+			await narratorPersistence.finalizeSegmentCompact(message.id, "n1", "failure", undefined, {
+				status: "failed",
+			}),
+		).toBeNull();
+		expect(assembled(message.id)).toEqual(before);
+		expect(
+			sqlite
+				.query(
+					"SELECT segment_compact_id AS marker FROM narrator_message_refs WHERE narrator_id = 'n1' AND message_id = ?",
+				)
+				.get(input.id),
+		).toEqual({ marker: message.id });
+	});
+
+	test("a segment without its owning ref or full hidden set cannot finalize", async () => {
+		const input = await narratorStore.appendInput("n1", "hidden");
+		const { message } = await narratorPersistence.persistSegmentCompactMarker("n1", [input.id]);
+		const before = assembled(message.id);
+		sqlite.run("UPDATE narrator_message_refs SET segment_compact_id = NULL WHERE message_id = ?", [
+			input.id,
+		]);
+		expect(await narratorPersistence.finalizeSegmentCompact(message.id, "n1", "stale")).toBeNull();
+		sqlite.run("DELETE FROM narrator_message_refs WHERE narrator_id = 'n1' AND message_id = ?", [
+			message.id,
+		]);
+		expect(await narratorPersistence.finalizeSegmentCompact(message.id, "n1", "orphan")).toBeNull();
+		expect(assembled(message.id)).toEqual(before);
+	});
+
+	test("a shared segment finalizes copy-on-write and retains the sibling's hidden set", async () => {
+		const input = await narratorStore.appendInput("n1", "hidden");
+		const { message } = await narratorPersistence.persistSegmentCompactMarker("n1", [input.id]);
+		const before = assembled(message.id);
+		sqlite.run(
+			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, segment_compact_id) SELECT 'sibling-' || id, 'n2', message_id, seq, is_compact, segment_compact_id FROM narrator_message_refs WHERE narrator_id = 'n1'",
+		);
+		const done = await narratorPersistence.finalizeSegmentCompact(message.id, "n1", "first");
+		expect(done).not.toBeNull();
+		expect(done?.id).not.toBe(message.id);
+		expect(assembled(message.id)).toEqual(before);
+		expect(
+			sqlite
+				.query(
+					"SELECT narrator_id AS narrator, segment_compact_id AS marker FROM narrator_message_refs WHERE message_id = ? ORDER BY narrator_id",
+				)
+				.all(input.id),
+		).toEqual([
+			{ narrator: "n1", marker: done?.id },
+			{ narrator: "n2", marker: message.id },
+		]);
+		expect(await narratorPersistence.finalizeSegmentCompact(message.id, "n1", "stale")).toBeNull();
 	});
 
 	test("a segment compact's summary is rewritten from the rows", async () => {

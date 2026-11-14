@@ -102,15 +102,7 @@ export function planTurnInterruption(
 	};
 }
 
-/**
- * How many consecutive no-progress self-continuations are allowed before the loop
- * stops nudging itself.
- *
- * "No progress" is deliberately narrow (see {@link computeContinuationStallState}):
- * a pass that ran a tool resets the count, so this bound only bites on a model that
- * answers the reminder with prose, or that keeps attempting the same rejected
- * protected-task mutation.
- */
+/** Maximum unchanged automatic-continuation observations before stopping. */
 export const MAX_CONTINUATION_STALL_TURNS = 3;
 
 export interface ContinuationStallState {
@@ -120,45 +112,36 @@ export interface ContinuationStallState {
 }
 
 /**
- * Classify whether a finished continuation pass made progress, and whether further
- * self-continuation must stop.
+ * A pure bound shared by primary and delegated continuation. Prose-only passes and
+ * repeated reflection denials retain their existing limits. Complete tool receipts
+ * establish an evidence baseline; identical later observations are not new progress
+ * merely because the provider minted fresh tool-use ids. Missing or oversized
+ * evidence is unknown and preserves the legacy tool-progress behavior.
  *
- * ## Why this is the ONLY bound on spec/max-turns continuation
- *
- * Each continuation pass gets a fresh turn budget, so nothing about turn counts can
- * bound a loop that re-continues after exhausting one. What bounds it is progress:
- * either the model called a tool (real work happened, so continuing is justified) or
- * it did not (the reminder produced nothing, so repeating it will keep producing
- * nothing). A repeated identical `taskReflection` denial is the same story with a
- * different signature: the model keeps trying one rejected protected-task mutation.
- *
- * ## Purity is load-bearing
- *
- * The function reads nothing but its arguments — in particular NOT the caller's state
- * container. The primary loop stores the counters on its `ActiveNarrator`; a subagent
- * has no such object and keeps them in run-local variables, which is a tighter scope
- * (its run IS the bound's natural lifetime) and works only because the rule itself
- * holds no state. Both audiences therefore share one bound rather than each inventing
- * one.
- *
- * `previous` is the caller's last returned state. A different key restarts the count,
- * which is what makes "a new kind of stall" distinguishable from "the same stall
- * again".
+ * Only granted continuation passes are judged. Fresh human input resets the state;
+ * this function neither changes task status nor authorizes tool replay.
  */
 export function computeContinuationStallState(
 	kind: "task" | "blocked",
-	result: Pick<ExecuteLoopResult, "hadToolUses" | "taskReflectionDenialFingerprint">,
+	result: Pick<
+		ExecuteLoopResult,
+		"hadToolUses" | "taskReflectionDenialFingerprint" | "toolProgressFingerprint"
+	>,
 	previous: Pick<ContinuationStallState, "count" | "key">,
 ): ContinuationStallState {
 	const denialFingerprint = result.taskReflectionDenialFingerprint?.trim();
 	const stallKey = denialFingerprint
 		? `task-reflection:${denialFingerprint}`
 		: result.hadToolUses
-			? undefined
+			? result.toolProgressFingerprint
+				? `tool-evidence:${result.toolProgressFingerprint}`
+				: undefined
 			: `no-tools:${kind}`;
 	if (!stallKey) return { count: 0, key: undefined, suppressed: false };
 
-	const count = previous.key === stallKey ? previous.count + 1 : 1;
+	// The first complete observation is a baseline, not a stalled attempt.
+	const count =
+		previous.key === stallKey ? previous.count + 1 : stallKey.startsWith("tool-evidence:") ? 0 : 1;
 	const limit = kind === "blocked" ? 1 : MAX_CONTINUATION_STALL_TURNS;
 	return { count, key: stallKey, suppressed: count >= limit };
 }
@@ -260,7 +243,10 @@ export function planSpecContinuation(input: {
 	protectedOpenCount: number;
 	previous: SpecContinuationState;
 	/** Omit when the ordinary loop already classified this pass into previous.stall. */
-	result?: Pick<ExecuteLoopResult, "hadToolUses" | "taskReflectionDenialFingerprint">;
+	result?: Pick<
+		ExecuteLoopResult,
+		"hadToolUses" | "taskReflectionDenialFingerprint" | "toolProgressFingerprint"
+	>;
 	/** Policy ceiling; omitted/null preserves ordinary unlimited progress continuation. */
 	maxPasses?: number | null;
 	/** An explicit /goal starts once even when automatic continuation is off. */

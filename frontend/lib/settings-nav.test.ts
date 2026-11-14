@@ -25,6 +25,7 @@ function flatten(groups: ReturnType<typeof getSettingsNavGroups>): SettingsNavIt
  */
 const EXPECTED_PERSONAL = [
 	"/settings/profile",
+	"/settings/memories",
 	"/settings/security",
 	"/settings/integrations",
 	"/settings/connected-apps",

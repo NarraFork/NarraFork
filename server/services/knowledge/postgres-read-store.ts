@@ -805,6 +805,51 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 			return rows as AclEventReadRow[];
 		},
 
+		async getInjectionEvidence(opts) {
+			const ids = [...new Set(opts.ids)].slice(0, 100);
+			if (ids.length === 0) return [];
+			if (opts.scope === "personal") {
+				if (!opts.userId) return [];
+				return db
+					.select({
+						id: knowledgeDrafts.id,
+						collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`,
+						title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`,
+						currentRevisionId: sql<null>`null`,
+						tagsJson: sql<null>`null`,
+						keywordsJson: knowledgeDrafts.keywordsJson,
+						updatedAt: knowledgeDrafts.updatedAt,
+						snippet: sql<string>`substr(${knowledgeDrafts.content}, 1, 1536)`,
+					})
+					.from(knowledgeDrafts)
+					.where(
+						and(
+							personalInjectionWhere({ ...opts, userId: opts.userId }),
+							inArray(knowledgeDrafts.id, ids),
+						),
+					);
+			}
+			return db
+				.select({
+					id: knowledgeEntries.id,
+					collectionId: knowledgeEntries.collectionId,
+					title: knowledgeEntries.title,
+					currentRevisionId: knowledgeEntries.currentRevisionId,
+					tagsJson: knowledgeEntries.tagsJson,
+					keywordsJson: knowledgeEntries.keywordsJson,
+					updatedAt: knowledgeEntries.updatedAt,
+					snippet: sql<string>`substr(coalesce(${knowledgeEntries.currentContent}, ${knowledgeEntries.title}), 1, 1536)`,
+				})
+				.from(knowledgeEntries)
+				.where(
+					and(
+						inArray(knowledgeEntries.id, ids),
+						eq(knowledgeEntries.status, "active"),
+						opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+						projectScopeClause(opts.projectId),
+					),
+				);
+		},
 		async listPersonalKeywordInjectionCandidates(opts) {
 			return db
 				.select({

@@ -3,17 +3,31 @@ import { formatKnowledgeInjections as formatInjectionsBare } from "@shared/sidec
 
 export { formatInjectionsBare };
 
+import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
-import { knowledgeReadStore } from "./knowledge/store";
+import {
+	isCurrentFullTextEvidence,
+	rankKnowledgeCandidates,
+	retrieveFullTextEvidence,
+} from "./knowledge/hybrid-retrieval";
+import {
+	MAX_KNOWLEDGE_EVIDENCE_CANDIDATES,
+	readKnowledgeEvidence,
+	sameKnowledgeEvidence,
+} from "./knowledge/injection-evidence";
+import {
+	type CompiledMatcher,
+	candidateKey,
+	compileMatcher,
+	getCompiledMatcher,
+	matchWithCompiledMatcher,
+	normalizeForKeywordMatch,
+} from "./knowledge/keyword-index";
 import { knowledgeAcl } from "./knowledge-acl";
-import { knowledgeInjectionReads, knowledgeService } from "./knowledge-service";
+import { knowledgeService } from "./knowledge-service";
 
 export function injectionKey(hit: { scope?: "personal" | "global"; entryId: string }): string {
 	return `${hit.scope ?? "global"}:${hit.entryId}`;
-}
-
-function candidateKey(candidate: KeywordCandidate): string {
-	return injectionKey({ scope: candidate.scope, entryId: candidate.id });
 }
 
 export interface InjectionHit {
@@ -39,9 +53,21 @@ export interface ToolOutputKnowledgeScanResult {
 /** De-dup set of entry ids already injected this turn (caller owns the set). */
 export type InjectedSet = Set<string>;
 
+export interface KnowledgeInjectionOptions {
+	collectionId?: string;
+	projectId?: string;
+	already?: InjectedSet;
+	signal?: AbortSignal;
+	/** Budget of the complete JSON hit list, including ids, titles and revision references. */
+	byteBudget?: number;
+}
+
+export const MAX_KNOWLEDGE_EVIDENCE_BYTES = 8 * 1024;
+const MAX_INJECTION_ENTRIES = 16;
+const MAX_INJECTION_INPUT_CHARS = 64 * 1024;
+const INJECTION_DEADLINE_MS = 1_000;
+
 const MAX_SUMMARY_CHARS = KNOWLEDGE_EXCERPT_MAX_CHARS;
-const CJK_RE = /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/;
-const WORD_RE = /[\p{L}\p{N}_]/u;
 
 /**
  * One-line excerpt of an entry body, for the hit's `summary`.
@@ -60,220 +86,13 @@ function summarize(text: string, title?: string): string {
 	return knowledgeExcerpt(text, { title, maxChars: MAX_SUMMARY_CHARS });
 }
 
-type KeywordCandidate = Awaited<
-	ReturnType<typeof knowledgeInjectionReads.listKeywordInjectionCandidates>
->[number];
-
-interface KeywordNeedle {
-	keyword: string;
-	entries: KeywordCandidate[];
-	needsBoundary: boolean;
-}
-
-interface TrieNode {
-	next: Map<string, number>;
-	fail: number;
-	out: number[];
-}
-
-function normalizeForKeywordMatch(text: string): string {
-	return text.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
-}
-
-function isNonCjkWordChar(ch: string | undefined): boolean {
-	return !!ch && WORD_RE.test(ch) && !CJK_RE.test(ch);
-}
-
-function hasKeywordBoundary(
-	text: string,
-	start: number,
-	length: number,
-	needsBoundary: boolean,
-): boolean {
-	if (!needsBoundary) return true;
-	return !isNonCjkWordChar(text[start - 1]) && !isNonCjkWordChar(text[start + length]);
-}
-
-function buildMatcher(candidates: KeywordCandidate[]): {
-	nodes: TrieNode[];
-	needles: KeywordNeedle[];
-} {
-	const nodes: TrieNode[] = [{ next: new Map(), fail: 0, out: [] }];
-	const needles: KeywordNeedle[] = [];
-	const needleByKeyword = new Map<string, number>();
-	const entryIdsByKeyword = new Map<string, Set<string>>();
-
-	for (const entry of candidates) {
-		for (const rawKeyword of entry.keywords) {
-			const keyword = normalizeForKeywordMatch(rawKeyword);
-			if (!keyword) continue;
-			let needleIndex = needleByKeyword.get(keyword);
-			if (needleIndex === undefined) {
-				needleIndex = needles.length;
-				needleByKeyword.set(keyword, needleIndex);
-				entryIdsByKeyword.set(keyword, new Set());
-				needles.push({ keyword, entries: [], needsBoundary: !CJK_RE.test(keyword) });
-
-				let nodeIndex = 0;
-				for (const ch of keyword) {
-					let nextIndex = nodes[nodeIndex].next.get(ch);
-					if (nextIndex === undefined) {
-						nextIndex = nodes.length;
-						nodes[nodeIndex].next.set(ch, nextIndex);
-						nodes.push({ next: new Map(), fail: 0, out: [] });
-					}
-					nodeIndex = nextIndex;
-				}
-				nodes[nodeIndex].out.push(needleIndex);
-			}
-
-			const entryIds = entryIdsByKeyword.get(keyword);
-			if (entryIds && !entryIds.has(candidateKey(entry))) {
-				entryIds.add(candidateKey(entry));
-				needles[needleIndex].entries.push(entry);
-			}
-		}
-	}
-
-	const queue: number[] = [];
-	for (const child of nodes[0].next.values()) queue.push(child);
-	for (let head = 0; head < queue.length; head++) {
-		const nodeIndex = queue[head];
-		for (const [ch, childIndex] of nodes[nodeIndex].next) {
-			let fail = nodes[nodeIndex].fail;
-			while (fail !== 0 && !nodes[fail].next.has(ch)) fail = nodes[fail].fail;
-			nodes[childIndex].fail = nodes[fail].next.get(ch) ?? 0;
-			nodes[childIndex].out.push(...nodes[nodes[childIndex].fail].out);
-			queue.push(childIndex);
-		}
-	}
-
-	return { nodes, needles };
-}
-
-interface CompiledMatcher {
-	nodes: TrieNode[];
-	needles: KeywordNeedle[];
-	/** Stable candidate order for deterministic tie-breaking in match results. */
-	candidateOrder: Map<string, number>;
-}
-
-function compileMatcher(candidates: KeywordCandidate[]): CompiledMatcher {
-	const { nodes, needles } = buildMatcher(candidates);
-	const candidateOrder = new Map(
-		candidates.map((candidate, index) => [candidateKey(candidate), index]),
-	);
-	return { nodes, needles, candidateOrder };
-}
-
-/**
- * Per-scope compiled-matcher cache. Building the Aho-Corasick trie means reading up
- * to 5000 rows + JSON-parsing every keyword list, which is wasteful to redo on every
- * user message and tool output. We key by scope and guard with the candidate-set
- * signature so a cached matcher is reused until the underlying entries change.
- */
-interface MatcherCacheEntry {
-	store: typeof knowledgeReadStore;
-	signature: string;
-	matcher: CompiledMatcher;
-}
-const matcherCache = new Map<string, MatcherCacheEntry>();
-const MATCHER_CACHE_MAX_SCOPES = 64;
-
-function matcherCacheKey(opts: {
-	collectionId?: string;
-	projectId?: string;
-	userId?: string | null;
-}): string {
-	return JSON.stringify([opts.collectionId ?? "", opts.projectId ?? "", opts.userId ?? ""]);
-}
-
-async function getCompiledMatcher(opts: {
-	userId?: string | null;
-	collectionId?: string;
-	projectId?: string;
-}): Promise<CompiledMatcher> {
-	const key = matcherCacheKey(opts);
-	const store = knowledgeReadStore;
-	const signature = await knowledgeInjectionReads.keywordInjectionCandidatesSignature(opts);
-	const cached = matcherCache.get(key);
-	if (cached?.store === store && cached.signature === signature) return cached.matcher;
-
-	const candidates = await knowledgeInjectionReads.listKeywordInjectionCandidates(opts);
-	const matcher = compileMatcher(candidates);
-	// Simple size guard: evict the oldest scope when the cache grows too large. Scopes
-	// are (collection, project) tuples, so 64 covers realistic deployments comfortably.
-	if (!matcherCache.has(key) && matcherCache.size >= MATCHER_CACHE_MAX_SCOPES) {
-		const oldest = matcherCache.keys().next().value;
-		if (oldest !== undefined) matcherCache.delete(oldest);
-	}
-	matcherCache.set(key, { store, signature, matcher });
-	return matcher;
-}
-
-function matchWithCompiledMatcher(
-	normalizedText: string,
-	matcher: CompiledMatcher,
-): KeywordCandidate[] {
-	const { nodes, needles, candidateOrder } = matcher;
-	if (!normalizedText || needles.length === 0) return [];
-
-	const hits = new Map<
-		string,
-		{ candidate: KeywordCandidate; firstIndex: number; keywordLength: number }
-	>();
-	let nodeIndex = 0;
-	let index = 0;
-	for (const ch of normalizedText) {
-		while (nodeIndex !== 0 && !nodes[nodeIndex].next.has(ch)) nodeIndex = nodes[nodeIndex].fail;
-		nodeIndex = nodes[nodeIndex].next.get(ch) ?? 0;
-		for (const needleIndex of nodes[nodeIndex].out) {
-			const needle = needles[needleIndex];
-			const start = index - needle.keyword.length + 1;
-			if (start < 0) continue;
-			if (!hasKeywordBoundary(normalizedText, start, needle.keyword.length, needle.needsBoundary)) {
-				continue;
-			}
-			for (const candidate of needle.entries) {
-				const existing = hits.get(candidateKey(candidate));
-				if (
-					!existing ||
-					start < existing.firstIndex ||
-					(start === existing.firstIndex && needle.keyword.length > existing.keywordLength)
-				) {
-					hits.set(candidateKey(candidate), {
-						candidate,
-						firstIndex: start,
-						keywordLength: needle.keyword.length,
-					});
-				}
-			}
-		}
-		index += ch.length;
-	}
-
-	return [...hits.values()]
-		.sort(
-			(a, b) =>
-				a.firstIndex - b.firstIndex ||
-				b.keywordLength - a.keywordLength ||
-				(candidateOrder.get(candidateKey(a.candidate)) ?? 0) -
-					(candidateOrder.get(candidateKey(b.candidate)) ?? 0),
-		)
-		.map((hit) => hit.candidate);
-}
-
 /**
  * Resolve knowledge entries relevant to `text` that the given user may read.
  *
- * Matching is KEYWORD-ONLY and treats knowledge keywords as a dictionary: normalize the
- * input text, scan it once for all declared keywords in the current scope, then ACL-filter
- * the matched entries. This is intentionally NOT an FTS query: passive injection needs
- * "input contains keyword" semantics, while FTS answers the opposite direction
- * ("indexed document contains query").
- *
- * Entries with no keywords are never auto-injected (they remain findable via KnowledgeSearch).
- * ACL is applied (dual-axis) — unreadable entries never surface.
+ * The default dictionary mode preserves "input contains keyword" semantics. Opt-in hybrid
+ * mode adds bounded full-text candidates, ranking declared keywords before title/body hits.
+ * Neither channel is evidence by itself: current content, revision, scope and live ACL
+ * are checked again before any excerpt leaves this service.
  *   - userId: the user who triggered this loop turn (null → anonymous, public only)
  *   - projectId: restrict to this project's collections + global ones (cross-project isolation)
  *   - returns at most settings.knowledge.maxInjectedEntries hits, excluding `already`
@@ -281,66 +100,147 @@ function matchWithCompiledMatcher(
 export async function resolveInjections(
 	userId: string | null | undefined,
 	text: string,
-	opts: { collectionId?: string; projectId?: string; already?: InjectedSet } = {},
+	opts: KnowledgeInjectionOptions = {},
 ): Promise<InjectionHit[]> {
+	const { signal } = opts;
+	signal?.throwIfAborted();
 	const cfg = settings.knowledge;
-	if (cfg.injectMode === "off") return [];
-	const normalizedText = normalizeForKeywordMatch(text ?? "");
+	const requested = opts.byteBudget ?? MAX_KNOWLEDGE_EVIDENCE_BYTES;
+	const byteBudget = Number.isFinite(requested)
+		? Math.min(MAX_KNOWLEDGE_EVIDENCE_BYTES, Math.max(0, Math.floor(requested)))
+		: 0;
+	const maxEntries = Number.isFinite(cfg.maxInjectedEntries)
+		? Math.min(MAX_INJECTION_ENTRIES, Math.max(0, Math.floor(cfg.maxInjectedEntries)))
+		: 0;
+	if (cfg.injectMode === "off" || byteBudget === 0 || maxEntries === 0) return [];
+	const normalizedText = normalizeForKeywordMatch((text ?? "").slice(0, MAX_INJECTION_INPUT_CHARS));
 	if (!normalizedText || normalizedText.length < cfg.minKeywordLen) return [];
+	const started = Date.now();
+	const withinBudget = () => {
+		signal?.throwIfAborted();
+		if (Date.now() - started <= INJECTION_DEADLINE_MS) return true;
+		logger.warn("Knowledge evidence deadline exceeded; omitting hints", {
+			durationMs: Date.now() - started,
+		});
+		return false;
+	};
 
-	let matcher: CompiledMatcher;
+	let matcher: CompiledMatcher | undefined;
 	try {
 		matcher = await getCompiledMatcher({
+			signal,
 			userId,
 			collectionId: opts.collectionId,
 			projectId: opts.projectId,
 		});
 	} catch {
-		return [];
+		signal?.throwIfAborted();
 	}
-	const matched = matchWithCompiledMatcher(normalizedText, matcher);
+	if (!withinBudget()) return [];
+	const keywordMatches = matcher ? matchWithCompiledMatcher(normalizedText, matcher) : [];
+	const fullText =
+		cfg.retrievalMode === "hybrid"
+			? await retrieveFullTextEvidence(normalizedText, { ...opts, userId })
+			: [];
+	if (!withinBudget()) return [];
+	const fullTextByKey = new Map(fullText.map((row) => [candidateKey(row), row]));
+	const ranked =
+		cfg.retrievalMode === "hybrid"
+			? rankKnowledgeCandidates(normalizedText, keywordMatches, fullText)
+			: keywordMatches;
+	const matched = ranked
+		.filter((row) => !opts.already?.has(candidateKey(row)))
+		.slice(0, MAX_KNOWLEDGE_EVIDENCE_CANDIDATES);
 	if (matched.length === 0) return [];
 
 	const caps = await knowledgeAcl.resolveCapsByUserId(userId);
+	if (!withinBudget()) return [];
 	const principal = { userId: caps.userId, role: caps.role };
-	// Reuse the caps we just resolved so filterReadable doesn't re-query grants.
 	const readableGlobal = await knowledgeService.filterReadable(
 		principal,
-		matched.filter((r) => r.scope !== "personal"),
+		matched.filter((row) => row.scope === "global"),
 		{ caps },
 	);
-	const readableGlobalIds = new Set(readableGlobal.map((r) => r.id));
-	const readable = matched.filter((r) => r.scope === "personal" || readableGlobalIds.has(r.id));
-
-	const selected: typeof readable = [];
-	for (const r of readable) {
-		if (opts.already?.has(candidateKey(r))) continue;
-		selected.push(r);
-		if (selected.length >= cfg.maxInjectedEntries) break;
-	}
+	if (!withinBudget()) return [];
+	const readableIds = new Set(readableGlobal.map(candidateKey));
+	const selected = matched
+		.filter((row) => row.scope === "personal" || readableIds.has(candidateKey(row)))
+		.slice(0, maxEntries);
 	if (selected.length === 0) return [];
 
-	const snippets = await knowledgeInjectionReads.snippetsByEntryIds(
-		selected.filter((r) => r.scope !== "personal").map((r) => r.id),
+	// A cached keyword hit is only a candidate, never evidence or an authorization decision.
+	const evidenceOptions = {
+		userId,
+		collectionId: opts.collectionId,
+		projectId: opts.projectId,
+		signal,
+	};
+	const evidence = await readKnowledgeEvidence(selected, evidenceOptions);
+	if (!withinBudget()) return [];
+	const byKey = new Map(evidence.map((row) => [candidateKey(row), row]));
+	const current = selected.flatMap((row) => {
+		const value = byKey.get(candidateKey(row));
+		return value ? [value] : [];
+	});
+	let currentKeywordMatches: ReturnType<typeof matchWithCompiledMatcher>;
+	try {
+		currentKeywordMatches = matchWithCompiledMatcher(normalizedText, compileMatcher(current));
+	} catch {
+		logger.warn("Knowledge evidence keyword budget exceeded; omitting hints");
+		return [];
+	}
+	const currentFullText = current.filter((row) => {
+		const hit = fullTextByKey.get(candidateKey(row));
+		return hit && isCurrentFullTextEvidence(hit, row);
+	});
+	const stillMatched =
+		cfg.retrievalMode === "hybrid"
+			? rankKnowledgeCandidates(normalizedText, currentKeywordMatches, currentFullText)
+			: currentKeywordMatches;
+	if (stillMatched.length === 0) return [];
+
+	// Archive/delete/move or edits during collection invalidate the selected snapshot.
+	const verified = await readKnowledgeEvidence(stillMatched, evidenceOptions);
+	if (!withinBudget()) return [];
+	const verifiedByKey = new Map(verified.map((row) => [candidateKey(row), row]));
+	const stable = stillMatched.filter((row) => {
+		const snapshot = byKey.get(candidateKey(row));
+		const latest = verifiedByKey.get(candidateKey(row));
+		return snapshot && latest && sameKnowledgeEvidence(snapshot, latest);
+	});
+	if (stable.length === 0) return [];
+	// Resolve live identity and grants AFTER the last content read; do not reuse earlier caps.
+	const finalCaps = await knowledgeAcl.resolveCapsByUserId(userId);
+	const authorized = await knowledgeService.filterReadable(
+		{ userId: finalCaps.userId, role: finalCaps.role },
+		stable.filter((row) => row.scope === "global"),
+		{ caps: finalCaps },
 	);
-	const personalSnippets = userId
-		? await knowledgeInjectionReads.personalSnippetsByEntryIds(
-				userId,
-				selected.filter((r) => r.scope === "personal").map((r) => r.id),
-			)
-		: new Map<string, string>();
-	return selected
-		.filter((r) => r.scope !== "personal" || personalSnippets.has(r.id))
-		.map((r) => ({
-			scope: r.scope,
-			entryId: r.id,
-			entryRevisionId: r.entryRevisionId,
-			title: r.title,
-			summary: summarize(
-				(r.scope === "personal" ? personalSnippets : snippets).get(r.id) ?? "",
-				r.title,
-			),
-		}));
+	if (!withinBudget()) return [];
+	const authorizedIds = new Set(authorized.map(candidateKey));
+	const allowed = stable.filter(
+		(row) => row.scope === "personal" || authorizedIds.has(candidateKey(row)),
+	);
+	const hits: InjectionHit[] = [];
+	for (const row of allowed) {
+		const snapshot = byKey.get(candidateKey(row));
+		const latest = verifiedByKey.get(candidateKey(row));
+		if (!snapshot || !latest || !sameKnowledgeEvidence(snapshot, latest)) continue;
+		const searched = fullTextByKey.get(candidateKey(snapshot));
+		const snippet =
+			searched && isCurrentFullTextEvidence(searched, snapshot)
+				? searched.snippet
+				: snapshot.snippet;
+		const hit: InjectionHit = {
+			scope: snapshot.scope,
+			entryId: snapshot.id,
+			entryRevisionId: snapshot.entryRevisionId,
+			title: snapshot.title,
+			summary: summarize(snippet, snapshot.title),
+		};
+		if (Buffer.byteLength(JSON.stringify([...hits, hit]), "utf8") <= byteBudget) hits.push(hit);
+	}
+	return withinBudget() ? hits : [];
 }
 
 /** Render injection hits as a system-reminder style block (or null if none). */
@@ -365,8 +265,9 @@ export async function scanToolOutputForKnowledgeDetailed(
 	userId: string | null | undefined,
 	output: string,
 	already: InjectedSet,
-	opts: { collectionId?: string; projectId?: string } = {},
+	opts: Omit<KnowledgeInjectionOptions, "already"> = {},
 ): Promise<ToolOutputKnowledgeScanResult | null> {
+	opts.signal?.throwIfAborted();
 	const cfg = settings.knowledge;
 	if (cfg.injectMode === "off" || !cfg.scanToolOutput) return null;
 	if (!output) return null;
@@ -390,7 +291,7 @@ export async function scanToolOutputForKnowledge(
 	userId: string | null | undefined,
 	output: string,
 	already: InjectedSet,
-	opts: { collectionId?: string; projectId?: string } = {},
+	opts: Omit<KnowledgeInjectionOptions, "already"> = {},
 ): Promise<string | null> {
 	const result = await scanToolOutputForKnowledgeDetailed(userId, output, already, opts);
 	return result?.content ?? null;

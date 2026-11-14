@@ -5003,6 +5003,73 @@ export const fileChangeRollups = sqliteTable(
 	],
 );
 
+// Private, explicitly confirmed long-term observations; never execution authority.
+export const contextMemories = sqliteTable(
+	"context_memories",
+	{
+		id: text("id").primaryKey(),
+		ownerUserId: text("owner_user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		scope: text("scope", { enum: ["user", "project", "session"] }).notNull(),
+		scopeKey: text("scope_key").notNull(),
+		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
+		key: text("key").notNull(),
+		content: text("content").notNull(),
+		contentHash: text("content_hash").notNull(),
+		status: text("status", { enum: ["candidate", "confirmed", "rejected", "archived"] })
+			.notNull()
+			.default("candidate"),
+		version: integer("version").notNull().default(1),
+		// Keep provenance ids after source deletion so recall fails closed, not source-free.
+		sourceNarratorId: text("source_narrator_id"),
+		sourceMessageId: text("source_message_id"),
+		createdByKind: text("created_by_kind", { enum: ["user", "agent"] }).notNull(),
+		confirmedAt: text("confirmed_at"),
+		expiresAt: text("expires_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_context_memory_key").on(table.ownerUserId, table.scopeKey, table.key),
+		index("idx_context_memory_recall").on(
+			table.ownerUserId,
+			table.scopeKey,
+			table.status,
+			table.id,
+		),
+		index("idx_context_memory_project").on(table.projectId),
+		index("idx_context_memory_narrator").on(table.narratorId),
+		check(
+			"context_memory_scope",
+			sql`(${table.scope} = 'user' and ${table.scopeKey} = 'user' and ${table.projectId} is null and ${table.narratorId} is null) or (${table.scope} = 'project' and ${table.projectId} is not null and ${table.scopeKey} = 'project:' || ${table.projectId} and ${table.narratorId} is null) or (${table.scope} = 'session' and ${table.narratorId} is not null and ${table.scopeKey} = 'session:' || ${table.narratorId} and ${table.projectId} is null)`,
+		),
+		check("context_memory_version", sql`${table.version} >= 1`),
+	],
+);
+
+// Audit stores hashes, not a second secret-bearing copy of the memory body.
+export const contextMemoryEvents = sqliteTable(
+	"context_memory_events",
+	{
+		id: text("id").primaryKey(),
+		memoryId: text("memory_id")
+			.notNull()
+			.references(() => contextMemories.id, { onDelete: "cascade" }),
+		version: integer("version").notNull(),
+		action: text("action", {
+			enum: ["propose", "revise", "confirm", "reject", "archive"],
+		}).notNull(),
+		actorUserId: text("actor_user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		actorKind: text("actor_kind", { enum: ["user", "agent"] }).notNull(),
+		contentHash: text("content_hash").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_context_memory_event_version").on(table.memoryId, table.version)],
+);
 // === knowledge_collections ===
 // Knowledge base namespace/grouping. Project-scoped (projectId set) or global (null).
 export const knowledgeCollections = sqliteTable(

@@ -535,6 +535,7 @@ export function createSqliteSearchStore(
 		id: string;
 		collection_id: string | null;
 		personal_entry_id?: string | null;
+		current_revision_id?: string | null;
 		title: string;
 		slug: string;
 		tags_json: string | null;
@@ -550,6 +551,7 @@ export function createSqliteSearchStore(
 			id: row.id,
 			collectionId: row.collection_id,
 			...(row.personal_entry_id ? { personalEntryId: row.personal_entry_id } : {}),
+			...(!fromDraft ? { entryRevisionId: row.current_revision_id ?? null } : {}),
 			title: row.title,
 			slug: row.slug,
 			tagsJson: row.tags_json,
@@ -1187,7 +1189,7 @@ export function createSqliteSearchStore(
 				if (query.projectId) params.push(query.projectId);
 				params.push(...exclude.params, query.limit);
 				const rows = (await execute(
-					`SELECT ${KNOWLEDGE_ENTRY_COLUMNS},
+					`SELECT ${KNOWLEDGE_ENTRY_COLUMNS}, e.current_revision_id,
 				  ${snippetCall("knowledge_entries_fts", 1, KNOWLEDGE_SNIPPET)} as snippet
 				 FROM knowledge_entries_fts
 				 JOIN knowledge_entries e ON e.rowid = knowledge_entries_fts.rowid
@@ -1216,7 +1218,7 @@ export function createSqliteSearchStore(
 			if (query.projectId) params.push(query.projectId);
 			params.push(...exclude.params, query.limit);
 			const rows = (await execute(
-				`SELECT ${KNOWLEDGE_ENTRY_COLUMNS},
+				`SELECT ${KNOWLEDGE_ENTRY_COLUMNS}, e.current_revision_id,
 			  substr(COALESCE(e.current_content, e.title), 1, ${PREVIEW_CHARS}) as snippet
 			 FROM knowledge_entries e
 			 WHERE (? = '' OR ${matchExpr})

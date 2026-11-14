@@ -3,6 +3,7 @@ import { chatApi } from "./chat";
 import { apiBase } from "./client";
 import { commandCodeApi } from "./commandcode";
 import { containersApi } from "./containers";
+import { contextMemoryApi } from "./context-memory";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { grammarsApi } from "./grammars";
@@ -55,6 +56,7 @@ export const api = {
 	...authApi,
 	...projectsApi,
 	...containersApi,
+	...contextMemoryApi,
 	...chatApi,
 	...narratorsApi,
 	...notificationsApi,

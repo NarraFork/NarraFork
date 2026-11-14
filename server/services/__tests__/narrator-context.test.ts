@@ -12,9 +12,12 @@ import * as taskSource from "../task-source";
 
 const { narratorContext } = await import("../narrator-context");
 
-/** Compact reads only `compactContext` from the narrator's task source. */
+/** Supply both live-task reads used by compact and its structured handoff. */
 function compactOnlyTaskSource(compactContext: () => Promise<string | null>): NarratorTaskSource {
-	return { compactContext } as unknown as NarratorTaskSource;
+	return {
+		compactContext,
+		openTasks: async () => ({ revision: null, tasks: [] }),
+	} as unknown as NarratorTaskSource;
 }
 
 const originalSummarizeChunk = narratorContext._summarizeChunk.bind(narratorContext);
@@ -316,6 +319,114 @@ describe("question inputs in actual summary provider requests", () => {
 		});
 	}
 
+	for (const kind of ["compact", "fork"] as const) {
+		test(`${kind} carries host-observed work state independently of model prose`, async () => {
+			getNarrator.mockResolvedValue({
+				id: "n-question-summary",
+				contextSummary: "",
+				cwd: "E:/old",
+				defaultDeviceId: "local",
+				workspaceRevision: 7,
+				contextProjectId: "p-authorized",
+				workspaceContext: { cwd: "/remote/repo", deviceId: "remote-1", revision: 7 },
+			} as never);
+			const tasks = {
+				revision: "tasks-revision",
+				tasks: [{ text: "WAIT_FOR_USER_APPROVAL", status: "blocked", protected: true }],
+			};
+			spec.mockResolvedValue({
+				compactContext: async () => "",
+				openTasks: async () => tasks,
+			} as unknown as NarratorTaskSource);
+			const rows = [
+				{
+					id: "running-message",
+					role: "assistant" as const,
+					contentText: "Running a tool",
+					toolCalls: [
+						{
+							toolUseId: "receipt-id",
+							toolName: "Bash",
+							status: "running",
+							inputJson: { token: "SECRET_INPUT" },
+							outputJson: { secret: "SECRET_OUTPUT" },
+						},
+					],
+				},
+			];
+			history.mockResolvedValue(rows as never);
+			let snapshot: unknown;
+			if (kind === "compact") {
+				const result = await narratorContext.generateCompactSummary(
+					"n-question-summary",
+					"en",
+					rows,
+				);
+				snapshot = result.workState;
+			} else {
+				const summary = await narratorContext.generateContextSummary("n-question-summary", "en", {
+					throwOnFailure: true,
+				});
+				expect(summary).toContain("not authorization");
+				snapshot = JSON.parse(
+					summary.match(/<work_state>\s*([\s\S]*?)\s*<\/work_state>/)?.[1] ?? "null",
+				);
+			}
+			expect(snapshot).toMatchObject({
+				version: 1,
+				narratorId: "n-question-summary",
+				workspace: {
+					cwd: "/remote/repo",
+					deviceId: "remote-1",
+					revision: 7,
+					projectId: "p-authorized",
+				},
+				tasks: { ...tasks, status: "available", omitted: 0 },
+				receipts: [
+					{
+						messageId: "running-message",
+						toolUseId: "receipt-id",
+						toolName: "Bash",
+						status: "running",
+					},
+				],
+			});
+			expect(JSON.stringify(snapshot)).not.toContain("SECRET_");
+		});
+	}
+
+	test("compact records unavailable task state instead of an empty success", async () => {
+		spec.mockResolvedValue({
+			compactContext: async () => null,
+			openTasks: async () => {
+				throw new Error("unavailable");
+			},
+		} as unknown as NarratorTaskSource);
+		const result = await narratorContext.generateCompactSummary(
+			"n-question-summary",
+			"en",
+			sourceRows(true),
+		);
+		expect(result.workState?.tasks.status).toBe("unavailable");
+	});
+
+	test("non-strict fork does not disguise an empty summary as successful context", async () => {
+		history.mockResolvedValue(sourceRows(true) as never);
+		generateText.mockResolvedValueOnce({ text: "" });
+		expect(await narratorContext.generateContextSummary("n-question-summary", "en")).toBe("");
+	});
+
+	for (const text of ["", "   "]) {
+		test(`strict fork rejects an empty summary (${JSON.stringify(text)})`, async () => {
+			history.mockResolvedValue(sourceRows(true) as never);
+			generateText.mockResolvedValueOnce({ text });
+			await expect(
+				narratorContext.generateContextSummary("n-question-summary", "en", {
+					throwOnFailure: true,
+				}),
+			).rejects.toThrow("empty summary");
+		});
+	}
 	test("fork with assistant prose still includes the synchronous question answer", async () => {
 		const rows = sourceRows(true);
 		rows[0].contentText = "The assistant asked a question.";

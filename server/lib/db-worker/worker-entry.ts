@@ -17,6 +17,7 @@
 
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
+import { compileMatcher } from "../../services/knowledge/keyword-matcher";
 import {
 	collectSessionAggregateStats,
 	loadScanContext,
@@ -213,6 +214,15 @@ port.on("message", async (message: DbWorkerInbound) => {
 	);
 	try {
 		const params = message.params;
+		if (params.kind === "knowledgeKeywordMatcher") {
+			post({
+				type: "result",
+				requestId: message.requestId,
+				result: compileMatcher(params.candidates),
+				durationMs: Date.now() - startedAt,
+			});
+			return;
+		}
 		const result = await runInSqlTraceSpan(sqlSpan, async () =>
 			params.kind === "storageHistoryRead"
 				? runStorageHistoryRead(getConnection(message.dbPath), params)

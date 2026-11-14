@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { join } from "node:path";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -73,8 +74,10 @@ const friend = generateId();
 const stranger = generateId();
 const projectId = generateId();
 const otherProjectId = generateId();
-const projectPath = `${process.env.NARRAFORK_HOME}/original-project`;
-const worktreePath = `${process.env.NARRAFORK_HOME}/original-worktree`;
+const testHome = process.env.NARRAFORK_HOME;
+if (!testHome) throw new Error("Isolated test home is required");
+const projectPath = join(testHome, "original-project");
+const worktreePath = join(testHome, "original-worktree");
 
 beforeAll(async () => {
 	for (const id of [owner, friend, stranger])
@@ -338,9 +341,10 @@ describe("ordinary session fork context and constraints", () => {
 			narratorService.forkNarrator(id, null, { inheritMode: "fresh" }),
 		).rejects.toMatchObject({ code: "WORKSPACE_DIRECTORY_REQUIRED" });
 		// Its own directory, once chosen, is forked like any other.
-		await db.update(narrators).set({ cwd: "/chosen" }).where(eq(narrators.id, id));
+		const chosen = join(testHome, "chosen");
+		await db.update(narrators).set({ cwd: chosen }).where(eq(narrators.id, id));
 		const child = await narratorService.forkNarrator(id, null, { inheritMode: "fresh" });
-		expect(child.cwd).toBe("/chosen");
+		expect(child.cwd).toBe(chosen);
 	});
 
 	test("ordinary tool wrapper refuses review/general subagents before allocating a child", async () => {
@@ -498,8 +502,27 @@ describe("ordinary session fork context and constraints", () => {
 				contextSummary: "fixture summary",
 				inheritMode: "compressed",
 			});
-			expect(summary).toHaveBeenCalledWith(id, "en", { userId: owner });
+			expect(summary).toHaveBeenCalledWith(id, "en", { userId: owner, throwOnFailure: true });
 			expect(sqlite.query("SELECT COUNT(*) AS n FROM projects").get()).toEqual(beforeProjects);
+		} finally {
+			summary.mockRestore();
+		}
+	});
+	test("failed compressed summary does not create a child narrator", async () => {
+		const { narratorContext } = await import("../narrator-context");
+		const summary = spyOn(narratorContext, "generateContextSummary").mockImplementation(
+			async (_id, _locale, options) => {
+				if (options?.throwOnFailure) throw new Error("summary unavailable");
+				return "Context summary generation failed. Starting fresh.";
+			},
+		);
+		try {
+			const id = await parent({ contextProjectId: projectId, cwd: worktreePath });
+			const before = sqlite.query("SELECT COUNT(*) AS n FROM narrators").get();
+			await expect(
+				narratorService.forkNarrator(id, null, { inheritMode: "compressed", userId: owner }),
+			).rejects.toThrow("summary unavailable");
+			expect(sqlite.query("SELECT COUNT(*) AS n FROM narrators").get()).toEqual(before);
 		} finally {
 			summary.mockRestore();
 		}

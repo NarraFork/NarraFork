@@ -2708,6 +2708,7 @@ export const narratorService = {
 				const locale = (opts?.locale ?? "en") as import("../lib/prompt-i18n").Locale;
 				contextSummary = await narratorContext.generateContextSummary(parentNarratorId, locale, {
 					userId: opts?.userId,
+					throwOnFailure: true,
 				});
 				if (contextSummary && parent.systemPrompt) {
 					systemPrompt = `${parent.systemPrompt}\n\n## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;

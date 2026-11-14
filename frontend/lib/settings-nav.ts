@@ -106,6 +106,7 @@ export function isAdminPath(pathname: string): boolean {
  */
 const personalItems: readonly SettingsNavItem[] = [
 	{ to: "/settings/profile", labelKey: "profileSection", Icon: IconUser },
+	{ to: "/settings/memories", labelKey: "memorySection", Icon: IconBrain },
 	{ to: "/settings/security", labelKey: "securitySection", Icon: IconShieldLock },
 	{ to: "/settings/integrations", labelKey: "integrationsSection", Icon: IconRoute },
 	{ to: "/settings/connected-apps", labelKey: "connectedAppsSection", Icon: IconPlugConnected },

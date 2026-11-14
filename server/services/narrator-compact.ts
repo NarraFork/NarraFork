@@ -1213,7 +1213,7 @@ async function doRunCustomCompact({
 		// internal backoff chain and the whole-chunk retry in narrator-context), so
 		// the UI's "retrying (N)" ordinal never resets or goes backwards mid-run.
 		let retryCount = 0;
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+		const { summary, contextPercent, workState } = await narratorContext.generateCompactSummary(
 			narratorId,
 			locale,
 			messages,
@@ -1252,6 +1252,8 @@ async function doRunCustomCompact({
 				contextPercent,
 				{
 					mode: finalizeMode,
+					workState,
+					workStateLocale: locale,
 					expectedAttempt,
 					expectedSeq,
 					epoch: compactEpochRecord(activeNarrators.get(narratorId)),
@@ -1643,7 +1645,7 @@ async function doRunSegmentCompact({
 		// Same retry-visibility contract as the history path: every scheduled retry
 		// bumps one ordinal the UI can show instead of a silent 0-char spinner.
 		let segmentRetryCount = 0;
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+		const { summary, contextPercent, workState } = await narratorContext.generateCompactSummary(
 			narratorId,
 			locale,
 			messages,
@@ -1668,7 +1670,15 @@ async function doRunSegmentCompact({
 			narratorId,
 			summary,
 			contextPercent,
+			{ workState, workStateLocale: locale },
 		);
+		if (!finalizedMsg) {
+			throw new AppError(
+				"Segment compact marker disappeared before finalize",
+				409,
+				"COMPACT_FINALIZE_CONFLICT",
+			);
+		}
 
 		let contextPercentAfter = contextPercent;
 		if (finalizedMsg) {

@@ -1,4 +1,5 @@
 import type { RuntimePolicy } from "@server/services/agent-runtime/policy";
+import type { ContextEvidenceBudget } from "@server/services/context-evidence-budget";
 import type {
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
@@ -1003,6 +1004,8 @@ export interface AgentHistoryReplacement {
 	systemPrompt?: string;
 	/** Persisted input rows the rebuilt history carries. */
 	replayedInjectionMessageIds?: readonly string[];
+	/** Optional evidence intentionally excluded by budget, not a model-delivery receipt. */
+	omittedOptionalMessageIds?: readonly string[];
 	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
 	toolLoading?: import("./tool-loading").ToolLoadingState;
 	/** The same registry candidates used to build `toolLoading`; applied only together with it. */
@@ -1201,6 +1204,8 @@ export interface AgentConfig {
 	 * to a fresh per-call set (legacy behaviour for standalone/test callers).
 	 */
 	knowledgeInjectedEntryIds?: Set<string>;
+	/** One request-local allowance shared by memory and both knowledge injection points. */
+	evidenceBudget?: ContextEvidenceBudget;
 	/** Compact cycle seq used when persisting knowledge-injection ledger events. */
 	knowledgeInjectionCompactSeq?: number;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */

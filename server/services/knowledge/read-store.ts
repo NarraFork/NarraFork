@@ -260,6 +260,19 @@ export interface KeywordInjectionCandidateRow {
 	updatedAt: string;
 }
 
+/** Current metadata and bounded text from ONE row read; never pair a cached revision with live text. */
+export interface KnowledgeInjectionEvidenceRow extends KeywordInjectionCandidateRow {
+	snippet: string | null;
+}
+
+export interface KnowledgeInjectionEvidenceQuery {
+	scope: "global" | "personal";
+	ids: string[];
+	userId?: string | null;
+	collectionId?: string;
+	projectId?: string;
+}
+
 export type LinkListDirection = "out" | "in" | "both";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -435,13 +448,20 @@ export interface KnowledgeReadStore {
 	}): Promise<AclEventReadRow[]>;
 
 	// ── passive keyword injection ──
+	/** At most 100 active, scope-checked rows, each with at most 1536 source characters.
+	 * Personal evidence is author-only and standalone; global evidence still needs a fresh ACL gate. */
+	getInjectionEvidence(
+		opts: KnowledgeInjectionEvidenceQuery,
+	): Promise<KnowledgeInjectionEvidenceRow[]>;
 	listPersonalKeywordInjectionCandidates(opts: {
+		signal?: AbortSignal;
 		userId: string;
 		collectionId?: string;
 		projectId?: string;
 		limit: number;
 	}): Promise<KeywordInjectionCandidateRow[]>;
 	personalKeywordInjectionSignature(opts: {
+		signal?: AbortSignal;
 		userId: string;
 		collectionId?: string;
 		projectId?: string;
@@ -457,6 +477,7 @@ export interface KnowledgeReadStore {
 	 * by `limit`. `projectId` narrows to that project's collections plus global ones.
 	 */
 	listKeywordInjectionCandidates(opts: {
+		signal?: AbortSignal;
 		collectionId?: string;
 		projectId?: string;
 		limit: number;
@@ -467,6 +488,7 @@ export interface KnowledgeReadStore {
 	 * set actually changes.
 	 */
 	keywordInjectionCandidatesSignature(opts: {
+		signal?: AbortSignal;
 		collectionId?: string;
 		projectId?: string;
 	}): Promise<string>;

@@ -3128,6 +3128,71 @@ export const fileChangeRollups = pgTable(
 	],
 );
 
+export const contextMemories = pgTable(
+	"context_memories",
+	{
+		id: text("id").primaryKey().notNull(),
+		ownerUserId: text("owner_user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		scope: text("scope").notNull(),
+		scopeKey: text("scope_key").notNull(),
+		projectId: text("project_id").references((): PgColumn => projects.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {
+			onDelete: "cascade",
+		}),
+		key: text("key").notNull(),
+		content: text("content").notNull(),
+		contentHash: text("content_hash").notNull(),
+		status: text("status").notNull().default("candidate"),
+		version: integer("version").notNull().default(1),
+		sourceNarratorId: text("source_narrator_id"),
+		sourceMessageId: text("source_message_id"),
+		createdByKind: text("created_by_kind").notNull(),
+		confirmedAt: text("confirmed_at"),
+		expiresAt: text("expires_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_context_memory_key").on(table.ownerUserId, table.scopeKey, table.key),
+		index("idx_context_memory_recall").on(
+			table.ownerUserId,
+			table.scopeKey,
+			table.status,
+			table.id,
+		),
+		index("idx_context_memory_project").on(table.projectId),
+		index("idx_context_memory_narrator").on(table.narratorId),
+		check(
+			"context_memory_scope",
+			sql.raw(
+				'("scope" = \'user\' and "scope_key" = \'user\' and "project_id" is null and "narrator_id" is null) or ("scope" = \'project\' and "project_id" is not null and "scope_key" = \'project:\' || "project_id" and "narrator_id" is null) or ("scope" = \'session\' and "narrator_id" is not null and "scope_key" = \'session:\' || "narrator_id" and "project_id" is null)',
+			),
+		),
+		check("context_memory_version", sql.raw('"version" >= 1')),
+	],
+);
+
+export const contextMemoryEvents = pgTable(
+	"context_memory_events",
+	{
+		id: text("id").primaryKey().notNull(),
+		memoryId: text("memory_id")
+			.notNull()
+			.references((): PgColumn => contextMemories.id, { onDelete: "cascade" }),
+		version: integer("version").notNull(),
+		action: text("action").notNull(),
+		actorUserId: text("actor_user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		actorKind: text("actor_kind").notNull(),
+		contentHash: text("content_hash").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_context_memory_event_version").on(table.memoryId, table.version)],
+);
+
 export const knowledgeCollections = pgTable(
 	"knowledge_collections",
 	{
@@ -4464,8 +4529,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 144,
-  "columnCount": 1918,
+  "tableCount": 146,
+  "columnCount": 1944,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -22629,6 +22694,358 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "lastEffectId"
           ],
           "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "contextMemories",
+      "name": "context_memories",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "ownerUserId",
+          "name": "owner_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "context_memories_owner_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "scope",
+          "name": "scope",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scopeKey",
+          "name": "scope_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projects",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "context_memories_project_id_projects_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "context_memories_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "key",
+          "name": "key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "content",
+          "name": "content",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contentHash",
+          "name": "content_hash",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"candidate\"",
+          "defaultExpression": "\"candidate\""
+        },
+        {
+          "property": "version",
+          "name": "version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "sourceNarratorId",
+          "name": "source_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceMessageId",
+          "name": "source_message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdByKind",
+          "name": "created_by_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "confirmedAt",
+          "name": "confirmed_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "expiresAt",
+          "name": "expires_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_context_memory_key",
+          "columns": [
+            "ownerUserId",
+            "scopeKey",
+            "key"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_context_memory_recall",
+          "columns": [
+            "ownerUserId",
+            "scopeKey",
+            "status",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_context_memory_project",
+          "columns": [
+            "projectId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_context_memory_narrator",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "context_memory_scope",
+        "context_memory_version"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "context_memory_scope",
+          "expression": "(\"scope\" = 'user' and \"scope_key\" = 'user' and \"project_id\" is null and \"narrator_id\" is null) or (\"scope\" = 'project' and \"project_id\" is not null and \"scope_key\" = 'project:' || \"project_id\" and \"narrator_id\" is null) or (\"scope\" = 'session' and \"narrator_id\" is not null and \"scope_key\" = 'session:' || \"narrator_id\" and \"project_id\" is null)"
+        },
+        {
+          "name": "context_memory_version",
+          "expression": "\"version\" >= 1"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "contextMemoryEvents",
+      "name": "context_memory_events",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "memoryId",
+          "name": "memory_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "contextMemories",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "context_memory_events_memory_id_context_memories_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "version",
+          "name": "version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "action",
+          "name": "action",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorUserId",
+          "name": "actor_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "context_memory_events_actor_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "actorKind",
+          "name": "actor_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contentHash",
+          "name": "content_hash",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_context_memory_event_version",
+          "columns": [
+            "memoryId",
+            "version"
+          ],
+          "unique": true
         }
       ],
       "checks": [],

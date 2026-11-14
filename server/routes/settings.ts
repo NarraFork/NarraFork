@@ -449,6 +449,7 @@ export const updateSettingsSchema = z
 					)
 					.optional(),
 				maxTurns: z.number().int().min(1).max(1000),
+				contextEvidenceBudgetBytes: z.number().int().min(0).max(65536),
 				subagentModels: z
 					.object({
 						explore: z.string(),
@@ -602,6 +603,14 @@ export const updateSettingsSchema = z
 				providerOrder: z.array(z.string()).max(50).optional(),
 				disabledProviders: z.array(z.string()).max(200).optional(),
 				autoExcludedProviders: z.array(z.string().min(1).max(100)).max(200).optional(),
+			})
+			.partial()
+			.optional(),
+		knowledge: z
+			.strictObject({
+				injectMode: z.enum(["summary", "off"]),
+				retrievalMode: z.enum(["keywords", "hybrid"]),
+				scanToolOutput: z.boolean(),
 			})
 			.partial()
 			.optional(),

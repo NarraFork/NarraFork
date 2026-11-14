@@ -12,7 +12,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
@@ -29,6 +29,7 @@ import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
+import { normalizePathForOS } from "../lib/platform-path";
 import * as spawn from "../lib/spawn";
 import { projectRoutes } from "../routes/projects";
 import { narratorCreationWorkspaceTarget, narratorService } from "./narrator-service";
@@ -714,10 +715,24 @@ for (const malformed of [
 	});
 }
 
+function expectShadowInitCommand(cmd: readonly string[], dir: string) {
+	const comparable = cmd.map((arg, index) =>
+		index === 3 ? normalizePathForOS(arg, process.platform) : arg,
+	);
+	expect(comparable).toEqual(["git", "init", "--bare", normalizePathForOS(dir, process.platform)]);
+}
 async function shadowBirthFixture() {
 	const dir = treeSnapshotPhysicalDir("local", path);
 	const home = process.env.NARRAFORK_HOME;
-	if (process.env.NARRAFORK_TEST !== "1" || !home || !dir.startsWith(`${home}/`))
+	const relativeDir = home ? relative(home, dir) : "";
+	if (
+		process.env.NARRAFORK_TEST !== "1" ||
+		!home ||
+		!relativeDir ||
+		isAbsolute(relativeDir) ||
+		relativeDir === ".." ||
+		relativeDir.startsWith(`..${sep}`)
+	)
 		throw new Error("Shadow birth fixture escaped isolated home");
 	expect(fs.existsSync(dir)).toBe(false);
 	otherRoots.push(dir);
@@ -812,7 +827,7 @@ for (const legacy of ["frozen-pin", "corrupt", "unimported"] as const) {
 		const marker = Buffer.from([0, 255, 128, 13, 10]);
 		const deletion = spyOn(fs, "rmSync");
 		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
+			expectShadowInitCommand(opts.cmd, dir);
 			await writeFile(join(dir, "marker.bin"), marker);
 			return failedShadowInit;
 		});
@@ -843,7 +858,7 @@ test("actual capture preserves the init error and both inodes after a birth repl
 	const replacement = Buffer.from([0, 128, 255, 13, 10, 2]);
 	const deletion = spyOn(fs, "rmSync");
 	const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-		expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
+		expectShadowInitCommand(opts.cmd, dir);
 		await writeFile(join(dir, "marker.bin"), original);
 		await rename(dir, backup);
 		await mkdir(dir);
@@ -881,7 +896,7 @@ test("actual capture retains failed initialization through gcAll and resumes", a
 	const { dir, capture, assertRetained } = await shadowBirthFixture();
 	const deletion = spyOn(fs, "rmSync");
 	const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-		expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
+		expectShadowInitCommand(opts.cmd, dir);
 		await writeFile(join(dir, "partial-owned.bin"), Buffer.from([0, 255, 13, 10]));
 		return failedShadowInit;
 	});
@@ -912,7 +927,7 @@ for (const kind of ["cwd", "registry"] as const) {
 		let before: number | undefined;
 		const deletion = spyOn(fs, "rmSync");
 		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
+			expectShadowInitCommand(opts.cmd, dir);
 			await writeFile(join(dir, "marker.bin"), marker);
 			if (kind === "cwd") {
 				const id = generateId();
@@ -973,7 +988,7 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 			// Session creation indexes its cwd into a project with a bounded git probe;
 			// only the shadow initializer is the sink under test.
 			if (opts.cmd[1] === "-C") return originalSpawn(opts);
-			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
+			expectShadowInitCommand(opts.cmd, dir);
 			if (kind === "cwd") {
 				const created = await narratorService.create({ cwd: path, title: "shared checkout cwd" });
 				otherNarrators.push(created.id);
@@ -1029,7 +1044,7 @@ test("actual capture preserves its init error without a final inventory query", 
 	const deletion = spyOn(fs, "rmSync");
 	let inventoryAvailable = true;
 	spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-		expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
+		expectShadowInitCommand(opts.cmd, dir);
 		await writeFile(join(dir, "marker.bin"), marker);
 		inventoryAvailable = false;
 		return failedShadowInit;

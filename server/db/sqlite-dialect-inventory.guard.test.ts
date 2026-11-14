@@ -430,6 +430,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 		"server/services/data-portability.ts",
 		"固定表清单的导出与导入：子进程逐表复制后再压实，ATTACH 之后靠 `sqlite_master` 与 `rowid` 按列交集拷贝；PostgreSQL 侧要走 `pg_dump`/`COPY` 的另一套实现",
 	],
+	[
+		"server/services/data-portability-memory.ts",
+		"SQLite 快照导入的记忆及审计子模块，与 data-portability.ts 共用 ATTACH 事务和按列交集拷贝",
+	],
 ]);
 
 /**
@@ -502,6 +506,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
 	// （复制后压实），ATTACH + 按列交集拷贝回库，`INSERT OR IGNORE` 跳过已存在的行，
 	// `SQLITE_BUSY` 之类的错误码决定重试；源库与目标库都按文件路径打开。
+	"server/services/data-portability-memory.ts": ["driver", "pragma", "rowid", "json1"],
 	"server/services/data-portability.ts": [
 		"connectionModule",
 		"driver",

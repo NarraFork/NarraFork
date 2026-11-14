@@ -9,6 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+	computeContinuationStallState,
 	interruptionContinuationLabel,
 	MAX_TURN_INTERRUPTION_RETRIES,
 	planTurnInterruption,
@@ -221,5 +222,60 @@ describe("interruptionContinuationLabel", () => {
 		expect(interruptionContinuationLabel("resumable_error", "subagent")).toBe(
 			"Subagent resumable-error continuation",
 		);
+	});
+});
+
+describe("unchanged tool evidence across continuation passes", () => {
+	test("new evidence establishes a baseline, three unchanged repeats stop automatic continuation", () => {
+		const result = { hadToolUses: true, toolProgressFingerprint: "same-receipts" };
+		let state = computeContinuationStallState("task", result, { count: 0 });
+		expect(state.suppressed).toBe(false);
+		expect(state.count).toBe(0);
+		for (let count = 1; count <= 3; count++) {
+			state = computeContinuationStallState("task", result, state);
+			expect(state.count).toBe(count);
+			expect(state.suppressed).toBe(count === 3);
+		}
+	});
+
+	test("changed or unmeasurable evidence clears the repetition counter", () => {
+		const baseline = computeContinuationStallState(
+			"task",
+			{ hadToolUses: true, toolProgressFingerprint: "old" },
+			{ count: 0 },
+		);
+		const previous = { ...baseline, count: 2 };
+		for (const fingerprint of ["changed", undefined]) {
+			const next = computeContinuationStallState(
+				"task",
+				{ hadToolUses: true, toolProgressFingerprint: fingerprint },
+				previous,
+			);
+			expect(next.count).toBe(0);
+			expect(next.suppressed).toBe(false);
+		}
+	});
+
+	test("reflection denial still takes precedence over receipt changes", () => {
+		const first = computeContinuationStallState(
+			"task",
+			{
+				hadToolUses: true,
+				toolProgressFingerprint: "one",
+				taskReflectionDenialFingerprint: "denied",
+			},
+			{ count: 0 },
+		);
+		const next = computeContinuationStallState(
+			"task",
+			{
+				hadToolUses: true,
+				toolProgressFingerprint: "two",
+				taskReflectionDenialFingerprint: "denied",
+			},
+			first,
+		);
+		expect(next.key).toBe("task-reflection:denied");
+		expect(next.count).toBe(2);
 	});
 });

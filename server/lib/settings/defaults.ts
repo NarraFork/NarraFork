@@ -32,6 +32,7 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	knowledge: {
 		injectMode: "summary",
+		retrievalMode: "keywords",
 		maxInjectedEntries: 3,
 		minKeywordLen: 3,
 		scanToolOutput: true,
@@ -85,6 +86,7 @@ export const DEFAULTS: NarraForkSettings = {
 		customModels: [],
 		hiddenModels: [],
 		maxTurns: 1000,
+		contextEvidenceBudgetBytes: 16 * 1024,
 		subagentModels: {
 			explore: "",
 			plan: "",
@@ -394,6 +396,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: '知识库被动注入模式。"summary"=自动注入命中条目摘要；"off"=关闭被动注入。',
 		type: "string",
 	},
+	"knowledge.retrievalMode": {
+		desc: '知识召回方式。"keywords" 保持声明关键词匹配；"hybrid" 合并关键词与有界全文检索，返回前复核版本和授权。',
+		type: "string",
+	},
 	"knowledge.maxInjectedEntries": {
 		desc: "每轮自动注入的最大知识条目数（控制上下文增长）。",
 		type: "number",
@@ -605,6 +611,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.hiddenModels": {
 		desc: "隐藏的模型列表。这些模型不会在 UI 模型选择器中显示，但仍可通过 API 使用。",
 		type: "string[]",
+	},
+	"agent.contextEvidenceBudgetBytes": {
+		desc: "每次请求中记忆与知识共享的可选证据 UTF-8 字节预算。0 关闭可选注入，不裁剪固定规则、任务状态或工具调用链。",
+		type: "number",
+		valid: "0-65536, 默认 16384",
 	},
 	"agent.maxTurns": {
 		desc: "叙述者会话的最大轮次。达到后 agent loop 停止。范围 1-1000。在 80% 时会发送 wrap-up 提醒。",

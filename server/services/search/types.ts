@@ -450,6 +450,8 @@ export interface RecallMessageRow {
 
 export interface KnowledgeSearchRow {
 	id: string;
+	/** Committed revision read in the same query as the excerpt; absent for working copies. */
+	entryRevisionId?: string | null;
 	/** Standalone rows use this id with KnowledgeRead, never a global entry id. */
 	personalEntryId?: string;
 	collectionId: string | null;

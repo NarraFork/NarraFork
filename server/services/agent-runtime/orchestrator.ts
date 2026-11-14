@@ -113,9 +113,15 @@ import { type ExecutionOwner, getRunHold, type RunControl } from "../agent-runti
 import { awaitRunHold } from "../agent-runtime/run";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
 import { backgroundTaskService } from "../background-task-service";
+import { ContextEvidenceBudget, projectKnowledgeEvidence } from "../context-evidence-budget";
+import { buildContextMemoryRecall } from "../context-memory-runtime";
 import { getAgentFileReferenceContext } from "../file-reference-context";
 import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
-import { injectionKey, knowledgeInjection } from "../knowledge-injection";
+import {
+	injectionKey,
+	knowledgeInjection,
+	MAX_KNOWLEDGE_EVIDENCE_BYTES,
+} from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
 	cleanupBufferedTextFilesAsync,
@@ -457,6 +463,7 @@ export async function runAgentLoopUnlocked(
 		knowledgeInjectionCycleStates.set(narratorId, knowledgeCycleState);
 	}
 	const knowledgeInjectedIds = knowledgeCycleState.ids;
+	const evidenceBudget = new ContextEvidenceBudget(() => settings.agent.contextEvidenceBudgetBytes);
 
 	let pendingWorkingDirectoryRecovery:
 		| { output: string; missingCwd: string; suggestedCwd: string }
@@ -1377,6 +1384,14 @@ export async function runAgentLoopUnlocked(
 					summaryChars: built.usedCompactSummary ? (current.contextSummary?.length ?? 0) : 0,
 				};
 			};
+			const getRequestContext = ({ byteBudget }: { byteBudget: number }) =>
+				buildContextMemoryRecall({
+					narratorId,
+					userId: active._currentUserId ?? null,
+					byteBudget,
+					locale,
+					signal: active.abortController.signal,
+				});
 			const preparedPrefix = await preparePrefixRequest({
 				narratorId,
 				locale,
@@ -1390,10 +1405,13 @@ export async function runAgentLoopUnlocked(
 				getToolLoading: toolLoadingInput,
 				refreshToolLoading: refreshMcpToolLoading,
 				buildPrefixPrompt,
+				getRequestContext,
+				evidenceBudget,
 			});
 			const { prompt: prefixPrompt, reconciled, sourceMessages: rawMessages } = preparedPrefix;
 			if (!prefixPrompt || !reconciled) throw new Error("Runtime prefix was not prepared");
-			if (reconciled.opened) active._resetUpstreamSessionOnNextRequest = true;
+			if (reconciled.opened || preparedPrefix.omittedOptionalMessageIds.length > 0)
+				active._resetUpstreamSessionOnNextRequest = true;
 			clearActiveHistoryCompactPending(narratorId);
 			const historyOptions = {
 				narratorId,
@@ -1417,18 +1435,21 @@ export async function runAgentLoopUnlocked(
 			// request and every later rebuild send the same bytes.
 			const knowledgeQuery = preparedHistory.currentInputText;
 			let knowledgePersisted = false;
-			if (knowledgeQuery.trim()) {
+			if (knowledgeQuery.trim() && evidenceBudget.remaining > 0) {
+				const reservation = evidenceBudget.reserve("knowledge", MAX_KNOWLEDGE_EVIDENCE_BYTES);
 				try {
 					const hits = await knowledgeInjection.resolveInjections(actingUserId, knowledgeQuery, {
 						already: knowledgeInjectedIds,
 						projectId: active._projectId ?? undefined,
+						signal: active.abortController.signal,
+						byteBudget: reservation.byteBudget,
 					});
 					if (hits.length > 0) {
 						const block = knowledgeInjection.formatInjections(
 							hits,
 							"Relevant knowledge-base entries were found for this request:",
 						);
-						if (block) {
+						if (block && Buffer.byteLength(block, "utf8") <= reservation.byteBudget) {
 							const knowledgeMessage = await messageWriters.persistSystemMessage(
 								narratorId,
 								block,
@@ -1439,6 +1460,7 @@ export async function runAgentLoopUnlocked(
 									},
 								],
 							);
+							reservation.commit(block);
 							broadcastToNarrator(narratorId, {
 								type: "message",
 								narratorId,
@@ -1468,16 +1490,20 @@ export async function runAgentLoopUnlocked(
 						narratorId,
 						error: String(err),
 					});
+				} finally {
+					reservation.release();
 				}
 			}
 			if (knowledgePersisted) {
+				const source = await narratorService.getModelHistorySinceLastCompact(
+					narratorId,
+					undefined,
+					{ signal: active.abortController.signal },
+				);
 				preparedHistory = await buildRuntimeHistory({
 					...historyOptions,
-					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
-						narratorId,
-						undefined,
-						{ signal: active.abortController.signal },
-					),
+					sourceMessages: projectKnowledgeEvidence(source, evidenceBudget.knowledgeAllowance)
+						.messages,
 				});
 			}
 
@@ -1504,7 +1530,7 @@ export async function runAgentLoopUnlocked(
 				}
 			};
 			const { usedCompactSummary } = prefixPrompt;
-			active.systemPrompt = reconciled.systemPrompt ?? prefixPrompt.prompt;
+			active.systemPrompt = preparedPrefix.systemPrompt ?? prefixPrompt.prompt;
 			// Legacy prompt offsets do not address the epoch's rendered baseline.
 			let runtimeSummaryChars = prefixPrompt.summaryChars;
 			const initialSystemChars = (active.systemPrompt?.length ?? 0) - runtimeSummaryChars;
@@ -1585,6 +1611,8 @@ export async function runAgentLoopUnlocked(
 				getToolLoading: toolLoadingInput,
 				refreshToolLoading: refreshMcpToolLoading,
 				attachmentSignal: active.abortController.signal,
+				getRequestContext,
+				evidenceBudget,
 				onCompactDone: () => {
 					compactDoneFlag = true;
 				},
@@ -2070,6 +2098,7 @@ export async function runAgentLoopUnlocked(
 				// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
 				// de-dups against the user-message injections (point A) and vice versa.
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
+				evidenceBudget,
 				knowledgeInjectionCompactSeq: cycleSeq,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
@@ -2757,8 +2786,8 @@ export async function runAgentLoopUnlocked(
 			}
 
 			// Suppress runaway auto-continuation when a continuation pass makes no effective
-			// progress: either it called no tools, or it repeatedly hit the same protected-task
-			// reflection denial. A different denial starts a fresh count; real tool progress resets it.
+			// progress: no tools, repeated protected-task denial, or unchanged complete
+			// tool evidence. New evidence resets the count; tool-call ids alone do not.
 			const continuationKind = active._continuationTurn;
 			if (continuationKind) {
 				const stall = computeContinuationStallState(continuationKind, result, {
