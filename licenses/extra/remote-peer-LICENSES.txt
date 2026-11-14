@@ -321,7 +321,7 @@ Source SHA-256: dcf382b0efb2735ac2a64e0e0a3c98b99d95e059979965aee4f6bddf553a7b7f
 
 === Source 17 ===
 Module: github.com/coder/websocket
-Version: v1.8.14
+Version: v1.8.15
 Upstream: https://github.com/coder/websocket
 Source file: LICENSE.txt
 License / notice: ISC
