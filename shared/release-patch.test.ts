@@ -93,7 +93,9 @@ describe("CI zstd patch asset contract", () => {
 			parseReleasePatchName(binary, `${binary}.from-${"9".repeat(129)}.0.0.zstd-patch`),
 		).toBeNull();
 	});
-	test("allows a zero tail and retains maximum safe sizes", () => {
+	test("allows 4 GiB base/output while retaining the 512 MiB patch limit", () => {
+		expect(MAX_RELEASE_BINARY_BYTES).toBe(4 * 1024 ** 3);
+		expect(MAX_RELEASE_PATCH_BYTES).toBe(512 * 1024 ** 2);
 		const value = {
 			...metadata,
 			oldFileSize: MAX_RELEASE_BINARY_BYTES,
