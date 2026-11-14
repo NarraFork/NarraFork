@@ -6,7 +6,6 @@ import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
-import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import {
 	canonicalProtectionAdmissionPath as canonicalAdmissionPath,
@@ -71,8 +70,6 @@ interface Reservation {
 	ports?: LifecycleGuardPorts;
 	targets: LifecycleTarget[];
 	admission: boolean;
-	/** Paths proven to have been born inside this identity context. */
-	createdPaths?: Set<string>;
 	/** Positive Git-root evidence acquired before this reserved retirement changes paths. */
 	distinctRoots?: Map<string, string>;
 }
@@ -87,6 +84,10 @@ function liveContext() {
 }
 function footprintReservation(): Reservation | undefined {
 	return liveContext()?.reservation;
+}
+/** Local filesystem identity uses native separators; POSIX backslashes are literal. */
+function identityKey(path: string): string {
+	return localPathSemantics.identityKey(resolve(path));
 }
 function overlaps(a: LifecycleTarget, b: LifecycleTarget): boolean {
 	if (a.scopeProjectId && a.scopeProjectId === b.scopeProjectId) return true;
@@ -142,7 +143,7 @@ export async function canonicalWorkspaceAdmissionTarget(
 		productionPorts.canonicalAdmissionPath(target.path),
 		performance.now() + MAX_MS,
 	);
-	return { ...resolved, path: normalizePathForComparison(canonicalCwd), canonicalCwd };
+	return { ...resolved, path: identityKey(canonicalCwd), canonicalCwd };
 }
 /** Async registration/CAS must keep their claim visible until the durable write completes. */
 export async function withWorkspaceAdmission<T>(
@@ -169,7 +170,6 @@ export interface LifecycleGuardPorts {
 		deadline: number,
 		signal?: AbortSignal,
 		targets?: readonly LifecycleTarget[],
-		includeLegacyReceipts?: boolean,
 	): Promise<{ complete: boolean; claims: ResourceClaim[] | AsyncIterable<ResourceClaim> }>;
 	/** Canonical comparison key, case-folded on Windows. */
 	canonicalPath(path: string): Promise<string>;
@@ -189,7 +189,13 @@ async function canonicalShadowReference(
 	if (!key) return undefined;
 	const parts = key.split("\0");
 	const [deviceId, path] = parts;
-	if (parts.length !== 2 || !deviceId || !path || path.length > 4096 || !isAbsolute(path))
+	if (
+		parts.length !== 2 ||
+		!deviceId ||
+		!path ||
+		path.length > 4096 ||
+		(deviceId === "local" && !isAbsolute(path))
+	)
 		throw new Error("Unverifiable shadow reference");
 	const canonical =
 		deviceId === "local" ? await boundedRead(ports.canonicalPath(path), deadline) : path;
@@ -251,11 +257,11 @@ async function probeGitRoot(
 const productionPorts: LifecycleGuardPorts & {
 	canonicalAdmissionPath(path: string): Promise<string>;
 } = {
-	readClaims: (deadline, signal, targets, includeLegacyReceipts) => {
+	readClaims: (deadline, signal, targets) => {
 		const fixture = fixturePorts.getStore();
 		return fixture
-			? fixture.readClaims(deadline, signal, targets, includeLegacyReceipts)
-			: readProtectionClaims(targets ?? [], deadline, signal, includeLegacyReceipts);
+			? fixture.readClaims(deadline, signal, targets)
+			: readProtectionClaims(targets ?? [], deadline, signal);
 	},
 	canonicalPath: (path) => (fixturePorts.getStore()?.canonicalPath ?? canonicalPath)(path),
 	canonicalAdmissionPath: (path) => {
@@ -296,7 +302,7 @@ async function freezeFootprint(
 		deadline,
 	);
 	held.footprints ??= new Map();
-	const key = normalizePathForComparison(path);
+	const key = identityKey(path);
 	const existing = held.footprints.get(key);
 	if (existing) {
 		if (
@@ -338,8 +344,9 @@ async function revalidateFootprints(held: Reservation, deadline = performance.no
 export function withLifecycleContext<T>(
 	paths: readonly string[],
 	body: () => Promise<T>,
+	signal?: AbortSignal,
 ): Promise<T> {
-	return runLifecycleContext(paths, body);
+	return runLifecycleContext(paths, body, undefined, signal);
 }
 
 async function runLifecycleContext<T>(
@@ -374,7 +381,7 @@ export async function revalidateLifecycleTarget(path: string): Promise<string> {
 	if (!held) reject("unreserved resource dispatch", unavailable());
 	try {
 		await revalidateFootprints(held);
-		const key = normalizePathForComparison(path);
+		const key = identityKey(path);
 		const footprint =
 			held.footprints?.get(key) ??
 			[...(held.footprints?.values() ?? [])].find((item) => item.canonical === key);
@@ -409,40 +416,6 @@ export async function lifecycleCreationPath(path: string): Promise<string> {
 	await captureLifecycleContextPath(normalized);
 	return revalidateLifecycleTarget(normalized);
 }
-export async function confirmLifecyclePathCreated(
-	path: string,
-	expectedIdentity?: string,
-): Promise<void> {
-	const held = footprintReservation();
-	if (!held) return;
-	const ports = held.ports ?? productionPorts;
-	const canonical = await boundedRead(ports.canonicalPath(path), performance.now() + MAX_MS);
-	const records = [...(held.footprints?.values() ?? [])].filter(
-		(item) => item.canonical === canonical,
-	);
-	if (!records.length) reject("unfrozen legacy creation", unavailable());
-	const identity = await boundedRead(
-		ports.pathIdentity?.(canonical) ?? Promise.resolve(null),
-		performance.now() + MAX_MS,
-	);
-	if (expectedIdentity !== undefined && identity !== expectedIdentity)
-		reject("created directory identity changed", unavailable());
-	for (const record of records) {
-		if (
-			(await boundedRead(ports.canonicalPath(record.raw), performance.now() + MAX_MS)) !==
-			record.canonical
-		)
-			reject("legacy creation alias changed", unavailable());
-		if (record.identity !== null && !record.removed && record.identity !== identity)
-			reject("legacy creation footprint changed", unavailable());
-		if (identity !== null && (record.identity === null || record.removed)) {
-			held.createdPaths ??= new Set();
-			held.createdPaths.add(canonical);
-		}
-		record.identity = identity;
-		record.removed = false;
-	}
-}
 /** Called only after the bounded Git/rm sink reports success and absence is verified. */
 export async function confirmLifecyclePathRemoved(path: string): Promise<void> {
 	const held = footprintReservation();
@@ -476,7 +449,6 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		_operation: string,
 		signal?: AbortSignal,
 		frozenTargets = false,
-		creatingShadow = false,
 	): Promise<ProtectionInspection> {
 		const deadline = performance.now() + MAX_MS;
 		try {
@@ -507,9 +479,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 					};
 				}),
 			);
-			// Cold capture creates an exclusive new shadow and never deletes a failed
-			// birth. Legacy request-log migration is a prerequisite for deletion, not capture.
-			const inventory = await ports.readClaims(deadline, signal, normalized, !creatingShadow);
+			const inventory = await ports.readClaims(deadline, signal, normalized);
 			if (!inventory.complete) return unavailable();
 			let bytes = Buffer.byteLength(JSON.stringify(normalized));
 			const probes = new Map<string, { root: string; common: string } | null>();
@@ -567,17 +537,13 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				};
 				const shadow = await canonicalShadowReference(claim.shadowKey, ports, deadline);
 				if (shadow) canonical.shadowKey = shadow.key;
-				// A cold mkdir birth is not deletion of an existing lineage store.
-				// Direct cwd/registry paths still protect D; only the derived shadow
-				// reference is non-exclusive while initializing the new physical store.
-				const shadowPhysical = !creatingShadow &&
-					shadow && {
-						deviceId: shadow.deviceId,
-						path:
-							shadow.deviceId === "local"
-								? await ports.canonicalPath(shadow.physicalPath)
-								: shadow.physicalPath,
-					};
+				const shadowPhysical = shadow && {
+					deviceId: shadow.deviceId,
+					path:
+						shadow.deviceId === "local"
+							? await ports.canonicalPath(shadow.physicalPath)
+							: shadow.physicalPath,
+				};
 				for (const target of normalized) {
 					if (!overlaps(target, canonical) && !(shadowPhysical && overlaps(target, shadowPhysical)))
 						continue;
@@ -616,12 +582,11 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		operation: string,
 		signal?: AbortSignal,
 		frozenTargets = false,
-		creatingShadow = false,
 	): Promise<ProtectionInspection> {
 		const started = performance.now();
 		try {
 			return await boundedRead(
-				inspectOnce(targets, operation, signal, frozenTargets, creatingShadow),
+				inspectOnce(targets, operation, signal, frozenTargets),
 				started + MAX_MS,
 			);
 		} catch {
@@ -643,7 +608,6 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		deadline = performance.now() + MAX_MS,
 		signal?: AbortSignal,
 		contextPaths: readonly string[] = [],
-		creatingShadow = false,
 	): Promise<T> {
 		if (
 			signal?.aborted ||
@@ -685,15 +649,11 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			);
 			for (const path of contextPaths) await freezeFootprint(held, path, deadline);
 			await revalidateFootprints(held, deadline);
-			const ownBirthRollback =
-				operation === "shadow initialization rollback" &&
-				resolved.every((target) => target.path && held.createdPaths?.has(target.path));
 			// Compare and publish in one synchronous segment. Preparing work stays private;
 			// any claim committed during it is checked by the subsequent inventory read.
 			for (const other of domain.reservations) {
 				if (
 					other !== held &&
-					!ownBirthRollback &&
 					other.targets.some((a) =>
 						resolved.some((b) =>
 							other.admission ? deletionContainsAdmission(b, a) : overlaps(a, b),
@@ -731,7 +691,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			if (resources.length) {
 				const inspection = await boundedRead(
 					domain.context.run({ reservation: held }, () =>
-						inspect(resources, operation, signal, true, creatingShadow),
+						inspect(resources, operation, signal, true),
 					),
 					deadline,
 				);
@@ -754,52 +714,10 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 	return {
 		inspect,
 		withProtectionReservation: reserve,
-		withShadowCreationReservation<T>(
-			target: { deviceId: "local"; path: string },
-			body: () => Promise<T>,
-		): Promise<T> {
-			return reserve([target], "shadow initialization", body, undefined, undefined, [], true);
-		},
 	};
 }
 const guard = createLifecycleGuard(productionPorts);
 export const inspect = guard.inspect;
-/** Re-read the complete bounded claim set at a last destructive fallback, not merely inode. */
-export async function assertLifecycleProtectionCurrent(
-	targets: readonly LifecycleTarget[],
-	operation: string,
-): Promise<void> {
-	const current = liveContext();
-	if (!current) reject(operation, unavailable());
-	const resolved = await Promise.all(
-		targets.map(async (target) => ({
-			...target,
-			...(target.path ? { path: await revalidateLifecycleTarget(target.path) } : {}),
-		})),
-	);
-	for (const target of resolved) {
-		const path = target.path;
-		const published = current.reservation.targets.filter(
-			(item) => (item.deviceId ?? "local") === (target.deviceId ?? "local"),
-		);
-		if (
-			(!target.path && !target.shadowKey && !target.repositoryKey && !target.scopeProjectId) ||
-			(path &&
-				!published.some((item) => item.path && localPathSemantics.contains(item.path, path))) ||
-			(target.shadowKey && !published.some((item) => item.shadowKey === target.shadowKey)) ||
-			(target.repositoryKey &&
-				!published.some((item) => item.repositoryKey === target.repositoryKey)) ||
-			(target.scopeProjectId &&
-				!published.some((item) => item.scopeProjectId === target.scopeProjectId))
-		)
-			reject("unreserved destructive target", unavailable());
-	}
-	const inspection = await createLifecycleGuard(
-		current.reservation.ports ?? productionPorts,
-	).inspect(resolved, operation, undefined, true);
-	if (inspection.status !== "clear") reject(operation, inspection);
-	await revalidateFootprints(current.reservation);
-}
 export function withProtectionReservation<T>(
 	targets: readonly LifecycleTarget[],
 	operation: string,
@@ -808,14 +726,6 @@ export function withProtectionReservation<T>(
 	contextPaths: readonly string[] = [],
 ): Promise<T> {
 	return guard.withProtectionReservation(targets, operation, body, undefined, signal, contextPaths);
-}
-
-/** Creation reserves only its physical destination; it never grants cleanup authority. */
-export function withShadowCreationReservation<T>(
-	target: { deviceId: "local"; path: string },
-	body: () => Promise<T>,
-): Promise<T> {
-	return guard.withShadowCreationReservation(target, body);
 }
 
 /** Project metadata is a scope barrier: a project with live worktree resources is protected. */

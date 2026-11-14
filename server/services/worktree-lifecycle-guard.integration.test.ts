@@ -12,7 +12,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
@@ -37,13 +37,13 @@ import { FileWorktreeJournal, worktreeReceiptHasResourceEffect } from "./narrato
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
 import { NarratorWorktreeService, type WorktreeTarget } from "./narrator-worktree-service";
 import * as oauthRuntime from "./oauth-runtime-revocation";
-import { maintainProtectionIndex } from "./resource-protection-index";
+import { canonicalProtectionPath, maintainProtectionIndex } from "./resource-protection-index";
 import {
 	SnapshotCaptureReceiptService,
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
 import { extractSubagentToPrimary } from "./subagent-extract";
-import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
+import { snapshotPathIdentity, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { workspaceContextService } from "./workspace-context-service";
 import {
 	inspect,
@@ -136,7 +136,7 @@ beforeEach(async () => {
 	// Reset only this isolated test's compatibility lifetime, including invalid old fixtures.
 	sqlite.exec(`DELETE FROM resource_protection_paths WHERE source = 'receipt';
 		DELETE FROM resource_protection_sources WHERE source = 'receipt' AND source_id != ''`);
-	temporary = await mkdtemp(join(tmpdir(), "nf-lifecycle-guard-"));
+	temporary = await realpath(await mkdtemp(join(tmpdir(), "nf-lifecycle-guard-")));
 	path = join(temporary, ".worktrees", "legacy-Ab1234");
 	const home = join(temporary, "home");
 	await mkdir(path, { recursive: true });
@@ -163,7 +163,9 @@ beforeEach(async () => {
 afterEach(async () => {
 	mock.restore();
 	writeClaimCache.clearClaims(path);
-	await db.delete(worktreeTreeSnapshots).where(eq(worktreeTreeSnapshots.worktreePath, path));
+	await db
+		.delete(worktreeTreeSnapshots)
+		.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(path)));
 	await db
 		.delete(narratorWorktreeResources)
 		.where(eq(narratorWorktreeResources.repositoryKey, "fixture-repository"));
@@ -389,7 +391,7 @@ for (const cwd of [0, false, "", [], {}]) {
 for (const gitPathNull of [false, true]) {
 	for (const state of ["ready", "preparing", "unknown"] as const) {
 		test(`project scope protects ${state} external/different-repo owner-deleted resources with gitPath ${gitPathNull ? "NULL" : "present"}`, async () => {
-			const external = await mkdtemp(join(tmpdir(), "nf-lifecycle-external-"));
+			const external = await realpath(await mkdtemp(join(tmpdir(), "nf-lifecycle-external-")));
 			otherRoots.push(external);
 			const binary = Buffer.from([0, 255, 128, 13, 10, 0, 42]);
 			await writeFile(join(external, "marker.bin"), binary);
@@ -555,7 +557,7 @@ test("project deletion does not claim unrelated same-repository resources or dep
 		timeout: 5000,
 		maxOutputBytes: 2048,
 	});
-	const foreign = await mkdtemp(join(tmpdir(), "nf-git-poison-"));
+	const foreign = await realpath(await mkdtemp(join(tmpdir(), "nf-git-poison-")));
 	otherRoots.push(foreign);
 	await spawn.safeSpawn({
 		cmd: ["git", "-C", foreign, "init"],
@@ -721,14 +723,19 @@ for (const malformed of [
 async function shadowBirthFixture() {
 	const dir = treeSnapshotPhysicalDir("local", path);
 	const home = process.env.NARRAFORK_HOME;
-	if (process.env.NARRAFORK_TEST !== "1" || !home || !dir.startsWith(`${home}/`))
+	if (
+		process.env.NARRAFORK_TEST !== "1" ||
+		!home ||
+		localPathSemantics.equals(home, dir) ||
+		!localPathSemantics.contains(home, dir)
+	)
 		throw new Error("Shadow birth fixture escaped isolated home");
 	expect(fs.existsSync(dir)).toBe(false);
 	otherRoots.push(dir);
 	await db.insert(worktreeTreeSnapshots).values({
 		id: generateId(),
 		deviceId: "local",
-		worktreePath: path,
+		worktreePath: snapshotPathIdentity(path),
 		treeHash: "a".repeat(40),
 		createdAt: new Date().toISOString(),
 	});
@@ -741,23 +748,37 @@ async function shadowBirthFixture() {
 	spyOn(observations, "finish").mockResolvedValue(undefined);
 	const capture = () =>
 		withSnapshotCaptureReceipts(observations, () => worktreeTreeSnapshot.capture(path));
-	const assertRetained = (before: number | undefined) => {
-		expect(changes()).toBe(before);
+	const assertRetained = (before: number | undefined, capturedHash?: string) => {
+		if (capturedHash) expect(changes()).toBeGreaterThan(before ?? 0);
+		else expect(changes()).toBe(before);
 		expect(cacheClear).toHaveBeenCalledTimes(0);
 		expect(writeClaimCache.claimCount(path)).toBe(1);
-		expect(
-			db
-				.select({ hash: worktreeTreeSnapshots.treeHash })
-				.from(worktreeTreeSnapshots)
-				.where(eq(worktreeTreeSnapshots.worktreePath, path))
-				.all(),
-		).toEqual([{ hash: "a".repeat(40) }]);
+		const hashes = db
+			.select({ hash: worktreeTreeSnapshots.treeHash })
+			.from(worktreeTreeSnapshots)
+			.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(path)))
+			.all()
+			.map((row) => row.hash);
+		expect(hashes).toContain("a".repeat(40));
+		if (capturedHash) expect(hashes).toContain(capturedHash);
+		else expect(hashes).toHaveLength(1);
 	};
-	return { dir, capture, assertRetained };
+	const stageFromInit = (cmd: readonly string[]) => {
+		expect(cmd.slice(0, 3)).toEqual(["git", "init", "--bare"]);
+		const stage = cmd[3];
+		if (!stage) throw new Error("Expected an isolated shadow stage");
+		expect(dirname(stage)).toBe(dirname(dir));
+		expect(basename(stage).startsWith(`.nf-shadow-stage-${basename(dir)}-`)).toBe(true);
+		expect(fs.existsSync(join(stage, "nf-shadow-init"))).toBe(true);
+		expect(stage).not.toBe(dir);
+		otherRoots.push(stage);
+		return stage;
+	};
+	return { dir, capture, assertRetained, stageFromInit };
 }
 
 for (const kind of ["cwd", "registry"] as const) {
-	test(`cold initialization protects a missing physical shadow with an independent ${kind} claim`, async () => {
+	test(`cold initialization accepts an independent ${kind} reference to a missing cache while destruction stays protected`, async () => {
 		const { dir, capture, assertRetained } = await shadowBirthFixture();
 		const id = generateId();
 		const now = new Date().toISOString();
@@ -779,14 +800,24 @@ for (const kind of ["cwd", "registry"] as const) {
 				updatedAt: now,
 			});
 		}
-		const git = spyOn(spawn, "safeSpawn");
 		const deletion = spyOn(fs, "rmSync");
+		const readClaims = mock(async () => {
+			throw new Error("A reference is not exclusive snapshot-creation ownership");
+		});
 		const before = changes();
-		await expect(capture()).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
-		expect(git).toHaveBeenCalledTimes(0);
-		expect(deletion).toHaveBeenCalledTimes(0);
-		expect(fs.existsSync(dir)).toBe(false);
-		assertRetained(before);
+		const hash = await withLifecycleGuardPorts(
+			{ canonicalPath: canonicalProtectionPath, readClaims },
+			() => capture(),
+		);
+		expect(hash).toMatch(/^[a-f0-9]{40,64}$/);
+		expect(readClaims).not.toHaveBeenCalled();
+		expect(deletion).not.toHaveBeenCalled();
+		expect(fs.existsSync(join(dir, "HEAD"))).toBe(true);
+		expect(fs.existsSync(join(dir, "nf-shadow-init"))).toBe(false);
+		assertRetained(before, hash);
+		expect((await inspect([{ path: dir }], "reference retirement fixture")).status).toBe(
+			"protected",
+		);
 	});
 }
 
@@ -794,7 +825,7 @@ const failedShadowInit = { exitCode: 1, stdout: "", stderr: "fixture shadow init
 
 for (const legacy of ["frozen-pin", "corrupt", "unimported"] as const) {
 	test(`cold initialization ignores ${legacy} legacy compatibility while destruction remains protected`, async () => {
-		const { dir, capture, assertRetained } = await shadowBirthFixture();
+		const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
 		const directory = getNarraforkPath("worktree-requests");
 		await mkdir(directory, { recursive: true });
 		// More than one read-only proof page models an unfinished import, not a permanent cap.
@@ -815,14 +846,25 @@ for (const legacy of ["frozen-pin", "corrupt", "unimported"] as const) {
 		else await importLegacyReceiptFixture(legacy !== "corrupt");
 		const marker = Buffer.from([0, 255, 128, 13, 10]);
 		const deletion = spyOn(fs, "rmSync");
+		const originalSpawn = spawn.safeSpawn;
 		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
-			await writeFile(join(dir, "marker.bin"), marker);
-			return failedShadowInit;
+			if (opts.cmd[1] === "init") {
+				const stage = stageFromInit(opts.cmd);
+				await writeFile(join(stage, "marker.bin"), marker);
+			}
+			return originalSpawn(opts);
+		});
+		const readClaims = mock(async () => {
+			throw new Error("Legacy inventory must not gate capture");
 		});
 		const before = changes();
-		await expect(capture()).rejects.toThrow("shadow repo init failed: fixture shadow init failure");
-		expect(init).toHaveBeenCalledTimes(1);
+		const hash = await withLifecycleGuardPorts(
+			{ canonicalPath: canonicalProtectionPath, readClaims },
+			() => capture(),
+		);
+		expect(hash).toMatch(/^[a-f0-9]{40,64}$/);
+		expect(readClaims).not.toHaveBeenCalled();
+		expect(init.mock.calls.filter(([opts]) => opts.cmd[1] === "init")).toHaveLength(1);
 		const destruction = mock(async () => undefined);
 		await expect(
 			withProtectionReservation(
@@ -835,23 +877,29 @@ for (const legacy of ["frozen-pin", "corrupt", "unimported"] as const) {
 		});
 		expect(destruction).toHaveBeenCalledTimes(0);
 		expect(deletion).toHaveBeenCalledTimes(0);
-		assertRetained(before);
+		assertRetained(before, hash);
+		expect(fs.existsSync(join(dir, "nf-shadow-init"))).toBe(false);
 		expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
 	});
 }
 
-test("actual capture preserves the init error and both inodes after a birth replacement", async () => {
-	const { dir, capture, assertRetained } = await shadowBirthFixture();
+test("actual capture preserves the init error and both inodes after a private stage replacement", async () => {
+	const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
 	const backup = join(temporary, "original-birth-D");
 	const original = Buffer.from([0, 128, 255, 13, 10, 1]);
 	const replacement = Buffer.from([0, 128, 255, 13, 10, 2]);
 	const deletion = spyOn(fs, "rmSync");
+	let stage = "";
+	let originalInode = 0;
+	let replacementInode = 0;
 	const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-		expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
-		await writeFile(join(dir, "marker.bin"), original);
-		await rename(dir, backup);
-		await mkdir(dir);
-		await writeFile(join(dir, "marker.bin"), replacement);
+		stage = stageFromInit(opts.cmd);
+		originalInode = fs.lstatSync(stage).ino;
+		await writeFile(join(stage, "marker.bin"), original);
+		await rename(stage, backup);
+		await mkdir(stage);
+		replacementInode = fs.lstatSync(stage).ino;
+		await writeFile(join(stage, "marker.bin"), replacement);
 		return failedShadowInit;
 	});
 	const before = changes();
@@ -860,7 +908,11 @@ test("actual capture preserves the init error and both inodes after a birth repl
 	expect(deletion).toHaveBeenCalledTimes(0);
 	assertRetained(before);
 	expect(await readFile(join(backup, "marker.bin"))).toEqual(original);
-	expect(await readFile(join(dir, "marker.bin"))).toEqual(replacement);
+	expect(fs.lstatSync(backup).ino).toBe(originalInode);
+	expect(await readFile(join(stage, "marker.bin"))).toEqual(replacement);
+	expect(fs.lstatSync(stage).ino).toBe(replacementInode);
+	expect(replacementInode).not.toBe(originalInode);
+	expect(fs.existsSync(dir)).toBe(false);
 });
 
 for (const headOnly of [false, true]) {
@@ -881,43 +933,51 @@ for (const headOnly of [false, true]) {
 	});
 }
 
-test("actual capture retains failed initialization through gcAll and resumes", async () => {
-	const { dir, capture, assertRetained } = await shadowBirthFixture();
+test("actual capture retains a failed private stage through gcAll and publishes a fresh retry", async () => {
+	const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
 	const deletion = spyOn(fs, "rmSync");
+	let failedStage = "";
+	const partial = Buffer.from([0, 255, 13, 10]);
 	const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-		expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
-		await writeFile(join(dir, "partial-owned.bin"), Buffer.from([0, 255, 13, 10]));
+		failedStage = stageFromInit(opts.cmd);
+		await writeFile(join(failedStage, "partial-owned.bin"), partial);
 		return failedShadowInit;
 	});
 	const before = changes();
 	await expect(capture()).rejects.toBeInstanceOf(TreeSnapshotError);
 	expect(init).toHaveBeenCalledTimes(1);
+	const birth = fs.lstatSync(failedStage);
+	const marker = await readFile(join(failedStage, "nf-shadow-init"));
 	await worktreeTreeSnapshot.gcAll();
 	expect(init).toHaveBeenCalledTimes(1);
-	expect(deletion).toHaveBeenCalledTimes(0);
-	expect(await readFile(join(dir, "partial-owned.bin"))).toEqual(Buffer.from([0, 255, 13, 10]));
-	expect(fs.existsSync(join(dir, "HEAD"))).toBe(false);
+	expect(deletion).not.toHaveBeenCalled();
+	expect(await readFile(join(failedStage, "partial-owned.bin"))).toEqual(partial);
+	expect(fs.existsSync(dir)).toBe(false);
 	assertRetained(before);
-	const marker = await readFile(join(dir, "nf-shadow-init"));
-	const birth = fs.lstatSync(dir);
 	expect(marker.length).toBeLessThanOrEqual(256);
 	init.mockRestore();
-	expect(await capture()).toMatch(/^[0-9a-f]{40}$/);
-	expect(fs.lstatSync(dir).ino).toBe(birth.ino);
+	const hash = await capture();
+	expect(hash).toMatch(/^[0-9a-f]{40,64}$/);
+	expect(fs.lstatSync(dir).ino).not.toBe(birth.ino);
+	expect(fs.lstatSync(failedStage).ino).toBe(birth.ino);
+	expect(await readFile(join(failedStage, "nf-shadow-init"))).toEqual(marker);
+	expect(await readFile(join(failedStage, "partial-owned.bin"))).toEqual(partial);
+	expect(fs.existsSync(join(dir, "partial-owned.bin"))).toBe(false);
 	expect(fs.existsSync(join(dir, "nf-shadow-init"))).toBe(false);
-	expect(await readFile(join(dir, "partial-owned.bin"))).toEqual(Buffer.from([0, 255, 13, 10]));
-	expect(deletion).toHaveBeenCalledTimes(0);
+	expect(deletion).not.toHaveBeenCalled();
+	assertRetained(before, hash);
 });
 
 for (const kind of ["cwd", "registry"] as const) {
-	test(`actual capture retains the init error and data after a bypassed late ${kind} claim`, async () => {
-		const { dir, capture, assertRetained } = await shadowBirthFixture();
+	test(`actual capture retains failed stage evidence and permits retry after a late ${kind} reference`, async () => {
+		const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
 		const marker = Buffer.from([0, 255, 128, 13, 10]);
 		let before: number | undefined;
+		let failedStage = "";
 		const deletion = spyOn(fs, "rmSync");
 		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
-			await writeFile(join(dir, "marker.bin"), marker);
+			failedStage = stageFromInit(opts.cmd);
+			await writeFile(join(failedStage, "marker.bin"), marker);
 			if (kind === "cwd") {
 				const id = generateId();
 				otherNarrators.push(id);
@@ -949,17 +1009,55 @@ for (const kind of ["cwd", "registry"] as const) {
 		});
 		await expect(capture()).rejects.toThrow("shadow repo init failed: fixture shadow init failure");
 		expect(init).toHaveBeenCalledTimes(1);
-		await expect(capture()).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
-		expect(init).toHaveBeenCalledTimes(1);
-		expect(deletion).toHaveBeenCalledTimes(0);
+		expect(deletion).not.toHaveBeenCalled();
 		assertRetained(before);
-		expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
+		expect(await readFile(join(failedStage, "marker.bin"))).toEqual(marker);
+		expect(fs.existsSync(dir)).toBe(false);
+		init.mockRestore();
+		const hash = await capture();
+		expect(hash).toMatch(/^[0-9a-f]{40,64}$/);
+		assertRetained(before, hash);
+		expect(await readFile(join(failedStage, "marker.bin"))).toEqual(marker);
+		expect((await inspect([{ path: dir }], "late reference retirement")).status).toBe("protected");
 	});
 }
 
+test("a late nonempty physical final refuses publication while preserving the complete stage and all history", async () => {
+	const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
+	const independent = Buffer.from([0, 255, 42, 13, 10]);
+	const staged = Buffer.from([0, 128, 27]);
+	const deletion = spyOn(fs, "rmSync");
+	const originalSpawn = spawn.safeSpawn;
+	let stage = "";
+	const git = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+		if (opts.cmd[1] === "init") {
+			stage = stageFromInit(opts.cmd);
+			await writeFile(join(stage, "stage-evidence.bin"), staged);
+			await mkdir(dir);
+			await writeFile(join(dir, "independent.bin"), independent);
+		}
+		return originalSpawn(opts);
+	});
+	const before = changes();
+	await expect(capture()).rejects.toMatchObject({
+		code: expect.stringMatching(/^(ENOTEMPTY|EEXIST|EPERM)$/),
+	});
+	assertRetained(before);
+	expect(await readFile(join(dir, "independent.bin"))).toEqual(independent);
+	expect(await readFile(join(stage, "stage-evidence.bin"))).toEqual(staged);
+	expect(fs.existsSync(join(stage, "HEAD"))).toBe(true);
+	expect(fs.existsSync(join(stage, "nf-shadow-init"))).toBe(false);
+	const calls = git.mock.calls.length;
+	await expect(capture()).rejects.toBeInstanceOf(TreeSnapshotError);
+	expect(git).toHaveBeenCalledTimes(calls);
+	expect(deletion).not.toHaveBeenCalled();
+	assertRetained(before);
+	expect(await readFile(join(dir, "independent.bin"))).toEqual(independent);
+});
+
 for (const kind of ["cwd", "registry", "receipt"] as const) {
 	test(`cold initialization permits a shared checkout ${kind} reference without a global barrier`, async () => {
-		const { dir, capture, assertRetained } = await shadowBirthFixture();
+		const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
 		const directory = getNarraforkPath("worktree-requests-v2");
 		const journal = new FileWorktreeJournal(directory, getNarraforkPath("worktree-requests"));
 		const publish = spyOn(journal, "claim");
@@ -973,11 +1071,12 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 		const deletion = spyOn(fs, "rmSync");
 		let before: number | undefined;
 		const originalSpawn = spawn.safeSpawn;
+		let stage = "";
 		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
 			// Session creation indexes its cwd into a project with a bounded git probe;
 			// only the shadow initializer is the sink under test.
 			if (opts.cmd[1] === "-C") return originalSpawn(opts);
-			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
+			stage = stageFromInit(opts.cmd);
 			if (kind === "cwd") {
 				const created = await narratorService.create({ cwd: path, title: "shared checkout cwd" });
 				otherNarrators.push(created.id);
@@ -1019,38 +1118,38 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 			expect(publish).toHaveBeenCalledTimes(kind === "receipt" ? 1 : 0);
 			expect(fs.existsSync(receipt)).toBe(kind === "receipt");
 			expect(deletion).not.toHaveBeenCalled();
-			expect(fs.existsSync(dir)).toBe(true);
-			expect(fs.existsSync(join(dir, "nf-shadow-init"))).toBe(true);
+			expect(fs.existsSync(dir)).toBe(false);
+			expect(fs.existsSync(join(stage, "nf-shadow-init"))).toBe(true);
 		} finally {
-			if (kind === "receipt") await rm(receipt);
+			if (kind === "receipt") await rm(receipt, { force: true });
 		}
 	});
 }
 
-test("actual capture preserves its init error without a final inventory query", async () => {
-	const { dir, capture, assertRetained } = await shadowBirthFixture();
+test("actual capture preserves its init error without any global inventory query", async () => {
+	const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
 	const marker = Buffer.from([0, 255, 128, 13, 10]);
 	const deletion = spyOn(fs, "rmSync");
-	let inventoryAvailable = true;
+	let stage = "";
 	spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-		expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
-		await writeFile(join(dir, "marker.bin"), marker);
-		inventoryAvailable = false;
+		stage = stageFromInit(opts.cmd);
+		await writeFile(join(stage, "marker.bin"), marker);
 		return failedShadowInit;
+	});
+	const readClaims = mock(async () => {
+		throw new Error("Global inventory is unavailable");
 	});
 	const before = changes();
 	await expect(
-		withLifecycleGuardPorts(
-			{
-				canonicalPath: async (value) => value,
-				readClaims: async () => ({ complete: inventoryAvailable, claims: [] }),
-			},
-			() => capture(),
+		withLifecycleGuardPorts({ canonicalPath: canonicalProtectionPath, readClaims }, () =>
+			capture(),
 		),
 	).rejects.toThrow("shadow repo init failed: fixture shadow init failure");
-	expect(deletion).toHaveBeenCalledTimes(0);
+	expect(readClaims).not.toHaveBeenCalled();
+	expect(deletion).not.toHaveBeenCalled();
 	assertRetained(before);
-	expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
+	expect(await readFile(join(stage, "marker.bin"))).toEqual(marker);
+	expect(fs.existsSync(dir)).toBe(false);
 });
 
 test("reserving one checkout does not block a sibling session using the same repository", async () => {
@@ -1092,20 +1191,11 @@ test("actual cold snapshot initialization allows shared subagents and unrelated 
 		}
 		return originalSpawn(options);
 	});
-	const readClaims = mock(
-		async (
-			_deadline: number,
-			_signal?: AbortSignal,
-			targets?: readonly { path?: string }[],
-			includeLegacyReceipts?: boolean,
-		) => {
-			expect(includeLegacyReceipts).toBe(false);
-			expect(targets?.every((target) => target.path === dir)).toBe(true);
-			return { complete: true, claims: [] };
-		},
-	);
+	const readClaims = mock(async () => {
+		throw new Error("Shared admissions and cold capture must not query global inventory");
+	});
 	const capture = withLifecycleGuardPorts(
-		{ canonicalPath: async (value) => value, readClaims },
+		{ canonicalPath: canonicalProtectionPath, readClaims },
 		() => worktreeTreeSnapshot.capture(path),
 	);
 	void capture.catch(() => {});
@@ -1123,8 +1213,30 @@ test("actual cold snapshot initialization allows shared subagents and unrelated 
 			cwd: path,
 		});
 		otherNarrators.push(child.id);
-		const ordinary = await narratorService.create({ cwd: temporary, title: "unrelated local cwd" });
+		const ordinary = await narratorService.create({
+			cwd: "/",
+			title: "ordinary root cwd is not an exclusive cache claim",
+		});
 		otherNarrators.push(ordinary.id);
+		const remoteId = generateId();
+		otherNarrators.push(remoteId);
+		await db.insert(narrators).values({
+			id: remoteId,
+			cwd: "/",
+			defaultDeviceId: "remote-fixture",
+			workspaceRevision: 1,
+			workspaceContext: {
+				revision: 1,
+				deviceId: "remote-fixture",
+				cwd: "/",
+				pathFlavor: "posix",
+				contextKey: "remote-root-fixture",
+				capabilities: { switchDirectory: false },
+			},
+			title: "remote root must not become a local cache inventory barrier",
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+		});
 		let remote = false;
 		await withWorkspaceAdmission(
 			{ deviceId: "remote-fixture", path: "/unrelated/remote" },
@@ -1137,7 +1249,7 @@ test("actual cold snapshot initialization allows shared subagents and unrelated 
 		release();
 	}
 	expect(await capture).toMatch(/^[0-9a-f]{40,64}$/);
-	expect(readClaims).toHaveBeenCalled();
+	expect(readClaims).not.toHaveBeenCalled();
 });
 
 test("a real zero-dispatch failed create keeps its v2 receipt without creating protection pins", async () => {

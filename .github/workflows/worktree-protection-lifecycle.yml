@@ -1,0 +1,104 @@
+name: worktree-protection-lifecycle
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "server/db/resource-protection-index.ts"
+      - "server/lib/agent/execution/path-semantics.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/platform-path*.ts"
+      - "server/lib/agent/execution/__tests__/path-semantics.test.ts"
+      - "server/lib/spawn*.ts"
+      - "server/services/resource-protection*.ts"
+      - "server/services/tree-snapshot-paths*.ts"
+      - "server/services/worktree-lifecycle-guard*.ts"
+      - "server/services/worktree-tree-snapshot*.ts"
+      - "server/services/snapshot-*.ts"
+      - "server/services/narrator-tree-snapshot-hooks*.ts"
+      - "server/services/narrator-worktree-resources.test.ts"
+      - "server/services/__tests__/subagent-tree-snapshot-hooks.test.ts"
+      - "server/services/tool-edit-preview.ts"
+      - "server/services/__tests__/tool-edit-preview.test.ts"
+      - "tests/scripts/worktree-protection-workflow.test.ts"
+      - "tests/preload.ts"
+      - "tests/sqlite-template.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/worktree-protection-lifecycle.yml"
+  pull_request:
+    paths:
+      - "server/db/resource-protection-index.ts"
+      - "server/lib/agent/execution/path-semantics.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/platform-path*.ts"
+      - "server/lib/agent/execution/__tests__/path-semantics.test.ts"
+      - "server/lib/spawn*.ts"
+      - "server/services/resource-protection*.ts"
+      - "server/services/tree-snapshot-paths*.ts"
+      - "server/services/worktree-lifecycle-guard*.ts"
+      - "server/services/worktree-tree-snapshot*.ts"
+      - "server/services/snapshot-*.ts"
+      - "server/services/narrator-tree-snapshot-hooks*.ts"
+      - "server/services/narrator-worktree-resources.test.ts"
+      - "server/services/__tests__/subagent-tree-snapshot-hooks.test.ts"
+      - "server/services/tool-edit-preview.ts"
+      - "server/services/__tests__/tool-edit-preview.test.ts"
+      - "tests/scripts/worktree-protection-workflow.test.ts"
+      - "tests/preload.ts"
+      - "tests/sqlite-template.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/worktree-protection-lifecycle.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worktree-protection-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
+jobs:
+  lifecycle:
+    name: Worker snapshot lifecycle (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Verify lifecycle, compatibility, and real process cleanup
+        run: >-
+          bun test --isolate
+          server/lib/platform-path.test.ts
+          server/lib/agent/execution/__tests__/path-semantics.test.ts
+          server/services/tree-snapshot-paths.test.ts
+          server/services/resource-protection-index.test.ts
+          server/services/resource-protection-production.test.ts
+          server/services/narrator-worktree-resources.test.ts
+          server/services/worktree-lifecycle-guard.test.ts
+          server/services/worktree-lifecycle-guard.integration.test.ts
+          server/services/worktree-tree-snapshot.test.ts
+          server/services/snapshot-revert-tree.test.ts
+          server/services/snapshot-capture-receipts.test.ts
+          server/services/narrator-tree-snapshot-hooks.test.ts
+          server/services/__tests__/subagent-tree-snapshot-hooks.test.ts
+          server/services/__tests__/tool-edit-preview.test.ts
+          server/lib/spawn-stream.test.ts
+          server/lib/spawn-kill.test.ts
+          tests/scripts/worktree-protection-workflow.test.ts
