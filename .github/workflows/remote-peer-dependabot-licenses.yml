@@ -1,0 +1,141 @@
+name: remote-peer Dependabot license sync
+# A remote-peer Go dependency bump must also update licenses/extra/remote-peer-LICENSES.txt
+# and the matching licenses/extra/entries.json versions, or remote-peer.yml fails.
+# Dependabot only edits go.mod/go.sum, so this workflow regenerates both license files on
+# Dependabot's own remote-peer PRs and pushes them back to the PR branch.
+#
+# Scope is deliberately narrow:
+# - only Dependabot-authored PRs from this repository, on a dependabot/go_modules/remote-peer/
+#   branch, whose changed files are exactly remote-peer/go.mod and remote-peer/go.sum;
+# - only version updates of already-reviewed license entries. A new or removed module fails
+#   here (sync-license-entries.sh) and needs a person to review its license;
+# - nothing from the bumped modules is compiled or run: the generator and its test use only
+#   the standard library and read license files from the module cache.
+#
+# Pushes made with GITHUB_TOKEN start no new pull_request runs, so after pushing, this job
+# dispatches ci.yml and remote-peer.yml on the PR branch so its new head gets checks.
+# After that push Dependabot no longer rebases the PR on its own; comment
+# `@dependabot recreate` to rebuild it, and this workflow runs again.
+
+permissions: {}
+
+on:
+  pull_request:
+    paths:
+      - "remote-peer/go.mod"
+      - "remote-peer/go.sum"
+
+concurrency:
+  group: remote-peer-dependabot-licenses-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    name: Sync remote-peer license records
+    if: >-
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'dependabot/go_modules/remote-peer/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: read
+    env:
+      CGO_ENABLED: "0"
+      GOTOOLCHAIN: go1.26.1
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Require a go.mod/go.sum-only PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' |
+              LC_ALL=C sort
+          )"
+          expected="$(printf '%s\n' remote-peer/go.mod remote-peer/go.sum)"
+          if [[ "$files" != "$expected" ]]; then
+            printf 'Not syncing: PR changes more than remote-peer/go.mod and go.sum:\n%s\n' \
+              "$files" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.1
+          # No shared cache: this job holds a write token.
+          cache: false
+          check-latest: false
+
+      - name: Download and verify locked modules
+        working-directory: remote-peer
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Regenerate license records
+        working-directory: remote-peer
+        run: make licenses
+
+      - name: Check what changed
+        id: diff
+        run: |
+          changed="$(git status --porcelain --untracked-files=all | cut -c4- | LC_ALL=C sort)"
+          if [[ -z "$changed" ]]; then
+            printf 'License records already match go.mod.\n'
+            printf 'changed=false\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          allowed="$(printf '%s\n' licenses/extra/entries.json licenses/extra/remote-peer-LICENSES.txt)"
+          while IFS= read -r path; do
+            if ! grep -qxF "$path" <<<"$allowed"; then
+              printf 'Unexpected change outside the license records: %s\n' "$path" >&2
+              exit 1
+            fi
+          done <<<"$changed"
+          git diff
+          printf 'changed=true\n' >>"$GITHUB_OUTPUT"
+
+      - name: Verify the synced records
+        if: steps.diff.outputs.changed == 'true'
+        working-directory: remote-peer
+        env:
+          GOFLAGS: -count=1
+        run: go test ./internal/licensebundle
+
+      - name: Push the sync commit
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add licenses/extra/entries.json licenses/extra/remote-peer-LICENSES.txt
+          git commit -q -m 'chore(remote-peer): sync license records with go.mod' \
+            -m "Generated by remote-peer-dependabot-licenses.yml for PR #$PR_NUMBER."
+          # Fast-forward only: if Dependabot moved the branch meanwhile, its new push
+          # starts a fresh run of this workflow.
+          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/$HEAD_REF"
+
+      - name: Start checks on the new head
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$HEAD_REF"
+          gh workflow run remote-peer.yml --repo "$GITHUB_REPOSITORY" --ref "$HEAD_REF"
