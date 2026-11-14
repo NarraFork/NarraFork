@@ -21,7 +21,8 @@
  *   |                    | the person alone wrote are counted, not listed; deleted ones counted |
  *   | 任务 tasks         | `task_json.status` before the window against after it: done,        |
  *   |                    | cancelled, reopened; handed to the person (`assignee`); new and      |
- *   |                    | started only counted; tasks the lease job gave back counted apart    |
+ *   |                    | started only counted; tasks the lease job gave back counted apart,   |
+ *   |                    | and so are tasks a session gave back with a handoff at a run's end   |
  *   | 计划 plans         | each `plan` commit: the root's `task_json.plan` before and after it  |
  *   | 提问 questions     | each version with the question flag: its `ask_json` before and after |
  *   | 其他 other         | reverts, imports, confirmations by people, tasks handed to subagents |
@@ -49,15 +50,22 @@ import type {
 	OutlineDigestTaskStored,
 } from "@shared/outline-digest";
 import { OUTLINE_DIGEST_SECTIONS } from "@shared/outline-digest";
+import { OUTLINE_HANDOFF_ACTOR } from "./handoff";
 import { readInProcess } from "./in-process";
 import {
+	commitPersonId,
 	OUTLINE_CHANGE,
+	OUTLINE_HAND_OUT_ACTOR,
 	type OutlineAskJson,
 	type OutlineSpaceKind,
 	type OutlineTaskJson,
 } from "./model";
 import { OUTLINE_PLAN_ACTOR, OUTLINE_PLAN_REVIEW_ACTOR } from "./plans";
-import { OUTLINE_SPEC_IMPORT_ACTOR } from "./spec-import/plan";
+import {
+	OUTLINE_SPEC_IMPORT_ACTOR,
+	OUTLINE_SPEC_LOSS_ACTOR,
+	OUTLINE_SPEC_REVERT_ACTOR,
+} from "./spec-import/plan";
 import type { OutlineRangeChange, OutlineVersionMeta } from "./store/digest-port";
 import type {
 	OutlineCommitRow,
@@ -109,11 +117,17 @@ export const OUTLINE_DIGEST_REPORT_ACTOR = "outline-report";
  */
 const ROUTINE_SYSTEM_ACTORS = new Set([
 	OUTLINE_LEASE_ACTOR,
+	// A session's unfinished task given back at a run's end, with a handoff (P2 PR 10c-2):
+	// counted with the tasks (`handedBack`), never listed.
+	OUTLINE_HANDOFF_ACTOR,
 	OUTLINE_PLAN_ACTOR,
 	OUTLINE_PLAN_REVIEW_ACTOR,
 	"outline-task-start",
 	// A session opened for a task from the board: its claim, and a claim given back (P2 PR 10c-1).
 	"outline-task-open",
+	// A session's task handed out (P2 PR 10c-3): the copy is told as a task created by whoever
+	// handed it out (`commitActor`), not as a system commit.
+	OUTLINE_HAND_OUT_ACTOR,
 	"outline-questions",
 	"outline-live",
 	"outline-live-sync",
@@ -122,6 +136,13 @@ const ROUTINE_SYSTEM_ACTORS = new Set([
 	// Old sessions' Dynamic Spec brought into the outline (P2 PR 12b): one session's import is
 	// several commits and many sessions are imported in a day, none of it anyone's work that day.
 	OUTLINE_SPEC_IMPORT_ACTOR,
+	// An administrator's move back to Dynamic Spec (P2 PR 12b2): its markers and the tasks it let
+	// go, bookkeeping of a decision made on the admin page, not anyone's work in the space.
+	OUTLINE_SPEC_REVERT_ACTOR,
+	// Possibly lost Dynamic Spec content attached to its imported page, by the scan's pass or
+	// because a person asked, and its removal on a dismissal (P2 PR 12c): old content shown where
+	// it belongs (owner decision D52: on the page only), not work of the day.
+	OUTLINE_SPEC_LOSS_ACTOR,
 ]);
 
 /** A commit of the Dynamic Spec import: what it writes is where its tasks start from, not news. */
@@ -228,6 +249,20 @@ function actorOf(kind: string, id: string): OutlineDigestActor {
 	return { kind: kind === "human" || kind === "agent" ? kind : "system", id };
 }
 
+/**
+ * Who a commit's task change is told as made by: its actor, except a hand-out's (P2 PR 10c-3), a
+ * system commit made for whoever handed the task out: the person (`commitPersonId`), or the
+ * session it carries.
+ */
+function commitActor(commit: OutlineCommitRow): OutlineDigestActor {
+	if (commit.actorKind === "system" && commit.actorId === OUTLINE_HAND_OUT_ACTOR) {
+		const person = commitPersonId(commit);
+		if (person) return { kind: "human", id: person };
+		if (commit.narratorId) return { kind: "agent", id: commit.narratorId };
+	}
+	return actorOf(commit.actorKind, commit.actorId);
+}
+
 function claimActor(claim: OutlineTaskClaimRow | undefined): OutlineDigestActor | null {
 	if (!claim) return null;
 	const narrator = claim.holderNarratorId ?? claim.lastHolderNarratorId;
@@ -274,6 +309,8 @@ export interface OutlineSpaceSummary {
 	tasksCreated: number;
 	tasksStarted: number;
 	leaseReturned: number;
+	/** Tasks a session gave back unfinished at a run's end (commits of `outline-handoff`). */
+	handedBack: number;
 	plans: OutlineDigestPlanStored[];
 	reviewComments: number;
 	questions: Array<Omit<OutlineDigestQuestionStored, "toYou">>;
@@ -337,6 +374,7 @@ export async function summarizeSpaceWindow(
 		tasksCreated: 0,
 		tasksStarted: 0,
 		leaseReturned: 0,
+		handedBack: 0,
 		plans: [],
 		reviewComments: 0,
 		questions: [],
@@ -478,15 +516,17 @@ export async function summarizeSpaceWindow(
 				: (prior.get(id)?.taskJson ?? null);
 		if (!isNew && !imported && prior.get(id)?.deleted) continue;
 		const after = lastVersion.taskJson;
-		const leased = list.some((v) => {
-			const c = commitOf.get(v.commitId);
-			return (
-				(v.changeFlags & OUTLINE_CHANGE.TASK) !== 0 &&
-				c?.actorKind === "system" &&
-				c.actorId === OUTLINE_LEASE_ACTOR
-			);
-		});
-		if (leased) summary.leaseReturned++;
+		const reopenedBy = (actor: string) =>
+			list.some((v) => {
+				const c = commitOf.get(v.commitId);
+				return (
+					(v.changeFlags & OUTLINE_CHANGE.TASK) !== 0 &&
+					c?.actorKind === "system" &&
+					c.actorId === actor
+				);
+			});
+		if (reopenedBy(OUTLINE_LEASE_ACTOR)) summary.leaseReturned++;
+		if (reopenedBy(OUTLINE_HANDOFF_ACTOR)) summary.handedBack++;
 		const change = taskTransition(before, after, isNew);
 		if (change.created && after) summary.tasksCreated++;
 		if (change.started) summary.tasksStarted++;
@@ -503,7 +543,7 @@ export async function summarizeSpaceWindow(
 			at: commit.createdAt,
 			blockId: id,
 			pageId: lastVersion.pageId,
-			by: actorOf(commit.actorKind, commit.actorId),
+			by: commitActor(commit),
 			executor: null,
 			manager: after.manager ? actorOf(after.manager.kind, after.manager.id) : null,
 			goal: after.humanCreated === true,
@@ -811,6 +851,7 @@ export function selectForPerson(
 			tasksCreated: summary.tasksCreated,
 			tasksStarted: summary.tasksStarted,
 			leaseReturned: summary.leaseReturned,
+			...(summary.handedBack > 0 ? { handedBack: summary.handedBack } : {}),
 			reviewComments: summary.reviewComments,
 		},
 		delegated: summary.delegated
@@ -870,6 +911,7 @@ export function spaceWeight(c: OutlinePersonContribution): number {
 		c.space.tasksCreated +
 		c.space.tasksStarted +
 		c.space.leaseReturned +
+		(c.space.handedBack ?? 0) +
 		c.space.reviewComments
 	);
 }

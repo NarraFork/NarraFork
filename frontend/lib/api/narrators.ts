@@ -1180,6 +1180,8 @@ export const narratorsApi = {
 			scope: "full" | "visible";
 			includeToolIO: boolean;
 			lang: string;
+			/** `1,2,3-10`；省略或空串表示导出当前 scope 的全部消息。 */
+			range?: string;
 		},
 	) => {
 		const params = new URLSearchParams({
@@ -1189,6 +1191,7 @@ export const narratorsApi = {
 			// The server only localizes Markdown labels for the languages it knows.
 			lang: opts.lang === "zh-CN" ? "zh-CN" : "en",
 		});
+		if (opts.range?.trim()) params.set("range", opts.range.trim());
 		const res = await authorizedFetch(`${apiBase()}/narrators/${id}/export?${params.toString()}`);
 		if (!res.ok) {
 			const error = await readFetchError(res, "Export failed");
@@ -1199,6 +1202,21 @@ export const narratorsApi = {
 			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
 		};
 	},
+	/**
+	 * 导出范围选择弹窗的轮次索引。
+	 *
+	 * `scope` 与导出保持一致：弹窗只列将要导出的那份内容里的轮次。
+	 */
+	getNarratorExportTurns: (id: string, scope: "full" | "visible", signal?: AbortSignal) =>
+		request<{
+			turns: Array<{
+				turn: number;
+				userPreview: string;
+				assistantPreview: string | null;
+				createdAt: string;
+			}>;
+			truncated: boolean;
+		}>(`/narrators/${id}/export-turns?scope=${scope}`, { signal }),
 	getToolCallDetail: (
 		narratorId: string,
 		toolUseId: string,
@@ -1714,9 +1732,12 @@ export const narratorsApi = {
 	// returned here and cannot be changed through these calls.
 
 	getNarratorGitIdentity: (id: string) =>
-		request<{ identities: GitIdentity[]; selectedId: string | null }>(
-			`/narrators/${id}/git-identity`,
-		),
+		request<{
+			identities: GitIdentity[];
+			selectedId: string | null;
+			/** 会话没有自己的 pick 时跟随的侧栏文件夹身份；没有文件夹或未设置时为 null。 */
+			folderSelectedId?: string | null;
+		}>(`/narrators/${id}/git-identity`),
 	setNarratorGitIdentity: (id: string, identityId: string | null) =>
 		request<{ ok: boolean }>(`/narrators/${id}/git-identity`, {
 			method: "PUT",
@@ -1984,7 +2005,7 @@ export const narratorsApi = {
 			}
 		} else {
 			headers["Content-Type"] = "application/json";
-			res = await fetch(url, {
+			res = await authorizedFetch(url, {
 				method: "POST",
 				headers,
 				body: JSON.stringify({
@@ -2205,7 +2226,7 @@ export const narratorsApi = {
 			});
 		}
 
-		const res = await fetch(
+		const res = await authorizedFetch(
 			inputBlockId
 				? `${apiBase()}/narrators/${narratorId}/blocks/${encodeURIComponent(inputBlockId)}/edit-and-regenerate`
 				: `${apiBase()}/narrators/${narratorId}/edit-and-regenerate/${messageId}`,

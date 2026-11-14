@@ -38,6 +38,33 @@ function installMapLocalStorage(): Map<string, string> {
 	return store;
 }
 
+describe("getToken without usable browser storage", () => {
+	test("a missing localStorage is an absent session, not a rendering exception", () => {
+		Reflect.deleteProperty(g, "localStorage");
+		expect(getToken()).toBeNull();
+	});
+	test("a blocked storage getter does not throw while rendering a preference consumer", () => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			get() {
+				throw new DOMException("Storage blocked", "SecurityError");
+			},
+		});
+		expect(getToken()).toBeNull();
+	});
+	test("a failing getItem cannot produce an authenticated token", () => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			value: {
+				getItem() {
+					throw new Error("Storage unavailable");
+				},
+			},
+		});
+		expect(getToken()).toBeNull();
+	});
+});
+
 describe("getErrorMessage", () => {
 	test("prefers fallback reason over generic error code", () => {
 		expect(
@@ -284,6 +311,27 @@ describe("endSession", () => {
 		);
 	});
 
+	for (const outcome of ["success", "failure"] as const) {
+		test(`a delayed ${outcome} logout cannot clear a newer session`, async () => {
+			installMapLocalStorage();
+			let complete!: () => void;
+			const response = new Promise<Response>((resolve, reject) => {
+				complete = () => {
+					if (outcome === "success") resolve(new Response(null, { status: 200 }));
+					else reject(new TypeError("Connection closed"));
+				};
+			});
+			globalThis.fetch = (async () => response) as unknown as typeof fetch;
+			setToken(opaqueToken("old"));
+			const pending = endSession();
+			expect(getToken()).toBeNull();
+			const replacement = opaqueToken("new");
+			setToken(replacement);
+			complete();
+			await pending;
+			expect(getToken()).toBe(replacement);
+		});
+	}
 	test("sends nothing when there is no session", () => {
 		installMapLocalStorage();
 		let called = false;

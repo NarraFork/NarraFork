@@ -1170,8 +1170,15 @@ test("an empty 顺便提问 asks about the excerpt directly; Escape and failures
 
 		await openAsk(page);
 		await page.keyboard.type("never sent");
-		// Escape steps back to the still-live selection's actions; ✕ dismisses them.
+		const draftBeforeCancel = (await snapshot(page)).document;
+		// Typing focuses the question input and collapses the source selection. Escape
+		// cancels ask mode, but actions only survive until the live-selection debounce
+		// notices the collapse. Never depend on that stale candidate outliving Escape.
 		await page.keyboard.press("Escape");
+		await page.waitForSelector('[data-quote-candidate][data-mode="ask"]', { hidden: true });
+		expect((await snapshot(page)).document).toEqual(draftBeforeCancel);
+		// Select the excerpt again before testing the action toolbar's explicit dismiss.
+		await selectQuotableSource(page);
 		await page.waitForSelector('[data-quote-candidate][data-mode="actions"]', { visible: true });
 		await page.click("[data-quote-dismiss]");
 		await page.waitForSelector("[data-quote-candidate]", { hidden: true });
@@ -1193,6 +1200,7 @@ test("an empty 顺便提问 asks about the excerpt directly; Escape and failures
 			),
 		).toBe("fails");
 		expect((await snapshot(page)).asked).toHaveLength(2);
+		expect((await snapshot(page)).document).toEqual(draftBeforeCancel);
 	} finally {
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.failAsk(null));
 		await close(page);

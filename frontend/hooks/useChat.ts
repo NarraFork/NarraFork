@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type ChatRoomKind, isConversationRoomKind } from "@shared/chat-room-kinds";
 import {
 	type InfiniteData,
@@ -56,7 +57,7 @@ export function useChatDirectory(query?: string, enabled = true) {
 	return useQuery({
 		queryKey: chatKeys.directory(query),
 		queryFn: () => api.listChatDirectory(query),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		gcTime: CHAT_GC_TIME_MS,
 	});
 }
@@ -65,6 +66,7 @@ export function useChatRooms() {
 	return useQuery({
 		queryKey: chatKeys.rooms(),
 		queryFn: () => api.listChatRooms(),
+		enabled: !REMOTE_BUILD,
 		gcTime: CHAT_GC_TIME_MS,
 		staleTime: CHAT_SUMMARY_STALE_TIME_MS,
 	});
@@ -74,7 +76,7 @@ export function useChatUnread(enabled = true) {
 	return useQuery({
 		queryKey: chatKeys.unread(),
 		queryFn: () => api.getChatUnread(),
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 		gcTime: CHAT_GC_TIME_MS,
 		staleTime: CHAT_SUMMARY_STALE_TIME_MS,
 	});
@@ -85,7 +87,7 @@ export function useNarratorChatRoom(narratorId: string | undefined, enabled = tr
 	return useQuery({
 		queryKey: chatKeys.narratorRoom(narratorId ?? ""),
 		queryFn: () => api.getNarratorChatRoom(narratorId as string),
-		enabled: enabled && !!narratorId,
+		enabled: !REMOTE_BUILD && enabled && !!narratorId,
 		gcTime: CHAT_GC_TIME_MS,
 		staleTime: Number.POSITIVE_INFINITY,
 	});
@@ -101,7 +103,7 @@ export function useBotChatRoom(narratorId: string | undefined, enabled = true) {
 	return useQuery({
 		queryKey: chatKeys.botRoom(narratorId ?? ""),
 		queryFn: () => api.getBotChatRoom(narratorId as string),
-		enabled: enabled && !!narratorId,
+		enabled: !REMOTE_BUILD && enabled && !!narratorId,
 		gcTime: CHAT_GC_TIME_MS,
 		staleTime: CHAT_SUMMARY_STALE_TIME_MS,
 	});
@@ -137,7 +139,7 @@ export function useChatMessages(roomId: string | undefined) {
 			}),
 		initialPageParam: undefined as number | undefined,
 		getNextPageParam: (lastPage: ChatMessagePage) => lastPage.nextBeforeSeq ?? undefined,
-		enabled: !!roomId,
+		enabled: !REMOTE_BUILD && !!roomId,
 		gcTime: CHAT_GC_TIME_MS,
 	});
 }
@@ -593,6 +595,7 @@ export function useChatRoomLive(roomId: string | undefined): void {
 	const qc = useQueryClient();
 
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (!roomId) return;
 		const handleId = narratorWSManager.allocateId();
 		narratorWSManager.joinChatRoom(roomId, handleId);
@@ -656,6 +659,7 @@ export function useChatRoomLive(roomId: string | undefined): void {
 export function useChatUnreadLive(): void {
 	const qc = useQueryClient();
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		const listener = narratorWSManager.addListener(
 			{ narratorIds: "*", types: ["chat:unread_changed"] },
 			(data) => {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	cp,
 	mkdir,
@@ -6,6 +6,7 @@ import {
 	readdir,
 	readFile,
 	realpath,
+	rename,
 	rm,
 	symlink,
 	writeFile,
@@ -13,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { logger } from "@server/lib/logger";
 import {
 	PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES,
 	PROVIDER_REQUEST_MAX_BYTES,
@@ -44,8 +46,9 @@ import {
 	type PluginRuntimeOptions,
 	type RuntimeDiagnostics,
 	type RuntimeState,
+	RuntimeSupervisor,
 } from "@server/services/plugin-runtime";
-import { PluginStateStore } from "@server/services/plugin-state-store";
+import { createPluginStateRecord, PluginStateStore } from "@server/services/plugin-state-store";
 
 const fixturePackage = fileURLToPath(
 	new URL("../../fixtures/plugins/packages/valid-package", import.meta.url),
@@ -348,6 +351,282 @@ afterEach(async () => {
 });
 
 describe("PluginManager", () => {
+	test("shutdown preserves disable failure after successful persistence, supervisor cleanup and callback drain", async () => {
+		const root = await makeTempRoot();
+		const writing = deferred();
+		const release = deferred();
+		let holdWrites = false;
+		const stateStore = new PluginStateStore({
+			root: join(root, "plugins"),
+			renameFile: async (from, to) => {
+				if (holdWrites) {
+					writing.resolve();
+					await release.promise;
+				}
+				await rename(from, to);
+			},
+		});
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({
+			root: stateStore.root,
+			stateStore,
+			runtimeSupervisor: supervisor,
+			disabled: false,
+		});
+		const settle = trackRuntimeLifecycle(manager);
+		const pluginId = "com.example.shutdown-disable-failure";
+		const source = await makePackage(root, pluginId);
+		await manager.install(source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		await settle();
+		const failure = new Error("injected disable failure");
+		const originalDisable = supervisor.disable.bind(supervisor);
+		const disable = spyOn(supervisor, "disable").mockRejectedValue(failure);
+		// This custom supervisor successfully cleans its resource despite the earlier disable error.
+		const shutdown = spyOn(supervisor, "shutdown").mockImplementation(async () => {
+			holdWrites = true;
+			await originalDisable(pluginId);
+		});
+		let closing: Promise<void> | undefined;
+		drainBeforeCleanup.push(async () => {
+			release.resolve();
+			await closing?.catch(() => {});
+			await settle();
+		});
+		try {
+			let settled = false;
+			closing = manager.shutdown();
+			void closing.then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+			await writing.promise; // The real stop callback has reached its atomic StateStore rename.
+			expect(disable).toHaveBeenCalledTimes(1);
+			expect(shutdown).toHaveBeenCalledTimes(1);
+			expect(supervisor.get(pluginId)?.state).toBe("stopped");
+			expect(settled).toBe(false);
+			release.resolve();
+			await expect(closing).rejects.toBe(failure);
+			await settle();
+			expect(settled).toBe(true);
+			expect((await stateStore.getState(pluginId))?.lastError?.message).toBe(failure.message);
+			const operations = await stateStore.listOperations(pluginId);
+			expect(
+				operations.some(
+					(operation) =>
+						operation.operation === "deactivate" &&
+						operation.status === "failed" &&
+						operation.error?.message === failure.message,
+				),
+			).toBe(true);
+		} finally {
+			release.resolve();
+			await closing?.catch(() => {});
+			disable.mockRestore();
+			shutdown.mockRestore();
+			await supervisor.shutdown();
+			await settle();
+		}
+	});
+	test("health canaries are scalar-only while persisted failure details survive a throwing sink", async () => {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({ root, runtimeSupervisor: supervisor });
+		await manager.initialize();
+		const pluginId = "com.example.health-canary";
+		await manager.stateStore.upsert(createPluginStateRecord(pluginId));
+		const runtime = supervisor.register({
+			pluginId,
+			command: ["fixture"],
+			cwd: root,
+			generation: 1,
+		});
+		const canary = "plugin-secret-/private/root-raw-error-body";
+		const records: { message: string; data?: Record<string, unknown> }[] = [];
+		const logs = (["warn", "error"] as const).map((level) =>
+			spyOn(logger, level).mockImplementation((message, data) => {
+				records.push({ message, data });
+				throw new Error(canary);
+			}),
+		);
+		const internal = manager as unknown as {
+			persistRuntimeState(
+				id: string,
+				event: { runtime: FakeRuntime; diagnostics: RuntimeDiagnostics; state: string },
+			): Promise<void>;
+			handleObservedLifecycleRevokeFailure(
+				id: string,
+				state: string,
+				error: unknown,
+				sourceError?: unknown,
+			): Promise<void>;
+		};
+		try {
+			const update = spyOn(manager.stateStore, "updateState").mockRejectedValueOnce(
+				new Error(canary),
+			);
+			try {
+				await internal.persistRuntimeState(pluginId, {
+					runtime,
+					diagnostics: runtime.getDiagnostics(),
+					state: "stopped",
+				});
+			} finally {
+				update.mockRestore();
+			}
+			await internal.handleObservedLifecycleRevokeFailure(
+				pluginId,
+				"quarantine",
+				new Error(canary),
+				new Error(canary),
+			);
+			expect((await manager.stateStore.getState(pluginId))?.lastError?.message).toContain(canary);
+			expect(records.length).toBeGreaterThanOrEqual(2);
+			expect(JSON.stringify(records)).not.toContain(canary);
+			for (const record of records) {
+				expect(record.message).toBe("Plugin runtime health");
+				for (const [key, value] of Object.entries(record.data ?? {})) {
+					expect([
+						"code",
+						"generation",
+						"failures",
+						"attempt",
+						"quarantined",
+						"sourceError",
+					]).toContain(key);
+					expect(["string", "number", "boolean"]).toContain(typeof value);
+				}
+			}
+		} finally {
+			for (const log of logs) log.mockRestore();
+			await manager.shutdown();
+		}
+	});
+	test.each([
+		"uninitialized",
+		"metadata-read-failure",
+	] as const)("shutdown still exits real processes and drains actual StateStore callbacks (%s)", async (mode) => {
+		const root = await makeTempRoot();
+		const writing = deferred();
+		const release = deferred();
+		let delayWrites = false;
+		const stateStore = new PluginStateStore({
+			root,
+			renameFile: async (from, to) => {
+				if (delayWrites) {
+					writing.resolve();
+					await release.promise;
+				}
+				await rename(from, to);
+			},
+		});
+		const supervisor = new RuntimeSupervisor();
+		const manager = new PluginManager({ root, stateStore, runtimeSupervisor: supervisor });
+		let closing: Promise<void> | undefined;
+		drainBeforeCleanup.push(async () => {
+			release.resolve();
+			await supervisor.shutdown().catch(() => {});
+			await closing?.catch(() => {});
+		});
+		if (mode === "metadata-read-failure") await manager.initialize();
+		const pluginId = "com.example.runtime";
+		await stateStore.upsert(createPluginStateRecord(pluginId));
+		const internal = manager as unknown as {
+			handleRuntimeStateChange(
+				id: string,
+				event: {
+					runtime: ReturnType<RuntimeSupervisor["register"]>;
+					diagnostics: RuntimeDiagnostics;
+					state: string;
+				},
+			): Promise<void>;
+		};
+		let observe = false;
+		const cwd = fileURLToPath(new URL("../../fixtures/plugins/runtime", import.meta.url));
+		const runtime = supervisor.register({
+			pluginId,
+			version: "1.0.0",
+			cwd,
+			command: [process.execPath, join(cwd, "fixture.ts"), "normal"],
+			runnerOptions: { allowUnboundedResourceUsage: true },
+			onStateChange(state) {
+				if (!observe) return;
+				void internal
+					.handleRuntimeStateChange(pluginId, {
+						runtime,
+						diagnostics: runtime.getDiagnostics(),
+						state,
+					})
+					.catch(() => {});
+			},
+		});
+		await supervisor.start(pluginId);
+		const pid = runtime.pid;
+		const exited = Promise.withResolvers<void>();
+		const shutdown = supervisor.shutdown.bind(supervisor);
+		const shutdownSpy = spyOn(supervisor, "shutdown").mockImplementation(() => {
+			const pending = shutdown();
+			void pending.then(exited.resolve, exited.reject);
+			return pending;
+		});
+		let restoreRead = () => {};
+		const metadataError = new Error("state metadata read failed");
+		try {
+			observe = true;
+			delayWrites = true;
+			await runtime.drain();
+			await writing.promise; // An actual atomic StateStore rename is now held by the callback.
+			if (mode === "metadata-read-failure") {
+				const read = spyOn(stateStore, "listStates").mockRejectedValueOnce(metadataError);
+				restoreRead = () => read.mockRestore();
+			}
+			let settled = false;
+			closing = manager.shutdown();
+			void closing.then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+			await exited.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(shutdownSpy).toHaveBeenCalledTimes(1);
+			expect(() => process.kill(pid as number, 0)).toThrow();
+			expect(settled).toBe(false);
+			release.resolve();
+			if (mode === "metadata-read-failure") await expect(closing).rejects.toBe(metadataError);
+			else await expect(closing).resolves.toBeUndefined();
+			expect(settled).toBe(true);
+			const persisted = JSON.parse(await readFile(stateStore.statePath, "utf8"));
+			// Persistence deliberately maps a stopped runtime to the existing inactive business state.
+			expect(persisted.plugins[pluginId].runtimeState).toBe("inactive");
+			expect(persisted.plugins[pluginId].runtimeGeneration).toBe(runtime.generation);
+		} finally {
+			release.resolve();
+			restoreRead();
+			await closing?.catch(() => {});
+			await supervisor.shutdown().catch(() => {});
+			shutdownSpy.mockRestore();
+		}
+	});
+
+	test("propagates unconfirmed supervisor cleanup instead of reporting clean shutdown", async () => {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({ root, runtimeSupervisor: supervisor });
+		await manager.initialize();
+		supervisor.shutdown = async () => {
+			throw new Error("resource exit unconfirmed");
+		};
+		await expect(manager.shutdown()).rejects.toThrow("resource exit unconfirmed");
+	});
 	test.each([
 		false,
 		true,

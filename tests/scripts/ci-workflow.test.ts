@@ -107,6 +107,68 @@ function shell(script: string, env: Record<string, string> = {}, cwd?: string) {
 	);
 }
 
+function aptMirrorScenario(mode: "update-first" | "install-first" | "all") {
+	const dependencies = step("tests", (value) => value.name === "Install test system dependencies");
+	const script = dependencies.run ?? "";
+	const root = mkdtempSync(join(tmpdir(), "ci-apt-sources-"));
+	roots.push(root);
+	const path = join(root, "ubuntu.sources");
+	const trace = join(root, "apt-calls");
+	const sources = [
+		"Types: deb",
+		"URIs: mirror+file:/etc/apt/apt-mirrors.txt",
+		"Suites: noble noble-updates noble-backports",
+		"Components: main universe restricted multiverse",
+		"Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg",
+		"",
+		"Types: deb",
+		"URIs: mirror+file:/etc/apt/apt-security-mirrors.txt",
+		"Suites: noble-security",
+		"Components: main universe restricted multiverse",
+		"Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg",
+		"",
+	].join("\n");
+	writeFileSync(path, sources);
+	const prepare = script
+		.slice(0, script.indexOf("command -v zstd"))
+		.replaceAll("/etc/apt/sources.list.d/ubuntu.sources", path);
+	const result = shell(
+		`
+		sudo() {
+			if [[ "$1" == env ]]; then shift; export "$1"; shift; fi
+			"$@"
+		}
+		updates=0
+		installs=0
+		apt-get() {
+			[[ " $* " == *" Acquire::ForceIPv4=true "* ]] || return 42
+			[[ " $* " == *" Acquire::https::Timeout=15 "* ]] || return 43
+			if [[ " $* " == *" update "* ]]; then
+				[[ " $* " == *" APT::Update::Error-Mode=any "* ]] || return 44
+				((updates+=1))
+				printf 'update %s\\n' "$mirror" >> "$TRACE"
+				if [[ "$MODE" == all || ( "$MODE" == update-first && "$updates" == 1 ) ]]; then return 100; fi
+			else
+				[[ " $* " == *" install --yes zstd podman git ripgrep acl python3 "* ]] || return 45
+				((installs+=1))
+				printf 'install %s\\n' "$mirror" >> "$TRACE"
+				if [[ "$MODE" == install-first && "$installs" == 1 ]]; then return 100; fi
+			fi
+			return 0
+		}
+		${prepare}
+	`,
+		{ MODE: mode, TRACE: trace },
+	);
+	return {
+		result,
+		script,
+		sources,
+		actual: readFileSync(path, "utf8"),
+		trace: existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n") : [],
+	};
+}
+
 describe("generic CI workflow", () => {
 	test("runs for every PR, main push and manual dispatch without paths or branch exclusions", () => {
 		expect(Object.keys(workflow.on).sort()).toEqual([
@@ -143,7 +205,21 @@ describe("generic CI workflow", () => {
 			for (const valueStep of value.steps) {
 				expect(valueStep["continue-on-error"]).toBeUndefined();
 				const isReport = id === "tests" && valueStep.uses === pins.upload;
-				expect(valueStep.if).toBe(isReport ? expression("always()") : undefined);
+				const isDeclaredRemoteAsset =
+					(id === "build" &&
+						[
+							"Build declared remote frontend",
+							"Upload remote frontend",
+							"Upload remote UI for isolated browser tests",
+						].includes(valueStep.name ?? "")) ||
+					(id === "tests" && valueStep.name === "Download remote UI for isolated browser tests");
+				expect(valueStep.if).toBe(
+					isReport
+						? expression("always()")
+						: isDeclaredRemoteAsset
+							? expression("hashFiles('shared/remote-access/frontend-capability.json') != ''")
+							: undefined,
+				);
 				if (valueStep.uses) {
 					expect(valueStep.uses).toMatch(/^[\w-]+\/[\w-]+@[a-f0-9]{40}$/);
 					expect(Object.values(pins)).toContain(valueStep.uses);
@@ -383,7 +459,10 @@ describe("generic CI workflow", () => {
 			(value) => !!value.run?.includes("test -f frontend/routeTree.gen.ts"),
 		);
 		const typecheck = command("build", "bunx tsgo --noEmit");
-		const upload = step("build", (value) => value.uses === pins.upload);
+		const upload = step(
+			"build",
+			(value) => value.uses === pins.upload && value.with?.name === "ci-frontend",
+		);
 		expect(steps.indexOf(build)).toBeLessThan(steps.indexOf(verify));
 		expect(verify.run).toContain("test -f dist/frontend/index.html");
 		expect(steps.indexOf(verify)).toBeLessThan(steps.indexOf(typecheck));
@@ -401,41 +480,42 @@ describe("generic CI workflow", () => {
 		);
 	});
 
-	test("uses an independently hosted signed Ubuntu mirror before installing test dependencies", () => {
-		const dependencies = step("tests", (value) => !!value.run?.includes("apt-get install"));
-		const script = dependencies.run ?? "";
-		const updateOffset = script.indexOf("sudo apt-get update");
-		expect(updateOffset).toBeGreaterThan(0);
-		const root = mkdtempSync(join(tmpdir(), "ci-apt-sources-"));
-		roots.push(root);
-		const path = join(root, "ubuntu.sources");
-		const sources = [
-			"Types: deb",
-			"URIs: mirror+file:/etc/apt/apt-mirrors.txt",
-			"Suites: noble noble-updates noble-backports noble-security",
-			"Components: main universe restricted multiverse",
-			"Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg",
-			"",
-		].join("\n");
-		writeFileSync(path, sources);
-		const prepare = script
-			.slice(0, updateOffset)
-			.replaceAll("/etc/apt/sources.list.d/ubuntu.sources", path);
-		const result = shell(`sudo() { "$@"; }\n${prepare}`);
+	test.each([
+		"update-first",
+		"install-first",
+	] as const)("switches signed Ubuntu mirrors after %s failure without dropping dependencies", (mode) => {
+		const { result, script, sources, actual, trace } = aptMirrorScenario(mode);
+		expect(result.stderr).toBe("");
 		expect(result.status).toBe(0);
-		expect(readFileSync(path, "utf8")).toBe(
-			sources.replace(
-				"mirror+file:/etc/apt/apt-mirrors.txt",
-				"https://mirrors.edge.kernel.org/ubuntu/",
-			),
+		expect(actual).toBe(
+			sources.replace(/^URIs:.*$/gm, "URIs: https://azure.archive.ubuntu.com/ubuntu/"),
 		);
+		expect(trace).toEqual([
+			"update https://archive.ubuntu.com/ubuntu/",
+			...(mode === "install-first" ? ["install https://archive.ubuntu.com/ubuntu/"] : []),
+			"update https://azure.archive.ubuntu.com/ubuntu/",
+			"install https://azure.archive.ubuntu.com/ubuntu/",
+		]);
 		expect(script).not.toMatch(/allow-unauthenticated|trusted=yes|Check-Valid-Until=false/);
-		expect(updateOffset).toBeLessThan(script.indexOf("sudo apt-get install"));
+	});
+
+	test("fails explicitly after all independent Ubuntu mirrors fail", () => {
+		const { result, trace } = aptMirrorScenario("all");
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("Unable to install test dependencies");
+		expect(trace).toEqual([
+			"update https://archive.ubuntu.com/ubuntu/",
+			"update https://azure.archive.ubuntu.com/ubuntu/",
+			"update https://mirrors.edge.kernel.org/ubuntu/",
+		]);
 	});
 
 	test("prepares real system dependencies and PostgreSQL in the harness's rootless storage", () => {
-		const dependencies = step("tests", (value) => !!value.run?.includes("apt-get install"));
-		expect(dependencies.run).toMatch(/apt-get install --yes zstd podman git ripgrep/);
+		const dependencies = step(
+			"tests",
+			(value) => value.name === "Install test system dependencies",
+		);
+		expect(dependencies.run).toContain("install --yes zstd podman git ripgrep acl python3");
 		for (const binary of ["zstd", "podman", "git", "rg"]) {
 			expect(dependencies.run).toContain(`command -v ${binary}`);
 			expect(dependencies.run).toContain(`${binary} --version`);

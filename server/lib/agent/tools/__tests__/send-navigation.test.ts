@@ -6,6 +6,7 @@ const realWebsocket = { ...(await import("@server/websocket/narrator-ws")) };
 const frames: unknown[] = [];
 const showIntents: Array<boolean | undefined> = [];
 let pauseDelivery = true;
+const detailedCalls: Array<Record<string, unknown>> = [];
 let release: (() => void) | undefined;
 let frameReceived: (() => void) | undefined;
 const deliveryTargets = [
@@ -21,6 +22,7 @@ mock.module("@server/services/agent-communication", () => ({
 		onDeliveryResolved?: (target: { id: string; deliveryMessageId: string }) => void;
 	}) => {
 		showIntents.push(input.showToUser);
+		detailedCalls.push(input as Record<string, unknown>);
 		if (deliveryTargets.length) input.onTargetsResolved?.(deliveryTargets.length);
 		for (const target of deliveryTargets) input.onDeliveryResolved?.(target);
 		if (pauseDelivery)
@@ -124,7 +126,40 @@ test("raw and Zod schemas agree on optional boolean display intent", () => {
 		);
 	const description = (raw?.properties as Record<string, { description: string }>).show_to_user
 		.description;
-	expect(description).toContain("default false");
+	// States WHEN to set it, in terms the sender can judge, and that it is display only.
+	expect(description).toContain("Set true when");
+	expect(description).toContain("a finding, a conclusion, a decision, a blocker");
 	expect(description).toContain("expandable");
-	expect(description).toContain("not a privacy or permission flag");
+	expect(description).toContain("delivery, permissions");
+	// The tool description itself names the flag, so it is seen without opening the schema.
+	expect(sendTool.description).toContain("show_to_user: true");
+	expect(sendTool.description).toContain("ContextAsk");
+});
+
+// Models that fill every optional parameter with "" (observed via a completions
+// relay) must still reach agent delivery, not be hijacked into bot-user mode.
+test("empty-string user falls through to agent-target delivery", async () => {
+	frames.length = 0;
+	detailedCalls.length = 0;
+	const received = new Promise<void>((resolve) => {
+		frameReceived = () => {
+			if (frames.length >= 1) resolve();
+		};
+	});
+	const waiting = sendTool.execute(
+		{ message: "Review the diff", name: "child-a", user: "", id: "" },
+		{
+			narratorId: "primary",
+			currentToolUseId: "send-empty-user",
+			signal: new AbortController().signal,
+			locale: "en",
+		} as ToolContext,
+	);
+	await received;
+	expect(detailedCalls).toHaveLength(1);
+	expect(detailedCalls[0]).toMatchObject({ name: "child-a" });
+	release?.();
+	const result = await waiting;
+	expect(result.isError).toBeFalsy();
+	expect(String(result.output)).toBe("Delivered");
 });

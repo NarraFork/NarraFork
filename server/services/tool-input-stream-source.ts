@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type FileHandle, mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { Worker } from "node:worker_threads";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
@@ -13,6 +12,16 @@ import {
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { getNarraforkHome } from "../lib/narrafork-home";
+import { TaskQueue, TaskQueueError } from "../lib/worker-runtime/queue";
+import {
+	closeHistoricalWriteWorkers,
+	HistoricalWriteWorkerRuntime,
+} from "./tool-input-stream-source-worker";
+
+export {
+	HISTORICAL_WRITE_INPUT_MAX_BYTES,
+	streamHistoricalWriteContent,
+} from "./tool-input-stream-source-worker";
 
 export const TOOL_INPUT_SOURCE_MEMORY_BYTES = 256 * 1024;
 export const TOOL_INPUT_GLOBAL_MEMORY_BYTES = 16 * 1024 * 1024;
@@ -98,7 +107,7 @@ export interface ToolInputStreamSourceOptions {
 	) => Promise<void>;
 	/** Injectable asynchronous writer allows queue/backpressure tests without real user data. */
 	write?: (file: FileHandle, bytes: Buffer, position: number) => Promise<void>;
-	slowLog?: (metadata: { refId: string; elapsedMs: number; length: number }) => void;
+	slowLog?: (metadata: { elapsedMs: number; length: number }) => void;
 }
 
 function sourceError(code: string, status = 409): AppError {
@@ -126,134 +135,6 @@ async function writeAll(file: FileHandle, bytes: Buffer, position: number): Prom
 	}
 }
 
-// The SQLite row limit is below this worker input ceiling. It is a resource refusal, never truncation.
-// The HTTP/WS main thread never reads input_json/output_json or parses historical field bodies.
-export const HISTORICAL_WRITE_INPUT_MAX_BYTES = 1024 * 1024 * 1024;
-const HISTORICAL_WRITE_WORKER_PROGRAM = `
-const { parentPort, workerData } = require("node:worker_threads");
-const { Database } = require("bun:sqlite");
-const fail = (code) => { const error = new Error(code); error.documentCode = code; throw error; };
-(async () => {
- let database;
- try {
-  const identity = workerData.identity;
-  database = new Database(workerData.databasePath, { readonly: true });
-  database.run("PRAGMA busy_timeout = 0");
-  const bindings = [identity.toolCallId, identity.messageId, identity.toolUseId, identity.narratorId, identity.executionAttempt];
-  const where = "id = ? AND message_id = ? AND tool_use_id = ? AND narrator_id = ? AND execution_attempt = ? AND tool_name = 'Write'";
-  const metadata = database.query("SELECT octet_length(input_json) AS bytes FROM narrator_tool_calls WHERE " + where + " LIMIT 1").get(...bindings);
-  if (!metadata) fail("TEXT_DOCUMENT_NOT_FOUND");
-  if (metadata.bytes > workerData.maxInputBytes) fail("TEXT_DOCUMENT_WORKER_INPUT_LIMIT");
-  let row = database.query("SELECT input_json FROM narrator_tool_calls WHERE " + where + " LIMIT 1").get(...bindings);
-  if (!row) fail("TEXT_DOCUMENT_NOT_FOUND");
-  database.close(); database = undefined;
-  let input = JSON.parse(row.input_json); row = undefined;
-  const text = input && input.content; input = undefined;
-  if (typeof text !== "string") fail("TEXT_DOCUMENT_NOT_WRITE_CONTENT");
-  for (let offset = 0; offset < text.length; offset += workerData.pageChars) {
-   const delta = text.slice(offset, offset + workerData.pageChars);
-   const ack = new Promise((resolve, reject) => parentPort.once("message", (message) => {
-    if (message && message.type === "ack" && message.offset === offset) resolve();
-    else reject(new Error("invalid acknowledgement"));
-   }));
-   parentPort.postMessage({ type: "chunk", offset, text: delta });
-   await ack;
-  }
-  parentPort.postMessage({ type: "done", length: text.length });
- } catch (error) {
-  const code = error && typeof error.documentCode === "string" ? error.documentCode : "TEXT_DOCUMENT_WORKER_FAILED";
-  parentPort.postMessage({ type: "error", code });
- } finally { if (database) database.close(); parentPort.close(); }
-})();
-`;
-
-/** Eval uses a constant program, not caller code; it works in compiled Bun without extra bundle entries. */
-export async function streamHistoricalWriteContent(
-	databasePath: string,
-	identity: HistoricalWriteDocumentIdentity,
-	sink: HistoricalChunkSink,
-	signal: AbortSignal,
-	timeoutMs = TOOL_INPUT_READ_TIMEOUT_MS,
-): Promise<void> {
-	signal.throwIfAborted();
-	const thread = new Worker(HISTORICAL_WRITE_WORKER_PROGRAM, {
-		eval: true,
-		workerData: {
-			databasePath,
-			identity,
-			maxInputBytes: HISTORICAL_WRITE_INPUT_MAX_BYTES,
-			pageChars: TEXT_DOCUMENT_PAGE_CHARS,
-		},
-	});
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let abort: (() => void) | undefined;
-	let offset = 0;
-	let settled = false;
-	try {
-		await new Promise<void>((resolve, reject) => {
-			const refuse = (error: unknown) => {
-				if (!settled) {
-					settled = true;
-					reject(error);
-				}
-			};
-			abort = () => refuse(signal.reason ?? sourceError("TEXT_DOCUMENT_CANCELLED", 408));
-			signal.addEventListener("abort", abort, { once: true });
-			if (signal.aborted) return abort();
-			timer = setTimeout(() => refuse(sourceError("TEXT_DOCUMENT_READ_TIMEOUT", 408)), timeoutMs);
-			thread.once("error", () => refuse(sourceError("TEXT_DOCUMENT_WORKER_FAILED", 503)));
-			thread.once("exit", () => {
-				if (!settled) refuse(sourceError("TEXT_DOCUMENT_WORKER_FAILED", 503));
-			});
-			thread.on("message", (message: unknown) => {
-				if (settled) return;
-				if (!message || typeof message !== "object" || !("type" in message)) {
-					refuse(sourceError("TEXT_DOCUMENT_WORKER_PROTOCOL", 503));
-					return;
-				}
-				const packet = message as {
-					type: string;
-					offset?: number;
-					text?: string;
-					length?: number;
-					code?: string;
-				};
-				if (packet.type === "chunk") {
-					if (
-						typeof packet.text !== "string" ||
-						packet.text.length > TEXT_DOCUMENT_PAGE_CHARS ||
-						packet.offset !== offset ||
-						Buffer.byteLength(JSON.stringify(packet)) > TEXT_DOCUMENT_PACKET_BYTES
-					) {
-						refuse(sourceError("TEXT_DOCUMENT_WORKER_PROTOCOL", 503));
-						return;
-					}
-					const start = offset;
-					const text = packet.text;
-					// One page in flight. Producer cannot enqueue the next page until storage accepts this page.
-					void sink(text, start).then(() => {
-						if (settled) return;
-						offset += text.length;
-						thread.postMessage({ type: "ack", offset: start });
-					}, refuse);
-				} else if (packet.type === "done" && packet.length === offset) {
-					settled = true;
-					resolve();
-				} else if (packet.type === "error") {
-					const code = packet.code?.startsWith("TEXT_DOCUMENT_")
-						? packet.code
-						: "TEXT_DOCUMENT_WORKER_FAILED";
-					refuse(sourceError(code, code === "TEXT_DOCUMENT_NOT_FOUND" ? 404 : 503));
-				} else refuse(sourceError("TEXT_DOCUMENT_WORKER_PROTOCOL", 503));
-			});
-		});
-	} finally {
-		if (timer) clearTimeout(timer);
-		if (abort) signal.removeEventListener("abort", abort);
-		await thread.terminate().catch(() => {});
-	}
-}
-
 /** No database access or filesystem work at construction; tests can inject an isolated directory. */
 export class ToolInputStreamSourceService {
 	private readonly sources = new Map<string, SourceState>();
@@ -265,8 +146,16 @@ export class ToolInputStreamSourceService {
 	private lastCleanupAt = 0;
 	private readonly historicalAliases = new Map<string, string>();
 	private readonly historicalJobs = new Map<string, Promise<TextDocumentRef>>();
-	private historicalTail: Promise<void> = Promise.resolve();
-	private historicalQueued = 0;
+	readonly historicalWorkerRuntimeVersion = 1;
+	private readonly historicalQueue = new TaskQueue({
+		concurrency: 1,
+		maxQueued: 15,
+		maxQueuedBytes: 256 * 1024,
+	});
+	private historicalRuntime?: HistoricalWriteWorkerRuntime;
+	private historicalClosed = false;
+	private historicalClosing?: Promise<void>;
+	private historicalCleanupFailure?: unknown;
 	private readonly historicalGenerations = new Map<string, { value: number }>();
 	private readonly historicalControls = new Map<
 		string,
@@ -274,6 +163,7 @@ export class ToolInputStreamSourceService {
 			generationKey: string;
 			generation: { value: number };
 			controller: AbortController;
+			subscribers: number;
 		}
 	>();
 	private readonly currentInputLanes = new Map<string, string>();
@@ -375,6 +265,7 @@ export class ToolInputStreamSourceService {
 		reference: HistoricalWriteDocumentReference,
 		signal?: AbortSignal,
 	): Promise<TextDocumentRef> {
+		if (this.historicalClosed) throw sourceError("TEXT_DOCUMENT_HISTORY_CLOSED", 503);
 		if (
 			!reference.toolCallId ||
 			!reference.messageId ||
@@ -388,6 +279,7 @@ export class ToolInputStreamSourceService {
 		signal?.throwIfAborted();
 		const identity = await this.historicalIdentity(narratorId, toolUseId, reference);
 		signal?.throwIfAborted();
+		if (this.historicalClosed) throw sourceError("TEXT_DOCUMENT_HISTORY_CLOSED", 503);
 		const key = JSON.stringify([
 			narratorId,
 			toolUseId,
@@ -399,110 +291,154 @@ export class ToolInputStreamSourceService {
 		if (existing && this.sources.has(existing)) return this.descriptor(existing);
 		if (existing) this.historicalAliases.delete(key);
 		const joined = this.historicalJobs.get(key);
-		if (joined) return this.waitForHistoricalJob(joined, signal);
-		if (this.historicalQueued >= 16) throw sourceError("TEXT_DOCUMENT_HISTORY_QUEUE_LIMIT", 429);
-		this.historicalQueued++;
-		const previous = this.historicalTail;
-		let release!: () => void;
-		this.historicalTail = new Promise<void>((resolve) => {
-			release = resolve;
-		});
+		if (joined) return this.waitForHistoricalJob(key, joined, signal);
 		const controller = new AbortController();
 		const { key: generationKey, generation } = this.historicalGeneration(reference);
 		const startedGeneration = generation.value;
-		this.historicalControls.set(key, { generationKey, generation, controller });
-		const abort = () =>
-			controller.abort(signal?.reason ?? sourceError("TEXT_DOCUMENT_CANCELLED", 408));
-		signal?.addEventListener("abort", abort, { once: true });
+		this.historicalControls.set(key, { generationKey, generation, controller, subscribers: 0 });
 		const timer = setTimeout(
 			() => controller.abort(sourceError("TEXT_DOCUMENT_READ_TIMEOUT", 408)),
 			this.options.readTimeoutMs ?? TOOL_INPUT_READ_TIMEOUT_MS,
 		);
 		const start = Date.now();
-		const job = (async () => {
-			let refId: string | undefined;
-			try {
-				await previous;
-				controller.signal.throwIfAborted();
-				const ref = this.create(
-					{ narratorId, toolUseId, field: "content", ...reference },
-					`history/${identity.narratorId}/${identity.messageId}/${identity.toolCallId}/${identity.executionAttempt}`,
-				);
-				refId = ref.id;
-				const sink: HistoricalChunkSink = async (text, offset) => {
-					controller.signal.throwIfAborted();
-					await this.append(ref.id, text, offset);
-				};
-				if (this.options.streamHistorical)
-					await this.options.streamHistorical(identity, sink, controller.signal);
-				else {
-					const { activeDatabaseBackend } = await import("../db");
-					if (activeDatabaseBackend !== "sqlite")
-						throw sourceError("TEXT_DOCUMENT_WORKER_BACKEND_UNSUPPORTED", 503);
-					const { getDbPath } = await import("../db/connection");
-					await streamHistoricalWriteContent(
-						getDbPath(),
-						identity,
-						sink,
-						controller.signal,
-						this.options.readTimeoutMs ?? TOOL_INPUT_READ_TIMEOUT_MS,
-					);
-				}
-				controller.signal.throwIfAborted();
-				// Visibility/attempt can change while a worker reads: refuse publication of stale authority.
-				await this.historicalIdentity(narratorId, toolUseId, reference);
-				controller.signal.throwIfAborted();
-				if (generation.value !== startedGeneration)
-					throw sourceError("TEXT_DOCUMENT_HISTORY_CHANGED");
-				await this.append(ref.id, "", undefined, true);
-				// Sealing also yields to the write tail. No await may separate the final fence from publication.
-				controller.signal.throwIfAborted();
-				if (generation.value !== startedGeneration)
-					throw sourceError("TEXT_DOCUMENT_HISTORY_CHANGED");
-				this.require(ref.id).recoverable = true;
-				this.historicalAliases.set(key, ref.id);
-				return this.descriptor(ref.id);
-			} catch (error) {
-				if (refId) await this.discard(refId);
+		let refId: string | undefined;
+		const job = this.historicalQueue
+			.run(
+				async () => {
+					try {
+						controller.signal.throwIfAborted();
+						const ref = this.create(
+							{ narratorId, toolUseId, field: "content", ...reference },
+							`history/${identity.narratorId}/${identity.messageId}/${identity.toolCallId}/${identity.executionAttempt}`,
+						);
+						refId = ref.id;
+						const sink: HistoricalChunkSink = async (text, offset) => {
+							controller.signal.throwIfAborted();
+							await this.append(ref.id, text, offset);
+						};
+						if (this.options.streamHistorical)
+							await this.options.streamHistorical(identity, sink, controller.signal);
+						else {
+							const { activeDatabaseBackend } = await import("../db");
+							if (activeDatabaseBackend !== "sqlite")
+								throw sourceError("TEXT_DOCUMENT_WORKER_BACKEND_UNSUPPORTED", 503);
+							const { getDbPath } = await import("../db/connection");
+							this.historicalRuntime ??= new HistoricalWriteWorkerRuntime();
+							await this.historicalRuntime.stream(
+								getDbPath(),
+								identity,
+								sink,
+								controller.signal,
+								this.options.readTimeoutMs ?? TOOL_INPUT_READ_TIMEOUT_MS,
+							);
+						}
+						controller.signal.throwIfAborted();
+						// Visibility/attempt can change while a worker reads: refuse publication of stale authority.
+						await this.historicalIdentity(narratorId, toolUseId, reference);
+						controller.signal.throwIfAborted();
+						if (generation.value !== startedGeneration)
+							throw sourceError("TEXT_DOCUMENT_HISTORY_CHANGED");
+						await this.append(ref.id, "", undefined, true);
+						// Sealing also yields to the write tail. No await may separate the final fence from publication.
+						controller.signal.throwIfAborted();
+						if (generation.value !== startedGeneration)
+							throw sourceError("TEXT_DOCUMENT_HISTORY_CHANGED");
+						this.require(ref.id).recoverable = true;
+						this.historicalAliases.set(key, ref.id);
+						return this.descriptor(ref.id);
+					} catch (error) {
+						if (refId) {
+							try {
+								await this.discard(refId);
+							} catch (cleanupError) {
+								// An unconfirmed FD close is not freed capacity. Permanently stop admission;
+								// retain its source/alias owner as evidence rather than silently clearing it.
+								this.historicalCleanupFailure ??= cleanupError;
+								this.historicalClosed = true;
+								void this.historicalQueue.close(cleanupError);
+								for (const control of this.historicalControls.values())
+									control.controller.abort(cleanupError);
+								throw cleanupError;
+							}
+						}
+						throw error;
+					}
+				},
+				{ signal: controller.signal, deadlineAt: Infinity, bytes: key.length * 2 },
+			)
+			.catch((error) => {
+				if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL")
+					throw sourceError("TEXT_DOCUMENT_HISTORY_QUEUE_LIMIT", 429);
 				throw error;
-			} finally {
-				release();
-				this.historicalQueued--;
+			})
+			.finally(() => {
 				this.historicalJobs.delete(key);
 				this.historicalControls.delete(key);
 				clearTimeout(timer);
-				signal?.removeEventListener("abort", abort);
 				const elapsedMs = Date.now() - start;
-				if (elapsedMs >= 1000)
-					this.options.slowLog?.({
-						refId: refId ?? "history",
-						elapsedMs,
-						length: refId ? (this.sources.get(refId)?.ref.length ?? 0) : 0,
-					});
-			}
-		})();
+				if (elapsedMs >= 1000) {
+					try {
+						this.options.slowLog?.({
+							elapsedMs,
+							length: refId ? (this.sources.get(refId)?.ref.length ?? 0) : 0,
+						});
+					} catch {
+						/* A diagnostic sink cannot change publication/cleanup results. */
+					}
+				}
+			});
 		this.historicalJobs.set(key, job);
-		return this.waitForHistoricalJob(job, controller.signal);
+		return this.waitForHistoricalJob(key, job, signal);
 	}
 
 	private async waitForHistoricalJob(
+		key: string,
 		job: Promise<TextDocumentRef>,
 		signal?: AbortSignal,
 	): Promise<TextDocumentRef> {
-		if (!signal) return job;
+		const control = this.historicalControls.get(key);
+		if (!control) return job;
+		control.subscribers++;
+		const combined = signal
+			? AbortSignal.any([signal, control.controller.signal])
+			: control.controller.signal;
 		let abort: (() => void) | undefined;
 		try {
 			return await Promise.race([
 				job,
 				new Promise<never>((_resolve, reject) => {
-					abort = () => reject(signal.reason ?? sourceError("TEXT_DOCUMENT_CANCELLED", 408));
-					signal.addEventListener("abort", abort, { once: true });
-					if (signal.aborted) abort();
+					abort = () => reject(combined.reason ?? sourceError("TEXT_DOCUMENT_CANCELLED", 408));
+					combined.addEventListener("abort", abort, { once: true });
+					if (combined.aborted) abort();
 				}),
 			]);
 		} finally {
-			if (abort) signal.removeEventListener("abort", abort);
+			if (abort) combined.removeEventListener("abort", abort);
+			control.subscribers--;
+			if (control.subscribers === 0 && signal?.aborted)
+				control.controller.abort(signal.reason ?? sourceError("TEXT_DOCUMENT_CANCELLED", 408));
 		}
+	}
+
+	/** Stop historical admission, drain partial-source cleanup and wait for real Worker exits.
+	 * Persisted aliases, raw sources and their storage owner are deliberately not destroyed. */
+	closeHistoricalWorkers(): Promise<void> {
+		if (this.historicalClosing) return this.historicalClosing;
+		this.historicalClosed = true;
+		const reason = sourceError("TEXT_DOCUMENT_HISTORY_CLOSED", 503);
+		const drained = this.historicalQueue.close(reason);
+		for (const control of this.historicalControls.values()) control.controller.abort(reason);
+		this.historicalClosing = (async () => {
+			const stopped = this.historicalRuntime?.close();
+			const outcomes = await Promise.allSettled([
+				drained,
+				stopped,
+				Promise.allSettled([...this.historicalJobs.values()]),
+			]);
+			for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+			if (this.historicalCleanupFailure) throw this.historicalCleanupFailure;
+		})();
+		return this.historicalClosing;
 	}
 
 	get usage() {
@@ -807,7 +743,13 @@ export class ToolInputStreamSourceService {
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", abort);
 			const elapsedMs = Date.now() - start;
-			if (elapsedMs >= 1000) this.options.slowLog?.({ refId, elapsedMs, length: state.ref.length });
+			if (elapsedMs >= 1000) {
+				try {
+					this.options.slowLog?.({ elapsedMs, length: state.ref.length });
+				} catch {
+					/* Diagnostics cannot replace a read or its cleanup outcome. */
+				}
+			}
 		}
 	}
 
@@ -1020,9 +962,24 @@ export const toolInputStreamSource = hotSafe(
 			// A short content field does not imply a small row (output/other input metadata may be huge).
 			// Retain bounded raw memory/spill; historical regeneration reads ONLY input_json in a Worker.
 			slowLog: (metadata) => {
-				void import("../lib/logger").then(({ logger }) =>
-					logger.warn("Slow text document read", metadata),
-				);
+				void import("../lib/logger")
+					.then(({ logger }) => logger.warn("Slow text document read", metadata))
+					.catch(() => {});
 			},
 		}),
 );
+
+// An old hot-pinned instance has no evidence of owned Handles. Preserve its data and fail closed;
+// counting zero workers or replacing the instance would silently orphan its old resources.
+if (toolInputStreamSource.historicalWorkerRuntimeVersion !== 1)
+	throw new Error(
+		"Historical Write worker ownership predates this runtime; manually restart NarraFork",
+	);
+
+export async function closeToolInputHistoricalWorkers(): Promise<void> {
+	const outcomes = await Promise.allSettled([
+		toolInputStreamSource.closeHistoricalWorkers(),
+		closeHistoricalWriteWorkers(),
+	]);
+	for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+}

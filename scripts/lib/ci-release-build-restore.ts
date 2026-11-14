@@ -1,11 +1,14 @@
 import { lstat, mkdir, mkdtemp, realpath, rm, statfs } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
+import { remoteFrontendArtifactNames } from "../../shared/remote-access/frontend-manifest";
 import { validateSmokeMetadata } from "../smoke-release-binary";
 import { runPublicationProcess as runBridgeProcess } from "./ci-publication-runtime";
 import {
 	CI_DISK_RESERVE,
 	CI_METADATA_LIMIT,
+	CI_PLATFORM_ARTIFACT_LIMIT,
 	CI_TEXT_LIMIT,
 	hashReleaseFile,
 	readReleaseText,
@@ -32,11 +35,12 @@ import {
 	type CiReleaseTarget,
 } from "./ci-release-types";
 import type { GhRunner } from "./github-release";
+import { restoreRemotePeerReleasePlan } from "./remote-peer-release-prepare";
 
 const TIMEOUT = 15 * 60_000;
 const CONTROL_LIMIT = 4 * 1024 ** 2;
-const BINARY_LIMIT = 1024 ** 3;
-const PLATFORM_LIMIT = BINARY_LIMIT + 2 * 1024 ** 2;
+const BINARY_LIMIT = MAX_RELEASE_BINARY_BYTES;
+const PLATFORM_LIMIT = CI_PLATFORM_ARTIFACT_LIMIT;
 const UPLOAD_ACTION = "Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
@@ -149,11 +153,13 @@ const EXTRACT = `
 import json, os, resource, shutil, stat, sys, zipfile
 resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 ** 2, 512 * 1024 ** 2))
 resource.setrlimit(resource.RLIMIT_CPU, (900, 900))
-archive, destination, mode, binary = sys.argv[1:]
+archive, destination, mode, binary, binary_limit, reserve = sys.argv[1:]
+binary_limit, reserve = int(binary_limit), int(reserve)
 control = mode == 'control'
-allowed = {'plan.json', 'control.js'} if control else {binary, binary + '.metadata.json'}
+remote = mode == 'remote'
+allowed = {'plan.json', 'control.js'} if control else ({binary + '.tar.gz', binary + '.manifest.json'} if remote else {binary, binary + '.metadata.json'})
 required = {'plan.json'} if control else allowed
-maximum = 4 * 1024 ** 2 if control else 1024 ** 3 + 65536
+maximum = 4 * 1024 ** 2 if control else (129 * 1024 ** 2 if remote else binary_limit + 65536)
 with zipfile.ZipFile(archive) as bundle:
     entries = bundle.infolist()
     if len(entries) < 1 or len(entries) > 2: raise ValueError('archive entry limit')
@@ -166,13 +172,13 @@ with zipfile.ZipFile(archive) as bundle:
         kind = stat.S_IFMT(entry.external_attr >> 16)
         if entry.flag_bits & 1 or entry.is_dir() or kind not in (0, stat.S_IFREG):
             raise ValueError('nonregular or encrypted archive entry')
-        limit = (1024 * 1024 if name == 'plan.json' else 3 * 1024 ** 2) if control else (65536 if name.endswith('.metadata.json') else 1024 ** 3)
+        limit = (1024 * 1024 if name == 'plan.json' else 3 * 1024 ** 2) if control else ((1024 ** 2 if name.endswith('.manifest.json') else 128 * 1024 ** 2) if remote else (65536 if name.endswith('.metadata.json') else binary_limit))
         if entry.file_size < 1 or entry.file_size > limit:
             raise ValueError('archive entry size limit')
         total += entry.file_size
         if total > maximum: raise ValueError('archive inflated size limit')
     if not required.issubset(seen): raise ValueError('missing archive inputs')
-    if shutil.disk_usage(destination).free < total + 4 * 1024 ** 3:
+    if shutil.disk_usage(destination).free < total + reserve:
         raise ValueError('insufficient disk space')
     written = 0
     for entry in entries:
@@ -197,17 +203,31 @@ with zipfile.ZipFile(archive) as bundle:
 async function extract(
 	archive: string,
 	destination: string,
-	mode: "control" | "platform",
+	mode: "control" | "platform" | "remote",
 	binary: string,
 	options: ReturnType<typeof boundedOptions>,
 ) {
 	await mkdir(destination);
-	await runBridgeProcess("python3", ["-I", "-c", EXTRACT, archive, destination, mode, binary], {
-		timeoutMs: TIMEOUT,
-		maximumOutputBytes: CI_TEXT_LIMIT,
-		signal: options.signal,
-		environment: options.env,
-	});
+	await runBridgeProcess(
+		"python3",
+		[
+			"-I",
+			"-c",
+			EXTRACT,
+			archive,
+			destination,
+			mode,
+			binary,
+			String(BINARY_LIMIT),
+			String(CI_DISK_RESERVE),
+		],
+		{
+			timeoutMs: TIMEOUT,
+			maximumOutputBytes: CI_TEXT_LIMIT,
+			signal: options.signal,
+			environment: options.env,
+		},
+	);
 }
 
 /** Linux/Ubuntu control path only: never fall back to a replace-capable rename. */
@@ -445,7 +465,23 @@ async function readSource(
 	} finally {
 		await rm(temporary, { recursive: true, force: true });
 	}
-	return { dispatch, source, original, control, platforms };
+	let remoteFrontend: z.infer<typeof artifactSchema> | undefined;
+	if (original.remoteFrontend) {
+		const build = jobs.filter((job) => job.name === "Verify release source / Build and typecheck");
+		const uploads = build[0]?.steps?.filter((step) => step.name === "Upload remote frontend") ?? [];
+		if (
+			build.length !== 1 ||
+			uploads.length !== 1 ||
+			uploads[0].status !== "completed" ||
+			uploads[0].conclusion !== "success"
+		)
+			throw new Error("Original remote frontend upload proof missing");
+		remoteFrontend = await getArtifact(
+			`remote-frontend-${sourceRunId}-${sourceRunAttempt}`,
+			130 * 1024 ** 2,
+		);
+	}
+	return { dispatch, source, original, control, platforms, remoteFrontend };
 }
 
 export async function prepareCiReleaseBuild(
@@ -471,13 +507,21 @@ export async function prepareCiReleaseBuild(
 		runAttempt: result.source.run_attempt,
 		workflowCommit: result.source.head_sha,
 		controlArtifact: identity(result.control),
+		...(result.remoteFrontend ? { remoteFrontend: identity(result.remoteFrontend) } : {}),
 		platforms: result.platforms.map(({ target, artifact }) => ({
 			target,
 			artifact: identity(artifact),
 		})),
 	};
 	bounded.signal.throwIfAborted();
-	return validateCiReleasePlan({ ...verified, ...result.dispatch, buildSource });
+	return validateCiReleasePlan({
+		...verified,
+		...result.dispatch,
+		buildSource,
+		...(verified.remotePeer
+			? { remotePeer: restoreRemotePeerReleasePlan(verified.remotePeer, result.original) }
+			: {}),
+	});
 }
 
 function productIdentity(plan: CiReleasePlan) {
@@ -492,6 +536,7 @@ function productIdentity(plan: CiReleasePlan) {
 		channel: plan.channel,
 		changelog: plan.changelog,
 		baselines: plan.baselines,
+		remoteFrontend: plan.remoteFrontend,
 	};
 }
 async function verifiedSource(
@@ -517,6 +562,13 @@ async function verifiedSource(
 	) {
 		throw new Error("Frozen original build/control identity mismatch");
 	}
+	if (
+		Boolean(source.remoteFrontend) !== Boolean(result.remoteFrontend) ||
+		(source.remoteFrontend &&
+			result.remoteFrontend &&
+			!sameIdentity(source.remoteFrontend, identity(result.remoteFrontend)))
+	)
+		throw new Error("Frozen original remote frontend artifact identity mismatch");
 	for (const platform of result.platforms) {
 		const frozen = source.platforms.find((item) => item.target === platform.target);
 		if (!frozen || !sameIdentity(frozen.artifact, identity(platform.artifact)))
@@ -535,6 +587,58 @@ export async function validateCiReleaseBuildSource(
 	options: BuildOptions,
 ): Promise<void> {
 	await verifiedSource(plan, boundedOptions(options));
+}
+
+/** Restore the source attempt's exact remote ZIP; never invoke target build scripts. */
+export async function restoreCiReleaseRemoteFrontend(
+	options: BuildOptions & { plan: CiReleasePlan; destination: string },
+): Promise<void> {
+	const bounded = boundedOptions(options);
+	const plan = validateCiReleasePlan(options.plan);
+	if (!plan.remoteFrontend || !plan.buildSource?.remoteFrontend)
+		throw new Error("No frozen remote frontend to restore");
+	const destination = resolve(options.destination);
+	const parent = await absentDestination(destination);
+	const source = await verifiedSource(plan, bounded);
+	if (
+		source.dispatch.runId !== plan.runId ||
+		source.dispatch.runAttempt !== plan.runAttempt ||
+		source.dispatch.workflowCommit !== plan.workflowCommit ||
+		!source.remoteFrontend
+	)
+		throw new Error("Remote restore run/control identity mismatch");
+	await checkSpace(parent, source.remoteFrontend.size_in_bytes);
+	const temporary = await mkdtemp(join(parent, ".remote-frontend-restore-"));
+	try {
+		const archive = join(temporary, "remote.zip");
+		const extracted = join(temporary, "extracted");
+		const { downloadArchive } = await import("./ci-release-restore");
+		await downloadArchive(
+			source.remoteFrontend,
+			plan.repository,
+			archive,
+			bounded.env,
+			bounded.fetch,
+			bounded.signal,
+		);
+		const names = remoteFrontendArtifactNames(plan.version);
+		await extract(archive, extracted, "remote", names.archive.slice(0, -7), bounded);
+		const { verifyRemoteFrontendArtifact } = await import("./remote-frontend-artifact");
+		await verifyRemoteFrontendArtifact(
+			extracted,
+			{
+				repository: plan.repository,
+				version: plan.version,
+				commit: plan.commit,
+				capability: plan.remoteFrontend,
+			},
+			bounded.signal,
+		);
+		bounded.signal.throwIfAborted();
+		await atomicInstallCiReleaseBuild(extracted, destination, bounded.env);
+	} finally {
+		await rm(temporary, { recursive: true, force: true });
+	}
 }
 
 export async function restoreCiReleaseBuildPlatform(

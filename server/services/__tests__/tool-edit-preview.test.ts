@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { FILE_CHANGE_LIMITS, type FileChangeState } from "@shared/file-change-protocol";
 import { and, eq, inArray } from "drizzle-orm";
@@ -15,16 +15,22 @@ import {
 	narrators,
 	narratorToolCalls,
 	users,
+	worktreeTreeSnapshots,
 } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
+import { normalizePathForComparison } from "../../lib/platform-path";
 import { safeSpawn } from "../../lib/spawn";
 import { narratorRoutes } from "../../routes/narrators";
 import { FileChangeBlobStore } from "../file-change-blob-store";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "../file-change-identity";
 import { narratorService } from "../narrator-service";
 import { getToolEditPreview, readToolEditPreviewState } from "../tool-edit-preview";
-import { treeSnapshotPhysicalDir } from "../tree-snapshot-paths";
+import {
+	legacyTreeSnapshotPhysicalDir,
+	snapshotPathIdentity,
+	treeSnapshotPhysicalDir,
+} from "../tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "../worktree-tree-snapshot";
 
 const now = "2026-09-08T00:00:00.000Z";
@@ -607,6 +613,206 @@ describe("preview authorization and exact attempt binding", () => {
 });
 
 describe("local historical tree fallback", () => {
+	async function legacyBackslashTrees() {
+		const root = await mkdtemp(join(testEnvironment.isolatedHome, "preview-v1-tree-"));
+		const cwd = join(root, "a\\b");
+		await mkdir(cwd);
+		const initialized = await safeSpawn({
+			cmd: ["git", "init", cwd],
+			timeout: 10_000,
+			maxOutputBytes: 4096,
+		});
+		expect(initialized.exitCode).toBe(0);
+		const filePath = join(cwd, "preview.ts");
+		await writeFile(filePath, "v1 before\n");
+		const before = await worktreeTreeSnapshot.capture(cwd);
+		await writeFile(filePath, "v1 after\n");
+		const after = await worktreeTreeSnapshot.capture(cwd);
+		const current = treeSnapshotPhysicalDir("local", cwd);
+		const legacy = legacyTreeSnapshotPhysicalDir("local", cwd);
+		const legacyPath = normalizePathForComparison(cwd);
+		expect(current).not.toBe(legacy);
+		// Simulate untouched v1 storage and rows, not a new capture under the fixed identity.
+		await rename(current, legacy);
+		db.update(worktreeTreeSnapshots)
+			.set({ worktreePath: legacyPath })
+			.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(cwd)))
+			.run();
+		const rows = db
+			.select()
+			.from(worktreeTreeSnapshots)
+			.where(eq(worktreeTreeSnapshots.worktreePath, legacyPath))
+			.orderBy(worktreeTreeSnapshots.id)
+			.limit(3)
+			.all();
+		expect(rows).toHaveLength(2);
+		await writeFile(filePath, "CURRENT_BYTES_MUST_NOT_FILL_V1_HISTORY");
+		const owner = narrator();
+		const call = tool(owner.id);
+		db.update(narratorToolCalls)
+			.set({
+				executionCwd: cwd,
+				resolvedFilePath: filePath,
+				canonicalFilePath: filePath,
+				treeHashBefore: before,
+				treeHashAfter: after,
+			})
+			.where(eq(narratorToolCalls.id, call.id))
+			.run();
+		return {
+			cwd,
+			filePath,
+			before,
+			after,
+			current,
+			legacy,
+			legacyPath,
+			rows,
+			owner,
+			call,
+			async cleanup() {
+				db.delete(worktreeTreeSnapshots)
+					.where(
+						inArray(
+							worktreeTreeSnapshots.id,
+							rows.map((row) => row.id),
+						),
+					)
+					.run();
+				await rm(current, { recursive: true, force: true });
+				await rm(legacy, { recursive: true, force: true });
+				await rm(root, { recursive: true, force: true });
+			},
+		};
+	}
+
+	test.skipIf(process.platform === "win32")(
+		"the real preview service and route read v1 backslash hashes without rewriting legacy evidence",
+		async () => {
+			const fixture = await legacyBackslashTrees();
+			const retained = await Promise.all(
+				["HEAD", "config", "index"].map((name) => readFile(join(fixture.legacy, name))),
+			);
+			let snapshotQueries = 0;
+			const prepare = sqlite.prepare.bind(sqlite);
+			const queries = spyOn(sqlite, "prepare").mockImplementation(
+				(...args: Parameters<typeof sqlite.prepare>) => {
+					if (args[0].includes('"worktree_tree_snapshots"')) snapshotQueries++;
+					return prepare(...args);
+				},
+			);
+			try {
+				const direct = await preview(fixture.owner.id, fixture.call);
+				expect(direct.source).toBe("tree");
+				expect(direct.before).toEqual({ status: "available", content: "v1 before\n" });
+				expect(direct.after).toEqual({ status: "available", content: "v1 after\n" });
+				expect(snapshotQueries).toBe(1);
+				const response = await appFor(fixture.owner.ownerUserId).request(
+					url(fixture.owner.id, fixture.call),
+				);
+				expect(response.status).toBe(200);
+				expect(await response.json()).toEqual(direct);
+				expect(snapshotQueries).toBe(2);
+				queries.mockRestore();
+				expect(
+					db
+						.select()
+						.from(worktreeTreeSnapshots)
+						.where(
+							inArray(
+								worktreeTreeSnapshots.id,
+								fixture.rows.map((row) => row.id),
+							),
+						)
+						.orderBy(worktreeTreeSnapshots.id)
+						.all(),
+				).toEqual(fixture.rows);
+				expect(
+					await Promise.all(
+						["HEAD", "config", "index"].map((name) => readFile(join(fixture.legacy, name))),
+					),
+				).toEqual(retained);
+				expect(await readFile(fixture.filePath, "utf8")).toBe(
+					"CURRENT_BYTES_MUST_NOT_FILL_V1_HISTORY",
+				);
+			} finally {
+				queries.mockRestore();
+				await fixture.cleanup();
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"v1 aliases cannot bypass wrong cwd, hash/device evidence, exact tool PK, or operation attempt",
+		async () => {
+			const fixture = await legacyBackslashTrees();
+			const { call, owner, rows, cwd, before, after, legacyPath, filePath } = fixture;
+			const read = spyOn(worktreeTreeSnapshot, "readFilePreviewAtTree");
+			try {
+				db.update(narratorToolCalls)
+					.set({ executionCwd: legacyPath })
+					.where(eq(narratorToolCalls.id, call.id))
+					.run();
+				expect((await preview(owner.id, call)).source).toBe("unavailable");
+				db.update(narratorToolCalls)
+					.set({ executionCwd: cwd, treeHashAfter: null })
+					.where(eq(narratorToolCalls.id, call.id))
+					.run();
+				const beforeRow = rows.find((row) => row.treeHash === before);
+				if (!beforeRow) throw new Error("missing before fixture");
+				for (const foreign of [
+					{ worktreePath: join(cwd, "foreign") },
+					{ deviceId: "foreign-device" },
+				]) {
+					db.update(worktreeTreeSnapshots)
+						.set(foreign)
+						.where(eq(worktreeTreeSnapshots.id, beforeRow.id))
+						.run();
+					expect((await preview(owner.id, call)).before).toEqual({
+						status: "unavailable",
+						reason: "missing_evidence",
+					});
+					db.update(worktreeTreeSnapshots)
+						.set({ worktreePath: legacyPath, deviceId: "local" })
+						.where(eq(worktreeTreeSnapshots.id, beforeRow.id))
+						.run();
+				}
+				expect(read).not.toHaveBeenCalled();
+				const foreignCall = tool(narrator(owner.ownerUserId).id, call.toolUseId);
+				expect((await appFor(owner.ownerUserId).request(url(owner.id, foreignCall))).status).toBe(
+					404,
+				);
+				db.update(narratorToolCalls)
+					.set({ treeHashAfter: after })
+					.where(eq(narratorToolCalls.id, call.id))
+					.run();
+				const e = evidence(call);
+				db.update(fileChangeScopes)
+					.set({ canonicalRoot: cwd, displayRoot: cwd })
+					.where(eq(fileChangeScopes.id, e.identity.scopeId))
+					.run();
+				const identity = { ...e.identity, canonicalPath: filePath, lexicalPath: filePath };
+				db.update(fileChangeEffects)
+					.set({ identityJson: identity, fileKey: fileChangeIdentityKey(identity) })
+					.where(eq(fileChangeEffects.id, e.effectId))
+					.run();
+				expect((await preview(owner.id, call)).source).toBe("evidence");
+				db.update(narratorToolCalls)
+					.set({ executionAttempt: 2 })
+					.where(eq(narratorToolCalls.id, call.id))
+					.run();
+				expect((await preview(owner.id, call)).before).toEqual({
+					status: "unavailable",
+					reason: "identity_unverified",
+				});
+				expect(read).not.toHaveBeenCalled();
+			} finally {
+				read.mockRestore();
+				await fixture.cleanup();
+			}
+		},
+	);
+
 	test("an ignored file omitted from both trees is missing evidence, not an absent file", async () => {
 		const root = await mkdtemp(join(testEnvironment.isolatedHome, "preview-ignored-tree-"));
 		const initialized = await safeSpawn({

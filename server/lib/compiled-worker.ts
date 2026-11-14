@@ -1,5 +1,6 @@
-import { Worker } from "node:worker_threads";
+import type { Worker, WorkerOptions } from "node:worker_threads";
 import { isCompiledRuntime } from "./runtime-target";
+import { WorkerCleanupError, WorkerHandle } from "./worker-runtime/lifecycle";
 
 /**
  * How to load a worker inside `bun build --compile`.
@@ -97,101 +98,206 @@ export function workerEntryFromSpecifier(specifier: string): string | URL {
 	return url;
 }
 
-export interface ConnectedWorker {
-	worker: Worker;
-	specifier: string;
+/** Startup failures can be translated to an existing domain error without parsing log text. */
+export class WorkerStartupError extends Error {
+	constructor(
+		readonly code: "TIMEOUT" | "EXITED",
+		message: string,
+	) {
+		super(message);
+		this.name = "WorkerStartupError";
+	}
 }
 
-/**
- * Start the first candidate that reports ready. A missing embedded module fails on the
- * worker's `error` event (or a synchronous throw for a rejected filename) and the next
- * layout is tried. Only earlier candidates are probes with a timeout: the last one (the only
- * one in source runs and once a layout is cached) may start slowly and is bounded by `signal`.
- * The returned worker has had its startup listeners removed.
- */
-export async function connectCompiledWorker(
+interface ConnectedResource<Resource> {
+	worker: Resource;
+	specifier: string;
+	handle: WorkerHandle<Resource>;
+}
+export type ConnectedWorker = ConnectedResource<Worker>;
+export type ConnectedBunWorker = ConnectedResource<globalThis.Worker>;
+
+interface ConnectOptions {
+	signal?: AbortSignal;
+	/** Default total startup budget; also caps each individual attempt (default 5 seconds). */
+	timeoutMs?: number;
+	/** Optional operation deadline, shared with queueing/execution rather than restarted here. */
+	deadlineAt?: number;
+	isReady?: (message: unknown) => boolean;
+	/** False for self-announcing workers whose first input must be the business request. */
+	sendPing?: boolean;
+}
+export interface ConnectWorkerOptions extends ConnectOptions {
+	workerOptions?: WorkerOptions;
+}
+export interface ConnectBunWorkerOptions extends ConnectOptions {
+	workerOptions?: Bun.WorkerOptions;
+}
+type ListenForMessage<Resource> = (
+	worker: Resource,
+	listener: (message: unknown) => void,
+) => () => void;
+interface StartupWorker {
+	postMessage(message: unknown): void;
+}
+
+// Candidate lists are fixed by trusted backend callers; no workers or task payloads are cached.
+const resolvedWorkerSpecifiers = new Map<string, string>();
+
+export function connectCompiledWorker(
 	specifiers: readonly string[],
-	options: {
-		signal?: AbortSignal;
-		timeoutMs?: number;
-		isReady?: (message: unknown) => boolean;
-	} = {},
+	options: ConnectWorkerOptions = {},
 ): Promise<ConnectedWorker> {
+	return connectNativeWorker(
+		specifiers,
+		options,
+		"node",
+		(specifier) => WorkerHandle.thread(workerEntryFromSpecifier(specifier), options.workerOptions),
+		(worker, listener) => {
+			worker.on("message", listener);
+			return () => {
+				worker.off("message", listener);
+			};
+		},
+	);
+}
+
+/** Native Bun/self workers keep their original file href and EventTarget message API. */
+export function connectCompiledBunWorker(
+	specifiers: readonly string[],
+	options: ConnectBunWorkerOptions = {},
+): Promise<ConnectedBunWorker> {
+	return connectNativeWorker(
+		specifiers,
+		options,
+		"bun",
+		(specifier) => WorkerHandle.bunThread(specifier, options.workerOptions),
+		(worker, listener) => {
+			const receive = (event: MessageEvent<unknown>) => listener(event.data);
+			worker.addEventListener("message", receive);
+			return () => {
+				worker.removeEventListener("message", receive);
+			};
+		},
+	);
+}
+
+async function connectNativeWorker<Resource extends StartupWorker>(
+	specifiers: readonly string[],
+	options: ConnectOptions,
+	transport: "node" | "bun",
+	create: (specifier: string) => WorkerHandle<Resource>,
+	listen: ListenForMessage<Resource>,
+): Promise<ConnectedResource<Resource>> {
+	const { signal } = options;
+	signal?.throwIfAborted();
 	const timeoutMs = options.timeoutMs ?? 5_000;
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647)
+		throw new RangeError("Worker ready timeout must be between 1 and 2147483647 ms");
+	const deadlineAt = options.deadlineAt ?? Date.now() + timeoutMs;
+	if (!Number.isFinite(deadlineAt)) throw new RangeError("Worker startup deadline must be finite");
 	const isReady =
 		options.isReady ??
 		((message: unknown) =>
 			!!message && typeof message === "object" && (message as { ready?: boolean }).ready === true);
+	// The same URI may work under one native loader but not the other.
+	const key = JSON.stringify([transport, ...specifiers]);
+	const preferred = resolvedWorkerSpecifiers.get(key);
+	const candidates = preferred
+		? [preferred, ...specifiers.filter((specifier) => specifier !== preferred)]
+		: specifiers;
 	const failures: string[] = [];
-	for (const [index, specifier] of specifiers.entries()) {
-		options.signal?.throwIfAborted();
-		const probe = index < specifiers.length - 1;
+	let lastFailure: unknown;
+	for (const specifier of candidates) {
+		signal?.throwIfAborted();
+		const remaining = deadlineAt - Date.now();
+		if (remaining <= 0) {
+			const timeout = new WorkerStartupError("TIMEOUT", "worker startup deadline exceeded");
+			lastFailure = timeout;
+			failures.push(timeout.message);
+			break;
+		}
+		let handle: WorkerHandle<Resource> | undefined;
 		try {
-			const worker = await startOne(
-				specifier,
-				probe ? timeoutMs : undefined,
+			handle = create(specifier);
+			await waitReady(
+				handle,
+				Math.min(timeoutMs, remaining),
 				isReady,
-				options.signal,
+				listen,
+				signal,
+				options.sendPing,
 			);
-			return { worker, specifier };
+			if (handle.closed)
+				throw handle.error ?? new WorkerStartupError("EXITED", "worker exited before ready");
+			if (specifiers.length > 1) resolvedWorkerSpecifiers.set(key, specifier);
+			return { worker: handle.resource, specifier, handle };
 		} catch (error) {
-			if (options.signal?.aborted) throw error;
+			// A failed stop hands ownership to the pool/caller, never to an untracked retry.
+			if (handle) {
+				try {
+					await handle.close();
+				} catch (cleanupError) {
+					throw new WorkerCleanupError(handle, cleanupError);
+				}
+			}
+			if (signal?.aborted) throw error;
+			if (specifier === preferred) resolvedWorkerSpecifiers.delete(key);
+			lastFailure = error;
 			failures.push(`${specifier}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	throw new Error(`No worker entry loaded (${failures.join(" | ")})`);
+	throw new Error(`No worker entry loaded (${failures.join(" | ")})`, { cause: lastFailure });
 }
 
-function startOne(
-	specifier: string,
-	timeoutMs: number | undefined,
+function waitReady<Resource extends StartupWorker>(
+	handle: WorkerHandle<Resource>,
+	timeoutMs: number,
 	isReady: (message: unknown) => boolean,
+	listen: ListenForMessage<Resource>,
 	signal?: AbortSignal,
-): Promise<Worker> {
-	return new Promise((resolve, reject) => {
+	sendPing = true,
+): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
 		let settled = false;
-		let thread: Worker | undefined;
-		const finish = (error: unknown, value?: Worker) => {
+		let removeMessage: (() => void) | undefined;
+		const finish = (error?: unknown) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
-			thread?.off("error", onError);
-			thread?.off("exit", onExit);
-			thread?.off("message", onMessage);
-			if (error) {
-				// Keep a listener so termination after a missed entry cannot surface as unhandled.
-				thread?.on("error", () => {});
-				if (thread) void thread.terminate();
-				reject(error);
-			} else if (value) resolve(value);
+			removeMessage?.();
+			if (error === undefined) resolve();
+			else reject(error);
 		};
 		const onAbort = () => finish(signal?.reason ?? new Error("worker start aborted"));
-		const onError = (error: Error) => finish(error);
-		const onExit = () => finish(new Error("worker exited before ready"));
 		const onMessage = (message: unknown) => {
-			if (isReady(message)) finish(undefined, thread);
+			try {
+				if (isReady(message)) finish();
+			} catch (error) {
+				finish(error);
+			}
 		};
-		const timer =
-			timeoutMs === undefined
-				? undefined
-				: setTimeout(() => finish(new Error("worker did not become ready")), timeoutMs);
-		try {
-			thread = new Worker(workerEntryFromSpecifier(specifier));
-		} catch (error) {
-			settled = true;
-			clearTimeout(timer);
-			reject(error);
+		const timer = setTimeout(
+			() => finish(new WorkerStartupError("TIMEOUT", "worker did not become ready")),
+			timeoutMs,
+		);
+		removeMessage = listen(handle.resource, onMessage);
+		// The handle already owns native error/exit events for either transport. One startup
+		// continuation is retained for its lifetime, never any task or business input.
+		void handle.exited.then(
+			() => finish(handle.error ?? new WorkerStartupError("EXITED", "worker exited before ready")),
+			(error: unknown) => finish(error),
+		);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) return onAbort();
+		if (handle.closed) {
+			finish(handle.error ?? new WorkerStartupError("EXITED", "worker exited before ready"));
 			return;
 		}
-		thread.on("error", onError);
-		thread.on("exit", onExit);
-		thread.on("message", onMessage);
-		signal?.addEventListener("abort", onAbort, { once: true });
-		// Ask after the listeners exist. A startup message can be lost if the worker
-		// thread posts it before the parent subscribes; a missing module errors instead.
+		if (!sendPing) return;
 		try {
-			thread.postMessage({ action: "ping" });
+			handle.resource.postMessage({ action: "ping" });
 		} catch (error) {
 			finish(error);
 		}

@@ -67,6 +67,51 @@ afterEach(() => {
 });
 
 describe("CodexManager session affinity", () => {
+	test("consecutive failures reset on success and evict affinity at the threshold", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-a", priority: 0 },
+			{ id: "cred-b", priority: 1 },
+		]);
+		tempHomes.push(tmpHome);
+		manager.setLoadBalancingMode("balanced");
+		const first = await manager.acquireContext("session-1");
+		manager.reportFailure(first.id);
+		manager.reportFailure(first.id);
+		expect(manager.snapshot().entries.find((entry) => entry.id === first.id)?.disabled).toBe(false);
+		manager.reportSuccess(first.id);
+		expect(manager.snapshot().entries.find((entry) => entry.id === first.id)?.failureCount).toBe(0);
+		manager.reportFailure(first.id);
+		manager.reportFailure(first.id);
+		manager.reportFailure(first.id);
+		expect(manager.snapshot().entries.find((entry) => entry.id === first.id)?.disabledReason).toBe(
+			"too_many_failures",
+		);
+		expect(manager.snapshot().stickySessionCount).toBe(0);
+		expect((await manager.acquireContext("session-1")).id).not.toBe(first.id);
+		manager.dispose();
+	});
+
+	test("self-healing only revives failure-disabled credentials, not manual or banned ones", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "failed", priority: 0 },
+			{ id: "manual", priority: 1 },
+			{ id: "banned", priority: 2 },
+		]);
+		tempHomes.push(tmpHome);
+		manager.setDisabled("manual", true);
+		manager.markBanned("banned");
+		manager.reportFailure("failed");
+		manager.reportFailure("failed");
+		expect(manager.reportFailure("failed")).toBe(false);
+		expect((await manager.acquireContext("session-1")).id).toBe("failed");
+		const snapshot = manager.snapshot();
+		expect(snapshot.availableEntries.map((entry) => entry.id)).toEqual(["failed"]);
+		expect(snapshot.entries.find((entry) => entry.id === "failed")?.failureCount).toBe(0);
+		expect(snapshot.entries.find((entry) => entry.id === "manual")?.disabledReason).toBe("manual");
+		expect(snapshot.entries.find((entry) => entry.id === "banned")?.disabledReason).toBe("banned");
+		manager.dispose();
+	});
+
 	test("balanced 模式下同一 session 复用同一 credential", async () => {
 		const { manager, tmpHome } = createManagerWithCredentials([
 			{ id: "cred-a", priority: 0 },

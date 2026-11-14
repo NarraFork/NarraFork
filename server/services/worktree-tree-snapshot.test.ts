@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
@@ -15,9 +16,10 @@ import {
 } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { eq } from "drizzle-orm";
 import iconv from "iconv-lite";
+import { seedSqliteTestDatabase } from "../../tests/sqlite-template";
 import { db } from "../db";
 import { worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -27,8 +29,18 @@ import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
-import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
-import { withLifecycleGuardPorts } from "./worktree-lifecycle-guard";
+import {
+	legacyTreeSnapshotKey,
+	legacyTreeSnapshotPhysicalDir,
+	snapshotPathIdentity,
+	treeSnapshotKey,
+	treeSnapshotPhysicalDir,
+} from "./tree-snapshot-paths";
+import {
+	revalidateLifecycleTarget,
+	withLifecycleGuardPorts,
+	withProtectionReservation,
+} from "./worktree-lifecycle-guard";
 import {
 	hasHotPathWarmupForTests,
 	resetHotPathCaptureStateForTests,
@@ -42,6 +54,26 @@ const snapshotPaths: string[] = [];
 /** The shadow repository backing a workspace, derived the same way the module does. */
 function shadowOf(worktreePath: string): string {
 	return treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, worktreePath);
+}
+
+/** Private attempts are evidence, not resumable cache entries or gc candidates. */
+function shadowStages(worktreePath: string): string[] {
+	const final = shadowOf(worktreePath);
+	const parent = dirname(final);
+	if (!existsSync(parent)) return [];
+	return readdirSync(parent)
+		.filter((name) => name.startsWith(`.nf-shadow-stage-${basename(final)}-`))
+		.map((name) => join(parent, name));
+}
+
+/** Manufacture a real v1 birth receipt without making its fingerprint follow v2 keys. */
+function legacyInitMarker(dir: string, worktreePath: string): string {
+	const born = lstatSync(dir);
+	const parent = lstatSync(dirname(dir));
+	const key = createHash("sha256")
+		.update(legacyTreeSnapshotKey(LOCAL_DEVICE_ID, worktreePath))
+		.digest("hex");
+	return `nf-shadow-init-v1\n${key}\n${born.dev}:${born.ino}\n${parent.dev}:${parent.ino}\n`;
 }
 
 /**
@@ -151,7 +183,8 @@ async function writeRepoExclude(mainRepo: string, contents: string): Promise<voi
 
 afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) {
-		// Shadow repositories are never deleted by the module itself; the test owns these.
+		// Shadow repositories and failed attempts are owned only by these isolated fixtures.
+		for (const stage of shadowStages(dir)) rmSync(stage, { recursive: true, force: true });
 		rmSync(shadowOf(dir), { recursive: true, force: true });
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -181,23 +214,28 @@ describe("worktree tree snapshots", () => {
 
 	for (const partial of ["empty", "HEAD", "objects", "complete"] as const) {
 		for (const cold of [false, true]) {
-			test(`failed ${partial} shadow birth resumes ${cold ? "in a cold process" : "on retry"} without deleting evidence`, async () => {
+			test(`failed ${partial} stage retains evidence and retries ${cold ? "in a cold process" : "in a fresh stage"}`, async () => {
 				const repo = await createRepo("nf-tree-init-resume-");
 				writeFileSync(join(repo, "a.txt"), "recoverable\n");
-				const dir = treeSnapshotPhysicalDir("local", repo);
-				const markerPath = join(dir, "nf-shadow-init");
+				const dir = shadowOf(repo);
+				let failedStage = "";
 				const evidence = Buffer.from([0, 255, 128, 13, 10]);
 				const realSpawn = spawn.safeSpawn;
 				const failed = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
 					if (opts.cmd[1] !== "init" || !opts.cmd.includes("--bare")) return realSpawn(opts);
+					const stage = opts.cmd.at(-1) as string;
+					failedStage = stage;
+					expect(shadowStages(repo)).toContain(stage);
+					expect(dirname(stage)).toBe(dirname(dir));
+					expect(existsSync(dir)).toBe(false);
 					if (partial === "complete") expect((await realSpawn(opts)).exitCode).toBe(0);
-					writeFileSync(join(dir, "marker.bin"), evidence);
-					if (partial === "HEAD") writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
+					writeFileSync(join(stage, "marker.bin"), evidence);
+					if (partial === "HEAD") writeFileSync(join(stage, "HEAD"), "ref: refs/heads/main\n");
 					if (partial === "objects") {
-						mkdirSync(join(dir, "objects"));
-						writeFileSync(join(dir, "objects", "evidence.bin"), evidence);
-						mkdirSync(join(dir, "refs", "nf"), { recursive: true });
-						writeFileSync(join(dir, "refs", "nf", "preserved"), `${"a".repeat(40)}\n`);
+						mkdirSync(join(stage, "objects"));
+						writeFileSync(join(stage, "objects", "evidence.bin"), evidence);
+						mkdirSync(join(stage, "refs", "nf"), { recursive: true });
+						writeFileSync(join(stage, "refs", "nf", "preserved"), `${"a".repeat(40)}\n`);
 					}
 					return { exitCode: 1, stdout: "", stderr: "injected init failure" };
 				});
@@ -208,21 +246,29 @@ describe("worktree tree snapshots", () => {
 				} finally {
 					failed.mockRestore();
 				}
-				const birth = lstatSync(dir);
+				const birth = lstatSync(failedStage);
+				const markerPath = join(failedStage, "nf-shadow-init");
 				const marker = readFileSync(markerPath);
-				const headBefore = existsSync(join(dir, "HEAD")) ? readFileSync(join(dir, "HEAD")) : null;
+				const headBefore = existsSync(join(failedStage, "HEAD"))
+					? readFileSync(join(failedStage, "HEAD"))
+					: null;
 				expect(marker.length).toBeLessThanOrEqual(256);
-				await worktreeTreeSnapshot.gcAll();
-				expect(existsSync(join(dir, "HEAD")) ? readFileSync(join(dir, "HEAD")) : null).toEqual(
-					headBefore,
+				expect(marker.toString()).toStartWith("nf-shadow-init-v2\n");
+				expect(marker.toString()).toContain(
+					createHash("sha256").update(treeSnapshotKey(LOCAL_DEVICE_ID, repo)).digest("hex"),
 				);
+				await worktreeTreeSnapshot.gcAll();
+				expect(
+					existsSync(join(failedStage, "HEAD")) ? readFileSync(join(failedStage, "HEAD")) : null,
+				).toEqual(headBefore);
 				expect(readFileSync(markerPath)).toEqual(marker);
-				expect(readFileSync(join(dir, "marker.bin"))).toEqual(evidence);
+				expect(readFileSync(join(failedStage, "marker.bin"))).toEqual(evidence);
 				if (cold) {
 					// A separate module graph and database, but the same physical shadow store.
 					// Never share the parent's live DB lock or bypass instance locking.
 					const coldHome = mkdtempSync(join(tmpdir(), "nf-tree-cold-home-"));
 					tempDirs.push(coldHome);
+					seedSqliteTestDatabase(coldHome);
 					symlinkSync(join(dir, ".."), join(coldHome, "tree-snapshots"), "dir");
 					const result = await realSpawn({
 						cmd: [
@@ -247,13 +293,16 @@ describe("worktree tree snapshots", () => {
 				} else {
 					expect(await worktreeTreeSnapshot.capture(repo)).toMatch(/^[0-9a-f]{40}$/);
 				}
-				expect(lstatSync(dir).ino).toBe(birth.ino);
-				expect(lstatSync(dir).dev).toBe(birth.dev);
-				expect(existsSync(markerPath)).toBe(false);
-				expect(readFileSync(join(dir, "marker.bin"))).toEqual(evidence);
+				expect(lstatSync(failedStage).ino).toBe(birth.ino);
+				expect(lstatSync(failedStage).dev).toBe(birth.dev);
+				expect(lstatSync(dir).ino).not.toBe(birth.ino);
+				expect(readFileSync(markerPath)).toEqual(marker);
+				expect(readFileSync(join(failedStage, "marker.bin"))).toEqual(evidence);
+				expect(existsSync(join(dir, "nf-shadow-init"))).toBe(false);
+				expect(existsSync(join(dir, "marker.bin"))).toBe(false);
 				if (partial === "objects") {
-					expect(readFileSync(join(dir, "objects", "evidence.bin"))).toEqual(evidence);
-					expect(readFileSync(join(dir, "refs", "nf", "preserved"), "utf8")).toBe(
+					expect(readFileSync(join(failedStage, "objects", "evidence.bin"))).toEqual(evidence);
+					expect(readFileSync(join(failedStage, "refs", "nf", "preserved"), "utf8")).toBe(
 						`${"a".repeat(40)}\n`,
 					);
 				}
@@ -267,6 +316,7 @@ describe("worktree tree snapshots", () => {
 		"oversized",
 		"foreign-key",
 		"directory",
+		"marker-directory",
 		"parent",
 		"symlink",
 	] as const) {
@@ -274,18 +324,9 @@ describe("worktree tree snapshots", () => {
 			const repo = await createRepo("nf-tree-init-refuse-");
 			const dir = treeSnapshotPhysicalDir("local", repo);
 			const markerPath = join(dir, "nf-shadow-init");
-			const realSpawn = spawn.safeSpawn;
-			const failed = spyOn(spawn, "safeSpawn").mockImplementation((opts) =>
-				opts.cmd[1] === "init" && opts.cmd.includes("--bare")
-					? Promise.resolve({ exitCode: 1, stdout: "", stderr: "injected init failure" })
-					: realSpawn(opts),
-			);
-			try {
-				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("shadow repo init failed");
-			} finally {
-				failed.mockRestore();
-			}
-			const marker = readFileSync(markerPath, "utf8");
+			mkdirSync(dir, { recursive: true });
+			const marker = legacyInitMarker(dir, repo);
+			writeFileSync(markerPath, marker);
 			if (damage === "missing") rmSync(markerPath);
 			if (damage === "corrupt") writeFileSync(markerPath, "{broken");
 			if (damage === "oversized") writeFileSync(markerPath, "x".repeat(257));
@@ -303,6 +344,10 @@ describe("worktree tree snapshots", () => {
 				writeFileSync(markerPath, marker);
 				expect(lstatSync(dir).ino).not.toBe(lstatSync(backup).ino);
 				expect(readFileSync(join(backup, "nf-shadow-init"), "utf8")).toBe(marker);
+			}
+			if (damage === "marker-directory") {
+				rmSync(markerPath);
+				mkdirSync(markerPath);
 			}
 			if (damage === "symlink") {
 				const external = join(repo, "external-marker");
@@ -323,27 +368,179 @@ describe("worktree tree snapshots", () => {
 		});
 	}
 
-	test("marker creation failure preserves the birth but does not authorize recovery", async () => {
-		const repo = await createRepo("nf-tree-init-marker-failure-");
-		const dir = treeSnapshotPhysicalDir("local", repo);
-		const realWrite = fsPromises.writeFile;
-		const writing = spyOn(fsPromises, "writeFile").mockImplementation((...args) =>
-			args[0] === join(dir, "nf-shadow-init")
-				? Promise.reject(new Error("injected marker creation failure"))
-				: realWrite(...args),
-		);
+	for (const partialMarker of [false, true]) {
+		test(`marker creation failure preserves ${partialMarker ? "partial marker" : "empty stage"} and permits a fresh retry`, async () => {
+			const repo = await createRepo("nf-tree-init-marker-failure-");
+			writeFileSync(join(repo, "a.txt"), "retry after marker failure\n");
+			const dir = shadowOf(repo);
+			let failedStage = "";
+			const realWrite = fsPromises.writeFile;
+			const writing = spyOn(fsPromises, "writeFile").mockImplementation(async (...args) => {
+				if (basename(String(args[0])) !== "nf-shadow-init") return realWrite(...args);
+				failedStage = dirname(String(args[0]));
+				if (partialMarker) writeFileSync(String(args[0]), "incomplete marker evidence");
+				throw new Error("injected marker creation failure");
+			});
+			const dispatch = spyOn(spawn, "safeSpawn");
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("marker creation failed");
+				expect(dispatch).toHaveBeenCalledTimes(0);
+			} finally {
+				writing.mockRestore();
+				dispatch.mockRestore();
+			}
+			expect(shadowStages(repo)).toContain(failedStage);
+			expect(existsSync(dir)).toBe(false);
+			expect(existsSync(join(failedStage, "nf-shadow-init"))).toBe(partialMarker);
+			const stageEntries = readdirSync(failedStage);
+			const tree = await worktreeTreeSnapshot.capture(repo);
+			expect(await treePaths(repo, tree)).toEqual(["a.txt"]);
+			expect(readdirSync(failedStage)).toEqual(stageEntries);
+			if (partialMarker)
+				expect(readFileSync(join(failedStage, "nf-shadow-init"), "utf8")).toBe(
+					"incomplete marker evidence",
+				);
+			expect(existsSync(join(dir, "nf-shadow-init"))).toBe(false);
+		});
+	}
+
+	for (const partial of ["empty", "HEAD", "objects", "complete"] as const) {
+		test(`a valid v1 ${partial} final birth resumes through a private stage without losing evidence`, async () => {
+			const repo = await createRepo("nf-tree-init-v1-");
+			writeFileSync(join(repo, "a.txt"), "v1 retry\n");
+			const dir = shadowOf(repo);
+			expect(dir).toBe(legacyTreeSnapshotPhysicalDir(LOCAL_DEVICE_ID, repo));
+			mkdirSync(dir, { recursive: true });
+			if (partial === "complete") {
+				const initialized = await safeSpawn({
+					cmd: ["git", "init", "--bare", dir],
+					timeout: 15_000,
+				});
+				expect(initialized.exitCode).toBe(0);
+			}
+			if (partial === "HEAD") writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
+			if (partial === "objects") mkdirSync(join(dir, "objects"));
+			const marker = legacyInitMarker(dir, repo);
+			writeFileSync(join(dir, "nf-shadow-init"), marker);
+			writeFileSync(join(dir, "preserved.bin"), "v1 evidence");
+			const born = lstatSync(dir);
+			const realSpawn = spawn.safeSpawn;
+			const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+				if (opts.cmd[1] === "init" && opts.cmd.includes("--bare")) {
+					const stage = opts.cmd.at(-1) as string;
+					expect(shadowStages(repo)).toContain(stage);
+					expect(existsSync(dir)).toBe(false);
+					expect(lstatSync(stage).ino).toBe(born.ino);
+					expect(readFileSync(join(stage, "nf-shadow-init"), "utf8")).toBe(marker);
+				}
+				return realSpawn(opts);
+			});
+			try {
+				const tree = await worktreeTreeSnapshot.capture(repo);
+				expect(await treePaths(repo, tree)).toEqual(["a.txt"]);
+				expect(lstatSync(dir).ino).toBe(born.ino);
+				expect(lstatSync(dir).dev).toBe(born.dev);
+				expect(readFileSync(join(dir, "preserved.bin"), "utf8")).toBe("v1 evidence");
+				expect(existsSync(join(dir, "nf-shadow-init"))).toBe(false);
+				expect(shadowStages(repo)).toHaveLength(0);
+			} finally {
+				dispatch.mockRestore();
+			}
+		});
+	}
+
+	test("v1 resume refuses a final replaced while the real private stage is being created", async () => {
+		const repo = await createRepo("nf-tree-v1-stage-race-");
+		const dir = shadowOf(repo);
+		const backup = join(repo, "original-v1-shadow");
+		mkdirSync(dir, { recursive: true });
+		const marker = legacyInitMarker(dir, repo);
+		writeFileSync(join(dir, "nf-shadow-init"), marker);
+		writeFileSync(join(dir, "preserved.bin"), "original v1 evidence");
+		const original = lstatSync(dir);
+		const sentinel = Buffer.from([0, 255, 128, 13, 10]);
+		let replacedIdentity = "";
+		let stagesCreated = 0;
+		const realMkdtemp = fsPromises.mkdtemp;
+		const creating = spyOn(fsPromises, "mkdtemp").mockImplementation(async (...args) => {
+			const [prefix] = args;
+			const stage = await Reflect.apply(realMkdtemp, fsPromises, args);
+			if (String(prefix) === join(dirname(dir), `.nf-shadow-stage-${basename(dir)}-`)) {
+				stagesCreated++;
+				expect(existsSync(String(stage))).toBe(true);
+				renameSync(dir, backup);
+				mkdirSync(dir);
+				writeFileSync(join(dir, "sentinel.bin"), sentinel);
+				const replacement = lstatSync(dir);
+				replacedIdentity = `${replacement.dev}:${replacement.ino}`;
+			}
+			return stage;
+		});
 		const dispatch = spyOn(spawn, "safeSpawn");
 		try {
-			await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("marker creation failed");
-			expect(dispatch).toHaveBeenCalledTimes(0);
+			await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow();
+			expect(stagesCreated).toBe(1);
+			expect(dispatch).not.toHaveBeenCalled();
+			expect(existsSync(dir)).toBe(true);
+			const retained = lstatSync(dir);
+			expect(`${retained.dev}:${retained.ino}`).toBe(replacedIdentity);
+			expect(readdirSync(dir)).toEqual(["sentinel.bin"]);
+			expect(readFileSync(join(dir, "sentinel.bin"))).toEqual(sentinel);
+			expect(lstatSync(backup).dev).toBe(original.dev);
+			expect(lstatSync(backup).ino).toBe(original.ino);
+			expect(readFileSync(join(backup, "nf-shadow-init"), "utf8")).toBe(marker);
+			expect(readFileSync(join(backup, "preserved.bin"), "utf8")).toBe("original v1 evidence");
+			for (const stage of shadowStages(repo))
+				expect(existsSync(join(stage, "sentinel.bin"))).toBe(false);
 		} finally {
-			writing.mockRestore();
+			creating.mockRestore();
 			dispatch.mockRestore();
 		}
-		expect(lstatSync(dir).isDirectory()).toBe(true);
+	});
+
+	test("an unmarked empty final directory recovers without adopting unknown nonempty contents", async () => {
+		const repo = await createRepo("nf-tree-init-empty-final-");
+		writeFileSync(join(repo, "a.txt"), "empty final recovery\n");
+		const dir = shadowOf(repo);
+		mkdirSync(dir, { recursive: true });
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		expect(await treePaths(repo, tree)).toEqual(["a.txt"]);
 		expect(existsSync(join(dir, "nf-shadow-init"))).toBe(false);
-		await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(
-			"existing shadow repo is invalid",
+	});
+
+	test("a cold shadow does not consult unrelated local or remote lifecycle inventory", async () => {
+		const repo = await createRepo("nf-tree-cold-inventory-");
+		writeFileSync(join(repo, "a.txt"), "no inventory authority\n");
+		const readClaims = mock(async () => {
+			throw new Error("local and remote inventories are unavailable");
+		});
+		const tree = await withLifecycleGuardPorts(
+			{ canonicalPath: async (value) => snapshotPathIdentity(value), readClaims },
+			() => worktreeTreeSnapshot.capture(repo),
+		);
+		expect(await treePaths(repo, tree)).toEqual(["a.txt"]);
+		expect(readClaims).not.toHaveBeenCalled();
+	});
+
+	test("a cold capture leaves its enclosing checkout reservation revalidatable", async () => {
+		const repo = await createRepo("nf-tree-cold-outer-context-");
+		writeFileSync(join(repo, "a.txt"), "private stage identity must not escape\n");
+		const dir = shadowOf(repo);
+		expect(existsSync(dir)).toBe(false);
+		await withLifecycleGuardPorts(
+			{
+				canonicalPath: async (value) => value,
+				readClaims: async () => ({ complete: true, claims: [] }),
+			},
+			() =>
+				withProtectionReservation([{ path: repo }], "enclosing checkout operation", async () => {
+					expect(await revalidateLifecycleTarget(repo)).toBe(repo);
+					const tree = await worktreeTreeSnapshot.capture(repo);
+					expect(await treePaths(repo, tree)).toEqual(["a.txt"]);
+					expect(existsSync(join(dir, "HEAD"))).toBe(true);
+					expect(shadowStages(repo)).toHaveLength(0);
+					expect(await revalidateLifecycleTarget(repo)).toBe(repo);
+				}),
 		);
 	});
 
@@ -361,6 +558,61 @@ describe("worktree tree snapshots", () => {
 		expect(current).toBe(tree);
 		expect(readClaims).not.toHaveBeenCalled();
 	});
+
+	for (const phase of ["init", "validate", "ignore"] as const) {
+		test(`cancellation after real ${phase} dispatch prevents every later initialization write or scan`, async () => {
+			const repo = await createRepo("nf-tree-init-cancel-");
+			writeFileSync(join(repo, "a.txt"), "cancelled preparation\n");
+			const controller = new AbortController();
+			const reason = new Error(`cancelled at ${phase}`);
+			const realSpawn = spawn.safeSpawn;
+			let reached = 0;
+			let dispatchesAfterAbort = 0;
+			const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+				if (controller.signal.aborted) dispatchesAfterAbort++;
+				const result = await realSpawn(opts);
+				const matches =
+					phase === "init"
+						? opts.cmd[1] === "init" && opts.cmd.includes("--bare")
+						: phase === "validate"
+							? opts.cmd.includes("--absolute-git-dir")
+							: opts.cmd[1] === "config" && opts.cmd.includes("core.excludesFile");
+				if (matches) {
+					expect(opts.signal).toBe(controller.signal);
+					reached++;
+					controller.abort(reason);
+				}
+				return result;
+			});
+			try {
+				await expect(
+					worktreeTreeSnapshot.capture(repo, LOCAL_DEVICE_ID, { signal: controller.signal }),
+				).rejects.toThrow(reason.message);
+				expect(reached).toBe(1);
+				expect(dispatchesAfterAbort).toBe(0);
+				expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("add"))).toBe(false);
+				expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("write-tree"))).toBe(false);
+			} finally {
+				dispatch.mockRestore();
+			}
+			expect(existsSync(shadowOf(repo))).toBe(false);
+			const stages = shadowStages(repo);
+			expect(stages).toHaveLength(1);
+			const stage = stages[0] as string;
+			const marker = readFileSync(join(stage, "nf-shadow-init"));
+			expect(existsSync(join(stage, "info", "attributes"))).toBe(false);
+			if (existsSync(join(stage, "info", "exclude")))
+				expect(readFileSync(join(stage, "info", "exclude"), "utf8")).not.toContain("/.worktrees/");
+			expect(
+				await db.query.worktreeTreeSnapshots.findMany({
+					where: eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(repo)),
+				}),
+			).toHaveLength(0);
+			const tree = await worktreeTreeSnapshot.capture(repo);
+			expect(await treePaths(repo, tree)).toEqual(["a.txt"]);
+			expect(readFileSync(join(stage, "nf-shadow-init"))).toEqual(marker);
+		});
+	}
 
 	test("a canonical checkout identity does not replace the raw shadow key or stored path", async () => {
 		const repo = await createRepo("nf-tree-raw-key-");
@@ -384,38 +636,47 @@ describe("worktree tree snapshots", () => {
 		expect(rows[0]?.treeHash).toBe(tree);
 	});
 
-	for (const replaced of ["shadow", "checkout"] as const) {
-		test(`successful init refuses a replaced ${replaced} inode before metadata writes or capture`, async () => {
+	for (const replaced of ["final", "checkout"] as const) {
+		test(`stage publication refuses a replaced ${replaced} without writing Git metadata into the replacement`, async () => {
 			const repo = await createRepo("nf-tree-init-context-");
 			writeFileSync(join(repo, "a.txt"), "original checkout\n");
-			const dir = treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, repo);
-			const target = replaced === "shadow" ? dir : repo;
+			const dir = shadowOf(repo);
+			const target = replaced === "final" ? dir : repo;
 			const backup = `${target}-before-replacement`;
-			tempDirs.push(backup);
+			if (replaced === "checkout") tempDirs.push(backup);
+			let stage = "";
 			const realSpawn = spawn.safeSpawn;
 			const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
 				const result = await realSpawn(opts);
 				if (opts.cmd[1] === "init" && opts.cmd.includes("--bare")) {
 					expect(result.exitCode).toBe(0);
-					renameSync(target, backup);
+					stage = opts.cmd.at(-1) as string;
+					if (replaced === "checkout") renameSync(target, backup);
 					mkdirSync(target);
 					writeFileSync(join(target, "sentinel.bin"), "replacement must stay untouched");
 				}
 				return result;
 			});
 			try {
-				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(
-					"resource footprint changed",
-				);
-				expect(dispatch).toHaveBeenCalledTimes(1);
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow();
+				expect(stage).not.toBe("");
+				expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("add"))).toBe(false);
+				expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("write-tree"))).toBe(false);
 				expect(readdirSync(target)).toEqual(["sentinel.bin"]);
 				expect(readFileSync(join(target, "sentinel.bin"), "utf8")).toBe(
 					"replacement must stay untouched",
 				);
-				expect(existsSync(join(replaced === "shadow" ? backup : dir, "nf-shadow-init"))).toBe(true);
+				expect(existsSync(join(target, "HEAD"))).toBe(false);
+				expect(existsSync(join(target, "config"))).toBe(false);
+				expect(existsSync(join(stage, "HEAD"))).toBe(true);
+				expect(existsSync(join(stage, "config"))).toBe(true);
+				if (replaced === "checkout") {
+					expect(existsSync(dir)).toBe(false);
+					expect(existsSync(join(stage, "nf-shadow-init"))).toBe(true);
+				}
 				expect(
 					await db.query.worktreeTreeSnapshots.findMany({
-						where: eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(repo)),
+						where: eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(repo)),
 					}),
 				).toHaveLength(0);
 			} finally {
@@ -530,6 +791,182 @@ describe("worktree tree snapshots", () => {
 			}
 		});
 	}
+
+	test("existing validation completion cannot authorize metadata writes into a replaced final", async () => {
+		const repo = await createRepo("nf-tree-existing-validate-race-");
+		writeFileSync(join(repo, "a.txt"), "original checkout\n");
+		await worktreeTreeSnapshot.capture(repo);
+		const dir = shadowOf(repo);
+		const backup = join(repo, "original-shadow-before-validation");
+		const sentinel = Buffer.from([0, 255, 128, 13, 10]);
+		let replacedIdentity = "";
+		let validations = 0;
+		const realSpawn = spawn.safeSpawn;
+		const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+			const result = await realSpawn(opts);
+			if (opts.cmd.includes("--absolute-git-dir") && opts.cmd.includes(dir)) {
+				expect(result.exitCode).toBe(0);
+				validations++;
+				// The first turn lets validateShadowRepo finish its own inode checks;
+				// the second runs before ensureShadowRepo resumes metadata synchronization.
+				queueMicrotask(() => {
+					queueMicrotask(() => {
+						renameSync(dir, backup);
+						mkdirSync(join(dir, "info"), { recursive: true });
+						writeFileSync(join(dir, "info", "exclude"), sentinel);
+						const replacement = lstatSync(dir);
+						replacedIdentity = `${replacement.dev}:${replacement.ino}`;
+					});
+				});
+			}
+			return result;
+		});
+		try {
+			await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow();
+			expect(validations).toBe(1);
+			expect(replacedIdentity).not.toBe("");
+			const retained = lstatSync(dir);
+			expect(`${retained.dev}:${retained.ino}`).toBe(replacedIdentity);
+			expect(readdirSync(dir)).toEqual(["info"]);
+			expect(readdirSync(join(dir, "info"))).toEqual(["exclude"]);
+			expect(readFileSync(join(dir, "info", "exclude"))).toEqual(sentinel);
+			expect(existsSync(join(backup, "HEAD"))).toBe(true);
+			expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("add"))).toBe(false);
+			expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("write-tree"))).toBe(false);
+		} finally {
+			dispatch.mockRestore();
+		}
+	});
+
+	test("existing exclude config resolution cannot overwrite a replaced final", async () => {
+		const repo = await createRepo("nf-tree-existing-config-race-");
+		writeFileSync(join(repo, "a.txt"), "original checkout\n");
+		// Warm the final-path caches so the injected config call belongs to
+		// syncExcludes itself rather than syncExcludesIfStale's initial lookup.
+		await worktreeTreeSnapshot.capture(repo);
+		await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, ".gitignore"), "ignored-after-warmup/\n");
+		const dir = shadowOf(repo);
+		const backup = join(repo, "original-shadow-before-config");
+		const sentinel = Buffer.from([0, 255, 128, 13, 10]);
+		let replacedIdentity = "";
+		let resolutions = 0;
+		const realSpawn = spawn.safeSpawn;
+		const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+			const result = await realSpawn(opts);
+			if (opts.cmd[1] === "config" && opts.cmd.includes("core.excludesFile")) {
+				resolutions++;
+				renameSync(dir, backup);
+				mkdirSync(join(dir, "info"), { recursive: true });
+				writeFileSync(join(dir, "info", "exclude"), sentinel);
+				const replacement = lstatSync(dir);
+				replacedIdentity = `${replacement.dev}:${replacement.ino}`;
+			}
+			return result;
+		});
+		try {
+			await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow();
+			expect(resolutions).toBe(1);
+			expect(replacedIdentity).not.toBe("");
+			const retained = lstatSync(dir);
+			expect(`${retained.dev}:${retained.ino}`).toBe(replacedIdentity);
+			expect(readdirSync(dir)).toEqual(["info"]);
+			expect(readdirSync(join(dir, "info"))).toEqual(["exclude"]);
+			expect(readFileSync(join(dir, "info", "exclude"))).toEqual(sentinel);
+			expect(existsSync(join(backup, "HEAD"))).toBe(true);
+			expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("add"))).toBe(false);
+			expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("write-tree"))).toBe(false);
+		} finally {
+			dispatch.mockRestore();
+		}
+	});
+
+	test("a symlink at the final path is refused without touching its target", async () => {
+		const repo = await createRepo("nf-tree-init-final-symlink-");
+		const dir = shadowOf(repo);
+		const external = join(repo, "foreign-shadow");
+		mkdirSync(external);
+		writeFileSync(join(external, "sentinel.bin"), "do not adopt");
+		mkdirSync(dirname(dir), { recursive: true });
+		symlinkSync(external, dir, process.platform === "win32" ? "junction" : "dir");
+		const dispatch = spyOn(spawn, "safeSpawn");
+		try {
+			await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(TreeSnapshotError);
+			expect(dispatch).not.toHaveBeenCalled();
+			expect(lstatSync(dir).isSymbolicLink()).toBe(true);
+			expect(readdirSync(external)).toEqual(["sentinel.bin"]);
+			expect(readFileSync(join(external, "sentinel.bin"), "utf8")).toBe("do not adopt");
+		} finally {
+			dispatch.mockRestore();
+		}
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"POSIX backslash histories stay read-only and remain previewable and diffable after a new capture",
+		async () => {
+			const root = await createRepo("nf-tree-legacy-backslash-");
+			const literal = join(root, "back\\slash");
+			const nested = join(root, "back", "slash");
+			for (const workspace of [literal, nested]) {
+				mkdirSync(workspace, { recursive: true });
+				tempDirs.push(workspace);
+				snapshotPaths.push(snapshotPathIdentity(workspace));
+				const initialized = await safeSpawn({
+					cmd: ["git", "init"],
+					cwd: workspace,
+					timeout: 15_000,
+				});
+				expect(initialized.exitCode).toBe(0);
+			}
+			writeFileSync(join(nested, "common.txt"), "old shared-cache bytes\n");
+			writeFileSync(join(nested, "only-old.txt"), "old only\n");
+			const oldTree = await worktreeTreeSnapshot.capture(nested);
+			const legacy = legacyTreeSnapshotPhysicalDir(LOCAL_DEVICE_ID, literal);
+			expect(legacy).toBe(shadowOf(nested));
+			expect(shadowOf(literal)).not.toBe(legacy);
+			const marker = legacyInitMarker(legacy, literal);
+			writeFileSync(join(legacy, "nf-shadow-init"), marker);
+			const retained = ["HEAD", "config", "index"].map((file) => ({
+				file,
+				bytes: readFileSync(join(legacy, file)),
+			}));
+			writeFileSync(join(literal, "common.txt"), "new literal-directory bytes\n");
+			writeFileSync(join(literal, "only-new.txt"), "new only\n");
+			expect(await preview(literal, oldTree, "common.txt")).toEqual({
+				status: "available",
+				content: "old shared-cache bytes\n",
+			});
+			expect(existsSync(shadowOf(literal))).toBe(false);
+			const newTree = await worktreeTreeSnapshot.capture(literal);
+			expect(newTree).not.toBe(oldTree);
+			expect(await treePaths(literal, newTree)).toEqual(["common.txt", "only-new.txt"]);
+			expect(await preview(literal, oldTree, "common.txt")).toEqual({
+				status: "available",
+				content: "old shared-cache bytes\n",
+			});
+			expect(await preview(literal, newTree, "common.txt")).toEqual({
+				status: "available",
+				content: "new literal-directory bytes\n",
+			});
+			expect(
+				(await worktreeTreeSnapshot.diffPathStatuses(literal, oldTree, newTree)).sort((a, b) =>
+					a.path.localeCompare(b.path),
+				),
+			).toEqual([
+				{ path: "common.txt", kind: "updated" },
+				{ path: "only-new.txt", kind: "added" },
+				{ path: "only-old.txt", kind: "deleted" },
+			]);
+			for (const { file, bytes } of retained)
+				expect(readFileSync(join(legacy, file))).toEqual(bytes);
+			expect(readFileSync(join(legacy, "nf-shadow-init"), "utf8")).toBe(marker);
+			expect(existsSync(join(shadowOf(literal), "nf-shadow-init"))).toBe(false);
+			const rows = await db.query.worktreeTreeSnapshots.findMany({
+				where: eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(literal)),
+			});
+			expect(rows.map((row) => row.treeHash)).toEqual([newTree]);
+		},
+	);
 
 	test("captures a tree hash and records it once per distinct state", async () => {
 		const repo = await createRepo("nf-tree-capture-");
@@ -1545,6 +1982,41 @@ describe("hot-path capture budget", () => {
 		});
 		expect(warmed).toBe(tree);
 	});
+	test("gcAll preempts a real cold warm-up before its final shadow directory exists", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-gc-cold-");
+		writeFileSync(join(repo, "a.txt"), "cold stage warm-up\n");
+		const started = Promise.withResolvers<void>();
+		let capturedSignal: AbortSignal | undefined;
+		const realSpawn = spawn.safeSpawn;
+		const dispatch = spyOn(spawn, "safeSpawn").mockImplementation((opts) => {
+			if (opts.cmd[1] !== "init" || !opts.cmd.includes("--bare")) return realSpawn(opts);
+			capturedSignal = opts.signal;
+			started.resolve();
+			return new Promise<Awaited<ReturnType<typeof safeSpawn>>>((_resolve, reject) => {
+				opts.signal?.addEventListener("abort", () => reject(opts.signal?.reason), { once: true });
+			});
+		});
+		try {
+			await promoteToWarmup(repo);
+			await started.promise;
+			expect(hasHotPathWarmupForTests(repo)).toBe(true);
+			expect(existsSync(shadowOf(repo))).toBe(false);
+			expect(shadowStages(repo)).toHaveLength(1);
+			await worktreeTreeSnapshot.gcAll();
+			expect(capturedSignal?.aborted).toBe(true);
+			expect(hasHotPathWarmupForTests(repo)).toBe(false);
+			expect(existsSync(shadowOf(repo))).toBe(false);
+		} finally {
+			dispatch.mockRestore();
+			resetHotPathCaptureStateForTests();
+		}
+		const stages = shadowStages(repo);
+		expect(stages).toHaveLength(1);
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		expect(await treePaths(repo, tree)).toEqual(["a.txt"]);
+		expect(shadowStages(repo)).toEqual(stages);
+	});
 });
 
 /**
@@ -1553,6 +2025,35 @@ describe("hot-path capture budget", () => {
  * and repositories written by older versions also carry lineage refs under `refs/nf/`.
  */
 describe("gcAll maintenance", () => {
+	test("complete private stages without markers are never repaired or repacked", async () => {
+		const repo = await createRepo("nf-tree-gc-private-stage-");
+		writeFileSync(join(repo, "a.txt"), "published snapshot\n");
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		const final = shadowOf(repo);
+		const stage = join(dirname(final), `.nf-shadow-stage-${basename(final)}-unpublished`);
+		const initialized = await safeSpawn({
+			cmd: ["git", "init", "--bare", stage],
+			timeout: 15_000,
+		});
+		expect(initialized.exitCode).toBe(0);
+		writeFileSync(join(stage, "sentinel.bin"), "private evidence without marker");
+		const head = readFileSync(join(stage, "HEAD"));
+		const config = readFileSync(join(stage, "config"));
+		const dispatch = spyOn(spawn, "safeSpawn");
+		try {
+			await worktreeTreeSnapshot.gcAll();
+			expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes(stage))).toBe(false);
+			expect(readFileSync(join(stage, "HEAD"))).toEqual(head);
+			expect(readFileSync(join(stage, "config"))).toEqual(config);
+			expect(readFileSync(join(stage, "sentinel.bin"), "utf8")).toBe(
+				"private evidence without marker",
+			);
+			expect(await hasTree(repo, tree)).toBe(true);
+		} finally {
+			dispatch.mockRestore();
+		}
+	});
+
 	test("a captured tree and a legacy lineage ref both survive a repack", async () => {
 		const repo = await createRepo("nf-tree-gc-keep-");
 		writeFileSync(join(repo, "a.txt"), "worth keeping\n");
@@ -1601,7 +2102,10 @@ describe("gcAll maintenance", () => {
 	});
 
 	test("retains an incomplete directory and unknown marker even without objects or refs", async () => {
-		const empty = getNarraforkPath("tree-snapshots", `deadbeef${generateId().slice(0, 8)}`);
+		const empty = getNarraforkPath(
+			"tree-snapshots",
+			createHash("sha256").update(generateId()).digest("hex").slice(0, 32),
+		);
 		mkdirSync(join(empty, "objects", "pack"), { recursive: true });
 		mkdirSync(join(empty, "refs"), { recursive: true });
 		const marker = Buffer.from([0, 128, 255, 13, 10]);

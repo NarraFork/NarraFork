@@ -28,12 +28,8 @@
 			"session": "Session"
 		},
 		"orphaned": "Owner removed",
-		"commits_one": "{{count}} commit",
-		"commits_other": "{{count}} commits",
 		"readOnly": "Read only",
-		"searchPlaceholder": "Search this space",
-		"pages": "Pages",
-		"noPages": "No pages yet. Agents and editors add them here."
+		"searchPlaceholder": "Search this space"
 	},
 	"page": {
 		"task": {
@@ -530,6 +526,8 @@
 			"tasksStarted_other": "{{count}} started",
 			"leaseReturned_one": "{{count}} given back when its session stopped",
 			"leaseReturned_other": "{{count}} given back when their sessions stopped",
+			"handedBack_one": "{{count}} handed back unfinished, with a handoff note",
+			"handedBack_other": "{{count}} handed back unfinished, with handoff notes",
 			"reviewComments_one": "the plan review left comments {{count}} time",
 			"reviewComments_other": "the plan review left comments {{count}} times"
 		},
@@ -579,6 +577,11 @@
 		"humanCreated": "Set by a person",
 		"newlyDone": "Newly done",
 		"newlyDoneHint": "An agent finished this task you created. The mark goes once you have seen it.",
+		"handoffs_one": "Handoff · {{count}} time",
+		"handoffs_other": "Handoff · {{count}} times",
+		"handoffsHint": "A session gave this task back unfinished and left a handoff note under it. The next session continues from that note.",
+		"handoffsManyHint_one": "This task has been given back {{count}} time. Read the handoff notes before opening another session for it.",
+		"handoffsManyHint_other": "This task has been given back {{count}} times. Read the handoff notes before opening another session for it.",
 		"locked": "Locked · {{name}}",
 		"lockedSomeone": "Locked",
 		"waitPrerequisites": "Waits for {{count}} prerequisite(s)",
@@ -610,12 +613,31 @@
 			"assignUser": "Hand to someone…",
 			"assignSession": "Hand back to the session",
 			"transferSession": "Hand to a session…",
+			"handToTeam": "Hand to the team",
 			"usernamePlaceholder": "Username",
 			"assign": "Hand over",
 			"open": "Open in the outline",
 			"failed": "Could not change the task",
 			"conflict": "The task changed meanwhile; the board was reloaded.",
 			"updated": "Task updated"
+		},
+		"handOut": {
+			"toTeam": "Handed to the team: a copy is on the project's task page ({{address}}). This task waits for it.",
+			"toOthers": "Handed out: a copy is on the project's task page ({{address}}). This task waits for it.",
+			"failed": "Could not hand the task out",
+			"refused": {
+				"not_session_task": "Only a task of a session's own space is handed out.",
+				"not_owner": "Only the session's owner can hand its tasks out.",
+				"no_project": "The session belongs to no project, so there is nowhere to hand the task to.",
+				"cannot_write_project": "You cannot write the project's tasks, where the copy would go.",
+				"finished": "The task is finished already.",
+				"planning": "The task is part of a plan that is not approved yet.",
+				"locked": "The task is in a plan a person locked.",
+				"held": "Someone else is doing the task.",
+				"changed": "The task changed meanwhile; the board was reloaded.",
+				"already_handed_out": "The task was handed out already to someone else, and its copy is in progress.",
+				"original_not_updated": "The copy was made, but this task could not be set to wait for it. A note under the copy says so."
+			}
 		},
 		"transfer": {
 			"note": "An existing session brings its earlier context along. A new session is usually the better choice.",
@@ -665,6 +687,7 @@
 			"model": "Model",
 			"cwd": "Working directory",
 			"cwdPlaceholder": "The project's directory",
+			"previousDirectory": "Continue in the previous session's directory",
 			"note": "Further instructions",
 			"notePlaceholder": "Optional: added to the session's brief as written",
 			"submit": "Open session",
@@ -687,6 +710,45 @@
 				"forbidden": "You may not open sessions for this project's tasks.",
 				"unreadable": "The new session could not read this project's outline, so it was not given the task. Check the project's and the sessions' visibility settings."
 			}
+		}
+	},
+	"tree": {
+		"hint": "Open anything in place to read it; open a page's title to edit it.",
+		"collapseAll": "Collapse all",
+		"recent": "Recently visited ({{count}})",
+		"sessions": "Sessions ({{count}})",
+		"sessionsUncounted": "Sessions",
+		"loose": "Sessions outside projects ({{count}})",
+		"orphaned": "Spaces without an owner ({{count}})",
+		"noSessions": "No sessions you can read.",
+		"noPages": "No pages yet.",
+		"moreSpaces_one": "{{count}} more ▸",
+		"moreSpaces_other": "{{count}} more ▸",
+		"moreProjects": "More projects ▸",
+		"gone": "No longer available.",
+		"partial_one": "Showing the first {{count}} block of this page here.",
+		"partial_other": "Showing the first {{count}} blocks of this page here.",
+		"openPage": "Open the page",
+		"waiting": "{{n}} waiting for you",
+		"waitingLabel_one": "{{count}} question waiting for your answer",
+		"waitingLabel_other": "{{count}} questions waiting for your answer",
+		"waitingAction_one": "Answer {{count}} waiting question",
+		"waitingAction_other": "Answer {{count}} waiting questions",
+		"doingLabel_one": "{{count}} task in progress",
+		"doingLabel_other": "{{count}} tasks in progress",
+		"summary": {
+			"doing": "Doing: {{text}}",
+			"finished": "Finished: {{text}}"
+		},
+		"locate": "Show in the outline tree",
+		"locateFailed": "Could not show it in the tree: it may be gone, or past what one read of its page holds.",
+		"dismiss": "Dismiss",
+		"search": {
+			"label": "Search results",
+			"hint": "Matches with what they are under. Open a match to see it in the tree.",
+			"locate": "Show in the tree: {{title}}",
+			"more": "More matches ▸",
+			"untitled": "Untitled"
 		}
 	}
 }

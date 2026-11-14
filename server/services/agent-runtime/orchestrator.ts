@@ -219,7 +219,11 @@ import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { endTurn, startTurn } from "../narrator-turns";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
-import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease-keeper";
+import {
+	keepOutlineTaskLeases,
+	type OutlineLeaseKeeper,
+	outlinePersonHourRunning,
+} from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
@@ -236,7 +240,7 @@ import {
 	shouldResumeAfterCompact,
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
-import { registerNarratorLoop } from "../update-coordinator";
+import { registerNarratorLoop, waitForRestartBeforeFailure } from "../update-coordinator";
 import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
@@ -398,6 +402,24 @@ export async function runAgentLoopUnlocked(
 	let continuationStopNote: string | null = null;
 	let abortedBeforeCleanup: boolean | undefined;
 	let freshInput = false;
+	// A person's message started this run or joined it (outline: such a run keeps the session's
+	// unfinished team tasks for a while; one the system started gives them back when it ends).
+	// Said by the run's entry point, never read off the input (a Retry or a Continue carries no
+	// text): unset is a person. A person's queued message taken up later makes it theirs too, and
+	// so does a person acting inside it (`_runPersonActed`: a permission, a plan, a question
+	// resolved, an asynchronous answer taken up).
+	let personSpoke = active._runInitiatedBy !== "system";
+	const runForTaskId = active._runForTaskId ?? null;
+	active._runInitiatedBy = undefined;
+	active._runForTaskId = undefined;
+	active._runPersonActed = false;
+	const personRun = () => personSpoke || active._runPersonActed === true;
+	/** What the finalizer restarts the session for, and what will wake it when it finishes. */
+	const workPendingAtEnd = async (): Promise<boolean> =>
+		(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
+		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
+		// A question a person has yet to answer: their answer wakes the session.
+		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -640,6 +662,7 @@ export async function runAgentLoopUnlocked(
 			throw error;
 		}
 		if (buffered) {
+			personSpoke = true;
 			const bufferedClaim = buffered._mailboxClaim;
 			if (!bufferedClaim) throw new Error("Claimed buffered input missing mailbox claim");
 			active._bufferSoftStopTaken = false;
@@ -1001,6 +1024,13 @@ export async function runAgentLoopUnlocked(
 				},
 			);
 			const outlineEditCore = taskBackend === "outline" && freshNarrator.type !== "subagent";
+			// A root session the Dynamic Spec import moved: its `spec://` calls are told where the
+			// old files went (outline P2 PR 12b2). One cached primary-key read per session.
+			const specImported =
+				outlineEditCore &&
+				(await import("../outline/spec-import/state").then(({ isSpecImportedSession }) =>
+					isSpecImportedSession(narratorId),
+				));
 			{
 				if (active._workspaceInstallFailed)
 					throw new Error("Workspace context installation requires session recovery");
@@ -1822,6 +1852,8 @@ export async function runAgentLoopUnlocked(
 
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
+					// Providers may surface teardown errors as events rather than throws.
+					await waitForRestartBeforeFailure(active.abortController.signal);
 					// A plan approval still waiting for its response to finish never restarted
 					// the pass: this ending is an ordinary interruption or failure, and the
 					// partial response must be kept, not cleaned up as an approval abort.
@@ -1837,7 +1869,7 @@ export async function runAgentLoopUnlocked(
 					// Clean up partial message
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
-					if (message === "Aborted") {
+					if (message === "Aborted" || active.abortController.signal.aborted) {
 						if (
 							active._planApprovedContinue === "compact" ||
 							active._planApprovedContinue === "continue"
@@ -1918,6 +1950,7 @@ export async function runAgentLoopUnlocked(
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
 				taskBackend,
+				specImported,
 				bot: isBotNarrator(freshNarrator.traits),
 				narratorId,
 				conversationId: active.conversationId,
@@ -2797,6 +2830,11 @@ export async function runAgentLoopUnlocked(
 				if (placement) {
 					const payment = result.paymentRequired;
 					for (const recipient of [narratorId, placement.parentNarratorId]) {
+						// The parent copy is tagged like every other dual-broadcast frame: a
+						// child running out of balance must not make the parent page open its
+						// own recharge dialog.
+						const isParentCopy =
+							recipient === placement.parentNarratorId && recipient !== narratorId;
 						broadcastToNarrator(recipient, {
 							type: "payment_required",
 							narratorId: recipient,
@@ -2805,6 +2843,7 @@ export async function runAgentLoopUnlocked(
 							balance: payment.balance,
 							required: payment.required,
 							resumeAction: payment.resumeAction,
+							...(isParentCopy && { isSubagent: true }),
 						});
 					}
 				}
@@ -3501,7 +3540,14 @@ export async function runAgentLoopUnlocked(
 				// before the drain (its reads are awaited), and written only once this run has
 				// settled terminal below, so nothing awaited sits between the drain and the
 				// arbitration. The drain or a hold continuing the run drops it.
-				const turnEndNote = await decideOutlineTurnEndNote(active);
+				const turnEndNote = await decideOutlineTurnEndNote(active, {
+					givingBackTeamTasks:
+						!personRun() &&
+						!runState.wasInterrupted &&
+						!active.abortController.signal.aborted &&
+						!outlinePersonHourRunning(narratorId) &&
+						!(await workPendingAtEnd().catch(() => true)),
+				});
 
 				// Drain any queued injection FIRST, before flipping the DB status to idle.
 				// This closes the window where status is already idle (visible to clients /
@@ -3544,6 +3590,9 @@ export async function runAgentLoopUnlocked(
 			break;
 		}
 	} catch (err) {
+		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
+		// Keep the run active for the next process instead of publishing a false failure.
+		await waitForRestartBeforeFailure(active.abortController.signal);
 		if (pendingBufferedDelivery) {
 			try {
 				await restoreBufferedMessage(narratorId, pendingBufferedDelivery);
@@ -3555,33 +3604,49 @@ export async function runAgentLoopUnlocked(
 			}
 			pendingBufferedDelivery = undefined;
 		}
-		const errorMsg = serializeCatalogErrorMessage(err);
-		logger.error("Narrator loop error", {
-			narratorId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-		try {
-			await withDbRetry(
-				() =>
-					updateTerminalStatus({
-						substatus: ["error"],
-						errorMessage: errorMsg,
-					}),
-				{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
-			);
-		} catch (statusErr) {
-			logger.error("Failed to persist narrator error status", {
+		if (active.abortController.signal.aborted) {
+			runState.wasInterrupted = true;
+		} else {
+			const errorMsg = serializeCatalogErrorMessage(err);
+			logger.error("Narrator loop error", {
 				narratorId,
-				error: String(statusErr),
+				error: err instanceof Error ? err.message : String(err),
 			});
+			try {
+				await withDbRetry(
+					() =>
+						updateTerminalStatus({
+							substatus: ["error"],
+							errorMessage: errorMsg,
+						}),
+					{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
+				);
+			} catch (statusErr) {
+				logger.error("Failed to persist narrator error status", {
+					narratorId,
+					error: String(statusErr),
+				});
+			}
+			runState.finalText = errorMsg;
+			runState.hadError = true;
+			active.events.emit("event", { type: "error", data: { message: errorMsg } });
 		}
-		runState.finalText = errorMsg;
-		runState.hadError = true;
-		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
 		// The run ended: the session's claims go on the idle lease while it waits for its next
-		// turn, a subagent's pass to its root (not waited for).
-		void outlineLeases?.stop();
+		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
+		// started that ended by itself are given back with a handoff (not waited for).
+		void outlineLeases?.stop({
+			natural:
+				!freshInput &&
+				!runState.hadError &&
+				!runState.wasInterrupted &&
+				!active.abortController.signal.aborted,
+			// A subagent's run is never a person's hour of its own: its claims pass to its root.
+			person: personRun() && !deliverTo,
+			reply: runState.finalText,
+			forTaskId: runForTaskId,
+			pending: workPendingAtEnd,
+		});
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;
 		unregisterUpdateLoop();

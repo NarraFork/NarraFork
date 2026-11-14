@@ -34,7 +34,7 @@ import {
 	SnapshotCaptureReceiptService,
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
-import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
+import { snapshotPathIdentity, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { treeSnapshotKey, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 let root: string;
@@ -56,7 +56,8 @@ function database(client: Database) {
 beforeEach(async () => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	if (crashChild) return;
-	root = await mkdtemp(join(await realpath(tmpdir()), "nf-capture-receipt-"));
+	// Canonicalize the newly-owned root, including Windows 8.3 and macOS /var aliases.
+	root = await realpath(await mkdtemp(join(tmpdir(), "nf-capture-receipt-")));
 	workspace = join(root, "workspace");
 	privateRoot = join(root, "private");
 	await mkdir(workspace);
@@ -103,7 +104,9 @@ afterEach(async () => {
 		.where(eq(schema.narratorMessages.narratorId, narratorId))
 		.run();
 	appDb.delete(schema.narrators).where(eq(schema.narrators.id, narratorId)).run();
-	sqlite.close();
+	// Drizzle retains prepare() statements. Default close defers the real SQLite
+	// close until their GC; strict close finalizes them before Windows removes the files.
+	sqlite.close(true);
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -227,7 +230,7 @@ describe("actual tree-scan observation receipts", () => {
 		const legacy = appDb
 			.select()
 			.from(schema.worktreeTreeSnapshots)
-			.where(eq(schema.worktreeTreeSnapshots.worktreePath, workspace))
+			.where(eq(schema.worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(workspace)))
 			.limit(5)
 			.all();
 		expect(legacy).toHaveLength(1);
@@ -499,7 +502,7 @@ describe("actual tree-scan observation receipts", () => {
 		const legacy = appDb
 			.select()
 			.from(schema.worktreeTreeSnapshots)
-			.where(eq(schema.worktreeTreeSnapshots.worktreePath, workspace))
+			.where(eq(schema.worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(workspace)))
 			.limit(1)
 			.get();
 		await rename(`${source}.saved`, source);
@@ -525,7 +528,7 @@ describe("actual tree-scan observation receipts", () => {
 			expect(rows()).toHaveLength(0);
 		} finally {
 			blocker.exec("ROLLBACK;");
-			blocker.close();
+			blocker.close(true);
 			sqlite.exec("PRAGMA busy_timeout = 0;");
 		}
 		await capture();
@@ -759,7 +762,7 @@ describe("actual tree-scan observation receipts", () => {
 			expect(rows()).toHaveLength(1);
 		} finally {
 			competing.exec("ROLLBACK;");
-			competing.close();
+			competing.close(true);
 		}
 		await editorWrite("writer still usable after receipt lock contention\n");
 		expect(await readFile(join(workspace, "a.txt"), "utf8")).toContain("writer still usable");
@@ -787,6 +790,30 @@ describe("actual tree-scan observation receipts", () => {
 			),
 		).not.toBeNull();
 		expect(rows()).toHaveLength(3);
+	});
+
+	test("strict fixture close finalizes retained statements before removing the real database", async () => {
+		const deferred = new Database(join(root, "evidence.db"));
+		const statement = deferred.prepare<{ value: number }, []>("SELECT 1 AS value");
+		try {
+			deferred.close();
+			// Control: default close still leaves prepare() and its underlying handle alive.
+			expect(statement.get()).toEqual({ value: 1 });
+		} finally {
+			statement.finalize();
+			deferred.close(true);
+		}
+		const retained = db
+			.select({ id: schema.fileChangeScopes.id })
+			.from(schema.fileChangeScopes)
+			.limit(1)
+			.prepare();
+		expect(retained.get()?.id).toBeDefined();
+		sqlite.close(true);
+		// Keep the Drizzle statement alive: success must not depend on a GC cycle.
+		expect(() => retained.get()).toThrow();
+		await rm(join(root, "evidence.db"));
+		await expect(readFile(join(root, "evidence.db"))).rejects.toThrow();
 	});
 
 	test("scope lookup uses the exact incarnation index with a fixed row/metadata projection", () => {

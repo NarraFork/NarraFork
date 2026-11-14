@@ -7,16 +7,24 @@ import {
 } from "../../shared/helper-distribution";
 import {
 	MAX_MIRROR_METADATA_BYTES,
+	MIRROR_MAIN_COMMIT_TIMEOUT_MS,
+	MIRROR_MAIN_TRANSFER_TIMEOUT_MS,
 	type MirrorAssetDescriptor,
 	mirrorAssetsForTarget,
 	parseMirrorAssetDescriptor,
 	parseMirrorSnapshot,
 } from "../../shared/independent-update-mirror";
 import { MAX_MIRROR_UPLOAD_CONCURRENCY, mirrorTransferTimeoutMs } from "../../shared/mirror-relay";
+import { isValidReleaseVersion } from "../../shared/release-version";
 import { EXECUTOR_MANIFEST_FILENAME } from "../../shared/remote-executor";
+import { REMOTE_PEER_MANIFEST_FILENAME } from "../../shared/remote-peer";
+import {
+	parseRemotePeerReleaseManifest,
+	parseRemotePeerReleaseTag,
+} from "../../shared/remote-peer-manifest";
 import { parseUpdateIndex } from "../../shared/update-index";
 import type { UpdateIndexV1 } from "../../shared/update-index-types";
-import { getConfig } from "../lib/config";
+import { getConfig, MAX_MIRROR_STORAGE_BYTES } from "../lib/config";
 import { logger } from "../lib/logger";
 import type { StorageBackend } from "../storage/types";
 import { objectPath, validateMirrorMetadata, verifyMirrorAsset } from "./mirror-ingest-io";
@@ -44,7 +52,7 @@ export interface MirrorToolsReceipt {
 	schemaVersion: 1;
 	verification: "server-sha256";
 	repository: string;
-	kind: "helpers" | "executor";
+	kind: "helpers" | "executor" | "remote-peer";
 	tag: string;
 	verified: MirrorVerifiedAsset[];
 }
@@ -64,6 +72,8 @@ const toolPath = (product: string, kind: string, tag: string) =>
 interface TargetMarker {
 	version: string;
 	fingerprint: string;
+	/** Missing in old catalogs: never infer executable visibility from object existence. */
+	projectionVersion: 1 | 2;
 }
 interface CatalogState {
 	schemaVersion: 2;
@@ -78,7 +88,7 @@ interface ToolAsset extends MirrorVerifiedAsset {
 interface ToolProjection {
 	schemaVersion: 1;
 	repository: string;
-	kind: "helpers" | "executor";
+	kind: "helpers" | "executor" | "remote-peer";
 	tag: string;
 	assets: ToolAsset[];
 	/** Descriptors only; executable bytes are separate streamed objects. */
@@ -95,15 +105,25 @@ function fingerprint(index: UpdateIndexV1, version: string): string | undefined 
 	return target ? digest(target) : undefined;
 }
 function checkToolsIdentity(kind: string, tag: string) {
-	if (!/^(helpers|executor)$/.test(kind) || !/^[a-z0-9.-]{1,64}$/.test(tag))
+	if (kind === "remote-peer") {
+		parseRemotePeerReleaseTag(tag);
+		return;
+	}
+	if (
+		!/^(helpers|executor)$/.test(kind) ||
+		!/^[a-z0-9.-]{1,64}$/.test(tag) ||
+		!tag.startsWith(`${kind}-v`) ||
+		!isValidReleaseVersion(tag.slice(`${kind}-v`.length))
+	)
 		throw new Error("Invalid component identity");
 }
 export function parseTools(
 	input: unknown,
 	repository: string,
-	kind: "helpers" | "executor",
+	kind: "helpers" | "executor" | "remote-peer",
 	tag: string,
 ): ToolProjection {
+	checkToolsIdentity(kind, tag);
 	const encoded = JSON.stringify(input);
 	if (!encoded || Buffer.byteLength(encoded) > STATE_LIMIT)
 		throw new Error("Component metadata byte limit");
@@ -151,19 +171,31 @@ export function parseTools(
 			throw new Error("Component metadata size/hash mismatch");
 		return { ...summary(a), content: a.content };
 	});
-	const manifestName = kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME;
+	const manifestName =
+		kind === "helpers"
+			? HELPER_MANIFEST_FILENAME
+			: kind === "executor"
+				? EXECUTOR_MANIFEST_FILENAME
+				: REMOTE_PEER_MANIFEST_FILENAME;
 	const manifestAsset = assets.find((a) => a.name === manifestName);
 	if (!manifestAsset) throw new Error(`Required ${manifestName} missing`);
 	const value = JSON.parse(manifestAsset.content);
 	const manifest =
 		kind === "helpers"
 			? parseHelperManifest(value, { repository, tag })
-			: parseExecutorReleaseManifest(value, {
-					repository,
-					tag,
-					version: tag.replace(/^executor-v/, ""),
-					protocolVersion: value?.manifest?.protocolVersion,
-				});
+			: kind === "executor"
+				? parseExecutorReleaseManifest(value, {
+						repository,
+						tag,
+						version: tag.slice("executor-v".length),
+						protocolVersion: value?.manifest?.protocolVersion,
+					})
+				: parseRemotePeerReleaseManifest(value, {
+						repository,
+						tag,
+						version: tag.slice("remote-peer-v".length),
+						protocolVersion: value?.manifest?.protocolVersion,
+					});
 	if (
 		assets.length !== manifest.licenses.length + 1 ||
 		new Set(assets.map((a) => a.name)).size !== assets.length
@@ -252,7 +284,7 @@ export class MirrorIngestService {
 		const bytes = await this.smallFile(statePath(product));
 		if (!bytes) return null;
 		const data = JSON.parse(bytes.toString("utf8"));
-		if (data.schemaVersion === 1) {
+		if (data.schemaVersion === 1 || (data.schemaVersion === 2 && "assets" in data)) {
 			const old = parseMirrorSnapshot(data, repo);
 			return {
 				schemaVersion: 2,
@@ -263,6 +295,7 @@ export class MirrorIngestService {
 					{
 						version: old.targetVersion,
 						fingerprint: fingerprint(old.index, old.targetVersion) as string,
+						projectionVersion: old.schemaVersion,
 					},
 				],
 			};
@@ -279,13 +312,24 @@ export class MirrorIngestService {
 		const index = parseUpdateIndex(data.index, repo);
 		const targets: TargetMarker[] = [];
 		for (const marker of data.targets) {
-			if (!marker || typeof marker.version !== "string" || typeof marker.fingerprint !== "string")
+			if (
+				!marker ||
+				typeof marker.version !== "string" ||
+				typeof marker.fingerprint !== "string" ||
+				(marker.projectionVersion !== undefined &&
+					marker.projectionVersion !== 1 &&
+					marker.projectionVersion !== 2)
+			)
 				throw new Error("Invalid stored mirror target marker");
 			if (
 				fingerprint(index, marker.version) === marker.fingerprint &&
 				!targets.some((t) => t.version === marker.version)
 			)
-				targets.push({ version: marker.version, fingerprint: marker.fingerprint });
+				targets.push({
+					version: marker.version,
+					fingerprint: marker.fingerprint,
+					projectionVersion: marker.projectionVersion ?? 1,
+				});
 		}
 		return { schemaVersion: 2, repository: repo, indexCommit: data.indexCommit, index, targets };
 	}
@@ -298,7 +342,9 @@ export class MirrorIngestService {
 		return catalog
 			? {
 					index: catalog.index,
-					assets: catalog.targets.flatMap((t) => mirrorAssetsForTarget(catalog.index, t.version)),
+					assets: catalog.targets.flatMap((t) =>
+						mirrorAssetsForTarget(catalog.index, t.version, t.projectionVersion),
+					),
 				}
 			: null;
 	}
@@ -319,7 +365,7 @@ export class MirrorIngestService {
 			(asset.kind === "patch-meta" && !asset.name.endsWith(".zstd-patch.meta.json")) ||
 			(asset.kind === "notes" && !/^notes\/[A-Za-z0-9.+-]+\.json$/.test(asset.name))
 		)
-			throw new Error("Only canonical metadata, patches and component binaries may be uploaded");
+			throw new Error("Only canonical mirror assets may be uploaded");
 		if (!this.storage.saveVerifiedFile)
 			throw new MirrorIngestError(503, "STORAGE_VERIFICATION_UNAVAILABLE");
 		if (this.uploads.size >= MAX_MIRROR_UPLOAD_CONCURRENCY || this.uploads.has(asset.sha256))
@@ -335,14 +381,19 @@ export class MirrorIngestService {
 			const timeoutMs =
 				delivery === "relay"
 					? mirrorTransferTimeoutMs(getConfig().mirrorRelay?.transferTimeoutMinutes)
-					: 120_000;
+					: asset.kind === "main-binary"
+						? MIRROR_MAIN_TRANSFER_TIMEOUT_MS
+						: 120_000;
 			signal.throwIfAborted();
 			await this.storage.saveVerifiedFile(objectPath(asset.sha256), stream, {
 				size: asset.size,
 				sha256: asset.sha256,
 				signal,
 				timeoutMs: Math.min(limits?.uploadTimeoutMs ?? timeoutMs, timeoutMs),
-				quotaBytes: Math.min(limits?.quotaBytes ?? 8 * 1024 ** 3, 8 * 1024 ** 3),
+				quotaBytes: Math.min(
+					limits?.quotaBytes ?? MAX_MIRROR_STORAGE_BYTES,
+					MAX_MIRROR_STORAGE_BYTES,
+				),
 				minFreeBytes: Math.max(limits?.minFreeBytes ?? 256 * 1024 ** 2, 0),
 			});
 			signal.throwIfAborted();
@@ -369,11 +420,15 @@ export class MirrorIngestService {
 			throw new MirrorIngestError(503, "STORAGE_COMMIT_UNAVAILABLE");
 		if (this.commits.size >= 2 || this.commits.has(product))
 			throw new MirrorIngestError(409, "MIRROR_COMMIT_IN_PROGRESS");
+		const snapshot = parseMirrorSnapshot(input, repo);
+		const started = Date.now();
 		this.commits.add(product);
-		const deadline = AbortSignal.any([signal, AbortSignal.timeout(120_000)]);
+		const deadline = AbortSignal.any([
+			signal,
+			AbortSignal.timeout(snapshot.schemaVersion === 2 ? MIRROR_MAIN_COMMIT_TIMEOUT_MS : 120_000),
+		]);
 		try {
 			deadline.throwIfAborted();
-			const snapshot = parseMirrorSnapshot(input, repo);
 			const previous = await this.catalog(product);
 			if (previous && snapshot.index.generation < previous.index.generation)
 				throw new MirrorIngestError(409, "STALE_CANONICAL_SNAPSHOT");
@@ -393,9 +448,14 @@ export class MirrorIngestService {
 					t.version !== snapshot.targetVersion &&
 					fingerprint(snapshot.index, t.version) === t.fingerprint,
 			);
+			const targetFingerprint = fingerprint(snapshot.index, snapshot.targetVersion) as string;
+			const priorTarget = previous?.targets.find(
+				(t) => t.version === snapshot.targetVersion && t.fingerprint === targetFingerprint,
+			);
 			targets.push({
 				version: snapshot.targetVersion,
-				fingerprint: fingerprint(snapshot.index, snapshot.targetVersion) as string,
+				fingerprint: targetFingerprint,
+				projectionVersion: priorTarget?.projectionVersion === 2 ? 2 : snapshot.schemaVersion,
 			});
 			if (targets.length > 32) throw new Error("Mirror target marker limit");
 			const state: CatalogState = {
@@ -420,12 +480,19 @@ export class MirrorIngestService {
 			};
 		} finally {
 			this.commits.delete(product);
+			if (Date.now() - started >= 1000)
+				logger.info("Slow mirror snapshot verification", {
+					projectionVersion: snapshot.schemaVersion,
+					assets: snapshot.assets.length,
+					bytes: snapshot.assets.reduce((sum, asset) => sum + asset.size, 0),
+					durationMs: Date.now() - started,
+				});
 		}
 	}
 
 	public async readTools(
 		product: string,
-		kind: "helpers" | "executor",
+		kind: "helpers" | "executor" | "remote-peer",
 		tag: string,
 	): Promise<ToolProjection | null> {
 		const repo = this.repository(product);
@@ -447,7 +514,7 @@ export class MirrorIngestService {
 
 	public async commitTools(
 		product: string,
-		kind: "helpers" | "executor",
+		kind: "helpers" | "executor" | "remote-peer",
 		tag: string,
 		input: unknown,
 		signal: AbortSignal,

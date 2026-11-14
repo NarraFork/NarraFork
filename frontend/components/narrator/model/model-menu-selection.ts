@@ -1,11 +1,9 @@
 import type { MenuProps } from "@mantine/core";
 import {
-	AGG_MODEL_PREFIX,
 	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_PARENT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
-	isAutoModelOptionValue,
 	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
@@ -15,23 +13,10 @@ import {
  * Provider prefix of a concrete `provider:model` value, for the small secondary
  * line under the Default/Summary rows. Those rows sit under a role header
  * ("Default" / "Summary") rather than a provider group, so the model name alone
- * does not say who serves it.
- *
- * Returns null for empty values and meta sentinels (aggregations, follow-*),
- * which have no single provider.
+ * does not say who serves it. Lives with the shared model search rules, which
+ * match those rows by the same prefix.
  */
-export function modelProviderPrefix(value: string | null | undefined): string | null {
-	if (!value || value.startsWith(AGG_MODEL_PREFIX) || isAutoModelOptionValue(value)) return null;
-	if (
-		value === FOLLOW_DEFAULT_MODEL ||
-		value === FOLLOW_SUMMARY_MODEL ||
-		value === FOLLOW_PARENT_MODEL
-	) {
-		return null;
-	}
-	const idx = value.indexOf(":");
-	return idx > 0 ? value.slice(0, idx) : null;
-}
+export { modelProviderPrefix } from "../../../lib/model-search";
 
 /**
  * Whether a model-menu entry may be written into the instance-wide default or
@@ -258,20 +243,13 @@ export function autoChoiceReason(
 /**
  * Group the picker's options: auto models by vendor family, everything else by service.
  *
- * A `<prefix>:<model>` that some auto row already lists as a source is left out of its
- * service group, so a model shows once, under its family, with its services one level
- * down. Services keep the models no auto row covers (outside the catalog, or excluded
- * from auto), which can only be chosen by naming the service. The currently selected value
- * is never dropped, so the selection always has a row to center on.
+ * Every service keeps all of its models, including those an auto row also lists as a
+ * source. The two never share one list: the model view shows only auto rows (through
+ * ModelSourceBrowser) and the provider view shows only service groups, so dropping a
+ * covered model from its service would remove it from the provider view altogether, and
+ * a service whose every model is in the catalog would vanish from the picker.
  */
-export function groupModelOptions(
-	options: readonly ModelOption[],
-	currentValue: string,
-): Map<string, ModelOption[]> {
-	const coveredByAuto = new Set<string>();
-	for (const option of options) {
-		for (const source of option.autoSources ?? []) coveredByAuto.add(source.value);
-	}
+export function groupModelOptions(options: readonly ModelOption[]): Map<string, ModelOption[]> {
 	const groups = new Map<string, ModelOption[]>();
 	const push = (key: string, option: ModelOption) => {
 		const list = groups.get(key);
@@ -283,10 +261,7 @@ export function groupModelOptions(
 			push(`${AUTO_FAMILY_GROUP_PREFIX}${option.family ?? ""}`, option);
 			continue;
 		}
-		const provider = option.provider ?? "unknown";
-		const isService = !provider.startsWith("__");
-		if (isService && coveredByAuto.has(option.value) && option.value !== currentValue) continue;
-		push(provider, option);
+		push(option.provider ?? "unknown", option);
 	}
 	return groups;
 }

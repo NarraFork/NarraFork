@@ -3,6 +3,7 @@ import { apiRequests, narrators, users } from "@server/db/schema";
 import { readQuery } from "@server/db/worker-read";
 import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
+import { workerFailureDetails } from "@server/lib/db-worker/failure";
 import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import {
@@ -51,7 +52,7 @@ interface CostCoverage {
 	partialRequestCount: number;
 }
 
-import { and, desc, eq, gte, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, gte, isNull, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
 	/** Historical owner; __unattributed__ selects requests with no recorded owner. */
@@ -70,10 +71,30 @@ export interface UsageHistoryFilters {
 	includeSubagents?: boolean;
 }
 
-// Only requests with an actual cache read participate; ordinary totals stay unfiltered.
+/**
+ * 命中率 = 缓存读取 / 总输入（读取 + 写入 + 未缓存输入）。
+ *
+ * 哪些请求进分母，看 `cache_usage_reported`（provider 的 usage 里有没有缓存计数字段）：
+ *   - true：上报了缓存计数，即使读写都是 0 也是真实未命中（新会话首轮、缓存过期、
+ *     OpenAI 系没有写入计数的未命中），必须进分母；
+ *   - false：provider 没上报缓存计数，读写列里的 0 只是占位，排除；
+ *   - null：旧记录或适配器无法判断。`cached_input_tokens` 等是 NOT NULL DEFAULT 0
+ *     （见 drizzle/0180），区分不了，只能退回"有缓存读或写才算"的启发式。
+ *
+ * 并列展示的读取/写入总量与这里的分子、写入部分一致（被排除的请求读写本就为 0）；
+ * 并列的"输入"总量包含未参与请求的输入，两者不要求相等。
+ */
+const reportsCacheUsage = or(
+	eq(apiRequests.cacheUsageReported, true),
+	and(
+		isNull(apiRequests.cacheUsageReported),
+		or(gt(apiRequests.cachedInputTokens, 0), gt(apiRequests.cacheCreationInputTokens, 0)),
+	),
+);
+
 const cacheHitRateSelection = {
-	cacheHitRateReadTokens: sql<number>`coalesce(sum(case when ${apiRequests.cachedInputTokens} > 0 then ${apiRequests.cachedInputTokens} else 0 end), 0)`,
-	cacheHitRateInputTokens: sql<number>`coalesce(sum(case when ${apiRequests.cachedInputTokens} > 0 then ${apiRequests.cachedInputTokens} + coalesce(${apiRequests.cacheCreationInputTokens}, 0) + coalesce(${apiRequests.inputTokens}, 0) else 0 end), 0)`,
+	cacheHitRateReadTokens: sql<number>`coalesce(sum(case when ${reportsCacheUsage} then coalesce(${apiRequests.cachedInputTokens}, 0) else 0 end), 0)`,
+	cacheHitRateInputTokens: sql<number>`coalesce(sum(case when ${reportsCacheUsage} then coalesce(${apiRequests.cachedInputTokens}, 0) + coalesce(${apiRequests.cacheCreationInputTokens}, 0) + coalesce(${apiRequests.inputTokens}, 0) else 0 end), 0)`,
 };
 
 interface CacheHitRateTotals {
@@ -405,9 +426,17 @@ export class UsageHistoryService {
 		try {
 			return await readQuery(query, { maxRows, signal: execution.signal });
 		} catch (error) {
-			logger.warn("Usage history aggregation worker failed", {
-				error: error instanceof Error ? error.message : String(error),
-			});
+			try {
+				const diagnostic = workerFailureDetails(error, false);
+				logger.warn("Usage history aggregation worker failed", {
+					entry: "usage-history-aggregation",
+					phase: "read",
+					errorType: diagnostic.errorType,
+					code: diagnostic.code,
+				});
+			} catch {
+				// Diagnostics must not replace the public error after the worker releases its task.
+			}
 			throw new AppError(
 				"Usage statistics are temporarily unavailable",
 				503,
@@ -415,7 +444,17 @@ export class UsageHistoryService {
 			);
 		} finally {
 			const durationMs = Date.now() - startedAt;
-			if (durationMs > 1000) logger.warn("Slow usage history aggregation", { durationMs });
+			if (durationMs > 1000) {
+				try {
+					logger.warn("Slow usage history aggregation", {
+						entry: "usage-history-aggregation",
+						phase: "read",
+						durationMs,
+					});
+				} catch {
+					// A slow-log sink cannot change a completed result or a pending rejection.
+				}
+			}
 		}
 	}
 

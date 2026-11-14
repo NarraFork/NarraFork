@@ -97,6 +97,7 @@ mock.module("@mantine/notifications", () => ({
 }));
 mock.module("../../hooks/useGitIdentities", () => ({
 	useGitIdentities: () => ({ data: [], isLoading: false, isError: false }),
+	useFolderGitIdentity: () => ({ data: undefined }),
 	narratorGitIdentityQueryKey: (narratorId: string) => [
 		"auth",
 		"git-identities",

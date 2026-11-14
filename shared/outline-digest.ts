@@ -180,6 +180,11 @@ export interface OutlineDigestSpaceStored {
 	tasksStarted: number;
 	/** Tasks the lease job gave back (a session stopped renewing). */
 	leaseReturned: number;
+	/**
+	 * Tasks a session gave back unfinished when a run of it ended, with a handoff under them
+	 * (outline P2 PR 10c-2). Absent in reports stored before it: none.
+	 */
+	handedBack?: number;
 	/** Plan reviews that left comments (a `plan-review` commit that did not decide the plan). */
 	reviewComments: number;
 	/** This space's items past the caps, per section (absent: none). */
@@ -330,6 +335,7 @@ export interface OutlineDigestSpaceView {
 	tasksCreated: number;
 	tasksStarted: number;
 	leaseReturned: number;
+	handedBack: number;
 	reviewComments: number;
 	/** This space's items past the caps, per section (absent: none). */
 	more: Partial<Record<OutlineDigestSection, number>>;

@@ -502,8 +502,36 @@
 		{
 			"idx": 71,
 			"version": "7",
-			"when": 1794530544957,
-			"tag": "0071_plugin-overlay-preferences",
+			"when": 1794473785466,
+			"tag": "0071_outline_spec_imports",
+			"breakpoints": true
+		},
+		{
+			"idx": 72,
+			"version": "7",
+			"when": 1794532902803,
+			"tag": "0072_api_request_cache_usage_reported",
+			"breakpoints": true
+		},
+		{
+			"idx": 73,
+			"version": "7",
+			"when": 1794560569388,
+			"tag": "0073_outline_spec_loss",
+			"breakpoints": true
+		},
+		{
+			"idx": 74,
+			"version": "7",
+			"when": 1794645737122,
+			"tag": "0074_appearance_preferences",
+			"breakpoints": true
+		},
+		{
+			"idx": 75,
+			"version": "7",
+			"when": 1794677338258,
+			"tag": "0075_plugin_overlay_preferences",
 			"breakpoints": true
 		}
   ]

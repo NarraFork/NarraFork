@@ -463,7 +463,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// `getDbPath` (the PG branch acquires the same instance lock at the same path — the lock
 	// guards local resources, not the database file). Neither opens a SQLite connection.
 	"server/db/index.ts": ["drizzleDialect", "driver", "connectionModule"],
-	"server/db/resource-protection-index.ts": ["driver"],
+	"server/db/resource-protection-index.ts": ["driver", "sqliteCatalog"],
 	"server/services/resource-protection-index.ts": ["driver", "handle"],
 	"server/db/integrity-check.ts": ["connectionModule", "sqliteCli"],
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
@@ -489,6 +489,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// the raw-handle access path for its non-search reads.
 	"server/lib/agent/tools/recall.ts": ["driver", "handle"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
+	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
+	"server/lib/db-worker/failure.ts": ["errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
 	"server/lib/sql-trace.ts": ["driver"],
@@ -620,14 +622,15 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// Retention fences consult the SQLite body projection before accepting late writes.
 	"server/services/narrator-body-writes.ts": ["handle"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
-	"server/lib/narrator-bodies.ts": ["driver", "sqliteCatalog"],
+	"server/lib/narrator-bodies.ts": ["driver", "pragmaFn", "sqliteCatalog"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
 	// storage): exports, the session interchange, and the body length they measure in SQL.
 	"server/lib/narrator-body-length.ts": ["json1"],
 	"server/services/narrator-export.ts": ["handle"],
 	"server/services/session-interchange/export.ts": ["handle"],
 	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
-	"server/services/narrator-refs-backfill.ts": ["blobFn"],
+	// Lazy refs must reject an ambient native transaction before any async page preparation.
+	"server/services/narrator-refs-backfill.ts": ["nativeClient", "blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],
 	"server/services/narrator-subagent-recovery.ts": ["handle"],
@@ -709,7 +712,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
-	"server/services/tool-input-stream-source.ts": ["driver", "pragma", "handle"],
+	"server/services/tool-input-stream-source.ts": ["handle"],
+	// The trusted read-only eval program now belongs to the worker adapter, not the source owner.
+	"server/services/tool-input-stream-source-worker.ts": ["driver", "pragma"],
 	// 用量分桶：SQLite 用 strftime + 按 DST 分段应用的偏移，PostgreSQL 用 date_trunc/AT TIME ZONE。
 	// 两个分支都在 usage-bucket-sql.ts 里，PG 分支有真实库测试。
 	"server/services/usage-bucket-sql.ts": ["timeFn"],

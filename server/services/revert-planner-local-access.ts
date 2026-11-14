@@ -9,7 +9,7 @@ import {
 	type FileChangeRevertAction,
 	type FileChangeState,
 } from "@shared/file-change-protocol";
-import { and, eq } from "drizzle-orm";
+import { and, eq, gte, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narratorMessageRefs,
@@ -36,6 +36,11 @@ import {
 import { assertNarratorAccess, type NarratorAclRow, type NarratorPrincipal } from "./narrator-acl";
 import { boundedStoredBody } from "./narrator-body-reads";
 import { resolveNarratorProjectId } from "./narrator-project";
+import {
+	ensureRefsCoverMessage,
+	prepareLazyChildrenForHistoryRewrite,
+	prepareRevertRefs,
+} from "./narrator-refs-backfill";
 import type { ScopedRevertUnavailableReason } from "./narrator-scoped-revert";
 import {
 	invalidateWorkspaceTreeCache,
@@ -379,15 +384,114 @@ async function services(signal: AbortSignal) {
 	return cached;
 }
 
+async function prepareLocalRevertHistory(
+	request: Pick<RevertPlannerRequest, "narratorId" | "selector" | "kind"> & { signal: AbortSignal },
+) {
+	const { narratorId, selector, signal } = request;
+	const options = { signal, deadlineAt: Date.now() + FILE_CHANGE_LIMITS.planLifetimeMs };
+	await prepareRevertRefs(narratorId, selector, options);
+	if (request.kind === "revert") return;
+	let boundary: number | undefined;
+	if (selector.kind === "after_block") {
+		boundary = db
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, selector.messageId),
+				),
+			)
+			.get()?.seq;
+	}
+	const refs = db
+		.select({ seq: narratorMessageRefs.seq })
+		.from(narratorMessageRefs)
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				selector.kind === "from_seq" ? gte(narratorMessageRefs.seq, selector.minSeq) : undefined,
+				selector.kind === "after_block"
+					? boundary === undefined
+						? inArray(narratorMessageRefs.messageId, [])
+						: gte(narratorMessageRefs.seq, boundary)
+					: undefined,
+				selector.kind === "messages"
+					? inArray(narratorMessageRefs.messageId, selector.messageIds)
+					: undefined,
+				selector.kind === "tool_calls"
+					? inArray(
+							narratorMessageRefs.messageId,
+							db
+								.select({ messageId: narratorToolCalls.messageId })
+								.from(narratorToolCalls)
+								.where(inArray(narratorToolCalls.id, selector.toolCallIds)),
+						)
+					: undefined,
+			),
+		)
+		.orderBy(narratorMessageRefs.seq)
+		.limit(1)
+		.get();
+	if (refs) await prepareLazyChildrenForHistoryRewrite(narratorId, refs.seq, options);
+	signal.throwIfAborted();
+}
+
 async function prepareLocalRevertPlanCore(request: RevertPlannerRequest & { signal: AbortSignal }) {
 	const { planner } = await services(request.signal);
-	return planner.prepare(request);
+	const deadlineAt = Date.now() + FILE_CHANGE_LIMITS.planLifetimeMs;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await planner.prepare(request);
+		} catch (error) {
+			if (
+				!(error instanceof AppError) ||
+				error.code !== "HISTORY_LAZY_DEPENDENCY_CHANGED" ||
+				attempt >= 3
+			)
+				throw error;
+			const dependencies = (
+				error.details as
+					| { lazyDependencies?: Array<{ narratorId: string; minSeq: number }> }
+					| undefined
+			)?.lazyDependencies;
+			if (!Array.isArray(dependencies) || dependencies.length === 0 || dependencies.length > 1000)
+				throw error;
+			// The read-only collector discovered exact delegated sources. Its incomplete
+			// selection was never published; prepare outside transactions, then collect anew.
+			for (const dependency of dependencies) {
+				if (
+					typeof dependency.narratorId !== "string" ||
+					!Number.isSafeInteger(dependency.minSeq) ||
+					dependency.minSeq < 0
+				)
+					throw error;
+				await access.owner(request.principal, dependency.narratorId, request.signal);
+				await prepareLazyChildrenForHistoryRewrite(dependency.narratorId, dependency.minSeq, {
+					signal: request.signal,
+					deadlineAt,
+				});
+			}
+		}
+	}
 }
 
 export async function prepareLocalRevertPlan(request: RevertPlannerRequest) {
 	const signal = request.signal ?? AbortSignal.timeout(FILE_CHANGE_LIMITS.planLifetimeMs);
 	try {
 		await access.owner(request.principal, request.narratorId, signal);
+		const current = db
+			.select({ messageVersion: narrators.messageVersion })
+			.from(narrators)
+			.where(eq(narrators.id, request.narratorId))
+			.get();
+		if (!current || current.messageVersion !== request.expectedMessageVersion)
+			throw new AppError(
+				"Narrator history changed before preview preparation",
+				409,
+				"REVERT_SELECTION_STALE",
+			);
+		await prepareLocalRevertHistory({ ...request, signal });
 		return await prepareLocalRevertPlanCore({ ...request, signal });
 	} catch (error) {
 		if (signal.aborted)
@@ -453,12 +557,6 @@ export async function prepareLocalRevertAction(
 ) {
 	await access.owner(principal, narratorId, signal);
 	try {
-		const narrator = db
-			.select({ messageVersion: narrators.messageVersion })
-			.from(narrators)
-			.where(eq(narrators.id, narratorId))
-			.get();
-		if (!narrator) throw new NotFoundError("Narrator", narratorId);
 		// Subagents are revert roots too: users work in them directly. Their selection
 		// covers only their own history (plus anything they delegated), and admission
 		// reserves only the subagent, never its parent's live turn.
@@ -468,6 +566,8 @@ export async function prepareLocalRevertAction(
 				"This action requires a local filesystem narrator",
 			);
 		await assertLocalRevertPlatform();
+		if (input.messageId !== "__all__")
+			await ensureRefsCoverMessage(narratorId, input.messageId, { signal });
 		let selector: RevertPlannerRequest["selector"];
 		let kind: RevertPlannerRequest["kind"];
 		if (input.action === "revert_files") {
@@ -555,6 +655,13 @@ export async function prepareLocalRevertAction(
 				selector = { kind: "tool_calls", toolCallIds: tools.map((tool) => tool.id) };
 			}
 		}
+		await prepareLocalRevertHistory({ narratorId, selector, kind, signal });
+		const narrator = db
+			.select({ messageVersion: narrators.messageVersion })
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.get();
+		if (!narrator) throw new NotFoundError("Narrator", narratorId);
 		const result = await prepareLocalRevertPlanCore({
 			principal,
 			narratorId,

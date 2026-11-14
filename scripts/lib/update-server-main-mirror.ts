@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	MIRROR_ASSET_HEADERS,
-	type MirrorSnapshotV1,
+	type MirrorSnapshotV2,
 	mirrorAssetLimit,
 	mirrorAssetsForTarget,
 } from "../../shared/independent-update-mirror";
@@ -27,6 +27,7 @@ import {
 	currentPublicRelease,
 	matchPublicAsset,
 	mirrorGhRunner,
+	type PublicMirrorRelease,
 	publicTagCommit,
 	readIndexNotes,
 	readIndexSnapshot,
@@ -43,6 +44,7 @@ import {
 	mirrorUploadDiskBytes,
 	orderMirrorUploads,
 } from "./mirror-upload-pool";
+import type { PublicationReceipt } from "./publication-receipt";
 import { preparePublishedUpdateIndexRelease } from "./update-index-github";
 import {
 	BridgeHttpError,
@@ -57,10 +59,12 @@ export {
 	verifyPreparedMainMirror,
 } from "./update-server-main-mirror-history";
 export const MAIN_MIRROR_TOTAL_TIMEOUT_MS = 25 * 60_000;
-export const MIRROR_TOTAL_BYTES = 4 * 1024 ** 3;
+/** Default and hard bound: 32GiB bidirectional, at most 16GiB of original assets. */
+export const MIRROR_TOTAL_BYTES = 32 * 1024 ** 3;
+export const MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS = 25 * 60_000;
 export interface IndependentMirrorReceipt {
 	schemaVersion: 1;
-	kind: "main" | "helpers" | "executor";
+	kind: "main" | "helpers" | "executor" | "remote-peer";
 	repository: string;
 	tag: string;
 	status:
@@ -78,6 +82,8 @@ export interface IndependentMirrorReceipt {
 	/** Exact committed assets verified by the update server, never runner readback. */
 	verified: string[];
 	snapshotCommitted: boolean;
+	/** Frozen successful publisher identity, when initiated from workflow receipts. */
+	publication?: { commit: string; releaseId: number; source: PublicationReceipt["source"] };
 	failureCode?: "FAILED_CONFIG" | "CANCELLED" | "MIRROR_FAILED" | "SERVER_RECEIPT_REQUIRED";
 }
 export class IndependentMirrorError extends Error {
@@ -124,7 +130,7 @@ export class IndependentMirrorError extends Error {
 	}
 }
 export interface MirrorPublishedOptions {
-	kind: "main" | "helpers" | "executor";
+	kind: "main" | "helpers" | "executor" | "remote-peer";
 	repository: string;
 	tag: string;
 	config?: UpdateServerMirrorConfig;
@@ -142,9 +148,43 @@ export interface MirrorPublishedOptions {
 	totalTimeoutMs?: number;
 	/** Complete tasks: direct defaults to 2 (old servers), WebDAV to 3; hard cap 8. */
 	uploadConcurrency?: number;
+	/** A verified workflow receipt freezes the exact public identity throughout producer execution. */
+	publication?: PublicationReceipt;
+	/** Multiple publications reserve one shared source-download + upload/count budget. */
+	reserveAssets?: (assets: { size: number }[]) => void;
+}
+export function assertMirrorPublicationIdentity(
+	options: MirrorPublishedOptions,
+	remote: PublicMirrorRelease,
+	commit: string,
+): void {
+	const expected = options.publication;
+	if (!expected) return;
+	if (
+		expected.repository.toLowerCase() !== options.repository.toLowerCase() ||
+		expected.kind !== options.kind ||
+		expected.tag !== options.tag ||
+		expected.commit !== commit ||
+		expected.releaseId !== remote.id ||
+		expected.assets.length !== remote.assets.length ||
+		expected.assets.some(
+			(asset) =>
+				!remote.assets.some(
+					(a) =>
+						a.id === asset.id &&
+						a.name === asset.name &&
+						a.size === asset.size &&
+						a.digest === asset.digest,
+				),
+		)
+	)
+		throw new Error("Public identity differs from frozen publication receipt");
 }
 export function mirrorReceipt(
-	options: Pick<MirrorPublishedOptions, "kind" | "repository" | "tag" | "transport">,
+	options: Pick<
+		MirrorPublishedOptions,
+		"kind" | "repository" | "tag" | "transport" | "publication"
+	>,
 ): IndependentMirrorReceipt {
 	return {
 		schemaVersion: 1,
@@ -157,6 +197,15 @@ export function mirrorReceipt(
 		uploaded: [],
 		verified: [],
 		snapshotCommitted: false,
+		...(options.publication
+			? {
+					publication: {
+						commit: options.publication.commit,
+						releaseId: options.publication.releaseId,
+						source: options.publication.source,
+					},
+				}
+			: {}),
 	};
 }
 function digest(bytes: string): string {
@@ -188,6 +237,7 @@ export async function mirrorPublishedMainRelease(
 		const run = mirrorGhRunner(options.run, signal);
 		const remote = await currentPublicRelease(run, options.repository, options.tag);
 		const commit = await publicTagCommit(run, options.repository, options.tag);
+		assertMirrorPublicationIdentity(options, remote, commit);
 		const verified = await preparePublishedUpdateIndexRelease({
 			repository: options.repository,
 			version,
@@ -209,13 +259,21 @@ export async function mirrorPublishedMainRelease(
 				target.files.some((f) => !options.platforms?.includes(f.platform)))
 		)
 			throw new Error("Canonical snapshot requires the complete target platform projection");
-		for (const file of target.files) matchPublicAsset(remote, file); // full binaries are descriptors, never fetched
-		const assets = mirrorAssetsForTarget(snapshot.index, version);
+		for (const file of target.files) matchPublicAsset(remote, file);
+		const assets = mirrorAssetsForTarget(snapshot.index, version, 2);
 		// Reserve source download + transport upload; assets are never downloaded back.
 		const total = 2 * assets.reduce((sum, a) => sum + a.size, 0);
 		const budget = options.maxTotalBytes ?? MIRROR_TOTAL_BYTES;
-		if (!Number.isSafeInteger(budget) || budget <= 0 || total > budget)
+		if (
+			!Number.isSafeInteger(budget) ||
+			budget <= 0 ||
+			budget > MIRROR_TOTAL_BYTES ||
+			total > budget ||
+			assets.length > 200 ||
+			assets.some((asset) => asset.size > mirrorAssetLimit(asset.kind))
+		)
 			throw new Error("Independent mirror total byte budget exceeded");
+		options.reserveAssets?.(assets);
 		for (const asset of assets) if (asset.kind !== "notes") matchPublicAsset(remote, asset);
 		for (const asset of remote.assets) {
 			if (
@@ -245,7 +303,10 @@ export async function mirrorPublishedMainRelease(
 		}
 		const http = stage
 			? undefined
-			: (options.http ?? new UpdateServerMirrorHttp(options.config as UpdateServerMirrorConfig));
+			: (options.http ??
+				new UpdateServerMirrorHttp(options.config as UpdateServerMirrorConfig, {
+					requestTimeoutMs: MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS,
+				}));
 		const root = "/api/v3/products/narrafork/mirror";
 		directory = await mkdtemp(join(tmpdir(), "nf-public-mirror-"));
 		const disk = await statfs(directory);
@@ -254,7 +315,7 @@ export async function mirrorPublishedMainRelease(
 		if (
 			disk.bavail * disk.bsize <
 			mirrorUploadDiskBytes(
-				groups.map((g) => g.asset).filter((a) => a.kind === "patch"),
+				groups.map((g) => g.asset).filter((a) => a.kind === "patch" || a.kind === "main-binary"),
 				pool.concurrency,
 			)
 		)
@@ -264,11 +325,11 @@ export async function mirrorPublishedMainRelease(
 			let stream: ReadableStream<Uint8Array> | undefined;
 			let path: string | undefined;
 			try {
-				if (asset.kind === "patch") {
+				if (asset.kind === "patch" || asset.kind === "main-binary") {
 					const github = matchPublicAsset(remote, asset);
 					path = join(directory as string, `${index}-${asset.sha256}`);
 					await timeReleasePhase(
-						"mirror.github-patch",
+						asset.kind === "patch" ? "mirror.github-patch" : "mirror.github-binary",
 						{ inputBytes: asset.size },
 						() =>
 							(options.downloadAsset ?? downloadReleaseAsset)({
@@ -282,7 +343,7 @@ export async function mirrorPublishedMainRelease(
 					);
 					const actual = await hashReleaseFile(path, mirrorAssetLimit(asset.kind), signal);
 					if (actual.size !== asset.size || actual.sha256 !== asset.sha256)
-						throw new Error("Public patch raw bytes mismatch");
+						throw new Error("Public payload raw bytes mismatch");
 					stream = Bun.file(path).stream();
 				} else {
 					const raw =
@@ -330,6 +391,7 @@ export async function mirrorPublishedMainRelease(
 						(http as UpdateServerMirrorHttp).putRaw(`${root}/assets/${asset.sha256}`, body, {
 							maxBytes: mirrorAssetLimit(asset.kind),
 							expected: asset,
+							timeoutMs: 15 * 60_000,
 							headers,
 							signal,
 						}),
@@ -390,8 +452,8 @@ export async function mirrorPublishedMainRelease(
 			if (!freshTarget || JSON.stringify(freshTarget) !== JSON.stringify(target))
 				throw new Error("Canonical target changed or left the index window before snapshot commit");
 			snapshot = fresh;
-			const projection: MirrorSnapshotV1 = {
-				schemaVersion: 1,
+			const projection: MirrorSnapshotV2 = {
+				schemaVersion: 2,
 				repository: options.repository,
 				...snapshot,
 				targetVersion: version,
@@ -407,7 +469,7 @@ export async function mirrorPublishedMainRelease(
 				const acknowledgement = await (http as UpdateServerMirrorHttp).postJson(
 					`${root}/snapshot`,
 					projection,
-					{ maxBytes: 320 * 1024, signal },
+					{ maxBytes: 320 * 1024, signal, timeoutMs: MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS },
 				);
 				assertServerVerified(
 					acknowledgement,
@@ -428,7 +490,9 @@ export async function mirrorPublishedMainRelease(
 			}
 		}
 		receipt.snapshotCommitted = true;
-		receipt.status = assets.some((a) => a.kind === "patch") ? "MIRRORED" : "METADATA_ONLY";
+		receipt.status = assets.some((a) => a.kind === "patch" || a.kind === "main-binary")
+			? "MIRRORED"
+			: "METADATA_ONLY";
 		return receipt;
 	} catch (error) {
 		receipt.failureCode = parentSignal.aborted

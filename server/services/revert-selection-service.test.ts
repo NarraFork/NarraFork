@@ -1,13 +1,20 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
-import { REVERT_SELECTION_LIMITS, RevertSelectionService } from "./revert-selection-service";
+import {
+	closeRevertBodyWorkers,
+	REVERT_SELECTION_LIMITS,
+	REVERT_SELECTION_PAGE_ITEMS,
+	RevertSelectionService,
+	resetRevertBodyWorkersForTests,
+} from "./revert-selection-service";
 
 // Independent in-memory schema; importing the service never imports application DB/runtime.
 const DDL = `
@@ -15,10 +22,11 @@ CREATE TABLE narrators (
  id TEXT PRIMARY KEY, owner_user_id TEXT, visibility TEXT NOT NULL DEFAULT 'private',
  write_audience TEXT NOT NULL DEFAULT 'owner', type TEXT NOT NULL DEFAULT 'primary',
  acl_root_narrator_id TEXT, context_project_id TEXT, message_version INTEGER NOT NULL DEFAULT 7,
- refs_inherited_from TEXT, status TEXT NOT NULL DEFAULT 'idle', parent_narrator_id TEXT, origin_tool_call_id TEXT,
+ refs_inherited_from TEXT, refs_backfill_cursor INTEGER, status TEXT NOT NULL DEFAULT 'idle', parent_narrator_id TEXT, origin_tool_call_id TEXT,
  fork_message_id TEXT
 );
 CREATE INDEX idx_narrators_parent ON narrators(parent_narrator_id);
+CREATE INDEX idx_narrators_refs_inherited_from ON narrators(refs_inherited_from) WHERE refs_inherited_from IS NOT NULL;
 CREATE INDEX idx_narrators_fork_message ON narrators(fork_message_id);
 CREATE TABLE narrator_messages (
  id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_tool_use_id TEXT, role TEXT NOT NULL DEFAULT 'assistant', content_json TEXT NOT NULL,
@@ -100,7 +108,8 @@ let queries: string[];
 let beforeQuery: ((query: string) => void) | undefined;
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 
-beforeEach(() => {
+beforeEach(async () => {
+	await resetRevertBodyWorkersForTests();
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
 	sqlite = new Database(":memory:");
@@ -126,7 +135,10 @@ beforeEach(() => {
 	});
 	service = new RevertSelectionService({ $client: traced }, { authorize, onSlow: () => {} });
 });
-afterEach(() => sqlite.close());
+afterEach(async () => {
+	await closeRevertBodyWorkers();
+	sqlite.close();
+});
 async function authorize(
 	owner: NarratorPrincipal,
 	row: NarratorAclRow,
@@ -343,6 +355,119 @@ describe("authorized stable source selection", () => {
 		sqlite.query("UPDATE narrators SET refs_inherited_from='other' WHERE id='root'").run();
 		await rejected(collect(), "INHERITED_REFS_UNMATERIALIZED");
 	});
+	test("lazy selectors require only their actual materialized range", async () => {
+		const point = tool(80, "Read");
+		const boundary = message(100, [
+			{ type: "text", text: "keep" },
+			{ type: "text", text: "remove" },
+		]);
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='other',refs_backfill_cursor=100 WHERE id='root'",
+			)
+			.run();
+		await rejected(collect(), "INHERITED_REFS_UNMATERIALIZED");
+		await rejected(collect({ kind: "from_seq", minSeq: 99 }), "INHERITED_REFS_UNMATERIALIZED");
+		expect(
+			(await collect({ kind: "from_seq", minSeq: 100 })).history.messages.map((m) => m.id),
+		).toEqual([boundary]);
+		expect(
+			(await collect({ kind: "messages", messageIds: [point.messageId] })).history.messages,
+		).toHaveLength(1);
+		expect(
+			(await collect({ kind: "tool_calls", toolCallIds: [point.id] })).tools.map((t) => t.id),
+		).toEqual([point.id]);
+		expect(
+			(await collect({ kind: "after_block", messageId: boundary, keepThroughBlockIndex: 0 }))
+				.boundary?.messageId,
+		).toBe(boundary);
+		await rejected(
+			collect({ kind: "after_block", messageId: point.messageId, keepThroughBlockIndex: -1 }),
+			"INHERITED_REFS_UNMATERIALIZED",
+		);
+		await rejected(collect({ kind: "messages", messageIds: ["missing"] }), "NOT_FOUND");
+	});
+	test.each([
+		null,
+		-1,
+		1.5,
+	])("invalid lazy cursor %s rejects even point selection", async (cursor) => {
+		const id = message(100);
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='other',refs_backfill_cursor=? WHERE id='root'",
+			)
+			.run(cursor);
+		await rejected(
+			collect({ kind: "messages", messageIds: [id] }),
+			"INHERITED_REFS_UNMATERIALIZED",
+		);
+	});
+	test("a new unpreserved lazy child rejects without materializing or changing the selection", async () => {
+		const id = message(10);
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='root',refs_backfill_cursor=11 WHERE id='other'",
+			)
+			.run();
+		const error = await collect({ kind: "messages", messageIds: [id] }).catch((error) => error);
+		expect(error).toMatchObject({ code: "HISTORY_LAZY_DEPENDENCY_CHANGED", statusCode: 409 });
+		expect(
+			(await collect({ kind: "messages", messageIds: [id] }, { historyRewrite: false }))
+				.evidenceComplete,
+		).toBe(true);
+		expect(
+			sqlite.query("SELECT refs_backfill_cursor AS cursor FROM narrators WHERE id='other'").get(),
+		).toEqual({ cursor: 11 });
+	});
+	test("lazy children below the affected range do not veto a stable point", async () => {
+		const id = message(10);
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='root',refs_backfill_cursor=10 WHERE id='other'",
+			)
+			.run();
+		expect((await collect({ kind: "messages", messageIds: [id] })).selectionComplete).toBe(true);
+	});
+	test("working runtime state is nonblocking and excluded from the selected digest", async () => {
+		const id = message(10);
+		const selected = await collect({ kind: "messages", messageIds: [id] });
+		sqlite.query("UPDATE narrators SET status='working',message_version=8 WHERE id='root'").run();
+		const current = await collect(
+			{ kind: "messages", messageIds: [id] },
+			{ expectedMessageVersion: undefined },
+		);
+		expect(current.evidenceComplete).toBe(true);
+		expect(current.issues).toEqual([]);
+		expect(current.metadataDigest).toBe(selected.metadataDigest);
+		expect(current.messageVersions).toEqual([{ narratorId: "root", messageVersion: 8 }]);
+	});
+	test("lazy cache loading and unrelated same-narrator version changes preserve a point selection", async () => {
+		const id = message(100);
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='other',refs_backfill_cursor=100 WHERE id='root'",
+			)
+			.run();
+		const expected = await collect({ kind: "messages", messageIds: [id] });
+		let calls = 0;
+		service = new RevertSelectionService(
+			{ $client: sqlite },
+			{
+				authorize: async (...args) => {
+					await authorize(...args);
+					if (++calls === 2)
+						sqlite
+							.query(
+								"UPDATE narrators SET status='working',refs_backfill_cursor=50,message_version=message_version+1 WHERE id='root'",
+							)
+							.run();
+				},
+			},
+		);
+		const current = await collect({ kind: "messages", messageIds: [id] });
+		expect(current.metadataDigest).toBe(expected.metadataDigest);
+	});
 	test("message version mismatch rejects before collection", async () => {
 		message(1);
 		await rejected(collect({ kind: "all" }, { expectedMessageVersion: 6 }), "STALE");
@@ -374,18 +499,440 @@ describe("authorized stable source selection", () => {
 		const clone = tool(2, "Write", { providerId: original.providerId });
 		sqlite
 			.query(
-				"UPDATE narrator_tool_calls SET execution_origin_tool_call_id=?,file_change_operation_id=? WHERE id=?",
+				`UPDATE narrator_tool_calls SET execution_origin_tool_call_id=?,file_change_operation_id=?,
+				 resolved_file_path=(SELECT resolved_file_path FROM narrator_tool_calls WHERE id=?),
+				 canonical_file_path=(SELECT canonical_file_path FROM narrator_tool_calls WHERE id=?) WHERE id=?`,
 			)
-			.run(original.id, op, clone.id);
+			.run(original.id, op, original.id, original.id, clone.id);
 		const result = await collect();
 		expect(result.tools).toHaveLength(2);
 		expect(result.operations).toHaveLength(1);
 		expect(result.effects).toHaveLength(1);
 		expect(result.evidenceComplete).toBe(true);
 	});
+
+	function historyClone(original: ReturnType<typeof tool>, operationId: string) {
+		// Real forks inherit the source's audiences; this fixture's unrelated owner does not.
+		sqlite.query("UPDATE narrators SET owner_user_id='alice' WHERE id='other'").run();
+		const clone = tool(1, "Write", { narratorId: "other", providerId: original.providerId });
+		sqlite
+			.query(
+				`UPDATE narrator_tool_calls SET execution_origin_tool_call_id=?,file_change_operation_id=?,
+				 resolved_file_path=(SELECT resolved_file_path FROM narrator_tool_calls WHERE id=?),
+				 canonical_file_path=(SELECT canonical_file_path FROM narrator_tool_calls WHERE id=?) WHERE id=?`,
+			)
+			.run(original.id, operationId, original.id, original.id, clone.id);
+		return clone;
+	}
+
+	for (const removeOrigin of [false, true])
+		test(`a cross-narrator history copy keeps its original execution receipt (source deleted=${removeOrigin})`, async () => {
+			const original = tool(1);
+			const operationId = journal(original);
+			const clone = historyClone(original, operationId);
+			if (removeOrigin) sqlite.query("DELETE FROM narrator_tool_calls WHERE id=?").run(original.id);
+			const result = await collect(
+				{ kind: "tool_calls", toolCallIds: [clone.id] },
+				{ narratorId: "other" },
+			);
+			expect(result.evidenceComplete).toBe(true);
+			expect(result.issues).toEqual([]);
+			expect(result.effects).toHaveLength(1);
+			expect(result.operations[0].narratorId).toBe("root");
+			expect(result.tools[0].narratorId).toBe("other");
+		});
+
+	for (const forged of ["origin", "attempt", "operation", "owner", "path", "wire"] as const)
+		test(`a history copy cannot substitute its frozen execution ${forged}`, async () => {
+			const original = tool(1);
+			const operationId = journal(original);
+			const clone = historyClone(original, operationId);
+			if (forged === "origin")
+				sqlite
+					.query("UPDATE narrator_tool_calls SET execution_origin_tool_call_id='forged' WHERE id=?")
+					.run(clone.id);
+			if (forged === "attempt")
+				sqlite.query("UPDATE narrator_tool_calls SET execution_attempt=2 WHERE id=?").run(clone.id);
+			if (forged === "operation") {
+				const unrelated = tool(2);
+				const unrelatedOperation = journal(unrelated);
+				sqlite
+					.query("UPDATE narrator_tool_calls SET file_change_operation_id=? WHERE id=?")
+					.run(unrelatedOperation, clone.id);
+			}
+			if (forged === "owner")
+				sqlite
+					.query("UPDATE file_change_operations SET narrator_id='other' WHERE id=?")
+					.run(operationId);
+			if (forged === "path")
+				sqlite
+					.query("UPDATE narrator_tool_calls SET canonical_file_path='/repo/forged' WHERE id=?")
+					.run(clone.id);
+			if (forged === "wire")
+				sqlite
+					.query("UPDATE narrator_tool_calls SET tool_use_id='forged' WHERE id=?")
+					.run(original.id);
+			const result = await collect(
+				{ kind: "tool_calls", toolCallIds: [clone.id] },
+				{ narratorId: "other" },
+			);
+			expect(hasIssue(result, "ATTEMPT_BINDING_MISMATCH")).toBe(true);
+			expect(result.evidenceComplete).toBe(false);
+		});
+
+	for (const selected of ["retained-origin", "separate-copy"] as const)
+		test(`source deletion preserves the receipt of a ${selected} with its original PK`, async () => {
+			const original = tool(1);
+			const operationId = journal(original);
+			const clone = historyClone(original, operationId);
+			const holder = selected === "retained-origin" ? "other" : "stable-sibling";
+			if (holder !== "other") narrator(holder);
+			// Match narratorService.remove: surviving shared history keeps the source
+			// PK, becomes a non-executable self-origin, and loses its source narrator FK.
+			sqlite
+				.query("UPDATE narrator_message_refs SET narrator_id=? WHERE narrator_id='root'")
+				.run(holder);
+			sqlite
+				.query("UPDATE narrator_messages SET narrator_id=? WHERE id=?")
+				.run(holder, original.messageId);
+			sqlite
+				.query(
+					"UPDATE narrator_tool_calls SET narrator_id=?,execution_origin_tool_call_id=id WHERE id=?",
+				)
+				.run(holder, original.id);
+			sqlite
+				.query("UPDATE file_change_operations SET narrator_id=NULL WHERE id=?")
+				.run(operationId);
+			sqlite.query("DELETE FROM narrators WHERE id='root'").run();
+			const result = await collect(
+				{
+					kind: "tool_calls",
+					toolCallIds: [selected === "retained-origin" ? original.id : clone.id],
+				},
+				{ narratorId: "other" },
+			);
+			expect(result.evidenceComplete).toBe(true);
+			expect(result.issues).toEqual([]);
+			expect(result.effects).toHaveLength(1);
+			expect(result.operations[0].sourceId).toBe(original.id);
+			expect(result.operations[0].narratorId).toBeNull();
+		});
+
+	test("a retained source marker cannot mask a mismatched live journal owner", async () => {
+		const original = tool(1);
+		const operationId = journal(original);
+		const clone = historyClone(original, operationId);
+		sqlite
+			.query("UPDATE narrator_tool_calls SET execution_origin_tool_call_id=id WHERE id=?")
+			.run(original.id);
+		const result = await collect(
+			{ kind: "tool_calls", toolCallIds: [clone.id] },
+			{ narratorId: "other" },
+		);
+		expect(hasIssue(result, "ATTEMPT_BINDING_MISMATCH")).toBe(true);
+	});
+
+	test("an unfinished copied file tool is still incomplete evidence, not zero IO", async () => {
+		const original = tool(1);
+		const operationId = journal(original);
+		const clone = historyClone(original, operationId);
+		sqlite.query("UPDATE narrator_tool_calls SET status='running' WHERE id=?").run(clone.id);
+		const result = await collect(
+			{ kind: "tool_calls", toolCallIds: [clone.id] },
+			{ narratorId: "other" },
+		);
+		expect(hasIssue(result, "FILE_TOOL_PENDING")).toBe(true);
+		expect(result.evidenceComplete).toBe(false);
+		expect(result.noDiskTools).toEqual([]);
+	});
+});
+
+describe("pooled body worker lifecycle", () => {
+	test("separate collections reuse one native thread with distinct RPC IDs and duplicate ready is inert", async () => {
+		message(1);
+		const threads = new Set<Worker>();
+		const ids = new Set<string>();
+		let calls = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (typeof args[0]?.digestOnly === "boolean") {
+				threads.add(this);
+				ids.add(args[0].requestId);
+				calls++;
+				this.emit("message", { ready: true });
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			const first = await collect();
+			const second = await collect();
+			expect(second.metadataDigest).toBe(first.metadataDigest);
+			expect(threads.size).toBe(1);
+			expect(ids.size).toBe(calls);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test("concurrent collectors share a bounded two-thread pool rather than starting per collector", async () => {
+		message(1);
+		const threads = new Set<Worker>();
+		let live = 0;
+		let peak = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (args[0]?.action === "ping" && !threads.has(this)) {
+				threads.add(this);
+				peak = Math.max(peak, ++live);
+				this.once("exit", () => live--);
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			const results = await Promise.all(
+				Array.from({ length: 6 }, () =>
+					new RevertSelectionService({ $client: sqlite }, { authorize }).collect({
+						principal,
+						narratorId: "root",
+						expectedMessageVersion: 7,
+						selector: { kind: "all" },
+					}),
+				),
+			);
+			expect(new Set(results.map((r) => r.metadataDigest)).size).toBe(1);
+			expect(threads.size).toBe(2);
+			expect(peak).toBe(2);
+			await closeRevertBodyWorkers();
+			expect(live).toBe(0);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test.each([
+		"startup-error",
+		"startup-timeout",
+		"cancel",
+		"timeout",
+		"error",
+		"messageerror",
+	] as const)("%s fails without fallback/replay and awaits actual native exit", async (mode) => {
+		message(1);
+		const controller = new AbortController();
+		const threads = new Set<Worker>();
+		const exited = new Set<Worker>();
+		let business = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (!threads.has(this)) {
+				threads.add(this);
+				this.once("exit", () => exited.add(this));
+			}
+			if (args[0]?.action === "ping") {
+				if (mode === "startup-error") throw Error("injected startup failure");
+				if (mode === "startup-timeout") return;
+				return Reflect.apply(original, this, args);
+			}
+			business++;
+			if (mode === "cancel") controller.abort(Error("injected cancellation"));
+			if (mode === "error" || mode === "messageerror")
+				this.emit(mode, Error("injected runtime failure"));
+			// Deliberately do not send the body: timeout/cancel/fault must not compute inline.
+		});
+		try {
+			const service = new RevertSelectionService(
+				{ $client: sqlite },
+				{ authorize, timeoutMs: 180 },
+			);
+			const error = await service
+				.collect({
+					principal,
+					narratorId: "root",
+					expectedMessageVersion: 7,
+					selector: { kind: "all" },
+					signal: controller.signal,
+				})
+				.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+			expect(error).toBeDefined();
+			expect(threads.size).toBe(1);
+			expect(exited.size).toBe(1);
+			expect(business).toBe(mode.startsWith("startup") ? 0 : 1);
+		} finally {
+			post.mockRestore();
+		}
+		// A bad slot is replaced, never silently replayed; a later independent request works.
+		expect((await collect()).history.messages).toHaveLength(1);
+	});
+	test("healthy domain validation errors keep the thread reusable", async () => {
+		const id = message(1);
+		const originalBody = sqlite
+			.query<{ body: string }, [string]>(
+				"SELECT content_json AS body FROM narrator_messages WHERE id=?",
+			)
+			.get(id)?.body as string;
+		const threads = new Set<Worker>();
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (typeof args[0]?.digestOnly === "boolean") threads.add(this);
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			sqlite.query("UPDATE narrator_messages SET content_json='{' WHERE id=?").run(id);
+			await rejected(collect(), "BODY_UNVERIFIED");
+			sqlite.query("UPDATE narrator_messages SET content_json=? WHERE id=?").run(originalBody, id);
+			expect((await collect()).history.messages).toHaveLength(1);
+			expect(threads.size).toBe(1);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test("final close cancels active work, awaits exit and refuses new dispatch", async () => {
+		message(1);
+		let exited = false;
+		let dispatched = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (typeof args[0]?.digestOnly === "boolean") {
+				dispatched++;
+				this.once("exit", () => {
+					exited = true;
+				});
+				void closeRevertBodyWorkers();
+				return;
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			await rejected(collect(), "BODY_UNVERIFIED");
+			await closeRevertBodyWorkers();
+			expect(exited).toBe(true);
+			await rejected(collect(), "BODY_UNVERIFIED");
+			expect(dispatched).toBe(1);
+		} finally {
+			post.mockRestore();
+		}
+	});
 });
 
 describe("stable block boundary and COW history manifest", () => {
+	test("real body worker ignores stale success/error IDs across parse and digest-only of one message", async () => {
+		const id = message(1, [
+			{ type: "text", text: "keep" },
+			{ type: "text", text: "remove" },
+		]);
+		const selector = { kind: "after_block", messageId: id, keepThroughBlockIndex: 0 } as const;
+		const expected = await collect(selector);
+		const requests: { worker: Worker; requestId: string; id: string; digestOnly: boolean }[] = [];
+		let injectedErrors = 0;
+		let injectedResults = 0;
+		const realPost = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			const [request] = args;
+			if (typeof request?.id === "string" && typeof request.digestOnly === "boolean") {
+				const wrongId = requests.at(-1)?.requestId ?? `wrong-${request.requestId}`;
+				requests.push({
+					worker: this,
+					requestId: request.requestId,
+					id: request.id,
+					digestOnly: request.digestOnly,
+				});
+				// Emit before forwarding to the actual worker, including the previous parse's ID.
+				this.emit("message", { requestId: wrongId, error: "stale body error" });
+				injectedErrors++;
+				this.emit("message", {
+					requestId: wrongId,
+					result: { digest: "0".repeat(64), blocks: [] },
+				});
+				injectedResults++;
+			}
+			return Reflect.apply(realPost, this, args);
+		});
+		try {
+			const result = await collect(selector);
+			expect(result.metadataDigest).toBe(expected.metadataDigest);
+			expect(result.history.messages).toEqual(expected.history.messages);
+			expect(result.history.blocks).toEqual(expected.history.blocks);
+			expect(injectedErrors).toBeGreaterThan(0);
+			expect(injectedResults).toBeGreaterThan(0);
+			expect(new Set(requests.map((request) => request.worker)).size).toBe(1);
+			expect(requests.map((request) => request.digestOnly)).toContain(false);
+			expect(requests.map((request) => request.digestOnly)).toContain(true);
+			expect(new Set(requests.map((request) => request.requestId)).size).toBe(requests.length);
+			for (const request of requests) {
+				expect(typeof request.requestId).toBe("string");
+				expect(request.requestId).not.toBe(id);
+				expect(request.id).toBe(id);
+			}
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test.each([
+		{ name: "null envelope", reply: (_id: string) => null },
+		{ name: "array envelope", reply: (_id: string) => [] },
+		{ name: "missing ID", reply: (_id: string) => ({ result: {} }) },
+		{ name: "invalid ID", reply: (_id: string) => ({ requestId: 1 }) },
+		{ name: "missing result", reply: (requestId: string) => ({ requestId }) },
+		{ name: "null result", reply: (requestId: string) => ({ requestId, result: null }) },
+		{
+			name: "invalid result shape",
+			reply: (requestId: string) => ({ requestId, result: { digest: 1, blocks: [] } }),
+		},
+		{ name: "invalid error", reply: (requestId: string) => ({ requestId, error: 1 }) },
+		{
+			name: "ambiguous result/error",
+			reply: (requestId: string) => ({
+				requestId,
+				error: "ambiguous",
+				result: { digest: "0".repeat(64), blocks: [] },
+			}),
+		},
+	])("malformed real body worker reply fails explicitly: $name", async ({ reply }) => {
+		message(1);
+		let injected = 0;
+		let exited = false;
+		const realPost = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			const [request] = args;
+			if (typeof request?.id === "string" && typeof request.digestOnly === "boolean") {
+				this.once("exit", () => {
+					exited = true;
+				});
+				this.emit("message", reply(request.requestId));
+				injected++;
+			}
+			return Reflect.apply(realPost, this, args);
+		});
+		try {
+			await rejected(collect(), "BODY_UNVERIFIED");
+			expect(injected).toBeGreaterThan(0);
+			expect(exited).toBe(true);
+		} finally {
+			post.mockRestore();
+		}
+	});
 	test("after_block fixes retained boundary and all later message/ref changes in one capture", async () => {
 		const early = message(0);
 		const boundary = message(1, [
@@ -905,7 +1452,7 @@ describe("derived history requires actual origins and fresh authorization", () =
 		expect(result.noDiskTools.filter((row) => row.reason === "delegated")).toHaveLength(3);
 		expect(
 			queries.filter((query) => query.includes("SELECT id, origin_tool_call_id AS origin")),
-		).toHaveLength(6); // One collection scan plus one bounded commitment verification.
+		).toHaveLength(9); // Three pages: collection, yielding verification, then final no-await verification.
 		expect(authorized).not.toContain("sibling-72");
 	});
 
@@ -1152,7 +1699,114 @@ describe("bounded metadata collection and drift", () => {
 		await rejected(collect(), "STALE");
 	});
 
-	test("final authorization rechecks the target version after its async callback", async () => {
+	test.each([
+		"body",
+		"same-length body",
+		"ref",
+		"tool",
+		"suffix",
+	])("the final ACL callback cannot hide selected %s drift behind a new global version", async (kind) => {
+		const selected = tool(1, "Read");
+		const oldBody =
+			sqlite
+				.query<{ body: string }, [string]>(
+					"SELECT content_json AS body FROM narrator_messages WHERE id=?",
+				)
+				.get(selected.messageId)?.body ?? "";
+		let calls = 0;
+		service = new RevertSelectionService(
+			{ $client: sqlite },
+			{
+				authorize: async (...args) => {
+					await authorize(...args);
+					if (++calls !== 3) return;
+					if (kind === "body")
+						sqlite
+							.query("UPDATE narrator_messages SET content_json='[]' WHERE id=?")
+							.run(selected.messageId);
+					if (kind === "same-length body")
+						sqlite
+							.query("UPDATE narrator_messages SET content_json=? WHERE id=?")
+							.run(oldBody.replace("Read", "Glob"), selected.messageId);
+					if (kind === "ref")
+						sqlite
+							.query("UPDATE narrator_message_refs SET seq=9 WHERE message_id=?")
+							.run(selected.messageId);
+					if (kind === "tool")
+						sqlite
+							.query("UPDATE narrator_tool_calls SET execution_attempt=2 WHERE id=?")
+							.run(selected.id);
+					if (kind === "suffix") message(9);
+					sqlite
+						.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'")
+						.run();
+				},
+			},
+		);
+		await rejected(collect(), "STALE");
+		expect(calls).toBe(3);
+	});
+	test.each([
+		"association",
+		"tool",
+	])("final empty-source batches reject a late selected %s insertion", async (kind) => {
+		const selected = message(1);
+		const boundary = service as unknown as { verifySourcesSync(state: unknown): void };
+		const original = boundary.verifySourcesSync;
+		const verify = spyOn(boundary, "verifySourcesSync").mockImplementation(function (
+			this: unknown,
+			state,
+		) {
+			if (kind === "association")
+				sqlite.query("INSERT INTO api_requests VALUES('late-association',?)").run(selected);
+			else tool(1, "Read", { messageId: selected });
+			return Reflect.apply(original, this, [state]);
+		});
+		try {
+			await rejected(collect(), "STALE");
+		} finally {
+			verify.mockRestore();
+		}
+	});
+	test("final empty-source batches keep fixed source, SQL-byte and binding budgets", async () => {
+		for (let i = 0; i < 70; i++) message(i);
+		expect((await collect()).evidenceComplete).toBe(true);
+		const batches = queries.filter((query) => query.startsWith("SELECT CASE WHEN NOT EXISTS("));
+		expect(batches.length).toBeGreaterThan(1);
+		for (const query of batches) {
+			expect(query.match(/NOT EXISTS\(/g)?.length ?? 0).toBeLessThanOrEqual(
+				REVERT_SELECTION_PAGE_ITEMS,
+			);
+			expect(Buffer.byteLength(query)).toBeLessThanOrEqual(FILE_CHANGE_LIMITS.metadataBytes);
+			expect(query.match(/\?/g)?.length ?? 0).toBeLessThanOrEqual(4000);
+		}
+	});
+	test("continuous unrelated version updates never require a session-wide stable verification round", async () => {
+		const selected = message(1);
+		const unrelated = message(9, [{ type: "text", text: "a" }]);
+		const expected = await collect({ kind: "messages", messageIds: [selected] });
+		let writes = 0;
+		beforeQuery = (query) => {
+			if (!query.includes("SELECT") || !query.includes("FROM")) return;
+			writes++;
+			sqlite
+				.query(
+					"UPDATE narrators SET message_version=message_version+1,status='working' WHERE id='root'",
+				)
+				.run();
+			sqlite
+				.query("UPDATE narrator_messages SET content_json=? WHERE id=?")
+				.run(JSON.stringify([{ type: "text", text: String(writes) }]), unrelated);
+		};
+		const current = await collect(
+			{ kind: "messages", messageIds: [selected] },
+			{ expectedMessageVersion: undefined },
+		);
+		expect(writes).toBeGreaterThan(20);
+		expect(current.metadataDigest).toBe(expected.metadataDigest);
+		expect(current.evidenceComplete).toBe(true);
+	});
+	test("final authorization rechecks real ACL context after its async callback", async () => {
 		message(1);
 		let authorizations = 0;
 		service = new RevertSelectionService(
@@ -1161,9 +1815,7 @@ describe("bounded metadata collection and drift", () => {
 				authorize: async (...args) => {
 					await authorize(...args);
 					if (++authorizations === 3)
-						sqlite
-							.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'")
-							.run();
+						sqlite.query("UPDATE narrators SET write_audience='project' WHERE id='root'").run();
 				},
 				onSlow: () => {},
 			},
@@ -1202,11 +1854,11 @@ describe("bounded metadata collection and drift", () => {
 				++pages === 2
 			)
 				sqlite
-					.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'")
+					.query("UPDATE narrator_message_refs SET seq=seq+1 WHERE narrator_id='root' AND seq=0")
 					.run();
 		};
 		await rejected(collect(), "STALE");
-		expect(pages).toBe(3);
+		expect(pages).toBeGreaterThanOrEqual(2);
 	});
 
 	test("a hung ACL callback is cancelled without holding a database transaction", async () => {

@@ -12,6 +12,12 @@ import { EXECUTOR_MANIFEST_FILENAME } from "../../shared/remote-executor";
 const originalPlan = await import("../../scripts/lib/ci-release-plan");
 const originalGithub = await import("../../scripts/lib/github-release");
 const originalHelpers = await import("../../scripts/lib/helper-release");
+const originalRestore = { ...(await import("../../scripts/lib/ci-release-restore")) };
+const unexpectedArchiveDownload = mock(
+	async (..._args: Parameters<typeof originalRestore.downloadArchive>) => {
+		throw new Error("Unexpected archive download in controller fixture");
+	},
+);
 const commit = "a".repeat(40);
 const digest = createHash("sha256").update("fixture").digest("hex");
 const file = { name: "fixture.metadata.json", size: 7, sha256: digest };
@@ -114,6 +120,9 @@ mock.module("../../scripts/lib/ci-release-bundle", () => ({
 	},
 }));
 mock.module("../../scripts/lib/ci-release-restore", () => ({
+	...originalRestore,
+	// Keep the complete module contract without permitting a real artifact download.
+	downloadArchive: unexpectedArchiveDownload,
 	restoreCiReleaseBundle: async (options: { destination: string }) => {
 		trace.push("restore-source");
 		await mkdir(options.destination);
@@ -201,6 +210,7 @@ beforeEach(async () => {
 	delete process.env.NF_UPDATE_SERVER;
 	delete process.env.NF_UPDATE_TOKEN;
 	trace.length = 0;
+	unexpectedArchiveDownload.mockClear();
 	indexFailure = false;
 	guardFailure = false;
 	corruptReadback = false;
@@ -211,6 +221,7 @@ afterEach(async () => {
 	for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
 	Object.assign(process.env, env);
 	await rm(root, { recursive: true, force: true });
+	expect(unexpectedArchiveDownload).not.toHaveBeenCalled();
 });
 afterAll(() => mock.restore());
 const main = () =>

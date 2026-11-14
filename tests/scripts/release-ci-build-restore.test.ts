@@ -22,8 +22,10 @@ import {
 	prepareCiReleaseBuild,
 	REQUIRED_RELEASE_BUILD_SOURCE_CHECKS,
 	restoreCiReleaseBuildPlatform,
+	restoreCiReleaseRemoteFrontend,
 	validateCiReleaseBuildSource,
 } from "../../scripts/lib/ci-release-build-restore";
+import { CI_PLATFORM_ARTIFACT_LIMIT } from "../../scripts/lib/ci-release-io";
 import {
 	CI_RELEASE_BUN,
 	CI_RELEASE_REPOSITORY,
@@ -31,8 +33,11 @@ import {
 	CI_RELEASE_WORKFLOW,
 	type CiReleasePlan,
 } from "../../scripts/lib/ci-release-types";
-
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
+
+import { REMOTE_FRONTEND_CAPABILITY } from "../../shared/remote-access/application";
+import { remoteReleaseFixture } from "./remote-frontend-release.fixture";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -79,13 +84,14 @@ with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as bundle:
  for item in entries:
   info=zipfile.ZipInfo(item['name']); info.create_system=3
   info.compress_type=zipfile.ZIP_DEFLATED
+  if item.get('inflated',0)>=2**32: info.extra=struct.pack('<HHQ',1,8,item['inflated'])
   info.external_attr=(0o120777 if item.get('kind')=='symlink' else 0o40755 if item.get('kind')=='directory' else 0o100644)<<16
   bundle.writestr(info,base64.b64decode(item['bytes']))
 data=bytearray(open(path,'rb').read())
 pos=0
 for item in entries:
  pos=data.index(b'PK\\x01\\x02',pos)
- if item.get('inflated') is not None: struct.pack_into('<I',data,pos+24,item['inflated'])
+ if item.get('inflated') is not None: struct.pack_into('<I',data,pos+24,min(item['inflated'],2**32-1))
  if item.get('encrypted'): struct.pack_into('<H',data,pos+8,struct.unpack_from('<H',data,pos+8)[0]|1)
  pos+=46
 open(path,'wb').write(data)
@@ -298,7 +304,10 @@ function fixture(supplied?: CiReleasePlan) {
 			else if (path.startsWith("compare/"))
 				value = { status: "ahead", merge_base_commit: { sha: path.slice(8, 48) } };
 			else if (path === `git/trees/${commit}`) value = { truncated: false, tree: [] };
-			else if (path === `contents/package.json?ref=${commit}`)
+			else if (path === `contents/shared/remote-access/frontend-capability.json?ref=${commit}`) {
+				if (!original.remoteFrontend) throw new Error("HTTP 404");
+				value = contents(original.remoteFrontend);
+			} else if (path === `contents/package.json?ref=${commit}`)
 				value = contents({ version: "1.2.0", packageManager: `bun@${CI_RELEASE_BUN}` });
 			else if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)
 				value = contents(basePlan.changelog);
@@ -443,6 +452,100 @@ describe("default artifact template isolation", () => {
 		expect(fresh.downloads).toEqual([900]);
 		noOwnedTemps(right);
 		noOwnedTemps(fresh);
+	});
+});
+
+async function addRemoteOriginal(state: ReturnType<typeof fixture>, sourceCommit = commit) {
+	state.original.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+	state.repackPlan();
+	const remote = await remoteReleaseFixture(state.root, {
+		...state.original,
+		commit: sourceCommit,
+	});
+	state.artifacts.push({
+		...structuredClone(state.artifacts[0]),
+		id: 950,
+		name: "remote-frontend-101-2",
+	});
+	state.entries.set(
+		950,
+		Object.values(remote.names).map((name) => ({
+			name,
+			bytes: readFileSync(join(remote.directory, name)),
+		})),
+	);
+	state.repack(950);
+	const build = state.jobs.find(
+		(job) => job.name === "Verify release source / Build and typecheck",
+	);
+	if (!build) throw new Error("Missing fixture build");
+	build.steps.push({ name: "Upload remote frontend", status: "completed", conclusion: "success" });
+	return remote;
+}
+describe("frozen original remote frontend recovery", () => {
+	test("freezes artifact ID/digest/size/run/attempt and restores original bytes without a build", async () => {
+		const state = fixture();
+		const remote = await addRemoteOriginal(state);
+		const plan = await prepare(state, "all");
+		const artifact = state.artifacts.find((item) => item.id === 950);
+		if (!artifact) throw new Error("Missing remote artifact fixture");
+		expect(plan.buildSource?.remoteFrontend).toEqual({
+			id: 950,
+			digest: artifact.digest,
+			size: artifact.size_in_bytes,
+		});
+		expect(plan.buildSource).toMatchObject({ runId: 101, runAttempt: 2, workflowCommit });
+		const destination = join(state.root, "remote-restored");
+		await restoreCiReleaseRemoteFrontend({
+			root: state.root,
+			plan,
+			destination,
+			run: state.run,
+			env: state.env,
+			fetch: state.fetch,
+		});
+		for (const name of Object.values(remote.names))
+			expect(readFileSync(join(destination, name))).toEqual(
+				readFileSync(join(remote.directory, name)),
+			);
+		expect(state.downloads.every((id) => id === 900 || id === 950)).toBe(true);
+	});
+	test("rejects missing remote artifact/proof and a changed frozen digest rather than rebuilding", async () => {
+		const state = fixture();
+		await addRemoteOriginal(state);
+		const plan = await prepare(state, "all");
+		const remote = state.artifacts.find((artifact) => artifact.id === 950);
+		if (!remote) throw new Error();
+		remote.digest = `sha256:${"0".repeat(64)}`;
+		await expect(
+			restoreCiReleaseRemoteFrontend({
+				root: state.root,
+				plan,
+				destination: join(state.root, "rejected"),
+				run: state.run,
+				env: state.env,
+				fetch: state.fetch,
+			}),
+		).rejects.toThrow("identity");
+		state.artifacts.splice(state.artifacts.indexOf(remote), 1);
+		await expect(prepare(state, "all")).rejects.toThrow("artifact missing");
+	});
+	test("valid transport digest cannot excuse remote manifest with another source commit", async () => {
+		const state = fixture();
+		await addRemoteOriginal(state, "d".repeat(40));
+		const plan = await prepare(state, "all");
+		const destination = join(state.root, "wrong-source");
+		await expect(
+			restoreCiReleaseRemoteFrontend({
+				root: state.root,
+				plan,
+				destination,
+				run: state.run,
+				env: state.env,
+				fetch: state.fetch,
+			}),
+		).rejects.toThrow("TARGET_MISMATCH");
+		expect(existsSync(destination)).toBe(false);
 	});
 });
 
@@ -799,7 +902,7 @@ describe("original build recovery", () => {
 		[
 			"platform too large",
 			(s: ReturnType<typeof fixture>) => {
-				s.artifacts[1].size_in_bytes = 2 * 1024 ** 3;
+				s.artifacts[1].size_in_bytes = CI_PLATFORM_ARTIFACT_LIMIT + 1;
 			},
 		],
 	] as const) {
@@ -909,7 +1012,7 @@ describe("original build recovery", () => {
 			else if (kind === "symlink" || kind === "directory") values[0].kind = kind;
 			else if (kind === "duplicate") values[1].name = values[0].name;
 			else if (kind === "encrypted") values[0].encrypted = true;
-			else if (kind === "oversized") values[0].inflated = 1024 ** 3 + 1;
+			else if (kind === "oversized") values[0].inflated = MAX_RELEASE_BINARY_BYTES + 1;
 			else if (kind === "missing") values.pop();
 			else if (kind === "extra") values.push({ name: "other", bytes: Buffer.from("x") });
 			else if (kind === "wrong binary hash") values[0].bytes = Buffer.from("not original bytes");

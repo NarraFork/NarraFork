@@ -88,7 +88,12 @@ import { readDisplayNames, readNarrator, readTeamActivityFacts } from "./access-
 import { OUTLINE_DIGEST_REPORT_ACTOR, taskTransition } from "./digest";
 import { seqBefore } from "./digest-job";
 import { isOutlineEnabled } from "./feature";
-import { OUTLINE_CHANGE, OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
+import {
+	commitPersonId,
+	OUTLINE_CHANGE,
+	OUTLINE_TASKS_PAGE_ALIAS,
+	type OutlineTaskJson,
+} from "./model";
 import { describeOutlineOverlaps, readOutlineFileOverlaps } from "./overlap";
 import { canSessionReadNarrator, canSessionReadSpace } from "./session-scope";
 import { outlineStore } from "./store";
@@ -441,7 +446,9 @@ async function lookAtSpace(
 			const r = writerRoots.get(writer) ?? writer;
 			return r === root ? null : `s:${r}`;
 		}
-		return commit.actorKind === "human" ? `h:${commit.actorId}` : "x";
+		// A person's commit, or a hand-out a person made (`commitPersonId`).
+		const person = commitPersonId(commit);
+		return person ? `h:${person}` : "x";
 	};
 	// Others' versions only; the session's own (and its subagents') are not news to it.
 	const others = changes.filter((c) => {
@@ -582,7 +589,7 @@ async function lookAtSpace(
 				continue;
 			}
 			if (!after && !before) continue;
-			const person = commit.actorKind === "human";
+			const person = commitPersonId(commit) !== null;
 			if (person && toldByPeopleEdits(blockId)) continue;
 			if (created) {
 				// Created for this session by name: its team row said so.

@@ -103,6 +103,7 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  * reload. Importers must reach the logic module directly.
  */
 import { stripKey } from "./recent-tab-keyboard-nav";
+import { newSessionTargetFor } from "./recent-tab-new-session";
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
@@ -530,9 +531,11 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const [editFolder, setEditFolder] = useState<RecentTab | null>(null);
 
 	// Open the shell before resolving cwd; only a resolved target mounts the form body.
+	// 文件夹目标没有目录要解析，`folderId` 表示"建完把新会话放进去"。
 	const [newNarratorTarget, setNewNarratorTarget] = useState<{
-		narratorId: string;
+		narratorId?: string;
 		cwd?: string;
+		folderId?: string;
 	} | null>(null);
 	const newNarratorTargetRef = useRef(newNarratorTarget);
 	newNarratorTargetRef.current = newNarratorTarget;
@@ -754,11 +757,17 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const newNarratorHereFor = useCallback(
 		async (tab: RecentTab) => {
 			if (!requireSetup()) return;
-			const narratorId = getRecentTabNarratorId(tab);
-			if (!narratorId) {
-				notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+			const sessionTarget = newSessionTargetFor(tab);
+			if (!sessionTarget) return;
+			// 文件夹没有目录要解析：直接用弹窗的默认预填，建完再归入这个文件夹。
+			if ("folderId" in sessionTarget) {
+				newNarratorRequestRef.current += 1;
+				const folderTarget = { folderId: sessionTarget.folderId };
+				newNarratorTargetRef.current = folderTarget;
+				setNewNarratorTarget(folderTarget);
 				return;
 			}
+			const { narratorId } = sessionTarget;
 			const request = ++newNarratorRequestRef.current;
 			const target = { narratorId };
 			newNarratorTargetRef.current = target;
@@ -785,19 +794,35 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	}, [ctxMenu, newNarratorHereFor]);
 
 	const handleNewNarratorHereCreated = useCallback(
-		(data: CreateNarratorResult) => {
+		// The modal closes (clearing `newNarratorTarget`) before it reports creation, so the
+		// folder comes from the call site's closure rather than from state.
+		(data: CreateNarratorResult, folderId?: string) => {
 			closeNewNarratorHere();
-			addRecentTab({
+			void addRecentTab({
 				type: "narrator",
 				id: data.id,
 				title: data.title,
 				subtitle: data.cwd,
 				status: data.status,
+			}).then(() => {
+				if (!folderId) return;
+				// The upsert strips `folderId`, so membership is a separate move. Going through the
+				// tab mutation keeps the row from flashing at top level until the WS delta lands.
+				moveTab(
+					`narrator:${data.id}`,
+					{ folderId },
+					{
+						// The session exists either way; say so, or the modal's "follow the folder"
+						// identity would silently not apply.
+						onError: () =>
+							notifications.show({ color: "orange", message: t("newNarratorJoinFolderFailed") }),
+					},
+				);
 			});
 			navigate({ to: `/narrators/${data.id}` });
 			onNavigate?.();
 		},
-		[navigate, onNavigate, closeNewNarratorHere],
+		[navigate, onNavigate, closeNewNarratorHere, moveTab, t],
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
@@ -1277,7 +1302,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								onReveal={handleReveal}
 								canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
 								onNewNarratorHere={handleNewNarratorHere}
-								canNewNarratorHere={ctxTab.type === "narrator" || ctxTab.type === "subagent"}
+								canNewNarratorHere={newSessionTargetFor(ctxTab) !== null}
+								newNarratorHereLabel={ctxIsFolder ? t("newNarratorInFolder") : t("newNarratorHere")}
 								onCopyCwd={handleCopyCwd}
 								canCopyCwd={["narrator", "subagent"].includes(ctxTab.type)}
 								onOpenInWindow={handleOpenInWindow}
@@ -1359,10 +1385,14 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 						/>
 						<CreateNarratorLazyModal
 							opened={newNarratorTarget !== null}
-							busy={newNarratorTarget?.cwd == null}
+							// Busy only while a session target's directory is resolving; folders open directly.
+							busy={newNarratorTarget?.narratorId != null && newNarratorTarget.cwd == null}
 							initialCwd={newNarratorTarget?.cwd}
+							// 从文件夹里新建时，弹窗要说清 git 身份跟的是这个文件夹。
+							gitIdentityFolderId={newNarratorTarget?.folderId}
 							onClose={closeNewNarratorHere}
-							onCreated={handleNewNarratorHereCreated}
+							// 闭包捕获本次打开时的目标：onCreated 触发时状态已被清空。
+							onCreated={(data) => handleNewNarratorHereCreated(data, newNarratorTarget?.folderId)}
 						/>
 					</Box>
 					{/* Keep preview rows outside the measured source container. */}

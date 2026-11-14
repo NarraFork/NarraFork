@@ -76,7 +76,11 @@ async function measureInputCharacters(
 ): Promise<ContextInputCharacters | null> {
 	const maxChars = budget.maxChars ?? 32 * 1024 * 1024;
 	const maxNodes = budget.maxNodes ?? 100_000;
-	const deadline = performance.now() + (budget.maxMilliseconds ?? 100);
+	// Occupancy budget, not wall clock: time spent OFF the event loop after a yield is
+	// not main-thread occupancy. Counting it turned a slow or throttled timer (shared CI
+	// runners, a contended browser) into "count unavailable" for requests whose real
+	// work is milliseconds.
+	let deadline = performance.now() + (budget.maxMilliseconds ?? 100);
 	let nodes = 0;
 	let work = 0;
 	let totalChars = 0;
@@ -96,7 +100,9 @@ async function measureInputCharacters(
 		nodes++;
 		check();
 		if (++work % 2048 === 0) {
+			const yieldedAt = performance.now();
 			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			deadline += performance.now() - yieldedAt;
 			check();
 		}
 	};

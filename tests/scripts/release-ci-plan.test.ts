@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { CI_PLATFORM_ARTIFACT_LIMIT } from "../../scripts/lib/ci-release-io";
 import {
 	assertCiMainAncestor,
 	ciApiList,
 	createCiReleasePlan,
+	readTargetRemoteFrontendCapability,
 	revalidateCiReleasePlan,
 	validateCiReleasePlan,
 } from "../../scripts/lib/ci-release-plan";
@@ -13,6 +15,8 @@ import {
 	CI_RELEASE_WORKFLOW,
 } from "../../scripts/lib/ci-release-types";
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
+import { REMOTE_FRONTEND_CAPABILITY } from "../../shared/remote-access/application";
 
 const commit = "a".repeat(40);
 const workflowCommit = "b".repeat(40);
@@ -53,6 +57,8 @@ function fixture(repository = CI_RELEASE_REPOSITORY, defaultBranch = "main") {
 		changelog: { ...changelog },
 		marker: true,
 		componentVersions: undefined as unknown,
+		remoteFrontend: undefined as unknown,
+		remoteFrontendError: undefined as Error | undefined,
 		releases: [] as unknown[],
 		environment: {
 			name: "release",
@@ -122,6 +128,11 @@ function fixture(repository = CI_RELEASE_REPOSITORY, defaultBranch = "main") {
 					],
 				});
 			if (path === `git/blobs/${configSha}`) return config.toString("base64");
+			if (path === `contents/shared/remote-access/frontend-capability.json?ref=${commit}`) {
+				if (state.remoteFrontendError) throw state.remoteFrontendError;
+				if (state.remoteFrontend === undefined) throw new Error("HTTP 404");
+				return JSON.stringify(contents(state.remoteFrontend));
+			}
 			if (path === `contents/package.json?ref=${commit}`)
 				return JSON.stringify(contents(state.pkg));
 			if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)
@@ -156,6 +167,54 @@ const componentEvidence = {
 		buildInputsSha256: "f".repeat(64),
 	},
 };
+
+describe("frozen remote frontend declaration", () => {
+	test("reads target commit rather than control commit and preserves historical absence", async () => {
+		const state = fixture();
+		expect((await createCiReleasePlan(options(state))).remoteFrontend).toBeUndefined();
+		state.remoteFrontend = REMOTE_FRONTEND_CAPABILITY;
+		const plan = await createCiReleasePlan(options(state));
+		expect(plan.remoteFrontend).toEqual(REMOTE_FRONTEND_CAPABILITY);
+		expect(
+			state.calls
+				.filter((call) => call[1].includes("frontend-capability"))
+				.every((call) => call[1].endsWith(`ref=${commit}`)),
+		).toBe(true);
+		state.remoteFrontend = undefined;
+		await expect(revalidateCiReleasePlan(plan, options(state))).rejects.toThrow(
+			"declaration differs",
+		);
+	});
+	test("only actual HTTP 404 is optional; bad JSON, unknown ABI and transport errors fail", async () => {
+		for (const message of ["HTTP 403", "HTTP 500", "timeout", "connection reset"]) {
+			const state = fixture();
+			state.remoteFrontendError = new Error(message);
+			await expect(createCiReleasePlan(options(state))).rejects.toThrow(message);
+		}
+		const state = fixture();
+		state.remoteFrontend = { ...REMOTE_FRONTEND_CAPABILITY, wireVersion: 99 };
+		await expect(createCiReleasePlan(options(state))).rejects.toThrow();
+		await expect(
+			readTargetRemoteFrontendCapability(
+				async () => "HTTP 404 is malformed JSON",
+				commit,
+				CI_RELEASE_REPOSITORY,
+			),
+		).rejects.toThrow();
+		await expect(
+			readTargetRemoteFrontendCapability(
+				async () =>
+					JSON.stringify({
+						...contents({}),
+						content: Buffer.from("not JSON HTTP 404").toString("base64"),
+						size: 17,
+					}),
+				commit,
+				CI_RELEASE_REPOSITORY,
+			),
+		).rejects.toThrow();
+	});
+});
 
 describe("CI release plan trust boundary", () => {
 	test("ancestry checks project only trust fields before bounded output collection", async () => {
@@ -438,6 +497,31 @@ describe("CI release plan trust boundary", () => {
 				helperDistribution: dependencies,
 			},
 		};
+		for (const size of [1024 ** 3 + 1, MAX_RELEASE_BINARY_BYTES])
+			expect(() =>
+				validateCiReleasePlan({
+					...plan,
+					baselines: [
+						{
+							...baseline,
+							binaryAsset: { ...baseline.binaryAsset, size },
+							metadata: { ...baseline.metadata, size },
+						},
+					],
+				}),
+			).not.toThrow();
+		expect(() =>
+			validateCiReleasePlan({
+				...plan,
+				baselines: [
+					{
+						...baseline,
+						binaryAsset: { ...baseline.binaryAsset, size: MAX_RELEASE_BINARY_BYTES + 1 },
+						metadata: { ...baseline.metadata, size: MAX_RELEASE_BINARY_BYTES + 1 },
+					},
+				],
+			}),
+		).toThrow();
 		const input = { ...plan, baselines: [baseline] };
 		expect(validateCiReleasePlan(input).baselines[0]?.metadata.helperDistribution).toEqual(
 			dependencies,
@@ -790,7 +874,27 @@ describe("original build provenance plan contract", () => {
 			workflowCommit,
 			buildSource: source,
 		});
+		for (const size of [1024 ** 3 + 1, MAX_RELEASE_BINARY_BYTES, CI_PLATFORM_ARTIFACT_LIMIT])
+			expect(() =>
+				validateCiReleasePlan({
+					...base,
+					buildSource: {
+						...source,
+						platforms: [
+							{ ...source.platforms[0], artifact: { ...source.platforms[0].artifact, size } },
+						],
+					},
+				}),
+			).not.toThrow();
 		for (const changed of [
+			{
+				platforms: [
+					{
+						...source.platforms[0],
+						artifact: { ...source.platforms[0].artifact, size: CI_PLATFORM_ARTIFACT_LIMIT + 1 },
+					},
+				],
+			},
 			{ runId: base.runId },
 			{ runAttempt: 0 },
 			{ workflowCommit: "d".repeat(8) },

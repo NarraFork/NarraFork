@@ -4,11 +4,13 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { apiRequests, users } from "@server/db/schema";
+import * as workerRead from "@server/db/worker-read";
 import {
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	shutdownDbWorkerPool,
 } from "@server/lib/db-worker/pool";
+import { logger } from "@server/lib/logger";
 import { decodeUsageHistoryCursor } from "@server/lib/usage-history-cursor";
 import type { SQLWrapper } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -225,9 +227,75 @@ describe("cache hit rate eligibility", () => {
 			.run();
 	}
 
-	test("summary and time buckets only use positive cache-read rows without filtering ordinary totals", async () => {
+	test("reported cache counters decide eligibility; zero-cache misses count, unreported rows do not", async () => {
+		db.insert(apiRequests)
+			.values([
+				{
+					// OpenAI 系没有写入计数：上报了 cached=0 的未命中必须进分母。
+					id: "openai-miss",
+					createdAt,
+					provider: "openai",
+					model: "gpt",
+					inputTokens: 5000,
+					cachedInputTokens: 0,
+					cacheUsageReported: true,
+				},
+				{
+					id: "openai-hit",
+					createdAt,
+					provider: "openai",
+					model: "gpt",
+					inputTokens: 2000,
+					cachedInputTokens: 3000,
+					cacheUsageReported: true,
+				},
+				{
+					// 中转没带缓存字段：0 只是占位，不进分母。
+					id: "relay-unreported",
+					createdAt,
+					provider: "relay",
+					model: "gpt",
+					inputTokens: 7000,
+					cacheUsageReported: false,
+				},
+				{
+					// 旧记录：退回"有缓存读写才算"。
+					id: "legacy-write",
+					createdAt,
+					provider: "legacy",
+					model: "claude",
+					inputTokens: 100,
+					cacheCreationInputTokens: 900,
+				},
+				{
+					id: "legacy-silent",
+					createdAt,
+					provider: "legacy",
+					model: "claude",
+					inputTokens: 4000,
+				},
+			])
+			.run();
+		const stats = await service.getUsageStats(filters);
+		expect(stats).toMatchObject({
+			cacheHitRateReadTokens: 3000,
+			cacheHitRateInputTokens: 5000 + 5000 + 1000,
+		});
+		expect(stats.cacheHitRate).toBeCloseTo(3000 / 11000);
+		expect(
+			(await service.getUsageStats({ ...filters, provider: "openai" })).cacheHitRate,
+		).toBeCloseTo(0.3);
+		expect(
+			(await service.getUsageStats({ ...filters, provider: "relay" })).cacheHitRate,
+		).toBeNull();
+		expect((await service.getUsageStats({ ...filters, provider: "legacy" })).cacheHitRate).toBe(0);
+	});
+
+	test("legacy rows: summary and time buckets include every request with cache activity, ignoring ordinary totals", async () => {
 		seedCacheRequests();
 		const stats = await service.getUsageStats(filters);
+		// 参与分母：cache-large 1600 + cache-small 100 + zero-cache 13000 + write-only 34000。
+		// `missing-cache` 读写全为 0（provider 不上报缓存），不进分母。
 		expect(stats).toMatchObject({
 			totalRequests: 5,
 			totalInputTokens: 60200,
@@ -237,49 +305,50 @@ describe("cache hit rate eligibility", () => {
 			totalTokens: 68950,
 			totalCost: 15,
 			cacheHitRateReadTokens: 900,
-			cacheHitRateInputTokens: 1700,
+			cacheHitRateInputTokens: 48700,
 		});
-		expect(stats.cacheHitRate).toBeCloseTo(900 / 1700);
+		expect(stats.cacheHitRate).toBeCloseTo(900 / 48700);
 		const points = (await service.getUsageTimeSeries(filters)).points;
 		expect(points.map((point) => point.requestCount)).toEqual([4, 1, 0]);
-		expect(points[0].cacheHitRate).toBeCloseTo(900 / 1700);
-		expect(points[1].cacheHitRate).toBeNull();
+		// 第一天只有前三条有缓存活动；第二天只有 write-only，写了 4000 却一条没读到。
+		expect(points[0].cacheHitRate).toBeCloseTo(900 / 14700);
+		expect(points[1].cacheHitRate).toBeCloseTo(0);
 		expect(points[2].cacheHitRate).toBeNull();
+		// 这个 provider 写了缓存但从未命中：命中率是 0，不是"没有数据"。
 		expect(
 			(await service.getUsageStats({ ...filters, provider: "uncached" })).cacheHitRate,
-		).toBeNull();
+		).toBeCloseTo(0);
 		expect(
 			(await service.getUsageStats({ ...filters, provider: "missing" })).cacheHitRate,
 		).toBeNull();
 	});
 
 	for (const dimension of ["provider", "model", "kind", "user"] as const) {
-		test(`keeps ${dimension} breakdown and stacked ratios weighted and null when ineligible`, async () => {
+		test(`keeps ${dimension} breakdown and stacked ratios weighted, zero when cached-but-never-read`, async () => {
 			seedCacheRequests();
 			const breakdown = await service.getUsageBreakdown(filters, {
 				dimension,
 				metric: "cacheHitRate",
 			});
-			expect(breakdown.total).toBeCloseTo(900 / 1700);
-			expect(breakdown.entries.filter((entry) => entry.value != null)).toHaveLength(1);
-			expect(breakdown.entries.find((entry) => entry.value != null)?.value).toBeCloseTo(900 / 1700);
+			expect(breakdown.total).toBeCloseTo(900 / 48700);
+			// 每组都含至少一条有缓存活动的请求，所以每组都有值；只写不读的组是 0。
+			expect(breakdown.entries.every((entry) => entry.value != null)).toBe(true);
 			expect(breakdown.entries.reduce((sum, entry) => sum + entry.count, 0)).toBe(5);
 			const stacked = await service.getUsageTimeSeriesStacked(filters, {
 				dimension,
 				metric: "cacheHitRate",
 			});
-			const participating = stacked.series.find((series) => series.data[0].value != null);
-			expect(participating?.data[0].value).toBeCloseTo(900 / 1700);
+			expect(stacked.series.some((series) => series.data[0].value != null)).toBe(true);
+			// 第三天没有任何请求，所有系列都该是 null。
 			for (const series of stacked.series) {
-				expect(series.data[1].value).toBeNull();
 				expect(series.data[2].value).toBeNull();
 			}
+			// 只写缓存、从未读到的 provider 现在是 0，而不是"没有数据"。
 			const empty = await service.getUsageBreakdown(
 				{ ...filters, provider: "uncached" },
 				{ dimension, metric: "cacheHitRate" },
 			);
-			expect(empty.total).toBeNull();
-			expect(empty.entries.every((entry) => entry.value === null)).toBe(true);
+			expect(empty.total).toBeCloseTo(0);
 		});
 	}
 
@@ -723,27 +792,204 @@ describe("UsageHistoryService production worker", () => {
 			expect(getDbWorkerPoolStats().workers).toBeGreaterThan(0);
 			fileDb.close();
 		} finally {
-			shutdownDbWorkerPool();
+			await shutdownDbWorkerPool();
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
 
-	test("fails closed instead of performing a main-thread scan when workers are disabled", async () => {
+	test.each([
+		false,
+		true,
+	])("fails closed without inline scans when workers are disabled (sink throws: %s)", async (sinkThrows) => {
 		seedUsers();
 		const directory = await mkdtemp(join(tmpdir(), "usage-history-worker-"));
 		const fileDb = new Database(join(directory, "usage.db"));
 		const original = process.env.NARRAFORK_DB_WORKER;
 		process.env.NARRAFORK_DB_WORKER = "off";
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			if (sinkThrows) throw new Error("logging sink failed");
+		});
+		const query = spyOn(fileDb, "query");
+		const prepare = spyOn(fileDb, "prepare");
 		try {
 			await expect(
 				new UsageHistoryService(drizzle({ client: fileDb }) as typeof db).getUsageStats({}),
-			).rejects.toMatchObject({ statusCode: 503, code: "USAGE_QUERY_UNAVAILABLE" });
+			).rejects.toMatchObject({
+				message: "Usage statistics are temporarily unavailable",
+				statusCode: 503,
+				code: "USAGE_QUERY_UNAVAILABLE",
+			});
+			expect(warn).toHaveBeenCalledWith("Usage history aggregation worker failed", {
+				entry: "usage-history-aggregation",
+				phase: "read",
+				errorType: "WorkersUnavailableError",
+				code: undefined,
+			});
+			expect(JSON.stringify(warn.mock.calls)).not.toContain("disabled_by_env");
+			expect(query).not.toHaveBeenCalled();
+			expect(prepare).not.toHaveBeenCalled();
+			expect(getDbWorkerPoolStats()).toMatchObject({ busy: 0, queued: 0, inFlight: 0 });
 		} finally {
+			prepare.mockRestore();
+			query.mockRestore();
+			warn.mockRestore();
 			fileDb.close();
 			await rm(directory, { recursive: true, force: true });
 			if (original === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = original;
-			resetDbWorkerPoolForTest();
+			await resetDbWorkerPoolForTest();
+		}
+	});
+
+	for (const sinkThrows of [false, true]) {
+		test.each([
+			{
+				label: "known",
+				name: "TypeError",
+				code: "SQLITE_BUSY",
+				errorType: "TypeError",
+				safeCode: "SQLITE_BUSY",
+			},
+			{
+				label: "unknown",
+				name: "USAGE_PRIVATE_NAME_SECRET",
+				code: "SQLITE_USAGE_PRIVATE_SECRET",
+				errorType: "WorkerError",
+				safeCode: undefined,
+			},
+		])(`worker diagnostics project $label canaries to scalars (sink throws: ${sinkThrows})`, async ({
+			name,
+			code,
+			errorType,
+			safeCode,
+		}) => {
+			const fault = Object.assign(
+				new TypeError(
+					`postgres://alice:private@host/db token=secret ${"USAGE_PRIVATE_BODY_SECRET".repeat(1024)}`,
+				),
+				{
+					name,
+					code,
+					filename: "/home/private/USAGE_PRIVATE_PATH_SECRET.sqlite",
+					stack:
+						"USAGE_PRIVATE_BODY_SECRET\n at USAGE_PRIVATE_STACK_SECRET (/home/private/USAGE_PRIVATE_PATH_SECRET.ts:12:34)",
+					diagnostic: { contentJson: "USAGE_PRIVATE_BODY_SECRET" },
+				},
+			);
+			const read = spyOn(workerRead, "readQuery").mockRejectedValueOnce(fault);
+			const warn = spyOn(logger, "warn").mockImplementation(() => {
+				if (sinkThrows) throw new Error("logging sink failed");
+			});
+			const clock = spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(1501);
+			const controller = new AbortController();
+			try {
+				await expect(
+					service.getUsageStats(dateFilters, { signal: controller.signal }),
+				).rejects.toMatchObject({
+					message: "Usage statistics are temporarily unavailable",
+					statusCode: 503,
+					code: "USAGE_QUERY_UNAVAILABLE",
+				});
+				expect(read).toHaveBeenCalledTimes(1);
+				expect(read.mock.calls[0][1]).toEqual({ maxRows: 1, signal: controller.signal });
+				expect(warn.mock.calls).toEqual([
+					[
+						"Usage history aggregation worker failed",
+						{
+							entry: "usage-history-aggregation",
+							phase: "read",
+							errorType,
+							code: safeCode,
+						},
+					],
+					[
+						"Slow usage history aggregation",
+						{
+							entry: "usage-history-aggregation",
+							phase: "read",
+							durationMs: 1501,
+						},
+					],
+				]);
+				const serialized = JSON.stringify(warn.mock.calls);
+				expect(serialized.length).toBeLessThan(1024);
+				for (const secret of [
+					"USAGE_PRIVATE_BODY_SECRET",
+					"USAGE_PRIVATE_PATH_SECRET",
+					"USAGE_PRIVATE_STACK_SECRET",
+					"USAGE_PRIVATE_NAME_SECRET",
+					"SQLITE_USAGE_PRIVATE_SECRET",
+					"alice:private",
+					"token=secret",
+					import.meta.dir,
+				])
+					expect(serialized).not.toContain(secret);
+				expect(getDbWorkerPoolStats()).toMatchObject({ busy: 0, queued: 0, inFlight: 0 });
+			} finally {
+				clock.mockRestore();
+				warn.mockRestore();
+				read.mockRestore();
+			}
+		});
+	}
+
+	test("a throwing slow-log sink cannot replace a successful aggregation result", async () => {
+		seedUsers();
+		const expected = await service.getUsageStats(dateFilters);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("logging sink failed");
+		});
+		const clock = spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(1501);
+		try {
+			expect(await service.getUsageStats(dateFilters)).toEqual(expected);
+			expect(warn.mock.calls).toEqual([
+				[
+					"Slow usage history aggregation",
+					{
+						entry: "usage-history-aggregation",
+						phase: "read",
+						durationMs: 1501,
+					},
+				],
+			]);
+		} finally {
+			clock.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
+	test("a throwing failure sink leaves a real rejected worker task released", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "usage-history-worker-"));
+		const fileDb = new Database(join(directory, "usage.db"));
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("logging sink failed");
+		});
+		try {
+			await expect(
+				new UsageHistoryService(drizzle({ client: fileDb }) as typeof db).getUsageStats({}),
+			).rejects.toMatchObject({
+				message: "Usage statistics are temporarily unavailable",
+				statusCode: 503,
+				code: "USAGE_QUERY_UNAVAILABLE",
+			});
+			expect(warn).toHaveBeenCalledWith("Usage history aggregation worker failed", {
+				entry: "usage-history-aggregation",
+				phase: "read",
+				errorType: "DbReadTaskExecutionError",
+				code: "SQLITE_ERROR",
+			});
+			expect(getDbWorkerPoolStats()).toMatchObject({
+				busy: 0,
+				queued: 0,
+				inFlight: 0,
+				starting: 0,
+			});
+		} finally {
+			warn.mockRestore();
+			await shutdownDbWorkerPool();
+			fileDb.close();
+			await rm(directory, { recursive: true, force: true });
+			await resetDbWorkerPoolForTest();
 		}
 	});
 });

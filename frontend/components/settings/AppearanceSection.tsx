@@ -1,4 +1,5 @@
-import { Group, SegmentedControl, Select, Slider, Stack, Switch, Text, Title } from "@mantine/core";
+import { Group, SegmentedControl, Slider, Stack, Text, Title } from "@mantine/core";
+import type { AppearancePreferenceKey } from "@shared/appearance-preferences";
 import {
 	DEFAULT_TYPOGRAPHY,
 	setTypography,
@@ -17,6 +18,12 @@ import { typographyPreferencePatch } from "../../lib/typography-preferences";
 import { LanguageSwitcher } from "../LanguageSwitcher";
 import { ThemeSwitcher } from "../ThemeSwitcher";
 import { TERMINAL_THEMES } from "../terminal/terminal-theme";
+import {
+	AppearanceCustomSyncSwitch,
+	AppearancePreferenceRow,
+	AppearanceSelect as Select,
+	AppearanceSwitch as Switch,
+} from "./AppearanceSyncControl";
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
 type AnyPrefs = any;
@@ -54,6 +61,7 @@ export interface AppearanceSectionProps {
  * Writing per frame would re-measure every open transcript on every pointer move.
  */
 function TypographyKnob({
+	preferenceKey,
 	label,
 	description,
 	value,
@@ -64,6 +72,7 @@ function TypographyKnob({
 	onPreview,
 	onCommit,
 }: {
+	preferenceKey: AppearancePreferenceKey;
 	label: string;
 	description: string;
 	value: number;
@@ -76,36 +85,38 @@ function TypographyKnob({
 }) {
 	const [dragging, setDragging] = useState<number | null>(null);
 	return (
-		<Stack gap={4}>
-			<Group justify="space-between" wrap="nowrap" gap="xs">
-				<Text size="sm" fw={500}>
-					{label}
-				</Text>
+		<AppearancePreferenceRow preferenceKey={preferenceKey} label={label}>
+			<Stack gap={4}>
+				<Group justify="space-between" wrap="nowrap" gap="xs">
+					<Text size="sm" fw={500}>
+						{label}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{`${dragging ?? value}%`}
+					</Text>
+				</Group>
 				<Text size="xs" c="dimmed">
-					{`${dragging ?? value}%`}
+					{description}
 				</Text>
-			</Group>
-			<Text size="xs" c="dimmed">
-				{description}
-			</Text>
-			<Slider
-				value={dragging ?? value}
-				onChange={(next) => {
-					setDragging(next);
-					onPreview(next);
-				}}
-				onChangeEnd={(next) => {
-					setDragging(null);
-					onCommit(next);
-				}}
-				min={min}
-				max={max}
-				step={step}
-				label={(v) => `${v}%`}
-				marks={marks}
-				mb="md"
-			/>
-		</Stack>
+				<Slider
+					value={dragging ?? value}
+					onChange={(next) => {
+						setDragging(next);
+						onPreview(next);
+					}}
+					onChangeEnd={(next) => {
+						setDragging(null);
+						onCommit(next);
+					}}
+					min={min}
+					max={max}
+					step={step}
+					label={(v) => `${v}%`}
+					marks={marks}
+					mb="md"
+				/>
+			</Stack>
+		</AppearancePreferenceRow>
 	);
 }
 
@@ -143,10 +154,14 @@ export function AppearanceSection({
 
 	return (
 		<Stack>
+			<AppearanceCustomSyncSwitch />
 			{/* Theme */}
 			<Title order={5}>{t("themeSubSection")}</Title>
-			<ThemeSwitcher />
+			<AppearancePreferenceRow preferenceKey="colorScheme" label={t("themeSubSection")}>
+				<ThemeSwitcher />
+			</AppearancePreferenceRow>
 			<Switch
+				preferenceKey="narrafork_oled"
 				label={t("oledMode")}
 				description={t("oledModeDesc")}
 				checked={oledMode}
@@ -154,6 +169,7 @@ export function AppearanceSection({
 			/>
 			{availableThemes.length > 0 && (
 				<Select
+					preferenceKey="pluginTheme"
 					label={t("pluginTheme")}
 					description={t("pluginThemeDesc")}
 					data={[
@@ -187,6 +203,7 @@ export function AppearanceSection({
 				{t("displaySubSection")}
 			</Title>
 			<Switch
+				preferenceKey="narrafork_fullscreen"
 				label={t("ignoreSafeArea")}
 				description={t("ignoreSafeAreaDesc")}
 				checked={isFullscreen}
@@ -202,6 +219,7 @@ export function AppearanceSection({
 				}}
 			/>
 			<Switch
+				preferenceKey="recentTabsShowDirectory"
 				label={t("recentTabsShowDirectory")}
 				description={t("recentTabsShowDirectoryDesc")}
 				checked={userPrefs?.recentTabsShowDirectory ?? false}
@@ -210,18 +228,21 @@ export function AppearanceSection({
 				}
 			/>
 			<Switch
+				preferenceKey="narrafork_narrator_bottom_spacing_resize"
 				label={t("bottomSpacingResize")}
 				description={t("bottomSpacingResizeDesc")}
 				checked={bottomSpacingResize}
 				onChange={(e) => setBottomSpacingResize(e.currentTarget.checked)}
 			/>
 			<Switch
+				preferenceKey="narrafork_wakelock"
 				label={t("wakeLock")}
 				description={t("wakeLockDesc")}
 				checked={wakeLock}
 				onChange={(e) => setWakeLock(e.currentTarget.checked)}
 			/>
 			<Switch
+				preferenceKey="narrafork_advanced_anim"
 				label={t("advancedAnimation")}
 				description={t("advancedAnimationDesc")}
 				checked={advancedAnim}
@@ -231,80 +252,90 @@ export function AppearanceSection({
 			    switch above is off, so the control that owns it stays discoverable
 			    instead of appearing out of nowhere after a toggle. Local state during
 			    the drag keeps the slider responsive; the pref is written on release. */}
-			<Stack gap={4} ml="xl" opacity={advancedAnim ? 1 : 0.5}>
-				<Text size="sm" fw={500}>
-					{t("blurInDuration")}
-				</Text>
-				<Text size="xs" c="dimmed">
-					{t("blurInDurationDesc")}
-				</Text>
-				<Slider
-					disabled={!advancedAnim}
-					value={localBlurInMs ?? blurInMs}
-					onChange={setLocalBlurInMs}
-					onChangeEnd={(v) => {
-						setLocalBlurInMs(null);
-						setBlurInMs(v);
-					}}
-					min={0}
-					max={2000}
-					step={50}
-					label={(v) => (v === 0 ? t("blurInDurationInstant") : `${v}ms`)}
-					marks={[
-						{ value: 0, label: t("blurInDurationInstant") },
-						{ value: 400, label: "400ms" },
-						{ value: 1000, label: "1s" },
-						{ value: 2000, label: "2s" },
-					]}
-					mb="md"
-				/>
-			</Stack>
+			<AppearancePreferenceRow preferenceKey="narrafork_blur_in_ms" label={t("blurInDuration")}>
+				<Stack gap={4} ml="xl" opacity={advancedAnim ? 1 : 0.5}>
+					<Text size="sm" fw={500}>
+						{t("blurInDuration")}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{t("blurInDurationDesc")}
+					</Text>
+					<Slider
+						disabled={!advancedAnim}
+						value={localBlurInMs ?? blurInMs}
+						onChange={setLocalBlurInMs}
+						onChangeEnd={(v) => {
+							setLocalBlurInMs(null);
+							setBlurInMs(v);
+						}}
+						min={0}
+						max={2000}
+						step={50}
+						label={(v) => (v === 0 ? t("blurInDurationInstant") : `${v}ms`)}
+						marks={[
+							{ value: 0, label: t("blurInDurationInstant") },
+							{ value: 400, label: "400ms" },
+							{ value: 1000, label: "1s" },
+							{ value: 2000, label: "2s" },
+						]}
+						mb="md"
+					/>
+				</Stack>
+			</AppearancePreferenceRow>
 			{/* Duration of the streaming per-grapheme fade. Both renderers (the virtual
 			    list and the classic one) follow this value. Note the setting is a
 			    request, not a guarantee: past ~1s a fast stream hits the live-span cap
 			    in stream-token-anim and the oldest graphemes seal early, so the fade
 			    shortens on its own. The description text says so. */}
-			<Stack gap={4} ml="xl" opacity={advancedAnim ? 1 : 0.5}>
-				<Text size="sm" fw={500}>
-					{t("streamTokenDuration")}
-				</Text>
-				<Text size="xs" c="dimmed">
-					{t("streamTokenDurationDesc")}
-				</Text>
-				<Slider
-					disabled={!advancedAnim}
-					value={localStreamTokenMs ?? streamTokenMs}
-					onChange={setLocalStreamTokenMs}
-					onChangeEnd={(v) => {
-						setLocalStreamTokenMs(null);
-						setStreamTokenMs(v);
-					}}
-					min={0}
-					max={5000}
-					step={20}
-					label={(v) => (v === 0 ? t("blurInDurationInstant") : `${v}ms`)}
-					marks={[
-						{ value: 0, label: t("blurInDurationInstant") },
-						{ value: 320, label: "320ms" },
-						{ value: 2500, label: "2.5s" },
-						{ value: 5000, label: "5s" },
-					]}
-					mb="md"
-				/>
-			</Stack>
+			<AppearancePreferenceRow
+				preferenceKey="narrafork_stream_token_ms"
+				label={t("streamTokenDuration")}
+			>
+				<Stack gap={4} ml="xl" opacity={advancedAnim ? 1 : 0.5}>
+					<Text size="sm" fw={500}>
+						{t("streamTokenDuration")}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{t("streamTokenDurationDesc")}
+					</Text>
+					<Slider
+						disabled={!advancedAnim}
+						value={localStreamTokenMs ?? streamTokenMs}
+						onChange={setLocalStreamTokenMs}
+						onChangeEnd={(v) => {
+							setLocalStreamTokenMs(null);
+							setStreamTokenMs(v);
+						}}
+						min={0}
+						max={5000}
+						step={20}
+						label={(v) => (v === 0 ? t("blurInDurationInstant") : `${v}ms`)}
+						marks={[
+							{ value: 0, label: t("blurInDurationInstant") },
+							{ value: 320, label: "320ms" },
+							{ value: 2500, label: "2.5s" },
+							{ value: 5000, label: "5s" },
+						]}
+						mb="md"
+					/>
+				</Stack>
+			</AppearancePreferenceRow>
 			<Switch
+				preferenceKey="narrafork_narrator_centered_column"
 				label={t("narratorCenteredColumn")}
 				description={t("narratorCenteredColumnDesc")}
 				checked={centeredColumn}
 				onChange={(e) => setCenteredColumn(e.currentTarget.checked)}
 			/>
 			<Switch
+				preferenceKey="narrafork_lod_alt_gesture"
 				label={t("lodAltGesture")}
 				description={t("lodAltGestureDesc")}
 				checked={lodAltGesture}
 				onChange={(e) => setLodAltGesture(e.currentTarget.checked)}
 			/>
 			<Select
+				preferenceKey="compactAuxiliaryContent"
 				label={t("auxiliaryContentDisplay")}
 				description={t("auxiliaryContentDisplayDesc")}
 				value={userPrefs?.compactAuxiliaryContent === false ? "legacy" : "compact"}
@@ -329,6 +360,7 @@ export function AppearanceSection({
 				{t("narratorTypographyDesc")}
 			</Text>
 			<TypographyKnob
+				preferenceKey="narratorFontScalePercent"
 				label={t("narratorFontScale")}
 				description={t("narratorFontScaleDesc")}
 				value={userPrefs?.narratorFontScalePercent ?? DEFAULT_TYPOGRAPHY.fontScalePercent}
@@ -344,6 +376,7 @@ export function AppearanceSection({
 				onCommit={(v) => updateUserPref.mutate(typographyPreferencePatch({ fontScalePercent: v }))}
 			/>
 			<TypographyKnob
+				preferenceKey="narratorLetterSpacingPercent"
 				label={t("narratorLetterSpacing")}
 				description={t("narratorLetterSpacingDesc")}
 				value={userPrefs?.narratorLetterSpacingPercent ?? DEFAULT_TYPOGRAPHY.letterSpacingPercent}
@@ -361,6 +394,7 @@ export function AppearanceSection({
 				}
 			/>
 			<TypographyKnob
+				preferenceKey="narratorLineHeightV2Percent"
 				label={t("narratorLineHeight")}
 				description={t("narratorLineHeightDesc")}
 				value={userPrefs?.narratorLineHeightV2Percent ?? DEFAULT_TYPOGRAPHY.lineHeightScalePercent}
@@ -384,6 +418,7 @@ export function AppearanceSection({
 				}
 			/>
 			<TypographyKnob
+				preferenceKey="narratorParagraphScalePercent"
 				label={t("narratorParagraphScale")}
 				description={t("narratorParagraphScaleDesc")}
 				value={userPrefs?.narratorParagraphScalePercent ?? DEFAULT_TYPOGRAPHY.paragraphScalePercent}
@@ -406,6 +441,7 @@ export function AppearanceSection({
 				{t("wordWrapSubSection")}
 			</Title>
 			<Switch
+				preferenceKey="wordWrapMarkdown"
 				label={t("wordWrapMarkdown")}
 				checked={userPrefs?.wordWrapMarkdown ?? true}
 				onChange={(e) =>
@@ -415,17 +451,20 @@ export function AppearanceSection({
 				}
 			/>
 			<Switch
+				preferenceKey="wordWrapCode"
 				label={t("wordWrapCode")}
 				checked={userPrefs?.wordWrapCode ?? true}
 				onChange={(e) => updateUserPref.mutate({ wordWrapCode: e.currentTarget.checked })}
 			/>
 			<Switch
+				preferenceKey="wordWrapDiff"
 				label={t("wordWrapDiff")}
 				checked={userPrefs?.wordWrapDiff ?? true}
 				onChange={(e) => updateUserPref.mutate({ wordWrapDiff: e.currentTarget.checked })}
 			/>
 
 			<Switch
+				preferenceKey="treatAsLocalAccess"
 				label={t("treatAsLocalAccess")}
 				description={t("treatAsLocalAccessDesc")}
 				checked={userPrefs?.treatAsLocalAccess ?? false}
@@ -438,6 +477,7 @@ export function AppearanceSection({
 				{t("recentTabsSubSection")}
 			</Title>
 			<Switch
+				preferenceKey="addSubagentToRecentTabs"
 				label={t("addSubagentToRecentTabs")}
 				description={t("addSubagentToRecentTabsDesc")}
 				checked={userPrefs?.addSubagentToRecentTabs ?? true}
@@ -451,6 +491,7 @@ export function AppearanceSection({
 				{t("terminalSubSection")}
 			</Title>
 			<Select
+				preferenceKey="terminalTheme"
 				label={t("terminalTheme")}
 				data={[
 					{ value: "auto", label: t("terminalThemeAuto") },
@@ -462,37 +503,41 @@ export function AppearanceSection({
 				value={userPrefs?.terminalTheme ?? "auto"}
 				onChange={(v) => updateUserPref.mutate({ terminalTheme: v ?? "auto" })}
 			/>
-			<Stack gap={4}>
-				<Text size="sm" fw={500}>
-					{t("terminalFontSize")}
-				</Text>
-				<Group>
-					<Slider
-						value={localFontSize ?? userPrefs?.terminalFontSize ?? 14}
-						onChange={setLocalFontSize}
-						onChangeEnd={(v) => {
-							setLocalFontSize(null);
-							updateUserPref.mutate({ terminalFontSize: v });
-						}}
-						min={8}
-						max={32}
-						step={1}
-						style={{ flex: 1 }}
-						marks={[
-							{ value: 8, label: "8" },
-							{ value: 14, label: "14" },
-							{ value: 20, label: "20" },
-							{ value: 32, label: "32" },
-						]}
-					/>
-				</Group>
-			</Stack>
+			<AppearancePreferenceRow preferenceKey="terminalFontSize" label={t("terminalFontSize")}>
+				<Stack gap={4}>
+					<Text size="sm" fw={500}>
+						{t("terminalFontSize")}
+					</Text>
+					<Group>
+						<Slider
+							value={localFontSize ?? userPrefs?.terminalFontSize ?? 14}
+							onChange={setLocalFontSize}
+							onChangeEnd={(v) => {
+								setLocalFontSize(null);
+								updateUserPref.mutate({ terminalFontSize: v });
+							}}
+							min={8}
+							max={32}
+							step={1}
+							style={{ flex: 1 }}
+							marks={[
+								{ value: 8, label: "8" },
+								{ value: 14, label: "14" },
+								{ value: 20, label: "20" },
+								{ value: 32, label: "32" },
+							]}
+						/>
+					</Group>
+				</Stack>
+			</AppearancePreferenceRow>
 
 			{/* Language */}
 			<Title order={5} mt="sm">
 				{t("languageSubSection")}
 			</Title>
-			<LanguageSwitcher />
+			<AppearancePreferenceRow preferenceKey="language" label={t("languageSubSection")}>
+				<LanguageSwitcher />
+			</AppearancePreferenceRow>
 
 			{/* Input */}
 			<Title order={5} mt="sm">
@@ -505,30 +550,41 @@ export function AppearanceSection({
 				<Text size="xs" c="dimmed">
 					{t("sendModeDesc")}
 				</Text>
-				<Text size="xs" fw={500} mt={4}>
-					{t("enterKeyBehavior")}
-				</Text>
-				<SegmentedControl
-					value={userPrefs?.enterQueueMode ?? "turn"}
-					onChange={(v) => updateUserPref.mutate({ enterQueueMode: v })}
-					data={[
-						{ value: "turn", label: t("queueMode_turn") },
-						{ value: "tool", label: t("queueMode_tool") },
-						{ value: "interrupt", label: t("queueMode_interrupt") },
-					]}
-				/>
-				<Text size="xs" fw={500} mt={4}>
-					{t("ctrlEnterKeyBehavior")}
-				</Text>
-				<SegmentedControl
-					value={userPrefs?.ctrlEnterQueueMode ?? "tool"}
-					onChange={(v) => updateUserPref.mutate({ ctrlEnterQueueMode: v })}
-					data={[
-						{ value: "turn", label: t("queueMode_turn") },
-						{ value: "tool", label: t("queueMode_tool") },
-						{ value: "interrupt", label: t("queueMode_interrupt") },
-					]}
-				/>
+				<AppearancePreferenceRow preferenceKey="enterQueueMode" label={t("enterKeyBehavior")}>
+					<Stack gap={4}>
+						<Text size="xs" fw={500} mt={4}>
+							{t("enterKeyBehavior")}
+						</Text>
+						<SegmentedControl
+							value={userPrefs?.enterQueueMode ?? "turn"}
+							onChange={(v) => updateUserPref.mutate({ enterQueueMode: v })}
+							data={[
+								{ value: "turn", label: t("queueMode_turn") },
+								{ value: "tool", label: t("queueMode_tool") },
+								{ value: "interrupt", label: t("queueMode_interrupt") },
+							]}
+						/>
+					</Stack>
+				</AppearancePreferenceRow>
+				<AppearancePreferenceRow
+					preferenceKey="ctrlEnterQueueMode"
+					label={t("ctrlEnterKeyBehavior")}
+				>
+					<Stack gap={4}>
+						<Text size="xs" fw={500} mt={4}>
+							{t("ctrlEnterKeyBehavior")}
+						</Text>
+						<SegmentedControl
+							value={userPrefs?.ctrlEnterQueueMode ?? "tool"}
+							onChange={(v) => updateUserPref.mutate({ ctrlEnterQueueMode: v })}
+							data={[
+								{ value: "turn", label: t("queueMode_turn") },
+								{ value: "tool", label: t("queueMode_tool") },
+								{ value: "interrupt", label: t("queueMode_interrupt") },
+							]}
+						/>
+					</Stack>
+				</AppearancePreferenceRow>
 				<Text size="xs" c="dimmed" mt={4}>
 					{t("shiftEnterNewlineHint")}
 				</Text>
@@ -539,6 +595,7 @@ export function AppearanceSection({
 				{t("sessionSubSection")}
 			</Title>
 			<Switch
+				preferenceKey="autoLoadOlderMessages"
 				label={t("autoLoadOlderMessages")}
 				description={t("autoLoadOlderMessagesDesc")}
 				checked={userPrefs?.autoLoadOlderMessages ?? true}
@@ -549,6 +606,7 @@ export function AppearanceSection({
 				}
 			/>
 			<Switch
+				preferenceKey="replyInUserLanguage"
 				label={t("replyInUserLanguage")}
 				description={t("replyInUserLanguageDesc")}
 				checked={userPrefs?.replyInUserLanguage ?? true}
@@ -559,6 +617,7 @@ export function AppearanceSection({
 				}
 			/>
 			<Switch
+				preferenceKey="narrafork_expand_reasoning"
 				label={t("expandReasoning")}
 				description={t("expandReasoningDesc")}
 				checked={expandReasoning}
@@ -570,6 +629,7 @@ export function AppearanceSection({
 				{t("debugSubSection")}
 			</Title>
 			<Switch
+				preferenceKey="showTokenUsage"
 				label={t("showTokenUsage")}
 				description={t("showTokenUsageDesc")}
 				checked={userPrefs?.showTokenUsage ?? false}
@@ -580,6 +640,7 @@ export function AppearanceSection({
 				}
 			/>
 			<Switch
+				preferenceKey="showOutputStats"
 				label={t("showOutputStats")}
 				description={t("showOutputStatsDesc")}
 				checked={userPrefs?.showOutputStats ?? false}

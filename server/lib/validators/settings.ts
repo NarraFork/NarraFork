@@ -1,3 +1,4 @@
+import { type AppearanceValues, isAccountAppearanceValues } from "@shared/appearance-preferences";
 import { PERSISTED_NARRATOR_TOOLBAR_IDS } from "@shared/narrator-toolbar";
 import { PERSISTED_NAV_IDS } from "@shared/nav-layout";
 import { LEGACY_LINE_HEIGHT_RANGE, TYPOGRAPHY_RANGE } from "@shared/pretext-layout/typography";
@@ -130,6 +131,7 @@ export const updateUserPreferencesSchema = z.object({
 	showTokenUsage: z.boolean().optional(),
 	showOutputStats: z.boolean().optional(),
 	compactAuxiliaryContent: z.boolean().optional(),
+	appearancePreferences: z.custom<AppearanceValues>(isAccountAppearanceValues).optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
 	// Narrator transcript typography (percentages). Bounds are taken FROM the shared

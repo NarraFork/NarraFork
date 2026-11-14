@@ -454,8 +454,8 @@ export class RevertTransactionService {
 		const current = await this.selection.collect({
 			principal: run.request.principal,
 			narratorId: run.request.narratorId,
-			expectedMessageVersion: manifest.header.expectedMessageVersion,
 			selector: manifest.selection.selector,
+			historyRewrite: run.operation?.kind !== "revert",
 			signal: run.signal,
 		});
 		await worker<boolean>({ action: "compare", fixed: manifest.selection, current }, run.signal);

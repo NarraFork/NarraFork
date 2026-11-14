@@ -1,8 +1,5 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
-import { eq } from "drizzle-orm";
-
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
 // resolve the tsconfig alias, and this module is dependency-free string constants, so it adds
 // nothing but the literals to the server bundle.
@@ -11,19 +8,15 @@ import {
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
 import { urlHost } from "../shared/server-host";
-import {
-	declaredBodyExceeds,
-	isStorageImportUpload,
-	MAX_IMPORT_BYTES,
-	MAX_ORDINARY_BODY_BYTES,
-} from "../shared/storage-transfer";
-import { isStreamingAttachmentUpload } from "../shared/text-file-types";
+import { MAX_IMPORT_BYTES } from "../shared/storage-transfer";
 import { app } from "./app";
+import { createServerRequestDispatcher } from "./http-dispatcher";
+import { createServerRequestLifecycle } from "./http-request-lifecycle";
+import { attachRemoteAccessRuntime } from "./services/remote-access-runtime";
 import "./db"; // Ensure DB is initialized early
 import {
 	activeDatabaseBackend,
 	closePostgresRuntime,
-	db,
 	markDatabaseCleanShutdown,
 	postgresRuntime,
 	releaseDatabaseInstanceLockOnly,
@@ -33,15 +26,14 @@ import {
 	cancelBackgroundIntegrityCheck,
 	scheduleBackgroundIntegrityCheck,
 } from "./db/integrity-check";
-import { users } from "./db/schema";
 import { registerExternalProviderResolver } from "./lib/agent/provider";
-import { verifyToken } from "./lib/auth";
-import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
+import { claimBrowserShutdownOwnership } from "./lib/browser/pool";
 import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
+import { hotOnce, hotSafe } from "./lib/hot-safe";
 import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
 import {
@@ -56,7 +48,6 @@ import { prepareMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
-import { validateAccessTokenById } from "./lib/oauth-provider";
 import { openFrontendOnce } from "./lib/open-frontend";
 import { IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
@@ -72,11 +63,10 @@ import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
-import { buildHealthPayload, createStartupReadinessGate } from "./lib/startup-readiness";
+import { createStartupReadinessGate } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
 import { noPortAvailable, portUnavailable } from "./lib/startup-status/startup-problems";
 import { reissueBuiltinTlsOnStartup } from "./lib/tls";
-import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
 import { terminateWindowsChildren } from "./lib/windows-child-job";
@@ -96,6 +86,7 @@ import {
 	composePostgresStores,
 } from "./services/postgres-composition";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
+import { TOKEN_RECALCULATION_BATCH_TIMEOUT_MS } from "./services/token-recalculation";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -132,20 +123,9 @@ import { materializeLegacyDelegations } from "./services/legacy-delegation-mater
 import { setMigrationPgHandle } from "./services/migration-db";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
-	consumeOAuthWsTicket,
-	EXTERNAL_NARRATORS_WS_CHANNEL,
-	getExternalWebSocketRolloutSettings,
-	isExternalWebSocketOriginAllowed,
-} from "./services/oauth-ws-ticket-service";
-import {
 	migrateReservedAutoPrefixOnStartup,
 	recoverProviderPrefixMigrationOnStartup,
 } from "./services/provider-prefix-migration-service";
-import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
-import {
-	type VerifiedPublicShare,
-	verifyPublicShare,
-} from "./services/public-narrator-share-service";
 import { beginRecoveryDiscovery, finishRecoveryDiscovery } from "./services/recovery-handoff";
 import {
 	automaticResumeEnabled,
@@ -155,19 +135,15 @@ import {
 	restoreOrdinaryRestartRecovery,
 } from "./services/restart-recovery-service";
 import { terminalService } from "./services/terminal-service";
+import { markUpdateRestarting } from "./services/update-coordinator";
 import {
 	getPlannedUpdateStartupProtection,
 	restoreNarratorsAfterPlannedUpdate,
 } from "./services/update-recovery-service";
-import { canAcceptExternalNarratorConnection } from "./websocket/oauth-connection-registry";
 import {
 	closeAllConnections,
-	narratorWebSocketBackendRefusal,
-	resolveExternalNarratorWSData,
-	resolveWSData,
 	startHeartbeat,
 	stopHeartbeat,
-	type WSData,
 	waitForWebSocketActivityDrain,
 	wsHandlers,
 } from "./websocket/ws-handler";
@@ -319,13 +295,15 @@ import { refreshWindowsPath } from "./lib/win-env";
 	}
 }
 
-// Catch unhandled errors to prevent silent crashes
-process.on("uncaughtException", (err) => {
-	logger.error("Uncaught exception", { error: String(err), stack: err?.stack });
-});
-process.on("unhandledRejection", (reason) => {
-	logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
-});
+// Catch unhandled errors once, including across --hot evaluations.
+if (hotOnce("narrafork.main.errorHooks")) {
+	process.on("uncaughtException", (err) => {
+		logger.error("Uncaught exception", { error: String(err), stack: err?.stack });
+	});
+	process.on("unhandledRejection", (reason) => {
+		logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
+	});
+}
 
 // CLI flags: --port=XXXX --host=XXXX
 const cliPort = process.argv.find((a) => a.startsWith("--port="))?.split("=")[1];
@@ -669,44 +647,15 @@ function getProtocol(): "https" | "http" {
 	return _server.url.protocol === "https:" ? "https" : "http";
 }
 
-async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAuth | null> {
-	if (!settings.vnet?.enabled) return null;
-	const bearer = req.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
-	const queryToken = url.searchParams.get("token") ?? undefined;
-	const token = bearer || queryToken;
-	const relayToken = settings.vnet.relayToken?.trim();
-
-	if (token && relayToken && token === relayToken) {
-		return { kind: "relay-token" };
-	}
-	if (token) {
-		try {
-			const payload = await verifyToken(token);
-			return { kind: "session", userId: payload.sub };
-		} catch {
-			// Fall through to anonymous only when explicitly enabled.
-		}
-	}
-	if (settings.vnet.allowAnonymousRelay) {
-		return { kind: "anonymous" };
-	}
-	return null;
-}
-
-const httpRequestContext = new AsyncLocalStorage<number>();
-const activeHttpRequests = new Map<number, Promise<Response | undefined>>();
-let nextHttpRequestId = 0;
-let acceptingHttpRequests = true;
-
-async function waitForHttpRequestDrain(excludedRequestId?: number): Promise<void> {
-	while (true) {
-		const pending = [...activeHttpRequests.entries()]
-			.filter(([requestId]) => requestId !== excludedRequestId)
-			.map(([, request]) => request);
-		if (pending.length === 0) return;
-		await Promise.allSettled(pending);
-	}
-}
+const httpLifecycle = createServerRequestLifecycle();
+const httpRequestContext = httpLifecycle.context;
+const waitForHttpRequestDrain = httpLifecycle.drain;
+const fetchRequest = createServerRequestDispatcher({
+	app,
+	lifecycle: httpLifecycle,
+	startupReadiness,
+	activeDatabaseBackend,
+});
 
 /**
  * Close the listener without awaiting `Bun.Server.stop()`'s promise.
@@ -740,43 +689,6 @@ function stopHttpListener(): void {
 
 let boundTlsConfig = settings.server.tls;
 
-const BODYLESS_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-
-/**
- * `maxRequestBodySize` 是全局的，导入预览把它抬到 4 GB。
- * 其它带正文的请求仍按 128 MB 拒绝：声明的 Content-Length 直接 413，
- * 缺省或偏小的长度则在读流时计数，避免未声明长度的请求把 4 GB 吃满。
- * WebSocket 升级在调用这里之前已经返回。
- */
-function limitOrdinaryRequestBody(req: Request, url: URL): Request | Response {
-	if (isStorageImportUpload(req.method, url.pathname)) return req;
-	// 附件流式上传逐块落盘，并在 attachment-staging 里按实际字节数执行 1 GiB 上限，
-	// 在这里按 128 MB 截断会让大附件永远传不上去。
-	if (isStreamingAttachmentUpload(req.method, url.pathname)) return req;
-	if (BODYLESS_METHODS.has(req.method.toUpperCase())) return req;
-	if (declaredBodyExceeds(req.headers.get("content-length"), MAX_ORDINARY_BODY_BYTES)) {
-		return new Response("Request body too large", {
-			status: 413,
-			headers: { "content-type": "text/plain; charset=utf-8" },
-		});
-	}
-	if (!req.body) return req;
-	let seen = 0;
-	const limited = req.body.pipeThrough(
-		new TransformStream<Uint8Array, Uint8Array>({
-			transform(chunk, controller) {
-				seen += chunk.byteLength;
-				if (seen > MAX_ORDINARY_BODY_BYTES) {
-					controller.error(new Error("Request body too large"));
-					return;
-				}
-				controller.enqueue(chunk);
-			},
-		}),
-	);
-	return new Request(req, { body: limited, duplex: "half" } as RequestInit);
-}
-
 function startServer(
 	listenPort: number,
 	tlsCfg: typeof settings.server.tls,
@@ -792,244 +704,6 @@ function startServer(
 				}
 			: undefined;
 
-	const fetchRequest = (
-		req: Request,
-		server: Pick<Bun.Server<WSData>, "requestIP" | "upgrade">,
-	) => {
-		if (!acceptingHttpRequests) {
-			return new Response("Server is shutting down", {
-				status: 503,
-				headers: { "Retry-After": "1" },
-			});
-		}
-		const requestId = ++nextHttpRequestId;
-		const execution = httpRequestContext.run(requestId, async () => {
-			const url = new URL(req.url);
-
-			// Keep liveness available while exposing whether continuation recovery is still
-			// running or has failed. Recovery is considered admitted once every continuation
-			// has been protected and mounted in the background; terminal Agent/Await and user
-			// permission waits must never hold this barrier.
-			if (url.pathname === "/api/health") {
-				const healthResponse = await app.fetch(req);
-				const healthPayload = (await healthResponse.json().catch(() => ({}))) as Record<
-					string,
-					unknown
-				>;
-				const headers = new Headers(healthResponse.headers);
-				headers.delete("content-length");
-				headers.set("content-type", "application/json; charset=UTF-8");
-				return new Response(
-					JSON.stringify({
-						...buildHealthPayload(healthPayload, startupReadiness.state),
-						// Which database backend this process wired at startup. A monitor that
-						// watches a PostgreSQL deployment must be able to tell it actually came
-						// up on PostgreSQL — a silent fallback would report a healthy SQLite.
-						database: { backend: activeDatabaseBackend },
-					}),
-					{
-						status: healthResponse.status,
-						headers,
-					},
-				);
-			}
-
-			const narratorWsRefusal = narratorWebSocketBackendRefusal(
-				url.pathname,
-				activeDatabaseBackend,
-			);
-			if (narratorWsRefusal) return narratorWsRefusal;
-
-			// Wait for recovery to reach a terminal outcome so restored narrators observe a
-			// consistent state. A recovery failure is scoped to its narrator and never
-			// closes the HTTP surface: the UI is what repairs that narrator's state.
-			await startupReadiness.barrier;
-
-			if (url.pathname === "/ws/external/v1/narrators") {
-				const rollout = getExternalWebSocketRolloutSettings();
-				const origin = req.headers.get("origin");
-				if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
-					return new Response("WebSocket Origin is not allowed", { status: 403 });
-				}
-				if (!canAcceptExternalNarratorConnection()) {
-					return new Response("External narrator WebSocket capacity reached", { status: 503 });
-				}
-				const ticket = url.searchParams.get("ticket");
-				if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
-				const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
-				if (!consumed) return new Response("Invalid or expired WebSocket ticket", { status: 401 });
-				const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
-				if (
-					!live ||
-					live.userId !== consumed.auth.user.sub ||
-					live.clientId !== consumed.auth.oauth.clientId ||
-					live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
-					live.grantId !== consumed.auth.oauth.grantId ||
-					live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
-					!live.scopes.includes("narrator.read") ||
-					!live.scopes.includes("event.subscribe")
-				) {
-					return new Response("OAuth authorization is no longer valid", { status: 401 });
-				}
-				const upgraded = server.upgrade(req, {
-					data: resolveExternalNarratorWSData(consumed.auth),
-				});
-				if (upgraded) return undefined;
-				return new Response("WebSocket upgrade failed", { status: 400 });
-			}
-
-			if (url.pathname === "/ws/vnet") {
-				const auth = await resolveVNetRelayAuth(req, url);
-				if (!auth) {
-					return new Response("VNet relay authentication required", { status: 401 });
-				}
-				const wsData = resolveWSData(url, undefined, auth);
-				if (!wsData) {
-					return new Response("Unknown WebSocket endpoint", { status: 404 });
-				}
-				const upgraded = server.upgrade(req, { data: wsData });
-				if (upgraded) return undefined;
-				return new Response("WebSocket upgrade failed", { status: 400 });
-			}
-
-			// Remote executor devices authenticate via the hello frame (device token),
-			// not a JWT, so accept the upgrade here and let the handshake verify.
-			if (url.pathname === "/ws/device") {
-				const wsData = resolveWSData(url);
-				if (!wsData) {
-					return new Response("Unknown WebSocket endpoint", { status: 404 });
-				}
-				const upgraded = server.upgrade(req, { data: wsData });
-				if (upgraded) return undefined;
-				return new Response("WebSocket upgrade failed", { status: 400 });
-			}
-
-			// WebSocket upgrade for /ws/narrator and /ws/terminal
-			if (url.pathname.startsWith("/ws")) {
-				// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
-				// of a session token. Verified once at upgrade, scoped at subscribe time
-				// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
-				const shareId = url.searchParams.get("share");
-				if (shareId && url.pathname === "/ws/narrator") {
-					const shareToken = url.searchParams.get("token");
-					if (!shareToken) {
-						return new Response("Authentication required", { status: 401 });
-					}
-					let share: VerifiedPublicShare;
-					try {
-						share = verifyPublicShare(shareId, `Share ${shareToken}`);
-					} catch {
-						return new Response("Share link unavailable", { status: 401 });
-					}
-					const wsData = resolveWSData(url, undefined, undefined, undefined, share);
-					if (!wsData) {
-						return new Response("Unknown WebSocket endpoint", { status: 404 });
-					}
-					const ip = resolveClientIp({
-						peerIp: server.requestIP(req)?.address,
-						xForwardedFor: req.headers.get("x-forwarded-for"),
-						xRealIp: req.headers.get("x-real-ip"),
-						trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
-					});
-					if (wsData.channel !== "narrator") {
-						return new Response("Unknown WebSocket endpoint", { status: 404 });
-					}
-					const upgraded = publicShareConnectionBudget.upgrade(share.shareId, ip, (lease) => {
-						wsData.publicShareConnectionLease = lease;
-						return server.upgrade(req, { data: wsData });
-					});
-					if (upgraded === null) {
-						return new Response("Too many sharing connections", {
-							status: 429,
-							headers: { "Retry-After": "15" },
-						});
-					}
-					if (upgraded) return undefined;
-					return new Response("WebSocket upgrade failed", { status: 400 });
-				}
-
-				// Verify the session token from the query param
-				const token = url.searchParams.get("token");
-				if (!token) {
-					return new Response("Authentication required", { status: 401 });
-				}
-				let payload: Awaited<ReturnType<typeof verifyToken>>;
-				try {
-					payload = await verifyToken(token);
-				} catch {
-					return new Response("Invalid or expired token", { status: 401 });
-				}
-
-				// Look up user info for presence tracking
-				const user = await db.query.users.findFirst({
-					where: eq(users.id, payload.sub),
-					columns: {
-						id: true,
-						username: true,
-						avatarColor: true,
-						avatarImageId: true,
-						// Read live, so a demotion applies to the next socket. The narrator
-						// subscribe path uses it for the admin short-circuit.
-						role: true,
-					},
-				});
-				// `verifyToken` already rejected revoked and expired sessions; a user row that
-				// vanished since still fails the upgrade.
-				if (!user) {
-					return new Response("Invalid or expired token", { status: 401 });
-				}
-				const userInfo = user
-					? {
-							userId: user.id,
-							username: user.username,
-							avatarColor: user.avatarColor,
-							avatarImageId: user.avatarImageId,
-							role: user.role,
-						}
-					: undefined;
-
-				// Remember the session so the socket can be re-checked when it lapses or
-				// when the user's authorization changes (logout, revocation, role).
-				const wsData = resolveWSData(url, userInfo, undefined, {
-					sessionExp: payload.exp,
-					sessionId: payload.sid,
-					sessionUserId: payload.sub,
-				});
-				if (!wsData) {
-					return new Response("Unknown WebSocket endpoint", { status: 404 });
-				}
-
-				const upgraded = server.upgrade(req, { data: wsData });
-				if (upgraded) return undefined;
-				return new Response("WebSocket upgrade failed", { status: 400 });
-			}
-
-			// Everything else goes to Hono. Resolve the client IP and whether the immediate
-			// socket peer is trusted at the Bun boundary, so routes never trust forwarding
-			// headers solely because a caller supplied them.
-			const peerIp = server.requestIP(req)?.address;
-			const trustedProxyCidrs = settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"];
-			const clientIp = resolveClientIp({
-				peerIp,
-				xForwardedFor: req.headers.get("x-forwarded-for"),
-				xRealIp: req.headers.get("x-real-ip"),
-				trustedProxyCidrs,
-			});
-			const limited = limitOrdinaryRequestBody(req, url);
-			if (limited instanceof Response) return limited;
-			return app.fetch(limited, {
-				clientIp,
-				peerIp,
-				trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
-			});
-		});
-		activeHttpRequests.set(requestId, execution);
-		void execution.then(
-			() => activeHttpRequests.delete(requestId),
-			() => activeHttpRequests.delete(requestId),
-		);
-		return execution;
-	};
 	const group = startManagerListenerGroup({
 		bindPublic: () => {
 			const bind = (host: string) => ({
@@ -1177,7 +851,7 @@ const restartHttpListener = createManagerRebindCoordinator({
 	// Resolve before detaching; stale DNS completions must never overwrite a newer rebind.
 	resolveHost: (host) => resolveManagerListenHost(resolveListenHost(host), readManagerToken()),
 	getCurrentAddress: runtimeAddress,
-	isAccepting: () => acceptingHttpRequests,
+	isAccepting: () => httpLifecycle.accepting,
 	rebind: (newHost, newPort, resolvedHost, options) => {
 		const oldHost = currentHost;
 		const oldConfiguredHost = configuredHost;
@@ -1250,6 +924,12 @@ startServerAddressWatcher({
 // 本进程自己的保存同样会触发文件事件，内容与上次写入一致时无需重载。
 startSettingsFileWatcher(() => {
 	reloadSettingsIfChanged();
+});
+
+const stopRemoteAccess = attachRemoteAccessRuntime({
+	dispatch: fetchRequest,
+	lifecycle: httpLifecycle,
+	readiness: startupReadiness,
 });
 
 // Print welcome banner to stdout & auto-open browser
@@ -1629,7 +1309,7 @@ void startupReadiness.barrier.then((recovery) => {
 });
 
 // Outline pages edited live when the previous process ended: commit what their logs hold.
-void startupReadiness.barrier.then((recovery) => {
+void startupReadiness.barrier.then(() => {
 	import("./services/outline/live/registry")
 		.then(({ startLiveReplay }) => startLiveReplay())
 		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
@@ -1662,6 +1342,11 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/spec-import/triggers")
 		.then(({ startSpecImportJob }) => startSpecImportJob())
 		.catch((err) => logger.warn("Dynamic Spec import job failed to start", { error: String(err) }));
+	// What the old Spec panel may have swallowed is looked for in the background (read-only; a
+	// pass a while after start, then at intervals) and shown to people, never repaired.
+	import("./services/outline/spec-import/loss-scan")
+		.then(({ startSpecLossScanJob }) => startSpecLossScanJob())
+		.catch((err) => logger.warn("Swallowed-content scan failed to start", { error: String(err) }));
 	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
 	import("./services/outline/plugin-task-events")
 		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
@@ -1745,8 +1430,13 @@ type GracefulShutdownResult = {
 	durationMs: number;
 };
 
-let shutdownPromise: Promise<GracefulShutdownResult> | null = null;
-let killWindowsProcessTreeOnExit = true;
+// Keep a single shutdown owner across --hot evaluations; hooks below delegate to the latest main.
+const shutdownState = hotSafe<{
+	promise: Promise<GracefulShutdownResult> | null;
+	killWindowsProcessTreeOnExit: boolean;
+	onSignal?: () => void;
+	onExit?: () => void;
+}>("narrafork.mainShutdown", () => ({ promise: null, killWindowsProcessTreeOnExit: true }));
 
 /**
  * Run a shutdown teardown step with a hard timeout so one hanging await can't stall the entire
@@ -1769,14 +1459,22 @@ async function shutdownStep(
 			Promise.resolve()
 				.then(fn)
 				.then(() => "ok" as const)
-				.catch((err) => {
-					logger.warn(`Shutdown step failed: ${label}`, { error: String(err) });
+				.catch(() => {
+					try {
+						logger.warn("Shutdown step failed", { step: label, outcome: "failed" });
+					} catch {
+						// Diagnostic sinks must not prevent recording a degraded shutdown.
+					}
 					return "failed" as const;
 				}),
 			timeout,
 		]);
 		if (result === "timeout") {
-			logger.warn(`Shutdown step timed out: ${label}`, { timeoutMs });
+			try {
+				logger.warn("Shutdown step timed out", { step: label, outcome: "timeout", timeoutMs });
+			} catch {
+				// Continue to record the timeout even when diagnostics fail.
+			}
 		}
 		tracker.recordStep(label, result);
 		return result;
@@ -1788,14 +1486,18 @@ async function shutdownStep(
 async function performGracefulShutdown(
 	options: GracefulShutdownOptions,
 ): Promise<GracefulShutdownResult> {
-	if (shutdownPromise) return shutdownPromise;
+	if (shutdownState.promise) return shutdownState.promise;
 	const startedAt = Date.now();
 	if (options.skipWindowsProcessTreeKill) {
-		killWindowsProcessTreeOnExit = false;
+		shutdownState.killWindowsProcessTreeOnExit = false;
 	}
 
-	shutdownPromise = (async () => {
-		logger.info("Graceful shutdown started", { reason: options.reason });
+	shutdownState.promise = (async () => {
+		try {
+			logger.info("Graceful shutdown started", { reason: options.reason });
+		} catch {
+			// Observational sinks cannot prevent producers from stopping.
+		}
 		backgroundOccupancyInitializer.stop();
 		stopHeartbeat();
 
@@ -1814,9 +1516,22 @@ async function performGracefulShutdown(
 		// before its response is flushed, so it is safe to close every connection here. The two drain
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
-		acceptingHttpRequests = false;
+		httpLifecycle.stopAccepting();
+		await shutdownStep(tracker, "remoteAccess.stop", stopRemoteAccess, 5000);
+		httpLifecycle.abortAll();
+		let preserveAgentRuns = false;
 		if (options.reason === "signal") {
-			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
+			const prepared = await shutdownStep(
+				tracker,
+				"restartRecovery.prepare",
+				prepareSignalRestartRecovery,
+				5_000,
+			);
+			if (prepared === "ok") {
+				preserveAgentRuns = true;
+				// Worker teardown must not turn checkpointed runs into task failures.
+				markUpdateRestarting();
+			}
 		}
 		const shutdownRequestId = httpRequestContext.getStore();
 		// Outline pages being edited live: log what arrived and acknowledge it while the sockets
@@ -1856,6 +1571,16 @@ async function performGracefulShutdown(
 			tracker.markDrainComplete();
 		}
 
+		// Sandboxed host-tool callers must stop before their outline/editor/compute dependencies.
+		await shutdownStep(
+			tracker,
+			"programmaticServices.close",
+			() =>
+				import("./lib/agent/programmatic/service").then((owner) =>
+					owner.closeProgrammaticServices(),
+				),
+			155_000,
+		);
 		// Outline pages being edited live: commit their text, end the sessions.
 		await shutdownStep(
 			tracker,
@@ -1874,8 +1599,10 @@ async function performGracefulShutdown(
 				const inProcess = await import("./services/outline/in-process");
 				const digests = await import("./services/outline/digest-job");
 				const specImport = await import("./services/outline/spec-import/triggers");
+				const specLoss = await import("./services/outline/spec-import/loss-scan");
 				await Promise.all([
 					specImport.stopSpecImportJob(),
+					specLoss.stopSpecLossScanJob(),
 					inProcess.stopOutlineInProcessRebuild(),
 					tasks.stopOutlineTaskLeaseJob(),
 					digests.stopOutlineDigestJob(),
@@ -1883,8 +1610,25 @@ async function performGracefulShutdown(
 			},
 			5_000,
 		);
+		await shutdownStep(
+			tracker,
+			"outlineTextWorkers.close",
+			() =>
+				import("./services/outline/edit-text-runner").then((owner) => owner.closeEditTextWorkers()),
+			35_000,
+		);
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
+		// Finish an already-committing token batch through its original owner before closing helpers.
+		await shutdownStep(
+			tracker,
+			"tokenWorkers.close",
+			() =>
+				import("./services/token-recalculation-worker-client").then((owner) =>
+					owner.closeTokenRecalculationWorkers(),
+				),
+			TOKEN_RECALCULATION_BATCH_TIMEOUT_MS + 5_000,
+		);
 		await shutdownStep(tracker, "prefixSnapshots.stop", stopPrefixSnapshotMaintenance);
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
@@ -1893,35 +1637,42 @@ async function performGracefulShutdown(
 		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
 		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
-			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
+			await shutdownStep(tracker, "killAllBashProcesses", () =>
+				killAllBashProcesses({ preserveAgents: preserveAgentRuns }),
+			);
 		}
-		// The background integrity probe is a separate PROCESS holding a read-only handle on the
-		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
-		// replacement process may swap the database file (startup recovery) or rewrite it (admin
-		// VACUUM), and its verdict has no parent to report to.
-		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
-		// Read workers hold their own read-only SQLite connections; terminate them before the clean
-		// marker is written so no thread is still touching the database afterwards.
-		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
-		await shutdownStep(tracker, "prefixSnapshots.close", closePrefixSnapshotStore);
-		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
-		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
-		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
-		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
 		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
-		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
+		await shutdownStep(tracker, "pluginPlatformProducers.stop", () =>
+			import("./services/plugin-platform-services").then((owner) =>
+				owner.stopPluginPlatformProducers(),
+			),
+		);
+		// A pending startup can use its original 90s phases before drain/exit/tree cleanup.
+		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown(), 125_000);
 		unregisterExternalProviderResolver();
 		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
 		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
 		// pool into preserve-on-close mode so browserPool.close disconnects (keeps Chrome alive)
 		// for recovery. A normal shutdown skips this and closes the browser as usual.
 		if (preservesRecoveryOnShutdown(options.reason)) {
-			await shutdownStep(tracker, "browserSessions.persistForUpdate", () =>
-				import("./services/browser-session-recovery").then(({ persistBrowserSessionsForUpdate }) =>
-					persistBrowserSessionsForUpdate(),
-				),
+			await shutdownStep(
+				tracker,
+				"browserSessions.persistForUpdate",
+				() =>
+					import("./services/browser-session-recovery").then(
+						({ persistBrowserSessionsForUpdate }) => persistBrowserSessionsForUpdate(),
+					),
+				35_000,
 			);
 		}
+		// Finalize/cleanup/reply grace and real native exit precede Chrome close or preserve detach.
+		await shutdownStep(
+			tracker,
+			"browserMemoryWorkers.close",
+			() =>
+				import("./lib/browser/memory-job").then((owner) => owner.closeMemoryDiagnosticWorkers()),
+			35_000,
+		);
 		// Close browser pool if it was started. When preserve mode was set above, this disconnects
 		// from Chrome (leaving it running for the replacement process) rather than closing it.
 		await shutdownStep(tracker, "browserPool.close", () =>
@@ -1934,6 +1685,121 @@ async function performGracefulShutdown(
 				clearCodexResponsesWebSocketSessions(),
 			),
 		);
+		// Keep the existing 30s IO/ACK phases and still allow actual exit to be observed.
+		await shutdownStep(
+			tracker,
+			"editorDocuments.close",
+			() =>
+				import("./services/editor-document-runtime").then((owner) =>
+					owner.closeEditorDocumentService(),
+				),
+			70_000,
+		);
+		await shutdownStep(tracker, "computeWorkers.close", async () => {
+			const results = await Promise.allSettled([
+				import("./services/revert-transaction-worker").then((owner) =>
+					owner.closeRevertManifestWorkers(),
+				),
+				import("./services/revert-selection-service").then((owner) =>
+					owner.closeRevertBodyWorkers(),
+				),
+				import("./services/revert-history-commit").then((owner) =>
+					owner.closeRevertRewriteWorkers(),
+				),
+				import("./lib/share-preview-html").then((owner) => owner.closeSharePreviewHtmlWorkers()),
+				import("./lib/agent/request-json").then((owner) => owner.closeRequestJsonWorkers()),
+				import("./services/gen-ui/compiler").then((owner) => owner.closeGenUiCompilerWorkers()),
+				import("./lib/agent/execution/local-backend").then((owner) =>
+					owner.closeLocalGlobWorkers(),
+				),
+				import("./lib/agent/image-generation-response").then((owner) =>
+					owner.closeImageGenerationResponseWorkers(),
+				),
+			]);
+			const failures = results.flatMap((result) =>
+				result.status === "rejected" ? [result.reason] : [],
+			);
+			if (failures.length) throw new AggregateError(failures, "Compute workers did not all close");
+		});
+		await shutdownStep(
+			tracker,
+			"gitWorkers.close",
+			async () => {
+				const results = await Promise.allSettled([
+					import("./services/git-current-baseline").then((owner) =>
+						owner.closeGitCurrentBaselineWorkers(),
+					),
+					import("./services/git-line-stats").then((owner) => owner.closeGitLineStatsWorkers()),
+				]);
+				const failures = results.flatMap((result) =>
+					result.status === "rejected" ? [result.reason] : [],
+				);
+				if (failures.length)
+					throw new AggregateError(failures, "Git worker helpers did not all close");
+			},
+			35_000,
+		);
+		// Preserve the existing 65s archive ACK and subsequent 120s download lease, plus cleanup.
+		await shutdownStep(
+			tracker,
+			"requestRecorderWorkers.close",
+			() => import("./lib/request-recorder").then((owner) => owner.closeRequestRecorderWorkers()),
+			200_000,
+		);
+		await shutdownStep(tracker, "modelHistoryWorkers.close", () =>
+			import("./services/agent-runtime/model-history-source").then((owner) =>
+				owner.closeModelHistoryWorkers(),
+			),
+		);
+		await shutdownStep(
+			tracker,
+			"toolInputHistoryWorkers.close",
+			() =>
+				import("./services/tool-input-stream-source").then((owner) =>
+					owner.closeToolInputHistoricalWorkers(),
+				),
+			15_000,
+		);
+		await shutdownStep(tracker, "fsScanWorkers.close", () =>
+			import("./lib/fs-scan-worker/client").then((owner) => owner.closeFsScanWorkers()),
+		);
+		// The background integrity probe is a separate PROCESS holding a read-only handle on the
+		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
+		// replacement process may swap the database file (startup recovery) or rewrite it (admin
+		// VACUUM), and its verdict has no parent to report to.
+		await shutdownStep(
+			tracker,
+			"maintenanceWorkers.close",
+			async () => {
+				const results = await Promise.allSettled([
+					import("./db/snapshot-build").then((owner) => owner.closeSnapshotBuilds()),
+					import("./services/file-change-physical-audit").then((owner) =>
+						owner.closeFileChangePhysicalAudits(),
+					),
+				]);
+				const failures = results.flatMap((result) =>
+					result.status === "rejected" ? [result.reason] : [],
+				);
+				if (failures.length)
+					throw new AggregateError(failures, "Maintenance workers did not all close");
+			},
+			35_000,
+		);
+		await shutdownStep(tracker, "integrityProbe.cancel", () =>
+			cancelBackgroundIntegrityCheck({ permanent: true }),
+		);
+		// Read workers hold their own read-only SQLite connections; terminate them before the clean
+		// marker is written so no thread is still touching the database afterwards.
+		await shutdownStep(tracker, "dbWorkerPool.shutdown", () =>
+			shutdownDbWorkerPool({ permanent: true }),
+		);
+		await shutdownStep(tracker, "prefixSnapshots.close", () =>
+			closePrefixSnapshotStore({ permanent: true }),
+		);
+		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
+		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
+		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
+		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
 		if (!options.skipWindowsProcessTreeKill) {
 			killOwnWindowsChildProcesses();
 		}
@@ -1944,10 +1810,14 @@ async function performGracefulShutdown(
 		const summary = tracker.summary();
 		const cleanMarked = summary.clean ? markDatabaseCleanShutdown() : false;
 		if (!summary.clean) {
-			logger.warn("Graceful shutdown degraded — releasing lock without clean marker", {
-				drainComplete: summary.drainComplete,
-				degradedSteps: summary.degradedSteps,
-			});
+			try {
+				logger.warn("Graceful shutdown degraded — releasing lock without clean marker", {
+					drainComplete: summary.drainComplete,
+					degradedStepCount: summary.degradedSteps.length,
+				});
+			} catch {
+				// Diagnostic failure cannot suppress the unclean lock-release path.
+			}
 			releaseDatabaseInstanceLockOnly();
 		}
 
@@ -1957,18 +1827,26 @@ async function performGracefulShutdown(
 			pid: process.pid,
 			durationMs: Date.now() - startedAt,
 		};
-		logger.info("Graceful shutdown completed", { ...result, cleanMarked });
+		try {
+			logger.info("Graceful shutdown completed", { ...result, cleanMarked });
+		} catch {
+			// Cleanup has completed; keep its result even if diagnostics are unavailable.
+		}
 		return result;
 	})();
 
-	return shutdownPromise;
+	return shutdownState.promise;
 }
 
-registerGracefulShutdownHandler(async (request) => {
-	logger.info("Replacement server requested graceful shutdown", {
-		replacementPid: request.pid,
-		replacementVersion: request.version,
-	});
+registerGracefulShutdownHandler(async () => {
+	try {
+		logger.info("Replacement server requested graceful shutdown", {
+			phase: "replacement",
+			outcome: "requested",
+		});
+	} catch {
+		// A diagnostic sink cannot prevent the registered shutdown sequence.
+	}
 	const result = await performGracefulShutdown({
 		reason: "replacement_started",
 		skipWindowsProcessTreeKill: true,
@@ -1987,7 +1865,11 @@ registerGracefulShutdownHandler(async (request) => {
  * processes and browser sessions for the next manually started server.
  */
 registerOperatorShutdownHandler(async ({ reason }) => {
-	logger.info("Administrator requested shutdown", { reason });
+	try {
+		logger.info("Administrator requested shutdown", { phase: "operator", outcome: "requested" });
+	} catch {
+		// Operators must still reach cleanup when diagnostics are unavailable.
+	}
 	const preserveForRecovery = preservesRecoveryOnShutdown(reason);
 	const result = await performGracefulShutdown({
 		reason,
@@ -2009,8 +1891,6 @@ const safeShutdown = () => {
 		.then(() => process.exit(0))
 		.catch(() => process.exit(1));
 };
-process.on("SIGINT", safeShutdown);
-process.on("SIGTERM", safeShutdown);
 // SIGHUP fires on some Windows terminal emulators when the console window is closed, and Bun
 // may also surface Windows CTRL_CLOSE / CTRL_SHUTDOWN / CTRL_LOGOFF events as SIGHUP. Whether
 // Bun actually delivers these console-control events to JS is runtime-dependent and unverified.
@@ -2023,22 +1903,29 @@ process.on("SIGTERM", safeShutdown);
 // it cannot catch TerminateProcess either, adds FFI-callback risk at a fragile exit point, and
 // the codebase has no JSCallback precedent — so we intentionally do not use it. The startup
 // fallback (quick_check + conditional FTS rebuild) is what protects the unclean cases.
-process.on("SIGHUP", safeShutdown);
+shutdownState.onSignal = safeShutdown;
+if (hotOnce("narrafork.mainShutdown.signals")) {
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		process.on(signal, () => shutdownState.onSignal?.());
+	}
+}
+// Only the registered main sequence may decide when preserve metadata and Chrome are closed.
+// Standalone browser scripts retain their own signal cleanup until this synchronous claim.
+claimBrowserShutdownOwnership();
 // On Windows, closing the console window may not deliver SIGINT/SIGTERM.
 // "exit" fires when the event loop drains or process.exit() is called elsewhere.
 // NOTE: "exit" handlers MUST be synchronous — async work is ignored.
-process.on("exit", () => {
+shutdownState.onExit = () => {
 	try {
 		_server?.stop(true);
 	} catch {
 		// best effort
 	}
-	// On Windows, child processes (terminals, agent shells, MCP servers) may
-	// outlive the parent even after _server.stop(). Trace and kill our own live
-	// descendants while the parent PID is still meaningful, instead of guessing
-	// from stale/ghost PIDs on the next startup. During update handoff, skip this
-	// so the newly spawned replacement process is not killed as part of the old tree.
-	if (IS_WINDOWS && killWindowsProcessTreeOnExit) {
+	// The current main owns the current listener/process tree; preserve handoff intent across HMR.
+	if (IS_WINDOWS && shutdownState.killWindowsProcessTreeOnExit) {
 		killOwnWindowsChildProcesses();
 	}
-});
+};
+if (hotOnce("narrafork.mainShutdown.exit")) {
+	process.on("exit", () => shutdownState.onExit?.());
+}

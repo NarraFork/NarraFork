@@ -9,10 +9,11 @@ import type {
 	ToolEditPreviewSide,
 	ToolEditPreviewUnavailableReason,
 } from "@shared/tool-edit-preview";
-import { type AnyColumn, and, eq, sql } from "drizzle-orm";
+import { type AnyColumn, and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorToolCalls, worktreeTreeSnapshots } from "../db/schema";
 import { logger } from "../lib/logger";
+import { normalizePathForComparison } from "../lib/platform-path";
 import { FileChangeBlobStore, FileChangeBlobStoreError } from "./file-change-blob-store";
 import {
 	type FileChangeEffectRecord,
@@ -21,6 +22,7 @@ import {
 	type FileChangeScopeRecord,
 } from "./file-change-evidence";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
+import { snapshotPathIdentity } from "./tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 const PREVIEW_TIMEOUT_MS = 5_000;
@@ -234,21 +236,31 @@ async function treePreview(
 	const rel = relative(cwd, filePath);
 	if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return missing;
 	const root = resolve(cwd);
+	const identity = snapshotPathIdentity(root);
+	const legacyIdentity = normalizePathForComparison(root);
+	const paths = identity === legacyIdentity ? [identity] : [identity, legacyIdentity];
+	const hashes = [row.treeHashBefore, row.treeHashAfter].filter(
+		(hash): hash is string => hash !== null && /^[a-f0-9]{40,64}$/.test(hash),
+	);
+	if (hashes.length === 0) return missing;
+	// The exact tool row already freezes these hashes and cwd. A v1 path alias is
+	// evidence only for those explicit hashes, never proof of the current directory.
+	const recorded = db
+		.select({ treeHash: worktreeTreeSnapshots.treeHash })
+		.from(worktreeTreeSnapshots)
+		.where(
+			and(
+				eq(worktreeTreeSnapshots.deviceId, row.executionDeviceId as string),
+				inArray(worktreeTreeSnapshots.worktreePath, paths),
+				inArray(worktreeTreeSnapshots.treeHash, hashes),
+			),
+		)
+		// The unique (device, path, hash) index bounds two paths × two hashes to four rows.
+		.limit(4)
+		.all();
+	const recordedHashes = new Set(recorded.map(({ treeHash }) => treeHash));
 	const side = async (hash: string | null): Promise<ToolEditPreviewSide> => {
-		if (!hash || !/^[a-f0-9]{40,64}$/.test(hash)) return unavailable("missing_evidence");
-		const recorded = db
-			.select({ id: worktreeTreeSnapshots.id })
-			.from(worktreeTreeSnapshots)
-			.where(
-				and(
-					eq(worktreeTreeSnapshots.deviceId, row.executionDeviceId as string),
-					eq(worktreeTreeSnapshots.worktreePath, root),
-					eq(worktreeTreeSnapshots.treeHash, hash),
-				),
-			)
-			.limit(1)
-			.get();
-		if (!recorded) return unavailable("missing_evidence");
+		if (!hash || !recordedHashes.has(hash)) return unavailable("missing_evidence");
 		return worktreeTreeSnapshot.readFilePreviewAtTree(
 			root,
 			hash,

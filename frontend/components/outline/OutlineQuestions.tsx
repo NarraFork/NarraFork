@@ -159,6 +159,7 @@ export function OutlineQuestionsForm({
 	onOpen,
 	showOpenLink = true,
 	hideQuestionTitle = false,
+	live = true,
 }: {
 	blockId: string;
 	questionRootIds?: readonly string[];
@@ -167,11 +168,13 @@ export function OutlineQuestionsForm({
 	onOpen?: () => void;
 	showOpenLink?: boolean;
 	hideQuestionTitle?: boolean;
+	/** Keep the questions fresh by their pages' commits; false: the host does. */
+	live?: boolean;
 }) {
 	const { t } = useTranslation("outline");
 	const queries = useOutlineQuestionGroups(questionRootIds ?? [blockId]);
 	const groups = queries.flatMap((query) => (query.data ? [query.data] : []));
-	useOutlineQuestionsLive(groups);
+	useOutlineQuestionsLive(groups, live);
 	const group = groups[0]?.group;
 	const questions = [
 		...new Map(groups.flatMap((g) => g.questions).map((q) => [q.blockId, q])).values(),

@@ -525,6 +525,68 @@ describe("committed LOD entry: lazy selected-path planning", () => {
 	});
 });
 
+describe("row ↔ bubble across a level switch", () => {
+	const element = (kind: string, top: number, height: number, nested: boolean) => ({
+		unitId: "tool-send",
+		key: "tool-send",
+		kind,
+		top,
+		height,
+		...(nested ? { nested: true, clip: { top: 100, bottom: 400 } } : {}),
+	});
+	const revealOps = (h: ReturnType<typeof harness>) =>
+		h.calls.push.flatMap((push) => push.ops).filter((op) => op.scope.endsWith(":reveal"));
+
+	it("un-clips the bubble from the row's height while it slides into place", () => {
+		let current = geometryFrom([element("trace-row", 120, 19, true)]);
+		const h = harness();
+		h.cache.current = { get: () => current };
+		const frame = cards();
+		h.commit(frame, { lod: 2 });
+		current = geometryFrom([element("communication-bubble", 160, 119, false)]);
+		h.commit(frame, { lod: 3 });
+		// One identity on both sides, so the pair is planned as a re-theme that travels.
+		expect(h.calls.diff[0]).toEqual([
+			{
+				unitId: "tool-send",
+				deltaY: -40,
+				fade: true,
+				toKind: "communication-bubble",
+				durationMs: 250,
+			},
+		]);
+		const reveal = revealOps(h);
+		expect(reveal.map((op) => op.scope)).toEqual(["lod:tool-send:reveal"]);
+		// Starts clipped to the row's 19px and opens to the bubble's full 119px.
+		expect(reveal[0].keyframes).toEqual([
+			{ offset: 0, clipPath: "inset(0px 0px 100px 0px)" },
+			{ offset: 1, clipPath: "inset(0px 0px 0px 0px)" },
+		]);
+		expect(h.calls.push.every((push) => push.duration === LOD_MOTION_DURATION_MS)).toBe(true);
+	});
+
+	it("bubble → row pairs too, and nothing is clipped on the way down", () => {
+		let current = geometryFrom([element("injection-bubble", 160, 119, false)]);
+		const h = harness();
+		h.cache.current = { get: () => current };
+		const frame = cards();
+		h.commit(frame, { lod: 3 });
+		current = geometryFrom([element("trace-row", 120, 19, true)]);
+		h.commit(frame, { lod: 2 });
+		expect(h.calls.diff[0].map((p) => [p.unitId, p.deltaY, p.fade, p.toKind])).toEqual([
+			["tool-send", 40, true, "trace-row"],
+		]);
+		expect(revealOps(h)).toEqual([]);
+	});
+
+	it("a card the row turns into is not clipped: only bubbles reveal", () => {
+		const h = harness();
+		h.commit(rows(), { lod: 2 });
+		h.commit(cards(), { lod: 4 });
+		expect(revealOps(h)).toEqual([]);
+	});
+});
+
 function geometryFrom(elements: readonly LodElementSource[]): LodMorphGeometry {
 	return {
 		elements: [...elements],

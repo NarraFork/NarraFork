@@ -29,8 +29,11 @@ const platformSha256 = (platform: ExecutorPlatform) =>
 	(EXECUTOR_PLATFORMS.indexOf(platform) + 1).toString(16).repeat(64);
 const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 const repository = "fixture/install-script-url";
-const tag = `executor-v${EXECUTOR_VERSION}`;
-const manifestUrl = `https://github.com/${repository}/releases/download/${tag}/${EXECUTOR_MANIFEST_FILENAME}`;
+const tag = BUILD_EXECUTOR_DISTRIBUTION.tag;
+const mirrorOrigin = "https://fixture.example";
+const product = "install-script-url";
+const manifestUrl = `${mirrorOrigin}/api/v3/products/${encodeURIComponent(product)}/mirror/tools/executor/${encodeURIComponent(tag)}/assets/${EXECUTOR_MANIFEST_FILENAME}`;
+const manifestRequests: string[] = [];
 
 function canonicalManifest() {
 	return {
@@ -80,17 +83,20 @@ let originalAllowPlaintext: boolean | undefined;
 
 beforeEach(async () => {
 	resetExecutorTickets();
+	manifestRequests.length = 0;
 	originalAllowPlaintext = settings.devices?.allowPlaintextEnrollmentOnPrivateNetwork;
 	settings.update = {
 		...originalUpdate,
 		source: "update-server",
 		githubRepository: repository,
-		serverUrl: "https://fixture.example",
+		product,
+		serverUrl: mirrorOrigin,
 		proxy: { mode: "direct" },
 	};
 	resetExecutorManifestCache();
 	globalThis.fetch = Object.assign(
 		async (url: RequestInfo | URL) => {
+			manifestRequests.push(String(url));
 			expect(String(url)).toBe(manifestUrl);
 			return Response.json(canonicalManifest());
 		},
@@ -110,6 +116,17 @@ afterEach(async () => {
 		await db.delete(remoteDevices).where(inArray(remoteDevices.id, created.splice(0)));
 	}
 	resetExecutorTickets();
+	// Manifest failures may be caught by the distribution cache layer; assert the
+	// attempted transport itself so no stale cache can hide a GitHub fallback.
+	expect(manifestRequests.length).toBeGreaterThan(0);
+	expect(manifestRequests.every((url) => url === manifestUrl)).toBe(true);
+	expect(
+		manifestRequests.some(
+			(url) =>
+				new URL(url).hostname === "github.com" ||
+				new URL(url).hostname.endsWith(".githubusercontent.com"),
+		),
+	).toBe(false);
 });
 
 function app(): Hono {
@@ -223,6 +240,8 @@ describe("server URL composition", () => {
 		globalThis.fetch = Object.assign(
 			async (input: RequestInfo | URL) => {
 				calls.push(String(input));
+				manifestRequests.push(String(input));
+				expect(String(input)).toBe(manifestUrl);
 				return Response.json(metadata);
 			},
 			{ preconnect: originalFetch.preconnect },
@@ -230,9 +249,9 @@ describe("server URL composition", () => {
 		const response = await generate(id, { body: { serverBaseUrl: "https://nf.example.com" } });
 		expect(response.status).toBe(400);
 		expect((await response.json()).error).toContain("No compatible executor release");
-		expect(calls).toEqual([
-			`https://github.com/${expectedRepository}/releases/download/${tag}/${EXECUTOR_MANIFEST_FILENAME}`,
-		]);
+		// Repository is verified in the envelope; mirror namespace URLs remain pinned
+		// to the selected product/component/tag rather than becoming GitHub URLs.
+		expect(calls).toEqual([manifestUrl]);
 		expect(countLiveExecutorTickets()).toBe(0);
 	});
 
@@ -409,6 +428,13 @@ describe("the generated command is self-serving", () => {
 			expect(binary.ok).toBe(true);
 			expect(binary.artifact?.filename).toBe(executorPublishedFilename(EXECUTOR_VERSION, platform));
 			expect(binary.artifact?.sha256).toBe(platformSha256(platform));
+			expect(binary.artifact?.source).toEqual({
+				source: "update-server",
+				serverUrl: mirrorOrigin,
+				product,
+				repository,
+			});
+			expect(binary.artifact?.tag).toBe(tag);
 			expect(finalScript).toContain(
 				target === "unix"
 					? `EXPECTED_SHA256='${platformSha256(platform)}'`

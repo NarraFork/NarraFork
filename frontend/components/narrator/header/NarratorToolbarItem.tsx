@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { ActionIcon, Indicator, Menu, Tooltip } from "@mantine/core";
 import { PluginContributionPicker } from "../../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../../plugins/PluginUiSurfaceContext";
@@ -45,6 +46,7 @@ export function NarratorToolbarItem({
 	mode = "inline",
 }: NarratorToolbarItemProps) {
 	const hostSurface = usePluginUiSurface()?.hostContext.surface ?? "focus";
+	if (REMOTE_BUILD && def.id !== "lodlevel") return null;
 	const Icon = def.icon;
 	const title = t(def.labelKey, { ns: def.namespace ?? "narrator" });
 	const label =

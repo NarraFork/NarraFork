@@ -1,6 +1,6 @@
 import { isValidGitHubRepository } from "./github-repository";
 import { HELPER_BINARY_MAX_BYTES } from "./helper-distribution";
-import { MAX_RELEASE_PATCH_BYTES } from "./release-patch";
+import { MAX_RELEASE_BINARY_BYTES, MAX_RELEASE_PATCH_BYTES } from "./release-patch";
 import { isValidReleaseVersion } from "./release-version";
 import { parseUpdateIndex, updateJsonBytes } from "./update-index";
 import type { UpdateIndexAsset, UpdateIndexV1 } from "./update-index-types";
@@ -8,7 +8,10 @@ import type { UpdateIndexAsset, UpdateIndexV1 } from "./update-index-types";
 export const MIRROR_PROTOCOL_VERSION = 1;
 export const MAX_MIRROR_SNAPSHOT_BYTES = 320 * 1024;
 export const MAX_MIRROR_METADATA_BYTES = 64 * 1024;
-export const MAX_MIRROR_ASSETS = 137;
+export const MAX_MIRROR_ASSETS = 145;
+export const MAX_MIRROR_MAIN_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
+export const MIRROR_MAIN_TRANSFER_TIMEOUT_MS = 15 * 60_000;
+export const MIRROR_MAIN_COMMIT_TIMEOUT_MS = 25 * 60_000;
 export const MIRROR_ASSET_HEADERS = {
 	kind: "x-mirror-kind",
 	name: "x-mirror-name",
@@ -18,12 +21,14 @@ export const MIRROR_ASSET_HEADERS = {
 	platform: "x-mirror-platform",
 } as const;
 export type MirrorAssetKind =
+	| "main-binary"
 	| "binary-sidecar"
 	| "patch"
 	| "patch-meta"
 	| "notes"
 	| "helpers-binary"
-	| "executor-binary";
+	| "executor-binary"
+	| "remote-peer-binary";
 export interface MirrorAssetDescriptor extends UpdateIndexAsset {
 	kind: MirrorAssetKind;
 	version: string;
@@ -37,6 +42,10 @@ export interface MirrorSnapshotV1 {
 	targetVersion: string;
 	assets: MirrorAssetDescriptor[];
 }
+export interface MirrorSnapshotV2 extends Omit<MirrorSnapshotV1, "schemaVersion"> {
+	schemaVersion: 2;
+}
+export type MirrorSnapshot = MirrorSnapshotV1 | MirrorSnapshotV2;
 export interface MirrorAvailabilityV1 {
 	schemaVersion: 1;
 	repository: string;
@@ -60,7 +69,8 @@ function repo(value: unknown, expected: string) {
 	);
 }
 export function mirrorAssetLimit(kind: MirrorAssetKind): number {
-	return kind === "helpers-binary" || kind === "executor-binary"
+	if (kind === "main-binary") return MAX_MIRROR_MAIN_BINARY_BYTES;
+	return kind === "helpers-binary" || kind === "executor-binary" || kind === "remote-peer-binary"
 		? HELPER_BINARY_MAX_BYTES
 		: kind === "patch"
 			? MAX_RELEASE_PATCH_BYTES
@@ -78,14 +88,16 @@ export function parseMirrorAssetDescriptor(value: unknown): MirrorAssetDescripto
 	);
 	check(
 		[
+			"main-binary",
 			"binary-sidecar",
 			"patch",
 			"patch-meta",
 			"notes",
 			"helpers-binary",
 			"executor-binary",
+			"remote-peer-binary",
 		].includes(String(a.kind)),
-		"asset kind (main binaries prohibited)",
+		"asset kind",
 	);
 	const kind = a.kind as MirrorAssetKind;
 	check(typeof a.version === "string" && isValidReleaseVersion(a.version), "asset version");
@@ -120,15 +132,25 @@ export function parseMirrorAssetDescriptor(value: unknown): MirrorAssetDescripto
 		...(a.platform === undefined ? {} : { platform: a.platform as string }),
 	};
 }
-/** Complete projection of the one target release. Never includes full binaries or historical patches. */
+/** Complete projection of one release; legacy callers remain metadata/patch-only. */
 export function mirrorAssetsForTarget(
 	index: UpdateIndexV1,
 	targetVersion: string,
+	projectionVersion: 1 | 2 = 1,
 ): MirrorAssetDescriptor[] {
 	const target = index.releases.find((r) => r.version === targetVersion);
 	check(target, "target not in canonical index");
 	const assets: MirrorAssetDescriptor[] = [];
 	for (const file of target.files) {
+		if (projectionVersion === 2)
+			assets.push({
+				name: file.name,
+				size: file.size,
+				sha256: file.sha256,
+				kind: "main-binary",
+				version: targetVersion,
+				platform: file.platform,
+			});
 		assets.push({
 			...file.metadata,
 			kind: "binary-sidecar",
@@ -162,7 +184,7 @@ export function mirrorAssetsForTarget(
 		});
 	return assets;
 }
-export function parseMirrorSnapshot(value: unknown, expectedRepository: string): MirrorSnapshotV1 {
+export function parseMirrorSnapshot(value: unknown, expectedRepository: string): MirrorSnapshot {
 	check(updateJsonBytes(value) <= MAX_MIRROR_SNAPSHOT_BYTES, "snapshot byte limit");
 	const s = object(value);
 	check(
@@ -173,14 +195,14 @@ export function parseMirrorSnapshot(value: unknown, expectedRepository: string):
 		),
 		"unknown snapshot field",
 	);
-	check(s.schemaVersion === 1, "schema version");
+	check(s.schemaVersion === 1 || s.schemaVersion === 2, "schema version");
 	repo(s.repository, expectedRepository);
 	check(typeof s.indexCommit === "string" && /^[a-f0-9]{40}$/.test(s.indexCommit), "index commit");
 	const index = parseUpdateIndex(s.index, expectedRepository);
 	check(typeof s.targetVersion === "string", "target version");
 	check(Array.isArray(s.assets) && s.assets.length <= MAX_MIRROR_ASSETS, "asset count");
 	const assets = s.assets.map(parseMirrorAssetDescriptor);
-	const expected = mirrorAssetsForTarget(index, s.targetVersion);
+	const expected = mirrorAssetsForTarget(index, s.targetVersion, s.schemaVersion);
 	check(
 		assets.length === expected.length && new Set(assets.map((a) => a.name)).size === assets.length,
 		"complete target projection required",
@@ -198,7 +220,7 @@ export function parseMirrorSnapshot(value: unknown, expectedRepository: string):
 		);
 	}
 	return {
-		schemaVersion: 1,
+		schemaVersion: s.schemaVersion,
 		repository: index.repository,
 		indexCommit: s.indexCommit,
 		index,

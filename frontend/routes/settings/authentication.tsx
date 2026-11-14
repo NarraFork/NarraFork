@@ -6,7 +6,9 @@ import {
 	Divider,
 	Group,
 	Loader,
+	NumberInput,
 	PasswordInput,
+	Select,
 	Stack,
 	Switch,
 	Text,
@@ -14,13 +16,18 @@ import {
 	Title,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { IconKey, IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconKey, IconPlus, IconServer2, IconTrash } from "@tabler/icons-react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
-import { useAuthConfig, useCurrentUser, useUpdateAuthConfig } from "../../hooks/useAuth";
-import type { AdminOidcProvider } from "../../lib/api";
+import {
+	useAuthConfig,
+	useCurrentUser,
+	useTestLdap,
+	useUpdateAuthConfig,
+} from "../../hooks/useAuth";
+import type { AdminLdapConfig, AdminOidcProvider, LdapProbeResult } from "../../lib/api";
 
 export const Route = createFileRoute("/settings/authentication")({
 	component: SettingsAuthenticationPage,
@@ -66,6 +73,108 @@ function splitList(value: string): string[] {
 		.filter(Boolean);
 }
 
+/** Local editable shape of the directory: numeric fields held as text. */
+interface LdapDraft {
+	enabled: boolean;
+	url: string;
+	startTls: boolean;
+	tlsRejectUnauthorized: boolean;
+	mode: "search" | "direct";
+	bindDn: string;
+	bindPassword: string;
+	searchBase: string;
+	searchScope: "sub" | "one" | "base";
+	searchFilter: string;
+	bindDnTemplate: string;
+	usernameAttribute: string;
+	emailAttribute: string;
+	displayNameAttribute: string;
+	connectTimeoutMs: number | string;
+	timeoutMs: number | string;
+}
+
+function emptyLdapDraft(): LdapDraft {
+	return {
+		enabled: false,
+		url: "",
+		startTls: false,
+		// Verification on by default: a directory that only presents a self-signed
+		// certificate is the exception an operator opts into.
+		tlsRejectUnauthorized: true,
+		mode: "search",
+		bindDn: "",
+		bindPassword: "",
+		searchBase: "",
+		searchScope: "sub",
+		searchFilter: "",
+		bindDnTemplate: "",
+		usernameAttribute: "",
+		emailAttribute: "",
+		displayNameAttribute: "",
+		connectTimeoutMs: "",
+		timeoutMs: "",
+	};
+}
+
+function toLdapDraft(config: AdminLdapConfig | null | undefined): LdapDraft {
+	if (!config) return emptyLdapDraft();
+	return {
+		enabled: config.enabled,
+		url: config.url ?? "",
+		startTls: config.startTls ?? false,
+		tlsRejectUnauthorized: config.tlsRejectUnauthorized !== false,
+		mode: config.mode ?? "search",
+		bindDn: config.bindDn ?? "",
+		bindPassword: config.bindPassword ?? "",
+		searchBase: config.searchBase ?? "",
+		searchScope: config.searchScope ?? "sub",
+		searchFilter: config.searchFilter ?? "",
+		bindDnTemplate: config.bindDnTemplate ?? "",
+		usernameAttribute: config.usernameAttribute ?? "",
+		emailAttribute: config.emailAttribute ?? "",
+		displayNameAttribute: config.displayNameAttribute ?? "",
+		connectTimeoutMs: config.connectTimeoutMs ?? "",
+		timeoutMs: config.timeoutMs ?? "",
+	};
+}
+
+function optionalInt(value: number | string): number | undefined {
+	const parsed = typeof value === "number" ? value : Number.parseInt(value.trim(), 10);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function optionalText(value: string): string | undefined {
+	return value.trim() || undefined;
+}
+
+/**
+ * Build the wire payload. `bindPassword` is omitted when empty so the server keeps the
+ * stored one — the same contract as the OIDC client secret on this page.
+ */
+function toLdapPayload(draft: LdapDraft): AdminLdapConfig {
+	const secure = draft.url.trim().toLowerCase().startsWith("ldaps://");
+	return {
+		enabled: draft.enabled,
+		url: draft.url.trim(),
+		// StartTLS has no meaning on an already-encrypted connection; normalizing here
+		// keeps a stored config from depending on which URL it was saved with.
+		startTls: secure ? false : draft.startTls,
+		tlsRejectUnauthorized: draft.tlsRejectUnauthorized,
+		mode: draft.mode,
+		bindDn: optionalText(draft.bindDn),
+		bindPassword: draft.bindPassword || undefined,
+		searchBase: optionalText(draft.searchBase),
+		searchScope: draft.searchScope,
+		searchFilter: optionalText(draft.searchFilter),
+		bindDnTemplate: optionalText(draft.bindDnTemplate),
+		usernameAttribute: optionalText(draft.usernameAttribute),
+		emailAttribute: optionalText(draft.emailAttribute),
+		displayNameAttribute: optionalText(draft.displayNameAttribute),
+		connectTimeoutMs: optionalInt(draft.connectTimeoutMs),
+		timeoutMs: optionalInt(draft.timeoutMs),
+	};
+}
+
 function SettingsAuthenticationPage() {
 	const { t } = useTranslation("settings");
 	const { data: user } = useCurrentUser();
@@ -78,7 +187,12 @@ function SettingsAuthenticationPage() {
 	const [rpID, setRpID] = useState("");
 	const [rpName, setRpName] = useState("");
 	const [origins, setOrigins] = useState("");
+	const [ldap, setLdap] = useState<LdapDraft>(emptyLdapDraft);
+	const [ldapTestUser, setLdapTestUser] = useState("");
+	const [ldapTestPassword, setLdapTestPassword] = useState("");
+	const [ldapProbe, setLdapProbe] = useState<LdapProbeResult | null>(null);
 	const [error, setError] = useState("");
+	const testLdap = useTestLdap();
 
 	useEffect(() => {
 		if (!data) return;
@@ -86,6 +200,7 @@ function SettingsAuthenticationPage() {
 		setRpID(data.webauthn?.rpID ?? "");
 		setRpName(data.webauthn?.rpName ?? "");
 		setOrigins((data.webauthn?.origins ?? []).join(", "));
+		setLdap(toLdapDraft(data.ldap));
 	}, [data]);
 
 	if (!isAdmin) return null;
@@ -133,6 +248,19 @@ function SettingsAuthenticationPage() {
 			if (ids.has(p.id.trim())) return t("ssoValidationDuplicate");
 			ids.add(p.id.trim());
 		}
+		// The server is the real gate (it validates the whole block); these two checks
+		// just name the most common mistakes in the operator's own language.
+		const ldapUrl = ldap.url.trim();
+		if (ldap.enabled && !ldapUrl) return t("ldapValidationUrl");
+		if (ldapUrl && !/^ldaps?:\/\//i.test(ldapUrl)) return t("ldapValidationUrl");
+		if (ldap.enabled) {
+			const template =
+				ldap.mode === "search"
+					? ldap.searchFilter.trim() || "(&(objectClass=person)(uid={username}))"
+					: ldap.bindDnTemplate.trim();
+			if (ldap.mode === "search" && !ldap.searchBase.trim()) return t("ldapValidationSearchBase");
+			if (!template.includes("{username}")) return t("ldapValidationTemplate");
+		}
 		return null;
 	};
 
@@ -162,12 +290,39 @@ function SettingsAuthenticationPage() {
 					rpName: rpName.trim() || undefined,
 					origins: splitList(origins),
 				},
+				ldap: toLdapPayload(ldap),
 			});
 			notifications.show({ color: "green", message: t("authConfigSaved") });
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		} catch (e: any) {
 			setError(e?.message || t("authConfigSaveFailed"));
 		}
+	};
+
+	/** Probe with the values currently in the form, saved or not. */
+	const handleTestLdap = async () => {
+		setError("");
+		setLdapProbe(null);
+		try {
+			setLdapProbe(
+				await testLdap.mutateAsync({
+					config: toLdapPayload(ldap),
+					username: ldapTestUser.trim() || undefined,
+					password: ldapTestPassword || undefined,
+				}),
+			);
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		} catch (e: any) {
+			setLdapProbe({
+				stage: "config",
+				ok: false,
+				message: e?.message || t("authConfigSaveFailed"),
+			});
+		}
+	};
+
+	const patchLdap = (patch: Partial<LdapDraft>) => {
+		setLdap((prev) => ({ ...prev, ...patch }));
 	};
 
 	return (
@@ -275,6 +430,223 @@ function SettingsAuthenticationPage() {
 						))}
 					</Stack>
 				)}
+			</Card>
+
+			{/* === LDAP / Active Directory (credential provider) === */}
+			<Card withBorder padding="lg">
+				<Group gap="xs">
+					<IconServer2 size={22} />
+					<Text fw={600}>{t("ldapTitle")}</Text>
+				</Group>
+				<Text size="sm" c="dimmed" mt={4}>
+					{t("ldapDescription")}
+				</Text>
+
+				<Stack gap="sm" mt="md">
+					<Switch
+						label={t("ldapEnabled")}
+						description={t("ldapEnabledHint")}
+						checked={ldap.enabled}
+						onChange={(e) => patchLdap({ enabled: e.currentTarget.checked })}
+					/>
+					<TextInput
+						label={t("ldapUrl")}
+						description={t("ldapUrlHint")}
+						placeholder="ldaps://dc1.corp.example.com:636"
+						value={ldap.url}
+						onChange={(e) => patchLdap({ url: e.currentTarget.value })}
+					/>
+					<Group grow align="flex-start">
+						{ldap.url.trim().toLowerCase().startsWith("ldap://") ? (
+							<Switch
+								label={t("ldapStartTls")}
+								description={t("ldapStartTlsHint")}
+								checked={ldap.startTls}
+								onChange={(e) => patchLdap({ startTls: e.currentTarget.checked })}
+							/>
+						) : (
+							<div />
+						)}
+						<Switch
+							label={t("ldapTrustSelfSigned")}
+							description={t("ldapTrustSelfSignedHint")}
+							checked={!ldap.tlsRejectUnauthorized}
+							onChange={(e) => patchLdap({ tlsRejectUnauthorized: !e.currentTarget.checked })}
+						/>
+					</Group>
+
+					<Select
+						label={t("ldapMode")}
+						description={t("ldapModeHint")}
+						data={[
+							{ value: "search", label: t("ldapModeSearch") },
+							{ value: "direct", label: t("ldapModeDirect") },
+						]}
+						value={ldap.mode}
+						allowDeselect={false}
+						onChange={(value) => patchLdap({ mode: value === "direct" ? "direct" : "search" })}
+					/>
+
+					{ldap.mode === "search" ? (
+						<>
+							<Group grow align="flex-start">
+								<TextInput
+									label={t("ldapBindDn")}
+									description={t("ldapBindDnHint")}
+									placeholder="cn=narrafork,ou=services,dc=example,dc=com"
+									value={ldap.bindDn}
+									onChange={(e) => patchLdap({ bindDn: e.currentTarget.value })}
+								/>
+								<PasswordInput
+									label={t("ldapBindPassword")}
+									placeholder={t("ldapSecretKeep")}
+									value={ldap.bindPassword}
+									onChange={(e) => patchLdap({ bindPassword: e.currentTarget.value })}
+								/>
+							</Group>
+							<Group grow align="flex-start">
+								<TextInput
+									label={t("ldapSearchBase")}
+									placeholder="dc=example,dc=com"
+									value={ldap.searchBase}
+									onChange={(e) => patchLdap({ searchBase: e.currentTarget.value })}
+								/>
+								<Select
+									label={t("ldapSearchScope")}
+									data={[
+										{ value: "sub", label: t("ldapSearchScopeSub") },
+										{ value: "one", label: t("ldapSearchScopeOne") },
+										{ value: "base", label: t("ldapSearchScopeBase") },
+									]}
+									value={ldap.searchScope}
+									allowDeselect={false}
+									onChange={(value) =>
+										patchLdap({
+											searchScope: value === "one" || value === "base" ? value : "sub",
+										})
+									}
+								/>
+							</Group>
+							<TextInput
+								label={t("ldapSearchFilter")}
+								description={t("ldapSearchFilterHint")}
+								placeholder="(&(objectClass=person)(uid={username}))"
+								value={ldap.searchFilter}
+								onChange={(e) => patchLdap({ searchFilter: e.currentTarget.value })}
+							/>
+						</>
+					) : (
+						<TextInput
+							label={t("ldapBindDnTemplate")}
+							description={t("ldapBindDnTemplateHint")}
+							placeholder="uid={username},ou=people,dc=example,dc=com"
+							value={ldap.bindDnTemplate}
+							onChange={(e) => patchLdap({ bindDnTemplate: e.currentTarget.value })}
+						/>
+					)}
+
+					<Group grow align="flex-start">
+						<TextInput
+							label={t("ldapUsernameAttribute")}
+							description={t("ldapUsernameAttributeHint")}
+							placeholder="uid"
+							value={ldap.usernameAttribute}
+							onChange={(e) => patchLdap({ usernameAttribute: e.currentTarget.value })}
+						/>
+						<TextInput
+							label={t("ldapEmailAttribute")}
+							placeholder="mail"
+							value={ldap.emailAttribute}
+							onChange={(e) => patchLdap({ emailAttribute: e.currentTarget.value })}
+						/>
+						<TextInput
+							label={t("ldapDisplayNameAttribute")}
+							placeholder="cn"
+							value={ldap.displayNameAttribute}
+							onChange={(e) => patchLdap({ displayNameAttribute: e.currentTarget.value })}
+						/>
+					</Group>
+
+					<Group grow align="flex-start">
+						<NumberInput
+							label={t("ldapConnectTimeout")}
+							description={t("ldapTimeoutHint")}
+							min={1000}
+							max={30000}
+							step={500}
+							placeholder="5000"
+							value={ldap.connectTimeoutMs}
+							onChange={(value) => patchLdap({ connectTimeoutMs: value })}
+						/>
+						<NumberInput
+							label={t("ldapOperationTimeout")}
+							description={t("ldapTimeoutHint")}
+							min={1000}
+							max={30000}
+							step={500}
+							placeholder="5000"
+							value={ldap.timeoutMs}
+							onChange={(value) => patchLdap({ timeoutMs: value })}
+						/>
+					</Group>
+
+					<Divider label={t("ldapTestTitle")} labelPosition="left" />
+					<Text size="xs" c="dimmed">
+						{t("ldapTestHint")}
+					</Text>
+					<Group grow align="flex-end">
+						<TextInput
+							label={t("ldapTestUsername")}
+							placeholder="alice"
+							value={ldapTestUser}
+							onChange={(e) => setLdapTestUser(e.currentTarget.value)}
+							autoComplete="off"
+						/>
+						<PasswordInput
+							label={t("ldapTestPassword")}
+							value={ldapTestPassword}
+							onChange={(e) => setLdapTestPassword(e.currentTarget.value)}
+							autoComplete="new-password"
+						/>
+						<Button
+							variant="light"
+							onClick={handleTestLdap}
+							loading={testLdap.isPending}
+							style={{ alignSelf: "flex-end" }}
+						>
+							{t("ldapTestRun")}
+						</Button>
+					</Group>
+					{ldapProbe && (
+						<Alert color={ldapProbe.ok ? "green" : "red"} title={t(`ldapStage_${ldapProbe.stage}`)}>
+							<Text size="sm">{ldapProbe.message}</Text>
+							{ldapProbe.user && (
+								<Text size="xs" mt={4} style={{ wordBreak: "break-all" }}>
+									{ldapProbe.user.displayName
+										? `${ldapProbe.user.displayName} · ${ldapProbe.user.id}`
+										: ldapProbe.user.id}
+									{` · ${ldapProbe.user.dn}`}
+								</Text>
+							)}
+						</Alert>
+					)}
+
+					<Divider label={t("ldapPolicyTitle")} labelPosition="left" />
+					<Stack gap={2}>
+						<Text size="xs" c="dimmed">
+							• {t("ldapPolicyBound")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							• {t("ldapPolicySameName")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							• {t("ldapPolicyCreate")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							• {t("ldapPolicyClosed")}
+						</Text>
+					</Stack>
+				</Stack>
 			</Card>
 
 			{/* === WebAuthn / passkey RP === */}

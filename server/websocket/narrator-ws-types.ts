@@ -89,6 +89,8 @@ export type NarratorServerMessage =
 	| import("@shared/outline-page-events").OutlinePageServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
+	/** Delivered only to this account's sockets; clients refetch authorized preferences. */
+	| { type: "user_preferences_changed" }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */
 	| {
 			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
@@ -327,6 +329,8 @@ export type NarratorServerMessage =
 			balance?: number;
 			required?: number;
 			resumeAction: "retry" | "continue";
+			/** Parent copy of a subagent's frame: the parent must not react to it. */
+			isSubagent?: boolean;
 	  }
 	| {
 			/**
@@ -957,6 +961,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
+			/** Parent copy of a subagent's frame: its balance is not the parent's. */
+			isSubagent?: boolean;
 	  }
 	| {
 			type: "queue_status";
@@ -1265,7 +1271,7 @@ export type NarratorServerMessage =
 			path: string;
 			revisionId: string | null;
 			updatedBy: "user" | "assistant" | "system";
-			source: "ui" | "tool" | "task_create" | "reset" | "import";
+			source: "ui" | "tool" | "task_create" | "reset" | "import" | "revert";
 	  }
 	| {
 			/**

@@ -16,11 +16,17 @@ import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-i
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
+	closeRevertRewriteWorkers,
 	type PreparedRevertHistory,
 	REWRITE_WORKER,
 	RevertHistoryCommitService,
+	resetRevertRewriteWorkersForTests,
 } from "./revert-history-commit";
-import { RevertSelectionService } from "./revert-selection-service";
+import {
+	closeRevertBodyWorkers,
+	RevertSelectionService,
+	resetRevertBodyWorkersForTests,
+} from "./revert-selection-service";
 import { loadSendTargetDetails } from "./send-delivery-resolution";
 
 // Actual schema/FKs/generated columns, with a real independent root and actual collector.
@@ -81,7 +87,9 @@ function seedSchema(client: Database, options: { schemaAlreadyCopied?: boolean }
 		"CREATE INDEX IF NOT EXISTS idx_question_events_question_rowid ON narrator_question_events(question_id)",
 	);
 }
-beforeEach(() => {
+beforeEach(async () => {
+	await resetRevertBodyWorkersForTests();
+	await resetRevertRewriteWorkersForTests();
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
 	// Byte copy of the same schema, built once per process (see tests/sqlite-schema-image.ts);
@@ -103,7 +111,9 @@ beforeEach(() => {
 	service = new RevertHistoryCommitService(db, { authorize, onSlow: () => {} });
 	collector = new RevertSelectionService(db, { authorize, onSlow: () => {} });
 });
-afterEach(() => {
+afterEach(async () => {
+	await closeRevertBodyWorkers();
+	await closeRevertRewriteWorkers();
 	for (const connection of connections) connection.close();
 });
 async function authorize(
@@ -484,13 +494,17 @@ for (const role of ["assistant", "user", "sys", "system", "disp", "other"]) {
 		});
 		const worker = new Worker(REWRITE_WORKER, { eval: true });
 		try {
-			const response = new Promise<{ contextCharsJson: string; error?: string }>(
-				(resolve, reject) => {
-					worker.once("message", resolve);
-					worker.once("error", reject);
-				},
-			);
+			const requestId = `characters-${role}`;
+			const response = new Promise<{
+				requestId: string;
+				result: { contextCharsJson: string };
+				error?: string;
+			}>((resolve, reject) => {
+				worker.once("message", resolve);
+				worker.once("error", reject);
+			});
 			worker.postMessage({
+				requestId,
 				message: {
 					id: "char-message",
 					contentDigest,
@@ -502,16 +516,322 @@ for (const role of ["assistant", "user", "sys", "system", "disp", "other"]) {
 				role,
 				limit: FILE_CHANGE_LIMITS.historyCowBytes,
 			});
-			const result = await response;
-			expect(result.error).toBeUndefined();
-			expect(JSON.parse(result.contextCharsJson)).toEqual(measureMessageCharacters(role, retained));
+			const reply = await response;
+			expect(reply.requestId).toBe(requestId);
+			expect(reply.error).toBeUndefined();
+			expect(JSON.parse(reply.result.contextCharsJson)).toEqual(
+				measureMessageCharacters(role, retained),
+			);
+			const errorResponse = new Promise<{ requestId: string; error: string }>((resolve) => {
+				worker.once("message", resolve);
+			});
+			worker.postMessage({
+				requestId: `${requestId}-invalid`,
+				message: { id: "char-message", contentDigest: hash("different body") },
+				blocks: fixed,
+				body,
+				role,
+				limit: FILE_CHANGE_LIMITS.historyCowBytes,
+			});
+			expect(await errorResponse).toEqual({
+				requestId: `${requestId}-invalid`,
+				error: "Raw body commitment changed",
+			});
 		} finally {
 			await worker.terminate();
 		}
 	});
 }
 
+describe("pooled rewrite worker lifecycle", () => {
+	test("separate preparations reuse one native rewrite thread without changing shared originals", async () => {
+		const target = withTools();
+		ref(target.messageId, "fork", 1);
+		const originalBody = body(target.messageId);
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		const threads = new Set<Worker>();
+		const ids = new Set<string>();
+		let calls = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (args[0]?.message?.id) {
+				threads.add(this);
+				ids.add(args[0].requestId);
+				calls++;
+				this.emit("message", { ready: true });
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			await service.prepare({ principal, fixedSelection });
+			const token = await service.prepare({ principal, fixedSelection });
+			expect(threads.size).toBe(1);
+			expect(calls).toBe(2);
+			expect(ids.size).toBe(2);
+			expect(body(target.messageId)).toBe(originalBody);
+			const result = apply(token);
+			expect(result.replacements).toHaveLength(1);
+			expect(body(target.messageId)).toBe(originalBody);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test("concurrent preparations share at most two native rewrite threads", async () => {
+		const target = withTools();
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		const threads = new Set<Worker>();
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (args[0]?.message?.id) threads.add(this);
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			const tokens = await Promise.all(
+				Array.from({ length: 6 }, () =>
+					new RevertHistoryCommitService(db, { authorize }).prepare({ principal, fixedSelection }),
+				),
+			);
+			expect(tokens).toHaveLength(6);
+			expect(threads.size).toBe(2);
+			expect(version()).toBe(7);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test.each([
+		"startup-error",
+		"startup-timeout",
+		"cancel",
+		"timeout",
+		"error",
+		"messageerror",
+		"close",
+	] as const)("%s awaits actual rewrite exit without fallback, replay or COW mutation", async (mode) => {
+		const target = withTools();
+		ref(target.messageId, "fork", 1);
+		const originalBody = body(target.messageId);
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		const controller = new AbortController();
+		const threads = new Set<Worker>();
+		const exited = new Set<Worker>();
+		let business = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			const request = args[0];
+			// The body pool is already warm. Only rewrite startup/business is intercepted.
+			if (request?.action === "ping" || request?.message?.id) {
+				if (!threads.has(this)) {
+					threads.add(this);
+					this.once("exit", () => exited.add(this));
+				}
+				if (request.action === "ping") {
+					if (mode === "startup-error") throw Error("injected startup failure");
+					if (mode === "startup-timeout") return;
+					return Reflect.apply(original, this, args);
+				}
+				business++;
+				if (mode === "cancel") controller.abort(Error("injected cancellation"));
+				if (mode === "error" || mode === "messageerror")
+					this.emit(mode, Error("injected runtime failure"));
+				if (mode === "close") void closeRevertRewriteWorkers();
+				return;
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			const history = new RevertHistoryCommitService(db, { authorize, timeoutMs: 220 });
+			const error = await history
+				.prepare({ principal, fixedSelection, signal: controller.signal })
+				.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+			expect(error).toBeDefined();
+			expect(threads.size).toBe(1);
+			expect(exited.size).toBe(1);
+			expect(business).toBe(mode.startsWith("startup") ? 0 : 1);
+			expect(body(target.messageId)).toBe(originalBody);
+			expect(count("narrator_messages")).toBe(1);
+			expect(version()).toBe(7);
+			if (mode === "close") {
+				await closeRevertRewriteWorkers();
+				const closedError = await service.prepare({ principal, fixedSelection }).then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				expect(closedError).toMatchObject({ code: "REVERT_HISTORY_BODY_INVALID" });
+				expect(business).toBe(1);
+			}
+		} finally {
+			post.mockRestore();
+		}
+		if (mode !== "close")
+			expect(await service.prepare({ principal, fixedSelection })).toBeDefined();
+	});
+	test("healthy rewrite commitment rejection does not retire its thread", async () => {
+		const target = withTools();
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		const threads = new Set<Worker>();
+		let corrupt = true;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (args[0]?.message?.id) {
+				threads.add(this);
+				if (corrupt)
+					args[0] = { ...args[0], message: { ...args[0].message, contentDigest: "0".repeat(64) } };
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			const error = await service.prepare({ principal, fixedSelection }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toMatchObject({ code: "REVERT_HISTORY_BODY_INVALID" });
+			corrupt = false;
+			expect(await service.prepare({ principal, fixedSelection })).toBeDefined();
+			expect(threads.size).toBe(1);
+		} finally {
+			post.mockRestore();
+		}
+	});
+});
+
 describe("fixed selector history application", () => {
+	test("real reused rewrite worker ignores stale success/error IDs without contaminating COW or rewrite", async () => {
+		const shared = withTools(1, ["remove-shared", "keep-shared"]);
+		const local = withTools(2, ["remove-local", "keep-local"]);
+		ref(shared.messageId, "fork", 1);
+		const sharedOriginal = body(shared.messageId);
+		const fixedSelection = await select({
+			kind: "tool_calls",
+			toolCallIds: [shared.tools[0], local.tools[0]],
+		});
+		const requests: { worker: Worker; requestId: string; messageId: string }[] = [];
+		let injectedErrors = 0;
+		let injectedResults = 0;
+		const realPost = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			const [request] = args;
+			if (typeof request?.message?.id === "string" && typeof request.role === "string") {
+				const wrongId = requests.at(-1)?.requestId ?? `wrong-${request.requestId}`;
+				requests.push({
+					worker: this,
+					requestId: request.requestId,
+					messageId: request.message.id,
+				});
+				this.emit("message", { requestId: wrongId, error: "stale rewrite error" });
+				injectedErrors++;
+				this.emit("message", {
+					requestId: wrongId,
+					result: {
+						body: '[{"type":"text","text":"poisoned"}]',
+						text: "poisoned",
+						bytes: 50,
+						contextCharsJson: '{"segments":[]}',
+					},
+				});
+				injectedResults++;
+			}
+			return Reflect.apply(realPost, this, args);
+		});
+		try {
+			const token = await service.prepare({ principal, fixedSelection });
+			const result = apply(token);
+			const replacement = result.replacements.find(
+				(row) => row.previousMessageId === shared.messageId,
+			);
+			expect(replacement).toBeDefined();
+			expect(body(shared.messageId)).toBe(sharedOriginal);
+			expect(JSON.parse(body(replacement?.messageId ?? "missing"))).toEqual([
+				{ type: "text", text: "keep" },
+				{ type: "tool_use", id: "keep-shared", name: "Read", input: {} },
+			]);
+			expect(JSON.parse(body(local.messageId))).toEqual([
+				{ type: "text", text: "keep" },
+				{ type: "tool_use", id: "keep-local", name: "Read", input: {} },
+			]);
+			expect(injectedErrors).toBeGreaterThan(0);
+			expect(injectedResults).toBeGreaterThan(0);
+			expect(requests).toHaveLength(2);
+			expect(new Set(requests.map((request) => request.worker)).size).toBe(1);
+			expect(new Set(requests.map((request) => request.requestId)).size).toBe(2);
+			for (const request of requests) {
+				expect(typeof request.requestId).toBe("string");
+				expect(request.requestId).not.toBe(request.messageId);
+			}
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test.each([
+		{ name: "null envelope", reply: (_id: string) => null },
+		{ name: "array envelope", reply: (_id: string) => [] },
+		{ name: "missing ID", reply: (_id: string) => ({ result: {} }) },
+		{ name: "invalid ID", reply: (_id: string) => ({ requestId: 1 }) },
+		{ name: "missing result", reply: (requestId: string) => ({ requestId }) },
+		{ name: "null result", reply: (requestId: string) => ({ requestId, result: null }) },
+		{
+			name: "invalid result shape",
+			reply: (requestId: string) => ({
+				requestId,
+				result: { body: "[]", text: null, bytes: -1, contextCharsJson: "{}" },
+			}),
+		},
+		{ name: "invalid error", reply: (requestId: string) => ({ requestId, error: 1 }) },
+		{
+			name: "ambiguous result/error",
+			reply: (requestId: string) => ({ requestId, error: "ambiguous", result: {} }),
+		},
+	])("malformed real rewrite worker reply fails explicitly: $name", async ({ reply }) => {
+		const target = withTools();
+		const original = body(target.messageId);
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		let injected = 0;
+		let exited = false;
+		const realPost = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			const [request] = args;
+			if (typeof request?.message?.id === "string" && typeof request.role === "string") {
+				this.once("exit", () => {
+					exited = true;
+				});
+				this.emit("message", reply(request.requestId));
+				injected++;
+			}
+			return Reflect.apply(realPost, this, args);
+		});
+		try {
+			const error = await service
+				.prepare({ principal, fixedSelection })
+				.catch((error: unknown) => error);
+			expect(error).toMatchObject({ code: "REVERT_HISTORY_BODY_INVALID" });
+			expect(injected).toBeGreaterThan(0);
+			expect(exited).toBe(true);
+			expect(body(target.messageId)).toBe(original);
+			expect(version()).toBe(7);
+		} finally {
+			post.mockRestore();
+		}
+	});
 	for (const kind of ["all", "from_seq", "messages"] as const)
 		test(`${kind} removes exactly the fixed refs/messages`, async () => {
 			const first = message(1);
@@ -1112,7 +1432,12 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 				sqlite
 					.query("UPDATE narrator_messages SET tree_hash_after='other' WHERE id=?")
 					.run(target.messageId);
-			await expect(service.prepare({ principal, fixedSelection })).rejects.toBeDefined();
+			// Await natively: Bun's async matcher can starve an already reusable thread's RPC.
+			const error = await service.prepare({ principal, fixedSelection }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeDefined();
 			expect(count("narrator_messages")).toBe(1);
 			expect(version()).toBe(7);
 		});
@@ -1160,6 +1485,142 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 			expect(count("narrator_tool_calls")).toBe(2);
 			expect(version()).toBe(7);
 		});
+	test("unrelated same-narrator messages and working status do not stale a fixed point plan", async () => {
+		const target = withTools();
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		const unrelated = message(20, [{ type: "text", text: "unrelated" }]);
+		sqlite
+			.query(
+				"UPDATE narrators SET message_version=message_version+1,status='working' WHERE id='root'",
+			)
+			.run();
+		let changedDuringPrepare = false;
+		onAuthorize = () => {
+			if (changedDuringPrepare) return;
+			changedDuringPrepare = true;
+			sqlite
+				.query(
+					"UPDATE narrators SET message_version=message_version+1,status='idle' WHERE id='root'",
+				)
+				.run();
+		};
+		apply(await service.prepare({ principal, fixedSelection }));
+		expect(body(unrelated)).toBeDefined();
+		expect(body(target.messageId)).toBeDefined();
+		expect(count("narrator_tool_calls")).toBe(1);
+		expect(version()).toBe(10);
+	});
+	test("a version bump during rewrite preparation binds the final current version rather than the consumed old row", async () => {
+		const target = withTools();
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		const mutation = mutateAfterRead(
+			(text) => text.includes("SELECT id,message_version,fork_message_id FROM narrators"),
+			() =>
+				sqlite
+					.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'")
+					.run(),
+		);
+		try {
+			const token = await service.prepare({ principal, fixedSelection });
+			expect(mutation.state.mutated).toBe(true);
+			apply(token);
+			expect(version()).toBe(9);
+			expect(count("narrator_tool_calls")).toBe(1);
+		} finally {
+			mutation.restore();
+		}
+	});
+	test("prepare-to-apply version CAS still rejects even unrelated semantic writes atomically", async () => {
+		const target = withTools();
+		const token = await prepare({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		sqlite.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'").run();
+		expect(() => apply(token)).toThrow("Selected message history changed");
+		expect(body(target.messageId)).toBeDefined();
+		expect(count("narrator_tool_calls")).toBe(2);
+		expect(version()).toBe(8);
+	});
+	test.each([
+		"plan-to-prepare",
+		"prepare-to-apply",
+	])("%s rejects a new rollback suffix member even without a version bump", async (phase) => {
+		const boundary = message(1, [
+			{ type: "text", text: "keep" },
+			{ type: "text", text: "remove" },
+		]);
+		message(2);
+		const fixedSelection = await select({
+			kind: "after_block",
+			messageId: boundary,
+			keepThroughBlockIndex: 0,
+		});
+		const token =
+			phase === "prepare-to-apply"
+				? await service.prepare({ principal, fixedSelection })
+				: undefined;
+		const later = message(3);
+		if (token) expect(() => apply(token)).toThrow("Selected history changed");
+		else {
+			const error = await service.prepare({ principal, fixedSelection }).catch((error) => error);
+			expect(error).toMatchObject({ code: "REVERT_HISTORY_STALE" });
+		}
+		expect(body(boundary)).toBeDefined();
+		expect(body(later)).toBeDefined();
+		expect(version()).toBe(7);
+	});
+	test("ACL changes after preparation reject before any history mutation", async () => {
+		withTools();
+		const token = await prepare();
+		sqlite.query("UPDATE narrators SET visibility='public' WHERE id='root'").run();
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(count("narrator_messages")).toBe(1);
+		expect(version()).toBe(7);
+	});
+	test("new lazy dependencies after preparation reject without any automatic backfill", async () => {
+		const target = withTools(10);
+		const token = await prepare();
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='root',refs_backfill_cursor=11 WHERE id='other'",
+			)
+			.run();
+		let error: unknown;
+		try {
+			apply(token);
+		} catch (cause) {
+			error = cause;
+		}
+		expect(error).toMatchObject({ code: "HISTORY_LAZY_DEPENDENCY_CHANGED", statusCode: 409 });
+		expect(body(target.messageId)).toBeDefined();
+		expect(version()).toBe(7);
+		expect(scalar("SELECT refs_backfill_cursor AS n FROM narrators WHERE id='other'")).toBe(11);
+	});
+	test("status and unrelated lazy cursor loading after preparation do not invalidate the short commit", async () => {
+		withTools(100);
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='other',refs_backfill_cursor=100 WHERE id='root'",
+			)
+			.run();
+		const token = await prepare({ kind: "from_seq", minSeq: 100 });
+		sqlite
+			.query("UPDATE narrators SET status='working',refs_backfill_cursor=50 WHERE id='root'")
+			.run();
+		apply(token);
+		expect(count("narrator_messages")).toBe(0);
+		expect(version()).toBe(8);
+	});
+	test("a malformed lazy cursor after preparation still rejects before history writes", async () => {
+		withTools(100);
+		const token = await prepare();
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='other',refs_backfill_cursor=-1 WHERE id='root'",
+			)
+			.run();
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(count("narrator_messages")).toBe(1);
+		expect(version()).toBe(7);
+	});
 	test("external metadata-only writes preserve selected message versions", async () => {
 		const filename = join(process.env.HOME as string, `history-${Date.now()}.sqlite`);
 		const fileDb = new Database(filename);
@@ -1282,15 +1743,20 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 		expect(body(target.messageId)).toBeDefined();
 		expect(count("narrator_tool_calls")).toBe(1);
 	});
-	test("fake version/ref/block commitments are not accepted merely because digest matches", async () => {
+	test("fake narrator/ref/block commitments are not accepted merely because digest matches", async () => {
 		const target = withTools();
 		const original = await select();
-		for (const kind of ["version", "ref", "block"]) {
+		for (const kind of ["narrator", "ref", "block"]) {
 			const fixedSelection = structuredClone(original);
-			if (kind === "version") fixedSelection.messageVersions[0].messageVersion++;
+			if (kind === "narrator") fixedSelection.messageVersions[0].narratorId = "other";
 			if (kind === "ref") fixedSelection.history.messages[0].refId = "fake-ref";
 			if (kind === "block") fixedSelection.history.blocks[0].key = "fake-block";
-			await expect(service.prepare({ principal, fixedSelection })).rejects.toBeDefined();
+			// Await natively: Bun's async matcher can starve an already reusable thread's RPC.
+			const error = await service.prepare({ principal, fixedSelection }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeDefined();
 		}
 		expect(body(target.messageId)).toBeDefined();
 	});

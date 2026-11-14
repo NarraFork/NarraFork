@@ -11,7 +11,16 @@ interface LeaseEntry {
 	uncertain: boolean;
 	owner: string;
 }
-const leases = new Map<string, LeaseEntry>();
+const OWNER = Symbol.for("narrafork.browser.trace-leases");
+const globals = globalThis as typeof globalThis & {
+	[OWNER]?: { version: 1; leases: Map<string, LeaseEntry> };
+};
+const previous = globals[OWNER];
+if (previous && (previous.version !== 1 || !(previous.leases instanceof Map)))
+	throw new Error("Browser trace lease ownership cannot be recovered");
+const owner = previous ?? { version: 1 as const, leases: new Map<string, LeaseEntry>() };
+globals[OWNER] = owner;
+const leases = owner.leases;
 
 /** A browser-wide trace has one owner, not one owner per page or CDP connection. */
 export function acquireTraceLease(browser: Browser, owner: string): TraceLease {

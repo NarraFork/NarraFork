@@ -260,6 +260,87 @@ describe("the opening brief", () => {
 	});
 });
 
+describe("the handoff section of the opening brief (PR 10c-2)", () => {
+	const handoff = {
+		times: 3,
+		head: 'Handoff (generation 3 · session `nrt` "Refresh work" · 2026-11-11 08:12 UTC): not finished; back to do',
+		lines: ["The session's notes: Refresh takes two paths", "Steps: 2 of 5 done"],
+		notes: [
+			{
+				address: "Kx81mPqa/Note0001",
+				text: "Refresh takes two paths\nThe second is not changed yet",
+			},
+		],
+		earlier: ["Handoff (generation 2 · …): not finished; back to do", "Handoff (generation 1 · …)"],
+	};
+
+	test("without a handoff the brief is what it was; with one, the section sits between the task's text and its notes", () => {
+		const plain = renderTaskBrief(input());
+		expect(renderTaskBrief(input({ handoff: null }))).toBe(plain);
+		expect(plain).not.toContain("## Handoff");
+		const brief = renderTaskBrief(input({ handoff }));
+		const at = (text: string) => brief.indexOf(text);
+		expect(at("## What to do")).toBeLessThan(at("## Handoff from the previous session"));
+		expect(at("## Handoff from the previous session")).toBeLessThan(
+			at("## Notes and steps so far"),
+		);
+		expect(brief).toContain(
+			[
+				"## Handoff from the previous session",
+				"This task was given back unfinished 3 times. The newest handoff follows; continue from it rather than starting over.",
+				`- ${handoff.head}`,
+				"  - The session's notes: Refresh takes two paths",
+				"  - Steps: 2 of 5 done",
+				"The notes it points to, in full:",
+				"- `Kx81mPqa/Note0001`",
+				"  Refresh takes two paths",
+				"  The second is not changed yet",
+				"Earlier handoffs (their first lines):",
+				"- Handoff (generation 2 · …): not finished; back to do",
+				"- Handoff (generation 1 · …)",
+			].join("\n"),
+		);
+		// Everything after it is what the brief without a handoff has.
+		expect(brief.slice(at("## Notes and steps so far"))).toBe(
+			plain.slice(plain.indexOf("## Notes and steps so far")),
+		);
+	});
+
+	test("oversized: the newest handoff is whole, notes and earlier ones give way, the brief stays within its budget", () => {
+		const big = {
+			times: 40,
+			head: handoff.head,
+			lines: ["Steps: 2 of 5 done"],
+			notes: Array.from({ length: 3 }, (_, i) => ({
+				address: `Kx81mPqa/Note000${i}`,
+				text: `Note ${i} ${"n".repeat(3000)}`,
+			})),
+			earlier: Array.from({ length: 20 }, (_, i) => `Earlier ${i} ${"e".repeat(300)}`),
+		};
+		const brief = renderTaskBrief(
+			input({
+				handoff: big,
+				children: Array.from({ length: 500 }, (_, i) => ({
+					text: `Note ${i} ${"x".repeat(80)}`,
+					box: null,
+					children: [],
+				})),
+			}),
+		);
+		expect(bytes(brief)).toBeLessThanOrEqual(OUTLINE_TASK_BRIEF_LIMITS.bytes);
+		expect(brief).toContain(`- ${handoff.head}`);
+		expect(brief).toContain("  - Steps: 2 of 5 done");
+		const section = brief.slice(
+			brief.indexOf("## Handoff from the previous session"),
+			brief.indexOf("## Notes and steps so far"),
+		);
+		expect(bytes(section)).toBeLessThanOrEqual(OUTLINE_TASK_BRIEF_LIMITS.handoffBytes + 2);
+		// The notes under the task and the rules are still there.
+		expect(brief).toContain("- Note 0 ");
+		expect(brief).toContain("## How to work on this task");
+	});
+});
+
 describe("outlineTaskStartBlocker", () => {
 	const wait = (over: object = {}) => ({
 		prerequisites: [],

@@ -10,11 +10,21 @@ NarraFork 的项目原创源代码和配套材料（除另有明确许可声明�
 
 ## GitHub 辅助 Release 披露
 
-`helpers-v<catalog>` 和 `executor-v<version>` 是独立分发产物，也必须携带真实许可正文。辅助 manifest 记录许可文件名称、size 和 SHA256，publisher 核对必需附件及远端资产完整集合；只上传裸可执行文件不能算完整发布。rg/PCRE2、zstd、musl、LLVM compiler-rt/MinGW，以及 executor 的 Go 标准库/模块沿用 `licenses/extra/` 已有正文及选定许可分支。`entries.json` 的分发方式同步标记 GitHub 辅助 Release与旧 tools 兼容路径，不另写或改写第三方许可正文。
+`helpers-v<catalog>`、`executor-v<version>` 和可选的 `remote-peer-v<version>` 是独立分发产物，也必须携带真实许可正文。辅助 manifest 记录许可文件名称、size 和 SHA256，publisher 核对必需附件及远端资产完整集合；只上传裸可执行文件不能算完整发布。rg/PCRE2、zstd、musl、LLVM compiler-rt/MinGW，以及 executor 的 Go 标准库/模块沿用 `licenses/extra/` 已有正文及选定许可分支。`entries.json` 的分发方式同步标记 GitHub 辅助 Release与旧 tools 兼容路径，不另写或改写第三方许可正文。
 
 Linux GCC 构建另保守披露运行库与启动代码；`gcc-runtime.txt` 由固定 GCC 14.2.0 上游 commit 的 COPYING3 与 COPYING.RUNTIME 逐字材料组成，附在 helpers Release 并以 size/SHA256 校验，不改 zstd 原有 BSD 分支。许可原文不凭记忆重写。
 
 新 helper 平台或构建 recipe 引入额外静态链接组件时，仍须补登记和真实许可材料，不能认为共享主程序 `/licenses` 页面已经覆盖独立下载资产。
+
+### 可选 remote-peer 独立组件
+
+`remote-peer` 使用自己的 Go 1.26.1 工具链和 `remote-peer/go.mod` / `go.sum`，不与 remote executor 的版本或 Device RPC 协议混用。NF 主包不包含 peer 可执行文件，普通启动不下载、不启动它；许可页面的登记是独立组件分发披露，**不表示这些 Go/Pion 库已嵌入 NF 主程序，也不表示 WebRTC 原型已接入生产业务**。现有 executor 的 Go 标准库与模块条目保持独立。
+
+独立 peer Release 必须附带 [remote-peer-LICENSES.txt](../licenses/extra/remote-peer-LICENSES.txt)，并在 manifest 中固定其 size/SHA-256。该文件覆盖全部 23 个锁定模块（含 Pion 间接依赖和 `golang.org/x/*`）、Go 1.26.1 的 LICENSE/PATENTS、标准库自身 vendored 模块、fiat-crypto 以及 `math` 中 Sun fdlibm/Cephes 的原始归属材料。Pion 的 `stun/internal/hmac`、`transport/utils/xor` 含 Go BSD-3-Clause 代码，不能只披露根目录 MIT。仅测试依赖、Pion test-wasm/示例/测试数据、Go 编译工具和未启用的 BoringSSL 不作为六平台 peer 二进制的分发内容。
+
+正文由 `remote-peer/internal/licensebundle` 从实际 Go 源目录和锁定 module cache 逐字复制；在 `remote-peer/` 执行 `go run ./internal/licensebundle` 可重现附件。升级依赖后在 `remote-peer/` 执行 `make licenses`：重新生成附件，并把 `entries.json` 中已有 `(remote-peer)` 条目的版本号同步为 `go.mod` 锁定版本；新增或移除模块时脚本拒绝自动处理，需人工审阅许可后补登记（含 `licensebundle` 的 metadata 表）。Dependabot 的 remote-peer Go 升级 PR 由 `.github/workflows/remote-peer-dependabot-licenses.yml` 自动执行同一步骤并推回 PR 分支，随后手动派发 `ci.yml` 与 `remote-peer.yml`（`GITHUB_TOKEN` 的推送不会触发新的 PR 检查）；推送后 Dependabot 不再自动 rebase，需要时评论 `@dependabot recreate`。每段记录模块、版本、上游、源文件与原文 SHA-256；只对字节完全相同的全文作显式映射去重，不合并不同版权人或年份。生成器与测试限制单附件严格小于 64KiB，超限必须先审阅有限拆分，不能放宽上限。
+
+归属待核验点：Pion interceptor v0.1.49 的 `pkg/twcc/arrival_time_map.go` 标注 MIT，但注释说明改编自 Chrome/WebRTC；模块未附单独 WebRTC notice。该上游归属疑点已保留在条目和附件中，材料收集不等于法律合规认证。
 
 ## 第三方披露范围与实现
 

@@ -1,4 +1,5 @@
 import { fileReferenceApi } from "@frontend/lib/api/file-references";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import type { FileTarget } from "@shared/file-reference";
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -93,7 +94,7 @@ export function useInternalFileViewer(
 	const navigation = useFilePanelNavigationReceiver();
 	const dockOpenFilePanel = navigation.openFilePanel;
 	const receiver = navigation.receiver;
-	const useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview;
+	const useInternalViewer = !REMOTE_BUILD && !dockOpenFilePanel && !isWorkspacePreview;
 	const latestNavigation = useRef({
 		narratorId,
 		dockOpenFilePanel,
@@ -109,6 +110,7 @@ export function useInternalFileViewer(
 		};
 	});
 	const handleOpenFilePanel = useMemo(() => {
+		if (REMOTE_BUILD) return undefined;
 		if (dockOpenFilePanel) return (filePath: string) => dockOpenFilePanel(filePath);
 		if (useInternalViewer)
 			return (filePath: string) => {
@@ -127,6 +129,7 @@ export function useInternalFileViewer(
 	);
 	const handleOpenReferencedFile = useCallback(
 		async (target: FileTarget, options: FileNavigationOptions = {}) => {
+			if (REMOTE_BUILD) return;
 			if (
 				options.signal?.aborted ||
 				options.isCurrent?.() === false ||
@@ -191,7 +194,8 @@ export function useInternalFileViewer(
 		[narratorId, canReplaceFile, t],
 	);
 
-	const canOpenReferencedFile = !isWorkspacePreview && (!!dockOpenFilePanel || useInternalViewer);
+	const canOpenReferencedFile =
+		!REMOTE_BUILD && !isWorkspacePreview && (!!dockOpenFilePanel || useInternalViewer);
 
 	return {
 		internalFileViewerPath,

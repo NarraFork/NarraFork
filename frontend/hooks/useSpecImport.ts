@@ -25,7 +25,8 @@ export function useSpecImportStatus(narratorId: string) {
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: [narratorId], types: ["spec_changed"] },
 			(data) => {
-				if (data.source !== "import") return;
+				// Moved by an import, or back by an administrator (12b2).
+				if (data.source !== "import" && data.source !== "revert") return;
 				void queryClient.invalidateQueries({ queryKey: specImportKey(narratorId) });
 			},
 		);

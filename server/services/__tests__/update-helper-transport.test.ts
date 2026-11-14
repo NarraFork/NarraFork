@@ -160,7 +160,19 @@ beforeEach(() => {
 		async (...args: Parameters<typeof fetch>) => {
 			const url = String(args[0]);
 			wireRequests.push({ url, init: args[1] ?? {} });
-			if (!url.startsWith(`https://github.com/${repository}/releases/download/`))
+			const mirroredHelper = helpers.some(
+				({ spec, options }) =>
+					options.context?.source.source === "update-server" &&
+					distributionAssetUrl(options.context.source, HELPER_RELEASE_TAG, spec.toolName) === url,
+			);
+			const mirroredMain =
+				settings.update?.source === "update-server" &&
+				url.startsWith(`${settings.update.serverUrl}/api/v3/products/narrafork/mirror/assets/`);
+			if (
+				!url.startsWith(`https://github.com/${repository}/releases/download/`) &&
+				!mirroredHelper &&
+				!mirroredMain
+			)
 				throw new Error("Unexpected source or real network call");
 			return new Response(url.endsWith(".zstd-patch") ? patchPayload : payload);
 		},
@@ -232,24 +244,46 @@ describe("main downloadUpdate helper/transport wiring", () => {
 		expect(JSON.stringify(result.preparedIdentity)).not.toContain("secret");
 	});
 
-	test("explicit mirror sourceIdentity still freezes configured GitHub helper source and full fallback", async () => {
+	test("explicit mirror helper and main-program full delivery share the frozen mirror source", async () => {
 		if (!settings.update) throw new Error("Missing update settings");
 		settings.update.source = "update-server";
-		const info = {
-			...fixtureRelease(),
-			source: "update-server" as const,
-			_mirror: { serverUrl: settings.update.serverUrl },
+		const fixture = fixtureRelease();
+		const mirrorBase = `${settings.update.serverUrl}/api/v3/products/narrafork/mirror`;
+		const sha256 = createHash("sha256").update(payload).digest("hex");
+		const info: ReleaseInfo = {
+			...fixture,
+			source: "update-server",
+			_github: undefined,
+			recoveryManifestVersions: [1, 2],
+			_mirror: {
+				serverUrl: settings.update.serverUrl,
+				full: {
+					name: fixture.path,
+					size: payload.length,
+					sha256,
+					sha512,
+					version,
+					platform: fixture.sourceIdentity?.platform ?? "linux-x64",
+					commit: "a".repeat(40),
+					recoveryManifestVersions: [1, 2],
+					url: `${mirrorBase}/assets/${sha256}`,
+					metadata: {
+						name: `${fixture.path}.metadata.json`,
+						size: 1,
+						sha256: "a".repeat(64),
+						url: `${mirrorBase}/assets/${"a".repeat(64)}`,
+					},
+				},
+			},
 		};
 		seam = async (options, dependencies) => {
 			expect(options.release.sourceIdentity?.source).toBe("update-server");
 			expect(await dependencies.resolveZstd(options.signal)).toBe("/mock/verified/zstd");
 			expect(helpers[0]?.options.context?.source).toEqual({
-				source: "github",
+				source: "update-server",
 				repository,
-				mirror: {
-					serverUrl: settings.update?.serverUrl ?? "https://narrafork-update.b.domexie.cn",
-					product: settings.update?.product ?? "narrafork",
-				},
+				serverUrl: settings.update?.serverUrl ?? "https://narrafork-update.b.domexie.cn",
+				product: settings.update?.product ?? "narrafork",
 			});
 			await dependencies.downloadFull(options.release, options.outputPath, {
 				signal: options.signal,
@@ -259,8 +293,13 @@ describe("main downloadUpdate helper/transport wiring", () => {
 		const result = await downloadUpdate(info, undefined, { signal: parent.signal });
 		expect(result.success).toBe(true);
 		expect(result.preparedIdentity?.sourceIdentity?.source).toBe("update-server");
+		expect(wireRequests).toHaveLength(2);
+		expect(wireRequests[0].url).toContain(
+			`${settings.update.serverUrl}/api/v3/products/narrafork/mirror/tools/helpers/${HELPER_RELEASE_TAG}/assets/`,
+		);
+		expect(wireRequests[1].url).toBe(info._mirror?.full.url ?? "");
 		expect(
-			wireRequests.every(({ url }) => url.startsWith(`https://github.com/${repository}/`)),
+			wireRequests.every(({ url }) => new URL(url).origin === settings.update?.serverUrl),
 		).toBe(true);
 	});
 

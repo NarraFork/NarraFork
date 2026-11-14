@@ -2,16 +2,20 @@ import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { BalanceProbeRequestError } from "@server/lib/provider-balance-adapters";
 import { builtinProviderBalanceEngine } from "@server/lib/provider-balance-engine";
 import type { CustomApiProviderConfig } from "@server/lib/settings";
-import { createApikeyQuotaEngine } from "@server/services/apikey-quota-plugin-engine";
+import {
+	createApikeyQuotaEngine,
+	invokeApikeyQuotaCommand,
+} from "@server/services/apikey-quota-plugin-engine";
 import { PluginManager } from "@server/services/plugin-manager";
 import { pluginPlatformServices } from "@server/services/plugin-platform-services";
+import { apikeyQuotaCommandInputSchema } from "@shared/apikey-quota-plugin";
 import type { ProviderBalanceData } from "@shared/provider-balance";
 
 /**
  * End-to-end parity between the two implementations of one engine interface.
  *
  * Both are driven against the same mock relay with the same provider config. Every plugin
- * invocation must cross the real tools.invoke RPC and leave a successful registry audit;
+ * invocation must cross the real commands.invoke RPC after host authorization;
  * falling back to the host implementation fails the test instead of comparing it with itself.
  */
 const payloads = {
@@ -49,8 +53,8 @@ const payloads = {
 
 /**
  * The engine under test is wired to the *real* plugin manager, so the plugin is reached through
- * the same activation + tool-registry path production uses. Without that, the engine would find
- * no registered tool, silently answer from the bundled adapters, and this whole file would be
+ * the same activation + authorized-command path production uses. Without that, the engine would find
+ * no registered command, silently answer from the bundled adapters, and this whole file would be
  * comparing the bundled engine with itself.
  */
 let managerPromise: Promise<PluginManager> | undefined;
@@ -90,25 +94,28 @@ async function pluginEngine() {
 		throw new Error("Quota parity must execute plugin RPC, not the host fallback");
 	};
 	return createApikeyQuotaEngine({
-		tools: {
-			async invoke(...args: Parameters<typeof pluginPlatformServices.toolRegistry.invoke>) {
-				const runtime = pluginPlatformServices.runtimeSupervisor.get("com.narrafork.apikey-quota");
-				expect(runtime).toBeDefined();
+		commands: {
+			async invoke(
+				...args: Parameters<typeof pluginPlatformServices.pluginCommandRegistry.invoke>
+			) {
+				const [commandId, pluginId, input, context] = args;
+				expect(commandId).toBe("com.narrafork.apikey-quota/query-balance");
+				expect(pluginId).toBe("com.narrafork.apikey-quota");
+				const runtime = pluginPlatformServices.runtimeSupervisor.get(pluginId);
 				if (!runtime) throw new Error("Quota runtime was not activated");
 				const rpc = spyOn(runtime, "request");
 				try {
-					const result = await pluginPlatformServices.toolRegistry.invoke(...args);
+					const result = await invokeApikeyQuotaCommand(
+						apikeyQuotaCommandInputSchema.parse(input),
+						context,
+					);
 					expect(rpc).toHaveBeenCalledWith(
-						"tools.invoke",
+						"commands.invoke",
 						expect.objectContaining({ contributionId: "query-balance" }),
 						expect.any(Object),
 					);
-					expect(pluginPlatformServices.toolRegistry.getAuditEntries().at(-1)).toMatchObject({
-						fullId: "com.narrafork.apikey-quota/query-balance",
-						methodId: "tools.invoke",
-						principalKind: "plugin_background",
-						outcome: "succeeded",
-					});
+					expect(rpc.mock.calls.some(([method]) => method === "tools.invoke")).toBe(false);
+					expect(pluginPlatformServices.toolRegistry.list(pluginId)).toEqual([]);
 					return result;
 				} finally {
 					rpc.mockRestore();
@@ -542,6 +549,20 @@ describe("per-request timeout means the same thing in both engines", () => {
 	}
 });
 
+test("quota backend rejects the former tools.invoke RPC", async () => {
+	const manager = await sharedManager();
+	const pluginId = "com.narrafork.apikey-quota";
+	await manager.activate(pluginId);
+	const runtime = pluginPlatformServices.runtimeSupervisor.get(pluginId);
+	if (!runtime) throw new Error("Quota runtime was not activated");
+	await expect(
+		runtime.request("tools.invoke", {
+			contributionId: "query-balance",
+			input: { mode: "probe", baseUrl: "https://unused.invalid/v1", apiKey: "quota-test-only" },
+		}),
+	).rejects.toMatchObject({ code: "-32601" });
+});
+
 test("revoking the initial grant still denies RPC after re-enabling the builtin", async () => {
 	const manager = await sharedManager();
 	const pluginId = "com.narrafork.apikey-quota";
@@ -559,13 +580,12 @@ test("revoking the initial grant still denies RPC after re-enabling the builtin"
 	const rpc = spyOn(runtime, "request");
 	try {
 		await expect(
-			pluginPlatformServices.toolRegistry.invoke(
-				`${pluginId}/query-balance`,
+			invokeApikeyQuotaCommand(
 				{ mode: "probe", baseUrl: "https://unused.invalid/v1", apiKey: "quota-test-only" },
-				{ invocation: { kind: "plugin_background", source: "internal" } },
+				{ requestId: "quota-revoked-grant" },
 			),
 		).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
-		expect(rpc.mock.calls.some(([method]) => method === "tools.invoke")).toBe(false);
+		expect(rpc.mock.calls.some(([method]) => method === "commands.invoke")).toBe(false);
 		expect((await manager.getPermissions(pluginId)).grants).toEqual([]);
 	} finally {
 		rpc.mockRestore();
@@ -590,7 +610,7 @@ describe("host egress policy is handed to the plugin transport verbatim", () => 
 				signal: AbortSignal,
 				fetcher: (url: string, init: Record<string, unknown>) => Promise<Response>,
 			) => Promise<{ balance?: unknown } | null>;
-			parseToolInput: (raw: Record<string, unknown>) => Record<string, unknown>;
+			parseCommandInput: (raw: Record<string, unknown>) => Record<string, unknown>;
 		}>;
 
 	test("the resolved proxy and the timeout reach fetch options unchanged", async () => {
@@ -618,8 +638,8 @@ describe("host egress policy is handed to the plugin transport verbatim", () => 
 	});
 
 	test("the wire input keeps every connection fact the host sent", async () => {
-		const { parseToolInput } = await plugin();
-		const parsed = parseToolInput({
+		const { parseCommandInput } = await plugin();
+		const parsed = parseCommandInput({
 			mode: "probe",
 			baseUrl: "https://relay.example.test/v1",
 			apiKey: "sk-parity",

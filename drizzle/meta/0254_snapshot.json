@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "cf9ddf4a-7097-47eb-ae46-a816b5a34987",
+  "id": "34cd43ab-2abb-4cd2-89d6-6867131afc6e",
   "prevId": "525a8d15-a1d5-49db-b2ba-ad09f72a1e10",
   "tables": {
     "acl_events": {
@@ -15903,6 +15903,212 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
+    "outline_spec_imports": {
+      "name": "outline_spec_imports",
+      "columns": {
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "trigger": {
+          "name": "trigger",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "last_error_code": {
+          "name": "last_error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_error_count": {
+          "name": "last_error_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_error_detail": {
+          "name": "last_error_detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "attention_reason": {
+          "name": "attention_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "switch_count": {
+          "name": "switch_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "switched_at": {
+          "name": "switched_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "notice_switch": {
+          "name": "notice_switch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "space_id": {
+          "name": "space_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "task_page_id": {
+          "name": "task_page_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "fence_revision_id": {
+          "name": "fence_revision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "tasks": {
+          "name": "tasks",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "pages": {
+          "name": "pages",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "revert_count": {
+          "name": "revert_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "reverted_at": {
+          "name": "reverted_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "reverted_by": {
+          "name": "reverted_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "revert_source_key": {
+          "name": "revert_source_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "revert_note_ids": {
+          "name": "revert_note_ids",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_actor": {
+          "name": "last_actor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_outline_spec_imports_status": {
+          "name": "idx_outline_spec_imports_status",
+          "columns": [
+            "status",
+            "updated_at",
+            "narrator_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "outline_spec_imports_narrator_id_narrators_id_fk": {
+          "name": "outline_spec_imports_narrator_id_narrators_id_fk",
+          "tableFrom": "outline_spec_imports",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "outline_task_claims": {
       "name": "outline_task_claims",
       "columns": {
@@ -20655,14 +20861,6 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'{}'"
-        },
-        "hidden_plugin_overlays": {
-          "name": "hidden_plugin_overlays",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "'[]'"
         },
         "traits": {
           "name": "traits",

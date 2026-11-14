@@ -51,6 +51,7 @@ import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
+import { useAllModels } from "../../../hooks/useModels";
 import {
 	useBlacklistDirs,
 	useClearBlockedSkills,
@@ -131,6 +132,8 @@ import {
 } from "./details-panel-sections";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorGitIdentitySelect } from "./NarratorGitIdentitySelect";
+import { TurnRangeInput } from "./TurnRangeInput";
+import { TurnRangePickerModal } from "./TurnRangePickerModal";
 import {
 	beginEditingDevice,
 	describeDeviceDirectories,
@@ -527,6 +530,9 @@ function NarratorDetailsContent({
 	const modelPoolDraft = useDetailsDraft(
 		customTraits?.subagentModelRestriction?.pools ?? EMPTY_POOLS,
 	);
+	// Shares the ["settings"] cache the hosting panel already loaded; the pool
+	// editor only needs it so provider display names are searchable.
+	const { modelOptionsFilter } = useAllModels();
 	const updateSubagentModelsMutation = useUpdateSubagentModelRestriction();
 	const clearSubagentModelsMutation = useClearSubagentModelRestriction();
 	const updateDisabledToolsMutation = useUpdateDisabledTools();
@@ -581,6 +587,14 @@ function NarratorDetailsContent({
 	// exported file states when this left earlier history out, so the narrower
 	// default cannot be mistaken for a complete archive.
 	const [exportFullHistory, setExportFullHistory] = useState(false);
+	// 空串 = 不限制，导出当前 scope 的全部消息。
+	const [exportRange, setExportRange] = useState("");
+	// 轮号随 scope 重排：切换完整历史后，旧范围会指到别的轮次上，直接清掉。
+	const changeExportFullHistory = (next: boolean) => {
+		setExportFullHistory(next);
+		setExportRange("");
+	};
+	const [rangePickerOpen, setRangePickerOpen] = useState(false);
 	const [exporting, setExporting] = useState(false);
 
 	const toolOptions = useMemo(
@@ -758,6 +772,7 @@ function NarratorDetailsContent({
 				scope: exportFullHistory ? "full" : "visible",
 				includeToolIO: exportIncludeToolIO,
 				lang: i18n.language,
+				range: exportRange.trim() || undefined,
 			});
 			objectUrl = URL.createObjectURL(blob);
 			const link = document.createElement("a");
@@ -1785,6 +1800,7 @@ function NarratorDetailsContent({
 						t("details.exportFormatCodex"),
 						t("details.exportIncludeToolIO"),
 						t("details.exportFullHistory"),
+						t("details.exportRange"),
 						t("details.exportAction"),
 					]}
 				>
@@ -1839,9 +1855,26 @@ function NarratorDetailsContent({
 								label={t("details.exportFullHistory")}
 								description={t("details.exportFullHistoryDescription")}
 								checked={exportFullHistory}
-								onChange={(event) => setExportFullHistory(event.currentTarget.checked)}
+								onChange={(event) => changeExportFullHistory(event.currentTarget.checked)}
 								disabled={exporting}
 							/>
+							<Group align="flex-end" gap="xs" wrap="nowrap">
+								<Box style={{ flex: 1, minWidth: 0 }}>
+									<TurnRangeInput
+										value={exportRange}
+										onChange={setExportRange}
+										disabled={exporting}
+									/>
+								</Box>
+								<Button
+									size="xs"
+									variant="default"
+									disabled={exporting}
+									onClick={() => setRangePickerOpen(true)}
+								>
+									{t("details.exportRangePick")}
+								</Button>
+							</Group>
 							<Group justify="flex-end">
 								<Button
 									size="xs"
@@ -1855,6 +1888,20 @@ function NarratorDetailsContent({
 						</>
 					)}
 				</DetailsPanelSection>
+
+				<TurnRangePickerModal
+					opened={rangePickerOpen}
+					onClose={() => setRangePickerOpen(false)}
+					narratorId={narratorId}
+					format={exportFormat === "json" ? "json" : "markdown"}
+					onFormatChange={setExportFormat}
+					includeToolIO={exportIncludeToolIO}
+					onIncludeToolIOChange={setExportIncludeToolIO}
+					fullHistory={exportFullHistory}
+					onFullHistoryChange={changeExportFullHistory}
+					range={exportRange}
+					onRangeChange={setExportRange}
+				/>
 
 				<DetailsPanelSection
 					id="customTraits"
@@ -1876,6 +1923,7 @@ function NarratorDetailsContent({
 							pools={modelPoolDraft.value}
 							setPools={modelPoolDraft.setValue}
 							availableModels={customTraits?.availableModels}
+							modelOptionsFilter={modelOptionsFilter}
 							loaded={customTraits !== undefined}
 							saving={updateSubagentModelsMutation.isPending}
 							clearing={clearSubagentModelsMutation.isPending}

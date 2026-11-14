@@ -31,6 +31,7 @@ import {
 	useSpecTasks,
 	useUpdateSpecFile,
 } from "../../../hooks/useSpec";
+import { useSpecImportStatus } from "../../../hooks/useSpecImport";
 import { useNarratorCurrentTask } from "../../../hooks/useTaskBoard";
 import { api } from "../../../lib/api";
 import type { SpecOutlineBehavior, SpecTaskItem } from "../../../lib/api/spec";
@@ -41,6 +42,7 @@ import { MarkdownContent } from "../markdown/MarkdownContent";
 import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecImportBanner } from "./SpecImportBanner";
+import { SpecLossNotice } from "./SpecLossFindings";
 import { SpecTaskBoard } from "./SpecTaskBoard";
 import type { SpecEditorMode } from "./spec-editor-mode";
 import { registerSpecFileSelector } from "./spec-file-reveal";
@@ -147,6 +149,7 @@ function OutlineTasksPanel({
 					</ActionIcon>
 				</Group>
 			)}
+			<SpecLossNotice narratorId={narratorId} />
 			<ScrollArea style={{ flex: 1 }}>
 				<AutoContinuationControl narratorId={narratorId} />
 				<Box px="xs" pb="xs">
@@ -462,10 +465,15 @@ function SpecFilesPanel({
 			)}
 
 			{onBackToBoard ? (
-				<BackToBoard onClick={onBackToBoard} />
+				<>
+					<BackToBoard onClick={onBackToBoard} />
+					<SpecMovedNotice narratorId={narratorId} />
+				</>
 			) : (
 				<SpecImportBanner narratorId={narratorId} />
 			)}
+			{/* What a save from the old editor may have lost here (12c): shown, never repaired. */}
+			<SpecLossNotice narratorId={narratorId} />
 			{/* File tabs */}
 			<Box px="xs" py={6} style={{ flexShrink: 0 }}>
 				<SpecFileTabStrip
@@ -611,6 +619,71 @@ function BackToBoard({ onClick }: { onClick: () => void }) {
 				{t("board.legacy.back")}
 			</Anchor>
 		</Box>
+	);
+}
+
+/**
+ * The read-only line over the old Spec files of a session the import moved into the outline
+ * (outline P2 PR 12b2): they are kept, read-only and no longer updated, and a link opens the
+ * session's task page (beside the session when the host has an outline dock, else on the outline
+ * page). A session created in the outline has no such line (nothing was moved).
+ */
+function SpecMovedNotice({ narratorId }: { narratorId: string }) {
+	const { t } = useTranslation("narrator");
+	const opener = useOutlineOpener();
+	const { data } = useSpecImportStatus(narratorId);
+	if (!data?.switchedAt || data.state === "reverted") return null;
+	const spaceId = data.spaceId;
+	const pageId = data.taskPageId;
+	const href = spaceId
+		? outlineTargetHref(
+				pageId ? { kind: "block", spaceId, blockId: pageId } : { kind: "space", spaceId },
+			)
+		: null;
+	return (
+		<Group
+			gap={6}
+			px="sm"
+			py={6}
+			mt={6}
+			wrap="nowrap"
+			align="flex-start"
+			data-testid="spec-moved-notice"
+			style={{
+				flexShrink: 0,
+				borderTop: "1px solid var(--mantine-color-default-border)",
+				borderBottom: "1px solid var(--mantine-color-default-border)",
+				background: "var(--mantine-color-default-hover)",
+			}}
+		>
+			<IconLock size={13} color="var(--mantine-color-dimmed)" style={{ marginTop: 2 }} />
+			<Box style={{ flex: 1, minWidth: 0 }}>
+				<Text size="xs" fw={600}>
+					{t("spec.specImportMovedTitle")}
+				</Text>
+				<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+					{t("spec.specImportMovedBody")}{" "}
+					{href && spaceId && (
+						<Anchor
+							size="xs"
+							href={href}
+							data-testid="spec-moved-open"
+							onClick={(event) => {
+								if (!opener || !isOpenClick(event)) return;
+								// A host that cannot show a panel right now leaves the link to navigate.
+								const opened = opener.open(
+									pageId ? { spaceId, blockId: pageId, pageId } : { spaceId },
+									{ newPanel: wantsNewPanel(event) },
+								);
+								if (opened) event.preventDefault();
+							}}
+						>
+							{t("spec.specImportMovedOpen")}
+						</Anchor>
+					)}
+				</Text>
+			</Box>
+		</Group>
 	);
 }
 

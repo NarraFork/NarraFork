@@ -35,6 +35,7 @@ import { FileChangeBlobCatalog } from "./file-change-blob-catalog";
 import { FileChangeBlobStore } from "./file-change-blob-store";
 import {
 	auditFileChangePhysical,
+	closeFileChangePhysicalAudits,
 	type FileChangeAuditIdentity,
 	type FileChangePhysicalAuditOptions,
 	type FileChangePhysicalAuditSummary,
@@ -1160,5 +1161,45 @@ finally:
 		expect(missing.full).toBe(false);
 		expect(codes(missing)).toContain("wal_sidecars_required");
 		expect(await readdir(sandbox)).toEqual(entries);
+	});
+
+	test("permanent close drains queued work and waits for owned process exit ACK", async () => {
+		const request = await options();
+		const exit = Promise.withResolvers<number>();
+		let creates = 0;
+		let cancellations = 0;
+		const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+			creates++;
+			return {
+				exited: exit.promise,
+				send(message: string) {
+					if (JSON.parse(message).type === "cancel") cancellations++;
+				},
+				kill() {},
+			} as unknown as ReturnType<typeof Bun.spawn>;
+		});
+		try {
+			const first = auditFileChangePhysical(request);
+			const waiting = auditFileChangePhysical(request);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(creates).toBe(1);
+			let closed = false;
+			const closing = closeFileChangePhysicalAudits().then(() => {
+				closed = true;
+			});
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(closed).toBe(false);
+			expect(cancellations).toBe(1);
+			expect(creates).toBe(1);
+			expect((await waiting).issues).toContain("closed");
+			exit.resolve(0);
+			await closing;
+			expect((await first).issues).toContain("closed");
+			expect(closed).toBe(true);
+			expect((await auditFileChangePhysical(request)).issues).toContain("closed");
+		} finally {
+			spawn.mockRestore();
+			exit.resolve(0);
+		}
 	});
 });

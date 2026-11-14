@@ -571,11 +571,43 @@
 		},
 		{
 			"idx": 71,
-			"tag": "0071_plugin-overlay-preferences",
-			"id": "0c49a536-fc06-4e11-910d-f0f4d011cf4e",
+			"tag": "0071_outline_spec_imports",
+			"id": "c8a9eeba-aacb-4856-b151-f491477a6d62",
 			"prevId": "1363fe77-68fa-4135-8d93-e64136d06a6d",
 			"version": "7",
-			"snapshotDigest": "3861f221e3589d36136721ff456e74072f2e4bcad38610bc7e5e11844ef12075"
+			"snapshotDigest": "f9e7d6b4fe840ad6f7991ac9c622049d233e972f53c6a99dd3cfd665a4b201f7"
+		},
+		{
+			"idx": 72,
+			"tag": "0072_api_request_cache_usage_reported",
+			"id": "11493ae9-9036-4353-b911-18624a649666",
+			"prevId": "c8a9eeba-aacb-4856-b151-f491477a6d62",
+			"version": "7",
+			"snapshotDigest": "a99655ddcd191560e9e7b012214cf92ec9efa813515a472cd06bed4251eb15d6"
+		},
+		{
+			"idx": 73,
+			"tag": "0073_outline_spec_loss",
+			"id": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+			"prevId": "11493ae9-9036-4353-b911-18624a649666",
+			"version": "7",
+			"snapshotDigest": "9b69bab6d6b1864e335e6d5a067c9e052ba4ea869b1eb384e715818ce611ca83"
+		},
+		{
+			"idx": 74,
+			"tag": "0074_appearance_preferences",
+			"id": "4732deae-5c40-46e7-a744-98ff336e40ad",
+			"prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+			"version": "7",
+			"snapshotDigest": "b02e691735cb67b24ad5b98b24178b943fbd422bf13078b91535370a06c13829"
+		},
+		{
+			"idx": 75,
+			"tag": "0075_plugin_overlay_preferences",
+			"id": "247a3c32-d37e-4ac1-8c2d-f1c176eb47a4",
+			"prevId": "4732deae-5c40-46e7-a744-98ff336e40ad",
+			"version": "7",
+			"snapshotDigest": "924477a94066dad819736d414a88c27485b0f83025ccce1c18e0c9e5431c8759"
 		}
 	]
 }

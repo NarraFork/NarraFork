@@ -527,6 +527,52 @@ export interface OidcProviderConfig {
 	enabled?: boolean;
 }
 
+/**
+ * A single LDAP / Active Directory directory used as a *credential provider* for the
+ * ordinary login form — not as another sign-in button.
+ *
+ * The local account stays the authorization record (role, sessions, MFA); the directory
+ * only decides whether the submitted password is correct. So a login is: local bcrypt
+ * first, and only when that fails, the directory. One directory per instance.
+ */
+export interface LdapSettings {
+	/** Master switch. `enabled && url` is what actually turns directory logins on. */
+	enabled: boolean;
+	/** `ldap://host:port` or `ldaps://host:port`. Never carries credentials or a base DN. */
+	url: string;
+	/** Upgrade a plaintext `ldap://` connection with StartTLS before binding. */
+	startTls?: boolean;
+	/** Verify the server certificate. Defaults to true; only disable for a self-signed CA. */
+	tlsRejectUnauthorized?: boolean;
+	/** TCP/TLS connect timeout in ms (1000..30000, default 5000). */
+	connectTimeoutMs?: number;
+	/** Per-operation timeout in ms (1000..30000, default 5000). */
+	timeoutMs?: number;
+	/**
+	 * `search` (default): bind a service account, find the user's DN, bind as them.
+	 * `direct`: build the DN (or UPN) from `bindDnTemplate` and bind as them directly.
+	 */
+	mode?: "search" | "direct";
+	/** Service-account DN for `search` mode. Empty/omitted = anonymous search. */
+	bindDn?: string;
+	/** Service-account password. Masked on read; empty/masked on write keeps the stored value. */
+	bindPassword?: string;
+	/** Search root, e.g. `dc=example,dc=com`. Required in `search` mode. */
+	searchBase?: string;
+	/** Search scope. Defaults to `sub`. */
+	searchScope?: "sub" | "one" | "base";
+	/** RFC 4515 filter containing `{username}`. Defaults to `(uid={username})`. */
+	searchFilter?: string;
+	/** `direct` mode template containing `{username}`, e.g. `{username}@corp.example.com`. */
+	bindDnTemplate?: string;
+	/** Attribute holding the login name. Defaults to `uid`; Active Directory uses `sAMAccountName`. */
+	usernameAttribute?: string;
+	/** Attribute holding the email address. Defaults to `mail`. */
+	emailAttribute?: string;
+	/** Attribute holding the display name. Defaults to `cn`. */
+	displayNameAttribute?: string;
+}
+
 /** 逐模型可选的协议；`agent.modelProtocols` 与 `agent.modelProtocolOverrides` 的值域。 */
 export const MODEL_PROTOCOLS = [
 	"anthropic-messages",
@@ -686,11 +732,19 @@ export interface NarraForkSettings {
 		 * How sessions that still keep their tasks in Dynamic Spec are imported into the outline
 		 * (outline P2 PR 12b), while `enabled` is on: their current spec files, tasks and behavior
 		 * fence are written into the session space, checked one by one, and the session is moved
-		 * to the outline (its Dynamic Spec rows stay). `manual` (the default): only from the Spec
-		 * panel's button. `auto`: also before a small session's next run and by a background job
-		 * while sessions are idle. `off`: not at all.
+		 * to the outline (its Dynamic Spec rows stay). `auto` (the default, outline P2 PR 12b2):
+		 * before a small session's next run, by a background job while sessions are idle, and from
+		 * the Spec panel's button. `manual`: only from the button (and an administrator's
+		 * re-import). `off`: not at all.
 		 */
 		specImport?: "auto" | "manual" | "off";
+		/**
+		 * When the swallowed-content scan (outline P2 PR 12c) first ran on this instance (ISO time;
+		 * written by the scan, not meant to be edited). The scan ships after the Spec panel's editor
+		 * was fixed, so a person's save made after this moment was made with the fixed editor: what
+		 * it removed was removed on purpose, and the scan does not look at it.
+		 */
+		specLossCutoff?: string;
 	};
 	/** Plugin subsystem settings. */
 	/** Request evidence (ring recording + auto-pin); read live for each provider request. */
@@ -1012,6 +1066,11 @@ export interface NarraForkSettings {
 		 * enables a "Sign in with …" option. Empty/omitted = SSO disabled.
 		 */
 		oidcProviders?: OidcProviderConfig[];
+		/**
+		 * Optional LDAP / Active Directory directory that accepts the ordinary login
+		 * form's password. Omitted or `enabled: false` = directory logins off.
+		 */
+		ldap?: LdapSettings;
 	};
 	/** OAuth provider runtime configuration. */
 	oauth?: {
@@ -1109,6 +1168,8 @@ export interface NarraForkSettings {
 		/** Automatically download updates when available. */
 		autoDownload: boolean;
 	};
+	/** Optional RTC access; secrets and state paths are never settings. */
+	remoteAccess?: import("../../../shared/remote-access/management").RemoteAccessSettings;
 	/** Application-level virtual network relay for Bun-to-Bun communication. */
 	vnet?: {
 		enabled: boolean;
