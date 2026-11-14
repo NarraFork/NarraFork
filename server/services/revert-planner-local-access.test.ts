@@ -46,6 +46,7 @@ import {
 import { withFileWrite } from "./file-write-queue";
 import { narratorService } from "./narrator-service";
 import * as narratorState from "./narrator-session-state";
+import * as projectIndex from "./project-index";
 import { collectRevertBlockers } from "./revert-blockers";
 import type { RevertPlanFileMetadata, RevertPlanSummary } from "./revert-plan-service";
 import { RevertPlannerLocalAccess } from "./revert-planner-local-access";
@@ -176,6 +177,12 @@ async function seedFixture(owner: HttpFixtureLifetime) {
 	settings.workspace.treeSnapshotsEnabled = false;
 	runtime = await getDefaultLocalFileChangeRuntime();
 	owner.runtime = runtime;
+	// Workspace switching starts index/Git probes after the HTTP response. They still own this cwd.
+	const syncProjects = projectIndex.syncNarratorProjectLinksSafely;
+	const projectSync = spyOn(projectIndex, "syncNarratorProjectLinksSafely").mockImplementation(
+		(id) => track(owner, syncProjects(id)),
+	);
+	owner.restorers.push(() => projectSync.mockRestore());
 	const verifyNamespace = runtime.verifyNamespace;
 	// Track actual namespace checks and file execution through cancellation, without
 	// recreating the retired workspace-wide namespace lock.
