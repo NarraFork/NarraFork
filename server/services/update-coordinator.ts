@@ -988,13 +988,14 @@ export async function waitUntilUpdateGateOpens(signal?: AbortSignal): Promise<vo
 }
 
 /** Park teardown failures, but let explicit cancellation/deadlines reach the normal finalizer. */
-export async function waitForRestartBeforeFailure(signal: AbortSignal): Promise<void> {
-	if (state.phase !== "restarting" || signal.aborted) return;
+export async function waitForRestartBeforeFailure(signal: AbortSignal): Promise<boolean> {
+	if (state.phase !== "restarting" || signal.aborted) return false;
 	try {
 		await waitUntilUpdateGateOpens(signal);
 	} catch (error) {
 		if (!signal.aborted) throw error;
 	}
+	return true;
 }
 
 export function markUpdateRestarting(): UpdateCoordinationStatus {
