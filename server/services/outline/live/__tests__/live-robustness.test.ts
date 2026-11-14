@@ -13,9 +13,12 @@ import {
 	decodeLiveFrame,
 	encodeLiveFrame,
 	LIVE_FRAME,
+	LIVE_TEXT_KIND,
 	type LiveFrame,
 	OUTLINE_LIVE_MAX_HANDLE,
+	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
+import { seededTextDoc } from "@shared/outline-live-text";
 import { and, eq } from "drizzle-orm";
 import * as Y from "yjs";
 import { db } from "../../../../db";
@@ -50,6 +53,7 @@ import {
 } from "../registry";
 import { replayLiveEpoch } from "../replay";
 import {
+	encodeLogTexts,
 	LIVE_SYNC_ACTOR,
 	OUTLINE_LIVE_BOUNDS,
 	OUTLINE_LIVE_HOOKS,
@@ -351,7 +355,7 @@ describe("access and joins", () => {
 			kind: LIVE_FRAME.join,
 			handle: 70_000,
 			n: 0,
-			head: { page: pageId, mode: "view", key: "ghostkey01" },
+			head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "view", key: "ghostkey01" },
 			body: new Uint8Array(0),
 		});
 		expect(ghost.sent).toEqual([]);
@@ -384,7 +388,7 @@ describe("access and joins", () => {
 				kind: LIVE_FRAME.join,
 				handle: 1,
 				n: 0,
-				head: { page: pageId, mode: "view", key: "ratekey001" },
+				head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "view", key: "ratekey001" },
 				body: new Uint8Array(0),
 			});
 		}
@@ -404,7 +408,7 @@ describe("access and joins", () => {
 			kind: LIVE_FRAME.join,
 			handle: 2,
 			n: 0,
-			head: { page: pageId, mode: "view", key: "slowkey001" },
+			head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "view", key: "slowkey001" },
 			body: new Uint8Array(0),
 		});
 		expect(answers.map((f) => f.kind)).toEqual([LIVE_FRAME.closed]);
@@ -661,7 +665,7 @@ describe("misbehaving clients", () => {
 			kind: LIVE_FRAME.join,
 			handle: 3,
 			n: 0,
-			head: { page: pageId, mode: "edit", key: "floodkey01" },
+			head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "edit", key: "floodkey01" },
 			body: new Uint8Array(0),
 		});
 		let release: () => void = () => {};
@@ -753,7 +757,7 @@ describe("the socket adapter", () => {
 			encodeLiveFrame({
 				kind: LIVE_FRAME.join,
 				handle: 1,
-				head: { page: pageId, mode: "edit", key: "adapterkey1" },
+				head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "edit", key: "adapterkey1" },
 			}),
 		);
 		await waitFor(() => out.some((f) => f.kind === LIVE_FRAME.joined), 3000, "joined");
@@ -1092,10 +1096,8 @@ describe("logs written around a commit", () => {
 			actor: { kind: "human", id: owner },
 			responsibleUserId: owner,
 		});
-		const doc = new Y.Doc();
-		const text = new Y.Text();
-		doc.getMap<Y.Text>("texts").set(block, text);
-		text.insert(0, "x hello");
+		const { doc, text } = seededTextDoc("x");
+		text.insert(1, " hello");
 		const epoch = 424_242;
 		const at = new Date().toISOString();
 		const b64 = (data: Uint8Array) => Buffer.from(data).toString("base64");
@@ -1104,7 +1106,11 @@ describe("logs written around a commit", () => {
 				pageBlockId: pageId,
 				epoch,
 				seq: 0,
-				updateB64: b64(Y.encodeStateAsUpdate(doc)),
+				updateB64: b64(
+					encodeLogTexts([
+						{ id: block, kind: LIVE_TEXT_KIND.update, data: Y.encodeStateAsUpdate(doc) },
+					]),
+				),
 				actorKind: "system",
 				actorId: "outline-live",
 				createdAt: at,

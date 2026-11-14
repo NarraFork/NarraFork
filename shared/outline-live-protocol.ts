@@ -19,12 +19,32 @@
  *               the recipient the server has processed (batch); 0 when unused
  *   varuint     length of the JSON head in bytes, 0 for none
  *   …           the JSON head (UTF-8)
- *   …           the body: raw bytes to the end of the frame (a Yjs update or state vector)
+ *   …           the body: raw bytes to the end of the frame: text entries ({@link LiveTextEntry})
  *
- * A typing frame is therefore 5 bytes of framing plus the Yjs update, in both directions.
+ * TEXT IS PER BLOCK (protocol version 2)
+ * --------------------------------------
+ * Every block has a text document of its own (`shared/outline-live-text.ts`), made only when
+ * someone changes the block's text. A body is a list of entries, each naming its block:
+ *   - `seed`: the block's text as plain UTF-8, for a block nobody has a document for (S→C: in a
+ *     snapshot, and when a write from outside the session adds a block). Both ends make the
+ *     block's document from exactly this text, so documents made independently are the same one.
+ *     A block with no entry at all has the empty text.
+ *   - `update`: a Yjs update of that block's document (both directions; in a snapshot, the
+ *     document's whole state).
+ *   - `vector`: the state vector of a document the client holds (C→S, in a resuming join): the
+ *     answer carries what that document lacks, and every document the client did not name whole.
  *
- * Nothing here depends on Yjs: bodies are opaque bytes.
+ * A typing frame is therefore 5 bytes of framing, the block id and the Yjs update, in both
+ * directions.
+ *
+ * Nothing here depends on Yjs: entry payloads are opaque bytes.
  */
+
+/**
+ * The protocol's version, named by every join. A client of another version is told its session
+ * is `outdated` (it reloads to get the matching code); nothing is negotiated.
+ */
+export const OUTLINE_LIVE_PROTOCOL_VERSION = 2;
 
 export const OUTLINE_LIVE_MAGIC = 0xb1;
 
@@ -35,19 +55,19 @@ export const OUTLINE_LIVE_MAGIC = 0xb1;
 export const OUTLINE_LIVE_MAX_HANDLE = 255;
 
 export const LIVE_FRAME = {
-	/** C→S: join a page. Head {@link LiveJoinHead}; body: the client's state vector on resume. */
+	/** C→S: join a page. Head {@link LiveJoinHead}; body: on resume, a `vector` entry per held document. */
 	join: 0x01,
 	/** C→S: leave. */
 	leave: 0x02,
-	/** C→S: text-only Yjs update. `n` = transaction number; body = update. */
+	/** C→S: text only. `n` = transaction number; body = `update` entries. */
 	update: 0x03,
-	/** C→S: structural transaction. `n`; head {@link LiveTxHead}; body = its Yjs update. */
+	/** C→S: structural transaction. `n`; head {@link LiveTxHead}; body = its `update` entries. */
 	tx: 0x04,
 	/** C→S: own selection. Head {@link LivePresenceUp}. */
 	selection: 0x05,
-	/** S→C: joined. Head {@link LiveJoinedHead}; body = Yjs state (reset) or diff (resume). */
+	/** S→C: joined. Head {@link LiveJoinedHead}; body = every text (reset) or what is missing (resume). */
 	joined: 0x81,
-	/** S→C: coalesced changes. `n` = ack; head {@link LiveBatchHead} or none; body = update. */
+	/** S→C: coalesced changes. `n` = ack; head {@link LiveBatchHead} or none; body = text entries. */
 	batch: 0x82,
 	/** S→C: a transaction was refused; `n` = it. Later ones from this client were dropped. */
 	reject: 0x83,
@@ -83,6 +103,10 @@ export const OUTLINE_LIVE_LIMITS = {
 	maxTxOps: 200,
 	/** Bytes of the JSON head of a client frame. */
 	maxHeadBytes: 64 * 1024,
+	/** Text entries of one client frame (a transaction's blocks, or a resume's documents). */
+	maxClientTextEntries: 4096,
+	/** Bytes of a block id in a text entry. */
+	maxTextIdBytes: 128,
 	/**
 	 * Bytes of the JSON head of a server frame: a snapshot's structure (about 45 bytes a block),
 	 * a resume's operations, a batch with a large outside commit. Bounded by the page limits.
@@ -130,7 +154,8 @@ export type LiveTaskChar = " " | "/" | "x" | "-";
 
 /**
  * A structural operation as sent and broadcast. Content is never here: a block's text lives in
- * the Yjs document (a new block's text arrives in the same frame's update).
+ * its text document (a new block's text arrives in the same frame's body, as an update of the
+ * document its creator made from the empty text).
  *   - `i`: insert, or restore when the id names a deleted block; `p` parent, `k` order key; `q`
  *     the block is a question put to a person (`Ask`): set by the server only (a client cannot
  *     make a question, and the server ignores the field from one), added after the first
@@ -174,15 +199,16 @@ export interface LiveCommitWire {
 }
 
 export interface LiveJoinHead {
+	/** {@link OUTLINE_LIVE_PROTOCOL_VERSION}. */
+	v: number;
 	page: string;
 	/** `edit` asks for write access; a read-only person gets `view`. */
 	mode: "edit" | "view";
 	/** Identifies this editor instance across reconnects (8–64 characters). */
 	key: string;
-	/** Resume a session this instance was in: body is the client's Yjs state vector. */
 	/**
 	 * The session this client was in before (sent on every join after the first). Without
-	 * `reset` the client asks to resume it (a state-vector diff); with `reset` it wants a
+	 * `reset` the client asks to resume it (the body names the documents it holds); with `reset` it wants a
 	 * snapshot. Either way the answer says which of its transactions of that session the page
 	 * already has (`tx`, `dur`), so the client neither loses nor repeats them.
 	 */
@@ -287,7 +313,9 @@ export type LiveCloseCode =
 	/** The page is larger than a live session takes; show it read-only. */
 	| "too_large"
 	/** The session was closed (shutdown); join again later. */
-	| "ended";
+	| "ended"
+	/** The client speaks another protocol version: it must be reloaded. */
+	| "outdated";
 
 export interface LiveClosedHead {
 	code: LiveCloseCode;
@@ -456,6 +484,97 @@ export function decodeLiveFrame(bytes: Uint8Array, maxHeadBytes?: number): LiveF
 		}
 	}
 	return { kind: bytes[1] as number, handle, n, head, body: bytes.subarray(at + headLength) };
+}
+
+export const LIVE_TEXT_KIND = { seed: 0, update: 1, vector: 2 } as const;
+
+export type LiveTextKind = (typeof LIVE_TEXT_KIND)[keyof typeof LIVE_TEXT_KIND];
+
+/** One block's text in a frame body (see the module header). */
+export interface LiveTextEntry {
+	id: string;
+	kind: LiveTextKind;
+	data: Uint8Array;
+}
+
+/**
+ * Encode text entries as a frame body:
+ *   varuint  bytes of the block id      …  the id (UTF-8)
+ *   byte     kind
+ *   varuint  bytes of the payload       …  the payload
+ * repeated to the end of the body.
+ */
+export function encodeLiveTexts(entries: readonly LiveTextEntry[]): Uint8Array {
+	if (entries.length === 0) return EMPTY;
+	const ids = entries.map((e) => encoder.encode(e.id));
+	let size = 0;
+	entries.forEach((e, i) => {
+		const id = ids[i] as Uint8Array;
+		size += varuintSize(id.length) + id.length + 1 + varuintSize(e.data.length) + e.data.length;
+	});
+	const out = new Uint8Array(size);
+	let at = 0;
+	entries.forEach((e, i) => {
+		const id = ids[i] as Uint8Array;
+		at = writeVaruint(out, at, id.length);
+		out.set(id, at);
+		at += id.length;
+		out[at++] = e.kind;
+		at = writeVaruint(out, at, e.data.length);
+		out.set(e.data, at);
+		at += e.data.length;
+	});
+	return out;
+}
+
+/**
+ * Decode a frame body's text entries. Null for anything malformed (a truncated entry, an
+ * unknown kind, an id that is empty, too long or not UTF-8) or more than `maxEntries`. Payloads
+ * are views into `bytes`.
+ */
+export function decodeLiveTexts(
+	bytes: Uint8Array,
+	maxEntries = Number.POSITIVE_INFINITY,
+): LiveTextEntry[] | null {
+	const out: LiveTextEntry[] = [];
+	let at = 0;
+	const read = (): number | null => {
+		let result = 0;
+		let scale = 1;
+		for (let i = 0; i < 8; i++) {
+			if (at >= bytes.length) return null;
+			const b = bytes[at++] as number;
+			result += (b & 0x7f) * scale;
+			if (b < 0x80) return Number.isSafeInteger(result) ? result : null;
+			scale *= 0x80;
+		}
+		return null;
+	};
+	while (at < bytes.length) {
+		if (out.length >= maxEntries) return null;
+		const idLength = read();
+		if (
+			idLength === null ||
+			idLength === 0 ||
+			idLength > OUTLINE_LIVE_LIMITS.maxTextIdBytes ||
+			at + idLength + 1 > bytes.length
+		)
+			return null;
+		let id: string;
+		try {
+			id = decoder.decode(bytes.subarray(at, at + idLength));
+		} catch {
+			return null;
+		}
+		at += idLength;
+		const kind = bytes[at++] as number;
+		if (kind !== 0 && kind !== 1 && kind !== 2) return null;
+		const length = read();
+		if (length === null || at + length > bytes.length) return null;
+		out.push({ id, kind, data: bytes.subarray(at, at + length) });
+		at += length;
+	}
+	return out;
 }
 
 /** Task status ⇄ the checkbox character the editor keeps. */

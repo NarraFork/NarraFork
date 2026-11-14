@@ -2,11 +2,13 @@
  * Replaying a live session's log after it ended without committing everything (a crash, a
  * failed final commit): the text people typed is committed, then the log is dropped.
  *
- * An epoch's log is a document snapshot, increments, and sync rows (what the database held for
- * a block when the session changed it, commits the session was about to write, and how far each
- * client's changes reached the log; see `LivePage.persistStep`). Replay rebuilds the final
- * document and, for every live block of the page, merges three ways: from the last synced
- * content (or the snapshot's text), to the final text, onto what the database holds now. So a
+ * An epoch's log is a snapshot of the session's text documents (one per block someone typed
+ * in), increments (a document's seed text before its first update), and sync rows (what the
+ * database held for a block when the session changed it, commits the session was about to
+ * write, and how far each client's changes reached the log; see `LivePage.persistStep`). Replay
+ * rebuilds each block's final document and, for every live block of the page that has one,
+ * merges three ways: from the last synced content (or the document's seed, or its text in the
+ * snapshot), to the final text, onto what the database holds now. So a
  * commit the session never logged (an outside write in the last moments) is kept, and only
  * what people typed and nobody committed is written, as their own commits. A block whose last
  * logged intent was never resolved and whose content equals it was committed by the session
@@ -17,9 +19,16 @@
  * {@link OUTLINE_LIVE_REPLAY.maxRows} rows and {@link OUTLINE_LIVE_REPLAY.maxBytes} of log per
  * epoch are read (a session compacts long before that); an epoch over the bound is left for an
  * operator and logged, never truncated.
+ *
+ * A log written before text was per block (one Yjs document a page) is not read: its rows do not
+ * decode (`decodeLogTexts`), the epoch is kept and logged like any unreadable one, and the page
+ * stays editable. A clean shutdown leaves no log, so this only concerns a crash right before the
+ * upgrade.
  */
 import { logger } from "@server/lib/logger";
 import { merge3 } from "@shared/outline";
+import { LIVE_TEXT_KIND } from "@shared/outline-live-protocol";
+import { type LiveTextDoc, seededTextDoc } from "@shared/outline-live-text";
 import * as Y from "yjs";
 import { OUTLINE_LIMITS } from "../model";
 import { outlineStore } from "../store";
@@ -29,6 +38,7 @@ import { asOwnLiveWrite } from "./lane";
 import {
 	type ContentPlan,
 	contentOps,
+	decodeLogTexts,
 	fitBody,
 	LIVE_SYNC_ACTOR,
 	OUTLINE_LIVE_HOOKS,
@@ -110,24 +120,27 @@ export async function replayLiveEpochDetailed(
 		return { outcome: "kept", keys };
 	}
 	if (rows.length === 0) return { outcome: "empty", keys };
-	const doc = new Y.Doc();
-	const texts = doc.getMap<Y.Text>("texts");
+	const docs = new Map<string, LiveTextDoc>();
 	const base = new Map<string, string>();
 	/** Intents not resolved by a later sync row or cancel: block → content to be committed. */
 	const intents = new Map<string, string>();
 	const lastActor = new Map<string, string>();
-	texts.observeDeep((events, txn) => {
-		const actor = txn.origin as OutlineLiveUpdateRow | null;
-		if (!actor || actor.actorKind !== "human") return;
-		for (const ev of events) {
-			const target = ev.target as unknown as { _item?: { parentSub?: string | null } };
-			const id = ev.target === texts ? null : target._item?.parentSub;
-			if (id) lastActor.set(id, actor.actorId);
-			if (ev.target === texts)
-				for (const key of (ev as Y.YMapEvent<Y.Text>).keysChanged)
-					lastActor.set(key, actor.actorId);
+	/** A block's document: made from its seed text, or empty (a snapshot's state, a new block). */
+	const docOf = (id: string, seed = ""): LiveTextDoc => {
+		let t = docs.get(id);
+		if (!t) {
+			t = seededTextDoc(seed);
+			docs.set(id, t);
+			t.text.observe((_event, txn) => {
+				const actor = txn.origin as OutlineLiveUpdateRow | null;
+				if (actor?.actorKind === "human") lastActor.set(id, actor.actorId);
+			});
 		}
-	});
+		return t;
+	};
+	const destroy = () => {
+		for (const t of docs.values()) t.doc.destroy();
+	};
 	let first = true;
 	try {
 		for (const row of rows) {
@@ -152,32 +165,41 @@ export async function replayLiveEpochDetailed(
 				}
 				continue;
 			}
-			Y.applyUpdate(doc, data, row);
+			const entries = decodeLogTexts(data);
+			if (!entries) throw new Error("not a per-block text row");
+			for (const e of entries) {
+				if (e.kind === LIVE_TEXT_KIND.seed) {
+					if (docs.has(e.id)) continue;
+					// What the database held when the document was made.
+					const seed = decoder.decode(e.data);
+					docOf(e.id, seed);
+					if (!base.has(e.id)) base.set(e.id, seed);
+				} else Y.applyUpdate(docOf(e.id).doc, e.data, row);
+			}
 			if (first) {
 				// The snapshot: its texts are the base wherever no sync row says otherwise.
-				for (const [id, t] of texts)
-					if (t instanceof Y.Text && !base.has(id)) base.set(id, t.toString());
+				for (const [id, t] of docs) if (!base.has(id)) base.set(id, t.text.toString());
 				first = false;
 			}
 		}
 	} catch (error) {
 		logger.warn("Outline live log unreadable; kept", { pageId, epoch, error: String(error) });
-		doc.destroy();
+		destroy();
 		return { outcome: "kept", keys };
 	}
 
 	const page = await outlineStore.getBlock(pageId);
 	if (!page || page.deleted) {
-		doc.destroy();
+		destroy();
 		await outlineStore.deleteLiveUpdates(pageId, epoch);
 		return { outcome: "empty", keys };
 	}
 	const { blocks } = await outlineStore.listPageBlocks(pageId, OUTLINE_LIMITS.maxPageBlocks);
 	const changes: Array<{ id: string; text: string; actor: string | null }> = [];
 	for (const b of blocks) {
-		const t = texts.get(b.id);
-		if (!(t instanceof Y.Text)) continue;
-		const final = t.toString();
+		const t = docs.get(b.id);
+		if (!t) continue;
+		const final = t.text.toString();
 		// The session committed this just before it ended, and logged nothing after.
 		const intent = intents.get(b.id);
 		if (intent !== undefined && intent === b.content) continue;
@@ -187,7 +209,7 @@ export async function replayLiveEpochDetailed(
 		const text = merged.ok ? merged.result : final;
 		if (text !== b.content) changes.push({ id: b.id, text, actor: lastActor.get(b.id) ?? null });
 	}
-	doc.destroy();
+	destroy();
 	if (changes.length > 0) {
 		const committed = await commitChanges(page.spaceId, changes, blocks);
 		if (!committed) return { outcome: "kept", keys, changes };

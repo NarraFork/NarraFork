@@ -30,13 +30,14 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	decodeLiveFrame,
 	encodeLiveFrame,
+	encodeLiveTexts,
 	LIVE_FRAME,
+	LIVE_TEXT_KIND,
 	type LiveBlockWire,
 	type LiveFrame,
 	type LiveJoinedHead,
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
-import * as Y from "yjs";
 import { LiveClient, type LiveTransport, type SeedBlock } from "./live-client";
 import {
 	acquireLiveSession,
@@ -133,13 +134,11 @@ function read(): SeedBlock[] {
 
 /** The page's snapshot: A and B (or only those named) under the page. */
 function joined(handle: number, head: Partial<LiveJoinedHead> = {}, ids: string[] = [A, B]) {
-	const doc = new Y.Doc();
-	const map = doc.getMap<Y.Text>("texts");
 	const texts: Record<string, string> = { [PAGE]: "Page", [A]: "Alpha", [B]: "Bee" };
 	const blocks: LiveBlockWire[] = [[PAGE, -1, "a0", "p1", ""]];
-	map.set(PAGE, new Y.Text("Page"));
+	const sent: Record<string, string> = { [PAGE]: "Page" };
 	ids.forEach((id, i) => {
-		map.set(id, new Y.Text(texts[id] ?? ""));
+		sent[id] = texts[id] ?? "";
 		blocks.push([id, 0, `a${i}`, id === A ? "a1" : "b1", ""]);
 	});
 	const answer: LiveJoinedHead = {
@@ -153,7 +152,18 @@ function joined(handle: number, head: Partial<LiveJoinedHead> = {}, ids: string[
 		peers: [],
 		...head,
 	};
-	return { kind: LIVE_FRAME.joined, handle, head: answer, body: Y.encodeStateAsUpdate(doc) };
+	return { kind: LIVE_FRAME.joined, handle, head: answer, body: seeds(sent) };
+}
+
+/** A snapshot's body: every block's text as its seed (nobody has changed any yet). */
+function seeds(texts: Record<string, string>): Uint8Array {
+	return encodeLiveTexts(
+		Object.entries(texts).map(([id, t]) => ({
+			id,
+			kind: LIVE_TEXT_KIND.seed,
+			data: new TextEncoder().encode(t),
+		})),
+	);
 }
 
 const type = (client: LiveClient, id: string, md: string) =>
@@ -477,13 +487,11 @@ describe("a session with typing not acknowledged", () => {
 		const deadHandle = s.joinOf(PAGE)?.handle as number;
 		const fineHandle = s.joinOf("page-0000002")?.handle as number;
 		s.deliver(joined(deadHandle));
-		const two = new Y.Doc();
-		two.getMap<Y.Text>("texts").set("page-0000002", new Y.Text("Page two"));
 		s.deliver({
 			kind: LIVE_FRAME.joined,
 			handle: fineHandle,
 			head: { ...joined(fineHandle).head, blocks: [["page-0000002", -1, "a0", "p2", ""]] },
-			body: Y.encodeStateAsUpdate(two),
+			body: seeds({ "page-0000002": "Page two" }),
 		});
 		type(dead.client, A, "Alpha sent into the void");
 		type(fine.client, "page-0000002", "Page two typed");

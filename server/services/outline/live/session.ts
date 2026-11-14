@@ -3,32 +3,35 @@
  *
  * WHAT IT HOLDS
  * -------------
- *   - a Yjs document with one `Y.Text` per block of the page, created from the blocks' content
- *     when the session opens (all of them at once: a text created lazily lets keystrokes race its
- *     creation, and redo then reverses typed text, as the prototype found);
+ *   - the text of every block of the page: a plain string (what the database holds) until
+ *     someone changes it, then a Yjs document of that block alone (`shared/outline-live-text.ts`:
+ *     made from the plain text the same way on every end, so nothing races its creation). A
+ *     document is kept until the session ends, also when the change that made it was refused:
+ *     every end must hold every item of a document it has;
  *   - a mirror of the page's structure (`mirror.ts`), equal to the blocks table between tasks;
  *   - the participants: people editing (write access) or viewing (read access) the page.
  *
  * HOW CHANGES FLOW
  * ----------------
- *   - Text: a participant's Yjs update is applied at once and broadcast to the others within
- *     {@link OUTLINE_LIVE_TIMING.broadcastMs}, merged with everything else of that window
- *     (`Y.mergeUpdates`), never echoed to its sender (who gets the transaction number back
- *     instead). Changed blocks are committed as the editor's own human commits a little later
+ *   - Text: a participant's updates (one per block it changed) are applied at once and
+ *     broadcast to the others within {@link OUTLINE_LIVE_TIMING.broadcastMs}, merged per block
+ *     with everything else of that window (`Y.mergeUpdates`), never echoed to their sender (who
+ *     gets the transaction number back instead). Changed blocks are committed as the editor's own human commits a little later
  *     (after {@link OUTLINE_LIVE_TIMING.flushIdleMs} of quiet, at most
  *     {@link OUTLINE_LIVE_TIMING.flushMaxMs} after the first change), normalized off the main
  *     thread when large (`normalize.ts`).
  *   - Structure: a structural transaction (insert, move, delete, checkbox, plus the Yjs update
  *     of the same keystroke) is checked against the mirror, written as one commit through
  *     `writeOutline`, then broadcast in canonical form. A refused transaction is rolled back
- *     (its Yjs part included) and every later frame of that participant is dropped until it
+ *     (its text part by undoing it in each block's document) and every later frame of that participant is dropped until it
  *     joins again; the client rebuilds its document and replays its own later changes.
  *   - Writes from outside (agents, reverts) reach the session through the barrier
  *     (`live-barrier.ts`): unflushed text is committed first, then the outside commit is read
  *     back (its block versions) and pushed in as a remote change, merged into the live text.
- *   - Every Yjs update is also appended to `outline_live_updates` within
- *     {@link OUTLINE_LIVE_TIMING.persistMs} (a snapshot first, increments after, compacted once
- *     the increments outweigh a snapshot). A participant's transactions are acknowledged only
+ *   - Every text update is also appended to `outline_live_updates` within
+ *     {@link OUTLINE_LIVE_TIMING.persistMs} (a snapshot of every document first, increments
+ *     after, each block's seed text before its first update, compacted once the increments
+ *     outweigh a snapshot; the row format is {@link encodeLogTexts}). A participant's transactions are acknowledged only
  *     once the log (or the page) has them: after a crash, what was acknowledged is replayed
  *     from the log (a startup job, or the next join), and what was not is still held by its
  *     client, which replays it into the next session. Every join after a client's first names
@@ -51,11 +54,14 @@ import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { compareOrderKeys, keyBetween, merge3 } from "@shared/outline";
 import {
+	decodeLiveTexts,
 	encodeLiveFrame,
 	encodeLiveHead,
+	encodeLiveTexts,
 	isLiveTaskChar,
 	LIVE_FRAME,
 	LIVE_STATUS_OF_TASK,
+	LIVE_TEXT_KIND,
 	type LiveActor,
 	type LiveBatchHead,
 	type LiveClaimedWire,
@@ -70,10 +76,18 @@ import {
 	type LiveRejectHead,
 	type LiveSelWire,
 	type LiveTaskChar,
+	type LiveTextEntry,
 	livePeerColor,
 	OUTLINE_LIVE_AGENT_PNO_BASE,
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
+import {
+	dropPendingStructs,
+	hasPendingStructs,
+	type LiveTextDoc,
+	mergeTextUpdates,
+	seededTextDoc,
+} from "@shared/outline-live-text";
 import * as Y from "yjs";
 import { canManageSpace } from "../access";
 import { readDisplayNames } from "../access-reads";
@@ -140,9 +154,9 @@ export const OUTLINE_LIVE_TIMING: Record<
 /** Bounds of a session. Mutable only so tests can shrink them. */
 export const OUTLINE_LIVE_BOUNDS = {
 	/**
-	 * Bytes of updates a session's document may take in (from its open) before the session is
-	 * restarted with a fresh document: Yjs keeps deleted items, and a writer could otherwise grow
-	 * it without bound. Participants rejoin at once.
+	 * Bytes of updates a session's documents may take in (from its open, the page's text
+	 * included) before the session is restarted with fresh ones: Yjs keeps deleted items, and a
+	 * writer could otherwise grow them without bound. Participants rejoin at once.
 	 */
 	maxDocBytes: 16 * 1024 * 1024,
 	/** Failed commits of a block as code after which it is no longer retried (until edited). */
@@ -252,15 +266,15 @@ interface AgentPeer {
 	sel: LiveSelWire;
 }
 
-interface WindowUpdate {
+/** One block's text change of the broadcast window: who made it (0: not a participant). */
+interface WindowUpdate extends LiveTextEntry {
 	from: number;
-	update: Uint8Array;
 }
 
-interface PendingRow {
+/** One block's text change waiting for the log. */
+interface PendingRow extends LiveTextEntry {
 	actorKind: "human" | "system";
 	actorId: string;
-	update: Uint8Array;
 }
 
 export interface CommittedEvent {
@@ -292,8 +306,13 @@ function newEpoch(): number {
 }
 
 export class LivePage {
-	readonly doc = new Y.Doc();
-	readonly texts: Y.Map<Y.Text>;
+	/** The documents of blocks whose text someone changed in this session, by block id. */
+	private readonly docs = new Map<string, LiveTextDoc>();
+	/**
+	 * Blocks a write from outside added, by the operation number of the batch that added them: a
+	 * resuming client that had not seen that batch is sent their seed text.
+	 */
+	private readonly seededAt = new Map<string, number>();
 	readonly mirror: PageMirror;
 	readonly epoch = newEpoch();
 	readonly participants = new Map<number, Participant>();
@@ -356,8 +375,6 @@ export class LivePage {
 	private flushTimer: ReturnType<typeof setTimeout> | null = null;
 	/** Blocks whose text changed in the update being applied (for structural transactions). */
 	private touched: Set<string> | null = null;
-	/** Live blocks a participant's update left without a text, repaired after it. */
-	private readonly broken = new Set<string>();
 
 	// Persistence.
 	private pendingRows: PendingRow[] = [];
@@ -421,12 +438,11 @@ export class LivePage {
 		private readonly schedule: (task: () => Promise<void>) => void,
 		private readonly onEnd: (page: LivePage, code: LiveCloseCode, idle: boolean) => void,
 	) {
-		this.texts = this.doc.getMap<Y.Text>("texts");
 		this.mirror = new PageMirror(pageId);
 	}
 
 	/**
-	 * Open a session: read the page (it must be small enough) and build the document. Runs in
+	 * Open a session: read the page (it must be small enough); no text document is made. Runs in
 	 * the space's lane. `schedule` queues a task on that lane; `onEnd` asks for the session to be
 	 * closed (idle: the last participant left and the idle period passed; or the page went, or
 	 * the document grew past its bound).
@@ -461,79 +477,134 @@ export class LivePage {
 				dbContent: b.content,
 			});
 		}
-		const ids = blocks.map((b) => b.id).sort();
-		session.doc.transact(() => {
-			for (const id of ids) {
-				session.texts.set(id, new Y.Text(session.mirror.get(id)?.dbContent ?? ""));
-			}
-		}, SERVER_ORIGIN);
-		// The initial texts are what the database holds: nothing to persist or broadcast yet.
-		session.windowUpdates = [];
-		session.pendingRows = [];
+		// The texts are what the database holds: nothing to persist or broadcast yet.
 		session.docBytes = bytes + 64 * blocks.length;
-		session.watch();
 		return session;
 	}
 
-	private watch(): void {
-		this.doc.on("update", (update: Uint8Array, origin: unknown) => {
+	// ─────────────────────────────────────────────────────────────────────────
+	// Text
+	// ─────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * A block's document, made on first use from the text the database holds for it (the empty
+	 * text for a block the page does not have yet: a block a transaction is about to insert).
+	 * Every end makes it from that same text (`shared/outline-live-text.ts`); the log learns the
+	 * text before the document's first update.
+	 */
+	private textDoc(id: string): LiveTextDoc {
+		const existing = this.docs.get(id);
+		if (existing) return existing;
+		const seed = this.mirror.get(id)?.dbContent ?? "";
+		const made = seededTextDoc(seed);
+		this.docs.set(id, made);
+		if (seed.length > 0)
+			this.pendingRows.push({
+				actorKind: "system",
+				actorId: LIVE_LOG_ACTOR,
+				id,
+				kind: LIVE_TEXT_KIND.seed,
+				data: utf8.encode(seed),
+			});
+		made.doc.on("update", (update: Uint8Array, origin: unknown) => {
 			if (this.closed) return;
 			this.docBytes += update.length;
 			if (this.docBytes > OUTLINE_LIVE_BOUNDS.maxDocBytes && !this.restartRequested) {
 				// Everything is committed and the participants rejoin a fresh session.
 				this.restartRequested = true;
-				logger.warn("Outline live document grew past its bound; restarting the session", {
+				logger.warn("Outline live documents grew past their bound; restarting the session", {
 					pageId: this.pageId,
 					bytes: this.docBytes,
 				});
 				this.onEnd(this, "ended", false);
 			}
 			const from = origin instanceof Participant ? origin.pno : 0;
-			this.windowUpdates.push({ from, update });
+			this.windowUpdates.push({ from, id, kind: LIVE_TEXT_KIND.update, data: update });
 			this.scheduleBroadcast();
-			this.pendingRows.push(
-				origin instanceof Participant
-					? { actorKind: "human", actorId: origin.userId, update }
-					: { actorKind: "system", actorId: LIVE_LOG_ACTOR, update },
-			);
+			this.pendingRows.push({
+				...(origin instanceof Participant
+					? { actorKind: "human" as const, actorId: origin.userId }
+					: { actorKind: "system" as const, actorId: LIVE_LOG_ACTOR }),
+				id,
+				kind: LIVE_TEXT_KIND.update,
+				data: update,
+			});
 			this.schedulePersist();
 		});
-		this.texts.observeDeep((events, txn) => {
-			const person = txn.origin instanceof Participant ? txn.origin : null;
-			for (const ev of events) {
-				if (ev.target === this.texts) {
-					// Only structural transactions create texts; anything else touching the map
-					// leaves a live block without its text, which is repaired from the database.
-					for (const key of (ev as Y.YMapEvent<Y.Text>).keysChanged) {
-						if (!person) continue;
-						const t = this.texts.get(key);
-						if (!(t instanceof Y.Text) && this.mirror.alive(key)) this.broken.add(key);
-						this.touched?.add(key);
-					}
-					continue;
-				}
-				if (!(ev.target instanceof Y.Text)) continue;
-				const id = (ev.target as unknown as { _item?: { parentSub?: string | null } })._item
-					?.parentSub;
-				if (!id) continue;
-				this.touched?.add(id);
-				if (person) this.markDirty(id, person.userId);
-			}
+		made.text.observe((_event, txn) => {
+			this.touched?.add(id);
+			if (txn.origin instanceof Participant) this.markDirty(id, txn.origin.userId);
 		});
+		return made;
+	}
+
+	/** Whether the session holds a text for the block (a document, or the page's block). */
+	private hasText(id: string): boolean {
+		return this.docs.has(id) || this.mirror.get(id) !== undefined;
+	}
+
+	/** Change a block's text as the session itself (never a participant). */
+	private editText(id: string, edit: (text: Y.Text) => void): void {
+		const t = this.textDoc(id);
+		t.doc.transact(() => edit(t.text), SERVER_ORIGIN);
+	}
+
+	/** Documents made so far (diagnostics and measurements). */
+	get textDocs(): number {
+		return this.docs.size;
+	}
+
+	/**
+	 * Every text of the session, as a snapshot carries it: each document's whole state, and the
+	 * seed text of every other block the session knows (deleted ones too: undoing a delete
+	 * brings a block back with the text it had). A block with the empty text has no entry.
+	 */
+	private allTexts(): LiveTextEntry[] {
+		const out: LiveTextEntry[] = [];
+		for (const [id, t] of this.docs)
+			out.push({ id, kind: LIVE_TEXT_KIND.update, data: Y.encodeStateAsUpdate(t.doc) });
+		for (const b of this.mirror.all()) {
+			if (b.dbContent.length === 0 || this.docs.has(b.id)) continue;
+			out.push({ id: b.id, kind: LIVE_TEXT_KIND.seed, data: utf8.encode(b.dbContent) });
+		}
+		return out;
+	}
+
+	/**
+	 * What a resuming client lacks: of each document it named, the difference to its state
+	 * vector; every other document whole; and the seed text of blocks added from outside after
+	 * the last batch it saw. Null when a vector cannot be read.
+	 */
+	private missingTexts(vectors: readonly LiveTextEntry[], op: number): LiveTextEntry[] | null {
+		const named = new Map<string, Uint8Array>();
+		for (const v of vectors) if (v.kind === LIVE_TEXT_KIND.vector) named.set(v.id, v.data);
+		const out: LiveTextEntry[] = [];
+		for (const [id, at] of this.seededAt) {
+			if (at <= op || this.docs.has(id)) continue;
+			const content = this.mirror.get(id)?.dbContent ?? "";
+			if (content.length > 0)
+				out.push({ id, kind: LIVE_TEXT_KIND.seed, data: utf8.encode(content) });
+		}
+		try {
+			for (const [id, t] of this.docs) {
+				const vector = named.get(id);
+				const data = vector ? Y.encodeStateAsUpdate(t.doc, vector) : Y.encodeStateAsUpdate(t.doc);
+				// An update of no structs and no deletions is two zero bytes.
+				if (data.length > 2) out.push({ id, kind: LIVE_TEXT_KIND.update, data });
+			}
+		} catch {
+			return null;
+		}
+		return out;
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// Reading
 	// ─────────────────────────────────────────────────────────────────────────
 
-	private ytext(id: string): Y.Text | null {
-		const t = this.texts.get(id);
-		return t instanceof Y.Text ? t : null;
-	}
-
-	/** A block's live text (its database content when it has no text in the session). */
+	/** A block's live text (its database content while nobody changed it in the session). */
 	textOf(id: string): string {
-		return this.ytext(id)?.toString() ?? this.mirror.get(id)?.dbContent ?? "";
+		return this.docs.get(id)?.text.toString() ?? this.mirror.get(id)?.dbContent ?? "";
 	}
 
 	get editors(): number {
@@ -573,7 +644,12 @@ export class LivePage {
 			if (timer) clearTimeout(timer);
 		}
 		this.participants.clear();
-		this.doc.destroy();
+		this.destroyDocs();
+	}
+
+	private destroyDocs(): void {
+		for (const t of this.docs.values()) t.doc.destroy();
+		this.docs.clear();
 	}
 
 	/** Whether any text is waiting to be committed. */
@@ -588,9 +664,8 @@ export class LivePage {
 	 */
 	adoptRecovered(changes: readonly RecoveredChange[]): void {
 		for (const c of changes) {
-			const t = this.ytext(c.id);
-			if (!t || !this.mirror.alive(c.id)) continue;
-			const current = t.toString();
+			if (!this.mirror.alive(c.id)) continue;
+			const current = this.textOf(c.id);
 			if (current === c.text) continue;
 			this.mergeText(c.id, current, c.text);
 			this.markDirty(c.id, c.actor);
@@ -613,7 +688,8 @@ export class LivePage {
 		socket: LiveSocket,
 		handle: number,
 		head: LiveJoinHead,
-		stateVector: Uint8Array,
+		/** On a resume: a `vector` entry for every document the client holds. */
+		held: Uint8Array,
 		canWrite: boolean,
 		dur?: number,
 	): Participant | Refusal {
@@ -670,13 +746,10 @@ export class LivePage {
 		const durable = sameSession
 			? Math.min(processed, this.keyDurable.get(head.key) ?? 0)
 			: (dur ?? 0);
-		let diff: Uint8Array | null = null;
-		if (sameSession && !resume.reset && stateVector.length > 0) {
-			try {
-				diff = Y.encodeStateAsUpdate(this.doc, stateVector);
-			} catch {
-				diff = null;
-			}
+		let diff: LiveTextEntry[] | null = null;
+		if (sameSession && !resume.reset) {
+			const vectors = decodeLiveTexts(held, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
+			diff = vectors ? this.missingTexts(vectors, resume.op) : null;
 		}
 		if (resume && diff) {
 			const covered =
@@ -692,7 +765,7 @@ export class LivePage {
 					? { ops: this.opLog.filter((c) => c.o > resume.op) }
 					: { blocks: this.mirror.snapshot() }),
 			};
-			body = diff;
+			body = encodeLiveTexts(diff);
 		} else {
 			joined = {
 				...base,
@@ -701,7 +774,7 @@ export class LivePage {
 				dur: durable,
 				blocks: this.mirror.snapshot(),
 			};
-			body = Y.encodeStateAsUpdate(this.doc);
+			body = encodeLiveTexts(this.allTexts());
 		}
 		let frame: Uint8Array;
 		try {
@@ -903,12 +976,11 @@ export class LivePage {
 		const mergedFor = (pno: number, start: number): Uint8Array | null => {
 			const share = updates.slice(start).filter((u) => u.from !== pno);
 			if (share.length === 0) return null;
-			if (share.length === 1) return (share[0] as WindowUpdate).update;
 			// Recipients that sent nothing in the window share one merge.
 			const key = start === 0 && share.length === updates.length ? "all" : `${pno}`;
 			let out = merged.get(key);
 			if (!out) {
-				out = Y.mergeUpdates(share.map((u) => u.update));
+				out = encodeLiveTexts(mergeTexts(share));
 				merged.set(key, out);
 			}
 			return out;
@@ -918,7 +990,7 @@ export class LivePage {
 			const commitStart = p.commitStart;
 			p.windowStart = 0;
 			p.commitStart = 0;
-			// A participant that fell behind rejoins and gets everything from its state vector.
+			// A participant that fell behind rejoins and gets everything it lacks.
 			if (p.lagging) continue;
 			const others = [
 				...p.heldCommits,
@@ -1389,56 +1461,71 @@ export class LivePage {
 		this.reject(p, n, "read_only");
 	}
 
-	/** Apply a participant's update, reporting whether it integrated cleanly. */
-	private applyUpdate(p: Participant, update: Uint8Array): boolean {
-		const store = this.doc.store as unknown as {
-			pendingStructs: unknown;
-			pendingDs: unknown;
-		};
+	/**
+	 * The text entries of a participant's frame: updates only, each of a block the session has
+	 * a text for or (a structural transaction) one the transaction inserts. Null otherwise.
+	 */
+	private parseTexts(body: Uint8Array, inserted?: ReadonlySet<string>): LiveTextEntry[] | null {
+		const entries = decodeLiveTexts(body, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
+		if (!entries) return null;
+		const seen = new Set<string>();
+		for (const e of entries) {
+			if (e.kind !== LIVE_TEXT_KIND.update || seen.has(e.id)) return null;
+			if (!this.hasText(e.id) && !inserted?.has(e.id)) return null;
+			seen.add(e.id);
+		}
+		return entries;
+	}
+
+	/**
+	 * Apply a participant's text updates, reporting whether all integrated cleanly. `undos`
+	 * collects what takes each one back (a structural transaction that may yet be refused).
+	 */
+	private applyTexts(
+		p: Participant,
+		entries: readonly LiveTextEntry[],
+		undos?: Y.UndoManager[],
+	): boolean {
 		const t0 = performance.now();
 		try {
-			Y.applyUpdate(this.doc, update, p);
-		} catch {
-			return false;
+			for (const e of entries) {
+				const t = this.textDoc(e.id);
+				if (undos)
+					undos.push(
+						new Y.UndoManager(t.text, { trackedOrigins: new Set([p]), captureTimeout: 0 }),
+					);
+				try {
+					Y.applyUpdate(t.doc, e.data, p);
+				} catch {
+					return false;
+				}
+				this.stats.updatesIn++;
+				this.stats.updateBytesIn += e.data.length;
+				if (hasPendingStructs(t.doc)) {
+					// The update depends on changes this session never had (a client out of step):
+					// it would sit in the document forever. Drop it and have the client rebuild.
+					dropPendingStructs(t.doc);
+					return false;
+				}
+			}
 		} finally {
 			this.stats.applyMs += performance.now() - t0;
 		}
-		this.stats.updatesIn++;
-		this.stats.updateBytesIn += update.length;
-		if (store.pendingStructs || store.pendingDs) {
-			// The update depends on changes this session never had (a client out of step): it
-			// would sit in the document forever. Drop it and have the client rebuild.
-			store.pendingStructs = null;
-			store.pendingDs = null;
-			return false;
-		}
-		this.repairBroken();
 		return true;
 	}
 
-	/** Live blocks whose text a participant's update removed get it back from the database. */
-	private repairBroken(): void {
-		if (this.broken.size === 0) return;
-		const ids = [...this.broken];
-		this.broken.clear();
-		this.doc.transact(() => {
-			for (const id of ids) {
-				const b = this.mirror.alive(id);
-				if (b && !(this.texts.get(id) instanceof Y.Text))
-					this.texts.set(id, new Y.Text(b.dbContent));
-			}
-		}, SERVER_ORIGIN);
-	}
-
-	/** A text-only update (`update` frame). */
-	handleUpdate(p: Participant, n: number, update: Uint8Array): void {
+	/** Text only (`update` frame). */
+	handleUpdate(p: Participant, n: number, body: Uint8Array): void {
 		if (this.participants.get(p.pno) !== p || p.blocked || this.closed) return;
 		if (n <= p.lastTx) return;
 		if (!p.canWrite) {
 			this.reject(p, n, "read_only");
 			return;
 		}
-		if (!this.applyUpdate(p, update)) {
+		const entries = this.parseTexts(body);
+		// Updates before one that does not integrate stay: the client rebuilds from a snapshot
+		// that has them and merges what it typed onto it by text.
+		if (!entries || !this.applyTexts(p, entries)) {
 			this.reject(p, n, "invalid");
 			return;
 		}
@@ -1648,11 +1735,10 @@ export class LivePage {
 	private carryRest(plan: ContentPlan, partIds: readonly string[], userId: string | null): void {
 		if (!plan.rest) return;
 		const lastId = partIds[partIds.length - 1] ?? plan.id;
-		const target = this.ytext(lastId) ?? this.ytext(plan.id);
-		if (!target) return;
-		const id = this.ytext(lastId) ? lastId : plan.id;
+		const id = this.mirror.get(lastId) ? lastId : plan.id;
+		if (!this.hasText(id)) return;
 		const rest = plan.rest;
-		this.doc.transact(() => target.insert(target.length, `\n${rest}`), SERVER_ORIGIN);
+		this.editText(id, (text) => text.insert(text.length, `\n${rest}`));
 		this.markDirty(id, userId);
 	}
 
@@ -1747,6 +1833,9 @@ export class LivePage {
 	private setDbContent(id: string, content: string): void {
 		const b = this.mirror.get(id);
 		if (!b || b.dbContent === content) return;
+		// A block's seed text never changes: its document is made from what the database held
+		// (and every client was told) before this.
+		this.textDoc(id);
 		this.mirror.update(id, { dbContent: content });
 		this.syncPending.set(id, content);
 		this.schedulePersist();
@@ -1754,19 +1843,18 @@ export class LivePage {
 
 	/** Bring a block's live text from `from` to `to`, keeping changes made since `from`. */
 	private mergeText(id: string, from: string, to: string): void {
-		const t = this.ytext(id);
-		if (!t) return;
-		const current = t.toString();
+		if (!this.hasText(id)) return;
+		const current = this.textOf(id);
 		const r = merge3(from, to, current, { lenient: true });
 		if (!r.ok || r.result === current) return;
-		this.doc.transact(() => {
+		this.editText(id, (t) => {
 			// Last first, so earlier offsets hold; hunks at one offset in reverse too (an insertion
 			// before a deletion there must be applied after it), as `applyHunks` reads them.
 			for (const h of [...r.patch].sort((a, b) => a.start - b.start).reverse()) {
 				if (h.end > h.start) t.delete(h.start, h.end - h.start);
 				if (h.text) t.insert(h.start, h.text);
 			}
-		}, SERVER_ORIGIN);
+		});
 	}
 
 	/**
@@ -1871,7 +1959,7 @@ export class LivePage {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	/** A structural transaction (`tx` frame): check, apply, commit, broadcast or refuse. */
-	async handleTx(p: Participant, n: number, rawHead: unknown, update: Uint8Array): Promise<void> {
+	async handleTx(p: Participant, n: number, rawHead: unknown, body: Uint8Array): Promise<void> {
 		if (this.participants.get(p.pno) !== p || p.blocked || this.closed) return;
 		if (n <= p.lastTx) return;
 		if (!p.canWrite) {
@@ -1886,6 +1974,13 @@ export class LivePage {
 		const plan = this.planTx(ops);
 		if (!plan) {
 			this.reject(p, n, "conflict");
+			return;
+		}
+		const inserted = new Map<string, Extract<LiveOp, { t: "i" }>>();
+		for (const op of plan.ops) if (op.t === "i") inserted.set(op.id, op);
+		const entries = this.parseTexts(body, new Set(inserted.keys()));
+		if (!entries) {
+			this.reject(p, n, "invalid");
 			return;
 		}
 		// Text of blocks this transaction deletes is committed first, so their history keeps it.
@@ -1911,9 +2006,10 @@ export class LivePage {
 			}
 		}
 
-		// The update goes in first (it creates the new blocks' texts) and is undone when the
-		// commit fails, so a refused transaction leaves the session as it was. Its log rows are
-		// held back until the commit is in: the log never holds a change the page refused.
+		// The text goes in first (it holds the new blocks' texts) and is undone when the commit
+		// fails, so a refused transaction leaves every text as it was. Its log rows are held back
+		// until the commit is in or its undo is with them: the log never holds only the change of
+		// a transaction the page refused.
 		// The log's snapshot must not contain a change that may yet be refused: written first.
 		if (!this.snapshotWritten) {
 			this.snapshotWanted = true;
@@ -1922,10 +2018,10 @@ export class LivePage {
 				return;
 			}
 		}
-		const undo = new Y.UndoManager(this.texts, {
-			trackedOrigins: new Set([p]),
-			captureTimeout: 0,
-		});
+		const undos: Y.UndoManager[] = [];
+		const dropUndos = () => {
+			for (const u of undos.splice(0)) u.destroy();
+		};
 		const mark = this.pendingRows.length;
 		let held: PendingRow[] = [];
 		const intents = new Map<string, string>();
@@ -1934,12 +2030,13 @@ export class LivePage {
 			committed: readonly OutlineWriteResult[] = [],
 			claimed?: LiveClaimedWire,
 		) => {
-			const before = this.pendingRows.length;
-			undo.undo();
-			undo.destroy();
-			// Neither the refused update nor its undo goes to the log.
-			this.pendingRows.splice(before);
+			for (const u of undos) u.undo();
+			dropUndos();
+			// The refused change and its undo reach the log together (one append): the documents
+			// keep the items of both, and later updates may name them.
+			this.pendingRows = [...held, ...this.pendingRows];
 			held = [];
+			this.schedulePersist();
 			this.cancelIntents(intents.keys());
 			this.reject(p, n, code, claimed);
 			return committed;
@@ -1951,7 +2048,7 @@ export class LivePage {
 			this.touched = new Set();
 			let touched: Set<string>;
 			try {
-				const integrated = update.length === 0 || this.applyUpdate(p, update);
+				const integrated = this.applyTexts(p, entries, undos);
 				touched = this.touched;
 				held = this.pendingRows.splice(mark);
 				if (!integrated) {
@@ -1961,8 +2058,6 @@ export class LivePage {
 			} finally {
 				this.touched = null;
 			}
-			const inserted = new Map<string, Extract<LiveOp, { t: "i" }>>();
-			for (const op of plan.ops) if (op.t === "i") inserted.set(op.id, op);
 			const deleted = new Set(plan.deleted);
 			const updated = [...touched].filter(
 				(id) => !inserted.has(id) && !deleted.has(id) && this.mirror.alive(id),
@@ -2019,7 +2114,7 @@ export class LivePage {
 			// The update and what follows from it reach the log in order.
 			this.pendingRows = [...held, ...this.pendingRows];
 			held = [];
-			undo.destroy();
+			dropUndos();
 			this.stats.txCommitted++;
 			// The texts this commit wrote are settled, whoever typed them.
 			for (const c of contents) this.dirty.delete(c.id);
@@ -2096,6 +2191,7 @@ export class LivePage {
 			await this.persistNow();
 			this.scheduleBroadcast();
 		} finally {
+			dropUndos();
 			this.holding--;
 		}
 	}
@@ -2357,29 +2453,43 @@ export class LivePage {
 					await outlineStore.getBlockMetas(this.spaceId, { ids: created.map((v) => v.blockId) })
 				).map((m) => [m.id, m.sid]),
 			);
-			this.doc.transact(() => {
-				for (const v of created) {
-					const prior = this.mirror.get(v.blockId);
-					const content = v.content ?? "";
-					this.mirror.put({
-						id: v.blockId,
-						sid: sids.get(v.blockId) ?? prior?.sid ?? "",
-						parentId: v.parentId,
-						orderKey: v.orderKey,
-						taskJson: v.taskJson,
-						question: v.askJson !== null,
-						deleted: false,
-						dbContent: content,
-					});
-					this.syncPending.set(v.blockId, content);
-					const t = this.ytext(v.blockId);
-					if (!t) this.texts.set(v.blockId, new Y.Text(content));
-					else if (t.toString() !== content) {
+			for (const v of created) {
+				const prior = this.mirror.get(v.blockId);
+				const content = v.content ?? "";
+				// A block the session has a text for (deleted here and now restored, or left by a
+				// refused insert) keeps its document, or gets one from the text everyone holds for
+				// it, and takes the content as a change; a new one is plain text, told to everyone.
+				const known = this.hasText(v.blockId);
+				if (known && this.textOf(v.blockId) !== content) {
+					this.editText(v.blockId, (t) => {
 						t.delete(0, t.length);
 						t.insert(0, content);
+					});
+				}
+				this.mirror.put({
+					id: v.blockId,
+					sid: sids.get(v.blockId) ?? prior?.sid ?? "",
+					parentId: v.parentId,
+					orderKey: v.orderKey,
+					taskJson: v.taskJson,
+					question: v.askJson !== null,
+					deleted: false,
+					dbContent: content,
+				});
+				this.syncPending.set(v.blockId, content);
+				if (!known) {
+					this.seededAt.set(v.blockId, this.opSeq + 1);
+					if (content.length > 0) {
+						this.windowUpdates.push({
+							from: 0,
+							id: v.blockId,
+							kind: LIVE_TEXT_KIND.seed,
+							data: utf8.encode(content),
+						});
+						this.scheduleBroadcast();
 					}
 				}
-			}, SERVER_ORIGIN);
+			}
 			// Parents before children.
 			const ordered = [...created].sort(
 				(a, b) =>
@@ -2444,7 +2554,9 @@ export class LivePage {
 	}
 
 	/**
-	 * One append. The log of an epoch is: a snapshot of the document, then increments, and
+	 * One append. The log of an epoch is: a snapshot of every text document, then increments
+	 * (per actor, each block's updates merged; the seed texts of documents made since the last
+	 * append in a row of their own before them), all in the format of {@link encodeLogTexts}, and
 	 * "sync" rows (JSON, see `encodeSyncRow`): what the database held for blocks whose content it
 	 * changed (`b`, a commit of typed text, a write from outside), commits about to be written
 	 * (`i`, the content they will give a block) and intents whose commit did not happen (`x`),
@@ -2490,17 +2602,21 @@ export class LivePage {
 		this.keysPending.clear();
 		let snapshot = false;
 		if (!this.snapshotWritten) {
-			// The whole document first: later increments build on the items it holds. Blocks
+			// Every document whole first: later increments build on the items they hold. Blocks
 			// whose text is already ahead of the database get their database content synced.
-			rows.push(row(Y.encodeStateAsUpdate(this.doc), "system", LIVE_LOG_ACTOR));
+			rows.push(row(this.logSnapshot(), "system", LIVE_LOG_ACTOR));
 			snapshot = true;
 			for (const b of this.mirror.all()) {
 				if (!b.deleted && this.textOf(b.id) !== b.dbContent && !sync.has(b.id))
 					sync.set(b.id, b.dbContent);
 			}
 		} else {
+			// Seed texts first, whoever's update made the document: an update needs its seed.
+			const seeds = pending.filter((r) => r.kind === LIVE_TEXT_KIND.seed);
+			if (seeds.length > 0) rows.push(row(encodeLogTexts(seeds), "system", LIVE_LOG_ACTOR));
 			const byActor = new Map<string, PendingRow[]>();
 			for (const r of pending) {
+				if (r.kind === LIVE_TEXT_KIND.seed) continue;
 				const key = `${r.actorKind}\u0000${r.actorId}`;
 				const list = byActor.get(key);
 				if (list) list.push(r);
@@ -2508,13 +2624,7 @@ export class LivePage {
 			}
 			for (const list of byActor.values()) {
 				const first = list[0] as PendingRow;
-				rows.push(
-					row(
-						list.length === 1 ? first.update : Y.mergeUpdates(list.map((r) => r.update)),
-						first.actorKind,
-						first.actorId,
-					),
-				);
+				rows.push(row(encodeLogTexts(mergeTexts(list)), first.actorKind, first.actorId));
 			}
 		}
 		if (sync.size > 0 || intents.size > 0 || cancels.size > 0 || keys.size > 0)
@@ -2588,7 +2698,7 @@ export class LivePage {
 		// (unless the compaction fails). Ones arriving while it is written are not.
 		const covered = this.pendingRows;
 		this.pendingRows = [];
-		const compacted = [row(Y.encodeStateAsUpdate(this.doc), "system", LIVE_LOG_ACTOR)];
+		const compacted = [row(this.logSnapshot(), "system", LIVE_LOG_ACTOR)];
 		if (ahead.size > 0 || this.openIntents.size > 0 || this.keyDurable.size > 0) {
 			compacted.push(
 				row(
@@ -2608,6 +2718,14 @@ export class LivePage {
 		this.rowsSinceCompact = compacted.length;
 		this.bytesSinceCompact = 0;
 		this.stats.compactions++;
+	}
+
+	/** Every document whole, as the first row of an epoch's log holds them. */
+	private logSnapshot(): Uint8Array {
+		const entries: LiveTextEntry[] = [];
+		for (const [id, t] of this.docs)
+			entries.push({ id, kind: LIVE_TEXT_KIND.update, data: Y.encodeStateAsUpdate(t.doc) });
+		return encodeLogTexts(entries);
 	}
 
 	/** Transactions now in the log are acknowledged to their clients. */
@@ -2708,8 +2826,64 @@ export class LivePage {
 				epoch: this.epoch,
 			});
 		}
-		this.doc.destroy();
+		this.destroyDocs();
 	}
+}
+
+/**
+ * Text entries with each block's updates merged into one, a block's seed before them, blocks in
+ * the order they first appear.
+ */
+function mergeTexts(entries: readonly LiveTextEntry[]): LiveTextEntry[] {
+	if (entries.length === 1) return [entries[0] as LiveTextEntry];
+	const seeds = new Map<string, LiveTextEntry>();
+	const updates = new Map<string, Uint8Array[]>();
+	const order: string[] = [];
+	for (const e of entries) {
+		if (!seeds.has(e.id) && !updates.has(e.id)) order.push(e.id);
+		if (e.kind === LIVE_TEXT_KIND.seed) seeds.set(e.id, e);
+		else {
+			const list = updates.get(e.id);
+			if (list) list.push(e.data);
+			else updates.set(e.id, [e.data]);
+		}
+	}
+	const out: LiveTextEntry[] = [];
+	for (const id of order) {
+		const seed = seeds.get(id);
+		if (seed) out.push({ id, kind: seed.kind, data: seed.data });
+		const list = updates.get(id);
+		if (list) out.push({ id, kind: LIVE_TEXT_KIND.update, data: mergeTextUpdates(list) });
+	}
+	return out;
+}
+
+/**
+ * The first bytes of a text row of the log. A row written before text was per block (one Yjs
+ * update of a whole page) never starts with them: its epoch's first row was a snapshot of a
+ * document with at least the page's text, whose first byte is a client count of 1 or more.
+ */
+const LOG_TEXT_TAG = [0x00, 0xb2] as const;
+
+/**
+ * A text row of the log: {@link LOG_TEXT_TAG}, then text entries as a frame body carries them
+ * (`encodeLiveTexts`): `seed` (the plain text a document was made from) and `update`.
+ */
+export function encodeLogTexts(entries: readonly LiveTextEntry[]): Uint8Array {
+	const body = encodeLiveTexts(entries);
+	const out = new Uint8Array(LOG_TEXT_TAG.length + body.length);
+	out.set(LOG_TEXT_TAG, 0);
+	out.set(body, LOG_TEXT_TAG.length);
+	return out;
+}
+
+/** The entries of a text row; null for anything else (a row of the format before this one). */
+export function decodeLogTexts(row: Uint8Array): LiveTextEntry[] | null {
+	if (row.length < LOG_TEXT_TAG.length) return null;
+	if (row[0] !== LOG_TEXT_TAG[0] || row[1] !== LOG_TEXT_TAG[1]) return null;
+	const entries = decodeLiveTexts(row.subarray(LOG_TEXT_TAG.length));
+	if (!entries || entries.some((e) => e.kind === LIVE_TEXT_KIND.vector)) return null;
+	return entries;
 }
 
 function encodeSyncRow(

@@ -483,9 +483,9 @@ async function typing(
 	// Every local Yjs update of a typist (one per keystroke): sizes for the comparisons.
 	const ySizes: number[] = [];
 	for (const c of clients.slice(0, typists)) {
-		c.doc.on("update", (u: Uint8Array, origin: unknown) => {
+		c.onTextUpdate = (_id, u, origin) => {
 			if ((origin as { origin?: string } | null)?.origin === "local") ySizes.push(u.length);
-		});
+		};
 	}
 	for (const t of transports) t.resetCounts();
 	wire.up = 0;
