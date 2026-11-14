@@ -416,7 +416,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 		queryFn: api.getSettings,
 		gcTime: SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS,
 	});
-	const { groupedModels, visibleModels } = useAllModels();
+	const { groupedModels, visibleModels, modelOptionsFilter } = useAllModels();
 	// Default model selector: exclude "follow default" (self-reference) and
 	// "follow summary" (circular, since summary follows default).
 	const groupedModelsWithoutFollowDefault = useMemo(
@@ -490,6 +490,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 				placeholder={t("wizardSelectModel")}
 				data={groupedModelsWithoutFollowDefault}
 				searchable
+				filter={modelOptionsFilter}
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={defaultModel}
 				onChange={(v) => {
@@ -509,6 +510,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 				placeholder={t("wizardSelectModel")}
 				data={groupedModelsWithoutFollowSummary}
 				searchable
+				filter={modelOptionsFilter}
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={summaryModel}
 				onChange={(v) => {

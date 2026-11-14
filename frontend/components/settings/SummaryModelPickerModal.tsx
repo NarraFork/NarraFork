@@ -47,7 +47,7 @@ export function SummaryModelPickerModal({
 }: SummaryModelPickerModalProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 	const [selected, setSelected] = useState<string | null>(null);
 
 	// Exclude the "follow summary" sentinel — it would be self-referential here.
@@ -106,6 +106,7 @@ export function SummaryModelPickerModal({
 					label={t("summaryModel")}
 					data={summaryModelOptions}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					value={selected}
 					onChange={setSelected}

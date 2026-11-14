@@ -13,6 +13,7 @@ import {
 	mergeModels,
 	modelValue,
 } from "../lib/constants";
+import { createModelOptionsFilter } from "../lib/model-search";
 import type { ProviderCapabilityKey } from "./usePlatform";
 
 const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
@@ -826,6 +827,14 @@ export function useAllModels() {
 			if (group.nugProviderId) nugProviderIdByPrefix[group.prefix] = group.nugProviderId;
 		}
 
+		// The full metadata snapshot survives the grouped value/label projection.
+		// Hidden models enrich already-stored pool references without becoming options.
+		// Its identity changes only with the settings/auto-model snapshots.
+		const modelOptionsFilter = createModelOptionsFilter(
+			{ providerLabels, defaultModelValue, summaryModelValue },
+			[...allModels, followDefaultOption, followSummaryOption, ...autoOptions, ...aggModels],
+		);
+
 		return {
 			/** All models (including hidden) — disabled providers filtered out. */
 			allModels,
@@ -835,6 +844,11 @@ export function useAllModels() {
 			visibleWithDefault,
 			/** Grouped for Mantine Select (includes "follow default" and aggregations). */
 			groupedModels,
+			/**
+			 * `filter` for model Select / MultiSelect: matches provider display name,
+			 * prefix and model id, and resolves Default/Summary rows to their target.
+			 */
+			modelOptionsFilter,
 			/** The "follow default" ModelOption. */
 			followDefaultOption,
 			/** The "follow summary" ModelOption. */
