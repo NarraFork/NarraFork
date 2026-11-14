@@ -2764,14 +2764,22 @@ describe("planned update continuation scheduling", () => {
 			leaseMs: 100,
 			intervalMs: 10,
 		});
-		await new Promise((resolve) => setTimeout(resolve, 35));
-		expect(renewCalls).toBeGreaterThanOrEqual(2);
-		expect(abortController.signal.aborted).toBe(false);
+		try {
+			// Scheduling can be delayed by other workers; observe renewal, not wall-clock precision.
+			const deadline = Date.now() + 1_000;
+			while (renewCalls < 2 && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+			expect(renewCalls).toBeGreaterThanOrEqual(2);
+			expect(abortController.signal.aborted).toBe(false);
 
-		renewal.stop();
-		const callsAfterStop = renewCalls;
-		await new Promise((resolve) => setTimeout(resolve, 25));
-		expect(renewCalls).toBe(callsAfterStop);
+			renewal.stop();
+			const callsAfterStop = renewCalls;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			expect(renewCalls).toBe(callsAfterStop);
+		} finally {
+			renewal.stop();
+		}
 	});
 
 	test("aborts an in-flight recovery when claim renewal loses CAS ownership", async () => {

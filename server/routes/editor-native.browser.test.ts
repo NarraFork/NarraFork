@@ -17,13 +17,20 @@ import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { getDeviceConnectionGeneration } from "../services/device-connection-service";
 import { createRemoteBackend } from "../services/device-remote-backend";
-import { getEditorDocumentService } from "../services/editor-document-runtime";
+import {
+	getEditorDocumentService,
+	resetEditorDocumentServiceForTests,
+} from "../services/editor-document-runtime";
 import { editorFileSubscriptions } from "../services/editor-file-subscription";
 import { handleNarratorWS, type NarratorClientMessage } from "../websocket/narrator-ws";
 import { resolveWSData, type WSData } from "../websocket/ws-handler";
 import { createEditorDocumentRoutes } from "./editor-documents";
 import { editorHostColdBrowserAcceptance } from "./editor-host-cold-browser-acceptance";
-import { denyHostEditorHelpers, nativeEditorFixture } from "./editor-native-fixture";
+import {
+	denyHostEditorHelpers,
+	drainNativeEditorService,
+	nativeEditorFixture,
+} from "./editor-native-fixture";
 import { createFileReferenceRoutes } from "./narrator-file-references";
 
 type RawWindow = Window & { rawFixture: typeof Fixture };
@@ -140,10 +147,12 @@ test.each([
 			workers: number;
 		};
 	}[] = [];
+	// The fixture owns the lazy server service, not just its page and executor.
+	const service = getEditorDocumentService();
+	let serviceDrain: Promise<void> | undefined;
 	try {
 		if (device === "remote") await fixture.start();
 		// Local uses the production Host writer; no helper preparation/probe.
-		const service = getEditorDocumentService();
 		const app = new Hono();
 		// Same synthetic HTTP identity boundary as existing browser fixtures; WS authentication is real.
 		app.use("*", async (c, next) => {
@@ -737,7 +746,16 @@ test.each([
 			(window as unknown as RawWindow).rawFixture.state(),
 		);
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.close());
+		const closed = await page.evaluate(() => (window as unknown as RawWindow).rawFixture.state());
+		expect(closed.registry.workingCopies).toBe(0);
+		expect(closed.models).toBe(0);
+		expect(closed.views.views).toBe(0);
+		expect(closed.disk).toEqual({ copies: 0, running: 0, pending: 0, timers: 0, subscriptions: 0 });
+		// Revocation rejects the browser's document DELETEs. Server resource zero is
+		// therefore the fixture owner's drain, not proof that UI close alone freed it.
 		const end = Date.now() + 5000;
+		serviceDrain = drainNativeEditorService(service, end);
+		await serviceDrain;
 		// Browser abort/unmount does not join the source worker and remote close ACKs.
 		// Wait on live stream ownership before taking the final resource sample.
 		while (
@@ -749,7 +767,12 @@ test.each([
 		) {
 			if (Date.now() > end)
 				throw new Error(
-					`Native subscription/helper/stream cleanup did not settle: ${JSON.stringify(service.diagnostics.streams)}`,
+					`Native subscription/helper/stream cleanup did not settle: ${JSON.stringify({
+						device,
+						subscriptions: editorFileSubscriptions.diagnostics,
+						helpers: hostHelperDiagnostics(),
+						service: service.diagnostics,
+					})}`,
 				);
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
@@ -826,10 +849,16 @@ test.each([
 		stopSampling = true;
 		await sampler;
 		await browser?.close();
-		await server?.stop(true);
-		await fixture.dispose();
-		processGuard.restore();
-		await rm(root, { recursive: true, force: true });
-		await rm(bundleRoot, { recursive: true, force: true });
+		try {
+			serviceDrain ??= drainNativeEditorService(service);
+			await serviceDrain;
+			await resetEditorDocumentServiceForTests();
+		} finally {
+			await server?.stop(true);
+			await fixture.dispose();
+			processGuard.restore();
+			await rm(root, { recursive: true, force: true });
+			await rm(bundleRoot, { recursive: true, force: true });
+		}
 	}
 }, 240_000);

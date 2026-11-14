@@ -240,7 +240,7 @@ import {
 	shouldResumeAfterCompact,
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
-import { registerNarratorLoop } from "../update-coordinator";
+import { registerNarratorLoop, waitForRestartBeforeFailure } from "../update-coordinator";
 import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
@@ -1852,6 +1852,8 @@ export async function runAgentLoopUnlocked(
 
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
+					// Providers may surface teardown errors as events rather than throws.
+					await waitForRestartBeforeFailure(active.abortController.signal);
 					// A plan approval still waiting for its response to finish never restarted
 					// the pass: this ending is an ordinary interruption or failure, and the
 					// partial response must be kept, not cleaned up as an approval abort.
@@ -1867,7 +1869,7 @@ export async function runAgentLoopUnlocked(
 					// Clean up partial message
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
-					if (message === "Aborted") {
+					if (message === "Aborted" || active.abortController.signal.aborted) {
 						if (
 							active._planApprovedContinue === "compact" ||
 							active._planApprovedContinue === "continue"
@@ -3588,6 +3590,9 @@ export async function runAgentLoopUnlocked(
 			break;
 		}
 	} catch (err) {
+		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
+		// Keep the run active for the next process instead of publishing a false failure.
+		await waitForRestartBeforeFailure(active.abortController.signal);
 		if (pendingBufferedDelivery) {
 			try {
 				await restoreBufferedMessage(narratorId, pendingBufferedDelivery);
@@ -3599,29 +3604,33 @@ export async function runAgentLoopUnlocked(
 			}
 			pendingBufferedDelivery = undefined;
 		}
-		const errorMsg = serializeCatalogErrorMessage(err);
-		logger.error("Narrator loop error", {
-			narratorId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-		try {
-			await withDbRetry(
-				() =>
-					updateTerminalStatus({
-						substatus: ["error"],
-						errorMessage: errorMsg,
-					}),
-				{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
-			);
-		} catch (statusErr) {
-			logger.error("Failed to persist narrator error status", {
+		if (active.abortController.signal.aborted) {
+			runState.wasInterrupted = true;
+		} else {
+			const errorMsg = serializeCatalogErrorMessage(err);
+			logger.error("Narrator loop error", {
 				narratorId,
-				error: String(statusErr),
+				error: err instanceof Error ? err.message : String(err),
 			});
+			try {
+				await withDbRetry(
+					() =>
+						updateTerminalStatus({
+							substatus: ["error"],
+							errorMessage: errorMsg,
+						}),
+					{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
+				);
+			} catch (statusErr) {
+				logger.error("Failed to persist narrator error status", {
+					narratorId,
+					error: String(statusErr),
+				});
+			}
+			runState.finalText = errorMsg;
+			runState.hadError = true;
+			active.events.emit("event", { type: "error", data: { message: errorMsg } });
 		}
-		runState.finalText = errorMsg;
-		runState.hadError = true;
-		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
 		// The run ended: the session's claims go on the idle lease while it waits for its next
 		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system

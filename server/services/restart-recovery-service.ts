@@ -10,6 +10,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { parseSubstatus } from "../lib/narrator-utils";
+import type { Locale } from "../lib/prompt-i18n";
 import type { RunDeliverTo } from "../lib/validators/runtime-registration";
 import { narratorPersistence } from "./narrator-persistence";
 import {
@@ -470,10 +471,27 @@ export async function prepareOrdinaryRestartRecovery(
 			if (call && call.status !== "success" && call.status !== "fail") rows.push(row);
 		}
 	}
+	// A live loop recorded at shutdown also authorizes its own unchanged run, even
+	// when it delivers to nobody. Historical active rows (or rows without a run ID) do not.
+	const recordedRuns = new Map(
+		previous?.targets
+			.filter(
+				(target) =>
+					target.logicalRunId &&
+					previous.snapshot.narrators.some((entry) => entry.narratorId === target.narratorId),
+			)
+			.map((target) => [target.narratorId, target.logicalRunId]),
+	);
+	const explicitIds = new Set(
+		rows
+			.filter((row) => row.logicalRunId && recordedRuns.get(row.id) === row.logicalRunId)
+			.map((row) => row.id),
+	);
 	// A run that delivers its result is resumed; the session it delivers to (and so on
 	// up) is selected too, because it waits for that result exactly once.
 	const delegated = rows.filter((row) => row.deliverTo);
 	const selectedIds = new Set([
+		...explicitIds,
 		...delegated.map((row) => row.id),
 		...rows.filter((row) => unfinishedOwners.has(row.id)).map((row) => row.id),
 	]);
@@ -495,13 +513,16 @@ export async function prepareOrdinaryRestartRecovery(
 		version: 2,
 		updateEpoch: previous?.snapshot.updateEpoch ?? `restart-${generateId()}`,
 		capturedAt: previous?.snapshot.capturedAt ?? new Date().toISOString(),
-		narrators: selected.map(
-			(row) =>
-				previous?.snapshot.narrators.find((target) => target.narratorId === row.id) ?? {
-					narratorId: row.id,
-					locale: "en",
-				},
-		),
+		narrators: selected.flatMap((row) => {
+			const saved = previous?.targets.some(
+				(target) => target.narratorId === row.id && target.logicalRunId === row.logicalRunId,
+			)
+				? previous.snapshot.narrators.find((target) => target.narratorId === row.id)
+				: undefined;
+			// Caller discovery is not evidence that its independent loop was live. Keep
+			// its continuation, but do not manufacture standalone restart authorization.
+			return saved ? [saved] : row.deliverTo ? [{ narratorId: row.id, locale: "en" }] : [];
+		}),
 	};
 	const manifest: RestartManifest = {
 		version: 1,
@@ -516,7 +537,13 @@ export async function prepareOrdinaryRestartRecovery(
 			updateEpoch: snapshot.updateEpoch,
 			kind: "ordinary",
 			capturedAt: snapshot.capturedAt,
-			narrators: snapshot.narrators,
+			narrators: selected.map(
+				(row) =>
+					snapshot.narrators.find((target) => target.narratorId === row.id) ?? {
+						narratorId: row.id,
+						locale: "en",
+					},
+			),
 			pendingNarratorIds: manifest.targets.map((target) => target.narratorId),
 			logicalRuns: manifest.targets,
 		},
@@ -644,10 +671,18 @@ export async function prepareOrdinaryRestartRecovery(
 			.map((record) => record.narratorId),
 	);
 	for (const row of selected) {
-		if (!row.deliverTo && !queuedOwners.has(row.id)) {
+		if (!row.deliverTo && !queuedOwners.has(row.id) && !explicitIds.has(row.id)) {
 			protection.narratorIds.delete(row.id);
 		}
 	}
+	// Ancestors discovered through a historical/finished Agent call have no loop to
+	// mount. Keep their run facts for tool adoption, but not as pending standalone work.
+	const source = getRegisteredRecoverySource(snapshot.updateEpoch);
+	if (source)
+		registerRecoverySource(source).update({
+			...source,
+			pendingNarratorIds: source.pendingNarratorIds.filter((id) => protection.narratorIds.has(id)),
+		});
 	// Represented children are driven by Agent continuations; standalone children mount independently.
 	logger.info("Prepared ordinary restart recovery", {
 		targetCount: selected.length,
@@ -770,24 +805,25 @@ export async function restoreCarriedOrdinaryTargets(
 					where: eq(narrators.id, target.narratorId),
 					columns: { id: true, logicalRunId: true, status: true, substatus: true },
 				});
+				const saved = current.narrators.find((entry) => entry.narratorId === target.narratorId);
 				const valid =
 					row &&
 					row.logicalRunId === target.logicalRunId &&
-					!!(await deliverToOf(row.id)) &&
+					(!!(await deliverToOf(row.id)) || (!!target.logicalRunId && !!saved)) &&
 					(restartEligible(row) ||
 						(row.status === "idle" &&
 							parseSubstatus(row.substatus).includes("interrupted") &&
 							!parseSubstatus(row.substatus).some((tag) =>
-								["error", "taken_over", "cancelled"].includes(tag),
+								["error", "taken_over", "manual_override", "cancelled"].includes(tag),
 							)));
 				if (valid) {
-					// The same persisted run continues (deadline kept); its result was already
-					// owed through its own task/tool call, so recovery does not deliver it again.
+					// Keep the persisted run/deadline and original reply options. A delegated
+					// run's task/tool call already owns delivery; recovery must not deliver twice.
 					const resumed = await continueNarrator(
 						row.id,
-						"en",
-						false,
-						undefined,
+						(saved?.locale ?? "en") as Locale,
+						saved?.replyInUserLanguage ?? false,
+						saved?.userId,
 						{
 							resumeRunId: row.logicalRunId ?? undefined,
 							recovered: true,
@@ -795,7 +831,7 @@ export async function restoreCarriedOrdinaryTargets(
 						},
 						humanReplyContext?.narratorId === row.id ? humanReplyContext.context : undefined,
 					);
-					if (!resumed.ok) throw new Error("Standalone delivering run recovery did not start");
+					if (!resumed.ok) throw new Error("Standalone run recovery did not start");
 				}
 				const original = getRegisteredRecoverySource(source.updateEpoch);
 				if (original)
@@ -806,7 +842,7 @@ export async function restoreCarriedOrdinaryTargets(
 			});
 		} catch (error) {
 			failures.push(target.narratorId);
-			logger.error("Could not resume interrupted standalone subagent", {
+			logger.error("Could not resume interrupted standalone narrator", {
 				narratorId: target.narratorId,
 				error: String(error),
 			});
