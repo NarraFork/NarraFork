@@ -1,0 +1,174 @@
+/**
+ * NarraFork design tokens — the single source of truth for palette, semantic color,
+ * spacing, radius and motion.
+ *
+ * ## Direction of derivation (do not invert)
+ *
+ *     palette (hex)  →  --mantine-*  →  semantic tokens  →  components
+ *
+ * The `--nf-*` semantic names below read Mantine's variables rather than the palette
+ * directly, because three separate mechanisms overwrite those variables on <html>:
+ * OLED mode (styles/oled.css) and plugin-contributed themes (compiled server-side into
+ * scoped `--mantine-*` declarations). Reading through them is what makes a theme change
+ * reach every surface. A semantic token that pointed straight at `--nf-ink-900` would
+ * silently stop following both — and the failure looks like a colour being one shade
+ * off, which nobody reports.
+ *
+ * ## Hex belongs here only
+ *
+ * Every literal colour in `frontend/` should come from this file, with two deliberate
+ * exceptions kept in the check script's allowlist: `components/terminal/terminal-theme.ts`
+ * (terminal palettes are content, not chrome) and `components/settings/BrandingSection.tsx`
+ * (user-chosen brand colours).
+ *
+ * ## Dark surfaces group; they do not divide
+ *
+ * Adjacent dark surfaces cannot be pushed far apart — past roughly 1.5:1 the UI starts
+ * to look muddy and grey rather than deep. So the surface ramp only *groups* (each step
+ * is ≥1.12:1 from its neighbour) and real boundaries use `--nf-line` (≈2:1, decorative)
+ * or `--nf-line-strong` (3.4:1, meets WCAG 1.4.11 for interactive control boundaries).
+ * Please do not "make the layers clearer" by brightening the surfaces.
+ *
+ * ## Relationship to the plugin token set
+ *
+ * `components/plugins/host-tokens.ts` publishes fourteen semantic names to sandboxed
+ * plugin iframes and reads their values from the live document. It is a public contract
+ * for third-party plugins, so this file must keep deriving from `--mantine-*`; the plugin
+ * set keeps working without a single change there.
+ *
+ * Import order matters: after `@mantine/core/styles.css` and before `styles/oled.css`
+ * (see main.tsx). `light-dark()` requires a `color-scheme`, which Mantine sets on
+ * `:root[data-mantine-color-scheme]`.
+ */
+
+:root {
+	/* ---- palette: dark ink (blue-cast neutral, not grey) ---- */
+	--nf-ink-950: #0b0e14;
+	--nf-ink-900: #191d26;
+	--nf-ink-850: #22262f;
+	--nf-ink-800: #2c3240;
+	--nf-ink-700: #39404f;
+	--nf-ink-600: #657086;
+	--nf-ink-300: #8a93a5;
+	--nf-ink-200: #b7bfce;
+	--nf-ink-100: #e7ebf3;
+
+	/* ---- palette: light paper ---- */
+	--nf-paper-50: #f6f7f9;
+	--nf-paper-0: #ffffff;
+	--nf-paper-100: #eef1f5;
+	--nf-paper-200: #e6eaf1;
+	--nf-paper-300: #d8dee8;
+	--nf-paper-500: #7e8a9e;
+	--nf-paper-600: #5e6878;
+	--nf-paper-700: #414a5a;
+	--nf-paper-900: #141821;
+
+	/*
+	 * Action: what the user can do (primary buttons, focus, current selection).
+	 * Filled values are dark enough to carry white text (≥4.5:1); the `-text` variants
+	 * are the on-surface variant used for links and text inside a tinted chip.
+	 */
+	--nf-action-fill-dark: #5060db;
+	--nf-action-fill-light: #4459d8;
+	--nf-action-fill-hover-dark: #5a6ae0;
+	--nf-action-fill-hover-light: #4a5fdd;
+	--nf-action-text-dark: #a0aef7;
+	--nf-action-text-light: #3a50b8;
+	--nf-action-subtle-dark: #1e2236;
+	--nf-action-subtle-light: #edf0fe;
+
+	/*
+	 * Status: what the system is doing. Deliberately separate from `action` — one hue
+	 * carrying both "you can press this" and "this is running" is how a screen ends up
+	 * with nothing standing out.
+	 *
+	 * `-graphic` values are for dots, bars and icons (≥3:1 non-text). `-text` values are
+	 * the legible-on-surface variants (≥4.5:1); in dark they happen to coincide for three
+	 * of the four, in light they do not — `live` at 3.97:1 fails AA as text, which is why
+	 * it gets its own darker step.
+	 */
+	--nf-live-graphic-dark: #46c6bc;
+	--nf-live-graphic-light: #0f8f86;
+	--nf-live-text-dark: #7fd8d2;
+	--nf-live-text-light: #0b7268;
+	--nf-wait-graphic-dark: #7d95b8;
+	--nf-wait-graphic-light: #5a739a;
+	--nf-attention-graphic-dark: #f0a93e;
+	--nf-attention-graphic-light: #96600b;
+	--nf-danger-graphic-dark: #f0555a;
+	--nf-danger-graphic-light: #c2262b;
+
+	/* ---- radius: by role, not by size ---- */
+	--nf-radius-plane: 0;
+	--nf-radius-control: var(--mantine-radius-sm); /* 4px */
+	--nf-radius-overlay: var(--mantine-radius-md); /* 8px */
+
+	/* ---- spacing ---- */
+	--nf-space-1: 2px;
+	--nf-space-2: 4px;
+	--nf-space-3: 8px;
+	--nf-space-4: 12px;
+	--nf-space-5: 16px;
+	--nf-space-6: 24px;
+	--nf-space-7: 32px;
+	--nf-space-8: 48px;
+
+	/* ---- type ---- */
+	--nf-font-ui:
+		ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+		"Noto Sans CJK SC", sans-serif;
+	--nf-font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", monospace;
+	/* Counts, durations and token totals must not change width while a stream appends. */
+	--nf-numeric: tabular-nums;
+
+	/* ---- motion ---- */
+	--nf-dur-fast: 120ms;
+	--nf-dur-base: 180ms;
+	--nf-dur-slow: 240ms;
+	--nf-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* ---- semantic layer ---- */
+:root {
+	--nf-surface-canvas: var(--mantine-color-body);
+	--nf-surface: var(--mantine-color-default);
+	--nf-surface-raised: light-dark(var(--nf-paper-100), var(--nf-ink-850));
+	--nf-surface-overlay: light-dark(var(--nf-paper-200), var(--nf-ink-800));
+
+	/*
+	 * Derived from the Mantine border variable rather than the palette so it follows OLED
+	 * and plugin themes; mixed with the surface to land at the decorative weight (~2:1).
+	 */
+	--nf-line: color-mix(in srgb, var(--mantine-color-default-border) 62%, var(--nf-surface));
+	--nf-line-strong: var(--mantine-color-default-border);
+
+	--nf-text: var(--mantine-color-text);
+	--nf-text-secondary: light-dark(var(--nf-paper-700), var(--nf-ink-200));
+	--nf-text-muted: var(--mantine-color-dimmed);
+
+	--nf-action: light-dark(var(--nf-action-fill-light), var(--nf-action-fill-dark));
+	--nf-action-hover: light-dark(
+		var(--nf-action-fill-hover-light),
+		var(--nf-action-fill-hover-dark)
+	);
+	--nf-action-label: light-dark(var(--nf-action-text-light), var(--nf-action-text-dark));
+	--nf-action-subtle: light-dark(var(--nf-action-subtle-light), var(--nf-action-subtle-dark));
+
+	--nf-live-graphic: light-dark(var(--nf-live-graphic-light), var(--nf-live-graphic-dark));
+	--nf-live-text: light-dark(var(--nf-live-text-light), var(--nf-live-text-dark));
+	--nf-wait-graphic: light-dark(var(--nf-wait-graphic-light), var(--nf-wait-graphic-dark));
+	--nf-attention-graphic: light-dark(
+		var(--nf-attention-graphic-light),
+		var(--nf-attention-graphic-dark)
+	);
+	--nf-danger-graphic: light-dark(var(--nf-danger-graphic-light), var(--nf-danger-graphic-dark));
+}
+
+@media (prefers-reduced-motion: reduce) {
+	:root {
+		--nf-dur-fast: 0ms;
+		--nf-dur-base: 0ms;
+		--nf-dur-slow: 0ms;
+	}
+}

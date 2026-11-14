@@ -11,6 +11,15 @@ import "@mantine/core/styles.css";
 import "@mantine/dates/styles.css";
 import "@mantine/notifications/styles.css";
 import "@mantine/tiptap/styles.css";
+/*
+ * Design tokens (palette, semantic colours, spacing, radius, motion).
+ *
+ * Order is load-bearing: after Mantine's own stylesheets (it defines the `--mantine-*`
+ * variables and the `color-scheme` that `light-dark()` resolves against) and BEFORE
+ * `styles/oled.css` (which overrides `--mantine-color-body`; a later token declaration
+ * would win over it and silently disable OLED). See the stylesheet's header.
+ */
+import "@frontend/styles/tokens.css";
 // Patches a Mantine Slider layout detail: mark labels must not widen the
 // scroll container they sit in. Global because every `marks` slider needs it —
 // see the stylesheet header.

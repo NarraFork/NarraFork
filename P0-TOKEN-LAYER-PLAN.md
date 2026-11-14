@@ -384,22 +384,22 @@ P0 只定义三档时长（120 / 180 / 240ms）+ 一条缓动，并把 `prefers-
 }
 ```
 
-### 5.2 补丁 `frontend/lib/mantine-theme.ts`
+### 5.2 主题文件：PR1 不动
 
-PR1 只加**不改变取值**的两项（字体栈、数字样式），其余留到 PR2：
+**修正（实现时发现）**：初版说 PR1 顺带接上 `fontFamily`。这不成立——字体栈一换就在 Linux 上真实改变渲染（Mantine 默认栈含 Roboto/Helvetica，我们的栈含 Noto CJK SC），不满足「零视觉变化」。所以 PR1 **`mantine-theme.ts` 一行不改**，字体栈接入归 PR2：
 
 ```ts
+// PR2 才加：
 export const mantineTheme = createTheme({
-	primaryColor: "indigo",
-	defaultRadius: "sm",           // 保持 4px，不动
+	// ...
 	fontFamily: "var(--nf-font-ui)",
 	fontFamilyMonospace: "var(--nf-font-mono)",
-	// fontSizes / lineHeights / radius / spacing 在 PR1 全部不传：
+	// fontSizes / lineHeights / radius / spacing 仍然不传：
 	// 传了就等于改刻度（见自审 #1、#2）
 });
 ```
 
-> 初版这里写了 `fontSizes` / `lineHeights` / `radius` 三张表，是错的：即便"值等于默认"，`radius` 改键也会改变 `radius="sm"` 的语义。PR1 的正确形态是**只加字体栈**。
+PR1 唯一的代码改动是 `frontend/main.tsx` 里加一行 CSS 导入。这也是它能做到"零视觉变化"的前提：新文件里没有任何消费者，且不覆写任何 `--mantine-*`。
 
 ### 5.3 与阅读器排版的关系（初版遗漏）
 
@@ -455,7 +455,7 @@ const ALLOW = [
 
 | PR | 内容 | 视觉变化 | 可回滚性 |
 |---|---|---|---|
-| **PR1** | 新增 `tokens.css`（只含 palette + 标量，**不覆写任何 `--mantine-*`**）+ `main.tsx` 导入顺序 + 主题只加字体栈 | **严格为零** | 删文件即可 |
+| **PR1** | 新增 `frontend/styles/tokens.css`（palette + 标量 + 语义层，**不覆写任何 `--mantine-*`**）+ `main.tsx` 加一行导入（位置在 Mantine 样式之后、`oled.css` 之前） | **严格为零** | 删文件 + 删一行导入即可 |
 | **PR2** | 打开槽位覆写（§4.3）+ `colors.dark` 换 ink 阶 + 迁移 Top 20 字面量 | 有，需前后截图 | revert 单 PR |
 | **PR3** | 守卫脚本 + CI + 存量清理 | 无 | 移除 CI job |
 
