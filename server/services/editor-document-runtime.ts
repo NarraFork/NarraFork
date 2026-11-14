@@ -10,7 +10,6 @@ import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
-import { settings } from "../lib/settings";
 import { hasDeviceProtocolFeature } from "./device-connection-service";
 import { RemoteBackend } from "./device-remote-backend";
 import {
@@ -34,6 +33,18 @@ import {
 import { workspaceContextService } from "./workspace-context-service";
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 import { closeClaim, openClaim, sealClaim } from "./worktree-write-claims";
+
+function editorRuntimeDiagnostic(
+	level: "debug" | "warn",
+	message: string,
+	fields: Record<string, string | number | boolean>,
+) {
+	try {
+		logger[level](message, fields);
+	} catch {
+		// Logging never changes a durable receipt or skips a finally cleanup.
+	}
+}
 
 /** The original remote raw-v2 save as persisted. Null is never inferred: it only
  * means the row lacks a field the executor query is bound to, not non-execution. */
@@ -163,16 +174,55 @@ export const executeEditorDocumentFileChange: EditorDocumentDependencies["execut
 		// The Host already holds this terminal proof as the returned real outcome. ACK
 		// only shortens executor retention; history settlement is never a precondition.
 		if (backend && terminal)
-			await acknowledgeEditorReceipt(backend.deviceId, terminal.query).catch((error) =>
-				logger.debug("Editor engine ACK deferred", { error: String(error) }),
-			);
+			await acknowledgeEditorReceipt(backend.deviceId, terminal.query).catch(() => {
+				try {
+					editorRuntimeDiagnostic("debug", "Editor engine ACK deferred", { deferred: true });
+				} catch {
+					// Diagnostics cannot change the already-settled write outcome.
+				}
+			});
 	}
 };
 
+const EDITOR_SERVICE_KEY = "narrafork.editor-documents.v1";
+const EDITOR_SERVICE_CLOSED_KEY = Symbol.for("narrafork.editor-documents.closed.v2");
+function currentEditorDocumentService(): EditorDocumentService | undefined {
+	const service: unknown = Reflect.get(globalThis, Symbol.for(EDITOR_SERVICE_KEY));
+	if (!service) return undefined;
+	if (
+		typeof service !== "object" ||
+		!("lifecycleVersion" in service) ||
+		service.lifecycleVersion !== 2 ||
+		!("dispose" in service) ||
+		typeof service.dispose !== "function"
+	)
+		throw new AppError(
+			"Editor worker ownership predates safe draining; restart the server manually",
+			503,
+			"EDITOR_RESTART_REQUIRED",
+		);
+	return service as EditorDocumentService;
+}
+/** Close the actual lazy production owner without instantiating an unused service. */
+export async function closeEditorDocumentService(): Promise<void> {
+	// A resource-free scalar latch also closes the not-yet-created lazy owner across HMR.
+	Reflect.set(globalThis, EDITOR_SERVICE_CLOSED_KEY, true);
+	await currentEditorDocumentService()?.dispose();
+}
+/** Explicit test reset, only after successful drain; failed ownership remains pinned. */
+export async function resetEditorDocumentServiceForTests(): Promise<void> {
+	await closeEditorDocumentService();
+	Reflect.deleteProperty(globalThis, Symbol.for(EDITOR_SERVICE_KEY));
+	Reflect.deleteProperty(globalThis, EDITOR_SERVICE_CLOSED_KEY);
+}
 export function getEditorDocumentService(): EditorDocumentService {
-	// A hot module reload must not clean up the live previous generation's pinned objects.
+	if (Reflect.get(globalThis, EDITOR_SERVICE_CLOSED_KEY))
+		throw new AppError("Editor documents are closed", 503, "EDITOR_CLOSED");
+	// HMR retains the live owner. Old shapes lacking lifecycle proof fail closed, never duplicate it.
+	const existing = currentEditorDocumentService();
+	if (existing) return existing;
 	return hotSafe(
-		"narrafork.editor-documents.v1",
+		EDITOR_SERVICE_KEY,
 		() =>
 			new EditorDocumentService({
 				root: join(getNarraforkHome(), "editor-transfers"),
@@ -206,8 +256,10 @@ export function getEditorDocumentService(): EditorDocumentService {
 						changed = true;
 						try {
 							if (claimPath) closeClaim(binding.cwd, claimId, [claimPath]);
-						} catch (error) {
-							logger.debug("Closing large editor claim failed", { error: String(error) });
+						} catch {
+							editorRuntimeDiagnostic("debug", "Closing large editor claim failed", {
+								deferred: true,
+							});
 						}
 						try {
 							const { interjectFileEditAsUserMessage } = await import("./file-edit-interject");
@@ -218,15 +270,19 @@ export function getEditorDocumentService(): EditorDocumentService {
 								locale: actor.locale ?? "en",
 								userId: actor.userId,
 							});
-						} catch (error) {
-							logger.debug("Large editor save notification failed", { error: String(error) });
+						} catch {
+							editorRuntimeDiagnostic("debug", "Large editor save notification failed", {
+								deferred: true,
+							});
 						}
 					} catch (error) {
 						changed = error instanceof EditorFileChangeUncertainError;
 						try {
 							if (claimPath) sealClaim(binding.cwd, claimId);
-						} catch (claimError) {
-							logger.debug("Sealing large editor claim failed", { error: String(claimError) });
+						} catch {
+							editorRuntimeDiagnostic("debug", "Sealing large editor claim failed", {
+								deferred: true,
+							});
 						}
 						throw error;
 					} finally {
@@ -234,9 +290,9 @@ export function getEditorDocumentService(): EditorDocumentService {
 							try {
 								const { invalidateWorkspaceTreeCache } = await import("./narrator-session-state");
 								invalidateWorkspaceTreeCache(binding.cwd);
-							} catch (error) {
-								logger.debug("Large editor tree cache invalidation failed", {
-									error: String(error),
+							} catch {
+								editorRuntimeDiagnostic("debug", "Large editor tree cache invalidation failed", {
+									deferred: true,
 								});
 							}
 						}
@@ -364,8 +420,8 @@ export const queryEditorOperation: NonNullable<
 		const result = effectResult(operation, effect, operationId, saved);
 		// Retry only the terminal ACK; an offline executor never downgrades recorded proof.
 		if (result.status !== "uncertain")
-			await acknowledgeEditorReceipt(deviceId, intent.query).catch((error) =>
-				logger.debug("Editor engine ACK deferred", { error: String(error) }),
+			await acknowledgeEditorReceipt(deviceId, intent.query).catch(() =>
+				editorRuntimeDiagnostic("debug", "Editor engine ACK deferred", { deferred: true }),
 			);
 		return result;
 	}
@@ -378,9 +434,12 @@ export const queryEditorOperation: NonNullable<
 			intent.query,
 			actor.signal,
 		);
-	} catch (error) {
+	} catch {
 		actor.signal?.throwIfAborted();
-		logger.debug("Editor remote query unavailable", { operationId, error: String(error) });
+		editorRuntimeDiagnostic("debug", "Editor remote query unavailable", {
+			operationId,
+			unavailable: true,
+		});
 	}
 	// Access may have been revoked while the RPC was in flight.
 	await authorize?.();
@@ -407,13 +466,15 @@ export const queryEditorOperation: NonNullable<
 			snapshotRevision: intent.snapshotRevision,
 		};
 		if (receipt.rawDigest !== committed.hash || receipt.totalBytes !== committed.bytes) {
-			logger.warn("Editor receipt contradicts original intent", { operationId });
+			editorRuntimeDiagnostic("warn", "Editor receipt contradicts original intent", {
+				operationId,
+			});
 			return { status: "uncertain", operationId };
 		}
 	} else if (receipt.rawDigest !== null || receipt.totalBytes !== null)
 		return { status: "uncertain", operationId };
-	await acknowledgeEditorReceipt(deviceId, intent.query).catch((error) =>
-		logger.debug("Editor engine ACK deferred", { error: String(error) }),
+	await acknowledgeEditorReceipt(deviceId, intent.query).catch(() =>
+		editorRuntimeDiagnostic("debug", "Editor engine ACK deferred", { deferred: true }),
 	);
 	return committed ? savedResult(operationId, committed, false) : { status: "failed", operationId };
 };

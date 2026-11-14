@@ -20,7 +20,6 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { setTimeout as yieldToEventLoop } from "node:timers/promises";
-import { Worker } from "node:worker_threads";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeExecutionBinding,
@@ -30,7 +29,10 @@ import {
 	hasSettledMeasuredFileEffect,
 	NON_OPERATION_ROLES,
 } from "@shared/file-change-protocol";
+import { connectCompiledWorker } from "../lib/compiled-worker";
 import { AppError } from "../lib/errors";
+import { hotSafe } from "../lib/hot-safe";
+import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
 	bodyLengthSql,
@@ -39,6 +41,8 @@ import {
 	hasRowsOnlyBodies,
 } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
+import type { WorkerHandle } from "../lib/worker-runtime/lifecycle";
+import { type PoolWorker, WorkerPool, type WorkerTaskContext } from "../lib/worker-runtime/pool";
 import {
 	createFileChangeIdentity,
 	fileChangeExecutionBindingMatches,
@@ -257,7 +261,7 @@ interface ScopeState {
 	childCandidates: Map<string, ReadonlyMap<string, readonly string[]>>;
 	childCandidateCount: number;
 	files: Set<string>;
-	worker: BodyWorker;
+	deadlineAt: number;
 }
 
 /**
@@ -333,7 +337,7 @@ export class RevertSelectionService {
 			childCandidates: new Map(),
 			childCandidateCount: 0,
 			files: new Set(),
-			worker: new BodyWorker(signal),
+			deadlineAt: Date.now() + this.timeoutMs,
 			result: {
 				version: 1,
 				narratorId: input.narratorId,
@@ -383,7 +387,6 @@ export class RevertSelectionService {
 			completed = true;
 			return state.result;
 		} finally {
-			await state.worker.close();
 			this.active--;
 			const durationMs = performance.now() - started;
 			if (durationMs >= 100) {
@@ -401,8 +404,8 @@ export class RevertSelectionService {
 				else console.warn("[revert-selection] slow metadata collection", event);
 			}
 			if (completed) {
-				this.check(state); // worker shutdown was the final await
-				// Catch version/context changes even during ACL callbacks or worker shutdown.
+				this.check(state);
+				// Catch version/context changes even during ACL callbacks or source verification.
 				for (const narratorId of state.narrators.keys())
 					this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [narratorId]);
 			}
@@ -462,7 +465,7 @@ export class RevertSelectionService {
 		// Raw bodies are rehashed off-thread, never included in main-thread row digests.
 		for (const { ref, digest } of state.bodies.values()) {
 			const content = this.readBody(state, ref);
-			const current = await state.worker.inspect(ref.id, content, true);
+			const current = await inspectBody(state, ref.id, content, true);
 			this.check(state);
 			if (current.digest !== digest) throw fail("STALE", "Selected message body changed");
 		}
@@ -617,7 +620,7 @@ export class RevertSelectionService {
 			REVERT_SELECTION_LIMITS.inspectedBodyBytes,
 			"total body inspection bytes",
 		);
-		const summary = await state.worker.inspect(ref.id, this.readBody(state, ref));
+		const summary = await inspectBody(state, ref.id, this.readBody(state, ref));
 		this.check(state);
 		const old = state.bodies.get(ref.id);
 		if (old && old.digest !== summary.digest) throw fail("STALE", "Selected message body changed");
@@ -1518,61 +1521,177 @@ function withSignal<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
 	});
 }
 
-/** One worker per bounded collection; no code/input from a model is executed. */
-class BodyWorker {
-	private worker: Worker | null = null;
-	private termination: Promise<number> | undefined;
-	private pending: {
-		resolve: (summary: BodySummary) => void;
-		reject: (error: Error) => void;
-	} | null = null;
-	constructor(private readonly signal: AbortSignal) {}
-	async inspect(id: string, body: string, digestOnly = false): Promise<BodySummary> {
-		this.signal.throwIfAborted();
-		if (!this.worker) {
-			this.worker = new Worker(BODY_WORKER, { eval: true });
-			this.worker.on("message", (result: BodySummary & { error?: string }) => {
-				const pending = this.pending;
-				this.pending = null;
-				if (result.error) pending?.reject(fail("BODY_UNVERIFIED", result.error));
-				else pending?.resolve(result);
-			});
-			this.worker.on("error", (error) => {
-				this.pending?.reject(error instanceof Error ? error : new Error("Body worker failed"));
-				this.pending = null;
-			});
-			this.signal.addEventListener("abort", this.abort, { once: true });
+type BodyRequest = { id: string; body: string; digestOnly: boolean };
+
+/** One native RPC listener per reusable slot. No payload computation runs here. */
+class BodyPoolWorker implements PoolWorker<BodyRequest, BodySummary> {
+	private stopping = false;
+	private pending:
+		| {
+				requestId: string;
+				resolve: (summary: BodySummary) => void;
+				reject: (error: unknown) => void;
+		  }
+		| undefined;
+	constructor(private readonly handle: WorkerHandle<import("node:worker_threads").Worker>) {
+		handle.resource.on("message", this.message);
+		handle.resource.on("error", this.error);
+		handle.resource.on("messageerror", this.error);
+		handle.resource.on("exit", this.exit);
+		handle.resource.unref();
+	}
+	get closed() {
+		return this.stopping || this.handle.closed;
+	}
+	private message = (reply: unknown) => {
+		if (
+			reply &&
+			typeof reply === "object" &&
+			!Array.isArray(reply) &&
+			"ready" in reply &&
+			reply.ready === true &&
+			!("requestId" in reply) &&
+			!("result" in reply) &&
+			!("error" in reply)
+		)
+			return;
+		if (
+			!reply ||
+			typeof reply !== "object" ||
+			Array.isArray(reply) ||
+			!("requestId" in reply) ||
+			typeof reply.requestId !== "string" ||
+			!reply.requestId
+		) {
+			this.error(fail("BODY_UNVERIFIED", "Invalid body worker response"));
+			return;
 		}
+		const pending = this.pending;
+		// A late success OR error belongs only to its own RPC, never the next inspect.
+		if (!pending || reply.requestId !== pending.requestId) return;
+		if ("error" in reply && typeof reply.error === "string" && !("result" in reply)) {
+			this.pending = undefined;
+			this.handle.resource.unref();
+			pending.reject(fail("BODY_UNVERIFIED", reply.error));
+			return;
+		}
+		const result = "result" in reply ? reply.result : undefined;
+		// Only the envelope/top-level shape: never rehash or traverse blocks on this thread.
+		if (
+			"error" in reply ||
+			!result ||
+			typeof result !== "object" ||
+			Array.isArray(result) ||
+			!("digest" in result) ||
+			typeof result.digest !== "string" ||
+			!("blocks" in result) ||
+			!Array.isArray(result.blocks)
+		) {
+			this.error(fail("BODY_UNVERIFIED", "Invalid body worker response"));
+			return;
+		}
+		this.pending = undefined;
+		this.handle.resource.unref();
+		pending.resolve(result as BodySummary);
+	};
+	private error = (error: unknown) => {
+		this.pending?.reject(error);
+		this.pending = undefined;
+		void this.close().catch(() => {});
+	};
+	private exit = () => this.error(fail("BODY_UNVERIFIED", "Body worker exited"));
+	run(request: BodyRequest, context: WorkerTaskContext): Promise<BodySummary> {
+		context.signal.throwIfAborted();
+		if (this.closed) return Promise.reject(fail("BODY_UNVERIFIED", "Body worker unavailable"));
+		this.handle.resource.ref();
 		return new Promise((resolve, reject) => {
-			this.pending = { resolve, reject };
-			this.worker?.postMessage({
-				id,
-				body,
-				digestOnly,
-				maxBlocks: REVERT_SELECTION_LIMITS.blockItems,
-				maxOutput: FILE_CHANGE_LIMITS.summaryBytes,
-			});
+			this.pending = { requestId: context.requestId, resolve, reject };
+			try {
+				this.handle.resource.postMessage({
+					...request,
+					requestId: context.requestId,
+					maxBlocks: REVERT_SELECTION_LIMITS.blockItems,
+					maxOutput: FILE_CHANGE_LIMITS.summaryBytes,
+				});
+			} catch (error) {
+				this.error(error);
+			}
 		});
 	}
-	private abort = () => {
-		this.pending?.reject(this.signal.reason);
-		this.pending = null;
-		this.termination ??= this.worker?.terminate();
-	};
-	async close() {
-		this.signal.removeEventListener("abort", this.abort);
-		this.termination ??= this.worker?.terminate();
-		await this.termination;
-		this.worker = null;
+	async close(): Promise<void> {
+		this.stopping = true;
+		this.pending?.reject(fail("BODY_UNVERIFIED", "Body worker closed"));
+		this.pending = undefined;
+		await this.handle.close();
+		this.handle.resource.off("message", this.message);
+		this.handle.resource.off("error", this.error);
+		this.handle.resource.off("messageerror", this.error);
+		this.handle.resource.off("exit", this.exit);
+	}
+}
+
+function createBodyPool() {
+	return new WorkerPool<BodyRequest, BodySummary>({
+		concurrency: REVERT_SELECTION_LIMITS.concurrentCollectors,
+		maxQueued: 32,
+		maxQueuedBytes: 64 * 1024 * 1024,
+		timeoutMs: REVERT_SELECTION_LIMITS.timeoutMs,
+		create: async (context) => {
+			const { handle } = await connectCompiledWorker([BODY_WORKER], {
+				signal: context.signal,
+				deadlineAt: context.deadlineAt,
+				workerOptions: { eval: true },
+			});
+			return new BodyPoolWorker(handle);
+		},
+	});
+}
+const bodyWorkers = hotSafe("revert-body:pool", () => ({ pool: createBodyPool() }));
+
+/** Final production shutdown: stops admission and awaits every native thread's exit. */
+export function closeRevertBodyWorkers(): Promise<void> {
+	return bodyWorkers.pool.close();
+}
+/** Explicit test-only reconstruction; production close never silently recreates a pool. */
+export async function resetRevertBodyWorkersForTests(): Promise<void> {
+	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Test-only body pool reset");
+	await closeRevertBodyWorkers();
+	bodyWorkers.pool = createBodyPool();
+}
+async function inspectBody(
+	scope: Pick<ScopeState, "signal" | "deadlineAt">,
+	id: string,
+	body: string,
+	digestOnly = false,
+): Promise<BodySummary> {
+	try {
+		return await bodyWorkers.pool.run(
+			{ id, body, digestOnly },
+			{
+				signal: scope.signal,
+				deadlineAt: scope.deadlineAt,
+				requestId: generateId(),
+				bytes: (body.length + id.length) * 3 + 1024,
+			},
+		);
+	} catch (error) {
+		scope.signal.throwIfAborted();
+		if (
+			error instanceof Error &&
+			(error.name === "TaskQueueError" || error.name === "WorkerPoolError")
+		)
+			throw fail("BODY_UNVERIFIED", error.message);
+		throw error;
 	}
 }
 const BODY_WORKER = `
 const { parentPort } = require('node:worker_threads');
 const { createHash } = require('node:crypto');
 const hash = value => createHash('sha256').update(value).digest('hex');
-parentPort.on('message', ({id, body, digestOnly, maxBlocks, maxOutput}) => {
+parentPort.on('message', ({action, requestId, id, body, digestOnly, maxBlocks, maxOutput}) => {
+ if (action === 'ping') { parentPort.postMessage({ready: true}); return; }
  try {
-  if (digestOnly) { parentPort.postMessage({digest: hash(body), blocks: []}); return; }
+  if (digestOnly) { parentPort.postMessage({requestId, result: {digest: hash(body), blocks: []}}); return; }
   const parsed = JSON.parse(body);
   if (!Array.isArray(parsed) || parsed.length > maxBlocks) throw Error('Message block coverage is unavailable or over budget');
   const digest = hash(body); const seen = new Set(); const blocks = [];
@@ -1588,7 +1707,7 @@ parentPort.on('message', ({id, body, digestOnly, maxBlocks, maxOutput}) => {
   }
   const result = {digest, blocks};
   if (Buffer.byteLength(JSON.stringify(result)) > maxOutput) throw Error('Block metadata exceeds the worker output budget');
-  parentPort.postMessage(result);
- } catch (error) { parentPort.postMessage({error: error.message}); }
+  parentPort.postMessage({requestId, result});
+ } catch (error) { parentPort.postMessage({requestId, error: error.message}); }
 });
 `;

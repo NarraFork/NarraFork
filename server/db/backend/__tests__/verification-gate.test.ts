@@ -44,7 +44,7 @@ let saved: Record<string, string | undefined> = {};
 
 beforeEach(async () => {
 	const { cancelBackgroundIntegrityCheck } = await import("../../integrity-check");
-	cancelBackgroundIntegrityCheck();
+	await cancelBackgroundIntegrityCheck();
 	saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
 	home = mkdtempSync(join(tmpdir(), "nf-verification-gate-"));
 	process.env.NARRAFORK_HOME = home;
@@ -54,7 +54,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	const { cancelBackgroundIntegrityCheck } = await import("../../integrity-check");
-	cancelBackgroundIntegrityCheck();
+	await cancelBackgroundIntegrityCheck();
 	for (const key of ENV_KEYS) {
 		const value = saved[key];
 		if (value === undefined) delete process.env[key];
@@ -96,7 +96,7 @@ async function decide(options: {
 			return { status: "ok", mode, details: "ok", durationMs: 1 };
 		},
 	});
-	cancelBackgroundIntegrityCheck();
+	await cancelBackgroundIntegrityCheck();
 	return { decision, probed };
 }
 

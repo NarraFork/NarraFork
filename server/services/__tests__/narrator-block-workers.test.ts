@@ -18,10 +18,10 @@ const before = { ...settings.narratorBlocks };
 const previousWorker = process.env.NARRAFORK_DB_WORKER;
 const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 
-afterAll(() => {
+afterAll(async () => {
 	blockIndex.setBlockIndexAutoRunForTests(false);
 	blockSync.stopBlockSyncSweep();
-	shutdownDbWorkerPool();
+	await shutdownDbWorkerPool();
 	Object.assign(settings.narratorBlocks, before);
 	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
 	else process.env.NARRAFORK_DB_WORKER = previousWorker;
@@ -38,7 +38,7 @@ test("default production block readers convert, verify, reindex, index, clear an
 	cleanDb(sqlite);
 	delete process.env.NARRAFORK_DB_WORKER;
 	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
-	resetDbWorkerPoolForTest();
+	await resetDbWorkerPoolForTest();
 	blockIndex.setBlockIndexAutoRunForTests(false);
 	Object.assign(settings.narratorBlocks, { write: true, read: true, compactJson: false });
 	const at = "2026-10-01T00:00:00.000Z";

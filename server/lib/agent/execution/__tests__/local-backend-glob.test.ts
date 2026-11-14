@@ -2,7 +2,16 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { WorkerHandle } from "../../../worker-runtime/lifecycle";
 import { LocalBackend } from "../local-backend";
+
+async function eventually(predicate: () => boolean) {
+	const end = Date.now() + 1000;
+	while (!predicate()) {
+		if (Date.now() > end) throw new Error("Worker synchronization timed out");
+		await Bun.sleep(0);
+	}
+}
 
 const roots: string[] = [];
 function tempRoot() {
@@ -77,6 +86,7 @@ describe("local glob worker budgets", () => {
 		}) as typeof setTimeout);
 		const clear = spyOn(globalThis, "clearTimeout");
 		const terminate = spyOn(Worker.prototype, "terminate");
+		const close = spyOn(WorkerHandle.prototype, "close");
 		try {
 			const pending = new LocalBackend().glob("**/never-present-*.xyz", {
 				cwd: root,
@@ -84,17 +94,20 @@ describe("local glob worker budgets", () => {
 				maxBytes: 1024,
 				timeoutMs: 1,
 			});
+			await eventually(() => fireDeadline !== undefined);
 			expect(fireDeadline).toBeDefined();
 			if (!fireDeadline) throw new Error("Glob did not register its deadline");
 			fireDeadline();
 			// Assert at the deadline, before the Promise's finally cleanup can mask
 			// a watchdog that rejects but leaves its worker running.
-			expect(terminate).toHaveBeenCalledTimes(1);
+			expect(close).toHaveBeenCalledTimes(1);
 			await expect(pending).rejects.toThrow("Glob scan timed out after 1ms");
+			expect(terminate).toHaveBeenCalledTimes(1);
 			expect(clear).toHaveBeenCalledWith(deadlineTimer);
 		} finally {
 			if (deadlineTimer) realClearTimeout(deadlineTimer);
 			terminate.mockRestore();
+			close.mockRestore();
 			clear.mockRestore();
 			schedule.mockRestore();
 		}
@@ -114,17 +127,20 @@ describe("local glob worker budgets", () => {
 		writeFileSync(join(root, "file.ts"), "");
 		const abort = new AbortController();
 		const terminate = spyOn(Worker.prototype, "terminate");
+		const create = spyOn(WorkerHandle, "bunThread");
 		const pending = new LocalBackend().glob("**/*", {
 			cwd: root,
 			signal: abort.signal,
 			timeoutMs: 2000,
 		});
+		await eventually(() => create.mock.calls.length === 1);
 		abort.abort(new Error("superseded query"));
 		try {
 			await expect(pending).rejects.toThrow("superseded query");
 			expect(terminate).toHaveBeenCalled();
 		} finally {
 			terminate.mockRestore();
+			create.mockRestore();
 		}
 		expect([...(await new LocalBackend().glob("**/*", { cwd: root, timeoutMs: 2000 }))]).toEqual([
 			"file.ts",

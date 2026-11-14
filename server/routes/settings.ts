@@ -88,6 +88,7 @@ import {
 	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
+import { isSensitiveHeaderName } from "../lib/settings/search-header-secrets";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import { updateSourceSettingsSchema } from "../lib/settings/update-source";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
@@ -841,10 +842,6 @@ function maskVNetSettings(vnet: NarraForkSettings["vnet"]): NarraForkSettings["v
 		...vnet,
 		relayToken: vnet.relayToken ? maskApiKey(vnet.relayToken) : "",
 	};
-}
-
-function isSensitiveHeaderName(name: string): boolean {
-	return /^(authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie)$/i.test(name.trim());
 }
 
 function maskSearchProviderBaseUrl(

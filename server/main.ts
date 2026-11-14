@@ -27,11 +27,13 @@ import {
 	scheduleBackgroundIntegrityCheck,
 } from "./db/integrity-check";
 import { registerExternalProviderResolver } from "./lib/agent/provider";
+import { claimBrowserShutdownOwnership } from "./lib/browser/pool";
 import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
+import { hotOnce, hotSafe } from "./lib/hot-safe";
 import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
 import {
@@ -84,6 +86,7 @@ import {
 	composePostgresStores,
 } from "./services/postgres-composition";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
+import { TOKEN_RECALCULATION_BATCH_TIMEOUT_MS } from "./services/token-recalculation";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -291,13 +294,15 @@ import { refreshWindowsPath } from "./lib/win-env";
 	}
 }
 
-// Catch unhandled errors to prevent silent crashes
-process.on("uncaughtException", (err) => {
-	logger.error("Uncaught exception", { error: String(err), stack: err?.stack });
-});
-process.on("unhandledRejection", (reason) => {
-	logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
-});
+// Catch unhandled errors once, including across --hot evaluations.
+if (hotOnce("narrafork.main.errorHooks")) {
+	process.on("uncaughtException", (err) => {
+		logger.error("Uncaught exception", { error: String(err), stack: err?.stack });
+	});
+	process.on("unhandledRejection", (reason) => {
+		logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
+	});
+}
 
 // CLI flags: --port=XXXX --host=XXXX
 const cliPort = process.argv.find((a) => a.startsWith("--port="))?.split("=")[1];
@@ -1424,8 +1429,13 @@ type GracefulShutdownResult = {
 	durationMs: number;
 };
 
-let shutdownPromise: Promise<GracefulShutdownResult> | null = null;
-let killWindowsProcessTreeOnExit = true;
+// Keep a single shutdown owner across --hot evaluations; hooks below delegate to the latest main.
+const shutdownState = hotSafe<{
+	promise: Promise<GracefulShutdownResult> | null;
+	killWindowsProcessTreeOnExit: boolean;
+	onSignal?: () => void;
+	onExit?: () => void;
+}>("narrafork.mainShutdown", () => ({ promise: null, killWindowsProcessTreeOnExit: true }));
 
 /**
  * Run a shutdown teardown step with a hard timeout so one hanging await can't stall the entire
@@ -1448,14 +1458,22 @@ async function shutdownStep(
 			Promise.resolve()
 				.then(fn)
 				.then(() => "ok" as const)
-				.catch((err) => {
-					logger.warn(`Shutdown step failed: ${label}`, { error: String(err) });
+				.catch(() => {
+					try {
+						logger.warn("Shutdown step failed", { step: label, outcome: "failed" });
+					} catch {
+						// Diagnostic sinks must not prevent recording a degraded shutdown.
+					}
 					return "failed" as const;
 				}),
 			timeout,
 		]);
 		if (result === "timeout") {
-			logger.warn(`Shutdown step timed out: ${label}`, { timeoutMs });
+			try {
+				logger.warn("Shutdown step timed out", { step: label, outcome: "timeout", timeoutMs });
+			} catch {
+				// Continue to record the timeout even when diagnostics fail.
+			}
 		}
 		tracker.recordStep(label, result);
 		return result;
@@ -1467,14 +1485,18 @@ async function shutdownStep(
 async function performGracefulShutdown(
 	options: GracefulShutdownOptions,
 ): Promise<GracefulShutdownResult> {
-	if (shutdownPromise) return shutdownPromise;
+	if (shutdownState.promise) return shutdownState.promise;
 	const startedAt = Date.now();
 	if (options.skipWindowsProcessTreeKill) {
-		killWindowsProcessTreeOnExit = false;
+		shutdownState.killWindowsProcessTreeOnExit = false;
 	}
 
-	shutdownPromise = (async () => {
-		logger.info("Graceful shutdown started", { reason: options.reason });
+	shutdownState.promise = (async () => {
+		try {
+			logger.info("Graceful shutdown started", { reason: options.reason });
+		} catch {
+			// Observational sinks cannot prevent producers from stopping.
+		}
 		backgroundOccupancyInitializer.stop();
 		stopHeartbeat();
 
@@ -1537,6 +1559,16 @@ async function performGracefulShutdown(
 			tracker.markDrainComplete();
 		}
 
+		// Sandboxed host-tool callers must stop before their outline/editor/compute dependencies.
+		await shutdownStep(
+			tracker,
+			"programmaticServices.close",
+			() =>
+				import("./lib/agent/programmatic/service").then((owner) =>
+					owner.closeProgrammaticServices(),
+				),
+			155_000,
+		);
 		// Outline pages being edited live: commit their text, end the sessions.
 		await shutdownStep(
 			tracker,
@@ -1566,8 +1598,25 @@ async function performGracefulShutdown(
 			},
 			5_000,
 		);
+		await shutdownStep(
+			tracker,
+			"outlineTextWorkers.close",
+			() =>
+				import("./services/outline/edit-text-runner").then((owner) => owner.closeEditTextWorkers()),
+			35_000,
+		);
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
+		// Finish an already-committing token batch through its original owner before closing helpers.
+		await shutdownStep(
+			tracker,
+			"tokenWorkers.close",
+			() =>
+				import("./services/token-recalculation-worker-client").then((owner) =>
+					owner.closeTokenRecalculationWorkers(),
+				),
+			TOKEN_RECALCULATION_BATCH_TIMEOUT_MS + 5_000,
+		);
 		await shutdownStep(tracker, "prefixSnapshots.stop", stopPrefixSnapshotMaintenance);
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
@@ -1578,33 +1627,38 @@ async function performGracefulShutdown(
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}
-		// The background integrity probe is a separate PROCESS holding a read-only handle on the
-		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
-		// replacement process may swap the database file (startup recovery) or rewrite it (admin
-		// VACUUM), and its verdict has no parent to report to.
-		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
-		// Read workers hold their own read-only SQLite connections; terminate them before the clean
-		// marker is written so no thread is still touching the database afterwards.
-		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
-		await shutdownStep(tracker, "prefixSnapshots.close", closePrefixSnapshotStore);
-		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
-		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
-		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
-		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
 		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
-		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
+		await shutdownStep(tracker, "pluginPlatformProducers.stop", () =>
+			import("./services/plugin-platform-services").then((owner) =>
+				owner.stopPluginPlatformProducers(),
+			),
+		);
+		// A pending startup can use its original 90s phases before drain/exit/tree cleanup.
+		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown(), 125_000);
 		unregisterExternalProviderResolver();
 		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
 		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
 		// pool into preserve-on-close mode so browserPool.close disconnects (keeps Chrome alive)
 		// for recovery. A normal shutdown skips this and closes the browser as usual.
 		if (preservesRecoveryOnShutdown(options.reason)) {
-			await shutdownStep(tracker, "browserSessions.persistForUpdate", () =>
-				import("./services/browser-session-recovery").then(({ persistBrowserSessionsForUpdate }) =>
-					persistBrowserSessionsForUpdate(),
-				),
+			await shutdownStep(
+				tracker,
+				"browserSessions.persistForUpdate",
+				() =>
+					import("./services/browser-session-recovery").then(
+						({ persistBrowserSessionsForUpdate }) => persistBrowserSessionsForUpdate(),
+					),
+				35_000,
 			);
 		}
+		// Finalize/cleanup/reply grace and real native exit precede Chrome close or preserve detach.
+		await shutdownStep(
+			tracker,
+			"browserMemoryWorkers.close",
+			() =>
+				import("./lib/browser/memory-job").then((owner) => owner.closeMemoryDiagnosticWorkers()),
+			35_000,
+		);
 		// Close browser pool if it was started. When preserve mode was set above, this disconnects
 		// from Chrome (leaving it running for the replacement process) rather than closing it.
 		await shutdownStep(tracker, "browserPool.close", () =>
@@ -1617,6 +1671,121 @@ async function performGracefulShutdown(
 				clearCodexResponsesWebSocketSessions(),
 			),
 		);
+		// Keep the existing 30s IO/ACK phases and still allow actual exit to be observed.
+		await shutdownStep(
+			tracker,
+			"editorDocuments.close",
+			() =>
+				import("./services/editor-document-runtime").then((owner) =>
+					owner.closeEditorDocumentService(),
+				),
+			70_000,
+		);
+		await shutdownStep(tracker, "computeWorkers.close", async () => {
+			const results = await Promise.allSettled([
+				import("./services/revert-transaction-worker").then((owner) =>
+					owner.closeRevertManifestWorkers(),
+				),
+				import("./services/revert-selection-service").then((owner) =>
+					owner.closeRevertBodyWorkers(),
+				),
+				import("./services/revert-history-commit").then((owner) =>
+					owner.closeRevertRewriteWorkers(),
+				),
+				import("./lib/share-preview-html").then((owner) => owner.closeSharePreviewHtmlWorkers()),
+				import("./lib/agent/request-json").then((owner) => owner.closeRequestJsonWorkers()),
+				import("./services/gen-ui/compiler").then((owner) => owner.closeGenUiCompilerWorkers()),
+				import("./lib/agent/execution/local-backend").then((owner) =>
+					owner.closeLocalGlobWorkers(),
+				),
+				import("./lib/agent/image-generation-response").then((owner) =>
+					owner.closeImageGenerationResponseWorkers(),
+				),
+			]);
+			const failures = results.flatMap((result) =>
+				result.status === "rejected" ? [result.reason] : [],
+			);
+			if (failures.length) throw new AggregateError(failures, "Compute workers did not all close");
+		});
+		await shutdownStep(
+			tracker,
+			"gitWorkers.close",
+			async () => {
+				const results = await Promise.allSettled([
+					import("./services/git-current-baseline").then((owner) =>
+						owner.closeGitCurrentBaselineWorkers(),
+					),
+					import("./services/git-line-stats").then((owner) => owner.closeGitLineStatsWorkers()),
+				]);
+				const failures = results.flatMap((result) =>
+					result.status === "rejected" ? [result.reason] : [],
+				);
+				if (failures.length)
+					throw new AggregateError(failures, "Git worker helpers did not all close");
+			},
+			35_000,
+		);
+		// Preserve the existing 65s archive ACK and subsequent 120s download lease, plus cleanup.
+		await shutdownStep(
+			tracker,
+			"requestRecorderWorkers.close",
+			() => import("./lib/request-recorder").then((owner) => owner.closeRequestRecorderWorkers()),
+			200_000,
+		);
+		await shutdownStep(tracker, "modelHistoryWorkers.close", () =>
+			import("./services/agent-runtime/model-history-source").then((owner) =>
+				owner.closeModelHistoryWorkers(),
+			),
+		);
+		await shutdownStep(
+			tracker,
+			"toolInputHistoryWorkers.close",
+			() =>
+				import("./services/tool-input-stream-source").then((owner) =>
+					owner.closeToolInputHistoricalWorkers(),
+				),
+			15_000,
+		);
+		await shutdownStep(tracker, "fsScanWorkers.close", () =>
+			import("./lib/fs-scan-worker/client").then((owner) => owner.closeFsScanWorkers()),
+		);
+		// The background integrity probe is a separate PROCESS holding a read-only handle on the
+		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
+		// replacement process may swap the database file (startup recovery) or rewrite it (admin
+		// VACUUM), and its verdict has no parent to report to.
+		await shutdownStep(
+			tracker,
+			"maintenanceWorkers.close",
+			async () => {
+				const results = await Promise.allSettled([
+					import("./db/snapshot-build").then((owner) => owner.closeSnapshotBuilds()),
+					import("./services/file-change-physical-audit").then((owner) =>
+						owner.closeFileChangePhysicalAudits(),
+					),
+				]);
+				const failures = results.flatMap((result) =>
+					result.status === "rejected" ? [result.reason] : [],
+				);
+				if (failures.length)
+					throw new AggregateError(failures, "Maintenance workers did not all close");
+			},
+			35_000,
+		);
+		await shutdownStep(tracker, "integrityProbe.cancel", () =>
+			cancelBackgroundIntegrityCheck({ permanent: true }),
+		);
+		// Read workers hold their own read-only SQLite connections; terminate them before the clean
+		// marker is written so no thread is still touching the database afterwards.
+		await shutdownStep(tracker, "dbWorkerPool.shutdown", () =>
+			shutdownDbWorkerPool({ permanent: true }),
+		);
+		await shutdownStep(tracker, "prefixSnapshots.close", () =>
+			closePrefixSnapshotStore({ permanent: true }),
+		);
+		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
+		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
+		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
+		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
 		if (!options.skipWindowsProcessTreeKill) {
 			killOwnWindowsChildProcesses();
 		}
@@ -1627,10 +1796,14 @@ async function performGracefulShutdown(
 		const summary = tracker.summary();
 		const cleanMarked = summary.clean ? markDatabaseCleanShutdown() : false;
 		if (!summary.clean) {
-			logger.warn("Graceful shutdown degraded — releasing lock without clean marker", {
-				drainComplete: summary.drainComplete,
-				degradedSteps: summary.degradedSteps,
-			});
+			try {
+				logger.warn("Graceful shutdown degraded — releasing lock without clean marker", {
+					drainComplete: summary.drainComplete,
+					degradedStepCount: summary.degradedSteps.length,
+				});
+			} catch {
+				// Diagnostic failure cannot suppress the unclean lock-release path.
+			}
 			releaseDatabaseInstanceLockOnly();
 		}
 
@@ -1640,18 +1813,26 @@ async function performGracefulShutdown(
 			pid: process.pid,
 			durationMs: Date.now() - startedAt,
 		};
-		logger.info("Graceful shutdown completed", { ...result, cleanMarked });
+		try {
+			logger.info("Graceful shutdown completed", { ...result, cleanMarked });
+		} catch {
+			// Cleanup has completed; keep its result even if diagnostics are unavailable.
+		}
 		return result;
 	})();
 
-	return shutdownPromise;
+	return shutdownState.promise;
 }
 
-registerGracefulShutdownHandler(async (request) => {
-	logger.info("Replacement server requested graceful shutdown", {
-		replacementPid: request.pid,
-		replacementVersion: request.version,
-	});
+registerGracefulShutdownHandler(async () => {
+	try {
+		logger.info("Replacement server requested graceful shutdown", {
+			phase: "replacement",
+			outcome: "requested",
+		});
+	} catch {
+		// A diagnostic sink cannot prevent the registered shutdown sequence.
+	}
 	const result = await performGracefulShutdown({
 		reason: "replacement_started",
 		skipWindowsProcessTreeKill: true,
@@ -1670,7 +1851,11 @@ registerGracefulShutdownHandler(async (request) => {
  * processes and browser sessions for the next manually started server.
  */
 registerOperatorShutdownHandler(async ({ reason }) => {
-	logger.info("Administrator requested shutdown", { reason });
+	try {
+		logger.info("Administrator requested shutdown", { phase: "operator", outcome: "requested" });
+	} catch {
+		// Operators must still reach cleanup when diagnostics are unavailable.
+	}
 	const preserveForRecovery = preservesRecoveryOnShutdown(reason);
 	const result = await performGracefulShutdown({
 		reason,
@@ -1692,8 +1877,6 @@ const safeShutdown = () => {
 		.then(() => process.exit(0))
 		.catch(() => process.exit(1));
 };
-process.on("SIGINT", safeShutdown);
-process.on("SIGTERM", safeShutdown);
 // SIGHUP fires on some Windows terminal emulators when the console window is closed, and Bun
 // may also surface Windows CTRL_CLOSE / CTRL_SHUTDOWN / CTRL_LOGOFF events as SIGHUP. Whether
 // Bun actually delivers these console-control events to JS is runtime-dependent and unverified.
@@ -1706,22 +1889,29 @@ process.on("SIGTERM", safeShutdown);
 // it cannot catch TerminateProcess either, adds FFI-callback risk at a fragile exit point, and
 // the codebase has no JSCallback precedent — so we intentionally do not use it. The startup
 // fallback (quick_check + conditional FTS rebuild) is what protects the unclean cases.
-process.on("SIGHUP", safeShutdown);
+shutdownState.onSignal = safeShutdown;
+if (hotOnce("narrafork.mainShutdown.signals")) {
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		process.on(signal, () => shutdownState.onSignal?.());
+	}
+}
+// Only the registered main sequence may decide when preserve metadata and Chrome are closed.
+// Standalone browser scripts retain their own signal cleanup until this synchronous claim.
+claimBrowserShutdownOwnership();
 // On Windows, closing the console window may not deliver SIGINT/SIGTERM.
 // "exit" fires when the event loop drains or process.exit() is called elsewhere.
 // NOTE: "exit" handlers MUST be synchronous — async work is ignored.
-process.on("exit", () => {
+shutdownState.onExit = () => {
 	try {
 		_server?.stop(true);
 	} catch {
 		// best effort
 	}
-	// On Windows, child processes (terminals, agent shells, MCP servers) may
-	// outlive the parent even after _server.stop(). Trace and kill our own live
-	// descendants while the parent PID is still meaningful, instead of guessing
-	// from stale/ghost PIDs on the next startup. During update handoff, skip this
-	// so the newly spawned replacement process is not killed as part of the old tree.
-	if (IS_WINDOWS && killWindowsProcessTreeOnExit) {
+	// The current main owns the current listener/process tree; preserve handoff intent across HMR.
+	if (IS_WINDOWS && shutdownState.killWindowsProcessTreeOnExit) {
 		killOwnWindowsChildProcesses();
 	}
-});
+};
+if (hotOnce("narrafork.mainShutdown.exit")) {
+	process.on("exit", () => shutdownState.onExit?.());
+}

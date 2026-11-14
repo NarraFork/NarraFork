@@ -16,6 +16,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { parentPort } from "node:worker_threads";
 import { compileMatcher } from "../../services/knowledge/keyword-matcher";
 import {
 	collectSessionAggregateStats,
@@ -54,7 +55,8 @@ import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 
-declare const self: Worker;
+if (!parentPort) throw new Error("Database reader requires a worker thread");
+const port = parentPort;
 
 /** Cached read-only connections, keyed by path. A worker usually only ever sees one path. */
 const connections = new Map<string, Database>();
@@ -78,7 +80,7 @@ function getConnection(dbPath: string): Database {
 }
 
 function post(message: DbWorkerOutbound): void {
-	postMessage(message);
+	port.postMessage(message);
 }
 
 function runStorageScanContext(dbPath: string): StorageScanContextResult {
@@ -180,8 +182,7 @@ function runStorageScanSessionPreview(
 }
 
 const activeTasks = new Map<string, AbortController>();
-self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
-	const message = event.data;
+port.on("message", async (message: DbWorkerInbound) => {
 	if (!message || typeof message !== "object") return;
 
 	if (message.type === "cancel") {
@@ -300,7 +301,7 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 		sqlSpan?.end();
 		activeTasks.delete(message.requestId);
 	}
-};
+});
 
 // Aggregation deliberately stays on the main thread (see pool.ts): merging there, after every
 // shard has returned, is what makes the result independent of shard completion order.

@@ -493,6 +493,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// the raw-handle access path for its non-search reads.
 	"server/lib/agent/tools/recall.ts": ["driver", "handle"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
+	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
+	"server/lib/db-worker/failure.ts": ["errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
 	"server/lib/sql-trace.ts": ["driver"],
@@ -714,7 +716,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
-	"server/services/tool-input-stream-source.ts": ["driver", "pragma", "handle"],
+	"server/services/tool-input-stream-source.ts": ["handle"],
+	// The trusted read-only eval program now belongs to the worker adapter, not the source owner.
+	"server/services/tool-input-stream-source-worker.ts": ["driver", "pragma"],
 	// 用量分桶：SQLite 用 strftime + 按 DST 分段应用的偏移，PostgreSQL 用 date_trunc/AT TIME ZONE。
 	// 两个分支都在 usage-bucket-sql.ts 里，PG 分支有真实库测试。
 	"server/services/usage-bucket-sql.ts": ["timeFn"],

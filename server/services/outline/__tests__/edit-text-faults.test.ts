@@ -13,7 +13,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "
 import { EventEmitter } from "node:events";
 import type { Worker } from "node:worker_threads";
 import * as specLoss from "@shared/spec-content-loss";
+import { connectCompiledWorker } from "../../../lib/compiled-worker";
+import { logger } from "../../../lib/logger";
 import { settings } from "../../../lib/settings";
+import { WorkerHandle } from "../../../lib/worker-runtime/lifecycle";
 import { writeSpecFile } from "../../spec-vfs-service";
 import { invalidateTaskBackend } from "../../task-source";
 import type { EditTextJob } from "../edit-text";
@@ -68,14 +71,21 @@ class FakeWorker extends EventEmitter {
 		this.posted++;
 		this.onPost(this);
 	}
+	ref(): void {}
 	unref(): void {}
 	async terminate(): Promise<number> {
 		this.terminated++;
+		queueMicrotask(() => this.emit("exit", 0));
 		return 0;
 	}
 }
 
-const asWorker = (fake: FakeWorker) => ({ worker: fake as unknown as Worker });
+const asWorker = (fake: FakeWorker) => {
+	const worker = fake as unknown as Worker;
+	const exited = new Promise<number>((resolve) => fake.once("exit", resolve));
+	fake.on("error", () => {});
+	return { worker, handle: new WorkerHandle(worker, exited, () => fake.terminate()) };
+};
 
 let inline: ReturnType<typeof spyOn>;
 let channels = 0;
@@ -108,10 +118,30 @@ describe("a worker that does not start", () => {
 	});
 
 	test("its start never answers: the job times out, and is not run here", async () => {
-		const ch = channel(() => new Promise(() => {}));
-		expect((await failure(ch.run(job))).code).toBe("OUTLINE_TEXT_TIMEOUT");
-		expect(inline).not.toHaveBeenCalled();
-		ch.stop();
+		let exited = false;
+		const thread = WorkerHandle.thread.bind(WorkerHandle);
+		const creation = spyOn(WorkerHandle, "thread").mockImplementation((...args) => {
+			const handle = thread(...args);
+			void handle.exited.then(() => {
+				exited = true;
+			});
+			return handle;
+		});
+		const ch = channel((options) =>
+			connectCompiledWorker(
+				[new URL("./edit-text-worker.fixture.ts", import.meta.url).href],
+				options,
+			),
+		);
+		try {
+			expect((await failure(ch.run(job))).code).toBe("OUTLINE_TEXT_TIMEOUT");
+			expect(creation).toHaveBeenCalledTimes(1);
+			expect(exited).toBe(true);
+			expect(inline).not.toHaveBeenCalled();
+		} finally {
+			await ch.stop();
+			creation.mockRestore();
+		}
 	});
 
 	test("worker threads are unavailable (disabled): the job fails, and is not run here", async () => {
@@ -198,6 +228,67 @@ describe("the Dynamic Spec import over a failing background channel", () => {
 			expect(inline).not.toHaveBeenCalled();
 		} finally {
 			background.mockRestore();
+		}
+	});
+});
+
+describe("import outcome diagnostics remain observational", () => {
+	beforeEach(() => {
+		settings.outline.enabled = true;
+		settings.outline.specImport = "manual";
+		invalidateTaskBackend();
+		resetSpecImportRecords();
+	});
+	test("worker failure text is retained for the caller, never logged or replaced by a sink error", async () => {
+		const secret = "PRIVATE_OUTLINE_INPUT /private/notes.md";
+		const background = spyOn(runner, "processBackgroundText").mockRejectedValue(
+			new OutlineEditTextError("OUTLINE_TEXT_FAILED", secret, 500),
+		);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("PRIVATE_LOG_FAILURE");
+		});
+		try {
+			const { id } = await makeSession();
+			await writeTasks(id, [{ text: "a task" }]);
+			await writeNote(id, "notes.md", "# Notes\n\nsome text\n");
+			const result = await importSpecSession(id, { trigger: "manual" });
+			expect(result).toMatchObject({ status: "failed", error: secret, attention: false });
+			expect(await backendOf(id)).toBe("spec");
+			expect(await commitCount(id)).toBe(0);
+			expect(inline).not.toHaveBeenCalled();
+			const calls = warn.mock.calls.filter(
+				([message]) => message === "Dynamic Spec import did not move a session",
+			);
+			expect(calls).toHaveLength(1);
+			expect(calls[0]?.[1]).toMatchObject({ reason: "other", attention: false });
+			const logged = JSON.stringify(calls);
+			for (const value of ["PRIVATE_OUTLINE_INPUT", "/private/", "PRIVATE_LOG_FAILURE"])
+				expect(logged).not.toContain(value);
+		} finally {
+			warn.mockRestore();
+			background.mockRestore();
+		}
+	});
+	test("a success log failure cannot turn an already committed import into a failed import", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "one task" }]);
+		await writeNote(id, "notes.md", "# Notes\n\nsome text\n");
+		const info = spyOn(logger, "info").mockImplementation((message) => {
+			if (message === "Dynamic Spec session imported into the outline")
+				throw new Error("PRIVATE_LOG_FAILURE");
+		});
+		try {
+			const result = await importSpecSession(id, { trigger: "manual" });
+			expect(result).toMatchObject({ status: "imported", tasks: 1 });
+			expect(await backendOf(id)).toBe("outline");
+			expect(await commitCount(id)).toBeGreaterThan(0);
+			expect(
+				info.mock.calls.some(
+					([message]) => message === "Dynamic Spec session imported into the outline",
+				),
+			).toBe(true);
+		} finally {
+			info.mockRestore();
 		}
 	});
 });

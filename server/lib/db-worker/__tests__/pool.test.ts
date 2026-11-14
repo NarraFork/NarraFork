@@ -65,7 +65,11 @@ function createFixtureDatabase(dbPath: string): void {
  */
 function writeWorkerFixture(dir: string, name: string, body: string): string {
 	const file = join(dir, name);
-	writeFileSync(file, `${body}\npostMessage({ type: "ready" });\n`, "utf8");
+	writeFileSync(
+		file,
+		`import { parentPort } from "node:worker_threads";\nparentPort.on("message", data => self.onmessage?.({ data }));\n${body}\npostMessage({ type: "ready" });\n`,
+		"utf8",
+	);
 	return pathToFileURL(file).href;
 }
 
@@ -124,13 +128,13 @@ describe("scan result determinism", () => {
 	let home = "";
 	let dbPath = "";
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		home = mkdtempSync(join(tmpdir(), "narrafork-scan-determinism-"));
 		dbPath = join(home, "narrafork.db");
 		createFixtureDatabase(dbPath);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		rmSync(home, { recursive: true, force: true });
 	});
 
@@ -212,15 +216,15 @@ describe("worker pool", () => {
 	let home = "";
 	let dbPath = "";
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		home = mkdtempSync(join(tmpdir(), "narrafork-db-pool-"));
 		dbPath = join(home, "narrafork.db");
 		createFixtureDatabase(dbPath);
-		resetDbWorkerPoolForTest();
+		await resetDbWorkerPoolForTest();
 	});
 
 	afterEach(async () => {
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		setDbWorkerSpecifiersForTest(null);
 		delete process.env.NARRAFORK_DB_WORKER;
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
@@ -542,7 +546,7 @@ describe("worker pool", () => {
 	test("shutdown terminates workers and clears state", async () => {
 		await runReadTask<StorageScanContextResult>(dbPath, { kind: "storageScanContext" });
 		expect(getDbWorkerPoolStats().workers).toBeGreaterThan(0);
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		const stats = getDbWorkerPoolStats();
 		expect(stats.workers).toBe(0);
 		expect(stats.queued).toBe(0);
@@ -685,7 +689,7 @@ describe("worker pool", () => {
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 
 		blocker.catch(() => {});
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		await expect(blocker).rejects.toThrow();
 	}, 40_000);
 
@@ -712,7 +716,7 @@ describe("worker pool", () => {
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 
 		blocker.catch(() => {});
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		await expect(blocker).rejects.toThrow();
 	}, 40_000);
 
@@ -734,7 +738,7 @@ describe("worker pool", () => {
 
 		blocker.catch(() => {});
 		queued.catch(() => {});
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		await expect(queued).rejects.toBeInstanceOf(WorkersUnavailableError);
 		await expect(blocker).rejects.toThrow();
 	}, 40_000);

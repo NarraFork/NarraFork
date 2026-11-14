@@ -9,7 +9,7 @@ import {
 	MEMORY_METRICS_DEFAULT_TIMEOUT_MS,
 	MEMORY_METRICS_MAX_TIMEOUT_MS,
 } from "./memory-constants";
-import { runMemoryJob, waitForMemory } from "./memory-job";
+import { retainMemoryJob, runMemoryJob, waitForMemory } from "./memory-job";
 import { exportHeapSnapshot } from "./memory-snapshot";
 import { SnapshotError } from "./memory-snapshot-stream";
 import { type BrowserSession, touchSession } from "./session";
@@ -18,6 +18,16 @@ import { type BrowserSession, touchSession } from "./session";
 // "Disconnected" is silently ineffective. Keep the narrow typing bridge local.
 const CDP_DISCONNECTED = (CDPSessionEvent as typeof CDPSessionEvent & { Disconnected: symbol })
 	.Disconnected;
+
+function diagnosticLog(
+	level: "info" | "warn",
+	message: string,
+	details: Record<string, string | number>,
+) {
+	try {
+		logger[level](message, details);
+	} catch {}
+}
 
 export interface MemoryOptions {
 	collectGarbage?: boolean;
@@ -103,8 +113,7 @@ async function withMemorySession<T>(
 				});
 				signal.throwIfAborted();
 				if (Date.now() - started >= 5_000) {
-					logger.info("Slow browser memory diagnostic", {
-						sessionId: session.id,
+					diagnosticLog("info", "Slow browser memory diagnostic", {
 						stage,
 						durationMs: Date.now() - started,
 					});
@@ -115,8 +124,7 @@ async function withMemorySession<T>(
 			}
 		} catch (error) {
 			// Protocol errors can contain endpoint credentials. Only our typed stages are safe.
-			logger.warn("Browser memory diagnostic failed", {
-				sessionId: session.id,
+			diagnosticLog("warn", "Browser memory diagnostic failed", {
 				stage: error instanceof SnapshotError ? error.stage : stage,
 				durationMs: Date.now() - started,
 			});
@@ -194,6 +202,7 @@ export async function heapSnapshot(
 	const started = Date.now();
 	const url = session.page.url().slice(0, 2048);
 	const release = reserveDiagnostic("snapshot");
+	let resourceCleanup: Promise<void> = Promise.resolve();
 	try {
 		return await withMemorySession(
 			session,
@@ -214,9 +223,12 @@ export async function heapSnapshot(
 					timeoutMs: remainingMs(),
 					collectGarbage: opts.collectGarbage ?? false,
 					signal,
+					onCleanup: (cleanup) => {
+						resourceCleanup = cleanup;
+						retainMemoryJob(session, cleanup);
+					},
 				});
-				logger.info("Browser heap snapshot exported", {
-					sessionId: session.id,
+				diagnosticLog("info", "Browser heap snapshot exported", {
 					fileSize: result.fileSize,
 					durationMs: Date.now() - started,
 				});
@@ -229,12 +241,20 @@ export async function heapSnapshot(
 			},
 		);
 	} catch (error) {
-		await waitForMemory(
-			Promise.all([rm(savePath, { force: true }), rm(`${savePath}.partial`, { force: true })]),
-			AbortSignal.timeout(MEMORY_CLEANUP_TIMEOUT_MS),
-		).catch(() => {});
+		// A worker may still own the files after the response budget. Never unlink under it.
+		resourceCleanup = resourceCleanup
+			.then(async () => {
+				await Promise.all([
+					rm(savePath, { force: true }),
+					rm(`${savePath}.partial`, { force: true }),
+				]);
+			})
+			.catch(() => {});
+		await waitForMemory(resourceCleanup, AbortSignal.timeout(MEMORY_CLEANUP_TIMEOUT_MS)).catch(
+			() => {},
+		);
 		throw error;
 	} finally {
-		release();
+		void resourceCleanup.then(release, release);
 	}
 }
