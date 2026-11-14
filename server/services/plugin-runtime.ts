@@ -13,6 +13,7 @@ import {
 	type PluginToHostFeature,
 	pluginHelloParamsSchema,
 } from "@server/lib/plugins/protocol";
+import { spawnWindowsPluginProcess } from "@server/lib/plugins/windows-plugin-process";
 import { WorkerCleanupError, WorkerHandle } from "@server/lib/worker-runtime/lifecycle";
 import { TaskQueue } from "@server/lib/worker-runtime/queue";
 import {
@@ -709,6 +710,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	private readonly queuedMessages: JsonRpcEnvelope[] = [];
 	private readonly queuedErrors: Error[] = [];
 	private readonly stdoutDrained: Promise<void>;
+	private readonly stderrDrained: Promise<void>;
 	private resolveStdoutDrained!: () => void;
 	private exitCode: number | undefined;
 	private readonly writes = new TaskQueue({
@@ -757,7 +759,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			() => this.resolveStdoutDrained(),
 			() => this.resolveStdoutDrained(),
 		);
-		void this.readStderr();
+		this.stderrDrained = this.readStderr();
 		if (options.idleTimeoutMs && options.idleTimeoutMs > 0) this.resetIdleTimer();
 		if (options.totalTimeoutMs && options.totalTimeoutMs > 0) {
 			this.totalTimer = setTimeout(() => this.timeout("total"), options.totalTimeoutMs);
@@ -889,7 +891,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	}
 
 	private async finalizeExit(exitCode: number): Promise<void> {
-		await this.stdoutDrained;
+		await Promise.all([this.stdoutDrained, this.stderrDrained]);
 		this.clearTimers();
 		this.closed = true;
 		this.exitCode = exitCode;
@@ -1221,6 +1223,9 @@ async function spawnWithTimeout(
 }
 
 function defaultSpawner(command: string[], options: RunnerSpawnOptions): RunnerProcess {
+	if (globalThis.process.platform === "win32") {
+		return spawnWindowsPluginProcess(command, options, PROCESS_TREE_KILL_TIMEOUT_MS);
+	}
 	// windowsHide：插件进程从 GUI 后端派生，不隐藏会在 Windows 上闪出控制台窗口。
 	const process = Bun.spawn(command, { ...options, windowsHide: true });
 	let termination: Promise<void> | undefined;
@@ -1265,12 +1270,6 @@ async function terminateSpawnedProcess(
 	},
 	detachedProcessGroup: boolean,
 ): Promise<void> {
-	if (globalThis.process.platform === "win32") {
-		await runCleanupCommand(["taskkill", "/T", "/F", "/PID", String(childProcess.pid)]);
-		childProcess.kill();
-		await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
-		return;
-	}
 	if (!detachedProcessGroup) {
 		childProcess.kill();
 		await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
@@ -1315,28 +1314,6 @@ async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	return !isProcessGroupAlive(pid);
-}
-
-async function runCleanupCommand(command: string[]): Promise<void> {
-	const handle = WorkerHandle.subprocess(command, {
-		stdin: "ignore",
-		stdout: "ignore",
-		stderr: "ignore",
-		windowsHide: true,
-	});
-	let failure: unknown;
-	try {
-		const code = await promiseWithTimeout(handle.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
-		if (code !== 0) throw new Error("Plugin process-tree cleanup command failed");
-	} catch (error) {
-		failure = error;
-	}
-	try {
-		await handle.close();
-	} catch (cause) {
-		throw new WorkerCleanupError(handle, cause);
-	}
-	if (failure) throw failure;
 }
 
 export interface RuntimeTimeouts {

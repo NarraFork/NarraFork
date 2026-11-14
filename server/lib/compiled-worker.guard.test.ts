@@ -268,6 +268,34 @@ test("special worker process launchers keep native spawn centralized or wrapped,
 	expect(driver).toContain('"container", "exists"');
 });
 
+test("Windows launcher and target phases remain owned by the existing plugin process family", () => {
+	expect(processOwners.filter((owner) => owner.kind === "plugin-runtime")).toHaveLength(1);
+	for (const owner of [
+		"lib/plugins/windows-plugin-process.ts",
+		"lib/plugins/windows-plugin-launcher.ts",
+	]) {
+		const text = ownerText([owner]);
+		expect(text, owner).toContain("WorkerHandle.subprocess");
+		expect(text, owner).not.toMatch(/\bBun\.spawn\s*\(/);
+		expect(workerConstructors(text, owner), owner).toEqual([]);
+	}
+	const mode = ownerText(["plugin-runtime-worker.ts"]);
+	expect(mode).toContain("entryPath === WINDOWS_PLUGIN_LAUNCHER_MODE");
+	expect(mode).toContain("runWindowsPluginLauncher(process.argv.slice(flagIndex + 2))");
+	const launcher = ownerText(["lib/plugins/windows-plugin-launcher.ts"]);
+	const assigned = launcher.indexOf("native.assignCurrent(");
+	const spawned = launcher.indexOf("spawn(command)");
+	expect(assigned).toBeGreaterThanOrEqual(0);
+	expect(spawned).toBeGreaterThan(assigned);
+	const job = ownerText(["lib/plugins/windows-plugin-process.ts"]);
+	expect(job).toContain("native.activeProcesses(job)");
+	expect(job).not.toContain("terminateWindowsChildren");
+	const index = ownerText(["index.ts"]);
+	expect(index.indexOf("process.argv.includes(PLUGIN_RUNTIME_WORKER_FLAG)")).toBeLessThan(
+		index.indexOf("shouldRunManager({"),
+	);
+});
+
 test("the common runtime owns mechanics only, never business persistence or result caches", () => {
 	for (const file of ["queue.ts", "pool.ts", "lifecycle.ts"]) {
 		const source = ownerText([`lib/worker-runtime/${file}`]);
