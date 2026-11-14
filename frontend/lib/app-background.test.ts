@@ -79,6 +79,18 @@ describe("background image", () => {
 		expect(back.enabled).toBe(true);
 	});
 
+	test("the reload key survives parsing and is not lost by other edits", () => {
+		// A local (component-state) nonce used to be overwritten by the other hook instance
+		// that also applies the wallpaper, so reloading appeared to do nothing.
+		const withKey = parseBackgroundChoice({
+			enabled: true,
+			url: "https://x.test/a.png",
+			reloadKey: 1234,
+		});
+		expect(withKey.reloadKey).toBe(1234);
+		expect(switchBackgroundSource(withKey, "file").reloadKey).toBe(1234);
+	});
+
 	test("switching to an empty source disables it instead of painting nothing", () => {
 		expect(switchBackgroundSource(DEFAULT_BACKGROUND, "file").enabled).toBe(false);
 		expect(switchBackgroundSource(DEFAULT_BACKGROUND, "url").enabled).toBe(false);

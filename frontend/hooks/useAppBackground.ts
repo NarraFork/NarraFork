@@ -11,6 +11,7 @@ import {
 	BACKGROUND_PREF_KEY,
 	DEFAULT_BACKGROUND,
 	parseBackgroundChoice,
+	readStoredBackground,
 	subscribeBackground,
 	syncWallpaperLayer,
 	writeStoredBackground,
@@ -49,8 +50,9 @@ export function useAppBackground() {
 	 * Bumped by the reload button. A plain re-run of the effect would hand the browser the
 	 * same URL and it would answer from cache, which looks like the button does nothing.
 	 */
-	const [nonce, setNonce] = useState(0);
-	const reload = useCallback(() => setNonce((value) => value + 1), []);
+	const reload = useCallback(() => {
+		writeStoredBackground({ ...readStoredBackground(), reloadKey: Date.now() });
+	}, []);
 
 	useEffect(() => {
 		if (typeof document === "undefined") return;
@@ -62,16 +64,26 @@ export function useAppBackground() {
 			return;
 		}
 		setStatus("loading");
-		void syncWallpaperLayer(choice, { nonce }).then((result) => {
-			// The async load can finish after the user changed the preference; ignoring the
-			// stale result keeps the error state from sticking to a newer, valid choice.
-			if (cancelled) return;
-			setStatus(result === "ok" ? "ok" : "error");
-		});
+		/*
+		 * Never let a wallpaper failure escape into React: this effect runs in the provider
+		 * that wraps every route, so an unhandled throw here blanks the whole app. A broken
+		 * image must degrade to "no wallpaper", not to "no UI".
+		 */
+		syncWallpaperLayer(choice)
+			.then((result) => {
+				// The load can finish after the preference changed; dropping the stale result
+				// keeps an error state from sticking to a newer, valid choice.
+				if (cancelled) return;
+				setStatus(result === "ok" ? "ok" : "error");
+			})
+			.catch((error) => {
+				console.error("[wallpaper] failed to apply", error);
+				if (!cancelled) setStatus("error");
+			});
 		return () => {
 			cancelled = true;
 		};
-	}, [choice, nonce]);
+	}, [choice]);
 
 	return { choice, setChoice, status, reload };
 }

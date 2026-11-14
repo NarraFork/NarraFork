@@ -308,3 +308,13 @@ curl 带 localhost Referer → 403
 1. **网络↔本地切回来就不显示**：选本地文件时把 `url` 清成了空串，切回「网络地址」自然无图可加载；切源还无条件 `enabled: false`。改为 `switchBackgroundSource()`：两个来源各自保留配置，`enabled` 跟随新来源是否有效。已加回归测试（6 项）。
 2. **弹层跟着变透明**：之前把全局 `--mantine-color-body` 改成了半透明，而 Modal / Menu / Dropdown / Tooltip 都 portal 到 `<body>` 读同一个变量——它们下面不是面板而是壁纸，于是弹窗也变成半透明，很难读。改成只让 `#root` 半透明（作用域限于外壳），`--mantine-color-body` 保持不透明；面板仍走 `--mantine-color-default` 的混合值。
 3. **重新加载按钮**：URL 输入框后新增「重新加载」，带 `nf_reload=<nonce>` 参数，避免浏览器直接命中缓存导致"点了没反应"。
+
+### 11.8 重新加载没有生效 + 界面空白
+
+**重新加载不刷新**：nonce 原本存在按钮所在组件的 state 里，但壁纸会被**两个** hook 实例应用（应用外壳的 `CoreProviders` 和设置卡片）。父级实例后运行、用不带 nonce 的 URL 覆盖了子级刚设置的那次，于是看起来"点了没反应"。改成把 `reloadKey` 存进偏好本身：所有实例读到同一个值，后续任何设置变化也不会把它冲掉（已加单测）。
+
+**界面空白**：不是功能逻辑，是我当时正在改的中间版本被 Vite HMR 推到了浏览器——那一版里 `syncWallpaperLayer` 引用了一个尚未定义的 `options`，运行时抛错直接打穿了整棵树。两处加固：
+- 壁纸的应用逻辑全部包进 `.catch()`，失败只置为 `status="error"`，绝不让异常冒到 React；
+- 这道 effect 挂在包住所有路由的 provider 上，任何抛出都会白屏，所以这里不允许 throw。
+
+遇到空白时先强刷一次（Cmd/Ctrl+Shift+R），清掉 HMR 留下的旧模块。

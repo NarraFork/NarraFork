@@ -41,6 +41,13 @@ export interface BackgroundChoice {
 	scrim: number;
 	/** Backdrop blur in px. Sharp images behind text are unreadable; 0 is allowed on purpose. */
 	blur: number;
+	/**
+	 * Bumped by the "reload" button. It lives in the stored choice rather than in component
+	 * state because more than one hook instance applies the wallpaper (the app shell and the
+	 * settings card): a local nonce would be overwritten by whichever instance ran last,
+	 * making the reload appear to do nothing.
+	 */
+	reloadKey?: number;
 }
 
 export const DEFAULT_BACKGROUND: BackgroundChoice = {
@@ -98,6 +105,7 @@ export function parseBackgroundChoice(raw: unknown): BackgroundChoice {
 		opacity: clamp(value.opacity, MIN_OPACITY, 100, DEFAULT_BACKGROUND.opacity),
 		scrim: clamp(value.scrim, 0, 90, DEFAULT_BACKGROUND.scrim),
 		blur: clamp(value.blur, 0, 24, DEFAULT_BACKGROUND.blur),
+		...(typeof value.reloadKey === "number" ? { reloadKey: value.reloadKey } : {}),
 	};
 }
 
@@ -202,10 +210,7 @@ export function applyBackground(root: HTMLElement, choice: BackgroundChoice): vo
  * Returns "error" when the image could not be loaded, which is the settings card's cue to
  * say so instead of leaving a silent flat background.
  */
-export async function syncWallpaperLayer(
-	choice: BackgroundChoice,
-	options: { nonce?: number } = {},
-): Promise<WallpaperResult> {
+export async function syncWallpaperLayer(choice: BackgroundChoice): Promise<WallpaperResult> {
 	if (!choice.enabled) {
 		hideWallpaper();
 		return "ok";
@@ -226,10 +231,10 @@ export async function syncWallpaperLayer(
 		return "error";
 	}
 	let src = choice.url.trim();
-	if (options.nonce) {
+	if (choice.reloadKey) {
 		// A reload must actually re-request the bytes; hosts commonly serve a cached copy
 		// for the same URL, which looks like "the retry did nothing".
-		src += `${src.includes("?") ? "&" : "?"}nf_reload=${options.nonce}`;
+		src += `${src.includes("?") ? "&" : "?"}nf_reload=${choice.reloadKey}`;
 	}
 	return showWallpaper({ src, blur: choice.blur });
 }
