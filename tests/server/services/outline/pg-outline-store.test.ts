@@ -14,7 +14,7 @@
  *   - the harness owns and removes its database.
  */
 import { describe, expect, it } from "bun:test";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { ensurePgFts } from "../../../../server/db/pg-fts";
 import { createPostgresClient } from "../../../../server/db/postgres-client";
@@ -28,11 +28,13 @@ import {
 	OUTLINE_DIGEST_CONTRACT,
 	type OutlineDigestContractContext,
 } from "../../../../server/services/outline/__tests__/digest-contract";
+import { OUTLINE_HISTORY_CONTRACT } from "../../../../server/services/outline/__tests__/history-contract";
 import { OUTLINE_PENDING_CONTRACT } from "../../../../server/services/outline/__tests__/pending-contract";
 import { OUTLINE_QUESTION_CONTRACT } from "../../../../server/services/outline/__tests__/question-contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
 import { OUTLINE_TASK_CONTRACT } from "../../../../server/services/outline/__tests__/task-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
+import type { OutlineEdgeRow } from "../../../../server/services/outline/store/history-port";
 import {
 	chunked,
 	type OutlineLinkRow,
@@ -142,7 +144,21 @@ describe("PostgreSQL outline store", () => {
 							authorKind: b.authorKind as "human" | "agent" | "system",
 						}));
 						const versions: OutlineVersionRow[] = [];
+						const edges: OutlineEdgeRow[] = [];
+						const marks: Array<{ ancestorId: string; seq: number }> = [];
 						for (const ids of chunked(blocks.map((b) => b.id))) {
+							edges.push(
+								...(await pgDb
+									.select()
+									.from(pgSchema.outlineBlockEdges)
+									.where(inArray(pgSchema.outlineBlockEdges.blockId, ids))),
+							);
+							marks.push(
+								...(await pgDb
+									.select()
+									.from(pgSchema.outlineSubtreeChanges)
+									.where(inArray(pgSchema.outlineSubtreeChanges.ancestorId, ids))),
+							);
 							const rows = await pgDb
 								.select()
 								.from(pgSchema.outlineBlockVersions)
@@ -168,7 +184,9 @@ describe("PostgreSQL outline store", () => {
 								.orderBy(pgSchema.outlineCommits.seq)
 						).map((c) => c as SpaceDump["commits"][number]);
 						const claims = await store.getTaskClaims(blocks.map((b) => b.id));
-						return { space, blocks, versions, links, commits, claims };
+						const history = (await store.getHistoryStates([spaceId])).get(spaceId);
+						if (!history) throw new Error(`no history state for ${spaceId}`);
+						return { space, blocks, versions, links, commits, claims, edges, marks, history };
 					},
 					async resetInProcess(spaceId) {
 						await pgDb
@@ -184,6 +202,17 @@ describe("PostgreSQL outline store", () => {
 						await pgDb
 							.delete(pgSchema.outlineTaskClaims)
 							.where(inArray(pgSchema.outlineTaskClaims.taskBlockId, [...taskBlockIds]));
+					},
+					async forgetHistory(spaceId) {
+						const blocks = sql`(SELECT id FROM outline_blocks WHERE space_id = ${spaceId})`;
+						await pgDb.execute(sql`DELETE FROM outline_block_edges WHERE block_id IN ${blocks}`);
+						await pgDb.execute(
+							sql`DELETE FROM outline_subtree_changes WHERE ancestor_id IN ${blocks}`,
+						);
+						await pgDb
+							.update(pgSchema.outlineSpaces)
+							.set({ edgesReady: false, historyFloorSeq: 0 })
+							.where(eq(pgSchema.outlineSpaces.id, spaceId));
 					},
 					async setLastCommitAt(spaceId, value) {
 						await pgDb
@@ -208,6 +237,7 @@ describe("PostgreSQL outline store", () => {
 						...OUTLINE_TASK_CONTRACT,
 						...OUTLINE_PENDING_CONTRACT,
 						...OUTLINE_QUESTION_CONTRACT,
+						...OUTLINE_HISTORY_CONTRACT,
 						...OUTLINE_READ_CONTRACT,
 						...OUTLINE_DIGEST_CONTRACT,
 					]) {
@@ -237,6 +267,7 @@ describe("PostgreSQL outline store", () => {
 					OUTLINE_TASK_CONTRACT.length +
 					OUTLINE_PENDING_CONTRACT.length +
 					OUTLINE_QUESTION_CONTRACT.length +
+					OUTLINE_HISTORY_CONTRACT.length +
 					OUTLINE_READ_CONTRACT.length +
 					OUTLINE_DIGEST_CONTRACT.length,
 			);

@@ -44,6 +44,7 @@ import type {
 	OutlineTaskJson,
 } from "../model";
 import type { OutlineDigestPort } from "./digest-port";
+import type { OutlineHistoryPort } from "./history-port";
 import type { OutlineReadPort } from "./read-port";
 
 export { WriteConflictError } from "@server/db/backend/write-port";
@@ -386,6 +387,19 @@ export interface OutlineClaimPlan {
  *  10. write `questions` (insert, or update all but the asker, creation and, unless
  *      `setDelivered`, delivery).
  *
+ * The two derived history tables are written by the section itself, from the block rows, so no
+ * plan can leave them out (`history-port.ts`):
+ *
+ *   - change marks (`outline_subtree_changes`): one row `(ancestor, seq)` for every ancestor of
+ *     every block in `versions`, as the tree was before step 3 (read before it) and as it is
+ *     after step 4 (read after it), each ancestor once. Should a commit mark more than
+ *     {@link OUTLINE_HISTORY_LIMITS} ancestors, it is refused whole with
+ *     {@link OutlineChangeMarksLimitError};
+ *   - placements (`outline_block_edges`), after step 5, for the blocks whose version says they
+ *     were created, moved, deleted or restored ({@link OUTLINE_PLACEMENT_FLAGS}): their open
+ *     placement is closed at `seq`, and those that are live get one from their new row. A
+ *     commit that only changes content, tasks or properties writes no placement.
+ *
  * Step 1 claims `next_seq`, and `in_process_epoch` with it when the plan names one. Before it the
  * section checks that every claim row `claims` expects (`put`, `expire`, `verify`) is still as
  * read; when one is not, it writes nothing and rejects with {@link OutlineClaimsMovedError}. Then
@@ -431,6 +445,39 @@ export interface OutlineCommitPlan {
 	pending?: OutlinePendingPlan;
 	/** Question rows of the blocks whose question this commit asks, changes or ends (step 10). */
 	questions?: OutlineQuestionWrite[];
+}
+
+/**
+ * Change flags of a version that say the block's placement changed: it was created, moved (to
+ * another parent or among its siblings), deleted or restored. The literal values of
+ * `OUTLINE_CHANGE.CREATE | MOVE | DELETE | RESTORE` (`model.ts`).
+ */
+export const OUTLINE_PLACEMENT_FLAGS = 1 | 4 | 8 | 16;
+
+/**
+ * Change marks one commit writes at most (`maxChangeMarks`). A commit touches at most 2000
+ * blocks (`OUTLINE_LIMITS.maxRowsTouched`) and the tree is at most 1000 deep, so the blocks of
+ * one subtree and the two chains above a move fit with room to spare; only a commit spread over
+ * many separate deep chains reaches this, and it is refused rather than run as one long
+ * transaction. Mutable only so tests can lower it.
+ */
+export const OUTLINE_HISTORY_LIMITS: { maxChangeMarks: number } = { maxChangeMarks: 4000 };
+
+/** A commit would mark more ancestors than {@link OUTLINE_HISTORY_LIMITS} allows; nothing was written. */
+export class OutlineChangeMarksLimitError extends Error {
+	constructor(readonly spaceId: string) {
+		super(
+			`a commit to outline space ${spaceId} would mark more than ${OUTLINE_HISTORY_LIMITS.maxChangeMarks} ancestors as changed`,
+		);
+		this.name = "OutlineChangeMarksLimitError";
+	}
+}
+
+/** The blocks of a plan whose placement changes (see {@link OUTLINE_PLACEMENT_FLAGS}). */
+export function placedBlockIds(plan: OutlineCommitPlan): string[] {
+	return plan.versions
+		.filter((group) => (group.flags & OUTLINE_PLACEMENT_FLAGS) !== 0)
+		.flatMap((group) => group.ids);
 }
 
 /**
@@ -627,7 +674,11 @@ export interface OutlineClaimedTask {
 // The port
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface OutlineStore extends WritePortIdentity, OutlineReadPort, OutlineDigestPort {
+export interface OutlineStore
+	extends WritePortIdentity,
+		OutlineReadPort,
+		OutlineDigestPort,
+		OutlineHistoryPort {
 	/**
 	 * The space of a project, user or narrator, created on first use. Concurrent callers get
 	 * the same row (one per scope, enforced by a unique index). New spaces start at seq 1.

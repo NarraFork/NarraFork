@@ -12,6 +12,7 @@
 import { Database } from "bun:sqlite";
 import {
 	DB_SNAPSHOT_KINDS_ENV,
+	DB_SNAPSHOT_OUTLINE_KIND,
 	DB_SNAPSHOT_OUTPUT_ENV,
 	DB_SNAPSHOT_SOURCE_ENV,
 	SNAPSHOT_TABLES,
@@ -36,10 +37,103 @@ function selectedTables(): { all: string[]; copied: string[] } {
 	};
 }
 
+/** 一个事务里写入的行数：够大以摊薄提交开销，够小以免占住内存。 */
+const OUTLINE_COPY_BATCH = 5000;
+
+/**
+ * 大纲整表拷贝：`outline_*` 的每张普通表（虚表和它的影子表除外）原样进新库。
+ *
+ * 源库用**只读连接**打开，这个进程因此没有任何办法写主库；所有表在同一个读事务里读完，所以是
+ * 同一时刻的。行经由本进程逐批写进新库（不是 `ATTACH` 后 `INSERT … SELECT`：那需要一个可写的
+ * 连接挂着主库）。复制后逐表核对行数，对不上就算失败。不建索引和约束：这份文件是给人留底的。
+ */
+function buildOutlineCopy(source: string, output: string): SnapshotBuildResult {
+	let src: Database | undefined;
+	let out: Database | undefined;
+	try {
+		src = new Database(source, { readonly: true });
+		out = new Database(output);
+		const from = src;
+		const to = out;
+		const named = from
+			.query(
+				"SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name LIKE 'outline!_%' ESCAPE '!' ORDER BY name",
+			)
+			.all() as Array<{ name: string; sql: string | null }>;
+		const virtual = named
+			.filter((table) => /^\s*CREATE\s+VIRTUAL\s+TABLE/i.test(table.sql ?? ""))
+			.map((table) => table.name);
+		const tables = named
+			.map((table) => table.name)
+			.filter((name) => /^[a-z0-9_]+$/.test(name))
+			.filter((name) => !virtual.some((v) => name === v || name.startsWith(`${v}_`)));
+		if (tables.length === 0) return { ok: false, error: "no outline tables in the source" };
+		let rows = 0;
+		from.run("BEGIN");
+		try {
+			for (const table of tables) {
+				const columns = from.query(`PRAGMA table_info(${table})`).all() as Array<{
+					name: string;
+					type: string;
+				}>;
+				const quoted = columns.map((column) => `"${column.name.replaceAll('"', '""')}"`);
+				to.run(
+					`CREATE TABLE ${table} (${columns
+						.map(
+							(column, i) => `${quoted[i]} ${/^[A-Za-z ]*$/.test(column.type) ? column.type : ""}`,
+						)
+						.join(", ")})`,
+				);
+				const insert = to.prepare(
+					`INSERT INTO ${table} VALUES (${columns.map(() => "?").join(", ")})`,
+				);
+				const writeBatch = to.transaction((batch: unknown[][]) => {
+					for (const row of batch) insert.run(...(row as never[]));
+				});
+				let batch: unknown[][] = [];
+				let copied = 0;
+				for (const row of from.query(`SELECT ${quoted.join(", ")} FROM ${table}`).iterate()) {
+					batch.push(Object.values(row as Record<string, unknown>));
+					if (batch.length >= OUTLINE_COPY_BATCH) {
+						writeBatch(batch);
+						copied += batch.length;
+						batch = [];
+					}
+				}
+				writeBatch(batch);
+				copied += batch.length;
+				const had = from.query(`SELECT count(*) AS n FROM ${table}`).get() as { n: number };
+				const landed = to.query(`SELECT count(*) AS n FROM ${table}`).get() as { n: number };
+				if (landed.n !== had.n || copied !== had.n)
+					throw new Error(`row count of ${table} differs: ${landed.n} copied of ${had.n}`);
+				rows += landed.n;
+			}
+		} finally {
+			from.run("COMMIT");
+		}
+		return { ok: true, tables: tables.length, rows };
+	} catch (error) {
+		return { ok: false, error: String(error).slice(0, 500) };
+	} finally {
+		try {
+			out?.close();
+		} catch {
+			// 关闭失败不影响结果判定
+		}
+		try {
+			src?.close();
+		} catch {
+			// 同上
+		}
+	}
+}
+
 function build(): SnapshotBuildResult {
 	const source = process.env[DB_SNAPSHOT_SOURCE_ENV]?.trim();
 	const output = process.env[DB_SNAPSHOT_OUTPUT_ENV]?.trim();
 	if (!source || !output) return { ok: false, error: "missing snapshot paths" };
+	if (process.env[DB_SNAPSHOT_KINDS_ENV]?.trim() === DB_SNAPSHOT_OUTLINE_KIND)
+		return buildOutlineCopy(source, output);
 
 	const { all, copied } = selectedTables();
 	if (copied.length === 0) return { ok: false, error: "nothing selected" };

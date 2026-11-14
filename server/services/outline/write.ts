@@ -196,9 +196,11 @@ import {
 } from "./pending-hold";
 import { outlineStore } from "./store";
 import {
+	OUTLINE_HISTORY_LIMITS,
 	type OutlineBlockMeta,
 	type OutlineBlockPatch,
 	type OutlineBlockRow,
+	OutlineChangeMarksLimitError,
 	type OutlineClaimPlan,
 	type OutlineClaimWrite,
 	type OutlineCommitPlan,
@@ -3828,6 +3830,13 @@ async function writePrepared(
 		} catch (error) {
 			if (error instanceof OutlineStaleWriteError) continue;
 			if (isStalePending(error)) continue;
+			// The commit would mark more ancestors as changed than one transaction may write.
+			if (error instanceof OutlineChangeMarksLimitError) {
+				throw new OutlineWriteError(
+					`the transaction changes blocks under more than ${OUTLINE_HISTORY_LIMITS.maxChangeMarks} different ancestors; split it into smaller transactions`,
+					"OUTLINE_TOO_MANY_ROWS",
+				);
+			}
 			if (
 				error instanceof WriteConflictError &&
 				CALLER_ID_CONSTRAINTS.has(error.constraint ?? "")

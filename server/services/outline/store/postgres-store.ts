@@ -75,9 +75,11 @@ import {
 	type NarratorStateRow,
 	narratorSessions,
 	OUTLINE_BATCH_SPACES,
+	OUTLINE_HISTORY_LIMITS,
 	OUTLINE_RENEW_LIMIT,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
+	OutlineChangeMarksLimitError,
 	OutlineClaimsMovedError,
 	type OutlineClaimWrite,
 	type OutlineCommitPlan,
@@ -101,9 +103,11 @@ import {
 	type OutlineViewStateRow,
 	oldestClaimsFirst,
 	pendingAsExpected,
+	placedBlockIds,
 	writesAsExpected,
 } from "./port";
 import { createPostgresOutlineDigests } from "./postgres-digest";
+import { createPostgresOutlineHistory } from "./postgres-history";
 import { createPostgresOutlineReads } from "./postgres-read";
 
 /** Transaction handle as produced by `db.transaction(async (tx) => …)`. */
@@ -156,9 +160,16 @@ function askOf(value: unknown): OutlineAskJson | null {
 }
 
 function toSpace(row: SpaceSelect): OutlineSpaceRow {
-	// `in_process_ready` is bookkeeping of the in-process rebuild, and `last_commit_at` the
-	// reports' (read through `listSpacesCommittedSince`): neither is part of a space's row.
-	const { inProcessReady: _ready, lastCommitAt: _last, ...space } = row;
+	// `in_process_ready` is bookkeeping of the in-process rebuild, `last_commit_at` the reports'
+	// (read through `listSpacesCommittedSince`), the history floor and `edges_ready` the
+	// placement reads' (`getHistoryStates`): none is part of a space's row.
+	const {
+		inProcessReady: _ready,
+		lastCommitAt: _last,
+		historyFloorSeq: _floor,
+		edgesReady: _edges,
+		...space
+	} = row;
 	return { ...space, kind: row.kind as OutlineSpaceKind };
 }
 
@@ -401,6 +412,58 @@ function idList(ids: readonly string[]): SQL {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Mark every ancestor of `ids` as the tree is at this point of the section; the same statement
+ * as the SQLite store's (`markAncestors` there), returning how many rows it added.
+ */
+async function markAncestors(
+	tx: PgTransaction,
+	ids: readonly string[],
+	seq: number,
+	room: number,
+): Promise<number> {
+	let added = 0;
+	for (const chunk of chunked(ids)) {
+		const rows = await tx.execute(sql`
+			WITH RECURSIVE up(id) AS (
+				SELECT parent_id FROM outline_blocks
+				WHERE id IN (${idList(chunk)}) AND parent_id IS NOT NULL
+				UNION
+				SELECT b.parent_id FROM up JOIN outline_blocks b ON b.id = up.id
+				WHERE b.parent_id IS NOT NULL
+			)
+			INSERT INTO outline_subtree_changes (ancestor_id, seq)
+			SELECT up.id, CAST(${seq} AS integer) FROM up
+			WHERE NOT EXISTS (SELECT 1 FROM outline_subtree_changes m
+				WHERE m.ancestor_id = up.id AND m.seq = CAST(${seq} AS integer))
+			LIMIT CAST(${room - added + 1} AS integer)
+			RETURNING 1
+		`);
+		added += (rows as unknown as unknown[]).length;
+		if (added > room) break;
+	}
+	return added;
+}
+
+/** Close and open placements; the same two statements as the SQLite store's. */
+async function writePlacements(
+	tx: PgTransaction,
+	ids: readonly string[],
+	seq: number,
+): Promise<void> {
+	for (const chunk of chunked(ids)) {
+		await tx.execute(sql`
+			UPDATE outline_block_edges SET to_seq = CAST(${seq} AS integer)
+			WHERE block_id IN (${idList(chunk)}) AND to_seq IS NULL
+		`);
+		await tx.execute(sql`
+			INSERT INTO outline_block_edges (parent_key, block_id, from_seq, to_seq, order_key)
+			SELECT COALESCE(parent_id, space_id), id, CAST(${seq} AS integer), NULL, order_key
+			FROM outline_blocks WHERE id IN (${idList(chunk)}) AND NOT deleted
+		`);
+	}
+}
+
+/**
  * The whole commit, in the SQLite section's order. Resolves false, having written nothing, when
  * the space counter is no longer at the plan's seq.
  */
@@ -447,6 +510,11 @@ async function applyCommitSection(
 	if (claimed.length === 0) return "stale";
 
 	await tx.insert(outlineCommits).values(plan.commit);
+
+	// Change marks, first half: the ancestors of the changed blocks as the tree was.
+	const maxMarks = OUTLINE_HISTORY_LIMITS.maxChangeMarks;
+	let marks = await markAncestors(tx, plan.closeVersionIds, seq, maxMarks);
+	if (marks > maxMarks) throw new OutlineChangeMarksLimitError(plan.spaceId);
 
 	let closed = 0;
 	for (const ids of chunked(plan.closeVersionIds)) {
@@ -499,6 +567,16 @@ async function applyCommitSection(
 			`);
 		}
 	}
+
+	// Change marks, second half: the ancestors of every changed block as the tree is now.
+	marks += await markAncestors(
+		tx,
+		plan.versions.flatMap((group) => group.ids),
+		seq,
+		maxMarks - marks,
+	);
+	if (marks > maxMarks) throw new OutlineChangeMarksLimitError(plan.spaceId);
+	await writePlacements(tx, placedBlockIds(plan), seq);
 
 	for (const ids of chunked(plan.closeLinkIds)) {
 		await tx
@@ -860,6 +938,8 @@ async function ensureSpaceSection(
 			createdAt: now,
 			// Every block of a new space is written by a path that derives it.
 			inProcessReady: true,
+			// And placed by the commit that writes it: nothing for the conversion to do.
+			edgesReady: true,
 		})
 		.onConflictDoNothing();
 	return findSpaceIn(tx, scope);
@@ -874,6 +954,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		backendId: "postgres",
 		...createPostgresOutlineReads(db),
 		...createPostgresOutlineDigests(db),
+		...createPostgresOutlineHistory(db),
 
 		async ensureSpace(scope, now) {
 			for (let attempt = 0; attempt < SPACE_KEY_ATTEMPTS; attempt++) {

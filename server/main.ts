@@ -1321,6 +1321,11 @@ void startupReadiness.barrier.then(() => {
 	import("./services/outline/in-process")
 		.then(({ scheduleOutlineInProcessRebuild }) => scheduleOutlineInProcessRebuild())
 		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
+	// Outline placements for spaces written before they existed (once, in bounded batches,
+	// after a copy of the outline's tables is made in another process).
+	import("./services/outline/history-convert")
+		.then(({ scheduleOutlineHistoryConversion }) => scheduleOutlineHistoryConversion())
+		.catch((err) => logger.warn("Outline placement conversion failed", { error: String(err) }));
 	// Outline reports: each person's day, made in the background (a sweep every 5 minutes,
 	// in bounded slices), and "today so far" when asked.
 	import("./services/outline/digest-job")
@@ -1585,6 +1590,7 @@ async function performGracefulShutdown(
 			async () => {
 				const tasks = await import("./services/outline/tasks");
 				const inProcess = await import("./services/outline/in-process");
+				const history = await import("./services/outline/history-convert");
 				const digests = await import("./services/outline/digest-job");
 				const specImport = await import("./services/outline/spec-import/triggers");
 				const specLoss = await import("./services/outline/spec-import/loss-scan");
@@ -1592,6 +1598,7 @@ async function performGracefulShutdown(
 					specImport.stopSpecImportJob(),
 					specLoss.stopSpecLossScanJob(),
 					inProcess.stopOutlineInProcessRebuild(),
+					history.stopOutlineHistoryConversion(),
 					tasks.stopOutlineTaskLeaseJob(),
 					digests.stopOutlineDigestJob(),
 				]);
