@@ -79,6 +79,7 @@ interface ReadOptions {
 interface BodyOptions {
 	maxBytes: number;
 	signal?: AbortSignal;
+	timeoutMs?: number;
 }
 
 function boundedLimit(value: number): number {
@@ -419,7 +420,7 @@ export class UpdateServerBridgeHttp {
 			(response, signal) => this.#json(response, BRIDGE_METADATA_LIMIT, signal),
 		);
 	}
-	/** Raw stream, bounded and hashed as consumed. Never buffers a patch or accepts a full binary. */
+	/** Raw payload stream, bounded and hashed as consumed; never text-buffers patch or binary. */
 	async putRaw(
 		path: string,
 		stream: ReadableStream<Uint8Array>,

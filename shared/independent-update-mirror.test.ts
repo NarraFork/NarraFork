@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import {
+	MAX_MIRROR_MAIN_BINARY_BYTES,
 	type MirrorSnapshotV1,
+	type MirrorSnapshotV2,
 	mirrorAssetLimit,
 	mirrorAssetsForTarget,
 	parseMirrorAssetDescriptor,
@@ -77,7 +79,46 @@ test("pure mirror schema is bound to configured repo, target and complete exact 
 	}
 	expect(() => parseMirrorSnapshot(value, "")).toThrow("unconfigured");
 });
-test("raw asset admission rejects full binary kinds, traversal and per-kind byte limits", () => {
+test("v2 requires exact full-binary projection while v1 remains metadata-only", () => {
+	const old = fixture();
+	const full: MirrorSnapshotV2 = {
+		...old,
+		schemaVersion: 2,
+		assets: mirrorAssetsForTarget(old.index, old.targetVersion, 2),
+	};
+	expect(parseMirrorSnapshot(full, old.repository)).toEqual(full);
+	expect(full.assets[0].kind).toBe("main-binary");
+	expect(full.assets[0]).not.toHaveProperty("metadata");
+	expect(() => parseMirrorSnapshot({ ...full, assets: old.assets }, old.repository)).toThrow(
+		"complete",
+	);
+	expect(() => parseMirrorSnapshot({ ...full, schemaVersion: 1 }, old.repository)).toThrow(
+		"complete",
+	);
+	expect(mirrorAssetLimit("main-binary")).toBe(1024 ** 3);
+	expect(
+		parseMirrorAssetDescriptor({ ...full.assets[0], size: MAX_MIRROR_MAIN_BINARY_BYTES }).size,
+	).toBe(MAX_MIRROR_MAIN_BINARY_BYTES);
+	expect(() =>
+		parseMirrorAssetDescriptor({ ...full.assets[0], size: MAX_MIRROR_MAIN_BINARY_BYTES + 1 }),
+	).toThrow("size");
+	for (const change of [
+		{ sha256: "e".repeat(64) },
+		{ platform: "win-x64" },
+		{ version: "0.9.3" },
+		{ name: "invented" },
+		{ size: full.assets[0].size + 1 },
+	]) {
+		expect(() =>
+			parseMirrorSnapshot(
+				{ ...full, assets: [{ ...full.assets[0], ...change }, ...full.assets.slice(1)] },
+				old.repository,
+			),
+		).toThrow("canonical");
+	}
+});
+
+test("raw asset admission rejects unknown binary kinds, traversal and per-kind byte limits", () => {
 	const asset = fixture().assets[0];
 	for (const changed of [
 		{ ...asset, kind: "binary" },

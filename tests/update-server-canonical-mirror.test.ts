@@ -13,8 +13,11 @@ import {
 	HELPER_TOOLS,
 } from "../shared/helper-distribution";
 import {
+	MIRROR_MAIN_TRANSFER_TIMEOUT_MS,
 	type MirrorAssetDescriptor,
+	type MirrorSnapshot,
 	type MirrorSnapshotV1,
+	type MirrorSnapshotV2,
 	mirrorAssetsForTarget,
 	parseMirrorAvailability,
 } from "../shared/independent-update-mirror";
@@ -364,6 +367,7 @@ function fixture(patches = true, version = "0.9.2") {
 		assets: mirrorAssetsForTarget(index, version),
 	};
 	const bytes = new Map([
+		[name, binary],
 		[`${name}.metadata.json`, sidecar],
 		[patchName, patch],
 		[`${patchName}.meta.json`, meta],
@@ -423,7 +427,7 @@ function headers(token: string, asset: MirrorAssetDescriptor) {
 }
 async function uploadAll(
 	ctx: Parameters<Parameters<typeof withServer>[0]>[0],
-	current: ReturnType<typeof fixture>,
+	current: { snapshot: MirrorSnapshot; bytes: Map<string, Buffer> },
 ) {
 	for (const asset of current.snapshot.assets) {
 		const response = await ctx.app.request(`${ctx.url}/assets/${asset.sha256}`, {
@@ -443,7 +447,7 @@ async function uploadAll(
 }
 async function commit(
 	ctx: Parameters<Parameters<typeof withServer>[0]>[0],
-	snapshot: MirrorSnapshotV1,
+	snapshot: MirrorSnapshot,
 ) {
 	return ctx.app.request(`${ctx.url}/snapshot`, {
 		method: "POST",
@@ -451,6 +455,203 @@ async function commit(
 		body: JSON.stringify(snapshot),
 	});
 }
+
+function fullSnapshot(snapshot: MirrorSnapshotV1): MirrorSnapshotV2 {
+	return {
+		...snapshot,
+		schemaVersion: 2,
+		assets: mirrorAssetsForTarget(snapshot.index, snapshot.targetVersion, 2),
+	};
+}
+
+for (const legacyFormat of ["snapshot-v1", "catalog-v2"] as const) {
+	test(`${legacyFormat} restart cannot expose cross-product binary objects; validated upgrade is monotonic`, async () => {
+		await withServer(
+			async (ctx) => {
+				const current = fixture();
+				await uploadAll(ctx, current);
+				expect((await commit(ctx, current.snapshot)).status).toBe(200);
+				const statePath = "mirror-snapshots/narrafork.json";
+				if (legacyFormat === "snapshot-v1") {
+					await ctx.storage.saveFile(statePath, Buffer.from(JSON.stringify(current.snapshot)));
+				} else {
+					const state = JSON.parse((await ctx.storage.getFile(statePath))?.toString() as string);
+					for (const target of state.targets) delete target.projectionVersion;
+					await ctx.storage.saveFile(statePath, Buffer.from(JSON.stringify(state)));
+				}
+				const full = fullSnapshot(current.snapshot);
+				const binary = full.assets.find((a) => a.kind === "main-binary") as MirrorAssetDescriptor;
+				// Even an exact globally content-addressed object ingested by another product is not evidence.
+				await ctx.ingest.ingestAsset(
+					"other",
+					binary,
+					new Blob([Uint8Array.from(current.bytes.get(binary.name) as Buffer)]).stream(),
+					AbortSignal.timeout(5000),
+				);
+				const restarted = createApp(ctx.storage, new MirrorIngestService(ctx.storage));
+				expect((await restarted.request(`${ctx.url}/assets/${binary.sha256}`)).status).toBe(404);
+				expect((await commit(ctx, full)).status).toBe(200);
+				const read = spyOn(ctx.storage, "getFile");
+				try {
+					expect((await commit(ctx, full)).status).toBe(200);
+					expect(read.mock.calls.some(([path]) => path === `mirror-objects/${binary.sha256}`)).toBe(
+						false,
+					);
+				} finally {
+					read.mockRestore();
+				}
+				expect((await restarted.request(`${ctx.url}/assets/${binary.sha256}`)).status).toBe(200);
+				const availability = parseMirrorAvailability(
+					await (await restarted.request(`${ctx.url}/availability/0.9.2/linux-x64`)).json(),
+					repository,
+					"0.9.2",
+					"linux-x64",
+					full.index,
+				);
+				expect(availability.assets).toHaveLength(current.snapshot.assets.length);
+				// Standalone v2 snapshots are also readable on restart before catalog conversion.
+				await ctx.storage.saveFile(statePath, Buffer.from(JSON.stringify(full)));
+				expect((await restarted.request(`${ctx.url}/assets/${binary.sha256}`)).status).toBe(200);
+				// A v1 producer retry must neither revoke binary qualification nor claim it in its receipt.
+				const legacyRetry = await commit(ctx, current.snapshot);
+				expect((await legacyRetry.json()).verified).toHaveLength(current.snapshot.assets.length);
+				expect((await restarted.request(`${ctx.url}/assets/${binary.sha256}`)).status).toBe(200);
+				const stored = JSON.parse((await ctx.storage.getFile(statePath))?.toString() as string);
+				expect(stored.targets[0].projectionVersion).toBe(2);
+				const next = fixture(false, "0.9.3");
+				next.snapshot.index = mergeUpdateIndex(full.index, next.release, repository);
+				next.snapshot.indexCommit = "d".repeat(40);
+				await uploadAll(ctx, next);
+				expect((await commit(ctx, next.snapshot)).status).toBe(200);
+				for (const asset of full.assets)
+					expect((await restarted.request(`${ctx.url}/assets/${asset.sha256}`)).status).toBe(200);
+			},
+			{ mirrorRepositories: { narrafork: repository, other: "other/project" } },
+		);
+	});
+}
+
+test("v2 missing, corrupt, truncated and oversized main binaries never publish a partial snapshot", async () => {
+	await withServer(async (ctx) => {
+		const current = fixture();
+		await uploadAll(ctx, current);
+		const full = fullSnapshot(current.snapshot);
+		const binary = full.assets[0];
+		expect((await commit(ctx, full)).status).toBe(400);
+		expect((await ctx.app.request(`${ctx.url}/index`)).status).toBe(404);
+		for (const bytes of [
+			Buffer.alloc(binary.size, 9),
+			Buffer.alloc(binary.size - 1),
+			Buffer.alloc(binary.size + 1),
+		]) {
+			const response = await ctx.app.request(`${ctx.url}/assets/${binary.sha256}`, {
+				method: "PUT",
+				headers: headers(ctx.token, binary),
+				body: new Blob([Uint8Array.from(bytes)]).stream(),
+			});
+			expect(response.status).toBe(400);
+			expect(await ctx.storage.fileExists(`mirror-objects/${binary.sha256}`)).toBe(false);
+		}
+		await uploadAll(ctx, { snapshot: full, bytes: current.bytes });
+		expect((await commit(ctx, full)).status).toBe(200);
+		await ctx.storage.saveFile(`mirror-objects/${binary.sha256}`, Buffer.alloc(binary.size, 7));
+		expect((await commit(ctx, full)).status).toBe(400);
+	});
+});
+
+test("cancelled full-binary commit verification never upgrades a legacy marker and releases its lock", async () => {
+	await withServer(async (ctx) => {
+		const current = fixture();
+		await uploadAll(ctx, current);
+		expect((await commit(ctx, current.snapshot)).status).toBe(200);
+		const full = fullSnapshot(current.snapshot);
+		await uploadAll(ctx, { snapshot: full, bytes: current.bytes });
+		const binary = full.assets[0];
+		const before = await ctx.storage.getFile("mirror-snapshots/narrafork.json");
+		const entered = Promise.withResolvers<void>();
+		let cancelled = false;
+		const real = ctx.storage.getFileStream.bind(ctx.storage);
+		const reading = spyOn(ctx.storage, "getFileStream").mockImplementation((path) =>
+			path === `mirror-objects/${binary.sha256}`
+				? Promise.resolve(
+						new ReadableStream<Uint8Array>({
+							pull() {
+								entered.resolve();
+							},
+							cancel() {
+								cancelled = true;
+							},
+						}),
+					)
+				: real(path),
+		);
+		const abort = new AbortController();
+		try {
+			const work = ctx.ingest.commitMain("narrafork", full, abort.signal);
+			await entered.promise;
+			abort.abort();
+			await expect(work).rejects.toThrow("aborted");
+			expect(cancelled).toBe(true);
+			expect(await ctx.storage.getFile("mirror-snapshots/narrafork.json")).toEqual(before);
+			expect((await ctx.app.request(`${ctx.url}/assets/${binary.sha256}`)).status).toBe(404);
+		} finally {
+			reading.mockRestore();
+		}
+		expect((await commit(ctx, full)).status).toBe(200);
+	});
+});
+
+test("main binary uses bounded 15 minute direct budget and honours cancellation and stricter quota", async () => {
+	await withServer(
+		async (ctx) => {
+			const current = fixture();
+			const binary = fullSnapshot(current.snapshot).assets[0];
+			const saving = spyOn(ctx.storage, "saveVerifiedFile");
+			try {
+				const controller = new AbortController();
+				let cancelled = false;
+				const pending = ctx.ingest.ingestAsset(
+					"narrafork",
+					binary,
+					new ReadableStream({
+						start(c) {
+							c.enqueue(new Uint8Array([1]));
+						},
+						cancel() {
+							cancelled = true;
+						},
+					}),
+					controller.signal,
+				);
+				await new Promise<void>((resolve) => setTimeout(resolve, 10));
+				controller.abort();
+				await expect(pending).rejects.toThrow();
+				expect(cancelled).toBe(true);
+				expect(saving.mock.calls[0][2].timeoutMs).toBe(MIRROR_MAIN_TRANSFER_TIMEOUT_MS);
+				expect(await ctx.storage.listFiles("mirror-objects")).toEqual([]);
+			} finally {
+				saving.mockRestore();
+			}
+		},
+		{ mirrorLimits: { minFreeBytes: 0 } },
+	);
+	await withServer(
+		async (ctx) => {
+			const current = fixture();
+			const binary = fullSnapshot(current.snapshot).assets[0];
+			await expect(
+				ctx.ingest.ingestAsset(
+					"narrafork",
+					binary,
+					new Blob([Uint8Array.from(current.bytes.get(binary.name) as Buffer)]).stream(),
+					AbortSignal.timeout(5000),
+				),
+			).rejects.toThrow("quota");
+			expect((await ctx.app.request(`${ctx.url}/assets/${binary.sha256}`)).status).toBe(404);
+		},
+		{ mirrorLimits: { quotaBytes: 1, minFreeBytes: 0 } },
+	);
+});
 
 test("empty server mirrors current canonical assets without source history or full binaries; history v999 has no authority", async () => {
 	await withServer(async (ctx) => {

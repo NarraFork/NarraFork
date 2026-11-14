@@ -1,11 +1,21 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
+import { mirrorAssetsForTarget } from "../../../shared/independent-update-mirror";
 import type { UpdateSourceIdentity } from "../../../shared/update-identity";
-import { UPDATE_INDEX_PLATFORMS, type UpdateIndexV1 } from "../../../shared/update-index";
+import {
+	mergeUpdateIndex,
+	UPDATE_INDEX_PLATFORMS,
+	type UpdateIndexRelease,
+	type UpdateIndexV1,
+} from "../../../shared/update-index";
+import { createApp } from "../../../update-server/app";
+import { initConfig } from "../../../update-server/lib/config";
+import { MirrorIngestService } from "../../../update-server/services/mirror-ingest";
+import { LocalStorage } from "../../../update-server/storage/local";
 import type { UpdateFetchContext } from "../../lib/net/update-fetch";
 import { settings } from "../../lib/settings";
 import { BUILD_PLATFORM } from "../../lib/version";
@@ -14,10 +24,11 @@ import {
 	downloadGithubUpdateToFile,
 } from "../github-release-patch-apply";
 import {
-	downloadGithubBinaryToFile,
-	readIndexedGithubBinaryMetadata,
-} from "../github-release-update";
-import { checkMirrorUpdate, downloadMirrorPatch, getMirrorNotes } from "../update-mirror-client";
+	checkMirrorUpdate,
+	downloadMirrorBinary,
+	downloadMirrorPatch,
+	getMirrorNotes,
+} from "../update-mirror-client";
 import {
 	checkForUpdate,
 	downloadUpdate,
@@ -71,7 +82,8 @@ const notesBytes = Buffer.from(
 	}),
 );
 const baseUrl = `${identity.serverUrl}/api/v3/products/narrafork/mirror`;
-const fullUrl = `https://github.com/${identity.repository}/releases/download/v${version}/${name}`;
+const fullUrl = `${baseUrl}/assets/${hash(binary)}`;
+const sidecarUrl = () => `${baseUrl}/assets/${hash(binarySidecar())}`;
 const originalUpdate = structuredClone(settings.update);
 const originalFetch = globalThis.fetch;
 let directory: string;
@@ -180,9 +192,10 @@ beforeEach(async () => {
 		isCurrent: () => true,
 		fetch: async (url, init) => {
 			calls.push(url);
+			expect(new URL(url).origin).toBe(identity.serverUrl);
 			expect(init?.redirect).toBe("manual");
 			if (url === `${baseUrl}/index`) return Response.json(index());
-			if (url === `${fullUrl}.metadata.json`) return streamed(binarySidecar());
+			if (url === sidecarUrl()) return streamed(binarySidecar());
 			if (url === `${baseUrl}/assets/${hash(notesBytes)}`)
 				return streamed(mode === "badnotes" ? Buffer.alloc(notesBytes.length) : notesBytes);
 			if (url.startsWith(`${baseUrl}/availability/`)) {
@@ -209,7 +222,10 @@ beforeEach(async () => {
 			if (url === `${baseUrl}/assets/${hash(fixturePatch())}`) {
 				if (mode === "404") return new Response(null, { status: 404 });
 				if (mode === "redirect")
-					return new Response(null, { status: 302, headers: { location: fullUrl } });
+					return new Response(null, {
+						status: 302,
+						headers: { location: "https://github.com/forbidden/patch" },
+					});
 				if (mode === "corrupt") return streamed(Buffer.alloc(patchBytes.length));
 				if (mode === "deadline")
 					return new Promise((_resolve, reject) =>
@@ -219,13 +235,7 @@ beforeEach(async () => {
 					);
 				return streamed(fixturePatch());
 			}
-			if (url === fullUrl)
-				return new Response(null, {
-					status: 302,
-					headers: { location: "https://release-assets.githubusercontent.com/fixture/full" },
-				});
-			if (url === "https://release-assets.githubusercontent.com/fixture/full")
-				return streamed(binary);
+			if (url === fullUrl) return streamed(binary);
 			throw new Error(`Unexpected origin ${url}`);
 		},
 	};
@@ -242,17 +252,18 @@ async function run(
 	cancelPatch?: () => void,
 ) {
 	return downloadGithubUpdateToFile(
-		{ release: { ...release, source: "github" }, currentVersion, basePath, outputPath, signal },
+		{ release, currentVersion, basePath, outputPath, signal },
 		{
-			downloadPatch: (_step, path, options) =>
+			downloadPatch: (step, path, options) =>
 				downloadMirrorPatch(
 					release,
 					path,
 					{ ...options, onProgress: () => cancelPatch?.() },
 					transport,
+					step,
 				),
 			downloadFull: (target, path, options) =>
-				downloadGithubBinaryToFile(target, path, { ...options, fetcher: transport.fetch }),
+				downloadMirrorBinary(target, path, options, transport),
 			resolveZstd: async () => null,
 		},
 	);
@@ -267,8 +278,302 @@ async function clean(output = true) {
 	if (output) expect(await readFile(outputPath)).toEqual(binary);
 }
 
+describe("real mirror routes and ingest", () => {
+	function releaseFixture(targetVersion: string, fromVersion: string, old: Buffer, binary: Buffer) {
+		const name = `narrafork-${targetVersion}-${UPDATE_INDEX_PLATFORMS[platform]}`;
+		const patchName = `${name}.from-${fromVersion}.zstd-patch`;
+		const patch = zstdCompressSync(binary);
+		const metadata = Buffer.from(
+			JSON.stringify({
+				...meta,
+				fromVersion,
+				toVersion: targetVersion,
+				oldFileSize: old.length,
+				oldFileSha512: hash(old, "sha512"),
+				newFileSize: binary.length,
+				newFileSha512: hash(binary, "sha512"),
+				patchSize: patch.length,
+				newTailSize: binary.length,
+			}),
+		);
+		const sidecar = Buffer.from(
+			JSON.stringify({
+				name,
+				version: targetVersion,
+				platform,
+				target: `bun-${platform.replace(/^win-/, "windows-")}`,
+				size: binary.length,
+				sha256: hash(binary),
+				sha512: hash(binary, "sha512"),
+				commit: "a".repeat(40),
+				recoveryManifestVersions: [1, 2, 3],
+			}),
+		);
+		const release: UpdateIndexRelease = {
+			version: targetVersion,
+			tag: `v${targetVersion}`,
+			commit: "a".repeat(40),
+			prerelease: false,
+			publishedAt: "2026-10-14T00:00:00Z",
+			files: [
+				{
+					name,
+					size: binary.length,
+					sha256: hash(binary),
+					sha512: hash(binary, "sha512"),
+					platform,
+					metadata: { name: `${name}.metadata.json`, size: sidecar.length, sha256: hash(sidecar) },
+					patches: [
+						{
+							name: patchName,
+							fromVersion,
+							size: patch.length,
+							sha256: hash(patch),
+							metadata: {
+								name: `${patchName}.meta.json`,
+								size: metadata.length,
+								sha256: hash(metadata),
+							},
+						},
+					],
+				},
+			],
+		};
+		return {
+			release,
+			bytes: new Map([
+				[name, binary],
+				[`${name}.metadata.json`, sidecar],
+				[patchName, patch],
+				[`${patchName}.meta.json`, metadata],
+			]),
+		};
+	}
+	test.each([
+		"count",
+		"bytes",
+	])("bounded discovery enforces version/concurrency/metadata %s budgets", async (budgetMode) => {
+		const fixtures = Array.from({ length: 32 }, (_, index) =>
+			releaseFixture(`1.0.${index + 1}`, currentVersion, baseBinary, binary),
+		);
+		const assets = new Map<string, Buffer>();
+		for (const fixture of fixtures) {
+			const file = fixture.release.files[0];
+			const patch = file.patches[0];
+			const alternativeName = `${file.name}.zstd-patch`;
+			file.patches.push({
+				...patch,
+				name: alternativeName,
+				metadata: { ...patch.metadata, name: `${alternativeName}.meta.json` },
+			});
+			for (const bytes of fixture.bytes.values()) assets.set(hash(bytes), bytes);
+		}
+		const catalog: UpdateIndexV1 = {
+			...index(),
+			channels: { stable: "1.0.32", beta: "1.0.32" },
+			releases: fixtures.map((fixture) => fixture.release),
+		};
+		let active = 0;
+		let maximum = 0;
+		let metadataRequests = 0;
+		let availabilityRequests = 0;
+		const limited: UpdateFetchContext = {
+			key: "bounded",
+			isCurrent: () => true,
+			fetch: async (url) => {
+				calls.push(url);
+				expect(new URL(url).origin).toBe(identity.serverUrl);
+				if (url.endsWith("/index")) return Response.json(catalog);
+				if (url.includes("/availability/")) {
+					availabilityRequests++;
+					active++;
+					maximum = Math.max(maximum, active);
+					await new Promise<void>((resolve) => setTimeout(resolve, 1));
+					active--;
+					const version = url.split("/").at(-2);
+					const fixture = fixtures.find((fixture) => fixture.release.version === version);
+					if (!fixture) throw new Error("Unexpected candidate version");
+					const file = fixture.release.files[0];
+					const value = JSON.stringify({
+						schemaVersion: 1,
+						repository: identity.repository,
+						version,
+						platform,
+						assets: file.patches
+							.flatMap((patch) => [patch, patch.metadata])
+							.map(({ name, size, sha256 }) => ({ name, size, sha256 })),
+					});
+					return new Response(budgetMode === "bytes" ? value.padEnd(250 * 1024, " ") : value);
+				}
+				const digest = url.split("/").at(-1) ?? "";
+				const bytes = assets.get(digest);
+				if (!bytes) throw new Error("Unexpected metadata identity");
+				if (!bytes.toString().includes("recoveryManifestVersions")) metadataRequests++;
+				return streamed(bytes);
+			},
+		};
+		const checked = await checkMirrorUpdate(identity, currentVersion, limited);
+		expect(checked.updateAvailable).toBe(true);
+		expect(checked.releaseInfo?._mirror?.full.version).toBe("1.0.32");
+		expect(maximum).toBeLessThanOrEqual(4);
+		expect(availabilityRequests).toBeLessThanOrEqual(32);
+		expect(metadataRequests).toBeLessThanOrEqual(32);
+		if (budgetMode === "count") expect(metadataRequests).toBe(32);
+		else expect(availabilityRequests).toBeLessThan(32);
+	});
+	async function realMirror() {
+		const config = join(directory, "config.json");
+		const initialized = await initConfig(config);
+		const settings = JSON.parse(await Bun.file(config).text());
+		settings.mirrorRepositories = { narrafork: identity.repository };
+		settings.mirrorLimits = { minFreeBytes: 0, quotaBytes: 4 * 1024 * 1024, uploadTimeoutMs: 1000 };
+		await writeFile(config, JSON.stringify(settings));
+		await initConfig(config);
+		const storage = new LocalStorage(join(directory, "storage"));
+		const ingest = new MirrorIngestService(storage);
+		const app = createApp(storage, ingest);
+		const transport: UpdateFetchContext = {
+			key: "real-routes",
+			isCurrent: () => true,
+			fetch: async (url, init) => {
+				calls.push(url);
+				expect(new URL(url).origin).toBe(identity.serverUrl);
+				return app.request(new URL(url).pathname, init);
+			},
+		};
+		let index: UpdateIndexV1 | null = null;
+		const publish = async (fixture: ReturnType<typeof releaseFixture>, projection: 1 | 2 = 2) => {
+			index = mergeUpdateIndex(index, fixture.release, identity.repository, "2026-10-14T00:00:00Z");
+			const assets = mirrorAssetsForTarget(index, fixture.release.version, projection);
+			for (const asset of assets) {
+				const response = await app.request(`${baseUrl}/assets/${asset.sha256}`, {
+					method: "PUT",
+					headers: {
+						authorization: `Bearer ${initialized.adminToken}`,
+						"x-mirror-repository": identity.repository,
+						"x-mirror-kind": asset.kind,
+						"x-mirror-name": asset.name,
+						"x-mirror-size": String(asset.size),
+						"x-mirror-version": asset.version,
+						...(asset.platform ? { "x-mirror-platform": asset.platform } : {}),
+					},
+					body: Uint8Array.from(fixture.bytes.get(asset.name) as Buffer),
+				});
+				expect(response.status).toBe(200);
+			}
+			const response = await app.request(`${baseUrl}/snapshot`, {
+				method: "POST",
+				headers: {
+					authorization: `Bearer ${initialized.adminToken}`,
+					"content-type": "application/json",
+				},
+				body: JSON.stringify({
+					schemaVersion: projection,
+					repository: identity.repository,
+					indexCommit: "b".repeat(40),
+					index,
+					targetVersion: fixture.release.version,
+					assets,
+				}),
+			});
+			expect(response.status, await response.text()).toBe(200);
+		};
+		return { app, storage, transport, publish };
+	}
+	test("v2 PUT/commit serves verified full and historical two-step reconstruction without GitHub", async () => {
+		const real = await realMirror();
+		const first = releaseFixture(version, currentVersion, baseBinary, binary);
+		await real.publish(first);
+		let checked = await checkMirrorUpdate(identity, currentVersion, real.transport);
+		if (!checked.releaseInfo) throw new Error("Missing v2 mirror selection");
+		await downloadMirrorBinary(
+			checked.releaseInfo,
+			outputPath,
+			{ signal: new AbortController().signal },
+			real.transport,
+		);
+		expect(await readFile(outputPath)).toEqual(binary);
+		await rm(outputPath);
+		const final = Buffer.from("second historical binary fixture".repeat(400));
+		const second = releaseFixture("1.0.2", version, binary, final);
+		await real.publish(second);
+		checked = await checkMirrorUpdate(identity, currentVersion, real.transport);
+		if (!checked.releaseInfo) throw new Error("Missing historical selection");
+		expect(checked.releaseInfo._github).toBeUndefined();
+		expect(checked.patchChain?.map((step) => [step.fromVersion, step.toVersion])).toEqual([
+			[currentVersion, version],
+			[version, "1.0.2"],
+		]);
+		const release = checked.releaseInfo;
+		expect(
+			await downloadGithubUpdateToFile(
+				{ release, currentVersion, basePath, outputPath, signal: new AbortController().signal },
+				{
+					downloadPatch: (step, path, options) =>
+						downloadMirrorPatch(release, path, options, real.transport, step),
+					downloadFull: (target, path, options) =>
+						downloadMirrorBinary(target, path, options, real.transport),
+					resolveZstd: async () => null,
+				},
+			),
+		).toBe("zstd");
+		expect(await readFile(outputPath)).toEqual(final);
+		const patchUrls = [first, second].map(
+			(fixture) => `${baseUrl}/assets/${fixture.release.files[0].patches[0].sha256}`,
+		);
+		for (const url of patchUrls) expect(calls).toContain(url);
+		expect(calls).toContain(`${baseUrl}/availability/${version}/${platform}`);
+		expect(calls.every((url) => new URL(url).origin === identity.serverUrl)).toBe(true);
+		// A missing intermediate is not silently reused from the index.
+		await real.storage.deleteFile(`mirror-objects/${first.release.files[0].patches[0].sha256}`);
+		const missing = await checkMirrorUpdate(identity, currentVersion, real.transport);
+		expect(missing.strategy).toBe("full");
+		expect(missing.patchChain).toBeUndefined();
+		if (!missing.releaseInfo) throw new Error("Missing verified full after optional patch loss");
+		await rm(outputPath);
+		await downloadMirrorBinary(
+			missing.releaseInfo,
+			outputPath,
+			{ signal: new AbortController().signal },
+			real.transport,
+		);
+		expect(await readFile(outputPath)).toEqual(final);
+		expect(calls.every((url) => new URL(url).origin === identity.serverUrl)).toBe(true);
+	});
+	test("v1 metadata-only mirror retains working delta but missing full fails at the mirror", async () => {
+		const real = await realMirror();
+		await real.publish(releaseFixture(version, currentVersion, baseBinary, binary), 1);
+		const checked = await checkMirrorUpdate(identity, currentVersion, real.transport);
+		if (!checked.releaseInfo) throw new Error("Missing legacy mirror selection");
+		const release = checked.releaseInfo;
+		expect(
+			await downloadGithubUpdateToFile(
+				{ release, currentVersion, basePath, outputPath, signal: new AbortController().signal },
+				{
+					downloadPatch: (step, path, options) =>
+						downloadMirrorPatch(release, path, options, real.transport, step),
+					downloadFull: (target, path, options) =>
+						downloadMirrorBinary(target, path, options, real.transport),
+					resolveZstd: async () => null,
+				},
+			),
+		).toBe("zstd");
+		expect(await readFile(outputPath)).toEqual(binary);
+		await rm(outputPath);
+		await expect(
+			downloadMirrorBinary(
+				release,
+				outputPath,
+				{ signal: new AbortController().signal },
+				real.transport,
+			),
+		).rejects.toThrow("404");
+		expect(calls.every((url) => new URL(url).origin === identity.serverUrl)).toBe(true);
+	});
+});
+
 describe("canonical mirror recovery capabilities", () => {
-	test("legacy GitHub sidecars remain compatible without claiming v3", async () => {
+	test("legacy mirror sidecars remain compatible without claiming v3", async () => {
 		binaryMetadataChanges = { recoveryManifestVersions: undefined };
 		expect((await checked()).recoveryManifestVersions).toEqual([1, 2]);
 	});
@@ -289,17 +594,17 @@ describe("canonical mirror recovery capabilities", () => {
 		{ sha256: "b".repeat(64) },
 		{ sha512: hash("another", "sha512") },
 	]) {
-		test(`invalid GitHub sidecar ${JSON.stringify(changes)} fails before patch selection`, async () => {
+		test(`invalid mirror sidecar ${JSON.stringify(changes)} fails before patch selection`, async () => {
 			binaryMetadataChanges = changes;
 			await expect(checked()).rejects.toMatchObject({ code: "INVALID_METADATA" });
-			expect(calls).toEqual([`${baseUrl}/index`, `${fullUrl}.metadata.json`]);
+			expect(calls).toEqual([`${baseUrl}/index`, sidecarUrl()]);
 		});
 	}
 	for (const failure of ["digest", "size", "oversize", "json", "unavailable", "redirect"]) {
-		test(`GitHub sidecar ${failure} cannot grant mirror v3 capabilities`, async () => {
+		test(`mirror sidecar ${failure} cannot grant mirror v3 capabilities`, async () => {
 			const original = transport.fetch;
 			transport.fetch = async (url, init) => {
-				if (url !== `${fullUrl}.metadata.json`) return original(url, init);
+				if (url !== sidecarUrl()) return original(url, init);
 				if (failure === "unavailable") return new Response(null, { status: 404 });
 				if (failure === "redirect")
 					return new Response(null, {
@@ -330,37 +635,138 @@ describe("canonical mirror recovery capabilities", () => {
 		expect(release.sha512).toBe(changedDigest);
 		expect(release.recoveryManifestVersions).toEqual([1, 2]);
 	});
-	test("indexed sidecar request and stream honor the caller deadline", async () => {
-		const target = index().releases[0];
+	test("mirror sidecar request and stream honor the caller deadline", async () => {
+		const original = transport.fetch;
 		for (const stage of ["headers", "body"]) {
+			transport.fetch = async (url, init) =>
+				url !== sidecarUrl()
+					? original(url, init)
+					: stage === "headers"
+						? new Promise(() => {})
+						: new Response(
+								new ReadableStream({
+									start(controller) {
+										controller.enqueue(Buffer.from("{"));
+									},
+								}),
+							);
 			await expect(
-				readIndexedGithubBinaryMetadata(
-					{
-						repository: identity.repository,
-						version,
-						commit: target.commit,
-						binary: target.files[0],
-					},
-					{
-						signal: AbortSignal.timeout(20),
-						fetcher: async () =>
-							stage === "headers"
-								? new Promise(() => {})
-								: new Response(
-										new ReadableStream({
-											start(controller) {
-												controller.enqueue(Buffer.from("{"));
-											},
-										}),
-									),
-					},
-				),
+				checkMirrorUpdate(identity, currentVersion, transport, AbortSignal.timeout(20)),
 			).rejects.toThrow();
 		}
 	});
 });
 
 describe("canonical mirror actual file pipeline", () => {
+	test("the check's actual overall deadline stops optional probes instead of returning full", async () => {
+		const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+		const timeout = spyOn(AbortSignal, "timeout").mockImplementation((ms) =>
+			originalTimeout(ms === 30_000 ? 20 : ms),
+		);
+		const original = transport.fetch;
+		transport.fetch = async (url, init) =>
+			url.includes("/availability/") ? new Promise(() => {}) : original(url, init);
+		try {
+			await expect(checkMirrorUpdate(identity, currentVersion, transport)).rejects.toThrow();
+			expect(timeout).toHaveBeenCalledWith(30_000);
+			expect(calls).not.toContain(fullUrl);
+		} finally {
+			timeout.mockRestore();
+		}
+	});
+	test("full response-body deadline cancels a stalled stream and leaves no output", async () => {
+		mode = "absent";
+		const release = await checked();
+		const original = transport.fetch;
+		let cancelled = false;
+		transport.fetch = async (url, init) =>
+			url !== fullUrl
+				? original(url, init)
+				: new Response(
+						new ReadableStream({
+							start(controller) {
+								controller.enqueue(binary.subarray(0, 1));
+							},
+							cancel() {
+								cancelled = true;
+							},
+						}),
+					);
+		const deadline = createGithubUpdateDeadline(undefined, 20);
+		try {
+			await expect(run(release, deadline.signal)).rejects.toThrow("overall deadline");
+		} finally {
+			deadline.dispose();
+		}
+		expect(cancelled).toBe(true);
+		await clean(false);
+	});
+	test.each([
+		"404",
+		"corrupt",
+		"redirect",
+		"infinite",
+		"sha512",
+	])("full %s fails without leaving output or accessing GitHub", async (failure) => {
+		mode = "absent";
+		const release = await checked();
+		const original = transport.fetch;
+		transport.fetch = async (url, init) => {
+			if (url !== fullUrl) return original(url, init);
+			calls.push(url);
+			if (failure === "404") return new Response(null, { status: 404 });
+			if (failure === "redirect")
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://github.com/forbidden/full" },
+				});
+			if (failure === "infinite")
+				return new Response(
+					new ReadableStream({
+						pull(controller) {
+							controller.enqueue(Buffer.alloc(binary.length));
+						},
+					}),
+				);
+			return streamed(failure === "corrupt" ? Buffer.alloc(binary.length) : binary);
+		};
+		if (failure === "sha512") {
+			release.sha512 = hash("different", "sha512");
+			release.files[0].sha512 = release.sha512;
+			if (release._mirror) release._mirror.full.sha512 = release.sha512;
+		}
+		await expect(run(release)).rejects.toThrow();
+		expect(calls.every((url) => new URL(url).origin === identity.serverUrl)).toBe(true);
+		await clean(false);
+	});
+	test.each([
+		"index",
+		"availability",
+		"notes",
+	])("%s rejects cross-origin redirects without following them", async (stage) => {
+		const original = transport.fetch;
+		transport.fetch = async (url, init) => {
+			if (
+				(stage === "index" && url.endsWith("/index")) ||
+				(stage === "availability" && url.includes("/availability/")) ||
+				(stage === "notes" && url.endsWith(hash(notesBytes)))
+			) {
+				calls.push(url);
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://github.com/forbidden/metadata" },
+				});
+			}
+			return original(url, init);
+		};
+		if (stage === "index") await expect(checked()).rejects.toThrow("redirect");
+		else if (stage === "notes")
+			await expect(
+				getMirrorNotes(identity, version, hash(binary, "sha512"), transport),
+			).rejects.toThrow("redirect");
+		else expect((await checked())._mirror?.patchChain).toBeUndefined();
+		expect(calls.every((url) => new URL(url).origin === identity.serverUrl)).toBe(true);
+	});
 	test("stable channel without a published release reports NO_RELEASE rather than up-to-date", async () => {
 		const betaOnly = index();
 		betaOnly.releases[0].prerelease = true;
@@ -383,13 +789,11 @@ describe("canonical mirror actual file pipeline", () => {
 		expect(result.releaseInfo).toBeUndefined();
 		expect(calls).toEqual([`${baseUrl}/index`]);
 	});
-	test("available direct patch verifies metadata/base/payload/output and requests only the binary sidecar from GitHub", async () => {
+	test("available direct patch verifies metadata/base/payload/output with zero GitHub requests", async () => {
 		const release = await checked();
 		expect(release.recoveryManifestVersions).toEqual([1, 2, 3]);
 		expect(await run(release)).toBe("zstd");
-		expect(calls.filter((url) => !url.startsWith(identity.serverUrl))).toEqual([
-			`${fullUrl}.metadata.json`,
-		]);
+		expect(calls.filter((url) => new URL(url).origin !== identity.serverUrl)).toEqual([]);
 		await clean();
 	});
 	test.each([
@@ -402,16 +806,14 @@ describe("canonical mirror actual file pipeline", () => {
 		"redirect",
 		"rebuild",
 		"wrongavailability",
-	])("%s cleans owned temps and streams the same canonical GitHub target", async (failure) => {
+	])("%s cleans owned temps and streams the same mirror full target", async (failure) => {
 		mode = failure;
 		const release = await checked();
 		if (failure === "badbase") await writeFile(basePath, Buffer.alloc(baseBinary.length));
 		if (failure === "badbasesize") await writeFile(basePath, "wrong size");
 		expect(await run(release)).toBe("full");
-		expect(calls.filter((url) => url.startsWith("https://github.com/"))).toEqual([
-			`${fullUrl}.metadata.json`,
-			fullUrl,
-		]);
+		expect(calls).toContain(fullUrl);
+		expect(calls.filter((url) => new URL(url).origin !== identity.serverUrl)).toEqual([]);
 		expect(calls.some((url) => url.includes("api.github.com") || url.includes("/latest"))).toBe(
 			false,
 		);
@@ -421,7 +823,7 @@ describe("canonical mirror actual file pipeline", () => {
 	});
 	test("zstd missing falls back without changing target", async () => {
 		const release = await checked();
-		const chain = release._github?.patchChain;
+		const chain = release._mirror?.patchChain;
 		if (!chain) throw new Error("Missing chain");
 		chain[0].meta.mode = "patch-from";
 		expect(await run(release)).toBe("full");
@@ -516,7 +918,7 @@ describe("canonical mirror actual file pipeline", () => {
 	test("legacy mirror protocol and arbitrary full URL descriptors cannot become canonical releases", async () => {
 		const unavailable = { ...transport, fetch: async () => new Response(null, { status: 410 }) };
 		await expect(checkMirrorUpdate(identity, currentVersion, unavailable)).rejects.toThrow(
-			"upgrade it or select GitHub",
+			"upgrade the mirror",
 		);
 		const poisoned = {
 			...transport,

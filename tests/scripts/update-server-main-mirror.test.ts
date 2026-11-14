@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fsPromises from "node:fs/promises";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,14 +10,31 @@ import {
 } from "../../scripts/lib/update-server-bridge-http";
 import {
 	IndependentMirrorError,
+	MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS,
+	MIRROR_TOTAL_BYTES,
 	prepareUpdateServerMainMirror,
 } from "../../scripts/lib/update-server-main-mirror";
 import { mirrorPublishedGitHubRelease } from "../../scripts/mirror-update-server";
 import { mergeUpdateIndex } from "../../shared/update-index";
+import { WebDavClient } from "../../shared/webdav-transport";
 import { createApp } from "../../update-server/app";
 import { initConfig } from "../../update-server/lib/config";
 import { LocalStorage } from "../../update-server/storage/local";
+import { createWebDavFixture } from "../fixtures/webdav-fixture";
 import { config, mirrorFixture, repository, sha } from "./mirror-fixture";
+
+function relayFixture() {
+	const dav = createWebDavFixture();
+	const config = { url: dav.baseUrl, feed: "default", auth: { bearerToken: "fixture" } };
+	return {
+		dav,
+		options: {
+			config,
+			signingKey: Buffer.alloc(32, 4).toString("base64"),
+			client: new WebDavClient(config, { fetchImpl: dav.fetchImpl }),
+		},
+	};
+}
 
 const options = (fixture: ReturnType<typeof mirrorFixture>) => ({
 	kind: "main" as const,
@@ -45,20 +63,55 @@ describe("canonical independent main mirror", () => {
 		expect(f.committed?.assets.some((asset) => asset.name.includes("remote-frontend"))).toBe(false);
 		expect(f.downloaded.some((id) => id >= 900)).toBe(false);
 	});
-	test("explicit overall deadline reaches main download instead of restarting the default budget", async () => {
-		const f = mirrorFixture(true);
-		const downloadAsset = async ({ signal }: { signal?: AbortSignal }) =>
-			new Promise<void>((_, reject) => {
-				if (signal?.aborted) return reject(signal.reason);
-				signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
-			});
-		await expect(
-			mirrorPublishedGitHubRelease({ ...options(f), downloadAsset, totalTimeoutMs: 40 }),
-		).rejects.toThrow();
-		expect(f.httpCalls.some((r) => r.method === "POST")).toBe(false);
+	for (const transport of ["direct", "webdav"] as const)
+		test(`${transport} overall deadline cancels binary download without further requests`, async () => {
+			const f = mirrorFixture(true);
+			const relay = relayFixture();
+			let downloads = 0;
+			const downloadAsset = async ({ signal }: { signal?: AbortSignal }) => {
+				downloads++;
+				return new Promise<void>((_, reject) => {
+					if (signal?.aborted) return reject(signal.reason);
+					signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+				});
+			};
+			try {
+				await mirrorPublishedGitHubRelease({
+					...options(f),
+					transport,
+					downloadAsset,
+					totalTimeoutMs: 40,
+					uploadConcurrency: 1,
+					relay: relay.options,
+				});
+				throw new Error("must cancel");
+			} catch (error) {
+				expect((error as IndependentMirrorError).receipt.failureCode).toBe("CANCELLED");
+			}
+			expect(downloads).toBe(1);
+			expect(relay.dav.requests).toHaveLength(0);
+			expect(f.httpCalls).toHaveLength(0);
+			expect(f.committed).toBeUndefined();
+		});
+	test("temporary disk reservation includes the full binary even without a patch", async () => {
+		const f = mirrorFixture(false);
+		const disk = spyOn(fsPromises, "statfs").mockResolvedValue({
+			bavail: 64 * 1024 ** 2 + f.release.files[0].size - 1,
+			bsize: 1,
+		} as Awaited<ReturnType<typeof fsPromises.statfs>>);
+		try {
+			await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toBeInstanceOf(
+				IndependentMirrorError,
+			);
+			expect(disk).toHaveBeenCalledTimes(1);
+			expect(f.downloaded).toHaveLength(0);
+			expect(f.httpCalls).toHaveLength(0);
+		} finally {
+			disk.mockRestore();
+		}
 	});
 	for (const withPatch of [true, false])
-		test(`empty real Hono and LocalStorage server commits ${withPatch ? "current raw patch" : "metadata-only"} with server verification and no GET readback`, async () => {
+		test(`empty real Hono and LocalStorage server commits ${withPatch ? "binary and current raw patch" : "binary without a patch"} with server verification and no GET readback`, async () => {
 			const root = await mkdtemp(join(tmpdir(), "nf-producer-server-e2e-"));
 			try {
 				const configFile = join(root, "config.json");
@@ -100,7 +153,7 @@ describe("canonical independent main mirror", () => {
 					config: serverConfig,
 					http,
 				});
-				expect(result.status).toBe(withPatch ? "MIRRORED" : "METADATA_ONLY");
+				expect(result.status).toBe("MIRRORED");
 				expect(result.uploaded).toEqual(result.verified);
 				expect(result.snapshotCommitted).toBe(true);
 				const commitAt = requests.findIndex(
@@ -113,22 +166,23 @@ describe("canonical independent main mirror", () => {
 				expect(requests.slice(commitAt + 1)).toHaveLength(0);
 				expect(requests.some((r) => r.method === "GET")).toBe(false);
 				expect(result.verification).toBe("server-sha256");
-				expect(result.uploaded).not.toContain(f.name);
+				expect(result.uploaded).toContain(f.name);
 			} finally {
 				await rm(root, { recursive: true, force: true });
 			}
 		});
-	test("copies only current raw patch/sidecars/notes; never full binary or historical server state", async () => {
+	test("copies all current original binary/patch/sidecars/notes, never historical server state", async () => {
 		const f = mirrorFixture();
 		const receipt = await mirrorPublishedGitHubRelease(options(f));
 		expect(receipt.status).toBe("MIRRORED");
 		expect(receipt.snapshotCommitted).toBe(true);
-		expect(f.downloaded).toHaveLength(1);
+		expect(f.downloaded).toHaveLength(2);
+		expect(f.committed?.schemaVersion).toBe(2);
 		expect(f.committed?.index).toEqual(f.index);
 		for (const asset of f.committed?.assets ?? []) {
 			const expected = asset.kind === "notes" ? Buffer.from(f.notesRaw) : f.raw.get(asset.name);
 			expect(f.stored.get(asset.sha256)).toEqual(expected);
-			expect(asset.name).not.toBe(f.name);
+			if (asset.name === f.name) expect(asset.kind).toBe("main-binary");
 		}
 		const write = f.httpCalls.findIndex((c) => c.path.endsWith("/snapshot"));
 		expect(
@@ -149,7 +203,7 @@ describe("canonical independent main mirror", () => {
 	])("build metadata version mirrors canonical assets (patch=%s)", async (withPatch) => {
 		const f = mirrorFixture(withPatch, true, "1.2.0+build.42");
 		const receipt = await mirrorPublishedGitHubRelease(options(f));
-		expect(receipt.status).toBe(withPatch ? "MIRRORED" : "METADATA_ONLY");
+		expect(receipt.status).toBe("MIRRORED");
 		expect(receipt.tag).toBe("v1.2.0+build.42");
 		expect(receipt.snapshotCommitted).toBe(true);
 		expect(f.committed?.targetVersion).toBe("1.2.0+build.42");
@@ -158,13 +212,14 @@ describe("canonical independent main mirror", () => {
 			expect(f.stored.get(asset.sha256)).toEqual(expected);
 		}
 		expect(receipt.uploaded.some((name) => name.includes("+build.42"))).toBe(true);
-		expect(receipt.uploaded).not.toContain(f.name);
+		expect(receipt.uploaded).toContain(f.name);
 	});
-	test("no-patch current release is legal metadata-only even empty mirror or old v999 garbage", async () => {
+	test("no-patch current release mirrors its full binary even with unrelated old v999 data", async () => {
 		const f = mirrorFixture(false);
 		f.stored.set(sha("historical-v999"), Buffer.from("unrelated old data"));
-		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("METADATA_ONLY");
-		expect(f.downloaded).toHaveLength(0);
+		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("MIRRORED");
+		expect(f.downloaded).toHaveLength(1);
+		expect(f.stored.has(f.release.files[0].sha256)).toBe(true);
 		expect(f.stored.has(sha("historical-v999"))).toBe(true);
 	});
 	test("preview revalidates public GitHub identity without mirror token or server calls", async () => {
@@ -252,6 +307,50 @@ describe("canonical independent main mirror", () => {
 		expect(f.downloaded).toHaveLength(0);
 		expect(f.httpCalls).toHaveLength(0);
 	});
+	for (const transport of ["direct", "webdav"] as const)
+		for (const budget of ["excluding-binary", "above-hard-limit"] as const)
+			test(`${transport} ${budget} fails before any payload or transport request`, async () => {
+				const f = mirrorFixture(false);
+				const relay = relayFixture();
+				const metadataOnlyBytes =
+					2 * (f.release.files[0].metadata.size + Buffer.byteLength(f.notesRaw));
+				await expect(
+					mirrorPublishedGitHubRelease({
+						...options(f),
+						transport,
+						relay: relay.options,
+						maxTotalBytes:
+							budget === "excluding-binary" ? metadataOnlyBytes : MIRROR_TOTAL_BYTES + 1,
+					}),
+				).rejects.toBeInstanceOf(IndependentMirrorError);
+				expect(f.downloaded).toHaveLength(0);
+				expect(relay.dav.requests).toHaveLength(0);
+				expect(f.httpCalls).toHaveLength(0);
+			});
+	test("binary upload and snapshot use explicit bounded large-file timeouts", async () => {
+		const f = mirrorFixture(false);
+		const put = f.http.putRaw.bind(f.http);
+		const post = f.http.postJson.bind(f.http);
+		f.http.putRaw = (path, body, request) => {
+			expect(request.timeoutMs).toBe(15 * 60_000);
+			return put(path, body, request);
+		};
+		f.http.postJson = (path, body, request) => {
+			expect(request?.timeoutMs).toBe(MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS);
+			return post(path, body, request);
+		};
+		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("MIRRORED");
+	});
+	test("corrupt binary bytes fail before upload and never commit a partial projection", async () => {
+		const f = mirrorFixture(false);
+		f.raw.set(f.name, Buffer.alloc(f.release.files[0].size, 8));
+		await expect(
+			mirrorPublishedGitHubRelease({ ...options(f), uploadConcurrency: 1 }),
+		).rejects.toBeInstanceOf(IndependentMirrorError);
+		expect(f.downloaded).toHaveLength(1);
+		expect(f.httpCalls).toHaveLength(0);
+		expect(f.committed).toBeUndefined();
+	});
 	test("partial upload failure retains real verified subset and never commits snapshot", async () => {
 		const f = mirrorFixture();
 		const patch = f.assets.find((a) => a.name.endsWith("zstd-patch"));
@@ -264,7 +363,7 @@ describe("canonical independent main mirror", () => {
 			const r = (error as IndependentMirrorError).receipt;
 			expect(r.status).toBe("FAILED");
 			expect(r.snapshotCommitted).toBe(false);
-			expect(r.uploaded).toEqual([`${f.name}.metadata.json`]);
+			expect(r.uploaded).toEqual([f.name, `${f.name}.metadata.json`]);
 			expect(r.verified).toEqual([]);
 		}
 		expect(f.committed).toBeUndefined();
@@ -363,7 +462,7 @@ describe("canonical independent main mirror", () => {
 		f.onIndexRead = () => {
 			if (f.indexReads === 2) f.index = mergeUpdateIndex(f.index, next, repository);
 		};
-		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("METADATA_ONLY");
+		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("MIRRORED");
 		expect(f.committed?.index.channels.stable).toBe("1.3.0");
 		expect(f.committed?.targetVersion).toBe("1.2.0");
 	});
@@ -384,8 +483,8 @@ describe("canonical independent main mirror", () => {
 		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("MIRRORED");
 		expect(f.committed?.index.channels.stable).toBe("1.3.0");
 		expect(f.httpCalls.filter((c) => c.method === "POST")).toHaveLength(2);
-		expect(f.httpCalls.filter((c) => c.method === "PUT")).toHaveLength(3);
-		expect(f.downloaded).toHaveLength(1);
+		expect(f.httpCalls.filter((c) => c.method === "PUT")).toHaveLength(4);
+		expect(f.downloaded).toHaveLength(2);
 	});
 	test("repeated canonical conflicts exhaust a finite budget without reading mirror history", async () => {
 		const f = mirrorFixture(false);
