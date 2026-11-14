@@ -100,7 +100,7 @@ import { UnsavedTextsNotice } from "./editor/UnsavedTextsNotice";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
-import { OutlineBreadcrumbs } from "./OutlineBreadcrumbs";
+import { OutlineBreadcrumbs, OutlineLocateLink } from "./OutlineBreadcrumbs";
 import { OutlineGate } from "./OutlineGate";
 import { OutlineQuestionsSection } from "./OutlineQuestions";
 import { OutlineSidePanel } from "./OutlineSidePanel";
@@ -555,6 +555,13 @@ function SurfaceBody({
 				<div className={classes.toolbar}>
 					<OutlineBreadcrumbs view={view} search={linkSearch} path={crumbPath} />
 					<Group gap="xs" wrap="nowrap">
+						<OutlineLocateLink
+							view={view}
+							path={crumbPath}
+							host={layout}
+							blockId={blockId}
+							title={rootTitle}
+						/>
 						{history && (
 							<Group gap={2} wrap="nowrap">
 								<Tooltip label={t("history.back")}>

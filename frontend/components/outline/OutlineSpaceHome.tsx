@@ -1,7 +1,7 @@
 /**
  * One outline space, as the connected outline focused on it (readability E): where it hangs
  * (outline › its project › it), then its pages and, a project, its sessions, each opened in
- * place (`tree/OutlineTree.tsx`), and search within it. Router-free like the surface, so the
+ * place (`tree/OutlineTree.tsx`), and search within it, drawn as a tree of the matches. Router-free like the surface, so the
  * outline route and a dock panel (opened from a session's menu, on the session) show the same.
  */
 import {
@@ -19,14 +19,16 @@ import {
 import { useDebouncedValue } from "@mantine/hooks";
 import type { OutlineSpaceDetail } from "@shared/outline-api";
 import { IconSearch } from "@tabler/icons-react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useOutlineSearch, useOutlineSpace } from "../../hooks/useOutline";
+import { useOutlineSpace } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
-import { OutlineLink, outlineBlockTarget } from "./outline-nav";
+import { OutlineLink } from "./outline-nav";
+import { OutlineSearchTree } from "./tree/OutlineSearchTree";
 import { OutlineTree } from "./tree/OutlineTree";
+import type { TreeLocateTarget } from "./tree/tree-locate";
 
 export function OutlineSpaceHome({
 	spaceId,
@@ -50,8 +52,13 @@ export function OutlineSpaceHome({
 	const space = useOutlineSpace(spaceId);
 	const [query, setQuery] = useState("");
 	const [debounced] = useDebouncedValue(query, 250);
-	const search = useOutlineSearch(debounced, spaceId, space.isSuccess);
+	const searching = debounced.trim() !== "" && query.trim() !== "";
+	const [locate, setLocate] = useState<TreeLocateTarget | null>(null);
 	const detail = space.data?.space;
+	const root = useMemo(
+		() => (detail ? ({ kind: "space", space: detail } as const) : null),
+		[detail],
+	);
 	const name = detail ? spaceName(detail) : "";
 	useEffect(() => {
 		if (detail && onLoaded) onLoaded(detail, name);
@@ -117,34 +124,23 @@ export function OutlineSpaceHome({
 				aria-label={t("space.searchPlaceholder")}
 				value={query}
 				onChange={(event) => setQuery(event.currentTarget.value)}
+				onKeyDown={(event) => {
+					if (event.key === "Escape" && query !== "") setQuery("");
+				}}
+				data-testid="outline-search-input"
 			/>
-			{debounced.trim() ? (
-				<Stack gap={2}>
-					{search.data && search.data.hits.length === 0 && (
-						<Text size="sm" c="dimmed">
-							{t("home.noResults")}
-						</Text>
-					)}
-					{search.data?.hits.map((hit) => (
-						<OutlineLink
-							key={hit.blockId}
-							to={outlineBlockTarget(hit.spaceId, hit.blockId)}
-							className={classes.listItem}
-						>
-							<Text size="sm" fw={500} className={classes.ellipsis}>
-								{hit.title || hit.address}
-							</Text>
-							{hit.path.length > 0 && (
-								<Text size="xs" c="dimmed" className={classes.ellipsis}>
-									{hit.path.join(" › ")}
-								</Text>
-							)}
-						</OutlineLink>
-					))}
-				</Stack>
-			) : (
-				<OutlineTree root={{ kind: "space", space: detail }} host={host} />
+			{/* The search drawn as a tree, in the tree's place; a match is then shown in the tree. */}
+			{searching && (
+				<OutlineSearchTree
+					query={debounced}
+					spaceId={spaceId}
+					onLocate={(target) => {
+						setQuery("");
+						setLocate(target);
+					}}
+				/>
 			)}
+			{root && <OutlineTree root={root} host={host} locate={locate} hidden={searching} />}
 		</Stack>
 	);
 }

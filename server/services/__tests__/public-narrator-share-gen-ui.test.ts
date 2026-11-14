@@ -210,6 +210,182 @@ describe("GenUI anonymous read boundary", () => {
 	});
 });
 
+describe("public reasoning replay metadata boundary", () => {
+	for (const type of ["message", "message_updated"] as const) {
+		test(`${type} keeps public reasoning text but removes every provider's replay state`, () => {
+			const providerMetadata = {
+				signatureSource: "openai",
+				openai: {
+					itemId: "private-item-id",
+					reasoningEncryptedContent: "private-ciphertext",
+					reasoningContent: [{ type: "reasoning_text", text: "private-native-body" }],
+					reasoningSummary: [{ type: "summary_text", text: "private-native-summary" }],
+				},
+				anthropic: { signature: "private-anthropic-signature" },
+				gemini: { thoughtSignature: "private-gemini-signature" },
+				opaque: { content: "private-opaque-replay" },
+			};
+			const reasoning = { type: "reasoning", text: "Public reasoning", providerMetadata };
+			const answer = { type: "text", text: "Public answer" };
+			const event = {
+				type,
+				narratorId: "scope",
+				message: {
+					id: "message-id",
+					role: "assistant",
+					contentJson: [reasoning, answer],
+					contentText: "Public reasoning\nPublic answer",
+				},
+			};
+			const original = structuredClone(event);
+			const projected = projectPublicNarratorEvent("scope", event);
+			expect<unknown>(projected?.message.contentJson).toEqual([
+				{
+					type: "reasoning",
+					text: "Public reasoning",
+					providerMetadata: { hasEncryptedReasoning: true },
+				},
+				answer,
+			]);
+			expect(JSON.stringify(projected)).not.toContain("private-");
+			expect(projected?.message.contentText).toBe(event.message.contentText);
+			expect(projected?.message.contentJson[1]).toBe(answer);
+			expect(event).toEqual(original);
+			expect(reasoning.providerMetadata).toBe(providerMetadata);
+		});
+	}
+
+	test("content replacement and nested thinking remove replay-only data without inventing encryption", () => {
+		const providerMetadata = {
+			openai: {
+				reasoningEncryptedContent: "",
+				reasoningContent: [{ type: "reasoning_text", text: "private-body" }],
+				reasoningSummary: [{ type: "summary_text", text: "private-summary" }],
+			},
+			opaque: "private-opaque",
+			anthropic: { signature: "private-signature" },
+		};
+		const event = {
+			type: "message_updated",
+			message: {
+				id: "same-message",
+				contentJson: [{ type: "reasoning", text: "Replacement body", providerMetadata }],
+				children: [
+					{ contentJson: [{ type: "thinking", thinking: "Child thought", providerMetadata }] },
+				],
+			},
+		};
+		const original = structuredClone(event);
+		const projected = projectPublicNarratorEvent("scope", event);
+		expect<unknown>(projected?.message.contentJson).toEqual([
+			{ type: "reasoning", text: "Replacement body" },
+		]);
+		expect<unknown>(projected?.message.children[0].contentJson).toEqual([
+			{ type: "thinking", thinking: "Child thought" },
+		]);
+		expect(event).toEqual(original);
+	});
+
+	test("the display encryption marker is idempotent, including future provider namespaces", () => {
+		for (const providerMetadata of [
+			{ hasEncryptedReasoning: true },
+			{ hasEncryptedReasoning: true, opaque: "private-replay" },
+			{ futureProvider: { reasoningEncryptedContent: "private-ciphertext" } },
+		]) {
+			const payload = { contentJson: [{ type: "reasoning", text: "", providerMetadata }] };
+			const projected = projectPublicNarratorPayload("scope", payload);
+			expect(projected.contentJson[0].providerMetadata).toEqual({ hasEncryptedReasoning: true });
+			expect(projectPublicNarratorPayload("scope", projected)).toBe(projected);
+		}
+	});
+
+	test("mixed reasoning and GenUI still remove the tool's denormalized text fallback", () => {
+		const payload = {
+			contentJson: [
+				{ type: "reasoning", text: "Public reasoning", providerMetadata: { opaque: secret } },
+				{ type: "tool_use", id: "gen-ui", name: "GenUI", input: { source: secret } },
+			],
+			contentText: `Public reasoning\n${secret}`,
+		};
+		const projected = projectPublicNarratorPayload("scope", payload);
+		assertStatic(projected);
+		expect<unknown>(projected.contentJson[0]).toEqual({
+			type: "reasoning",
+			text: "Public reasoning",
+		});
+		expect(projected.contentText).toBeNull();
+		expect(payload.contentText).toContain(secret);
+	});
+
+	test("native replay arrays are discarded without traversal or additional database reads", () => {
+		const replay = Array.from({ length: 25_000 }, () => ({
+			type: "reasoning_text",
+			text: "private-native-body",
+		}));
+		const event = {
+			type: "message_updated",
+			message: {
+				contentJson: [
+					{
+						type: "reasoning",
+						text: "Public reasoning",
+						providerMetadata: { openai: { reasoningContent: replay, reasoningSummary: replay } },
+					},
+				],
+			},
+		};
+		const select = spyOn(db, "select");
+		try {
+			expect<unknown>(projectPublicNarratorEvent("scope", event)?.message.contentJson).toEqual([
+				{ type: "reasoning", text: "Public reasoning" },
+			]);
+			expect(select.mock.calls).toHaveLength(0);
+			expect(event.message.contentJson[0].providerMetadata.openai.reasoningContent).toBe(replay);
+		} finally {
+			select.mockRestore();
+		}
+	});
+
+	test("provider namespaces consume the existing projection budget and fail closed", () => {
+		const event = {
+			type: "message_updated",
+			message: {
+				contentJson: [
+					{
+						type: "reasoning",
+						text: "Public reasoning",
+						providerMetadata: Object.fromEntries(
+							Array.from({ length: 20_001 }, (_, index) => [
+								`provider-${index}`,
+								{ signature: "private-replay" },
+							]),
+						),
+					},
+				],
+			},
+		};
+		expect(projectPublicNarratorEvent("scope", event)).toBeNull();
+	});
+
+	test("ordinary tool JSON and non-reasoning metadata are not recursively scrubbed", () => {
+		const data = {
+			type: "reasoning",
+			providerMetadata: { opaque: "ordinary-user-data" },
+			contentJson: [{ type: "reasoning", providerMetadata: { opaque: "nested-user-data" } }],
+		};
+		const payload = {
+			contentJson: [
+				{ type: "tool_use", id: "bash", name: "Bash", input: data },
+				{ type: "tool_result", tool_use_id: "bash", content: [data] },
+				{ type: "text", text: "Answer", providerMetadata: { opaque: "ordinary-text-data" } },
+			],
+			toolCalls: [{ toolUseId: "bash", toolName: "Bash", inputJson: data, outputJson: data }],
+		};
+		rememberPublicToolIdentity("scope", { toolUseId: "bash", toolName: "Bash" });
+		expect(projectPublicNarratorPayload("scope", payload)).toBe(payload);
+	});
+});
+
 describe("shared projection and live identity", () => {
 	test("nested trees, tool results, catch-up activities and snapshots redact without mutating", async () => {
 		const f = await fixture();

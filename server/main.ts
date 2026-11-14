@@ -1341,6 +1341,11 @@ void startupReadiness.barrier.then(() => {
 	import("./services/outline/spec-import/triggers")
 		.then(({ startSpecImportJob }) => startSpecImportJob())
 		.catch((err) => logger.warn("Dynamic Spec import job failed to start", { error: String(err) }));
+	// What the old Spec panel may have swallowed is looked for in the background (read-only; a
+	// pass a while after start, then at intervals) and shown to people, never repaired.
+	import("./services/outline/spec-import/loss-scan")
+		.then(({ startSpecLossScanJob }) => startSpecLossScanJob())
+		.catch((err) => logger.warn("Swallowed-content scan failed to start", { error: String(err) }));
 	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
 	import("./services/outline/plugin-task-events")
 		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
@@ -1582,8 +1587,10 @@ async function performGracefulShutdown(
 				const inProcess = await import("./services/outline/in-process");
 				const digests = await import("./services/outline/digest-job");
 				const specImport = await import("./services/outline/spec-import/triggers");
+				const specLoss = await import("./services/outline/spec-import/loss-scan");
 				await Promise.all([
 					specImport.stopSpecImportJob(),
+					specLoss.stopSpecLossScanJob(),
 					inProcess.stopOutlineInProcessRebuild(),
 					tasks.stopOutlineTaskLeaseJob(),
 					digests.stopOutlineDigestJob(),

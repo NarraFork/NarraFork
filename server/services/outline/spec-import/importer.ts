@@ -97,6 +97,7 @@ import {
 	isImportSid,
 	type NormalizedTaskText,
 	OUTLINE_SPEC_IMPORT_ACTOR,
+	OUTLINE_SPEC_LOSS_ACTOR,
 	OUTLINE_SPEC_REVERT_ACTOR,
 	planSpecFile,
 	planSpecTasks,
@@ -1285,6 +1286,10 @@ const IMPORT_ACTORS: ReadonlySet<string> = new Set([
 	OUTLINE_BEHAVIOR_IMPORT_ACTOR,
 	// The markers a move back to Dynamic Spec left (12b2).
 	OUTLINE_SPEC_REVERT_ACTOR,
+	// Possibly lost content attached to an imported page (12c, `loss-attach.ts`): it is kept in
+	// its finding and attached anew to the page of the file's new revision, so a page it sits on
+	// is still the import's to take away.
+	OUTLINE_SPEC_LOSS_ACTOR,
 ]);
 
 interface StaleBlock {

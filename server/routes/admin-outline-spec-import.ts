@@ -6,14 +6,28 @@
  *   POST /:narratorId/reimport       attention and failed attempts cleared, imported now (202)
  *   POST /:narratorId/revert         moved back to Dynamic Spec (`spec-import/admin.ts`)
  *
+ * Content the old Spec panel may have swallowed (outline P2 PR 12c, `spec-import/loss-*.ts`):
+ *
+ *   GET  /loss                       one status's findings of every session, and the scan's state
+ *   GET  /loss/:findingId            one finding with the lost text
+ *   POST /loss/:findingId            a decision: attach to the imported page (`confirmRule` for
+ *                                    the behavior page), dismiss, reopen
+ *   POST /loss-scan                  start a scan pass in the background (202)
+ *
  * A session's owner keeps the Spec panel's "Import now" and its retry
  * (`POST /api/outline/narrators/:narratorId/spec-import`); a session moved back is imported again
  * by an administrator only.
  */
 import type { OutlineSpecImportStatus } from "@shared/outline-spec-import";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { formatZodError, ValidationError } from "../lib/errors";
-import { outlineIdSchema, outlineSpecImportAdminQuerySchema } from "../lib/validators/outline";
+import {
+	outlineIdSchema,
+	outlineSpecImportAdminQuerySchema,
+	outlineSpecLossActionSchema,
+	outlineSpecLossQuerySchema,
+} from "../lib/validators/outline";
 import { requireAdmin } from "../middleware/auth";
 import { isOutlineEnabled } from "../services/outline/feature";
 
@@ -39,6 +53,41 @@ outlineSpecImportAdminRoutes.get("/", async (c) => {
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
 	const { specImportAdminPage } = await import("../services/outline/spec-import/admin");
 	return c.json(await specImportAdminPage(parsed.data));
+});
+
+outlineSpecImportAdminRoutes.get("/loss", async (c) => {
+	const parsed = outlineSpecLossQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	const { specLossPage } = await import("../services/outline/spec-import/loss-findings");
+	return c.json(await specLossPage({ ...parsed.data, narratorId: null, canAct: true }));
+});
+
+outlineSpecImportAdminRoutes.get("/loss/:findingId", async (c) => {
+	const findingId = narratorIdOf(c.req.param("findingId"));
+	const { specLossDetail } = await import("../services/outline/spec-import/loss-findings");
+	return c.json(await specLossDetail(findingId, null));
+});
+
+outlineSpecImportAdminRoutes.post("/loss/:findingId", bodyLimit({ maxSize: 1024 }), async (c) => {
+	const findingId = narratorIdOf(c.req.param("findingId"));
+	const parsed = outlineSpecLossActionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	const { decideSpecLossFinding } = await import("../services/outline/spec-import/loss-findings");
+	return c.json(
+		await decideSpecLossFinding({
+			id: findingId,
+			narratorId: null,
+			action: parsed.data.action,
+			confirmRule: parsed.data.confirmRule,
+			userId: c.get("user").sub,
+		}),
+	);
+});
+
+// Only starts the pass: it runs in the background, one session at a time.
+outlineSpecImportAdminRoutes.post("/loss-scan", async (c) => {
+	const { requestSpecLossPass } = await import("../services/outline/spec-import/loss-scan");
+	return c.json(requestSpecLossPass(), 202);
 });
 
 outlineSpecImportAdminRoutes.post("/:narratorId/reimport", async (c) => {

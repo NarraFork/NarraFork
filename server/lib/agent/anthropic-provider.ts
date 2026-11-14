@@ -849,6 +849,8 @@ interface AnthropicUsageAccum {
 	cacheCreationInputTokens: number;
 	cacheCreation5mTokens: number;
 	cacheCreation1hTokens: number;
+	/** Any usage payload in this response carried a cache counter field (even 0). */
+	cacheReported: boolean;
 	/** Text lanes tracked alongside the per-response usage state. */
 	textBlocks?: Set<number>;
 }
@@ -861,6 +863,7 @@ function createAnthropicUsageAccum(): AnthropicUsageAccum {
 		cacheCreationInputTokens: 0,
 		cacheCreation5mTokens: 0,
 		cacheCreation1hTokens: 0,
+		cacheReported: false,
 	};
 }
 
@@ -880,6 +883,13 @@ function updateAnthropicUsageAccum(
 	partUsage: AnthropicUsagePayload | undefined,
 ): void {
 	if (!partUsage) return;
+	if (
+		partUsage.cache_read_input_tokens != null ||
+		partUsage.cache_creation_input_tokens != null ||
+		partUsage.cache_creation != null
+	) {
+		usage.cacheReported = true;
+	}
 	if (isPositiveTokenCount(partUsage.input_tokens)) usage.inputTokens = partUsage.input_tokens;
 	if (isPositiveTokenCount(partUsage.cache_read_input_tokens)) {
 		usage.cachedInputTokens = partUsage.cache_read_input_tokens;
@@ -922,6 +932,7 @@ function parsedUsageFromAnthropicAccum(
 			cacheCreationInputTokens: usage.cacheCreationInputTokens,
 			cacheCreation5mTokens: usage.cacheCreation5mTokens,
 			cacheCreation1hTokens: usage.cacheCreation1hTokens,
+			cacheReported: usage.cacheReported,
 			...(contextWindow != null && { contextWindow }),
 		},
 	};

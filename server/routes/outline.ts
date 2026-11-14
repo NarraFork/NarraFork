@@ -107,6 +107,8 @@ import {
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
+	outlineSpecLossActionSchema,
+	outlineSpecLossQuerySchema,
 	outlineTaskBoardQuerySchema,
 	outlineTreeQuerySchema,
 	outlineViewStatePutSchema,
@@ -153,7 +155,7 @@ import { commitSeqAt } from "../services/outline/read";
 import { readReportAuthors } from "../services/outline/report-authors";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
-import { OUTLINE_SEARCH_LIMITS, searchOutline } from "../services/outline/search";
+import { OUTLINE_SEARCH_LIMITS, searchOutlinePage } from "../services/outline/search";
 import {
 	listOutlineTreeSpaces,
 	readOutlineTree,
@@ -185,7 +187,7 @@ import {
 	OUTLINE_TRANSFER_LIMITS,
 	startSessionOnTransferredTask,
 } from "../services/outline/transfer";
-import { readViewState, writeViewState } from "../services/outline/view-state";
+import { normalizeFolding, readViewState, writeViewState } from "../services/outline/view-state";
 import {
 	describeLocks,
 	describeSpaces,
@@ -463,6 +465,19 @@ outlineRoutes.get("/spaces/:spaceId/blocks/:blockId", async (c) => {
 			bytes: query.bytes ?? OUTLINE_VIEW_LIMITS.maxBytes,
 		},
 		narratorVisible: narratorVisibility(principal),
+		// The connected outline's pages: the reader's own stored folding of the page, by its
+		// primary key (theirs alone; reading it needs no more than reading the page).
+		...(query.fold === "default"
+			? {
+					fold: async (pageId: string) => {
+						const stored = await outlineStore.getViewState(principal.userId, pageId);
+						return normalizeFolding({
+							collapsed: stored?.collapsed ?? [],
+							expanded: stored?.expanded ?? [],
+						});
+					},
+				}
+			: {}),
 	});
 	if (!view) throw new NotFoundError("Outline block", blockId);
 	const locked = view.blocks.flatMap((b) => (b.lock ? [b.lock] : []));
@@ -584,14 +599,15 @@ outlineRoutes.get("/search", async (c) => {
 	const spaceIds = query.spaceId
 		? [(await readableSpace(principal, query.spaceId)).id]
 		: await readableSpaceIds(principal);
-	const hits = await searchOutline({
+	const page = await searchOutlinePage({
 		query: query.q,
 		spaceIds,
 		contextSpaceId: query.spaceId ?? null,
 		limit: query.limit ?? OUTLINE_VIEW_LIMITS.defaultSearch,
+		offset: query.cursor ? decodeSearchCursor(query.cursor) : 0,
 	});
 	const body: OutlineSearchResponse = {
-		hits: hits.map((hit) => ({
+		hits: page.hits.map((hit) => ({
 			blockId: hit.blockId,
 			spaceId: hit.spaceId,
 			pageId: hit.pageId,
@@ -600,11 +616,28 @@ outlineRoutes.get("/search", async (c) => {
 			title: hit.title,
 			snippet: hit.snippet,
 			path: hit.path,
+			pathIds: hit.pathIds,
 			process: hit.process,
 		})),
+		nextCursor:
+			page.nextOffset === null
+				? null
+				: Buffer.from(String(page.nextOffset), "utf8").toString("base64url"),
+		// Spaces searched are spaces the person may read, so these are theirs to see named.
+		spaces: await describeSpaces(principal, page.spaces),
 	};
 	return c.json(body);
 });
+
+/** A search cursor: a position in the ranked list, within what one search ranks. */
+function decodeSearchCursor(cursor: string): number {
+	const text = Buffer.from(cursor, "base64url").toString("utf8");
+	const offset = /^\d{1,4}$/.test(text) ? Number(text) : Number.NaN;
+	if (!Number.isSafeInteger(offset) || offset > OUTLINE_SEARCH_LIMITS.candidates * 2) {
+		throw new ValidationError("Invalid cursor");
+	}
+	return offset;
+}
 
 /** A space named by key or by id, if the person may read it; null otherwise. */
 async function readableSpaceNamed(
@@ -1201,6 +1234,62 @@ outlineRoutes.post("/narrators/:narratorId/spec-import", async (c) => {
 	};
 	return c.json(body, 202);
 });
+
+/**
+ * Content a save from the old Spec panel may have swallowed in this session (outline P2 PR 12c):
+ * what the background scan recorded, a page of one status at a time, without the lost text.
+ * Read access; `canAct` says whether the reader may decide about a finding (write access).
+ */
+outlineRoutes.get("/narrators/:narratorId/spec-import/loss", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	const query = parse(outlineSpecLossQuerySchema, c.req.query());
+	const { specLossPage } = await import("../services/outline/spec-import/loss-findings");
+	return c.json(
+		await specLossPage({
+			...query,
+			narratorId: narrator.id,
+			canAct: await holds(principal, "write", { narrator }),
+		}),
+	);
+});
+
+/** One finding of the session with the lost text, as it stood before the save. Read access. */
+outlineRoutes.get("/narrators/:narratorId/spec-import/loss/:findingId", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	const { specLossDetail } = await import("../services/outline/spec-import/loss-findings");
+	return c.json(await specLossDetail(idParam(c, "findingId"), narrator.id));
+});
+
+/**
+ * A person's decision about one finding: `attach` puts the lost text on the file's imported page
+ * (one block at its top; nothing else is changed), `dismiss` says it was removed on purpose,
+ * `reopen` undoes a dismissal. Write access to the session. 409 when it was decided already,
+ * cannot be attached (the session is not imported, or the page is gone), an import is working on
+ * the session, or it is of the behavior fence and `confirmRule` is not set (the agent reads that
+ * page as its rules: the person is asked first).
+ */
+outlineRoutes.post(
+	"/narrators/:narratorId/spec-import/loss/:findingId",
+	bodyLimit({ maxSize: 1024 }),
+	async (c) => {
+		const principal = principalOf(c);
+		const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+		if (!(await holds(principal, "write", { narrator }))) throw new ForbiddenError();
+		const input = parse(outlineSpecLossActionSchema, await c.req.json().catch(() => ({})));
+		const { decideSpecLossFinding } = await import("../services/outline/spec-import/loss-findings");
+		return c.json(
+			await decideSpecLossFinding({
+				id: idParam(c, "findingId"),
+				narratorId: narrator.id,
+				action: input.action,
+				confirmRule: input.confirmRule,
+				userId: principal.userId,
+			}),
+		);
+	},
+);
 
 /**
  * The person saw tasks marked 「新完成」 on a board (outline P2 PR 9b): each is recorded at the

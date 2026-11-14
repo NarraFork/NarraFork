@@ -18,6 +18,8 @@
  *   需要补默认值或拒绝旧版本；
  * - 新增需要「清空」的数据需在 `clearData` 对应分支处理；
  * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话改了 task_backend 时删掉它的行，清空会话时一起清；
+ * - 被吞内容排查的两张表（`outline_spec_loss_findings` / `outline_spec_loss_scans`，12c）也不导出：
+ *   说的是本机 spec 修订的事（spec 表不导出），覆盖会话不动它们，清空会话时一起清；
  * - 改完跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
  * 详见 docs/DATA_PORTABILITY.md。
  */
@@ -1767,6 +1769,9 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				sqlite.run(`DELETE FROM folder_git_identity_bindings`);
 				// The Dynamic Spec import's state (outline P2 PR 12b2); the narrator FK cascades too.
 				sqlite.run(`DELETE FROM outline_spec_imports`);
+				// What the swallowed-content scan recorded about these sessions (outline P2 PR 12c).
+				sqlite.run(`DELETE FROM outline_spec_loss_findings`);
+				sqlite.run(`DELETE FROM outline_spec_loss_scans`);
 				sqlite.run(`DELETE FROM narrators`);
 				deleted.sessions = Number(before.n);
 			}

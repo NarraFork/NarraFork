@@ -505,6 +505,20 @@
 			"when": 1794473785466,
 			"tag": "0071_outline_spec_imports",
 			"breakpoints": true
+		},
+		{
+			"idx": 72,
+			"version": "7",
+			"when": 1794532902803,
+			"tag": "0072_api_request_cache_usage_reported",
+			"breakpoints": true
+		},
+		{
+			"idx": 73,
+			"version": "7",
+			"when": 1794560569388,
+			"tag": "0073_outline_spec_loss",
+			"breakpoints": true
 		}
   ]
 }
