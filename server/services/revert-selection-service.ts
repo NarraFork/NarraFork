@@ -38,7 +38,9 @@ import {
 	bodyLengthSql,
 	boundedBodyText,
 	hasBlockStorage,
+	hasBodyRevisions,
 	hasRowsOnlyBodies,
+	legacyBodyTextMatches,
 } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import type { WorkerHandle } from "../lib/worker-runtime/lifecycle";
@@ -543,12 +545,8 @@ export class RevertSelectionService {
 			if (legacyText === undefined) continue;
 			this.check(state);
 			state.queries++;
-			const unchanged = this.database.$client
-				.query<{ unchanged: number }, [string, string]>(
-					"SELECT 1 AS unchanged FROM narrator_messages WHERE id = ? AND content_json IS ? LIMIT 1",
-				)
-				.get(ref.id, legacyText);
-			if (!unchanged) throw fail("STALE", "Selected message body changed after verification");
+			if (!legacyBodyTextMatches(this.database.$client, ref.id, legacyText))
+				throw fail("STALE", "Selected message body changed after verification");
 		}
 		for (const { query, params, empty } of state.commitments.values())
 			if (!empty) this.rows(state, query, params);
@@ -1444,20 +1442,6 @@ const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearc
 /** Whether bodies are read from block rows (`narrator-bodies.ts`); the database is SQLite. */
 const bodiesFromBlocks = (db: Database) =>
 	hasBlockStorage(db) && (settings.narratorBlocks.read || hasRowsOnlyBodies(db));
-const bodyRevisionColumns = new WeakMap<Database, boolean>();
-function hasBodyRevisions(db: Database): boolean {
-	let supported = bodyRevisionColumns.get(db);
-	if (supported === undefined) {
-		supported =
-			db
-				.query<{ supported: number }, []>(
-					"SELECT EXISTS(SELECT 1 FROM pragma_table_info('narrator_messages') WHERE name='body_revision' LIMIT 1) AND EXISTS(SELECT 1 FROM pragma_table_info('narrator_messages') WHERE name='state_revision' LIMIT 1) AS supported LIMIT 1",
-				)
-				.get()?.supported === 1;
-		bodyRevisionColumns.set(db, supported);
-	}
-	return supported;
-}
 /** Refs with their message's sizes/revisions; a body is measured as readers read it. */
 const refSelect = (db: Database) => {
 	const body = bodyLengthSql("m", bodiesFromBlocks(db));

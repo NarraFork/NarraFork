@@ -738,8 +738,19 @@ test.each([
 		);
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.close());
 		const end = Date.now() + 5000;
-		while (editorFileSubscriptions.diagnostics.references || hostHelperDiagnostics().processes) {
-			if (Date.now() > end) throw new Error("Native subscription/helper cleanup did not settle");
+		// Browser abort/unmount does not join the source worker and remote close ACKs.
+		// Wait on live stream ownership before taking the final resource sample.
+		while (
+			editorFileSubscriptions.diagnostics.references ||
+			hostHelperDiagnostics().processes ||
+			service.diagnostics.streams.active ||
+			service.diagnostics.streams.queued ||
+			service.diagnostics.streams.streams
+		) {
+			if (Date.now() > end)
+				throw new Error(
+					`Native subscription/helper/stream cleanup did not settle: ${JSON.stringify(service.diagnostics.streams)}`,
+				);
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 		stopSampling = true;
