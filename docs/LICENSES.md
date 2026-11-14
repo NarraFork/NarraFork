@@ -22,7 +22,7 @@ Linux GCC 构建另保守披露运行库与启动代码；`gcc-runtime.txt` 由�
 
 独立 peer Release 必须附带 [remote-peer-LICENSES.txt](../licenses/extra/remote-peer-LICENSES.txt)，并在 manifest 中固定其 size/SHA-256。该文件覆盖全部 23 个锁定模块（含 Pion 间接依赖和 `golang.org/x/*`）、Go 1.26.1 的 LICENSE/PATENTS、标准库自身 vendored 模块、fiat-crypto 以及 `math` 中 Sun fdlibm/Cephes 的原始归属材料。Pion 的 `stun/internal/hmac`、`transport/utils/xor` 含 Go BSD-3-Clause 代码，不能只披露根目录 MIT。仅测试依赖、Pion test-wasm/示例/测试数据、Go 编译工具和未启用的 BoringSSL 不作为六平台 peer 二进制的分发内容。
 
-正文由 `remote-peer/internal/licensebundle` 从实际 Go 源目录和锁定 module cache 逐字复制；在 `remote-peer/` 执行 `go run ./internal/licensebundle` 可重现附件。每段记录模块、版本、上游、源文件与原文 SHA-256；只对字节完全相同的全文作显式映射去重，不合并不同版权人或年份。生成器与测试限制单附件严格小于 64KiB，超限必须先审阅有限拆分，不能放宽上限。
+正文由 `remote-peer/internal/licensebundle` 从实际 Go 源目录和锁定 module cache 逐字复制；在 `remote-peer/` 执行 `go run ./internal/licensebundle` 可重现附件。升级依赖后在 `remote-peer/` 执行 `make licenses`：重新生成附件，并把 `entries.json` 中已有 `(remote-peer)` 条目的版本号同步为 `go.mod` 锁定版本；新增或移除模块时脚本拒绝自动处理，需人工审阅许可后补登记（含 `licensebundle` 的 metadata 表）。Dependabot 的 remote-peer Go 升级 PR 由 `.github/workflows/remote-peer-dependabot-licenses.yml` 自动执行同一步骤并推回 PR 分支，随后手动派发 `ci.yml` 与 `remote-peer.yml`（`GITHUB_TOKEN` 的推送不会触发新的 PR 检查）；推送后 Dependabot 不再自动 rebase，需要时评论 `@dependabot recreate`。每段记录模块、版本、上游、源文件与原文 SHA-256；只对字节完全相同的全文作显式映射去重，不合并不同版权人或年份。生成器与测试限制单附件严格小于 64KiB，超限必须先审阅有限拆分，不能放宽上限。
 
 归属待核验点：Pion interceptor v0.1.49 的 `pkg/twcc/arrival_time_map.go` 标注 MIT，但注释说明改编自 Chrome/WebRTC；模块未附单独 WebRTC notice。该上游归属疑点已保留在条目和附件中，材料收集不等于法律合规认证。
 

@@ -417,6 +417,7 @@ function NarratorPanelBody({
 	const {
 		visibleWithDefault: allModels,
 		groupedModels,
+		modelOptionsFilter,
 		defaultModelValue,
 		summaryModelValue,
 		settingsData,
@@ -4066,6 +4067,7 @@ function NarratorPanelBody({
 				opened={globalModelEditTarget != null}
 				mode={globalModelEditTarget}
 				groupedModels={groupedModels}
+				modelOptionsFilter={modelOptionsFilter}
 				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
 				saving={updateSettingsMutation.isPending}
 				onClose={closeGlobalModelModal}

@@ -20,6 +20,7 @@ import {
 	useUpdateSubagentModelRestriction,
 } from "../../hooks/useNarrator";
 import type { NarratorCustomTraits } from "../../lib/api/narrators";
+import { createModelOptionsFilter } from "../../lib/model-search";
 import commonEn from "../../locales/en/common.json";
 import narratorEn from "../../locales/en/narrator.json";
 import settingsEn from "../../locales/en/settings.json";
@@ -210,6 +211,50 @@ async function typePurpose(value: string) {
 	});
 }
 
+function fieldByLabel(text: string): HTMLInputElement {
+	const label = [...container.querySelectorAll("label")].find(
+		(element) => element.textContent?.trim() === text,
+	);
+	const id = label?.getAttribute("for");
+	const field = [...container.querySelectorAll("input")].find((input) => !!id && input.id === id);
+	if (!field) throw new Error(`missing input labelled ${text}`);
+	return field as HTMLInputElement;
+}
+
+/**
+ * A searchable MultiSelect field renders `type="visible"`, which a browser
+ * reflects as "text" but linkedom returns raw, so React would not treat it as a
+ * text input. Reflect it as a browser does, then type through both of React's
+ * change pipelines.
+ */
+async function searchPool(label: string, text: string) {
+	const field = fieldByLabel(label);
+	// React reassigns `type` on every commit, so keep the native setter working.
+	const native = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(field), "type");
+	Object.defineProperty(field, "type", {
+		configurable: true,
+		get: () => "text",
+		set(value: string) {
+			native?.set?.call(field, value);
+		},
+	});
+	await act(async () => field.dispatchEvent(makeEvent("focusin", { bubbles: true })));
+	await click(field);
+	await act(async () => {
+		setNativeValue(field, text);
+		field.dispatchEvent(makeEvent("input", { bubbles: true }));
+		field.dispatchEvent(makeEvent("keyup", { bubbles: true }));
+	});
+}
+
+function poolOptions(label: string): string[] {
+	const listId = fieldByLabel(label).getAttribute("aria-controls");
+	const list = listId ? document.getElementById(listId) : null;
+	return [...(list?.querySelectorAll('[role="option"]') ?? [])].map(
+		(option) => option.textContent ?? "",
+	);
+}
+
 const stored: SubagentModelPools = {
 	explore: [{ model: "p:visible", purpose: "existing purpose" }],
 	plan: [],
@@ -370,6 +415,35 @@ describe("session pool editor: real Mantine interactions", () => {
 		await chooseEffort("default", narratorEn.reasoning_none);
 		await click(button(commonEn.save));
 		expect(saves[1]).toEqual({ general: [{ model: "default", reasoningEffort: "none" }] });
+	});
+
+	test("pool model search matches a provider's display name through the shared filter", async () => {
+		const explore = narratorEn["details.subagentType_explore"];
+		await render(
+			sessionEditor({
+				pools: {},
+				availableModels: [{ model: "edge:claude-opus-5" }, { model: "codex:gpt-6-astra" }],
+				modelOptionsFilter: createModelOptionsFilter({ providerLabels: { edge: "Example Cloud" } }),
+			}),
+		);
+		await searchPool(explore, "Example Cloud");
+		expect(poolOptions(explore)).toEqual(["edge:claude-opus-5"]);
+		await searchPool(explore, "codex");
+		expect(poolOptions(explore)).toEqual(["codex:gpt-6-astra"]);
+	});
+
+	test("without settings context the pool search still matches the prefix only", async () => {
+		const explore = narratorEn["details.subagentType_explore"];
+		await render(
+			sessionEditor({
+				pools: {},
+				availableModels: [{ model: "edge:claude-opus-5" }, { model: "codex:gpt-6-astra" }],
+			}),
+		);
+		await searchPool(explore, "Example Cloud");
+		expect(poolOptions(explore)).toEqual([]);
+		await searchPool(explore, "edge");
+		expect(poolOptions(explore)).toEqual(["edge:claude-opus-5"]);
 	});
 
 	test("failed or pending load cannot submit empty initial state; later data becomes editable", async () => {

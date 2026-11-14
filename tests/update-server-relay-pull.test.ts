@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertServerVerified, MirrorRelayStage } from "../scripts/lib/mirror-relay-stage";
 import { mirrorPublishedMainRelease } from "../scripts/lib/update-server-main-mirror";
-import { type MirrorSnapshotV1, mirrorAssetsForTarget } from "../shared/independent-update-mirror";
+import {
+	type MirrorSnapshot,
+	mirrorAssetsForTarget,
+	parseMirrorSnapshot,
+} from "../shared/independent-update-mirror";
 import {
 	createRelayReady,
 	RELAY_TTL_MS,
@@ -19,6 +23,7 @@ import {
 	EXECUTOR_PLATFORMS,
 	executorPublishedFilename,
 } from "../shared/remote-executor";
+import { UPDATE_INDEX_PLATFORMS } from "../shared/update-index-types";
 import { WebDavClient } from "../shared/webdav-transport";
 import { createApp } from "../update-server/app";
 import { initConfig } from "../update-server/lib/config";
@@ -121,16 +126,42 @@ type Context = Awaited<ReturnType<typeof setup>>;
 /** Stage exact canonical bytes without calling any update-server endpoint. */
 async function stage(
 	ctx: Context,
-	options: { jobId?: string; patch?: boolean; now?: number; signingKey?: string } = {},
+	options: {
+		jobId?: string;
+		patch?: boolean;
+		now?: number;
+		signingKey?: string;
+		full?: boolean;
+		binarySize?: number;
+		overBudget?: number;
+	} = {},
 ) {
 	const f = mirrorFixture(options.patch ?? true, true);
-	const snapshot: MirrorSnapshotV1 = {
-		schemaVersion: 1,
+	if (options.binarySize) f.index.releases[0].files[0].size = options.binarySize;
+	if (options.overBudget) {
+		const file = f.index.releases[0].files[0];
+		f.index.releases[0].files = Object.entries(UPDATE_INDEX_PLATFORMS)
+			.slice(0, options.overBudget)
+			.map(([platform, suffix]) => {
+				const name = `narrafork-${f.release.version}-${suffix}`;
+				return {
+					...file,
+					name,
+					platform,
+					size: 4 * 1024 ** 3,
+					metadata: { ...file.metadata, name: `${name}.metadata.json` },
+					patches: [],
+				};
+			});
+	}
+	const projectionVersion = options.full || options.binarySize || options.overBudget ? 2 : 1;
+	const snapshot: MirrorSnapshot = {
+		schemaVersion: projectionVersion,
 		repository,
 		index: f.index,
 		indexCommit: f.indexCommit,
 		targetVersion: f.release.version,
-		assets: mirrorAssetsForTarget(f.index, f.release.version),
+		assets: mirrorAssetsForTarget(f.index, f.release.version, projectionVersion),
 	};
 	const payload = Buffer.from(JSON.stringify(snapshot));
 	const now = options.now ?? ctx.clock.now;
@@ -151,7 +182,7 @@ async function stage(
 		.slice(0, -1)
 		.join("/");
 	await ctx.client.ensureCollection(objectDirectory, signal());
-	for (const asset of snapshot.assets) {
+	for (const asset of options.overBudget || options.binarySize ? [] : snapshot.assets) {
 		const bytes = asset.kind === "notes" ? Buffer.from(f.notesRaw) : f.raw.get(asset.name);
 		if (!bytes) throw new Error("Missing canonical test bytes");
 		await ctx.client.put(relayObjectPath(manifest, asset.sha256), bytes, asset, signal());
@@ -195,6 +226,85 @@ async function pollUntilSeen(ctx: Context, count = 1) {
 	}
 	return { committed, failed };
 }
+
+test("signed v2 relay streams full binaries, retains v1 availability and restart visibility", async () => {
+	const ctx = await setup();
+	try {
+		const staged = await stage(ctx, { full: true });
+		const binary = staged.snapshot.assets.find((a) => a.kind === "main-binary");
+		if (!binary) throw new Error("Expected full binary");
+		expect((await ctx.app.request(`${root}/assets/${binary.sha256}`)).status).toBe(404);
+		expect(await pollUntilSeen(ctx)).toEqual({ committed: 1, failed: 0 });
+		const restarted = createApp(ctx.storage, new MirrorIngestService(ctx.storage));
+		const response = await restarted.request(`${root}/assets/${binary.sha256}`);
+		expect(hash(new Uint8Array(await response.arrayBuffer()))).toBe(binary.sha256);
+		const availability = await (
+			await restarted.request(`${root}/availability/${binary.version}/${binary.platform}`)
+		).json();
+		expect(availability.assets.some((a: { name: string }) => a.name === binary.name)).toBe(false);
+	} finally {
+		await ctx.close();
+	}
+});
+
+test.each([
+	4, 5,
+])("signed v2 relay rejects %i × 4GiB plus metadata over 16GiB before fetching any asset or publishing", async (count) => {
+	const ctx = await setup();
+	try {
+		const staged = await stage(ctx, { overBudget: count });
+		expect(parseMirrorSnapshot(staged.snapshot, repository).assets).toEqual(staged.snapshot.assets);
+		expect(
+			staged.snapshot.assets.reduce((sum, a) => sum + a.size, staged.manifest.payload.size),
+		).toBeGreaterThan(16 * 1024 ** 3);
+		const start = ctx.dav.requests.length;
+		expect(await pollUntilSeen(ctx)).toEqual({ committed: 0, failed: 1 });
+		const objectGets = ctx.dav.requests
+			.slice(start)
+			.filter((r) => r.method === "GET" && r.path.includes("/objects/"));
+		expect(objectGets.map((r) => r.path)).toEqual([staged.payloadPath]);
+		expect((await ctx.app.request(`${root}/index`)).status).toBe(404);
+		expect(await ctx.storage.listFiles("mirror-objects")).toEqual([]);
+	} finally {
+		await ctx.close();
+	}
+});
+
+test("signed relay admits one 4GiB binary plus metadata but never commits a truncated stream", async () => {
+	let binaryPath = "";
+	const ctx = await setup((request) =>
+		request.method === "GET" && new URL(request.url).pathname === binaryPath
+			? new Response(new Uint8Array([1]), {
+					headers: { "content-length": String(4 * 1024 ** 3) },
+				})
+			: null,
+	);
+	const saving = spyOn(ctx.storage, "saveVerifiedFile");
+	try {
+		const staged = await stage(ctx, { full: true, patch: false, binarySize: 4 * 1024 ** 3 });
+		const binary = staged.snapshot.assets.find((a) => a.kind === "main-binary");
+		if (!binary) throw new Error("Expected main binary");
+		binaryPath = staged.assetPath(binary.sha256);
+		expect(
+			staged.snapshot.assets.reduce((sum, a) => sum + a.size, staged.manifest.payload.size),
+		).toBeGreaterThan(4 * 1024 ** 3);
+		const start = ctx.dav.requests.length;
+		expect(await pollUntilSeen(ctx)).toEqual({ committed: 0, failed: 1 });
+		expect(
+			ctx.dav.requests
+				.slice(start)
+				.filter((r) => r.method === "GET" && r.path.includes("/objects/"))
+				.map((r) => r.path),
+		).toEqual([staged.payloadPath, binaryPath]);
+		expect(saving.mock.calls).toHaveLength(1);
+		expect(saving.mock.calls[0][2].size).toBe(4 * 1024 ** 3);
+		expect((await ctx.app.request(`${root}/index`)).status).toBe(404);
+		expect(await ctx.storage.listFiles("mirror-objects")).toEqual([]);
+	} finally {
+		saving.mockRestore();
+		await ctx.close();
+	}
+});
 
 test("actual optional pull imports patch/metadata through WebDAV, server verifies and serves only committed bytes", async () => {
 	const ctx = await setup();
@@ -554,100 +664,101 @@ test("actual GitHub producer stages for pull without any update-server connectio
 	}
 });
 
-for (const mode of ["stop", "deadline", "storage-deadline"] as const) {
-	test(`actual pull ${mode} cancels a hanging patch stream without commit or temp-file leakage`, async () => {
-		let hangingPath = "";
-		let cancelled = false;
-		const entered = Promise.withResolvers<void>();
-		const reading = Promise.withResolvers<void>();
-		const ctx = await setup((request) => {
-			if (request.method !== "GET" || new URL(request.url).pathname !== hangingPath) return null;
-			return new Response(
-				new ReadableStream<Uint8Array>({
-					start(controller) {
-						controller.enqueue(new Uint8Array([1, 2, 3]));
-					},
-					pull() {
-						reading.resolve();
-					},
-					cancel() {
-						cancelled = true;
-					},
-				}),
-			);
-		});
-		let short: MirrorRelayPuller | undefined;
-		try {
-			const staged = await stage(ctx);
-			const patch = staged.snapshot.assets.find((a) => a.kind === "patch");
-			if (!patch) throw new Error("Expected patch");
-			hangingPath = staged.assetPath(patch.sha256);
-			const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
-			const jobDeadline = new AbortController();
-			const deadline = spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
-				// Trigger the job cancellation only after the hanging stream has arrived. A real 150ms
-				// timeout races CI scheduling and can expire before the fixture reaches its checkpoint.
-				if (ms === 25 * 60_000) return jobDeadline.signal;
-				return originalTimeout(ms);
-			});
-			const originalSave = ctx.storage.saveVerifiedFile.bind(ctx.storage);
-			const saving = spyOn(ctx.storage, "saveVerifiedFile").mockImplementation(
-				(path, stream, options) => {
-					const work = originalSave(path, stream, {
-						...options,
-						// Keep the native storage timer and TimeoutError semantics, but allow enough time for
-						// the fixture to observe the blocked read before expiry on a loaded CI runner.
-						timeoutMs: mode === "storage-deadline" ? 1_000 : options.timeoutMs,
-					});
-					if (options.sha256 === patch.sha256) entered.resolve();
-					return work;
-				},
-			);
-			try {
-				short = new MirrorRelayPuller(ctx.storage, ctx.ingest, ctx.settings, {
-					fetchImpl: ctx.dav.fetchImpl,
-					now: () => ctx.clock.now,
-				});
-				const work = short.pollOnce();
-				await entered.promise;
-				// Admission can complete asynchronously. Wait until writeStream is actually blocked in
-				// reader.read(), so cancellation exercises the hanging-body path rather than setup/admission.
-				await reading.promise;
-				const expired = () => new DOMException("The operation timed out.", "TimeoutError");
-				if (mode === "stop") await short.stop();
-				else if (mode === "deadline") jobDeadline.abort(expired());
-				const result = await work;
-				expect(result.committed).toBe(0);
-				if (mode !== "stop") expect(result.failed).toBe(1);
-				expect(deadline.mock.calls.some(([ms]) => ms === 25 * 60_000)).toBe(true);
-				expect(
-					saving.mock.calls.find((call) => call[2].sha256 === patch.sha256)?.[2].timeoutMs,
-				).toBe(15 * 60_000);
-				expect(cancelled).toBe(true);
-				expect((await ctx.app.request(`${root}/index`)).status).toBe(404);
-				expect(
-					(await ctx.storage.listFiles("mirror-objects")).some((path) => path.endsWith(".tmp")),
-				).toBe(false);
-				// Cancellation/deadline must release both shared ingest and storage admission locks.
-				const bytes = ctx.dav.objects.get(hangingPath);
-				if (!bytes) throw new Error("Expected canonical patch bytes");
-				await ctx.ingest.ingestAsset(
-					"narrafork",
-					patch,
-					new Blob([Uint8Array.from(bytes)]).stream(),
-					signal(),
-					"relay",
+for (const kind of ["patch", "main-binary"] as const)
+	for (const mode of ["stop", "deadline", "storage-deadline"] as const) {
+		test(`actual pull ${mode} cancels a hanging ${kind} stream without commit or temp-file leakage`, async () => {
+			let hangingPath = "";
+			let cancelled = false;
+			const entered = Promise.withResolvers<void>();
+			const reading = Promise.withResolvers<void>();
+			const ctx = await setup((request) => {
+				if (request.method !== "GET" || new URL(request.url).pathname !== hangingPath) return null;
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(new Uint8Array([1, 2, 3]));
+						},
+						pull() {
+							reading.resolve();
+						},
+						cancel() {
+							cancelled = true;
+						},
+					}),
 				);
+			});
+			let short: MirrorRelayPuller | undefined;
+			try {
+				const staged = await stage(ctx, { full: kind === "main-binary" });
+				const patch = staged.snapshot.assets.find((a) => a.kind === kind);
+				if (!patch) throw new Error(`Expected ${kind}`);
+				hangingPath = staged.assetPath(patch.sha256);
+				const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+				const jobDeadline = new AbortController();
+				const deadline = spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+					// Trigger the job cancellation only after the hanging stream has arrived. A real 150ms
+					// timeout races CI scheduling and can expire before the fixture reaches its checkpoint.
+					if (ms === 25 * 60_000) return jobDeadline.signal;
+					return originalTimeout(ms);
+				});
+				const originalSave = ctx.storage.saveVerifiedFile.bind(ctx.storage);
+				const saving = spyOn(ctx.storage, "saveVerifiedFile").mockImplementation(
+					(path, stream, options) => {
+						const work = originalSave(path, stream, {
+							...options,
+							// Keep the native storage timer and TimeoutError semantics, but allow enough time for
+							// the fixture to observe the blocked read before expiry on a loaded CI runner.
+							timeoutMs: mode === "storage-deadline" ? 1_000 : options.timeoutMs,
+						});
+						if (options.sha256 === patch.sha256) entered.resolve();
+						return work;
+					},
+				);
+				try {
+					short = new MirrorRelayPuller(ctx.storage, ctx.ingest, ctx.settings, {
+						fetchImpl: ctx.dav.fetchImpl,
+						now: () => ctx.clock.now,
+					});
+					const work = short.pollOnce();
+					await entered.promise;
+					// Admission can complete asynchronously. Wait until writeStream is actually blocked in
+					// reader.read(), so cancellation exercises the hanging-body path rather than setup/admission.
+					await reading.promise;
+					const expired = () => new DOMException("The operation timed out.", "TimeoutError");
+					if (mode === "stop") await short.stop();
+					else if (mode === "deadline") jobDeadline.abort(expired());
+					const result = await work;
+					expect(result.committed).toBe(0);
+					if (mode !== "stop") expect(result.failed).toBe(1);
+					expect(deadline.mock.calls.some(([ms]) => ms === 25 * 60_000)).toBe(true);
+					expect(
+						saving.mock.calls.find((call) => call[2].sha256 === patch.sha256)?.[2].timeoutMs,
+					).toBe(15 * 60_000);
+					expect(cancelled).toBe(true);
+					expect((await ctx.app.request(`${root}/index`)).status).toBe(404);
+					expect(
+						(await ctx.storage.listFiles("mirror-objects")).some((path) => path.endsWith(".tmp")),
+					).toBe(false);
+					// Cancellation/deadline must release both shared ingest and storage admission locks.
+					const bytes = ctx.dav.objects.get(hangingPath);
+					if (!bytes) throw new Error("Expected canonical patch bytes");
+					await ctx.ingest.ingestAsset(
+						"narrafork",
+						patch,
+						new Blob([Uint8Array.from(bytes)]).stream(),
+						signal(),
+						"relay",
+					);
+				} finally {
+					saving.mockRestore();
+					deadline.mockRestore();
+				}
 			} finally {
-				saving.mockRestore();
-				deadline.mockRestore();
+				await short?.stop();
+				await ctx.close();
 			}
-		} finally {
-			await short?.stop();
-			await ctx.close();
-		}
-	});
-}
+		});
+	}
 
 function executorPayload(commit: string) {
 	const version = "1.2.0";

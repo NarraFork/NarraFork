@@ -37,6 +37,7 @@ function allPlatformFixture() {
 	for (const [platform, suffix] of Object.entries(UPDATE_INDEX_PLATFORMS)) {
 		if (platform === first.platform) continue;
 		const name = `narrafork-${f.release.version}-${suffix}`;
+		descriptor(name, f.raw.get(first.name) as Buffer);
 		const metadata = descriptor(
 			`${name}.metadata.json`,
 			Buffer.from(
@@ -109,7 +110,7 @@ test("default main direct stays within an old server's two upload slots without 
 	expect(rejected).toBe(0);
 	expect(active).toBe(0);
 	expect(result.uploaded).toEqual(
-		mirrorAssetsForTarget(f.index, f.release.version).map((a) => a.name),
+		mirrorAssetsForTarget(f.index, f.release.version, 2).map((a) => a.name),
 	);
 });
 
@@ -127,7 +128,7 @@ for (const transport of ["direct", "webdav"] as const)
 			let canceled = 0;
 			let uploadNumber = 0;
 			const accepted: string[] = [];
-			const descriptors = mirrorAssetsForTarget(f.index, f.release.version);
+			const descriptors = mirrorAssetsForTarget(f.index, f.release.version, 2);
 			const names = new Map(descriptors.map((a) => [a.sha256, a.name]));
 			const download = f.downloadAsset;
 			f.downloadAsset = async (options) => {
@@ -160,7 +161,7 @@ for (const transport of ["direct", "webdav"] as const)
 					}
 					await pause(signal, fail && attempt > 2 ? 500 : 15);
 					const result = await action();
-					accepted.push(names.get(hash) as string);
+					accepted.push(...descriptors.filter((a) => a.sha256 === hash).map((a) => a.name));
 					return result;
 				} catch (error) {
 					if (signal?.aborted) canceled++;

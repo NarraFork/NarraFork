@@ -522,6 +522,37 @@ String.fromCharCode = (...units) => {
 });
 
 describe("mailbox closure and timeouts", () => {
+	for (const [slot, publish, consume] of [
+		[ABI.request, "publishRequest", "mailbox.takeRequest()"],
+		[ABI.response, "publishResponse", "mailbox.takeResponse(1)"],
+	] as const) {
+		test(`${publish} stays committed when its notification consumes the frame and closes`, () => {
+			const { context, mailbox } = inVm(`
+const nativeNotify = Atomics.notify;
+Atomics.notify = (header, index, count) => {
+  const notified = nativeNotify(header, index, count);
+  if (index === ${slot + 1} && Atomics.load(header, ${slot}) === 2) {
+    globalThis.consumed = ${consume};
+    mailbox.close(73);
+  }
+  return notified;
+};`);
+			mailbox[publish](1, "sent");
+			expect(runInContext("consumed", context)).toEqual(
+				slot === ABI.request ? { sequence: 1, text: "sent" } : "sent",
+			);
+			expect(mailbox.isClosed()).toBe(true);
+			expect(Atomics.load(header(mailbox), slot)).toBe(0);
+			expect(throwsCode(() => mailbox[publish](2, "late"), "MAILBOX_CLOSED").reason).toBe(73);
+		});
+		test(`${publish} rejects a mailbox closed before publication without writing a frame`, () => {
+			const mailbox = createMailbox(SMALL);
+			mailbox.close(74);
+			const before = Array.from(header(mailbox));
+			expect(throwsCode(() => mailbox[publish](1, "late"), "MAILBOX_CLOSED").reason).toBe(74);
+			expect(Array.from(header(mailbox))).toEqual(before);
+		});
+	}
 	test("keeps the first positive close reason separate from occupied data slots", () => {
 		const mailbox = createMailbox(SMALL);
 		const peer = createMailbox(SMALL, mailbox.buffers);

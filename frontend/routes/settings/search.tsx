@@ -126,7 +126,7 @@ function SettingsSearchPage() {
 	const { i18n } = useTranslation();
 	const { data: user } = useCurrentUser();
 	const qc = useQueryClient();
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 	const [state, setState] = useState<SearchSettingsState | null>(null);
 	const [saved, setSaved] = useState<SearchSettingsState | null>(null);
 	const [testQuery, setTestQuery] = useState("latest AI news");
@@ -477,6 +477,7 @@ function SettingsSearchPage() {
 											searchable
 											clearable
 											data={groupedModels}
+											filter={modelOptionsFilter}
 											value={channel.model ?? null}
 											onChange={(value) => updateChannel(channel.id, { model: value ?? undefined })}
 										/>

@@ -6,6 +6,7 @@ import {
 	type HelperDistributionDependencies,
 	parseHelperDistributionDependencies,
 } from "../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
 import {
 	parseRemoteFrontendCapability,
@@ -14,6 +15,7 @@ import {
 import { EXECUTOR_VERSION_RE } from "../../shared/remote-executor-manifest";
 import { parseRecoveryManifestVersions } from "../../shared/update-identity";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
+import { CI_PLATFORM_ARTIFACT_LIMIT } from "./ci-release-io";
 import {
 	CI_RELEASE_BUN,
 	CI_RELEASE_REPOSITORY,
@@ -72,7 +74,7 @@ const artifactIdentitySchema = z
 	.object({
 		id,
 		digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-		size: id.max(2 * 1024 ** 3),
+		size: id.max(CI_PLATFORM_ARTIFACT_LIMIT),
 	})
 	.strict();
 const buildSourceSchema = z
@@ -150,7 +152,7 @@ const planSchema = z
 								commit: z.string().regex(/^[a-f0-9]{7,40}$/),
 								repository: z.string().refine(isValidGitHubRepository).optional(),
 								buildDate: z.string().datetime(),
-								size: id.max(1024 ** 3),
+								size: id.max(MAX_RELEASE_BINARY_BYTES),
 								sha256: z.string().regex(/^[a-f0-9]{64}$/),
 								sha512: z.string().regex(/^[A-Za-z0-9+/]{86}==$/),
 								recoveryManifestVersions: z
