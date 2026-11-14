@@ -203,7 +203,9 @@ const CONTRAST_PAIRS: ReadonlyArray<{
 	{ label: "dark danger indicator", fg: "--nf-danger-graphic-dark", bg: "--nf-ink-900", min: 3 },
 	{ label: "light body text", fg: "--nf-paper-900", bg: "--nf-paper-0", min: 4.5 },
 	{ label: "light muted text", fg: "--nf-paper-600", bg: "--nf-paper-0", min: 4.5 },
-	{ label: "light control border", fg: "--nf-paper-500", bg: "--nf-paper-0", min: 3 },
+	// Token-level only: Mantine's *rendered* light-scheme borders still come from its
+	// gray-4 ramp (1.51:1) until the components-level pass; see the plan's known gaps.
+	{ label: "light line-strong token", fg: "--nf-paper-500", bg: "--nf-paper-0", min: 3 },
 	{
 		label: "light primary fill vs white label",
 		fg: "--nf-on-solid",
