@@ -110,7 +110,9 @@ const runningBashProcesses = hotSafe(
  * Called during graceful shutdown to prevent ghost processes holding ports
  * (especially on Windows where child processes can outlive the parent).
  */
-export async function killAllBashProcesses(): Promise<void> {
+export async function killAllBashProcesses(
+	options: { preserveAgents?: boolean } = {},
+): Promise<void> {
 	// Kill foreground bash processes
 	const entries = [...runningBashProcesses.entries()];
 	for (const [id, entry] of entries) {
@@ -123,8 +125,8 @@ export async function killAllBashProcesses(): Promise<void> {
 		}
 		runningBashProcesses.delete(id);
 	}
-	// Kill background bash tasks via the service
-	await backgroundTaskService.killAll();
+	// A signal restart still owns its Agent runs; only shell processes need termination.
+	await backgroundTaskService.killAll(options);
 }
 
 /**

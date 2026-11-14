@@ -987,6 +987,16 @@ export async function waitUntilUpdateGateOpens(signal?: AbortSignal): Promise<vo
 	});
 }
 
+/** Park teardown failures, but let explicit cancellation/deadlines reach the normal finalizer. */
+export async function waitForRestartBeforeFailure(signal: AbortSignal): Promise<void> {
+	if (state.phase !== "restarting" || signal.aborted) return;
+	try {
+		await waitUntilUpdateGateOpens(signal);
+	} catch (error) {
+		if (!signal.aborted) throw error;
+	}
+}
+
 export function markUpdateRestarting(): UpdateCoordinationStatus {
 	if (state.phase === "idle" || state.phase === "restarting") return resolveStatus();
 	state.phase = "restarting";

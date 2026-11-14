@@ -135,6 +135,7 @@ import {
 	restoreOrdinaryRestartRecovery,
 } from "./services/restart-recovery-service";
 import { terminalService } from "./services/terminal-service";
+import { markUpdateRestarting } from "./services/update-coordinator";
 import {
 	getPlannedUpdateStartupProtection,
 	restoreNarratorsAfterPlannedUpdate,
@@ -1518,8 +1519,19 @@ async function performGracefulShutdown(
 		httpLifecycle.stopAccepting();
 		await shutdownStep(tracker, "remoteAccess.stop", stopRemoteAccess, 5000);
 		httpLifecycle.abortAll();
+		let preserveAgentRuns = false;
 		if (options.reason === "signal") {
-			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
+			const prepared = await shutdownStep(
+				tracker,
+				"restartRecovery.prepare",
+				prepareSignalRestartRecovery,
+				5_000,
+			);
+			if (prepared === "ok") {
+				preserveAgentRuns = true;
+				// Worker teardown must not turn checkpointed runs into task failures.
+				markUpdateRestarting();
+			}
 		}
 		const shutdownRequestId = httpRequestContext.getStore();
 		// Outline pages being edited live: log what arrived and acknowledge it while the sockets
@@ -1625,7 +1637,9 @@ async function performGracefulShutdown(
 		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
 		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
-			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
+			await shutdownStep(tracker, "killAllBashProcesses", () =>
+				killAllBashProcesses({ preserveAgents: preserveAgentRuns }),
+			);
 		}
 		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
 		await shutdownStep(tracker, "pluginPlatformProducers.stop", () =>

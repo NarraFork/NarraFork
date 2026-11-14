@@ -5,8 +5,10 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Worker } from "node:worker_threads";
+import { renderContextUpdate } from "@shared/prefix-context";
 import * as connector from "../lib/compiled-worker";
 import { WorkerCleanupError } from "../lib/worker-runtime/lifecycle";
+import { freezePrefixValue } from "./narrator-prefix-snapshot-values";
 import {
 	closePrefixSnapshotStore,
 	createPrefixSnapshotStore,
@@ -84,6 +86,57 @@ test("the actor bounds queued items and cancellation removes only its waiter", a
 	).toBe(true);
 	expect(dispatches).toBe(1);
 	expect(connection).toHaveBeenCalledTimes(1);
+});
+
+test("16 independent adopted context snapshots queue by measured bytes behind an active task", async () => {
+	const { store } = await fixture();
+	const gate = Promise.withResolvers<void>();
+	let dispatches = 0;
+	const connection = spyConnection(async (...args) => {
+		const connected = await connect(...args);
+		const post = connected.worker.postMessage.bind(connected.worker);
+		spyOn(connected.worker, "postMessage").mockImplementation((request) => {
+			if (++dispatches === 1) void gate.promise.then(() => post(request));
+			else post(request);
+		});
+		return connected;
+	});
+	const active = store.putPrefixText("active");
+	try {
+		await until(() => dispatches === 1);
+		const snapshots = Array.from({ length: 16 }, (_, index) => {
+			const changes = [{ key: "workspace", value: `/repo/${index}` }];
+			return { changes, modelText: renderContextUpdate(changes) };
+		});
+		await Promise.all(snapshots.map((snapshot) => freezePrefixValue(snapshot)));
+		const cancelled = new AbortController();
+		const waiting = store
+			.putPrefixJson(snapshots[0], cancelled.signal)
+			.catch((error: unknown) => error);
+		const writes = snapshots.map((snapshot) =>
+			store.putPrefixJson(snapshot).catch((error: unknown) => error),
+		);
+		const oversized = {
+			changes: [{ key: "workspace", value: "x".repeat(12 * 1024 * 1024) }],
+			modelText: "oversized",
+		};
+		await freezePrefixValue(oversized);
+		await expect(store.putPrefixJson(oversized)).rejects.toHaveProperty("code", "TASK_QUEUE_FULL");
+		const reason = new Error("cancel only this context snapshot waiter");
+		cancelled.abort(reason);
+		expect(await waiting).toBe(reason);
+		expect(dispatches).toBe(1);
+		gate.resolve();
+		expect(await active).toBe(hashOf("active"));
+		const hashes = snapshots.map((snapshot) => hashOf(JSON.stringify(snapshot)));
+		expect(await Promise.all(writes)).toEqual(hashes);
+		expect(dispatches).toBe(17);
+		for (let index = 0; index < hashes.length; index++)
+			expect(await store.getPrefixJson(hashes[index])).toEqual(snapshots[index]);
+		expect(connection).toHaveBeenCalledTimes(1);
+	} finally {
+		gate.resolve();
+	}
 });
 
 test("unknown JSON reserves the byte budget without serialization or body traversal", async () => {
@@ -420,46 +473,49 @@ test("old IDs and duplicate ready cannot complete an RPC; malformed matching res
 	expect(await third).toBe(hashOf("third"));
 });
 
-test("create, unready, runtime failure, timeout and closed paths never calculate JSON inline", async () => {
-	const { store, root, db } = await fixture({ timeoutMs: 500 });
-	const value = { secret: "only the worker may serialize this" };
-	const stringify = JSON.stringify;
-	let inline = 0;
-	const json = spyOn(JSON, "stringify").mockImplementation(((
-		input: unknown,
-		...rest: unknown[]
-	) => {
-		if (input === value) inline++;
-		return Reflect.apply(stringify, JSON, [input, ...rest]);
-	}) as typeof JSON.stringify);
-	cleanups.push(() => json.mockRestore());
-	let mode: "create" | "unready" | "runtime" | "timeout" = "create";
-	const unready = join(root, "unready.ts");
-	await writeFile(
-		unready,
-		'import { parentPort } from "node:worker_threads"; parentPort?.on("message", () => {});',
-	);
-	const connection = spyConnection(async (...args) => {
-		if (mode === "create") throw new Error("injected create failure");
-		if (mode === "unready")
-			return connect([unready], { ...args[1], timeoutMs: 30, deadlineAt: Date.now() + 30 });
-		const connected = await connect(...args);
-		spyOn(connected.worker, "postMessage").mockImplementation(() => {
-			if (mode === "runtime") void connected.worker.terminate();
+for (const adopted of [false, true]) {
+	test(`${adopted ? "adopted" : "unknown"} JSON never calculates inline on create, unready, runtime, timeout or close failure`, async () => {
+		const { store, root, db } = await fixture({ timeoutMs: 500 });
+		const value = { secret: "only the worker may serialize this" };
+		if (adopted) await freezePrefixValue(value);
+		const stringify = JSON.stringify;
+		let inline = 0;
+		const json = spyOn(JSON, "stringify").mockImplementation(((
+			input: unknown,
+			...rest: unknown[]
+		) => {
+			if (input === value) inline++;
+			return Reflect.apply(stringify, JSON, [input, ...rest]);
+		}) as typeof JSON.stringify);
+		cleanups.push(() => json.mockRestore());
+		let mode: "create" | "unready" | "runtime" | "timeout" = "create";
+		const unready = join(root, "unready.ts");
+		await writeFile(
+			unready,
+			'import { parentPort } from "node:worker_threads"; parentPort?.on("message", () => {});',
+		);
+		const connection = spyConnection(async (...args) => {
+			if (mode === "create") throw new Error("injected create failure");
+			if (mode === "unready")
+				return connect([unready], { ...args[1], timeoutMs: 30, deadlineAt: Date.now() + 30 });
+			const connected = await connect(...args);
+			spyOn(connected.worker, "postMessage").mockImplementation(() => {
+				if (mode === "runtime") void connected.worker.terminate();
+			});
+			return connected;
 		});
-		return connected;
+		for (const failure of ["create", "unready", "runtime", "timeout"] as const) {
+			mode = failure;
+			const result = await store.putPrefixJson(value).catch((error: unknown) => error);
+			expect(result).toBeInstanceOf(Error);
+		}
+		await store.close();
+		await expect(store.putPrefixJson(value)).rejects.toThrow("closed");
+		expect(connection).toHaveBeenCalledTimes(4);
+		expect(inline).toBe(0);
+		expect(db.query("SELECT count(*) AS n FROM narrator_text_snapshots").get()).toEqual({ n: 0 });
 	});
-	for (const failure of ["create", "unready", "runtime", "timeout"] as const) {
-		mode = failure;
-		const result = await store.putPrefixJson(value).catch((error: unknown) => error);
-		expect(result).toBeInstanceOf(Error);
-	}
-	await store.close();
-	await expect(store.putPrefixJson(value)).rejects.toThrow("closed");
-	expect(connection).toHaveBeenCalledTimes(4);
-	expect(inline).toBe(0);
-	expect(db.query("SELECT count(*) AS n FROM narrator_text_snapshots").get()).toEqual({ n: 0 });
-});
+}
 
 test("startup time consumes the first operation budget and close during startup cannot open a replacement", async () => {
 	const { store } = await fixture({ timeoutMs: 150 });

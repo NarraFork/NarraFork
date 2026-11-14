@@ -38,6 +38,7 @@ import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { baselineContextDisplays, refineContextDisplay } from "./context-display-refiners";
 import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
+import { freezePrefixValue } from "./narrator-prefix-snapshot-values";
 import {
 	getPrefixToolDefinitions,
 	putPrefixJson,
@@ -498,7 +499,9 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 	const changes = contextChanges(reduced.parts, parts);
 	if (changes.length) {
 		const modelText = renderContextUpdate(changes);
-		const snapshotRef = await putPrefixJson({ changes, modelText }, signal);
+		const snapshot = { changes, modelText };
+		await freezePrefixValue(snapshot, () => signal?.throwIfAborted());
+		const snapshotRef = await putPrefixJson(snapshot, signal);
 		// The reader's summaries: each changed part's own, refined against the row this session was
 		// last shown (the current-tasks view then names what was finished or started in between).
 		// Rendered after, and never read by, the model's text above.

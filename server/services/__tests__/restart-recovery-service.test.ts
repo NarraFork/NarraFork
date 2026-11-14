@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import { eq } from "drizzle-orm";
 import { testEnvironment } from "../../../tests/preload";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorMessageRefs,
@@ -19,11 +19,10 @@ import {
 	resetRecoveryHandoffForTests,
 } from "../recovery-handoff";
 
-// Keep all recovery classification, conditional result writes, and continuation claims real.
+// Use preload's isolated file DB and real manifests across simulated cold starts.
 // Only the boundaries that would launch a tool/model are replaced below.
-const { db, sqlite } = getTestDb();
-const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 // Initialize the service first to avoid its persistence facade's circular import.
 await import("../narrator-service");
 const recovery = await import("../restart-recovery-service");
@@ -37,7 +36,13 @@ const backgroundStartOutput =
 const originalArgs = [...process.argv];
 type RecoveredRun = NonNullable<Parameters<typeof session.continueNarrator>[4]>;
 /** Every recovery start goes through the one entry: the session and its run options. */
-const runs: Array<{ narratorId: string; run?: RecoveredRun }> = [];
+const runs: Array<{
+	narratorId: string;
+	locale?: string;
+	replyInUserLanguage?: boolean;
+	userId?: string | null;
+	run?: RecoveredRun;
+}> = [];
 /** Recovery that did not re-enter the session's own persisted run. */
 const freshRuns: string[] = [];
 const started = () => runs.map((entry) => entry.narratorId);
@@ -79,6 +84,21 @@ async function seedNarrator(id: string, values: Partial<typeof narrators.$inferI
 		updatedAt: now,
 		...values,
 	});
+}
+
+async function seedPrimary(id: string, values: Partial<typeof narrators.$inferInsert> = {}) {
+	await seedNarrator(id, {
+		type: "primary",
+		variant: "primary",
+		runtimeRegistrationJson: null,
+		...values,
+	});
+}
+
+function coldReset() {
+	recovery.resetRestartRecoveryForTests();
+	resetRecoveryHandoffForTests();
+	coordinator.resetUpdateCoordinationForTests();
 }
 
 async function seedTool(
@@ -164,6 +184,7 @@ async function tool(id: string) {
 }
 
 beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	recovery.resetRestartRecoveryForTests();
 	resetRecoveryHandoffForTests();
@@ -175,31 +196,33 @@ beforeEach(async () => {
 	await unlink(getNarraforkPath("restart-recovery.json")).catch((error: NodeJS.ErrnoException) => {
 		if (error.code !== "ENOENT") throw error;
 	});
-	spyOn(session, "continueNarrator").mockImplementation(async (narratorId, _l, _r, _u, run) => {
-		runs.push({ narratorId, run });
-		// Recovery always continues the persisted run (same id, same deadline), never a new one.
-		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
-		if (!run?.recovered || (row?.logicalRunId && run.resumeRunId !== row.logicalRunId))
-			freshRuns.push(narratorId);
-		// Simulate the run boundary: a run that delivers and has no running task row
-		// rewrites its registered destination tool call once; a task row receives it otherwise.
-		const deliverTo = await session.readSessionDeliverTo(narratorId);
-		const task = await db.query.backgroundTasks.findFirst({
-			where: eq(backgroundTasks.subagentNarratorId, narratorId),
-		});
-		if (deliverTo?.toolCallId && run?.deliver !== false && task?.status !== "running") {
-			const origin = await tool(deliverTo.toolCallId);
-			if (origin) {
-				await narratorPersistence.updateToolCallResultIfActive(
-					origin.toolUseId,
-					{ status: "success", output: "Recovered child result", completedAt: Date.now() },
-					origin.messageId,
-					origin.id,
-				);
+	spyOn(session, "continueNarrator").mockImplementation(
+		async (narratorId, locale, replyInUserLanguage, userId, run) => {
+			runs.push({ narratorId, locale, replyInUserLanguage, userId, run });
+			// Recovery always continues the persisted run (same id, same deadline), never a new one.
+			const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+			if (!run?.recovered || (row?.logicalRunId && run.resumeRunId !== row.logicalRunId))
+				freshRuns.push(narratorId);
+			// Simulate the run boundary: a run that delivers and has no running task row
+			// rewrites its registered destination tool call once; a task row receives it otherwise.
+			const deliverTo = await session.readSessionDeliverTo(narratorId);
+			const task = await db.query.backgroundTasks.findFirst({
+				where: eq(backgroundTasks.subagentNarratorId, narratorId),
+			});
+			if (deliverTo?.toolCallId && run?.deliver !== false && task?.status !== "running") {
+				const origin = await tool(deliverTo.toolCallId);
+				if (origin) {
+					await narratorPersistence.updateToolCallResultIfActive(
+						origin.toolUseId,
+						{ status: "success", output: "Recovered child result", completedAt: Date.now() },
+						origin.messageId,
+						origin.id,
+					);
+				}
 			}
-		}
-		return { ok: true, terminal: Promise.resolve("Recovered child result") };
-	});
+			return { ok: true, terminal: Promise.resolve("Recovered child result") };
+		},
+	);
 	spyOn(session, "executePersistedToolCall").mockImplementation(async () => {
 		executedTools++;
 		throw new Error("Unexpected tool execution in restart recovery test");
@@ -217,8 +240,8 @@ afterEach(() => {
 	mock.restore();
 });
 
-afterAll(() => {
-	mock.module("../../db", () => realDbModule);
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	sqlite.close();
 });
@@ -227,6 +250,7 @@ describe("ordinary restart eligibility and tool disposition", () => {
 	test("preload isolates all manifests from the user's data", () => {
 		expect(process.env.NARRAFORK_HOME).toBe(testEnvironment.narraforkHome);
 		expect(process.env.NARRAFORK_HOME).not.toBe(testEnvironment.realNarraforkHome);
+		expect(sqlite.filename).toBe(getNarraforkPath("narrafork.db"));
 	});
 
 	test("automatic resume is enabled unless the exact opt-out flag is present", () => {
@@ -960,7 +984,13 @@ describe("ordinary restart with real persisted recovery records", () => {
 			.update(narratorToolCalls)
 			.set({ status: "success", outputJson: "Historical result" })
 			.where(eq(narratorToolCalls.id, "agent-call"));
-		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		let prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(
+			prepared.manifest?.snapshot.narrators.some((target) => target.narratorId === "parent"),
+		).toBe(false);
+		coldReset();
+		prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(prepared.protection.narratorIds.has("parent")).toBe(false);
 		expect(await toolContinuationService.getByToolCallId("agent-call")).toBeNull();
 		await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
 		expect(started()).toEqual(["child"]);
@@ -1198,6 +1228,266 @@ describe("ordinary restart with real persisted recovery records", () => {
 		const cold = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(cold.manifest).toBeNull();
 		expect(runs).toEqual([]);
+		expect(executedTools).toBe(0);
+	});
+
+	test("a mounted manual prepared recovery survives a later signal with its original primary run", async () => {
+		await seedPrimary("primary");
+		const options = { userId: "prepared-user", replyInUserLanguage: true };
+		coordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			capturedAt: now,
+			updateEpoch: "manual-prepared-then-signal",
+			resumeOnNextStartup: true,
+			narrators: [{ narratorId: "primary", locale: "zh-CN", ...options }],
+		});
+		// Replace only the model-launch boundary; authorization, source claims and manifests are real.
+		spyOn(session, "continueNarratorAfterPlannedUpdate").mockImplementation(
+			async (id, _token, locale, replyInUserLanguage, userId, run) =>
+				session.continueNarrator(id, locale, replyInUserLanguage, userId, run),
+		);
+		const planned = await import("../update-recovery-service");
+		const first = await planned.getPlannedUpdateStartupProtection();
+		await (await planned.restoreNarratorsAfterPlannedUpdate(first))?.completion;
+		expect(started()).toEqual(["primary"]);
+		expect(coordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+
+		// The mounted run is still working when the operator stops this process again.
+		coordinator.registerNarratorLoop("primary", "zh-CN", options);
+		await recovery.prepareSignalRestartRecovery();
+		coordinator.markUpdateRestarting();
+		coldReset();
+		const second = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		await (await recovery.restoreOrdinaryRestartRecovery(second))?.completion;
+		expect(started()).toEqual(["primary", "primary"]);
+		for (const entry of runs) {
+			expect(entry).toMatchObject({
+				locale: "zh-CN",
+				...options,
+				run: { resumeRunId: "run-primary", recovered: true },
+			});
+		}
+		expect(executedTools).toBe(0);
+		expect(await Bun.file(getNarraforkPath("restart-recovery.json")).exists()).toBe(false);
+	});
+	test("recorded independent primary and Agent cold-resume together, keeping the primary run across another shutdown", async () => {
+		await seedAgent();
+		await seedPrimary("primary");
+		await seedPrimary("unlisted");
+		await seedTool("primary-saved", "primary", { status: "success", outputJson: "Saved result" });
+		await seedTool("primary-started", "primary", { executionStartedAt: now });
+		const replyOptions = { userId: "primary-user", replyInUserLanguage: true };
+		coordinator.registerNarratorLoop("primary", "zh-CN", replyOptions);
+		coordinator.registerNarratorLoop("parent", "en");
+		coordinator.registerNarratorLoop("child", "en");
+		await recovery.prepareSignalRestartRecovery();
+
+		coldReset();
+		const first = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(first.protection.narratorIds.has("primary")).toBe(true);
+		expect(first.protection.narratorIds.has("unlisted")).toBe(false);
+		Reflect.deleteProperty(globalThis, Symbol.for("narrafork.narrator.initialized"));
+		try {
+			await session.recoverOnStartup(first.protection, { heldRunIds: first.heldRunIds });
+		} finally {
+			Reflect.deleteProperty(globalThis, Symbol.for("narrafork.narrator.initialized"));
+		}
+		await (await recovery.restoreOrdinaryRestartRecovery(first))?.completion;
+		expect(started().sort()).toEqual(["child", "parent", "primary"]);
+		expect(runs.find((entry) => entry.narratorId === "primary")).toMatchObject({
+			locale: "zh-CN",
+			...replyOptions,
+			run: { resumeRunId: "run-primary", recovered: true, deliver: false },
+		});
+		expect((await tool("primary-saved"))?.outputJson).toBe("Saved result");
+		expect(await tool("primary-started")).toMatchObject({
+			status: "fail",
+			outputJson: recovery.RESTART_EXECUTION_UNKNOWN,
+		});
+		expect((await tool("agent-call"))?.outputJson).toBe("Recovered child result");
+		expect(await Bun.file(getNarraforkPath("restart-recovery.json")).exists()).toBe(false);
+
+		// Model launch is mocked: register its still-live primary loop for the next real signal capture.
+		for (const id of ["parent", "child"]) {
+			await db
+				.update(narrators)
+				.set({ status: "idle", substatus: "[]" })
+				.where(eq(narrators.id, id));
+		}
+		coordinator.registerNarratorLoop("primary", "zh-CN", replyOptions);
+		await recovery.prepareSignalRestartRecovery();
+		coldReset();
+		const second = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(second.manifest?.targets).toEqual([
+			{ narratorId: "primary", logicalRunId: "run-primary" },
+		]);
+		await (await recovery.restoreOrdinaryRestartRecovery(second))?.completion;
+		const primaryRuns = runs.filter((entry) => entry.narratorId === "primary");
+		expect(primaryRuns).toHaveLength(2);
+		for (const entry of primaryRuns) {
+			expect(entry).toMatchObject({
+				locale: "zh-CN",
+				...replyOptions,
+				run: { resumeRunId: "run-primary", recovered: true, deliver: false },
+			});
+		}
+		expect((await tool("primary-saved"))?.outputJson).toBe("Saved result");
+		expect((await tool("agent-call"))?.outputJson).toBe("Recovered child result");
+		expect(executedTools).toBe(0);
+	});
+
+	for (const invalidateBeforeClassification of [true, false]) {
+		test(`recorded primary invalidated ${invalidateBeforeClassification ? "before classification" : "before mounting"} is not revived`, async () => {
+			const invalid = [
+				"done",
+				"cancelled",
+				"archived",
+				"taken_over",
+				"manual_override",
+				"error",
+				"new-run",
+			];
+			for (const id of ["eligible", ...invalid, "missing-run", "unlisted"]) {
+				await seedPrimary(id, id === "missing-run" ? { logicalRunId: null } : {});
+				if (id !== "unlisted") coordinator.registerNarratorLoop(id, "zh-CN");
+			}
+			await recovery.prepareSignalRestartRecovery();
+			coldReset();
+			const invalidate = async () => {
+				await db
+					.update(narrators)
+					.set({ status: "idle", substatus: "[]" })
+					.where(eq(narrators.id, "done"));
+				await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "archived"));
+				await db
+					.update(narrators)
+					.set({ logicalRunId: "replacement-run" })
+					.where(eq(narrators.id, "new-run"));
+				for (const tag of ["cancelled", "taken_over", "manual_override", "error"]) {
+					await db
+						.update(narrators)
+						.set({
+							status: "idle",
+							substatus: JSON.stringify(["interrupted", tag]),
+						})
+						.where(eq(narrators.id, tag));
+				}
+			};
+			if (invalidateBeforeClassification) await invalidate();
+			const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+			expect(prepared.manifest?.targets.map((target) => target.narratorId).sort()).toEqual(
+				invalidateBeforeClassification ? ["eligible"] : ["eligible", ...invalid].sort(),
+			);
+			if (!invalidateBeforeClassification) await invalidate();
+			await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
+			expect(started()).toEqual(["eligible"]);
+			expect(executedTools).toBe(0);
+		});
+	}
+
+	test("recorded independent primary survives an opt-out cold boot and another signal without losing reply options", async () => {
+		await seedPrimary("primary");
+		const options = { userId: "paused-primary-user", replyInUserLanguage: false };
+		coordinator.registerNarratorLoop("primary", "zh-CN", options);
+		await recovery.prepareSignalRestartRecovery();
+		coldReset();
+		process.argv.push(recovery.NO_AUTO_RESUME_FLAG);
+		const paused = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(await recovery.restoreOrdinaryRestartRecovery(paused)).toBeNull();
+		expect(started()).toEqual([]);
+		await db.update(narrators).set({ status: "idle", substatus: '["interrupted"]' });
+		await recovery.prepareSignalRestartRecovery();
+		coldReset();
+		process.argv = originalArgs.filter((arg) => arg !== recovery.NO_AUTO_RESUME_FLAG);
+		const resumed = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(resumed.manifest?.snapshot.updateEpoch).toBe(paused.manifest?.snapshot.updateEpoch);
+		await (await recovery.restoreOrdinaryRestartRecovery(resumed))?.completion;
+		expect(runs).toMatchObject([
+			{
+				narratorId: "primary",
+				locale: "zh-CN",
+				...options,
+				run: { resumeRunId: "run-primary", recovered: true, deliver: false },
+			},
+		]);
+		expect(executedTools).toBe(0);
+	});
+
+	test("manual Continue can mount a recorded independent primary while automatic resume is disabled", async () => {
+		await seedPrimary("primary");
+		coordinator.registerNarratorLoop("primary", "zh-CN", {
+			userId: "manual-user",
+			replyInUserLanguage: true,
+		});
+		await recovery.prepareSignalRestartRecovery();
+		coldReset();
+		process.argv.push(recovery.NO_AUTO_RESUME_FLAG);
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		await db.update(narrators).set({ status: "idle", substatus: '["interrupted"]' });
+		expect(await recovery.restoreOrdinaryRestartRecovery(prepared)).toBeNull();
+		expect(await recovery.manuallyResumeRestartRecovery("primary")).toBe(true);
+		expect(runs).toMatchObject([
+			{
+				narratorId: "primary",
+				locale: "zh-CN",
+				userId: "manual-user",
+				replyInUserLanguage: true,
+				run: { resumeRunId: "run-primary", recovered: true, deliver: false },
+			},
+		]);
+		expect(await recovery.manuallyResumeRestartRecovery("primary")).toBe(false);
+		// Join the queue's already-mounted cleanup before resetting the next test's DB.
+		const deadline = Date.now() + 2_000;
+		while (await Bun.file(getNarraforkPath("restart-recovery.json")).exists()) {
+			if (Date.now() > deadline)
+				throw new Error("Manual primary recovery did not consume its manifest");
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		expect(executedTools).toBe(0);
+	});
+
+	test("a planned v3 source carries recorded independent primary recovery with the same run and reply options", async () => {
+		await seedPrimary("primary");
+		const options = { userId: "carried-user", replyInUserLanguage: false };
+		coordinator.registerNarratorLoop("primary", "zh-CN", options);
+		await recovery.prepareSignalRestartRecovery();
+		coldReset();
+		const ordinary = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		if (!ordinary.manifest) throw new Error("Missing recorded primary manifest");
+		const { snapshot, targets } = ordinary.manifest;
+		coordinator.writePlannedUpdateRecoverySnapshot({
+			version: 3,
+			updateEpoch: "carried-primary-root",
+			capturedAt: now,
+			resumeOnNextStartup: true,
+			narrators: [],
+			sources: [
+				{
+					updateEpoch: snapshot.updateEpoch,
+					kind: "ordinary",
+					capturedAt: snapshot.capturedAt,
+					narrators: snapshot.narrators,
+					pendingNarratorIds: targets.map((target) => target.narratorId),
+					logicalRuns: targets,
+				},
+			],
+		});
+		// Reset process-local recovery without the coordinator helper deleting the planned file.
+		recovery.resetRestartRecoveryForTests();
+		resetRecoveryHandoffForTests();
+		const planned = await import("../update-recovery-service");
+		const startup = await planned.getPlannedUpdateStartupProtection();
+		expect((await recovery.prepareOrdinaryRestartRecovery(startup.protection)).manifest).toBeNull();
+		await (await planned.restoreNarratorsAfterPlannedUpdate(startup))?.completion;
+		expect(runs).toMatchObject([
+			{
+				narratorId: "primary",
+				locale: "zh-CN",
+				...options,
+				run: { resumeRunId: "run-primary", recovered: true, deliver: false },
+			},
+		]);
+		expect(await Bun.file(getNarraforkPath("restart-recovery.json")).exists()).toBe(false);
 		expect(executedTools).toBe(0);
 	});
 

@@ -99,6 +99,58 @@ describe("main shutdown wiring without booting the server", () => {
 		return at;
 	};
 
+	test.each([
+		"ok",
+		"failed",
+		"timeout",
+	] as const)("signal cleanup preserves Agent runs only after checkpoint preparation returns %s", async (outcome) => {
+		const prepareStart = shutdown.indexOf("let preserveAgentRuns = false;");
+		const prepareEnd = shutdown.indexOf("const shutdownRequestId", prepareStart);
+		const cleanupStart = shutdown.indexOf("if (!options.skipBashProcessKill)");
+		const cleanupEnd = shutdown.indexOf(
+			'await shutdownStep(tracker, "vnetUdpRendezvous.stop"',
+			cleanupStart,
+		);
+		expect(prepareStart).toBeGreaterThanOrEqual(0);
+		expect(prepareEnd).toBeGreaterThan(prepareStart);
+		expect(cleanupStart).toBeGreaterThan(prepareEnd);
+		expect(cleanupEnd).toBeGreaterThan(cleanupStart);
+		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
+			`async function close() { ${shutdown.slice(prepareStart, prepareEnd)}\n${shutdown.slice(cleanupStart, cleanupEnd)} }`,
+		);
+		const calls: unknown[] = [];
+		const close = new Function(
+			"options",
+			"tracker",
+			"shutdownStep",
+			"prepareSignalRestartRecovery",
+			"markUpdateRestarting",
+			"killAllBashProcesses",
+			`${code}\nreturn close();`,
+		);
+		await close(
+			{ reason: "signal" },
+			new ShutdownActivityTracker(),
+			async (_tracker: unknown, label: string, action: () => Promise<unknown>) => {
+				await action();
+				return label === "restartRecovery.prepare" ? outcome : "ok";
+			},
+			async () => {
+				calls.push("checkpoint");
+			},
+			() => {
+				calls.push("restarting");
+			},
+			async (options: unknown) => {
+				calls.push(options);
+			},
+		);
+		expect(calls).toEqual([
+			"checkpoint",
+			...(outcome === "ok" ? ["restarting"] : []),
+			{ preserveAgents: outcome === "ok" },
+		]);
+	});
 	test("owners and compute threads drain before database closure and the clean marker", () => {
 		const db = position("dbWorkerPool.shutdown");
 		const pg = position("postgresRuntime.close");

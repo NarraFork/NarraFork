@@ -3991,12 +3991,16 @@ class BackgroundTaskService {
 		});
 	}
 
-	async killAll(): Promise<void> {
-		// Cancel all running tasks in DB
+	async killAll(options: { preserveAgents?: boolean } = {}): Promise<void> {
 		const running = await db
 			.select()
 			.from(backgroundTasks)
-			.where(eq(backgroundTasks.status, "running"))
+			.where(
+				and(
+					eq(backgroundTasks.status, "running"),
+					options.preserveAgents ? ne(backgroundTasks.type, "agent") : undefined,
+				),
+			)
 			.all();
 
 		for (const task of running) {
@@ -4034,7 +4038,10 @@ class BackgroundTaskService {
 			}
 		}
 
-		logger.info("Killed all background tasks", { count: running.length });
+		logger.info("Background tasks stopped", {
+			count: running.length,
+			preserveAgents: options.preserveAgents ?? false,
+		});
 	}
 
 	// ── Private helpers ─────────────────────────────────────────────────
