@@ -172,6 +172,9 @@ afterEach(async () => {
 		.where(eq(narratorWorktreeResources.scopeProjectId, projectId));
 	const ids = [...otherNarrators.splice(0).reverse(), narratorId];
 	await db.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.narratorId, ids));
+	// A selected-message fork also keeps its boundary as a message FK.
+	// Retire that fixture pointer before deleting the shared message rows.
+	await db.update(narrators).set({ forkMessageId: null }).where(inArray(narrators.id, ids));
 	await db.delete(narratorMessages).where(inArray(narratorMessages.narratorId, ids));
 	for (const id of ids) await db.delete(narrators).where(eq(narrators.id, id));
 	await db.delete(projects).where(eq(projects.id, projectId));
@@ -474,6 +477,7 @@ for (const kind of ["create", "subagent", "fork", "forkFromMessages"] as const) 
 			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});
 		const created = await action();
+		if (kind === "forkFromMessages") expect(created.forkMessageId).toBe(messageId);
 		if (kind !== "create") {
 			expect(created.replyContext).not.toBeNull();
 			expect(created.replyContext).toEqual(

@@ -83,7 +83,16 @@ if (port) {
 		try {
 			check(typeof requestId === "string" && !!request, "INVALID_MANIFEST");
 			if (request.action === "compare") {
-				check(equal(request.fixed, request.current), "SELECTION_STALE");
+				const { messageVersions: fixedVersions, ...fixedSelection } = request.fixed;
+				const { messageVersions: currentVersions, ...currentSelection } = request.current;
+				check(
+					equal(fixedSelection, currentSelection) &&
+						equal(
+							fixedVersions?.map((row) => row.narratorId),
+							currentVersions?.map((row) => row.narratorId),
+						),
+					"SELECTION_STALE",
+				);
 				port.postMessage({ requestId, value: true });
 			} else if (request.action === "entrypoint") {
 				validateEntrypoint(request);

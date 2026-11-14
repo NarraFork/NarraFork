@@ -622,14 +622,15 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// Retention fences consult the SQLite body projection before accepting late writes.
 	"server/services/narrator-body-writes.ts": ["handle"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
-	"server/lib/narrator-bodies.ts": ["driver", "sqliteCatalog"],
+	"server/lib/narrator-bodies.ts": ["driver", "pragmaFn", "sqliteCatalog"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
 	// storage): exports, the session interchange, and the body length they measure in SQL.
 	"server/lib/narrator-body-length.ts": ["json1"],
 	"server/services/narrator-export.ts": ["handle"],
 	"server/services/session-interchange/export.ts": ["handle"],
 	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
-	"server/services/narrator-refs-backfill.ts": ["blobFn"],
+	// Lazy refs must reject an ambient native transaction before any async page preparation.
+	"server/services/narrator-refs-backfill.ts": ["nativeClient", "blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],
 	"server/services/narrator-subagent-recovery.ts": ["handle"],

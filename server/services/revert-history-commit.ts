@@ -46,6 +46,7 @@ import {
 } from "./narrator-question-history";
 import {
 	isSnapshotSelectionComplete,
+	REVERT_LAZY_CHILD_DEPENDENCY_QUERY,
 	REVERT_SELECTION_PAGE_ITEMS,
 	type RevertSelectionBlock,
 	type RevertSelectionMessage,
@@ -94,7 +95,7 @@ export interface RevertHistoryApplyResult {
 type Value = string | number | null;
 type Row = Record<string, Value>;
 type Statement = { text: string; values: SQLQueryBindings[] };
-type Check = Statement & { count: number };
+type Check = Statement & { count: number; code?: "HISTORY_LAZY_DEPENDENCY_CHANGED" };
 type Target = { row: Row; count: number };
 type StoredColumns = { message: string[]; tool: string[] };
 type Snapshot = {
@@ -307,7 +308,8 @@ export class RevertHistoryCommitService {
 			AbortSignal.timeout(this.timeoutMs),
 		]);
 		const snapshot: Snapshot = {
-			versions: request.fixedSelection.messageVersions.map((row) => ({ ...row })),
+			// Bind only after the final selected-history recheck, not to the old plan version.
+			versions: [],
 			signal,
 			expiresAt: Date.now() + this.timeoutMs,
 			statements: [],
@@ -324,7 +326,6 @@ export class RevertHistoryCommitService {
 			const current = await this.selection.collect({
 				principal,
 				narratorId: fixed.narratorId,
-				expectedMessageVersion: fixed.rootVersion,
 				selector: fixed.selector,
 				signal,
 			});
@@ -340,11 +341,16 @@ export class RevertHistoryCommitService {
 			const latest = await this.selection.collect({
 				principal,
 				narratorId: fixed.narratorId,
-				expectedMessageVersion: fixed.rootVersion,
 				selector: fixed.selector,
 				signal,
 			});
 			await compareSelection(fixed, latest, () => this.pause(snapshot));
+			// Current versions are a short prepare→apply CAS only. The complete selected
+			// sources above, not a session-wide old counter, bind the user's consent.
+			snapshot.versions = latest.messageVersions.map((row) => {
+				bound(row.messageVersion, Number.MAX_SAFE_INTEGER - 1, "narrator mutation version");
+				return { ...row };
+			});
 		} finally {
 			this.active--;
 			this.report("prepare", started, snapshot.statements.length);
@@ -390,8 +396,11 @@ export class RevertHistoryCommitService {
 			const actual = this.root
 				.query<{ n: number }, SQLQueryBindings[]>(check.text)
 				.get(...check.values);
-			if (actual?.n !== check.count)
+			if (actual?.n !== check.count) {
+				if (check.code)
+					throw new AppError("Inherited child history changed after preview", 409, check.code);
 				throw fail("STALE", "Selected history changed after preparation");
+			}
 		}
 		this.#prepared.delete(prepared);
 		try {
@@ -536,6 +545,36 @@ export class RevertHistoryCommitService {
 			selection.messageVersions.map((row) => [row.narratorId, row.messageVersion]),
 		);
 		const narrators = new Map<string, Narrator>();
+		const authorizationRows = new Map<string, Row>();
+		for (const id of versions.keys())
+			capture(
+				authorizationRows,
+				id,
+				this.one<Row>(
+					work,
+					"SELECT id,owner_user_id,visibility,write_audience,type,acl_root_narrator_id,context_project_id,parent_narrator_id,origin_tool_call_id FROM narrators WHERE id=? LIMIT 1",
+					[id],
+				),
+			);
+		for (const id of versions.keys())
+			work.checks.push({
+				text: "SELECT CASE WHEN (refs_inherited_from IS NULL AND refs_backfill_cursor IS NULL) OR (refs_inherited_from IS NOT NULL AND typeof(refs_backfill_cursor)='integer' AND refs_backfill_cursor>=0) THEN 1 ELSE 0 END AS n FROM narrators WHERE id=? LIMIT 1",
+				values: [id],
+				count: 1,
+			});
+		const lazyParents = new Map<string, number>();
+		for (const message of messages)
+			lazyParents.set(
+				message.narratorId,
+				Math.min(lazyParents.get(message.narratorId) ?? message.seq, message.seq),
+			);
+		for (const [id, minSeq] of lazyParents)
+			work.checks.push({
+				text: `SELECT EXISTS(${REVERT_LAZY_CHILD_DEPENDENCY_QUERY}) AS n`,
+				values: [id, minSeq, id, minSeq],
+				count: 0,
+				code: "HISTORY_LAZY_DEPENDENCY_CHANGED",
+			});
 		const affected = new Set<string>();
 		const narratorPatches = new Map<string, Row>();
 		const refPatches = new Map<string, { ref: Ref; patch: Row; remove: boolean }>();
@@ -801,8 +840,6 @@ export class RevertHistoryCommitService {
 				"SELECT id,message_version,fork_message_id FROM narrators WHERE id=? LIMIT 1",
 				[id],
 			);
-			if (narrator.message_version !== versions.get(id))
-				throw fail("STALE", "Authorized narrator version changed");
 			bound(narrator.message_version, Number.MAX_SAFE_INTEGER - 1, "narrator mutation version");
 			narrators.set(id, narrator);
 		}
@@ -952,17 +989,17 @@ export class RevertHistoryCommitService {
 		}
 		const narratorProgram: Statement[] = [];
 		const now = new Date().toISOString();
-		for (const [id, narrator] of narrators)
+		for (const id of narrators.keys())
 			narratorProgram.push(
 				update(
 					"narrators",
 					{
 						...narratorPatches.get(id),
 						api_conversation_id: null,
-						message_version: narrator.message_version + 1,
 						updated_at: now,
 					},
-					{ id, message_version: narrator.message_version },
+					{ id },
+					["message_version"],
 				),
 			);
 		// Count actual unique row mutations too: the collector's conservative budget is a
@@ -1006,6 +1043,40 @@ export class RevertHistoryCommitService {
 				work.statements.push(deletion("narrator_messages", { id: message.id }));
 		work.result.affectedNarratorIds = [...affected];
 		work.result.refreshedNarratorIds = recipient.refreshedIds;
+		const selector = selection.selector;
+		if (
+			selector.kind === "all" ||
+			selector.kind === "from_seq" ||
+			selector.kind === "after_block"
+		) {
+			let minSeq = selector.kind === "from_seq" ? selector.minSeq : -Number.MAX_SAFE_INTEGER;
+			let retainedBoundary = 0;
+			if (selector.kind === "after_block") {
+				const boundary = this.one<Ref>(
+					work,
+					"SELECT id,narrator_id,message_id,seq,segment_compact_id,is_compact FROM narrator_message_refs WHERE narrator_id=? AND message_id=? LIMIT 1",
+					[selection.narratorId, selector.messageId],
+				);
+				capture(refRows, boundary.id, boundary);
+				minSeq = boundary.seq;
+				if (!messageById.has(selector.messageId)) retainedBoundary = 1;
+			}
+			work.checks.push({
+				text: "SELECT CASE WHEN refs_inherited_from IS NULL OR refs_backfill_cursor<=? THEN 1 ELSE 0 END AS n FROM narrators WHERE id=? LIMIT 1",
+				values: [minSeq, selection.narratorId],
+				count: 1,
+			});
+			work.checks.push({
+				// Bounded indexed membership check: even an unversioned suffix insertion
+				// cannot be silently excluded from an already confirmed rollback range.
+				text: "SELECT count(*) AS n FROM (SELECT id FROM narrator_message_refs INDEXED BY idx_narrator_refs_seq WHERE narrator_id=? AND seq>=? LIMIT ?)",
+				values: [selection.narratorId, minSeq, FILE_CHANGE_LIMITS.historyMessageRefChanges + 1],
+				count:
+					messages.filter(
+						(message) => message.narratorId === selection.narratorId && message.seq >= minSeq,
+					).length + retainedBoundary,
+			});
+		}
 		work.checks.push(
 			...rowChecks("narrator_messages", "id", messageRows.values(), {
 				ftsBytes: "coalesce(octet_length(a.content_text),0)",
@@ -1017,7 +1088,12 @@ export class RevertHistoryCommitService {
 				outputBytes: "octet_length(a.output_json)",
 				rowBytes: rowLength(stored.tool, "a."),
 			}),
-			...rowChecks("narrators", "id", narrators.values()),
+			...rowChecks("narrators", "id", authorizationRows.values()),
+			...rowChecks(
+				"narrators",
+				"id",
+				[...narrators.values()].map(({ message_version: _version, ...row }) => row),
+			),
 			...targetChecks(
 				toolTargets,
 				"CROSS JOIN narrator_tool_calls a INDEXED BY idx_toolcalls_message ON a.message_id=t.message_id",
@@ -1492,11 +1568,12 @@ function conditions(where: Row) {
 		.map((name) => `${quote(name)} IS ?`)
 		.join(" AND ");
 }
-function update(table: string, patch: Row, where: Row): Statement {
+function update(table: string, patch: Row, where: Row, increments: string[] = []): Statement {
 	return {
-		text: `UPDATE ${quote(table)} SET ${Object.keys(patch)
-			.map((name) => `${quote(name)}=?`)
-			.join(",")} WHERE ${conditions(where)}`,
+		text: `UPDATE ${quote(table)} SET ${[
+			...Object.keys(patch).map((name) => `${quote(name)}=?`),
+			...increments.map((name) => `${quote(name)}=${quote(name)}+1`),
+		].join(",")} WHERE ${conditions(where)}`,
 		values: [...Object.values(patch), ...Object.values(where)],
 	};
 }
@@ -1645,9 +1722,10 @@ function fixSelection(selection: RevertSelectionResult, snapshotRecovery = false
 		FILE_CHANGE_LIMITS.historyCowBytes,
 		"manifest COW budget",
 	);
-	const versions = selection.messageVersions.map((row) =>
-		smallCommitment([fixedText(row.narratorId), row.messageVersion]),
-	);
+	const narrators = selection.messageVersions.map((row) => {
+		bound(row.messageVersion, Number.MAX_SAFE_INTEGER, "message version");
+		return smallCommitment(fixedText(row.narratorId));
+	});
 	const rootVersion = selection.messageVersions.find(
 		(row) => row.narratorId === selection.narratorId,
 	)?.messageVersion;
@@ -1657,9 +1735,8 @@ function fixSelection(selection: RevertSelectionResult, snapshotRecovery = false
 		narratorId: fixedText(selection.narratorId),
 		userId: fixedText(selection.requestedByUserId),
 		digest: fixedText(selection.metadataDigest),
-		rootVersion,
 		selector: fixSelector(selection.selector),
-		versions,
+		narrators,
 		messages: selection.history.messages.map((row) => smallCommitment(messageKey(row))),
 		blocks: selection.history.blocks.map((row) => smallCommitment(blockKey(row))),
 		toolChanges: selection.history.toolChanges.map((row) => smallCommitment(row)),
@@ -1680,7 +1757,7 @@ async function compareSelection(
 	)
 		throw fail("STALE", "The original plan metadata or boundary changed");
 	for (const [left, right] of [
-		[fixed.versions, current.messageVersions.map((row) => [row.narratorId, row.messageVersion])],
+		[fixed.narrators, current.messageVersions.map((row) => row.narratorId)],
 		[fixed.messages, current.history.messages.map(messageKey)],
 		[fixed.blocks, current.history.blocks.map(blockKey)],
 		[fixed.toolChanges, current.history.toolChanges],

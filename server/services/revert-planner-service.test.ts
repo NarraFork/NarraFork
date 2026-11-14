@@ -969,6 +969,71 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		expect(await readFile(path)).toEqual(disk);
 	});
 
+	test("DB working and unrelated same-narrator changes do not block a stable single-tool preview", async () => {
+		const { path, first } = await fixture();
+		db.update(schema.narrators)
+			.set({ status: "working" })
+			.where(eq(schema.narrators.id, "root"))
+			.run();
+		beforeRead = (_path, count) => {
+			if (count !== 1) return;
+			db.insert(schema.narratorMessages)
+				.values({
+					id: "late-unrelated",
+					narratorId: "root",
+					role: "user",
+					contentJson: [{ type: "text", text: "unrelated" }],
+					createdAt: now(),
+				})
+				.run();
+			db.insert(schema.narratorMessageRefs)
+				.values({
+					id: "late-unrelated-ref",
+					narratorId: "root",
+					messageId: "late-unrelated",
+					seq: 999,
+				})
+				.run();
+			sqlite
+				.query(
+					"UPDATE narrators SET status='idle',message_version=message_version+1 WHERE id='root'",
+				)
+				.run();
+		};
+		const result = await prepare({
+			selector: { kind: "tool_calls", toolCallIds: [first.toolCallId] },
+		});
+		expect(result.plan.status).toBe("prepared");
+		expect(result.plan.coverageComplete).toBe(true);
+		expect(await readFile(path)).toBeDefined();
+		const original = await rawManifest<{ request: RevertPlannerRequest }>(
+			result.plan.manifestDigests.selector,
+		);
+		expect(original.request.expectedMessageVersion).toBe(7);
+	});
+	test("a rollback suffix cannot silently exclude a newly appended message", async () => {
+		await fixture();
+		beforeRead = (_path, count) => {
+			if (count !== 1) return;
+			db.insert(schema.narratorMessages)
+				.values({
+					id: "late-suffix",
+					narratorId: "root",
+					role: "user",
+					contentJson: [{ type: "text", text: "new suffix member" }],
+					createdAt: now(),
+				})
+				.run();
+			db.insert(schema.narratorMessageRefs)
+				.values({ id: "late-suffix-ref", narratorId: "root", messageId: "late-suffix", seq: 999 })
+				.run();
+			sqlite.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'").run();
+		};
+		(await rejected(prepare({ selector: { kind: "from_seq", minSeq: 0 } }))).toMatchObject({
+			code: "REVERT_PLANNER_STALE",
+		});
+		assertUnprepared();
+	});
 	test("original expected message version is enforced", async () => {
 		await fixture();
 		const before = historySnapshot();
