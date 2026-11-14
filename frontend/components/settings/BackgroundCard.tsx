@@ -7,7 +7,12 @@
  */
 
 import { useAppBackground } from "@frontend/hooks/useAppBackground";
-import { checkBackgroundUrl, DEFAULT_BACKGROUND, MIN_OPACITY } from "@frontend/lib/app-background";
+import {
+	checkBackgroundUrl,
+	DEFAULT_BACKGROUND,
+	MIN_OPACITY,
+	switchBackgroundSource,
+} from "@frontend/lib/app-background";
 import { clearWallpaperBlob, saveWallpaperBlob } from "@frontend/lib/wallpaper-store";
 import {
 	Alert,
@@ -23,13 +28,13 @@ import {
 	Text,
 	TextInput,
 } from "@mantine/core";
-import { IconAlertTriangle, IconPhoto, IconX } from "@tabler/icons-react";
+import { IconAlertTriangle, IconPhoto, IconRefresh, IconX } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 export function BackgroundCard() {
 	const { t } = useTranslation("settings");
-	const { choice, setChoice, status } = useAppBackground();
+	const { choice, setChoice, status, reload } = useAppBackground();
 	const [draft, setDraft] = useState(choice.url);
 	const [touched, setTouched] = useState(false);
 
@@ -53,11 +58,11 @@ export function BackgroundCard() {
 		if (!file) return;
 		await saveWallpaperBlob(file);
 		setTouched(false);
+		// Keep the URL: switching back to "Remote URL" must not lose the address.
 		setChoice({
 			...choice,
 			source: "file",
 			fileName: file.name,
-			url: "",
 			enabled: true,
 		});
 	};
@@ -84,11 +89,7 @@ export function BackgroundCard() {
 				size="xs"
 				value={choice.source}
 				onChange={(value) =>
-					setChoice({
-						...choice,
-						source: value === "file" ? "file" : "url",
-						enabled: false,
-					})
+					setChoice(switchBackgroundSource(choice, value === "file" ? "file" : "url"))
 				}
 				data={[
 					{ value: "url", label: t("bgSourceUrl") },
@@ -98,20 +99,31 @@ export function BackgroundCard() {
 			/>
 
 			{choice.source === "url" ? (
-				<TextInput
-					size="xs"
-					style={{ maxWidth: 620 }}
-					label={t("bgUrlLabel")}
-					description={t("bgUrlHint")}
-					placeholder="https://example.com/wallpaper.webp"
-					value={draft}
-					error={errorMessage}
-					onBlur={() => setTouched(true)}
-					onChange={(event) => {
-						setTouched(true);
-						commitUrl(event.currentTarget.value);
-					}}
-				/>
+				<Group align="flex-end" gap="xs" wrap="nowrap">
+					<TextInput
+						size="xs"
+						style={{ maxWidth: 620 }}
+						label={t("bgUrlLabel")}
+						description={t("bgUrlHint")}
+						placeholder="https://example.com/wallpaper.webp"
+						value={draft}
+						error={errorMessage}
+						onBlur={() => setTouched(true)}
+						onChange={(event) => {
+							setTouched(true);
+							commitUrl(event.currentTarget.value);
+						}}
+					/>
+					<Button
+						size="xs"
+						variant="default"
+						leftSection={<IconRefresh size={12} />}
+						disabled={!check.ok}
+						onClick={reload}
+					>
+						{t("bgReload")}
+					</Button>
+				</Group>
 			) : (
 				<Group gap="sm" align="center">
 					<FileButton

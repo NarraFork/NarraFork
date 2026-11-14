@@ -3109,5 +3109,6 @@
 	"bgNoFile": "还没有选择文件",
 	"bgLoadFailed": "这张图没能加载",
 	"bgLoadFailedHint": "图床可能开了防盗链（会拒绝来自其他站点的请求），或者地址已失效。换成本地文件最稳。",
-	"bgLocalPrivacy": "图片只存在这个浏览器里，不会上传，也不依赖网络。"
+	"bgLocalPrivacy": "图片只存在这个浏览器里，不会上传，也不依赖网络。",
+	"bgReload": "重新加载"
 }

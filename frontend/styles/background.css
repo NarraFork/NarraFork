@@ -37,14 +37,12 @@
 		var(--nf-canvas-base) var(--nf-bg-scrim, 40%),
 		transparent
 	);
-	/* The base layer is deliberately lighter than the panels: the wallpaper should read as
-	   the room behind the furniture, not as something inside the cards. Text lives on the
-	   panels, which stay closer to opaque. */
-	--mantine-color-body: color-mix(
-		in srgb,
-		var(--nf-canvas-base) var(--nf-bg-body-opacity, 62%),
-		transparent
-	);
+	/*
+	 * Only the panels are made translucent here. `--mantine-color-body` is deliberately left
+	 * alone: modals, menus, dropdowns and tooltips portal to <body> and paint with it, and a
+	 * translucent dialog over a wallpaper is unreadable. The shell gets its transparency
+	 * from the `#root` rule below instead, which is scoped to the app surface only.
+	 */
 	--mantine-color-default: color-mix(
 		in srgb,
 		var(--nf-pane-base) var(--nf-bg-pane-opacity, 80%),
@@ -57,7 +55,8 @@ html[data-nf-bg="on"] body {
 }
 
 html[data-nf-bg="on"] #root {
-	background: var(--mantine-color-body);
+	/* The shell itself, not the global surface variable — see the note above. */
+	background: color-mix(in srgb, var(--nf-canvas-base) var(--nf-bg-body-opacity, 62%), transparent);
 	min-height: 100vh;
 	/*
 	 * NO `backdrop-filter` here. It would make #root a containing block for every

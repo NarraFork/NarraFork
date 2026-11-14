@@ -45,6 +45,12 @@ export function useAppBackground() {
 	}, []);
 
 	const [status, setStatus] = useState<"idle" | "loading" | "ok" | "error">("idle");
+	/**
+	 * Bumped by the reload button. A plain re-run of the effect would hand the browser the
+	 * same URL and it would answer from cache, which looks like the button does nothing.
+	 */
+	const [nonce, setNonce] = useState(0);
+	const reload = useCallback(() => setNonce((value) => value + 1), []);
 
 	useEffect(() => {
 		if (typeof document === "undefined") return;
@@ -56,7 +62,7 @@ export function useAppBackground() {
 			return;
 		}
 		setStatus("loading");
-		void syncWallpaperLayer(choice).then((result) => {
+		void syncWallpaperLayer(choice, { nonce }).then((result) => {
 			// The async load can finish after the user changed the preference; ignoring the
 			// stale result keeps the error state from sticking to a newer, valid choice.
 			if (cancelled) return;
@@ -65,7 +71,7 @@ export function useAppBackground() {
 		return () => {
 			cancelled = true;
 		};
-	}, [choice]);
+	}, [choice, nonce]);
 
-	return { choice, setChoice, status };
+	return { choice, setChoice, status, reload };
 }

@@ -101,6 +101,24 @@ export function parseBackgroundChoice(raw: unknown): BackgroundChoice {
 	};
 }
 
+/**
+ * Switch the active source without destroying the other one's configuration.
+ *
+ * Regression this exists for: picking a local file used to blank `url`, and switching back
+ * to "URL" then had nothing to load — the wallpaper silently stopped appearing even though
+ * the address was still on screen in the input.
+ *
+ * `enabled` follows the newly selected source: switching to a URL re-enables it when the
+ * address is valid, switching to a file re-enables it when a file has been picked.
+ */
+export function switchBackgroundSource(
+	choice: BackgroundChoice,
+	source: BackgroundSource,
+): BackgroundChoice {
+	const enabled = source === "url" ? checkBackgroundUrl(choice.url).ok : Boolean(choice.fileName);
+	return { ...choice, source, enabled };
+}
+
 export const BACKGROUND_PREF_KEY = "narrafork_background";
 
 const listeners = new Set<() => void>();
@@ -184,7 +202,10 @@ export function applyBackground(root: HTMLElement, choice: BackgroundChoice): vo
  * Returns "error" when the image could not be loaded, which is the settings card's cue to
  * say so instead of leaving a silent flat background.
  */
-export async function syncWallpaperLayer(choice: BackgroundChoice): Promise<WallpaperResult> {
+export async function syncWallpaperLayer(
+	choice: BackgroundChoice,
+	options: { nonce?: number } = {},
+): Promise<WallpaperResult> {
 	if (!choice.enabled) {
 		hideWallpaper();
 		return "ok";
@@ -204,7 +225,13 @@ export async function syncWallpaperLayer(choice: BackgroundChoice): Promise<Wall
 		hideWallpaper();
 		return "error";
 	}
-	return showWallpaper({ src: choice.url.trim(), blur: choice.blur });
+	let src = choice.url.trim();
+	if (options.nonce) {
+		// A reload must actually re-request the bytes; hosts commonly serve a cached copy
+		// for the same URL, which looks like "the retry did nothing".
+		src += `${src.includes("?") ? "&" : "?"}nf_reload=${options.nonce}`;
+	}
+	return showWallpaper({ src, blur: choice.blur });
 }
 
 /**

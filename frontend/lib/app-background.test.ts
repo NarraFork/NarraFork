@@ -5,6 +5,7 @@ import {
 	DEFAULT_BACKGROUND,
 	MIN_OPACITY,
 	parseBackgroundChoice,
+	switchBackgroundSource,
 } from "./app-background";
 
 function stubRoot() {
@@ -64,6 +65,23 @@ describe("background image", () => {
 			url: "https://x.test/a.png",
 			opacity: MIN_OPACITY,
 		});
+	});
+
+	test("switching source keeps the other source's configuration", () => {
+		// Regression: picking a file used to blank `url`, so switching back to "URL" had
+		// nothing to load and the wallpaper silently stopped appearing.
+		const withUrl = parseBackgroundChoice({ enabled: true, url: "https://x.test/a.png" });
+		const toFile = switchBackgroundSource({ ...withUrl, fileName: "a.png" }, "file");
+		expect(toFile.url).toBe("https://x.test/a.png");
+		expect(toFile.enabled).toBe(true);
+		const back = switchBackgroundSource(toFile, "url");
+		expect(back.url).toBe("https://x.test/a.png");
+		expect(back.enabled).toBe(true);
+	});
+
+	test("switching to an empty source disables it instead of painting nothing", () => {
+		expect(switchBackgroundSource(DEFAULT_BACKGROUND, "file").enabled).toBe(false);
+		expect(switchBackgroundSource(DEFAULT_BACKGROUND, "url").enabled).toBe(false);
 	});
 
 	test("applying writes the variables, clearing removes them", () => {

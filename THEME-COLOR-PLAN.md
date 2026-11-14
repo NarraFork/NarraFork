@@ -302,3 +302,9 @@ curl 带 localhost Referer → 403
 - 运行时用 `URL.createObjectURL` 提供，替换时 `revokeObjectURL`，不泄漏
 - 只存一张，重新选图会覆盖；"清除"会同时删掉 blob 与偏好
 - 本地文件不经过网络，不受防盗链、离线、域名失效影响
+
+### 11.7 切源丢配置 / 弹层透明 / 重新加载
+
+1. **网络↔本地切回来就不显示**：选本地文件时把 `url` 清成了空串，切回「网络地址」自然无图可加载；切源还无条件 `enabled: false`。改为 `switchBackgroundSource()`：两个来源各自保留配置，`enabled` 跟随新来源是否有效。已加回归测试（6 项）。
+2. **弹层跟着变透明**：之前把全局 `--mantine-color-body` 改成了半透明，而 Modal / Menu / Dropdown / Tooltip 都 portal 到 `<body>` 读同一个变量——它们下面不是面板而是壁纸，于是弹窗也变成半透明，很难读。改成只让 `#root` 半透明（作用域限于外壳），`--mantine-color-body` 保持不透明；面板仍走 `--mantine-color-default` 的混合值。
+3. **重新加载按钮**：URL 输入框后新增「重新加载」，带 `nf_reload=<nonce>` 参数，避免浏览器直接命中缓存导致"点了没反应"。
