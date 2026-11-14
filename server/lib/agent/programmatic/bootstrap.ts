@@ -1,4 +1,5 @@
 import parserSource from "@babel/parser" with { type: "text" };
+import { WorkerHandle } from "../../worker-runtime/lifecycle";
 import { createMailbox } from "./mailbox";
 import type { RunBudgets, StartFrame } from "./protocol";
 import { PROGRAMMATIC_LIMITS } from "./protocol";
@@ -99,8 +100,11 @@ async function brokerMain(
 	mailboxFactory: typeof createMailbox,
 	workerSource: string,
 	limits: typeof PROGRAMMATIC_LIMITS,
+	lifecycle: typeof WorkerHandle,
 ) {
 	let worker: Worker | undefined;
+	let workerHandle: WorkerHandle<Worker> | undefined;
+	let workerUrl: string | undefined;
 	let mailbox: ReturnType<typeof createMailbox> | undefined;
 	let finished = false;
 	let started = false;
@@ -142,8 +146,11 @@ async function brokerMain(
 		changed();
 		if (timer) clearTimeout(timer);
 		mailbox?.close();
-		worker?.terminate();
 		try {
+			// This owner lives inside the container; the host still separately reaps and
+			// verifies that container. Never inject this lifecycle object into the VM.
+			await workerHandle?.close();
+			if (workerUrl) URL.revokeObjectURL(workerUrl);
 			if (Buffer.byteLength(json) > limits.wireFrameBytes) throw new Error("result frame limit");
 			await write(JSON.parse(json));
 			process.exit(0);
@@ -260,11 +267,11 @@ async function brokerMain(
 			timer = setTimeout(() => {
 				void fail("DEADLINE");
 			}, budgets.wallMs);
-			const url = URL.createObjectURL(new Blob([workerSource], { type: "application/javascript" }));
-			worker = new Worker(url);
+			workerUrl = URL.createObjectURL(new Blob([workerSource], { type: "application/javascript" }));
+			workerHandle = lifecycle.bunThread(workerUrl);
+			worker = workerHandle.resource;
 			worker.onerror = (event) => {
 				if (typeof event.message === "string") process.stderr.write(event.message.slice(0, 2000));
-				URL.revokeObjectURL(url);
 				void fail("WORKER_ERROR");
 			};
 			worker.onmessage = (event: MessageEvent<unknown>) => {
@@ -349,5 +356,5 @@ async function brokerMain(
 export function createSandboxBootstrap(): string {
 	// Babel's self-contained CJS exports remain local to the Worker, never the VM.
 	const workerSource = `import vm from "node:vm";\nconst parser = {};\n(function(exports){${parserSource}\n})(parser);\n(${workerMain.toString()})(vm,${JSON.stringify(createMailbox.toString())},${JSON.stringify(createVmRuntime.toString())},parser.parse,(${guardSource.toString()}));`;
-	return `(${brokerMain.toString()})((${createMailbox.toString()}),${JSON.stringify(workerSource)},${JSON.stringify(PROGRAMMATIC_LIMITS)});`;
+	return `(${brokerMain.toString()})((${createMailbox.toString()}),${JSON.stringify(workerSource)},${JSON.stringify(PROGRAMMATIC_LIMITS)},(${WorkerHandle.toString()}));`;
 }

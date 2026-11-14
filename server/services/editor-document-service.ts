@@ -255,6 +255,17 @@ const expired = () =>
 const invalid = (message: string) => new EditorDocumentError("EDITOR_INVALID_STATE", message);
 // Optional restart metadata must not consume the target write's full IO budget.
 const RECOVERY_BUDGET_MS = 1_000;
+function editorDiagnostic(
+	level: "warn" | "debug",
+	message: string,
+	fields: Record<string, string | number | boolean | null>,
+) {
+	try {
+		logger[level](message, fields);
+	} catch {
+		// A diagnostic sink must not replace a write outcome or bypass cleanup.
+	}
+}
 
 function storageUnavailable(message: string): AppError {
 	return new AppError(message, 503, "EDITOR_STORAGE_UNAVAILABLE");
@@ -341,6 +352,22 @@ async function ensureEditorTempDirectory(root: string): Promise<string> {
 
 /** All state is bounded metadata. Text exists only in worker memory and private temporary objects. */
 export class EditorDocumentService {
+	/** HMR must never treat an older, untracked worker owner as safely empty. */
+	readonly lifecycleVersion = 2;
+	private disposed = false;
+	private closing?: Promise<void>;
+	private readonly pending = new Set<Promise<unknown>>();
+	private assertOpen() {
+		if (this.disposed)
+			throw new EditorDocumentError("EDITOR_CLOSED", "Editor documents are closed", 503);
+	}
+	private track<T>(body: () => Promise<T>): Promise<T> {
+		this.assertOpen();
+		const operation = Promise.resolve().then(body);
+		this.pending.add(operation);
+		void operation.finally(() => this.pending.delete(operation)).catch(() => {});
+		return operation;
+	}
 	private sessions = new Map<string, Session>();
 	private operations = new Map<string, Operation>();
 	private readonly jobs: EditorDocumentJobs;
@@ -420,6 +447,7 @@ export class EditorDocumentService {
 		return this.draftAnchors.create(owner, input, settled);
 	}
 	private initialize(): Promise<void> {
+		this.assertOpen();
 		this.ready ??= this.bootstrap().catch((error) => {
 			// Allow the next editor open to retry after a transient FS failure.
 			this.ready = undefined;
@@ -435,9 +463,13 @@ export class EditorDocumentService {
 		});
 		if (cleaned.kind !== "cleaned") throw invalid("Unexpected recovery worker response");
 		if (cleaned.unavailableRecoveryCount)
-			logger.warn("Editor recovery descriptions unavailable at startup; files retained", {
-				count: cleaned.unavailableRecoveryCount,
-			});
+			editorDiagnostic(
+				"warn",
+				"Editor recovery descriptions unavailable at startup; files retained",
+				{
+					count: cleaned.unavailableRecoveryCount,
+				},
+			);
 		for (const recovery of cleaned.operations)
 			this.addOperation(recovery.operationId, {
 				userId: recovery.userId,
@@ -457,10 +489,9 @@ export class EditorDocumentService {
 			const previous = this.rootIdentity;
 			this.rootIdentity = identity;
 			if (previous !== identity)
-				logger.warn("Repaired editor temporary directory", {
-					path: this.deps.root,
-					previousIdentity: previous ?? null,
-					identity,
+				editorDiagnostic("warn", "Repaired editor temporary directory", {
+					repaired: true,
+					previouslyKnown: previous !== undefined,
 				});
 		})().finally(() => {
 			this.heal = undefined;
@@ -506,6 +537,7 @@ export class EditorDocumentService {
 	/** Routes still require current narrator ACL. These operations expose only the
 	 * verified owner's private transfer metadata, never file bytes or write authority. */
 	private async owned(actor: EditorActor, docId: string) {
+		this.assertOpen();
 		const session = this.sessions.get(docId);
 		if (
 			!session ||
@@ -548,9 +580,17 @@ export class EditorDocumentService {
 		input: CreateEditorDocumentInput,
 		signal?: AbortSignal,
 	): Promise<EditorDocumentDescriptor> {
+		return this.track(() => this.createActive(actor, input, signal));
+	}
+	private async createActive(
+		actor: EditorActor,
+		input: CreateEditorDocumentInput,
+		signal?: AbortSignal,
+	): Promise<EditorDocumentDescriptor> {
 		await this.initialize();
 		await this.assertStore();
 		const binding = await actor.authorize(input, "read");
+		this.assertOpen();
 		if (
 			this.sessions.size >= EDITOR_MAX_SESSIONS ||
 			(this.userSessions.get(actor.userId) ?? 0) >= EDITOR_USER_MAX_SESSIONS
@@ -792,7 +832,10 @@ export class EditorDocumentService {
 		await this.owned(actor, docId);
 		await this.streams.close(docId, readId);
 	}
-	async content(
+	async content(...args: Parameters<EditorDocumentService["contentActive"]>) {
+		return this.track(() => this.contentActive(...args));
+	}
+	private async contentActive(
 		actor: EditorActor,
 		docId: string,
 		versionHandle: string,
@@ -885,8 +928,8 @@ export class EditorDocumentService {
 					408,
 				),
 			);
-			void close().catch((error) =>
-				logger.debug("Editor download cleanup failed", { error: String(error) }),
+			void close().catch(() =>
+				editorDiagnostic("debug", "Editor download cleanup failed", { cleanupFailed: true }),
 			);
 		};
 		const touch = () => {
@@ -1035,7 +1078,10 @@ export class EditorDocumentService {
 			generated();
 		}
 	}
-	async createUpload(
+	async createUpload(...args: Parameters<EditorDocumentService["createUploadActive"]>) {
+		return this.track(() => this.createUploadActive(...args));
+	}
+	private async createUploadActive(
 		actor: EditorActor,
 		docId: string,
 		input: CreateEditorUploadInput,
@@ -1098,7 +1144,10 @@ export class EditorDocumentService {
 		if (value.session.closing || !this.sessions.has(docId)) throw expired();
 		return value;
 	}
-	async putChunk(
+	async putChunk(...args: Parameters<EditorDocumentService["putChunkActive"]>) {
+		return this.track(() => this.putChunkActive(...args));
+	}
+	private async putChunkActive(
 		actor: EditorActor,
 		docId: string,
 		uploadId: string,
@@ -1227,7 +1276,10 @@ export class EditorDocumentService {
 			if (session.closing) await this.release(session);
 		}
 	}
-	async sealRaw(
+	async sealRaw(...args: Parameters<EditorDocumentService["sealRawActive"]>) {
+		return this.track(() => this.sealRawActive(...args));
+	}
+	private async sealRawActive(
 		actor: EditorActor,
 		docId: string,
 		uploadId: string,
@@ -1298,7 +1350,10 @@ export class EditorDocumentService {
 		if (!upload) throw expired();
 		return upload;
 	}
-	async put(
+	async put(...args: Parameters<EditorDocumentService["putActive"]>) {
+		return this.track(() => this.putActive(...args));
+	}
+	private async putActive(
 		actor: EditorActor,
 		docId: string,
 		uploadId: string,
@@ -1410,7 +1465,10 @@ export class EditorDocumentService {
 			if (session.closing) await this.release(session);
 		}
 	}
-	async commit(
+	async commit(...args: Parameters<EditorDocumentService["commitActive"]>) {
+		return this.track(() => this.commitActive(...args));
+	}
+	private async commitActive(
 		actor: EditorActor,
 		docId: string,
 		uploadId: string,
@@ -1629,9 +1687,9 @@ export class EditorDocumentService {
 									throw error;
 								// The worker is terminated before releasing its files on cancellation.
 								// This is only the editor's restart description, not file-change history.
-								logger.warn("Editor save recovery description unavailable", {
+								editorDiagnostic("warn", "Editor save recovery description unavailable", {
 									operationId,
-									error: String(error),
+									reason: "description_unavailable",
 								});
 							}
 							return {
@@ -1698,8 +1756,8 @@ export class EditorDocumentService {
 					session.looseFiles.delete(conflictPath);
 					this.reserve(session, -conflictReserved);
 				}
-			} catch (error) {
-				logger.warn("Editor preparation cleanup deferred", { error: String(error) });
+			} catch {
+				editorDiagnostic("warn", "Editor preparation cleanup deferred", { cleanupFailed: true });
 			}
 			await this.cleanUpload(session, upload);
 			if (session.closing) await this.release(session);
@@ -1784,9 +1842,9 @@ export class EditorDocumentService {
 				});
 				this.reserve(session, -upload.reserved);
 				upload.reserved = 0;
-			} catch (error) {
+			} catch {
 				// Preserve the reservation for the retry; cleanup cannot reverse a saved receipt.
-				logger.warn("Editor upload cleanup deferred", { error: String(error) });
+				editorDiagnostic("warn", "Editor upload cleanup deferred", { cleanupFailed: true });
 			}
 		})();
 		try {
@@ -1822,8 +1880,8 @@ export class EditorDocumentService {
 					this.reserve(session, -session.reserved);
 					this.count(this.userSessions, session.userId, -1);
 				}
-			} catch (error) {
-				logger.warn("Editor session cleanup deferred", { error: String(error) });
+			} catch {
+				editorDiagnostic("warn", "Editor session cleanup deferred", { cleanupFailed: true });
 			}
 		})();
 		try {
@@ -1857,17 +1915,37 @@ export class EditorDocumentService {
 						this.count(this.userBytes, operation.userId, -EDITOR_METADATA_MAX_BYTES);
 						this.totalBytes -= EDITOR_METADATA_MAX_BYTES;
 					}
-				} catch (error) {
-					logger.warn("Editor recovery cleanup deferred", { error: String(error) });
+				} catch {
+					editorDiagnostic("warn", "Editor recovery cleanup deferred", { cleanupFailed: true });
 				}
 			}
 			if (++scanned % 64 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
-	async dispose() {
+	/** Production drain; idempotent and never resolves while an owned FD/worker remains live. */
+	dispose(): Promise<void> {
+		if (this.closing) return this.closing;
+		this.disposed = true;
 		clearInterval(this.timer);
-		await this.streams.dispose();
-		for (const cancel of this.downloads.keys()) await cancel();
-		for (const session of this.sessions.values()) await this.release(session);
+		const jobs = this.jobs.close();
+		const streams = this.streams.dispose();
+		this.closing = (async () => {
+			const releases = [...this.sessions.values()].map((session) => this.release(session));
+			const downloads = [...this.downloads.keys()].map((cancel) => cancel());
+			const cleanup = await Promise.allSettled([jobs, streams, ...releases, ...downloads]);
+			await Promise.allSettled([...this.pending, this.ready, this.sweeping]);
+			// A bootstrap that was already running may have installed its timer after shutdown began.
+			clearInterval(this.timer);
+			for (const session of this.sessions.values()) await this.release(session);
+			const failure = cleanup.find((result) => result.status === "rejected");
+			if (failure?.status === "rejected") throw failure.reason;
+			if (this.sessions.size || this.downloads.size)
+				throw new EditorDocumentError(
+					"EDITOR_CLEANUP_FAILED",
+					"Editor resources remain owned",
+					503,
+				);
+		})();
+		return this.closing;
 	}
 }

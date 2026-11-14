@@ -1,5 +1,5 @@
 import { unlink } from "node:fs/promises";
-import { Worker } from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
 	DEFAULT_RECORDING_RESPONSE_BYTES,
@@ -15,7 +15,7 @@ import {
 	type RequestRecordingDetail,
 	type SavedRecording,
 } from "../../shared/request-recording";
-import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "./compiled-worker";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "./compiled-worker";
 import { diskSafetySettings } from "./disk-safety";
 import { AppError } from "./errors";
 import { hotSafe } from "./hot-safe";
@@ -33,6 +33,8 @@ import {
 } from "./request-recorder-protocol";
 import { sanitizeRecordingMetadata } from "./request-recorder-sanitize";
 import { settings } from "./settings";
+import { WorkerCleanupError, type WorkerHandle } from "./worker-runtime/lifecycle";
+import { TaskQueue, TaskQueueError, type TaskQueuePermit } from "./worker-runtime/queue";
 
 export { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "./request-recorder-protocol";
 
@@ -73,6 +75,14 @@ interface Waiter {
 	signal?: AbortSignal;
 }
 
+interface RecorderClientOptions {
+	/** Injection is for real-worker fault tests; production always uses the compiled connector. */
+	connect?: typeof connectCompiledWorker;
+	readyTimeoutMs?: number;
+	operationTimeoutMs?: number;
+	archiveTimeoutMs?: number;
+}
+
 /** A single bounded mailbox. Worker compression never blocks the ingestion queue. */
 export class RequestRecorderClient {
 	private worker?: Worker;
@@ -88,104 +98,162 @@ export class RequestRecorderClient {
 	private lastWarning = 0;
 	private retryAt = 0;
 	private closed = false;
-	private generation = 0;
+	private stopping = false;
+	private closing?: Promise<void>;
+	private retiring?: Promise<void>;
+	private failure?: unknown;
+	private handle?: WorkerHandle<Worker>;
+	private workerPermit?: TaskQueuePermit;
+	private readonly resources = new TaskQueue({ concurrency: 1, maxQueued: 0 });
+	private readonly recordingAdmission = new TaskQueue({ concurrency: 128, maxQueued: 0 });
+	private readonly calls = new TaskQueue({ concurrency: 16, maxQueued: 0 });
+	private readonly callPermits = new Map<number, Promise<TaskQueuePermit>>();
+	private readonly operationTimers = new Map<number, ReturnType<typeof setTimeout>>();
+	private drainWaiter?: { resolve(): void; reject(error: unknown): void };
 	// Admission lasts through end ACK, including begins still in the mailbox and closing requests.
-	private recordings = new Map<string, { beginId: number; endId?: number; bound?: boolean }>();
+	private recordings = new Map<
+		string,
+		{ beginId: number; endId?: number; bound?: boolean; permit: Promise<TaskQueuePermit> }
+	>();
 	private lifecycle = new Map<number, { type: "begin" | "end"; requestId: string }>();
 	private static readonly MAX_RECORDINGS = 128;
 	private static readonly MAX_OPERATIONS = 2048;
 	private static readonly CONTROL_BYTES = 16 * 1024;
 	private static readonly GAP_BYTES = 2048;
-	constructor(readonly home: string) {}
+	constructor(
+		readonly home: string,
+		private readonly options: RecorderClientOptions = {},
+	) {}
+	/** Hot reload must not reuse a legacy client without real-exit ownership evidence. */
+	ownsWorkerLifecycle(): boolean {
+		return true;
+	}
 	private warn(error: unknown): void {
 		if (Date.now() - this.lastWarning < 10_000) return;
 		this.lastWarning = Date.now();
-		logger.warn("Request recording unavailable or incomplete", { error: String(error) });
+		// Diagnostics never contain request data, paths or raw errors, and cannot break cleanup.
+		try {
+			logger.warn("Request recording unavailable or incomplete", {
+				failed: error !== undefined,
+				queued: this.queued.length,
+				inflight: this.inflight.size,
+			});
+		} catch {}
 	}
 	private start(): Promise<void> {
 		if (this.starting) return this.starting;
-		const generation = ++this.generation;
-		this.starting = (async () => {
-			const paths = compiledWorkerSpecifiers(
-				"lib/request-recorder-worker.ts",
-				"./request-recorder-worker.ts",
-				import.meta.url,
-			);
-			let failure: unknown;
-			for (const path of paths) {
-				if (this.closed || generation !== this.generation) return;
-				const worker = new Worker(workerEntryFromSpecifier(path), {
-					workerData: { home: this.home },
-				});
+		if (this.closed || this.retiring)
+			return Promise.reject(new AppError("Recording worker unavailable", 503, "RECORDING_BUSY"));
+		const job = (async () => {
+			this.workerPermit = await this.resources.acquire({ deadlineAt: Infinity });
+			try {
+				const connected = await (this.options.connect ?? connectCompiledWorker)(
+					compiledWorkerSpecifiers(
+						"lib/request-recorder-worker.ts",
+						"./request-recorder-worker.ts",
+						import.meta.url,
+					),
+					{
+						workerOptions: { workerData: { home: this.home } },
+						timeoutMs: this.options.readyTimeoutMs ?? 10_000,
+						sendPing: false,
+					},
+				);
+				this.handle = connected.handle;
+				const worker = connected.worker;
 				this.worker = worker;
-				// Bun may emit a probe failure more than once, including during termination.
-				// Keep a listener on retired workers too; active failures are handled below.
-				worker.on("error", () => {});
-				try {
-					await new Promise<void>((resolveReady, reject) => {
-						const timer = setTimeout(
-							() => reject(new Error("Recording worker startup timeout")),
-							10_000,
-						);
-						const onError = (error: Error) => {
-							clearTimeout(timer);
-							reject(error);
-						};
-						worker.once("error", onError);
-						worker.once("exit", () => onError(new Error("Recording worker exited during startup")));
-						worker.once("message", (message: { ready?: boolean }) => {
-							clearTimeout(timer);
-							worker.removeListener("error", onError);
-							if (message.ready) resolveReady();
-							else reject(new Error("Recording worker did not become ready"));
-						});
-					});
-					if (this.closed || generation !== this.generation) {
-						await worker.terminate();
-						return;
-					}
-					this.ready = true;
-					worker.on("message", (message: RecorderReply) => {
-						if (this.worker === worker) this.onReply(message);
-					});
-					worker.on("error", (error) => {
-						if (this.worker === worker) this.fail(error);
-					});
-					worker.on("exit", (code) => {
-						if (!this.closed && this.worker === worker)
-							this.fail(new Error(`Recording worker exited (${code})`));
-					});
-					this.pump();
-					return;
-				} catch (error) {
-					failure = error;
-					await worker.terminate();
+				// A timeout/forced close during readiness can never publish a replacement.
+				if (this.closed || this.retiring) {
+					await connected.handle.close();
+					throw new Error("Recording client stopped during startup");
 				}
+				this.failure = undefined;
+				this.ready = true;
+				worker.on("message", (message: RecorderReply) => {
+					if (this.worker === worker && this.ready) this.onReply(message);
+				});
+				worker.on("error", (error) => {
+					if (this.worker === worker) this.fail(error);
+				});
+				worker.on("messageerror", () => {
+					if (this.worker === worker) this.fail(new Error("Invalid recording worker message"));
+				});
+				void connected.handle.exited.then(() => {
+					if (!this.closed && this.worker === worker)
+						this.fail(new Error("Recording worker exited"));
+				});
+				this.pump();
+			} catch (error) {
+				if (error instanceof WorkerCleanupError) this.handle = error.handle as WorkerHandle<Worker>;
+				this.fail(error);
+				throw error;
 			}
-			throw failure ?? new Error("Recording worker unavailable");
-		})().catch((error) => {
-			if (generation === this.generation) this.fail(error);
-			throw error;
-		});
-		return this.starting;
+		})();
+		this.starting = job;
+		void job.finally(() => this.checkDrained()).catch(() => {});
+		return job;
+	}
+	private clearOperation(id: number): void {
+		clearTimeout(this.operationTimers.get(id));
+		this.operationTimers.delete(id);
+		const permit = this.callPermits.get(id);
+		this.callPermits.delete(id);
+		if (permit)
+			void permit.then(
+				(value) => value.release(),
+				() => {},
+			);
+	}
+	private releaseRecording(requestId: string): void {
+		const record = this.recordings.get(requestId);
+		this.recordings.delete(requestId);
+		if (record)
+			void record.permit.then(
+				(permit) => permit.release(),
+				() => {},
+			);
+	}
+	private checkDrained(): void {
+		if (this.failure) this.drainWaiter?.reject(this.failure);
+		else if (!this.queued.length && !this.inflight.size) this.drainWaiter?.resolve();
 	}
 	private fail(error: unknown): void {
-		const worker = this.worker;
-		this.worker = undefined;
-		this.generation++;
-		if (worker) void worker.terminate().catch(() => {});
+		if (this.retiring) return;
 		this.ready = false;
-		this.starting = undefined;
+		this.failure = error;
 		this.lastConfig = "";
 		this.retryAt = Date.now() + 10_000;
-		if (!this.closed) this.warn(error);
 		for (const id of [...this.waiters.keys()]) this.settle(id, undefined, error);
-		this.queued = [];
-		this.queuedBytes = 0;
-		this.inflight.clear();
-		this.inflightBytes = 0;
-		this.recordings.clear();
-		this.lifecycle.clear();
+		for (const timer of this.operationTimers.values()) clearTimeout(timer);
+		this.operationTimers.clear();
+		this.checkDrained();
+		this.warn(error);
+		// Capture admission, inflight bytes and the resource slot remain owned until real exit.
+		// If readiness is still pending, retain ownership until its connector also finishes cleanup.
+		const startup = this.starting;
+		const cleanup = (async () => {
+			if (!this.handle && startup) await startup.catch(() => {});
+			await this.handle?.close();
+			this.worker = undefined;
+			this.handle = undefined;
+			for (const requestId of this.recordings.keys()) this.releaseRecording(requestId);
+			for (const id of this.callPermits.keys()) this.clearOperation(id);
+			this.queued = [];
+			this.queuedBytes = 0;
+			this.inflight.clear();
+			this.inflightBytes = 0;
+			this.lifecycle.clear();
+			this.workerPermit?.release();
+			this.workerPermit = undefined;
+			this.starting = undefined;
+		})();
+		this.retiring = cleanup;
+		void cleanup.then(
+			() => {
+				if (this.retiring === cleanup) this.retiring = undefined;
+			},
+			() => {}, // Failed cleanup stays latched and owns its handle/permits (fail closed).
+		);
 	}
 	private settle(id: number, value?: unknown, error?: unknown): void {
 		const waiter = this.waiters.get(id);
@@ -197,6 +265,8 @@ export class RequestRecorderClient {
 		else waiter.resolve(value);
 	}
 	private onReply(message: RecorderReply): void {
+		if (!this.inflight.has(message.id)) return;
+		this.clearOperation(message.id);
 		this.inflightBytes -= this.inflight.get(message.id) ?? 0;
 		this.inflight.delete(message.id);
 		const error = message.error
@@ -208,19 +278,27 @@ export class RequestRecorderClient {
 			const recording = this.recordings.get(lifecycle.requestId);
 			if (lifecycle.type === "begin" && error && recording?.beginId === message.id)
 				this.release(lifecycle.requestId, error);
-			else if (lifecycle.type === "end" && recording?.endId === message.id)
-				this.recordings.delete(lifecycle.requestId);
+			else if (lifecycle.type === "end" && recording?.endId === message.id) {
+				// A failed end does not prove termination of its active store record.
+				if (error) {
+					this.fail(error);
+					return;
+				}
+				this.releaseRecording(lifecycle.requestId);
+			}
 		}
 		if (error && !this.waiters.has(message.id)) this.warn(error);
 		this.settle(message.id, message.value, error);
 		this.pump();
+		this.checkDrained();
 	}
 	private release(requestId: string, error: unknown): void {
-		this.recordings.delete(requestId);
+		this.releaseRecording(requestId);
 		this.queued = this.queued.filter((item) => {
 			if (!("requestId" in item.op) || item.op.requestId !== requestId) return true;
 			this.queuedBytes -= item.bytes;
 			this.lifecycle.delete(item.id);
+			this.clearOperation(item.id);
 			this.settle(item.id, undefined, error);
 			return false;
 		});
@@ -290,17 +368,22 @@ export class RequestRecorderClient {
 		);
 	}
 	private gap(op: Extract<RecorderOperation, { type: "chunk" | "meta" }>): void {
-		this.enqueue({
-			type: "gap",
-			requestId: op.requestId,
-			side: op.side,
-			bytes: op.type === "chunk" ? op.data.byteLength : 0,
-			reason: op.type === "chunk" ? "mailbox overload" : "mailbox overload: metadata missing",
-		});
+		this.enqueue(
+			{
+				type: "gap",
+				requestId: op.requestId,
+				side: op.side,
+				bytes: op.type === "chunk" ? op.data.byteLength : 0,
+				reason: op.type === "chunk" ? "mailbox overload" : "mailbox overload: metadata missing",
+			},
+			undefined,
+			true,
+		);
 	}
 	private drop(index: number): void {
 		const [item] = this.queued.splice(index, 1);
 		this.queuedBytes -= item.bytes;
+		this.clearOperation(item.id);
 		if (item.op.type === "chunk" || item.op.type === "meta") this.gap(item.op);
 		this.settle(
 			item.id,
@@ -308,19 +391,23 @@ export class RequestRecorderClient {
 			new AppError("Recording evidence dropped by overload", 429, "RECORDING_BUSY"),
 		);
 	}
-	private enqueue(op: RecorderOperation, id = ++this.sequence): boolean {
-		if (this.closed || Date.now() < this.retryAt) return false;
+	private enqueue(op: RecorderOperation, id = ++this.sequence, internal = false): boolean {
+		if (this.closed || (this.stopping && !internal) || this.retiring || Date.now() < this.retryAt)
+			return false;
 		let admitted = false;
 		if (op.type === "begin") {
 			const requestId = op.identity.requestId;
 			if (
 				this.recordings.size >= RequestRecorderClient.MAX_RECORDINGS ||
+				this.recordingAdmission.stats.active >= RequestRecorderClient.MAX_RECORDINGS ||
 				this.recordings.has(requestId) ||
 				Buffer.byteLength(JSON.stringify(requestId)) > 512 ||
 				this.operationBytes(op) > RequestRecorderClient.CONTROL_BYTES
 			)
 				return false;
-			this.recordings.set(requestId, { beginId: id });
+			const permit = this.recordingAdmission.acquire({ deadlineAt: Infinity });
+			void permit.catch((error) => this.fail(error));
+			this.recordings.set(requestId, { beginId: id, permit });
 			admitted = true;
 		} else if (
 			op.type === "chunk" ||
@@ -383,7 +470,7 @@ export class RequestRecorderClient {
 				? RequestRecorderClient.GAP_BYTES
 				: RequestRecorderClient.CONTROL_BYTES;
 		if (op.type !== "chunk" && op.type !== "meta" && bytes > maximum) {
-			if (admitted && op.type === "begin") this.recordings.delete(op.identity.requestId);
+			if (admitted && op.type === "begin") this.releaseRecording(op.identity.requestId);
 			return false;
 		}
 		while (!this.fits(bytes, op)) {
@@ -404,7 +491,7 @@ export class RequestRecorderClient {
 					continue;
 				}
 			}
-			if (admitted && op.type === "begin") this.recordings.delete(op.identity.requestId);
+			if (admitted && op.type === "begin") this.releaseRecording(op.identity.requestId);
 			if (op.type === "chunk" || op.type === "meta") this.gap(op);
 			this.warn("control mailbox overload");
 			return false;
@@ -430,6 +517,18 @@ export class RequestRecorderClient {
 			if (recording) recording.endId = id;
 			this.lifecycle.set(id, { type: "end", requestId: op.requestId });
 		}
+		// Every posted capture/control has a finite ACK phase, independent of recording duration.
+		const timeout =
+			op.type === "archive"
+				? (this.options.archiveTimeoutMs ?? 65_000)
+				: (this.options.operationTimeoutMs ?? 30_000);
+		this.operationTimers.set(
+			id,
+			setTimeout(
+				() => this.fail(new AppError("Recording ACK timed out", 504, "RECORDING_TIMEOUT")),
+				timeout,
+			),
+		);
 		void this.start().catch(() => {});
 		this.pump();
 		return true;
@@ -455,12 +554,27 @@ export class RequestRecorderClient {
 		}
 	}
 	async call<T>(op: RecorderOperation, signal?: AbortSignal): Promise<T> {
+		return this.callOperation(op, signal);
+	}
+	private async callOperation<T>(
+		op: RecorderOperation,
+		signal?: AbortSignal,
+		internal = false,
+	): Promise<T> {
 		signal?.throwIfAborted();
-		if (this.waiters.size >= 16)
+		if (this.closed || (this.stopping && !internal))
+			throw new AppError("Recording client closed", 503, "RECORDING_CLOSED");
+		if (this.calls.stats.active >= 16)
 			throw new AppError("Recording operations are busy", 429, "RECORDING_BUSY");
 		const id = ++this.sequence;
+		const permit = this.calls.acquire({ deadlineAt: Infinity });
+		this.callPermits.set(id, permit);
+		void permit.catch((error) => this.fail(error));
 		return new Promise<T>((resolveCall, reject) => {
-			const timeout = op.type === "archive" ? 65_000 : 30_000;
+			const timeout =
+				op.type === "archive"
+					? (this.options.archiveTimeoutMs ?? 65_000)
+					: (this.options.operationTimeoutMs ?? 30_000);
 			const abort = () => {
 				const error = new AppError(
 					"Recording operation cancelled or timed out",
@@ -473,6 +587,7 @@ export class RequestRecorderClient {
 					if (removed) {
 						this.queuedBytes -= removed.bytes;
 						this.queued = this.queued.filter((item) => item.id !== id);
+						this.clearOperation(id);
 						if (op.type === "chunk" || op.type === "meta") this.gap(op);
 					}
 					if (op.type === "begin") {
@@ -490,6 +605,7 @@ export class RequestRecorderClient {
 					}
 				}
 				this.settle(id, undefined, error);
+				this.checkDrained();
 			};
 			const timer = setTimeout(abort, timeout);
 			this.waiters.set(id, {
@@ -501,13 +617,16 @@ export class RequestRecorderClient {
 			});
 			signal?.addEventListener("abort", abort, { once: true });
 			try {
-				if (!this.enqueue(op, id))
+				if (!this.enqueue(op, id, internal)) {
+					this.clearOperation(id);
 					this.settle(
 						id,
 						undefined,
 						new AppError("Recording mailbox is busy", 429, "RECORDING_BUSY"),
 					);
+				}
 			} catch (error) {
+				this.clearOperation(id);
 				if (op.type === "chunk" || op.type === "meta") {
 					try {
 						this.gap(op);
@@ -517,19 +636,97 @@ export class RequestRecorderClient {
 			}
 		});
 	}
-	/** Isolated clients may be closed by tests; never used to restart the application. */
-	async close(): Promise<void> {
-		this.closed = true;
-		const worker = this.worker;
-		this.fail(new Error("Recording client closed"));
-		await worker?.terminate();
+	/** Stop producers, finish admitted captures, drain independent jobs, flush, then confirm exit. */
+	close(): Promise<void> {
+		if (this.closing) return this.closing;
+		this.stopping = true;
+		this.closing = (async () => {
+			let failure: unknown = this.failure;
+			try {
+				if (failure) throw failure;
+				for (const [requestId, recording] of this.recordings) {
+					if (
+						!recording.endId &&
+						!this.enqueue({ type: "end", requestId, status: "aborted" }, undefined, true)
+					)
+						throw new Error("Recording terminal admission failed");
+				}
+				// flush alone is not a barrier for independent archive/list/detail jobs.
+				await new Promise<void>((resolve, reject) => {
+					this.drainWaiter = { resolve, reject };
+					this.checkDrained();
+				});
+				if (this.starting) {
+					await this.starting;
+					await this.callOperation({ type: "flush" }, undefined, true);
+				}
+			} catch (error) {
+				failure = error;
+				this.fail(error);
+			} finally {
+				this.drainWaiter = undefined;
+				this.closed = true;
+				// No permit is returned on timeout/failed termination; failed owners stay latched.
+				if (this.retiring) await this.retiring;
+				else {
+					await this.starting?.catch(() => {});
+					await this.handle?.close();
+					this.worker = undefined;
+					this.handle = undefined;
+					this.workerPermit?.release();
+					this.workerPermit = undefined;
+				}
+				await Promise.all([
+					this.resources.close(),
+					this.recordingAdmission.close(),
+					this.calls.close(),
+				]);
+			}
+			if (failure) throw failure;
+		})();
+		return this.closing;
 	}
 }
 const clients = hotSafe(
 	"request-recording-clients",
 	() => new Map<string, RequestRecorderClient>(),
 );
+const recorderOwner = hotSafe("request-recording-runtime-owner.v1", () => ({
+	closed: false,
+	closing: undefined as Promise<void> | undefined,
+	downloads: new TaskQueue({ concurrency: RECORDING_MAX_DOWNLOADS, maxQueued: 0 }),
+}));
+function assertLifecycleOwner(value: RequestRecorderClient): void {
+	if (typeof value.ownsWorkerLifecycle !== "function" || !value.ownsWorkerLifecycle())
+		throw new AppError(
+			"Recording runtime changed; restart required",
+			503,
+			"RECORDING_RESTART_REQUIRED",
+		);
+}
+/** Permanent process shutdown latch; callers must await rejection before marking shutdown clean. */
+export function closeRequestRecorderWorkers(): Promise<void> {
+	if (recorderOwner.closing) return recorderOwner.closing;
+	recorderOwner.closed = true;
+	recorderOwner.closing = (async () => {
+		const results = await Promise.allSettled([
+			recorderOwner.downloads.close(),
+			...Array.from(clients.values(), async (value) => {
+				assertLifecycleOwner(value);
+				await value.close();
+			}),
+		]);
+		const failures = results.filter((value) => value.status === "rejected");
+		if (failures.length)
+			throw new AggregateError(
+				failures.map((value) => value.reason),
+				"Recording shutdown failed",
+			);
+	})();
+	return recorderOwner.closing;
+}
 function client(): RequestRecorderClient {
+	if (recorderOwner.closed) throw new AppError("Recording workers closed", 503, "RECORDING_CLOSED");
 	const home = getNarraforkHome();
 	let value = clients.get(home);
 	if (!value) {
@@ -537,6 +734,7 @@ function client(): RequestRecorderClient {
 		value = new RequestRecorderClient(home);
 		clients.set(home, value);
 	}
+	assertLifecycleOwner(value);
 	value.configure(requestRecordingSettings());
 	return value;
 }
@@ -649,16 +847,21 @@ export function createRequestRecording(identity: RecordingIdentity): RequestReco
 	let port: RequestRecorderClient;
 	try {
 		port = client();
-	} catch (error) {
-		logger.warn("Could not start request recording", { error: String(error) });
+	} catch {
+		try {
+			logger.warn("Could not start request recording", { unavailable: true });
+		} catch {}
 		return undefined;
 	}
-	port.capture({
-		type: "begin",
-		identity,
-		continuous: config.autoPin !== "off",
-		errorsOnly: config.autoPin === "errors",
-	});
+	if (
+		!port.capture({
+			type: "begin",
+			identity,
+			continuous: config.autoPin !== "off",
+			errorsOnly: config.autoPin === "errors",
+		})
+	)
+		return undefined;
 	let packet = 0;
 	let finished = false;
 	const notices = new Set<string>();
@@ -736,11 +939,15 @@ export function createRequestRecording(identity: RecordingIdentity): RequestReco
 	};
 }
 export function bindRecordingRequest(requestId: string, apiRequestId: string): void {
-	clients.get(getNarraforkHome())?.capture({ type: "bind", requestId, apiRequestId });
+	const value = clients.get(getNarraforkHome());
+	if (recorderOwner.closed || !value || typeof value.ownsWorkerLifecycle !== "function") return;
+	value.capture({ type: "bind", requestId, apiRequestId });
 }
 /** Pin a (possibly already finished) recording; a no-op when it already left the ring. */
 export function pinRecordingRequest(requestId: string, reason: RecordingPinReason): void {
-	clients.get(getNarraforkHome())?.capture({ type: "pin", requestId, reason });
+	const value = clients.get(getNarraforkHome());
+	if (recorderOwner.closed || !value || typeof value.ownsWorkerLifecycle !== "function") return;
+	value.capture({ type: "pin", requestId, reason });
 }
 export async function saveRequestRecording(narratorId: string): Promise<SavedRecording> {
 	return client().call({ type: "save", narratorId });
@@ -852,14 +1059,34 @@ export async function downloadSavedRecording(
 	saveId: string,
 	signal?: AbortSignal,
 ): Promise<Response> {
+	if (recorderOwner.closed) throw new AppError("Recording workers closed", 503, "RECORDING_CLOSED");
 	if (activeDownloads.size >= RECORDING_MAX_DOWNLOADS)
 		throw new AppError(
 			"Recording downloads are busy; retry after a transfer completes",
 			429,
 			"RECORDING_BUSY",
 		);
+	// No queued transfer waiters: a lease survives archive creation and the entire HTTP body.
+	let permit: TaskQueuePermit;
+	try {
+		permit = await recorderOwner.downloads.acquire({ deadlineAt: Infinity, signal });
+	} catch (error) {
+		if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL")
+			throw new AppError(
+				"Recording downloads are busy; retry after a transfer completes",
+				429,
+				"RECORDING_BUSY",
+			);
+		if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_CLOSED")
+			throw new AppError("Recording workers closed", 503, "RECORDING_CLOSED");
+		throw error;
+	}
 	const lease = Symbol("recording-download");
 	activeDownloads.add(lease);
+	const release = () => {
+		activeDownloads.delete(lease);
+		permit.release();
+	};
 	let handedOff = false;
 	try {
 		const artifact = await client().call<{ path: string; bytes: number }>(
@@ -871,11 +1098,11 @@ export async function downloadSavedRecording(
 			saveId,
 			signal,
 			RECORDING_DOWNLOAD_LEASE_MS,
-			() => activeDownloads.delete(lease),
+			release,
 		);
 		handedOff = true;
 		return response;
 	} finally {
-		if (!handedOff) activeDownloads.delete(lease);
+		if (!handedOff) release();
 	}
 }

@@ -572,7 +572,7 @@ test("pending close rejected by worker error keeps its parent FD until that slot
 	}
 });
 
-test("source workers preflight and streamed EOF have no idle FD/body", async () => {
+test("preflight closes its FD; streamed EOF retains the parent FD and credit until consumer close", async () => {
 	const { path, streams } = await fixture();
 	const metadata = await streams.metadata("user", path);
 	expect(metadata.eolCounts).toEqual({ LF: 1, CRLF: 1, CR: 0 });
@@ -587,7 +587,7 @@ test("source workers preflight and streamed EOF have no idle FD/body", async () 
 		if (chunk.eof) break;
 	}
 	expect(offset).toBe(metadata.sourceBytes);
-	expect(await sourceFds(path)).toBe(0);
+	expect(await sourceFds(path)).toBe(1);
 	expect(streams.diagnostics.active).toBe(1);
 	const eofCounters = await streams.workers.counters();
 	await new Promise((resolve) => setTimeout(resolve, 20));

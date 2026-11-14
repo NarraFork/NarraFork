@@ -35,7 +35,7 @@ async function query(sql: string, params: SelectRowsParams["params"] = [], maxRo
 	);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	home = mkdtempSync(join(tmpdir(), "narrafork-search-worker-"));
 	dbPath = join(home, "fixture.db");
 	writer = new Database(dbPath);
@@ -46,11 +46,11 @@ beforeEach(() => {
 	writer.run("INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages");
 	previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
-	resetDbWorkerPoolForTest();
+	await resetDbWorkerPoolForTest();
 });
 
-afterEach(() => {
-	shutdownDbWorkerPool();
+afterEach(async () => {
+	await shutdownDbWorkerPool();
 	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 	writer.close();

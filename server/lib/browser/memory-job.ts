@@ -1,3 +1,4 @@
+import { TaskQueue } from "../worker-runtime/queue";
 import { MEMORY_CLEANUP_TIMEOUT_MS } from "./memory-constants";
 import type { BrowserSession } from "./session";
 
@@ -5,14 +6,75 @@ import type { BrowserSession } from "./session";
 export interface BrowserMemoryJob {
 	controller: AbortController;
 	done: Promise<void>;
+	/** Physical cleanup outlives a bounded RPC response. Never serialized. */
+	resources?: Set<Promise<unknown>>;
 }
 
-/** Cancel before closing/preserving a context. Never hold shutdown hostage. */
-export async function cancelMemoryJob(session: BrowserSession): Promise<void> {
+interface DiagnosticOwner {
+	version: 1;
+	ownership: "native-exit";
+	queue: TaskQueue;
+	jobs: Set<BrowserMemoryJob>;
+	closing?: Promise<void>;
+}
+const OWNER = Symbol.for("narrafork.browser.memory-workers");
+const globals = globalThis as typeof globalThis & { [OWNER]?: DiagnosticOwner };
+const previous = globals[OWNER];
+if (
+	previous &&
+	(previous.version !== 1 ||
+		previous.ownership !== "native-exit" ||
+		!previous.queue ||
+		!(previous.jobs instanceof Set))
+)
+	throw new Error("Browser memory worker ownership cannot be recovered");
+const owner: DiagnosticOwner = previous ?? {
+	version: 1,
+	ownership: "native-exit",
+	queue: new TaskQueue({ concurrency: 1, maxQueued: 0, maxQueuedBytes: 0 }),
+	jobs: new Set(),
+};
+globals[OWNER] = owner;
+
+/** Admission is shared; payloads and analysis state remain strictly per diagnostic. */
+export const memoryDiagnosticQueue = owner.queue;
+
+export function trackMemoryDiagnostic(job: BrowserMemoryJob): void {
+	if (owner.closing || owner.queue.stats.closed)
+		throw new Error("Browser memory diagnostics are closing");
+	owner.jobs.add(job);
+	void job.done.then(
+		() => owner.jobs.delete(job),
+		() => owner.jobs.delete(job),
+	);
+}
+
+/** Terminal production close: reject new work first, then wait for real resource cleanup. */
+export function closeMemoryDiagnosticWorkers(): Promise<void> {
+	if (owner.closing) return owner.closing;
+	const drained = owner.queue.close();
+	for (const job of owner.jobs) job.controller.abort();
+	owner.closing = Promise.all([drained, ...[...owner.jobs].map((job) => job.done)]).then(() => {});
+	return owner.closing;
+}
+
+export function retainMemoryJob(session: BrowserSession, cleanup: Promise<unknown>): void {
+	const job = session.memoryJob;
+	if (!job) throw new Error("Browser memory diagnostic has no session owner");
+	job.resources ??= new Set();
+	job.resources.add(cleanup);
+}
+
+/** Cancellation responses are bounded; shutdown may explicitly await actual session cleanup. */
+export async function cancelMemoryJob(
+	session: BrowserSession,
+	options: { waitForCleanup?: boolean } = {},
+): Promise<void> {
 	session.memoryDiagnosticsClosed = true;
 	const job = session.memoryJob;
 	if (!job) return;
 	job.controller.abort(new Error("Browser memory diagnostic cancelled: session closed"));
+	if (options.waitForCleanup) return job.done;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		await Promise.race([
@@ -79,7 +141,11 @@ export async function runMemoryJob<T>(
 	} finally {
 		clearTimeout(timer);
 		externalSignal?.removeEventListener("abort", abort);
-		if (session.memoryJob === job) session.memoryJob = undefined;
-		complete();
+		// The caller may already have a timeout response while a native worker is still exiting.
+		// Keep the session owner until every retained cleanup really settles.
+		void Promise.allSettled([...(job.resources ?? [])]).then(() => {
+			if (session.memoryJob === job) session.memoryJob = undefined;
+			complete();
+		});
 	}
 }

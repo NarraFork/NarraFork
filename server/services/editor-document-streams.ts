@@ -19,6 +19,8 @@ import { editorRawEncoding } from "../../shared/editor-stream-codec";
 import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { WorkerCleanupError, type WorkerHandle } from "../lib/worker-runtime/lifecycle";
+import { TaskQueue, TaskQueueError } from "../lib/worker-runtime/queue";
 import type { StreamWorkerRequest, StreamWorkerResult } from "./editor-document-stream-worker";
 
 export interface EditorRemoteRawSource {
@@ -28,6 +30,8 @@ export interface EditorRemoteRawSource {
 }
 type WorkerSlot = {
 	worker?: Worker;
+	handle?: WorkerHandle<Worker>;
+	closing?: Promise<void>;
 	ready: Promise<void>;
 	exited: Promise<void>;
 	failure?: Error;
@@ -59,92 +63,127 @@ function remoteChunkBytes(chunk: EditorRawReadChunk, maxBytes: number) {
 	return bytes;
 }
 
-/** Two reusable source workers, independent of the metadata/commit IO permits. */
+/** Two long-lived, affinity-bound source workers; WorkerHandle owns their real exit. */
 export class EditorSourceWorkers {
 	private slots: (WorkerSlot | undefined)[] = [];
 	onExit?: (slot: WorkerSlot) => void;
 	private sequence = 0;
 	private next = 0;
+	private readonly shutdown = new AbortController();
+	private closing?: Promise<void>;
 	constructor(
 		private specifiers = compiledWorkerSpecifiers(
 			"services/editor-document-stream-worker.ts",
 			"./editor-document-stream-worker.ts",
 			import.meta.url,
 		),
+		private readonly budget = { readyMs: 5000, ackMs: EDITOR_IO_TIMEOUT_MS },
 	) {}
 	assign(): WorkerSlot {
 		return this.slot(this.next++ % 2);
 	}
+	private fail(slot: WorkerSlot, error: unknown) {
+		slot.failure ??= error instanceof Error ? error : streamError("EDITOR_WORKER_FAILED", 503);
+		for (const request of slot.pending.values()) request.reject(slot.failure);
+		slot.pending.clear();
+	}
+	private retire(slot: WorkerSlot): Promise<void> {
+		slot.closing ??= (async () => {
+			await slot.ready.catch(() => {});
+			try {
+				await slot.handle?.close();
+			} finally {
+				// Failed terminate is still a live slot; never replace it before an observed exit.
+				await slot.exited;
+			}
+		})();
+		return slot.closing;
+	}
 	private slot(index: number): WorkerSlot {
+		if (this.shutdown.signal.aborted) throw streamError("EDITOR_WORKER_CLOSED", 503);
+		if (index !== 0 && index !== 1) throw streamError("EDITOR_STREAM_INVALID", 422);
 		if (this.slots[index]) return this.slots[index];
-		const pending: WorkerSlot["pending"] = new Map();
 		let confirmExit!: () => void;
 		const exited = new Promise<void>((resolve) => {
 			confirmExit = resolve;
 		});
-		const slot: WorkerSlot = { ready: Promise.resolve(), exited, pending };
-		const fail = (error: Error) => {
-			slot.failure ??= error;
-			for (const request of pending.values()) request.reject(slot.failure);
-			pending.clear();
-		};
+		const slot: WorkerSlot = { ready: Promise.resolve(), exited, pending: new Map() };
 		const finishExit = () => {
+			this.fail(slot, streamError("EDITOR_WORKER_CLOSED", 503));
 			confirmExit();
 			if (this.slots[index] === slot) this.slots[index] = undefined;
 			this.onExit?.(slot);
 		};
-		// Probe only before readiness, sharing the original five-second startup deadline.
-		// No stream request is dispatched until the loader has selected a live worker.
-		slot.ready = connectCompiledWorker(this.specifiers, { signal: AbortSignal.timeout(5000) })
-			.then(({ worker }) => {
+		this.slots[index] = slot;
+		slot.ready = connectCompiledWorker(this.specifiers, {
+			signal: this.shutdown.signal,
+			timeoutMs: this.budget.readyMs,
+		})
+			.then(({ worker, handle }) => {
 				slot.worker = worker;
+				slot.handle = handle;
+				void handle.exited.then(finishExit);
 				worker.on("message", (message) => {
-					if (message.ready) return;
-					const request = pending.get(message.id);
-					pending.delete(message.id);
-					if (message.error)
+					if (message?.ready) return;
+					const request = slot.pending.get(message?.id);
+					slot.pending.delete(message?.id);
+					if (message?.error)
 						request?.reject(
 							Object.assign(streamError(message.error), message.code ? { code: message.code } : {}),
 						);
-					else request?.resolve(message.result);
+					else request?.resolve(message?.result);
 				});
-				worker.on("error", (error) => {
-					fail(error instanceof Error ? error : streamError("EDITOR_WORKER_FAILED", 503));
-					void worker.terminate();
-				});
-				worker.on("exit", () => {
-					fail(streamError("EDITOR_WORKER_CLOSED", 503));
-					finishExit();
-				});
+				const failed = (error: unknown) => {
+					this.fail(slot, error);
+					void this.retire(slot).catch(() => {});
+				};
+				worker.on("error", failed);
+				worker.on("messageerror", failed);
 			})
 			.catch((error) => {
-				fail(error instanceof Error ? error : streamError("EDITOR_WORKER_FAILED", 503));
-				finishExit();
+				this.fail(slot, error);
+				if (error instanceof WorkerCleanupError) {
+					// The connector failed to stop a startup probe. Keep its physical slot pinned.
+					slot.handle = error.handle as WorkerHandle<Worker>;
+					void slot.handle.exited.then(finishExit);
+				} else finishExit();
 				throw slot.failure;
 			});
-		this.slots[index] = slot;
+		void slot.ready.catch(() => {});
 		return slot;
 	}
 	async run(owner: number | WorkerSlot, request: StreamWorkerRequest): Promise<StreamWorkerResult> {
 		const slot = typeof owner === "number" ? this.slot(owner) : owner;
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			await slot.ready;
 			if (slot.failure) throw slot.failure;
+			if (slot.pending.size >= 32) throw streamError("EDITOR_BUSY", 429);
 			const id = ++this.sequence;
 			return await new Promise<StreamWorkerResult>((resolve, reject) => {
 				slot.pending.set(id, { resolve, reject });
+				// Independent of the stream/consumer deadline: close ACKs also need a watchdog.
+				timer = setTimeout(() => {
+					this.fail(slot, streamError("EDITOR_WORKER_TIMEOUT", 408));
+					void this.retire(slot).catch(() => {});
+				}, this.budget.ackMs);
+				timer.unref();
 				try {
 					slot.worker?.postMessage({ id, request });
 				} catch (error) {
-					slot.pending.delete(id);
-					reject(error);
+					this.fail(slot, error);
+					void this.retire(slot).catch(() => {});
 				}
 			});
 		} catch (error) {
-			if (request.action !== "close" || !slot.failure) throw error;
-			// Cover failures both before dispatch and while close was awaiting its ACK.
+			if (request.action !== "close") throw error;
+			// Even a close-specific protocol error is not an ACK proving the borrowed FD idle.
+			this.fail(slot, error);
+			void this.retire(slot).catch(() => {});
 			await slot.exited;
 			return {};
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 	async counters() {
@@ -157,20 +196,19 @@ export class EditorSourceWorkers {
 	get count() {
 		return this.slots.filter(Boolean).length;
 	}
-	async dispose() {
-		await Promise.all(
-			this.slots.map(async (slot) => {
-				if (!slot) return;
-				await slot.ready.catch(() => {});
-				await slot.worker?.terminate();
-			}),
-		);
-		this.slots = [];
+	dispose(): Promise<void> {
+		if (this.closing) return this.closing;
+		this.shutdown.abort(streamError("EDITOR_WORKER_CLOSED", 503));
+		for (const slot of this.slots)
+			if (slot) this.fail(slot, streamError("EDITOR_WORKER_CLOSED", 503));
+		this.closing = Promise.all(
+			this.slots.flatMap((slot) => (slot ? [this.retire(slot)] : [])),
+		).then(() => {});
+		return this.closing;
 	}
 }
 
 type Permit = { signal: AbortSignal; release(): void };
-type Waiting = { userId: string; owner: string; start(): void; abort(): void };
 type ActiveRead = {
 	owner: string;
 	userId: string;
@@ -186,6 +224,7 @@ type ActiveRead = {
 	fileClose?: Promise<void>;
 	remote?: EditorRemoteRawSource;
 	remoteOpen?: EditorRawReadOpen;
+	openingRemote?: Promise<EditorRawReadOpen>;
 	close(): Promise<void>;
 	touch(): void;
 };
@@ -195,12 +234,16 @@ type ActiveRead = {
  * this application window is NOT a process/Monaco/HTTP memory bound. */
 export class EditorDocumentStreams {
 	readonly workers: EditorSourceWorkers;
-	private users = new Map<string, number>();
-	private queue: Waiting[] = [];
-	private active = 0;
+	private readonly admission = new TaskQueue({
+		concurrency: 8,
+		maxQueued: 64,
+		maxActivePerKey: 2,
+		maxQueuedPerKey: 8,
+	});
+	private readonly scopes = new Set<{ owner: string; controller: AbortController }>();
 	private reads = new Map<string, ActiveRead>();
-	private lastUser = "";
 	private disposed = false;
+	private closing?: Promise<void>;
 	/** Explicit deadlines are a fixture seam; production uses the fixed transfer budgets. */
 	constructor(
 		workers = new EditorSourceWorkers(),
@@ -214,80 +257,55 @@ export class EditorDocumentStreams {
 	}
 	get diagnostics() {
 		return {
-			active: this.active,
-			queued: this.queue.length,
+			active: this.admission.stats.active,
+			queued: this.admission.stats.queued,
 			streams: this.reads.size,
-			windowBytes: this.active * EDITOR_RAW_WINDOW_BYTES,
+			windowBytes: this.admission.stats.active * EDITOR_RAW_WINDOW_BYTES,
 			workers: this.workers.count,
 		};
 	}
-	private pump() {
-		if (this.disposed) return;
-		while (this.active < 8) {
-			let index = this.queue.findIndex(
-				(entry) => entry.userId !== this.lastUser && (this.users.get(entry.userId) ?? 0) < 2,
-			);
-			if (index < 0)
-				index = this.queue.findIndex((entry) => (this.users.get(entry.userId) ?? 0) < 2);
-			if (index < 0) break;
-			this.queue.splice(index, 1)[0].start();
-		}
-	}
-	private acquire(
+	private async acquire(
 		userId: string,
 		external: AbortSignal | undefined,
 		owner: string,
 	): Promise<Permit> {
-		if (this.disposed) return Promise.reject(streamError("EDITOR_STREAM_CLOSED"));
-		if (external?.aborted) return Promise.reject(external.reason);
-		if (
-			this.queue.length >= 64 ||
-			this.queue.filter((entry) => entry.userId === userId).length >= 8
-		)
-			return Promise.reject(streamError("EDITOR_BUSY", 429));
-		return new Promise((resolve, reject) => {
+		if (this.disposed) throw streamError("EDITOR_STREAM_CLOSED");
+		external?.throwIfAborted();
+		const scope = { owner, controller: new AbortController() };
+		this.scopes.add(scope);
+		try {
+			const permit = await this.admission.acquire({
+				key: userId,
+				deadlineAt: Date.now() + this.budget.deadlineMs,
+				signal: external
+					? AbortSignal.any([external, scope.controller.signal])
+					: scope.controller.signal,
+			});
 			const controller = new AbortController();
-			let admitted = false,
-				released = false;
-			const release = () => {
-				if (released) return;
-				released = true;
-				clearTimeout(timer);
-				external?.removeEventListener("abort", entry.abort);
-				const index = this.queue.indexOf(entry);
-				if (index >= 0) this.queue.splice(index, 1);
-				if (admitted) {
-					this.active--;
-					const count = (this.users.get(userId) ?? 1) - 1;
-					if (count) this.users.set(userId, count);
-					else this.users.delete(userId);
-				}
-				this.pump();
-			};
-			const entry: Waiting = {
-				userId,
-				owner,
-				start: () => {
-					admitted = true;
-					this.active++;
-					this.users.set(userId, (this.users.get(userId) ?? 0) + 1);
-					this.lastUser = userId;
-					resolve({ signal: controller.signal, release });
-				},
-				abort: () => {
-					controller.abort(streamError("EDITOR_TIMEOUT", 408));
-					if (!admitted) {
-						release();
-						reject(controller.signal.reason);
-					}
+			const abort = () =>
+				controller.abort(
+					permit.signal.reason instanceof TaskQueueError || external?.aborted
+						? streamError("EDITOR_TIMEOUT", 408)
+						: permit.signal.reason,
+				);
+			permit.signal.addEventListener("abort", abort, { once: true });
+			if (permit.signal.aborted) abort();
+			return {
+				signal: controller.signal,
+				release: () => {
+					permit.signal.removeEventListener("abort", abort);
+					this.scopes.delete(scope);
+					permit.release();
 				},
 			};
-			const timer = setTimeout(entry.abort, this.budget.deadlineMs);
-			timer.unref();
-			external?.addEventListener("abort", entry.abort, { once: true });
-			this.queue.push(entry);
-			this.pump();
-		});
+		} catch (error) {
+			this.scopes.delete(scope);
+			if (error instanceof TaskQueueError) {
+				if (error.code === "TASK_QUEUE_FULL") throw streamError("EDITOR_BUSY", 429);
+				if (error.code === "TASK_QUEUE_TIMEOUT") throw streamError("EDITOR_TIMEOUT", 408);
+			}
+			throw error;
+		}
 	}
 	async open(
 		userId: string,
@@ -303,6 +321,8 @@ export class EditorDocumentStreams {
 		const id = randomUUID();
 		let worker: WorkerSlot;
 		try {
+			permit.signal.throwIfAborted();
+			if (this.disposed) throw streamError("EDITOR_STREAM_CLOSED");
 			worker = this.workers.assign();
 		} catch (error) {
 			permit.release();
@@ -332,26 +352,26 @@ export class EditorDocumentStreams {
 					read.closed = true;
 					clearTimeout(idle);
 					permit.signal.removeEventListener("abort", onAbort);
+					await this.workers.run(worker, { action: "close", stream: id });
+					await closeReadFile(read);
+					await read.openingRemote?.catch(() => {});
+					if (read.remoteOpen)
+						await read.remote?.close({ readId: read.remoteOpen.readId, abort: !read.eof });
+					// Cleanup failures retain the read/permit as evidence, never count as freed credit.
+					this.reads.delete(id);
+					permit.release();
+					const elapsedMs = Math.round(performance.now() - started);
 					try {
-						await this.workers.run(worker, { action: "close", stream: id });
-					} finally {
-						try {
-							await closeReadFile(read);
-							if (read.remoteOpen)
-								await read.remote?.close({ readId: read.remoteOpen.readId, abort: !read.eof });
-						} finally {
-							this.reads.delete(id);
-							permit.release();
-							const elapsedMs = Math.round(performance.now() - started);
-							if (elapsedMs >= 1000)
-								logger.warn("Slow editor raw source lifecycle (includes consumer wait)", {
-									elapsedMs,
-									kind: preflightOnly ? "preflight" : "body",
-									remote: !!read.remote,
-									bodyBytes: read.offset,
-									eof: !!read.eof,
-								});
-						}
+						if (elapsedMs >= 1000)
+							logger.warn("Slow editor raw source lifecycle (includes consumer wait)", {
+								elapsedMs,
+								kind: preflightOnly ? "preflight" : "body",
+								remote: !!read.remote,
+								bodyBytes: read.offset,
+								eof: !!read.eof,
+							});
+					} catch {
+						// Diagnostics cannot change the consumer's result or resource accounting.
 					}
 				})()),
 		};
@@ -361,11 +381,12 @@ export class EditorDocumentStreams {
 		permit.signal.addEventListener("abort", onAbort, { once: true });
 		this.reads.set(id, read);
 		const openRemote = async (source: EditorRemoteRawSource) => {
-			const opened = await source.open(permit.signal);
-			if (closed || permit.signal.aborted) {
-				await source.close({ readId: opened.readId, abort: true });
-				throw streamError("EDITOR_STREAM_CLOSED");
-			}
+			read.openingRemote = source.open(permit.signal).then((opened) => {
+				read.remoteOpen = opened;
+				return opened;
+			});
+			const opened = await read.openingRemote;
+			if (closed || permit.signal.aborted) throw streamError("EDITOR_STREAM_CLOSED");
 			return opened;
 		};
 		try {
@@ -537,9 +558,8 @@ export class EditorDocumentStreams {
 			read.permit.signal.throwIfAborted();
 			if (closedRead(this.reads, read)) throw streamError("EDITOR_STREAM_CLOSED");
 			read.offset += result.bytes?.length ?? 0;
-			if (result.eof) await closeReadFile(read);
-			// The parent/executor closes the FD at verified EOF. Keep the window
-			// until the real consumer ACKs with close (or its idle/deadline expires).
+			// EOF is not a consumer close or a worker close ACK. Both parent FD and
+			// application window remain owned until close/idle/deadline joins cleanup.
 			read.eof = !!result.eof;
 			read.touch();
 			return result;
@@ -555,24 +575,36 @@ export class EditorDocumentStreams {
 		if (read?.owner === owner) await read.close();
 	}
 	async closeOwner(owner: string) {
-		for (const entry of this.queue.filter((entry) => entry.owner === owner)) entry.abort();
+		for (const scope of this.scopes)
+			if (scope.owner === owner) scope.controller.abort(streamError("EDITOR_STREAM_CLOSED"));
 		await Promise.all(
 			[...this.reads.values()].filter((read) => read.owner === owner).map((read) => read.close()),
 		);
 	}
-	async dispose() {
+	dispose(): Promise<void> {
+		if (this.closing) return this.closing;
 		this.disposed = true;
-		for (const entry of [...this.queue]) entry.abort();
-		await Promise.all([...this.reads.values()].map((read) => read.close()));
-		await this.workers.dispose();
+		const drained = this.admission.close(streamError("EDITOR_STREAM_CLOSED"));
+		for (const scope of this.scopes) scope.controller.abort(streamError("EDITOR_STREAM_CLOSED"));
+		this.closing = (async () => {
+			const cleanup = await Promise.allSettled(
+				[...this.reads.values()].map((read) => read.close()),
+			);
+			await this.workers.dispose();
+			const failure = cleanup.find((result) => result.status === "rejected");
+			if (failure?.status === "rejected") throw failure.reason;
+			// Includes admissions/open calls that were pending when the read snapshot was taken.
+			await drained;
+		})();
+		return this.closing;
 	}
 }
 function closeReadFile(read: ActiveRead): Promise<void> {
 	read.fileClose ??= (async () => {
 		await read.openingFile?.catch(() => {});
 		const file = read.file;
-		read.file = undefined;
 		await file?.close();
+		read.file = undefined;
 	})();
 	return read.fileClose;
 }
