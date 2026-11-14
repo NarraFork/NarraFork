@@ -1,3 +1,4 @@
+import { useAppBackground } from "@frontend/hooks/useAppBackground";
 import { usePaletteChoice } from "@frontend/hooks/usePaletteChoice";
 import { mantineTheme } from "@frontend/lib/mantine-theme";
 import { queryClient } from "@frontend/lib/query-client";
@@ -28,6 +29,9 @@ export function CoreProviders({
 	 * `usePaletteChoice`, which costs no re-render at all.
 	 */
 	const { resolved } = usePaletteChoice();
+	// Applying the wallpaper is an effect, not a value: subscribing here (rather than only
+	// in the settings card) is what keeps it live on every route.
+	useAppBackground();
 	const theme = useMemo(
 		() =>
 			createTheme({

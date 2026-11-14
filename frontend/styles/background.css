@@ -1,0 +1,70 @@
+/**
+ * Wallpaper layer: paints the user's image behind the app, blurred, under a scrim, with the
+ * surface colours turned translucent so it reads through.
+ *
+ * ## Structure
+ *
+ *   body        → the picture, plus a scrim gradient over it (fixed, covers the viewport)
+ *   #root       → the base surface colour, translucent, `backdrop-filter` blurs the picture
+ *   panels      → `--mantine-color-default`, a step more opaque than the base
+ *
+ * The picture must live on `body`, not on a `html::before` pseudo-element: a negatively
+ * stacked pseudo-element on the root element is painted below the canvas and never shows.
+ * `backdrop-filter` on `#root` is what makes the picture soft — a sharp photo behind text
+ * is unreadable regardless of how the panels are tuned.
+ *
+ * ## Specificity
+ *
+ * Mantine sets `--mantine-color-body` on `:root[data-mantine-color-scheme="dark"]` (0,2,0).
+ * A plain `html[data-nf-bg="on"]` selector (0,1,1) loses to it and the shell then paints an
+ * opaque background over the picture — the image loads, stacks, and stays invisible. Matching
+ * the scheme attribute too (0,3,0) is what makes the override stick.
+ */
+
+:root {
+	--nf-canvas-base: var(--nf-paper-50);
+	--nf-pane-base: var(--nf-paper-0);
+}
+
+:root[data-mantine-color-scheme="dark"] {
+	--nf-canvas-base: var(--nf-ink-950);
+	--nf-pane-base: var(--nf-ink-900);
+}
+
+:root[data-mantine-color-scheme][data-nf-bg="on"] {
+	--nf-bg-scrim-color: color-mix(
+		in srgb,
+		var(--nf-canvas-base) var(--nf-bg-scrim, 40%),
+		transparent
+	);
+	/* The base layer is deliberately lighter than the panels: the wallpaper should read as
+	   the room behind the furniture, not as something inside the cards. Text lives on the
+	   panels, which stay closer to opaque. */
+	--mantine-color-body: color-mix(
+		in srgb,
+		var(--nf-canvas-base) var(--nf-bg-body-opacity, 62%),
+		transparent
+	);
+	--mantine-color-default: color-mix(
+		in srgb,
+		var(--nf-pane-base) var(--nf-bg-pane-opacity, 80%),
+		transparent
+	);
+}
+
+html[data-nf-bg="on"] body {
+	background-color: transparent;
+	background-image:
+		linear-gradient(var(--nf-bg-scrim-color), var(--nf-bg-scrim-color)), var(--nf-bg-image);
+	background-size: cover, cover;
+	background-position: center, center;
+	background-repeat: no-repeat, no-repeat;
+	/* Fixed so a long transcript scrolls over a still picture instead of dragging it. */
+	background-attachment: fixed, fixed;
+}
+
+html[data-nf-bg="on"] #root {
+	background: var(--mantine-color-body);
+	min-height: 100vh;
+	backdrop-filter: blur(var(--nf-bg-blur, 10px));
+}

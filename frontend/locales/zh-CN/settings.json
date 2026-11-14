@@ -3087,5 +3087,20 @@
 	"paletteAccentRose": "玫红",
 	"palettePresetGithub": "GitHub",
 	"palettePresetCatppuccin": "Catppuccin",
-	"palettePresetClassic": "经典蓝黑"
+	"palettePresetClassic": "经典蓝黑",
+	"bgSection": "背景图",
+	"bgDesc": "用一张图片做背景，面板会变成半透明。支持 PNG / JPEG / WebP，动图 GIF 也能用（会持续耗电）。",
+	"bgUrlLabel": "图片地址",
+	"bgUrlHint": "直接粘贴 http(s) 链接，每次打开都会从该地址加载",
+	"bgInvalidProtocol": "只支持 http:// 或 https:// 地址",
+	"bgInvalidMalformed": "地址格式看起来不对",
+	"bgEnable": "启用背景图",
+	"bgOpacity": "面板不透明度",
+	"bgScrim": "遮罩强度",
+	"bgClear": "清除",
+	"bgPreview": "预览",
+	"bgPrivacy": "图片由远端服务器提供：离线或地址失效时会退回纯色背景。遮罩越强，文字越清楚。",
+	"bgBlur": "模糊",
+	"bgBlurSharp": "清晰",
+	"bgBlurSoft": "柔和"
 }

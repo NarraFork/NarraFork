@@ -20,6 +20,7 @@ import "@mantine/tiptap/styles.css";
  * would win over it and silently disable OLED). See the stylesheet's header.
  */
 import "@frontend/styles/tokens.css";
+import "@frontend/styles/background.css";
 // Patches a Mantine Slider layout detail: mark labels must not widen the
 // scroll container they sit in. Global because every `marks` slider needs it —
 // see the stylesheet header.
@@ -32,6 +33,7 @@ import "@frontend/styles/mantine-slider-marks.css";
  * updates and has no importer above it, editing any of them would reload the page. See
  * `lib/plugin-theme-pref-store.ts` for the full explanation.
  */
+import { applyInitialBackground } from "@frontend/lib/app-background";
 import { applyInitialPalette } from "@frontend/lib/palette-apply";
 import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
 import { readActivePluginThemeKey } from "@frontend/lib/plugin-theme-pref-store";
@@ -106,6 +108,7 @@ async function bootstrap() {
 	 * default colours.
 	 */
 	if (!isPublicShare) applyInitialPalette();
+	if (!isPublicShare) applyInitialBackground();
 	/*
 	 * Session handoff with an editor host that embeds this app (the VS Code extension).
 	 *

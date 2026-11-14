@@ -3087,5 +3087,20 @@
 	"paletteAccentRose": "Rose",
 	"palettePresetGithub": "GitHub",
 	"palettePresetCatppuccin": "Catppuccin",
-	"palettePresetClassic": "Classic"
+	"palettePresetClassic": "Classic",
+	"bgSection": "Background image",
+	"bgDesc": "Use an image as the wallpaper; panels become translucent. PNG / JPEG / WebP, and animated GIFs work too (they keep using power).",
+	"bgUrlLabel": "Image URL",
+	"bgUrlHint": "Paste an http(s) link; it is fetched from that host on every load",
+	"bgInvalidProtocol": "Only http:// or https:// URLs are supported",
+	"bgInvalidMalformed": "That does not look like a valid URL",
+	"bgEnable": "Enable background image",
+	"bgOpacity": "Panel opacity",
+	"bgScrim": "Scrim strength",
+	"bgClear": "Clear",
+	"bgPreview": "Preview",
+	"bgPrivacy": "Fetched from the remote host: offline or a dead link falls back to the solid colour. A stronger scrim keeps text readable.",
+	"bgBlur": "Blur",
+	"bgBlurSharp": "Sharp",
+	"bgBlurSoft": "Soft"
 }

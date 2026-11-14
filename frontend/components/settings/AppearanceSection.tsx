@@ -17,6 +17,7 @@ import { typographyPreferencePatch } from "../../lib/typography-preferences";
 import { LanguageSwitcher } from "../LanguageSwitcher";
 import { ThemeSwitcher } from "../ThemeSwitcher";
 import { TERMINAL_THEMES } from "../terminal/terminal-theme";
+import { BackgroundCard } from "./BackgroundCard";
 import { ThemeColorCard } from "./ThemeColorCard";
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
@@ -184,6 +185,7 @@ export function AppearanceSection({
 			)}
 
 			<ThemeColorCard />
+			<BackgroundCard />
 
 			{/* Display */}
 			<Title order={5} mt="sm">
