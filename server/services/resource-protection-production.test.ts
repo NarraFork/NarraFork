@@ -61,13 +61,23 @@ test("production cold snapshot survives history beyond the former global invento
 			}
 		}
 		expect(ready).toBe(true);
-		// Missing ordinary directories must not reintroduce a per-check history scan.
+		// The two root-cwd controls are not missing historical directories. Require
+		// every historical row to be indexed, with none forcing an alias-history scan.
 		expect(
 			sqlite
-				.query<{ n: number }, []>(`SELECT count(*) AS n FROM resource_protection_paths
-			WHERE source = 'narrator' AND alias_sensitive = 1`)
+				.query<{ n: number; aliases: number }, []>(`SELECT count(*) AS n,
+			coalesce(sum(p.alias_sensitive), 0) AS aliases
+			FROM resource_protection_paths p JOIN narrators n ON n.id = p.source_id
+			WHERE p.source = 'narrator' AND n.title = 'historical workspace'`)
+				.get(),
+		).toEqual({ n: 2500, aliases: 0 });
+		expect(
+			sqlite
+				.query<{ n: number }, []>(`SELECT count(*) AS n
+			FROM resource_protection_paths p JOIN narrators n ON n.id = p.source_id
+			WHERE p.source = 'narrator' AND n.title = 'root cwd is a reference, not exclusive cache ownership'`)
 				.get()?.n,
-		).toBe(0);
+		).toBe(2);
 		const heads = () =>
 			sqlite
 				.query(`SELECT source, revision, cursor, complete

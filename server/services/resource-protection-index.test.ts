@@ -4,7 +4,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, parse, resolve } from "node:path";
 import {
 	initializeAbsentReceiptProtectionSource,
 	installResourceProtectionTriggers,
@@ -701,7 +701,7 @@ describe("device ownership and native path identities", () => {
 			expect(changes()).toBe(before);
 			await bootstrap();
 			expect((await claims([{ path: host }])).map((claim) => claim.deviceId)).toEqual(["local"]);
-			expect(await claims([{ path: "/" }])).toHaveLength(1); // A real host reference, not a fabricated root claim.
+			expect(await claims([{ path: parse(host).root }])).toHaveLength(1); // Probe the host's drive, not the runner cwd's drive.
 			expect(
 				database
 					.query(
