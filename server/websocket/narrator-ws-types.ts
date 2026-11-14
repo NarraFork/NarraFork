@@ -327,6 +327,8 @@ export type NarratorServerMessage =
 			balance?: number;
 			required?: number;
 			resumeAction: "retry" | "continue";
+			/** Parent copy of a subagent's frame: the parent must not react to it. */
+			isSubagent?: boolean;
 	  }
 	| {
 			/**
@@ -957,6 +959,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
+			/** Parent copy of a subagent's frame: its balance is not the parent's. */
+			isSubagent?: boolean;
 	  }
 	| {
 			type: "queue_status";
