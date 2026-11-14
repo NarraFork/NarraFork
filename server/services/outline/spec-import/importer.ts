@@ -336,6 +336,18 @@ export class SpecImportPaused extends Error {
 	}
 }
 
+function logImportOutcome(
+	level: "info" | "warn",
+	message: string,
+	fields: Record<string, string | number | boolean>,
+): void {
+	try {
+		logger[level](message, fields);
+	} catch {
+		/* Observational sinks cannot change persisted import outcomes or cleanup. */
+	}
+}
+
 export interface SpecImportOptions {
 	trigger: SpecImportTrigger;
 	/**
@@ -417,7 +429,7 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 			attentionReason: null,
 		});
 		const outcome = await run(session, pointers, options, previous);
-		logger.info("Dynamic Spec session imported into the outline", {
+		logImportOutcome("info", "Dynamic Spec session imported into the outline", {
 			narratorId,
 			trigger: options.trigger,
 			tasks: outcome.tasks,
@@ -436,12 +448,16 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 		) {
 			const reason = error instanceof SpecImportPaused ? error : options.signal?.reason;
 			await persistBusy(narratorId, options.trigger, null);
-			logger.info("Dynamic Spec import gave way to its session; the next attempt goes on", {
-				narratorId,
-				trigger: options.trigger,
-				reason: String(reason),
-				elapsedMs: Math.round(performance.now() - started),
-			});
+			logImportOutcome(
+				"info",
+				"Dynamic Spec import gave way to its session; the next attempt goes on",
+				{
+					narratorId,
+					trigger: options.trigger,
+					urgent: reason instanceof SpecImportPaused && reason.urgent,
+					elapsedMs: Math.round(performance.now() - started),
+				},
+			);
 			return { status: "busy" };
 		}
 		const attention = error instanceof SpecImportAttention;
@@ -461,11 +477,11 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 			reason,
 			attentionReason: attention ? reason.code : null,
 		}));
-		logger.warn("Dynamic Spec import did not move a session", {
+		logImportOutcome("warn", "Dynamic Spec import did not move a session", {
 			narratorId,
 			trigger: options.trigger,
 			attention,
-			error: message,
+			reason: reason.code,
 		});
 		return { status: "failed", error: message, attention };
 	} finally {

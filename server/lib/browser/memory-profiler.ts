@@ -1,15 +1,21 @@
 import { lstat, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { Worker } from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import { CDPSessionEvent } from "puppeteer-core";
-import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../compiled-worker";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "../compiled-worker";
 import { generateId } from "../id";
 import { getNarraforkPath } from "../narrafork-home";
 import { isCompiledRuntime } from "../runtime-target";
 import { createShare, getMaxShareSizeBytes, getSharesDir, revokeShareRegistry } from "../shares";
+import { WorkerCleanupError, type WorkerHandle } from "../worker-runtime/lifecycle";
+import type { TaskQueuePermit } from "../worker-runtime/queue";
 import { reserveDiagnostic } from "./diagnostic-admission";
-import type { BrowserMemoryJob } from "./memory-job";
-import { waitForMemory } from "./memory-job";
+import {
+	type BrowserMemoryJob,
+	memoryDiagnosticQueue,
+	trackMemoryDiagnostic,
+	waitForMemory,
+} from "./memory-job";
 import { MemoryProfileError, PROFILE_LIMITS } from "./memory-profile-constants";
 import {
 	MEMORY_PROFILE_TRACE_CATEGORIES,
@@ -19,7 +25,6 @@ import {
 	type MemoryProfileMode,
 	type MemoryProfileRequest,
 	type MemoryProfileView,
-	type MemoryProfileWorkerCommand,
 	type MemoryProfileWorkerReply,
 	profileDiagnosticBrowserVersion,
 } from "./memory-profile-types";
@@ -29,6 +34,8 @@ import { acquireTraceLease, type TraceLease } from "./tracing-lease";
 export interface MemoryProfileHandle {
 	view: MemoryProfileView;
 	done: Promise<void>;
+	/** A bounded response failure does not settle done or relinquish any resource. */
+	responseFailure?: Promise<never>;
 	stop(): void;
 	cancel(): void;
 }
@@ -38,19 +45,11 @@ export interface MemoryProfileOptions {
 	samplingIntervalBytes?: number;
 	signal?: AbortSignal;
 }
-export interface MemoryProfileWorker {
-	on(event: "message", listener: (message: MemoryProfileWorkerReply) => void): unknown;
-	on(event: "error" | "exit", listener: () => void): unknown;
-	removeAllListeners(): unknown;
-	postMessage(command: MemoryProfileWorkerCommand): void;
-	terminate(): Promise<number>;
-}
 interface TargetSetup {
 	targetId: string;
 	detach(): Promise<void>;
 }
 interface ProfilerDependencies {
-	spawn?: (specifier: string) => MemoryProfileWorker;
 	specifiers?: () => string[];
 	setup?: (session: BrowserSession, signal: AbortSignal, lost: () => void) => Promise<TargetSetup>;
 	reserve?: typeof reserveDiagnostic;
@@ -212,14 +211,12 @@ async function setupTarget(
 	signal: AbortSignal,
 	lost: () => void,
 ): Promise<TargetSetup> {
-	const pending = session.page.createCDPSession();
-	void pending.then(
-		(client) => {
-			if (signal.aborted) void client.detach().catch(() => {});
-		},
-		() => {},
-	);
-	const client = await waitForMemory(pending, signal);
+	// Keep the startup owner until a late CDP attachment has really been detached.
+	const client = await session.page.createCDPSession();
+	if (signal.aborted) {
+		await client.detach().catch(() => {});
+		signal.throwIfAborted();
+	}
 	client.on(CDP_DISCONNECTED, lost);
 	try {
 		const info = await waitForMemory(client.send("Target.getTargetInfo"), signal);
@@ -232,12 +229,12 @@ async function setupTarget(
 		};
 	} catch {
 		client.off(CDP_DISCONNECTED, lost);
-		void client.detach().catch(() => {});
+		await client.detach().catch(() => {});
 		throw new MemoryProfileError("setup");
 	}
 }
 
-/** All admission is synchronous; session ownership is held until cleanup's bounded completion. */
+/** Session admission is synchronous; resource ownership lasts until actual cleanup, not a response race. */
 export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 	const startTimeout = deps.limits?.startTimeoutMs ?? PROFILE_LIMITS.startTimeoutMs;
 	const phaseBudgets: ProfilePhaseBudgets = {
@@ -294,7 +291,22 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 			started = resolve;
 			startFailed = reject;
 		});
-		let worker: MemoryProfileWorker | undefined;
+		try {
+			trackMemoryDiagnostic(job);
+		} catch {
+			lease?.confirmStopped();
+			release();
+			done();
+			throw new MemoryProfileError("closing");
+		}
+		let permit: TaskQueuePermit | undefined;
+		let workerHandle: WorkerHandle<Worker> | undefined;
+		let startupDone!: () => void;
+		const pendingStartup = new Promise<void>((resolve) => {
+			startupDone = resolve;
+		});
+		let publication: Promise<MemoryProfileView["artifacts"]> | undefined;
+		let worker: Worker | undefined;
 		let target: TargetSetup | undefined;
 		let dir: string | undefined;
 		let dispatched = false;
@@ -311,9 +323,15 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 		let cleanupAck: (() => void) | undefined;
 		let cleanupDeadline = Number.POSITIVE_INFINITY;
 		const published: Array<{ id: string; dir: string; revoked?: boolean }> = [];
+		let failResponse!: (error: MemoryProfileError) => void;
+		const responseFailure = new Promise<never>((_, reject) => {
+			failResponse = reject;
+		});
+		void responseFailure.catch(() => {});
 		const handle: MemoryProfileHandle = {
 			view: { profileId, state: "starting", config },
 			done: job.done,
+			responseFailure,
 			stop: () => {
 				if (finishing || stopping) return;
 				if (handle.view.state === "starting") {
@@ -336,6 +354,7 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 		session.memoryProfile = handle;
 		const externalAbort = () => controller.abort();
 		const lost = () => controller.abort();
+		const startupDeadline = Date.now() + startTimeout;
 		const startTimer = setTimeout(() => {
 			abortStage = "timeout";
 			controller.abort();
@@ -366,7 +385,7 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 						.then(action)
 						.catch(() => {}),
 					new Promise<void>((resolve) => {
-						timer = setTimeout(resolve, Math.max(1, cleanupDeadline - Date.now()));
+						timer = setTimeout(resolve, Math.max(1, cleanupDeadline - Date.now() - 10));
 					}),
 				]);
 			} finally {
@@ -480,68 +499,64 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 			// A terminal reply ends the worker phase. Publishing and disposal share our own 5s budget,
 			// rather than competing with the last milliseconds of the worker reply allowance.
 			cleanupDeadline = Date.now() + cleanupTimeout;
-			const publicationTimer =
-				result && state === "completed"
-					? setTimeout(() => {
-							abortStage = "timeout";
-							controller.abort();
-						}, cleanupTimeout)
-					: undefined;
+			// This bounds responses, not physical cleanup. Native slots/session leases remain owned.
+			const responseTimer = setTimeout(() => {
+				failResponse(new MemoryProfileError("timeout"));
+				if (!controller.signal.aborted) {
+					abortStage = "timeout";
+					controller.abort();
+				}
+				if (!startSettled) {
+					startSettled = true;
+					startFailed(
+						new MemoryProfileError(
+							safeStage(controller.signal.aborted ? abortStage : (stage ?? "timeout")),
+						),
+					);
+				}
+			}, cleanupTimeout);
 			let artifacts: MemoryProfileView["artifacts"];
 			try {
 				if (result && state === "completed") {
-					const publication = publish(result).finally(async () => {
-						// An FS call can finish after the publication deadline. Reap its late directory too.
-						if (controller.signal.aborted) await rollback();
-					});
+					publication = publish(result);
 					artifacts = await waitForMemory(publication, controller.signal);
 				}
 			} catch (error) {
 				state = controller.signal.aborted ? "cancelled" : "failed";
 				stage = error instanceof MemoryProfileError ? error.stage : "share";
-			} finally {
-				clearTimeout(publicationTimer);
 			}
 			// Close can race asynchronous artifact movement, including after the last createShare.
 			if (controller.signal.aborted) {
 				state = abortStage === "timeout" ? "failed" : "cancelled";
 				stage = abortStage;
 			}
-			await bounded(async () => {
-				await Promise.all([
-					(async () => {
-						if (!worker) return;
-						const current = worker;
-						const ack = new Promise<void>((resolve) => {
-							cleanupAck = resolve;
-							if (terminalReplySeen) resolve();
-						});
-						let timer: ReturnType<typeof setTimeout> | undefined;
-						try {
-							current.postMessage({ kind: "cancel", profileId });
-							await Promise.race([
-								ack,
-								new Promise<void>((resolve) => {
-									timer = setTimeout(resolve, Math.max(1, cleanupTimeout - 10));
-								}),
-							]);
-						} catch {
-						} finally {
-							clearTimeout(timer);
-						}
-						current.removeAllListeners();
-						current.on("error", () => {});
-						await current.terminate().catch(() => {});
-					})(),
-					target?.detach(),
-				]);
-			});
+			// Startup can finish after cancellation, and publication can complete a late FS operation.
+			// Neither a response timeout nor detach proves the worker has stopped writing.
+			await pendingStartup;
+			await publication?.catch(() => {});
+			await Promise.all([
+				(async () => {
+					if (!workerHandle) return;
+					const ack = new Promise<void>((resolve) => {
+						cleanupAck = resolve;
+						if (terminalReplySeen || workerHandle?.closed) resolve();
+					});
+					try {
+						worker?.postMessage({ kind: "cancel", profileId });
+					} catch {}
+					await bounded(() => ack);
+					await workerHandle.close().catch(() => {});
+					await workerHandle.exited;
+					worker?.off("message", message);
+				})(),
+				target?.detach().catch(() => {}),
+			]);
 			if (controller.signal.aborted) {
 				state = abortStage === "timeout" ? "failed" : "cancelled";
 				stage = abortStage;
 			}
-			if (state !== "completed") await bounded(rollback);
-			if (dir) await bounded(() => rm(dir as string, { recursive: true, force: true }));
+			if (state !== "completed") await rollback();
+			if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
 			session.page.off("close", lost);
 			session.page.off("error", lost);
 			browser.off("disconnected", lost);
@@ -550,7 +565,9 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 				if (traceStopped || !dispatched) lease.confirmStopped();
 				else lease.markUncertain();
 			}
+			permit?.release();
 			release();
+			clearTimeout(responseTimer);
 			handle.view = {
 				...handle.view,
 				state,
@@ -655,68 +672,61 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 			}
 		}
 		void (async () => {
+			let stage = "setup";
 			try {
 				const signal = controller.signal;
-				target = await waitForMemory(
-					(deps.setup ?? setupTarget)(session, signal, lost).then((late) => {
-						if (signal.aborted) void late.detach().catch(() => {});
-						return late;
-					}),
+				// Queue has no total deadline: recording/finalize/cleanup retain their domain budgets.
+				permit = await memoryDiagnosticQueue.acquire({
 					signal,
-				);
+					deadlineAt: Infinity,
+					key: session.id,
+				});
+				signal.throwIfAborted();
+				target = await (deps.setup ?? setupTarget)(session, signal, lost);
+				signal.throwIfAborted();
 				const root = deps.root ?? getNarraforkPath("memory-profiles");
 				await mkdir(root, { recursive: true });
 				signal.throwIfAborted();
-				const pendingDir = await mkdtemp(join(root, "profile-"));
-				if (signal.aborted) {
-					void rm(pendingDir, { recursive: true, force: true }).catch(() => {});
-					return;
-				}
-				dir = pendingDir;
-				const candidates = (deps.specifiers ?? profileWorkerSpecifiers)();
-				let index = 0;
-				const launch = () => {
-					if (finishing || signal.aborted) return;
-					if (index >= candidates.length) {
-						void finish("failed", "startup");
-						return;
-					}
-					try {
-						worker = (deps.spawn ?? ((path) => new Worker(workerEntryFromSpecifier(path))))(
-							candidates[index++],
-						);
-					} catch {
-						launch();
-						return;
-					}
-					const current = worker;
-					const failure = () => {
-						if (worker !== current || finishing) return;
-						if (dispatched) {
-							void finish("failed", "worker");
-							return;
-						}
-						current.removeAllListeners();
-						current.on("error", () => {});
-						void current.terminate().catch(() => {});
-						launch();
-					};
-					current.on("message", (reply) => {
-						if (worker === current) message(reply);
-					});
-					current.on("error", failure);
-					current.on("exit", () => {
-						cleanupAck?.();
-						failure();
-					});
+				dir = await mkdtemp(join(root, "profile-"));
+				signal.throwIfAborted();
+				stage = "startup";
+				const connected = await connectCompiledWorker(
+					(deps.specifiers ?? profileWorkerSpecifiers)(),
+					{
+						signal,
+						deadlineAt: startupDeadline,
+						timeoutMs: startTimeout,
+						sendPing: false,
+						isReady: (reply) => (reply as MemoryProfileWorkerReply)?.kind === "ready",
+					},
+				);
+				workerHandle = connected.handle;
+				worker = connected.worker;
+				const failure = () => {
+					cleanupAck?.();
+					if (!finishing) void finish("failed", "worker");
 				};
-				launch();
-			} catch {
+				worker.on("message", message);
+				worker.on("error", failure);
+				worker.once("exit", () => {
+					worker?.off("error", failure);
+					failure();
+				});
+				message({ kind: "ready" });
+			} catch (error) {
+				if (error instanceof WorkerCleanupError)
+					workerHandle = error.handle as WorkerHandle<Worker>;
 				if (!finishing)
-					await finish(
-						controller.signal.aborted ? "cancelled" : "failed",
-						controller.signal.aborted ? abortStage : "setup",
+					void finish(
+						controller.signal.aborted
+							? abortStage === "timeout"
+								? "failed"
+								: "cancelled"
+							: "failed",
+						controller.signal.aborted ? abortStage : stage,
 					);
+			} finally {
+				startupDone();
 			}
 		})();
 		return startResult;
@@ -754,10 +764,17 @@ async function waitForProfile(
 	if (signal?.aborted) abort();
 	try {
 		// External abort requests cancellation but still waits for bounded cleanup, not just the reply.
-		await waitForMemory(handle.done, deadline.signal);
-	} catch {
+		await waitForMemory(
+			handle.responseFailure ? Promise.race([handle.done, handle.responseFailure]) : handle.done,
+			deadline.signal,
+		);
+	} catch (error) {
 		handle.cancel();
-		throw new MemoryProfileError(deadline.signal.aborted ? "timeout" : "worker");
+		throw new MemoryProfileError(
+			deadline.signal.aborted || (error instanceof MemoryProfileError && error.stage === "timeout")
+				? "timeout"
+				: "worker",
+		);
 	} finally {
 		clearTimeout(timer);
 		signal?.removeEventListener("abort", abort);

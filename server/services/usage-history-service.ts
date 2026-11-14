@@ -3,6 +3,7 @@ import { apiRequests, narrators, users } from "@server/db/schema";
 import { readQuery } from "@server/db/worker-read";
 import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
+import { workerFailureDetails } from "@server/lib/db-worker/failure";
 import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import {
@@ -405,9 +406,17 @@ export class UsageHistoryService {
 		try {
 			return await readQuery(query, { maxRows, signal: execution.signal });
 		} catch (error) {
-			logger.warn("Usage history aggregation worker failed", {
-				error: error instanceof Error ? error.message : String(error),
-			});
+			try {
+				const diagnostic = workerFailureDetails(error, false);
+				logger.warn("Usage history aggregation worker failed", {
+					entry: "usage-history-aggregation",
+					phase: "read",
+					errorType: diagnostic.errorType,
+					code: diagnostic.code,
+				});
+			} catch {
+				// Diagnostics must not replace the public error after the worker releases its task.
+			}
 			throw new AppError(
 				"Usage statistics are temporarily unavailable",
 				503,
@@ -415,7 +424,17 @@ export class UsageHistoryService {
 			);
 		} finally {
 			const durationMs = Date.now() - startedAt;
-			if (durationMs > 1000) logger.warn("Slow usage history aggregation", { durationMs });
+			if (durationMs > 1000) {
+				try {
+					logger.warn("Slow usage history aggregation", {
+						entry: "usage-history-aggregation",
+						phase: "read",
+						durationMs,
+					});
+				} catch {
+					// A slow-log sink cannot change a completed result or a pending rejection.
+				}
+			}
 		}
 	}
 

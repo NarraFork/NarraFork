@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { hotSafe } from "../../hot-safe";
+import { TaskQueue, type TaskQueuePermit } from "../../worker-runtime/queue";
 import { createSandboxBootstrap } from "./bootstrap";
 import { createGateway, type GatewayOptions } from "./gateway";
 import {
@@ -42,8 +44,25 @@ export interface ServiceOptions {
 	onSlowOperation?: (event: { runId: string; phase: string; elapsedMs: number }) => void;
 }
 
+const serviceOwner = hotSafe("narrafork.programmatic.services.v1", () => ({
+	closed: false,
+	services: new Set<{ close(): Promise<void> }>(),
+	closing: undefined as Promise<void> | undefined,
+}));
+
+/** Does not construct a sandbox. Includes services retained by older HMR module instances. */
+export function closeProgrammaticServices(): Promise<void> {
+	serviceOwner.closed = true;
+	serviceOwner.closing ??= Promise.all(
+		[...serviceOwner.services].map((service) => service.close()),
+	).then(() => {});
+	return serviceOwner.closing;
+}
+
 /** Not registered as an agent tool: callers must provide real authorization and audit sinks. */
 export function createProgrammaticService(options: ServiceOptions) {
+	if (serviceOwner.closed)
+		throw new ProgrammaticError("CLOSED", "Programmatic execution is closed");
 	const driver = options.driver;
 	if (!driver || driver.policy.kind !== "podman")
 		throw new ProgrammaticError("ISOLATION_REQUIRED", "A qualified isolation driver is required");
@@ -55,13 +74,25 @@ export function createProgrammaticService(options: ServiceOptions) {
 	for (const value of Object.values(capacities))
 		if (!Number.isInteger(value) || value < 1 || value > 16)
 			throw new ProgrammaticError("CONFIG", "Concurrency capacities must be in 1..16");
-	const active = new Map<string, { user: string; team?: string }>();
+	// Total/user admission belongs to the shared queue. Team/run identity remains a
+	// domain constraint: a task has two independent identities, not a synthetic key.
+	const queue = new TaskQueue({
+		concurrency: capacities.total,
+		maxActivePerKey: capacities.user,
+		maxQueued: 0,
+	});
+	const active = new Map<string, { team?: string }>();
+	const stops = new Set<(reason: ProgrammaticError) => void>();
+	let closed = false;
+	let closing: Promise<void> | undefined;
 	const bootstrap = createSandboxBootstrap();
 	function checkAbort(signal: AbortSignal) {
 		if (signal.aborted) throw new ProgrammaticError("CANCELLED", "Execution was cancelled");
 	}
 	async function execute(input: ExecutionOptions): Promise<ExecutionResult> {
 		checkAbort(input.signal);
+		if (closed || serviceOwner.closed)
+			throw new ProgrammaticError("CLOSED", "Programmatic execution is closed");
 		if (
 			typeof input.source !== "string" ||
 			Buffer.byteLength(input.source) > PROGRAMMATIC_LIMITS.sourceBytes
@@ -86,21 +117,51 @@ export function createProgrammaticService(options: ServiceOptions) {
 		const deadlineAt = started + wallMs;
 		const gateway = createGateway({ ...input, budgets, signal: controller.signal, deadlineAt });
 		const identity = Object.freeze({ ...input.identity });
-		const existing = [...active.values()];
-		if (
-			active.has(identity.runId) ||
-			active.size >= capacities.total ||
-			existing.filter((r) => r.user === identity.actorUserId).length >= capacities.user ||
-			(identity.teamId &&
-				existing.filter((r) => r.team === identity.teamId).length >= capacities.team)
-		) {
+		// Register before acquire yields, so production close also owns a granted-but-
+		// not-yet-resumed admission. No rejected caller is inserted into the run ledger.
+		serviceOwner.services.add(service);
+		let permit: TaskQueuePermit | undefined;
+		try {
+			permit = await queue.acquire({
+				signal: input.signal,
+				key: identity.actorUserId,
+				bytes: input.source.length * 2,
+				deadlineAt: Infinity,
+			});
+			if (closed || serviceOwner.closed)
+				throw new ProgrammaticError("CLOSED", "Programmatic execution is closed");
+			if (
+				active.has(identity.runId) ||
+				(identity.teamId &&
+					[...active.values()].filter((run) => run.team === identity.teamId).length >=
+						capacities.team)
+			)
+				throw new ProgrammaticError(
+					"CAPACITY",
+					"Execution capacity is occupied; no unbounded queue is created",
+				);
+			active.set(identity.runId, { team: identity.teamId });
+		} catch (error) {
+			permit?.release();
+			if (queue.stats.active === 0) serviceOwner.services.delete(service);
 			gateway.close();
-			throw new ProgrammaticError(
-				"CAPACITY",
-				"Execution capacity is occupied; no unbounded queue is created",
-			);
+			// Admission does not launch resources or replay user source.
+			if ((error as { code?: string })?.code === "TASK_QUEUE_FULL")
+				throw new ProgrammaticError(
+					"CAPACITY",
+					"Execution capacity is occupied; no unbounded queue is created",
+				);
+			throw error;
 		}
-		active.set(identity.runId, { user: identity.actorUserId, team: identity.teamId });
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			active.delete(identity.runId);
+			stops.delete(stop);
+			permit?.release();
+			if (queue.stats.active === 0) serviceOwner.services.delete(service);
+		};
 		let stopReason: ProgrammaticError | undefined;
 		let rejectStop: (error: ProgrammaticError) => void = () => {};
 		const stopped = new Promise<never>((_resolve, reject) => {
@@ -114,16 +175,18 @@ export function createProgrammaticService(options: ServiceOptions) {
 			gateway.close();
 			rejectStop(reason);
 		};
+		stops.add(stop);
 		const onAbort = () => stop(new ProgrammaticError("CANCELLED", "Execution cancelled by caller"));
 		input.signal.addEventListener("abort", onAbort, { once: true });
 		const timeout = setTimeout(
 			() => stop(new ProgrammaticError("DEADLINE", "Execution exceeded its wall deadline")),
-			wallMs,
+			Math.max(1, deadlineAt - Date.now()),
 		);
 		if (input.signal.aborted) onAbort();
 		const guarded = <T>(promise: Promise<T>) => Promise.race([promise, stopped]);
 		let session: SandboxSession | undefined;
 		let launch: Promise<SandboxSession> | undefined;
+		let launchAttempted = false;
 		let readiness: Promise<void> | undefined;
 		let pump: Promise<void> | undefined;
 		let inFlight: Promise<void> | undefined;
@@ -147,7 +210,10 @@ export function createProgrammaticService(options: ServiceOptions) {
 			cleanupPromise ??= (async () => {
 				try {
 					const target = session ?? (launch ? await launch.catch(() => undefined) : undefined);
-					return target ? await target.terminate() : { confirmed: true, exitCode: null };
+					if (!target) return { confirmed: !launchAttempted, exitCode: null };
+					const report = await target.terminate();
+					if (report.confirmed) await target.exited;
+					return report;
 				} catch {
 					return {
 						confirmed: false,
@@ -161,6 +227,8 @@ export function createProgrammaticService(options: ServiceOptions) {
 		try {
 			readiness = driver.checkAvailable(controller.signal);
 			await guarded(readiness);
+			checkAbort(controller.signal);
+			launchAttempted = true;
 			launch = driver.launch({
 				runId: identity.runId,
 				bootstrap,
@@ -329,7 +397,7 @@ export function createProgrammaticService(options: ServiceOptions) {
 		const pendingDrain = Promise.allSettled([gateway.drained(), readiness, pump, inFlight]).then(
 			() => {
 				drained = true;
-				if (cleanup.confirmed) active.delete(identity.runId);
+				if (cleanup.confirmed) release();
 			},
 		);
 		let drainTimer: ReturnType<typeof setTimeout> | undefined;
@@ -345,15 +413,15 @@ export function createProgrammaticService(options: ServiceOptions) {
 		}
 		if (!drained || !cleanup.confirmed) {
 			void Promise.all([pendingDrain, terminate()]).then(([, confirmed]) => {
-				if (confirmed.confirmed) active.delete(identity.runId);
+				if (confirmed.confirmed) release();
 			});
 			error ??= {
 				code: "RECLAIM_PENDING",
 				message: "Cleanup or host callback completion is pending; capacity remains reserved",
 				fatal: true,
 			};
-		} else active.delete(identity.runId);
-		const resourcesReleased = !active.has(identity.runId);
+		} else release();
+		const resourcesReleased = released;
 		return {
 			runId: identity.runId,
 			ok: !!result?.ok && !error && resourcesReleased,
@@ -368,5 +436,18 @@ export function createProgrammaticService(options: ServiceOptions) {
 			},
 		};
 	}
-	return { execute, activeRuns: () => active.size };
+	function close(): Promise<void> {
+		if (closing) return closing;
+		closed = true;
+		const reason = new ProgrammaticError("CLOSED", "Programmatic execution is closed");
+		closing = queue.close(reason);
+		for (const stop of stops) stop(reason);
+		void closing.then(
+			() => serviceOwner.services.delete(service),
+			() => {},
+		);
+		return closing;
+	}
+	const service = { execute, close, activeRuns: () => queue.stats.active };
+	return service;
 }

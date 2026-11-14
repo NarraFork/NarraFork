@@ -1,13 +1,19 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
-import { REVERT_SELECTION_LIMITS, RevertSelectionService } from "./revert-selection-service";
+import {
+	closeRevertBodyWorkers,
+	REVERT_SELECTION_LIMITS,
+	RevertSelectionService,
+	resetRevertBodyWorkersForTests,
+} from "./revert-selection-service";
 
 // Independent in-memory schema; importing the service never imports application DB/runtime.
 const DDL = `
@@ -100,7 +106,8 @@ let queries: string[];
 let beforeQuery: ((query: string) => void) | undefined;
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 
-beforeEach(() => {
+beforeEach(async () => {
+	await resetRevertBodyWorkersForTests();
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
 	sqlite = new Database(":memory:");
@@ -126,7 +133,10 @@ beforeEach(() => {
 	});
 	service = new RevertSelectionService({ $client: traced }, { authorize, onSlow: () => {} });
 });
-afterEach(() => sqlite.close());
+afterEach(async () => {
+	await closeRevertBodyWorkers();
+	sqlite.close();
+});
 async function authorize(
 	owner: NarratorPrincipal,
 	row: NarratorAclRow,
@@ -385,7 +395,292 @@ describe("authorized stable source selection", () => {
 	});
 });
 
+describe("pooled body worker lifecycle", () => {
+	test("separate collections reuse one native thread with distinct RPC IDs and duplicate ready is inert", async () => {
+		message(1);
+		const threads = new Set<Worker>();
+		const ids = new Set<string>();
+		let calls = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (typeof args[0]?.digestOnly === "boolean") {
+				threads.add(this);
+				ids.add(args[0].requestId);
+				calls++;
+				this.emit("message", { ready: true });
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			const first = await collect();
+			const second = await collect();
+			expect(second.metadataDigest).toBe(first.metadataDigest);
+			expect(threads.size).toBe(1);
+			expect(ids.size).toBe(calls);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test("concurrent collectors share a bounded two-thread pool rather than starting per collector", async () => {
+		message(1);
+		const threads = new Set<Worker>();
+		let live = 0;
+		let peak = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (args[0]?.action === "ping" && !threads.has(this)) {
+				threads.add(this);
+				peak = Math.max(peak, ++live);
+				this.once("exit", () => live--);
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			const results = await Promise.all(
+				Array.from({ length: 6 }, () =>
+					new RevertSelectionService({ $client: sqlite }, { authorize }).collect({
+						principal,
+						narratorId: "root",
+						expectedMessageVersion: 7,
+						selector: { kind: "all" },
+					}),
+				),
+			);
+			expect(new Set(results.map((r) => r.metadataDigest)).size).toBe(1);
+			expect(threads.size).toBe(2);
+			expect(peak).toBe(2);
+			await closeRevertBodyWorkers();
+			expect(live).toBe(0);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test.each([
+		"startup-error",
+		"startup-timeout",
+		"cancel",
+		"timeout",
+		"error",
+		"messageerror",
+	] as const)("%s fails without fallback/replay and awaits actual native exit", async (mode) => {
+		message(1);
+		const controller = new AbortController();
+		const threads = new Set<Worker>();
+		const exited = new Set<Worker>();
+		let business = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (!threads.has(this)) {
+				threads.add(this);
+				this.once("exit", () => exited.add(this));
+			}
+			if (args[0]?.action === "ping") {
+				if (mode === "startup-error") throw Error("injected startup failure");
+				if (mode === "startup-timeout") return;
+				return Reflect.apply(original, this, args);
+			}
+			business++;
+			if (mode === "cancel") controller.abort(Error("injected cancellation"));
+			if (mode === "error" || mode === "messageerror")
+				this.emit(mode, Error("injected runtime failure"));
+			// Deliberately do not send the body: timeout/cancel/fault must not compute inline.
+		});
+		try {
+			const service = new RevertSelectionService(
+				{ $client: sqlite },
+				{ authorize, timeoutMs: 180 },
+			);
+			const error = await service
+				.collect({
+					principal,
+					narratorId: "root",
+					expectedMessageVersion: 7,
+					selector: { kind: "all" },
+					signal: controller.signal,
+				})
+				.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+			expect(error).toBeDefined();
+			expect(threads.size).toBe(1);
+			expect(exited.size).toBe(1);
+			expect(business).toBe(mode.startsWith("startup") ? 0 : 1);
+		} finally {
+			post.mockRestore();
+		}
+		// A bad slot is replaced, never silently replayed; a later independent request works.
+		expect((await collect()).history.messages).toHaveLength(1);
+	});
+	test("healthy domain validation errors keep the thread reusable", async () => {
+		const id = message(1);
+		const originalBody = sqlite
+			.query<{ body: string }, [string]>(
+				"SELECT content_json AS body FROM narrator_messages WHERE id=?",
+			)
+			.get(id)?.body as string;
+		const threads = new Set<Worker>();
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (typeof args[0]?.digestOnly === "boolean") threads.add(this);
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			sqlite.query("UPDATE narrator_messages SET content_json='{' WHERE id=?").run(id);
+			await rejected(collect(), "BODY_UNVERIFIED");
+			sqlite.query("UPDATE narrator_messages SET content_json=? WHERE id=?").run(originalBody, id);
+			expect((await collect()).history.messages).toHaveLength(1);
+			expect(threads.size).toBe(1);
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test("final close cancels active work, awaits exit and refuses new dispatch", async () => {
+		message(1);
+		let exited = false;
+		let dispatched = 0;
+		const original = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			if (typeof args[0]?.digestOnly === "boolean") {
+				dispatched++;
+				this.once("exit", () => {
+					exited = true;
+				});
+				void closeRevertBodyWorkers();
+				return;
+			}
+			return Reflect.apply(original, this, args);
+		});
+		try {
+			await rejected(collect(), "BODY_UNVERIFIED");
+			await closeRevertBodyWorkers();
+			expect(exited).toBe(true);
+			await rejected(collect(), "BODY_UNVERIFIED");
+			expect(dispatched).toBe(1);
+		} finally {
+			post.mockRestore();
+		}
+	});
+});
+
 describe("stable block boundary and COW history manifest", () => {
+	test("real body worker ignores stale success/error IDs across parse and digest-only of one message", async () => {
+		const id = message(1, [
+			{ type: "text", text: "keep" },
+			{ type: "text", text: "remove" },
+		]);
+		const selector = { kind: "after_block", messageId: id, keepThroughBlockIndex: 0 } as const;
+		const expected = await collect(selector);
+		const requests: { worker: Worker; requestId: string; id: string; digestOnly: boolean }[] = [];
+		let injectedErrors = 0;
+		let injectedResults = 0;
+		const realPost = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			const [request] = args;
+			if (typeof request?.id === "string" && typeof request.digestOnly === "boolean") {
+				const wrongId = requests.at(-1)?.requestId ?? `wrong-${request.requestId}`;
+				requests.push({
+					worker: this,
+					requestId: request.requestId,
+					id: request.id,
+					digestOnly: request.digestOnly,
+				});
+				// Emit before forwarding to the actual worker, including the previous parse's ID.
+				this.emit("message", { requestId: wrongId, error: "stale body error" });
+				injectedErrors++;
+				this.emit("message", {
+					requestId: wrongId,
+					result: { digest: "0".repeat(64), blocks: [] },
+				});
+				injectedResults++;
+			}
+			return Reflect.apply(realPost, this, args);
+		});
+		try {
+			const result = await collect(selector);
+			expect(result.metadataDigest).toBe(expected.metadataDigest);
+			expect(result.history.messages).toEqual(expected.history.messages);
+			expect(result.history.blocks).toEqual(expected.history.blocks);
+			expect(injectedErrors).toBeGreaterThan(0);
+			expect(injectedResults).toBeGreaterThan(0);
+			expect(new Set(requests.map((request) => request.worker)).size).toBe(1);
+			expect(requests.map((request) => request.digestOnly)).toContain(false);
+			expect(requests.map((request) => request.digestOnly)).toContain(true);
+			expect(new Set(requests.map((request) => request.requestId)).size).toBe(requests.length);
+			for (const request of requests) {
+				expect(typeof request.requestId).toBe("string");
+				expect(request.requestId).not.toBe(id);
+				expect(request.id).toBe(id);
+			}
+		} finally {
+			post.mockRestore();
+		}
+	});
+	test.each([
+		{ name: "null envelope", reply: (_id: string) => null },
+		{ name: "array envelope", reply: (_id: string) => [] },
+		{ name: "missing ID", reply: (_id: string) => ({ result: {} }) },
+		{ name: "invalid ID", reply: (_id: string) => ({ requestId: 1 }) },
+		{ name: "missing result", reply: (requestId: string) => ({ requestId }) },
+		{ name: "null result", reply: (requestId: string) => ({ requestId, result: null }) },
+		{
+			name: "invalid result shape",
+			reply: (requestId: string) => ({ requestId, result: { digest: 1, blocks: [] } }),
+		},
+		{ name: "invalid error", reply: (requestId: string) => ({ requestId, error: 1 }) },
+		{
+			name: "ambiguous result/error",
+			reply: (requestId: string) => ({
+				requestId,
+				error: "ambiguous",
+				result: { digest: "0".repeat(64), blocks: [] },
+			}),
+		},
+	])("malformed real body worker reply fails explicitly: $name", async ({ reply }) => {
+		message(1);
+		let injected = 0;
+		let exited = false;
+		const realPost = Worker.prototype.postMessage;
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			...args: Parameters<Worker["postMessage"]>
+		) {
+			const [request] = args;
+			if (typeof request?.id === "string" && typeof request.digestOnly === "boolean") {
+				this.once("exit", () => {
+					exited = true;
+				});
+				this.emit("message", reply(request.requestId));
+				injected++;
+			}
+			return Reflect.apply(realPost, this, args);
+		});
+		try {
+			await rejected(collect(), "BODY_UNVERIFIED");
+			expect(injected).toBeGreaterThan(0);
+			expect(exited).toBe(true);
+		} finally {
+			post.mockRestore();
+		}
+	});
 	test("after_block fixes retained boundary and all later message/ref changes in one capture", async () => {
 		const early = message(0);
 		const boundary = message(1, [

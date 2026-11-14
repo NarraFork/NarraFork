@@ -4,11 +4,13 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { apiRequests, users } from "@server/db/schema";
+import * as workerRead from "@server/db/worker-read";
 import {
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	shutdownDbWorkerPool,
 } from "@server/lib/db-worker/pool";
+import { logger } from "@server/lib/logger";
 import { decodeUsageHistoryCursor } from "@server/lib/usage-history-cursor";
 import type { SQLWrapper } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -723,27 +725,204 @@ describe("UsageHistoryService production worker", () => {
 			expect(getDbWorkerPoolStats().workers).toBeGreaterThan(0);
 			fileDb.close();
 		} finally {
-			shutdownDbWorkerPool();
+			await shutdownDbWorkerPool();
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
 
-	test("fails closed instead of performing a main-thread scan when workers are disabled", async () => {
+	test.each([
+		false,
+		true,
+	])("fails closed without inline scans when workers are disabled (sink throws: %s)", async (sinkThrows) => {
 		seedUsers();
 		const directory = await mkdtemp(join(tmpdir(), "usage-history-worker-"));
 		const fileDb = new Database(join(directory, "usage.db"));
 		const original = process.env.NARRAFORK_DB_WORKER;
 		process.env.NARRAFORK_DB_WORKER = "off";
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			if (sinkThrows) throw new Error("logging sink failed");
+		});
+		const query = spyOn(fileDb, "query");
+		const prepare = spyOn(fileDb, "prepare");
 		try {
 			await expect(
 				new UsageHistoryService(drizzle({ client: fileDb }) as typeof db).getUsageStats({}),
-			).rejects.toMatchObject({ statusCode: 503, code: "USAGE_QUERY_UNAVAILABLE" });
+			).rejects.toMatchObject({
+				message: "Usage statistics are temporarily unavailable",
+				statusCode: 503,
+				code: "USAGE_QUERY_UNAVAILABLE",
+			});
+			expect(warn).toHaveBeenCalledWith("Usage history aggregation worker failed", {
+				entry: "usage-history-aggregation",
+				phase: "read",
+				errorType: "WorkersUnavailableError",
+				code: undefined,
+			});
+			expect(JSON.stringify(warn.mock.calls)).not.toContain("disabled_by_env");
+			expect(query).not.toHaveBeenCalled();
+			expect(prepare).not.toHaveBeenCalled();
+			expect(getDbWorkerPoolStats()).toMatchObject({ busy: 0, queued: 0, inFlight: 0 });
 		} finally {
+			prepare.mockRestore();
+			query.mockRestore();
+			warn.mockRestore();
 			fileDb.close();
 			await rm(directory, { recursive: true, force: true });
 			if (original === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = original;
-			resetDbWorkerPoolForTest();
+			await resetDbWorkerPoolForTest();
+		}
+	});
+
+	for (const sinkThrows of [false, true]) {
+		test.each([
+			{
+				label: "known",
+				name: "TypeError",
+				code: "SQLITE_BUSY",
+				errorType: "TypeError",
+				safeCode: "SQLITE_BUSY",
+			},
+			{
+				label: "unknown",
+				name: "USAGE_PRIVATE_NAME_SECRET",
+				code: "SQLITE_USAGE_PRIVATE_SECRET",
+				errorType: "WorkerError",
+				safeCode: undefined,
+			},
+		])(`worker diagnostics project $label canaries to scalars (sink throws: ${sinkThrows})`, async ({
+			name,
+			code,
+			errorType,
+			safeCode,
+		}) => {
+			const fault = Object.assign(
+				new TypeError(
+					`postgres://alice:private@host/db token=secret ${"USAGE_PRIVATE_BODY_SECRET".repeat(1024)}`,
+				),
+				{
+					name,
+					code,
+					filename: "/home/private/USAGE_PRIVATE_PATH_SECRET.sqlite",
+					stack:
+						"USAGE_PRIVATE_BODY_SECRET\n at USAGE_PRIVATE_STACK_SECRET (/home/private/USAGE_PRIVATE_PATH_SECRET.ts:12:34)",
+					diagnostic: { contentJson: "USAGE_PRIVATE_BODY_SECRET" },
+				},
+			);
+			const read = spyOn(workerRead, "readQuery").mockRejectedValueOnce(fault);
+			const warn = spyOn(logger, "warn").mockImplementation(() => {
+				if (sinkThrows) throw new Error("logging sink failed");
+			});
+			const clock = spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(1501);
+			const controller = new AbortController();
+			try {
+				await expect(
+					service.getUsageStats(dateFilters, { signal: controller.signal }),
+				).rejects.toMatchObject({
+					message: "Usage statistics are temporarily unavailable",
+					statusCode: 503,
+					code: "USAGE_QUERY_UNAVAILABLE",
+				});
+				expect(read).toHaveBeenCalledTimes(1);
+				expect(read.mock.calls[0][1]).toEqual({ maxRows: 1, signal: controller.signal });
+				expect(warn.mock.calls).toEqual([
+					[
+						"Usage history aggregation worker failed",
+						{
+							entry: "usage-history-aggregation",
+							phase: "read",
+							errorType,
+							code: safeCode,
+						},
+					],
+					[
+						"Slow usage history aggregation",
+						{
+							entry: "usage-history-aggregation",
+							phase: "read",
+							durationMs: 1501,
+						},
+					],
+				]);
+				const serialized = JSON.stringify(warn.mock.calls);
+				expect(serialized.length).toBeLessThan(1024);
+				for (const secret of [
+					"USAGE_PRIVATE_BODY_SECRET",
+					"USAGE_PRIVATE_PATH_SECRET",
+					"USAGE_PRIVATE_STACK_SECRET",
+					"USAGE_PRIVATE_NAME_SECRET",
+					"SQLITE_USAGE_PRIVATE_SECRET",
+					"alice:private",
+					"token=secret",
+					import.meta.dir,
+				])
+					expect(serialized).not.toContain(secret);
+				expect(getDbWorkerPoolStats()).toMatchObject({ busy: 0, queued: 0, inFlight: 0 });
+			} finally {
+				clock.mockRestore();
+				warn.mockRestore();
+				read.mockRestore();
+			}
+		});
+	}
+
+	test("a throwing slow-log sink cannot replace a successful aggregation result", async () => {
+		seedUsers();
+		const expected = await service.getUsageStats(dateFilters);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("logging sink failed");
+		});
+		const clock = spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(1501);
+		try {
+			expect(await service.getUsageStats(dateFilters)).toEqual(expected);
+			expect(warn.mock.calls).toEqual([
+				[
+					"Slow usage history aggregation",
+					{
+						entry: "usage-history-aggregation",
+						phase: "read",
+						durationMs: 1501,
+					},
+				],
+			]);
+		} finally {
+			clock.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
+	test("a throwing failure sink leaves a real rejected worker task released", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "usage-history-worker-"));
+		const fileDb = new Database(join(directory, "usage.db"));
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("logging sink failed");
+		});
+		try {
+			await expect(
+				new UsageHistoryService(drizzle({ client: fileDb }) as typeof db).getUsageStats({}),
+			).rejects.toMatchObject({
+				message: "Usage statistics are temporarily unavailable",
+				statusCode: 503,
+				code: "USAGE_QUERY_UNAVAILABLE",
+			});
+			expect(warn).toHaveBeenCalledWith("Usage history aggregation worker failed", {
+				entry: "usage-history-aggregation",
+				phase: "read",
+				errorType: "DbReadTaskExecutionError",
+				code: "SQLITE_ERROR",
+			});
+			expect(getDbWorkerPoolStats()).toMatchObject({
+				busy: 0,
+				queued: 0,
+				inFlight: 0,
+				starting: 0,
+			});
+		} finally {
+			warn.mockRestore();
+			await shutdownDbWorkerPool();
+			fileDb.close();
+			await rm(directory, { recursive: true, force: true });
+			await resetDbWorkerPoolForTest();
 		}
 	});
 });
