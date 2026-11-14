@@ -3566,9 +3566,12 @@ export const outlineSpaces = pgTable(
 		inProcessReady: boolean("in_process_ready").notNull().default(false),
 		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
 		lastCommitAt: text("last_commit_at"),
+		historyFloorSeq: integer("history_floor_seq").notNull().default(0),
+		edgesReady: boolean("edges_ready").notNull().default(false),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		index("idx_outline_spaces_edges_pending").on(table.id).where(sql.raw('"edges_ready" = FALSE')),
 		index("idx_outline_spaces_last_commit").on(table.lastCommitAt, table.id),
 		index("idx_outline_spaces_unstamped")
 			.on(table.id)
@@ -3701,6 +3704,34 @@ export const outlineBlockVersions = pgTable(
 		index("idx_outline_versions_commit").on(table.commitId),
 		primaryKey({ columns: [table.blockId, table.fromSeq] }),
 	],
+);
+
+export const outlineBlockEdges = pgTable(
+	"outline_block_edges",
+	{
+		parentKey: text("parent_key").notNull(),
+		blockId: text("block_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		fromSeq: integer("from_seq").notNull(),
+		toSeq: integer("to_seq"),
+		orderKey: text("order_key").notNull(),
+	},
+	(table) => [
+		index("idx_outline_edges_block").on(table.blockId, table.fromSeq),
+		primaryKey({ columns: [table.parentKey, table.blockId, table.fromSeq] }),
+	],
+);
+
+export const outlineSubtreeChanges = pgTable(
+	"outline_subtree_changes",
+	{
+		ancestorId: text("ancestor_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		seq: integer("seq").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.ancestorId, table.seq] })],
 );
 
 export const outlineLinks = pgTable(
@@ -4464,8 +4495,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 144,
-  "columnCount": 1918,
+  "tableCount": 146,
+  "columnCount": 1927,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -25085,6 +25116,29 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "historyFloorSeq",
+          "name": "history_floor_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "edgesReady",
+          "name": "edges_ready",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         }
       ],
       "indexes": [
@@ -25094,6 +25148,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "key"
           ],
           "unique": true
+        },
+        {
+          "name": "idx_outline_spaces_edges_pending",
+          "columns": [
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"edges_ready\" = FALSE"
         },
         {
           "name": "idx_outline_spaces_last_commit",
@@ -25738,6 +25800,131 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "blockId",
             "fromSeq"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "outlineBlockEdges",
+      "name": "outline_block_edges",
+      "columns": [
+        {
+          "property": "parentKey",
+          "name": "parent_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_block_edges_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "fromSeq",
+          "name": "from_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "toSeq",
+          "name": "to_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "orderKey",
+          "name": "order_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_edges_block",
+          "columns": [
+            "blockId",
+            "fromSeq"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "parentKey",
+            "blockId",
+            "fromSeq"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "outlineSubtreeChanges",
+      "name": "outline_subtree_changes",
+      "columns": [
+        {
+          "property": "ancestorId",
+          "name": "ancestor_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_subtree_changes_ancestor_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "seq",
+          "name": "seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "ancestorId",
+            "seq"
           ]
         }
       ]

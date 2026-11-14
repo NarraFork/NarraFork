@@ -592,6 +592,14 @@
 			"prevId": "11493ae9-9036-4353-b911-18624a649666",
 			"version": "7",
 			"snapshotDigest": "9b69bab6d6b1864e335e6d5a067c9e052ba4ea869b1eb384e715818ce611ca83"
+		},
+		{
+			"idx": 74,
+			"tag": "0074_outline_edges",
+			"id": "5c6280b8-c028-4e92-b199-ec6aec85bda1",
+			"prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
+			"version": "7",
+			"snapshotDigest": "b94ea851c8192ce298f0af20276fd131e9da238aef5fea80e7ff0f4853c430f7"
 		}
 	]
 }

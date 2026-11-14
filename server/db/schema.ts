@@ -5792,9 +5792,25 @@ export const outlineSpaces = sqliteTable(
 		 * column existed are stamped by the report job from their last commit.
 		 */
 		lastCommitAt: text("last_commit_at"),
+		/**
+		 * The history floor: commits at or before this seq are not kept as history, so a read as of
+		 * a seq below it is answered "history starts later". 0 for a space whose whole history is
+		 * kept. Written once, when the space's placement edges were built for content that predates
+		 * them (`services/outline/history-convert.ts`).
+		 */
+		historyFloorSeq: integer("history_floor_seq").notNull().default(0),
+		/**
+		 * Whether every live block of the space has its open row in `outline_block_edges`. Spaces
+		 * created after the table existed are written true and stay so (every commit keeps the
+		 * table in step); older ones wait for the one-time conversion, which sets it together with
+		 * `history_floor_seq`. Until then reads by placement must not be trusted for the space.
+		 */
+		edgesReady: integer("edges_ready", { mode: "boolean" }).notNull().default(false),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		// Spaces the placement conversion still has to visit; empty once it has run.
+		index("idx_outline_spaces_edges_pending").on(table.id).where(sql`"edges_ready" = 0`),
 		// Spaces with commits since a time, by that time then id (the report job's pages).
 		index("idx_outline_spaces_last_commit").on(table.lastCommitAt, table.id),
 		// Spaces committed to before `last_commit_at` existed: what the report job still stamps.
@@ -5970,6 +5986,62 @@ export const outlineBlockVersions = sqliteTable(
 		index("idx_outline_versions_page_range").on(table.pageId, table.fromSeq, table.toSeq),
 		index("idx_outline_versions_commit").on(table.commitId),
 	],
+);
+
+// === outline_block_edges ===
+/**
+ * Placement intervals: where a block sat (under which parent, at which order key) for
+ * `from_seq <= seq < to_seq`; the current placement has `to_seq` NULL. `parent_key` is the parent
+ * block's id, or the SPACE id for a top-level block, so a space is the root of its tree and
+ * "the children of X as of a seq" is one lookup by parent whatever X is.
+ *
+ * Derived from the block versions and kept in step by the commit that changes a placement
+ * (`applyCommit`, in the same atomic section): a row is written on create, move, reorder, delete
+ * (closes) and restore (opens) only. A content or task change writes none, which is the point:
+ * reading a level as of a seq does not slow down with the number of text versions under it.
+ * A live block has exactly one open row, equal to its current parent and order key; a deleted
+ * block has none. A row whose `from_seq` is 0 was built by the one-time conversion for content
+ * older than the table: it holds from before the space's history floor.
+ *
+ * A plain rowid table: drizzle-orm has no `WITHOUT ROWID`, so the primary key is a separate
+ * index (measured in `store/__tests__/history-size.test.ts`).
+ */
+export const outlineBlockEdges = sqliteTable(
+	"outline_block_edges",
+	{
+		parentKey: text("parent_key").notNull(),
+		blockId: text("block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		fromSeq: integer("from_seq").notNull(),
+		toSeq: integer("to_seq"),
+		orderKey: text("order_key").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.parentKey, table.blockId, table.fromSeq] }),
+		// A block's placements (its open one, its parent as of a seq); also the FK's index.
+		index("idx_outline_edges_block").on(table.blockId, table.fromSeq),
+	],
+);
+
+// === outline_subtree_changes ===
+/**
+ * Change marks: `(ancestor_id, seq)` says the commit `seq` changed a block that was below
+ * `ancestor_id` before or after it. A commit writes one row for every ancestor (before the
+ * commit and after it) of every block it gives a version, each once. So a block with no version
+ * of its own and no mark in `(s1, s2]` has the same subtree at both seqs, and the commits that
+ * touched anything under a block are one index range. Derived, like the edges, and written in
+ * the same atomic section. A space is not an ancestor here: its timeline is its commits.
+ */
+export const outlineSubtreeChanges = sqliteTable(
+	"outline_subtree_changes",
+	{
+		ancestorId: text("ancestor_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		seq: integer("seq").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.ancestorId, table.seq] })],
 );
 
 // === outline_links ===
