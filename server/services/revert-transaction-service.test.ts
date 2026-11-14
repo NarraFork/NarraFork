@@ -306,8 +306,191 @@ describe("independent file restoration", () => {
 		expect((await execution(plan).whenSettled).status).toBe("committed");
 		expect(await fs.readFile(path, "utf8")).toBe("before");
 	});
-	test("changed message version rejects before file dispatch", async () => {
+	test("a version-only change does not veto a structurally identical confirmed plan", async () => {
 		const { a, plan } = await twoFiles();
+		db.update(schema.narrators)
+			.set({ messageVersion: 8, status: "working" })
+			.where(eq(schema.narrators.id, "narrator"))
+			.run();
+		const result = await execution(plan).whenSettled;
+		expect(result.historyCommitted).toBe(true);
+		expect(result.status).toBe("committed");
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+	});
+	for (const kind of ["revert", "history_delete"] as const)
+		test(`${kind} ignores new unrelated same-narrator messages for a single selected tool`, async () => {
+			const path = join(workspace, "stable-point.txt");
+			await fs.writeFile(path, "original");
+			const target = await write(path, "changed");
+			const plan = await prepare({
+				kind,
+				selector: { kind: "tool_calls", toolCallIds: [target.toolCallId] },
+			});
+			db.insert(schema.narratorMessages)
+				.values({
+					id: "unrelated-message",
+					narratorId: "narrator",
+					role: "user",
+					contentJson: [{ type: "text", text: "unrelated" }],
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+			db.insert(schema.narratorMessageRefs)
+				.values({
+					id: "unrelated-ref",
+					narratorId: "narrator",
+					messageId: "unrelated-message",
+					seq: 999,
+				})
+				.run();
+			db.update(schema.narrators)
+				.set({ messageVersion: 8, status: "working" })
+				.where(eq(schema.narrators.id, "narrator"))
+				.run();
+			const result = await execution(plan).whenSettled;
+			expect(result.status).toBe("committed");
+			expect(result.historyCommitted).toBe(kind === "history_delete");
+			expect(await fs.readFile(path, "utf8")).toBe("original");
+			expect(
+				db
+					.select()
+					.from(schema.narratorMessageRefs)
+					.where(eq(schema.narratorMessageRefs.id, "unrelated-ref"))
+					.get()?.messageId,
+			).toBe("unrelated-message");
+		});
+	test("a version bump inside the initial collector preserves original header consent and still executes", async () => {
+		const path = join(workspace, "initial-collect-drift.txt");
+		await fs.writeFile(path, "original");
+		const target = await write(path, "changed");
+		const realCollect = RevertSelectionService.prototype.collect;
+		let scheduled = false;
+		const collect = spyOn(RevertSelectionService.prototype, "collect").mockImplementation(function (
+			this: RevertSelectionService,
+			request,
+		) {
+			if (!scheduled && request.expectedMessageVersion !== undefined) {
+				scheduled = true;
+				queueMicrotask(() =>
+					db
+						.update(schema.narrators)
+						.set({ messageVersion: 8, status: "working" })
+						.where(eq(schema.narrators.id, "narrator"))
+						.run(),
+				);
+			}
+			return realCollect.call(this, request);
+		});
+		try {
+			const plan = await prepare({
+				selector: { kind: "tool_calls", toolCallIds: [target.toolCallId] },
+			});
+			expect(plan.expectedMessageVersion).toBe(7);
+			expect((await execution(plan).whenSettled).status).toBe("committed");
+			expect(await fs.readFile(path, "utf8")).toBe("original");
+		} finally {
+			collect.mockRestore();
+		}
+	});
+	test("a selected message change still rejects before file dispatch", async () => {
+		const { a, plan } = await twoFiles();
+		db.update(schema.narratorMessages).set({ contentJson: [] }).run();
+		db.update(schema.narrators)
+			.set({ messageVersion: 8 })
+			.where(eq(schema.narrators.id, "narrator"))
+			.run();
+		await expect(execution(plan).whenSettled).rejects.toThrow();
+		expect(await fs.readFile(a, "utf8")).toBe("changed");
+		expect(operation(plan)?.status).toBe("prepared");
+	});
+	for (const mutation of ["body", "same-length body", "ref", "tool", "suffix"] as const)
+		test(`the last collection ACL cannot permit ${mutation} changes before file dispatch`, async () => {
+			const { a, plan } = await twoFiles();
+			const selected = db.select().from(schema.narratorMessages).limit(1).get();
+			if (!selected || !Array.isArray(selected.contentJson))
+				throw new Error("Missing selected message");
+			const selectedBody = selected.contentJson;
+			const originalAuthorize = options.access.authorizeNarrator;
+			let calls = 0;
+			let fileReads = 0;
+			setFileHook(() => {
+				fileReads++;
+			});
+			const authorize = spyOn(options.access, "authorizeNarrator").mockImplementation(
+				async (...args) => {
+					await originalAuthorize(...args);
+					if (++calls !== 3) return;
+					if (mutation === "body")
+						db.update(schema.narratorMessages)
+							.set({ contentJson: [] })
+							.where(eq(schema.narratorMessages.id, selected.id))
+							.run();
+					if (mutation === "same-length body")
+						db.update(schema.narratorMessages)
+							.set({ contentJson: [{ type: "text", text: "mutate" }, ...selectedBody.slice(1)] })
+							.where(eq(schema.narratorMessages.id, selected.id))
+							.run();
+					if (mutation === "ref")
+						db.update(schema.narratorMessageRefs)
+							.set({ seq: 999 })
+							.where(eq(schema.narratorMessageRefs.messageId, selected.id))
+							.run();
+					if (mutation === "tool")
+						db.update(schema.narratorToolCalls)
+							.set({ executionAttempt: 2 })
+							.where(eq(schema.narratorToolCalls.messageId, selected.id))
+							.run();
+					if (mutation === "suffix") {
+						db.insert(schema.narratorMessages)
+							.values({
+								id: "acl-late-suffix",
+								narratorId: "narrator",
+								role: "user",
+								contentJson: [],
+								createdAt: new Date().toISOString(),
+							})
+							.run();
+						db.insert(schema.narratorMessageRefs)
+							.values({
+								id: "acl-late-suffix-ref",
+								narratorId: "narrator",
+								messageId: "acl-late-suffix",
+								seq: 999,
+							})
+							.run();
+					}
+					db.update(schema.narrators)
+						.set({ messageVersion: 8 })
+						.where(eq(schema.narrators.id, "narrator"))
+						.run();
+				},
+			);
+			try {
+				setService(makeFixtureTransaction(db, options));
+				const error = await execution(plan).whenSettled.catch((error) => error);
+				expect(error).toMatchObject({ code: "REVERT_SELECTION_STALE" });
+				expect(calls).toBe(3);
+				expect(fileReads).toBe(0);
+				expect(await fs.readFile(a, "utf8")).toBe("changed");
+				expect(operation(plan)?.status).toBe("prepared");
+			} finally {
+				authorize.mockRestore();
+			}
+		});
+	test("a newly appended rollback member invalidates the complete suffix plan", async () => {
+		const { a, plan } = await twoFiles();
+		db.insert(schema.narratorMessages)
+			.values({
+				id: "new-suffix",
+				narratorId: "narrator",
+				role: "user",
+				contentJson: [],
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		db.insert(schema.narratorMessageRefs)
+			.values({ id: "new-suffix-ref", narratorId: "narrator", messageId: "new-suffix", seq: 999 })
+			.run();
 		db.update(schema.narrators)
 			.set({ messageVersion: 8 })
 			.where(eq(schema.narrators.id, "narrator"))

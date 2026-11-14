@@ -2568,7 +2568,7 @@ describe("backend scope and namespace guards", () => {
 		const before = history();
 		const response = await apply(plan, "revert_files");
 		expect(response.status).toBe(409);
-		expect((await response.json()).code).toBe("REVERT_SELECTION_STALE");
+		expect((await response.json()).code).toBe("REVERT_TRANSACTION_SELECTION_STALE");
 		expect(await readFile(path, "utf8")).toBe("new\n");
 		expect(history()).toBe(before);
 		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
@@ -2971,6 +2971,197 @@ describe("per-file queues, archived metadata and unchanged state", () => {
 		await refused(await prepare());
 		expect(history()).toBe(before);
 		expect(await readFile(path, "utf8")).toBe("new\n");
+	});
+});
+
+describe("lazy fork revert preparation", () => {
+	async function forkAcrossCompact() {
+		const parentId = narratorId;
+		const oldest = message("user", [{ type: "text", text: "unrelated old history" }]);
+		const oldBoundary = message("user", [{ type: "text", text: "old target" }]);
+		const oldCall = await write(join(workspace, "lazy-old.txt"), "old evidence\n");
+		const compactId = generateId();
+		db.transaction(() => {
+			db.insert(schema.narratorMessages)
+				.values({
+					id: compactId,
+					narratorId,
+					role: "system",
+					contentJson: [{ type: "compact", status: "compacted", summary: "real compact boundary" }],
+					createdAt: now(),
+				})
+				.run();
+			db.insert(schema.narratorMessageRefs)
+				.values({
+					id: generateId(),
+					narratorId,
+					messageId: compactId,
+					seq: ++sequence,
+					isCompact: 1,
+				})
+				.run();
+		});
+		const recentBoundary = message("user", [{ type: "text", text: "recent target" }]);
+		const recentCall = await write(join(workspace, "lazy-recent.txt"), "recent evidence\n");
+		const child = await narratorService.forkNarrator(parentId, null, { inheritMode: "full" });
+		return { parentId, child, oldest, oldBoundary, oldCall, compactId, recentBoundary, recentCall };
+	}
+	function lazyState(id: string) {
+		return db
+			.select({
+				from: schema.narrators.refsInheritedFrom,
+				cursor: schema.narrators.refsBackfillCursor,
+			})
+			.from(schema.narrators)
+			.where(eq(schema.narrators.id, id))
+			.get();
+	}
+
+	test("compact then full fork can preview and commit a recent rollback without loading old refs", async () => {
+		const { child, oldBoundary, compactId, recentBoundary } = await forkAcrossCompact();
+		narratorId = child.id;
+		const before = lazyState(child.id);
+		const plan = await actionPrepared("rollback_to_block", recentBoundary, { blockIndex: 0 });
+		expect(lazyState(child.id)).toEqual(before);
+		expect(messageRefs().map((ref) => ref.messageId)).not.toContain(oldBoundary);
+		expect(messageRefs().map((ref) => ref.messageId)).not.toContain(compactId);
+		await committed(plan, "rollback_to_block");
+		expect(lazyState(child.id)).toEqual(before);
+		expect(messageRefs().map((ref) => ref.messageId)).toEqual([recentBoundary]);
+	});
+
+	test("an old rollback materializes its required suffix and leaves older unrelated refs lazy", async () => {
+		const { child, oldest, oldBoundary } = await forkAcrossCompact();
+		narratorId = child.id;
+		const plan = await actionPrepared("rollback_to_block", oldBoundary, { blockIndex: 0 });
+		expect(lazyState(child.id)).toMatchObject({ cursor: 2 });
+		expect(messageRefs().map((ref) => ref.messageId)).not.toContain(oldest);
+		expect(messageRefs().map((ref) => ref.messageId)).toContain(oldBoundary);
+		await committed(plan, "rollback_to_block");
+		expect(messageRefs().map((ref) => ref.messageId)).toEqual([oldBoundary]);
+	});
+
+	test("raw preview keeps explicit expectedVersion, while pure materialization is transparent", async () => {
+		const { child, oldest, oldCall } = await forkAcrossCompact();
+		narratorId = child.id;
+		const version = messageVersion();
+		await prepared({
+			expectedMessageVersion: version,
+			selector: { kind: "messages", messageIds: [oldCall.messageId] },
+		});
+		expect(messageVersion()).toBe(version);
+		expect(messageRefs().map((ref) => ref.messageId)).not.toContain(oldest);
+		db.update(schema.narrators)
+			.set({ messageVersion: (version ?? 0) + 1 })
+			.where(eq(schema.narrators.id, child.id))
+			.run();
+		const staleResponse = await prepare({
+			idempotencyKey: "explicit-old-version",
+			expectedMessageVersion: version,
+			selector: { kind: "all" },
+		});
+		expect(staleResponse.status).toBe(409);
+		expect((await staleResponse.json()).code).toMatch(/STALE/);
+		expect(messageRefs().map((ref) => ref.messageId)).not.toContain(oldest);
+	});
+
+	test("file-only rollback does not materialize lazy readers of unchanged source history", async () => {
+		const { child, oldCall } = await forkAcrossCompact();
+		const before = lazyState(child.id);
+		const plan = await actionPrepared("revert_files", oldCall.messageId);
+		expect(lazyState(child.id)).toEqual(before);
+		await committed(plan, "revert_files");
+		expect(lazyState(child.id)).toEqual(before);
+	});
+
+	test("preview discovers a late fork reader and prepares it before recollecting a fixed manifest", async () => {
+		const { parentId, oldCall } = await forkAcrossCompact();
+		const resolveContext = RevertPlannerLocalAccess.prototype.resolveContext;
+		let lateReader: Awaited<ReturnType<typeof narratorService.forkNarrator>> | undefined;
+		const spy = spyOn(RevertPlannerLocalAccess.prototype, "resolveContext").mockImplementation(
+			async function (this: RevertPlannerLocalAccess, input) {
+				const result = await resolveContext.call(this, input);
+				if (!lateReader)
+					lateReader = await narratorService.forkNarrator(parentId, null, { inheritMode: "full" });
+				return result;
+			},
+		);
+		let plan: RevertPlanSummary;
+		try {
+			plan = await actionPrepared("delete_tool_block", oldCall.messageId, {
+				blockIndex: oldCall.blockIndex,
+			});
+		} finally {
+			spy.mockRestore();
+		}
+		if (!lateReader) throw new Error("Late fork was not injected");
+		expect(lazyState(lateReader.id)).toMatchObject({ from: parentId, cursor: 3 });
+		await committed(plan, "delete_tool_block");
+		const { ensureAllRefsMaterialized } = await import("./narrator-refs-backfill");
+		await ensureAllRefsMaterialized(lateReader.id);
+		const readerRefs = db
+			.select({
+				messageId: schema.narratorMessageRefs.messageId,
+				seq: schema.narratorMessageRefs.seq,
+			})
+			.from(schema.narratorMessageRefs)
+			.where(eq(schema.narratorMessageRefs.narratorId, lateReader.id))
+			.all();
+		expect(readerRefs).toHaveLength(6);
+		expect(readerRefs.filter((ref) => ref.seq === 3)).toEqual([
+			{ messageId: oldCall.messageId, seq: 3 },
+		]);
+		expect(messageRow(oldCall.messageId)?.contentJson).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: oldCall.toolUseId, type: "tool_use" }),
+			]),
+		);
+	});
+
+	test("unauthorized preview does not materialize inherited history", async () => {
+		const { child, oldBoundary } = await forkAcrossCompact();
+		narratorId = child.id;
+		const before = messageRefs();
+		const state = lazyState(child.id);
+		const response = await actionPreview(
+			"rollback_to_block",
+			oldBoundary,
+			{ blockIndex: 0 },
+			otherToken,
+		);
+		expect([403, 404]).toContain(response.status);
+		expect(messageRefs()).toEqual(before);
+		expect(lazyState(child.id)).toEqual(state);
+	});
+
+	test("source delete preview first freezes lazy child readers, then COW preserves their original history", async () => {
+		const { child, oldCall } = await forkAcrossCompact();
+		const plan = await actionPrepared("delete_tool_block", oldCall.messageId, {
+			blockIndex: oldCall.blockIndex,
+		});
+		expect(lazyState(child.id)).toMatchObject({ cursor: 3 });
+		const childRefs = () =>
+			db
+				.select({
+					messageId: schema.narratorMessageRefs.messageId,
+					seq: schema.narratorMessageRefs.seq,
+				})
+				.from(schema.narratorMessageRefs)
+				.where(eq(schema.narratorMessageRefs.narratorId, child.id))
+				.orderBy(schema.narratorMessageRefs.seq)
+				.all();
+		expect(childRefs().map((ref) => ref.messageId)).toContain(oldCall.messageId);
+		await committed(plan, "delete_tool_block");
+		const { ensureAllRefsMaterialized } = await import("./narrator-refs-backfill");
+		await ensureAllRefsMaterialized(child.id);
+		expect(childRefs().filter((ref) => ref.seq === 3)).toEqual([
+			{ messageId: oldCall.messageId, seq: 3 },
+		]);
+		expect(messageRow(oldCall.messageId)?.contentJson).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: oldCall.toolUseId, type: "tool_use" }),
+			]),
+		);
 	});
 });
 

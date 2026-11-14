@@ -1,19 +1,29 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
+import {
+	MAX_MIRROR_MAIN_BINARY_BYTES,
+	mirrorAssetLimit,
+} from "../shared/independent-update-mirror";
 import { addToken, initConfig } from "../update-server/lib/config";
 import { createReleaseRoutes } from "../update-server/routes/releases";
 import type { StorageBackend } from "../update-server/storage/types";
 import type { ReleaseMeta, ZstdPatchMeta } from "../update-server/types";
 
-test("production HTTP entry admits bounded streaming patches up to 512 MiB", () => {
-	// app.request bypasses Bun.serve admission, so route tests alone cannot catch
-	// an entry-point limit that rejects canonical patches before streaming validation.
+test("production HTTP entry admits 4 GiB binaries while patches remain bounded to 512 MiB", () => {
+	// app.request bypasses Bun.serve admission. The entry must admit full binaries;
+	// authenticated streaming validation still enforces each asset kind's smaller limit.
 	const entry = readFileSync(new URL("../update-server/index.ts", import.meta.url), "utf8");
-	expect(entry).toMatch(/Bun\.serve\(\{[\s\S]*?maxRequestBodySize:\s*512\s*\*\s*1024\s*\*\s*1024/);
+	expect(entry).toMatch(
+		/Bun\.serve\(\{[\s\S]*?maxRequestBodySize:\s*MAX_MIRROR_MAIN_BINARY_BYTES\b/,
+	);
+	expect(MAX_MIRROR_MAIN_BINARY_BYTES).toBe(4 * 1024 ** 3);
+	expect(mirrorAssetLimit("main-binary")).toBe(MAX_MIRROR_MAIN_BINARY_BYTES);
+	expect(mirrorAssetLimit("patch")).toBe(512 * 1024 ** 2);
 });
 
 class MemoryStorage implements StorageBackend {
@@ -225,3 +235,89 @@ test("release upload route keeps published platform identities immutable", async
 		rmSync(configDirectory, { recursive: true, force: true });
 	}
 });
+
+test("legacy metadata admission accepts 4 GiB but rejects larger binaries without storing payloads", async () => {
+	const configDirectory = mkdtempSync(join(tmpdir(), "nf-update-size-integrity-"));
+	try {
+		const { adminToken } = await initConfig(join(configDirectory, "config.json"));
+		const storage = new MemoryStorage();
+		const app = new Hono();
+		app.route("/api/v2/products", createReleaseRoutes(storage));
+		for (const [i, size] of [1024 ** 3 + 1, 4 * 1024 ** 3, 4 * 1024 ** 3 + 1].entries()) {
+			const product = `size-integrity-${i}`;
+			const version = "4.0.1";
+			const form = new FormData();
+			form.set("version", version);
+			form.set("channel", "beta");
+			form.set("platform", "linux-x64");
+			form.set("filename", `narrafork-${version}-linux-x64`);
+			form.set("size", String(size));
+			form.set("sha512", Buffer.alloc(64).toString("base64"));
+			const response = await app.request(`/api/v2/products/${product}/releases`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${adminToken}` },
+				body: form,
+			});
+			const path = `products/${product}/releases/${version}/meta.json`;
+			if (size > MAX_MIRROR_MAIN_BINARY_BYTES) {
+				expect(response.status).toBe(400);
+				expect(await storage.fileExists(path)).toBe(false);
+			} else {
+				expect(response.status).toBe(200);
+				const bytes = await storage.getFile(path);
+				expect(bytes).not.toBeNull();
+				expect(JSON.parse(bytes?.toString("utf8") ?? "{}").platforms["linux-x64"].size).toBe(size);
+			}
+		}
+	} finally {
+		rmSync(configDirectory, { recursive: true, force: true });
+	}
+});
+
+test("real Bun HTTP admission streams 4 GiB without truncating its size to 32 bits", async () => {
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		maxRequestBodySize: MAX_MIRROR_MAIN_BINARY_BYTES,
+		async fetch(request) {
+			try {
+				// Consume only the first byte, not a multi-GiB fixture.
+				await request.body?.getReader().read();
+				return new Response("stream-open");
+			} catch {
+				return new Response("too-large", { status: 413 });
+			}
+		},
+	});
+	const probe = (size: number) =>
+		new Promise<number>((resolve, reject) => {
+			const socket = createConnection(server.port as number, "127.0.0.1");
+			const finish = () => socket.destroy();
+			socket.setTimeout(2000, () => {
+				finish();
+				reject(new Error("HTTP admission probe timed out"));
+			});
+			socket.once("connect", () =>
+				socket.write(
+					`POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${size}\r\nConnection: close\r\n\r\nx`,
+				),
+			);
+			socket.once("data", (data) => {
+				finish();
+				const status = /^HTTP\/1\.1 (\d+)/.exec(data.toString());
+				if (!status) reject(new Error("Invalid HTTP admission response"));
+				else resolve(Number(status[1]));
+			});
+			socket.once("error", (error) => {
+				finish();
+				reject(error);
+			});
+		});
+	try {
+		expect(await probe(1024 ** 3 + 1)).toBe(200);
+		expect(await probe(MAX_MIRROR_MAIN_BINARY_BYTES)).toBe(200);
+		expect(await probe(MAX_MIRROR_MAIN_BINARY_BYTES + 1)).toBe(413);
+	} finally {
+		await server.stop(true);
+	}
+}, 10_000);

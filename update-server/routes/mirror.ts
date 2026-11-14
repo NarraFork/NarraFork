@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import {
 	MAX_MIRROR_SNAPSHOT_BYTES,
 	MIRROR_ASSET_HEADERS,
+	MIRROR_MAIN_TRANSFER_TIMEOUT_MS,
 	parseMirrorAssetDescriptor,
 } from "../../shared/independent-update-mirror";
 import { requireAuth } from "../lib/auth";
@@ -13,6 +14,7 @@ function boundedDownload(
 	source: ReadableStream<Uint8Array>,
 	size: number,
 	signal: AbortSignal,
+	timeoutMs = 120_000,
 ): ReadableStream<Uint8Array> {
 	const reader = source.getReader();
 	let bytes = 0;
@@ -34,7 +36,7 @@ function boundedDownload(
 	return new ReadableStream<Uint8Array>({
 		start(c) {
 			controller = c;
-			timer = setTimeout(() => fail("Mirror download deadline exceeded"), 120_000);
+			timer = setTimeout(() => fail("Mirror download deadline exceeded"), timeoutMs);
 			signal.addEventListener("abort", abort, { once: true });
 			if (signal.aborted) abort();
 		},
@@ -95,7 +97,7 @@ export function createMirrorRoutes(
 			return c.json({ error: "Unknown canonical target/platform" }, 404);
 		const assets = [];
 		for (const asset of snapshot.assets.filter(
-			(a) => a.version === version && a.platform === platform,
+			(a) => a.version === version && a.platform === platform && a.kind !== "main-binary",
 		)) {
 			if ((await storage.getFileSize(objectPath(asset.sha256))) === asset.size)
 				assets.push({ name: asset.name, size: asset.size, sha256: asset.sha256 });
@@ -112,13 +114,21 @@ export function createMirrorRoutes(
 			return c.json({ error: "Committed mirror asset unavailable" }, 404);
 		const stream = await storage.getFileStream(objectPath(sha));
 		return stream
-			? new Response(boundedDownload(stream, asset.size, c.req.raw.signal), {
-					headers: {
-						"Content-Type": "application/octet-stream",
-						"Content-Length": String(asset.size),
-						"X-Content-Type-Options": "nosniff",
+			? new Response(
+					boundedDownload(
+						stream,
+						asset.size,
+						c.req.raw.signal,
+						asset.kind === "main-binary" ? MIRROR_MAIN_TRANSFER_TIMEOUT_MS : 120_000,
+					),
+					{
+						headers: {
+							"Content-Type": "application/octet-stream",
+							"Content-Length": String(asset.size),
+							"X-Content-Type-Options": "nosniff",
+						},
 					},
-				})
+				)
 			: c.json({ error: "Mirror asset unavailable" }, 404);
 	});
 	routes.put("/:product/mirror/assets/:sha256", requireAuth("upload"), async (c) => {
@@ -142,7 +152,9 @@ export function createMirrorRoutes(
 		return c.json(await ingest.ingestAsset(product, asset, c.req.raw.body, c.req.raw.signal));
 	});
 	routes.post("/:product/mirror/snapshot", requireAuth("upload"), async (c) => {
-		const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(120_000)]);
+		// readMirrorBounded retains its own 15s metadata-body deadline; commitMain starts
+		// the longer verification budget only after the small JSON has been parsed.
+		const signal = c.req.raw.signal;
 		const input = JSON.parse(
 			(await readMirrorBounded(c.req.raw.body, MAX_MIRROR_SNAPSHOT_BYTES, signal)).toString("utf8"),
 		);

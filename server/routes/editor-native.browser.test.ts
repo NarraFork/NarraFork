@@ -756,6 +756,8 @@ test.each([
 		const end = Date.now() + 5000;
 		serviceDrain = drainNativeEditorService(service, end);
 		await serviceDrain;
+		// Browser abort/unmount does not join the source worker and remote close ACKs.
+		// Wait on live stream ownership before taking the final resource sample.
 		while (
 			editorFileSubscriptions.diagnostics.references ||
 			hostHelperDiagnostics().processes ||
