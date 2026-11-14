@@ -2,6 +2,7 @@ import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ApiError, api, endSession, getToken, setToken } from "../lib/api";
 import { isMfaChallenge, type LoginResult, type LoginSession } from "../lib/api/auth";
+import { appearanceStore } from "../lib/appearance-preference-store";
 import { assetUrl } from "../lib/base-path";
 import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
 
@@ -13,6 +14,9 @@ export async function applySession(qc: QueryClient, data: LoginSession): Promise
 	} else {
 		setToken(data.token);
 	}
+	// Never let a new account hydrate from the preceding account's raw preference cache.
+	qc.removeQueries({ queryKey: ["user-preferences"] });
+	appearanceStore.activate(data.user.id);
 	// Seed the user cache immediately so AuthenticatedLayout won't flash.
 	qc.setQueryData(["auth", "me"], data.user);
 	try {
