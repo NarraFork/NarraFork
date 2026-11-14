@@ -371,10 +371,10 @@ describe("outline pageless upgrade (golden)", () => {
 					.query(
 						"SELECT parent_key, block_id, from_seq, to_seq, order_key FROM outline_block_edges ORDER BY block_id",
 					)
-					.values(),
+					.values() as unknown[][],
 			).toEqual(
 				live
-					.map((b) => [b.parentId ?? spaceOf(b.id), b.id, 0, null, b.orderKey])
+					.map((b): unknown[] => [b.parentId ?? spaceOf(b.id), b.id, 0, null, b.orderKey])
 					.sort((x, y) => ((x[1] as string) < (y[1] as string) ? -1 : 1)),
 			);
 			expect(database.query("SELECT count(*) AS n FROM outline_subtree_changes").get()).toEqual({

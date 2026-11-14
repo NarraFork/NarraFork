@@ -284,14 +284,15 @@ describe("PostgreSQL outline store", () => {
 		"reads by placement keep their join order on analyzed data (plan guard)",
 		async () => {
 			const sqls = await migrationSql();
-			const outcome = await withPostgres(async ({ exec, port, credentials }) => {
-				for (const statement of sqls) {
-					const applied = await exec(statement);
-					if (applied.code !== 0) return { error: applied.stderr.slice(0, 400) };
-				}
-				// 200 top-level blocks with 500 children each, five versions a block; analyzed, so the
-				// planner chooses from real statistics (on empty tables everything is a scan).
-				const seeded = await exec(`
+			const outcome = await withPostgres(
+				async ({ exec, port, credentials }): Promise<PlanOutcome | { error: string }> => {
+					for (const statement of sqls) {
+						const applied = await exec(statement);
+						if (applied.code !== 0) return { error: applied.stderr.slice(0, 400) };
+					}
+					// 200 top-level blocks with 500 children each, five versions a block; analyzed, so the
+					// planner chooses from real statistics (on empty tables everything is a scan).
+					const seeded = await exec(`
 					INSERT INTO outline_spaces (id, key, kind, next_seq, created_at, edges_ready)
 						VALUES ('plan-space', 'plan', 'personal', 6, '2026-11-14T00:00:00.000Z', true);
 					INSERT INTO outline_commits (id, space_id, seq, kind, actor_kind, actor_id, created_at, summary)
@@ -315,83 +316,85 @@ describe("PostgreSQL outline store", () => {
 					FROM outline_blocks WHERE space_id = 'plan-space';
 					ANALYZE outline_blocks; ANALYZE outline_block_versions; ANALYZE outline_block_edges;
 				`);
-				if (seeded.code !== 0) return { error: seeded.stderr.slice(0, 400) };
-				const client = createPostgresClient({
-					driver: "bun-sql",
-					url: urlFor(port, credentials),
-					max: 2,
-					connectTimeout: 10,
-				});
-				try {
-					const planOf = async (statement: SQL) => {
-						const rows = (await client.db.execute(
-							sql`EXPLAIN (FORMAT JSON) ${statement}`,
-						)) as unknown as Array<Record<string, unknown>>;
-						const raw = Object.values(rows[0] ?? {})[0];
-						const parsed = (typeof raw === "string" ? JSON.parse(raw) : raw) as Array<{
-							Plan: PlanNode;
-						}>;
-						const nodes: PlanNode[] = [];
-						const walk = (node: PlanNode) => {
-							nodes.push(node);
-							for (const child of node.Plans ?? []) walk(child);
-						};
-						walk((parsed[0] as { Plan: PlanNode }).Plan);
-						return nodes;
-					};
-					const store = createPostgresOutlineStore(client.db);
-					const twenty = Array.from({ length: 20 }, (_, i) => `top${i + 1}`);
-					const level = await store.listLevel("plan-space", "top7", { asOf: 3, limit: 50 });
-					const subtree = await store.listSubtreeAt("plan-space", "top7", {
-						asOf: 3,
-						limit: 800,
+					if (seeded.code !== 0) return { error: seeded.stderr.slice(0, 400) };
+					const client = createPostgresClient({
+						driver: "bun-sql",
+						url: urlFor(port, credentials),
+						max: 2,
+						connectTimeout: 10,
 					});
-					// Printed only: what a screen costs over a pooled local connection.
-					const timings: string[] = [];
-					const time = async (name: string, fn: () => Promise<unknown>) => {
-						for (let i = 0; i < 3; i++) await fn();
-						const samples: number[] = [];
-						for (let i = 0; i < 30; i++) {
-							const started = performance.now();
-							await fn();
-							samples.push(performance.now() - started);
-						}
-						samples.sort((a, b) => a - b);
-						timings.push(
-							`  ${name}: ${(samples[15] as number).toFixed(2)} / ${(samples[28] as number).toFixed(2)} ms`,
+					try {
+						const planOf = async (statement: SQL) => {
+							const rows = (await client.db.execute(
+								sql`EXPLAIN (FORMAT JSON) ${statement}`,
+							)) as unknown as Array<Record<string, unknown>>;
+							const raw = Object.values(rows[0] ?? {})[0];
+							const parsed = (typeof raw === "string" ? JSON.parse(raw) : raw) as Array<{
+								Plan: PlanNode;
+							}>;
+							const nodes: PlanNode[] = [];
+							const walk = (node: PlanNode) => {
+								nodes.push(node);
+								for (const child of node.Plans ?? []) walk(child);
+							};
+							walk((parsed[0] as { Plan: PlanNode }).Plan);
+							return nodes;
+						};
+						const store = createPostgresOutlineStore(client.db);
+						const twenty = Array.from({ length: 20 }, (_, i) => `top${i + 1}`);
+						const level = await store.listLevel("plan-space", "top7", { asOf: 3, limit: 50 });
+						const subtree = await store.listSubtreeAt("plan-space", "top7", {
+							asOf: 3,
+							limit: 800,
+						});
+						// Printed only: what a screen costs over a pooled local connection.
+						const timings: string[] = [];
+						const time = async (name: string, fn: () => Promise<unknown>) => {
+							for (let i = 0; i < 3; i++) await fn();
+							const samples: number[] = [];
+							for (let i = 0; i < 30; i++) {
+								const started = performance.now();
+								await fn();
+								samples.push(performance.now() - started);
+							}
+							samples.sort((a, b) => a - b);
+							timings.push(
+								`  ${name}: ${(samples[15] as number).toFixed(2)} / ${(samples[28] as number).toFixed(2)} ms`,
+							);
+						};
+						await time("level as of a seq, 50 of 500 children", () =>
+							store.listLevel("plan-space", "top7", { asOf: 3, limit: 50 }),
 						);
-					};
-					await time("level as of a seq, 50 of 500 children", () =>
-						store.listLevel("plan-space", "top7", { asOf: 3, limit: 50 }),
-					);
-					await time("level now, 50 of 500 children", () =>
-						store.listLevel("plan-space", "top7", { asOf: null, limit: 50 }),
-					);
-					await time("subtree as of a seq, 800 of the whole space", () =>
-						store.listSubtreeAt("plan-space", null, { asOf: 3, limit: 800 }),
-					);
-					await time("subtree now, 800 of the whole space", () =>
-						store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 }),
-					);
-					await time("levels as of a seq, 20 parents, 800 rows", () =>
-						store.listLevels("plan-space", twenty, { asOf: 3, limit: 800 }),
-					);
-					return {
-						timings,
-						level: await planOf(pgLevelAsOf("plan-space", ["top7"], 3, null, 51)),
-						levels: await planOf(pgLevelAsOf("plan-space", twenty, 3, null, 801)),
-						now: await planOf(pgLevelNow("plan-space", twenty, null, 801)),
-						marks: await planOf(pgMarkAncestorsSql(["kid1", "kid2", "kid3"], 7, 4001)),
-						subtreeNow: (await store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 }))
-							.rows.length,
-						levelRows: level.rows.length,
-						levelNext: level.next !== null,
-						subtreeRows: subtree.rows.length,
-					};
-				} finally {
-					await client.close();
-				}
-			});
+						await time("level now, 50 of 500 children", () =>
+							store.listLevel("plan-space", "top7", { asOf: null, limit: 50 }),
+						);
+						await time("subtree as of a seq, 800 of the whole space", () =>
+							store.listSubtreeAt("plan-space", null, { asOf: 3, limit: 800 }),
+						);
+						await time("subtree now, 800 of the whole space", () =>
+							store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 }),
+						);
+						await time("levels as of a seq, 20 parents, 800 rows", () =>
+							store.listLevels("plan-space", twenty, { asOf: 3, limit: 800 }),
+						);
+						return {
+							timings,
+							level: await planOf(pgLevelAsOf("plan-space", ["top7"], 3, null, 51)),
+							levels: await planOf(pgLevelAsOf("plan-space", twenty, 3, null, 801)),
+							now: await planOf(pgLevelNow("plan-space", twenty, null, 801)),
+							marks: await planOf(pgMarkAncestorsSql(["kid1", "kid2", "kid3"], 7, 4001)),
+							subtreeNow: (
+								await store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 })
+							).rows.length,
+							levelRows: level.rows.length,
+							levelNext: level.next !== null,
+							subtreeRows: subtree.rows.length,
+						};
+					} finally {
+						await client.close();
+					}
+				},
+			);
 			if (!outcome || typeof outcome !== "object" || !("level" in outcome)) {
 				throw new Error(`PostgreSQL harness did not run: ${JSON.stringify(outcome)}`);
 			}
@@ -445,6 +448,19 @@ describe("PostgreSQL outline store", () => {
 		RUN_TIMEOUT_MS,
 	);
 });
+
+/** What the plan guard brings back from the server. */
+interface PlanOutcome {
+	timings: string[];
+	level: PlanNode[];
+	levels: PlanNode[];
+	now: PlanNode[];
+	marks: PlanNode[];
+	subtreeNow: number;
+	levelRows: number;
+	levelNext: boolean;
+	subtreeRows: number;
+}
 
 /** A node of `EXPLAIN (FORMAT JSON)`. */
 interface PlanNode {

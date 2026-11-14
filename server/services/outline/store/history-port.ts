@@ -137,6 +137,11 @@ export interface OutlineHistoryPort {
 	 * what is left of the limit and skipping the blocks known to have no children: its cost
 	 * follows the rows returned, not the size of the subtree or of the levels it starts.
 	 */
+	listSubtreeAt(
+		spaceId: string,
+		rootId: string | null,
+		options: { asOf: number | null; limit: number },
+	): Promise<{ rows: OutlineLevelRow[]; truncated: boolean }>;
 	/**
 	 * Where each block sat as of a seq (`null`: now): its parent key (the space id for a
 	 * top-level block) and order key. Blocks that were not in the tree then (not created yet,

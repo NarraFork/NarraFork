@@ -11,10 +11,11 @@
 import { expect } from "bun:test";
 import { OutlineWriteError } from "../errors";
 import { convertOutlineHistory } from "../history-convert";
-import type { OutlineTaskJson } from "../model";
+import { OUTLINE_CHANGE, type OutlineTaskJson } from "../model";
 import type { OutlineLevelCursor } from "../store/history-port";
 import {
 	OUTLINE_HISTORY_LIMITS,
+	OUTLINE_PLACEMENT_FLAGS,
 	type OutlineSpaceRow,
 	type OutlineVersionRow,
 } from "../store/port";
@@ -166,6 +167,13 @@ export const OUTLINE_HISTORY_CONTRACT: ContractCase[] = [
 			const { space, snapshots } = await randomizedHistory(ctx, 20261114);
 			const seqs = [...snapshots.keys()].sort((a, b) => a - b);
 			expect(seqs.length).toBeGreaterThan(5);
+			// The store's literal is the model's four placement changes.
+			expect(OUTLINE_PLACEMENT_FLAGS).toBe(
+				OUTLINE_CHANGE.CREATE |
+					OUTLINE_CHANGE.MOVE |
+					OUTLINE_CHANGE.DELETE |
+					OUTLINE_CHANGE.RESTORE,
+			);
 			expect((await ctx.store.getHistoryStates([space.id])).get(space.id)).toEqual({
 				floorSeq: 0,
 				edgesReady: true,
