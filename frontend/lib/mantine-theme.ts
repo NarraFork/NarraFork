@@ -13,6 +13,16 @@ import { createTheme } from "@mantine/core";
 export const mantineTheme = createTheme({
 	primaryColor: "indigo",
 	defaultRadius: "sm",
+	/*
+	 * Both families resolve through `styles/tokens.css`. They are `var()` references rather
+	 * than literals so the CJK ordering (English first, then PingFang / YaHei / Noto, which
+	 * matters for mixed Chinese/English copy at small sizes) lives in one place with the
+	 * rest of the palette. `fontSizes` / `lineHeights` / `spacing` are deliberately NOT set
+	 * here: overrides that merely restate Mantine's defaults still shift the scale, and that
+	 * is a separate, visually reviewable change.
+	 */
+	fontFamily: "var(--nf-font-ui)",
+	fontFamilyMonospace: "var(--nf-font-mono)",
 	colors: {
 		/*
 		 * Blue-toned neutral for "the system is waiting on itself" states — e.g. a
