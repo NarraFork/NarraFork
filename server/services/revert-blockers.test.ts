@@ -152,6 +152,68 @@ describe("collectRevertBlockers", () => {
 		expect(JSON.stringify(blockers)).not.toContain("sleep 30");
 	});
 
+	for (const status of ["initializing", "pending", "running"] as const)
+		test(`historical ${status} copies are not live tools, but an explicit new attempt is`, () => {
+			const timestamp = now();
+			const originId = generateId();
+			const copyId = generateId();
+			const toolUseId = generateId();
+			db.insert(narratorToolCalls)
+				.values([
+					{
+						id: originId,
+						narratorId: ids.other,
+						messageId: ids.message,
+						toolUseId,
+						toolName: "Edit",
+						status,
+						createdAt: timestamp,
+					},
+					{
+						id: copyId,
+						narratorId: ids.narrator,
+						messageId: ids.message,
+						toolUseId,
+						toolName: "Edit",
+						status,
+						executionOriginToolCallId: originId,
+						createdAt: timestamp,
+					},
+				])
+				.run();
+			expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+			expect(collectRevertBlockers(ids.other)).toEqual([
+				{
+					kind: "running_tool",
+					toolCallId: originId,
+					toolName: "Edit",
+					messageId: ids.message,
+				},
+			]);
+
+			const retryId = generateId();
+			db.insert(narratorToolCalls)
+				.values({
+					id: retryId,
+					narratorId: ids.narrator,
+					messageId: ids.message,
+					toolUseId,
+					toolName: "Edit",
+					status: "running",
+					executionAttempt: 2,
+					createdAt: timestamp,
+				})
+				.run();
+			expect(collectRevertBlockers(ids.narrator)).toEqual([
+				{
+					kind: "running_tool",
+					toolCallId: retryId,
+					toolName: "Edit",
+					messageId: ids.message,
+				},
+			]);
+		});
+
 	test("archived pending operations and quarantined leases never block new narrator work", async () => {
 		const timestamp = now();
 		const operationId = generateId();
