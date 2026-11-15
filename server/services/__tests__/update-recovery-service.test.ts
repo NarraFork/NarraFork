@@ -1441,7 +1441,8 @@ describe("planned update continuation scheduling", () => {
 		expect(updatedToolResults).toHaveLength(1);
 		expect(updatedToolResults[0]?.args[1] as Record<string, unknown>).toMatchObject({
 			output:
-				'<background_task_id>background-worker</background_task_id>\n\nBackground task started. Await({ type: "agent", id: "background-worker" })',
+				"<background_task_id>background-worker</background_task_id>\n\n[background\\-worker](nf-agent://open?id=child-background)\n\n" +
+				'Background task started. Await({ type: "agent", id: "background-worker" })',
 			status: "success",
 		});
 		expect(

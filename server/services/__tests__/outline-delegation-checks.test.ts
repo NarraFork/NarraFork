@@ -1600,7 +1600,10 @@ describe("the registration", () => {
 		const root = await rootSession(owner);
 		model.script = [{ text: "plain result" }];
 		const { result, childId } = await agent(root, owner, { prompt: "look around" });
-		expect(result.output).toMatch(/^<subagent_id>[^<]+<\/subagent_id>\n\nplain result$/);
+		expect(result.output).toMatch(
+			/^<subagent_id>[^<]+<\/subagent_id>\n\n\[[^\n]+\]\(nf-agent:\/\/open\?id=[A-Za-z0-9_-]+\)\n\nplain result$/,
+		);
+		expect(result.output).toContain(`(nf-agent://open?id=${childId})`);
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId as string) });
 		expect(
 			readRuntimeRegistrationColumn(row?.runtimeRegistrationJson)?.delegatedTask,

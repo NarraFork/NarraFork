@@ -976,7 +976,7 @@ async function renderResult(
 		]);
 	const turn = await db.query.narrators.findFirst({
 		where: eq(narrators.id, id),
-		columns: { turnStartedAt: true },
+		columns: { turnStartedAt: true, title: true },
 	});
 	return appendSubagentFileChanges(
 		{
@@ -992,7 +992,7 @@ async function renderResult(
 				completedAt: new Date().toISOString(),
 			},
 		},
-		agentResultTag(await resolveAgentLabel(deliverTo.narratorId, id)) + finalText,
+		agentResultTag(await resolveAgentLabel(deliverTo.narratorId, id), id, turn?.title) + finalText,
 	);
 }
 

@@ -28,8 +28,15 @@ import { prepareWithSegments } from "@chenglou/pretext";
 import type { RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { measureRichInlineStats, prepareRichInline } from "@chenglou/pretext/rich-inline";
 import { marked, type Token, type Tokens } from "marked";
+import {
+	agentReferenceMarker,
+	isAgentReference,
+	normalizeAgentReferenceLabel,
+	parseAgentReference,
+} from "../agent-reference";
 import { prepareMarkdownEmphasis, stripEmphasisSentinel } from "../markdown-emphasis-compat";
 import { fileLinkLineSuffix, localFileHref, parseLocalFilePath } from "../markdown-file-path";
+import { agentReferenceMetrics, type PreparedAgentReferences } from "./agent-reference-flow";
 import type { GlyphVerticalResolver, GlyphWidthResolver, KatexRuntime } from "./katex-geometry";
 import { measureKatex } from "./katex-geometry";
 import { inlineTokensToPlainText, slugifyHeading } from "./markdown-anchor";
@@ -122,6 +129,8 @@ interface InlinePiece {
 	href: string | null;
 	breakMode: "normal" | "never";
 	extraWidth: number;
+	/** Width before content-column shrinking; the complete label stays in text. */
+	agentReferenceWidth?: number;
 	/** Set when this piece is an inline formula rendered as a fixed-width atom. */
 	math?: InlineMathFragment;
 }
@@ -781,6 +790,20 @@ function buildPreparedInline(
 	return blocks;
 }
 
+/** Preserve raw item inputs only when a content-column-dependent atom needs them. */
+function agentReferencesForPieces(
+	items: RichInlineItem[],
+	pieces: readonly InlinePiece[],
+): PreparedAgentReferences | undefined {
+	const atoms: PreparedAgentReferences["atoms"] = [];
+	for (const [itemIndex, piece] of pieces.entries()) {
+		if (piece.agentReferenceWidth !== undefined) {
+			atoms.push({ itemIndex, baseWidth: piece.agentReferenceWidth });
+		}
+	}
+	return atoms.length > 0 ? { items, atoms } : undefined;
+}
+
 function buildOneInline(
 	pieces: InlinePiece[],
 	variant: InlineVariant,
@@ -805,11 +828,15 @@ function buildOneInline(
 		};
 	});
 	const hasMath = pieces.some((p) => p.math != null);
+	const agentReferences = agentReferencesForPieces(items, pieces);
 	// A formula taller than the text line box must grow the line, or its glyphs
 	// would overlap the neighbouring lines. `PreparedInlineBlock` carries a single
 	// lineHeight, so the whole block adopts the tallest formula's height — the same
 	// thing the browser's own line-height calculation does.
-	let lineHeight = lineHeightForVariant(variant);
+	let lineHeight = Math.max(
+		lineHeightForVariant(variant),
+		agentReferences ? agentReferenceMetrics().height : 0,
+	);
 	if (hasMath) {
 		for (const piece of pieces) {
 			if (piece.math && piece.math.height > lineHeight) lineHeight = Math.ceil(piece.math.height);
@@ -819,6 +846,7 @@ function buildOneInline(
 		...blockBase(ctx),
 		kind: "inline",
 		flow: prepareRichInline(items),
+		...(agentReferences ? { agentReferences } : {}),
 		lineHeight,
 		classNames: pieces.map((p) => p.className),
 		hrefs: pieces.map((p) => p.href),
@@ -908,6 +936,22 @@ function collectInlineLines(
 				case "link": {
 					const link = token as Tokens.Link;
 					const linkMarks = { ...marks, href: parseHref(link.href) };
+					const agentId = parseAgentReference(linkMarks.href);
+					if (agentId) {
+						// The whole authored title is one body-font atom, never a status item
+						// followed by separately wrapping bold/code/link-label fragments.
+						let label = agentReferenceLabel(link.tokens ?? []);
+						if (ctx.formulas) {
+							label = label.replace(MATH_SENTINEL_RE, (source, index) => {
+								const latex = ctx.formulas?.[Number(index)];
+								return latex != null ? `$${latex}$` : source;
+							});
+						}
+						push(
+							agentReferencePiece(normalizeAgentReferenceLabel(label) || agentId, linkMarks.href),
+						);
+						continue;
+					}
 					walk(link.tokens ?? [], linkMarks);
 					// Append once to the logical link BEFORE measuring. Decorating each
 					// painted fragment would repeat the suffix and invalidate line widths.
@@ -948,6 +992,39 @@ function collectInlineLines(
 	return lines.length === 0 ? [[]] : lines;
 }
 
+/** Keep explicit Markdown breaks as word boundaries while discarding label styling. */
+function agentReferenceLabel(tokens: readonly Token[]): string {
+	return inlineTokensToPlainText(
+		tokens.map((token) => {
+			if (token.type === "br") return { type: "text", text: " " };
+			const nested = "tokens" in token ? token.tokens : undefined;
+			if (Array.isArray(nested) && nested.length > 0 && token.type !== "codespan") {
+				return { type: token.type, text: agentReferenceLabel(nested) };
+			}
+			return token;
+		}),
+	);
+}
+
+function agentReferencePiece(label: string, href: string | null): InlinePiece {
+	const { font, chromeWidth, maxWidth, letterSpacing } = agentReferenceMetrics();
+	const text = label;
+	const naturalWidth = measureRichInlineStats(
+		prepareRichInline([{ text, font, break: "never", letterSpacing }]),
+		TABLE_NATURAL_WIDTH_BOUND,
+	).maxLineWidth;
+	const width = Math.min(maxWidth, naturalWidth + chromeWidth);
+	return {
+		text,
+		font,
+		className: "vlist-frag agent-reference-atom is-link",
+		href,
+		breakMode: "never",
+		extraWidth: width - naturalWidth,
+		agentReferenceWidth: width,
+	};
+}
+
 function textPiece(text: string, marks: MarkState, variant: InlineVariant): InlinePiece | null {
 	// Flank sentinels (see markdown-emphasis-compat) must never reach measure or paint.
 	const visible = stripEmphasisSentinel(text);
@@ -986,7 +1063,13 @@ function codePiece(text: string, marks: MarkState): InlinePiece | null {
 function canMerge(a: InlinePiece, b: InlinePiece): boolean {
 	// A math atom's width lives in its own `extraWidth`; concatenating its
 	// placeholder text into a neighbour would silently drop the formula.
-	if (a.math != null || b.math != null) return false;
+	if (
+		a.math != null ||
+		b.math != null ||
+		a.agentReferenceWidth !== undefined ||
+		b.agentReferenceWidth !== undefined
+	)
+		return false;
 	return (
 		a.font === b.font &&
 		a.className === b.className &&
@@ -1147,6 +1230,7 @@ function buildTableCell(
 		};
 	});
 	const flow = prepareRichInline(items);
+	const agentReferences = agentReferencesForPieces(items, resolved);
 	// Natural width (max-content): a bound large enough that no wrap can occur.
 	const natural = measureRichInlineStats(flow, TABLE_NATURAL_WIDTH_BOUND);
 	// A cell formula must survive into the render layer, exactly like a paragraph's
@@ -1162,6 +1246,7 @@ function buildTableCell(
 	}
 	return {
 		flow,
+		...(agentReferences ? { agentReferences, inlineHeight: agentReferenceMetrics().height } : {}),
 		classNames: resolved.map((p) => p.className),
 		hrefs: resolved.map((p) => p.href),
 		fonts: resolved.map((p) => p.font),
@@ -1187,6 +1272,15 @@ function buildTableCell(
 function measureCellMinWidth(pieces: readonly InlinePiece[]): number {
 	let widest = 0;
 	for (const piece of pieces) {
+		// References stay atomic but ellipsize with their column. Their min-content
+		// floor is just the fixed status/padding chrome, not the full title width.
+		if (piece.agentReferenceWidth !== undefined) {
+			widest = Math.max(
+				widest,
+				Math.min(piece.agentReferenceWidth, agentReferenceMetrics().chromeWidth),
+			);
+			continue;
+		}
 		// A math atom is unbreakable and already carries its full width.
 		if (piece.math != null) {
 			const width = piece.math.width;
@@ -1281,7 +1375,12 @@ function boldenPiece(piece: InlinePiece): InlinePiece {
 	// the same generation, so a stale constant here would fail every match and
 	// silently leave header cells measured at regular weight (i.e. too narrow).
 	const { font } = typographyMetrics();
-	if (piece.math != null || piece.font === font.inlineCode) return piece;
+	if (
+		piece.math != null ||
+		piece.agentReferenceWidth !== undefined ||
+		piece.font === font.inlineCode
+	)
+		return piece;
 	const bold = piece.font === font.bodyItalic ? font.bodyBoldItalic : font.bodyBold;
 	if (piece.font === bold) return piece;
 	return { ...piece, font: bold };
@@ -1554,6 +1653,10 @@ function parseHref(href: string | null | undefined): string | null {
 	// Decoding only matters when there is a reference to decode; skipping the
 	// regex passes keeps the common link on one string scan.
 	const probe = trimmed.includes("&") ? decodeCharacterReferences(trimmed) : trimmed;
+	if (isAgentReference(probe)) {
+		const id = parseAgentReference(probe);
+		return id ? agentReferenceMarker(id) : null;
+	}
 	// These are file hints, never browser-navigable schemes. Validate the full
 	// shape and carry the location/device in an inert marker before filtering.
 	if (/^(?:file:|nf-file:|[a-z]:[\\/])/i.test(probe)) {
