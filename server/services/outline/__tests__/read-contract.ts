@@ -1339,6 +1339,38 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "revert: a block goes back under its old parent after the ancestor that moved into it",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			// E > F > L, then one commit takes L out and puts E under it. Going back, E must leave
+			// L before L can go under F again, whichever id sorts first.
+			for (const [low, top] of [
+				["0", "z"],
+				["z", "0"],
+			]) {
+				const unique = crypto.randomUUID().replace(/-/g, "");
+				const l = `${low}${unique}`;
+				const e = `${top}${unique}`;
+				const made = await write(ctx, space, [
+					{ op: "insert", id: e, parent: null, content: "E" },
+					{ op: "insert", tempId: "f", parent: { id: e }, content: "F" },
+					{ op: "insert", id: l, parent: { tempId: "f" }, content: "L" },
+				]);
+				const f = a(made);
+				const swap = await write(ctx, space, [
+					{ op: "move", block: { id: l }, parent: null },
+					{ op: "move", block: { id: e }, parent: { id: l } },
+				]);
+				const back = await revert(ctx, swap.commit?.id as string);
+				expect(back.skipped).toEqual([]);
+				expect(await ctx.store.getBlock(e)).toMatchObject({ parentId: null, pageId: e });
+				expect(await ctx.store.getBlock(l)).toMatchObject({ parentId: f, pageId: e });
+			}
+			checkSpaceInvariants(await ctx.dump(space.id));
+			checkChangeFlags(await ctx.dump(space.id));
+		},
+	},
+	{
 		name: "revert: skips blocks changed later, gone parents, later children and cycles",
 		async run(ctx) {
 			const space = await personalSpace(ctx);

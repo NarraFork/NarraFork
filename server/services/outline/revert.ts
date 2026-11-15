@@ -391,14 +391,21 @@ class RevertAnalysis {
 		for (const t of topmost) {
 			if (!holding.has(t.id)) push({ op: "delete", block: { id: t.id } }, t.id);
 		}
-		// Parents before children, in the tree as it will be.
+		// Ancestors before descendants, in the tree as it will be: every ancestor that is put
+		// back too, not only the parent. One further up may sit inside the block now (the commit
+		// moved it there), and the block can only go back under its old parent once that has left.
 		const pending = new Set(placed.map((t) => t.id));
 		const ordered: Target[] = [];
 		const visit = (t: Target, depth: number) => {
 			if (!pending.has(t.id) || depth > OUTLINE_LIMITS.maxDepth) return;
-			const parentId = t.prev?.parentId ?? null;
-			const parent = parentId === null ? null : this.active(parentId);
-			if (parent && parent.action !== "delete") visit(parent, depth + 1);
+			for (const ancestorId of this.finalAncestors(t.id)) {
+				const ancestor = this.active(ancestorId);
+				if (ancestor && ancestor.action !== "delete") {
+					// The nearest one takes those above it first.
+					visit(ancestor, depth + 1);
+					break;
+				}
+			}
 			if (!pending.delete(t.id)) return;
 			ordered.push(t);
 		};
