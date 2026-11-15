@@ -192,3 +192,12 @@ describe("outgoing requests", () => {
 		expect(headers.get(OPENCODE_SESSION_HEADER)).toBe("ses_operator");
 	});
 });
+
+test("an empty extra header does not suppress the generated session default", () => {
+	const headers = buildOpencodeSessionHeader({
+		baseUrl: "https://opencode.ai/zen/go/v1",
+		conversationId: CONVERSATION,
+		extraHeaders: { "X-OpenCode-Session": "" },
+	});
+	expect(headers[OPENCODE_SESSION_HEADER]).toBe(deriveOpencodeSessionId(CONVERSATION));
+});

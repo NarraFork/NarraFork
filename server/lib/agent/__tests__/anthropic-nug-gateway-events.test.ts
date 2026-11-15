@@ -94,6 +94,16 @@ describe("anthropic provider consuming NUG gateway streams", () => {
 		expect(contextPercent).toBe(34.5);
 	});
 
+	test("multiline tail gateway event survives EOF without a separator", async () => {
+		const events = await collect(
+			`${MIXED_SSE}event: meteringEvent\rdata:{\rdata:"usage":19,\rdata:"unit":"credit"\rdata:}`,
+		);
+		expect(events.filter((event) => event.metering != null).at(-1)?.metering).toMatchObject({
+			usage: 19,
+			unit: "credit",
+		});
+	});
+
 	test("drains gateway measurements after message_stop", async () => {
 		const events = await collect(
 			`${MIXED_SSE}event: contextUsageEvent\ndata: {"contextUsagePercentage":42}\n\n` +

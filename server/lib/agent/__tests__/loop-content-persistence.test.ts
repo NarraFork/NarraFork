@@ -1,8 +1,9 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
-import type { DbMessage, ProviderAdapter } from "../provider";
+import { createProviderTurnContext } from "../codex-turn-state";
+import type { ChatParams, DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
-import type { AgentConfig, AgentEvent } from "../types";
+import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 
 function gate() {
 	let resolve!: () => void;
@@ -14,10 +15,12 @@ function gate() {
 
 let script: ProviderAdapter["chat"];
 let attempts = 0;
+let scriptEveryAttempt = false;
 const started: string[] = [];
 /** Rows each projected request was built from (the fake builder's input). */
 const builtRows: DbMessage[][] = [];
-const requests: Array<{ history: unknown[]; toolResults?: unknown[] }> = [];
+const requests: Array<{ history: unknown[]; content: string; toolResults?: unknown[] }> = [];
+const turnContexts: ChatParams["turnContext"][] = [];
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
 	buildHistory: async (rows) => {
@@ -33,10 +36,15 @@ const provider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		requests.push(
-			structuredClone({ history: params.history ?? [], toolResults: params.toolResults }),
+			structuredClone({
+				history: params.history ?? [],
+				content: params.content,
+				toolResults: params.toolResults,
+			}),
 		);
+		turnContexts.push(params.turnContext);
 		params.onRequestStart?.();
-		if (++attempts > 1) {
+		if (++attempts > 1 && !scriptEveryAttempt) {
 			yield { text: "收尾" };
 			return;
 		}
@@ -71,9 +79,11 @@ toolRegistry.register({
 
 beforeEach(() => {
 	attempts = 0;
+	scriptEveryAttempt = false;
 	started.length = 0;
 	builtRows.length = 0;
 	requests.length = 0;
+	turnContexts.length = 0;
 });
 afterAll(() => {
 	mock.module("../provider", () => realProvider);
@@ -84,6 +94,8 @@ afterAll(() => {
 async function run(
 	onEvent?: (event: AgentEvent) => Promise<void> | void,
 	permissionHandler: AgentConfig["permissionHandler"] = async () => ({ behavior: "allow" }),
+	overrides: Partial<AgentConfig> = {},
+	initialRows: DbMessage[] = [],
 ) {
 	const config: AgentConfig = {
 		narratorId: "n-content-persistence",
@@ -94,8 +106,9 @@ async function run(
 		signal: new AbortController().signal,
 		permissionHandler,
 	};
+	Object.defineProperties(config, Object.getOwnPropertyDescriptors(overrides));
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(config, "test content ordering", { rows: [] })) {
+	for await (const event of agentLoop(config, "test content ordering", { rows: initialRows })) {
 		events.push(event);
 		await onEvent?.(event);
 	}
@@ -284,6 +297,334 @@ describe("content publication precedes tools", () => {
 		expect(reasoningWrites.at(-1)?.providerMetadata?.openai?.reasoningEncryptedContent).toBe(
 			"encrypted",
 		);
+	});
+});
+
+describe("Responses phase and explicit end_turn", () => {
+	test("false→false→true replays item/part metadata and consumes input exactly once", async () => {
+		scriptEveryAttempt = true;
+		script = async function* () {
+			if (attempts === 1) {
+				yield {
+					text: "commentary",
+					textBlockId: "comment/0",
+					textOutputIndex: 0,
+					textMetadata: { openai: { itemId: "comment", contentIndex: 0 } },
+				};
+				yield {
+					contentBoundary: {
+						kind: "text",
+						phase: "complete",
+						blockId: "comment/0",
+						outputIndex: 0,
+					},
+				};
+				for (const index of [0, 1]) {
+					yield {
+						text: `part ${index}`,
+						textBlockId: `partial/${index}`,
+						textOutputIndex: 1,
+						textMetadata: {
+							openai: { itemId: "partial", contentIndex: index, phase: "partial_answer" },
+						},
+					};
+				}
+				yield {
+					textBlockId: "comment/0",
+					textOutputIndex: 0,
+					textMetadata: { openai: { phase: "commentary" } },
+					endTurn: false,
+				};
+			} else {
+				yield {
+					text: `answer ${attempts}`,
+					textBlockId: `final-${attempts}/0`,
+					textOutputIndex: 0,
+					textMetadata: {
+						openai: { itemId: `final-${attempts}`, contentIndex: 0, phase: "final_answer" },
+					},
+					// final_answer alone must not end the logical turn.
+					endTurn: attempts === 3,
+				};
+			}
+		};
+		const initialRows: DbMessage[] = [
+			{
+				id: "previous-step",
+				role: "assistant",
+				parentToolUseId: null,
+				messageUuid: null,
+				contentText: null,
+				contentJson: [
+					{ type: "tool_use", id: "old-call", name: "ContentProbe", input: { value: "old" } },
+				],
+				toolCalls: [
+					{
+						toolUseId: "old-call",
+						toolName: "ContentProbe",
+						inputJson: { value: "old" },
+						outputJson: { output: "consumed result" },
+						status: "completed",
+					},
+				],
+			},
+		];
+		const events = await run(undefined, undefined, { maxTurns: 4 }, initialRows);
+		expect(attempts).toBe(3);
+		expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "assistant_message")).toHaveLength(3);
+		expect(requests.map((request) => request.content)).toEqual(["", "", ""]);
+		expect(requests.map((request) => request.toolResults)).toEqual([[], [], []]);
+		expect(requests[2].history).toMatchObject([
+			{ role: "assistant", content: initialRows[0].contentJson, calls: initialRows[0].toolCalls },
+			{ role: "user", content: [{ type: "text", text: "test content ordering" }] },
+			{
+				role: "assistant",
+				content: [
+					{
+						text: "commentary",
+						providerMetadata: {
+							openai: { itemId: "comment", contentIndex: 0, phase: "commentary" },
+						},
+					},
+					{
+						text: "part 0",
+						providerMetadata: {
+							openai: { itemId: "partial", contentIndex: 0, phase: "partial_answer" },
+						},
+					},
+					{
+						text: "part 1",
+						providerMetadata: {
+							openai: { itemId: "partial", contentIndex: 1, phase: "partial_answer" },
+						},
+					},
+				],
+			},
+			{
+				role: "assistant",
+				content: [{ text: "answer 2", providerMetadata: { openai: { phase: "final_answer" } } }],
+			},
+		]);
+		const commentWrites = events.flatMap((event) =>
+			event.type === "block_complete" &&
+			event.block.type === "text" &&
+			event.block.text === "commentary"
+				? [event.block]
+				: [],
+		);
+		expect(commentWrites).toHaveLength(2);
+		expect(commentWrites[1].id).toBe(commentWrites[0].id);
+		expect(commentWrites[1]).toMatchObject({
+			completed: true,
+			providerMetadata: { openai: { phase: "commentary" } },
+		});
+		expect(turnContexts[0]).toBeDefined();
+		expect(turnContexts[1]).toBe(turnContexts[0]);
+		expect(turnContexts[2]).toBe(turnContexts[0]);
+	});
+
+	test.each([
+		undefined,
+		"commentary" as const,
+	])("missing end_turn keeps legacy completion (phase=%s)", async (phase) => {
+		script = async function* () {
+			yield { text: "legacy", ...(phase ? { textMetadata: { openai: { phase } } } : {}) };
+		};
+		const events = await run();
+		expect(attempts).toBe(1);
+		expect(events.at(-1)?.type).toBe("done");
+	});
+
+	test("end_turn=true cannot bypass tools awaiting execution", async () => {
+		script = async function* () {
+			yield {
+				text: "running",
+				endTurn: true,
+				toolUses: [{ toolUseId: "true-call", name: "ContentProbe", input: { value: "executed" } }],
+			};
+		};
+		await run();
+		expect(started).toEqual(["executed"]);
+		expect(attempts).toBe(2);
+	});
+
+	test.each([
+		false,
+		true,
+	])("explicit continuation remains bounded (reflection=%s)", async (reflection) => {
+		scriptEveryAttempt = true;
+		script = async function* () {
+			yield { text: "more", endTurn: false };
+		};
+		const events = await run(undefined, undefined, {
+			maxTurns: 2,
+			...(reflection ? { reflectionLoop: { allowedTools: [], context: { kind: "test" } } } : {}),
+		});
+		expect(attempts).toBe(2);
+		expect(events.at(-1)).toEqual({ type: "max_turns_exceeded", maxTurns: 2 });
+		expect(requests[1].content).toBe("");
+	});
+
+	test("a graceful stop wins over explicit continuation", async () => {
+		script = async function* () {
+			yield { text: "more", endTurn: false };
+		};
+		let stop = false;
+		const events = await run(
+			(event) => {
+				if (event.type === "assistant_message") stop = true;
+			},
+			undefined,
+			{ shouldStop: () => stop },
+		);
+		expect(attempts).toBe(1);
+		expect(events.at(-1)?.type).toBe("turn_complete");
+	});
+
+	test.each([
+		"empty",
+		"reasoning",
+	] as const)("completed intermediate %s output follows up without a dead-turn retry", async (kind) => {
+		script = async function* () {
+			if (kind === "reasoning") yield { reasoning: "intermediate reasoning" };
+			yield { endTurn: false };
+		};
+		const events = await run(undefined, undefined, { maxTurns: 2 });
+		expect(attempts).toBe(2);
+		expect(events.some((event) => event.type === "retrying" || event.type === "stream_reset")).toBe(
+			false,
+		);
+		expect(events.filter((event) => event.type === "assistant_message")).toHaveLength(
+			kind === "empty" ? 1 : 2,
+		);
+		const replayed = builtRows[1].filter((row) => row.role === "assistant");
+		expect(replayed).toHaveLength(kind === "empty" ? 0 : 1);
+		if (kind === "reasoning")
+			expect(replayed[0].contentJson).toMatchObject([
+				{ type: "reasoning", text: "intermediate reasoning" },
+			]);
+		expect(requests[1].content).toBe("");
+		expect(events.at(-1)?.type).toBe("done");
+	});
+
+	test("after-tools input and results are committed once before a no-tool continuation", async () => {
+		scriptEveryAttempt = true;
+		script = async function* () {
+			if (attempts === 1)
+				yield {
+					toolUses: [{ toolUseId: "tool-once", name: "ContentProbe", input: { value: "once" } }],
+				};
+			else yield { text: `response ${attempts}`, endTurn: attempts === 3 };
+		};
+		let consumed = 0;
+		let deliveries = 0;
+		await run(undefined, undefined, {
+			maxTurns: 4,
+			getAfterToolsInjections: () => {
+				deliveries++;
+				return {
+					text: "host update",
+					parts: [{ text: "host update", messageId: "injected-once" }],
+					onConsumed: () => {
+						consumed++;
+					},
+				};
+			},
+		});
+		expect(started).toEqual(["once"]);
+		expect(deliveries).toBe(1);
+		expect(consumed).toBe(1);
+		expect(requests.map((request) => request.content)).toEqual(["", "", ""]);
+		expect(requests.map((request) => request.toolResults)).toEqual([[], [], []]);
+		expect(builtRows[2]).toMatchObject([
+			{ role: "user", contentJson: [{ type: "text", text: "test content ordering" }] },
+			{
+				role: "assistant",
+				contentJson: [{ type: "tool_use", id: "tool-once" }],
+				toolCalls: [{ toolUseId: "tool-once", status: "success", outputJson: "ok" }],
+			},
+			{ role: "user", contentJson: [{ type: "text", text: "host update" }] },
+			{ role: "assistant", contentJson: [{ type: "text", text: "response 2" }] },
+		]);
+	});
+
+	test.each([
+		"abort",
+		"error",
+	] as const)("%s wins over a previously reported end_turn=false", async (kind) => {
+		const abort = new AbortController();
+		script = async function* () {
+			yield { text: "intermediate", endTurn: false };
+			if (kind === "abort") abort.abort();
+			else yield { invalidState: { reason: "invalid_request_error", message: "invalid request" } };
+		};
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(
+			{
+				narratorId: "n-phase-error",
+				conversationId: "phase-error",
+				provider: "test",
+				model: "test:model",
+				cwd: process.cwd(),
+				signal: abort.signal,
+				maxTurns: 2,
+				permissionHandler: async () => ({ behavior: "allow" }),
+			},
+			"do not continue",
+			{ rows: [] },
+		))
+			events.push(event);
+		expect(attempts).toBe(1);
+		expect(events.some((event) => event.type === "error" || event.type === "invalid_state")).toBe(
+			true,
+		);
+		expect(events.some((event) => event.type === "done")).toBe(false);
+	});
+
+	test("a retry clears the failed attempt's end_turn while retaining its logical context", async () => {
+		scriptEveryAttempt = true;
+		script = async function* () {
+			if (attempts === 1) {
+				yield { endTurn: false };
+				throw new ApiError(503, "retry me");
+			}
+			yield { text: "legacy final" };
+		};
+		const events = await run(undefined, undefined, {
+			maxTurns: 3,
+			maxTransientRetries: 1,
+			retryBackoffCeilMs: 1,
+		});
+		expect(attempts).toBe(2);
+		expect(requests.map((request) => request.content)).toEqual(["", ""]);
+		expect(requests[1].history).toEqual(requests[0].history);
+		expect(turnContexts[1]).toBe(turnContexts[0]);
+		expect(events.some((event) => event.type === "retrying")).toBe(true);
+		expect(events.at(-1)?.type).toBe("done");
+	});
+
+	test("turn contexts are live, and independent direct loops never share the fallback", async () => {
+		script = async function* () {
+			yield { text: "more", endTurn: false };
+		};
+		const first = createProviderTurnContext();
+		const second = createProviderTurnContext();
+		let current = first;
+		await run(undefined, undefined, {
+			get turnContext() {
+				return current;
+			},
+			onBeforeTurn: async () => {
+				current = second;
+				return null;
+			},
+		});
+		expect(turnContexts).toEqual([first, second]);
+		await run();
+		await run();
+		expect(turnContexts[2]).not.toBe(turnContexts[3]);
+		expect(turnContexts[2]).not.toBe(first);
 	});
 });
 

@@ -180,6 +180,8 @@ export interface OpenAIProviderConfig {
 	 * extraHeaders, so dynamic values win. Not persisted in settings.
 	 */
 	dynamicHeaders?: () => Record<string, string>;
+	/** Internal: NUG sends trailing metering after native completion; not persisted in settings. */
+	drainUntilEof?: boolean;
 	/** Which User-Agent to present on outbound requests. Absent = narrafork UA default. */
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */

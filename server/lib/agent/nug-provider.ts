@@ -235,6 +235,8 @@ export class NugProvider implements ProviderAdapter {
 				const delegate = new OpenAIProvider({
 					...delegateBase,
 					baseUrl: `${this.baseUrl}/v1`,
+					// NUG appends metering/gateway events after native completion.
+					drainUntilEof: true,
 					apiMode:
 						meta.channelType === "codex"
 							? "codex"

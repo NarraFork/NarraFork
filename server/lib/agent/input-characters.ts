@@ -33,7 +33,7 @@ export interface InputCharacterOptions extends InputCharacterBudget {
 	includeComposition?: boolean;
 	/** Completions only: first messages[] entry is the known injected runtime prefix. */
 	firstMessageIsRuntimeSystem?: boolean;
-	/** Responses may concatenate historical system turns into instructions; only this prefix is fixed. */
+	/** Responses instructions (root or migrated input_text) may include historical system turns. */
 	instructionsFixedChars?: number;
 }
 
@@ -41,6 +41,14 @@ export interface InputCharacterOptions extends InputCharacterBudget {
 // replacement while remaining absent from serialized wire/history data and user JSON.
 const runtimeSystemMessages = new WeakSet<object>();
 const runtimeInstructionRoots = new WeakSet<object>();
+const runtimeInstructionInputs = new WeakMap<object, { type: "input_text"; text: string }>();
+/** Preserve instruction provenance when Codex moves root instructions into input. */
+export function markInstructionsInput(
+	body: object,
+	textPart: { type: "input_text"; text: string },
+): void {
+	runtimeInstructionInputs.set(body, textPart);
+}
 /** The builder generated root instructions itself rather than lifting history text. */
 export function markRuntimeInstructions<T extends object>(body: T): T {
 	runtimeInstructionRoots.add(body);
@@ -183,6 +191,14 @@ async function measureInputCharacters(
 		}
 		ancestors.delete(value);
 	};
+	const inputInstructions = runtimeInstructionInputs.get(object(body));
+	const countInstructions = (instructions: string) => {
+		const fixed = budget.instructionsFixedChars ?? instructions.length;
+		if (!Number.isSafeInteger(fixed) || fixed < 0 || fixed > instructions.length)
+			fail("unsupported_input");
+		add(fixed, "system");
+		add(instructions.length - fixed, "other");
+	};
 	const content = async (value: unknown, category: ContextCategory, depth = 0): Promise<void> => {
 		await tick();
 		if (depth > 128) fail("depth_budget");
@@ -197,6 +213,10 @@ async function measureInputCharacters(
 		if (value === undefined || value === null) return;
 		if (typeof value !== "object") fail("unsupported_input");
 		const part = object(value);
+		if (value === inputInstructions) {
+			countInstructions(inputInstructions.text);
+			return;
+		}
 		if (category !== "system") {
 			if (part.role === "user") category = "user";
 			else if (part.role === "assistant" || part.role === "model") category = "assistant";
@@ -363,13 +383,7 @@ async function measureInputCharacters(
 		// Interactions chains reference upstream-only history, so a delta is not a full denominator.
 		if (request.previous_interaction_id != null) fail("upstream_only_history");
 		text(request.system_instruction, "system");
-		if (typeof request.instructions === "string") {
-			const fixed = budget.instructionsFixedChars ?? request.instructions.length;
-			if (!Number.isSafeInteger(fixed) || fixed < 0 || fixed > request.instructions.length)
-				fail("unsupported_input");
-			add(fixed, "system");
-			add(request.instructions.length - fixed, "other");
-		}
+		if (typeof request.instructions === "string") countInstructions(request.instructions);
 		await content(request.system, "system");
 		await content(request.systemInstruction, "system");
 		if (Array.isArray(request.messages)) {
@@ -478,18 +492,22 @@ export async function reportInputCharacters(
 	) {
 		options.firstMessageIsRuntimeSystem = synthetic && request.messages[0] === first;
 	}
+	const instructions =
+		typeof request.instructions === "string"
+			? request.instructions
+			: runtimeInstructionInputs.get(request)?.text;
 	if (
 		params.history &&
-		typeof request.instructions === "string" &&
+		typeof instructions === "string" &&
 		options.instructionsFixedChars === undefined
 	) {
 		const runtimeContent = object(first).content;
 		options.instructionsFixedChars = runtimeInstructionRoots.has(request)
-			? request.instructions.length
+			? instructions.length
 			: synthetic && typeof runtimeContent === "string"
 				? runtimeContent.length > (options.maxChars ?? 32 * 1024 * 1024) ||
-					request.instructions === runtimeContent ||
-					(!params.signal.aborted && request.instructions.startsWith(runtimeContent))
+					instructions === runtimeContent ||
+					(!params.signal.aborted && instructions.startsWith(runtimeContent))
 					? runtimeContent.length
 					: -1
 				: 0;

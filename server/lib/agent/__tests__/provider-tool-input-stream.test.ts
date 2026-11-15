@@ -271,6 +271,111 @@ describe("provider incremental tool arguments", () => {
 		expect(stream.finish()).toEqual(expected);
 	});
 
+	test.each([
+		"block",
+		"message",
+	])("Anthropic initial tool input survives zero-delta %s stop exactly once", async (termination) => {
+		const input = { file_path: "x", content: "初始内容", options: { recursive: true } };
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sse([
+					{ type: "message_start", message: { id: "msg-initial" } },
+					{
+						type: "content_block_start",
+						index: 2,
+						content_block: { type: "tool_use", id: "initial", name: "Write", input },
+					},
+					...(termination === "block" ? [{ type: "content_block_stop", index: 2 }] : []),
+					{ type: "message_delta", delta: { stop_reason: "tool_use" } },
+					{ type: "message_stop" },
+				]).body as ReadableStream<Uint8Array>,
+			),
+		);
+		const chunks = events.flatMap((event) => (event.toolUseChunk ? [event.toolUseChunk] : []));
+		expect(chunks[0]).toMatchObject({ toolUseId: "initial", stop: false });
+		expect(chunks[0].input).toBeUndefined();
+		expect(chunks[0].finalInput).toBeUndefined();
+		expect(chunks.filter((chunk) => chunk.stop)).toEqual([
+			{
+				toolUseId: "initial",
+				name: "Write",
+				stop: true,
+				outputIndex: 2,
+				finalInput: JSON.stringify(input),
+			},
+		]);
+	});
+
+	test.each([
+		"eof",
+		"usage-only",
+		"max_tokens",
+		"refusal",
+	])("Anthropic initial snapshot cannot turn %s truncation into a completed call", async (termination) => {
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sse([
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: {
+							type: "tool_use",
+							id: "truncated-initial",
+							name: "Write",
+							input: { file_path: "x", content: "not yet authorized" },
+						},
+					},
+					...(termination === "eof"
+						? []
+						: [
+								{
+									type: "message_delta",
+									delta: termination === "usage-only" ? {} : { stop_reason: termination },
+									usage: { output_tokens: 2 },
+								},
+							]),
+				]).body as ReadableStream<Uint8Array>,
+			),
+		);
+		expect(events.some((event) => event.toolUseChunk?.stop)).toBe(false);
+		expect(events.some((event) => event.toolUseChunk?.finalInput !== undefined)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("incomplete_tool_input");
+	});
+
+	test.each([
+		'{"content":"streamed"}',
+		'{"content":"partial',
+		'{"content":}',
+		"",
+	])("Anthropic input delta wins over the initial snapshot, including malformed input: %s", async (raw) => {
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sse([
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: {
+							type: "tool_use",
+							id: "delta-wins",
+							name: "Write",
+							input: { content: "must not mask the delta" },
+						},
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "input_json_delta", partial_json: raw },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{ type: "message_delta", delta: { stop_reason: "tool_use" } },
+				]).body as ReadableStream<Uint8Array>,
+			),
+		);
+		expect(events.filter((event) => event.toolUseChunk?.stop)).toHaveLength(1);
+		expect(events.some((event) => event.toolUseChunk?.finalInput !== undefined)).toBe(false);
+		expect(events.map((event) => event.toolUseChunk?.input ?? "").join("")).toBe(raw);
+	});
+
 	test("Chat eager completion, malformed native stop and EOF full-input fallback", async () => {
 		const raw = '{"file_path":"x","content":"hi"}';
 		const eager = await chat([

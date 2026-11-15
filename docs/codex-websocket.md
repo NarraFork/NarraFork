@@ -40,14 +40,15 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
     真实 HTTP 头的是 remote-control 注册接口，不是 `/responses`。
   - 可选 `ChatGPT-Account-Id`（仅官方域名且提供了 accountId 时）
   - 可选 `x-codex-turn-metadata`（仅调用方显式传入时）
-  - 最后合并调用方的 `extraHeaders`，因此它可以覆盖上面任意一项
+  - 调用方非空 `extraHeaders` 按名称大小写无关覆盖默认值，UA 选项不会被协议默认头重新盖回；同名头不拼接，空值保留默认值。传输专用字段及不支持的 lite opt-in 仍由协议约束
 - **握手头不含** `x-codex-turn-state`：该 token 要等一个 turn 的首个响应才拿到，而那时本连接的
   握手早已发出、且连接会被 turn 内后续请求复用，握手头结构上不可能承载它。它改走每个
   `response.create` 的 `client_metadata`（见 `applyTurnStateToRequest`），与 codex-rs 一致——
   上游 `build_websocket_headers` 显式传 `/*turn_state*/ None`，并在 WS 的 `client_metadata`
   里注入该 token；只有 HTTP 路径才把它作为请求头发送
-- **不发送** `x-openai-internal-codex-responses-lite`：该头不是身份标记，而是一份请求体契约的一半。真实客户端由模型目录里的 `ModelInfo.use_responses_lite` 驱动，置位时同时做四件事——省略顶层 `instructions` 与 `tools`、把 `additional_tools` 与 developer 指令消息插到 `input` 最前、`parallel_tool_calls: false`、再加这个头。上游会校验这对配对关系，只要 `tools` 里出现 hosted 工具（如 `web_search` / `image_generation`）就返回 400：`X-OpenAI-Internal-Codex-Responses-Lite only supports function tools, custom tools, and client-executed tool search.`。NarraFork 发送的是经典非 lite 请求体，因此不声明 lite；`stripResponsesLiteHeader` 会把用户 `extraHeaders` 里塞进来的该头也去掉。
-- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`，包含稳定的 `client_metadata`、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: false`、`reasoning.summary: "auto"`（非 lite 形态省略 `reasoning.context`，与 codex-rs 0.159.2 一致）与 `text.verbosity: "low"`，`client_metadata` 含会话稳定的 `x-codex-window-id`，以及拿到 turn state 之后的 `x-codex-turn-state`
+- **不发送** `x-openai-internal-codex-responses-lite`：它是请求体契约，不是身份标记。最新 Codex 0.169.0 的非 lite 分支仍保留顶层 `tools`；lite 分支则移入 `additional_tools` input 项并禁用并行工具。两种分支的基础指令都已放在 `input` 最前的 developer 消息中，不再使用顶层 `instructions`。NarraFork 只实现非 lite 分支，不声明 lite；最终出口会移除用户额外头中的该 opt-in。这不代表所有模型都支持非 lite。
+- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`，基础指令为稳定 ID 的 developer `input_text` 前缀；保留顶层工具、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: true`、`reasoning.summary: "auto"` 与 `text.verbosity: "low"`，非 lite 省略 `reasoning.context`。`client_metadata` 保留安装/会话/window 身份，实际逻辑轮次存在时附加 `turn_id`，拿到本轮 token 后附加 `x-codex-turn-state`。
+- 源码基线：Codex **0.169.0**（2026-11-13），提交 `d32063f96c2dff1dc96af839b3952abb6acfeda4`；UA 前缀及后缀版本一致，TUI originator 仍为 `codex-tui`。
 - 增量续写复用判定（`requestWithoutInput`）**排除 `client_metadata`**：该字段带有随请求变化的运行时值
   （尤其是 `x-codex-turn-state`），若参与比较，首个响应之后的每个请求都会被判定为「不同请求」，
   从而静默退化成全量重发并丢失 prompt cache。codex-rs 的
@@ -63,10 +64,11 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 
 ## 已实现能力
 
-- 连接复用（按 session / credential / model 缓存）
+- 连接按 session / credential / model 缓存；复用前比较 URL、代理及最终握手头的规范化摘要。UA、凭据或额外头变化会安全重连，不把凭据原文保存在身份摘要/缓存键中
 - `previous_response_id` 增量续写
 - `response.output_item.done` 基线跟踪
-- `x-codex-turn-state` 回放（握手响应头 + `response.metadata` 事件两个来源）
+- `x-codex-turn-state` 来自握手/HTTP 响应头或 `response.metadata`，首个非空值锁定。按显式逻辑用户轮次和认证归属隔离，工具续写、同轮重试及 HTTP/WS 切换共享；独立新输入重置，UA 更新不清同轮 token
+- Responses 每个 assistant item 的 `phase`、item ID 和 content part 信息保存在现有内容 JSON 并回放；`end_turn:false` 触发有界续写，不把中间答案当最终完成。字段缺失保持旧行为
 - 426/404/405/501 等不支持场景自动禁用 WS 并回退 HTTP
 - 配额耗尽时继续沿用 Codex credential failover
 - 连接寿命上限主动回收 + `websocket_connection_limit_reached` / `previous_response_not_found` 自动恢复

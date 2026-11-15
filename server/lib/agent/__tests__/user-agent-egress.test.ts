@@ -360,3 +360,100 @@ describe("no egress ever emits two User-Agent keys", () => {
 		expect(userAgentKeys(headers)).toHaveLength(1);
 	});
 });
+
+describe("provider defaults are overridden at the real HTTP egress", () => {
+	for (const protocol of ["anthropic", "responses", "completions"] as const) {
+		test(`${protocol} sends one selected UA and one value for each overridden header`, async () => {
+			const captured: Headers[] = [];
+			const frames =
+				protocol === "anthropic"
+					? [
+							{
+								type: "message_start",
+								message: { id: "msg_probe", usage: { input_tokens: 1, output_tokens: 0 } },
+							},
+							{
+								type: "content_block_start",
+								index: 0,
+								content_block: { type: "text", text: "ok" },
+							},
+							{ type: "content_block_stop", index: 0 },
+							{ type: "message_stop" },
+						]
+					: protocol === "responses"
+						? [
+								{ type: "response.output_text.delta", delta: "ok", output_index: 0 },
+								{
+									type: "response.completed",
+									response: { id: "resp_probe", status: "completed", output: [] },
+								},
+							]
+						: [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					captured.push(request.headers);
+					return new Response(
+						frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(""),
+						{ headers: { "content-type": "text/event-stream" } },
+					);
+				},
+			});
+			try {
+				const config = {
+					id: `wire-${protocol}`,
+					prefix: "wire",
+					name: "Wire probe",
+					apiKey: "default-key",
+					baseUrl: `${server.url.origin}/v1`,
+					defaultModel: protocol === "anthropic" ? "claude-sonnet-5" : "gpt-5.5",
+					userAgentMode: "custom" as const,
+					customUserAgent: "configured/1",
+					proxy: "direct",
+					apiMode: protocol === "responses" ? "codex" : "completions",
+					codexWebSocket: false,
+					codexWebSearch: false,
+					codexImageGeneration: false,
+					officialApi: true,
+				};
+				for (const extraHeaders of [
+					undefined,
+					{
+						"uSeR-aGeNt": "operator/2",
+						authorization: "Bearer operator",
+						Originator: "operator",
+						"cOnTeNt-TyPe": "application/custom+json",
+						"Anthropic-Version": "operator-version",
+					},
+				]) {
+					const provider =
+						protocol === "anthropic"
+							? new AnthropicProvider({ ...config, extraHeaders } as never)
+							: new OpenAIProvider({ ...config, extraHeaders } as never);
+					for await (const _event of provider.chat({
+						conversationId: "wire-probe",
+						model: `wire:${config.defaultModel}`,
+						content: "hello",
+						cwd: process.cwd(),
+						history: [],
+						tools: [],
+						toolResults: [],
+						signal: AbortSignal.timeout(2000),
+					})) {
+						// Drain the actual transport, including successful completion.
+					}
+				}
+				expect(captured).toHaveLength(2);
+				expect(captured[0]?.get("user-agent")).toBe("configured/1");
+				expect(captured[1]?.get("user-agent")).toBe("operator/2");
+				expect(captured[1]?.get("authorization")).toBe("Bearer operator");
+				expect(captured[1]?.get("originator")).toBe("operator");
+				expect(captured[1]?.get("content-type")).toBe("application/custom+json");
+				expect(captured[1]?.get("anthropic-version")).toBe("operator-version");
+			} finally {
+				await server.stop(true);
+			}
+		});
+	}
+});

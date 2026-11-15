@@ -13,6 +13,7 @@ import {
 	toolOutputImages,
 	toolOutputMedia,
 } from "../agent-protocol/tool-output";
+import type { TextProviderMetadata } from "../agent-protocol/types";
 import type { TextCitation } from "../citations";
 import { isMediaContentBlock } from "../media-attachments";
 import type { MessageOrigin } from "../message-origin";
@@ -186,10 +187,16 @@ function outputPhase(raw: RawBlock): BlockPhase {
 	return raw.completed === false ? "aborted" : "done";
 }
 
-function textPart(text: string, citations?: unknown): TextPart {
-	return Array.isArray(citations) && citations.length
-		? { type: "text", text, citations: citations as TextCitation[] }
-		: { type: "text", text };
+function textPart(text: string, citations?: unknown, providerMetadata?: unknown): TextPart {
+	const metadata = record(providerMetadata) as TextProviderMetadata | undefined;
+	return {
+		type: "text",
+		text,
+		...(Array.isArray(citations) && citations.length
+			? { citations: citations as TextCitation[] }
+			: {}),
+		...(metadata ? { providerMetadata: metadata } : {}),
+	};
 }
 
 // === Assistant steps ===
@@ -388,7 +395,7 @@ function decodeAssistant(message: DecodableMessage): {
 					kind: "output",
 					ordinal: 0,
 					phase: outputPhase(raw),
-					payload: { parts: [textPart(text, raw.citations)] },
+					payload: { parts: [textPart(text, raw.citations, raw.providerMetadata)] },
 				});
 				return;
 			}
