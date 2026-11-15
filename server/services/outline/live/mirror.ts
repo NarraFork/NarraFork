@@ -4,7 +4,8 @@
  * WHAT IS LOADED
  * --------------
  * The mirror is keyed by parent: a parent is LOADED when every live child it has in the blocks
- * table is here ({@link SpaceMirror.isLoaded}). Parents are loaded on demand and unloaded when
+ * table is here ({@link SpaceMirror.isLoaded}: every block of a root's tree is, since a tree is
+ * loaded whole; other parents are marked one by one). Parents are loaded on demand and unloaded when
  * nobody needs them, so the mirror's size follows what participants have open, never the size of
  * the space. A top-level block whose whole subtree is loaded and that participants may join is a
  * ROOT (today's wire protocol joins a page: every parent under the page is loaded with it).
@@ -81,9 +82,14 @@ export class SpaceMirror {
 
 	// ── what is loaded ────────────────────────────────────────────────────────
 
-	/** Every live child of `parentId` is here. */
+	/**
+	 * Every live child of `parentId` is here: it is in a root's tree (loaded whole), or was
+	 * marked on its own.
+	 */
 	isLoaded(parentId: string): boolean {
-		return this.loaded.has(parentId);
+		if (this.loaded.has(parentId)) return true;
+		const top = this.topOf(parentId);
+		return top !== null && this.roots.has(top);
 	}
 
 	markLoaded(parentId: string): void {

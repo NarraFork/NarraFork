@@ -1170,10 +1170,7 @@ export class LiveSpace {
 		for (let at = 0; at < blocks.length; at += step) {
 			if (at > 0) await yieldToLoop();
 			if (this.closed) return { refused: "ended" };
-			for (const b of blocks.slice(at, at + step)) {
-				this.putRow(b);
-				this.mirror.markLoaded(b.id);
-			}
+			for (const b of blocks.slice(at, at + step)) this.putRow(b);
 		}
 		this.mirror.markRoot(pageId);
 		const view = new LivePageView(this, pageId);
@@ -2729,7 +2726,6 @@ export class LiveSpace {
 							dbContent: prior?.dbContent ?? "",
 							gen: prior?.gen ?? 0,
 						});
-						this.mirror.markLoaded(op.id);
 						this.orphanScope.delete(op.id);
 						const top = this.scopeOf(op.id);
 						if (cameFrom !== top) this.enter(op.id, top, this.opSeq + 1);
@@ -3159,7 +3155,6 @@ export class LiveSpace {
 					// always goes out with it then (`wholeText`).
 					gen: prior?.gen ?? this.era,
 				});
-				this.mirror.markLoaded(v.blockId);
 				this.orphanScope.delete(v.blockId);
 				this.syncPending.set(v.blockId, content);
 				// New to the people of its page (also a block they never had that another page's
