@@ -1763,6 +1763,29 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return out;
 		},
 
+		async getLiveParents(spaceId, ids) {
+			const out: Array<{ id: string; parentId: string | null }> = [];
+			for (const chunk of chunked(ids)) {
+				// Only the ids in the WHERE clause, so nothing but the primary key can serve it: with
+				// the space there too, SQLite walked the whole space by an index on it (measured:
+				// 475 ms for 750 ids in a space of 100,000 blocks, against 2 ms).
+				const rows = await db
+					.select({
+						id: outlineBlocks.id,
+						parentId: outlineBlocks.parentId,
+						spaceId: outlineBlocks.spaceId,
+						deleted: outlineBlocks.deleted,
+					})
+					.from(outlineBlocks)
+					.where(inArray(outlineBlocks.id, chunk));
+				for (const row of rows) {
+					if (row.spaceId === spaceId && !row.deleted)
+						out.push({ id: row.id, parentId: row.parentId });
+				}
+			}
+			return out;
+		},
+
 		async findAliasOwnersInSpaces(spaceIds, alias) {
 			const out: Array<{ spaceId: string; id: string }> = [];
 			for (const chunk of chunked(spaceIds)) {

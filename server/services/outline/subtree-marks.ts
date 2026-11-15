@@ -40,8 +40,8 @@ export interface OutlineAncestry {
 	 * tree of the space, or the walk did not reach the top.
 	 */
 	above(id: string): string[] | null;
-	/** The block as the walk read it (live blocks of the space only). */
-	meta(id: string): OutlineBlockMeta | undefined;
+	/** The block is a live block of the space (as far as the walk read). */
+	has(id: string): boolean;
 	/** The walk stopped at its row limit: some `above` are null for that reason alone. */
 	cutShort: boolean;
 }
@@ -50,26 +50,27 @@ export interface OutlineAncestry {
 const MAX_WALK_DEPTH = 1024;
 
 /**
- * Walk the given blocks up to the space, together: one chunked primary-key read per level,
- * at most `maxRows` blocks in all. `known` are metas the caller already holds.
+ * Walk the given blocks up to the space, together: one chunked primary-key read of two columns
+ * per level of the tree (`getLiveParents`), at most `maxRows` blocks in all. `known` are live
+ * blocks of the space whose parent the caller already holds.
  */
 export async function readOutlineAncestry(
 	spaceId: string,
 	ids: Iterable<string>,
-	options: { maxRows: number; known?: readonly OutlineBlockMeta[]; store?: OutlineStore },
+	options: {
+		maxRows: number;
+		known?: ReadonlyArray<{ id: string; parentId: string | null }>;
+		store?: OutlineStore;
+	},
 ): Promise<OutlineAncestry> {
 	const store = options.store ?? outlineStore;
-	const metas = new Map<string, OutlineBlockMeta>();
+	const parentOf = new Map<string, string | null>();
 	const dead = new Set<string>();
-	const take = (meta: OutlineBlockMeta) => {
-		if (meta.spaceId === spaceId && !meta.deleted) metas.set(meta.id, meta);
-		else dead.add(meta.id);
-	};
-	for (const meta of options.known ?? []) take(meta);
+	for (const block of options.known ?? []) parentOf.set(block.id, block.parentId);
 	let frontier = new Set<string>();
-	for (const id of ids) if (!metas.has(id) && !dead.has(id)) frontier.add(id);
-	for (const meta of metas.values())
-		if (meta.parentId !== null && !metas.has(meta.parentId)) frontier.add(meta.parentId);
+	for (const id of ids) if (!parentOf.has(id)) frontier.add(id);
+	for (const parent of parentOf.values())
+		if (parent !== null && !parentOf.has(parent)) frontier.add(parent);
 	let rows = 0;
 	let cutShort = false;
 	while (frontier.size > 0) {
@@ -80,42 +81,32 @@ export async function readOutlineAncestry(
 			if (asked.length === 0) break;
 		}
 		rows += asked.length;
-		const found = await store.getBlockMetasByIds(asked);
-		const seen = new Set<string>();
-		for (const meta of found) {
-			take(meta);
-			seen.add(meta.id);
-		}
-		for (const id of asked) if (!seen.has(id)) dead.add(id);
+		const found = await store.getLiveParents(spaceId, asked);
+		for (const block of found) parentOf.set(block.id, block.parentId);
+		for (const id of asked) if (!parentOf.has(id)) dead.add(id);
 		if (cutShort) break;
 		frontier = new Set();
-		for (const meta of found) {
-			const parent = meta.parentId;
-			if (metas.get(meta.id) && parent !== null && !metas.has(parent) && !dead.has(parent))
-				frontier.add(parent);
-		}
+		for (const { parentId } of found)
+			if (parentId !== null && !parentOf.has(parentId) && !dead.has(parentId))
+				frontier.add(parentId);
 	}
 	const memo = new Map<string, string[] | null>();
 	const above = (id: string): string[] | null => {
 		const cached = memo.get(id);
 		if (cached !== undefined) return cached;
 		const chain: string[] = [];
-		let result: string[] | null = chain;
-		let at = metas.get(id);
-		if (!at) result = null;
-		while (at && at.parentId !== null) {
-			const parent = metas.get(at.parentId);
-			if (!parent || chain.length >= MAX_WALK_DEPTH) {
+		let result: string[] | null = parentOf.has(id) ? chain : null;
+		for (let at = parentOf.get(id) ?? null; at !== null; at = parentOf.get(at) ?? null) {
+			if (!parentOf.has(at) || chain.length >= MAX_WALK_DEPTH) {
 				result = null;
 				break;
 			}
-			chain.push(parent.id);
-			at = parent;
+			chain.push(at);
 		}
 		memo.set(id, result);
 		return result;
 	};
-	return { above, meta: (id) => metas.get(id), cutShort };
+	return { above, has: (id) => parentOf.has(id), cutShort };
 }
 
 /** The things a marks read counts, as the space's indexes list them. */
@@ -219,7 +210,7 @@ export async function readOutlineMarks(request: OutlineMarksRequest): Promise<Ou
 
 	const byKey = new Map<string, OutlineSubtreeMarks>();
 	for (const key of keys) {
-		if (key !== space.id && !ancestry.above(key) && !ancestry.meta(key)) continue;
+		if (key !== space.id && !ancestry.has(key)) continue;
 		// A key whose own walk was cut short is still a live block: it gets its (lower) counts.
 		byKey.set(key, { key, questions: 0, tasks: { todo: 0, doing: 0 }, locked: 0, pending: 0 });
 	}

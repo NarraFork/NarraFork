@@ -62,7 +62,7 @@ import {
 	type OutlineTreeLevel,
 } from "@shared/outline-subtree-api";
 import { OUTLINE_TEXT } from "./messages";
-import { OUTLINE_LIMITS, OUTLINE_PENDING_LIMITS, type OutlineAskJson } from "./model";
+import { OUTLINE_LIMITS, type OutlineAskJson } from "./model";
 import { loadBodiesWithin } from "./read";
 import { readReportAuthors } from "./report-authors";
 import { outlineStore } from "./store";
@@ -329,7 +329,7 @@ async function pendingMarks(ctx: ReadContext): Promise<Map<string, string[]> | n
 	if (ctx.asOf !== null) return null;
 	const rows = await ctx.store.listOpenPendingBySpace(
 		ctx.space.id,
-		OUTLINE_PENDING_LIMITS.openPerPage,
+		OUTLINE_SUBTREE_LIMITS.markCandidates,
 	);
 	const out = new Map<string, string[]>();
 	const mark = (id: string, rowId: string) => {
