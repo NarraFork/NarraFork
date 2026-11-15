@@ -733,11 +733,32 @@ test("负字距末尾句号：区分逻辑框与 ink，并检测真实绘制越�
 		);
 		expect((await punctuationPaint(page)).outside).toBeGreaterThan(0);
 
-		await page.$eval("[data-ink-probe]", (punctuation) => {
+		const clipBox = await page.$eval("[data-ink-probe]", (punctuation) => {
 			const line = punctuation.closest<HTMLElement>("[data-vlist-line]");
-			if (!line) throw new Error("缺少实际绘制行");
+			const sample = punctuation.closest<HTMLElement>("[data-case]");
+			if (!line || !sample) throw new Error("缺少实际绘制行或裁切边界");
+			const column = sample.getBoundingClientRect();
+			// Reproduce the inherited max-content floor independently of installed fonts.
+			line.style.minWidth = `${column.width + 16}px`;
+			const expandedWidth = line.getBoundingClientRect().width;
+			// This is an authored clipping control, not a production layout change.
+			// Width alone cannot override min-width:max-content on the normal copy-safe line.
+			line.style.minWidth = "0";
+			line.style.width = `${column.width}px`;
 			line.style.overflow = "hidden";
+			const actual = line.getBoundingClientRect();
+			return {
+				expandedWidth,
+				columnWidth: column.width,
+				actualWidth: actual.width,
+				leftDelta: actual.left - column.left,
+				rightDelta: actual.right - column.right,
+			};
 		});
+		expect(clipBox.expandedWidth).toBeGreaterThan(clipBox.columnWidth);
+		expect(Math.abs(clipBox.actualWidth - clipBox.columnWidth)).toBeLessThanOrEqual(1 / 64);
+		expect(Math.abs(clipBox.leftDelta)).toBeLessThanOrEqual(1 / 64);
+		expect(Math.abs(clipBox.rightDelta)).toBeLessThanOrEqual(1 / 64);
 		const clipped = await geometry(page);
 		expect(assertLayout(clipped, await state(page))).toEqual([]);
 		const clippedInk = clipped
