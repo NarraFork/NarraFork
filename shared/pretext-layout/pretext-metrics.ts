@@ -6,6 +6,7 @@
 
 import { measureLineStats } from "@chenglou/pretext";
 import { measureRichInlineStats } from "@chenglou/pretext/rich-inline";
+import { inlineFlowForWidth } from "./agent-reference-flow";
 import type {
 	BlockLineMetrics,
 	LineMetricsResolver,
@@ -19,7 +20,10 @@ export const pretextLineMetrics: LineMetricsResolver = (block, contentWidth) => 
 };
 
 export function inlineMetrics(block: PreparedInlineBlock, contentWidth: number): BlockLineMetrics {
-	const { lineCount, maxLineWidth } = measureRichInlineStats(block.flow, contentWidth);
+	const { lineCount, maxLineWidth } = measureRichInlineStats(
+		inlineFlowForWidth(block, contentWidth),
+		contentWidth,
+	);
 	return { lineCount: Math.max(1, lineCount), maxLineWidth };
 }
 

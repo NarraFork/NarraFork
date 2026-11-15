@@ -1,4 +1,8 @@
 {
+	"agentReference": {
+		"unknown": "Agent status unknown",
+		"unavailable": "Agent unavailable or access denied"
+	},
 	"historyCleared": "History cleared",
 	"toolDetailsCleared": "Tool-call details cleared",
 	"modelTraceReturn": "Return",
