@@ -161,6 +161,17 @@ const STRUCTURE_AS_OF = `SELECT v.block_id, b.sid, v.parent_id, v.order_key, v.a
 	WHERE v.page_id = ? AND v.from_seq <= ? AND (v.to_seq IS NULL OR v.to_seq > ?) AND v.deleted = 0
 	LIMIT ? OFFSET ?`;
 
+/**
+ * A block's newest version that is not a tombstone. Walks the primary key (`block_id`,
+ * `from_seq`) backwards and stops at the first live version, so it reads the tombstones written
+ * since the block was last live and nothing older (plan and cost: `history-plan.guard.test.ts`).
+ */
+export const SQLITE_LAST_LIVE_VERSION = `SELECT from_seq AS fromSeq, to_seq AS toSeq
+	FROM outline_block_versions
+	WHERE block_id = ? AND deleted = 0
+	ORDER BY from_seq DESC
+	LIMIT 1`;
+
 function inlineValues(text: string, params: Array<string | number>): unknown[][] {
 	return sqlite.query(text).values(...params) as unknown[][];
 }
@@ -402,14 +413,10 @@ export const sqliteOutlineReads: OutlineReadPort = {
 	},
 
 	async getLastLiveVersion(blockId) {
-		const v = outlineBlockVersions;
-		const row = db
-			.select({ fromSeq: v.fromSeq, toSeq: v.toSeq })
-			.from(v)
-			.where(and(eq(v.blockId, blockId), eq(v.deleted, false)))
-			.orderBy(desc(v.fromSeq))
-			.limit(1)
-			.get();
+		const row = sqlite.query(SQLITE_LAST_LIVE_VERSION).get(blockId) as {
+			fromSeq: number;
+			toSeq: number | null;
+		} | null;
 		return row ?? null;
 	},
 
