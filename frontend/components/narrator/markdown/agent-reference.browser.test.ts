@@ -102,10 +102,12 @@ async function render(page: Page, options: Parameters<typeof Fixture.render>[0])
 	await settle(page);
 }
 
-/** Actual Chrome glyph ranges, intersected ONLY with authored overflow clips, not the test box. */
+/** DOM line boxes + Canvas horizontal ink, clipped ONLY by authored overflow, not the test box. */
 const geometry = (page: Page) =>
 	page.evaluate(() => {
 		const metadata = (window as unknown as FixtureWindow).fixture.snapshot();
+		const inkContext = document.createElement("canvas").getContext("2d");
+		if (!inkContext) throw new Error("缺少 Canvas 字体墨迹测量");
 		const probe = document.body.appendChild(document.createElement("span"));
 		probe.style.color = "var(--mantine-color-anchor)";
 		probe.style.borderRadius = "var(--mantine-radius-sm)";
@@ -144,7 +146,14 @@ const geometry = (page: Page) =>
 				}
 				return local(visible);
 			};
+			const outsideBounds = (box: Box) =>
+				box.x < -1 / 64 ||
+				box.x + box.width > bounds.width + 1 / 64 ||
+				box.y < -1 / 64 ||
+				box.y + box.height > bounds.height + 1 / 64;
 			const glyphs: Array<Box & { text: string }> = [];
+			const inkGlyphs: Array<Box & { text: string }> = [];
+			const overflowGlyphs: Array<Box & { text: string }> = [];
 			const markerGlyphs: Array<Box & { text: string }> = [];
 			const labelTops: number[] = [];
 			const after: Box[] = [];
@@ -152,6 +161,8 @@ const geometry = (page: Page) =>
 			for (let node = walker.nextNode(); node; node = walker.nextNode()) {
 				if (node.parentElement?.closest("[data-agent-status]")) continue;
 				const text = node.textContent ?? "";
+				const css = getComputedStyle(node.parentElement ?? sample);
+				inkContext.font = `${css.fontStyle} ${css.fontWeight} ${css.fontSize} ${css.fontFamily}`;
 				const afterIndex = text.indexOf(metadata.afterText);
 				if (afterIndex >= 0) {
 					const range = document.createRange();
@@ -167,10 +178,32 @@ const geometry = (page: Page) =>
 					const box = range.getBoundingClientRect();
 					if (node.parentElement?.closest("[data-agent-label]")) labelTops.push(box.y);
 					const visible = clipped(rect(box), node.parentElement);
+					const isMarker = !!node.parentElement?.closest(".vlist-marker");
 					if (visible.width && visible.height) {
-						const target = node.parentElement?.closest(".vlist-marker") ? markerGlyphs : glyphs;
+						const target = isMarker ? markerGlyphs : glyphs;
 						target.push({ text: text[i] ?? "", ...visible });
 					}
+					// These fixtures are horizontal LTR. Range locates each glyph but its width is
+					// an advance/selection box, NOT ink (notably 。 with negative letter-spacing).
+					// Keep DOM vertical line bounds and the original logical geometry; horizontal
+					// paint uses this font's real bearings, without adding/removing spacing again.
+					const ink = inkContext.measureText(text[i] ?? "");
+					const rawInk = {
+						x: box.x - ink.actualBoundingBoxLeft,
+						y: box.y,
+						width: ink.actualBoundingBoxLeft + ink.actualBoundingBoxRight,
+						height: box.height,
+					};
+					const painted = clipped(rawInk, node.parentElement);
+					if (!isMarker && painted.width && painted.height)
+						inkGlyphs.push({ text: text[i] ?? "", ...painted });
+					// Retain the existing Range candidate oracle and all logical comparisons.
+					// Before calling an outlying selection box "painted outside", confirm its
+					// ink: negative spacing plus a font's side bearings can leave empty advance
+					// beyond the edge. Generic font optical overhang is not a chip regression.
+					const overflow = outsideBounds(visible) ? painted : visible;
+					if (!isMarker && overflow.width && overflow.height)
+						overflowGlyphs.push({ text: text[i] ?? "", ...overflow });
 				}
 			}
 			const references = [...sample.querySelectorAll<HTMLElement>("[data-agent-reference]")].map(
@@ -242,18 +275,10 @@ const geometry = (page: Page) =>
 				),
 			);
 			const outside = [
-				...glyphs,
+				...overflowGlyphs,
 				...icons,
 				...references.map((reference) => reference.bounds),
-			].filter(
-				(box) =>
-					box.width > 0 &&
-					box.height > 0 &&
-					(box.x < -1 / 64 ||
-						box.x + box.width > bounds.width + 1 / 64 ||
-						box.y < -1 / 64 ||
-						box.y + box.height > bounds.height + 1 / 64),
-			);
+			].filter((box) => box.width > 0 && box.height > 0 && outsideBounds(box));
 			return {
 				name: sample.dataset.case ?? "",
 				expectedReferences: Number(sample.dataset.referenceCount),
@@ -269,11 +294,58 @@ const geometry = (page: Page) =>
 					atoms: references.map(({ bounds, label, status }) => ({ bounds, label, status })),
 					after,
 				},
+				inkGlyphs,
 				overlaps,
 				outside,
 			};
 		});
 	});
+
+/** Independent raster check: only the test punctuation is magenta; no DOM/Canvas text metrics. */
+async function punctuationPaint(page: Page) {
+	const clip = await page.$eval('[data-case="prepared-public"]', (sample) => {
+		sample.scrollIntoView({ block: "center", inline: "center" });
+		const box = sample.getBoundingClientRect();
+		const x = Math.floor(box.x);
+		const y = Math.floor(box.y);
+		return {
+			x,
+			y,
+			width: Math.ceil(box.right + 16) - x,
+			height: Math.ceil(box.bottom) - y,
+			right: box.right,
+		};
+	});
+	const png = await page.screenshot({
+		encoding: "base64",
+		clip: { x: clip.x, y: clip.y, width: clip.width, height: clip.height },
+	});
+	return page.evaluate(
+		async ({ png, clip }) => {
+			const bytes = Uint8Array.from(atob(png), (character) => character.charCodeAt(0));
+			const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
+			const canvas = document.createElement("canvas");
+			canvas.width = bitmap.width;
+			canvas.height = bitmap.height;
+			const context = canvas.getContext("2d");
+			if (!context) throw new Error("无法读取 Chrome 截图像素");
+			context.drawImage(bitmap, 0, 0);
+			bitmap.close();
+			const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+			let inside = 0;
+			let outside = 0;
+			for (let index = 0; index < data.length; index += 4) {
+				const [red = 0, green = 0, blue = 0] = data.subarray(index, index + 3);
+				if (red <= green + 40 || blue <= green + 40) continue;
+				const x = clip.x + ((index / 4) % canvas.width) * (clip.width / canvas.width);
+				if (x >= clip.right) outside++;
+				else inside++;
+			}
+			return { inside, outside };
+		},
+		{ png, clip },
+	);
+}
 
 function assertLayout(
 	samples: Awaited<ReturnType<typeof geometry>>,
@@ -606,6 +678,79 @@ test("放大字体与正负字距：100%/135% 正文和预排版保留同一原�
 		expect([...new Set(issues)]).toEqual([]);
 	});
 }, 30_000);
+
+test("负字距末尾句号：区分逻辑框与 ink，并检测真实绘制越界和 overflow 裁切", async () => {
+	await withFixture(async (page) => {
+		await render(page, { width: 270, fontScalePercent: 135, letterSpacingPercent: -3 });
+		await page.evaluate(() => {
+			const sample = document.querySelector('[data-case="prepared-public"]');
+			const fragment = [...(sample?.querySelectorAll(".vlist-frag--body") ?? [])].find((node) =>
+				node.textContent?.includes("。"),
+			);
+			const text = fragment?.firstChild;
+			if (!sample || !text || text.nodeType !== Node.TEXT_NODE)
+				throw new Error("缺少公开引用后文的句号");
+			const index = text.textContent?.indexOf("。") ?? -1;
+			const range = document.createRange();
+			range.setStart(text, index);
+			range.setEnd(text, index + 1);
+			const punctuation = document.createElement("span");
+			punctuation.dataset.inkProbe = "";
+			punctuation.style.cssText = "position:relative;color:rgb(255,0,255)";
+			range.surroundContents(punctuation);
+			// Reproduce the CI edge precisely with the actual installed font, not a pinned
+			// font or wider tolerance: logical right=270.453125px while ink still fits.
+			punctuation.style.left = `${sample.getBoundingClientRect().right - range.getBoundingClientRect().right + 0.453125}px`;
+		});
+		const safe = await geometry(page);
+		const publicSample = safe.find((sample) => sample.name === "prepared-public");
+		if (!publicSample) throw new Error("缺少公开引用样本");
+		const logicalRight = Math.max(
+			...publicSample.layout.glyphs.map((glyph) => glyph.x + glyph.width),
+		);
+		expect(Math.abs(logicalRight - 270.453125)).toBeLessThanOrEqual(1 / 64);
+		const ink = publicSample.inkGlyphs.find((glyph) => glyph.text === "。" && glyph.x > 240);
+		if (!ink) throw new Error("缺少靠边句号 ink");
+		expect(ink.x + ink.width).toBeLessThanOrEqual(270);
+		expect(assertLayout(safe, await state(page))).toEqual([]);
+		const safePaint = await punctuationPaint(page);
+		expect(safePaint.inside).toBeGreaterThan(0);
+		expect(safePaint.outside).toBe(0);
+
+		// Move half the real ink beyond the box. This must fail the same production
+		// layout assertion, and the independent Chrome raster must show outside pixels.
+		await page.$eval(
+			"[data-ink-probe]",
+			(punctuation, delta) => {
+				const element = punctuation as HTMLElement;
+				element.style.left = `${Number.parseFloat(element.style.left) + delta}px`;
+			},
+			270 - ink.x - ink.width / 2,
+		);
+		const overflowing = await geometry(page);
+		expect(assertLayout(overflowing, await state(page))).toContainEqual(
+			expect.stringContaining("prepared-public: painted outside measured box"),
+		);
+		expect((await punctuationPaint(page)).outside).toBeGreaterThan(0);
+
+		await page.$eval("[data-ink-probe]", (punctuation) => {
+			const line = punctuation.closest<HTMLElement>("[data-vlist-line]");
+			if (!line) throw new Error("缺少实际绘制行");
+			line.style.overflow = "hidden";
+		});
+		const clipped = await geometry(page);
+		expect(assertLayout(clipped, await state(page))).toEqual([]);
+		const clippedInk = clipped
+			.find((sample) => sample.name === "prepared-public")
+			?.inkGlyphs.find((glyph) => glyph.text === "。" && glyph.x > 240);
+		if (!clippedInk) throw new Error("句号应保留未裁切的半边 ink");
+		expect(clippedInk.width).toBeLessThan(ink.width);
+		expect(clippedInk.x + clippedInk.width).toBeLessThanOrEqual(270);
+		const clippedPaint = await punctuationPaint(page);
+		expect(clippedPaint.inside).toBeGreaterThan(0);
+		expect(clippedPaint.outside).toBe(0);
+	});
+}, 15_000);
 
 test("极窄 8/16px：固定图标确实被胶囊裁切，而不是用未裁切 DOM 矩形假装不溢出", async () => {
 	await withFixture(async (page) => {

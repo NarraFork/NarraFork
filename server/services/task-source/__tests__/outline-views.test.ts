@@ -976,13 +976,23 @@ describe("spec sessions are unchanged", () => {
 		}
 	});
 
-	// The whole spec prompt for a fixed input, as PR 3 (`924aebac`) built it: computed there and
-	// pinned here, so any byte of it changing fails.
-	test("the full spec prompt is byte for byte what PR 3 built", async () => {
+	// Keep PR 3's legacy task-source baseline pinned. Agent References is an intentional
+	// global contract addition: account for only that section, not unrelated prompt drift.
+	test("the spec prompt retains the PR 3 baseline apart from agent-reference guidance", async () => {
 		const out: Record<string, string> = {};
 		for (const locale of ["en", "zh-CN"] as const) {
 			const built = await buildEffectiveSystemPrompt({ ...options, locale });
-			out[locale] = digest({ prompt: built.prompt, contract: built.contract, parts: built.parts });
+			const sections = built.contract.match(/\n\n## Agent References\n\n[^\n]+/g) ?? [];
+			expect(sections).toHaveLength(1);
+			const referenceSection = sections[0];
+			if (!referenceSection) throw new Error("Missing agent reference contract");
+			if (built.prompt === null) throw new Error("Missing effective spec prompt");
+			expect(referenceSection).toContain("[task name](nf-agent://open?id=NARRATOR_ID)");
+			out[locale] = digest({
+				prompt: built.prompt.replace(referenceSection, ""),
+				contract: built.contract.replace(referenceSection, ""),
+				parts: built.parts,
+			});
 		}
 		expect(out).toEqual(SPEC_PROMPT_DIGESTS);
 	});
@@ -1017,7 +1027,7 @@ describe("spec sessions are unchanged", () => {
 	});
 });
 
-/** See "the full spec prompt is byte for byte what PR 3 built". */
+/** Historical PR 3 baseline; later global contracts must be accounted for explicitly. */
 const SPEC_PROMPT_DIGESTS: Record<string, string> = {
 	en: "85bd631b5545aa90",
 	"zh-CN": "3f9b5c535127b3cb",
