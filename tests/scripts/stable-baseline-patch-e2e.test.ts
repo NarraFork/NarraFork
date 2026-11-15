@@ -1,7 +1,7 @@
 /**
  * Previous-stable patches are generated locally for GitHub publication. The independent
- * server mirrors their original bytes and metadata; it never receives full executables
- * or generates patches. Client download checks below are separate from producer traffic.
+ * server mirrors their original bytes, executables and metadata; it never generates patches.
+ * Client download checks below are separate from producer traffic.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -115,8 +115,8 @@ function producerOptions() {
 		downloadAsset: async (o: { assetId: number; outputPath: string; signal?: AbortSignal }) => {
 			o.signal?.throwIfAborted();
 			const asset = target.assets.find((a) => a.id === o.assetId);
-			if (!asset?.name.endsWith(".zstd-patch"))
-				throw new Error("Only public patch bytes may be downloaded");
+			if (!asset || (!asset.name.endsWith(".zstd-patch") && asset.name !== filename(TARGET)))
+				throw new Error("Only public patch or target binary bytes may be downloaded");
 			downloaded.push(asset.name);
 			await writeFile(o.outputPath, target.raw.get(asset.name) as Buffer, { flag: "wx" });
 		},
@@ -145,6 +145,7 @@ beforeAll(async () => {
 			buildDate: f.release.publishedAt,
 		});
 		const raw = Buffer.from(formatMetadataJson(metadata));
+		f.raw.set(filename(version), bytes);
 		f.raw.set(f.release.files[0].metadata.name, raw);
 		Object.assign(f.release.files[0], {
 			size: bytes.length,
@@ -240,7 +241,7 @@ beforeAll(async () => {
 	expect(receipt.verification).toBe("server-sha256");
 	expect(receipt.snapshotCommitted).toBe(true);
 	expect(receipt.uploaded).toEqual(receipt.verified);
-	expect(receipt.uploaded).toHaveLength(5);
+	expect(receipt.uploaded).toHaveLength(6);
 });
 afterAll(async () => {
 	if (directory) await rm(directory, { recursive: true, force: true });
@@ -263,15 +264,23 @@ describe("GitHub-produced previous-stable patches through the independent mirror
 			{ platform: PLATFORM, reason: `missing local binaries: ${filename(STABLE_BASE)}` },
 		]);
 	});
-	test("producer sends only original sidecar/patch bytes, never full binaries or GET readback", async () => {
-		expect(producerCalls.map((c) => c.method)).toEqual(["PUT", "PUT", "PUT", "PUT", "PUT", "POST"]);
-		expect(downloaded.sort()).toEqual(targetFile.patches.map((p) => p.name).sort());
+	test("producer sends original binary/sidecar/patch bytes, never rebuilds or GET readback", async () => {
+		expect(producerCalls.map((c) => c.method)).toEqual([
+			"PUT",
+			"PUT",
+			"PUT",
+			"PUT",
+			"PUT",
+			"PUT",
+			"POST",
+		]);
+		expect(downloaded.sort()).toEqual(
+			[filename(TARGET), ...targetFile.patches.map((p) => p.name)].sort(),
+		);
 		expect(await storage.listFiles("products")).toEqual([]);
-		expect(await storage.fileExists(`mirror-objects/${targetFile.sha256}`)).toBe(false);
-		for (const [name, bytes] of target.raw) {
+		expect(await storage.fileExists(`mirror-objects/${targetFile.sha256}`)).toBe(true);
+		for (const bytes of target.raw.values())
 			expect(await storage.getFile(`mirror-objects/${sha(bytes)}`)).toEqual(bytes);
-			expect(name).not.toBe(filename(TARGET));
-		}
 	});
 	test("canonical availability exposes both exact patch pairs and clients reconstruct the target", async () => {
 		const index = await (await clientGet("/api/v3/products/narrafork/mirror/index")).json();

@@ -15,6 +15,7 @@ import {
 } from "../../shared/release-patch";
 import { applyZstdPatchToFile } from "../lib/zstd-patch";
 import { validateGithubAssetUrl } from "./github-release-update";
+import { validateMirrorFull, validateMirrorPatchStep } from "./update-mirror-client";
 import type { ReleaseInfo, UpdateProgress } from "./update-service";
 
 export const GITHUB_UPDATE_TIMEOUT_MS = 15 * 60_000;
@@ -83,8 +84,9 @@ async function verifyFileIdentity(
 /** Recheck trusted discovery descriptors at execution time, before any patch payload request. */
 function validateChain(release: ReleaseInfo, currentVersion: string): GithubPatchStep[] {
 	const github = release._github;
-	const chain = github?.patchChain;
-	if (!github || !chain?.length || chain.length > MAX_RELEASE_PATCH_STEPS) {
+	const mirror = release.source === "update-server";
+	const chain = mirror ? release._mirror?.patchChain : github?.patchChain;
+	if ((!mirror && !github) || !chain?.length || chain.length > MAX_RELEASE_PATCH_STEPS) {
 		throw new Error("No bounded GitHub patch chain available");
 	}
 	const finalSize = release.files[0]?.size;
@@ -97,7 +99,9 @@ function validateChain(release: ReleaseInfo, currentVersion: string): GithubPatc
 		release.files[0]?.sha512 !== release.sha512
 	)
 		throw new Error("Invalid GitHub full binary identity");
-	validateGithubAssetUrl(github.downloadUrl, github.repository, release.version, release.path);
+	if (mirror) validateMirrorFull(release);
+	else if (github)
+		validateGithubAssetUrl(github.downloadUrl, github.repository, release.version, release.path);
 	let version = currentVersion;
 	let previous: GithubPatchStep["meta"] | undefined;
 	let patchTotal = 0;
@@ -133,18 +137,22 @@ function validateChain(release: ReleaseInfo, currentVersion: string): GithubPatc
 		)
 			throw new Error("GitHub legacy patch exceeds its small-input memory budget");
 		const binaryName = release.path.replace(`-${release.version}-`, `-${step.toVersion}-`);
-		const patchName = decodeURIComponent(new URL(step.url).pathname.split("/").at(-1) ?? "");
+		const patchName = mirror
+			? validateMirrorPatchStep(release, step).name
+			: decodeURIComponent(new URL(step.url).pathname.split("/").at(-1) ?? "");
 		const parsed = parseReleasePatchName(binaryName, patchName);
 		if (!parsed || (parsed.fromVersion && parsed.fromVersion !== step.fromVersion)) {
 			throw new Error("GitHub patch filename does not match its binary or source version");
 		}
-		validateGithubAssetUrl(step.url, github.repository, step.toVersion, patchName);
-		validateGithubAssetUrl(
-			step.metaUrl,
-			github.repository,
-			step.toVersion,
-			`${patchName}.meta.json`,
-		);
+		if (!mirror && github) {
+			validateGithubAssetUrl(step.url, github.repository, step.toVersion, patchName);
+			validateGithubAssetUrl(
+				step.metaUrl,
+				github.repository,
+				step.toVersion,
+				`${patchName}.meta.json`,
+			);
+		}
 		version = step.toVersion;
 		previous = meta;
 		return { ...step, meta };
@@ -179,13 +187,19 @@ export async function downloadGithubUpdateToFile(
 	dependencies: GithubUpdateDependencies,
 ): Promise<"zstd" | "full"> {
 	const { release, signal, onProgress } = options;
-	if (
+	if (release.source === "update-server") validateMirrorFull(release);
+	else if (
 		release.source !== "github" ||
 		!release._github ||
 		release._github.repository.toLowerCase() !== release.repository?.toLowerCase()
 	)
 		throw new Error("GitHub descriptor repository does not match the selected release");
-	let strategy: "full" | "zstd" = release._github.patchChain?.length ? "zstd" : "full";
+	let strategy: "full" | "zstd" = (release.source === "update-server"
+		? release._mirror?.patchChain
+		: release._github?.patchChain
+	)?.length
+		? "zstd"
+		: "full";
 	let fallback = false;
 	const progress = (phase: UpdateProgress["phase"], bytes: number, total: number) =>
 		onProgress?.({

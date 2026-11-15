@@ -1,6 +1,7 @@
 /** Historical release metadata compatibility. New canonical mirrors use /api/v3. */
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
+import { MAX_MIRROR_MAIN_BINARY_BYTES } from "../../shared/independent-update-mirror";
 import { isValidReleaseVersion } from "../../shared/release-version";
 import { requireAuth } from "../lib/auth";
 import { logger } from "../lib/logger";
@@ -76,7 +77,7 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			filename.includes("..") ||
 			!Number.isSafeInteger(size) ||
 			size <= 0 ||
-			size > 1024 ** 3 ||
+			size > MAX_MIRROR_MAIN_BINARY_BYTES ||
 			typeof sha512 !== "string" ||
 			!/^[A-Za-z0-9+/]{86}==$/.test(sha512)
 		)

@@ -14,7 +14,10 @@ import type { GhRunner } from "./github-release";
 export const CI_TEXT_LIMIT = 1024 * 1024;
 export const CI_METADATA_LIMIT = 64 * 1024;
 export const CI_DOWNLOAD_TIMEOUT = 15 * 60 * 1000;
-export const CI_BUNDLE_LIMIT = 24 * 1024 ** 3;
+/** Default and hard disk budget (archive + expanded): eight 4GiB binaries, up to
+ * sixteen 512MiB patches, frontend and metadata, with bounded ZIP overhead. */
+export const CI_BUNDLE_LIMIT = 96 * 1024 ** 3;
+export const CI_PLATFORM_ARTIFACT_LIMIT = MAX_RELEASE_BINARY_BYTES + 2 * 1024 ** 2;
 export const CI_DISK_RESERVE = 4 * 1024 ** 3;
 
 /** Known logical input/output sizes, not measured network traffic or partial failure bytes. */

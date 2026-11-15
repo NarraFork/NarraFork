@@ -1312,6 +1312,7 @@ export const userPreferences = pgTable("user_preferences", {
 	showTokenUsage: boolean("show_token_usage").notNull().default(false),
 	showOutputStats: boolean("show_output_stats").notNull().default(true),
 	compactAuxiliaryContent: boolean("compact_auxiliary_content").notNull().default(true),
+	appearancePreferences: text("appearance_preferences").notNull().default("{}"),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	narratorFontScalePercent: integer("narrator_font_scale_percent").notNull().default(100),
@@ -1354,6 +1355,7 @@ export const userPreferences = pgTable("user_preferences", {
 		.notNull()
 		.default(false),
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
+	hiddenPluginOverlays: text("hidden_plugin_overlays").notNull().default("[]"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
 	outlineDigestTimeZone: text("outline_digest_time_zone"),
@@ -4465,7 +4467,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 144,
-  "columnCount": 1918,
+  "columnCount": 1920,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11753,6 +11755,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "true"
         },
         {
+          "property": "appearancePreferences",
+          "name": "appearance_preferences",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"{}\"",
+          "defaultExpression": "\"{}\""
+        },
+        {
           "property": "terminalTheme",
           "name": "terminal_theme",
           "kind": "text",
@@ -12177,6 +12190,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"{}\"",
           "defaultExpression": "\"{}\""
+        },
+        {
+          "property": "hiddenPluginOverlays",
+          "name": "hidden_plugin_overlays",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"[]\"",
+          "defaultExpression": "\"[]\""
         },
         {
           "property": "traits",

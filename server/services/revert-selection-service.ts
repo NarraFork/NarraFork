@@ -38,7 +38,9 @@ import {
 	bodyLengthSql,
 	boundedBodyText,
 	hasBlockStorage,
+	hasBodyRevisions,
 	hasRowsOnlyBodies,
+	legacyBodyTextMatches,
 } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import type { WorkerHandle } from "../lib/worker-runtime/lifecycle";
@@ -62,6 +64,7 @@ export const REVERT_SELECTION_LIMITS = Object.freeze({
 	concurrentCollectors: 2,
 	/** Total candidate children inspected, including unselected origins. */
 	childNarrators: 1000,
+	queries: 500_000,
 });
 
 export interface RevertSelectionOptions {
@@ -82,8 +85,11 @@ export interface RevertSelectionOptions {
 export interface RevertSelectionRequest {
 	principal: NarratorPrincipal;
 	narratorId: string;
-	expectedMessageVersion: number;
+	/** Required by raw preview requests; fixed-plan revalidation compares the actual selection. */
+	expectedMessageVersion?: number;
 	selector: FileChangeRevertSelector;
+	/** Internal file-only plans do not rewrite refs and need no lazy-child preservation. */
+	historyRewrite?: boolean;
 	signal?: AbortSignal;
 }
 export interface RevertSelectionBlock {
@@ -208,6 +214,7 @@ export interface RevertSelectionResult {
 interface NarratorRow extends NarratorAclRow {
 	messageVersion: number;
 	refsInheritedFrom: string | null;
+	refsBackfillCursor: number | null;
 	status: string;
 	parentNarratorId: string | null;
 	originToolCallId: string | null;
@@ -222,6 +229,8 @@ interface RefRow {
 	segmentCompactId: string | null;
 	contentBytes: number;
 	copyBytes: number;
+	bodyRevision: number | null;
+	stateRevision: number | null;
 	treeHashAfter: string | null;
 	snapshotCommitSha: string | null;
 }
@@ -237,12 +246,18 @@ interface BodySummary {
 	blocks: BodyBlock[];
 }
 interface ScopeState {
+	historyRewrite: boolean;
+	expectedMessageVersion?: number;
 	principal: NarratorPrincipal;
 	signal: AbortSignal;
 	/** Bounded source queries only; never a database-wide write counter. */
-	commitments: Map<string, { query: string; params: SQLQueryBindings[]; digest: string }>;
+	commitments: Map<
+		string,
+		{ query: string; params: SQLQueryBindings[]; digest: string; empty: boolean }
+	>;
+	emptySourceChecks: { query: string; params: SQLQueryBindings[] }[];
 	commitmentBytes: number;
-	bodies: Map<string, { ref: RefRow; digest: string }>;
+	bodies: Map<string, { ref: RefRow; digest: string; legacyText?: string }>;
 	queries: number;
 	inspectedBytes: number;
 	manifestBytes: number;
@@ -269,9 +284,9 @@ interface ScopeState {
  * and their journals. It never guesses a latest toolUseId, filters failed calls out, mutates
  * history, publishes raw blobs or upgrades counts into proof of a successful reversal.
  *
- * All requested refs (including hidden file-history checkpoints) participate. Lazy inherited
- * refs must be materialized by the existing authorized backfill workflow first; this reader
- * refuses rather than enumerate a local prefix. Bodies are length-gated, one bounded message
+ * All requested refs (including hidden file-history checkpoints) participate. The selected
+ * lazy range must be covered by the authorized backfill workflow; unrelated older history
+ * need not be loaded. This reader refuses incomplete ranges rather than enumerate a prefix. Bodies are length-gated, one bounded message
  * at a time, then digested/parsed in a worker; inputJson/outputJson are never selected.
  * There is an additional 32MiB total inspection budget. Above it, a future DB worker/indexed
  * block projection is needed, NOT an incomplete manifest. Public results are internal bounded
@@ -279,7 +294,8 @@ interface ScopeState {
  *
  * Recheck selected narrator metadata and bounded source-query/body commitments, not unrelated
  * database writes. This is optimistic validation, NOT an atomic snapshot across await: normal
- * history writers must bump messageVersion, and execution must recheck returned versions/digests.
+ * history writers must bump messageVersion; fixed plans recheck actual sources and final commit
+ * uses a newly prepared current-version CAS, never the preview's old session-wide counter.
  * A direct unversioned write after its source's last verification can still race the preview.
  *
  * Current FK actions are inventoried explicitly, including spec revisions;
@@ -316,9 +332,12 @@ export class RevertSelectionService {
 			throw fail("BUSY", "Too many metadata collectors");
 		this.active++;
 		const state: ScopeState = {
+			historyRewrite: request.historyRewrite !== false,
+			expectedMessageVersion: input.expectedMessageVersion,
 			principal: input.principal,
 			signal,
 			commitments: new Map(),
+			emptySourceChecks: [],
 			commitmentBytes: 0,
 			bodies: new Map(),
 			queries: 0,
@@ -367,9 +386,13 @@ export class RevertSelectionService {
 		try {
 			await this.authorize(state, input.narratorId);
 			const root = state.narrators.get(input.narratorId);
-			if (root?.messageVersion !== input.expectedMessageVersion)
+			if (
+				input.expectedMessageVersion !== undefined &&
+				root?.messageVersion !== input.expectedMessageVersion
+			)
 				throw fail("STALE", "Message version changed before collection");
 			await this.select(state, input.narratorId, input.selector);
+			this.assertPreservedLazyChildren(state);
 			for (const narratorId of state.narrators.keys())
 				await this.authorize(state, narratorId, true);
 			this.check(state);
@@ -405,9 +428,9 @@ export class RevertSelectionService {
 			}
 			if (completed) {
 				this.check(state);
-				// Catch version/context changes even during ACL callbacks or source verification.
-				for (const narratorId of state.narrators.keys())
-					this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [narratorId]);
+				// ACL/context and lazy preservation remain commitments; runtime status, cache
+				// loading and unrelated version bumps do not change the selected history.
+				this.verifySourcesSync(state);
 			}
 		}
 	}
@@ -421,6 +444,8 @@ export class RevertSelectionService {
 	}
 	private check(state: ScopeState) {
 		state.signal.throwIfAborted();
+		if (Date.now() >= state.deadlineAt) throw fail("TIMEOUT", "Selection verification timed out");
+		integer(state.queries, 0, REVERT_SELECTION_LIMITS.queries, "selection queries");
 		this.root();
 	}
 	private rows<T>(
@@ -446,7 +471,12 @@ export class RevertSelectionService {
 					REVERT_SELECTION_LIMITS.manifestBytes,
 					"source commitments",
 				);
-				state.commitments.set(key, { query, params: [...params], digest });
+				state.commitments.set(key, {
+					query,
+					params: [...params],
+					digest,
+					empty: rows.length === 0,
+				});
 			}
 		}
 		return rows;
@@ -460,6 +490,8 @@ export class RevertSelectionService {
 		return this.rows<T>(state, query, params, commit)[0];
 	}
 	private async verifySources(state: ScopeState) {
+		// No asynchronous ACL callback may run after the final source verification.
+		for (const narratorId of state.narrators.keys()) await this.authorize(state, narratorId, true);
 		// Reuse the original indexed/keyset SELECTs, including their empty/end pages:
 		// row insertion/removal, sharing, tool bindings and FK associations all matter.
 		// Raw bodies are rehashed off-thread, never included in main-thread row digests.
@@ -470,11 +502,68 @@ export class RevertSelectionService {
 			if (current.digest !== digest) throw fail("STALE", "Selected message body changed");
 		}
 		let verified = 0;
-		for (const { query, params } of state.commitments.values()) {
+		let predicates: string[] = [];
+		let bindings: SQLQueryBindings[] = [];
+		let sqlBytes = 0;
+		const flushEmptyChecks = () => {
+			if (!predicates.length) return;
+			const query = `SELECT CASE WHEN ${predicates.join(" AND ")} THEN 1 ELSE 0 END AS unchanged`;
+			state.commitmentBytes +=
+				Buffer.byteLength(query) + Buffer.byteLength(JSON.stringify(bindings));
+			integer(state.commitmentBytes, 0, REVERT_SELECTION_LIMITS.manifestBytes, "source checks");
+			state.emptySourceChecks.push({ query, params: bindings });
+			predicates = [];
+			bindings = [];
+			sqlBytes = 0;
+		};
+		for (const { query, params, empty } of state.commitments.values()) {
 			this.rows(state, query, params);
+			if (empty) {
+				const predicate = `NOT EXISTS(${query})`;
+				const bytes = Buffer.byteLength(predicate);
+				integer(bytes, 0, FILE_CHANGE_LIMITS.metadataBytes - 256, "source check SQL bytes");
+				integer(params.length, 0, 4000, "source check bindings");
+				if (
+					predicates.length >= REVERT_SELECTION_PAGE_ITEMS ||
+					bindings.length + params.length > 4000 ||
+					sqlBytes + bytes + 256 > FILE_CHANGE_LIMITS.metadataBytes
+				)
+					flushEmptyChecks();
+				predicates.push(predicate);
+				bindings.push(...params);
+				sqlBytes += bytes;
+			}
 			if (++verified % REVERT_SELECTION_PAGE_ITEMS === 0) await this.pause(state);
 		}
-		for (const narratorId of state.narrators.keys()) await this.authorize(state, narratorId, true);
+		flushEmptyChecks();
+	}
+	private verifySourcesSync(state: ScopeState) {
+		// Final no-await boundary: native body/state revisions are in the exact ref
+		// commitments. Legacy fixtures retain bounded raw text solely for SQL equality;
+		// body hashing/parsing always remains in the healthy body worker above.
+		for (const { ref, legacyText } of state.bodies.values()) {
+			if (legacyText === undefined) continue;
+			this.check(state);
+			state.queries++;
+			if (!legacyBodyTextMatches(this.database.$client, ref.id, legacyText))
+				throw fail("STALE", "Selected message body changed after verification");
+		}
+		for (const { query, params, empty } of state.commitments.values())
+			if (!empty) this.rows(state, query, params);
+		// Empty associations/end pages retain exact NOT EXISTS semantics, compiled in
+		// bounded batches during the yielding phase instead of thousands of tiny hashes.
+		for (const { query, params } of state.emptySourceChecks) {
+			this.check(state);
+			state.queries++;
+			const unchanged = this.database.$client
+				.query<{ unchanged: number }, SQLQueryBindings[]>(query)
+				.get(...params);
+			if (unchanged?.unchanged !== 1)
+				throw fail("STALE", "Selected source membership changed after verification");
+		}
+		for (const narratorId of state.narrators.keys()) this.refreshNarrator(state, narratorId);
+		this.assertPreservedLazyChildren(state);
+		this.check(state);
 	}
 	private async pause(state: ScopeState) {
 		// A zero-delay timer avoids Bun's long immediate-poll waits while a body worker
@@ -512,10 +601,70 @@ export class RevertSelectionService {
 		integer(budget.cowBytes, 0, FILE_CHANGE_LIMITS.historyCowBytes, "COW bytes");
 	}
 
+	private refreshNarrator(state: ScopeState, narratorId: string) {
+		const row = this.one<NarratorRow>(
+			state,
+			`${NARRATOR_SELECT} WHERE id = ? LIMIT 1`,
+			[narratorId],
+			false,
+		);
+		if (!row) throw fail("NOT_FOUND", "Narrator not found");
+		this.one(state, `${NARRATOR_CONTEXT_SELECT} WHERE id = ? LIMIT 1`, [narratorId]);
+		if (!Number.isSafeInteger(row.messageVersion)) throw fail("STALE", "Unknown message version");
+		if (
+			(row.refsInheritedFrom !== null || row.refsBackfillCursor !== null) &&
+			(row.refsInheritedFrom === null ||
+				row.refsBackfillCursor === null ||
+				!Number.isSafeInteger(row.refsBackfillCursor) ||
+				row.refsBackfillCursor < 0)
+		)
+			throw fail("INHERITED_REFS_UNMATERIALIZED", "Inherited history cursor is invalid");
+		const previous = state.narrators.get(narratorId);
+		if (
+			previous &&
+			row.refsInheritedFrom !== null &&
+			(row.refsInheritedFrom !== previous.refsInheritedFrom ||
+				(row.refsBackfillCursor as number) > (previous.refsBackfillCursor ?? -1))
+		)
+			throw fail("STALE", "Inherited history dependency changed");
+		const version = state.result.messageVersions.find((entry) => entry.narratorId === narratorId);
+		// Keep the original raw preview's root snapshot bound to its immutable header.
+		// Internal fixed-plan collects omit expectedMessageVersion and return current CAS versions.
+		if (
+			version &&
+			!(narratorId === state.result.narratorId && state.expectedMessageVersion !== undefined)
+		)
+			version.messageVersion = row.messageVersion;
+		if (state.narrators.has(narratorId)) state.narrators.set(narratorId, row);
+		return row;
+	}
+	private assertPreservedLazyChildren(state: ScopeState) {
+		if (!state.historyRewrite) return;
+		const affected = new Map<string, number>();
+		for (const message of state.result.history.messages)
+			affected.set(
+				message.narratorId,
+				Math.min(affected.get(message.narratorId) ?? message.seq, message.seq),
+			);
+		for (const [narratorId, minSeq] of affected) {
+			const child = this.one<{ id: string }>(state, REVERT_LAZY_CHILD_DEPENDENCY_QUERY, [
+				narratorId,
+				minSeq,
+				narratorId,
+				minSeq,
+			]);
+			if (child)
+				throw new AppError(
+					"Inherited child history must be preserved before preparing a new preview",
+					409,
+					"HISTORY_LAZY_DEPENDENCY_CHANGED",
+					undefined,
+					{ lazyDependencies: [{ narratorId, minSeq }] },
+				);
+		}
+	}
 	private async authorize(state: ScopeState, narratorId: string, recheck = false) {
-		const row = this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [
-			narratorId,
-		]);
+		const row = this.refreshNarrator(state, narratorId);
 		if (!row) throw fail("NOT_FOUND", "Narrator not found");
 		const authorized = await withSignal(
 			this.options.authorize({ ...state.principal }, { ...row }, "write", state.signal),
@@ -524,23 +673,13 @@ export class RevertSelectionService {
 		if (authorized !== undefined)
 			throw fail("AUTHORIZATION_REQUIRED", "The ACL adapter must assert access or throw");
 		this.check(state);
-		if (row.refsInheritedFrom !== null)
-			throw fail(
-				"INHERITED_REFS_UNMATERIALIZED",
-				"Backfill inherited refs before building a complete selector",
-			);
-		if (!Number.isSafeInteger(row.messageVersion)) throw fail("STALE", "Unknown message version");
 		const old = state.narrators.get(narratorId);
-		if (old && JSON.stringify(old) !== JSON.stringify(row))
-			throw fail("STALE", "Narrator context changed");
 		if (!recheck && !old) {
 			state.narrators.set(narratorId, row);
 			this.add(state, state.result.messageVersions, {
 				narratorId,
 				messageVersion: row.messageVersion,
 			});
-			if (row.status !== "idle" && row.status !== "archived")
-				this.issue(state, { code: "NARRATOR_ACTIVE" });
 		}
 	}
 
@@ -579,12 +718,18 @@ export class RevertSelectionService {
 			}
 			return;
 		}
+		const narrator = state.narrators.get(narratorId);
+		const lazyCursor = narrator?.refsBackfillCursor;
+		if (selector.kind === "all" && lazyCursor !== null)
+			throw fail("INHERITED_REFS_UNMATERIALIZED", "The complete inherited history is required");
 		let startSeq = selector.kind === "from_seq" ? selector.minSeq : -Number.MAX_SAFE_INTEGER;
 		let boundaryId: string | null = null;
 		if (selector.kind === "after_block") {
 			const boundary = this.ref(state, narratorId, selector.messageId);
 			startSeq = boundary.seq;
 			boundaryId = boundary.id;
+			if (lazyCursor !== null && lazyCursor !== undefined && startSeq < lazyCursor)
+				throw fail("INHERITED_REFS_UNMATERIALIZED", "The selected suffix is not materialized");
 			// Same-seq siblings have no durable relative order: never silently pick an ID order.
 			const ties = this.one<{ id: string }>(
 				state,
@@ -595,6 +740,8 @@ export class RevertSelectionService {
 				throw fail("ORDER_UNVERIFIED", "The after-block boundary shares its history sequence");
 			await this.message(state, boundary, { after: selector.keepThroughBlockIndex });
 		}
+		if (lazyCursor !== null && lazyCursor !== undefined && startSeq < lazyCursor)
+			throw fail("INHERITED_REFS_UNMATERIALIZED", "The selected suffix is not materialized");
 		let cursor = { seq: startSeq, rowid: 0 };
 		for (;;) {
 			const page = this.rows<RefRow>(
@@ -620,11 +767,16 @@ export class RevertSelectionService {
 			REVERT_SELECTION_LIMITS.inspectedBodyBytes,
 			"total body inspection bytes",
 		);
-		const summary = await inspectBody(state, ref.id, this.readBody(state, ref));
+		const content = this.readBody(state, ref);
+		const summary = await inspectBody(state, ref.id, content);
 		this.check(state);
 		const old = state.bodies.get(ref.id);
 		if (old && old.digest !== summary.digest) throw fail("STALE", "Selected message body changed");
-		state.bodies.set(ref.id, { ref, digest: summary.digest });
+		state.bodies.set(ref.id, {
+			ref,
+			digest: summary.digest,
+			...(ref.bodyRevision === null || ref.stateRevision === null ? { legacyText: content } : {}),
+		});
 		return summary;
 	}
 	private readBody(state: ScopeState, ref: RefRow): string {
@@ -1013,10 +1165,50 @@ export class RevertSelectionService {
 			return;
 		}
 		const origin = tool.executionOriginToolCallId ?? tool.id;
+		// A COW row belongs to its history holder, not to the execution it snapshots.
+		// Its immutable journal still names the original PK. If that row survives,
+		// verify its frozen binding too; source deletion does not erase a copied receipt.
+		const original = tool.executionOriginToolCallId
+			? this.one<RevertSelectionTool>(
+					state,
+					`SELECT narrator_id AS narratorId, tool_use_id AS toolUseId, tool_name AS toolName,
+					 execution_identity_version AS executionIdentityVersion,
+					 execution_origin_tool_call_id AS executionOriginToolCallId,
+					 execution_attempt AS executionAttempt, file_change_operation_id AS fileChangeOperationId,
+					 execution_device_id AS executionDeviceId, execution_path_flavor AS executionPathFlavor,
+					 resolved_file_path AS resolvedFilePath, canonical_file_path AS canonicalFilePath,
+					 runtime_generation AS runtimeGeneration FROM narrator_tool_calls WHERE id = ? LIMIT 1`,
+					[origin],
+				)
+			: undefined;
+		// Removing a source narrator can retain its exact tool PK for stable forks.
+		// That row becomes a non-executable self-origin, and the journal's narrator
+		// FK becomes null. Its new history holder is not a changed execution owner.
+		const retainedOrigin =
+			original?.executionOriginToolCallId === origin && operation.narratorId === null;
+		const originalMismatch =
+			original !== undefined &&
+			((original.executionOriginToolCallId !== null && !retainedOrigin) ||
+				(!retainedOrigin && original.narratorId !== operation.narratorId) ||
+				(
+					[
+						"toolUseId",
+						"toolName",
+						"executionIdentityVersion",
+						"executionAttempt",
+						"fileChangeOperationId",
+						"executionDeviceId",
+						"executionPathFlavor",
+						"resolvedFilePath",
+						"canonicalFilePath",
+						"runtimeGeneration",
+					] as const
+				).some((key) => original[key] !== tool[key]));
 		const binding: FileChangeExecutionBinding | null = operation.executionBindingJson
 			? JSON.parse(operation.executionBindingJson)
 			: null;
 		if (
+			originalMismatch ||
 			(operation.evidenceVersion === 2 &&
 				(!binding ||
 					binding.deviceId !== tool.executionDeviceId ||
@@ -1028,7 +1220,7 @@ export class RevertSelectionService {
 			operation.toolCallId !== origin ||
 			operation.attempt !== tool.executionAttempt ||
 			!operation.requestDigest ||
-			operation.narratorId !== tool.narratorId
+			(!tool.executionOriginToolCallId && operation.narratorId !== tool.narratorId)
 		)
 			this.issue(state, {
 				code: "ATTEMPT_BINDING_MISMATCH",
@@ -1234,21 +1426,32 @@ function sourceRowsDigest(rows: unknown[]): string {
 	return hash.digest("hex");
 }
 
-const NARRATOR_SELECT = `SELECT id, owner_user_id AS ownerUserId, visibility, write_audience AS writeAudience, type,
+const NARRATOR_CONTEXT_COLUMNS = `id, owner_user_id AS ownerUserId, visibility, write_audience AS writeAudience, type,
  acl_root_narrator_id AS aclRootNarratorId, context_project_id AS contextProjectId,
- message_version AS messageVersion, refs_inherited_from AS refsInheritedFrom, status,
- parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId FROM narrators`;
+ parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId`;
+const NARRATOR_CONTEXT_SELECT = `SELECT ${NARRATOR_CONTEXT_COLUMNS} FROM narrators`;
+const NARRATOR_SELECT = `SELECT ${NARRATOR_CONTEXT_COLUMNS}, message_version AS messageVersion,
+ refs_inherited_from AS refsInheritedFrom, refs_backfill_cursor AS refsBackfillCursor, status FROM narrators`;
+/** Same read-only dependency predicate as assertNoLazyChildrenForHistoryRewriteTx, on the injected DB. */
+export const REVERT_LAZY_CHILD_DEPENDENCY_QUERY = `SELECT child.id FROM narrators child INDEXED BY idx_narrators_refs_inherited_from
+ WHERE child.refs_inherited_from = ? AND child.refs_backfill_cursor > ?
+ AND EXISTS (SELECT 1 FROM narrator_message_refs refs INDEXED BY idx_narrator_refs_seq
+ WHERE refs.narrator_id = ? AND refs.seq >= ? AND refs.seq < child.refs_backfill_cursor
+ AND refs.segment_compact_id IS NULL) LIMIT 1`;
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
 /** Whether bodies are read from block rows (`narrator-bodies.ts`); the database is SQLite. */
 const bodiesFromBlocks = (db: Database) =>
 	hasBlockStorage(db) && (settings.narratorBlocks.read || hasRowsOnlyBodies(db));
-/** Refs with their message's sizes; a body is measured as readers read it. */
+/** Refs with their message's sizes/revisions; a body is measured as readers read it. */
 const refSelect = (db: Database) => {
 	const body = bodyLengthSql("m", bodiesFromBlocks(db));
+	const revisions = hasBodyRevisions(db)
+		? "m.body_revision AS bodyRevision, m.state_revision AS stateRevision"
+		: "NULL AS bodyRevision, NULL AS stateRevision";
 	return `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
  coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, ${body} AS contentBytes,
  ${body} + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
- m.tree_hash_after AS treeHashAfter, m.snapshot_commit_sha AS snapshotCommitSha
+ m.tree_hash_after AS treeHashAfter, m.snapshot_commit_sha AS snapshotCommitSha, ${revisions}
  FROM narrator_message_refs r LEFT JOIN narrator_messages m ON m.id = r.message_id`;
 };
 const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS messageId, tool_use_id AS toolUseId, tool_name AS toolName, status,
@@ -1412,7 +1615,8 @@ function normalizeRequest(input: RevertSelectionRequest) {
 	text(input.principal.userId);
 	if (typeof input.principal.isAdmin !== "boolean")
 		throw fail("INVALID_INPUT", "An authenticated principal is required");
-	integer(input.expectedMessageVersion, 0, Number.MAX_SAFE_INTEGER, "message version");
+	if (input.expectedMessageVersion !== undefined)
+		integer(input.expectedMessageVersion, 0, Number.MAX_SAFE_INTEGER, "message version");
 	const selector = input.selector;
 	let fixed: FileChangeRevertSelector;
 	if (selector.kind === "all") fixed = { kind: "all" };
@@ -1479,8 +1683,8 @@ function* manifestRows(result: RevertSelectionResult) {
 		for (const id of result.selector.messageIds) yield { selectedMessageId: id };
 	if (result.selector.kind === "tool_calls")
 		for (const id of result.selector.toolCallIds) yield { selectedToolCallId: id };
+	for (const row of result.messageVersions) yield { selectedNarratorId: row.narratorId };
 	for (const values of [
-		result.messageVersions,
 		result.history.messages,
 		result.history.blocks,
 		result.history.toolChanges,

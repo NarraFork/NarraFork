@@ -21,6 +21,9 @@ on:
       - "licenses/extra/remote-peer-LICENSES.txt"
       - "licenses/extra/entries.json"
       - ".github/workflows/remote-peer.yml"
+  # remote-peer-dependabot-licenses.yml dispatches this after pushing its sync commit:
+  # pushes made with GITHUB_TOKEN start no pull_request run of their own.
+  workflow_dispatch:
 
 concurrency:
   group: remote-peer-${{ github.event.pull_request.number || github.ref }}

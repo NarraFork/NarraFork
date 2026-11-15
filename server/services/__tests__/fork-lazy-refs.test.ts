@@ -22,7 +22,11 @@ const { narratorMessageQueries } = await import("../narrator-messages");
 const {
 	ensureAllRefsMaterialized,
 	ensureRefsCoverSeq,
+	ensureRefsCoverMessage,
 	hasUnmaterializedRefsBelow,
+	prepareLazyChildrenForHistoryRewrite,
+	prepareRevertRefs,
+	assertNoLazyChildrenForHistoryRewriteTx,
 	requireSqliteLazyRefsBackfill,
 	resolveLazyLineage,
 } = await import("../narrator-refs-backfill");
@@ -403,6 +407,362 @@ describe("lineage scopes handed to search", () => {
 		seedNarrator("solo");
 		await seedMessage({ id: "solo-1", narratorId: "solo", seq: 0 });
 		expect(await resolveLazyLineage("solo")).toEqual([]);
+	});
+});
+
+describe("bounded inherited range preparation", () => {
+	async function lazyFork() {
+		await seedParentWithCompact();
+		return narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+	}
+	test("recent range does not load unrelated older history; an old point loads its continuous suffix", async () => {
+		const child = await lazyFork();
+		const before = await refsOf(child.id);
+		await prepareRevertRefs(child.id, { kind: "from_seq", minSeq: 6 });
+		expect(await refsOf(child.id)).toEqual(before);
+		const version = db
+			.select({ version: narrators.messageVersion })
+			.from(narrators)
+			.where(eq(narrators.id, child.id))
+			.get()?.version;
+		await ensureRefsCoverMessage(child.id, "parent-old-2");
+		expect((await refsOf(child.id)).map((ref) => ref.seq)).toEqual([2, 3, 4, 5, 6, 7, 8]);
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(2);
+		expect(
+			db
+				.select({ version: narrators.messageVersion })
+				.from(narrators)
+				.where(eq(narrators.id, child.id))
+				.get()?.version,
+		).toBe(version);
+	});
+
+	test("same-seq ties are copied as a whole, or rejected before any part of that group", async () => {
+		const child = await lazyFork();
+		db.transaction(() => {
+			for (let index = 0; index < 450; index++) {
+				const id = `tie-${index}`;
+				db.insert(narratorMessages)
+					.values({
+						id,
+						narratorId: "parent",
+						role: "assistant",
+						contentJson: [{ type: "text", text: id }],
+						createdAt: now,
+					})
+					.run();
+				db.insert(narratorMessageRefs)
+					.values({ id: `ref-${id}`, narratorId: "parent", messageId: id, seq: 4 })
+					.run();
+			}
+		});
+		await expect(ensureRefsCoverSeq(child.id, 4, { maxRows: 450 })).rejects.toMatchObject({
+			code: "HISTORY_REFS_BUDGET_EXCEEDED",
+		});
+		expect(await refsOf(child.id)).toHaveLength(4);
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(5);
+		await ensureRefsCoverSeq(child.id, 4, { maxRows: 451 });
+		expect((await refsOf(child.id)).filter((ref) => ref.seq === 4)).toHaveLength(451);
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(4);
+	});
+
+	test("hidden compacted refs consume bounded scan rows but are never copied into the child", async () => {
+		const child = await lazyFork();
+		db.update(narratorMessageRefs)
+			.set({ segmentCompactId: "parent-compact" })
+			.where(eq(narratorMessageRefs.id, "ref-parent-parent-old-3"))
+			.run();
+		await expect(ensureRefsCoverSeq(child.id, 3, { maxRows: 1 })).rejects.toMatchObject({
+			code: "HISTORY_REFS_BUDGET_EXCEEDED",
+		});
+		expect(await refsOf(child.id)).toHaveLength(4);
+		await ensureRefsCoverSeq(child.id, 3, { maxRows: 2 });
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(3);
+		expect((await refsOf(child.id)).map((ref) => ref.seq)).toEqual([4, 5, 6, 7, 8]);
+	});
+
+	test("cancellation, deadline, row and page exhaustion explicitly fail", async () => {
+		const child = await lazyFork();
+		const controller = new AbortController();
+		controller.abort(new Error("cancelled before preparation"));
+		await expect(ensureRefsCoverSeq(child.id, 0, { signal: controller.signal })).rejects.toThrow(
+			"cancelled",
+		);
+		await expect(
+			ensureRefsCoverSeq(child.id, 0, { deadlineAt: Date.now() - 1 }),
+		).rejects.toMatchObject({ code: "HISTORY_REFS_TIMEOUT" });
+		await expect(ensureRefsCoverSeq(child.id, 0, { maxRows: 1 })).rejects.toMatchObject({
+			code: "HISTORY_REFS_BUDGET_EXCEEDED",
+		});
+		expect(await refsOf(child.id)).toHaveLength(4);
+		let timerRan = false;
+		const timer = setTimeout(() => {
+			timerRan = true;
+		}, 0);
+		try {
+			await expect(
+				ensureRefsCoverSeq(child.id, 0, { maxPages: 1, pageSize: 1 }),
+			).rejects.toMatchObject({ code: "HISTORY_REFS_BUDGET_EXCEEDED" });
+			expect(timerRan).toBe(true);
+		} finally {
+			clearTimeout(timer);
+		}
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(4);
+	});
+
+	test("an exhausted zero cursor clears atomically, but a half-null cursor fails explicitly", async () => {
+		const child = await lazyFork();
+		db.update(narrators).set({ refsBackfillCursor: 0 }).where(eq(narrators.id, child.id)).run();
+		await ensureAllRefsMaterialized(child.id);
+		expect(await lazyStateOf(child.id)).toEqual({
+			refsInheritedFrom: null,
+			refsBackfillCursor: null,
+		});
+		db.update(narrators)
+			.set({ refsInheritedFrom: "parent", refsBackfillCursor: null })
+			.where(eq(narrators.id, child.id))
+			.run();
+		await expect(ensureAllRefsMaterialized(child.id)).rejects.toMatchObject({
+			code: "HISTORY_REFS_INCOMPLETE",
+		});
+		expect((await lazyStateOf(child.id))?.refsInheritedFrom).toBe("parent");
+	});
+
+	test("a cyclic lineage fails without deadlock or losing the inheritance link", async () => {
+		const child = await lazyFork();
+		db.update(narrators)
+			.set({ refsInheritedFrom: child.id, refsBackfillCursor: 5 })
+			.where(eq(narrators.id, "parent"))
+			.run();
+		await expect(ensureRefsCoverSeq(child.id, 0)).rejects.toMatchObject({
+			code: "HISTORY_REFS_LINEAGE_CYCLE",
+		});
+		await expect(resolveLazyLineage(child.id)).rejects.toMatchObject({
+			code: "HISTORY_REFS_LINEAGE_CYCLE",
+		});
+		expect((await lazyStateOf(child.id))?.refsInheritedFrom).toBe("parent");
+		expect(await refsOf(child.id)).toHaveLength(4);
+	});
+
+	test("preservation copies only the affected continuous suffix and its guard detects a new dependent", async () => {
+		const child = await lazyFork();
+		await prepareLazyChildrenForHistoryRewrite("parent", 3);
+		expect((await refsOf(child.id)).map((ref) => ref.seq)).toEqual([3, 4, 5, 6, 7, 8]);
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(3);
+		expect(() =>
+			db.transaction((tx) => assertNoLazyChildrenForHistoryRewriteTx(tx, "parent", 3)),
+		).not.toThrow();
+		await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		expect(() =>
+			db.transaction((tx) => assertNoLazyChildrenForHistoryRewriteTx(tx, "parent", 3)),
+		).toThrow(/Derived history readers changed/);
+	});
+});
+
+describe("source history rewrites retain lazy readers", () => {
+	test("source deletion retains the old suffix through two fork generations", async () => {
+		await seedParentWithCompact();
+		const child = await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		const grandchild = await narratorService.forkNarrator(child.id, null, { inheritMode: "full" });
+		await narratorMessageQueries.deleteMessage("parent", "parent-old-2", { skipRevert: true });
+		expect((await refsOf("parent")).map((ref) => ref.seq)).toEqual([0, 1]);
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(2);
+		await ensureAllRefsMaterialized(grandchild.id);
+		await ensureAllRefsMaterialized(child.id);
+		const expected = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+		for (const id of [child.id, grandchild.id]) {
+			const refs = await refsOf(id);
+			expect(refs.map((ref) => ref.seq)).toEqual(expected);
+			expect(new Set(refs.map((ref) => ref.messageId)).size).toBe(9);
+		}
+	});
+
+	test("history-only deletion retries outside its transaction when a lazy child appears during preparation", async () => {
+		await seedParentWithCompact();
+		await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		const tail = (await refsOf("parent")).filter((ref) => ref.seq >= 5);
+		let created = false;
+		const timer = setTimeout(() => {
+			db.transaction(() => {
+				seedNarrator("late-child");
+				db.update(narrators)
+					.set({ refsInheritedFrom: "parent", refsBackfillCursor: 5 })
+					.where(eq(narrators.id, "late-child"))
+					.run();
+				for (const ref of tail)
+					db.insert(narratorMessageRefs)
+						.values({ id: `late-${ref.messageId}`, narratorId: "late-child", ...ref })
+						.run();
+			});
+			created = true;
+		}, 0);
+		try {
+			await narratorMessageQueries.deleteMessage("parent", "parent-old-2", { skipRevert: true });
+			expect(created).toBe(true);
+			expect((await lazyStateOf("late-child"))?.refsBackfillCursor).toBe(2);
+			await ensureAllRefsMaterialized("late-child");
+			expect((await refsOf("late-child")).map((ref) => ref.seq)).toEqual([
+				0, 1, 2, 3, 4, 5, 6, 7, 8,
+			]);
+			expect((await refsOf("parent")).map((ref) => ref.seq)).toEqual([0, 1]);
+		} finally {
+			clearTimeout(timer);
+		}
+	});
+
+	test("block COW does not create A/B duplicate history when a lazy child later backfills", async () => {
+		await seedParentWithCompact();
+		await db
+			.update(narratorMessages)
+			.set({
+				contentJson: [
+					{ type: "text", text: "original" },
+					{ type: "text", text: "keep" },
+				],
+			})
+			.where(eq(narratorMessages.id, "parent-old-2"));
+		const child = await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		await narratorMessageQueries.deleteMessageBlock("parent", "parent-old-2", 0, {
+			skipRevert: true,
+		});
+		const parentRef = (await refsOf("parent")).find((ref) => ref.seq === 2);
+		expect(parentRef?.messageId).not.toBe("parent-old-2");
+		expect((await refsOf(child.id)).find((ref) => ref.seq === 2)?.messageId).toBe("parent-old-2");
+		await ensureAllRefsMaterialized(child.id);
+		expect((await refsOf(child.id)).filter((ref) => ref.seq === 2)).toEqual([
+			{ messageId: "parent-old-2", seq: 2 },
+		]);
+		expect(await narratorMessageQueries.getMessages(child.id)).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "parent-old-2",
+					contentJson: [
+						{ type: "text", text: "original" },
+						{ type: "text", text: "keep" },
+					],
+				}),
+			]),
+		);
+	});
+
+	test.each([
+		"update",
+		"delete",
+	])("compact %s retains the lazy child's original marker", async (action) => {
+		await seedParentWithCompact();
+		const child = await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		if (action === "update")
+			await narratorMessageQueries.updateCompactSummary("parent", "parent-compact", "changed");
+		else await narratorMessageQueries.deleteCompactMessage("parent", "parent-compact");
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(4);
+		await ensureAllRefsMaterialized(child.id);
+		const refs = await refsOf(child.id);
+		expect(refs.filter((ref) => ref.seq === 4)).toEqual([{ messageId: "parent-compact", seq: 4 }]);
+		expect(
+			await narratorMessageQueries.getCompactSummary(child.id, "parent-compact"),
+		).toMatchObject({ summary: "summary" });
+	});
+
+	test("a child revert reservation prevents source deletion without changing child refs/cursor", async () => {
+		await seedParentWithCompact();
+		const child = await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		const { reserveNarratorRevertAdmission } = await import("../narrator-session-state");
+		const admission = reserveNarratorRevertAdmission(child.id);
+		const release = await admission.acquire(new AbortController().signal, () => false);
+		const before = await refsOf(child.id);
+		try {
+			await expect(
+				narratorMessageQueries.deleteMessage("parent", "parent-old-2", { skipRevert: true }),
+			).rejects.toMatchObject({ code: "NARRATOR_REVERT_IN_PROGRESS" });
+			expect(await refsOf(child.id)).toEqual(before);
+			expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(5);
+			expect(await refsOf("parent")).toHaveLength(9);
+		} finally {
+			release();
+			admission.release();
+		}
+	});
+
+	test("a reservation arriving between pages freezes the child's refs and cursor immediately", async () => {
+		await seedParentWithCompact();
+		const child = await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		const { reserveNarratorRevertAdmission } = await import("../narrator-session-state");
+		let admission: ReturnType<typeof reserveNarratorRevertAdmission> | undefined;
+		let atReservation: Awaited<ReturnType<typeof refsOf>> = [];
+		let cursor: number | null | undefined;
+		const timer = setTimeout(() => {
+			admission = reserveNarratorRevertAdmission(child.id);
+			atReservation = db
+				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, child.id))
+				.orderBy(narratorMessageRefs.seq)
+				.all();
+			cursor = db
+				.select({ cursor: narrators.refsBackfillCursor })
+				.from(narrators)
+				.where(eq(narrators.id, child.id))
+				.get()?.cursor;
+		}, 0);
+		try {
+			await expect(ensureRefsCoverSeq(child.id, 0, { pageSize: 1 })).rejects.toMatchObject({
+				code: "NARRATOR_REVERT_IN_PROGRESS",
+			});
+			expect(admission).toBeDefined();
+			expect(await refsOf(child.id)).toEqual(atReservation);
+			expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(cursor);
+		} finally {
+			clearTimeout(timer);
+			admission?.release();
+		}
+	});
+
+	test("an oversized tied preservation window cannot partially commit source history", async () => {
+		await seedParentWithCompact();
+		const child = await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		db.transaction(() => {
+			for (let index = 0; index < 2001; index++) {
+				const id = `oversized-tie-${index}`;
+				db.insert(narratorMessages)
+					.values({
+						id,
+						narratorId: "parent",
+						role: "assistant",
+						contentJson: [{ type: "text", text: id }],
+						createdAt: now,
+					})
+					.run();
+				db.insert(narratorMessageRefs)
+					.values({ id: `ref-${id}`, narratorId: "parent", messageId: id, seq: 4 })
+					.run();
+			}
+		});
+		await expect(
+			narratorMessageQueries.deleteMessage("parent", "parent-old-2", { skipRevert: true }),
+		).rejects.toMatchObject({ code: "HISTORY_REFS_BUDGET_EXCEEDED" });
+		expect(await refsOf("parent")).toHaveLength(2010);
+		expect(await refsOf(child.id)).toHaveLength(4);
+		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(5);
+	}, 15_000);
+
+	test("cancellation during child preparation does not commit source history", async () => {
+		await seedParentWithCompact();
+		const child = await narratorService.forkNarrator("parent", null, { inheritMode: "full" });
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(new Error("stop preservation")), 0);
+		try {
+			await expect(
+				narratorMessageQueries.deleteMessage("parent", "parent-old-2", {
+					skipRevert: true,
+					signal: controller.signal,
+				}),
+			).rejects.toThrow(/stop preservation|aborted/);
+			expect(await refsOf("parent")).toHaveLength(9);
+			await ensureAllRefsMaterialized(child.id);
+			expect(await refsOf(child.id)).toEqual(await refsOf("parent"));
+		} finally {
+			clearTimeout(timer);
+		}
 	});
 });
 

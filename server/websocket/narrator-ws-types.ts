@@ -89,6 +89,8 @@ export type NarratorServerMessage =
 	| import("@shared/outline-page-events").OutlinePageServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
+	/** Delivered only to this account's sockets; clients refetch authorized preferences. */
+	| { type: "user_preferences_changed" }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */
 	| {
 			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;

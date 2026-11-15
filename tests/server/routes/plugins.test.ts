@@ -267,6 +267,39 @@ describe("plugin routes", () => {
 		expect(JSON.stringify(body)).not.toContain("do-not-return");
 	});
 
+	it("flags overlay views by a boolean only, never the view definitions", async () => {
+		const manager = new MockPluginManager();
+		manager.detailResult = {
+			...(manager.detailResult as Record<string, unknown>),
+			manifest: {
+				contributes: {
+					views: [
+						{ id: "panel", surfaces: ["workspace"], entry: "do-not-return.js" },
+						{ id: "pet", surfaces: ["overlay"], entry: "do-not-return.js" },
+					],
+				},
+			},
+		};
+		const app = createApp(manager);
+		const body = (await (await app.request("/com.example.demo")).json()) as {
+			manifest?: { overlay?: boolean; permissions?: unknown };
+		};
+		expect(body.manifest).toEqual({ overlay: true });
+		expect(JSON.stringify(body)).not.toContain("do-not-return");
+
+		manager.detailResult = {
+			...(manager.detailResult as Record<string, unknown>),
+			manifest: {
+				permissions: { host: ["query.read.projects"] },
+				contributes: { views: [{ id: "panel", surfaces: ["workspace"] }] },
+			},
+		};
+		const plain = (await (await app.request("/com.example.demo")).json()) as {
+			manifest?: Record<string, unknown>;
+		};
+		expect(plain.manifest).toEqual({ permissions: { host: ["query.read.projects"] } });
+	});
+
 	it("returns redacted and bounded diagnostics without paths or raw fields", async () => {
 		const app = createApp(new MockPluginManager());
 		const response = await app.request("/com.example.demo/diagnostics");
