@@ -3566,6 +3566,10 @@ class OutlinePlanner {
 	private baseFlags(block: WorkingBlock): number {
 		const base = block.base;
 		if (!base) return 0;
+		// Deleted before and after (restored and deleted again by this transaction, alone or with
+		// a parent it was put under): nothing of it changed. A second tombstone would hide when it
+		// was last live, which is where a later restore finds its tags.
+		if (block.deleted && base.deleted) return 0;
 		let flags = 0;
 		if (block.contentHash !== base.contentHash) flags |= OUTLINE_CHANGE.CONTENT;
 		if (block.parentId !== base.parentId || block.orderKey !== base.orderKey)

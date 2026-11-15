@@ -1288,6 +1288,57 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "restore op: the tags are those of the last commit that left the block live",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "p", parent: null, content: "page" },
+				{ op: "insert", tempId: "x", parent: { tempId: "p" }, content: "old", tags: ["Ops"] },
+				{ op: "insert", tempId: "y", parent: { tempId: "p" }, content: "Y", tags: ["Ops"] },
+				{ op: "insert", tempId: "q", parent: null, content: "page two" },
+			]);
+			const [, x, y, q] = ids(r) as string[];
+			const tagsOf = async (id: string) =>
+				(await ctx.store.listOpenLinks([id], 10))
+					.filter((l) => l.kind === "tag")
+					.map((l) => l.targetRef)
+					.sort();
+
+			// Tags are link rows only and a deleted block has none: tags replaced by the very
+			// commit that deletes the block are recorded nowhere, while the row keeps the text.
+			await write(ctx, space, [
+				{ op: "update", block: { id: x as string }, content: "new", tags: ["Design", "Risk"] },
+				{ op: "delete", block: { id: x as string } },
+			]);
+			await write(ctx, space, [{ op: "restore", block: { id: x as string } }]);
+			expect((await ctx.store.getBlock(x as string))?.content).toBe("new");
+			expect(await tagsOf(x as string)).toEqual(["Ops"]);
+
+			// Restored and deleted again by one commit (here with the page it was put under): the
+			// block is as it was, and a later restore still finds its tags.
+			await write(ctx, space, [{ op: "delete", block: { id: y as string } }]);
+			const tombstone = await ctx.store.getBlock(y as string);
+			const again = await write(ctx, space, [
+				{ op: "restore", block: { id: y as string }, parent: { id: q as string }, content: "Y2" },
+				{ op: "delete", block: { id: q as string } },
+			]);
+			expect(again.commit).not.toBeNull();
+			expect(await ctx.store.getBlock(y as string)).toEqual(tombstone);
+			expect(await ctx.store.listBlockVersions(y as string, 10)).toHaveLength(2);
+			// A commit that only does that writes nothing.
+			const nothing = await write(ctx, space, [
+				{ op: "restore", block: { id: y as string } },
+				{ op: "delete", block: { id: y as string } },
+			]);
+			expect(nothing.commit).toBeNull();
+			await write(ctx, space, [{ op: "restore", block: { id: y as string } }]);
+			expect(await ctx.store.getBlock(y as string)).toMatchObject({ deleted: false, content: "Y" });
+			expect(await tagsOf(y as string)).toEqual(["Ops"]);
+			checkSpaceInvariants(await ctx.dump(space.id));
+			checkChangeFlags(await ctx.dump(space.id));
+		},
+	},
+	{
 		name: "revert: skips blocks changed later, gone parents, later children and cycles",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
