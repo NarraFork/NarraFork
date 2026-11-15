@@ -38,7 +38,6 @@ import { readTool } from "./read";
 import { recallTool } from "./recall";
 import { requestPermissionRuleTool } from "./request-permission-rule";
 import { scheduledTaskTool } from "./scheduled-task";
-import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { scheduledTaskReportTool } from "./scheduled-task-report";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
@@ -85,7 +84,6 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["PluginInstall", pluginInstallTool],
 	["McpAdmin", mcpAdminTool],
 	["HookAdmin", hookAdminTool],
-	["ScheduledTaskAdmin", scheduledTaskAdminTool],
 	["KnowledgeCreate", knowledgeCreateTool],
 	["KnowledgeEdit", knowledgeEditTool],
 	["KnowledgeAdmin", knowledgeAdminTool],

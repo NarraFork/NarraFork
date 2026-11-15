@@ -19,7 +19,6 @@ import {
 import type { ToolContext } from "../types";
 import { isScheduledTaskReadAction } from "./scheduled-task-actions";
 import {
-	normalizeScheduledTaskInput,
 	type ScheduledTaskFields,
 	scheduledTaskFieldsSchema,
 	scheduledTaskParametersSchema,
@@ -204,7 +203,6 @@ export function previewScheduledTask(
 export async function resolveScheduledTaskApproval(
 	ctx: ScheduledTaskPolicyContext,
 	raw: Record<string, unknown>,
-	toolName: "ScheduledTask" | "ScheduledTaskAdmin" = "ScheduledTask",
 ): Promise<{
 	input: Record<string, unknown>;
 	approval: Record<string, unknown>;
@@ -214,20 +212,10 @@ export async function resolveScheduledTaskApproval(
 		"../../../services/scheduled-task-acl"
 	);
 	const principal = await resolveTaskPrincipal(ctx.userId);
-	if (toolName === "ScheduledTaskAdmin" && !principal.isAdmin)
-		throw new Error("ScheduledTaskAdmin is restricted to administrators.");
-	const input = normalizeScheduledTaskInput(raw, toolName === "ScheduledTaskAdmin");
 	const { scheduledTaskService: service } = await import(
 		"../../../services/scheduled-task-service"
 	);
-	// The historical toggle action means invert current state. Freeze the target state for approval.
-	if (input.action === "toggle") {
-		if (typeof input.id !== "string") throw new Error("'id' is required for toggle.");
-		const existing = await service.get(input.id);
-		await assertTaskAccess(existing, principal, "pause");
-		input.action = existing?.enabled ? "disable" : "enable";
-	}
-	const parsed = scheduledTaskParametersSchema.parse(input);
+	const parsed = scheduledTaskParametersSchema.parse(raw);
 	validateScheduledTaskArguments(parsed);
 	const { action, id } = parsed;
 	const { lookupScheduledRun } = await import("../../../services/scheduled-task-run-service");

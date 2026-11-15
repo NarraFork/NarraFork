@@ -355,10 +355,7 @@ export function InlinePermission({
 			{permission.toolName === "RequestPermissionRule" && (
 				<PermissionRuleRequestDetails permission={permission} />
 			)}
-			{(permission.toolName === "ScheduledTask" ||
-				permission.toolName === "ScheduledTaskAdmin") && (
-				<ScheduledTaskApproval permission={permission} />
-			)}
+			{permission.toolName === "ScheduledTask" && <ScheduledTaskApproval permission={permission} />}
 			{permissionTargetDeviceId &&
 				!isExitPlan &&
 				permission.toolName !== "RequestPermissionRule" && (

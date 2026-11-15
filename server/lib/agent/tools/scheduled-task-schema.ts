@@ -122,30 +122,6 @@ export const scheduledTaskParametersSchema = z.object({
 });
 export type ScheduledTaskParameters = z.infer<typeof scheduledTaskParametersSchema>;
 
-/** The compatibility name still accepts its historical flat input, but has no separate implementation. */
-export function normalizeScheduledTaskInput(
-	input: Record<string, unknown>,
-	admin = false,
-): Record<string, unknown> {
-	if (!admin) return { ...input };
-	const { action, id, limit, cursor, filters, task, enabled, ...fields } = input;
-	return {
-		action:
-			action === "run"
-				? "run_now"
-				: action === "toggle" && typeof enabled === "boolean"
-					? enabled
-						? "enable"
-						: "disable"
-					: action,
-		id,
-		limit,
-		cursor,
-		filters,
-		task: task ?? { ...fields, ...(enabled === undefined ? {} : { enabled }) },
-	};
-}
-
 export function validateScheduledTaskArguments(input: ScheduledTaskParameters): void {
 	if (!["list", "preview", "create"].includes(input.action) && !input.id)
 		throw new Error(`'id' is required for the ${input.action} action.`);

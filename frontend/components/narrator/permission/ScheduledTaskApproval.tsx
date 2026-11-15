@@ -14,7 +14,7 @@ function record(value: unknown): Record<string, unknown> | null {
 export function scheduledTaskApprovalView(
 	permission: Pick<PendingPermission, "toolName" | "inputJson">,
 ) {
-	if (!["ScheduledTask", "ScheduledTaskAdmin"].includes(permission.toolName)) return null;
+	if (permission.toolName !== "ScheduledTask") return null;
 	const raw = record(record(permission.inputJson)?._scheduledTaskApproval);
 	const task = record(raw?.task);
 	if (raw?.version !== 1 || !task || typeof task.timezone !== "string") return null;

@@ -989,7 +989,6 @@
 		"server/lib/agent/tools/__tests__/pipeline.test.ts": 400,
 		"server/lib/agent/tools/__tests__/plugin-install.test.ts": 300,
 		"server/lib/agent/tools/__tests__/reflection-descriptions.test.ts": 194,
-		"server/lib/agent/tools/__tests__/scheduled-task-admin.test.ts": 344,
 		"server/lib/agent/tools/__tests__/scheduled-task.test.ts": 732,
 		"server/lib/agent/tools/__tests__/send-navigation.test.ts": 685,
 		"server/lib/agent/tools/__tests__/share-file-archiver.test.ts": 536,

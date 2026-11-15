@@ -52,7 +52,8 @@ describe("scheduled task approval", () => {
 		expect(
 			scheduledTaskApprovalView({ ...permission, inputJson: { task, elevated: false } }),
 		).toBeNull();
-		expect(scheduledTaskApprovalView({ ...permission, toolName: "Write" })).toBeNull();
+		for (const toolName of ["Write", "ScheduledTaskAdmin"])
+			expect(scheduledTaskApprovalView({ ...permission, toolName })).toBeNull();
 		const view = scheduledTaskApprovalView(permission);
 		expect(view).toMatchObject({
 			action: "update",

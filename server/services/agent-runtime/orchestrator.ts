@@ -225,7 +225,11 @@ import {
 	outlinePersonHourRunning,
 } from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
-import { scheduledRunModelOverride } from "../scheduled-run-registry";
+import {
+	getScheduledRunById,
+	getScheduledRunMember,
+	scheduledRunModelOverride,
+} from "../scheduled-run-registry";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
@@ -247,6 +251,7 @@ import { createRuntimeEventContext, createRuntimeMessageWriters } from "./contex
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
+import { getRunControl } from "./ownership";
 import {
 	applyPlanApproval,
 	dropDeferredPlanApproval,
@@ -1068,6 +1073,17 @@ export async function runAgentLoopUnlocked(
 
 			// Every refresh derives the complete request view from one registry array. An
 			// explicit ceiling has no managed loading and needs no MCP grant DB read.
+			// Reporting is intrinsic to a trusted scheduled execution, including its report-only
+			// follow-up. Do not persist a /load or inherit the capability into later human turns.
+			const scheduledReportLoaded = () => {
+				const member = getScheduledRunMember(narratorId);
+				return (
+					!!run?.logicalRunId &&
+					getRunControl(narratorId) === run &&
+					member?.logicalRunId === run.logicalRunId &&
+					!!getScheduledRunById(member.runId)
+				);
+			};
 			const managedOptionalTools = new Set<string>();
 			let toolCandidates: readonly ToolDefinition[] = [];
 			let toolRegistryRevision = toolRegistry.revision;
@@ -1143,6 +1159,7 @@ export async function runAgentLoopUnlocked(
 				if (!profileToolFilter(tool)) return false;
 				if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
 				if (active._disabledTools.has(tool.name)) return false;
+				if (tool.name === "ScheduledTaskReport" && !scheduledReportLoaded()) return false;
 				if (tool.name === "Skill" && active._blockedSkills.all) return false;
 				if (tool.name === "WebSearch" && shouldUseNativeSearch(identity.provider, identity.model))
 					return false;
@@ -1167,13 +1184,23 @@ export async function runAgentLoopUnlocked(
 				if (OPTIONAL_TOOLS.has(tool.name)) return managedOptionalTools.has(tool.name);
 				return active._narratorKind !== "knowledge" || !KNOWLEDGE_KIND_DENY_CORE.has(tool.name);
 			};
-			const toolLoadingInput = (identity: RequestModelIdentity) => ({
-				// Freeze one request's derivation; live active membership is only for execution.
-				managed: new Set(managedOptionalTools),
-				current: new Set(active._enabledOptionalTools),
-				candidates: toolCandidates.filter((tool) => requestToolAllowed(tool, identity)),
-				registryRevision: toolRegistryRevision,
-			});
+			const toolLoadingInput = (identity: RequestModelIdentity) => {
+				const candidates = toolCandidates.filter((tool) => requestToolAllowed(tool, identity));
+				// Reused sessions may have an immutable prefix that predates the report tool.
+				// The host-required set is already narrowed by every capability gate above.
+				const required = new Set(
+					candidates
+						.filter((tool) => tool.name === "ScheduledTaskReport" && scheduledReportLoaded())
+						.map((tool) => tool.name),
+				);
+				return {
+					managed: new Set(managedOptionalTools),
+					current: new Set([...active._enabledOptionalTools, ...required]),
+					required,
+					candidates,
+					registryRevision: toolRegistryRevision,
+				};
+			};
 
 			// Preserve the original signed array. buildRuntimeHistory drops the placement under
 			// this run's destination on its detached model projection only; both freshness
@@ -2116,7 +2143,10 @@ export async function runAgentLoopUnlocked(
 				),
 				toolLoading: preparedHistory.toolLoading,
 				toolCandidates: preparedHistory.toolCandidates,
-				isToolLoaded: (name) => active._enabledOptionalTools.has(name),
+				isToolLoaded: (name) =>
+					name === "ScheduledTaskReport"
+						? scheduledReportLoaded()
+						: active._enabledOptionalTools.has(name),
 				toolFilter: (tool) =>
 					requestToolAllowed(tool, {
 						model: config.model,

@@ -259,43 +259,41 @@ describe("ScheduledTask trusted policy and provenance", () => {
 	});
 
 	test("all mutations need a fresh session approval even in bypass mode", () => {
-		for (const toolName of ["ScheduledTask", "ScheduledTaskAdmin"]) {
-			for (const action of [
-				"create",
-				"update",
-				"enable",
-				"disable",
-				"delete",
-				"run_now",
-				"unknown_action",
-			]) {
-				expect(
-					resolvePermissionDecision({
-						toolName,
-						input: { action },
-						permMode: "bypassPermissions",
-						cwd: process.cwd(),
-					}),
-				).toBe("ask");
-				for (const permMode of ["readOnly", "dontAsk"] as const)
-					expect(
-						resolvePermissionDecision({
-							toolName,
-							input: { action },
-							permMode,
-							cwd: process.cwd(),
-						}),
-					).toBe("deny");
-			}
+		for (const action of [
+			"create",
+			"update",
+			"enable",
+			"disable",
+			"delete",
+			"run_now",
+			"unknown_action",
+		]) {
 			expect(
 				resolvePermissionDecision({
-					toolName,
-					input: { action: "preview" },
-					permMode: "readOnly",
+					toolName: "ScheduledTask",
+					input: { action },
+					permMode: "bypassPermissions",
 					cwd: process.cwd(),
 				}),
-			).toBe("allow");
+			).toBe("ask");
+			for (const permMode of ["readOnly", "dontAsk"] as const)
+				expect(
+					resolvePermissionDecision({
+						toolName: "ScheduledTask",
+						input: { action },
+						permMode,
+						cwd: process.cwd(),
+					}),
+				).toBe("deny");
 		}
+		expect(
+			resolvePermissionDecision({
+				toolName: "ScheduledTask",
+				input: { action: "preview" },
+				permMode: "readOnly",
+				cwd: process.cwd(),
+			}),
+		).toBe("allow");
 	});
 
 	test("narrator deny rules cannot be erased by scheduling a fresh session", async () => {

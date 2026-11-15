@@ -234,17 +234,6 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
-		id: "scheduled_task_admin",
-		type: "tool",
-		category: "tools",
-		tool: {
-			toolName: "ScheduledTaskAdmin",
-			descriptionEn:
-				"Deprecated admin compatibility alias — use ScheduledTask instead; live administrator checks remain required",
-			descriptionZh: "旧版管理员兼容入口 — 已由 ScheduledTask 取代，仍实时校验管理员身份",
-		},
-	},
-	{
 		id: "knowledge_create",
 		type: "tool",
 		category: "tools",

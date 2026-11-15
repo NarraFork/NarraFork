@@ -202,7 +202,7 @@ export function snapshotToolDefinitions(
 
 export type PrefixToolInput = Pick<
 	ReconcileEpochInput,
-	"managed" | "current" | "candidates" | "registryRevision" | "prompt"
+	"managed" | "current" | "required" | "candidates" | "registryRevision" | "prompt"
 >;
 
 export interface ReconciledEpoch {
@@ -219,6 +219,8 @@ export interface ReconcileEpochInput {
 	messages: readonly DbMessage[];
 	managed: ReadonlySet<string>;
 	current: Iterable<string>;
+	/** Host-required tools for this run, already filtered by live capability ceilings. */
+	required?: ReadonlySet<string>;
 	candidates?: readonly ToolDefinition[];
 	registryRevision?: string;
 	model: string;
@@ -368,13 +370,28 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 		epoch?.prefix && profile && !targetChanged && !profileChanged
 			? undeclaredExplicitLoads(messages, managed, current, epoch, candidates)
 			: [];
+	// A runtime-owned tool (e.g. the current scheduled run's report) cannot depend on
+	// ToolSearch: a report-only follow-up is expressly forbidden to call it. Publish a
+	// new baseline once when required tools are absent; never mutate the old prefix.
+	const declaredTools = new Set(epoch?.baseToolNames ?? epoch?.toolNames ?? []);
+	const missingRequired = epoch
+		? candidates
+				.filter(
+					(tool) =>
+						input.required?.has(tool.name) &&
+						(!managed.has(tool.name) || current.has(tool.name)) &&
+						!declaredTools.has(tool.name),
+				)
+				.map((tool) => tool.name)
+		: [];
+	const mustDeclareTools = pendingLoads.length > 0 || missingRequired.length > 0;
 	let changed = false;
 	let opened = false;
 	if (
 		!epoch ||
 		targetChanged ||
 		profileChanged ||
-		pendingLoads.length > 0 ||
+		mustDeclareTools ||
 		(input.prompt && !epoch.prefix)
 	) {
 		const baseCandidates = candidates.filter(
@@ -406,7 +423,7 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 			reason:
 				targetChanged || profileChanged
 					? "target"
-					: pendingLoads.length > 0
+					: mustDeclareTools
 						? "tools"
 						: epoch?.reason === "compact"
 							? "compact"

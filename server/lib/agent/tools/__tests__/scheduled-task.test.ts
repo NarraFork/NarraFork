@@ -1,11 +1,17 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { db } from "@server/db";
+import { users } from "@server/db/schema";
+import { eq } from "drizzle-orm";
+import { scheduledTaskService } from "../../../../services/scheduled-task-service";
 import { summarizeSubagentToolCall } from "../../../../services/subagent-activity";
+import { ADMIN_ONLY_LOAD_TOOLS } from "../../../../services/tool-load-markers";
 import { getBuiltinRoutine, getBuiltinToolNames } from "../../../builtin-routines";
+import { toolRegistry } from "../../tool-registry";
 import { OPTIONAL_TOOLS } from "../index";
 import { scheduledTaskTool } from "../scheduled-task";
 import { isScheduledTaskReadAction, SCHEDULED_TASK_ACTIONS } from "../scheduled-task-actions";
-import { previewScheduledTask } from "../scheduled-task-policy";
-import { caller } from "./scheduled-task-fixtures";
+import { previewScheduledTask, resolveScheduledTaskApproval } from "../scheduled-task-policy";
+import { caller, dailyTask, taskFor } from "./scheduled-task-fixtures";
 
 describe("ScheduledTask registration", () => {
 	test("is optional and off by default", () => {
@@ -15,6 +21,15 @@ describe("ScheduledTask registration", () => {
 		if (!routine?.tool) throw new Error("scheduled_task routine is missing its tool definition");
 		expect(getBuiltinToolNames(routine.tool)).toEqual(["ScheduledTask"]);
 		expect(OPTIONAL_TOOLS.has("ScheduledTask")).toBe(true);
+	});
+
+	test("removes the redundant admin tool without restricting the unified tool's loading", () => {
+		expect(toolRegistry.get("ScheduledTask")).toBe(scheduledTaskTool);
+		expect(toolRegistry.get("ScheduledTaskAdmin")).toBeUndefined();
+		expect(OPTIONAL_TOOLS.has("ScheduledTaskAdmin")).toBe(false);
+		expect(getBuiltinRoutine("scheduled_task_admin")).toBeUndefined();
+		expect(ADMIN_ONLY_LOAD_TOOLS.has("ScheduledTaskAdmin")).toBe(false);
+		expect(ADMIN_ONLY_LOAD_TOOLS.has("ScheduledTask")).toBe(false);
 	});
 
 	/**
@@ -58,6 +73,19 @@ describe("ScheduledTask argument validation", () => {
 		const result = await run({ action: "purge" });
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("Invalid ScheduledTask arguments");
+	});
+
+	test("rejects retired admin action aliases and flat create fields before IO", async () => {
+		for (const action of ["toggle", "run"]) {
+			const result = await run({ action, id: "t1", enabled: true });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Invalid ScheduledTask arguments");
+		}
+		const result = await run({ action: "create", ...dailyTask });
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain(
+			"create requires task.name, task.prompt, task.schedule or task.cronExpr",
+		);
 	});
 
 	test("requires an id for id-based actions", async () => {
@@ -136,6 +164,123 @@ describe("ScheduledTask argument validation", () => {
 		});
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("Invalid ScheduledTask arguments");
+	});
+});
+
+describe("ScheduledTask unified administrator ACL", () => {
+	test("an administrator can read another owner's private task without list prompt leakage", async () => {
+		const admin = await caller("admin");
+		const owner = await caller();
+		const task = await taskFor(owner);
+		const listing = await scheduledTaskTool.execute({ action: "list" }, admin.ctx);
+		expect(listing.isError).toBeFalsy();
+		const payload = JSON.parse(listing.output);
+		expect(payload.tasks.some((row: { id: string }) => row.id === task.id)).toBe(true);
+		expect(payload.truncated).toBe(false);
+		expect(listing.output).not.toContain("PRIVATE_TASK_PROMPT");
+		expect(listing.output).not.toContain("PRIVATE_SYSTEM_PROMPT");
+		for (const action of ["get", "runs"])
+			expect(
+				(await scheduledTaskTool.execute({ action, id: task.id }, admin.ctx)).isError,
+			).toBeFalsy();
+	});
+
+	test("administrator creation uses the same structured input and current owner identity", async () => {
+		const admin = await caller("admin");
+		const approved = await resolveScheduledTaskApproval(admin.ctx, {
+			action: "create",
+			task: dailyTask,
+		});
+		const result = await scheduledTaskTool.execute(approved.input, admin.ctx);
+		expect(result.isError).toBeFalsy();
+		const task = JSON.parse(result.output);
+		expect(task.ownerUserId).toBe(admin.userId);
+		expect(task.permissionMode).toBe("default");
+	});
+
+	test.each([
+		"update",
+		"enable",
+		"disable",
+		"delete",
+		"run_now",
+	])("an administrator can %s another owner's task through the unified tool", async (action) => {
+		const admin = await caller("admin");
+		const owner = await caller();
+		const task = await taskFor(owner);
+		const approved = await resolveScheduledTaskApproval(admin.ctx, {
+			action,
+			id: task.id,
+			...(action === "update" ? { task: { name: "Admin reviewed name" } } : {}),
+		});
+		const run =
+			action === "run_now"
+				? spyOn(scheduledTaskService, "runTask").mockResolvedValue(undefined)
+				: undefined;
+		try {
+			const result = await scheduledTaskTool.execute(approved.input, admin.ctx);
+			expect(result.isError).toBeFalsy();
+			if (action === "run_now") {
+				expect(run).toHaveBeenCalledWith(task.id, {
+					manual: true,
+					principal: admin.principal,
+					expectedUpdatedAt: task.updatedAt,
+				});
+				expect(result.title).toContain("not task completion");
+			} else {
+				const saved = await scheduledTaskService.get(task.id);
+				if (action === "delete") expect(saved).toBeUndefined();
+				else {
+					expect(saved?.ownerUserId).toBe(owner.userId);
+					if (action === "update") expect(saved?.name).toBe("Admin reviewed name");
+					else expect(saved?.enabled).toBe(action === "enable");
+				}
+			}
+		} finally {
+			run?.mockRestore();
+		}
+	});
+
+	test("demotion rejects stale cross-owner approvals and reads but preserves owner rights", async () => {
+		const admin = await caller("admin");
+		const owner = await caller();
+		const own = await taskFor(admin);
+		const foreign = await taskFor(owner);
+		const ownApproval = await resolveScheduledTaskApproval(admin.ctx, {
+			action: "disable",
+			id: own.id,
+		});
+		const foreignApprovals = await Promise.all(
+			["get", "runs", "update", "enable", "disable", "delete", "run_now"].map((action) =>
+				resolveScheduledTaskApproval(admin.ctx, {
+					action,
+					id: foreign.id,
+					...(action === "update" ? { task: { name: "No longer authorized" } } : {}),
+				}),
+			),
+		);
+		await db.update(users).set({ role: "user" }).where(eq(users.id, admin.userId));
+		const run = spyOn(scheduledTaskService, "runTask").mockResolvedValue(undefined);
+		try {
+			for (const approved of foreignApprovals) {
+				const result = await scheduledTaskTool.execute(approved.input, admin.ctx);
+				expect(result.isError).toBe(true);
+			}
+			expect(run).not.toHaveBeenCalled();
+			expect(await scheduledTaskService.get(foreign.id)).toMatchObject({
+				ownerUserId: owner.userId,
+				name: dailyTask.name,
+				enabled: true,
+			});
+			const listing = await scheduledTaskTool.execute({ action: "list" }, admin.ctx);
+			expect(listing.isError).toBeFalsy();
+			expect(listing.output).toContain(own.id);
+			expect(listing.output).not.toContain(foreign.id);
+			expect((await scheduledTaskTool.execute(ownApproval.input, admin.ctx)).isError).toBeFalsy();
+			expect((await scheduledTaskService.get(own.id))?.enabled).toBe(false);
+		} finally {
+			run.mockRestore();
+		}
 	});
 });
 

@@ -1102,7 +1102,7 @@ export function resolvePermissionDecision(
 	// below them a mutation would be auto-allowed and the classification would never
 	// run. An unclassified action is treated as mutating so a future action stays gated
 	// until it is listed as a read.
-	if (toolName === "ScheduledTask" || toolName === "ScheduledTaskAdmin") {
+	if (toolName === "ScheduledTask") {
 		if (isScheduledTaskReadAction(input.action)) return "allow";
 		if (effectiveMode === "readOnly" || effectiveMode === "dontAsk") return "deny";
 		return "ask";
@@ -1341,8 +1341,7 @@ const READ_ONLY_TOOLS = [
  */
 function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
 	if (toolName === "ScheduledTaskReport") return true;
-	if (toolName === "ScheduledTask" || toolName === "ScheduledTaskAdmin")
-		return isScheduledTaskReadAction(input.action);
+	if (toolName === "ScheduledTask") return isScheduledTaskReadAction(input.action);
 	if (READ_ONLY_TOOLS.includes(toolName)) return true;
 	if (toolName === "Notification") return input.action === "list_channels";
 	if (toolName === "GenUI") return isGenUiReadAction(input.action);
@@ -5059,9 +5058,7 @@ export async function recheckFinalToolExecutionPermission(
 					analysis.nonWhitelisted.length > 0 ||
 					analysis.dangerousPatterns.length > 0 ||
 					analysis.hasEnvInjection)) ||
-			(["GenUI", "Notification", "ScheduledTask", "ScheduledTaskAdmin", "Worktree"].includes(
-				check.toolName,
-			) &&
+			(["GenUI", "Notification", "ScheduledTask", "Worktree"].includes(check.toolName) &&
 				!isReadOnlyCall(check.toolName, check.input)))
 	)
 		finalPermissionDeny("read-only capability ceiling");
@@ -5118,7 +5115,7 @@ export async function recheckFinalToolExecutionPermission(
 		((scheduled.onBlocked === "auto" &&
 			check.toolName === "ExitPlanMode" &&
 			isPlanModeTrait(before.narrator.traits)) ||
-			(["ScheduledTask", "ScheduledTaskAdmin"].includes(check.toolName) &&
+			(check.toolName === "ScheduledTask" &&
 				check.input.action === "disable" &&
 				check.input.id === scheduled.taskId));
 	if (
@@ -5640,7 +5637,7 @@ export async function handlePermission(
 		}
 	}
 
-	if (toolName === "ScheduledTask" || toolName === "ScheduledTaskAdmin") {
+	if (toolName === "ScheduledTask") {
 		try {
 			const { resolveScheduledTaskApproval } = await import(
 				"../lib/agent/tools/scheduled-task-policy"
@@ -5653,7 +5650,6 @@ export async function handlePermission(
 					locale,
 				},
 				effectiveInput,
-				toolName,
 			);
 			effectiveInput = resolved.input;
 		} catch (error) {
@@ -6004,7 +6000,7 @@ export async function handlePermission(
 	if (scheduledRun && !runtimeConstraint) {
 		const selfDisable =
 			decision === "ask" &&
-			["ScheduledTask", "ScheduledTaskAdmin"].includes(toolName) &&
+			toolName === "ScheduledTask" &&
 			effectiveInput.action === "disable" &&
 			effectiveInput.id === scheduledRun.taskId;
 		const automated = selfDisable

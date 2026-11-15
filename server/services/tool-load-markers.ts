@@ -8,7 +8,6 @@ export const ADMIN_ONLY_LOAD_TOOLS = new Set([
 	"PluginInstall",
 	"McpAdmin",
 	"HookAdmin",
-	"ScheduledTaskAdmin",
 ]);
 
 /** Loading is not an authorization grant: recheck the acting user's current role. */

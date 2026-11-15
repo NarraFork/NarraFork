@@ -104,6 +104,10 @@ beforeEach(() => {
 	});
 	install("window", window);
 	install("document", window.document);
+	Object.defineProperty(window.document, "fonts", {
+		configurable: true,
+		value: { addEventListener() {}, removeEventListener() {} },
+	});
 	install("navigator", window.navigator);
 	install("HTMLElement", window.HTMLElement);
 	install("HTMLInputElement", window.HTMLInputElement);

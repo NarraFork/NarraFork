@@ -14,7 +14,6 @@ import {
 	resolveScheduledTaskApproval,
 } from "./scheduled-task-policy";
 import {
-	normalizeScheduledTaskInput,
 	scheduledTaskParametersSchema,
 	validateScheduledTaskArguments,
 } from "./scheduled-task-schema";
@@ -26,17 +25,13 @@ function jsonOut(title: string, value: unknown): ToolResult {
 /** The framework asks before EVERY mutation, including bypassPermissions sessions.
  * Execution re-resolves identity, ACL and delegation boundaries; approval is not a capability grant.
  */
-export async function executeScheduledTask(
+async function executeScheduledTask(
 	args: Record<string, unknown>,
 	ctx: ToolContext,
-	toolName: "ScheduledTask" | "ScheduledTaskAdmin" = "ScheduledTask",
 ): Promise<ToolResult> {
 	try {
-		const input = normalizeScheduledTaskInput(args, toolName === "ScheduledTaskAdmin");
-		// toggle needs the live, ACL-checked row. All other invalid shapes fail before IO.
-		if (input.action !== "toggle")
-			validateScheduledTaskArguments(scheduledTaskParametersSchema.parse(input));
-		const resolved = await resolveScheduledTaskApproval(ctx, args, toolName);
+		validateScheduledTaskArguments(scheduledTaskParametersSchema.parse(args));
+		const resolved = await resolveScheduledTaskApproval(ctx, args);
 		const { action, id, task, limit, cursor, filters } = scheduledTaskParametersSchema.parse(
 			resolved.input,
 		);
@@ -63,7 +58,7 @@ export async function executeScheduledTask(
 		const recheckMutation = async () => {
 			await ctx.recheckAuthorization?.();
 			ctx.signal.throwIfAborted();
-			const live = await resolveScheduledTaskApproval(ctx, resolved.input, toolName);
+			const live = await resolveScheduledTaskApproval(ctx, resolved.input);
 			assertScheduledTaskApprovalFresh(resolved.input, live.approval);
 			ctx.signal.throwIfAborted();
 			ctx.assertFinalExecutionPermission?.();
@@ -148,7 +143,7 @@ export async function executeScheduledTask(
 			output:
 				error instanceof z.ZodError
 					? `Invalid ScheduledTask arguments: ${error.message}`
-					: `${toolName} failed: ${error instanceof Error ? error.message : String(error)}`,
+					: `ScheduledTask failed: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
 }
