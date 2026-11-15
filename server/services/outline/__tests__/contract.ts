@@ -2202,7 +2202,7 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 	{
 		name: "randomized: every seq's tree rebuilt from versions equals the model",
 		async run(ctx) {
-			for (const seed of [1, 2, 3, 4242, 5074, 6028, 6048, 6106])
+			for (const seed of [1, 2, 3, 449, 4242, 5074, 6028, 6048, 6106])
 				await randomizedHistory(ctx, seed);
 		},
 	},

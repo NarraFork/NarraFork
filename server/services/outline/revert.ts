@@ -105,6 +105,8 @@ export interface OutlineRevertOptions {
 }
 
 const DEFAULT_ATTEMPTS = 5;
+/** Passes over a revert's blocks spent on freeing order keys before they are taken back. */
+const KEY_ORDER_ROUNDS = 16;
 
 type Action = "restore" | "update" | "delete";
 
@@ -325,6 +327,76 @@ class RevertAnalysis {
 		return true;
 	}
 
+	/**
+	 * `ordered` (ancestors first) with a block that sits on an order key another one goes back
+	 * to moved away first, where the tree allows it: otherwise the one going back finds its key
+	 * taken, is placed after the holder, and the siblings end in another order than before the
+	 * commit. Keys held in a ring (two blocks that swapped places) cannot all be freed first: one
+	 * of them is placed next to its holder, which keeps the order, with a note about the key.
+	 */
+	private keyHoldersFirst(ordered: Target[]): Target[] {
+		const slot = (parentId: string | null, orderKey: string) =>
+			`${parentId ?? ""}\u0000${orderKey}`;
+		const wanted = (t: Target) => {
+			const before = t.prev as OutlineVersionRow;
+			return slot(before.parentId, before.orderKey);
+		};
+		const moves = (t: Target) =>
+			t.meta.deleted || wanted(t) !== slot(t.meta.parentId, t.meta.orderKey);
+		/** Slots held now by blocks that are about to leave them. */
+		const held = new Map<string, string>();
+		for (const t of ordered) {
+			if (!t.meta.deleted && moves(t)) held.set(slot(t.meta.parentId, t.meta.orderKey), t.id);
+		}
+		const waits = (t: Target) => {
+			const holder = held.get(wanted(t));
+			return moves(t) && holder !== undefined && holder !== t.id;
+		};
+		if (!ordered.some(waits)) return ordered;
+
+		const pending = new Map(ordered.map((t) => [t.id, t]));
+		const parentNow = new Map<string, string | null>();
+		const parentOf = (id: string) =>
+			parentNow.has(id) ? (parentNow.get(id) ?? null) : (this.metas.get(id)?.parentId ?? null);
+		/** Whether the block can go back now: its old parent is live and not inside it. */
+		const ready = (t: Target) => {
+			const parentId = (t.prev as OutlineVersionRow).parentId;
+			if (parentId === null) return true;
+			if (pending.get(parentId)?.meta.deleted) return false;
+			if (t.meta.deleted) return true;
+			let current: string | null = parentId;
+			for (let depth = 0; current !== null; depth++) {
+				if (current === t.id || depth > OUTLINE_LIMITS.maxDepth) return false;
+				current = parentOf(current);
+			}
+			return true;
+		};
+		const out: Target[] = [];
+		const place = (t: Target) => {
+			pending.delete(t.id);
+			parentNow.set(t.id, (t.prev as OutlineVersionRow).parentId);
+			const own = slot(t.meta.parentId, t.meta.orderKey);
+			if (held.get(own) === t.id) held.delete(own);
+			out.push(t);
+		};
+		// Each round places every block whose key is free; a round that places none places the
+		// first one left, which ancestors-first guarantees can go back. The rounds are bounded:
+		// what is left after them goes in the given order.
+		for (let round = 0; pending.size > 0 && round < KEY_ORDER_ROUNDS; round++) {
+			let placed = false;
+			for (const t of ordered) {
+				if (!pending.has(t.id) || waits(t) || !ready(t)) continue;
+				place(t);
+				placed = true;
+			}
+			if (placed) continue;
+			const first = ordered.find((t) => pending.has(t.id));
+			if (first) place(first);
+		}
+		for (const t of ordered) if (pending.has(t.id)) place(t);
+		return out;
+	}
+
 	private async operations(): Promise<Plan> {
 		const c = this.commit.seq;
 		const active = [...this.targets.values()].filter((t) => this.active(t.id));
@@ -411,7 +483,7 @@ class RevertAnalysis {
 		};
 		for (const t of [...placed].sort((a, b) => (a.id < b.id ? -1 : 1))) visit(t, 0);
 
-		for (const t of ordered) {
+		for (const t of this.keyHoldersFirst(ordered)) {
 			const before = t.prev as OutlineVersionRow;
 			const parent = before.parentId === null ? null : { id: before.parentId };
 			const tags = tagsBefore.get(t.id) ?? [];

@@ -23,7 +23,7 @@ import { searchOutline } from "../search";
 import type { OutlineSpaceRow, OutlineVersionRow } from "../store/port";
 import { OUTLINE_LAST_WRITES_SCAN, OUTLINE_PAGE_HEAD_CHARS } from "../store/read-port";
 import { type OutlineNode, subtreeNodes } from "../tree";
-import type { OutlineOp, OutlineWriteInput, OutlineWriteResult } from "../write";
+import type { OutlineOp, OutlinePosition, OutlineWriteInput, OutlineWriteResult } from "../write";
 import { writeOutline } from "../write";
 import {
 	type ContractCase,
@@ -202,6 +202,269 @@ function checkRevert(
 		expect(now.taskJson).toEqual(p.taskJson);
 		if (!dropped.has(version.blockId)) expect(now.alias).toBe(p.alias);
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Revert fuzz: one random commit on a small random tree, reverted
+// ─────────────────────────────────────────────────────────────────────────────
+
+function fuzzRandom(seed: number): () => number {
+	let a = seed >>> 0;
+	return () => {
+		a = (a + 0x6d2b79f5) >>> 0;
+		let t = a;
+		t = Math.imul(t ^ (t >>> 15), t | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/** The generator's own picture of the tree, to make operations the write accepts. */
+interface FuzzTree {
+	parent: Map<string, string | null>;
+	/** Live children by parent (`""`: top level). */
+	kids: Map<string, string[]>;
+	deleted: Set<string>;
+}
+
+const fuzzKids = (m: FuzzTree, parent: string | null): string[] => {
+	const key = parent ?? "";
+	let list = m.kids.get(key);
+	if (!list) {
+		list = [];
+		m.kids.set(key, list);
+	}
+	return list;
+};
+const fuzzSubtree = (m: FuzzTree, id: string): string[] => [
+	id,
+	...fuzzKids(m, id).flatMap((child) => fuzzSubtree(m, child)),
+];
+const fuzzDepth = (m: FuzzTree, id: string | null): number =>
+	id === null ? 0 : 1 + fuzzDepth(m, m.parent.get(id) ?? null);
+const fuzzHeight = (m: FuzzTree, id: string): number =>
+	1 + Math.max(0, ...fuzzKids(m, id).map((child) => fuzzHeight(m, child)));
+const fuzzPick = <T>(rand: () => number, list: readonly T[]): T =>
+	list[Math.floor(rand() * list.length)] as T;
+
+/** A space with `count` blocks in a random tree; ids in a random order of their own. */
+async function fuzzBuild(ctx: OutlineContractContext, rand: () => number, count: number) {
+	const space = await personalSpace(ctx);
+	const m: FuzzTree = { parent: new Map(), kids: new Map(), deleted: new Set() };
+	const made: string[] = [];
+	const ops: OutlineOp[] = [];
+	const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+	for (let i = 0; i < count; i++) {
+		// The first two characters decide how the ids sort: independent of the insert order.
+		const id = `${digits[Math.floor(rand() * 36)]}${digits[Math.floor(rand() * 36)]}${crypto.randomUUID().replace(/-/g, "")}`;
+		const parent = i === 0 || rand() < 0.2 ? null : fuzzPick(rand, made);
+		ops.push({
+			op: "insert",
+			id,
+			parent: parent ? { id: parent } : null,
+			content: `b${i}`,
+			...(rand() < 0.3 ? { tags: [`T${i % 3}`] } : {}),
+		});
+		made.push(id);
+		m.parent.set(id, parent);
+		fuzzKids(m, parent).push(id);
+	}
+	await write(ctx, space, ops);
+	return { space, m, made };
+}
+
+function fuzzMove(rand: () => number, m: FuzzTree, live: string[]): OutlineOp | null {
+	for (let tries = 0; tries < 20; tries++) {
+		const block = fuzzPick(rand, live);
+		const inside = new Set(fuzzSubtree(m, block));
+		const candidates: Array<string | null> = [null, ...live.filter((id) => !inside.has(id))];
+		const parent = rand() < 0.2 ? null : fuzzPick(rand, candidates);
+		if (parent !== null && fuzzDepth(m, parent) + fuzzHeight(m, block) > 12) continue;
+		const from = fuzzKids(m, m.parent.get(block) ?? null);
+		from.splice(from.indexOf(block), 1);
+		const to = fuzzKids(m, parent);
+		let position: OutlinePosition;
+		const roll = rand();
+		if (to.length === 0 || roll < 0.25) {
+			position = { first: true };
+			to.unshift(block);
+		} else if (roll < 0.5) {
+			position = { last: true };
+			to.push(block);
+		} else {
+			const sibling = fuzzPick(rand, to);
+			if (roll < 0.75) {
+				position = { after: { id: sibling } };
+				to.splice(to.indexOf(sibling) + 1, 0, block);
+			} else {
+				position = { before: { id: sibling } };
+				to.splice(to.indexOf(sibling), 0, block);
+			}
+		}
+		m.parent.set(block, parent);
+		return { op: "move", block: { id: block }, parent: parent ? { id: parent } : null, position };
+	}
+	return null;
+}
+
+/** What a revert must give back, per block, and the sibling order of every parent. */
+function fuzzState(dump: SpaceDump): { blocks: Map<string, string>; order: string } {
+	const blocks = new Map<string, string>();
+	const kids = new Map<string, Array<{ id: string; orderKey: string }>>();
+	for (const b of dump.blocks) {
+		if (b.deleted) {
+			blocks.set(b.id, "deleted");
+			continue;
+		}
+		const tags = dump.links
+			.filter((l) => l.fromBlockId === b.id && l.toSeq === null && l.kind === "tag")
+			.map((l) => l.targetRef)
+			.sort();
+		blocks.set(
+			b.id,
+			JSON.stringify([b.parentId, b.pageId, b.content, b.alias, b.taskJson ?? null, tags]),
+		);
+		const list = kids.get(b.parentId ?? "");
+		if (list) list.push(b);
+		else kids.set(b.parentId ?? "", [b]);
+	}
+	const order = [...kids]
+		.map(
+			([parent, list]) =>
+				`${parent}:${list
+					.sort((x, y) =>
+						x.orderKey < y.orderKey ? -1 : x.orderKey > y.orderKey ? 1 : x.id < y.id ? -1 : 1,
+					)
+					.map((b) => b.id)
+					.join(",")}`,
+		)
+		.sort()
+		.join("|");
+	return { blocks, order };
+}
+
+/** Commit `ops`, check the tables, revert, check again: every block and order as before. */
+async function fuzzCommitAndRevert(
+	ctx: OutlineContractContext,
+	space: OutlineSpaceRow,
+	ops: OutlineOp[],
+	seed: number,
+): Promise<void> {
+	const where = `seed ${seed} ${JSON.stringify(ops)}`;
+	const before = fuzzState(await ctx.dump(space.id));
+	let result: OutlineWriteResult;
+	try {
+		result = await write(ctx, space, ops);
+	} catch (error) {
+		throw new Error(`${where}: the write failed: ${error}`);
+	}
+	const written = await ctx.dump(space.id);
+	try {
+		checkSpaceInvariants(written);
+		checkChangeFlags(written);
+	} catch (error) {
+		throw new Error(`${where}: after the commit: ${error}`);
+	}
+	if (!result.commit) {
+		expect({ where, state: fuzzState(written) }).toEqual({ where, state: before });
+		return;
+	}
+	let back: Awaited<ReturnType<typeof revert>>;
+	try {
+		back = await revert(ctx, result.commit.id);
+	} catch (error) {
+		throw new Error(`${where}: the revert failed: ${error}`);
+	}
+	const after = await ctx.dump(space.id);
+	try {
+		checkSpaceInvariants(after);
+		checkChangeFlags(after);
+	} catch (error) {
+		throw new Error(`${where}: after the revert: ${error}`);
+	}
+	const state = fuzzState(after);
+	// Blocks the commit made are deleted again; the others are as they were.
+	for (const [id, now] of state.blocks) {
+		if (!before.blocks.has(id)) expect({ where, id, now }).toEqual({ where, id, now: "deleted" });
+	}
+	expect({
+		where,
+		skipped: back.skipped.map((s) => s.reason),
+		blocks: [...before.blocks].map(([id]) => [id, state.blocks.get(id)]),
+		order: state.order,
+	}).toEqual({ where, skipped: [], blocks: [...before.blocks], order: before.order });
+}
+
+/** Seeds of the revert fuzz: `count` from 1, and those that once failed. */
+const fuzzSeeds = (count: number, once: readonly number[]) => [
+	...new Set([...Array.from({ length: count }, (_, i) => i + 1), ...once]),
+];
+
+/** One random commit of moves, deletions, restores, inserts and edits, for the revert fuzz. */
+function fuzzMixedOps(
+	rand: () => number,
+	m: FuzzTree,
+	made: string[],
+	seed: number,
+	sameCommit: boolean,
+): OutlineOp[] {
+	const ops: OutlineOp[] = [];
+	const count = 2 + Math.floor(rand() * 5);
+	const deletedNow = new Set<string>();
+	let inserted = 0;
+	for (let i = 0; i < count; i++) {
+		const live = made.filter((id) => !m.deleted.has(id));
+		// With `sameCommit`, a block the commit deleted may be restored by it too.
+		const dead = made.filter((id) => m.deleted.has(id) && (sameCommit || !deletedNow.has(id)));
+		const roll = rand();
+		if (roll < 0.5 && live.length > 1) {
+			const op = fuzzMove(rand, m, live);
+			if (op) ops.push(op);
+		} else if (roll < 0.65 && live.length > 2) {
+			const block = fuzzPick(rand, live);
+			const gone = fuzzSubtree(m, block);
+			const siblings = fuzzKids(m, m.parent.get(block) ?? null);
+			siblings.splice(siblings.indexOf(block), 1);
+			for (const id of gone) {
+				m.deleted.add(id);
+				deletedNow.add(id);
+				m.kids.set(id, []);
+			}
+			ops.push({ op: "delete", block: { id: block } });
+		} else if (roll < 0.8 && dead.length > 0) {
+			const block = fuzzPick(rand, dead);
+			const parent = rand() < 0.2 || live.length === 0 ? null : fuzzPick(rand, live);
+			if (parent !== null && fuzzDepth(m, parent) >= 11) continue;
+			m.deleted.delete(block);
+			m.parent.set(block, parent);
+			fuzzKids(m, parent).push(block);
+			ops.push({
+				op: "restore",
+				block: { id: block },
+				parent: parent ? { id: parent } : null,
+				position: { last: true },
+				...(rand() < 0.4 ? { content: `restored ${seed}` } : {}),
+				...(rand() < 0.3 ? { tags: ["R"] } : {}),
+			});
+		} else if (roll < 0.9 && live.length > 0) {
+			const parent = rand() < 0.2 ? null : fuzzPick(rand, live);
+			if (parent !== null && fuzzDepth(m, parent) >= 11) continue;
+			ops.push({
+				op: "insert",
+				tempId: `t${inserted++}`,
+				parent: parent ? { id: parent } : null,
+				content: "new",
+			});
+		} else if (live.length > 0) {
+			ops.push({
+				op: "update",
+				block: { id: fuzzPick(rand, live) },
+				...(rand() < 0.6 ? { content: `edit ${seed} ${i}` } : {}),
+				tags: rand() < 0.5 ? [] : ["U", "V"],
+			});
+		}
+	}
+	return ops;
 }
 
 export const OUTLINE_READ_CONTRACT: ContractCase[] = [
@@ -1579,6 +1842,51 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 			expect(r4.skipped.map((k) => [k.blockId, k.reason])).toEqual([[y, "cycle"]]);
 			checkSpaceInvariants(await ctx.dump(space.id));
 			checkChangeFlags(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "revert fuzz: a commit of several moves goes back to the same tree and sibling order",
+		async run(ctx) {
+			// 2242, 5557, 6380: a block went back before the one holding its order key had left.
+			for (const seed of fuzzSeeds(300, [2242, 5557, 6380])) {
+				const rand = fuzzRandom(seed);
+				const { space, m, made } = await fuzzBuild(ctx, rand, 4 + Math.floor(rand() * 9));
+				const ops: OutlineOp[] = [];
+				const count = 2 + Math.floor(rand() * 5);
+				for (let i = 0; i < count; i++) {
+					const op = fuzzMove(rand, m, made);
+					if (op) ops.push(op);
+				}
+				await fuzzCommitAndRevert(ctx, space, ops, seed);
+			}
+		},
+	},
+	{
+		name: "revert fuzz: a mixed commit keeps the invariants and goes back to the same tree",
+		async run(ctx) {
+			// 75, 1285, 5619, 6600: tombstones left pointing at each other by a planner shortcut
+			// (never merged) for blocks restored and deleted again by one commit.
+			const seeds = fuzzSeeds(200, [75, 1285, 5619, 6600]);
+			for (const sameCommit of [false, true]) {
+				for (const seed of sameCommit ? seeds.slice(0, 100) : seeds) {
+					const rand = fuzzRandom(seed * 7919);
+					const { space, m, made } = await fuzzBuild(ctx, rand, 6 + Math.floor(rand() * 8));
+					// Some blocks deleted beforehand, for the commit to restore.
+					const deletions = 1 + Math.floor(rand() * 2);
+					for (let i = 0; i < deletions; i++) {
+						const live = made.filter((id) => !m.deleted.has(id));
+						if (live.length < 4) break;
+						const block = fuzzPick(rand, live);
+						const siblings = fuzzKids(m, m.parent.get(block) ?? null);
+						siblings.splice(siblings.indexOf(block), 1);
+						for (const id of fuzzSubtree(m, block)) m.deleted.add(id);
+						await write(ctx, space, [{ op: "delete", block: { id: block } }]);
+					}
+					for (const id of m.deleted) m.kids.set(id, []);
+					const ops = fuzzMixedOps(rand, m, made, seed, sameCommit);
+					if (ops.length > 0) await fuzzCommitAndRevert(ctx, space, ops, seed);
+				}
+			}
 		},
 	},
 	{
