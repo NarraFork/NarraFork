@@ -25,6 +25,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 	outlineLiveLog,
+	outlineLiveUpdates,
 	outlinePending,
 	outlineQuestions,
 	outlineSpaces,
@@ -192,7 +193,7 @@ function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveLogRow {
 	return { ...row, actorKind: row.actorKind as OutlineActorKind };
 }
 
-/** Rows per multi-row INSERT of the live log (8 columns each). */
+/** Rows per multi-row INSERT of the live log (7 columns each). */
 const LIVE_INSERT_CHUNK = 50;
 
 type ViewStateSelect = typeof outlineViewState.$inferSelect;
@@ -1192,6 +1193,14 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				.delete(outlineLiveLog)
 				.where(and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)))
 				.returning({ seq: outlineLiveLog.seq });
+			return rows.length;
+		},
+
+		async countLegacyLiveUpdates(limit) {
+			const rows = await db
+				.select({ seq: outlineLiveUpdates.seq })
+				.from(outlineLiveUpdates)
+				.limit(limit);
 			return rows.length;
 		},
 

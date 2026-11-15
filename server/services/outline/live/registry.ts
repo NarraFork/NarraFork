@@ -37,6 +37,7 @@ import {
 	type LiveCloseCode,
 	type LiveFrame,
 	type LiveJoinHead,
+	type LiveLostWire,
 	type LivePresenceUp,
 	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_PROTOCOL_VERSION,
@@ -78,10 +79,10 @@ export const OUTLINE_LIVE_SOCKET_BOUNDS = {
 	recoveredMs: 7 * 24 * 60 * 60_000,
 	recoveredSessions: 1_000,
 	/** Ended sessions of one space whose client positions the log keeps. */
-	endedPerPage: 32,
+	endedPerSpace: 32,
 	/**
-	 * Blocks all sessions of the process hold in their mirrors at most (about 190 bytes each,
-	 * measured): a join that needs a page loaded past it is refused (`unavailable`).
+	 * Blocks all sessions of the process hold in their mirrors at most: a join whose page, once
+	 * read, would take them past it is refused (`unavailable`).
 	 */
 	processBlocks: 200_000,
 	/** Leftover epochs one open replays at most (the rest wait for the startup job). */
@@ -107,7 +108,10 @@ const state = hotSafe("narrafork.outlineLive.state", () => ({
 	 * `${spaceId}:${epoch}` of an ended session → client key → highest transaction in the space.
 	 * A cache of the log's epoch-0 rows (`recordEnded`).
 	 */
-	recovered: new Map<string, { at: number; keys: Map<string, number> }>(),
+	recovered: new Map<
+		string,
+		{ at: number; keys: Map<string, number>; lost: Map<string, LiveLostWire[]> }
+	>(),
 	/** Epochs whose log cannot be read, so opens do not read them again (an operator's job). */
 	unreadable: new Set<string>(),
 	/** Join tokens per socket. */
@@ -123,13 +127,20 @@ const state = hotSafe("narrafork.outlineLive.state", () => ({
  */
 export const ENDED_EPOCH = 0;
 
-function cacheRecovered(spaceId: string, epoch: number, keys: Map<string, number>): void {
+type LostByKey = Map<string, LiveLostWire[]>;
+
+function cacheRecovered(
+	spaceId: string,
+	epoch: number,
+	keys: Map<string, number>,
+	lost: LostByKey = new Map(),
+): void {
 	const now = Date.now();
 	for (const [key, entry] of state.recovered) {
 		if (now - entry.at <= OUTLINE_LIVE_SOCKET_BOUNDS.recoveredMs) break;
 		state.recovered.delete(key);
 	}
-	state.recovered.set(`${spaceId}:${epoch}`, { at: now, keys });
+	state.recovered.set(`${spaceId}:${epoch}`, { at: now, keys, lost });
 	while (state.recovered.size > OUTLINE_LIVE_SOCKET_BOUNDS.recoveredSessions) {
 		const oldest = state.recovered.keys().next().value;
 		if (oldest === undefined) break;
@@ -146,24 +157,30 @@ async function recordEnded(
 	spaceId: string,
 	epoch: number,
 	keys: Map<string, number>,
+	/** Text of clients' transactions the session did not take and had not told them of. */
+	lost: LostByKey = new Map(),
 ): Promise<void> {
 	if (keys.size === 0) return;
-	cacheRecovered(spaceId, epoch, keys);
+	cacheRecovered(spaceId, epoch, keys, lost);
 	try {
 		const rows = (
 			await outlineStore.listLiveLog(spaceId, ENDED_EPOCH, {
-				limit: 2 * OUTLINE_LIVE_SOCKET_BOUNDS.endedPerPage,
+				limit: 2 * OUTLINE_LIVE_SOCKET_BOUNDS.endedPerSpace,
 			})
 		)
 			.filter((r) => r.seq !== epoch && fresh(r.createdAt))
 			.sort((x, y) => (x.createdAt < y.createdAt ? 1 : -1))
-			.slice(0, OUTLINE_LIVE_SOCKET_BOUNDS.endedPerPage - 1);
+			.slice(0, OUTLINE_LIVE_SOCKET_BOUNDS.endedPerSpace - 1);
 		rows.push({
 			spaceId,
 			epoch: ENDED_EPOCH,
 			seq: epoch,
-			blockId: null,
-			updateB64: Buffer.from(JSON.stringify({ k: Object.fromEntries(keys) })).toString("base64"),
+			updateB64: Buffer.from(
+				JSON.stringify({
+					k: Object.fromEntries(keys),
+					...(lost.size > 0 ? { x: Object.fromEntries(lost) } : {}),
+				}),
+			).toString("base64"),
 			actorKind: "system",
 			actorId: LIVE_SYNC_ACTOR,
 			createdAt: new Date().toISOString(),
@@ -178,13 +195,19 @@ async function recordEnded(
 	}
 }
 
-/** Of a client's earlier session of a space (now ended), its transactions the space has. */
-async function endedTx(spaceId: string, head: LiveJoinHead): Promise<number | undefined> {
+/**
+ * Of a client's earlier session of a space (now ended): its transactions the space has, and
+ * what of them was not taken that it was never told of.
+ */
+async function endedTx(
+	spaceId: string,
+	head: LiveJoinHead,
+): Promise<{ tx: number | undefined; lost: LiveLostWire[] } | undefined> {
 	const epoch = head.resume?.epoch;
 	if (epoch === undefined || epoch <= ENDED_EPOCH) return undefined;
 	const entry = state.recovered.get(`${spaceId}:${epoch}`);
 	if (entry && Date.now() - entry.at <= OUTLINE_LIVE_SOCKET_BOUNDS.recoveredMs)
-		return entry.keys.get(head.key);
+		return { tx: entry.keys.get(head.key), lost: entry.lost.get(head.key) ?? [] };
 	const [row] = await outlineStore.listLiveLog(spaceId, ENDED_EPOCH, {
 		afterSeq: epoch - 1,
 		limit: 1,
@@ -193,12 +216,16 @@ async function endedTx(spaceId: string, head: LiveJoinHead): Promise<number | un
 	try {
 		const parsed = JSON.parse(Buffer.from(row.updateB64, "base64").toString("utf8")) as {
 			k?: Record<string, number>;
+			x?: Record<string, LiveLostWire[]>;
 		};
 		const keys = new Map(
 			Object.entries(parsed.k ?? {}).filter(([, tx]) => Number.isSafeInteger(tx)),
 		);
-		cacheRecovered(spaceId, epoch, keys);
-		return keys.get(head.key);
+		const lost: LostByKey = new Map(
+			Object.entries(parsed.x ?? {}).filter(([, list]) => Array.isArray(list)),
+		);
+		cacheRecovered(spaceId, epoch, keys, lost);
+		return { tx: keys.get(head.key), lost: lost.get(head.key) ?? [] };
 	} catch {
 		return undefined;
 	}
@@ -207,7 +234,7 @@ async function endedTx(spaceId: string, head: LiveJoinHead): Promise<number | un
 /** Drop the ended-session rows of a space that are past keeping (the startup job). */
 async function pruneEnded(spaceId: string): Promise<void> {
 	const rows = await outlineStore.listLiveLog(spaceId, ENDED_EPOCH, {
-		limit: 2 * OUTLINE_LIVE_SOCKET_BOUNDS.endedPerPage,
+		limit: 2 * OUTLINE_LIVE_SOCKET_BOUNDS.endedPerSpace,
 	});
 	const keep = rows.filter((r) => fresh(r.createdAt));
 	if (keep.length === rows.length) return;
@@ -395,6 +422,8 @@ async function openSession(space: OutlineSpaceRow): Promise<LiveSpace> {
 		space.id,
 		(task) => void lane.run(task),
 		(session, code, idle) => void lane.run(() => closeSession(session, code, idle)),
+		// What the process may still load: checked with the size of the tree just read.
+		() => OUTLINE_LIVE_SOCKET_BOUNDS.processBlocks - loadedBlocks(),
 	);
 	state.sessions.set(space.id, opened);
 	state.spaces.set(space.id, space);
@@ -431,7 +460,12 @@ async function closeSession(session: LiveSpace, code: LiveCloseCode, idle = fals
 			if (binding.space === session) bindings.delete(handle);
 	}
 	await session.close(code);
-	await recordEnded(session.spaceId, session.epoch, session.durableKeys(session.closedClean));
+	await recordEnded(
+		session.spaceId,
+		session.epoch,
+		session.durableKeys(session.closedClean),
+		session.lostUntold,
+	);
 	if (state.sessions.get(session.spaceId) === session) state.sessions.delete(session.spaceId);
 	retireLane(session.spaceId);
 }
@@ -501,11 +535,7 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 			if (socket.closed) return { refused: "ended" as LiveCloseCode };
 			const session = await openSession(space);
 			// A page that would have to be loaded: the process's bounds first.
-			if (
-				!session.scopes.has(head.page) &&
-				(scopeCount() >= OUTLINE_LIVE_LIMITS.livePages ||
-					loadedBlocks() >= OUTLINE_LIVE_SOCKET_BOUNDS.processBlocks)
-			) {
+			if (!session.scopes.has(head.page) && scopeCount() >= OUTLINE_LIVE_LIMITS.livePages) {
 				if (session.scopes.size === 0 && session.participants.size === 0)
 					await closeSession(session, "ended", true);
 				return { refused: "unavailable" as LiveCloseCode };
@@ -520,7 +550,8 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 				head,
 				frame.body,
 				head.mode === "edit" && canWrite,
-				ended,
+				ended?.tx,
+				ended?.lost,
 			);
 			if ("refused" in joined) {
 				// A session opened for a join that came to nothing does not stay.
@@ -729,10 +760,30 @@ export async function persistAllLiveSessions(): Promise<void> {
 }
 
 /**
+ * The log table of before a space had one session (`outline_live_updates`) is not read any
+ * more. Rows in it are what a crash right before the upgrade left uncommitted (a clean shutdown
+ * leaves none): said once at startup, with how many (counted up to a bound), so an operator
+ * knows text may be in there. The table and this warning go with the page-keyed storage (X2).
+ */
+async function warnOfLegacyLog(): Promise<void> {
+	try {
+		const rows = await outlineStore.countLegacyLiveUpdates(1001);
+		if (rows > 0)
+			logger.warn(
+				"Outline: outline_live_updates holds rows of live sessions that ended without committing before the upgrade; they are not replayed",
+				{ rows: rows > 1000 ? "more than 1000" : rows },
+			);
+	} catch (error) {
+		logger.warn("Outline legacy live log could not be counted", { error: String(error) });
+	}
+}
+
+/**
  * Replay what earlier sessions left in the log (the startup job). One run per process; later
  * calls return the same promise.
  */
 export function startLiveReplay(): Promise<unknown> {
+	if (!state.replayDone) void warnOfLegacyLog();
 	state.replayDone ??= replayAllLiveEpochs(
 		(spaceId, epoch) => state.sessions.get(spaceId)?.epoch === epoch,
 		async (spaceId, epoch) => {

@@ -1937,8 +1937,6 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				spaceId: page,
 				epoch,
 				seq,
-				// A row of one block names it; the others (snapshots, bookkeeping) do not.
-				blockId: seq % 2 === 0 ? `block-${seq}` : null,
 				updateB64: Buffer.from(`update ${page} ${epoch} ${seq}`).toString("base64"),
 				actorKind: "human" as const,
 				actorId: "user-contract",
@@ -1989,6 +1987,10 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 			expect(await ctx.store.deleteLiveLog(one, 9)).toBe(1);
 			expect(await ctx.store.deleteLiveLog(two, 3)).toBe(2);
 			expect(ours(await ctx.store.listLiveLogEpochs({ limit: 10_000 }))).toEqual([]);
+			// The table of before (no longer written): counted up to the bound given.
+			const legacy = await ctx.store.countLegacyLiveUpdates(5);
+			expect(legacy).toBeGreaterThanOrEqual(0);
+			expect(legacy).toBeLessThanOrEqual(5);
 		},
 	},
 	{

@@ -6320,10 +6320,10 @@ export const outlineLiveUpdates = sqliteTable(
  * entries of the blocks people typed in and the session's bookkeeping rows, appended within half
  * a second so a crash loses nothing acknowledged; replayed into commits at startup, dropped when
  * the session ends cleanly. Transient: never exported, never part of history. `update_b64` is a
- * row's payload as base64 text (there is no binary column type); `block_id` names the block of
- * a row that concerns exactly one (null for snapshot, bookkeeping and multi-block rows; no
- * foreign key: a row may outlive its block). `epoch` numbers the sessions of a space; epoch 0
- * holds one row per ended session (`live/registry.ts`).
+ * row's payload as base64 text (there is no binary column type), whose entries name their
+ * blocks (the plan's `block_id` column is left out: a row holds several blocks' entries and
+ * nothing reads rows by block). `epoch` numbers the sessions of a space; epoch 0 holds one row
+ * per ended session (`live/registry.ts`).
  */
 export const outlineLiveLog = sqliteTable(
 	"outline_live_log",
@@ -6333,7 +6333,6 @@ export const outlineLiveLog = sqliteTable(
 			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
 		epoch: integer("epoch").notNull(),
 		seq: integer("seq").notNull(),
-		blockId: text("block_id"),
 		updateB64: text("update_b64").notNull(),
 		actorKind: text("actor_kind", { enum: ["human", "agent", "system"] }).notNull(),
 		actorId: text("actor_id").notNull(),

@@ -2,7 +2,6 @@ CREATE TABLE "outline_live_log" (
 	"space_id" text NOT NULL,
 	"epoch" integer NOT NULL,
 	"seq" integer NOT NULL,
-	"block_id" text,
 	"update_b64" text NOT NULL,
 	"actor_kind" text NOT NULL,
 	"actor_id" text NOT NULL,

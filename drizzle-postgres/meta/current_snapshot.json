@@ -1,5 +1,5 @@
 {
-  "id": "5f84300e-7ab6-486b-8001-260579750eb6",
+  "id": "f509e6ed-3d82-42d7-8008-1d25254f0189",
   "prevId": "407a309f-7e0a-4573-842a-f58767b8af6d",
   "version": "7",
   "dialect": "postgresql",
@@ -18629,12 +18629,6 @@
           "type": "integer",
           "primaryKey": false,
           "notNull": true
-        },
-        "block_id": {
-          "name": "block_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
         },
         "update_b64": {
           "name": "update_b64",

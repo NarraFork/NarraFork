@@ -40,6 +40,7 @@ import {
 	type ContentPlan,
 	contentOps,
 	decodeLogTexts,
+	encodeLogTexts,
 	fitBody,
 	LIVE_SYNC_ACTOR,
 	OUTLINE_LIVE_HOOKS,
@@ -226,18 +227,11 @@ export async function replayLiveEpochDetailed(
 		destroy();
 		return { outcome: "kept", keys };
 	}
-	// An update still waiting for items no row brought: the document's text is not what was
-	// typed. Nothing is committed from such a log, and it is not dropped.
-	const stuck = [...docs].filter(([, t]) => hasPendingStructs(t.doc)).map(([id]) => id);
-	if (stuck.length > 0) {
-		logger.warn("Outline live log incomplete (updates without the items they name); kept", {
-			spaceId,
-			epoch,
-			blocks: stuck.slice(0, 20),
-		});
-		destroy();
-		return { outcome: "kept", keys };
-	}
+	// An update still waiting for items no row brought: that document's text is not what was
+	// typed, and nothing of it is committed. It does not hold back the other blocks' text.
+	const stuck = new Set([...docs].filter(([, t]) => hasPendingStructs(t.doc)).map(([id]) => id));
+	/** Stuck documents of blocks that are still there: their rows are kept. */
+	const unsound: string[] = [];
 
 	// What the blocks table holds now for every block the log has a document of: read by
 	// primary key, a few at a time (a log holds at most a few thousand documents).
@@ -247,7 +241,12 @@ export async function replayLiveEpochDetailed(
 	for (const [id, t] of docs) {
 		if (++read % 50 === 0) await new Promise((resolve) => setImmediate(resolve));
 		const b = await outlineStore.getBlock(id);
+		// A block that is gone has nothing to commit, whatever state its document is in.
 		if (!b || b.deleted || b.spaceId !== spaceId) continue;
+		if (stuck.has(id)) {
+			unsound.push(id);
+			continue;
+		}
 		blocks.push(b);
 		const final = t.text.toString();
 		// The session committed this just before it ended, and logged nothing after.
@@ -264,8 +263,68 @@ export async function replayLiveEpochDetailed(
 		const committed = await commitChanges(spaceId, changes, blocks);
 		if (!committed) return { outcome: "kept", keys, changes };
 	}
+	if (unsound.length > 0) {
+		// Everything else is committed; only the rows of the documents that cannot be rebuilt
+		// stay, for an operator.
+		logger.warn(
+			"Outline live log incomplete (updates without the items they name): those blocks' rows are kept, the rest was replayed",
+			{ spaceId, epoch, blocks: unsound.slice(0, 20), committed: changes.length },
+		);
+		try {
+			await outlineStore.replaceLiveLog(spaceId, epoch, rowsAbout(rows, new Set(unsound)));
+		} catch (error) {
+			logger.warn("Outline live log could not be cut down to its incomplete blocks", {
+				spaceId,
+				epoch,
+				error: String(error),
+			});
+		}
+		return { outcome: "kept", keys };
+	}
 	await outlineStore.deleteLiveLog(spaceId, epoch);
 	return { outcome: changes.length > 0 ? "committed" : "empty", keys };
+}
+
+/**
+ * The rows of an epoch cut down to what concerns `ids`: text rows keep their entries of those
+ * blocks, sync rows their fields of them. The first row stays (as the epoch's snapshot, maybe
+ * empty), so the rows still read as a log.
+ */
+function rowsAbout(
+	rows: readonly OutlineLiveLogRow[],
+	ids: ReadonlySet<string>,
+): OutlineLiveLogRow[] {
+	const out: OutlineLiveLogRow[] = [];
+	const b64 = (data: Uint8Array) => Buffer.from(data).toString("base64");
+	rows.forEach((row, at) => {
+		const data = Buffer.from(row.updateB64, "base64");
+		if (row.actorId === LIVE_SYNC_ACTOR) {
+			const parsed = JSON.parse(decoder.decode(data)) as {
+				b?: Record<string, string>;
+				i?: Record<string, string>;
+				x?: string[];
+			};
+			const pick = (map?: Record<string, string>) =>
+				Object.fromEntries(Object.entries(map ?? {}).filter(([id]) => ids.has(id)));
+			const kept = {
+				b: pick(parsed.b),
+				i: pick(parsed.i),
+				x: (parsed.x ?? []).filter((id) => ids.has(id)),
+			};
+			const body = {
+				...(Object.keys(kept.b).length > 0 ? { b: kept.b } : {}),
+				...(Object.keys(kept.i).length > 0 ? { i: kept.i } : {}),
+				...(kept.x.length > 0 ? { x: kept.x } : {}),
+			};
+			if (Object.keys(body).length > 0)
+				out.push({ ...row, updateB64: b64(new TextEncoder().encode(JSON.stringify(body))) });
+			return;
+		}
+		const entries = (decodeLogTexts(data) ?? []).filter((e) => ids.has(e.id));
+		if (entries.length > 0 || at === 0)
+			out.push({ ...row, updateB64: b64(encodeLogTexts(entries)) });
+	});
+	return out;
 }
 
 async function commitChanges(

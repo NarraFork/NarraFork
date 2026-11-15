@@ -92,6 +92,7 @@ import {
 	type LiveCommitWire,
 	type LiveJoinedHead,
 	type LiveJoinHead,
+	type LiveLostWire,
 	type LiveOp,
 	type LivePeerWire,
 	type LivePresenceDown,
@@ -214,6 +215,14 @@ export const OUTLINE_LIVE_BOUNDS = {
 	 */
 	maxLoadedBlocks: 20_000,
 	maxLoadedChars: 32 * 1024 * 1024,
+	/** Blocks whose leaving the session is remembered ({@link LiveSpace} `recentlyGone`). */
+	goneBlocks: 5000,
+	/**
+	 * Blocks one person's pages may hold in a space's mirror (pages only that person is in).
+	 * Past it, their own least recently joined page is closed for them before another is loaded,
+	 * so one person with many tabs cannot take the whole of {@link maxLoadedBlocks}.
+	 */
+	maxUserBlocks: 8000,
 	/** Blocks put into or taken out of the mirror between two yields to the event loop. */
 	loadStep: 500,
 	/** Failed commits of a block as code after which it is no longer retried (until edited). */
@@ -400,6 +409,15 @@ export class LivePageView {
 	loadedAtOp = 0;
 	/** Set once the page's tree is being taken out of the session. */
 	gone = false;
+	/**
+	 * The generation the tree's blocks were given when it was loaded: a snapshot names it once
+	 * (`LiveJoinedHead.g`) and sends a generation only with the blocks that have another.
+	 */
+	baseGen = 0;
+	/** Blocks the tree had when it was loaded (budgets). */
+	blocks = 0;
+	/** When someone last joined (a person's least recently joined page goes first). */
+	joinedAt = 0;
 
 	constructor(
 		readonly space: LiveSpace,
@@ -969,6 +987,20 @@ export class LiveSpace {
 	/** Per page: the highest operation number no longer in `opLog`. */
 	private readonly opDropped = new Map<string, number>();
 	private sweepTimer: ReturnType<typeof setTimeout> | null = null;
+	/**
+	 * Blocks that left the session lately (their tree was unloaded): typing still on its way
+	 * into one is told back as not taken, not refused as text of a block that never was.
+	 */
+	private readonly recentlyGone = new Map<string, number>();
+	/**
+	 * Per client key: text of its transactions that was not taken, kept until its client shows
+	 * it was told (a join names the last acknowledgement the client got; what was not taken of a
+	 * transaction goes out with that transaction's acknowledgement). A frame sent is not a frame
+	 * received.
+	 */
+	private readonly keyLost = new Map<string, LiveLostWire[]>();
+	/** Entries of {@link keyLost} already sent, by participant number (not sent twice to one). */
+	private readonly lostSent = new Map<number, number>();
 	/** Trees being loaded (a join waits for the one already under way). */
 	private readonly loading = new Map<string, Promise<LivePageView | Refusal>>();
 	private nextPno = 1;
@@ -1063,6 +1095,8 @@ export class LiveSpace {
 		readonly spaceId: string,
 		private readonly schedule: (task: () => Promise<void>) => void,
 		private readonly onEnd: (space: LiveSpace, code: LiveCloseCode, idle: boolean) => void,
+		/** Blocks the process may still load (the registry's bound across all sessions). */
+		private readonly room: () => number = () => Number.POSITIVE_INFINITY,
 	) {}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1080,15 +1114,18 @@ export class LiveSpace {
 	}
 
 	/** Put one row of the blocks table into the mirror; returns its content's size. */
-	private putRow(b: {
-		id: string;
-		sid: string;
-		parentId: string | null;
-		orderKey: string;
-		taskJson: OutlineTaskJson | null;
-		askJson: unknown;
-		content: string;
-	}): void {
+	private putRow(
+		root: string,
+		b: {
+			id: string;
+			sid: string;
+			parentId: string | null;
+			orderKey: string;
+			taskJson: OutlineTaskJson | null;
+			askJson: unknown;
+			content: string;
+		},
+	): void {
 		const prior = this.mirror.get(b.id);
 		let gen = this.era;
 		if (prior) {
@@ -1111,6 +1148,8 @@ export class LiveSpace {
 			deleted: false,
 			dbContent: b.content,
 			gen,
+			// The snapshot of the page's first join sends it.
+			held: root,
 		});
 	}
 
@@ -1120,12 +1159,12 @@ export class LiveSpace {
 	 * enough to edit live); the mirror takes it {@link OUTLINE_LIVE_BOUNDS.loadStep} blocks at a
 	 * time, yielding in between. Runs in the lane.
 	 */
-	async ensureScope(pageId: string): Promise<LivePageView | Refusal> {
+	async ensureScope(pageId: string, userId?: string): Promise<LivePageView | Refusal> {
 		const existing = this.scopes.get(pageId);
 		if (existing && !existing.gone) return existing;
 		const underWay = this.loading.get(pageId);
 		if (underWay) return await underWay;
-		const load = this.loadTree(pageId);
+		const load = this.loadTree(pageId, userId);
 		this.loading.set(pageId, load);
 		try {
 			return await load;
@@ -1134,7 +1173,7 @@ export class LiveSpace {
 		}
 	}
 
-	private async loadTree(pageId: string): Promise<LivePageView | Refusal> {
+	private async loadTree(pageId: string, userId?: string): Promise<LivePageView | Refusal> {
 		const t0 = performance.now();
 		const { blocks, truncated } = await outlineStore.listPageBlocks(
 			pageId,
@@ -1155,7 +1194,22 @@ export class LiveSpace {
 		// Room first: pages nobody is in go, least recently left first.
 		const over = () =>
 			this.mirror.size + blocks.length > OUTLINE_LIVE_BOUNDS.maxLoadedBlocks ||
-			this.mirror.chars + chars > OUTLINE_LIVE_BOUNDS.maxLoadedChars;
+			this.mirror.chars + chars > OUTLINE_LIVE_BOUNDS.maxLoadedChars ||
+			blocks.length > this.room();
+		// The pages only this person is in, and what they hold.
+		const own = () =>
+			userId === undefined
+				? []
+				: [...this.scopes.values()]
+						.filter(
+							(v) =>
+								!v.gone &&
+								v.participants.size > 0 &&
+								[...v.participants.values()].every((p) => p.userId === userId),
+						)
+						.sort((a, b) => a.joinedAt - b.joinedAt);
+		const ownBlocks = () => own().reduce((n, v) => n + v.blocks, 0);
+		const tooMany = () => ownBlocks() + blocks.length > OUTLINE_LIVE_BOUNDS.maxUserBlocks;
 		if (over()) {
 			const idle = [...this.scopes.values()]
 				.filter((v) => v.participants.size === 0 && !v.gone)
@@ -1164,16 +1218,27 @@ export class LiveSpace {
 				if (!over()) break;
 				await this.unloadScope(v);
 			}
-			if (over()) return { refused: "unavailable" };
 		}
+		// Then this person's own pages, least recently joined first: one person's tabs do not
+		// keep everyone else out of the space, and a person's newest page wins over their oldest.
+		while (over() || tooMany()) {
+			const oldest = own()[0];
+			if (!oldest) break;
+			for (const p of [...oldest.participants.values()]) this.dismiss(p, "unavailable");
+			if (!(await this.unloadScope(oldest))) break;
+		}
+		if (over() || this.closed) return { refused: this.closed ? "ended" : "unavailable" };
+		const base = this.era;
 		const step = OUTLINE_LIVE_BOUNDS.loadStep;
 		for (let at = 0; at < blocks.length; at += step) {
 			if (at > 0) await yieldToLoop();
 			if (this.closed) return { refused: "ended" };
-			for (const b of blocks.slice(at, at + step)) this.putRow(b);
+			for (const b of blocks.slice(at, at + step)) this.putRow(pageId, b);
 		}
 		this.mirror.markRoot(pageId);
 		const view = new LivePageView(this, pageId);
+		view.baseGen = base;
+		view.blocks = blocks.length;
 		// A number of its own: a client that last saw an earlier one was here before this load.
 		view.loadedAtOp = ++this.opSeq;
 		this.scopes.set(pageId, view);
@@ -1205,6 +1270,12 @@ export class LiveSpace {
 	}
 
 	private forget(id: string): void {
+		this.recentlyGone.delete(id);
+		this.recentlyGone.set(id, Date.now());
+		if (this.recentlyGone.size > OUTLINE_LIVE_BOUNDS.goneBlocks) {
+			const oldest = this.recentlyGone.keys().next().value;
+			if (oldest !== undefined) this.recentlyGone.delete(oldest);
+		}
 		this.destroyDoc(id);
 		this.dirty.delete(id);
 		this.stuck.delete(id);
@@ -1224,7 +1295,12 @@ export class LiveSpace {
 		this.docCharged.delete(id);
 		this.docTouched.delete(id);
 		this.orphanScope.delete(id);
-		// The log forgets it too: a replay must not take its text for uncommitted.
+		// The log forgets it too: a replay must not take its text for uncommitted. Rows of the
+		// document not appended yet go (nothing may follow the drop of the document they are
+		// of); what was appended before stays before it.
+		if (this.pendingRows.some((r) => r.id === id))
+			this.pendingRows = this.pendingRows.filter((r) => r.id !== id);
+		this.schedulePersist();
 		this.pendingRows.push({
 			actorKind: "system",
 			actorId: LIVE_LOG_ACTOR,
@@ -1288,9 +1364,14 @@ export class LiveSpace {
 		if (this.scopes.size === 0 && this.participants.size === 0) this.onEnd(this, "ended", true);
 	}
 
-	/** The page whose participants are sent a block's text (also a deleted block's). */
+	/** The page whose people hold a block's text and are sent its updates (`MirrorBlock.held`). */
 	private scopeOf(id: string): string {
-		return this.mirror.topOf(id) ?? this.orphanScope.get(id) ?? "";
+		return this.mirror.get(id)?.held ?? this.orphanScope.get(id) ?? "";
+	}
+
+	/** The top-level block of the tree a block is in (structure; deleted parents count). */
+	private treeOf(id: string): string {
+		return this.mirror.topOf(id) ?? "";
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1406,7 +1487,7 @@ export class LiveSpace {
 
 	/** Whether any text of one page is waiting to be committed. */
 	hasUnflushedIn(root: string): boolean {
-		for (const id of this.dirty.keys()) if (this.scopeOf(id) === root) return true;
+		for (const id of this.dirty.keys()) if (this.treeOf(id) === root) return true;
 		return false;
 	}
 
@@ -1445,18 +1526,36 @@ export class LiveSpace {
 	 * text of every other block of the tree the session knows (deleted ones too: undoing a
 	 * delete brings a block back with the text it had).
 	 */
-	private allTexts(root: string): LiveTextEntry[] {
+	private allTexts(root: string, base: number): LiveTextEntry[] {
 		const out: LiveTextEntry[] = [];
 		const seen = new Set<string>();
-		for (const id of this.docs.keys()) {
+		// A block of the generation the snapshot names (`base`) needs none said: a plain seed
+		// text, or nothing when it is empty. Any other generation is said with the block.
+		const plain = (id: string, gen: number, text: string) => {
+			if (gen !== base)
+				out.push({ id, kind: LIVE_TEXT_KIND.drop, gen, data: encodeLiveSeed(text) });
+			else if (text.length > 0)
+				out.push({ id, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed(text) });
+		};
+		for (const [id, t] of this.docs) {
 			if (this.scopeOf(id) !== root) continue;
 			seen.add(id);
-			out.push(this.wholeText(id) as LiveTextEntry);
+			const gen = this.mirror.get(id)?.gen ?? 0;
+			// A document of generation 0 in a snapshot of another: said by a drop to 0 before it.
+			if (gen === 0 && base !== 0)
+				out.push({ id, kind: LIVE_TEXT_KIND.drop, gen: 0, data: EMPTY_TEXT });
+			out.push({
+				id,
+				kind: LIVE_TEXT_KIND.update,
+				...(gen !== 0 ? { gen } : {}),
+				data: Y.encodeStateAsUpdate(t.doc),
+			});
 		}
 		for (const id of this.mirror.subtreeAll(root)) {
 			if (seen.has(id)) continue;
-			const e = this.wholeText(id);
-			if (e) out.push(e);
+			const b = this.mirror.get(id) as MirrorBlock;
+			// A deleted block this page's people were never shown is not theirs to hold.
+			if (b.held === root) plain(id, b.gen, b.dbContent);
 		}
 		return out;
 	}
@@ -1505,6 +1604,7 @@ export class LiveSpace {
 		for (const id of this.mirror.subtreeAll(root)) {
 			if (sent.has(id)) continue;
 			const b = this.mirror.get(id) as MirrorBlock;
+			if (b.held !== root) continue;
 			const vector = named.get(id);
 			if (b.gen > g || (vector !== undefined && (vector.gen ?? 0) !== b.gen))
 				out.push({
@@ -1596,6 +1696,8 @@ export class LiveSpace {
 		held: Uint8Array,
 		canWrite: boolean,
 		dur?: number,
+		/** Of the client's previous session (gone): what it was never told was not taken. */
+		lostBefore?: readonly LiveLostWire[],
 	): Promise<Participant | Refusal> {
 		if (this.closed || this.restartRequested) return { refused: "ended" };
 		// People are numbered below the agents' numbers: a session that has seen that many joins
@@ -1607,7 +1709,7 @@ export class LiveSpace {
 		}
 		// A socket that has not taken what it was sent gets no snapshot on top of it.
 		if (socketBuffered(socket) > OUTLINE_LIVE_BOUNDS.lagBytes) return { refused: "unavailable" };
-		const scope = await this.ensureScope(head.page);
+		const scope = await this.ensureScope(head.page, socket.userId);
 		if ("refused" in scope) return scope;
 		if (this.closed || this.restartRequested) return { refused: "ended" };
 		if (
@@ -1687,9 +1789,17 @@ export class LiveSpace {
 				tx: processed,
 				dur: durable,
 				blocks: this.mirror.snapshot(root),
+				...(scope.baseGen !== 0 ? { g: scope.baseGen } : {}),
 			};
-			body = encodeLiveTexts(this.allTexts(root));
+			body = encodeLiveTexts(this.allTexts(root, scope.baseGen));
 		}
+		// Text of its earlier transactions that was not taken, which it was not told of yet.
+		// What the client was acknowledged it was also told of; the rest it is told now.
+		if (sameSession) this.toldLost(head.key, resume.tx);
+		const lost = sameSession
+			? (this.keyLost.get(head.key) ?? []).filter((l) => l[0] <= processed)
+			: [...(lostBefore ?? [])];
+		if (lost.length > 0) joined.x = lost;
 		let frame: Uint8Array;
 		try {
 			frame = encodeLiveFrame({ kind: LIVE_FRAME.joined, handle, head: joined, body });
@@ -1715,7 +1825,9 @@ export class LiveSpace {
 			if (scope.participants.size === 0) scope.armIdle();
 			return { refused: "unavailable" };
 		}
+		if (lost.length > 0) this.lostSent.set(p.pno, processed);
 		this.nextPno++;
+		scope.joinedAt = Date.now();
 		this.participants.set(p.pno, p);
 		scope.participants.set(p.pno, p);
 		scope.cancelIdle();
@@ -1733,6 +1845,7 @@ export class LiveSpace {
 		this.participants.delete(p.pno);
 		scope.participants.delete(p.pno);
 		this.windowAcks.delete(p.pno);
+		this.lostSent.delete(p.pno);
 		scope.presencePeers.delete(p.pno);
 		scope.presenceCursors.delete(p.pno);
 		scope.presenceBehind.delete(p.pno);
@@ -1771,8 +1884,10 @@ export class LiveSpace {
 	 * document; the frame, never processed, comes again with it.
 	 */
 	private forceResync(p: Participant): void {
-		if (p.resyncSent) return;
+		// Nothing more of it is taken until it has joined again, whether or not it was already
+		// asked to (its next frame must not be processed over the one left out here).
 		p.blocked = true;
+		if (p.resyncSent) return;
 		p.lagging = true;
 		p.resyncSent = true;
 		this.stats.resyncs++;
@@ -1954,19 +2069,24 @@ export class LiveSpace {
 				continue;
 			}
 			const body = mergedFor(p, start);
-			if (!body && own.length === 0 && ack === 0) continue;
+			const upTo = Math.max(ack, p.ackedTx);
+			const sentTo = this.lostSent.get(p.pno) ?? 0;
+			const lost = (this.keyLost.get(p.key) ?? []).filter((l) => l[0] <= upTo && l[0] > sentTo);
+			if (!body && own.length === 0 && ack === 0 && lost.length === 0) continue;
 			const head: LiveBatchHead = {};
 			if (own.length > 0) head.c = own;
 			if (acks && acks.length > 0) head.a = acks;
+			if (lost.length > 0) head.x = lost;
 			const sent = this.deliver(p, "data", () =>
 				encodeLiveFrame({
 					kind: LIVE_FRAME.batch,
 					handle: p.handle,
 					n: ack,
-					...(head.c || head.a ? { head } : {}),
+					...(head.c || head.a || head.x ? { head } : {}),
 					...(body ? { body } : {}),
 				}),
 			);
+			if (sent && lost.length > 0) this.lostSent.set(p.pno, upTo);
 			if (sent && ack > 0) {
 				p.ackedTx = ack;
 				if (ack > (this.keyAcked.get(p.key) ?? 0)) this.keyAcked.set(p.key, ack);
@@ -2015,26 +2135,59 @@ export class LiveSpace {
 		p: Participant,
 		body: Uint8Array,
 		inserted?: ReadonlySet<string>,
-	): LiveTextEntry[] | "stale" | null {
+	): { entries: LiveTextEntry[]; lost: string[] } | "stale" | null {
 		const entries = decodeLiveTexts(body, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
 		if (!entries) return null;
 		const seen = new Set<string>();
 		const out: LiveTextEntry[] = [];
+		const lost: string[] = [];
 		let stale = false;
 		for (const e of entries) {
 			if (e.kind !== LIVE_TEXT_KIND.update || seen.has(e.id)) return null;
-			if (!this.hasText(e.id) && !inserted?.has(e.id)) return null;
 			seen.add(e.id);
-			const gen = this.mirror.get(e.id)?.gen ?? 0;
+			if (!this.hasText(e.id) && !inserted?.has(e.id)) {
+				// A block that left the session with its tree a moment ago: not taken, and said so.
+				if (!this.recentlyGone.has(e.id)) return null;
+				lost.push(e.id);
+				continue;
+			}
+			const known = this.mirror.get(e.id);
+			const gen = known?.gen ?? 0;
 			if ((e.gen ?? 0) > gen) return null;
-			if ((e.gen ?? 0) === gen) out.push(e);
-			// Of a block of the participant's page: it is told of the drop (a join names it).
-			// Of a block that left its page (it holds it as deleted, and is told nothing more of
-			// it): typing that crossed the block's leaving, as typing may cross a delete; only
-			// that entry is left out.
+			// A block that went to a page nobody has open: the session does not follow it.
+			if (known?.deleted && known.held !== p.root) lost.push(e.id);
+			else if ((e.gen ?? 0) === gen) out.push(e);
+			// Of a block whose text the participant's page holds: it is told of the drop (a join
+			// names it). Of a block that left its page (it holds it as deleted, and is told
+			// nothing more of it) and whose document is another by now: typing that crossed the
+			// block's leaving cannot be put into that document; the client is told it was not
+			// taken and keeps it for the person.
 			else if (this.scopeOf(e.id) === p.root) stale = true;
+			else lost.push(e.id);
 		}
-		return stale ? "stale" : out;
+		return stale ? "stale" : { entries: out, lost };
+	}
+
+	/** Text of a processed transaction that was not taken: told with its acknowledgement. */
+	private noteLost(p: Participant, n: number, blocks: readonly string[]): void {
+		if (blocks.length === 0) return;
+		const list = this.keyLost.get(p.key) ?? [];
+		list.push([n, [...blocks]]);
+		while (list.length > 64) list.shift();
+		this.keyLost.set(p.key, list);
+		this.scheduleBroadcast();
+	}
+
+	/** What clients were not told yet was not taken (kept past the session's end, `registry.ts`). */
+	get lostUntold(): Map<string, LiveLostWire[]> {
+		return new Map(this.keyLost);
+	}
+
+	/** The client of `key` was told what was not taken of its transactions up to `upTo`. */
+	private toldLost(key: string, upTo: number): void {
+		const rest = (this.keyLost.get(key) ?? []).filter((l) => l[0] > upTo);
+		if (rest.length > 0) this.keyLost.set(key, rest);
+		else this.keyLost.delete(key);
 	}
 
 	/**
@@ -2084,18 +2237,19 @@ export class LiveSpace {
 			this.reject(p, n, "read_only");
 			return;
 		}
-		const entries = this.parseTexts(p, body);
-		if (entries === "stale") {
+		const parsed = this.parseTexts(p, body);
+		if (parsed === "stale") {
 			this.forceResync(p);
 			return;
 		}
 		// Updates before one that does not integrate stay: the client rebuilds from a snapshot
 		// that has them and merges what it typed onto it by text.
-		if (!entries || !this.applyTexts(p, entries)) {
+		if (!parsed || !this.applyTexts(p, parsed.entries)) {
 			this.reject(p, n, "invalid");
 			return;
 		}
 		this.processed(p, n);
+		this.noteLost(p, n, parsed.lost);
 	}
 
 	private processed(p: Participant, n: number): void {
@@ -2260,6 +2414,8 @@ export class LiveSpace {
 		if (ops.length === 0) {
 			this.settleContents(plans);
 			for (const plan of plans) done.add(plan.id);
+			// What was typed and taken back is in the log before anything is done on its account.
+			await this.persistNow();
 			return { ok: true, permanent: false, done };
 		}
 		// The log learns what is about to be committed first: a crash right after the commit
@@ -2544,15 +2700,16 @@ export class LiveSpace {
 		}
 		const inserted = new Map<string, Extract<LiveOp, { t: "i" }>>();
 		for (const op of plan.ops) if (op.t === "i") inserted.set(op.id, op);
-		const entries = this.parseTexts(p, body, new Set(inserted.keys()));
-		if (entries === "stale") {
+		const parsed = this.parseTexts(p, body, new Set(inserted.keys()));
+		if (parsed === "stale") {
 			this.forceResync(p);
 			return;
 		}
-		if (!entries) {
+		if (!parsed) {
 			this.reject(p, n, "invalid");
 			return;
 		}
+		const entries = parsed.entries;
 		// Text of blocks this transaction deletes is committed first, so their history keeps it.
 		// If that fails the transaction is refused: the text stays uncommitted (and marked).
 		const doomed = plan.deleted.filter((id) => this.dirty.has(id));
@@ -2712,9 +2869,6 @@ export class LiveSpace {
 						// A restored question is still one (review S9: undoing its delete brings the
 						// question back, and its checkbox stays refused). A client cannot make one.
 						const question = prior?.question === true;
-						// Brought back into another tree than the one that remembers it: the people
-						// there never had its text.
-						const cameFrom = this.scopeOf(op.id) || p.root;
 						this.mirror.put({
 							id: op.id,
 							sid: r?.sid ?? prior?.sid ?? "",
@@ -2725,25 +2879,26 @@ export class LiveSpace {
 							deleted: false,
 							dbContent: prior?.dbContent ?? "",
 							gen: prior?.gen ?? 0,
+							// A new block's text is with its maker's page; `route` sends it to
+							// another page's people if that is where the block is.
+							held: prior?.held ?? this.orphanScope.get(op.id) ?? p.root,
 						});
 						this.orphanScope.delete(op.id);
-						const top = this.scopeOf(op.id);
-						if (cameFrom !== top) this.enter(op.id, top, this.opSeq + 1);
 						events.push({
 							op: { ...op, k: key, ...(question ? { q: true as const } : {}) },
-							top,
+							top: this.treeOf(op.id),
 						});
 						break;
 					}
 					case "m": {
-						const from = this.scopeOf(op.id);
+						const from = this.treeOf(op.id);
 						const sub = this.mirror.subtree(op.id);
 						this.mirror.update(op.id, { parentId: op.p, orderKey: key });
-						events.push({ op: { ...op, k: key }, top: this.scopeOf(op.id), from, sub });
+						events.push({ op: { ...op, k: key }, top: this.treeOf(op.id), from, sub });
 						break;
 					}
 					case "d": {
-						const top = this.scopeOf(op.id);
+						const top = this.treeOf(op.id);
 						for (const id of this.mirror.subtree(op.id)) {
 							this.mirror.update(id, { deleted: true });
 							events.push({ op: { t: "d", id }, top });
@@ -2757,13 +2912,14 @@ export class LiveSpace {
 								? { ...(b?.taskJson ?? { assignee: null }), status: LIVE_STATUS_OF_TASK[op.task] }
 								: null,
 						});
-						events.push({ op, top: this.scopeOf(op.id) });
+						events.push({ op, top: this.treeOf(op.id) });
 						break;
 					}
 				}
 			}
 			this.settleContents(contents);
 			this.processed(p, n);
+			this.noteLost(p, n, parsed.lost);
 			if (events.length > 0) {
 				const o = ++this.opSeq;
 				const routed = this.route(events, o);
@@ -2793,12 +2949,17 @@ export class LiveSpace {
 	}
 
 	/**
-	 * A block came into a page's tree from elsewhere (another page's tree, or the database): the
-	 * page's people are sent its text whole, and a client resuming from before batch `o` too.
+	 * The one place a page's people are shown a block (every insert a page is sent passes here):
+	 * unless they hold its text already, they are sent it whole and hold it from now on, and a
+	 * client resuming from before batch `o` is sent it too. Whatever path brought the block here
+	 * (made, restored, moved in from another page's tree, alone or under its parent, read from
+	 * the database), its text cannot be missing or stale on that page.
 	 */
-	private enter(id: string, root: string, o: number): void {
+	private tell(id: string, root: string, o: number): void {
+		const b = this.mirror.get(id);
+		if (!b || b.held === root) return;
+		this.mirror.update(id, { held: root });
 		this.seededAt.set(id, o);
-		if (!this.scopes.has(root)) return;
 		const e = this.wholeText(id);
 		if (!e) return;
 		this.windowUpdates.push({ from: 0, scope: root, ...e });
@@ -2815,6 +2976,7 @@ export class LiveSpace {
 		const out = new Map<string, LiveOp[]>();
 		const add = (root: string, op: LiveOp) => {
 			if (!this.scopes.has(root)) return;
+			if (op.t === "i") this.tell(op.id, root, o);
 			const list = out.get(root);
 			if (list) list.push(op);
 			else out.set(root, [op]);
@@ -2825,9 +2987,17 @@ export class LiveSpace {
 				continue;
 			}
 			for (const id of e.sub ?? [e.op.id]) add(e.from, { t: "d", id });
-			for (const id of this.mirror.subtree(e.op.id)) {
+			for (const id of this.mirror.subtreeAll(e.op.id)) {
 				const b = this.mirror.get(id) as MirrorBlock;
-				if (b.parentId === null) continue;
+				if (b.deleted) {
+					// A deleted block that went along: the page it left is told nothing more of
+					// it, the page it reached nothing yet. Nobody holds its text until it is
+					// brought back somewhere.
+					if (b.held !== "") this.mirror.update(id, { held: "" });
+					continue;
+				}
+				// Only what is still attached (a live block under a deleted one is not shown).
+				if (b.parentId === null || this.mirror.rootOf(id) !== e.top) continue;
 				const task = taskCharOf(b.taskJson);
 				add(e.top, {
 					t: "i",
@@ -2837,7 +3007,6 @@ export class LiveSpace {
 					...(task ? { task } : {}),
 					...(b.question ? { q: true as const } : {}),
 				});
-				this.enter(id, e.top, o);
 			}
 		}
 		return out;
@@ -3091,28 +3260,39 @@ export class LiveSpace {
 			if (!loaded) {
 				// Everything under it left with it, whether or not the commit wrote a version of
 				// each (a move to another page does today; it will not once pages are gone).
-				const top = this.scopeOf(v.blockId);
+				const top = this.treeOf(v.blockId);
 				for (const id of this.mirror.subtree(v.blockId)) {
-					this.mirror.update(id, { deleted: true });
+					// Moved to a page that is not loaded (not deleted): it lives on there, and
+					// nobody here holds its text any more (typing still on its way into it is
+					// told back as not taken, `parseTexts`).
+					if (v.deleted) this.mirror.update(id, { deleted: true });
+					else {
+						// Its document ends here too (its text is committed: the write waited for
+						// that): what a client still types into its copy is not taken, so that
+						// copy is no longer the block's document, and whoever is shown the block
+						// again is given a later generation of it.
+						this.destroyDoc(id);
+						this.mirror.update(id, { deleted: true, held: "", gen: ++this.era });
+					}
 					deletes.push({ op: { t: "d", id }, top });
 				}
 				continue;
 			}
 			if (m.parentId !== v.parentId || m.orderKey !== v.orderKey) {
-				const from = this.scopeOf(v.blockId);
+				const from = this.treeOf(v.blockId);
 				const sub = this.mirror.subtree(v.blockId);
 				this.mirror.update(v.blockId, { parentId: v.parentId, orderKey: v.orderKey });
 				if (v.parentId !== null)
 					moves.push({
 						op: { t: "m", id: v.blockId, p: v.parentId, k: v.orderKey },
-						top: this.scopeOf(v.blockId),
+						top: this.treeOf(v.blockId),
 						from,
 						sub,
 					});
 			}
 			const task = taskCharOf(v.taskJson);
 			if (task !== taskCharOf(m.taskJson))
-				tasks.push({ op: { t: "k", id: v.blockId, task }, top: this.scopeOf(v.blockId) });
+				tasks.push({ op: { t: "k", id: v.blockId, task }, top: this.treeOf(v.blockId) });
 			if (JSON.stringify(v.taskJson) !== JSON.stringify(m.taskJson))
 				this.mirror.update(v.blockId, { taskJson: v.taskJson });
 			if ((v.askJson !== null) !== (m.question === true))
@@ -3135,7 +3315,6 @@ export class LiveSpace {
 				// refused insert) keeps its document, or gets one from the text everyone holds for
 				// it, and takes the content as a change; a new one is plain text, told to everyone.
 				const known = this.hasText(v.blockId);
-				const cameFrom = known ? this.scopeOf(v.blockId) : null;
 				if (known && this.textOf(v.blockId) !== content) {
 					this.editText(v.blockId, (t) => {
 						t.delete(0, t.length);
@@ -3154,12 +3333,12 @@ export class LiveSpace {
 					// A block new to the session is of the generation the session is at: its text
 					// always goes out with it then (`wholeText`).
 					gen: prior?.gen ?? this.era,
+					// Whoever held it before still does; `route` sends its text to the people of
+					// the page it is in now when they are not the ones (`tell`).
+					held: prior?.held ?? this.orphanScope.get(v.blockId) ?? "",
 				});
 				this.orphanScope.delete(v.blockId);
 				this.syncPending.set(v.blockId, content);
-				// New to the people of its page (also a block they never had that another page's
-				// people did): its text goes with it.
-				if (!known || cameFrom !== v.pageId) this.enter(v.blockId, v.pageId, this.opSeq + 1);
 			}
 			// Parents before children.
 			const ordered = [...created].sort(
@@ -3257,26 +3436,20 @@ export class LiveSpace {
 			return;
 		this.pendingRows = [];
 		const now = new Date().toISOString();
-		const row: LogRowMaker = (data, actorKind, actorId, blockId = null) => ({
+		const row: LogRowMaker = (data, actorKind, actorId) => ({
 			spaceId: this.spaceId,
 			epoch: this.epoch,
 			seq: this.logSeq++,
-			blockId,
 			updateB64: Buffer.from(data).toString("base64"),
 			actorKind,
 			actorId,
 			createdAt: now,
 		});
-		/** A text row of entries, naming its block when it concerns one. */
 		const textRow = (
 			entries: readonly LiveTextEntry[],
 			actorKind: "human" | "system",
 			actorId: string,
-		) => {
-			const first = entries[0] as LiveTextEntry;
-			const one = entries.every((e) => e.id === first.id);
-			return row(encodeLogTexts(entries), actorKind, actorId, one ? first.id : null);
-		};
+		) => row(encodeLogTexts(entries), actorKind, actorId);
 		const rows: OutlineLiveLogRow[] = [];
 		const sync = new Map(this.syncPending);
 		const intents = new Map(this.intentPending);
@@ -3299,25 +3472,45 @@ export class LiveSpace {
 					sync.set(b.id, b.dbContent);
 			}
 		} else {
-			// Dropped documents first (everything a dropped document took was appended before it
-			// was dropped, `sweepDocs`), then seed texts, whoever's update made the document: an
-			// update needs its seed, and a block's next document starts after the drop of its last.
-			const drops = pending.filter((r) => r.kind === LIVE_TEXT_KIND.drop);
-			if (drops.length > 0) rows.push(textRow(drops, "system", LIVE_LOG_ACTOR));
-			const seeds = pending.filter((r) => r.kind === LIVE_TEXT_KIND.seed);
-			if (seeds.length > 0) rows.push(textRow(seeds, "system", LIVE_LOG_ACTOR));
-			const byActor = new Map<string, PendingRow[]>();
+			// A block's rows keep the order they came in: a drop of its document cuts the rows
+			// into stretches, and nothing of a stretch is written across it. Within a stretch,
+			// seed texts first, whoever's update made the document (an update needs its seed),
+			// then each actor's updates, a block's merged into one.
+			let stretch: PendingRow[] = [];
+			let drops: PendingRow[] = [];
+			const endStretch = () => {
+				if (stretch.length === 0) return;
+				const seeds = stretch.filter((r) => r.kind === LIVE_TEXT_KIND.seed);
+				if (seeds.length > 0) rows.push(textRow(seeds, "system", LIVE_LOG_ACTOR));
+				const byActor = new Map<string, PendingRow[]>();
+				for (const r of stretch) {
+					if (r.kind === LIVE_TEXT_KIND.seed) continue;
+					const key = `${r.actorKind}\u0000${r.actorId}`;
+					const list = byActor.get(key);
+					if (list) list.push(r);
+					else byActor.set(key, [r]);
+				}
+				for (const list of byActor.values()) {
+					const first = list[0] as PendingRow;
+					rows.push(textRow(mergeTexts(list), first.actorKind, first.actorId));
+				}
+				stretch = [];
+			};
+			const endDrops = () => {
+				if (drops.length > 0) rows.push(textRow(drops, "system", LIVE_LOG_ACTOR));
+				drops = [];
+			};
 			for (const r of pending) {
-				if (r.kind === LIVE_TEXT_KIND.seed || r.kind === LIVE_TEXT_KIND.drop) continue;
-				const key = `${r.actorKind}\u0000${r.actorId}`;
-				const list = byActor.get(key);
-				if (list) list.push(r);
-				else byActor.set(key, [r]);
+				if (r.kind === LIVE_TEXT_KIND.drop) {
+					endStretch();
+					drops.push(r);
+				} else {
+					endDrops();
+					stretch.push(r);
+				}
 			}
-			for (const list of byActor.values()) {
-				const first = list[0] as PendingRow;
-				rows.push(textRow(mergeTexts(list), first.actorKind, first.actorId));
-			}
+			endStretch();
+			endDrops();
 		}
 		if (sync.size > 0 || intents.size > 0 || cancels.size > 0 || keys.size > 0)
 			rows.push(row(encodeSyncRow(sync, intents, cancels, keys), "system", LIVE_SYNC_ACTOR));
@@ -3611,43 +3804,41 @@ export class LiveSpace {
  */
 function mergeTexts(entries: readonly LiveTextEntry[]): LiveTextEntry[] {
 	if (entries.length === 1) return [entries[0] as LiveTextEntry];
-	// A block's plain text (a seed, or the text a dropped document left) comes before the updates
-	// of the document made from it; the window holds no update of a document from before its drop
-	// (`sweepDocs` sends everything out first).
-	const plains = new Map<string, LiveTextEntry>();
-	const updates = new Map<string, Uint8Array[]>();
-	const gens = new Map<string, number>();
-	const order: string[] = [];
+	// In the order they came, a block's consecutive updates (of one generation) merged into one.
+	// A plain text (a seed, or what a dropped document left) ends the run of its block: what
+	// comes after it is of another document and is never merged across it or put before it.
+	const out: Array<LiveTextEntry | { id: string; gen: number; run: Uint8Array[] }> = [];
+	const open = new Map<string, { id: string; gen: number; run: Uint8Array[] }>();
 	for (const e of entries) {
-		if (!plains.has(e.id) && !updates.has(e.id)) order.push(e.id);
-		if (e.kind === LIVE_TEXT_KIND.update) {
-			const list = updates.get(e.id);
-			if (list) list.push(e.data);
-			else updates.set(e.id, [e.data]);
-			if (e.gen) gens.set(e.id, e.gen);
-		} else plains.set(e.id, e);
+		if (e.kind !== LIVE_TEXT_KIND.update) {
+			open.delete(e.id);
+			out.push(e);
+			continue;
+		}
+		const gen = e.gen ?? 0;
+		const run = open.get(e.id);
+		if (run && run.gen === gen) run.run.push(e.data);
+		else {
+			const made = { id: e.id, gen, run: [e.data] };
+			open.set(e.id, made);
+			out.push(made);
+		}
 	}
-	const out: LiveTextEntry[] = [];
-	for (const id of order) {
-		const plain = plains.get(id);
-		if (plain)
-			out.push({
-				id,
-				kind: plain.kind,
-				...(plain.gen !== undefined ? { gen: plain.gen } : {}),
-				data: plain.data,
-			});
-		const list = updates.get(id);
-		const gen = gens.get(id);
-		if (list)
-			out.push({
-				id,
-				kind: LIVE_TEXT_KIND.update,
-				...(gen ? { gen } : {}),
-				data: mergeTextUpdates(list),
-			});
-	}
-	return out;
+	return out.map((e) =>
+		"run" in e
+			? {
+					id: e.id,
+					kind: LIVE_TEXT_KIND.update,
+					...(e.gen !== 0 ? { gen: e.gen } : {}),
+					data: e.run.length === 1 ? (e.run[0] as Uint8Array) : mergeTextUpdates(e.run),
+				}
+			: {
+					id: e.id,
+					kind: e.kind,
+					...(e.gen !== undefined ? { gen: e.gen } : {}),
+					data: e.data,
+				},
+	);
 }
 
 /** The payload of a log row that only says "this block's document is gone". */
@@ -3657,7 +3848,6 @@ type LogRowMaker = (
 	data: Uint8Array,
 	actorKind: "human" | "system",
 	actorId: string,
-	blockId?: string | null,
 ) => OutlineLiveLogRow;
 
 /** Let timers and I/O run between two steps of a long lane task. */

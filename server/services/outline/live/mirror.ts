@@ -44,6 +44,14 @@ export interface MirrorBlock {
 	 * the session's counter at the time for a block loaded later or whose document was dropped.
 	 */
 	gen: number;
+	/**
+	 * The page (root) whose people hold the block's text: they were sent it whole (in a snapshot,
+	 * or when the block came into their tree) and get every update and drop of it since. Empty:
+	 * nobody. It is what text is routed by, and it changes only at the one place a page is sent a
+	 * block's text whole (`LiveSpace.tell`), so no path can show a page a block without its text.
+	 * A deleted block carried to another tree under its moved parent is held by nobody.
+	 */
+	held: string;
 }
 
 export function taskCharOf(task: OutlineTaskJson | null): LiveTaskChar | null {

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "ea8b623f-f5e4-4b69-8a77-7ad1f370bbd1",
+  "id": "7cebf1d6-7f7f-4e3b-8c46-a3fa3b661d6d",
   "prevId": "bf3f4a25-8744-4019-8538-3b1da8b88a8e",
   "tables": {
     "acl_events": {
@@ -15329,13 +15329,6 @@
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
-          "autoincrement": false
-        },
-        "block_id": {
-          "name": "block_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
           "autoincrement": false
         },
         "update_b64": {

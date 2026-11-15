@@ -21,8 +21,8 @@
  *   …           the JSON head (UTF-8)
  *   …           the body: raw bytes to the end of the frame: text entries ({@link LiveTextEntry})
  *
- * TEXT IS PER BLOCK (protocol version 2)
- * --------------------------------------
+ * TEXT IS PER BLOCK (since protocol version 2)
+ * --------------------------------------------
  * Every block has a text document of its own (`shared/outline-live-text.ts`), made only when
  * someone changes the block's text. A body is a list of entries, each naming its block:
  *   - `seed`: the block's text as plain UTF-8, for a block nobody has a document for (S→C: in a
@@ -64,8 +64,11 @@
  * (`OutlineSurface`). A client older than version 2 does not know the code: it takes it as a
  * session closed for good, keeps the typing the same way and shows that live editing is
  * unavailable.
+ *
+ * Version 3 (L2): text entries of kinds 3 to 5 (document generations and drops), which a
+ * version 2 reader takes for a malformed body and ignores whole. L3 takes 4.
  */
-export const OUTLINE_LIVE_PROTOCOL_VERSION = 2;
+export const OUTLINE_LIVE_PROTOCOL_VERSION = 3;
 
 export const OUTLINE_LIVE_MAGIC = 0xb1;
 
@@ -276,6 +279,13 @@ export interface LiveJoinedHead {
 	blocks?: LiveBlockWire[];
 	/** Structural batches after the client's `op` (resume). */
 	ops?: LiveCommitWire[];
+	/**
+	 * A snapshot (L2): the document generation of every block it lists that no text entry names
+	 * a generation for (absent: 0). Blocks of another generation come with a `drop` entry.
+	 */
+	g?: number;
+	/** Text of the client's earlier transactions that was not taken ({@link LiveLostWire}). */
+	x?: LiveLostWire[];
 	peers: LivePeerWire[];
 	/** Cursors of the peers now. */
 	cur?: Array<[pno: number, sel: LiveSelWire | null]>;
@@ -302,7 +312,17 @@ export interface LiveBatchHead {
 	 * sent (an order key moved, a delete took more blocks, an insert became a restore).
 	 */
 	a?: Array<[tx: number, op: number, ops?: LiveOp[]]>;
+	/** Text of this recipient's transactions that was not taken ({@link LiveLostWire}). */
+	x?: LiveLostWire[];
 }
+
+/**
+ * A transaction of the recipient (acknowledged with or before this frame) and the blocks whose
+ * text in it the session did not take: they are no longer in the recipient's page (moved to
+ * another page, or gone from the session with it) and their document is not the one the text
+ * was typed in. The client keeps that text for the person (the unsaved-text store).
+ */
+export type LiveLostWire = [tx: number, blocks: string[]];
 
 /**
  * A position in a block's text: the block id and a Yjs relative position as

@@ -1065,7 +1065,6 @@ describe("the log and its replay", () => {
 		await outlineStore.appendLiveLog([
 			{
 				spaceId: space.id,
-				blockId: null,
 				epoch,
 				seq: 0,
 				updateB64: Buffer.from(Y.encodeStateAsUpdate(old)).toString("base64"),
@@ -1337,7 +1336,6 @@ describe("a log read in any order", () => {
 			actorId: string,
 		) => ({
 			spaceId: space.id,
-			blockId: null,
 			epoch,
 			seq,
 			updateB64: b64(data),
@@ -1382,7 +1380,6 @@ describe("a log read in any order", () => {
 				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed("x") }]),
 			].map((data, seq) => ({
 				spaceId: space.id,
-				blockId: null,
 				epoch,
 				seq,
 				updateB64: b64(data),
@@ -1401,7 +1398,7 @@ describe("a log read in any order", () => {
 		expect(await content(block)).toBe("agent: x hello");
 	});
 
-	test("an update whose items no row brings: nothing is committed and the log is kept", async () => {
+	test("an update whose items no row brings: nothing of that block is committed and its rows are kept; the other blocks of the log are replayed", async () => {
 		const { pageId, ids } = await page(["x", "y"]);
 		const [block, other] = ids as [string, string];
 		const { doc, text } = seededTextDoc("x");
@@ -1428,7 +1425,6 @@ describe("a log read in any order", () => {
 				]),
 			].map((data, seq) => ({
 				spaceId: space.id,
-				blockId: null,
 				epoch,
 				seq,
 				updateB64: b64(data),
@@ -1439,16 +1435,18 @@ describe("a log read in any order", () => {
 		);
 		expect(await replayLiveEpoch(space.id, epoch)).toBe("kept");
 		expect(await content(block)).toBe("x");
-		expect(await content(other)).toBe("y");
-		expect(left(pageId, epoch)).toBe(3);
-		// The page is still editable, and the log still there afterwards.
+		// One block's broken document does not take the rest of the log down with it (L2 review):
+		// what is sound is committed, and only the broken block's rows stay.
+		expect(await content(other)).toBe("y fine");
+		expect(left(pageId, epoch)).toBe(2);
+		// The page is still editable, and what is left of the log still there afterwards.
 		const a = open(link(owner), pageId);
 		await waitFor(() => a.ready, 3000, "joined");
 		type(a, block, "!");
 		await settle();
 		await flushed(pageId);
 		expect(await content(block)).toBe("x!");
-		expect(left(pageId, epoch)).toBe(3);
+		expect(left(pageId, epoch)).toBe(2);
 		await db
 			.delete(outlineLiveLog)
 			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)));

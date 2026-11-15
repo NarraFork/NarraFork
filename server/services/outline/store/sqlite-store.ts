@@ -40,6 +40,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 	outlineLiveLog,
+	outlineLiveUpdates,
 	outlinePending,
 	outlineQuestions,
 	outlineSpaces,
@@ -208,7 +209,7 @@ function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveLogRow {
 	return { ...row, actorKind: row.actorKind as OutlineActorKind };
 }
 
-/** Rows per multi-row INSERT of the live log (8 columns each). */
+/** Rows per multi-row INSERT of the live log (7 columns each). */
 type ViewStateSelect = typeof outlineViewState.$inferSelect;
 
 function toViewState(row: ViewStateSelect): OutlineViewStateRow {
@@ -959,6 +960,11 @@ export const sqliteOutlineStore: OutlineStore = {
 			.where(and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)))
 			.returning({ seq: outlineLiveLog.seq })
 			.all().length;
+	},
+
+	async countLegacyLiveUpdates(limit) {
+		return db.select({ seq: outlineLiveUpdates.seq }).from(outlineLiveUpdates).limit(limit).all()
+			.length;
 	},
 
 	async listLiveLogEpochs(options) {

@@ -612,10 +612,10 @@
 		{
 			"idx": 76,
 			"tag": "0076_outline_live_log",
-			"id": "5f84300e-7ab6-486b-8001-260579750eb6",
+			"id": "f509e6ed-3d82-42d7-8008-1d25254f0189",
 			"prevId": "407a309f-7e0a-4573-842a-f58767b8af6d",
 			"version": "7",
-			"snapshotDigest": "acda9f539870d3d3f5ba9d0488076c479ef02f0eb6145a25bae00cbc7abc3ebf"
+			"snapshotDigest": "a6536cb41caeed269302f1ff918c6224869013bf0830bcf15354702142eca159"
 		}
 	]
 }

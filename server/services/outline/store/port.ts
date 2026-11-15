@@ -146,13 +146,12 @@ export interface OutlineCommitRow {
  * that block's document, or the drop of its document), or a JSON sync row. Seq 0 of an epoch,
  * or the first row after a compaction, holds every text document of the session whole; the
  * rows after it are increments. Replaying an epoch's rows in seq order rebuilds each block's
- * document. `blockId` names the block of a text row that concerns exactly one, null otherwise.
+ * document.
  */
 export interface OutlineLiveLogRow {
 	spaceId: string;
 	epoch: number;
 	seq: number;
-	blockId: string | null;
 	updateB64: string;
 	actorKind: OutlineActorKind;
 	actorId: string;
@@ -1031,6 +1030,11 @@ export interface OutlineStore
 	): Promise<OutlineLiveLogRow[]>;
 	/** Delete every row of an epoch; returns how many went. */
 	deleteLiveLog(spaceId: string, epoch: number): Promise<number>;
+	/**
+	 * Rows left in the log table of before L2 (`outline_live_updates`, no longer read), counted
+	 * up to `limit` (one bounded statement; for the startup warning, until X2 drops the table).
+	 */
+	countLegacyLiveUpdates(limit: number): Promise<number>;
 	/** Epochs that have rows, ordered by space then epoch, after `after`, at most `limit`. */
 	listLiveLogEpochs(options: {
 		after?: { spaceId: string; epoch: number };

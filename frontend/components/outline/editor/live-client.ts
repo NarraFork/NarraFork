@@ -55,6 +55,7 @@ import {
 	type LiveFrame,
 	type LiveJoinedHead,
 	type LiveJoinHead,
+	type LiveLostWire,
 	type LiveModeHead,
 	type LiveOp,
 	type LivePeerWire,
@@ -198,8 +199,21 @@ interface PendingTx {
 	 */
 	undone?: Map<string, { before: string; after: string }>;
 	structural: boolean;
+	/** Not on its way: to be sent (again, after a disconnect). */
 	sent: boolean;
+	/**
+	 * Was ever sent: the page may have taken it, so nothing typed later may be added to it (a
+	 * join that says the page has it would drop what was added with it).
+	 */
+	everSent?: boolean;
 	bytes: number;
+}
+
+/** A change of this client to make again on a new document: typed, or made by an undo or redo. */
+interface Remade {
+	before: string;
+	after: string;
+	typed: boolean;
 }
 
 interface Step {
@@ -521,7 +535,7 @@ export class LiveClient {
 		id: string,
 		gen: number,
 		text: string,
-		redo: Array<{ id: string; changes: Array<{ before: string; after: string }> }> | null,
+		redo: Array<{ id: string; changes: Remade[] }> | null,
 	): void {
 		const old = this.docs.get(id);
 		if (old) {
@@ -536,11 +550,15 @@ export class LiveClient {
 		for (const v of this.views) v.noteTextReset(id);
 		if (!redo) return;
 		this.outY = this.outY.filter((u) => u.id !== id);
-		const changes: Array<{ before: string; after: string }> = [];
+		const changes: Remade[] = [];
 		for (const tx of this.pending) {
 			// A block this transaction itself creates carries its text in the operation.
-			if (!tx.ops.some((op) => op.t === "i" && op.id === id))
-				for (const typed of [tx.bodies.get(id), tx.undone?.get(id)]) if (typed) changes.push(typed);
+			if (!tx.ops.some((op) => op.t === "i" && op.id === id)) {
+				const typed = tx.bodies.get(id);
+				if (typed) changes.push({ ...typed, typed: true });
+				const undone = tx.undone?.get(id);
+				if (undone) changes.push({ ...undone, typed: false });
+			}
 			tx.bodies.delete(id);
 			tx.undone?.delete(id);
 			if (tx.update.some((u) => u.id === id)) tx.update = tx.update.filter((u) => u.id !== id);
@@ -552,23 +570,80 @@ export class LiveClient {
 		if (changes.length > 0) redo.push({ id, changes });
 	}
 
-	/** Make this client's changes of dropped documents again, on the texts the page now has. */
-	private rebaseDropped(
-		redo: ReadonlyArray<{ id: string; changes: Array<{ before: string; after: string }> }>,
-	): void {
+	/**
+	 * Make this client's changes of dropped documents again, on the texts the page now has. What
+	 * the person typed is a step of their undo history again (the steps it was in went with the
+	 * document); what an undo or redo changed is not.
+	 */
+	private rebaseDropped(redo: ReadonlyArray<{ id: string; changes: Remade[] }>): void {
 		const bodies = new Map<string, { before: string; after: string }>();
+		this.closeCaptures();
+		const step: Step = {
+			inverse: [],
+			texts: new Map(),
+			selBefore: null,
+			selAfter: null,
+			kind: "struct",
+			blockId: null,
+			time: 0,
+		};
 		for (const { id, changes } of redo) {
 			for (const c of changes) {
 				if (!this.hasText(id)) continue;
 				const current = this.textOf(id);
 				const r = merge3(c.before, c.after, current, { lenient: true });
 				if (!r.ok || r.result === current) continue;
-				const change = this.writeBody({ id, md: r.result, hunks: r.patch }, REPLAY);
+				const before = this.docs.get(id)?.um?.undoStack.length ?? 0;
+				const change = this.writeBody(
+					{ id, md: r.result, hunks: r.patch },
+					c.typed ? LOCAL : REPLAY,
+				);
 				const prev = bodies.get(id);
 				if (change) bodies.set(id, prev ? { before: prev.before, after: change.after } : change);
+				const um = this.docs.get(id)?.um;
+				if (um && um.undoStack.length > before)
+					step.texts.set(id, um.undoStack[um.undoStack.length - 1] as StackItem);
 			}
 		}
+		if (step.texts.size > 0) {
+			this.undoStack.push(step);
+			this.closeCaptures();
+			for (const id of step.texts.keys()) this.docs.get(id)?.um?.stopCapturing();
+		}
 		this.enqueue([], bodies, false);
+	}
+
+	/**
+	 * The page did not take what some transactions typed into blocks that are no longer in this
+	 * page (moved to another page, or gone with it, while the typing was on its way): that text
+	 * is kept for the person (the unsaved-text store), to be added back as a new block next to
+	 * where the block was.
+	 */
+	private keepLost(lost: LiveLostWire[] | undefined, txs: readonly PendingTx[]): void {
+		if (!lost || lost.length === 0) return;
+		const items: Array<Omit<UnsavedEntry, "id" | "at">> = [];
+		for (const [n, ids] of lost) {
+			const tx = txs.find((t) => t.n === n);
+			if (!tx) continue;
+			for (const id of ids) {
+				const change = tx.bodies.get(id) ?? tx.undone?.get(id);
+				if (!change || change.after === change.before) continue;
+				let parent: string | null = this.confirmed.get(id)?.parentId ?? null;
+				while (parent && !this.confirmed.alive(parent))
+					parent = this.confirmed.get(parent)?.parentId ?? null;
+				items.push({
+					pageId: this.pageId,
+					blockId: id,
+					text: change.after,
+					base: change.before,
+					reason: "moved_away",
+					restore: { parentId: parent ?? this.pageId, task: null },
+				});
+			}
+		}
+		if (items.length === 0) return;
+		this.log.push(`${items.length} block(s) typed in after they left the page: kept unsaved`);
+		keepUnsavedTexts(items);
 	}
 
 	/**
@@ -659,7 +734,7 @@ export class LiveClient {
 			this.log.push("a frame's text could not be read");
 			return;
 		}
-		const redo: Array<{ id: string; changes: Array<{ before: string; after: string }> }> = [];
+		const redo: Array<{ id: string; changes: Remade[] }> = [];
 		for (const e of entries) {
 			const mine = this.gens.get(e.id) ?? 0;
 			const gen = e.gen ?? 0;
@@ -674,7 +749,11 @@ export class LiveClient {
 				const text = decodeLiveSeed(e.data);
 				if (text === null) this.log.push(`the text of ${e.id} could not be read`);
 				else if (gen > mine) this.dropTo(e.id, gen, text, fresh ? null : redo);
-				else this.setPlain(e.id, text);
+				else {
+					this.setPlain(e.id, text);
+					// In a snapshot: the block's generation said outright (see `onReset`).
+					if (fresh) this.gens.set(e.id, gen);
+				}
 			} else if (e.kind === LIVE_TEXT_KIND.update) {
 				// A document of a later generation comes whole: it starts from no text here.
 				if (gen > mine) this.dropTo(e.id, gen, "", fresh ? null : redo);
@@ -990,7 +1069,7 @@ export class LiveClient {
 		if (ops.length === 0 && update.length === 0) return;
 		const bytes = update.reduce((n, u) => n + u.update.length, 0);
 		const tail = this.pending[this.pending.length - 1];
-		if (!structural && tail && !tail.structural && !tail.sent) {
+		if (!structural && tail && !tail.structural && !tail.sent && !tail.everSent) {
 			// Typing joins the batch being collected.
 			tail.update.push(...update);
 			tail.bytes += bytes;
@@ -1070,6 +1149,7 @@ export class LiveClient {
 			}
 			if (!this.sendFrame(frame)) return;
 			tx.sent = true;
+			tx.everSent = true;
 			const restore = this.restoring.get(tx.n);
 			if (restore) restore.sent = true;
 			this.stats.txSent++;
@@ -1387,6 +1467,7 @@ export class LiveClient {
 		// What the page has of this client's transactions: forget what is logged, keep what is
 		// applied but not logged (unsent, not replayed), send or replay the rest.
 		const all = [...this.awaiting, ...this.pending].sort((x, y) => x.n - y.n);
+		this.keepLost(head.x, all);
 		const dur = head.dur ?? 0;
 		const applied = Math.max(head.tx, dur);
 		const kept = all.filter((tx) => tx.n > dur);
@@ -1429,6 +1510,11 @@ export class LiveClient {
 		this.capturing.clear();
 		this.outY = [];
 		this.applyTexts(body, true);
+		// The generation of every block the snapshot did not name one for (`LiveJoinedHead.g`).
+		if (head.g) {
+			for (const b of head.blocks ?? []) if (!this.gens.has(b[0])) this.gens.set(b[0], head.g);
+			this.era = Math.max(this.era, head.g);
+		}
 		this.confirmed = storeFromSnapshot(this.pageId, head.blocks ?? []);
 		// A block the snapshot sent no text for has the empty text.
 		for (const b of head.blocks ?? []) if (!this.hasText(b[0])) this.plain.set(b[0], "");
@@ -1455,6 +1541,7 @@ export class LiveClient {
 
 	/** Re-apply transactions the server never took onto the rebuilt state, as new ones. */
 	private replayPending(txs: readonly PendingTx[]): void {
+		const gone = new Map<string, { before: string; after: string }>();
 		for (const tx of txs) {
 			// A restore of unsaved text goes again as a new transaction (or not at all: its entry
 			// stays).
@@ -1477,7 +1564,13 @@ export class LiveClient {
 			}
 			for (const [id, { before, after }] of tx.bodies) {
 				if (created.has(id)) continue;
-				if (!this.hasText(id) || !this.visible.alive(id)) continue;
+				if (!this.hasText(id) || !this.visible.alive(id)) {
+					// The block is not in the page any more (deleted, or moved to another page,
+					// while this was on its way): what was typed into it is kept for the person.
+					const prev = gone.get(id);
+					if (after !== before) gone.set(id, { before: prev?.before ?? before, after });
+					continue;
+				}
 				const current = this.textOf(id);
 				const r = merge3(before, after, current, { lenient: true });
 				if (!r.ok || r.result === current) continue;
@@ -1488,6 +1581,24 @@ export class LiveClient {
 			if (restoring && ops.length > 0)
 				this.restoring.set(this.n, { entry: restoring.entry, sent: false });
 			else if (restoring) markUnsavedAdding(restoring.entry, null);
+		}
+		if (gone.size > 0) {
+			this.log.push(`${gone.size} block(s) typed in are gone from the page: kept unsaved`);
+			keepUnsavedTexts(
+				[...gone].map(([id, { before, after }]) => {
+					let parent: string | null = this.visible.get(id)?.parentId ?? null;
+					while (parent && !this.visible.alive(parent))
+						parent = this.visible.get(parent)?.parentId ?? null;
+					return {
+						pageId: this.pageId,
+						blockId: id,
+						text: after,
+						base: before,
+						reason: "moved_away" as const,
+						restore: { parentId: parent ?? this.pageId, task: null },
+					};
+				}),
+			);
 		}
 		this.flushTyping();
 	}
@@ -1537,6 +1648,7 @@ export class LiveClient {
 	private onBatch(ack: number, head: LiveBatchHead | null, body: Uint8Array): void {
 		const commits: Array<{ o: number; apply: () => void }> = [];
 		const acks = new Map((head?.a ?? []).map((a) => [a[0], a] as const));
+		if (head?.x) this.keepLost(head.x, [...this.awaiting, ...this.pending]);
 		if (ack > 0) {
 			if (this.awaiting.length > 0) this.awaiting = this.awaiting.filter((tx) => tx.n > ack);
 			const done = this.pending.filter((tx) => tx.n <= ack);

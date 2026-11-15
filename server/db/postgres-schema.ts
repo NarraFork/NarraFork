@@ -3901,7 +3901,6 @@ export const outlineLiveLog = pgTable(
 			.references((): PgColumn => outlineSpaces.id, { onDelete: "cascade" }),
 		epoch: integer("epoch").notNull(),
 		seq: integer("seq").notNull(),
-		blockId: text("block_id"),
 		updateB64: text("update_b64").notNull(),
 		actorKind: text("actor_kind").notNull(),
 		actorId: text("actor_id").notNull(),
@@ -4519,7 +4518,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 147,
-  "columnCount": 1935,
+  "columnCount": 1934,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -26816,15 +26815,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "kind": "integer",
           "pgType": "integer",
           "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "blockId",
-          "name": "block_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
           "primary": false,
           "unique": false
         },

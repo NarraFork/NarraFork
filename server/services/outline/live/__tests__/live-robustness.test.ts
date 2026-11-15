@@ -1102,7 +1102,6 @@ describe("logs written around a commit", () => {
 		await outlineStore.appendLiveLog([
 			{
 				spaceId: space.id,
-				blockId: null,
 				epoch,
 				seq: 0,
 				updateB64: b64(
@@ -1116,7 +1115,6 @@ describe("logs written around a commit", () => {
 			},
 			{
 				spaceId: space.id,
-				blockId: null,
 				epoch,
 				seq: 1,
 				updateB64: b64(
