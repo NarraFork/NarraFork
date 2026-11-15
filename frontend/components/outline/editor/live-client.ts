@@ -192,6 +192,11 @@ interface PendingTx {
 	update: TextUpdate[];
 	/** Text before and after, per block, for replay after a rebuild. */
 	bodies: Map<string, { before: string; after: string }>;
+	/**
+	 * Text an undo or redo changed, per block (those carry no `bodies`): only for making the
+	 * change again on a block whose document the page dropped meanwhile (`dropTo`).
+	 */
+	undone?: Map<string, { before: string; after: string }>;
 	structural: boolean;
 	sent: boolean;
 	bytes: number;
@@ -345,6 +350,13 @@ export class LiveClient {
 	onTextUpdate: ((id: string, update: Uint8Array, origin: unknown) => void) | null = null;
 	private textCache = new Map<string, string>();
 	private outY: TextUpdate[] = [];
+	/**
+	 * Generations of the blocks' documents that are not 0 (`shared/outline-live-protocol.ts`,
+	 * "document generations"): what the page's last `drop` of a block said.
+	 */
+	private readonly gens = new Map<string, number>();
+	/** The highest generation the page told this client of; a resuming join names it. */
+	private era = 0;
 	private originView: ClientView | null = null;
 	private undoing = false;
 	private typingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -488,6 +500,75 @@ export class LiveClient {
 		this.docs.clear();
 		this.plain.clear();
 		this.textCache.clear();
+		this.gens.clear();
+		this.era = 0;
+	}
+
+	/** The generation of a block's document (diagnostics and tests). */
+	genOf(id: string): number {
+		return this.gens.get(id) ?? 0;
+	}
+
+	/**
+	 * The page dropped a block's document: this end drops its own (of an older generation), takes
+	 * the plain text, and forgets what its undo stack held for the block's text (the items lived
+	 * in the dropped document; the steps still undo their structure and other blocks). Changes of
+	 * this client the page has not taken (every unacknowledged one: the page drops a document
+	 * only once all it took of it is acknowledged) are taken out of their transactions and
+	 * collected in `redo`, to be made again on the new text (`rebaseDropped`).
+	 */
+	private dropTo(
+		id: string,
+		gen: number,
+		text: string,
+		redo: Array<{ id: string; changes: Array<{ before: string; after: string }> }> | null,
+	): void {
+		const old = this.docs.get(id);
+		if (old) {
+			if (old.um) this.capturing.delete(old.um);
+			old.um?.destroy();
+			old.doc.destroy();
+			this.docs.delete(id);
+		}
+		this.gens.set(id, gen);
+		this.plain.set(id, text);
+		this.textCache.delete(id);
+		for (const v of this.views) v.noteTextReset(id);
+		if (!redo) return;
+		this.outY = this.outY.filter((u) => u.id !== id);
+		const changes: Array<{ before: string; after: string }> = [];
+		for (const tx of this.pending) {
+			// A block this transaction itself creates carries its text in the operation.
+			if (!tx.ops.some((op) => op.t === "i" && op.id === id))
+				for (const typed of [tx.bodies.get(id), tx.undone?.get(id)]) if (typed) changes.push(typed);
+			tx.bodies.delete(id);
+			tx.undone?.delete(id);
+			if (tx.update.some((u) => u.id === id)) tx.update = tx.update.filter((u) => u.id !== id);
+		}
+		for (const stack of [this.undoStack, this.redoStack]) for (const s of stack) s.texts.delete(id);
+		const live = (s: Step) => s.inverse.length > 0 || s.texts.size > 0;
+		this.undoStack = this.undoStack.filter(live);
+		this.redoStack = this.redoStack.filter(live);
+		if (changes.length > 0) redo.push({ id, changes });
+	}
+
+	/** Make this client's changes of dropped documents again, on the texts the page now has. */
+	private rebaseDropped(
+		redo: ReadonlyArray<{ id: string; changes: Array<{ before: string; after: string }> }>,
+	): void {
+		const bodies = new Map<string, { before: string; after: string }>();
+		for (const { id, changes } of redo) {
+			for (const c of changes) {
+				if (!this.hasText(id)) continue;
+				const current = this.textOf(id);
+				const r = merge3(c.before, c.after, current, { lenient: true });
+				if (!r.ok || r.result === current) continue;
+				const change = this.writeBody({ id, md: r.result, hunks: r.patch }, REPLAY);
+				const prev = bodies.get(id);
+				if (change) bodies.set(id, prev ? { before: prev.before, after: change.after } : change);
+			}
+		}
+		this.enqueue([], bodies, false);
 	}
 
 	/**
@@ -567,22 +648,40 @@ export class LiveClient {
 		return s;
 	}
 
-	/** Text entries from the server: seed texts and updates of documents. */
-	private applyTexts(body: Uint8Array): void {
+	/**
+	 * Text entries from the server: seed texts, updates of documents, and drops of documents.
+	 * `fresh`: a snapshot onto emptied texts (nothing of this client's to carry over).
+	 */
+	private applyTexts(body: Uint8Array, fresh = false): void {
 		if (body.length === 0) return;
 		const entries = decodeLiveTexts(body);
 		if (!entries) {
 			this.log.push("a frame's text could not be read");
 			return;
 		}
+		const redo: Array<{ id: string; changes: Array<{ before: string; after: string }> }> = [];
 		for (const e of entries) {
+			const mine = this.gens.get(e.id) ?? 0;
+			const gen = e.gen ?? 0;
+			if (gen > this.era) this.era = gen;
+			// An entry of a generation this end has left behind.
+			if (gen < mine) continue;
 			if (e.kind === LIVE_TEXT_KIND.seed) {
 				const seed = decodeLiveSeed(e.data);
 				if (seed === null) this.log.push(`the text of ${e.id} could not be read`);
 				else this.setPlain(e.id, seed);
-			} else if (e.kind === LIVE_TEXT_KIND.update)
+			} else if (e.kind === LIVE_TEXT_KIND.drop) {
+				const text = decodeLiveSeed(e.data);
+				if (text === null) this.log.push(`the text of ${e.id} could not be read`);
+				else if (gen > mine) this.dropTo(e.id, gen, text, fresh ? null : redo);
+				else this.setPlain(e.id, text);
+			} else if (e.kind === LIVE_TEXT_KIND.update) {
+				// A document of a later generation comes whole: it starts from no text here.
+				if (gen > mine) this.dropTo(e.id, gen, "", fresh ? null : redo);
 				Y.applyUpdate(this.textDoc(e.id).doc, e.data, REMOTE);
+			}
 		}
+		if (redo.length > 0) this.rebaseDropped(redo);
 	}
 
 	/** A resuming join's body: the state vector of every document held, or null when too many. */
@@ -590,7 +689,12 @@ export class LiveClient {
 		if (this.docs.size > OUTLINE_LIVE_LIMITS.maxClientTextEntries) return null;
 		const entries: LiveTextEntry[] = [];
 		for (const [id, t] of this.docs)
-			entries.push({ id, kind: LIVE_TEXT_KIND.vector, data: Y.encodeStateVector(t.doc) });
+			entries.push({
+				id,
+				kind: LIVE_TEXT_KIND.vector,
+				...(this.gens.has(id) ? { gen: this.gens.get(id) } : {}),
+				data: Y.encodeStateVector(t.doc),
+			});
 		const body = encodeLiveTexts(entries);
 		return body.length > OUTLINE_LIVE_LIMITS.maxClientFrameBytes - 1024 ? null : body;
 	}
@@ -701,6 +805,7 @@ export class LiveClient {
 							op: this.opSeq,
 							tx: this.ackedTx,
 							...(held ? {} : { reset: true }),
+							...(this.era > 0 ? { g: this.era } : {}),
 						},
 					}
 				: {}),
@@ -878,6 +983,7 @@ export class LiveClient {
 		ops: ClientOp[],
 		bodies: Map<string, { before: string; after: string }>,
 		structural: boolean,
+		undone?: Map<string, { before: string; after: string }>,
 	): void {
 		const update = this.outY;
 		this.outY = [];
@@ -892,9 +998,23 @@ export class LiveClient {
 				const prev = tail.bodies.get(id);
 				tail.bodies.set(id, prev ? { before: prev.before, after: change.after } : change);
 			}
+			for (const [id, change] of undone ?? []) {
+				tail.undone ??= new Map();
+				const prev = tail.undone.get(id);
+				tail.undone.set(id, prev ? { before: prev.before, after: change.after } : change);
+			}
 		} else {
 			if (structural) this.flushTyping();
-			this.pending.push({ n: ++this.n, ops, update, bodies, structural, sent: false, bytes });
+			this.pending.push({
+				n: ++this.n,
+				ops,
+				update,
+				bodies,
+				...(undone && undone.size > 0 ? { undone } : {}),
+				structural,
+				sent: false,
+				bytes,
+			});
 		}
 		if (structural) this.sendPending();
 		else if (!this.typingTimer) {
@@ -923,7 +1043,12 @@ export class LiveClient {
 			const body =
 				tx.update.length > 0
 					? encodeLiveTexts(
-							tx.update.map((u) => ({ id: u.id, kind: LIVE_TEXT_KIND.update, data: u.update })),
+							tx.update.map((u) => ({
+								id: u.id,
+								kind: LIVE_TEXT_KIND.update,
+								...(this.gens.has(u.id) ? { gen: this.gens.get(u.id) } : {}),
+								data: u.update,
+							})),
 						)
 					: undefined;
 			const frame = tx.structural
@@ -1011,6 +1136,7 @@ export class LiveClient {
 		const ops: ClientOp[] = [];
 		const inverses: ClientOp[] = [];
 		const texts = new Map<string, StackItem>();
+		const undone = new Map<string, { before: string; after: string }>();
 		try {
 			for (const op of step.inverse) {
 				if (!this.validLocally(op)) {
@@ -1024,15 +1150,20 @@ export class LiveClient {
 			}
 			for (const [id, item] of step.texts) {
 				const um = this.docs.get(id)?.um;
+				const before = um ? this.textOf(id) : "";
 				const made = um ? popExactly(um, dir, item) : null;
-				if (made) texts.set(id, made);
+				this.textCache.delete(id);
+				if (made) {
+					texts.set(id, made);
+					undone.set(id, { before, after: this.textOf(id) });
+				}
 				else this.log.push(`${dir} changed nothing in ${id}: its text was changed since`);
 				this.textCache.delete(id);
 			}
 		} finally {
 			this.undoing = false;
 		}
-		this.enqueue(ops, new Map(), ops.length > 0);
+		this.enqueue(ops, new Map(), ops.length > 0, undone);
 		this.syncViews(null);
 		const sel = step.selBefore;
 		if (sel) sel.view.restoreSelection(sel);
@@ -1298,7 +1429,7 @@ export class LiveClient {
 		this.dropTexts();
 		this.capturing.clear();
 		this.outY = [];
-		this.applyTexts(body);
+		this.applyTexts(body, true);
 		this.confirmed = storeFromSnapshot(this.pageId, head.blocks ?? []);
 		// A block the snapshot sent no text for has the empty text.
 		for (const b of head.blocks ?? []) if (!this.hasText(b[0])) this.plain.set(b[0], "");

@@ -1,6 +1,6 @@
 {
-  "id": "407a309f-7e0a-4573-842a-f58767b8af6d",
-  "prevId": "5c6280b8-c028-4e92-b199-ec6aec85bda1",
+  "id": "5f84300e-7ab6-486b-8001-260579750eb6",
+  "prevId": "407a309f-7e0a-4573-842a-f58767b8af6d",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -18603,6 +18603,90 @@
         }
       },
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.outline_live_log": {
+      "name": "outline_live_log",
+      "schema": "",
+      "columns": {
+        "space_id": {
+          "name": "space_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "epoch": {
+          "name": "epoch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "seq": {
+          "name": "seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "block_id": {
+          "name": "block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "update_b64": {
+          "name": "update_b64",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor_kind": {
+          "name": "actor_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor_id": {
+          "name": "actor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "outline_live_log_space_id_outline_spaces_id_fk": {
+          "name": "outline_live_log_space_id_outline_spaces_id_fk",
+          "tableFrom": "outline_live_log",
+          "tableTo": "outline_spaces",
+          "columnsFrom": [
+            "space_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "outline_live_log_space_id_epoch_seq_pk": {
+          "name": "outline_live_log_space_id_epoch_seq_pk",
+          "columns": [
+            "space_id",
+            "epoch",
+            "seq"
+          ]
+        }
+      },
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},

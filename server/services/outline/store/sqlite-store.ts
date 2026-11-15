@@ -39,7 +39,7 @@ import {
 	outlineBlockVersions,
 	outlineCommits,
 	outlineLinks,
-	outlineLiveUpdates,
+	outlineLiveLog,
 	outlinePending,
 	outlineQuestions,
 	outlineSpaces,
@@ -77,7 +77,7 @@ import {
 	type OutlineCommitPlan,
 	type OutlineCommitRow,
 	type OutlineLinkRow,
-	type OutlineLiveUpdateRow,
+	type OutlineLiveLogRow,
 	type OutlinePendingDecision,
 	type OutlinePendingHead,
 	OutlinePendingMovedError,
@@ -163,7 +163,7 @@ type BlockSelect = typeof outlineBlocks.$inferSelect;
 type VersionSelect = typeof outlineBlockVersions.$inferSelect;
 type LinkSelect = typeof outlineLinks.$inferSelect;
 type CommitSelect = typeof outlineCommits.$inferSelect;
-type LiveUpdateSelect = typeof outlineLiveUpdates.$inferSelect;
+type LiveUpdateSelect = typeof outlineLiveLog.$inferSelect;
 
 function toSpace(row: SpaceSelect): OutlineSpaceRow {
 	// `in_process_ready` is bookkeeping of the in-process rebuild, `last_commit_at` the reports'
@@ -204,11 +204,11 @@ function toCommit(row: CommitSelect): OutlineCommitRow {
 	};
 }
 
-function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveUpdateRow {
+function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveLogRow {
 	return { ...row, actorKind: row.actorKind as OutlineActorKind };
 }
 
-/** Rows per multi-row INSERT of the live log (7 columns each). */
+/** Rows per multi-row INSERT of the live log (8 columns each). */
 type ViewStateSelect = typeof outlineViewState.$inferSelect;
 
 function toViewState(row: ViewStateSelect): OutlineViewStateRow {
@@ -908,79 +908,79 @@ export const sqliteOutlineStore: OutlineStore = {
 		return rows.map(toCommit);
 	},
 
-	async appendLiveUpdates(rows) {
+	async appendLiveLog(rows) {
 		if (rows.length === 0) return;
 		await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
 					for (const chunk of chunked(rows, LIVE_INSERT_CHUNK)) {
-						tx.insert(outlineLiveUpdates).values(chunk).run();
+						tx.insert(outlineLiveLog).values(chunk).run();
 					}
 				}),
-			{ label: "outline.appendLiveUpdates", maxRetries: 3 },
+			{ label: "outline.appendLiveLog", maxRetries: 3 },
 		);
 	},
 
-	async replaceLiveUpdates(pageBlockId, epoch, rows) {
+	async replaceLiveLog(spaceId, epoch, rows) {
 		await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
-					tx.delete(outlineLiveUpdates)
+					tx.delete(outlineLiveLog)
 						.where(
 							and(
-								eq(outlineLiveUpdates.pageBlockId, pageBlockId),
-								eq(outlineLiveUpdates.epoch, epoch),
+								eq(outlineLiveLog.spaceId, spaceId),
+								eq(outlineLiveLog.epoch, epoch),
 							),
 						)
 						.run();
 					for (const chunk of chunked(rows, LIVE_INSERT_CHUNK)) {
-						tx.insert(outlineLiveUpdates).values(chunk).run();
+						tx.insert(outlineLiveLog).values(chunk).run();
 					}
 				}),
-			{ label: "outline.replaceLiveUpdates", maxRetries: 3 },
+			{ label: "outline.replaceLiveLog", maxRetries: 3 },
 		);
 	},
 
-	async listLiveUpdates(pageBlockId, epoch, options) {
+	async listLiveLog(spaceId, epoch, options) {
 		const rows = db
 			.select()
-			.from(outlineLiveUpdates)
+			.from(outlineLiveLog)
 			.where(
 				and(
-					eq(outlineLiveUpdates.pageBlockId, pageBlockId),
-					eq(outlineLiveUpdates.epoch, epoch),
-					options.afterSeq === undefined ? undefined : gt(outlineLiveUpdates.seq, options.afterSeq),
+					eq(outlineLiveLog.spaceId, spaceId),
+					eq(outlineLiveLog.epoch, epoch),
+					options.afterSeq === undefined ? undefined : gt(outlineLiveLog.seq, options.afterSeq),
 				),
 			)
-			.orderBy(asc(outlineLiveUpdates.seq))
+			.orderBy(asc(outlineLiveLog.seq))
 			.limit(options.limit)
 			.all();
 		return rows.map(toLiveUpdate);
 	},
 
-	async deleteLiveUpdates(pageBlockId, epoch) {
+	async deleteLiveLog(spaceId, epoch) {
 		return db
-			.delete(outlineLiveUpdates)
+			.delete(outlineLiveLog)
 			.where(
-				and(eq(outlineLiveUpdates.pageBlockId, pageBlockId), eq(outlineLiveUpdates.epoch, epoch)),
+				and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)),
 			)
-			.returning({ seq: outlineLiveUpdates.seq })
+			.returning({ seq: outlineLiveLog.seq })
 			.all().length;
 	},
 
-	async listLiveEpochs(options) {
+	async listLiveLogEpochs(options) {
 		const after = options.after;
 		// GROUP BY the primary key's prefix walks the key in order without a sort.
 		const rows = db
-			.select({ pageBlockId: outlineLiveUpdates.pageBlockId, epoch: outlineLiveUpdates.epoch })
-			.from(outlineLiveUpdates)
+			.select({ spaceId: outlineLiveLog.spaceId, epoch: outlineLiveLog.epoch })
+			.from(outlineLiveLog)
 			.where(
 				after
-					? sql`(${outlineLiveUpdates.pageBlockId}, ${outlineLiveUpdates.epoch}) > (${after.pageBlockId}, ${after.epoch})`
+					? sql`(${outlineLiveLog.spaceId}, ${outlineLiveLog.epoch}) > (${after.spaceId}, ${after.epoch})`
 					: undefined,
 			)
-			.groupBy(outlineLiveUpdates.pageBlockId, outlineLiveUpdates.epoch)
-			.orderBy(asc(outlineLiveUpdates.pageBlockId), asc(outlineLiveUpdates.epoch))
+			.groupBy(outlineLiveLog.spaceId, outlineLiveLog.epoch)
+			.orderBy(asc(outlineLiveLog.spaceId), asc(outlineLiveLog.epoch))
 			.limit(options.limit)
 			.all();
 		return rows;

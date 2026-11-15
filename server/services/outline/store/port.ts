@@ -141,17 +141,18 @@ export interface OutlineCommitRow {
 }
 
 /**
- * One row of a page's live session log (`outline_live_updates`), base64: text entries naming
- * their blocks (`encodeLogTexts` in `live/session.ts`: a block's seed text, or a Yjs update of
- * that block's document), or a JSON sync row. Seq 0 of an epoch, or the first row after a
- * compaction, holds every text document of the session whole; the rows after it are increments.
- * Replaying an epoch's rows in seq order rebuilds each block's document. The table's schema
- * comment (`update_b64` "is the Yjs update") predates this format; the column is unchanged.
+ * One row of a space's live session log (`outline_live_log`), base64: text entries naming
+ * their blocks (`encodeLogTexts` in `live/session.ts`: a block's seed text, a Yjs update of
+ * that block's document, or the drop of its document), or a JSON sync row. Seq 0 of an epoch,
+ * or the first row after a compaction, holds every text document of the session whole; the
+ * rows after it are increments. Replaying an epoch's rows in seq order rebuilds each block's
+ * document. `blockId` names the block of a text row that concerns exactly one, null otherwise.
  */
-export interface OutlineLiveUpdateRow {
-	pageBlockId: string;
+export interface OutlineLiveLogRow {
+	spaceId: string;
 	epoch: number;
 	seq: number;
+	blockId: string | null;
 	updateB64: string;
 	actorKind: OutlineActorKind;
 	actorId: string;
@@ -1014,31 +1015,31 @@ export interface OutlineStore
 	markQuestionsDelivered(blockIds: readonly string[], at: string): Promise<number>;
 
 	// ── live session log (`services/outline/live/`) ─────────────────────────────────────
-	// Not part of a page's history: rows are written while a page is edited live and deleted
+	// Not part of history: rows are written while a space is edited live and deleted
 	// once the session's text is committed. Each call is one small indexed statement or one
 	// short transaction; callers bound the row counts.
 
 	/** Append rows (at most a handful per call). */
-	appendLiveUpdates(rows: readonly OutlineLiveUpdateRow[]): Promise<void>;
+	appendLiveLog(rows: readonly OutlineLiveLogRow[]): Promise<void>;
 	/** Replace every row of an epoch with `rows`, atomically (a compaction). */
-	replaceLiveUpdates(
-		pageBlockId: string,
+	replaceLiveLog(
+		spaceId: string,
 		epoch: number,
-		rows: readonly OutlineLiveUpdateRow[],
+		rows: readonly OutlineLiveLogRow[],
 	): Promise<void>;
 	/** Rows of an epoch by seq, after `afterSeq`, at most `limit`. */
-	listLiveUpdates(
-		pageBlockId: string,
+	listLiveLog(
+		spaceId: string,
 		epoch: number,
 		options: { afterSeq?: number; limit: number },
-	): Promise<OutlineLiveUpdateRow[]>;
+	): Promise<OutlineLiveLogRow[]>;
 	/** Delete every row of an epoch; returns how many went. */
-	deleteLiveUpdates(pageBlockId: string, epoch: number): Promise<number>;
-	/** Epochs that have rows, ordered by page then epoch, after `after`, at most `limit`. */
-	listLiveEpochs(options: {
-		after?: { pageBlockId: string; epoch: number };
+	deleteLiveLog(spaceId: string, epoch: number): Promise<number>;
+	/** Epochs that have rows, ordered by space then epoch, after `after`, at most `limit`. */
+	listLiveLogEpochs(options: {
+		after?: { spaceId: string; epoch: number };
 		limit: number;
-	}): Promise<Array<{ pageBlockId: string; epoch: number }>>;
+	}): Promise<Array<{ spaceId: string; epoch: number }>>;
 
 	// ── view state (`services/outline/view-state.ts`) ───────────────────────────────────
 	// One row per person and page, read and written by primary key: one small statement each.

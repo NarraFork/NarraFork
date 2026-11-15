@@ -533,6 +533,13 @@
 			"when": 1794664879668,
 			"tag": "0075_outline_edges_by_parent",
 			"breakpoints": true
+		},
+		{
+			"idx": 76,
+			"version": "7",
+			"when": 1794715028216,
+			"tag": "0076_outline_live_log",
+			"breakpoints": true
 		}
   ]
 }

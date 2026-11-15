@@ -33,6 +33,23 @@
  *     document's whole state).
  *   - `vector`: the state vector of a document the client holds (C→S, in a resuming join): the
  *     answer carries what that document lacks, and every document the client did not name whole.
+ *   - `drop` (S→C; L2): the server dropped the block's document (its text is committed and
+ *     nobody changed it for a while, or the session ran short of room). The payload is the
+ *     block's plain text and the GENERATION its next document will have. The client forgets its
+ *     document of an older generation, takes the plain text, and makes what it typed and the
+ *     server had not taken into a new change on top (`live-client.ts` `dropTo`).
+ *
+ * DOCUMENT GENERATIONS (L2). Every end must hold every item of a document it has, so a document
+ * cannot be dropped by one end alone. Each block has a generation (0 at first; set by `drop`,
+ * drawn from one counter of the session so it only grows). A document is "the document of block
+ * B at generation G", made by each end from the plain text it holds for B at G. `update` and
+ * `vector` entries name their generation: the server skips a client's update of an older
+ * generation (the client, told of the drop on the same ordered stream, sends that typing again
+ * as a change of the new document) and refuses one of a generation it never announced. A
+ * resuming client names the generation of every document it holds; for one that is no longer
+ * the block's generation the answer is a `drop`. A generation instead of an acknowledged drop:
+ * the server keeps no per-participant state per document, and a client that was away needs the
+ * comparison anyway.
  *
  * A typing frame is therefore 5 bytes of framing, the block id and the Yjs update, in both
  * directions.
@@ -215,8 +232,10 @@ export interface LiveJoinHead {
 	 * `reset` the client asks to resume it (the body names the documents it holds); with `reset`
 	 * it wants a snapshot. Either way the answer says which of its transactions of that session
 	 * the page already has (`tx`, `dur`), so the client neither loses nor repeats them.
+	 * `g` (L2): the highest document generation the page told this client of; the answer to a
+	 * resume drops every document of a later generation the client may hold.
 	 */
-	resume?: { epoch: number; op: number; tx: number; reset?: boolean };
+	resume?: { epoch: number; op: number; tx: number; reset?: boolean; g?: number };
 }
 
 /**
@@ -490,14 +509,33 @@ export function decodeLiveFrame(bytes: Uint8Array, maxHeadBytes?: number): LiveF
 	return { kind: bytes[1] as number, handle, n, head, body: bytes.subarray(at + headLength) };
 }
 
-export const LIVE_TEXT_KIND = { seed: 0, update: 1, vector: 2 } as const;
+/**
+ * Kinds of text entries. `drop` (L2): the block's document, if any, is dropped; its text is the
+ * plain text in the payload, and a document made for it from now on is of generation `gen`.
+ */
+export const LIVE_TEXT_KIND = { seed: 0, update: 1, vector: 2, drop: 3 } as const;
 
 export type LiveTextKind = (typeof LIVE_TEXT_KIND)[keyof typeof LIVE_TEXT_KIND];
 
-/** One block's text in a frame body (see the module header). */
+/** Wire kinds of an `update` and a `vector` of a document of a generation other than 0. */
+const WIRE_UPDATE_AT = 4;
+const WIRE_VECTOR_AT = 5;
+
+/**
+ * One block's text in a frame body (see the module header).
+ *
+ * `gen` is the generation of the block's document (L2, document eviction): 0 until the server
+ * first drops the block's document, then whatever the last `drop` entry said. Every end makes a
+ * block's document from the plain text it holds for it at that generation, so documents of one
+ * generation are the same document; an entry of another generation never touches it. A `drop`
+ * always carries its generation; `update` and `vector` carry it when it is not 0 (on the wire
+ * as kinds 4 and 5, the generation before the payload); a `seed` is of generation 0.
+ */
 export interface LiveTextEntry {
 	id: string;
 	kind: LiveTextKind;
+	/** See the interface comment; absent means 0. */
+	gen?: number;
 	data: Uint8Array;
 }
 
@@ -525,27 +563,42 @@ export function decodeLiveSeed(data: Uint8Array): string | null {
 /**
  * Encode text entries as a frame body:
  *   varuint  bytes of the block id      …  the id (UTF-8)
- *   byte     kind
- *   varuint  bytes of the payload       …  the payload
+ *   byte     kind (0 seed, 1 update, 2 vector, 3 drop, 4 update of a generation, 5 vector of one)
+ *   varuint  bytes of the payload       …  the payload; kinds 3, 4 and 5 start it with the
+ *                                          generation as a varuint
  * repeated to the end of the body.
  */
 export function encodeLiveTexts(entries: readonly LiveTextEntry[]): Uint8Array {
 	if (entries.length === 0) return EMPTY;
 	const ids = entries.map((e) => encoder.encode(e.id));
+	/** The wire kind, and the generation when the wire carries it (-1: it does not). */
+	const wire = (e: LiveTextEntry): [number, number] => {
+		const gen = e.gen ?? 0;
+		if (e.kind === LIVE_TEXT_KIND.drop) return [LIVE_TEXT_KIND.drop, gen];
+		if (gen === 0) return [e.kind, -1];
+		if (e.kind === LIVE_TEXT_KIND.update) return [WIRE_UPDATE_AT, gen];
+		if (e.kind === LIVE_TEXT_KIND.vector) return [WIRE_VECTOR_AT, gen];
+		// A plain text of a later generation is what a drop says.
+		return [LIVE_TEXT_KIND.drop, gen];
+	};
 	let size = 0;
 	entries.forEach((e, i) => {
 		const id = ids[i] as Uint8Array;
-		size += varuintSize(id.length) + id.length + 1 + varuintSize(e.data.length) + e.data.length;
+		const [, gen] = wire(e);
+		const payload = (gen < 0 ? 0 : varuintSize(gen)) + e.data.length;
+		size += varuintSize(id.length) + id.length + 1 + varuintSize(payload) + payload;
 	});
 	const out = new Uint8Array(size);
 	let at = 0;
 	entries.forEach((e, i) => {
 		const id = ids[i] as Uint8Array;
+		const [kind, gen] = wire(e);
 		at = writeVaruint(out, at, id.length);
 		out.set(id, at);
 		at += id.length;
-		out[at++] = e.kind;
-		at = writeVaruint(out, at, e.data.length);
+		out[at++] = kind;
+		at = writeVaruint(out, at, (gen < 0 ? 0 : varuintSize(gen)) + e.data.length);
+		if (gen >= 0) at = writeVaruint(out, at, gen);
 		out.set(e.data, at);
 		at += e.data.length;
 	});
@@ -593,11 +646,30 @@ export function decodeLiveTexts(
 		}
 		at += idLength;
 		const kind = bytes[at++] as number;
-		if (kind !== 0 && kind !== 1 && kind !== 2) return null;
+		if (!Number.isInteger(kind) || kind < 0 || kind > WIRE_VECTOR_AT) return null;
 		const length = read();
 		if (length === null || at + length > bytes.length) return null;
-		out.push({ id, kind, data: bytes.subarray(at, at + length) });
-		at += length;
+		const end = at + length;
+		if (kind <= LIVE_TEXT_KIND.vector) {
+			out.push({ id, kind: kind as LiveTextKind, data: bytes.subarray(at, end) });
+		} else {
+			const gen = read();
+			if (gen === null || at > end || gen > 0x7fffffff) return null;
+			// Generation 0 is written without one: a second spelling of an entry is refused.
+			if (gen === 0 && kind !== LIVE_TEXT_KIND.drop) return null;
+			out.push({
+				id,
+				kind:
+					kind === WIRE_UPDATE_AT
+						? LIVE_TEXT_KIND.update
+						: kind === WIRE_VECTOR_AT
+							? LIVE_TEXT_KIND.vector
+							: LIVE_TEXT_KIND.drop,
+				gen,
+				data: bytes.subarray(at, end),
+			});
+		}
+		at = end;
 	}
 	return out;
 }
