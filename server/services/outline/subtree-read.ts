@@ -624,6 +624,13 @@ export interface OutlineSubtreeRequest {
 	 * sets empty for a reader who never folded anything here).
 	 */
 	fold?: { expanded: ReadonlySet<string>; collapsed: ReadonlySet<string> };
+	/**
+	 * With `fold` and no root (a whole space): its top-level blocks are closed unless the
+	 * reader opened them, whatever the default and whatever is under them (a space's landing
+	 * view lists them one line each; what they hide is counted by the marks). What is under
+	 * one the reader opened folds by the default, as under a focused root.
+	 */
+	topClosed?: boolean;
 	narratorVisible?: (narratorId: string) => Promise<boolean>;
 	store?: OutlineStore;
 }
@@ -692,11 +699,13 @@ export async function readOutlineSubtree(
 		const over: ReadonlySet<string> | null = attention?.over ?? null;
 
 		const fold = request.fold;
+		const topClosed = request.topClosed === true && rootId === null;
 		const foldAt = new Map<string, FoldAt>();
 		const isOpen = (row: OutlineLevelRow, at: FoldAt): boolean => {
 			if (!fold) return true;
 			if (at.depth >= FOLD_MAX_OPEN_DEPTH) return false;
 			if (fold.expanded.has(row.id)) return true;
+			if (topClosed && at.depth === 1) return false;
 			if (fold.collapsed.has(row.id)) return false;
 			if (over?.has(row.id)) return true;
 			const status = row.taskJson?.status ?? null;

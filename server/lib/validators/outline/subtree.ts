@@ -1,4 +1,4 @@
-import { OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
+import { OUTLINE_FOLD_STATE_LIMITS, OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
 import { z } from "zod";
 import { outlineIdSchema } from "./index";
 
@@ -45,6 +45,11 @@ export const outlineSubtreeQuerySchema = z
 		bytes: limitSchema(OUTLINE_SUBTREE_LIMITS.maxBytes).optional(),
 		/** Do not go below rows closed by default and by the reader. */
 		fold: z.literal("default").optional(),
+		/**
+		 * With `fold`, reading a whole space: its top-level blocks are closed unless the reader
+		 * opened them (a space's landing view lists them one line each).
+		 */
+		top: z.literal("closed").optional(),
 	})
 	.refine(...asOfExclusive);
 
@@ -101,4 +106,12 @@ export const outlineChangedChildrenQuerySchema = z.object({
 export const outlineSubtreeTimelineQuerySchema = z.object({
 	before: seqSchema.optional(),
 	limit: limitSchema(OUTLINE_SUBTREE_LIMITS.maxTimeline).optional(),
+});
+
+/** `PUT /spaces/:spaceId/fold-state` */
+export const outlineFoldStatePutSchema = z.object({
+	changes: z
+		.array(z.object({ blockId: outlineIdSchema, open: z.boolean().nullable() }))
+		.min(1)
+		.max(OUTLINE_FOLD_STATE_LIMITS.maxChanges),
 });

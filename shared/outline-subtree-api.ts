@@ -223,3 +223,42 @@ export const OUTLINE_HISTORY_ERROR_CODES = {
 	"not-ready": "OUTLINE_HISTORY_NOT_READY",
 	"before-floor": "OUTLINE_HISTORY_BEFORE_FLOOR",
 } as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A reader's own folding, by block (pageless outline, F1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * What a reader opened and closed in one space, one row per block (`outline_fold_state`). A
+ * block in neither set follows the default folding (`shared/outline-fold.ts`), so a task that
+ * gets done later closes by itself. Personal, never part of the block model, never a commit.
+ */
+export const OUTLINE_FOLD_STATE_LIMITS = {
+	/**
+	 * Blocks one reader has a stored folding for in one space. Writing more drops the ones
+	 * written longest ago (they go back to the default).
+	 */
+	maxPerSpace: 2000,
+	/** Blocks one write names at most. */
+	maxChanges: 500,
+	/** Bytes of a write's body. */
+	maxBodyBytes: 64 * 1024,
+} as const;
+
+/** `GET /spaces/:spaceId/fold-state` and the answer of a write. */
+export interface OutlineFoldStateResponse {
+	spaceId: string;
+	/** Opened by the reader: closed by default. */
+	expanded: string[];
+	/** Closed by the reader: open by default. */
+	collapsed: string[];
+}
+
+/**
+ * `PUT /spaces/:spaceId/fold-state`: changes, not the whole state, so two tabs of one reader do
+ * not undo each other. `open: null` puts the block back to its default (its row is removed).
+ * Ids that are not live blocks of the space are dropped silently.
+ */
+export interface OutlineFoldStatePutBody {
+	changes: Array<{ blockId: string; open: boolean | null }>;
+}

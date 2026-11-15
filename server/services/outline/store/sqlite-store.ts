@@ -38,6 +38,7 @@ import {
 	outlineBlocks,
 	outlineBlockVersions,
 	outlineCommits,
+	outlineFoldState,
 	outlineLinks,
 	outlineLiveUpdates,
 	outlinePending,
@@ -1055,6 +1056,83 @@ export const sqliteOutlineStore: OutlineStore = {
 						.run();
 				}),
 			{ label: "outline.putViewState", maxRetries: 3 },
+		);
+	},
+
+	async listFoldState(userId, spaceId, limit) {
+		return db
+			.select({
+				blockId: outlineFoldState.blockId,
+				open: outlineFoldState.open,
+				updatedAt: outlineFoldState.updatedAt,
+			})
+			.from(outlineFoldState)
+			.where(and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId)))
+			.orderBy(desc(outlineFoldState.updatedAt), desc(outlineFoldState.blockId))
+			.limit(limit)
+			.all();
+	},
+
+	async putFoldState(userId, spaceId, changes, updatedAt, keep) {
+		const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
+		const written = changes.flatMap((change) => (change.open === null ? [] : [change.blockId]));
+		const removed = changes.flatMap((change) => (change.open === null ? [change.blockId] : []));
+		const justWritten = new Set(written);
+		await withDbRetry(
+			async () =>
+				db.transaction((tx) => {
+					for (const chunk of chunked(removed)) {
+						tx.delete(outlineFoldState)
+							.where(and(own, inArray(outlineFoldState.blockId, chunk)))
+							.run();
+					}
+					const writes = changes.filter((change) => change.open !== null);
+					for (const chunk of chunked(writes, 100)) {
+						tx.insert(outlineFoldState)
+							.values(
+								chunk.map((change) => ({
+									userId,
+									spaceId,
+									blockId: change.blockId,
+									open: change.open === true,
+									updatedAt,
+								})),
+							)
+							.onConflictDoUpdate({
+								target: [
+									outlineFoldState.userId,
+									outlineFoldState.spaceId,
+									outlineFoldState.blockId,
+								],
+								set: { open: sql`excluded.open`, updatedAt },
+							})
+							.run();
+					}
+					// Past the cap: the rows written longest ago go, never the ones just written (a
+					// clock stepping back could make them the oldest; they then stay beside the
+					// `keep` newest until a later write).
+					const kept = tx
+						.select({ id: outlineFoldState.blockId })
+						.from(outlineFoldState)
+						.where(own)
+						.orderBy(desc(outlineFoldState.updatedAt), desc(outlineFoldState.blockId))
+						.limit(keep);
+					const stale = tx
+						.select({ id: outlineFoldState.blockId })
+						.from(outlineFoldState)
+						.where(and(own, notInArray(outlineFoldState.blockId, kept)))
+						// At most `keep` rows were there and one write adds `changes.length`.
+						.limit(2 * changes.length + 2)
+						.all()
+						.map((row) => row.id)
+						.filter((id) => !justWritten.has(id));
+					for (const chunk of chunked(stale)) {
+						tx.delete(outlineFoldState)
+							.where(and(own, inArray(outlineFoldState.blockId, chunk)))
+							.run();
+					}
+				}),
+			{ label: "outline.putFoldState", maxRetries: 3 },
 		);
 	},
 

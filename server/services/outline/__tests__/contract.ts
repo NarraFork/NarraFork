@@ -2082,6 +2082,122 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "fold state by block: per person and space, changes not replacement, the oldest dropped past the cap",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const otherSpace = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "fold one" },
+				{ op: "insert", parent: null, content: "fold two" },
+				{ op: "insert", parent: null, content: "fold three" },
+				{ op: "insert", parent: null, content: "fold four" },
+			]);
+			const [one, two, three, four] = r.results.map((x) => x.blockId) as [
+				string,
+				string,
+				string,
+				string,
+			];
+			const elsewhere = (
+				await write(ctx, otherSpace, [{ op: "insert", parent: null, content: "fold elsewhere" }])
+			).results[0]?.blockId as string;
+			const me = await ctx.seedUser();
+			const other = await ctx.seedUser();
+			const at = (n: number) => `2026-11-15T00:00:0${n}.000Z`;
+			const read = async (user: string, spaceId = space.id) =>
+				(await ctx.store.listFoldState(user, spaceId, 100)).map((row) => [row.blockId, row.open]);
+			expect(await read(me)).toEqual([]);
+			await ctx.store.putFoldState(
+				me,
+				space.id,
+				[
+					{ blockId: one, open: true },
+					{ blockId: two, open: false },
+				],
+				at(1),
+				100,
+			);
+			expect(new Map((await read(me)) as Array<[string, boolean]>)).toEqual(
+				new Map([
+					[one, true],
+					[two, false],
+				]),
+			);
+			// Changes: an unnamed block keeps its row; a named one is replaced; null removes.
+			await ctx.store.putFoldState(
+				me,
+				space.id,
+				[
+					{ blockId: two, open: true },
+					{ blockId: three, open: false },
+				],
+				at(2),
+				100,
+			);
+			expect(new Map((await read(me)) as Array<[string, boolean]>)).toEqual(
+				new Map([
+					[one, true],
+					[two, true],
+					[three, false],
+				]),
+			);
+			// The most recently written come first.
+			expect((await read(me)).at(-1)?.[0]).toBe(one);
+			await ctx.store.putFoldState(me, space.id, [{ blockId: one, open: null }], at(3), 100);
+			expect((await read(me)).map((row) => row[0]).sort()).toEqual([two, three].sort());
+			// Removing a row that is not there changes nothing.
+			await ctx.store.putFoldState(me, space.id, [{ blockId: four, open: null }], at(3), 100);
+			expect((await read(me)).length).toBe(2);
+			// Per person, per space.
+			expect(await read(other)).toEqual([]);
+			await ctx.store.putFoldState(other, space.id, [{ blockId: two, open: false }], at(3), 100);
+			await ctx.store.putFoldState(
+				me,
+				otherSpace.id,
+				[{ blockId: elsewhere, open: true }],
+				at(3),
+				100,
+			);
+			expect(await read(other)).toEqual([[two, false]]);
+			expect(await read(me, otherSpace.id)).toEqual([[elsewhere, true]]);
+			expect((await read(me)).length).toBe(2);
+			// The limit of a read.
+			expect((await ctx.store.listFoldState(me, space.id, 1)).length).toBe(1);
+			// Past the cap the rows written longest ago go: `two` and `three` (at 2) make room.
+			await ctx.store.putFoldState(
+				me,
+				space.id,
+				[
+					{ blockId: one, open: true },
+					{ blockId: four, open: true },
+				],
+				at(4),
+				2,
+			);
+			expect((await read(me)).map((row) => row[0]).sort()).toEqual([one, four].sort());
+			// … never another person's, never another space's.
+			expect(await read(other)).toEqual([[two, false]]);
+			expect(await read(me, otherSpace.id)).toEqual([[elsewhere, true]]);
+			// A clock that stepped back: what was just written is never what is dropped.
+			await ctx.store.putFoldState(
+				me,
+				space.id,
+				[{ blockId: two, open: false }],
+				"2026-11-14T00:00:00.000Z",
+				2,
+			);
+			const after = (await read(me)).map((row) => row[0]);
+			expect(after).toContain(two);
+			expect(after.length).toBe(3);
+			// … it stays beside the newest until a later write, which then drops it as the oldest.
+			await ctx.store.putFoldState(me, space.id, [{ blockId: three, open: true }], at(5), 2);
+			const later = (await read(me)).map((row) => row[0]);
+			expect(later.length).toBe(2);
+			expect(later).toContain(three);
+			expect(later).not.toContain(two);
+		},
+	},
+	{
 		name: "tasks seen finished: per person and task, the higher version kept, old rows pruned",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
