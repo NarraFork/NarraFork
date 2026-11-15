@@ -8,10 +8,11 @@
  *     fontSizes / lineHeights / headings.sizes / spacing / radius
  *   - MarkdownContent.module.css (the ground-truth markdown styles)
  *
- * The app theme overrides `fontFamily` to the stack in `styles/tokens.css`
- * (`--nf-font-ui` / `--nf-font-mono`). `SANS_FAMILY` below is that same stack, written
- * out, because canvas `measureText` does not resolve CSS variables. `fontSizes` /
- * `lineHeights` / `headings` stay on Mantine's defaults.
+ * The app theme overrides `fontFamily` to the UI stack in `styles/tokens.css`
+ * (`--nf-font-ui`). `SANS_FAMILY` below is that same stack, written out, because canvas
+ * `measureText` does not resolve CSS variables. `MONO_FAMILY` stays Mantine's default
+ * monospace: the vlist paints code with these strings, not `--nf-font-mono`. `fontSizes`
+ * / `lineHeights` / `headings` stay on Mantine's defaults.
  *
  * IMPORTANT: pretext `font` strings follow the CSS shorthand accepted by canvas
  * `measureText`: "[style] [weight] <size>px <family>". Keep size in px.

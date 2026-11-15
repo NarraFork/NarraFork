@@ -60,9 +60,9 @@ const TEXTAREA_LINE_HEIGHT = `var(${TYPOGRAPHY_CSS_VARS.xsBaseLine}, 1.55)`;
 const TEXTAREA_LETTER_SPACING = `var(${TYPOGRAPHY_CSS_VARS.letterSpacing}, normal)`;
 /**
  * Size and family are separate properties. The `font` shorthand rejects a family that
- * arrives as a `var()` of a comma-separated stack (`--mantine-font-family` is
- * `var(--nf-font-ui)`), and the whole declaration is then dropped — the stand-in
- * inherits 16px instead of the xs size the live textarea paints.
+ * arrives as a `var()` of a comma-separated stack (`--mantine-font-family` is the UI
+ * stack, the same list as `--nf-font-ui`), and the whole declaration is then dropped —
+ * the stand-in inherits 16px instead of the xs size the live textarea paints.
  */
 const textareaFont = (family: string) => ({
 	fontSize: TEXTAREA_FONT_SIZE,
