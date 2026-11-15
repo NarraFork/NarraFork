@@ -12,8 +12,11 @@
  *
  * TWO KINDS OF WATCH
  * ------------------
- *   - a LEVEL (an open parent): told when the list of its children changed (one created, moved
- *     in or out, reordered, deleted, restored) or one of its direct children changed itself.
+ *   - a LEVEL (an open parent): told when a read of that level would differ: the list of its
+ *     children changed (one created, moved in or out, reordered, deleted, restored), one of its
+ *     direct children changed itself, or the list of children of one of its children changed
+ *     (a row says whether it has children, so a child gaining its first child or losing its
+ *     last shows in the level; it is told whenever a child's list changes, not only then).
  *     Not told about anything deeper.
  *   - a SUBTREE (a timeline, a board, a plan card, a closed row's marks): told when the block
  *     itself or anything that was under it changed, before or after the commit (a block moved
@@ -32,15 +35,12 @@ export const OUTLINE_COMMIT_CHANGE_LIMITS = { ids: 512 } as const;
  */
 export interface OutlineCommitChanges {
 	/**
-	 * Parent keys with a direct child the commit gave a version: the parent before the commit
-	 * and the parent after it, of every changed block.
+	 * Parent keys of the levels that read differently after the commit: the parent before the
+	 * commit and the parent after it of every changed block, and, for a block that was
+	 * created, moved, deleted or restored, the parent of each of those parents too (their row
+	 * there says whether they have children).
 	 */
 	parentKeys: string[];
-	/**
-	 * The parent keys among those whose LIST of children changed: a child was created, moved
-	 * (in, out, or among its siblings), deleted or restored.
-	 */
-	listParentKeys: string[];
 	/** The blocks the commit gave a version. */
 	blockIds: string[];
 	/**
@@ -54,7 +54,6 @@ export interface OutlineCommitChanges {
 /** {@link OutlineCommitChanges} from whole sets, cut to the limits. */
 export function buildOutlineCommitChanges(input: {
 	parentKeys: Iterable<string>;
-	listParentKeys: Iterable<string>;
 	blockIds: Iterable<string>;
 	ancestorIds: Iterable<string>;
 }): OutlineCommitChanges {
@@ -72,7 +71,6 @@ export function buildOutlineCommitChanges(input: {
 	};
 	const changes = {
 		parentKeys: cut(input.parentKeys),
-		listParentKeys: cut(input.listParentKeys),
 		blockIds: cut(input.blockIds),
 		ancestorIds: cut(input.ancestorIds),
 	};
@@ -121,6 +119,12 @@ export function outlineSubtreeChanged(index: OutlineCommitChangeIndex, rootKey: 
  * One subscription watches one space. Sending `outline_watch` again with the same
  * `subscriptionId` REPLACES what it watches (a client sends its whole set when a row opens or
  * closes); the answer is a new `outline_watching`.
+ *
+ * REPLACING LOSES NOTHING. A change the old set was already told of but whose frame had not
+ * gone out yet (frames are coalesced) is carried over: for the keys the new set still
+ * watches, it arrives in an `outline_watch_changed` after the new `outline_watching`. Keys
+ * the new set dropped are forgotten, and so is everything when the space changes. A key that
+ * is new in the set has no past: the client reads it when it starts watching it.
  */
 export type OutlineWatchClientMessage =
 	| {
@@ -180,6 +184,8 @@ export const OUTLINE_WATCH_LIMITS = {
 	perSocket: 16,
 	/** Subscriptions of one space across sockets. */
 	perSpace: 200,
+	/** Subscriptions of one space one person holds, across their sockets and tabs. */
+	perUserPerSpace: 24,
 	/** Levels and subtrees one subscription watches, together. */
 	keysPerSubscription: 2000,
 	/** Keys one change frame names at most; past it the frame says `all`. */

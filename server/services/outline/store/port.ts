@@ -813,16 +813,6 @@ export interface OutlineStore
 	): Promise<OutlineBlockMeta[]>;
 	/** Blocks by id in any space, live or deleted, without content (primary key, chunked). */
 	getBlockMetasByIds(ids: readonly string[]): Promise<OutlineBlockMeta[]>;
-	/**
-	 * The parent of each of the given blocks that is a LIVE block of the space (`null`: a
-	 * top-level block); deleted blocks, blocks of other spaces and unknown ids are left out. By
-	 * primary key, chunked, two columns: what walking many blocks up to the space reads
-	 * (`subtree-marks.ts`).
-	 */
-	getLiveParents(
-		spaceId: string,
-		ids: readonly string[],
-	): Promise<Array<{ id: string; parentId: string | null }>>;
 	/** Live blocks holding `alias` in any of the spaces (the alias index, chunked). */
 	findAliasOwnersInSpaces(
 		spaceIds: readonly string[],

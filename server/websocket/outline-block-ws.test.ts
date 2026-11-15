@@ -14,6 +14,7 @@ import { aclGrants, narrators, projects, users } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
+import { narratorWsMessageSchema } from "../lib/validators/websocket";
 import { ensureProjectSpace, ensureSessionSpace } from "../services/outline/spaces";
 import type { OutlineSpaceRow } from "../services/outline/store/port";
 import { type OutlineOp, writeOutline } from "../services/outline/write";
@@ -262,6 +263,83 @@ describe("watching", () => {
 		expect(outlineBlockSubscriptionStats().total).toBe(0);
 	});
 
+	test("replacing a subscription keeps a change it was told of and had not sent yet", async () => {
+		const ws = socket(reader);
+		await watch(ws, "s1", space.id, { levels: [a] });
+		// A commit under A, and the set re-sent before its frame went out.
+		const added = await commit(space, [
+			{ op: "insert", parent: { id: a }, content: "New under A" },
+		]);
+		await watch(ws, "s1", space.id, { levels: [a, c] });
+		await settle(() => changes(ws).length === 1);
+		expect(ws.frames.map((frame) => frame.type)).toEqual([
+			"outline_watching",
+			"outline_watching",
+			"outline_watch_changed",
+		]);
+		expect(changes(ws)[0]).toMatchObject({
+			subscriptionId: "s1",
+			seq: added.seq,
+			commitIds: [added.id],
+			levels: [a],
+			subtrees: [],
+			all: false,
+		});
+		// A key the new set dropped is forgotten with what was pending for it.
+		const again = await commit(space, [
+			{ op: "delete", block: { id: added.results[0]?.blockId as string } },
+		]);
+		await watch(ws, "s1", space.id, { levels: [c] });
+		await quiet();
+		expect(changes(ws)).toHaveLength(1);
+		expect(ws.frames.at(-1)).toMatchObject({ type: "outline_watching", seq: again.seq });
+		// "Everything may have changed" is kept too.
+		eventBus.emit({
+			type: "outline:committed",
+			spaceId: space.id,
+			commitId: "commit-without-changes",
+			seq: again.seq,
+			pageIds: [],
+			actorKind: "system",
+			actorId: "test",
+		});
+		await watch(ws, "s1", space.id, { levels: [a] });
+		await settle(() => changes(ws).length === 2);
+		expect(changes(ws)[1]).toMatchObject({ all: true });
+	});
+
+	test("a level is told when one of its rows gains its first child or loses its last", async () => {
+		const ws = socket(reader);
+		// C is a leaf under the page; the level watched is the page's.
+		await watch(ws, "s1", space.id, { levels: [page] });
+		const first = await commit(space, [
+			{ op: "insert", parent: { id: c }, content: "First child" },
+		]);
+		await settle(() => changes(ws).length === 1);
+		expect(changes(ws)[0]).toMatchObject({ levels: [page], seq: first.seq });
+		const gone = await commit(space, [
+			{ op: "delete", block: { id: first.results[0]?.blockId as string } },
+		]);
+		await settle(() => changes(ws).length === 2);
+		expect(changes(ws)[1]).toMatchObject({ levels: [page], seq: gone.seq });
+		// A child moved away from a parent the commit did not otherwise touch (X leaves B, whose
+		// row is in A's level).
+		const deep = socket(reader);
+		await watch(deep, "s1", space.id, { levels: [a] });
+		await commit(space, [{ op: "move", block: { id: x }, parent: { id: page } }]);
+		await settle(() => changes(deep).length === 1);
+		expect(changes(deep)[0]?.levels).toEqual([a]);
+		await commit(space, [{ op: "move", block: { id: x }, parent: { id: b } }]);
+		// Text two levels down is still none of the level's business.
+		const before = changes(ws).length;
+		await quiet();
+		const settled = changes(ws).length;
+		await commit(space, [{ op: "update", block: { id: x }, content: "X, deeper" }]);
+		await quiet();
+		expect(changes(ws).length).toBe(settled);
+		expect(settled).toBeGreaterThanOrEqual(before);
+	});
+
 	test("an event without its changes, or one cut short, says everything may have changed", async () => {
 		const ws = socket(reader);
 		await watch(ws, "s1", space.id, { levels: [c] });
@@ -392,6 +470,82 @@ describe("access", () => {
 });
 
 describe("limits", () => {
+	test("one message names at most 2000 keys in all", () => {
+		const keys = (n: number, prefix: string) =>
+			Array.from({ length: n }, (_, i) => `${prefix}${i}`);
+		const message = (levels: number, subtrees: number) => ({
+			type: "outline_watch",
+			subscriptionId: "s1",
+			spaceId: "space",
+			levels: keys(levels, "l"),
+			subtrees: keys(subtrees, "t"),
+		});
+		expect(narratorWsMessageSchema.safeParse(message(1000, 1000)).success).toBe(true);
+		expect(narratorWsMessageSchema.safeParse(message(1001, 1000)).success).toBe(false);
+		expect(narratorWsMessageSchema.safeParse(message(2001, 0)).success).toBe(false);
+	});
+
+	test("places in a space go to those who may read it: per person, and in all", async () => {
+		// Someone who may not read the space takes no place, however often they ask.
+		const outsider = socket(stranger);
+		for (let i = 0; i < OUTLINE_WATCH_LIMITS.perSocket * 3; i++) {
+			await watch(outsider, `s${i % OUTLINE_WATCH_LIMITS.perSocket}`, space.id, {});
+		}
+		expect(
+			outsider.frames.every((frame) => (frame as { code?: string }).code === "access_denied"),
+		).toBe(true);
+		expect(outlineBlockSubscriptionStats()).toMatchObject({ total: 0, spaces: 0 });
+
+		// One person holds at most their share, across sockets; another still gets in.
+		const fill = async (userId: string, role: string, count: number) => {
+			const opened: FakeSocket[] = [];
+			for (let i = 0; i < count; i++) {
+				if (i % OUTLINE_WATCH_LIMITS.perSocket === 0) opened.push(socket(userId, role));
+				await watch(opened.at(-1) as FakeSocket, `s${i}`, space.id, {});
+			}
+			return opened;
+		};
+		const mine = await fill(reader, "user", OUTLINE_WATCH_LIMITS.perUserPerSpace);
+		expect(
+			mine.flatMap((ws) => ws.frames).every((frame) => frame.type === "outline_watching"),
+		).toBe(true);
+		const extra = socket(reader);
+		await watch(extra, "one-more", space.id, {});
+		expect(extra.frames).toEqual([
+			{ type: "outline_watch_error", subscriptionId: "one-more", code: "unavailable" },
+		]);
+		const other = socket(owner);
+		await watch(other, "s1", space.id, {});
+		expect(other.frames[0]).toMatchObject({ type: "outline_watching" });
+
+		// Fill the space with other readers (admins read every space).
+		let held = outlineBlockSubscriptionStats().total;
+		for (let n = 0; held < OUTLINE_WATCH_LIMITS.perSpace; n++) {
+			const take = Math.min(
+				OUTLINE_WATCH_LIMITS.perUserPerSpace,
+				OUTLINE_WATCH_LIMITS.perSpace - held,
+			);
+			await fill(`admin-${n}`, "admin", take);
+			held += take;
+		}
+		expect(outlineBlockSubscriptionStats().total).toBe(OUTLINE_WATCH_LIMITS.perSpace);
+		const late = socket("admin-late", "admin");
+		await watch(late, "s1", space.id, {});
+		expect(late.frames).toEqual([
+			{ type: "outline_watch_error", subscriptionId: "s1", code: "unavailable" },
+		]);
+		// Full or not, lack of access answers the same for a space that exists and one that
+		// does not.
+		for (const spaceId of [space.id, "no-such-space"]) {
+			const denied = socket(stranger);
+			await watch(denied, "s1", spaceId, {});
+			expect(denied.frames).toEqual([
+				{ type: "outline_watch_error", subscriptionId: "s1", code: "access_denied" },
+			]);
+		}
+		expect(outlineBlockSubscriptionStats().total).toBe(OUTLINE_WATCH_LIMITS.perSpace);
+	});
+
 	test("subscriptions per socket and keys per subscription are bounded", async () => {
 		const ws = socket(reader);
 		for (let i = 0; i < OUTLINE_WATCH_LIMITS.perSocket; i++) {

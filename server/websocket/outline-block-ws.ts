@@ -13,12 +13,16 @@
  *     that does not exist answers the same `access_denied`. The keys are never looked up: a
  *     commit is matched by its space first and by key second, so a key of another space (or of
  *     nothing) matches no commit, and nothing tells whether it exists.
+ *   - Replacing a subscription (the same id sent again) keeps what the old one was told of
+ *     and had not sent yet, for the keys still watched.
  *   - Coalesced: commits that land within {@link OUTLINE_BLOCK_COALESCE_MS} become one frame
  *     per subscription. The event bus emits synchronously from the write path, so its listener
  *     only records the commit against the space's subscriptions and arms a timer; matching a
  *     commit costs the smaller of "its changed ids" and "the keys watched", per subscription.
- *   - Bounded: {@link OUTLINE_WATCH_LIMITS} per socket, per space and per subscription, plus a
- *     global ceiling; a frame names at most `keysPerFrame` keys and says `all` past that. A
+ *   - Bounded: {@link OUTLINE_WATCH_LIMITS} per socket, per space, per person in a space and
+ *     per subscription, plus a global ceiling. A subscription counts against its space only
+ *     once it is authorized, so nobody who may not read a space can use up its places, and a
+ *     refusal for lack of access never depends on how full the space is; a frame names at most `keysPerFrame` keys and says `all` past that. A
  *     socket whose send buffer is past {@link OUTLINE_BLOCK_BACKPRESSURE_BYTES} is closed so
  *     the client reconnects and re-reads instead of missing a change.
  *   - `outline.enabled` off: watching answers `unavailable`, and turning it off ends every
@@ -62,6 +66,8 @@ interface Subscription {
 	subtrees: ReadonlySet<string>;
 	/** The space once authorized; null while the first check runs. */
 	space: OutlineSpaceRow | null;
+	/** `outline_watching` went out: change frames may follow. */
+	ready: boolean;
 	active: boolean;
 	/** Newest seq not sent yet; 0 when nothing is pending. */
 	pendingSeq: number;
@@ -144,9 +150,26 @@ async function authorize(sub: Subscription): Promise<OutlineSpaceRow | null> {
 	return space;
 }
 
+/**
+ * What a subscription being replaced was already told of and had not sent yet, for the keys
+ * its successor still watches in the same space (the rule is in the protocol's header).
+ */
+function carryOver(from: Subscription, to: Subscription): void {
+	if (from.spaceId !== to.spaceId) return;
+	to.pendingChanges = from.pendingChanges;
+	if (from.pendingSeq === 0) return;
+	for (const key of from.pendingLevels) if (to.levels.has(key)) to.pendingLevels.add(key);
+	for (const key of from.pendingSubtrees) if (to.subtrees.has(key)) to.pendingSubtrees.add(key);
+	to.pendingAll = from.pendingAll;
+	if (!to.pendingAll && to.pendingLevels.size + to.pendingSubtrees.size === 0) return;
+	to.pendingSeq = from.pendingSeq;
+	to.pendingCommits = [...from.pendingCommits];
+}
+
 async function watch(
 	ws: OutlineBlockSocket,
 	message: Extract<OutlineWatchClientMessage, { type: "outline_watch" }>,
+	replaced: Subscription | undefined,
 ): Promise<void> {
 	const subscriptionId = message.subscriptionId;
 	const refuse = (code: OutlineWatchErrorCode) =>
@@ -170,6 +193,7 @@ async function watch(
 		levels,
 		subtrees,
 		space: null,
+		ready: false,
 		active: true,
 		pendingSeq: 0,
 		pendingCommits: [],
@@ -178,21 +202,15 @@ async function watch(
 		pendingAll: false,
 		pendingChanges: false,
 	};
+	if (replaced) carryOver(replaced, sub);
+	// Held by its socket from here on (so a newer message for the same id replaces it), but
+	// not counted against its space, and told of no commit, until it is authorized.
 	if (!entries) {
 		entries = new Map();
 		state.bySocket.set(ws, entries);
 	}
 	entries.set(subscriptionId, sub);
 	state.count++;
-	// Registered before the check, so a commit that lands while it runs is not missed: it is
-	// held until the subscription is confirmed (`flush` skips an unauthorized one).
-	let watchers = state.bySpace.get(sub.spaceId);
-	if ((watchers?.size ?? 0) >= OUTLINE_WATCH_LIMITS.perSpace) return fail(sub, "unavailable");
-	if (!watchers) {
-		watchers = new Set();
-		state.bySpace.set(sub.spaceId, watchers);
-	}
-	watchers.add(sub);
 
 	let space: OutlineSpaceRow | null = null;
 	try {
@@ -207,16 +225,42 @@ async function watch(
 		if (isCurrent(sub)) fail(sub, "unavailable");
 		return;
 	}
+	// A space that does not exist and one the person may not read answer the same, whatever
+	// the limits below would have said.
 	if (!space) return fail(sub, "access_denied");
 	if (!isOutlineEnabled()) return fail(sub, "unavailable");
+	let watchers = state.bySpace.get(sub.spaceId);
+	let own = 0;
+	for (const other of watchers ?? []) if (other.ws.data.userId === ws.data.userId) own++;
+	if (
+		(watchers?.size ?? 0) >= OUTLINE_WATCH_LIMITS.perSpace ||
+		own >= OUTLINE_WATCH_LIMITS.perUserPerSpace
+	) {
+		return fail(sub, "unavailable");
+	}
+	if (!watchers) {
+		watchers = new Set();
+		state.bySpace.set(sub.spaceId, watchers);
+	}
+	watchers.add(sub);
 	sub.space = space;
+	// Listening from here. The seq it is told is read AFTER that, so a commit that landed
+	// during the check is either within that seq or arrives as a change after it.
+	let latest: OutlineSpaceRow | null = null;
+	try {
+		latest = await outlineStore.getSpace(sub.spaceId);
+	} catch (error) {
+		logger.warn("Outline block subscription failed", { error: String(error) });
+	}
+	if (!isCurrent(sub)) return;
+	if (!latest) return fail(sub, "unavailable");
+	sub.ready = true;
 	send(ws, {
 		type: "outline_watching",
 		subscriptionId,
 		spaceId: space.id,
-		seq: space.nextSeq - 1,
+		seq: latest.nextSeq - 1,
 	});
-	// Commits that landed during the check: the seq above may not include them.
 	if (isCurrent(sub) && (sub.pendingSeq !== 0 || sub.pendingChanges)) arm(sub);
 }
 
@@ -227,7 +271,7 @@ export async function handleOutlineBlockMessage(
 	const existing = state.bySocket.get(ws)?.get(message.subscriptionId);
 	if (existing) remove(existing);
 	if (message.type === "outline_unwatch") return;
-	await watch(ws, message);
+	await watch(ws, message, existing);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -257,7 +301,7 @@ function flush(): void {
 	const batch = [...state.dirty];
 	state.dirty.clear();
 	for (const sub of batch) {
-		if (!isCurrent(sub) || !sub.space) continue;
+		if (!isCurrent(sub) || !sub.ready) continue;
 		if (sub.pendingSeq !== 0) {
 			const all =
 				sub.pendingAll ||

@@ -55,11 +55,14 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			type: z.literal("outline_watch"),
 			subscriptionId: z.string().min(1).max(128),
 			spaceId: z.string().min(1).max(128),
-			// `OUTLINE_WATCH_LIMITS.keysPerSubscription` for both together (checked by the handler).
+			// `OUTLINE_WATCH_LIMITS.keysPerSubscription`, for both lists together.
 			levels: z.array(z.string().min(1).max(128)).max(2000).optional(),
 			subtrees: z.array(z.string().min(1).max(128)).max(2000).optional(),
 		})
-		.strict(),
+		.strict()
+		.refine((message) => (message.levels?.length ?? 0) + (message.subtrees?.length ?? 0) <= 2000, {
+			message: "an outline_watch names at most 2000 keys",
+		}),
 	z
 		.object({
 			type: z.literal("outline_unwatch"),

@@ -27,12 +27,14 @@ import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import type { OutlineAskJson, OutlineSpaceKind, OutlineTaskJson } from "../model";
 import {
 	assertHistoryReadable,
+	type OutlineAncestorRow,
 	type OutlineChangedChildRow,
 	type OutlineEdgeRow,
 	type OutlineHistoryPort,
 	type OutlineHistoryState,
 	type OutlineLevelCursor,
 	type OutlineLevelRow,
+	type OutlineParentRow,
 	type OutlineSubtreeChange,
 	pageChangedChildren,
 	readSubtreeByLevels,
@@ -301,6 +303,110 @@ export function pgMarkAncestorsSql(ids: readonly string[], seq: number, limit: n
 		RETURNING ancestor_id`;
 }
 
+const pgLocked = (alias: SQL): SQL => sql`(${alias}.task_json::jsonb #>> '{lock}') IS NOT NULL`;
+
+/**
+ * A block and its ancestors as the tree is now, nearest first: SQLite's `SQLITE_ANCESTRY_NOW`.
+ * The step up and each row's block are `LATERAL`s with `OFFSET 0`, so every step is one
+ * primary-key probe whatever the statistics say.
+ */
+export function pgAncestryNow(blockId: string, maxDepth: number): SQL {
+	return sql`
+		WITH RECURSIVE up(id, depth) AS (
+			SELECT ${text(blockId)}, 0
+			UNION ALL
+			SELECT p.parent_id, up.depth + 1
+			FROM up LEFT JOIN LATERAL (
+				SELECT y.parent_id FROM outline_blocks y WHERE y.id = up.id OFFSET 0
+			) p ON TRUE
+			WHERE up.id IS NOT NULL AND up.depth <= ${int(maxDepth)}
+		)
+		SELECT b.id, b.sid, b.parent_id, b.space_id, b.deleted,
+			b.task_json IS NOT NULL AS is_task, b.ask_json IS NOT NULL AS is_ask,
+			${pgLocked(sql`b`)} AS locked
+		FROM up CROSS JOIN LATERAL (
+			SELECT y.* FROM outline_blocks y WHERE y.id = up.id OFFSET 0
+		) b
+		ORDER BY up.depth`;
+}
+
+/**
+ * A block of a space and its ancestors as of a seq, nearest first, the space itself (or a row
+ * without an id) last: SQLite's `SQLITE_ANCESTRY_AS_OF`, the probes fenced the same way.
+ */
+export function pgAncestryAsOf(
+	spaceId: string,
+	blockId: string,
+	asOf: number,
+	maxDepth: number,
+): SQL {
+	return sql`
+		WITH RECURSIVE up(id, depth) AS (
+			SELECT ${text(blockId)}, 0
+			UNION ALL
+			SELECT p.parent_key, up.depth + 1
+			FROM up LEFT JOIN LATERAL (
+				SELECT e.parent_key FROM outline_block_edges e
+				WHERE e.block_id = up.id AND ${validAt(sql`e`, asOf)}
+				ORDER BY e.from_seq DESC LIMIT 1
+			) p ON TRUE
+			WHERE up.id IS NOT NULL AND up.id <> ${text(spaceId)} AND up.depth <= ${int(maxDepth)}
+		)
+		SELECT up.id, b.sid, v.deleted, v.task_json IS NOT NULL AS is_task,
+			v.ask_json IS NOT NULL AS is_ask, ${pgLocked(sql`v`)} AS locked
+		FROM up
+		LEFT JOIN LATERAL (
+			SELECT y.sid FROM outline_blocks y
+			WHERE y.id = up.id AND y.space_id = ${text(spaceId)} OFFSET 0
+		) b ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT x.deleted, x.task_json, x.ask_json FROM outline_block_versions x
+			WHERE x.block_id = up.id AND x.from_seq <= ${int(asOf)}
+			ORDER BY x.from_seq DESC LIMIT 1
+		) v ON TRUE
+		ORDER BY up.depth`;
+}
+
+/**
+ * The given blocks and every ancestor of them, each once: SQLite's `SQLITE_ANCESTRY_OF`, the
+ * step up fenced as the commit's change marks are ({@link pgMarkAncestorsSql}). Each row
+ * carries its space and whether it is deleted; the caller keeps the live blocks of its space.
+ */
+export function pgAncestryOf(ids: readonly string[], limit: number): SQL {
+	return sql`
+		WITH RECURSIVE up(id) AS (
+			SELECT id FROM outline_blocks WHERE id IN (${idList(ids)})
+			UNION
+			SELECT b.parent_id FROM up CROSS JOIN LATERAL (
+				SELECT y.parent_id FROM outline_blocks y WHERE y.id = up.id OFFSET 0
+			) b
+			WHERE b.parent_id IS NOT NULL
+		)
+		SELECT b.id, b.parent_id, b.space_id, b.deleted, ${pgLocked(sql`b`)} AS locked
+		FROM up CROSS JOIN LATERAL (
+			SELECT y.* FROM outline_blocks y WHERE y.id = up.id OFFSET 0
+		) b
+		LIMIT ${int(limit)}`;
+}
+
+/**
+ * The live locked tasks of a space: the partial lock index's predicate word for word inside
+ * a fence (`OFFSET 0`), so the planner reads the locked blocks (few, in every space together)
+ * and keeps this space's, instead of walking the space by an index on it. The fence orders by
+ * the index's own key: without statistics on the expression the planner takes almost every
+ * block for locked and would read the table instead (seen on 100,000 analyzed blocks).
+ */
+export function pgLockedOfSpace(spaceId: string, limit: number): SQL {
+	return sql`
+		SELECT l.id, l.parent_id FROM (
+			SELECT id, parent_id, space_id FROM outline_blocks
+			WHERE ("task_json"::jsonb #>> '{lock}') IS NOT NULL AND "deleted" = FALSE
+			ORDER BY page_id OFFSET 0
+		) l
+		WHERE l.space_id = ${text(spaceId)}
+		LIMIT ${int(limit)}`;
+}
+
 interface SpaceRecord {
 	id: string;
 	key: string;
@@ -473,6 +579,92 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 				}
 			}
 			return out;
+		},
+
+		async getAncestry(spaceId, blockId, { asOf, maxDepth }) {
+			if (asOf === null) {
+				const rows = await rowsOf<{
+					id: string;
+					sid: string;
+					parent_id: string | null;
+					space_id: string;
+					deleted: boolean;
+					is_task: boolean;
+					is_ask: boolean;
+					locked: boolean;
+				}>(pgAncestryNow(blockId, maxDepth));
+				const last = rows.at(-1);
+				// The walk must end at a top-level block, through live blocks of the space only.
+				if (!last || last.parent_id !== null || rows.length > maxDepth + 1) return null;
+				if (rows.some((row) => row.space_id !== spaceId || row.deleted)) return null;
+				return rows.map(
+					(row): OutlineAncestorRow => ({
+						id: row.id,
+						sid: row.sid,
+						isTask: row.is_task,
+						isAsk: row.is_ask,
+						locked: row.locked,
+					}),
+				);
+			}
+			if (!(await readable(spaceId, asOf))) return null;
+			const rows = await rowsOf<{
+				id: string | null;
+				sid: string | null;
+				deleted: boolean | null;
+				is_task: boolean;
+				is_ask: boolean;
+				locked: boolean | null;
+			}>(pgAncestryAsOf(spaceId, blockId, asOf, maxDepth));
+			// The walk must end at the space itself, through blocks of the space only.
+			if (rows.length < 2 || rows.at(-1)?.id !== spaceId || rows.length > maxDepth + 2) return null;
+			const chain = rows.slice(0, -1);
+			if (chain.some((row) => row.id === null || row.sid === null || row.deleted === null))
+				return null;
+			// The block itself must not be a tombstone then (an ancestor of a live block never is).
+			if (chain[0]?.deleted) return null;
+			return chain.map(
+				(row): OutlineAncestorRow => ({
+					id: row.id as string,
+					sid: row.sid as string,
+					isTask: row.is_task,
+					isAsk: row.is_ask,
+					locked: row.locked === true,
+				}),
+			);
+		},
+
+		async listAncestryOf(spaceId, blockIds, limit) {
+			const max = Math.max(0, Math.floor(limit));
+			const seen = new Map<string, OutlineParentRow>();
+			let truncated = false;
+			for (const chunk of chunked([...new Set(blockIds)])) {
+				const room = max - seen.size;
+				if (room <= 0) {
+					truncated = true;
+					break;
+				}
+				const rows = await rowsOf<{
+					id: string;
+					parent_id: string | null;
+					space_id: string;
+					deleted: boolean;
+					locked: boolean;
+				}>(pgAncestryOf(chunk, room + 1));
+				if (rows.length > room) truncated = true;
+				for (const row of rows.slice(0, room)) {
+					if (row.space_id !== spaceId || row.deleted) continue;
+					seen.set(row.id, { id: row.id, parentId: row.parent_id, locked: row.locked });
+				}
+			}
+			return { rows: [...seen.values()], truncated };
+		},
+
+		async listLockedOfSpace(spaceId, limit) {
+			const rows = await rowsOf<{ id: string; parent_id: string | null }>(
+				pgLockedOfSpace(spaceId, Math.max(0, Math.floor(limit))),
+			);
+			return rows.map((row) => ({ id: row.id, parentId: row.parent_id, locked: true }));
 		},
 
 		async findSubtreeChanges(spaceId, blockIds, { after, upTo }) {

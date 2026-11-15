@@ -115,7 +115,8 @@ async function assemble(
 		budget: { blocks: sizes.blocks, bytes: sizes.bytes },
 		store: counter.store,
 	});
-	expect(counter.take()).toBeLessThanOrEqual(sizes.blocks);
+	// Every level read peeks one row past what it returns: never more than twice the budget.
+	expect(counter.take()).toBeLessThanOrEqual(2 * sizes.blocks + 1);
 	if (!first) return null;
 	const out: Assembled = { blocks: new Map(), children: new Map(), calls: 1 };
 	const started: Array<string | null> = [];
@@ -158,7 +159,7 @@ async function assemble(
 			bytes: sizes.bytes,
 			store: counter.store,
 		});
-		expect(counter.take()).toBeLessThanOrEqual(sizes.level);
+		expect(counter.take()).toBeLessThanOrEqual(sizes.level + 1);
 		expect(read.blocks.length).toBeLessThanOrEqual(sizes.level);
 		out.calls++;
 		// A level that got nothing this time and says `more` must still make progress later.
@@ -282,7 +283,6 @@ async function committedDuring(
 
 const asSets = (changes: OutlineCommitChanges | undefined) => ({
 	parentKeys: [...(changes?.parentKeys ?? [])].sort(),
-	listParentKeys: [...(changes?.listParentKeys ?? [])].sort(),
 	blockIds: [...(changes?.blockIds ?? [])].sort(),
 	ancestorIds: [...(changes?.ancestorIds ?? [])].sort(),
 	truncated: changes?.truncated,
@@ -400,7 +400,7 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 				budget: { blocks: 12 },
 				store: counter.store,
 			});
-			expect(counter.take()).toBeLessThanOrEqual(12);
+			expect(counter.take()).toBe(12);
 			expect(read?.blocks.map((b) => b.id)).toEqual([p, ...kids.slice(0, 11)]);
 			expect(read?.truncated).toBe(true);
 			const level = read?.levels.find((l) => l.parentId === p) as OutlineTreeLevel;
@@ -434,13 +434,40 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 				limit: 3,
 				store: counter.store,
 			});
-			expect(counter.take()).toBeLessThanOrEqual(3);
+			expect(counter.take()).toBe(4);
 			expect(several.blocks).toHaveLength(3);
-			expect(several.levels.map((l) => [l.childIds.length, l.more])).toEqual([
+			// The limit fell exactly between two parents: the third level is whole, and says so.
+			expect(several.levels.map((l) => [l.childIds.length, l.more, l.nextCursor])).toEqual([
+				[1, false, null],
+				[1, false, null],
+				[1, false, null],
+				[0, true, null],
+				[0, true, null],
+			]);
+			// And when the store has nothing past the limit, nothing says `more`.
+			const exact = await readOutlineLevels({
+				space,
+				parents: kids.slice(0, 3).map((parentId) => ({ parentId })),
+				limit: 3,
+				store: counter.store,
+			});
+			expect(counter.take()).toBe(3);
+			expect(exact.levels.map((l) => [l.childIds.length, l.more])).toEqual([
 				[1, false],
 				[1, false],
-				[1, true],
-				[0, true],
+				[1, false],
+			]);
+			const oneLeft = await readOutlineLevels({
+				space,
+				parents: kids.slice(0, 4).map((parentId) => ({ parentId })),
+				limit: 3,
+				store: counter.store,
+			});
+			expect(counter.take()).toBe(4);
+			expect(oneLeft.levels.map((l) => [l.childIds.length, l.more])).toEqual([
+				[1, false],
+				[1, false],
+				[1, false],
 				[0, true],
 			]);
 			// One child of each parent (what a closed row's preview is read from).
@@ -851,6 +878,58 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 			const locked = await read([p, a, b] as string[]);
 			expect(locked.marks.map((mark) => mark.locked)).toEqual([1, 0, 1]);
 
+			// A finished task can still be locked: it counts, and a folded read keeps what is over
+			// it open (a finished task closed over a finished, locked one).
+			const finished = await write(ctx, space, [
+				{
+					op: "insert",
+					tempId: "d",
+					parent: { id: p as string },
+					content: "Done",
+					task: { status: "todo" },
+				},
+				{
+					op: "insert",
+					tempId: "e",
+					parent: { tempId: "d" },
+					content: "Done and locked",
+					task: { status: "todo" },
+				},
+				{ op: "insert", parent: { tempId: "e" }, content: "under it" },
+			]);
+			const [d, e] = finished.results.map((r) => r.blockId) as [string, string];
+			await lockOutlineTask({ blockId: e, userId: locker, store });
+			for (const id of [e, d]) {
+				await writeOutline(
+					{
+						spaceId: space.id,
+						ops: [{ op: "setTask", block: { id }, task: { status: "done" } }],
+						actor: { kind: "human", id: locker },
+						responsibleUserId: locker,
+					},
+					{ store },
+				);
+			}
+			space = await fresh(ctx, space);
+			expect((await store.getBlock(e))?.taskJson).toMatchObject({ status: "done", lock: {} });
+			const doneLocked = await read([p, d, e, b] as string[]);
+			expect(doneLocked.marks.map((mark) => [mark.key, mark.locked, mark.tasks])).toEqual([
+				[p, 2, { todo: 2, doing: 1 }],
+				[d, 1, { todo: 0, doing: 0 }],
+				[e, 0, { todo: 0, doing: 0 }],
+				[b, 1, { todo: 1, doing: 0 }],
+			]);
+			const folded = await readOutlineSubtree({
+				space,
+				rootId: p as string,
+				view: "all",
+				fold: { expanded: new Set(), collapsed: new Set() },
+				store,
+			});
+			expect(folded?.closed).not.toContain(d);
+			expect(folded?.blocks.map((block) => block.id)).toContain(e);
+			expect(folded?.blocks.find((block) => block.id === e)?.lock).toMatchObject({ blockId: e });
+
 			// Changed since a seq: the block itself, something under it, or neither.
 			const since = space.nextSeq - 1;
 			await write(ctx, space, [{ op: "update", block: { id: a2 as string }, content: "a2!" }]);
@@ -998,7 +1077,7 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 			});
 			// The finished task is closed over one child; the open task shows its note, closed over
 			// one detail; the finished task hiding a question stays open down to the question.
-			expect(counter.take()).toBe(read?.blocks.length ? read.blocks.length - 1 : -1);
+			expect(counter.take()).toBeLessThanOrEqual(2 * (read?.blocks.length ?? 0));
 			expect(read?.blocks.map((block) => block.id).sort()).toEqual(
 				[p, fact, f1, done, d1, open, n, n1, done2, w, q].sort(),
 			);
@@ -1034,6 +1113,46 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 			expect(facts?.view).toBe("facts");
 			expect(facts?.blocks.map((block) => block.id)).toEqual([p, fact, f1]);
 			expect(facts?.levels.find((level) => level.parentId === p)?.processHidden).toBe(3);
+			// Cut by bytes inside a level: what the view left out before the cut is counted once
+			// over the pages, not lost.
+			const level = await write(ctx, space, [
+				{ op: "insert", tempId: "l", parent: null, content: "Level" },
+				{
+					op: "insert",
+					parent: { tempId: "l" },
+					content: "a task first",
+					task: { status: "todo" },
+				},
+				...["a", "b", "c"].map(
+					(name): OutlineOp => ({
+						op: "insert",
+						parent: { tempId: "l" },
+						content: `${name} ${"x".repeat(300)}`,
+					}),
+				),
+			]);
+			const l = level.results[0]?.blockId as string;
+			const space2 = await fresh(ctx, space);
+			let hidden = 0;
+			const got: string[] = [];
+			let cursor: string | null | undefined;
+			for (let pages = 0; pages < 10; pages++) {
+				const page = await readOutlineLevels({
+					space: space2,
+					parents: [{ parentId: l, cursor }],
+					view: "facts",
+					bytes: 700,
+					store: ctx.store,
+				});
+				const own = page.levels[0] as OutlineTreeLevel;
+				hidden += own.processHidden;
+				got.push(...own.childIds);
+				if (!own.more) break;
+				cursor = own.nextCursor;
+			}
+			expect(got).toEqual(level.results.slice(2).map((r) => r.blockId));
+			expect(hidden).toBe(1);
+
 			// A root that is process is read whole whatever was asked.
 			const task = await readOutlineSubtree({ space, rootId: open, store: ctx.store });
 			expect(task?.view).toBe("all");
@@ -1062,19 +1181,17 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 			expect(created).toHaveLength(1);
 			expect(asSets(created[0]?.changes)).toEqual({
 				parentKeys: [space.id, p, a, b].sort(),
-				listParentKeys: [space.id, p, a, b].sort(),
 				blockIds: [p, a, b, x, c].sort(),
 				ancestorIds: [p, a, b].sort(),
 				truncated: false,
 			});
 
-			// Text only: the parent has a changed child, but its list of children did not change.
+			// Text only: the level the block is in, and nothing above it.
 			const edited = await committedDuring(space.id, () =>
 				write(ctx, space, [{ op: "update", block: { id: x }, content: "X, edited" }]),
 			);
 			expect(asSets(edited[0]?.changes)).toEqual({
 				parentKeys: [b],
-				listParentKeys: [],
 				blockIds: [x],
 				ancestorIds: [p, a, b].sort(),
 				truncated: false,
@@ -1085,8 +1202,8 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 				write(ctx, space, [{ op: "move", block: { id: x }, parent: { id: c } }]),
 			);
 			expect(asSets(moved[0]?.changes)).toEqual({
-				parentKeys: [b, c].sort(),
-				listParentKeys: [b, c].sort(),
+				// Both parents, and each one's own parent (its row there says whether it has children).
+				parentKeys: [p, a, b, c].sort(),
 				blockIds: [x],
 				ancestorIds: [p, a, b, c].sort(),
 				truncated: false,
@@ -1106,7 +1223,6 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 				write(ctx, space, [{ op: "delete", block: { id: p } }]),
 			);
 			expect(top[0]?.changes?.parentKeys).toContain(space.id);
-			expect(top[0]?.changes?.listParentKeys).toContain(space.id);
 
 			// More than a list holds: cut, and said so.
 			// More than a list holds (deleting a parent tombstones every block under it): cut,
@@ -1134,6 +1250,237 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 			expect(wide[0]?.changes?.truncated).toBe(true);
 			expect(wide[0]?.changes?.blockIds).toHaveLength(OUTLINE_COMMIT_CHANGE_LIMITS.ids);
 			expect(wide[0]?.changes?.parentKeys.sort()).toEqual([space.id, wideId].sort());
+		},
+	},
+	{
+		name: "pending: a read marks its blocks with the open changes of the locked tasks over them, and counts them under every ancestor",
+		async run(ctx) {
+			const lockerId = await ctx.seedUser();
+			const space0 = await ctx.store.ensureSpace({ kind: "personal", ownerUserId: lockerId }, NOW);
+			const agent = await ctx.seedNarrator();
+			const store = ctx.store;
+			const human = (ops: OutlineOp[]) =>
+				writeOutline(
+					{
+						spaceId: space0.id,
+						ops,
+						actor: { kind: "human", id: lockerId },
+						responsibleUserId: lockerId,
+					},
+					{ store },
+				);
+			const asAgent = (ops: OutlineOp[]) =>
+				writeOutline(
+					{
+						spaceId: space0.id,
+						ops,
+						actor: { kind: "agent", id: agent },
+						narratorId: agent,
+						responsibleUserId: null,
+					},
+					{ store },
+				);
+			const made = await human([
+				{ op: "insert", tempId: "page", parent: null, content: "Page" },
+				{ op: "insert", tempId: "section", parent: { tempId: "page" }, content: "Section" },
+				{
+					op: "insert",
+					tempId: "plan",
+					parent: { tempId: "section" },
+					content: "The plan",
+					task: { status: "todo" },
+				},
+				{
+					op: "insert",
+					tempId: "step",
+					parent: { tempId: "plan" },
+					content: "A step",
+					task: { status: "todo" },
+				},
+				{ op: "insert", tempId: "leaf", parent: { tempId: "step" }, content: "A detail" },
+				{ op: "insert", tempId: "sibling", parent: { tempId: "step" }, content: "Another detail" },
+				{
+					op: "insert",
+					tempId: "outside",
+					parent: { tempId: "page" },
+					content: "Outside the plan",
+				},
+			]);
+			const [page, section, plan, step, leaf, sibling, outside] = made.results.map(
+				(r) => r.blockId,
+			) as [string, string, string, string, string, string, string];
+			await lockOutlineTask({ blockId: plan, userId: lockerId, store });
+
+			// A change to a block three levels under the locked plan is held.
+			const edit = await asAgent([
+				{ op: "update", block: { id: leaf }, content: "A detail, changed" },
+			]);
+			const editId = edit.pending?.id as string;
+			expect(editId).toBeTruthy();
+			expect((await store.getBlock(leaf))?.content).toBe("A detail");
+			let space = await fresh(ctx, space0);
+			const counts = async () =>
+				(
+					await readOutlineMarks({
+						space,
+						keys: [space.id, page, section, plan, step, leaf, sibling, outside],
+						store,
+					})
+				).marks.map((mark) => mark.pending);
+			// Under the space, the page, the section, the plan and the direct parent; not on the
+			// block itself, not on its siblings.
+			expect(await counts()).toEqual([1, 1, 1, 1, 1, 0, 0, 0]);
+
+			const pendingOf = (blocks: ReadonlyArray<{ id: string; pending: string[] }>) =>
+				Object.fromEntries(
+					blocks
+						.filter((block) => block.pending.length > 0)
+						.map((b) => [b.id, [...b.pending].sort()]),
+				);
+			// Whatever the read starts from, the block is marked: the lock is found among the blocks
+			// read, above the root, or above the parents asked for.
+			const whole = await readOutlineSubtree({ space, rootId: null, view: "all", store });
+			expect(pendingOf(whole?.blocks ?? [])).toEqual({ [leaf]: [editId] });
+			expect(whole?.pendingTruncated).toBeUndefined();
+			const fromStep = await readOutlineSubtree({ space, rootId: step, view: "all", store });
+			expect(pendingOf(fromStep?.blocks ?? [])).toEqual({ [leaf]: [editId] });
+			const fromLeaf = await readOutlineSubtree({ space, rootId: leaf, view: "all", store });
+			expect(pendingOf(fromLeaf?.blocks ?? [])).toEqual({ [leaf]: [editId] });
+			const level = await readOutlineLevels({ space, parents: [{ parentId: step }], store });
+			expect(pendingOf(level.blocks)).toEqual({ [leaf]: [editId] });
+			const elsewhere = await readOutlineLevels({ space, parents: [{ parentId: page }], store });
+			expect(pendingOf(elsewhere.blocks)).toEqual({});
+			// As of a seq nothing waits: pending changes are of now.
+			const then = await readOutlineSubtree({
+				space,
+				rootId: step,
+				asOf: space.nextSeq - 1,
+				view: "all",
+				store,
+			});
+			expect(pendingOf(then?.blocks ?? [])).toEqual({});
+
+			// A held insert (a new step) marks the block it adds under; a session's changes on one
+			// plan may be one change or two.
+			const add = await asAgent([
+				{ op: "insert", parent: { id: plan }, content: "A new step", task: { status: "todo" } },
+			]);
+			const addId = add.pending?.id as string;
+			expect(addId).toBeTruthy();
+			space = await fresh(ctx, space);
+			const after = await readOutlineSubtree({ space, rootId: plan, view: "all", store });
+			const marked = pendingOf(after?.blocks ?? []);
+			expect(Object.keys(marked).sort()).toEqual([leaf, plan].sort());
+			expect(marked[plan]).toContain(addId);
+			const changes = new Set([editId, addId]).size;
+			// The block added under counts under its ancestors, not under itself.
+			expect(await counts()).toEqual([changes, changes, changes, 1, 1, 0, 0, 0]);
+			// A folded read keeps the way to a waiting change open.
+			const folded = await readOutlineSubtree({
+				space,
+				rootId: page,
+				view: "all",
+				fold: { expanded: new Set(), collapsed: new Set() },
+				store,
+			});
+			expect(folded?.blocks.map((block) => block.id)).toContain(leaf);
+			expect(folded?.closed ?? []).not.toContain(step);
+		},
+	},
+	{
+		name: "depth: a root 600 levels down costs a handful of store calls, and reads the same now and as of a seq",
+		async run(ctx) {
+			const space0 = await personalSpace(ctx);
+			const ids: string[] = [];
+			for (let from = 0; from < 600; from += 150) {
+				const made = await write(
+					ctx,
+					space0,
+					Array.from(
+						{ length: 150 },
+						(_, i): OutlineOp => ({
+							op: "insert",
+							tempId: `n${from + i}`,
+							parent:
+								from + i === 0
+									? null
+									: i === 0
+										? { id: ids[from - 1] as string }
+										: { tempId: `n${from + i - 1}` },
+							content: `level ${from + i}`,
+							// The top is a task: everything under it is process.
+							...(from + i === 0 ? { task: { status: "todo" as const } } : {}),
+						}),
+					),
+				);
+				ids.push(...made.results.map((r) => r.blockId as string));
+			}
+			const bottom = await write(ctx, space0, [
+				{
+					op: "insert",
+					parent: { id: ids[599] as string },
+					content: "open",
+					task: { status: "todo" },
+				},
+			]);
+			const leaf = bottom.results[0]?.blockId as string;
+			const space = await fresh(ctx, space0);
+			let calls = 0;
+			const counted = new Proxy(ctx.store, {
+				get(target, prop, receiver) {
+					const value = Reflect.get(target, prop, receiver);
+					if (typeof value !== "function") return value;
+					return (...args: unknown[]) => {
+						calls++;
+						return (value as (...a: unknown[]) => unknown).apply(target, args);
+					};
+				},
+			});
+			const taken = () => {
+				const n = calls;
+				calls = 0;
+				return n;
+			};
+			const root = ids[590] as string;
+			const now = await readOutlineSubtree({ space, rootId: root, store: counted });
+			expect(taken()).toBeLessThanOrEqual(24);
+			const then = await readOutlineSubtree({
+				space,
+				rootId: root,
+				asOf: space.nextSeq - 1,
+				store: counted,
+			});
+			expect(taken()).toBeLessThanOrEqual(24);
+			if (!now || !then) throw new Error("the deep root does not read");
+			// Deeper than the path names: the task at the very top still decides the view, the
+			// same now and as of a seq.
+			for (const read of [now, then]) {
+				expect(read.view).toBe("all");
+				expect(read.rootInTask).toBe(true);
+				expect(read.pathTruncated).toBe(true);
+				expect(read.path.map((entry) => entry.id)).toEqual(
+					ids.slice(590 - OUTLINE_SUBTREE_LIMITS.maxPath, 590),
+				);
+				expect(read.blocks.map((block) => block.id)).toEqual([...ids.slice(590), leaf]);
+			}
+			expect(then.path).toEqual(now.path);
+
+			// Marks walk every open thing up 600 levels in one statement.
+			const marks = await readOutlineMarks({
+				space,
+				keys: [ids[0] as string, ids[300] as string, ids[599] as string, leaf],
+				store: counted,
+			});
+			expect(taken()).toBeLessThanOrEqual(8);
+			expect(marks.marks.map((mark) => mark.tasks.todo)).toEqual([1, 1, 1, 0]);
+			expect(marks.atLeast).toBe(false);
+			const levels = await readOutlineLevels({
+				space,
+				parents: [{ parentId: ids[599] as string }],
+				store: counted,
+			});
+			expect(taken()).toBeLessThanOrEqual(12);
+			expect(levels.blocks.map((block) => block.id)).toEqual([leaf]);
 		},
 	},
 ];

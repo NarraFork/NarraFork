@@ -28,6 +28,9 @@ import { join } from "node:path";
 import { applyPendingMigrationsByHash } from "../../../db/run-migrations";
 import {
 	createSqliteOutlineHistory,
+	SQLITE_ANCESTRY_AS_OF,
+	SQLITE_ANCESTRY_NOW,
+	SQLITE_ANCESTRY_OF,
 	SQLITE_BACKFILL_INSERT,
 	SQLITE_BACKFILL_SCAN,
 	SQLITE_CHANGED_CHILDREN_CLOSED,
@@ -39,6 +42,7 @@ import {
 	SQLITE_PLACEMENT_NOW,
 	SQLITE_SUBTREE_CHANGE,
 	SQLITE_SUBTREE_CHANGE_SEQS,
+	SQLITE_TASK_LOCKS_OF_SPACE,
 	sqliteMarkAncestorsSql,
 } from "../store/sqlite-history";
 
@@ -378,6 +382,43 @@ function checkMarkPlan(): void {
 	);
 }
 
+/**
+ * The walks up (one block to the space, now and as of a seq; many blocks at once) and the
+ * locked tasks of a space: every step a probe by key, no table walked.
+ */
+function checkAncestryPlans(): void {
+	const asOf = Math.floor(lastSeq / 2);
+	const now = planOf(SQLITE_ANCESTRY_NOW, [big, 1000]);
+	expectNoScan(now);
+	lineOf(now, /SEARCH p USING INDEX sqlite_autoindex_outline_blocks_1 \(id=\?\)/);
+	lineOf(now, /SEARCH b USING INDEX sqlite_autoindex_outline_blocks_1 \(id=\?\)/);
+
+	const then = planOf(SQLITE_ANCESTRY_AS_OF, [big, asOf, SPACE, 1000]);
+	expectNoScan(then);
+	lineOf(then, /SEARCH e USING INDEX idx_outline_edges_block \(block_id=\? AND from_seq<\?\)/);
+	lineOf(then, /SEARCH b USING INDEX sqlite_autoindex_outline_blocks_1 \(id=\?\)/);
+	lineOf(
+		then,
+		/SEARCH v USING INDEX sqlite_autoindex_outline_block_versions_1 \(block_id=\? AND from_seq=\?\)/,
+	);
+
+	const many = planOf(SQLITE_ANCESTRY_OF, [JSON.stringify([wide, big, hot]), 4001]);
+	expectNoScan(many);
+	const recursion = lineOf(many, /RECURSIVE STEP/);
+	expect(
+		many.filter((line) =>
+			/SEARCH b USING INDEX sqlite_autoindex_outline_blocks_1 \(id=\?\)/.test(line),
+		).length,
+	).toBeGreaterThanOrEqual(2);
+	expect(recursion).toBeGreaterThanOrEqual(0);
+	// Nothing reaches the blocks by their space: that is the walk of the whole space.
+	expect(many.filter((line) => /space_id/.test(line))).toEqual([]);
+
+	const locked = planOf(SQLITE_TASK_LOCKS_OF_SPACE, [SPACE, 501]);
+	lineOf(locked, /SCAN b USING INDEX idx_outline_blocks_locked/);
+	expect(locked.filter((line) => /idx_outline_blocks_children|space_id=/.test(line))).toEqual([]);
+}
+
 function percentile(samples: number[], p: number): number {
 	const sorted = [...samples].sort((a, b) => a - b);
 	return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] as number;
@@ -400,12 +441,14 @@ describe("outline history: plans, size and timings on 100,000 blocks", () => {
 	test("the reads search placements first and never scan a table, without statistics", () => {
 		checkPlans();
 		checkMarkPlan();
+		checkAncestryPlans();
 	});
 
 	test("and after ANALYZE on the skewed data", () => {
 		database.run("ANALYZE");
 		checkPlans();
 		checkMarkPlan();
+		checkAncestryPlans();
 	});
 
 	test("plain tables against WITHOUT ROWID: bytes per row", () => {

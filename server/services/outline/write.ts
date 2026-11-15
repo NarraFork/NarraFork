@@ -1161,11 +1161,11 @@ interface Planned {
 	pageIds: string[];
 	/**
 	 * What the commit changes by block, as the plan knows it: the parent keys (a block's id, or
-	 * the space's for the top level) before and after of every block that gets a version, those
-	 * among them whose list of children changes, and the blocks themselves. The store adds the
+	 * the space's for the top level) of the levels that read differently after it
+	 * (`OutlineCommitChanges.parentKeys`), and the blocks that get a version. The store adds the
 	 * ancestors (`applyCommit`'s result).
 	 */
-	changes: { parentKeys: string[]; listParentKeys: string[]; blockIds: string[] };
+	changes: { parentKeys: string[]; blockIds: string[] };
 	/** Pages whose pending changes the commit decides or withdraws. */
 	pendingPageIds: string[];
 }
@@ -2790,7 +2790,8 @@ class OutlinePlanner {
 		const insertLinks: OutlineLinkRow[] = [];
 		const pageIds = new Set<string>();
 		const parentKeys = new Set<string>();
-		const listParentKeys = new Set<string>();
+		/** Parents (blocks) whose list of children this commit changes. */
+		const placedParents = new Set<string>();
 		const changedIds: string[] = [];
 
 		for (const block of all) {
@@ -2823,9 +2824,8 @@ class OutlinePlanner {
 			for (const parentId of block.base === null
 				? [block.parentId]
 				: [block.parentId, block.base.parentId]) {
-				const key = parentId ?? this.space.id;
-				parentKeys.add(key);
-				if (placed) listParentKeys.add(key);
+				parentKeys.add(parentId ?? this.space.id);
+				if (placed && parentId !== null) placedParents.add(parentId);
 			}
 
 			if (block.base === null) {
@@ -2839,6 +2839,26 @@ class OutlinePlanner {
 			const group = patches.get(key);
 			if (group) group.ids.push(block.id);
 			else patches.set(key, { ids: [block.id], patch });
+		}
+
+		// A parent that gains its first child or loses its last reads differently in ITS parent's
+		// level (a row says whether it has children): that level is named too. Whether the answer
+		// really flips is not known here without counting siblings, so it is named whenever the
+		// list of children changes.
+		const unknownParents: string[] = [];
+		for (const parentId of placedParents) {
+			const parent = this.blocks.get(parentId);
+			if (!parent) unknownParents.push(parentId);
+			else {
+				parentKeys.add(parent.parentId ?? this.space.id);
+				if (parent.base) parentKeys.add(parent.base.parentId ?? this.space.id);
+			}
+		}
+		// A parent the plan never loaded (a block moved or deleted away from it): one read by
+		// primary key, without adding it to the working copy.
+		if (unknownParents.length > 0) {
+			for (const meta of await this.store.getBlockMetasByIds(unknownParents))
+				if (meta.spaceId === this.space.id) parentKeys.add(meta.parentId ?? this.space.id);
 		}
 
 		const versionedIds = new Set([...closeVersionIds, ...insertBlocks.map((b) => b.id)]);
@@ -2935,7 +2955,6 @@ class OutlinePlanner {
 			pageIds: [...pageIds],
 			changes: {
 				parentKeys: [...parentKeys],
-				listParentKeys: [...listParentKeys],
 				blockIds: changedIds,
 			},
 		};

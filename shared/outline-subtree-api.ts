@@ -32,6 +32,8 @@ export const OUTLINE_SUBTREE_LIMITS = {
 	maxPreviews: 50,
 	/** Keys one marks read names at most. */
 	maxMarkKeys: 100,
+	/** Open changes one read marks its blocks with; past it the read says `pendingTruncated`. */
+	pendingRows: 500,
 	/** Candidates of each kind a marks read looks at; past it the counts are lower bounds. */
 	markCandidates: 500,
 	/** Blocks a marks read looks up while walking candidates up to the space. */
@@ -58,7 +60,11 @@ export interface OutlineTreeBlock {
 	tags: string[];
 	/** `from_seq` of the version read. */
 	versionSeq: number;
-	/** It had live children at the seq read, whether or not the read loaded them (see `levels`). */
+	/**
+	 * It had live children at the seq read, whether or not the read loaded them (see
+	 * `levels`), and whatever they are: in the facts view a block whose only children are tasks
+	 * or questions still says true, and its level then comes back empty with `processHidden`.
+	 */
 	hasChildren: boolean;
 	/** The lock, on a locked task. */
 	lock: OutlineLockView | null;
@@ -99,6 +105,11 @@ interface OutlineTreeRead {
 	 * none of its children loaded.
 	 */
 	levels: OutlineTreeLevel[];
+	/**
+	 * More open changes touch the blocks read than one read looks at
+	 * ({@link OUTLINE_SUBTREE_LIMITS.pendingRows}): some `pending` lists are incomplete.
+	 */
+	pendingTruncated?: boolean;
 }
 
 /** `GET /spaces/:spaceId/children` */
@@ -130,7 +141,7 @@ export interface OutlineSubtreeMarks {
 	/** Questions put to a person, not answered yet. */
 	questions: number;
 	tasks: { todo: number; doing: number };
-	/** Locked tasks among the open tasks. */
+	/** Locked tasks, whatever their status (a finished task can still be locked). */
 	locked: number;
 	/** Open changes waiting for confirmation that touch a block there. */
 	pending: number;

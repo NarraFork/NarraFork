@@ -135,6 +135,25 @@ export interface OutlineChangedChildCursor {
 	blockId: string;
 }
 
+/** A block on the way up from a block to the space, as of the seq read. */
+export interface OutlineAncestorRow {
+	id: string;
+	sid: string;
+	/** It is a task; a question put to a person. */
+	isTask: boolean;
+	isAsk: boolean;
+	/** It is a locked task. */
+	locked: boolean;
+}
+
+/** A live block of a space with its parent: one step of many walks up at once. */
+export interface OutlineParentRow {
+	id: string;
+	parentId: string | null;
+	/** It is a locked task. */
+	locked: boolean;
+}
+
 /** Why a read by placement or by change mark cannot be answered; see the header. */
 export class OutlineHistoryUnavailableError extends Error {
 	constructor(
@@ -271,6 +290,40 @@ export interface OutlineHistoryPort {
 		blockId: string,
 		options: { before?: number | null; after?: number; limit: number },
 	): Promise<number[]>;
+	/**
+	 * A block and its ancestors up to the space, the block first, then nearest first, as the
+	 * tree is now (`asOf` null: up the blocks' parent column, every block on the way live and
+	 * of the space) or was as of a seq (up the placements valid then, each with its version
+	 * valid then). Null when the block was not in the tree then, or sits deeper than `maxDepth`.
+	 * ONE recursive statement by primary key whatever the depth, at most `maxDepth + 2` rows.
+	 * As of a seq: refused like {@link getPlacementsAt}.
+	 */
+	getAncestry(
+		spaceId: string,
+		blockId: string,
+		options: { asOf: number | null; maxDepth: number },
+	): Promise<OutlineAncestorRow[] | null>;
+	/**
+	 * The given blocks and every ancestor of them as the tree is now, each once, in no order:
+	 * only LIVE blocks of the space (the walk goes up the parent column through whatever is
+	 * there; a block that is deleted or of another space is left out, which breaks the chains
+	 * through it). At most `limit` rows, `truncated` when the walk found more. One recursive
+	 * statement per 500 ids, by primary key: what walking many blocks up at once reads
+	 * (`subtree-marks.ts`).
+	 */
+	listAncestryOf(
+		spaceId: string,
+		blockIds: readonly string[],
+		limit: number,
+	): Promise<{ rows: OutlineParentRow[]; truncated: boolean }>;
+	/**
+	 * The live locked tasks of a space, whatever their status, at most `limit`, unordered. Read
+	 * from the partial lock index, which is keyed by page until pages go (X2 keys it by space):
+	 * the read walks the locked blocks of EVERY space and keeps this one's, so it costs the
+	 * number of locks in the database, which are few (a person's locked plans), never the size
+	 * of the space.
+	 */
+	listLockedOfSpace(spaceId: string, limit: number): Promise<OutlineParentRow[]>;
 	/** The history floor and placement readiness of the given spaces (primary key, chunked). */
 	getHistoryStates(spaceIds: readonly string[]): Promise<Map<string, OutlineHistoryState>>;
 
