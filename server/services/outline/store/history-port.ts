@@ -307,7 +307,8 @@ export interface OutlineHistoryPort {
 	 * The given blocks and every ancestor of them as the tree is now, each once, in no order:
 	 * only LIVE blocks of the space (the walk goes up the parent column through whatever is
 	 * there; a block that is deleted or of another space is left out, which breaks the chains
-	 * through it). At most `limit` rows, `truncated` when the walk found more. One recursive
+	 * through it). Ids that are not live blocks of the space start no walk and cost none of
+	 * the limit. At most `limit` rows, `truncated` when the walk found more. One recursive
 	 * statement per 500 ids, by primary key: what walking many blocks up at once reads
 	 * (`subtree-marks.ts`).
 	 */
@@ -319,9 +320,10 @@ export interface OutlineHistoryPort {
 	/**
 	 * The live locked tasks of a space, whatever their status, at most `limit`, unordered. Read
 	 * from the partial lock index, which is keyed by page until pages go (X2 keys it by space):
-	 * the read walks the locked blocks of EVERY space and keeps this one's, so it costs the
-	 * number of locks in the database, which are few (a person's locked plans), never the size
-	 * of the space.
+	 * the read walks the locked blocks of EVERY space and keeps this one's. Its cost therefore
+	 * grows with the locks of ALL spaces, not with this space: measured on SQLite 0.7 ms with
+	 * 10,000 locks elsewhere and 3.4 ms with 50,000. Fine while locks are a person's locked
+	 * plans; X2 MUST re-key the lock index by space, which makes this a seek.
 	 */
 	listLockedOfSpace(spaceId: string, limit: number): Promise<OutlineParentRow[]>;
 	/** The history floor and placement readiness of the given spaces (primary key, chunked). */

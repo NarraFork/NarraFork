@@ -209,9 +209,16 @@ export async function readOutlineMarks(request: OutlineMarksRequest): Promise<Ou
 		{ maxRows: OUTLINE_SUBTREE_LIMITS.markWalkRows, store },
 	);
 
+	// Which keys are live blocks of the space is asked on its own (primary key, at most 100):
+	// a key the bounded walk did not reach still gets its (lower-bound) counts, with `atLeast`.
+	const live = new Set<string>();
+	if (ancestry.cutShort && blockKeys.some((key) => !ancestry.has(key))) {
+		for (const meta of await store.getBlockMetasByIds(blockKeys))
+			if (meta.spaceId === space.id && !meta.deleted) live.add(meta.id);
+	}
 	const byKey = new Map<string, OutlineSubtreeMarks>();
 	for (const key of keys) {
-		if (key !== space.id && !ancestry.has(key)) continue;
+		if (key !== space.id && !ancestry.has(key) && !live.has(key)) continue;
 		byKey.set(key, { key, questions: 0, tasks: { todo: 0, doing: 0 }, locked: 0, pending: 0 });
 	}
 	/** The asked-for keys a live block counts for: the space, and its ancestors among them. */

@@ -124,7 +124,12 @@ export function outlineSubtreeChanged(index: OutlineCommitChangeIndex, rootKey: 
  * gone out yet (frames are coalesced) is carried over: for the keys the new set still
  * watches, it arrives in an `outline_watch_changed` after the new `outline_watching`. Keys
  * the new set dropped are forgotten, and so is everything when the space changes. A key that
- * is new in the set has no past: the client reads it when it starts watching it.
+ * is new in the set has no past: the client reads it when it starts watching it. While the
+ * replacement is being checked, the old set keeps listening and its frames keep coming.
+ *
+ * THE BACKSTOP. Every `outline_watching` carries the space's last commit seq. A client that
+ * gets one whose seq is past what it last read (after a reconnect, a replacement, anything)
+ * re-reads everything it watches: that never depends on which frames reached it.
  */
 export type OutlineWatchClientMessage =
 	| {

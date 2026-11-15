@@ -248,15 +248,19 @@ export const SQLITE_ANCESTRY_AS_OF = `WITH RECURSIVE up(id, depth) AS (
 	ORDER BY up.depth`;
 
 /**
- * The blocks whose ids are the JSON array `?1` and every ancestor of them, each once: up the
- * parent column by primary key, the `CROSS JOIN`s keeping it that way round (as the commit's
- * change marks, {@link sqliteMarkAncestorsSql}). At most `?2` rows; each carries its space and
- * whether it is deleted, and the caller keeps the live blocks of its space. Nothing but the
- * ids is in a WHERE clause: with the space there too, SQLite walked the whole space by an
- * index on it (measured: 475 ms for 750 ids in a space of 100,000 blocks, against 2 ms).
+ * The blocks whose ids are the JSON array `?1` that are live blocks of the space `?3`, and
+ * every ancestor of them, each once: up the parent column by primary key, the `CROSS JOIN`s
+ * keeping it that way round (as the commit's change marks, {@link sqliteMarkAncestorsSql}).
+ * Ids that are deleted, of another space or of nothing start no walk, so they use up none of
+ * the `?2` rows. Each row carries its space and whether it is deleted, and the caller keeps
+ * the live blocks of its space. The ids are probed one by one from the JSON list and the
+ * space is only a filter on the row found: with `id IN (…) AND space_id = ?` as the search,
+ * SQLite walked the whole space by an index on it (measured: 475 ms for 750 ids in a space
+ * of 100,000 blocks, against 2 ms).
  */
 export const SQLITE_ANCESTRY_OF = `WITH RECURSIVE up(id) AS (
-		SELECT j.value FROM json_each(?1) j
+		SELECT s.id FROM json_each(?1) j CROSS JOIN outline_blocks s ON s.id = j.value
+			WHERE s.space_id = ?3 AND s.deleted = 0
 		UNION
 		SELECT b.parent_id FROM up CROSS JOIN outline_blocks b
 			ON b.id = up.id WHERE b.parent_id IS NOT NULL
@@ -495,9 +499,11 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 					truncated = true;
 					break;
 				}
-				const rows = values(SQLITE_ANCESTRY_OF, [JSON.stringify(chunk), room + 1]) as Array<
-					[string, string | null, string, number, number]
-				>;
+				const rows = values(SQLITE_ANCESTRY_OF, [
+					JSON.stringify(chunk),
+					room + 1,
+					spaceId,
+				]) as Array<[string, string | null, string, number, number]>;
 				if (rows.length > room) truncated = true;
 				for (const row of rows.slice(0, room)) {
 					if (row[2] !== spaceId || Number(row[3]) !== 0) continue;

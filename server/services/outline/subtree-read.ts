@@ -687,10 +687,9 @@ export async function readOutlineSubtree(
 			(request.view ?? "facts") === "facts" && located.process ? "all" : (request.view ?? "facts");
 
 		// Folded current reads: what must stay open.
-		const over: ReadonlySet<string> | null =
-			ctx.asOf === null && request.fold
-				? (await readOutlineAttention(space, { store })).over
-				: null;
+		const attention =
+			ctx.asOf === null && request.fold ? await readOutlineAttention(space, { store }) : null;
+		const over: ReadonlySet<string> | null = attention?.over ?? null;
 
 		const fold = request.fold;
 		const foldAt = new Map<string, FoldAt>();
@@ -790,6 +789,7 @@ export async function readOutlineSubtree(
 			truncated: truncated || done.cut,
 			...(done.pendingTruncated ? { pendingTruncated: true } : {}),
 			...(fold ? { closed: closed.filter((id) => shownIds.has(id)) } : {}),
+			...(attention?.atLeast ? { attentionAtLeast: true } : {}),
 		};
 	});
 }

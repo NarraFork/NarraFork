@@ -371,11 +371,16 @@ export function pgAncestryAsOf(
  * The given blocks and every ancestor of them, each once: SQLite's `SQLITE_ANCESTRY_OF`, the
  * step up fenced as the commit's change marks are ({@link pgMarkAncestorsSql}). Each row
  * carries its space and whether it is deleted; the caller keeps the live blocks of its space.
+ * Only live blocks of the space start a walk (found by id inside a fence, the space a filter
+ * on what was found), so other ids use up none of the limit.
  */
-export function pgAncestryOf(ids: readonly string[], limit: number): SQL {
+export function pgAncestryOf(spaceId: string, ids: readonly string[], limit: number): SQL {
 	return sql`
 		WITH RECURSIVE up(id) AS (
-			SELECT id FROM outline_blocks WHERE id IN (${idList(ids)})
+			SELECT s.id FROM (
+				SELECT id, space_id, deleted FROM outline_blocks WHERE id IN (${idList(ids)}) OFFSET 0
+			) s
+			WHERE s.space_id = ${text(spaceId)} AND NOT s.deleted
 			UNION
 			SELECT b.parent_id FROM up CROSS JOIN LATERAL (
 				SELECT y.parent_id FROM outline_blocks y WHERE y.id = up.id OFFSET 0
@@ -650,7 +655,7 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 					space_id: string;
 					deleted: boolean;
 					locked: boolean;
-				}>(pgAncestryOf(chunk, room + 1));
+				}>(pgAncestryOf(spaceId, chunk, room + 1));
 				if (rows.length > room) truncated = true;
 				for (const row of rows.slice(0, room)) {
 					if (row.space_id !== spaceId || row.deleted) continue;

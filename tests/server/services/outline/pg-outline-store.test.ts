@@ -416,7 +416,7 @@ describe("PostgreSQL outline store", () => {
 							marks: await planOf(pgMarkAncestorsSql(["kid1", "kid2", "kid3"], 7, 4001)),
 							ancestryNow: await planOf(pgAncestryNow("kid1", 1000)),
 							ancestryAsOf: await planOf(pgAncestryAsOf("plan-space", "kid1", 3, 1000)),
-							ancestryOf: await planOf(pgAncestryOf(["kid1", "kid2", "kid3"], 4001)),
+							ancestryOf: await planOf(pgAncestryOf("plan-space", ["kid1", "kid2", "kid3"], 4001)),
 							locked: await planOf(pgLockedOfSpace("plan-space", 501)),
 							ancestry: [
 								(await store.getAncestry("plan-space", "kid1", { asOf: null, maxDepth: 1000 }))

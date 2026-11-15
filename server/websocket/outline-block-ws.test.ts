@@ -308,6 +308,55 @@ describe("watching", () => {
 		expect(changes(ws)[1]).toMatchObject({ all: true });
 	});
 
+	test("the old set keeps listening while its replacement is being checked", async () => {
+		const ws = socket(reader);
+		await watch(ws, "s1", space.id, { levels: [a] });
+		// The client sends its new set; a commit naming A lands before the check has finished.
+		const replacing = watch(ws, "s1", space.id, { levels: [a, c] });
+		const landed = await commit(space, [
+			{ op: "insert", parent: { id: a }, content: "In the gap" },
+		]);
+		await replacing;
+		await settle(() => changes(ws).length === 1);
+		expect(changes(ws)[0]).toMatchObject({ levels: [a], seq: landed.seq, all: false });
+		expect(ws.frames.filter((frame) => frame.type === "outline_watching")).toHaveLength(2);
+		// The same with the event alone, between the message and its answer.
+		const again = watch(ws, "s1", space.id, { levels: [a] });
+		eventBus.emit({
+			type: "outline:committed",
+			spaceId: space.id,
+			commitId: "commit-in-the-gap",
+			seq: landed.seq + 1,
+			pageIds: [],
+			changes: { parentKeys: [a], blockIds: ["x"], ancestorIds: [], truncated: false },
+			actorKind: "system",
+			actorId: "test",
+		});
+		await again;
+		await settle(() => changes(ws).length === 2);
+		expect(changes(ws)[1]).toMatchObject({ levels: [a], commitIds: ["commit-in-the-gap"] });
+		// Two replacements at once: the later one wins, nothing is counted twice, one is left.
+		const first = watch(ws, "s1", space.id, { levels: [c] });
+		const second = watch(ws, "s1", space.id, { levels: [a, c] });
+		await Promise.all([first, second]);
+		expect(outlineBlockSubscriptionStats().total).toBe(1);
+		await commit(space, [{ op: "delete", block: { id: landed.results[0]?.blockId as string } }]);
+		await settle(() => changes(ws).length === 3);
+		expect(changes(ws)[2]?.levels).toEqual([a]);
+		// A socket full of subscriptions can still replace one of them.
+		for (let i = 2; i <= OUTLINE_WATCH_LIMITS.perSocket; i++)
+			await watch(ws, `s${i}`, space.id, {});
+		expect(outlineBlockSubscriptionStats().total).toBe(OUTLINE_WATCH_LIMITS.perSocket);
+		await watch(ws, "s1", space.id, { levels: [c] });
+		expect(ws.frames.at(-1)).toMatchObject({ type: "outline_watching", subscriptionId: "s1" });
+		expect(outlineBlockSubscriptionStats().total).toBe(OUTLINE_WATCH_LIMITS.perSocket);
+		// Unwatching while a replacement is under way ends both.
+		const late = watch(ws, "s1", space.id, { levels: [a] });
+		await handleOutlineBlockMessage(ws, { type: "outline_unwatch", subscriptionId: "s1" });
+		await late;
+		expect(outlineBlockSubscriptionStats().total).toBe(OUTLINE_WATCH_LIMITS.perSocket - 1);
+	});
+
 	test("a level is told when one of its rows gains its first child or loses its last", async () => {
 		const ws = socket(reader);
 		// C is a leaf under the page; the level watched is the page's.

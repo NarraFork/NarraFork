@@ -132,6 +132,12 @@ export interface OutlineSubtreeResponse extends OutlineTreeRead {
 	 * the one child its preview line is read from.
 	 */
 	closed?: string[];
+	/**
+	 * With `fold=default`: the space has more open questions, locks or open changes than one
+	 * read looks at ({@link OUTLINE_SUBTREE_LIMITS.markCandidates} of each), or the walk up
+	 * from them was cut short, so a row in `closed` may hide one of them after all.
+	 */
+	attentionAtLeast?: boolean;
 }
 
 /** What is under one block (the block itself not counted), or in the whole space. */

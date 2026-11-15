@@ -13,8 +13,10 @@
  *     that does not exist answers the same `access_denied`. The keys are never looked up: a
  *     commit is matched by its space first and by key second, so a key of another space (or of
  *     nothing) matches no commit, and nothing tells whether it exists.
- *   - Replacing a subscription (the same id sent again) keeps what the old one was told of
- *     and had not sent yet, for the keys still watched.
+ *   - Replacing a subscription (the same id sent again): the old one keeps listening, and
+ *     sending, while its successor is authorized; the successor then takes over in one step
+ *     with what the old one had not sent yet, for the keys still watched. So no commit falls
+ *     between the two, and the pair is never counted twice against a limit.
  *   - Coalesced: commits that land within {@link OUTLINE_BLOCK_COALESCE_MS} become one frame
  *     per subscription. The event bus emits synchronously from the write path, so its listener
  *     only records the commit against the space's subscriptions and arms a timer; matching a
@@ -69,6 +71,10 @@ interface Subscription {
 	/** `outline_watching` went out: change frames may follow. */
 	ready: boolean;
 	active: boolean;
+	/** While being set up: the listening subscription of the same id it will take over from. */
+	replaces: Subscription | undefined;
+	/** The latest subscription being set up to take over from this one. */
+	successor: Subscription | undefined;
 	/** Newest seq not sent yet; 0 when nothing is pending. */
 	pendingSeq: number;
 	pendingCommits: string[];
@@ -151,8 +157,8 @@ async function authorize(sub: Subscription): Promise<OutlineSpaceRow | null> {
 }
 
 /**
- * What a subscription being replaced was already told of and had not sent yet, for the keys
- * its successor still watches in the same space (the rule is in the protocol's header).
+ * What a subscription being replaced was told of and had not sent yet, for the keys its
+ * successor still watches in the same space (the rule is in the protocol's header).
  */
 function carryOver(from: Subscription, to: Subscription): void {
 	if (from.spaceId !== to.spaceId) return;
@@ -166,23 +172,55 @@ function carryOver(from: Subscription, to: Subscription): void {
 	to.pendingCommits = [...from.pendingCommits];
 }
 
+/**
+ * Whether a subscription still being set up is the one its socket wants: the entry of its id,
+ * or the latest successor of the entry it replaces (which keeps listening meanwhile).
+ */
+function isWanted(sub: Subscription): boolean {
+	const old = sub.replaces;
+	return old ? old.successor === sub && isCurrent(old) : isCurrent(sub);
+}
+
+/** End a subscription that could not be set up, and the one it was to replace. */
+function refuseSetup(sub: Subscription, code: OutlineWatchErrorCode): void {
+	const old = sub.replaces;
+	if (!old) {
+		fail(sub, code);
+		return;
+	}
+	old.successor = undefined;
+	// One error for the id: the client's subscription is over, old set and new.
+	fail(old, code);
+}
+
 async function watch(
 	ws: OutlineBlockSocket,
 	message: Extract<OutlineWatchClientMessage, { type: "outline_watch" }>,
-	replaced: Subscription | undefined,
+	existing: Subscription | undefined,
 ): Promise<void> {
 	const subscriptionId = message.subscriptionId;
-	const refuse = (code: OutlineWatchErrorCode) =>
+	// A subscription that is listening keeps listening until its successor takes over; one
+	// still being set up has heard nothing yet and is simply dropped.
+	const replaces = existing?.ready ? existing : undefined;
+	if (existing && !replaces) remove(existing);
+	const refuse = (code: OutlineWatchErrorCode) => {
+		if (replaces) {
+			replaces.successor = undefined;
+			remove(replaces);
+		}
 		send(ws, { type: "outline_watch_error", subscriptionId, code });
+	};
 	if (!isOutlineEnabled() || !ws.data.userId) return refuse("unavailable");
 	const levels = new Set(message.levels ?? []);
 	const subtrees = new Set(message.subtrees ?? []);
 	if (levels.size + subtrees.size > OUTLINE_WATCH_LIMITS.keysPerSubscription)
 		return refuse("unavailable");
 	let entries = state.bySocket.get(ws);
+	// A replacement takes the place its predecessor holds: it is not counted a second time.
 	if (
-		(entries?.size ?? 0) >= OUTLINE_WATCH_LIMITS.perSocket ||
-		state.count >= OUTLINE_BLOCK_MAX_SUBSCRIPTIONS
+		!replaces &&
+		((entries?.size ?? 0) >= OUTLINE_WATCH_LIMITS.perSocket ||
+			state.count >= OUTLINE_BLOCK_MAX_SUBSCRIPTIONS)
 	) {
 		return refuse("unavailable");
 	}
@@ -195,6 +233,8 @@ async function watch(
 		space: null,
 		ready: false,
 		active: true,
+		replaces,
+		successor: undefined,
 		pendingSeq: 0,
 		pendingCommits: [],
 		pendingLevels: new Set(),
@@ -202,39 +242,57 @@ async function watch(
 		pendingAll: false,
 		pendingChanges: false,
 	};
-	if (replaced) carryOver(replaced, sub);
-	// Held by its socket from here on (so a newer message for the same id replaces it), but
-	// not counted against its space, and told of no commit, until it is authorized.
-	if (!entries) {
-		entries = new Map();
-		state.bySocket.set(ws, entries);
+	if (replaces) replaces.successor = sub;
+	else {
+		// Held by its socket from here on (so a newer message for the same id replaces it), but
+		// not counted against its space, and told of no commit, until it is authorized.
+		if (!entries) {
+			entries = new Map();
+			state.bySocket.set(ws, entries);
+		}
+		entries.set(subscriptionId, sub);
+		state.count++;
 	}
-	entries.set(subscriptionId, sub);
-	state.count++;
 
 	let space: OutlineSpaceRow | null = null;
 	try {
 		for (;;) {
 			const epoch = state.accessEpoch;
 			space = await authorize(sub);
-			if (!isCurrent(sub)) return;
+			if (!isWanted(sub)) return;
 			if (epoch === state.accessEpoch) break;
 		}
 	} catch (error) {
 		logger.warn("Outline block subscription failed", { error: String(error) });
-		if (isCurrent(sub)) fail(sub, "unavailable");
+		if (isWanted(sub)) refuseSetup(sub, "unavailable");
 		return;
 	}
 	// A space that does not exist and one the person may not read answer the same, whatever
 	// the limits below would have said.
-	if (!space) return fail(sub, "access_denied");
-	if (!isOutlineEnabled()) return fail(sub, "unavailable");
+	if (!space) return refuseSetup(sub, "access_denied");
+	if (!isOutlineEnabled()) return refuseSetup(sub, "unavailable");
+	// The successor takes over here, in one step: the old subscription leaves (so it is not
+	// counted against the limits a second time), what it had not sent yet moves over, and the
+	// new one listens. No commit falls between the two.
+	if (replaces) {
+		replaces.successor = undefined;
+		remove(replaces);
+		carryOver(replaces, sub);
+		sub.replaces = undefined;
+		let own = state.bySocket.get(ws);
+		if (!own) {
+			own = new Map();
+			state.bySocket.set(ws, own);
+		}
+		own.set(subscriptionId, sub);
+		state.count++;
+	}
 	let watchers = state.bySpace.get(sub.spaceId);
-	let own = 0;
-	for (const other of watchers ?? []) if (other.ws.data.userId === ws.data.userId) own++;
+	let held = 0;
+	for (const other of watchers ?? []) if (other.ws.data.userId === ws.data.userId) held++;
 	if (
 		(watchers?.size ?? 0) >= OUTLINE_WATCH_LIMITS.perSpace ||
-		own >= OUTLINE_WATCH_LIMITS.perUserPerSpace
+		held >= OUTLINE_WATCH_LIMITS.perUserPerSpace
 	) {
 		return fail(sub, "unavailable");
 	}
@@ -269,8 +327,13 @@ export async function handleOutlineBlockMessage(
 	message: OutlineWatchClientMessage,
 ): Promise<void> {
 	const existing = state.bySocket.get(ws)?.get(message.subscriptionId);
-	if (existing) remove(existing);
-	if (message.type === "outline_unwatch") return;
+	if (message.type === "outline_unwatch") {
+		if (existing) {
+			existing.successor = undefined;
+			remove(existing);
+		}
+		return;
+	}
 	await watch(ws, message, existing);
 }
 
