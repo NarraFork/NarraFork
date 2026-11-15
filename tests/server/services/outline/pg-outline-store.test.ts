@@ -32,6 +32,7 @@ import { OUTLINE_HISTORY_CONTRACT } from "../../../../server/services/outline/__
 import { OUTLINE_PENDING_CONTRACT } from "../../../../server/services/outline/__tests__/pending-contract";
 import { OUTLINE_QUESTION_CONTRACT } from "../../../../server/services/outline/__tests__/question-contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
+import { OUTLINE_SUBTREE_CONTRACT } from "../../../../server/services/outline/__tests__/subtree-contract";
 import { OUTLINE_TASK_CONTRACT } from "../../../../server/services/outline/__tests__/task-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
 import type { OutlineEdgeRow } from "../../../../server/services/outline/store/history-port";
@@ -245,6 +246,7 @@ describe("PostgreSQL outline store", () => {
 						...OUTLINE_PENDING_CONTRACT,
 						...OUTLINE_QUESTION_CONTRACT,
 						...OUTLINE_HISTORY_CONTRACT,
+						...OUTLINE_SUBTREE_CONTRACT,
 						...OUTLINE_READ_CONTRACT,
 						...OUTLINE_DIGEST_CONTRACT,
 					]) {
@@ -275,6 +277,7 @@ describe("PostgreSQL outline store", () => {
 					OUTLINE_PENDING_CONTRACT.length +
 					OUTLINE_QUESTION_CONTRACT.length +
 					OUTLINE_HISTORY_CONTRACT.length +
+					OUTLINE_SUBTREE_CONTRACT.length +
 					OUTLINE_READ_CONTRACT.length +
 					OUTLINE_DIGEST_CONTRACT.length,
 			);
