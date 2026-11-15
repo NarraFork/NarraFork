@@ -1,4 +1,8 @@
 {
+	"agentReference": {
+		"unknown": "子代理状态未知",
+		"unavailable": "子代理不存在或无权访问"
+	},
 	"historyCleared": "历史已清理",
 	"toolDetailsCleared": "工具调用详情已清理",
 	"modelTraceReturn": "返回",

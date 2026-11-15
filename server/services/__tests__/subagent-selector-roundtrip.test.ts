@@ -158,6 +158,8 @@ describe("recovered subagents retain their original selectors", () => {
 				},
 			});
 			expect(notifiedTitle).toBe("核实法线实际调用阶段");
+			expect(result.formatted).toContain(`[核实法线实际调用阶段](nf-agent://open?id=${NANOID})`);
+			expect(result.formatted).not.toContain("nf-agent://open?id=normal-stage-audit");
 			expect(result).toMatchObject({
 				id: NANOID,
 				label: "normal-stage-audit",

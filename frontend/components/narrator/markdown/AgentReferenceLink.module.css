@@ -1,0 +1,51 @@
+.reference {
+	align-items: center;
+	box-sizing: border-box;
+	vertical-align: bottom;
+	flex-shrink: 0;
+	min-width: 0;
+	overflow: hidden;
+	border-radius: var(--mantine-radius-sm);
+	background: var(--mantine-color-default-hover);
+	box-shadow: inset 0 0 0 1px var(--mantine-color-default-border);
+	text-decoration: none;
+}
+
+a.reference {
+	color: var(--mantine-color-anchor);
+}
+
+a.reference:hover {
+	background: var(--mantine-color-default-border);
+	text-decoration: none;
+}
+
+a.reference:focus-visible {
+	outline: 2px solid var(--mantine-color-anchor);
+	outline-offset: 2px;
+}
+
+/* A copy-safe pretext line is an inline formatting context, not a flex row of
+   fragments. Remove its inherited strut and center ALL peers when it contains
+   a chip, otherwise the taller chip sits below baseline-aligned prose. */
+[data-vlist-line-frags]:has(> .reference) {
+	line-height: 0;
+}
+
+[data-vlist-line-frags]:has(> .reference) > * {
+	vertical-align: middle;
+}
+
+.status {
+	display: inline-flex;
+	align-items: center;
+	flex: 0 0 auto;
+	line-height: 0;
+}
+
+.label {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}

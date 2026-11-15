@@ -55,6 +55,7 @@ import { type CodeCopyPlacement, resolveCodeCopyPlacement } from "../vlist-conte
 import { splitTokensByVisualLines } from "../vlist-token-lines";
 import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import "../vlist-markdown.css";
+import { inlineFlowForWidth } from "@shared/pretext-layout/agent-reference-flow";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { getTypographyRevision } from "@shared/pretext-layout/typography";
 import { TokenText } from "../../content/TokenLines";
@@ -743,9 +744,10 @@ function TableCellView({
 }) {
 	const lines = useMemo(() => {
 		const out: InlineLine[] = [];
-		walkRichInlineLineRanges(cell.flow, width, (range) => {
+		const flow = inlineFlowForWidth(cell, width);
+		walkRichInlineLineRanges(flow, width, (range) => {
 			if (maxHeight !== undefined && out.length * lineHeight >= maxHeight) return;
-			const line = materializeRichInlineLineRange(cell.flow, range);
+			const line = materializeRichInlineLineRange(flow, range);
 			out.push({
 				fragments: line.fragments.map((f) => ({
 					text: f.text,
@@ -753,6 +755,7 @@ function TableCellView({
 					className: cell.classNames[f.itemIndex] ?? "",
 					href: cell.hrefs[f.itemIndex] ?? null,
 					gapBefore: f.gapBefore,
+					occupiedWidth: f.occupiedWidth,
 					globalStart: 0,
 					// A cell formula reaches here the same way a paragraph's does; leaving
 					// this null painted the atom placeholder (an NBSP) instead of the KaTeX
@@ -808,6 +811,8 @@ function TableCellView({
 										<MarkdownLink
 											lineNumbersInChildren
 											href={frag.href}
+											labelText={frag.text}
+											occupiedWidth={frag.occupiedWidth}
 											className={frag.className}
 											style={fragmentTextStyle({
 												font: frag.font,
@@ -842,6 +847,7 @@ function TableCellView({
 // ── Inline block: materialize line ranges and lay out fragments ──────────────
 
 interface InlineFragment {
+	occupiedWidth: number;
 	text: string;
 	font: string;
 	className: string;
@@ -898,10 +904,11 @@ function InlineBlockView({
 		const maxLines = frame.renderLimited
 			? Math.ceil(Math.max(0, frame.height - contentTop) / block.lineHeight)
 			: Number.POSITIVE_INFINITY;
-		walkRichInlineLineRanges(block.flow, lineWidth, (range) => {
+		const flow = inlineFlowForWidth(block, lineWidth);
+		walkRichInlineLineRanges(flow, lineWidth, (range) => {
 			const index = lineIndex++;
 			if (index < skip || out.length >= maxLines) return;
-			const line = materializeRichInlineLineRange(block.flow, range);
+			const line = materializeRichInlineLineRange(flow, range);
 			out.push({
 				fragments: line.fragments.map((f) => {
 					const globalStart = offset;
@@ -913,7 +920,9 @@ function InlineBlockView({
 						className: block.classNames[f.itemIndex] ?? "",
 						href: block.hrefs[f.itemIndex] ?? null,
 						gapBefore: f.gapBefore,
+						occupiedWidth: f.occupiedWidth,
 						globalStart,
+
 						math: block.mathHtmls?.[f.itemIndex] ?? null,
 					};
 				}),
@@ -1104,6 +1113,8 @@ function InlineBlockView({
 													<MarkdownLink
 														lineNumbersInChildren
 														href={frag.href}
+														labelText={frag.text}
+														occupiedWidth={frag.occupiedWidth}
 														className={frag.className}
 														style={fragmentTextStyle({
 															font: frag.font,

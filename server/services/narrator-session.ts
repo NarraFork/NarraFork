@@ -4103,14 +4103,18 @@ async function updateToolCallConclusionUnlocked(opts: {
 		resultMessageId,
 		refreshTiming = false,
 	} = opts;
-	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
 	// Scope metadata only: do not load the child's transcript or file-tool payloads.
 	const attributionTurn = await db.query.narrators
 		.findFirst({
 			where: eq(narrators.id, subagentId),
-			columns: { turnStartedAt: true },
+			columns: { turnStartedAt: true, title: true },
 		})
 		.catch(() => undefined);
+	const resultPrefix = agentResultTag(
+		await resolveAgentLabel(parentNarratorId, subagentId),
+		subagentId,
+		attributionTurn?.title,
+	);
 	const output = await appendSubagentFileChanges(
 		{
 			parentNarratorId,
