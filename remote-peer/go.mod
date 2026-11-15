@@ -3,7 +3,7 @@ module narrafork/remote-peer
 go 1.26.1
 
 require (
-	github.com/coder/websocket v1.8.14
+	github.com/coder/websocket v1.8.15
 	github.com/pion/logging v0.2.4
 	github.com/pion/webrtc/v4 v4.2.23
 	golang.org/x/sys v0.45.0
