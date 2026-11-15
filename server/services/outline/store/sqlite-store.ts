@@ -926,12 +926,7 @@ export const sqliteOutlineStore: OutlineStore = {
 			async () =>
 				db.transaction((tx) => {
 					tx.delete(outlineLiveLog)
-						.where(
-							and(
-								eq(outlineLiveLog.spaceId, spaceId),
-								eq(outlineLiveLog.epoch, epoch),
-							),
-						)
+						.where(and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)))
 						.run();
 					for (const chunk of chunked(rows, LIVE_INSERT_CHUNK)) {
 						tx.insert(outlineLiveLog).values(chunk).run();
@@ -961,9 +956,7 @@ export const sqliteOutlineStore: OutlineStore = {
 	async deleteLiveLog(spaceId, epoch) {
 		return db
 			.delete(outlineLiveLog)
-			.where(
-				and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)),
-			)
+			.where(and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)))
 			.returning({ seq: outlineLiveLog.seq })
 			.all().length;
 	},

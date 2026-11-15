@@ -417,9 +417,8 @@ describe("a block moved from one page to another by a commit, both pages open", 
 		const one = await page(["moves", "stays"], "One");
 		const two = await page(["there"], "Two");
 		const x = one.ids[0] as string;
-		const child = (
-			await agent([{ op: "insert", parent: { id: x }, content: "under it" }])
-		).results[0]?.blockId as string;
+		const child = (await agent([{ op: "insert", parent: { id: x }, content: "under it" }]))
+			.results[0]?.blockId as string;
 		const la = link(owner);
 		const lb = link(writer);
 		const a = open(la, one.pageId);
@@ -445,9 +444,7 @@ describe("a block moved from one page to another by a commit, both pages open", 
 		type(b, child, "2");
 		await settle(60);
 		expect(session(two.pageId).textOf(x)).toBe("moves!?");
-		expect(
-			la.socket.sent.slice(sentToA).flatMap((f) => decodeLiveTexts(f.body) ?? []),
-		).toEqual([]);
+		expect(la.socket.sent.slice(sentToA).flatMap((f) => decodeLiveTexts(f.body) ?? [])).toEqual([]);
 		// Back again: the first page's people held an older state of that document.
 		await agent([{ op: "move", block: { id: x }, parent: { id: one.pageId } }]);
 		await settle(60);
@@ -551,7 +548,12 @@ describe("a participant's own transaction between two loaded pages", () => {
 			kind: LIVE_FRAME.join,
 			handle: 1,
 			n: 0,
-			head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: one.pageId, mode: "edit", key: "rawclient001" },
+			head: {
+				v: OUTLINE_LIVE_PROTOCOL_VERSION,
+				page: one.pageId,
+				mode: "edit",
+				key: "rawclient001",
+			},
 			body: new Uint8Array(0),
 		});
 		expect(answers[0]?.kind).toBe(LIVE_FRAME.joined);
@@ -613,7 +615,9 @@ describe("pages are loaded on the first join and unloaded when nobody is in them
 		expect(b.undoStack.length).toBe(1);
 		type(b, two.ids[0] as string, "?");
 		// Written while it was not loaded: nothing of it reaches the session.
-		await agent([{ op: "update", block: { id: one.ids[0] as string }, content: "left, rewritten" }]);
+		await agent([
+			{ op: "update", block: { id: one.ids[0] as string }, content: "left, rewritten" },
+		]);
 		await settle(60);
 		expect(theSpace().loadedBlocks).toBe(2);
 		const again = open(link(third), one.pageId);
@@ -653,7 +657,12 @@ describe("pages are loaded on the first join and unloaded when nobody is in them
 	test("the session's budget: pages nobody is in make room for a join; when everything is in use the join is refused", async () => {
 		const pages = [];
 		for (let i = 0; i < 4; i++)
-			pages.push(await page(Array.from({ length: 9 }, (_, n) => `p${i} b${n}`), `P${i}`));
+			pages.push(
+				await page(
+					Array.from({ length: 9 }, (_, n) => `p${i} b${n}`),
+					`P${i}`,
+				),
+			);
 		// Room for two pages of ten blocks.
 		OUTLINE_LIVE_BOUNDS.maxLoadedBlocks = 25;
 		OUTLINE_LIVE_TIMING.idleCloseMs = 60_000;
@@ -858,7 +867,15 @@ describe("documents are dropped by every end together", () => {
 		// A step of structure and text together, then one of text alone, then one undone.
 		struct(
 			a,
-			[{ t: "i", id: z, p: pageId, k: keyBetweenLoose(a.visible.get(y)?.orderKey ?? null, null), content: "" }],
+			[
+				{
+					t: "i",
+					id: z,
+					p: pageId,
+					k: keyBetweenLoose(a.visible.get(y)?.orderKey ?? null, null),
+					content: "",
+				},
+			],
 			[{ id: y, md: "y two" }],
 		);
 		edit(a, x, "x one three");
@@ -1132,7 +1149,12 @@ describe("several people on several pages with an agent that moves blocks betwee
 		test(`seed ${seed}: every page's people converge on what the database holds`, async () => {
 			const pages = [];
 			for (let i = 0; i < 3; i++)
-				pages.push(await page(Array.from({ length: 6 }, (_, n) => `p${i} block ${n}`), `P${i}`));
+				pages.push(
+					await page(
+						Array.from({ length: 6 }, (_, n) => `p${i} block ${n}`),
+						`P${i}`,
+					),
+				);
 			const pageIds = pages.map((p) => p.pageId);
 			const r = rng(seed);
 			OUTLINE_LIVE_TIMING.docIdleMs = 0;
@@ -1170,7 +1192,8 @@ describe("several people on several pages with an agent that moves blocks betwee
 							block: { id: pick.id },
 							content: `${pick.content} [agent ${n}]`,
 						});
-					else if (what < 0.5 && live.length > 3) ops.push({ op: "delete", block: { id: pick.id } });
+					else if (what < 0.5 && live.length > 3)
+						ops.push({ op: "delete", block: { id: pick.id } });
 					else {
 						const there = (await outlineStore.listPageBlocks(to, 10_000)).blocks;
 						const under = there[Math.floor(r() * there.length)];
@@ -1223,7 +1246,10 @@ describe("fifty people on one space (printed, not asserted on time)", () => {
 		for (let p = 0; p < 10; p++)
 			for (let i = 0; i < 5; i++)
 				everyone.push({
-					c: open(link([owner, writer, third][i % 3] as string, `u${p}-${i}`), pages[p]?.pageId as string),
+					c: open(
+						link([owner, writer, third][i % 3] as string, `u${p}-${i}`),
+						pages[p]?.pageId as string,
+					),
 					p,
 				});
 		await waitFor(() => everyone.every((e) => e.c.ready), 10_000, "joined");

@@ -1156,8 +1156,7 @@ export class LiveClient {
 				if (made) {
 					texts.set(id, made);
 					undone.set(id, { before, after: this.textOf(id) });
-				}
-				else this.log.push(`${dir} changed nothing in ${id}: its text was changed since`);
+				} else this.log.push(`${dir} changed nothing in ${id}: its text was changed since`);
 				this.textCache.delete(id);
 			}
 		} finally {

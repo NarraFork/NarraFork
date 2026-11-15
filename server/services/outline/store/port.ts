@@ -1022,11 +1022,7 @@ export interface OutlineStore
 	/** Append rows (at most a handful per call). */
 	appendLiveLog(rows: readonly OutlineLiveLogRow[]): Promise<void>;
 	/** Replace every row of an epoch with `rows`, atomically (a compaction). */
-	replaceLiveLog(
-		spaceId: string,
-		epoch: number,
-		rows: readonly OutlineLiveLogRow[],
-	): Promise<void>;
+	replaceLiveLog(spaceId: string, epoch: number, rows: readonly OutlineLiveLogRow[]): Promise<void>;
 	/** Rows of an epoch by seq, after `afterSeq`, at most `limit`. */
 	listLiveLog(
 		spaceId: string,

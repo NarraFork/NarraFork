@@ -130,7 +130,7 @@ async function content(id: string): Promise<string> {
 }
 
 /** The page's log rows of its sessions (not the ended-session records under epoch 0). */
-async function logRows(pageId: string): Promise<number> {
+async function logRows(_pageId: string): Promise<number> {
 	return db
 		.select()
 		.from(outlineLiveLog)
@@ -971,12 +971,7 @@ describe("what the page already has of a client's transactions", () => {
 			const ended = db
 				.select()
 				.from(outlineLiveLog)
-				.where(
-					and(
-						eq(outlineLiveLog.spaceId, space.id),
-						eq(outlineLiveLog.epoch, ENDED_EPOCH),
-					),
-				)
+				.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, ENDED_EPOCH)))
 				.all()
 				// The space keeps one record per ended session: this session's.
 				.filter((r) => r.seq === sessionEpoch);
@@ -1088,7 +1083,7 @@ describe("what the page already has of a client's transactions", () => {
 
 describe("logs written around a commit", () => {
 	test("an intent logged with its block's old content in one row is not cancelled by it", async () => {
-		const { pageId, ids } = await page(["x"]);
+		const { ids } = await page(["x"]);
 		const block = ids[0] as string;
 		// The session committed "x hello!" (normalized from the typed "x hello") just before it
 		// died; its last row (a compaction, or its first snapshot) holds the block's old content

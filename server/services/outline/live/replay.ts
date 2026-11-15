@@ -5,8 +5,8 @@
  * An epoch's log is a snapshot of the session's text documents (one per block someone typed
  * in), increments (a document's seed text before its first update), and sync rows (what the
  * database held for a block when the session changed it, commits the session was about to
- * write, and how far each client's changes reached the log; see `LivePage.persistStep`). Replay
- * rebuilds each block's final document and, for every live block of the page that has one,
+ * write, and how far each client's changes reached the log; see `LiveSpace.persistStep`). Replay
+ * rebuilds each block's final document and, for every live block of the space that has one,
  * merges three ways: from the last synced content (or the document's seed, or its text in the
  * snapshot), to the final text, onto what the database holds now. So a
  * commit the session never logged (an outside write in the last moments) is kept, and only
@@ -14,16 +14,18 @@
  * logged intent was never resolved and whose content equals it was committed by the session
  * just before it ended: it is left as it is (merging it again would repeat the text).
  *
- * Runs at startup as a background job over every epoch left in `outline_live_updates`, and
- * before a session opens on a page that still has one. Bounded: at most
+ * Runs at startup as a background job over every epoch left in `outline_live_log`, and
+ * before a session opens on a space that still has one. A dropped document (`drop` rows: its
+ * text was committed, or its block left the session) is forgotten; a later document of the
+ * block starts from its own seed. Bounded: at most
  * {@link OUTLINE_LIVE_REPLAY.maxRows} rows and {@link OUTLINE_LIVE_REPLAY.maxBytes} of log per
  * epoch are read (a session compacts long before that); an epoch over the bound is left for an
  * operator and logged, never truncated.
  *
- * A log written before text was per block (one Yjs document a page) is not read: its rows do not
- * decode (`decodeLogTexts`), the epoch is kept and logged like any unreadable one, and the page
- * stays editable. A clean shutdown leaves no log, so this only concerns a crash right before the
- * upgrade.
+ * A row that is neither a text row of this format nor a sync row (`decodeLogTexts`) makes its
+ * epoch unreadable: kept and logged, never misread, and the space stays editable. (The log of
+ * the format before this one lives in another table, `outline_live_updates`, which nothing
+ * reads any more: a clean shutdown leaves none, so only a crash right before the upgrade does.)
  */
 import { logger } from "@server/lib/logger";
 import { merge3 } from "@shared/outline";

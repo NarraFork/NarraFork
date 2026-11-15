@@ -309,9 +309,7 @@ async function replaceLiveSection(
 ): Promise<void> {
 	await tx
 		.delete(outlineLiveLog)
-		.where(
-			and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)),
-		);
+		.where(and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)));
 	await appendLiveSection(tx, rows);
 }
 
@@ -1181,9 +1179,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 					and(
 						eq(outlineLiveLog.spaceId, spaceId),
 						eq(outlineLiveLog.epoch, epoch),
-						options.afterSeq === undefined
-							? undefined
-							: gt(outlineLiveLog.seq, options.afterSeq),
+						options.afterSeq === undefined ? undefined : gt(outlineLiveLog.seq, options.afterSeq),
 					),
 				)
 				.orderBy(asc(outlineLiveLog.seq))
@@ -1194,9 +1190,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		async deleteLiveLog(spaceId, epoch) {
 			const rows = await db
 				.delete(outlineLiveLog)
-				.where(
-					and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)),
-				)
+				.where(and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)))
 				.returning({ seq: outlineLiveLog.seq });
 			return rows.length;
 		},

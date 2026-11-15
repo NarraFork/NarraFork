@@ -887,7 +887,7 @@ describe("reconnecting", () => {
 });
 
 describe("the log and its replay", () => {
-	const rowsOf = (pageId: string, epoch: number) =>
+	const rowsOf = (_pageId: string, epoch: number) =>
 		db
 			.select()
 			.from(outlineLiveLog)
@@ -1314,7 +1314,7 @@ describe("documents count against the session's bound", () => {
 
 describe("a log read in any order", () => {
 	const b64 = (data: Uint8Array) => Buffer.from(data).toString("base64");
-	const left = (pageId: string, epoch: number) =>
+	const left = (_pageId: string, epoch: number) =>
 		db
 			.select()
 			.from(outlineLiveLog)
@@ -1337,7 +1337,7 @@ describe("a log read in any order", () => {
 			actorId: string,
 		) => ({
 			spaceId: space.id,
-				blockId: null,
+			blockId: null,
 			epoch,
 			seq,
 			updateB64: b64(data),
@@ -1367,7 +1367,7 @@ describe("a log read in any order", () => {
 	});
 
 	test("the same, with the database changed since: the seed is the base the typing is merged from", async () => {
-		const { pageId, ids } = await page(["x"]);
+		const { ids } = await page(["x"]);
 		const block = ids[0] as string;
 		const { doc, text } = seededTextDoc("x");
 		const vector = Y.encodeStateVector(doc);

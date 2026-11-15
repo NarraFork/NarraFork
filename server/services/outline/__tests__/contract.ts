@@ -1972,11 +1972,7 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				{ spaceId: one, epoch: 9 },
 				{ spaceId: two, epoch: 3 },
 			].sort((a, b) =>
-				a.spaceId === b.spaceId
-					? a.epoch - b.epoch
-					: a.spaceId < b.spaceId
-						? -1
-						: 1,
+				a.spaceId === b.spaceId ? a.epoch - b.epoch : a.spaceId < b.spaceId ? -1 : 1,
 			);
 			expect(all).toEqual(expected);
 			const firstEpoch = expected[0] as { spaceId: string; epoch: number };

@@ -1,56 +1,76 @@
 /**
- * One page's live editing session (design §6.2–§6.6, plan §8, D33).
+ * One space's live editing session (design §6.2–§6.6, plan §8, D33; one per space since the
+ * pageless plan's L2).
  *
  * WHAT IT HOLDS
  * -------------
- *   - the text of every block of the page: a plain string (what the database holds) until
- *     someone changes it, then a Yjs document of that block alone (`shared/outline-live-text.ts`:
- *     made from the plain text the same way on every end, so nothing races its creation). A
- *     document is kept until the session ends, also when the change that made it was refused:
- *     every end must hold every item of a document it has;
- *   - a mirror of the page's structure (`mirror.ts`), equal to the blocks table between tasks;
- *   - the participants: people editing (write access) or viewing (read access) the page.
+ *   - a mirror of the part of the space people have open (`mirror.ts`): blocks by parent, a
+ *     page's tree loaded on the first join of the page and unloaded when nobody is in it, so the
+ *     session's size follows what is open ({@link OUTLINE_LIVE_BOUNDS.maxLoadedBlocks}); equal to
+ *     the blocks table between tasks;
+ *   - the text of every loaded block: a plain string (what the database holds) until someone
+ *     changes it, then a Yjs document of that block alone (`shared/outline-live-text.ts`: made
+ *     from the plain text the same way on every end, so nothing races its creation). A document
+ *     belongs to its block wherever the block is moved. It is kept, also when the change that
+ *     made it was refused (every end must hold every item of a document it has), until every
+ *     end drops it together (`sweepDocs`: generations);
+ *   - the participants, each in the page it joined ({@link LivePageView}): the wire protocol
+ *     still joins a page, and a participant is sent what concerns its page's tree only. Two
+ *     pages of a space are one session: one lane, one sequence of structural batches, one log.
  *
  * HOW CHANGES FLOW
  * ----------------
  *   - Text: a participant's updates (one per block it changed) are applied at once and
- *     broadcast to the others within {@link OUTLINE_LIVE_TIMING.broadcastMs}, merged per block
- *     with everything else of that window (`Y.mergeUpdates`), never echoed to their sender (who
- *     gets the transaction number back instead). Changed blocks are committed as the editor's
- *     own human commits a little later (after {@link OUTLINE_LIVE_TIMING.flushIdleMs} of quiet,
- *     at most {@link OUTLINE_LIVE_TIMING.flushMaxMs} after the first change), normalized off the
- *     main thread when large (`normalize.ts`).
+ *     broadcast to the others of the block's page within {@link OUTLINE_LIVE_TIMING.broadcastMs},
+ *     merged per block with everything else of that window (`Y.mergeUpdates`), never echoed to
+ *     their sender (who gets the transaction number back instead). Changed blocks are committed
+ *     as the editor's own human commits a little later (after
+ *     {@link OUTLINE_LIVE_TIMING.flushIdleMs} of quiet, at most
+ *     {@link OUTLINE_LIVE_TIMING.flushMaxMs} after the first change), normalized off the main
+ *     thread when large (`normalize.ts`).
  *   - Structure: a structural transaction (insert, move, delete, checkbox, plus the text
  *     updates of the same keystroke) is checked against the mirror, written as one commit
- *     through `writeOutline`, then broadcast in canonical form. A refused transaction is rolled
- *     back (its text part by undoing it in each block's document) and every later frame of that
- *     participant is dropped until it joins again; the client rebuilds its documents and replays
- *     its own later changes.
+ *     through `writeOutline`, then broadcast in canonical form. Its blocks and parents may be in
+ *     any loaded trees of the space: there is no page boundary (only the top-level blocks
+ *     themselves cannot be moved, deleted or checked over the wire yet). Each page is sent its
+ *     own view of the batch (`route`): a block moved to another page's tree is a delete there
+ *     and inserts (with text) here. A refused transaction is rolled back (its text part by
+ *     undoing it in each block's document) and every later frame of that participant is dropped
+ *     until it joins again; the client rebuilds its documents and replays its own later changes.
  *   - Writes from outside (agents, reverts) reach the session through the barrier
  *     (`live-barrier.ts`): unflushed text is committed first, then the outside commit is read
- *     back (its block versions) and pushed in as a remote change, merged into the live text.
- *   - Every text update is also appended to `outline_live_updates` within
+ *     back (its block versions) and pushed in as a remote change, merged into the live text. A
+ *     block a commit moves between two loaded pages keeps its document.
+ *   - Every text update is also appended to `outline_live_log` within
  *     {@link OUTLINE_LIVE_TIMING.persistMs} (a snapshot of every document first, increments
- *     after, each block's seed text before its first update, compacted once the increments
- *     outweigh a snapshot; the row format is {@link encodeLogTexts}). A participant's
- *     transactions are acknowledged only once the log (or the page) has them: after a crash,
- *     what was acknowledged is replayed from the log (a startup job, or the next join), and what
- *     was not is still held by its client, which replays it into the next session. Every join
- *     after a client's first names
- *     the session it was in, and the answer says which of its transactions the page applied
- *     (`tx`) and which of those are safe in the log or committed (`dur`): the client forgets
- *     the latter, keeps the rest of what was applied unsent until acknowledged, and replays
- *     only what the page does not have, so nothing is applied twice (also across a refusal,
- *     a restart or days offline: an ended session's positions stay in the log, `registry.ts`).
- *     Before the session commits text it logs what it is about to write (an intent), so a
- *     crash between the commit and the next append does not merge committed text with itself.
+ *     after, each block's seed text before its first update, a dropped document's drop before
+ *     anything later of its block, compacted once the increments outweigh a snapshot; the row
+ *     format is {@link encodeLogTexts}). A participant's transactions are acknowledged only once
+ *     the log (or the space) has them: after a crash, what was acknowledged is replayed from the
+ *     log (a startup job, or the next join), and what was not is still held by its client, which
+ *     replays it into the next session. Every join after a client's first names the session it
+ *     was in, and the answer says which of its transactions the space applied (`tx`) and which
+ *     of those are safe in the log or committed (`dur`): the client forgets the latter, keeps
+ *     the rest of what was applied unsent until acknowledged, and replays only what the space
+ *     does not have, so nothing is applied twice (also across a refusal, a restart or days
+ *     offline: an ended session's positions stay in the log, `registry.ts`). Before the session
+ *     commits text it logs what it is about to write (an intent), so a crash between the commit
+ *     and the next append does not merge committed text with itself.
  *   - Failures: a commit that fails part way keeps what was written (the session takes it as
- *     the page now is); text that cannot be normalized or written is committed as code blocks,
+ *     the space now is); text that cannot be normalized or written is committed as code blocks,
  *     and given up on (kept live and in the log) when even that fails a few times; a log that
- *     cannot be committed is taken over by the next session of the page. A frame that cannot
+ *     cannot be committed is taken over by the next session of the space. A frame that cannot
  *     be encoded drops only its recipient.
  *
- * Every method that touches the document or the database runs in the space's lane.
+ * BOUNDS
+ * ------
+ * Loaded blocks and their content per space ({@link OUTLINE_LIVE_BOUNDS}; pages nobody is in go
+ * first, then the join is refused), loaded blocks across the process (`registry.ts`), documents
+ * (dropped when idle or when there are many; a hard bound as the last resort), a participant's
+ * queued frames and buffered bytes. Loading and unloading a tree is one bounded read and
+ * {@link OUTLINE_LIVE_BOUNDS.loadStep} blocks at a time in memory, yielding in between.
+ *
+ * Every method that touches the documents or the database runs in the space's lane.
  */
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
@@ -1826,11 +1846,7 @@ export class LiveSpace {
 	 * Encode and send one frame to one participant. A frame that cannot be encoded is a bug of
 	 * this session, not of the others: the participant is dropped and everyone else carries on.
 	 */
-	deliver(
-		p: Participant,
-		kind: "data" | "presence" | "control",
-		build: () => Uint8Array,
-	): boolean {
+	deliver(p: Participant, kind: "data" | "presence" | "control", build: () => Uint8Array): boolean {
 		if (p.lagging) return false;
 		let frame: Uint8Array;
 		try {
@@ -2919,8 +2935,7 @@ export class LiveSpace {
 				}
 				case "k": {
 					// A question is not a task: its checkbox is refused (it is answered in the inbox).
-					if (!alive(op.id) || isTop(op.id) || this.mirror.get(op.id)?.question)
-						return null;
+					if (!alive(op.id) || isTop(op.id) || this.mirror.get(op.id)?.question) return null;
 					out.push(op);
 					break;
 				}
@@ -3357,9 +3372,7 @@ export class LiveSpace {
 	}
 
 	/** Replace an epoch's rows with one snapshot and one sync row of what is still open. */
-	private async compact(
-		row: LogRowMaker,
-	): Promise<void> {
+	private async compact(row: LogRowMaker): Promise<void> {
 		const ahead = new Map<string, string>();
 		for (const b of this.mirror.all()) {
 			if (!b.deleted && this.textOf(b.id) !== b.dbContent) ahead.set(b.id, b.dbContent);
