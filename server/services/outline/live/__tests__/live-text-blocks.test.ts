@@ -72,7 +72,7 @@ import {
 	decodeLogTexts,
 	encodeLogTexts,
 	LIVE_SYNC_ACTOR,
-	type LivePage,
+	type LivePageView,
 	OUTLINE_LIVE_BOUNDS,
 	OUTLINE_LIVE_HOOKS,
 	OUTLINE_LIVE_TIMING,
@@ -141,7 +141,7 @@ function edit(c: LiveClient, id: string, md: string): void {
 	struct(c, [], [{ id, md }]);
 }
 
-function session(pageId: string): LivePage {
+function session(pageId: string): LivePageView {
 	const s = liveSessionOf(pageId);
 	if (!s) throw new Error("no session");
 	return s;

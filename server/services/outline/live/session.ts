@@ -196,8 +196,6 @@ export const OUTLINE_LIVE_BOUNDS = {
 	maxLoadedChars: 32 * 1024 * 1024,
 	/** Blocks put into or taken out of the mirror between two yields to the event loop. */
 	loadStep: 500,
-	/** Children one parent may have to be loaded on its own (`LiveSpace.loadParent`). */
-	maxParentChildren: 2000,
 	/** Failed commits of a block as code after which it is no longer retried (until edited). */
 	maxCommitFailures: 3,
 	/** A socket buffering more than this gets no more frames until it drains and rejoins. */
@@ -1159,48 +1157,12 @@ export class LiveSpace {
 		}
 		this.mirror.markRoot(pageId);
 		const view = new LivePageView(this, pageId);
-		view.loadedAtOp = this.opSeq;
+		// A number of its own: a client that last saw an earlier one was here before this load.
+		view.loadedAtOp = ++this.opSeq;
 		this.scopes.set(pageId, view);
 		this.stats.treesLoaded++;
 		this.stats.loadMs += performance.now() - t0;
 		return view;
-	}
-
-	/**
-	 * Load the live children of one parent the mirror holds (L3's unit of loading: "watch a
-	 * parent"). The children come without their own children; a parent with more than
-	 * {@link OUTLINE_LIVE_BOUNDS.maxParentChildren} is not loaded this way. In the lane.
-	 */
-	async loadParent(parentId: string): Promise<boolean> {
-		if (this.mirror.isLoaded(parentId)) return true;
-		if (!this.mirror.alive(parentId)) return false;
-		const max = OUTLINE_LIVE_BOUNDS.maxParentChildren;
-		const rows = await outlineStore.listChildren(this.spaceId, parentId, max + 1);
-		if (rows.length > max || this.closed) return false;
-		if (this.mirror.size + rows.length > OUTLINE_LIVE_BOUNDS.maxLoadedBlocks) return false;
-		if (!this.mirror.alive(parentId)) return false;
-		const step = OUTLINE_LIVE_BOUNDS.loadStep;
-		for (let at = 0; at < rows.length; at += step) {
-			if (at > 0) await yieldToLoop();
-			for (const b of rows.slice(at, at + step)) if (!this.mirror.alive(b.id)) this.putRow(b);
-		}
-		this.mirror.markLoaded(parentId);
-		return true;
-	}
-
-	/**
-	 * Unload what {@link loadParent} loaded under a parent: its children and everything under
-	 * them go from the mirror, their documents with them (text not committed yet is committed
-	 * first; false when that fails, and nothing is unloaded). In the lane.
-	 */
-	async unloadParent(parentId: string): Promise<boolean> {
-		if (!this.mirror.isLoaded(parentId) || this.mirror.isRoot(this.mirror.topOf(parentId) ?? ""))
-			return false;
-		const ids = this.mirror.subtreeAll(parentId).slice(1);
-		if (!(await this.settleForUnload(ids))) return false;
-		await this.removeBlocks(ids);
-		this.mirror.unmarkLoaded(parentId);
-		return true;
 	}
 
 	/** Commit and log what is pending of `ids`; false when some text of them cannot be committed. */
@@ -2037,22 +1999,29 @@ export class LiveSpace {
 	 * (`forceResync`); one of a generation it never announced is refused like any malformed one.
 	 */
 	private parseTexts(
+		p: Participant,
 		body: Uint8Array,
 		inserted?: ReadonlySet<string>,
 	): LiveTextEntry[] | "stale" | null {
 		const entries = decodeLiveTexts(body, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
 		if (!entries) return null;
 		const seen = new Set<string>();
+		const out: LiveTextEntry[] = [];
 		let stale = false;
 		for (const e of entries) {
 			if (e.kind !== LIVE_TEXT_KIND.update || seen.has(e.id)) return null;
 			if (!this.hasText(e.id) && !inserted?.has(e.id)) return null;
+			seen.add(e.id);
 			const gen = this.mirror.get(e.id)?.gen ?? 0;
 			if ((e.gen ?? 0) > gen) return null;
-			if ((e.gen ?? 0) < gen) stale = true;
-			seen.add(e.id);
+			if ((e.gen ?? 0) === gen) out.push(e);
+			// Of a block of the participant's page: it is told of the drop (a join names it).
+			// Of a block that left its page (it holds it as deleted, and is told nothing more of
+			// it): typing that crossed the block's leaving, as typing may cross a delete; only
+			// that entry is left out.
+			else if (this.scopeOf(e.id) === p.root) stale = true;
 		}
-		return stale ? "stale" : entries;
+		return stale ? "stale" : out;
 	}
 
 	/**
@@ -2102,7 +2071,7 @@ export class LiveSpace {
 			this.reject(p, n, "read_only");
 			return;
 		}
-		const entries = this.parseTexts(body);
+		const entries = this.parseTexts(p, body);
 		if (entries === "stale") {
 			this.forceResync(p);
 			return;
@@ -2562,7 +2531,7 @@ export class LiveSpace {
 		}
 		const inserted = new Map<string, Extract<LiveOp, { t: "i" }>>();
 		for (const op of plan.ops) if (op.t === "i") inserted.set(op.id, op);
-		const entries = this.parseTexts(body, new Set(inserted.keys()));
+		const entries = this.parseTexts(p, body, new Set(inserted.keys()));
 		if (entries === "stale") {
 			this.forceResync(p);
 			return;
