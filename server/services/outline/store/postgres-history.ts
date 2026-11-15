@@ -298,7 +298,7 @@ export function pgMarkAncestorsSql(ids: readonly string[], seq: number, limit: n
 		WHERE NOT EXISTS (SELECT 1 FROM outline_subtree_changes m
 			WHERE m.ancestor_id = up.id AND m.seq = ${int(seq)})
 		LIMIT ${int(limit)}
-		RETURNING 1`;
+		RETURNING ancestor_id`;
 }
 
 interface SpaceRecord {

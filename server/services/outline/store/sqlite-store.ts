@@ -318,15 +318,23 @@ function idList(ids: readonly string[]): SQL {
  * commit's block changes and again after them), each `(ancestor, seq)` once, whether or not a
  * block on the way up is deleted (the statement is `sqliteMarkAncestorsSql`). Ancestors marked
  * already are left out before the limit, which is one past what is left of the commit's
- * allowance; returns how many rows it added.
+ * allowance; returns how many rows it added, and adds the ancestors it marked to `marked`.
  */
-function markAncestors(tx: Tx, ids: readonly string[], seq: number, room: number): number {
+function markAncestors(
+	tx: Tx,
+	ids: readonly string[],
+	seq: number,
+	room: number,
+	marked: string[],
+): number {
 	let added = 0;
 	for (const chunk of chunked(ids)) {
 		const [head, tail] = sqliteMarkAncestorsSql(seq, room - added + 1).split(SQLITE_IDS_SLOT);
-		added += tx.all(
+		const rows = tx.all<{ ancestor_id: string }>(
 			sql`${sql.raw(head as string)}${idList(chunk)}${sql.raw(tail as string)}`,
-		).length;
+		);
+		for (const row of rows) marked.push(row.ancestor_id);
+		added += rows.length;
 		if (added > room) break;
 	}
 	return added;
@@ -358,8 +366,11 @@ function writePlacements(tx: Tx, ids: readonly string[], seq: number): void {
 function applyCommitSection(
 	tx: Tx,
 	plan: OutlineCommitPlan,
+	/** Gets the ancestors the commit marked as changed (emptied first: the section may run again). */
+	marked: string[],
 ): "applied" | "stale" | "claims" | "pending" {
 	const { seq } = plan;
+	marked.length = 0;
 	// The claims the plan read must still be as read (a lease renewed since may have made a
 	// takeover wrong). Nothing writes inside this synchronous section but this section.
 	const expected = expectedClaimIds(plan);
@@ -395,7 +406,7 @@ function applyCommitSection(
 
 	// Change marks, first half: the ancestors of the changed blocks as the tree was.
 	const maxMarks = OUTLINE_HISTORY_LIMITS.maxChangeMarks;
-	let marks = markAncestors(tx, plan.closeVersionIds, seq, maxMarks);
+	let marks = markAncestors(tx, plan.closeVersionIds, seq, maxMarks, marked);
 	if (marks > maxMarks) throw new OutlineChangeMarksLimitError(plan.spaceId);
 
 	let closed = 0;
@@ -456,6 +467,7 @@ function applyCommitSection(
 		plan.versions.flatMap((group) => group.ids),
 		seq,
 		maxMarks - marks,
+		marked,
 	);
 	if (marks > maxMarks) throw new OutlineChangeMarksLimitError(plan.spaceId);
 	writePlacements(tx, placedBlockIds(plan), seq);
@@ -1088,9 +1100,10 @@ export const sqliteOutlineStore: OutlineStore = {
 
 	async applyCommit(plan) {
 		let outcome: "applied" | "stale" | "claims" | "pending";
+		const marked: string[] = [];
 		try {
 			outcome = await withDbRetry(
-				async () => db.transaction((tx) => applyCommitSection(tx, plan)),
+				async () => db.transaction((tx) => applyCommitSection(tx, plan, marked)),
 				{ label: "outline.applyCommit", maxRetries: 3 },
 			);
 		} catch (error) {
@@ -1099,6 +1112,7 @@ export const sqliteOutlineStore: OutlineStore = {
 		if (outcome === "stale") throw new OutlineStaleWriteError(plan.spaceId, plan.seq);
 		if (outcome === "claims") throw new OutlineClaimsMovedError(plan.spaceId, plan.seq);
 		if (outcome === "pending") throw new OutlinePendingMovedError(plan.spaceId, plan.seq);
+		return { markedAncestorIds: marked };
 	},
 
 	async getPending(ids) {

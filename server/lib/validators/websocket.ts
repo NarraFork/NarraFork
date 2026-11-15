@@ -52,6 +52,22 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		.strict(),
 	z
 		.object({
+			type: z.literal("outline_watch"),
+			subscriptionId: z.string().min(1).max(128),
+			spaceId: z.string().min(1).max(128),
+			// `OUTLINE_WATCH_LIMITS.keysPerSubscription` for both together (checked by the handler).
+			levels: z.array(z.string().min(1).max(128)).max(2000).optional(),
+			subtrees: z.array(z.string().min(1).max(128)).max(2000).optional(),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.literal("outline_unwatch"),
+			subscriptionId: z.string().min(1).max(128),
+		})
+		.strict(),
+	z
+		.object({
 			type: z.literal("git_workspace_subscribe"),
 			subscriptionId: z.string().min(1).max(128),
 			narratorId: z.string().min(1).max(128).optional(),
