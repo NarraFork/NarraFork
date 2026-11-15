@@ -2715,7 +2715,7 @@ class OutlinePlanner {
 		);
 		if (!touches || this.behaviorGrant()) return;
 		throw new OutlineWriteError(
-			OUTLINE_TEXT.errors.behaviorPageReadonly,
+			OUTLINE_TEXT.errors.behaviorReadonly,
 			"OUTLINE_BEHAVIOR_PAGE_READONLY",
 		);
 	}
@@ -2738,7 +2738,7 @@ class OutlinePlanner {
 		});
 		if (!touches) return;
 		throw new OutlineWriteError(
-			OUTLINE_TEXT.errors.tasksPageReserved,
+			OUTLINE_TEXT.errors.tasksReserved,
 			"OUTLINE_TASKS_PAGE_RESERVED",
 		);
 	}

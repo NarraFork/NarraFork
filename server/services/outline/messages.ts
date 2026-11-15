@@ -15,12 +15,17 @@ function blocks(n: number): string {
 export const OUTLINE_TEXT = {
 	/** Under a block whose further blocks did not fit the read's budget. */
 	more: (n: number) => `‹… ${n} more›`,
+	/**
+	 * The same under a block of a tree loaded in part: `n` blocks are known to be left out, and
+	 * there are more the read did not load.
+	 */
+	moreOpen: (n: number) => (n > 0 ? `‹… ${n}+ more›` : "‹… more›"),
 	/** After a facts view that left process blocks out. */
 	factsOnly: (n: number) =>
 		`‹facts only: ${blocks(n)} under tasks not shown; read with view "all" to include them›`,
-	/** After a read of a page with more blocks than one read loads. */
-	pageTruncated: (n: number) =>
-		`‹the page has more blocks than one read loads; only ${n} were read: read a smaller part›`,
+	/** After a read of a part of the outline with more blocks than one read loads. */
+	readTruncated: (n: number) =>
+		`‹this part of the outline has more blocks than one read loads; only ${n} were read: read a smaller part›`,
 
 	/** Why a revert left a block as it is. */
 	revertSkipped: {
@@ -93,9 +98,8 @@ export const OUTLINE_TEXT = {
 	questionNotTask: (address: string) =>
 		`${address} is a question (asked with Ask); it cannot be a task too. Answer it, or withdraw it with Ask`,
 
-	/** An agent's write tried to lock or unlock (only people lock, through the page). */
-	lockDenied:
-		"only people lock or unlock a task (from the outline page); an agent cannot change a lock",
+	/** An agent's write tried to lock or unlock (only people lock, in the outline's own view). */
+	lockDenied: "only people lock or unlock a task (in the outline); an agent cannot change a lock",
 	/** An agent's write tried to change a plan's state (the system keeps it: plan mode, approval). */
 	planStateDenied:
 		"a plan's state (planning, approved) is kept by plan mode; an agent cannot set or clear it",
@@ -110,29 +114,30 @@ export const OUTLINE_TEXT = {
 	pendingTooLarge: (ops: number, bytes: number) =>
 		`the change waiting for confirmation on this plan would grow past ${ops} operations or ${bytes} bytes of text; wait until it is confirmed or rejected`,
 	pendingFull: (max: number) =>
-		`the page already has ${max} changes waiting for confirmation; wait until some are decided`,
+		`there are already ${max} changes waiting for confirmation here; wait until some are decided`,
 	/** Summary of a commit that confirms a pending change. */
 	confirmSummary: (label: string, summary: string) => `confirm ${label}: ${summary}`,
 
 	/** Why a read or search was refused. */
 	errors: {
-		pageTooLarge: (pageId: string, max: number) =>
-			`outline page ${pageId} has more than ${max} blocks; read a smaller part of it`,
+		readTooLarge: (max: number) =>
+			`this part of the outline has more than ${max} blocks; read a smaller part of it`,
 		badSeq: (field: string) => `${field} must be a commit seq (a non-negative integer)`,
 		badTime: "not a valid time",
 		tooManySpaces: (max: number, got: number) =>
 			`a search covers at most ${max} spaces (got ${got})`,
-		/** An agent's write to the session's behavior page without the user turn's grant. */
-		behaviorPageReadonly:
-			"the behavior page of this session (alias behavior) holds the user's standing rules: you may write it only as the first tool call of a user turn in which the user asked you to record a rule",
-		/** An agent's write giving or taking the task page's alias, moving or deleting the page. */
-		tasksPageReserved:
-			"the task page of this session (alias tasks) is where people add their tasks: you may add and change blocks under it, but not give or take its alias, nor move or delete the page",
+		/** An agent's write to the session's behavior boundary without the user turn's grant. */
+		behaviorReadonly:
+			"the behavior boundary of this session (session/behavior, the block with alias behavior, and what is under it) holds the user's standing rules: you may write it only as the first tool call of a user turn in which the user asked you to record a rule",
+		/** An agent's write giving or taking the task list's alias, moving or deleting its block. */
+		tasksReserved:
+			"the task list of this session (session/tasks, the block with alias tasks) is where people add their tasks: you may add and change blocks under it, but not give or take its alias, nor move or delete it",
 	},
-	/** Summary of the commit that imports a session's old behavior fence into its page. */
-	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",
-	/** Summary of the commit that copies the behavior page into a fork. */
-	behaviorForkSummary: (from: string) => `copied the behavior page from session ${from}`,
+	/** Summary of the commit that imports a session's old behavior fence into its boundary. */
+	behaviorImportSummary:
+		"imported the behavior fence (spec://behavior_fence) into the behavior boundary",
+	/** Summary of the commit that copies the behavior boundary into a fork. */
+	behaviorForkSummary: (from: string) => `copied the behavior boundary from session ${from}`,
 	/** Summaries of a plugin's commits for a session (`plugin-tasks.ts`, outline P2 PR 12a). */
 	pluginTaskAdded: (pluginId: string) => `plugin ${pluginId} added a task`,
 	pluginTaskStatus: (pluginId: string, address: string, status: string) =>
@@ -140,10 +145,12 @@ export const OUTLINE_TEXT = {
 	pluginTasksWritten: (pluginId: string) =>
 		`plugin ${pluginId} wrote its task list (spec://tasks.json)`,
 	pluginIndexWritten: (pluginId: string) => `plugin ${pluginId} wrote index.md (spec://index.md)`,
-	pluginRulesSet: (pluginId: string) => `plugin ${pluginId} updated its rules on this page`,
-	pluginRulesCleared: (pluginId: string) => `plugin ${pluginId} cleared its rules on this page`,
+	pluginRulesSet: (pluginId: string) =>
+		`plugin ${pluginId} updated its rules in the behavior boundary`,
+	pluginRulesCleared: (pluginId: string) =>
+		`plugin ${pluginId} cleared its rules in the behavior boundary`,
 	pluginSopMoved: (pluginId: string) =>
-		`moved plugin ${pluginId}'s rules from the old behavior fence (spec://behavior_fence) into this page`,
+		`moved plugin ${pluginId}'s rules from the old behavior fence (spec://behavior_fence) into the behavior boundary`,
 } as const;
 
 export type OutlineRevertSkipReason = keyof typeof OUTLINE_TEXT.revertSkipped;
@@ -178,7 +185,8 @@ function quoted(text: string): string {
 export const OUTLINE_TOOL_TEXT = {
 	disabled: "The outline is turned off on this server (setting outline.enabled).",
 	untitled: "(untitled)",
-	pageMark: " (page)",
+	/** After a candidate that sits at the top level of its space. */
+	topMark: " (top level)",
 	aliasMark: (alias: string) => ` (alias ${alias})`,
 
 	spaceName: {
@@ -191,39 +199,47 @@ export const OUTLINE_TOOL_TEXT = {
 	},
 
 	overviewHeader:
-		'the outline spaces of this session and their pages; read one with OutlineRead { address: "<id>" }; address "*" gives an overview of every space this session can read',
+		'the outline spaces of this session and their top-level blocks; read one with OutlineRead { address: "<id>" }; address "*" gives an overview of every space this session can read',
 	spaceSection: (space: string, isDefault: boolean) =>
 		`space ${space}${isDefault ? "; bare ids and titles are looked up here first" : ""}`,
-	noPages: "no pages yet",
-	morePages: "more pages not listed; find them with OutlineSearch",
+	nothingYet: "nothing here yet",
+	/** A space lists more top-level blocks after the last one shown. */
+	moreTops: (key: string, last: string) =>
+		`more top-level blocks after these: continue with OutlineRead { address: "${key}/", after: "${last}" }, or find one with OutlineSearch`,
+	/** Under a level that continues past what a read shows (see `OUTLINE_TEXT.moreOpen`). */
+	moreOpen: (n: number) => OUTLINE_TEXT.moreOpen(n),
+	moreCounted: (n: number) => OUTLINE_TEXT.more(n),
+	/** A facts view left tasks and questions out of the levels it read. */
+	factsHidden: (n: number) =>
+		`facts only: ${n === 1 ? "1 task or question" : `${n} tasks or questions`} (with what is under ${n === 1 ? "it" : "them"}) not shown; read with view "all" to include them`,
+	/** `after` given where there is no level to continue. */
+	afterNeedsLevel:
+		"after continues one level: give it with the address of the block whose children you are reading (or key/ for a space's top level).",
+	afterNotUnder: (after: string, parent: string) =>
+		`${quoted(after)} is not a block directly under ${parent}. after names the last child of ${parent} a read showed; the read continues after it.`,
+	nothingAfter: "nothing after it: this level ends here",
 	writeHint:
 		"to write, use OutlineEdit (if it is not in your tool list, load it with /load OutlineEdit)",
 
 	allSpacesHeader: (n: number) =>
-		`overview of ${n === 1 ? "the 1 space" : `${n} spaces`} this session can read, its own first: each space's pages, expanded level by level within the budget. Blocks of its own spaces are labeled with their id, blocks of other spaces with key/id; read one with OutlineRead { address: "<id or key/id>" }`,
+		`overview of ${n === 1 ? "the 1 space" : `${n} spaces`} this session can read, its own first: each space's top-level blocks, expanded level by level within the budget. Blocks of its own spaces are labeled with their id, blocks of other spaces with key/id; read one with OutlineRead { address: "<id or key/id>" }`,
 	allSpacesNone:
-		'This session can read no outline space yet. OutlineEdit creates its own on the first write: { add: "/", markdown: "- A page" }.',
+		'This session can read no outline space yet. OutlineEdit creates its own on the first write: { add: "/", markdown: "- A first block" }.',
 	moreSpaces:
 		'this session can read more spaces than the overview lists: read one by its key (key/), or search them all with OutlineSearch { spaces: ["*"] }',
 	spacesUnchecked:
 		"the overview stops after checking a number of spaces, so a space this session can read may be missing from it: name it by its key (key/) to read it",
-	/** Pages of a space the overview leaves out; never shorter as `n` grows. */
-	morePagesOf: (key: string, n: number, more: boolean) =>
-		`${n === 0 ? "more pages" : `${n}${more ? "+" : ""} more ${n === 1 && !more ? "page" : "pages"}`} not shown; OutlineRead { address: "${key}/" } lists them`,
-	taskPagesHidden: (n: number) =>
-		`facts only: ${n === 1 ? "1 page that is a task" : `${n} pages that are tasks`} not shown; read with view "all" to include them`,
-	notExpandedLarge: (labels: readonly string[]) =>
-		`shown without what is under them, each has more blocks than one read of the overview takes: read ${list(labels)} on their own`,
-	notExpandedLimit: (labels: readonly string[]) =>
-		`shown without what is under them, past the blocks one overview reads in all: read ${list(labels)} on their own`,
+	/** Top-level blocks of a space the overview leaves out; never shorter as `n` grows. */
+	moreTopsOf: (key: string, n: number, more: boolean) =>
+		`${n === 0 ? "more top-level blocks" : `${n}${more ? "+" : ""} more top-level ${n === 1 && !more ? "block" : "blocks"}`} not shown; OutlineRead { address: "${key}/" } lists them`,
 	accessChanged:
 		"Who may read this session kept changing while the outline was being read, so nothing is shown. Read it again.",
 	overviewNotAsOf:
 		'asOf reads one block as it was; the overview ("*") shows the spaces as they are now. Read a block with asOf instead.',
-	otherSessionPages: (n: number, more: boolean) =>
-		`${more ? `more than ${n} pages` : n === 1 ? "1 page" : `${n} pages`}, not listed: another session's notes are process; read them with view "all", or by address (key/ lists them)`,
+	otherSessionNotes: (n: number, more: boolean) =>
+		`${more ? `more than ${n} top-level blocks` : n === 1 ? "1 top-level block" : `${n} top-level blocks`}, not listed: another session's notes are process; read them with view "all", or by address (key/ lists them)`,
 	noSpaces:
-		'This session has no outline pages yet. OutlineEdit creates its space on the first write: { add: "/", markdown: "- A page" } writes to the project\'s space (or, where this turn may not write it, to this session\'s notes); add: "session/" writes to the session\'s notes.',
+		'This session has no outline yet. OutlineEdit creates its space on the first write: { add: "/", markdown: "- A first block" } writes to the project\'s space (or, where this turn may not write it, to this session\'s notes); add: "session/" writes to the session\'s notes.',
 	noSuchSpace: (name: string) =>
 		`No outline space ${quoted(name)} that this session can read. Name a space by its key, or project/, session/ or personal/.`,
 	notFound: (ref: string) =>
@@ -233,10 +249,15 @@ export const OUTLINE_TOOL_TEXT = {
 		`${address} is deleted. Read it as it was with asOf (a commit number or a time before it was deleted).`,
 	notAtSeq: (address: string, seq: number) => `${address} did not exist as of commit #${seq}.`,
 	badAsOf: "asOf must be a commit number or a time (such as 2026-10-26T09:00:00Z).",
-	readHeader: (space: string, path: readonly string[], asOf: number | null) =>
+	readHeader: (
+		space: string,
+		path: readonly string[],
+		asOf: number | null,
+		after: string | null = null,
+	) =>
 		`space ${space}${path.length > 0 ? ` · in ${path.join(" › ")}` : ""}${
-			asOf === null ? "" : ` · as of commit #${asOf}`
-		}`,
+			after === null ? "" : ` · after ${after}`
+		}${asOf === null ? "" : ` · as of commit #${asOf}`}`,
 
 	searchHeader: (n: number, query: string, spaces: readonly string[]) =>
 		`${n === 1 ? "1 result" : `${n} results`} for ${quoted(query)} in ${list(spaces)}`,
@@ -270,7 +291,7 @@ export const OUTLINE_TOOL_TEXT = {
 			"in read-only and plan mode OutlineEdit writes only this session's own space (session/); write there, or leave plan mode",
 		noPermission: (space: string) => `the person running this turn may not write ${space}`,
 		defaultToSession:
-			"this turn may not write the project's space, so new pages went to this session's notes (session/)",
+			"this turn may not write the project's space, so the new top-level blocks went to this session's notes (session/)",
 		ambiguous: (ref: string, candidates: readonly string[]) =>
 			`${quoted(ref)} matches several blocks (${list(candidates)}); use an address`,
 		deletedBlock: (address: string) => `${address} is deleted`,
@@ -303,7 +324,7 @@ export const OUTLINE_TOOL_TEXT = {
 			`${address} was in progress and got a new assignee: it is back to to-do, so whoever takes it up claims it afresh`,
 		/** A task of the session's own space given to someone else was handed out (P2 PR 10c-3). */
 		handedOut: (task: string, copy: string, assignee: string | null, omitted: number) =>
-			`${task} was handed out: its copy ${copy} is on the project's task page${
+			`${task} was handed out: its copy ${copy} is on the project's task list (project/tasks)${
 				assignee ? `, assigned to @${assignee}` : ", in the team's pool (nobody assigned)"
 			}${
 				omitted > 0
@@ -321,8 +342,8 @@ export const OUTLINE_TOOL_TEXT = {
 			`the session @agent:${name} names cannot work in this space (it is archived, or the person it works for may not write here); nothing was written`,
 		taskPropsIgnored: (n: number) =>
 			`edit ${n}: depends:: and due:: belong to tasks and were left out on a block without a checkbox`,
-		samePageTitle: (title: string, addresses: readonly string[]) =>
-			`a page titled ${quoted(title)} already existed: ${list(addresses.map((a) => `[[${a}]]`))}; merge them if they are the same`,
+		sameTopTitle: (title: string, addresses: readonly string[]) =>
+			`a top-level block titled ${quoted(title)} already existed: ${list(addresses.map((a) => `[[${a}]]`))}; merge them if they are the same`,
 		busy: "the space kept changing while the edit was written; nothing was written, try again",
 		conflictHeader:
 			"Nothing was written: blocks you are changing (or deleting with what is under them) changed after you last read them, or you have not read them, and your edits could not be merged with those changes.",
@@ -368,8 +389,8 @@ export const OUTLINE_TOOL_TEXT = {
 		noChange: "Nothing changed: the edits leave the outline as it was. No commit was written.",
 		committed: (seq: number, space: string, edits: number) =>
 			`Committed #${seq} to ${space} (${edits === 1 ? "1 edit" : `${edits} edits`}; it can be reverted as one commit).`,
-		topLevel: "the top level (it is a page now)",
-		added: (where: string | null) => (where ? `added under ${where}:` : "added new pages:"),
+		topLevel: "the top level of the space",
+		added: (where: string | null) => (where ? `added under ${where}:` : "added at the top level:"),
 		replaced: (sid: string) => `replaced [${sid}]`,
 		replacedMerged: (sid: string) =>
 			`replaced [${sid}], merged with changes made after you read it (shown below)`,
@@ -452,7 +473,7 @@ export const OUTLINE_TOOL_TEXT = {
 			`pending ${label}: your proposed change, merged over changes made here since you proposed it; not confirmed yet`,
 		markOwnConflict: (label: string, _decider: string, detail: string) =>
 			`pending ${label}: changed since you proposed it, your change no longer applies here (${detail}); shown as it is now`,
-		/** After a read: this session's own open changes on the page. */
+		/** After a read: this session's own open changes on the plans read. */
 		yours: (label: string, decider: string, since: "none" | "merged" | "conflict") =>
 			since === "conflict"
 				? `${label} is your change to this plan; blocks it changes were changed since you proposed it and part of it no longer applies (marked above, shown as they are now): it cannot be confirmed as it is. Propose those blocks again from the text as it is now (they merge into ${label}), or reject ${label} to withdraw it. It waits for ${decider}`

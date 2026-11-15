@@ -256,6 +256,8 @@ async function readLevelsFromStart(
 
 interface Finished {
 	blocks: OutlineTreeBlock[];
+	/** The same blocks as tree nodes, in the same order (see {@link OutlineReadNodes}). */
+	shown: OutlineNode[];
 	levels: OutlineTreeLevel[];
 	/** Rows left out because the byte budget ran out. */
 	cut: boolean;
@@ -357,6 +359,7 @@ async function finish(
 	}
 	return {
 		blocks,
+		shown,
 		levels,
 		cut: shown.length < order.length,
 		pendingTruncated: pending.truncated,
@@ -427,12 +430,33 @@ export interface OutlineLevelsRequest {
 export type OutlineLevelsResult = OutlineLevelsResponse;
 
 /**
+ * What a read returned, once more as tree nodes: for readers that render text and need what
+ * the wire shape leaves out (the whole task with its plan and prerequisites as written, the
+ * whole question). One node per block of `read.blocks`, in the same order, content and tags
+ * loaded; nodes are linked among themselves, but a caller that combines several reads links
+ * them itself from `read.levels`.
+ */
+export interface OutlineReadNodes<Read> {
+	read: Read;
+	nodes: OutlineNode[];
+	/** Locked tasks above what was read (ancestors of the root, or of the parents asked for). */
+	lockedAbove: string[];
+}
+
+/**
  * The children of the given parents, in the order given, until the budget is spent (see the
  * header). A parent that is not a live block of the space (then) has no children here.
  */
 export async function readOutlineLevels(
 	request: OutlineLevelsRequest,
 ): Promise<OutlineLevelsResult> {
+	return (await readOutlineLevelsNodes(request)).read;
+}
+
+/** {@link readOutlineLevels} with the blocks as tree nodes too. */
+export async function readOutlineLevelsNodes(
+	request: OutlineLevelsRequest,
+): Promise<OutlineReadNodes<OutlineLevelsResult>> {
 	const store = request.store ?? outlineStore;
 	const { space } = request;
 	const ctx: ReadContext = {
@@ -503,13 +527,17 @@ export async function readOutlineLevels(
 				: [];
 		const done = await finish(ctx, order, drafts, maxBytes, lockedAbove);
 		return {
-			spaceId: space.id,
-			seq: ctx.asOf ?? space.nextSeq - 1,
-			current: ctx.asOf === null,
-			view,
-			blocks: done.blocks,
-			levels: done.levels,
-			...(done.pendingTruncated ? { pendingTruncated: true } : {}),
+			read: {
+				spaceId: space.id,
+				seq: ctx.asOf ?? space.nextSeq - 1,
+				current: ctx.asOf === null,
+				view,
+				blocks: done.blocks,
+				levels: done.levels,
+				...(done.pendingTruncated ? { pendingTruncated: true } : {}),
+			},
+			nodes: done.shown,
+			lockedAbove,
 		};
 	});
 }
@@ -646,6 +674,13 @@ interface FoldAt {
 export async function readOutlineSubtree(
 	request: OutlineSubtreeRequest,
 ): Promise<OutlineSubtreeResult | null> {
+	return (await readOutlineSubtreeNodes(request))?.read ?? null;
+}
+
+/** {@link readOutlineSubtree} with the blocks as tree nodes too. */
+export async function readOutlineSubtreeNodes(
+	request: OutlineSubtreeRequest,
+): Promise<OutlineReadNodes<OutlineSubtreeResult> | null> {
 	const store = request.store ?? outlineStore;
 	const { space, rootId } = request;
 	const ctx: ReadContext = {
@@ -776,20 +811,24 @@ export async function readOutlineSubtree(
 		const done = await finish(ctx, order, drafts, maxBytes, located.lockedAbove);
 		const shownIds = new Set(done.blocks.map((block) => block.id));
 		return {
-			spaceId: space.id,
-			rootId,
-			seq: ctx.asOf ?? space.nextSeq - 1,
-			current: ctx.asOf === null,
-			view,
-			path: located.path,
-			pathTruncated: located.pathTruncated,
-			rootInTask: located.inTask,
-			blocks: done.blocks,
-			levels: done.levels,
-			truncated: truncated || done.cut,
-			...(done.pendingTruncated ? { pendingTruncated: true } : {}),
-			...(fold ? { closed: closed.filter((id) => shownIds.has(id)) } : {}),
-			...(attention?.atLeast ? { attentionAtLeast: true } : {}),
+			read: {
+				spaceId: space.id,
+				rootId,
+				seq: ctx.asOf ?? space.nextSeq - 1,
+				current: ctx.asOf === null,
+				view,
+				path: located.path,
+				pathTruncated: located.pathTruncated,
+				rootInTask: located.inTask,
+				blocks: done.blocks,
+				levels: done.levels,
+				truncated: truncated || done.cut,
+				...(done.pendingTruncated ? { pendingTruncated: true } : {}),
+				...(fold ? { closed: closed.filter((id) => shownIds.has(id)) } : {}),
+				...(attention?.atLeast ? { attentionAtLeast: true } : {}),
+			},
+			nodes: done.shown,
+			lockedAbove: located.lockedAbove,
 		};
 	});
 }
