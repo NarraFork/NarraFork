@@ -401,6 +401,18 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return out;
 	},
 
+	async getLastLiveVersion(blockId) {
+		const v = outlineBlockVersions;
+		const row = db
+			.select({ fromSeq: v.fromSeq, toSeq: v.toSeq })
+			.from(v)
+			.where(and(eq(v.blockId, blockId), eq(v.deleted, false)))
+			.orderBy(desc(v.fromSeq))
+			.limit(1)
+			.get();
+		return row ?? null;
+	},
+
 	async listLinksAt(blockIds, seq, kinds, limit) {
 		const out: OutlineLinkRow[] = [];
 		if (kinds.length === 0) return out;

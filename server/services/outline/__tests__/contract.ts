@@ -717,10 +717,7 @@ export async function randomizedHistory(
 				for (const handle of subtree(target.handle)) {
 					const gone = model.get(handle) as ModelBlock;
 					// Restorable later: blocks that existed before this transaction.
-					const was = beforeGraveyard.find(([id]) => id === handle);
-					// Restored and deleted again by one transaction: as if it had not been touched.
-					if (was) graveyard.set(handle, structuredClone(was[1]));
-					else if (!handle.startsWith("tmp:") && !gone.pending && gone.sid) {
+					if (!handle.startsWith("tmp:") && !gone.pending && gone.sid) {
 						graveyard.set(handle, {
 							sid: gone.sid,
 							content: gone.content,

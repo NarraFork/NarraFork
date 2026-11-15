@@ -1288,52 +1288,200 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "restore op: the tags are those of the last commit that left the block live",
+		name: "restore op: the tags are those the block had when it was last live",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
 			const r = await write(ctx, space, [
 				{ op: "insert", tempId: "p", parent: null, content: "page" },
-				{ op: "insert", tempId: "x", parent: { tempId: "p" }, content: "old", tags: ["Ops"] },
 				{ op: "insert", tempId: "y", parent: { tempId: "p" }, content: "Y", tags: ["Ops"] },
 				{ op: "insert", tempId: "q", parent: null, content: "page two" },
 			]);
-			const [, x, y, q] = ids(r) as string[];
+			const [, y, q] = ids(r) as [string, string, string];
 			const tagsOf = async (id: string) =>
 				(await ctx.store.listOpenLinks([id], 10))
 					.filter((l) => l.kind === "tag")
 					.map((l) => l.targetRef)
 					.sort();
+			const tombstones = async (id: string) =>
+				(await ctx.store.listBlockVersions(id, 100)).filter((v) => v.deleted).length;
 
-			// Tags are link rows only and a deleted block has none: tags replaced by the very
-			// commit that deletes the block are recorded nowhere, while the row keeps the text.
+			// Restored and deleted again by one commit (with the page it was put under): the
+			// commit writes another tombstone, after which the newest version says nothing of when
+			// the block was last live.
+			await write(ctx, space, [{ op: "delete", block: { id: y } }]);
+			expect(await ctx.store.getLastLiveVersion(y)).toEqual({ fromSeq: 1, toSeq: 2 });
 			await write(ctx, space, [
-				{ op: "update", block: { id: x as string }, content: "new", tags: ["Design", "Risk"] },
-				{ op: "delete", block: { id: x as string } },
+				{ op: "restore", block: { id: y }, parent: { id: q }, content: "Y2" },
+				{ op: "delete", block: { id: q } },
 			]);
-			await write(ctx, space, [{ op: "restore", block: { id: x as string } }]);
-			expect((await ctx.store.getBlock(x as string))?.content).toBe("new");
-			expect(await tagsOf(x as string)).toEqual(["Ops"]);
+			expect(await tombstones(y)).toBe(2);
+			expect(await ctx.store.getLastLiveVersion(y)).toEqual({ fromSeq: 1, toSeq: 2 });
+			await write(ctx, space, [{ op: "restore", block: { id: y }, parent: null }]);
+			expect(await ctx.store.getBlock(y)).toMatchObject({ deleted: false, content: "Y2" });
+			expect(await tagsOf(y)).toEqual(["Ops"]);
+			expect(await ctx.store.getLastLiveVersion(y)).toEqual({ fromSeq: 4, toSeq: null });
 
-			// Restored and deleted again by one commit (here with the page it was put under): the
-			// block is as it was, and a later restore still finds its tags.
-			await write(ctx, space, [{ op: "delete", block: { id: y as string } }]);
-			const tombstone = await ctx.store.getBlock(y as string);
-			const again = await write(ctx, space, [
-				{ op: "restore", block: { id: y as string }, parent: { id: q as string }, content: "Y2" },
-				{ op: "delete", block: { id: q as string } },
+			// Any number of tombstones in a row: the tags replaced while it was live last, not
+			// the first ones, and not those a restore that did not last asked for.
+			await write(ctx, space, [{ op: "update", block: { id: y }, tags: ["Design", "Risk"] }]);
+			await write(ctx, space, [{ op: "delete", block: { id: y } }]);
+			for (let n = 0; n < 3; n++) {
+				await write(ctx, space, [
+					{ op: "restore", block: { id: y }, content: `again ${n}`, tags: [`T${n}`] },
+					{ op: "delete", block: { id: y } },
+				]);
+			}
+			expect(await tombstones(y)).toBe(6);
+			expect(await ctx.store.getLastLiveVersion(y)).toEqual({ fromSeq: 5, toSeq: 6 });
+			await write(ctx, space, [{ op: "restore", block: { id: y } }]);
+			expect(await tagsOf(y)).toEqual(["Design", "Risk"]);
+
+			// Made and deleted by one commit: never live, so it comes back with no tags.
+			const never = await write(ctx, space, [
+				{ op: "insert", tempId: "n", parent: null, content: "N", tags: ["Ops"] },
+				{ op: "delete", block: { tempId: "n" } },
 			]);
-			expect(again.commit).not.toBeNull();
-			expect(await ctx.store.getBlock(y as string)).toEqual(tombstone);
-			expect(await ctx.store.listBlockVersions(y as string, 10)).toHaveLength(2);
-			// A commit that only does that writes nothing.
-			const nothing = await write(ctx, space, [
-				{ op: "restore", block: { id: y as string } },
-				{ op: "delete", block: { id: y as string } },
+			expect(await ctx.store.getLastLiveVersion(a0(never))).toBeNull();
+			await write(ctx, space, [{ op: "restore", block: { id: a0(never) } }]);
+			expect(await tagsOf(a0(never))).toEqual([]);
+			checkSpaceInvariants(await ctx.dump(space.id));
+			checkChangeFlags(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "restore op: a block restored, given a subtree and deleted again by one commit",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			// S > G > X and a page O. X is deleted; then one commit restores X under O, moves S
+			// (X's old grandparent) under it and deletes X: S and G go with it, each tombstone
+			// under the parent it had at that moment.
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "s", parent: null, content: "S" },
+				{ op: "insert", tempId: "g", parent: { tempId: "s" }, content: "G" },
+				{ op: "insert", tempId: "x", parent: { tempId: "g" }, content: "X", tags: ["Ops"] },
+				{ op: "insert", tempId: "o", parent: null, content: "O" },
 			]);
-			expect(nothing.commit).toBeNull();
-			await write(ctx, space, [{ op: "restore", block: { id: y as string } }]);
-			expect(await ctx.store.getBlock(y as string)).toMatchObject({ deleted: false, content: "Y" });
-			expect(await tagsOf(y as string)).toEqual(["Ops"]);
+			const [s, g, x, o] = ids(r) as [string, string, string, string];
+			await write(ctx, space, [{ op: "delete", block: { id: x } }]);
+			const before = await ctx.dump(space.id);
+			const commit = await write(ctx, space, [
+				{ op: "restore", block: { id: x }, parent: { id: o } },
+				{ op: "move", block: { id: s }, parent: { id: x } },
+				{ op: "delete", block: { id: x } },
+			]);
+			const parents = async () =>
+				Object.fromEntries(
+					(await ctx.store.getBlockMetas(space.id, { ids: [s, g, x] })).map((b) => [
+						b.id,
+						[b.parentId, b.deleted],
+					]),
+				);
+			// No loop among the tombstones' parents.
+			expect(await parents()).toEqual({ [x]: [o, true], [s]: [x, true], [g]: [s, true] });
+			checkSpaceInvariants(await ctx.dump(space.id));
+			checkChangeFlags(await ctx.dump(space.id));
+
+			const back = await revert(ctx, commit.commit?.id as string);
+			expect(back.skipped).toEqual([]);
+			expect(await parents()).toEqual({ [x]: [o, true], [s]: [null, false], [g]: [s, false] });
+			const after = await ctx.dump(space.id);
+			checkSpaceInvariants(after);
+			checkChangeFlags(after);
+			expect(treeAt(after, Number.MAX_SAFE_INTEGER)).toEqual(
+				treeAt(before, Number.MAX_SAFE_INTEGER),
+			);
+			await write(ctx, space, [{ op: "restore", block: { id: x }, parent: { id: g } }]);
+			expect(
+				(await ctx.store.listOpenLinks([x], 10)).map((l) => `${l.kind} ${l.targetRef}`),
+			).toEqual(["tag Ops"]);
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "restore op: a child restored elsewhere is not taken along when its old parent is restored and moved",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "p", parent: null, content: "P" },
+				{ op: "insert", tempId: "c", parent: { tempId: "p" }, content: "C" },
+				{ op: "insert", tempId: "d", parent: { tempId: "p" }, content: "D" },
+				{ op: "insert", tempId: "o", parent: null, content: "O" },
+			]);
+			const [p, c, d, o] = ids(r) as [string, string, string, string];
+			await write(ctx, space, [
+				{ op: "delete", block: { id: p } },
+				{ op: "restore", block: { id: c }, parent: null },
+				{ op: "restore", block: { id: p }, parent: { id: o } },
+				{ op: "move", block: { id: p }, parent: null },
+			]);
+			expect(await ctx.store.getBlock(c)).toMatchObject({
+				deleted: false,
+				parentId: null,
+				pageId: c,
+			});
+			expect(await ctx.store.getBlock(p)).toMatchObject({
+				deleted: false,
+				parentId: null,
+				pageId: p,
+			});
+			// The child that was not restored stays deleted.
+			expect((await ctx.store.getBlock(d))?.deleted).toBe(true);
+			checkSpaceInvariants(await ctx.dump(space.id));
+			checkChangeFlags(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "restore op, known limitation: tags replaced by the commit that deletes a block are not kept, its text is",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "p", parent: null, content: "page" },
+				{ op: "insert", tempId: "x", parent: { tempId: "p" }, content: "old", tags: ["Ops"] },
+			]);
+			const x = a(r);
+			// Tags are link rows only and a deleted block has none, so the tags this commit gives
+			// are recorded nowhere; the block's row keeps the text. The restore mixes the two.
+			await write(ctx, space, [
+				{ op: "update", block: { id: x }, content: "new", tags: ["Design", "Risk"] },
+				{ op: "delete", block: { id: x } },
+			]);
+			await write(ctx, space, [{ op: "restore", block: { id: x } }]);
+			expect((await ctx.store.getBlock(x))?.content).toBe("new");
+			expect(
+				(await ctx.store.listOpenLinks([x], 10)).map((l) => `${l.kind} ${l.targetRef}`),
+			).toEqual(["tag Ops"]);
+			checkSpaceInvariants(await ctx.dump(space.id));
+			checkChangeFlags(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "restore op, known limitation: after a restore is reverted, a plain restore brings back that restore's text",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "p", parent: null, content: "page" },
+				{ op: "insert", tempId: "x", parent: { tempId: "p" }, content: "old", tags: ["Ops"] },
+				{ op: "insert", tempId: "o", parent: null, content: "other" },
+			]);
+			const [, x, o] = ids(r) as [string, string, string];
+			await write(ctx, space, [{ op: "delete", block: { id: x } }]);
+			const rewrite = await write(ctx, space, [
+				{ op: "restore", block: { id: x }, parent: { id: o }, content: "rewrite", tags: ["R"] },
+			]);
+			// The revert deletes the block again as the reverted commit left it: its tombstone
+			// carries that commit's text, place and tags, not those from before it.
+			const back = await revert(ctx, rewrite.commit?.id as string);
+			expect(back.skipped).toEqual([]);
+			expect(await ctx.store.getBlock(x)).toMatchObject({ deleted: true, content: "rewrite" });
+			await write(ctx, space, [{ op: "restore", block: { id: x } }]);
+			expect(await ctx.store.getBlock(x)).toMatchObject({
+				deleted: false,
+				content: "rewrite",
+				parentId: o,
+			});
+			expect(
+				(await ctx.store.listOpenLinks([x], 10)).map((l) => `${l.kind} ${l.targetRef}`),
+			).toEqual(["tag R"]);
 			checkSpaceInvariants(await ctx.dump(space.id));
 			checkChangeFlags(await ctx.dump(space.id));
 		},
