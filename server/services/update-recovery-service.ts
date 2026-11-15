@@ -1005,7 +1005,7 @@ async function persistRecoveredBackgroundAgentStartResult(
 	await narratorService.updateToolCallResult(
 		toolCall.toolUseId,
 		{
-			output: buildBackgroundAgentStartOutput(taskIdOrAlias),
+			output: buildBackgroundAgentStartOutput(taskIdOrAlias, subagentId),
 			status: "success",
 			completedAt: Date.now(),
 		},

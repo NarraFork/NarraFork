@@ -723,7 +723,7 @@ Verbatim text: see Source 2 (byte-identical original, including attribution).
 
 === Source 43 ===
 Module: golang.org/x/net
-Version: v0.54.0
+Version: v0.55.0
 Upstream: https://github.com/golang/net
 Source file: LICENSE
 License / notice: BSD-3-Clause
@@ -732,7 +732,7 @@ Verbatim text: see Source 1 (byte-identical original, including attribution).
 
 === Source 44 ===
 Module: golang.org/x/net
-Version: v0.54.0
+Version: v0.55.0
 Upstream: https://github.com/golang/net
 Source file: PATENTS
 License / notice: BSD-3-Clause

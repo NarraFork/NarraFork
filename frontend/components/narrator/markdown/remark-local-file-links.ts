@@ -1,3 +1,8 @@
+import {
+	agentReferenceMarker,
+	isAgentReference,
+	parseAgentReference,
+} from "@shared/agent-reference";
 import { localFileHref, parseLocalFilePath } from "@shared/markdown-file-path";
 import type { Parent, Root } from "mdast";
 
@@ -7,6 +12,11 @@ export function remarkLocalFileLinks() {
 		const walk = (parent: Parent) => {
 			for (const node of parent.children) {
 				if (node.type === "link" || node.type === "definition") {
+					if (isAgentReference(node.url)) {
+						const id = parseAgentReference(node.url);
+						node.url = agentReferenceMarker(id ?? "");
+						continue;
+					}
 					// Explicit special destinations become inert markers before the normal
 					// URL sanitizer. The label and all non-link text remain untouched.
 					if (/^(?:file:|nf-file:|[a-z]:[\\/])/i.test(node.url)) {

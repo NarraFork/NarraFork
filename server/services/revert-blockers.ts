@@ -1,4 +1,4 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
 import {
@@ -35,6 +35,8 @@ export function collectRevertBlockers(narratorId: string, code?: string): Revert
 		.where(
 			and(
 				eq(narratorToolCalls.narratorId, narratorId),
+				// COW snapshots retain the source status, but own no running execution.
+				isNull(narratorToolCalls.executionOriginToolCallId),
 				sql`${narratorToolCalls.status} IN ('initializing','pending','running')`,
 			),
 		)

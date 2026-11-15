@@ -104,7 +104,8 @@ async function profileFixture(
 		specifiers: () => [entry],
 		setup: setup ?? (async () => ({ targetId: "exact-target", detach: async () => {} })),
 		limits: {
-			startTimeoutMs: behavior === "no-ready" ? 80 : 1000,
+			// Startup includes async directory creation before the Worker exists, even when unready.
+			startTimeoutMs: 1000,
 			stopTimeoutMs: 30,
 			workerCleanupTimeoutMs: 30,
 			replyGraceMs: 20,

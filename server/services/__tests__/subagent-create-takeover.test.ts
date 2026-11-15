@@ -227,7 +227,9 @@ async function launch(
 	]).finally(() => clearTimeout(timer));
 	await until(() => observedAtStart !== undefined);
 	expect(execute).toHaveBeenCalledTimes(1);
-	expect(output).toContain("<background_task_id>");
+	expect(output).toContain("<background_task_id>creation-takeover-regression</background_task_id>");
+	expect(output).toContain(`[Creation takeover regression](nf-agent://open?id=${activeChildId})`);
+	expect(output).not.toContain("nf-agent://open?id=creation-takeover-regression");
 	return { output, observedAtStart, childId: activeChildId as string };
 }
 

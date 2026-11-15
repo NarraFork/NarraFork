@@ -153,9 +153,19 @@ export interface PluginDockPanelHostApi {
 export function PluginDockPanelView({
 	rawParams,
 	hostApi,
+	passthrough = false,
 }: {
 	rawParams: unknown;
 	hostApi: PluginDockPanelHostApi;
+	/**
+	 * Render the view as a transparent, click-through layer.
+	 *
+	 * Used by the `overlay` surface: that iframe covers the whole viewport, so if it
+	 * accepted pointer events the entire app beneath it would stop responding.
+	 * Interaction there is routed through a separate hit region the view announces
+	 * (`overlay.setBounds`), never through this element.
+	 */
+	passthrough?: boolean;
 }) {
 	const { t } = useTranslation("plugins");
 	const runtime = useOptionalPluginUiRuntime();
@@ -259,6 +269,14 @@ export function PluginDockPanelView({
 		}
 	}, [contribution, params, hostApi]);
 
+	// Overlay failures must disappear, not put ordinary panel chrome over the app.
+	if (
+		passthrough &&
+		(!params || !runtime || missing || !contribution || status !== "available" || !sessionContext)
+	) {
+		return null;
+	}
+
 	if (!params) {
 		return (
 			<Placeholder
@@ -321,7 +339,21 @@ export function PluginDockPanelView({
 		);
 	}
 	const withSlot = (content: React.ReactNode) => (
-		<Box h="100%" w="100%" style={{ overflow: "hidden", background: "var(--mantine-color-body)" }}>
+		<Box
+			h="100%"
+			w="100%"
+			style={{
+				overflow: "hidden",
+				// A dock panel paints the app surface behind its iframe. An overlay must not:
+				// this box is stretched to the whole viewport there, so the panel background
+				// would become a full-page wash, and its default `pointer-events: auto` would
+				// swallow every click even though the iframe itself is click-through.
+				// `pointer-events` inherits, so setting it once here covers the slot wrapper
+				// and the iframe too; the overlay's own hit region re-enables it explicitly.
+				background: passthrough ? "transparent" : "var(--mantine-color-body)",
+				...(passthrough ? { pointerEvents: "none" as const } : {}),
+			}}
+		>
 			<PluginPanelSlot panelInstanceId={params.panelInstanceId} active={hostApi.isActive}>
 				{content}
 			</PluginPanelSlot>
@@ -329,6 +361,8 @@ export function PluginDockPanelView({
 	);
 	// A crashed/disposed session must show the error placeholder, not the iframe.
 	const sessionBroken = snapshot && ["error", "crashed", "disposed"].includes(snapshot.status);
+	// Retain the slot while connecting/failed, but never paint a loading/error panel.
+	if (passthrough && (!controller || sessionBroken)) return withSlot(null);
 	if (controller && !sessionBroken) {
 		// Live session: render the iframe directly in the panel content. The
 		// handshake happens on iframe load (controller.attach), same as before.
@@ -337,6 +371,8 @@ export function PluginDockPanelView({
 				srcDoc={controller.getSrcdoc()}
 				sandbox="allow-scripts"
 				allow=""
+				inert={passthrough || undefined}
+				tabIndex={passthrough ? -1 : undefined}
 				referrerPolicy="no-referrer"
 				title={contribution.title || params.contributionId}
 				onLoad={(event) => controller.attach(event.currentTarget)}
@@ -347,7 +383,10 @@ export function PluginDockPanelView({
 					height: "100%",
 					border: 0,
 					display: "block",
-					pointerEvents: "auto",
+					pointerEvents: passthrough ? "none" : "auto",
+					// An opaque iframe background would paint a white rectangle over the
+					// whole app, so the overlay layer is transparent by definition.
+					...(passthrough ? { background: "transparent" } : {}),
 				}}
 			/>,
 		);

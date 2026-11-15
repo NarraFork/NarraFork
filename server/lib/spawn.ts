@@ -330,10 +330,9 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			...(opts.stdoutStream ? { terminationReason } : {}),
 		};
 	} catch (error) {
-		if (opts.stdoutStream) {
-			kill("consumer");
-			await proc.exited;
-		}
+		// Pipe failures must not release callers' resource locks while the child still runs.
+		kill("consumer");
+		await proc.exited;
 		throw error;
 	} finally {
 		if (hardTimer != null) clearTimeout(hardTimer);

@@ -350,7 +350,7 @@
 	},
 	{
 		"name": "golang.org/x/net (remote-peer)",
-		"version": "0.54.0",
+		"version": "0.55.0",
 		"license": "BSD-3-Clause",
 		"author": "The Go Authors",
 		"repository": "https://github.com/golang/net",

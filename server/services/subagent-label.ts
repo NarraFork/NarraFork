@@ -25,6 +25,7 @@
  *   5. first 8 chars of the id                 — last resort, still shorter
  */
 
+import { agentReferenceHref } from "@shared/agent-reference";
 import { eq } from "drizzle-orm";
 import {
 	getPersistedSubagentAliases,
@@ -145,6 +146,14 @@ async function loadLabelSources(subagentId: string): Promise<{
 	return { narrator: narrator ?? null, taskAlias: task?.alias ?? null };
 }
 
+/** A copyable session reference: the selector label must never stand in for the real id. */
+export function agentMarkdownReference(narratorId: string, label: string): string {
+	const escapedLabel = (label.trim() || shortAgentId(narratorId))
+		.replace(/\s+/g, " ")
+		.replace(/[\\`*_{}[\]()<>#+\-.!|~]/g, "\\$&");
+	return `[${escapedLabel}](${agentReferenceHref(narratorId)})`;
+}
+
 /**
  * The `<subagent_id>` addressing prefix a subagent result carries.
  *
@@ -154,8 +163,11 @@ async function loadLabelSources(subagentId: string): Promise<{
  * cards read `metadata.subagentId`; the tag is only their last-resort fallback,
  * and it stays a valid selector either way.
  */
-export function agentResultTag(label: string): string {
-	return `<subagent_id>${label}</subagent_id>\n\n`;
+export function agentResultTag(label: string, narratorId: string, title?: string | null): string {
+	return (
+		`<subagent_id>${label}</subagent_id>\n\n` +
+		`${agentMarkdownReference(narratorId, title || label)}\n\n`
+	);
 }
 
 /**
