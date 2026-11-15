@@ -33,8 +33,6 @@ import "@frontend/styles/mantine-slider-marks.css";
  * updates and has no importer above it, editing any of them would reload the page. See
  * `lib/plugin-theme-pref-store.ts` for the full explanation.
  */
-import { applyInitialBackground } from "@frontend/lib/app-background";
-import { applyInitialPalette } from "@frontend/lib/palette-apply";
 import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
 import { readActivePluginThemeKey } from "@frontend/lib/plugin-theme-pref-store";
 import "@frontend/styles/oled.css";
@@ -103,12 +101,23 @@ async function bootstrap() {
 	const isPublicShare = isPublicNarratorSharePath(window.location.pathname, getRouterBasepath());
 	if (!isPublicShare) applyInitialPluginTheme();
 	/*
-	 * Same reason as the plugin theme above: write the stored palette before the first paint.
-	 * React re-applies it on mount, but by then a full reload would already have flashed the
-	 * default colours.
+	 * Same reason as the plugin theme above: write the stored palette and wallpaper before
+	 * the first paint. React re-applies them on mount, but by then a full reload would
+	 * already have flashed the default colours.
+	 *
+	 * Loaded with a dynamic import, not a static one. These modules must run before
+	 * `createRoot`, but they are not part of the entry's HMR graph: `main.tsx` cannot
+	 * accept an update, so a static import would reload the whole page on every edit of
+	 * the palette, the wallpaper, or anything they reach.
 	 */
-	if (!isPublicShare) applyInitialPalette();
-	if (!isPublicShare) applyInitialBackground();
+	if (!isPublicShare) {
+		const [{ applyInitialPalette }, { applyInitialBackground }] = await Promise.all([
+			import("@frontend/lib/palette-apply"),
+			import("@frontend/lib/app-background"),
+		]);
+		applyInitialPalette();
+		applyInitialBackground();
+	}
 	/*
 	 * Session handoff with an editor host that embeds this app (the VS Code extension).
 	 *
