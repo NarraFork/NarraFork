@@ -10,7 +10,7 @@ import { keyBetween } from "@shared/outline";
 import { LIVE_FRAME } from "@shared/outline-live-protocol";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../../../db";
-import { aclGrants, outlineLiveUpdates, projects, users } from "../../../../db/schema";
+import { aclGrants, outlineLiveLog, projects, users } from "../../../../db/schema";
 import { eventBus } from "../../../../lib/event-bus";
 import { generateId } from "../../../../lib/id";
 import { settings } from "../../../../lib/settings";
@@ -406,8 +406,11 @@ describe("persistence", () => {
 		const epoch = session?.epoch as number;
 		await waitFor(
 			() =>
-				db.select().from(outlineLiveUpdates).where(eq(outlineLiveUpdates.pageBlockId, pageId)).all()
-					.length > 0,
+				db
+					.select()
+					.from(outlineLiveLog)
+					.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)))
+					.all().length > 0,
 			2000,
 			"log rows",
 		);
@@ -425,13 +428,13 @@ describe("persistence", () => {
 			responsibleUserId: owner,
 		});
 		// Replay commits what was typed onto what the database has now, and drops the rows.
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(block)).toBe("agent: crash test");
 		expect(await content(ids[1] as string)).toBe("other, by agent");
 		const left = db
 			.select()
-			.from(outlineLiveUpdates)
-			.where(and(eq(outlineLiveUpdates.pageBlockId, pageId), eq(outlineLiveUpdates.epoch, epoch)))
+			.from(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)))
 			.all();
 		expect(left).toHaveLength(0);
 	});
@@ -446,14 +449,18 @@ describe("persistence", () => {
 		await waitFor(() => a.ready, 3000, "joined");
 		type(a, block, "!");
 		await settle();
+		// The log is the space's now: this session's rows are those of its epoch, and its record
+		// under epoch 0.
+		const epoch = liveSessionOf(pageId)?.epoch as number;
 		la.disconnect();
 		await waitFor(() => liveSessionOf(pageId) === undefined, 3000, "closed");
 		expect(await content(block)).toBe("idle!");
 		const left = db
 			.select()
-			.from(outlineLiveUpdates)
-			.where(eq(outlineLiveUpdates.pageBlockId, pageId))
-			.all();
+			.from(outlineLiveLog)
+			.where(eq(outlineLiveLog.spaceId, space.id))
+			.all()
+			.filter((r) => r.epoch === epoch || (r.epoch === 0 && r.seq === epoch));
 		// Only the record of how far each client got (epoch 0), for a client coming back later.
 		expect(left.map((r) => r.epoch)).toEqual([0]);
 	});

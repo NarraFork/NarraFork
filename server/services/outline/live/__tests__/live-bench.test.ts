@@ -30,7 +30,7 @@ import { ensureProjectSpace } from "../../spaces";
 import type { OutlineSpaceRow } from "../../store/port";
 import { writeOutline } from "../../write";
 import { closeAllLiveSessions, liveSessionOf, outlineLiveQuiet } from "../registry";
-import { LivePage, OUTLINE_LIVE_TIMING } from "../session";
+import { LiveSpace, OUTLINE_LIVE_TIMING } from "../session";
 
 const BENCH = process.env.NF_OUTLINE_LIVE_BENCH === "1";
 const NOW = "2026-10-27T00:00:00.000Z";
@@ -43,7 +43,7 @@ const people: Array<{ id: string; name: string }> = [];
 const timing = { updates: 0, updateMs: 0, flushes: 0, flushMs: 0, openMs: 0, joinMs: 0, joins: 0 };
 
 function instrument(): void {
-	const proto = LivePage.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+	const proto = LiveSpace.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
 	const wrap = (name: string, count: keyof typeof timing, ms: keyof typeof timing) => {
 		const orig = proto[name] as (...args: unknown[]) => unknown;
 		proto[name] = function (this: unknown, ...args: unknown[]) {
@@ -58,16 +58,22 @@ function instrument(): void {
 	};
 	wrap("handleUpdate", "updates", "updateMs");
 	wrap("flushBroadcast", "flushes", "flushMs");
-	wrap("join", "joins", "joinMs");
-	const open = LivePage.open.bind(LivePage);
-	(LivePage as unknown as { open: typeof LivePage.open }).open = async (...args) => {
-		const t0 = performance.now();
-		try {
-			return await open(...args);
-		} finally {
-			timing.openMs += performance.now() - t0;
-		}
+	// Joining is asynchronous since a space's session loads a page's tree on its first join
+	// (`ensureScope`, what opening a page's session was): timed to their promises' end.
+	const wrapAsync = (name: string, ms: keyof typeof timing, count?: keyof typeof timing) => {
+		const orig = proto[name] as (...args: unknown[]) => Promise<unknown>;
+		proto[name] = async function (this: unknown, ...args: unknown[]) {
+			const t0 = performance.now();
+			try {
+				return await orig.apply(this, args);
+			} finally {
+				timing[ms] += performance.now() - t0;
+				if (count) timing[count]++;
+			}
+		};
 	};
+	wrapAsync("join", "joinMs", "joins");
+	wrapAsync("loadTree", "openMs");
 }
 
 // ─── Server, proxy, clients ─────────────────────────────────────────────────

@@ -22,7 +22,7 @@ import { seededTextDoc } from "@shared/outline-live-text";
 import { and, eq } from "drizzle-orm";
 import * as Y from "yjs";
 import { db } from "../../../../db";
-import { aclGrants, outlineLiveUpdates, projects, users } from "../../../../db/schema";
+import { aclGrants, outlineLiveLog, projects, users } from "../../../../db/schema";
 import { eventBus } from "../../../../lib/event-bus";
 import { generateId } from "../../../../lib/id";
 import { settings } from "../../../../lib/settings";
@@ -133,8 +133,8 @@ async function content(id: string): Promise<string> {
 async function logRows(pageId: string): Promise<number> {
 	return db
 		.select()
-		.from(outlineLiveUpdates)
-		.where(eq(outlineLiveUpdates.pageBlockId, pageId))
+		.from(outlineLiveLog)
+		.where(eq(outlineLiveLog.spaceId, space.id))
 		.all()
 		.filter((r) => r.epoch !== 0).length;
 }
@@ -206,7 +206,7 @@ describe("crashes", () => {
 		});
 		expect(await content(block)).toBe("x hello");
 		abandonLiveSessionForTests(pageId);
-		await replayLiveEpoch(pageId, epoch);
+		await replayLiveEpoch(space.id, epoch);
 		expect(await content(block)).toBe("x hello");
 		expect(await logRows(pageId)).toBe(0);
 	});
@@ -224,7 +224,7 @@ describe("crashes", () => {
 		expect(a.pending.length).toBeGreaterThan(0);
 		const epoch = liveSessionOf(pageId)?.epoch as number;
 		abandonLiveSessionForTests(pageId);
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("empty");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("empty");
 		OUTLINE_LIVE_TIMING.persistMs = 20;
 		la.disconnect();
 		la.reconnect();
@@ -285,7 +285,7 @@ describe("crashes", () => {
 		const epoch = liveSessionOf(pageId)?.epoch as number;
 		abandonLiveSessionForTests(pageId);
 		OUTLINE_LIVE_HOOKS.write = savedHooks.write;
-		await replayLiveEpoch(pageId, epoch);
+		await replayLiveEpoch(space.id, epoch);
 		expect(await content(block)).toBe("first second");
 		expect((await outlineStore.getBlock(newId))?.deleted ?? true).toBe(true);
 	});
@@ -626,7 +626,7 @@ describe("failures while committing", () => {
 		OUTLINE_LIVE_HOOKS.normalize = async () => {
 			throw new OutlineEditTextError("OUTLINE_TEXT_FAILED", "broken", 500);
 		};
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("kept");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("kept");
 		// The next join opens the page anyway, with the text.
 		const b = open(link(owner), pageId);
 		await waitFor(() => b.ready, 3000, "joined after");
@@ -916,7 +916,7 @@ describe("what the page already has of a client's transactions", () => {
 		// The log stops taking writes: Alice's move is committed, not acknowledged.
 		setOutlineStore({
 			...outlineStore,
-			appendLiveUpdates: async () => {
+			appendLiveLog: async () => {
 				throw new Error("disk I/O error");
 			},
 		});
@@ -963,20 +963,23 @@ describe("what the page already has of a client's transactions", () => {
 			await waitFor(() => liveSessionOf(pageId)?.textOf(x) === "X1abcd", 3000, "applied");
 			expect(a.pending.length).toBe(2);
 			// The worst order: connections first, then the sessions close (log, commit).
+			const sessionEpoch = liveSessionOf(pageId)?.epoch as number;
 			la.disconnect();
 			await closeAllLiveSessions("ended");
 			expect(await content(x)).toBe("X1abcd");
 			// The log keeps how far each client got, for a client that comes back later.
 			const ended = db
 				.select()
-				.from(outlineLiveUpdates)
+				.from(outlineLiveLog)
 				.where(
 					and(
-						eq(outlineLiveUpdates.pageBlockId, pageId),
-						eq(outlineLiveUpdates.epoch, ENDED_EPOCH),
+						eq(outlineLiveLog.spaceId, space.id),
+						eq(outlineLiveLog.epoch, ENDED_EPOCH),
 					),
 				)
-				.all();
+				.all()
+				// The space keeps one record per ended session: this session's.
+				.filter((r) => r.seq === sessionEpoch);
 			expect(ended.length).toBe(1);
 			expect(await logRows(pageId)).toBe(0);
 			if (restart) forgetEndedSessionsForTests();
@@ -1101,9 +1104,10 @@ describe("logs written around a commit", () => {
 		const epoch = 424_242;
 		const at = new Date().toISOString();
 		const b64 = (data: Uint8Array) => Buffer.from(data).toString("base64");
-		await outlineStore.appendLiveUpdates([
+		await outlineStore.appendLiveLog([
 			{
-				pageBlockId: pageId,
+				spaceId: space.id,
+				blockId: null,
 				epoch,
 				seq: 0,
 				updateB64: b64(
@@ -1116,7 +1120,8 @@ describe("logs written around a commit", () => {
 				createdAt: at,
 			},
 			{
-				pageBlockId: pageId,
+				spaceId: space.id,
+				blockId: null,
 				epoch,
 				seq: 1,
 				updateB64: b64(
@@ -1130,7 +1135,7 @@ describe("logs written around a commit", () => {
 			},
 		]);
 		doc.destroy();
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("empty");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("empty");
 		expect(await content(block)).toBe("x hello!");
 	});
 });
@@ -1148,7 +1153,7 @@ describe("structure delivered in order", () => {
 		const base = outlineStore;
 		setOutlineStore({
 			...base,
-			appendLiveUpdates: async () => {
+			appendLiveLog: async () => {
 				throw new Error("disk I/O error");
 			},
 		});
@@ -1238,7 +1243,7 @@ describe("text that cannot be committed", () => {
 		expect(await logRows(pageId)).toBeGreaterThan(0);
 		// Whatever was wrong is fixed: the log's text goes in.
 		OUTLINE_LIVE_HOOKS.write = savedHooks.write;
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(never)).toBe("never typed");
 		expect(await content(other)).toBe("agent text");
 	});

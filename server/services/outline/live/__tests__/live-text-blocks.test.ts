@@ -52,7 +52,7 @@ import { seededTextDoc } from "@shared/outline-live-text";
 import { and, eq } from "drizzle-orm";
 import * as Y from "yjs";
 import { db } from "../../../../db";
-import { aclGrants, outlineLiveUpdates, projects, users } from "../../../../db/schema";
+import { aclGrants, outlineLiveLog, projects, users } from "../../../../db/schema";
 import { generateId } from "../../../../lib/id";
 import { settings } from "../../../../lib/settings";
 import { ensureProjectSpace } from "../../spaces";
@@ -890,8 +890,8 @@ describe("the log and its replay", () => {
 	const rowsOf = (pageId: string, epoch: number) =>
 		db
 			.select()
-			.from(outlineLiveUpdates)
-			.where(and(eq(outlineLiveUpdates.pageBlockId, pageId), eq(outlineLiveUpdates.epoch, epoch)))
+			.from(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)))
 			.all()
 			.sort((p, q) => p.seq - q.seq);
 
@@ -942,7 +942,7 @@ describe("the log and its replay", () => {
 			actor: { kind: "agent", id: "n" },
 			responsibleUserId: owner,
 		});
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(one)).toBe("crash one typed!");
 		expect(await content(two)).toBe("agent: crash two also");
 		expect(await content(untouched)).toBe("untouched");
@@ -994,7 +994,7 @@ describe("the log and its replay", () => {
 			actor: { kind: "agent", id: "n" },
 			responsibleUserId: owner,
 		});
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		// Both the outside text and the typed text are there.
 		const merged = await content(empty);
 		expect(merged).toContain("agent wrote here");
@@ -1049,7 +1049,7 @@ describe("the log and its replay", () => {
 		const epoch = session(pageId).epoch;
 		expect(await content(block)).toBe("split me here");
 		abandonLiveSessionForTests(pageId);
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(block)).toBe("split me! here?");
 		expect(await dbOutline(pageId)).toBe("- split me! here?\n- tail");
 	});
@@ -1062,9 +1062,10 @@ describe("the log and its replay", () => {
 		const text = new Y.Text("legacy and unsaved");
 		old.getMap<Y.Text>("texts").set(block, text);
 		const epoch = 77_001;
-		await outlineStore.appendLiveUpdates([
+		await outlineStore.appendLiveLog([
 			{
-				pageBlockId: pageId,
+				spaceId: space.id,
+				blockId: null,
 				epoch,
 				seq: 0,
 				updateB64: Buffer.from(Y.encodeStateAsUpdate(old)).toString("base64"),
@@ -1074,7 +1075,7 @@ describe("the log and its replay", () => {
 			},
 		]);
 		old.destroy();
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("kept");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("kept");
 		expect(await content(block)).toBe("legacy");
 		expect(rowsOf(pageId, epoch)).toHaveLength(1);
 		const a = open(link(owner), pageId);
@@ -1084,7 +1085,9 @@ describe("the log and its replay", () => {
 		await flushed(pageId);
 		expect(await content(block)).toBe("legacy lives");
 		expect(rowsOf(pageId, epoch)).toHaveLength(1);
-		await db.delete(outlineLiveUpdates).where(eq(outlineLiveUpdates.pageBlockId, pageId));
+		await db
+			.delete(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)));
 	});
 });
 
@@ -1314,8 +1317,8 @@ describe("a log read in any order", () => {
 	const left = (pageId: string, epoch: number) =>
 		db
 			.select()
-			.from(outlineLiveUpdates)
-			.where(and(eq(outlineLiveUpdates.pageBlockId, pageId), eq(outlineLiveUpdates.epoch, epoch)))
+			.from(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)))
 			.all().length;
 
 	test("an update row before its block's seed row: the text is committed, as its author's", async () => {
@@ -1333,7 +1336,8 @@ describe("a log read in any order", () => {
 			actorKind: "human" | "system",
 			actorId: string,
 		) => ({
-			pageBlockId: pageId,
+			spaceId: space.id,
+				blockId: null,
 			epoch,
 			seq,
 			updateB64: b64(data),
@@ -1341,7 +1345,7 @@ describe("a log read in any order", () => {
 			actorId,
 			createdAt: at,
 		});
-		await outlineStore.appendLiveUpdates([
+		await outlineStore.appendLiveLog([
 			row(0, encodeLogTexts([]), "system", "outline-live"),
 			row(
 				1,
@@ -1356,7 +1360,7 @@ describe("a log read in any order", () => {
 				"outline-live",
 			),
 		]);
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(block)).toBe("x hello");
 		expect(left(pageId, epoch)).toBe(0);
 		expect((await outlineStore.getBlock(block))?.authorId).toBe(owner);
@@ -1371,13 +1375,14 @@ describe("a log read in any order", () => {
 		const typed = Y.encodeStateAsUpdate(doc, vector);
 		const epoch = 515_152;
 		const at = new Date().toISOString();
-		await outlineStore.appendLiveUpdates(
+		await outlineStore.appendLiveLog(
 			[
 				encodeLogTexts([]),
 				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.update, data: typed }]),
 				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed("x") }]),
 			].map((data, seq) => ({
-				pageBlockId: pageId,
+				spaceId: space.id,
+				blockId: null,
 				epoch,
 				seq,
 				updateB64: b64(data),
@@ -1392,7 +1397,7 @@ describe("a log read in any order", () => {
 			actor: { kind: "agent", id: "n" },
 			responsibleUserId: owner,
 		});
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(block)).toBe("agent: x hello");
 	});
 
@@ -1408,7 +1413,7 @@ describe("a log read in any order", () => {
 		fine.text.insert(1, " fine");
 		const epoch = 515_153;
 		const at = new Date().toISOString();
-		await outlineStore.appendLiveUpdates(
+		await outlineStore.appendLiveLog(
 			[
 				encodeLogTexts([]),
 				// The seed of `block` is missing; `other` is whole.
@@ -1422,7 +1427,8 @@ describe("a log read in any order", () => {
 					},
 				]),
 			].map((data, seq) => ({
-				pageBlockId: pageId,
+				spaceId: space.id,
+				blockId: null,
 				epoch,
 				seq,
 				updateB64: b64(data),
@@ -1431,7 +1437,7 @@ describe("a log read in any order", () => {
 				createdAt: at,
 			})),
 		);
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("kept");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("kept");
 		expect(await content(block)).toBe("x");
 		expect(await content(other)).toBe("y");
 		expect(left(pageId, epoch)).toBe(3);
@@ -1443,7 +1449,9 @@ describe("a log read in any order", () => {
 		await flushed(pageId);
 		expect(await content(block)).toBe("x!");
 		expect(left(pageId, epoch)).toBe(3);
-		await db.delete(outlineLiveUpdates).where(eq(outlineLiveUpdates.pageBlockId, pageId));
+		await db
+			.delete(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)));
 	});
 });
 

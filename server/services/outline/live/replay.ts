@@ -30,9 +30,8 @@ import { merge3 } from "@shared/outline";
 import { decodeLiveSeed, LIVE_TEXT_KIND } from "@shared/outline-live-protocol";
 import { hasPendingStructs, type LiveTextDoc, seededTextDoc } from "@shared/outline-live-text";
 import * as Y from "yjs";
-import { OUTLINE_LIMITS } from "../model";
 import { outlineStore } from "../store";
-import type { OutlineLiveUpdateRow } from "../store/port";
+import type { OutlineLiveLogRow } from "../store/port";
 import type { OutlineCanonicalContent, OutlineOp } from "../write";
 import { asOwnLiveWrite } from "./lane";
 import {
@@ -81,12 +80,12 @@ export interface ReplayResult {
 /** Sync rows are JSON as written: malformed UTF-8 makes the log unreadable (kept). */
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
-async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpdateRow[] | null> {
-	const rows: OutlineLiveUpdateRow[] = [];
+async function readEpoch(spaceId: string, epoch: number): Promise<OutlineLiveLogRow[] | null> {
+	const rows: OutlineLiveLogRow[] = [];
 	let bytes = 0;
 	let afterSeq: number | undefined;
 	for (;;) {
-		const page = await outlineStore.listLiveUpdates(pageId, epoch, {
+		const page = await outlineStore.listLiveLog(spaceId, epoch, {
 			...(afterSeq !== undefined ? { afterSeq } : {}),
 			limit: OUTLINE_LIVE_REPLAY.pageRows,
 		});
@@ -97,7 +96,7 @@ async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpda
 		if (rows.length > OUTLINE_LIVE_REPLAY.maxRows || bytes > OUTLINE_LIVE_REPLAY.maxBytes)
 			return null;
 		if (page.length < OUTLINE_LIVE_REPLAY.pageRows) return rows;
-		afterSeq = (page[page.length - 1] as OutlineLiveUpdateRow).seq;
+		afterSeq = (page[page.length - 1] as OutlineLiveLogRow).seq;
 	}
 }
 
@@ -105,19 +104,19 @@ async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpda
  * Replay one epoch: commit what is not committed, then drop the rows. `kept` when the log could
  * not be replayed (too large, unreadable, the commit failed): the rows stay.
  */
-export async function replayLiveEpoch(pageId: string, epoch: number): Promise<ReplayOutcome> {
-	return (await replayLiveEpochDetailed(pageId, epoch)).outcome;
+export async function replayLiveEpoch(spaceId: string, epoch: number): Promise<ReplayOutcome> {
+	return (await replayLiveEpochDetailed(spaceId, epoch)).outcome;
 }
 
 /** {@link replayLiveEpoch}, with what a new session of the page needs from it. */
 export async function replayLiveEpochDetailed(
-	pageId: string,
+	spaceId: string,
 	epoch: number,
 ): Promise<ReplayResult> {
 	const keys = new Map<string, number>();
-	const rows = await readEpoch(pageId, epoch);
+	const rows = await readEpoch(spaceId, epoch);
 	if (!rows) {
-		logger.warn("Outline live log too large to replay; kept", { pageId, epoch });
+		logger.warn("Outline live log too large to replay; kept", { spaceId, epoch });
 		return { outcome: "kept", keys };
 	}
 	if (rows.length === 0) return { outcome: "empty", keys };
@@ -133,7 +132,7 @@ export async function replayLiveEpochDetailed(
 			t = seededTextDoc(seed);
 			docs.set(id, t);
 			t.text.observe((_event, txn) => {
-				const actor = txn.origin as OutlineLiveUpdateRow | null;
+				const actor = txn.origin as OutlineLiveLogRow | null;
 				if (actor?.actorKind === "human") lastActor.set(id, actor.actorId);
 			});
 		}
@@ -145,7 +144,7 @@ export async function replayLiveEpochDetailed(
 	/** Blocks whose base is only assumed empty: no seed row for their document was read yet. */
 	const assumed = new Set<string>();
 	/** Updates waiting in a document for items it lacks: the row of the person who made them. */
-	const waiting = new Map<string, OutlineLiveUpdateRow>();
+	const waiting = new Map<string, OutlineLiveLogRow>();
 	let first = true;
 	try {
 		for (const row of rows) {
@@ -174,7 +173,18 @@ export async function replayLiveEpochDetailed(
 			const entries = decodeLogTexts(data);
 			if (!entries) throw new Error("not a per-block text row");
 			for (const e of entries) {
-				if (e.kind === LIVE_TEXT_KIND.seed) {
+				if (e.kind === LIVE_TEXT_KIND.drop) {
+					// The session dropped the block's document (its text was committed, or the
+					// block left the session): nothing of it is uncommitted, and a document the
+					// block gets later starts from its own seed.
+					docs.get(e.id)?.doc.destroy();
+					docs.delete(e.id);
+					base.delete(e.id);
+					assumed.delete(e.id);
+					intents.delete(e.id);
+					waiting.delete(e.id);
+					lastActor.delete(e.id);
+				} else if (e.kind === LIVE_TEXT_KIND.seed) {
 					// What the database held when the document was made.
 					const seed = decodeLiveSeed(e.data);
 					if (seed === null) throw new Error("a seed text is not UTF-8");
@@ -210,7 +220,7 @@ export async function replayLiveEpochDetailed(
 			}
 		}
 	} catch (error) {
-		logger.warn("Outline live log unreadable; kept", { pageId, epoch, error: String(error) });
+		logger.warn("Outline live log unreadable; kept", { spaceId, epoch, error: String(error) });
 		destroy();
 		return { outcome: "kept", keys };
 	}
@@ -219,7 +229,7 @@ export async function replayLiveEpochDetailed(
 	const stuck = [...docs].filter(([, t]) => hasPendingStructs(t.doc)).map(([id]) => id);
 	if (stuck.length > 0) {
 		logger.warn("Outline live log incomplete (updates without the items they name); kept", {
-			pageId,
+			spaceId,
 			epoch,
 			blocks: stuck.slice(0, 20),
 		});
@@ -227,17 +237,16 @@ export async function replayLiveEpochDetailed(
 		return { outcome: "kept", keys };
 	}
 
-	const page = await outlineStore.getBlock(pageId);
-	if (!page || page.deleted) {
-		destroy();
-		await outlineStore.deleteLiveUpdates(pageId, epoch);
-		return { outcome: "empty", keys };
-	}
-	const { blocks } = await outlineStore.listPageBlocks(pageId, OUTLINE_LIMITS.maxPageBlocks);
+	// What the blocks table holds now for every block the log has a document of: read by
+	// primary key, a few at a time (a log holds at most a few thousand documents).
+	const blocks: Array<{ id: string; content: string; parentId: string | null }> = [];
 	const changes: Array<{ id: string; text: string; actor: string | null }> = [];
-	for (const b of blocks) {
-		const t = docs.get(b.id);
-		if (!t) continue;
+	let read = 0;
+	for (const [id, t] of docs) {
+		if (++read % 50 === 0) await new Promise((resolve) => setImmediate(resolve));
+		const b = await outlineStore.getBlock(id);
+		if (!b || b.deleted || b.spaceId !== spaceId) continue;
+		blocks.push(b);
 		const final = t.text.toString();
 		// The session committed this just before it ended, and logged nothing after.
 		const intent = intents.get(b.id);
@@ -250,10 +259,10 @@ export async function replayLiveEpochDetailed(
 	}
 	destroy();
 	if (changes.length > 0) {
-		const committed = await commitChanges(page.spaceId, changes, blocks);
+		const committed = await commitChanges(spaceId, changes, blocks);
 		if (!committed) return { outcome: "kept", keys, changes };
 	}
-	await outlineStore.deleteLiveUpdates(pageId, epoch);
+	await outlineStore.deleteLiveLog(spaceId, epoch);
 	return { outcome: changes.length > 0 ? "committed" : "empty", keys };
 }
 
@@ -327,26 +336,26 @@ async function commitChanges(
  * epochs of sessions open in this process (`isLive`). Resolves when the log was walked once.
  */
 export async function replayAllLiveEpochs(
-	isLive: (pageId: string, epoch: number) => boolean,
-	replay: (pageId: string, epoch: number) => Promise<ReplayOutcome>,
+	isLive: (spaceId: string, epoch: number) => boolean,
+	replay: (spaceId: string, epoch: number) => Promise<ReplayOutcome>,
 ): Promise<{ committed: number; kept: number }> {
-	let after: { pageBlockId: string; epoch: number } | undefined;
+	let after: { spaceId: string; epoch: number } | undefined;
 	let committed = 0;
 	let kept = 0;
 	for (;;) {
-		const epochs = await outlineStore.listLiveEpochs({
+		const epochs = await outlineStore.listLiveLogEpochs({
 			...(after ? { after } : {}),
 			limit: OUTLINE_LIVE_REPLAY.epochsPerPage,
 		});
 		for (const e of epochs) {
-			if (isLive(e.pageBlockId, e.epoch)) continue;
+			if (isLive(e.spaceId, e.epoch)) continue;
 			try {
-				const outcome = await replay(e.pageBlockId, e.epoch);
+				const outcome = await replay(e.spaceId, e.epoch);
 				if (outcome === "committed") committed++;
 				if (outcome === "kept") kept++;
 			} catch (error) {
 				kept++;
-				logger.warn("Outline live replay failed", { pageId: e.pageBlockId, error: String(error) });
+				logger.warn("Outline live replay failed", { spaceId: e.spaceId, error: String(error) });
 			}
 			await new Promise((resolve) => setTimeout(resolve, OUTLINE_LIVE_REPLAY.pauseMs));
 		}
