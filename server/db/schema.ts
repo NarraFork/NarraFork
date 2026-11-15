@@ -6294,6 +6294,9 @@ export const outlineQuestions = sqliteTable(
  * Pending CRDT updates of a page's live editing session, flushed at least once a second so a
  * crash loses nothing; folded into a commit when the session ends. `update_b64` is the Yjs update
  * as base64 text (there is no binary column type). `epoch` numbers the sessions of a page.
+ *
+ * No longer read or written since a space has one live session (`outline_live_log` below takes
+ * its place); the table goes with the rest of the page-keyed storage (pageless plan, X2).
  */
 export const outlineLiveUpdates = sqliteTable(
 	"outline_live_updates",

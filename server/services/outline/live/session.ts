@@ -160,7 +160,7 @@ export const OUTLINE_LIVE_TIMING: Record<
 	broadcastMs: 50,
 	/** Cursors are coalesced (last one wins) and broadcast this often. */
 	presenceMs: 100,
-	/** Yjs updates reach `outline_live_updates` at most this long after they arrive. */
+	/** Yjs updates reach `outline_live_log` at most this long after they arrive. */
 	persistMs: 500,
 	/** Changed text is committed after this much quiet… */
 	flushIdleMs: 2_000,
