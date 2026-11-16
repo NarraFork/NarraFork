@@ -1103,6 +1103,14 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 			expect((await ctx.store.listChildren(space.id, null, 100)).map((b) => b.id)).toEqual([
 				page.blockId,
 			]);
+			// Whole rows of several parents' children, the top level among them, bounded.
+			const kids = await ctx.store.listChildBlocks(space.id, [page.blockId, a.blockId, null], 100);
+			expect(kids.map((b) => b.content).sort()).toEqual(
+				["# Plan", "between", "first", "nested", "second", "zeroth"].sort(),
+			);
+			expect(kids.find((b) => b.id === nested.blockId)?.parentId).toBe(a.blockId);
+			expect(await ctx.store.listChildBlocks(space.id, [page.blockId], 2)).toHaveLength(2);
+			expect(await ctx.store.listChildBlocks(space.id, [], 10)).toEqual([]);
 			const nestedRow = await ctx.store.getBlock(nested.blockId);
 			expect(nestedRow).toMatchObject({
 				parentId: a.blockId,

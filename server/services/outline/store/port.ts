@@ -738,6 +738,16 @@ export interface OutlineStore
 	getBlockBySid(spaceId: string, sid: string): Promise<OutlineBlockRow | null>;
 	/** Live children of a parent (`null`: the space's pages) in sibling order. */
 	listChildren(spaceId: string, parentId: string | null, limit: number): Promise<OutlineBlockRow[]>;
+	/**
+	 * Live children of the given parents (`null`: the top level), whole rows, in no particular
+	 * order, at most `limit`; one statement per 500 parents on the children index. What a live
+	 * session loading a watched subtree reads, a level at a time (`live/session.ts`).
+	 */
+	listChildBlocks(
+		spaceId: string,
+		parentIds: readonly (string | null)[],
+		limit: number,
+	): Promise<OutlineBlockRow[]>;
 	/** Live blocks of a page, unordered; `truncated` when the page holds more than `limit`. */
 	listPageBlocks(
 		pageId: string,

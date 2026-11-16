@@ -781,6 +781,26 @@ export const sqliteOutlineStore: OutlineStore = {
 		return out;
 	},
 
+	async listChildBlocks(spaceId, parentIds, limit) {
+		const out: OutlineBlockRow[] = [];
+		const ids = parentIds.filter((id): id is string => id !== null);
+		const groups: Array<SQL | undefined> = chunked(ids).map((chunk) =>
+			inArray(outlineBlocks.parentId, chunk),
+		);
+		if (parentIds.includes(null)) groups.push(isNull(outlineBlocks.parentId));
+		for (const parents of groups) {
+			if (out.length >= limit) break;
+			const rows = db
+				.select()
+				.from(outlineBlocks)
+				.where(and(eq(outlineBlocks.spaceId, spaceId), parents, eq(outlineBlocks.deleted, false)))
+				.limit(limit - out.length)
+				.all();
+			for (const row of rows) out.push(toBlock(row));
+		}
+		return out;
+	},
+
 	async listLastChildMetas(spaceId, parentId, limit) {
 		// SQLite compares text bytewise (BINARY), which is the order-key order.
 		return db

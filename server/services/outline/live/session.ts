@@ -1423,20 +1423,9 @@ export class LiveSpace {
 		}
 	}
 
-	/** Rows of the blocks table by id, live ones only, 500 a read, yielding in between. */
-	private async readRows(ids: readonly string[]): Promise<OutlineBlockRow[]> {
-		const out: OutlineBlockRow[] = [];
-		for (let at = 0; at < ids.length; at += 500) {
-			if (at > 0) await yieldToLoop();
-			for (const row of await outlineStore.getBlocks(ids.slice(at, at + 500)))
-				if (!row.deleted && row.spaceId === this.spaceId) out.push(row);
-		}
-		return out;
-	}
-
 	/**
 	 * What a watch needs from the blocks table: a subtree's root and every live block under it
-	 * (read level by level, at most {@link OUTLINE_LIVE_LIMITS.maxWatchBlocks}), or a level's
+	 * (read a level at a time, at most {@link OUTLINE_LIVE_LIMITS.maxWatchBlocks}), or a level's
 	 * parent (its anchor) and live children. Nothing is read of what the mirror holds whole
 	 * already (inside a loaded subtree). `access_denied`: the block is not a live block of this
 	 * space; `too_large`: over the bound.
@@ -1452,14 +1441,19 @@ export class LiveSpace {
 				return { rows: [], anchor: null };
 			const root = await outlineStore.getBlock(watch.s);
 			if (!usable(root)) return { refused: "access_denied" };
-			const sub = await outlineStore.listSubtreeAt(this.spaceId, watch.s, {
-				asOf: null,
-				limit: max - 1,
-			});
-			if (sub.truncated) return { refused: "too_large" };
-			const rows = await this.readRows(sub.rows.map((r) => r.id));
-			// Written meanwhile is not possible (the lane), so every row is there.
-			return { rows: [root, ...rows], anchor: null };
+			// A level at a time, whole rows (nothing is written meanwhile: the lane), stopping one
+			// past the bound.
+			const rows: OutlineBlockRow[] = [root];
+			let frontier = [root.id];
+			while (frontier.length > 0) {
+				const room = max - rows.length;
+				const level = await outlineStore.listChildBlocks(this.spaceId, frontier, room + 1);
+				if (level.length > room) return { refused: "too_large" };
+				for (const b of level) rows.push(b);
+				frontier = level.map((b) => b.id);
+				if (frontier.length > 0) await yieldToLoop();
+			}
+			return { rows, anchor: null };
 		}
 		const parentId = watch.l;
 		let anchor: OutlineBlockRow | null = null;
