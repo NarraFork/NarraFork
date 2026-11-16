@@ -6,7 +6,6 @@ import {
 	Code,
 	Group,
 	Loader,
-	Modal,
 	Paper,
 	SegmentedControl,
 	Stack,
@@ -26,18 +25,12 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { lazy, Suspense, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { RemoteDevice } from "../../lib/api/devices";
 import { CopyButton } from "../common/CopyButton";
-import { DIRECTORY_BROWSER_MODAL_STYLES } from "../common/directory-browser-modal";
-
-const RemoteDirectoryBrowser = lazy(() =>
-	import("../permissions/RemoteDirectoryBrowser").then((module) => ({
-		default: module.RemoteDirectoryBrowser,
-	})),
-);
+import { DeviceDirectoryModal } from "../common/DeviceDirectoryPicker";
 
 /** Same-length, same-order comparison; used to detect unsaved and drifted state. */
 function rulesEqual(left: readonly ExecutorPathRule[], right: readonly ExecutorPathRule[]) {
@@ -274,29 +267,24 @@ export function DevicePathRulesEditor({ device }: { device: RemoteDevice }) {
 				</Paper>
 			) : null}
 
-			<Modal
+			<DeviceDirectoryModal
 				opened={browserOpened}
 				onClose={browser.close}
 				title={t("devicePathRulesBrowse")}
-				size="lg"
-				styles={DIRECTORY_BROWSER_MODAL_STYLES}
-			>
-				{browserOpened && browsingIndex !== null ? (
-					<Suspense fallback={<Loader size="sm" />}>
-						<RemoteDirectoryBrowser
-							deviceLabel={device.name}
-							initialPath={rules[browsingIndex]?.path.trim() || undefined}
-							listDirectory={(path, opts) => api.browseDevicePath(device.id, path, opts)}
-							queryKey={["deviceBrowse", device.id]}
-							onSelect={(path) => {
-								update(browsingIndex, { path });
-								browser.close();
-							}}
-							onCancel={browser.close}
-						/>
-					</Suspense>
-				) : null}
-			</Modal>
+				deviceId={device.id}
+				deviceLabel={device.name}
+				initialPath={
+					browsingIndex === null ? undefined : rules[browsingIndex]?.path.trim() || undefined
+				}
+				listDirectory={(path, opts) => api.browseDevicePath(device.id, path, opts)}
+				queryKey={["deviceBrowse", device.id]}
+				onSelect={(path) => {
+					if (browsingIndex === null) return;
+					update(browsingIndex, { path });
+					browser.close();
+				}}
+				onCancel={browser.close}
+			/>
 		</Stack>
 	);
 }

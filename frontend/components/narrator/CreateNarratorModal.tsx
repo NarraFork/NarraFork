@@ -37,7 +37,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
@@ -58,9 +58,9 @@ import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { useWorkspaceDevices } from "../../hooks/useWorkspaceContext";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
-import { Z } from "../../lib/z-index";
+import { DeviceDirectoryModal } from "../common/DeviceDirectoryPicker";
 import { DirectoryPicker } from "../common/DirectoryPicker";
-import { DIRECTORY_BROWSER_MODAL_STYLES } from "../common/directory-browser-modal";
+import { deviceSelectData, LOCAL_DEVICE } from "../common/device-directory-options";
 import { resolveCwdPrefill } from "./composer/create-narrator-cwd-prefill";
 import {
 	resolveStartInPlanModePrefill,
@@ -69,16 +69,8 @@ import {
 import { followIdentityKind } from "./details/git-identity-follow-label";
 import { ProjectPromptModal } from "./ProjectPromptModal";
 
-const RemoteDirectoryBrowser = lazy(() =>
-	import("../permissions/RemoteDirectoryBrowser").then((module) => ({
-		default: module.RemoteDirectoryBrowser,
-	})),
-);
-
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
-
-const LOCAL_DEVICE = "local";
 
 /** 选择它表示不写绑定，跟随本人的默认身份（与会话详情面板的哨兵值一致）。 */
 const FOLLOW_DEFAULT_GIT_IDENTITY = "__follow_default__";
@@ -96,6 +88,11 @@ export interface CreateNarratorModalProps {
 	onCreated?: (narrator: CreateNarratorResult) => void;
 	/** Pre-fill the working directory (e.g. "new narrator in this directory" entry points). */
 	initialCwd?: string;
+	/**
+	 * Pre-fill the execution device, so an entry point that already chose one (the
+	 * dashboard composer) opens on the same target instead of silently falling back here.
+	 */
+	initialDeviceId?: string;
 	/** Explicit project membership; a directory alone never implies a project. */
 	contextProjectId?: string;
 	/**
@@ -191,6 +188,7 @@ export function CreateNarratorModalBody({
 	onClose,
 	onCreated,
 	initialCwd,
+	initialDeviceId,
 	contextProjectId,
 	gitIdentityFolderId,
 }: CreateNarratorModalProps) {
@@ -305,9 +303,14 @@ export function CreateNarratorModalBody({
 
 	// Callers may keep this modal mounted across opens (or swap the target directory
 	// while it is closed), so adopt `initialCwd` on every open rather than only at mount.
+	// The device is adopted alongside it: an entry point that already chose a target (the
+	// dashboard composer) must not reopen here on the local machine with a path taken from
+	// another one.
 	useEffect(() => {
-		if (opened && initialCwd) setCwd(initialCwd);
-	}, [opened, initialCwd]);
+		if (!opened) return;
+		if (initialDeviceId) setDeviceId(initialDeviceId);
+		if (initialCwd) setCwd(initialCwd);
+	}, [opened, initialCwd, initialDeviceId]);
 
 	// When the caller gives no entry-point directory, pre-fill the instance's default
 	// project directory: the field previously only SHOWED it as a placeholder while an
@@ -577,14 +580,10 @@ export function CreateNarratorModalBody({
 			<Select
 				label={t("executionDevice")}
 				description={t("executionDeviceHint")}
-				data={[
-					{ value: LOCAL_DEVICE, label: t("executionDeviceLocal") },
-					...remoteDevices.map((device) => ({
-						value: device.id,
-						label: device.online ? device.name : `${device.name} · ${t("executionDeviceOffline")}`,
-						disabled: !device.online,
-					})),
-				]}
+				data={deviceSelectData(remoteDevices, {
+					local: t("executionDeviceLocal"),
+					offline: t("executionDeviceOffline"),
+				})}
 				value={deviceId}
 				onChange={(value) => handleDeviceChange(value ?? LOCAL_DEVICE)}
 				allowDeselect={false}
@@ -900,37 +899,26 @@ export function CreateNarratorModalBody({
 				<ProjectPromptModal cwd={cwd} onClose={() => setPromptEditorOpen(false)} />
 			) : null}
 			{isRemoteDevice ? (
-				<Modal
+				<DeviceDirectoryModal
 					opened={remoteBrowserOpen}
 					onClose={() => setRemoteBrowserOpen(false)}
 					title={t("browseRemoteDirectoryTitle", { device: selectedDevice?.name ?? deviceId })}
-					size="md"
-					// Opened from inside this modal: use the global modal token, not Mantine's
-					// base modal level, or the picker would render behind its parent.
-					zIndex={Z.modal}
-					styles={DIRECTORY_BROWSER_MODAL_STYLES}
-				>
-					{remoteBrowserOpen ? (
-						<Suspense fallback={null}>
-							<RemoteDirectoryBrowser
-								deviceLabel={selectedDevice?.name ?? deviceId}
-								initialPath={cwd.trim() || undefined}
-								listDirectory={(path, opts) =>
-									api.browseWorkspaceDirectory(deviceId, path, {
-										showHidden: opts.showHidden,
-										projectId: contextProjectId,
-									})
-								}
-								queryKey={["workspaceDeviceBrowse", deviceId, contextProjectId ?? null]}
-								onSelect={(path) => {
-									setCwd(path);
-									setRemoteBrowserOpen(false);
-								}}
-								onCancel={() => setRemoteBrowserOpen(false)}
-							/>
-						</Suspense>
-					) : null}
-				</Modal>
+					deviceId={deviceId}
+					deviceLabel={selectedDevice?.name ?? deviceId}
+					initialPath={cwd.trim() || undefined}
+					listDirectory={(path, opts) =>
+						api.browseWorkspaceDirectory(deviceId, path, {
+							showHidden: opts.showHidden,
+							projectId: contextProjectId,
+						})
+					}
+					queryKey={["workspaceDeviceBrowse", deviceId, contextProjectId ?? null]}
+					onSelect={(path) => {
+						setCwd(path);
+						setRemoteBrowserOpen(false);
+					}}
+					onCancel={() => setRemoteBrowserOpen(false)}
+				/>
 			) : null}
 		</>
 	);
