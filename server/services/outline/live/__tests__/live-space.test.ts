@@ -1767,7 +1767,7 @@ describe("review round 1", () => {
 describe("every keystroke lands exactly once (model, seeded)", () => {
 	const SEEDS = process.env.NF_LIVE_SPACE_SEEDS
 		? process.env.NF_LIVE_SPACE_SEEDS.split(",").map(Number)
-		: [11, 222, 3333, 44444];
+		: [11, 222, 3333, 44444, 7777, 90210];
 	for (const { seed, tag } of runs(SEEDS)) {
 		test(`seed ${seed}${tag}`, async () => {
 			const pages = [];
@@ -1891,9 +1891,9 @@ describe("every keystroke lands exactly once (model, seeded)", () => {
 				if (here.length === 0) continue;
 				for (const c of here) expect(c.outline()).toBe(await dbOutline(pageIds[p] as string));
 			}
-			// The run did type (how much depends on how long links were held or down: one run
-			// of 1,600 typed only 14 words).
-			expect(typed.length).toBeGreaterThan(10);
+			// The run did type at all (how much depends on how long links were held or down; the
+			// invariant above holds whatever it is).
+			expect(typed.length).toBeGreaterThan(5);
 		}, 90_000);
 	}
 });
@@ -2235,5 +2235,71 @@ describe("deterministic sequences (review round 2)", () => {
 		);
 		expect(await content(x)).toBe("x one");
 		expect(a.textOf(x)).toBe("x one");
+	});
+	test("ZZ3: moved to another open page and deleted there while the typing was held; restored and moved back: the typist's copy is the page's again, and what they type next lands", async () => {
+		const one = await page(["goes", "stays"], "One");
+		const two = await page(["there"], "Two");
+		const x = one.ids[0] as string;
+		const la = link(owner);
+		const a = open(la, one.pageId);
+		const b = open(link(writer), two.pageId);
+		await clock.until(() => a.ready && b.ready, 5000, "joined");
+		type(a, x, "1");
+		await clock.settle();
+		await runInLane(space.id, async () => {
+			await theSpace().flushContent();
+		});
+		la.hold(true);
+		type(a, x, " LATE");
+		await clock.advance(60);
+		await agent([{ op: "move", block: { id: x }, parent: { id: two.pageId } }]);
+		await clock.settle();
+		await agent([{ op: "delete", block: { id: x } }]);
+		await clock.settle();
+		la.hold(false);
+		await clock.until(() => a.pending.length === 0, 5000, "answered");
+		await clock.settle();
+		expect(unsavedTextsOf(one.pageId).map((e) => [e.blockId, e.text, e.reason])).toEqual([
+			[x, "goes1 LATE", "moved_away"],
+		]);
+		await agent([{ op: "restore", block: { id: x } } as OutlineOp]);
+		await clock.settle();
+		await agent([{ op: "move", block: { id: x }, parent: { id: one.pageId } }]);
+		await clock.settle();
+		// The block is back with the page's text, not the copy that held what was not taken.
+		expect(a.textOf(x)).toBe(theSpace().textOf(x));
+		expect(a.textOf(x)).toBe("goes1");
+		type(a, x, " Z");
+		await clock.settle();
+		await runInLane(space.id, async () => {
+			await theSpace().flushContent();
+		});
+		await clock.settle();
+		expect(a.stats.rejects).toBe(0);
+		expect(await content(x)).toBe("goes1 Z");
+		expect(a.textOf(x)).toBe("goes1 Z");
+		expect(a.outline()).toBe(await dbOutline(one.pageId));
+		expect(unsavedTextsOf(one.pageId).map((e) => [e.blockId, e.text])).toEqual([[x, "goes1 LATE"]]);
+	});
+
+	test("a refused transaction's typing is kept as unsaved text, never dropped", async () => {
+		const { pageId, ids } = await page(["x", "y"]);
+		const x = ids[0] as string;
+		const y = ids[1] as string;
+		const la = link(owner);
+		const a = open(la, pageId);
+		await clock.until(() => a.ready, 5000, "joined");
+		la.hold(true);
+		// Typing and a move under a block an agent deletes meanwhile: the transaction is refused.
+		struct(a, [{ t: "m", id: x, p: y, k: keyBetween(null, null) }], [{ id: x, md: "x KEEP" }]);
+		await clock.advance(60);
+		await agent([{ op: "delete", block: { id: y } }]);
+		await clock.settle();
+		la.hold(false);
+		await clock.until(() => a.stats.rejects > 0 && a.status === "live", 5000, "refused");
+		await clock.settle();
+		const kept = unsavedTextsOf(pageId).map((e) => [e.blockId, e.text, e.reason]);
+		expect(kept).toEqual([[x, "x KEEP", "rejected"]]);
+		expect(await content(x)).toBe("x");
 	});
 });

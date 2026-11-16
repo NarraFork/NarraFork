@@ -154,7 +154,9 @@ export class TestLink implements LiveTransport {
 		while (!this.downHeld && this.down.length > 0) {
 			const frame = this.down.shift() as Uint8Array;
 			later(() => {
-				if (!this.connected) return;
+				// A frame of a connection that went is never delivered, also not onto a new one
+				// opened in the meantime (as the browser transport drops a closed socket's frames).
+				if (!this.connected || this.socket !== socket) return;
 				this.framesDown++;
 				this.bytesDown += frame.length;
 				const decoded = decodeLiveFrame(frame);

@@ -350,9 +350,15 @@ setOutlineLiveBarrier({ run: runBehindBarrier, holds: holdsLane });
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Tell a socket a join failed. Never throws. */
-function sendClosed(socket: LiveSocket, handle: number, code: LiveCloseCode): void {
+function sendClosed(socket: LiveSocket, handle: number, code: LiveCloseCode, j?: number): void {
 	try {
-		socket.send(encodeLiveFrame({ kind: LIVE_FRAME.closed, handle, head: { code } }));
+		socket.send(
+			encodeLiveFrame({
+				kind: LIVE_FRAME.closed,
+				handle,
+				head: j === undefined ? { code } : { code, j },
+			}),
+		);
 	} catch {
 		// Nothing to tell a socket that cannot take a frame.
 	}
@@ -388,6 +394,7 @@ function validJoinHead(head: unknown): LiveJoinHead | null {
 			(r.g !== undefined && (!Number.isSafeInteger(r.g) || r.g < 0)))
 	)
 		return null;
+	if (h.j !== undefined && (!Number.isSafeInteger(h.j) || h.j < 0)) return null;
 	return h as LiveJoinHead;
 }
 
@@ -475,6 +482,9 @@ async function closeSession(session: LiveSpace, code: LiveCloseCode, idle = fals
 /** A `join` frame. */
 export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<void> {
 	const handle = frame.handle;
+	// The join's number, said back with a refusal (`LiveJoinHead.j`).
+	const rawJ = (frame.head as { j?: unknown } | null)?.j;
+	const j = Number.isSafeInteger(rawJ) && (rawJ as number) >= 0 ? (rawJ as number) : undefined;
 	// A handle no frame can carry cannot be answered either: ignored.
 	if (!isLiveHandle(handle)) {
 		warnRarely("Outline live join with an invalid handle ignored", { handle });
@@ -488,11 +498,11 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 		(frame.head as { v?: unknown } | null)?.v !== OUTLINE_LIVE_PROTOCOL_VERSION &&
 		typeof (frame.head as { page?: unknown } | null)?.page === "string"
 	)
-		return sendClosed(socket, handle, "outdated");
+		return sendClosed(socket, handle, "outdated", j);
 	const head = validJoinHead(frame.head);
-	if (!head || handle === 0) return sendClosed(socket, handle, "unavailable");
-	if (!isOutlineEnabled()) return sendClosed(socket, handle, "unavailable");
-	if (!takeJoinToken(socket)) return sendClosed(socket, handle, "unavailable");
+	if (!head || handle === 0) return sendClosed(socket, handle, "unavailable", j);
+	if (!isOutlineEnabled()) return sendClosed(socket, handle, "unavailable", j);
+	if (!takeJoinToken(socket)) return sendClosed(socket, handle, "unavailable", j);
 	let bindings = state.sockets.get(socket);
 	// Joining again on a handle (a resync, a resume) replaces what was there.
 	const previous = bindings?.get(handle);
@@ -510,7 +520,7 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 		(bindings?.size ?? 0) + joining.size >= OUTLINE_LIVE_LIMITS.sessionsPerSocket ||
 		joining.has(handle)
 	)
-		return sendClosed(socket, handle, "unavailable");
+		return sendClosed(socket, handle, "unavailable", j);
 	joining.add(handle);
 	try {
 		let verdict: Awaited<ReturnType<typeof authorize>> = null;
@@ -520,7 +530,7 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 			verdict = await authorize(socket, head.page);
 			if (checked === state.accessEpoch) break;
 		}
-		if (!verdict) return sendClosed(socket, handle, "access_denied");
+		if (!verdict) return sendClosed(socket, handle, "access_denied", j);
 		const space = verdict.space;
 		let canWrite = verdict.canWrite;
 		const result = await laneFor(space.id).run(async () => {
@@ -563,7 +573,7 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 			}
 			return { space: session, participant: joined };
 		});
-		if ("refused" in result) return sendClosed(socket, handle, result.refused);
+		if ("refused" in result) return sendClosed(socket, handle, result.refused, j);
 		if (socket.closed) {
 			// The socket closed while the join ran.
 			void laneFor(space.id).run(() => result.space.leave(result.participant));
@@ -577,7 +587,7 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 		bindings.set(handle, result);
 	} catch (error) {
 		logger.warn("Outline live join failed", { error: String(error) });
-		sendClosed(socket, handle, "unavailable");
+		sendClosed(socket, handle, "unavailable", j);
 	} finally {
 		joining.delete(handle);
 		if (joining.size === 0) state.joining.delete(socket);

@@ -14,7 +14,11 @@ export type LiveTimer = { readonly __liveTimer: true } | ReturnType<typeof setTi
 
 export interface LiveClock {
 	now(): number;
-	setTimeout(fn: () => void, ms: number): LiveTimer;
+	/**
+	 * `keepAlive`: a wait something is awaiting (a retry of a commit); on the server it keeps
+	 * the process alive like any pending work. Other timers are unreferenced.
+	 */
+	setTimeout(fn: () => void, ms: number, keepAlive?: boolean): LiveTimer;
 	clearTimeout(timer: LiveTimer): void;
 	/** Let other tasks run (a long loop yields to the event loop between steps). */
 	yield(): Promise<void>;
@@ -22,9 +26,9 @@ export interface LiveClock {
 
 const realClock: LiveClock = {
 	now: () => Date.now(),
-	setTimeout: (fn, ms) => {
+	setTimeout: (fn, ms, keepAlive) => {
 		const t = setTimeout(fn, ms);
-		(t as { unref?: () => void }).unref?.();
+		if (!keepAlive) (t as { unref?: () => void }).unref?.();
 		return t;
 	},
 	clearTimeout: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
@@ -48,8 +52,9 @@ export function cancelLiveTimer(timer: LiveTimer | null | undefined): void {
 	if (timer) current.clearTimeout(timer);
 }
 
+/** A wait something awaits: referenced (an unreferenced one could leave its promise unsettled at exit). */
 export function liveSleep(ms: number): Promise<void> {
-	return new Promise((resolve) => current.setTimeout(resolve, ms));
+	return new Promise((resolve) => current.setTimeout(resolve, ms, true));
 }
 
 export function liveYield(): Promise<void> {

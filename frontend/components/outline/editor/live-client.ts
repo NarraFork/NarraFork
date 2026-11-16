@@ -40,7 +40,7 @@ import {
 	merge3,
 	simpleDiff,
 } from "@shared/outline";
-import { cancelLiveTimer, type LiveTimer, liveNow, liveTimeout } from "@shared/outline-live-clock";
+import { cancelLiveTimer, type LiveTimer, liveTimeout } from "@shared/outline-live-clock";
 import {
 	decodeLiveFrame,
 	decodeLiveSeed,
@@ -278,6 +278,9 @@ export type ClientEvent =
 
 let idCounter = 0;
 
+/** The generation of a block whose copy here the page did not take (`detachLost`): unknown. */
+const LOST_GEN = -1;
+
 function randomId(length: number): string {
 	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 	const bytes = new Uint8Array(length);
@@ -388,8 +391,8 @@ export class LiveClient {
 	private wantPresence: LiveSelWire | null = null;
 	private retryTimer: LiveTimer | null = null;
 	private retries = 0;
-	/** Joins sent and not answered yet (`superseded`). */
-	private joinsOut = 0;
+	/** The number of this client's last join (`LiveJoinHead.j`, `superseded`). */
+	private joinSeq = 0;
 	private readonly listeners = new Set<(event: ClientEvent) => void>();
 	private readonly off: Array<() => void> = [];
 	private disposed = false;
@@ -428,8 +431,6 @@ export class LiveClient {
 				if (connected && this.closeCode === "outdated") return;
 				if (connected) this.join();
 				else {
-					// What was on its way on the connection that went is never answered.
-					this.joinsOut = 0;
 					this.setStatus(this.status === "closed" ? "closed" : "offline");
 					for (const tx of this.pending) tx.sent = false;
 				}
@@ -672,6 +673,7 @@ export class LiveClient {
 				const prior = this.lostText.get(id);
 				const base = prior?.base ?? change.before;
 				this.lostText.set(id, { base, text: after });
+				this.detachLost(id, base);
 				if (after === base) continue;
 				items.push(this.lostItem(id, base, after));
 			}
@@ -679,6 +681,33 @@ export class LiveClient {
 		if (items.length === 0) return;
 		this.log.push(`${items.length} block(s) typed in after they left the page: kept unsaved`);
 		keepUnsavedTexts(items);
+	}
+
+	/**
+	 * Forget this end's document of a block whose text the page did not take: it holds that
+	 * change, which no other end has, so nothing of it may be sent or built on. The block shows
+	 * the text from before the change, and its generation is unknown here (`LOST_GEN`): whatever
+	 * the page sends of the block next (it is sent whole: the page's people do not hold the
+	 * block's text since it left them) replaces it, whatever its generation. Typing into it
+	 * meanwhile stays here (`sendPending` leaves it out) and joins the unsaved entry when the
+	 * block's text comes (`dropTo`, `replayPending`).
+	 */
+	private detachLost(id: string, text: string): void {
+		const old = this.docs.get(id);
+		if (old) {
+			if (old.um) this.capturing.delete(old.um);
+			old.um?.destroy();
+			old.doc.destroy();
+			this.docs.delete(id);
+		}
+		this.gens.set(id, LOST_GEN);
+		this.plain.set(id, text);
+		this.textCache.delete(id);
+		for (const v of this.views) v.noteTextReset(id);
+		for (const stack of [this.undoStack, this.redoStack]) for (const s of stack) s.texts.delete(id);
+		const live = (s: Step) => s.inverse.length > 0 || s.texts.size > 0;
+		this.undoStack = this.undoStack.filter(live);
+		this.redoStack = this.redoStack.filter(live);
 	}
 
 	/** An unsaved-text entry of a block whose text this client changed and the page did not take. */
@@ -832,12 +861,13 @@ export class LiveClient {
 		if (this.docs.size > OUTLINE_LIVE_LIMITS.maxClientTextEntries) return null;
 		const entries: LiveTextEntry[] = [];
 		for (const [id, t] of this.docs)
-			entries.push({
-				id,
-				kind: LIVE_TEXT_KIND.vector,
-				...(this.gens.has(id) ? { gen: this.gens.get(id) } : {}),
-				data: Y.encodeStateVector(t.doc),
-			});
+			if (this.gens.get(id) !== LOST_GEN)
+				entries.push({
+					id,
+					kind: LIVE_TEXT_KIND.vector,
+					...(this.gens.has(id) ? { gen: this.gens.get(id) } : {}),
+					data: Y.encodeStateVector(t.doc),
+				});
 		const body = encodeLiveTexts(entries);
 		return body.length > OUTLINE_LIVE_LIMITS.maxClientFrameBytes - 1024 ? null : body;
 	}
@@ -938,6 +968,7 @@ export class LiveClient {
 		const held = known && this.ready && !this.resetting ? this.heldVectors() : null;
 		const head: LiveJoinHead = {
 			v: OUTLINE_LIVE_PROTOCOL_VERSION,
+			j: ++this.joinSeq,
 			page: this.pageId,
 			mode: this.mode,
 			key: this.key,
@@ -954,7 +985,7 @@ export class LiveClient {
 				: {}),
 		};
 		this.setStatus("connecting");
-		const sent = this.sendFrame(
+		this.sendFrame(
 			encodeLiveFrame({
 				kind: LIVE_FRAME.join,
 				handle: this.handle,
@@ -962,8 +993,6 @@ export class LiveClient {
 				...(held ? { body: held } : {}),
 			}),
 		);
-		// Only a join that went out is answered.
-		if (sent) this.joinsOut++;
 	}
 
 	/** Start over from a snapshot (after a refusal): replays what was not acknowledged. */
@@ -1038,7 +1067,8 @@ export class LiveClient {
 			this.syncViews(null);
 			return;
 		}
-		const now = liveNow();
+		// Monotonic: a clock change must not merge or split typing steps.
+		const now = performance.now();
 		const last = this.undoStack[this.undoStack.length - 1];
 		// Typing on from where the last keystroke left the cursor, within a second, is one step;
 		// putting the cursor elsewhere first starts a new one.
@@ -1184,6 +1214,9 @@ export class LiveClient {
 		if (this.status !== "live" || this.handle === null || this.resetting) return;
 		for (const tx of this.pending) {
 			if (tx.sent) continue;
+			// A block whose copy here the page did not take (`detachLost`): nothing of it goes.
+			if (tx.update.some((u) => this.gens.get(u.id) === LOST_GEN))
+				tx.update = tx.update.filter((u) => this.gens.get(u.id) !== LOST_GEN);
 			if (tx.update.length > 1) tx.update = mergedUpdates(tx.update);
 			const body =
 				tx.update.length > 0
@@ -1480,7 +1513,7 @@ export class LiveClient {
 		}
 		switch (frame.kind) {
 			case LIVE_FRAME.joined:
-				if (this.superseded()) break;
+				if (this.superseded(frame.head)) break;
 				this.onJoined(frame.head as LiveJoinedHead, frame.body);
 				break;
 			case LIVE_FRAME.batch:
@@ -1507,7 +1540,7 @@ export class LiveClient {
 				this.join();
 				break;
 			case LIVE_FRAME.closed:
-				if (this.superseded()) break;
+				if (this.superseded(frame.head)) break;
 				this.onClosed(
 					((frame.head as { code?: LiveCloseCode } | null)?.code ?? "ended") as LiveCloseCode,
 				);
@@ -1521,13 +1554,10 @@ export class LiveClient {
 	 * the later one, and anything this client sent after acting on the earlier answer would
 	 * reach the later participant, whose answer does not count it (it would be made twice).
 	 */
-	private superseded(): boolean {
-		if (this.joinsOut > 1) {
-			this.joinsOut--;
-			return true;
-		}
-		this.joinsOut = 0;
-		return false;
+	private superseded(head: unknown): boolean {
+		const j = (head as { j?: unknown } | null)?.j;
+		// A `closed` the session sends of itself (a shutdown, a dismissal) answers no join.
+		return typeof j === "number" && j !== this.joinSeq;
 	}
 
 	/** Raw bytes from a transport that does not decode. */
@@ -1778,8 +1808,11 @@ export class LiveClient {
 			this.pending = [];
 			this.emit("readonly");
 		}
-		// Acknowledged ones were answered before the refusal; the refused one is dropped; the
-		// server ignores the rest until this client joins again, and they are replayed then.
+		// Acknowledged ones were answered before the refusal; the refused one is dropped (what it
+		// typed is kept for the person: never dropped silently); the server ignores the rest until
+		// this client joins again, and they are replayed then.
+		const dropped = this.pending.find((tx) => tx.n === n);
+		if (dropped && !refused && code !== "read_only") this.keepUnsaved("rejected", [dropped]);
 		this.pending = this.pending.filter((tx) => tx.n !== n);
 		this.emit("rejected");
 		this.rebuild();

@@ -1743,6 +1743,7 @@ export class LiveSpace {
 		let joined: LiveJoinedHead;
 		let body: Uint8Array;
 		const base = {
+			...(head.j !== undefined ? { j: head.j } : {}),
 			epoch: this.epoch,
 			w: canWrite,
 			op: this.opSeq,

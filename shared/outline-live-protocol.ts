@@ -239,6 +239,11 @@ export interface LiveJoinHead {
 	 * resume drops every document of a later generation the client may hold.
 	 */
 	resume?: { epoch: number; op: number; tx: number; reset?: boolean; g?: number };
+	/**
+	 * This join's number on its handle (L2): the answer (`joined`, or `closed` refusing it) says
+	 * it back, so a client with two joins on their way acts on the answer to its last only.
+	 */
+	j?: number;
 }
 
 /**
@@ -260,6 +265,8 @@ export type LivePeerWire = [
 ];
 
 export interface LiveJoinedHead {
+	/** The join this answers (`LiveJoinHead.j`). */
+	j?: number;
 	/** The session instance; a resume names it. */
 	epoch: number;
 	/** `reset`: drop local state and take the snapshot. `resume`: apply the diff and ops. */
@@ -373,6 +380,8 @@ export type LiveCloseCode =
 
 export interface LiveClosedHead {
 	code: LiveCloseCode;
+	/** When it refuses a join: that join's number (`LiveJoinHead.j`). */
+	j?: number;
 }
 
 export type LiveRejectCode =
