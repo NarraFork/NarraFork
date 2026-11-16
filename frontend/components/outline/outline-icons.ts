@@ -17,6 +17,7 @@
  */
 import type { OutlineTaskStatus } from "@shared/outline-api";
 import { LIVE_STATUS_OF_TASK, type LiveTaskChar } from "@shared/outline-live-protocol";
+import type { OutlineDiffKind } from "@shared/outline-restore-api";
 import type { OutlineStatusKey } from "@shared/outline-status";
 import {
 	IconArrowForwardUp,
@@ -32,7 +33,12 @@ import {
 	IconHelpCircle,
 	IconHourglass,
 	IconLock,
+	IconLogin2,
+	IconLogout2,
+	IconMinus,
 	type IconNode,
+	IconPencil,
+	IconPlus,
 	IconX,
 	type TablerIcon,
 } from "@tabler/icons-react";
@@ -50,6 +56,11 @@ import { __iconNode as foldUpNode } from "@tabler/icons-react/dist/esm/icons/Ico
 import { __iconNode as helpCircleNode } from "@tabler/icons-react/dist/esm/icons/IconHelpCircle.mjs";
 import { __iconNode as hourglassNode } from "@tabler/icons-react/dist/esm/icons/IconHourglass.mjs";
 import { __iconNode as lockNode } from "@tabler/icons-react/dist/esm/icons/IconLock.mjs";
+import { __iconNode as login2Node } from "@tabler/icons-react/dist/esm/icons/IconLogin2.mjs";
+import { __iconNode as logout2Node } from "@tabler/icons-react/dist/esm/icons/IconLogout2.mjs";
+import { __iconNode as minusNode } from "@tabler/icons-react/dist/esm/icons/IconMinus.mjs";
+import { __iconNode as pencilNode } from "@tabler/icons-react/dist/esm/icons/IconPencil.mjs";
+import { __iconNode as plusNode } from "@tabler/icons-react/dist/esm/icons/IconPlus.mjs";
 import { __iconNode as xNode } from "@tabler/icons-react/dist/esm/icons/IconX.mjs";
 import "./outline-icons.css";
 
@@ -146,6 +157,28 @@ export const FOCUS_ICON: OutlineIcon = {
 	name: "focus-centered",
 	Icon: IconFocusCentered,
 	node: focusCenteredNode,
+};
+
+/**
+ * What a comparison of two moments says happened to a block (`history/`): added, removed, moved
+ * in, moved away, changed. Different shapes (a plus, a minus, an arrow going in, one going out,
+ * a pencil), so the colour ({@link DIFF_TONE}) is never the only signal.
+ */
+export const DIFF_ICONS: Record<OutlineDiffKind, OutlineIcon> = {
+	added: { name: "plus", Icon: IconPlus, node: plusNode },
+	removed: { name: "minus", Icon: IconMinus, node: minusNode },
+	"moved-in": { name: "login-2", Icon: IconLogin2, node: login2Node },
+	"moved-away": { name: "logout-2", Icon: IconLogout2, node: logout2Node },
+	changed: { name: "pencil", Icon: IconPencil, node: pencilNode },
+};
+
+/** The Mantine colour of each kind of a comparison's mark (a light badge, both schemes). */
+export const DIFF_TONE: Record<OutlineDiffKind, string> = {
+	added: "green",
+	removed: "red",
+	"moved-in": "cyan",
+	"moved-away": "orange",
+	changed: "indigo",
 };
 
 /** What a row shows where its text starts: exactly one of these, after the folding arrow. */

@@ -45,6 +45,7 @@ import {
 	type OutlineTreeSpace,
 	type OutlineViewMode,
 } from "@shared/outline-api";
+import type { OutlineDiffKind } from "@shared/outline-restore-api";
 import { IconClock, IconFolder, IconFolders, IconMessages, IconUser } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -949,7 +950,8 @@ export interface OutlineForestProps {
 		| {
 				kind: "block";
 				spaceId: string;
-				blockId: string;
+				/** The block focused; null: the space's top level (its whole history, as of a seq). */
+				blockId: string | null;
 				/** Facts (the default) or everything. */
 				view?: OutlineViewMode;
 				/** Commit seq to show it as of (read only, not live); absent: now. */
@@ -976,6 +978,11 @@ export interface OutlineForestProps {
 	live?: boolean;
 	/** Requests of the block lists; the app's API when absent (tests). */
 	io?: ForestIO;
+	/**
+	 * A focused root as of a commit: the blocks a comparison from that commit names, marked on
+	 * their rows (`history/`).
+	 */
+	diffMarks?: ReadonlyMap<string, OutlineDiffKind>;
 }
 
 /** A block focused: what is under it, with the control for all of it. */
@@ -985,12 +992,14 @@ function FocusedForest({
 	onForest,
 	live,
 	io,
+	diffMarks,
 }: {
 	root: Extract<OutlineForestProps["root"], { kind: "block" }>;
 	onEdit?: (spaceId: string, blockId: string) => void;
 	onForest?: (forest: SpaceForest | null) => void;
 	live?: boolean;
 	io?: ForestIO;
+	diffMarks?: ReadonlyMap<string, OutlineDiffKind>;
 }) {
 	const { t } = useTranslation("outline");
 	const [forest, setForest] = useState<SpaceForest | null>(null);
@@ -1045,6 +1054,7 @@ function FocusedForest({
 					onEdit={onEdit ? edit : undefined}
 					live={live}
 					io={io}
+					diffMarks={diffMarks}
 				/>
 			</div>
 		</Box>
@@ -1063,6 +1073,7 @@ export function OutlineForest(props: OutlineForestProps) {
 				onForest={props.onForest}
 				live={props.live}
 				io={props.io}
+				diffMarks={props.diffMarks}
 			/>
 		);
 	}

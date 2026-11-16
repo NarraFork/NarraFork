@@ -16,6 +16,7 @@ import {
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
 import { boundedFoldView } from "@shared/outline-fold";
+import { OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
 import {
 	type QueryClient,
 	useInfiniteQuery,
@@ -41,8 +42,13 @@ export const outlineKeys = {
 	blocks: (spaceId: string) => ["outline", "block", spaceId] as const,
 	block: (spaceId: string, blockId: string, asOf: number | null, view: OutlineViewMode) =>
 		["outline", "block", spaceId, blockId, asOf, view] as const,
-	timeline: (spaceId: string, pageId: string) => ["outline", "timeline", spaceId, pageId] as const,
+	/** The commits of a block's subtree (`""`: the whole space). */
+	timeline: (spaceId: string, rootId: string | null) =>
+		["outline", "timeline", spaceId, rootId ?? ""] as const,
 	history: (spaceId: string, blockId: string) => ["outline", "history", spaceId, blockId] as const,
+	/** A comparison of a subtree between two seqs (`to` null: now as of its first page). */
+	diff: (spaceId: string, rootId: string | null, thenSeq: number, to: number | null) =>
+		["outline", "diff", spaceId, rootId ?? "", thenSeq, to] as const,
 	backlinks: (spaceId: string, blockId: string) =>
 		["outline", "backlinks", spaceId, blockId] as const,
 	search: (q: string, spaceId: string | null) => ["outline", "search", q, spaceId] as const,
@@ -377,33 +383,52 @@ export function useOutlineViewStateSync(
 	return sync;
 }
 
-export function useOutlineTimeline(spaceId: string, pageId: string | undefined) {
+/**
+ * The timeline of a block's subtree (`rootId` null: the whole space): the commits that changed
+ * the block or anything under it, newest first, a page at a time, down to the space's history
+ * floor (H2 `blocks/:blockId/commits`).
+ */
+export function useOutlineSubtreeTimeline(spaceId: string, rootId: string | null, enabled = true) {
 	return useInfiniteQuery({
-		queryKey: outlineKeys.timeline(spaceId, pageId ?? ""),
+		queryKey: outlineKeys.timeline(spaceId, rootId),
 		queryFn: ({ pageParam }) =>
-			api.getOutlinePageCommits(spaceId, pageId as string, {
+			api.getOutlineSubtreeCommits(spaceId, rootId, {
 				before: pageParam,
-				limit: OUTLINE_VIEW_LIMITS.defaultTimeline,
-			}),
-		initialPageParam: null as number | null,
-		getNextPageParam: (page) => page.nextBefore,
-		enabled: !REMOTE_BUILD && !!pageId,
-		retry: false,
-	});
-}
-
-export function useOutlineBlockHistory(spaceId: string, blockId: string, enabled: boolean) {
-	return useInfiniteQuery({
-		queryKey: outlineKeys.history(spaceId, blockId),
-		queryFn: ({ pageParam }) =>
-			api.getOutlineBlockHistory(spaceId, blockId, {
-				before: pageParam,
-				limit: OUTLINE_VIEW_LIMITS.defaultTimeline,
+				limit: OUTLINE_SUBTREE_LIMITS.defaultTimeline,
 			}),
 		initialPageParam: null as number | null,
 		getNextPageParam: (page) => page.nextBefore,
 		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
+	});
+}
+
+/**
+ * What differs under a block (`rootId` null: the space) between `thenSeq` and `to` (absent:
+ * now, as of the first page), a page at a time (H3 `diff`). Not refreshed by commits: the
+ * comparison is of the two seqs its first page named.
+ */
+export function useOutlineSubtreeDiff(
+	spaceId: string,
+	rootId: string | null,
+	thenSeq: number,
+	to: number | undefined,
+	enabled: boolean,
+) {
+	return useInfiniteQuery({
+		queryKey: outlineKeys.diff(spaceId, rootId, thenSeq, to ?? null),
+		queryFn: ({ pageParam }) =>
+			api.diffOutlineSubtree(spaceId, {
+				rootId,
+				thenSeq,
+				...(to !== undefined ? { to } : {}),
+				...(pageParam ? { cursor: pageParam } : {}),
+			}),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor,
+		enabled: !REMOTE_BUILD && enabled,
+		retry: false,
+		staleTime: Number.POSITIVE_INFINITY,
 	});
 }
 

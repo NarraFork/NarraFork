@@ -67,7 +67,6 @@
 		},
 		"viewLabel": "What to show",
 		"sidePanel": "Backlinks and history",
-		"asOfBanner": "Viewing the page as of commit #{{seq}} (read only).",
 		"backToCurrent": "Back to now",
 		"processHidden_one": "{{count}} block under tasks is not shown.",
 		"processHidden_other": "{{count}} blocks under tasks are not shown.",
@@ -80,25 +79,12 @@
 		"noBacklinks": "Nothing links here.",
 		"backlinksTruncated_one": "Showing the first {{count}}.",
 		"backlinksTruncated_other": "Showing the first {{count}}.",
-		"noHistory": "No history.",
 		"linkKind": {
 			"link": "Link",
 			"embed": "Embed",
 			"depends": "Depends on",
 			"tag": "Tag"
-		},
-		"change": {
-			"create": "Created",
-			"content": "Edited",
-			"move": "Moved",
-			"delete": "Deleted",
-			"restore": "Restored",
-			"task": "Task",
-			"page": "Page changed",
-			"props": "Alias or tags",
-			"merge": "Merged"
-		},
-		"viewAt": "View the page as of commit #{{seq}}"
+		}
 	},
 	"timeline": {
 		"label": "Timeline",
@@ -141,7 +127,11 @@
 			"cycle": "it would end up under itself"
 		},
 		"openSession": "Open the session",
-		"sessionUnavailable": "You cannot open the session that wrote this."
+		"sessionUnavailable": "You cannot open the session that wrote this.",
+		"floor": "Earlier history is not kept.",
+		"view": "See it as it was at #{{seq}}",
+		"unavailable": "The history here cannot be read yet: it is still being prepared.",
+		"beforeFloor": "History before #{{seq}} is not kept."
 	},
 	"editor": {
 		"changeStatus": "Change status",
@@ -775,5 +765,119 @@
 		"reportAllParts_other": "Show all ({{count}} sections) ▸",
 		"reportAllPartsAtLeast_one": "Show all ({{count}}+ sections) ▸",
 		"reportAllPartsAtLeast_other": "Show all ({{count}}+ sections) ▸"
+	},
+	"asOf": {
+		"banner": "Viewing history: as it was at #{{seq}}",
+		"readOnly": "Read only",
+		"backToNow": "Back to now",
+		"compare": "What changed since",
+		"hideCompare": "Hide the changes",
+		"restore": "Restore to this point…",
+		"readOnlyHint": "You can look and compare, but you cannot change this space, so you cannot restore it.",
+		"open": "History",
+		"openHint": "See this space as it was at an earlier point",
+		"close": "Close the history",
+		"pick": "Pick a point on the timeline to see the whole space as it was then."
+	},
+	"diff": {
+		"titleNow": "What changed from #{{from}} to now",
+		"titleTo": "What changed from #{{from}} to #{{to}}",
+		"compareWith": "Compare with",
+		"now": "Now",
+		"empty": "Nothing changed here.",
+		"more": "Show more changes",
+		"untitled": "(empty)",
+		"then": "Then",
+		"after": "After",
+		"kind": {
+			"added": "Added",
+			"removed": "Deleted",
+			"moved-in": "Moved in",
+			"moved-away": "Moved away",
+			"changed": "Changed"
+		},
+		"movedAwayDeleted": "Moved away, then deleted",
+		"field": {
+			"parent": "place",
+			"order": "order",
+			"text": "text",
+			"task": "task",
+			"question": "question",
+			"alias": "alias",
+			"tags": "tags"
+		},
+		"fields": "Changed: {{fields}}",
+		"mark": {
+			"removed": "Deleted after this point",
+			"moved-away": "Moved away after this point",
+			"changed": "Changed after this point"
+		}
+	},
+	"restore": {
+		"title": "Restore to #{{seq}}",
+		"intro": "Only what was under here at #{{seq}} is touched: blocks added since are deleted, blocks moved in are moved back out, and text and order are put back. Blocks that moved away are not pulled back: they are listed at the end, each with its own Move back.",
+		"loading": "Working out what would change…",
+		"nothing": "Nothing here differs from #{{seq}}.",
+		"group": {
+			"delete": "Deleted (added since)",
+			"restore": "Brought back (deleted since)",
+			"move-out": "Moved back out (moved in since)",
+			"put-back": "Put back (text, order or details)",
+			"kept": "Left as they are",
+			"moved-away": "Moved away since: not pulled back"
+		},
+		"unlessHolds": "unless something that cannot leave is still under it then",
+		"carries_one": "takes the {{count}} block under it along",
+		"carries_other": "takes the {{count}} blocks under it along",
+		"carriesMore_one": "takes {{count}}+ block under it along",
+		"carriesMore_other": "takes {{count}}+ blocks under it along",
+		"staysPut": "its text and details are put back; it stays where it is",
+		"deletedSince": "deleted since",
+		"moveBack": "Move back",
+		"movedBack": "Moved back",
+		"movedBackRestored": "Brought back and moved back",
+		"cannotMoveBack": "Its old place is gone",
+		"refreshed": "The list was worked out again after the move.",
+		"moreList": "Show more of the list",
+		"listIncomplete": "The list goes on: confirming restores all of it, not only what is shown.",
+		"confirm": "Restore",
+		"cancel": "Cancel",
+		"running": "Restoring… {{changed}} blocks changed so far",
+		"stop": "Stop",
+		"stopped": "Stopped. What was restored so far stays; continue to finish.",
+		"continue": "Continue",
+		"done": "Restored to #{{seq}}.",
+		"summary": "Blocks changed: {{changed}} · commits: {{commits}}",
+		"doneNothing": "Nothing needed to change.",
+		"pendingHeld": "Held for confirmation: {{label}}",
+		"skippedTitle": "Left as they are ({{count}})",
+		"skippedMore": "More were left as they are than are listed here.",
+		"movedAwayTitle": "Moved away since ({{count}}): not pulled back",
+		"skip": {
+			"parent-moved-away": "the block it belonged under has moved away from here, so it stays where it is",
+			"parent-gone": "the block it came from is deleted",
+			"holds-kept": "something that stays is still under it, so it is kept",
+			"refused": "the change was refused (it would end up under itself, or a limit or a claim stopped it)",
+			"parent-refused": "it was to go back under a block whose change was refused",
+			"lock-kept": "someone else has locked it",
+			"place-taken": "its old place or alias is taken"
+		},
+		"close": "Close",
+		"previewAgain": "Preview again",
+		"retry": "Try again",
+		"problem": {
+			"conflict": "Someone changed this part of the outline after the preview (commit #{{seq}}). Nothing more was written. Preview again to see the list as it is now.",
+			"conflictNoSeq": "Someone changed this part of the outline after the preview. Nothing more was written. Preview again to see the list as it is now.",
+			"expired": "The preview is more than 30 minutes old. Preview again.",
+			"person": "This preview was made by someone else. Preview it yourself.",
+			"token": "The preview is no longer valid. Preview again.",
+			"not-ready": "The history here is still being prepared. Try again in a moment.",
+			"before-floor": "History before #{{seq}} is not kept. Pick a later point.",
+			"root": "This block was not in the outline at that point.",
+			"parent-gone": "The block it was under is deleted now; bring that one back first.",
+			"forbidden": "You can read this space but not change it.",
+			"missing": "This place cannot be found."
+		},
+		"partial": "Part of it was restored: {{changed}} blocks changed."
 	}
 }

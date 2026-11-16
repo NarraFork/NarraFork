@@ -9,6 +9,7 @@ import {
 	Anchor,
 	Badge,
 	Breadcrumbs,
+	Button,
 	Group,
 	Loader,
 	Stack,
@@ -18,18 +19,23 @@ import {
 } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
 import type { OutlineSpaceDetail } from "@shared/outline-api";
-import { IconSearch } from "@tabler/icons-react";
-import { useEffect, useMemo, useState } from "react";
+import type { OutlineDiffKind } from "@shared/outline-restore-api";
+import { IconHistory, IconSearch } from "@tabler/icons-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineSpace } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
 import { OutlineForest } from "./forest/OutlineForest";
+import { OutlineHistoryBar } from "./history/OutlineHistoryBar";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
+import { OutlineTimeline } from "./OutlineTimeline";
 import { OutlineLink, outlineBlockTarget, useOutlineNavigate } from "./outline-nav";
 import { ForestSwitcher } from "./QuickSwitcher";
 import { OutlineSearchTree } from "./tree/OutlineSearchTree";
 import type { TreeLocateTarget } from "./tree/tree-locate";
+
+const NO_MARKS: ReadonlyMap<string, OutlineDiffKind> = new Map();
 
 export function OutlineSpaceHome({
 	spaceId,
@@ -56,6 +62,11 @@ export function OutlineSpaceHome({
 	const [debounced] = useDebouncedValue(query, 250);
 	const searching = debounced.trim() !== "" && query.trim() !== "";
 	const [locate, setLocate] = useState<TreeLocateTarget | null>(null);
+	// The space's history: its timeline, and the whole space as of a point picked on it.
+	const [historyOpen, setHistoryOpen] = useState(false);
+	const [asOf, setAsOf] = useState<number | undefined>(undefined);
+	const [diffMarks, setDiffMarks] = useState<ReadonlyMap<string, OutlineDiffKind>>(NO_MARKS);
+	const backToNow = useCallback(() => setAsOf(undefined), []);
 	const detail = space.data?.space;
 	const root = useMemo(
 		() => (detail ? ({ kind: "space", space: detail } as const) : null),
@@ -123,23 +134,63 @@ export function OutlineSpaceHome({
 								{t("space.readOnly")}
 							</Badge>
 						)}
+						<Button
+							size="compact-xs"
+							variant={historyOpen ? "light" : "subtle"}
+							color="gray"
+							leftSection={<IconHistory size={14} />}
+							aria-pressed={historyOpen}
+							title={t(historyOpen ? "asOf.close" : "asOf.openHint")}
+							onClick={() => {
+								if (historyOpen) setAsOf(undefined);
+								setHistoryOpen(!historyOpen);
+							}}
+							data-testid="outline-space-history"
+						>
+							{t("asOf.open")}
+						</Button>
 						{actions}
 					</Group>
 				</Group>
 
-				<TextInput
-					leftSection={<IconSearch size={16} />}
-					placeholder={t("space.searchPlaceholder")}
-					aria-label={t("space.searchPlaceholder")}
-					value={query}
-					onChange={(event) => setQuery(event.currentTarget.value)}
-					onKeyDown={(event) => {
-						if (event.key === "Escape" && query !== "") setQuery("");
-					}}
-					data-testid="outline-search-input"
-				/>
+				{asOf !== undefined && (
+					<OutlineHistoryBar
+						spaceId={spaceId}
+						rootId={null}
+						asOf={asOf}
+						canWrite={detail.canWrite}
+						onBack={backToNow}
+						onMarks={setDiffMarks}
+					/>
+				)}
+				{historyOpen && asOf === undefined && (
+					<Text size="sm" c="dimmed" data-testid="outline-space-history-hint">
+						{t("asOf.pick")}
+					</Text>
+				)}
+				{asOf !== undefined && (
+					<OutlineForest
+						root={{ kind: "block", spaceId, blockId: null, view: "all", asOf }}
+						host={host}
+						diffMarks={diffMarks}
+					/>
+				)}
+
+				{asOf === undefined && (
+					<TextInput
+						leftSection={<IconSearch size={16} />}
+						placeholder={t("space.searchPlaceholder")}
+						aria-label={t("space.searchPlaceholder")}
+						value={query}
+						onChange={(event) => setQuery(event.currentTarget.value)}
+						onKeyDown={(event) => {
+							if (event.key === "Escape" && query !== "") setQuery("");
+						}}
+						data-testid="outline-search-input"
+					/>
+				)}
 				{/* The search drawn as a tree, in the tree's place; a match is then shown in the tree. */}
-				{searching && (
+				{searching && asOf === undefined && (
 					<OutlineSearchTree
 						query={debounced}
 						spaceId={spaceId}
@@ -149,7 +200,23 @@ export function OutlineSpaceHome({
 						}}
 					/>
 				)}
-				{root && <OutlineForest root={root} host={host} locate={locate} hidden={searching} />}
+				{root && (
+					<OutlineForest
+						root={root}
+						host={host}
+						locate={locate}
+						hidden={searching || asOf !== undefined}
+					/>
+				)}
+				{historyOpen && (
+					<OutlineTimeline
+						spaceId={spaceId}
+						rootId={null}
+						canWrite={detail.canWrite}
+						asOf={asOf}
+						onSelect={setAsOf}
+					/>
+				)}
 			</Stack>
 		</ForestSwitcher>
 	);
