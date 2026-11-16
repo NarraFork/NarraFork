@@ -359,7 +359,7 @@
 	},
 	{
 		"name": "golang.org/x/sys (remote-peer)",
-		"version": "0.45.0",
+		"version": "0.50.0",
 		"license": "BSD-3-Clause",
 		"author": "The Go Authors",
 		"repository": "https://github.com/golang/sys",
