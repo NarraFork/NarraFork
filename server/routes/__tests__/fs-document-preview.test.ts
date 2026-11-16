@@ -93,6 +93,40 @@ describe("document asset route", () => {
 		expect((await response.arrayBuffer()).byteLength).toBeGreaterThan(0);
 	});
 
+	test("does not return an SVG part as image/svg+xml", async () => {
+		const svgPath = join(root, "with-svg.docx");
+		writeFileSync(
+			svgPath,
+			buildDocx({
+				bodyXml: `<w:p><w:r><w:t>仍可预览</w:t></w:r></w:p>${pictureParagraph()}${pictureParagraph("rId2")}`,
+				extraParts: [
+					{
+						name: "word/media/image2.svg",
+						data: '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+					},
+				],
+				extraRels: [{ id: "rId2", target: "media/image2.svg" }],
+			}),
+		);
+		const response = await preview(svgPath);
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as {
+			ok: boolean;
+			result: { markdown: string; assets: Array<{ id: string; mime: string }> };
+		};
+		expect(body.ok).toBe(true);
+		expect(body.result.markdown).toContain("仍可预览");
+		expect(body.result.assets.map((asset) => asset.mime)).toEqual(["image/png"]);
+		expect(body.result.assets.some((asset) => asset.mime === "image/svg+xml")).toBe(false);
+
+		const picture = await asset(svgPath, "a1");
+		expect(picture.status).toBe(200);
+		expect(picture.headers.get("content-type")).toBe("image/png");
+		expect(picture.headers.get("content-type")).not.toContain("svg");
+		expect((await asset(svgPath, "a2")).status).toBe(400);
+		rmSync(svgPath, { force: true });
+	});
+
 	test("refuses an id that is not a parser-minted asset id", async () => {
 		// A ZIP part name must never be addressable: this is the path a caller would try.
 		const response = await asset(docxPath, "word/media/image1.png");

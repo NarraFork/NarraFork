@@ -14,7 +14,7 @@
  * are exposed through generated ids (`a1`, `a2`, …) — never through a path a client supplied.
  */
 
-import { MAX_DOCUMENT_ASSET_BYTES } from "./limits";
+import { MAX_DOCUMENT_ASSET_BYTES, OMITTED_DOCUMENT_IMAGE_MIMES } from "./limits";
 import { type DocumentBlock, renderMarkdown } from "./markdown";
 import type { DocumentAssetRef, DocumentPreviewResult } from "./types";
 import { walkXml } from "./xml";
@@ -346,6 +346,26 @@ const MIME_BY_EXT: Record<string, string> = {
 	wmf: "image/wmf",
 };
 
+/**
+ * Extensions whose MIME is in `OMITTED_DOCUMENT_IMAGE_MIMES`.
+ *
+ * Checked before inflate: an SVG can be the full picture cap (20MB) and sanitizing it would
+ * parse that whole document. Dropping the part is enough — the preview has no use for a format
+ * it must not execute, and EMF/WMF would not paint. A name match skips the inflate entirely.
+ */
+const OMITTED_IMAGE_EXTENSIONS = new Set(["svg", "emf", "wmf"]);
+
+function imageExtension(name: string): string {
+	const dot = name.lastIndexOf(".");
+	return dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
+}
+
+/** True when this part must be omitted rather than returned as an image. */
+function omittedImagePart(name: string, bytes?: Uint8Array): boolean {
+	if (OMITTED_IMAGE_EXTENSIONS.has(imageExtension(name))) return true;
+	return bytes !== undefined && OMITTED_DOCUMENT_IMAGE_MIMES.has(imageMimeFor(name, bytes));
+}
+
 /** MIME from the stored part's magic bytes, falling back to its extension. */
 export function imageMimeFor(name: string, bytes: Uint8Array): string {
 	const head = bytes.subarray(0, 12);
@@ -430,6 +450,11 @@ export function parseDocx(buffer: Buffer, options: ParseDocxOptions): DocumentPr
 				? image.target.slice(1)
 				: `word/${image.target.replace(/^\.\//, "")}`;
 			if (!zip.has(relative)) continue;
+			// Extension is enough to know the type, so a large SVG is never inflated.
+			if (omittedImagePart(relative)) {
+				omitted.push("a picture format cannot be previewed");
+				continue;
+			}
 
 			const existing = assetByPart.get(relative);
 			if (existing) {
@@ -456,9 +481,16 @@ export function parseDocx(buffer: Buffer, options: ParseDocxOptions): DocumentPr
 				continue;
 			}
 
+			const mime = imageMimeFor(relative, bytes);
+			// Magic bytes can disagree with the name. Still refuse an active or unpaintable type.
+			if (omittedImagePart(relative, bytes)) {
+				omitted.push("a picture format cannot be previewed");
+				continue;
+			}
+
 			const asset: DocumentAssetRef = {
 				id: `a${assets.length + 1}`,
-				mime: imageMimeFor(relative, bytes),
+				mime,
 				byteLength: bytes.length,
 			};
 			assets.push(asset);

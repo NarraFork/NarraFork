@@ -29,7 +29,7 @@ import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
 import { getClientIp, isLocalMachineAddress } from "../lib/client-ip";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
 import { requestDocumentAsset, requestDocumentPreview } from "../lib/document-preview/client";
-import { MAX_DOCUMENT_BYTES } from "../lib/document-preview/limits";
+import { MAX_DOCUMENT_BYTES, OMITTED_DOCUMENT_IMAGE_MIMES } from "../lib/document-preview/limits";
 import { AppError, ValidationError } from "../lib/errors";
 import { claimDownloadTicket, issueDownloadTicket } from "../lib/fs-download-ticket";
 import {
@@ -622,6 +622,12 @@ fsRoutes.get("/document-asset", async (c) => {
 
 	const asset = await requestDocumentAsset(absPath, assetId);
 	if (!asset) throw new ValidationError(`Unknown document asset: ${assetId}`);
+	// The worker already omits these. Refuse again at the HTTP boundary: the client puts the
+	// body in a same-origin blob, so a response of this type would be an executable document.
+	// This is a type check, not a parse — `sanitizeSvg` stays off the main thread.
+	if (OMITTED_DOCUMENT_IMAGE_MIMES.has(asset.mime)) {
+		throw new ValidationError(`Unknown document asset: ${assetId}`);
+	}
 
 	return new Response(Buffer.from(asset.bytes), {
 		headers: {

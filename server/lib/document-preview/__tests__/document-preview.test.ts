@@ -84,6 +84,44 @@ describe("docx parsing", () => {
 		const notDocx = buildZip([{ name: "word/styles.xml", data: "<x/>" }]);
 		expect(() => parseDocx(notDocx, { filePath: FILE_PATH })).toThrow("word/document.xml");
 	});
+
+	test("does not return an SVG part as image/svg+xml", () => {
+		const svg = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>';
+		const buffer = buildDocx({
+			bodyXml: `<w:p><w:r><w:t>仍可预览</w:t></w:r></w:p>${pictureParagraph()}${pictureParagraph("rId2")}${pictureParagraph("rId3")}${pictureParagraph("rId4")}`,
+			extraParts: [
+				{ name: "word/media/image2.svg", data: svg },
+				{ name: "word/media/image3.emf", data: Buffer.from([0x01, 0x00, 0x00, 0x00]) },
+				{ name: "word/media/image4.wmf", data: Buffer.from([0xd7, 0xcd, 0xc6, 0x9a]) },
+			],
+			extraRels: [
+				{ id: "rId2", target: "media/image2.svg" },
+				{ id: "rId3", target: "media/image3.emf" },
+				{ id: "rId4", target: "media/image4.wmf" },
+			],
+		});
+		const parsed = parseDocx(buffer, { filePath: FILE_PATH });
+		expect(parsed.markdown).toContain("仍可预览");
+		expect(parsed.truncated).toBe(false);
+		expect(parsed.assets.map((asset) => asset.mime)).toEqual(["image/png"]);
+		expect(parsed.assets.some((asset) => asset.mime === "image/svg+xml")).toBe(false);
+		expect(
+			parsed.omitted.filter((note) => note === "a picture format cannot be previewed"),
+		).toHaveLength(3);
+		expect(readDocxAsset(buffer, "a1", FILE_PATH)?.mime).toBe("image/png");
+		expect(readDocxAsset(buffer, "a2", FILE_PATH)).toBeUndefined();
+
+		const svgOnly = buildDocx({
+			bodyXml: `<w:p><w:r><w:t>只有矢量图</w:t></w:r></w:p>${pictureParagraph("rId2")}`,
+			extraParts: [{ name: "word/media/image2.svg", data: svg }],
+			extraRels: [{ id: "rId2", target: "media/image2.svg" }],
+		});
+		const dropped = parseDocx(svgOnly, { filePath: FILE_PATH });
+		expect(dropped.assets).toEqual([]);
+		expect(dropped.markdown).toContain("只有矢量图");
+		expect(dropped.markdown).not.toContain("nf-doc-asset:");
+		expect(readDocxAsset(svgOnly, "a1", FILE_PATH)).toBeUndefined();
+	});
 });
 
 describe("document parser bounds", () => {
