@@ -105,6 +105,7 @@ import {
 	type NarratorListStateSnapshotItem,
 	type NarratorServerMessage,
 } from "./narrator-ws-types";
+import { handleOutlineBlockMessage, releaseOutlineBlockSubscriptions } from "./outline-block-ws";
 import { releaseOutlineLive } from "./outline-live-ws";
 import { handleOutlinePageMessage, releaseOutlinePageSubscriptions } from "./outline-page-ws";
 import type { WSData } from "./ws-handler";
@@ -168,6 +169,7 @@ export type NarratorClientMessage =
 	| GitWorkspaceClientMessage
 	| import("@shared/editor-file-events").EditorFileClientMessage
 	| import("@shared/outline-page-events").OutlinePageClientMessage
+	| import("@shared/outline-block-events").OutlineWatchClientMessage
 	| { type: "pong" }
 	| {
 			type: "subscribe";
@@ -261,6 +263,7 @@ function removeConnection(ws: NarratorWS): void {
 	releaseGitWorkspaceSubscriptions(ws);
 	releaseEditorFileSubscriptions(ws);
 	releaseOutlinePageSubscriptions(ws);
+	releaseOutlineBlockSubscriptions(ws);
 	releaseOutlineLive(ws);
 	const removed = connections.delete(ws);
 	if (removed && ws.data.publicShare) {
@@ -1941,6 +1944,10 @@ export const handleNarratorWS = {
 			case "outline_page_subscribe":
 			case "outline_page_unsubscribe":
 				await handleOutlinePageMessage(ws, msg);
+				break;
+			case "outline_watch":
+			case "outline_unwatch":
+				await handleOutlineBlockMessage(ws, msg);
 				break;
 			case "pong":
 				// Heartbeat response — lastPongAt already updated above

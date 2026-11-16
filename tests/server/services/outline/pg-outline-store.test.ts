@@ -32,6 +32,7 @@ import { OUTLINE_HISTORY_CONTRACT } from "../../../../server/services/outline/__
 import { OUTLINE_PENDING_CONTRACT } from "../../../../server/services/outline/__tests__/pending-contract";
 import { OUTLINE_QUESTION_CONTRACT } from "../../../../server/services/outline/__tests__/question-contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
+import { OUTLINE_SUBTREE_CONTRACT } from "../../../../server/services/outline/__tests__/subtree-contract";
 import { OUTLINE_TASK_CONTRACT } from "../../../../server/services/outline/__tests__/task-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
 import type { OutlineEdgeRow } from "../../../../server/services/outline/store/history-port";
@@ -41,10 +42,14 @@ import {
 	type OutlineVersionRow,
 } from "../../../../server/services/outline/store/port";
 import {
+	pgAncestryAsOf,
+	pgAncestryNow,
+	pgAncestryOf,
 	pgChangedChildrenLeft,
 	pgChangedChildrenThere,
 	pgLevelAsOf,
 	pgLevelNow,
+	pgLockedOfSpace,
 	pgMarkAncestorsSql,
 } from "../../../../server/services/outline/store/postgres-history";
 import { createPostgresOutlineStore } from "../../../../server/services/outline/store/postgres-store";
@@ -245,6 +250,7 @@ describe("PostgreSQL outline store", () => {
 						...OUTLINE_PENDING_CONTRACT,
 						...OUTLINE_QUESTION_CONTRACT,
 						...OUTLINE_HISTORY_CONTRACT,
+						...OUTLINE_SUBTREE_CONTRACT,
 						...OUTLINE_READ_CONTRACT,
 						...OUTLINE_DIGEST_CONTRACT,
 					]) {
@@ -275,6 +281,7 @@ describe("PostgreSQL outline store", () => {
 					OUTLINE_PENDING_CONTRACT.length +
 					OUTLINE_QUESTION_CONTRACT.length +
 					OUTLINE_HISTORY_CONTRACT.length +
+					OUTLINE_SUBTREE_CONTRACT.length +
 					OUTLINE_READ_CONTRACT.length +
 					OUTLINE_DIGEST_CONTRACT.length,
 			);
@@ -407,6 +414,17 @@ describe("PostgreSQL outline store", () => {
 								),
 							),
 							marks: await planOf(pgMarkAncestorsSql(["kid1", "kid2", "kid3"], 7, 4001)),
+							ancestryNow: await planOf(pgAncestryNow("kid1", 1000)),
+							ancestryAsOf: await planOf(pgAncestryAsOf("plan-space", "kid1", 3, 1000)),
+							ancestryOf: await planOf(pgAncestryOf("plan-space", ["kid1", "kid2", "kid3"], 4001)),
+							locked: await planOf(pgLockedOfSpace("plan-space", 501)),
+							ancestry: [
+								(await store.getAncestry("plan-space", "kid1", { asOf: null, maxDepth: 1000 }))
+									?.length,
+								(await store.getAncestry("plan-space", "kid1", { asOf: 3, maxDepth: 1000 }))
+									?.length,
+								(await store.listAncestryOf("plan-space", ["kid1", "kid2"], 100)).rows.length,
+							],
 							subtreeNow: (
 								await store.listSubtreeAt("plan-space", null, { asOf: null, limit: 800 })
 							).rows.length,
@@ -435,6 +453,29 @@ describe("PostgreSQL outline store", () => {
 			for (const node of up) {
 				expect(node["Node Type"]).toMatch(/^(Index (Only )?Scan|Bitmap Heap Scan)$/);
 				if (node["Index Name"]) expect(node["Index Name"]).toBe("outline_blocks_pkey");
+			}
+			// The walks up (one block now and as of a seq, many blocks at once): every step a
+			// probe by key, no table read whole. The locked tasks of a space: the lock index.
+			expect(outcome.ancestry).toEqual([2, 2, 4]);
+			for (const nodes of [outcome.ancestryNow, outcome.ancestryAsOf, outcome.ancestryOf]) {
+				const blocks = nodes.filter((n) => n["Relation Name"] === "outline_blocks");
+				expect(blocks.length).toBeGreaterThan(0);
+				for (const node of blocks) {
+					expect(node["Node Type"]).toMatch(/^(Index (Only )?Scan|Bitmap Heap Scan)$/);
+					if (node["Index Name"]) expect(node["Index Name"]).toBe("outline_blocks_pkey");
+				}
+				for (const node of nodes) expect(node["Node Type"]).not.toBe("Seq Scan");
+			}
+			expect(
+				outcome.ancestryAsOf
+					.filter((n) => n["Relation Name"] === "outline_block_edges")
+					.map((n) => n["Index Name"]),
+			).toEqual(["idx_outline_edges_block"]);
+			const lockedNodes = outcome.locked.filter((n) => n["Relation Name"] === "outline_blocks");
+			expect(lockedNodes.length).toBeGreaterThan(0);
+			for (const node of lockedNodes) {
+				expect(node["Node Type"]).not.toBe("Seq Scan");
+				expect(node["Index Name"]).toBe("idx_outline_blocks_locked");
 			}
 			// Now: the children index by parent, the blocks never scanned whole.
 			const nowBlocks = outcome.now.filter((n) => n["Relation Name"] === "outline_blocks");
@@ -509,6 +550,11 @@ interface PlanOutcome {
 	changedThere: PlanNode[];
 	changedLeft: PlanNode[];
 	marks: PlanNode[];
+	ancestryNow: PlanNode[];
+	ancestryAsOf: PlanNode[];
+	ancestryOf: PlanNode[];
+	locked: PlanNode[];
+	ancestry: Array<number | undefined>;
 	subtreeNow: number;
 	levelRows: number;
 	levelNext: boolean;

@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
 import type { ChatRoomKind } from "@shared/chat-room-kinds";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
+import type { OutlineCommitChanges } from "@shared/outline-block-events";
 import type { PublicationRun } from "../services/agent-runtime/publication-outbox";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import type { ApiRequestDiagnostics } from "./agent/types";
@@ -429,6 +430,15 @@ export type NarraForkEvent =
 			seq: number;
 			/** Pages whose blocks changed, including pages blocks moved out of. */
 			pageIds: string[];
+			/**
+			 * What the commit changed, by block (pageless outline, H2): the parents whose children
+			 * changed, the changed blocks and their ancestors, each list capped (`truncated`: treat
+			 * the whole space as changed). What block subscriptions are matched against
+			 * (`shared/outline-block-events.ts`); `pageIds` goes away with pages.
+			 * Optional only so events built without it (tests) still type-check: absent means
+			 * "unknown", which a listener treats like `truncated`.
+			 */
+			changes?: OutlineCommitChanges;
 			actorKind: "human" | "agent" | "system";
 			actorId: string;
 			/**

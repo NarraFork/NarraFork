@@ -647,8 +647,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// The SQLite side of `outline/store/history-port.ts`: cached raw statements for the reads by
 	// placement, typed with the driver's `Database` so the upgrade test can run the conversion
 	// against a database file of its own. The PostgreSQL store answers the same port
-	// (`postgres-history.ts`).
-	"server/services/outline/store/sqlite-history.ts": ["driver", "handle", "indexHint"],
+	// (`postgres-history.ts`). JSON1: whether a task is locked (`$.lock`), and the ids of a
+	// walk up from many blocks handed over as one JSON array (`json_each`).
+	"server/services/outline/store/sqlite-history.ts": ["driver", "handle", "indexHint", "json1"],
 	// The copy of the outline's tables before the placement conversion is of the SQLite file
 	// (its path is the connection's); PostgreSQL is backed up by whoever operates it.
 	"server/services/outline/history-backup.ts": ["driver", "handle", "sqliteCatalog"],

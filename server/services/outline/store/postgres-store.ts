@@ -420,11 +420,15 @@ async function markAncestors(
 	ids: readonly string[],
 	seq: number,
 	room: number,
+	marked: string[],
 ): Promise<number> {
 	let added = 0;
 	for (const chunk of chunked(ids)) {
-		const rows = await tx.execute(pgMarkAncestorsSql(chunk, seq, room - added + 1));
-		added += (rows as unknown as unknown[]).length;
+		const rows = (await tx.execute(
+			pgMarkAncestorsSql(chunk, seq, room - added + 1),
+		)) as unknown as Array<{ ancestor_id: string }>;
+		for (const row of rows) marked.push(row.ancestor_id);
+		added += rows.length;
 		if (added > room) break;
 	}
 	return added;
@@ -456,8 +460,11 @@ async function writePlacements(
 async function applyCommitSection(
 	tx: PgTransaction,
 	plan: OutlineCommitPlan,
+	/** Gets the ancestors the commit marked as changed (emptied first: the section may run again). */
+	marked: string[],
 ): Promise<"applied" | "stale" | "claims" | "pending"> {
 	const { seq } = plan;
+	marked.length = 0;
 	// The claims the plan read must still be as read (a lease renewed since may have made a
 	// takeover wrong). Their rows, and those it releases without checking (a person ending
 	// someone else's task), are locked first, in id order, so a renewal waits for this commit
@@ -499,7 +506,7 @@ async function applyCommitSection(
 
 	// Change marks, first half: the ancestors of the changed blocks as the tree was.
 	const maxMarks = OUTLINE_HISTORY_LIMITS.maxChangeMarks;
-	let marks = await markAncestors(tx, plan.closeVersionIds, seq, maxMarks);
+	let marks = await markAncestors(tx, plan.closeVersionIds, seq, maxMarks, marked);
 	if (marks > maxMarks) throw new OutlineChangeMarksLimitError(plan.spaceId);
 
 	let closed = 0;
@@ -560,6 +567,7 @@ async function applyCommitSection(
 		plan.versions.flatMap((group) => group.ids),
 		seq,
 		maxMarks - marks,
+		marked,
 	);
 	if (marks > maxMarks) throw new OutlineChangeMarksLimitError(plan.spaceId);
 	await writePlacements(tx, placedBlockIds(plan), seq);
@@ -1265,16 +1273,19 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 
 		async applyCommit(plan) {
 			let outcome: "applied" | "stale" | "claims" | "pending";
+			const marked: string[] = [];
 			try {
-				outcome = await withPgRetry(() => db.transaction((tx) => applyCommitSection(tx, plan)), {
-					label: "outline.applyCommit",
-				});
+				outcome = await withPgRetry(
+					() => db.transaction((tx) => applyCommitSection(tx, plan, marked)),
+					{ label: "outline.applyCommit" },
+				);
 			} catch (error) {
 				rethrowAsPortError(error);
 			}
 			if (outcome === "stale") throw new OutlineStaleWriteError(plan.spaceId, plan.seq);
 			if (outcome === "claims") throw new OutlineClaimsMovedError(plan.spaceId, plan.seq);
 			if (outcome === "pending") throw new OutlinePendingMovedError(plan.spaceId, plan.seq);
+			return { markedAncestorIds: marked };
 		},
 
 		async getPending(ids) {

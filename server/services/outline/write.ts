@@ -144,6 +144,7 @@ import {
 	serializeBody,
 	type TaskStatus,
 } from "@shared/outline";
+import { buildOutlineCommitChanges } from "@shared/outline-block-events";
 import {
 	OutlineBusyError,
 	OutlineClaimChangedError,
@@ -197,12 +198,14 @@ import {
 import { outlineStore } from "./store";
 import {
 	OUTLINE_HISTORY_LIMITS,
+	OUTLINE_PLACEMENT_FLAGS,
 	type OutlineBlockMeta,
 	type OutlineBlockPatch,
 	type OutlineBlockRow,
 	OutlineChangeMarksLimitError,
 	type OutlineClaimPlan,
 	type OutlineClaimWrite,
+	type OutlineCommitApplied,
 	type OutlineCommitPlan,
 	type OutlineLinkRow,
 	type OutlinePendingDecision,
@@ -1156,6 +1159,13 @@ const listKey = (parentId: string | null) => parentId ?? PAGES;
 interface Planned {
 	plan: OutlineCommitPlan;
 	pageIds: string[];
+	/**
+	 * What the commit changes by block, as the plan knows it: the parent keys (a block's id, or
+	 * the space's for the top level) of the levels that read differently after it
+	 * (`OutlineCommitChanges.parentKeys`), and the blocks that get a version. The store adds the
+	 * ancestors (`applyCommit`'s result).
+	 */
+	changes: { parentKeys: string[]; blockIds: string[] };
 	/** Pages whose pending changes the commit decides or withdraws. */
 	pendingPageIds: string[];
 }
@@ -2785,6 +2795,10 @@ class OutlinePlanner {
 		const closeLinkIds: string[] = [];
 		const insertLinks: OutlineLinkRow[] = [];
 		const pageIds = new Set<string>();
+		const parentKeys = new Set<string>();
+		/** Parents (blocks) whose list of children this commit changes. */
+		const placedParents = new Set<string>();
+		const changedIds: string[] = [];
 
 		for (const block of all) {
 			const linkChange = this.linkChanges(block, openLinks.get(block.id) ?? []);
@@ -2811,6 +2825,14 @@ class OutlinePlanner {
 				});
 			}
 			pageIds.add(block.pageId);
+			changedIds.push(block.id);
+			const placed = (flags & OUTLINE_PLACEMENT_FLAGS) !== 0;
+			for (const parentId of block.base === null
+				? [block.parentId]
+				: [block.parentId, block.base.parentId]) {
+				parentKeys.add(parentId ?? this.space.id);
+				if (placed && parentId !== null) placedParents.add(parentId);
+			}
 
 			if (block.base === null) {
 				insertBlocks.push(this.newRow(block, seq));
@@ -2823,6 +2845,26 @@ class OutlinePlanner {
 			const group = patches.get(key);
 			if (group) group.ids.push(block.id);
 			else patches.set(key, { ids: [block.id], patch });
+		}
+
+		// A parent that gains its first child or loses its last reads differently in ITS parent's
+		// level (a row says whether it has children): that level is named too. Whether the answer
+		// really flips is not known here without counting siblings, so it is named whenever the
+		// list of children changes.
+		const unknownParents: string[] = [];
+		for (const parentId of placedParents) {
+			const parent = this.blocks.get(parentId);
+			if (!parent) unknownParents.push(parentId);
+			else {
+				parentKeys.add(parent.parentId ?? this.space.id);
+				if (parent.base) parentKeys.add(parent.base.parentId ?? this.space.id);
+			}
+		}
+		// A parent the plan never loaded (a block moved or deleted away from it): one read by
+		// primary key, without adding it to the working copy.
+		if (unknownParents.length > 0) {
+			for (const meta of await this.store.getBlockMetasByIds(unknownParents))
+				if (meta.spaceId === this.space.id) parentKeys.add(meta.parentId ?? this.space.id);
 		}
 
 		const versionedIds = new Set([...closeVersionIds, ...insertBlocks.map((b) => b.id)]);
@@ -2917,6 +2959,10 @@ class OutlinePlanner {
 				...(questions.length > 0 ? { questions } : {}),
 			},
 			pageIds: [...pageIds],
+			changes: {
+				parentKeys: [...parentKeys],
+				blockIds: changedIds,
+			},
 		};
 	}
 
@@ -3831,8 +3877,9 @@ async function writePrepared(
 			};
 		}
 		if (hold) planned.plan.pending = { ...planned.plan.pending, put: hold.put };
+		let applied: OutlineCommitApplied | undefined;
 		try {
-			await store.applyCommit(planned.plan);
+			applied = await store.applyCommit(planned.plan);
 		} catch (error) {
 			if (error instanceof OutlineStaleWriteError) continue;
 			if (isStalePending(error)) continue;
@@ -3863,6 +3910,15 @@ async function writePrepared(
 			commitId: commit.id,
 			seq: commit.seq,
 			pageIds: planned.pageIds,
+			// A store that reports no ancestors (a test double) leaves the changes unknown.
+			...(applied?.markedAncestorIds
+				? {
+						changes: buildOutlineCommitChanges({
+							...planned.changes,
+							ancestorIds: applied.markedAncestorIds,
+						}),
+					}
+				: {}),
 			actorKind: commit.actorKind,
 			actorId: commit.actorId,
 			// An agent's write names its session even when the caller left `narratorId` out.
