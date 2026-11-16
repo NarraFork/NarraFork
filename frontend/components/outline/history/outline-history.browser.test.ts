@@ -326,7 +326,8 @@ test("the timeline of a block's subtree is paged; a point shows the forest as of
 	expect(await call(page, (f) => f.clickTestId("outline-history-now"))).toBe(true);
 	await until(page, "now again", (f) => f.bar() === null);
 	await until(page, "the subtree now", hasRow, "Delta 54");
-	expect((await call(page, (f) => f.navigated())).at(-1)?.asOf).toBeUndefined();
+	const back = (await call(page, (f) => f.navigated())).at(-1);
+	expect(back?.kind === "block" ? back.asOf : "not a block").toBeUndefined();
 	await page.browserContext().close();
 }, 120_000);
 

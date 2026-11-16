@@ -80,16 +80,20 @@ export function OutlineRestoreModal({
 	const queryClient = useQueryClient();
 	// One run per opening: a new preview each time the dialog opens.
 	const [nonce, setNonce] = useState(0);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: a new opening is a new run
-	const run = useMemo(
-		() => (opened ? new RestoreRun(io ?? restoreIO(spaceId), rootId, thenSeq) : null),
-		[opened, nonce, spaceId, rootId, thenSeq, io],
-	);
+	// Made in the effect (not during render), so that a mount run twice (React's strict mode)
+	// disposes the first run and previews with a live second one.
+	const [run, setRun] = useState<RestoreRun | null>(null);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a new nonce is a new run
 	useEffect(() => {
-		if (!run) return;
-		void run.preview();
-		return () => run.dispose();
-	}, [run]);
+		if (!opened) {
+			setRun(null);
+			return;
+		}
+		const made = new RestoreRun(io ?? restoreIO(spaceId), rootId, thenSeq);
+		setRun(made);
+		void made.preview();
+		return () => made.dispose();
+	}, [opened, nonce, spaceId, rootId, thenSeq, io]);
 	const state = useSyncExternalStore(
 		run?.subscribe ?? noSubscribe,
 		run?.getState ?? noState,
