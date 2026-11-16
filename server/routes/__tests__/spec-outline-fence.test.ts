@@ -84,12 +84,12 @@ describe("the Spec panel's fence tab", () => {
 		const before = await (await app.request(`/${id}/spec/files`)).json();
 		const fence = before.files.find((f: { path: string }) => f.path === "behavior_fence");
 		expect(fence).toMatchObject({ uiEditable: false, readonly: true });
-		expect(before.outlineBehavior).toEqual({ spaceId: null, pageId: null });
+		expect(before.outlineBehavior).toEqual({ spaceId: null, blockId: null });
 
 		const pageId = await seedBehaviorPage(id, "Never force-push.");
 		const space = await ensureSessionSpace(id);
 		const after = await (await app.request(`/${id}/spec/files`)).json();
-		expect(after.outlineBehavior).toEqual({ spaceId: space.id, pageId });
+		expect(after.outlineBehavior).toEqual({ spaceId: space.id, blockId: pageId });
 		const file = await (await app.request(`/${id}/spec/file?uri=${fenceUri}`)).json();
 		expect(file).toMatchObject({ path: "behavior_fence", uiEditable: false });
 

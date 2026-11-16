@@ -14,26 +14,26 @@ export const specRoutes = new Hono();
 
 /**
  * Where an outline session's behavior boundary lives (outline plan PR 4): its session space and
- * the behavior page in it, either null until it exists. Null for a spec session. In an outline
- * session the old `behavior_fence` is the plugins' SOP channel only, so the Spec panel shows it
- * read-only and offers to open the page instead.
+ * the behavior boundary block in it (`session/behavior`), either null until it exists. Null for a
+ * spec session. In an outline session the old `behavior_fence` is the plugins' SOP channel only,
+ * so the Spec panel shows it read-only and offers to open the boundary instead.
  */
 async function outlineBehaviorOf(
 	narratorId: string,
-): Promise<{ spaceId: string | null; pageId: string | null } | null> {
+): Promise<{ spaceId: string | null; blockId: string | null } | null> {
 	if ((await readTaskBackend(narratorId)) !== "outline") return null;
 	const { findSessionSpace } = await import("../services/outline/spaces");
 	const { findBehaviorBlock } = await import("../services/task-source/outline-behavior");
 	const space = await findSessionSpace(narratorId);
-	const page = space ? await findBehaviorBlock(space.id) : null;
-	return { spaceId: space?.id ?? null, pageId: page?.id ?? null };
+	const boundary = space ? await findBehaviorBlock(space.id) : null;
+	return { spaceId: space?.id ?? null, blockId: boundary?.id ?? null };
 }
 
 /**
- * True for an outline session with a behavior page while the outline is switched off: it runs as
- * a spec session (its fence editable as before), but the page's rules are still put in front of
- * the agent with the fence (`spec-reminder.ts`). The panel says so, so nobody copies them into the
- * fence, from where the import would move them to the page a second time.
+ * True for an outline session with a behavior boundary while the outline is switched off: it runs
+ * as a spec session (its fence editable as before), but the boundary's rules are still put in
+ * front of the agent with the fence (`spec-reminder.ts`). The panel says so, so nobody copies them
+ * into the fence, from where the import would move them under the boundary a second time.
  */
 async function outlineSwitchedOff(narratorId: string): Promise<boolean> {
 	if (isOutlineEnabled()) return false;

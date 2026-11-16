@@ -625,8 +625,8 @@ function BackToBoard({ onClick }: { onClick: () => void }) {
 /**
  * The read-only line over the old Spec files of a session the import moved into the outline
  * (outline P2 PR 12b2): they are kept, read-only and no longer updated, and a link opens the
- * session's task page (beside the session when the host has an outline dock, else on the outline
- * page). A session created in the outline has no such line (nothing was moved).
+ * session's task list (beside the session when the host has an outline dock, else in the outline
+ * view). A session created in the outline has no such line (nothing was moved).
  */
 function SpecMovedNotice({ narratorId }: { narratorId: string }) {
 	const { t } = useTranslation("narrator");
@@ -634,10 +634,10 @@ function SpecMovedNotice({ narratorId }: { narratorId: string }) {
 	const { data } = useSpecImportStatus(narratorId);
 	if (!data?.switchedAt || data.state === "reverted") return null;
 	const spaceId = data.spaceId;
-	const pageId = data.taskPageId;
+	const listId = data.taskBlockId;
 	const href = spaceId
 		? outlineTargetHref(
-				pageId ? { kind: "block", spaceId, blockId: pageId } : { kind: "space", spaceId },
+				listId ? { kind: "block", spaceId, blockId: listId } : { kind: "space", spaceId },
 			)
 		: null;
 	return (
@@ -672,7 +672,7 @@ function SpecMovedNotice({ narratorId }: { narratorId: string }) {
 								if (!opener || !isOpenClick(event)) return;
 								// A host that cannot show a panel right now leaves the link to navigate.
 								const opened = opener.open(
-									pageId ? { spaceId, blockId: pageId, pageId } : { spaceId },
+									listId ? { spaceId, blockId: listId } : { spaceId },
 									{ newPanel: wantsNewPanel(event) },
 								);
 								if (opened) event.preventDefault();
@@ -688,10 +688,10 @@ function SpecMovedNotice({ narratorId }: { narratorId: string }) {
 }
 
 /**
- * The fence tab of a session whose tasks live in the outline: its behavior boundary is the
- * behavior page of its session space (outline plan PR 4), so the old fence is shown read-only (it
- * only carries plugin SOP) under a note that opens the page in the outline, beside the session
- * when the host has an outline dock, else on the outline page.
+ * The fence tab of a session whose tasks live in the outline: its behavior boundary is the block
+ * `session/behavior` of its session space (outline plan PR 4), so the old fence is shown
+ * read-only (it only carries plugin SOP) under a note that opens the boundary in the outline,
+ * beside the session when the host has an outline dock, else in the outline view.
  */
 function OutlineFenceNotice({ behavior }: { behavior: SpecOutlineBehavior }) {
 	const { t } = useTranslation("narrator");
@@ -699,8 +699,8 @@ function OutlineFenceNotice({ behavior }: { behavior: SpecOutlineBehavior }) {
 	const spaceId = behavior.spaceId;
 	const href = spaceId
 		? outlineTargetHref(
-				behavior.pageId
-					? { kind: "block", spaceId, blockId: behavior.pageId }
+				behavior.blockId
+					? { kind: "block", spaceId, blockId: behavior.blockId }
 					: { kind: "space", spaceId },
 			)
 		: null;
@@ -729,9 +729,7 @@ function OutlineFenceNotice({ behavior }: { behavior: SpecOutlineBehavior }) {
 							if (!opener || !isOpenClick(event)) return;
 							// A host that cannot show a panel right now leaves the link to navigate.
 							const opened = opener.open(
-								behavior.pageId
-									? { spaceId, blockId: behavior.pageId, pageId: behavior.pageId }
-									: { spaceId },
+								behavior.blockId ? { spaceId, blockId: behavior.blockId } : { spaceId },
 								{ newPanel: wantsNewPanel(event) },
 							);
 							if (opened) event.preventDefault();
@@ -747,7 +745,7 @@ function OutlineFenceNotice({ behavior }: { behavior: SpecOutlineBehavior }) {
 
 /**
  * The fence tab of an outline session while the outline is switched off: it runs on Dynamic Spec
- * and its fence is editable, but the rules on its behavior page still apply (they are shown to
+ * and its fence is editable, but the rules under its behavior boundary still apply (they are shown to
  * the agent with this file). One line says so, so nobody copies them here, from where turning the
  * outline back on would import them a second time.
  */

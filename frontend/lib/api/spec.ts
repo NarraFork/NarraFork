@@ -49,12 +49,12 @@ export interface SpecWriteResult {
 }
 
 /**
- * Where an outline session's behavior boundary lives: its session space and the behavior page in
+ * Where an outline session's behavior boundary lives: its session space and the boundary block in
  * it (either null until it exists). Its old `behavior_fence` only carries plugin SOP, read-only.
  */
 export interface SpecOutlineBehavior {
 	spaceId: string | null;
-	pageId: string | null;
+	blockId: string | null;
 }
 
 export interface SpecFilesResponse {

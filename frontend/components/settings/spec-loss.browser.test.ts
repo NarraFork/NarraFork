@@ -226,10 +226,10 @@ test("the admin section: the scan, the findings a page at a time, why not attach
 		);
 		// Of the imported session, two were left out, each with its reason.
 		expect(await text(page, '[data-finding="f030"] [data-testid="spec-loss-why"]')).toBe(
-			en.why.no_page,
+			en.why.no_block,
 		);
 		const row = '[data-finding="f027"]';
-		expect(await text(page, `${row} [data-testid="spec-loss-why"]`)).toBe(en.why.page_cap);
+		expect(await text(page, `${row} [data-testid="spec-loss-why"]`)).toBe(en.why.block_cap);
 
 		// Its lost content, on demand.
 		await page.click(`${row} [data-testid="spec-loss-view"]`);
@@ -445,7 +445,7 @@ test("what no pass attaches: the behavior page asks with its own warning; other 
 		const listed = '[data-finding="f902"]';
 		await page.waitForSelector(rule);
 		// Each says why it is only listed.
-		expect(await text(page, `${rule} [data-testid="spec-loss-why"]`)).toBe(strings.why.rule_page);
+		expect(await text(page, `${rule} [data-testid="spec-loss-why"]`)).toBe(strings.why.rule_block);
 		expect(await text(page, `${listed} [data-testid="spec-loss-why"]`)).toBe(strings.why.list_only);
 		expect(await text(page, `${rule} [data-testid="spec-loss-path"]`)).toBe("behavior_fence");
 		await noSidewaysScroll(page);

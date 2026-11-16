@@ -19,9 +19,9 @@ const LOCALES = new URL("../../locales/", import.meta.url).pathname;
 
 /** Outline strings outside `outline.json` that do not name the outline themselves. */
 const OUTLINE_SURFACES: Record<string, string[]> = {
-	"narrator.json": ["spec.loss.*", "spec.outline*"],
+	"narrator.json": ["spec.loss.*", "spec.outline*", "spec.specImport*"],
 	"narrators.json": ["workspaceAddOutline"],
-	"errors.json": ["SPEC_MOVED_TO_OUTLINE", "OUTLINE_*"],
+	"errors.json": ["SPEC_MOVED_TO_OUTLINE", "SPEC_LOSS_*", "SPEC_IMPORT_*", "OUTLINE_*"],
 	"settings.json": ["specImportAdmin*", "outline*"],
 };
 
@@ -46,11 +46,6 @@ const NOT_MIGRATED: Record<string, string> = {
 	"side.change.page": "X1 (a move is a move: the change kind goes away)",
 	// Handing a task out names the project's task list.
 	"board.handOut.*": "A2 (the task list is a block with an alias)",
-	// Dynamic Spec import into the outline: its pages (tasks, notes, behavior boundary).
-	"narrator.json:spec.loss.*": "A3 (spec import: the imported file is a top-level block)",
-	"narrator.json:spec.outlineFence*": "A3 (the fence: the behavior boundary is a block)",
-	"errors.json:SPEC_MOVED_TO_OUTLINE": "A3 (spec import)",
-	"settings.json:specImportAdmin*": "A3 (spec import, admin)",
 };
 
 type Strings = Record<string, string>;

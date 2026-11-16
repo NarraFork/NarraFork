@@ -39,7 +39,7 @@ const base: OutlineSpecImportStatus = {
 	attempts: 0,
 	switchedAt: null,
 	spaceId: null,
-	taskPageId: null,
+	taskBlockId: null,
 	revertedAt: null,
 };
 
