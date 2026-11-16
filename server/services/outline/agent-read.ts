@@ -535,7 +535,7 @@ async function overviewAnswer(
 	}> = [];
 	let processHidden = 0;
 	let truncated = cut !== null;
-	for (const [i, { space, word }] of spaces.entries()) {
+	for (const { space, word } of spaces) {
 		// Every space's read is a stretch of the main thread of its own.
 		await yieldToEventLoop();
 		const own = scope.isOwnSpace(space);
