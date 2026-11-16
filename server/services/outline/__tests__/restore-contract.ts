@@ -592,11 +592,8 @@ async function restoreAndCheck(
 	expect(after.space.nextSeq - 1 - pin).toBe(ran.commits.length);
 
 	// Confirming again applies nothing twice.
-	const again = await restoreOutlineSubtree(
-		{ ...WRITER, space, token: preview.token },
-		{ store: ctx.store },
-	);
-	expect(again.done).toBe(true);
+	// (A walk of a large subtree may take more than one call to find that out.)
+	const again = await runRestore(ctx, space, preview.token);
 	expect(again.commits).toEqual([]);
 	return { ran, preview, pin };
 }
