@@ -44,8 +44,6 @@ const NOT_MIGRATED: Record<string, string> = {
 	"page.asOfBanner": "F2",
 	"side.viewAt": "F2",
 	"side.change.page": "X1 (a move is a move: the change kind goes away)",
-	// Handing a task out names the project's task list.
-	"board.handOut.*": "A2 (the task list is a block with an alias)",
 	// Dynamic Spec import into the outline: its pages (tasks, notes, behavior boundary).
 	"narrator.json:spec.loss.*": "A3 (spec import: the imported file is a top-level block)",
 	"narrator.json:spec.outlineFence*": "A3 (the fence: the behavior boundary is a block)",
