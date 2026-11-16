@@ -1,11 +1,11 @@
 import { notifications } from "@mantine/notifications";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { Mutate } from "./mutate";
 
 export interface UseInterruptLongPressOptions {
 	narratorId: string;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useInterruptNarrator.
-	interruptMutation: any;
+	interruptMutation: Mutate<{ id: string; waitForIdle?: boolean }>;
 	/** narrator translation fn (namespace "narrator"). */
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }

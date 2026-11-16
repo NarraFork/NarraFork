@@ -2,6 +2,7 @@ import type React from "react";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FastModeControl } from "./FastModeControl";
+import type { Mutate } from "./mutate";
 
 type FastModeOverride = "inherit" | "on" | "off";
 
@@ -13,10 +14,8 @@ export interface UseFastModeControlOptions {
 	fastModeDefault: boolean;
 	/** Coarse-pointer / mobile viewports open settings by long-press, not hover. */
 	fastModeUsesTapSettings: boolean;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateFastMode.
-	fastModeMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateUserPreferences.
-	updateUserPrefs: any;
+	fastModeMutation: Mutate<{ id: string; fastModeOverride: "inherit" | "on" | "off" }>;
+	updateUserPrefs: Mutate<{ fastModeDefault: boolean }>;
 	/** narrator translation fn (namespace "narrator"). */
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }
