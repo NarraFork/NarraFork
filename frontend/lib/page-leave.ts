@@ -38,3 +38,28 @@ export function onPageLeave(flush: () => void): () => void {
 		flushers.delete(flush);
 	};
 }
+
+const holds = new Set<symbol>();
+
+function askBeforeLeaving(event: BeforeUnloadEvent): void {
+	event.preventDefault();
+	// Older browsers show the prompt only when a value is set.
+	event.returnValue = "";
+}
+
+/**
+ * Ask before the page goes away while something must not be cut short (an outline restore
+ * running call after call): the browser's own "leave this page?" prompt, while any hold is
+ * held. Returns the release.
+ */
+export function holdPageLeave(): () => void {
+	const hold = Symbol("hold");
+	if (holds.size === 0 && typeof window !== "undefined")
+		window.addEventListener("beforeunload", askBeforeLeaving);
+	holds.add(hold);
+	return () => {
+		if (!holds.delete(hold)) return;
+		if (holds.size === 0 && typeof window !== "undefined")
+			window.removeEventListener("beforeunload", askBeforeLeaving);
+	};
+}

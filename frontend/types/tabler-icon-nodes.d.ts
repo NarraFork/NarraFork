@@ -60,3 +60,23 @@ declare module "@tabler/icons-react/dist/esm/icons/IconFoldDown.mjs" {
 declare module "@tabler/icons-react/dist/esm/icons/IconFoldUp.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }
+
+declare module "@tabler/icons-react/dist/esm/icons/IconLogin2.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconLogout2.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconMinus.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconPencil.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconPlus.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}

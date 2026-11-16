@@ -17,6 +17,7 @@ import { Anchor, Badge, Loader, Paper, Popover, Stack, Text, Tooltip } from "@ma
 import { blockTitle } from "@shared/outline";
 import type { OutlineQuestionMark, OutlineTaskStatus, OutlineViewMode } from "@shared/outline-api";
 import { isOutlineReportBlockId } from "@shared/outline-report-line";
+import type { OutlineDiffKind } from "@shared/outline-restore-api";
 import type {
 	OutlineOpenTaskItem,
 	OutlineSubtreeMarks,
@@ -42,6 +43,7 @@ import { outlineBlockWatch } from "../../../lib/outline-block-watch";
 import { reportLineDisplay } from "../../../lib/outline-report-line";
 import { onPageLeave } from "../../../lib/page-leave";
 import { ownKeys, plainClick, spokenLabel } from "../fold-controls";
+import { OutlineDiffMark } from "../history/HistoryParts";
 import classes from "../Outline.module.css";
 import { OutlineBlockBody } from "../OutlineBlockBody";
 import { OutlineQuestionsForm } from "../OutlineQuestions";
@@ -146,6 +148,8 @@ interface RowViewProps {
 	openTasks: number;
 	processHidden: number;
 	changed: "self" | "below" | "both" | "";
+	/** What a comparison from this point says happened to it since (a view as of a commit). */
+	diff: OutlineDiffKind | null;
 	located: boolean;
 	onToggle: (id: string, inside: boolean, open: boolean) => void;
 	onQuestions: (id: string) => void;
@@ -171,6 +175,7 @@ const BlockRowView = memo(function BlockRowView({
 	openTasks,
 	processHidden,
 	changed,
+	diff,
 	located,
 	onToggle,
 	onQuestions,
@@ -274,6 +279,7 @@ const BlockRowView = memo(function BlockRowView({
 				data-fold={row.hasChildren ? (row.open ? "open" : "closed") : undefined}
 				data-located={located ? "" : undefined}
 				data-pinned={row.pinned || undefined}
+				data-diff={diff ?? undefined}
 			>
 				<span className={classes.indent} style={{ width: indent }} />
 				<span className={classes.toggle}>
@@ -315,6 +321,12 @@ const BlockRowView = memo(function BlockRowView({
 				{marker === "task" && block.task && <OutlineTaskIcon status={block.task.status} />}
 				{marker === "question" && block.question && (
 					<OutlineQuestionIcon state={block.question.state} proceed={block.question.proceed} />
+				)}
+				{/* What happened to it since (a view as of a commit, compared): inline, before its text. */}
+				{diff && (
+					<span className={classes.diffSlot}>
+						<OutlineDiffMark kind={diff} label={t(`diff.mark.${diff}`)} />
+					</span>
 				)}
 				{/* biome-ignore lint/a11y/noStaticElementInteractions: a second way into editing; the visible control is the host's */}
 				<div
@@ -765,6 +777,11 @@ export interface ForestBlocksProps {
 	io?: ForestIO;
 	/** Watch the space's changes (default true; false in a hidden panel). */
 	live?: boolean;
+	/**
+	 * Blocks a comparison from `asOf` names (a view as of a commit): each row says what happened
+	 * to its block since (deleted, moved away, changed).
+	 */
+	diffMarks?: ReadonlyMap<string, OutlineDiffKind>;
 }
 
 /**
@@ -837,7 +854,7 @@ const noSubscribe = () => () => {};
 const zero = () => 0;
 
 export function ForestBlocks(props: ForestBlocksProps) {
-	const { spaceId, view, asOf, indent, locate, onLocated, onEdit, onForest } = props;
+	const { spaceId, view, asOf, indent, locate, onLocated, onEdit, onForest, diffMarks } = props;
 	const { t } = useTranslation("outline");
 	const { forest, paused, resume } = useForest(props);
 	useEffect(() => {
@@ -1018,6 +1035,7 @@ export function ForestBlocks(props: ForestBlocksProps) {
 					openTasks={marks ? marks.tasks.todo + marks.tasks.doing : 0}
 					processHidden={row.open ? (forest.levelOf(row.id)?.processHidden ?? 0) : 0}
 					changed={changedOf(marks, closed)}
+					diff={diffMarks?.get(row.id) ?? null}
 					located={located === row.id}
 					onToggle={onToggle}
 					onQuestions={onQuestions}

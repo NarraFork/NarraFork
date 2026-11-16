@@ -67,7 +67,6 @@
 		},
 		"viewLabel": "显示范围",
 		"sidePanel": "反链与历史",
-		"asOfBanner": "正在查看提交 #{{seq}} 时的页面（只读）。",
 		"backToCurrent": "回到现在",
 		"processHidden_one": "任务下的 {{count}} 个块没有显示。",
 		"processHidden_other": "任务下的 {{count}} 个块没有显示。",
@@ -80,25 +79,12 @@
 		"noBacklinks": "没有链接到这里的内容。",
 		"backlinksTruncated_one": "只显示前 {{count}} 条。",
 		"backlinksTruncated_other": "只显示前 {{count}} 条。",
-		"noHistory": "没有历史。",
 		"linkKind": {
 			"link": "链接",
 			"embed": "嵌入",
 			"depends": "前置",
 			"tag": "标签"
-		},
-		"change": {
-			"create": "创建",
-			"content": "修改",
-			"move": "移动",
-			"delete": "删除",
-			"restore": "恢复",
-			"task": "任务",
-			"page": "换页",
-			"props": "别名或标签",
-			"merge": "合并"
-		},
-		"viewAt": "查看提交 #{{seq}} 时的页面"
+		}
 	},
 	"timeline": {
 		"label": "时间轴",
@@ -141,7 +127,10 @@
 			"cycle": "恢复后会挂到自己下面"
 		},
 		"openSession": "打开写入它的会话",
-		"sessionUnavailable": "你无法打开写入它的会话。"
+		"sessionUnavailable": "你无法打开写入它的会话。",
+		"floor": "更早的历史没有保留。",
+		"view": "查看 #{{seq}} 时的样子",
+		"unavailable": "这里的历史暂时读不到：还在准备中。"
 	},
 	"editor": {
 		"questionMark": "打开提问即可回答；删除即撤回。",
@@ -775,5 +764,131 @@
 		"reportAllParts_other": "展开全文（{{count}} 节）▸",
 		"reportAllPartsAtLeast_one": "展开全文（{{count}}+ 节）▸",
 		"reportAllPartsAtLeast_other": "展开全文（{{count}}+ 节）▸"
+	},
+	"asOf": {
+		"banner": "正在查看历史：#{{seq}} 时的样子",
+		"readOnly": "只读",
+		"backToNow": "回到现在",
+		"compare": "比较变化",
+		"hideCompare": "收起变化",
+		"restore": "恢复到这个时刻…",
+		"readOnlyHint": "你可以查看和比较，但你不能修改这个空间，所以不能恢复。",
+		"open": "历史",
+		"openHint": "查看这个空间之前某个时刻的样子",
+		"close": "关闭历史",
+		"pick": "在时间轴上选一个时刻，查看整个空间当时的样子。"
+	},
+	"diff": {
+		"titleNow": "#{{from}} 到现在的变化",
+		"titleTo": "#{{from}} 到 #{{to}} 的变化",
+		"compareWith": "比较到",
+		"now": "现在",
+		"empty": "这里没有变化。",
+		"more": "显示更多变化",
+		"untitled": "（空）",
+		"then": "当时",
+		"after": "之后",
+		"kind": {
+			"added": "新增",
+			"removed": "删除",
+			"moved-in": "移入",
+			"moved-away": "移走",
+			"changed": "改动"
+		},
+		"movedAwayDeleted": "移走后被删除",
+		"field": {
+			"parent": "位置",
+			"order": "顺序",
+			"text": "文字",
+			"task": "任务",
+			"question": "提问",
+			"alias": "别名",
+			"tags": "标签"
+		},
+		"fields": "改了：{{fields}}",
+		"mark": {
+			"removed": "这个时刻之后被删除",
+			"moved-away": "这个时刻之后被移走",
+			"changed": "这个时刻之后有改动"
+		}
+	},
+	"restore": {
+		"title": "恢复到 #{{seq}}",
+		"intro": "只动 #{{seq}} 时在这里的内容：之后新增的块会被删除，之后移进来的块会移回原处，文字和顺序会改回。之后移走的块不会被拉回，只在最后列出，每个都可以单独「移回」。",
+		"loading": "正在计算会改动什么…",
+		"nothing": "这里和 #{{seq}} 时没有区别。",
+		"group": {
+			"delete": "删除（之后新增的）",
+			"restore": "恢复（之后被删除的）",
+			"move-out": "移回原处（之后移进来的）",
+			"put-back": "改回（文字、顺序或属性）",
+			"kept": "保持不变",
+			"moved-away": "之后移走的：不拉回"
+		},
+		"unlessHolds": "除非到时它下面还有移不走的块",
+		"carries_one": "下面的 {{count}} 个块跟着走",
+		"carries_other": "下面的 {{count}} 个块跟着走",
+		"carriesMore_one": "下面的 {{count}}+ 个块跟着走",
+		"carriesMore_other": "下面的 {{count}}+ 个块跟着走",
+		"staysPut": "文字和属性改回，位置不动",
+		"deletedSince": "之后被删除",
+		"moveBack": "移回",
+		"movedBack": "已移回",
+		"movedBackRestored": "已恢复并移回",
+		"cannotMoveBack": "原来的位置已经不在了",
+		"refreshed": "移回之后，清单已重新计算。",
+		"listIncomplete": "已列出 {{count}} 项改动，清单还没完。恢复之前请先看完整个清单：恢复会改动清单上的全部内容。",
+		"confirm": "恢复",
+		"cancel": "取消",
+		"running": "正在恢复… 已改动 {{changed}} 个块",
+		"stop": "停止",
+		"stopped": "已停止。已经恢复的部分保留；可以继续完成。",
+		"continue": "继续",
+		"done": "已恢复到 #{{seq}}。",
+		"summary": "改动的块：{{changed}} · 提交：{{commits}}",
+		"doneNothing": "没有需要改动的内容。",
+		"pendingHeld": "等待确认：{{label}}",
+		"skippedTitle": "保持不变（{{count}}）",
+		"skippedMore": "保持不变的块比这里列出的更多。",
+		"movedAwayTitle": "之后移走的（{{count}}）：不拉回",
+		"skip": {
+			"parent-moved-away": "它原来所在的块已经移出这里，所以它留在原处",
+			"parent-gone": "它原来所在的块已被删除",
+			"holds-kept": "它下面还有要保留的块，所以没有删除它",
+			"refused": "这个改动被拒绝（会挂到自己下面，或受限额、认领的限制）",
+			"parent-refused": "它要回到的那个块的改动被拒绝了",
+			"lock-kept": "别人锁定了它",
+			"place-taken": "它原来的位置或别名已被占用"
+		},
+		"close": "关闭",
+		"previewAgain": "重新预览",
+		"retry": "重试",
+		"problem": {
+			"conflict": "预览之后有人改动了这里（提交 #{{seq}}），没有再写入任何内容。请重新预览，查看现在的清单。",
+			"conflictNoSeq": "预览之后有人改动了这里，没有再写入任何内容。请重新预览，查看现在的清单。",
+			"expired": "预览已超过 30 分钟，请重新预览。",
+			"person": "这个预览是别人做的，请自己预览。",
+			"token": "预览已失效，请重新预览。",
+			"not-ready": "这里的历史还在准备中，请稍后再试。",
+			"before-floor": "#{{seq}} 之前的历史没有保留，请选一个更晚的时刻。",
+			"root": "那个时刻这个块不在大纲里。",
+			"parent-gone": "它原来所在的块现在已被删除，请先恢复那个块。",
+			"forbidden": "你可以查看这个空间，但不能修改。",
+			"missing": "找不到这个位置。",
+			"conflictOwn": "预览之后你自己的「移回」（提交 #{{seq}}）改动了这里，没有再写入任何内容。请重新预览，按现在的清单继续。"
+		},
+		"partial": "已经恢复了一部分：改动了 {{changed}} 个块。",
+		"titleSpace": "把整个空间恢复到 #{{seq}}",
+		"introSpace": "#{{seq}} 时在这个空间里的内容都会改回：之后在空间任何地方新增的块会被删除，被删除的会恢复，文字和顺序会改回。这会动整个空间，不只是一个块。",
+		"doneSpace": "整个空间已恢复到 #{{seq}}。",
+		"earlier": "这次预览之前已经恢复了 {{changed}} 个块（保持恢复后的样子）。",
+		"wholeList": "显示完整清单",
+		"spaceSure": "这会改动整个空间里的 {{count}} 个块（{{groups}}）。确定恢复整个空间吗？",
+		"confirmSpace": "恢复整个空间…",
+		"confirmSpaceSure": "确定，恢复整个空间",
+		"waitMoveBack": "等移回完成",
+		"blockUnreadable": "一个已无法读取的块",
+		"skippedUnnamed_one": "……还有 {{count}} 个块保持不变。",
+		"skippedUnnamed_other": "……还有 {{count}} 个块保持不变。"
 	}
 }
