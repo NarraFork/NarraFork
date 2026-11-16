@@ -3,7 +3,7 @@
  * AND PENDING CONFIRMATION), turned into the `outline_pending` row the write puts: a new row, or
  * the proposal merged into the open change the writer's session already has on the same locked
  * tree (one per session and tree, builder decision 5). Reads: the writer's session, its open row
- * on the tree (whole: it is merged into), and for a new row how many the page has open (a
+ * on the tree (whole: it is merged into), and for a new row how many the space has open (a
  * bounded count), all indexed.
  */
 import { OutlineWriteError } from "./errors";
@@ -169,13 +169,10 @@ export async function buildPendingPut(args: {
 		: null;
 	const existing = session ? await store.findOpenPending(session, tree.rootId) : null;
 	if (!existing) {
-		const open = await store.countOpenPendingByPage(
-			tree.pageId,
-			OUTLINE_PENDING_LIMITS.openPerPage,
-		);
-		if (open >= OUTLINE_PENDING_LIMITS.openPerPage) {
+		const open = await store.countOpenPendingBySpace(space.id, OUTLINE_PENDING_LIMITS.openPerSpace);
+		if (open >= OUTLINE_PENDING_LIMITS.openPerSpace) {
 			throw new OutlineWriteError(
-				OUTLINE_TEXT.pendingFull(OUTLINE_PENDING_LIMITS.openPerPage),
+				OUTLINE_TEXT.pendingFull(OUTLINE_PENDING_LIMITS.openPerSpace),
 				"OUTLINE_PENDING_FULL",
 			);
 		}

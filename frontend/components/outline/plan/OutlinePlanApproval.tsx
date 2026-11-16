@@ -130,7 +130,6 @@ export function OutlinePlanApproval({
 	const diff = useOutlinePlanDiff(
 		{
 			spaceId: root?.spaceId ?? "",
-			pageId: root?.pageId ?? "",
 			blockId: root?.blockId ?? "",
 			from: submission?.baseSeq ?? 0,
 		},
@@ -211,7 +210,7 @@ export function OutlinePlanApproval({
 	};
 
 	const openBlock = (blockId: string) => {
-		const target = { spaceId: root.spaceId, blockId, pageId: root.pageId };
+		const target = { spaceId: root.spaceId, blockId };
 		if (opener?.open(target, { newPanel: false })) return;
 		window.open(outlineTargetHref({ kind: "block", spaceId: root.spaceId, blockId }), "_blank");
 	};

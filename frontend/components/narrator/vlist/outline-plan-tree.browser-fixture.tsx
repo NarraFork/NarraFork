@@ -122,7 +122,6 @@ function planInput(options: FixtureOptions) {
 		_planRoot: {
 			blockId: "root-block",
 			spaceId: "space",
-			pageId: "page",
 			address: "MTBXwl1Y/u90Ia1yR",
 			title: "历史读取10秒改告警",
 			round: 1,

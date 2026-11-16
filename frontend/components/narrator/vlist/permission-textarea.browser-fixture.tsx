@@ -97,7 +97,6 @@ function permissionOf(kind: CardKind): PendingPermission {
 					_planRoot: {
 						blockId: "b",
 						spaceId: "s",
-						pageId: "p",
 						address: "k/AbCdEfGh",
 						title: "Plan",
 						round: 2,

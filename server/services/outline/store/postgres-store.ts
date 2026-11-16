@@ -1438,6 +1438,18 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return Number(first?.n ?? 0);
 		},
 
+		async countOpenPendingBySpace(spaceId, limit) {
+			const rows = await db.execute(sql`
+				SELECT count(*)::int AS n FROM (
+					SELECT 1 FROM outline_pending
+					WHERE space_id = CAST(${spaceId} AS text) AND "status" = 'open'
+					LIMIT CAST(${limit} AS integer)
+				) AS open_rows
+			`);
+			const first = (rows as unknown as Array<{ n: number | string }>)[0];
+			return Number(first?.n ?? 0);
+		},
+
 		async listOpenPendingBySpace(spaceId, limit) {
 			const rows = await db
 				.select(pendingHeadColumns)
@@ -1487,16 +1499,20 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return rows[0] ? toPending(rows[0]) : null;
 		},
 
-		async listUnreportedPending(requesterSession, pageId, limit) {
-			// The predicate is the unreported index's own.
+		async listUnreportedPending(requesterSession, limit, after) {
+			// The predicate is the unreported index's own; its order is the index's.
 			const rows = await db
 				.select(pendingHeadColumns)
 				.from(outlinePending)
 				.where(
 					and(
 						eq(outlinePending.requesterSession, requesterSession),
-						eq(outlinePending.pageId, pageId),
 						sql`"reported_at" IS NULL AND "status" <> 'open'`,
+						...(after
+							? [
+									sql`(${outlinePending.createdAt}, ${outlinePending.id} COLLATE "C") > (CAST(${after.createdAt} AS text), CAST(${after.id} AS text) COLLATE "C")`,
+								]
+							: []),
 					),
 				)
 				.orderBy(asc(outlinePending.createdAt), sql`${outlinePending.id} COLLATE "C"`)

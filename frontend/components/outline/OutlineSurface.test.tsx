@@ -147,7 +147,6 @@ function questionGroup(rootId = "a", isQuestion = true): OutlineQuestionGroupRes
 			blockId: rootId,
 			spaceId: "space",
 			spaceKey: "K",
-			pageId: "page",
 			title: `Block ${rootId}`,
 			isQuestion,
 		},

@@ -175,7 +175,6 @@ import {
 	OUTLINE_BEHAVIOR_ALIAS,
 	OUTLINE_CHANGE,
 	OUTLINE_LIMITS,
-	OUTLINE_PENDING_LIMITS,
 	OUTLINE_TASK_IDLE_LEASE_MS,
 	OUTLINE_TASKS_PAGE_ALIAS,
 	type OutlineActorKind,
@@ -2817,7 +2816,6 @@ class OutlinePlanner {
 		await this.endHandedOverWork();
 		this.leaveUnclaimedToDo();
 		await this.guardLocks();
-		await this.checkRepage();
 		// May load more blocks (ancestors, children whose in-process changes): before `all`.
 		await this.planInProcess();
 		const all = [...this.blocks.values()];
@@ -3097,38 +3095,6 @@ class OutlinePlanner {
 			out.push({ row, setDelivered: newAnswer });
 		}
 		return out;
-	}
-
-	/**
-	 * A locked task this commit moves to another page takes its open changes there: refused when
-	 * the page would hold more open changes than it may (`OUTLINE_PENDING_FULL`).
-	 */
-	private async checkRepage(): Promise<void> {
-		const moving = [...this.blocks.values()].filter((block) => {
-			const lock = block.base && !block.base.deleted ? block.base.taskJson?.lock : undefined;
-			return (
-				!!lock &&
-				!block.deleted &&
-				sameLocker(block.taskJson?.lock, lock) &&
-				block.pageId !== (block.base as OutlineBlockMeta).pageId
-			);
-		});
-		if (moving.length === 0) return;
-		const limit = OUTLINE_PENDING_LIMITS.openPerPage;
-		const arriving = new Map<string, number>();
-		for (const block of moving) {
-			const open = await this.store.listOpenPendingByPage(
-				(block.base as OutlineBlockMeta).pageId,
-				limit,
-			);
-			const n = open.filter((row) => row.rootBlockId === block.id).length;
-			if (n > 0) arriving.set(block.pageId, (arriving.get(block.pageId) ?? 0) + n);
-		}
-		for (const [pageId, n] of arriving) {
-			if ((await this.store.countOpenPendingByPage(pageId, limit)) + n > limit) {
-				throw new OutlineWriteError(OUTLINE_TEXT.pendingFull(limit), "OUTLINE_PENDING_FULL");
-			}
-		}
 	}
 
 	/**

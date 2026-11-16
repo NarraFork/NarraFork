@@ -230,7 +230,9 @@ export type OutlinePendingStatus = (typeof OUTLINE_PENDING_STATUSES)[number];
 
 /** Limits of pending changes (`pending.ts`). */
 export const OUTLINE_PENDING_LIMITS = {
-	/** Open pending changes on one page; a proposal past it is refused. */
+	/** Open pending changes in one space; a new proposal past it is refused. */
+	openPerSpace: 500,
+	/** Open pending changes the editor's side panel of a top-level block reads. */
 	openPerPage: 100,
 	/** Operations one pending change holds, merges included. */
 	maxOps: OUTLINE_LIMITS.maxOps,
@@ -249,6 +251,14 @@ export const OUTLINE_PENDING_LIMITS = {
 	diffSubtreeRows: OUTLINE_LIMITS.maxRowsTouched,
 	/** Unreported decisions one read shows. */
 	reportsPerRead: 10,
+	/**
+	 * A session's unreported decisions one read looks through (oldest first, a batch at a time)
+	 * for those about where it reads: past them, older ones elsewhere crowd the rest out.
+	 */
+	reportsScan: 500,
+	reportsBatch: 100,
+	/** Blocks the walk up from those decisions' locked tasks reads at most. */
+	reportsWalkRows: 4000,
 } as const;
 
 /** How a pending change is named to people and agents: `P` and its id (8 characters). */

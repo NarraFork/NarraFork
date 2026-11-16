@@ -1,6 +1,6 @@
 /**
  * Questions put to people (`Ask`, outline P2 PR 7; design §3.3, §4.1, §4.5): asking, answering,
- * telling the asker, and what the inbox, the page and the task source read of them.
+ * telling the asker, and what the inbox, the outline's views and the task source read of them.
  *
  * A question is a block under the task (or any block) it is about: its content is the question,
  * its `ask_json` holds who is asked, the choices, the asker's recommendation and later the answer
@@ -1727,15 +1727,14 @@ export function watchArchivedSessionQuestions(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Reads: the inbox and the page
+// Reads: the inbox and the outline's views
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** One thing in a person's inbox: open questions put to them under the same block (D20). */
 export interface OutlineQuestionGroup {
-	/** The block they are under (a question, for a question asked at the top of a page). */
+	/** The block they are under (a question, for a question asked at the top level). */
 	groupBlockId: string;
 	spaceId: string;
-	pageId: string;
 	title: string;
 	questionIds: string[];
 	/** The asking sessions, oldest question's first. */
@@ -1789,7 +1788,7 @@ export async function listQuestionGroupsForUser(
 			const meta = metas.get(row.blockId);
 			if (!meta || meta.deleted) continue;
 			// A question under questions goes with the topmost one's group: the block that one is
-			// under, or itself at the top of a page.
+			// under, or itself at the top level.
 			let top = meta;
 			for (let depth = 0; depth < OUTLINE_QUESTION_LIMITS.nestDepth; depth++) {
 				const parent = top.parentId === null ? undefined : metas.get(top.parentId);
@@ -1800,7 +1799,6 @@ export async function listQuestionGroupsForUser(
 			const group = groups.get(key) ?? {
 				groupBlockId: key,
 				spaceId,
-				pageId: meta.pageId,
 				title: "",
 				questionIds: [],
 				askers: [],
@@ -1833,7 +1831,7 @@ export async function listQuestionGroupsForUser(
 
 /**
  * The questions under a block (and their sub-questions), or the question itself with its
- * sub-questions, as the inbox, the page's side panel and the `Ask` card show them, for `viewer`
+ * sub-questions, as the inbox, the outline's side panel and the `Ask` card show them, for `viewer`
  * (who may answer which). The caller has checked the viewer may read the space.
  */
 export async function readQuestionsUnder(
@@ -1965,7 +1963,6 @@ export async function readQuestionsUnder(
 			blockId: head.id,
 			spaceId: space.id,
 			spaceKey: space.key,
-			pageId: head.pageId,
 			title: blockTitle(head.content).slice(0, 240),
 			isQuestion: head.askJson !== null,
 		},
