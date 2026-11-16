@@ -115,7 +115,6 @@ export function FilePreviewModal({
 		};
 	}, [blobUrl]);
 
-	// Fetch file content when modal opens
 	useEffect(() => {
 		if (!opened || !previewCapability.supported) return;
 		let cancelled = false;

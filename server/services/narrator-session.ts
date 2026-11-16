@@ -1662,8 +1662,8 @@ async function createNarrator(
 		}
 	} else {
 		// Preload optional tools whose routine mode is `resident` (project override
-		// first, then global). `manual` and `auto` are not preloaded — `auto` is the
-		// toolsearch placeholder and behaves like `manual` until that lands.
+		// first, then global). `manual` stays out until `/load`. `auto` is not
+		// preloaded either; ToolSearch loads that group on demand.
 		for (const routine of getBuiltinToolRoutines()) {
 			if (!routine.tool) continue;
 			const { mode } = resolveEffectiveToolRoutineMode(

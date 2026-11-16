@@ -50,6 +50,10 @@ if (IS_WINDOWS) {
  * This is intentionally best-effort and safe to call before every child process
  * spawn. Do not restore the flag: NarraFork does not intentionally pass arbitrary
  * socket/file handles to children, and stdio handles are explicitly skipped.
+ *
+ * An FFI failure must not abort server startup (`after server bind`) or a child
+ * spawn (`before spawn`). The catch logs once and continues. That policy is not
+ * visible from the catch body, and it is not a license to swallow other errors.
  */
 function clearInheritableWindowsHandles(phase: "after server bind" | "before spawn"): void {
 	if (!setHandleInformation) return;
@@ -85,7 +89,6 @@ function clearInheritableWindowsHandles(phase: "after server bind" | "before spa
 			});
 		}
 	} catch (error) {
-		// Best-effort workaround only. Never fail server startup/spawn because of FFI guard issues.
 		if (!ffiWarningLogged) {
 			ffiWarningLogged = true;
 			logger.warn(`Windows handle guard failed ${phase}`, { error: String(error) });

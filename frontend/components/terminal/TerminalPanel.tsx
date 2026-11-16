@@ -37,6 +37,19 @@ const TERMINAL_SCROLLBACK_LINES = 2_000;
 const TERMINAL_PENDING_BUFFER_MAX_CHARS = 1_000_000;
 const TERMINAL_SELECTION_STATE_MAX_CHARS = 10_000;
 
+/**
+ * xterm 5.5 schedules Viewport.syncScrollArea() with setTimeout during open().
+ * React StrictMode can run this cleanup immediately and dispose the renderer
+ * before that callback, so xterm reads `dimensions` from an already-disposed
+ * renderer. Finish this instance's queued initialization before disposing it.
+ */
+function disposeTerminalAfterViewportSync(term: Terminal, afterDispose: () => void): void {
+	setTimeout(() => {
+		term.dispose();
+		afterDispose();
+	}, 0);
+}
+
 function trimTerminalBufferText(data: string): string {
 	return data.length > TERMINAL_PENDING_BUFFER_MAX_CHARS
 		? data.slice(-TERMINAL_PENDING_BUFFER_MAX_CHARS)
@@ -743,16 +756,10 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 					longPressTimerRef.current = null;
 				}
 
-				// xterm 5.5 schedules Viewport.syncScrollArea() with setTimeout during
-				// open(). React StrictMode can run this cleanup immediately and dispose
-				// the renderer before that callback runs, causing xterm to read
-				// `dimensions` from an already-disposed renderer. Let xterm finish its
-				// queued initialization before disposing this effect's own instance.
-				setTimeout(() => {
-					term.dispose();
+				disposeTerminalAfterViewportSync(term, () => {
 					if (termRef.current === term) termRef.current = null;
 					if (fitAddonRef.current === fitAddon) fitAddonRef.current = null;
-				}, 0);
+				});
 			};
 		}, [write, runFit, scheduleFit, handleSelectionChange]);
 

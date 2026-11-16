@@ -119,7 +119,7 @@ server/
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播，所有跨服务通信通过类型化事件流转。
 - **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），HTTP SSE 流式 + 并行 WebSocket 广播；权限请求暂停会话（Promise 挂起）由用户决策解除（5 分钟超时）。
-- **可选工具三段式模式**（`shared/routine-modes.ts`）：`manual`（会话内 `/load` 临时加载）、`auto`（预留，当前等同 manual）、`resident`（新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），`enabledRoutines`/`disabledRoutines` 作为兼容投射双向同步；`narrators.enabledTools` 是正交的会话级临时装载。
+- **可选工具三段式模式**（`shared/routine-modes.ts`）：`manual`（会话内 `/load` 临时加载）、`auto`（不预装，经 ToolSearch 按需成组加载）、`resident`（新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），`enabledRoutines`/`disabledRoutines` 作为兼容投射双向同步；`narrators.enabledTools` 是正交的会话级临时装载。`isPreloadedMode` 只对 `resident` 为真；`auto` 故意不进旧的启用/禁用名单。
 - **子代理**：通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**：`full`（延迟会话 fork）/ `compressed`（摘要注入 system prompt）/ `fresh`（无上下文）。
 - **项目归属**：会话的项目只经 `resolveNarratorProjectId`（SQL 侧 `narratorProjectIdText` / `narratorProjectIdColumn`）判断：有 `contextProjectId` 用它，否则用工作目录推导出的主链接；最长前缀匹配已有项目根，否则取 git 主仓库根并自动建公开项目，非 git 目录不建项目。权限与配置只看主项目，`additional` 链接只让会话出现在其他项目页。索引可随时整表重建（启动时后台分页重建）。
