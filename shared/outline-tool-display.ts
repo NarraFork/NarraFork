@@ -51,7 +51,7 @@ export interface OutlineDisplayCreated extends OutlineDisplayRef {
 export type OutlineEditDisplayOp =
 	| {
 			op: "add";
-			/** Null: new pages at the top of the space. */
+			/** Null: new blocks at the top level of the space. */
 			parent: OutlineDisplayRef | null;
 			created: OutlineDisplayCreated[];
 			/** Created blocks not listed. */
@@ -73,7 +73,7 @@ export type OutlineEditDisplayOp =
 	| {
 			op: "move";
 			target: OutlineDisplayRef;
-			/** Null: made a page. */
+			/** Null: moved to the top level of the space. */
 			to: OutlineDisplayRef | null;
 			held?: true;
 	  }
