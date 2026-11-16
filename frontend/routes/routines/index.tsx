@@ -33,6 +33,9 @@ import {
 import {
 	IconChevronDown,
 	IconChevronRight,
+	IconDownload,
+	IconEye,
+	IconPencil,
 	IconPlug,
 	IconPlus,
 	IconRefresh,
@@ -50,6 +53,7 @@ import {
 	textareaOptimizeControlsWidth,
 } from "../../components/narrator/composer/TextareaOptimizeControls";
 import { ProjectSkillsManager } from "../../components/project/ProjectSkillsManager";
+import { SkillLinkModal } from "../../components/project/SkillLinkModal";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	type CustomSubagentDef,
@@ -175,6 +179,7 @@ interface SkillSummary {
 	location: string;
 	files: string[];
 	disabled?: boolean;
+	canUpdateFromUrl?: boolean;
 }
 
 // === Main Page ===
@@ -907,38 +912,83 @@ function GlobalSkillsTab() {
 		? undefined
 		: (skillsCapability.reason ?? t("globalSkillsUnsupportedDesc"));
 	const canManageGlobalSkills = skillsCapability.supported;
+	const { data: currentUser } = useCurrentUser();
+	// Link import pulls a remote file tree into the instance-wide skills directory.
+	const canLinkGlobalSkills = canManageGlobalSkills && currentUser?.role === "admin";
 	const { data: skills, isLoading } = useGlobalSkills(canManageGlobalSkills);
 	const createMutation = useCreateGlobalSkill();
 	const updateMutation = useUpdateGlobalSkill();
 	const deleteMutation = useDeleteGlobalSkill();
 	const refreshMutation = useGlobalSkillsRefresh();
 	const toggleMutation = useToggleGlobalSkill();
+	const [linkTarget, setLinkTarget] = useState<{ skill?: SkillSummary } | null>(null);
+	const closeLink = useCallback(() => setLinkTarget(null), []);
+	useEffect(() => {
+		if (!canLinkGlobalSkills) closeLink();
+	}, [canLinkGlobalSkills, closeLink]);
 
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [viewOpened, { open: openView, close: closeView }] = useDisclosure(false);
 
-	const [editingSkill, setEditingSkill] = useState<string | null>(null); // null = create
+	const editLoadSeqRef = useRef(0);
+	const draftTouchedRef = useRef(false);
+	const [editingSkill, setEditingSkill] = useState<string | null>(null);
 	const [draft, setDraft] = useState<SkillDraft>({ name: "", description: "", content: "" });
+	const [editContentLoading, setEditContentLoading] = useState(false);
 	const [deleteTarget, setDeleteTarget] = useState<string>("");
 	const [viewTarget, setViewTarget] = useState<SkillSummary | null>(null);
 
+	const handleCloseEdit = useCallback(() => {
+		editLoadSeqRef.current++;
+		draftTouchedRef.current = false;
+		setEditContentLoading(false);
+		closeEdit();
+	}, [closeEdit]);
+
+	useEffect(() => {
+		if (!canManageGlobalSkills) handleCloseEdit();
+		return () => {
+			editLoadSeqRef.current++;
+		};
+	}, [canManageGlobalSkills, handleCloseEdit]);
+
+	const updateDraft = useCallback((updater: (current: SkillDraft) => SkillDraft) => {
+		draftTouchedRef.current = true;
+		setDraft(updater);
+	}, []);
+
 	const handleCreate = useCallback(() => {
 		if (!canManageGlobalSkills) return;
+		editLoadSeqRef.current++;
+		draftTouchedRef.current = false;
+		setEditContentLoading(false);
 		setEditingSkill(null);
 		setDraft({ name: "", description: "", content: "" });
-		openEdit();
-	}, [canManageGlobalSkills, openEdit]);
+		if (canLinkGlobalSkills) setLinkTarget({});
+		else openEdit();
+	}, [canManageGlobalSkills, canLinkGlobalSkills, openEdit]);
 
 	const handleEdit = useCallback(
 		(skill: SkillSummary) => {
 			if (!canManageGlobalSkills) return;
+			const loadSeq = ++editLoadSeqRef.current;
+			draftTouchedRef.current = false;
+			setEditContentLoading(true);
 			setEditingSkill(skill.name);
 			setDraft({ name: skill.name, description: skill.description, content: "" });
-			// Fetch full content
-			api.getGlobalSkill(skill.name).then((full) => {
-				setDraft({ name: full.name, description: full.description, content: full.content });
-			});
+			api
+				.getGlobalSkill(skill.name)
+				.then((full) => {
+					if (editLoadSeqRef.current !== loadSeq) return;
+					setEditContentLoading(false);
+					if (draftTouchedRef.current) return;
+					setDraft({ name: full.name, description: full.description, content: full.content });
+				})
+				.catch(() => {
+					if (editLoadSeqRef.current === loadSeq) setEditContentLoading(false);
+					// Keep the summary fields visible; save will surface any later API error.
+				});
 			openEdit();
 		},
 		[canManageGlobalSkills, openEdit],
@@ -954,14 +1004,21 @@ function GlobalSkillsTab() {
 		if (!data.name || !data.description) return;
 
 		if (editingSkill) {
-			updateMutation.mutate(
-				{ currentName: editingSkill, ...data },
-				{ onSuccess: () => closeEdit() },
-			);
+			updateMutation.mutate({ currentName: editingSkill, ...data }, { onSuccess: handleCloseEdit });
 		} else {
-			createMutation.mutate(data, { onSuccess: () => closeEdit() });
+			createMutation.mutate(data, {
+				onSuccess: () => setLinkTarget((current) => (current === linkTarget ? null : current)),
+			});
 		}
-	}, [canManageGlobalSkills, draft, editingSkill, createMutation, updateMutation, closeEdit]);
+	}, [
+		canManageGlobalSkills,
+		draft,
+		editingSkill,
+		createMutation,
+		updateMutation,
+		handleCloseEdit,
+		linkTarget,
+	]);
 
 	const handleDelete = useCallback(
 		(name: string) => {
@@ -989,6 +1046,63 @@ function GlobalSkillsTab() {
 		refreshMutation.mutate();
 	}, [canManageGlobalSkills, refreshMutation]);
 
+	const editorForm = (
+		<Stack>
+			<TextInput
+				label={t("skillName")}
+				placeholder={t("skillNamePlaceholder")}
+				value={draft.name}
+				onChange={(e) => {
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, name: val }));
+				}}
+			/>
+			<TextInput
+				label={t("skillDescription")}
+				placeholder={t("skillDescriptionPlaceholder")}
+				value={draft.description}
+				onChange={(e) => {
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, description: val }));
+				}}
+			/>
+			<Textarea
+				label={t("skillContent")}
+				placeholder={t("skillContentPlaceholder")}
+				value={draft.content}
+				onChange={(e) => {
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, content: val }));
+				}}
+				autosize
+				minRows={8}
+				maxRows={20}
+			/>
+			<Group justify="flex-end" gap="xs">
+				<Button
+					variant="subtle"
+					onClick={editingSkill ? handleCloseEdit : closeLink}
+					disabled={createMutation.isPending || updateMutation.isPending}
+				>
+					{t("cancel")}
+				</Button>
+				<Button
+					onClick={handleSave}
+					disabled={
+						!canManageGlobalSkills ||
+						editContentLoading ||
+						!draft.name.trim() ||
+						!draft.description.trim()
+					}
+					loading={createMutation.isPending || updateMutation.isPending}
+					title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+				>
+					{t("save")}
+				</Button>
+			</Group>
+		</Stack>
+	);
+
 	return (
 		<Stack>
 			<Group justify="space-between">
@@ -1000,13 +1114,14 @@ function GlobalSkillsTab() {
 						{skillsUnsupportedReason}
 					</Alert>
 				)}
-				<Group gap="xs">
+				<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
 					<ActionIcon
 						variant="subtle"
 						size="sm"
 						onClick={handleRefresh}
 						loading={refreshMutation.isPending}
 						disabled={!canManageGlobalSkills}
+						aria-label={t("refreshSkills")}
 						title={!canManageGlobalSkills ? skillsUnsupportedReason : t("refreshSkills")}
 					>
 						<IconRefresh size={14} />
@@ -1019,7 +1134,7 @@ function GlobalSkillsTab() {
 						disabled={!canManageGlobalSkills}
 						title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
 					>
-						{t("createSkill")}
+						{t("addSkill")}
 					</Button>
 				</Group>
 			</Group>
@@ -1065,7 +1180,7 @@ function GlobalSkillsTab() {
 									{formatRoutineTextPreview(skill.description, MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS)}
 								</Text>
 							</div>
-							<Group gap={4}>
+							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
 								<Switch
 									checked={!isDisabled}
 									onChange={(e) => {
@@ -1079,31 +1194,54 @@ function GlobalSkillsTab() {
 									disabled={!canManageGlobalSkills}
 									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
 								/>
-								<Button
+								<ActionIcon
 									variant="subtle"
-									size="compact-xs"
+									size="sm"
 									onClick={() => handleView(skill)}
 									disabled={!canManageGlobalSkills}
-									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+									aria-label={t("viewSkill")}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : t("viewSkill")}
 								>
-									{t("viewSkill")}
-								</Button>
-								<Button
+									<IconEye size={14} />
+								</ActionIcon>
+								<ActionIcon
 									variant="subtle"
-									size="compact-xs"
+									size="sm"
 									onClick={() => handleEdit(skill)}
 									disabled={!canManageGlobalSkills}
-									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+									aria-label={t("editSkill")}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : t("editSkill")}
 								>
-									{t("editSkill")}
-								</Button>
+									<IconPencil size={14} />
+								</ActionIcon>
+								<ActionIcon
+									variant="subtle"
+									size="sm"
+									onClick={() => {
+										if (canLinkGlobalSkills && skill.canUpdateFromUrl) setLinkTarget({ skill });
+									}}
+									disabled={!canLinkGlobalSkills || !skill.canUpdateFromUrl}
+									aria-label={t("updateSkillFromLink")}
+									title={
+										!canManageGlobalSkills
+											? skillsUnsupportedReason
+											: !canLinkGlobalSkills
+												? t("skillLinkAdminOnly")
+												: !skill.canUpdateFromUrl
+													? t("skillLinkUpdateUnsupported")
+													: t("updateSkillFromLink")
+									}
+								>
+									<IconDownload size={14} />
+								</ActionIcon>
 								<ActionIcon
 									variant="subtle"
 									color="red"
 									size="sm"
 									onClick={() => handleDelete(skill.name)}
 									disabled={!canManageGlobalSkills}
-									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+									aria-label={t("deleteSkill")}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : t("deleteSkill")}
 								>
 									<IconTrash size={14} />
 								</ActionIcon>
@@ -1113,58 +1251,23 @@ function GlobalSkillsTab() {
 				);
 			})}
 
-			{/* Create / Edit Modal */}
+			<SkillLinkModal
+				opened={linkTarget !== null}
+				onClose={closeLink}
+				skill={linkTarget?.skill}
+				enabled={canLinkGlobalSkills}
+				manualForm={!linkTarget?.skill ? editorForm : undefined}
+				manualPending={createMutation.isPending}
+			/>
+
+			{/* Edit Modal */}
 			<Modal
 				opened={editOpened}
-				onClose={closeEdit}
-				title={editingSkill ? t("editSkill") : t("createSkill")}
+				onClose={handleCloseEdit}
+				title={t(editingSkill ? "editSkill" : "createSkill")}
 				size="lg"
 			>
-				<Stack>
-					<TextInput
-						label={t("skillName")}
-						placeholder={t("skillNamePlaceholder")}
-						value={draft.name}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							setDraft((d) => ({ ...d, name: val }));
-						}}
-					/>
-					<TextInput
-						label={t("skillDescription")}
-						placeholder={t("skillDescriptionPlaceholder")}
-						value={draft.description}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							setDraft((d) => ({ ...d, description: val }));
-						}}
-					/>
-					<Textarea
-						label={t("skillContent")}
-						placeholder={t("skillContentPlaceholder")}
-						value={draft.content}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							setDraft((d) => ({ ...d, content: val }));
-						}}
-						autosize
-						minRows={8}
-						maxRows={20}
-					/>
-					<Group justify="flex-end" gap="xs">
-						<Button variant="subtle" onClick={closeEdit}>
-							{t("cancel")}
-						</Button>
-						<Button
-							onClick={handleSave}
-							disabled={!canManageGlobalSkills || !draft.name.trim() || !draft.description.trim()}
-							loading={createMutation.isPending || updateMutation.isPending}
-							title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
-						>
-							{t("save")}
-						</Button>
-					</Group>
-				</Stack>
+				{editorForm}
 			</Modal>
 
 			{/* Delete Confirm Modal */}
@@ -1832,6 +1935,7 @@ function ProjectSkillsTab() {
 
 			{selectedProjectId && (
 				<ProjectSkillsManager
+					key={selectedProjectId}
 					projectId={selectedProjectId}
 					enabled={skillsCapability.supported}
 					disabledReason={skillsUnsupportedReason}
