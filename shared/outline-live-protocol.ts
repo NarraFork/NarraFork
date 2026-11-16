@@ -358,7 +358,18 @@ export type LiveCloseCode =
 	/** The session was closed (shutdown); join again later. */
 	| "ended"
 	/** The client speaks another protocol version: the page says to reload; no retry. */
-	| "outdated";
+	| "outdated"
+	/**
+	 * Too much of this space is open in this person's other tabs (pages only they are in, past
+	 * `OUTLINE_LIVE_BOUNDS.maxUserBlocks`): this join is refused, never another tab of theirs
+	 * closed. The page says so and offers a retry; the client does not retry by itself.
+	 */
+	| "user_limit"
+	/**
+	 * The space's session holds as much as it may and every page in it has people in it: this
+	 * join is refused (nobody's open page is closed for it). Retried by the person only.
+	 */
+	| "space_full";
 
 export interface LiveClosedHead {
 	code: LiveCloseCode;

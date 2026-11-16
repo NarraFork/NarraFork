@@ -40,6 +40,7 @@ import {
 	merge3,
 	simpleDiff,
 } from "@shared/outline";
+import { cancelLiveTimer, type LiveTimer, liveNow, liveTimeout } from "@shared/outline-live-clock";
 import {
 	decodeLiveFrame,
 	decodeLiveSeed,
@@ -305,6 +306,14 @@ function storeFromSnapshot(pageId: string, blocks: readonly LiveBlockWire[]): St
 export class LiveClient {
 	/** Seed text of blocks nobody changed yet (a block here has no document). */
 	private readonly plain = new Map<string, string>();
+	/**
+	 * Blocks whose text this client changed and the page did not take (a `lost` notice, `x`),
+	 * while this end's document of the block still holds that change: the unsaved entry made of
+	 * it (its base, and the text so far). Whatever this client changes in the block until the
+	 * page gives it the block's text again (a later generation, or a snapshot) is built on the
+	 * text not taken: it joins the entry and is never merged into the block (`keepLost`).
+	 */
+	private readonly lostText = new Map<string, { base: string; text: string }>();
 	/** Documents of the blocks whose text changed, here or elsewhere. */
 	private readonly docs = new Map<string, BlockText>();
 	confirmed: Store;
@@ -373,11 +382,11 @@ export class LiveClient {
 	private era = 0;
 	private originView: ClientView | null = null;
 	private undoing = false;
-	private typingTimer: ReturnType<typeof setTimeout> | null = null;
-	private presenceTimer: ReturnType<typeof setTimeout> | null = null;
+	private typingTimer: LiveTimer | null = null;
+	private presenceTimer: LiveTimer | null = null;
 	private lastPresence = "";
 	private wantPresence: LiveSelWire | null = null;
-	private retryTimer: ReturnType<typeof setTimeout> | null = null;
+	private retryTimer: LiveTimer | null = null;
 	private retries = 0;
 	private readonly listeners = new Set<(event: ClientEvent) => void>();
 	private readonly off: Array<() => void> = [];
@@ -490,7 +499,8 @@ export class LiveClient {
 		this.abandonRestores();
 		this.disposed = true;
 		for (const off of this.off.splice(0)) off();
-		for (const t of [this.typingTimer, this.presenceTimer, this.retryTimer]) if (t) clearTimeout(t);
+		for (const t of [this.typingTimer, this.presenceTimer, this.retryTimer])
+			if (t) cancelLiveTimer(t);
 		if (this.handle !== null) {
 			this.transport.send(encodeLiveFrame({ kind: LIVE_FRAME.leave, handle: this.handle }));
 			this.transport.releaseHandle(this.handle);
@@ -567,7 +577,11 @@ export class LiveClient {
 		const live = (s: Step) => s.inverse.length > 0 || s.texts.size > 0;
 		this.undoStack = this.undoStack.filter(live);
 		this.redoStack = this.redoStack.filter(live);
-		if (changes.length > 0) redo.push({ id, changes });
+		// Made on top of text the page did not take: kept with it, not made again (`keepLost`).
+		if (this.lostText.has(id)) {
+			this.foldLost(id, changes);
+			this.lostText.delete(id);
+		} else if (changes.length > 0) redo.push({ id, changes });
 	}
 
 	/**
@@ -622,28 +636,73 @@ export class LiveClient {
 	private keepLost(lost: LiveLostWire[] | undefined, txs: readonly PendingTx[]): void {
 		if (!lost || lost.length === 0) return;
 		const items: Array<Omit<UnsavedEntry, "id" | "at">> = [];
+		const ordered = [...txs].sort((x, y) => x.n - y.n);
 		for (const [n, ids] of lost) {
-			const tx = txs.find((t) => t.n === n);
+			const tx = ordered.find((t) => t.n === n);
 			if (!tx) continue;
 			for (const id of ids) {
 				const change = tx.bodies.get(id) ?? tx.undone?.get(id);
-				if (!change || change.after === change.before) continue;
-				let parent: string | null = this.confirmed.get(id)?.parentId ?? null;
-				while (parent && !this.confirmed.alive(parent))
-					parent = this.confirmed.get(parent)?.parentId ?? null;
-				items.push({
-					pageId: this.pageId,
-					blockId: id,
-					text: change.after,
-					base: change.before,
-					reason: "moved_away",
-					restore: { parentId: parent ?? this.pageId, task: null },
-				});
+				if (!change) continue;
+				// What this client changed in the block after the change not taken was made on top
+				// of it (this end's document of the block still holds it): none of it can be taken
+				// either (it is of the same old generation, see `parseTexts` on the server), and
+				// rebasing it onto the page's text by a text merge would cut words apart where the
+				// text not taken was. So it all goes with it, as one text, and the block keeps no
+				// change of this client's past this point (`lostText`).
+				let after = change.after;
+				tx.bodies.delete(id);
+				tx.undone?.delete(id);
+				for (const later of ordered) {
+					if (later.n <= n) continue;
+					const typed = later.bodies.get(id);
+					const undone = later.undone?.get(id);
+					if (typed) after = typed.after;
+					if (undone) after = undone.after;
+					later.bodies.delete(id);
+					later.undone?.delete(id);
+					if (!later.sent && !later.everSent && later.update.some((u) => u.id === id))
+						later.update = later.update.filter((u) => u.id !== id);
+				}
+				this.outY = this.outY.filter((u) => u.id !== id);
+				const prior = this.lostText.get(id);
+				const base = prior?.base ?? change.before;
+				this.lostText.set(id, { base, text: after });
+				if (after === base) continue;
+				items.push(this.lostItem(id, base, after));
 			}
 		}
 		if (items.length === 0) return;
 		this.log.push(`${items.length} block(s) typed in after they left the page: kept unsaved`);
 		keepUnsavedTexts(items);
+	}
+
+	/** An unsaved-text entry of a block whose text this client changed and the page did not take. */
+	private lostItem(id: string, base: string, text: string): Omit<UnsavedEntry, "id" | "at"> {
+		let parent: string | null = this.confirmed.get(id)?.parentId ?? null;
+		while (parent && !this.confirmed.alive(parent))
+			parent = this.confirmed.get(parent)?.parentId ?? null;
+		return {
+			pageId: this.pageId,
+			blockId: id,
+			text,
+			base,
+			reason: "moved_away",
+			restore: { parentId: parent ?? this.pageId, task: null },
+		};
+	}
+
+	/**
+	 * More of this client's changes to a block whose text the page did not take (`lostText`):
+	 * they go to the same unsaved entry, never into the block.
+	 */
+	private foldLost(id: string, changes: readonly { after: string }[]): void {
+		const lost = this.lostText.get(id);
+		if (!lost) return;
+		const last = changes[changes.length - 1];
+		if (!last || last.after === lost.text) return;
+		lost.text = last.after;
+		this.log.push("typing on top of text not taken: kept unsaved with it");
+		keepUnsavedTexts([this.lostItem(id, lost.base, lost.text)]);
 	}
 
 	/**
@@ -905,7 +964,7 @@ export class LiveClient {
 		this.resetting = true;
 		this.stats.rebuilds++;
 		if (this.typingTimer) {
-			clearTimeout(this.typingTimer);
+			cancelLiveTimer(this.typingTimer);
 			this.typingTimer = null;
 		}
 		if (this.transport.connected) this.join();
@@ -972,7 +1031,7 @@ export class LiveClient {
 			this.syncViews(null);
 			return;
 		}
-		const now = performance.now();
+		const now = liveNow();
 		const last = this.undoStack[this.undoStack.length - 1];
 		// Typing on from where the last keystroke left the cursor, within a second, is one step;
 		// putting the cursor elsewhere first starts a new one.
@@ -1097,7 +1156,7 @@ export class LiveClient {
 		}
 		if (structural) this.sendPending();
 		else if (!this.typingTimer) {
-			this.typingTimer = setTimeout(() => {
+			this.typingTimer = liveTimeout(() => {
 				this.typingTimer = null;
 				this.sendPending();
 			}, OUTLINE_LIVE_LIMITS.typingBatchMs);
@@ -1107,7 +1166,7 @@ export class LiveClient {
 
 	private flushTyping(): void {
 		if (this.typingTimer) {
-			clearTimeout(this.typingTimer);
+			cancelLiveTimer(this.typingTimer);
 			this.typingTimer = null;
 		}
 		this.sendPending();
@@ -1340,7 +1399,7 @@ export class LiveClient {
 						h: this.relOf(sel.head.blockId, sel.head.offset),
 					};
 		if (this.presenceTimer) return;
-		this.presenceTimer = setTimeout(() => {
+		this.presenceTimer = liveTimeout(() => {
 			this.presenceTimer = null;
 			this.sendPresence();
 		}, OUTLINE_LIVE_LIMITS.presenceIntervalMs);
@@ -1527,6 +1586,8 @@ export class LiveClient {
 		this.ready = true;
 		this.seedTexts.clear();
 		if (replay.length > 0) this.replayPending(replay);
+		// The snapshot gave every block the page's text: nothing is built on text not taken now.
+		this.lostText.clear();
 		if (seedStore && replay.length > 0) this.noteLostWhileConnecting(replay, seedStore);
 		// From a seed, the views' cached nodes are still right (keyed by text): equal texts keep
 		// their DOM, and changed ones map the cursor through the text's difference.
@@ -1564,6 +1625,10 @@ export class LiveClient {
 			}
 			for (const [id, { before, after }] of tx.bodies) {
 				if (created.has(id)) continue;
+				if (this.lostText.has(id)) {
+					this.foldLost(id, [{ after }]);
+					continue;
+				}
 				if (!this.hasText(id) || !this.visible.alive(id)) {
 					// The block is not in the page any more (deleted, or moved to another page,
 					// while this was on its way): what was typed into it is kept for the person.
@@ -1711,8 +1776,10 @@ export class LiveClient {
 	private onClosed(code: LiveCloseCode): void {
 		this.closeCode = code;
 		if (code !== "ended" && code !== "unavailable") {
-			// Closed for good (refused after typing on the read, access gone, too large, or this
-			// client is of another protocol version than the server: `outdated`): nothing not
+			// Closed for good (refused after typing on the read, access gone, too large, this
+			// client is of another protocol version than the server: `outdated`, or too much of
+			// the space is open: `user_limit` / `space_full`, which only the person retries, so a
+			// refused tab never makes room by taking another's place and back): nothing not
 			// acknowledged can be sent any more. Kept for the person at once, while the page turns
 			// read only (and, outdated, asks for a reload; this client does not join again).
 			this.keepUnsaved(this.provisional ? "refused" : "not_sent", [
@@ -1726,9 +1793,9 @@ export class LiveClient {
 		if (code === "ended" || code === "unavailable") {
 			// The session closed (shutdown, idle, a limit): try again a little later.
 			this.setStatus("offline");
-			if (this.retryTimer) clearTimeout(this.retryTimer);
+			if (this.retryTimer) cancelLiveTimer(this.retryTimer);
 			const delay = Math.min(30_000, 1000 * 2 ** this.retries++);
-			this.retryTimer = setTimeout(() => {
+			this.retryTimer = liveTimeout(() => {
 				this.retryTimer = null;
 				this.resetting = true;
 				if (this.transport.connected) this.join();

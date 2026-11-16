@@ -188,6 +188,8 @@
 		"dismiss": "Dismiss",
 		"tooLargePage": "This page is too large to edit live (over 2000 blocks or 4 MB). It is shown read only; focus on a part of it or split it.",
 		"unavailable": "Live editing is not available right now; the page is shown read only.",
+		"userLimit": "Too much of this space is open in your other tabs, so this page is shown read only. Close one of them, then try again.",
+		"spaceFull": "Too much of this space is being edited live right now, so this page is shown read only. Try again once others have closed some pages.",
 		"retry": "Try again",
 		"outdated": "The outline editor was updated. This tab still runs the old version and can no longer edit live, so the page is shown read only. Copy any text shown as not saved, then reload.",
 		"reload": "Reload",

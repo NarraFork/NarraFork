@@ -29,7 +29,8 @@
  */
 import { logger } from "@server/lib/logger";
 import { merge3 } from "@shared/outline";
-import { decodeLiveSeed, LIVE_TEXT_KIND } from "@shared/outline-live-protocol";
+import { liveSleep, liveYield } from "@shared/outline-live-clock";
+import { decodeLiveSeed, LIVE_TEXT_KIND, type LiveLostWire } from "@shared/outline-live-protocol";
 import { hasPendingStructs, type LiveTextDoc, seededTextDoc } from "@shared/outline-live-text";
 import * as Y from "yjs";
 import { outlineStore } from "../store";
@@ -74,6 +75,16 @@ export interface ReplayResult {
 	/** Per client key of the ended session: its highest transaction now in the page. */
 	keys: Map<string, number>;
 	/**
+	 * Per client key: text of its transactions the session did not take and had not told it
+	 * of (the client learns it at its next join, `registry.ts`).
+	 */
+	lost: Map<string, LiveLostWire[]>;
+	/**
+	 * Kept only for blocks whose documents cannot be rebuilt (their rows stay for an operator):
+	 * everything else of the log is committed, so `keys` and `lost` hold for the clients.
+	 */
+	partial?: boolean;
+	/**
 	 * When the log was read but its text could not be committed (`kept`): what it holds, for a
 	 * new session to take over. Absent when the log could not be read at all.
 	 */
@@ -117,12 +128,13 @@ export async function replayLiveEpochDetailed(
 	epoch: number,
 ): Promise<ReplayResult> {
 	const keys = new Map<string, number>();
+	const lost = new Map<string, LiveLostWire[]>();
 	const rows = await readEpoch(spaceId, epoch);
 	if (!rows) {
 		logger.warn("Outline live log too large to replay; kept", { spaceId, epoch });
-		return { outcome: "kept", keys };
+		return { outcome: "kept", keys, lost };
 	}
-	if (rows.length === 0) return { outcome: "empty", keys };
+	if (rows.length === 0) return { outcome: "empty", keys, lost };
 	const docs = new Map<string, LiveTextDoc>();
 	const base = new Map<string, string>();
 	/** Intents not resolved by a later sync row or cancel: block → content to be committed. */
@@ -158,6 +170,7 @@ export async function replayLiveEpochDetailed(
 					i?: Record<string, string>;
 					x?: string[];
 					k?: Record<string, number>;
+					l?: Record<string, LiveLostWire[]>;
 				};
 				// Within one row, what the database held (`b`) and cancels (`x`) are older than the
 				// intents (`i`) written with them: an intent is resolved only by a later row.
@@ -170,6 +183,19 @@ export async function replayLiveEpochDetailed(
 				for (const [id, content] of Object.entries(parsed.i ?? {})) intents.set(id, content);
 				for (const [key, tx] of Object.entries(parsed.k ?? {})) {
 					if (Number.isSafeInteger(tx) && tx > (keys.get(key) ?? 0)) keys.set(key, tx);
+				}
+				// A key's notices are written whole each time they change: the last row says.
+				for (const [key, list] of Object.entries(parsed.l ?? {})) {
+					if (!Array.isArray(list)) continue;
+					const valid = list.filter(
+						(x): x is LiveLostWire =>
+							Array.isArray(x) &&
+							Number.isSafeInteger(x[0]) &&
+							Array.isArray(x[1]) &&
+							x[1].every((id: unknown) => typeof id === "string"),
+					);
+					if (valid.length > 0) lost.set(key, valid);
+					else lost.delete(key);
 				}
 				continue;
 			}
@@ -225,7 +251,7 @@ export async function replayLiveEpochDetailed(
 	} catch (error) {
 		logger.warn("Outline live log unreadable; kept", { spaceId, epoch, error: String(error) });
 		destroy();
-		return { outcome: "kept", keys };
+		return { outcome: "kept", keys, lost };
 	}
 	// An update still waiting for items no row brought: that document's text is not what was
 	// typed, and nothing of it is committed. It does not hold back the other blocks' text.
@@ -239,7 +265,7 @@ export async function replayLiveEpochDetailed(
 	const changes: Array<{ id: string; text: string; actor: string | null }> = [];
 	let read = 0;
 	for (const [id, t] of docs) {
-		if (++read % 50 === 0) await new Promise((resolve) => setImmediate(resolve));
+		if (++read % 50 === 0) await liveYield();
 		const b = await outlineStore.getBlock(id);
 		// A block that is gone has nothing to commit, whatever state its document is in.
 		if (!b || b.deleted || b.spaceId !== spaceId) continue;
@@ -261,7 +287,7 @@ export async function replayLiveEpochDetailed(
 	destroy();
 	if (changes.length > 0) {
 		const committed = await commitChanges(spaceId, changes, blocks);
-		if (!committed) return { outcome: "kept", keys, changes };
+		if (!committed) return { outcome: "kept", keys, lost, changes };
 	}
 	if (unsound.length > 0) {
 		// Everything else is committed; only the rows of the documents that cannot be rebuilt
@@ -279,16 +305,19 @@ export async function replayLiveEpochDetailed(
 				error: String(error),
 			});
 		}
-		return { outcome: "kept", keys };
+		// The clients' positions hold all the same: what the space took of their transactions is
+		// committed or in those rows, and they must not make it again by a text merge.
+		return { outcome: "kept", keys, lost, partial: true };
 	}
 	await outlineStore.deleteLiveLog(spaceId, epoch);
-	return { outcome: changes.length > 0 ? "committed" : "empty", keys };
+	return { outcome: changes.length > 0 ? "committed" : "empty", keys, lost };
 }
 
 /**
  * The rows of an epoch cut down to what concerns `ids`: text rows keep their entries of those
- * blocks, sync rows their fields of them. The first row stays (as the epoch's snapshot, maybe
- * empty), so the rows still read as a log.
+ * blocks, sync rows their fields of them and the clients' positions and notices (`k`, `l`: a
+ * later replay of these rows still tells the clients what the space has). The first row stays
+ * (as the epoch's snapshot, maybe empty), so the rows still read as a log.
  */
 function rowsAbout(
 	rows: readonly OutlineLiveLogRow[],
@@ -303,6 +332,8 @@ function rowsAbout(
 				b?: Record<string, string>;
 				i?: Record<string, string>;
 				x?: string[];
+				k?: Record<string, number>;
+				l?: Record<string, LiveLostWire[]>;
 			};
 			const pick = (map?: Record<string, string>) =>
 				Object.fromEntries(Object.entries(map ?? {}).filter(([id]) => ids.has(id)));
@@ -315,6 +346,8 @@ function rowsAbout(
 				...(Object.keys(kept.b).length > 0 ? { b: kept.b } : {}),
 				...(Object.keys(kept.i).length > 0 ? { i: kept.i } : {}),
 				...(kept.x.length > 0 ? { x: kept.x } : {}),
+				...(parsed.k && Object.keys(parsed.k).length > 0 ? { k: parsed.k } : {}),
+				...(parsed.l && Object.keys(parsed.l).length > 0 ? { l: parsed.l } : {}),
 			};
 			if (Object.keys(body).length > 0)
 				out.push({ ...row, updateB64: b64(new TextEncoder().encode(JSON.stringify(body))) });
@@ -418,7 +451,7 @@ export async function replayAllLiveEpochs(
 				kept++;
 				logger.warn("Outline live replay failed", { spaceId: e.spaceId, error: String(error) });
 			}
-			await new Promise((resolve) => setTimeout(resolve, OUTLINE_LIVE_REPLAY.pauseMs));
+			await liveSleep(OUTLINE_LIVE_REPLAY.pauseMs);
 		}
 		if (epochs.length < OUTLINE_LIVE_REPLAY.epochsPerPage) break;
 		after = epochs[epochs.length - 1];

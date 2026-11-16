@@ -76,6 +76,14 @@ import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { compareOrderKeys, keyBetween, merge3 } from "@shared/outline";
 import {
+	cancelLiveTimer,
+	type LiveTimer,
+	liveNow,
+	liveSleep,
+	liveTimeout,
+	liveYield,
+} from "@shared/outline-live-clock";
+import {
 	decodeLiveTexts,
 	encodeLiveFrame,
 	encodeLiveHead,
@@ -211,16 +219,20 @@ export const OUTLINE_LIVE_BOUNDS = {
 	/**
 	 * Blocks (deleted ones it remembers included) and UTF-16 units of content one space's session
 	 * holds in its mirror at most. A join that would pass them first unloads the pages nobody is
-	 * in, and is refused (`unavailable`) when that is not enough.
+	 * in, and is refused (`space_full`) when that is not enough.
 	 */
 	maxLoadedBlocks: 20_000,
 	maxLoadedChars: 32 * 1024 * 1024,
 	/** Blocks whose leaving the session is remembered ({@link LiveSpace} `recentlyGone`). */
 	goneBlocks: 5000,
 	/**
-	 * Blocks one person's pages may hold in a space's mirror (pages only that person is in).
-	 * Past it, their own least recently joined page is closed for them before another is loaded,
-	 * so one person with many tabs cannot take the whole of {@link maxLoadedBlocks}.
+	 * Blocks one person's pages may hold in a space's mirror, so one person with many tabs
+	 * cannot take the whole of {@link maxLoadedBlocks}. Past it, a join that would load another
+	 * page is refused (`user_limit`); no open page of theirs is closed for it. Its limits: it is
+	 * per account (the same person on two devices counts once, two people on one account too);
+	 * it counts only the pages that person is alone in (a page someone else is in too is
+	 * nobody's share), pages already loaded cost nothing to join, and a person's first page is
+	 * never refused by it (the space's own bound still applies).
 	 */
 	maxUserBlocks: 8000,
 	/** Blocks put into or taken out of the mirror between two yields to the event loop. */
@@ -250,6 +262,11 @@ export const OUTLINE_LIVE_BOUNDS = {
 	clientKeysHard: 1024,
 	/** Blocks one block selection may name in presence. */
 	presenceBlocks: 200,
+	/**
+	 * Notices of text not taken kept per client key until its client shows it got them (a
+	 * join). Past it the oldest go, with a warning.
+	 */
+	lostPerKey: 1024,
 };
 
 const SERVER_ORIGIN = { live: "server" } as const;
@@ -496,7 +513,7 @@ export class LivePageView {
 	stop(): void {
 		this.gone = true;
 		for (const timer of [this.presenceTimer, this.idleTimer, this.agentTimer, this.agentExpiry])
-			if (timer) clearTimeout(timer);
+			if (timer) cancelLiveTimer(timer);
 		this.presenceTimer = null;
 		this.idleTimer = null;
 		this.agentTimer = null;
@@ -509,7 +526,7 @@ export class LivePageView {
 	readonly presenceCursors = new Set<number>();
 	/** Recipients that skipped presence under backpressure and need the full picture. */
 	readonly presenceBehind = new Set<number>();
-	presenceTimer: ReturnType<typeof setTimeout> | null = null;
+	presenceTimer: LiveTimer | null = null;
 
 	// Agents (outline P2 PR 10b): sessions running with a cursor on this page.
 	/** By narrator id, in the order shown. */
@@ -531,13 +548,13 @@ export class LivePageView {
 	agentReadersStale = false;
 	/** Narrators whose run starting or ending may change this page's agents. */
 	agentInterest: ReadonlySet<string> = new Set();
-	agentTimer: ReturnType<typeof setTimeout> | null = null;
-	agentExpiry: ReturnType<typeof setTimeout> | null = null;
+	agentTimer: LiveTimer | null = null;
+	agentExpiry: LiveTimer | null = null;
 	agentRunning = false;
 	agentDirty = false;
 	agentLastAt = 0;
 
-	idleTimer: ReturnType<typeof setTimeout> | null = null;
+	idleTimer: LiveTimer | null = null;
 
 	get editors(): number {
 		let n = 0;
@@ -551,7 +568,7 @@ export class LivePageView {
 
 	cancelIdle(): void {
 		if (this.idleTimer) {
-			clearTimeout(this.idleTimer);
+			cancelLiveTimer(this.idleTimer);
 			this.idleTimer = null;
 		}
 	}
@@ -561,12 +578,11 @@ export class LivePageView {
 
 	armIdle(): void {
 		this.cancelIdle();
-		this.idleSince = Date.now();
-		this.idleTimer = setTimeout(() => {
+		this.idleSince = liveNow();
+		this.idleTimer = liveTimeout(() => {
 			this.idleTimer = null;
 			if (this.participants.size === 0 && !this.space.closed) this.space.scopeIdle(this);
 		}, OUTLINE_LIVE_TIMING.idleCloseMs);
-		this.idleTimer.unref?.();
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -583,11 +599,10 @@ export class LivePageView {
 
 	schedulePresence(): void {
 		if (this.presenceTimer || this.space.closed) return;
-		this.presenceTimer = setTimeout(() => {
+		this.presenceTimer = liveTimeout(() => {
 			this.presenceTimer = null;
 			this.flushPresence();
 		}, OUTLINE_LIVE_TIMING.presenceMs);
-		this.presenceTimer.unref?.();
 	}
 
 	/**
@@ -730,12 +745,11 @@ export class LivePageView {
 			return;
 		}
 		if (this.agentTimer) return;
-		const wait = Math.max(0, this.agentLastAt + OUTLINE_LIVE_TIMING.agentsMs - Date.now());
-		this.agentTimer = setTimeout(() => {
+		const wait = Math.max(0, this.agentLastAt + OUTLINE_LIVE_TIMING.agentsMs - liveNow());
+		this.agentTimer = liveTimeout(() => {
 			this.agentTimer = null;
 			void this.runAgents();
 		}, wait);
-		this.agentTimer.unref?.();
 	}
 
 	/** Access changed somewhere: who may name which agent is asked again. */
@@ -753,7 +767,7 @@ export class LivePageView {
 	async runAgents(): Promise<void> {
 		if (this.space.closed) return;
 		this.agentRunning = true;
-		this.agentLastAt = Date.now();
+		this.agentLastAt = liveNow();
 		try {
 			await this.refreshAgents();
 		} catch (error) {
@@ -778,7 +792,7 @@ export class LivePageView {
 			.slice(-OUTLINE_LIVE_AGENT_BOUNDS.writtenBlocks);
 		if (blocks.length === 0) return;
 		this.agentWrites.delete(narratorId);
-		this.agentWrites.set(narratorId, { blocks, at: Date.now() });
+		this.agentWrites.set(narratorId, { blocks, at: liveNow() });
 		while (this.agentWrites.size > OUTLINE_LIVE_AGENT_BOUNDS.narrators) {
 			const oldest = this.agentWrites.keys().next().value;
 			if (oldest === undefined) break;
@@ -837,7 +851,7 @@ export class LivePageView {
 	}
 
 	async refreshAgents(): Promise<void> {
-		const now = Date.now();
+		const now = liveNow();
 		for (const [id, w] of this.agentWrites)
 			if (now - w.at >= OUTLINE_LIVE_AGENT_BOUNDS.writeMs) this.agentWrites.delete(id);
 		const doing: string[] = [];
@@ -929,19 +943,18 @@ export class LivePageView {
 		}
 		if (changed) this.schedulePresence();
 		// A cursor on a block just written lasts its while: look again when the first one ends.
-		if (this.agentExpiry) clearTimeout(this.agentExpiry);
+		if (this.agentExpiry) cancelLiveTimer(this.agentExpiry);
 		this.agentExpiry = null;
 		let first = Number.POSITIVE_INFINITY;
 		for (const w of this.agentWrites.values()) first = Math.min(first, w.at);
 		if (Number.isFinite(first)) {
-			this.agentExpiry = setTimeout(
+			this.agentExpiry = liveTimeout(
 				() => {
 					this.agentExpiry = null;
 					this.requestAgents();
 				},
-				Math.max(0, first + OUTLINE_LIVE_AGENT_BOUNDS.writeMs - Date.now()),
+				Math.max(0, first + OUTLINE_LIVE_AGENT_BOUNDS.writeMs - liveNow()),
 			);
-			this.agentExpiry.unref?.();
 		}
 	}
 
@@ -986,7 +999,7 @@ export class LiveSpace {
 	private readonly orphanScope = new Map<string, string>();
 	/** Per page: the highest operation number no longer in `opLog`. */
 	private readonly opDropped = new Map<string, number>();
-	private sweepTimer: ReturnType<typeof setTimeout> | null = null;
+	private sweepTimer: LiveTimer | null = null;
 	/**
 	 * Blocks that left the session lately (their tree was unloaded): typing still on its way
 	 * into one is told back as not taken, not refused as text of a block that never was.
@@ -999,6 +1012,8 @@ export class LiveSpace {
 	 * received.
 	 */
 	private readonly keyLost = new Map<string, LiveLostWire[]>();
+	/** Client keys whose {@link keyLost} changed since the last log row about them. */
+	private readonly lostPending = new Set<string>();
 	/** Entries of {@link keyLost} already sent, by participant number (not sent twice to one). */
 	private readonly lostSent = new Map<number, number>();
 	/** Trees being loaded (a join waits for the one already under way). */
@@ -1019,13 +1034,13 @@ export class LiveSpace {
 	private windowUpdates: WindowUpdate[] = [];
 	private windowCommits: ScopedCommit[] = [];
 	private readonly windowAcks = new Map<number, Array<[number, number, LiveOp[]?]>>();
-	private broadcastTimer: ReturnType<typeof setTimeout> | null = null;
+	private broadcastTimer: LiveTimer | null = null;
 
 	// Text not committed yet: block id → who changed it last (null: not a person).
 	private readonly dirty = new Map<string, string | null>();
 	private firstDirtyAt = 0;
 	private lastDirtyAt = 0;
-	private flushTimer: ReturnType<typeof setTimeout> | null = null;
+	private flushTimer: LiveTimer | null = null;
 	/** Blocks whose text changed in the update being applied (for structural transactions). */
 	private touched: Set<string> | null = null;
 
@@ -1043,7 +1058,7 @@ export class LiveSpace {
 	private readonly keyDurable = new Map<string, number>();
 	/** Client keys whose durable transaction advanced since the last log row about them. */
 	private readonly keysPending = new Set<string>();
-	private persistTimer: ReturnType<typeof setTimeout> | null = null;
+	private persistTimer: LiveTimer | null = null;
 	private persistChain: Promise<void> = Promise.resolve();
 	private logSeq = 0;
 	private snapshotWritten = false;
@@ -1191,25 +1206,13 @@ export class LiveSpace {
 		}
 		if (bytes > OUTLINE_LIVE_LIMITS.maxPageBytes) return { refused: "too_large" };
 		if (this.closed) return { refused: "ended" };
-		// Room first: pages nobody is in go, least recently left first.
-		const over = () =>
+		// Room first: pages nobody is in go, least recently left first. A page someone is
+		// connected to is never closed to make room for another: that would only move the
+		// shortage to it (its tab would come back and close the next one, round and round).
+		const overSpace = () =>
 			this.mirror.size + blocks.length > OUTLINE_LIVE_BOUNDS.maxLoadedBlocks ||
-			this.mirror.chars + chars > OUTLINE_LIVE_BOUNDS.maxLoadedChars ||
-			blocks.length > this.room();
-		// The pages only this person is in, and what they hold.
-		const own = () =>
-			userId === undefined
-				? []
-				: [...this.scopes.values()]
-						.filter(
-							(v) =>
-								!v.gone &&
-								v.participants.size > 0 &&
-								[...v.participants.values()].every((p) => p.userId === userId),
-						)
-						.sort((a, b) => a.joinedAt - b.joinedAt);
-		const ownBlocks = () => own().reduce((n, v) => n + v.blocks, 0);
-		const tooMany = () => ownBlocks() + blocks.length > OUTLINE_LIVE_BOUNDS.maxUserBlocks;
+			this.mirror.chars + chars > OUTLINE_LIVE_BOUNDS.maxLoadedChars;
+		const over = () => overSpace() || blocks.length > this.room();
 		if (over()) {
 			const idle = [...this.scopes.values()]
 				.filter((v) => v.participants.size === 0 && !v.gone)
@@ -1219,15 +1222,22 @@ export class LiveSpace {
 				await this.unloadScope(v);
 			}
 		}
-		// Then this person's own pages, least recently joined first: one person's tabs do not
-		// keep everyone else out of the space, and a person's newest page wins over their oldest.
-		while (over() || tooMany()) {
-			const oldest = own()[0];
-			if (!oldest) break;
-			for (const p of [...oldest.participants.values()]) this.dismiss(p, "unavailable");
-			if (!(await this.unloadScope(oldest))) break;
+		if (this.closed) return { refused: "ended" };
+		// One person's tabs do not take the whole space: past their share, their new page is
+		// refused (they close one of their own and retry), never one of their open ones closed.
+		if (userId !== undefined) {
+			let own = 0;
+			for (const v of this.scopes.values()) {
+				if (v.gone || v.participants.size === 0) continue;
+				let alone = true;
+				for (const p of v.participants.values()) if (p.userId !== userId) alone = false;
+				if (alone) own += v.blocks;
+			}
+			if (own > 0 && own + blocks.length > OUTLINE_LIVE_BOUNDS.maxUserBlocks)
+				return { refused: "user_limit" };
 		}
-		if (over() || this.closed) return { refused: this.closed ? "ended" : "unavailable" };
+		if (overSpace()) return { refused: "space_full" };
+		if (over()) return { refused: "unavailable" };
 		const base = this.era;
 		const step = OUTLINE_LIVE_BOUNDS.loadStep;
 		for (let at = 0; at < blocks.length; at += step) {
@@ -1271,7 +1281,7 @@ export class LiveSpace {
 
 	private forget(id: string): void {
 		this.recentlyGone.delete(id);
-		this.recentlyGone.set(id, Date.now());
+		this.recentlyGone.set(id, liveNow());
 		if (this.recentlyGone.size > OUTLINE_LIVE_BOUNDS.goneBlocks) {
 			const oldest = this.recentlyGone.keys().next().value;
 			if (oldest !== undefined) this.recentlyGone.delete(oldest);
@@ -1393,7 +1403,7 @@ export class LiveSpace {
 		// A document is kept until every end drops it (`sweepDocs`), also when its block is
 		// deleted: each one counts against the session's bound.
 		this.charge(id, OUTLINE_LIVE_BOUNDS.docCostBytes);
-		this.docTouched.set(id, Date.now());
+		this.docTouched.set(id, liveNow());
 		this.scheduleSweep();
 		if (seed.length > 0)
 			this.pendingRows.push({
@@ -1406,7 +1416,7 @@ export class LiveSpace {
 		made.doc.on("update", (update: Uint8Array, origin: unknown) => {
 			if (this.closed) return;
 			this.charge(id, update.length);
-			this.docTouched.set(id, Date.now());
+			this.docTouched.set(id, liveNow());
 			const from = origin instanceof Participant ? origin.pno : 0;
 			const gen = this.mirror.get(id)?.gen ?? 0;
 			this.windowUpdates.push({
@@ -1643,7 +1653,7 @@ export class LiveSpace {
 	abandon(): void {
 		this.closed = true;
 		for (const timer of [this.broadcastTimer, this.flushTimer, this.persistTimer, this.sweepTimer])
-			if (timer) clearTimeout(timer);
+			if (timer) cancelLiveTimer(timer);
 		for (const view of this.scopes.values()) view.stop();
 		this.participants.clear();
 		for (const view of this.scopes.values()) view.participants.clear();
@@ -1797,9 +1807,12 @@ export class LiveSpace {
 		// Text of its earlier transactions that was not taken, which it was not told of yet.
 		// What the client was acknowledged it was also told of; the rest it is told now.
 		if (sameSession) this.toldLost(head.key, resume.tx);
+		// Of an ended session: what the client was not acknowledged yet (a notice goes out with
+		// the acknowledgement of its transaction, so one acknowledged was received).
+		const before = sameSession ? [] : (lostBefore ?? []).filter((l) => l[0] > (resume?.tx ?? 0));
 		const lost = sameSession
 			? (this.keyLost.get(head.key) ?? []).filter((l) => l[0] <= processed)
-			: [...(lostBefore ?? [])];
+			: before;
 		if (lost.length > 0) joined.x = lost;
 		let frame: Uint8Array;
 		try {
@@ -1827,8 +1840,10 @@ export class LiveSpace {
 			return { refused: "unavailable" };
 		}
 		if (lost.length > 0) this.lostSent.set(p.pno, processed);
+		// Sent is not received: kept until the client's next join shows it got them.
+		this.adoptLost(head.key, before);
 		this.nextPno++;
-		scope.joinedAt = Date.now();
+		scope.joinedAt = liveNow();
 		this.participants.set(p.pno, p);
 		scope.participants.set(p.pno, p);
 		scope.cancelIdle();
@@ -1974,8 +1989,8 @@ export class LiveSpace {
 	private brokenLogged = 0;
 
 	private dropBroken(p: Participant, error: unknown): void {
-		if (Date.now() - this.brokenLogged > 60_000) {
-			this.brokenLogged = Date.now();
+		if (liveNow() - this.brokenLogged > 60_000) {
+			this.brokenLogged = liveNow();
 			logger.warn("Outline live frame failed; participant dropped", {
 				spaceId: this.spaceId,
 				error: String(error),
@@ -1986,11 +2001,10 @@ export class LiveSpace {
 
 	private scheduleBroadcast(): void {
 		if (this.broadcastTimer || this.closed) return;
-		this.broadcastTimer = setTimeout(() => {
+		this.broadcastTimer = liveTimeout(() => {
 			this.broadcastTimer = null;
 			this.flushBroadcast();
 		}, OUTLINE_LIVE_TIMING.broadcastMs);
-		this.broadcastTimer.unref?.();
 	}
 
 	/**
@@ -2000,7 +2014,7 @@ export class LiveSpace {
 	 */
 	flushBroadcast(): void {
 		if (this.broadcastTimer) {
-			clearTimeout(this.broadcastTimer);
+			cancelLiveTimer(this.broadcastTimer);
 			this.broadcastTimer = null;
 		}
 		const updates = this.windowUpdates;
@@ -2155,9 +2169,14 @@ export class LiveSpace {
 			const known = this.mirror.get(e.id);
 			const gen = known?.gen ?? 0;
 			if ((e.gen ?? 0) > gen) return null;
-			// A block that went to a page nobody has open: the session does not follow it.
-			if (known?.deleted && known.held !== p.root) lost.push(e.id);
-			else if ((e.gen ?? 0) === gen) out.push(e);
+			// Of the document the session has (a deleted block's too, wherever it is: typing that
+			// crossed a delete, or a block that went along deleted with its parent, is kept in its
+			// text and goes with it when it is brought back). A block that went to a page nobody
+			// has open was given a new generation then, so typing into the copy it left is never
+			// taken here: whatever is reported not taken is of a generation older than the
+			// block's, and the client's copy is replaced when the block is shown to it again
+			// (the client relies on it: `LiveClient.keepLost`).
+			if ((e.gen ?? 0) === gen) out.push(e);
 			// Of a block whose text the participant's page holds: it is told of the drop (a join
 			// names it). Of a block that left its page (it holds it as deleted, and is told
 			// nothing more of it) and whose document is another by now: typing that crossed the
@@ -2174,8 +2193,20 @@ export class LiveSpace {
 		if (blocks.length === 0) return;
 		const list = this.keyLost.get(p.key) ?? [];
 		list.push([n, [...blocks]]);
-		while (list.length > 64) list.shift();
+		if (list.length > OUTLINE_LIVE_BOUNDS.lostPerKey) {
+			// Never silently: a client this far behind on its notices has lost touch with its
+			// typing long ago (it is told at its next join; an entry is a few block ids).
+			const gone = list.splice(0, list.length - OUTLINE_LIVE_BOUNDS.lostPerKey);
+			logger.warn("Outline live: notices of text not taken dropped for a client", {
+				spaceId: this.spaceId,
+				dropped: gone.length,
+				oldestTx: gone[0]?.[0],
+			});
+		}
 		this.keyLost.set(p.key, list);
+		// In the log with the transaction's position (`persistStep`), before it is acknowledged.
+		this.lostPending.add(p.key);
+		this.schedulePersist();
 		this.scheduleBroadcast();
 	}
 
@@ -2186,9 +2217,28 @@ export class LiveSpace {
 
 	/** The client of `key` was told what was not taken of its transactions up to `upTo`. */
 	private toldLost(key: string, upTo: number): void {
-		const rest = (this.keyLost.get(key) ?? []).filter((l) => l[0] > upTo);
+		const had = this.keyLost.get(key);
+		if (!had) return;
+		const rest = had.filter((l) => l[0] > upTo);
+		if (rest.length === had.length) return;
 		if (rest.length > 0) this.keyLost.set(key, rest);
 		else this.keyLost.delete(key);
+		this.lostPending.add(key);
+		this.schedulePersist();
+	}
+
+	/**
+	 * Notices of an ended session of this client's (`lostBefore`) are this session's to deliver
+	 * now: kept, logged and sent again until the client shows it got them (a later join).
+	 */
+	private adoptLost(key: string, lost: readonly LiveLostWire[]): void {
+		if (lost.length === 0) return;
+		const list = [...(this.keyLost.get(key) ?? [])];
+		for (const l of lost) if (!list.some((x) => x[0] === l[0])) list.push(l);
+		list.sort((a, b) => a[0] - b[0]);
+		this.keyLost.set(key, list);
+		this.lostPending.add(key);
+		this.schedulePersist();
 	}
 
 	/**
@@ -2306,7 +2356,7 @@ export class LiveSpace {
 		// Edited again: worth another try.
 		if (this.parked.delete(id)) this.failures.delete(id);
 		this.dirty.set(id, userId);
-		const now = Date.now();
+		const now = liveNow();
 		if (this.firstDirtyAt === 0) this.firstDirtyAt = now;
 		this.lastDirtyAt = now;
 		this.scheduleFlush();
@@ -2314,24 +2364,23 @@ export class LiveSpace {
 
 	private scheduleFlush(delayMs?: number): void {
 		if (this.closed) return;
-		if (this.flushTimer) clearTimeout(this.flushTimer);
+		if (this.flushTimer) cancelLiveTimer(this.flushTimer);
 		const due =
 			delayMs !== undefined
-				? Date.now() + delayMs
+				? liveNow() + delayMs
 				: Math.min(
 						this.lastDirtyAt + OUTLINE_LIVE_TIMING.flushIdleMs,
 						this.firstDirtyAt + OUTLINE_LIVE_TIMING.flushMaxMs,
 					);
-		this.flushTimer = setTimeout(
+		this.flushTimer = liveTimeout(
 			() => {
 				this.flushTimer = null;
 				this.schedule(async () => {
 					await this.flushContent();
 				});
 			},
-			Math.max(0, due - Date.now()),
+			Math.max(0, due - liveNow()),
 		);
-		this.flushTimer.unref?.();
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -2361,7 +2410,7 @@ export class LiveSpace {
 			} catch (error) {
 				// The worker's queue is full: wait a little, a few times.
 				if (!isBusyText(error) || attempt >= 2) throw error;
-				await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+				await liveSleep(100 * (attempt + 1));
 			}
 		}
 		let at = 0;
@@ -2592,7 +2641,7 @@ export class LiveSpace {
 	 */
 	async flushContent(): Promise<boolean> {
 		if (this.flushTimer) {
-			clearTimeout(this.flushTimer);
+			cancelLiveTimer(this.flushTimer);
 			this.flushTimer = null;
 		}
 		if (this.dirty.size === 0) return true;
@@ -2612,7 +2661,7 @@ export class LiveSpace {
 		// past this budget the blocks not tried alone wait, as they are, for the next flush (at
 		// least one is tried per flush, so it gets through them). Those that failed alone go as
 		// code from now on, so the next batch does not fail on them again.
-		const deadline = Date.now() + OUTLINE_LIVE_TIMING.narrowBudgetMs;
+		const deadline = liveNow() + OUTLINE_LIVE_TIMING.narrowBudgetMs;
 		let tried = 0;
 		const giveUp = (id: string, user: string | null) => {
 			const n = (this.failures.get(id) ?? 0) + 1;
@@ -2646,7 +2695,7 @@ export class LiveSpace {
 				continue;
 			}
 			for (const id of failed) {
-				if (tried > 0 && Date.now() >= deadline) {
+				if (tried > 0 && liveNow() >= deadline) {
 					// Not tried alone: nothing known against it, so it is neither counted nor fenced.
 					ok = false;
 					redirty([id], user);
@@ -2671,7 +2720,7 @@ export class LiveSpace {
 			}
 		}
 		if (!ok) {
-			this.firstDirtyAt = Date.now();
+			this.firstDirtyAt = liveNow();
 			this.scheduleFlush(OUTLINE_LIVE_TIMING.flushRetryMs);
 		}
 		return ok;
@@ -3377,11 +3426,10 @@ export class LiveSpace {
 
 	private schedulePersist(): void {
 		if (this.persistTimer || this.closed) return;
-		this.persistTimer = setTimeout(() => {
+		this.persistTimer = liveTimeout(() => {
 			this.persistTimer = null;
 			void this.persistNow();
 		}, OUTLINE_LIVE_TIMING.persistMs);
-		this.persistTimer.unref?.();
 	}
 
 	/**
@@ -3390,7 +3438,7 @@ export class LiveSpace {
 	 */
 	persistNow(): Promise<boolean> {
 		if (this.persistTimer) {
-			clearTimeout(this.persistTimer);
+			cancelLiveTimer(this.persistTimer);
 			this.persistTimer = null;
 		}
 		const step = this.persistChain.then(() => this.persistStep());
@@ -3432,7 +3480,8 @@ export class LiveSpace {
 			this.syncPending.size === 0 &&
 			this.intentPending.size === 0 &&
 			this.cancelPending.size === 0 &&
-			this.keysPending.size === 0
+			this.keysPending.size === 0 &&
+			this.lostPending.size === 0
 		)
 			return;
 		this.pendingRows = [];
@@ -3462,6 +3511,11 @@ export class LiveSpace {
 			if (tx !== undefined) keys.set(key, tx);
 		}
 		this.keysPending.clear();
+		// What was not taken of those transactions goes in the same row as how far they reached:
+		// a client told after a crash that a transaction is in the space is told this too.
+		const lost = new Map<string, LiveLostWire[]>();
+		for (const key of this.lostPending) lost.set(key, [...(this.keyLost.get(key) ?? [])]);
+		this.lostPending.clear();
 		let snapshot = false;
 		if (!this.snapshotWritten) {
 			// Every document whole first: later increments build on the items they hold. Blocks
@@ -3513,14 +3567,15 @@ export class LiveSpace {
 			endStretch();
 			endDrops();
 		}
-		if (sync.size > 0 || intents.size > 0 || cancels.size > 0 || keys.size > 0)
-			rows.push(row(encodeSyncRow(sync, intents, cancels, keys), "system", LIVE_SYNC_ACTOR));
+		if (sync.size > 0 || intents.size > 0 || cancels.size > 0 || keys.size > 0 || lost.size > 0)
+			rows.push(row(encodeSyncRow(sync, intents, cancels, keys, lost), "system", LIVE_SYNC_ACTOR));
 		try {
 			await outlineStore.appendLiveLog(rows);
 		} catch (error) {
 			// Kept for the next attempt (the seq numbers drawn stay unused).
 			this.pendingRows = [...pending, ...this.pendingRows];
 			for (const key of keys.keys()) this.keysPending.add(key);
+			for (const key of lost.keys()) this.lostPending.add(key);
 			this.schedulePersist();
 			throw error;
 		}
@@ -3571,10 +3626,15 @@ export class LiveSpace {
 		const covered = this.pendingRows;
 		this.pendingRows = [];
 		const compacted = [row(this.logSnapshot(), "system", LIVE_LOG_ACTOR)];
-		if (ahead.size > 0 || this.openIntents.size > 0 || this.keyDurable.size > 0) {
+		if (
+			ahead.size > 0 ||
+			this.openIntents.size > 0 ||
+			this.keyDurable.size > 0 ||
+			this.keyLost.size > 0
+		) {
 			compacted.push(
 				row(
-					encodeSyncRow(ahead, this.openIntents, new Set(), this.keyDurable),
+					encodeSyncRow(ahead, this.openIntents, new Set(), this.keyDurable, this.keyLost),
 					"system",
 					LIVE_SYNC_ACTOR,
 				),
@@ -3653,13 +3713,12 @@ export class LiveSpace {
 
 	private scheduleSweep(): void {
 		if (this.sweepTimer || this.closed) return;
-		this.sweepTimer = setTimeout(() => {
+		this.sweepTimer = liveTimeout(() => {
 			this.sweepTimer = null;
 			this.schedule(async () => {
 				await this.sweepDocs();
 			});
 		}, OUTLINE_LIVE_TIMING.sweepMs);
-		this.sweepTimer.unref?.();
 	}
 
 	/** Whether a block's document can be dropped now. */
@@ -3681,7 +3740,7 @@ export class LiveSpace {
 	 */
 	async sweepDocs(): Promise<number> {
 		if (this.sweepTimer) {
-			clearTimeout(this.sweepTimer);
+			cancelLiveTimer(this.sweepTimer);
 			this.sweepTimer = null;
 		}
 		if (this.closed || this.docs.size === 0) return 0;
@@ -3689,7 +3748,7 @@ export class LiveSpace {
 			this.scheduleSweep();
 			return 0;
 		}
-		const now = Date.now();
+		const now = liveNow();
 		const over = this.docs.size - OUTLINE_LIVE_BOUNDS.softDocs;
 		const idle: Array<[number, string]> = [];
 		for (const id of this.docs.keys()) {
@@ -3766,7 +3825,7 @@ export class LiveSpace {
 		this.closed = true;
 		this.closedClean = committed && this.dirty.size === 0 && this.parked.size === 0;
 		for (const timer of [this.broadcastTimer, this.flushTimer, this.persistTimer, this.sweepTimer])
-			if (timer) clearTimeout(timer);
+			if (timer) cancelLiveTimer(timer);
 		for (const view of this.scopes.values()) view.stop();
 		for (const p of [...this.participants.values()]) {
 			try {
@@ -3853,7 +3912,7 @@ type LogRowMaker = (
 
 /** Let timers and I/O run between two steps of a long lane task. */
 function yieldToLoop(): Promise<void> {
-	return new Promise((resolve) => setImmediate(resolve));
+	return liveYield();
 }
 
 /**
@@ -3889,6 +3948,8 @@ function encodeSyncRow(
 	intents: ReadonlyMap<string, string>,
 	cancels: ReadonlySet<string>,
 	keys: ReadonlyMap<string, number>,
+	/** Per client key: what of its transactions was not taken and it was not told yet (whole). */
+	lost: ReadonlyMap<string, readonly LiveLostWire[]> = new Map(),
 ): Uint8Array {
 	return utf8.encode(
 		JSON.stringify({
@@ -3896,6 +3957,7 @@ function encodeSyncRow(
 			...(intents.size > 0 ? { i: Object.fromEntries(intents) } : {}),
 			...(cancels.size > 0 ? { x: [...cancels] } : {}),
 			...(keys.size > 0 ? { k: Object.fromEntries(keys) } : {}),
+			...(lost.size > 0 ? { l: Object.fromEntries(lost) } : {}),
 		}),
 	);
 }

@@ -30,6 +30,7 @@ import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
 import { hotOnce, hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { subscribeSettingsChanges } from "@server/lib/settings";
+import { type LiveTimer, liveNow, liveTimeout } from "@shared/outline-live-clock";
 import {
 	encodeLiveFrame,
 	isLiveHandle,
@@ -101,7 +102,7 @@ const state = hotSafe("narrafork.outlineLive.state", () => ({
 	/** Joins being authorized or opened, per socket (they count toward the socket's limit). */
 	joining: new Map<LiveSocket, Set<number>>(),
 	reauthFilters: [] as ReauthFilter[],
-	reauthTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+	reauthTimer: undefined as LiveTimer | undefined,
 	accessEpoch: 0,
 	replayDone: null as Promise<unknown> | null,
 	/**
@@ -250,7 +251,7 @@ function warnRarely(message: string, fields: Record<string, unknown>): void {
 }
 
 function takeJoinToken(socket: LiveSocket): boolean {
-	const now = Date.now();
+	const now = liveNow();
 	const b = state.joinBudget.get(socket) ?? {
 		tokens: OUTLINE_LIVE_SOCKET_BOUNDS.joinBurst,
 		at: now,
@@ -289,13 +290,13 @@ function laneFor(spaceId: string): SpaceLane {
 
 /** Drop a lane nothing uses any more. */
 function retireLane(spaceId: string): void {
-	setTimeout(() => {
+	liveTimeout(() => {
 		const lane = state.lanes.get(spaceId);
 		if (lane && !lane.busy && !state.sessions.has(spaceId)) {
 			state.lanes.delete(spaceId);
 			state.pending.delete(spaceId);
 		}
-	}, 0).unref?.();
+	}, 0);
 }
 
 /** Push commits recorded for the space into its sessions (runs after every lane task). */
@@ -410,7 +411,8 @@ async function openSession(space: OutlineSpaceRow): Promise<LiveSpace> {
 			const tag = `${space.id}:${e.epoch}`;
 			if (state.unreadable.has(tag)) continue;
 			const r = await replayLiveEpochDetailed(space.id, e.epoch);
-			if (r.outcome !== "kept" || r.changes) await recordEnded(space.id, e.epoch, r.keys);
+			if (r.outcome !== "kept" || r.changes || r.partial)
+				await recordEnded(space.id, e.epoch, r.keys, r.lost);
 			if (r.outcome !== "kept") continue;
 			if (r.changes) adopted.push({ epoch: e.epoch, changes: r.changes });
 			else state.unreadable.add(tag);
@@ -705,8 +707,7 @@ function scheduleReauth(filter: ReauthFilter): void {
 	state.accessEpoch++;
 	state.reauthFilters.push(filter);
 	if (!state.reauthTimer) {
-		state.reauthTimer = setTimeout(() => void reauthorize(), OUTLINE_LIVE_TIMING.broadcastMs);
-		state.reauthTimer.unref?.();
+		state.reauthTimer = liveTimeout(() => void reauthorize(), OUTLINE_LIVE_TIMING.broadcastMs);
 	}
 }
 
@@ -793,7 +794,8 @@ export function startLiveReplay(): Promise<unknown> {
 					return "empty" as const;
 				}
 				const r = await replayLiveEpochDetailed(spaceId, epoch);
-				if (r.outcome !== "kept" || r.changes) await recordEnded(spaceId, epoch, r.keys);
+				if (r.outcome !== "kept" || r.changes || r.partial)
+					await recordEnded(spaceId, epoch, r.keys, r.lost);
 				return r.outcome;
 			};
 			// Always in the space's lane: a join opening the space replays in it too, so the two
