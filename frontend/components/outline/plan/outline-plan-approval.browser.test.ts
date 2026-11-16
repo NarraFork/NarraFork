@@ -40,10 +40,10 @@ import {
 	reviewOutlinePlan,
 } from "../../../../server/services/outline-plan-mode";
 import {
-	handleOutlinePageMessage,
-	type OutlinePageSocket,
-	releaseOutlinePageSubscriptions,
-} from "../../../../server/websocket/outline-page-ws";
+	handleOutlineBlockMessage,
+	type OutlineBlockSocket,
+	releaseOutlineBlockSubscriptions,
+} from "../../../../server/websocket/outline-block-ws";
 import type * as Fixture from "./outline-plan-approval.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -59,7 +59,8 @@ let owner: string;
 let colleague: string;
 let projectId: string;
 let lead: string;
-const subscribedPages = new Set<string>();
+/** Blocks whose subtrees a card watches (the plan's root). */
+const watchedSubtrees = new Set<string>();
 
 function api() {
 	const app = new Hono();
@@ -141,18 +142,18 @@ beforeAll(async () => {
 		websocket: {
 			message(ws, message) {
 				if (typeof message !== "string") return;
-				const frame = JSON.parse(message) as { type?: string; pageId?: string };
-				if (frame.type === "outline_page_subscribe" || frame.type === "outline_page_unsubscribe")
-					void handleOutlinePageMessage(
-						ws as unknown as OutlinePageSocket,
-						frame as Parameters<typeof handleOutlinePageMessage>[1],
+				const frame = JSON.parse(message) as { type?: string; subtrees?: string[] };
+				if (frame.type === "outline_watch" || frame.type === "outline_unwatch")
+					void handleOutlineBlockMessage(
+						ws as unknown as OutlineBlockSocket,
+						frame as Parameters<typeof handleOutlineBlockMessage>[1],
 					).then(() => {
-						if (frame.type === "outline_page_subscribe" && frame.pageId)
-							subscribedPages.add(frame.pageId);
+						if (frame.type === "outline_watch")
+							for (const id of frame.subtrees ?? []) watchedSubtrees.add(id);
 					});
 			},
 			close(ws) {
-				releaseOutlinePageSubscriptions(ws as unknown as OutlinePageSocket);
+				releaseOutlineBlockSubscriptions(ws as unknown as OutlineBlockSocket);
 			},
 		},
 	});
@@ -291,7 +292,6 @@ async function waitingPlan(review?: Array<{ step?: number; text: string }>, deta
 		requestId,
 		space,
 		root: root?.blockId as string,
-		pageId: (await outlineStore.getBlock(root?.blockId as string))?.pageId as string,
 		steps: [written.results[1]?.blockId as string, written.results[2]?.blockId as string],
 		permission: {
 			id: requestId,
@@ -380,7 +380,7 @@ test("the card's summary and diff; an edit by the person shows live; a change by
 	expect(shown[0]).toContain("Ship the importer");
 	expect(shown[1]).toContain("rerun by hand");
 	expect(shown[2]).toContain("Step A");
-	await waitFor("the page subscription", () => subscribedPages.has(plan.pageId));
+	await waitFor("the watch on the plan's subtree", () => watchedSubtrees.has(plan.root));
 
 	// The person rewrites a step in the outline beside the session: the open diff follows.
 	await writeOutline({

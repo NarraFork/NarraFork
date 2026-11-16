@@ -64,13 +64,14 @@
  *
  * COST, once per run end: one indexed read of the session's claims (and nothing else when it
  * holds none); for project tasks, their ancestors by primary key level by level, the claims of
- * the session's subagents (bounded), one page-structure read per tree not kept already (at most
+ * the session's subagents (bounded), one subtree read by block per tree not kept already (at most
  * {@link OUTLINE_RELEASE_LIMITS.trees}; the rest are kept) with the claims and waits of
  * the open tasks in it (bounded), one conditional write of the leases, and for tasks given back
  * the handoff's reads and one commit per space.
  */
 import { logger } from "@server/lib/logger";
 import { readNarratorHandoffRows } from "./access-reads";
+import { readBlockSubtree } from "./block-tree";
 import {
 	loadOutlineAncestors,
 	OUTLINE_HANDOFF_ACTOR,
@@ -78,7 +79,6 @@ import {
 	planOutlineHandoffs,
 } from "./handoff";
 import { OUTLINE_TASK_GRACE_LEASE_MS, OUTLINE_TASK_IDLE_LEASE_MS } from "./model";
-import { readSubtree } from "./read";
 import { outlineStore } from "./store";
 import type {
 	OutlineBlockMeta,
@@ -109,7 +109,7 @@ export const OUTLINE_RELEASE_LIMITS = {
 	/** Levels of ancestors read above the tasks held. */
 	depth: 64,
 	/**
-	 * Trees looked into for other sessions' work and for questions (one page read each); the rest
+	 * Trees looked into for other sessions' work and for questions (one subtree read each); the rest
 	 * are kept.
 	 */
 	trees: 20,
@@ -338,10 +338,10 @@ async function decide(
  * Of the trees (by their topmost held task), those something else keeps: another session is
  * doing a task in it, or a question or a change waiting for confirmation is open anywhere in it
  * (the session waits for people there, even when the nearest task above is not one it holds).
- * One page-structure read per tree, at most {@link OUTLINE_RELEASE_LIMITS.trees}; the claims and
+ * One subtree read by block per tree, at most {@link OUTLINE_RELEASE_LIMITS.trees}; the claims and
  * the waits of at most {@link OUTLINE_RELEASE_LIMITS.treeTasks} open tasks not held by the
  * session. What is not known is kept: a tree past {@link OUTLINE_RELEASE_LIMITS.trees}, one that
- * cannot be read or is on a page read truncated, and one whose open tasks did not all fit in
+ * cannot be read or whose read was cut short, and one whose open tasks did not all fit in
  * {@link OUTLINE_RELEASE_LIMITS.treeTasks}.
  */
 async function treesInWork(
@@ -356,7 +356,7 @@ async function treesInWork(
 	const subjects: OutlineTaskSubject[] = [];
 	for (const group of groups.slice(OUTLINE_RELEASE_LIMITS.trees)) out.add(group);
 	for (const group of groups.slice(0, OUTLINE_RELEASE_LIMITS.trees)) {
-		const subtree = await readSubtree(group, { store }).catch(() => null);
+		const subtree = await readBlockSubtree(group, { store }).catch(() => null);
 		if (!subtree || subtree.state.truncated) {
 			out.add(group);
 			continue;

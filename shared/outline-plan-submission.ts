@@ -91,7 +91,6 @@ export function outlinePlanSubmissionOf(
 		root: {
 			blockId: root.blockId,
 			spaceId: root.spaceId,
-			pageId: typeof root.pageId === "string" ? root.pageId : root.blockId,
 			address: root.address,
 			title: typeof root.title === "string" ? root.title : root.address,
 			round: typeof root.round === "number" ? root.round : 1,

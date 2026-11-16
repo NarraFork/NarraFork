@@ -3,7 +3,7 @@
  * (`team-activity.test.ts`) and on PostgreSQL (`tests/server/services/outline/
  * pg-outline-team-activity.test.ts`), with the outline store and access executor of that
  * database injected. They cover what a look reads and says: the scope (related trees, the project
- * task page, files), what is left out (the session's own and its subagents' commits, a person's
+ * task list, files), what is left out (the session's own and its subagents' commits, a person's
  * change to a task it holds, tidying, unrelated trees, session spaces), names, the 4 KiB / 20 line
  * budget, the window and the cursor. Writing the row (cadence, delivery, the prompt) goes through
  * the session runtime, which runs on SQLite only, and is tested in the test file.
@@ -84,8 +84,8 @@ async function write(
 const link = (r: OutlineOpResult, title: string) => `[[${r.address}|${title}]]`;
 
 /**
- * A project with sessions A (the one looking), B and C of one person, a page with A's tree
- * (`auth 模块稳定` > `改刷新逻辑`, `补测试`; A holds `补测试`) and the project task page with a task
+ * A project with sessions A (the one looking), B and C of one person, a top-level block with A's
+ * tree (`auth 模块稳定` > `改刷新逻辑`, `补测试`; A holds `补测试`) and the project task list with a task
  * nobody started, all written well before the window. `改刷新逻辑` is a person's task in A's tree
  * (its manager is the person): a task A created itself ending elsewhere is told to A by its team
  * row (`team-events.ts`, outline P2 PR 10a), and team activity leaves it out (the last scenario).
@@ -151,7 +151,7 @@ async function project(ctx: TeamActivityContext) {
 
 export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 	{
-		name: "what others did around the session's trees and on the task page, and nothing else",
+		name: "what others did around the session's trees and under the task list, and nothing else",
 		async run(ctx) {
 			resetOutlineTeamActivityForTests();
 			const p = await project(ctx);
@@ -173,14 +173,14 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 				],
 				t.next(),
 			);
-			// C adds a claimable task to the task page and starts the waiting one.
+			// C adds a claimable task to the task list and starts the waiting one.
 			const [added] = await write(
 				space.id,
 				agent(p.c, p.alice.id),
 				[
 					{
 						op: "insert",
-						parent: { id: (await pageOf(p.upgrade)).id },
+						parent: { id: (await parentOf(p.upgrade)).id },
 						content: "迁移配置",
 						task: { status: "todo", claimable: true },
 					},
@@ -194,7 +194,7 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 				t.next(),
 			);
 			// Left out: A's own commit, its subagent's, a person's change to the task A holds
-			// (PR 5 told it), tidying (a move, a reworded note), another tree off the task page.
+			// (PR 5 told it), tidying (a move, a reworded note), another tree outside the task list.
 			const helper = await ctx.subagent(p.a, p.alice.id, p.projectId);
 			await write(
 				space.id,
@@ -623,7 +623,7 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 			);
 			expect(await readOutlineTeamActivity(spec, { locale: "en", now: p.t.look })).toBeNull();
 			expect(await readOutlineTeamActivity(helper, { locale: "en", now: p.t.look })).toBeNull();
-			// C relates to nothing B did (its tree is A's, not on the task page).
+			// C relates to nothing B did (its tree is A's, not under the task list).
 			expect(await readOutlineTeamActivity(p.c, { locale: "en", now: p.t.look })).toBeNull();
 		},
 	},
@@ -633,7 +633,7 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 			resetOutlineTeamActivityForTests();
 			const p = await project(ctx);
 			const { t, space } = p;
-			const tasksPage = (await pageOf(p.upgrade)).id;
+			const tasksList = (await parentOf(p.upgrade)).id;
 			// B ends a task A created (its team row tells A), hands A one that exists and creates
 			// one for it (both its team row's too), and starts a person's task in A's tree (nobody
 			// tells A of that but team activity).
@@ -645,7 +645,7 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 					{ op: "setTask", block: { id: p.upgrade.blockId }, task: { assignee: `agent:${p.a}` } },
 					{
 						op: "insert",
-						parent: { id: tasksPage },
+						parent: { id: tasksList },
 						content: "替主线建的",
 						task: { status: "todo", assignee: `agent:${p.a}` },
 					},
@@ -659,12 +659,116 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 			]);
 		},
 	},
+	{
+		name: "where a change is goes by its block path: the task list anywhere, a top-level tree, deep under a tree",
+		async run(ctx) {
+			resetOutlineTeamActivityForTests();
+			const p = await project(ctx);
+			const { t, space } = p;
+			const alice = human(p.alice.id);
+			const list = (await parentOf(p.upgrade)).id;
+			// Before the window: the task list moves under a top-level block (it is no top-level
+			// block any more), a group under it; A holds a step of a top-level task (its own tree).
+			const before = new Date(t.base - 30 * 60_000);
+			const [planning, group] = await write(
+				space.id,
+				alice,
+				[
+					{ op: "insert", tempId: "plan", parent: null, content: "Planning" },
+					{ op: "move", block: { id: list }, parent: { tempId: "plan" } },
+					{ op: "insert", tempId: "group", parent: { id: list }, content: "Q3" },
+				],
+				before,
+			);
+			const [top, step] = await write(
+				space.id,
+				agent(p.a, p.alice.id),
+				[
+					{
+						op: "insert",
+						tempId: "top",
+						parent: null,
+						content: "顶层目标",
+						task: { status: "todo" },
+					},
+					{ op: "insert", parent: { tempId: "top" }, content: "第一步", task: { status: "doing" } },
+				],
+				new Date(before.getTime() + 1000),
+			);
+			if (!planning || !group || !top || !step) throw new Error("seed failed");
+			// In the window, B: a task deep under the list (list > Q3 > task); a step of the
+			// top-level tree; notes three levels under A's first tree; a task under unrelated work
+			// (left out).
+			const [listed, second, , finer, unrelated] = await write(
+				space.id,
+				agent(p.b, p.alice.id),
+				[
+					{
+						op: "insert",
+						parent: { id: group.blockId },
+						content: "季度复盘",
+						task: { status: "todo" },
+					},
+					{
+						op: "insert",
+						parent: { id: top.blockId },
+						content: "第二步",
+						task: { status: "todo" },
+					},
+					{ op: "insert", tempId: "n", parent: { id: p.tests.blockId }, content: "细节" },
+					{ op: "insert", parent: { tempId: "n" }, content: "更细" },
+					{
+						op: "insert",
+						parent: { id: p.elsewhere.blockId },
+						content: "无关子任务",
+						task: { status: "todo" },
+					},
+				],
+				t.next(),
+			);
+			if (!listed || !second || !finer || !unrelated) throw new Error("write failed");
+			const [, , , deeper] = await write(
+				space.id,
+				agent(p.b, p.alice.id),
+				[
+					{ op: "setTask", block: { id: second.blockId }, task: { status: "doing" } },
+					{ op: "setTask", block: { id: listed.blockId }, task: { status: "doing" } },
+					{ op: "setTask", block: { id: p.upgrade.blockId }, task: { claimable: true } },
+					{
+						op: "insert",
+						parent: { id: finer.blockId },
+						content: "最深的任务",
+						task: { status: "todo" },
+					},
+				],
+				t.next(),
+			);
+			if (!deeper) throw new Error("write failed");
+			const look = await readOutlineTeamActivity(p.a, { locale: "en", now: t.look });
+			const lines = look?.content.split("\n").slice(1) ?? [];
+			// Trees first (in the order first met), then the task list; within a tree in the order
+			// the window holds them.
+			expect([...lines].sort()).toEqual(
+				[
+					`- Under ${link(top, "顶层目标")}: session "B" added the task ${link(second, "第二步")}`,
+					`- Under ${link(top, "顶层目标")}: session "B" started ${link(second, "第二步")}`,
+					`- Under ${link(p.root, "auth 模块稳定")}: session "B" added 2 notes`,
+					`- Under ${link(p.root, "auth 模块稳定")}: session "B" added the task ${link(deeper, "最深的任务")}`,
+					`- Project task list: session "B" added the task ${link(listed, "季度复盘")}`,
+					`- Project task list: session "B" started ${link(listed, "季度复盘")}`,
+					`- Project task list: session "B" put ${link(p.upgrade, "升级依赖")} in the claim pool`,
+				].sort(),
+			);
+			expect(lines.slice(-3).every((line) => line.startsWith("- Project task list:"))).toBe(true);
+			expect(look?.content).not.toContain("无关子任务");
+		},
+	},
 ];
 
-/** The page a written block is on. */
-async function pageOf(block: OutlineOpResult): Promise<{ id: string }> {
+/** The parent of a written block (the task list, for a task written there). */
+async function parentOf(block: OutlineOpResult): Promise<{ id: string }> {
 	const { outlineStore } = await import("../store");
 	const [meta] = await outlineStore.getBlockMetasByIds([block.blockId]);
-	if (!meta) throw new Error("no block");
-	return { id: meta.pageId };
+	if (!meta?.parentId) throw new Error("no parent");
+	return { id: meta.parentId };
 }

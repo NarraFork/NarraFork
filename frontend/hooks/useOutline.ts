@@ -16,6 +16,7 @@ import {
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
 import { boundedFoldView } from "@shared/outline-fold";
+import { OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
 import {
 	type QueryClient,
 	useInfiniteQuery,
@@ -29,7 +30,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { OutlineViewState } from "../components/outline/view-state";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+import { outlineBlockWatch } from "../lib/outline-block-watch";
 import { type OutlinePageHint, OutlinePageSubscriptions } from "../lib/outline-page-subscription";
+import { OutlineSubtreeWatches } from "../lib/outline-subtree-watch";
 
 export { useOutlineEnabled } from "./useOutlineEnabled";
 
@@ -41,8 +44,12 @@ export const outlineKeys = {
 	blocks: (spaceId: string) => ["outline", "block", spaceId] as const,
 	block: (spaceId: string, blockId: string, asOf: number | null, view: OutlineViewMode) =>
 		["outline", "block", spaceId, blockId, asOf, view] as const,
-	timeline: (spaceId: string, pageId: string) => ["outline", "timeline", spaceId, pageId] as const,
-	history: (spaceId: string, blockId: string) => ["outline", "history", spaceId, blockId] as const,
+	/** The commits of a block's subtree (`""`: the whole space). */
+	timeline: (spaceId: string, rootId: string | null) =>
+		["outline", "timeline", spaceId, rootId ?? ""] as const,
+	/** A comparison of a subtree between two seqs (`to` null: now as of its first page). */
+	diff: (spaceId: string, rootId: string | null, thenSeq: number, to: number | null) =>
+		["outline", "diff", spaceId, rootId ?? "", thenSeq, to] as const,
 	backlinks: (spaceId: string, blockId: string) =>
 		["outline", "backlinks", spaceId, blockId] as const,
 	search: (q: string, spaceId: string | null) => ["outline", "search", q, spaceId] as const,
@@ -377,33 +384,52 @@ export function useOutlineViewStateSync(
 	return sync;
 }
 
-export function useOutlineTimeline(spaceId: string, pageId: string | undefined) {
+/**
+ * The timeline of a block's subtree (`rootId` null: the whole space): the commits that changed
+ * the block or anything under it, newest first, a page at a time, down to the space's history
+ * floor (H2 `blocks/:blockId/commits`).
+ */
+export function useOutlineSubtreeTimeline(spaceId: string, rootId: string | null, enabled = true) {
 	return useInfiniteQuery({
-		queryKey: outlineKeys.timeline(spaceId, pageId ?? ""),
+		queryKey: outlineKeys.timeline(spaceId, rootId),
 		queryFn: ({ pageParam }) =>
-			api.getOutlinePageCommits(spaceId, pageId as string, {
+			api.getOutlineSubtreeCommits(spaceId, rootId, {
 				before: pageParam,
-				limit: OUTLINE_VIEW_LIMITS.defaultTimeline,
-			}),
-		initialPageParam: null as number | null,
-		getNextPageParam: (page) => page.nextBefore,
-		enabled: !REMOTE_BUILD && !!pageId,
-		retry: false,
-	});
-}
-
-export function useOutlineBlockHistory(spaceId: string, blockId: string, enabled: boolean) {
-	return useInfiniteQuery({
-		queryKey: outlineKeys.history(spaceId, blockId),
-		queryFn: ({ pageParam }) =>
-			api.getOutlineBlockHistory(spaceId, blockId, {
-				before: pageParam,
-				limit: OUTLINE_VIEW_LIMITS.defaultTimeline,
+				limit: OUTLINE_SUBTREE_LIMITS.defaultTimeline,
 			}),
 		initialPageParam: null as number | null,
 		getNextPageParam: (page) => page.nextBefore,
 		enabled: !REMOTE_BUILD && enabled,
 		retry: false,
+	});
+}
+
+/**
+ * What differs under a block (`rootId` null: the space) between `thenSeq` and `to` (absent:
+ * now, as of the first page), a page at a time (H3 `diff`). Not refreshed by commits: the
+ * comparison is of the two seqs its first page named.
+ */
+export function useOutlineSubtreeDiff(
+	spaceId: string,
+	rootId: string | null,
+	thenSeq: number,
+	to: number | undefined,
+	enabled: boolean,
+) {
+	return useInfiniteQuery({
+		queryKey: outlineKeys.diff(spaceId, rootId, thenSeq, to ?? null),
+		queryFn: ({ pageParam }) =>
+			api.diffOutlineSubtree(spaceId, {
+				rootId,
+				thenSeq,
+				...(to !== undefined ? { to } : {}),
+				...(pageParam ? { cursor: pageParam } : {}),
+			}),
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) => page.nextCursor,
+		enabled: !REMOTE_BUILD && enabled,
+		retry: false,
+		staleTime: Number.POSITIVE_INFINITY,
 	});
 }
 
@@ -457,7 +483,7 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 		// Views as of a commit never change.
 		predicate: (query) => query.queryKey[4] === null,
 	});
-	for (const kind of ["timeline", "history", "backlinks", "pages", "space", "pending"]) {
+	for (const kind of ["timeline", "backlinks", "pages", "space", "pending"]) {
 		void queryClient.invalidateQueries({ queryKey: ["outline", kind, spaceId] });
 	}
 	void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });
@@ -488,38 +514,68 @@ export function useOutlineQuestionGroups(blockIds: readonly string[]) {
 	});
 }
 
-/** Share the existing page subscriptions with the editor; no polling or second socket. */
+let subtreeWatches: OutlineSubtreeWatches | null = null;
+
+/** This tab's shared subtree watches (`outline-subtree-watch.ts`), over the narrator socket. */
+function sharedSubtreeWatches(): OutlineSubtreeWatches {
+	subtreeWatches ??= new OutlineSubtreeWatches((spaceId, handlers) =>
+		outlineBlockWatch(() => narratorWSManager).open(spaceId, handlers),
+	);
+	return subtreeWatches;
+}
+
 /**
- * Keep the questions shown fresh through their pages' subscriptions. `enabled` false: the host
- * keeps them fresh itself (a page open in the connected outline, which re-reads that page only).
+ * Watch the subtrees of some blocks (`outline-subtree-watch.ts`: every caller of a space shares
+ * one wire subscription, no polling or second socket): `onChange(spaceId, seq)` runs when a commit
+ * changes one of them or anything under it, when the watch is (re)confirmed past what was seen
+ * (a reconnect, a watch back after it had no room), and with `seq` null when changes waiting for
+ * confirmation changed or the watch was denied (the caller's re-read then answers not found).
+ * Nothing named or `enabled` false: no watch.
+ */
+export function useOutlineSubtreeWatch(
+	targets: ReadonlyArray<{ spaceId: string; blockId: string }>,
+	onChange: (spaceId: string, seq: number | null) => void,
+	enabled = true,
+) {
+	const latest = useRef(onChange);
+	latest.current = onChange;
+	const keys = JSON.stringify(
+		[...new Set(targets.map((t) => `${t.spaceId}\u0000${t.blockId}`))].sort(),
+	);
+	useEffect(() => {
+		if (REMOTE_BUILD || !enabled) return;
+		const bySpace = new Map<string, string[]>();
+		for (const key of JSON.parse(keys) as string[]) {
+			const [spaceId = "", blockId = ""] = key.split("\u0000");
+			if (spaceId && blockId) bySpace.set(spaceId, [...(bySpace.get(spaceId) ?? []), blockId]);
+		}
+		const watches = sharedSubtreeWatches();
+		const stops = [...bySpace].map(([spaceId, blockIds]) =>
+			watches.watch(spaceId, blockIds, (seq) => latest.current(spaceId, seq)),
+		);
+		return () => {
+			for (const stop of stops) stop();
+		};
+	}, [keys, enabled]);
+}
+
+/**
+ * Keep the questions shown fresh through a block watch on the blocks they are under. `enabled`
+ * false: the host keeps them fresh itself (the connected outline, which re-reads what it shows).
  */
 export function useOutlineQuestionsLive(
 	groups: readonly OutlineQuestionGroupResponse[],
 	enabled = true,
 ) {
 	const client = useQueryClient();
-	const pages = JSON.stringify([
-		...new Map(groups.map(({ group }) => [group.pageId, [group.pageId, group.spaceId]])).values(),
-	]);
-	useEffect(() => {
-		if (REMOTE_BUILD || !enabled) return;
-		const unsubscribe = (JSON.parse(pages) as [string, string][]).map(([pageId, spaceId]) => {
-			let seen = -1;
-			return pageSubscriptions().subscribe(pageId, (hint) => {
-				if (
-					hint.kind === "denied" ||
-					((hint.kind === "subscribed" || hint.kind === "changed") && hint.seq > seen)
-				) {
-					if (hint.kind !== "denied") seen = hint.seq;
-					invalidateOutlineSpace(client, spaceId);
-					void client.invalidateQueries({ queryKey: ["human-attention"] });
-				}
-			});
-		});
-		return () => {
-			for (const dispose of unsubscribe) dispose();
-		};
-	}, [client, pages, enabled]);
+	useOutlineSubtreeWatch(
+		groups.map(({ group }) => ({ spaceId: group.spaceId, blockId: group.blockId })),
+		(spaceId) => {
+			invalidateOutlineSpace(client, spaceId);
+			void client.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+		enabled,
+	);
 }
 
 /** Answer questions of one space at once; questions, views and the inbox re-read after. */
@@ -795,11 +851,11 @@ const PLAN_DIFF_REFRESH_MS = 300;
  * space-wide invalidation leaves this query to its own subscription.
  */
 export function useOutlinePlanDiff(
-	plan: { spaceId: string; pageId: string; blockId: string; from: number },
+	plan: { spaceId: string; blockId: string; from: number },
 	enabled: boolean,
 ) {
 	const queryClient = useQueryClient();
-	const { spaceId, pageId, blockId, from } = plan;
+	const { spaceId, blockId, from } = plan;
 	const query = useQuery({
 		queryKey: ["outline", "plan-diff", spaceId, blockId, from],
 		queryFn: () => api.getOutlinePlanDiff(spaceId, blockId, from),
@@ -808,6 +864,7 @@ export function useOutlinePlanDiff(
 		staleTime: 5_000,
 	});
 	const state = useRef({ wanted: -1, shown: -1, fetching: false });
+	const hints = useRef<((seq: number) => void) | null>(null);
 	state.current.shown = query.data?.toSeq ?? -1;
 	state.current.fetching = query.isFetching;
 	useEffect(() => {
@@ -827,17 +884,25 @@ export function useOutlinePlanDiff(
 				queryKey: ["outline", "plan-diff", spaceId, blockId],
 			});
 		};
-		const unsubscribe = pageSubscriptions().subscribe(pageId, (hint) => {
-			if (hint.kind !== "changed" && hint.kind !== "subscribed") return;
-			if (hint.seq <= state.current.wanted) return;
-			state.current.wanted = hint.seq;
+		const hint = (seq: number) => {
+			if (seq <= state.current.wanted) return;
+			state.current.wanted = seq;
 			timer ??= setTimeout(check, PLAN_DIFF_REFRESH_MS);
-		});
+		};
+		hints.current = hint;
 		return () => {
-			unsubscribe();
+			hints.current = null;
 			if (timer !== null) clearTimeout(timer);
 		};
-	}, [enabled, pageId, spaceId, blockId, queryClient]);
+	}, [enabled, spaceId, blockId, queryClient]);
+	// The plan's root and everything under it: what a commit there changes, its seq.
+	useOutlineSubtreeWatch(
+		spaceId && blockId ? [{ spaceId, blockId }] : [],
+		(_space, seq) => {
+			if (seq !== null) hints.current?.(seq);
+		},
+		enabled,
+	);
 	return query;
 }
 

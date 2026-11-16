@@ -2,7 +2,6 @@ import type {
 	OutlineAnswerRequest,
 	OutlineAnswerResponse,
 	OutlineBacklinksResponse,
-	OutlineBlockHistoryResponse,
 	OutlineBlockViewResponse,
 	OutlineDigestResponse,
 	OutlineLockResponse,
@@ -22,19 +21,25 @@ import type {
 	OutlineSpaceKind,
 	OutlineSpaceListResponse,
 	OutlineSpaceResolveResponse,
-	OutlineTimelineResponse,
 	OutlineTreeResponse,
 	OutlineTreeSpacesResponse,
 	OutlineViewMode,
 	OutlineViewStatePutRequest,
 	OutlineViewStateResponse,
 } from "@shared/outline-api";
+import type { OutlineCopyRequest, OutlineCopyResponse } from "@shared/outline-copy-api";
 import type {
 	OutlineDigestDetailResponse,
 	OutlineDigestListResponse,
 	OutlineDigestNowResponse,
 	OutlineDigestUndoResponse,
 } from "@shared/outline-digest";
+import type {
+	OutlineMoveBackResponse,
+	OutlineRestorePreviewResponse,
+	OutlineRestoreResponse,
+	OutlineSubtreeDiffResponse,
+} from "@shared/outline-restore-api";
 import type {
 	OutlineSpecImportAdminPage,
 	OutlineSpecImportAdminState,
@@ -54,6 +59,7 @@ import type {
 	OutlineMarksResponse,
 	OutlineOpenTasksResponse,
 	OutlineSubtreeResponse,
+	OutlineSubtreeTimelineResponse,
 } from "@shared/outline-subtree-api";
 import type {
 	NarratorCurrentTaskResponse,
@@ -198,25 +204,65 @@ export const outlineApi = {
 		request<OutlineBlockViewResponse>(
 			`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}${query(params)}`,
 		),
-	getOutlineBlockHistory: (
-		spaceId: string,
-		blockId: string,
-		params: { before?: number | null; limit?: number },
-	) =>
-		request<OutlineBlockHistoryResponse>(
-			`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/history${query(params)}`,
-		),
 	getOutlineBacklinks: (spaceId: string, blockId: string) =>
 		request<OutlineBacklinksResponse>(
 			`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/backlinks`,
 		),
-	getOutlinePageCommits: (
+	/**
+	 * The commits that changed a block or anything under it (`blockId` null: every commit of the
+	 * space), newest first, a page at a time.
+	 */
+	getOutlineSubtreeCommits: (
 		spaceId: string,
-		pageId: string,
+		blockId: string | null,
 		params: { before?: number | null; limit?: number },
 	) =>
-		request<OutlineTimelineResponse>(
-			`/outline/spaces/${enc(spaceId)}/pages/${enc(pageId)}/commits${query(params)}`,
+		request<OutlineSubtreeTimelineResponse>(
+			blockId === null
+				? `/outline/spaces/${enc(spaceId)}/commits${query(params)}`
+				: `/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/commits${query(params)}`,
+		),
+	/** What differs under a block (`rootId` null: the space) between `thenSeq` and `to` (now). */
+	diffOutlineSubtree: (
+		spaceId: string,
+		body: {
+			rootId: string | null;
+			thenSeq: number;
+			to?: number;
+			cursor?: string;
+			limit?: number;
+		},
+	) =>
+		request<OutlineSubtreeDiffResponse>(`/outline/spaces/${enc(spaceId)}/diff`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** What restoring a subtree to `thenSeq` would do, a page at a time (writes nothing). */
+	previewOutlineRestore: (
+		spaceId: string,
+		body: {
+			rootId: string | null;
+			thenSeq: number;
+			token?: string;
+			cursor?: string;
+			limit?: number;
+		},
+	) =>
+		request<OutlineRestorePreviewResponse>(`/outline/spaces/${enc(spaceId)}/restore/preview`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** Confirm a previewed restore; call again with the cursor while `done` is false. */
+	restoreOutlineSubtree: (spaceId: string, body: { token: string; cursor?: string }) =>
+		request<OutlineRestoreResponse>(`/outline/spaces/${enc(spaceId)}/restore`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** Put one block back where it was at `thenSeq` (bringing it back if it is deleted). */
+	moveOutlineBlockBack: (spaceId: string, blockId: string, thenSeq: number) =>
+		request<OutlineMoveBackResponse>(
+			`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/move-back`,
+			{ method: "POST", body: JSON.stringify({ thenSeq }) },
 		),
 	searchOutline: (params: { q: string; spaceId?: string; limit?: number; cursor?: string }) =>
 		request<OutlineSearchResponse>(`/outline/search${query(params)}`),
@@ -434,6 +480,15 @@ export const outlineApi = {
 			method: "POST",
 			body: JSON.stringify(body),
 			...(options.keepalive ? { keepalive: true } : {}),
+		}),
+	/**
+	 * Copy a block and its subtree under a parent of the same space or another (「复制到这里」,
+	 * pageless outline A2). Ask again with the returned `copyId` while `done` is false.
+	 */
+	copyOutlineSubtree: (spaceId: string, blockId: string, body: OutlineCopyRequest) =>
+		request<OutlineCopyResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/copy`, {
+			method: "POST",
+			body: JSON.stringify(body),
 		}),
 	/** The status bar's current task, from the session's task source (either backend). */
 	getNarratorCurrentTask: (narratorId: string) =>

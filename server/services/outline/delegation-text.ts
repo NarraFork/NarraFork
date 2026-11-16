@@ -236,12 +236,12 @@ export const TASK_BRIEF_TEXT = {
 	factLine: (title: string, address: string) => `- ${title} (\`${address}\`): not shown here`,
 	/** A target the session may not read: no title, no address. */
 	factUnreadable: "- (a block this session cannot read)",
-	pages: "## Pages of the project's outline",
-	pagesNote:
-		"A map, not the content: each page with the first lines of what it holds. Read a page with OutlineRead before relying on it.",
-	page: (title: string, address: string, linked: boolean) =>
-		`- ${title} (\`${address}\`)${linked ? " · linked from the task" : ""}`,
-	pageLine: (text: string) => `  - ${text}`,
+	map: "## The top level of the project's outline",
+	mapNote:
+		"A map, not the content: each top-level block with the first lines of what it holds. Read one with OutlineRead before relying on it.",
+	mapEntry: (title: string, address: string, linked: boolean) =>
+		`- ${title} (\`${address}\`)${linked ? " · the task links to something here" : ""}`,
+	mapLine: (text: string) => `  - ${text}`,
 	more: (n: number) => `- … ${n} more`,
 	/** The last section: how the session works on the task and how it ends (design §B.4). */
 	rules: [

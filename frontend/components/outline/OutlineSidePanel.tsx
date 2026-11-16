@@ -1,36 +1,22 @@
-import {
-	Alert,
-	Badge,
-	Button,
-	Group,
-	Loader,
-	Stack,
-	Tabs,
-	Text,
-	UnstyledButton,
-} from "@mantine/core";
+import { Alert, Badge, Group, Loader, Stack, Tabs, Text } from "@mantine/core";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import { IconHistory, IconHourglass, IconLink } from "@tabler/icons-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	useOutlineBacklinks,
-	useOutlineBlockHistory,
-	useOutlinePagePending,
-} from "../../hooks/useOutline";
-import { formatFullLocaleDateTime, formatSmartTime } from "../../lib/format";
+import { useOutlineBacklinks, useOutlinePagePending } from "../../hooks/useOutline";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
+import { OutlineHistoryList } from "./history/OutlineHistoryList";
 import classes from "./Outline.module.css";
 import { OutlineLockSection, OutlinePendingList, pendingFor } from "./OutlinePendingPanel";
-import { commitActorLabel } from "./OutlineTimeline";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 type SideTab = "backlinks" | "history" | "pending";
 
 /**
  * About the focused block, beside the outline: its lock (a focused task: lock or unlock it), the
- * changes to it waiting for confirmation (when there are any), what links to it, and its history.
- * Picking a version shows the page as of it.
+ * changes to it waiting for confirmation (when there are any), what links to it, and the history
+ * of its subtree (`history/OutlineHistoryList.tsx`). Picking a commit shows the block and what is
+ * under it as of then.
  */
 export function OutlineSidePanel({
 	view,
@@ -46,11 +32,6 @@ export function OutlineSidePanel({
 	const spaceId = view.space.id;
 	const blockId = view.rootId;
 	const backlinks = useOutlineBacklinks(spaceId, blockId, tab === "backlinks");
-	const history = useOutlineBlockHistory(spaceId, blockId, tab === "history");
-	const entries = useMemo(
-		() => history.data?.pages.flatMap((page) => page.entries) ?? [],
-		[history.data],
-	);
 	const pagePending = useOutlinePagePending(spaceId, view.pageId, view.current);
 	const pending = useMemo(
 		() => (view.current ? pendingFor(view, pagePending.data?.pending ?? []) : []),
@@ -131,63 +112,12 @@ export function OutlineSidePanel({
 					)}
 				</Tabs.Panel>
 				<Tabs.Panel value="history" pt="xs">
-					{history.isLoading && <Loader size="sm" />}
-					{history.isError && (
-						<Alert color="red" variant="light">
-							{t("loadFailed")}
-						</Alert>
-					)}
-					{history.isSuccess && entries.length === 0 && (
-						<Text size="sm" c="dimmed">
-							{t("side.noHistory")}
-						</Text>
-					)}
-					<Stack gap={2}>
-						{entries.map((entry) => (
-							<UnstyledButton
-								key={entry.seq}
-								className={classes.listItem}
-								data-selected={search.asOf === entry.seq}
-								aria-current={search.asOf === entry.seq ? "true" : undefined}
-								title={entry.commit ? formatFullLocaleDateTime(entry.commit.createdAt) : undefined}
-								aria-label={t("side.viewAt", { seq: entry.seq })}
-								onClick={() => onViewAt(entry.seq)}
-							>
-								<Group gap={4} wrap="wrap">
-									<Text size="xs" fw={500}>
-										{t("timeline.commit", { seq: entry.seq })}
-									</Text>
-									{entry.changes
-										.filter((change) => change !== "page" || entry.changes.length === 1)
-										.map((change) => (
-											<Badge key={change} size="xs" variant="light" tt="none">
-												{t(`side.change.${change}`)}
-											</Badge>
-										))}
-								</Group>
-								{entry.commit && (
-									<Text size="xs" c="dimmed" className={classes.ellipsis}>
-										{[
-											commitActorLabel(entry.commit, t),
-											formatSmartTime(entry.commit.createdAt),
-											entry.commit.summary,
-										].join(" · ")}
-									</Text>
-								)}
-							</UnstyledButton>
-						))}
-					</Stack>
-					{history.hasNextPage && (
-						<Button
-							variant="subtle"
-							size="compact-xs"
-							mt={4}
-							loading={history.isFetchingNextPage}
-							onClick={() => void history.fetchNextPage()}
-						>
-							{t("loadMore")}
-						</Button>
-					)}
+					<OutlineHistoryList
+						spaceId={spaceId}
+						rootId={blockId}
+						asOf={search.asOf}
+						onViewAt={onViewAt}
+					/>
 				</Tabs.Panel>
 			</Tabs>
 		</>

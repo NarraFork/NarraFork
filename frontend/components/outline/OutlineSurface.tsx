@@ -2,7 +2,9 @@
  * One block of the outline focused (a top-level block, or any block under one): the path of its
  * ancestors, then what is under it — read as the forest with that block as its only root
  * (`forest/OutlineForest.tsx`), or edited in the live editor — a side panel with backlinks and
- * history, and the timeline strip.
+ * the history of its subtree, and the timeline strip of that subtree. As of a commit, the
+ * history bar (`history/OutlineHistoryBar.tsx`) says so, compares that point with now (marking
+ * rows of the forest as of then) and restores the subtree to it.
  *
  * A self-contained surface: everything it shows comes from its props, and everything that would
  * change them (focus, breadcrumbs, the view, the time) goes out through `onNavigate`; links
@@ -54,11 +56,11 @@ import {
 import { useElementSize, useMediaQuery } from "@mantine/hooks";
 import { titleOf } from "@shared/outline";
 import type { OutlineViewMode } from "@shared/outline-api";
+import type { OutlineDiffKind } from "@shared/outline-restore-api";
 import {
 	IconArrowLeft,
 	IconArrowRight,
 	IconCheck,
-	IconClock,
 	IconLayoutSidebarRight,
 	IconPencil,
 } from "@tabler/icons-react";
@@ -105,6 +107,8 @@ import { UnsavedTextsNotice } from "./editor/UnsavedTextsNotice";
 import { OutlineTaskIcon } from "./forest/ForestBlocks";
 import type { SpaceForest } from "./forest/forest-model";
 import { OutlineForest } from "./forest/OutlineForest";
+import { OutlineHistoryBar } from "./history/OutlineHistoryBar";
+import { OutlineRestoreModal, type OutlineRestoreTarget } from "./history/OutlineRestoreModal";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBreadcrumbs, OutlineLocateLink } from "./OutlineBreadcrumbs";
@@ -128,7 +132,7 @@ export interface OutlineSurfaceProps {
 	blockId: string;
 	/** Facts (the default) or all. */
 	view?: OutlineViewMode;
-	/** Commit seq to show the page as of (read only); absent for the current, live page. */
+	/** Commit seq to show the block and what is under it as of (read only); absent for now. */
 	asOf?: number;
 	/** Focus, breadcrumb, view and time changes: the host decides what they do. */
 	onNavigate: (to: OutlineTarget) => void;
@@ -193,6 +197,7 @@ const START_EDITING = true;
 
 const noSubscribe = () => () => {};
 const zero = () => 0;
+const NO_MARKS: ReadonlyMap<string, OutlineDiffKind> = new Map();
 
 const SidePanel = memo(OutlineSidePanel);
 const Timeline = memo(OutlineTimeline);
@@ -408,6 +413,17 @@ function SurfaceBody({
 	const goRef = useRef(go);
 	goRef.current = go;
 	const goAsOf = useCallback((seq: number | undefined) => goRef.current({ asOf: seq }), []);
+	const backToNow = useCallback(() => goRef.current({ asOf: undefined }), []);
+	// The blocks of the forest as of `asOf` that the comparison names (marked on their rows).
+	const [diffMarks, setDiffMarks] = useState<ReadonlyMap<string, OutlineDiffKind>>(NO_MARKS);
+	// The restore dialog, with what it restores captured as it opens: going elsewhere in history
+	// (or to another block) meanwhile does not change it, and a running restore runs on.
+	const [restoring, setRestoring] = useState<OutlineRestoreTarget | null>(null);
+	const restoreTo = useCallback(
+		(thenSeq: number) => setRestoring({ spaceId, rootId: blockId, thenSeq }),
+		[spaceId, blockId],
+	);
+	const restoreClosed = useCallback(() => setRestoring(null), []);
 	const linkSearch = useMemo<OutlineBlockSearch>(
 		() => ({
 			...(asOf !== undefined ? { asOf } : {}),
@@ -653,21 +669,16 @@ function SurfaceBody({
 					</Group>
 				</div>
 
-				{!view.current && (
-					<Alert
-						variant="light"
-						color="indigo"
-						icon={<IconClock size={16} />}
-						py={6}
-						styles={{
-							message: { display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" },
-						}}
-					>
-						<Text size="sm">{t("page.asOfBanner", { seq: view.seq })}</Text>
-						<Button size="compact-xs" variant="light" onClick={() => go({ asOf: undefined })}>
-							{t("page.backToCurrent")}
-						</Button>
-					</Alert>
+				{asOf !== undefined && (
+					<OutlineHistoryBar
+						spaceId={spaceId}
+						rootId={blockId}
+						asOf={asOf}
+						canWrite={view.space.canWrite}
+						onBack={backToNow}
+						onMarks={setDiffMarks}
+						onRestore={restoreTo}
+					/>
 				)}
 
 				<div className={`${classes.body} ${showSide && !compact ? classes.bodyWithSide : ""}`}>
@@ -758,6 +769,7 @@ function SurfaceBody({
 									onForest={setForest}
 									onEdit={asOf === undefined && fallback === null ? onEditRow : undefined}
 									live={onScreen}
+									diffMarks={asOf !== undefined ? diffMarks : undefined}
 								/>
 							</>
 						)}
@@ -780,7 +792,13 @@ function SurfaceBody({
 					{showSide && !compact && <Box className={classes.side}>{sidePanel}</Box>}
 				</div>
 
-				<Timeline view={view} asOf={asOf} onSelect={goAsOf} />
+				<Timeline
+					spaceId={spaceId}
+					rootId={blockId}
+					canWrite={view.space.canWrite}
+					asOf={asOf}
+					onSelect={goAsOf}
+				/>
 			</>
 		);
 	}
@@ -801,6 +819,7 @@ function SurfaceBody({
 				{content}
 			</Box>
 			{drawer}
+			<OutlineRestoreModal target={restoring} onClose={restoreClosed} onFinished={backToNow} />
 			<QuickSwitcherHost
 				ref={switcher}
 				spaceId={spaceId}

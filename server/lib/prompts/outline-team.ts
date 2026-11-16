@@ -32,10 +32,10 @@ export type OutlineTeamEvent =
 	| { kind: "claimable"; task: OutlineTeamTask }
 	| { kind: "notes" | "reports" | "answers"; n: number };
 
-/** One line of the note: under a related task tree, on the project task page, or about a file. */
+/** One line of the note: under a related task tree, under the project task list, or about a file. */
 export type OutlineTeamLine =
 	| { where: "tree"; tree: OutlineTeamTask; by: OutlineTeamActor; event: OutlineTeamEvent }
-	| { where: "page"; by: OutlineTeamActor; event: OutlineTeamEvent }
+	| { where: "list"; by: OutlineTeamActor; event: OutlineTeamEvent }
 	| {
 			where: "file";
 			by: OutlineTeamActor;
@@ -153,20 +153,20 @@ export function getOutlineTeamActivityHeading(locale: Locale): string {
 }
 
 /**
- * The line that counts what did not fit. `taskPage` is the project task page when there is one:
+ * The line that counts what did not fit. `taskList` is the project task list when there is one:
  * the place to read on.
  */
 export function getOutlineTeamActivityMore(
 	more: number,
-	taskPage: OutlineTeamTask | null,
+	taskList: OutlineTeamTask | null,
 	locale: Locale,
 ): string {
 	if (locale === "zh-CN")
-		return taskPage
-			? `（还有 ${more} 处变化没有列出，用 OutlineRead 读 ${outlineTeamLink(taskPage)}）`
+		return taskList
+			? `（还有 ${more} 处变化没有列出，用 OutlineRead 读 ${outlineTeamLink(taskList)}）`
 			: `（还有 ${more} 处变化没有列出，用 OutlineRead 读相关的任务）`;
-	return taskPage
-		? `(${more} more change${more === 1 ? "" : "s"} not listed; read ${outlineTeamLink(taskPage)} with OutlineRead)`
+	return taskList
+		? `(${more} more change${more === 1 ? "" : "s"} not listed; read ${outlineTeamLink(taskList)} with OutlineRead)`
 		: `(${more} more change${more === 1 ? "" : "s"} not listed; read the related tasks with OutlineRead)`;
 }
 

@@ -1235,9 +1235,8 @@ async function pendingForYouNearby(
 }
 
 /**
- * Decisions on this session's changes it has not been told of, for a read of `blockId`: told
- * once, then marked. The store files a decided change by the top-level block its plan is under,
- * which is looked up here from the block read; nothing of it reaches the agent.
+ * Decisions on this session's changes it has not been told of, for a read of `blockId`: those
+ * whose locked task is under the same top-level block (by ancestry), told once, then marked.
  */
 async function decisionReports(
 	scope: OutlineAgentScope,
@@ -1246,7 +1245,11 @@ async function decisionReports(
 ): Promise<OutlinePendingHead[]> {
 	const meta = (await scope.store.getBlockMetasByIds([blockId]))[0];
 	if (!meta || meta.deleted) return [];
-	return await takePendingReports(session, { store: scope.store, pageId: meta.pageId });
+	return await takePendingReports(session, {
+		store: scope.store,
+		spaceId: meta.spaceId,
+		blockId: meta.id,
+	});
 }
 
 export async function outlineSearch(

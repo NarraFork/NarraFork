@@ -6,12 +6,13 @@
  *
  * WHAT IT COVERS: {@link OUTLINE_TEAM_ACTIVITY_SCOPE}, the one place that decides (owner decision
  * Q5 is still open; this is the design note's recommendation A):
- *   1. the session's related task trees in project spaces: the trees (up to the topmost task below
- *      the page) of the tasks it holds, manages (`task_json.manager`), is assigned
+ *   1. the session's related task trees in project spaces: the trees (up to the topmost task above
+ *      them, a top-level block included) of the tasks it holds, manages (`task_json.manager`), is assigned
  *      (`@agent:<its id or handle>`) or wrote in the last 7 days; in them, others' status changes,
  *      hand-overs, new subtasks, notes (counted), reports attached (counted), answers (counted);
- *   2. the project task page (alias `tasks`): task-level changes (new, started, done, cancelled,
- *      reopened, handed over, put in the claim pool) outside those trees, at most 8 lines;
+ *   2. the project task list (alias `tasks`, anywhere in the space) and what is under it:
+ *      task-level changes (new, started, done, cancelled, reopened, handed over, put in the claim
+ *      pool) outside those trees, at most 8 lines;
  *   3. files it changed that another session's task in progress changed since (`overlap.ts`).
  *
  * WHAT IT LEAVES OUT (noise): the session's own commits and its subagents'; a person's change to a
@@ -55,9 +56,12 @@
  * it cannot take whole, so the next one starts there; one commit larger than a read is taken up to
  * the limit); when the reads run out first, the space's cursor stays after the last commit read
  * whole and the next look goes on from there. Then those commits, the related tasks (claims by
- * holder, open tasks, the session's recent writes), only the versions on the pages of the related
- * trees and the task page, the versions before them by primary key, ancestors by primary key,
- * claims of changed tasks, at most {@link OUTLINE_TEAM_ACTIVITY_LIMITS.heads} titles. Older commits
+ * holder, open tasks, the session's recent writes), where each change sits (the parents its
+ * versions had, walked up together: one recursive statement by primary key per 500 parents, at
+ * most {@link OUTLINE_TEAM_ACTIVITY_LIMITS.walkRows} blocks; a change whose way up is not known is
+ * left out), only the versions under the related trees and the task list, the versions before
+ * them by primary key, the related tasks' ancestors by primary key, claims of changed tasks, at
+ * most {@link OUTLINE_TEAM_ACTIVITY_LIMITS.heads} titles. Older commits
  * of a busy window are passed over, uncounted. The session runtime runs on SQLite only, so rows
  * are written there; the reads are shared with PostgreSQL and tested on both.
  */
@@ -91,7 +95,8 @@ import { isOutlineEnabled } from "./feature";
 import {
 	commitPersonId,
 	OUTLINE_CHANGE,
-	OUTLINE_TASKS_PAGE_ALIAS,
+	OUTLINE_LIMITS,
+	OUTLINE_TASKS_PAGE_ALIAS as OUTLINE_TASKS_ALIAS,
 	type OutlineTaskJson,
 } from "./model";
 import { describeOutlineOverlaps, readOutlineFileOverlaps } from "./overlap";
@@ -128,8 +133,8 @@ export const OUTLINE_TEAM_ACTIVITY_SCOPE = {
 		/** Tasks (or blocks under tasks) it wrote this recently; 0: none. */
 		recentWorkMs: 7 * DAY_MS,
 	},
-	/** Task-level changes on the project task page outside those trees; 0 lines: off. */
-	taskPage: { lines: 8 },
+	/** Task-level changes under the project task list outside those trees; 0 lines: off. */
+	taskList: { lines: 8 },
 	/** Files the session changed that another session's task in progress changed since; 0: off. */
 	files: { lines: 5 },
 	/** Session spaces never: the session's own place, and people's changes there are PR 5's. */
@@ -156,9 +161,11 @@ export const OUTLINE_TEAM_ACTIVITY_LIMITS = {
 	heads: 30,
 	/** Trees per space. */
 	trees: 12,
-	/** Ancestor levels walked, and blocks read doing it. */
+	/** Ancestor levels walked, and blocks read doing it (the related tasks' trees). */
 	depth: 16,
 	ancestors: 400,
+	/** Blocks read walking the changed blocks' parents up to the top level, all at once. */
+	walkRows: 4000,
 	/** Claims of the session read; open tasks of a space read for managed or assigned ones. */
 	claims: 50,
 	openTasks: 200,
@@ -216,7 +223,7 @@ function keepSessionState(narratorId: string, value: SessionState): void {
 /** A line before it is named: block ids and actor keys, resolved to text at the end. */
 type Draft =
 	| {
-			where: "tree" | "page";
+			where: "tree" | "list";
 			spaceId: string;
 			treeId: string | null;
 			actor: string;
@@ -243,8 +250,8 @@ interface SpaceLook {
 	clipped: boolean;
 	/** Blocks of this space that drafts name, with their metas. */
 	metas: Map<string, OutlineBlockMeta>;
-	/** The task page, for "read on". */
-	taskPageId: string | null;
+	/** The task list, for "read on". */
+	taskListId: string | null;
 }
 
 interface LookContext {
@@ -256,7 +263,7 @@ interface LookContext {
 	now: number;
 }
 
-/** Ancestors of blocks up to their page, by primary key level by level, bounded. */
+/** Ancestors of blocks up to the top level, by primary key level by level, bounded. */
 async function withAncestors(
 	store: OutlineStore,
 	ids: Iterable<string>,
@@ -277,8 +284,8 @@ async function withAncestors(
 }
 
 /**
- * The tree a block is in: its topmost task ancestor below the page (itself when it is that task),
- * or null when no task is above it (or the chain is not known).
+ * The tree a block is in: its topmost task ancestor (itself when it is that task; a top-level
+ * task is a tree too), or null when no task is above it (or the chain is not known).
  */
 function treeOf(blockId: string, metas: Map<string, OutlineBlockMeta>): string | null {
 	const meta = metas.get(blockId);
@@ -296,8 +303,8 @@ function treeFrom(
 	let top: string | null = block.task ? block.id : null;
 	let current = metas.get(block.parentId);
 	for (let i = 0; current && i <= OUTLINE_TEAM_ACTIVITY_LIMITS.depth; i++) {
-		if (current.parentId === null) return top;
 		if (current.taskJson) top = current.id;
+		if (current.parentId === null) return top;
 		current = metas.get(current.parentId);
 	}
 	return null;
@@ -424,7 +431,7 @@ async function lookAtSpace(
 		readThrough,
 		clipped,
 		metas: new Map(),
-		taskPageId: null,
+		taskListId: null,
 	};
 	if (changes.length === 0) return look;
 	const commits = new Map(
@@ -457,8 +464,8 @@ async function lookAtSpace(
 	});
 	if (others.length === 0) return look;
 
-	const [taskPage] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-	look.taskPageId = taskPage?.id ?? null;
+	const [taskList] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_ALIAS]);
+	look.taskListId = taskList?.id ?? null;
 	const related = await relatedTasks(ctx, space);
 	await withAncestors(store, related, look.metas);
 	const trees = new Set<string>();
@@ -467,34 +474,38 @@ async function lookAtSpace(
 		const tree = treeOf(id, look.metas);
 		if (tree) trees.add(tree);
 	}
-	// Only the pages of those trees and the task page can say anything: the rest are not read on.
-	const pages = new Set<string>();
-	for (const tree of trees) {
-		const page = look.metas.get(tree)?.pageId;
-		if (page) pages.add(page);
-	}
-	if (look.taskPageId && OUTLINE_TEAM_ACTIVITY_SCOPE.taskPage.lines > 0) pages.add(look.taskPageId);
-	const onPages = others.filter((c) => pages.has(c.pageId));
-	if (onPages.length === 0) return look;
-	// A changed block is placed by the parent its version had: only parents and their ancestors
-	// are read (a commit of 400 notes under one task reads that task's chain once).
-	await withAncestors(
-		store,
-		onPages.flatMap((c) => (c.parentId ? [c.parentId] : [])),
-		look.metas,
+	const listId = OUTLINE_TEAM_ACTIVITY_SCOPE.taskList.lines > 0 ? look.taskListId : null;
+	if (trees.size === 0 && listId === null) return look;
+	// Where each change sits: the parent its version had, walked up to the top level, all of them
+	// at once (a deleted parent's own parent column goes on: where it was deleted from). A
+	// commit of 400 notes under one task walks that task's chain once.
+	const walk = await store.listAncestryOf(
+		space.id,
+		[...new Set(others.flatMap((c) => (c.parentId ? [c.parentId] : [])))],
+		OUTLINE_TEAM_ACTIVITY_LIMITS.walkRows,
+		{ includeDeleted: true },
 	);
-	const treeOfChange = (c: OutlineRangeChange): string | null => {
-		const t = treeFrom(
-			{ id: c.blockId, parentId: c.parentId, task: !c.deleted && c.taskJson !== null },
-			look.metas,
-		);
-		return t !== null && trees.has(t) ? t : null;
+	const parentOf = new Map(walk.rows.map((row) => [row.id, row.parentId] as const));
+	/** The nearest of the trees or the task list on the way up from a change; null: none known. */
+	const placeOf = (c: OutlineRangeChange): string | null => {
+		// A tree's own task changing: it is the tree.
+		if (!c.deleted && c.taskJson !== null && trees.has(c.blockId)) return c.blockId;
+		let at = c.parentId;
+		for (let depth = 0; at !== null && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+			if (trees.has(at) || at === listId) return at;
+			if (!parentOf.has(at)) return null;
+			at = parentOf.get(at) ?? null;
+		}
+		return null;
 	};
-	const onTaskPage = (c: OutlineRangeChange) =>
-		OUTLINE_TEAM_ACTIVITY_SCOPE.taskPage.lines > 0 &&
-		look.taskPageId !== null &&
-		c.pageId === look.taskPageId;
-	const wanted = onPages.filter((c) => treeOfChange(c) !== null || onTaskPage(c));
+	const places = new Map(others.map((c) => [c, placeOf(c)] as const));
+	const treeOfChange = (c: OutlineRangeChange): string | null => {
+		const place = places.get(c) ?? placeOf(c);
+		return place !== null && trees.has(place) ? place : null;
+	};
+	const onTaskList = (c: OutlineRangeChange) =>
+		listId !== null && (places.get(c) ?? placeOf(c)) === listId;
+	const wanted = others.filter((c) => treeOfChange(c) !== null || onTaskList(c));
 	if (wanted.length === 0) return look;
 
 	// Every version of the blocks wanted, in order, and the version before the window.
@@ -559,9 +570,9 @@ async function lookAtSpace(
 			const actor = commit ? actorOf(commit) : null;
 			if (!commit || !actor) continue;
 			const tree = treeOfChange(v);
-			const page = onTaskPage(v);
-			if (tree === null && !page) continue;
-			const where = tree !== null ? "tree" : "page";
+			const listed = onTaskList(v);
+			if (tree === null && !listed) continue;
+			const where = tree !== null ? "tree" : "list";
 			const after = v.deleted ? null : v.taskJson;
 			const base = { where, spaceId: space.id, treeId: tree, actor } as const;
 			const count = (kind: "notes" | "reports" | "answers") => {
@@ -753,9 +764,9 @@ export async function readOutlineTeamActivity(
 	let more = 0;
 	// Counted: changes read and found to concern the session that the limits leave out.
 	for (const { space, look } of looks) {
-		// Trees first, a tree at most `linesPerTree`; then the task page, at most its lines.
+		// Trees first, a tree at most `linesPerTree`; then the task list, at most its lines.
 		const perTree = new Map<string, number>();
-		let page = 0;
+		let list = 0;
 		for (const draft of look.drafts) {
 			if (draft.where === "tree" && draft.treeId) {
 				const n = perTree.get(draft.treeId) ?? 0;
@@ -764,17 +775,17 @@ export async function readOutlineTeamActivity(
 					continue;
 				}
 				perTree.set(draft.treeId, n + 1);
-			} else if (draft.where === "page") {
-				if (page >= OUTLINE_TEAM_ACTIVITY_SCOPE.taskPage.lines) {
+			} else if (draft.where === "list") {
+				if (list >= OUTLINE_TEAM_ACTIVITY_SCOPE.taskList.lines) {
 					more++;
 					continue;
 				}
-				page++;
+				list++;
 			}
 			drafts.push({ space, draft });
 		}
 	}
-	// Trees, then the task page, then files; a tree's lines together, trees in the order first met.
+	// Trees, then the task list, then files; a tree's lines together, trees in the order first met.
 	const treeRank = new Map<string, number>();
 	for (const { draft } of drafts)
 		if (draft.where === "tree" && draft.treeId && !treeRank.has(draft.treeId))
@@ -797,7 +808,7 @@ export async function readOutlineTeamActivity(
 	const named = await nameDrafts(store, root, drafts, looks, overlaps, locale);
 	// The budget: lines and bytes, the heading and a count line included.
 	const heading = getOutlineTeamActivityHeading(locale);
-	const taskPage = await taskPageOf(store, main, looks, locale);
+	const taskList = await taskListOf(store, main, looks, locale);
 	const clippedLine = clipped ? getOutlineTeamActivityClipped(locale) : "";
 	const lines: string[] = [];
 	const items: OutlineTaskNoticeItem[] = [];
@@ -806,7 +817,7 @@ export async function readOutlineTeamActivity(
 	for (const [index, entry] of listed.entries()) {
 		const text = outlineTeamLineText(entry.text, locale);
 		const rest = listed.length - index - 1 + left;
-		const tail = rest > 0 ? getOutlineTeamActivityMore(rest + 1, taskPage, locale) : "";
+		const tail = rest > 0 ? getOutlineTeamActivityMore(rest + 1, taskList, locale) : "";
 		const size = bytesOf([heading, ...lines, text, tail, clippedLine].filter(Boolean).join("\n"));
 		if (
 			lines.length >= OUTLINE_TEAM_ACTIVITY_LIMITS.lines ||
@@ -822,7 +833,7 @@ export async function readOutlineTeamActivity(
 	const content = [
 		heading,
 		...lines,
-		...(left > 0 ? [getOutlineTeamActivityMore(left, taskPage, locale)] : []),
+		...(left > 0 ? [getOutlineTeamActivityMore(left, taskList, locale)] : []),
 		...(clippedLine ? [clippedLine] : []),
 	].join("\n");
 	return {
@@ -840,8 +851,8 @@ export async function readOutlineTeamActivity(
 	};
 }
 
-/** The main project's task page, where a count line says to read on (null: none). */
-async function taskPageOf(
+/** The main project's task list, where a count line says to read on (null: none). */
+async function taskListOf(
 	store: OutlineStore,
 	main: OutlineSpaceRow | null,
 	looks: ReadonlyArray<{ space: OutlineSpaceRow; look: SpaceLook }>,
@@ -849,19 +860,19 @@ async function taskPageOf(
 ): Promise<OutlineTeamTask | null> {
 	if (!main) return null;
 	const look = looks.find((l) => l.space.id === main.id)?.look;
-	const pageId =
-		look?.taskPageId ?? (await store.findAliasOwners(main.id, [OUTLINE_TASKS_PAGE_ALIAS]))[0]?.id;
-	if (!pageId) return null;
+	const listId =
+		look?.taskListId ?? (await store.findAliasOwners(main.id, [OUTLINE_TASKS_ALIAS]))[0]?.id;
+	if (!listId) return null;
 	const sid =
-		look?.metas.get(pageId)?.sid ?? (await store.getBlockMetasByIds([pageId]))[0]?.sid ?? null;
+		look?.metas.get(listId)?.sid ?? (await store.getBlockMetasByIds([listId]))[0]?.sid ?? null;
 	return sid
 		? { address: `${main.key}/${sid}`, title: locale === "zh-CN" ? "任务" : "tasks" }
 		: null;
 }
 
-/** Trees, then the task page, then files. */
+/** Trees, then the task list, then files. */
 function order(draft: Draft): number {
-	return draft.where === "tree" ? 0 : draft.where === "page" ? 1 : 2;
+	return draft.where === "tree" ? 0 : draft.where === "list" ? 1 : 2;
 }
 
 /** Name every draft (null: a draft that names a task without a title read: counted instead). */
@@ -997,7 +1008,7 @@ async function nameDrafts(
 		const text: OutlineTeamLine =
 			draft.where === "tree" && tree
 				? { where: "tree", tree, by, event }
-				: { where: "page", by, event };
+				: { where: "list", by, event };
 		return {
 			text,
 			item: subject

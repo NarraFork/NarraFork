@@ -12,11 +12,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type {
-	OutlineBlockViewResponse,
-	OutlineCommitSummary,
-	OutlineRevertResponse,
-} from "@shared/outline-api";
+import type { OutlineCommitSummary, OutlineRevertResponse } from "@shared/outline-api";
 import {
 	IconArrowBackUp,
 	IconChevronsLeft,
@@ -28,10 +24,12 @@ import type { TFunction } from "i18next";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorReadable } from "../../hooks/useNarratorReadable";
-import { useOutlineTimeline, useRevertOutlineCommit } from "../../hooks/useOutline";
+import { useOutlineSubtreeTimeline, useRevertOutlineCommit } from "../../hooks/useOutline";
 import { describeApiError } from "../../lib/api-error";
 import { formatFullLocaleDateTime, formatSmartTime } from "../../lib/format";
 import { timelineOldestFirst, timelinePosition } from "../../lib/outline-view";
+import { problemText } from "./history/HistoryParts";
+import { historyProblemOf } from "./history/history-model";
 import classes from "./Outline.module.css";
 import { useOutlineHost } from "./outline-host";
 
@@ -111,25 +109,34 @@ function OpenCommitSession({
 }
 
 /**
- * The strip at the bottom of a page: every commit that touched the page, oldest to newest
- * (older ones loaded on demand). Picking one shows the page as of it; "Now" goes back to the
- * current state. People who may write the space can revert the picked commit.
+ * The timeline strip of a block's subtree (or, `rootId` null, of the whole space): every commit
+ * that changed the block or anything under it, oldest to newest (older ones loaded on demand,
+ * down to the space's history floor; H2 `blocks/:blockId/commits`). Picking one shows the
+ * subtree as of it (read only); "Now" goes back to the current state. People who may write the
+ * space can revert the picked commit (that commit's own changes, by commit).
  */
 export function OutlineTimeline({
-	view,
+	spaceId,
+	rootId,
+	canWrite,
 	asOf,
 	onSelect,
 }: {
-	view: OutlineBlockViewResponse;
+	spaceId: string;
+	/** The block whose subtree's commits are shown; null: the whole space. */
+	rootId: string | null;
+	canWrite: boolean;
 	asOf: number | undefined;
 	onSelect: (seq: number | undefined) => void;
 }) {
 	const { t } = useTranslation("outline");
 	const host = useOutlineHost();
-	const timeline = useOutlineTimeline(view.space.id, view.pageId);
+	const timeline = useOutlineSubtreeTimeline(spaceId, rootId);
 	const commits = useMemo(() => timelineOldestFirst(timeline.data?.pages ?? []), [timeline.data]);
 	const { selected, previous, next } = timelinePosition(commits, asOf);
-	const revert = useRevertOutlineCommit(view.space.id);
+	const floorSeq = timeline.data?.pages.at(-1)?.floorSeq ?? 0;
+	const problem = timeline.isError ? historyProblemOf(timeline.error) : null;
+	const revert = useRevertOutlineCommit(spaceId);
 	const [confirming, setConfirming] = useState<OutlineCommitSummary | null>(null);
 	const viewport = useRef<HTMLDivElement>(null);
 	const selectedSeq = selected?.seq;
@@ -173,7 +180,12 @@ export function OutlineTimeline({
 	};
 
 	return (
-		<Box className={classes.timeline} role="region" aria-label={t("timeline.label")}>
+		<Box
+			className={classes.timeline}
+			role="region"
+			aria-label={t("timeline.label")}
+			data-testid="outline-timeline"
+		>
 			<Group gap={6} wrap="nowrap">
 				<Tooltip label={t("timeline.previous")}>
 					<ActionIcon
@@ -194,6 +206,16 @@ export function OutlineTimeline({
 					viewportRef={viewport}
 				>
 					<div className={classes.ticks}>
+						{!timeline.hasNextPage && timeline.isSuccess && floorSeq > 0 && (
+							<Text
+								size="xs"
+								c="dimmed"
+								data-testid="outline-timeline-floor"
+								style={{ flexShrink: 0 }}
+							>
+								{t("timeline.floor")}
+							</Text>
+						)}
 						{timeline.hasNextPage && (
 							<Tooltip label={t("timeline.older")}>
 								<ActionIcon
@@ -225,6 +247,11 @@ export function OutlineTimeline({
 						{timeline.isSuccess && commits.length === 0 && (
 							<Text size="xs" c="dimmed">
 								{t("timeline.empty")}
+							</Text>
+						)}
+						{problem && (
+							<Text size="xs" c="dimmed" data-testid="outline-timeline-problem">
+								{problem.kind === "not-ready" ? t("timeline.unavailable") : problemText(problem, t)}
 							</Text>
 						)}
 					</div>
@@ -268,7 +295,7 @@ export function OutlineTimeline({
 						{host.openSession && selected.actorKind === "agent" && selected.narratorId && (
 							<OpenCommitSession narratorId={selected.narratorId} open={host.openSession} />
 						)}
-						{view.space.canWrite && (
+						{canWrite && (
 							<Button
 								size="compact-xs"
 								variant="subtle"

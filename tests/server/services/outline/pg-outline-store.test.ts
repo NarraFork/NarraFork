@@ -582,6 +582,97 @@ describe("PostgreSQL outline store", () => {
 		},
 		RUN_TIMEOUT_MS,
 	);
+
+	it(
+		"pending reads by space and by session use their indexes on analyzed data (plan guard, pageless A2)",
+		async () => {
+			const sqls = await migrationSql();
+			const outcome = await withPostgres(
+				async ({
+					exec,
+					port,
+					credentials,
+				}): Promise<Record<string, PlanNode[]> | { error: string }> => {
+					for (const statement of sqls) {
+						const applied = await exec(statement);
+						if (applied.code !== 0) return { error: applied.stderr.slice(0, 400) };
+					}
+					// 50 spaces, 40,000 decided changes of 400 sessions (half told), 500 open ones.
+					const seeded = await exec(`
+					INSERT INTO outline_spaces (id, key, kind, next_seq, created_at, edges_ready)
+					SELECT 'ps' || g, 'pk' || g, 'personal', 1, '2026-11-14T00:00:00.000Z', true
+					FROM generate_series(1, 50) g;
+					INSERT INTO outline_pending (id, space_id, kind, status, page_id, root_block_id, ops_json,
+						base_json, op_count, subtree_json, block_ids_json, adds_json, summary,
+						requested_by_json, requester_session, decider_json, rev, created_at, updated_at,
+						reported_at)
+					SELECT 'pd' || g, 'ps' || (1 + g % 50), 'locked_plan',
+						CASE WHEN g <= 500 THEN 'open' ELSE 'rejected' END, 'pg' || (g % 900),
+						'root' || g, '[]', '{}', 1, '{}', '[]', '[]', 's', '{}', 'sess' || (g % 400), '{}', 1,
+						to_char(timestamp '2026-01-01' + g * interval '1 second', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+						'2026-11-14T00:00:00.000Z',
+						CASE WHEN g % 2 = 0 THEN '2026-11-14T00:00:00.000Z' ELSE NULL END
+					FROM generate_series(1, 40500) g;
+					ANALYZE outline_pending;
+				`);
+					if (seeded.code !== 0) return { error: seeded.stderr.slice(0, 400) };
+					const client = createPostgresClient({
+						driver: "bun-sql",
+						url: urlFor(port, credentials),
+						max: 2,
+						connectTimeout: 10,
+					});
+					try {
+						const planOf = async (statement: SQL) => {
+							const rows = (await client.db.execute(
+								sql`EXPLAIN (FORMAT JSON) ${statement}`,
+							)) as unknown as Array<Record<string, unknown>>;
+							const raw = Object.values(rows[0] ?? {})[0];
+							const parsed = (typeof raw === "string" ? JSON.parse(raw) : raw) as Array<{
+								Plan: PlanNode;
+							}>;
+							const nodes: PlanNode[] = [];
+							const walk = (node: PlanNode) => {
+								nodes.push(node);
+								for (const child of node.Plans ?? []) walk(child);
+							};
+							walk((parsed[0] as { Plan: PlanNode }).Plan);
+							return nodes;
+						};
+						// The statements as the store sends them (`postgres-store.ts`).
+						return {
+							count: await planOf(sql`SELECT count(*)::int AS n FROM (
+								SELECT 1 FROM outline_pending
+								WHERE space_id = CAST(${"ps7"} AS text) AND "status" = 'open'
+								LIMIT CAST(${500} AS integer)
+							) AS open_rows`),
+							unreported: await planOf(sql`SELECT id FROM outline_pending
+								WHERE requester_session = ${"sess7"} AND "reported_at" IS NULL AND "status" <> 'open'
+								ORDER BY created_at ASC, id COLLATE "C" LIMIT 100`),
+							after: await planOf(sql`SELECT id FROM outline_pending
+								WHERE requester_session = ${"sess7"} AND "reported_at" IS NULL AND "status" <> 'open'
+									AND (created_at, id COLLATE "C") > (CAST(${"2026-01-01T01:00:00.000Z"} AS text), CAST(${"pd1"} AS text) COLLATE "C")
+								ORDER BY created_at ASC, id COLLATE "C" LIMIT 100`),
+						};
+					} finally {
+						await client.close();
+					}
+				},
+			);
+			if (!outcome || typeof outcome !== "object" || !("count" in outcome)) {
+				throw new Error(`PostgreSQL harness did not run: ${JSON.stringify(outcome)}`);
+			}
+			const indexes = (nodes: PlanNode[]) =>
+				nodes.flatMap((n) => (n["Index Name"] ? [n["Index Name"]] : []));
+			for (const nodes of Object.values(outcome)) {
+				for (const node of nodes) expect(node["Node Type"]).not.toBe("Seq Scan");
+			}
+			expect(indexes(outcome.count)).toContain("idx_outline_pending_space_open");
+			expect(indexes(outcome.unreported)).toContain("idx_outline_pending_unreported");
+			expect(indexes(outcome.after)).toContain("idx_outline_pending_unreported");
+		},
+		RUN_TIMEOUT_MS,
+	);
 });
 
 /** What the plan guard brings back from the server. */

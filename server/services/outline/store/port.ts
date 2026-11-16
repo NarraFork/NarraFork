@@ -964,19 +964,29 @@ export interface OutlineStore
 	listOpenPendingByRoots(rootIds: readonly string[], limit: number): Promise<OutlinePendingHead[]>;
 	/** How many open pending changes a page has, counting at most `limit`. */
 	countOpenPendingByPage(pageId: string, limit: number): Promise<number>;
+	/**
+	 * How many open pending changes a space has, counting at most `limit` (the space's open
+	 * index): what a new proposal is held to.
+	 */
+	countOpenPendingBySpace(spaceId: string, limit: number): Promise<number>;
 	/** The open row a session has on a lock root, if any, whole. */
 	findOpenPending(requesterSession: string, rootBlockId: string): Promise<OutlinePendingRow | null>;
 	/**
-	 * Decisions on a session's changes on a page it has not been told of (heads), oldest first,
-	 * at most `limit` (the unreported index: open rows and other pages are not read).
+	 * Decisions on a session's changes it has not been told of (heads), oldest first by
+	 * (`created_at`, `id`), after `after` when given, at most `limit` (the unreported index, in
+	 * its own order: open rows are not read). The caller keeps those about where the session
+	 * reads (`takePendingReports`, by the ancestry of each change's locked task).
 	 */
 	listUnreportedPending(
 		requesterSession: string,
-		pageId: string,
 		limit: number,
+		after?: { createdAt: string; id: string } | null,
 	): Promise<OutlinePendingHead[]>;
-	/** Mark decided rows as shown to their proposer. */
-	markPendingReported(ids: readonly string[], at: string): Promise<void>;
+	/**
+	 * Mark decided rows as shown to their proposer, only those not marked yet; returns the ids
+	 * this call marked (two reads at once report a decision once).
+	 */
+	markPendingReported(ids: readonly string[], at: string): Promise<string[]>;
 	/**
 	 * Write a plan's pending changes without a commit (a proposal with nothing written directly):
 	 * atomically, and only while the space's counter is still `seq` (no commit landed since the

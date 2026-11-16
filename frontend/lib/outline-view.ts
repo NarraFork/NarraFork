@@ -13,7 +13,7 @@ import { buildFoldTree, type FoldSource, type FoldTree, type FoldView } from "@s
 import { isOutlineReportContainer } from "@shared/outline-report-line";
 
 export interface OutlineBlockSearch {
-	/** Commit seq to show the page as of; absent for the current state. */
+	/** Commit seq to show the block as of; absent for the current state. */
 	asOf?: number;
 	/** Absent means the facts view, the default. */
 	view?: OutlineViewMode;

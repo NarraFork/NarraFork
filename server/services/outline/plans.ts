@@ -7,7 +7,7 @@
  * THE ROOT
  * --------
  * `EnterPlanMode` makes the root ({@link ensurePlanRoot}): a to-do in the session space, last on
- * the task page (alias `tasks`, D37, D48 Q4) or under a task the agent names (`under`, a goal it
+ * the task list (alias `tasks`, D37, D48 Q4) or under a task the agent names (`under`, a goal it
  * plans for), managed by the session, with `plan = { state: planning, by: session, round: 0,
  * baseSeq: 0 }`. A session plans one plan at a time: entering plan mode again resumes the plan it
  * has not had approved (D48 Q3). An existing task tree can be planned again (`root`), unless a
@@ -60,8 +60,9 @@
  * rendering and size budget, its diff, the next reviewer's view, the person's edits told to the
  * agent and the 409 check all leave them out.
  *
- * Every read is bounded: the session space's open tasks (one indexed read), the plan's page
- * structure (as `OutlineRead`), the commits since the seen version (at most
+ * Every read is bounded: the session space's open tasks (one indexed read), the plan's subtree by
+ * block (`block-tree.ts`, at most {@link OUTLINE_PLAN_LIMITS.maxBlocks} blocks), the commits that
+ * changed it since the seen version (its change marks, at most
  * {@link OUTLINE_PLAN_LIMITS.commitScan}).
  */
 import { createHash } from "node:crypto";
@@ -86,6 +87,7 @@ import {
 	type PlanStructureNode,
 	planStructureIssues,
 } from "@shared/outline-plan-structure";
+import { readBlockOutline, readBlockSubtree } from "./block-tree";
 import { withOutlineLiveBarrier } from "./live-barrier";
 import {
 	OUTLINE_LIMITS,
@@ -93,10 +95,10 @@ import {
 	type OutlineTaskActorRef,
 	type OutlineTaskJson,
 } from "./model";
-import { OUTLINE_TASKS_PAGE_TITLE } from "./person-tasks";
+import { OUTLINE_TASKS_LIST_TITLE } from "./person-tasks";
 import { OUTLINE_PLAN_LIMITS, readPlanDiff } from "./plan-diff";
-import { readOutline, readSubtree } from "./read";
 import { outlineStore } from "./store";
+import { OutlineHistoryUnavailableError } from "./store/history-port";
 import type { OutlineBlockRow, OutlineSpaceRow, OutlineStore } from "./store/port";
 import { isOpenTask, isPlanningRoot } from "./task-json";
 import type { OutlineNode } from "./tree";
@@ -150,7 +152,6 @@ export class OutlinePlanError extends AppError {
 export interface OutlinePlanRoot {
 	blockId: string;
 	spaceId: string;
-	pageId: string;
 	sid: string;
 	/** `key/sid`. */
 	address: string;
@@ -167,7 +168,7 @@ function planningBy(task: OutlineTaskJson | null, session: string): boolean {
 async function rootOf(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
-	block: Pick<OutlineBlockRow, "id" | "sid" | "pageId" | "taskJson" | "versionSeq">,
+	block: Pick<OutlineBlockRow, "id" | "sid" | "taskJson" | "versionSeq">,
 	content?: string,
 ): Promise<OutlinePlanRoot> {
 	let title = content !== undefined ? blockTitle(content) : "";
@@ -178,7 +179,6 @@ async function rootOf(
 	return {
 		blockId: block.id,
 		spaceId: space.id,
-		pageId: block.pageId,
 		sid: block.sid,
 		address: `${space.key}/${block.sid}`,
 		title: title.slice(0, OUTLINE_PLAN_LIMITS.titleChars) || block.sid,
@@ -288,7 +288,7 @@ export interface EnsuredPlanRoot {
 /**
  * The root `session` plans under (EnterPlanMode, the plan-mode switch): its plan being planned,
  * if it has one; else the task `root` names, planned again; else a new to-do under `under` (a
- * task of the session space) or last on the task page. The caller has checked `session` is an
+ * task of the session space) or last on the task list. The caller has checked `session` is an
  * outline root session.
  */
 export async function ensurePlanRoot(args: {
@@ -397,17 +397,17 @@ export async function ensurePlanRoot(args: {
 			}
 			parent = { id: goal.id };
 		} else {
-			const [page] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-			if (page) parent = { id: page.id };
+			const [list] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
+			if (list) parent = { id: list.id };
 			else {
 				ops.push({
 					op: "insert",
-					tempId: "page",
+					tempId: "tasks",
 					parent: null,
-					content: OUTLINE_TASKS_PAGE_TITLE[args.locale === "zh-CN" ? "zh-CN" : "en"],
+					content: OUTLINE_TASKS_LIST_TITLE[args.locale === "zh-CN" ? "zh-CN" : "en"],
 					alias: OUTLINE_TASKS_PAGE_ALIAS,
 				});
-				parent = { tempId: "page" };
+				parent = { tempId: "tasks" };
 			}
 		}
 		const fallback = args.locale === "zh-CN" ? "计划" : "Plan";
@@ -537,8 +537,9 @@ export async function readPlanSubmission(args: {
 		// they are only what the review wrote (review round 2 S3).
 		const reviews = await planReviewBlocks(store, args.session, block, plan.baseSeq);
 		const omit = omittableReviews(reviews);
-		const read = await readOutline({
+		const read = await readBlockOutline({
 			blockId: found.blockId,
+			limit: OUTLINE_PLAN_LIMITS.maxBlocks,
 			view: "all",
 			budget: { blocks: OUTLINE_PLAN_LIMITS.maxBlocks, bytes: OUTLINE_PLAN_LIMITS.renderBytes },
 			planNotes: false,
@@ -616,7 +617,6 @@ export async function readPlanSubmission(args: {
 				root: {
 					blockId: found.blockId,
 					spaceId: found.spaceId,
-					pageId: block.pageId,
 					address: found.address,
 					title: blockTitle(block.content).slice(0, OUTLINE_PLAN_LIMITS.titleChars) || found.sid,
 					round: plan.round + 1,
@@ -637,61 +637,48 @@ export function planSubmitProblemText(locale: Locale, problem: OutlinePlanSubmit
 	return getOutlinePlanSubmitProblem(locale, problem);
 }
 
-/** Ids of the plan's blocks now and as of `seq` (the version a person looked at). */
-async function planBlockIds(
-	store: OutlineStore,
-	rootId: string,
-	seq: number,
-): Promise<Set<string>> {
-	const ids = new Set<string>();
-	const collect = (root: OutlineNode | undefined) => {
-		const stack = root ? [root] : [];
-		while (stack.length > 0 && ids.size <= OUTLINE_PLAN_LIMITS.maxBlocks * 2) {
-			const node = stack.pop() as OutlineNode;
-			ids.add(node.id);
-			for (const child of node.children) stack.push(child);
-		}
-	};
-	collect((await readSubtree(rootId, { store }))?.root);
-	if (seq >= 1) collect((await readSubtree(rootId, { asOf: seq, store }))?.root);
-	return ids;
-}
-
 /**
- * Whether anyone but `decider` changed the plan after `seenSeq`: a version of the plan's page
- * recorded since then (one indexed read, at most {@link OUTLINE_PLAN_LIMITS.maxBlocks}; more
- * counts as changed) of a block of the plan, written by a commit of someone else (the commits
- * since then read once, at most {@link OUTLINE_PLAN_LIMITS.commitScan}; one past them counts as
- * changed). A live session's flush with nobody to name (`system:outline-live`) is not counted: it
- * is most often the person's own typing saved for them (review round 1 N7), nor are the plan
- * review's comments for `session` (PR 8b). A block moved off the page since then is not seen.
+ * Whether anyone but `decider` changed the plan after `seenSeq`: a commit that changed the plan's
+ * root or anything that was under it then (its change marks and its own versions, two bounded
+ * range reads; a block moved out of the plan since counts, and so does one moved in), written by
+ * someone else; more than {@link OUTLINE_PLAN_LIMITS.commitScan} such commits count as changed.
+ * A live session's flush with nobody to name (`system:outline-live`) is not counted: it is most
+ * often the person's own typing saved for them (review round 1 N7), nor are the plan review's
+ * comments for `session` (PR 8b). A space whose history cannot be read (its placements are not
+ * built yet), or a seen version below its history floor, counts as changed: what is not known is
+ * not passed as unchanged.
  */
 async function changedByOthersSince(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
-	root: { id: string; pageId: string },
+	rootId: string,
 	seenSeq: number,
 	decider: OutlineTaskActorRef,
 	session: string,
 ): Promise<boolean> {
 	if (space.nextSeq - 1 <= seenSeq) return false;
-	const versions = await store.listPageVersions(root.pageId, {
-		afterSeq: seenSeq,
-		limit: OUTLINE_PLAN_LIMITS.maxBlocks + 1,
-	});
-	if (versions.length > OUTLINE_PLAN_LIMITS.maxBlocks) return true;
-	if (versions.length === 0) return false;
-	const ids = await planBlockIds(store, root.id, seenSeq);
-	const touching = new Set(versions.filter((v) => ids.has(v.blockId)).map((v) => v.commitId));
-	if (touching.size === 0) return false;
-	const commits = await store.listCommits(space.id, {
-		afterSeq: seenSeq,
-		limit: OUTLINE_PLAN_LIMITS.commitScan + 1,
-	});
-	const byId = new Map(commits.map((c) => [c.id, c]));
-	for (const commitId of touching) {
-		const commit = byId.get(commitId);
-		if (!commit) return true;
+	const scan = OUTLINE_PLAN_LIMITS.commitScan;
+	let seqs: Set<number>;
+	try {
+		// Below the history floor nothing is known of what happened: the change marks start
+		// there, so a version seen before it counts as changed.
+		const state = (await store.getHistoryStates([space.id])).get(space.id);
+		if (!state?.edgesReady || seenSeq < state.floorSeq) return true;
+		const below = await store.listSubtreeChangeSeqs(space.id, rootId, {
+			after: seenSeq,
+			limit: scan + 1,
+		});
+		const own = await store.listBlockHistory(rootId, { limit: scan + 1 });
+		seqs = new Set([...below, ...own.map((row) => row.fromSeq).filter((seq) => seq > seenSeq)]);
+	} catch (error) {
+		if (error instanceof OutlineHistoryUnavailableError) return true;
+		throw error;
+	}
+	if (seqs.size > scan) return true;
+	if (seqs.size === 0) return false;
+	const commits = await store.getCommitsBySeqs(space.id, [...seqs]);
+	if (commits.length < seqs.size) return true;
+	for (const commit of commits) {
 		if (commit.actorKind === decider.kind && commit.actorId === decider.id) continue;
 		if (commit.actorKind === "system" && commit.actorId === LIVE_FLUSH_ACTOR) continue;
 		// The plan review's comments for this session are not someone changing the plan (PR 8b).
@@ -809,14 +796,7 @@ export async function decideOutlinePlan(args: {
 		if (
 			args.decider.kind === "human" &&
 			typeof args.seenSeq === "number" &&
-			(await changedByOthersSince(
-				store,
-				space,
-				{ id: block.id, pageId: block.pageId },
-				args.seenSeq,
-				deciderRef,
-				args.session,
-			))
+			(await changedByOthersSince(store, space, block.id, args.seenSeq, deciderRef, args.session))
 		) {
 			throw new OutlinePlanError(
 				"the plan changed since you looked at it; look at the changes again",
@@ -980,7 +960,7 @@ export async function discardEmptyPlanRoot(args: {
 /**
  * The plan as of `seq` for its review: the submission's rendering with each block labelled by its
  * short id (`[sid]`, as `OutlineRead` labels the session's own space), so a comment can name the
- * step it is about. One page-structure read within the submission's budget. Null when the root is
+ * step it is about. One read of the plan's subtree within the submission's budget. Null when the root is
  * not there at `seq`.
  */
 export async function renderPlanForReview(args: {
@@ -990,7 +970,8 @@ export async function renderPlanForReview(args: {
 	omit?: ReadonlySet<string>;
 	store?: OutlineStore;
 }): Promise<string | null> {
-	const read = await readOutline({
+	const read = await readBlockOutline({
+		limit: OUTLINE_PLAN_LIMITS.maxBlocks,
 		...(args.omit && args.omit.size > 0 ? { omit: args.omit } : {}),
 		blockId: args.rootId,
 		...(args.seq >= 1 ? { asOf: args.seq } : {}),
@@ -1314,10 +1295,13 @@ export async function writePlanReview(args: {
 				"OUTLINE_PLAN_DECIDED",
 			);
 		const address = `${space.key}/${block.sid}`;
-		// Targets: blocks of the plan as it is now (one page-structure read, only when named).
+		// Targets: blocks of the plan as it is now (one read of its subtree, only when named).
 		const targets = new Map<string, string>();
 		if (args.comments.some((comment) => comment.target?.trim())) {
-			const subtree = await readSubtree(block.id, { store });
+			const subtree = await readBlockSubtree(block.id, {
+				limit: OUTLINE_PLAN_LIMITS.maxBlocks,
+				store,
+			});
 			if (!subtree) throw new OutlinePlanError("the plan was not found", "OUTLINE_PLAN_NOT_FOUND");
 			const stack = [subtree.root];
 			while (stack.length > 0 && targets.size <= OUTLINE_PLAN_LIMITS.maxBlocks * 2) {

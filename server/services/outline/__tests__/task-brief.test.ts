@@ -38,11 +38,11 @@ function input(over: Partial<TaskBriefInput> = {}): TaskBriefInput {
 			{ address: "Kx81mPqa/Fact0001", title: "Auth design", text: "- Auth design\n  - One lock" },
 			{ unreadable: true },
 		],
-		pages: [
-			{ address: "Kx81mPqa/Page0001", title: "Auth design", linked: true, lines: ["One lock"] },
-			{ address: "Kx81mPqa/Page0002", title: "Glossary", linked: false, lines: [] },
+		map: [
+			{ address: "Kx81mPqa/Top00001", title: "Auth design", linked: true, lines: ["One lock"] },
+			{ address: "Kx81mPqa/Top00002", title: "Glossary", linked: false, lines: [] },
 		],
-		morePages: 0,
+		moreMap: 0,
 		...over,
 	};
 }
@@ -115,11 +115,11 @@ describe("the opening brief", () => {
 				"- Auth design\n  - One lock",
 				"- (a block this session cannot read)",
 				"",
-				"## Pages of the project's outline",
-				"A map, not the content: each page with the first lines of what it holds. Read a page with OutlineRead before relying on it.",
-				"- Auth design (`Kx81mPqa/Page0001`) · linked from the task",
+				"## The top level of the project's outline",
+				"A map, not the content: each top-level block with the first lines of what it holds. Read one with OutlineRead before relying on it.",
+				"- Auth design (`Kx81mPqa/Top00001`) · the task links to something here",
 				"  - One lock",
-				"- Glossary (`Kx81mPqa/Page0002`)",
+				"- Glossary (`Kx81mPqa/Top00002`)",
 				"",
 				"## Further instructions",
 				"Keep the public API.",
@@ -148,12 +148,12 @@ describe("the opening brief", () => {
 
 	test("an empty task: only the head and the rules", () => {
 		const brief = renderTaskBrief(
-			input({ body: null, children: [], prerequisites: [], background: [], facts: [], pages: [] }),
+			input({ body: null, children: [], prerequisites: [], background: [], facts: [], map: [] }),
 		);
 		expect(brief).not.toContain("## What to do");
 		expect(brief).not.toContain("## Background");
 		expect(brief).not.toContain("## Facts");
-		expect(brief).not.toContain("## Pages");
+		expect(brief).not.toContain("## The top level");
 		expect(brief).toContain("## How to work on this task");
 	});
 
@@ -185,13 +185,13 @@ describe("the opening brief", () => {
 					title: `Fact ${i}`,
 					text: `- Fact ${i}\n${"  - detail line of the fact\n".repeat(200)}`,
 				})),
-				pages: Array.from({ length: 20 }, (_, i) => ({
-					address: `Kx81mPqa/Page00${i}`,
-					title: `Page ${i}`,
+				map: Array.from({ length: 20 }, (_, i) => ({
+					address: `Kx81mPqa/Top000${i}`,
+					title: `Top ${i}`,
 					linked: i < 2,
 					lines: Array.from({ length: 5 }, (_, j) => `line ${j} ${"p".repeat(300)}`),
 				})),
-				morePages: 7,
+				moreMap: 7,
 				prompt: note,
 			}),
 		);
@@ -208,24 +208,24 @@ describe("the opening brief", () => {
 			"## Notes and steps so far",
 			"## Background (the tasks above this one)",
 			"## Facts the task links to",
-			"## Pages of the project's outline",
+			"## The top level of the project's outline",
 			"## How to work on this task",
 		])
 			expect(brief).toContain(heading);
 		// A fact is cut to its own limit; one that does not fit whole is named with its address.
-		const facts = brief.slice(brief.indexOf("## Facts"), brief.indexOf("## Pages"));
+		const facts = brief.slice(brief.indexOf("## Facts"), brief.indexOf("## The top level"));
 		expect(facts).toContain("### `Kx81mPqa/Fact0000`");
 		expect(facts).toMatch(/- Fact \d \(`Kx81mPqa\/Fact000\d`\): not shown here/);
 		// Every fact is at least named.
 		expect(facts.match(/^(### `|- Fact \d \()/gm)).toHaveLength(8);
-		// Pages that did not fit whole keep their title line; those never read are counted.
-		const pages = brief.slice(
-			brief.indexOf("## Pages"),
+		// Top-level blocks that did not fit whole keep their title line; those never read are counted.
+		const map = brief.slice(
+			brief.indexOf("## The top level"),
 			brief.indexOf("\n\n## Further instructions"),
 		);
-		expect(pages).toContain("- Page 0 (`Kx81mPqa/Page000`) · linked from the task");
-		expect(pages).toMatch(/\n- … \d+ more$/);
-		expect(Number(/- … (\d+) more$/.exec(pages)?.[1])).toBeGreaterThanOrEqual(7);
+		expect(map).toContain("- Top 0 (`Kx81mPqa/Top0000`) · the task links to something here");
+		expect(map).toMatch(/\n- … \d+ more$/);
+		expect(Number(/- … (\d+) more$/.exec(map)?.[1])).toBeGreaterThanOrEqual(7);
 	});
 
 	test("what earlier sections leave unused, later ones use", () => {
