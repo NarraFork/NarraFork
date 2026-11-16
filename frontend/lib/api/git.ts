@@ -10,6 +10,10 @@ import type {
 	WorktreePrepareRequest,
 	WorktreePrepareResult,
 	WorktreeReconcileRequest,
+	WorktreeRemovalPlan,
+	WorktreeRemovalPlanRequest,
+	WorktreeRemovalRequest,
+	WorktreeRemovalResult,
 } from "@shared/narrator-worktrees";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
@@ -101,6 +105,18 @@ export const gitApi = {
 	reconcileNarratorWorktree: (id: string, input: WorktreeReconcileRequest) =>
 		gitRequest<WorktreeCreateResult>(
 			`/narrators/${encodeURIComponent(id)}/git/worktrees/reconcile`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
+	/** Read-only removal preflight; safe to re-run whenever the dialog needs fresh facts. */
+	planNarratorWorktreeRemoval: (id: string, input: WorktreeRemovalPlanRequest) =>
+		gitRequest<WorktreeRemovalPlan>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/removal/plan`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
+	/** Explicit destructive command. Retrying a completed removal reports `already_absent`. */
+	removeNarratorWorktree: (id: string, input: WorktreeRemovalRequest) =>
+		gitRequest<WorktreeRemovalResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/removal`,
 			{ method: "POST", body: JSON.stringify(input) },
 		),
 	getGitWorkspace: (narratorId: string, signal?: AbortSignal) =>

@@ -78,6 +78,7 @@ const reconcile = mock(
 mock.module("@frontend/hooks/useWorkspaceContext", () => ({
 	useWorkspaceContext: () => ({ data: activeContext }),
 	useSwitchWorkspaceContext: () => ({ mutateAsync: switched, isPending: false }),
+	workspaceContextKey: (id: string) => ["workspaceContext", id],
 }));
 class FakeApiError extends Error {
 	constructor(
@@ -126,6 +127,8 @@ mock.module("@tanstack/react-query", () => ({
 	},
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+const shown = mock((_notification: unknown) => {});
+mock.module("@mantine/notifications", () => ({ notifications: { show: shown } }));
 type Children = { children?: ReactNode };
 const Wrapper = ({ children }: Children) => <div>{children}</div>;
 mock.module("@mantine/core", () => {
@@ -152,6 +155,44 @@ mock.module("@mantine/core", () => {
 		Tooltip: Wrapper,
 		Menu,
 		Badge: Wrapper,
+		Divider: () => <hr />,
+		UnstyledButton: ({
+			children,
+			onClick,
+			disabled,
+			"data-worktree-path": path,
+		}: Children & {
+			onClick?: () => void;
+			disabled?: boolean;
+			"data-worktree-path"?: string;
+		}) => (
+			<button type="button" disabled={disabled} onClick={onClick} data-worktree-path={path}>
+				{children}
+			</button>
+		),
+		Checkbox: ({
+			label,
+			checked,
+			onChange,
+			disabled,
+		}: {
+			label: string;
+			checked: boolean;
+			onChange: (event: { currentTarget: { checked: boolean } }) => void;
+			disabled?: boolean;
+		}) => (
+			<label>
+				<input
+					type="checkbox"
+					checked={checked}
+					disabled={disabled}
+					onChange={(event) =>
+						onChange({ currentTarget: { checked: event.currentTarget.checked } })
+					}
+				/>
+				{label}
+			</label>
+		),
 		ScrollArea: {
 			Autosize: ({
 				children,
