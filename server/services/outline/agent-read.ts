@@ -236,7 +236,8 @@ function linkTree(parts: readonly TreePart[], top: string | null | undefined): L
 			const isTop = top !== undefined && level.parentId === top;
 			if (!parent && !isTop) continue;
 			looked.add(level.parentId);
-			if (level.more) open.add(level.parentId);
+			// The top level of the read is `null` here, whichever block it hangs under.
+			if (level.more) open.add(parent ? level.parentId : null);
 			processHidden += level.processHidden;
 			for (const id of level.childIds) {
 				const child = nodes.get(id);
@@ -479,8 +480,8 @@ async function stableAnswer(
  * number of its top-level blocks; view `all` lists them.
  *
  * Bounded: one read of each space from its top (`readOutlineSubtreeNodes`), for a share of the
- * budget (twice an even share, so a space with little leaves room for the others; never more
- * than the budget), yielding between spaces. Where a space's share ended, its blocks say
+ * budget (twice an even share, so a space with little leaves room for the others; at least
+ * {@link OUTLINE_AGENT_READ_LIMITS.overviewMinShare} blocks), yielding between spaces. Where a space's share ended, its blocks say
  * `‹… more›`. What it shows is a read: recorded in the ledger, links titled where the session
  * may read them.
  */
@@ -510,8 +511,10 @@ async function overviewAnswer(
 	const budget = budgetOf(input.budget);
 	const context = await scope.contextSpace();
 	const share = {
+		// Not capped by the budget: a read spends its blocks on rows read, and the facts view may
+		// leave the first of them out (top-level tasks).
 		blocks: Math.min(
-			budget.blocks,
+			limits.maxBlocks,
 			Math.max(limits.overviewMinShare, Math.ceil((budget.blocks * 2) / spaces.length)),
 		),
 		bytes: Math.min(
@@ -533,7 +536,8 @@ async function overviewAnswer(
 	let processHidden = 0;
 	let truncated = cut !== null;
 	for (const [i, { space, word }] of spaces.entries()) {
-		if (i > 0) await yieldToEventLoop();
+		// Every space's read is a stretch of the main thread of its own.
+		await yieldToEventLoop();
 		const own = scope.isOwnSpace(space);
 		const header = [
 			note(OUTLINE_TOOL_TEXT.spaceSection(await scope.describe(space), space.id === context?.id)),

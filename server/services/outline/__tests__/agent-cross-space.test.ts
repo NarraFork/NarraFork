@@ -301,7 +301,7 @@ describe("links to what the session may not read", () => {
 });
 
 describe("the overview of every readable space", () => {
-	test("its own spaces first, then the others, each with its pages within the budget", async () => {
+	test("its own spaces first, then the others, each with its top-level blocks within the budget", async () => {
 		const w = await world();
 		await write(w.atlas, w.alice, [
 			{ op: "insert", tempId: "a", parent: null, content: "Auth module" },
@@ -338,11 +338,12 @@ describe("the overview of every readable space", () => {
 		expect(out).toContain("- [");
 		expect(out).toContain("Tokens live on the server");
 		expect(out).not.toContain("regression");
-		expect(out).toContain("‹facts only: 1 block under tasks not shown");
+		// Shape changed (pageless A1): the tasks left out are counted, not the blocks under them.
+		expect(out).toContain(`‹${OUTLINE_TOOL_TEXT.factsHidden(1)}›`);
 		expect(out).toContain(`‹space ${w.billing.key} · project "Billing"›`);
 		expect(out).toContain(`- [${w.billing.key}/${invoices}] Invoices`);
 		expect(out).toContain("Totals are kept in cents");
-		expect(out).toContain(`‹space ${w.notes.key} · this session's notes›\n‹no pages yet›`);
+		expect(out).toContain(`‹space ${w.notes.key} · this session's notes›\n‹nothing here yet›`);
 		expect(out).toContain("My preferences");
 		expect(result.metadata?.complete).toBe(true);
 		// What it showed is a read.
@@ -365,7 +366,7 @@ describe("the overview of every readable space", () => {
 		expect(asOf.output).toBe(OUTLINE_TOOL_TEXT.overviewNotAsOf);
 	});
 
-	test("another session's notes are process: the facts view counts their pages", async () => {
+	test("another session's notes are process: the facts view counts their top-level blocks", async () => {
 		const w = await world();
 		const [repro] = await write(w.otherNotes, w.alice, [
 			{ op: "insert", tempId: "r", parent: null, content: "Repro steps" },
@@ -376,7 +377,7 @@ describe("the overview of every readable space", () => {
 		const c = ctx(w.session, w.alice);
 		const facts = await call(outlineReadTool, { address: "*" }, c);
 		expect(facts.output).toContain(
-			`‹space ${w.otherNotes.key} · session "Login bug"›\n‹${OUTLINE_TOOL_TEXT.otherSessionPages(2, false)}›`,
+			`‹space ${w.otherNotes.key} · session "Login bug"›\n‹${OUTLINE_TOOL_TEXT.otherSessionNotes(2, false)}›`,
 		);
 		expect(facts.output).not.toContain("Repro steps");
 		expect(facts.output).not.toContain("Hypotheses");
@@ -395,12 +396,12 @@ describe("the overview of every readable space", () => {
 		expect(byKey.output).toContain(`- [${w.otherNotes.key}/${repro}] Repro steps`);
 	});
 
-	test("pages that are tasks take nothing from the budget; pages not expanded say why", async () => {
+	test("top-level tasks take nothing from the budget; where a space's share ends it says more", async () => {
 		const w = await world();
 		await write(w.atlas, w.alice, [
 			{ op: "insert", parent: null, content: "Task one", task: { status: "todo" } },
 			{ op: "insert", parent: null, content: "Task two", task: { status: "todo" } },
-			{ op: "insert", parent: null, content: "Plain page" },
+			{ op: "insert", parent: null, content: "Plain block" },
 		]);
 		const lines = (n: number, tempId: string) =>
 			Array.from({ length: n }, (_, i) => ({
@@ -408,49 +409,40 @@ describe("the overview of every readable space", () => {
 				parent: { tempId },
 				content: `line ${i}`,
 			}));
-		const [bigPage] = await write(w.billing, w.alice, [
-			{ op: "insert", tempId: "big", parent: null, content: "Big page" },
+		const [big] = await write(w.billing, w.alice, [
+			{ op: "insert", tempId: "big", parent: null, content: "Big block" },
 			...lines(6, "big"),
 		]);
 		await write(w.billing, w.alice, [
-			{ op: "insert", tempId: "small", parent: null, content: "Small page" },
+			{ op: "insert", tempId: "small", parent: null, content: "Small block" },
 			...lines(2, "small"),
 		]);
 		const c = ctx(w.session, w.alice);
-		// Budget 1: the task pages are listed before the plain page but do not take its place.
+		// Budget 1: the top-level tasks come before the plain block but do not take its place.
 		const one = await call(outlineReadTool, { address: "*", budget: 1 }, c);
-		expect(one.output).toContain("Plain page");
-		expect(one.output).toContain(OUTLINE_TOOL_TEXT.taskPagesHidden(2));
+		expect(one.output).toContain("Plain block");
+		expect(one.output).toContain(OUTLINE_TOOL_TEXT.factsHidden(2));
 		const limits = OUTLINE_AGENT_READ_LIMITS;
 		const saved = { ...limits };
 		try {
-			// One read takes 5 blocks: the 7-block page shows alone, the 3-block one whole.
-			limits.overviewBlocksPerRead = 5;
-			const large = await call(outlineReadTool, { address: "*" }, c);
-			expect(large.output).toContain(`- [${w.billing.key}/${bigPage}] Big page`);
-			expect(large.output).toContain(
-				OUTLINE_TOOL_TEXT.notExpandedLarge([`[${w.billing.key}/${bigPage}]`]),
-			);
-			expect(large.output).not.toContain("line 5");
-			expect(large.output).toMatch(/Small page\n {2}- \[[^\]]+\] line 0/);
-			expect(large.metadata?.truncated).toBe(true);
-			// Past what one overview reads in all: shown alone, and said so.
-			limits.overviewBlocksPerRead = saved.overviewBlocksPerRead;
-			limits.overviewBlocks = 2;
-			const past = await call(outlineReadTool, { address: "*" }, c);
-			expect(past.output).toMatch(
-				/shown without what is under them, past the blocks one overview reads/,
-			);
-			expect(past.output).not.toContain("line 0");
-			const meta = past.metadata?.spaces as Array<{ key: string; pages: number }>;
-			expect(meta.find((s) => s.key === w.billing.key)?.pages).toBe(2);
-			expect(meta.find((s) => s.key === w.atlas.key)?.pages).toBe(1);
+			// A space's share is 4 blocks: both top-level blocks and two lines of the first. What
+			// the share did not reach is marked, never counted.
+			limits.overviewMinShare = 4;
+			const cut = await call(outlineReadTool, { address: "*", budget: 4 }, c);
+			expect(cut.output).toContain(`- [${w.billing.key}/${big}] Big block`);
+			expect(cut.output).toMatch(/Big block\n {2}- \[[^\]]+\] line 0\n {2}‹… 1\+ more›/);
+			expect(cut.output).toMatch(/Small block\n {2}‹… more›/);
+			expect(cut.output).not.toContain("line 5");
+			expect(cut.metadata?.truncated).toBe(true);
+			const meta = cut.metadata?.spaces as Array<{ key: string; blocks: number }>;
+			expect(meta.find((s) => s.key === w.billing.key)?.blocks).toBe(2);
+			expect(meta.find((s) => s.key === w.atlas.key)?.blocks).toBe(1);
 		} finally {
 			Object.assign(limits, saved);
 		}
 	});
 
-	test("every space shows its pages, round-robin; structure is read in a few batched reads", async () => {
+	test("every space shows its top-level blocks, round-robin; nothing is read by page", async () => {
 		const owner = await user("wide");
 		const main = await project(owner, "Main");
 		const session = await narrator(owner, main);
@@ -464,7 +456,7 @@ describe("the overview of every readable space", () => {
 					op: "insert",
 					tempId: `p${p}`,
 					parent: null,
-					content: `${space.key} page ${p}`,
+					content: `${space.key} top ${p}`,
 				});
 				for (let k = 0; k < 3; k++) {
 					ops.push({ op: "insert", parent: { tempId: `p${p}` }, content: `child ${p}.${k}` });
@@ -472,39 +464,39 @@ describe("the overview of every readable space", () => {
 			}
 			await write(space, owner, ops);
 		}
+		// The reads keyed by page are gone from this path (they are deleted with pages).
 		const store = outlineStore as unknown as Record<string, (...args: unknown[]) => unknown>;
-		const calls = { single: 0, batched: 0 };
-		const single = store.listPageStructure as (...args: unknown[]) => unknown;
-		const batched = store.listPagesStructure as (...args: unknown[]) => unknown;
-		store.listPageStructure = (...args) => {
-			calls.single++;
-			return single.apply(outlineStore, args);
-		};
-		store.listPagesStructure = (...args) => {
-			calls.batched++;
-			return batched.apply(outlineStore, args);
-		};
+		const pageReads = ["listPageStructure", "listPagesStructure", "listSpacePages"] as const;
+		const originals = pageReads.map((name) => store[name]);
+		let byPage = 0;
+		for (const [i, name] of pageReads.entries()) {
+			store[name] = (...args) => {
+				byPage++;
+				return (originals[i] as (...args: unknown[]) => unknown).apply(outlineStore, args);
+			};
+		}
 		try {
 			const c = ctx(session, owner);
-			const wide = await call(outlineReadTool, { address: "*", budget: 2000 }, c);
+			const wide = await call(outlineReadTool, { address: "*", budget: 800 }, c);
 			const sections = wide.output.split(/\n(?=‹space )/).slice(1);
 			expect(sections).toHaveLength(12);
 			for (const section of sections) {
 				expect((section.match(/^- \[/gm) ?? []).length).toBe(6);
 				expect((section.match(/^ {2}- \[/gm) ?? []).length).toBe(18);
 			}
-			expect(calls.single).toBe(0);
-			expect(calls.batched).toBe(1);
-			// A small budget takes the first page of every space before any second page.
+			expect(wide.output).not.toContain("more›");
+			// A small budget takes the first block of every space before any second one.
 			const small = await call(outlineReadTool, { address: "*", budget: 12 }, c);
 			for (const space of spaces) {
-				expect(small.output).toContain(`${space.key} page 0`);
-				expect(small.output).not.toContain(`${space.key} page 1`);
-				expect(small.output).toContain(OUTLINE_TOOL_TEXT.morePagesOf(space.key, 5, false));
+				expect(small.output).toContain(`${space.key} top 0`);
+				expect(small.output).not.toContain(`${space.key} top 1`);
+				expect(small.output).toContain(OUTLINE_TOOL_TEXT.moreTopsOf(space.key, 5, false));
 			}
+			expect(byPage).toBe(0);
 		} finally {
-			store.listPageStructure = single;
-			store.listPagesStructure = batched;
+			for (const [i, name] of pageReads.entries()) {
+				store[name] = originals[i] as (...args: unknown[]) => unknown;
+			}
 		}
 	});
 
@@ -944,7 +936,7 @@ describe("access that changes while the outline is read", () => {
 	 * calls `counts` admits are counted and hooked).
 	 */
 	async function patched<T>(
-		method: "listSpacePages" | "searchBlocks",
+		method: "listLevels" | "searchBlocks",
 		onCall: (n: number) => Promise<void>,
 		fn: () => Promise<T>,
 		counts: (args: unknown[]) => boolean = () => true,
@@ -970,7 +962,7 @@ describe("access that changes while the outline is read", () => {
 		expect(before.output).toContain("Numbat secret 0");
 		clearOutlineReads();
 		const r = await patched(
-			"listSpacePages",
+			"listLevels",
 			async (n) => {
 				if (n === 0) await w.share(true);
 			},
@@ -1011,7 +1003,7 @@ describe("access that changes while the outline is read", () => {
 		// Shared, unshared, shared again: each answer is built under access that then changes. The
 		// last one, built unshared, shows the secrets; shared now, the session may not read them.
 		const r = await patched(
-			"listSpacePages",
+			"listLevels",
 			async (n) => {
 				if (n === 0 || n === 2) await w.share(true);
 				if (n === 1) await w.share(false);
@@ -1024,7 +1016,7 @@ describe("access that changes while the outline is read", () => {
 		// Unshared at once and changed (for nothing) after every answer: the last answer still
 		// holds when it is checked, so it is given.
 		const settledLast = await patched(
-			"listSpacePages",
+			"listLevels",
 			async () => {
 				await w.share(false);
 			},
