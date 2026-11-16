@@ -74,7 +74,7 @@ const DEDUPE_SCAN = 500;
 const DEDUPE_FULL_READS = 8;
 
 /** The title of a session's task page when it is made (by `/goal`, the board or plan mode). */
-export const OUTLINE_TASKS_PAGE_TITLE: Record<"en" | "zh-CN", string> = {
+export const OUTLINE_TASKS_LIST_TITLE: Record<"en" | "zh-CN", string> = {
 	en: "Tasks",
 	"zh-CN": "任务",
 };
@@ -197,15 +197,15 @@ export async function addPersonTask(args: {
 						: [
 								{
 									op: "insert" as const,
-									tempId: "page",
+									tempId: "tasks",
 									parent: null,
-									content: OUTLINE_TASKS_PAGE_TITLE[args.locale ?? "en"],
+									content: OUTLINE_TASKS_LIST_TITLE[args.locale ?? "en"],
 									alias: OUTLINE_TASKS_PAGE_ALIAS,
 								},
 							]),
 					{
 						op: "insert" as const,
-						parent: owner ? { id: owner.id } : { tempId: "page" },
+						parent: owner ? { id: owner.id } : { tempId: "tasks" },
 						content: text,
 						task: {
 							status: "todo" as const,

@@ -54,15 +54,15 @@
  * steps and questions under it and its prerequisites (the delegation brief's rendering,
  * `renderDelegationBrief`); the background (the nearest tasks above with their first paragraph,
  * and the nearest one's tasks, to place this one); the facts the task links to; a map of the
- * project space's pages; how to work and how to end (§B.4); the person's note. What an earlier
+ * top level of the task's space; how to work and how to end (§B.4); the person's note. What an earlier
  * section leaves unused of its share, later ones may use.
  *
  * WHICH FACTS, WITHOUT RETRIEVAL (§F.2; D54: no retrieval now)
  * Only structure the outline already has, in three tiers: (1) the link targets of the task's own
  * text and of the blocks under it that were read; (2) those of the titles and first paragraphs of
  * the tasks above it; together at most {@link OUTLINE_TASK_BRIEF_LIMITS.facts}, each read in the
- * facts view within {@link OUTLINE_TASK_BRIEF_LIMITS.factBytes}; (3) the pages of the project
- * space, each with the first lines of its facts, the linked ones first. No full-text match, no
+ * facts view within {@link OUTLINE_TASK_BRIEF_LIMITS.factBytes}; (3) the top-level blocks of the
+ * task's space, each with the first lines of its facts, those the facts are under first. No full-text match, no
  * search by the task's title.
  *
  * WHOSE READ ACCESS (§F.3)
@@ -72,10 +72,11 @@
  *
  * COST
  * ----
- * Every read is indexed and bounded: the task's page structure (one read), bodies within the
- * budget, at most `facts` targets each one bounded read of its page, at most `pages` pages'
- * structure in one read (`pageBlocks` rows) and their first lines as content heads. One claim
- * commit and one injection per click.
+ * Every read is indexed and bounded: the task's subtree and ancestry by block (`block-tree.ts`),
+ * bodies within the budget, at most `facts` targets each one bounded read of its subtree, the
+ * ancestry of those targets (one statement), the space's top level (`mapCounted` rows), the first
+ * children of at most `mapBlocks` of its blocks (`mapChildRows` each) and their first lines as
+ * content heads. One claim commit and one injection per click.
  */
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -89,6 +90,12 @@ import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { canReadSpace, canWriteSpace, narratorVisibility, projectUsersWith } from "./access";
 import { readDisplayNames, readProject } from "./access-reads";
 import { OutlineAgentScope } from "./agent-scope";
+import {
+	type OutlineBlockTree,
+	readBlockOutline,
+	readBlockSubtree,
+	readChildLevels,
+} from "./block-tree";
 import {
 	clip,
 	contentTargets,
@@ -110,10 +117,11 @@ import {
 import { isHandoffBlockId, OUTLINE_HANDOFF_LIMITS, previousSessionDirectory } from "./handoff";
 import { linkDisplayTitle, linkTitles } from "./link-display";
 import { oneAtATime } from "./person-tasks";
-import { loadBodies, readOutline, readSubtree } from "./read";
+import { loadBodies } from "./read";
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineSpaceRow, OutlineStore } from "./store/port";
 import { OutlineStaleWriteError } from "./store/port";
+import { readOutlineAncestry } from "./subtree-marks";
 import { isPlanningRoot, type OutlineTaskStartBlocker, outlineTaskStartBlocker } from "./task-json";
 import { deriveOutlineTaskWaits, isClaimLive } from "./tasks";
 import { buildTree, type OutlineNode, viewChildren } from "./tree";
@@ -134,10 +142,10 @@ export const OUTLINE_TASK_BRIEF_LIMITS = {
 	/** UTF-8 bytes of one line of a handoff, and of one note it points to. */
 	handoffLineBytes: 400,
 	handoffNoteBytes: 800,
-	/** The share of the background, the linked facts and the map of pages. */
+	/** The share of the background, the linked facts and the map of the top level. */
 	backgroundBytes: 1800,
 	factsBytes: 3 * 1024,
-	pagesBytes: 1536,
+	mapBytes: 1536,
 	/** Tasks above the task the background names, nearest first. */
 	ancestors: 3,
 	/** Characters of a background paragraph (the plan format's context paragraph). */
@@ -149,13 +157,15 @@ export const OUTLINE_TASK_BRIEF_LIMITS = {
 	/** UTF-8 bytes and blocks of one fact as read. */
 	factBytes: 600,
 	factBlocks: 12,
-	/** Pages of the project space the map lists, and first lines of each. */
-	pages: 20,
-	pageLines: 5,
-	/** Pages read (their heads only) to count those the map does not list. */
-	pagesCounted: 200,
-	/** Structure rows read for the map's pages in all. */
-	pageBlocks: 2000,
+	/** Top-level blocks of the space the map lists, and first lines of each. */
+	mapBlocks: 20,
+	mapLines: 5,
+	/** Top-level blocks read (structure only) to count those the map does not list. */
+	mapCounted: 200,
+	/** Children read under each block the map lists (tasks among them are passed over). */
+	mapChildRows: 16,
+	/** Blocks of the targets' ancestry read to place them under the top level. */
+	mapWalkRows: 2000,
 	/** Characters of a line of the map. */
 	lineChars: 120,
 	/** Characters of the session's title (the task's). */
@@ -447,10 +457,10 @@ export interface TaskBriefInput extends DelegationBriefInput {
 	 */
 	handoff?: TaskBriefHandoff | null;
 	facts: TaskBriefFact[];
-	/** The project space's pages, those linked first. */
-	pages: Array<{ address: string; title: string; linked: boolean; lines: string[] }>;
-	/** Pages past the ones listed. */
-	morePages: number;
+	/** The top-level blocks of the task's space, those the facts are under first. */
+	map: Array<{ address: string; title: string; linked: boolean; lines: string[] }>;
+	/** Top-level blocks past the ones listed. */
+	moreMap: number;
 }
 
 export interface TaskBriefHandoff {
@@ -551,7 +561,7 @@ export function renderTaskBrief(
 	const share = {
 		background: Math.floor(limits.backgroundBytes * scale),
 		facts: Math.floor(limits.factsBytes * scale),
-		pages: Math.floor(limits.pagesBytes * scale),
+		map: Math.floor(limits.mapBytes * scale),
 	};
 	const background = input.background.map((above, index) => {
 		const lines = [text.ancestor(clip(above.title))];
@@ -571,17 +581,17 @@ export function renderTaskBrief(
 					fallback: [text.factLine(clip(fact.title), fact.address)],
 				},
 	);
-	const pages = input.pages.map((page) => {
-		const head = text.page(clip(page.title), page.address, page.linked);
+	const map = input.map.map((entry) => {
+		const head = text.mapEntry(clip(entry.title), entry.address, entry.linked);
 		return {
-			lines: [head, ...page.lines.map((line) => text.pageLine(clip(line, limits.lineChars)))],
+			lines: [head, ...entry.lines.map((line) => text.mapLine(clip(line, limits.lineChars)))],
 			fallback: [head],
 		};
 	});
 	return renderDelegationBrief(input, budget, {
 		head: text.head(input.address, input.epoch),
 		bodyBytes: Math.floor(limits.bodyBytes * scale),
-		reserve: share.background + share.facts + share.pages,
+		reserve: share.background + share.facts + share.map,
 		closing: text.rules,
 		...(input.handoff
 			? { before: handoffSection(input.handoff, Math.floor(limits.handoffBytes * scale)) }
@@ -594,10 +604,10 @@ export function renderTaskBrief(
 				rest -= cost(lines);
 			};
 			section(
-				takeGroups([text.background], background, Math.max(0, rest - share.facts - share.pages)),
+				takeGroups([text.background], background, Math.max(0, rest - share.facts - share.map)),
 			);
-			section(takeGroups([text.facts], facts, Math.max(0, rest - share.pages)));
-			section(takeGroups([text.pages, text.pagesNote], pages, Math.max(0, rest), input.morePages));
+			section(takeGroups([text.facts], facts, Math.max(0, rest - share.map)));
+			section(takeGroups([text.map, text.mapNote], map, Math.max(0, rest), input.moreMap));
 			return out;
 		},
 	});
@@ -640,7 +650,7 @@ export async function readTaskBrief(args: {
 	const limits = OUTLINE_TASK_BRIEF_LIMITS;
 	// Nothing of a space the session may not read is ever put into its history.
 	if (!(await scope.canRead(space))) return null;
-	const subtree = await readSubtree(block.id, { store });
+	const subtree = await readBlockSubtree(block.id, { store });
 	if (!subtree) return null;
 	// The handoffs are shown in their own section, before the notes, so earlier siblings cannot
 	// crowd the newest one out.
@@ -658,6 +668,9 @@ export async function readTaskBrief(args: {
 		.reverse()
 		.slice(0, limits.ancestors);
 	const nearest = above[0];
+	// Their own levels (the tree read holds only the way down to this task): a first paragraph
+	// each, and the nearest one's tasks.
+	await readChildLevels(subtree, above, { store });
 	const contexts = new Map<OutlineNode, OutlineNode>();
 	for (const node of above) {
 		const first = viewChildren(node, "facts")[0];
@@ -692,20 +705,23 @@ export async function readTaskBrief(args: {
 		stack.push(...node.children);
 	}
 	const facts: TaskBriefFact[] = [];
-	const linkedPages = new Set<string>();
+	/** Blocks of this space the facts are, to place under the top level. */
+	const linked: string[] = [];
 	for (const target of targets) {
 		const resolved = await resolveTarget(target, scope, store);
 		if (!resolved) {
 			facts.push({ unreadable: true });
 			continue;
 		}
-		linkedPages.add(resolved.block.pageId);
+		if (resolved.space.id === space.id) linked.push(resolved.block.id);
 		// What is under the task is shown with it already.
 		if (inTask.has(resolved.block.id)) continue;
-		const read = await readOutline({
+		const read = await readBlockOutline({
 			blockId: resolved.block.id,
 			view: "facts",
 			budget: { blocks: limits.factBlocks, bytes: limits.factBytes },
+			// Tasks under it are passed over by the facts view: read past them.
+			limit: limits.factBlocks * 8,
 			store,
 		});
 		if (!read) {
@@ -719,43 +735,7 @@ export async function readTaskBrief(args: {
 		});
 	}
 
-	// The map: the project space's pages (the task's own page is process, not facts).
-	const listed = await store.listSpacePages(space.id, { limit: limits.pagesCounted });
-	const candidates = listed.filter((page) => page.id !== block.pageId && !page.isTask);
-	const mapped = candidates.slice(0, limits.pages);
-	const lines = new Map<string, string[]>();
-	if (mapped.length > 0) {
-		const { rows } = await store.listPagesStructure(
-			mapped.map((page) => page.id),
-			limits.pageBlocks,
-		);
-		const nodes = buildTree(rows);
-		const firsts = new Map<string, OutlineNode[]>();
-		for (const page of mapped) {
-			const node = nodes.get(page.id);
-			firsts.set(page.id, node ? viewChildren(node, "facts").slice(0, limits.pageLines) : []);
-		}
-		const heads = new Map(
-			(await store.getBlockHeads([...firsts.values()].flat().map((node) => node.id))).map(
-				(head) => [head.id, blockTitle(head.contentHead)],
-			),
-		);
-		for (const [pageId, list] of firsts)
-			lines.set(
-				pageId,
-				list.map((node) => heads.get(node.id) ?? "").filter((line) => line.trim() !== ""),
-			);
-	}
-	const pages = mapped
-		.map((page) => ({
-			address: `${space.key}/${page.sid}`,
-			title: blockTitle(page.contentHead) || page.sid,
-			linked: linkedPages.has(page.id),
-			lines: lines.get(page.id) ?? [],
-		}))
-		// Linked pages first; the others keep the space's page order.
-		.sort((a, b) => Number(b.linked) - Number(a.linked));
-
+	const { map, moreMap } = await readTopLevelMap(store, space, subtree, linked);
 	return {
 		...core,
 		address: `${space.key}/${block.sid}`,
@@ -775,9 +755,76 @@ export async function readTaskBrief(args: {
 		})),
 		handoff,
 		facts,
-		pages,
-		morePages: Math.max(0, candidates.length - mapped.length),
+		map,
+		moreMap,
 	};
+}
+
+/**
+ * The map of the space's top level: its top-level blocks (the one the task is in and tasks left
+ * out: the task's own place is process, not facts), each with the first lines of its facts, those
+ * a fact of the brief is under first, the others in the space's order. Bounded: the top level
+ * (`mapCounted` rows), the ancestry of the linked blocks (one statement), `mapChildRows` children
+ * of each block listed, their first lines as content heads.
+ */
+async function readTopLevelMap(
+	store: OutlineStore,
+	space: OutlineSpaceRow,
+	subtree: OutlineBlockTree,
+	linkedIds: readonly string[],
+): Promise<{ map: TaskBriefInput["map"]; moreMap: number }> {
+	const limits = OUTLINE_TASK_BRIEF_LIMITS;
+	const own = (subtree.path[0] ?? subtree.root).id;
+	const { rows } = await store.listLevel(space.id, null, {
+		asOf: null,
+		limit: limits.mapCounted,
+	});
+	const candidates = rows.filter((row) => row.id !== own && row.taskJson === null && !row.askJson);
+	const mapped = candidates.slice(0, limits.mapBlocks);
+	if (mapped.length === 0) return { map: [], moreMap: 0 };
+	const tops = new Set<string>();
+	if (linkedIds.length > 0) {
+		const ancestry = await readOutlineAncestry(space.id, linkedIds, {
+			maxRows: limits.mapWalkRows,
+			store,
+		});
+		for (const id of linkedIds) {
+			const above = ancestry.above(id);
+			if (above !== null) tops.add(above.at(-1) ?? id);
+		}
+	}
+	const firsts = new Map<string, string[]>();
+	for (const row of mapped) {
+		if (!row.hasChildren) continue;
+		const level = await store.listLevel(space.id, row.id, {
+			asOf: null,
+			limit: limits.mapChildRows,
+		});
+		firsts.set(
+			row.id,
+			level.rows
+				.filter((child) => child.taskJson === null && !child.askJson)
+				.slice(0, limits.mapLines)
+				.map((child) => child.id),
+		);
+	}
+	const heads = new Map(
+		(
+			await store.getBlockHeads([...mapped.map((row) => row.id), ...[...firsts.values()].flat()])
+		).map((head) => [head.id, blockTitle(head.contentHead)]),
+	);
+	const map = mapped
+		.map((row) => ({
+			address: `${space.key}/${row.sid}`,
+			title: heads.get(row.id) || row.sid,
+			linked: tops.has(row.id),
+			lines: (firsts.get(row.id) ?? [])
+				.map((id) => heads.get(id) ?? "")
+				.filter((line) => line.trim() !== ""),
+		}))
+		// Those the facts are under first; the others keep the space's order.
+		.sort((a, b) => Number(b.linked) - Number(a.linked));
+	return { map, moreMap: Math.max(0, candidates.length - mapped.length) };
 }
 
 /**
@@ -786,7 +833,7 @@ export async function readTaskBrief(args: {
  * their first line (at most the newest {@link OUTLINE_HANDOFF_LIMITS.counted}).
  */
 async function readHandoffs(
-	subtree: NonNullable<Awaited<ReturnType<typeof readSubtree>>>,
+	subtree: OutlineBlockTree,
 	handoffs: readonly OutlineNode[],
 	space: OutlineSpaceRow,
 	store: OutlineStore,
@@ -993,7 +1040,7 @@ async function openOne(
 	)
 		return { narratorId: before.narratorId, started: true, epoch: before.epoch, already: true };
 
-	const subtree = await readSubtree(taskId, { store });
+	const subtree = await readBlockSubtree(taskId, { limit: 0, store });
 	if (!subtree) throw new NotFoundError("Outline task", taskId);
 	// A task above it that someone is doing: its steps are theirs (nearest first).
 	const above = subtree.path.filter((node) => node.task !== null).reverse();

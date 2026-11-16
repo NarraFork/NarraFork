@@ -4,8 +4,8 @@
  *
  * HOW IT IS COMPUTED
  * ------------------
- * Two reads of the root's subtree (`readSubtree`, the page's structure at each seq: ids, parents,
- * order keys, task fields, the version each block was at), matched by block id:
+ * Two reads of the root's subtree by block (`readBlockSubtree`, its structure at each seq: ids,
+ * parents, order keys, task fields, the version each block was at), matched by block id:
  *
  *   - `added`: in the subtree now, not before; `removed`: before, not now (deleted or moved out);
  *   - `moved`: another parent, or another place among its siblings (its order key changed);
@@ -16,7 +16,7 @@
  *     compared.
  *
  * Commit ranges are not used: a subtree gains and loses blocks by moves, which only the two trees
- * show directly. Each read is one page structure (as `OutlineRead`'s); the subtree is cut at
+ * show directly. Each read is the root's subtree level by level; the subtree is cut at
  * {@link OUTLINE_PLAN_LIMITS.maxBlocks} blocks, and contents are loaded only for the first
  * {@link OUTLINE_PLAN_LIMITS.diffEntries} changed blocks (a block past them that changed its
  * version and nothing else the structure shows is counted as a text change, and the diff is
@@ -30,9 +30,11 @@ import type {
 	OutlinePlanDiffEntry,
 	OutlinePlanTaskView,
 } from "@shared/outline-api";
+import { type OutlineTreeState, readBlockSubtree } from "./block-tree";
 import type { OutlineTaskJson } from "./model";
-import { loadBodies, type OutlinePageState, readSubtree } from "./read";
+import { loadBodies } from "./read";
 import { outlineStore } from "./store";
+import { OutlineHistoryUnavailableError } from "./store/history-port";
 import type { OutlineStore } from "./store/port";
 import type { OutlineNode } from "./tree";
 
@@ -65,7 +67,7 @@ export const OUTLINE_PLAN_LIMITS = {
 
 export interface OutlinePlanDiff {
 	root: OutlineNode;
-	state: OutlinePageState;
+	state: OutlineTreeState;
 	fromSeq: number;
 	toSeq: number;
 	counts: OutlinePlanDiffCounts;
@@ -156,18 +158,34 @@ export async function readPlanDiff(args: {
 	store?: OutlineStore;
 }): Promise<OutlinePlanDiff | null> {
 	const store = args.store ?? outlineStore;
-	const after = await readSubtree(args.rootId, {
+	// One past the limit read: `subtreeLargerThan` tells a plan cut at the limit.
+	const limit = OUTLINE_PLAN_LIMITS.maxBlocks + 1;
+	const after = await readBlockSubtree(args.rootId, {
 		...(args.toSeq !== null ? { asOf: args.toSeq } : {}),
+		limit,
 		store,
 	});
 	if (!after) return null;
+	// A version from before the space's history floor (or while its placements are being built)
+	// cannot be read: compared with nothing, and said to be incomplete.
+	let unreadable = false;
 	const before =
-		args.fromSeq >= 1 ? await readSubtree(args.rootId, { asOf: args.fromSeq, store }) : null;
+		args.fromSeq >= 1
+			? await readBlockSubtree(args.rootId, { asOf: args.fromSeq, limit, store }).catch(
+					(error: unknown) => {
+						if (!(error instanceof OutlineHistoryUnavailableError)) throw error;
+						unreadable = true;
+						return null;
+					},
+				)
+			: null;
 	const max = OUTLINE_PLAN_LIMITS.maxBlocks;
 	const now = preorder(after.root, max, args.skip);
 	const then = before ? preorder(before.root, max, args.skip) : { nodes: [], depth: new Map() };
 	let truncated =
-		subtreeLargerThan(after.root, max) || (!!before && subtreeLargerThan(before.root, max));
+		unreadable ||
+		subtreeLargerThan(after.root, max) ||
+		(!!before && subtreeLargerThan(before.root, max));
 	const beforeById = new Map(then.nodes.map((n) => [n.id, n]));
 	const afterIds = new Set(now.nodes.map((n) => n.id));
 

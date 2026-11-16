@@ -74,6 +74,7 @@ import type { OutlineBoardHandOutRefusal } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
 import { readNarrator, readSessionWriteFacts, readUserByUsername } from "./access-reads";
 import { canSessionWorkIn, resolveAgentAssignee, sessionAssignee } from "./assignee";
+import { readBlockSubtree } from "./block-tree";
 import { type DelegationLocale, delegationLocale } from "./delegation-text";
 import {
 	OutlineBusyError,
@@ -82,8 +83,8 @@ import {
 	OutlineWriteError,
 } from "./errors";
 import { OUTLINE_HAND_OUT_ACTOR, OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
-import { assigneeLabel, OUTLINE_TASKS_PAGE_TITLE, oneAtATime } from "./person-tasks";
-import { loadBodiesWithin, readSubtree } from "./read";
+import { assigneeLabel, OUTLINE_TASKS_LIST_TITLE, oneAtATime } from "./person-tasks";
+import { loadBodiesWithin } from "./read";
 import { canSessionReadSpace } from "./session-scope";
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineSpaceRow, OutlineStore } from "./store/port";
@@ -478,7 +479,7 @@ async function planCopy(args: {
 	newSid: () => string;
 }): Promise<CopyPlan> {
 	const { store, original, sessionSpace, place, version } = args;
-	const subtree = await readSubtree(original.id, { store });
+	const subtree = await readBlockSubtree(original.id, { store });
 	if (!subtree) throw new OutlineHandOutError("changed");
 	// Breadth first, the hand-outs' own notes left out (with what is under them).
 	const order = breadthFirst(subtree.root, "all", Number.MAX_SAFE_INTEGER).filter(
@@ -526,7 +527,7 @@ async function planCopy(args: {
 			op: "insert",
 			tempId: "page",
 			parent: null,
-			content: OUTLINE_TASKS_PAGE_TITLE[args.locale],
+			content: OUTLINE_TASKS_LIST_TITLE[args.locale],
 			alias: OUTLINE_TASKS_PAGE_ALIAS,
 		});
 	}
@@ -711,7 +712,7 @@ async function handOutOne(args: Parameters<typeof handOutTask>[0]): Promise<Outl
 	if (args.baseVersionSeq !== undefined && args.baseVersionSeq !== original.versionSeq)
 		throw new OutlineHandOutError("changed");
 	if (isFinishedTask(task)) throw new OutlineHandOutError("finished");
-	const above = await readSubtree(original.id, { store });
+	const above = await readBlockSubtree(original.id, { store });
 	if (!above) throw new OutlineHandOutError("changed");
 	const chain = [above.root, ...above.path];
 	if (chain.some((node) => isPlanningRoot(node.task))) throw new OutlineHandOutError("planning");
@@ -1131,7 +1132,7 @@ export async function planAgentHandOuts(args: {
 		// unseen).
 		const anchor = anchorOf(op);
 		if (anchor) {
-			const chain = await readSubtree(anchor, { store });
+			const chain = await readBlockSubtree(anchor, { limit: 0, store });
 			const nodes = chain ? [chain.root, ...chain.path] : [];
 			if (nodes.some((node) => isPlanningRoot(node.task))) continue;
 			if (nodes.some((node) => !!node.task?.lock))

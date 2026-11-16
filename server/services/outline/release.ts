@@ -71,6 +71,7 @@
  */
 import { logger } from "@server/lib/logger";
 import { readNarratorHandoffRows } from "./access-reads";
+import { readBlockSubtree } from "./block-tree";
 import {
 	loadOutlineAncestors,
 	OUTLINE_HANDOFF_ACTOR,
@@ -78,7 +79,6 @@ import {
 	planOutlineHandoffs,
 } from "./handoff";
 import { OUTLINE_TASK_GRACE_LEASE_MS, OUTLINE_TASK_IDLE_LEASE_MS } from "./model";
-import { readSubtree } from "./read";
 import { outlineStore } from "./store";
 import type {
 	OutlineBlockMeta,
@@ -356,7 +356,7 @@ async function treesInWork(
 	const subjects: OutlineTaskSubject[] = [];
 	for (const group of groups.slice(OUTLINE_RELEASE_LIMITS.trees)) out.add(group);
 	for (const group of groups.slice(0, OUTLINE_RELEASE_LIMITS.trees)) {
-		const subtree = await readSubtree(group, { store }).catch(() => null);
+		const subtree = await readBlockSubtree(group, { store }).catch(() => null);
 		if (!subtree || subtree.state.truncated) {
 			out.add(group);
 			continue;

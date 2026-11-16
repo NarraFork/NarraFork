@@ -37,6 +37,7 @@ import type { Locale } from "@server/lib/prompt-i18n";
 import { compareOrderKeys, isAlias, parseAddress, serializeBody } from "@shared/outline";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { readDisplayNames } from "./access-reads";
+import { readBlockSubtree } from "./block-tree";
 import { OutlineLeaseNotExpiredError } from "./errors";
 import { isOutlineEnabled } from "./feature";
 import { type OutlineHandoffSubject, planOutlineHandoffs } from "./handoff";
@@ -54,7 +55,6 @@ import {
 	sweepOutlineAnswerDeliveries,
 	watchArchivedSessionQuestions,
 } from "./questions";
-import { readSubtree } from "./read";
 import { outlineStore } from "./store";
 import {
 	chunked,
@@ -1084,7 +1084,7 @@ export async function findContinuationCandidates(options: {
 	excludeUnder?: readonly string[];
 	/**
 	 * Only the tasks of this block's subtree (a tree a person asked to start, an approved plan;
-	 * review round 1 S3): read from its page's structure, so tasks elsewhere neither crowd it out
+	 * review round 1 S3): read from its own subtree (by block), so tasks elsewhere neither crowd it out
 	 * nor show. At most {@link OUTLINE_TASK_LIMITS.withinBlocks} of its open tasks.
 	 */
 	within?: string;
@@ -1111,7 +1111,10 @@ export async function findContinuationCandidates(options: {
 
 	let subtree: Set<string> | null = null;
 	if (options.within) {
-		const read = await readSubtree(options.within, { store });
+		const read = await readBlockSubtree(options.within, {
+			limit: OUTLINE_TASK_LIMITS.withinBlocks,
+			store,
+		});
 		if (!read) return empty(false);
 		subtree = new Set();
 		const stack = [read.root];

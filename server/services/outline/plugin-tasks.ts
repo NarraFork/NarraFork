@@ -60,7 +60,7 @@ import {
 	OUTLINE_TASKS_PAGE_ALIAS,
 	type OutlineTaskJson,
 } from "./model";
-import { bodyFromText, findSameTask, OUTLINE_TASKS_PAGE_TITLE, oneAtATime } from "./person-tasks";
+import { bodyFromText, findSameTask, OUTLINE_TASKS_LIST_TITLE, oneAtATime } from "./person-tasks";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
 import type { OutlineStructureRow } from "./store/read-port";
@@ -699,7 +699,7 @@ async function tasksPageOf(
 				op: "insert",
 				tempId: "page",
 				parent: null,
-				content: OUTLINE_TASKS_PAGE_TITLE[locale === "zh-CN" ? "zh-CN" : "en"],
+				content: OUTLINE_TASKS_LIST_TITLE[locale === "zh-CN" ? "zh-CN" : "en"],
 				alias: OUTLINE_TASKS_PAGE_ALIAS,
 			},
 		],
