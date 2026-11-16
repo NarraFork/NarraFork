@@ -1479,7 +1479,9 @@ async function deleteStale(ctx: Context, subtrees: readonly StaleNode[][]): Prom
 			rows += piece.size;
 		}
 		if (pack.length > 0) packs.push(pack);
-		const commitPack = async (list: ReadonlyArray<{ id: string; size: number }>): Promise<boolean> => {
+		const commitPack = async (
+			list: ReadonlyArray<{ id: string; size: number }>,
+		): Promise<boolean> => {
 			try {
 				await commit(
 					ctx,
