@@ -5,7 +5,7 @@
  *
  * WHAT IT LISTS
  * -------------
- *   - SESSION: the tasks of the session's space (its behavior page left out: those checkboxes are
+ *   - SESSION: the tasks of the session's space (its behavior boundary left out: those checkboxes are
  *     rules, outline plan PR 4), and the open tasks the session holds in other spaces.
  *   - PROJECT: the project space, then the session spaces of the project's sessions the person
  *     may read (`readProjectSessionSpacePage`, filtered in SQL), a page of spaces at a time.
@@ -103,6 +103,7 @@ import type {
 import { isPlanningRoot, outlineTaskStartBlocker } from "./task-json";
 import { outlineTaskSessionProjectDir, outlineTaskSessionsAvailable } from "./task-session";
 import { deriveOutlineTaskWaits, inDocumentOrder, isClaimLive } from "./tasks";
+import { blocksUnder } from "./well-known";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cursors
@@ -594,7 +595,6 @@ async function describe(
 			spaceId: meta.spaceId,
 			sid: meta.sid,
 			address: `${space?.key ?? "?"}/${meta.sid}`,
-			pageId: meta.pageId,
 			title: titles.get(meta.id) || meta.sid,
 			status: task.status,
 			waiting,
@@ -722,9 +722,33 @@ export async function writableSpaces(
 }
 
 /**
+ * Of a space's tasks, those not at or under its behavior boundary (`excluded`: the block aliased
+ * `behavior`; its checkboxes are rules): judged by ancestry, one walk for all of them.
+ */
+async function outsideBoundary(
+	store: OutlineStore,
+	spaceId: string,
+	excluded: readonly string[] | undefined,
+	rows: readonly OutlineBlockMeta[],
+): Promise<OutlineBlockMeta[]> {
+	if (!excluded || excluded.length === 0 || rows.length === 0) return [...rows];
+	const left = new Set<string>();
+	for (const boundary of excluded) {
+		const { under } = await blocksUnder(
+			spaceId,
+			boundary,
+			rows.map((row) => row.id),
+			{ store },
+		);
+		for (const id of under) left.add(id);
+	}
+	return rows.filter((row) => !left.has(row.id));
+}
+
+/**
  * The own sections of the given spaces, in that order: each space's open tasks (up to
  * `limits.open`, in document order) and its latest finished ones (up to `limits.finished`), its
- * behavior page left out. Every read is one for all the spaces.
+ * behavior boundary left out (by ancestry). Every read is one for all the spaces.
  */
 async function ownSections(
 	ctx: Context,
@@ -772,11 +796,11 @@ async function ownSections(
 		const active = openRows.filter(isActiveTask).sort(byKey);
 		const rest = openRows.filter((row) => !isActiveTask(row)).sort(byKey);
 		shownOpen.push(...[...active, ...rest].slice(0, limits.open));
-		// The cursor follows the rows read, whether or not the behavior page's were left out.
+		// The cursor follows the rows read, whether or not those under the behavior boundary were
+		// left out.
 		const rows = finishedOf.get(space.id) ?? [];
 		const window = rows.slice(0, limits.finished);
-		const pages = new Set(excluded.get(space.id) ?? []);
-		shownFinished.push(...window.filter((m) => !pages.has(m.pageId)));
+		shownFinished.push(...(await outsideBoundary(store, space.id, excluded.get(space.id), window)));
 		const last = window.at(-1);
 		cursors.set(
 			space.id,
@@ -996,11 +1020,10 @@ export async function readFinishedTasks(
 		OUTLINE_TASK_BOARD_LIMITS.maxFinishedPage,
 	);
 	const ctx: Context = { store, principal, spaces: new Map([[space.id, space]]) };
-	const excluded = new Set(
+	const excluded =
 		space.kind === "session"
 			? (await store.findAliasOwners(space.id, [OUTLINE_BEHAVIOR_ALIAS])).map((o) => o.id)
-			: [],
-	);
+			: [];
 	const rows = await store.listFinishedTasks(space.id, {
 		before: options.cursor ? decodeFinishedCursor(options.cursor) : null,
 		limit: limit + 1,
@@ -1008,11 +1031,9 @@ export async function readFinishedTasks(
 	const window = rows.slice(0, limit);
 	const last = window.at(-1);
 	return {
-		tasks: await describe(
-			ctx,
-			window.filter((m) => !excluded.has(m.pageId)),
-			{ open: false },
-		),
+		tasks: await describe(ctx, await outsideBoundary(store, space.id, excluded, window), {
+			open: false,
+		}),
 		nextCursor: rows.length > limit && last ? encodeFinishedCursor(last) : null,
 	};
 }

@@ -392,7 +392,6 @@ describe("measureInlinePermission — an outline plan's approval (outline P2 PR 
 		const root = {
 			blockId: "b",
 			spaceId: "s",
-			pageId: "p",
 			address: "sess/AbCdEfGh",
 			title: "Plan",
 			round: 1,
@@ -441,7 +440,7 @@ describe("measureInlinePermission — an outline plan's approval (outline P2 PR 
 		);
 		const inputJson = {
 			plan: "- [ ] Plan",
-			_planRoot: { blockId: "b", spaceId: "s", pageId: "p", address: "a", title: "P", round: 1 },
+			_planRoot: { blockId: "b", spaceId: "s", address: "a", title: "P", round: 1 },
 		};
 		const rows = (innerWidth: number, placeholder?: string) =>
 			predictInlinePermission(
@@ -466,7 +465,7 @@ describe("measureInlinePermission — an outline plan's approval (outline P2 PR 
 		);
 		const inputJson = {
 			plan: "- [ ] Plan",
-			_planRoot: { blockId: "b", spaceId: "s", pageId: "p", address: "a", title: "P", round: 1 },
+			_planRoot: { blockId: "b", spaceId: "s", address: "a", title: "P", round: 1 },
 		};
 		const rows = (innerWidth: number, extra: Record<string, unknown> = {}) =>
 			predictInlinePermission(

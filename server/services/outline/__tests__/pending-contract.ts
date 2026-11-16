@@ -594,11 +594,10 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			expect((await ctx.store.getSpace(space.id))?.nextSeq).toBe(seq);
 			expect(await contentOf(ctx, ids.s1)).toBe("Parse the header");
 			// Told once, on the proposer's next read.
-			const told = await takePendingReports(p.narrators.a, { store: ctx.store, pageId: ids.root });
+			const here = { store: ctx.store, spaceId: space.id, blockId: ids.root };
+			const told = await takePendingReports(p.narrators.a, here);
 			expect(told.map((row) => row.id)).toEqual([rejected.id]);
-			expect(
-				await takePendingReports(p.narrators.a, { store: ctx.store, pageId: ids.root }),
-			).toEqual([]);
+			expect(await takePendingReports(p.narrators.a, here)).toEqual([]);
 			// A new proposal is a new change; the proposer (a subagent of its session) withdraws it.
 			const again = await write(ctx, space, a, [
 				{ op: "update", block: { id: ids.s1 }, content: "nope again" },
@@ -1230,7 +1229,7 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "reports: a decision is told on its page however many open changes the session has elsewhere (review S-6)",
+		name: "reports: a decision is told where it was made however many open changes the session has elsewhere (review S-6)",
 		async run(ctx) {
 			const lockerId = await ctx.seedUser();
 			const locker = { kind: "human" as const, userId: lockerId };
@@ -1266,11 +1265,10 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 				reason: "no",
 				store: ctx.store,
 			});
-			const told = await takePendingReports(a.narratorId, { store: ctx.store, pageId: rootB });
+			const here = { store: ctx.store, spaceId: space.id, blockId: rootB };
+			const told = await takePendingReports(a.narratorId, here);
 			expect(told.map((r) => r.id)).toEqual([proposal.pending?.id as string]);
-			expect(await takePendingReports(a.narratorId, { store: ctx.store, pageId: rootB })).toEqual(
-				[],
-			);
+			expect(await takePendingReports(a.narratorId, here)).toEqual([]);
 		},
 	},
 	{
@@ -1302,7 +1300,7 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "locks: past the locks a page lists, a write outside every locked tree goes on, one inside is still held; a locked task moving takes its changes only where they fit",
+		name: "locks: past the locks a page lists, a write outside every locked tree goes on, one inside is still held; a locked task moving within its space takes its changes along, the space's limit holds new ones",
 		async run(ctx) {
 			const lockerId = await ctx.seedUser();
 			const locker = { kind: "human" as const, userId: lockerId };
@@ -1341,40 +1339,34 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			} finally {
 				OUTLINE_LOCK_SCAN.perPage = scan;
 			}
-			// The other page holds as many open changes as it may: the plan cannot move there.
+			// The space holds as many open changes as it may: a new change anywhere in it is
+			// refused, an open one still takes more, and moving a locked plan within the space
+			// (its changes stay in the space) is not refused.
 			await write(ctx, space, b, [
 				{ op: "update", block: { id: planQ as string }, content: "Plan Q, reworded" },
 			]);
-			const limits = OUTLINE_PENDING_LIMITS as { openPerPage: number };
-			const open = limits.openPerPage;
-			limits.openPerPage = 1;
+			const limits = OUTLINE_PENDING_LIMITS as { openPerSpace: number };
+			const open = limits.openPerSpace;
+			limits.openPerSpace = 2;
 			try {
 				const full = await refusedWith(
-					write(ctx, space, locker, [
-						{ op: "move", block: { id: plan as string }, parent: { id: otherPage as string } },
-					]),
-					OutlineWriteError,
-				);
-				expect(full.code).toBe("OUTLINE_PENDING_FULL");
-				// A new change there is refused too; the open one still takes more.
-				const another = await refusedWith(
 					write(ctx, space, a, [
 						{ op: "update", block: { id: planQ as string }, content: "Plan Q, a's way" },
 					]),
 					OutlineWriteError,
 				);
-				expect(another.code).toBe("OUTLINE_PENDING_FULL");
+				expect(full.code).toBe("OUTLINE_PENDING_FULL");
 				const more = await write(ctx, space, b, [
 					{ op: "update", block: { id: planQ as string }, content: "Plan Q, reworded again" },
 				]);
 				expect(more.pending?.merged).toBe(true);
+				const movedFull = await write(ctx, space, locker, [
+					{ op: "move", block: { id: plan as string }, parent: { id: otherPage as string } },
+				]);
+				expect(movedFull.commit).not.toBeNull();
 			} finally {
-				limits.openPerPage = open;
+				limits.openPerSpace = open;
 			}
-			const moved = await write(ctx, space, locker, [
-				{ op: "move", block: { id: plan as string }, parent: { id: otherPage as string } },
-			]);
-			expect(moved.commit).not.toBeNull();
 			expect((await openPending(ctx, otherPage as string)).length).toBe(2);
 		},
 	},
@@ -1722,6 +1714,102 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 				changed: new Map([[ids.s2, 1]]),
 				unchecked: new Map(),
 			});
+		},
+	},
+	{
+		name: "reports by ancestry: told on a read anywhere under the locked task's top-level block, wherever the task went since, deleted or not; older ones elsewhere do not crowd them out",
+		async run(ctx) {
+			const lockerId = await ctx.seedUser();
+			const locker = { kind: "human" as const, userId: lockerId };
+			const space = await ctx.store.ensureSpace({ kind: "personal", ownerUserId: lockerId }, NOW);
+			const a = { kind: "agent" as const, narratorId: await ctx.seedNarrator() };
+			const r = await write(ctx, space, locker, [
+				{ op: "insert", tempId: "area", parent: null, content: "Area" },
+				{ op: "insert", tempId: "g", parent: { tempId: "area" }, content: "Group" },
+				{ op: "insert", tempId: "deep", parent: { tempId: "g" }, content: "Deep note" },
+				{ op: "insert", parent: { tempId: "g" }, content: "Plan 1", task: { status: "todo" } },
+				{ op: "insert", parent: { tempId: "g" }, content: "Plan 3", task: { status: "todo" } },
+				{ op: "insert", tempId: "box", parent: { tempId: "area" }, content: "Box" },
+				{ op: "insert", parent: { tempId: "box" }, content: "Plan 4", task: { status: "todo" } },
+				{ op: "insert", tempId: "other", parent: null, content: "Other" },
+				{ op: "insert", tempId: "oc", parent: { tempId: "other" }, content: "Other child" },
+				{ op: "insert", parent: { tempId: "other" }, content: "Plan 2", task: { status: "todo" } },
+				{ op: "insert", parent: { tempId: "other" }, content: "Plan 5", task: { status: "todo" } },
+				{ op: "insert", parent: { tempId: "other" }, content: "Plan 6", task: { status: "todo" } },
+			]);
+			const [area, group, deep, p1, p3, box, p4, other, otherChild, p2, p5, p6] = r.results.map(
+				(x) => x.blockId,
+			) as string[];
+			/** A decided change of `a` on `plan`: locked, proposed, rejected. */
+			const decided = async (plan: string): Promise<string> => {
+				await lockOutlineTask({ blockId: plan, userId: lockerId, store: ctx.store });
+				const proposal = await write(ctx, space, a, [
+					{ op: "update", block: { id: plan }, content: "changed" },
+				]);
+				const id = proposal.pending?.id as string;
+				await rejectOutlinePending({
+					pendingId: id,
+					by: { kind: "human", userId: lockerId },
+					reason: "no",
+					store: ctx.store,
+				});
+				return id;
+			};
+			const at = (blockId: string) => ({ store: ctx.store, spaceId: space.id, blockId });
+			const told = async (blockId: string) =>
+				(await takePendingReports(a.narratorId, at(blockId))).map((row) => row.id);
+			// Older decisions elsewhere first: they must not crowd out the one about Area.
+			const d5 = await decided(p5 as string);
+			const d6 = await decided(p6 as string);
+			const d1 = await decided(p1 as string);
+			const d2 = await decided(p2 as string);
+			const limits = OUTLINE_PENDING_LIMITS as { reportsBatch: number; reportsPerRead: number };
+			const saved = { batch: limits.reportsBatch, perRead: limits.reportsPerRead };
+			limits.reportsBatch = 2;
+			limits.reportsPerRead = 1;
+			try {
+				// A read deep under Area: Area's decision only (the scan went past two batches).
+				expect(await told(deep as string)).toEqual([d1]);
+				// Another space's read of the same block id tells nothing.
+				expect(
+					await takePendingReports(a.narratorId, { ...at(deep as string), spaceId: "elsewhere" }),
+				).toEqual([]);
+				// Other's: one a read, oldest first.
+				expect(await told(otherChild as string)).toEqual([d5]);
+				expect(await told(other as string)).toEqual([d6]);
+				expect(await told(other as string)).toEqual([d2]);
+				expect(await told(area as string)).toEqual([]);
+			} finally {
+				limits.reportsBatch = saved.batch;
+				limits.reportsPerRead = saved.perRead;
+			}
+			// A locked task moved under Other since its decision: told under Other, not Area.
+			const d3 = await decided(p3 as string);
+			await write(ctx, space, locker, [
+				{ op: "move", block: { id: p3 as string }, parent: { id: other as string } },
+			]);
+			expect(await told(group as string)).toEqual([]);
+			expect(await told(otherChild as string)).toEqual([d3]);
+			// A locked task deleted with its parent since: told where it was deleted from.
+			const d4 = await decided(p4 as string);
+			await write(ctx, space, locker, [{ op: "delete", block: { id: box as string } }]);
+			expect(await told(other as string)).toEqual([]);
+			expect(await told(area as string)).toEqual([d4]);
+			expect(await told(area as string)).toEqual([]);
+			// Two reads at once: each decision is told by one of them only.
+			const p7 = (
+				await write(ctx, space, locker, [
+					{
+						op: "insert",
+						parent: { id: group as string },
+						content: "Plan 7",
+						task: { status: "todo" },
+					},
+				])
+			).results[0]?.blockId as string;
+			const d7 = await decided(p7);
+			const both = await Promise.all([told(deep as string), told(group as string)]);
+			expect(both.flat()).toEqual([d7]);
 		},
 	},
 ];

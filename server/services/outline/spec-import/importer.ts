@@ -85,7 +85,7 @@ import { OutlineWriteError } from "../errors";
 import { isOutlineEnabled } from "../feature";
 import { forgetSpecImportLeftover } from "../lease-keeper";
 import { OUTLINE_LIMITS, OUTLINE_TASKS_PAGE_ALIAS } from "../model";
-import { OUTLINE_TASKS_PAGE_TITLE } from "../person-tasks";
+import { OUTLINE_TASKS_LIST_TITLE } from "../person-tasks";
 import { PluginTaskError, pluginBlockedNoteSid } from "../plugin-tasks";
 import { yieldToEventLoop } from "../session-scope";
 import { outlineStore } from "../store";
@@ -1449,7 +1449,7 @@ async function ensureTasksBlock(ctx: Context): Promise<string> {
 			{
 				op: "insert",
 				parent: null,
-				content: OUTLINE_TASKS_PAGE_TITLE[ctx.locale === "zh-CN" ? "zh-CN" : "en"],
+				content: OUTLINE_TASKS_LIST_TITLE[ctx.locale === "zh-CN" ? "zh-CN" : "en"],
 				alias: OUTLINE_TASKS_PAGE_ALIAS,
 			},
 		],

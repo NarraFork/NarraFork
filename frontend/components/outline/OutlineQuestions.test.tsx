@@ -52,7 +52,6 @@ const group: OutlineQuestionGroupResponse = {
 		blockId: "task",
 		spaceId: "space",
 		spaceKey: "key",
-		pageId: "page",
 		title: "Ship the importer",
 		isQuestion: false,
 	},

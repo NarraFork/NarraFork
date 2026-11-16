@@ -48,6 +48,29 @@ const SOURCES = [
 	"server/lib/prompts/outline-tasks.ts",
 	"server/lib/prompts/outline-team.ts",
 	"server/lib/prompts/outline-plan.ts",
+	// Tasks and the team (A2): the task brief, delegation, team activity and events, hand-out,
+	// transfer, the person's tasks, questions, plans, pending changes and their decisions.
+	"server/services/outline/delegation-text.ts",
+	"server/services/outline/delegation.ts",
+	"server/services/outline/task-session.ts",
+	"server/services/outline/task-board.ts",
+	"server/services/outline/team-activity.ts",
+	"server/services/outline/team-events.ts",
+	"server/services/outline/team-wake.ts",
+	"server/services/outline/person-tasks.ts",
+	"server/services/outline/hand-out.ts",
+	"server/services/outline/handoff.ts",
+	"server/services/outline/release.ts",
+	"server/services/outline/transfer.ts",
+	"server/services/outline/questions.ts",
+	"server/services/outline/inbox.ts",
+	"server/services/outline/plans.ts",
+	"server/services/outline/plan-diff.ts",
+	"server/services/outline/pending.ts",
+	"server/services/outline/pending-hold.ts",
+	"server/services/outline/subtree-copy.ts",
+	"server/services/outline/block-tree.ts",
+	"server/services/outline-plan-mode.ts",
 	// A3: reports, the Dynamic Spec import and its lost-content scan, plugin task commands.
 	"server/services/outline/digest.ts",
 	"server/services/outline/digest-job.ts",
@@ -74,12 +97,6 @@ const PAGE = /page|页/i;
  * Keep it short; a new entry needs a reason a reviewer accepts.
  */
 const ALLOWED: Record<string, ReadonlyArray<{ text: string; why: string }>> = {
-	"server/lib/prompts/outline-team.ts": [
-		{
-			text: "page",
-			why: "a discriminator of an internal line type (`where`), never rendered; the team notes move to blocks in A2",
-		},
-	],
 	"server/services/outline/spec-import/state.ts": [
 		{
 			text: "task_page_id",

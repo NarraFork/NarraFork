@@ -58,7 +58,6 @@ export interface OutlineBoardTask {
 	sid: string;
 	/** `key/sid`. */
 	address: string;
-	pageId: string;
 	/** The task's first line, plain text. */
 	title: string;
 	status: OutlineTaskStatus;
@@ -213,7 +212,7 @@ export type OutlineBoardAssignTarget =
 	| { kind: "narrator"; narratorId: string }
 	/**
 	 * To the team (「交给团队」, outline P2 PR 10c-3): a task of a session space is handed out as an
-	 * unassigned copy on its project's task page, which the original then waits for.
+	 * unassigned copy in its project's task list, which the original then waits for.
 	 */
 	| { kind: "team" };
 
@@ -271,7 +270,7 @@ export interface OutlineBoardTaskUpdateResponse {
 	notStarted?: OutlineBoardNotStarted;
 	/**
 	 * The task (of a session space) was handed out (outline P2 PR 10c-3): the copy on the project's
-	 * task page, which the task now waits for. `already`: it had been handed out before.
+	 * task list, which the task now waits for. `already`: it had been handed out before.
 	 */
 	handedOut?: { copyId: string; address: string; already?: true };
 }

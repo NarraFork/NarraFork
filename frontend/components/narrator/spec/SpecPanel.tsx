@@ -115,7 +115,6 @@ function OutlineTasksPanel({
 			const state = {
 				spaceId: task.spaceId,
 				blockId: task.id,
-				pageId: task.pageId,
 				view: "all" as const,
 			};
 			if (opener?.open(state)) return;

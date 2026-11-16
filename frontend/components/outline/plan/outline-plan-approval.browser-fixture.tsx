@@ -103,7 +103,7 @@ export function focusedLabel(): string | null {
 
 /** Mount the approval form of one waiting plan (under the panel's keyboard navigation). */
 export function open(permission: PendingPermission, options: { keyboard?: boolean } = {}): void {
-	// The diff's page subscription rides the narrator socket, as in the app.
+	// The diff's block watch rides the narrator socket, as in the app.
 	narratorWSManager.connect();
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	queryClient.setQueryData(["settings"], { outline: { enabled: true } });
@@ -237,7 +237,6 @@ function samplePermission(review: number): PendingPermission {
 			_planRoot: {
 				blockId: "b",
 				spaceId: "s",
-				pageId: "p",
 				address: "k/AbCdEfGh",
 				title: "Plan",
 				round: 2,

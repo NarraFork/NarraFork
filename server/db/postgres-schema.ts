@@ -3822,6 +3822,7 @@ export const outlinePending = pgTable(
 	},
 	(table) => [
 		index("idx_outline_pending_space").on(table.spaceId),
+		index("idx_outline_pending_space_open").on(table.spaceId).where(sql.raw("\"status\" = 'open'")),
 		index("idx_outline_pending_page_open").on(table.pageId).where(sql.raw("\"status\" = 'open'")),
 		index("idx_outline_pending_root_open")
 			.on(table.rootBlockId)
@@ -3830,7 +3831,7 @@ export const outlinePending = pgTable(
 			.on(table.requesterSession, table.rootBlockId)
 			.where(sql.raw("\"status\" = 'open'")),
 		index("idx_outline_pending_unreported")
-			.on(table.requesterSession, table.pageId)
+			.on(table.requesterSession, table.createdAt, table.id)
 			.where(sql.raw('"reported_at" IS NULL AND "status" <> \'open\'')),
 		index("idx_outline_pending_decider_open")
 			.on(table.deciderUserId)
@@ -26510,6 +26511,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_outline_pending_space_open",
+          "columns": [
+            "spaceId"
+          ],
+          "unique": false,
+          "predicate": "\"status\" = 'open'"
+        },
+        {
           "name": "idx_outline_pending_page_open",
           "columns": [
             "pageId"
@@ -26538,7 +26547,8 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_outline_pending_unreported",
           "columns": [
             "requesterSession",
-            "pageId"
+            "createdAt",
+            "id"
           ],
           "unique": false,
           "predicate": "\"reported_at\" IS NULL AND \"status\" <> 'open'"

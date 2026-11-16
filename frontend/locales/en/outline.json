@@ -613,8 +613,8 @@
 			"updated": "Task updated"
 		},
 		"handOut": {
-			"toTeam": "Handed to the team: a copy is on the project's task page ({{address}}). This task waits for it.",
-			"toOthers": "Handed out: a copy is on the project's task page ({{address}}). This task waits for it.",
+			"toTeam": "Handed to the team: a copy is in the project's task list ({{address}}). This task waits for it.",
+			"toOthers": "Handed out: a copy is in the project's task list ({{address}}). This task waits for it.",
 			"failed": "Could not hand the task out",
 			"refused": {
 				"not_session_task": "Only a task of a session's own space is handed out.",

@@ -37,6 +37,7 @@ import type { Locale } from "@server/lib/prompt-i18n";
 import { compareOrderKeys, isAlias, parseAddress, serializeBody } from "@shared/outline";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { readDisplayNames } from "./access-reads";
+import { readBlockSubtree } from "./block-tree";
 import { OutlineLeaseNotExpiredError } from "./errors";
 import { isOutlineEnabled } from "./feature";
 import { type OutlineHandoffSubject, planOutlineHandoffs } from "./handoff";
@@ -54,7 +55,6 @@ import {
 	sweepOutlineAnswerDeliveries,
 	watchArchivedSessionQuestions,
 } from "./questions";
-import { readSubtree } from "./read";
 import { outlineStore } from "./store";
 import {
 	chunked,
@@ -1062,7 +1062,7 @@ export interface OutlineContinuationCandidates {
  * candidate, since continuing it takes it over.
  *
  * Order is document order: the session space first, then other spaces by key; within a space by
- * page, then depth first by sibling order. At most `limit` of each list.
+ * top-level block, then depth first by sibling order. At most `limit` of each list.
  *
  * A task with unfinished tasks under it is a `container`: listed (it is still open, and counts as
  * the person's work when it is theirs) but never the one continuation names or starts. A plan that
@@ -1084,7 +1084,7 @@ export async function findContinuationCandidates(options: {
 	excludeUnder?: readonly string[];
 	/**
 	 * Only the tasks of this block's subtree (a tree a person asked to start, an approved plan;
-	 * review round 1 S3): read from its page's structure, so tasks elsewhere neither crowd it out
+	 * review round 1 S3): read from its own subtree (by block), so tasks elsewhere neither crowd it out
 	 * nor show. At most {@link OUTLINE_TASK_LIMITS.withinBlocks} of its open tasks.
 	 */
 	within?: string;
@@ -1111,7 +1111,10 @@ export async function findContinuationCandidates(options: {
 
 	let subtree: Set<string> | null = null;
 	if (options.within) {
-		const read = await readSubtree(options.within, { store });
+		const read = await readBlockSubtree(options.within, {
+			limit: OUTLINE_TASK_LIMITS.withinBlocks,
+			store,
+		});
 		if (!read) return empty(false);
 		subtree = new Set();
 		const stack = [read.root];
@@ -1283,7 +1286,7 @@ async function delegatedTasksAbove(
 
 /**
  * Sort blocks into document order: `first` space before the others (by key), then by the path of
- * sibling positions from the page down. Ancestors are read level by level, one indexed query per
+ * sibling positions from the top level down. Ancestors are read level by level, one indexed query per
  * space and level, at most {@link OUTLINE_LIMITS.maxDepth} levels. Also the task board's order.
  */
 export async function inDocumentOrder(

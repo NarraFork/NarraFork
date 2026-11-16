@@ -261,7 +261,7 @@ export interface OutlineReadRequest extends OutlineReadOptions {
 	 * content of the blocks the read may show (`nodes`, the root first) is loaded.
 	 */
 	display?: (
-		state: OutlinePageState,
+		state: OutlineReadTree["state"],
 		nodes: readonly OutlineNode[],
 	) => Promise<OutlineDisplay | undefined>;
 	/**
@@ -312,14 +312,38 @@ function omitUnder(root: OutlineNode, omit: ReadonlySet<string>): void {
 
 /**
  * A block and its subtree as a markdown outline: the facts view by default, expanded breadth
- * first within the budget. Null when the block is not live (at `asOf`).
+ * first within the budget. Null when the block is not live (at `asOf`). Reads the block's page
+ * (see the module header); the task features read by block with `readBlockOutline`
+ * (`block-tree.ts`).
  */
 export async function readOutline(request: OutlineReadRequest): Promise<OutlineReadResult | null> {
 	const store = request.store ?? outlineStore;
 	const subtree = await readSubtree(request.blockId, { asOf: request.asOf, store });
 	if (!subtree) return null;
+	return { ...(await renderSubtreeRead(subtree, request)), pageId: subtree.state.pageId };
+}
+
+/** What {@link renderSubtreeRead} needs of a tree read: the page's or a block's own. */
+export interface OutlineReadTree {
+	state: Pick<OutlinePageState, "space" | "seq" | "current" | "nodes" | "truncated">;
+	root: OutlineNode;
+	/** The root's ancestors, the top-level block first. */
+	path: OutlineNode[];
+}
+
+/** {@link OutlineReadResult} without the page: what a read by block returns. */
+export type OutlineTreeReadResult = Omit<OutlineReadResult, "pageId">;
+
+/**
+ * Render a tree read as {@link readOutline} does: steps 3 and 4 of the module header. The tree is
+ * the read's own (built per read), so leaving blocks out edits nothing shared.
+ */
+export async function renderSubtreeRead(
+	subtree: OutlineReadTree,
+	request: Omit<OutlineReadRequest, "blockId" | "asOf">,
+): Promise<OutlineTreeReadResult> {
+	const store = request.store ?? outlineStore;
 	const { state, root, path } = subtree;
-	// The tree is this read's own (built per read), so leaving blocks out edits nothing shared.
 	if (request.omit && request.omit.size > 0) omitUnder(root, request.omit);
 	const overlay = state.current ? request.overlay : undefined;
 	overlay?.prepare(state);
@@ -342,12 +366,15 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 		display,
 		annotate: overlay ? (node) => overlay.annotate(node) : undefined,
 		planNotes: request.planNotes,
-		truncatedRead: state.truncated ? { blocksRead: state.nodes.size } : undefined,
+		// Said only where the cut could matter: the budget would have shown more than was read.
+		truncatedRead:
+			state.truncated && order.length < budget.blocks
+				? { blocksRead: state.nodes.size }
+				: undefined,
 	});
 	return {
 		...rendered,
 		space: { id: state.space.id, key: state.space.key, kind: state.space.kind },
-		pageId: state.pageId,
 		rootId: root.id,
 		seq: state.seq,
 		current: state.current,

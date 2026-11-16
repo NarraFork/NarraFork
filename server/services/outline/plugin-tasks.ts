@@ -58,7 +58,7 @@ import { readTaskBackend, readTaskSession } from "../task-source/backend";
 import { readNarrator } from "./access-reads";
 import { OUTLINE_TEXT } from "./messages";
 import { OUTLINE_LIMITS, OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
-import { bodyFromText, findSameTask, OUTLINE_TASKS_PAGE_TITLE, oneAtATime } from "./person-tasks";
+import { bodyFromText, findSameTask, OUTLINE_TASKS_LIST_TITLE, oneAtATime } from "./person-tasks";
 import { yieldToEventLoop } from "./session-scope";
 import { outlineStore } from "./store";
 import type { OutlineLevelCursor, OutlineLevelRow } from "./store/history-port";
@@ -792,7 +792,7 @@ async function taskListOf(
 				op: "insert",
 				tempId: "tasks",
 				parent: null,
-				content: OUTLINE_TASKS_PAGE_TITLE[locale === "zh-CN" ? "zh-CN" : "en"],
+				content: OUTLINE_TASKS_LIST_TITLE[locale === "zh-CN" ? "zh-CN" : "en"],
 				alias: OUTLINE_TASKS_PAGE_ALIAS,
 			},
 		],

@@ -112,7 +112,7 @@ import {
 	toldByPeopleEdits,
 } from "./task-finished";
 import { hasHumanAssignee, isFinishedTask, isOpenTask } from "./task-json";
-import { deriveOutlineTaskWaits, isClaimLive, isWaiting } from "./tasks";
+import { deriveOutlineTaskWaits, inDocumentOrder, isClaimLive, isWaiting } from "./tasks";
 import { wakeForTeam } from "./team-wake";
 
 /** The injection source of a row that tells more than tasks the session created (`docs/INJECTION.md`). */
@@ -485,12 +485,15 @@ async function unblockedInCommit(
 		})),
 		{ store },
 	);
-	// The link index gives them in no order a reader would know: by space, page and sibling order.
-	const place = (t: OutlineBlockMeta) =>
-		`${t.spaceId}\u0000${t.pageId}\u0000${t.orderKey}\u0000${t.id}`;
-	found.sort((a, b) =>
-		place(a.task) < place(b.task) ? -1 : place(a.task) > place(b.task) ? 1 : 0,
+	// The link index gives them in no order a reader would know: by space, then the outline's
+	// own order (the order keys from the top level down, `inDocumentOrder`).
+	const ordered = await inDocumentOrder(
+		store,
+		[...new Map(found.map((f) => [f.task.id, f.task])).values()],
+		null,
 	);
+	const rank = new Map(ordered.map((task, index) => [task.id, index]));
+	found.sort((a, b) => (rank.get(a.task.id) ?? 0) - (rank.get(b.task.id) ?? 0));
 	for (const { root, pair, task } of found) {
 		const entry: Unblocked = {
 			task,
@@ -960,7 +963,7 @@ export function startOutlineTeamEvents(): void {
 /**
  * Push the commits of the last {@link OUTLINE_TEAM_EVENT_LIMITS.repushWindowMs} again (see the
  * module header): what a process that stopped between a commit and its rows left untold. Bounded
- * and indexed: spaces by `last_commit_at`, a page at a time; of each the newest commits by seq.
+ * and indexed: spaces by `last_commit_at`, a batch at a time; of each the newest commits by seq.
  * Runs in the background, a commit at a time through the listener's queue, yielding between
  * spaces. Returns how many commits were queued.
  */
