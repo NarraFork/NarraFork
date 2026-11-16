@@ -6223,16 +6223,19 @@ export const outlinePending = sqliteTable(
 		digestSeenAt: text("digest_seen_at"),
 	},
 	(table) => [
-		// FK covering index (a partial index cannot serve the FK action); open rows of a space.
+		// FK covering index (a partial index cannot serve the FK action).
 		index("idx_outline_pending_space").on(table.spaceId),
+		// Open rows of a space: what a new proposal is held to (pageless A2: a space's limit).
+		index("idx_outline_pending_space_open").on(table.spaceId).where(sql`"status" = 'open'`),
 		index("idx_outline_pending_page_open").on(table.pageId).where(sql`"status" = 'open'`),
 		index("idx_outline_pending_root_open").on(table.rootBlockId).where(sql`"status" = 'open'`),
 		uniqueIndex("uq_outline_pending_open_proposer")
 			.on(table.requesterSession, table.rootBlockId)
 			.where(sql`"status" = 'open'`),
-		// Decisions a session has not been told of, by page (open rows are not decided).
+		// Decisions a session has not been told of, oldest first (open rows are not decided); the
+		// reader keeps those about where the session reads, by ancestry (pageless A2).
 		index("idx_outline_pending_unreported")
-			.on(table.requesterSession, table.pageId)
+			.on(table.requesterSession, table.createdAt, table.id)
 			.where(sql`"reported_at" IS NULL AND "status" <> 'open'`),
 		index("idx_outline_pending_decider_open").on(table.deciderUserId).where(sql`"status" = 'open'`),
 		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
