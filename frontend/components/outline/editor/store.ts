@@ -99,21 +99,22 @@ export class Store {
 		return b && !b.deleted ? b : undefined;
 	}
 
+	/** Top-level blocks are children of "" (a watched top level lists them; ids are never empty). */
 	private link(b: BlockRec): void {
-		if (b.parentId === null) return;
-		let set = this.kids.get(b.parentId);
+		const key = b.parentId ?? "";
+		let set = this.kids.get(key);
 		if (!set) {
 			set = new Set();
-			this.kids.set(b.parentId, set);
+			this.kids.set(key, set);
 		}
 		set.add(b.id);
-		this.sorted.delete(b.parentId);
+		this.sorted.delete(key);
 	}
 
 	private unlink(b: BlockRec): void {
-		if (b.parentId === null) return;
-		this.kids.get(b.parentId)?.delete(b.id);
-		this.sorted.delete(b.parentId);
+		const key = b.parentId ?? "";
+		this.kids.get(key)?.delete(b.id);
+		this.sorted.delete(key);
 	}
 
 	put(b: BlockRec): void {
@@ -123,7 +124,7 @@ export class Store {
 		this.link(b);
 	}
 
-	/** Live children in sibling order (order key, then id). */
+	/** Live children in sibling order (order key, then id); "" lists the top-level blocks. */
 	children(parentId: string): string[] {
 		let s = this.sorted.get(parentId);
 		if (s) return s;
@@ -157,17 +158,27 @@ export class Store {
 		for (let guard = 0; cur && guard < 10_000; guard++) {
 			const b = this.blocks.get(cur);
 			if (!b || b.deleted) return false;
-			if (cur === this.pageId || this.scope.roots.has(cur)) return true;
+			if (this.scope.roots.has(cur)) return true;
 			if (this.scope.levels.has(b.parentId ?? "")) return true;
 			cur = b.parentId;
 		}
 		return false;
 	}
 
-	/** Whether a block may be put under a parent: one shown, a watched level's, the top level's. */
+	/**
+	 * Whether a block may be put under a parent: one inside a watched subtree (every child of it
+	 * is here), a watched level's parent, the top level while it is watched.
+	 */
 	open(parentId: string | null): boolean {
 		if (this.scope.levels.has(parentId ?? "")) return true;
-		return parentId !== null && this.inPage(parentId);
+		let cur: string | null = parentId;
+		for (let guard = 0; cur && guard < 10_000; guard++) {
+			const b = this.blocks.get(cur);
+			if (!b || b.deleted) return false;
+			if (this.scope.roots.has(cur)) return true;
+			cur = b.parentId;
+		}
+		return false;
 	}
 
 	subtree(id: string): string[] {

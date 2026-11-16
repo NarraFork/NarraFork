@@ -2822,13 +2822,16 @@ export class LiveSpace {
 		p: Participant,
 		entries: readonly LiveTextEntry[],
 		undos?: Y.UndoManager[],
+		/** Of blocks a transaction inserts: the watches that will show them. */
+		showers?: ReadonlyMap<string, readonly LiveView[]>,
 	): boolean {
 		const t0 = performance.now();
 		try {
 			for (const e of entries) {
 				// A block the mirror never had (this transaction inserts it, and may be refused):
-				// its updates go to whoever shares a watch with its maker.
-				if (!this.docs.has(e.id) && !this.mirror.get(e.id)) this.orphanHeld.set(e.id, p.views);
+				// its updates go to the watchers of where it is put (its maker's text is its own).
+				if (!this.docs.has(e.id) && !this.mirror.get(e.id))
+					this.orphanHeld.set(e.id, showers?.get(e.id) ?? p.views);
 				const t = this.textDoc(e.id);
 				if (undos)
 					undos.push(
@@ -3398,7 +3401,7 @@ export class LiveSpace {
 			this.touched = new Set();
 			let touched: Set<string>;
 			try {
-				const integrated = this.applyTexts(p, entries, undos);
+				const integrated = this.applyTexts(p, entries, undos, this.showersOf(plan.ops));
 				touched = this.touched;
 				held = this.pendingRows.splice(mark);
 				if (!integrated) {
@@ -3513,7 +3516,7 @@ export class LiveSpace {
 							gen: prior?.gen ?? 0,
 							// A new block's text is with its maker's watches; `route` sends it to
 							// other watches if that is where the block is.
-							held: prior?.held ?? this.orphanHeld.get(op.id) ?? p.views,
+							held: prior?.held ?? this.orphanHeld.get(op.id) ?? HELD_BY_NOBODY,
 						});
 						this.orphanHeld.delete(op.id);
 						break;
@@ -3622,6 +3625,25 @@ export class LiveSpace {
 			if (op.t === "i" || op.t === "k") add(op.id);
 			else if (this.mirror.alive(op.id)) for (const id of this.mirror.subtree(op.id)) add(id);
 			else add(op.id);
+		}
+		return out;
+	}
+
+	/**
+	 * Of each block a list of operations inserts: the watches that will show it (the level of its
+	 * parent, the subtrees showing its parent; a parent inserted before it by the same list counts
+	 * as it will be).
+	 */
+	private showersOf(ops: readonly LiveOp[]): Map<string, LiveView[]> {
+		const out = new Map<string, LiveView[]>();
+		for (const op of ops) {
+			if (op.t !== "i" || this.mirror.get(op.id)) continue;
+			const views: LiveView[] = [];
+			const level = this.levelViews.get(parentKeyOf(op.p));
+			if (level) views.push(level);
+			if (op.p !== null)
+				for (const v of out.get(op.p) ?? this.showingViews(op.p)) if (v.kind === "s") views.push(v);
+			out.set(op.id, views);
 		}
 		return out;
 	}
