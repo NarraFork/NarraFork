@@ -29,6 +29,7 @@ mock.module("@mantine/core", () => {
 	const Block = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
 	return Object.fromEntries(
 		[
+			"ActionIcon",
 			"Alert",
 			"Badge",
 			"Button",
@@ -39,9 +40,11 @@ mock.module("@mantine/core", () => {
 			"Select",
 			"Skeleton",
 			"Stack",
+			"Switch",
 			"Text",
 			"TextInput",
 			"Title",
+			"Tooltip",
 		].map((name) => [name, name === "List" ? Object.assign(Block, { Item: Block }) : Block]),
 	);
 });

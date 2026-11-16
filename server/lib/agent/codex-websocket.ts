@@ -11,6 +11,7 @@ import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { generateId } from "../id";
 import { logger } from "../logger";
+import { applyProxyExemptions } from "../net/proxy";
 import {
 	getHttpCodexUserAgent,
 	mergeExtraHeaders,
@@ -951,8 +952,13 @@ class ReusableWebSocketConnection {
 			const wsOptions: { headers: Record<string, string>; agent?: boolean | HttpAgent } = {
 				headers: this.headers,
 			};
-			if (this.proxy) {
-				wsOptions.agent = new HttpsProxyAgent(this.proxy);
+			// The proxy arrives already resolved (custom / system / inherited global);
+			// applying exemptions here keeps the WebSocket path consistent with the
+			// HTTP path: a target covered by `settings.proxy.noProxyRules` connects
+			// directly. `wss:` URLs parse, so the rules match on host/URL as usual.
+			const proxyUrl = this.proxy ? applyProxyExemptions(this.proxy, this.url) : undefined;
+			if (proxyUrl) {
+				wsOptions.agent = new HttpsProxyAgent(proxyUrl);
 			}
 			const ws = new WebSocketImpl(this.url, wsOptions);
 			this.ws = ws;

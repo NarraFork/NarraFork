@@ -17,7 +17,7 @@ export const DEFAULTS: NarraForkSettings = {
 	speech: { enabled: false, providers: [] },
 	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
-	proxy: { mode: "direct" },
+	proxy: { mode: "direct", noProxyRules: [] },
 	// SQLite by default. Selecting "postgres" additionally requires NF_DATABASE_URL /
 	// DATABASE_URL from the environment — the connection URL is never read from this file
 	// (see the `database` field comment in types.ts).
@@ -377,6 +377,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"proxy.url": {
 		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。支持 http/https 协议，仅填 host:port 时默认按 http 处理。',
 		type: "string",
+	},
+	"proxy.noProxyRules": {
+		desc: "直连规则（no_proxy）。每条含 match（wildcard / regex）、pattern、enabled。内置 HTTP 通道按目标豁免；插件提供商不按目标豁免。交互浏览器只收到部分通配主机规则，裸主机在 Chromium 里不是「主机及其子域」。规则只能直连，不能强制走代理。",
+		type: "array",
 	},
 
 	// ── paths ───────────────────────────────────────────────────────────
