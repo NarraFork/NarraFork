@@ -198,8 +198,8 @@ import {
 } from "../services/outline/views";
 import { flushOutlineTaskEdits } from "../services/outline-task-edits";
 import { resolveTaskBackend } from "../services/task-source";
-import { outlineDigestRoutes } from "./outline-digest";
 import { outlineCopyRoutes } from "./outline-copy";
+import { outlineDigestRoutes } from "./outline-digest";
 import { outlineRestoreRoutes } from "./outline-restore";
 import { outlineSubtreeRoutes } from "./outline-subtree";
 

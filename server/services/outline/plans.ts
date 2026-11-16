@@ -663,7 +663,7 @@ async function changedByOthersSince(
 		// Below the history floor nothing is known of what happened: the change marks start
 		// there, so a version seen before it counts as changed.
 		const state = (await store.getHistoryStates([space.id])).get(space.id);
-		if (!state || !state.edgesReady || seenSeq < state.floorSeq) return true;
+		if (!state?.edgesReady || seenSeq < state.floorSeq) return true;
 		const below = await store.listSubtreeChangeSeqs(space.id, rootId, {
 			after: seenSeq,
 			limit: scan + 1,

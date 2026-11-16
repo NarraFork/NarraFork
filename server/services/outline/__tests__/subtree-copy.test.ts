@@ -282,7 +282,7 @@ describe("copying a subtree", () => {
 		expect(small.copied).toBe(5);
 		expect(small.omitted).toBe(12);
 		expect((await shape(s.id, small.root.id)).slice(1)).toEqual([
-			"  from " + `${s.key}/${root?.sid} (12 left out)`,
+			`  from ${s.key}/${root?.sid} (12 left out)`,
 			"  child 0",
 			"  child 1",
 			"  child 2",
