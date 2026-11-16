@@ -569,11 +569,17 @@ function checkRestored(
 		const was = then.live.get(rootId) as OutlineVersionRow;
 		const is = now.live.get(rootId) as OutlineVersionRow;
 		const reason = skipped.get(rootId);
-		if (reason !== undefined) checkLeft(rootId, reason);
+		if (reason !== undefined && reason !== "place-taken") checkLeft(rootId, reason);
 		else {
 			expect(is.contentHash).toBe(was.contentHash);
 			expect(sameTaskJson(is.taskJson, was.taskJson)).toBe(true);
 			expect(now.tags.get(rootId) ?? "").toBe(then.tags.get(rootId) ?? "");
+			// Its alias of then, unless another live block holds it now.
+			if (is.alias !== was.alias) {
+				expect(reason).toBe("place-taken");
+				expect(is.alias).toBeNull();
+				expect([...now.live.values()].some((v) => v.alias === was.alias)).toBe(true);
+			}
 		}
 		// Where the root sits is not part of its subtree.
 		expect(is.parentId).toBe(atPin.live.get(rootId)?.parentId as string | null);
