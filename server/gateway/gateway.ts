@@ -281,7 +281,6 @@ class Gateway {
 			reloaded.push(p);
 		}
 
-		// Update stored config
 		this.config = newConfig;
 
 		// If gateway wasn't started yet but now has enabled config, do a full start
@@ -640,7 +639,6 @@ class Gateway {
 		// (or only) user so recentTabs and notifications work out of the box.
 		const appUserId = await this.resolveAppUserId();
 
-		// Create narrator
 		const gwPermMode = this.config?.defaultPermissionMode ?? "default";
 		await db.insert(narrators).values({
 			id: narratorId,

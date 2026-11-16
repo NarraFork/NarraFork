@@ -85,7 +85,6 @@ function clearInheritableWindowsHandles(phase: "after server bind" | "before spa
 			});
 		}
 	} catch (error) {
-		// Best-effort workaround only. Never fail server startup/spawn because of FFI guard issues.
 		if (!ffiWarningLogged) {
 			ffiWarningLogged = true;
 			logger.warn(`Windows handle guard failed ${phase}`, { error: String(error) });
