@@ -57,9 +57,9 @@ export const OUTLINE_READ_PAGE_LIMITS = {
 
 /** The block's page holds more blocks than one read loads and the block was not among them. */
 export class OutlinePageTooLargeError extends AppError {
-	constructor(pageId: string) {
+	constructor(_pageId: string) {
 		super(
-			OUTLINE_TEXT.errors.pageTooLarge(pageId, OUTLINE_READ_PAGE_LIMITS.maxPageBlocks),
+			OUTLINE_TEXT.errors.readTooLarge(OUTLINE_READ_PAGE_LIMITS.maxPageBlocks),
 			413,
 			"OUTLINE_PAGE_TOO_LARGE",
 		);

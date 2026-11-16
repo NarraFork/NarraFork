@@ -270,7 +270,7 @@ describe("S-R3-2: the page in the spec fence with the outline off (probe R3-6)",
 		expect(off).toContain("  - Never force-push.\n");
 		expect(off).not.toContain("OutlineRead");
 		expect(off).toMatch(
-			/\n‹2 blocks of this page are shortened or left out here; the user can see the whole page in the outline›$/,
+			/\n‹2 blocks here are shortened or left out; the user can see all of them in the outline›$/,
 		);
 	});
 });

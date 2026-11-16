@@ -9,7 +9,7 @@ import type { OutlineTaskNoticeChange } from "@shared/outline-task-notice";
 // instructions, the two built-in views (current tasks, behavior boundary), the continuation
 // prompts, the interrupt note, the turn-end note, the compact context and the hint a `spec://`
 // path gets. No `spec://` vocabulary: an outline session has none (its behavior boundary is the
-// behavior page of its session space, outline plan PR 4).
+// behavior boundary of its session space, outline plan PR 4).
 //
 // The system-prompt section is part of the frozen contract of a prefix epoch, so it holds only
 // what does not change while a session runs (design §0, the three conventions); live task state
@@ -43,7 +43,7 @@ This session keeps its notes and tasks in the outline: read with OutlineRead and
 
 A task of a project's space is the team's. If you must stop with one unfinished and nobody is waiting on you in this conversation, leave a note under it before you end: where you stopped, what comes next, which branch and commit hold the code. The system may hand the task to a new session, which continues from your note; do not set it back to \`[ ]\` yourself.
 
-Standing rules of behavior are not tasks. They live on this session's behavior page (alias \`behavior\` in \`session/\`). When the user asks you to record one, write it to that page with OutlineEdit (create the page with \`alias:: behavior\` if there is none), and only as the first tool call of that user turn; at any other time the page is read-only to you. This session has no \`spec://\`: the \`spec://\` paths the file tools mention do not apply here.
+Standing rules of behavior are not tasks. They live under this session's behavior boundary (\`session/behavior\`: the top-level block with alias \`behavior\` in \`session/\`). When the user asks you to record one, add it under that block with OutlineEdit (create the block at the top level of \`session/\` with \`alias:: behavior\` if there is none), and only as the first tool call of that user turn; at any other time that block and everything under it are read-only to you. This session has no \`spec://\`: the \`spec://\` paths the file tools mention do not apply here.
 
 The system keeps two views in your context and updates them when they change: this session's current tasks (\`outline.tasks\`) and its behavior boundary (\`outline.behavior\`, which you must always follow).
 </system-reminder>`,
@@ -57,7 +57,7 @@ The system keeps two views in your context and updates them when they change: th
 
 项目空间里的任务是团队的。如果不得不停下而任务还没做完，这个对话里又没有人在等你，结束前在任务下留一段说明：停在哪、下一步是什么、代码在哪个分支哪个提交。系统可能把任务交给一个新会话，由它照你的说明接着做；不要自己把它改回 \`[ ]\`。
 
-长期的行为规则不是任务，它们在本会话的行为边界页里（\`session/\` 中别名为 \`behavior\` 的页）。用户要求你记下一条时，用 OutlineEdit 写进这一页（还没有这一页就新建，并写上 \`alias:: behavior\`），而且只能作为该用户回合的第一个工具调用；其他时候这一页对你只读。本会话没有 \`spec://\`：文件工具说明里提到的 \`spec://\` 路径在这里都不适用。
+长期的行为规则不是任务，它们在本会话的行为边界下面（\`session/behavior\`：\`session/\` 顶层别名为 \`behavior\` 的块）。用户要求你记下一条时，用 OutlineEdit 加到这个块下面（还没有就在 \`session/\` 顶层新建一个块，并写上 \`alias:: behavior\`），而且只能作为该用户回合的第一个工具调用；其他时候这个块和它下面的内容对你只读。本会话没有 \`spec://\`：文件工具说明里提到的 \`spec://\` 路径在这里都不适用。
 
 系统在你的上下文里维护两个视图，有变化时更新：本会话的当前任务（\`outline.tasks\`）和行为边界（\`outline.behavior\`，务必遵守）。
 </system-reminder>`,
@@ -304,8 +304,8 @@ const behaviorViewText = {
 		"zh-CN": "行为边界（用户设定的长期约束，务必遵守）",
 	},
 	fence: {
-		en: "From this session's old behavior fence (not moved to the behavior page yet):",
-		"zh-CN": "来自本会话旧的行为护栏（尚未移到行为边界页）：",
+		en: "From this session's old behavior fence (not moved under the behavior boundary yet):",
+		"zh-CN": "来自本会话旧的行为护栏（尚未移到行为边界下面）：",
 	},
 	sop: { en: "Plugin SOP:", "zh-CN": "插件 SOP：" },
 } satisfies Record<string, LocalizedValue<string>>;
@@ -315,15 +315,15 @@ export function getOutlineBehaviorViewHeading(locale: Locale): string {
 	return pickLocalizedValue(behaviorViewText.heading, locale);
 }
 
-/** The line before the behavior page in the behavior view. */
-export function getOutlineBehaviorViewPage(address: string, locale: Locale): string {
+/** The line before the behavior boundary's blocks in the behavior view. */
+export function getOutlineBehaviorViewBoundary(address: string, locale: Locale): string {
 	return locale === "zh-CN"
-		? `来自本会话的行为边界页 \`${address}\`：`
-		: `From this session's behavior page \`${address}\`:`;
+		? `来自本会话的行为边界 \`${address}\`：`
+		: `From this session's behavior boundary \`${address}\`:`;
 }
 
 /**
- * The note after a behavior page the view could not show whole: `count` blocks are shown with
+ * The note after a behavior boundary the view could not show whole: `count` blocks are shown with
  * only their start, or not at all.
  */
 export function getOutlineBehaviorViewTruncated(
@@ -333,21 +333,21 @@ export function getOutlineBehaviorViewTruncated(
 ): string {
 	return locale === "zh-CN"
 		? `‹没有全部列出：${count} 块只显示了开头或没有列出；完整内容用 OutlineRead 读 \`${address}\`›`
-		: `‹not all shown: ${count} ${count === 1 ? "block is" : "blocks are"} shortened or left out; read \`${address}\` with OutlineRead for the whole page›`;
+		: `‹not all shown: ${count} ${count === 1 ? "block is" : "blocks are"} shortened or left out; read \`${address}\` with OutlineRead for all of it›`;
 }
 
 /**
- * The note after a behavior page cut to fit the spec fence while the outline is switched off. No
- * outline tool is offered then, so it points at nothing the agent would have to read: the person
- * sees the whole page in the outline.
+ * The note after a behavior boundary cut to fit the spec fence while the outline is switched off.
+ * No outline tool is offered then, so it points at nothing the agent would have to read: the
+ * person sees all of it in the outline.
  */
 export function getOutlineBehaviorFenceTruncated(count: number, locale: Locale): string {
 	return locale === "zh-CN"
-		? `‹这一页有 ${count} 块在这里只显示了开头或没有列出；用户可以在大纲里看到整页›`
-		: `‹${count} ${count === 1 ? "block" : "blocks"} of this page ${count === 1 ? "is" : "are"} shortened or left out here; the user can see the whole page in the outline›`;
+		? `‹这里有 ${count} 块只显示了开头或没有列出；用户可以在大纲里看到全部›`
+		: `‹${count} ${count === 1 ? "block" : "blocks"} here ${count === 1 ? "is" : "are"} shortened or left out; the user can see all of them in the outline›`;
 }
 
-/** The line before old fence text that was not moved to the page (its import did not happen). */
+/** The line before old fence text not moved under the boundary (its import did not happen). */
 export function getOutlineBehaviorViewFence(locale: Locale): string {
 	return pickLocalizedValue(behaviorViewText.fence, locale);
 }
@@ -357,20 +357,28 @@ export function getOutlineBehaviorViewSop(locale: Locale): string {
 	return pickLocalizedValue(behaviorViewText.sop, locale);
 }
 
-/** The first block of a fork's behavior page when the copy was cut at the commit limit. */
+/**
+ * The first block of a fork's behavior boundary when the copy was cut at the commit limit.
+ * `total` is null when the original holds more blocks than the copy looked at.
+ */
 export function getOutlineBehaviorForkCutNote(
 	copied: number,
-	total: number,
+	total: number | null,
 	address: string,
 	locale: Locale,
 ): string {
-	return locale === "zh-CN"
-		? `fork 时只复制了这一页 ${total} 块中的 ${copied} 块；其余的在行为边界页 \`${address}\`。`
-		: `Only ${copied} of the ${total} blocks of this page were copied when the session was forked; the rest are on the behavior page \`${address}\`.`;
+	if (locale === "zh-CN") {
+		return total === null
+			? `fork 时只复制了行为边界的前 ${copied} 块；其余的在 \`${address}\`。`
+			: `fork 时只复制了行为边界 ${total} 块中的 ${copied} 块；其余的在 \`${address}\`。`;
+	}
+	return total === null
+		? `Only the first ${copied} blocks of the behavior boundary were copied when the session was forked; the rest are under \`${address}\`.`
+		: `Only ${copied} of the ${total} blocks of the behavior boundary were copied when the session was forked; the rest are under \`${address}\`.`;
 }
 
-/** The title of a behavior page the system creates (the import of an old fence). */
-export function getOutlineBehaviorPageTitle(locale: Locale): string {
+/** The title of the behavior boundary block the system creates (the import of an old fence). */
+export function getOutlineBehaviorBoundaryTitle(locale: Locale): string {
 	return locale === "zh-CN" ? "行为边界" : "Behavior boundary";
 }
 
@@ -462,9 +470,9 @@ export function getOutlineTurnEndNote(task: OutlineTaskPromptTask, locale: Local
 }
 
 const specUnavailable: LocalizedValue<string> = {
-	en: "spec:// is not available in this session: its tasks and notes live in the outline, and its behavior boundary is the behavior page of its session space (alias behavior in session/), which the system keeps in your context. Read with OutlineRead or OutlineSearch and write with OutlineEdit (a task is a checkbox block; your own go in this session's space, session/). Nothing was read or written.",
+	en: "spec:// is not available in this session: its tasks and notes live in the outline, and its behavior boundary is the block session/behavior of its session space (alias behavior, with what is under it), which the system keeps in your context. Read with OutlineRead or OutlineSearch and write with OutlineEdit (a task is a checkbox block; your own go in this session's space, session/). Nothing was read or written.",
 	"zh-CN":
-		"本会话不能使用 spec://：它的任务和笔记都在大纲里，行为边界是会话空间里的行为边界页（session/ 中别名为 behavior 的页），系统会把它放在你的上下文里。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写（任务是带复选框的块，你自己的任务写在本会话的空间 session/ 里）。本次没有读写任何内容。",
+		"本会话不能使用 spec://：它的任务和笔记都在大纲里，行为边界是会话空间里的 session/behavior（别名为 behavior 的块和它下面的内容），系统会把它放在你的上下文里。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写（任务是带复选框的块，你自己的任务写在本会话的空间 session/ 里）。本次没有读写任何内容。",
 };
 
 /** What a tool call naming a `spec://` path gets in an outline session. */
@@ -473,9 +481,9 @@ export function getOutlineSpecUnavailableHint(locale: Locale): string {
 }
 
 const specMoved: LocalizedValue<string> = {
-	en: "spec:// no longer applies in this session: its Dynamic Spec was moved into the outline. Its tasks are on the task page session/tasks, its old spec:// files are outline pages in session/ (titled by their file name), and its behavior boundary is the behavior page session/behavior. Read with OutlineRead or OutlineSearch and write with OutlineEdit. Nothing was read or written.",
+	en: "spec:// no longer applies in this session: its Dynamic Spec was moved into the outline. Its tasks are on the task list session/tasks, its old spec:// files are top-level blocks in session/ (titled by their file name), and its behavior boundary is session/behavior. Read with OutlineRead or OutlineSearch and write with OutlineEdit. Nothing was read or written.",
 	"zh-CN":
-		"本会话不再使用 spec://：它的 Dynamic Spec 已搬进大纲。任务在任务页 session/tasks，原来的 spec:// 文件是 session/ 里的大纲页（以文件名为标题），行为边界是行为边界页 session/behavior。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写。本次没有读写任何内容。",
+		"本会话不再使用 spec://：它的 Dynamic Spec 已搬进大纲。任务在任务清单 session/tasks，原来的 spec:// 文件是 session/ 里的顶层块（以文件名为标题），行为边界是 session/behavior。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写。本次没有读写任何内容。",
 };
 
 /**
@@ -510,18 +518,18 @@ export function getSpecImportNotice(
 	if (input.morePages > 0)
 		lines.push(
 			zh
-				? `- 另有 ${input.morePages} 页，用 OutlineRead 读 session/ 查看`
-				: `- ${input.morePages} more pages; read session/ with OutlineRead`,
+				? `- 另有 ${input.morePages} 个文件，用 OutlineRead 读 session/ 查看`
+				: `- ${input.morePages} more files; read session/ with OutlineRead`,
 		);
 	const notes =
 		lines.length > 0
 			? zh
-				? `\n\n原来的 spec:// 文件现在是这些大纲页：\n${lines.join("\n")}`
-				: `\n\nThe old spec:// files are now these outline pages:\n${lines.join("\n")}`
+				? `\n\n原来的 spec:// 文件现在是这些顶层块：\n${lines.join("\n")}`
+				: `\n\nThe old spec:// files are now these top-level blocks:\n${lines.join("\n")}`
 			: "";
 	return zh
-		? `系统通知（不是用户发言）：本会话的 Dynamic Spec 已搬进大纲。任务现在在任务页 session/tasks（导入了 ${input.tasks} 个），行为边界是行为边界页 session/behavior，系统会把当前任务和行为边界放在你的上下文里。${notes}\n\n本会话不再使用 spec://：读用 OutlineRead 或 OutlineSearch，写用 OutlineEdit（任务是带复选框的块）。旧的 Dynamic Spec 文件保留，只读，不再更新。`
-		: `System notice (not the user speaking): this session's Dynamic Spec was moved into the outline. Its tasks are now on the task page session/tasks (${input.tasks} imported), and its behavior boundary is the behavior page session/behavior; the system keeps the current tasks and the behavior boundary in your context.${notes}\n\nspec:// no longer applies in this session: read with OutlineRead or OutlineSearch, write with OutlineEdit (a task is a checkbox block). The old Dynamic Spec files are kept read-only and are no longer updated.`;
+		? `系统通知（不是用户发言）：本会话的 Dynamic Spec 已搬进大纲。任务现在在任务清单 session/tasks（导入了 ${input.tasks} 个），行为边界是 session/behavior，系统会把当前任务和行为边界放在你的上下文里。${notes}\n\n本会话不再使用 spec://：读用 OutlineRead 或 OutlineSearch，写用 OutlineEdit（任务是带复选框的块）。旧的 Dynamic Spec 文件保留，只读，不再更新。`
+		: `System notice (not the user speaking): this session's Dynamic Spec was moved into the outline. Its tasks are now on the task list session/tasks (${input.tasks} imported), and its behavior boundary is session/behavior; the system keeps the current tasks and the behavior boundary in your context.${notes}\n\nspec:// no longer applies in this session: read with OutlineRead or OutlineSearch, write with OutlineEdit (a task is a checkbox block). The old Dynamic Spec files are kept read-only and are no longer updated.`;
 }
 
 // ─── People's changes to the session's tasks (outline P2 PR 5) ───

@@ -240,8 +240,8 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 					"团队动态（上一轮之后别人做的；系统整理，不是用户发言）",
 					`- ${link(p.root, "auth 模块稳定")} 下：会话「B」把 ${link(p.refresh, "改刷新逻辑")} 勾成完成`,
 					`- ${link(p.root, "auth 模块稳定")} 下：${p.alice.username} 加了 2 条笔记`,
-					`- 项目任务页：会话「C」加了任务 [[${added?.address}|迁移配置]]（可领取）`,
-					`- 项目任务页：会话「C」开始做 ${link(p.upgrade, "升级依赖")}`,
+					`- 项目任务清单：会话「C」加了任务 [[${added?.address}|迁移配置]]（可领取）`,
+					`- 项目任务清单：会话「C」开始做 ${link(p.upgrade, "升级依赖")}`,
 				].join("\n"),
 			);
 			// The reader's card: the same changes, who made them in no language.
@@ -288,8 +288,8 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 					"Team activity since your last turn (what others did; compiled by the system, not the user)",
 					`- Under ${link(p.root, "auth 模块稳定")}: session "B" ticked ${link(p.refresh, "改刷新逻辑")} done`,
 					`- Under ${link(p.root, "auth 模块稳定")}: ${p.alice.username} added 2 notes`,
-					`- Project task page: session "C" added the task [[${added?.address}|迁移配置]] (claimable)`,
-					`- Project task page: session "C" started ${link(p.upgrade, "升级依赖")}`,
+					`- Project task list: session "C" added the task [[${added?.address}|迁移配置]] (claimable)`,
+					`- Project task list: session "C" started ${link(p.upgrade, "升级依赖")}`,
 				].join("\n"),
 			);
 			resetOutlineTeamActivityForTests();

@@ -41,8 +41,8 @@ import { writeOutline } from "../../outline/write";
 import { readSpecFile, writeSpecFile } from "../../spec-vfs-service";
 import { taskSourceForNarrator } from "../index";
 import {
-	copyOutlineBehaviorPage,
-	findBehaviorPage,
+	copyOutlineBehaviorBoundary,
+	findBehaviorBlock,
 	importOutlineBehaviorFence,
 	OUTLINE_BEHAVIOR_IMPORT_ACTOR,
 	resetOutlineBehaviorImport,
@@ -220,7 +220,7 @@ describe("the behavior view", () => {
 		expect(rootView).toBe(
 			[
 				"Behavior boundary (standing constraints the user set; always follow them)",
-				`From this session's behavior page \`${address}\`:`,
+				`From this session's behavior boundary \`${address}\`:`,
 				"- Behavior boundary",
 				"  - Never force-push the main branch.",
 				"Plugin SOP:",
@@ -238,7 +238,7 @@ describe("the behavior view", () => {
 
 		const zh = part(await parts(root, "zh-CN"), "outline.behavior") ?? "";
 		expect(zh).toContain("行为边界（用户设定的长期约束，务必遵守）");
-		expect(zh).toContain(`来自本会话的行为边界页 \`${address}\``);
+		expect(zh).toContain(`来自本会话的行为边界 \`${address}\``);
 		expect(zh).toContain("插件 SOP：");
 	});
 
@@ -254,9 +254,7 @@ describe("the behavior view", () => {
 		expect(view.length).toBeLessThanOrEqual(OUTLINE_VIEW_LIMITS.behaviorChars);
 		expect(view).toContain("Rule zero.");
 		expect(view).toMatch(/\n‹not all shown: \d+ blocks are shortened or left out; read `[^`]+`/);
-		expect(view).toContain(
-			`; read \`${await addressOf(pageId)}\` with OutlineRead for the whole page›`,
-		);
+		expect(view).toContain(`; read \`${await addressOf(pageId)}\` with OutlineRead for all of it›`);
 	});
 
 	test("fence text the import has not moved yet is shown from the old fence", async () => {
@@ -264,7 +262,7 @@ describe("the behavior view", () => {
 		await oldFence(id, "Always run the tests before committing.");
 		const view = part(await parts(id), "outline.behavior") ?? "";
 		expect(view).toContain(
-			"From this session's old behavior fence (not moved to the behavior page yet):",
+			"From this session's old behavior fence (not moved under the behavior boundary yet):",
 		);
 		expect(view).toContain("Always run the tests before committing.");
 		expect(await (await taskSourceForNarrator(id)).behaviorFence()).toBeNull();
@@ -494,7 +492,7 @@ describe("importing an old fence", () => {
 		expect(await importOutlineBehaviorFence(id, "zh-CN")).toBe("imported");
 
 		const space = await ensureSessionSpace(id);
-		const page = await findBehaviorPage(space.id);
+		const page = await findBehaviorBlock(space.id);
 		expect(page).not.toBeNull();
 		const commits = await db
 			.select()
@@ -565,7 +563,7 @@ describe("importing an old fence", () => {
 		const active = { narratorId: id, locale: "en" } as unknown as ActiveNarrator;
 		await prepareOutlineRun(active);
 		const space = await ensureSessionSpace(id);
-		expect(await findBehaviorPage(space.id)).not.toBeNull();
+		expect(await findBehaviorBlock(space.id)).not.toBeNull();
 		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe("");
 	});
 });
@@ -594,7 +592,7 @@ describe("the agent writing the behavior page", () => {
 
 		const refused = await add();
 		expect(refused.isError).toBe(true);
-		expect(refused.output).toContain("behavior page of this session");
+		expect(refused.output).toContain("behavior boundary of this session");
 		const space = await ensureSessionSpace(id);
 		expect((await outlineStore.listChildren(space.id, pageId, 10)).map((b) => b.content)).toEqual([
 			"Never force-push.",
@@ -622,7 +620,7 @@ describe("the agent writing the behavior page", () => {
 		]);
 		expect(create.isError).toBe(true);
 		const space = await ensureSessionSpace(id);
-		expect(await findBehaviorPage(space.id)).toBeNull();
+		expect(await findBehaviorBlock(space.id)).toBeNull();
 
 		// An ordinary page of the session space is the agent's to write, grant or not, and does
 		// not spend the grant.
@@ -636,7 +634,7 @@ describe("the agent writing the behavior page", () => {
 		// Giving that page the alias needs the grant (spent here).
 		const named = await edit([{ set: notesAddress, alias: "behavior" }]);
 		expect(named.isError).toBeFalsy();
-		expect((await findBehaviorPage(space.id))?.id).toBe(notesPage?.id);
+		expect((await findBehaviorBlock(space.id))?.id).toBe(notesPage?.id);
 
 		// Moving a block of its own onto the page needs it again.
 		const other = await edit([{ add: "session/", markdown: "- Scratch\n  - Move me." }]);
@@ -647,7 +645,7 @@ describe("the agent writing the behavior page", () => {
 		const [moveMe] = await outlineStore.listChildMetas(space.id, [scratch?.id ?? null], 10);
 		const moved = await edit([{ move: await addressOf(moveMe?.id ?? ""), to: notesAddress }]);
 		expect(moved.isError).toBe(true);
-		expect(moved.output).toContain("behavior page of this session");
+		expect(moved.output).toContain("behavior boundary of this session");
 	});
 
 	test("people and system writes are not asked; another session's or space's alias is no page", async () => {
@@ -678,7 +676,7 @@ describe("forks copy the behavior page", () => {
 		await seedOutlineTasks(parent, [{ text: "Parent task", status: "todo" }]);
 		const child = await narratorService.forkNarrator(parent, null, { userId: owner });
 		const childSpace = await ensureSessionSpace(child.id);
-		const page = await findBehaviorPage(childSpace.id);
+		const page = await findBehaviorBlock(childSpace.id);
 		const [parentPage] = await outlineStore.getBlocks([pageId]);
 		expect(page?.sid).toBe(parentPage?.sid);
 		expect(
@@ -688,16 +686,16 @@ describe("forks copy the behavior page", () => {
 		expect(part(await parts(child.id), "outline.behavior")).toContain("Never force-push.");
 		expect(part(await parts(child.id), "outline.tasks")).toBeNull();
 		// Copying again changes nothing.
-		expect(await copyOutlineBehaviorPage(parent, child.id)).toBe(false);
+		expect(await copyOutlineBehaviorBoundary(parent, child.id)).toBe(false);
 	});
 
 	test("a spec parent, or an outline parent without a page, copies nothing", async () => {
 		const spec = await session({ backend: "spec" });
 		const specChild = await session({ backend: "spec" });
-		expect(await copyOutlineBehaviorPage(spec, specChild)).toBe(false);
+		expect(await copyOutlineBehaviorBoundary(spec, specChild)).toBe(false);
 		const bare = await session();
 		const bareChild = await session();
-		expect(await copyOutlineBehaviorPage(bare, bareChild)).toBe(false);
+		expect(await copyOutlineBehaviorBoundary(bare, bareChild)).toBe(false);
 		expect(await outlineStore.findSpace({ kind: "session", narratorId: bareChild })).toBeNull();
 	});
 });
@@ -1121,7 +1119,7 @@ describe("an outline session's run", () => {
 		expect(prompts[0]).toContain("## Context: outline.tasks");
 		expect(prompts[0]).toContain("Write the parser");
 		const space = await ensureSessionSpace(id);
-		expect(await findBehaviorPage(space.id)).not.toBeNull();
+		expect(await findBehaviorBlock(space.id)).not.toBeNull();
 		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe("");
 	});
 

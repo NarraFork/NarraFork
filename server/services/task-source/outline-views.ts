@@ -37,9 +37,9 @@ import { hotOnce, hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import {
 	getOutlineBehaviorFenceTruncated,
+	getOutlineBehaviorViewBoundary,
 	getOutlineBehaviorViewFence,
 	getOutlineBehaviorViewHeading,
-	getOutlineBehaviorViewPage,
 	getOutlineBehaviorViewSop,
 	getOutlineBehaviorViewTruncated,
 	getOutlineTasksViewHeading,
@@ -76,18 +76,20 @@ import {
 import { registerContextDisplayRefiner } from "../context-display-refiners";
 import { readDisplayNames, readNarrator } from "../outline/access-reads";
 import { listOutlineAssignedTasks } from "../outline/assigned";
-import { loadBodies, readSubtree } from "../outline/read";
+import { loadBodies } from "../outline/read";
 import { renderOutline } from "../outline/render";
 import { outlineStore } from "../outline/store";
+import { readLiveSubtree } from "../outline/subtree-read";
 import { isOpenTask } from "../outline/task-json";
 import { isClaimLive } from "../outline/tasks";
 import { breadthFirst, type OutlineNode } from "../outline/tree";
 import { readTaskSession } from "./backend";
 import {
 	dropSpecLossAttachBlocks,
-	findBehaviorPage,
+	findBehaviorBlock,
 	graphemeBoundary,
 	importLeftover,
+	isSpecLossAttachRow,
 	readOldBehaviorFence,
 } from "./outline-behavior";
 import {
@@ -140,7 +142,8 @@ export const OUTLINE_VIEW_LIMITS = {
 	 * and the agent has no outline tool then to read the rest.
 	 */
 	switchedOffChars: 30_000,
-	switchedOffBlocks: 1000,
+	/** What one read of a subtree takes from the store at most. */
+	switchedOffBlocks: 800,
 	/** How long a cached view is served without a change that drops it. */
 	maxAgeMs: 60_000,
 	/** Narrators' views kept, the least recently used dropped first. */
@@ -891,7 +894,7 @@ async function loadBehaviorBodies(
 /** Blocks whose bodies one statement of the behavior render loads. */
 const OUTLINE_BEHAVIOR_BODY_CHUNK = 25;
 
-interface BehaviorPageRender {
+interface BehaviorBoundaryRender {
 	markdown: string;
 	/**
 	 * Blocks shown with only their start or left out by the budget (at least one when the page
@@ -910,17 +913,23 @@ interface BehaviorPageRender {
  * block's start fits are the last ones (breadth first) left out, with the share that shows the
  * most top-level rules' starts (see `fairShare`). `notInFull` counts what is not shown in full.
  */
-async function renderBehaviorPage(
-	pageId: string,
+async function renderBehaviorBoundary(
+	boundary: { id: string; spaceId: string },
 	maxChars: number,
 	maxBlocks: number = OUTLINE_VIEW_LIMITS.behaviorBlocks,
-): Promise<BehaviorPageRender | null> {
+): Promise<BehaviorBoundaryRender | null> {
 	if (maxChars <= 0) return null;
-	const subtree = await readSubtree(pageId);
+	// The boundary block and what is under it, by block: structure first (breadth first, at most
+	// `maxBlocks`), content only for what the fair shares can show.
+	// Content the swallowed-content scan attached is never shown as a rule (outline P2 PR 12c): a
+	// rule a person removed must not apply again because a check found it. It is never read
+	// either: the budget goes to rules, not to what the scan attached (it stands first).
+	const subtree = await readLiveSubtree(boundary.spaceId, boundary.id, {
+		limit: maxBlocks,
+		skip: isSpecLossAttachRow,
+	});
 	if (!subtree) return null;
 	const { state, root } = subtree;
-	// Content the swallowed-content scan attached is never shown as a rule (outline P2 PR 12c): a
-	// rule a person removed must not apply again because a check found it.
 	// Of content a person confirmed as rules, the content only: its header speaks to the person.
 	dropSpecLossAttachBlocks(root, { rulesOnly: true });
 	const min = OUTLINE_VIEW_LIMITS.behaviorBlockMinChars;
@@ -965,13 +974,13 @@ async function renderBehaviorPage(
 				shortened.add(node.id);
 				return { ...shown, content };
 			},
-			truncatedRead: state.truncated ? { blocksRead: state.nodes.size } : undefined,
+			truncatedRead: subtree.truncated ? { blocksRead: subtree.nodes.size } : undefined,
 		});
 		const markdown = rendered.markdown.trimEnd();
 		const shownShortened = rendered.blockIds.filter((id) => shortened.has(id)).length;
 		last = {
 			markdown,
-			notInFull: Math.max(shownShortened + rendered.hiddenByBudget, state.truncated ? 1 : 0),
+			notInFull: Math.max(shownShortened + rendered.hiddenByBudget, subtree.truncated ? 1 : 0),
 		};
 		if (markdown.length <= maxChars) return { ...last, truncated: last.notInFull > 0 };
 		// Over: when every block was to fit (the cost estimate is close, not exact), a smaller
@@ -1027,15 +1036,15 @@ async function readBehaviorView(
 
 	// 1. The person's page comes first and gets the budget it needs.
 	const page =
-		session.spaceId && sessionNarratorId ? await findBehaviorPage(session.spaceId) : null;
+		session.spaceId && sessionNarratorId ? await findBehaviorBlock(session.spaceId) : null;
 	if (page) {
 		const space = await outlineStore.getSpace(page.spaceId);
 		const address = `${space?.key ?? page.spaceId}/${page.sid}`;
-		const intro = getOutlineBehaviorViewPage(address, locale);
+		const intro = getOutlineBehaviorViewBoundary(address, locale);
 		// Room for the note with the largest count it can carry.
 		const longestNote = getOutlineBehaviorViewTruncated(address, 99_999, locale);
-		const rendered = await renderBehaviorPage(
-			page.id,
+		const rendered = await renderBehaviorBoundary(
+			page,
 			room - 1 - intro.length - 1 - longestNote.length - 1,
 		);
 		if (rendered?.markdown.trim()) {
@@ -1124,23 +1133,23 @@ export function unreadableOutlineContextParts(): ContextPart[] {
  * fence, which after the import holds only the plugin SOP, so the person's rules never drop out.
  * Null for any other narrator. A subagent gets its session's page, as under the outline (D31).
  */
-export async function behaviorPageForSpecFence(narratorId: string): Promise<string | null> {
+export async function behaviorBoundaryForSpecFence(narratorId: string): Promise<string | null> {
 	const session = await readTaskSession(narratorId);
 	if (!session || session.backend !== "outline" || !session.sessionNarratorId) return null;
 	const space = await outlineStore.findSpace({
 		kind: "session",
 		narratorId: session.sessionNarratorId,
 	});
-	const page = space ? await findBehaviorPage(space.id) : null;
+	const page = space ? await findBehaviorBlock(space.id) : null;
 	if (!space || !page) return null;
 	// Worded in the session owner's language: the spec fence reader knows no locale.
 	const owner = (await readNarrator(session.sessionNarratorId))?.ownerUserId ?? null;
 	const locale: Locale = owner ? await getUserLanguage(owner) : "en";
 	const address = `${space.key}/${page.sid}`;
-	const intro = getOutlineBehaviorViewPage(address, locale);
+	const intro = getOutlineBehaviorViewBoundary(address, locale);
 	const longestNote = getOutlineBehaviorFenceTruncated(99_999, locale);
-	const rendered = await renderBehaviorPage(
-		page.id,
+	const rendered = await renderBehaviorBoundary(
+		page,
 		OUTLINE_VIEW_LIMITS.switchedOffChars - intro.length - 1 - longestNote.length - 1,
 		OUTLINE_VIEW_LIMITS.switchedOffBlocks,
 	);

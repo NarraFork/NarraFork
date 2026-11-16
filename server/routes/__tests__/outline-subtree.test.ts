@@ -395,6 +395,47 @@ describe("reading", () => {
 		expect(facts.body.levels[0]?.processHidden).toBe(1);
 	});
 
+	test("in the facts view the budget counts blocks shown: tasks before the facts take none of it", async () => {
+		// A space of its own: the other cases count the commits of spaceA.
+		const space = await ensureProjectSpace(await project(alice, [bob]));
+		const made = await write(
+			space,
+			[
+				{ op: "insert", tempId: "p", parent: null, content: "Mixed" },
+				...Array.from({ length: 5 }, (_, i) => ({
+					op: "insert" as const,
+					parent: { tempId: "p" },
+					content: `task ${i}`,
+					task: { status: "todo" as const },
+				})),
+				{ op: "insert", parent: { tempId: "p" }, content: "fact one" },
+				{ op: "insert", parent: { tempId: "p" }, content: "fact two" },
+				{ op: "insert", parent: { tempId: "p" }, content: "fact three" },
+			],
+			alice,
+		);
+		const parent = made.results[0]?.blockId as string;
+		const read = await call<OutlineSubtreeResponse>(
+			bob,
+			`/spaces/${space.id}/blocks/${parent}/subtree?blocks=3`,
+		);
+		expect(read.status).toBe(200);
+		// The root and two facts: the five tasks read on the way cost nothing.
+		expect(read.body.blocks.map((block) => block.content)).toEqual([
+			"Mixed",
+			"fact one",
+			"fact two",
+		]);
+		const level = read.body.levels[0];
+		expect(level).toMatchObject({ parentId: parent, more: true, processHidden: 5 });
+		// The level continues from its cursor with what is left.
+		const rest = await call<OutlineLevelsResponse>(
+			bob,
+			`/spaces/${space.id}/children?parents=${parent}&view=facts&cursor=${level?.nextCursor}`,
+		);
+		expect(rest.body.blocks.map((block) => block.content)).toEqual(["fact three"]);
+	});
+
 	test("as of a seq or a time it shows that state; a lock says who may undo it", async () => {
 		const before = (await outlineStore.getSpace(spaceA.id)) as OutlineSpaceRow;
 		const seq = before.nextSeq - 1;

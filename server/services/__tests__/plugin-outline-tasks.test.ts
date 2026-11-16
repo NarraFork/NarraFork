@@ -47,7 +47,7 @@ import {
 } from "../plugin-public-api";
 import { readSpecFile, writeSpecFile } from "../spec-vfs-service";
 import { invalidateTaskBackend } from "../task-source";
-import { copyOutlineBehaviorPage, findBehaviorPage } from "../task-source/outline-behavior";
+import { copyOutlineBehaviorBoundary, findBehaviorBlock } from "../task-source/outline-behavior";
 import { moveOutlineFenceSop, pluginRulesSid } from "../task-source/outline-plugin-rules";
 import { outlineBehaviorView } from "../task-source/outline-views";
 
@@ -876,10 +876,10 @@ describe("an SOP left in the old fence", () => {
 
 		await ok("behavior_rules_set", { narratorId: id, mode: "upsert", text: "Parent rules." });
 		const fork = await session();
-		expect(await copyOutlineBehaviorPage(id, fork)).toBe(true);
+		expect(await copyOutlineBehaviorBoundary(id, fork)).toBe(true);
 		await ok("behavior_rules_set", { narratorId: fork, mode: "upsert", text: "Fork rules." });
 		const space = await ensureSessionSpace(fork);
-		const page = await findBehaviorPage(space.id);
+		const page = await findBehaviorBlock(space.id);
 		const blocks = await outlineStore.listChildren(space.id, page?.id as string, 10);
 		expect(blocks.map((b) => b.content)).toEqual([`Rules from plugin ${PLUGIN}`]);
 		expect(
