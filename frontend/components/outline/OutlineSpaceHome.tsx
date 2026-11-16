@@ -1,7 +1,7 @@
 /**
  * One outline space, as the connected outline focused on it (readability E): where it hangs
- * (outline › its project › it), then its pages and, a project, its sessions, each opened in
- * place (`tree/OutlineTree.tsx`), and search within it, drawn as a tree of the matches. Router-free like the surface, so the
+ * (outline › its project › it), then its top-level blocks and, a project, its sessions, each
+ * opened in place (`forest/OutlineForest.tsx`), and search within it, drawn as a tree of the matches. Router-free like the surface, so the
  * outline route and a dock panel (opened from a session's menu, on the session) show the same.
  */
 import {
@@ -23,11 +23,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineSpace } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
+import { OutlineForest } from "./forest/OutlineForest";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
 import { OutlineLink } from "./outline-nav";
 import { OutlineSearchTree } from "./tree/OutlineSearchTree";
-import { OutlineTree } from "./tree/OutlineTree";
 import type { TreeLocateTarget } from "./tree/tree-locate";
 
 export function OutlineSpaceHome({
@@ -140,7 +140,7 @@ export function OutlineSpaceHome({
 					}}
 				/>
 			)}
-			{root && <OutlineTree root={root} host={host} locate={locate} hidden={searching} />}
+			{root && <OutlineForest root={root} host={host} locate={locate} hidden={searching} />}
 		</Stack>
 	);
 }

@@ -16,12 +16,12 @@ import type { TreeHost } from "./tree/tree-open-state";
 type Ancestor = OutlineBlockViewResponse["path"][number];
 
 /**
- * Outline › (a session's project ›) space › page › … › the focused block's parent: where the page
- * is, not what it is. A session space names its project when the reader may read it (the space's
+ * Outline › (a session's project ›) space › top-level block › … › the focused block's parent:
+ * where it is, not what it is (the ancestor path; there is no "page" level). A session space names its project when the reader may read it (the space's
  * `parent`, read once per space and kept: commits do not change it). The
- * focused block's own title is the page title right below (and the tab's name in a dock), so the
+ * focused block's own title is the heading right below (and the tab's name in a dock), so the
  * bar does not say it again. Every crumb is a link that focuses it, keeping the view and the
- * time the page is shown at. While the page is edited live, `path` comes from the live page (it
+ * time it is shown at. While it is edited live, `path` comes from the live editor (it
  * follows focus at once, before the read of the block lands).
  *
  * One line, always: crumbs truncate, and a deep path folds its middle into a "…" menu
@@ -137,27 +137,22 @@ export function OutlineBreadcrumbs({
 }
 
 /**
- * "Show in the outline tree" (readability F), beside the bar, among the page's controls: the
+ * "Show in the outline tree" (readability F), beside the bar, among the view's controls: the
  * reader is taken to the tree, where what this block is under opens and the tree scrolls to it.
  * Not a crumb and not in the bar: the crumbs' one line is theirs alone.
  */
 export function OutlineLocateLink({
-	view,
-	path,
+	spaceId,
 	host,
 	blockId,
-	title,
 }: {
-	view: OutlineBlockViewResponse;
-	path?: OutlineBlockViewResponse["path"];
+	spaceId: string;
 	/** The host whose tree shows it (the outline page, a dock panel). */
 	host: TreeHost;
-	/** The focused block and its title. */
+	/** The focused block. */
 	blockId: string;
-	title: string;
 }) {
 	const { t } = useTranslation("outline");
-	const above = path ?? view.path;
 	return (
 		<OutlineLink
 			to={{ kind: "home" }}
@@ -169,13 +164,7 @@ export function OutlineLocateLink({
 				// Only a plain click goes to this host's tree (a new tab has its own).
 				if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey)
 					return;
-				requestTreeLocate(host, {
-					spaceId: view.space.id,
-					pageId: above[0]?.id ?? blockId,
-					blockId,
-					pathIds: above.map((ancestor) => ancestor.id),
-					pageTitle: above[0]?.title ?? title,
-				});
+				requestTreeLocate(host, { spaceId, blockId });
 			}}
 		>
 			<IconBinaryTree2 size={16} />

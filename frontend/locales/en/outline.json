@@ -2,7 +2,7 @@
 	"title": "Outline",
 	"subtitle": "Notes, decisions and plans as outlines, for projects, sessions and yourself.",
 	"unavailable": "The outline is not turned on for this server.",
-	"notFound": "This page does not exist, or you cannot read it.",
+	"notFound": "This does not exist, or you cannot read it.",
 	"notAtTime": "This block did not exist at that point in the history.",
 	"loadFailed": "Could not load this. Try again in a moment.",
 	"loadMore": "Load more",
@@ -11,7 +11,7 @@
 		"noResults": "No matches.",
 		"process": "Process",
 		"recent": "Recently visited",
-		"noRecent": "Pages you open appear here.",
+		"noRecent": "What you open appears here.",
 		"spaces": "Spaces",
 		"noSpaces": "No spaces yet."
 	},
@@ -59,8 +59,6 @@
 		"hiddenUnderHint": "Only done or cancelled tasks are under this block; the facts view leaves them out. Switch to All to see them.",
 		"more_one": "… {{count}} more",
 		"more_other": "… {{count}} more",
-		"moreAtRoot_one": "… {{count}} more block does not fit on this page; focus on a part of it.",
-		"moreAtRoot_other": "… {{count}} more blocks do not fit on this page; focus on a part of it.",
 		"factsEmpty": "Only tasks and their progress are here. Switch to All to see them.",
 		"empty": "No blocks under this one yet.",
 		"view": {
@@ -71,7 +69,6 @@
 		"sidePanel": "Backlinks and history",
 		"asOfBanner": "Viewing the page as of commit #{{seq}} (read only).",
 		"backToCurrent": "Back to now",
-		"truncated": "This page is too large to read at once; focus on a part of it.",
 		"processHidden_one": "{{count}} block under tasks is not shown.",
 		"processHidden_other": "{{count}} blocks under tasks are not shown.",
 		"showAll": "Show all",
@@ -216,14 +213,14 @@
 		"label": "Find a block to jump to",
 		"empty": "No matches.",
 		"noRecent": "Blocks you focus appear here.",
-		"searching": "Searching other pages…",
+		"searching": "Searching the rest…",
 		"via": {
 			"title": "Title",
 			"alias": "Alias",
 			"body": "Text",
 			"recent": "Recent"
 		},
-		"thisPage": "This page",
+		"thisPage": "Loaded here",
 		"otherSpace": "Another space"
 	},
 	"history": {
@@ -234,22 +231,22 @@
 		"notFound": "This outline link points to something that does not exist, or that you cannot read."
 	},
 	"panel": {
-		"openPage": "Open in the outline page"
+		"openPage": "Open in the outline"
 	},
 	"dock": {
 		"sessions": "Sessions",
 		"recentSessions": "Recent sessions of this space",
 		"noSessions": "No sessions here yet.",
-		"discuss": "Discuss this page in a session",
-		"discussTitle": "Discuss this page in a session",
-		"discussHint": "A link to this page is put in the session's message box.",
+		"discuss": "Discuss this in a session",
+		"discussTitle": "Discuss this in a session",
+		"discussHint": "A link to this place is put in the session's message box.",
 		"newSession": "New session…"
 	},
 	"workspace": {
-		"addTitle": "Add an outline page"
+		"addTitle": "Add an outline"
 	},
 	"crumbs": {
-		"label": "Where this page is",
+		"label": "Where this is",
 		"more_one": "{{count}} more level",
 		"more_other": "{{count}} more levels"
 	},
@@ -550,8 +547,8 @@
 		"olderFailed": "Earlier reports could not be loaded.",
 		"retry": "Try again",
 		"dayWithItems": "{{day}} ({{items}})",
-		"moreOnPage_one": "{{count}} more on the reports page",
-		"moreOnPage_other": "{{count}} more on the reports page",
+		"moreOnPage_one": "{{count}} more among the reports",
+		"moreOnPage_other": "{{count}} more among the reports",
 		"inboxFailed": "The report could not be shown.",
 		"upTo": "{{day}} (up to {{time}})"
 	},
@@ -715,7 +712,7 @@
 		}
 	},
 	"tree": {
-		"hint": "Open anything in place to read it; open a page's title to edit it.",
+		"hint": "Open anything in place to read it; a block's bullet focuses it.",
 		"collapseAll": "Collapse all",
 		"recent": "Recently visited ({{count}})",
 		"sessions": "Sessions ({{count}})",
@@ -723,14 +720,10 @@
 		"loose": "Sessions outside projects ({{count}})",
 		"orphaned": "Spaces without an owner ({{count}})",
 		"noSessions": "No sessions you can read.",
-		"noPages": "No pages yet.",
 		"moreSpaces_one": "{{count}} more ▸",
 		"moreSpaces_other": "{{count}} more ▸",
 		"moreProjects": "More projects ▸",
 		"gone": "No longer available.",
-		"partial_one": "Showing the first {{count}} block of this page here.",
-		"partial_other": "Showing the first {{count}} blocks of this page here.",
-		"openPage": "Open the page",
 		"waiting": "{{n}} waiting for you",
 		"waitingLabel_one": "{{count}} question waiting for your answer",
 		"waitingLabel_other": "{{count}} questions waiting for your answer",
@@ -743,7 +736,7 @@
 			"finished": "Finished: {{text}}"
 		},
 		"locate": "Show in the outline tree",
-		"locateFailed": "Could not show it in the tree: it may be gone, or past what one read of its page holds.",
+		"locateFailed": "Could not show it in the tree: it may be gone, or you may not be able to read where it is.",
 		"dismiss": "Dismiss",
 		"search": {
 			"label": "Search results",
@@ -752,5 +745,24 @@
 			"more": "More matches ▸",
 			"untitled": "Untitled"
 		}
+	},
+	"forest": {
+		"empty": "Nothing here yet.",
+		"load": "Show what is inside",
+		"retry": "Try again",
+		"next": "Next ▸",
+		"prev": "◂ Previous",
+		"paged": "Showing {{from}}–{{to}}. This level is too long to show whole.",
+		"reportAll": "Show all ▸",
+		"pinned": "Located",
+		"pinnedHint": "Shown out of its place in this long level because what you located is under it.",
+		"changedSelf": "Changed since your last visit",
+		"changedBelow": "Something inside changed since your last visit",
+		"inProgressHint": "Open tasks under this block. Focus on it to see them.",
+		"historyUnavailable": "The outline as of that time cannot be shown: its history starts later, or is still being prepared.",
+		"edit": "Edit",
+		"done": "Done",
+		"editHint": "Edit here (F2, or double-click a line)",
+		"doneHint": "Back to reading"
 	}
 }

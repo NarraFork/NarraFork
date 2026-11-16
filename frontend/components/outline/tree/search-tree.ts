@@ -2,20 +2,20 @@
  * A search drawn as a tree (readability F): the hits with their ancestors, nothing else.
  *
  *   ▾ Project A                        the space of the hits under it
- *       ▾ Tasks                        the page
+ *       ▾ Tasks                        a top-level block
  *           ▾ Fix the refresh race     an ancestor (drawn once, however many hits are under it)
  *               • … the **race** is in the reader …      a hit, with its snippet
  *
- * Built from the hits alone: each names its ancestors by id (`pathIds`, the page first) and by
+ * Built from the hits alone: each names its ancestors by id (`pathIds`, the top-level block first) and by
  * title (`path`), and its space is in the response. A hit may itself be an ancestor of another.
- * Bounded by the hits loaded (pages of at most 50, as many as one search ranks). Pure.
+ * Bounded by the hits loaded (batches of at most 50, as many as one search ranks). Pure.
  */
 import type { OutlineSearchHitView, OutlineSpaceSummary } from "@shared/outline-api";
 
 export interface SearchTreeNode {
 	/** `space:<id>` for a space's row, else the block's id. */
 	key: string;
-	kind: "space" | "page" | "block";
+	kind: "space" | "block";
 	spaceId: string;
 	/** A block's id; null for a space's row. */
 	blockId: string | null;
@@ -35,18 +35,13 @@ export function buildSearchTree(
 	const roots: SearchTreeNode[] = [];
 	const nodes = new Map<string, SearchTreeNode>();
 	const seen = new Set<string>();
-	const child = (
-		parent: SearchTreeNode,
-		blockId: string,
-		title: string,
-		page: boolean,
-	): SearchTreeNode => {
+	const child = (parent: SearchTreeNode, blockId: string, title: string): SearchTreeNode => {
 		const key = `${parent.spaceId}:${blockId}`;
 		let node = nodes.get(key);
 		if (!node) {
 			node = {
 				key: blockId,
-				kind: page ? "page" : "block",
+				kind: "block",
 				spaceId: parent.spaceId,
 				blockId,
 				title,
@@ -60,7 +55,7 @@ export function buildSearchTree(
 		return node;
 	};
 	for (const hit of hits) {
-		// A hit shown once (two pages of a search may overlap after a commit).
+		// A hit shown once (two batches of a search may overlap after a commit).
 		if (seen.has(hit.blockId)) continue;
 		seen.add(hit.blockId);
 		let at = nodes.get(`space:${hit.spaceId}`);
@@ -81,9 +76,9 @@ export function buildSearchTree(
 		// Without ids (an older server) the hit hangs under its space, its path said in words.
 		const ids = hit.pathIds?.length === hit.path.length ? hit.pathIds : [];
 		for (let i = 0; i < ids.length; i++) {
-			at = child(at, ids[i] as string, hit.path[i] ?? "", ids[i] === hit.pageId);
+			at = child(at, ids[i] as string, hit.path[i] ?? "");
 		}
-		const node = child(at, hit.blockId, hit.title, hit.blockId === hit.pageId);
+		const node = child(at, hit.blockId, hit.title);
 		node.hit = hit;
 		if (hit.title) node.title = hit.title;
 	}

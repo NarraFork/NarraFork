@@ -1,37 +1,40 @@
 /**
- * One outline page, or any block of one focused as a page: breadcrumbs, the live editor (or the
- * read-only block tree), a side panel with backlinks and history, and the timeline strip.
+ * One block of the outline focused (a top-level block, or any block under one): the path of its
+ * ancestors, then what is under it — read as the forest with that block as its only root
+ * (`forest/OutlineForest.tsx`), or edited in the live editor — a side panel with backlinks and
+ * history, and the timeline strip.
  *
  * A self-contained surface: everything it shows comes from its props, and everything that would
  * change them (focus, breadcrumbs, the view, the time) goes out through `onNavigate`; links
  * render through the host's link renderer (`outline-nav.tsx`). It never touches the router, so
  * the outline route (`routes/outline/$spaceId/$blockId.tsx`) and dock panels host it alike, and
- * several may be mounted in one tab: the same page twice shares one live session and one page
- * subscription (both keyed by page), while folding, selection and scroll stay per surface.
+ * several may be mounted in one tab.
  *
- * The current page is the live editor (`OutlineEditor`): people who may write the space edit it
- * together, people who may only read it watch it change. The view as of a commit is the
- * read-only block tree, and so is a page live editing cannot take (too large, the socket is
- * unavailable, or the tab already has as many pages live as its socket takes). The side panel
- * and the timeline follow commits through the page subscription.
+ * READ AND EDIT. Reading is the forest in read mode: lazily loaded, folded by the default with
+ * the reader's own folding (stored per block), kept fresh by the block watch. Editing is the
+ * live editor (`OutlineEditor`), which until L4–L6 still works on the top-level block the
+ * focus is under as a whole (internally: its "page"). 「编辑」 on the toolbar, F2, or a double
+ * click on a row's text enters editing; 「完成」 returns to reading. Until L6 ships the rest of
+ * that rule (D58: start in read mode, leave when idle), a surface on screen STARTS in the
+ * editor, as it always did ({@link START_EDITING}). A view as of a commit is read only, and so
+ * is a block live editing cannot take (the socket is unavailable, the tab has no live slot
+ * left): the forest shows it.
  *
  * Live only on screen: inside a dock panel that is not visible (a background tab, a Director
- * preview) the surface neither joins the page's live session nor subscribes to the page, and
- * shows the read-only tree; it joins again when shown (`live-sessions.ts` keeps a session a few
- * seconds after its last editor, so flicking between tabs is cheap). Hidden panels so take no
- * live slot of the socket and do not show their reader as present to others.
+ * preview) the surface neither joins a live session nor watches, and shows the forest; it joins
+ * again when shown (`live-sessions.ts` keeps a session a few seconds after its last editor, so
+ * flicking between tabs is cheap).
  *
  * Narrow (a phone, or a dock panel of 320–480 px): the side panel is a drawer, over the window on
  * a phone and inside the surface in a panel.
  *
- * Two views of the live page (design §6.10, D29): the outline and the mind map, switched on the
- * editor's toolbar, sharing focus, folding, selection and the viewport anchor; folding and the
- * map's direction are stored per person and page (`useOutlineViewStateSync`). Focus moves without
- * rebuilding the editor: while the read of a newly focused block of the same space loads, the
- * previous read stays and the breadcrumbs follow the live page. Mod-K opens the quick switcher
- * (`QuickSwitcher.tsx`, D35).
+ * Two views while editing (design §6.10, D29): the outline and the mind map, switched on the
+ * editor's toolbar, sharing focus, folding, selection and the viewport anchor. Focus moves
+ * without rebuilding the editor: while the read of a newly focused block of the same space
+ * loads, the previous read stays and the breadcrumbs follow the editor. Mod-K opens the quick
+ * switcher (`QuickSwitcher.tsx`, D35).
  *
- * History: on the outline page, back and forward are the browser's (focus is in the URL). A dock
+ * History: on the outline route, back and forward are the browser's (focus is in the URL). A dock
  * panel never changes the URL, so its host passes `history` — the panel's own navigation history —
  * and the surface shows back and forward buttons and takes Mod-[ and Mod-] for them.
  */
@@ -51,12 +54,13 @@ import {
 import { useElementSize, useMediaQuery } from "@mantine/hooks";
 import { titleOf } from "@shared/outline";
 import type { OutlineViewMode } from "@shared/outline-api";
-import type { FoldAction, FoldTree, FoldView } from "@shared/outline-fold";
 import {
 	IconArrowLeft,
 	IconArrowRight,
+	IconCheck,
 	IconClock,
 	IconLayoutSidebarRight,
+	IconPencil,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -65,9 +69,9 @@ import {
 	useCallback,
 	useEffect,
 	useMemo,
-	useReducer,
 	useRef,
 	useState,
+	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -98,9 +102,11 @@ import {
 import { TabLimitNotice } from "./editor/TabLimitNotice";
 import { liveTransport } from "./editor/transport";
 import { UnsavedTextsNotice } from "./editor/UnsavedTextsNotice";
+import { OutlineTaskIcon } from "./forest/ForestBlocks";
+import type { SpaceForest } from "./forest/forest-model";
+import { OutlineForest } from "./forest/OutlineForest";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
-import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
 import { OutlineBreadcrumbs, OutlineLocateLink } from "./OutlineBreadcrumbs";
 import { OutlineGate } from "./OutlineGate";
 import { OutlineQuestionsSection } from "./OutlineQuestions";
@@ -174,6 +180,15 @@ export interface OutlineSurfaceLoaded {
 	canWrite: boolean;
 }
 
+/**
+ * A surface on screen starts in the editor (see the header). L6 turns this off: the focused
+ * view then starts in read mode, as D58 says.
+ */
+const START_EDITING = true;
+
+const noSubscribe = () => () => {};
+const zero = () => 0;
+
 const SidePanel = memo(OutlineSidePanel);
 const Timeline = memo(OutlineTimeline);
 
@@ -207,16 +222,33 @@ function SurfaceBody({
 	const onScreen = useNarratorPanelVisible();
 	const [fallback, setFallback] = useState<OutlineLiveUnavailable | null>(null);
 	const [hiddenLive, setHiddenLive] = useState(0);
-	const editing = onScreen && asOf === undefined && fallback === null;
+	// Reading (the forest) or editing (the live editor): the reader's choice on this surface.
+	const [reading, setReading] = useState(!START_EDITING);
+	const editing = onScreen && asOf === undefined && fallback === null && !reading;
+	// What the forest's view left out (tasks and questions, in the facts view).
+	const [forest, setForest] = useState<SpaceForest | null>(null);
+	const forestVersion = useSyncExternalStore(
+		forest?.subscribe ?? noSubscribe,
+		forest?.getVersion ?? zero,
+		forest?.getVersion ?? zero,
+	);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: the version says the rows changed
+	const hiddenRead = useMemo(
+		() => (forest?.status === "ready" ? forest.getView().processHidden : 0),
+		[forest, forestVersion],
+	);
 	// No room was left while on screen: try again the next time the panel is shown.
 	useEffect(() => {
 		if (!onScreen) setFallback((current) => (current === "tab_limit" ? null : current));
 	}, [onScreen]);
-	// While editing, the HTTP read feeds the breadcrumbs, questions, side panel and timeline.
+	// The surface's own read is of the focused block alone: it feeds the title, the breadcrumbs,
+	// the questions, the side panel and the timeline. What is under the block is the forest's
+	// (lazily, by level) or the editor's.
 	const query = useOutlineBlock(spaceId, blockId, {
 		asOf,
 		view: mode,
-		...(editing ? { blocks: 1, keepSpace: true } : {}),
+		blocks: 1,
+		...(asOf === undefined ? { keepSpace: true } : {}),
 	});
 	const view = query.data;
 	// The read is of the focused block (not a previous one kept while it loads).
@@ -292,23 +324,12 @@ function SurfaceBody({
 		seenStates.add(viewState);
 		viewState.view = lastView.current;
 	}
-	const [foldVersion, bumpFold] = useReducer((n: number) => n + 1, 0);
 	useEffect(
 		() =>
 			viewState?.on((part) => {
-				if (part === "collapsed" || part === "stored") bumpFold();
 				if (part === "view") lastView.current = viewState.view;
 			}),
 		[viewState],
-	);
-	// The reader's folding as the read-only tree takes it: a new object when it changed.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: foldVersion says the sets changed
-	const fold = useMemo<FoldView>(
-		() => ({
-			expanded: new Set(viewState?.expanded ?? []),
-			collapsed: new Set(viewState?.collapsed ?? []),
-		}),
-		[viewState, foldVersion],
 	);
 	useOutlineViewStateSync(pageId, viewState);
 	// Who wrote the live page's subagent reports (the editor names the containers it holds).
@@ -354,12 +375,9 @@ function SurfaceBody({
 	const [focusInfo, setFocusInfo] = useState<OutlineFocusInfo | null>(null);
 	const switcher = useRef<QuickSwitcherHandle | null>(null);
 	const openSwitcher = useCallback(() => switcher.current?.open(), []);
-	const onFold = useCallback(
-		(tree: FoldTree, action: FoldAction) => {
-			viewState?.fold(tree, action);
-		},
-		[viewState],
-	);
+	// A double click on a row's text of the forest: edit there (the editor opens on the block
+	// focused; L6 puts the cursor in the row).
+	const onEditRow = useCallback(() => setReading(false), []);
 
 	const mobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const { ref: surfaceRef, width } = useElementSize();
@@ -481,6 +499,12 @@ function SurfaceBody({
 	const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
 		if (event.defaultPrevented || event.altKey) return;
 		const mod = event.metaKey || event.ctrlKey;
+		// F2 enters editing from reading (D58).
+		if (!mod && event.key === "F2" && !event.shiftKey && reading && asOf === undefined) {
+			event.preventDefault();
+			setReading(false);
+			return;
+		}
 		if (!mod) return;
 		if (!event.shiftKey && event.key.toLowerCase() === "k") {
 			event.preventDefault();
@@ -556,13 +580,20 @@ function SurfaceBody({
 				<div className={classes.toolbar}>
 					<OutlineBreadcrumbs view={view} search={linkSearch} path={crumbPath} />
 					<Group gap="xs" wrap="nowrap">
-						<OutlineLocateLink
-							view={view}
-							path={crumbPath}
-							host={layout}
-							blockId={blockId}
-							title={rootTitle}
-						/>
+						<OutlineLocateLink spaceId={view.space.id} host={layout} blockId={blockId} />
+						{asOf === undefined && fallback === null && (
+							<Button
+								size="compact-xs"
+								variant={reading ? "light" : "subtle"}
+								color={reading ? "indigo" : "gray"}
+								leftSection={reading ? <IconPencil size={14} /> : <IconCheck size={14} />}
+								onClick={() => setReading(!reading)}
+								title={reading ? t("forest.editHint") : t("forest.doneHint")}
+								data-testid={reading ? "outline-enter-edit" : "outline-leave-edit"}
+							>
+								{t(reading ? "forest.edit" : "forest.done")}
+							</Button>
+						)}
 						{history && (
 							<Group gap={2} wrap="nowrap">
 								<Tooltip label={t("history.back")}>
@@ -632,11 +663,6 @@ function SurfaceBody({
 						</Button>
 					</Alert>
 				)}
-				{view.pageTruncated && (
-					<Alert variant="light" color="yellow" py={6}>
-						{t("page.truncated")}
-					</Alert>
-				)}
 
 				<div className={`${classes.body} ${showSide && !compact ? classes.bodyWithSide : ""}`}>
 					<Box className={classes.main}>
@@ -688,7 +714,7 @@ function SurfaceBody({
 							<>
 								{/* Typing of this tab that did not reach the page (the editor shows it live). */}
 								<UnsavedTextsNotice pageId={view.pageId} />
-								{/* The page title: the conversation's h3, as in the live editor. */}
+								{/* The focused block's title: the conversation's h3, as in the live editor. */}
 								<Group
 									gap={6}
 									wrap="nowrap"
@@ -706,12 +732,12 @@ function SurfaceBody({
 										<OutlineBlockBody content={root.content} />
 									</Box>
 								)}
-								<OutlineBlockTree
-									view={view}
-									fold={fold}
-									search={linkSearch}
-									onFold={onFold}
-									onOpenQuestions={openQuestionForm}
+								<OutlineForest
+									root={{ kind: "block", spaceId, blockId, view: mode, asOf }}
+									host={layout}
+									onForest={setForest}
+									onEdit={asOf === undefined && fallback === null ? onEditRow : undefined}
+									live={onScreen}
 								/>
 							</>
 						)}
@@ -720,10 +746,10 @@ function SurfaceBody({
 						{settled && view.current && asOf === undefined && (
 							<OutlineQuestionsSection view={view} hideQuestionTitle={!!root.question} />
 						)}
-						{view.view === "facts" && (editing ? hiddenLive : view.hiddenByView) > 0 && (
+						{view.view === "facts" && (editing ? hiddenLive : hiddenRead) > 0 && (
 							<Text size="xs" c="dimmed" mt="sm">
 								{t("page.processHidden", {
-									count: editing ? hiddenLive : view.hiddenByView,
+									count: editing ? hiddenLive : hiddenRead,
 								})}{" "}
 								<Button size="compact-xs" variant="subtle" onClick={() => go({ view: "all" })}>
 									{t("page.showAll")}

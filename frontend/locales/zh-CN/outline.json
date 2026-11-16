@@ -2,7 +2,7 @@
 	"title": "大纲",
 	"subtitle": "用大纲记下项目、会话和个人的笔记、结论与计划。",
 	"unavailable": "此服务器没有开启大纲功能。",
-	"notFound": "这一页不存在，或者你没有权限查看。",
+	"notFound": "它不存在，或者你没有权限查看。",
 	"notAtTime": "历史上的这个时间点还没有这个块。",
 	"loadFailed": "加载失败，请稍后再试。",
 	"loadMore": "加载更多",
@@ -11,7 +11,7 @@
 		"noResults": "没有匹配的内容。",
 		"process": "过程",
 		"recent": "最近访问",
-		"noRecent": "打开过的页面会出现在这里。",
+		"noRecent": "打开过的内容会出现在这里。",
 		"spaces": "空间",
 		"noSpaces": "还没有空间。"
 	},
@@ -59,8 +59,6 @@
 		"hiddenUnderHint": "这个块下面只有已完成或已取消的任务，事实视图不显示它们；切到“全部”查看。",
 		"more_one": "… 还有 {{count}} 项",
 		"more_other": "… 还有 {{count}} 项",
-		"moreAtRoot_one": "… 还有 {{count}} 个块放不下，请聚焦到其中一部分。",
-		"moreAtRoot_other": "… 还有 {{count}} 个块放不下，请聚焦到其中一部分。",
 		"factsEmpty": "这里只有任务和进展。切到「全部」可以看到。",
 		"empty": "这个块下面还没有内容。",
 		"view": {
@@ -71,7 +69,6 @@
 		"sidePanel": "反链与历史",
 		"asOfBanner": "正在查看提交 #{{seq}} 时的页面（只读）。",
 		"backToCurrent": "回到现在",
-		"truncated": "这一页太大，无法一次读完；请聚焦到其中一部分。",
 		"processHidden_one": "任务下的 {{count}} 个块没有显示。",
 		"processHidden_other": "任务下的 {{count}} 个块没有显示。",
 		"showAll": "显示全部",
@@ -216,14 +213,14 @@
 		"label": "找一个块跳过去",
 		"empty": "没有匹配的块。",
 		"noRecent": "聚焦过的块会出现在这里。",
-		"searching": "正在搜其他页…",
+		"searching": "正在搜其余内容…",
 		"via": {
 			"title": "标题",
 			"alias": "别名",
 			"body": "正文",
 			"recent": "最近"
 		},
-		"thisPage": "这一页",
+		"thisPage": "已加载的内容",
 		"otherSpace": "其他空间"
 	},
 	"history": {
@@ -234,22 +231,22 @@
 		"notFound": "这个大纲链接指向的内容不存在，或你无权阅读。"
 	},
 	"panel": {
-		"openPage": "在大纲页打开"
+		"openPage": "在大纲里打开"
 	},
 	"dock": {
 		"sessions": "会话",
 		"recentSessions": "这个空间最近的会话",
 		"noSessions": "这里还没有会话。",
-		"discuss": "在会话里讨论这一页",
-		"discussTitle": "在会话里讨论这一页",
-		"discussHint": "会在会话的输入框里放入这一页的链接。",
+		"discuss": "在会话里讨论这里",
+		"discussTitle": "在会话里讨论这里",
+		"discussHint": "会在会话的输入框里放入这里的链接。",
 		"newSession": "新建会话…"
 	},
 	"workspace": {
-		"addTitle": "添加大纲页"
+		"addTitle": "添加大纲"
 	},
 	"crumbs": {
-		"label": "这一页的位置",
+		"label": "这里的位置",
 		"more_one": "还有 {{count}} 层",
 		"more_other": "还有 {{count}} 层"
 	},
@@ -550,8 +547,8 @@
 		"olderFailed": "更早的汇报没能读取。",
 		"retry": "重试",
 		"dayWithItems": "{{day}}（{{items}}）",
-		"moreOnPage_one": "还有 {{count}} 份在汇报页上",
-		"moreOnPage_other": "还有 {{count}} 份在汇报页上",
+		"moreOnPage_one": "还有 {{count}} 份在汇报里",
+		"moreOnPage_other": "还有 {{count}} 份在汇报里",
 		"inboxFailed": "汇报没能显示出来。",
 		"upTo": "{{day}}（截至 {{time}}）"
 	},
@@ -715,7 +712,7 @@
 		}
 	},
 	"tree": {
-		"hint": "箭头就地展开阅读；点页标题打开这一页编辑。",
+		"hint": "箭头就地展开阅读；点块前的圆点聚焦到它。",
 		"collapseAll": "全部收起",
 		"recent": "最近访问（{{count}}）",
 		"sessions": "会话（{{count}}）",
@@ -723,14 +720,10 @@
 		"loose": "不属于项目的会话（{{count}}）",
 		"orphaned": "已失效的空间（{{count}}）",
 		"noSessions": "没有你能查看的会话。",
-		"noPages": "还没有页面。",
 		"moreSpaces_one": "还有 {{count}} 个 ▸",
 		"moreSpaces_other": "还有 {{count}} 个 ▸",
 		"moreProjects": "更多项目 ▸",
 		"gone": "已不可查看。",
-		"partial_one": "这里只显示这一页的前 {{count}} 块。",
-		"partial_other": "这里只显示这一页的前 {{count}} 块。",
-		"openPage": "打开这一页",
 		"waiting": "等你回答 {{n}}",
 		"waitingLabel_one": "{{count}} 个提问等你回答",
 		"waitingLabel_other": "{{count}} 个提问等你回答",
@@ -743,7 +736,7 @@
 			"finished": "已完成：{{text}}"
 		},
 		"locate": "在大纲树里定位",
-		"locateFailed": "没能在树里定位到它：它可能已经不在，或者超出了这一页一次读取的范围。",
+		"locateFailed": "没能在树里定位到它：它可能已经不在，或者你看不到它所在的地方。",
 		"dismiss": "知道了",
 		"search": {
 			"label": "搜索结果",
@@ -752,5 +745,24 @@
 			"more": "更多匹配 ▸",
 			"untitled": "无标题"
 		}
+	},
+	"forest": {
+		"empty": "这里还没有内容。",
+		"load": "显示里面的内容",
+		"retry": "重试",
+		"next": "后面的 ▸",
+		"prev": "◂ 前面的",
+		"paged": "正在显示第 {{from}}–{{to}} 条。这一层太长，分段显示。",
+		"reportAll": "展开全文 ▸",
+		"pinned": "定位到这里",
+		"pinnedHint": "这一层很长，它不在当前显示的这一段里；因为你定位的内容在它下面，所以显示在这里。",
+		"changedSelf": "自你上次查看以来有改动",
+		"changedBelow": "自你上次查看以来里面有改动",
+		"inProgressHint": "这个块下面有未完成的任务；聚焦到它查看。",
+		"historyUnavailable": "无法显示那个时刻的内容：历史从更晚的时候开始，或者还在准备中。",
+		"edit": "编辑",
+		"done": "完成",
+		"editHint": "在这里编辑（F2，或双击一行文字）",
+		"doneHint": "回到阅读"
 	}
 }

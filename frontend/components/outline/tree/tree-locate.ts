@@ -1,10 +1,10 @@
 /**
- * "Locate in the tree" (readability F): bring a block on screen in the connected outline by
- * opening what it is under — its space's place in the tree, its page, its ancestors — and
- * scrolling to it.
+ * "Locate in the tree" (readability F): bring a block on screen in the forest by opening what
+ * it is under — its space's place in the tree, then its ancestors (the space's own block list
+ * does that, `forest/ForestBlocks.tsx`) — and scrolling to it.
  *
  * A request comes from a search hit (the tree is on screen: its host hands it over), or from a
- * focused page (the reader is taken to the tree: the request waits here, per host, for the tree
+ * focused block (the reader is taken to the tree: the request waits here, per host, for the tree
  * that mounts next, and is dropped when none does within {@link LOCATE_PENDING_MS}).
  *
  * The node keys to open are worked out here ({@link locateKeys}); a row the tree's lists have
@@ -16,13 +16,8 @@ import type { TreeHost } from "./tree-open-state";
 
 export interface TreeLocateTarget {
 	spaceId: string;
-	pageId: string;
-	/** The block to show; the page's own id for the page itself. */
+	/** The block to show (its ancestors are read when it is located). */
 	blockId: string;
-	/** The block's ancestors, the page first (none for a page). */
-	pathIds: readonly string[];
-	/** The page's title, for its row when the tree has not listed it yet. */
-	pageTitle: string;
 	/** The block is a question for the reader: once shown, its answer form opens in the tree. */
 	answer?: boolean;
 }
@@ -52,7 +47,7 @@ export type LocateSpace = Pick<
 >;
 
 export interface LocatePlan {
-	/** Node keys to open, outermost first; the page's last. */
+	/** Node keys to open, outermost first; the space's own last (none for the tree's root). */
 	keys: string[];
 	/**
 	 * The list the space's own row is in, should it need pinning there: `root` (a project at the
@@ -61,13 +56,13 @@ export interface LocatePlan {
 	pinIn: string | null;
 	/**
 	 * The session's project space must be pinned at the tree's root too: the root lists projects
-	 * a page at a time, and the session's may be past what it has loaded.
+	 * a list page at a time, and the session's may be past what it has loaded.
 	 */
 	pinParentAtRoot: boolean;
 }
 
 /**
- * The nodes to open for a page of `space`, in a tree rooted at the whole outline (`root` null)
+ * The nodes to open for a block of `space`, in a tree rooted at the whole outline (`root` null)
  * or at one space. `parent`: the project space a session hangs under, with that project's id
  * (null: the session is under none the reader may read). Null when the tree cannot show it (a
  * tree rooted at another space).
@@ -75,32 +70,30 @@ export interface LocatePlan {
 export function locateKeys(
 	space: LocateSpace,
 	parent: { spaceId: string; projectId: string } | null,
-	pageId: string,
 	root: { spaceId: string; projectId: string | null } | null,
 ): LocatePlan | null {
-	const page = `page:${pageId}`;
 	if (root) {
-		if (root.spaceId === space.id) return { keys: [page], pinIn: null, pinParentAtRoot: false };
+		if (root.spaceId === space.id) return { keys: [], pinIn: null, pinParentAtRoot: false };
 		// A session of the project the tree is rooted at.
 		if (space.kind === "session" && parent && parent.spaceId === root.spaceId) {
 			const group = `group:sessions:${parent.projectId}`;
-			return { keys: [group, `space:${space.id}`, page], pinIn: group, pinParentAtRoot: false };
+			return { keys: [group, `space:${space.id}`], pinIn: group, pinParentAtRoot: false };
 		}
 		return null;
 	}
 	const own = `space:${space.id}`;
 	if (space.orphaned)
-		return { keys: ["group:orphaned", own, page], pinIn: "group:orphaned", pinParentAtRoot: false };
+		return { keys: ["group:orphaned", own], pinIn: "group:orphaned", pinParentAtRoot: false };
 	if (space.kind === "personal")
-		return space.mine ? { keys: [own, page], pinIn: null, pinParentAtRoot: false } : null;
-	if (space.kind === "project") return { keys: [own, page], pinIn: "root", pinParentAtRoot: false };
+		return space.mine ? { keys: [own], pinIn: null, pinParentAtRoot: false } : null;
+	if (space.kind === "project") return { keys: [own], pinIn: "root", pinParentAtRoot: false };
 	if (parent) {
 		const group = `group:sessions:${parent.projectId}`;
 		return {
-			keys: [`space:${parent.spaceId}`, group, own, page],
+			keys: [`space:${parent.spaceId}`, group, own],
 			pinIn: group,
 			pinParentAtRoot: true,
 		};
 	}
-	return { keys: ["group:loose", own, page], pinIn: "group:loose", pinParentAtRoot: false };
+	return { keys: ["group:loose", own], pinIn: "group:loose", pinParentAtRoot: false };
 }
