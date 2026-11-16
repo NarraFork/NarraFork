@@ -120,6 +120,8 @@ export const OUTLINE_AGENT_READ_LIMITS = {
 	levelReads: 6,
 	/** Spaces a search of every readable space covers. */
 	searchAllSpaces: 100,
+	/** Notes on how to continue a level past hidden tasks and questions, per read. */
+	resumeNotes: 3,
 };
 
 /** The address that reads the overview of every space the session may read. */
@@ -199,6 +201,11 @@ interface LoadedTree {
 	open: Set<string | null>;
 	/** Tasks and questions the facts view left out of the levels read. */
 	processHidden: number;
+	/**
+	 * Levels that continue after a child the view left out (`resumeAfter` of the reads), by
+	 * parent (`null`: the tree's top level): that child's sid, which `after` names.
+	 */
+	resumeAfter: Map<string | null, string>;
 }
 
 type TreePart = OutlineReadNodes<{
@@ -230,8 +237,14 @@ function linkTree(parts: readonly TreePart[], top: string | null | undefined): L
 	const tops: OutlineNode[] = [];
 	const open = new Set<string | null>();
 	const looked = new Set<string | null>();
+	const resumeAfter = new Map<string | null, string>();
 	let processHidden = 0;
 	for (const part of parts) {
+		for (const entry of part.resumeAfter ?? []) {
+			const parent = entry.parentId === null ? undefined : nodes.get(entry.parentId);
+			const isTop = top !== undefined && entry.parentId === top;
+			if (parent || isTop) resumeAfter.set(parent ? entry.parentId : null, entry.sid);
+		}
 		for (const level of part.read.levels) {
 			const parent = level.parentId === null ? undefined : nodes.get(level.parentId);
 			const isTop = top !== undefined && level.parentId === top;
@@ -251,7 +264,7 @@ function linkTree(parts: readonly TreePart[], top: string | null | undefined): L
 		}
 	}
 	for (const id of withChildren) if (!looked.has(id)) open.add(id);
-	return { nodes, tops, open, processHidden };
+	return { nodes, tops, open, processHidden, resumeAfter };
 }
 
 /** What a read shows of a loaded tree: one root, or the blocks of a level. */
@@ -283,6 +296,8 @@ async function showTree(
 		reportsOf: string | null;
 		/** The block read: changes waiting for this session anywhere in its top-level block are listed. */
 		forYouUnder: string;
+		/** The address of the block whose children are the tree's top level (a level continued). */
+		topAddress: string;
 	},
 ): Promise<Shown> {
 	const { state } = args;
@@ -337,7 +352,24 @@ async function showTree(
 		const version = seen.get(id);
 		return version === undefined || added?.has(id) ? [] : [[id, version] as const];
 	});
-	return { rendered, notes: (pending?.notes ?? []).map(note), reads };
+	// Levels whose store rows ran out among tasks and questions the view leaves out: how to go
+	// on, by the last of them (no child shown names the place).
+	const address = scope.addressIn(space);
+	const shownIds = new Set(rendered.blockIds);
+	const resume = [...tree.resumeAfter]
+		.flatMap(([parentId, sid]) => {
+			if (parentId === null) return [OUTLINE_TOOL_TEXT.resumeAfter(args.topAddress, address(sid))];
+			const parent = tree.nodes.get(parentId);
+			return parent && shownIds.has(parentId)
+				? [OUTLINE_TOOL_TEXT.resumeAfter(address(parent.sid), address(sid))]
+				: [];
+		})
+		.slice(0, OUTLINE_AGENT_READ_LIMITS.resumeNotes);
+	return {
+		rendered,
+		notes: [...resume, ...(pending?.notes ?? [])].map(note),
+		reads,
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -943,6 +975,7 @@ export async function outlineRead(
 			lockedAbove: got.lockedAbove,
 			reportsOf: block.id,
 			forYouUnder: block.id,
+			topAddress: block.address,
 		});
 	} else {
 		const cursor = await levelCursor(scope, space, block, after, asOf);
@@ -958,6 +991,7 @@ export async function outlineRead(
 			lockedAbove: [...got.lockedAbove, ...(root?.task?.lock ? [block.id] : [])],
 			reportsOf: null,
 			forYouUnder: block.id,
+			topAddress: block.address,
 		});
 	}
 	const { rendered } = shown;

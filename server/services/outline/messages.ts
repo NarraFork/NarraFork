@@ -217,6 +217,9 @@ export const OUTLINE_TOOL_TEXT = {
 		"after continues one level: give it with the address of the block whose children you are reading (or key/ for a space's top level).",
 	afterNotUnder: (after: string, parent: string) =>
 		`${quoted(after)} is not a block directly under ${parent}. after names the last child of ${parent} a read showed; the read continues after it. It may have moved or been deleted since that read: read ${parent} again and continue from what it shows.`,
+	/** A level whose read ran out among tasks and questions the facts view leaves out. */
+	resumeAfter: (parent: string, after: string) =>
+		`the blocks under ${parent} go on after ${after}, a task or question this view leaves out: OutlineRead { address: "${parent}", after: "${after}" }`,
 	nothingAfter: "nothing after it: this level ends here",
 	writeHint:
 		"to write, use OutlineEdit (if it is not in your tool list, load it with /load OutlineEdit)",

@@ -561,6 +561,95 @@ describe("equivalence with reads by page, and what a read costs", () => {
 		console.log(`[agent-pageless] characters per read, before and now:\n${rows.join("\n")}`);
 	});
 
+	test("tasks before facts cost the facts view nothing: at least as many facts as by page", async () => {
+		const w = await world();
+		// A level of 30 tasks (one child each), then 30 facts (one detail each).
+		const ops: OutlineOp[] = [{ op: "insert", tempId: "p", parent: null, content: "Parent" }];
+		for (let i = 0; i < 30; i++) {
+			ops.push({
+				op: "insert",
+				tempId: `t${i}`,
+				parent: { tempId: "p" },
+				content: `Task ${i}`,
+				task: { status: "todo" },
+			});
+			ops.push({ op: "insert", parent: { tempId: `t${i}` }, content: `under task ${i}` });
+		}
+		const made = await humanWrite(w.space, w.alice, ops);
+		const parentId = made.results[0]?.blockId as string;
+		const facts: OutlineOp[] = [];
+		for (let i = 0; i < 30; i++) {
+			facts.push({ op: "insert", tempId: `f${i}`, parent: { id: parentId }, content: `Fact ${i}` });
+			facts.push({ op: "insert", parent: { tempId: `f${i}` }, content: `detail ${i}` });
+		}
+		await humanWrite(w.space, w.alice, facts);
+		const sid = (await outlineStore.getBlock(parentId))?.sid as string;
+		const count = (text: string) => ({
+			facts: (text.match(/\] Fact \d+/g) ?? []).length,
+			details: (text.match(/\] detail \d+/g) ?? []).length,
+		});
+		const label = (node: { sid: string }) => `[${node.sid}]`;
+		for (const budget of [10, 30, 45, 80, 200]) {
+			const before = await readOutline({
+				blockId: parentId,
+				view: "facts",
+				budget: { blocks: budget },
+				label,
+			});
+			const was = count(before?.markdown ?? "");
+			const now = count((await call(outlineReadTool, { address: sid, budget }, w.c)).output);
+			expect({
+				budget,
+				facts: now.facts >= was.facts,
+				details: now.details >= was.details,
+			}).toEqual({ budget, facts: true, details: true });
+			expect(now.facts).toBeGreaterThan(0);
+		}
+		// The default budget shows every fact and every detail, as by page.
+		expect(count((await call(outlineReadTool, { address: sid }, w.c)).output)).toEqual({
+			facts: 30,
+			details: 30,
+		});
+	});
+
+	test("more hidden tasks than one read takes: the read says where to go on, and the facts are reached", async () => {
+		const w = await world();
+		const [parentId] = (
+			await humanWrite(w.space, w.alice, [{ op: "insert", parent: null, content: "Long" }])
+		).results.map((r) => r.blockId as string);
+		for (let i = 0; i < 850; i += 170) {
+			await humanWrite(
+				w.space,
+				w.alice,
+				Array.from({ length: 170 }, (_, k) => ({
+					op: "insert" as const,
+					parent: { id: parentId as string },
+					content: `Task ${i + k}`,
+					task: { status: "todo" as const },
+				})),
+			);
+		}
+		await humanWrite(
+			w.space,
+			w.alice,
+			Array.from({ length: 5 }, (_, k) => ({
+				op: "insert" as const,
+				parent: { id: parentId as string },
+				content: `Fact ${k}`,
+			})),
+		);
+		const sid = (await outlineStore.getBlock(parentId as string))?.sid as string;
+		const first = await call(outlineReadTool, { address: sid }, w.c);
+		expect(first.output).not.toMatch(/\] Fact \d/);
+		const resume = /OutlineRead \{ address: "([^"]+)", after: "([^"]+)" \}/.exec(first.output);
+		expect(resume).not.toBeNull();
+		expect(resume?.[1]).toBe(sid);
+		// The cursor is a task the view left out; continuing from it reaches the facts.
+		const next = await call(outlineReadTool, { address: sid, after: resume?.[2] }, w.c);
+		expect(next.isError).toBeUndefined();
+		expect((next.output.match(/\] Fact \d/g) ?? []).length).toBe(5);
+	});
+
 	test("outputs stay bounded whatever is under the block", async () => {
 		const w = await world();
 		const [root] = (

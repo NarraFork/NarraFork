@@ -34,7 +34,10 @@
  *
  * THE FACTS VIEW leaves tasks and questions out, and with them what is under them
  * (`tree.ts`); each level says how many it left out. A root that is process, or under it, is
- * read whole whatever was asked.
+ * read whole whatever was asked. What it leaves out costs the budget of blocks shown nothing
+ * (a level of many tasks before its facts still shows the facts): it reads as far as the
+ * call's 800 store rows go, and where they run out among hidden rows the level continues after
+ * the last row read (`nextCursor`, and `resumeAfter` for readers that continue by a child).
  *
  * FOLDED READS (`fold`)
  * ---------------------
@@ -95,6 +98,32 @@ function clamp(value: number | undefined, fallback: number, max: number): number
 
 function isProcess(row: OutlineLevelRow): boolean {
 	return row.taskJson !== null || !!row.askJson;
+}
+
+/** The view shows the row (the facts view leaves tasks and questions out). */
+function shows(view: OutlineViewMode, row: OutlineLevelRow): boolean {
+	return view === "all" || !isProcess(row);
+}
+
+/**
+ * How many of `rows` (at most `max`) a read keeps so that it shows at most `shown` of them: up
+ * to just before the row that would be one too many, the rows the view leaves out on the way
+ * included (they cost the budget nothing; a continuation goes on after them).
+ */
+function keepForShown(
+	rows: readonly OutlineLevelRow[],
+	max: number,
+	shown: number,
+	view: OutlineViewMode,
+): number {
+	let count = 0;
+	const end = Math.min(max, rows.length);
+	for (let i = 0; i < end; i++) {
+		if (!shows(view, rows[i] as OutlineLevelRow)) continue;
+		if (count === shown) return i;
+		count++;
+	}
+	return end;
 }
 
 function questionMark(ask: OutlineAskJson): OutlineQuestionMark {
@@ -199,31 +228,34 @@ function draftOf(
 }
 
 /**
- * The children of several parents from their beginnings, at most `limit` rows in all: one
- * store read (`listLevels`), split by parent. The read asks for one row more than it returns
- * (within what the call may still take, `rowsLeft`), so it knows whether the parent the limit ended in has
- * more children or the limit fell exactly between two parents. Parents the limit did not
- * reach come back as unread drafts (`more`, no rows).
+ * The children of several parents from their beginnings, at most `limit` of them SHOWN: one
+ * store read (`listLevels`), split by parent. Rows the view leaves out (the facts view's tasks
+ * and questions) cost `limit` nothing, only the call's store rows (`rowsLeft`): the facts view
+ * asks for all the rows the call may still take, the all view for one more than it can show.
+ * The read takes one row more than it returns, so it knows whether the parent the limit ended
+ * in has more children or the limit fell exactly between two parents. Parents the limit did not
+ * reach come back as unread drafts (`more`, no rows). `shown`: the rows returned that the view
+ * shows.
  */
 async function readLevelsFromStart(
 	ctx: ReadContext,
 	parentIds: readonly (string | null)[],
 	limit: number,
 	view: OutlineViewMode,
-): Promise<{ drafts: LevelDraft[]; read: number }> {
-	const asked = Math.min(limit + 1, ctx.rowsLeft);
+): Promise<{ drafts: LevelDraft[]; shown: number }> {
+	const asked = view === "all" ? Math.min(limit + 1, ctx.rowsLeft) : ctx.rowsLeft;
 	if (asked <= 0) {
 		return {
 			drafts: [...new Set(parentIds)].map((parentId) => draftOf(parentId, [], true, view, null)),
-			read: 0,
+			shown: 0,
 		};
 	}
-	const usable = Math.min(limit, asked - 1);
 	const found = await ctx.store.listLevels(ctx.space.id, parentIds, {
 		asOf: ctx.asOf,
 		limit: asked,
 	});
 	ctx.rowsLeft -= found.rows.length;
+	const usable = keepForShown(found.rows, asked - 1, limit, view);
 	const rows = found.rows.slice(0, usable);
 	/** The first row past what is returned: its parent is where the limit ended. */
 	const peek = found.rows[usable];
@@ -235,19 +267,21 @@ async function readLevelsFromStart(
 	}
 	const drafts: LevelDraft[] = [];
 	// Parents come back in the order given. Before the peeked row's parent every level is
-	// whole; that parent has more; after it nothing was read, unless the store had nothing
-	// more at all (then those parents have no children).
+	// whole; that parent has more; after it nothing is returned: such a parent has children when
+	// the store had more, or when rows of it were read past what is returned.
+	const readPast = new Set(found.rows.slice(usable).map((row) => row.parentId));
 	let state: "whole" | "after" = "whole";
 	for (const parentId of new Set(parentIds)) {
 		const own = byParent.get(parentId) ?? [];
 		if (!peek) drafts.push(draftOf(parentId, own, false, view, null));
-		else if (state === "after") drafts.push(draftOf(parentId, [], found.truncated, view, null));
+		else if (state === "after")
+			drafts.push(draftOf(parentId, [], found.truncated || readPast.has(parentId), view, null));
 		else if (parentId === peek.parentId) {
 			drafts.push(draftOf(parentId, own, true, view, null));
 			state = "after";
 		} else drafts.push(draftOf(parentId, own, false, view, null));
 	}
-	return { drafts, read: rows.length };
+	return { drafts, shown: rows.filter((row) => shows(view, row)).length };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,6 +297,8 @@ interface Finished {
 	cut: boolean;
 	/** More open changes touch these blocks than one read looks at. */
 	pendingTruncated: boolean;
+	/** See {@link OutlineReadNodes.resumeAfter}. */
+	resumeAfter: OutlineResumeAfter[];
 }
 
 /**
@@ -333,12 +369,16 @@ async function finish(
 		}),
 	);
 	const levels: OutlineTreeLevel[] = [];
+	const resumeAfter: OutlineResumeAfter[] = [];
 	for (const draft of drafts) {
 		// A level whose own parent did not fit is not part of the answer.
 		if (draft.parentId !== null && hasChildren.has(draft.parentId) && !shownIds.has(draft.parentId))
 			continue;
 		const kept = draft.rows.filter((row) => shownIds.has(row.id));
 		const whole = kept.length === draft.rows.length;
+		if (whole && draft.more && draft.last && !shownIds.has(draft.last.id)) {
+			resumeAfter.push({ parentId: draft.parentId, id: draft.last.id, sid: draft.last.sid });
+		}
 		const lastKept = kept.at(-1);
 		// All shown: the level continues after the last row READ (shown or left out by the view).
 		// Cut by bytes: after the last row shown, or where this read started.
@@ -363,6 +403,7 @@ async function finish(
 		levels,
 		cut: shown.length < order.length,
 		pendingTruncated: pending.truncated,
+		resumeAfter,
 	};
 }
 
@@ -415,7 +456,10 @@ export interface OutlineLevelsRequest {
 	parents: ReadonlyArray<{ parentId: string | null; cursor?: string | null }>;
 	/** Commit seq of the space to read as of; the current state when omitted. */
 	asOf?: number;
-	/** Blocks in all (default 200, at most 800). */
+	/**
+	 * Blocks shown in all (default 200, at most 800); rows the view leaves out do not count, the
+	 * call reads at most 800 store rows.
+	 */
 	limit?: number;
 	/** Children of one parent at most; unlimited (within `limit`) when omitted. */
 	perParent?: number;
@@ -441,6 +485,19 @@ export interface OutlineReadNodes<Read> {
 	nodes: OutlineNode[];
 	/** Locked tasks above what was read (ancestors of the root, or of the parents asked for). */
 	lockedAbove: string[];
+	/** See {@link OutlineResumeAfter}. */
+	resumeAfter: OutlineResumeAfter[];
+}
+
+/**
+ * A level that continues after a row the view left out (the store rows of the call ran out among
+ * tasks and questions the facts view hides): its `nextCursor` is that row, which no shown child
+ * names. A reader that continues by naming a child (the agent's `after`) names this one.
+ */
+export interface OutlineResumeAfter {
+	parentId: string | null;
+	id: string;
+	sid: string;
 }
 
 /**
@@ -501,19 +558,25 @@ export async function readOutlineLevelsNodes(
 			let room = limit;
 			for (const parent of parents) {
 				const startCursor = parent.cursor ?? null;
-				const take = Math.min(room, perParent ?? room, ctx.rowsLeft);
-				if (take <= 0) {
+				const want = Math.min(room, perParent ?? room);
+				// Rows the view leaves out cost `room` nothing: the facts view reads as far as the
+				// call's store rows go and keeps what shows `want` of them.
+				const take = view === "all" ? Math.min(want, ctx.rowsLeft) : ctx.rowsLeft;
+				if (want <= 0 || take <= 0) {
 					drafts.push(draftOf(parent.parentId, [], true, view, startCursor));
 					continue;
 				}
-				const { rows, next } = await store.listLevel(space.id, parent.parentId, {
+				const found = await store.listLevel(space.id, parent.parentId, {
 					asOf: ctx.asOf,
 					after: startCursor ? decodeOutlineLevelCursor(startCursor) : null,
 					limit: take,
 				});
-				room -= rows.length;
-				ctx.rowsLeft -= rows.length;
-				drafts.push(draftOf(parent.parentId, rows, next !== null, view, startCursor));
+				ctx.rowsLeft -= found.rows.length;
+				const keep = keepForShown(found.rows, found.rows.length, want, view);
+				const rows = found.rows.slice(0, keep);
+				room -= rows.filter((row) => shows(view, row)).length;
+				const more = keep < found.rows.length || found.next !== null;
+				drafts.push(draftOf(parent.parentId, rows, more, view, startCursor));
 			}
 		}
 		const order = drafts.flatMap((draft) => draft.rows);
@@ -538,6 +601,7 @@ export async function readOutlineLevelsNodes(
 			},
 			nodes: done.shown,
 			lockedAbove,
+			resumeAfter: done.resumeAfter,
 		};
 	});
 }
@@ -643,7 +707,11 @@ export interface OutlineSubtreeRequest {
 	rootId: string | null;
 	/** Commit seq of the space to read as of; the current state when omitted. */
 	asOf?: number;
-	/** Blocks (default 400, at most 800, the root included) and bytes of content. */
+	/**
+	 * Blocks SHOWN (default 400, at most 800, the root included) and bytes of content. Rows the
+	 * view leaves out cost the budget nothing; the call reads at most 800 store rows whatever
+	 * the view, and where those run out first the levels say `more` from the last row read.
+	 */
 	budget?: { blocks?: number; bytes?: number };
 	/** Default `facts`. */
 	view?: OutlineViewMode;
@@ -765,7 +833,7 @@ export async function readOutlineSubtreeNodes(
 				break;
 			}
 			const level = await readLevelsFromStart(ctx, frontier, room, view);
-			room -= level.read;
+			room -= level.shown;
 			const next: string[] = [];
 			for (const draft of level.drafts) {
 				drafts.push(draft);
@@ -829,6 +897,7 @@ export async function readOutlineSubtreeNodes(
 			},
 			nodes: done.shown,
 			lockedAbove: located.lockedAbove,
+			resumeAfter: done.resumeAfter,
 		};
 	});
 }
