@@ -34,6 +34,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useOutlineQuestions } from "../../../hooks/useOutline";
 import { api } from "../../../lib/api";
 import { REMOTE_BUILD } from "../../../lib/build-target";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
@@ -129,9 +130,7 @@ const defaultIO: ForestIO = {
 	children: (spaceId, params) => api.getOutlineChildren(spaceId, params),
 	marks: (spaceId, keys, since) => api.getOutlineMarks(spaceId, keys, since),
 	getFold: (spaceId) => api.getOutlineFoldState(spaceId),
-	putFold: (spaceId, changes, keepalive) =>
-		api.putOutlineFoldState(spaceId, { changes }, keepalive),
-	resetFold: (spaceId, under, keepalive) => api.resetOutlineFoldState(spaceId, under, keepalive),
+	putFold: (spaceId, body, keepalive) => api.putOutlineFoldState(spaceId, body, keepalive),
 	openTasks: (spaceId, under, cursor) => api.getOutlineOpenTasks(spaceId, under, cursor),
 };
 
@@ -442,6 +441,8 @@ const BlockRowView = memo(function BlockRowView({
 											if (plainClick(e)) onQuestions(id);
 										}}
 										onKeyDown={ownKeys(() => onQuestions(id))}
+										// Reached by the arrow keys like a row (the tree is one tab stop).
+										data-tree-nav=""
 										{...props}
 									>
 										{count}
@@ -563,7 +564,17 @@ function InProgressMarker({
 		[openTasks, spaceId, blockId],
 	);
 	return (
-		<Popover position="bottom-start" shadow="sm" width={300} opened={opened} onChange={setOpened}>
+		// Opened from the keyboard too (the count is reached by the arrow keys, `data-tree-nav`):
+		// the focus goes into the list, and comes back to the count when it closes.
+		<Popover
+			position="bottom-start"
+			shadow="sm"
+			width={300}
+			opened={opened}
+			onChange={setOpened}
+			trapFocus
+			returnFocus
+		>
 			<Popover.Target>
 				<Badge
 					size="xs"
@@ -576,6 +587,7 @@ function InProgressMarker({
 					aria-label={t("page.inProgressHint")}
 					aria-expanded={opened}
 					data-testid="outline-in-progress"
+					data-tree-nav=""
 					onClick={(e: React.MouseEvent) => {
 						if (!plainClick(e)) return;
 						const next = !opened;
@@ -641,6 +653,21 @@ function InProgressMarker({
 			</Popover.Dropdown>
 		</Popover>
 	);
+}
+
+/**
+ * The answer form shown in the tree under a question: once nothing under its block is left to
+ * answer (the reader answered), it goes (a later question does not bring it back).
+ */
+function TreeQuestions({ under, onDone }: { under: string; onDone: () => void }) {
+	const questions = useOutlineQuestions(under, true);
+	const answered =
+		questions.isSuccess &&
+		(questions.data?.questions ?? []).every((question) => question.state !== "open");
+	useEffect(() => {
+		if (answered) onDone();
+	}, [answered, onDone]);
+	return <OutlineQuestionsForm blockId={under} showOpenLink={false} live={false} />;
 }
 
 function MoreRowView({
@@ -848,6 +875,7 @@ export function ForestBlocks(props: ForestBlocksProps) {
 		[forest],
 	);
 	const onQuestions = useCallback((id: string) => forest?.openQuestions(id), [forest]);
+	const closeForm = useCallback(() => forest?.closeForm(), [forest]);
 	const onMore = useCallback(
 		(parentKey: string, mode: ForestMoreRow["mode"]) => {
 			if (!forest) return;
@@ -1023,7 +1051,7 @@ export function ForestBlocks(props: ForestBlocksProps) {
 					// Its fields keep their tab stops (the tree is otherwise one, `tree-roving.ts`).
 					data-tree-keep=""
 				>
-					<OutlineQuestionsForm blockId={row.under} showOpenLink={false} live={false} />
+					<TreeQuestions under={row.under} onDone={closeForm} />
 				</Paper>
 			);
 		}

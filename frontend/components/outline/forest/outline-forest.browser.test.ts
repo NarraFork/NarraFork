@@ -658,13 +658,16 @@ test("10,000 loaded rows scroll with a bounded DOM", async () => {
 	const measured = await call(page, (f) => f.measureScroll(240));
 	// Marks are asked once per screen, debounced: scrolling past 10,000 rows is a handful of
 	// reads, never one per row or per frame; nothing else is read again.
-	// (The read after the scroll stops is debounced: wait for it, bounded.)
-	const deadline = Date.now() + 5000;
+	// Back to the top, where the chapters' rows are on screen: the marks of what is now in
+	// view are read (once the scroll stops: debounced; waited for, bounded).
+	await call(page, (f) => f.scrollToY(0));
+	const deadline = Date.now() + 10_000;
 	while (!page.requests.slice(before).some((r) => r.includes("/marks")) && Date.now() < deadline)
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	const during = page.requests.slice(before);
 	const marks = during.filter((r) => r.includes("/marks")).length;
 	console.log(`[forest perf] requests while scrolling: ${during.length} (marks ${marks})`);
+	expect(marks).toBeGreaterThanOrEqual(1);
 	expect(marks).toBeLessThanOrEqual(12);
 	expect(during.filter((r) => r.includes("/children") || r.includes("/subtree")).length).toBe(0);
 	console.log(
@@ -984,6 +987,77 @@ test("the tree comes back where the reader left it", async () => {
 		before?.key,
 		before?.top,
 	);
+	await page.browserContext().close();
+}, 90_000);
+
+test("the keyboard reaches a row's counts: 「in progress」 and 「waiting for you」 open from it", async () => {
+	const seeded = await seedAtlas();
+	const page = await openView({
+		target: { kind: "block", spaceId: seeded.race, blockId: seeded.notes, view: "facts" },
+	});
+	await until(page, "the count", (f) => f.count("[data-testid=outline-in-progress]") === 1);
+	expect(await call(page, (f) => f.focusTitle("Refresh flow"))).toBe(true);
+	await page.keyboard.press("ArrowDown");
+	expect(await call(page, (f) => f.activeControl())).toBe("outline-in-progress");
+	await page.keyboard.press("Enter");
+	await until(page, "the list", (f) => f.inProgressItems().length === 3);
+	await page.keyboard.press("Escape");
+	await until(page, "closed", (f) => f.count("[data-testid=outline-in-progress-list]") === 0);
+	expect(await call(page, (f) => f.activeControl())).toBe("outline-in-progress");
+	await page.browserContext().close();
+
+	const home = await openView({ target: { kind: "home" } });
+	await open(home, "Atlas");
+	await until(home, "the sessions group", (f) =>
+		f.rows().some((r) => r.kind === "group" && r.title.startsWith("Sessions")),
+	);
+	const group = (await call(home, (f) => f.rows())).find(
+		(r) => r.kind === "group" && r.title.startsWith("Sessions"),
+	);
+	await open(home, group?.title as string);
+	await until(home, "the session", hasRow, "Fix the refresh race");
+	expect(await call(home, (f) => f.focusTitle("Fix the refresh race"))).toBe(true);
+	await home.keyboard.press("ArrowDown");
+	expect(await call(home, (f) => f.activeControl())).toBe("count:waiting");
+	await home.keyboard.press("Enter");
+	await until(home, "a question located", (f) => f.located() !== null);
+	await until(
+		home,
+		"its answer form",
+		(f) => f.count("[data-testid=outline-tree-questions]") === 1,
+	);
+	await home.browserContext().close();
+}, 90_000);
+
+test("answering in the tree's form closes it; the tree did not leave itself", async () => {
+	await seedAtlas();
+	const page = await openView({ target: { kind: "home" } });
+	await open(page, "Atlas");
+	await until(page, "the sessions group", (f) =>
+		f.rows().some((r) => r.kind === "group" && r.title.startsWith("Sessions")),
+	);
+	const group = (await call(page, (f) => f.rows())).find(
+		(r) => r.kind === "group" && r.title.startsWith("Sessions"),
+	);
+	await open(page, group?.title as string);
+	await until(page, "the waiting count", (f) => f.count("button[data-tree-count=waiting]") === 1);
+	expect(await call(page, (f) => f.click("button[data-tree-count=waiting]"))).toBe(true);
+	await until(
+		page,
+		"the answer form",
+		(f) => f.count("[data-testid=outline-tree-questions] textarea") >= 1,
+	);
+	await call(page, (f) =>
+		f.typeAll("[data-testid=outline-tree-questions] textarea", "The newer one, always"),
+	);
+	await until(
+		page,
+		"submit enabled",
+		(f) => f.count("[data-testid=outline-questions-submit]:not(:disabled)") === 1,
+	);
+	expect(await call(page, (f) => f.click("[data-testid=outline-questions-submit]"))).toBe(true);
+	await until(page, "the form gone", (f) => f.count("[data-testid=outline-tree-questions]") === 0);
+	expect(await call(page, (f) => f.navigated().length)).toBe(0);
 	await page.browserContext().close();
 }, 90_000);
 

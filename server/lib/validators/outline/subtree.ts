@@ -113,12 +113,25 @@ export const outlineSubtreeTimelineQuerySchema = z.object({
 });
 
 /** `PUT /spaces/:spaceId/fold-state` */
-export const outlineFoldStatePutSchema = z.object({
-	changes: z
-		.array(z.object({ blockId: outlineIdSchema, open: z.boolean().nullable() }))
-		.min(1)
-		.max(OUTLINE_FOLD_STATE_LIMITS.maxChanges),
-});
+export const outlineFoldStatePutSchema = z
+	.object({
+		changes: z
+			.array(z.object({ blockId: outlineIdSchema, open: z.boolean().nullable() }))
+			.max(OUTLINE_FOLD_STATE_LIMITS.maxChanges)
+			.default([]),
+		reset: z.array(outlineIdSchema.nullable()).max(OUTLINE_FOLD_STATE_LIMITS.maxResets).optional(),
+		writer: z
+			.string()
+			.regex(/^[A-Za-z0-9_-]{8,64}$/)
+			.optional(),
+		n: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+	})
+	.refine((body) => body.changes.length > 0 || (body.reset?.length ?? 0) > 0, {
+		message: "A write needs changes or resets",
+	})
+	.refine((body) => (body.writer === undefined) === (body.n === undefined), {
+		message: "writer and n go together",
+	});
 
 /** `DELETE /spaces/:spaceId/fold-state` */
 export const outlineFoldStateResetQuerySchema = z.object({

@@ -254,6 +254,8 @@ export const OUTLINE_FOLD_STATE_LIMITS = {
 	maxChanges: 500,
 	/** Bytes of a write's body. */
 	maxBodyBytes: 64 * 1024,
+	/** Resets one write carries at most (applied before its changes). */
+	maxResets: 50,
 } as const;
 
 /** `GET /spaces/:spaceId/fold-state` and the answer of a write. */
@@ -268,6 +270,8 @@ export interface OutlineFoldStateResponse {
 	 * some under the block may still be there.
 	 */
 	incomplete?: true;
+	/** The write was older than one already applied for its writer: nothing was changed. */
+	ignored?: true;
 }
 
 /**
@@ -315,5 +319,18 @@ export interface OutlineOpenTasksResponse {
  * Ids that are not live blocks of the space are dropped silently.
  */
 export interface OutlineFoldStatePutBody {
-	changes: Array<{ blockId: string; open: boolean | null }>;
+	changes?: Array<{ blockId: string; open: boolean | null }>;
+	/**
+	 * Back to the default BEFORE the changes, in the same transaction: null (or the space's
+	 * id) for the whole space, a block for it and everything under it. At most
+	 * `maxResets`. A write needs changes or resets.
+	 */
+	reset?: Array<string | null>;
+	/**
+	 * Who writes (one id per view, 8–64 of `A–Z a–z 0–9 _ -`) and the write's number, rising:
+	 * the server ignores a write numbered at or below one it applied for that writer (the
+	 * answer says `ignored`). Both or neither.
+	 */
+	writer?: string;
+	n?: number;
 }

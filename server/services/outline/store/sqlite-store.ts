@@ -1073,7 +1073,7 @@ export const sqliteOutlineStore: OutlineStore = {
 			.all();
 	},
 
-	async putFoldState(userId, spaceId, changes, updatedAt, keep) {
+	async putFoldState(userId, spaceId, changes, updatedAt, keep, clear) {
 		const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
 		const written = changes.flatMap((change) => (change.open === null ? [] : [change.blockId]));
 		const removed = changes.flatMap((change) => (change.open === null ? [change.blockId] : []));
@@ -1081,6 +1081,15 @@ export const sqliteOutlineStore: OutlineStore = {
 		await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
+					// The resets first, then the changes.
+					if (clear && "all" in clear) tx.delete(outlineFoldState).where(own).run();
+					else if (clear) {
+						for (const chunk of chunked([...new Set(clear.ids)])) {
+							tx.delete(outlineFoldState)
+								.where(and(own, inArray(outlineFoldState.blockId, chunk)))
+								.run();
+						}
+					}
 					for (const chunk of chunked(removed)) {
 						tx.delete(outlineFoldState)
 							.where(and(own, inArray(outlineFoldState.blockId, chunk)))

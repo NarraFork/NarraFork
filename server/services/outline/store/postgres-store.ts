@@ -251,8 +251,16 @@ async function putFoldStateSection(
 	changes: ReadonlyArray<{ blockId: string; open: boolean | null }>,
 	updatedAt: string,
 	keep: number,
+	clear: { all: true } | { ids: readonly string[] } | undefined,
 ): Promise<void> {
 	const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
+	// The resets first, then the changes.
+	if (clear && "all" in clear) await tx.delete(outlineFoldState).where(own);
+	else if (clear) {
+		for (const chunk of chunked([...new Set(clear.ids)])) {
+			await tx.delete(outlineFoldState).where(and(own, inArray(outlineFoldState.blockId, chunk)));
+		}
+	}
 	const writes = changes.filter((change) => change.open !== null);
 	const removed = changes.flatMap((change) => (change.open === null ? [change.blockId] : []));
 	const justWritten = new Set(writes.map((change) => change.blockId));
@@ -1317,11 +1325,11 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				.limit(limit);
 		},
 
-		async putFoldState(userId, spaceId, changes, updatedAt, keep) {
+		async putFoldState(userId, spaceId, changes, updatedAt, keep, clear) {
 			await withPgRetry(
 				() =>
 					db.transaction((tx) =>
-						putFoldStateSection(tx, userId, spaceId, changes, updatedAt, keep),
+						putFoldStateSection(tx, userId, spaceId, changes, updatedAt, keep, clear),
 					),
 				{ label: "outline.putFoldState" },
 			);

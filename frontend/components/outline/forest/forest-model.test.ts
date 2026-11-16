@@ -626,20 +626,29 @@ describe("reconnects, the focused root, a transient deny", () => {
 		const { model, time } = await forest(o, { rootId: "fact" });
 		model.setViewport(0, 50);
 		await time.run();
-		expect(model.watchKeys().subtrees).toContain("fact");
+		// Its own level (its parent's children) is watched, not everything under it.
+		expect(model.watchKeys().levels).toContain("top1");
+		expect(model.watchKeys().subtrees).not.toContain("fact");
 		expect(model.path.map((step) => step.id)).toEqual(["top1"]);
+		// A change below the root does not read the root again.
+		const reads = count(o, "subtree");
+		o.edit("factKid", { content: "edited" });
+		model.onChanged({ seq: o.seq, levels: ["fact"], subtrees: [], all: false });
+		await time.run();
+		expect(count(o, "subtree")).toBe(reads);
 		// Moved under "Elsewhere".
 		o.remove("fact");
 		o.add({ id: "fact", parentId: "elsewhere", content: "A fact" });
 		o.add({ id: "factKid", parentId: "fact", content: "Under the fact" });
-		model.onChanged({ seq: o.seq, levels: [], subtrees: ["fact"], all: false });
+		model.onChanged({ seq: o.seq, levels: ["top1", "elsewhere"], subtrees: [], all: false });
 		await time.run();
 		expect(model.path.map((step) => step.id)).toEqual(["elsewhere"]);
+		expect(model.watchKeys().levels).toContain("elsewhere");
 		expect(model.status).toBe("ready");
 		// Deleted.
 		o.remove("factKid");
 		o.remove("fact");
-		model.onChanged({ seq: o.seq, levels: ["fact"], subtrees: ["fact"], all: false });
+		model.onChanged({ seq: o.seq, levels: ["elsewhere"], subtrees: [], all: false });
 		await time.run();
 		expect(model.status).toBe("missing");
 	});
@@ -704,4 +713,154 @@ describe("locate in one round trip", () => {
 		expect(await found).toBe(true);
 		expect(model.getView().indexOf.has("bottom")).toBe(true);
 	}, 30_000);
+});
+
+/** A fake whose fold writes are held (in flight) until each is let through or failed. */
+class HeldFold extends FakeOutline {
+	held: Array<{ ok: () => void; fail: () => void }> = [];
+	sentHeld: Array<{ body: Parameters<FakeOutline["putFold"]>[1]; keepalive: boolean }> = [];
+	hold = false;
+	override async putFold(
+		spaceId: string,
+		body: Parameters<FakeOutline["putFold"]>[1],
+		keepalive?: boolean,
+	) {
+		if (!this.hold) return super.putFold(spaceId, body, keepalive);
+		// Sent (it is on its way): what was sent is known now, its effect when let through.
+		this.sentHeld.push({ body, keepalive: keepalive === true });
+		return new Promise<Awaited<ReturnType<FakeOutline["putFold"]>>>((resolve, reject) =>
+			this.held.push({
+				ok: () => void super.putFold(spaceId, body, keepalive).then(resolve, reject),
+				fail: () => reject(Object.assign(new Error("503"), { status: 503 })),
+			}),
+		);
+	}
+}
+
+function heldSample(): HeldFold {
+	const o = new HeldFold();
+	o.add({ id: "top1", parentId: null, content: "Top one" });
+	o.add({ id: "fact", parentId: "top1", content: "A fact" });
+	o.add({ id: "factKid", parentId: "fact", content: "kid" });
+	o.add({ id: "other", parentId: "top1", content: "o" });
+	o.add({ id: "otherKid", parentId: "other", content: "k" });
+	o.expanded.add("top1");
+	return o;
+}
+
+describe("fold writes in flight, resets and the page going away (review round 2)", () => {
+	test("a failed write that was in flight does not undo a later reset", async () => {
+		const o = heldSample();
+		const { model, time } = await forest(o);
+		model.setViewport(0, 50);
+		await settle();
+		o.hold = true;
+		model.toggle("fact"); // closed: stored as collapsed …
+		await time.run(); // … by a write now in flight
+		expect(o.held.length).toBe(1);
+		model.foldInside("top1", false); // back to the default inside top1
+		o.hold = false;
+		o.held[0]?.fail();
+		for (let i = 0; i < 8; i++) await time.run();
+		expect(o.collapsed.has("fact")).toBe(false);
+		expect(model.foldOf("fact")).toBe(null);
+		// A change made after the reset is still saved.
+		model.toggle("top1");
+		for (let i = 0; i < 3; i++) await time.run();
+		expect(o.expanded.has("top1")).toBe(true);
+	});
+
+	test("a failed write's changes come back unless the reader changed the block since", async () => {
+		const o = heldSample();
+		const { model, time } = await forest(o);
+		model.setViewport(0, 50);
+		await settle();
+		o.hold = true;
+		model.toggle("fact");
+		model.toggle("other");
+		await time.run();
+		model.toggle("other"); // back to its default: null, queued
+		o.hold = false;
+		o.held[0]?.fail();
+		for (let i = 0; i < 8; i++) await time.run();
+		expect(o.collapsed.has("fact")).toBe(true);
+		expect(o.collapsed.has("other")).toBe(false);
+	});
+
+	test("leave(): ONE write, carrying the write in flight, the reset and a newer change", async () => {
+		const o = heldSample();
+		const { model, time } = await forest(o);
+		model.setViewport(0, 50);
+		await settle();
+		o.hold = true;
+		model.toggle("other"); // closed, in flight and never answered
+		await time.run();
+		model.foldInside("other", false); // a reset queued behind it
+		model.toggle("fact"); // a newer change after the reset
+		const before = o.sentHeld.length;
+		expect(model.leave()).toBeGreaterThan(0);
+		expect(o.sentHeld.length - before).toBe(1);
+		const sent = o.sentHeld.at(-1);
+		expect(sent?.keepalive).toBe(true);
+		const body = sent?.body as {
+			reset: Array<string | null>;
+			changes: Array<{ blockId: string; open: boolean | null }>;
+			n: number;
+		};
+		expect(body.n).toBeGreaterThan((o.sentHeld[0]?.body as { n: number }).n);
+		expect(body.reset).toEqual(["other"]);
+		// The write in flight closed `other`, which the reset covers; the newer change is there.
+		expect(body.changes).toEqual([{ blockId: "fact", open: false }]);
+		// The keepalive write is held too: let it through, then the old one lands late.
+		o.hold = false;
+		o.held[1]?.ok();
+		await settle();
+		o.held[0]?.ok();
+		await settle();
+		expect(o.collapsed.has("other")).toBe(false);
+		expect(o.collapsed.has("fact")).toBe(true);
+		await time.run();
+		// Nothing left to send: the next hide sends nothing.
+		expect(model.leave()).toBe(0);
+	});
+
+	test("the write loop does not go on past a page-leave write still on its way", async () => {
+		const o = heldSample();
+		const { model, time } = await forest(o);
+		model.setViewport(0, 50);
+		await settle();
+		o.hold = true;
+		model.toggle("fact");
+		await time.run(); // W1 in flight (the loop waits for it)
+		model.leave(); // W2, held, numbered past W1
+		model.toggle("other"); // queued while the loop still waits for W1
+		o.held[0]?.ok(); // W1 answered: the loop goes on …
+		for (let i = 0; i < 3; i++) await time.run();
+		// … but sends nothing while W2 is on its way.
+		expect(o.sentHeld.length).toBe(2);
+		o.hold = false;
+		o.held[1]?.ok();
+		for (let i = 0; i < 3; i++) await time.run();
+		expect(o.collapsed.has("other")).toBe(true);
+		expect(o.collapsed.has("fact")).toBe(true);
+	});
+
+	test("a write after leave() waits for it: never numbered past it while it is on its way", async () => {
+		const o = heldSample();
+		const { model, time } = await forest(o);
+		model.setViewport(0, 50);
+		await settle();
+		o.hold = true;
+		model.toggle("fact");
+		model.leave(); // held
+		expect(o.held.length).toBe(1);
+		o.hold = false;
+		model.toggle("fact"); // open again (null)
+		await time.run();
+		// Not sent before the page-leave write is answered.
+		expect(count(o, "putFold")).toBe(0);
+		o.held[0]?.ok();
+		for (let i = 0; i < 3; i++) await time.run();
+		expect(o.collapsed.has("fact")).toBe(false);
+	});
 });

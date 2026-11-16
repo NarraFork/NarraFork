@@ -438,6 +438,8 @@ function SpaceNode({ space, depth }: { space: OutlineTreeSpace; depth: number })
 										component: "button" as const,
 										type: "button" as const,
 										style: { cursor: "pointer" },
+										// Reached by the arrow keys like a row (one tab stop per tree).
+										"data-tree-nav": "",
 										onClick: () =>
 											locateTo({ spaceId: space.id, blockId: asks.blockId, answer: true }),
 									}

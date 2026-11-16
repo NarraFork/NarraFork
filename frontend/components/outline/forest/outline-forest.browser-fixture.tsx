@@ -596,3 +596,26 @@ export function inProgressItems(): string[] {
 		(item.textContent ?? "").trim(),
 	);
 }
+
+/** What the focus is on: its test id, its tree count kind, or its tag. */
+export function activeControl(): string {
+	const element = document.activeElement as HTMLElement | null;
+	if (!element) return "";
+	if (element.dataset.testid) return element.dataset.testid;
+	if (element.dataset.treeCount) return `count:${element.dataset.treeCount}`;
+	return element.tagName;
+}
+
+/** Type `value` into every field `selector` matches; how many. */
+export function typeAll(selector: string, value: string): number {
+	const fields = [...document.querySelectorAll<HTMLTextAreaElement | HTMLInputElement>(selector)];
+	for (const field of fields) {
+		const proto =
+			field instanceof HTMLTextAreaElement
+				? HTMLTextAreaElement.prototype
+				: HTMLInputElement.prototype;
+		Object.getOwnPropertyDescriptor(proto, "value")?.set?.call(field, value);
+		field.dispatchEvent(new Event("input", { bubbles: true }));
+	}
+	return fields.length;
+}

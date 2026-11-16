@@ -41,6 +41,7 @@ import type { OutlineViewMode } from "@shared/outline-api";
 import { FOLD_MAX_OPEN_DEPTH, foldDefaultOpen } from "@shared/outline-fold";
 import { isOutlineReportBlockId, isOutlineReportContainer } from "@shared/outline-report-line";
 import type {
+	OutlineFoldStatePutBody,
 	OutlineFoldStateResponse,
 	OutlineLevelsResponse,
 	OutlineMarksResponse,
@@ -106,15 +107,13 @@ export interface ForestIO {
 	): Promise<OutlineLevelsResponse>;
 	marks(spaceId: string, keys: readonly string[], since?: number): Promise<OutlineMarksResponse>;
 	getFold(spaceId: string): Promise<OutlineFoldStateResponse>;
+	/**
+	 * One write of the reader's folding: its resets (back to the default, applied first), then
+	 * its changes, numbered by its writer so that an older write never lands after a newer.
+	 */
 	putFold(
 		spaceId: string,
-		changes: Array<{ blockId: string; open: boolean | null }>,
-		keepalive?: boolean,
-	): Promise<unknown>;
-	/** The reader's folding back to the default: a block and what is under it, or (null) all. */
-	resetFold(
-		spaceId: string,
-		under: string | null,
+		body: OutlineFoldStatePutBody,
 		keepalive?: boolean,
 	): Promise<OutlineFoldStateResponse>;
 	/** The open tasks under a block (the space's id: all), for the "in progress" count. */
@@ -272,7 +271,23 @@ export const FOLD_CHUNK_BYTES = 48 * 1024;
 export const FOLD_LEAVE_BYTES = 60 * 1024;
 /** A failed fold write is tried again after 1 s, 2 s, 4 s, … this many times. */
 export const FOLD_RETRIES = 4;
+/** Resets one fold write carries at most (the server's `maxResets`). */
+const FOLD_MAX_RESETS = 50;
 const FOLD_RETRY_MS = 1000;
+
+type FoldChange = { blockId: string; open: boolean | null };
+interface FoldFlight {
+	resets: Array<string | null>;
+	changes: FoldChange[];
+	superseded: boolean;
+}
+
+/** A writer id for one view (`OUTLINE_FOLD_STATE` writes): random, URL-safe. */
+function writerId(): string {
+	const bytes = new Uint8Array(12);
+	crypto.getRandomValues(bytes);
+	return `w${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
 const MARKS_DELAY_MS = 250;
 const MARKS_REFRESH_MS = 400;
 const ROOT_CHECK_MS = 300;
@@ -352,6 +367,13 @@ export class SpaceForest {
 	private cancelFoldFlush: (() => void) | null = null;
 	private cancelFoldRetry: (() => void) | null = null;
 	private foldWrite: Promise<unknown> = Promise.resolve();
+	/** This view's name as a writer of folding, and the number of its last write. */
+	private readonly writer = writerId();
+	private foldN = 0;
+	/** The write on its way: what it carries; `superseded` once a later write carried it too. */
+	private inFlight: FoldFlight | null = null;
+	/** The write `leave` sent, until it is answered. */
+	private leaveWrite: Promise<void> | null = null;
 	private foldFailures = 0;
 	/** The reader's folding could not be saved (after the retries): the view says so. */
 	foldSaveFailed = false;
@@ -625,10 +647,11 @@ export class SpaceForest {
 
 	/**
 	 * Send the reader's folding not sent yet, one write at a time in the order the reader
-	 * folded: resets first, then the changes in chunks the server takes
-	 * ({@link FOLD_CHUNK_CHANGES} changes, {@link FOLD_CHUNK_BYTES} bytes). What fails stays
-	 * queued and is tried again after a growing delay, {@link FOLD_RETRIES} times; then the
-	 * forest says its folding could not be saved ({@link foldSaveFailed}) until a write works.
+	 * folded. A write carries the resets queued (applied first by the server) and a chunk of the
+	 * changes the server takes ({@link FOLD_CHUNK_CHANGES} changes, {@link FOLD_CHUNK_BYTES}
+	 * bytes). What fails goes back in the queue, except what the reader changed since or a
+	 * later reset covers, and is tried again after a growing delay, {@link FOLD_RETRIES} times;
+	 * then the forest says its folding could not be saved ({@link foldSaveFailed}).
 	 * `keepalive`: kept alive past a page that goes away (still in order).
 	 */
 	flushFold(keepalive: boolean): Promise<unknown> {
@@ -640,73 +663,143 @@ export class SpaceForest {
 	}
 
 	/**
-	 * The page is going away (`pagehide`, hidden): what is queued goes now, with `keepalive`,
-	 * NOT behind a write still on its way (that one may never finish), and within the
-	 * browser's budget for such requests ({@link FOLD_LEAVE_BYTES} in all). Returns the bytes sent.
+	 * The page is hidden or going away (`pagehide`, hidden): ONE write goes now, with
+	 * `keepalive`, NOT behind the write still on its way (that one may never finish). It
+	 * carries that write's resets and changes too (unless a reset queued since covers a change,
+	 * or the reader changed the block again), then what is queued: the server applies its
+	 * resets first, then its changes, and ignores the write on its way if it lands later (it
+	 * is numbered lower). Within one write's limits ({@link FOLD_CHUNK_CHANGES} changes,
+	 * {@link FOLD_LEAVE_BYTES} bytes, under the browser's 64 KB for such requests); what does
+	 * not fit stays queued. Returns the body's bytes (0: nothing to send).
 	 */
 	leave(): number {
 		this.cancelFoldFlush?.();
 		this.cancelFoldFlush = null;
-		let budget = FOLD_LEAVE_BYTES;
-		for (const under of this.resetQueue.splice(0)) {
-			budget -= 200;
-			void this.io.resetFold(this.spaceId, under, true).catch(() => undefined);
+		const flight = this.inFlight && !this.inFlight.superseded ? this.inFlight : null;
+		if (!flight && this.foldQueue.size === 0 && this.resetQueue.length === 0) return 0;
+		const resets = [...(flight?.resets ?? []), ...this.resetQueue].slice(0, FOLD_MAX_RESETS);
+		const changes = new Map<string, boolean | null>();
+		for (const change of flight?.changes ?? []) {
+			if (!this.coveredByReset(change.blockId, this.resetQueue))
+				changes.set(change.blockId, change.open);
 		}
-		while (this.foldQueue.size > 0 && budget > 0) {
-			const chunk = this.takeFoldChunk(Math.min(FOLD_CHUNK_BYTES, budget));
-			if (chunk.changes.length === 0) break;
-			budget -= chunk.bytes;
-			void this.io.putFold(this.spaceId, chunk.changes, true).catch(() => undefined);
+		for (const [id, open] of this.foldQueue) {
+			changes.delete(id);
+			changes.set(id, open);
 		}
-		return FOLD_LEAVE_BYTES - budget;
+		const body: OutlineFoldStatePutBody = { reset: resets, changes: [] };
+		let bytes = JSON.stringify({ ...body, writer: this.writer, n: this.foldN + 1 }).length;
+		const sent: FoldChange[] = [];
+		for (const [blockId, open] of changes) {
+			const size = JSON.stringify({ blockId, open }).length + 1;
+			if (sent.length >= FOLD_CHUNK_CHANGES || bytes + size > FOLD_LEAVE_BYTES) break;
+			sent.push({ blockId, open });
+			bytes += size;
+		}
+		if (resets.length === 0 && sent.length === 0) return 0;
+		if (flight) flight.superseded = true;
+		this.resetQueue.splice(0, Math.max(0, resets.length - (flight?.resets.length ?? 0)));
+		for (const change of sent) this.foldQueue.delete(change.blockId);
+		const mine: FoldFlight = { resets, changes: sent, superseded: false };
+		const write = this.io
+			.putFold(
+				this.spaceId,
+				{
+					...(resets.length > 0 ? { reset: resets } : {}),
+					changes: sent,
+					writer: this.writer,
+					n: ++this.foldN,
+				},
+				true,
+			)
+			.then(
+				() => this.foldSaved(),
+				// The page stayed after all and the write failed: back in the queue.
+				() => this.requeue(mine),
+			);
+		// Later writes go after this one (the one on its way is carried by it).
+		const done = write.then(() => {
+			if (this.leaveWrite === done) this.leaveWrite = null;
+		});
+		this.leaveWrite = done;
+		this.foldWrite = Promise.all([this.foldWrite, done]);
+		return bytes;
 	}
 
-	/** The next changes of the queue that fit one write (taken out of the queue). */
-	private takeFoldChunk(maxBytes: number): {
-		changes: Array<{ blockId: string; open: boolean | null }>;
-		bytes: number;
-	} {
-		const changes: Array<{ blockId: string; open: boolean | null }> = [];
-		// `{"changes":[` … `]}`
-		let bytes = 14;
+	/** Whether a reset in `resets` puts the block back to the default (it or an ancestor). */
+	private coveredByReset(blockId: string, resets: ReadonlyArray<string | null>): boolean {
+		return resets.some(
+			(under) =>
+				under === null ||
+				under === this.spaceId ||
+				under === blockId ||
+				this.isUnder(blockId, under),
+		);
+	}
+
+	/** A write that failed: what it carried goes back, unless changed or reset since. */
+	private requeue(flight: FoldFlight): void {
+		if (flight.superseded) return;
+		// Resets queued since are newer than every change of this write.
+		const newer = [...this.resetQueue];
+		this.resetQueue.unshift(...flight.resets);
+		for (const change of flight.changes) {
+			if (this.foldQueue.has(change.blockId)) continue;
+			if (this.coveredByReset(change.blockId, newer)) continue;
+			this.foldQueue.set(change.blockId, change.open);
+		}
+	}
+
+	/** The next write: the queued resets and the changes that fit (taken out of the queue). */
+	private takeWrite(maxBytes: number): FoldFlight {
+		const resets = this.resetQueue.splice(0, FOLD_MAX_RESETS);
+		const changes: FoldChange[] = [];
+		// `{"changes":[` … `],"reset":[…],"writer":…,"n":…}`
+		let bytes = 120 + JSON.stringify(resets).length;
 		for (const [blockId, open] of this.foldQueue) {
-			const change = { blockId, open };
-			const size = JSON.stringify(change).length + 1;
+			const size = JSON.stringify({ blockId, open }).length + 1;
 			if (changes.length >= FOLD_CHUNK_CHANGES || bytes + size > maxBytes) break;
-			changes.push(change);
+			changes.push({ blockId, open });
 			bytes += size;
 		}
 		for (const change of changes) this.foldQueue.delete(change.blockId);
-		return { changes, bytes };
+		return { resets, changes, superseded: false };
 	}
 
 	private async sendFolds(keepalive: boolean): Promise<void> {
 		try {
-			while (this.resetQueue.length > 0) {
-				const under = this.resetQueue[0] as string | null;
-				const state = await this.io.resetFold(this.spaceId, under, keepalive);
-				this.resetQueue.shift();
-				// The server's folding after the reset, with what is still queued on top.
-				if (!this.disposed) {
+			while (this.resetQueue.length > 0 || this.foldQueue.size > 0) {
+				// (Never past a write sent as the page went away: it is numbered lower.)
+				if (this.leaveWrite) await this.leaveWrite;
+				if (this.resetQueue.length === 0 && this.foldQueue.size === 0) break;
+				const flight = this.takeWrite(FOLD_CHUNK_BYTES);
+				this.inFlight = flight;
+				let state: OutlineFoldStateResponse;
+				try {
+					state = await this.io.putFold(
+						this.spaceId,
+						{
+							...(flight.resets.length > 0 ? { reset: flight.resets } : {}),
+							changes: flight.changes,
+							writer: this.writer,
+							n: ++this.foldN,
+						},
+						keepalive,
+					);
+				} catch (error) {
+					this.requeue(flight);
+					throw error;
+				} finally {
+					if (this.inFlight === flight) this.inFlight = null;
+				}
+				// After a reset: the server's folding, with what is still queued on top.
+				if (flight.resets.length > 0 && !flight.superseded && !state.ignored && !this.disposed) {
 					this.expanded.clear();
 					this.collapsed.clear();
 					for (const id of state.expanded) this.expanded.add(id);
 					for (const id of state.collapsed) this.collapsed.add(id);
 					for (const [id, open] of this.foldQueue) this.applyFold(id, open);
 					this.changed();
-				}
-				this.foldSaved();
-			}
-			while (this.foldQueue.size > 0) {
-				const chunk = this.takeFoldChunk(FOLD_CHUNK_BYTES);
-				try {
-					await this.io.putFold(this.spaceId, chunk.changes, keepalive);
-				} catch (error) {
-					// Back in the queue, unless the reader folded the block again since.
-					for (const change of chunk.changes)
-						if (!this.foldQueue.has(change.blockId))
-							this.foldQueue.set(change.blockId, change.open);
-					throw error;
 				}
 				this.foldSaved();
 			}
@@ -1089,12 +1182,22 @@ export class SpaceForest {
 		return () => this.watchListeners.delete(listener);
 	}
 
+	/** The level the focused root is in: its parent block, or the space; null without a root. */
+	private rootParentKey(): string | null {
+		if (this.rootId === null) return null;
+		const parent = this.blocks.get(this.rootId)?.parentId ?? this.path.at(-1)?.id ?? null;
+		return parent ?? this.spaceId;
+	}
+
 	/** What the block watch should watch now: loaded levels near the viewport, visible closed rows. */
 	watchKeys(): { levels: string[]; subtrees: string[] } {
 		if (this.asOf !== undefined || this.status !== "ready") return { levels: [], subtrees: [] };
 		const levels = [...this.near].filter((key) => this.levels.has(key));
-		// The focused root itself, as a subtree: its deletion or move names it.
-		const subtrees: string[] = this.rootId !== null ? [this.rootId] : [];
+		// The focused root's parent, as a level: the root itself deleted, moved or edited names
+		// it; a change anywhere below the root does not.
+		const parent = this.rootParentKey();
+		if (parent !== null && !levels.includes(parent)) levels.unshift(parent);
+		const subtrees: string[] = [];
 		for (const id of this.visible) {
 			if (subtrees.length >= FOREST_LIMITS.watchSubtrees) break;
 			if (this.info.get(id)?.open === false) subtrees.push(id);
@@ -1692,7 +1795,8 @@ export class SpaceForest {
 		// Marks are read on their own: a level read during a disconnect may have moved
 		// `knownSeq` past the last marks read; a closed row newly watched has no past either.
 		if (seq > this.marksSeq || added.subtrees.length > 0) this.marksDirty = true;
-		if (this.rootId !== null && added.subtrees.includes(this.rootId)) this.checkRoot();
+		const parent = this.rootParentKey();
+		if (parent !== null && added.levels.includes(parent)) this.checkRoot();
 		this.noteSeq(seq);
 		this.afterLive();
 	}
@@ -1708,13 +1812,11 @@ export class SpaceForest {
 			this.checkRoot();
 		} else {
 			for (const key of frame.levels) this.markStale(key, frame.seq);
+			// The focused root's own level (its parent's children) changed: the root itself may
+			// be gone, moved or retitled. Changes below the root do not name that level.
+			const parent = this.rootParentKey();
+			if (parent !== null && frame.levels.includes(parent)) this.checkRoot();
 			for (const key of frame.subtrees) {
-				// The focused root itself: it may be gone or moved (its own level is watched as
-				// a level; what changed under it is not a reason to read that again).
-				if (key === this.rootId) {
-					this.checkRoot();
-					continue;
-				}
 				// A closed row: its one line may have changed, and what is loaded under it is
 				// not watched, so it is read again when the row opens.
 				this.markStale(key, frame.seq);

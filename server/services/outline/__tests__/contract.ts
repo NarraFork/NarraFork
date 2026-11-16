@@ -2234,6 +2234,31 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 			expect(await ids(me)).toEqual([]);
 			expect(await ids(other)).toEqual([one, two, three].sort());
 			expect(await ids(me, otherSpace.id)).toEqual([elsewhere]);
+			// A write's own clear runs first, in its transaction: then its changes.
+			await ctx.store.putFoldState(me, space.id, all, at, 100);
+			await ctx.store.putFoldState(
+				me,
+				space.id,
+				[{ blockId: two, open: false }],
+				"2026-11-15T00:00:02.000Z",
+				100,
+				{ ids: [one, two] },
+			);
+			expect(await ids(me)).toEqual([two, three].sort());
+			expect(
+				(await ctx.store.listFoldState(me, space.id, 100)).find((row) => row.blockId === two)?.open,
+			).toBe(false);
+			await ctx.store.putFoldState(
+				me,
+				space.id,
+				[{ blockId: one, open: true }],
+				"2026-11-15T00:00:03.000Z",
+				100,
+				{ all: true },
+			);
+			expect(await ids(me)).toEqual([one]);
+			expect(await ids(other)).toEqual([one, two, three].sort());
+			expect(await ids(me, otherSpace.id)).toEqual([elsewhere]);
 		},
 	},
 	{

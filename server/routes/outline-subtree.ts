@@ -281,6 +281,7 @@ outlineSubtreeRoutes.put(
 			principalOf(c).userId,
 			space,
 			input.changes,
+			{ reset: input.reset, writer: input.writer, n: input.n },
 		);
 		return c.json(body);
 	},

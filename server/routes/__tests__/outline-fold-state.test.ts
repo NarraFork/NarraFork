@@ -41,7 +41,7 @@ import { toErrorPayload } from "../../lib/app-error-response";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
-import { writeFoldState } from "../../services/outline/fold-state";
+import { resetFoldWritersForTests, writeFoldState } from "../../services/outline/fold-state";
 import { ensureProjectSpace } from "../../services/outline/spaces";
 import { outlineStore } from "../../services/outline/store";
 import type { OutlineSpaceRow } from "../../services/outline/store/port";
@@ -493,6 +493,119 @@ describe("back to the default in one request", () => {
 		expect((await call(alice, "DELETE", foldPath())).status).toBe(404);
 		settings.outline.enabled = true;
 		expect((await call(alice, "GET", foldPath())).body.expanded).toEqual([ids.top1]);
+	});
+});
+
+describe("one write: resets, then changes, in order of the writer's numbers", () => {
+	test("a write's resets apply before its changes, in one request", async () => {
+		await call(alice, "PUT", foldPath(), {
+			changes: [
+				{ blockId: ids.top1, open: true },
+				{ blockId: ids.fact, open: false },
+				{ blockId: ids.done, open: true },
+				{ blockId: ids.top2, open: true },
+			],
+		});
+		// Back to the default under top1, and then the fact closed again: the change survives.
+		const both = await call(alice, "PUT", foldPath(), {
+			reset: [ids.top1],
+			changes: [{ blockId: ids.fact, open: false }],
+		});
+		expect(both.status).toBe(200);
+		expect(both.body).toEqual({ spaceId: space.id, expanded: [ids.top2], collapsed: [ids.fact] });
+		// The whole space (null), then a change.
+		const whole = await call(alice, "PUT", foldPath(), {
+			reset: [null],
+			changes: [{ blockId: ids.done, open: true }],
+		});
+		expect(whole.body).toEqual({ spaceId: space.id, expanded: [ids.done], collapsed: [] });
+		// Resets alone are a write; nothing at all is not.
+		expect((await call(alice, "PUT", foldPath(), { reset: [ids.done] })).body.expanded).toEqual([]);
+		expect((await call(alice, "PUT", foldPath(), { reset: [] })).status).toBe(400);
+		expect(
+			(await call(alice, "PUT", foldPath(), { reset: Array.from({ length: 51 }, () => null) }))
+				.status,
+		).toBe(400);
+		// Nobody else's: Bob's reset of the whole space leaves Alice's rows.
+		await call(alice, "PUT", foldPath(), { changes: [{ blockId: ids.top1, open: true }] });
+		await call(bob, "PUT", foldPath(), { reset: [null] });
+		expect((await call(alice, "GET", foldPath())).body.expanded).toEqual([ids.top1]);
+		expect((await call(mallory, "PUT", foldPath(), { reset: [null] })).status).toBe(404);
+	});
+
+	test("a write numbered at or below one already applied for its writer is ignored", async () => {
+		resetFoldWritersForTests();
+		const writer = "tab-0123456789";
+		const newer = await call(alice, "PUT", foldPath(), {
+			writer,
+			n: 7,
+			changes: [{ blockId: ids.fact, open: false }],
+		});
+		expect(newer.body.collapsed).toEqual([ids.fact]);
+		// The older write, still on its way, lands later: ignored, and said so.
+		const older = await call(alice, "PUT", foldPath(), {
+			writer,
+			n: 6,
+			changes: [{ blockId: ids.fact, open: null }],
+		});
+		expect(older.status).toBe(200);
+		expect(older.body.ignored).toBe(true);
+		expect(older.body.collapsed).toEqual([ids.fact]);
+		expect(
+			(
+				await call(alice, "PUT", foldPath(), {
+					writer,
+					n: 7,
+					changes: [{ blockId: ids.fact, open: null }],
+				})
+			).body.ignored,
+		).toBe(true);
+		// Another writer (another view), or another person, is not held back by it.
+		expect(
+			(
+				await call(alice, "PUT", foldPath(), {
+					writer: "tab-other-writer",
+					n: 1,
+					changes: [{ blockId: ids.done, open: true }],
+				})
+			).body.expanded,
+		).toEqual([ids.done]);
+		expect(
+			(
+				await call(bob, "PUT", foldPath(), {
+					writer,
+					n: 1,
+					changes: [{ blockId: ids.fact, open: false }],
+				})
+			).body.ignored,
+		).toBeUndefined();
+		// A newer one applies; writer and n go together; a bad writer id is refused.
+		expect(
+			(
+				await call(alice, "PUT", foldPath(), {
+					writer,
+					n: 8,
+					changes: [{ blockId: ids.fact, open: null }],
+				})
+			).body.collapsed,
+		).toEqual([]);
+		expect(
+			(
+				await call(alice, "PUT", foldPath(), {
+					writer,
+					changes: [{ blockId: ids.fact, open: false }],
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await call(alice, "PUT", foldPath(), {
+					writer: "bad writer!",
+					n: 9,
+					changes: [{ blockId: ids.fact, open: false }],
+				})
+			).status,
+		).toBe(400);
 	});
 });
 

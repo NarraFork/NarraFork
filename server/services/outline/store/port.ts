@@ -1086,7 +1086,8 @@ export interface OutlineStore
 	 * written most recently stay, and the ones just written whatever a clock says (after a
 	 * clock stepped back they stay beside the `keep` newest until a later write); the rest of
 	 * that person's rows of that space are deleted. Other people's rows and other
-	 * spaces are never touched. `changes` is bounded by the caller.
+	 * spaces are never touched. `changes` is bounded by the caller. `clear`, first and in the
+	 * same transaction: delete all of the person's rows of the space, or those of `ids`.
 	 */
 	putFoldState(
 		userId: string,
@@ -1094,6 +1095,7 @@ export interface OutlineStore
 		changes: ReadonlyArray<{ blockId: string; open: boolean | null }>,
 		updatedAt: string,
 		keep: number,
+		clear?: { all: true } | { ids: readonly string[] },
 	): Promise<void>;
 	/**
 	 * Back to the default folding: delete the person's rows of a space, all of them (`blockIds`
