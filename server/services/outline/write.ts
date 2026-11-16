@@ -2081,12 +2081,16 @@ class OutlinePlanner {
 		block.parentId = parentId;
 		block.orderKey = orderKey;
 		block.pageId = parent ? parent.pageId : block.id;
-		// Children deleted with it (earlier in this transaction) stay deleted.
+		// Children deleted with it (earlier in this transaction) stay deleted, and one restored
+		// somewhere else since is no longer its child: the list is from before the deletion.
 		const own = this.children.get(listKey(block.id));
 		if (own)
 			this.children.set(
 				listKey(block.id),
-				own.filter((id) => !this.block(id).deleted),
+				own.filter((id) => {
+					const child = this.block(id);
+					return !child.deleted && child.parentId === block.id;
+				}),
 			);
 
 		let split: OutlineBlockAddressed[] = [];
@@ -2117,10 +2121,12 @@ class OutlinePlanner {
 		if (op.ask !== undefined) block.askJson = op.ask;
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
 		else if (block.base?.deleted) {
-			// The tags it had just before it was deleted.
+			// The tags it had when it was last live. Its newest version need not be the tombstone
+			// that ended that: a commit that restored it and left it deleted again wrote another.
+			const live = await this.store.getLastLiveVersion(block.id);
 			const tags = await this.store.listLinksAt(
 				[block.id],
-				block.base.versionSeq - 1,
+				(live?.toSeq ?? block.base.versionSeq) - 1,
 				["tag"],
 				OUTLINE_LIMITS.maxTagsPerBlock,
 			);
