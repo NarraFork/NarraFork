@@ -410,6 +410,29 @@ describe("continuing a level", () => {
 		expect(then.output.split("\n")[0]).toContain(`after [${a1}] · as of commit #${seq}`);
 		const now = await call(outlineReadTool, { address: a, after: a1 }, w.c);
 		expect(ids(now.output)).toHaveLength(2);
+		// A cursor deleted since: refused, saying so and how to go on.
+		await call(outlineEditTool, { edits: [{ delete: a1 }] }, w.c);
+		const gone = await call(outlineReadTool, { address: a, after: a1 }, w.c);
+		expect(gone.isError).toBe(true);
+		expect(gone.output).toContain("moved or been deleted since");
+		// The description says to keep asOf on a continued read.
+		expect(outlineReadTool.description).toContain("Keep the same asOf when you continue");
+	});
+
+	test("lists of top-level blocks are only as they are now: asOf is refused, alike for any space", async () => {
+		const w = await world();
+		await call(outlineEditTool, { edits: [{ add: "/", markdown: "- A" }] }, w.c);
+		const answers = [];
+		for (const address of [`${w.space.key}/`, "project/", "Zz99Zz99/", ""]) {
+			const read = await call(outlineReadTool, { address, asOf: 1 }, w.c);
+			expect(read.isError).toBe(true);
+			answers.push(read.output);
+		}
+		expect(new Set(answers)).toEqual(new Set([OUTLINE_TOOL_TEXT.listNotAsOf]));
+		// Without asOf the list reads as before.
+		const now = await call(outlineReadTool, { address: `${w.space.key}/` }, w.c);
+		expect(now.isError).toBeUndefined();
+		expect(now.output).toContain("A");
 	});
 });
 

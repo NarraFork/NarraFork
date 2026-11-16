@@ -216,7 +216,7 @@ export const OUTLINE_TOOL_TEXT = {
 	afterNeedsLevel:
 		"after continues one level: give it with the address of the block whose children you are reading (or key/ for a space's top level).",
 	afterNotUnder: (after: string, parent: string) =>
-		`${quoted(after)} is not a block directly under ${parent}. after names the last child of ${parent} a read showed; the read continues after it.`,
+		`${quoted(after)} is not a block directly under ${parent}. after names the last child of ${parent} a read showed; the read continues after it. It may have moved or been deleted since that read: read ${parent} again and continue from what it shows.`,
 	nothingAfter: "nothing after it: this level ends here",
 	writeHint:
 		"to write, use OutlineEdit (if it is not in your tool list, load it with /load OutlineEdit)",
@@ -234,6 +234,8 @@ export const OUTLINE_TOOL_TEXT = {
 		`${n === 0 ? "more top-level blocks" : `${n}${more ? "+" : ""} more top-level ${n === 1 && !more ? "block" : "blocks"}`} not shown; OutlineRead { address: "${key}/" } lists them`,
 	accessChanged:
 		"Who may read this session kept changing while the outline was being read, so nothing is shown. Read it again.",
+	listNotAsOf:
+		"asOf reads one block as it was; a list of top-level blocks (key/, or no address) shows them as they are now. Read a top-level block with asOf instead.",
 	overviewNotAsOf:
 		'asOf reads one block as it was; the overview ("*") shows the spaces as they are now. Read a block with asOf instead.',
 	otherSessionNotes: (n: number, more: boolean) =>

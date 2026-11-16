@@ -152,7 +152,7 @@ export const outlineReadTool: ToolDefinition = {
 - Facts are shown by default: tasks, questions and everything under them are left out (view "all" includes them; reading a task shows all of it).
 - address: an id, key/id, an alias such as Q17, or a block's title (ids, aliases and titles alone are looked up in this session's own spaces). Omit it to list this session's own spaces and their top-level blocks; key/ (or project/, session/, personal/) lists one space's top-level blocks; "*" is an overview of every space this session can read, its own first, each with its top-level blocks expanded together within the budget.
 - after: continue a level. A block directly under address (with key/: a top-level block of that space); the read shows the blocks after it, not address itself.
-- asOf: a commit number or a time, to read the block as it was then.
+- asOf: a commit number or a time, to read the block as it was then. Keep the same asOf when you continue such a read with after. Lists of top-level blocks (key/, no address) and "*" are only as they are now.
 To write, use OutlineEdit (copy what you read into it: the ids and ‹…› notes are dropped).`,
 	parameters: z.object({
 		address: z

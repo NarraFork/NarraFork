@@ -865,13 +865,18 @@ export async function outlineRead(
 	const after = input.after?.trim() || undefined;
 	if (address === "") {
 		if (after !== undefined) return failed(OUTLINE_TOOL_TEXT.afterNeedsLevel, {});
+		if (input.asOf !== undefined) return failed(OUTLINE_TOOL_TEXT.listNotAsOf, {});
 		return await readOverview(scope);
 	}
 	if (address === OUTLINE_ALL_SPACES) {
 		return await stableAnswer(scope, (current) => overviewAnswer(current, input));
 	}
 	const spaceName = spaceRootName(address);
-	if (spaceName !== null) return await readSpace(scope, spaceName, after);
+	if (spaceName !== null) {
+		// Refused before the space is looked up: the same answer whether it exists or not.
+		if (input.asOf !== undefined) return failed(OUTLINE_TOOL_TEXT.listNotAsOf, { address });
+		return await readSpace(scope, spaceName, after);
+	}
 
 	const resolution = await scope.resolve(address);
 	if (resolution.status === "not_found") {
