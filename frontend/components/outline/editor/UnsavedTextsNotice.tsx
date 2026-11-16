@@ -29,6 +29,7 @@ const REASON_KEY: Record<UnsavedReason, string> = {
 	refused: "editor.unsavedRefused",
 	read_only: "editor.unsavedReadOnly",
 	not_sent: "editor.unsavedNotSent",
+	rejected: "editor.unsavedRejected",
 	moved_away: "editor.unsavedMovedAway",
 };
 

@@ -168,10 +168,29 @@ export function acquireLiveSession(
 			dispose(map, key, shared, { unconfirmed });
 		},
 	};
+	// The server counts a page this tab left as open until its session goes: when a join is
+	// refused for room, the sessions only waiting out their grace period go first.
+	shared.client.makeRoom = () => releaseLeftPages(map, shared);
 	map.set(key, shared);
 	// Never held (a render that did not mount): dropped after the grace period.
 	shared.timer = setTimeout(shared.drop, graceMs);
 	return shared;
+}
+
+/**
+ * Let go of the sessions of pages this tab left (no editor holds them; only their grace period
+ * keeps them), except one whose join is on its way or whose typing is not acknowledged (it would
+ * leave without it). True when one went.
+ */
+function releaseLeftPages(map: Map<string, SharedLiveSession>, except: SharedLiveSession): boolean {
+	let released = false;
+	for (const [key, shared] of [...map]) {
+		if (shared === except || shared.refs > 0 || !occupies(shared)) continue;
+		if (shared.client.status === "connecting" || unacked(shared.client)) continue;
+		dispose(map, key, shared);
+		released = true;
+	}
+	return released;
 }
 
 export function retainLiveSession(shared: SharedLiveSession): void {

@@ -28,7 +28,11 @@
  */
 import type { LiveTaskChar } from "@shared/outline-live-protocol";
 
-export type UnsavedReason = "refused" | "read_only" | "not_sent" | "moved_away";
+/**
+ * `rejected`: the page refused the change this text was part of (a conflict with someone
+ * else's change, or one it could not save); the rest of the person's typing was replayed.
+ */
+export type UnsavedReason = "refused" | "read_only" | "not_sent" | "moved_away" | "rejected";
 
 export interface UnsavedEntry {
 	/** This entry (dismiss, restore). */

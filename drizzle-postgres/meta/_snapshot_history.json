@@ -608,6 +608,14 @@
 			"prevId": "5c6280b8-c028-4e92-b199-ec6aec85bda1",
 			"version": "7",
 			"snapshotDigest": "d791f26f651fc8fde521e5fec1cd16fbac9c6433991b9c17642cc60276eabaee"
+		},
+		{
+			"idx": 76,
+			"tag": "0076_outline_live_log",
+			"id": "f509e6ed-3d82-42d7-8008-1d25254f0189",
+			"prevId": "407a309f-7e0a-4573-842a-f58767b8af6d",
+			"version": "7",
+			"snapshotDigest": "a6536cb41caeed269302f1ff918c6224869013bf0830bcf15354702142eca159"
 		}
 	]
 }

@@ -216,6 +216,67 @@ describe("text entries (protocol version 2)", () => {
 		expect(decodeLiveTexts(long)).toBeNull();
 		expect(decodeLiveTexts(body, 1)).toBeNull();
 		expect(decodeLiveTexts(body, 2)).toHaveLength(2);
-		expect(OUTLINE_LIVE_PROTOCOL_VERSION).toBe(2);
+		expect(OUTLINE_LIVE_PROTOCOL_VERSION).toBe(3);
+	});
+});
+
+describe("document generations and drops (L2)", () => {
+	const bytes = (text: string) => new TextEncoder().encode(text);
+
+	test("entries of generation 0 are written as before; a generation rides in front of the payload", () => {
+		const plain = encodeLiveTexts([
+			{ id: "b1", kind: LIVE_TEXT_KIND.update, data: new Uint8Array([7, 8]) },
+		]);
+		// id length, id, kind 1, payload length, payload: nothing a version 2 reader did not know.
+		expect([...plain]).toEqual([2, 0x62, 0x31, 1, 2, 7, 8]);
+		expect(
+			encodeLiveTexts([
+				{ id: "b1", kind: LIVE_TEXT_KIND.update, gen: 0, data: new Uint8Array([7, 8]) },
+			]),
+		).toEqual(plain);
+		const later = encodeLiveTexts([
+			{ id: "b1", kind: LIVE_TEXT_KIND.update, gen: 300, data: new Uint8Array([7, 8]) },
+		]);
+		// Kind 4, payload of 4 bytes: the generation (300 as a varuint) and the update.
+		expect([...later]).toEqual([2, 0x62, 0x31, 4, 4, 0xac, 0x02, 7, 8]);
+	});
+
+	test("drop, update and vector round trip with their generations; a plain text of a later generation is a drop", () => {
+		const entries = [
+			{ id: "a", kind: LIVE_TEXT_KIND.drop, gen: 5, data: bytes("text now") },
+			{ id: "b", kind: LIVE_TEXT_KIND.drop, gen: 0, data: new Uint8Array(0) },
+			{ id: "c", kind: LIVE_TEXT_KIND.update, gen: 2_000_000, data: new Uint8Array([1]) },
+			{ id: "d", kind: LIVE_TEXT_KIND.vector, gen: 9, data: new Uint8Array([2, 3]) },
+			{ id: "e", kind: LIVE_TEXT_KIND.seed, data: bytes("seed") },
+		];
+		const decoded = decodeLiveTexts(encodeLiveTexts(entries));
+		expect(decoded?.map((e) => [e.id, e.kind, e.gen, [...e.data]])).toEqual([
+			["a", LIVE_TEXT_KIND.drop, 5, [...bytes("text now")]],
+			["b", LIVE_TEXT_KIND.drop, 0, []],
+			["c", LIVE_TEXT_KIND.update, 2_000_000, [1]],
+			["d", LIVE_TEXT_KIND.vector, 9, [2, 3]],
+			["e", LIVE_TEXT_KIND.seed, undefined, [...bytes("seed")]],
+		]);
+		const seeded = decodeLiveTexts(
+			encodeLiveTexts([{ id: "f", kind: LIVE_TEXT_KIND.seed, gen: 4, data: bytes("s") }]),
+		);
+		expect(seeded?.map((e) => [e.kind, e.gen])).toEqual([[LIVE_TEXT_KIND.drop, 4]]);
+	});
+
+	test("malformed: a generation cut short or past its payload, generation 0 spelled the long way, an unknown kind", () => {
+		const id = [1, 0x61];
+		// Kind 4 with an empty payload: no generation to read.
+		expect(decodeLiveTexts(new Uint8Array([...id, 4, 0]))).toBeNull();
+		// The generation's varuint runs past the payload.
+		expect(decodeLiveTexts(new Uint8Array([...id, 4, 1, 0x80, 0x01]))).toBeNull();
+		// An update or a vector of generation 0 has one spelling only.
+		expect(decodeLiveTexts(new Uint8Array([...id, 4, 1, 0]))).toBeNull();
+		expect(decodeLiveTexts(new Uint8Array([...id, 5, 1, 0]))).toBeNull();
+		expect(decodeLiveTexts(new Uint8Array([...id, 6, 1, 1]))).toBeNull();
+		// A drop to generation 0 is what the log writes for a document that is gone.
+		expect(decodeLiveTexts(new Uint8Array([...id, 3, 1, 0]))?.[0]).toMatchObject({
+			kind: LIVE_TEXT_KIND.drop,
+			gen: 0,
+		});
 	});
 });

@@ -6294,6 +6294,9 @@ export const outlineQuestions = sqliteTable(
  * Pending CRDT updates of a page's live editing session, flushed at least once a second so a
  * crash loses nothing; folded into a commit when the session ends. `update_b64` is the Yjs update
  * as base64 text (there is no binary column type). `epoch` numbers the sessions of a page.
+ *
+ * No longer read or written since a space has one live session (`outline_live_log` below takes
+ * its place); the table goes with the rest of the page-keyed storage (pageless plan, X2).
  */
 export const outlineLiveUpdates = sqliteTable(
 	"outline_live_updates",
@@ -6309,6 +6312,33 @@ export const outlineLiveUpdates = sqliteTable(
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [primaryKey({ columns: [table.pageBlockId, table.epoch, table.seq] })],
+);
+
+// === outline_live_log ===
+/**
+ * What a space's live editing session has not committed yet (pageless plan, appendix B): text
+ * entries of the blocks people typed in and the session's bookkeeping rows, appended within half
+ * a second so a crash loses nothing acknowledged; replayed into commits at startup, dropped when
+ * the session ends cleanly. Transient: never exported, never part of history. `update_b64` is a
+ * row's payload as base64 text (there is no binary column type), whose entries name their
+ * blocks (the plan's `block_id` column is left out: a row holds several blocks' entries and
+ * nothing reads rows by block). `epoch` numbers the sessions of a space; epoch 0 holds one row
+ * per ended session (`live/registry.ts`).
+ */
+export const outlineLiveLog = sqliteTable(
+	"outline_live_log",
+	{
+		spaceId: text("space_id")
+			.notNull()
+			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
+		epoch: integer("epoch").notNull(),
+		seq: integer("seq").notNull(),
+		updateB64: text("update_b64").notNull(),
+		actorKind: text("actor_kind", { enum: ["human", "agent", "system"] }).notNull(),
+		actorId: text("actor_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.spaceId, table.epoch, table.seq] })],
 );
 
 // === outline_view_state ===

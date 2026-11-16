@@ -1,60 +1,88 @@
 /**
- * One page's live editing session (design §6.2–§6.6, plan §8, D33).
+ * One space's live editing session (design §6.2–§6.6, plan §8, D33; one per space since the
+ * pageless plan's L2).
  *
  * WHAT IT HOLDS
  * -------------
- *   - the text of every block of the page: a plain string (what the database holds) until
- *     someone changes it, then a Yjs document of that block alone (`shared/outline-live-text.ts`:
- *     made from the plain text the same way on every end, so nothing races its creation). A
- *     document is kept until the session ends, also when the change that made it was refused:
- *     every end must hold every item of a document it has;
- *   - a mirror of the page's structure (`mirror.ts`), equal to the blocks table between tasks;
- *   - the participants: people editing (write access) or viewing (read access) the page.
+ *   - a mirror of the part of the space people have open (`mirror.ts`): blocks by parent, a
+ *     page's tree loaded on the first join of the page and unloaded when nobody is in it, so the
+ *     session's size follows what is open ({@link OUTLINE_LIVE_BOUNDS.maxLoadedBlocks}); equal to
+ *     the blocks table between tasks;
+ *   - the text of every loaded block: a plain string (what the database holds) until someone
+ *     changes it, then a Yjs document of that block alone (`shared/outline-live-text.ts`: made
+ *     from the plain text the same way on every end, so nothing races its creation). A document
+ *     belongs to its block wherever the block is moved. It is kept, also when the change that
+ *     made it was refused (every end must hold every item of a document it has), until every
+ *     end drops it together (`sweepDocs`: generations);
+ *   - the participants, each in the page it joined ({@link LivePageView}): the wire protocol
+ *     still joins a page, and a participant is sent what concerns its page's tree only. Two
+ *     pages of a space are one session: one lane, one sequence of structural batches, one log.
  *
  * HOW CHANGES FLOW
  * ----------------
  *   - Text: a participant's updates (one per block it changed) are applied at once and
- *     broadcast to the others within {@link OUTLINE_LIVE_TIMING.broadcastMs}, merged per block
- *     with everything else of that window (`Y.mergeUpdates`), never echoed to their sender (who
- *     gets the transaction number back instead). Changed blocks are committed as the editor's
- *     own human commits a little later (after {@link OUTLINE_LIVE_TIMING.flushIdleMs} of quiet,
- *     at most {@link OUTLINE_LIVE_TIMING.flushMaxMs} after the first change), normalized off the
- *     main thread when large (`normalize.ts`).
+ *     broadcast to the others of the block's page within {@link OUTLINE_LIVE_TIMING.broadcastMs},
+ *     merged per block with everything else of that window (`Y.mergeUpdates`), never echoed to
+ *     their sender (who gets the transaction number back instead). Changed blocks are committed
+ *     as the editor's own human commits a little later (after
+ *     {@link OUTLINE_LIVE_TIMING.flushIdleMs} of quiet, at most
+ *     {@link OUTLINE_LIVE_TIMING.flushMaxMs} after the first change), normalized off the main
+ *     thread when large (`normalize.ts`).
  *   - Structure: a structural transaction (insert, move, delete, checkbox, plus the text
  *     updates of the same keystroke) is checked against the mirror, written as one commit
- *     through `writeOutline`, then broadcast in canonical form. A refused transaction is rolled
- *     back (its text part by undoing it in each block's document) and every later frame of that
- *     participant is dropped until it joins again; the client rebuilds its documents and replays
- *     its own later changes.
+ *     through `writeOutline`, then broadcast in canonical form. Its blocks and parents may be in
+ *     any loaded trees of the space: there is no page boundary (only the top-level blocks
+ *     themselves cannot be moved, deleted or checked over the wire yet). Each page is sent its
+ *     own view of the batch (`route`): a block moved to another page's tree is a delete there
+ *     and inserts (with text) here. A refused transaction is rolled back (its text part by
+ *     undoing it in each block's document) and every later frame of that participant is dropped
+ *     until it joins again; the client rebuilds its documents and replays its own later changes.
  *   - Writes from outside (agents, reverts) reach the session through the barrier
  *     (`live-barrier.ts`): unflushed text is committed first, then the outside commit is read
- *     back (its block versions) and pushed in as a remote change, merged into the live text.
- *   - Every text update is also appended to `outline_live_updates` within
+ *     back (its block versions) and pushed in as a remote change, merged into the live text. A
+ *     block a commit moves between two loaded pages keeps its document.
+ *   - Every text update is also appended to `outline_live_log` within
  *     {@link OUTLINE_LIVE_TIMING.persistMs} (a snapshot of every document first, increments
- *     after, each block's seed text before its first update, compacted once the increments
- *     outweigh a snapshot; the row format is {@link encodeLogTexts}). A participant's
- *     transactions are acknowledged only once the log (or the page) has them: after a crash,
- *     what was acknowledged is replayed from the log (a startup job, or the next join), and what
- *     was not is still held by its client, which replays it into the next session. Every join
- *     after a client's first names
- *     the session it was in, and the answer says which of its transactions the page applied
- *     (`tx`) and which of those are safe in the log or committed (`dur`): the client forgets
- *     the latter, keeps the rest of what was applied unsent until acknowledged, and replays
- *     only what the page does not have, so nothing is applied twice (also across a refusal,
- *     a restart or days offline: an ended session's positions stay in the log, `registry.ts`).
- *     Before the session commits text it logs what it is about to write (an intent), so a
- *     crash between the commit and the next append does not merge committed text with itself.
+ *     after, each block's seed text before its first update, a dropped document's drop before
+ *     anything later of its block, compacted once the increments outweigh a snapshot; the row
+ *     format is {@link encodeLogTexts}). A participant's transactions are acknowledged only once
+ *     the log (or the space) has them: after a crash, what was acknowledged is replayed from the
+ *     log (a startup job, or the next join), and what was not is still held by its client, which
+ *     replays it into the next session. Every join after a client's first names the session it
+ *     was in, and the answer says which of its transactions the space applied (`tx`) and which
+ *     of those are safe in the log or committed (`dur`): the client forgets the latter, keeps
+ *     the rest of what was applied unsent until acknowledged, and replays only what the space
+ *     does not have, so nothing is applied twice (also across a refusal, a restart or days
+ *     offline: an ended session's positions stay in the log, `registry.ts`). Before the session
+ *     commits text it logs what it is about to write (an intent), so a crash between the commit
+ *     and the next append does not merge committed text with itself.
  *   - Failures: a commit that fails part way keeps what was written (the session takes it as
- *     the page now is); text that cannot be normalized or written is committed as code blocks,
+ *     the space now is); text that cannot be normalized or written is committed as code blocks,
  *     and given up on (kept live and in the log) when even that fails a few times; a log that
- *     cannot be committed is taken over by the next session of the page. A frame that cannot
+ *     cannot be committed is taken over by the next session of the space. A frame that cannot
  *     be encoded drops only its recipient.
  *
- * Every method that touches the document or the database runs in the space's lane.
+ * BOUNDS
+ * ------
+ * Loaded blocks and their content per space ({@link OUTLINE_LIVE_BOUNDS}; pages nobody is in go
+ * first, then the join is refused), loaded blocks across the process (`registry.ts`), documents
+ * (dropped when idle or when there are many; a hard bound as the last resort), a participant's
+ * queued frames and buffered bytes. Loading and unloading a tree is one bounded read and
+ * {@link OUTLINE_LIVE_BOUNDS.loadStep} blocks at a time in memory, yielding in between.
+ *
+ * Every method that touches the documents or the database runs in the space's lane.
  */
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { compareOrderKeys, keyBetween, merge3 } from "@shared/outline";
+import {
+	cancelLiveTimer,
+	type LiveTimer,
+	liveNow,
+	liveSleep,
+	liveTimeout,
+	liveYield,
+} from "@shared/outline-live-clock";
 import {
 	decodeLiveTexts,
 	encodeLiveFrame,
@@ -72,6 +100,7 @@ import {
 	type LiveCommitWire,
 	type LiveJoinedHead,
 	type LiveJoinHead,
+	type LiveLostWire,
 	type LiveOp,
 	type LivePeerWire,
 	type LivePresenceDown,
@@ -103,7 +132,7 @@ import {
 } from "../errors";
 import { OUTLINE_CHANGE, OUTLINE_LIMITS, type OutlineTaskJson } from "../model";
 import { outlineStore } from "../store";
-import type { OutlineVersionRow } from "../store/port";
+import type { OutlineLiveLogRow, OutlineVersionRow } from "../store/port";
 import {
 	type OutlineCanonicalContent,
 	type OutlineOp,
@@ -117,7 +146,7 @@ import {
 	readLiveAgents,
 } from "./agent-presence";
 import { asOwnLiveWrite } from "./lane";
-import { type MirrorBlock, PageMirror, taskCharOf } from "./mirror";
+import { type MirrorBlock, SpaceMirror, taskCharOf } from "./mirror";
 import { type LiveNormalized, normalizeLiveTexts } from "./normalize";
 import type { RecoveredChange } from "./replay";
 
@@ -131,14 +160,16 @@ export const OUTLINE_LIVE_TIMING: Record<
 	| "idleCloseMs"
 	| "flushRetryMs"
 	| "narrowBudgetMs"
-	| "agentsMs",
+	| "agentsMs"
+	| "sweepMs"
+	| "docIdleMs",
 	number
 > = {
 	/** Changes are coalesced and broadcast this often (design §7.2). */
 	broadcastMs: 50,
 	/** Cursors are coalesced (last one wins) and broadcast this often. */
 	presenceMs: 100,
-	/** Yjs updates reach `outline_live_updates` at most this long after they arrive. */
+	/** Yjs updates reach `outline_live_log` at most this long after they arrive. */
 	persistMs: 500,
 	/** Changed text is committed after this much quiet… */
 	flushIdleMs: 2_000,
@@ -152,6 +183,13 @@ export const OUTLINE_LIVE_TIMING: Record<
 	narrowBudgetMs: 15_000,
 	/** The agents of a page are worked out again at most this often (P2 PR 10b). */
 	agentsMs: 1_000,
+	/** Documents nobody needs any more are looked for this often (`LiveSpace.sweepDocs`). */
+	sweepMs: 30_000,
+	/**
+	 * A block's document is dropped once its text is committed and nothing changed it for this
+	 * long (every end drops it together; the block's text undo history goes with it).
+	 */
+	docIdleMs: 5 * 60_000,
 };
 
 /** Bounds of a session. Mutable only so tests can shrink them. */
@@ -170,6 +208,35 @@ export const OUTLINE_LIVE_BOUNDS = {
 	 * documents (4,096), deleted blocks' included, before it starts afresh.
 	 */
 	docCostBytes: 4096,
+	/**
+	 * Documents a session holds before it drops the least recently changed committed ones without
+	 * waiting for {@link OUTLINE_LIVE_TIMING.docIdleMs}. Well under the hard bound above, which
+	 * is the last resort (reached only when that many documents are all uncommitted or parked).
+	 */
+	softDocs: 2048,
+	/** Documents one sweep drops at most (one lane task; the rest wait for the next). */
+	evictPerSweep: 256,
+	/**
+	 * Blocks (deleted ones it remembers included) and UTF-16 units of content one space's session
+	 * holds in its mirror at most. A join that would pass them first unloads the pages nobody is
+	 * in, and is refused (`space_full`) when that is not enough.
+	 */
+	maxLoadedBlocks: 20_000,
+	maxLoadedChars: 32 * 1024 * 1024,
+	/** Blocks whose leaving the session is remembered ({@link LiveSpace} `recentlyGone`). */
+	goneBlocks: 5000,
+	/**
+	 * Blocks one person's pages may hold in a space's mirror, so one person with many tabs
+	 * cannot take the whole of {@link maxLoadedBlocks}. Past it, a join that would load another
+	 * page is refused (`user_limit`); no open page of theirs is closed for it. Its limits: it is
+	 * per account (the same person on two devices counts once, two people on one account too);
+	 * it counts only the pages that person is alone in (a page someone else is in too is
+	 * nobody's share), pages already loaded cost nothing to join, and a person's first page is
+	 * never refused by it (the space's own bound still applies).
+	 */
+	maxUserBlocks: 8000,
+	/** Blocks put into or taken out of the mirror between two yields to the event loop. */
+	loadStep: 500,
 	/** Failed commits of a block as code after which it is no longer retried (until edited). */
 	maxCommitFailures: 3,
 	/** A socket buffering more than this gets no more frames until it drains and rejoins. */
@@ -195,6 +262,11 @@ export const OUTLINE_LIVE_BOUNDS = {
 	clientKeysHard: 1024,
 	/** Blocks one block selection may name in presence. */
 	presenceBlocks: 200,
+	/**
+	 * Notices of text not taken kept per client key until its client shows it got them (a
+	 * join). Past it the oldest go, with a warning.
+	 */
+	lostPerKey: 1024,
 };
 
 const SERVER_ORIGIN = { live: "server" } as const;
@@ -252,7 +324,13 @@ export class Participant {
 		readonly key: string,
 		readonly wantsEdit: boolean,
 		public canWrite: boolean,
+		/** The page it joined. */
+		readonly scope: LivePageView,
 	) {}
+
+	get root(): string {
+		return this.scope.rootId;
+	}
 
 	get userId(): string {
 		return this.socket.userId;
@@ -280,6 +358,24 @@ interface AgentPeer {
 /** One block's text change of the broadcast window: who made it (0: not a participant). */
 interface WindowUpdate extends LiveTextEntry {
 	from: number;
+	/** The page (top-level block) whose participants get it. */
+	scope: string;
+}
+
+/** A structural change with the trees it concerns, before it is cut to each page's view. */
+interface RoutedOp {
+	op: LiveOp;
+	/** The tree the block is in after the change. */
+	top: string;
+	/** A move: the tree it was in before, and what moved with it (parents first). */
+	from?: string;
+	sub?: string[];
+}
+
+/** One page's view of a structural batch. */
+interface ScopedCommit {
+	root: string;
+	wire: LiveCommitWire;
 }
 
 /** One block's text change waiting for the log. */
@@ -316,332 +412,149 @@ function newEpoch(): number {
 	return ((a[0] as number) % 0x7ffffffe) + 1;
 }
 
-export class LivePage {
-	/** The documents of blocks whose text someone changed in this session, by block id. */
-	private readonly docs = new Map<string, LiveTextDoc>();
-	/**
-	 * Blocks a write from outside added, by the operation number of the batch that added them: a
-	 * resuming client that had not seen that batch is sent their seed text.
-	 */
-	private readonly seededAt = new Map<string, number>();
-	readonly mirror: PageMirror;
-	readonly epoch = newEpoch();
+/**
+ * One page people have joined in a space's session: the page's tree is loaded in the session's
+ * mirror, and this holds who is in it, their presence, and the agents working on the page. The
+ * wire protocol still joins a page (L3 changes it to "join a space, watch parents"); everything
+ * a participant is sent is cut to its page here and in `LiveSpace.flushBroadcast`.
+ *
+ * Tests and diagnostics reach a page's session through it (`liveSessionOf`).
+ */
+export class LivePageView {
 	readonly participants = new Map<number, Participant>();
-	private nextPno = 1;
-	/** Per client key: the highest transaction processed (least recently used first). */
-	private readonly keys = new Map<string, number>();
-	/** Per client key: the highest transaction acknowledged to its client. */
-	private readonly keyAcked = new Map<string, number>();
-	private opSeq = 0;
-	private readonly opLog: LiveCommitWire[] = [];
-	closed = false;
-	/** Set at close: everything was committed and the log dropped. */
-	closedClean = false;
-	private closing: Promise<void> | null = null;
+	/** The session's operation number when the tree was loaded: older resumes get a snapshot. */
+	loadedAtOp = 0;
+	/** Set once the page's tree is being taken out of the session. */
+	gone = false;
+	/**
+	 * The generation the tree's blocks were given when it was loaded: a snapshot names it once
+	 * (`LiveJoinedHead.g`) and sends a generation only with the blocks that have another.
+	 */
+	baseGen = 0;
+	/** Blocks the tree had when it was loaded (budgets). */
+	blocks = 0;
+	/** When someone last joined (a person's least recently joined page goes first). */
+	joinedAt = 0;
 
-	// Broadcast window.
-	private windowUpdates: WindowUpdate[] = [];
-	private windowCommits: LiveCommitWire[] = [];
-	private readonly windowAcks = new Map<number, Array<[number, number, LiveOp[]?]>>();
-	private broadcastTimer: ReturnType<typeof setTimeout> | null = null;
+	constructor(
+		readonly space: LiveSpace,
+		readonly rootId: string,
+	) {}
+
+	get pageId(): string {
+		return this.rootId;
+	}
+
+	get spaceId(): string {
+		return this.space.spaceId;
+	}
+
+	get epoch(): number {
+		return this.space.epoch;
+	}
+
+	get closed(): boolean {
+		return this.space.closed || this.gone;
+	}
+
+	get stats(): LiveSpace["stats"] {
+		return this.space.stats;
+	}
+
+	get mirror(): SpaceMirror {
+		return this.space.mirror;
+	}
+
+	textOf(id: string): string {
+		return this.space.textOf(id);
+	}
+
+	textState(id: string): { state: Uint8Array; stuck: boolean } | null {
+		return this.space.textState(id);
+	}
+
+	/** Documents of this page's blocks (deleted ones included). */
+	get textDocIds(): string[] {
+		return this.space.textDocIdsOf(this.rootId);
+	}
+
+	get textDocs(): number {
+		return this.textDocIds.length;
+	}
+
+	/** Whether any text of this page is waiting to be committed. */
+	get hasUnflushed(): boolean {
+		return this.space.hasUnflushedIn(this.rootId);
+	}
+
+	flushContent(): Promise<boolean> {
+		return this.space.flushContent();
+	}
+
+	persistNow(): Promise<boolean> {
+		return this.space.persistNow();
+	}
+
+	/** A text frame of one of the page's participants (tests drive the session directly). */
+	handleUpdate(p: Participant, n: number, body: Uint8Array): void {
+		this.space.handleUpdate(p, n, body);
+	}
+
+	handleTx(p: Participant, n: number, rawHead: unknown, body: Uint8Array): Promise<void> {
+		return this.space.handleTx(p, n, rawHead, body);
+	}
+
+	/** The session's record of client keys (tests look at its bound). */
+	get keys(): ReadonlyMap<string, number> {
+		return this.space.clientKeys;
+	}
+
+	/** Stop every timer of the view (the page left the session, or the session ended). */
+	stop(): void {
+		this.gone = true;
+		for (const timer of [this.presenceTimer, this.idleTimer, this.agentTimer, this.agentExpiry])
+			if (timer) cancelLiveTimer(timer);
+		this.presenceTimer = null;
+		this.idleTimer = null;
+		this.agentTimer = null;
+		this.agentExpiry = null;
+	}
 
 	// Presence.
-	private readonly presencePeers = new Set<number>();
-	private readonly presenceGone = new Set<number>();
-	private readonly presenceCursors = new Set<number>();
+	readonly presencePeers = new Set<number>();
+	readonly presenceGone = new Set<number>();
+	readonly presenceCursors = new Set<number>();
 	/** Recipients that skipped presence under backpressure and need the full picture. */
-	private readonly presenceBehind = new Set<number>();
-	private presenceTimer: ReturnType<typeof setTimeout> | null = null;
+	readonly presenceBehind = new Set<number>();
+	presenceTimer: LiveTimer | null = null;
 
 	// Agents (outline P2 PR 10b): sessions running with a cursor on this page.
 	/** By narrator id, in the order shown. */
-	private readonly agents = new Map<string, AgentPeer>();
+	readonly agents = new Map<string, AgentPeer>();
 	/** Agents present beyond those shown. */
-	private agentsMore = 0;
+	agentsMore = 0;
 	/** An agent keeps its participant number for the session's life. */
-	private readonly agentPnos = new Map<string, number>();
+	readonly agentPnos = new Map<string, number>();
 	/** Agents' numbers count up from the base and are never given twice in a session. */
-	private nextAgentPno = OUTLINE_LIVE_AGENT_PNO_BASE;
-	private readonly agentPeersChanged = new Set<number>();
-	private readonly agentGone = new Set<number>();
-	private readonly agentCursors = new Set<number>();
-	private agentsMoreChanged = false;
+	nextAgentPno = OUTLINE_LIVE_AGENT_PNO_BASE;
+	readonly agentPeersChanged = new Set<number>();
+	readonly agentGone = new Set<number>();
+	readonly agentCursors = new Set<number>();
+	agentsMoreChanged = false;
 	/** Blocks of this page agents wrote lately, by narrator. */
-	private readonly agentWrites = new Map<string, LiveAgentWrite>();
+	readonly agentWrites = new Map<string, LiveAgentWrite>();
 	/** Who may read which agent's session: user id → narrator id → verdict. */
-	private readonly agentReaders = new Map<string, Map<string, boolean>>();
-	private agentReadersStale = false;
+	readonly agentReaders = new Map<string, Map<string, boolean>>();
+	agentReadersStale = false;
 	/** Narrators whose run starting or ending may change this page's agents. */
 	agentInterest: ReadonlySet<string> = new Set();
-	private agentTimer: ReturnType<typeof setTimeout> | null = null;
-	private agentExpiry: ReturnType<typeof setTimeout> | null = null;
-	private agentRunning = false;
-	private agentDirty = false;
-	private agentLastAt = 0;
+	agentTimer: LiveTimer | null = null;
+	agentExpiry: LiveTimer | null = null;
+	agentRunning = false;
+	agentDirty = false;
+	agentLastAt = 0;
 
-	// Text not committed yet: block id → who changed it last (null: not a person).
-	private readonly dirty = new Map<string, string | null>();
-	private firstDirtyAt = 0;
-	private lastDirtyAt = 0;
-	private flushTimer: ReturnType<typeof setTimeout> | null = null;
-	/** Blocks whose text changed in the update being applied (for structural transactions). */
-	private touched: Set<string> | null = null;
-
-	// Persistence.
-	private pendingRows: PendingRow[] = [];
-	/** Blocks whose database content changed since the last sync row (see `persistStep`). */
-	private readonly syncPending = new Map<string, string>();
-	/** Commits about to be written: block → the content it will have (see `persistStep`). */
-	private readonly intentPending = new Map<string, string>();
-	/** Intents written to the log and not resolved by a sync row or a cancel yet. */
-	private readonly openIntents = new Map<string, string>();
-	/** Intents whose commit did not happen. */
-	private readonly cancelPending = new Set<string>();
-	/** Per client key: the highest transaction known to be in the log (or committed). */
-	private readonly keyDurable = new Map<string, number>();
-	/** Client keys whose durable transaction advanced since the last log row about them. */
-	private readonly keysPending = new Set<string>();
-	private persistTimer: ReturnType<typeof setTimeout> | null = null;
-	private persistChain: Promise<void> = Promise.resolve();
-	private logSeq = 0;
-	private snapshotWritten = false;
-	private rowsSinceCompact = 0;
-	/** Base64 bytes of the increments appended since the last snapshot. */
-	private bytesSinceCompact = 0;
-	/** Base64 bytes of the last snapshot row. */
-	private snapshotBytes = 0;
-	/** Bytes charged since the session opened: updates taken in, documents made (`charge`). */
-	private docBytes = 0;
-	private restartRequested = false;
-	/** Structural transactions whose change is applied but held back from the log. */
-	private holding = 0;
-	/** The snapshot row is wanted now, even with nothing else to log. */
-	private snapshotWanted = false;
-	/** Blocks whose text could not be normalized or written: committed as a code block next. */
-	private readonly stuck = new Set<string>();
-	/** Failed commits per block, since its last successful one. */
-	private readonly failures = new Map<string, number>();
-	/** Blocks whose text cannot be committed even as code: kept live and in the log only. */
-	private readonly parked = new Set<string>();
-
-	private idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-	/** Measurements for diagnostics and the PR's numbers. */
-	readonly stats = {
-		updatesIn: 0,
-		updateBytesIn: 0,
-		applyMs: 0,
-		framesOut: 0,
-		bytesOut: 0,
-		mergeMs: 0,
-		txCommitted: 0,
-		txRejected: 0,
-		flushCommits: 0,
-		rowsWritten: 0,
-		rowBytes: 0,
-		compactions: 0,
-		resyncs: 0,
-	};
-
-	private constructor(
-		readonly pageId: string,
-		readonly spaceId: string,
-		private readonly schedule: (task: () => Promise<void>) => void,
-		private readonly onEnd: (page: LivePage, code: LiveCloseCode, idle: boolean) => void,
-	) {
-		this.mirror = new PageMirror(pageId);
-	}
-
-	/**
-	 * Open a session: read the page (it must be small enough); no text document is made. Runs in
-	 * the space's lane. `schedule` queues a task on that lane; `onEnd` asks for the session to be
-	 * closed (idle: the last participant left and the idle period passed; or the page went, or
-	 * the document grew past its bound).
-	 */
-	static async open(
-		pageId: string,
-		spaceId: string,
-		schedule: (task: () => Promise<void>) => void,
-		onEnd: (page: LivePage, code: LiveCloseCode, idle: boolean) => void,
-	): Promise<LivePage | Refusal> {
-		const { blocks, truncated } = await outlineStore.listPageBlocks(
-			pageId,
-			OUTLINE_LIVE_LIMITS.maxPageBlocks,
-		);
-		if (truncated) return { refused: "too_large" };
-		const page = blocks.find((b) => b.id === pageId);
-		if (!page || page.parentId !== null || page.spaceId !== spaceId)
-			return { refused: "access_denied" };
-		let bytes = 0;
-		for (const b of blocks) bytes += bytesOf(b.content);
-		if (bytes > OUTLINE_LIVE_LIMITS.maxPageBytes) return { refused: "too_large" };
-		const session = new LivePage(pageId, spaceId, schedule, onEnd);
-		for (const b of blocks) {
-			session.mirror.put({
-				id: b.id,
-				sid: b.sid,
-				parentId: b.parentId,
-				orderKey: b.orderKey,
-				taskJson: b.taskJson,
-				question: b.askJson !== null,
-				deleted: false,
-				dbContent: b.content,
-			});
-		}
-		// The texts are what the database holds: nothing to persist or broadcast yet.
-		session.docBytes = bytes + 64 * blocks.length;
-		return session;
-	}
-
-	// ─────────────────────────────────────────────────────────────────────────
-	// Text
-	// ─────────────────────────────────────────────────────────────────────────
-
-	/**
-	 * A block's document, made on first use from the text the database holds for it (the empty
-	 * text for a block the page does not have yet: a block a transaction is about to insert).
-	 * Every end makes it from that same text (`shared/outline-live-text.ts`); the log learns the
-	 * text before the document's first update.
-	 */
-	private textDoc(id: string): LiveTextDoc {
-		const existing = this.docs.get(id);
-		if (existing) return existing;
-		const seed = this.mirror.get(id)?.dbContent ?? "";
-		const made = seededTextDoc(seed);
-		this.docs.set(id, made);
-		// A document is kept until the session ends, also when its block is deleted: each one
-		// counts against the session's bound.
-		this.charge(OUTLINE_LIVE_BOUNDS.docCostBytes);
-		if (seed.length > 0)
-			this.pendingRows.push({
-				actorKind: "system",
-				actorId: LIVE_LOG_ACTOR,
-				id,
-				kind: LIVE_TEXT_KIND.seed,
-				data: encodeLiveSeed(seed),
-			});
-		made.doc.on("update", (update: Uint8Array, origin: unknown) => {
-			if (this.closed) return;
-			this.charge(update.length);
-			const from = origin instanceof Participant ? origin.pno : 0;
-			this.windowUpdates.push({ from, id, kind: LIVE_TEXT_KIND.update, data: update });
-			this.scheduleBroadcast();
-			this.pendingRows.push({
-				...(origin instanceof Participant
-					? { actorKind: "human" as const, actorId: origin.userId }
-					: { actorKind: "system" as const, actorId: LIVE_LOG_ACTOR }),
-				id,
-				kind: LIVE_TEXT_KIND.update,
-				data: update,
-			});
-			this.schedulePersist();
-		});
-		made.text.observe((_event, txn) => {
-			this.touched?.add(id);
-			if (txn.origin instanceof Participant) this.markDirty(id, txn.origin.userId);
-		});
-		return made;
-	}
-
-	/**
-	 * Count bytes against the session's bound ({@link OUTLINE_LIVE_BOUNDS.maxDocBytes}). Past it
-	 * the session ends: everything is committed, the participants rejoin a fresh one, which has
-	 * the page's live blocks as plain text again and no document (none of a deleted block's).
-	 */
-	private charge(bytes: number): void {
-		this.docBytes += bytes;
-		if (this.docBytes <= OUTLINE_LIVE_BOUNDS.maxDocBytes || this.restartRequested) return;
-		this.restartRequested = true;
-		logger.warn("Outline live documents grew past their bound; restarting the session", {
-			pageId: this.pageId,
-			bytes: this.docBytes,
-			documents: this.docs.size,
-		});
-		this.onEnd(this, "ended", false);
-	}
-
-	/** Whether the session holds a text for the block (a document, or the page's block). */
-	private hasText(id: string): boolean {
-		return this.docs.has(id) || this.mirror.get(id) !== undefined;
-	}
-
-	/** Change a block's text as the session itself (never a participant). */
-	private editText(id: string, edit: (text: Y.Text) => void): void {
-		const t = this.textDoc(id);
-		t.doc.transact(() => edit(t.text), SERVER_ORIGIN);
-	}
-
-	/** Documents made so far (diagnostics and measurements). */
-	get textDocs(): number {
-		return this.docs.size;
-	}
-
-	/** Blocks that have a document (diagnostics and tests). */
-	get textDocIds(): string[] {
-		return [...this.docs.keys()];
-	}
-
-	/**
-	 * A block's document as diagnostics and tests compare it across ends: its whole state, and
-	 * whether an update that names items it lacks is stuck in it. Null without a document.
-	 */
-	textState(id: string): { state: Uint8Array; stuck: boolean } | null {
-		const t = this.docs.get(id);
-		return t ? { state: Y.encodeStateAsUpdate(t.doc), stuck: hasPendingStructs(t.doc) } : null;
-	}
-
-	/**
-	 * Every text of the session, as a snapshot carries it: each document's whole state, and the
-	 * seed text of every other block the session knows (deleted ones too: undoing a delete
-	 * brings a block back with the text it had). A block with the empty text has no entry.
-	 */
-	private allTexts(): LiveTextEntry[] {
-		const out: LiveTextEntry[] = [];
-		for (const [id, t] of this.docs)
-			out.push({ id, kind: LIVE_TEXT_KIND.update, data: Y.encodeStateAsUpdate(t.doc) });
-		for (const b of this.mirror.all()) {
-			if (b.dbContent.length === 0 || this.docs.has(b.id)) continue;
-			out.push({ id: b.id, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed(b.dbContent) });
-		}
-		return out;
-	}
-
-	/**
-	 * What a resuming client lacks: of each document it named, the difference to its state
-	 * vector; every other document whole; and the seed text of blocks added from outside after
-	 * the last batch it saw. Null when a vector cannot be read.
-	 */
-	private missingTexts(vectors: readonly LiveTextEntry[], op: number): LiveTextEntry[] | null {
-		const named = new Map<string, Uint8Array>();
-		for (const v of vectors) if (v.kind === LIVE_TEXT_KIND.vector) named.set(v.id, v.data);
-		const out: LiveTextEntry[] = [];
-		for (const [id, at] of this.seededAt) {
-			if (at <= op || this.docs.has(id)) continue;
-			const content = this.mirror.get(id)?.dbContent ?? "";
-			if (content.length > 0)
-				out.push({ id, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed(content) });
-		}
-		try {
-			for (const [id, t] of this.docs) {
-				const vector = named.get(id);
-				const data = vector ? Y.encodeStateAsUpdate(t.doc, vector) : Y.encodeStateAsUpdate(t.doc);
-				// An update of no structs and no deletions is two zero bytes.
-				if (data.length > 2) out.push({ id, kind: LIVE_TEXT_KIND.update, data });
-			}
-		} catch {
-			return null;
-		}
-		return out;
-	}
-
-	// ─────────────────────────────────────────────────────────────────────────
-	// Reading
-	// ─────────────────────────────────────────────────────────────────────────
-
-	/** A block's live text (its database content while nobody changed it in the session). */
-	textOf(id: string): string {
-		return this.docs.get(id)?.text.toString() ?? this.mirror.get(id)?.dbContent ?? "";
-	}
+	idleTimer: LiveTimer | null = null;
 
 	get editors(): number {
 		let n = 0;
@@ -653,431 +566,23 @@ export class LivePage {
 		return this.participants.size - this.editors;
 	}
 
-	/** Nothing waits to be broadcast (tests). */
-	get quiet(): boolean {
-		return (
-			this.broadcastTimer === null &&
-			this.windowUpdates.length === 0 &&
-			this.windowCommits.length === 0
-		);
-	}
-
-	/**
-	 * Stop without committing or closing anything, as if the process had died here (tests of
-	 * the replay). The log rows stay.
-	 */
-	abandon(): void {
-		this.closed = true;
-		for (const timer of [
-			this.broadcastTimer,
-			this.presenceTimer,
-			this.flushTimer,
-			this.persistTimer,
-			this.idleTimer,
-			this.agentTimer,
-			this.agentExpiry,
-		]) {
-			if (timer) clearTimeout(timer);
-		}
-		this.participants.clear();
-		this.destroyDocs();
-	}
-
-	private destroyDocs(): void {
-		for (const t of this.docs.values()) t.doc.destroy();
-		this.docs.clear();
-	}
-
-	/** Whether any text is waiting to be committed. */
-	get hasUnflushed(): boolean {
-		return this.dirty.size > 0;
-	}
-
-	/**
-	 * Take over text an earlier session of this page left that could not be committed (its log
-	 * is replayed into this one): the blocks get it as live text, to be committed by this
-	 * session like anything typed. In the lane, right after opening.
-	 */
-	adoptRecovered(changes: readonly RecoveredChange[]): void {
-		for (const c of changes) {
-			if (!this.mirror.alive(c.id)) continue;
-			const current = this.textOf(c.id);
-			if (current === c.text) continue;
-			this.mergeText(c.id, current, c.text);
-			this.markDirty(c.id, c.actor);
-		}
-	}
-
-	// ─────────────────────────────────────────────────────────────────────────
-	// Participants
-	// ─────────────────────────────────────────────────────────────────────────
-
-	/**
-	 * Add a participant and answer its join: a snapshot (reset), or the difference to what it
-	 * has when it resumes this same session. `dur`: of the client's previous session (gone), the
-	 * transactions already in the page (a reset tells the client not to replay them).
-	 *
-	 * The participant is added only once its answer is encoded and queued: a join that cannot be
-	 * answered leaves nothing behind.
-	 */
-	join(
-		socket: LiveSocket,
-		handle: number,
-		head: LiveJoinHead,
-		/** On a resume: a `vector` entry for every document the client holds. */
-		held: Uint8Array,
-		canWrite: boolean,
-		dur?: number,
-	): Participant | Refusal {
-		if (this.closed || this.restartRequested) return { refused: "ended" };
-		// People are numbered below the agents' numbers: a session that has seen that many joins
-		// starts afresh (everyone rejoins a new one), as one whose document grew too large does.
-		if (this.nextPno >= OUTLINE_LIVE_AGENT_PNO_BASE) {
-			this.restartRequested = true;
-			this.onEnd(this, "ended", false);
-			return { refused: "ended" };
-		}
-		if (
-			canWrite
-				? this.editors >= OUTLINE_LIVE_LIMITS.editorsPerPage
-				: this.viewers >= OUTLINE_LIVE_LIMITS.viewersPerPage
-		)
-			return { refused: "unavailable" };
-		// A socket that has not taken what it was sent gets no snapshot on top of it.
-		if (socketBuffered(socket) > OUTLINE_LIVE_BOUNDS.lagBytes) return { refused: "unavailable" };
-		const p = new Participant(
-			this.nextPno,
-			socket,
-			handle,
-			head.key,
-			head.mode === "edit",
-			canWrite,
-		);
-		const resume = head.resume;
-		let joined: LiveJoinedHead;
-		let body: Uint8Array;
-		const base = {
-			epoch: this.epoch,
-			w: canWrite,
-			op: this.opSeq,
-			me: p.pno,
-			// Agents are named once this person's verdicts are known (`learnAgentReaders`).
-			peers: [
-				...[...this.participants.values()].map((x) => x.peer()),
-				...[...this.agents.values()].map((a) => this.agentWire(a, socket.userId)),
-			],
-			cur: [
-				...[...this.participants.values()]
-					.filter((x) => x.sel !== null)
-					.map((x) => [x.pno, x.sel] as [number, LiveSelWire | null]),
-				...[...this.agents.values()].map((a) => [a.pno, a.sel] as [number, LiveSelWire | null]),
-			],
-			...(this.agentsMore > 0 ? { am: this.agentsMore } : {}),
-		};
-		// Which of the client's transactions of its previous session the page has: this session's
-		// own bookkeeping when it is that session (a resume, or a snapshot after a refusal), else
-		// what the registry knows of the ended one (`dur`).
-		const sameSession = resume !== undefined && resume.epoch === this.epoch;
-		const processed = sameSession ? (this.keys.get(head.key) ?? 0) : (dur ?? 0);
-		const durable = sameSession
-			? Math.min(processed, this.keyDurable.get(head.key) ?? 0)
-			: (dur ?? 0);
-		let diff: LiveTextEntry[] | null = null;
-		if (sameSession && !resume.reset) {
-			const vectors = decodeLiveTexts(held, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
-			diff = vectors ? this.missingTexts(vectors, resume.op) : null;
-		}
-		if (resume && diff) {
-			const covered =
-				resume.op === this.opSeq ||
-				(this.opLog.length > 0 && (this.opLog[0] as LiveCommitWire).o <= resume.op + 1);
-			joined = {
-				...base,
-				mode: "resume",
-				tx: processed,
-				// Processed but not in the log yet: the client keeps those until acknowledged.
-				dur: durable,
-				...(covered
-					? { ops: this.opLog.filter((c) => c.o > resume.op) }
-					: { blocks: this.mirror.snapshot() }),
-			};
-			body = encodeLiveTexts(diff);
-		} else {
-			joined = {
-				...base,
-				mode: "reset",
-				tx: processed,
-				dur: durable,
-				blocks: this.mirror.snapshot(),
-			};
-			body = encodeLiveTexts(this.allTexts());
-		}
-		let frame: Uint8Array;
-		try {
-			frame = encodeLiveFrame({ kind: LIVE_FRAME.joined, handle, head: joined, body });
-		} catch (error) {
-			logger.warn("Outline live join could not be answered", {
-				pageId: this.pageId,
-				error: String(error),
-			});
-			return { refused: "unavailable" };
-		}
-		// In this same session the participant goes on from where its client was: what is
-		// applied is not taken again, and is acknowledged once logged. A client of an ended
-		// session numbers on from its old transactions, which this session never saw.
-		p.lastTx = sameSession ? processed : 0;
-		p.durableTx = sameSession ? durable : 0;
-		p.ackedTx = p.durableTx;
-		if (sameSession && durable > (this.keyAcked.get(head.key) ?? 0))
-			this.keyAcked.set(head.key, durable);
-		p.windowStart = this.windowUpdates.length;
-		p.commitStart = this.windowCommits.length;
-		if (!this.sendTo(p, frame, "control")) return { refused: "unavailable" };
-		this.nextPno++;
-		this.participants.set(p.pno, p);
-		this.cancelIdle();
-		this.presencePeers.add(p.pno);
-		this.schedulePresence();
-		// The first person in: who else is working here. Later ones: whose names they may see.
-		if (this.participants.size === 1 && this.agents.size === 0) this.requestAgents();
-		else if (this.agents.size > 0) void this.learnAgentReaders([p], [...this.agents.keys()]);
-		return p;
-	}
-
-	leave(p: Participant): void {
-		if (this.participants.get(p.pno) !== p) return;
-		this.participants.delete(p.pno);
-		this.windowAcks.delete(p.pno);
-		this.presencePeers.delete(p.pno);
-		this.presenceCursors.delete(p.pno);
-		this.presenceBehind.delete(p.pno);
-		this.presenceGone.add(p.pno);
-		this.schedulePresence();
-		if (this.participants.size === 0) this.armIdle();
-	}
-
-	/**
-	 * Change a participant's write access (an access change re-checked it). A viewer becomes an
-	 * editor only while the page has room for one more.
-	 */
-	setWrite(p: Participant, canWrite: boolean): void {
-		if (p.canWrite === canWrite || this.participants.get(p.pno) !== p) return;
-		if (canWrite && this.editors >= OUTLINE_LIVE_LIMITS.editorsPerPage) return;
-		p.canWrite = canWrite;
-		this.deliver(p, "control", () =>
-			encodeLiveFrame({ kind: LIVE_FRAME.mode, handle: p.handle, head: { w: canWrite } }),
-		);
-		this.presencePeers.add(p.pno);
-		this.schedulePresence();
-	}
-
-	/** Tell a participant the session ended for it (it is removed). */
-	dismiss(p: Participant, code: LiveCloseCode): void {
-		this.deliver(p, "control", () =>
-			encodeLiveFrame({ kind: LIVE_FRAME.closed, handle: p.handle, head: { code } }),
-		);
-		this.leave(p);
-	}
-
-	private cancelIdle(): void {
+	cancelIdle(): void {
 		if (this.idleTimer) {
-			clearTimeout(this.idleTimer);
+			cancelLiveTimer(this.idleTimer);
 			this.idleTimer = null;
 		}
 	}
 
-	private armIdle(): void {
+	/** When the last participant left (the least recently left page is unloaded first). */
+	idleSince = 0;
+
+	armIdle(): void {
 		this.cancelIdle();
-		this.idleTimer = setTimeout(() => {
+		this.idleSince = liveNow();
+		this.idleTimer = liveTimeout(() => {
 			this.idleTimer = null;
-			if (this.participants.size === 0 && !this.closed) this.onEnd(this, "ended", true);
+			if (this.participants.size === 0 && !this.space.closed) this.space.scopeIdle(this);
 		}, OUTLINE_LIVE_TIMING.idleCloseMs);
-		this.idleTimer.unref?.();
-	}
-
-	/**
-	 * Called when a participant's socket drained: one that fell behind is told to rejoin, and
-	 * gets exactly what it lacks from its state vector; one that skipped presence gets the whole
-	 * picture. Its own frames are still taken meanwhile.
-	 */
-	onDrain(p: Participant): void {
-		if (this.participants.get(p.pno) !== p) return;
-		if (this.presenceBehind.has(p.pno)) this.schedulePresence();
-		if (!p.lagging || p.resyncSent) return;
-		if (socketBuffered(p.socket) > OUTLINE_LIVE_BOUNDS.resumeBytes) return;
-		p.resyncSent = true;
-		this.stats.resyncs++;
-		try {
-			p.socket.send(encodeLiveFrame({ kind: LIVE_FRAME.resync, handle: p.handle }));
-		} catch (error) {
-			this.dropBroken(p, error);
-		}
-	}
-
-	// ─────────────────────────────────────────────────────────────────────────
-	// Sending
-	// ─────────────────────────────────────────────────────────────────────────
-
-	/**
-	 * Send one frame. `presence` frames are skipped under mild backpressure (kept to be sent
-	 * later); any frame is held back from a socket buffering past {@link OUTLINE_LIVE_BOUNDS.
-	 * lagBytes}, which is then told to rejoin once it drains: dropping a text update silently
-	 * would leave that client diverged. Never throws.
-	 */
-	private sendTo(
-		p: Participant,
-		frame: Uint8Array,
-		kind: "data" | "presence" | "control",
-	): boolean {
-		if (p.lagging) return false;
-		const buffered = socketBuffered(p.socket);
-		if (kind === "presence" && buffered > OUTLINE_LIVE_BOUNDS.presenceDropBytes) return false;
-		if (kind === "data" && buffered > OUTLINE_LIVE_BOUNDS.lagBytes) {
-			p.lagging = true;
-			return false;
-		}
-		let sent: boolean;
-		try {
-			sent = p.socket.send(frame);
-		} catch {
-			sent = false;
-		}
-		if (!sent) {
-			p.lagging = true;
-			return false;
-		}
-		this.stats.framesOut++;
-		this.stats.bytesOut += frame.length;
-		return true;
-	}
-
-	/**
-	 * Encode and send one frame to one participant. A frame that cannot be encoded is a bug of
-	 * this session, not of the others: the participant is dropped and everyone else carries on.
-	 */
-	private deliver(
-		p: Participant,
-		kind: "data" | "presence" | "control",
-		build: () => Uint8Array,
-	): boolean {
-		if (p.lagging) return false;
-		let frame: Uint8Array;
-		try {
-			frame = build();
-		} catch (error) {
-			this.dropBroken(p, error);
-			return false;
-		}
-		return this.sendTo(p, frame, kind);
-	}
-
-	private brokenLogged = 0;
-
-	private dropBroken(p: Participant, error: unknown): void {
-		if (Date.now() - this.brokenLogged > 60_000) {
-			this.brokenLogged = Date.now();
-			logger.warn("Outline live frame failed; participant dropped", {
-				pageId: this.pageId,
-				error: String(error),
-			});
-		}
-		this.leave(p);
-	}
-
-	private scheduleBroadcast(): void {
-		if (this.broadcastTimer || this.closed) return;
-		this.broadcastTimer = setTimeout(() => {
-			this.broadcastTimer = null;
-			this.flushBroadcast();
-		}, OUTLINE_LIVE_TIMING.broadcastMs);
-		this.broadcastTimer.unref?.();
-	}
-
-	/**
-	 * Send everyone what the window collected for them (see the module header). A participant's
-	 * transactions are acknowledged once they are in the log (`durableTx`), so an acknowledged
-	 * change survives a crash; the client keeps the others and replays them if it must.
-	 */
-	flushBroadcast(): void {
-		if (this.broadcastTimer) {
-			clearTimeout(this.broadcastTimer);
-			this.broadcastTimer = null;
-		}
-		const updates = this.windowUpdates;
-		const commits = this.windowCommits;
-		this.windowUpdates = [];
-		this.windowCommits = [];
-		const t0 = performance.now();
-		const merged = new Map<string, Uint8Array>();
-		const mergedFor = (pno: number, start: number): Uint8Array | null => {
-			const share = updates.slice(start).filter((u) => u.from !== pno);
-			if (share.length === 0) return null;
-			// Recipients that sent nothing in the window share one merge.
-			const key = start === 0 && share.length === updates.length ? "all" : `${pno}`;
-			let out = merged.get(key);
-			if (!out) {
-				out = encodeLiveTexts(mergeTexts(share));
-				merged.set(key, out);
-			}
-			return out;
-		};
-		for (const p of [...this.participants.values()]) {
-			const start = p.windowStart;
-			const commitStart = p.commitStart;
-			p.windowStart = 0;
-			p.commitStart = 0;
-			// A participant that fell behind rejoins and gets everything it lacks.
-			if (p.lagging) continue;
-			const others = [
-				...p.heldCommits,
-				...commits.slice(commitStart).filter((c) => c.by !== p.pno),
-			];
-			const ackable = Math.min(p.lastTx, p.durableTx);
-			const ack = ackable > p.ackedTx ? ackable : 0;
-			const waiting = this.windowAcks.get(p.pno);
-			const acks = ack > 0 ? waiting?.filter((a) => a[0] <= ack) : undefined;
-			// The client applies structure in operation order: others' changes after its own
-			// first unacknowledged one wait for that acknowledgement.
-			let first = Number.POSITIVE_INFINITY;
-			for (const a of waiting ?? []) if (a[0] > ack && a[1] < first) first = a[1];
-			const own = others.filter((c) => c.o < first);
-			p.heldCommits = others.filter((c) => c.o >= first);
-			if (p.heldCommits.length > OUTLINE_LIVE_BOUNDS.opLog) {
-				// Held too long (the log is not taking writes): it rejoins and gets everything.
-				p.heldCommits = [];
-				p.lagging = true;
-				p.resyncSent = true;
-				this.stats.resyncs++;
-				try {
-					p.socket.send(encodeLiveFrame({ kind: LIVE_FRAME.resync, handle: p.handle }));
-				} catch (error) {
-					this.dropBroken(p, error);
-				}
-				continue;
-			}
-			const body = mergedFor(p.pno, start);
-			if (!body && own.length === 0 && ack === 0) continue;
-			const head: LiveBatchHead = {};
-			if (own.length > 0) head.c = own;
-			if (acks && acks.length > 0) head.a = acks;
-			const sent = this.deliver(p, "data", () =>
-				encodeLiveFrame({
-					kind: LIVE_FRAME.batch,
-					handle: p.handle,
-					n: ack,
-					...(head.c || head.a ? { head } : {}),
-					...(body ? { body } : {}),
-				}),
-			);
-			if (sent && ack > 0) {
-				p.ackedTx = ack;
-				if (ack > (this.keyAcked.get(p.key) ?? 0)) this.keyAcked.set(p.key, ack);
-				const rest = waiting?.filter((a) => a[0] > ack) ?? [];
-				if (rest.length > 0) this.windowAcks.set(p.pno, rest);
-				else this.windowAcks.delete(p.pno);
-			}
-		}
-		this.stats.mergeMs += performance.now() - t0;
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1092,13 +597,12 @@ export class LivePage {
 		this.schedulePresence();
 	}
 
-	private schedulePresence(): void {
-		if (this.presenceTimer || this.closed) return;
-		this.presenceTimer = setTimeout(() => {
+	schedulePresence(): void {
+		if (this.presenceTimer || this.space.closed) return;
+		this.presenceTimer = liveTimeout(() => {
 			this.presenceTimer = null;
 			this.flushPresence();
 		}, OUTLINE_LIVE_TIMING.presenceMs);
-		this.presenceTimer.unref?.();
 	}
 
 	/**
@@ -1108,7 +612,7 @@ export class LivePage {
 	 * encoded for; they get the whole picture when their socket drains, and one that fell behind
 	 * gets it with its rejoin.
 	 */
-	private flushPresence(): void {
+	flushPresence(): void {
 		const cursors: Participant[] = [];
 		for (const n of this.presenceCursors) {
 			const p = this.participants.get(n);
@@ -1197,7 +701,7 @@ export class LivePage {
 			}
 			const raw = headFor(r, behind);
 			if (!raw) continue;
-			const sent = this.deliver(r, "presence", () =>
+			const sent = this.space.deliver(r, "presence", () =>
 				encodeLiveFrame({ kind: LIVE_FRAME.presence, handle: r.handle, rawHead: raw }),
 			);
 			if (sent) this.presenceBehind.delete(r.pno);
@@ -1210,12 +714,12 @@ export class LivePage {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	/** Whether the person may see the agent's name (its session is one they may read). */
-	private mayName(userId: string, agent: AgentPeer): boolean {
+	mayName(userId: string, agent: AgentPeer): boolean {
 		return this.agentReaders.get(userId)?.get(agent.narratorId) === true;
 	}
 
 	/** An agent as one person sees it: named, with its session, or just "Agent". */
-	private agentWire(agent: AgentPeer, userId: string): LivePeerWire {
+	agentWire(agent: AgentPeer, userId: string): LivePeerWire {
 		if (!this.mayName(userId, agent)) return [agent.pno, "", "", agent.color, "e", "a"];
 		return agent.session
 			? [agent.pno, "", agent.title, agent.color, "e", "a", agent.narratorId, agent.session]
@@ -1235,18 +739,17 @@ export class LivePage {
 	 * {@link OUTLINE_LIVE_TIMING.agentsMs}, one at a time (a request meanwhile runs once after).
 	 */
 	requestAgents(): void {
-		if (this.closed) return;
+		if (this.space.closed) return;
 		if (this.agentRunning) {
 			this.agentDirty = true;
 			return;
 		}
 		if (this.agentTimer) return;
-		const wait = Math.max(0, this.agentLastAt + OUTLINE_LIVE_TIMING.agentsMs - Date.now());
-		this.agentTimer = setTimeout(() => {
+		const wait = Math.max(0, this.agentLastAt + OUTLINE_LIVE_TIMING.agentsMs - liveNow());
+		this.agentTimer = liveTimeout(() => {
 			this.agentTimer = null;
 			void this.runAgents();
 		}, wait);
-		this.agentTimer.unref?.();
 	}
 
 	/** Access changed somewhere: who may name which agent is asked again. */
@@ -1261,15 +764,15 @@ export class LivePage {
 		this.requestAgents();
 	}
 
-	private async runAgents(): Promise<void> {
-		if (this.closed) return;
+	async runAgents(): Promise<void> {
+		if (this.space.closed) return;
 		this.agentRunning = true;
-		this.agentLastAt = Date.now();
+		this.agentLastAt = liveNow();
 		try {
 			await this.refreshAgents();
 		} catch (error) {
 			logger.warn("Outline live agents could not be worked out", {
-				pageId: this.pageId,
+				pageId: this.rootId,
 				error: String(error),
 			});
 		} finally {
@@ -1282,14 +785,14 @@ export class LivePage {
 	}
 
 	/** Note the blocks of this page an agent's commit wrote (the last few), for its cursor. */
-	private noteAgentWrite(narratorId: string, versions: readonly OutlineVersionRow[]): void {
+	noteAgentWrite(narratorId: string, versions: readonly OutlineVersionRow[]): void {
 		const blocks = versions
-			.filter((v) => !v.deleted && v.pageId === this.pageId && v.blockId !== this.pageId)
+			.filter((v) => !v.deleted && v.pageId === this.rootId && v.blockId !== this.rootId)
 			.map((v) => v.blockId)
 			.slice(-OUTLINE_LIVE_AGENT_BOUNDS.writtenBlocks);
 		if (blocks.length === 0) return;
 		this.agentWrites.delete(narratorId);
-		this.agentWrites.set(narratorId, { blocks, at: Date.now() });
+		this.agentWrites.set(narratorId, { blocks, at: liveNow() });
 		while (this.agentWrites.size > OUTLINE_LIVE_AGENT_BOUNDS.narrators) {
 			const oldest = this.agentWrites.keys().next().value;
 			if (oldest === undefined) break;
@@ -1302,7 +805,7 @@ export class LivePage {
 	 * may no longer) gets the whole picture again; a verdict learnt for the first time that says
 	 * "may not" changes nothing (an unnamed agent is what they were sent).
 	 */
-	private async learnAgentReaders(
+	async learnAgentReaders(
 		people: readonly Participant[],
 		narratorIds: readonly string[],
 	): Promise<void> {
@@ -1324,13 +827,13 @@ export class LivePage {
 				verdicts.set(narratorId, may);
 			}
 		}
-		if (this.closed || changed.size === 0) return;
+		if (this.space.closed || changed.size === 0) return;
 		for (const p of this.participants.values())
 			if (changed.has(p.userId)) this.presenceBehind.add(p.pno);
 		this.schedulePresence();
 	}
 
-	private agentPnoOf(narratorId: string): number {
+	agentPnoOf(narratorId: string): number {
 		let pno = this.agentPnos.get(narratorId);
 		if (pno === undefined) {
 			pno = this.nextAgentPno++;
@@ -1347,19 +850,19 @@ export class LivePage {
 		return pno;
 	}
 
-	private async refreshAgents(): Promise<void> {
-		const now = Date.now();
+	async refreshAgents(): Promise<void> {
+		const now = liveNow();
 		for (const [id, w] of this.agentWrites)
 			if (now - w.at >= OUTLINE_LIVE_AGENT_BOUNDS.writeMs) this.agentWrites.delete(id);
 		const doing: string[] = [];
-		for (const b of this.mirror.all())
-			if (!b.deleted && b.taskJson?.status === "doing") doing.push(b.id);
+		for (const id of this.space.mirror.subtree(this.rootId))
+			if (this.space.mirror.get(id)?.taskJson?.status === "doing") doing.push(id);
 		const read = await readLiveAgents({ doing, writes: this.agentWrites, now });
-		if (this.closed) return;
+		if (this.space.closed) return;
 		this.agentInterest = read.interest;
 		const next = read.agents.flatMap((a) => {
 			const ids = a.blocks
-				.filter((id) => this.mirror.alive(id))
+				.filter((id) => this.space.mirror.alive(id))
 				.slice(0, OUTLINE_LIVE_BOUNDS.presenceBlocks);
 			return ids.length > 0 ? [{ ...a, blocks: ids }] : [];
 		});
@@ -1383,7 +886,7 @@ export class LivePage {
 			const fresh = next.filter((a) => !this.agents.has(a.narratorId)).map((a) => a.narratorId);
 			if (fresh.length > 0 && people.length > 0) await this.learnAgentReaders(people, fresh);
 		}
-		if (this.closed) return;
+		if (this.space.closed) return;
 		let changed = false;
 		const wanted = new Set(next.map((a) => a.narratorId));
 		for (const [id, peer] of this.agents) {
@@ -1440,36 +943,1175 @@ export class LivePage {
 		}
 		if (changed) this.schedulePresence();
 		// A cursor on a block just written lasts its while: look again when the first one ends.
-		if (this.agentExpiry) clearTimeout(this.agentExpiry);
+		if (this.agentExpiry) cancelLiveTimer(this.agentExpiry);
 		this.agentExpiry = null;
 		let first = Number.POSITIVE_INFINITY;
 		for (const w of this.agentWrites.values()) first = Math.min(first, w.at);
 		if (Number.isFinite(first)) {
-			this.agentExpiry = setTimeout(
+			this.agentExpiry = liveTimeout(
 				() => {
 					this.agentExpiry = null;
 					this.requestAgents();
 				},
-				Math.max(0, first + OUTLINE_LIVE_AGENT_BOUNDS.writeMs - Date.now()),
+				Math.max(0, first + OUTLINE_LIVE_AGENT_BOUNDS.writeMs - liveNow()),
 			);
-			this.agentExpiry.unref?.();
 		}
 	}
 
 	/** A selection as presence carries it: positions, or live blocks of this page (bounded). */
-	private validSelection(sel: unknown): LiveSelWire | null {
+	validSelection(sel: unknown): LiveSelWire | null {
 		if (!sel || typeof sel !== "object") return null;
 		const s = sel as Record<string, unknown>;
 		if (Array.isArray(s.b)) {
 			const ids: string[] = [];
 			for (const x of s.b as unknown[]) {
 				if (ids.length >= OUTLINE_LIVE_BOUNDS.presenceBlocks) break;
-				if (typeof x === "string" && x.length <= 64 && this.mirror.alive(x)) ids.push(x);
+				if (typeof x === "string" && x.length <= 64 && this.space.mirror.alive(x)) ids.push(x);
 			}
 			return { b: ids };
 		}
 		if (validPos(s.a) && validPos(s.h)) return { a: s.a as never, h: s.h as never };
 		return null;
+	}
+}
+
+export class LiveSpace {
+	/** The documents of blocks whose text someone changed in this session, by block id. */
+	private readonly docs = new Map<string, LiveTextDoc>();
+	/**
+	 * Blocks a write from outside added, by the operation number of the batch that added them: a
+	 * resuming client that had not seen that batch is sent their seed text.
+	 */
+	private readonly seededAt = new Map<string, number>();
+	readonly mirror = new SpaceMirror();
+	readonly epoch = newEpoch();
+	/** Everyone in the session, whatever page they joined. */
+	readonly participants = new Map<number, Participant>();
+	/** The pages people have joined: each a loaded tree and its participants. */
+	readonly scopes = new Map<string, LivePageView>();
+	/** The session's document generation counter (`MirrorBlock.gen`): it only grows. */
+	private era = 0;
+	/** When each document last took an update (eviction picks the idle ones). */
+	private readonly docTouched = new Map<string, number>();
+	/** Bytes each document is charged against the bound. */
+	private readonly docCharged = new Map<string, number>();
+	/** Documents of blocks the mirror never had (a refused insert): the page of who made them. */
+	private readonly orphanScope = new Map<string, string>();
+	/** Per page: the highest operation number no longer in `opLog`. */
+	private readonly opDropped = new Map<string, number>();
+	private sweepTimer: LiveTimer | null = null;
+	/**
+	 * Blocks that left the session lately (their tree was unloaded): typing still on its way
+	 * into one is told back as not taken, not refused as text of a block that never was.
+	 */
+	private readonly recentlyGone = new Map<string, number>();
+	/**
+	 * Per client key: text of its transactions that was not taken, kept until its client shows
+	 * it was told (a join names the last acknowledgement the client got; what was not taken of a
+	 * transaction goes out with that transaction's acknowledgement). A frame sent is not a frame
+	 * received.
+	 */
+	private readonly keyLost = new Map<string, LiveLostWire[]>();
+	/** Client keys whose {@link keyLost} changed since the last log row about them. */
+	private readonly lostPending = new Set<string>();
+	/** Entries of {@link keyLost} already sent, by participant number (not sent twice to one). */
+	private readonly lostSent = new Map<number, number>();
+	/** Trees being loaded (a join waits for the one already under way). */
+	private readonly loading = new Map<string, Promise<LivePageView | Refusal>>();
+	private nextPno = 1;
+	/** Per client key: the highest transaction processed (least recently used first). */
+	private readonly keys = new Map<string, number>();
+	/** Per client key: the highest transaction acknowledged to its client. */
+	private readonly keyAcked = new Map<string, number>();
+	private opSeq = 0;
+	private readonly opLog: ScopedCommit[] = [];
+	closed = false;
+	/** Set at close: everything was committed and the log dropped. */
+	closedClean = false;
+	private closing: Promise<void> | null = null;
+
+	// Broadcast window.
+	private windowUpdates: WindowUpdate[] = [];
+	private windowCommits: ScopedCommit[] = [];
+	private readonly windowAcks = new Map<number, Array<[number, number, LiveOp[]?]>>();
+	private broadcastTimer: LiveTimer | null = null;
+
+	// Text not committed yet: block id → who changed it last (null: not a person).
+	private readonly dirty = new Map<string, string | null>();
+	private firstDirtyAt = 0;
+	private lastDirtyAt = 0;
+	private flushTimer: LiveTimer | null = null;
+	/** Blocks whose text changed in the update being applied (for structural transactions). */
+	private touched: Set<string> | null = null;
+
+	// Persistence.
+	private pendingRows: PendingRow[] = [];
+	/** Blocks whose database content changed since the last sync row (see `persistStep`). */
+	private readonly syncPending = new Map<string, string>();
+	/** Commits about to be written: block → the content it will have (see `persistStep`). */
+	private readonly intentPending = new Map<string, string>();
+	/** Intents written to the log and not resolved by a sync row or a cancel yet. */
+	private readonly openIntents = new Map<string, string>();
+	/** Intents whose commit did not happen. */
+	private readonly cancelPending = new Set<string>();
+	/** Per client key: the highest transaction known to be in the log (or committed). */
+	private readonly keyDurable = new Map<string, number>();
+	/** Client keys whose durable transaction advanced since the last log row about them. */
+	private readonly keysPending = new Set<string>();
+	private persistTimer: LiveTimer | null = null;
+	private persistChain: Promise<void> = Promise.resolve();
+	private logSeq = 0;
+	private snapshotWritten = false;
+	private rowsSinceCompact = 0;
+	/** Base64 bytes of the increments appended since the last snapshot. */
+	private bytesSinceCompact = 0;
+	/** Base64 bytes of the last snapshot row. */
+	private snapshotBytes = 0;
+	/** Bytes charged since the session opened: updates taken in, documents made (`charge`). */
+	private docBytes = 0;
+	private restartRequested = false;
+	/** Structural transactions whose change is applied but held back from the log. */
+	private holding = 0;
+	/** The snapshot row is wanted now, even with nothing else to log. */
+	private snapshotWanted = false;
+	/** Blocks whose text could not be normalized or written: committed as a code block next. */
+	private readonly stuck = new Set<string>();
+	/** Failed commits per block, since its last successful one. */
+	private readonly failures = new Map<string, number>();
+	/** Blocks whose text cannot be committed even as code: kept live and in the log only. */
+	private readonly parked = new Set<string>();
+
+	/** Measurements for diagnostics and the PR's numbers. */
+	readonly stats = {
+		updatesIn: 0,
+		updateBytesIn: 0,
+		applyMs: 0,
+		framesOut: 0,
+		bytesOut: 0,
+		mergeMs: 0,
+		txCommitted: 0,
+		txRejected: 0,
+		flushCommits: 0,
+		rowsWritten: 0,
+		rowBytes: 0,
+		compactions: 0,
+		resyncs: 0,
+		docsEvicted: 0,
+		treesLoaded: 0,
+		treesUnloaded: 0,
+		loadMs: 0,
+	};
+
+	/**
+	 * `schedule` queues a task on the space's lane; `onEnd` asks for the session to be closed
+	 * (idle: nobody is in it and no page is loaded; or its documents grew past their hard bound).
+	 */
+	constructor(
+		readonly spaceId: string,
+		private readonly schedule: (task: () => Promise<void>) => void,
+		private readonly onEnd: (space: LiveSpace, code: LiveCloseCode, idle: boolean) => void,
+		/** Blocks the process may still load (the registry's bound across all sessions). */
+		private readonly room: () => number = () => Number.POSITIVE_INFINITY,
+	) {}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// Loading and unloading
+	// ─────────────────────────────────────────────────────────────────────────
+
+	/** Per client key: the highest transaction processed (diagnostics and tests). */
+	get clientKeys(): ReadonlyMap<string, number> {
+		return this.keys;
+	}
+
+	/** Blocks the mirror holds (budgets, diagnostics). */
+	get loadedBlocks(): number {
+		return this.mirror.size;
+	}
+
+	/** Put one row of the blocks table into the mirror; returns its content's size. */
+	private putRow(
+		root: string,
+		b: {
+			id: string;
+			sid: string;
+			parentId: string | null;
+			orderKey: string;
+			taskJson: OutlineTaskJson | null;
+			askJson: unknown;
+			content: string;
+		},
+	): void {
+		const prior = this.mirror.get(b.id);
+		let gen = this.era;
+		if (prior) {
+			// A deleted block another tree remembers (it was moved here while this tree was not
+			// loaded): the same text and no document means the same lineage, anything else a new
+			// generation (whoever still holds the old one is told when the block reaches them).
+			if (!this.docs.has(b.id) && prior.dbContent === b.content) gen = prior.gen;
+			else {
+				this.destroyDoc(b.id);
+				gen = ++this.era;
+			}
+		}
+		this.mirror.put({
+			id: b.id,
+			sid: b.sid,
+			parentId: b.parentId,
+			orderKey: b.orderKey,
+			taskJson: b.taskJson,
+			question: b.askJson !== null,
+			deleted: false,
+			dbContent: b.content,
+			gen,
+			// The snapshot of the page's first join sends it.
+			held: root,
+		});
+	}
+
+	/**
+	 * The view of a page, loading its tree when it is not here: the page block and every live
+	 * block under it, so every parent in it is loaded. One bounded read (the page must be small
+	 * enough to edit live); the mirror takes it {@link OUTLINE_LIVE_BOUNDS.loadStep} blocks at a
+	 * time, yielding in between. Runs in the lane.
+	 */
+	async ensureScope(pageId: string, userId?: string): Promise<LivePageView | Refusal> {
+		const existing = this.scopes.get(pageId);
+		if (existing && !existing.gone) return existing;
+		const underWay = this.loading.get(pageId);
+		if (underWay) return await underWay;
+		const load = this.loadTree(pageId, userId);
+		this.loading.set(pageId, load);
+		try {
+			return await load;
+		} finally {
+			this.loading.delete(pageId);
+		}
+	}
+
+	private async loadTree(pageId: string, userId?: string): Promise<LivePageView | Refusal> {
+		const t0 = performance.now();
+		const { blocks, truncated } = await outlineStore.listPageBlocks(
+			pageId,
+			OUTLINE_LIVE_LIMITS.maxPageBlocks,
+		);
+		if (truncated) return { refused: "too_large" };
+		const page = blocks.find((b) => b.id === pageId);
+		if (!page || page.parentId !== null || page.spaceId !== this.spaceId)
+			return { refused: "access_denied" };
+		let bytes = 0;
+		let chars = 0;
+		for (const b of blocks) {
+			bytes += bytesOf(b.content);
+			chars += b.content.length;
+		}
+		if (bytes > OUTLINE_LIVE_LIMITS.maxPageBytes) return { refused: "too_large" };
+		if (this.closed) return { refused: "ended" };
+		// Room first: pages nobody is in go, least recently left first. A page someone is
+		// connected to is never closed to make room for another: that would only move the
+		// shortage to it (its tab would come back and close the next one, round and round).
+		const overSpace = () =>
+			this.mirror.size + blocks.length > OUTLINE_LIVE_BOUNDS.maxLoadedBlocks ||
+			this.mirror.chars + chars > OUTLINE_LIVE_BOUNDS.maxLoadedChars;
+		const over = () => overSpace() || blocks.length > this.room();
+		if (over()) {
+			const idle = [...this.scopes.values()]
+				.filter((v) => v.participants.size === 0 && !v.gone)
+				.sort((a, b) => a.idleSince - b.idleSince);
+			for (const v of idle) {
+				if (!over()) break;
+				await this.unloadScope(v);
+			}
+		}
+		if (this.closed) return { refused: "ended" };
+		// One person's tabs do not take the whole space: past their share, their new page is
+		// refused (they close one of their own and retry), never one of their open ones closed.
+		if (userId !== undefined) {
+			let own = 0;
+			for (const v of this.scopes.values()) {
+				if (v.gone || v.participants.size === 0) continue;
+				let alone = true;
+				for (const p of v.participants.values()) if (p.userId !== userId) alone = false;
+				if (alone) own += v.blocks;
+			}
+			if (own > 0 && own + blocks.length > OUTLINE_LIVE_BOUNDS.maxUserBlocks)
+				return { refused: "user_limit" };
+		}
+		if (overSpace()) return { refused: "space_full" };
+		if (over()) return { refused: "unavailable" };
+		const base = this.era;
+		const step = OUTLINE_LIVE_BOUNDS.loadStep;
+		for (let at = 0; at < blocks.length; at += step) {
+			if (at > 0) await yieldToLoop();
+			if (this.closed) return { refused: "ended" };
+			for (const b of blocks.slice(at, at + step)) this.putRow(pageId, b);
+		}
+		this.mirror.markRoot(pageId);
+		const view = new LivePageView(this, pageId);
+		view.baseGen = base;
+		view.blocks = blocks.length;
+		// A number of its own: a client that last saw an earlier one was here before this load.
+		view.loadedAtOp = ++this.opSeq;
+		this.scopes.set(pageId, view);
+		this.stats.treesLoaded++;
+		this.stats.loadMs += performance.now() - t0;
+		return view;
+	}
+
+	/** Commit and log what is pending of `ids`; false when some text of them cannot be committed. */
+	private async settleForUnload(ids: readonly string[]): Promise<boolean> {
+		if (ids.some((id) => this.parked.has(id) || this.stuck.has(id))) return false;
+		if (ids.some((id) => this.dirty.has(id))) {
+			await this.flushContent();
+			if (ids.some((id) => this.dirty.has(id) || this.parked.has(id))) return false;
+		}
+		return (await this.persistNow()) && this.holding === 0;
+	}
+
+	/** Take blocks out of the mirror with everything the session holds of them. */
+	private async removeBlocks(ids: readonly string[]): Promise<void> {
+		const step = OUTLINE_LIVE_BOUNDS.loadStep;
+		for (let at = 0; at < ids.length; at += step) {
+			if (at > 0) await yieldToLoop();
+			for (const id of ids.slice(at, at + step)) this.forget(id);
+		}
+		// Whoever comes back with a document of one of these holds an older generation.
+		this.era++;
+		this.schedulePersist();
+	}
+
+	private forget(id: string): void {
+		this.recentlyGone.delete(id);
+		this.recentlyGone.set(id, liveNow());
+		if (this.recentlyGone.size > OUTLINE_LIVE_BOUNDS.goneBlocks) {
+			const oldest = this.recentlyGone.keys().next().value;
+			if (oldest !== undefined) this.recentlyGone.delete(oldest);
+		}
+		this.destroyDoc(id);
+		this.dirty.delete(id);
+		this.stuck.delete(id);
+		this.failures.delete(id);
+		this.parked.delete(id);
+		this.seededAt.delete(id);
+		this.mirror.remove(id);
+	}
+
+	/** Drop a block's document on this end only (the block leaves the session, or a new lineage). */
+	private destroyDoc(id: string): void {
+		const t = this.docs.get(id);
+		if (!t) return;
+		t.doc.destroy();
+		this.docs.delete(id);
+		this.docBytes -= this.docCharged.get(id) ?? 0;
+		this.docCharged.delete(id);
+		this.docTouched.delete(id);
+		this.orphanScope.delete(id);
+		// The log forgets it too: a replay must not take its text for uncommitted. Rows of the
+		// document not appended yet go (nothing may follow the drop of the document they are
+		// of); what was appended before stays before it.
+		if (this.pendingRows.some((r) => r.id === id))
+			this.pendingRows = this.pendingRows.filter((r) => r.id !== id);
+		this.schedulePersist();
+		this.pendingRows.push({
+			actorKind: "system",
+			actorId: LIVE_LOG_ACTOR,
+			id,
+			kind: LIVE_TEXT_KIND.drop,
+			data: EMPTY_TEXT,
+		});
+	}
+
+	/**
+	 * Take a page nobody is in out of the session: its text is committed, its documents dropped,
+	 * its blocks forgotten. False when someone joined meanwhile or its text cannot be committed
+	 * now (it stays, and is tried again). In the lane.
+	 */
+	async unloadScope(view: LivePageView): Promise<boolean> {
+		if (view.gone || this.scopes.get(view.rootId) !== view) return true;
+		if (view.participants.size > 0 || this.closed) return false;
+		const ids = this.mirror.subtreeAll(view.rootId);
+		if (!(await this.settleForUnload(ids))) return false;
+		if (view.participants.size > 0 || this.closed) return false;
+		view.stop();
+		this.scopes.delete(view.rootId);
+		await this.removeBlocks(this.mirror.subtreeAll(view.rootId));
+		this.stats.treesUnloaded++;
+		return true;
+	}
+
+	/** A page's idle period passed with nobody in it (`LivePageView.armIdle`). */
+	scopeIdle(view: LivePageView): void {
+		if (this.closed) return;
+		// The last page of a session nobody is in: the session ends, committing everything (and
+		// keeping its log when it cannot).
+		if (this.participants.size === 0 && this.scopes.size <= 1) {
+			this.onEnd(this, "ended", true);
+			return;
+		}
+		this.schedule(async () => {
+			if (view.participants.size > 0 || view.gone || this.closed) return;
+			if (!(await this.unloadScope(view))) view.armIdle();
+			else if (this.scopes.size === 0 && this.participants.size === 0)
+				this.onEnd(this, "ended", true);
+		});
+	}
+
+	/**
+	 * A page was deleted, or moved under another block: its view ends (its participants are told;
+	 * a rejoin finds the page gone). Blocks now in another loaded tree stay; the rest go.
+	 */
+	private endScope(view: LivePageView): void {
+		if (view.gone) return;
+		for (const p of [...view.participants.values()]) this.dismiss(p, "ended");
+		view.stop();
+		this.scopes.delete(view.rootId);
+		this.mirror.unmarkRoot(view.rootId);
+		const top = this.mirror.get(view.rootId);
+		if (top && (top.deleted || top.parentId === null)) {
+			for (const id of this.mirror.subtreeAll(view.rootId)) this.forget(id);
+			this.era++;
+			this.schedulePersist();
+		}
+		if (this.scopes.size === 0 && this.participants.size === 0) this.onEnd(this, "ended", true);
+	}
+
+	/** The page whose people hold a block's text and are sent its updates (`MirrorBlock.held`). */
+	private scopeOf(id: string): string {
+		return this.mirror.get(id)?.held ?? this.orphanScope.get(id) ?? "";
+	}
+
+	/** The top-level block of the tree a block is in (structure; deleted parents count). */
+	private treeOf(id: string): string {
+		return this.mirror.topOf(id) ?? "";
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// Text
+	// ─────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * A block's document, made on first use from the text the database holds for it (the empty
+	 * text for a block the page does not have yet: a block a transaction is about to insert).
+	 * Every end makes it from that same text (`shared/outline-live-text.ts`); the log learns the
+	 * text before the document's first update.
+	 */
+	private textDoc(id: string): LiveTextDoc {
+		const existing = this.docs.get(id);
+		if (existing) return existing;
+		const seed = this.mirror.get(id)?.dbContent ?? "";
+		const made = seededTextDoc(seed);
+		this.docs.set(id, made);
+		// A document is kept until every end drops it (`sweepDocs`), also when its block is
+		// deleted: each one counts against the session's bound.
+		this.charge(id, OUTLINE_LIVE_BOUNDS.docCostBytes);
+		this.docTouched.set(id, liveNow());
+		this.scheduleSweep();
+		if (seed.length > 0)
+			this.pendingRows.push({
+				actorKind: "system",
+				actorId: LIVE_LOG_ACTOR,
+				id,
+				kind: LIVE_TEXT_KIND.seed,
+				data: encodeLiveSeed(seed),
+			});
+		made.doc.on("update", (update: Uint8Array, origin: unknown) => {
+			if (this.closed) return;
+			this.charge(id, update.length);
+			this.docTouched.set(id, liveNow());
+			const from = origin instanceof Participant ? origin.pno : 0;
+			const gen = this.mirror.get(id)?.gen ?? 0;
+			this.windowUpdates.push({
+				from,
+				scope: this.scopeOf(id),
+				id,
+				kind: LIVE_TEXT_KIND.update,
+				...(gen !== 0 ? { gen } : {}),
+				data: update,
+			});
+			this.scheduleBroadcast();
+			this.pendingRows.push({
+				...(origin instanceof Participant
+					? { actorKind: "human" as const, actorId: origin.userId }
+					: { actorKind: "system" as const, actorId: LIVE_LOG_ACTOR }),
+				id,
+				kind: LIVE_TEXT_KIND.update,
+				data: update,
+			});
+			this.schedulePersist();
+		});
+		made.text.observe((_event, txn) => {
+			this.touched?.add(id);
+			if (txn.origin instanceof Participant) this.markDirty(id, txn.origin.userId);
+		});
+		return made;
+	}
+
+	/**
+	 * Count a document's bytes against the session's hard bound
+	 * ({@link OUTLINE_LIVE_BOUNDS.maxDocBytes}). Documents are dropped long before it
+	 * (`sweepDocs`), so it is reached only when that many are all uncommitted; then the session
+	 * ends: everything is committed, the participants rejoin a fresh one with no document.
+	 */
+	private charge(id: string, bytes: number): void {
+		this.docBytes += bytes;
+		this.docCharged.set(id, (this.docCharged.get(id) ?? 0) + bytes);
+		if (this.docBytes <= OUTLINE_LIVE_BOUNDS.maxDocBytes || this.restartRequested) return;
+		this.restartRequested = true;
+		logger.warn("Outline live documents grew past their bound; restarting the session", {
+			spaceId: this.spaceId,
+			bytes: this.docBytes,
+			documents: this.docs.size,
+		});
+		this.onEnd(this, "ended", false);
+	}
+
+	/** Whether the session holds a text for the block (a document, or the page's block). */
+	private hasText(id: string): boolean {
+		return this.docs.has(id) || this.mirror.get(id) !== undefined;
+	}
+
+	/** Change a block's text as the session itself (never a participant). */
+	private editText(id: string, edit: (text: Y.Text) => void): void {
+		const t = this.textDoc(id);
+		t.doc.transact(() => edit(t.text), SERVER_ORIGIN);
+	}
+
+	/** Documents made so far (diagnostics and measurements). */
+	get textDocs(): number {
+		return this.docs.size;
+	}
+
+	/** Blocks that have a document (diagnostics and tests). */
+	get textDocIds(): string[] {
+		return [...this.docs.keys()];
+	}
+
+	/** Blocks of one page that have a document. */
+	textDocIdsOf(root: string): string[] {
+		return [...this.docs.keys()].filter((id) => this.scopeOf(id) === root);
+	}
+
+	/** A block's document generation (diagnostics and tests). */
+	genOf(id: string): number {
+		return this.mirror.get(id)?.gen ?? 0;
+	}
+
+	/** Whether any text of one page is waiting to be committed. */
+	hasUnflushedIn(root: string): boolean {
+		for (const id of this.dirty.keys()) if (this.treeOf(id) === root) return true;
+		return false;
+	}
+
+	/**
+	 * A block's document as diagnostics and tests compare it across ends: its whole state, and
+	 * whether an update that names items it lacks is stuck in it. Null without a document.
+	 */
+	textState(id: string): { state: Uint8Array; stuck: boolean } | null {
+		const t = this.docs.get(id);
+		return t ? { state: Y.encodeStateAsUpdate(t.doc), stuck: hasPendingStructs(t.doc) } : null;
+	}
+
+	/**
+	 * A block's text whole, as an entry: its document's state, or its plain text (as a `drop`
+	 * when its generation is not 0, so the other end learns the generation). Null for the empty
+	 * text of generation 0, which needs no entry.
+	 */
+	private wholeText(id: string): LiveTextEntry | null {
+		const b = this.mirror.get(id);
+		const gen = b?.gen ?? 0;
+		const t = this.docs.get(id);
+		if (t)
+			return {
+				id,
+				kind: LIVE_TEXT_KIND.update,
+				...(gen !== 0 ? { gen } : {}),
+				data: Y.encodeStateAsUpdate(t.doc),
+			};
+		const text = b?.dbContent ?? "";
+		if (gen !== 0) return { id, kind: LIVE_TEXT_KIND.drop, gen, data: encodeLiveSeed(text) };
+		return text.length > 0 ? { id, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed(text) } : null;
+	}
+
+	/**
+	 * Every text of a page, as a snapshot carries it: each document's whole state, and the plain
+	 * text of every other block of the tree the session knows (deleted ones too: undoing a
+	 * delete brings a block back with the text it had).
+	 */
+	private allTexts(root: string, base: number): LiveTextEntry[] {
+		const out: LiveTextEntry[] = [];
+		const seen = new Set<string>();
+		// A block of the generation the snapshot names (`base`) needs none said: a plain seed
+		// text, or nothing when it is empty. Any other generation is said with the block.
+		const plain = (id: string, gen: number, text: string) => {
+			if (gen !== base)
+				out.push({ id, kind: LIVE_TEXT_KIND.drop, gen, data: encodeLiveSeed(text) });
+			else if (text.length > 0)
+				out.push({ id, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed(text) });
+		};
+		for (const [id, t] of this.docs) {
+			if (this.scopeOf(id) !== root) continue;
+			seen.add(id);
+			const gen = this.mirror.get(id)?.gen ?? 0;
+			// A document of generation 0 in a snapshot of another: said by a drop to 0 before it.
+			if (gen === 0 && base !== 0)
+				out.push({ id, kind: LIVE_TEXT_KIND.drop, gen: 0, data: EMPTY_TEXT });
+			out.push({
+				id,
+				kind: LIVE_TEXT_KIND.update,
+				...(gen !== 0 ? { gen } : {}),
+				data: Y.encodeStateAsUpdate(t.doc),
+			});
+		}
+		// By who holds the text, not by where the block is: a deleted block this page's people
+		// were shown may sit under a block that has since gone elsewhere, and one they were never
+		// shown may sit in this tree.
+		for (const b of this.mirror.all())
+			if (b.held === root && !seen.has(b.id)) plain(b.id, b.gen, b.dbContent);
+		return out;
+	}
+
+	/**
+	 * What a resuming client lacks of a page: of each document it named (at the block's
+	 * generation), the difference to its state vector; every other document whole; the text of
+	 * blocks that came into the tree after the last batch it saw; and a `drop` for every block
+	 * whose document was dropped since (`g`: the highest generation it was told of). Null when a
+	 * vector cannot be read.
+	 */
+	private missingTexts(
+		root: string,
+		vectors: readonly LiveTextEntry[],
+		op: number,
+		g: number,
+	): LiveTextEntry[] | null {
+		const named = new Map<string, LiveTextEntry>();
+		for (const v of vectors) if (v.kind === LIVE_TEXT_KIND.vector) named.set(v.id, v);
+		const out: LiveTextEntry[] = [];
+		const sent = new Set<string>();
+		for (const [id, at] of this.seededAt) {
+			if (at <= op || this.docs.has(id) || this.scopeOf(id) !== root) continue;
+			sent.add(id);
+			const e = this.wholeText(id);
+			if (e) out.push(e);
+		}
+		try {
+			for (const [id, t] of this.docs) {
+				if (this.scopeOf(id) !== root) continue;
+				sent.add(id);
+				const gen = this.mirror.get(id)?.gen ?? 0;
+				const vector = named.get(id);
+				const same = vector !== undefined && (vector.gen ?? 0) === gen;
+				const data = same
+					? Y.encodeStateAsUpdate(t.doc, vector.data)
+					: Y.encodeStateAsUpdate(t.doc);
+				// An update of no structs and no deletions is two zero bytes. A document of another
+				// generation than the client's (one it names, or one made since the last
+				// generation it heard of) goes whole whatever it holds: the client drops its own
+				// and learns the generation.
+				if (data.length > 2 || (!same && (vector !== undefined || gen > g)))
+					out.push({ id, kind: LIVE_TEXT_KIND.update, ...(gen !== 0 ? { gen } : {}), data });
+			}
+		} catch {
+			return null;
+		}
+		// Every block this page's people hold, wherever it is now (see `allTexts`).
+		for (const b of this.mirror.all()) {
+			const id = b.id;
+			if (b.held !== root || sent.has(id)) continue;
+			const vector = named.get(id);
+			if (b.gen > g || (vector !== undefined && (vector.gen ?? 0) !== b.gen))
+				out.push({
+					id,
+					kind: LIVE_TEXT_KIND.drop,
+					gen: b.gen,
+					data: encodeLiveSeed(b.dbContent),
+				});
+		}
+		return out;
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// Reading
+	// ─────────────────────────────────────────────────────────────────────────
+
+	/** A block's live text (its database content while nobody changed it in the session). */
+	textOf(id: string): string {
+		return this.docs.get(id)?.text.toString() ?? this.mirror.get(id)?.dbContent ?? "";
+	}
+
+	/** Nothing waits to be broadcast (tests). */
+	get quiet(): boolean {
+		return (
+			this.broadcastTimer === null &&
+			this.windowUpdates.length === 0 &&
+			this.windowCommits.length === 0
+		);
+	}
+
+	/**
+	 * Stop without committing or closing anything, as if the process had died here (tests of
+	 * the replay). The log rows stay.
+	 */
+	abandon(): void {
+		this.closed = true;
+		for (const timer of [this.broadcastTimer, this.flushTimer, this.persistTimer, this.sweepTimer])
+			if (timer) cancelLiveTimer(timer);
+		for (const view of this.scopes.values()) view.stop();
+		this.participants.clear();
+		for (const view of this.scopes.values()) view.participants.clear();
+		this.scopes.clear();
+		this.destroyDocs();
+	}
+
+	private destroyDocs(): void {
+		for (const t of this.docs.values()) t.doc.destroy();
+		this.docs.clear();
+	}
+
+	/** Whether any text is waiting to be committed. */
+	get hasUnflushed(): boolean {
+		return this.dirty.size > 0;
+	}
+
+	/**
+	 * Take over text an earlier session of this page left that could not be committed (its log
+	 * is replayed into this one): the blocks get it as live text, to be committed by this
+	 * session like anything typed. In the lane, right after opening.
+	 */
+	adoptRecovered(changes: readonly RecoveredChange[]): void {
+		for (const c of changes) {
+			if (!this.mirror.alive(c.id)) continue;
+			const current = this.textOf(c.id);
+			if (current === c.text) continue;
+			this.mergeText(c.id, current, c.text);
+			this.markDirty(c.id, c.actor);
+		}
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// Participants
+	// ─────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * Add a participant to a page (loading its tree when needed) and answer its join: a snapshot
+	 * (reset), or the difference to what it has when it resumes this same session. `dur`: of the
+	 * client's previous session (gone), the transactions already in the page (a reset tells the
+	 * client not to replay them).
+	 *
+	 * The participant is added only once its answer is encoded and queued: a join that cannot be
+	 * answered leaves nothing behind.
+	 */
+	async join(
+		socket: LiveSocket,
+		handle: number,
+		head: LiveJoinHead,
+		/** On a resume: a `vector` entry for every document the client holds. */
+		held: Uint8Array,
+		canWrite: boolean,
+		dur?: number,
+		/** Of the client's previous session (gone): what it was never told was not taken. */
+		lostBefore?: readonly LiveLostWire[],
+	): Promise<Participant | Refusal> {
+		if (this.closed || this.restartRequested) return { refused: "ended" };
+		// People are numbered below the agents' numbers: a session that has seen that many joins
+		// starts afresh (everyone rejoins a new one), as one whose documents grew too large does.
+		if (this.nextPno >= OUTLINE_LIVE_AGENT_PNO_BASE) {
+			this.restartRequested = true;
+			this.onEnd(this, "ended", false);
+			return { refused: "ended" };
+		}
+		// A socket that has not taken what it was sent gets no snapshot on top of it.
+		if (socketBuffered(socket) > OUTLINE_LIVE_BOUNDS.lagBytes) return { refused: "unavailable" };
+		const scope = await this.ensureScope(head.page, socket.userId);
+		if ("refused" in scope) return scope;
+		if (this.closed || this.restartRequested) return { refused: "ended" };
+		if (
+			canWrite
+				? scope.editors >= OUTLINE_LIVE_LIMITS.editorsPerPage
+				: scope.viewers >= OUTLINE_LIVE_LIMITS.viewersPerPage
+		)
+			return { refused: "unavailable" };
+		const root = scope.rootId;
+		const p = new Participant(
+			this.nextPno,
+			socket,
+			handle,
+			head.key,
+			head.mode === "edit",
+			canWrite,
+			scope,
+		);
+		const resume = head.resume;
+		let joined: LiveJoinedHead;
+		let body: Uint8Array;
+		const base = {
+			...(head.j !== undefined ? { j: head.j } : {}),
+			epoch: this.epoch,
+			w: canWrite,
+			op: this.opSeq,
+			me: p.pno,
+			// Agents are named once this person's verdicts are known (`learnAgentReaders`).
+			peers: [
+				...[...scope.participants.values()].map((x) => x.peer()),
+				...[...scope.agents.values()].map((a) => scope.agentWire(a, socket.userId)),
+			],
+			cur: [
+				...[...scope.participants.values()]
+					.filter((x) => x.sel !== null)
+					.map((x) => [x.pno, x.sel] as [number, LiveSelWire | null]),
+				...[...scope.agents.values()].map((a) => [a.pno, a.sel] as [number, LiveSelWire | null]),
+			],
+			...(scope.agentsMore > 0 ? { am: scope.agentsMore } : {}),
+		};
+		// Which of the client's transactions of its previous session the page has: this session's
+		// own bookkeeping when it is that session (a resume, or a snapshot after a refusal), else
+		// what the registry knows of the ended one (`dur`).
+		const sameSession = resume !== undefined && resume.epoch === this.epoch;
+		const processed = sameSession ? (this.keys.get(head.key) ?? 0) : (dur ?? 0);
+		const durable = sameSession
+			? Math.min(processed, this.keyDurable.get(head.key) ?? 0)
+			: (dur ?? 0);
+		let diff: LiveTextEntry[] | null = null;
+		// A page unloaded and loaded again since the client left starts afresh for it: what the
+		// session remembered of the page's deleted blocks and documents went with the unload.
+		if (sameSession && !resume.reset && scope.loadedAtOp <= resume.op) {
+			const vectors = decodeLiveTexts(held, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
+			diff = vectors ? this.missingTexts(root, vectors, resume.op, resume.g ?? 0) : null;
+		}
+		if (resume && diff) {
+			// Every batch of this page after the client's last is still in the log of batches.
+			const covered = (this.opDropped.get(root) ?? 0) <= resume.op;
+			joined = {
+				...base,
+				mode: "resume",
+				tx: processed,
+				// Processed but not in the log yet: the client keeps those until acknowledged.
+				dur: durable,
+				...(covered
+					? {
+							ops: this.opLog
+								.filter((c) => c.root === root && c.wire.o > resume.op)
+								.map((c) => c.wire),
+						}
+					: { blocks: this.mirror.snapshot(root) }),
+			};
+			body = encodeLiveTexts(diff);
+		} else {
+			joined = {
+				...base,
+				mode: "reset",
+				tx: processed,
+				dur: durable,
+				blocks: this.mirror.snapshot(root),
+				...(scope.baseGen !== 0 ? { g: scope.baseGen } : {}),
+			};
+			body = encodeLiveTexts(this.allTexts(root, scope.baseGen));
+		}
+		// Text of its earlier transactions that was not taken, which it was not told of yet.
+		// What the client was acknowledged it was also told of; the rest it is told now.
+		if (sameSession) this.toldLost(head.key, resume.tx);
+		// Of an ended session: what the client was not acknowledged yet (a notice goes out with
+		// the acknowledgement of its transaction, so one acknowledged was received).
+		const before = sameSession ? [] : (lostBefore ?? []).filter((l) => l[0] > (resume?.tx ?? 0));
+		const lost = sameSession
+			? (this.keyLost.get(head.key) ?? []).filter((l) => l[0] <= processed)
+			: before;
+		if (lost.length > 0) joined.x = lost;
+		let frame: Uint8Array;
+		try {
+			frame = encodeLiveFrame({ kind: LIVE_FRAME.joined, handle, head: joined, body });
+		} catch (error) {
+			logger.warn("Outline live join could not be answered", {
+				spaceId: this.spaceId,
+				error: String(error),
+			});
+			if (scope.participants.size === 0) scope.armIdle();
+			return { refused: "unavailable" };
+		}
+		// In this same session the participant goes on from where its client was: what is
+		// applied is not taken again, and is acknowledged once logged. A client of an ended
+		// session numbers on from its old transactions, which this session never saw.
+		p.lastTx = sameSession ? processed : 0;
+		p.durableTx = sameSession ? durable : 0;
+		p.ackedTx = p.durableTx;
+		if (sameSession && durable > (this.keyAcked.get(head.key) ?? 0))
+			this.keyAcked.set(head.key, durable);
+		p.windowStart = this.windowUpdates.length;
+		p.commitStart = this.windowCommits.length;
+		if (!this.sendTo(p, frame, "control")) {
+			if (scope.participants.size === 0) scope.armIdle();
+			return { refused: "unavailable" };
+		}
+		if (lost.length > 0) this.lostSent.set(p.pno, processed);
+		// Sent is not received: kept until the client's next join shows it got them.
+		this.adoptLost(head.key, before);
+		this.nextPno++;
+		scope.joinedAt = liveNow();
+		this.participants.set(p.pno, p);
+		scope.participants.set(p.pno, p);
+		scope.cancelIdle();
+		scope.presencePeers.add(p.pno);
+		scope.schedulePresence();
+		// The first person in: who else is working here. Later ones: whose names they may see.
+		if (scope.participants.size === 1 && scope.agents.size === 0) scope.requestAgents();
+		else if (scope.agents.size > 0) void scope.learnAgentReaders([p], [...scope.agents.keys()]);
+		return p;
+	}
+
+	leave(p: Participant): void {
+		if (this.participants.get(p.pno) !== p) return;
+		const scope = p.scope;
+		this.participants.delete(p.pno);
+		scope.participants.delete(p.pno);
+		this.windowAcks.delete(p.pno);
+		this.lostSent.delete(p.pno);
+		scope.presencePeers.delete(p.pno);
+		scope.presenceCursors.delete(p.pno);
+		scope.presenceBehind.delete(p.pno);
+		scope.presenceGone.add(p.pno);
+		scope.schedulePresence();
+		if (scope.participants.size === 0 && !scope.gone) scope.armIdle();
+	}
+
+	/**
+	 * Change a participant's write access (an access change re-checked it). A viewer becomes an
+	 * editor only while the page has room for one more.
+	 */
+	setWrite(p: Participant, canWrite: boolean): void {
+		if (p.canWrite === canWrite || this.participants.get(p.pno) !== p) return;
+		if (canWrite && p.scope.editors >= OUTLINE_LIVE_LIMITS.editorsPerPage) return;
+		p.canWrite = canWrite;
+		this.deliver(p, "control", () =>
+			encodeLiveFrame({ kind: LIVE_FRAME.mode, handle: p.handle, head: { w: canWrite } }),
+		);
+		p.scope.presencePeers.add(p.pno);
+		p.scope.schedulePresence();
+	}
+
+	/** Tell a participant the session ended for it (it is removed). */
+	dismiss(p: Participant, code: LiveCloseCode): void {
+		this.deliver(p, "control", () =>
+			encodeLiveFrame({ kind: LIVE_FRAME.closed, handle: p.handle, head: { code } }),
+		);
+		this.leave(p);
+	}
+
+	/**
+	 * Have a participant join again (a resume: it keeps its undo history) and take nothing of
+	 * its frames until it has: it sent text of a document generation the session has dropped.
+	 * The answer to its join names the drop, and the client makes that text again on the new
+	 * document; the frame, never processed, comes again with it.
+	 */
+	private forceResync(p: Participant): void {
+		// Nothing more of it is taken until it has joined again, whether or not it was already
+		// asked to (its next frame must not be processed over the one left out here).
+		p.blocked = true;
+		if (p.resyncSent) return;
+		p.lagging = true;
+		p.resyncSent = true;
+		this.stats.resyncs++;
+		try {
+			p.socket.send(encodeLiveFrame({ kind: LIVE_FRAME.resync, handle: p.handle }));
+		} catch (error) {
+			this.dropBroken(p, error);
+		}
+	}
+
+	/**
+	 * Called when a participant's socket drained: one that fell behind is told to rejoin, and
+	 * gets exactly what it lacks from its state vector; one that skipped presence gets the whole
+	 * picture. Its own frames are still taken meanwhile.
+	 */
+	onDrain(p: Participant): void {
+		if (this.participants.get(p.pno) !== p) return;
+		if (p.scope.presenceBehind.has(p.pno)) p.scope.schedulePresence();
+		if (!p.lagging || p.resyncSent) return;
+		if (socketBuffered(p.socket) > OUTLINE_LIVE_BOUNDS.resumeBytes) return;
+		p.resyncSent = true;
+		this.stats.resyncs++;
+		try {
+			p.socket.send(encodeLiveFrame({ kind: LIVE_FRAME.resync, handle: p.handle }));
+		} catch (error) {
+			this.dropBroken(p, error);
+		}
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// Sending
+	// ─────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * Send one frame. `presence` frames are skipped under mild backpressure (kept to be sent
+	 * later); any frame is held back from a socket buffering past {@link OUTLINE_LIVE_BOUNDS.
+	 * lagBytes}, which is then told to rejoin once it drains: dropping a text update silently
+	 * would leave that client diverged. Never throws.
+	 */
+	private sendTo(
+		p: Participant,
+		frame: Uint8Array,
+		kind: "data" | "presence" | "control",
+	): boolean {
+		if (p.lagging) return false;
+		const buffered = socketBuffered(p.socket);
+		if (kind === "presence" && buffered > OUTLINE_LIVE_BOUNDS.presenceDropBytes) return false;
+		if (kind === "data" && buffered > OUTLINE_LIVE_BOUNDS.lagBytes) {
+			p.lagging = true;
+			return false;
+		}
+		let sent: boolean;
+		try {
+			sent = p.socket.send(frame);
+		} catch {
+			sent = false;
+		}
+		if (!sent) {
+			p.lagging = true;
+			return false;
+		}
+		this.stats.framesOut++;
+		this.stats.bytesOut += frame.length;
+		return true;
+	}
+
+	/**
+	 * Encode and send one frame to one participant. A frame that cannot be encoded is a bug of
+	 * this session, not of the others: the participant is dropped and everyone else carries on.
+	 */
+	deliver(p: Participant, kind: "data" | "presence" | "control", build: () => Uint8Array): boolean {
+		if (p.lagging) return false;
+		let frame: Uint8Array;
+		try {
+			frame = build();
+		} catch (error) {
+			this.dropBroken(p, error);
+			return false;
+		}
+		return this.sendTo(p, frame, kind);
+	}
+
+	private brokenLogged = 0;
+
+	private dropBroken(p: Participant, error: unknown): void {
+		if (liveNow() - this.brokenLogged > 60_000) {
+			this.brokenLogged = liveNow();
+			logger.warn("Outline live frame failed; participant dropped", {
+				spaceId: this.spaceId,
+				error: String(error),
+			});
+		}
+		this.leave(p);
+	}
+
+	private scheduleBroadcast(): void {
+		if (this.broadcastTimer || this.closed) return;
+		this.broadcastTimer = liveTimeout(() => {
+			this.broadcastTimer = null;
+			this.flushBroadcast();
+		}, OUTLINE_LIVE_TIMING.broadcastMs);
+	}
+
+	/**
+	 * Send everyone what the window collected for them (see the module header). A participant's
+	 * transactions are acknowledged once they are in the log (`durableTx`), so an acknowledged
+	 * change survives a crash; the client keeps the others and replays them if it must.
+	 */
+	flushBroadcast(): void {
+		if (this.broadcastTimer) {
+			cancelLiveTimer(this.broadcastTimer);
+			this.broadcastTimer = null;
+		}
+		const updates = this.windowUpdates;
+		const commits = this.windowCommits;
+		this.windowUpdates = [];
+		this.windowCommits = [];
+		const t0 = performance.now();
+		const merged = new Map<string, Uint8Array>();
+		// One page's share of the window; several pages only when several are being edited.
+		const byRoot = new Map<string, WindowUpdate[]>();
+		for (const u of updates) {
+			const list = byRoot.get(u.scope);
+			if (list) list.push(u);
+			else byRoot.set(u.scope, [u]);
+		}
+		const mergedFor = (p: Participant, start: number): Uint8Array | null => {
+			const pno = p.pno;
+			const mine = byRoot.get(p.root);
+			if (!mine) return null;
+			const whole = start === 0;
+			const share = whole
+				? mine.filter((u) => u.from !== pno)
+				: updates.slice(start).filter((u) => u.from !== pno && u.scope === p.root);
+			if (share.length === 0) return null;
+			// Recipients of a page that sent nothing in the window share one merge.
+			const key = whole && share.length === mine.length ? `all ${p.root}` : `${pno}`;
+			let out = merged.get(key);
+			if (!out) {
+				out = encodeLiveTexts(mergeTexts(share));
+				merged.set(key, out);
+			}
+			return out;
+		};
+		for (const p of [...this.participants.values()]) {
+			const start = p.windowStart;
+			const commitStart = p.commitStart;
+			p.windowStart = 0;
+			p.commitStart = 0;
+			// A participant that fell behind rejoins and gets everything it lacks.
+			if (p.lagging) continue;
+			const others = [...p.heldCommits];
+			for (let i = commitStart; i < commits.length; i++) {
+				const c = commits[i] as ScopedCommit;
+				if (c.root === p.root && c.wire.by !== p.pno) others.push(c.wire);
+			}
+			const ackable = Math.min(p.lastTx, p.durableTx);
+			const ack = ackable > p.ackedTx ? ackable : 0;
+			const waiting = this.windowAcks.get(p.pno);
+			const acks = ack > 0 ? waiting?.filter((a) => a[0] <= ack) : undefined;
+			// The client applies structure in operation order: others' changes after its own
+			// first unacknowledged one wait for that acknowledgement.
+			let first = Number.POSITIVE_INFINITY;
+			for (const a of waiting ?? []) if (a[0] > ack && a[1] < first) first = a[1];
+			const own = others.filter((c) => c.o < first);
+			p.heldCommits = others.filter((c) => c.o >= first);
+			if (p.heldCommits.length > OUTLINE_LIVE_BOUNDS.opLog) {
+				// Held too long (the log is not taking writes): it rejoins and gets everything.
+				p.heldCommits = [];
+				p.lagging = true;
+				p.resyncSent = true;
+				this.stats.resyncs++;
+				try {
+					p.socket.send(encodeLiveFrame({ kind: LIVE_FRAME.resync, handle: p.handle }));
+				} catch (error) {
+					this.dropBroken(p, error);
+				}
+				continue;
+			}
+			const body = mergedFor(p, start);
+			const upTo = Math.max(ack, p.ackedTx);
+			const sentTo = this.lostSent.get(p.pno) ?? 0;
+			const lost = (this.keyLost.get(p.key) ?? []).filter((l) => l[0] <= upTo && l[0] > sentTo);
+			if (!body && own.length === 0 && ack === 0 && lost.length === 0) continue;
+			const head: LiveBatchHead = {};
+			if (own.length > 0) head.c = own;
+			if (acks && acks.length > 0) head.a = acks;
+			if (lost.length > 0) head.x = lost;
+			const sent = this.deliver(p, "data", () =>
+				encodeLiveFrame({
+					kind: LIVE_FRAME.batch,
+					handle: p.handle,
+					n: ack,
+					...(head.c || head.a || head.x ? { head } : {}),
+					...(body ? { body } : {}),
+				}),
+			);
+			if (sent && lost.length > 0) this.lostSent.set(p.pno, upTo);
+			if (sent && ack > 0) {
+				p.ackedTx = ack;
+				if (ack > (this.keyAcked.get(p.key) ?? 0)) this.keyAcked.set(p.key, ack);
+				const rest = waiting?.filter((a) => a[0] > ack) ?? [];
+				if (rest.length > 0) this.windowAcks.set(p.pno, rest);
+				else this.windowAcks.delete(p.pno);
+			}
+		}
+		this.stats.mergeMs += performance.now() - t0;
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1501,19 +2143,101 @@ export class LivePage {
 	 * The text entries of a participant's frame: updates only, one a block, each of a block the
 	 * session knows, deleted or not (typing may cross its block's deletion, and refusing it
 	 * would take the whole frame and the typist's undo history with it), or (a structural
-	 * transaction) of one the transaction inserts. Null otherwise: a block the page never had
-	 * gets no document. Every document made counts against the session's bound (`charge`).
+	 * transaction) of one the transaction inserts. Null otherwise: a block the session never had
+	 * gets no document. `"stale"`: an entry is of a document generation the session has dropped
+	 * (`forceResync`); one of a generation it never announced is refused like any malformed one.
 	 */
-	private parseTexts(body: Uint8Array, inserted?: ReadonlySet<string>): LiveTextEntry[] | null {
+	private parseTexts(
+		p: Participant,
+		body: Uint8Array,
+		inserted?: ReadonlySet<string>,
+	): { entries: LiveTextEntry[]; lost: string[] } | "stale" | null {
 		const entries = decodeLiveTexts(body, OUTLINE_LIVE_LIMITS.maxClientTextEntries);
 		if (!entries) return null;
 		const seen = new Set<string>();
+		const out: LiveTextEntry[] = [];
+		const lost: string[] = [];
+		let stale = false;
 		for (const e of entries) {
 			if (e.kind !== LIVE_TEXT_KIND.update || seen.has(e.id)) return null;
-			if (!this.hasText(e.id) && !inserted?.has(e.id)) return null;
 			seen.add(e.id);
+			if (!this.hasText(e.id) && !inserted?.has(e.id)) {
+				// A block that left the session with its tree a moment ago: not taken, and said so.
+				if (!this.recentlyGone.has(e.id)) return null;
+				lost.push(e.id);
+				continue;
+			}
+			const known = this.mirror.get(e.id);
+			const gen = known?.gen ?? 0;
+			if ((e.gen ?? 0) > gen) return null;
+			// A deleted block whose text another page's people hold (or nobody): the session does
+			// not follow it. (A block that went to a page nobody has open was also given a new
+			// generation then: whoever is shown it again gets a later one, and their copy, with
+			// the typing not taken, is replaced; `LiveClient.keepLost` relies on it.)
+			if (known?.deleted && known.held !== p.root) lost.push(e.id);
+			else if ((e.gen ?? 0) === gen) out.push(e);
+			// Of a block whose text the participant's page holds: it is told of the drop (a join
+			// names it). Of a block that left its page (it holds it as deleted, and is told
+			// nothing more of it) and whose document is another by now: typing that crossed the
+			// block's leaving cannot be put into that document; the client is told it was not
+			// taken and keeps it for the person.
+			else if (this.scopeOf(e.id) === p.root) stale = true;
+			else lost.push(e.id);
 		}
-		return entries;
+		return stale ? "stale" : { entries: out, lost };
+	}
+
+	/** Text of a processed transaction that was not taken: told with its acknowledgement. */
+	private noteLost(p: Participant, n: number, blocks: readonly string[]): void {
+		if (blocks.length === 0) return;
+		const list = this.keyLost.get(p.key) ?? [];
+		list.push([n, [...blocks]]);
+		if (list.length > OUTLINE_LIVE_BOUNDS.lostPerKey) {
+			// Never silently: a client this far behind on its notices has lost touch with its
+			// typing long ago (it is told at its next join; an entry is a few block ids).
+			const gone = list.splice(0, list.length - OUTLINE_LIVE_BOUNDS.lostPerKey);
+			logger.warn("Outline live: notices of text not taken dropped for a client", {
+				spaceId: this.spaceId,
+				dropped: gone.length,
+				oldestTx: gone[0]?.[0],
+			});
+		}
+		this.keyLost.set(p.key, list);
+		// In the log with the transaction's position (`persistStep`), before it is acknowledged.
+		this.lostPending.add(p.key);
+		this.schedulePersist();
+		this.scheduleBroadcast();
+	}
+
+	/** What clients were not told yet was not taken (kept past the session's end, `registry.ts`). */
+	get lostUntold(): Map<string, LiveLostWire[]> {
+		return new Map(this.keyLost);
+	}
+
+	/** The client of `key` was told what was not taken of its transactions up to `upTo`. */
+	private toldLost(key: string, upTo: number): void {
+		const had = this.keyLost.get(key);
+		if (!had) return;
+		const rest = had.filter((l) => l[0] > upTo);
+		if (rest.length === had.length) return;
+		if (rest.length > 0) this.keyLost.set(key, rest);
+		else this.keyLost.delete(key);
+		this.lostPending.add(key);
+		this.schedulePersist();
+	}
+
+	/**
+	 * Notices of an ended session of this client's (`lostBefore`) are this session's to deliver
+	 * now: kept, logged and sent again until the client shows it got them (a later join).
+	 */
+	private adoptLost(key: string, lost: readonly LiveLostWire[]): void {
+		if (lost.length === 0) return;
+		const list = [...(this.keyLost.get(key) ?? [])];
+		for (const l of lost) if (!list.some((x) => x[0] === l[0])) list.push(l);
+		list.sort((a, b) => a[0] - b[0]);
+		this.keyLost.set(key, list);
+		this.lostPending.add(key);
+		this.schedulePersist();
 	}
 
 	/**
@@ -1528,6 +2252,8 @@ export class LivePage {
 		const t0 = performance.now();
 		try {
 			for (const e of entries) {
+				// A block the mirror never had (this transaction inserts it, and may be refused).
+				if (!this.docs.has(e.id) && !this.mirror.get(e.id)) this.orphanScope.set(e.id, p.root);
 				const t = this.textDoc(e.id);
 				if (undos)
 					undos.push(
@@ -1561,14 +2287,19 @@ export class LivePage {
 			this.reject(p, n, "read_only");
 			return;
 		}
-		const entries = this.parseTexts(body);
+		const parsed = this.parseTexts(p, body);
+		if (parsed === "stale") {
+			this.forceResync(p);
+			return;
+		}
 		// Updates before one that does not integrate stay: the client rebuilds from a snapshot
 		// that has them and merges what it typed onto it by text.
-		if (!entries || !this.applyTexts(p, entries)) {
+		if (!parsed || !this.applyTexts(p, parsed.entries)) {
 			this.reject(p, n, "invalid");
 			return;
 		}
 		this.processed(p, n);
+		this.noteLost(p, n, parsed.lost);
 	}
 
 	private processed(p: Participant, n: number): void {
@@ -1606,7 +2337,7 @@ export class LivePage {
 		}
 		if (forced > 0)
 			logger.warn("Outline live session dropped unacknowledged client keys", {
-				pageId: this.pageId,
+				spaceId: this.spaceId,
 				count: forced,
 			});
 	}
@@ -1624,7 +2355,7 @@ export class LivePage {
 		// Edited again: worth another try.
 		if (this.parked.delete(id)) this.failures.delete(id);
 		this.dirty.set(id, userId);
-		const now = Date.now();
+		const now = liveNow();
 		if (this.firstDirtyAt === 0) this.firstDirtyAt = now;
 		this.lastDirtyAt = now;
 		this.scheduleFlush();
@@ -1632,24 +2363,23 @@ export class LivePage {
 
 	private scheduleFlush(delayMs?: number): void {
 		if (this.closed) return;
-		if (this.flushTimer) clearTimeout(this.flushTimer);
+		if (this.flushTimer) cancelLiveTimer(this.flushTimer);
 		const due =
 			delayMs !== undefined
-				? Date.now() + delayMs
+				? liveNow() + delayMs
 				: Math.min(
 						this.lastDirtyAt + OUTLINE_LIVE_TIMING.flushIdleMs,
 						this.firstDirtyAt + OUTLINE_LIVE_TIMING.flushMaxMs,
 					);
-		this.flushTimer = setTimeout(
+		this.flushTimer = liveTimeout(
 			() => {
 				this.flushTimer = null;
 				this.schedule(async () => {
 					await this.flushContent();
 				});
 			},
-			Math.max(0, due - Date.now()),
+			Math.max(0, due - liveNow()),
 		);
-		this.flushTimer.unref?.();
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1679,7 +2409,7 @@ export class LivePage {
 			} catch (error) {
 				// The worker's queue is full: wait a little, a few times.
 				if (!isBusyText(error) || attempt >= 2) throw error;
-				await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+				await liveSleep(100 * (attempt + 1));
 			}
 		}
 		let at = 0;
@@ -1733,6 +2463,8 @@ export class LivePage {
 		if (ops.length === 0) {
 			this.settleContents(plans);
 			for (const plan of plans) done.add(plan.id);
+			// What was typed and taken back is in the log before anything is done on its account.
+			await this.persistNow();
 			return { ok: true, permanent: false, done };
 		}
 		// The log learns what is about to be committed first: a crash right after the commit
@@ -1850,7 +2582,7 @@ export class LivePage {
 				);
 			} catch (error) {
 				logger.warn("Outline live commit failed", {
-					pageId: this.pageId,
+					spaceId: this.spaceId,
 					error: String(error),
 					code: (error as { code?: string }).code,
 				});
@@ -1908,7 +2640,7 @@ export class LivePage {
 	 */
 	async flushContent(): Promise<boolean> {
 		if (this.flushTimer) {
-			clearTimeout(this.flushTimer);
+			cancelLiveTimer(this.flushTimer);
 			this.flushTimer = null;
 		}
 		if (this.dirty.size === 0) return true;
@@ -1928,7 +2660,7 @@ export class LivePage {
 		// past this budget the blocks not tried alone wait, as they are, for the next flush (at
 		// least one is tried per flush, so it gets through them). Those that failed alone go as
 		// code from now on, so the next batch does not fail on them again.
-		const deadline = Date.now() + OUTLINE_LIVE_TIMING.narrowBudgetMs;
+		const deadline = liveNow() + OUTLINE_LIVE_TIMING.narrowBudgetMs;
 		let tried = 0;
 		const giveUp = (id: string, user: string | null) => {
 			const n = (this.failures.get(id) ?? 0) + 1;
@@ -1943,7 +2675,7 @@ export class LivePage {
 			// a later edit of the block tries again.
 			this.parked.add(id);
 			logger.warn("Outline live text cannot be committed; kept in the log", {
-				pageId: this.pageId,
+				spaceId: this.spaceId,
 				blockId: id,
 			});
 		};
@@ -1962,7 +2694,7 @@ export class LivePage {
 				continue;
 			}
 			for (const id of failed) {
-				if (tried > 0 && Date.now() >= deadline) {
+				if (tried > 0 && liveNow() >= deadline) {
 					// Not tried alone: nothing known against it, so it is neither counted nor fenced.
 					ok = false;
 					redirty([id], user);
@@ -1973,7 +2705,7 @@ export class LivePage {
 				if (!one.ok && one.permanent && !stuckBefore.has(id)) {
 					this.stuck.add(id);
 					logger.warn("Outline live text could not be committed; committing it as code", {
-						pageId: this.pageId,
+						spaceId: this.spaceId,
 						blockId: id,
 					});
 					one = await this.commitTexts([id], user);
@@ -1987,7 +2719,7 @@ export class LivePage {
 			}
 		}
 		if (!ok) {
-			this.firstDirtyAt = Date.now();
+			this.firstDirtyAt = liveNow();
 			this.scheduleFlush(OUTLINE_LIVE_TIMING.flushRetryMs);
 		}
 		return ok;
@@ -2017,11 +2749,16 @@ export class LivePage {
 		}
 		const inserted = new Map<string, Extract<LiveOp, { t: "i" }>>();
 		for (const op of plan.ops) if (op.t === "i") inserted.set(op.id, op);
-		const entries = this.parseTexts(body, new Set(inserted.keys()));
-		if (!entries) {
+		const parsed = this.parseTexts(p, body, new Set(inserted.keys()));
+		if (parsed === "stale") {
+			this.forceResync(p);
+			return;
+		}
+		if (!parsed) {
 			this.reject(p, n, "invalid");
 			return;
 		}
+		const entries = parsed.entries;
 		// Text of blocks this transaction deletes is committed first, so their history keeps it.
 		// If that fails the transaction is refused: the text stays uncommitted (and marked).
 		const doomed = plan.deleted.filter((id) => this.dirty.has(id));
@@ -2160,7 +2897,7 @@ export class LivePage {
 
 			// The mirror follows what was written; the broadcast carries the canonical form.
 			const written = results.flatMap((r) => r.results);
-			const canonicalOps: LiveOp[] = [];
+			const events: RoutedOp[] = [];
 			for (const op of plan.ops) {
 				const at = opOf.get(op);
 				const r = at === undefined ? undefined : written[at];
@@ -2190,20 +2927,33 @@ export class LivePage {
 							question,
 							deleted: false,
 							dbContent: prior?.dbContent ?? "",
+							gen: prior?.gen ?? 0,
+							// A new block's text is with its maker's page; `route` sends it to
+							// another page's people if that is where the block is.
+							held: prior?.held ?? this.orphanScope.get(op.id) ?? p.root,
 						});
-						canonicalOps.push({ ...op, k: key, ...(question ? { q: true as const } : {}) });
+						this.orphanScope.delete(op.id);
+						events.push({
+							op: { ...op, k: key, ...(question ? { q: true as const } : {}) },
+							top: this.treeOf(op.id),
+						});
 						break;
 					}
-					case "m":
+					case "m": {
+						const from = this.treeOf(op.id);
+						const sub = this.mirror.subtree(op.id);
 						this.mirror.update(op.id, { parentId: op.p, orderKey: key });
-						canonicalOps.push({ ...op, k: key });
+						events.push({ op: { ...op, k: key }, top: this.treeOf(op.id), from, sub });
 						break;
-					case "d":
+					}
+					case "d": {
+						const top = this.treeOf(op.id);
 						for (const id of this.mirror.subtree(op.id)) {
 							this.mirror.update(id, { deleted: true });
-							canonicalOps.push({ t: "d", id });
+							events.push({ op: { t: "d", id }, top });
 						}
 						break;
+					}
 					case "k": {
 						const b = this.mirror.get(op.id);
 						this.mirror.update(op.id, {
@@ -2211,18 +2961,23 @@ export class LivePage {
 								? { ...(b?.taskJson ?? { assignee: null }), status: LIVE_STATUS_OF_TASK[op.task] }
 								: null,
 						});
-						canonicalOps.push(op);
+						events.push({ op, top: this.treeOf(op.id) });
 						break;
 					}
 				}
 			}
 			this.settleContents(contents);
 			this.processed(p, n);
-			if (canonicalOps.length > 0) {
-				const commit: LiveCommitWire = { o: ++this.opSeq, by: p.pno, ops: canonicalOps };
-				this.recordCommit(commit);
+			this.noteLost(p, n, parsed.lost);
+			if (events.length > 0) {
+				const o = ++this.opSeq;
+				const routed = this.route(events, o);
+				for (const [root, list] of routed) this.recordCommit(root, { o, by: p.pno, ops: list });
+				// What the transaction came to in its author's page (nothing, when it only changed
+				// another one).
+				const own = routed.get(p.root) ?? [];
 				const acks = this.windowAcks.get(p.pno) ?? [];
-				acks.push(sameOps(canonicalOps, ops) ? [n, commit.o] : [n, commit.o, canonicalOps]);
+				acks.push(sameOps(own, ops) ? [n, o] : [n, o, own]);
 				this.windowAcks.set(p.pno, acks);
 			}
 			if (contents.some(reshapes)) await this.applyOwnResults(results);
@@ -2242,17 +2997,86 @@ export class LivePage {
 		}
 	}
 
-	private recordCommit(commit: LiveCommitWire): void {
+	/**
+	 * The one place a page's people are shown a block (every insert a page is sent passes here):
+	 * unless they hold its text already, they are sent it whole and hold it from now on, and a
+	 * client resuming from before batch `o` is sent it too. Whatever path brought the block here
+	 * (made, restored, moved in from another page's tree, alone or under its parent, read from
+	 * the database), its text cannot be missing or stale on that page.
+	 */
+	private tell(id: string, root: string, o: number): void {
+		const b = this.mirror.get(id);
+		if (!b || b.held === root) return;
+		this.mirror.update(id, { held: root });
+		this.seededAt.set(id, o);
+		const e = this.wholeText(id);
+		if (!e) return;
+		this.windowUpdates.push({ from: 0, scope: root, ...e });
+		this.scheduleBroadcast();
+	}
+
+	/**
+	 * Cut a batch of structural changes (already in the mirror) to each page's view: a change
+	 * inside one tree goes to that page as it is; a block moved from one tree to another is a
+	 * delete of what moved for the page it left, and an insert of each block (with its text) for
+	 * the page it reached. Trees nobody joined get nothing.
+	 */
+	private route(events: readonly RoutedOp[], o: number): Map<string, LiveOp[]> {
+		const out = new Map<string, LiveOp[]>();
+		const add = (root: string, op: LiveOp) => {
+			if (!this.scopes.has(root)) return;
+			if (op.t === "i") this.tell(op.id, root, o);
+			const list = out.get(root);
+			if (list) list.push(op);
+			else out.set(root, [op]);
+		};
+		for (const e of events) {
+			if (e.op.t !== "m" || e.from === undefined || e.from === e.top) {
+				add(e.top, e.op);
+				continue;
+			}
+			for (const id of e.sub ?? [e.op.id]) add(e.from, { t: "d", id });
+			for (const id of this.mirror.subtreeAll(e.op.id)) {
+				const b = this.mirror.get(id) as MirrorBlock;
+				if (b.deleted) {
+					// A deleted block that went along: the page it left is told nothing more of
+					// it, the page it reached nothing yet. Nobody holds its text until it is
+					// brought back somewhere.
+					if (b.held !== "") this.mirror.update(id, { held: "" });
+					continue;
+				}
+				// Only what is still attached (a live block under a deleted one is not shown).
+				if (b.parentId === null || this.mirror.rootOf(id) !== e.top) continue;
+				const task = taskCharOf(b.taskJson);
+				add(e.top, {
+					t: "i",
+					id,
+					p: b.parentId,
+					k: b.orderKey,
+					...(task ? { task } : {}),
+					...(b.question ? { q: true as const } : {}),
+				});
+			}
+		}
+		return out;
+	}
+
+	private recordCommit(root: string, commit: LiveCommitWire): void {
+		const scope = this.scopes.get(root);
+		if (!scope) return;
 		// A person's checkbox or delete here may end a task an agent's cursor is on.
 		if (
 			typeof commit.by === "number" &&
-			this.agents.size > 0 &&
+			scope.agents.size > 0 &&
 			commit.ops.some((op) => op.t === "k" || op.t === "d")
 		)
-			this.requestAgents();
-		this.windowCommits.push(commit);
-		this.opLog.push(commit);
-		while (this.opLog.length > OUTLINE_LIVE_BOUNDS.opLog) this.opLog.shift();
+			scope.requestAgents();
+		this.windowCommits.push({ root, wire: commit });
+		this.opLog.push({ root, wire: commit });
+		while (this.opLog.length > OUTLINE_LIVE_BOUNDS.opLog) {
+			const gone = this.opLog.shift() as ScopedCommit;
+			this.opDropped.set(gone.root, gone.wire.o);
+		}
 		this.scheduleBroadcast();
 	}
 
@@ -2266,6 +3090,10 @@ export class LivePage {
 		const parentOf = (id: string): string | null | undefined =>
 			overlay.has(id) ? overlay.get(id)?.parentId : this.mirror.get(id)?.parentId;
 		const known = (id: string): boolean => overlay.has(id) || this.mirror.get(id) !== undefined;
+		/** A top-level block: the wire cannot move, delete or check one (L3 adds the top level). */
+		const isTop = (id: string): boolean => this.mirror.get(id)?.parentId === null;
+		/** Every live child of the parent is here: a block may be put under it. */
+		const open = (id: string): boolean => overlay.has(id) || this.mirror.isLoaded(id);
 		const alive = (id: string): boolean => {
 			let cur: string | null | undefined = id;
 			for (let guard = 0; cur && guard < 10_000; guard++) {
@@ -2273,8 +3101,10 @@ export class LivePage {
 					? overlay.get(cur)?.deleted
 					: this.mirror.get(cur)?.deleted;
 				if (deleted !== false) return false;
-				if (cur === this.pageId) return true;
-				cur = parentOf(cur);
+				// Up to a top-level block the mirror holds: any loaded tree of the space.
+				const parent = parentOf(cur);
+				if (parent === null) return true;
+				cur = parent;
 			}
 			return false;
 		};
@@ -2291,21 +3121,21 @@ export class LivePage {
 		for (const op of ops) {
 			switch (op.t) {
 				case "i": {
-					if (!CLIENT_ID_RE.test(op.id) || !alive(op.p)) return null;
+					if (!CLIENT_ID_RE.test(op.id) || !alive(op.p) || !open(op.p)) return null;
 					if (known(op.id) && alive(op.id)) return null;
 					overlay.set(op.id, { parentId: op.p, deleted: false });
 					out.push(op);
 					break;
 				}
 				case "m": {
-					if (op.id === this.pageId || !alive(op.id) || !alive(op.p)) return null;
+					if (isTop(op.id) || !alive(op.id) || !alive(op.p) || !open(op.p)) return null;
 					if (isWithin(op.p, op.id)) return null;
 					overlay.set(op.id, { parentId: op.p, deleted: false });
 					out.push(op);
 					break;
 				}
 				case "d": {
-					if (op.id === this.pageId) return null;
+					if (isTop(op.id)) return null;
 					if (!known(op.id)) return null;
 					// Inside a block this transaction already deleted: gone with it.
 					if (!alive(op.id)) {
@@ -2319,8 +3149,7 @@ export class LivePage {
 				}
 				case "k": {
 					// A question is not a task: its checkbox is refused (it is answered in the inbox).
-					if (!alive(op.id) || op.id === this.pageId || this.mirror.get(op.id)?.question)
-						return null;
+					if (!alive(op.id) || isTop(op.id) || this.mirror.get(op.id)?.question) return null;
 					out.push(op);
 					break;
 				}
@@ -2423,7 +3252,9 @@ export class LivePage {
 	 */
 	async applyCommits(commits: readonly CommittedEvent[]): Promise<void> {
 		for (const commit of commits) {
-			if (this.closed || !commit.pageIds.includes(this.pageId)) continue;
+			if (this.closed) return;
+			// Nothing of it is loaded: a commit of pages nobody has open.
+			if (!commit.pageIds.some((id) => this.mirror.get(id) !== undefined)) continue;
 			const versions: OutlineVersionRow[] = [];
 			for (const pageId of commit.pageIds) {
 				const rows = await outlineStore.listPageVersions(pageId, {
@@ -2437,53 +3268,80 @@ export class LivePage {
 			// commit that changed tasks may have ended or handed over one an agent holds.
 			// A person's commit made for a session (a plan locked for it) is the person's, not the
 			// session's work here.
-			if (commit.narratorId && commit.actorKind !== "human") {
-				this.noteAgentWrite(commit.narratorId, versions);
-				this.requestAgents();
-			} else if (
-				this.agents.size > 0 &&
-				versions.some((v) => v.deleted || v.changeFlags & OUTLINE_CHANGE.TASK)
-			)
-				this.requestAgents();
+			for (const pageId of commit.pageIds) {
+				const scope = this.scopes.get(pageId);
+				if (!scope) continue;
+				if (commit.narratorId && commit.actorKind !== "human") {
+					scope.noteAgentWrite(commit.narratorId, versions);
+					scope.requestAgents();
+				} else if (
+					scope.agents.size > 0 &&
+					versions.some((v) => v.deleted || v.changeFlags & OUTLINE_CHANGE.TASK)
+				)
+					scope.requestAgents();
+			}
 		}
 	}
 
+	/**
+	 * Take the block versions one commit wrote into the mirror and tell each page what changed
+	 * in its tree. A block's page after the commit (`pageId`) says where it is now: in a loaded
+	 * tree, or not (deleted, or moved to a page nobody has open: the same to the people here).
+	 */
 	private async applyVersions(versions: OutlineVersionRow[], by: LiveActor): Promise<void> {
-		const self = versions.find((v) => v.blockId === this.pageId);
-		if (self && (self.deleted || self.parentId !== null)) {
-			// The page itself was deleted or moved under another page: this session has nothing
-			// left to edit. Its participants are told it ended (a rejoin finds the page gone).
-			if (!this.restartRequested) {
-				this.restartRequested = true;
-				this.onEnd(this, "ended", false);
-			}
-			return;
-		}
-		const inserts: LiveOp[] = [];
-		const moves: LiveOp[] = [];
-		const tasks: LiveOp[] = [];
-		const deletes: LiveOp[] = [];
+		const inserts: RoutedOp[] = [];
+		const moves: RoutedOp[] = [];
+		const tasks: RoutedOp[] = [];
+		const deletes: RoutedOp[] = [];
 		const created: OutlineVersionRow[] = [];
+		const ended: LivePageView[] = [];
 		for (const v of versions) {
 			const m = this.mirror.get(v.blockId);
-			const inPage = !v.deleted && v.pageId === this.pageId;
-			if (inPage && (!m || m.deleted)) {
+			// The page a view is on was deleted, or moved under another block.
+			const view = this.scopes.get(v.blockId);
+			if (view && (v.deleted || v.parentId !== null)) ended.push(view);
+			const loaded = !v.deleted && this.mirror.isRoot(v.pageId);
+			if (loaded && (!m || m.deleted)) {
 				created.push(v);
 				continue;
 			}
 			if (!m || m.deleted) continue;
-			if (!inPage) {
-				this.mirror.update(v.blockId, { deleted: true });
-				deletes.push({ t: "d", id: v.blockId });
+			if (!loaded) {
+				// Everything under it left with it, whether or not the commit wrote a version of
+				// each (a move to another page does today; it will not once pages are gone).
+				const top = this.treeOf(v.blockId);
+				for (const id of this.mirror.subtree(v.blockId)) {
+					// Moved to a page that is not loaded (not deleted): it lives on there, and
+					// nobody here holds its text any more (typing still on its way into it is
+					// told back as not taken, `parseTexts`).
+					if (v.deleted) this.mirror.update(id, { deleted: true });
+					else {
+						// Its document ends here too (its text is committed: the write waited for
+						// that): what a client still types into its copy is not taken, so that
+						// copy is no longer the block's document, and whoever is shown the block
+						// again is given a later generation of it.
+						this.destroyDoc(id);
+						this.mirror.update(id, { deleted: true, held: "", gen: ++this.era });
+					}
+					deletes.push({ op: { t: "d", id }, top });
+				}
 				continue;
 			}
 			if (m.parentId !== v.parentId || m.orderKey !== v.orderKey) {
+				const from = this.treeOf(v.blockId);
+				const sub = this.mirror.subtree(v.blockId);
 				this.mirror.update(v.blockId, { parentId: v.parentId, orderKey: v.orderKey });
 				if (v.parentId !== null)
-					moves.push({ t: "m", id: v.blockId, p: v.parentId, k: v.orderKey });
+					moves.push({
+						op: { t: "m", id: v.blockId, p: v.parentId, k: v.orderKey },
+						top: this.treeOf(v.blockId),
+						from,
+						sub,
+					});
 			}
 			const task = taskCharOf(v.taskJson);
-			if (task !== taskCharOf(m.taskJson)) tasks.push({ t: "k", id: v.blockId, task });
+			if (task !== taskCharOf(m.taskJson))
+				tasks.push({ op: { t: "k", id: v.blockId, task }, top: this.treeOf(v.blockId) });
 			if (JSON.stringify(v.taskJson) !== JSON.stringify(m.taskJson))
 				this.mirror.update(v.blockId, { taskJson: v.taskJson });
 			if ((v.askJson !== null) !== (m.question === true))
@@ -2521,20 +3379,15 @@ export class LivePage {
 					question: v.askJson !== null,
 					deleted: false,
 					dbContent: content,
+					// A block new to the session is of the generation the session is at: its text
+					// always goes out with it then (`wholeText`).
+					gen: prior?.gen ?? this.era,
+					// Whoever held it before still does; `route` sends its text to the people of
+					// the page it is in now when they are not the ones (`tell`).
+					held: prior?.held ?? this.orphanScope.get(v.blockId) ?? "",
 				});
+				this.orphanScope.delete(v.blockId);
 				this.syncPending.set(v.blockId, content);
-				if (!known) {
-					this.seededAt.set(v.blockId, this.opSeq + 1);
-					if (content.length > 0) {
-						this.windowUpdates.push({
-							from: 0,
-							id: v.blockId,
-							kind: LIVE_TEXT_KIND.seed,
-							data: encodeLiveSeed(content),
-						});
-						this.scheduleBroadcast();
-					}
-				}
 			}
 			// Parents before children.
 			const ordered = [...created].sort(
@@ -2546,18 +3399,24 @@ export class LivePage {
 				if (v.parentId === null) continue;
 				const task = taskCharOf(v.taskJson);
 				inserts.push({
-					t: "i",
-					id: v.blockId,
-					p: v.parentId,
-					k: v.orderKey,
-					...(task ? { task } : {}),
-					...(v.askJson !== null ? { q: true as const } : {}),
+					op: {
+						t: "i",
+						id: v.blockId,
+						p: v.parentId,
+						k: v.orderKey,
+						...(task ? { task } : {}),
+						...(v.askJson !== null ? { q: true as const } : {}),
+					},
+					top: v.pageId,
 				});
 			}
 		}
-		// Blocks still in the page whose parent went: they went with it.
-		const ops = [...inserts, ...moves, ...tasks, ...deletes];
-		if (ops.length > 0) this.recordCommit({ o: ++this.opSeq, by, ops });
+		const events = [...inserts, ...moves, ...tasks, ...deletes];
+		if (events.length > 0) {
+			const o = ++this.opSeq;
+			for (const [root, ops] of this.route(events, o)) this.recordCommit(root, { o, by, ops });
+		}
+		for (const view of ended) this.endScope(view);
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -2566,11 +3425,10 @@ export class LivePage {
 
 	private schedulePersist(): void {
 		if (this.persistTimer || this.closed) return;
-		this.persistTimer = setTimeout(() => {
+		this.persistTimer = liveTimeout(() => {
 			this.persistTimer = null;
 			void this.persistNow();
 		}, OUTLINE_LIVE_TIMING.persistMs);
-		this.persistTimer.unref?.();
 	}
 
 	/**
@@ -2579,7 +3437,7 @@ export class LivePage {
 	 */
 	persistNow(): Promise<boolean> {
 		if (this.persistTimer) {
-			clearTimeout(this.persistTimer);
+			cancelLiveTimer(this.persistTimer);
 			this.persistTimer = null;
 		}
 		const step = this.persistChain.then(() => this.persistStep());
@@ -2591,7 +3449,7 @@ export class LivePage {
 			() => true,
 			(error) => {
 				logger.warn("Outline live log append failed", {
-					pageId: this.pageId,
+					spaceId: this.spaceId,
 					error: String(error),
 				});
 				return false;
@@ -2621,13 +3479,14 @@ export class LivePage {
 			this.syncPending.size === 0 &&
 			this.intentPending.size === 0 &&
 			this.cancelPending.size === 0 &&
-			this.keysPending.size === 0
+			this.keysPending.size === 0 &&
+			this.lostPending.size === 0
 		)
 			return;
 		this.pendingRows = [];
 		const now = new Date().toISOString();
-		const row = (data: Uint8Array, actorKind: "human" | "system", actorId: string) => ({
-			pageBlockId: this.pageId,
+		const row: LogRowMaker = (data, actorKind, actorId) => ({
+			spaceId: this.spaceId,
 			epoch: this.epoch,
 			seq: this.logSeq++,
 			updateB64: Buffer.from(data).toString("base64"),
@@ -2635,7 +3494,12 @@ export class LivePage {
 			actorId,
 			createdAt: now,
 		});
-		const rows = [];
+		const textRow = (
+			entries: readonly LiveTextEntry[],
+			actorKind: "human" | "system",
+			actorId: string,
+		) => row(encodeLogTexts(entries), actorKind, actorId);
+		const rows: OutlineLiveLogRow[] = [];
 		const sync = new Map(this.syncPending);
 		const intents = new Map(this.intentPending);
 		const cancels = new Set(this.cancelPending);
@@ -2646,6 +3510,11 @@ export class LivePage {
 			if (tx !== undefined) keys.set(key, tx);
 		}
 		this.keysPending.clear();
+		// What was not taken of those transactions goes in the same row as how far they reached:
+		// a client told after a crash that a transaction is in the space is told this too.
+		const lost = new Map<string, LiveLostWire[]>();
+		for (const key of this.lostPending) lost.set(key, [...(this.keyLost.get(key) ?? [])]);
+		this.lostPending.clear();
 		let snapshot = false;
 		if (!this.snapshotWritten) {
 			// Every document whole first: later increments build on the items they hold. Blocks
@@ -2657,30 +3526,55 @@ export class LivePage {
 					sync.set(b.id, b.dbContent);
 			}
 		} else {
-			// Seed texts first, whoever's update made the document: an update needs its seed.
-			const seeds = pending.filter((r) => r.kind === LIVE_TEXT_KIND.seed);
-			if (seeds.length > 0) rows.push(row(encodeLogTexts(seeds), "system", LIVE_LOG_ACTOR));
-			const byActor = new Map<string, PendingRow[]>();
+			// A block's rows keep the order they came in: a drop of its document cuts the rows
+			// into stretches, and nothing of a stretch is written across it. Within a stretch,
+			// seed texts first, whoever's update made the document (an update needs its seed),
+			// then each actor's updates, a block's merged into one.
+			let stretch: PendingRow[] = [];
+			let drops: PendingRow[] = [];
+			const endStretch = () => {
+				if (stretch.length === 0) return;
+				const seeds = stretch.filter((r) => r.kind === LIVE_TEXT_KIND.seed);
+				if (seeds.length > 0) rows.push(textRow(seeds, "system", LIVE_LOG_ACTOR));
+				const byActor = new Map<string, PendingRow[]>();
+				for (const r of stretch) {
+					if (r.kind === LIVE_TEXT_KIND.seed) continue;
+					const key = `${r.actorKind}\u0000${r.actorId}`;
+					const list = byActor.get(key);
+					if (list) list.push(r);
+					else byActor.set(key, [r]);
+				}
+				for (const list of byActor.values()) {
+					const first = list[0] as PendingRow;
+					rows.push(textRow(mergeTexts(list), first.actorKind, first.actorId));
+				}
+				stretch = [];
+			};
+			const endDrops = () => {
+				if (drops.length > 0) rows.push(textRow(drops, "system", LIVE_LOG_ACTOR));
+				drops = [];
+			};
 			for (const r of pending) {
-				if (r.kind === LIVE_TEXT_KIND.seed) continue;
-				const key = `${r.actorKind}\u0000${r.actorId}`;
-				const list = byActor.get(key);
-				if (list) list.push(r);
-				else byActor.set(key, [r]);
+				if (r.kind === LIVE_TEXT_KIND.drop) {
+					endStretch();
+					drops.push(r);
+				} else {
+					endDrops();
+					stretch.push(r);
+				}
 			}
-			for (const list of byActor.values()) {
-				const first = list[0] as PendingRow;
-				rows.push(row(encodeLogTexts(mergeTexts(list)), first.actorKind, first.actorId));
-			}
+			endStretch();
+			endDrops();
 		}
-		if (sync.size > 0 || intents.size > 0 || cancels.size > 0 || keys.size > 0)
-			rows.push(row(encodeSyncRow(sync, intents, cancels, keys), "system", LIVE_SYNC_ACTOR));
+		if (sync.size > 0 || intents.size > 0 || cancels.size > 0 || keys.size > 0 || lost.size > 0)
+			rows.push(row(encodeSyncRow(sync, intents, cancels, keys, lost), "system", LIVE_SYNC_ACTOR));
 		try {
-			await outlineStore.appendLiveUpdates(rows);
+			await outlineStore.appendLiveLog(rows);
 		} catch (error) {
 			// Kept for the next attempt (the seq numbers drawn stay unused).
 			this.pendingRows = [...pending, ...this.pendingRows];
 			for (const key of keys.keys()) this.keysPending.add(key);
+			for (const key of lost.keys()) this.lostPending.add(key);
 			this.schedulePersist();
 			throw error;
 		}
@@ -2721,21 +3615,7 @@ export class LivePage {
 	}
 
 	/** Replace an epoch's rows with one snapshot and one sync row of what is still open. */
-	private async compact(
-		row: (
-			data: Uint8Array,
-			actorKind: "human" | "system",
-			actorId: string,
-		) => {
-			pageBlockId: string;
-			epoch: number;
-			seq: number;
-			updateB64: string;
-			actorKind: "human" | "system";
-			actorId: string;
-			createdAt: string;
-		},
-	): Promise<void> {
+	private async compact(row: LogRowMaker): Promise<void> {
 		const ahead = new Map<string, string>();
 		for (const b of this.mirror.all()) {
 			if (!b.deleted && this.textOf(b.id) !== b.dbContent) ahead.set(b.id, b.dbContent);
@@ -2745,17 +3625,22 @@ export class LivePage {
 		const covered = this.pendingRows;
 		this.pendingRows = [];
 		const compacted = [row(this.logSnapshot(), "system", LIVE_LOG_ACTOR)];
-		if (ahead.size > 0 || this.openIntents.size > 0 || this.keyDurable.size > 0) {
+		if (
+			ahead.size > 0 ||
+			this.openIntents.size > 0 ||
+			this.keyDurable.size > 0 ||
+			this.keyLost.size > 0
+		) {
 			compacted.push(
 				row(
-					encodeSyncRow(ahead, this.openIntents, new Set(), this.keyDurable),
+					encodeSyncRow(ahead, this.openIntents, new Set(), this.keyDurable, this.keyLost),
 					"system",
 					LIVE_SYNC_ACTOR,
 				),
 			);
 		}
 		try {
-			await outlineStore.replaceLiveUpdates(this.pageId, this.epoch, compacted);
+			await outlineStore.replaceLiveLog(this.spaceId, this.epoch, compacted);
 		} catch (error) {
 			this.pendingRows = [...covered, ...this.pendingRows];
 			throw error;
@@ -2814,6 +3699,108 @@ export class LivePage {
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
+	// Dropping documents
+	// ─────────────────────────────────────────────────────────────────────────
+	//
+	// Every end must hold every item of a document it has, so a document is dropped by all ends
+	// together: the session drops its own, gives the block a new generation, and tells the page's
+	// people (`drop`, with the block's text). See "document generations" in
+	// `shared/outline-live-protocol.ts` for what the other ends do and why no end keeps a stale
+	// document. A document can go once nothing of it is uncommitted or unlogged: its text is then
+	// exactly what the blocks table holds (for a deleted block: what its document says, which is
+	// kept as the block's plain text).
+
+	private scheduleSweep(): void {
+		if (this.sweepTimer || this.closed) return;
+		this.sweepTimer = liveTimeout(() => {
+			this.sweepTimer = null;
+			this.schedule(async () => {
+				await this.sweepDocs();
+			});
+		}, OUTLINE_LIVE_TIMING.sweepMs);
+	}
+
+	/** Whether a block's document can be dropped now. */
+	private evictable(id: string): boolean {
+		const t = this.docs.get(id);
+		if (!t || this.dirty.has(id) || this.stuck.has(id) || this.parked.has(id)) return false;
+		if (this.intentPending.has(id) || this.openIntents.has(id) || this.syncPending.has(id))
+			return false;
+		if (hasPendingStructs(t.doc)) return false;
+		const b = this.mirror.get(id);
+		return !b || b.deleted || t.text.toString() === b.dbContent;
+	}
+
+	/**
+	 * Drop the documents nobody needs: idle for {@link OUTLINE_LIVE_TIMING.docIdleMs}, or the
+	 * least recently changed ones while the session holds more than
+	 * {@link OUTLINE_LIVE_BOUNDS.softDocs}; at most {@link OUTLINE_LIVE_BOUNDS.evictPerSweep} a
+	 * call. In the lane. Returns how many went.
+	 */
+	async sweepDocs(): Promise<number> {
+		if (this.sweepTimer) {
+			cancelLiveTimer(this.sweepTimer);
+			this.sweepTimer = null;
+		}
+		if (this.closed || this.docs.size === 0) return 0;
+		if (this.holding > 0) {
+			this.scheduleSweep();
+			return 0;
+		}
+		const now = liveNow();
+		const over = this.docs.size - OUTLINE_LIVE_BOUNDS.softDocs;
+		const idle: Array<[number, string]> = [];
+		for (const id of this.docs.keys()) {
+			const age = now - (this.docTouched.get(id) ?? 0);
+			if (age >= OUTLINE_LIVE_TIMING.docIdleMs || over > 0) idle.push([age, id]);
+		}
+		idle.sort((a, b) => b[0] - a[0]);
+		const want = idle.filter(([age], i) => age >= OUTLINE_LIVE_TIMING.docIdleMs || i < over);
+		let dropped = 0;
+		if (want.length > 0) {
+			// Everything these documents took is in the log and acknowledged before they go, and
+			// the drop goes out before anything else is taken in: a client that still has a change
+			// of one unacknowledged when the drop reaches it knows the session never took it.
+			if (await this.persistNow()) {
+				this.flushBroadcast();
+				for (const [, id] of want) {
+					if (dropped >= OUTLINE_LIVE_BOUNDS.evictPerSweep) break;
+					if (!this.evictable(id) || this.closed) continue;
+					this.evict(id);
+					dropped++;
+				}
+				if (dropped > 0) {
+					this.flushBroadcast();
+					await this.persistNow();
+				}
+			}
+		}
+		if (this.docs.size > 0) this.scheduleSweep();
+		return dropped;
+	}
+
+	private evict(id: string): void {
+		const t = this.docs.get(id) as LiveTextDoc;
+		const b = this.mirror.get(id);
+		const text = t.text.toString();
+		// The block is told apart from `destroyDoc`'s log row below: the same row, written once.
+		this.destroyDoc(id);
+		this.stats.docsEvicted++;
+		if (!b) return;
+		const gen = ++this.era;
+		this.mirror.update(id, { gen, ...(b.deleted ? { dbContent: text } : {}) });
+		this.windowUpdates.push({
+			from: 0,
+			scope: this.scopeOf(id),
+			id,
+			kind: LIVE_TEXT_KIND.drop,
+			gen,
+			data: encodeLiveSeed(text),
+		});
+		this.scheduleBroadcast();
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
 	// Closing
 	// ─────────────────────────────────────────────────────────────────────────
 
@@ -2836,17 +3823,9 @@ export class LivePage {
 		this.flushBroadcast();
 		this.closed = true;
 		this.closedClean = committed && this.dirty.size === 0 && this.parked.size === 0;
-		for (const timer of [
-			this.broadcastTimer,
-			this.presenceTimer,
-			this.flushTimer,
-			this.persistTimer,
-			this.idleTimer,
-			this.agentTimer,
-			this.agentExpiry,
-		]) {
-			if (timer) clearTimeout(timer);
-		}
+		for (const timer of [this.broadcastTimer, this.flushTimer, this.persistTimer, this.sweepTimer])
+			if (timer) cancelLiveTimer(timer);
+		for (const view of this.scopes.values()) view.stop();
 		for (const p of [...this.participants.values()]) {
 			try {
 				p.socket.send(
@@ -2857,18 +3836,20 @@ export class LivePage {
 			}
 		}
 		this.participants.clear();
+		for (const view of this.scopes.values()) view.participants.clear();
+		this.scopes.clear();
 		if (this.closedClean) {
 			try {
-				await outlineStore.deleteLiveUpdates(this.pageId, this.epoch);
+				await outlineStore.deleteLiveLog(this.spaceId, this.epoch);
 			} catch (error) {
 				logger.warn("Outline live log could not be dropped", {
-					pageId: this.pageId,
+					spaceId: this.spaceId,
 					error: String(error),
 				});
 			}
 		} else {
 			logger.warn("Outline live session closed with uncommitted text; the log is kept for replay", {
-				pageId: this.pageId,
+				spaceId: this.spaceId,
 				epoch: this.epoch,
 			});
 		}
@@ -2882,26 +3863,55 @@ export class LivePage {
  */
 function mergeTexts(entries: readonly LiveTextEntry[]): LiveTextEntry[] {
 	if (entries.length === 1) return [entries[0] as LiveTextEntry];
-	const seeds = new Map<string, LiveTextEntry>();
-	const updates = new Map<string, Uint8Array[]>();
-	const order: string[] = [];
+	// In the order they came, a block's consecutive updates (of one generation) merged into one.
+	// A plain text (a seed, or what a dropped document left) ends the run of its block: what
+	// comes after it is of another document and is never merged across it or put before it.
+	const out: Array<LiveTextEntry | { id: string; gen: number; run: Uint8Array[] }> = [];
+	const open = new Map<string, { id: string; gen: number; run: Uint8Array[] }>();
 	for (const e of entries) {
-		if (!seeds.has(e.id) && !updates.has(e.id)) order.push(e.id);
-		if (e.kind === LIVE_TEXT_KIND.seed) seeds.set(e.id, e);
+		if (e.kind !== LIVE_TEXT_KIND.update) {
+			open.delete(e.id);
+			out.push(e);
+			continue;
+		}
+		const gen = e.gen ?? 0;
+		const run = open.get(e.id);
+		if (run && run.gen === gen) run.run.push(e.data);
 		else {
-			const list = updates.get(e.id);
-			if (list) list.push(e.data);
-			else updates.set(e.id, [e.data]);
+			const made = { id: e.id, gen, run: [e.data] };
+			open.set(e.id, made);
+			out.push(made);
 		}
 	}
-	const out: LiveTextEntry[] = [];
-	for (const id of order) {
-		const seed = seeds.get(id);
-		if (seed) out.push({ id, kind: seed.kind, data: seed.data });
-		const list = updates.get(id);
-		if (list) out.push({ id, kind: LIVE_TEXT_KIND.update, data: mergeTextUpdates(list) });
-	}
-	return out;
+	return out.map((e) =>
+		"run" in e
+			? {
+					id: e.id,
+					kind: LIVE_TEXT_KIND.update,
+					...(e.gen !== 0 ? { gen: e.gen } : {}),
+					data: e.run.length === 1 ? (e.run[0] as Uint8Array) : mergeTextUpdates(e.run),
+				}
+			: {
+					id: e.id,
+					kind: e.kind,
+					...(e.gen !== undefined ? { gen: e.gen } : {}),
+					data: e.data,
+				},
+	);
+}
+
+/** The payload of a log row that only says "this block's document is gone". */
+const EMPTY_TEXT = new Uint8Array(0);
+
+type LogRowMaker = (
+	data: Uint8Array,
+	actorKind: "human" | "system",
+	actorId: string,
+) => OutlineLiveLogRow;
+
+/** Let timers and I/O run between two steps of a long lane task. */
+function yieldToLoop(): Promise<void> {
+	return liveYield();
 }
 
 /**
@@ -2937,6 +3947,8 @@ function encodeSyncRow(
 	intents: ReadonlyMap<string, string>,
 	cancels: ReadonlySet<string>,
 	keys: ReadonlyMap<string, number>,
+	/** Per client key: what of its transactions was not taken and it was not told yet (whole). */
+	lost: ReadonlyMap<string, readonly LiveLostWire[]> = new Map(),
 ): Uint8Array {
 	return utf8.encode(
 		JSON.stringify({
@@ -2944,6 +3956,7 @@ function encodeSyncRow(
 			...(intents.size > 0 ? { i: Object.fromEntries(intents) } : {}),
 			...(cancels.size > 0 ? { x: [...cancels] } : {}),
 			...(keys.size > 0 ? { k: Object.fromEntries(keys) } : {}),
+			...(lost.size > 0 ? { l: Object.fromEntries(lost) } : {}),
 		}),
 	);
 }
