@@ -337,6 +337,17 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 			return out;
 		},
 
+		async getLastLiveVersion(blockId) {
+			const v = outlineBlockVersions;
+			const rows = await db
+				.select({ fromSeq: v.fromSeq, toSeq: v.toSeq })
+				.from(v)
+				.where(and(eq(v.blockId, blockId), eq(v.deleted, false)))
+				.orderBy(desc(v.fromSeq))
+				.limit(1);
+			return rows[0] ?? null;
+		},
+
 		async listLinksAt(blockIds, seq, kinds, limit) {
 			const out: OutlineLinkRow[] = [];
 			if (kinds.length === 0) return out;
