@@ -207,7 +207,8 @@ function expectDefault(
 		preview: {
 			kind: "report",
 			text: "The summary paragraph.",
-			label: surface === "editor" ? "Show all (5 blocks) ▸" : "Show all ▸",
+			// (The tree counts what it read of the report: its sections, the direct children.)
+			label: surface === "editor" ? "Show all (5 blocks) ▸" : "Show all (2 sections) ▸",
 		},
 		quick: "expand",
 	});
@@ -868,7 +869,7 @@ for (const variant of [
 			expect((await rowOf(a, reportId))?.preview).toEqual({
 				kind: "report",
 				text: "The summary paragraph.",
-				label: "展开全文 ▸",
+				label: "展开全文（2 节）▸",
 			});
 			expect((await a.call((f) => f.foldAll()))?.label).toBe("全部展开");
 		}

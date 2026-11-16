@@ -513,3 +513,86 @@ export function scrollToY(y: number): number {
 export function domSize(): number {
 	return document.getElementsByTagName("*").length;
 }
+
+/** The rows of spaces as the reader glances at them: counts, one line, read only. */
+export function glance(): Array<{
+	title: string;
+	waiting: string | null;
+	doing: string | null;
+	readOnly: boolean;
+	summary: string | null;
+	/** What comes first in the row's end: `waiting`, `doing`, or neither. */
+	first: string | null;
+}> {
+	return [...document.querySelectorAll<HTMLElement>("[data-tree-kind=space]")].map((row) => {
+		const item = row.closest("[role=treeitem]");
+		return {
+			title: row.querySelector<HTMLElement>("[data-tree-title]")?.textContent ?? "",
+			waiting: row.querySelector<HTMLElement>("[data-tree-count=waiting]")?.textContent ?? null,
+			doing: row.querySelector<HTMLElement>("[data-tree-count=doing]")?.textContent ?? null,
+			readOnly: row.querySelector("[data-tree-read-only]") !== null,
+			summary:
+				item?.querySelector<HTMLElement>(
+					":scope > * [data-tree-summary], :scope > [data-tree-summary]",
+				)?.textContent ?? null,
+			first: row.querySelector<HTMLElement>("[data-tree-count]")?.dataset.treeCount ?? null,
+		};
+	});
+}
+
+export function scrollY(): number {
+	return Math.round(window.scrollY);
+}
+
+/** The first tree row at or below the top of the view: its key and where its top is. */
+export function topRow(): { key: string; top: number } | null {
+	for (const row of document.querySelectorAll<HTMLElement>(
+		"[data-testid=outline-tree] [data-tree-node]",
+	)) {
+		const box = row.getBoundingClientRect();
+		if (box.height > 0 && box.bottom > 0) {
+			return { key: row.dataset.treeNode ?? "", top: Math.round(box.top) };
+		}
+	}
+	return null;
+}
+
+/** The scroll anchor kept for the home tree of the outline page, as stored. */
+export function storedAnchor(): string | null {
+	return sessionStorage.getItem("narrafork_outline_tree_scroll:page:all");
+}
+
+/** Focus the title of the row titled `title`. */
+export function focusTitle(title: string): boolean {
+	const element = rowTitled(title)?.querySelector<HTMLElement>("[data-tree-title]") ?? null;
+	element?.focus();
+	return !!element && document.activeElement === element;
+}
+
+/** The title of the row the focus is in ("" when none). */
+export function activeRow(): string {
+	const row = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>(
+		"[data-tree-node]",
+	);
+	return row ? titleOf(row) : "";
+}
+
+/** Elements of each tree that Tab reaches (tabindex >= 0, not disabled), per tree. */
+export function tabStops(): number[] {
+	return [...document.querySelectorAll<HTMLElement>("[role=tree]")].map(
+		(tree) =>
+			[...tree.querySelectorAll<HTMLElement>("a[href], button, input, [tabindex]")].filter(
+				(element) =>
+					element.tabIndex >= 0 &&
+					!(element as HTMLButtonElement).disabled &&
+					!element.closest("[data-tree-keep]"),
+			).length,
+	);
+}
+
+/** The tasks the "in progress" list shows (its links' text). */
+export function inProgressItems(): string[] {
+	return [...document.querySelectorAll<HTMLElement>("[data-in-progress-item]")].map((item) =>
+		(item.textContent ?? "").trim(),
+	);
+}

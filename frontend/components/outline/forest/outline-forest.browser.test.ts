@@ -654,7 +654,19 @@ test("10,000 loaded rows scroll with a bounded DOM", async () => {
 	);
 	const loaded = await call(page, (f) => f.forests()[0]?.rows ?? 0);
 	await call(page, (f) => f.measureScroll(40));
+	const before = page.requests.length;
 	const measured = await call(page, (f) => f.measureScroll(240));
+	// Marks are asked once per screen, debounced: scrolling past 10,000 rows is a handful of
+	// reads, never one per row or per frame; nothing else is read again.
+	// (The read after the scroll stops is debounced: wait for it, bounded.)
+	const deadline = Date.now() + 5000;
+	while (!page.requests.slice(before).some((r) => r.includes("/marks")) && Date.now() < deadline)
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	const during = page.requests.slice(before);
+	const marks = during.filter((r) => r.includes("/marks")).length;
+	console.log(`[forest perf] requests while scrolling: ${during.length} (marks ${marks})`);
+	expect(marks).toBeLessThanOrEqual(12);
+	expect(during.filter((r) => r.includes("/children") || r.includes("/subtree")).length).toBe(0);
 	console.log(
 		`[forest perf] rows=${loaded} scrollHeight=${measured.height}px frames=${measured.frames} ` +
 			`frame p50=${measured.p50.toFixed(1)}ms p95=${measured.p95.toFixed(1)}ms max=${measured.max.toFixed(1)}ms ` +
@@ -746,3 +758,269 @@ test("in Chinese, dark, at 360 px: the same forest, nothing wider than the scree
 	await shot(dark, "6-dark");
 	await dark.browserContext().close();
 }, 90_000);
+
+// ── Coverage of the old tree, ported (space rows, keys, scroll, locate past the first page) ──
+
+async function session(title: string, owner: string, projectId: string, visibility: string) {
+	const id = generateId();
+	await db.insert(narrators).values({
+		id,
+		title,
+		ownerUserId: owner,
+		visibility: visibility as "private",
+		writeAudience: "owner",
+		contextProjectId: projectId,
+		taskBackend: "outline",
+		createdAt: NOW,
+		updatedAt: NOW,
+	});
+	return (await ensureSessionSpace(id)).id;
+}
+
+let atlas: { space: string; race: string; notes: string } | null = null;
+
+/** A project with a summary line, a session of the reader's and a readable one of Bob's. */
+async function seedAtlas() {
+	if (atlas) return atlas;
+	const bob = generateId();
+	await db
+		.insert(users)
+		.values({ id: bob, username: "bob", passwordHash: "x", role: "user", createdAt: NOW });
+	const projectId = generateId();
+	await db.insert(projects).values({
+		id: projectId,
+		name: "Atlas",
+		ownerUserId: alice,
+		visibility: "private",
+		createdAt: NOW,
+		updatedAt: NOW,
+	});
+	const space = (await ensureProjectSpace(projectId)).id;
+	await write(space, [
+		{
+			op: "insert",
+			parent: null,
+			content: "Outline phase two: tasks and teams",
+			alias: "summary",
+		},
+	]);
+	const spike = await session("Bob's spike", bob, projectId, "project");
+	await writeOutline({
+		spaceId: spike,
+		ops: [
+			{ op: "insert", tempId: "p", parent: null, content: "Tasks" },
+			{
+				op: "insert",
+				parent: { tempId: "p" },
+				content: "Measure the cold start",
+				task: { status: "doing" },
+			},
+		],
+		actor: { kind: "human", id: bob },
+		responsibleUserId: bob,
+	});
+	const race = await session("Fix the refresh race", alice, projectId, "private");
+	const ids = await write(race, [
+		{ op: "insert", tempId: "p", parent: null, content: "Tasks" },
+		{ op: "insert", parent: { tempId: "p" }, content: "Write the fix", task: { status: "doing" } },
+		{
+			op: "insert",
+			parent: { tempId: "p" },
+			content: "Which token wins?",
+			ask: { to: { kind: "human", id: alice }, recommend: {} },
+		},
+		{
+			op: "insert",
+			parent: { tempId: "p" },
+			content: "Ship on Friday?",
+			ask: { to: { kind: "human", id: alice }, recommend: {} },
+		},
+		{ op: "insert", tempId: "n", parent: null, content: "Notes" },
+		{ op: "insert", tempId: "f", parent: { tempId: "n" }, content: "Refresh flow" },
+		{
+			op: "insert",
+			parent: { tempId: "f" },
+			content: "Rotate the token",
+			task: { status: "todo" },
+		},
+		{
+			op: "insert",
+			parent: { tempId: "f" },
+			content: "Retry the refresh",
+			task: { status: "doing" },
+		},
+		{ op: "insert", parent: { tempId: "f" }, content: "Document it", task: { status: "todo" } },
+	] as OutlineOp[]);
+	atlas = { space, race, notes: ids[4] as string };
+	return atlas;
+}
+
+test("a space's row: what waits for the reader first, what is in progress, one line, read only", async () => {
+	await seedAtlas();
+	const page = await openView({ target: { kind: "home" } });
+	await open(page, "Atlas");
+	await until(page, "the sessions group", (f) =>
+		f.rows().some((r) => r.kind === "group" && r.title.startsWith("Sessions")),
+	);
+	const group = (await call(page, (f) => f.rows())).find(
+		(r) => r.kind === "group" && r.title.startsWith("Sessions"),
+	);
+	await open(page, group?.title as string);
+	await until(page, "the sessions", hasRow, "Bob's spike");
+	const by = new Map((await call(page, (f) => f.glance())).map((row) => [row.title, row]));
+	const race = by.get("Fix the refresh race");
+	expect(race?.waiting).toContain("2");
+	expect(Number(race?.doing)).toBeGreaterThanOrEqual(1);
+	// What waits for the reader comes before what is in progress.
+	expect(race?.first).toBe("waiting");
+	expect(race?.readOnly).toBe(false);
+	expect(race?.summary).toMatch(/^Doing: /);
+	// Readable, not writable: marked, and nothing waits for the reader there.
+	const spike = by.get("Bob's spike");
+	expect(spike?.readOnly).toBe(true);
+	expect(spike?.waiting).toBeNull();
+	expect(spike?.doing).toBe("1");
+	// The project's own line is the block its writers aliased `summary`.
+	expect(by.get("Atlas")?.summary).toBe("Outline phase two: tasks and teams");
+	expect(await call(page, (f) => f.arrowsDrawn())).toBe(true);
+	await shot(page, "7-space-rows");
+	// "Waiting for you" shows the first question in the tree, with its form.
+	expect(await call(page, (f) => f.click("button[data-tree-count=waiting]"))).toBe(true);
+	await until(page, "a question located", (f) => f.located() !== null);
+	await until(
+		page,
+		"its answer form",
+		(f) => f.count("[data-testid=outline-tree-questions]") === 1,
+	);
+	await page.browserContext().close();
+}, 90_000);
+
+test('"in progress · N" opens the list of which tasks, read when it opens', async () => {
+	const seeded = await seedAtlas();
+	const page = await openView({
+		target: { kind: "block", spaceId: seeded.race, blockId: seeded.notes, view: "facts" },
+	});
+	await until(page, "the fact", hasRow, "Refresh flow");
+	await until(page, "its count", (f) => f.count("[data-testid=outline-in-progress]") === 1);
+	expect(page.requests.some((r) => r.includes("/open-tasks"))).toBe(false);
+	expect(await call(page, (f) => f.click("[data-testid=outline-in-progress]"))).toBe(true);
+	await until(page, "the list", (f) => f.inProgressItems().length === 3);
+	const items = await call(page, (f) => f.inProgressItems());
+	// In progress first.
+	expect(items[0]).toContain("Retry the refresh");
+	expect(items.slice(1).sort()).toEqual(["Document it", "Rotate the token"]);
+	expect(page.requests.filter((r) => r.includes("/open-tasks")).length).toBe(1);
+	await shot(page, "8-in-progress-list", false);
+	await page.browserContext().close();
+}, 90_000);
+
+test("the keyboard: the tree is one tab stop; the arrow keys move between rows, open and close", async () => {
+	const page = await openView({ target: { kind: "space", spaceId: projectSpace } });
+	await open(page, "Facts: the outline system");
+	await until(page, "the level below", hasRow, "The queue is per space");
+	await until(page, "one tab stop", (f) => f.tabStops().every((n) => n === 1));
+	// (An earlier case edited and added rows here: the order is read, not assumed.)
+	const titles = (await call(page, (f) => f.rows())).map((r) => r.title);
+	const from = titles.indexOf("Writes go through one queue");
+	expect(titles[from + 1]).toBe("The queue is per space");
+	const third = titles[from + 2] as string;
+	expect(await call(page, (f) => f.focusTitle("Writes go through one queue"))).toBe(true);
+	const active = () => call(page, (f) => f.activeRow());
+	await page.keyboard.press("ArrowDown");
+	expect(await active()).toBe("The queue is per space");
+	await page.keyboard.press("ArrowDown");
+	expect(await active()).toBe(third);
+	// A leaf: ← goes to the row it is under.
+	await page.keyboard.press("ArrowLeft");
+	expect(await active()).toBe("Facts: the outline system");
+	// Open: ← closes it, → opens it again.
+	await page.keyboard.press("ArrowLeft");
+	await until(page, "closed", (f, t: string) => !f.rows().some((r) => r.title === t), third);
+	await page.keyboard.press("ArrowRight");
+	await until(page, "open again", hasRow, third);
+	await page.keyboard.press("End");
+	expect(await active()).not.toBe("Facts: the outline system");
+	// Still one stop: the row the reader is on.
+	await until(page, "one tab stop", (f) => f.tabStops().every((n) => n === 1));
+	await page.keyboard.press("Home");
+	expect(await active()).toBe("Facts: the outline system");
+	await page.browserContext().close();
+}, 90_000);
+
+test("the tree comes back where the reader left it", async () => {
+	const page = await openView({ target: { kind: "home" } }, { width: 900, height: 500 });
+	await open(page, "Big", "A long level");
+	await until(page, "the long level", hasRow, "Entry 10");
+	await call(page, (f) => f.scrollToY(700));
+	await until(page, "scrolled", (f) => f.scrollY() >= 600);
+	const before = await call(page, (f) => f.topRow());
+	expect(before?.key.startsWith("block:")).toBe(true);
+	// Away (a space), and back.
+	await page.evaluate(
+		(spaceId) =>
+			(window as unknown as FixtureWindow).fixture.open({
+				target: { kind: "space", spaceId },
+				user: "",
+			}),
+		projectSpace,
+	);
+	await until(page, "the space", hasRow, "Facts: the outline system");
+	expect(await call(page, (f) => f.storedAnchor())).not.toBeNull();
+	await page.evaluate(() =>
+		(window as unknown as FixtureWindow).fixture.open({ target: { kind: "home" }, user: "" }),
+	);
+	await until(
+		page,
+		"the same row at the top again",
+		(f, key: string, top: number) => {
+			const now = f.topRow();
+			return now?.key === key && Math.abs(now.top - top) <= 2;
+		},
+		before?.key,
+		before?.top,
+	);
+	await page.browserContext().close();
+}, 90_000);
+
+test("a session is located although its project is past the first page of the root", async () => {
+	// Thirty projects committed to later: the root's first page ends before NarraFork.
+	for (let i = 0; i < 30; i++) {
+		const id = generateId();
+		await db.insert(projects).values({
+			id,
+			name: `Filler ${String(i + 1).padStart(2, "0")}`,
+			ownerUserId: alice,
+			visibility: "private",
+			createdAt: NOW,
+			updatedAt: NOW,
+		});
+		const space = await ensureProjectSpace(id);
+		await write(space.id, [{ op: "insert", parent: null, content: "Notes" }]);
+	}
+	const first = await openView({ target: { kind: "home" } });
+	await until(first, "a filler", hasRow, "Filler 30");
+	const listed = (await call(first, (f) => f.rows())).map((r) => r.title);
+	await first.browserContext().close();
+	const page = await openView({ target: { kind: "space", spaceId: projectSpace } });
+	await until(page, "a top-level block", hasRow, "Facts: the outline system");
+	await call(
+		page,
+		(f, target: Parameters<typeof Fixture.requestLocate>[0]) => f.requestLocate(target),
+		{ spaceId: sessionSpace, blockId: tasks.idOf("Wire into the 4 CI shards") },
+	);
+	await page.evaluate(() =>
+		(window as unknown as FixtureWindow).fixture.open({ target: { kind: "home" }, user: "" }),
+	);
+	await until(
+		page,
+		"the block located",
+		(f, id: string) => f.located()?.id === id,
+		tasks.idOf("Wire into the 4 CI shards"),
+	);
+	const rows = await call(page, (f) => f.rows());
+	// Its project is shown (pinned first among the projects), once; it was not on the first page.
+	expect(rows.filter((r) => r.title === "NarraFork")).toHaveLength(1);
+	expect(listed).not.toContain("NarraFork");
+	expect(await call(page, (f) => f.count("[data-testid=outline-locate-failed]"))).toBe(0);
+	await page.browserContext().close();
+}, 120_000);

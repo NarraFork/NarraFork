@@ -241,7 +241,7 @@ const BlockRowView = memo(function BlockRowView({
 	const previewLabel =
 		row.previewKind === "report"
 			? row.previewRest !== null
-				? t(row.previewRestMore ? "forest.reportAllAtLeast" : "fold.reportAll", {
+				? t(row.previewRestMore ? "forest.reportAllPartsAtLeast" : "forest.reportAllParts", {
 						count: row.previewRest + 1,
 					})
 				: t("forest.reportAll")

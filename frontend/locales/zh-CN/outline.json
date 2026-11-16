@@ -765,10 +765,12 @@
 		"doneHint": "回到阅读",
 		"moreAtLeast_one": "还有 {{count}}+ 条 ▸",
 		"moreAtLeast_other": "还有 {{count}}+ 条 ▸",
-		"reportAllAtLeast_one": "展开全文（{{count}}+ 块）▸",
-		"reportAllAtLeast_other": "展开全文（{{count}}+ 块）▸",
 		"inProgressFocus": "聚焦到这个块，查看下面的全部内容",
 		"livePaused": "实时更新已暂停：这个空间同时打开的视图太多。",
-		"foldNotSaved": "这里的展开和收起没能保存。"
+		"foldNotSaved": "这里的展开和收起没能保存。",
+		"reportAllParts_one": "展开全文（{{count}} 节）▸",
+		"reportAllParts_other": "展开全文（{{count}} 节）▸",
+		"reportAllPartsAtLeast_one": "展开全文（{{count}}+ 节）▸",
+		"reportAllPartsAtLeast_other": "展开全文（{{count}}+ 节）▸"
 	}
 }

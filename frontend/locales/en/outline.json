@@ -765,10 +765,12 @@
 		"doneHint": "Back to reading",
 		"moreAtLeast_one": "{{count}}+ more ▸",
 		"moreAtLeast_other": "{{count}}+ more ▸",
-		"reportAllAtLeast_one": "Show all ({{count}}+ block) ▸",
-		"reportAllAtLeast_other": "Show all ({{count}}+ blocks) ▸",
 		"inProgressFocus": "Focus on this block to see everything under it",
 		"livePaused": "Live updates are paused: too many views of this space are open.",
-		"foldNotSaved": "What you opened and closed here could not be saved."
+		"foldNotSaved": "What you opened and closed here could not be saved.",
+		"reportAllParts_one": "Show all ({{count}} section) ▸",
+		"reportAllParts_other": "Show all ({{count}} sections) ▸",
+		"reportAllPartsAtLeast_one": "Show all ({{count}}+ sections) ▸",
+		"reportAllPartsAtLeast_other": "Show all ({{count}}+ sections) ▸"
 	}
 }
