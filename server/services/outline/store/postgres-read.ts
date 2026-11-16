@@ -51,6 +51,7 @@ import {
 	type OutlinePageStructureRow,
 	type OutlineReadPort,
 	type OutlineSearchRow,
+	type OutlineVersionHead,
 } from "./read-port";
 
 /** Version keys per statement (two bound parameters each). */
@@ -227,6 +228,42 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 					.from(outlineBlockVersions)
 					.where(and(inArray(outlineBlockVersions.blockId, ids), validAt(seq)));
 				for (const row of rows) out.push(toVersion(row));
+			}
+			return out;
+		},
+
+		async listVersionHeadsAt(blockIds, seq, chars) {
+			const out: OutlineVersionHead[] = [];
+			const v = outlineBlockVersions;
+			const head = Math.max(0, Math.floor(chars));
+			for (const ids of chunked(blockIds)) {
+				const rows = await db
+					.select({
+						blockId: v.blockId,
+						fromSeq: v.fromSeq,
+						toSeq: v.toSeq,
+						parentId: v.parentId,
+						orderKey: v.orderKey,
+						taskJson: v.taskJson,
+						askJson: v.askJson,
+						alias: v.alias,
+						contentHash: v.contentHash,
+						deleted: v.deleted,
+						contentHead: sql<
+							string | null
+						>`substring(${v.content} from 1 for ${sql.raw(String(head))})`,
+						contentChars: sql<number>`coalesce(char_length(${v.content}), 0)`,
+					})
+					.from(v)
+					.where(and(inArray(v.blockId, ids), validAt(seq)));
+				for (const row of rows) {
+					out.push({
+						...row,
+						taskJson: taskOf(row.taskJson),
+						askJson: askOf(row.askJson),
+						contentChars: Number(row.contentChars),
+					});
+				}
 			}
 			return out;
 		},

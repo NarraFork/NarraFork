@@ -93,6 +93,28 @@ export interface OutlineBlockHistoryRow {
 	deleted: boolean;
 }
 
+/**
+ * A version of a block without its whole content: what comparing two moments of many blocks
+ * reads (`subtree-diff.ts`). A body is up to 16 KiB, so a list never carries it; the head is
+ * enough for an excerpt, and the hash tells whether two versions hold the same text.
+ */
+export interface OutlineVersionHead {
+	blockId: string;
+	fromSeq: number;
+	toSeq: number | null;
+	parentId: string | null;
+	orderKey: string;
+	taskJson: OutlineTaskJson | null;
+	askJson: OutlineAskJson | null;
+	alias: string | null;
+	contentHash: string;
+	deleted: boolean;
+	/** The first `chars` characters of the content; null for a tombstone. */
+	contentHead: string | null;
+	/** Characters of the whole content (0 for a tombstone). */
+	contentChars: number;
+}
+
 /** A link target to look up backlinks for. */
 export interface OutlineLinkTargetRef {
 	targetKind: OutlineLinkTargetKind;
@@ -135,6 +157,16 @@ export interface OutlineReadPort {
 	 * when `seq` is null. Blocks with no version at `seq` (created later) are left out.
 	 */
 	listVersionsAt(blockIds: readonly string[], seq: number | null): Promise<OutlineVersionRow[]>;
+	/**
+	 * Like {@link listVersionsAt} without the content: each version valid at `seq` (null: the open
+	 * one) with the first `chars` characters of its content and the content's length. One
+	 * statement per 500 blocks; blocks with no version then are left out.
+	 */
+	listVersionHeadsAt(
+		blockIds: readonly string[],
+		seq: number | null,
+		chars: number,
+	): Promise<OutlineVersionHead[]>;
 	/**
 	 * Content of versions by exact key (`block_id`, `from_seq`): one primary-key lookup each, so
 	 * loading the blocks a read shows costs nothing for their older versions. Null for a

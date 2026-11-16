@@ -68,6 +68,7 @@ import {
 	type OutlineReadPort,
 	type OutlineSearchRow,
 	type OutlineStructureRow,
+	type OutlineVersionHead,
 } from "./read-port";
 
 /** Live blocks of a page read on the main thread; a larger page is read on the worker pool. */
@@ -288,6 +289,41 @@ export const sqliteOutlineReads: OutlineReadPort = {
 				.where(and(inArray(outlineBlockVersions.blockId, ids), validAt(outlineBlockVersions, seq)))
 				.all();
 			for (const row of rows) out.push(toVersion(row));
+		}
+		return out;
+	},
+
+	async listVersionHeadsAt(blockIds, seq, chars) {
+		const out: OutlineVersionHead[] = [];
+		const v = outlineBlockVersions;
+		const head = Math.max(0, Math.floor(chars));
+		for (const ids of chunked(blockIds)) {
+			const rows = db
+				.select({
+					blockId: v.blockId,
+					fromSeq: v.fromSeq,
+					toSeq: v.toSeq,
+					parentId: v.parentId,
+					orderKey: v.orderKey,
+					taskJson: v.taskJson,
+					askJson: v.askJson,
+					alias: v.alias,
+					contentHash: v.contentHash,
+					deleted: v.deleted,
+					contentHead: sql<string | null>`substr(${v.content}, 1, ${head})`,
+					contentChars: sql<number>`coalesce(length(${v.content}), 0)`,
+				})
+				.from(v)
+				.where(and(inArray(v.blockId, ids), validAt(v, seq)))
+				.all();
+			for (const row of rows) {
+				out.push({
+					...row,
+					taskJson: row.taskJson ?? null,
+					askJson: row.askJson ?? null,
+					contentChars: Number(row.contentChars),
+				});
+			}
 		}
 		return out;
 	},

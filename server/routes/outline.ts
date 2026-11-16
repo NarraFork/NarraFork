@@ -199,6 +199,7 @@ import {
 import { flushOutlineTaskEdits } from "../services/outline-task-edits";
 import { resolveTaskBackend } from "../services/task-source";
 import { outlineDigestRoutes } from "./outline-digest";
+import { outlineRestoreRoutes } from "./outline-restore";
 import { outlineSubtreeRoutes } from "./outline-subtree";
 
 export const outlineRoutes = new Hono();
@@ -213,6 +214,8 @@ outlineRoutes.route("/digests", outlineDigestRoutes);
 
 /** The reads that know no page (pageless outline, H2): `routes/outline-subtree.ts`, same gate. */
 outlineRoutes.route("/", outlineSubtreeRoutes);
+/** Comparing and restoring subtrees (pageless outline, H3): `routes/outline-restore.ts`. */
+outlineRoutes.route("/", outlineRestoreRoutes);
 
 function principalOf(c: Context): OutlinePrincipal {
 	const user = c.get("user");
