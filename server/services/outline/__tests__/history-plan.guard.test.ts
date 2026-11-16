@@ -694,7 +694,7 @@ describe("outline history: plans, size and timings on 100,000 blocks", () => {
 		times.sort((x, y) => x - y);
 		const p95 = times[Math.floor(times.length * 0.95)] as number;
 		console.log(
-			`[outline history] last live version behind ${TOMBSTONES} tombstones: ${ms([times[100] as number, p95])} (p50 / p95)`,
+			`[outline history] last live version behind ${TOMBSTONES} tombstones: ${(times[100] as number).toFixed(2)} / ${p95.toFixed(2)} ms (p50 / p95)`,
 		);
 		expect(p95).toBeLessThan(20);
 	});
