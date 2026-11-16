@@ -644,13 +644,27 @@ test("restoring the whole space: its own title, a second confirmation with the c
 	// Within the whole space nothing moved in or away: the moves are put back as changes.
 	const groups = await call(page, (f) => f.restoreGroups());
 	expect(groups.map((g) => g.group)).toEqual(["delete", "restore", "put-back"]);
-	// The first click asks again, with the counts.
-	expect(await call(page, (f) => f.clickTestId("outline-restore-confirm"))).toBe(true);
+	// A double click with the real mouse asks again, with the counts, and confirms nothing: the
+	// first button stays (disabled) where it was, the confirmation is inside the warning and
+	// takes no click for a moment.
+	await page.click("[data-testid=outline-restore-confirm]", { clickCount: 2, delay: 20 });
 	await until(page, "the second question", (f) =>
 		f.has("[data-testid=outline-restore-space-sure]"),
 	);
-	expect(await call(page, (f) => f.text())).toContain("across the whole space");
+	expect(await call(page, (f) => f.restorePhase())).toBe("preview");
+	expect(await call(page, (f) => f.has("[data-testid=outline-restore-confirm][disabled]"))).toBe(
+		true,
+	);
+	const sure = await page.$eval(
+		"[data-testid=outline-restore-space-sure]",
+		(alert) => alert.textContent ?? "",
+	);
+	// The count is the sum of the groups listed (1 deleted, 1 brought back, 3 put back).
+	expect(sure).toContain("This changes 5 blocks across the whole space");
 	expect((await outlineStore.getBlock(s.b))?.deleted).toBe(true);
+	await until(page, "the confirmation armed", (f) =>
+		f.has("[data-testid=outline-restore-confirm-space][data-armed=true]"),
+	);
 	await shot(page, "11-restore-whole-space");
 	expect(await call(page, (f) => f.clickTestId("outline-restore-confirm-space"))).toBe(true);
 	await until(page, "the result", (f) => f.restorePhase() === "done");

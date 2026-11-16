@@ -887,6 +887,8 @@
 		"confirmSpace": "Restore the whole space…",
 		"confirmSpaceSure": "Yes, restore the whole space",
 		"waitMoveBack": "Wait until the move back is done",
-		"blockUnreadable": "a block that can no longer be read"
+		"blockUnreadable": "a block that can no longer be read",
+		"skippedUnnamed_one": "…and {{count}} more block left as it is.",
+		"skippedUnnamed_other": "…and {{count}} more blocks left as they are."
 	}
 }

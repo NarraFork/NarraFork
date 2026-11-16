@@ -147,6 +147,11 @@ export function OutlineRestoreModal({
 	);
 }
 
+/** How long the whole space's second confirmation takes no click after it appears. */
+const SURE_ARM_MS = 500;
+/** Blocks a skip list reads the names of at most; the rest are counted. */
+const NAME_LOOKUPS = 20;
+
 const noSubscribe = () => () => {};
 const noState = () => null;
 
@@ -171,14 +176,24 @@ function RestoreBody({
 		[state.entries],
 	);
 	const changes = state.entries.length - movedAway.length;
+	// What the restore writes, by group: not what stays, not what moved away.
+	const writes = groups.filter((g) => g.group !== "moved-away" && g.group !== "kept");
 	const summary = t("restore.summary", {
 		changed: progress.changed,
 		commits: progress.commits.length,
 	});
-	// Restoring the whole space asks once more, with the counts.
+	// Restoring the whole space asks once more, with the counts, in the warning itself (not
+	// under the pointer), and takes no click for a moment: a double click never confirms it.
 	const [sure, setSure] = useState(false);
+	const [armed, setArmed] = useState(false);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: a new list asks again
 	useEffect(() => setSure(false), [state.entries]);
+	useEffect(() => {
+		setArmed(false);
+		if (!sure) return;
+		const timer = setTimeout(() => setArmed(true), SURE_ARM_MS);
+		return () => clearTimeout(timer);
+	}, [sure]);
 	// The keyboard follows the phase: Stop while it runs, the result's heading when it is done.
 	const stopRef = useRef<HTMLButtonElement>(null);
 	const headingRef = useRef<HTMLParagraphElement>(null);
@@ -186,10 +201,6 @@ function RestoreBody({
 		if (phase === "running") stopRef.current?.focus();
 		else if (phase === "done") headingRef.current?.focus();
 	}, [phase]);
-	// The result names every moved-away block: read whatever of the list is still unread.
-	useEffect(() => {
-		if (phase === "done" && state.more && !state.loadingAll) void run.moreAll();
-	}, [phase, state.more, state.loadingAll, run]);
 	const written = earlier.changed > 0 && (
 		<Alert color="yellow" variant="light" py={6} data-testid="outline-restore-earlier">
 			<Text size="sm">{t("restore.earlier", { changed: earlier.changed })}</Text>
@@ -303,7 +314,6 @@ function RestoreBody({
 								<EntryRow key={entry.blockId} entry={entry} run={run} state={state} />
 							))}
 						</Stack>
-						{state.loadingAll && <Loader size={12} mt={4} />}
 					</Box>
 				)}
 				<Group justify="flex-end">
@@ -444,23 +454,37 @@ function RestoreBody({
 				<Alert color="orange" variant="light" data-testid="outline-restore-space-sure">
 					<Text size="sm">
 						{t("restore.spaceSure", {
-							count: changes,
-							groups: groups
-								.filter((g) => g.group !== "moved-away" && g.group !== "kept")
+							count: writes.reduce((sum, g) => sum + g.entries.length, 0),
+							groups: writes
 								.map((g) => `${t(`restore.group.${g.group}`)} ${g.entries.length}`)
 								.join(" · "),
 						})}
 					</Text>
+					<Button
+						key="space-confirm"
+						mt="sm"
+						color="orange"
+						disabled={!ready}
+						onClick={() => {
+							if (armed) void run.confirm();
+						}}
+						data-armed={armed}
+						data-testid="outline-restore-confirm-space"
+					>
+						{t("restore.confirmSpaceSure")}
+					</Button>
 				</Alert>
 			)}
 			<Group justify="flex-end" gap="xs" className={classes.restoreActions}>
 				<Button variant="default" onClick={onClose}>
 					{t("restore.cancel")}
 				</Button>
-				{whole && !sure ? (
+				{whole ? (
+					// Stays where it is (disabled) once asked: a second click lands on nothing.
 					<Button
+						key="space-ask"
 						color="orange"
-						disabled={!ready}
+						disabled={!ready || sure}
 						title={moving ? t("restore.waitMoveBack") : undefined}
 						onClick={() => setSure(true)}
 						data-testid="outline-restore-confirm"
@@ -469,13 +493,14 @@ function RestoreBody({
 					</Button>
 				) : (
 					<Button
+						key="confirm"
 						color="orange"
 						disabled={!ready}
 						title={moving ? t("restore.waitMoveBack") : undefined}
 						onClick={() => void run.confirm()}
-						data-testid={whole ? "outline-restore-confirm-space" : "outline-restore-confirm"}
+						data-testid="outline-restore-confirm"
 					>
-						{t(whole ? "restore.confirmSpaceSure" : "restore.confirm")}
+						{t("restore.confirm")}
 					</Button>
 				)}
 			</Group>
@@ -592,10 +617,17 @@ function SkipList({
 }) {
 	const { t } = useTranslation("outline");
 	const byId = useMemo(() => new Map(entries.map((entry) => [entry.blockId, entry])), [entries]);
+	// Blocks the change list does not name are read by name, a few at most; the rest counted.
+	let lookups = 0;
+	let unnamed = 0;
 	return (
 		<Stack gap={2}>
 			{skipped.map((skip) => {
 				const entry = byId.get(skip.blockId);
+				if (!entry && lookups++ >= NAME_LOOKUPS) {
+					unnamed++;
+					return null;
+				}
 				return (
 					<Box
 						key={skip.blockId}
@@ -612,6 +644,11 @@ function SkipList({
 					</Box>
 				);
 			})}
+			{unnamed > 0 && (
+				<Text size="xs" c="dimmed" data-testid="outline-restore-skipped-unnamed">
+					{t("restore.skippedUnnamed", { count: unnamed })}
+				</Text>
+			)}
 		</Stack>
 	);
 }
