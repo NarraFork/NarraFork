@@ -298,6 +298,7 @@ test("the timeline of a block's subtree is paged; a point shows the forest as of
 	expect(await call(page, (f) => f.clickText("History"))).toBe(true);
 	await until(page, "the side panel's history", (f) => f.historyItems().length > 0);
 	const items = await call(page, (f) => f.historyItems());
+	await shot(page, "1b-side-history");
 	expect(items[0]).toBe(ticks.seqs.at(-1) ?? -1);
 	expect([...items].sort((x, y) => x - y)).toEqual(ticks.seqs.slice(-items.length));
 

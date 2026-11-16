@@ -131,7 +131,7 @@ export interface OutlineSurfaceProps {
 	blockId: string;
 	/** Facts (the default) or all. */
 	view?: OutlineViewMode;
-	/** Commit seq to show the page as of (read only); absent for the current, live page. */
+	/** Commit seq to show the block and what is under it as of (read only); absent for now. */
 	asOf?: number;
 	/** Focus, breadcrumb, view and time changes: the host decides what they do. */
 	onNavigate: (to: OutlineTarget) => void;
