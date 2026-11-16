@@ -3,11 +3,11 @@
  * `outline_spec_imports`, one row per root session an import was tried for or that was moved back
  * to Dynamic Spec. The source of truth for the Spec panel's banner, the automatic triggers'
  * attempt limits (they survive restarts), the model's one notice per switch, the read-only line
- * on the old Spec files and the admin page; this module keeps an in-memory cache of it only.
+ * on the old Spec files and the admin list; this module keeps an in-memory cache of it only.
  *
  * Every statement is one SQL text both dialects run, through the outline access executor
- * (`access-reads.ts`): a primary-key read, a primary-key upsert, and the admin page's reads on
- * `idx_outline_spec_imports_status` (a page of one state, `limit + 1`; a count per state capped at
+ * (`access-reads.ts`): a primary-key read, a primary-key upsert, and the admin list's reads on
+ * `idx_outline_spec_imports_status` (a batch of one state, `limit + 1`; a count per state capped at
  * {@link SPEC_IMPORT_STATE_LIMITS.countCap}). Writes of one session are serialized in this
  * process, each a whole row computed from the one before it.
  */
@@ -21,9 +21,9 @@ export const SPEC_IMPORT_STATE_LIMITS = {
 	cached: 4096,
 	/** Characters of a failure's English detail stored. */
 	detailChars: 300,
-	/** Rows one page of the admin list reads. */
-	page: 50,
-	/** Rows of one state the admin page counts at most (more reads as "1000+"). */
+	/** Rows one read of the admin list takes. */
+	listBatch: 50,
+	/** Rows of one state the admin list counts at most (more reads as "1000+"). */
 	countCap: 1000,
 	/** Marker block ids a move back records. */
 	noteIds: 4,
@@ -65,11 +65,13 @@ export interface SpecImportState {
 	/** The switch whose notice the session's history holds (`switchCount`: delivered). */
 	noticeSwitch: number;
 	spaceId: string | null;
-	taskPageId: string | null;
+	/** The session's task list (`session/tasks`) when it was moved. */
+	taskBlockId: string | null;
 	/** The `behavior_fence` revision the import read when it moved the session. */
 	fenceRevisionId: string | null;
 	tasks: number | null;
-	pages: number | null;
+	/** Files imported as notes (one top-level block each). */
+	notes: number | null;
 	revertCount: number;
 	revertedAt: string | null;
 	revertedBy: string | null;
@@ -148,10 +150,10 @@ function stateOf(row: Row): SpecImportState {
 		switchedAt: str(row, "switched_at"),
 		noticeSwitch: num(row, "notice_switch") ?? 0,
 		spaceId: str(row, "space_id"),
-		taskPageId: str(row, "task_page_id"),
+		taskBlockId: str(row, TASK_BLOCK_COLUMN),
 		fenceRevisionId: str(row, "fence_revision_id"),
 		tasks: num(row, "tasks"),
-		pages: num(row, "pages"),
+		notes: num(row, NOTES_COLUMN),
 		revertCount: num(row, "revert_count") ?? 0,
 		revertedAt: str(row, "reverted_at"),
 		revertedBy: str(row, "reverted_by"),
@@ -163,11 +165,21 @@ function stateOf(row: Row): SpecImportState {
 	};
 }
 
+/**
+ * Two columns keep the names they had while the outline had pages: the session's task list and
+ * the count of files imported as notes. X2 renames them (`task_block_id`, `notes`; plan §二.5);
+ * until then they are named here only.
+ */
+const TASK_BLOCK_COLUMN = "task_page_id";
+const NOTES_COLUMN = "pages";
+const taskBlockColumn = sql.raw(TASK_BLOCK_COLUMN);
+const notesColumn = sql.raw(NOTES_COLUMN);
+
 const COLUMNS = sql`
 	narrator_id, status, "trigger", attempts, last_error_code, last_error_count, last_error_detail,
-	attention_reason, switch_count, switched_at, notice_switch, space_id, task_page_id,
-	fence_revision_id, tasks, pages, revert_count, reverted_at, reverted_by, revert_source_key,
-	revert_note_ids, last_actor, created_at, updated_at
+	attention_reason, switch_count, switched_at, notice_switch, space_id, ${taskBlockColumn},
+	fence_revision_id, tasks, ${notesColumn}, revert_count, reverted_at, reverted_by,
+	revert_source_key, revert_note_ids, last_actor, created_at, updated_at
 `;
 
 /** Cached rows; `null`: the session has no row (read, or never written). */
@@ -250,10 +262,10 @@ function emptyState(narratorId: string, now: string): SpecImportState {
 		switchedAt: null,
 		noticeSwitch: 0,
 		spaceId: null,
-		taskPageId: null,
+		taskBlockId: null,
 		fenceRevisionId: null,
 		tasks: null,
-		pages: null,
+		notes: null,
 		revertCount: 0,
 		revertedAt: null,
 		revertedBy: null,
@@ -296,8 +308,8 @@ export async function writeSpecImportState(
 					${narratorId}, ${next.status}, ${next.trigger}, ${next.attempts},
 					${next.reason?.code ?? null}, ${next.reason?.count ?? null}, ${error},
 					${next.attentionReason}, ${next.switchCount}, ${next.switchedAt}, ${next.noticeSwitch},
-					${next.spaceId}, ${next.taskPageId}, ${next.fenceRevisionId}, ${next.tasks},
-					${next.pages}, ${next.revertCount}, ${next.revertedAt}, ${next.revertedBy},
+					${next.spaceId}, ${next.taskBlockId}, ${next.fenceRevisionId}, ${next.tasks},
+					${next.notes}, ${next.revertCount}, ${next.revertedAt}, ${next.revertedBy},
 					${next.revertSourceKey}, ${noteIds}, ${next.lastActor}, ${next.createdAt}, ${now}
 				)
 				on conflict (narrator_id) do update set
@@ -307,9 +319,9 @@ export async function writeSpecImportState(
 					last_error_detail = excluded.last_error_detail,
 					attention_reason = excluded.attention_reason, switch_count = excluded.switch_count,
 					switched_at = excluded.switched_at, notice_switch = excluded.notice_switch,
-					space_id = excluded.space_id, task_page_id = excluded.task_page_id,
+					space_id = excluded.space_id, ${taskBlockColumn} = excluded.${taskBlockColumn},
 					fence_revision_id = excluded.fence_revision_id, tasks = excluded.tasks,
-					pages = excluded.pages, revert_count = excluded.revert_count,
+					${notesColumn} = excluded.${notesColumn}, revert_count = excluded.revert_count,
 					reverted_at = excluded.reverted_at, reverted_by = excluded.reverted_by,
 					revert_source_key = excluded.revert_source_key,
 					revert_note_ids = excluded.revert_note_ids, last_actor = excluded.last_actor,
@@ -327,10 +339,10 @@ export async function writeSpecImportState(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The admin page
+// The admin list
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** One row of the admin page: the state and what names the session. */
+/** One row of the admin list: the state and what names the session. */
 export interface SpecImportStateListItem extends SpecImportState {
 	title: string | null;
 	taskBackend: string | null;
@@ -345,7 +357,7 @@ export interface SpecImportStateCursor {
 }
 
 /**
- * One page of the sessions in `status`, most recently changed first (`limit + 1` read to see
+ * A batch of the sessions in `status`, most recently changed first (`limit + 1` read to see
  * whether more follow). Each with its title, task backend and owner (primary-key joins).
  */
 export async function listSpecImportStates(options: {
@@ -353,7 +365,7 @@ export async function listSpecImportStates(options: {
 	after?: SpecImportStateCursor | null;
 	limit?: number;
 }): Promise<{ items: SpecImportStateListItem[]; next: SpecImportStateCursor | null }> {
-	const limit = Math.max(1, Math.min(options.limit ?? 20, SPEC_IMPORT_STATE_LIMITS.page));
+	const limit = Math.max(1, Math.min(options.limit ?? 20, SPEC_IMPORT_STATE_LIMITS.listBatch));
 	const after = options.after
 		? sql`and (i.updated_at < ${options.after.updatedAt}
 			or (i.updated_at = ${options.after.updatedAt} and i.narrator_id < ${options.after.narratorId}))`
@@ -361,8 +373,8 @@ export async function listSpecImportStates(options: {
 	const rows = await runOutlineAccessQuery(sql`
 		select i.narrator_id, i.status, i."trigger", i.attempts, i.last_error_code,
 			i.last_error_count, i.last_error_detail, i.attention_reason, i.switch_count,
-			i.switched_at, i.notice_switch, i.space_id, i.task_page_id, i.fence_revision_id,
-			i.tasks, i.pages, i.revert_count, i.reverted_at, i.reverted_by, i.revert_source_key,
+			i.switched_at, i.notice_switch, i.space_id, i.${taskBlockColumn}, i.fence_revision_id,
+			i.tasks, i.${notesColumn}, i.revert_count, i.reverted_at, i.reverted_by, i.revert_source_key,
 			i.revert_note_ids, i.last_actor, i.created_at, i.updated_at,
 			n.title, n.task_backend, n.owner_user_id, u.username as owner_name
 		from outline_spec_imports i

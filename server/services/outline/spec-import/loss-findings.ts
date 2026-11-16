@@ -1,26 +1,28 @@
 /**
  * What people see and do about content the old Spec panel may have swallowed (outline P2 PR 12c;
- * owner decisions D52: attached on the page only, and 2026-11-13: only tables by themselves). The
- * scan (`loss-scan.ts`) records findings and attaches those of tables to their imported pages
+ * owner decisions D52: attached beside the imported file only, and 2026-11-13: only tables by
+ * themselves). The scan (`loss-scan.ts`) records findings and attaches those of tables under
+ * their files' imported blocks
  * (`loss-attach.ts`); here they are listed (an
  * administrator: every session's; a session's reader: that session's), read one at a time with
  * the lost text, and decided, one at a time, by a person:
  *
  *   - DISMISS (an open or attached finding): a save that removed the content on purpose reads as
- *     a loss too; dismissing says so. Its block on the page is taken away when only the attach
+ *     a loss too; dismissing says so. Its attached block is taken away when only the attach
  *     ever wrote it; a block someone edited or added to is kept, and the finding is dismissed
  *     all the same.
  *   - REOPEN (a dismissed finding): open again; attached again at once when it is one a pass
  *     attaches (tables, not of the behavior fence, not inherited by a fork), listed otherwise.
  *   - ATTACH (an open finding): what a pass does not attach (anything but tables) or left out
- *     (the page was gone, a cap, failures), asked for by a person; refused with the reason when
- *     it cannot be. A finding of the BEHAVIOR FENCE goes onto the page the agent reads as its
- *     rules, so the request must say the person confirmed that (`confirmRule`).
+ *     (the file's block was gone, a cap, failures), asked for by a person; refused with the
+ *     reason when it cannot be. A finding of the BEHAVIOR FENCE goes under the behavior
+ *     boundary, which the agent reads as its rules, so the request must say the person confirmed
+ *     that (`confirmRule`).
  *
  * None of them while an import or a move back works on the session (`SPEC_IMPORT_IN_PROGRESS`).
  *
  * A decision is a conditional update of the finding's status, so two people deciding at once do
- * not both win. Nothing of a page's own content is changed by any of them.
+ * not both win. Nothing of the imported file's own content is changed by any of them.
  */
 import { AppError, catalogError, NotFoundError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
@@ -83,7 +85,7 @@ function publicFinding(row: SpecLossFindingRow): OutlineSpecLossFinding {
 		status: row.status,
 		blockId: row.blockId,
 		attachNote: row.attachNote,
-		rulePage: row.rulePage,
+		ruleBlock: row.ruleBlock,
 		spaceId: row.spaceId,
 		resolvedAt: row.resolvedAt,
 		createdAt: row.createdAt,
@@ -152,7 +154,7 @@ export async function decideSpecLossFinding(args: {
 	narratorId: string | null;
 	action: OutlineSpecLossAction;
 	userId: string;
-	/** The person was told the agent reads the behavior page as rules (attach of a fence finding). */
+	/** The person was told the agent reads the behavior boundary as rules (attach of a fence finding). */
 	confirmRule?: boolean;
 }): Promise<OutlineSpecLossFinding> {
 	const { action, userId } = args;
@@ -205,8 +207,8 @@ export async function decideSpecLossFinding(args: {
 				blockId,
 			});
 		} catch (error) {
-			if (error instanceof AppError && error.messageCode === "SPEC_LOSS_NO_PAGE")
-				await setSpecLossAttachNote(row.id, "no_page");
+			if (error instanceof AppError && error.messageCode === "SPEC_LOSS_NO_BLOCK")
+				await setSpecLossAttachNote(row.id, "no_block");
 			else if (!(error instanceof AppError && error.messageCode === "SPEC_LOSS_NOT_IMPORTED")) {
 				await setSpecLossAttachNote(row.id, "failed");
 				logger.warn("Could not attach a reopened finding", {

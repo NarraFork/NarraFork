@@ -146,7 +146,7 @@ export const ERROR_CATALOG = {
 	SPEC_MOVED_TO_OUTLINE: {
 		status: 409,
 		code: "SPEC_OUTLINE_SESSION",
-		en: "This session's Dynamic Spec was moved into the outline, so its old files are read-only. Its tasks are on the session's task page in the outline, its notes on outline pages and its behavior boundary on the behavior page.",
+		en: "This session's Dynamic Spec was moved into the outline, so its old files are read-only. Its tasks are in the session's task list in the outline, its notes in top-level blocks of the session's outline space and its behavior boundary in the behavior boundary block.",
 	},
 	/** An administrator's move back to Dynamic Spec for a session no import moved (12b2). */
 	SPEC_IMPORT_NOT_REVERTIBLE: {
@@ -176,22 +176,22 @@ export const ERROR_CATALOG = {
 	SPEC_LOSS_NOT_IMPORTED: {
 		status: 409,
 		code: "SPEC_LOSS_NOT_IMPORTED",
-		en: "This session still keeps Dynamic Spec, so there is no imported page to attach the content to. Import the session first; the content can be read here meanwhile.",
+		en: "This session still keeps Dynamic Spec, so there is no imported block to attach the content to. Import the session first; the content can be read here meanwhile.",
 	},
-	/** Attaching possibly lost content when the file's imported page is not there (12c). */
-	SPEC_LOSS_NO_PAGE: {
+	/** Attaching possibly lost content when the file's imported block is not there (12c). */
+	SPEC_LOSS_NO_BLOCK: {
 		status: 409,
-		code: "SPEC_LOSS_NO_PAGE",
-		en: "The page this file was imported to is not there (it was deleted, or the file was never imported), so the content cannot be attached. It can still be read and copied here.",
+		code: "SPEC_LOSS_NO_BLOCK",
+		en: "The block this file was imported to is not there (it was deleted, or the file was never imported), so the content cannot be attached. It can still be read and copied here.",
 	},
 	/**
 	 * Attaching possibly lost content of the behavior fence without the person's confirmation
-	 * (12c): the behavior page is shown to the agent as standing rules.
+	 * (12c): what is under the behavior boundary is shown to the agent as standing rules.
 	 */
 	SPEC_LOSS_RULE_CONFIRM: {
 		status: 409,
 		code: "SPEC_LOSS_RULE_CONFIRM",
-		en: "This content was removed from the session's behavior rules. Attached to the behavior page, the agent reads it as a rule again. Confirm that this is what you want.",
+		en: "This content was removed from the session's behavior rules. Attached under the behavior boundary, the agent reads it as a rule again. Confirm that this is what you want.",
 	},
 	/** A re-import of a session the import does not move (an outline session, a subagent). */
 	SPEC_IMPORT_NOT_IMPORTABLE: {

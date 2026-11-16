@@ -4,7 +4,7 @@
  * session looked at), and the reads of Dynamic Spec revisions the scan needs.
  *
  * Every statement is one SQL text both dialects run, through the outline access executor
- * (`access-reads.ts`), bounded and indexed: findings by primary key, or a page of one status on
+ * (`access-reads.ts`), bounded and indexed: findings by primary key, or a batch of one status on
  * `idx_outline_spec_loss_findings_status` / `_narrator` (`limit + 1`, never with the excerpt);
  * counts per status capped; a revision's ancestors by primary key, a hundred a statement, with
  * the LENGTH of each only. Nothing here writes Dynamic Spec or the outline.
@@ -25,8 +25,8 @@ import { sql } from "drizzle-orm";
 import { runOutlineAccessQuery } from "../access-reads";
 
 export const SPEC_LOSS_STORE_LIMITS = {
-	/** Findings one page of a list reads. */
-	page: 50,
+	/** Findings one read of a list takes. */
+	listBatch: 50,
 	/** Findings of one status counted at most (more reads as "1000+"). */
 	countCap: 1000,
 	/** Ancestors of a revision one statement reads. */
@@ -50,23 +50,42 @@ export function isSpecLossStatus(value: unknown): value is OutlineSpecLossStatus
 }
 
 const ATTACH_NOTES: readonly OutlineSpecLossAttachNote[] = [
-	"no_page",
-	"page_cap",
+	"no_block",
+	"block_cap",
 	"session_cap",
 	"restored",
 	"failed",
 	"gave_up",
 	"reattach_cap",
 	"list_only",
-	"rule_page",
+	"rule_block",
 	"fork",
 	"block_deleted",
 ];
 
 /**
+ * Three notes keep, in `outline_spec_loss_findings.attach_note`, the values they were first stored
+ * under, when the outline had pages: rows written before keep them until X2's conversion rewrites
+ * them (with the other renamed columns), so every row, old or new, is written and read through
+ * this table, here and nowhere else.
+ */
+const STORED_NOTES: ReadonlyArray<readonly [OutlineSpecLossAttachNote, string]> = [
+	["no_block", "no_page"],
+	["block_cap", "page_cap"],
+	["rule_block", "rule_page"],
+];
+
+/** A note as the table holds it. */
+function storedNote(note: OutlineSpecLossAttachNote | null): string | null {
+	if (note === null) return null;
+	return STORED_NOTES.find(([name]) => name === note)?.[1] ?? note;
+}
+
+/**
  * Why a finding is never attached by a pass, or null when it may be (owner decision 2026-11-13:
  * 「只自动贴表格，其余只列出」):
- *   - `rule_page`: it is of the behavior fence. That page is shown to the model as standing rules,
+ *   - `rule_block`: it is of the behavior fence. What is under the behavior boundary is shown to
+ *     the model as standing rules,
  *     so putting a removed rule back would make it apply again; only a person may, through a
  *     confirmation that says so;
  *   - `fork`: the save was made in the session this one was forked from; it is attached there,
@@ -78,15 +97,16 @@ export function specLossListedNote(finding: {
 	path: string;
 	kinds: Partial<Record<OutlineSpecLossKind, number>>;
 	inherited: boolean;
-}): "rule_page" | "fork" | "list_only" | null {
-	if (finding.path === SPEC_LOSS_FENCE_PATH) return "rule_page";
+}): "rule_block" | "fork" | "list_only" | null {
+	if (finding.path === SPEC_LOSS_FENCE_PATH) return "rule_block";
 	if (finding.inherited) return "fork";
 	const kinds = Object.entries(finding.kinds).filter(([, n]) => (n ?? 0) > 0);
 	return kinds.length > 0 && kinds.every(([kind]) => kind === "table") ? null : "list_only";
 }
 
 function attachNoteOf(value: string | null): OutlineSpecLossAttachNote | null {
-	return ATTACH_NOTES.find((note) => note === value) ?? null;
+	const named = STORED_NOTES.find(([, stored]) => stored === value)?.[0] ?? value;
+	return ATTACH_NOTES.find((note) => note === named) ?? null;
 }
 
 function kindsOf(value: string | null): Partial<Record<OutlineSpecLossKind, number>> {
@@ -252,7 +272,7 @@ export async function insertSpecLossFinding(finding: NewSpecLossFinding): Promis
 			${finding.id}, ${finding.narratorId}, ${finding.path}, ${finding.beforeRevisionId},
 			${finding.afterRevisionId}, ${finding.beforeAt}, ${finding.savedAt},
 			${JSON.stringify(finding.kinds)}, ${finding.items}, ${JSON.stringify(finding.parts)},
-			${finding.truncated ? 1 : 0}, 'open', ${specLossListedNote(finding)},
+			${finding.truncated ? 1 : 0}, 'open', ${storedNote(specLossListedNote(finding))},
 			${finding.inherited ? 1 : 0}, ${now}, ${now}
 		)
 		on conflict (id) do nothing
@@ -303,10 +323,10 @@ function findingOf(row: Row): SpecLossFindingRow {
 		truncated: num(row, "truncated") !== 0,
 		status: isSpecLossStatus(status) ? status : "open",
 		blockId: str(row, "block_id"),
-		// Of an open finding: why it is not on the page. Of a dismissed one: only that its block was
-		// deleted on the page (nobody pressed "dismiss").
+		// Of an open finding: why it is not attached. Of a dismissed one: only that its block was
+		// deleted in the outline (nobody pressed "dismiss").
 		attachNote: open || (status === "dismissed" && note === "block_deleted") ? note : null,
-		rulePage: path === SPEC_LOSS_FENCE_PATH,
+		ruleBlock: path === SPEC_LOSS_FENCE_PATH,
 		spaceId: str(row, "space_id"),
 		resolvedAt: str(row, "resolved_at"),
 		createdAt: str(row, "created_at") ?? "",
@@ -352,7 +372,7 @@ export async function listSpecLossFindings(options: {
 	after?: SpecLossCursor | null;
 	limit?: number;
 }): Promise<{ items: SpecLossFindingRow[]; next: SpecLossCursor | null }> {
-	const limit = Math.max(1, Math.min(options.limit ?? 20, SPEC_LOSS_STORE_LIMITS.page));
+	const limit = Math.max(1, Math.min(options.limit ?? 20, SPEC_LOSS_STORE_LIMITS.listBatch));
 	const session = options.narratorId ? sql`and f.narrator_id = ${options.narratorId}` : sql``;
 	const after = options.after
 		? sql`and (f.created_at < ${options.after.createdAt}
@@ -417,7 +437,7 @@ export async function setSpecLossFindingStatus(args: {
 	const block = args.blockId === undefined ? sql`block_id` : sql`${args.blockId}`;
 	const rows = await runOutlineAccessQuery(sql`
 		update outline_spec_loss_findings set
-			status = ${args.to}, block_id = ${block}, attach_note = ${args.note ?? null},
+			status = ${args.to}, block_id = ${block}, attach_note = ${storedNote(args.note ?? null)},
 			resolved_by = ${decided ? args.userId : null}, resolved_at = ${decided ? now : null},
 			attach_attempts = ${sql.raw(args.to === "open" ? "0" : "attach_attempts")},
 			updated_at = ${now}
@@ -427,13 +447,14 @@ export async function setSpecLossFindingStatus(args: {
 	return rows.length > 0;
 }
 
-/** Why an open finding is not on the page (while it is still open). */
+/** Why an open finding is not attached (while it is still open). */
 export async function setSpecLossAttachNote(
 	id: string,
 	note: OutlineSpecLossAttachNote,
 ): Promise<void> {
 	await runOutlineAccessQuery(sql`
-		update outline_spec_loss_findings set attach_note = ${note}, updated_at = ${new Date().toISOString()}
+		update outline_spec_loss_findings set attach_note = ${storedNote(note)},
+			updated_at = ${new Date().toISOString()}
 		where id = ${id} and status = 'open'
 	`);
 }
@@ -474,7 +495,10 @@ export async function bumpSpecLossAttachSeq(id: string, from: number): Promise<n
 	return rows[0] ? num(rows[0], "attach_seq") : from + 1;
 }
 
-/** How many findings are attached to the page of `path` in the session, counted up to `cap`. */
+/**
+ * How many findings are attached to the imported block of `path` in the session (one file, one
+ * block), counted up to `cap`.
+ */
 export async function countSpecLossAttached(
 	narratorId: string,
 	path: string,

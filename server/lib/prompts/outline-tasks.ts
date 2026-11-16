@@ -496,9 +496,9 @@ export function getOutlineSpecMovedHint(locale: Locale): string {
 
 // ─── The Dynamic Spec import's notice to the model (outline P2 PR 12b2) ───
 
-/** One page an import wrote from a Dynamic Spec file. */
-export interface SpecImportNoticePage {
-	/** The file it came from (its page title). */
+/** The top-level block an import wrote for a Dynamic Spec file. */
+export interface SpecImportNoticeNote {
+	/** The file it came from (the block's title). */
 	title: string;
 	/** `session/<sid>`. */
 	address: string;
@@ -507,19 +507,19 @@ export interface SpecImportNoticePage {
 /**
  * The one history row a session gets after the import moved it into the outline: where its
  * tasks, notes and behavior boundary are now, and that `spec://` no longer applies. At most
- * `pages.length` page lines (the caller bounds them); `morePages` counts the rest.
+ * `notes.length` file lines (the caller bounds them); `moreNotes` counts the rest.
  */
 export function getSpecImportNotice(
-	input: { tasks: number; pages: readonly SpecImportNoticePage[]; morePages: number },
+	input: { tasks: number; notes: readonly SpecImportNoticeNote[]; moreNotes: number },
 	locale: Locale,
 ): string {
 	const zh = locale === "zh-CN";
-	const lines = input.pages.map((page) => `- spec://${page.title} → ${page.address}`);
-	if (input.morePages > 0)
+	const lines = input.notes.map((note) => `- spec://${note.title} → ${note.address}`);
+	if (input.moreNotes > 0)
 		lines.push(
 			zh
-				? `- 另有 ${input.morePages} 个文件，用 OutlineRead 读 session/ 查看`
-				: `- ${input.morePages} more files; read session/ with OutlineRead`,
+				? `- 另有 ${input.moreNotes} 个文件，用 OutlineRead 读 session/ 查看`
+				: `- ${input.moreNotes} more files; read session/ with OutlineRead`,
 		);
 	const notes =
 		lines.length > 0
