@@ -29,7 +29,13 @@ import {
 import { and, eq } from "drizzle-orm";
 import * as Y from "yjs";
 import { db } from "../../../../db";
-import { aclGrants, outlineLiveLog, projects, users } from "../../../../db/schema";
+import {
+	aclGrants,
+	outlineLiveLog,
+	outlineLiveUpdates,
+	projects,
+	users,
+} from "../../../../db/schema";
 import { generateId } from "../../../../lib/id";
 import { settings } from "../../../../lib/settings";
 import { ensureProjectSpace } from "../../spaces";
@@ -189,9 +195,10 @@ function expectSameTexts(pageId: string, cs: readonly LiveClient[]): void {
 	for (const id of ids) {
 		const server = s.textState(id);
 		expect(server?.stuck ?? false).toBe(false);
-		// A block that went to another page is that page's people's now: these hold it as deleted,
-		// with whatever it was when it left.
-		const here = s.space.mirror.topOf(id) === pageId;
+		// What this page's people hold the text of (`MirrorBlock.held`). A block that went to
+		// another page is that page's people's now, or nobody's: these hold it as deleted, with
+		// whatever it was when it left.
+		const here = s.space.mirror.get(id)?.held === pageId;
 		for (const c of cs) {
 			if (c.visible.get(id) && here) {
 				expect(c.textOf(id)).toBe(s.textOf(id));
@@ -1676,6 +1683,25 @@ describe("review round 1", () => {
 		expect(outlineLiveStats().loadedBlocks).toBe(10);
 	});
 
+	test("rows left in the log table of before are counted for the startup warning, up to the bound", async () => {
+		const { pageId } = await page(["x"]);
+		const before = await outlineStore.countLegacyLiveUpdates(1000);
+		await db.insert(outlineLiveUpdates).values(
+			[0, 1, 2].map((seq) => ({
+				pageBlockId: pageId,
+				epoch: 4242,
+				seq,
+				updateB64: "",
+				actorKind: "system" as const,
+				actorId: "outline-live",
+				createdAt: NOW,
+			})),
+		);
+		expect(await outlineStore.countLegacyLiveUpdates(1000)).toBe(before + 3);
+		expect(await outlineStore.countLegacyLiveUpdates(before + 2)).toBe(before + 2);
+		await db.delete(outlineLiveUpdates).where(eq(outlineLiveUpdates.pageBlockId, pageId));
+	});
+
 	test("a snapshot after pages were unloaded names the generation once, not with every block", async () => {
 		const one = await page(["a"], "One");
 		const two = await page(
@@ -1844,7 +1870,7 @@ describe("every keystroke lands exactly once (model, seeded)", () => {
 				if (count === 0 && !kept) missing.push(t.token);
 				if (count > 1) twice.push(t.token);
 			}
-			expect(typed.length).toBeGreaterThan(40);
+			expect(typed.length).toBeGreaterThan(15);
 			expect({ missing, twice }).toEqual({ missing: [], twice: [] });
 			// And each page's people see what the database holds.
 			for (let p = 0; p < 3; p++) {

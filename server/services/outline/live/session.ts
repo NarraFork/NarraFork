@@ -1551,12 +1551,11 @@ export class LiveSpace {
 				data: Y.encodeStateAsUpdate(t.doc),
 			});
 		}
-		for (const id of this.mirror.subtreeAll(root)) {
-			if (seen.has(id)) continue;
-			const b = this.mirror.get(id) as MirrorBlock;
-			// A deleted block this page's people were never shown is not theirs to hold.
-			if (b.held === root) plain(id, b.gen, b.dbContent);
-		}
+		// By who holds the text, not by where the block is: a deleted block this page's people
+		// were shown may sit under a block that has since gone elsewhere, and one they were never
+		// shown may sit in this tree.
+		for (const b of this.mirror.all())
+			if (b.held === root && !seen.has(b.id)) plain(b.id, b.gen, b.dbContent);
 		return out;
 	}
 
@@ -1594,17 +1593,19 @@ export class LiveSpace {
 					? Y.encodeStateAsUpdate(t.doc, vector.data)
 					: Y.encodeStateAsUpdate(t.doc);
 				// An update of no structs and no deletions is two zero bytes. A document of another
-				// generation than the client's goes whole whatever it holds: the client drops its own.
-				if (data.length > 2 || (vector !== undefined && !same))
+				// generation than the client's (one it names, or one made since the last
+				// generation it heard of) goes whole whatever it holds: the client drops its own
+				// and learns the generation.
+				if (data.length > 2 || (!same && (vector !== undefined || gen > g)))
 					out.push({ id, kind: LIVE_TEXT_KIND.update, ...(gen !== 0 ? { gen } : {}), data });
 			}
 		} catch {
 			return null;
 		}
-		for (const id of this.mirror.subtreeAll(root)) {
-			if (sent.has(id)) continue;
-			const b = this.mirror.get(id) as MirrorBlock;
-			if (b.held !== root) continue;
+		// Every block this page's people hold, wherever it is now (see `allTexts`).
+		for (const b of this.mirror.all()) {
+			const id = b.id;
+			if (b.held !== root || sent.has(id)) continue;
 			const vector = named.get(id);
 			if (b.gen > g || (vector !== undefined && (vector.gen ?? 0) !== b.gen))
 				out.push({
