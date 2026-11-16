@@ -364,12 +364,6 @@ export function ensureI18nNamespaces(ns: readonly Namespace[], lng?: string): Pr
 			throw error;
 		});
 	namespaceSetCache.set(cacheKey, promise);
-	// The cached promise is created speculatively: a render may cache it and then
-	// never suspend on it (unmount, or a later render resolving from cache first),
-	// leaving a rejected promise nobody observes. `use()` still receives this same
-	// promise and still rethrows into the error boundary — the observer here only
-	// keeps a cached rejection from being reported as an unhandled one.
-	void promise.catch(() => {});
 	return promise;
 }
 
