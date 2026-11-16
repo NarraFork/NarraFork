@@ -196,6 +196,54 @@ describe("OutlineEdit on a locked plan", () => {
 		expect(delegate).toContain(`OutlineEdit { edits: [{ confirm: "${label}" }] }`);
 	});
 
+	test("the delegate reading another block under the same top-level block is told it waits; elsewhere not", async () => {
+		const w = await lockedPlan();
+		// The plan under a top-level block, next to a block of notes; another top-level block apart.
+		const made = await writeOutline({
+			spaceId: w.space.id,
+			ops: [
+				{ op: "insert", tempId: "t", parent: null, content: "Release 2" },
+				{ op: "insert", tempId: "n", parent: { tempId: "t" }, content: "Release notes" },
+				{ op: "insert", parent: null, content: "Elsewhere" },
+			],
+			actor: { kind: "human", id: w.alice },
+			responsibleUserId: w.alice,
+		});
+		const [, notes, elsewhere] = made.results.map((r) => r.sid) as [string, string, string];
+		const root = await outlineStore.getBlockBySid(w.space.id, w.sids.root);
+		await writeOutline({
+			spaceId: w.space.id,
+			ops: [
+				{
+					op: "move",
+					block: { id: root?.id as string },
+					parent: { id: made.results[0]?.blockId as string },
+				},
+			],
+			actor: { kind: "human", id: w.alice },
+			responsibleUserId: w.alice,
+		});
+		await read(w.a, w.sids.root);
+		const label = labelIn(
+			(await edit(w.a, [{ replace: w.sids.s1, text: "[ ] Parse the header and the footer" }]))
+				.output,
+		);
+		// A sibling of the locked plan: nothing locked is read, the change is still listed.
+		const sibling = await read(w.d, notes);
+		expect(sibling).toContain("Release notes");
+		expect(sibling).toContain(`‹${label} waits for your confirmation:`);
+		// Not marked: the read shows none of the blocks it touches.
+		expect(sibling).not.toContain(`‹pending ${label}:`);
+		// The top-level block itself, too.
+		expect(await read(w.d, made.results[0]?.sid as string)).toContain(
+			`‹${label} waits for your confirmation:`,
+		);
+		// Another top-level block: not listed.
+		expect(await read(w.d, elsewhere)).not.toContain(label);
+		// Neither for a session the change does not wait for.
+		expect(await read(w.b, notes)).not.toContain(label);
+	});
+
 	test("a block a held change adds is refused until confirmed; the delegate confirms, never the proposer; the proposer is told once", async () => {
 		const w = await lockedPlan();
 		await read(w.a, w.sids.root);

@@ -81,6 +81,7 @@ import { OUTLINE_SEARCH_LIMITS, searchOutline } from "./search";
 import { sessionScopeEpoch, yieldToEventLoop } from "./session-scope";
 import type { OutlineLevelCursor } from "./store/history-port";
 import type { OutlinePendingHead, OutlineSpaceRow } from "./store/port";
+import { readOutlineAncestry } from "./subtree-marks";
 import {
 	encodeOutlineLevelCursor,
 	type OutlineReadNodes,
@@ -280,6 +281,8 @@ async function showTree(
 		lockedAbove: readonly string[];
 		/** The block whose reads report decisions on this session's changes; null: none. */
 		reportsOf: string | null;
+		/** The block read: changes waiting for this session anywhere in its top-level block are listed. */
+		forYouUnder: string;
 	},
 ): Promise<Shown> {
 	const { state } = args;
@@ -291,6 +294,7 @@ async function showTree(
 					...[...tree.nodes.values()].flatMap((node) => (node.task?.lock ? [node.id] : [])),
 				],
 				reportsOf: args.reportsOf,
+				forYouUnder: args.forYouUnder,
 			})
 		: null;
 	const overlay = pending?.overlay ?? null;
@@ -933,6 +937,7 @@ export async function outlineRead(
 			state,
 			lockedAbove: got.lockedAbove,
 			reportsOf: block.id,
+			forYouUnder: block.id,
 		});
 	} else {
 		const cursor = await levelCursor(scope, space, block, after, asOf);
@@ -947,6 +952,7 @@ export async function outlineRead(
 			state,
 			lockedAbove: [...got.lockedAbove, ...(root?.task?.lock ? [block.id] : [])],
 			reportsOf: null,
+			forYouUnder: block.id,
 		});
 	}
 	const { rendered } = shown;
@@ -1005,13 +1011,16 @@ function bareSid(ref: string): string {
  * The open changes a read of this session shows (the module header): its own laid over, others'
  * marked, those waiting for its confirmation and its decided ones listed. `roots` are the locked
  * tasks read or above what was read: a change hangs on the locked task its plan is rooted at
- * and touches only blocks under it, so these are the changes that can touch the read. Null when
- * there is none of either.
+ * and touches only blocks under it, so these are the changes that can touch the read. Changes
+ * waiting for this session's confirmation are listed further: any under the top-level block of
+ * `forYouUnder` (the block read), as a read of its page listed them, so a delegate reading a
+ * sibling of the locked task is still told ({@link pendingForYouNearby}). Null when there is
+ * nothing to show.
  */
 async function pendingForRead(
 	scope: OutlineAgentScope,
 	space: OutlineSpaceRow,
-	args: { roots: readonly string[]; reportsOf: string | null },
+	args: { roots: readonly string[]; reportsOf: string | null; forYouUnder: string | null },
 ): Promise<{ overlay: OutlinePendingOverlay | null; notes: string[] } | null> {
 	const session = scope.rootNarratorId ?? scope.narratorId;
 	const store = scope.store;
@@ -1024,10 +1033,19 @@ async function pendingForRead(
 					(row) => row.spaceId === space.id,
 				);
 	const reports = args.reportsOf ? await decisionReports(scope, session, args.reportsOf) : [];
-	if (heads.length === 0 && reports.length === 0) return null;
+	const nearby = args.forYouUnder
+		? await pendingForYouNearby(
+				scope,
+				space,
+				session,
+				args.forYouUnder,
+				new Set(heads.map((h) => h.id)),
+			)
+		: [];
+	if (heads.length === 0 && reports.length === 0 && nearby.length === 0) return null;
 	// Who decides each change is the lock as it is now (review S-8).
 	const rows = await withCurrentDeciders(heads, { store });
-	const names = await pendingNames([...rows, ...reports]);
+	const names = await pendingNames([...rows, ...reports, ...nearby]);
 	// Sessions are named by title only when this session may read them (review S-5).
 	const titles = await scope.readableTitles(names.narrators);
 	const text = OUTLINE_TOOL_TEXT.pending;
@@ -1067,13 +1085,15 @@ async function pendingForRead(
 			states.includes("conflict") ? "conflict" : states.includes("merged") ? "merged" : "none",
 		);
 	});
-	// Changes this session decides: it is the session the locker named (or its subagent).
+	// Changes this session decides: it is the session the locker named (or its subagent). Those
+	// found nearby are listed only, never laid over or marked: they touch no block read.
+	const decidable = [...others, ...nearby];
 	const delegates = [
-		...new Set(others.flatMap((r) => (r.deciderJson.delegate ? [r.deciderJson.delegate] : []))),
+		...new Set(decidable.flatMap((r) => (r.deciderJson.delegate ? [r.deciderJson.delegate] : []))),
 	];
 	if (delegates.length > 0) {
 		const roots = await store.getNarratorRoots(delegates);
-		for (const row of others) {
+		for (const row of decidable) {
 			const delegate = row.deciderJson.delegate;
 			if (!delegate || (roots.get(delegate)?.root ?? delegate) !== session) continue;
 			notes.push(
@@ -1116,6 +1136,54 @@ async function pendingForRead(
 		}),
 		notes,
 	};
+}
+
+/** Open changes of a space a read looks through for those waiting for its session, at most. */
+const PENDING_NEARBY_SCAN = OUTLINE_SUBTREE_LIMITS.pendingRows;
+
+/**
+ * Open changes waiting for `session`'s confirmation (it is the delegate the locker named, or its
+ * root) whose plan is under the same top-level block as `blockId`, besides those in `seen`.
+ * Bounded: one read of the space's open change heads (at most {@link PENDING_NEARBY_SCAN}, oldest
+ * first), the deciders as they are now, and one walk up from the block and the few changes left
+ * (at most `markWalkRows` blocks); a walk cut short lists none of them.
+ */
+async function pendingForYouNearby(
+	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
+	session: string,
+	blockId: string,
+	seen: ReadonlySet<string>,
+): Promise<OutlinePendingHead[]> {
+	const store = scope.store;
+	const listed = (await store.listOpenPendingBySpace(space.id, PENDING_NEARBY_SCAN)).filter(
+		(row) => !seen.has(row.id) && row.requesterSession !== session && row.rootBlockId !== null,
+	);
+	if (listed.length === 0) return [];
+	const current = (await withCurrentDeciders(listed, { store })).filter(
+		(row) => !!row.deciderJson.delegate,
+	);
+	if (current.length === 0) return [];
+	const roots = await store.getNarratorRoots([
+		...new Set(current.map((row) => row.deciderJson.delegate as string)),
+	]);
+	const mine = current.filter((row) => {
+		const delegate = row.deciderJson.delegate as string;
+		return (roots.get(delegate)?.root ?? delegate) === session;
+	});
+	if (mine.length === 0) return [];
+	const ancestry = await readOutlineAncestry(
+		space.id,
+		[blockId, ...mine.map((row) => row.rootBlockId as string)],
+		{ maxRows: OUTLINE_SUBTREE_LIMITS.markWalkRows, store },
+	);
+	const topOf = (id: string): string | null => {
+		const above = ancestry.above(id);
+		return above === null ? null : (above.at(-1) ?? id);
+	};
+	const top = topOf(blockId);
+	if (top === null) return [];
+	return mine.filter((row) => topOf(row.rootBlockId as string) === top);
 }
 
 /**
