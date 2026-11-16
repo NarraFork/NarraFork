@@ -28,6 +28,8 @@ import {
 import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
 import { getClientIp, isLocalMachineAddress } from "../lib/client-ip";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
+import { requestDocumentAsset, requestDocumentPreview } from "../lib/document-preview/client";
+import { MAX_DOCUMENT_BYTES } from "../lib/document-preview/limits";
 import { AppError, ValidationError } from "../lib/errors";
 import { claimDownloadTicket, issueDownloadTicket } from "../lib/fs-download-ticket";
 import {
@@ -548,6 +550,87 @@ fsRoutes.get("/preview", async (c) => {
 });
 
 /**
+ * `GET /api/fs/document-preview?path=...` — read-only preview of a document file.
+ *
+ * Answers with Markdown plus the list of embedded pictures, so the client renders it with the
+ * SAME renderer as a `.md` preview. The format is decided by CONTENT inside the worker, not by
+ * the extension: a legacy binary `.doc` is refused with a reason (`ok: false`) instead of being
+ * read as text, which is what produced garbage previews before.
+ *
+ * Parsing runs in a worker (see `lib/document-preview/client.ts`); the main thread only does
+ * the cheap stat/authorization here.
+ */
+fsRoutes.get("/document-preview", async (c) => {
+	const rawPath = c.req.query("path");
+	if (!rawPath) throw new ValidationError("path is required");
+
+	const absPath = resolve(rawPath);
+	assertReadableThroughFileApi(absPath);
+
+	let info: ReturnType<typeof statSync>;
+	try {
+		info = statSync(absPath);
+	} catch {
+		throw new ValidationError(`File does not exist: ${absPath}`);
+	}
+	if (!info.isFile()) throw new ValidationError(`Not a file: ${absPath}`);
+	if (info.size > MAX_DOCUMENT_BYTES) {
+		return c.json({ error: "File too large to preview" }, 413);
+	}
+
+	const outcome = await requestDocumentPreview(absPath);
+	return c.json(outcome);
+});
+
+/** Asset ids are minted by the parser (`a1`, `a2`, …); anything else is refused unread. */
+const DOCUMENT_ASSET_ID_PATTERN = /^a[0-9]{1,6}$/;
+
+/**
+ * `GET /api/fs/document-asset?path=...&id=...` — one embedded picture of a document.
+ *
+ * The id is resolved by re-walking the document, so a caller can only address pictures the
+ * parser found; it can never name a ZIP entry and read an arbitrary part of a container.
+ */
+fsRoutes.get("/document-asset", async (c) => {
+	const rawPath = c.req.query("path");
+	const assetId = c.req.query("id");
+	if (!rawPath) throw new ValidationError("path is required");
+	if (!assetId) throw new ValidationError("id is required");
+	if (!DOCUMENT_ASSET_ID_PATTERN.test(assetId)) {
+		throw new ValidationError(`Unknown document asset: ${assetId}`);
+	}
+
+	const absPath = resolve(rawPath);
+	assertReadableThroughFileApi(absPath);
+
+	let info: ReturnType<typeof statSync>;
+	try {
+		info = statSync(absPath);
+	} catch {
+		throw new ValidationError(`File does not exist: ${absPath}`);
+	}
+	if (!info.isFile()) throw new ValidationError(`Not a file: ${absPath}`);
+	if (info.size > MAX_DOCUMENT_BYTES) {
+		return c.json({ error: "File too large to preview" }, 413);
+	}
+
+	const asset = await requestDocumentAsset(absPath, assetId);
+	if (!asset) throw new ValidationError(`Unknown document asset: ${assetId}`);
+
+	return new Response(Buffer.from(asset.bytes), {
+		headers: {
+			// `nosniff` keeps the declared type honest: these bytes come from a document, not
+			// from a file this API validated as an image.
+			"Content-Type": asset.mime,
+			"Content-Length": String(asset.bytes.length),
+			"Content-Disposition": "inline",
+			"X-Content-Type-Options": "nosniff",
+			"Cache-Control": "private, max-age=60",
+		},
+	});
+});
+
+/**
  * Cap on the body of one human save.
  *
  * Matches `/preview`'s text cap: the editor can only open what preview serves, so a
@@ -555,7 +638,6 @@ fsRoutes.get("/preview", async (c) => {
  * whole-file diff computed for line stats, which runs on the server's only JS thread.
  */
 const MAX_WRITE_BYTES = 1024 * 1024;
-
 /**
  * `GET /api/fs/edit-source?path=...` — load a file FOR EDITING.
  *
