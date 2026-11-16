@@ -516,8 +516,8 @@ describe("the automatic attach", () => {
 	});
 
 	test("so many on one page; more are left to a person, who may still attach one", async () => {
-		const perPage = SPEC_LOSS_ATTACH_LIMITS.perPage;
-		const total = perPage + 2;
+		const perBlock = SPEC_LOSS_ATTACH_LIMITS.perBlock;
+		const total = perBlock + 2;
 		const owner = await makeUser("en");
 		const { id } = await makeSession({ owner });
 		await writeTasks(id, [{ text: "a task" }]);
@@ -532,9 +532,9 @@ describe("the automatic attach", () => {
 		});
 		expect(await scanSpecSessionLossById(id)).toMatchObject({ findings: total });
 		await passes(
-			async () => (await open(id)).filter((f) => f.attachNote === "page_cap").length === 2,
+			async () => (await open(id)).filter((f) => f.attachNote === "block_cap").length === 2,
 		);
-		expect(await countSpecLossFindings(id)).toEqual({ open: 2, attached: perPage, dismissed: 0 });
+		expect(await countSpecLossFindings(id)).toEqual({ open: 2, attached: perBlock, dismissed: 0 });
 		const commits = await commitCount(id);
 		await runSpecLossPass({ pauseMs: 0 });
 		expect(await commitCount(id)).toBe(commits);
@@ -560,13 +560,13 @@ describe("the automatic attach", () => {
 			responsibleUserId: owner,
 		});
 		const commits = await commitCount(id);
-		await passes(async () => (await open(id))[0]?.attachNote === "no_page");
+		await passes(async () => (await open(id))[0]?.attachNote === "no_block");
 		expect(await commitCount(id)).toBe(commits);
 		expect(
 			await code(() =>
 				decideSpecLossFinding({ id: findingId, narratorId: id, action: "attach", userId: owner }),
 			),
-		).toBe("SPEC_LOSS_NO_PAGE");
+		).toBe("SPEC_LOSS_NO_BLOCK");
 		expect(await commitCount(id)).toBe(commits);
 		// The text can still be read.
 		expect((await specLossDetail(findingId, id)).parts[0]?.text).toBe(TABLE);
@@ -938,9 +938,9 @@ describe("the behavior fence is never attached by a pass", () => {
 		for (let n = 0; n < 3; n++) await runSpecLossPass({ pauseMs: 0 });
 		// Listed, both the table and the task item, and nothing written.
 		const found = await open(id);
-		expect(found.map((f) => [f.path, f.attachNote, f.rulePage])).toEqual([
-			["behavior_fence", "rule_page", true],
-			["behavior_fence", "rule_page", true],
+		expect(found.map((f) => [f.path, f.attachNote, f.ruleBlock])).toEqual([
+			["behavior_fence", "rule_block", true],
+			["behavior_fence", "rule_block", true],
 		]);
 		expect(await all(id, "attached")).toEqual([]);
 		expect(await commitCount(id)).toBe(commits);
@@ -1001,7 +1001,7 @@ describe("the behavior fence is never attached by a pass", () => {
 			action: "reopen",
 			userId: owner,
 		});
-		expect(reopened).toMatchObject({ status: "open", attachNote: "rule_page" });
+		expect(reopened).toMatchObject({ status: "open", attachNote: "rule_block" });
 		for (let n = 0; n < 2; n++) await runSpecLossPass({ pauseMs: 0 });
 		expect(await behaviorView(id)).toBe(before);
 	});

@@ -368,8 +368,8 @@ describe("a session's routes", () => {
 		const finding = page.body.items[0];
 		expect(finding).toMatchObject({
 			path: "behavior_fence",
-			attachNote: "rule_page",
-			rulePage: true,
+			attachNote: "rule_block",
+			ruleBlock: true,
 			attachable: true,
 		});
 		const post = (body: unknown) =>
@@ -398,7 +398,7 @@ describe("a session's routes", () => {
 		}
 		const attached = await post({ action: "attach", confirmRule: true });
 		expect(attached.status).toBe(200);
-		expect(attached.body).toMatchObject({ status: "attached", rulePage: true });
+		expect(attached.body).toMatchObject({ status: "attached", ruleBlock: true });
 		// The admin route asks for the confirmation as well.
 		const admin = await makeAdmin();
 		await post({ action: "dismiss" });

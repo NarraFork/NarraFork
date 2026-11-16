@@ -81,17 +81,17 @@ import {
 import { writeImportedFenceSop } from "../../task-source/outline-plugin-rules";
 import { outlineAccessBackend } from "../access-reads";
 import { OUTLINE_EDIT_TEXT_LIMITS, processBackgroundText } from "../edit-text-runner";
+import { OutlineWriteError } from "../errors";
 import { isOutlineEnabled } from "../feature";
 import { forgetSpecImportLeftover } from "../lease-keeper";
 import { OUTLINE_TASKS_PAGE_ALIAS } from "../model";
 import { OUTLINE_TASKS_PAGE_TITLE } from "../person-tasks";
 import { PluginTaskError, pluginBlockedNoteSid } from "../plugin-tasks";
-import { OutlineWriteError } from "../errors";
 import { yieldToEventLoop } from "../session-scope";
 import { outlineStore } from "../store";
-import { findTasksBlock } from "../well-known";
 import type { OutlineLevelCursor } from "../store/history-port";
 import type { OutlineBlockMeta, OutlineCommitRow, OutlineSpaceRow } from "../store/port";
+import { findTasksBlock } from "../well-known";
 import {
 	type OutlineBlockRef,
 	type OutlineCanonicalContent,
@@ -1479,7 +1479,7 @@ async function deleteStale(ctx: Context, subtrees: readonly StaleNode[][]): Prom
 			rows += piece.size;
 		}
 		if (pack.length > 0) packs.push(pack);
-		const commitPack = async (list: ReadonlyArray<{ id: string; size: number }>) => {
+		const commitPack = async (list: ReadonlyArray<{ id: string; size: number }>): Promise<boolean> => {
 			try {
 				await commit(
 					ctx,
@@ -1581,7 +1581,10 @@ async function onlyImportWrote(
 	}
 	if (!(await allImportCommits(space, seqs))) return null;
 	for (const [n, node] of nodes.entries()) {
-		const versions = await outlineStore.listBlockVersions(node.id, limits.staleVersionsPerBlock + 1);
+		const versions = await outlineStore.listBlockVersions(
+			node.id,
+			limits.staleVersionsPerBlock + 1,
+		);
 		if (versions.length > limits.staleVersionsPerBlock) return null;
 		versionsRead += versions.length;
 		if (versionsRead > limits.staleVersions) return null;

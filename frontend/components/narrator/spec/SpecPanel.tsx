@@ -671,10 +671,9 @@ function SpecMovedNotice({ narratorId }: { narratorId: string }) {
 							onClick={(event) => {
 								if (!opener || !isOpenClick(event)) return;
 								// A host that cannot show a panel right now leaves the link to navigate.
-								const opened = opener.open(
-									listId ? { spaceId, blockId: listId } : { spaceId },
-									{ newPanel: wantsNewPanel(event) },
-								);
+								const opened = opener.open(listId ? { spaceId, blockId: listId } : { spaceId }, {
+									newPanel: wantsNewPanel(event),
+								});
 								if (opened) event.preventDefault();
 							}}
 						>

@@ -119,7 +119,7 @@ describe("planSpecFile", () => {
 		children,
 	});
 
-	test("one page, parents before children", () => {
+	test("one top-level block per file, parents before children, short ids as before pages went", () => {
 		const plan = planSpecFile({
 			narratorId: "n",
 			path: "design.md",
@@ -127,41 +127,64 @@ describe("planSpecFile", () => {
 			blocks: [block("# H", [block("p1"), block("p2")]), block("tail")],
 			locale: "en",
 		});
-		expect(plan.pageSids).toHaveLength(1);
 		expect(plan.nodes.map((n) => n.content)).toEqual(["design.md", "# H", "p1", "p2", "tail"]);
-		const [page, h, p1] = plan.nodes;
-		expect(page?.parentSid).toBeNull();
-		expect(h?.parentSid).toBe(page?.sid as string);
+		const [root, h, p1] = plan.nodes;
+		expect(root?.parentSid).toBeNull();
+		expect(plan.rootSid).toBe(root?.sid as string);
+		expect(plan.nodes.filter((n) => n.parentSid === null)).toHaveLength(1);
+		expect(h?.parentSid).toBe(root?.sid as string);
 		expect(p1?.parentSid).toBe(h?.sid as string);
 		const tag = specFileTag("n", "design.md", "r");
 		expect(plan.nodes.every((n) => fileTagOfSid(n.sid) === tag && isImportSid(n.sid))).toBe(true);
+		// Depth first, numbered as the import always numbered them: an import cut short before
+		// pages went goes on with the same short ids.
+		expect(plan.nodes.map((n) => n.sid)).toEqual([
+			`sp${tag}`,
+			`sb${tag}0`,
+			`sb${tag}1`,
+			`sb${tag}2`,
+			`sb${tag}3`,
+		]);
+		expect(plan.blocks).toBe(4);
 	});
 
-	test("a file of more blocks than a page holds becomes several pages, nothing lost", () => {
+	test("a level wider than a block takes is grouped under it, nothing lost, ids unchanged", () => {
 		const plan = planSpecFile({
 			narratorId: "n",
 			path: "big.md",
 			revisionId: "r",
 			blocks: [block("# H", [block("a"), block("b"), block("c")]), block("d")],
 			locale: "zh-CN",
-			pageBlocks: 2,
-			pageSid: "fixedpage0001",
+			childrenPerBlock: 2,
+			rootSid: "fixedroot0001",
 		});
-		expect(plan.pageSids).toHaveLength(3);
-		expect(plan.pageSids[0]).toBe("fixedpage0001");
-		const pagesOf = plan.nodes.filter((n) => n.parentSid === null).map((n) => n.content);
-		expect(pagesOf).toEqual(["big.md（1/3）", "big.md（2/3）", "big.md（3/3）"]);
-		expect(plan.nodes.filter((n) => n.parentSid !== null).map((n) => n.content)).toEqual([
+		expect(plan.rootSid).toBe("fixedroot0001");
+		expect(plan.nodes.filter((n) => n.parentSid === null).map((n) => n.sid)).toEqual([
+			"fixedroot0001",
+		]);
+		expect(plan.nodes.map((n) => n.content)).toEqual([
+			"big.md",
 			"# H",
+			"big.md（1/2）",
 			"a",
 			"b",
+			"big.md（2/2）",
 			"c",
 			"d",
 		]);
-		// `b` and `c` are on the second part: their heading stayed on the first, so they hang
-		// from the part's page.
-		const b = plan.nodes.find((n) => n.content === "b");
-		expect(b?.parentSid).toBe(plan.pageSids[1] as string);
+		const of = (content: string) => plan.nodes.find((n) => n.content === content);
+		const h = of("# H");
+		expect(of("big.md（1/2）")?.parentSid).toBe(h?.sid as string);
+		expect(of("a")?.parentSid).toBe(of("big.md（1/2）")?.sid as string);
+		expect(of("c")?.parentSid).toBe(of("big.md（2/2）")?.sid as string);
+		expect(of("d")?.parentSid).toBe("fixedroot0001");
+		// Groups take no number of the text's blocks.
+		const tag = specFileTag("n", "big.md", "r");
+		expect(["# H", "a", "b", "c", "d"].map((c) => of(c)?.sid)).toEqual(
+			[0, 1, 2, 3, 4].map((n) => `sb${tag}${n}`),
+		);
+		expect(new Set(plan.nodes.map((n) => n.sid)).size).toBe(plan.nodes.length);
+		expect(plan.nodes.every((n) => isImportSid(n.sid) || n.sid === "fixedroot0001")).toBe(true);
 	});
 
 	test("what is not markdown is code in its extension's language", () => {
@@ -198,7 +221,7 @@ describe("a file's text as blocks (the reviewer's cases)", () => {
 		});
 	}
 
-	test("a file split over several pages keeps every block, in order", () => {
+	test("a file of more than 1,500 blocks stays one block, every block kept, in order", () => {
 		const text = Array.from({ length: 4000 }, (_, i) => `para ${i}`).join("\n\n");
 		const plan = planSpecFile({
 			narratorId: "n",
@@ -209,7 +232,12 @@ describe("a file's text as blocks (the reviewer's cases)", () => {
 		});
 		const body = plan.nodes.filter((n) => n.sid.startsWith("sb")).map((n) => n.content);
 		expect(body).toEqual(Array.from({ length: 4000 }, (_, i) => `para ${i}`));
-		expect(plan.pageSids).toHaveLength(3);
+		expect(plan.nodes.filter((n) => n.parentSid === null).map((n) => n.sid)).toEqual([
+			plan.rootSid,
+		]);
+		// 4,000 paragraphs at one level: two groups of 2,000 under the file's block.
+		const groups = plan.nodes.filter((n) => n.parentSid === plan.rootSid);
+		expect(groups.map((n) => n.content)).toEqual(["big.md (1/2)", "big.md (2/2)"]);
 		expect(new Set(plan.nodes.map((n) => n.sid)).size).toBe(plan.nodes.length);
 	});
 });

@@ -7,7 +7,7 @@
  *
  * THE TASK LIST (`spec_tasks_get`)
  * --------------------------------
- * The session space's top-level tasks (no task above them; the behavior page left out), in
+ * The session space's top-level tasks (no task above them; the behavior boundary left out), in
  * document order, at most {@link SPEC_COMPAT_LIMITS.tasks} (the spec limit), as
  * `{ text, status, protected }`: a cancelled task is not listed; an open task that waits (a
  * prerequisite, a person, a confirmation) or that a plugin marked blocked (its note under it,
@@ -20,24 +20,24 @@
  *
  * ADDING (`spec_task_add`)
  * ------------------------
- * `task_add` on the task page: deduped by body, `added` false when the text is there already;
+ * `task_add` in the task list: deduped by body, `added` false when the text is there already;
  * `protected` is the task found's, or the one asked for (D52: not locked).
  *
  * THE OVERWRITE (`spec_write` of tasks.json)
  * ------------------------------------------
  * The document is validated as a spec write validates it, then compared with the list above by
  * text (the text as listed, or the text normalized as the write path would store it; duplicates
- * in order); a text the list does not hold is looked for among the task page's own tasks too
+ * in order); a text the list does not hold is looked for among the task list's own tasks too
  * (one bounded read: a done task the list left out is that task, not a new one). One commit:
- *   - a new text: a task on the task page, after the item before it on the task page (first when
+ *   - a new text: a task in the task list, after the item before it in the task list (first when
  *     none is), to do, in progress or done; `blocked` is in progress with the plugin's note under
  *     it (no question is asked); `protected` makes it created by a person, not locked;
  *   - a status that changed: set; `blocked` writes the note once (a note taken away is brought
  *     back), any other status takes it away; `protected` on a task that was not is set;
- *   - an open task no longer listed: cancelled when it is a direct child of the task page (what is
+ *   - an open task no longer listed: cancelled when it is a direct child of the task list (what is
  *     under it stays: cancelling, not deleting); a done one, and one elsewhere (a plan's), are left
  *     alone and logged (review S3: a done task dropped from the file is still finished work);
- *   - the task page's own tasks are moved only when their order changed.
+ *   - the task list's own tasks are moved only when their order changed.
  * A write that would finish, drop or un-protect an open task a person created, or finish or cancel
  * a task a person locked (or cancel one under it, review S2), is refused whole with the error a
  * spec session gives, `SpecProtectedTaskError` (`CONFLICT` with the list of what it touched,
@@ -47,15 +47,16 @@
  *
  * NOTES (`spec_write` of index.md)
  * --------------------------------
- * The page `index.md` of the session space (its short id follows from the name; made, moved back
- * or brought back as needed) gets the text as notes (headings hold their sections, nothing is
- * outline syntax), replacing the notes it held (a task on the page is kept; a person's task under
- * a note refuses the rewrite, review N1), in one commit within one commit's limits; a text that
- * does not fit is refused (`PAYLOAD_TOO_LARGE`) and nothing is written.
+ * The block `index.md` of the session space (its short id follows from the name; made, or brought
+ * back at the top level, as needed; left where a person moved it) gets the text as notes
+ * (headings hold their sections, nothing is outline syntax), replacing the notes it held (a task
+ * directly under it is kept; a person's task under a note refuses the rewrite, review N1), in one
+ * commit within one commit's limits; a text that does not fit is refused (`PAYLOAD_TOO_LARGE`)
+ * and nothing is written.
  *
  * THE FENCE (`spec_behavior_fence_update`)
  * ----------------------------------------
- * The plugin's block on the behavior page (`outline-plugin-rules.ts`). A subagent keeps writing
+ * The plugin's block under the behavior boundary (`outline-plugin-rules.ts`). A subagent keeps writing
  * its own old fence (see there), so the session layer sends only a root session here.
  */
 import { createHash } from "node:crypto";
@@ -111,10 +112,12 @@ import { setOutlinePluginRules } from "./task-source/outline-plugin-rules";
 export const SPEC_COMPAT_LIMITS = {
 	/** Tasks the list holds (the spec limit). */
 	tasks: 100,
-	/** Top-level tasks read to choose them from (within the read's page and row budget). */
+	/** Top-level tasks read to choose them from (within the read's row budget). */
 	scan: 1000,
-	/** Children of the task page the overwrite looks at for a text it does not list (S4). */
-	pageScan: 500,
+	/** Children of the task list the overwrite looks at for a text it does not list (S4). */
+	taskListScan: 500,
+	/** Blocks under the `index.md` block a rewrite reads to find a person's task under a note. */
+	indexBlocks: 4000,
 } as const;
 
 /** A note written under a task a plugin marked blocked, in the session owner's language. */
@@ -123,7 +126,7 @@ export const SPEC_COMPAT_BLOCKED_NOTE: Record<Locale, (pluginId: string) => stri
 	"zh-CN": (pluginId) => `受阻（插件 ${pluginId} 标记）`,
 };
 
-/** The title of a session's `index.md` page. */
+/** The title of a session's `index.md` block. */
 export const SPEC_COMPAT_INDEX_TITLE = "index.md";
 
 /** One listed task and where it is. */
@@ -357,13 +360,13 @@ export async function writeSpecTasksCompat(args: {
 		const listed = (await readSpecCompatList(session, store)).entries;
 		const normalized = await normalizedTexts(document.tasks.map((t) => t.text));
 		const matches = matchItems(listed, document.tasks, normalized);
-		const [pageOwner] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-		// A text the list does not hold may still be a task of the task page (a done one the list
+		const [listOwner] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
+		// A text the list does not hold may still be a task of the task list (a done one the list
 		// left out): it is that task, not a new one (review S4).
 		const entries = [...listed];
 		const unmatched = matches.flatMap((at, i) => (at < 0 ? [i] : []));
-		if (unmatched.length > 0 && pageOwner) {
-			const extra = await taskPageEntries(store, space, pageOwner.id, listed);
+		if (unmatched.length > 0 && listOwner) {
+			const extra = await taskListEntries(store, space, listOwner.id, listed);
 			const extraMatches = matchItems(
 				extra,
 				unmatched.map((i) => document.tasks[i] as SpecTaskItem),
@@ -388,7 +391,7 @@ export async function writeSpecTasksCompat(args: {
 			const i = itemOf.get(j);
 			const item = i === undefined ? undefined : document.tasks[i];
 			if (!item) {
-				// Dropped: only the task page's own are cancelled (the rest are left alone).
+				// Dropped: only the task list's own are cancelled (the rest are left alone).
 				if (j >= listed.length) return;
 				if (entry.protected)
 					refused.push({
@@ -396,7 +399,7 @@ export async function writeSpecTasksCompat(args: {
 						text: entry.text,
 						details: "Protected task was removed from tasks.json.",
 					});
-				else if (entry.task.onTasksPage && entry.task.inLockedTree)
+				else if (entry.task.inTaskList && entry.task.inLockedTree)
 					refused.push({ kind: "delete", text: entry.text, details: LOCKED_DETAILS });
 				return;
 			}
@@ -420,18 +423,18 @@ export async function writeSpecTasksCompat(args: {
 		if (refused.length > 0) throw new SpecProtectedTaskError(refused);
 
 		const ops: OutlineOp[] = [];
-		let pageRef: OutlineBlockRef | null = pageOwner ? { id: pageOwner.id } : null;
-		const page = (): OutlineBlockRef => {
-			if (pageRef) return pageRef;
+		let listRef: OutlineBlockRef | null = listOwner ? { id: listOwner.id } : null;
+		const taskList = (): OutlineBlockRef => {
+			if (listRef) return listRef;
 			ops.push({
 				op: "insert",
-				tempId: "page",
+				tempId: "tasks",
 				parent: null,
 				content: OUTLINE_TASKS_PAGE_TITLE[session.locale === "zh-CN" ? "zh-CN" : "en"],
 				alias: OUTLINE_TASKS_PAGE_ALIAS,
 			});
-			pageRef = { tempId: "page" };
-			return pageRef;
+			listRef = { tempId: "tasks" };
+			return listRef;
 		};
 		// The blocked mark: written once, brought back when someone took it, taken by another status.
 		const markBlocked = (taskId: string, note: SpecCompatEntry["blockedNote"]) => {
@@ -456,23 +459,23 @@ export async function writeSpecTasksCompat(args: {
 				});
 		};
 
-		// The task page's own tasks in the new order: kept ones (by their entry) and new ones.
+		// The task list's own tasks in the new order: kept ones (by their entry) and new ones.
 		const sequence: Array<{ entry: number } | { item: number }> = [];
 		document.tasks.forEach((_, i) => {
 			const at = matches[i] as number;
 			if (at < 0) sequence.push({ item: i });
-			else if (at < listed.length && (entries[at] as SpecCompatEntry).task.onTasksPage)
+			else if (at < listed.length && (entries[at] as SpecCompatEntry).task.inTaskList)
 				sequence.push({ entry: at });
 		});
 		const kept = sequence.flatMap((s) => ("entry" in s ? [s.entry] : []));
 		const reordered = kept.some((at, k) => k > 0 && at < (kept[k - 1] as number));
-		if (sequence.some((step) => "item" in step) && pageOwner) {
-			// Nothing is added to a task page a person locked.
-			const [pageMeta] = await store.getBlockMetas(space.id, { ids: [pageOwner.id] });
-			if (isPersonLock(pageMeta?.taskJson))
+		if (sequence.some((step) => "item" in step) && listOwner) {
+			// Nothing is added to a task list a person locked.
+			const [listMeta] = await store.getBlockMetas(space.id, { ids: [listOwner.id] });
+			if (isPersonLock(listMeta?.taskJson))
 				throw new PluginTaskError(
 					"CONFLICT",
-					PLUGIN_TASK_TEXT.locked(`${space.key}/${pageMeta?.sid}`),
+					PLUGIN_TASK_TEXT.locked(`${space.key}/${listMeta?.sid}`),
 				);
 		}
 
@@ -499,7 +502,7 @@ export async function writeSpecTasksCompat(args: {
 			}
 		});
 
-		// The task page's order: new tasks after the one before them, kept ones moved if need be.
+		// The task list's order: new tasks after the one before them, kept ones moved if need be.
 		let anchor: OutlineBlockRef | null = null;
 		for (const step of sequence) {
 			const position: OutlinePosition = anchor ? { after: anchor } : { first: true };
@@ -509,7 +512,7 @@ export async function writeSpecTasksCompat(args: {
 					ops.push({
 						op: "move",
 						block: { id: entry.task.id },
-						parent: page(),
+						parent: taskList(),
 						position,
 						baseVersionSeq: entry.task.versionSeq,
 					});
@@ -522,7 +525,7 @@ export async function writeSpecTasksCompat(args: {
 			ops.push({
 				op: "insert",
 				id,
-				parent: page(),
+				parent: taskList(),
 				position,
 				content: item.text,
 				task: {
@@ -534,13 +537,13 @@ export async function writeSpecTasksCompat(args: {
 			anchor = { id };
 		}
 
-		// Listed tasks no longer listed: open ones on the task page are cancelled; done ones, and
+		// Listed tasks no longer listed: open ones in the task list are cancelled; done ones, and
 		// tasks elsewhere, are left alone (review S3: a done task dropped from the file is still
 		// done work).
 		let ignored = 0;
 		listed.forEach((entry, j) => {
 			if (matched.has(j)) return;
-			if (!entry.task.onTasksPage || entry.status === "done") {
+			if (!entry.task.inTaskList || entry.status === "done") {
 				ignored++;
 				return;
 			}
@@ -583,18 +586,18 @@ export async function writeSpecTasksCompat(args: {
 const LOCKED_DETAILS = "Task is locked by a person (its plan waits for them).";
 
 /**
- * The task page's own tasks (not cancelled) the list does not hold, as entries an item may
- * continue: one bounded read of the page's last children and the heads of those found.
+ * The task list's own tasks (not cancelled) the list does not hold, as entries an item may
+ * continue: one bounded read of the task list's last children and the heads of those found.
  */
-async function taskPageEntries(
+async function taskListEntries(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
-	pageId: string,
+	listId: string,
 	listed: readonly SpecCompatEntry[],
 ): Promise<SpecCompatEntry[]> {
 	const held = new Set(listed.map((entry) => entry.task.id));
 	const children = (
-		await store.listLastChildMetas(space.id, pageId, SPEC_COMPAT_LIMITS.pageScan)
+		await store.listLastChildMetas(space.id, listId, SPEC_COMPAT_LIMITS.taskListScan)
 	).filter((meta) => meta.taskJson && meta.taskJson.status !== "cancelled" && !held.has(meta.id));
 	if (children.length === 0) return [];
 	const ids = children.map((meta) => meta.id);
@@ -609,13 +612,12 @@ async function taskPageEntries(
 			id: meta.id,
 			sid: meta.sid,
 			parentId: meta.parentId,
-			pageId: meta.pageId,
 			taskJson,
 			versionSeq: meta.versionSeq,
 			path: [],
 			depth: 1,
 			topLevel: true,
-			onTasksPage: true,
+			inTaskList: true,
 			lockRoot,
 			inLockedTree: lockRoot,
 		};
@@ -630,42 +632,45 @@ async function taskPageEntries(
 }
 
 /**
- * The short id of a session's `index.md` page (short ids are unique within a space). The import of
- * old sessions (outline plan PR 12b) must write a session's `index.md` under `specIndexSid()`, so
- * a plugin's later `spec_write` of index.md replaces that page instead of making a second one
- * (review N2).
+ * The short id of a session's `index.md` block (short ids are unique within a space). The import
+ * of old sessions (outline plan PR 12b) must write a session's `index.md` under `specIndexSid()`,
+ * so a plugin's later `spec_write` of index.md replaces that block's notes instead of making a
+ * second one (review N2).
  */
 export function specIndexSid(): string {
 	return `pi${createHash("sha256").update("spec-index\u0000index.md").digest("hex").slice(0, 12)}`;
 }
 
 /**
- * What a rewrite of the `index.md` page deletes (review N1): its notes; a task on it is kept (a
- * person or the session may have added it there), and a person's task (created or locked by them)
- * under a note refuses the rewrite instead of going with the note.
+ * What a rewrite of the `index.md` block deletes (review N1): its notes; a task directly under it
+ * is kept (a person or the session may have added it there), and a person's task (created or
+ * locked by them) under a note refuses the rewrite instead of going with the note. What is under
+ * the block is read breadth first, at most {@link SPEC_COMPAT_LIMITS.indexBlocks} blocks without
+ * content; a block holding more is refused as too large (it could not be checked).
  */
 async function replacedUnder(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
-	page: { id: string; pageId: string },
+	index: { id: string },
 ): Promise<string[]> {
-	const structure = await store.listPageStructure(page.pageId, {
+	const read = await store.listSubtreeAt(space.id, index.id, {
 		asOf: null,
-		limit: OUTLINE_LIMITS.maxPageBlocks,
+		limit: SPEC_COMPAT_LIMITS.indexBlocks,
 	});
-	const children = new Map<string, typeof structure.rows>();
-	for (const row of structure.rows) {
+	if (read.truncated) throw new PluginTaskError("PAYLOAD_TOO_LARGE", INDEX_TOO_LARGE);
+	const children = new Map<string, typeof read.rows>();
+	for (const row of read.rows) {
 		if (row.parentId === null) continue;
 		const list = children.get(row.parentId);
 		if (list) list.push(row);
 		else children.set(row.parentId, [row]);
 	}
 	const out: string[] = [];
-	for (const child of children.get(page.id) ?? []) {
+	for (const child of children.get(index.id) ?? []) {
 		if (child.taskJson) continue;
 		const stack = [...(children.get(child.id) ?? [])];
 		while (stack.length > 0) {
-			const row = stack.pop() as (typeof structure.rows)[number];
+			const row = stack.pop() as (typeof read.rows)[number];
 			if (row.taskJson && (row.taskJson.humanCreated === true || isPersonLock(row.taskJson)))
 				throw new PluginTaskError(
 					"CONFLICT",
@@ -715,18 +720,17 @@ export async function writeSpecIndexCompat(args: {
 			ops.push(op);
 			canonical.push(content);
 		};
-		let pageRef: OutlineBlockRef;
+		let indexRef: OutlineBlockRef;
 		if (!meta) {
 			push({ op: "insert", tempId: "index", sid, parent: null, content: SPEC_COMPAT_INDEX_TITLE });
-			pageRef = { tempId: "index" };
+			indexRef = { tempId: "index" };
 		} else if (meta.deleted) {
 			push({ op: "restore", block: { id: meta.id }, parent: null });
-			pageRef = { id: meta.id };
+			indexRef = { id: meta.id };
 		} else {
-			if (meta.parentId !== null) push({ op: "move", block: { id: meta.id }, parent: null });
 			for (const id of await replacedUnder(store, space, meta))
 				push({ op: "delete", block: { id } });
-			pageRef = { id: meta.id };
+			indexRef = { id: meta.id };
 		}
 		const walk = (nodes: typeof converted.blocks, parent: OutlineBlockRef): void => {
 			for (const node of nodes) {
@@ -738,7 +742,7 @@ export async function writeSpecIndexCompat(args: {
 				walk(node.children, { tempId });
 			}
 		};
-		walk(converted.blocks, pageRef);
+		walk(converted.blocks, indexRef);
 		if (ops.length > OUTLINE_LIMITS.maxOps) throw tooLarge();
 		const result = await writeForPlugin(
 			session,
