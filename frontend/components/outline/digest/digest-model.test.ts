@@ -30,7 +30,6 @@ function link(spaceId: string, blockId: string | null, seq: number): OutlineDige
 		spaceId,
 		spaceKey: `${spaceId}-key`,
 		blockId,
-		pageId: "page",
 		address: blockId ? `${spaceId}-key/${blockId}` : null,
 		seq,
 		commitId: `c${seq}`,
@@ -62,10 +61,12 @@ function space(id: string, extra: Partial<OutlineDigestSpaceView> = {}): Outline
 
 function knowledge(spaceId: string, seq: number): OutlineDigestKnowledgeView {
 	return {
-		link: link(spaceId, `page${seq}`, seq),
-		title: `Page ${seq}`,
+		link: link(spaceId, `block${seq}`, seq),
+		title: `Block ${seq}`,
 		deleted: false,
 		at: "2026-11-05T01:00:00.000Z",
+		path: [],
+		pathCut: false,
 		created: 1,
 		changed: 0,
 		blocks: [],

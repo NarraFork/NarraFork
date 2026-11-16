@@ -33,6 +33,10 @@ export interface OutlineRangeChange {
 	seq: number;
 	commitId: string;
 	blockId: string;
+	/**
+	 * The version's page (storage keeps `page_id` until X2). Only the team activity reads it
+	 * (A2 moves it to blocks); reports and plugin events do not.
+	 */
 	pageId: string;
 	parentId: string | null;
 	changeFlags: number;
@@ -49,7 +53,6 @@ export interface OutlineVersionMeta {
 	fromSeq: number;
 	toSeq: number | null;
 	commitId: string;
-	pageId: string;
 	parentId: string | null;
 	contentHash: string;
 	taskJson: OutlineTaskJson | null;

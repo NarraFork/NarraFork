@@ -71,7 +71,6 @@ export interface OutlineDigestDelegatedStored extends StoredBase {
 	kind: OutlineDelegatedKind;
 	/** The locked plan's root, the plan root, the (first) question answered. */
 	blockId: string | null;
-	pageId: string | null;
 	/** The session that made the decision. */
 	narratorId: string | null;
 	/** A confirmation's pending change. */
@@ -82,21 +81,35 @@ export interface OutlineDigestDelegatedStored extends StoredBase {
 	questions?: number;
 }
 
-/** New or rewritten facts of one page. */
+/**
+ * New or rewritten facts in one subtree (pageless outline, A3): the facts whose topmost changed
+ * ancestor among them sits directly under `root`, or, at the space's top level, is `root`. A fact
+ * under another changed fact is counted with it, so a new section and what was written in it are
+ * one item; facts changed under different blocks are different items.
+ */
 export interface OutlineDigestKnowledgeStored extends StoredBase {
-	pageId: string;
+	/** The block whose subtree holds the changed facts. */
+	root: string;
 	created: number;
 	changed: number;
 	/** At most three of the topmost blocks changed (the prototype's rule). */
 	blocks: Array<{ id: string; seq: number; created: boolean }>;
 }
 
+/**
+ * A knowledge item as reports made before A3 stored it: grouped by the top-level block the facts
+ * were on (`pageId`) instead of `root`. Read as that block's subtree; X2's conversion drops these
+ * reports (their windows lie before the history floor).
+ */
+export type OutlineDigestKnowledgeStoredV1 = Omit<OutlineDigestKnowledgeStored, "root"> & {
+	pageId: string;
+};
+
 export type OutlineDigestTaskEvent = "done" | "cancelled" | "reopened" | "assigned";
 
 export interface OutlineDigestTaskStored extends StoredBase {
 	event: OutlineDigestTaskEvent;
 	blockId: string;
-	pageId: string;
 	/** Who wrote the change (the commit's actor). */
 	by: OutlineDigestActor;
 	/** Who was doing it: the claim's holder, or its last one. */
@@ -116,7 +129,6 @@ export type OutlineDigestPlanEvent = "planning" | "returned" | "approved_draft" 
 export interface OutlineDigestPlanStored extends StoredBase {
 	event: OutlineDigestPlanEvent;
 	blockId: string;
-	pageId: string;
 	round: number;
 	/** The session planning it. */
 	narratorId: string | null;
@@ -128,7 +140,6 @@ export type OutlineDigestQuestionEvent = "asked" | "answered" | "withdrawn";
 export interface OutlineDigestQuestionStored extends StoredBase {
 	event: OutlineDigestQuestionEvent;
 	blockId: string;
-	pageId: string;
 	/** The person asked. */
 	to: string | null;
 	/** Who answered (`answered`). */
@@ -161,7 +172,6 @@ export interface OutlineDigestOtherStored extends StoredBase {
 	blocks: number;
 	/** The task a delegation handed over, or a report was written under. */
 	blockId?: string | null;
-	pageId?: string | null;
 }
 
 /** A space of a report: its range and what is counted but not listed. */
@@ -192,13 +202,17 @@ export interface OutlineDigestSpaceStored {
 }
 
 export interface OutlineDigestStored {
-	v: 1;
+	/**
+	 * 2: made by blocks (A3). 1: made while the outline had pages; its knowledge items may be
+	 * {@link OutlineDigestKnowledgeStoredV1}.
+	 */
+	v: 1 | 2;
 	/** Spaces with changes, busiest first (at most 50). */
 	spaces: OutlineDigestSpaceStored[];
 	/** Spaces with changes past that. */
 	moreSpaces: number;
 	delegated: OutlineDigestDelegatedStored[];
-	knowledge: OutlineDigestKnowledgeStored[];
+	knowledge: Array<OutlineDigestKnowledgeStored | OutlineDigestKnowledgeStoredV1>;
 	tasks: OutlineDigestTaskStored[];
 	plans: OutlineDigestPlanStored[];
 	questions: OutlineDigestQuestionStored[];
@@ -243,10 +257,9 @@ export interface OutlineDigestLink {
 	spaceKey: string;
 	/** The block (focus it: `/outline/<spaceId>/<blockId>`). */
 	blockId: string | null;
-	pageId: string | null;
 	/** `key/sid` of the block. */
 	address: string | null;
-	/** The commit: `/outline/ref?space=<spaceKey>&commit=<seq>` shows the page as of it. */
+	/** The commit: `/outline/ref?space=<spaceKey>&commit=<seq>` shows what it changed, as of it. */
 	seq: number | null;
 	commitId: string | null;
 	/** The session, when the reader may read it. */
@@ -281,7 +294,15 @@ export interface OutlineDigestDelegatedView extends ViewBase {
 	canUndo: boolean;
 }
 
+/** New or rewritten facts in the subtree of one block (`link.blockId`, `title`). */
 export interface OutlineDigestKnowledgeView extends ViewBase {
+	/**
+	 * The titles of the block's ancestors now, top first (empty at the top level, or for a block
+	 * deleted since). With `pathCut`, ancestors between the first and the last ones shown were
+	 * left out (a deep block).
+	 */
+	path: string[];
+	pathCut: boolean;
 	created: number;
 	changed: number;
 	blocks: Array<{ link: OutlineDigestLink; title: string; deleted: boolean; created: boolean }>;
