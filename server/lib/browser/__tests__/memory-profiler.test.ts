@@ -250,12 +250,7 @@ describe("memory profile supervisor", () => {
 	test("same-session and global admission remain exclusive until cleanup is done", async () => {
 		const worker = new FakeWorker();
 		worker.ack = false;
-		// This asserts admission ordering, not how fast cleanup runs. A 40ms cleanup
-		// window made the wait race the supervisor's completion budget: on a loaded CI
-		// runner the fixture's file writes overran it and the profile failed with
-		// "timeout" instead of reaching the state the assertions describe. Keep the
-		// window wide enough that the ordering — not the clock — decides the outcome.
-		const f = await fixture({ worker, cleanupMs: 1_000 });
+		const f = await fixture({ worker, cleanupMs: 40 });
 		const other = await fixture();
 		try {
 			const view = await f.api.startMemoryProfile(f.session);

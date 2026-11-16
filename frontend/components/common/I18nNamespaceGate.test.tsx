@@ -138,12 +138,6 @@ test("pending hides children and StrictMode shares one resource load until resol
 test("rejected resources reach the existing error boundary", async () => {
 	const loading = deferred<ResourceModule>();
 	setLoader("en", "errors", loading);
-	// Observe the rejection from the loader side as well. The gate consumes it on a
-	// later React pass, and between `reject` and that pass the runtime can report the
-	// rejection as unhandled — which fails the run before the assertions below ever
-	// execute. Attaching a handler only marks it observed: the gate still receives the
-	// original rejection and must still reach its error boundary.
-	void loading.promise.catch(() => {});
 	render(["errors"]);
 	await waitFor(() => !!container.querySelector("[data-pending]"));
 	loading.reject(new Error("locale request failed"));
