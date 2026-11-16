@@ -155,6 +155,11 @@ export interface OutlineSurfaceProps {
 	 * page, whose history is the browser's.
 	 */
 	history?: OutlineSurfaceHistory;
+	/**
+	 * Start in read mode (the forest) instead of the editor. L6 makes this the rule; until then
+	 * a host may ask for it.
+	 */
+	startReading?: boolean;
 }
 
 /** A host's navigation history, for hosts without a URL (dock panels). */
@@ -214,6 +219,7 @@ function SurfaceBody({
 	onMissing,
 	actions,
 	history,
+	startReading,
 }: OutlineSurfaceProps) {
 	const { t, i18n } = useTranslation("outline");
 	const mode: OutlineViewMode = viewMode ?? "facts";
@@ -223,7 +229,7 @@ function SurfaceBody({
 	const [fallback, setFallback] = useState<OutlineLiveUnavailable | null>(null);
 	const [hiddenLive, setHiddenLive] = useState(0);
 	// Reading (the forest) or editing (the live editor): the reader's choice on this surface.
-	const [reading, setReading] = useState(!START_EDITING);
+	const [reading, setReading] = useState(startReading ?? !START_EDITING);
 	const editing = onScreen && asOf === undefined && fallback === null && !reading;
 	// What the forest's view left out (tasks and questions, in the facts view).
 	const [forest, setForest] = useState<SpaceForest | null>(null);

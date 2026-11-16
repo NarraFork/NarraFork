@@ -66,12 +66,12 @@ describe("a search as a tree", () => {
 		);
 		expect(rows).toEqual([
 			"0 space space:S1",
-			"1 page pg",
+			"1 block pg",
 			"2 block t1 *",
 			"3 block b1 *",
 			"3 block b2 *",
 			"0 space space:S2",
-			"1 page pg2 *",
+			"1 block pg2 *",
 		]);
 		expect(tree[0]?.space?.kind).toBe("project");
 		// An ancestor that is a hit too takes the hit's title.

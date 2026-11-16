@@ -770,6 +770,13 @@ export class SpaceForest {
 			whole.deep = true;
 			if (!row.open) whole.closed = true;
 			if (own || this.collapsed.has(row.id)) whole.own = true;
+			// An open row whose level waits for the reader (the budget) is closed to the controls:
+			// "everything inside" reads it.
+			const next = rows[i + 1];
+			if (row.open && next?.kind === "more" && next.mode === "load" && next.parentKey === row.id) {
+				for (const up of above) up.closed = true;
+				whole.closed = true;
+			}
 			if (row.open) above.push({ row, deep: false, closed: false, own: false });
 			else if (row.previewId && this.blocks.get(row.previewId)?.hasChildren) row.subtree = "expand";
 		}
@@ -869,6 +876,8 @@ export class SpaceForest {
 
 	private async pumpOnce(): Promise<void> {
 		const { rows } = this.getView();
+		// (A wish made while this round waits for a read is the next round's.)
+		const wished = [...this.wishes.keys()];
 		// "Everything inside": open what has loaded under the wished rows.
 		if (this.applyWishes()) {
 			this.changed();
@@ -902,7 +911,17 @@ export class SpaceForest {
 				start.push(id);
 		}
 		if (start.length > 0) {
-			await this.readFromStart([...new Set(start)].slice(0, FOREST_LIMITS.parents), false);
+			// As many parents as one read can bring a whole chunk of each.
+			await this.readFromStart(
+				[...new Set(start)].slice(
+					0,
+					Math.min(
+						FOREST_LIMITS.parents,
+						Math.floor(FOREST_LIMITS.readBlocks / FOREST_LIMITS.chunk),
+					),
+				),
+				false,
+			);
 			this.changed();
 			return;
 		}
@@ -933,7 +952,7 @@ export class SpaceForest {
 		}
 		// Nothing left to read: what was asked to open whole has opened as far as it goes.
 		this.settleQuestion();
-		this.wishes.clear();
+		for (const root of wished) this.wishes.delete(root);
 		this.sweep();
 	}
 
@@ -1133,7 +1152,17 @@ export class SpaceForest {
 			for (const id of this.loadedUnder(root)) {
 				const at = this.info.get(id);
 				const block = this.blocks.get(id);
-				if (!at || !block?.hasChildren || at.open) continue;
+				if (!at || !block?.hasChildren) continue;
+				if (at.open) {
+					// Open, its level waiting for the reader (the budget): asked for now.
+					const level = this.levels.get(id);
+					if ((!level || level.preview) && !this.asked.has(id) && room > 0) {
+						this.asked.add(id);
+						room--;
+						changed = true;
+					}
+					continue;
+				}
 				if (room <= 0) {
 					closedLeft = true;
 					break;

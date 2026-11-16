@@ -133,7 +133,13 @@ export function useWindowedRows(
 	}, [update]);
 	// Rows changed, or were measured: the window may hold other rows now.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: recomputed with the prefix sums
-	useLayoutEffect(update, [offsets, update]);
+	useLayoutEffect(() => {
+		update();
+		// Once more after the browser has laid the new rows out (a list that got shorter moves
+		// the scroll position without a scroll event reaching us first).
+		const frame = requestAnimationFrame(update);
+		return () => cancelAnimationFrame(frame);
+	}, [offsets, update]);
 
 	const pending = useRef(0);
 	const observer = useMemo(() => {

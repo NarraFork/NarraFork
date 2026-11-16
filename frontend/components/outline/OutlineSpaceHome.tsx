@@ -26,7 +26,8 @@ import { ApiError } from "../../lib/api";
 import { OutlineForest } from "./forest/OutlineForest";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
-import { OutlineLink } from "./outline-nav";
+import { OutlineLink, outlineBlockTarget, useOutlineNavigate } from "./outline-nav";
+import { ForestSwitcher } from "./QuickSwitcher";
 import { OutlineSearchTree } from "./tree/OutlineSearchTree";
 import type { TreeLocateTarget } from "./tree/tree-locate";
 
@@ -49,6 +50,7 @@ export function OutlineSpaceHome({
 }) {
 	const { t } = useTranslation("outline");
 	const spaceName = useOutlineSpaceName();
+	const navigate = useOutlineNavigate();
 	const space = useOutlineSpace(spaceId);
 	const [query, setQuery] = useState("");
 	const [debounced] = useDebouncedValue(query, 250);
@@ -78,69 +80,77 @@ export function OutlineSpaceHome({
 	}
 
 	return (
-		<Stack gap="md" data-testid="outline-space-home">
-			<Breadcrumbs separatorMargin={4}>
-				<Anchor size="sm" renderRoot={(props) => <OutlineLink {...props} to={{ kind: "home" }} />}>
-					{t("title")}
-				</Anchor>
-				{detail.parent && (
+		<ForestSwitcher
+			spaceId={spaceId}
+			onPick={(hit) => navigate(outlineBlockTarget(hit.spaceId, hit.blockId))}
+		>
+			<Stack gap="md" data-testid="outline-space-home">
+				<Breadcrumbs separatorMargin={4}>
 					<Anchor
 						size="sm"
-						data-testid="outline-crumb-project"
-						renderRoot={(props) => (
-							<OutlineLink
-								{...props}
-								to={{ kind: "space", spaceId: detail.parent?.spaceId ?? detail.id }}
-							/>
-						)}
+						renderRoot={(props) => <OutlineLink {...props} to={{ kind: "home" }} />}
 					>
-						{detail.parent.label ?? t("space.projectUnnamed")}
+						{t("title")}
 					</Anchor>
-				)}
-				<Text size="sm" fw={500} className={classes.crumb}>
-					{name}
-				</Text>
-			</Breadcrumbs>
-			<Group justify="space-between" wrap="wrap" gap="xs">
-				<Title order={3} className={classes.rootTitle}>
-					{name}
-				</Title>
-				<Group gap={6}>
-					<Badge variant="light" color="gray" tt="none">
-						{t(`space.kind.${detail.kind}`)}
-					</Badge>
-					{!detail.canWrite && (
-						<Badge variant="light" color="gray" tt="none">
-							{t("space.readOnly")}
-						</Badge>
+					{detail.parent && (
+						<Anchor
+							size="sm"
+							data-testid="outline-crumb-project"
+							renderRoot={(props) => (
+								<OutlineLink
+									{...props}
+									to={{ kind: "space", spaceId: detail.parent?.spaceId ?? detail.id }}
+								/>
+							)}
+						>
+							{detail.parent.label ?? t("space.projectUnnamed")}
+						</Anchor>
 					)}
-					{actions}
+					<Text size="sm" fw={500} className={classes.crumb}>
+						{name}
+					</Text>
+				</Breadcrumbs>
+				<Group justify="space-between" wrap="wrap" gap="xs">
+					<Title order={3} className={classes.rootTitle}>
+						{name}
+					</Title>
+					<Group gap={6}>
+						<Badge variant="light" color="gray" tt="none">
+							{t(`space.kind.${detail.kind}`)}
+						</Badge>
+						{!detail.canWrite && (
+							<Badge variant="light" color="gray" tt="none">
+								{t("space.readOnly")}
+							</Badge>
+						)}
+						{actions}
+					</Group>
 				</Group>
-			</Group>
 
-			<TextInput
-				leftSection={<IconSearch size={16} />}
-				placeholder={t("space.searchPlaceholder")}
-				aria-label={t("space.searchPlaceholder")}
-				value={query}
-				onChange={(event) => setQuery(event.currentTarget.value)}
-				onKeyDown={(event) => {
-					if (event.key === "Escape" && query !== "") setQuery("");
-				}}
-				data-testid="outline-search-input"
-			/>
-			{/* The search drawn as a tree, in the tree's place; a match is then shown in the tree. */}
-			{searching && (
-				<OutlineSearchTree
-					query={debounced}
-					spaceId={spaceId}
-					onLocate={(target) => {
-						setQuery("");
-						setLocate(target);
+				<TextInput
+					leftSection={<IconSearch size={16} />}
+					placeholder={t("space.searchPlaceholder")}
+					aria-label={t("space.searchPlaceholder")}
+					value={query}
+					onChange={(event) => setQuery(event.currentTarget.value)}
+					onKeyDown={(event) => {
+						if (event.key === "Escape" && query !== "") setQuery("");
 					}}
+					data-testid="outline-search-input"
 				/>
-			)}
-			{root && <OutlineForest root={root} host={host} locate={locate} hidden={searching} />}
-		</Stack>
+				{/* The search drawn as a tree, in the tree's place; a match is then shown in the tree. */}
+				{searching && (
+					<OutlineSearchTree
+						query={debounced}
+						spaceId={spaceId}
+						onLocate={(target) => {
+							setQuery("");
+							setLocate(target);
+						}}
+					/>
+				)}
+				{root && <OutlineForest root={root} host={host} locate={locate} hidden={searching} />}
+			</Stack>
+		</ForestSwitcher>
 	);
 }

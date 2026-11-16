@@ -667,7 +667,13 @@ export function ForestBlocks(props: ForestBlocksProps) {
 	);
 	const onQuestions = useCallback((id: string) => forest?.openQuestions(id), [forest]);
 	const onMore = useCallback(
-		(parentKey: string, mode: ForestMoreRow["mode"]) => void forest?.more(parentKey, mode),
+		(parentKey: string, mode: ForestMoreRow["mode"]) => {
+			if (!forest) return;
+			void forest.more(parentKey, mode).then(() => {
+				// Another window of a paged level: the reader is taken to where it starts.
+				if (mode === "next" || mode === "prev") setJump({ parentKey });
+			});
+		},
 		[forest],
 	);
 
@@ -709,6 +715,13 @@ export function ForestBlocks(props: ForestBlocksProps) {
 		};
 	}, [locateNonce, status, forest]);
 	const { scrollToIndex } = win;
+	const [jump, setJump] = useState<{ parentKey: string } | null>(null);
+	useLayoutEffect(() => {
+		if (!jump || !forest) return;
+		setJump(null);
+		const at = forest.getView().indexOf.get(jump.parentKey);
+		scrollToIndex(at === undefined ? 0 : at + 1);
+	}, [jump, forest, scrollToIndex]);
 	useLayoutEffect(() => {
 		const id = scrollTo.current;
 		if (!id || !forest) return;

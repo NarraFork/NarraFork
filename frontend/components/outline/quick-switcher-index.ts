@@ -1,8 +1,8 @@
 /**
  * The quick switcher's results (design §6.10, D35): the current space first, from a local index
  * of what this tab already holds (the live page's blocks: instant, no request), then the server's
- * full-text search (PR7's `/api/outline/search`), the current space's other pages before the other
- * readable spaces. Recently focused blocks rank first.
+ * full-text search (PR7's `/api/outline/search`), the rest of the current space before the other
+ * readable spaces, top-level blocks first. Recently focused blocks rank first.
  *
  * The local index matches titles (a block's first line, plain) and bodies (the whole text) as
  * substrings, case-insensitively; aliases are not in the live page (they are a block's column, not
@@ -220,13 +220,16 @@ export function serverHit(hit: OutlineSearchHitView, query: string): SwitcherHit
 }
 
 /**
- * Local hits first, then the server's hits of the current space, then of the other spaces;
- * each block once (a local hit wins over the same block from the server).
+ * Local hits first, then the server's hits of the current space, then of the other spaces
+ * (`spaceId` null: no current space, every hit is "other"); each block once (a local hit wins
+ * over the same block from the server). Among the server's hits of a group, TOP-LEVEL blocks
+ * come first (nothing above them: what a reader most often jumps to), the server's order kept
+ * within each half.
  */
 export function mergeSwitcherHits(
 	local: readonly SwitcherHit[],
 	server: readonly SwitcherHit[],
-	spaceId: string,
+	spaceId: string | null,
 	limit = SWITCHER_LIMIT,
 ): SwitcherHit[] {
 	const out: SwitcherHit[] = [];
@@ -237,7 +240,12 @@ export function mergeSwitcherHits(
 		out.push(h);
 	};
 	for (const h of local) add(h);
-	for (const h of server) if (h.spaceId === spaceId) add(h);
-	for (const h of server) if (h.spaceId !== spaceId) add(h);
+	for (const here of [true, false]) {
+		for (const top of [true, false]) {
+			for (const h of server) {
+				if ((h.spaceId === spaceId) === here && (h.path.length === 0) === top) add(h);
+			}
+		}
+	}
 	return out;
 }
