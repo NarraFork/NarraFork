@@ -524,7 +524,7 @@ describe("real schema parity", () => {
 	});
 
 	test("covers 146 tables and 1927 columns including the outline's placement edges", () => {
-		expect(target.tables.length).toBe(146);
+		expect(target.tables.length).toBe(147);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -571,7 +571,8 @@ describe("real schema parity", () => {
 		// outline_spec_loss_scans (6).
 		// The pageless outline's history (H1) adds outline_block_edges (5), outline_subtree_changes
 		// (2), outline_spaces.history_floor_seq and outline_spaces.edges_ready.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1927);
+		// A reader's own folding by block (pageless F1) adds outline_fold_state (5).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1932);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({
