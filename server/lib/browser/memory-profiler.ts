@@ -81,6 +81,18 @@ interface ProfilePhaseBudgets {
 	replyGraceMs: number;
 	mainCleanupMs: number;
 }
+/**
+ * How much earlier than the response deadline a bounded cleanup step gives up.
+ *
+ * `bounded()` stops waiting for a step at `cleanupDeadline - grace`, while the
+ * response timer that reports `timeout` fires at `cleanupDeadline`. A 10ms gap
+ * made those two race: the steps that run after the giving-up point — worker
+ * close, and the recursive removal of the profile directory — only got those 10ms
+ * before the deadline was declared blown, so a runner under load reported a hard
+ * timeout for cleanup that was about to finish. The wider grace keeps the failure
+ * verdict strictly after the work it is judging.
+ */
+const CLEANUP_RESPONSE_GRACE_MS = 100;
 const profilePhaseBudgets = new WeakMap<MemoryProfileHandle, ProfilePhaseBudgets>();
 function terminalReplyBudget(budgets: ProfilePhaseBudgets): number {
 	return budgets.workerFinalizeMs + budgets.workerCleanupMs + budgets.replyGraceMs;
@@ -385,7 +397,10 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 						.then(action)
 						.catch(() => {}),
 					new Promise<void>((resolve) => {
-						timer = setTimeout(resolve, Math.max(1, cleanupDeadline - Date.now() - 10));
+						timer = setTimeout(
+							resolve,
+							Math.max(1, cleanupDeadline - Date.now() - CLEANUP_RESPONSE_GRACE_MS),
+						);
 					}),
 				]);
 			} finally {
