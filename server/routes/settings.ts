@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
+	noProxyRulesSchema,
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -325,6 +326,26 @@ const externalWebSocketOriginSchema = z
 	}, "Origin must be an exact HTTP(S) origin without a path");
 
 /**
+ * Merge a validated `proxy` patch into the stored policy.
+ *
+ * `settings.proxy` is replaced wholesale on PATCH (so switching mode drops a stale
+ * custom URL). The no_proxy rule list is independent of the mode and shared by
+ * every proxied channel, so a patch that omits it keeps the stored rules — only an
+ * explicit array (including `[]`) replaces them. Exported for tests because that
+ * asymmetry is easy to regress and expensive to notice in production.
+ */
+export function mergeProxySettingsPatch(
+	current: NarraForkSettings["proxy"],
+	patch: NonNullable<NarraForkSettings["proxy"]>,
+): NonNullable<NarraForkSettings["proxy"]> {
+	const next = { ...patch };
+	if (next.noProxyRules === undefined && current?.noProxyRules !== undefined) {
+		next.noProxyRules = current.noProxyRules;
+	}
+	return next;
+}
+
+/**
  * Instance-wide settings that only admins may change (enforced by `requireAdmin`
  * on the PATCH route). Per-user preferences live in `/api/user-preferences`, so
  * every field here is shared state. `auth.jwtSecret` stays excluded regardless.
@@ -361,6 +382,11 @@ export const updateSettingsSchema = z
 			.object({
 				mode: z.enum(["system", "direct", "custom"]),
 				url: webFetchProxyUrlSchema,
+				/**
+				 * Targets that bypass the proxy. Omitted = keep the stored list
+				 * (see the merge in the PATCH handler); `[]` clears it.
+				 */
+				noProxyRules: noProxyRulesSchema,
 			})
 			.superRefine((value, ctx) => {
 				if (value.mode === "custom" && !value.url) {
@@ -1802,9 +1828,11 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			} else if (key === "speech") {
 				merged.speech = mergeSpeechSettingsPatch(current.speech, val);
 			} else if (key === "proxy") {
-				// Replace entirely so switching modes drops the stale custom url.
+				// Replace entirely so switching modes drops the stale custom url; the
+				// shared no_proxy list survives a patch that does not mention it.
+				const proxyPatch = val as NonNullable<NarraForkSettings["proxy"]>;
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				(merged as any).proxy = val;
+				(merged as any).proxy = mergeProxySettingsPatch(current.proxy, proxyPatch);
 			} else if (key === "vnet" && val && typeof val === "object" && !Array.isArray(val)) {
 				const vnetPatch = val as NonNullable<NarraForkSettings["vnet"]>;
 				merged.vnet = {
