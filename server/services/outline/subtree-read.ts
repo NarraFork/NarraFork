@@ -832,3 +832,59 @@ export async function readOutlineSubtreeNodes(
 		};
 	});
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A live subtree's structure
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A block's live subtree as a tree in memory, content not loaded. */
+export interface OutlineLiveSubtree {
+	root: OutlineNode;
+	/** Every block read, the root included, by id. */
+	nodes: Map<string, OutlineNode>;
+	/** The subtree holds more blocks than were read (breadth first: the deepest are missing). */
+	truncated: boolean;
+	/** What `loadBodies` needs to load content for these nodes. */
+	state: { current: true; seq: number };
+}
+
+/**
+ * The structure of the live subtree of a block (no content), breadth first, at most `limit`
+ * blocks under the root (capped at {@link OUTLINE_SUBTREE_LIMITS.maxBlocks}): for readers that
+ * spend their own budget on content (a behavior boundary shown fairly, a fork's copy). One
+ * primary-key read and the level reads of `listSubtreeAt`. Null when the block is not a live
+ * block of the space.
+ */
+export async function readLiveSubtree(
+	spaceId: string,
+	rootId: string,
+	options: { limit: number; store?: OutlineStore },
+): Promise<OutlineLiveSubtree | null> {
+	const store = options.store ?? outlineStore;
+	const meta = (await store.getBlockMetasByIds([rootId]))[0];
+	if (!meta || meta.deleted || meta.spaceId !== spaceId) return null;
+	const limit = clamp(
+		options.limit,
+		OUTLINE_SUBTREE_LIMITS.maxBlocks,
+		OUTLINE_SUBTREE_LIMITS.maxBlocks,
+	);
+	const { rows, truncated } = await store.listSubtreeAt(spaceId, rootId, { asOf: null, limit });
+	const nodes = buildTree([
+		{
+			id: meta.id,
+			sid: meta.sid,
+			// The root of this tree, wherever it sits in the space.
+			parentId: null,
+			orderKey: meta.orderKey,
+			alias: meta.alias,
+			taskJson: meta.taskJson,
+			askJson: meta.askJson,
+			versionSeq: meta.versionSeq,
+		},
+		...rows,
+	]);
+	const root = nodes.get(rootId);
+	if (!root) return null;
+	const space = await store.getSpace(spaceId);
+	return { root, nodes, truncated, state: { current: true, seq: (space?.nextSeq ?? 1) - 1 } };
+}

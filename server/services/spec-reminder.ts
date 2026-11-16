@@ -129,8 +129,8 @@ async function behaviorPageWhileSwitchedOff(narratorId: string): Promise<string 
 	try {
 		const { readTaskSession } = await import("./task-source/backend");
 		if ((await readTaskSession(narratorId))?.backend !== "outline") return null;
-		const { behaviorPageForSpecFence } = await import("./task-source/outline-views");
-		return await behaviorPageForSpecFence(narratorId);
+		const { behaviorBoundaryForSpecFence } = await import("./task-source/outline-views");
+		return await behaviorBoundaryForSpecFence(narratorId);
 	} catch {
 		return null;
 	}

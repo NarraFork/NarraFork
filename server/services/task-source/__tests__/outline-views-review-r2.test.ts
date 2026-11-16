@@ -46,9 +46,9 @@ import { buildBehaviorFenceBody } from "../../spec-reminder";
 import { readSpecFile, writeSpecFile } from "../../spec-vfs-service";
 import { taskSourceForNarrator } from "../index";
 import {
-	copyOutlineBehaviorPage,
+	copyOutlineBehaviorBoundary,
 	cutToBlocks,
-	findBehaviorPage,
+	findBehaviorBlock,
 	importLeftover,
 	importOutlineBehaviorFence,
 	OUTLINE_BEHAVIOR_LIMITS,
@@ -129,7 +129,7 @@ const part = (list: ContextPart[], key: string) =>
 /** Contents of the live children of the session's behavior page, in order. */
 async function pageChildren(narratorId: string): Promise<string[]> {
 	const space = await ensureSessionSpace(narratorId);
-	const page = await findBehaviorPage(space.id);
+	const page = await findBehaviorBlock(space.id);
 	if (!page) return [];
 	return (await outlineStore.listChildren(space.id, page.id, 1000)).map((b) => b.content);
 }
@@ -245,7 +245,7 @@ describe("N-R2-2: a person deletes a block a partial import wrote (probe R2-2)",
 		failOnCall(2);
 		expect(await importOutlineBehaviorFence(id, "en")).toBe("failed");
 		const space = await ensureSessionSpace(id);
-		const page = await findBehaviorPage(space.id);
+		const page = await findBehaviorBlock(space.id);
 		const [group] = await outlineStore.listChildMetas(space.id, [page?.id as string], 10);
 		await writeOutline({
 			spaceId: space.id,
@@ -496,14 +496,14 @@ describe("N-R2-9: the page in the spec fence with the outline off, and the fork 
 			expect(text).toContain("Rule 300:");
 			expect(text).not.toContain("OutlineRead");
 			if (language === "en") {
-				expect(text.startsWith(`From this session's behavior page \`${address}\`:`)).toBe(true);
+				expect(text.startsWith(`From this session's behavior boundary \`${address}\`:`)).toBe(true);
 				expect(text).toMatch(
-					/\n‹\d+ blocks of this page are shortened or left out here; the user can see the whole page in the outline›$/,
+					/\n‹\d+ blocks here are shortened or left out; the user can see all of them in the outline›$/,
 				);
 			} else {
-				expect(text.startsWith(`来自本会话的行为边界页 \`${address}\`：`)).toBe(true);
+				expect(text.startsWith(`来自本会话的行为边界 \`${address}\`：`)).toBe(true);
 				expect(text).toMatch(
-					/\n‹这一页有 \d+ 块在这里只显示了开头或没有列出；用户可以在大纲里看到整页›$/,
+					/\n‹这里有 \d+ 块只显示了开头或没有列出；用户可以在大纲里看到全部›$/,
 				);
 			}
 		}
@@ -516,7 +516,7 @@ describe("N-R2-9: the page in the spec fence with the outline off, and the fork 
 		const body = await buildBehaviorFenceBody(id);
 		settings.outline.enabled = true;
 		const text = body?.kind === "prose" ? body.text : "";
-		expect(text).toMatch(/^From this session's behavior page `[^`]+`:\n/);
+		expect(text).toMatch(/^From this session's behavior boundary `[^`]+`:\n/);
 		expect(text).toContain("Never force-push.");
 		expect(text).not.toContain("not all shown");
 	});
@@ -539,9 +539,9 @@ describe("N-R2-9: the page in the spec fence with the outline off, and the fork 
 		}
 		const [parentPage] = await outlineStore.getBlocks([pageId]);
 		const child = await session({ owner: await user("zh-CN") });
-		expect(await copyOutlineBehaviorPage(parent, child)).toBe(true);
+		expect(await copyOutlineBehaviorBoundary(parent, child)).toBe(true);
 		const kids = await pageChildren(child);
-		expect(kids[0]).toMatch(/^fork 时只复制了这一页 262 块中的 \d+ 块；其余的在行为边界页 `/);
+		expect(kids[0]).toMatch(/^fork 时只复制了行为边界 262 块中的 \d+ 块；其余的在 `/);
 		expect(kids[0]).toContain(`${space.key}/${parentPage?.sid}`);
 	});
 });

@@ -36,7 +36,11 @@
 import { createHash } from "node:crypto";
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
-import { getOutlineBehaviorPageTitle, getUserLanguage, type Locale } from "@server/lib/prompt-i18n";
+import {
+	getOutlineBehaviorBoundaryTitle,
+	getUserLanguage,
+	type Locale,
+} from "@server/lib/prompt-i18n";
 import { TEAM_SOP_PLUGIN_ID } from "../behavior-fence-sop";
 import { readNarrator } from "../outline/access-reads";
 import { DELEGATION_BLOCK_TEXT } from "../outline/delegation-text";
@@ -51,15 +55,17 @@ import {
 	resolvePluginTaskSession,
 	writeForPlugin,
 } from "../outline/plugin-tasks";
-import { loadBodiesWithin, readSubtree } from "../outline/read";
+import { loadBodiesWithin } from "../outline/read";
 import type { ReportBlock } from "../outline/report-text";
 import { outlineStore } from "../outline/store";
 import type { OutlineSpaceRow, OutlineStore } from "../outline/store/port";
+import { readLiveSubtree } from "../outline/subtree-read";
 import { type OutlineNode, subtreeNodes } from "../outline/tree";
+import { blocksUnder } from "../outline/well-known";
 import type { OutlineCanonicalContent, OutlineOp } from "../outline/write";
 import { writeSpecFile } from "../spec-vfs-service";
 import { readTaskSession } from "./backend";
-import { BEHAVIOR_FENCE_URI, findBehaviorPage, readOldBehaviorFence } from "./outline-behavior";
+import { BEHAVIOR_FENCE_URI, findBehaviorBlock, readOldBehaviorFence } from "./outline-behavior";
 
 export const OUTLINE_PLUGIN_RULES_LIMITS = {
 	/** Characters of a plugin's rules (the old command's limit). */
@@ -136,7 +142,7 @@ async function writeRulesBlock(
 			new Date().toISOString(),
 		));
 	const [block] = await store.getBlockMetas(space.id, { sids: [sid] });
-	const page = await findBehaviorPage(space.id, store);
+	const page = await findBehaviorBlock(space.id, store);
 	const ops: OutlineOp[] = [];
 	const canonical: Array<OutlineCanonicalContent | null> = [];
 	const push = (op: OutlineOp, content: OutlineCanonicalContent | null = null) => {
@@ -165,13 +171,16 @@ async function writeRulesBlock(
 				op: "insert",
 				tempId: "page",
 				parent: null,
-				content: getOutlineBehaviorPageTitle(session.locale),
+				content: getOutlineBehaviorBoundaryTitle(session.locale),
 				alias: OUTLINE_BEHAVIOR_ALIAS,
 			});
 		if (block && !block.deleted) {
-			// A person moved it off the page: back to the page, last.
-			if (!page || block.pageId !== page.id)
-				push({ op: "move", block: { id: block.id }, parent: pageRef });
+			// A person moved it out from under the boundary: back under it, last. Judged by
+			// ancestry: anywhere below the boundary block it still is a rule.
+			const inside =
+				page !== null &&
+				(await blocksUnder(space.id, page.id, [block.id], { store })).under.has(block.id);
+			if (!inside) push({ op: "move", block: { id: block.id }, parent: pageRef });
 			// The rules are replaced: what is under the block now goes, the new rules go in.
 			const children = await store.listChildMetas(
 				space.id,
@@ -241,8 +250,13 @@ async function holdsRules(
 	blockId: string,
 	blocks: readonly ReportBlock[],
 ): Promise<boolean> {
-	const read = await readSubtree(blockId, { store });
-	if (!read) return false;
+	const meta = (await store.getBlockMetasByIds([blockId]))[0];
+	if (!meta) return false;
+	const read = await readLiveSubtree(meta.spaceId, blockId, {
+		limit: OUTLINE_PLUGIN_RULES_LIMITS.children + 1,
+		store,
+	});
+	if (!read || read.truncated) return false;
 	const nodes = subtreeNodes(read.root).filter((node) => node !== read.root);
 	if (nodes.length > OUTLINE_PLUGIN_RULES_LIMITS.children) return false;
 	await loadBodiesWithin(read.state, nodes, 64 * 1024, { store });

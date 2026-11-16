@@ -49,12 +49,12 @@ export type {
 	SpecImportNoticePage,
 } from "./prompts/outline-tasks";
 export {
+	getOutlineBehaviorBoundaryTitle,
 	getOutlineBehaviorFenceTruncated,
 	getOutlineBehaviorForkCutNote,
-	getOutlineBehaviorPageTitle,
+	getOutlineBehaviorViewBoundary,
 	getOutlineBehaviorViewFence,
 	getOutlineBehaviorViewHeading,
-	getOutlineBehaviorViewPage,
 	getOutlineBehaviorViewSop,
 	getOutlineBehaviorViewTruncated,
 	getOutlineBoundedContinuationPrompt,

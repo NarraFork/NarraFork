@@ -88,7 +88,7 @@ import {
 } from "@shared/spec-content-loss";
 import { specIndexSid } from "../../plugin-spec-compat";
 import { isSpecImporting } from "../../task-source/backend";
-import { findBehaviorPage } from "../../task-source/outline-behavior";
+import { findBehaviorBlock } from "../../task-source/outline-behavior";
 import { processBackgroundText } from "../edit-text-runner";
 import type { ReportBlock } from "../report-text";
 import { outlineStore } from "../store";
@@ -285,7 +285,7 @@ async function pointerOf(ctx: AttachContext, path: string): Promise<SpecImportFi
  */
 async function pageOf(ctx: AttachContext, path: string): Promise<string | null> {
 	if (!ctx.space) return null;
-	if (path === SPEC_LOSS_FENCE_PATH) return (await findBehaviorPage(ctx.space.id))?.id ?? null;
+	if (path === SPEC_LOSS_FENCE_PATH) return (await findBehaviorBlock(ctx.space.id))?.id ?? null;
 	const pointer = await pointerOf(ctx, path);
 	if (!pointer?.revisionId) return null;
 	const sid =

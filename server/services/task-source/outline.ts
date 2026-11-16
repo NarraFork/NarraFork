@@ -75,12 +75,13 @@ import {
 	OutlineWriteError,
 } from "../outline/errors";
 import { OUTLINE_TEXT } from "../outline/messages";
-import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_CHANGE } from "../outline/model";
+import { OUTLINE_CHANGE } from "../outline/model";
 import { findCompletionsAwaitingConfirmation } from "../outline/pending";
 import { recordOutlineReads, seenOutlineVersion } from "../outline/read-ledger";
 import { resolveNarratorSpaces } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
 import { OutlineStaleWriteError } from "../outline/store/port";
+import { blocksUnder, findBehaviorBlock } from "../outline/well-known";
 import { writeOutline } from "../outline/write";
 import { readTaskSession } from "./backend";
 import {
@@ -449,11 +450,9 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			if (!newest.has(write.blockId)) newest.set(write.blockId, write.key);
 		const ids = [...newest.keys()].slice(0, OUTLINE_TASK_SOURCE_LIMITS.compactVersions);
 		if (ids.length === 0) return [];
-		// The behavior page holds the person's rules (in the new baseline anyway), not decisions.
-		const behavior = spaces?.session
-			? await outlineStore.findAliasOwners(spaces.session.id, [OUTLINE_BEHAVIOR_ALIAS])
-			: [];
-		const behaviorPages = new Set(behavior.map((owner) => owner.id));
+		// The behavior boundary holds the person's rules (in the new baseline anyway), not
+		// decisions: what is under it, by ancestry, is left out.
+		const behavior = spaces?.session ? await findBehaviorBlock(spaces.session.id) : null;
 		// Blocks are read a few at a time, newest first, until the budget is spent: only about what
 		// is shown is read.
 		const lines: string[] = [];
@@ -461,10 +460,18 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		reading: for (let i = 0; i < ids.length; i += OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk) {
 			const chunk = ids.slice(i, i + OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk);
 			const blocks = new Map((await outlineStore.getBlocks(chunk)).map((b) => [b.id, b]));
+			const rules = behavior
+				? await blocksUnder(
+						behavior.spaceId,
+						behavior.id,
+						chunk.filter((id) => blocks.get(id)?.spaceId === behavior.spaceId),
+					)
+				: null;
 			for (const id of chunk) {
 				const block = blocks.get(id);
 				if (!block || block.deleted || block.taskJson !== null) continue;
-				if (behaviorPages.has(block.pageId)) continue;
+				// A block whose place could not be told (its walk up was cut short) is not shown.
+				if (rules?.under.has(id) || rules?.unknown.has(id)) continue;
 				const title = blockTitle(block.content).replace(/\s+/g, " ").trim();
 				if (!title) continue;
 				const max = OUTLINE_TASK_SOURCE_LIMITS.compactNoteLine;

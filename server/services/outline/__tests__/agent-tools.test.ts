@@ -207,7 +207,7 @@ describe("OutlineEdit then OutlineRead", () => {
 		const c = ctx(w.session, w.alice);
 		const empty = await call(outlineReadTool, {}, c);
 		expect(empty.output).toContain(w.space.key);
-		expect(empty.output).toContain("no pages yet");
+		expect(empty.output).toContain("nothing here yet");
 
 		const added = await call(
 			outlineEditTool,
@@ -1697,7 +1697,7 @@ describe("OutlineEdit write rules", () => {
 			const fallback = await call(outlineEditTool, { edits: [{ add: "/", markdown: "- y" }] }, c);
 			expect(fallback.isError).toBeUndefined();
 			expect(fallback.output).toContain("this session's notes");
-			expect(fallback.output).toContain("new pages went to this session's notes");
+			expect(fallback.output).toContain("the new top-level blocks went to this session's notes");
 			const session = await call(
 				outlineEditTool,
 				{ edits: [{ add: "session/", markdown: "- z" }] },
@@ -1736,7 +1736,7 @@ describe("OutlineEdit write rules", () => {
 		expect(direct.output).toContain("may not write");
 		const fallback = await call(outlineEditTool, { edits: [{ add: "/", markdown: "- y" }] }, c);
 		expect(fallback.isError).toBeUndefined();
-		expect(fallback.output).toContain("new pages went to this session's notes");
+		expect(fallback.output).toContain("the new top-level blocks went to this session's notes");
 	});
 });
 
@@ -1785,7 +1785,7 @@ describe("through the tool executor", () => {
 
 		const overview = await run("OutlineRead", {}, "e2e-1");
 		expect(overview.isError).toBeFalsy();
-		expect(overview.output).toContain("no pages yet");
+		expect(overview.output).toContain("nothing here yet");
 
 		const added = await run(
 			"OutlineEdit",

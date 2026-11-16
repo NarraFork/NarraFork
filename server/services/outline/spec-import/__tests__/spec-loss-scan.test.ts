@@ -55,9 +55,12 @@ import { settings } from "../../../../lib/settings";
 import { forkSpecNamespace, writeSpecFile } from "../../../spec-vfs-service";
 import { invalidateTaskBackend } from "../../../task-source";
 import { beginSpecImport } from "../../../task-source/backend";
-import { copyOutlineBehaviorPage, findBehaviorPage } from "../../../task-source/outline-behavior";
 import {
-	behaviorPageForSpecFence,
+	copyOutlineBehaviorBoundary,
+	findBehaviorBlock,
+} from "../../../task-source/outline-behavior";
+import {
+	behaviorBoundaryForSpecFence,
 	outlineBehaviorView,
 	resetOutlineViewCache,
 } from "../../../task-source/outline-views";
@@ -980,7 +983,7 @@ describe("the behavior fence is never attached by a pass", () => {
 		expect(after).not.toContain("delete this block");
 		// A fork copies the block whole (its view leaves the header out the same way).
 		const fork = await makeSession({ owner, backend: "outline" });
-		expect(await copyOutlineBehaviorPage(id, fork.id)).toBe(true);
+		expect(await copyOutlineBehaviorBoundary(id, fork.id)).toBe(true);
 		const forkView = await behaviorView(fork.id);
 		expect(forkView).toContain("deploy freely");
 		expect(forkView).not.toContain("Possibly lost content");
@@ -1006,7 +1009,7 @@ describe("the behavior fence is never attached by a pass", () => {
 	test("an attach block nobody confirmed is in nothing that reads the behavior page as rules", async () => {
 		const { id, owner } = await fenceSession();
 		const spaceId = await spaceOf(id);
-		const page = await findBehaviorPage(spaceId);
+		const page = await findBehaviorBlock(spaceId);
 		if (!page) throw new Error("no behavior page");
 		const before = await behaviorView(id);
 		// As a build that attached to this page would have left it.
@@ -1043,7 +1046,7 @@ describe("the behavior fence is never attached by a pass", () => {
 		settings.outline.enabled = false;
 		invalidateTaskBackend();
 		try {
-			const fence = (await behaviorPageForSpecFence(id)) ?? "";
+			const fence = (await behaviorBoundaryForSpecFence(id)) ?? "";
 			expect(fence).toContain("never deploy on Fridays");
 			expect(fence).not.toContain("force-push");
 			expect(fence).not.toContain("Possibly lost content");
@@ -1053,7 +1056,7 @@ describe("the behavior fence is never attached by a pass", () => {
 		}
 		// A fork copies the page without it.
 		const child = await makeSession({ owner, backend: "outline" });
-		expect(await copyOutlineBehaviorPage(id, child.id)).toBe(true);
+		expect(await copyOutlineBehaviorBoundary(id, child.id)).toBe(true);
 		const copied = (await pages(child.id)).flatMap((p) => [p.title, ...p.blocks]).join("\n");
 		expect(copied).toContain("never deploy on Fridays");
 		expect(copied).toContain("keep commits small");

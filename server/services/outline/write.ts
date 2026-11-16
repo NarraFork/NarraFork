@@ -551,13 +551,14 @@ export interface OutlineWriteOptions {
 		delivered?: boolean;
 	};
 	/**
-	 * An agent's commit in a session space that writes the session's behavior page (the page
-	 * holding alias {@link OUTLINE_BEHAVIOR_ALIAS}): creating it, writing, moving or deleting
-	 * anything on it, moving blocks onto or off it, or giving or taking the alias. Such a commit
-	 * goes through only when this returns true, and is refused with
-	 * `OUTLINE_BEHAVIOR_PAGE_READONLY` otherwise (or when it is absent). It is called at most once
-	 * per write, and only for a commit that does write the page: the caller consumes the user
-	 * turn's one-shot grant in it. People and system writes are never asked.
+	 * An agent's commit in a session space that writes the session's behavior boundary (the
+	 * top-level block holding alias {@link OUTLINE_BEHAVIOR_ALIAS}, and what is under it by
+	 * ancestry): creating it, writing, moving or deleting anything under it, moving blocks under
+	 * it or out from under it, or giving or taking the alias. Such a commit goes through only when
+	 * this returns true, and is refused with `OUTLINE_BEHAVIOR_PAGE_READONLY` otherwise (or when it
+	 * is absent). It is called at most once per write, and only for a commit that does write the
+	 * boundary: the caller consumes the user turn's one-shot grant in it. People and system writes
+	 * are never asked.
 	 */
 	agentBehaviorGrant?: () => boolean;
 	/**
@@ -1202,6 +1203,9 @@ type OpTouch =
  */
 export const OUTLINE_LOCK_SCAN = { perPage: 1000 };
 
+/** Blocks one walk up reads when a commit is checked against the behavior boundary. */
+export const OUTLINE_BEHAVIOR_WALK_ROWS = 4000;
+
 /** Options of a planning pass beyond the transaction itself. */
 interface PlannerExtra {
 	/** Operations held for confirmation by an earlier pass: skipped. */
@@ -1209,7 +1213,7 @@ interface PlannerExtra {
 	/** Ids for inserts that name none, by operation index: the same in every pass. */
 	assignedIds?: readonly string[];
 	confirm?: OutlineWriteOptions["confirm"];
-	/** Asked when an agent's commit writes the session's behavior page; see `agentBehaviorGrant`. */
+	/** Asked when an agent's commit writes the session's behavior boundary; see `agentBehaviorGrant`. */
 	behaviorGrant?: () => boolean;
 	question?: OutlineWriteOptions["question"];
 	delegateClaim?: OutlineWriteOptions["delegateClaim"];
@@ -1320,7 +1324,7 @@ class OutlinePlanner {
 			}
 		}
 		// Before anything is held for confirmation: a refused change is never proposed.
-		this.checkTasksPage([...this.blocks.values()]);
+		this.checkTasksBlock([...this.blocks.values()]);
 		if (this.constrained) {
 			const hold = await this.classifyLocked();
 			if (hold) return { hold };
@@ -2684,35 +2688,42 @@ class OutlinePlanner {
 	// ── the commit ───────────────────────────────────────────────────────────
 
 	/**
-	 * An agent's commit in a session space may write the session's behavior page (the page holding
-	 * alias {@link OUTLINE_BEHAVIOR_ALIAS}, before or after this commit) only under the user turn's
-	 * one-shot grant (`OutlineWriteOptions.agentBehaviorGrant`). Every change counts: a block on
-	 * the page before or after (created, written, moved, deleted, restored, its task or tags), and
-	 * any block whose alias is or was `behavior` (creating or renaming the page). One small indexed
-	 * read (the alias owner) for an agent's commit in a session space; nothing for other writers.
+	 * An agent's commit in a session space may write the session's behavior boundary (the
+	 * top-level block holding alias {@link OUTLINE_BEHAVIOR_ALIAS}, before or after this commit,
+	 * and everything under it) only under the user turn's one-shot grant
+	 * (`OutlineWriteOptions.agentBehaviorGrant`). Every change counts: a block that is the
+	 * boundary or under it before or after (created, written, moved, deleted, restored, its task
+	 * or tags), and any block whose alias is or was `behavior` (creating or renaming it).
+	 *
+	 * "Under it" is ancestry, not a column: each changed block is walked up to the top of the
+	 * space as the tree was before the commit and as it is after. One small indexed read (the
+	 * alias owner) for an agent's commit in a session space, and, only when the space has a
+	 * boundary, one walk up for the blocks the commit touches (`listAncestryOf`: one recursive
+	 * statement per 500 blocks whatever the depth); nothing for other writers. A walk cut short
+	 * at its row limit counts as touching the boundary: never a write let through unseen.
 	 */
-	private async checkBehaviorPage(changed: readonly WorkingBlock[]): Promise<void> {
+	private async checkBehaviorBoundary(changed: readonly WorkingBlock[]): Promise<void> {
 		if (this.input.actor.kind !== "agent" || this.space.kind !== "session") return;
 		if (changed.length === 0) return;
-		const pages = new Set<string>();
+		const boundaries = new Set<string>();
 		const [owner] = await this.store.findAliasOwners(this.space.id, [OUTLINE_BEHAVIOR_ALIAS]);
 		if (owner) {
 			const before =
 				this.blocks.get(owner.id)?.base ??
 				(await this.store.getBlockMetas(this.space.id, { ids: [owner.id] }))[0];
-			if (before && !before.deleted && before.parentId === null) pages.add(before.id);
+			if (before && !before.deleted && before.parentId === null) boundaries.add(before.id);
 		}
 		for (const block of this.blocks.values()) {
 			if (!block.deleted && block.alias === OUTLINE_BEHAVIOR_ALIAS && block.parentId === null)
-				pages.add(block.id);
+				boundaries.add(block.id);
 		}
-		const touches = changed.some(
+		let touches = changed.some(
 			(block) =>
 				block.alias === OUTLINE_BEHAVIOR_ALIAS ||
 				block.base?.alias === OUTLINE_BEHAVIOR_ALIAS ||
-				pages.has(block.pageId) ||
-				(block.base !== null && pages.has(block.base.pageId)),
+				boundaries.has(block.id),
 		);
+		if (!touches && boundaries.size > 0) touches = await this.underAny(changed, boundaries);
 		if (!touches || this.behaviorGrant()) return;
 		throw new OutlineWriteError(
 			OUTLINE_TEXT.errors.behaviorReadonly,
@@ -2721,13 +2732,63 @@ class OutlinePlanner {
 	}
 
 	/**
-	 * An agent's commit in a session space may not give or take the task page's alias
-	 * ({@link OUTLINE_TASKS_PAGE_ALIAS}), nor move the page under another block or delete it; it
-	 * writes under the page freely (its steps under a goal). People and the system are never
+	 * Whether any of `changed` has one of `roots` among its ancestors, as the tree was before
+	 * this transaction or as it is after it. The stored tree is read by one walk up from the
+	 * changed blocks and from the stored parents the working copy points at; the working copy's
+	 * own parents lay the transaction over it. True as well when the walk was cut short.
+	 */
+	private async underAny(
+		changed: readonly WorkingBlock[],
+		roots: ReadonlySet<string>,
+	): Promise<boolean> {
+		const starts = new Set<string>();
+		for (const block of changed) if (block.base !== null) starts.add(block.id);
+		for (const block of this.blocks.values()) {
+			if (block.parentId !== null && !this.blocks.has(block.parentId)) starts.add(block.parentId);
+			const was = block.base?.parentId ?? null;
+			if (was !== null) starts.add(was);
+		}
+		const stored = new Map<string, string | null>();
+		if (starts.size > 0) {
+			const walk = await this.store.listAncestryOf(
+				this.space.id,
+				[...starts],
+				OUTLINE_BEHAVIOR_WALK_ROWS,
+			);
+			if (walk.truncated) return true;
+			for (const row of walk.rows) stored.set(row.id, row.parentId);
+		}
+		const reaches = (from: string | null, next: (id: string) => string | null): boolean => {
+			let id = from;
+			for (let depth = 0; id !== null && depth <= OUTLINE_LIMITS.maxDepth + 1; depth++) {
+				if (roots.has(id)) return true;
+				id = next(id);
+			}
+			return false;
+		};
+		const before = (id: string): string | null => {
+			const working = this.blocks.get(id);
+			return working?.base ? working.base.parentId : (stored.get(id) ?? null);
+		};
+		const after = (id: string): string | null => {
+			const working = this.blocks.get(id);
+			return working ? working.parentId : (stored.get(id) ?? null);
+		};
+		return changed.some(
+			(block) =>
+				reaches(block.parentId, after) ||
+				(block.base !== null && reaches(block.base.parentId, before)),
+		);
+	}
+
+	/**
+	 * An agent's commit in a session space may not give or take the task list's alias
+	 * ({@link OUTLINE_TASKS_PAGE_ALIAS}), nor move its block under another block or delete it; it
+	 * writes under it freely (its steps under a goal). People and the system are never
 	 * checked. No read: the working copy's blocks carry their alias and parent before and after
 	 * (a block the operations did not change has the same both).
 	 */
-	private checkTasksPage(changed: readonly WorkingBlock[]): void {
+	private checkTasksBlock(changed: readonly WorkingBlock[]): void {
 		if (this.input.actor.kind !== "agent" || this.space.kind !== "session") return;
 		const touches = changed.some((block) => {
 			const was =
@@ -2737,10 +2798,7 @@ class OutlinePlanner {
 			return was && block.parentId !== block.base?.parentId;
 		});
 		if (!touches) return;
-		throw new OutlineWriteError(
-			OUTLINE_TEXT.errors.tasksReserved,
-			"OUTLINE_TASKS_PAGE_RESERVED",
-		);
+		throw new OutlineWriteError(OUTLINE_TEXT.errors.tasksReserved, "OUTLINE_TASKS_PAGE_RESERVED");
 	}
 
 	private async assemble(): Promise<Planned | null> {
@@ -2757,7 +2815,7 @@ class OutlinePlanner {
 
 		const existing = all.filter((b) => b.base !== null);
 		const versioned = existing.filter((b) => b.tags !== undefined || this.baseFlags(b) !== 0);
-		await this.checkBehaviorPage([...created, ...versioned]);
+		await this.checkBehaviorBoundary([...created, ...versioned]);
 
 		// Open links of existing blocks whose links may change. Tombstoning a subtree closes all
 		// of its links, so that load is bounded by the row budget; the others by the per-block cap.

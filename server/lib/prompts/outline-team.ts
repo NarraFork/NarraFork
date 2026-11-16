@@ -142,7 +142,7 @@ export function outlineTeamLineText(line: OutlineTeamLine, locale: Locale): stri
 		const tree = outlineTeamLink(line.tree);
 		return zh ? `- ${tree} 下：${zhJoin(who, what)}` : `- Under ${tree}: ${who} ${what}`;
 	}
-	return zh ? `- 项目任务页：${zhJoin(who, what)}` : `- Project task page: ${who} ${what}`;
+	return zh ? `- 项目任务清单：${zhJoin(who, what)}` : `- Project task list: ${who} ${what}`;
 }
 
 /** The first line of the note. */
