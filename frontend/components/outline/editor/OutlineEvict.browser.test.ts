@@ -124,7 +124,7 @@ test("the focused block's document is dropped: caret, typing in flight, composit
 	await b.page.keyboard.type("Q");
 	await settle(b);
 	await input.commit("你好");
-	await until(b, (f, id) => f.viewText(id as never).includes("你好"), [b0]);
+	await until(b, (f, id) => (f.viewText(id as never) ?? "").includes("你好"), [b0]);
 	await converged(pageId, a, b);
 	expect(serverText(pageId, b0)).toBe(`Q${sText.slice(0, 5)}你好${sText.slice(5)}`);
 	expect(errorsOf(a)).toEqual([]);
