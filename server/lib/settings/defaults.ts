@@ -379,7 +379,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string",
 	},
 	"proxy.noProxyRules": {
-		desc: "始终跳过的直连目标列表（no_proxy 规则），对所有代理通道生效：AI 供应商、WebFetch、内置浏览器、IM 网关、Hook、更新下载与语音。每条规则含 match（wildcard 通配符 / regex 正则）、pattern 和 enabled。优先级：回环地址 → 正则规则（列表顺序）→ 通配符规则（列表顺序），先命中者生效；规则只能让目标直连，不能强制走代理。",
+		desc: "直连规则（no_proxy）。每条含 match（wildcard / regex）、pattern、enabled。内置 HTTP 通道按目标豁免；插件提供商不按目标豁免。交互浏览器只收到部分通配主机规则，裸主机在 Chromium 里不是「主机及其子域」。规则只能直连，不能强制走代理。",
 		type: "array",
 	},
 

@@ -133,6 +133,9 @@ function OutboundProxyCard() {
 		mode === "custom" && initialized && !!url.trim() && !normalizeProxyUrl(url);
 
 	const handleSave = useCallback(() => {
+		// Settings replace `proxy` wholesale. Saving before they load would send
+		// `noProxyRules: []` and wipe the stored list.
+		if (!initialized) return;
 		if (mode === "custom") {
 			const normalized = normalizeProxyUrl(url);
 			if (!normalized) {
@@ -144,7 +147,7 @@ function OutboundProxyCard() {
 		} else {
 			saveMut.mutate({ mode });
 		}
-	}, [mode, url, saveMut, t]);
+	}, [initialized, mode, url, saveMut, t]);
 
 	return (
 		<Card withBorder padding="md" maw={640}>
@@ -192,7 +195,12 @@ function OutboundProxyCard() {
 				</Alert>
 
 				<Group justify="flex-end">
-					<Button size="xs" onClick={handleSave} loading={saveMut.isPending}>
+					<Button
+						size="xs"
+						onClick={handleSave}
+						loading={saveMut.isPending}
+						disabled={!initialized}
+					>
 						{t("proxySave")}
 					</Button>
 				</Group>
