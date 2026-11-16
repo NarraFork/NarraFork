@@ -87,6 +87,7 @@ import {
 import { readNarratorWakeFacts } from "./access-reads";
 import { noteOutlineAssignedTasks } from "./assigned";
 import { agentAssigneeName, resolveAgentAssignee } from "./assignee";
+import { compareDocumentOrder, documentOrderKeys } from "./block-tree";
 import { isOutlineEnabled } from "./feature";
 import { OUTLINE_CHANGE, type OutlineTaskJson } from "./model";
 import { canSessionReadSpace, yieldToEventLoop } from "./session-scope";
@@ -485,11 +486,17 @@ async function unblockedInCommit(
 		})),
 		{ store },
 	);
-	// The link index gives them in no order a reader would know: by space, page and sibling order.
-	const place = (t: OutlineBlockMeta) =>
-		`${t.spaceId}\u0000${t.pageId}\u0000${t.orderKey}\u0000${t.id}`;
-	found.sort((a, b) =>
-		place(a.task) < place(b.task) ? -1 : place(a.task) > place(b.task) ? 1 : 0,
+	// The link index gives them in no order a reader would know: by space, then the outline's
+	// own order (by the order keys from the top level down), then id.
+	const paths = await documentOrderKeys(
+		found.map((f) => f.task),
+		{ store },
+	);
+	found.sort(
+		(a, b) =>
+			(a.task.spaceId < b.task.spaceId ? -1 : a.task.spaceId > b.task.spaceId ? 1 : 0) ||
+			compareDocumentOrder(paths.get(a.task.id) ?? [], paths.get(b.task.id) ?? []) ||
+			(a.task.id < b.task.id ? -1 : a.task.id > b.task.id ? 1 : 0),
 	);
 	for (const { root, pair, task } of found) {
 		const entry: Unblocked = {
@@ -960,7 +967,7 @@ export function startOutlineTeamEvents(): void {
 /**
  * Push the commits of the last {@link OUTLINE_TEAM_EVENT_LIMITS.repushWindowMs} again (see the
  * module header): what a process that stopped between a commit and its rows left untold. Bounded
- * and indexed: spaces by `last_commit_at`, a page at a time; of each the newest commits by seq.
+ * and indexed: spaces by `last_commit_at`, a batch at a time; of each the newest commits by seq.
  * Runs in the background, a commit at a time through the listener's queue, yielding between
  * spaces. Returns how many commits were queued.
  */

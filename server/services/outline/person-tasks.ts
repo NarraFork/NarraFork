@@ -4,8 +4,8 @@
  *
  * ADDING (`/goal`, "Add")
  * -----------------------
- * The task goes on the session space's task page (alias {@link OUTLINE_TASKS_PAGE_ALIAS}, made on
- * first use), last: a session's own work lives in its session space (D37). It is a to-do whose
+ * The task goes in the session space's task list (alias {@link OUTLINE_TASKS_PAGE_ALIAS}, a
+ * top-level block made on first use), last: a session's own work lives in its session space (D37). It is a to-do whose
  * manager is the person and which is marked created by a person (`humanCreated`, what
  * `protectedOnly` continuation counts, D27a). By default it is locked by that person, with no
  * session confirming for them (D26b, D25), in the SAME commit that creates it: the agent never
@@ -17,12 +17,12 @@
  * the session space (adding to a session takes its write access) and the task is new, so nobody
  * else holds a lock on it.
  *
- * Dedupe by body (as `/goal` did in Dynamic Spec, review round 1 S2): a task of the task page that
+ * Dedupe by body (as `/goal` did in Dynamic Spec, review round 1 S2): a task of the task list that
  * is not cancelled and holds the same text is not added again; done ones count too. "The same
  * text" is the whole body the person wrote, whitespace runs taken as one space: the task's own
  * block and the paragraphs written with it (its blocks created in the same commit, as they read
  * now), in order; steps added under it later are not part of it. The scan is bounded and
- * deterministic (the task page's last {@link DEDUPE_SCAN} children, last first); it compares
+ * deterministic (the task list's last {@link DEDUPE_SCAN} children, last first); it compares
  * the heads it reads ({@link OUTLINE_PAGE_HEAD_CHARS} characters) first, and reads whole
  * contents only for the few whose head matches. Adds of one session run one at a time, so the
  * same text sent twice at once is added once.
@@ -39,7 +39,7 @@
  *
  * A task of a SESSION space given to the team (「交给团队」), or by the session's owner to someone
  * who cannot work in the session space, is handed out instead (outline P2 PR 10c-3, `hand-out.ts`,
- * owner decision 2026-11-13): a copy goes to the project's task page and the task waits for it.
+ * owner decision 2026-11-13): a copy goes to the project's task list and the task waits for it.
  * Anyone who can work there already is assigned in place.
  */
 import { catalogError, ForbiddenError, NotFoundError, ValidationError } from "@server/lib/errors";
@@ -68,12 +68,12 @@ import { type OutlineTaskPatch, type OutlineWriteResult, writeOutline } from "./
 
 export { OUTLINE_TASKS_PAGE_ALIAS };
 
-/** Children of the task page the dedupe reads: the last ones, where tasks are added. */
+/** Children of the task list the dedupe reads: the last ones, where tasks are added. */
 const DEDUPE_SCAN = 500;
 /** Tasks whose head matches that the dedupe reads whole. */
 const DEDUPE_FULL_READS = 8;
 
-/** The title of a session's task page when it is made (by `/goal`, the board or plan mode). */
+/** The title of a session's task list when it is made (by `/goal`, the board or plan mode). */
 export const OUTLINE_TASKS_LIST_TITLE: Record<"en" | "zh-CN", string> = {
 	en: "Tasks",
 	"zh-CN": "任务",
@@ -235,16 +235,16 @@ export async function addPersonTask(args: {
 }
 
 /**
- * A task directly under `pageId` (the task page, or the parent a plugin names) with this body that
- * is not cancelled, if any.
+ * A task directly under `parentId` (the task list, or the parent a plugin names) with this body
+ * that is not cancelled, if any.
  */
 export async function findSameTask(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
-	pageId: string,
+	parentId: string,
 	body: TaskBody,
 ): Promise<{ id: string; sid: string; locked: boolean; task: OutlineTaskJson } | null> {
-	const children = (await store.listLastChildMetas(space.id, pageId, DEDUPE_SCAN)).filter(
+	const children = (await store.listLastChildMetas(space.id, parentId, DEDUPE_SCAN)).filter(
 		(meta) => meta.taskJson && meta.taskJson.status !== "cancelled",
 	);
 	if (children.length === 0) return null;
