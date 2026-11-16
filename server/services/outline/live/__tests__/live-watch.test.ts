@@ -581,7 +581,7 @@ describe("what L2 left over", () => {
 			[x, "goes1 LATE", "moved_away"],
 		]);
 		// Not at the unknown generation: the session's text, and the next keystroke lands.
-		expect(a.genOf(x)).toBe(liveSpaceOf(space.id)?.genOf(x));
+		expect(a.genOf(x)).toBe(liveSpaceOf(space.id)?.genOf(x) as number);
 		expect(a.textOf(x)).toBe("goes1");
 		type(a, x, " Z");
 		await flushAll();
