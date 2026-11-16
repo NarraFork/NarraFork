@@ -9,7 +9,7 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own users,
  * projects and sessions.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { db } from "../../../db";
 import { narrators, projects, users } from "../../../db/schema";
 import { outlineEditTool, outlineReadTool } from "../../../lib/agent/tools/outline";
@@ -17,6 +17,7 @@ import type { ToolContext, ToolResult } from "../../../lib/agent/types";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { stopEditTextWorker } from "../edit-text-runner";
+import { OUTLINE_TOOL_TEXT } from "../messages";
 import { lockOutlineTask } from "../pending";
 import { clearOutlineReads } from "../read-ledger";
 import { invalidateSessionReadScopes } from "../session-scope";
@@ -242,6 +243,33 @@ describe("OutlineEdit on a locked plan", () => {
 		expect(await read(w.d, elsewhere)).not.toContain(label);
 		// Neither for a session the change does not wait for.
 		expect(await read(w.b, notes)).not.toContain(label);
+	});
+
+	test("more open changes in the space than a read looks through: the read says some may not be listed", async () => {
+		const w = await lockedPlan();
+		const real = outlineStore.listOpenPendingBySpace.bind(outlineStore);
+		const spy = spyOn(outlineStore, "listOpenPendingBySpace").mockImplementation(
+			async (spaceId, limit) => {
+				const rows = await real(spaceId, limit);
+				// As many heads as the scan takes and one more: none of them waits for anyone here.
+				const filler = Array.from({ length: limit }, (_, i) => ({
+					...(rows[0] ?? ({} as (typeof rows)[number])),
+					id: `filler-${i}`,
+					spaceId,
+					requesterSession: w.ids.d,
+					rootBlockId: null,
+				}));
+				return [...rows, ...filler].slice(0, limit);
+			},
+		);
+		try {
+			const read = await outlineReadTool.execute({ address: w.sids.root, view: "all" }, w.d);
+			expect(read.output).toContain(OUTLINE_TOOL_TEXT.pending.forYouMaybeMore);
+		} finally {
+			spy.mockRestore();
+		}
+		// With the scan not full, nothing is said.
+		expect(await read(w.d, w.sids.root)).not.toContain(OUTLINE_TOOL_TEXT.pending.forYouMaybeMore);
 	});
 
 	test("a block a held change adds is refused until confirmed; the delegate confirms, never the proposer; the proposer is told once", async () => {

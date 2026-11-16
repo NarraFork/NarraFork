@@ -123,7 +123,27 @@ const OTHER_SENSES: Record<string, { phrases: readonly (string | RegExp)[]; why:
 	LearningGuide: { phrases: ["/learn page"], why: "the app's learning page" },
 	ListWorktrees: { phrases: LIST_PAGING, why: "a page of list results" },
 	Worktree: { phrases: LIST_PAGING, why: "a page of list results" },
-	Browser: { phrases: [/page/gi], why: "web pages in a browser" },
+	Browser: {
+		phrases: [
+			"page-target memory",
+			"page interactions",
+			"the page viewport",
+			"Scroll the page",
+			"the page context",
+			"with pages that",
+			"of the page or",
+			"the page in place",
+			"page errors",
+			"disturb the page",
+			"reloads the page",
+			"the active page",
+			"the current page",
+			"page-load requests",
+			"page text",
+			"with the page and",
+		],
+		why: "web pages in a browser",
+	},
 };
 
 /** The tool's description and its parameters as the provider gets them. */

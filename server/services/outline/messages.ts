@@ -490,6 +490,8 @@ export const OUTLINE_TOOL_TEXT = {
 		/** After a read: changes waiting for this session's confirmation. */
 		forYou: (label: string, summary: string, by: string) =>
 			`${label} waits for your confirmation: ${summary} (proposed by ${by}); confirm with OutlineEdit { edits: [{ confirm: "${label}" }] }, or reject with { reject: "${label}", reason }`,
+		forYouMaybeMore:
+			"this space has more open changes than one read looks through: some waiting for your confirmation may not be listed here; read the locked task a change is under to see the changes on it",
 		reportConfirmed: (label: string, by: string, seq: number | null) =>
 			`${label} was confirmed by ${by}${seq === null ? "" : ` (commit #${seq})`}: its changes are in the outline now`,
 		reportRejected: (label: string, by: string, reason: string | null) =>

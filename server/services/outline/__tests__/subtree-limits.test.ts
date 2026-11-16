@@ -244,6 +244,33 @@ describe("a live subtree read that skips blocks", () => {
 		expect(plain?.truncated).toBe(true);
 	});
 
+	test("more skipped blocks than the cap in a level read whole: nothing is lost, nothing cut", async () => {
+		const userId = await seedUser();
+		const space = await outlineStore.ensureSpace({ kind: "personal", ownerUserId: userId }, NOW);
+		const made = await human(space, userId, [
+			{ op: "insert", tempId: "r", parent: null, content: "root" },
+		]);
+		const rootId = made.results[0]?.blockId as string;
+		const total = OUTLINE_LIVE_SUBTREE_MAX_SKIPPED + 5;
+		for (let i = 0; i < total; i += 150) {
+			const ops: OutlineOp[] = [];
+			for (let j = i; j < Math.min(total, i + 150); j++)
+				ops.push({ op: "insert", parent: { id: rootId }, content: `SKIP ${j}` });
+			await human(space, userId, ops);
+		}
+		const kept = await human(space, userId, [
+			{ op: "insert", tempId: "k", parent: { id: rootId }, content: "keep" },
+			{ op: "insert", parent: { tempId: "k" }, content: "under keep" },
+		]);
+		const keepIds = new Set(kept.results.map((r) => r.blockId as string));
+		const read = await readLiveSubtree(space.id, rootId, {
+			limit: 10,
+			skip: (row) => !keepIds.has(row.id),
+		});
+		expect(read?.truncated).toBe(false);
+		expect(new Set([...(read?.nodes.keys() ?? [])])).toEqual(new Set([rootId, ...keepIds]));
+	});
+
 	test("more skipped blocks than the cap: the read stops and says it was cut", async () => {
 		const userId = await seedUser();
 		const space = await outlineStore.ensureSpace({ kind: "personal", ownerUserId: userId }, NOW);

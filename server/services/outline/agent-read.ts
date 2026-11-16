@@ -1072,7 +1072,7 @@ async function pendingForRead(
 					(row) => row.spaceId === space.id,
 				);
 	const reports = args.reportsOf ? await decisionReports(scope, session, args.reportsOf) : [];
-	const nearby = args.forYouUnder
+	const near = args.forYouUnder
 		? await pendingForYouNearby(
 				scope,
 				space,
@@ -1080,8 +1080,9 @@ async function pendingForRead(
 				args.forYouUnder,
 				new Set(heads.map((h) => h.id)),
 			)
-		: [];
-	if (heads.length === 0 && reports.length === 0 && nearby.length === 0) return null;
+		: { rows: [], more: false };
+	const nearby = near.rows;
+	if (heads.length === 0 && reports.length === 0 && nearby.length === 0 && !near.more) return null;
 	// Who decides each change is the lock as it is now (review S-8).
 	const rows = await withCurrentDeciders(heads, { store });
 	const names = await pendingNames([...rows, ...reports, ...nearby]);
@@ -1144,6 +1145,7 @@ async function pendingForRead(
 			);
 		}
 	}
+	if (near.more) notes.push(text.forYouMaybeMore);
 	for (const row of reports) {
 		const label = outlinePendingLabel(row.id);
 		const by = row.decidedByJson ? actorName(row.decidedByJson) : OUTLINE_TOOL_TEXT.edit.someone;
@@ -1185,7 +1187,9 @@ const PENDING_NEARBY_SCAN = OUTLINE_SUBTREE_LIMITS.pendingRows;
  * root) whose plan is under the same top-level block as `blockId`, besides those in `seen`.
  * Bounded: one read of the space's open change heads (at most {@link PENDING_NEARBY_SCAN}, oldest
  * first), the deciders as they are now, and one walk up from the block and the few changes left
- * (at most `markWalkRows` blocks); a walk cut short lists none of them.
+ * (at most `markWalkRows` blocks); a walk cut short lists none of them. `more`: the space has
+ * more open changes than the scan looked through (the newest are the ones left out), so some
+ * waiting for this session may not be listed; the read says so.
  */
 async function pendingForYouNearby(
 	scope: OutlineAgentScope,
@@ -1193,16 +1197,21 @@ async function pendingForYouNearby(
 	session: string,
 	blockId: string,
 	seen: ReadonlySet<string>,
-): Promise<OutlinePendingHead[]> {
+): Promise<{ rows: OutlinePendingHead[]; more: boolean }> {
 	const store = scope.store;
-	const listed = (await store.listOpenPendingBySpace(space.id, PENDING_NEARBY_SCAN)).filter(
-		(row) => !seen.has(row.id) && row.requesterSession !== session && row.rootBlockId !== null,
-	);
-	if (listed.length === 0) return [];
+	const scanned = await store.listOpenPendingBySpace(space.id, PENDING_NEARBY_SCAN + 1);
+	const more = scanned.length > PENDING_NEARBY_SCAN;
+	const none = { rows: [], more };
+	const listed = scanned
+		.slice(0, PENDING_NEARBY_SCAN)
+		.filter(
+			(row) => !seen.has(row.id) && row.requesterSession !== session && row.rootBlockId !== null,
+		);
+	if (listed.length === 0) return none;
 	const current = (await withCurrentDeciders(listed, { store })).filter(
 		(row) => !!row.deciderJson.delegate,
 	);
-	if (current.length === 0) return [];
+	if (current.length === 0) return none;
 	const roots = await store.getNarratorRoots([
 		...new Set(current.map((row) => row.deciderJson.delegate as string)),
 	]);
@@ -1210,7 +1219,7 @@ async function pendingForYouNearby(
 		const delegate = row.deciderJson.delegate as string;
 		return (roots.get(delegate)?.root ?? delegate) === session;
 	});
-	if (mine.length === 0) return [];
+	if (mine.length === 0) return none;
 	const ancestry = await readOutlineAncestry(
 		space.id,
 		[blockId, ...mine.map((row) => row.rootBlockId as string)],
@@ -1221,8 +1230,8 @@ async function pendingForYouNearby(
 		return above === null ? null : (above.at(-1) ?? id);
 	};
 	const top = topOf(blockId);
-	if (top === null) return [];
-	return mine.filter((row) => topOf(row.rootBlockId as string) === top);
+	if (top === null) return none;
+	return { rows: mine.filter((row) => topOf(row.rootBlockId as string) === top), more };
 }
 
 /**

@@ -932,8 +932,11 @@ export const OUTLINE_LIVE_SUBTREE_MAX_SKIPPED = 200;
  *
  * `skip`: blocks left out together with everything under them, never read and not counted
  * against `limit` (the swallowed-content scan's attach blocks: a reader that dropped them after
- * a budgeted read would have spent its budget on them, losing the rules below). At most
- * {@link OUTLINE_LIVE_SUBTREE_MAX_SKIPPED} are skipped; past that the read says `truncated`.
+ * a budgeted read would have spent its budget on them, losing the rules below). A level whose
+ * skipped rows took the room of rows to keep is read again, wider: one `listLevels` call then
+ * asks for up to `limit + 1 +` {@link OUTLINE_LIVE_SUBTREE_MAX_SKIPPED} rows (about 1,000).
+ * Past that many skipped rows, a level that would need a wider read still is cut and the read
+ * says `truncated`; a level read whole is never cut for what it skipped.
  */
 export async function readLiveSubtree(
 	spaceId: string,
@@ -1012,8 +1015,9 @@ async function readLiveLevels(
 				Math.max(want + left, ask * 2),
 			);
 		}
+		// A level read whole loses nothing, however many it skipped: the cap bounds only the
+		// wider reads again (skipped rows are never opened, so they cost nothing further down).
 		skipped += left;
-		if (skipped > OUTLINE_LIVE_SUBTREE_MAX_SKIPPED) return cut(kept);
 		for (const row of kept) rows.push(row);
 		if (rows.length > limit) return { rows: rows.slice(0, limit), truncated: true };
 		frontier = kept.filter((row) => row.hasChildren).map((row) => row.id);
