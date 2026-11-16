@@ -282,6 +282,16 @@ const fakeNarratorService = {
 			omittedCapped: false,
 		};
 	},
+	// Mirrors the real nested view: each listed member's own helpers, capped per member.
+	async listNestedSubagentsForTeamView(parentIds: readonly string[], perParent: number) {
+		const result = new Map<string, { subagents: FakeNarrator[]; total: number }>();
+		for (const parentId of parentIds) {
+			const children = [...narrators.values()].filter((n) => n.parentNarratorId === parentId);
+			if (children.length > 0)
+				result.set(parentId, { subagents: children.slice(0, perParent), total: children.length });
+		}
+		return result;
+	},
 	async getById(id: string) {
 		const n = narrators.get(id);
 		if (!n) throw new Error("narrator not found");

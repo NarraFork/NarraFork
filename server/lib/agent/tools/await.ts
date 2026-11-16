@@ -143,9 +143,9 @@ export function updateAwaitTimeout(toolUseId: string, newTimeoutMs: number): num
  * Tell the narrator's subscribers which child an in-flight Await is waiting on.
  *
  * Imported lazily and never awaited by the caller: this is a UI affordance, so it
- * must not add latency to the wait or fail it. `type: "agent"` is rejected for
- * subagents by the execution policy, so the owning narrator is always the
- * top-level one and no `parentToolUseId` routing is needed.
+ * must not add latency to the wait or fail it. The frame goes to the waiting
+ * narrator's own page only: a worker subagent awaiting its helper shows the wait
+ * on its own page, while its parent's card lists the call as a recent activity row.
  */
 export async function broadcastAwaitAgentResolved(
 	narratorId: string,
@@ -173,7 +173,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 		properties: {
 			type: {
 				description:
-					'What to await: "agent" (primary narrator only), "bash", "transfer", or "question" (an existing own async question). Current runtime capabilities are enforced at execution.',
+					'What to await: "agent" (an agent you launched; not available to most subagents), "bash", "transfer", or "question" (an existing own async question). Current runtime capabilities are enforced at execution.',
 				type: "string",
 				enum: ["agent", "bash", "transfer", "question"],
 			},
@@ -199,8 +199,8 @@ export const awaitTool: ToolDefinition = {
 	name: "Await",
 	description:
 		"Wait for an asynchronous task to complete and return its current status and output.\n\n" +
-		'Use `type: "agent"` to await a background or running subagent from a primary narrator. ' +
-		'Subagents cannot use `type: "agent"` to wait for other agents; use asynchronous Send instead. ' +
+		'Use `type: "agent"` to await a background or running subagent you launched yourself. ' +
+		'Subagents cannot use `type: "agent"` unless their template lets them launch helpers (worker); otherwise they use asynchronous Send instead. ' +
 		'Use `type: "bash"` to await a background bash task. ' +
 		'Use `type: "transfer"` to await a background device file transfer; a paused transfer ' +
 		"returns immediately as paused rather than waiting, so you can decide whether to resume it. " +
@@ -219,7 +219,7 @@ export const awaitTool: ToolDefinition = {
 		type: z
 			.enum(["agent", "bash", "transfer", "question"])
 			.describe(
-				'What to await: "agent" (primary narrator only), "bash", "transfer" (a background device file transfer), or "question" (an async AskUserQuestion).',
+				'What to await: "agent" (an agent you launched; not available to most subagents), "bash", "transfer" (a background device file transfer), or "question" (an async AskUserQuestion).',
 			),
 		id: z
 			.string()

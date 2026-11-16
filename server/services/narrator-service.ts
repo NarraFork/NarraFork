@@ -215,6 +215,8 @@ const MAX_INHERITED_FULL_FORK_REFS = 500;
  * same thing an exact number would.
  */
 const TEAM_VIEW_OMITTED_COUNT_CAP = 500;
+/** Members whose helpers one nested team-view query reads (the list actions' own maximum). */
+const TEAM_NESTED_PARENT_LIMIT = 100;
 /** Rows per keyset page of {@link narratorService.listTeamMembers}. */
 const TEAM_MEMBERS_PAGE_SIZE = 500;
 
@@ -2224,6 +2226,70 @@ export const narratorService = {
 			omitted: Math.min(remainder.length, TEAM_VIEW_OMITTED_COUNT_CAP),
 			omittedCapped: remainder.length > TEAM_VIEW_OMITTED_COUNT_CAP,
 		};
+	},
+
+	/**
+	 * The helpers of each listed team member, for the one nested level of a team tree
+	 * (TeamStatus, nested cards). At most `perParent` per member, active ones first, with
+	 * each member's total so a listing can say what it left out. One query over the
+	 * `parent_narrator_id` index; only short columns are read.
+	 */
+	async listNestedSubagentsForTeamView(
+		parentIds: readonly string[],
+		perParent: number,
+	): Promise<Map<string, { subagents: TeamViewSubagent[]; total: number }>> {
+		const result = new Map<string, { subagents: TeamViewSubagent[]; total: number }>();
+		const ids = [...new Set(parentIds)].slice(0, TEAM_NESTED_PARENT_LIMIT);
+		if (ids.length === 0) return result;
+		const limit = Math.max(1, Math.trunc(perParent));
+		const activeFirst = sql`CASE WHEN ${narrators.status} IN ('working','waiting') THEN 0 ELSE 1 END`;
+		const ranked = db
+			.select({
+				id: narrators.id,
+				title: narrators.title,
+				traits: narrators.traits,
+				variant: narrators.variant,
+				status: narrators.status,
+				createdAt: narrators.createdAt,
+				parentNarratorId: narrators.parentNarratorId,
+				rank: sql<number>`row_number() over (partition by ${narrators.parentNarratorId} order by ${activeFirst}, ${narrators.createdAt} desc, ${narrators.id} desc)`.as(
+					"rank",
+				),
+				total: sql<number>`count(*) over (partition by ${narrators.parentNarratorId})`.as(
+					"total",
+				),
+			})
+			.from(narrators)
+			.where(
+				and(
+					inArray(narrators.parentNarratorId, ids),
+					// A member's own team: rows it controls (see `teamMembersWhere`).
+					sql`coalesce(json_extract(${narrators.runtimeRegistrationJson}, '$.controller.narratorId'), json_extract(${narrators.runtimeRegistrationJson}, '$.run.deliverTo.narratorId')) = ${narrators.parentNarratorId}`,
+				),
+			)
+			.as("ranked");
+		const rows = await db
+			.select()
+			.from(ranked)
+			.where(sql`${ranked.rank} <= ${limit}`)
+			.orderBy(ranked.parentNarratorId, ranked.rank)
+			.limit(ids.length * limit)
+			.all();
+		for (const row of rows) {
+			const parentId = row.parentNarratorId;
+			if (!parentId) continue;
+			const entry = result.get(parentId) ?? { subagents: [], total: Number(row.total) };
+			entry.subagents.push({
+				id: row.id,
+				title: row.title,
+				traits: row.traits,
+				variant: row.variant,
+				status: row.status,
+				createdAt: row.createdAt,
+			});
+			result.set(parentId, entry);
+		}
+		return result;
 	},
 
 	/**
