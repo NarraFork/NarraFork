@@ -2169,14 +2169,12 @@ export class LiveSpace {
 			const known = this.mirror.get(e.id);
 			const gen = known?.gen ?? 0;
 			if ((e.gen ?? 0) > gen) return null;
-			// Of the document the session has (a deleted block's too, wherever it is: typing that
-			// crossed a delete, or a block that went along deleted with its parent, is kept in its
-			// text and goes with it when it is brought back). A block that went to a page nobody
-			// has open was given a new generation then, so typing into the copy it left is never
-			// taken here: whatever is reported not taken is of a generation older than the
-			// block's, and the client's copy is replaced when the block is shown to it again
-			// (the client relies on it: `LiveClient.keepLost`).
-			if ((e.gen ?? 0) === gen) out.push(e);
+			// A deleted block whose text another page's people hold (or nobody): the session does
+			// not follow it. (A block that went to a page nobody has open was also given a new
+			// generation then: whoever is shown it again gets a later one, and their copy, with
+			// the typing not taken, is replaced; `LiveClient.keepLost` relies on it.)
+			if (known?.deleted && known.held !== p.root) lost.push(e.id);
+			else if ((e.gen ?? 0) === gen) out.push(e);
 			// Of a block whose text the participant's page holds: it is told of the drop (a join
 			// names it). Of a block that left its page (it holds it as deleted, and is told
 			// nothing more of it) and whose document is another by now: typing that crossed the

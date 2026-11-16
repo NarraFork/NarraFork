@@ -388,6 +388,8 @@ export class LiveClient {
 	private wantPresence: LiveSelWire | null = null;
 	private retryTimer: LiveTimer | null = null;
 	private retries = 0;
+	/** Joins sent and not answered yet (`superseded`). */
+	private joinsOut = 0;
 	private readonly listeners = new Set<(event: ClientEvent) => void>();
 	private readonly off: Array<() => void> = [];
 	private disposed = false;
@@ -426,6 +428,8 @@ export class LiveClient {
 				if (connected && this.closeCode === "outdated") return;
 				if (connected) this.join();
 				else {
+					// What was on its way on the connection that went is never answered.
+					this.joinsOut = 0;
 					this.setStatus(this.status === "closed" ? "closed" : "offline");
 					for (const tx of this.pending) tx.sent = false;
 				}
@@ -644,8 +648,9 @@ export class LiveClient {
 				const change = tx.bodies.get(id) ?? tx.undone?.get(id);
 				if (!change) continue;
 				// What this client changed in the block after the change not taken was made on top
-				// of it (this end's document of the block still holds it): none of it can be taken
-				// either (it is of the same old generation, see `parseTexts` on the server), and
+				// of it (this end's document of the block still holds it): the page takes none of
+				// it either (it is typed into the same copy the page did not take, `parseTexts` on
+				// the server; the block's text reaches this page again as a later generation), and
 				// rebasing it onto the page's text by a text merge would cut words apart where the
 				// text not taken was. So it all goes with it, as one text, and the block keeps no
 				// change of this client's past this point (`lostText`).
@@ -949,7 +954,7 @@ export class LiveClient {
 				: {}),
 		};
 		this.setStatus("connecting");
-		this.sendFrame(
+		const sent = this.sendFrame(
 			encodeLiveFrame({
 				kind: LIVE_FRAME.join,
 				handle: this.handle,
@@ -957,6 +962,8 @@ export class LiveClient {
 				...(held ? { body: held } : {}),
 			}),
 		);
+		// Only a join that went out is answered.
+		if (sent) this.joinsOut++;
 	}
 
 	/** Start over from a snapshot (after a refusal): replays what was not acknowledged. */
@@ -1473,6 +1480,7 @@ export class LiveClient {
 		}
 		switch (frame.kind) {
 			case LIVE_FRAME.joined:
+				if (this.superseded()) break;
 				this.onJoined(frame.head as LiveJoinedHead, frame.body);
 				break;
 			case LIVE_FRAME.batch:
@@ -1499,11 +1507,27 @@ export class LiveClient {
 				this.join();
 				break;
 			case LIVE_FRAME.closed:
+				if (this.superseded()) break;
 				this.onClosed(
 					((frame.head as { code?: LiveCloseCode } | null)?.code ?? "ended") as LiveCloseCode,
 				);
 				break;
 		}
+	}
+
+	/**
+	 * An answer to a join that a later join of this client replaced (two were on their way: a
+	 * rejoin asked for while one was out, a retry). Not acted on: the server bound the handle to
+	 * the later one, and anything this client sent after acting on the earlier answer would
+	 * reach the later participant, whose answer does not count it (it would be made twice).
+	 */
+	private superseded(): boolean {
+		if (this.joinsOut > 1) {
+			this.joinsOut--;
+			return true;
+		}
+		this.joinsOut = 0;
+		return false;
 	}
 
 	/** Raw bytes from a transport that does not decode. */
