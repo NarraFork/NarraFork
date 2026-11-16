@@ -211,7 +211,7 @@ export const OUTLINE_TOOL_TEXT = {
 	moreCounted: (n: number) => OUTLINE_TEXT.more(n),
 	/** A facts view left tasks and questions out of the levels it read. */
 	factsHidden: (n: number) =>
-		`facts only: ${n === 1 ? "1 task or question" : `${n} tasks or questions`} (with what is under ${n === 1 ? "it" : "them"}) not shown; read with view "all" to include them`,
+		`facts only: ${n === 1 ? "1 task or question" : `${n} tasks or questions`} not shown; read with view "all" to include them`,
 	/** `after` given where there is no level to continue. */
 	afterNeedsLevel:
 		"after continues one level: give it with the address of the block whose children you are reading (or key/ for a space's top level).",

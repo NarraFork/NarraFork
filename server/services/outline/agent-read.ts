@@ -7,7 +7,7 @@
  *   - [Pq83nXcB] Token refresh has a race; see [[Lm29XkQa/Rt5uVw7Y|Session notes]]
  *     - [Ab3dEf9Q] [ ] Add a regression test @agent:w-auth
  *     ‹… more›
- *   ‹facts only: 2 tasks or questions (with what is under them) not shown; read with view "all" to include them›
+ *   ‹facts only: 2 tasks or questions not shown; read with view "all" to include them›
  *
  * The first line names the space once (its key and what it is) and where the block sits. Every
  * block line carries the block's address right after the bullet: its short id in one of the

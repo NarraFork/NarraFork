@@ -241,9 +241,7 @@ describe("OutlineEdit then OutlineRead", () => {
 		expect(read.output).not.toContain("regression");
 		// Shape changed (pageless A1): a read by block counts the tasks and questions it left out,
 		// not the blocks under them (it never reads those).
-		expect(read.output).toContain(
-			"‹facts only: 1 task or question (with what is under it) not shown",
-		);
+		expect(read.output).toContain("‹facts only: 1 task or question not shown");
 		expect(read.truncated).toBe(true);
 
 		const all = await call(outlineReadTool, { address: page, view: "all" }, c);

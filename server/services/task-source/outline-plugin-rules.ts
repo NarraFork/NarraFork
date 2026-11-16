@@ -115,7 +115,7 @@ async function rulesBlocks(text: string, locale: Locale, whole: boolean): Promis
 	if (whole && converted.omittedBytes > 0)
 		throw new PluginTaskError(
 			"PAYLOAD_TOO_LARGE",
-			"The plugin's SOP in the old fence is larger than its block on the behavior page holds",
+			"The plugin's SOP in the old fence is larger than its block under the behavior boundary holds",
 		);
 	return converted.blocks;
 }
@@ -165,11 +165,11 @@ async function writeRulesBlock(
 			(await holdsRules(store, block.id, blocks))
 		)
 			return { blockId: block.id, changed: false, space, seq: latestSeq(space) };
-		const pageRef = page ? { id: page.id } : { tempId: "page" };
+		const pageRef = page ? { id: page.id } : { tempId: "boundary" };
 		if (!page)
 			push({
 				op: "insert",
-				tempId: "page",
+				tempId: "boundary",
 				parent: null,
 				content: getOutlineBehaviorBoundaryTitle(session.locale),
 				alias: OUTLINE_BEHAVIOR_ALIAS,
@@ -451,7 +451,7 @@ export async function moveOutlineFenceSop(
 			return outcome;
 		});
 	} catch (error) {
-		logger.warn("Could not move a plugin's SOP from the old fence to the behavior page", {
+		logger.warn("Could not move a plugin's SOP from the old fence to the behavior boundary", {
 			narratorId,
 			error: String(error),
 		});

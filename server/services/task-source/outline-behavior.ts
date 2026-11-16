@@ -457,7 +457,7 @@ export async function importBehaviorFenceText(
 				// deleted that page, or took its alias): then a drawn one.
 				ops.push({
 					op: "insert",
-					tempId: "page",
+					tempId: "boundary",
 					...(existing.has(sids.page) ? {} : { sid: sids.page }),
 					parent: null,
 					content: title,
@@ -477,7 +477,7 @@ export async function importBehaviorFenceText(
 				const parent =
 					node.parentSid === null
 						? pageId === null
-							? { tempId: "page" }
+							? { tempId: "boundary" }
 							: { id: pageId }
 						: inThisCommit.has(node.parentSid)
 							? { tempId: node.parentSid }
@@ -501,7 +501,7 @@ export async function importBehaviorFenceText(
 				{ kind: "import", canonical },
 			);
 			if (pageId === null) pageId = result.results[0]?.blockId ?? null;
-			if (pageId === null) throw new Error("the import could not create the behavior page");
+			if (pageId === null) throw new Error("the import could not create the behavior boundary");
 			written = at;
 		}
 	} catch (error) {
@@ -648,7 +648,7 @@ export async function copyOutlineBehaviorBoundary(
 		);
 		return true;
 	} catch (error) {
-		logger.warn("Fork could not copy the behavior page", {
+		logger.warn("Fork could not copy the behavior boundary", {
 			parentNarratorId,
 			childNarratorId,
 			error: String(error),
