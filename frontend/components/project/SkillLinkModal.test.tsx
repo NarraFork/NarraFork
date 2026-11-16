@@ -17,6 +17,7 @@ const mantineHooks = { ...(await import("@mantine/hooks")) };
 const translation = { ...(await import("react-i18next")) };
 const skillHooks = { ...(await import("../../hooks/useSkills")) };
 const platformHooks = { ...(await import("../../hooks/usePlatform")) };
+const authHooks = { ...(await import("../../hooks/useAuth")) };
 const box = ({ children, style }: { children?: ReactNode; style?: CSSProperties }) => (
 	<div style={style}>{children}</div>
 );
@@ -212,11 +213,16 @@ mock.module("react-i18next", () => ({
 	useTranslation: () => ({ t: (key: string) => key }),
 }));
 let canManage = true;
+let currentRole: "admin" | "user" = "admin";
 mock.module("../../hooks/usePlatform", () => ({
 	...platformHooks,
 	useContentCapability: () => ({
 		projectSkills: { supported: canManage, reason: canManage ? undefined : "unsupported" },
 	}),
+}));
+mock.module("../../hooks/useAuth", () => ({
+	...authHooks,
+	useCurrentUser: () => ({ data: { role: currentRole } }),
 }));
 
 type LinkInput = { name?: string; url: string; signal: AbortSignal };
@@ -283,6 +289,7 @@ beforeEach(() => {
 	projectSkills = [];
 	globalSkills = [];
 	canManage = true;
+	currentRole = "admin";
 	close.mockClear();
 	mutation.mutate.mockClear();
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
@@ -315,6 +322,7 @@ afterAll(() => {
 	mock.module("react-i18next", () => translation);
 	mock.module("../../hooks/useSkills", () => skillHooks);
 	mock.module("../../hooks/usePlatform", () => platformHooks);
+	mock.module("../../hooks/useAuth", () => authHooks);
 	mock.restore();
 });
 function buttons(text: string) {
@@ -705,5 +713,21 @@ describe("skill card entries", () => {
 		expect(button("updateSkillFromLink").disabled).toBe(true);
 		expect(button("updateSkillFromLink").title).toBe("unsupported");
 		expect(container.querySelector("form")).toBeNull();
+	});
+
+	test("a non-admin keeps manual creation and cannot update a global skill from a link", async () => {
+		currentRole = "user";
+		globalSkills = [skill, { ...skill, name: "external", canUpdateFromUrl: false }];
+		await act(async () => root.render(<RoutinesPage />));
+		expect(button("addSkill").disabled).toBe(false);
+		expect(button("updateSkillFromLink").disabled).toBe(true);
+		expect(button("updateSkillFromLink").title).toBe("skillLinkAdminOnly");
+		expect(button("updateSkillFromLink", 1).disabled).toBe(true);
+		expect(button("updateSkillFromLink", 1).title).toBe("skillLinkAdminOnly");
+		await click("addSkill");
+		expect(container.querySelector('[data-modal="createSkill"]')).not.toBeNull();
+		expect(container.querySelector('[data-modal="addSkill"]')).toBeNull();
+		expect(container.querySelector('[role="radiogroup"]')).toBeNull();
+		expect(requests).toHaveLength(0);
 	});
 });
