@@ -33,7 +33,7 @@ export type OutlineTarget =
 			blockId: string;
 			/** Absent means the facts view, the default. */
 			view?: OutlineViewMode;
-			/** Commit seq to show the page as of; absent for the current state. */
+			/** Commit seq to show the block as of; absent for the current state. */
 			asOf?: number;
 	  };
 

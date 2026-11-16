@@ -530,6 +530,74 @@
 }
 
 /*
+ * History (`history/`): the bar over a view as of a commit, the comparison's rows and a
+ * restore's change list. Everything wraps or ellipsizes inside its row: nothing widens the
+ * surface at 360 px. No `:hover` rules (touch).
+ */
+.historyBar {
+	background: var(--mantine-color-indigo-light);
+	border-color: var(--mantine-color-indigo-light-color);
+	min-width: 0;
+}
+
+.historyEntry {
+	min-width: 0;
+	padding: 4px var(--mantine-spacing-xs);
+	border-radius: var(--mantine-radius-sm);
+}
+
+.historyEntry + .historyEntry {
+	border-top: 1px solid var(--mantine-color-default-border);
+}
+
+/* A comparison's mark on a forest row, before its text (in line with the first line). */
+.diffSlot {
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	align-self: flex-start;
+	margin-top: 3px;
+	margin-inline-end: 4px;
+}
+
+.diffList {
+	min-width: 0;
+}
+
+.diffTitle {
+	display: block;
+	flex: 1 1 auto;
+	font-size: var(--mantine-font-size-sm);
+	color: inherit;
+	text-decoration: none;
+}
+
+.historyText {
+	min-width: 0;
+	margin-top: 2px;
+	overflow-wrap: anywhere;
+}
+
+.diffBefore {
+	color: var(--mantine-color-dimmed);
+}
+
+.diffAfter {
+	color: var(--mantine-color-text);
+}
+
+.compareSelect {
+	max-width: 100%;
+}
+
+.restoreActions {
+	position: sticky;
+	bottom: 0;
+	padding-block: var(--mantine-spacing-xs);
+	background: var(--mantine-color-body);
+}
+
+/*
  * The live editor: the page stops scrolling as a whole; the editor's frame (the outline and the
  * mind map on top of each other, `edit-surface.ts`) fills what is left between the toolbar and
  * the timeline and scrolls inside, the side panel beside it scrolls on its own.

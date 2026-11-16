@@ -67,8 +67,8 @@ mock.module("../../hooks/useOutline", () => ({
 	useOutlineSeed: () => idle,
 	prefetchOutlineSeed: () => {},
 	useOutlineBacklinks: () => idle,
-	useOutlineBlockHistory: () => ({ ...idle, hasNextPage: false }),
-	useOutlineTimeline: () => ({ ...idle, hasNextPage: false }),
+	useOutlineSubtreeTimeline: () => ({ ...idle, hasNextPage: false }),
+	useOutlineSubtreeDiff: () => ({ ...idle, hasNextPage: false }),
 	useRevertOutlineCommit: () => ({ mutate: () => {}, isPending: false }),
 	useOutlinePagePending: () => idle,
 	useOutlineReportAuthors: () => idle,
@@ -242,13 +242,31 @@ describe("OutlineSurface", () => {
 		});
 		// A view as of a commit is read only: no way into editing.
 		expect(html).not.toContain("outline-enter-edit");
-		expect(html).toContain("page.asOfBanner");
+		// The history bar: it says so, goes back to now, compares, and (who may write) restores.
+		expect(html).toContain('data-testid="outline-history-bar"');
+		expect(html).toContain("asOf.banner");
+		expect(html).toContain('data-testid="outline-history-now"');
+		expect(html).toContain('data-testid="outline-history-compare"');
+		expect(html).toContain('data-testid="outline-history-restore"');
 		expect(targets).toContain(JSON.stringify({ kind: "home" }));
 		expect(targets).toContain(
 			JSON.stringify({ kind: "block", spaceId: "space", blockId: "page", view: "all", asOf: 2 }),
 		);
 		// The surface's own read is of the focused block alone.
 		expect(reads.at(-1)).toEqual(["space", "a", { asOf: 2, view: "all", blocks: 1 }]);
+	});
+
+	test("as of a commit, a reader who may not write compares but is offered no restore", () => {
+		const base = pageView();
+		shown = pageView({ current: false, seq: 2, space: { ...base.space, canWrite: false } });
+		const html = render(
+			<OutlineSurface spaceId="space" blockId="a" asOf={2} onNavigate={() => {}} />,
+		);
+		expect(html).toContain('data-testid="outline-history-compare"');
+		expect(html).not.toContain('data-testid="outline-history-restore"');
+		expect(html).toContain('data-testid="outline-history-read-only"');
+		// The timeline strip is the block's subtree's, not a page's.
+		expect(html).toContain('data-testid="outline-timeline"');
 	});
 
 	test.each([
