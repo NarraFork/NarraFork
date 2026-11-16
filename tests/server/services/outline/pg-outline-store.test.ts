@@ -52,6 +52,7 @@ import {
 	pgLevelNow,
 	pgLockedOfSpace,
 	pgMarkAncestorsSql,
+	pgUnderRootAt,
 } from "../../../../server/services/outline/store/postgres-history";
 import { createPostgresOutlineStore } from "../../../../server/services/outline/store/postgres-store";
 import { withPostgres } from "../../../db/pg-test-harness";
@@ -421,6 +422,26 @@ describe("PostgreSQL outline store", () => {
 							ancestryAsOf: await planOf(pgAncestryAsOf("plan-space", "kid1", 3, 1000)),
 							ancestryOf: await planOf(pgAncestryOf("plan-space", ["kid1", "kid2", "kid3"], 4001)),
 							locked: await planOf(pgLockedOfSpace("plan-space", 501)),
+							underRoot: await planOf(
+								pgUnderRootAt(
+									"plan-space",
+									"top7",
+									[
+										["kid1", 3],
+										["kid2", 3],
+										["kid3", 7],
+									],
+									1000,
+								),
+							),
+							under: (
+								await store.listUnderRootAt(
+									"plan-space",
+									"top7",
+									[{ blockId: "kid1", asOf: 3 }],
+									1000,
+								)
+							).length,
 							ancestry: [
 								(await store.getAncestry("plan-space", "kid1", { asOf: null, maxDepth: 1000 }))
 									?.length,
@@ -474,6 +495,17 @@ describe("PostgreSQL outline store", () => {
 					.filter((n) => n["Relation Name"] === "outline_block_edges")
 					.map((n) => n["Index Name"]),
 			).toEqual(["idx_outline_edges_block"]);
+			// Under a root as of a seq: each block by key, every step a seek on the block's
+			// placements, nothing scanned.
+			expect(outcome.under).toBe(1);
+			for (const node of outcome.underRoot) expect(node["Node Type"]).not.toBe("Seq Scan");
+			expect(
+				outcome.underRoot
+					.filter((n) => n["Relation Name"] === "outline_block_edges")
+					.map((n) => n["Index Name"]),
+			).toEqual(["idx_outline_edges_block"]);
+			for (const node of outcome.underRoot.filter((n) => n["Relation Name"] === "outline_blocks"))
+				expect(node["Index Name"]).toBe("outline_blocks_pkey");
 			const lockedNodes = outcome.locked.filter((n) => n["Relation Name"] === "outline_blocks");
 			expect(lockedNodes.length).toBeGreaterThan(0);
 			for (const node of lockedNodes) {
@@ -557,6 +589,8 @@ interface PlanOutcome {
 	ancestryAsOf: PlanNode[];
 	ancestryOf: PlanNode[];
 	locked: PlanNode[];
+	underRoot: PlanNode[];
+	under: number;
 	ancestry: Array<number | undefined>;
 	subtreeNow: number;
 	levelRows: number;
