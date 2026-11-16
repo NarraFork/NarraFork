@@ -34,7 +34,7 @@ export interface CustomSubagentDef {
 // Constants
 // ---------------------------------------------------------------------------
 
-const BUILTIN_TYPES = new Set(["explore", "plan", "general", "review"]);
+const BUILTIN_TYPES = new Set(["explore", "plan", "general", "worker", "review"]);
 const SUBAGENTS_DIR = join(narraforkDir, "subagents");
 const SUBAGENT_FILE = "SUBAGENT.md";
 

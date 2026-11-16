@@ -58,6 +58,7 @@ import {
 	parseRuntimeRegistration,
 } from "../../lib/validators/runtime-registration";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
+import { withDelegationDepth } from "../agent-runtime/policy";
 import { compileDelegationCeiling } from "../custom-subagent-service";
 import { bumpNarratorMessageVersion } from "../narrator-persistence";
 import { dbTransactionWithSeqFloor } from "../narrator-refs/seq-floor-tx";
@@ -544,9 +545,13 @@ export async function importInterchangeSession(
 				originToolCallId,
 				historyToolUseId: sub.parentToolUseId,
 				subagentType,
-				ceiling: await compileDelegationCeiling(subagentType, {
-					outlineSession: narrator.taskBackend === "outline",
-				}),
+				// Imported subagents are the primary's own, one level down, like a live delegation.
+				ceiling: withDelegationDepth(
+					await compileDelegationCeiling(subagentType, {
+						outlineSession: narrator.taskBackend === "outline",
+					}),
+					1,
+				),
 				title: sub.title,
 			});
 			createdIds.push(subagentId);
