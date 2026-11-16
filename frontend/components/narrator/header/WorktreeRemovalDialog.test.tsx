@@ -27,6 +27,7 @@ const blockedPlan = (): WorktreeRemovalPlan => ({
 		locked: false,
 		prunable: true,
 		mode: "prune",
+		pruneSiblings: 0,
 		present: false,
 		registered: true,
 		registrationId: "registration",

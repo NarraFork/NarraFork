@@ -18,7 +18,7 @@
  */
 import type { WorktreeDependent, WorktreeRemovalInventory } from "@shared/narrator-worktrees";
 import { withDeviceDirectory } from "@shared/workspace-directories";
-import { and, eq, isNull, like, or, sql } from "drizzle-orm";
+import { and, eq, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	containerInstances,
@@ -98,6 +98,17 @@ async function ownedTerminalsInPath(worktreePath: string) {
 }
 
 /**
+ * Escape LIKE metacharacters for a prefix match bound with `ESCAPE '\'`.
+ *
+ * The escape clause is not optional: without it SQLite treats `\` as an ordinary
+ * character, so a worktree named `feat_x` would search for the literal `feat\_x` and
+ * silently find no dependents at all.
+ */
+export function escapeLikePrefix(value: string): string {
+	return value.replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
+/**
  * Sessions whose effective directory lives inside the worktree.
  *
  * The predicate is deliberately generous — `LIKE prefix%` in SQL, exact containment in
@@ -110,7 +121,9 @@ async function findDependents(
 ): Promise<{ dependents: WorktreeDependent[]; truncated: boolean }> {
 	const separator = directorySeparator();
 	const prefix = worktreePath.endsWith(separator) ? worktreePath : `${worktreePath}${separator}`;
-	const pattern = `${prefix.replace(/[\\%_]/g, (match) => `\\${match}`)}%`;
+	const pattern = `${escapeLikePrefix(prefix)}%`;
+	const cwdPrefix = sql`${narrators.cwd} like ${pattern} escape '\\'`;
+	const contextPrefix = sql`${contextCwd} like ${pattern} escape '\\'`;
 	const rows = await db
 		.select({
 			id: narrators.id,
@@ -124,12 +137,7 @@ async function findDependents(
 		})
 		.from(narrators)
 		.where(
-			or(
-				eq(narrators.cwd, worktreePath),
-				like(narrators.cwd, pattern),
-				eq(contextCwd, worktreePath),
-				like(contextCwd, pattern),
-			),
+			or(eq(narrators.cwd, worktreePath), cwdPrefix, eq(contextCwd, worktreePath), contextPrefix),
 		)
 		.orderBy(narrators.id)
 		.limit(MAX_DEPENDENTS + 1);
@@ -270,7 +278,8 @@ export function createWorktreeRetirementPorts(): WorktreeRetirementPorts {
 				.get();
 			if (!row) throw new NotFoundError("Narrator", dependent.id);
 			// Still inside the doomed directory? A previous attempt may have moved it already.
-			if (row.cwd && !localPathSemantics.contains(worktreePath, row.cwd)) return;
+			if (row.cwd && !localPathSemantics.contains(worktreePath, row.cwd))
+				return { relocated: false };
 			if (
 				row.status === "working" ||
 				row.status === "waiting" ||
@@ -288,7 +297,7 @@ export function createWorktreeRetirementPorts(): WorktreeRetirementPorts {
 						},
 						{ origin: "http" },
 					);
-					return;
+					return { relocated: true };
 				} catch (error) {
 					// A specialized session cannot take a user-visible directory switch, but its
 					// protection claim still has to be released; fall through to the silent repair.
@@ -339,6 +348,7 @@ export function createWorktreeRetirementPorts(): WorktreeRetirementPorts {
 			});
 			// The directory may now belong to another project.
 			void syncNarratorProjectLinksSafely(dependent.id);
+			return { relocated: true };
 		},
 
 		async stopRuntime(input) {

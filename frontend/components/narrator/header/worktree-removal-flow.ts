@@ -1,3 +1,4 @@
+import { ApiError } from "@frontend/lib/api";
 import type {
 	WorktreeDependent,
 	WorktreeRemovalBlocker,
@@ -15,6 +16,14 @@ export interface WorktreeRemovalFlowState {
 	/** Confirmations the user actually ticked; never inferred from the plan alone. */
 	confirmed: WorktreeRemovalConfirmation[];
 	error?: string;
+	/**
+	 * Stable server code behind `error`, when the failure carried one.
+	 *
+	 * The dialog translates this instead of printing the server's English sentence; a
+	 * refusal such as WORKTREE_REMOVAL_DEPENDENT_NOT_ARCHIVED is actionable and the
+	 * catalogue already has a sentence for it.
+	 */
+	errorCode?: string;
 	result?: WorktreeRemovalResult;
 }
 export interface WorktreeRemovalFlowPorts {
@@ -67,7 +76,7 @@ export class WorktreeRemovalFlow {
 	async load(): Promise<void> {
 		const scope = this.scope();
 		if (!scope || this.state.busy) return;
-		this.update({ busy: true, step: "plan", error: undefined });
+		this.update({ busy: true, step: "plan", error: undefined, errorCode: undefined });
 		try {
 			const plan = await this.ports.plan(scope);
 			this.update({
@@ -76,7 +85,7 @@ export class WorktreeRemovalFlow {
 				confirmed: this.state.confirmed.filter((item) => plan.confirmations.includes(item)),
 			});
 		} catch (error) {
-			this.update({ error: messageOf(error) });
+			this.update({ error: messageOf(error), errorCode: codeOf(error) });
 		} finally {
 			this.update({ busy: false, step: this.state.step === "done" ? "done" : "idle" });
 		}
@@ -91,14 +100,14 @@ export class WorktreeRemovalFlow {
 	/** Archive a blocker, then refresh: the user asked for the obstruction to go away. */
 	async archiveDependent(narratorId: string): Promise<void> {
 		if (this.state.busy) return;
-		this.update({ busy: true, error: undefined });
+		this.update({ busy: true, error: undefined, errorCode: undefined });
 		let archived = false;
 		try {
 			await this.ports.archive(narratorId);
 			archived = true;
 		} catch (error) {
 			// A failed archive must not be reported as a fresh plan: it would erase the reason.
-			this.update({ error: messageOf(error) });
+			this.update({ error: messageOf(error), errorCode: codeOf(error) });
 		} finally {
 			this.update({ busy: false });
 		}
@@ -107,7 +116,7 @@ export class WorktreeRemovalFlow {
 	async submit(): Promise<WorktreeRemovalResult | undefined> {
 		const plan = this.state.plan;
 		if (!plan || !this.canSubmit) return undefined;
-		this.update({ busy: true, step: "remove", error: undefined });
+		this.update({ busy: true, step: "remove", error: undefined, errorCode: undefined });
 		try {
 			const result = await this.ports.remove({
 				// The revision the plan was taken under; the server refuses a stale one.
@@ -127,6 +136,7 @@ export class WorktreeRemovalFlow {
 			const fresh = this.ports.planFromError?.(error);
 			this.update({
 				error: messageOf(error),
+				errorCode: codeOf(error),
 				...(fresh ? { plan: fresh, confirmed: [] } : {}),
 			});
 			if (!fresh) await this.load();
@@ -139,6 +149,13 @@ export class WorktreeRemovalFlow {
 
 function messageOf(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/** The server's stable code, when the response carried one. */
+function codeOf(error: unknown): string | undefined {
+	if (!(error instanceof ApiError)) return undefined;
+	const code = error.data?.code;
+	return typeof code === "string" && code ? code : undefined;
 }
 
 /** Blockers rendered as one list; keeps the caller from re-deriving codes. */

@@ -21,16 +21,14 @@ import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspac
 /**
  * Authorized worktree target for one narrator.
  *
- * `recoverWorktreeList` additionally recovers the repository identity when the session's
- * own directory no longer exists — the only way to reach a worktree that has to be
- * pruned, since the caller is typically sitting in the checkout that was deleted.
+ * This is the ordinary grant: a live checkout, never the read-only recovery that
+ * `authorizeList` uses. Removal shares it on purpose — see `assertRemovalReady`.
  */
 async function resolveWorktreeAuthorization(
 	principal: NarratorPrincipal,
 	narratorId: string,
 	need: "read" | "write",
 	signal: AbortSignal,
-	recoverWorktreeList = false,
 ) {
 	if (activeDatabaseBackend !== "sqlite")
 		throw new AppError(
@@ -44,7 +42,7 @@ async function resolveWorktreeAuthorization(
 		need,
 		signal,
 		false,
-		recoverWorktreeList,
+		false,
 	);
 	const source = await loadNarratorForAccess(narratorId, principal, "read");
 	const rootId = await resolveAclRootId(source);
@@ -70,8 +68,6 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 		authorizeGitTargetForPrincipal(principal, { narratorId }, "read", signal, false, true),
 	authorize: (principal, narratorId, need, signal) =>
 		resolveWorktreeAuthorization(principal, narratorId, need, signal),
-	authorizeRemoval: (principal, narratorId, need, signal) =>
-		resolveWorktreeAuthorization(principal, narratorId, need, signal, true),
 	retirement: createWorktreeRetirementPorts(),
 	authorizeDestination: async (principal, narratorId, source, destination, need, signal) => {
 		const target = await authorizeGitDestinationForPrincipal(

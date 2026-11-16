@@ -92,11 +92,17 @@ export function WorktreeRemovalDialog({
 	}, [opened, worktreePath, flow]);
 	const plan = state.plan;
 	const busy = state.busy;
-	const label = (code: string) => {
+	/** Translated sentence for a stable server code, or undefined when we have none. */
+	const translated = (code: string | undefined) => {
+		if (!code) return undefined;
 		const key = `worktree.removeBlocker_${code}`;
 		const text = t(key);
-		return text === key ? code : text;
+		return text === key ? undefined : text;
 	};
+	const label = (code: string) => translated(code) ?? code;
+	// A refusal the catalogue knows is shown in the user's language; anything else keeps
+	// the server's own sentence rather than a bare code.
+	const failure = translated(state.errorCode) ?? state.error;
 	const dependentLabel = (dependent: WorktreeDependent) =>
 		dependent.title?.trim() || t("worktree.removeUntitled");
 	const stepLabel = (step: WorktreeRemovalStep) =>
@@ -117,7 +123,7 @@ export function WorktreeRemovalDialog({
 						<Text size="sm">{stepLabel(state.step)}</Text>
 					</Group>
 				)}
-				{state.error && <Alert color="red">{state.error}</Alert>}
+				{state.error && <Alert color="red">{failure}</Alert>}
 				{plan && (
 					<>
 						<Stack gap={2}>
@@ -151,9 +157,16 @@ export function WorktreeRemovalDialog({
 							</Group>
 						</Stack>
 						{plan.worktree.mode === "prune" && (
-							<Text size="xs" c="dimmed">
-								{t("worktree.removePruneOnly")}
-							</Text>
+							<>
+								<Text size="xs" c="dimmed">
+									{t("worktree.removePruneOnly")}
+								</Text>
+								{plan.worktree.pruneSiblings > 0 && (
+									<Text size="xs" c="orange">
+										{t("worktree.removePruneSiblings", { count: plan.worktree.pruneSiblings })}
+									</Text>
+								)}
+							</>
 						)}
 						{plan.worktree.mode === "rows" && (
 							<Text size="xs" c="dimmed">

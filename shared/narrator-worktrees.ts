@@ -6,7 +6,12 @@
  * remote cwd. Removal is supported, but only as an explicit user action on a local
  * worktree: the retirement path first relocates every session that still depends on
  * the directory, closes its runtime objects, and only then removes the checkout
- * through the protected lifecycle channel. Nothing here prunes in bulk.
+ * through the protected lifecycle channel.
+ *
+ * Only the named path is ever destroyed. `git worktree prune` cannot be aimed at one
+ * path, though, so a `prune` removal also drops every other stale registration in the
+ * repository; `pruneSiblings` reports exactly how many before the caller confirms, and
+ * a `remove` never touches anything but its own checkout.
  */
 export interface WorktreeEntry {
 	path: string;
@@ -158,11 +163,18 @@ export interface WorktreeRemovalPlan {
 		/**
 		 * What the removal will actually do to the checkout.
 		 *
-		 * `remove` deletes a present checkout through Git, `prune` drops only Git's
+		 * `remove` deletes a present checkout through Git, `prune` drops Git's
 		 * registration of an already-deleted one, and `rows` retires NarraFork's own
 		 * durable rows for a path Git no longer lists — never a directory on disk.
 		 */
 		mode: "remove" | "prune" | "rows";
+		/**
+		 * Other stale registrations this repository will lose in the same `prune`.
+		 *
+		 * `git worktree prune` has no path argument, so a `prune` removal always clears
+		 * every prunable entry Git reports. Always 0 for `remove` and `rows`.
+		 */
+		pruneSiblings: number;
 		/** The directory is still on disk. An absent one is pruned, never deleted. */
 		present: boolean;
 		/** A durable `narrator_worktree_resources` owner row exists for this path. */

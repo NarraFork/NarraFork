@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { access, lstat, open, opendir, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, normalize } from "node:path";
+import { dirname, isAbsolute, join, normalize } from "node:path";
 import type { GitWorkspace } from "@shared/git-workspace";
 import type {
 	WorktreeDependent,
@@ -133,12 +133,6 @@ export interface WorktreeServicePorts<Principal> {
 	): Promise<WorktreeTarget>;
 	/** Dedicated read-only recovery; ordinary read/create never receive this target. */
 	authorizeList?: WorktreeServicePorts<Principal>["authorize"];
-	/**
-	 * Removal authorization. It additionally recovers a repository identity when the
-	 * caller's own directory was deleted externally, which is exactly the state a
-	 * prunable worktree leaves its sessions in. Falls back to `authorize`.
-	 */
-	authorizeRemoval?: WorktreeServicePorts<Principal>["authorize"];
 	/** Explicit path-scope authorization; repository identity alone never grants sibling access. */
 	authorizeDestination?(
 		principal: Principal,
@@ -238,6 +232,9 @@ export interface WorktreeRetirementPorts {
 	 * the history reminder and broadcasts). `repair` is the silent relocation of an
 	 * agent nobody is looking at — archived roots and subagents, which a real switch
 	 * would refuse and which must still release their protection claim.
+	 *
+	 * `relocated` is false when the session had already left the directory, so the
+	 * reported effect count stays truthful across retries.
 	 */
 	relocate(input: {
 		dependent: WorktreeDependent;
@@ -245,7 +242,7 @@ export interface WorktreeRetirementPorts {
 		rootPath: string;
 		worktreePath: string;
 		signal: AbortSignal;
-	}): Promise<void>;
+	}): Promise<{ relocated: boolean }>;
 	/** Cancel background tasks, close browser sessions and the session run itself. */
 	stopRuntime(input: {
 		dependent: WorktreeDependent;
@@ -545,13 +542,13 @@ function assertReady(target: WorktreeTarget, need: "read" | "write", workspaceKe
 		error("GIT_WORKSPACE_UNAVAILABLE", "Canonical Git identity unavailable", 409);
 }
 /**
- * Removal admits one state ordinary worktree work does not.
+ * Removal needs a healthy local checkout, and deliberately nothing less.
  *
- * A session whose own checkout was deleted externally reports `missing_directory`, and
- * the recovery target zeroes its capability bits by design. Removing that worktree is
- * precisely the repair, so a repository-scoped recovery target is accepted — the write
- * grant itself was already enforced by the authorizer, which refuses `need: "write"`
- * before any capability is reported.
+ * The recovery target that `list()` receives exists to *show* a worktree whose directory
+ * has been deleted; it carries no write capability and its repository identity comes from
+ * persisted evidence rather than from a live checkout. Removal must not run on it: a
+ * session sitting in an already-deleted directory has to be repaired from another session
+ * of the same repository (see `capabilities.delete` in `list()`, which is false for it).
  */
 function assertRemovalReady(target: WorktreeTarget, workspaceKey: string) {
 	const { workspace, backend } = target;
@@ -561,9 +558,12 @@ function assertRemovalReady(target: WorktreeTarget, workspaceKey: string) {
 		error("WORKTREE_UNSUPPORTED", "Remote worktree removal is not supported", 409);
 	if (!workspace.repositoryKey || !target.repositoryPath)
 		error("GIT_WORKSPACE_UNAVAILABLE", "Canonical Git identity unavailable", 409);
-	if (workspace.state === "ready") return;
-	if (target.worktreeListOnly && workspace.state === "missing_directory") return;
-	error("GIT_WORKSPACE_UNAVAILABLE", "Git workspace unavailable or access denied", 403);
+	if (workspace.state !== "ready")
+		error(
+			"GIT_WORKSPACE_UNAVAILABLE",
+			"Worktree removal needs a healthy working directory; start it from another session of this repository",
+			409,
+		);
 }
 function removalBlocker(
 	code: string,
@@ -1190,14 +1190,20 @@ export class NarratorWorktreeService<Principal> {
 		);
 	}
 
-	/** Removal recovers a repository identity from a checkout that no longer exists. */
+	/**
+	 * Removal authorization is the ordinary write grant.
+	 *
+	 * It deliberately does not reuse `authorizeList`'s recovery: that path exists to keep a
+	 * deleted checkout *visible*, reports no capabilities, and takes the repository identity
+	 * from persisted evidence. Deleting through it would mean destroying a checkout the
+	 * caller was never granted write access to inspect.
+	 */
 	private async removalTarget(
 		principal: Principal,
 		narratorId: string,
 		signal: AbortSignal,
 	): Promise<WorktreeTarget> {
-		const authorize = this.ports.authorizeRemoval ?? this.ports.authorize;
-		return authorize(principal, narratorId, "write", signal);
+		return this.ports.authorize(principal, narratorId, "write", signal);
 	}
 
 	private requireRetirement(): WorktreeRetirementPorts {
@@ -1242,6 +1248,25 @@ export class NarratorWorktreeService<Principal> {
 			(mainWorktree && samePath(worktreePath, mainWorktree.path))
 		)
 			blockers.push(removalBlocker("WORKTREE_REMOVAL_MAIN_ROOT"));
+		// A path Git does not list and NarraFork never registered is not a worktree of this
+		// repository, whatever the caller sent. `rows` removal still closes terminals, moves
+		// sessions and drops tree-snapshot rows, so an arbitrary directory must not reach it:
+		// the only accepted answers are the managed namespace or a durable owner row.
+		// A path with nothing left to act on stays the idempotent `already_absent` case
+		// instead, so a retried removal never turns into a refusal.
+		const namespaceRoot = mainWorktree?.path ?? (repositoryPath ? dirname(repositoryPath) : "");
+		const hasRemovalEffects =
+			present || inspection.dependents.length > 0 || inspection.inventory.terminals > 0;
+		if (
+			!entry &&
+			!inspection.registration &&
+			hasRemovalEffects &&
+			!(
+				namespaceRoot &&
+				localPathSemantics.contains(join(namespaceRoot, ".worktrees"), worktreePath)
+			)
+		)
+			blockers.push(removalBlocker("WORKTREE_REMOVAL_UNKNOWN_PATH"));
 		if (!relocateTo && inspection.dependents.length > 0)
 			blockers.push(removalBlocker("WORKTREE_REMOVAL_NO_RELOCATION_ROOT"));
 		if (entry?.locked) blockers.push(removalBlocker("WORKTREE_REMOVAL_LOCKED"));
@@ -1274,6 +1299,12 @@ export class NarratorWorktreeService<Principal> {
 			);
 		if (dirtyFileCount > 0) confirmations.push("force");
 		if (entry && !inspection.registration) confirmations.push("acknowledgeUnregistered");
+		// `git worktree prune` cannot be aimed, so report what it will take with it.
+		const pruneSiblings =
+			entry && !present
+				? listing.entries.filter((item) => item.prunable && !samePath(item.path, worktreePath))
+						.length
+				: 0;
 		return {
 			status: blockers.length ? "blocked" : "ready",
 			expectedRevision: inspection.revision,
@@ -1285,6 +1316,7 @@ export class NarratorWorktreeService<Principal> {
 				locked: entry?.locked ?? false,
 				prunable: entry?.prunable ?? false,
 				mode: !entry ? "rows" : present ? "remove" : "prune",
+				pruneSiblings,
 				present,
 				registered: !!inspection.registration,
 				registrationId: inspection.registration?.id ?? null,
@@ -1367,14 +1399,14 @@ export class NarratorWorktreeService<Principal> {
 				await retirement.archiveSubagent(dependent);
 				effects.archivedSubagents += 1;
 			}
-			await retirement.relocate({
+			const moved = await retirement.relocate({
 				dependent,
 				mode: dependent.kind === "self" ? "switch" : "repair",
 				rootPath: relocateTo ?? "",
 				worktreePath,
 				signal,
 			});
-			effects.relocated += 1;
+			if (moved.relocated) effects.relocated += 1;
 		}
 		const attachments = await retirement.releaseAttachments({
 			registrationId: plan.worktree.registrationId,
@@ -1414,7 +1446,9 @@ export class NarratorWorktreeService<Principal> {
 				});
 				return 0;
 			});
-		if (plan.worktree.mode === "prune") effects.prunedRegistrations += 1;
+		// `prune` drops every stale registration Git reports, not only this one.
+		if (plan.worktree.mode === "prune")
+			effects.prunedRegistrations += 1 + plan.worktree.pruneSiblings;
 		return {
 			outcome: "removed",
 			worktree:

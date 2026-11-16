@@ -102,6 +102,7 @@ beforeEach(async () => {
 		},
 		relocate: async (input) => {
 			calls.push(`relocate:${input.mode}:${input.dependent.id}`);
+			return { relocated: true };
 		},
 		stopRuntime: async (input) => {
 			calls.push(`stopRuntime:${input.dependent.id}`);
@@ -144,7 +145,6 @@ beforeEach(async () => {
 	};
 	ports = {
 		authorize: async () => target,
-		authorizeRemoval: async () => target,
 		withRevision: async (_id, expected, action) => {
 			expect(expected).toBe(revision);
 			return action();
@@ -507,5 +507,85 @@ describe("worktree removal", () => {
 		);
 		expect(plan.worktree.mode).toBe("rows");
 		expect(plan.confirmations).toEqual([]);
+	});
+
+	test("refuses a path Git never listed and NarraFork never registered", async () => {
+		// `rows` removal still closes terminals and moves sessions, so an ordinary directory
+		// must not reach it: only the managed namespace or a durable owner row is a target.
+		registration = null;
+		const plain = join(source, "src");
+		await mkdir(plain, { recursive: true });
+		const plan = await service.planRemoval(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", path: plain },
+			signal(),
+		);
+		expect(plan.worktree.mode).toBe("rows");
+		expect(plan.status).toBe("blocked");
+		expect(plan.blockers.map((item) => item.code)).toContain("WORKTREE_REMOVAL_UNKNOWN_PATH");
+		await expect(
+			service.remove(
+				"actor",
+				"narrator",
+				{ expectedRevision: 4, workspaceKey: "workspace", path: plain },
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "WORKTREE_REMOVAL_UNKNOWN_PATH" });
+		expect(calls).not.toContain("releaseAttachments");
+		expect(calls).not.toContain("releasePathRows");
+		expect(await lstat(plain).then((node) => node.isDirectory())).toBe(true);
+	});
+
+	test("a prune reports every stale registration it clears", async () => {
+		// `git worktree prune` has no path argument: the plan must say what else goes.
+		registration = null;
+		const other = join(source, ".worktrees", "other");
+		await git(["worktree", "add", "-b", "other", other]);
+		await rm(worktreePath, { recursive: true, force: true });
+		await rm(other, { recursive: true, force: true });
+		const plan = await service.planRemoval(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", path: worktreePath },
+			signal(),
+		);
+		expect(plan.worktree.mode).toBe("prune");
+		expect(plan.worktree.pruneSiblings).toBe(1);
+		const result = await service.remove(
+			"actor",
+			"narrator",
+			{
+				expectedRevision: 4,
+				workspaceKey: "workspace",
+				path: worktreePath,
+				acknowledgeUnregistered: true,
+			},
+			signal(),
+		);
+		expect(result.outcome).toBe("removed");
+		expect(result.effects.prunedRegistrations).toBe(2);
+	});
+
+	test("a session that had already left is not reported as relocated", async () => {
+		dependents = [{ id: "old", title: "Old", status: "archived", kind: "primary", running: false }];
+		const retirement = ports.retirement;
+		if (!retirement) throw new Error("fixture must wire retirement");
+		const original = retirement.relocate;
+		retirement.relocate = async (input) => {
+			calls.push(`relocate:${input.mode}:${input.dependent.id}`);
+			return { relocated: false };
+		};
+		try {
+			const result = await service.remove(
+				"actor",
+				"narrator",
+				{ expectedRevision: 4, workspaceKey: "workspace", path: worktreePath },
+				signal(),
+			);
+			expect(result.effects.relocated).toBe(0);
+		} finally {
+			retirement.relocate = original;
+		}
 	});
 });

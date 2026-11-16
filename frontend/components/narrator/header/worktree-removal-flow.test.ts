@@ -32,6 +32,7 @@ const plan = (patch: Partial<WorktreeRemovalPlan> = {}): WorktreeRemovalPlan => 
 		locked: false,
 		prunable: false,
 		mode: "remove",
+		pruneSiblings: 0,
 		present: true,
 		registered: true,
 		registrationId: "registration",

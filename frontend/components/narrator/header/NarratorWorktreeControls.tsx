@@ -690,6 +690,12 @@ function ScopedWorktreeControls({
 							</Stack>
 						</ScrollArea.Autosize>
 						{firstPage?.truncated && <Alert color="yellow">{t("worktree.listTruncated")}</Alert>}
+						{/* Removal needs a healthy checkout of the requesting session. A session whose
+						    own directory was deleted sees its own prunable row here and nothing it
+						    can do about it, so name the way out instead of showing a dead list. */}
+						{canList && !canRemove && visibleEntries.some((entry) => entry.prunable) && (
+							<Alert color="yellow">{t("worktree.removeNeedsHealthyWorkspace")}</Alert>
+						)}
 						{switchError && <Alert color="red">{switchError}</Alert>}
 						{removalNotice && <Alert color="green">{removalNotice}</Alert>}
 					</Stack>
