@@ -64,7 +64,7 @@
  *
  * COST, once per run end: one indexed read of the session's claims (and nothing else when it
  * holds none); for project tasks, their ancestors by primary key level by level, the claims of
- * the session's subagents (bounded), one page-structure read per tree not kept already (at most
+ * the session's subagents (bounded), one subtree read by block per tree not kept already (at most
  * {@link OUTLINE_RELEASE_LIMITS.trees}; the rest are kept) with the claims and waits of
  * the open tasks in it (bounded), one conditional write of the leases, and for tasks given back
  * the handoff's reads and one commit per space.
@@ -109,7 +109,7 @@ export const OUTLINE_RELEASE_LIMITS = {
 	/** Levels of ancestors read above the tasks held. */
 	depth: 64,
 	/**
-	 * Trees looked into for other sessions' work and for questions (one page read each); the rest
+	 * Trees looked into for other sessions' work and for questions (one subtree read each); the rest
 	 * are kept.
 	 */
 	trees: 20,
@@ -338,10 +338,10 @@ async function decide(
  * Of the trees (by their topmost held task), those something else keeps: another session is
  * doing a task in it, or a question or a change waiting for confirmation is open anywhere in it
  * (the session waits for people there, even when the nearest task above is not one it holds).
- * One page-structure read per tree, at most {@link OUTLINE_RELEASE_LIMITS.trees}; the claims and
+ * One subtree read by block per tree, at most {@link OUTLINE_RELEASE_LIMITS.trees}; the claims and
  * the waits of at most {@link OUTLINE_RELEASE_LIMITS.treeTasks} open tasks not held by the
  * session. What is not known is kept: a tree past {@link OUTLINE_RELEASE_LIMITS.trees}, one that
- * cannot be read or is on a page read truncated, and one whose open tasks did not all fit in
+ * cannot be read or whose read was cut short, and one whose open tasks did not all fit in
  * {@link OUTLINE_RELEASE_LIMITS.treeTasks}.
  */
 async function treesInWork(

@@ -87,7 +87,6 @@ import {
 import { readNarratorWakeFacts } from "./access-reads";
 import { noteOutlineAssignedTasks } from "./assigned";
 import { agentAssigneeName, resolveAgentAssignee } from "./assignee";
-import { compareDocumentOrder, documentOrderKeys } from "./block-tree";
 import { isOutlineEnabled } from "./feature";
 import { OUTLINE_CHANGE, type OutlineTaskJson } from "./model";
 import { canSessionReadSpace, yieldToEventLoop } from "./session-scope";
@@ -113,7 +112,7 @@ import {
 	toldByPeopleEdits,
 } from "./task-finished";
 import { hasHumanAssignee, isFinishedTask, isOpenTask } from "./task-json";
-import { deriveOutlineTaskWaits, isClaimLive, isWaiting } from "./tasks";
+import { deriveOutlineTaskWaits, inDocumentOrder, isClaimLive, isWaiting } from "./tasks";
 import { wakeForTeam } from "./team-wake";
 
 /** The injection source of a row that tells more than tasks the session created (`docs/INJECTION.md`). */
@@ -487,17 +486,14 @@ async function unblockedInCommit(
 		{ store },
 	);
 	// The link index gives them in no order a reader would know: by space, then the outline's
-	// own order (by the order keys from the top level down), then id.
-	const paths = await documentOrderKeys(
-		found.map((f) => f.task),
-		{ store },
+	// own order (the order keys from the top level down, `inDocumentOrder`).
+	const ordered = await inDocumentOrder(
+		store,
+		[...new Map(found.map((f) => [f.task.id, f.task])).values()],
+		null,
 	);
-	found.sort(
-		(a, b) =>
-			(a.task.spaceId < b.task.spaceId ? -1 : a.task.spaceId > b.task.spaceId ? 1 : 0) ||
-			compareDocumentOrder(paths.get(a.task.id) ?? [], paths.get(b.task.id) ?? []) ||
-			(a.task.id < b.task.id ? -1 : a.task.id > b.task.id ? 1 : 0),
-	);
+	const rank = new Map(ordered.map((task, index) => [task.id, index]));
+	found.sort((a, b) => (rank.get(a.task.id) ?? 0) - (rank.get(b.task.id) ?? 0));
 	for (const { root, pair, task } of found) {
 		const entry: Unblocked = {
 			task,

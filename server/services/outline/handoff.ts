@@ -48,7 +48,7 @@
  *     session's words, or those of another project's session, are never copied here.
  *
  * COST
- * One page-structure read per task detailed (at most {@link OUTLINE_HANDOFF_LIMITS.detailed} per
+ * One subtree read by block per task detailed (at most {@link OUTLINE_HANDOFF_LIMITS.detailed} per
  * call; the rest get the head line only), the session's latest writes in the space (one bounded
  * read per session and space), the heads of at most `notes` blocks, and the sessions' rows by
  * primary key. No subprocess, no full content.

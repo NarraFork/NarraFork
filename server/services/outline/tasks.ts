@@ -1062,7 +1062,7 @@ export interface OutlineContinuationCandidates {
  * candidate, since continuing it takes it over.
  *
  * Order is document order: the session space first, then other spaces by key; within a space by
- * page, then depth first by sibling order. At most `limit` of each list.
+ * top-level block, then depth first by sibling order. At most `limit` of each list.
  *
  * A task with unfinished tasks under it is a `container`: listed (it is still open, and counts as
  * the person's work when it is theirs) but never the one continuation names or starts. A plan that
@@ -1286,7 +1286,7 @@ async function delegatedTasksAbove(
 
 /**
  * Sort blocks into document order: `first` space before the others (by key), then by the path of
- * sibling positions from the page down. Ancestors are read level by level, one indexed query per
+ * sibling positions from the top level down. Ancestors are read level by level, one indexed query per
  * space and level, at most {@link OUTLINE_LIMITS.maxDepth} levels. Also the task board's order.
  */
 export async function inDocumentOrder(

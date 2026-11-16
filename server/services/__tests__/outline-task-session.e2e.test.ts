@@ -227,7 +227,7 @@ async function write(spaceId: string, userId: string, ops: Op[]) {
 	});
 }
 
-/** A task page with one to-do task under it, in the project's space. */
+/** A task list with one to-do task under it, in the project's space. */
 async function taskIn(
 	spaceId: string,
 	owner: string,
@@ -361,7 +361,7 @@ describe("a click opens a session that does the task", () => {
 	test("the session, the atomic claim, the brief as the first row, and a run on the task", async () => {
 		const alice = await person("alice");
 		const p = await project(alice);
-		// A fact page the task links to, and a task with a body, steps and that link.
+		// A fact block the task links to, and a task with a body, steps and that link.
 		const fact = await write(p.space.id, alice, [
 			{ op: "insert", tempId: "f", parent: null, content: "Auth design" },
 			{ op: "insert", parent: { tempId: "f" }, content: "Tokens are refreshed under one lock" },
@@ -445,8 +445,10 @@ describe("a click opens a session that does the task", () => {
 		expect(brief).toContain("- Fix the refresh logic (in progress) ← this task");
 		expect(brief).toContain("## Facts the task links to");
 		expect(brief).toContain("Tokens are refreshed under one lock");
-		expect(brief).toContain("## Pages of the project's outline");
-		expect(brief).toContain(`- Auth design (\`${p.space.key}/${factSid}\`) · linked from the task`);
+		expect(brief).toContain("## The top level of the project's outline");
+		expect(brief).toContain(
+			`- Auth design (\`${p.space.key}/${factSid}\`) · the task links to something here`,
+		);
 		expect(brief).toContain("## How to work on this task");
 		expect(brief).toContain("write a handoff note under the task");
 		expect(brief).toContain("## Further instructions\nKeep the public API as it is.");
@@ -458,8 +460,8 @@ describe("a click opens a session that does the task", () => {
 		expect(at("## What to do")).toBeLessThan(at("## Notes and steps so far"));
 		expect(at("## Notes and steps so far")).toBeLessThan(at("## Background"));
 		expect(at("## Background")).toBeLessThan(at("## Facts the task links to"));
-		expect(at("## Facts the task links to")).toBeLessThan(at("## Pages of the project"));
-		expect(at("## Pages of the project")).toBeLessThan(at("## How to work on this task"));
+		expect(at("## Facts the task links to")).toBeLessThan(at("## The top level of the project"));
+		expect(at("## The top level of the project")).toBeLessThan(at("## How to work on this task"));
 
 		// The run: one turn (continuation is off here), whose input holds the brief and names the task.
 		expect(requests).toHaveLength(1);

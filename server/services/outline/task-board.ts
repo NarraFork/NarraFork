@@ -5,7 +5,7 @@
  *
  * WHAT IT LISTS
  * -------------
- *   - SESSION: the tasks of the session's space (its behavior page left out: those checkboxes are
+ *   - SESSION: the tasks of the session's space (its behavior boundary left out: those checkboxes are
  *     rules, outline plan PR 4), and the open tasks the session holds in other spaces.
  *   - PROJECT: the project space, then the session spaces of the project's sessions the person
  *     may read (`readProjectSessionSpacePage`, filtered in SQL), a page of spaces at a time.
@@ -748,7 +748,7 @@ async function outsideBoundary(
 /**
  * The own sections of the given spaces, in that order: each space's open tasks (up to
  * `limits.open`, in document order) and its latest finished ones (up to `limits.finished`), its
- * behavior page left out. Every read is one for all the spaces.
+ * behavior boundary left out (by ancestry). Every read is one for all the spaces.
  */
 async function ownSections(
 	ctx: Context,

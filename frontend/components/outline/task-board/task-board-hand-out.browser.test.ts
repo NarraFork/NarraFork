@@ -3,7 +3,7 @@
  * server running the real outline routes on the isolated SQLite of `tests/preload.ts`:
  *
  *   - the menu of an open task of a session's own space offers it to the session's owner; it
- *     hands the task out (a copy goes to the project's task page), says so, and the task stays on
+ *     hands the task out (a copy goes to the project's task list), says so, and the task stays on
  *     the board waiting for its prerequisite; nothing is started;
  *   - a session of no project, and someone who may write the session but does not own it, are
  *     not offered it;
@@ -245,7 +245,7 @@ async function shot(page: Page, name: string) {
 	if (shotsDir) await page.screenshot({ path: join(shotsDir, `${name}.png`) as `${string}.png` });
 }
 
-/** The tasks on the project's task page (the copies). */
+/** The tasks in the project's task list (the copies). */
 async function copiesIn(projectId: string) {
 	const space = await ensureProjectSpace(projectId);
 	const [page] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
@@ -266,7 +266,7 @@ test("「交给团队」 hands the task out: the copy in the project, the task w
 		await shot(page, "hand-out-en-light-menu");
 		await call(page, (f) => f.click("[data-testid=task-action-team]"));
 		await until(page, "the notice", (f) =>
-			f.notices().some((n) => n.text.startsWith("Handed to the team: a copy is on the project's")),
+			f.notices().some((n) => n.text.startsWith("Handed to the team: a copy is in the project's")),
 		);
 		await until(page, "the task waiting", (f) =>
 			(f.row("Port the parser")?.text ?? "").includes("Waits for 1 prerequisite(s)"),
@@ -279,7 +279,7 @@ test("「交给团队」 hands the task out: the copy in the project, the task w
 		);
 		const projectSpace = await ensureProjectSpace(w.projectId as string);
 		expect(notice?.text).toBe(
-			`Handed to the team: a copy is on the project's task page (${projectSpace.key}/${copy?.sid}). This task waits for it.`,
+			`Handed to the team: a copy is in the project's task list (${projectSpace.key}/${copy?.sid}). This task waits for it.`,
 		);
 		expect((await outlineStore.getBlock(w.parser))?.taskJson).toMatchObject({
 			status: "todo",
@@ -306,7 +306,7 @@ test("中文、暗色、360 px: the item, the notice; the menu inside the viewpo
 		await shot(page, "hand-out-zh-dark-360-menu");
 		await call(page, (f) => f.click("[data-testid=task-action-team]"));
 		await until(page, "the notice", (f) =>
-			f.notices().some((n) => n.text.startsWith("已交给团队：项目的任务页上有一份副本")),
+			f.notices().some((n) => n.text.startsWith("已交给团队：项目的任务清单里有一份副本")),
 		);
 		await until(page, "the task waiting", (f) =>
 			(f.row("Write the docs")?.text ?? "").includes("等 1 个前置任务"),
