@@ -1,15 +1,23 @@
 /**
  * Restore a block's subtree (or the whole space) to an earlier point (pageless outline, F2, on
- * H3's routes), as owner rule D58 says: only what was under it then is touched, and the change
- * list is shown before anything is written.
+ * H3's routes), as owner rule D58 says: only what was under it then is touched, and the WHOLE
+ * change list is shown before anything is written.
  *
- *   preview (paged) ──Restore──▶ running (one call after another, Stop) ──▶ done (result)
- *        ▲   │ Move back (a moved-away block): the list is worked out again
- *        └───┴── a conflict or a stale preview: Preview again
+ *   preview ──(whole list read)── Restore ──▶ running (call after call, Stop) ──▶ done (result)
+ *      ▲   │ Move back (a moved-away block): the list is worked out again
+ *      └───┴── a conflict or a stale preview: Preview again (what was written stays said)
  *
  * The list is grouped by what happens (deleted, brought back, moved back out with what goes
- * along, put back, left as it is with why, moved away with its own "Move back"). Everything it
- * says comes from the server's preview; nothing here decides what a restore does.
+ * along, put back, left as it is with why, moved away with its own "Move back"). Restore is
+ * offered only once every page of the list has been read ("Show the whole list" reads them,
+ * one bounded server read each, stoppable) and no move-back is in flight. Restoring the whole
+ * space asks once more, with the counts. Everything it says comes from the server's preview;
+ * nothing here decides what a restore does.
+ *
+ * The host keeps this dialog mounted with the target captured when it opened
+ * ({@link OutlineRestoreTarget}): moving through history or the address bar meanwhile does not
+ * change what it restores, and a running restore keeps going and shows its result. Leaving the
+ * page while it runs asks first (`lib/page-leave.ts`).
  */
 import {
 	Alert,
@@ -24,13 +32,15 @@ import {
 	Text,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { blockTitle } from "@shared/outline";
 import type { OutlineRestoreEntry, OutlineRestoreSkip } from "@shared/outline-restore-api";
 import { IconCheck } from "@tabler/icons-react";
-import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { invalidateOutlineSpace } from "../../../hooks/useOutline";
 import { api } from "../../../lib/api";
+import { holdPageLeave } from "../../../lib/page-leave";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../../../lib/responsive";
 import classes from "../Outline.module.css";
 import { entryLine, OutlineDiffMark, problemText } from "./HistoryParts";
@@ -55,20 +65,22 @@ export function restoreIO(spaceId: string): RestoreIO {
 	};
 }
 
-export function OutlineRestoreModal({
-	spaceId,
-	rootId,
-	thenSeq,
-	opened,
-	onClose,
-	onFinished,
-	io,
-}: {
+/** What a restore dialog restores, captured when it opens. */
+export interface OutlineRestoreTarget {
 	spaceId: string;
 	/** The block whose subtree is restored; null: the whole space. */
 	rootId: string | null;
 	thenSeq: number;
-	opened: boolean;
+}
+
+export function OutlineRestoreModal({
+	target,
+	onClose,
+	onFinished,
+	io,
+}: {
+	/** Open on this target; null: closed. */
+	target: OutlineRestoreTarget | null;
 	onClose: () => void;
 	/** The restore is done and the reader closed its result (the host goes back to now). */
 	onFinished?: () => void;
@@ -78,47 +90,49 @@ export function OutlineRestoreModal({
 	const { t } = useTranslation("outline");
 	const mobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const queryClient = useQueryClient();
-	// One run per opening: a new preview each time the dialog opens.
-	const [nonce, setNonce] = useState(0);
-	// Made in the effect (not during render), so that a mount run twice (React's strict mode)
-	// disposes the first run and previews with a live second one.
+	// One run per opening. Made in the effect (not during render), so that a mount run twice
+	// (React's strict mode) disposes the first run and previews with a live second one.
 	const [run, setRun] = useState<RestoreRun | null>(null);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: a new nonce is a new run
 	useEffect(() => {
-		if (!opened) {
+		if (!target) {
 			setRun(null);
 			return;
 		}
-		const made = new RestoreRun(io ?? restoreIO(spaceId), rootId, thenSeq);
+		const made = new RestoreRun(io ?? restoreIO(target.spaceId), target.rootId, target.thenSeq);
 		setRun(made);
 		void made.preview();
 		return () => made.dispose();
-	}, [opened, nonce, spaceId, rootId, thenSeq, io]);
+	}, [target, io]);
 	const state = useSyncExternalStore(
 		run?.subscribe ?? noSubscribe,
 		run?.getState ?? noState,
 		run?.getState ?? noState,
 	);
 	// What it wrote is shown everywhere: the current views, timelines and comparisons are stale.
-	const wrote = state?.progress.commits.length ?? 0;
+	const spaceId = target?.spaceId ?? null;
+	const wrote = state ? state.progress.commits.length + state.earlier.commits : 0;
 	const moved = state ? Object.values(state.moveBack).filter((m) => m.state === "moved").length : 0;
 	useEffect(() => {
-		if (wrote === 0 && moved === 0) return;
+		if (!spaceId || (wrote === 0 && moved === 0)) return;
 		invalidateOutlineSpace(queryClient, spaceId);
 		queryClient.removeQueries({ queryKey: ["outline", "diff", spaceId] });
 	}, [wrote, moved, queryClient, spaceId]);
 	const running = state?.phase === "running";
+	// Leaving the page while it runs asks first (what was written stays; the rest would not be).
+	useEffect(() => (running ? holdPageLeave() : undefined), [running]);
 	const close = () => {
 		if (running) return;
 		const finished = state?.phase === "done";
 		onClose();
 		if (finished) onFinished?.();
 	};
+	const whole = target?.rootId === null;
+	const seq = target?.thenSeq ?? 0;
 	return (
 		<Modal
-			opened={opened}
+			opened={target !== null}
 			onClose={close}
-			title={t("restore.title", { seq: thenSeq })}
+			title={t(whole ? "restore.titleSpace" : "restore.title", { seq })}
 			size="lg"
 			fullScreen={mobile}
 			closeOnClickOutside={!running}
@@ -126,14 +140,8 @@ export function OutlineRestoreModal({
 			withCloseButton={!running}
 			data-testid="outline-restore"
 		>
-			{run && state && (
-				<RestoreBody
-					run={run}
-					state={state}
-					thenSeq={thenSeq}
-					onClose={close}
-					onAgain={() => setNonce((n) => n + 1)}
-				/>
+			{run && state && target && (
+				<RestoreBody run={run} state={state} target={target} onClose={close} />
 			)}
 		</Modal>
 	);
@@ -145,18 +153,18 @@ const noState = () => null;
 function RestoreBody({
 	run,
 	state,
-	thenSeq,
+	target,
 	onClose,
-	onAgain,
 }: {
 	run: RestoreRun;
 	state: RestoreState;
-	thenSeq: number;
+	target: OutlineRestoreTarget;
 	onClose: () => void;
-	onAgain: () => void;
 }) {
 	const { t } = useTranslation("outline");
-	const { phase, progress, problem } = state;
+	const { phase, progress, problem, earlier } = state;
+	const thenSeq = target.thenSeq;
+	const whole = target.rootId === null;
 	const groups = useMemo(() => groupPreview(state.entries), [state.entries]);
 	const movedAway = useMemo(
 		() => state.entries.filter((entry) => entry.action === "none"),
@@ -167,19 +175,43 @@ function RestoreBody({
 		changed: progress.changed,
 		commits: progress.commits.length,
 	});
+	// Restoring the whole space asks once more, with the counts.
+	const [sure, setSure] = useState(false);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a new list asks again
+	useEffect(() => setSure(false), [state.entries]);
+	// The keyboard follows the phase: Stop while it runs, the result's heading when it is done.
+	const stopRef = useRef<HTMLButtonElement>(null);
+	const headingRef = useRef<HTMLParagraphElement>(null);
+	useEffect(() => {
+		if (phase === "running") stopRef.current?.focus();
+		else if (phase === "done") headingRef.current?.focus();
+	}, [phase]);
+	// The result names every moved-away block: read whatever of the list is still unread.
+	useEffect(() => {
+		if (phase === "done" && state.more && !state.loadingAll) void run.moreAll();
+	}, [phase, state.more, state.loadingAll, run]);
+	const written = earlier.changed > 0 && (
+		<Alert color="yellow" variant="light" py={6} data-testid="outline-restore-earlier">
+			<Text size="sm">{t("restore.earlier", { changed: earlier.changed })}</Text>
+		</Alert>
+	);
 
 	if (phase === "loading") {
 		return (
-			<Group gap="xs" data-restore-phase="loading">
-				<Loader size="sm" />
-				<Text size="sm">{t("restore.loading")}</Text>
-			</Group>
+			<Stack gap="sm" data-restore-phase="loading">
+				{written}
+				<Group gap="xs">
+					<Loader size="sm" />
+					<Text size="sm">{t("restore.loading")}</Text>
+				</Group>
+			</Stack>
 		);
 	}
 
 	if (phase === "running" || phase === "stopped") {
 		return (
 			<Stack gap="sm" data-restore-phase={phase}>
+				{written}
 				<Text size="sm" role="status" data-testid="outline-restore-progress">
 					{phase === "running"
 						? t("restore.running", { changed: progress.changed })
@@ -191,7 +223,12 @@ function RestoreBody({
 				</Text>
 				<Group justify="flex-end" gap="xs">
 					{phase === "running" ? (
-						<Button variant="default" onClick={() => run.stop()} data-testid="outline-restore-stop">
+						<Button
+							ref={stopRef}
+							variant="default"
+							onClick={() => run.stop()}
+							data-testid="outline-restore-stop"
+						>
 							{t("restore.stop")}
 						</Button>
 					) : (
@@ -201,6 +238,7 @@ function RestoreBody({
 							</Button>
 							<Button
 								color="orange"
+								disabled={!run.canConfirm()}
 								onClick={() => void run.confirm()}
 								data-testid="outline-restore-continue"
 							>
@@ -217,6 +255,7 @@ function RestoreBody({
 		const skipped = [...progress.skipped].sort(
 			(a, b) => SKIP_REASONS.indexOf(a.reason) - SKIP_REASONS.indexOf(b.reason),
 		);
+		const movedAwayCount = Math.max(progress.movedAway, movedAway.length);
 		return (
 			<Stack gap="sm" data-restore-phase="done" data-testid="outline-restore-result">
 				<Alert
@@ -224,10 +263,19 @@ function RestoreBody({
 					variant="light"
 					icon={<IconCheck size={16} />}
 				>
-					<Text size="sm" fw={500}>
-						{t("restore.done", { seq: thenSeq })}
+					<Text
+						ref={headingRef}
+						tabIndex={-1}
+						size="sm"
+						fw={500}
+						data-testid="outline-restore-done"
+					>
+						{t(whole ? "restore.doneSpace" : "restore.done", { seq: thenSeq })}
 					</Text>
 					<Text size="sm">{progress.changed > 0 ? summary : t("restore.doneNothing")}</Text>
+					{earlier.changed > 0 && (
+						<Text size="sm">{t("restore.earlier", { changed: earlier.changed })}</Text>
+					)}
 					{progress.pending && (
 						<Text size="sm">{t("restore.pendingHeld", { label: progress.pending.label })}</Text>
 					)}
@@ -237,7 +285,7 @@ function RestoreBody({
 						<Text size="sm" fw={500} mb={4}>
 							{t("restore.skippedTitle", { count: skipped.length })}
 						</Text>
-						<SkipList skipped={skipped} entries={state.entries} />
+						<SkipList skipped={skipped} entries={state.entries} spaceId={target.spaceId} />
 						{progress.skippedTruncated && (
 							<Text size="xs" c="dimmed" mt={4}>
 								{t("restore.skippedMore")}
@@ -245,16 +293,17 @@ function RestoreBody({
 						)}
 					</Box>
 				)}
-				{movedAway.length > 0 && (
-					<Box>
+				{movedAwayCount > 0 && (
+					<Box data-testid="outline-restore-moved-away" data-count={movedAwayCount}>
 						<Text size="sm" fw={500} mb={4}>
-							{t("restore.movedAwayTitle", { count: movedAway.length })}
+							{t("restore.movedAwayTitle", { count: movedAwayCount })}
 						</Text>
 						<Stack gap={2}>
 							{movedAway.map((entry) => (
 								<EntryRow key={entry.blockId} entry={entry} run={run} state={state} />
 							))}
 						</Stack>
+						{state.loadingAll && <Loader size={12} mt={4} />}
 					</Box>
 				)}
 				<Group justify="flex-end">
@@ -275,20 +324,28 @@ function RestoreBody({
 					variant="light"
 					data-testid="outline-restore-problem"
 					data-problem={problem?.kind}
+					data-own={problem?.kind === "conflict" && problem.own ? "" : undefined}
 				>
 					<Text size="sm">{problem ? problemText(problem, t) : null}</Text>
-					{progress.changed > 0 && (
-						<Text size="sm" mt={4}>
-							{t("restore.partial", { changed: progress.changed })}
+					{progress.changed + earlier.changed > 0 && (
+						<Text size="sm" mt={4} data-testid="outline-restore-partial">
+							{t("restore.partial", { changed: progress.changed + earlier.changed })}
 						</Text>
 					)}
 				</Alert>
+				{movedAway.length > 0 && (
+					<Stack gap={2}>
+						{movedAway.map((entry) => (
+							<EntryRow key={entry.blockId} entry={entry} run={run} state={state} />
+						))}
+					</Stack>
+				)}
 				<Group justify="flex-end" gap="xs">
 					<Button variant="default" onClick={onClose}>
 						{t("restore.close")}
 					</Button>
 					{fresh ? (
-						<Button onClick={onAgain} data-testid="outline-restore-again">
+						<Button onClick={() => void run.preview()} data-testid="outline-restore-again">
 							{t("restore.previewAgain")}
 						</Button>
 					) : (
@@ -306,10 +363,13 @@ function RestoreBody({
 
 	// The change list.
 	const empty = changes === 0 && !state.more;
+	const moving = Object.values(state.moveBack).some((m) => m.state === "moving");
+	const ready = run.canConfirm();
 	return (
 		<Stack gap="sm" data-restore-phase="preview" data-testid="outline-restore-preview">
+			{written}
 			<Text size="sm" c="dimmed">
-				{t("restore.intro", { seq: thenSeq })}
+				{t(whole ? "restore.introSpace" : "restore.intro", { seq: thenSeq })}
 			</Text>
 			{state.refreshed > 0 && (
 				<Text size="xs" c="dimmed" role="status" data-testid="outline-restore-refreshed">
@@ -322,7 +382,7 @@ function RestoreBody({
 				</Text>
 			)}
 			{groups.map(({ group, entries }) => (
-				<Box key={group} data-restore-group={group}>
+				<Box key={group} data-restore-group={group} data-count={entries.length}>
 					<Group gap={6} mb={4} wrap="nowrap">
 						<Text size="sm" fw={500}>
 							{t(`restore.group.${group}`)}
@@ -339,7 +399,11 @@ function RestoreBody({
 				</Box>
 			))}
 			{state.skippedElsewhere.length > 0 && (
-				<SkipList skipped={state.skippedElsewhere} entries={state.entries} />
+				<SkipList
+					skipped={state.skippedElsewhere}
+					entries={state.entries}
+					spaceId={target.spaceId}
+				/>
 			)}
 			{state.problem && (
 				<Alert color="red" variant="light" py={6}>
@@ -347,35 +411,73 @@ function RestoreBody({
 				</Alert>
 			)}
 			{state.more && (
-				<Box>
-					<Anchor
-						component="button"
-						type="button"
-						size="sm"
-						onClick={() => void run.more()}
-						disabled={state.loadingMore}
-						data-testid="outline-restore-more"
-					>
-						{t("restore.moreList")}
-					</Anchor>
-					{state.loadingMore && <Loader size={12} ml={6} />}
-					<Text size="xs" c="dimmed" mt={2}>
-						{t("restore.listIncomplete")}
+				<Box data-testid="outline-restore-incomplete">
+					<Text size="sm" mb={4}>
+						{t("restore.listIncomplete", { count: changes })}
 					</Text>
+					{state.loadingAll ? (
+						<Group gap="xs">
+							<Loader size={14} />
+							<Anchor
+								component="button"
+								type="button"
+								size="sm"
+								onClick={() => run.stopList()}
+								data-testid="outline-restore-all-stop"
+							>
+								{t("restore.stop")}
+							</Anchor>
+						</Group>
+					) : (
+						<Button
+							size="compact-sm"
+							variant="light"
+							onClick={() => void run.moreAll()}
+							data-testid="outline-restore-all"
+						>
+							{t("restore.wholeList")}
+						</Button>
+					)}
 				</Box>
+			)}
+			{whole && sure && (
+				<Alert color="orange" variant="light" data-testid="outline-restore-space-sure">
+					<Text size="sm">
+						{t("restore.spaceSure", {
+							count: changes,
+							groups: groups
+								.filter((g) => g.group !== "moved-away" && g.group !== "kept")
+								.map((g) => `${t(`restore.group.${g.group}`)} ${g.entries.length}`)
+								.join(" · "),
+						})}
+					</Text>
+				</Alert>
 			)}
 			<Group justify="flex-end" gap="xs" className={classes.restoreActions}>
 				<Button variant="default" onClick={onClose}>
 					{t("restore.cancel")}
 				</Button>
-				<Button
-					color="orange"
-					disabled={empty || (changes === 0 && !state.more)}
-					onClick={() => void run.confirm()}
-					data-testid="outline-restore-confirm"
-				>
-					{t("restore.confirm")}
-				</Button>
+				{whole && !sure ? (
+					<Button
+						color="orange"
+						disabled={!ready}
+						title={moving ? t("restore.waitMoveBack") : undefined}
+						onClick={() => setSure(true)}
+						data-testid="outline-restore-confirm"
+					>
+						{t("restore.confirmSpace")}
+					</Button>
+				) : (
+					<Button
+						color="orange"
+						disabled={!ready}
+						title={moving ? t("restore.waitMoveBack") : undefined}
+						onClick={() => void run.confirm()}
+						data-testid={whole ? "outline-restore-confirm-space" : "outline-restore-confirm"}
+					>
+						{t(whole ? "restore.confirmSpaceSure" : "restore.confirm")}
+					</Button>
+				)}
 			</Group>
 		</Stack>
 	);
@@ -414,7 +516,8 @@ function EntryRow({
 			data-restore-entry={entry.blockId}
 			data-restore-action={entry.action}
 		>
-			<OutlineDiffMark kind={entry.kind} label={kindLabel} />
+			{/* What happened since, muted: the group's heading says what the restore does. */}
+			<OutlineDiffMark kind={entry.kind} label={kindLabel} muted />
 			<Box style={{ minWidth: 0, flex: 1 }}>
 				<Text size="sm" className={classes.ellipsis}>
 					{entryLine(entry, t)}
@@ -481,9 +584,11 @@ function MoveBack({
 function SkipList({
 	skipped,
 	entries,
+	spaceId,
 }: {
 	skipped: readonly OutlineRestoreSkip[];
 	entries: readonly OutlineRestoreEntry[];
+	spaceId: string;
 }) {
 	const { t } = useTranslation("outline");
 	const byId = useMemo(() => new Map(entries.map((entry) => [entry.blockId, entry])), [entries]);
@@ -499,7 +604,7 @@ function SkipList({
 						data-block={skip.blockId}
 					>
 						<Text size="sm" className={classes.ellipsis}>
-							{entry ? entryLine(entry, t) : skip.sid}
+							{entry ? entryLine(entry, t) : <BlockName spaceId={spaceId} blockId={skip.blockId} />}
 						</Text>
 						<Text size="xs" c="dimmed">
 							{t(`restore.skip.${skip.reason}`)}
@@ -509,4 +614,19 @@ function SkipList({
 			})}
 		</Stack>
 	);
+}
+
+/** A block the change list did not name: its first line, read now (never a bare short id). */
+function BlockName({ spaceId, blockId }: { spaceId: string; blockId: string }) {
+	const { t } = useTranslation("outline");
+	const read = useQuery({
+		queryKey: ["outline", "block-name", spaceId, blockId],
+		queryFn: () => api.getOutlineSubtree(spaceId, blockId, { view: "all", blocks: 1 }),
+		retry: false,
+		staleTime: 60_000,
+	});
+	if (read.isLoading) return <Loader size={10} />;
+	const block = read.data?.blocks.find((b) => b.id === blockId);
+	const line = block ? blockTitle(block.content).trim() : "";
+	return <>{line || (block ? t("diff.untitled") : t("restore.blockUnreadable"))}</>;
 }

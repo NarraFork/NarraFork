@@ -2,8 +2,10 @@
  * The bar over a block (or the whole space) shown as it was at a point of its history
  * (pageless outline, F2): it says so plainly, goes back to now, opens what changed since (or
  * up to a later point: `OutlineDiffList`, whose rows the host marks in the forest as of then),
- * and — for people who may change the space — restores the subtree to this point
- * (`OutlineRestoreModal`). People who may only read see the history and the comparison.
+ * and — for people who may change the space — asks the host to restore the subtree to this
+ * point (`onRestore`: the host keeps the restore dialog, `OutlineRestoreModal`, so that moving
+ * through history meanwhile neither changes nor ends it). People who may only read see the
+ * history and the comparison.
  */
 import { Badge, Box, Button, Group, NativeSelect, Paper, Text } from "@mantine/core";
 import type { OutlineDiffKind } from "@shared/outline-restore-api";
@@ -15,9 +17,7 @@ import { formatSmartTime } from "../../../lib/format";
 import { timelineOldestFirst } from "../../../lib/outline-view";
 import classes from "../Outline.module.css";
 import { commitActorLabel } from "../OutlineTimeline";
-import type { RestoreIO } from "./history-model";
 import { OutlineDiffList } from "./OutlineDiffList";
-import { OutlineRestoreModal } from "./OutlineRestoreModal";
 
 /** Commits a "compare with" list offers at most (the newest after the point). */
 const COMPARE_CHOICES = 50;
@@ -29,7 +29,7 @@ export function OutlineHistoryBar({
 	canWrite,
 	onBack,
 	onMarks,
-	restoreIO,
+	onRestore,
 }: {
 	spaceId: string;
 	/** The block shown; null: the whole space. */
@@ -41,13 +41,12 @@ export function OutlineHistoryBar({
 	onBack: () => void;
 	/** What the comparison names in the forest as of `asOf` (empty when it is closed). */
 	onMarks?: (marks: ReadonlyMap<string, OutlineDiffKind>) => void;
-	/** Requests of a restore (tests); the app's API when absent. */
-	restoreIO?: RestoreIO;
+	/** Restore the subtree to `asOf` (the host opens its restore dialog). */
+	onRestore?: (thenSeq: number) => void;
 }) {
 	const { t } = useTranslation("outline");
 	const [comparing, setComparing] = useState(false);
 	const [to, setTo] = useState<number | undefined>(undefined);
-	const [restoring, setRestoring] = useState(false);
 	// The same query as the timeline strip: the commit shown, and the later ones to compare with.
 	const timeline = useOutlineSubtreeTimeline(spaceId, rootId);
 	const commits = useMemo(() => timelineOldestFirst(timeline.data?.pages ?? []), [timeline.data]);
@@ -104,13 +103,13 @@ export function OutlineHistoryBar({
 					>
 						{t(comparing ? "asOf.hideCompare" : "asOf.compare")}
 					</Button>
-					{canWrite && (
+					{canWrite && onRestore && (
 						<Button
 							size="compact-sm"
 							variant="light"
 							color="orange"
 							leftSection={<IconRestore size={14} />}
-							onClick={() => setRestoring(true)}
+							onClick={() => onRestore(asOf)}
 							data-testid="outline-history-restore"
 						>
 							{t("asOf.restore")}
@@ -157,17 +156,6 @@ export function OutlineHistoryBar({
 						onMarks={onMarks}
 					/>
 				</Paper>
-			)}
-			{canWrite && (
-				<OutlineRestoreModal
-					spaceId={spaceId}
-					rootId={rootId}
-					thenSeq={asOf}
-					opened={restoring}
-					onClose={() => setRestoring(false)}
-					onFinished={onBack}
-					io={restoreIO}
-				/>
 			)}
 		</Box>
 	);

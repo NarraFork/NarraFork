@@ -368,7 +368,9 @@ describe("a restore, driven", () => {
 
 	test("a move back that cannot go says why; after the restore it does not re-preview", async () => {
 		const s = scripted();
-		s.previews.push(async () => previewPage([entry("m", "none"), entry("n", "none")], null));
+		s.previews.push(async () =>
+			previewPage([entry("a", "delete"), entry("m", "none"), entry("n", "none")], null),
+		);
 		s.restores.push(async () => answer({ done: true }));
 		s.moves.push(async () => {
 			throw apiError(409, "OUTLINE_RESTORE_PARENT_GONE");
@@ -404,5 +406,119 @@ describe("a restore, driven", () => {
 		release(previewPage([entry("old", "delete")], null));
 		await first;
 		expect(run.getState().entries.map((e) => e.blockId)).toEqual(["new"]);
+	});
+});
+
+describe("the change list is shown before confirming (D58; review probes)", () => {
+	test("probe B: a first page with nothing but a moved-away block and more to read cannot be confirmed; the whole list can", async () => {
+		const s = scripted();
+		s.previews.push(
+			async () => previewPage([entry("m", "none")], "p1"),
+			async () => previewPage([entry("a", "put-back")], "p2"),
+			async () => previewPage([entry("b", "delete")], null),
+		);
+		s.restores.push(async () => answer({ done: true, changed: 2 }));
+		const run = new RestoreRun(s.io, "r", 5, now);
+		await run.preview();
+		expect(run.canConfirm()).toBe(false);
+		await run.confirm();
+		// Nothing was written: the changes on the unread pages were never shown.
+		expect(s.calls.filter((c) => c.kind === "restore")).toHaveLength(0);
+		expect(run.getState().phase).toBe("preview");
+		// "Show the whole list": page after page until there is none left.
+		await run.moreAll();
+		expect(run.getState().more).toBe(false);
+		expect(run.getState().loadingAll).toBe(false);
+		expect(run.getState().entries.map((e) => e.blockId)).toEqual(["m", "a", "b"]);
+		expect(run.canConfirm()).toBe(true);
+		await run.confirm();
+		expect(run.getState().phase).toBe("done");
+	});
+
+	test("reading the whole list stops when asked, after the page in flight", async () => {
+		const s = scripted();
+		let run: RestoreRun | null = null;
+		s.previews.push(
+			async () => previewPage([entry("a", "delete")], "p1"),
+			async () => {
+				run?.stopList();
+				return previewPage([entry("b", "delete")], "p2");
+			},
+		);
+		run = new RestoreRun(s.io, "r", 5, now);
+		await run.preview();
+		await run.moreAll();
+		expect(run.getState().entries.map((e) => e.blockId)).toEqual(["a", "b"]);
+		expect(run.getState().more).toBe(true);
+		expect(run.getState().loadingAll).toBe(false);
+		expect(run.canConfirm()).toBe(false);
+	});
+
+	test("probe A: no confirming while a move-back is in flight", async () => {
+		const s = scripted();
+		s.previews.push(async () => previewPage([entry("a", "put-back"), entry("m", "none")], null));
+		let release: () => void = () => {};
+		s.moves.push(
+			() =>
+				new Promise((resolve) => {
+					release = () => resolve({ commit: { id: "mb", seq: 12 } });
+				}),
+		);
+		s.previews.push(async () => previewPage([entry("a", "put-back")], null, { token: "tok2" }));
+		const run = new RestoreRun(s.io, "r", 5, now);
+		await run.preview();
+		const moving = run.moveBack("m");
+		expect(run.canConfirm()).toBe(false);
+		await run.confirm();
+		expect(s.calls.filter((c) => c.kind === "restore")).toHaveLength(0);
+		release();
+		await moving;
+		// Not confirmed yet: the list is worked out again, and can then be confirmed.
+		expect(run.getState().refreshed).toBe(1);
+		expect(run.canConfirm()).toBe(true);
+	});
+
+	test("probe A: a move-back after a partial restore keeps what was written; its own conflict is not blamed on someone else", async () => {
+		const s = scripted();
+		s.previews.push(async () => previewPage([entry("a", "put-back"), entry("m", "none")], null));
+		let run: RestoreRun | null = null;
+		s.restores.push(async () => {
+			run?.stop();
+			return answer({ cursor: "c1", changed: 7, commits: [{ id: "k1", seq: 10 }] });
+		});
+		s.moves.push(async () => ({ commit: { id: "mb", seq: 12 } }));
+		s.restores.push(async () => {
+			throw apiError(409, "OUTLINE_RESTORE_CONFLICT", { conflictSeq: 12 });
+		});
+		run = new RestoreRun(s.io, "r", 5, now);
+		await run.preview();
+		await run.confirm();
+		expect(run.getState().phase).toBe("stopped");
+		await run.moveBack("m");
+		// Confirmed already: no new preview, the 7 blocks written stay said.
+		expect(run.getState().phase).toBe("stopped");
+		expect(run.getState().progress.changed).toBe(7);
+		expect(s.calls.filter((c) => c.kind === "preview")).toHaveLength(1);
+		await run.confirm();
+		expect(run.getState().phase).toBe("failed");
+		expect(run.getState().problem).toEqual({ kind: "conflict", conflictSeq: 12, own: true });
+		expect(run.getState().progress.changed).toBe(7);
+		// Previewing again carries what was written.
+		s.previews.push(async () => previewPage([entry("a", "put-back")], null, { token: "tok2" }));
+		await run.preview();
+		expect(run.getState().phase).toBe("preview");
+		expect(run.getState().earlier).toEqual({ changed: 7, commits: 1 });
+	});
+
+	test("someone else's conflict is not marked as the reader's own", async () => {
+		const s = scripted();
+		s.previews.push(async () => previewPage([entry("a", "put-back")], null));
+		s.restores.push(async () => {
+			throw apiError(409, "OUTLINE_RESTORE_CONFLICT", { conflictSeq: 30 });
+		});
+		const run = new RestoreRun(s.io, "r", 5, now);
+		await run.preview();
+		await run.confirm();
+		expect(run.getState().problem).toEqual({ kind: "conflict", conflictSeq: 30 });
 	});
 });

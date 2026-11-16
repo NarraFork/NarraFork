@@ -266,7 +266,6 @@ const BlockRowView = memo(function BlockRowView({
 		hidden !== "" ||
 		row.pinned ||
 		changed !== "" ||
-		diff !== null ||
 		(facts && (openTasks > 0 || processHidden > 0));
 	return (
 		<>
@@ -323,6 +322,12 @@ const BlockRowView = memo(function BlockRowView({
 				{marker === "question" && block.question && (
 					<OutlineQuestionIcon state={block.question.state} proceed={block.question.proceed} />
 				)}
+				{/* What happened to it since (a view as of a commit, compared): inline, before its text. */}
+				{diff && (
+					<span className={classes.diffSlot}>
+						<OutlineDiffMark kind={diff} label={t(`diff.mark.${diff}`)} />
+					</span>
+				)}
 				{/* biome-ignore lint/a11y/noStaticElementInteractions: a second way into editing; the visible control is the host's */}
 				<div
 					className={classes.content}
@@ -339,7 +344,6 @@ const BlockRowView = memo(function BlockRowView({
 					)}
 					{hasMeta && (
 						<div className={classes.meta}>
-							{diff && <OutlineDiffMark kind={diff} label={t(`diff.mark.${diff}`)} />}
 							{row.pinned && (
 								<Badge
 									size="xs"

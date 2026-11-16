@@ -108,6 +108,7 @@ import { OutlineTaskIcon } from "./forest/ForestBlocks";
 import type { SpaceForest } from "./forest/forest-model";
 import { OutlineForest } from "./forest/OutlineForest";
 import { OutlineHistoryBar } from "./history/OutlineHistoryBar";
+import { OutlineRestoreModal, type OutlineRestoreTarget } from "./history/OutlineRestoreModal";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBreadcrumbs, OutlineLocateLink } from "./OutlineBreadcrumbs";
@@ -415,6 +416,14 @@ function SurfaceBody({
 	const backToNow = useCallback(() => goRef.current({ asOf: undefined }), []);
 	// The blocks of the forest as of `asOf` that the comparison names (marked on their rows).
 	const [diffMarks, setDiffMarks] = useState<ReadonlyMap<string, OutlineDiffKind>>(NO_MARKS);
+	// The restore dialog, with what it restores captured as it opens: going elsewhere in history
+	// (or to another block) meanwhile does not change it, and a running restore runs on.
+	const [restoring, setRestoring] = useState<OutlineRestoreTarget | null>(null);
+	const restoreTo = useCallback(
+		(thenSeq: number) => setRestoring({ spaceId, rootId: blockId, thenSeq }),
+		[spaceId, blockId],
+	);
+	const restoreClosed = useCallback(() => setRestoring(null), []);
 	const linkSearch = useMemo<OutlineBlockSearch>(
 		() => ({
 			...(asOf !== undefined ? { asOf } : {}),
@@ -668,6 +677,7 @@ function SurfaceBody({
 						canWrite={view.space.canWrite}
 						onBack={backToNow}
 						onMarks={setDiffMarks}
+						onRestore={restoreTo}
 					/>
 				)}
 
@@ -808,6 +818,7 @@ function SurfaceBody({
 				{content}
 			</Box>
 			{drawer}
+			<OutlineRestoreModal target={restoring} onClose={restoreClosed} onFinished={backToNow} />
 			<QuickSwitcherHost
 				ref={switcher}
 				spaceId={spaceId}

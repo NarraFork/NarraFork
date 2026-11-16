@@ -130,8 +130,7 @@
 		"sessionUnavailable": "你无法打开写入它的会话。",
 		"floor": "更早的历史没有保留。",
 		"view": "查看 #{{seq}} 时的样子",
-		"unavailable": "这里的历史暂时读不到：还在准备中。",
-		"beforeFloor": "#{{seq}} 之前的历史没有保留。"
+		"unavailable": "这里的历史暂时读不到：还在准备中。"
 	},
 	"editor": {
 		"questionMark": "打开提问即可回答；删除即撤回。",
@@ -838,8 +837,7 @@
 		"movedBackRestored": "已恢复并移回",
 		"cannotMoveBack": "原来的位置已经不在了",
 		"refreshed": "移回之后，清单已重新计算。",
-		"moreList": "显示更多清单",
-		"listIncomplete": "清单还没列完：确认后会全部恢复，不只是这里显示的部分。",
+		"listIncomplete": "已列出 {{count}} 项改动，清单还没完。恢复之前请先看完整个清单：恢复会改动清单上的全部内容。",
 		"confirm": "恢复",
 		"cancel": "取消",
 		"running": "正在恢复… 已改动 {{changed}} 个块",
@@ -876,8 +874,19 @@
 			"root": "那个时刻这个块不在大纲里。",
 			"parent-gone": "它原来所在的块现在已被删除，请先恢复那个块。",
 			"forbidden": "你可以查看这个空间，但不能修改。",
-			"missing": "找不到这个位置。"
+			"missing": "找不到这个位置。",
+			"conflictOwn": "预览之后你自己的「移回」（提交 #{{seq}}）改动了这里，没有再写入任何内容。请重新预览，按现在的清单继续。"
 		},
-		"partial": "已经恢复了一部分：改动了 {{changed}} 个块。"
+		"partial": "已经恢复了一部分：改动了 {{changed}} 个块。",
+		"titleSpace": "把整个空间恢复到 #{{seq}}",
+		"introSpace": "#{{seq}} 时在这个空间里的内容都会改回：之后在空间任何地方新增的块会被删除，被删除的会恢复，文字和顺序会改回。这会动整个空间，不只是一个块。",
+		"doneSpace": "整个空间已恢复到 #{{seq}}。",
+		"earlier": "这次预览之前已经恢复了 {{changed}} 个块（保持恢复后的样子）。",
+		"wholeList": "显示完整清单",
+		"spaceSure": "这会改动整个空间里的 {{count}} 个块（{{groups}}）。确定恢复整个空间吗？",
+		"confirmSpace": "恢复整个空间…",
+		"confirmSpaceSure": "确定，恢复整个空间",
+		"waitMoveBack": "等移回完成",
+		"blockUnreadable": "一个已无法读取的块"
 	}
 }

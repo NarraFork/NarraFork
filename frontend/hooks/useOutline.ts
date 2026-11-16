@@ -45,7 +45,6 @@ export const outlineKeys = {
 	/** The commits of a block's subtree (`""`: the whole space). */
 	timeline: (spaceId: string, rootId: string | null) =>
 		["outline", "timeline", spaceId, rootId ?? ""] as const,
-	history: (spaceId: string, blockId: string) => ["outline", "history", spaceId, blockId] as const,
 	/** A comparison of a subtree between two seqs (`to` null: now as of its first page). */
 	diff: (spaceId: string, rootId: string | null, thenSeq: number, to: number | null) =>
 		["outline", "diff", spaceId, rootId ?? "", thenSeq, to] as const,
@@ -482,7 +481,7 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 		// Views as of a commit never change.
 		predicate: (query) => query.queryKey[4] === null,
 	});
-	for (const kind of ["timeline", "history", "backlinks", "pages", "space", "pending"]) {
+	for (const kind of ["timeline", "backlinks", "pages", "space", "pending"]) {
 		void queryClient.invalidateQueries({ queryKey: ["outline", kind, spaceId] });
 	}
 	void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });

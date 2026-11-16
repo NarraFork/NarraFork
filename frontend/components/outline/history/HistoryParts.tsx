@@ -20,10 +20,13 @@ export function OutlineDiffMark({
 	kind,
 	label,
 	testId = "outline-diff-mark",
+	muted = false,
 }: {
 	kind: OutlineDiffKind;
 	label: string;
 	testId?: string;
+	/** Gray: beside words that say what happens (a restore's change list). */
+	muted?: boolean;
 }) {
 	const { Icon } = DIFF_ICONS[kind];
 	return (
@@ -31,7 +34,7 @@ export function OutlineDiffMark({
 			<Badge
 				size="xs"
 				variant="light"
-				color={DIFF_TONE[kind]}
+				color={muted ? "gray" : DIFF_TONE[kind]}
 				tt="none"
 				px={3}
 				role="img"
@@ -56,6 +59,8 @@ export function entryLine(entry: Pick<OutlineDiffEntry, "before" | "after">, t: 
 export function problemText(problem: HistoryProblem, t: TFunction): string {
 	switch (problem.kind) {
 		case "conflict":
+			if (problem.own)
+				return t("restore.problem.conflictOwn", { ns: "outline", seq: problem.conflictSeq });
 			return problem.conflictSeq !== null
 				? t("restore.problem.conflict", { ns: "outline", seq: problem.conflictSeq })
 				: t("restore.problem.conflictNoSeq", { ns: "outline" });

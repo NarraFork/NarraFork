@@ -27,6 +27,7 @@ import { useOutlineSpace } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
 import { OutlineForest } from "./forest/OutlineForest";
 import { OutlineHistoryBar } from "./history/OutlineHistoryBar";
+import { OutlineRestoreModal, type OutlineRestoreTarget } from "./history/OutlineRestoreModal";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
 import { OutlineTimeline } from "./OutlineTimeline";
@@ -67,6 +68,8 @@ export function OutlineSpaceHome({
 	const [asOf, setAsOf] = useState<number | undefined>(undefined);
 	const [diffMarks, setDiffMarks] = useState<ReadonlyMap<string, OutlineDiffKind>>(NO_MARKS);
 	const backToNow = useCallback(() => setAsOf(undefined), []);
+	// The whole space's restore dialog, its point captured as it opens (see `OutlineSurface`).
+	const [restoring, setRestoring] = useState<OutlineRestoreTarget | null>(null);
 	const detail = space.data?.space;
 	const root = useMemo(
 		() => (detail ? ({ kind: "space", space: detail } as const) : null),
@@ -161,6 +164,7 @@ export function OutlineSpaceHome({
 						canWrite={detail.canWrite}
 						onBack={backToNow}
 						onMarks={setDiffMarks}
+						onRestore={(thenSeq) => setRestoring({ spaceId, rootId: null, thenSeq })}
 					/>
 				)}
 				{historyOpen && asOf === undefined && (
@@ -208,6 +212,11 @@ export function OutlineSpaceHome({
 						hidden={searching || asOf !== undefined}
 					/>
 				)}
+				<OutlineRestoreModal
+					target={restoring}
+					onClose={() => setRestoring(null)}
+					onFinished={backToNow}
+				/>
 				{historyOpen && (
 					<OutlineTimeline
 						spaceId={spaceId}

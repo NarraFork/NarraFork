@@ -57,11 +57,13 @@ let server: ReturnType<typeof Bun.serve>;
 let alice: string;
 let bob: string;
 let spaceId: string;
+/** A second project space, restored whole. */
+let wholeSpaceId: string;
 let scenarios = 0;
 
-async function write(ops: OutlineOp[], user = alice) {
+async function write(ops: OutlineOp[], user = alice, space = spaceId) {
 	const result = await writeOutline({
-		spaceId,
+		spaceId: space,
 		ops,
 		actor: { kind: "human", id: user },
 		responsibleUserId: user,
@@ -74,9 +76,10 @@ async function write(ops: OutlineOp[], user = alice) {
  * (with a child). After `then`: Alpha's text changes, Delta is added, Gamma moves to E, Xray
  * moves into R, Beta is deleted.
  */
-async function scenario() {
+async function scenario(space = spaceId) {
 	const n = ++scenarios;
-	const made = await write([
+	const w = (ops: OutlineOp[]) => write(ops, alice, space);
+	const made = await w([
 		{ op: "insert", tempId: "r", parent: null, content: `Plan ${n}` },
 		{ op: "insert", tempId: "a", parent: { tempId: "r" }, content: "Alpha" },
 		{ op: "insert", tempId: "b", parent: { tempId: "r" }, content: "Beta" },
@@ -95,11 +98,11 @@ async function scenario() {
 		string,
 	];
 	const then = made.seq;
-	await write([{ op: "update", block: { id: a }, content: "Alpha v2" }]);
-	const d = (await write([{ op: "insert", parent: { id: r }, content: "Delta" }])).ids[0] as string;
-	await write([{ op: "move", block: { id: c }, parent: { id: e } }]);
-	await write([{ op: "move", block: { id: x }, parent: { id: r } }]);
-	const last = await write([{ op: "delete", block: { id: b } }]);
+	await w([{ op: "update", block: { id: a }, content: "Alpha v2" }]);
+	const d = (await w([{ op: "insert", parent: { id: r }, content: "Delta" }])).ids[0] as string;
+	await w([{ op: "move", block: { id: c }, parent: { id: e } }]);
+	await w([{ op: "move", block: { id: x }, parent: { id: r } }]);
+	const last = await w([{ op: "delete", block: { id: b } }]);
 	return { r, a, b, c, d, e, x, y, then, last: last.seq };
 }
 
@@ -188,6 +191,16 @@ beforeAll(async () => {
 		updatedAt: NOW,
 	});
 	spaceId = (await ensureProjectSpace(projectId)).id;
+	const wholeProject = generateId();
+	await db.insert(projects).values({
+		id: wholeProject,
+		name: "Whole",
+		ownerUserId: alice,
+		visibility: "private",
+		createdAt: NOW,
+		updatedAt: NOW,
+	});
+	wholeSpaceId = (await ensureProjectSpace(wholeProject)).id;
 	if (SHOTS) mkdirSync(SHOTS, { recursive: true });
 }, 120_000);
 
@@ -579,6 +592,77 @@ test("the whole space's history: its timeline on the space's page, and the space
 	await until(page, "the comparison", (f) => f.diffEntries().length > 0);
 	expect(await call(page, (f) => f.clickTestId("outline-history-now"))).toBe(true);
 	await until(page, "now again", (f) => f.bar() === null);
+	await page.browserContext().close();
+}, 120_000);
+
+test("a change list longer than one page: Restore waits until the whole list is shown", async () => {
+	const big = await write([{ op: "insert", parent: null, content: "Long restore" }]);
+	const bigId = big.ids[0] as string;
+	const added = (
+		await write(
+			Array.from({ length: 130 }, (_, i) => ({
+				op: "insert" as const,
+				parent: { id: bigId },
+				content: `Added ${i}`,
+			})),
+		)
+	).ids;
+	const page = await focus({ r: bigId }, alice, big.seq);
+	await until(page, "the bar", (f) => f.bar() !== null);
+	await preview(page);
+	// The first page does not hold all of it: Restore is not offered yet.
+	expect(await call(page, (f) => f.has("[data-testid=outline-restore-incomplete]"))).toBe(true);
+	expect(await call(page, (f) => f.has("[data-testid=outline-restore-confirm][disabled]"))).toBe(
+		true,
+	);
+	expect(await call(page, (f) => f.clickTestId("outline-restore-all"))).toBe(true);
+	await until(page, "the whole list", (f) => !f.has("[data-testid=outline-restore-incomplete]"));
+	const groups = await call(page, (f) => f.restoreGroups());
+	expect(groups.map((g) => [g.group, g.entries.length])).toEqual([["delete", 130]]);
+	expect(await call(page, (f) => f.clickTestId("outline-restore-confirm"))).toBe(true);
+	await until(page, "the result", (f) => f.restorePhase() === "done");
+	for (const id of [added[0], added[129]])
+		expect((await outlineStore.getBlock(id as string))?.deleted).toBe(true);
+	await page.browserContext().close();
+}, 120_000);
+
+test("restoring the whole space: its own title, a second confirmation with the counts, then done", async () => {
+	const s = await scenario(wholeSpaceId);
+	const page = await openView({ target: { kind: "space", spaceId: wholeSpaceId } });
+	await until(page, "the space's blocks", hasRow, `Plan ${scenarios}`);
+	expect(await call(page, (f) => f.clickTestId("outline-space-history"))).toBe(true);
+	await until(
+		page,
+		"the space's timeline",
+		(f, last: number) => f.ticks().seqs.includes(last),
+		s.last,
+	);
+	expect(await call(page, (f, seq: number) => f.clickTick(seq), s.then)).toBe(true);
+	await until(page, "the bar", (f) => f.bar() !== null);
+	await preview(page);
+	expect(await call(page, (f) => f.text())).toContain(`Restore the whole space to #${s.then}`);
+	// Within the whole space nothing moved in or away: the moves are put back as changes.
+	const groups = await call(page, (f) => f.restoreGroups());
+	expect(groups.map((g) => g.group)).toEqual(["delete", "restore", "put-back"]);
+	// The first click asks again, with the counts.
+	expect(await call(page, (f) => f.clickTestId("outline-restore-confirm"))).toBe(true);
+	await until(page, "the second question", (f) =>
+		f.has("[data-testid=outline-restore-space-sure]"),
+	);
+	expect(await call(page, (f) => f.text())).toContain("across the whole space");
+	expect((await outlineStore.getBlock(s.b))?.deleted).toBe(true);
+	await shot(page, "11-restore-whole-space");
+	expect(await call(page, (f) => f.clickTestId("outline-restore-confirm-space"))).toBe(true);
+	await until(page, "the result", (f) => f.restorePhase() === "done");
+	expect(await call(page, (f) => f.text())).toContain(
+		`The whole space was restored to #${s.then}.`,
+	);
+	const block = async (id: string) => outlineStore.getBlock(id);
+	expect((await block(s.a))?.content).toBe("Alpha");
+	expect((await block(s.b))?.deleted).toBe(false);
+	expect((await block(s.d))?.deleted).toBe(true);
+	expect((await block(s.c))?.parentId).toBe(s.r);
+	expect((await block(s.x))?.parentId).toBe(s.e);
 	await page.browserContext().close();
 }, 120_000);
 

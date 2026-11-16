@@ -550,6 +550,16 @@
 	border-top: 1px solid var(--mantine-color-default-border);
 }
 
+/* A comparison's mark on a forest row, before its text (in line with the first line). */
+.diffSlot {
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	align-self: flex-start;
+	margin-top: 3px;
+	margin-inline-end: 4px;
+}
+
 .diffList {
 	min-width: 0;
 }

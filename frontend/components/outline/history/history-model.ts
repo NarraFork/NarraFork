@@ -33,8 +33,11 @@ import { ApiError } from "../../../lib/api";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type HistoryProblem =
-	/** Someone changed the subtree after the preview: nothing more was written. */
-	| { kind: "conflict"; conflictSeq: number | null }
+	/**
+	 * The subtree changed after the preview: nothing more was written. `own`: the change was the
+	 * reader's own move-back from this dialog (not someone else's).
+	 */
+	| { kind: "conflict"; conflictSeq: number | null; own?: boolean }
 	/** The preview is older than its token allows. */
 	| { kind: "expired" }
 	/** The preview is someone else's. */
@@ -306,6 +309,13 @@ export interface RestoreState {
 	moveBack: Readonly<Record<string, MoveBackState>>;
 	/** The change list was read again after a move-back (the subtree changed). */
 	refreshed: number;
+	/** "Show the whole list" is reading page after page. */
+	loadingAll: boolean;
+	/**
+	 * What confirmations of an earlier preview in this dialog already wrote (a restore stopped
+	 * by a conflict, then previewed again): it stays written, and is said.
+	 */
+	earlier: { changed: number; commits: number };
 }
 
 const EMPTY_PROGRESS: RestoreProgress = {
@@ -335,6 +345,10 @@ export class RestoreRun {
 	/** Bumped by every new preview: answers of an older one are dropped. */
 	private generation = 0;
 	private stopAsked = false;
+	/** "Show the whole list" was asked to stop. */
+	private stopListAsked = false;
+	/** Seqs of the commits this dialog's own move-backs wrote. */
+	private readonly ownSeqs = new Set<number>();
 	/** The current preview was confirmed (a failed call then is retried by confirming again). */
 	private confirmed = false;
 	private disposed = false;
@@ -358,6 +372,8 @@ export class RestoreRun {
 			problem: null,
 			moveBack: {},
 			refreshed: 0,
+			loadingAll: false,
+			earlier: { changed: 0, commits: 0 },
 		};
 	}
 
@@ -388,8 +404,16 @@ export class RestoreRun {
 		this.restoreCursor = null;
 		this.pages = [];
 		this.stopAsked = false;
+		this.stopListAsked = true;
 		this.confirmed = false;
+		// What an earlier confirmation wrote stays written: it is carried, not forgotten.
+		const { progress, earlier } = this.state;
 		this.set({
+			earlier: {
+				changed: earlier.changed + progress.changed,
+				commits: earlier.commits + progress.commits.length,
+			},
+			loadingAll: false,
 			phase: "loading",
 			entries: [],
 			skippedElsewhere: [],
@@ -452,12 +476,61 @@ export class RestoreRun {
 	}
 
 	/**
+	 * "Show the whole list": read page after page until the change list is complete, the reader
+	 * stops it ({@link stopList}), or a page fails. Each page is one bounded read of the server.
+	 */
+	async moreAll(): Promise<void> {
+		if (this.state.loadingAll || !this.state.more) return;
+		const generation = this.generation;
+		this.stopListAsked = false;
+		this.set({ loadingAll: true });
+		while (
+			this.state.more &&
+			!this.stopListAsked &&
+			!this.disposed &&
+			generation === this.generation &&
+			this.state.phase === "preview" &&
+			this.state.problem === null
+		) {
+			await this.more();
+		}
+		if (generation === this.generation) this.set({ loadingAll: false });
+	}
+
+	/** Stop "Show the whole list" after the page in flight. */
+	stopList(): void {
+		this.stopListAsked = true;
+	}
+
+	/** A move-back of this dialog is in flight. */
+	private moving(): boolean {
+		return Object.values(this.state.moveBack).some((m) => m.state === "moving");
+	}
+
+	/**
+	 * Whether the restore can be confirmed now. Owner rule D58: the change list is shown BEFORE
+	 * confirming, so the whole list must be loaded (no page left), with something to change in
+	 * it; and not while a move-back is in flight (it changes the subtree under the preview).
+	 */
+	canConfirm(): boolean {
+		const { phase, more, loadingMore, entries } = this.state;
+		if (!this.token || this.moving()) return false;
+		if (phase === "stopped") return true;
+		return (
+			phase === "preview" &&
+			!more &&
+			!loadingMore &&
+			entries.some((entry) => entry.action !== "none")
+		);
+	}
+
+	/**
 	 * Confirm: call the restore again and again (with its cursor) until it is done, the reader
-	 * stops it, or a call fails. Continues where it stopped when called again.
+	 * stops it, or a call fails. Continues where it stopped when called again. Refused unless
+	 * {@link canConfirm}.
 	 */
 	async confirm(): Promise<void> {
-		const { phase } = this.state;
-		if (!this.token || (phase !== "preview" && phase !== "stopped")) return;
+		if (!this.token || !this.canConfirm()) return;
 		const generation = this.generation;
 		const token = this.token;
 		this.stopAsked = false;
@@ -480,7 +553,14 @@ export class RestoreRun {
 				});
 			} catch (error) {
 				if (generation !== this.generation) return;
-				this.set({ phase: "failed", problem: historyProblemOf(error) });
+				const problem = historyProblemOf(error);
+				if (
+					problem.kind === "conflict" &&
+					problem.conflictSeq !== null &&
+					this.ownSeqs.has(problem.conflictSeq)
+				)
+					problem.own = true;
+				this.set({ phase: "failed", problem });
 				return;
 			}
 			if (generation !== this.generation) return;
@@ -534,9 +614,10 @@ export class RestoreRun {
 	}
 
 	/**
-	 * Put one moved-away block back where it was at `then`. Before the restore is confirmed the
-	 * change list is read again afterwards (the subtree changed, and the old preview would be
-	 * refused as a conflict).
+	 * Put one moved-away block back where it was at `then`. While the preview is not confirmed
+	 * the change list is read again afterwards (the subtree changed, and the old preview would be
+	 * refused as a conflict); once confirmed (stopped, failed or done) the list stays, and what
+	 * the restore wrote stays said.
 	 */
 	async moveBack(blockId: string): Promise<void> {
 		const now = this.state.moveBack[blockId];
@@ -545,6 +626,7 @@ export class RestoreRun {
 		this.set({ moveBack: { ...this.state.moveBack, [blockId]: { state: "moving" } } });
 		try {
 			const answer = await this.io.moveBack(blockId, this.thenSeq);
+			if (answer.commit) this.ownSeqs.add(answer.commit.seq);
 			this.set({
 				moveBack: {
 					...this.state.moveBack,
@@ -555,7 +637,11 @@ export class RestoreRun {
 					},
 				},
 			});
-			if (answer.commit && (this.state.phase === "preview" || this.state.phase === "failed")) {
+			if (
+				answer.commit &&
+				!this.confirmed &&
+				(this.state.phase === "preview" || this.state.phase === "failed")
+			) {
 				const refreshed = this.state.refreshed + 1;
 				await this.preview();
 				this.set({ refreshed });

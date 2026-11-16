@@ -130,8 +130,7 @@
 		"sessionUnavailable": "You cannot open the session that wrote this.",
 		"floor": "Earlier history is not kept.",
 		"view": "See it as it was at #{{seq}}",
-		"unavailable": "The history here cannot be read yet: it is still being prepared.",
-		"beforeFloor": "History before #{{seq}} is not kept."
+		"unavailable": "The history here cannot be read yet: it is still being prepared."
 	},
 	"editor": {
 		"changeStatus": "Change status",
@@ -838,8 +837,7 @@
 		"movedBackRestored": "Brought back and moved back",
 		"cannotMoveBack": "Its old place is gone",
 		"refreshed": "The list was worked out again after the move.",
-		"moreList": "Show more of the list",
-		"listIncomplete": "The list goes on: confirming restores all of it, not only what is shown.",
+		"listIncomplete": "{{count}} changes listed so far, and the list goes on. Read the whole list before restoring: the restore changes everything on it.",
 		"confirm": "Restore",
 		"cancel": "Cancel",
 		"running": "Restoring… {{changed}} blocks changed so far",
@@ -876,8 +874,19 @@
 			"root": "This block was not in the outline at that point.",
 			"parent-gone": "The block it was under is deleted now; bring that one back first.",
 			"forbidden": "You can read this space but not change it.",
-			"missing": "This place cannot be found."
+			"missing": "This place cannot be found.",
+			"conflictOwn": "Your own move back (commit #{{seq}}) changed this part after the preview. Nothing more was written. Preview again to continue with the list as it is now."
 		},
-		"partial": "Part of it was restored: {{changed}} blocks changed."
+		"partial": "Part of it was restored: {{changed}} blocks changed.",
+		"titleSpace": "Restore the whole space to #{{seq}}",
+		"introSpace": "Everything in this space that was there at #{{seq}} is put back: blocks added anywhere in the space since are deleted, deleted ones are brought back, and text and order are put back. This touches the whole space, not one block.",
+		"doneSpace": "The whole space was restored to #{{seq}}.",
+		"earlier": "Restored before this preview: {{changed}} blocks (they stay restored).",
+		"wholeList": "Show the whole list",
+		"spaceSure": "This changes {{count}} blocks across the whole space ({{groups}}). Restore the whole space?",
+		"confirmSpace": "Restore the whole space…",
+		"confirmSpaceSure": "Yes, restore the whole space",
+		"waitMoveBack": "Wait until the move back is done",
+		"blockUnreadable": "a block that can no longer be read"
 	}
 }
