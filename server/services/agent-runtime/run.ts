@@ -18,7 +18,7 @@ import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-co
 
 import type { MediaRef } from "@shared/media-attachments";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators, narratorToolCalls } from "../../db/schema";
 import { diagnosticsFromError } from "../../lib/agent/error-diagnostics";
@@ -933,6 +933,9 @@ async function finishRun(
 	// A failed held commit must retain its reservation for an explicit retry.
 	if (publicationRun) await getRuntimePublicationService().releaseUnusedRunSlots(publicationRun);
 	await clearDeliveredHold(id, hold);
+	// A subagent that was stopped or ran out of time takes its helpers with it.
+	if (interrupted || timedOut)
+		void stopSubagentHelpers(id, timedOut ? "Parent subagent timed out" : "Parent subagent stopped");
 	// Terminal persistence (snapshot + delivery intent) precedes visible idle.
 	await settleStatus(id, deliverTo, {
 		hasError,
@@ -1406,6 +1409,53 @@ async function registerDetachedTask(
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Subagent detached to background. Await({ type: "agent", id: "${alias}" })`
 	);
+}
+
+/** Helpers one stop reaches; a subagent rarely runs more than a few at once. */
+const HELPER_STOP_LIMIT = 100;
+
+/**
+ * Stopping a SUBAGENT stops the helpers it launched (its own team: rows it controls),
+ * background ones included, so nothing keeps working, spending and delivering to a
+ * subagent that was stopped. A helper a person has taken over is left alone, as control
+ * actions never cut into a person's work. Primary narrators are untouched: their
+ * background agents keep running when the primary's turn is interrupted, as before.
+ * Never throws.
+ */
+export async function stopSubagentHelpers(narratorId: string, reason: string): Promise<number> {
+	try {
+		const owner = await db
+			.select({ type: narrators.type })
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.get();
+		if (owner?.type !== "subagent") return 0;
+		const { teamMembersWhere } = await import("../../lib/runtime-source");
+		const helpers = await db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(teamMembersWhere(narratorId), inArray(narrators.status, ["working", "waiting"])))
+			.limit(HELPER_STOP_LIMIT)
+			.all();
+		if (helpers.length === 0) return 0;
+		const { backgroundTaskService } = await import("../background-task-service");
+		let stopped = 0;
+		for (const helper of helpers) {
+			if (getRunHold(helper.id)) continue;
+			const cancelled =
+				(await backgroundTaskService.cancel(helper.id).catch(() => false)) ||
+				(await controlRun(helper.id, { kind: "cancel", reason }).catch(() => false));
+			if (cancelled) stopped++;
+		}
+		if (stopped > 0) logger.info("Stopped helpers of a stopped subagent", { narratorId, stopped });
+		return stopped;
+	} catch (error) {
+		logger.warn("Failed to stop a stopped subagent's helpers", {
+			narratorId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return 0;
+	}
 }
 
 /**

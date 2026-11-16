@@ -58,6 +58,7 @@ beforeAll(async () => {
 			runControls.push({ id, kind: command.kind });
 			return narrators.get(id)?.status === "working";
 		},
+		stopSubagentHelpers: async () => 0,
 	}));
 
 	({ interruptAndArchiveSubagent, archiveRetiredSubagents } = await import(
