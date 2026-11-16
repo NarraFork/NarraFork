@@ -33,6 +33,7 @@ import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
+import { agentMarkdownReference } from "./subagent-label";
 import {
 	formatSubagentModelFallbackNote,
 	resolveSubagentModelForRun,
@@ -47,9 +48,14 @@ import { tryAcquireFinalUpdateExecution, type UpdateExecutionLease } from "./upd
 export const BACKGROUND_TASK_TIMEOUT_MS = 5 * 60 * 60 * 1000;
 
 /** Initial tool-result text returned when a background Agent task starts. */
-export function buildBackgroundAgentStartOutput(taskIdOrAlias: string): string {
+export function buildBackgroundAgentStartOutput(
+	taskIdOrAlias: string,
+	narratorId: string,
+	title?: string,
+): string {
 	return (
 		`<background_task_id>${taskIdOrAlias}</background_task_id>\n\n` +
+		`${agentMarkdownReference(narratorId, title || taskIdOrAlias)}\n\n` +
 		`Background task started. Await({ type: "agent", id: "${taskIdOrAlias}" })`
 	);
 }
@@ -431,10 +437,11 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			return (
 				(input.takeoverByUser
 					? `<background_task_id>${aliasRegistration.alias}</background_task_id>\n\n` +
+						`${agentMarkdownReference(subagentId, title || aliasRegistration.alias)}\n\n` +
 						"Background task started. User takeover is already active. The initial prompt runs independently; " +
 						"turn completion will not notify or wake the parent. " +
 						"The user can continue interacting until they explicitly end takeover. Do not automatically Await this agent."
-					: buildBackgroundAgentStartOutput(aliasRegistration.alias)) +
+					: buildBackgroundAgentStartOutput(aliasRegistration.alias, subagentId, title)) +
 				delegationNote +
 				formatSubagentModelFallbackNote(inheritance) +
 				conflictNote

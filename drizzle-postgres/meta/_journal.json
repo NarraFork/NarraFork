@@ -523,29 +523,22 @@
 		{
 			"idx": 74,
 			"version": "7",
-			"when": 1794643914598,
-			"tag": "0074_outline_edges",
+			"when": 1794645737122,
+			"tag": "0074_appearance_preferences",
 			"breakpoints": true
 		},
 		{
 			"idx": 75,
 			"version": "7",
-			"when": 1794664879668,
-			"tag": "0075_outline_edges_by_parent",
+			"when": 1794677338258,
+			"tag": "0075_plugin_overlay_preferences",
 			"breakpoints": true
 		},
 		{
 			"idx": 76,
 			"version": "7",
-			"when": 1794748163496,
-			"tag": "0076_outline_live_log",
-			"breakpoints": true
-		},
-		{
-			"idx": 77,
-			"version": "7",
-			"when": 1794817441993,
-			"tag": "0077_outline_fold_state",
+			"when": 1794820839573,
+			"tag": "0076_outline_pageless",
 			"breakpoints": true
 		}
   ]

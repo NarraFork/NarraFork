@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { type FileHandle, link, mkdtemp, open, rm, statfs } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { hashReleaseFile } from "./ci-release-io";
 
 export interface UpdateServerBridgeConfig {
@@ -79,10 +80,11 @@ interface ReadOptions {
 interface BodyOptions {
 	maxBytes: number;
 	signal?: AbortSignal;
+	timeoutMs?: number;
 }
 
 function boundedLimit(value: number): number {
-	if (!Number.isSafeInteger(value) || value <= 0 || value > 1024 ** 3)
+	if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_RELEASE_BINARY_BYTES)
 		throw new Error("Invalid bridge byte limit");
 	return value;
 }
@@ -419,7 +421,7 @@ export class UpdateServerBridgeHttp {
 			(response, signal) => this.#json(response, BRIDGE_METADATA_LIMIT, signal),
 		);
 	}
-	/** Raw stream, bounded and hashed as consumed. Never buffers a patch or accepts a full binary. */
+	/** Raw payload stream, bounded and hashed as consumed; never text-buffers patch or binary. */
 	async putRaw(
 		path: string,
 		stream: ReadableStream<Uint8Array>,

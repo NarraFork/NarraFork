@@ -2301,6 +2301,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
 		.notNull()
 		.default(true),
+	/** Validated, previously-local presentation values only; never client scope rules. */
+	appearancePreferences: text("appearance_preferences").notNull().default("{}"),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**
@@ -2433,6 +2435,15 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * tasks.json / behavior_fence / index.md 不参与记录，始终固定在最前。
 	 */
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
+	/**
+	 * Plugin ids whose `overlay` views this user has hidden (JSON string array).
+	 *
+	 * Overlays are shown by default once an admin installs the plugin; this is the
+	 * per-person opt-out, so one colleague hiding a desktop pet does not hide it for the
+	 * whole instance. Stored per account rather than in the browser so the choice
+	 * follows the person across devices and survives a reload.
+	 */
+	hiddenPluginOverlays: text("hidden_plugin_overlays").notNull().default("[]"),
 	/**
 	 * User layer of the layered trait system — the lowest-priority layer, applied
 	 * to every narrator the user acts on. Same encoding as `narrators.traits`.

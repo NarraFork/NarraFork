@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, open, realpath, rename, rm, statfs } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
+import { MAX_RELEASE_BINARY_BYTES, MAX_RELEASE_PATCH_BYTES } from "../../shared/release-patch";
 import { runPublicationProcess as runBridgeProcess } from "./ci-publication-runtime";
 import { validateCiReleaseBuildSource } from "./ci-release-build-restore";
 import { verifyReleaseBundle } from "./ci-release-bundle";
-import { readReleaseText } from "./ci-release-io";
+import { CI_BUNDLE_LIMIT, CI_DISK_RESERVE, readReleaseText } from "./ci-release-io";
 import {
 	assertCiMainAncestor,
 	ciApi,
@@ -20,8 +21,8 @@ import {
 import { CI_RELEASE_TARGETS, CI_RELEASE_WORKFLOW } from "./ci-release-types";
 import type { GhRunner } from "./github-release";
 
-export const MAX_RELEASE_BUNDLE_BYTES = 24 * 1024 ** 3;
-const FREE_SPACE_RESERVE = 4 * 1024 ** 3;
+export const MAX_RELEASE_BUNDLE_BYTES = CI_BUNDLE_LIMIT;
+const FREE_SPACE_RESERVE = CI_DISK_RESERVE;
 const RESTORE_TIMEOUT_MS = 15 * 60_000;
 const sha = z
 	.string()
@@ -93,7 +94,8 @@ const EXTRACT_BUNDLE = `
 import os, re, resource, shutil, stat, sys, zipfile
 resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 ** 2, 512 * 1024 ** 2))
 resource.setrlimit(resource.RLIMIT_CPU, (900, 900))
-archive, destination, maximum = sys.argv[1], sys.argv[2], int(sys.argv[3])
+archive, destination = sys.argv[1:3]
+maximum, binary_limit, patch_limit, reserve = map(int, sys.argv[3:])
 with zipfile.ZipFile(archive) as bundle:
     entries = bundle.infolist()
     if len(entries) > 54: raise ValueError('bundle entry limit')
@@ -110,13 +112,17 @@ with zipfile.ZipFile(archive) as bundle:
         if entry.is_dir() or kind not in (0, stat.S_IFREG): raise ValueError('nonregular bundle entry')
         if name != 'manifest.json' and not re.fullmatch(r'dist/[A-Za-z0-9][A-Za-z0-9._-]{0,199}', name):
             raise ValueError('unsafe bundle path')
-        limit = 1024 * 1024 if name == 'manifest.json' or name.endswith('-remote-frontend.manifest.json') else (128 * 1024 ** 2 if name.endswith('-remote-frontend.tar.gz') else 1024 ** 3)
+        if name == 'manifest.json' or name.endswith('-remote-frontend.manifest.json') or name.endswith('-SHA256SUMS') or name.endswith('-checksums.txt'): limit = 1024 ** 2
+        elif name.endswith('.metadata.json') or name.endswith('.meta.json'): limit = 65536
+        elif name.endswith('-remote-frontend.tar.gz'): limit = 128 * 1024 ** 2
+        elif name.endswith('.zstd-patch'): limit = patch_limit
+        else: limit = binary_limit
         if entry.file_size < 1 or entry.file_size > limit: raise ValueError('bundle file size limit')
         total += entry.file_size
         if total + os.stat(archive).st_size > maximum: raise ValueError('bundle extraction budget')
     if 'manifest.json' not in seen: raise ValueError('missing bundle manifest')
     free = shutil.disk_usage(destination).free
-    if free < total + 4 * 1024 ** 3: raise ValueError('insufficient disk space')
+    if free < total + reserve: raise ValueError('insufficient disk space')
     os.mkdir(os.path.join(destination, 'dist'))
     written = 0
     for entry in entries:
@@ -360,7 +366,17 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 		// our child is reaped and both bounded output readers have closed, even on abort.
 		await runBridgeProcess(
 			"python3",
-			["-I", "-c", EXTRACT_BUNDLE, archive, extracted, String(MAX_RELEASE_BUNDLE_BYTES)],
+			[
+				"-I",
+				"-c",
+				EXTRACT_BUNDLE,
+				archive,
+				extracted,
+				String(MAX_RELEASE_BUNDLE_BYTES),
+				String(MAX_RELEASE_BINARY_BYTES),
+				String(MAX_RELEASE_PATCH_BYTES),
+				String(FREE_SPACE_RESERVE),
+			],
 			{
 				timeoutMs: RESTORE_TIMEOUT_MS,
 				maximumOutputBytes: 1024 * 1024,

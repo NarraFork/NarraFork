@@ -20,6 +20,7 @@ import { settings } from "../../lib/settings";
 import { safeSpawn } from "../../lib/spawn";
 import { resolveNarratorGitTarget } from "../git-workspace";
 import { enterNarratorPlanMode } from "../narrator-plan-mode";
+import * as prefixSnapshots from "../narrator-prefix-snapshots";
 import {
 	cleanupPrefixSnapshots,
 	closePrefixSnapshotStore,
@@ -194,6 +195,52 @@ describe("unified prefix epochs with real SQLite history", () => {
 			).toEqual([["workspace"], ["mode"], ["workspace"]]);
 		} finally {
 			await rm(root, { recursive: true, force: true });
+		}
+	}, 15000);
+
+	test("16 independent narrators persist concurrent context updates without queue rejection", async () => {
+		const sessions = [];
+		for (let index = 0; index < 16; index++) {
+			const { narratorId, input } = await fixture();
+			const initial = await reconcileEpoch(input);
+			const changes = [{ key: "workspace", value: `/repo/resumed-${index}` }];
+			sessions.push({ narratorId, input, initial, changes });
+		}
+		// Align admission so fast workers cannot hide the waiting-byte accounting bug.
+		const gate = Promise.withResolvers<void>();
+		const putJson = prefixSnapshots.putPrefixJson;
+		let arrivals = 0;
+		const writer = spyOn(prefixSnapshots, "putPrefixJson").mockImplementation(async (...args) => {
+			if (++arrivals === sessions.length) gate.resolve();
+			await gate.promise;
+			return putJson(...args);
+		});
+		try {
+			const results = await Promise.all(
+				sessions.map(({ input, changes }) =>
+					reconcileEpoch({
+						...input,
+						prompt: {
+							...input.prompt,
+							parts: changes.map(({ key, value }) => ({ key, text: value })),
+						},
+					}),
+				),
+			);
+			for (let index = 0; index < sessions.length; index++) {
+				const { narratorId, initial, changes } = sessions[index];
+				expect(results[index]).toMatchObject({ changed: true, opened: false });
+				expect(results[index].epoch?.markerId).toBe(initial.epoch?.markerId);
+				const persisted = await updates(narratorId);
+				expect(persisted).toHaveLength(1);
+				expect(persisted[0].update).toMatchObject({
+					changes,
+					modelText: renderContextUpdate(changes),
+				});
+			}
+		} finally {
+			gate.resolve();
+			writer.mockRestore();
 		}
 	}, 15000);
 

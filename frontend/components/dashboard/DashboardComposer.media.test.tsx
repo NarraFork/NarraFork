@@ -24,7 +24,8 @@ const modules = [
 	"../../hooks/usePlatform",
 	"../../hooks/useProjectDirStatus",
 	"../../hooks/useRecentTabs",
-	"../common/DirectoryPicker",
+	"../../hooks/useWorkspaceContext",
+	"../common/DeviceDirectoryPicker",
 	"../narrator/CreateNarratorLazyModal",
 	"../narrator/composer/NarratorComposer",
 	"../narrator/interaction/PermissionModePickerMenu",
@@ -92,7 +93,10 @@ replace("../../hooks/useProjectDirStatus", {
 	useProjectDirStatus: () => ({ usablePath: "/workspace", needsChoice: false }),
 });
 replace("../../hooks/useRecentTabs", { addRecentTab: async () => {} });
-replace("../common/DirectoryPicker", { DirectoryBrowserModal: () => null });
+replace("../../hooks/useWorkspaceContext", {
+	useWorkspaceDevices: () => ({ data: { devices: [] }, isSuccess: true }),
+});
+replace("../common/DeviceDirectoryPicker", { DeviceDirectoryModal: () => null });
 replace("../narrator/CreateNarratorLazyModal", { CreateNarratorLazyModal: () => null });
 replace("../narrator/interaction/PermissionModePickerMenu", {
 	PermissionModePickerMenu: () => null,

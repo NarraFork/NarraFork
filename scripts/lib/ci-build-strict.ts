@@ -6,6 +6,7 @@ import {
 	type HelperDistributionDependencies,
 	parseHelperDistributionDependencies,
 } from "../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { parseRecoveryManifestVersions } from "../../shared/update-identity";
 import {
 	type BinaryMetadata,
@@ -116,7 +117,7 @@ export async function computeCiBinaryMetadata(
 	if (!/^[0-9a-f]{40}$/.test(input.commit)) throw new Error("Missing full build commit");
 	if (!isValidGitHubRepository(input.repository)) throw new Error("Missing build repository");
 	const before = lstatSync(path);
-	if (!before.isFile() || before.size <= 0 || before.size > 1024 * 1024 * 1024) {
+	if (!before.isFile() || before.size <= 0 || before.size > MAX_RELEASE_BINARY_BYTES) {
 		throw new Error(`Invalid release binary: ${path}`);
 	}
 	const sha256 = createHash("sha256");
@@ -130,7 +131,7 @@ export async function computeCiBinaryMetadata(
 	try {
 		for await (const chunk of stream) {
 			size += chunk.length;
-			if (size > 1024 * 1024 * 1024) throw new Error("Release binary exceeded 1 GiB");
+			if (size > MAX_RELEASE_BINARY_BYTES) throw new Error("Release binary exceeded byte limit");
 			sha256.update(chunk);
 			sha512.update(chunk);
 		}
@@ -196,7 +197,7 @@ export function validateCiMetadata(
 		!/^[0-9a-f]{40}$/.test(metadata.commit) ||
 		!Number.isSafeInteger(metadata.size) ||
 		metadata.size <= 0 ||
-		metadata.size > 1024 * 1024 * 1024 ||
+		metadata.size > MAX_RELEASE_BINARY_BYTES ||
 		!/^[0-9a-f]{64}$/.test(metadata.sha256) ||
 		!/^[A-Za-z0-9+/]{86}==$/.test(metadata.sha512) ||
 		!Number.isFinite(Date.parse(metadata.buildDate))

@@ -1,6 +1,7 @@
 import { MarkdownContentListItem } from "@frontend/components/common/MarkdownListMarker";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Code, Divider, Table, Text } from "@mantine/core";
+import { parseAgentReference } from "@shared/agent-reference";
 import {
 	prepareMarkdownEmphasis,
 	remarkStripEmphasisSentinel,
@@ -13,6 +14,7 @@ import {
 	createContext,
 	Fragment,
 	memo,
+	type ReactElement,
 	type ReactNode,
 	useContext,
 	useEffect,
@@ -98,14 +100,17 @@ function MermaidOrCode({ code }: { code: string }) {
 	return <MermaidDiagram code={code} defaultSizeMode={streamedRef.current ? "actual" : "fit"} />;
 }
 
-/** Recursively extract plain text from React children */
-export function extractText(node: ReactNode): string {
+export function extractText(node: ReactNode, referenceTitle = false): string {
 	if (node == null || typeof node === "boolean") return "";
 	if (typeof node === "string" || typeof node === "number")
 		return stripEmphasisSentinel(String(node));
-	if (Array.isArray(node)) return node.map(extractText).join("");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	if (typeof node === "object" && "props" in node) return extractText((node as any).props.children);
+	if (Array.isArray(node)) return node.map((child) => extractText(child, referenceTitle)).join("");
+	if (typeof node === "object" && "props" in node) {
+		const element = node as ReactElement<{ children?: ReactNode; alt?: string }>;
+		if (referenceTitle && element.type === "br") return " ";
+		if (referenceTitle && typeof element.props.alt === "string") return element.props.alt;
+		return extractText(element.props.children, referenceTitle);
+	}
 	return "";
 }
 
@@ -247,7 +252,7 @@ function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): C
 			return (
 				<MarkdownLink
 					href={href}
-					labelText={extractText(children)}
+					labelText={extractText(children, parseAgentReference(href) !== null)}
 					linkClassName={classes.mdLink}
 					title={title}
 				>

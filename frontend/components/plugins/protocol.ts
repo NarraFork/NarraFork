@@ -130,6 +130,18 @@ export const PLUGIN_UI_HOST_LOCAL_METHODS = [
 	// plugin id: a view cannot refresh or test another plugin's provider.
 	"provider.modelsChanged",
 	"models.test",
+	/**
+	 * Report the rectangle an `overlay` view wants to be interactive in.
+	 *
+	 * The overlay iframe covers the whole viewport so the plugin can draw anywhere,
+	 * but that also means it would swallow every pointer event. The host therefore
+	 * keeps it `pointer-events: none` and renders a transparent hit region at the
+	 * reported rectangle instead; only inside that rectangle does the overlay take
+	 * input. Answering with the *applied* rect (clamped to the viewport) plus the
+	 * viewport size is what lets the plugin reason in viewport coordinates without
+	 * ever measuring the host document, which it cannot see.
+	 */
+	"overlay.setBounds",
 ] as const;
 export type PluginUiHostLocalMethod = (typeof PLUGIN_UI_HOST_LOCAL_METHODS)[number];
 
@@ -221,10 +233,30 @@ export type UiRpcResponse = z.infer<typeof uiRpcResponseSchema>;
 export type UiRpcEnvelope = z.infer<typeof uiRpcEnvelopeSchema>;
 export type UiRpcError = z.infer<typeof uiRpcErrorSchema>;
 
+/**
+ * Host surfaces a panel binding may name.
+ *
+ * One tuple for both the TypeScript union and the runtime zod enum, because the two
+ * used to be hand-written copies of each other and a surface added to one but not the
+ * other fails at the worst possible moment: the type checks, then
+ * `parsePluginDockPanelParams` rejects the binding at runtime and the panel never
+ * opens. `PluginUiHostSurface` is an alias of this type.
+ */
+export const HOST_SURFACE_VALUES = [
+	"focus",
+	"workspace",
+	"director",
+	"settings",
+	"provider-settings",
+	"overlay",
+] as const;
+
+export type PluginHostSurface = (typeof HOST_SURFACE_VALUES)[number];
+
 export type PluginPanelBinding =
 	| {
 			kind: "host-surface";
-			surface: "focus" | "workspace" | "director" | "settings" | "provider-settings";
+			surface: PluginHostSurface;
 	  }
 	| { kind: "focus-current-narrator"; narratorId?: string }
 	| { kind: "workspace"; workspaceId: string }
@@ -235,7 +267,7 @@ const bindingSchema = z.discriminatedUnion("kind", [
 	z
 		.object({
 			kind: z.literal("host-surface"),
-			surface: z.enum(["focus", "workspace", "director", "settings", "provider-settings"]),
+			surface: z.enum(HOST_SURFACE_VALUES),
 		})
 		.strict(),
 	z

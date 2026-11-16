@@ -2,6 +2,7 @@ import {
 	handleMarkdownAnchorClick,
 	markdownLinkTargetProps,
 } from "@frontend/lib/markdown-anchor-scroll";
+import { isAgentReference, parseAgentReference } from "@shared/agent-reference";
 import {
 	fileLinkLineSuffix,
 	filePathFromHref,
@@ -14,6 +15,7 @@ import type { ComponentPropsWithoutRef } from "react";
 import { isOutlineReferenceHref } from "../../../lib/outline-href";
 import { useOutlineLinkProps } from "../../../lib/outline-opener";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
+import { AgentReferenceLink } from "./AgentReferenceLink";
 
 /** Shared by flowing markdown and every measured visual fragment of a vlist link. */
 export function MarkdownLink({
@@ -25,12 +27,15 @@ export function MarkdownLink({
 	title,
 	labelText = "",
 	lineNumbersInChildren = false,
+	occupiedWidth,
 }: Pick<ComponentPropsWithoutRef<"a">, "href" | "children" | "className" | "style" | "title"> & {
 	linkClassName?: string;
 	/** Original visible label, before streaming animation wraps its text nodes. */
 	labelText?: string;
 	/** The exact renderer appended the suffix before measurement; never decorate fragments again. */
 	lineNumbersInChildren?: boolean;
+	/** Complete premeasured atom width for an agent reference. */
+	occupiedWidth?: number;
 }) {
 	const scope = useFileReferenceScope();
 	// An outline link inside a host that opens outline panels (a session surface, the outline
@@ -38,6 +43,19 @@ export function MarkdownLink({
 	// an ordinary link, and a tool card's reference (which only an outline host can open) is
 	// plain text. Checked before files because `/outline/…` also reads as an absolute path.
 	const outlineLink = useOutlineLinkProps(href);
+	const agentId = parseAgentReference(href);
+	if (agentId) {
+		return (
+			<AgentReferenceLink
+				id={agentId}
+				className={linkClassName ?? className}
+				style={style}
+				label={labelText || (typeof children === "string" ? children : "")}
+				occupiedWidth={occupiedWidth}
+			/>
+		);
+	}
+	if (isAgentReference(href)) return <span style={style}>{children}</span>;
 	if (outlineLink) {
 		return (
 			<a

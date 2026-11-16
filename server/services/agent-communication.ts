@@ -25,7 +25,12 @@ import { getSubagentFinalText } from "./narrator-session";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import { assertRuntimeCanAwaitAgent } from "./subagent-communication-policy";
-import { agentLabelFromNarrator, resolveAgentLabel, shortAgentId } from "./subagent-label";
+import {
+	agentLabelFromNarrator,
+	agentMarkdownReference,
+	resolveAgentLabel,
+	shortAgentId,
+} from "./subagent-label";
 import {
 	applySubagentModelSwitch,
 	planSubagentModelSwitch,
@@ -433,7 +438,9 @@ async function buildAwaitAgentResult(
 		...(knownTitle ? { title: knownTitle } : {}),
 		status,
 		output: output ?? "(no output)",
-		formatted: formatAgentAwaitResult(label, status, output ?? null, recentActivity),
+		formatted:
+			formatAgentAwaitResult(label, status, output ?? null, recentActivity) +
+			`\n\n${agentMarkdownReference(id, knownTitle || label)}`,
 		...(receipt
 			? {
 					terminalResultReceived: receipt.terminalResultReceived,

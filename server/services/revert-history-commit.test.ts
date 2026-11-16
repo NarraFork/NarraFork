@@ -1485,6 +1485,142 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 			expect(count("narrator_tool_calls")).toBe(2);
 			expect(version()).toBe(7);
 		});
+	test("unrelated same-narrator messages and working status do not stale a fixed point plan", async () => {
+		const target = withTools();
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		const unrelated = message(20, [{ type: "text", text: "unrelated" }]);
+		sqlite
+			.query(
+				"UPDATE narrators SET message_version=message_version+1,status='working' WHERE id='root'",
+			)
+			.run();
+		let changedDuringPrepare = false;
+		onAuthorize = () => {
+			if (changedDuringPrepare) return;
+			changedDuringPrepare = true;
+			sqlite
+				.query(
+					"UPDATE narrators SET message_version=message_version+1,status='idle' WHERE id='root'",
+				)
+				.run();
+		};
+		apply(await service.prepare({ principal, fixedSelection }));
+		expect(body(unrelated)).toBeDefined();
+		expect(body(target.messageId)).toBeDefined();
+		expect(count("narrator_tool_calls")).toBe(1);
+		expect(version()).toBe(10);
+	});
+	test("a version bump during rewrite preparation binds the final current version rather than the consumed old row", async () => {
+		const target = withTools();
+		const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		const mutation = mutateAfterRead(
+			(text) => text.includes("SELECT id,message_version,fork_message_id FROM narrators"),
+			() =>
+				sqlite
+					.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'")
+					.run(),
+		);
+		try {
+			const token = await service.prepare({ principal, fixedSelection });
+			expect(mutation.state.mutated).toBe(true);
+			apply(token);
+			expect(version()).toBe(9);
+			expect(count("narrator_tool_calls")).toBe(1);
+		} finally {
+			mutation.restore();
+		}
+	});
+	test("prepare-to-apply version CAS still rejects even unrelated semantic writes atomically", async () => {
+		const target = withTools();
+		const token = await prepare({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+		sqlite.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'").run();
+		expect(() => apply(token)).toThrow("Selected message history changed");
+		expect(body(target.messageId)).toBeDefined();
+		expect(count("narrator_tool_calls")).toBe(2);
+		expect(version()).toBe(8);
+	});
+	test.each([
+		"plan-to-prepare",
+		"prepare-to-apply",
+	])("%s rejects a new rollback suffix member even without a version bump", async (phase) => {
+		const boundary = message(1, [
+			{ type: "text", text: "keep" },
+			{ type: "text", text: "remove" },
+		]);
+		message(2);
+		const fixedSelection = await select({
+			kind: "after_block",
+			messageId: boundary,
+			keepThroughBlockIndex: 0,
+		});
+		const token =
+			phase === "prepare-to-apply"
+				? await service.prepare({ principal, fixedSelection })
+				: undefined;
+		const later = message(3);
+		if (token) expect(() => apply(token)).toThrow("Selected history changed");
+		else {
+			const error = await service.prepare({ principal, fixedSelection }).catch((error) => error);
+			expect(error).toMatchObject({ code: "REVERT_HISTORY_STALE" });
+		}
+		expect(body(boundary)).toBeDefined();
+		expect(body(later)).toBeDefined();
+		expect(version()).toBe(7);
+	});
+	test("ACL changes after preparation reject before any history mutation", async () => {
+		withTools();
+		const token = await prepare();
+		sqlite.query("UPDATE narrators SET visibility='public' WHERE id='root'").run();
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(count("narrator_messages")).toBe(1);
+		expect(version()).toBe(7);
+	});
+	test("new lazy dependencies after preparation reject without any automatic backfill", async () => {
+		const target = withTools(10);
+		const token = await prepare();
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='root',refs_backfill_cursor=11 WHERE id='other'",
+			)
+			.run();
+		let error: unknown;
+		try {
+			apply(token);
+		} catch (cause) {
+			error = cause;
+		}
+		expect(error).toMatchObject({ code: "HISTORY_LAZY_DEPENDENCY_CHANGED", statusCode: 409 });
+		expect(body(target.messageId)).toBeDefined();
+		expect(version()).toBe(7);
+		expect(scalar("SELECT refs_backfill_cursor AS n FROM narrators WHERE id='other'")).toBe(11);
+	});
+	test("status and unrelated lazy cursor loading after preparation do not invalidate the short commit", async () => {
+		withTools(100);
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='other',refs_backfill_cursor=100 WHERE id='root'",
+			)
+			.run();
+		const token = await prepare({ kind: "from_seq", minSeq: 100 });
+		sqlite
+			.query("UPDATE narrators SET status='working',refs_backfill_cursor=50 WHERE id='root'")
+			.run();
+		apply(token);
+		expect(count("narrator_messages")).toBe(0);
+		expect(version()).toBe(8);
+	});
+	test("a malformed lazy cursor after preparation still rejects before history writes", async () => {
+		withTools(100);
+		const token = await prepare();
+		sqlite
+			.query(
+				"UPDATE narrators SET refs_inherited_from='other',refs_backfill_cursor=-1 WHERE id='root'",
+			)
+			.run();
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(count("narrator_messages")).toBe(1);
+		expect(version()).toBe(7);
+	});
 	test("external metadata-only writes preserve selected message versions", async () => {
 		const filename = join(process.env.HOME as string, `history-${Date.now()}.sqlite`);
 		const fileDb = new Database(filename);
@@ -1607,12 +1743,12 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 		expect(body(target.messageId)).toBeDefined();
 		expect(count("narrator_tool_calls")).toBe(1);
 	});
-	test("fake version/ref/block commitments are not accepted merely because digest matches", async () => {
+	test("fake narrator/ref/block commitments are not accepted merely because digest matches", async () => {
 		const target = withTools();
 		const original = await select();
-		for (const kind of ["version", "ref", "block"]) {
+		for (const kind of ["narrator", "ref", "block"]) {
 			const fixedSelection = structuredClone(original);
-			if (kind === "version") fixedSelection.messageVersions[0].messageVersion++;
+			if (kind === "narrator") fixedSelection.messageVersions[0].narratorId = "other";
 			if (kind === "ref") fixedSelection.history.messages[0].refId = "fake-ref";
 			if (kind === "block") fixedSelection.history.blocks[0].key = "fake-block";
 			// Await natively: Bun's async matcher can starve an already reusable thread's RPC.

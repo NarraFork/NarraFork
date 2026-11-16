@@ -333,7 +333,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"server.tls.autoReissue": {
-		desc: "启动时，本机 IP 变化则自动重新签发内置证书，保留原 CA。默认开启。",
+		desc: "启动时，本机 IP 变化、证书有效期超过 825 天，或剩余不足 30 天，则自动重新签发内置证书，保留原 CA。默认开启。",
 		type: "boolean",
 	},
 	"server.tls.certFile": {

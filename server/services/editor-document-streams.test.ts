@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 import type { Worker } from "node:worker_threads";
 import iconv from "iconv-lite";
 import { EDITOR_FILE_MAX_BYTES, type EditorRawMetadata } from "../../shared/editor-document";
+import { DeviceOfflineError } from "./device-connection-service";
 import { EditorDocumentJobs } from "./editor-document-jobs";
 import { runStreamWorker } from "./editor-document-stream-worker";
 import {
@@ -364,6 +365,61 @@ test("remote metadata preflight keeps one 16KiB peer/worker frame and releases i
 	expect(f.closes).toEqual([false]);
 	expect(f.streams.diagnostics.windowBytes).toBe(0);
 	expect(f.streams.workers.count).toBeLessThanOrEqual(2);
+});
+
+test("remote preflight retries when the device drops during close", async () => {
+	const bytes = new TextEncoder().encode("hello\n");
+	const { streams } = await fixture(new Uint8Array());
+	const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+	let opens = 0;
+	let chunks = 0;
+	const identity = {
+		deviceId: "peer",
+		pathFlavor: "posix" as const,
+		canonicalPath: "/peer/file",
+		workspaceIdentity: "root",
+		runtimeEpoch: "epoch",
+		runtimeGeneration: 1,
+		fencingToken: 1,
+	};
+	const remote: EditorRemoteRawSource = {
+		open: async () => {
+			opens++;
+			return {
+				readId: `read-${opens}`,
+				sourceGeneration: "generation",
+				totalBytes: bytes.length,
+				rawDigest: digest,
+				identity,
+			};
+		},
+		chunk: async (input) => {
+			chunks++;
+			if (opens === 1) throw new DeviceOfflineError("peer");
+			const body = bytes.subarray(
+				input.offset,
+				Math.min(bytes.length, input.offset + input.maxBytes),
+			);
+			return {
+				readId: input.readId,
+				sourceGeneration: "generation",
+				offset: input.offset,
+				bytes: body.length,
+				dataB64: Buffer.from(body).toString("base64"),
+				eof: input.offset + body.length === bytes.length,
+			};
+		},
+		close: async () => {
+			if (opens === 1) throw new DeviceOfflineError("peer");
+		},
+	};
+	const metadata = await streams.metadata("u", remote);
+	expect(metadata.sourceBytes).toBe(bytes.length);
+	expect(metadata.baseHash).toBe(digest);
+	expect(opens).toBe(2);
+	expect(chunks).toBeGreaterThan(1);
+	expect(streams.diagnostics.windowBytes).toBe(0);
+	await new Promise((resolve) => setTimeout(resolve, 20));
 });
 
 test("ready worker exit releases local and remote read owners, rejects old handles and admits new streams", async () => {

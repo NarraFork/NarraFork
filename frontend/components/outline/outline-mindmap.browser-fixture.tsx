@@ -553,6 +553,80 @@ export function caret(blockId: string, offset = -1, head?: number): boolean {
 	return true;
 }
 
+/**
+ * A programmatic caret ready for native keyboard selection. ProseMirror schedules a DOM-selection
+ * repair while handling focus; native Shift+Down can otherwise run before that repair, and lose
+ * its new DOM selection before selectionchange reaches the editor. Wait for the callbacks actually
+ * scheduled by this focus, not a guessed delay or a private ProseMirror field.
+ */
+export async function caretReady(blockId: string, offset = -1, timeoutMs = 5000): Promise<boolean> {
+	const dom = view().pm.dom;
+	const original = { setTimeout: window.setTimeout, clearTimeout: window.clearTimeout };
+	const schedule: Window["setTimeout"] = original.setTimeout;
+	const cancel: Window["clearTimeout"] = original.clearTimeout;
+	const pending = new Map<number, () => void>();
+	const tasks: Promise<void>[] = [];
+	let deadline: number | undefined;
+	const capture = () => {
+		window.setTimeout = ((callback: TimerHandler, delay?: number, ...args: unknown[]) => {
+			if (typeof callback !== "function") return schedule.call(window, callback, delay, ...args);
+			let finish = () => {};
+			tasks.push(
+				new Promise<void>((resolve) => {
+					finish = resolve;
+				}),
+			);
+			const id = schedule.call(
+				window,
+				() => {
+					try {
+						callback(...args);
+					} finally {
+						pending.delete(id);
+						finish();
+					}
+				},
+				delay,
+			);
+			pending.set(id, finish);
+			return id;
+		}) as typeof window.setTimeout;
+		window.clearTimeout = ((id?: number) => {
+			cancel.call(window, id);
+			if (id !== undefined) {
+				pending.get(id)?.();
+				pending.delete(id);
+			}
+		}) as typeof window.clearTimeout;
+	};
+	dom.addEventListener("focus", capture, { capture: true, once: true });
+	try {
+		let placed: boolean;
+		try {
+			placed = caret(blockId, offset);
+		} finally {
+			dom.removeEventListener("focus", capture, true);
+			// Only synchronous focus setup is captured; later work uses the exact original scheduler.
+			window.setTimeout = original.setTimeout;
+		}
+		await Promise.race([
+			Promise.all(tasks),
+			new Promise<never>((_, reject) => {
+				deadline = schedule.call(
+					window,
+					() => reject(new Error("outline focus setup did not finish")),
+					timeoutMs,
+				);
+			}),
+		]);
+		return placed && view().pm.hasFocus();
+	} finally {
+		window.setTimeout = original.setTimeout;
+		window.clearTimeout = original.clearTimeout;
+		if (deadline !== undefined) cancel.call(window, deadline);
+	}
+}
+
 export function selection() {
 	const sel = view().captureSel();
 	return sel ? { anchor: sel.anchor, head: sel.head } : null;

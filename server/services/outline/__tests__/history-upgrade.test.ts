@@ -31,7 +31,7 @@ import type { OutlineLevelCursor } from "../store/history-port";
 import { createSqliteOutlineHistory } from "../store/sqlite-history";
 
 /** The last migration of the main branch: the shape the fixture is written in. */
-const MAIN_HEAD_MIGRATION = "0256_outline_spec_loss";
+const MAIN_HEAD_MIGRATION = "0258_damp_sleepwalker";
 const MIGRATIONS = join(import.meta.dir, "../../../../drizzle");
 
 const root = mkdtempSync(join(tmpdir(), "nf-outline-upgrade-"));

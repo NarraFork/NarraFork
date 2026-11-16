@@ -6,7 +6,7 @@ import {
 } from "../../scripts/lib/binary-metadata";
 import type { GhRunner } from "../../scripts/lib/github-release";
 import { UpdateServerMirrorHttp } from "../../scripts/lib/update-server-bridge-http";
-import type { MirrorSnapshotV1 } from "../../shared/independent-update-mirror";
+import type { MirrorSnapshotV2 } from "../../shared/independent-update-mirror";
 import { mergeUpdateIndex, parseUpdateIndexRelease } from "../../shared/update-index";
 export const repository = "fixture-owner/fork-product";
 export const commit = "a".repeat(40);
@@ -25,7 +25,10 @@ export function mirrorFixture(withPatch = true, withNotes = true, version = "1.2
 		buildDate: publishedAt,
 	});
 	const metadataRaw = formatMetadataJson(metadata);
-	const raw = new Map<string, Buffer>([[`${name}.metadata.json`, Buffer.from(metadataRaw)]]);
+	const raw = new Map<string, Buffer>([
+		[name, bytes],
+		[`${name}.metadata.json`, Buffer.from(metadataRaw)],
+	]);
 	const identity = (name: string, content: Buffer) => ({
 		name,
 		size: content.length,
@@ -87,16 +90,15 @@ export function mirrorFixture(withPatch = true, withNotes = true, version = "1.2
 	});
 	let index = mergeUpdateIndex(null, release, repository, publishedAt);
 	let indexHead = indexCommit;
-	const assets = [
-		identity(name, bytes),
-		...[...raw].map(([name, value]) => identity(name, value)),
-	].map((a, i) => ({
-		id: i + 1,
-		name: a.name,
-		size: a.size,
-		digest: `sha256:${a.sha256}`,
-		state: "uploaded",
-	}));
+	const assets = [...raw]
+		.map(([name, value]) => identity(name, value))
+		.map((a, i) => ({
+			id: i + 1,
+			name: a.name,
+			size: a.size,
+			digest: `sha256:${a.sha256}`,
+			state: "uploaded",
+		}));
 	const publicRelease = {
 		id: 17,
 		tag_name: release.tag,
@@ -140,7 +142,7 @@ export function mirrorFixture(withPatch = true, withNotes = true, version = "1.2
 		throw new Error(`Unexpected GitHub fixture endpoint ${path}`);
 	};
 	const stored = new Map<string, Buffer>();
-	let committed: MirrorSnapshotV1 | undefined;
+	let committed: MirrorSnapshotV2 | undefined;
 	const httpCalls: { path: string; method: string; headers: Headers }[] = [];
 	let failPath = "";
 	let snapshotConflicts = 0;
@@ -155,8 +157,8 @@ export function mirrorFixture(withPatch = true, withNotes = true, version = "1.2
 		if (method === "GET") throw new Error("Producer asset/index/availability GET is forbidden");
 		if (failPath && path.includes(failPath)) return new Response("failure", { status: 503 });
 		if (method === "PUT") {
-			if (headers.get("x-mirror-kind") === "binary" || headers.get("x-mirror-name") === name)
-				throw new Error("Read-only spy: full binary upload forbidden");
+			if (headers.get("x-mirror-name") === name && headers.get("x-mirror-kind") !== "main-binary")
+				throw new Error("Full binary requires the explicit main-binary kind");
 			if (!(init?.body instanceof ReadableStream)) throw new Error("Raw PUT must stream");
 			const body = await new Response(init.body).arrayBuffer();
 			stored.set(path.split("/").at(-1) as string, Buffer.from(body));
@@ -198,8 +200,12 @@ export function mirrorFixture(withPatch = true, withNotes = true, version = "1.2
 		o.signal?.throwIfAborted();
 		downloaded.push(o.assetId);
 		const asset = assets.find((a) => a.id === o.assetId);
-		if (!asset?.name.endsWith("zstd-patch"))
-			throw new Error("Read-only spy: full binary download forbidden");
+		if (
+			!asset ||
+			(!asset.name.endsWith("zstd-patch") &&
+				!release.files.some((file) => file.name === asset.name))
+		)
+			throw new Error("Only original patch or main binary uses the payload downloader");
 		await writeFile(o.outputPath, raw.get(asset.name) as Buffer, { flag: "wx" });
 	};
 	return {
