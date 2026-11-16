@@ -16,7 +16,12 @@ import { lockOutlineTask } from "../pending";
 import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
 import { readOutlineMarks } from "../subtree-marks";
-import { readOutlineLevels, readOutlineSubtree } from "../subtree-read";
+import {
+	OUTLINE_LIVE_SUBTREE_MAX_SKIPPED,
+	readLiveSubtree,
+	readOutlineLevels,
+	readOutlineSubtree,
+} from "../subtree-read";
 import { type OutlineOp, writeOutline } from "../write";
 
 const NOW = "2026-10-26T00:00:00.000Z";
@@ -194,4 +199,75 @@ describe("reads by block past their limits", () => {
 		expect(few.truncated).toBe(false);
 		expect(few.rows).toHaveLength(10);
 	}, 240_000);
+});
+
+describe("a live subtree read that skips blocks", () => {
+	test("skipped blocks and what is under them take none of the limit, even where they fill a level", async () => {
+		const userId = await seedUser();
+		const space = await outlineStore.ensureSpace({ kind: "personal", ownerUserId: userId }, NOW);
+		const ops: OutlineOp[] = [{ op: "insert", tempId: "r", parent: null, content: "root" }];
+		// Ten skipped blocks first, each with children, then two kept with one child each.
+		for (let i = 0; i < 10; i++) {
+			ops.push({ op: "insert", tempId: `s${i}`, parent: { tempId: "r" }, content: `SKIP ${i}` });
+			for (let j = 0; j < 5; j++)
+				ops.push({ op: "insert", parent: { tempId: `s${i}` }, content: `under skip ${i}.${j}` });
+		}
+		for (let i = 0; i < 2; i++) {
+			ops.push({ op: "insert", tempId: `k${i}`, parent: { tempId: "r" }, content: `keep ${i}` });
+			ops.push({ op: "insert", parent: { tempId: `k${i}` }, content: `keep child ${i}` });
+		}
+		const made = await human(space, userId, ops);
+		const rootId = made.results[0]?.blockId as string;
+		const content = new Map(
+			ops.flatMap((op, i) =>
+				op.op === "insert" ? [[made.results[i]?.blockId as string, op.content]] : [],
+			),
+		);
+		const skippedIds = new Set(
+			[...content].filter(([, text]) => text.startsWith("SKIP")).map(([id]) => id),
+		);
+		const skip = (row: { id: string }) => skippedIds.has(row.id);
+		const texts = (read: Awaited<ReturnType<typeof readLiveSubtree>>) =>
+			[...(read?.nodes.keys() ?? [])].filter((id) => id !== rootId).map((id) => content.get(id));
+
+		// Room for exactly the four kept blocks: the skipped ten fill the first read of the level.
+		const exact = await readLiveSubtree(space.id, rootId, { limit: 4, skip });
+		expect(texts(exact)).toEqual(["keep 0", "keep 1", "keep child 0", "keep child 1"]);
+		expect(exact?.truncated).toBe(false);
+		// One less: cut, and said so.
+		const cut = await readLiveSubtree(space.id, rootId, { limit: 3, skip });
+		expect(texts(cut)).toEqual(["keep 0", "keep 1", "keep child 0"]);
+		expect(cut?.truncated).toBe(true);
+		// Without the skip the same limit reads the skipped blocks.
+		const plain = await readLiveSubtree(space.id, rootId, { limit: 4 });
+		expect(texts(plain)).toEqual(["SKIP 0", "SKIP 1", "SKIP 2", "SKIP 3"]);
+		expect(plain?.truncated).toBe(true);
+	});
+
+	test("more skipped blocks than the cap: the read stops and says it was cut", async () => {
+		const userId = await seedUser();
+		const space = await outlineStore.ensureSpace({ kind: "personal", ownerUserId: userId }, NOW);
+		const made = await human(space, userId, [
+			{ op: "insert", tempId: "r", parent: null, content: "root" },
+		]);
+		const rootId = made.results[0]?.blockId as string;
+		const total = OUTLINE_LIVE_SUBTREE_MAX_SKIPPED + 50;
+		for (let i = 0; i < total; i += 150) {
+			const ops: OutlineOp[] = [];
+			for (let j = i; j < Math.min(total, i + 150); j++)
+				ops.push({ op: "insert", parent: { id: rootId }, content: `SKIP ${j}` });
+			await human(space, userId, ops);
+		}
+		const kept = await human(space, userId, [
+			{ op: "insert", parent: { id: rootId }, content: "keep" },
+		]);
+		const keepId = kept.results[0]?.blockId as string;
+		const read = await readLiveSubtree(space.id, rootId, {
+			limit: 10,
+			skip: (row) => row.id !== keepId,
+		});
+		// The kept block stands after more skipped ones than the cap: never reached.
+		expect(read?.truncated).toBe(true);
+		expect([...(read?.nodes.keys() ?? [])]).toEqual([rootId]);
+	});
 });

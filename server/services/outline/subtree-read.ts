@@ -849,16 +849,31 @@ export interface OutlineLiveSubtree {
 }
 
 /**
+ * Rows a {@link readLiveSubtree} with `skip` reads and leaves out at most, besides `limit`: past
+ * it the read stops and says `truncated`. The behavior boundary holds at most 20 attach blocks.
+ */
+export const OUTLINE_LIVE_SUBTREE_MAX_SKIPPED = 200;
+
+/**
  * The structure of the live subtree of a block (no content), breadth first, at most `limit`
  * blocks under the root (capped at {@link OUTLINE_SUBTREE_LIMITS.maxBlocks}): for readers that
  * spend their own budget on content (a behavior boundary shown fairly, a fork's copy). One
- * primary-key read and the level reads of `listSubtreeAt`. Null when the block is not a live
- * block of the space.
+ * primary-key read and one `listLevels` read per level (a level whose rows the skip took out of
+ * the budget is read again, wider). Null when the block is not a live block of the space.
+ *
+ * `skip`: blocks left out together with everything under them, never read and not counted
+ * against `limit` (the swallowed-content scan's attach blocks: a reader that dropped them after
+ * a budgeted read would have spent its budget on them, losing the rules below). At most
+ * {@link OUTLINE_LIVE_SUBTREE_MAX_SKIPPED} are skipped; past that the read says `truncated`.
  */
 export async function readLiveSubtree(
 	spaceId: string,
 	rootId: string,
-	options: { limit: number; store?: OutlineStore },
+	options: {
+		limit: number;
+		store?: OutlineStore;
+		skip?: (row: OutlineLevelRow) => boolean;
+	},
 ): Promise<OutlineLiveSubtree | null> {
 	const store = options.store ?? outlineStore;
 	const meta = (await store.getBlockMetasByIds([rootId]))[0];
@@ -868,7 +883,7 @@ export async function readLiveSubtree(
 		OUTLINE_SUBTREE_LIMITS.maxBlocks,
 		OUTLINE_SUBTREE_LIMITS.maxBlocks,
 	);
-	const { rows, truncated } = await store.listSubtreeAt(spaceId, rootId, { asOf: null, limit });
+	const { rows, truncated } = await readLiveLevels(store, spaceId, rootId, limit, options.skip);
 	const nodes = buildTree([
 		{
 			id: meta.id,
@@ -887,4 +902,52 @@ export async function readLiveSubtree(
 	if (!root) return null;
 	const space = await store.getSpace(spaceId);
 	return { root, nodes, truncated, state: { current: true, seq: (space?.nextSeq ?? 1) - 1 } };
+}
+
+/**
+ * A live subtree level by level (breadth first, the root left out), at most `limit` rows kept;
+ * rows `skip` takes are neither kept, counted nor opened. Without `skip` the same rows as
+ * `listSubtreeAt`.
+ */
+async function readLiveLevels(
+	store: OutlineStore,
+	spaceId: string,
+	rootId: string,
+	limit: number,
+	skip: ((row: OutlineLevelRow) => boolean) | undefined,
+): Promise<{ rows: OutlineLevelRow[]; truncated: boolean }> {
+	const rows: OutlineLevelRow[] = [];
+	let skipped = 0;
+	let frontier: string[] = [rootId];
+	const cut = (kept: readonly OutlineLevelRow[]) => {
+		for (const row of kept) rows.push(row);
+		return { rows: rows.slice(0, limit), truncated: true };
+	};
+	while (frontier.length > 0) {
+		// One more than fits tells whether the subtree holds more.
+		const want = limit - rows.length + 1;
+		let ask = want;
+		let kept: OutlineLevelRow[];
+		let left: number;
+		for (;;) {
+			const found = await store.listLevels(spaceId, frontier, { asOf: null, limit: ask });
+			kept = skip ? found.rows.filter((row) => !skip(row)) : found.rows;
+			left = found.rows.length - kept.length;
+			// Enough kept, or the whole level read: done with this level.
+			if (kept.length >= want || !found.truncated) break;
+			// Skipped rows took the room of rows to keep: read the level again, wider (at most
+			// as wide as the skips left allow; past them the read is cut).
+			if (skipped + left > OUTLINE_LIVE_SUBTREE_MAX_SKIPPED) return cut(kept);
+			ask = Math.min(
+				want + OUTLINE_LIVE_SUBTREE_MAX_SKIPPED - skipped,
+				Math.max(want + left, ask * 2),
+			);
+		}
+		skipped += left;
+		if (skipped > OUTLINE_LIVE_SUBTREE_MAX_SKIPPED) return cut(kept);
+		for (const row of kept) rows.push(row);
+		if (rows.length > limit) return { rows: rows.slice(0, limit), truncated: true };
+		frontier = kept.filter((row) => row.hasChildren).map((row) => row.id);
+	}
+	return { rows, truncated: false };
 }

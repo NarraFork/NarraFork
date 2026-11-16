@@ -103,6 +103,14 @@ export const OUTLINE_BEHAVIOR_FORK_ACTOR = "outline-behavior-fork";
 export { findBehaviorBlock };
 
 /**
+ * A row the swallowed-content scan attached (`sl…`): what a behavior boundary read skips, with
+ * everything under it, so it never takes the budget of the rules ({@link readLiveSubtree}).
+ */
+export function isSpecLossAttachRow(row: { sid: string }): boolean {
+	return isSpecLossAttachSid(row.sid);
+}
+
+/**
  * Take the swallowed-content scan's attach blocks, with what is under them, out of a behavior
  * page's tree as it was just read (see the module header); the tree is the caller's own, built
  * for this read. `rulesOnly` (what the model is shown): the header of content a person confirmed
@@ -564,11 +572,13 @@ export async function copyOutlineBehaviorBoundary(
 		// One operation is kept for the note a cut copy ends with.
 		const room = OUTLINE_BEHAVIOR_LIMITS.forkBlocks - 1;
 		// The structure of as much as one read takes, so the note can say how much there is.
+		// Possibly lost content attached by the scan is not a rule: a fork does not inherit it, and
+		// the read never spends its budget on it.
 		const subtree = await readLiveSubtree(parentSpace.id, page.id, {
 			limit: OUTLINE_SUBTREE_LIMITS.maxBlocks,
+			skip: isSpecLossAttachRow,
 		});
 		if (!subtree) return false;
-		// Possibly lost content attached by the scan is not a rule: a fork does not inherit it.
 		dropSpecLossAttachBlocks(subtree.root);
 		const order = breadthFirst(subtree.root, "all", room);
 		await loadBodiesWithin(subtree.state, order, OUTLINE_BEHAVIOR_LIMITS.forkBytes);

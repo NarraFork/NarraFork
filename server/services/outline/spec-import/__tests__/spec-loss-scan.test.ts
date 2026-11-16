@@ -67,7 +67,7 @@ import {
 import * as runner from "../../edit-text-runner";
 import { OutlineEditTextError, stopEditTextWorker } from "../../edit-text-runner";
 import { outlineStore } from "../../store";
-import { writeOutline } from "../../write";
+import { type OutlineOp, writeOutline } from "../../write";
 import { reimportSpecSession, revertSpecImport } from "../admin";
 import { importSpecSession, resetSpecImportRecords } from "../importer";
 import {
@@ -1064,6 +1064,81 @@ describe("the behavior fence is never attached by a pass", () => {
 		const childView = await behaviorView(child.id);
 		expect(childView).toContain("never deploy on Fridays");
 		expect(childView).not.toContain("force-push");
+	});
+
+	test("large attach blocks nobody confirmed never take the read budget of the rules", async () => {
+		const { id, owner } = await fenceSession();
+		const spaceId = await spaceOf(id);
+		const page = await findBehaviorBlock(spaceId);
+		if (!page) throw new Error("no behavior page");
+		// A rule with a rule under it, then attach blocks standing first with more under them
+		// than any of the reads takes (view 400, switched-off fence 800, fork 800).
+		await writeOutline({
+			spaceId,
+			ops: [
+				{ op: "insert", tempId: "r", parent: { id: page.id }, content: "Top rule" },
+				{ op: "insert", parent: { tempId: "r" }, content: "Sub rule ZEBRA" },
+			],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		for (let a = 0; a < 6; a++) {
+			const ops: OutlineOp[] = [
+				{
+					op: "insert",
+					tempId: "h",
+					sid: specLossBlockSid(`lf-big-attach-${a}`),
+					parent: { id: page.id },
+					position: { first: true },
+					content: `Possibly lost content ${a}.`,
+				},
+			];
+			for (let i = 0; i < 150; i++)
+				ops.push({ op: "insert", parent: { tempId: "h" }, content: `lost line ${a}.${i}` });
+			await writeOutline({
+				spaceId,
+				ops,
+				actor: { kind: "system", id: OUTLINE_SPEC_LOSS_ACTOR },
+				responsibleUserId: owner,
+			});
+		}
+		const view = await behaviorView(id);
+		expect(view).toContain("Top rule");
+		expect(view).toContain("Sub rule ZEBRA");
+		expect(view).not.toContain("lost line");
+		// Nothing was cut: the attached content is not "more" the view failed to read.
+		expect(view).not.toMatch(/were read|only \d+/);
+		settings.outline.enabled = false;
+		invalidateTaskBackend();
+		try {
+			const fence = (await behaviorBoundaryForSpecFence(id)) ?? "";
+			expect(fence).toContain("Sub rule ZEBRA");
+			expect(fence).not.toContain("lost line");
+		} finally {
+			settings.outline.enabled = true;
+			invalidateTaskBackend();
+		}
+		const child = await makeSession({ owner, backend: "outline" });
+		expect(await copyOutlineBehaviorBoundary(id, child.id)).toBe(true);
+		// Every block of the fork's space, at any depth.
+		const childSpace = await outlineStore.findSpace({ kind: "session", narratorId: child.id });
+		const contents: string[] = [];
+		let level: Array<string | null> = [null];
+		while (level.length > 0 && childSpace) {
+			const next: string[] = [];
+			for (const parent of level) {
+				for (const row of await outlineStore.listChildren(childSpace.id, parent, 500)) {
+					contents.push(row.content);
+					next.push(row.id);
+				}
+			}
+			level = next;
+		}
+		const copied = contents.join("\n");
+		expect(copied).toContain("Top rule");
+		expect(copied).toContain("Sub rule ZEBRA");
+		expect(copied).not.toContain("lost line");
+		expect(copied).not.toContain("Possibly lost content");
 	});
 });
 

@@ -89,6 +89,7 @@ import {
 	findBehaviorBlock,
 	graphemeBoundary,
 	importLeftover,
+	isSpecLossAttachRow,
 	readOldBehaviorFence,
 } from "./outline-behavior";
 import {
@@ -920,11 +921,15 @@ async function renderBehaviorBoundary(
 	if (maxChars <= 0) return null;
 	// The boundary block and what is under it, by block: structure first (breadth first, at most
 	// `maxBlocks`), content only for what the fair shares can show.
-	const subtree = await readLiveSubtree(boundary.spaceId, boundary.id, { limit: maxBlocks });
+	// Content the swallowed-content scan attached is never shown as a rule (outline P2 PR 12c): a
+	// rule a person removed must not apply again because a check found it. It is never read
+	// either: the budget goes to rules, not to what the scan attached (it stands first).
+	const subtree = await readLiveSubtree(boundary.spaceId, boundary.id, {
+		limit: maxBlocks,
+		skip: isSpecLossAttachRow,
+	});
 	if (!subtree) return null;
 	const { state, root } = subtree;
-	// Content the swallowed-content scan attached is never shown as a rule (outline P2 PR 12c): a
-	// rule a person removed must not apply again because a check found it.
 	// Of content a person confirmed as rules, the content only: its header speaks to the person.
 	dropSpecLossAttachBlocks(root, { rulesOnly: true });
 	const min = OUTLINE_VIEW_LIMITS.behaviorBlockMinChars;
