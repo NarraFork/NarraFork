@@ -12,27 +12,44 @@
  * reached this way (H1's change marks: each ancestor of a changed block, before and after, is
  * marked), and so is everything that arrived since.
  *
- * The walk is depth first over a stack of FRAMES, one per parent being looked at:
+ * The walk is depth first over a stack of FRAMES, one per parent on the path being looked at:
  *
- *   - `then`: the parent was under the root at `then` (or is the root) and is under it at `to`.
- *     Its children of `then` are the subtree's own; what arrived under it since is added (not
- *     in the tree at `then`), moved in (in the tree then, elsewhere), or a block of the subtree
- *     that belongs under another parent (handled where it belonged).
- *   - `away`: the parent was under the root at `then` and is not at `to` (it moved away, or is
- *     deleted under a block that did). Its children of `then` either followed it or are found
- *     to be elsewhere; nothing can be put back under it.
+ *   - `then`: the parent was under the root at `then` (or is the root) and is under it at `to`,
+ *     or was deleted while under it. Its children of `then` are the subtree's own; what arrived
+ *     under it since is added (not in the tree at `then`), moved in (in the tree then,
+ *     elsewhere), or a block of the subtree that belongs under another parent (handled where it
+ *     belonged).
+ *   - `away`: the parent was under the root at `then` and is not at `to` (it moved away, or was
+ *     deleted after it had). Its children of `then` either followed it or are found to be
+ *     elsewhere; nothing can be put back under it.
  *   - `added`: the parent was added since. Everything under it arrived; a restore deletes it
  *     once what must not go with it has left, so the walk tells when a frame is finished.
  *
+ * FRAMES ARE PUSHED LAZILY. A frame keeps the cursor of the page of its parent's changed
+ * children it is on, and how many blocks of that page it has handled (`pos`). A step handles
+ * the blocks of the page up to the next one with something changed under it, pushes that one's
+ * frame and stops; the parent's page is read again when the child's frame is finished. So the
+ * stack is the path from the root, never longer than the tree is deep, and a cursor stays small
+ * however wide the subtree. Every frame's read is pinned to `to` (its first cursor names it), so
+ * reading a page again gives the same rows whatever was committed since: the restore's own
+ * commits included.
+ *
  * Whether a block is under the root at a seq is known for free from the frame it is met in,
  * except for a block met under one parent that sits under another at the other seq: those are
- * walked up by their placements as of that seq, many at once, one bounded read per level.
+ * asked of the store in one statement (`listUnderRootAt`), one row per block.
  *
- * WHAT IT COSTS. One step reads one page of one parent's changed children
- * (`OUTLINE_DIFF_LIMITS.levelRows`) and, for those, their versions at both ends without
- * content, their rows, and the walks up. A caller runs steps until its row budget is spent
- * and hands the stack out as a cursor (`restore-errors.ts` seals it), so a comparison of a
- * huge subtree is many bounded reads, never one. Every read names the space.
+ * A block of the subtree that is deleted at `to` was REMOVED when it was deleted while under the
+ * root (a restore brings it back). When it was deleted after it had left the subtree, it moved
+ * away and was deleted since (`deletedSince`): a restore does not bring it back, it is listed
+ * with the blocks that moved away (owner rule D58: what moved away is not pulled back).
+ *
+ * WHAT IT COSTS. Every read is charged to `rows`, and a step is given the rows it may still read
+ * (`step(budget)`). It handles as many blocks as the budget surely covers (each block's fixed
+ * reads, its tags when they may differ, and what the caller reads for it after), and answers
+ * null when not even one fits: the caller ends its page there. Tags are read only for a block
+ * whose tags may differ between the two seqs (`findTagChanges`). So a page of a comparison of a
+ * huge subtree is a bounded number of rows, and many pages make the whole. Every read names the
+ * space.
  */
 import { ValidationError } from "@server/lib/errors";
 import {
@@ -52,7 +69,12 @@ import {
 	sealOutlineValue,
 } from "./restore-errors";
 import { outlineStore } from "./store";
-import { assertHistoryReadable, type OutlineChangedChildCursor } from "./store/history-port";
+import {
+	assertHistoryReadable,
+	type OutlineChangedChildCursor,
+	type OutlineChangedChildRow,
+	type OutlineUnderRootRow,
+} from "./store/history-port";
 import type { OutlineBlockMeta, OutlineSpaceRow, OutlineStore } from "./store/port";
 import type { OutlineVersionHead } from "./store/read-port";
 import { withOutlineHistory } from "./subtree-errors";
@@ -64,14 +86,16 @@ export interface DiffFrame {
 	/** Null: the top level of the space. */
 	parentId: string | null;
 	kind: DiffFrameKind;
-	/** The next page of the parent's changed children; null before the first. */
-	cursor: OutlineChangedChildCursor | null;
+	/** The page of the parent's changed children the frame is on (pinned to `to`). */
+	cursor: OutlineChangedChildCursor;
+	/** Blocks of that page already handled, in the page's order. */
+	pos: number;
 	/** No page of it is left to read. */
 	done: boolean;
 	/** `added`: something stays under the parent, so it cannot be deleted. */
 	kept: boolean;
-	/** Index of the frame that pushed this one; -1 for the root's. */
-	up: number;
+	/** `added`: something under the parent must leave it first; whether it can is not known. */
+	maybe: boolean;
 }
 
 export interface DiffWalkState {
@@ -106,17 +130,21 @@ export interface DiffItem {
 	/** It was under the root at `then` / is under it at `to`. */
 	inThen: boolean;
 	inNow: boolean;
+	/** Deleted at `to` after it had left the subtree: moved away, not removed. */
+	deletedSince: boolean;
 	/** What the comparison lists it as; null when it lists nothing for it here. */
 	kind: OutlineDiffKind | null;
 	/** For `changed`: what differs. */
 	fields: OutlineDiffField[];
+	/** A tag of it was put on or taken off since `then`: its tags may differ. */
+	tagsMayDiffer: boolean;
 	/** Its tags at `then` and at `to`, when the walk read them. */
 	thenTags?: string[];
 	nowTags?: string[];
 	/** It has a version of its own in the range; something under it changed in the range. */
 	self: boolean;
 	below: boolean;
-	/** The kind of the frame the walk pushed for it, if any. */
+	/** The kind of the frame the walk pushes for it, if any. */
 	descend: DiffFrameKind | null;
 }
 
@@ -129,7 +157,13 @@ export type DiffStep =
 			kind: DiffFrameKind;
 			items: DiffItem[];
 	  }
-	| { type: "close"; parentId: string | null; kind: DiffFrameKind; kept: boolean };
+	| {
+			type: "close";
+			parentId: string | null;
+			kind: DiffFrameKind;
+			kept: boolean;
+			maybe: boolean;
+	  };
 
 export interface DiffWalkScope {
 	store: OutlineStore;
@@ -140,13 +174,26 @@ export interface DiffWalkScope {
 	to: number;
 	/**
 	 * `compare`: read each block's version at `to` and tell what differs. `restore`: read only
-	 * where each block sat at `to`; the caller compares `then` with the rows as they are now.
+	 * where each block sat at `to`; the caller compares `then` with the rows as they are now
+	 * (so whether tags may differ is asked up to now, not up to `to`).
 	 */
 	mode: "compare" | "restore";
 }
 
-/** Levels walked up by batched placement reads before a block is walked alone. */
-const MEMBER_HOPS = 4;
+/** What a caller reads for the items of a step after the walk: charged to the step's budget. */
+export interface DiffLateCost {
+	/** The most it reads for one item. */
+	max: number;
+	/** What it reads at most for this item. */
+	cost(item: DiffItem, frameKind: DiffFrameKind): number;
+}
+
+/** Rows one block met on a page costs the walk at most, its tags aside. */
+export const DIFF_ITEM_ROWS = 8;
+/** Rows a block's tags cost at most (both seqs). */
+export const DIFF_TAG_ROWS = 2 * OUTLINE_LIMITS.maxTagsPerBlock;
+/** Pages of changed children a walk keeps in memory, to read a parent's page again for free. */
+const PAGE_CACHE = 8;
 
 function place(head: OutlineVersionHead): DiffPlace {
 	return { parentId: head.parentId, orderKey: head.orderKey };
@@ -166,21 +213,38 @@ export function contentFieldsDiffer(
 	return fields;
 }
 
+/** The first page of a frame's read, pinned to `to`. */
+export function startCursor(to: number): OutlineChangedChildCursor {
+	return { pin: to, open: true, toSeq: 0, fromSeq: 0, orderKey: "", blockId: "" };
+}
+
+const isStart = (cursor: OutlineChangedChildCursor, to: number): boolean =>
+	cursor.pin === to &&
+	cursor.open &&
+	cursor.toSeq === 0 &&
+	cursor.fromSeq === 0 &&
+	cursor.orderKey === "" &&
+	cursor.blockId === "";
+
+interface PageFlags {
+	coversThen: boolean;
+	coversTo: boolean;
+	self: boolean;
+	below: boolean;
+}
+
 export class SubtreeDiffWalk {
-	/** Rows read from the store so far. */
+	/** Rows read from the store so far (callers add their own reads). */
 	rows = 0;
-	private readonly memberThen = new Map<string, boolean>();
-	private readonly memberNow = new Map<string, boolean>();
+	private readonly pages = new Map<
+		string,
+		{ rows: OutlineChangedChildRow[]; next: OutlineChangedChildCursor | null }
+	>();
 
 	constructor(
 		private readonly scope: DiffWalkScope,
 		readonly state: DiffWalkState,
-	) {
-		if (scope.rootId !== null) {
-			this.memberThen.set(scope.rootId, true);
-			this.memberNow.set(scope.rootId, true);
-		}
-	}
+	) {}
 
 	get finished(): boolean {
 		return this.state.rootDone && this.state.frames.length === 0;
@@ -190,57 +254,93 @@ export class SubtreeDiffWalk {
 	snapshot(): DiffWalkState {
 		return {
 			rootDone: this.state.rootDone,
-			frames: this.state.frames.map((frame) => ({
-				...frame,
-				cursor: frame.cursor ? { ...frame.cursor } : null,
-			})),
+			frames: this.state.frames.map((frame) => ({ ...frame, cursor: { ...frame.cursor } })),
 		};
 	}
 
-	/** Mark the `added` frames from `frameIndex` up to the root as holding something that stays. */
+	/** Mark the `added` frames from `frameIndex` up to the first other one as holding what stays. */
 	keep(frameIndex: number): void {
-		for (let i = frameIndex; i >= 0; ) {
+		for (let i = frameIndex; i >= 0; i--) {
 			const frame = this.state.frames[i];
 			if (!frame || frame.kind !== "added") return;
 			frame.kept = true;
-			i = frame.up;
 		}
+	}
+
+	/** Mark the `added` frames from `frameIndex` up as holding what must leave first. */
+	maybe(frameIndex: number): void {
+		for (let i = frameIndex; i >= 0; i--) {
+			const frame = this.state.frames[i];
+			if (!frame || frame.kind !== "added") return;
+			frame.maybe = true;
+		}
+	}
+
+	/** Mark the open `added` frames of these blocks as holding what stays. */
+	keepIds(ids: ReadonlySet<string>): void {
+		for (const frame of this.state.frames)
+			if (frame.kind === "added" && frame.parentId !== null && ids.has(frame.parentId))
+				frame.kept = true;
 	}
 
 	/** The parents of the `added` frames from `frameIndex` up: the blocks a delete there takes. */
 	addedAbove(frameIndex: number): string[] {
 		const out: string[] = [];
-		for (let i = frameIndex; i >= 0; ) {
+		for (let i = frameIndex; i >= 0; i--) {
 			const frame = this.state.frames[i];
 			if (!frame || frame.kind !== "added") break;
 			if (frame.parentId !== null) out.push(frame.parentId);
-			i = frame.up;
 		}
 		return out;
 	}
 
-	private get range(): { after: number; upTo: number } {
-		return { after: this.scope.thenSeq, upTo: this.scope.to };
+	private push(parentId: string | null, kind: DiffFrameKind): void {
+		this.state.frames.push({
+			parentId,
+			kind,
+			cursor: startCursor(this.scope.to),
+			pos: 0,
+			done: false,
+			kept: false,
+			maybe: false,
+		});
 	}
 
-	private push(parentId: string | null, kind: DiffFrameKind, up: number): void {
-		this.state.frames.push({ parentId, kind, cursor: null, done: false, kept: false, up });
+	/** The rows a step needs at least to get anywhere. */
+	private need(late: DiffLateCost | undefined): number {
+		return DIFF_ITEM_ROWS + DIFF_TAG_ROWS + (late?.max ?? 0);
 	}
 
-	/** One unit of the walk: the root, one page of the top frame, or a finished frame. */
-	async step(): Promise<DiffStep> {
-		if (!this.state.rootDone) return await this.root();
+	/**
+	 * One unit of the walk: the root, part of one page of the top frame, or a finished frame;
+	 * at most `budget` rows read (and reserved for `late`). Null when the budget is too small
+	 * for even one block: the caller ends its page and comes back with a fresh budget.
+	 */
+	async step(budget: number, late?: DiffLateCost): Promise<DiffStep | null> {
+		if (!this.state.rootDone) {
+			if (budget < this.need(late)) return null;
+			return await this.root();
+		}
 		const index = this.state.frames.length - 1;
 		const frame = this.state.frames[index];
 		if (!frame) throw new Error("the outline diff walk is finished");
 		if (frame.done) {
 			this.state.frames.pop();
-			if (frame.kept) this.keep(frame.up);
-			return { type: "close", parentId: frame.parentId, kind: frame.kind, kept: frame.kept };
+			if (frame.kept) this.keep(index - 1);
+			else if (frame.maybe) this.maybe(index - 1);
+			return {
+				type: "close",
+				parentId: frame.parentId,
+				kind: frame.kind,
+				kept: frame.kept,
+				maybe: frame.maybe,
+			};
 		}
-		return await this.page(frame, index);
+		if (budget < OUTLINE_DIFF_LIMITS.levelRows + this.need(late)) return null;
+		return await this.page(frame, index, budget, late);
 	}
 
+	/** Versions at a seq, tombstones included. */
 	private async heads(
 		ids: readonly string[],
 		seq: number,
@@ -248,7 +348,7 @@ export class SubtreeDiffWalk {
 	): Promise<Map<string, OutlineVersionHead>> {
 		const rows = ids.length > 0 ? await this.scope.store.listVersionHeadsAt(ids, seq, chars) : [];
 		this.rows += rows.length;
-		return new Map(rows.filter((row) => !row.deleted).map((row) => [row.blockId, row]));
+		return new Map(rows.map((row) => [row.blockId, row]));
 	}
 
 	private async tags(ids: readonly string[], seq: number): Promise<Map<string, string[]>> {
@@ -266,21 +366,48 @@ export class SubtreeDiffWalk {
 		return out;
 	}
 
+	/** Which of `ids` may have other tags now than at `then`. */
+	private async tagHints(ids: readonly string[]): Promise<Set<string>> {
+		if (ids.length === 0) return new Set();
+		const { thenSeq, to, mode } = this.scope;
+		const found = await this.scope.store.findTagChanges(ids, {
+			after: thenSeq,
+			upTo: mode === "compare" ? to : Number.MAX_SAFE_INTEGER,
+		});
+		this.rows += found.length;
+		return new Set(found);
+	}
+
+	/** Where each block last sat as of its seq, and whether under the root; a row per block. */
+	private async under(
+		items: Array<{ blockId: string; asOf: number }>,
+	): Promise<Map<string, OutlineUnderRootRow>> {
+		const { store, space, rootId } = this.scope;
+		if (rootId === null || items.length === 0) return new Map();
+		const rows = await store.listUnderRootAt(space.id, rootId, items, OUTLINE_LIMITS.maxDepth);
+		this.rows += rows.length;
+		return new Map(rows.map((row) => [`${row.blockId}@${row.asOf}`, row]));
+	}
+
 	private async root(): Promise<DiffStep> {
 		const { store, space, rootId, thenSeq, to, mode } = this.scope;
 		this.state.rootDone = true;
 		if (rootId === null) {
-			this.push(null, "then", -1);
+			this.push(null, "then");
 			return { type: "root", item: null };
 		}
 		const chars = mode === "compare" ? OUTLINE_DIFF_LIMITS.excerptChars : 0;
 		const meta = (await store.getBlockMetas(space.id, { ids: [rootId] }))[0];
-		const before = (await this.heads([rootId], thenSeq, chars)).get(rootId) ?? null;
-		const after = (await this.heads([rootId], to, chars)).get(rootId) ?? null;
 		this.rows += 1;
-		if (!meta || !before) throw new OutlineRestoreRootError({ blockId: rootId, seq: thenSeq });
-		if (!after) throw new OutlineRestoreRootError({ blockId: rootId, seq: to });
-		const changes = await store.findSubtreeChanges(space.id, [rootId], this.range);
+		const before = (await this.heads([rootId], thenSeq, chars)).get(rootId);
+		const after = (await this.heads([rootId], to, chars)).get(rootId);
+		if (!meta || !before || before.deleted)
+			throw new OutlineRestoreRootError({ blockId: rootId, seq: thenSeq });
+		if (!after || after.deleted) throw new OutlineRestoreRootError({ blockId: rootId, seq: to });
+		const changes = await store.findSubtreeChanges(space.id, [rootId], {
+			after: thenSeq,
+			upTo: to,
+		});
 		this.rows += changes.length;
 		const change = changes[0];
 		const item: DiffItem = {
@@ -292,99 +419,74 @@ export class SubtreeDiffWalk {
 			own: true,
 			inThen: true,
 			inNow: true,
+			deletedSince: false,
 			kind: null,
 			fields: [],
+			tagsMayDiffer: false,
 			self: change?.self === true,
 			below: change?.below === true,
 			descend: null,
 		};
-		if (change?.self) {
-			item.thenTags = (await this.tags([rootId], thenSeq)).get(rootId) ?? [];
+		if (item.self) {
+			item.tagsMayDiffer = (await this.tagHints([rootId])).has(rootId);
+			if (item.tagsMayDiffer) {
+				item.thenTags = (await this.tags([rootId], thenSeq)).get(rootId) ?? [];
+				if (mode === "compare") item.nowTags = (await this.tags([rootId], to)).get(rootId) ?? [];
+			}
 			if (mode === "compare") {
-				item.nowTags = (await this.tags([rootId], to)).get(rootId) ?? [];
 				item.fields = contentFieldsDiffer(before, after);
-				if (item.thenTags.join("\n") !== item.nowTags.join("\n")) item.fields.push("tags");
+				if ((item.thenTags ?? []).join("\n") !== (item.nowTags ?? []).join("\n"))
+					item.fields.push("tags");
 				if (item.fields.length > 0) item.kind = "changed";
 			}
 		}
 		if (item.below) {
-			this.push(rootId, "then", -1);
+			this.push(rootId, "then");
 			item.descend = "then";
 		}
 		return { type: "root", item };
 	}
 
-	/**
-	 * Whether each of `ids` was under the root as of `seq`, into `memo`: up the placements valid
-	 * then, all of them one level per read; a chain longer than a few levels is finished with
-	 * one recursive read of its own.
-	 */
-	private async members(
-		ids: readonly string[],
-		seq: number,
-		memo: Map<string, boolean>,
-	): Promise<void> {
-		const { store, space, rootId } = this.scope;
-		if (rootId === null) return;
-		const parentOf = new Map<string, string>();
-		let frontier = [...new Set(ids)].filter((id) => !memo.has(id));
-		for (let hop = 0; frontier.length > 0 && hop < MEMBER_HOPS; hop++) {
-			const rows = await store.getPlacementsAt(space.id, frontier, seq);
-			this.rows += rows.length;
-			const found = new Map(rows.map((row) => [row.blockId, row.parentKey]));
-			const next = new Set<string>();
-			for (const id of frontier) {
-				const parentKey = found.get(id);
-				if (parentKey === undefined || parentKey === space.id) memo.set(id, false);
-				else if (parentKey === rootId) memo.set(id, true);
-				else {
-					parentOf.set(id, parentKey);
-					next.add(parentKey);
-				}
-			}
-			frontier = [...next].filter((id) => !memo.has(id) && !parentOf.has(id));
-		}
-		for (const id of frontier) {
-			const chain = await store.getAncestry(space.id, id, {
-				asOf: seq,
-				maxDepth: OUTLINE_LIMITS.maxDepth,
-			});
-			this.rows += chain?.length ?? 1;
-			memo.set(id, chain?.some((row) => row.id === rootId) === true);
-		}
-		for (const id of ids) {
-			const chain: string[] = [];
-			let current: string | undefined = id;
-			let answer = false;
-			for (let depth = 0; current !== undefined && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
-				const known = memo.get(current);
-				if (known !== undefined) {
-					answer = known;
-					break;
-				}
-				chain.push(current);
-				current = parentOf.get(current);
-			}
-			for (const link of chain) memo.set(link, answer);
-		}
-	}
-
-	private async page(frame: DiffFrame, index: number): Promise<DiffStep> {
-		const { store, space, rootId, thenSeq, to, mode } = this.scope;
-		const { rows, next } = await store.listChangedChildren(space.id, frame.parentId, {
-			...this.range,
+	/** A page of a frame's changed children: read once per walk, kept for reading it again. */
+	private async readPage(
+		frame: DiffFrame,
+	): Promise<{ rows: OutlineChangedChildRow[]; next: OutlineChangedChildCursor | null }> {
+		const key = `${frame.parentId ?? ""}|${JSON.stringify(frame.cursor)}`;
+		const known = this.pages.get(key);
+		if (known) return known;
+		const { store, space, thenSeq, to } = this.scope;
+		const page = await store.listChangedChildren(space.id, frame.parentId, {
+			after: thenSeq,
+			upTo: to,
 			cursor: frame.cursor,
 			limit: OUTLINE_DIFF_LIMITS.levelRows,
 		});
-		this.rows += rows.length;
-		frame.cursor = next;
-		if (!next) frame.done = true;
+		this.rows += page.rows.length;
+		if (this.pages.size >= PAGE_CACHE) this.pages.clear();
+		this.pages.set(key, page);
+		return page;
+	}
 
-		/** Per block: whether a row of this page covers `then` / `to`, and its change flags. */
-		const seen = new Map<
-			string,
-			{ coversThen: boolean; coversTo: boolean; self: boolean; below: boolean }
-		>();
+	private async page(
+		frame: DiffFrame,
+		index: number,
+		budget: number,
+		late: DiffLateCost | undefined,
+	): Promise<DiffStep> {
+		const { store, space, rootId, thenSeq, to, mode } = this.scope;
+		const started = this.rows;
+		const { rows, next } = await this.readPage(frame);
+		const result: DiffStep = {
+			type: "page",
+			frameIndex: index,
+			parentId: frame.parentId,
+			kind: frame.kind,
+			items: [],
+		};
+
+		// Per block, in the page's order: whether a row of this page covers `then` / `to`, and
+		// its change flags (the same on each of its rows: they are over the whole range).
+		const seen = new Map<string, PageFlags>();
 		for (const row of rows) {
 			const coversThen = row.fromSeq <= thenSeq && (row.toSeq === null || row.toSeq > thenSeq);
 			const coversTo = row.fromSeq <= to && (row.toSeq === null || row.toSeq > to);
@@ -396,26 +498,44 @@ export class SubtreeDiffWalk {
 				seen.set(row.blockId, { coversThen, coversTo, self: row.self, below: row.below });
 			}
 		}
-		const ids = [...seen.keys()];
-		const result: DiffStep = {
-			type: "page",
-			frameIndex: index,
-			parentId: frame.parentId,
-			kind: frame.kind,
-			items: [],
-		};
-		if (ids.length === 0) return result;
+		const order = [...seen.keys()];
+		if (frame.pos >= order.length) {
+			if (next) {
+				frame.cursor = next;
+				frame.pos = 0;
+			} else frame.done = true;
+			return result;
+		}
+
+		// This step's blocks: up to the next one with something changed under it (its frame is
+		// pushed, and the page is taken up again when that frame is finished), as many as the
+		// budget surely covers.
+		let end = frame.pos;
+		while (end < order.length) {
+			const below = (seen.get(order[end] as string) as PageFlags).below;
+			end++;
+			if (below) break;
+		}
+		const lateMax = late?.max ?? 0;
+		const room = budget - (this.rows - started) - DIFF_TAG_ROWS - lateMax;
+		const k = Math.max(1, Math.min(end - frame.pos, Math.floor(room / DIFF_ITEM_ROWS)));
+		const ids = order.slice(frame.pos, frame.pos + k);
 
 		const chars = mode === "compare" ? OUTLINE_DIFF_LIMITS.excerptChars : 0;
-		const thenHeads = await this.heads(ids, thenSeq, chars);
+		const thenHeads = new Map(
+			[...(await this.heads(ids, thenSeq, chars))].filter(([, head]) => !head.deleted),
+		);
 		const metaRows = await store.getBlockMetas(space.id, { ids });
 		this.rows += metaRows.length;
 		const metas = new Map(metaRows.map((row) => [row.id, row]));
-		let nowHeads = new Map<string, OutlineVersionHead>();
+		const nowHeads = new Map<string, OutlineVersionHead>();
 		const at = new Map<string, DiffPlace>();
 		if (mode === "compare") {
-			nowHeads = await this.heads(ids, to, chars);
-			for (const [id, head] of nowHeads) at.set(id, place(head));
+			for (const [id, head] of await this.heads(ids, to, chars)) {
+				if (head.deleted) continue;
+				nowHeads.set(id, head);
+				at.set(id, place(head));
+			}
 		} else {
 			const placements = await store.getPlacementsAt(space.id, ids, to);
 			this.rows += placements.length;
@@ -429,32 +549,41 @@ export class SubtreeDiffWalk {
 
 		// A block with two placements under this parent (it left and came back) is two rows,
 		// maybe on two pages: it is handled with the row that covers the seq it is judged at.
-		const handled: Array<{ id: string; own: boolean }> = [];
-		for (const [id, flags] of seen) {
+		const handled = new Map<string, boolean>();
+		for (const id of ids) {
+			const flags = seen.get(id) as PageFlags;
 			if (!metas.has(id)) continue;
 			const own = thenHeads.get(id)?.parentId === frame.parentId && thenHeads.has(id);
 			const here = at.get(id)?.parentId === frame.parentId && at.has(id);
 			if (own ? flags.coversThen : here && flags.coversTo && frame.kind !== "away")
-				handled.push({ id, own });
+				handled.set(id, own);
 		}
 		const wholeSpace = rootId === null;
+		// Asked of the store: a block met under another parent than at the other seq, and a block
+		// of the subtree deleted at `to` (where it was when it was deleted: under the root, or
+		// after it had left it).
+		const asked: Array<{ blockId: string; asOf: number }> = [];
 		if (!wholeSpace) {
-			await this.members(
-				handled.filter(({ id, own }) => own && at.has(id)).map(({ id }) => id),
-				to,
-				this.memberNow,
-			);
-			await this.members(
-				handled.filter(({ id, own }) => !own && thenHeads.has(id)).map(({ id }) => id),
-				thenSeq,
-				this.memberThen,
-			);
+			for (const [id, own] of handled) {
+				const where = at.get(id);
+				if (own && (!where || where.parentId !== frame.parentId))
+					asked.push({ blockId: id, asOf: to });
+				if (!own && thenHeads.has(id)) asked.push({ blockId: id, asOf: thenSeq });
+			}
 		}
+		const under = await this.under(asked);
+		const isUnder = (id: string, seq: number) =>
+			wholeSpace || under.get(`${id}@${seq}`)?.under === true;
 
-		const compared: DiffItem[] = [];
-		for (const { id, own } of handled) {
-			const flags = seen.get(id) as { self: boolean; below: boolean };
-			// (flags are the block's over the whole range, the same on each of its rows)
+		/** In the slice's order; null for a block judged elsewhere. */
+		const items: Array<DiffItem | null> = [];
+		for (const id of ids) {
+			const own = handled.get(id);
+			if (own === undefined) {
+				items.push(null);
+				continue;
+			}
+			const flags = seen.get(id) as PageFlags;
 			const before = thenHeads.get(id) ?? null;
 			const where = at.get(id) ?? null;
 			const item: DiffItem = {
@@ -466,25 +595,32 @@ export class SubtreeDiffWalk {
 				own,
 				inThen: own,
 				inNow: false,
+				deletedSince: false,
 				kind: null,
 				fields: [],
+				tagsMayDiffer: false,
 				self: flags.self,
 				below: flags.below,
 				descend: null,
 			};
 			if (own) {
 				if (!where) {
-					item.kind = "removed";
-					item.descend = frame.kind === "then" ? "then" : "away";
-				} else {
-					item.inNow =
-						where.parentId === frame.parentId
-							? frame.kind === "then"
-							: wholeSpace || this.memberNow.get(id) === true;
-					if (item.inNow) {
-						item.descend = "then";
-						compared.push(item);
+					const last = under.get(`${id}@${to}`);
+					if (wholeSpace || !last || last.under) {
+						item.kind = "removed";
+						item.descend = frame.kind === "then" ? "then" : "away";
 					} else {
+						// It left the subtree, then was deleted: listed with what moved away (unless it
+						// merely followed a block that moved away), never brought back here.
+						item.deletedSince = true;
+						if (frame.kind === "then" || last.parentKey !== (frame.parentId ?? space.id))
+							item.kind = "moved-away";
+						item.descend = "away";
+					}
+				} else {
+					item.inNow = where.parentId === frame.parentId ? frame.kind === "then" : isUnder(id, to);
+					if (item.inNow) item.descend = "then";
+					else {
 						if (where.parentId !== before?.parentId) item.kind = "moved-away";
 						item.descend = "away";
 					}
@@ -492,7 +628,7 @@ export class SubtreeDiffWalk {
 			} else {
 				item.inNow = true;
 				if (before) {
-					item.inThen = wholeSpace || this.memberThen.get(id) === true;
+					item.inThen = isUnder(id, thenSeq);
 					// In the tree at `then`, elsewhere: moved in, unless it is a block of the subtree
 					// that belongs under another parent (listed where it belonged).
 					if (!item.inThen) item.kind = "moved-in";
@@ -501,25 +637,52 @@ export class SubtreeDiffWalk {
 					item.descend = "added";
 				}
 			}
-			if (wholeSpace) {
-				this.memberThen.set(id, item.inThen);
-				this.memberNow.set(id, item.inNow);
-			}
-			result.items.push(item);
+			items.push(item);
 		}
 
-		// Tags: read for the blocks whose fields are compared or put back.
-		const tagged = result.items
-			.filter((item) => item.own && item.self && (item.kind === "removed" || item.inNow))
-			.map((item) => item.id);
-		const thenTags = await this.tags(tagged, thenSeq);
-		const nowTags = mode === "compare" ? await this.tags(tagged, to) : null;
-		for (const item of result.items) {
+		// Tags: of the blocks whose fields are compared or put back, only where they may differ;
+		// a removed block's are read whole (it is brought back with them).
+		const hinted = await this.tagHints(
+			items
+				.filter(
+					(item): item is DiffItem =>
+						item?.own === true && item.self && item.inNow && item.kind !== "removed",
+				)
+				.map((item) => item.id),
+		);
+		for (const item of items) if (item && hinted.has(item.id)) item.tagsMayDiffer = true;
+		const tagRows = (item: DiffItem) =>
+			item.kind === "removed"
+				? OUTLINE_LIMITS.maxTagsPerBlock
+				: item.tagsMayDiffer
+					? (mode === "compare" ? 2 : 1) * OUTLINE_LIMITS.maxTagsPerBlock
+					: 0;
+
+		// Cut the step where the budget ends: the first block always fits.
+		let spent = this.rows - started;
+		let take = 0;
+		for (const item of items) {
+			const cost = item ? tagRows(item) + (late?.cost(item, frame.kind) ?? 0) : 0;
+			if (take > 0 && spent + cost > budget) break;
+			spent += cost;
+			take++;
+		}
+		const taken = items.slice(0, take).filter((item): item is DiffItem => item !== null);
+		const thenTags = await this.tags(
+			taken.filter((item) => item.kind === "removed" || item.tagsMayDiffer).map((item) => item.id),
+			thenSeq,
+		);
+		const nowTags =
+			mode === "compare"
+				? await this.tags(
+						taken.filter((item) => item.tagsMayDiffer).map((item) => item.id),
+						to,
+					)
+				: null;
+		for (const item of taken) {
 			if (thenTags.has(item.id)) item.thenTags = thenTags.get(item.id);
 			if (nowTags?.has(item.id)) item.nowTags = nowTags.get(item.id);
-		}
-		if (mode === "compare") {
-			for (const item of compared) {
+			if (mode === "compare" && item.own && item.inNow) {
 				const before = item.before as OutlineVersionHead;
 				const after = item.now as OutlineVersionHead;
 				if (before.parentId !== after.parentId) item.fields.push("parent");
@@ -529,38 +692,39 @@ export class SubtreeDiffWalk {
 					item.fields.push("tags");
 				if (item.fields.length > 0) item.kind = "changed";
 			}
-		}
-
-		for (const item of result.items) {
 			if (!item.below) item.descend = null;
-			else if (item.descend) this.push(item.id, item.descend, index);
 		}
+		result.items = taken;
+		frame.pos += take;
+		// Only the last block of a step can have something changed under it.
+		const last = taken.at(-1);
+		if (last?.descend && items[take - 1] === last) this.push(last.id, last.descend);
 		return result;
 	}
 }
 
 const FRAME_KINDS: readonly DiffFrameKind[] = ["then", "away", "added"];
-const MAX_FRAMES = 20_000;
+/** The stack is the path from the root: never deeper than the tree, plus the root's frame. */
+const MAX_FRAMES = OUTLINE_LIMITS.maxDepth + 2;
 
-/** A walk's stack as plain JSON (sealed by the caller). */
-export function encodeDiffWalkState(state: DiffWalkState): unknown[] {
+/** A walk's stack as plain JSON (sealed by the caller); a frame's first page is `0`. */
+export function encodeDiffWalkState(state: DiffWalkState, to: number): unknown[] {
 	return [
 		state.rootDone ? 1 : 0,
 		state.frames.map((frame) => [
 			frame.parentId ?? "",
 			FRAME_KINDS.indexOf(frame.kind),
-			(frame.done ? 1 : 0) | (frame.kept ? 2 : 0),
-			frame.up,
-			frame.cursor
-				? [
-						frame.cursor.pin,
+			(frame.done ? 1 : 0) | (frame.kept ? 2 : 0) | (frame.maybe ? 4 : 0),
+			frame.pos,
+			isStart(frame.cursor, to)
+				? 0
+				: [
 						frame.cursor.open ? 1 : 0,
 						frame.cursor.toSeq,
 						frame.cursor.fromSeq,
 						frame.cursor.orderKey,
 						frame.cursor.blockId,
-					]
-				: 0,
+					],
 		]),
 	];
 }
@@ -568,47 +732,45 @@ export function encodeDiffWalkState(state: DiffWalkState): unknown[] {
 const isSeq = (value: unknown): value is number =>
 	typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
-/** The stack a cursor holds; throws when it is not one `encodeDiffWalkState` made. */
-export function decodeDiffWalkState(value: unknown): DiffWalkState {
+/** The stack a cursor holds; throws when it is not one `encodeDiffWalkState` made for `to`. */
+export function decodeDiffWalkState(value: unknown, to: number): DiffWalkState {
 	const bad = () => new OutlineRestoreTokenError("cursor");
 	if (!Array.isArray(value) || value.length !== 2 || !Array.isArray(value[1])) throw bad();
 	const list = value[1] as unknown[];
 	if (list.length > MAX_FRAMES) throw bad();
-	const frames = list.map((raw, i): DiffFrame => {
+	const frames = list.map((raw): DiffFrame => {
 		if (!Array.isArray(raw) || raw.length !== 5) throw bad();
-		const [parentId, kind, flags, up, cursor] = raw as unknown[];
+		const [parentId, kind, flags, pos, cursor] = raw as unknown[];
 		if (
 			typeof parentId !== "string" ||
 			typeof kind !== "number" ||
 			FRAME_KINDS[kind] === undefined ||
 			typeof flags !== "number" ||
-			typeof up !== "number" ||
-			!Number.isInteger(up) ||
-			up < -1 ||
-			up >= i
+			!isSeq(pos) ||
+			pos > OUTLINE_DIFF_LIMITS.levelRows
 		)
 			throw bad();
-		let at: OutlineChangedChildCursor | null = null;
+		let at = startCursor(to);
 		if (cursor !== 0) {
-			if (!Array.isArray(cursor) || cursor.length !== 6) throw bad();
-			const [pin, open, toSeq, fromSeq, orderKey, blockId] = cursor as unknown[];
+			if (!Array.isArray(cursor) || cursor.length !== 5) throw bad();
+			const [open, toSeq, fromSeq, orderKey, blockId] = cursor as unknown[];
 			if (
-				!isSeq(pin) ||
 				!isSeq(toSeq) ||
 				!isSeq(fromSeq) ||
 				typeof orderKey !== "string" ||
 				typeof blockId !== "string"
 			)
 				throw bad();
-			at = { pin, open: open === 1, toSeq, fromSeq, orderKey, blockId };
+			at = { pin: to, open: open === 1, toSeq, fromSeq, orderKey, blockId };
 		}
 		return {
 			parentId: parentId === "" ? null : parentId,
 			kind: FRAME_KINDS[kind] as DiffFrameKind,
 			cursor: at,
+			pos,
 			done: (flags & 1) !== 0,
 			kept: (flags & 2) !== 0,
-			up,
+			maybe: (flags & 4) !== 0,
 		};
 	});
 	return { rootDone: value[0] === 1, frames };
@@ -617,9 +779,6 @@ export function decodeDiffWalkState(value: unknown): DiffWalkState {
 // ─────────────────────────────────────────────────────────────────────────────
 // The comparison as a read
 // ─────────────────────────────────────────────────────────────────────────────
-
-/** Rows one step may read at most in the ordinary case: what a page keeps in reserve. */
-export const DIFF_STEP_ROWS = OUTLINE_DIFF_LIMITS.levelRows * 6;
 
 function side(head: OutlineVersionHead): OutlineDiffSide {
 	return {
@@ -642,6 +801,7 @@ export function diffEntry(item: DiffItem): OutlineDiffEntry | null {
 		fields: item.fields,
 		before: item.before ? side(item.before) : null,
 		after: item.now ? side(item.now) : null,
+		...(item.deletedSince ? { deletedSince: true } : {}),
 	};
 }
 
@@ -665,23 +825,20 @@ export function clampDiffLimit(limit: number | undefined): number {
 	return Math.max(OUTLINE_DIFF_LIMITS.levelRows, wanted);
 }
 
-/** Whether a paged walk has room for one more step. */
-export function diffHasRoom(walk: SubtreeDiffWalk, entries: number, limit: number): boolean {
-	return (
-		walk.rows + DIFF_STEP_ROWS <= OUTLINE_DIFF_LIMITS.maxStoreRows &&
-		entries + OUTLINE_DIFF_LIMITS.levelRows <= limit
-	);
+/** Whether a page of entries has room for one more step (a step lists at most a store page). */
+export function diffHasRoom(entries: number, limit: number): boolean {
+	return entries + OUTLINE_DIFF_LIMITS.levelRows <= limit;
 }
 
 /**
  * What differs under a block (`rootId` null: in the whole space) between the seq `then` and a
  * later one (`to`; the space's last commit by default), a page at a time: see
  * `shared/outline-restore-api.ts` for what each kind means. A page is what one bounded read
- * found (at most {@link OUTLINE_DIFF_LIMITS.maxStoreRows} store rows; `limit` entries, never
- * fewer than one store page of {@link OUTLINE_DIFF_LIMITS.levelRows}), in depth-first order;
- * `nextCursor` continues it, and all pages compare the same two seqs. Throws H2's history
- * errors when the space cannot answer for `then`, and `OutlineRestoreRootError` when the root
- * was not in the tree at one of the two seqs.
+ * found (at most {@link OUTLINE_DIFF_LIMITS.maxStoreRows} store rows, every read counted; `limit`
+ * entries, never fewer than one store page of {@link OUTLINE_DIFF_LIMITS.levelRows}), in
+ * depth-first order; `nextCursor` continues it, and all pages compare the same two seqs. Throws
+ * H2's history errors when the space cannot answer for `then`, and `OutlineRestoreRootError`
+ * when the root was not in the tree at one of the two seqs.
  */
 export async function readOutlineSubtreeDiff(input: {
 	space: OutlineSpaceRow;
@@ -705,12 +862,12 @@ export async function readOutlineSubtreeDiff(input: {
 			value[0] !== space.id ||
 			value[1] !== (rootId ?? "") ||
 			value[2] !== thenSeq ||
-			typeof value[3] !== "number" ||
+			!isSeq(value[3]) ||
 			value[3] > latest
 		)
 			throw new OutlineRestoreTokenError("cursor");
 		to = value[3];
-		state = decodeDiffWalkState(value[4]);
+		state = decodeDiffWalkState(value[4], to);
 	}
 	for (const [name, seq] of [
 		["then", thenSeq],
@@ -732,9 +889,12 @@ export async function readOutlineSubtreeDiff(input: {
 	});
 	if (to <= thenSeq) return done(null);
 	const walk = new SubtreeDiffWalk({ store, space, rootId, thenSeq, to, mode: "compare" }, state);
+	// The history state read above.
+	walk.rows = 1;
 	return await withOutlineHistory(async () => {
-		while (!walk.finished && diffHasRoom(walk, entries.length, limit)) {
-			const step = await walk.step();
+		while (!walk.finished && diffHasRoom(entries.length, limit)) {
+			const step = await walk.step(OUTLINE_DIFF_LIMITS.maxStoreRows - walk.rows);
+			if (!step) break;
 			const items = step.type === "root" ? [step.item] : step.type === "page" ? step.items : [];
 			for (const item of items) {
 				const entry = item ? diffEntry(item) : null;
@@ -749,7 +909,7 @@ export async function readOutlineSubtreeDiff(input: {
 						rootId ?? "",
 						thenSeq,
 						to,
-						encodeDiffWalkState(walk.state),
+						encodeDiffWalkState(walk.state, to),
 					]),
 		);
 	});

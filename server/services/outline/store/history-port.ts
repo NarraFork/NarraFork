@@ -146,6 +146,18 @@ export interface OutlineAncestorRow {
 	locked: boolean;
 }
 
+/** Where a block last sat as of a seq, and whether that was under a root (`listUnderRootAt`). */
+export interface OutlineUnderRootRow {
+	blockId: string;
+	asOf: number;
+	under: boolean;
+	/**
+	 * The parent key of that placement (the space's id for the top level); null when the block
+	 * had never been placed by then.
+	 */
+	parentKey: string | null;
+}
+
 /** A live block of a space with its parent: one step of many walks up at once. */
 export interface OutlineParentRow {
 	id: string;
@@ -304,6 +316,24 @@ export interface OutlineHistoryPort {
 		options: { asOf: number | null; maxDepth: number },
 	): Promise<OutlineAncestorRow[] | null>;
 	/**
+	 * For each `(blockId, asOf)` asked: where the block last sat as of that seq (its placement
+	 * then; for a block that was deleted then, the last placement it had before, as of the moment
+	 * just before it left it) and whether that was strictly under the block `rootId`, walking up
+	 * the placements valid at that moment. ONE row per distinct pair asked, whatever the depth:
+	 * what comparing two moments of a subtree asks of every block it meets under another parent
+	 * than the one it is met under, and of every block of the subtree deleted since (was it
+	 * deleted under the root, or after it had left?) (`subtree-diff.ts`). A block never placed by
+	 * then, of another space, or deeper than `maxDepth`, is not under it. One recursive
+	 * statement per 500 pairs, every step up a backward seek on the placements' block index.
+	 * Refused when the space is not ready, or the smallest seq asked is below its floor.
+	 */
+	listUnderRootAt(
+		spaceId: string,
+		rootId: string,
+		items: ReadonlyArray<{ blockId: string; asOf: number }>,
+		maxDepth: number,
+	): Promise<OutlineUnderRootRow[]>;
+	/**
 	 * The given blocks and every ancestor of them as the tree is now, each once, in no order:
 	 * only LIVE blocks of the space (the walk goes up the parent column through whatever is
 	 * there; a block that is deleted or of another space is left out, which breaks the chains
@@ -461,4 +491,19 @@ export async function pageChangedChildren(
 			blockId: last.blockId,
 		},
 	};
+}
+
+/** The distinct `(blockId, asOf)` pairs of a `listUnderRootAt` call, in the order first asked. */
+export function uniquePairs(
+	items: ReadonlyArray<{ blockId: string; asOf: number }>,
+): Array<[string, number]> {
+	const seen = new Set<string>();
+	const out: Array<[string, number]> = [];
+	for (const { blockId, asOf } of items) {
+		const key = `${blockId}\u0000${asOf}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push([blockId, asOf]);
+	}
+	return out;
 }

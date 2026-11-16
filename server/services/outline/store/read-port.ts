@@ -168,6 +168,17 @@ export interface OutlineReadPort {
 		chars: number,
 	): Promise<OutlineVersionHead[]>;
 	/**
+	 * Which of the blocks may have other tags at `upTo` than at `after`: a tag of theirs was put
+	 * on or taken off in `(after, upTo]`. Each block once, in no order; a block left out has the
+	 * same tags at both seqs (a tag put on and taken off inside the range is reported anyway: a
+	 * hint, not an answer). What comparing two moments reads before it reads any tag list. One
+	 * statement per 500 blocks over the blocks' own links.
+	 */
+	findTagChanges(
+		blockIds: readonly string[],
+		range: { after: number; upTo: number },
+	): Promise<string[]>;
+	/**
 	 * Content of versions by exact key (`block_id`, `from_seq`): one primary-key lookup each, so
 	 * loading the blocks a read shows costs nothing for their older versions. Null for a
 	 * tombstone.

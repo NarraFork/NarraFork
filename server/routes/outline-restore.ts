@@ -16,7 +16,9 @@
  * ACCESS. The diff is a read: a space the person may not read is 404, as one that does not
  * exist. The other three are a revert's: 404 when the space cannot be read, 403 when it can be
  * read but not written (the preview too: it hands out the token a restore is confirmed with);
- * someone else's lock is taken away only for who may unlock. A block named in the path, or as
+ * someone else's lock is taken away only for who may unlock. A preview's token is the
+ * previewing person's (anyone else gets 400 `OUTLINE_RESTORE_TOKEN_INVALID`, `reason: "person"`)
+ * and runs out after `OUTLINE_RESTORE_LIMITS.tokenMinutes` (`reason: "expired"`). A block named in the path, or as
  * `rootId`, must be a block of that space (live or deleted), 404 otherwise.
  *
  * ERRORS: 409 `OUTLINE_HISTORY_NOT_READY` / `OUTLINE_HISTORY_BEFORE_FLOOR` (H2's) when the
@@ -135,6 +137,7 @@ outlineRestoreRoutes.post("/spaces/:spaceId/restore/preview", async (c) => {
 		space,
 		rootId: await blockOf(space, input.rootId),
 		thenSeq: input.thenSeq,
+		userId: principalOf(c).userId,
 		token: input.token,
 		cursor: input.cursor,
 		limit: input.limit,

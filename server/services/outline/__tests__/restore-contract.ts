@@ -14,12 +14,14 @@
 import { expect } from "bun:test";
 import {
 	OUTLINE_DIFF_LIMITS,
+	OUTLINE_RESTORE_LIMITS,
 	type OutlineDiffEntry,
 	type OutlineDiffField,
 	type OutlineRestoreEntry,
 	type OutlineRestoreResponse,
 	type OutlineRestoreSkip,
 } from "@shared/outline-restore-api";
+import { setOutlineLiveBarrier } from "../live-barrier";
 import { OUTLINE_LIMITS } from "../model";
 import { lockOutlineTask } from "../pending";
 import {
@@ -31,6 +33,7 @@ import {
 import {
 	OUTLINE_HISTORY_LIMITS,
 	type OutlineBlockRow,
+	OutlineChangeMarksLimitError,
 	type OutlineSpaceRow,
 	type OutlineStore,
 	type OutlineVersionRow,
@@ -38,10 +41,12 @@ import {
 import { readOutlineSubtreeDiff } from "../subtree-diff";
 import { OutlineHistoryNotAvailableError } from "../subtree-errors";
 import {
+	dropRefused,
 	moveOutlineBlockBack,
 	type OutlineRestoreOptions,
 	outlineRestoreMarker,
 	previewOutlineRestore,
+	type RestoreBatchEntry,
 	restoreOutlineSubtree,
 } from "../subtree-restore";
 import { sameTaskJson } from "../task-json";
@@ -128,14 +133,19 @@ function counting(store: OutlineStore): { store: OutlineStore; take(): number } 
 interface StateAt {
 	/** Live blocks at the seq. */
 	live: Map<string, OutlineVersionRow>;
+	/** Tombstones valid at the seq. */
+	tombs: Map<string, OutlineVersionRow>;
 	tags: Map<string, string>;
+	dump: SpaceDump;
+	seq: number;
 }
 
 function stateAt(dump: SpaceDump, seq: number): StateAt {
 	const live = new Map<string, OutlineVersionRow>();
+	const tombs = new Map<string, OutlineVersionRow>();
 	for (const v of dump.versions) {
-		if (v.fromSeq <= seq && (v.toSeq === null || seq < v.toSeq) && !v.deleted)
-			live.set(v.blockId, v);
+		if (v.fromSeq <= seq && (v.toSeq === null || seq < v.toSeq))
+			(v.deleted ? tombs : live).set(v.blockId, v);
 	}
 	const lists = new Map<string, string[]>();
 	for (const link of dump.links) {
@@ -147,7 +157,7 @@ function stateAt(dump: SpaceDump, seq: number): StateAt {
 	}
 	const tags = new Map<string, string>();
 	for (const [id, list] of lists) tags.set(id, list.sort().join("\n"));
-	return { live, tags };
+	return { live, tombs, tags, dump, seq };
 }
 
 /** The blocks under `rootId` (null: every live block) in a state, the root left out. */
@@ -193,8 +203,15 @@ interface Expected {
 	entries: Map<string, string>;
 	thenSet: Set<string>;
 	nowSet: Set<string>;
-	/** Blocks under the root then that are live now and not under it. */
+	/**
+	 * Blocks under the root then that are not under it now: live elsewhere, or deleted after
+	 * they had left it (owner rule D58: not pulled back, not touched).
+	 */
 	away: Set<string>;
+	/** Blocks under the root then, deleted while under it. */
+	removed: Set<string>;
+	/** Of `away`, the deleted ones. */
+	deletedSince: Set<string>;
 }
 
 /** What a comparison must list, by brute force over two states. */
@@ -203,13 +220,54 @@ function expectedDiff(before: StateAt, after: StateAt, rootId: string | null): E
 	const nowSet = under(after, rootId);
 	const entries = new Map<string, string>();
 	const away = new Set<string>();
+	const removed = new Set<string>();
+	const deletedSince = new Set<string>();
 	if (rootId !== null) {
 		const fields = fieldsBetween(before, after, rootId, false);
 		if (fields.length > 0) entries.set(rootId, `changed:${fields.join(",")}`);
 	}
+	// Where each block of then that is deleted at `after` sat just before it was deleted.
+	const lastPlace = new Map<string, { under: boolean; parentId: string | null }>();
 	for (const id of thenSet) {
-		if (!after.live.has(id)) entries.set(id, "removed:");
-		else if (nowSet.has(id)) {
+		if (after.live.has(id) || !after.tombs.has(id)) continue;
+		// Deleted when its last live version ended (later tombstones may follow it).
+		let deletedAt = 0;
+		for (const v of before.dump.versions) {
+			if (v.blockId === id && !v.deleted && v.toSeq !== null && v.toSeq <= after.seq)
+				deletedAt = Math.max(deletedAt, v.toSeq);
+		}
+		const prior = stateAt(before.dump, deletedAt - 1);
+		lastPlace.set(id, {
+			under: under(prior, rootId).has(id),
+			parentId: prior.live.get(id)?.parentId ?? null,
+		});
+	}
+	for (const id of thenSet) if (lastPlace.get(id)?.under) removed.add(id);
+	/** Whether a block of then is there to be put back under (the walk's `then` frames). */
+	const there = new Map<string | null, boolean>([[rootId, true]]);
+	const isThere = (id: string | null): boolean => {
+		const known = there.get(id);
+		if (known !== undefined) return known;
+		const answer =
+			id !== null &&
+			(nowSet.has(id) || (removed.has(id) && isThere(before.live.get(id)?.parentId ?? null)));
+		there.set(id, answer);
+		return answer;
+	};
+	for (const id of thenSet) {
+		if (!after.live.has(id)) {
+			if (removed.has(id)) {
+				entries.set(id, "removed:");
+				continue;
+			}
+			// Left the subtree, then deleted: moved away (listed unless it merely followed a block
+			// that moved away), never removed.
+			away.add(id);
+			deletedSince.add(id);
+			const parentThen = before.live.get(id)?.parentId ?? null;
+			if (isThere(parentThen) || lastPlace.get(id)?.parentId !== parentThen)
+				entries.set(id, "moved-away:");
+		} else if (nowSet.has(id)) {
 			const fields = fieldsBetween(before, after, id, true);
 			if (fields.length > 0) entries.set(id, `changed:${fields.join(",")}`);
 		} else {
@@ -232,7 +290,7 @@ function expectedDiff(before: StateAt, after: StateAt, rootId: string | null): E
 		}
 		if (reached) entries.set(id, before.live.has(id) ? "moved-in:" : "added:");
 	}
-	return { entries, thenSet, nowSet, away };
+	return { entries, thenSet, nowSet, away, removed, deletedSince };
 }
 
 async function wholeDiff(
@@ -313,6 +371,7 @@ async function wholePreview(
 			token,
 			cursor,
 			limit: OUTLINE_DIFF_LIMITS.levelRows,
+			userId: ACTOR.id,
 			store: counter.store,
 		});
 		expect(counter.take()).toBeLessThanOrEqual(OUTLINE_DIFF_LIMITS.maxStoreRows);
@@ -384,11 +443,13 @@ const openVersion = (dump: SpaceDump) =>
  * What D58 says of a finished restore, against the raw rows before and after it:
  *   - every block under the root then that had not moved away is back: live, under its parent
  *     of then at its order key, with its text and fields (a block whose chain of parents of
- *     then passes through one that moved away keeps its place; a block the restore said it
- *     left alone is exempt from what that reason covers);
+ *     then passes through one that moved away keeps its place);
  *   - nothing that was not under the root then is under it now, except what it said it kept;
- *   - blocks that moved away, and everything that was under the root at neither moment, have
- *     the very version they had.
+ *   - blocks that moved away (deleted since or not), and everything that was under the root at
+ *     neither moment, have the very version they had; no block outside the root at `then` is
+ *     deleted or changed, except a block that moved in, which only goes back to its place.
+ * A block the restore said it left alone is exempt from what its reason covers, and every
+ * reason is checked against the rows here, never taken from the restore's word.
  */
 function checkRestored(
 	before: SpaceDump,
@@ -418,15 +479,39 @@ function checkRestored(
 			id !== null &&
 			expected.thenSet.has(id) &&
 			(expected.nowSet.has(id) ||
-				(!atPin.live.has(id) && isThere(then.live.get(id)?.parentId ?? null)));
+				(expected.removed.has(id) && isThere(then.live.get(id)?.parentId ?? null)));
 		there.set(id, answer);
 		return answer;
 	};
 	const isAnchored = (id: string) => isThere(then.live.get(id)?.parentId ?? null);
+	/** `ancestor` is `id` or above it in the tree now. */
+	const isAbove = (ancestor: string, id: string | null): boolean => {
+		for (let at = id, depth = 0; at !== null && depth < 2000; depth++) {
+			if (at === ancestor) return true;
+			at = now.live.get(at)?.parentId ?? null;
+		}
+		return false;
+	};
+	const locked = (id: string) =>
+		[then, atPin, now].some((state) => Boolean(state.live.get(id)?.taskJson?.lock));
+	/** The independent check of a reason the restore gave for leaving a block of then alone. */
+	const checkLeft = (id: string, reason: string, depth = 0): void => {
+		const parentId = then.live.get(id)?.parentId ?? null;
+		if (reason === "lock-kept") expect(locked(id)).toBe(true);
+		else if (reason === "refused") {
+			// The only refusal these histories can meet: going back would put it under itself.
+			expect(parentId !== null && isAbove(id, parentId)).toBe(true);
+		} else if (reason === "parent-refused") {
+			expect(parentId).not.toBeNull();
+			const parentReason = skipped.get(parentId as string);
+			expect(["refused", "parent-refused", "lock-kept"]).toContain(parentReason as string);
+			if (depth < 50) checkLeft(parentId as string, parentReason as string, depth + 1);
+		} else throw new Error(`unexpected reason ${reason} for ${id}`);
+	};
 
 	for (const id of expected.thenSet) {
 		if (expected.away.has(id)) {
-			// Moved away: not pulled back, not touched.
+			// Moved away, or deleted after it had: not pulled back, not touched.
 			expect(openAfter.get(id)?.fromSeq).toBe(openBefore.get(id)?.fromSeq as number);
 			continue;
 		}
@@ -444,7 +529,17 @@ function checkRestored(
 			}
 			continue;
 		}
-		if (reason === "refused" || reason === "lock-kept") continue;
+		if (reason === "refused" || reason === "lock-kept" || reason === "parent-refused") {
+			// (A later pass may have done it after all.)
+			const done =
+				is?.parentId === was.parentId &&
+				is.orderKey === was.orderKey &&
+				is.contentHash === was.contentHash &&
+				sameTaskJson(is.taskJson, was.taskJson) &&
+				(now.tags.get(id) ?? "") === (then.tags.get(id) ?? "");
+			if (!done) checkLeft(id, reason);
+			continue;
+		}
 		expect(reason === undefined || reason === "place-taken").toBe(true);
 		expect(is).toBeDefined();
 		if (!is) continue;
@@ -470,20 +565,24 @@ function checkRestored(
 		expect(JSON.stringify(is.askJson ?? null)).toBe(JSON.stringify(was.askJson ?? null));
 		expect(now.tags.get(id) ?? "").toBe(then.tags.get(id) ?? "");
 	}
-	if (rootId !== null && !skipped.has(rootId)) {
+	if (rootId !== null) {
 		const was = then.live.get(rootId) as OutlineVersionRow;
 		const is = now.live.get(rootId) as OutlineVersionRow;
-		expect(is.contentHash).toBe(was.contentHash);
-		expect(sameTaskJson(is.taskJson, was.taskJson)).toBe(true);
-		expect(now.tags.get(rootId) ?? "").toBe(then.tags.get(rootId) ?? "");
+		const reason = skipped.get(rootId);
+		if (reason !== undefined) checkLeft(rootId, reason);
+		else {
+			expect(is.contentHash).toBe(was.contentHash);
+			expect(sameTaskJson(is.taskJson, was.taskJson)).toBe(true);
+			expect(now.tags.get(rootId) ?? "").toBe(then.tags.get(rootId) ?? "");
+		}
 		// Where the root sits is not part of its subtree.
 		expect(is.parentId).toBe(atPin.live.get(rootId)?.parentId as string | null);
 		expect(is.orderKey).toBe(atPin.live.get(rootId)?.orderKey as string);
 	}
 
 	// Nothing foreign is left under the root without a reason: a block that moved in stays
-	// only when its parent of then is deleted (or the write path refused the move), and a block
-	// added since only while it holds a block that was in the tree then and cannot go back.
+	// only when its parent of then is deleted (or the move would put it under itself), and a
+	// block added since only while it holds a block that cannot leave.
 	const childrenNow = new Map<string, string[]>();
 	for (const v of now.live.values()) {
 		if (v.parentId === null) continue;
@@ -491,12 +590,22 @@ function checkRestored(
 		if (list) list.push(v.blockId);
 		else childrenNow.set(v.parentId, [v.blockId]);
 	}
-	/** A block that was in the tree then and has nowhere to go back to. */
+	/** A block that was in the tree then and cannot leave where it is now. */
 	const stuck = (id: string): boolean => {
 		const parentId = then.live.get(id)?.parentId ?? null;
-		return expected.thenSet.has(id)
-			? !isAnchored(id)
-			: skipped.get(id) === "refused" || (parentId !== null && !now.live.has(parentId));
+		if (expected.thenSet.has(id)) {
+			const reason = skipped.get(id);
+			if (reason === "refused" || reason === "lock-kept" || reason === "parent-refused") {
+				checkLeft(id, reason);
+				return true;
+			}
+			return !isAnchored(id);
+		}
+		return (
+			(parentId !== null && !now.live.has(parentId)) ||
+			(parentId !== null && isAbove(id, parentId)) ||
+			(skipped.get(id) === "lock-kept" && locked(id))
+		);
 	};
 	const holdsOld = (id: string): boolean =>
 		(childrenNow.get(id) ?? []).some((child) =>
@@ -508,16 +617,45 @@ function checkRestored(
 		// Judged at the topmost foreign block: what is under it stays or goes with it.
 		if (parentId !== rootId && !expected.thenSet.has(parentId as string)) continue;
 		const was = then.live.get(id);
+		const reason = skipped.get(id);
 		if (was) {
-			if (skipped.get(id) === "refused") continue;
-			expect(skipped.get(id)).toBe("parent-gone");
+			if (reason === "refused") {
+				expect(was.parentId !== null && isAbove(id, was.parentId)).toBe(true);
+				continue;
+			}
+			if (reason === "lock-kept") {
+				expect(locked(id)).toBe(true);
+				continue;
+			}
+			expect(reason).toBe("parent-gone");
 			expect(was.parentId !== null && !now.live.has(was.parentId)).toBe(true);
+		} else if (reason === "lock-kept") {
+			expect(locked(id) || [...(childrenNow.get(id) ?? [])].some(locked)).toBe(true);
 		} else {
-			expect(skipped.get(id)).toBe("holds-kept");
+			expect(reason).toBe("holds-kept");
 			expect(holdsOld(id)).toBe(true);
 		}
 	}
 
+	// No block that was outside the root at `then` is deleted or changed by the restore: one
+	// that moved in only goes back to its parent and order key of then.
+	for (const block of before.blocks) {
+		const id = block.id;
+		if (id === rootId || expected.thenSet.has(id) || !then.live.has(id)) continue;
+		const a = openBefore.get(id) as OutlineVersionRow;
+		const b = openAfter.get(id) as OutlineVersionRow;
+		if (b.fromSeq === a.fromSeq) continue;
+		// (A move to another page gives what is under the block versions of no content.)
+		expect(b.deleted).toBe(a.deleted);
+		expect(b.contentHash).toBe(a.contentHash);
+		if (b.parentId !== a.parentId || b.orderKey !== a.orderKey) {
+			expect(expected.entries.get(id)).toBe("moved-in:");
+			expect(b.parentId).toBe((then.live.get(id) as OutlineVersionRow).parentId);
+		}
+		expect(sameTaskJson(b.taskJson, a.taskJson)).toBe(true);
+		expect(b.alias).toBe(a.alias);
+		expect(now.tags.get(id) ?? "").toBe(atPin.tags.get(id) ?? "");
+	}
 	// Outside the subtree of both moments nothing has a new version.
 	for (const block of before.blocks) {
 		if (block.id === rootId || expected.thenSet.has(block.id) || expected.nowSet.has(block.id))
@@ -548,10 +686,17 @@ async function restoreAndCheck(
 	// away are in it, listed only.
 	expect(sorted(listed(preview.entries))).toEqual(sorted(expected.entries));
 	for (const entry of preview.entries) {
+		if (entry.kind === "added") {
+			expect(["delete", "delete-unless-holds"]).toContain(entry.action);
+			if (entry.skip !== undefined) {
+				expect(entry.skip).toBe("holds-kept");
+				expect(entry.action).toBe("delete");
+			}
+			continue;
+		}
 		expect(entry.action).toBe(
 			(
 				{
-					added: "delete",
 					removed: "restore",
 					"moved-in": "move-out",
 					"moved-away": "none",
@@ -559,6 +704,12 @@ async function restoreAndCheck(
 				} as const
 			)[entry.kind],
 		);
+		expect(entry.deletedSince === true).toBe(expected.deletedSince.has(entry.blockId));
+		if (entry.kind === "moved-in") {
+			const below = under(stateAt(before, pin), entry.blockId).size;
+			expect(entry.carries).toBe(Math.min(below, OUTLINE_DIFF_LIMITS.carryCount));
+			expect(entry.carriesMore).toBe(below > OUTLINE_DIFF_LIMITS.carryCount);
+		}
 	}
 
 	let ran: Ran;
@@ -586,6 +737,21 @@ async function restoreAndCheck(
 	}
 	const after = await ctx.dump(space.id);
 	checkRestored(before, after, rootId, thenSeq, pin, ran.skipped);
+	// What the preview said of each added block is what happened to it: deleted when it said
+	// "delete", kept (and said so) when it said it holds something that stays, either one when
+	// it could not know.
+	const deletedNow = new Set(after.blocks.filter((block) => block.deleted).map((b) => b.id));
+	for (const entry of preview.entries) {
+		if (entry.kind !== "added") continue;
+		const reason = ran.skipped.get(entry.blockId);
+		if (entry.skip === "holds-kept") {
+			expect(deletedNow.has(entry.blockId)).toBe(false);
+			expect(reason).toBe("holds-kept");
+		} else if (entry.action === "delete" && reason !== "lock-kept" && reason !== "refused")
+			expect(deletedNow.has(entry.blockId)).toBe(true);
+		else if (!deletedNow.has(entry.blockId))
+			expect(["holds-kept", "lock-kept", "refused"]).toContain(reason as string);
+	}
 	const restoreId = ran.calls[0]?.restoreId as string;
 	checkCommits(after, ran.commits, restoreId);
 	// Nothing but the restore wrote.
@@ -636,6 +802,7 @@ async function fixture(ctx: OutlineContractContext) {
 export async function restoreRandomHistory(
 	ctx: OutlineContractContext,
 	seed: number,
+	limits: OutlineRestoreOptions["limits"] = { maxBlocksPerCommit: 6, maxCommitsPerCall: 2 },
 ): Promise<Ran> {
 	const { space: made, snapshots } = await randomizedHistory(ctx, seed);
 	const space = await fresh(ctx, made);
@@ -647,9 +814,7 @@ export async function restoreRandomHistory(
 	const after = stateAt(dump, space.nextSeq - 1);
 	// The whole space for some seeds, a block with a subtree for the others.
 	const rootId = seed % 3 === 0 ? null : (candidateRoots(before, after, rnd, 1)[0] ?? null);
-	const { ran } = await restoreAndCheck(ctx, space, rootId, thenSeq, {
-		limits: { maxBlocksPerCommit: 6, maxCommitsPerCall: 2 },
-	});
+	const { ran } = await restoreAndCheck(ctx, space, rootId, thenSeq, { limits });
 	return ran;
 }
 
@@ -787,7 +952,13 @@ export const OUTLINE_RESTORE_CONTRACT: ContractCase[] = [
 				readOutlineSubtreeDiff({ space: now, rootId: newId, thenSeq, store: ctx.store }),
 			).rejects.toBeInstanceOf(OutlineRestoreRootError);
 			await expect(
-				previewOutlineRestore({ space: now, rootId: newId, thenSeq, store: ctx.store }),
+				previewOutlineRestore({
+					space: now,
+					rootId: newId,
+					thenSeq,
+					userId: ACTOR.id,
+					store: ctx.store,
+				}),
 			).rejects.toBeInstanceOf(OutlineRestoreRootError);
 			// A cursor of another comparison, or one nobody sealed, is refused.
 			const page = await readOutlineSubtreeDiff({
@@ -821,7 +992,14 @@ export const OUTLINE_RESTORE_CONTRACT: ContractCase[] = [
 			expect(floor).toBe(now.nextSeq - 1);
 			for (const call of [
 				() => readOutlineSubtreeDiff({ space: now, rootId: null, thenSeq, store: ctx.store }),
-				() => previewOutlineRestore({ space: now, rootId: null, thenSeq, store: ctx.store }),
+				() =>
+					previewOutlineRestore({
+						space: now,
+						rootId: null,
+						thenSeq,
+						userId: ACTOR.id,
+						store: ctx.store,
+					}),
 				() =>
 					moveOutlineBlockBack(
 						{ ...WRITER, space: now, blockId: ids.a1, thenSeq },
@@ -1440,4 +1618,483 @@ export const OUTLINE_RESTORE_CONTRACT: ContractCase[] = [
 			checkSpaceInvariants(dump);
 		},
 	},
+	{
+		name: "a move out that is refused never lets the restore delete the added block holding it, at any call boundary (B1)",
+		async run(ctx) {
+			for (const limits of [{ maxBlocksPerCommit: 2, maxCommitsPerCall: 1 }, {}]) {
+				// At `then`: top{x}, other{m, o1}. Since: A added under top, m moved under A, a leaf
+				// added under A, and `other` moved under m: moving m back would put it under itself.
+				const h = await strandedHistory(ctx);
+				const { ran, preview } = await restoreAndCheck(ctx, h.space, h.top, h.thenSeq, {
+					limits,
+				});
+				const entryOf = (id: string) => preview.entries.find((entry) => entry.blockId === id);
+				// What A holds may not be able to leave: the preview cannot know, and says so.
+				expect(entryOf(h.added)).toMatchObject({ kind: "added", action: "delete-unless-holds" });
+				expect(entryOf(h.m)).toMatchObject({ kind: "moved-in", action: "move-out", carries: 2 });
+				expect(ran.skipped.get(h.m)).toBe("refused");
+				expect(ran.skipped.get(h.added)).toBe("holds-kept");
+				const dump = await ctx.dump(h.space.id);
+				for (const id of [h.other, h.o1, h.m, h.added])
+					expect(blockOf(dump, id).deleted).toBe(false);
+				expect(blockOf(dump, h.leaf).deleted).toBe(true);
+				expect(blockOf(dump, h.o1).content).toBe("o1 outside content");
+			}
+		},
+	},
+	{
+		name: "a batch split by the change-mark limit keeps an added block whose block could not leave it (B1, halving)",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const made = await write(ctx, space, [
+				{ op: "insert", tempId: "top", parent: null, content: "top" },
+				{ op: "insert", tempId: "x", parent: { tempId: "top" }, content: "x" },
+				{ op: "insert", tempId: "other", parent: null, content: "other" },
+				{ op: "insert", tempId: "m", parent: { tempId: "other" }, content: "m" },
+				{ op: "insert", tempId: "mc", parent: { tempId: "m" }, content: "under m" },
+			]);
+			const [top, , other, m, mc] = made.results.map((r) => r.blockId) as string[];
+			const thenSeq = (made.commit as { seq: number }).seq;
+			const added = (
+				await write(ctx, space, [{ op: "insert", parent: { id: top as string }, content: "added" }])
+			).results[0]?.blockId as string;
+			await write(ctx, space, [{ op: "move", block: { id: m as string }, parent: { id: added } }]);
+			await write(ctx, space, [{ op: "insert", parent: { id: added }, content: "added leaf" }]);
+			const now = await fresh(ctx, space);
+			const preview = await wholePreview(ctx, now, top as string, thenSeq);
+			// Any commit that moves `m` is "too large", so the batch [leaf, m, added] is split until
+			// m's move is alone and given up: the delete of `added`, in the other half, must not go.
+			let refusedCommits = 0;
+			const splitting = new Proxy(ctx.store, {
+				get(target, prop, receiver) {
+					const value = Reflect.get(target, prop, receiver);
+					if (prop !== "applyCommit") return value;
+					return async (plan: { closeVersionIds: string[] }) => {
+						if (plan.closeVersionIds.includes(m as string)) {
+							refusedCommits++;
+							throw new OutlineChangeMarksLimitError(space.id);
+						}
+						return await (value as (p: unknown) => Promise<unknown>).apply(target, [plan]);
+					};
+				},
+			});
+			const result = await restoreOutlineSubtree(
+				{ ...WRITER, space: now, token: preview.token },
+				{ store: splitting },
+			);
+			expect(refusedCommits).toBeGreaterThanOrEqual(2);
+			expect(result.done).toBe(true);
+			const reasons = new Map(result.skipped.map((skip) => [skip.blockId, skip.reason]));
+			expect(reasons.get(m as string)).toBe("refused");
+			expect(reasons.get(added)).toBe("holds-kept");
+			const dump = await ctx.dump(space.id);
+			for (const id of [added, m, mc, other] as string[])
+				expect(blockOf(dump, id).deleted).toBe(false);
+			expect(blockOf(dump, m as string).parentId).toBe(added);
+			checkSpaceInvariants(dump);
+		},
+	},
+	{
+		name: "restoring random histories with tiny batches and one commit per call never deletes or changes a block that was outside the root then",
+		async run(ctx) {
+			let restored = 0;
+			for (const seed of [41, 42, 43, 44, 45, 46, 47, 48]) {
+				await restoreRandomHistory(ctx, seed, {
+					maxBlocksPerCommit: 1 + (seed % 3),
+					maxCommitsPerCall: 1,
+				});
+				restored++;
+			}
+			expect(restored).toBe(8);
+		},
+	},
+	{
+		name: "a block deleted after it moved away is listed as moved away, not restored, and nobody's later work on it is touched (S1, D58)",
+		async run(ctx) {
+			for (const touched of [false, true]) {
+				const { space, thenSeq, ids } = await fixture(ctx);
+				await write(ctx, space, [{ op: "move", block: { id: ids.a1 }, parent: { id: ids.other } }]);
+				await write(ctx, space, [{ op: "update", block: { id: ids.a1 }, content: "edited away" }]);
+				await write(ctx, space, [{ op: "delete", block: { id: ids.a1 } }]);
+				// Deleted while still under the root: restored.
+				await write(ctx, space, [{ op: "delete", block: { id: ids.b1 } }]);
+				const now = await fresh(ctx, space);
+				const diff = await wholeDiff(ctx, now, ids.top, thenSeq, undefined, 100);
+				expect(diff.entries.find((e) => e.blockId === ids.a1)).toMatchObject({
+					kind: "moved-away",
+					deletedSince: true,
+					after: null,
+				});
+				const preview = await wholePreview(ctx, now, ids.top, thenSeq);
+				const by = new Map(preview.entries.map((entry) => [entry.blockId, entry]));
+				expect(by.get(ids.a1)).toMatchObject({
+					kind: "moved-away",
+					action: "none",
+					deletedSince: true,
+					canMoveBack: true,
+				});
+				expect(by.get(ids.b1)).toMatchObject({ kind: "removed", action: "restore" });
+				if (touched) {
+					// Someone brings it back where it last was, outside the subtree, and works on it.
+					await write(ctx, space, [
+						{ op: "restore", block: { id: ids.a1 }, parent: { id: ids.other } },
+					]);
+					await write(ctx, space, [
+						{ op: "update", block: { id: ids.a1 }, content: "new work after the preview" },
+					]);
+				}
+				const result = await restoreOutlineSubtree(
+					{ ...WRITER, space: await fresh(ctx, space), token: preview.token },
+					{ store: ctx.store },
+				);
+				expect(result.done).toBe(true);
+				expect(result.movedAway).toBe(1);
+				const dump = await ctx.dump(space.id);
+				expect(blockOf(dump, ids.b1)).toMatchObject({ deleted: false, parentId: ids.b });
+				if (touched) {
+					expect(blockOf(dump, ids.a1)).toMatchObject({
+						deleted: false,
+						parentId: ids.other,
+						content: "new work after the preview",
+					});
+				} else {
+					expect(blockOf(dump, ids.a1).deleted).toBe(true);
+					// One click brings it back where it was.
+					const back = await moveOutlineBlockBack(
+						{ ...WRITER, space: await fresh(ctx, space), blockId: ids.a1, thenSeq },
+						{ store: ctx.store },
+					);
+					expect(back.restored).toBe(true);
+					expect(blockOf(await ctx.dump(space.id), ids.a1)).toMatchObject({
+						deleted: false,
+						parentId: ids.a,
+					});
+				}
+			}
+		},
+	},
+	{
+		name: "a page of a comparison or a preview, and a call of a restore, stay within their row budgets with tag-heavy blocks (S2)",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const tags = (prefix: string) => Array.from({ length: 30 }, (_, j) => `${prefix}${j}`);
+			const top = (await write(ctx, space, [{ op: "insert", parent: null, content: "top" }]))
+				.results[0]?.blockId as string;
+			const kids: string[] = [];
+			for (let c = 0; c < 2; c++) {
+				const made = await write(
+					ctx,
+					space,
+					Array.from(
+						{ length: 20 },
+						(_, i): OutlineOp => ({
+							op: "insert",
+							parent: { id: top },
+							content: `k${c * 20 + i}`,
+							tags: tags("t"),
+						}),
+					),
+				);
+				kids.push(...made.results.map((r) => r.blockId));
+			}
+			const thenSeq = (await fresh(ctx, space)).nextSeq - 1;
+			for (let c = 0; c < kids.length; c += 10) {
+				await write(
+					ctx,
+					space,
+					kids
+						.slice(c, c + 10)
+						.map((id): OutlineOp => ({ op: "update", block: { id }, tags: tags("u") })),
+				);
+			}
+			const now = await fresh(ctx, space);
+			// `wholeDiff` and `wholePreview` count every row of every page against the budget.
+			const diff = await wholeDiff(ctx, now, top, thenSeq, undefined, 200);
+			expect(diff.entries).toHaveLength(40);
+			expect(diff.pages).toBeGreaterThan(1);
+			for (const entry of diff.entries) expect(entry.fields).toEqual(["tags"]);
+			const preview = await wholePreview(ctx, now, top, thenSeq);
+			expect(preview.entries).toHaveLength(40);
+			// A restore call stops at its row budget (and always makes progress).
+			const counter = counting(ctx.store);
+			const maxRowsPerCall = 1200;
+			let cursor: string | null = null;
+			let calls = 0;
+			for (;;) {
+				const result = await restoreOutlineSubtree(
+					{ ...WRITER, space: now, token: preview.token, cursor },
+					{ store: counter.store, limits: { maxRowsPerCall, maxCommitsPerCall: 100 } },
+				);
+				calls++;
+				// The walk's and the restore's own reads stay within the budget; the write path
+				// reads what each commit it writes needs (one commit here, 40 blocks of 30 tags).
+				const rows = counter.take();
+				expect(rows).toBeLessThanOrEqual(
+					maxRowsPerCall + OUTLINE_DIFF_LIMITS.maxStoreRows + result.changed * 70,
+				);
+				expect(calls).toBeLessThan(50);
+				if (result.done) break;
+				cursor = result.cursor;
+			}
+			expect(calls).toBeGreaterThan(1);
+			const dump = await ctx.dump(space.id);
+			const open = dump.links.filter((link) => link.kind === "tag" && link.toSeq === null);
+			for (const id of kids) {
+				expect(
+					open
+						.filter((link) => link.fromBlockId === id)
+						.map((link) => link.targetRef)
+						.sort(),
+				).toEqual(tags("t").sort());
+			}
+		},
+	},
+	{
+		name: "a cursor stays small however wide or deep the walk, and every call of a restore moves on, with or without its cursor (S3)",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const made = await write(ctx, space, [
+				{ op: "insert", tempId: "top", parent: null, content: "top" },
+				{ op: "insert", tempId: "g", parent: { tempId: "top" }, content: "g" },
+				{ op: "insert", tempId: "s", parent: { tempId: "g" }, content: "s" },
+			]);
+			const [top, , s] = made.results.map((r) => r.blockId) as string[];
+			const leaves: string[] = [];
+			for (let i = 0; i < 5000; i += OUTLINE_LIMITS.maxOps) {
+				const batch = await write(
+					ctx,
+					space,
+					Array.from(
+						{ length: OUTLINE_LIMITS.maxOps },
+						(_, n): OutlineOp => ({
+							op: "insert",
+							parent: { id: s as string },
+							content: `leaf ${i + n}`,
+						}),
+					),
+				);
+				leaves.push(...batch.results.map((r) => r.blockId));
+			}
+			// And a chain 300 deep under `top`.
+			let parent = top as string;
+			const chain: string[] = [];
+			for (let depth = 0; depth < 300; depth += OUTLINE_LIMITS.maxOps) {
+				const length = Math.min(OUTLINE_LIMITS.maxOps, 300 - depth);
+				const batch = await write(
+					ctx,
+					space,
+					Array.from(
+						{ length },
+						(_, n): OutlineOp => ({
+							op: "insert",
+							tempId: `c${n}`,
+							parent: n === 0 ? { id: parent } : { tempId: `c${n - 1}` },
+							content: `chain ${depth + n}`,
+						}),
+					),
+				);
+				chain.push(...batch.results.map((r) => r.blockId));
+				parent = chain.at(-1) as string;
+			}
+			const thenSeq = (await fresh(ctx, space)).nextSeq - 1;
+			for (let i = 0; i < leaves.length; i += OUTLINE_LIMITS.maxOps) {
+				await write(
+					ctx,
+					space,
+					leaves
+						.slice(i, i + OUTLINE_LIMITS.maxOps)
+						.map((id): OutlineOp => ({ op: "update", block: { id }, content: "edited" })),
+				);
+			}
+			await write(ctx, space, [
+				{ op: "update", block: { id: chain.at(-1) as string }, content: "deep edit" },
+			]);
+			const now = await fresh(ctx, space);
+			let cursor: string | null = null;
+			let pages = 0;
+			let entries = 0;
+			let longest = 0;
+			do {
+				const page: Awaited<ReturnType<typeof readOutlineSubtreeDiff>> =
+					await readOutlineSubtreeDiff({
+						space: now,
+						rootId: top as string,
+						thenSeq,
+						cursor,
+						limit: OUTLINE_DIFF_LIMITS.maxEntries,
+						store: ctx.store,
+					});
+				entries += page.entries.length;
+				cursor = page.nextCursor;
+				longest = Math.max(longest, cursor?.length ?? 0);
+				expect(++pages).toBeLessThan(1000);
+			} while (cursor);
+			expect(entries).toBe(5001);
+			// The stack is the path: a few frames for the wide level, ~300 for the chain.
+			expect(longest).toBeLessThan(40_000);
+
+			// A restore without its cursor continues where the last call stopped; every call
+			// moves on.
+			const preview = await wholePreview(ctx, now, top as string, thenSeq);
+			const ran = await runRestore(
+				ctx,
+				now,
+				preview.token,
+				{ limits: { maxCommitsPerCall: 2 } },
+				false,
+			);
+			for (const call of ran.calls) {
+				if (!call.done) expect(call.commits.length).toBeGreaterThan(0);
+				expect(call.cursor?.length ?? 0).toBeLessThan(40_000);
+			}
+			expect(ran.calls.length).toBeGreaterThan(2);
+			const dump = await ctx.dump(space.id);
+			const contents = new Map(dump.blocks.map((block) => [block.id, block.content]));
+			for (const [i, id] of leaves.entries()) expect(contents.get(id)).toBe(`leaf ${i}`);
+			expect(contents.get(chain.at(-1) as string)).toBe("chain 299");
+		},
+	},
+	{
+		name: "what a refused block takes along is reported, each with its reason (S4)",
+		async run() {
+			const entry = (
+				blockId: string,
+				dependsOn: string | null,
+				extra: Partial<RestoreBatchEntry> = {},
+			): RestoreBatchEntry => ({
+				op: { op: "move", block: { id: blockId }, parent: null, position: { last: true } },
+				blockId,
+				dependsOn,
+				guards: [],
+				...extra,
+			});
+			const { left, dropped, unsafe } = dropRefused(
+				[
+					entry("p", null, { guards: ["holder"] }),
+					entry("c1", "p"),
+					entry("c2", "c1"),
+					entry("other", null),
+					entry("holder", null, {
+						op: { op: "delete", block: { id: "holder" } },
+						close: true,
+					}),
+				],
+				"p",
+			);
+			expect([...dropped].sort()).toEqual(["c1", "c2", "p"]);
+			expect([...unsafe]).toEqual(["holder"]);
+			expect(left.map((e) => e.blockId)).toEqual(["other"]);
+		},
+	},
+	{
+		name: "a preview's token is its person's and runs out; the first page waits for live edits",
+		async run(ctx) {
+			const { space, thenSeq, ids } = await fixture(ctx);
+			await write(ctx, space, [{ op: "update", block: { id: ids.a1 }, content: "a1 edited" }]);
+			// A live session holding an unsaved edit under the subtree writes it when the barrier
+			// is taken: the preview is of the space after it, so the restore meets no conflict.
+			let flushed = 0;
+			let inside = false;
+			setOutlineLiveBarrier({
+				holds: () => inside,
+				async run(spaceId, fn) {
+					inside = true;
+					try {
+						if (spaceId === space.id && flushed === 0) {
+							flushed = (
+								await write(ctx, space, [
+									{ op: "update", block: { id: ids.b1 }, content: "typed live" },
+								])
+							).commit?.seq as number;
+						}
+						return await fn();
+					} finally {
+						inside = false;
+					}
+				},
+			});
+			let preview: Awaited<ReturnType<typeof wholePreview>>;
+			try {
+				preview = await wholePreview(ctx, await fresh(ctx, space), ids.top, thenSeq);
+			} finally {
+				setOutlineLiveBarrier(null);
+			}
+			const first = await previewOutlineRestore({
+				space: await fresh(ctx, space),
+				rootId: ids.top,
+				thenSeq,
+				userId: ACTOR.id,
+				token: preview.token,
+				store: ctx.store,
+			});
+			expect(first.nowSeq).toBe(flushed);
+			const someoneElse = {
+				actor: { kind: "human" as const, id: "another" },
+				responsibleUserId: null,
+			};
+			const asOther = await restoreOutlineSubtree(
+				{ ...someoneElse, space: await fresh(ctx, space), token: preview.token },
+				{ store: ctx.store },
+			).catch((error: unknown) => error);
+			expect(asOther).toBeInstanceOf(OutlineRestoreTokenError);
+			expect((asOther as OutlineRestoreTokenError).details).toEqual({ reason: "person" });
+			const page = await previewOutlineRestore({
+				space: await fresh(ctx, space),
+				rootId: ids.top,
+				thenSeq,
+				userId: "another",
+				token: preview.token,
+				store: ctx.store,
+			}).catch((error: unknown) => error);
+			expect(page).toBeInstanceOf(OutlineRestoreTokenError);
+			const later = new Date(Date.now() + (OUTLINE_RESTORE_LIMITS.tokenMinutes + 1) * 60_000);
+			const expired = await restoreOutlineSubtree(
+				{ ...WRITER, space: await fresh(ctx, space), token: preview.token },
+				{ store: ctx.store, now: () => later },
+			).catch((error: unknown) => error);
+			expect((expired as OutlineRestoreTokenError).details).toEqual({ reason: "expired" });
+			const done = await restoreOutlineSubtree(
+				{ ...WRITER, space: await fresh(ctx, space), token: preview.token },
+				{ store: ctx.store },
+			);
+			expect(done.done).toBe(true);
+			const dump = await ctx.dump(space.id);
+			expect(blockOf(dump, ids.a1).content).toBe("a1");
+			expect(blockOf(dump, ids.b1).content).toBe("b1");
+		},
+	},
 ];
+
+/** The history of B1: an added block holding a moved-in block that cannot go back. */
+async function strandedHistory(ctx: OutlineContractContext) {
+	const space = await personalSpace(ctx);
+	const made = await write(ctx, space, [
+		{ op: "insert", tempId: "top", parent: null, content: "top" },
+		{ op: "insert", tempId: "x", parent: { tempId: "top" }, content: "x" },
+		{ op: "insert", tempId: "other", parent: null, content: "other" },
+		{ op: "insert", tempId: "m", parent: { tempId: "other" }, content: "m" },
+		{ op: "insert", tempId: "o1", parent: { tempId: "other" }, content: "o1 outside content" },
+	]);
+	const [top, , other, m, o1] = made.results.map((r) => r.blockId) as string[];
+	const thenSeq = (made.commit as { seq: number }).seq;
+	const added = (
+		await write(ctx, space, [{ op: "insert", parent: { id: top as string }, content: "A added" }])
+	).results[0]?.blockId as string;
+	await write(ctx, space, [{ op: "move", block: { id: m as string }, parent: { id: added } }]);
+	const leaf = (
+		await write(ctx, space, [{ op: "insert", parent: { id: added }, content: "L added leaf" }])
+	).results[0]?.blockId as string;
+	await write(ctx, space, [
+		{ op: "move", block: { id: other as string }, parent: { id: m as string } },
+	]);
+	return {
+		space,
+		thenSeq,
+		top: top as string,
+		other: other as string,
+		m: m as string,
+		o1: o1 as string,
+		added,
+		leaf,
+	};
+}

@@ -293,6 +293,28 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return out;
 	},
 
+	async findTagChanges(blockIds, { after, upTo }) {
+		const out: string[] = [];
+		const l = outlineLinks;
+		const inRange = (column: typeof l.fromSeq | typeof l.toSeq) =>
+			and(gt(column, after), lte(column, upTo));
+		for (const ids of chunked([...new Set(blockIds)])) {
+			const rows = db
+				.selectDistinct({ id: l.fromBlockId })
+				.from(l)
+				.where(
+					and(
+						inArray(l.fromBlockId, ids),
+						eq(l.kind, "tag"),
+						or(inRange(l.fromSeq), inRange(l.toSeq)),
+					),
+				)
+				.all();
+			for (const row of rows) out.push(row.id);
+		}
+		return out;
+	},
+
 	async listVersionHeadsAt(blockIds, seq, chars) {
 		const out: OutlineVersionHead[] = [];
 		const v = outlineBlockVersions;

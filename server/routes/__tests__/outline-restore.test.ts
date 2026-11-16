@@ -303,6 +303,16 @@ describe("outline restore routes", () => {
 			["added", "delete"],
 			["moved-away", "none"],
 		]);
+		// The token is the previewing person's: anyone else previews for themselves.
+		const admin = await user("admin", "admin");
+		const theirs = await post(admin, `/spaces/${space.id}/restore`, {
+			token: preview.body.token,
+		});
+		expect(theirs.status).toBe(400);
+		expect(theirs.body).toMatchObject({
+			code: "OUTLINE_RESTORE_TOKEN_INVALID",
+			details: { reason: "person" },
+		});
 		// Someone edits under the subtree after the preview.
 		const foreign = await write(
 			space,

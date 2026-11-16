@@ -68,10 +68,24 @@ export class OutlineRestoreParentGoneError extends AppError {
 	}
 }
 
-/** A cursor or token is malformed, was not made by this server, or belongs to another call. */
+/**
+ * A cursor or token is malformed, was not made by this server, or belongs to another call; or a
+ * token was handed to another person (`reason: "person"`) or has run out (`reason: "expired"`):
+ * preview again.
+ */
 export class OutlineRestoreTokenError extends AppError {
-	constructor(what: "cursor" | "token") {
-		super(`Invalid ${what}`, 400, OUTLINE_RESTORE_ERROR_CODES.token);
+	constructor(what: "cursor" | "token", reason?: "person" | "expired") {
+		super(
+			reason === "expired"
+				? "This restore's preview has expired; preview it again"
+				: reason === "person"
+					? "This restore was previewed by someone else; preview it yourself"
+					: `Invalid ${what}`,
+			400,
+			OUTLINE_RESTORE_ERROR_CODES.token,
+			undefined,
+			reason ? { reason } : undefined,
+		);
 		this.name = "OutlineRestoreTokenError";
 	}
 }
