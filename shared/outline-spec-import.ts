@@ -9,6 +9,7 @@
  * - `broken_tasks`: `tasks.json` is not a task list (imported as notes);
  * - `task_mismatch`: imported task `count` does not read as its source;
  * - `kept_blocks`: `count` blocks of an earlier attempt hold what someone added or changed;
+ * - `stale_limit`: more than `count` blocks to look through for what an earlier attempt left;
  * - `fence_too_large`: the behavior fence's own text is over `count` KiB;
  * - `sop_too_large`: the plugin SOP in the fence is larger than its block holds;
  * - `not_started`: `count` tasks in progress could not be started by the session;
@@ -24,6 +25,7 @@ export interface OutlineSpecImportReason {
 		| "broken_tasks"
 		| "task_mismatch"
 		| "kept_blocks"
+		| "stale_limit"
 		| "fence_too_large"
 		| "sop_too_large"
 		| "not_started"

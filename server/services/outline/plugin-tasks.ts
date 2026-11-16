@@ -59,11 +59,12 @@ import { readNarrator } from "./access-reads";
 import { OUTLINE_TEXT } from "./messages";
 import { OUTLINE_LIMITS, OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
 import { bodyFromText, findSameTask, OUTLINE_TASKS_PAGE_TITLE, oneAtATime } from "./person-tasks";
+import { yieldToEventLoop } from "./session-scope";
 import { outlineStore } from "./store";
 import type { OutlineLevelCursor, OutlineLevelRow } from "./store/history-port";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
 import { deriveOutlineTaskWaits, idleOutlineTaskClaims, isWaiting } from "./tasks";
-import { blocksUnder, findBehaviorBlock } from "./well-known";
+import { blocksUnder, findBehaviorBlock, findTasksBlock } from "./well-known";
 import {
 	type OutlineCanonicalContent,
 	type OutlineOp,
@@ -79,7 +80,10 @@ export const OUTLINE_PLUGIN_TASK_LIMITS = {
 	/** Characters of a task's text a read returns, and of a task a plugin adds. */
 	textChars: 1000,
 	/** Rows (blocks without content) one read takes. */
-	rowsPerRead: 20_000,
+	rowsPerRead: 5000,
+	/** The event loop is yielded after so many statements, or so many rows, of a read. */
+	yieldEveryReads: 20,
+	yieldEveryRows: 2000,
 	/** Statements one read makes at most; the next call continues after the last block seen. */
 	readsPerRead: 400,
 	/** Rows of one level one statement reads. */
@@ -140,6 +144,10 @@ export const PLUGIN_TASK_TEXT = {
 	locked: (address: string) =>
 		`Task ${address} is locked by a person: a plugin may not finish or cancel it, nor cancel or add tasks under it.`,
 	badCursor: "The cursor is invalid",
+	taskListNested:
+		"The session's task list (the block with alias tasks) is not at the top level of its space: move it back to the top level, or name a parent block for the task.",
+	indexUnderRules:
+		"index.md sits under the behavior boundary, where every line is read as a rule: nothing was written. A person moved it there; move it out of the boundary to write notes to it again.",
 } as const;
 
 /** The actor (and manager) of a plugin's writes: the system acting for the plugin. */
@@ -385,9 +393,9 @@ export async function walkSessionTasks(
 	const maxRows = options.budget?.rows ?? limits.rowsPerRead;
 	const maxReads = options.budget?.reads ?? limits.readsPerRead;
 	const cursor = options.cursor ?? null;
-	// The task list as the plugin commands write it (`taskListOf`): the alias's block.
-	const [[list], behavior] = await Promise.all([
-		store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]),
+	// The task list as the plugin commands write it (`taskListOf`): the well-known block.
+	const [list, behavior] = await Promise.all([
+		findTasksBlock(space.id, store),
 		findBehaviorBlock(space.id, store),
 	]);
 	const listId = list?.id ?? null;
@@ -422,8 +430,20 @@ export async function walkSessionTasks(
 			: null) ?? [top(after)];
 	}
 
+	let sinceYield = { reads: 0, rows: 0 };
+	/** Give way to other work now and then: a read is many short statements on the main thread. */
+	const pace = async () => {
+		if (
+			reads - sinceYield.reads >= limits.yieldEveryReads ||
+			rowsRead - sinceYield.rows >= limits.yieldEveryRows
+		) {
+			await yieldToEventLoop();
+			sinceYield = { reads, rows: rowsRead };
+		}
+	};
 	/** Read the next rows of a level, and the first children of those that have some. */
 	const fill = async (level: WalkLevel) => {
+		await pace();
 		const read = await store.listLevel(space.id, level.parentId, {
 			asOf: null,
 			after: level.after,
@@ -758,8 +778,12 @@ async function taskListOf(
 	locale: Locale,
 	store: OutlineStore,
 ): Promise<{ parent: { id: string } | { tempId: string }; id: string | null; ops: OutlineOp[] }> {
-	const [owner] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-	if (owner) return { parent: { id: owner.id }, id: owner.id, ops: [] };
+	const list = await findTasksBlock(space.id, store);
+	if (list) return { parent: { id: list.id }, id: list.id, ops: [] };
+	// The alias on a block that is not at the top level names no task list (A1), and it cannot
+	// be given twice: the plugin is told, nothing is written (it may be under the boundary).
+	if ((await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS])).length > 0)
+		throw new PluginTaskError("CONFLICT", PLUGIN_TASK_TEXT.taskListNested);
 	return {
 		parent: { tempId: "tasks" },
 		id: null,
@@ -779,7 +803,7 @@ async function taskListOf(
  * Whether a block is the session's behavior boundary or under it (by ancestry; a walk that cannot
  * tell counts as under it: its checkboxes may be rules).
  */
-async function underBehavior(
+export async function underBehavior(
 	store: OutlineStore,
 	spaceId: string,
 	blockId: string,

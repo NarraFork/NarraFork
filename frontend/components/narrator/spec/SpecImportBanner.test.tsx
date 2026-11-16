@@ -272,6 +272,7 @@ test("every string exists in both languages", () => {
 		"broken_tasks",
 		"task_mismatch",
 		"kept_blocks",
+		"stale_limit",
 		"fence_too_large",
 		"sop_too_large",
 		"not_started",

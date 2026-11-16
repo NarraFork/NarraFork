@@ -2470,6 +2470,7 @@
 			"broken_tasks": "tasks.json is not a valid task list; it was imported as notes.",
 			"task_mismatch": "Imported task {{n}} does not match its Dynamic Spec source.",
 			"kept_blocks": "{{n}} block(s) left by an earlier attempt hold what someone added or changed since. Move that out of them (or delete them), then import again.",
+			"stale_limit": "An earlier, unfinished import may have left more than {{n}} blocks to look through, more than one import checks. Nothing was written; tidy the session's outline space (or keep the session in Dynamic Spec).",
 			"fence_too_large": "The behavior fence is larger than {{n}} KiB.",
 			"sop_too_large": "The plugin SOP in the behavior fence is larger than its block under the behavior boundary holds.",
 			"not_started": "{{n}} task(s) in progress could not be started by the session.",

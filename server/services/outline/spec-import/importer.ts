@@ -84,13 +84,14 @@ import { OUTLINE_EDIT_TEXT_LIMITS, processBackgroundText } from "../edit-text-ru
 import { OutlineWriteError } from "../errors";
 import { isOutlineEnabled } from "../feature";
 import { forgetSpecImportLeftover } from "../lease-keeper";
-import { OUTLINE_TASKS_PAGE_ALIAS } from "../model";
+import { OUTLINE_LIMITS, OUTLINE_TASKS_PAGE_ALIAS } from "../model";
 import { OUTLINE_TASKS_PAGE_TITLE } from "../person-tasks";
 import { PluginTaskError, pluginBlockedNoteSid } from "../plugin-tasks";
 import { yieldToEventLoop } from "../session-scope";
 import { outlineStore } from "../store";
 import type { OutlineLevelCursor } from "../store/history-port";
 import type { OutlineBlockMeta, OutlineCommitRow, OutlineSpaceRow } from "../store/port";
+import { OutlineStaleWriteError } from "../store/port";
 import { findTasksBlock } from "../well-known";
 import {
 	type OutlineBlockRef,
@@ -144,29 +145,41 @@ export const SPEC_IMPORT_LIMITS = {
 	bytesPerCommit: 96 * 1024,
 	/** Short ids one lookup of what is in the space already asks for. */
 	sidLookup: 400,
-	/** Stale blocks of an earlier attempt one commit deletes at most. */
-	staleDeletesPerCommit: 20,
+	/** Stale blocks of an earlier attempt one commit deletes at most (the write path's limit). */
+	staleDeletesPerCommit: OUTLINE_LIMITS.maxOps,
 	/**
 	 * Blocks one commit of the stale removal deletes, with everything under them: a stale file
 	 * block larger than this goes in several commits, from the bottom up (the write path takes
 	 * 2,000 rows a commit, links included).
 	 */
 	staleDeleteBlocks: 1000,
-	/** Top-level blocks of the session space looked at for an earlier attempt's file blocks. */
-	staleTopLevel: 500,
-	/** Children of the task list (and of the index block) looked at likewise. */
+	/**
+	 * Top-level blocks of the session space looked at for an earlier attempt's file blocks, a
+	 * level read at a time; a space holding more needs attention (`stale_limit`), never an import
+	 * that leaves old content behind.
+	 */
+	staleTopLevel: 5000,
+	/** Children of the index block looked at likewise (a level of up to 2,000, and groups). */
+	staleIndexChildren: 5000,
+	/** Rows of one level read at a time by those scans. */
+	staleLevelRead: 200,
+	/** Children of the task list looked at for an earlier attempt's tasks (the last ones). */
 	staleChildren: 1000,
-	/** Blocks of one stale subtree read to see who wrote them; more: kept (attention). */
+	/** Live blocks of one stale subtree read to plan its removal; more: kept (attention). */
 	staleSubtreeBlocks: 20_000,
-	/** Distinct commits of one stale subtree looked up; more: kept (attention). */
+	/**
+	 * Distinct commits that changed anything ever under one stale block (its change marks above
+	 * the history floor) looked up; more: kept (attention).
+	 */
 	staleCommits: 1000,
-	/** Versions of one block read to see who ever wrote it; more: kept (attention). */
-	staleVersionsPerBlock: 64,
-	/** Versions of one stale subtree read in all; more: kept (attention). */
-	staleVersions: 40_000,
+	/** Versions of a stale block itself read (its own changes are not marks); more: kept. */
+	staleRootVersions: 64,
 	/** Characters of a failure kept for the Spec panel. */
 	errorChars: 300,
 } as const;
+
+/** Part pages of a file an attempt before pages went may have left (`sp<tag>p<n>`), looked for. */
+const SPEC_IMPORT_LEGACY_PARTS = 256;
 
 /** `admin`: an administrator's re-import (the only trigger that moves a moved-back session). */
 export type SpecImportTrigger = "run" | "sweep" | "manual" | "admin";
@@ -996,7 +1009,10 @@ async function writeEverything(
 			...(path === "index.md" ? { rootSid: specIndexSid() } : {}),
 		});
 		notesWritten++;
-		await writeNodes(ctx, plan.nodes, null, SPEC_IMPORT_TEXT[locale].summaryNotes(path));
+		await writeNodes(ctx, plan.nodes, null, SPEC_IMPORT_TEXT[locale].summaryNotes(path), {
+			relocate: true,
+		});
+		await tidyLegacyParts(ctx, path, plan.rootSid);
 	};
 	for (const batch of contentBatches(notePointers)) {
 		const contents = await readSpecRevisionContents(batch.map((p) => p.revisionId));
@@ -1100,7 +1116,7 @@ async function commit(
 	ops: OutlineOp[],
 	canonical: Array<OutlineCanonicalContent | null>,
 	summary: string,
-	options: { ignoreSignal?: boolean } = {},
+	options: { ignoreSignal?: boolean; expectNextSeq?: number } = {},
 ) {
 	if (!options.ignoreSignal) {
 		ctx.signal?.throwIfAborted();
@@ -1116,7 +1132,11 @@ async function commit(
 			narratorId: ctx.session.narratorId,
 			summary,
 		},
-		{ kind: "import", canonical },
+		{
+			kind: "import",
+			canonical,
+			...(options.expectNextSeq !== undefined ? { expectNextSeq: options.expectNextSeq } : {}),
+		},
 	);
 	if (result.commit) ctx.commits++;
 	const elapsed = performance.now() - started;
@@ -1145,13 +1165,18 @@ function giveWay(ctx: Context): void {
  * the import's own (12b review r2 SF2): what anyone else changed is left as they left it, so the
  * verification that follows fails on it (needs attention) instead of an import version hiding
  * it, which a later attempt would then delete as only the import's.
+ *
+ * `relocate` (a file's blocks): a block that is there already under another parent than the plan
+ * says, and that only the import ever wrote, is moved where the plan puts it, in plan order (an
+ * attempt cut short before pages went left a file over several pages: its blocks join the file's
+ * one block). One someone else wrote stays where it is.
  */
 async function writeNodes(
 	ctx: Context,
 	nodes: readonly SpecImportNode[],
 	root: OutlineBlockRef | null,
 	summary: string,
-	options: { heal?: boolean } = {},
+	options: { heal?: boolean; relocate?: boolean } = {},
 ): Promise<void> {
 	if (nodes.length === 0) return;
 	const existing = await existingBySid(
@@ -1159,6 +1184,23 @@ async function writeNodes(
 		nodes.map((node) => node.sid),
 	);
 	const healable = options.heal ? await importVersions(ctx.space, nodes, existing) : new Set();
+	const plannedParentId = (node: SpecImportNode): string | null | undefined => {
+		if (node.parentSid === null) return undefined;
+		const parent = existing.get(node.parentSid);
+		return parent && !parent.deleted ? parent.id : null;
+	};
+	const movable = options.relocate
+		? await onlyImportVersions(
+				ctx.space,
+				nodes.flatMap((node) => {
+					const found = existing.get(node.sid);
+					const planned = plannedParentId(node);
+					return found && !found.deleted && planned !== undefined && found.parentId !== planned
+						? [found.id]
+						: [];
+				}),
+			)
+		: new Set<string>();
 	const skipped = new Set<string>();
 	let ops: OutlineOp[] = [];
 	let canonical: Array<OutlineCanonicalContent | null> = [];
@@ -1207,6 +1249,12 @@ async function writeNodes(
 				content: node.content,
 				...(node.task ? { task: node.task } : {}),
 			};
+		} else if (
+			movable.has(found.id) &&
+			parent !== null &&
+			!("id" in parent && parent.id === found.parentId)
+		) {
+			op = { op: "move", block: { id: found.id }, parent };
 		} else if (options.heal && node.task && drifted(found, node) && healable.has(found.id)) {
 			op = {
 				op: "setTask",
@@ -1215,7 +1263,8 @@ async function writeNodes(
 			};
 		}
 		if (!op) continue;
-		const size = op.op === "setTask" ? 0 : Buffer.byteLength(node.content, "utf8");
+		const size =
+			op.op === "setTask" || op.op === "move" ? 0 : Buffer.byteLength(node.content, "utf8");
 		if (
 			ops.length >= SPEC_IMPORT_LIMITS.opsPerCommit ||
 			(ops.length > 0 && bytes + size > SPEC_IMPORT_LIMITS.bytesPerCommit)
@@ -1226,12 +1275,94 @@ async function writeNodes(
 		}
 		ops.push(op);
 		canonical.push(
-			op.op !== "setTask" && node.links ? { content: node.content, links: node.links } : null,
+			op.op !== "setTask" && op.op !== "move" && node.links
+				? { content: node.content, links: node.links }
+				: null,
 		);
 		if (op.op === "insert") inCommit.add(node.sid);
 		bytes += size;
 	}
 	await flush();
+}
+
+/**
+ * Of the given blocks, those every version of which one of the import's own commits wrote
+ * (bounded: at most {@link SPEC_IMPORT_LIMITS.staleRootVersions} versions a block, more: not one
+ * of them; commits looked up 100 seqs at a time).
+ */
+async function onlyImportVersions(
+	space: OutlineSpaceRow,
+	ids: readonly string[],
+): Promise<Set<string>> {
+	const out = new Set<string>();
+	if (ids.length === 0) return out;
+	const seqsOf = new Map<string, number[]>();
+	for (const [n, id] of ids.entries()) {
+		const versions = await outlineStore.listBlockVersions(
+			id,
+			SPEC_IMPORT_LIMITS.staleRootVersions + 1,
+		);
+		if (versions.length <= SPEC_IMPORT_LIMITS.staleRootVersions)
+			seqsOf.set(
+				id,
+				versions.map((v) => v.fromSeq),
+			);
+		if (n % 200 === 199) await yieldToEventLoop();
+	}
+	const wanted = [...new Set([...seqsOf.values()].flat())];
+	const ours = new Set<number>();
+	for (let i = 0; i < wanted.length; i += 100)
+		for (const row of await outlineStore.getCommitsBySeqs(space.id, wanted.slice(i, i + 100)))
+			if (isImportCommit(row)) ours.add(row.seq);
+	for (const [id, seqs] of seqsOf) if (seqs.every((seq) => ours.has(seq))) out.add(id);
+	return out;
+}
+
+/**
+ * After a file's blocks are written: what an attempt cut short before pages went left of the
+ * file's layout then. Its part pages (`sp<tag>p<n>`, the file over several pages) go once
+ * nothing is under them and only the import wrote them; the file's block, titled as the first
+ * part (`name (1/2)`), gets the file's path back, when only the import wrote it.
+ */
+async function tidyLegacyParts(ctx: Context, path: string, rootSid: string): Promise<void> {
+	const tag = fileTagOfSid(rootSid);
+	if (!rootSid.startsWith("sp") || rootSid !== `sp${tag}`) return;
+	const partSids = Array.from(
+		{ length: SPEC_IMPORT_LEGACY_PARTS },
+		(_, n) => `sp${tag}p${(n + 1).toString(36)}`,
+	);
+	const parts = (await outlineStore.getBlockMetas(ctx.space.id, { sids: partSids })).filter(
+		(meta) => !meta.deleted,
+	);
+	const empty: OutlineBlockMeta[] = [];
+	for (const part of parts)
+		if ((await outlineStore.listChildMetas(ctx.space.id, [part.id], 1)).length === 0)
+			empty.push(part);
+	const [root] = await outlineStore.getBlockMetas(ctx.space.id, { sids: [rootSid] });
+	const rootRow = root && !root.deleted ? await outlineStore.getBlock(root.id) : null;
+	const retitle = rootRow !== null && rootRow.content !== path;
+	const ours = await onlyImportVersions(ctx.space, [
+		...empty.map((part) => part.id),
+		...(retitle && root ? [root.id] : []),
+	]);
+	const ops: OutlineOp[] = [];
+	for (const part of empty)
+		if (ours.has(part.id))
+			ops.push({ op: "delete", block: { id: part.id }, baseVersionSeq: part.versionSeq });
+	if (retitle && root && ours.has(root.id))
+		ops.push({
+			op: "update",
+			block: { id: root.id },
+			content: path,
+			baseVersionSeq: root.versionSeq,
+		});
+	if (ops.length > 0)
+		await commit(
+			ctx,
+			ops,
+			ops.map(() => null),
+			SPEC_IMPORT_TEXT[ctx.locale].summaryNotes(path),
+		);
 }
 
 /**
@@ -1325,20 +1456,54 @@ interface StaleBlock {
 interface StaleNode {
 	id: string;
 	parentId: string | null;
+	versionSeq: number;
+}
+
+/** A scan that reached its limit with more to look at: the import does not go on blind. */
+function staleLimit(count: number): SpecImportAttention {
+	return new SpecImportAttention(
+		`An earlier, unfinished import may have left more than ${count} blocks to look through: nothing was taken away or written`,
+		{ code: "stale_limit", count },
+	);
+}
+
+/**
+ * The children of one parent (null: the top level) a level read at a time, at most `max`; a
+ * level that goes on past it needs attention.
+ */
+async function readLevelWhole(
+	space: OutlineSpaceRow,
+	parentId: string | null,
+	max: number,
+): Promise<Array<{ id: string; sid: string; versionSeq: number }>> {
+	const out: Array<{ id: string; sid: string; versionSeq: number }> = [];
+	let after: OutlineLevelCursor | null = null;
+	for (;;) {
+		const level = await outlineStore.listLevel(space.id, parentId, {
+			asOf: null,
+			after,
+			limit: SPEC_IMPORT_LIMITS.staleLevelRead,
+		});
+		out.push(...level.rows);
+		if (!level.next) return out;
+		if (out.length >= max) throw staleLimit(max);
+		after = level.next;
+	}
 }
 
 /**
  * Take away what an earlier attempt wrote from a source that is not the one read now: the
  * import's tasks of another `tasks.json` revision in the task list (their notes go with them),
  * its top-level file blocks of other file revisions (the `index.md` block when that file is gone),
- * its blocks of another `index.md` revision under the index block, and under the behavior
- * boundary its blocks of another fence text. Only the import's own short ids are looked at, only
- * before the session is moved, and only what nobody else ever wrote is taken away: when any stale
- * block holds what someone added, moved there or edited ({@link onlyImportWrote}), nothing is
- * taken away or written and the attempt needs attention (`kept_blocks`), so the space shows the
- * kept blocks and no new revision beside them. A file block someone moved off the top level is
- * not looked for: moving it made it theirs. Bounded reads; the deletes go in bounded commits
- * ({@link deleteStale}), so a stale file block of any size goes.
+ * its blocks and groups of another `index.md` revision under the index block, and under the
+ * behavior boundary its blocks of another fence text. Only the import's own short ids are looked
+ * at, only before the session is moved, and only what nobody else ever touched is taken away
+ * ({@link onlyImportWrote}): when any stale block was touched by anyone else, nothing is taken
+ * away or written and the attempt needs attention (`kept_blocks`), so the space shows the kept
+ * blocks and no new revision beside them. A file block someone moved off the top level is not
+ * looked for: moving it made it theirs. Bounded reads (a scan that reaches its limit needs
+ * attention, `stale_limit`); the deletes go in bounded commits that re-check before each one
+ * ({@link deleteStale}).
  */
 async function removeStale(
 	ctx: Context,
@@ -1353,11 +1518,18 @@ async function removeStale(
 ): Promise<void> {
 	const { space } = ctx;
 	const limits = SPEC_IMPORT_LIMITS;
+	// Everything up to here is what the checks below look at; what lands later is checked again
+	// before every delete.
+	const checkedUpTo = latestSeqOf(await outlineStore.getSpace(space.id));
 	const stale: StaleBlock[] = [];
 	const block = (meta: Pick<OutlineBlockMeta, "id" | "versionSeq">): StaleBlock => ({
 		id: meta.id,
 		versionSeq: meta.versionSeq,
 	});
+	const ofOtherFile = (sid: string) =>
+		(sid.startsWith("sb") || sid.startsWith("sp")) &&
+		isImportSid(sid) &&
+		!current.keepFileTags.has(fileTagOfSid(sid));
 	const [tasksList] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
 	if (tasksList) {
 		for (const meta of await outlineStore.listLastChildMetas(
@@ -1375,39 +1547,12 @@ async function removeStale(
 		// The file is gone: its block goes too, rather than staying behind empty.
 		if (!current.indexMd) stale.push(block(index));
 		else
-			for (const meta of await outlineStore.listLastChildMetas(
-				space.id,
-				index.id,
-				limits.staleChildren,
-			)) {
-				if (
-					meta.sid.startsWith("sb") &&
-					isImportSid(meta.sid) &&
-					!current.keepFileTags.has(fileTagOfSid(meta.sid))
-				)
-					stale.push(block(meta));
-			}
+			for (const row of await readLevelWhole(space, index.id, limits.staleIndexChildren))
+				if (ofOtherFile(row.sid)) stale.push(block(row));
 	}
-	// The import's file blocks of other revisions at the top level, a level read at a time.
-	let after: OutlineLevelCursor | null = null;
-	for (let read = 0; read < limits.staleTopLevel; ) {
-		const level = await outlineStore.listLevel(space.id, null, {
-			asOf: null,
-			after,
-			limit: Math.min(100, limits.staleTopLevel - read),
-		});
-		for (const row of level.rows) {
-			if (
-				row.sid.startsWith("sp") &&
-				isImportSid(row.sid) &&
-				!current.keepFileTags.has(fileTagOfSid(row.sid))
-			)
-				stale.push(block(row));
-		}
-		read += level.rows.length;
-		if (!level.next) break;
-		after = level.next;
-	}
+	// The import's file blocks of other revisions at the top level.
+	for (const row of await readLevelWhole(space, null, limits.staleTopLevel))
+		if (row.sid.startsWith("sp") && ofOtherFile(row.sid)) stale.push(block(row));
 	const behavior = await findBehaviorBlock(space.id);
 	if (behavior) {
 		for (const meta of await outlineStore.listLastChildMetas(
@@ -1429,17 +1574,23 @@ async function removeStale(
 	}
 	// Before anything is written (review r2 NIT 3): an attempt that cannot move the session leaves
 	// the space as it found it, rather than the new revision's blocks beside the kept ones.
-	if (kept > 0) {
-		logger.warn("Dynamic Spec import kept blocks of an earlier attempt that others wrote to", {
-			narratorId: ctx.session.narratorId,
-			kept,
-		});
-		throw new SpecImportAttention(
-			`${kept} block(s) an earlier, unfinished import wrote hold what someone added or changed since: they were kept; move what is yours out of them (or delete them), then import again`,
-			{ code: "kept_blocks", count: kept },
-		);
-	}
-	await deleteStale(ctx, removable);
+	if (kept > 0) throw keptBlocks(ctx, kept);
+	await deleteStale(ctx, removable, checkedUpTo);
+}
+
+function keptBlocks(ctx: Context, kept: number): SpecImportAttention {
+	logger.warn("Dynamic Spec import kept blocks of an earlier attempt that others wrote to", {
+		narratorId: ctx.session.narratorId,
+		kept,
+	});
+	return new SpecImportAttention(
+		`${kept} block(s) an earlier, unfinished import wrote hold what someone added or changed since: they were kept; move what is yours out of them (or delete them), then import again`,
+		{ code: "kept_blocks", count: kept },
+	);
+}
+
+function latestSeqOf(space: OutlineSpaceRow | null): number {
+	return space ? Math.max(0, space.nextSeq - 1) : 0;
 }
 
 /**
@@ -1448,22 +1599,93 @@ async function removeStale(
  * {@link SPEC_IMPORT_LIMITS.staleDeleteBlocks} blocks in all (and at most
  * {@link SPEC_IMPORT_LIMITS.staleDeletesPerCommit} operations): a stale subtree within that goes
  * whole; a larger one goes from the bottom up, round after round, each round deleting its largest
- * pieces that fit (a piece's parent goes in a later round, once what is left under it fits). A
- * commit the write path still finds too large (links count as rows too) is split in two, and a
- * single piece too large is planned again at half the size.
+ * pieces that fit. A commit the write path still finds too large (links count as rows too) is
+ * split in two, and a single piece too large is planned again at half the size.
+ *
+ * NOTHING BUT WHAT WAS CHECKED. Before every commit, every stale block still there is checked
+ * again for commits by anyone else that changed anything under it (or it) since the last check
+ * (its change marks): one, and the removal stops (`kept_blocks`, what went already stays gone:
+ * nobody else had touched it). The commit is then written only while the space is still at the
+ * seq that check read (`expectNextSeq`), each delete naming the version it checked: a commit
+ * landing in between makes the write refuse, and the check runs again. So a delete never takes
+ * a block that was not in the checked subtree.
  */
-async function deleteStale(ctx: Context, subtrees: readonly StaleNode[][]): Promise<void> {
+async function deleteStale(
+	ctx: Context,
+	subtrees: readonly StaleNode[][],
+	checkedUpTo: number,
+): Promise<void> {
 	const limits = SPEC_IMPORT_LIMITS;
 	const summary = SPEC_IMPORT_TEXT[ctx.locale].summaryStale;
-	const parentOf = new Map<string, string | null>();
-	for (const nodes of subtrees) for (const node of nodes) parentOf.set(node.id, node.parentId);
+	const nodeOf = new Map<string, StaleNode>();
+	for (const nodes of subtrees) for (const node of nodes) nodeOf.set(node.id, node);
+	const roots = subtrees.flatMap((nodes) => (nodes[0] ? [nodes[0].id] : []));
 	const gone = new Set<string>();
+	let verified = checkedUpTo;
 	let cap: number = limits.staleDeleteBlocks;
+
+	/** Check what landed since the last check; the space's next seq the check read. */
+	const recheck = async (): Promise<number> => {
+		const space = await outlineStore.getSpace(ctx.space.id);
+		if (!space) throw new Error("the session space is gone");
+		const latest = latestSeqOf(space);
+		if (latest > verified) {
+			for (const root of roots) {
+				if (gone.has(root)) continue;
+				const seqs = new Set(
+					await outlineStore.listSubtreeChangeSeqs(space.id, root, {
+						after: verified,
+						limit: limits.staleCommits + 1,
+					}),
+				);
+				const own = await outlineStore.listBlockVersions(root, limits.staleRootVersions + 1);
+				if (seqs.size > limits.staleCommits || own.length > limits.staleRootVersions)
+					throw keptBlocks(ctx, 1);
+				for (const version of own) if (version.fromSeq > verified) seqs.add(version.fromSeq);
+				if (!(await allImportCommits(space, seqs))) throw keptBlocks(ctx, 1);
+			}
+			verified = latest;
+		}
+		return space.nextSeq;
+	};
+
 	const tooLarge = (error: unknown) =>
 		error instanceof OutlineWriteError && error.code === "OUTLINE_TOO_MANY_ROWS";
-	/** Write the pieces (root, size) in as few commits as the limits allow; false: one is too big. */
-	const write = async (pieces: ReadonlyArray<{ id: string; size: number }>): Promise<boolean> => {
-		const packs: Array<Array<{ id: string; size: number }>> = [];
+	/** Write one pack; false: a single piece was too large. */
+	const commitPack = async (
+		list: ReadonlyArray<{ id: string; size: number }>,
+	): Promise<boolean> => {
+		for (;;) {
+			const expectNextSeq = await recheck();
+			try {
+				await commit(
+					ctx,
+					list.map((piece) => ({
+						op: "delete" as const,
+						block: { id: piece.id },
+						baseVersionSeq: (nodeOf.get(piece.id) as StaleNode).versionSeq,
+					})),
+					list.map(() => null),
+					summary,
+					{ expectNextSeq },
+				);
+				for (const piece of list) gone.add(piece.id);
+				return true;
+			} catch (error) {
+				// Someone wrote meanwhile: checked again before trying again.
+				if (error instanceof OutlineStaleWriteError) continue;
+				if (!tooLarge(error)) throw error;
+				if (list.length === 1) return false;
+				const half = Math.ceil(list.length / 2);
+				return (await commitPack(list.slice(0, half))) && (await commitPack(list.slice(half)));
+			}
+		}
+	};
+
+	for (;;) {
+		const pieces = stalePieces(subtrees, gone, cap);
+		if (pieces.length === 0) return;
+		let packs: Array<Array<{ id: string; size: number }>> = [];
 		let pack: Array<{ id: string; size: number }> = [];
 		let rows = 0;
 		for (const piece of pieces) {
@@ -1479,48 +1701,14 @@ async function deleteStale(ctx: Context, subtrees: readonly StaleNode[][]): Prom
 			rows += piece.size;
 		}
 		if (pack.length > 0) packs.push(pack);
-		const commitPack = async (
-			list: ReadonlyArray<{ id: string; size: number }>,
-		): Promise<boolean> => {
-			try {
-				await commit(
-					ctx,
-					list.map((piece) => ({ op: "delete" as const, block: { id: piece.id } })),
-					list.map(() => null),
-					summary,
-				);
-				for (const piece of list) gone.add(piece.id);
-				return true;
-			} catch (error) {
-				if (!tooLarge(error)) throw error;
-				if (list.length === 1) return false;
-				const half = Math.ceil(list.length / 2);
-				return (await commitPack(list.slice(0, half))) && (await commitPack(list.slice(half)));
+		let fits = true;
+		for (const list of packs)
+			if (!(await commitPack(list))) {
+				fits = false;
+				break;
 			}
-		};
-		for (const list of packs) if (!(await commitPack(list))) return false;
-		return true;
-	};
-	for (;;) {
-		// What is left, and the size of what is left under each block.
-		const left = [...parentOf.keys()].filter((id) => !isUnderGone(id, parentOf, gone));
-		if (left.length === 0) return;
-		const size = new Map<string, number>();
-		for (const id of left) {
-			for (let at: string | null = id; at !== null; at = parentOf.get(at) ?? null) {
-				size.set(at, (size.get(at) ?? 0) + 1);
-				if (!parentOf.has(at)) break;
-			}
-		}
-		// The largest pieces that fit: a block whose rest fits and whose parent's does not (or
-		// that is a stale root itself).
-		const pieces = left.flatMap((id) => {
-			const own = size.get(id) ?? 1;
-			const parent = parentOf.get(id) ?? null;
-			const parentFits = parent !== null && parentOf.has(parent) && (size.get(parent) ?? 0) <= cap;
-			return own <= cap && !parentFits ? [{ id, size: own }] : [];
-		});
-		if (!(await write(pieces))) {
+		packs = [];
+		if (!fits) {
 			if (cap <= 1) throw new Error("the import could not delete a stale block in one commit");
 			cap = Math.max(1, Math.floor(cap / 2));
 		}
@@ -1528,39 +1716,81 @@ async function deleteStale(ctx: Context, subtrees: readonly StaleNode[][]): Prom
 	}
 }
 
-/** Whether a block, or a block above it among the stale ones, was deleted already. */
-function isUnderGone(
-	id: string,
-	parentOf: ReadonlyMap<string, string | null>,
+/**
+ * The largest pieces of the stale subtrees left (not deleted yet) whose blocks number at most
+ * `cap`: walking down from each stale block, a block whose rest fits is a piece, else its
+ * children are looked at. Linear in the blocks left: one pass to count, one to choose.
+ */
+function stalePieces(
+	subtrees: readonly StaleNode[][],
 	gone: ReadonlySet<string>,
-): boolean {
-	for (let at: string | null = id; at !== null; at = parentOf.get(at) ?? null) {
-		if (gone.has(at)) return true;
-		if (!parentOf.has(at)) return false;
+	cap: number,
+): Array<{ id: string; size: number }> {
+	const pieces: Array<{ id: string; size: number }> = [];
+	for (const nodes of subtrees) {
+		const root = nodes[0];
+		if (!root || gone.has(root.id)) continue;
+		const children = new Map<string, string[]>();
+		for (const node of nodes) {
+			if (node.parentId === null) continue;
+			const list = children.get(node.parentId);
+			if (list) list.push(node.id);
+			else children.set(node.parentId, [node.id]);
+		}
+		// Sizes after the fact (post order, without recursion), skipping what went.
+		const size = new Map<string, number>();
+		const order: string[] = [];
+		const stack = [root.id];
+		while (stack.length > 0) {
+			const id = stack.pop() as string;
+			if (gone.has(id)) continue;
+			order.push(id);
+			for (const child of children.get(id) ?? []) stack.push(child);
+		}
+		for (let i = order.length - 1; i >= 0; i--) {
+			const id = order[i] as string;
+			let total = 1;
+			for (const child of children.get(id) ?? []) total += size.get(child) ?? 0;
+			size.set(id, total);
+		}
+		const down = [root.id];
+		while (down.length > 0) {
+			const id = down.pop() as string;
+			if (gone.has(id)) continue;
+			const own = size.get(id) ?? 1;
+			if (own <= cap) pieces.push({ id, size: own });
+			else for (const child of children.get(id) ?? []) down.push(child);
+		}
 	}
-	return false;
+	return pieces;
 }
 
 /**
- * Whether only the import ever wrote what is under `root` now, itself included: no version of a
- * live block there was opened by any commit but the import's. A block someone added, moved there
- * or edited was not (review S2), even when the import wrote a later version over theirs (12b
- * review r2 SF2); a block someone moved out or deleted is not there any more and does not count.
- * The live blocks under it now, the root first (null when someone else wrote any). Bounded: at
- * most {@link SPEC_IMPORT_LIMITS.staleSubtreeBlocks} blocks read without content, a level of
- * {@link SPEC_IMPORT_LIMITS.sidLookup} parents at a time, at most
- * {@link SPEC_IMPORT_LIMITS.staleVersionsPerBlock} versions of a block and
- * {@link SPEC_IMPORT_LIMITS.staleVersions} in all, and {@link SPEC_IMPORT_LIMITS.staleCommits}
- * commits by seq; past any, null (kept: it cannot tell). The event loop is yielded between reads.
+ * Whether only the import ever touched what is or was under `root`, itself included (outline
+ * owner rule, A3 review): no commit but the import's own changed `root` or any block that was
+ * under it at the time, live or deleted since: read from the root's change marks (every commit
+ * that versioned anything under it marks it) and the root's own versions. A person who added a
+ * child and deleted it again, edited a text and put it back, moved a block in or out: kept. What
+ * happened at or below the space's history floor left no marks and is not seen (history before
+ * the conversion is not kept). The live blocks under it now, the root first, to plan the
+ * deletes (null when someone else touched it, or a bound was reached: kept, it cannot tell).
+ * Bounded: {@link SPEC_IMPORT_LIMITS.staleSubtreeBlocks} live blocks read without content, a
+ * level of {@link SPEC_IMPORT_LIMITS.sidLookup} parents at a time; at most
+ * {@link SPEC_IMPORT_LIMITS.staleCommits} commits and
+ * {@link SPEC_IMPORT_LIMITS.staleRootVersions} versions of the root.
  */
 async function onlyImportWrote(
 	space: OutlineSpaceRow,
 	root: StaleBlock,
 ): Promise<StaleNode[] | null> {
 	const limits = SPEC_IMPORT_LIMITS;
-	const seqs = new Set<number>([root.versionSeq]);
-	let versionsRead = 0;
-	const nodes: StaleNode[] = [{ id: root.id, parentId: null }];
+	const state = (await outlineStore.getHistoryStates([space.id])).get(space.id);
+	if (!state?.edgesReady)
+		throw new SpecImportRetry(
+			"The session space's history is being converted: the import goes on once that is done",
+			{ code: "other" },
+		);
+	const nodes: StaleNode[] = [{ id: root.id, parentId: null, versionSeq: root.versionSeq }];
 	let level = [root.id];
 	while (level.length > 0) {
 		const next: string[] = [];
@@ -1572,28 +1802,23 @@ async function onlyImportWrote(
 			);
 			if (nodes.length + children.length > limits.staleSubtreeBlocks) return null;
 			for (const child of children) {
-				// What someone else wrote last: no need to read further.
-				seqs.add(child.versionSeq);
-				nodes.push({ id: child.id, parentId: child.parentId });
+				nodes.push({ id: child.id, parentId: child.parentId, versionSeq: child.versionSeq });
 				next.push(child.id);
 			}
-			if (seqs.size > limits.staleCommits) return null;
 		}
 		level = next;
+		await yieldToEventLoop();
 	}
-	if (!(await allImportCommits(space, seqs))) return null;
-	for (const [n, node] of nodes.entries()) {
-		const versions = await outlineStore.listBlockVersions(
-			node.id,
-			limits.staleVersionsPerBlock + 1,
-		);
-		if (versions.length > limits.staleVersionsPerBlock) return null;
-		versionsRead += versions.length;
-		if (versionsRead > limits.staleVersions) return null;
-		for (const version of versions) seqs.add(version.fromSeq);
-		if (seqs.size > limits.staleCommits) return null;
-		if (n % 200 === 199) await yieldToEventLoop();
-	}
+	const seqs = new Set(
+		await outlineStore.listSubtreeChangeSeqs(space.id, root.id, {
+			limit: limits.staleCommits + 1,
+		}),
+	);
+	if (seqs.size > limits.staleCommits) return null;
+	const own = await outlineStore.listBlockVersions(root.id, limits.staleRootVersions + 1);
+	if (own.length > limits.staleRootVersions) return null;
+	for (const version of own) if (version.fromSeq > state.floorSeq) seqs.add(version.fromSeq);
+	if (seqs.size > limits.staleCommits) return null;
 	return (await allImportCommits(space, seqs)) ? nodes : null;
 }
 

@@ -84,11 +84,13 @@ import {
 	readWaitingTasks,
 	resolvePluginTaskSession,
 	type SessionTask,
+	underBehavior,
 	walkSessionTasks,
 	writeForPlugin,
 } from "./outline/plugin-tasks";
 import { outlineStore } from "./outline/store";
 import type { OutlineSpaceRow, OutlineStore } from "./outline/store/port";
+import { findTasksBlock } from "./outline/well-known";
 import type {
 	OutlineBlockRef,
 	OutlineCanonicalContent,
@@ -360,7 +362,9 @@ export async function writeSpecTasksCompat(args: {
 		const listed = (await readSpecCompatList(session, store)).entries;
 		const normalized = await normalizedTexts(document.tasks.map((t) => t.text));
 		const matches = matchItems(listed, document.tasks, normalized);
-		const [listOwner] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
+		// The task list is the well-known top-level block (A1); one nested somewhere (maybe under
+		// the behavior boundary) is no task list, and nothing new is put there.
+		const listOwner = await findTasksBlock(space.id, store);
 		// A text the list does not hold may still be a task of the task list (a done one the list
 		// left out): it is that task, not a new one (review S4).
 		const entries = [...listed];
@@ -424,8 +428,12 @@ export async function writeSpecTasksCompat(args: {
 
 		const ops: OutlineOp[] = [];
 		let listRef: OutlineBlockRef | null = listOwner ? { id: listOwner.id } : null;
+		const nested =
+			listOwner === null &&
+			(await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS])).length > 0;
 		const taskList = (): OutlineBlockRef => {
 			if (listRef) return listRef;
+			if (nested) throw new PluginTaskError("CONFLICT", PLUGIN_TASK_TEXT.taskListNested);
 			ops.push({
 				op: "insert",
 				tempId: "tasks",
@@ -728,6 +736,10 @@ export async function writeSpecIndexCompat(args: {
 			push({ op: "restore", block: { id: meta.id }, parent: null });
 			indexRef = { id: meta.id };
 		} else {
+			// Under the behavior boundary every line is a rule: a plugin's notes never go there
+			// (a person moved the block; it stays where they put it).
+			if (await underBehavior(store, space.id, meta.id))
+				throw new PluginTaskError("CONFLICT", PLUGIN_TASK_TEXT.indexUnderRules);
 			for (const id of await replacedUnder(store, space, meta))
 				push({ op: "delete", block: { id } });
 			indexRef = { id: meta.id };

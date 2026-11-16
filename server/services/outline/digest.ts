@@ -793,15 +793,26 @@ export interface OutlinePersonContribution {
 export function groupByBlock(facts: readonly KnowledgeFact[]): Map<string, KnowledgeFact[]> {
 	const byId = new Map(facts.map((f) => [f.blockId, f]));
 	const groups = new Map<string, KnowledgeFact[]>();
+	/** The group of each fact found so far: a chain is walked once, whatever hangs from it. */
+	const rootOf = new Map<string, string>();
 	for (const fact of facts) {
+		const path: KnowledgeFact[] = [];
 		let top = fact;
+		let root: string | undefined;
 		// A cycle cannot be (a tree), but the walk is bounded all the same.
-		for (let steps = 0; steps < facts.length; steps++) {
+		for (let steps = 0; steps <= facts.length; steps++) {
+			root = rootOf.get(top.blockId);
+			if (root !== undefined) break;
+			path.push(top);
 			const parent = top.parentId === null ? undefined : byId.get(top.parentId);
-			if (!parent) break;
+			if (!parent) {
+				root = top.parentId ?? top.blockId;
+				break;
+			}
 			top = parent;
 		}
-		const root = top.parentId ?? top.blockId;
+		root ??= top.parentId ?? top.blockId;
+		for (const step of path) rootOf.set(step.blockId, root);
 		const list = groups.get(root);
 		if (list) list.push(fact);
 		else groups.set(root, [fact]);
