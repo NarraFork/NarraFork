@@ -1,6 +1,6 @@
 /**
  * Handing a task out (outline P2 PR 10c-3; design v2 §E.2, owner decision Q2 A): a task of a
- * session's own space is given to the team as a COPY on the task page of the session's main
+ * session's own space is given to the team as a COPY on the task list of the session's main
  * project, and the original stays with the session, waiting on that copy.
  *
  * WHEN (owner decision 2026-11-13, 「能写就原地指派」)
@@ -13,10 +13,11 @@
  *
  * WHAT, IN TWO COMMITS
  * --------------------
- *   1. The copy (one system commit in the project space, actor {@link OUTLINE_HAND_OUT_ACTOR}):
- *      the task and its subtree, breadth first, at most {@link OUTLINE_HAND_OUT_LIMITS.blocks}
- *      blocks with the provenance and {@link OUTLINE_HAND_OUT_LIMITS.bytes} of content, last on
- *      the project's task page (alias `tasks`, made when missing). The copy is to do, managed by
+ *   1. The copy (one system commit in the project space, actor {@link OUTLINE_HAND_OUT_ACTOR},
+ *      made by the general subtree copy, `subtree-copy.ts`): the task and its subtree, breadth
+ *      first, at most {@link OUTLINE_HAND_OUT_LIMITS.blocks} blocks with the provenance and
+ *      {@link OUTLINE_HAND_OUT_LIMITS.bytes} of content, last in the project's task list (alias
+ *      `tasks`, a top-level block made when missing). The copy is to do, managed by
  *      the original session, assigned to whoever it was given to (none for the team, which also
  *      marks it `claimable`). Steps keep their checkbox (one in progress is to do: nobody claims
  *      a copy), their people as assignees when those may write the project (the others are
@@ -61,15 +62,16 @@
  * project (a directory outside any git repository); the writer may not write the project's
  * space; the person or session it is given to could not work there.
  *
- * COST: the task's page structure (one read), the bodies of at most `blocks` blocks within the
- * byte budget, the task page's alias, the original's prerequisites in the project space by sid,
+ * COST: the task's subtree by block (`block-tree.ts`), the bodies of at most `blocks` blocks
+ * within the byte budget, the task list's alias, the original's prerequisites in the project space
+ * by sid,
  * the provenance links to the original (one indexed read). Two commits.
  */
 import { createHash } from "node:crypto";
 import { AppError, ValidationError } from "@server/lib/errors";
 import { getUserLanguage } from "@server/lib/i18n";
 import { logger } from "@server/lib/logger";
-import { type LinkTarget, parseAddress } from "@shared/outline";
+import { parseAddress } from "@shared/outline";
 import type { OutlineBoardHandOutRefusal } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
 import { readNarrator, readSessionWriteFacts, readUserByUsername } from "./access-reads";
@@ -84,20 +86,20 @@ import {
 } from "./errors";
 import { OUTLINE_HAND_OUT_ACTOR, OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
 import { assigneeLabel, OUTLINE_TASKS_LIST_TITLE, oneAtATime } from "./person-tasks";
-import { loadBodiesWithin } from "./read";
 import { canSessionReadSpace } from "./session-scope";
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineSpaceRow, OutlineStore } from "./store/port";
+import { copiedDepends, copyOutlineSubtree } from "./subtree-copy";
 import { isFinishedTask, isOpenTask, isPlanningRoot } from "./task-json";
 import { isClaimLive } from "./tasks";
 import { projectSpaceOrPending, transferProjectOf } from "./transfer";
-import { breadthFirst, type OutlineNode, subtreeNodes } from "./tree";
-import { type OutlineOp, type OutlineTaskInput, writeOutline } from "./write";
+import { subtreeNodes } from "./tree";
+import { type OutlineOp, writeOutline } from "./write";
 
 export { OUTLINE_HAND_OUT_ACTOR };
 
 export const OUTLINE_HAND_OUT_LIMITS = {
-	/** Blocks of one copy, its provenance included (one commit, with the task page if made). */
+	/** Blocks of one copy, its provenance included (one commit, with the task list if made). */
 	blocks: 199,
 	/** UTF-8 bytes of the copied content (one transaction carries 128 KiB). */
 	bytes: 120 * 1024,
@@ -381,162 +383,31 @@ export function assigneeOfTarget(target: OutlineHandOutTarget): string | null {
 // The copy
 // ─────────────────────────────────────────────────────────────────────────────
 
-function utf8(text: string): number {
-	return Buffer.byteLength(text, "utf8");
-}
-
 /**
- * The prerequisites a copied task gets: one that names a block that is copied names its copy;
- * one written bare (resolved in the space it was written in) is written with the session space's
- * key, so it still names what it named; any other is kept.
+ * Step 1: the copy, made by the general subtree copy (`subtree-copy.ts`, the same rules) under
+ * the project's task list (alias `tasks`, made in the same commit when missing), with the hand-out's
+ * own root (to do, managed by the session, assigned to the target) and provenance. The hand-out's
+ * limits keep it to one commit.
  */
-function copiedDepends(
-	depends: readonly LinkTarget[] | undefined,
-	sessionKey: string,
-	copied: { bySid: Map<string, string>; byAlias: Map<string, string> },
-): LinkTarget[] | undefined {
-	if (!depends?.length) return undefined;
-	return depends.map((d) => {
-		const target = d.target.trim();
-		const address = parseAddress(target);
-		const own =
-			address?.space === sessionKey
-				? (copied.bySid.get(address.sid) ?? copied.byAlias.get(address.sid))
-				: !target.includes("/")
-					? (copied.bySid.get(target) ?? copied.byAlias.get(target))
-					: undefined;
-		if (own) return { target: own, label: d.label };
-		if (!target.includes("/")) return { target: `${sessionKey}/${target}`, label: d.label };
-		return { target, label: d.label };
-	});
-}
-
-/**
- * `content` with its links to copied blocks pointing to their copies. Stored content spells a
- * link to `key/sid` exactly `[[key/sid]]` or `[[key/sid|label]]` (`link-display.ts`).
- */
-function copiedContent(content: string, sessionKey: string, bySid: Map<string, string>): string {
-	if (!content.includes(`[[${sessionKey}/`)) return content;
-	let out = content;
-	for (const [sid, copy] of bySid) {
-		out = out
-			.split(`[[${sessionKey}/${sid}]]`)
-			.join(`[[${copy}]]`)
-			.split(`[[${sessionKey}/${sid}|`)
-			.join(`[[${copy}|`);
-	}
-	return out;
-}
-
-/** The task a copied step gets (see the module header). */
-function copiedStep(
-	task: OutlineTaskJson,
-	depends: LinkTarget[] | undefined,
-	people: ReadonlySet<string>,
-): OutlineTaskInput {
-	return {
-		status: task.status === "doing" ? "todo" : task.status,
-		assignee: task.assignee && people.has(task.assignee) ? task.assignee : null,
-		...(depends ? { depends } : {}),
-		...(task.due ? { due: task.due } : {}),
-		manager: null,
-	};
-}
-
-interface CopyPlan {
-	ops: OutlineOp[];
-	sid: string;
-	omitted: number;
-}
-
-/** Of the `human:` assignees given, those whose person may write `space`. */
-async function peopleWhoCanWorkIn(
-	assignees: Iterable<string>,
-	space: OutlineSpaceRow,
-): Promise<Set<string>> {
-	const out = new Set<string>();
-	for (const assignee of new Set(assignees)) {
-		if (!assignee.startsWith("human:")) continue;
-		const user = await readUserByUsername(assignee.slice("human:".length));
-		if (user && (await canWriteSpace({ userId: user.id, isAdmin: false }, space)))
-			out.add(assignee);
-	}
-	return out;
-}
-
-/**
- * The ops of step 1: the task page when missing, the copy and its provenance. `newSid` draws a
- * sid for each copied block (so prerequisites between copied steps can name their copies).
- */
-async function planCopy(args: {
+async function makeCopy(args: {
 	store: OutlineStore;
 	original: OutlineBlockRow;
 	sessionSpace: OutlineSpaceRow;
-	place: OutlineHandOutPlace & { projectSpace: OutlineSpaceRow };
+	projectSpace: OutlineSpaceRow;
+	place: OutlineHandOutPlace;
 	version: number;
 	target: OutlineHandOutTarget;
+	by: OutlineHandOutBy;
 	locale: DelegationLocale;
-	newSid: () => string;
-}): Promise<CopyPlan> {
-	const { store, original, sessionSpace, place, version } = args;
-	const subtree = await readBlockSubtree(original.id, { store });
-	if (!subtree) throw new OutlineHandOutError("changed");
-	// Breadth first, the hand-outs' own notes left out (with what is under them).
-	const order = breadthFirst(subtree.root, "all", Number.MAX_SAFE_INTEGER).filter(
-		(node) => node === subtree.root || !isHandOutBlockId(node.id),
-	);
-	const reachable = new Set<string>([subtree.root.id]);
-	const candidates = order.filter((node) => {
-		if (node === subtree.root) return true;
-		if (!node.parentId || !reachable.has(node.parentId)) return false;
-		reachable.add(node.id);
-		return true;
-	});
-	const room = OUTLINE_HAND_OUT_LIMITS.blocks - 1;
-	const window = candidates.slice(0, room);
-	await loadBodiesWithin(subtree.state, window, OUTLINE_HAND_OUT_LIMITS.bytes, { store });
-	const taken: OutlineNode[] = [];
-	const takenIds = new Set<string>();
-	let bytes = 0;
-	for (const node of window) {
-		if (node.content === null) break;
-		if (node !== subtree.root && !takenIds.has(node.parentId as string)) continue;
-		const size = utf8(node.content);
-		if (bytes + size > OUTLINE_HAND_OUT_LIMITS.bytes) break;
-		bytes += size;
-		taken.push(node);
-		takenIds.add(node.id);
-	}
-	if (taken.length === 0) throw new OutlineHandOutError("changed");
-	const omitted = candidates.length - taken.length;
-
-	const sids = new Map(taken.map((node) => [node.id, args.newSid()]));
-	const projectKey = place.projectSpace.key;
-	const copied = {
-		bySid: new Map(taken.map((node) => [node.sid, `${projectKey}/${sids.get(node.id)}`])),
-		byAlias: new Map(
-			taken.flatMap((node) =>
-				node.alias ? [[node.alias, `${projectKey}/${sids.get(node.id)}`] as const] : [],
-			),
-		),
-	};
-	const ops: OutlineOp[] = [];
-	const [page] = await store.findAliasOwners(place.projectSpace.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-	if (!page) {
-		ops.push({
-			op: "insert",
-			tempId: "page",
-			parent: null,
-			content: OUTLINE_TASKS_LIST_TITLE[args.locale],
-			alias: OUTLINE_TASKS_PAGE_ALIAS,
-		});
-	}
-	const root = subtree.root;
-	const rootTask = root.task as OutlineTaskJson;
+	now?: () => Date;
+}): Promise<{ omitted: number }> {
+	const { store, original, sessionSpace, projectSpace, version } = args;
+	const rootTask = original.taskJson as OutlineTaskJson;
+	const projectKey = projectSpace.key;
 	// An earlier copy of this task that ended is not a prerequisite of the new one.
 	const earlier = new Set(
 		(
-			await store.getBlockMetas(place.projectSpace.id, {
+			await store.getBlockMetas(projectSpace.id, {
 				sids: (rootTask.depends ?? []).flatMap((d) => {
 					const address = parseAddress(d.target);
 					return address?.space === projectKey ? [address.sid] : [];
@@ -546,68 +417,59 @@ async function planCopy(args: {
 			.filter((m) => isHandOutBlockId(m.id) && !isOpenTask(m.taskJson))
 			.map((m) => `${projectKey}/${m.sid}`),
 	);
-	const rootDepends = copiedDepends(
-		rootTask.depends?.filter((d) => !earlier.has(d.target.trim())),
-		sessionSpace.key,
-		copied,
-	);
-	const text = (node: OutlineNode) =>
-		copiedContent(node.content as string, sessionSpace.key, copied.bySid);
-	const people = await peopleWhoCanWorkIn(
-		taken.flatMap((node) =>
-			node !== subtree.root && node.task?.assignee ? [node.task.assignee] : [],
-		),
-		place.projectSpace,
-	);
-	const dropped = taken.filter(
-		(node) =>
-			node !== subtree.root && !!node.task?.assignee && !people.has(node.task.assignee as string),
-	).length;
+	const [list] = await store.findAliasOwners(projectSpace.id, [OUTLINE_TASKS_PAGE_ALIAS]);
 	const assignee = assigneeOfTarget(args.target);
-	ops.push({
-		op: "insert",
-		tempId: `c:${root.id}`,
-		id: handOutBlockId("copy", original.id, version),
-		sid: sids.get(root.id) as string,
-		parent: page ? { id: page.id } : { tempId: "page" },
-		position: { last: true },
-		content: text(root),
-		task: {
-			status: "todo",
-			assignee,
-			...(rootDepends ? { depends: rootDepends } : {}),
-			...(rootTask.due ? { due: rootTask.due } : {}),
-			manager: { kind: "agent", id: place.sessionId },
-			...(rootTask.humanCreated ? { humanCreated: true } : {}),
-			...(args.target.kind === "team" ? { claimable: true } : {}),
-		},
-	});
-	ops.push({
-		op: "insert",
-		id: handOutBlockId("from", original.id, version),
-		parent: { tempId: `c:${root.id}` },
-		position: { first: true },
-		content: HAND_OUT_TEXT[args.locale].from(
-			`${sessionSpace.key}/${original.sid}`,
-			omitted,
-			dropped,
-		),
-	});
-	for (const node of taken) {
-		if (node === root) continue;
-		ops.push({
-			op: "insert",
-			tempId: `c:${node.id}`,
-			sid: sids.get(node.id) as string,
-			parent: { tempId: `c:${node.parentId}` },
+	const result = await copyOutlineSubtree({
+		sourceBlockId: original.id,
+		target: {
+			space: projectSpace,
+			parent: list
+				? { id: list.id }
+				: {
+						create: {
+							content: OUTLINE_TASKS_LIST_TITLE[args.locale],
+							alias: OUTLINE_TASKS_PAGE_ALIAS,
+						},
+					},
 			position: { last: true },
-			content: text(node),
-			task: node.task
-				? copiedStep(node.task, copiedDepends(node.task.depends, sessionSpace.key, copied), people)
-				: null,
-		});
-	}
-	return { ops, sid: sids.get(root.id) as string, omitted };
+		},
+		copyId: `hand-out\u0000${original.id}\u0000${version}`,
+		actor: { kind: "system", id: OUTLINE_HAND_OUT_ACTOR },
+		responsibleUserId:
+			args.by.kind === "person" ? args.by.principal.userId : (args.by.principal?.userId ?? null),
+		// A session's hand-out is written for it; a person's carries no session (its team events
+		// are the person's: they record and never wake).
+		...(args.by.kind === "session" ? { narratorId: args.by.narratorId } : {}),
+		summary: `handed out ${sessionSpace.key}/${original.sid}`,
+		limits: { blocks: OUTLINE_HAND_OUT_LIMITS.blocks, bytes: OUTLINE_HAND_OUT_LIMITS.bytes },
+		// The hand-outs' own notes are left out, with what is under them.
+		skip: (node) => isHandOutBlockId(node.id),
+		rootId: handOutBlockId("copy", original.id, version),
+		rootTask: (task, copied) => {
+			const depends = copiedDepends(
+				task.depends?.filter((d) => !earlier.has(d.target.trim())),
+				copied,
+			);
+			return {
+				status: "todo",
+				assignee,
+				...(depends ? { depends } : {}),
+				...(task.due ? { due: task.due } : {}),
+				manager: { kind: "agent", id: args.place.sessionId },
+				...(task.humanCreated ? { humanCreated: true } : {}),
+				...(args.target.kind === "team" ? { claimable: true } : {}),
+			};
+		},
+		provenance: {
+			id: handOutBlockId("from", original.id, version),
+			text: ({ source, omitted, dropped }) =>
+				HAND_OUT_TEXT[args.locale].from(source, omitted, dropped),
+		},
+		store,
+		...(args.now ? { now: args.now } : {}),
+	});
+	if (!result.done) throw new OutlineHandOutError("changed");
+	return { omitted: result.omitted };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -779,34 +641,19 @@ async function handOutOne(args: Parameters<typeof handOutTask>[0]): Promise<Outl
 		const projectSpace = place.projectSpace.id.startsWith("pending:")
 			? await store.ensureSpace({ kind: "project", projectId: place.projectId }, nowIso)
 			: place.projectSpace;
-		const { newOutlineSid } = await import("./keys");
-		const plan = await planCopy({
+		place.projectSpace = projectSpace;
+		({ omitted } = await makeCopy({
 			store,
 			original,
 			sessionSpace: space,
-			place: { ...place, projectSpace },
+			projectSpace,
+			place,
 			version,
 			target: args.target,
+			by: args.by,
 			locale,
-			newSid: newOutlineSid,
-		});
-		omitted = plan.omitted;
-		place.projectSpace = projectSpace;
-		const responsibleUserId =
-			args.by.kind === "person" ? args.by.principal.userId : (args.by.principal?.userId ?? null);
-		await writeOutline(
-			{
-				spaceId: projectSpace.id,
-				ops: plan.ops,
-				actor: { kind: "system", id: OUTLINE_HAND_OUT_ACTOR },
-				responsibleUserId,
-				// A session's hand-out is written for it; a person's carries no session (its team
-				// events are the person's: they record and never wake).
-				...(args.by.kind === "session" ? { narratorId: args.by.narratorId } : {}),
-				summary: `handed out ${space.key}/${original.sid} as ${projectSpace.key}/${plan.sid}`,
-			},
-			writeOptions,
-		);
+			...(args.now ? { now: args.now } : {}),
+		}));
 		copy = await store.getBlock(copyId);
 		if (!copy) throw new OutlineHandOutError("changed");
 	}
@@ -1159,7 +1006,7 @@ export async function planAgentHandOuts(args: {
 	if (writer)
 		return {
 			refused: [
-				`giving a task of this session's own space to someone who cannot work in it hands it out as a copy to the project's task page, which this turn may not write: ${writer}`,
+				`giving a task of this session's own space to someone who cannot work in it hands it out as a copy to the project's task list, which this turn may not write: ${writer}`,
 			],
 		};
 	const refused: string[] = [];
@@ -1168,7 +1015,7 @@ export async function planAgentHandOuts(args: {
 			await checkHandOutTarget(target, place, { store });
 		} catch (error) {
 			if (error instanceof ValidationError)
-				refused.push(`${error.message} (a copy would go to the project's task page)`);
+				refused.push(`${error.message} (a copy would go to the project's task list)`);
 			else throw error;
 		}
 	}
@@ -1186,7 +1033,7 @@ export async function planAgentHandOuts(args: {
 
 /** Why a hand-out was refused, as an agent is told. */
 export function handOutRefusalText(error: OutlineHandOutError): string {
-	return `giving a task of this session's own space to someone who cannot work in it hands it out as a copy to the project's task page, which is refused here: ${REFUSAL_TEXT[error.reason]}`;
+	return `giving a task of this session's own space to someone who cannot work in it hands it out as a copy to the project's task list, which is refused here: ${REFUSAL_TEXT[error.reason]}`;
 }
 
 /**

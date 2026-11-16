@@ -199,6 +199,7 @@ import {
 import { flushOutlineTaskEdits } from "../services/outline-task-edits";
 import { resolveTaskBackend } from "../services/task-source";
 import { outlineDigestRoutes } from "./outline-digest";
+import { outlineCopyRoutes } from "./outline-copy";
 import { outlineRestoreRoutes } from "./outline-restore";
 import { outlineSubtreeRoutes } from "./outline-subtree";
 
@@ -216,6 +217,8 @@ outlineRoutes.route("/digests", outlineDigestRoutes);
 outlineRoutes.route("/", outlineSubtreeRoutes);
 /** Comparing and restoring subtrees (pageless outline, H3): `routes/outline-restore.ts`. */
 outlineRoutes.route("/", outlineRestoreRoutes);
+/** Copying a subtree, in one space or into another (pageless outline, A2): `routes/outline-copy.ts`. */
+outlineRoutes.route("/", outlineCopyRoutes);
 
 function principalOf(c: Context): OutlinePrincipal {
 	const user = c.get("user");

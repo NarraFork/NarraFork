@@ -29,6 +29,7 @@ import type {
 	OutlineViewStatePutRequest,
 	OutlineViewStateResponse,
 } from "@shared/outline-api";
+import type { OutlineCopyRequest, OutlineCopyResponse } from "@shared/outline-copy-api";
 import type {
 	OutlineDigestDetailResponse,
 	OutlineDigestListResponse,
@@ -434,6 +435,15 @@ export const outlineApi = {
 			method: "POST",
 			body: JSON.stringify(body),
 			...(options.keepalive ? { keepalive: true } : {}),
+		}),
+	/**
+	 * Copy a block and its subtree under a parent of the same space or another (「复制到这里」,
+	 * pageless outline A2). Ask again with the returned `copyId` while `done` is false.
+	 */
+	copyOutlineSubtree: (spaceId: string, blockId: string, body: OutlineCopyRequest) =>
+		request<OutlineCopyResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/copy`, {
+			method: "POST",
+			body: JSON.stringify(body),
 		}),
 	/** The status bar's current task, from the session's task source (either backend). */
 	getNarratorCurrentTask: (narratorId: string) =>
