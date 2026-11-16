@@ -8,8 +8,9 @@
  * (`ResizeObserver`), an undrawn one counts as the estimate, and the rows above and below the
  * window are two spacers.
  *
- * COST: a scroll event is one `getBoundingClientRect` and a binary search over prefix sums;
- * React renders only when the window's first or last row changes. The prefix sums are rebuilt
+ * COST: nothing per scroll event (there is no scroll listener: the two spacers are watched,
+ * and a spacer coming near the viewport is one `getBoundingClientRect` and a binary search
+ * over prefix sums); React renders only when the window's first or last row changes. The prefix sums are rebuilt
  * (one pass, a float per row) when rows change or measurements arrive, batched per frame.
  * The DOM holds the window plus {@link OVERSCAN_PX} on each side, whatever the list's length.
  *
@@ -33,6 +34,9 @@ export interface WindowedRows {
 	visibleEnd: number;
 	/** The list's element: the spacers and the drawn rows are its children. */
 	listRef: (element: HTMLElement | null) => void;
+	/** Refs of the two spacers (always rendered, before and after the drawn rows). */
+	topRef: (element: HTMLElement | null) => void;
+	bottomRef: (element: HTMLElement | null) => void;
 	/** Ref of a drawn row's element (it is measured while mounted). */
 	rowRef: (key: string) => (element: HTMLElement | null) => void;
 	/** Scroll so the row is in the middle of the viewport. */
@@ -112,34 +116,62 @@ export function useWindowedRows(
 		);
 	}, []);
 
-	// Scrolls of anything above the list (scroll events do not bubble: captured at the document),
-	// and the window's size.
+	// When to look again: the two spacers are watched (`IntersectionObserver`) against what
+	// scrolls the list, with a margin of half the overscan. A spacer coming that close means the
+	// drawn rows are about to run out on that side. No scroll listener anywhere: the outline may
+	// be one of several on screen, and nothing under it listens on the window or the document.
+	const spacers = useRef<{ top: HTMLElement | null; bottom: HTMLElement | null }>({
+		top: null,
+		bottom: null,
+	});
+	const watcher = useRef<IntersectionObserver | null>(null);
+	const rearm = useCallback(() => {
+		const io = watcher.current;
+		if (!io) return;
+		// Observing again reports the spacer's state afresh (a callback only fires on a change).
+		for (const spacer of [spacers.current.top, spacers.current.bottom]) {
+			if (!spacer) continue;
+			io.unobserve(spacer);
+			io.observe(spacer);
+		}
+	}, []);
+	// (The list's element arrives with the first rows: the observer is made for it then.)
+	const [mounted, setMounted] = useState<HTMLElement | null>(null);
 	useEffect(() => {
+		const element = mounted;
+		if (!element || typeof IntersectionObserver === "undefined") return;
 		let frame = 0;
-		const schedule = () => {
-			if (frame) return;
-			frame = requestAnimationFrame(() => {
-				frame = 0;
-				update();
-			});
-		};
-		document.addEventListener("scroll", schedule, { capture: true, passive: true });
-		window.addEventListener("resize", schedule);
+		const io = new IntersectionObserver(
+			(entries) => {
+				if (!entries.some((entry) => entry.isIntersecting) || frame) return;
+				frame = requestAnimationFrame(() => {
+					frame = 0;
+					update();
+					rearm();
+				});
+			},
+			{ root: scrollerOf(element), rootMargin: `${OVERSCAN_PX / 2}px 0px` },
+		);
+		watcher.current = io;
+		rearm();
 		return () => {
 			if (frame) cancelAnimationFrame(frame);
-			document.removeEventListener("scroll", schedule, { capture: true });
-			window.removeEventListener("resize", schedule);
+			io.disconnect();
+			watcher.current = null;
 		};
-	}, [update]);
+	}, [mounted, update, rearm]);
 	// Rows changed, or were measured: the window may hold other rows now.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: recomputed with the prefix sums
 	useLayoutEffect(() => {
 		update();
 		// Once more after the browser has laid the new rows out (a list that got shorter moves
 		// the scroll position without a scroll event reaching us first).
-		const frame = requestAnimationFrame(update);
+		const frame = requestAnimationFrame(() => {
+			update();
+			rearm();
+		});
 		return () => cancelAnimationFrame(frame);
-	}, [offsets, update]);
+	}, [offsets, update, rearm]);
 
 	const pending = useRef(0);
 	const observer = useMemo(() => {
@@ -204,9 +236,25 @@ export function useWindowedRows(
 	const listRef = useCallback(
 		(element: HTMLElement | null) => {
 			list.current = element;
+			setMounted(element);
 			if (element) update();
 		},
 		[update],
+	);
+
+	const topRef = useCallback(
+		(element: HTMLElement | null) => {
+			spacers.current.top = element;
+			rearm();
+		},
+		[rearm],
+	);
+	const bottomRef = useCallback(
+		(element: HTMLElement | null) => {
+			spacers.current.bottom = element;
+			rearm();
+		},
+		[rearm],
 	);
 
 	const scrollToIndex = useCallback((index: number) => {
@@ -235,6 +283,8 @@ export function useWindowedRows(
 		visibleStart: range.vs,
 		visibleEnd: range.ve,
 		listRef,
+		topRef,
+		bottomRef,
 		rowRef,
 		scrollToIndex,
 	};

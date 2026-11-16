@@ -45,6 +45,14 @@ beforeEach(() => {
 	questionReads.length = 0;
 });
 const idle = { data: undefined, isLoading: false, isError: false, isSuccess: true };
+// The forest reads over its own requests; here only where the surface mounts it matters.
+const forests: Array<Record<string, unknown>> = [];
+mock.module("./forest/OutlineForest", () => ({
+	OutlineForest: (props: { root: Record<string, unknown> }) => {
+		forests.push(props.root);
+		return <div data-testid="forest-stub" data-root={JSON.stringify(props.root)} />;
+	},
+}));
 mock.module("../../hooks/useOutline", () => ({
 	useOutlineEnabled: () => ({ enabled: true, loading: false }),
 	useOutlineBlock: (...args: unknown[]) => {
@@ -202,7 +210,7 @@ describe("OutlineSurface", () => {
 		expect(html).toContain("The page");
 	});
 
-	test("as of a commit it is the read-only tree, linking through the host's renderer", () => {
+	test("as of a commit it is the forest in read mode, linking through the host's renderer", () => {
 		shown = pageView({ current: false, seq: 2 });
 		const targets: string[] = [];
 		const html = render(
@@ -223,16 +231,24 @@ describe("OutlineSurface", () => {
 			/>,
 		);
 		expect(html).not.toContain("data-editor");
-		expect(html).toContain("Block b");
+		// What is under the block is the forest's, focused on it, as of the commit (its rows link
+		// through the same renderer; `forest/` has its own tests).
+		expect(forests.at(-1)).toEqual({
+			kind: "block",
+			spaceId: "space",
+			blockId: "a",
+			view: "all",
+			asOf: 2,
+		});
+		// A view as of a commit is read only: no way into editing.
+		expect(html).not.toContain("outline-enter-edit");
 		expect(html).toContain("page.asOfBanner");
 		expect(targets).toContain(JSON.stringify({ kind: "home" }));
 		expect(targets).toContain(
 			JSON.stringify({ kind: "block", spaceId: "space", blockId: "page", view: "all", asOf: 2 }),
 		);
-		expect(targets).toContain(
-			JSON.stringify({ kind: "block", spaceId: "space", blockId: "b", view: "all", asOf: 2 }),
-		);
-		expect(reads.at(-1)).toEqual(["space", "a", { asOf: 2, view: "all" }]);
+		// The surface's own read is of the focused block alone.
+		expect(reads.at(-1)).toEqual(["space", "a", { asOf: 2, view: "all", blocks: 1 }]);
 	});
 
 	test.each([

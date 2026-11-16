@@ -586,10 +586,7 @@ function useForest(props: ForestBlocksProps): SpaceForest | null {
 		const made = new SpaceForest({ spaceId, rootId, view, asOf, io, since: readSeen(spaceId) });
 		setForest(made);
 		void made.load();
-		const leave = () => void made.flushFold(true);
-		window.addEventListener("pagehide", leave);
 		return () => {
-			window.removeEventListener("pagehide", leave);
 			// The next visit marks what changed after this one.
 			if (asOf === undefined && made.status === "ready") writeSeen(spaceId, made.knownSeq);
 			made.dispose();
@@ -866,9 +863,9 @@ export function ForestBlocks(props: ForestBlocksProps) {
 			data-forest-rows={rows.length}
 			data-forest-seq={forest.knownSeq}
 		>
-			{win.padTop > 0 && <div style={{ height: win.padTop }} aria-hidden="true" />}
+			<div ref={win.topRef} style={{ height: win.padTop }} aria-hidden="true" />
 			{drawn}
-			{win.padBottom > 0 && <div style={{ height: win.padBottom }} aria-hidden="true" />}
+			<div ref={win.bottomRef} style={{ height: win.padBottom }} aria-hidden="true" />
 		</div>
 	);
 }
