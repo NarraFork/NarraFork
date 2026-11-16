@@ -199,16 +199,33 @@ async function readSkillTextBounded(path: string, maxBytes: number): Promise<str
 	}
 	try {
 		const info = await handle.stat();
-		if (!info.isFile() || info.size > maxBytes) return null;
-		const buffer = new Uint8Array(maxBytes + 1);
+		if (!info.isFile()) return null;
+		const declared = Number(info.size);
+		if (!Number.isSafeInteger(declared) || declared < 0 || declared > maxBytes) {
+			logger.warn("Skill file exceeds the read limit", { path, maxBytes });
+			return null;
+		}
+		// Allocate the declared size, then read one extra byte so a growing file cannot
+		// be parsed from a short snapshot.
+		const buffer = new Uint8Array(declared);
 		let total = 0;
-		while (total < buffer.length) {
-			const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
+		while (total < declared) {
+			const { bytesRead } = await handle.read(buffer, total, declared - total, total);
 			if (!bytesRead) break;
 			total += bytesRead;
 		}
-		if (total > maxBytes) return null;
-		return new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, total));
+		const extra = new Uint8Array(1);
+		const more = await handle.read(extra, 0, 1, declared);
+		if (total !== declared || more.bytesRead > 0) {
+			logger.warn("Skill file changed while it was being read", { path });
+			return null;
+		}
+		try {
+			return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+		} catch {
+			logger.warn("Skill file is not valid UTF-8", { path });
+			return null;
+		}
 	} finally {
 		await handle.close();
 	}
@@ -305,9 +322,9 @@ const MAX_WALK_DEPTH = 5;
 
 /**
  * Recursively walk a directory tree looking for sub-directories that contain a
- * `SKILL.md` file.  When a `SKILL.md` is found the directory is treated as a
- * skill root and we do **not** recurse deeper (nested dirs are companion files,
- * not nested skills).
+ * `SKILL.md` file.  When `SKILL.md` or `SKILL.md.disabled` is present the directory
+ * is a skill root and we do **not** recurse deeper, even if the file cannot be
+ * loaded. Nested dirs are companion files, not nested skills.
  */
 async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): Promise<void> {
 	if (depth > MAX_WALK_DEPTH) return;
@@ -331,21 +348,20 @@ async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): P
 
 		const childDir = join(dir, entry.name);
 		const skillFile = join(childDir, "SKILL.md");
-		const skill = await loadSkillCached(skillFile, childDir);
-		if (skill) {
-			skills.push(skill);
-			// Don't recurse into a skill directory — sub-dirs are companion files
-		} else {
-			// Check for disabled skill (SKILL.md.disabled)
-			const disabledFile = join(childDir, "SKILL.md.disabled");
-			const disabledSkill = await loadSkillCached(disabledFile, childDir, true);
-			if (disabledSkill) {
-				skills.push(disabledSkill);
-			} else {
-				// No SKILL.md here — keep looking deeper
-				await walkForSkills(childDir, skills, depth + 1);
-			}
+		// Presence owns the directory. An oversized, invalid, or non-UTF-8 definition
+		// stays a skill root so companion directories are not discovered as skills.
+		if ((await getMtimeMs(skillFile)) !== null) {
+			const skill = await loadSkillCached(skillFile, childDir);
+			if (skill) skills.push(skill);
+			continue;
 		}
+		const disabledFile = join(childDir, "SKILL.md.disabled");
+		if ((await getMtimeMs(disabledFile)) !== null) {
+			const disabledSkill = await loadSkillCached(disabledFile, childDir, true);
+			if (disabledSkill) skills.push(disabledSkill);
+			continue;
+		}
+		await walkForSkills(childDir, skills, depth + 1);
 	}
 }
 

@@ -912,6 +912,9 @@ function GlobalSkillsTab() {
 		? undefined
 		: (skillsCapability.reason ?? t("globalSkillsUnsupportedDesc"));
 	const canManageGlobalSkills = skillsCapability.supported;
+	const { data: currentUser } = useCurrentUser();
+	// Link import pulls a remote file tree into the instance-wide skills directory.
+	const canLinkGlobalSkills = canManageGlobalSkills && currentUser?.role === "admin";
 	const { data: skills, isLoading } = useGlobalSkills(canManageGlobalSkills);
 	const createMutation = useCreateGlobalSkill();
 	const updateMutation = useUpdateGlobalSkill();
@@ -921,8 +924,8 @@ function GlobalSkillsTab() {
 	const [linkTarget, setLinkTarget] = useState<{ skill?: SkillSummary } | null>(null);
 	const closeLink = useCallback(() => setLinkTarget(null), []);
 	useEffect(() => {
-		if (!canManageGlobalSkills) closeLink();
-	}, [canManageGlobalSkills, closeLink]);
+		if (!canLinkGlobalSkills) closeLink();
+	}, [canLinkGlobalSkills, closeLink]);
 
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
@@ -962,8 +965,9 @@ function GlobalSkillsTab() {
 		setEditContentLoading(false);
 		setEditingSkill(null);
 		setDraft({ name: "", description: "", content: "" });
-		setLinkTarget({});
-	}, [canManageGlobalSkills]);
+		if (canLinkGlobalSkills) setLinkTarget({});
+		else openEdit();
+	}, [canManageGlobalSkills, canLinkGlobalSkills, openEdit]);
 
 	const handleEdit = useCallback(
 		(skill: SkillSummary) => {
@@ -1214,16 +1218,18 @@ function GlobalSkillsTab() {
 									variant="subtle"
 									size="sm"
 									onClick={() => {
-										if (canManageGlobalSkills && skill.canUpdateFromUrl) setLinkTarget({ skill });
+										if (canLinkGlobalSkills && skill.canUpdateFromUrl) setLinkTarget({ skill });
 									}}
-									disabled={!canManageGlobalSkills || !skill.canUpdateFromUrl}
+									disabled={!canLinkGlobalSkills || !skill.canUpdateFromUrl}
 									aria-label={t("updateSkillFromLink")}
 									title={
 										!canManageGlobalSkills
 											? skillsUnsupportedReason
-											: !skill.canUpdateFromUrl
-												? t("skillLinkUpdateUnsupported")
-												: t("updateSkillFromLink")
+											: !canLinkGlobalSkills
+												? t("skillLinkAdminOnly")
+												: !skill.canUpdateFromUrl
+													? t("skillLinkUpdateUnsupported")
+													: t("updateSkillFromLink")
 									}
 								>
 									<IconDownload size={14} />
@@ -1249,13 +1255,18 @@ function GlobalSkillsTab() {
 				opened={linkTarget !== null}
 				onClose={closeLink}
 				skill={linkTarget?.skill}
-				enabled={canManageGlobalSkills}
+				enabled={canLinkGlobalSkills}
 				manualForm={!linkTarget?.skill ? editorForm : undefined}
 				manualPending={createMutation.isPending}
 			/>
 
 			{/* Edit Modal */}
-			<Modal opened={editOpened} onClose={handleCloseEdit} title={t("editSkill")} size="lg">
+			<Modal
+				opened={editOpened}
+				onClose={handleCloseEdit}
+				title={t(editingSkill ? "editSkill" : "createSkill")}
+				size="lg"
+			>
 				{editorForm}
 			</Modal>
 

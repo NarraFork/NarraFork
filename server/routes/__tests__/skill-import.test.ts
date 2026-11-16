@@ -14,6 +14,7 @@ import { skillRoutes } from "../skills";
 const owner = generateId();
 const reader = generateId();
 const outsider = generateId();
+const admin = generateId();
 const projectId = generateId();
 const url = "https://github.com/example/skills/tree/main";
 const sha = "a".repeat(40);
@@ -71,12 +72,12 @@ function networkFixture(name: string) {
 beforeAll(async () => {
 	projectPath = await mkdtemp(join(getNarraforkHome(), "import-routes-"));
 	const now = new Date().toISOString();
-	for (const id of [owner, reader, outsider]) {
+	for (const id of [owner, reader, outsider, admin]) {
 		await db.insert(users).values({
 			id,
 			username: `import-${id}`,
 			passwordHash: "unused",
-			role: "user",
+			role: id === admin ? "admin" : "user",
 			createdAt: now,
 		});
 	}
@@ -105,7 +106,7 @@ afterEach(() => setOutboundFetchOverrideForTest(null));
 afterAll(async () => {
 	await db.delete(aclGrants).where(eq(aclGrants.scopeId, projectId));
 	await db.delete(projects).where(eq(projects.id, projectId));
-	for (const id of [owner, reader, outsider]) await db.delete(users).where(eq(users.id, id));
+	for (const id of [owner, reader, outsider, admin]) await db.delete(users).where(eq(users.id, id));
 	for (const path of [projectPath, ...globalPaths])
 		await rm(path, { recursive: true, force: true });
 });
@@ -114,6 +115,8 @@ describe("skill import routes", () => {
 	test("authentication and write authorization fail before outbound requests", async () => {
 		networkFixture("unauthorized");
 		expect((await request("/global/import")).status).toBe(401);
+		expect((await request("/global/import", outsider)).status).toBe(403);
+		expect((await request("/global/test/update-from-url", outsider)).status).toBe(403);
 		expect((await request(`/import?projectId=${projectId}`)).status).toBe(401);
 		expect((await request(`/import?projectId=${projectId}`, outsider)).status).toBe(404);
 		expect((await request(`/import?projectId=${projectId}`, reader)).status).toBe(404);
@@ -126,8 +129,8 @@ describe("skill import routes", () => {
 			expect((await request(`/import?projectId=${projectId}`, owner, body)).status).toBe(400);
 		}
 		expect((await request("/import", owner)).status).toBe(400);
-		expect((await request("/global/import", owner, { url: "x".repeat(9000) })).status).toBe(413);
-		const invalid = await appAs(owner).request("http://localhost/skills/global/import", {
+		expect((await request("/global/import", admin, { url: "x".repeat(9000) })).status).toBe(413);
+		const invalid = await appAs(admin).request("http://localhost/skills/global/import", {
 			method: "POST",
 			body: "{",
 			headers: { "content-type": "application/json" },
@@ -147,7 +150,7 @@ describe("skill import routes", () => {
 				cancelled = true;
 			},
 		});
-		const response = await appAs(owner).request("http://localhost/skills/global/import", {
+		const response = await appAs(admin).request("http://localhost/skills/global/import", {
 			method: "POST",
 			body,
 			headers: { "content-length": "2", "content-type": "application/json" },
@@ -175,7 +178,7 @@ describe("skill import routes", () => {
 			return original(fn, ms === 5_000 ? 10 : ms, ...rest);
 		}) as typeof setTimeout);
 		try {
-			const response = await appAs(owner).request("http://localhost/skills/global/import", {
+			const response = await appAs(admin).request("http://localhost/skills/global/import", {
 				method: "POST",
 				body,
 				headers: { "content-type": "application/json" },
@@ -204,13 +207,15 @@ describe("skill import routes", () => {
 		expect(await readFile(skill.location, "utf8")).toBe(raw);
 	});
 
-	test("global import keeps the existing authenticated-user policy (no admin requirement)", async () => {
+	test("global import requires an administrator and does not download for other users", async () => {
 		const name = `route-global-${generateId()
 			.replace(/[^a-z0-9]/gi, "")
 			.toLowerCase()}`;
 		networkFixture(name);
 		globalPaths.push(join(getNarraforkHome(), "skills", name));
-		const response = await request("/global/import", outsider);
+		expect((await request("/global/import", outsider)).status).toBe(403);
+		expect(networkCalls).toBe(0);
+		const response = await request("/global/import", admin);
 		expect(response.status).toBe(201);
 		expect(((await response.json()) as { name: string }).name).toBe(name);
 		expect(networkCalls).toBeGreaterThan(0);
@@ -239,7 +244,7 @@ describe("update skill from URL routes", () => {
 			).toBe(400);
 		}
 		expect(
-			(await request("/global/test/update-from-url", owner, { url: "x".repeat(9000) })).status,
+			(await request("/global/test/update-from-url", admin, { url: "x".repeat(9000) })).status,
 		).toBe(413);
 		expect(networkCalls).toBe(0);
 	});
@@ -258,14 +263,17 @@ describe("update skill from URL routes", () => {
 		expect(((await response.json()) as { name: string }).name).toBe(name);
 	});
 
-	test("global URL updates preserve the existing non-admin policy", async () => {
+	test("global URL updates require an administrator", async () => {
 		const name = `global-url-${generateId()
 			.replace(/[^a-z0-9]/gi, "")
 			.toLowerCase()}`;
 		globalPaths.push(join(getNarraforkHome(), "skills", name));
 		networkFixture(name);
-		expect((await request("/global/import", outsider)).status).toBe(201);
-		const response = await request(`/global/${name}/update-from-url`, outsider);
+		expect((await request("/global/import", admin)).status).toBe(201);
+		networkFixture(name);
+		expect((await request(`/global/${name}/update-from-url`, outsider)).status).toBe(403);
+		expect(networkCalls).toBe(0);
+		const response = await request(`/global/${name}/update-from-url`, admin);
 		expect(response.status).toBe(200);
 		expect(((await response.json()) as { name: string }).name).toBe(name);
 	});

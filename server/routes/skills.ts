@@ -6,7 +6,7 @@ import {
 	importSkillSchema,
 	updateProjectSkillSchema,
 } from "../lib/validators";
-import { requireAuth } from "../middleware/auth";
+import { requireAdmin, requireAuth } from "../middleware/auth";
 import { skillService } from "../services/skill-service";
 
 export const skillRoutes = new Hono();
@@ -87,7 +87,8 @@ async function readImportUrl(c: Context): Promise<string> {
 }
 
 // Keep literal import endpoints before the name routes. Authorization always precedes downloads.
-skillRoutes.post("/global/import", async (c) => {
+// Global link import writes a remote file tree into the instance-wide skills directory.
+skillRoutes.post("/global/import", requireAdmin, async (c) => {
 	const url = await readImportUrl(c);
 	const skill = await skillService.importGlobalSkill(url, c.req.raw.signal);
 	return c.json(skill, 201);
@@ -100,7 +101,7 @@ skillRoutes.post("/import", async (c) => {
 	return c.json(skill, 201);
 });
 
-skillRoutes.post("/global/:name/update-from-url", async (c) => {
+skillRoutes.post("/global/:name/update-from-url", requireAdmin, async (c) => {
 	const url = await readImportUrl(c);
 	return c.json(
 		await skillService.updateGlobalSkillFromUrl(c.req.param("name"), url, c.req.raw.signal),

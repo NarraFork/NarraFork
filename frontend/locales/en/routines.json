@@ -45,6 +45,7 @@
 	"skillLinkError": "Could not apply the skill link. Check the URL and try again.",
 	"skillLinkUpdateUnsupported": "Only non-symlink skill directories managed in this scope's .narrafork/skills can be updated from a link. Skills from .claude, .agents, or another scope cannot be updated here.",
 	"skillLinkManagementUnavailable": "Skill management is unavailable in this scope.",
+	"skillLinkAdminOnly": "Only an administrator can create or update global skills from a link.",
 	"editSkill": "Edit Skill",
 	"deleteSkill": "Delete",
 	"viewSkill": "View",

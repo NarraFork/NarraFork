@@ -45,6 +45,7 @@
 	"skillLinkError": "无法应用技能链接，请检查链接后重试。",
 	"skillLinkUpdateUnsupported": "仅支持通过链接更新当前范围内 .narrafork/skills 中可管理的非符号链接技能目录；无法在此更新来自 .claude、.agents 或其他范围的技能。",
 	"skillLinkManagementUnavailable": "当前范围无法管理技能。",
+	"skillLinkAdminOnly": "只有管理员可以通过链接创建或更新全局技能。",
 	"editSkill": "编辑技能",
 	"deleteSkill": "删除",
 	"viewSkill": "查看",
