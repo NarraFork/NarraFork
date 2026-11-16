@@ -689,6 +689,29 @@ describe("the behavior boundary, by ancestry", () => {
 		expect(granted.commit).not.toBeNull();
 	});
 
+	test("a rule deleted with its parent is still under it: restoring it anywhere needs the grant", async () => {
+		const w = await sessionWorld();
+		// A person deletes r1; r2 and r3 go with it.
+		await humanWrite(w.space, w.alice, [{ op: "delete", block: { id: w.id("r1") } }]);
+		// The agent restores r2 out to Notes: it last lived under the boundary.
+		await refused(
+			agentWrite(w, [{ op: "restore", block: { id: w.id("r2") }, parent: { id: w.id("n") } }]),
+		);
+		// Restoring r1 back to its place is writing the boundary as well.
+		await refused(agentWrite(w, [{ op: "restore", block: { id: w.id("r1") } }]));
+		// With the grant both are ordinary writes.
+		const restored = await agentWrite(
+			w,
+			[{ op: "restore", block: { id: w.id("r2") }, parent: { id: w.id("n") } }],
+			true,
+		);
+		expect(restored.commit).not.toBeNull();
+		// A block deleted from outside it is restored freely.
+		await humanWrite(w.space, w.alice, [{ op: "delete", block: { id: w.id("n1") } }]);
+		const free = await agentWrite(w, [{ op: "restore", block: { id: w.id("n1") } }]);
+		expect(free.commit).not.toBeNull();
+	});
+
 	test("what is not under it is written freely, and asks for no grant", async () => {
 		const w = await sessionWorld();
 		let asked = 0;

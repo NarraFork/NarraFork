@@ -2748,15 +2748,33 @@ class OutlinePlanner {
 			const was = block.base?.parentId ?? null;
 			if (was !== null) starts.add(was);
 		}
+		// Where each stored block sits: live blocks by the walk up; a deleted one (a restore of
+		// a block deleted with its parent starts below a deleted chain) by its own row, which
+		// keeps the parent it was deleted from, and the walk goes on from that parent. A block
+		// that last lived under the boundary is under it, as the page it was on said before.
 		const stored = new Map<string, string | null>();
-		if (starts.size > 0) {
+		let pending = new Set(starts);
+		let rows = 0;
+		for (let round = 0; pending.size > 0; round++) {
+			if (round > OUTLINE_LIMITS.maxDepth + 1) return true;
 			const walk = await this.store.listAncestryOf(
 				this.space.id,
-				[...starts],
-				OUTLINE_BEHAVIOR_WALK_ROWS,
+				[...pending],
+				OUTLINE_BEHAVIOR_WALK_ROWS - rows,
 			);
 			if (walk.truncated) return true;
+			rows += walk.rows.length;
 			for (const row of walk.rows) stored.set(row.id, row.parentId);
+			const missing = [...pending].filter((id) => !stored.has(id));
+			pending = new Set();
+			if (missing.length === 0) break;
+			rows += missing.length;
+			if (rows > OUTLINE_BEHAVIOR_WALK_ROWS) return true;
+			for (const meta of await this.store.getBlockMetasByIds(missing)) {
+				if (meta.spaceId !== this.space.id || !meta.deleted) continue;
+				stored.set(meta.id, meta.parentId);
+				if (meta.parentId !== null && !stored.has(meta.parentId)) pending.add(meta.parentId);
+			}
 		}
 		const reaches = (from: string | null, next: (id: string) => string | null): boolean => {
 			let id = from;
