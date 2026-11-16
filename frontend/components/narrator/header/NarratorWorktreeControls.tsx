@@ -24,7 +24,6 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { notifications } from "@mantine/notifications";
 import { IconGitFork, IconSwitchHorizontal, IconTrash } from "@tabler/icons-react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { nanoid } from "nanoid";
@@ -263,6 +262,8 @@ function ScopedWorktreeControls({
 	const [menuOpened, setMenuOpened] = useState(false);
 	// Removal is a second modal on top of the list: the row stays where the user found it.
 	const [removalPath, setRemovalPath] = useState<string | null>(null);
+	// The list modal stays open behind the confirmation, so the outcome belongs there.
+	const [removalNotice, setRemovalNotice] = useState<string>();
 	const [search, setSearch] = useState("");
 	const [sort, setSort] = useState<WorktreeSort>("lastCommitAt");
 	const [descending, setDescending] = useState(true);
@@ -451,6 +452,8 @@ function ScopedWorktreeControls({
 						onClick={() => {
 							setSearch("");
 							setMenuOpened(true);
+							// A new visit starts clean; the previous outcome belonged to another row.
+							setRemovalNotice(undefined);
 							// Reopening refreshes from page one, never replaying all saved cursors.
 							if (canList && debouncedSearch === "" && !worktrees.isFetching && !cursorExpired)
 								void queryClient.resetQueries({ queryKey: listKey, exact: true });
@@ -688,6 +691,7 @@ function ScopedWorktreeControls({
 						</ScrollArea.Autosize>
 						{firstPage?.truncated && <Alert color="yellow">{t("worktree.listTruncated")}</Alert>}
 						{switchError && <Alert color="red">{switchError}</Alert>}
+						{removalNotice && <Alert color="green">{removalNotice}</Alert>}
 					</Stack>
 				</Modal>
 			</Group>
@@ -840,15 +844,13 @@ function ScopedWorktreeControls({
 					void queryClient.invalidateQueries({ queryKey: ["narratorWorktrees"] });
 					// The requesting session may itself have been moved out of the checkout.
 					void queryClient.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
-					notifications.show({
-						color: result.outcome === "removed" ? "green" : "yellow",
-						message:
-							result.outcome === "removed"
-								? result.relocatedTo
-									? t("worktree.removeSuccessRelocated", { path: result.relocatedTo })
-									: t("worktree.removeSuccess")
-								: t("worktree.removeAlreadyAbsent"),
-					});
+					setRemovalNotice(
+						result.outcome === "removed"
+							? result.relocatedTo
+								? t("worktree.removeSuccessRelocated", { path: result.relocatedTo })
+								: t("worktree.removeSuccess")
+							: t("worktree.removeAlreadyAbsent"),
+					);
 				}}
 			/>
 		</>

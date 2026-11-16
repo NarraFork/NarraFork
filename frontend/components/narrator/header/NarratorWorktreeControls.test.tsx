@@ -127,8 +127,6 @@ mock.module("@tanstack/react-query", () => ({
 	},
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
-const shown = mock((_notification: unknown) => {});
-mock.module("@mantine/notifications", () => ({ notifications: { show: shown } }));
 type Children = { children?: ReactNode };
 const Wrapper = ({ children }: Children) => <div>{children}</div>;
 mock.module("@mantine/core", () => {
