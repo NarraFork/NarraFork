@@ -32,6 +32,52 @@ export function useCreateProjectSkill(projectId: string) {
 	});
 }
 
+export function useImportProjectSkill(projectId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: async ({ url, signal }: { url: string; signal?: AbortSignal }) => {
+			signal?.throwIfAborted();
+			const result = await api.importProjectSkill(projectId, { url }, signal);
+			signal?.throwIfAborted();
+			return result;
+		},
+		meta: { suppressErrorToast: true },
+		retry: false,
+		onSuccess: (data, { signal }) => {
+			if (signal?.aborted) return;
+			qc.invalidateQueries({ queryKey: ["skills", projectId], exact: true });
+			qc.invalidateQueries({ queryKey: ["skill", projectId, data.name], exact: true });
+		},
+	});
+}
+
+export function useUpdateProjectSkillFromUrl(projectId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: async ({
+			name,
+			url,
+			signal,
+		}: {
+			name: string;
+			url: string;
+			signal?: AbortSignal;
+		}) => {
+			signal?.throwIfAborted();
+			const result = await api.updateProjectSkillFromUrl(projectId, name, { url }, signal);
+			signal?.throwIfAborted();
+			return result;
+		},
+		meta: { suppressErrorToast: true },
+		retry: false,
+		onSuccess: (_data, { name, signal }) => {
+			if (signal?.aborted) return;
+			qc.invalidateQueries({ queryKey: ["skills", projectId], exact: true });
+			qc.invalidateQueries({ queryKey: ["skill", projectId, name], exact: true });
+		},
+	});
+}
+
 export function useUpdateProjectSkill(projectId: string) {
 	const qc = useQueryClient();
 	return useMutation({
@@ -99,6 +145,52 @@ export function useCreateGlobalSkill() {
 			api.createGlobalSkill(data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["global-skills"] });
+		},
+	});
+}
+
+export function useImportGlobalSkill() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: async ({ url, signal }: { url: string; signal?: AbortSignal }) => {
+			signal?.throwIfAborted();
+			const result = await api.importGlobalSkill({ url }, signal);
+			signal?.throwIfAborted();
+			return result;
+		},
+		meta: { suppressErrorToast: true },
+		retry: false,
+		onSuccess: (data, { signal }) => {
+			if (signal?.aborted) return;
+			qc.invalidateQueries({ queryKey: ["global-skills"], exact: true });
+			qc.invalidateQueries({ queryKey: ["global-skill", data.name], exact: true });
+		},
+	});
+}
+
+export function useUpdateGlobalSkillFromUrl() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: async ({
+			name,
+			url,
+			signal,
+		}: {
+			name: string;
+			url: string;
+			signal?: AbortSignal;
+		}) => {
+			signal?.throwIfAborted();
+			const result = await api.updateGlobalSkillFromUrl(name, { url }, signal);
+			signal?.throwIfAborted();
+			return result;
+		},
+		meta: { suppressErrorToast: true },
+		retry: false,
+		onSuccess: (_data, { name, signal }) => {
+			if (signal?.aborted) return;
+			qc.invalidateQueries({ queryKey: ["global-skills"], exact: true });
+			qc.invalidateQueries({ queryKey: ["global-skill", name], exact: true });
 		},
 	});
 }
