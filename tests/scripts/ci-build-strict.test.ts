@@ -6,6 +6,7 @@ import {
 	readFileSync,
 	rmSync,
 	symlinkSync,
+	truncateSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -21,6 +22,7 @@ import {
 	writeBuildAggregates,
 } from "../../scripts/lib/ci-build-strict";
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../../shared/update-identity";
 
 const dirs: string[] = [];
@@ -221,6 +223,19 @@ describe("strict CI builds fail closed without compiling or publishing", () => {
 		rmSync(path);
 		symlinkSync(`${path}.metadata.json`, path);
 		await expect(computeCiBinaryMetadata(path, input)).rejects.toThrow("Invalid release");
+	});
+	test("metadata descriptors allow above 1GiB through 4GiB, but not one byte more", async () => {
+		const path = join(temp(), platform.name);
+		writeFileSync(path, "fixture executable");
+		const metadata = await computeCiBinaryMetadata(path, input);
+		expect(MAX_RELEASE_BINARY_BYTES).toBe(4 * 1024 ** 3);
+		for (const size of [1024 ** 3 + 1, MAX_RELEASE_BINARY_BYTES])
+			expect(() => validateCiMetadata({ ...metadata, size }, identity)).not.toThrow();
+		expect(() =>
+			validateCiMetadata({ ...metadata, size: MAX_RELEASE_BINARY_BYTES + 1 }, identity),
+		).toThrow("metadata");
+		truncateSync(path, MAX_RELEASE_BINARY_BYTES + 1);
+		await expect(computeCiBinaryMetadata(path, input)).rejects.toThrow("Invalid release binary");
 	});
 	test("aggregation failure propagates, and valid checksums reflect final bytes", async () => {
 		const dir = temp();

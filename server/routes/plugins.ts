@@ -523,8 +523,30 @@ function sanitizeSummary(value: unknown): RouteResult {
 				if (names.length > 0) result.manifest = { permissions: { host: names } };
 			}
 		}
+		// Whether the plugin paints over the whole app: the install flow tells the admin,
+		// because unlike a dock panel nobody has to add it — it shows for every user.
+		if (manifestDeclaresOverlay(manifest)) {
+			result.manifest = {
+				...((result.manifest as Record<string, unknown> | undefined) ?? {}),
+				overlay: true,
+			};
+		}
 	}
 	return result;
+}
+
+function manifestDeclaresOverlay(manifest: Record<string, unknown>): boolean {
+	const contributes = manifest.contributes;
+	if (!contributes || typeof contributes !== "object" || Array.isArray(contributes)) return false;
+	const views = (contributes as Record<string, unknown>).views;
+	if (!Array.isArray(views)) return false;
+	return views.some(
+		(view) =>
+			view !== null &&
+			typeof view === "object" &&
+			Array.isArray((view as Record<string, unknown>).surfaces) &&
+			((view as Record<string, unknown>).surfaces as unknown[]).includes("overlay"),
+	);
 }
 
 function sanitizePermissionSet(value: unknown): RouteResult {

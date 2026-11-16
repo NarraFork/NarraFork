@@ -50,7 +50,12 @@ function createNodePathSemantics(flavor: "posix" | "windows"): TargetPathSemanti
 			const np = flavor === "windows" ? normalize(parent).toLowerCase() : normalize(parent);
 			const nc = flavor === "windows" ? normalize(child).toLowerCase() : normalize(child);
 			const relative = pathImpl.relative(np, nc);
-			return relative === "" || (!relative.startsWith("..") && !pathImpl.isAbsolute(relative));
+			return (
+				relative === "" ||
+				(relative !== ".." &&
+					!relative.startsWith(`..${pathImpl.sep}`) &&
+					!pathImpl.isAbsolute(relative))
+			);
 		},
 		identityKey,
 	});
@@ -93,7 +98,10 @@ export const specPathSemantics: TargetPathSemantics = Object.freeze({
 	equals: (left: string, right: string) => normalizeSpecPath(left) === normalizeSpecPath(right),
 	contains(parent: string, child: string): boolean {
 		const relative = this.relative(parent, child);
-		return relative === "" || (!relative.startsWith("..") && !posix.isAbsolute(relative));
+		return (
+			relative === "" ||
+			(relative !== ".." && !relative.startsWith("../") && !posix.isAbsolute(relative))
+		);
 	},
 	identityKey: normalizeSpecPath,
 });

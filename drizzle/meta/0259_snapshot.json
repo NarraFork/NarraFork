@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7cebf1d6-7f7f-4e3b-8c46-a3fa3b661d6d",
-  "prevId": "bf3f4a25-8744-4019-8538-3b1da8b88a8e",
+  "id": "890a65d7-3e67-402a-9157-d2ad27d11aaa",
+  "prevId": "24665056-4085-4b5f-9b98-bfe68cafd4cb",
   "tables": {
     "acl_events": {
       "name": "acl_events",
@@ -15210,6 +15210,117 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
+    "outline_fold_state": {
+      "name": "outline_fold_state",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "space_id": {
+          "name": "space_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "block_id": {
+          "name": "block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "open": {
+          "name": "open",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_outline_fold_state_written": {
+          "name": "idx_outline_fold_state_written",
+          "columns": [
+            "user_id",
+            "space_id",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "idx_outline_fold_state_block": {
+          "name": "idx_outline_fold_state_block",
+          "columns": [
+            "block_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "outline_fold_state_user_id_users_id_fk": {
+          "name": "outline_fold_state_user_id_users_id_fk",
+          "tableFrom": "outline_fold_state",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "outline_fold_state_space_id_outline_spaces_id_fk": {
+          "name": "outline_fold_state_space_id_outline_spaces_id_fk",
+          "tableFrom": "outline_fold_state",
+          "tableTo": "outline_spaces",
+          "columnsFrom": [
+            "space_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "outline_fold_state_block_id_outline_blocks_id_fk": {
+          "name": "outline_fold_state_block_id_outline_blocks_id_fk",
+          "tableFrom": "outline_fold_state",
+          "tableTo": "outline_blocks",
+          "columnsFrom": [
+            "block_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "outline_fold_state_user_id_space_id_block_id_pk": {
+          "columns": [
+            "user_id",
+            "space_id",
+            "block_id"
+          ],
+          "name": "outline_fold_state_user_id_space_id_block_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "outline_links": {
       "name": "outline_links",
       "columns": {
@@ -21084,6 +21195,14 @@
           "autoincrement": false,
           "default": true
         },
+        "appearance_preferences": {
+          "name": "appearance_preferences",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'{}'"
+        },
         "terminal_theme": {
           "name": "terminal_theme",
           "type": "text",
@@ -21385,6 +21504,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'{}'"
+        },
+        "hidden_plugin_overlays": {
+          "name": "hidden_plugin_overlays",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'[]'"
         },
         "traits": {
           "name": "traits",

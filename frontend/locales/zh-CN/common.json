@@ -443,7 +443,7 @@
 	"updateDeltaFallback": "已切换为全量下载。",
 	"updateSourceChanged": "更新配置已变更，请重新检查。",
 	"updateMirrorPromptTitle": "是否切换到官方更新服务器？",
-	"updateMirrorPromptDescription": "首次检查更新时，NarraFork 服务器连接 GitHub 失败、超时或受到限流。是否切换到官方更新服务器以改善更新检查和增量补丁下载？完整更新包仍可能需要连接 GitHub。仅在您确认后更改设置，不会自动安装或重启。",
+	"updateMirrorPromptDescription": "首次检查更新时，NarraFork 服务器连接 GitHub 失败、超时或受到限流。是否切换到官方更新服务器？切换后更新检查、增量补丁及完整更新包均只走所选服务器，不会访问或回退 GitHub。仅在您确认后更改设置，不会自动安装或重启。",
 	"updateMirrorKeepGithub": "保持 GitHub",
 	"updateMirrorSwitch": "切换到官方更新服务器",
 	"updateMirrorSwitchFailed": "切换更新服务器失败，请重试或前往服务器设置手动切换。",

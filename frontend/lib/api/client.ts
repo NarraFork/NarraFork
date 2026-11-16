@@ -60,7 +60,12 @@ function notifyTokenChange(token: string | null): void {
 }
 
 export function getToken(): string | null {
-	return localStorage.getItem(TOKEN_KEY);
+	try {
+		return typeof localStorage === "undefined" ? null : localStorage.getItem(TOKEN_KEY);
+	} catch {
+		// Storage can be unavailable in embedded/private contexts and pre-rendered consumers.
+		return null;
+	}
 }
 
 export function setToken(token: string): void {

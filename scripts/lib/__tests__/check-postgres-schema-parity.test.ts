@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 148 tables and 1939 columns including the outline's fold state", () => {
+	test("covers 148 tables and 1941 columns including the outline's fold state", () => {
 		expect(target.tables.length).toBe(148);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -569,11 +569,23 @@ describe("real schema parity", () => {
 		// Cache hit rate eligibility adds api_requests.cache_usage_reported (nullable).
 		// The swallowed-content scan (outline P2 PR 12c) adds outline_spec_loss_findings (21) and
 		// outline_spec_loss_scans (6).
+		// Account appearance preferences add one bounded JSON text column.
+		// Per-user plugin overlay visibility adds user_preferences.hidden_plugin_overlays.
 		// The pageless outline's history (H1) adds outline_block_edges (5), outline_subtree_changes
 		// (2), outline_spaces.history_floor_seq and outline_spaces.edges_ready.
 		// One live session per space (L2) adds outline_live_log (7).
 		// A reader's own folding by block (pageless F1) adds outline_fold_state (5).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1939);
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1941);
+		expect(
+			target.tables
+				.find((table) => table.name === "user_preferences")
+				?.columns.find((column) => column.property === "appearancePreferences"),
+		).toMatchObject({
+			name: "appearance_preferences",
+			pgType: "text",
+			notNull: true,
+			defaultExpression: '"{}"',
+		});
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({

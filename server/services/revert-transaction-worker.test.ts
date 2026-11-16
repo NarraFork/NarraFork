@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { on } from "node:events";
-import { watch } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -234,6 +233,42 @@ describe("revert manifest worker lifecycle", () => {
 	test("real source worker acknowledges readiness before comparing", async () => {
 		(await settled(runRevertManifestWorker<boolean>(request, signal()))).value.toBe(true);
 		expect(warn).not.toHaveBeenCalled();
+	});
+	test("compare ignores only narrator version numbers and retains every structural field", async () => {
+		const fixed = {
+			metadataDigest: "fixed",
+			messageVersions: [{ narratorId: "root", messageVersion: 7 }],
+			history: { messages: [{ id: "selected", contentDigest: "body" }] },
+			boundary: { messageId: "selected", contentDigest: "body" },
+			tools: [{ id: "tool", executionAttempt: 1 }],
+		} as unknown as RevertSelectionResult;
+		const current = structuredClone(fixed);
+		current.messageVersions[0].messageVersion++;
+		expect(await runRevertManifestWorker({ action: "compare", fixed, current }, signal())).toBe(
+			true,
+		);
+		for (const mutate of [
+			(value: RevertSelectionResult) => {
+				value.messageVersions[0].narratorId = "other";
+			},
+			(value: RevertSelectionResult) => {
+				value.history.messages[0].contentDigest = "changed";
+			},
+			(value: RevertSelectionResult) => {
+				if (value.boundary) value.boundary.contentDigest = "changed";
+			},
+			(value: RevertSelectionResult) => {
+				value.tools[0].executionAttempt++;
+			},
+		]) {
+			const changed = structuredClone(current);
+			mutate(changed);
+			const error = await runRevertManifestWorker(
+				{ action: "compare", fixed, current: changed },
+				signal(),
+			).catch((error) => error);
+			expect(error).toMatchObject({ code: "REVERT_TRANSACTION_SELECTION_STALE" });
+		}
 	});
 	test("timing logs retain pool, RPC and SQL parent correlation without the request body", async () => {
 		const specifier = await fixture(
@@ -577,14 +612,29 @@ ${ready}`,
 	test("cancellation after dispatch terminates without retrying", async () => {
 		const marker = join(root, "executions");
 		const controller = new AbortController();
-		const watcher = watch(root, (_event, name) => {
-			if (name === "executions") controller.abort();
+		const emit = Worker.prototype.emit;
+		// Observe the real thread's completed side effect, without requiring an OS
+		// filesystem watcher. Consume only this fixture's test-only acknowledgement.
+		const messages = spyOn(Worker.prototype, "emit").mockImplementation(function (
+			this: Worker,
+			event: string | symbol,
+			...args: unknown[]
+		) {
+			if (event === "message" && (args[0] as { type?: unknown })?.type === "test-dispatched") {
+				controller.abort();
+				return true;
+			}
+			return Reflect.apply(emit, this, [event, ...args]);
 		});
 		try {
 			const specifier = await fixture(
 				"cancel-after-dispatch",
 				`import { appendFileSync } from "node:fs";
-parentPort.on("message", () => appendFileSync(${JSON.stringify(marker)}, "x"));
+parentPort.on("message", (packet) => {
+  if (!packet.requestId || !packet.request) return;
+  appendFileSync(${JSON.stringify(marker)}, "x");
+  parentPort.postMessage({ type: "test-dispatched" });
+});
 ${ready}`,
 			);
 			(
@@ -599,7 +649,7 @@ ${ready}`,
 			expect(create).toHaveBeenCalledTimes(1);
 			expect(warn).not.toHaveBeenCalled();
 		} finally {
-			watcher.close();
+			messages.mockRestore();
 		}
 	});
 });

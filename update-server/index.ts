@@ -5,6 +5,7 @@
  *   bun update-server/index.ts [--config=path] [--port=7780]
  */
 import { resolve } from "node:path";
+import { MAX_MIRROR_MAIN_BINARY_BYTES } from "../shared/independent-update-mirror";
 import { createApp } from "./app";
 import { getConfig, initConfig } from "./lib/config";
 import { logger } from "./lib/logger";
@@ -60,10 +61,20 @@ const app = createApp(storage, ingest);
 const server = Bun.serve({
 	port,
 	hostname: host,
-	// Raw mirror patch admission; each authenticated stream independently enforces its exact size.
-	maxRequestBodySize: 512 * 1024 * 1024,
+	// Exact per-kind limits and deadlines remain enforced by authenticated streaming admission.
+	maxRequestBodySize: MAX_MIRROR_MAIN_BINARY_BYTES,
 	idleTimeout: 30,
-	fetch: app.fetch,
+	fetch(request, server) {
+		// These handlers impose their own absolute upload/verification/download deadlines.
+		// Bun's socket idle timeout must not cut off a healthy long verification with no output.
+		if (
+			/^\/api\/v3\/products\/[A-Za-z0-9_-]+\/mirror\/(assets\/[a-f0-9]{64}|snapshot)$/.test(
+				new URL(request.url).pathname,
+			)
+		)
+			server.timeout(request, 0);
+		return app.fetch(request, server);
+	},
 });
 
 logger.info(`Update server listening on http://${host}:${server.port}`);

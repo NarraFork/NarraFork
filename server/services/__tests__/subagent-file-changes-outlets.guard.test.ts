@@ -172,7 +172,9 @@ describe("subagent result outlets carry the file-change summary", () => {
 		const execute = source.slice(source.indexOf("async function executeRun("));
 		const crashIndex = execute.indexOf("} catch (error) {");
 		expect(crashIndex).toBeGreaterThan(-1);
-		const handlerTail = execute.slice(crashIndex, crashIndex + 600);
+		const crashEnd = execute.indexOf("\n\t} finally {", crashIndex);
+		expect(crashEnd).toBeGreaterThan(crashIndex);
+		const handlerTail = execute.slice(crashIndex, crashEnd);
 		expect(handlerTail).toContain("await finishRun(");
 		expect(handlerTail).toContain("hasError: true");
 		const finish = source.slice(source.indexOf("async function finishRun("));

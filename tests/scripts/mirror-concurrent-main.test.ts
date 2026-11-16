@@ -24,6 +24,29 @@ function pause(signal: AbortSignal | undefined, ms: number) {
 		if (signal?.aborted) abort();
 	});
 }
+/** Wait for fixture progress, or hold an upload until its real cancellation signal. */
+function waitForGate(signal: AbortSignal | undefined, gate?: Promise<unknown>) {
+	if (!signal) throw new Error("Fixture upload requires a cancellation signal");
+	return new Promise<void>((resolve, reject) => {
+		const abort = () => {
+			signal.removeEventListener("abort", abort);
+			reject(signal.reason ?? new Error("cancelled"));
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		gate?.then(
+			() => {
+				signal.removeEventListener("abort", abort);
+				resolve();
+			},
+			(error) => {
+				signal.removeEventListener("abort", abort);
+				reject(error);
+			},
+		);
+		if (signal.aborted) abort();
+	});
+}
+
 function allPlatformFixture() {
 	const f = mirrorFixture();
 	const first = f.release.files[0];
@@ -37,6 +60,7 @@ function allPlatformFixture() {
 	for (const [platform, suffix] of Object.entries(UPDATE_INDEX_PLATFORMS)) {
 		if (platform === first.platform) continue;
 		const name = `narrafork-${f.release.version}-${suffix}`;
+		descriptor(name, f.raw.get(first.name) as Buffer);
 		const metadata = descriptor(
 			`${name}.metadata.json`,
 			Buffer.from(
@@ -109,7 +133,7 @@ test("default main direct stays within an old server's two upload slots without 
 	expect(rejected).toBe(0);
 	expect(active).toBe(0);
 	expect(result.uploaded).toEqual(
-		mirrorAssetsForTarget(f.index, f.release.version).map((a) => a.name),
+		mirrorAssetsForTarget(f.index, f.release.version, 2).map((a) => a.name),
 	);
 });
 
@@ -127,7 +151,9 @@ for (const transport of ["direct", "webdav"] as const)
 			let canceled = 0;
 			let uploadNumber = 0;
 			const accepted: string[] = [];
-			const descriptors = mirrorAssetsForTarget(f.index, f.release.version);
+			const firstAccepted = Promise.withResolvers<void>();
+			const peerPending = Promise.withResolvers<void>();
+			const descriptors = mirrorAssetsForTarget(f.index, f.release.version, 2);
 			const names = new Map(descriptors.map((a) => [a.sha256, a.name]));
 			const download = f.downloadAsset;
 			f.downloadAsset = async (options) => {
@@ -155,12 +181,21 @@ for (const transport of ["direct", "webdav"] as const)
 				const attempt = ++uploadNumber;
 				try {
 					if (fail && attempt === 2) {
-						await pause(signal, 20);
+						// Prove partial success and a pending peer before injecting failure.
+						await waitForGate(signal, Promise.all([firstAccepted.promise, peerPending.promise]));
 						throw new Error("physical upload failed");
 					}
-					await pause(signal, fail && attempt > 2 ? 500 : 15);
+					if (fail && attempt > 2) {
+						const pending = waitForGate(signal);
+						// waitForGate installs the abort listener synchronously, before release.
+						peerPending.resolve();
+						await pending;
+					} else {
+						await pause(signal, 15);
+					}
 					const result = await action();
-					accepted.push(names.get(hash) as string);
+					accepted.push(...descriptors.filter((a) => a.sha256 === hash).map((a) => a.name));
+					firstAccepted.resolve();
 					return result;
 				} catch (error) {
 					if (signal?.aborted) canceled++;

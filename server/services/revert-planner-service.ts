@@ -267,7 +267,13 @@ export class RevertPlannerService {
 			work.charge(original.ref.sizeBytes);
 			const requestDigest = original.ref.digest;
 			this.checkIdempotency(owner, fixed.idempotencyKey, requestDigest);
-			const selected = await work.wait(this.selection.collect({ ...fixed, signal: work.signal }));
+			const selected = await work.wait(
+				this.selection.collect({
+					...fixed,
+					historyRewrite: fixed.kind !== "revert",
+					signal: work.signal,
+				}),
+			);
 			complete(selected);
 			// Authorized selection only: startup neither blocks preview nor sends/caches user data.
 			// The client owns bounded startup diagnostics; failure never triggers inline work.
@@ -536,7 +542,13 @@ export class RevertPlannerService {
 			work.check();
 			// Recheck the selected history, not every write made by any other session.
 			const finalSelection = await work.wait(
-				this.selection.collect({ ...fixed, signal: work.signal }),
+				this.selection.collect({
+					principal: fixed.principal,
+					narratorId: fixed.narratorId,
+					selector: fixed.selector,
+					historyRewrite: fixed.kind !== "revert",
+					signal: work.signal,
+				}),
 			);
 			complete(finalSelection);
 			if (finalSelection.metadataDigest !== selected.metadataDigest)

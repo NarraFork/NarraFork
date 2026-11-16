@@ -46,6 +46,7 @@ import { broadcastToNarrator } from "../../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator } from "../narrator-session-state";
 import { withNarratorStartAdmission, withNarratorWorkAdmission } from "../narrator-session-state";
+import { waitForRestartBeforeFailure } from "../update-coordinator";
 import {
 	type ExecutionOwner,
 	getRunControl,
@@ -642,11 +643,24 @@ async function executeRun(
 		finished = true;
 		return await finishRun(id, run, deliverTo, publicationRun, { ...outcome, delegated }, req);
 	} catch (error) {
+		// An exiting process may have closed a worker while this run was preparing.
+		const pausedForRestart = await waitForRestartBeforeFailure(run.cancel.signal);
 		// Infrastructure failure is not a successful turn boundary. In particular,
 		// do not auto-start queued work over a retained same-run terminal checkpoint.
 		allowInboxWake = false;
 		if (active) active._resumeBufferedAfterLoop = false;
 		const failureText = error instanceof Error ? error.message : String(error);
+		// Cancellation and deadlines still finalize normally when they release the pause gate.
+		if (pausedForRestart && !finished && deliverToResolved && run.cancel.signal.aborted) {
+			return await finishRun(
+				id,
+				run,
+				deliverTo,
+				publicationRun,
+				{ aborted: true, finalText: failureText, delegated },
+				req,
+			);
+		}
 		// A run that threw still ends exactly once at its destination (the same
 		// finalizer); the error then reaches the session's own error reporting.
 		if (!finished && deliverTo && publicationRun)
@@ -976,7 +990,7 @@ async function renderResult(
 		]);
 	const turn = await db.query.narrators.findFirst({
 		where: eq(narrators.id, id),
-		columns: { turnStartedAt: true },
+		columns: { turnStartedAt: true, title: true },
 	});
 	return appendSubagentFileChanges(
 		{
@@ -992,7 +1006,7 @@ async function renderResult(
 				completedAt: new Date().toISOString(),
 			},
 		},
-		agentResultTag(await resolveAgentLabel(deliverTo.narratorId, id)) + finalText,
+		agentResultTag(await resolveAgentLabel(deliverTo.narratorId, id), id, turn?.title) + finalText,
 	);
 }
 
