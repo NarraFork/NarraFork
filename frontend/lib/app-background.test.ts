@@ -1,0 +1,185 @@
+import { describe, expect, test } from "bun:test";
+import {
+	applyBackground,
+	checkBackgroundUrl,
+	DEFAULT_BACKGROUND,
+	MIN_OPACITY,
+	parseBackgroundChoice,
+	switchBackgroundSource,
+	wallpaperSourceKey,
+} from "./app-background";
+
+function stubRoot() {
+	const props = new Map<string, string>();
+	const attrs = new Map<string, string>();
+	return {
+		style: {
+			setProperty: (name: string, value: string) => props.set(name, value),
+			removeProperty: (name: string) => props.delete(name),
+		},
+		setAttribute: (name: string, value: string) => attrs.set(name, value),
+		removeAttribute: (name: string) => attrs.delete(name),
+		get: (name: string) => props.get(name),
+		attr: (name: string) => attrs.get(name),
+	} as unknown as HTMLElement & {
+		get: (n: string) => string | undefined;
+		attr: (n: string) => string | undefined;
+	};
+}
+
+describe("background image", () => {
+	test("accepts http(s) and rejects everything else", () => {
+		expect(checkBackgroundUrl("https://example.com/a.png")).toEqual({ ok: true });
+		expect(checkBackgroundUrl("http://example.com/a.gif")).toEqual({ ok: true });
+		expect(checkBackgroundUrl("javascript:alert(1)")).toEqual({ ok: false, reason: "protocol" });
+		expect(checkBackgroundUrl("data:image/png;base64,AAAA")).toEqual({
+			ok: false,
+			reason: "protocol",
+		});
+		expect(checkBackgroundUrl("example.com/a.png")).toEqual({ ok: false, reason: "protocol" });
+		expect(checkBackgroundUrl("")).toEqual({ ok: false, reason: "empty" });
+		expect(checkBackgroundUrl("https://example.com/a b.png")).toEqual({ ok: true });
+	});
+
+	test("rejects a URL that could close the css declaration", () => {
+		expect(checkBackgroundUrl('https://example.com/a".png')).toEqual({
+			ok: false,
+			reason: "malformed",
+		});
+		expect(checkBackgroundUrl("https://example.com/a\\.png")).toEqual({
+			ok: false,
+			reason: "malformed",
+		});
+	});
+
+	test("parsing clamps numbers and disables an unusable url", () => {
+		expect(parseBackgroundChoice(null)).toEqual(DEFAULT_BACKGROUND);
+		expect(
+			parseBackgroundChoice({ enabled: true, url: "javascript:alert(1)", opacity: 999, scrim: -5 }),
+		).toEqual({ ...DEFAULT_BACKGROUND, opacity: 100, scrim: 0, enabled: false, url: "" });
+		expect(
+			parseBackgroundChoice({ enabled: true, url: "https://x.test/a.png", opacity: 1 }),
+		).toEqual({
+			...DEFAULT_BACKGROUND,
+			enabled: true,
+			source: "url",
+			url: "https://x.test/a.png",
+			opacity: MIN_OPACITY,
+		});
+	});
+
+	test("a stored file source keeps the network URL and switching back restores it", () => {
+		const parsed = parseBackgroundChoice({
+			enabled: true,
+			source: "file",
+			fileName: "wall.png",
+			url: "https://x.test/a.png",
+			opacity: 70,
+			scrim: 10,
+			blur: 4,
+		});
+		expect(parsed.url).toBe("https://x.test/a.png");
+		expect(parsed.source).toBe("file");
+		expect(parsed.enabled).toBe(true);
+		expect(parsed.blur).toBe(4);
+		const back = switchBackgroundSource(parsed, "url");
+		expect(back.source).toBe("url");
+		expect(back.url).toBe("https://x.test/a.png");
+		expect(back.enabled).toBe(true);
+	});
+
+	test("blur is not part of the wallpaper load key", () => {
+		const base = {
+			...DEFAULT_BACKGROUND,
+			enabled: true,
+			source: "url" as const,
+			url: "https://x.test/a.png",
+			blur: 0,
+		};
+		expect(wallpaperSourceKey(base)).toBe(wallpaperSourceKey({ ...base, blur: 24 }));
+		expect(wallpaperSourceKey(base)).toBe(wallpaperSourceKey({ ...base, opacity: 90, scrim: 5 }));
+		expect(wallpaperSourceKey(base)).not.toBe(
+			wallpaperSourceKey({ ...base, url: "https://x.test/b.png" }),
+		);
+	});
+
+	test("switching source keeps the other source's configuration", () => {
+		// Regression: picking a file used to blank `url`, so switching back to "URL" had
+		// nothing to load and the wallpaper silently stopped appearing.
+		const withUrl = parseBackgroundChoice({ enabled: true, url: "https://x.test/a.png" });
+		const toFile = switchBackgroundSource({ ...withUrl, fileName: "a.png" }, "file");
+		expect(toFile.url).toBe("https://x.test/a.png");
+		expect(toFile.enabled).toBe(true);
+		const back = switchBackgroundSource(toFile, "url");
+		expect(back.url).toBe("https://x.test/a.png");
+		expect(back.enabled).toBe(true);
+	});
+
+	test("the reload key survives parsing and is not lost by other edits", () => {
+		// A local (component-state) nonce used to be overwritten by the other hook instance
+		// that also applies the wallpaper, so reloading appeared to do nothing.
+		const withKey = parseBackgroundChoice({
+			enabled: true,
+			url: "https://x.test/a.png",
+			reloadKey: 1234,
+		});
+		expect(withKey.reloadKey).toBe(1234);
+		expect(switchBackgroundSource(withKey, "file").reloadKey).toBe(1234);
+	});
+
+	test("switching to an empty source disables it instead of painting nothing", () => {
+		expect(switchBackgroundSource(DEFAULT_BACKGROUND, "file").enabled).toBe(false);
+		expect(switchBackgroundSource(DEFAULT_BACKGROUND, "url").enabled).toBe(false);
+	});
+
+	test("a local-file wallpaper marks the shell even though it has no URL", () => {
+		// Regression: the usability check only looked at `url`, so a file source (empty url)
+		// removed the data attribute — the image loaded but sat behind an opaque shell.
+		const root = stubRoot() as ReturnType<typeof stubRoot>;
+		applyBackground(root as unknown as HTMLElement, {
+			enabled: true,
+			source: "file",
+			fileName: "wall.png",
+			url: "",
+			opacity: 68,
+			scrim: 20,
+			blur: 6,
+		});
+		expect(root.attr("data-nf-bg")).toBe("on");
+		expect(root.get("--nf-bg-pane-opacity")).toBe("68%");
+
+		const noFile = stubRoot() as ReturnType<typeof stubRoot>;
+		applyBackground(noFile as unknown as HTMLElement, {
+			enabled: true,
+			source: "file",
+			url: "",
+			opacity: 68,
+			scrim: 20,
+			blur: 6,
+		});
+		expect(noFile.attr("data-nf-bg")).toBeUndefined();
+	});
+
+	test("applying writes the variables, clearing removes them", () => {
+		const root = stubRoot() as ReturnType<typeof stubRoot>;
+		applyBackground(root as unknown as HTMLElement, {
+			enabled: true,
+			source: "url",
+			url: "https://example.com/wall paper.png",
+			opacity: 80,
+			scrim: 60,
+			blur: 10,
+		});
+		expect(root.attr("data-nf-bg")).toBe("on");
+		// Spaces are legal inside a quoted url(); only quotes/backslashes need escaping.
+		expect(root.get("--nf-bg-image")).toBe('url("https://example.com/wall paper.png")');
+		expect(root.get("--nf-bg-pane-opacity")).toBe("80%");
+		expect(root.get("--nf-bg-scrim")).toBe("60%");
+		expect(root.get("--nf-bg-blur")).toBe("10px");
+		expect(root.get("--nf-bg-body-opacity")).toBe("62%");
+
+		applyBackground(root as unknown as HTMLElement, { ...DEFAULT_BACKGROUND });
+		expect(root.attr("data-nf-bg")).toBeUndefined();
+		expect(root.get("--nf-bg-image")).toBeUndefined();
+	});
+});

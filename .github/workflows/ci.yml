@@ -58,6 +58,8 @@ jobs:
         run: bun scripts/check-sqlite-migration-assets.ts
       - name: Check formatting and lint
         run: bunx @biomejs/biome check .
+      - name: Check design tokens
+        run: bun run check:tokens
       - name: Check translations
         run: bun run i18n:check
 

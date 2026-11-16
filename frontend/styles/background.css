@@ -1,0 +1,165 @@
+/**
+ * Wallpaper layer + translucent surfaces.
+ *
+ * ## Structure
+ *
+ *   #nf-wallpaper (fixed, z-index -1)   <img> with the picture, blurred
+ *                                       ::after with the scrim on top of it
+ *   #root                               base surface colour, translucent
+ *   panels                              `--mantine-color-default`, a step more opaque
+ *
+ * The picture is an `<img>`, not a CSS background: wallpaper hosts commonly answer 403 when
+ * a `Referer` header is present, and only an `<img referrerpolicy="no-referrer">` can load
+ * without one (see `lib/wallpaper-layer.ts`). Keeping it an element also means a failed load
+ * can be detected and reported instead of silently painting nothing.
+ *
+ * ## Specificity
+ *
+ * Mantine sets `--mantine-color-body` on `:root[data-mantine-color-scheme="dark"]` (0,2,0).
+ * A plain `html[data-nf-bg="on"]` selector (0,1,1) loses to it, and the shell then paints an
+ * opaque background over the picture — the image loads, stacks, and stays invisible. Matching
+ * the scheme attribute too (0,3,0) is what makes the override stick.
+ */
+
+:root {
+	/*
+	 * Follow the live Mantine surfaces. Pointing these at the slate `--nf-ink-*` /
+	 * `--nf-paper-*` literals would recolor the shell even when the user has not picked
+	 * a palette. A chosen preset rewrites the Mantine variables, so the shell follows.
+	 */
+	--nf-canvas-base: var(--mantine-color-body);
+	--nf-pane-base: var(--mantine-color-default);
+}
+
+:root[data-mantine-color-scheme][data-nf-bg="on"] {
+	--nf-bg-scrim-color: color-mix(
+		in srgb,
+		var(--nf-bg-scrim-tinted, var(--nf-canvas-base)) var(--nf-bg-scrim-effective, 20%),
+		transparent
+	);
+	/*
+	 * BOTH surface variables go translucent. `--mantine-color-body` is the one that matters
+	 * most: dockview's group view (the narrator page) and dozens of internal surfaces paint
+	 * with it, so leaving it opaque hid the wallpaper on exactly that route while every other
+	 * page showed it. Overlays portalled to <body> are re-opaque below by ARIA role, which is
+	 * a stable attribute — Mantine's generated class names are not.
+	 */
+	/*
+	 * Scheme-adjusted weights. The slider expresses "how present the wallpaper is" for the
+	 * dark scheme; a light scheme needs more separation to stay readable, because a photo
+	 * behind near-white surfaces is otherwise washed out to invisibility.
+	 *
+	 * These are computed here (not in JS) so they follow a light/dark switch without
+	 * re-applying anything.
+	 */
+	--nf-bg-pane-effective: var(--nf-bg-pane-opacity, 68%);
+	--nf-bg-body-effective: var(--nf-bg-body-opacity, 50%);
+	--nf-bg-scrim-effective: var(--nf-bg-scrim, 20%);
+
+	--mantine-color-default: color-mix(
+		in srgb,
+		var(--nf-bg-pane-tinted, var(--nf-pane-base)) var(--nf-bg-pane-effective),
+		transparent
+	);
+
+	--mantine-color-body: color-mix(
+		in srgb,
+		var(--nf-bg-canvas-tinted, var(--nf-canvas-base)) var(--nf-bg-body-effective),
+		transparent
+	);
+	/* Dockview seeds its own variable from the body colour; keep them in sync. */
+	--dv-group-view-background-color: var(--mantine-color-body);
+}
+
+:root[data-mantine-color-scheme="light"][data-nf-bg="on"] {
+	/*
+	 * A light scheme needs a different split, and not just "more of everything": cards at
+	 * 90% over a bright photo read as dirty grey, while the background keeps the photo. So
+	 * panels go almost opaque (crisp UI), the shell keeps enough transparency for the photo,
+	 * and the scrim goes DOWN — adding scrim on a light theme only washes the picture out.
+	 */
+	--nf-bg-pane-effective: calc(var(--nf-bg-pane-opacity, 68%) + 6%);
+	--nf-bg-body-effective: calc(var(--nf-bg-body-opacity, 50%) + 2%);
+	--nf-bg-scrim-effective: calc(var(--nf-bg-scrim, 20%) - 6%);
+	/*
+	 * Whiteness, not transparency, is what a bright photo exposes: at 74% the panels are
+	 * still near-white because the paper base is near-white. Even at full transparency a
+	 * white-background photo reads white, so the surfaces themselves take a few percent of
+	 * ink — enough to stop the glare, still clearly a light theme (panel text keeps ~13:1).
+	 */
+	--nf-bg-pane-tinted: color-mix(in srgb, var(--nf-pane-base) 92%, var(--nf-ink-950));
+	--nf-bg-canvas-tinted: color-mix(in srgb, var(--nf-canvas-base) 95%, var(--nf-ink-950));
+	--nf-bg-scrim-tinted: color-mix(in srgb, var(--nf-canvas-base) 85%, var(--nf-ink-950));
+}
+
+/*
+ * Hard floor: the moment the attribute is set (before the image layer even exists, and
+ * after a failed load) the page canvas must be the theme colour, not the browser default
+ * white. Without this, a failing image on the light scheme left the whole shell washed out
+ * because body is transparent and the shell only supplies 62% of a colour over nothing.
+ */
+html[data-nf-bg="on"] {
+	background: var(--nf-canvas-base);
+}
+
+/*
+ * Floating layers must stay opaque: they appear over the page (often over the picture) and
+ * carry dense text. ARIA roles survive component restyling, Mantine class names do not.
+ */
+html[data-nf-bg="on"] [role="dialog"],
+html[data-nf-bg="on"] [role="menu"],
+html[data-nf-bg="on"] [role="listbox"],
+html[data-nf-bg="on"] [role="tooltip"] {
+	background-color: var(--nf-pane-base);
+}
+
+html[data-nf-bg="on"] body {
+	background-color: transparent;
+}
+
+html[data-nf-bg="on"] #root {
+	/* The shell itself, not the global surface variable — see the note above. */
+	background: color-mix(in srgb, var(--nf-canvas-base) var(--nf-bg-body-opacity, 50%), transparent);
+	min-height: 100vh;
+	/*
+	 * NO `backdrop-filter` here. It would make #root a containing block for every
+	 * `position: fixed` descendant, so floating buttons, toasts and toolbars inside the app
+	 * would anchor to the shell instead of the viewport and visibly jump. The picture is
+	 * blurred on its own `<img>` instead — same look, no layout side effects.
+	 */
+}
+
+#nf-wallpaper {
+	position: fixed;
+	inset: 0;
+	z-index: -1;
+	overflow: hidden;
+	pointer-events: none;
+	background: var(--nf-canvas-base);
+}
+
+#nf-wallpaper > img {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	display: block;
+	filter: blur(var(--nf-bg-blur, 10px));
+	/* Oversized so the blur has pixels to sample at the edges. */
+	transform: scale(1.06);
+}
+
+/*
+ * A failed image must not leave the shell looking broken — but it must not be hidden either:
+ * the layer also paints the canvas colour behind the translucent shell. Hiding it here was
+ * exactly what washed the UI out when a load failed on the light scheme.
+ */
+#nf-wallpaper[data-state="error"] > img {
+	visibility: hidden;
+}
+
+#nf-wallpaper::after {
+	content: "";
+	position: absolute;
+	inset: 0;
+	background: var(--nf-bg-scrim-color);
+}
