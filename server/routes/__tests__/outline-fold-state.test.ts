@@ -479,7 +479,9 @@ describe("back to the default in one request", () => {
 		expect((await call(alice, "DELETE", `${foldPath()}?under=${elsewhere}`)).body.expanded).toEqual(
 			[ids.top2],
 		);
-		expect((await call(alice, "DELETE", `${foldPath()}?under=${"x".repeat(400)}`)).status).toBe(400);
+		expect((await call(alice, "DELETE", `${foldPath()}?under=${"x".repeat(400)}`)).status).toBe(
+			400,
+		);
 	});
 
 	test("access as the other fold routes: 404 without read access or with the outline off", async () => {
