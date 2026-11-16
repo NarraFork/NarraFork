@@ -254,9 +254,7 @@ describe("the behavior view", () => {
 		expect(view.length).toBeLessThanOrEqual(OUTLINE_VIEW_LIMITS.behaviorChars);
 		expect(view).toContain("Rule zero.");
 		expect(view).toMatch(/\n‹not all shown: \d+ blocks are shortened or left out; read `[^`]+`/);
-		expect(view).toContain(
-			`; read \`${await addressOf(pageId)}\` with OutlineRead for all of it›`,
-		);
+		expect(view).toContain(`; read \`${await addressOf(pageId)}\` with OutlineRead for all of it›`);
 	});
 
 	test("fence text the import has not moved yet is shown from the old fence", async () => {

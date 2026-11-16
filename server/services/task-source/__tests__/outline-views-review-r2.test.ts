@@ -502,9 +502,7 @@ describe("N-R2-9: the page in the spec fence with the outline off, and the fork 
 				);
 			} else {
 				expect(text.startsWith(`来自本会话的行为边界 \`${address}\`：`)).toBe(true);
-				expect(text).toMatch(
-					/\n‹这里有 \d+ 块只显示了开头或没有列出；用户可以在大纲里看到全部›$/,
-				);
+				expect(text).toMatch(/\n‹这里有 \d+ 块只显示了开头或没有列出；用户可以在大纲里看到全部›$/);
 			}
 		}
 	});
