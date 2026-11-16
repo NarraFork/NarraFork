@@ -7,6 +7,12 @@
  */
 import { LiveClient, type LiveTransport } from "@frontend/components/outline/editor/live-client";
 import type { BlockRec, ClientOp } from "@frontend/components/outline/editor/store";
+import {
+	type LiveClock,
+	type LiveTimer,
+	liveTimeout,
+	setLiveClockForTests,
+} from "@shared/outline-live-clock";
 import { decodeLiveFrame, type LiveFrame } from "@shared/outline-live-protocol";
 import {
 	drainLiveSocket,
@@ -50,7 +56,7 @@ let inFlight = 0;
 
 function later(fn: () => void): void {
 	inFlight++;
-	setTimeout(() => {
+	liveTimeout(() => {
 		try {
 			fn();
 		} finally {
@@ -121,6 +127,14 @@ export class TestLink implements LiveTransport {
 		this.handles.delete(handle);
 	}
 
+	/** Frames to the client queue (the server's answers are late); the client's still go. */
+	downHeld = false;
+
+	holdDown(on: boolean): void {
+		this.downHeld = on;
+		if (!on) this.pump();
+	}
+
 	hold(on: boolean): void {
 		this.held = on;
 		if (!on) this.pump();
@@ -137,7 +151,7 @@ export class TestLink implements LiveTransport {
 				if (decoded) handleLiveFrame(socket, decoded);
 			});
 		}
-		while (this.down.length > 0) {
+		while (!this.downHeld && this.down.length > 0) {
 			const frame = this.down.shift() as Uint8Array;
 			later(() => {
 				if (!this.connected) return;
@@ -163,6 +177,7 @@ export class TestLink implements LiveTransport {
 	reconnect(): void {
 		this.socket = this.newSocket();
 		this.connected = true;
+		this.downHeld = false;
 		this.handles = new Set();
 		for (const l of this.connListeners) l(true);
 	}
@@ -254,4 +269,125 @@ export function struct(
 /** The children of a block in the client's visible structure. */
 export function kids(c: LiveClient, id: string): BlockRec[] {
 	return c.visible.children(id).map((k) => c.visible.get(k) as BlockRec);
+}
+
+interface FakeTimer {
+	at: number;
+	seq: number;
+	fn: () => void;
+	cancelled: boolean;
+}
+
+/**
+ * A clock the test advances itself (`shared/outline-live-clock.ts`): every timer of the live
+ * engine, of the clients and of this harness's network fires in the order of its due time, and
+ * only when the test advances past it. Between timers, `flush` lets what is already running
+ * finish (promises and the store's work: no timer, no waiting for time).
+ */
+export class FakeLiveClock implements LiveClock {
+	t: number;
+	private seq = 0;
+	private readonly timers: FakeTimer[] = [];
+	/** Timers fired so far (diagnostics). */
+	fired = 0;
+
+	constructor(start = Date.parse("2026-11-16T00:00:00.000Z")) {
+		this.t = start;
+	}
+
+	now(): number {
+		return this.t;
+	}
+
+	setTimeout(fn: () => void, ms: number): LiveTimer {
+		const timer: FakeTimer = {
+			at: this.t + Math.max(0, ms),
+			seq: this.seq++,
+			fn,
+			cancelled: false,
+		};
+		this.timers.push(timer);
+		return timer as unknown as LiveTimer;
+	}
+
+	clearTimeout(timer: LiveTimer): void {
+		(timer as unknown as FakeTimer).cancelled = true;
+	}
+
+	yield(): Promise<void> {
+		return Promise.resolve();
+	}
+
+	install(): this {
+		setLiveClockForTests(this);
+		return this;
+	}
+
+	uninstall(): void {
+		setLiveClockForTests(null);
+	}
+
+	/** Let everything already started run to its next timer (promise chains, the store). */
+	async flush(): Promise<void> {
+		for (let i = 0; i < 3; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+
+	private next(until: number): FakeTimer | null {
+		let best: FakeTimer | null = null;
+		for (let i = this.timers.length - 1; i >= 0; i--) {
+			const t = this.timers[i] as FakeTimer;
+			if (t.cancelled) {
+				this.timers.splice(i, 1);
+				continue;
+			}
+			if (t.at > until) continue;
+			if (!best || t.at < best.at || (t.at === best.at && t.seq < best.seq)) best = t;
+		}
+		return best;
+	}
+
+	/** Advance by `ms`, firing every timer due on the way in order (and what they start). */
+	async advance(ms: number): Promise<void> {
+		const until = this.t + ms;
+		await this.flush();
+		for (;;) {
+			const t = this.next(until);
+			if (!t) break;
+			this.timers.splice(this.timers.indexOf(t), 1);
+			if (t.at > this.t) this.t = t.at;
+			this.fired++;
+			t.fn();
+			await this.flush();
+		}
+		this.t = until;
+		await this.flush();
+	}
+
+	/** Advance in steps of `step` until `predicate` holds; throws past `maxMs` of clock time. */
+	async until(
+		predicate: () => boolean,
+		maxMs = 30_000,
+		what = "condition",
+		step = 5,
+	): Promise<void> {
+		const end = this.t + maxMs;
+		await this.flush();
+		while (!predicate()) {
+			if (this.t >= end) throw new Error(`clock passed ${maxMs} ms waiting for ${what}`);
+			await this.advance(step);
+		}
+	}
+
+	/** Advance until nothing is in flight or due within `quietMs` (the network and the engine). */
+	async settle(quietMs = 100, maxMs = 30_000): Promise<void> {
+		const end = this.t + maxMs;
+		let quietSince = this.t;
+		for (;;) {
+			await this.advance(5);
+			const busy = inFlight > 0 || !outlineLiveQuiet() || [...watched].some((c) => !c.quiet);
+			if (busy) quietSince = this.t;
+			else if (this.t - quietSince >= quietMs) return;
+			if (this.t > end) throw new Error("live network did not settle on the fake clock");
+		}
+	}
 }
