@@ -31,7 +31,7 @@ import { getTerminalTheme } from "./terminal-theme";
 export const TERM_BG = "#1a1b26"; // Default fallback, actual bg comes from theme
 
 const HANDLE_SIZE = 20;
-const HANDLE_COLOR = "#4c6ef5"; // Mantine indigo
+const HANDLE_COLOR = "var(--mantine-primary-color-filled)";
 const TERMINAL_OUTPUT_FLUSH_FALLBACK_MS = 250;
 const TERMINAL_SCROLLBACK_LINES = 2_000;
 const TERMINAL_PENDING_BUFFER_MAX_CHARS = 1_000_000;

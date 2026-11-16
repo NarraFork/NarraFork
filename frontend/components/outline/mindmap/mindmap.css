@@ -311,7 +311,7 @@
 	padding: 0 4px;
 	border-radius: 7px;
 	background: var(--ob-accent);
-	color: #fff;
+	color: var(--nf-on-solid);
 }
 
 .nf-outline-editor .mm-more:empty {
