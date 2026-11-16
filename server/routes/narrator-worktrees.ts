@@ -32,6 +32,22 @@ export function createNarratorWorktreeRoutes<Principal>(
 			),
 		),
 	);
+	// Read-only: what removal would lose right now. POST keeps the path out of URLs and logs.
+	routes.post(`${path}/removal-report`, async (c) =>
+		c.json(
+			await service.inspectRemoval(
+				principalOf(c),
+				c.req.param("id"),
+				await c.req.json(),
+				c.req.raw.signal,
+			),
+		),
+	);
+	routes.post(`${path}/remove`, async (c) =>
+		c.json(
+			await service.remove(principalOf(c), c.req.param("id"), await c.req.json(), c.req.raw.signal),
+		),
+	);
 	routes.get(path, async (c) =>
 		c.json(await service.list(principalOf(c), c.req.param("id"), c.req.query(), c.req.raw.signal)),
 	);

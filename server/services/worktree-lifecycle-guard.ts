@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 import { eq } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
@@ -21,6 +21,13 @@ export interface LifecycleTarget {
 	shadowKey?: string;
 	/** Authorization scope is independent of repository/path/device location. */
 	scopeProjectId?: string | null;
+	/**
+	 * This deletion retires exactly this `narrator_worktree_resources` row. Its own row,
+	 * and creation receipts for the identical path, are inventory of the thing being
+	 * removed rather than users of it, so they do not protect it. Every other claim,
+	 * including nested registry rows and any narrator cwd, still does.
+	 */
+	retiringRegistryId?: string;
 }
 export interface ResourceClaim extends LifecycleTarget {
 	kind: "registry" | "narrator" | "receipt";
@@ -547,6 +554,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				for (const target of normalized) {
 					if (!overlaps(target, canonical) && !(shadowPhysical && overlaps(target, shadowPhysical)))
 						continue;
+					if (
+						target.retiringRegistryId &&
+						((claim.kind === "registry" && claim.id === target.retiringRegistryId) ||
+							(claim.kind === "receipt" && !!target.path && canonical.path === target.path))
+					)
+						continue;
 					// A repository-root cwd is not an owner of every linked worktree stored
 					// beneath it. This exception needs positive distinct Git-root evidence,
 					// never a path convention; durable inventories/receipts are never waived.
@@ -779,4 +792,126 @@ export async function withProjectRetirement<T>(
 		if (isResourceProtectionError(error) || admitted) throw error;
 		reject("project delete", unavailable());
 	}
+}
+
+/** What a worktree retirement needs to know about the row it retires. */
+export interface RetiringWorktreeResource {
+	id: string;
+	deviceId: string;
+	worktreePath: string;
+}
+
+/**
+ * Remove a recorded worktree under the existing deletion protection.
+ *
+ * Publishes a deletion reservation for exactly the recorded path, so a session cannot
+ * switch its cwd into it while the removal runs, and refuses when any independent claim
+ * overlaps it: a narrator cwd or workspace context inside it, a nested recorded
+ * worktree, another reservation. It then refuses a running local terminal whose cwd
+ * is inside, and a resource row that something still references (terminals, containers,
+ * ports, layouts and snapshot applications all restrict its deletion).
+ *
+ * `body` receives `confirmRemoved`, to be called once the Git removal has succeeded and
+ * the directory is verified absent: later Git commands in the same reservation then
+ * accept the path's disappearance instead of reading it as tampering.
+ *
+ * Nothing here lists a directory. The path comes from the resource row.
+ */
+export async function withWorktreeRetirement<T>(
+	resource: RetiringWorktreeResource,
+	body: (confirmRemoved: () => Promise<void>) => Promise<T>,
+	signal?: AbortSignal,
+): Promise<T> {
+	if (resource.deviceId !== "local" || !isAbsolute(resource.worktreePath))
+		reject("worktree remove", unavailable());
+	let admitted = false;
+	try {
+		return await guard.withProtectionReservation(
+			[{ deviceId: "local", path: resource.worktreePath, retiringRegistryId: resource.id }],
+			"worktree remove",
+			async () => {
+				const blocker = await worktreeRetirementBlocker(resource);
+				if (blocker) throw blocker;
+				admitted = true;
+				return body(() => confirmLifecyclePathRemoved(resource.worktreePath));
+			},
+			undefined,
+			signal,
+		);
+	} catch (error) {
+		if (
+			admitted ||
+			!(error instanceof ResourceProtectionError) ||
+			error.code !== "RESOURCE_PROTECTED"
+		)
+			throw error;
+		const claim = error.inspection.claims[0];
+		throw new AppError(
+			claim?.kind === "narrator"
+				? "A session's working directory is inside this worktree; switch it elsewhere first"
+				: "Another resource or operation is using this worktree",
+			409,
+			"WORKTREE_IN_USE",
+			undefined,
+			{ blockedBy: claim ? { kind: claim.kind, id: claim.id } : null },
+		);
+	}
+}
+
+/** Indexed, LIMIT 1 reads; a running terminal is matched by its recorded cwd. */
+async function worktreeRetirementBlocker(
+	resource: RetiringWorktreeResource,
+): Promise<AppError | null> {
+	const { db } = await import("../db");
+	const schema = await import("../db/schema");
+	const { and, eq, isNull, or, sql } = await import("drizzle-orm");
+	const path = resource.worktreePath;
+	const prefix = path.endsWith(sep) ? path : `${path}${sep}`;
+	const terminal = db
+		.select({ id: schema.terminals.id })
+		.from(schema.terminals)
+		.where(
+			and(
+				eq(schema.terminals.status, "running"),
+				or(isNull(schema.terminals.deviceId), eq(schema.terminals.deviceId, "local")),
+				or(
+					eq(schema.terminals.cwd, path),
+					sql`substr(${schema.terminals.cwd}, 1, ${prefix.length}) = ${prefix}`,
+					eq(schema.terminals.worktreeResourceId, resource.id),
+				),
+			),
+		)
+		.limit(1)
+		.get();
+	if (terminal)
+		return new AppError(
+			"A running terminal is inside this worktree; close it first",
+			409,
+			"WORKTREE_IN_USE",
+			undefined,
+			{ blockedBy: { kind: "terminal", id: terminal.id } },
+		);
+	const references = [
+		[schema.terminals, schema.terminals.worktreeResourceId],
+		[schema.terminalViewState, schema.terminalViewState.worktreeResourceId],
+		[schema.containerInstances, schema.containerInstances.worktreeResourceId],
+		[schema.portAllocations, schema.portAllocations.worktreeResourceId],
+		[schema.volumeSnapshots, schema.volumeSnapshots.sourceWorktreeResourceId],
+		[schema.volumeSnapshotApplications, schema.volumeSnapshotApplications.targetWorktreeResourceId],
+	] as const;
+	for (const [table, column] of references) {
+		const row = db
+			.select({ found: sql<number>`1` })
+			.from(table)
+			.where(eq(column, resource.id))
+			.limit(1)
+			.get();
+		if (row)
+			return new AppError(
+				"Other NarraFork resources still reference this worktree",
+				409,
+				"WORKTREE_RESOURCE_ATTACHED",
+			);
+	}
+	return null;
 }

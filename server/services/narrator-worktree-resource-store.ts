@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, isNotNull, ne, or } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, or } from "drizzle-orm";
 import { narratorWorktreeResources } from "../db/schema";
 import { AppError } from "../lib/errors";
 
@@ -17,12 +17,34 @@ export interface WorktreeResourceRegistration {
 	createRequestId: string;
 	scope?: VerifiedWorktreeScope;
 }
+/** One durable inventory row, as removal reads it. */
+export interface RecordedWorktreeResource {
+	id: string;
+	ownerNarratorId: string | null;
+	deviceId: string;
+	repositoryKey: string;
+	worktreePath: string;
+	state: "preparing" | "ready" | "unknown";
+	createRequestId: string;
+}
+/** Page-sized lookups only: a worktree list page has at most 100 rows. */
+export const WORKTREE_RESOURCE_FIND_MAX_PATHS = 128;
 export interface WorktreeResourceRegistry {
 	// biome-ignore lint/suspicious/noConfusingVoidType: Legacy registries return Promise<void>, not Promise<undefined>.
 	register(resource: WorktreeResourceRegistration): Promise<void | { inserted: boolean }>;
 	setState(resource: WorktreeResourceRegistration, state: "ready" | "unknown"): Promise<void>;
 	/** Only the fresh creator with this call's inserted:true evidence, before Git dispatch. No disk cleanup. */
 	releaseUndispatched?(resource: WorktreeResourceRegistration): Promise<void>;
+	/**
+	 * Rows recorded at exactly these canonical paths, by primary key. Removal never
+	 * looks anywhere else: a directory without a row is not NarraFork's to remove.
+	 */
+	find?(deviceId: string, worktreePaths: readonly string[]): Promise<RecordedWorktreeResource[]>;
+	/**
+	 * Delete exactly this incarnation after its checkout is gone. False when the row
+	 * changed, vanished, or is still referenced (every reference is ON DELETE RESTRICT).
+	 */
+	retire?(resource: RecordedWorktreeResource): Promise<boolean>;
 }
 export const unknownWorktreeScope: VerifiedWorktreeScope = Object.freeze({
 	scopeKind: "unknown",
@@ -61,6 +83,53 @@ export function createWorktreeResourceRegistry(
 	admission: WorktreeResourceAdmission,
 ) {
 	return {
+		async find(
+			deviceId: string,
+			worktreePaths: readonly string[],
+		): Promise<RecordedWorktreeResource[]> {
+			if (worktreePaths.length > WORKTREE_RESOURCE_FIND_MAX_PATHS)
+				throw new AppError(
+					"Too many worktree paths in one lookup",
+					413,
+					"WORKTREE_LOOKUP_TOO_LARGE",
+				);
+			const ids = [...new Set(worktreePaths)].map((path) => worktreeResourceId(deviceId, path));
+			if (!ids.length) return [];
+			return database
+				.select({
+					id: narratorWorktreeResources.id,
+					ownerNarratorId: narratorWorktreeResources.ownerNarratorId,
+					deviceId: narratorWorktreeResources.deviceId,
+					repositoryKey: narratorWorktreeResources.repositoryKey,
+					worktreePath: narratorWorktreeResources.worktreePath,
+					state: narratorWorktreeResources.state,
+					createRequestId: narratorWorktreeResources.createRequestId,
+				})
+				.from(narratorWorktreeResources)
+				.where(inArray(narratorWorktreeResources.id, ids))
+				.limit(ids.length)
+				.all();
+		},
+		async retire(resource: RecordedWorktreeResource): Promise<boolean> {
+			try {
+				const removed = await database
+					.delete(narratorWorktreeResources)
+					.where(
+						and(
+							eq(narratorWorktreeResources.id, resource.id),
+							eq(narratorWorktreeResources.deviceId, resource.deviceId),
+							eq(narratorWorktreeResources.worktreePath, resource.worktreePath),
+							eq(narratorWorktreeResources.repositoryKey, resource.repositoryKey),
+							eq(narratorWorktreeResources.createRequestId, resource.createRequestId),
+						),
+					)
+					.returning({ id: narratorWorktreeResources.id });
+				return removed.length === 1;
+			} catch {
+				// A restricting reference keeps the row; the caller reports it as retained.
+				return false;
+			}
+		},
 		async register(resource: WorktreeResourceRegistration): Promise<{ inserted: boolean }> {
 			const { scope = unknownWorktreeScope, ...identity } = resource;
 			validateVerifiedWorktreeScope(scope);

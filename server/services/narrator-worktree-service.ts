@@ -3,7 +3,12 @@ import { constants, type Stats } from "node:fs";
 import { access, lstat, open, opendir, realpath } from "node:fs/promises";
 import { isAbsolute, normalize } from "node:path";
 import type { GitWorkspace } from "@shared/git-workspace";
-import type { WorktreeListResult, WorktreePrepareResult } from "@shared/narrator-worktrees";
+import type {
+	WorktreeListResult,
+	WorktreePrepareResult,
+	WorktreeRemovalReport,
+	WorktreeRemoveResult,
+} from "@shared/narrator-worktrees";
 import { z } from "zod/v4";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { AppError } from "../lib/errors";
@@ -14,7 +19,18 @@ import {
 	worktreeCreateSchema,
 	worktreeListSchema,
 	worktreePrepareSchema,
+	worktreeRemovalQuerySchema,
+	worktreeRemoveSchema,
 } from "../lib/validators/narrator-worktrees";
+import {
+	branchUpstream,
+	countCommitsNotIn,
+	GIT_UNCOMMITTED_LISTING_MAX_BYTES,
+	type GitQueryRunner,
+	isAncestor,
+	resolveCommit,
+	uncommittedChanges,
+} from "./git-ref-queries";
 import {
 	type WorktreeCreateResult,
 	type WorktreeEntry,
@@ -24,6 +40,7 @@ import {
 } from "./narrator-worktree-journal";
 
 import type {
+	RecordedWorktreeResource,
 	VerifiedWorktreeScope,
 	WorktreeResourceRegistration,
 	WorktreeResourceRegistry,
@@ -65,7 +82,12 @@ type ResolvedWorktreeRequest = Omit<WorktreeCreateRequest, "branch"> & {
 	branch: { kind: "new" | "existing"; name: string };
 };
 
-export type { WorktreeListResult, WorktreePrepareResult } from "@shared/narrator-worktrees";
+export type {
+	WorktreeListResult,
+	WorktreePrepareResult,
+	WorktreeRemovalReport,
+	WorktreeRemoveResult,
+} from "@shared/narrator-worktrees";
 
 /** safeSpawn may append a truncation explanation; structured porcelain must stay byte bounded. */
 export function boundWorktreeGitResult(
@@ -137,6 +159,17 @@ export interface WorktreeServicePorts<Principal> {
 	metadataTimeoutMs?: number;
 	/** Test seam for directory birthtime; production uses asynchronous lstat, never mtime/ctime. */
 	statDirectory?: (path: string) => Promise<Pick<Stats, "birthtimeMs" | "isDirectory">>;
+	/**
+	 * Deletion protection around a recorded worktree's removal (production: the lifecycle
+	 * guard's reservation plus the running-terminal and reference checks). Without it
+	 * removal is unsupported. `confirmRemoved` is called after Git removed the checkout
+	 * and the directory is verified absent.
+	 */
+	withRetirement?<T>(
+		resource: RecordedWorktreeResource,
+		body: (confirmRemoved: () => Promise<void>) => Promise<T>,
+		signal: AbortSignal,
+	): Promise<T>;
 	/** Test seam. Production defaults to local-only argv execution with hard bounds. */
 	runGit?: (
 		target: WorktreeTarget,
@@ -935,6 +968,8 @@ export class NarratorWorktreeService<Principal> {
 		}
 		signal.throwIfAborted();
 		const entries = snapshot.entries.slice(offset, offset + limit).map((entry) => ({ ...entry }));
+		const removable = this.removalSupported(target);
+		if (removable) await this.markRecorded(target, entries);
 		const hasMore = offset + entries.length < snapshot.entries.length;
 		return {
 			repositoryKey: target.workspace.repositoryKey,
@@ -946,11 +981,11 @@ export class NarratorWorktreeService<Principal> {
 				list: true,
 				create: target.workspace.capabilities.write,
 				switch: false,
-				delete: false,
+				delete: removable,
 				prune: false,
 				remote: false,
 				reason:
-					"Create supports only existing, non-symlink parents inside the authorized repository root; cleanup is unsupported",
+					"Create supports only existing, non-symlink parents inside the authorized repository root; only recorded worktrees can be removed",
 			},
 		};
 	}
@@ -1707,5 +1742,381 @@ export class NarratorWorktreeService<Principal> {
 				return result;
 			});
 		});
+	}
+	// === Removal: recorded worktrees only ===
+
+	private removalSupported(target: WorktreeTarget): boolean {
+		return (
+			target.workspace.capabilities.write &&
+			target.workspace.deviceId === "local" &&
+			!!this.ports.resources?.find &&
+			!!this.ports.resources.retire &&
+			!!this.ports.withRetirement
+		);
+	}
+
+	/** One indexed primary-key lookup per page; a failed lookup only hides the action. */
+	private async markRecorded(target: WorktreeTarget, entries: WorktreeEntry[]) {
+		if (!entries.length) return;
+		try {
+			const rows =
+				(await this.ports.resources?.find?.(
+					"local",
+					entries.map((entry) => entry.path),
+				)) ?? [];
+			const recorded = new Set(
+				rows
+					.filter((row) => row.repositoryKey === target.workspace.repositoryKey)
+					.map((row) => row.worktreePath),
+			);
+			for (const entry of entries) entry.recorded = recorded.has(entry.path);
+		} catch (cause) {
+			logger.warn("Worktree resource lookup failed; removal hidden for this page", {
+				reason: String(cause).slice(0, 256),
+			});
+		}
+	}
+
+	/** Ref questions through this service's own bounded runner, in one directory. */
+	private queryRunner(target: WorktreeTarget, cwd: string, signal: AbortSignal): GitQueryRunner {
+		return async (args, options) => {
+			const result = await this.run(
+				{ ...target, workspace: { ...target.workspace, rootPath: cwd } },
+				args,
+				signal,
+				false,
+				options?.maxOutputBytes ?? WORKTREE_MAX_OUTPUT_BYTES,
+			);
+			return {
+				stdout: result.stdout,
+				stderr: result.stderr,
+				exitCode: result.exitCode,
+				truncated: !!(result.stdoutTruncated || result.stderrTruncated),
+			};
+		};
+	}
+
+	/**
+	 * Authorize the narrator's workspace, then find the resource row for exactly this
+	 * path. A path without a row is refused before anything else looks at it: old
+	 * `.worktrees/` directories and anything a person made by hand are never touched.
+	 */
+	private async removalContext(
+		principal: Principal,
+		narratorId: string,
+		workspaceKey: string,
+		path: string,
+		need: "read" | "write",
+		signal: AbortSignal,
+	) {
+		const target = await this.ports.authorize(principal, narratorId, need, signal);
+		assertReady(target, need, workspaceKey);
+		const backend = target.backend;
+		const root = target.workspace.rootPath;
+		const find = this.ports.resources?.find;
+		if (!backend || !root || !find || !this.ports.resources?.retire || !this.ports.withRetirement)
+			error("WORKTREE_REMOVE_UNSUPPORTED", "Worktree removal is unavailable here", 409);
+		const paths = backend.paths;
+		if (!paths.isAbsolute(path) || hasControlCharacters(path) || paths.normalize(path) !== path)
+			error("WORKTREE_INVALID_PATH", "Worktree path must be an absolute normalized path");
+		if (
+			paths.equals(root, path) ||
+			paths.contains(path, root) ||
+			(target.repositoryPath && paths.contains(target.repositoryPath, path))
+		)
+			error("WORKTREE_REMOVE_DENIED", "The current checkout cannot be removed", 403);
+		// Sibling checkouts need the same explicit path grant creation needed.
+		if (!paths.contains(root, path)) {
+			if (!this.ports.authorizeDestination)
+				error(
+					"WORKTREE_DESTINATION_DENIED",
+					"Worktree must be inside the authorized repository root",
+					403,
+				);
+			await this.ports.authorizeDestination(principal, narratorId, target, path, need, signal);
+		}
+		const resource = (await find("local", [path])).find(
+			(row) => row.worktreePath === path && row.deviceId === "local",
+		);
+		if (!resource)
+			error(
+				"WORKTREE_NOT_RECORDED",
+				"Only worktrees NarraFork created and still records can be removed",
+				404,
+			);
+		if (resource.repositoryKey !== target.workspace.repositoryKey)
+			error("WORKTREE_NOT_RECORDED", "This worktree belongs to another repository", 404);
+		if (resource.state === "preparing")
+			error("WORKTREE_RESOURCE_PREPARING", "This worktree is still being created", 409);
+		return { target, resource };
+	}
+
+	/** Measure what removal would lose. Read-only; every Git call is bounded. */
+	private async removalReport(
+		target: WorktreeTarget,
+		resource: RecordedWorktreeResource,
+		baseRef: string | undefined,
+		signal: AbortSignal,
+	): Promise<WorktreeRemovalReport> {
+		const root = target.workspace.rootPath ?? "";
+		const list = await this.entries(target, signal);
+		const index = list.entries.findIndex((entry) =>
+			target.backend?.paths.equals(entry.path, resource.worktreePath),
+		);
+		const entry = list.entries[index];
+		if (!entry)
+			error(
+				list.truncated ? "WORKTREE_LIST_TRUNCATED" : "WORKTREE_NOT_REGISTERED",
+				list.truncated
+					? "Cannot safely remove with an incomplete worktree list"
+					: "Git no longer lists this worktree; nothing was removed",
+				409,
+			);
+		// The first entry is the main checkout, which is never a removable worktree.
+		if (index === 0) error("WORKTREE_REMOVE_DENIED", "The main checkout cannot be removed", 403);
+		if (entry.locked)
+			error("WORKTREE_LOCKED", "This worktree is locked; unlock it in Git before removing", 409);
+		const rootRun = this.queryRunner(target, root, signal);
+		const baseName = baseRef ?? "HEAD";
+		validateRef(baseName);
+		const baseSha = await resolveCommit(rootRun, baseName);
+		if (!baseSha) error("WORKTREE_INVALID_BASE", "Base ref must resolve to a commit");
+		const head =
+			entry.head && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(entry.head) && !/^0+$/.test(entry.head)
+				? entry.head
+				: null;
+		const branch = entry.branch?.startsWith("refs/heads/")
+			? entry.branch.slice("refs/heads/".length)
+			: null;
+		const present = await lstat(resource.worktreePath).then(
+			() => true,
+			(cause) => {
+				if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
+				throw cause;
+			},
+		);
+		const missing = entry.prunable || !present;
+		const changes = missing
+			? { count: 0, exact: true }
+			: await uncommittedChanges(
+					this.queryRunner(target, resource.worktreePath, signal),
+					GIT_UNCOMMITTED_LISTING_MAX_BYTES,
+				);
+		const upstream = branch ? await branchUpstream(rootRun, branch) : null;
+		const unmergedCommits = head
+			? await countCommitsNotIn(rootRun, head, upstream ? [baseSha, upstream.sha] : [baseSha])
+			: 0;
+		return {
+			path: resource.worktreePath,
+			branch,
+			head,
+			base: { ref: baseName, sha: baseSha },
+			upstream,
+			uncommittedFiles: changes.count,
+			uncommittedExact: changes.exact,
+			unmergedCommits,
+			missing,
+		};
+	}
+
+	/** What removing this recorded worktree would lose. Changes nothing. */
+	async inspectRemoval(
+		principal: Principal,
+		narratorId: string,
+		input: unknown,
+		signal: AbortSignal,
+	): Promise<WorktreeRemovalReport> {
+		const request = worktreeRemovalQuerySchema.parse(input);
+		const { target, resource } = await this.removalContext(
+			principal,
+			narratorId,
+			request.workspaceKey,
+			request.path,
+			"read",
+			signal,
+		);
+		return this.removalReport(target, resource, request.baseRef, signal);
+	}
+
+	/**
+	 * Remove a recorded worktree, then its resource row, then (when asked) its branch.
+	 *
+	 * Refused while a session cwd or running terminal is inside it, and refused when it
+	 * holds uncommitted paths or commits that neither the base nor the upstream contains,
+	 * unless `discard` repeats a report a person confirmed and nothing grew since. Only
+	 * the removed entry is pruned (`git worktree remove`); `git worktree prune` and any
+	 * directory listing are never used.
+	 */
+	async remove(
+		principal: Principal,
+		narratorId: string,
+		input: unknown,
+		signal: AbortSignal,
+	): Promise<WorktreeRemoveResult> {
+		const request = worktreeRemoveSchema.parse(input);
+		const { target, resource } = await this.removalContext(
+			principal,
+			narratorId,
+			request.workspaceKey,
+			request.path,
+			"write",
+			signal,
+		);
+		const withRetirement = this.ports.withRetirement;
+		const retire = this.ports.resources?.retire;
+		if (!withRetirement || !retire)
+			error("WORKTREE_REMOVE_UNSUPPORTED", "Worktree removal is unavailable here", 409);
+		const started = performance.now();
+		return this.ports.withRepositoryLock(target.workspace.repositoryKey ?? "", () =>
+			withRetirement(
+				resource,
+				async (confirmRemoved) => {
+					const report = await this.removalReport(target, resource, request.baseRef, signal);
+					const loses =
+						report.uncommittedFiles > 0 || !report.uncommittedExact || report.unmergedCommits > 0;
+					const discard = request.discard;
+					if (loses && !discard)
+						throw new AppError(
+							"Removing this worktree would lose uncommitted files or unmerged commits",
+							409,
+							"WORKTREE_REMOVAL_WOULD_LOSE_WORK",
+							undefined,
+							{ report },
+						);
+					if (
+						loses &&
+						discard &&
+						(discard.head !== report.head ||
+							report.uncommittedFiles > discard.uncommittedFiles ||
+							report.unmergedCommits > discard.unmergedCommits)
+					)
+						throw new AppError(
+							"The worktree changed after the confirmation; review the new report",
+							409,
+							"WORKTREE_REMOVAL_CHANGED",
+							undefined,
+							{ report },
+						);
+					signal.throwIfAborted();
+					const removal = await this.run(
+						target,
+						["worktree", "remove", ...(loses ? ["--force"] : []), "--", resource.worktreePath],
+						signal,
+						true,
+					);
+					if (removal.exitCode !== 0)
+						error(
+							"WORKTREE_REMOVE_FAILED",
+							`git worktree remove failed: ${(removal.stderr || removal.stdout).trim().slice(0, 1024)}`,
+							409,
+						);
+					const remains = await lstat(resource.worktreePath).then(
+						() => true,
+						(cause) => {
+							if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
+							throw cause;
+						},
+					);
+					if (remains)
+						error(
+							"WORKTREE_REMOVE_INCOMPLETE",
+							"Git reported success but the directory is still present",
+							409,
+						);
+					await confirmRemoved();
+					const retired = await retire(resource).catch(() => false);
+					if (!retired)
+						logger.warn("Removed worktree keeps its resource row", { resourceId: resource.id });
+					const branch =
+						request.deleteBranch && report.branch && report.head
+							? await this.deleteRemovedBranch(
+									target,
+									report.branch,
+									report.head,
+									report.base.sha,
+									loses && report.unmergedCommits > 0,
+									signal,
+								)
+							: null;
+					logger.info("Narrator worktree removed", {
+						narratorId,
+						resourceId: resource.id,
+						forced: loses,
+						branchDeleted: branch?.deleted ?? false,
+						elapsedMs: Math.round(performance.now() - started),
+					});
+					return {
+						removed: true as const,
+						path: resource.worktreePath,
+						report,
+						record: retired ? ("retired" as const) : ("retained" as const),
+						branch,
+					};
+				},
+				signal,
+			),
+		);
+	}
+
+	/**
+	 * `git branch -d` first: Git itself confirms the branch is merged into HEAD or its
+	 * upstream. Otherwise delete only when is-ancestor proves the tip is in the base, or
+	 * when a person confirmed discarding its unmerged commits; both delete with a
+	 * compare-and-delete `update-ref` on the reported tip, so a branch that moved since
+	 * the report is kept. A branch checked out anywhere is never deleted.
+	 */
+	private async deleteRemovedBranch(
+		target: WorktreeTarget,
+		name: string,
+		tip: string,
+		base: string,
+		discardConfirmed: boolean,
+		signal: AbortSignal,
+	): Promise<NonNullable<WorktreeRemoveResult["branch"]>> {
+		const failed = (code: string, message: string) => ({
+			name,
+			deleted: false,
+			error: { code, message: message.slice(0, 1024) },
+		});
+		try {
+			validateRef(name);
+			const ref = `refs/heads/${name}`;
+			const valid = await this.run(target, ["check-ref-format", ref], signal);
+			if (valid.exitCode !== 0) return failed("WORKTREE_INVALID_BRANCH", "Invalid Git branch name");
+			const merged = await this.run(target, ["branch", "-d", "--", name], signal, true);
+			if (merged.exitCode === 0) return { name, deleted: true, method: "merged" as const };
+			const contained = await isAncestor(
+				this.queryRunner(target, target.workspace.rootPath ?? "", signal),
+				tip,
+				base,
+			).catch(() => false);
+			if (!contained && !discardConfirmed)
+				return failed(
+					"WORKTREE_BRANCH_NOT_MERGED",
+					(merged.stderr || "The branch is not fully merged").trim(),
+				);
+			const list = await this.entries(target, signal);
+			if (list.truncated || list.entries.some((entry) => entry.branch === ref))
+				return failed(
+					"WORKTREE_BRANCH_CHECKED_OUT",
+					"The branch is checked out in another worktree or the list is incomplete",
+				);
+			const deleted = await this.run(target, ["update-ref", "-d", ref, tip], signal, true);
+			if (deleted.exitCode !== 0)
+				return failed("WORKTREE_BRANCH_MOVED", "The branch moved after the report; it was kept");
+			// What `git branch -d` would also have removed; absence is not an error.
+			await this.run(target, ["config", "--remove-section", `branch.${name}`], signal, true);
+			return {
+				name,
+				deleted: true,
+				method: contained ? ("contained" as const) : ("forced" as const),
+			};
+		} catch (cause) {
+			signal.throwIfAborted();
+			return failed(
+				cause instanceof AppError ? cause.code : "WORKTREE_BRANCH_DELETE_FAILED",
+				cause instanceof Error ? cause.message : "Branch deletion failed",
+			);
+		}
 	}
 }

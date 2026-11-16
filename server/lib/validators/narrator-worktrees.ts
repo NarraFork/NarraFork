@@ -50,3 +50,24 @@ export const worktreePrepareSchema = z
 		},
 	);
 export type WorktreeCreateRequest = z.infer<typeof worktreeCreateSchema>;
+const worktreeRemovalPath = z.string().min(1).max(4096);
+const worktreeRemovalBaseRef = z.string().min(1).max(256);
+export const worktreeRemovalQuerySchema = z
+	.object({ workspaceKey, path: worktreeRemovalPath, baseRef: worktreeRemovalBaseRef.optional() })
+	.strict();
+export const worktreeRemovalDiscardSchema = z
+	.object({
+		head: z
+			.string()
+			.regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/)
+			.nullable(),
+		uncommittedFiles: z.number().int().nonnegative().max(1_000_000_000),
+		unmergedCommits: z.number().int().nonnegative().max(1_000_000_000_000),
+	})
+	.strict();
+export const worktreeRemoveSchema = worktreeRemovalQuerySchema
+	.extend({
+		deleteBranch: z.boolean().default(false),
+		discard: worktreeRemovalDiscardSchema.optional(),
+	})
+	.strict();

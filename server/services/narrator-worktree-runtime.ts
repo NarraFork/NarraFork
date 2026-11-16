@@ -16,6 +16,7 @@ import { unknownWorktreeScope } from "./narrator-worktree-resource-store";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
 import { NarratorWorktreeService } from "./narrator-worktree-service";
 import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspace-context-service";
+import { withWorktreeRetirement } from "./worktree-lifecycle-guard";
 
 /** Real production adapters; fixture tests deliberately import only the pure service. */
 export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrincipal>({
@@ -83,6 +84,7 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 		join(narraforkDir, "worktree-requests"),
 	),
 	resources: narratorWorktreeResourceRegistry,
+	withRetirement: withWorktreeRetirement,
 	generateBranchName: async (principal, narratorId, requirement, signal) => {
 		const [{ summaryGenerate }, { db }, { narrators }] = await Promise.all([
 			import("../lib/agent"),
