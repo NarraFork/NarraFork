@@ -14,38 +14,65 @@ import { loadNarratorForAccess, resolveAclRootId } from "./narrator-acl";
 import { FileWorktreeJournal } from "./narrator-worktree-journal";
 import { unknownWorktreeScope } from "./narrator-worktree-resource-store";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
+import { createWorktreeRetirementPorts } from "./narrator-worktree-retirement";
 import { NarratorWorktreeService } from "./narrator-worktree-service";
 import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspace-context-service";
+
+/**
+ * Authorized worktree target for one narrator.
+ *
+ * `recoverWorktreeList` additionally recovers the repository identity when the session's
+ * own directory no longer exists — the only way to reach a worktree that has to be
+ * pruned, since the caller is typically sitting in the checkout that was deleted.
+ */
+async function resolveWorktreeAuthorization(
+	principal: NarratorPrincipal,
+	narratorId: string,
+	need: "read" | "write",
+	signal: AbortSignal,
+	recoverWorktreeList = false,
+) {
+	if (activeDatabaseBackend !== "sqlite")
+		throw new AppError(
+			"Worktree resource adapter unavailable",
+			503,
+			"WORKTREE_RESOURCE_BACKEND_UNAVAILABLE",
+		);
+	const target = await authorizeGitTargetForPrincipal(
+		principal,
+		{ narratorId },
+		need,
+		signal,
+		false,
+		recoverWorktreeList,
+	);
+	const source = await loadNarratorForAccess(narratorId, principal, "read");
+	const rootId = await resolveAclRootId(source);
+	if (!rootId) return { ...target, resourceScope: unknownWorktreeScope };
+	const root = await loadNarratorForAccess(rootId, principal, "read");
+	signal.throwIfAborted();
+	// Resolver contextProjectId is explicit provenance, not cwd/repository proximity.
+	return {
+		...target,
+		resourceScope: root.ownerUserId
+			? {
+					scopeKind: target.contextProjectId ? ("project" as const) : ("standalone" as const),
+					scopeProjectId: target.contextProjectId ?? null,
+					scopeOwnerUserId: root.ownerUserId,
+				}
+			: unknownWorktreeScope,
+	};
+}
 
 /** Real production adapters; fixture tests deliberately import only the pure service. */
 export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrincipal>({
 	authorizeList: (principal, narratorId, _need, signal) =>
 		authorizeGitTargetForPrincipal(principal, { narratorId }, "read", signal, false, true),
-	authorize: async (principal, narratorId, need, signal) => {
-		if (activeDatabaseBackend !== "sqlite")
-			throw new AppError(
-				"Worktree resource adapter unavailable",
-				503,
-				"WORKTREE_RESOURCE_BACKEND_UNAVAILABLE",
-			);
-		const target = await authorizeGitTargetForPrincipal(principal, { narratorId }, need, signal);
-		const source = await loadNarratorForAccess(narratorId, principal, "read");
-		const rootId = await resolveAclRootId(source);
-		if (!rootId) return { ...target, resourceScope: unknownWorktreeScope };
-		const root = await loadNarratorForAccess(rootId, principal, "read");
-		signal.throwIfAborted();
-		// Resolver contextProjectId is explicit provenance, not cwd/repository proximity.
-		return {
-			...target,
-			resourceScope: root.ownerUserId
-				? {
-						scopeKind: target.contextProjectId ? ("project" as const) : ("standalone" as const),
-						scopeProjectId: target.contextProjectId ?? null,
-						scopeOwnerUserId: root.ownerUserId,
-					}
-				: unknownWorktreeScope,
-		};
-	},
+	authorize: (principal, narratorId, need, signal) =>
+		resolveWorktreeAuthorization(principal, narratorId, need, signal),
+	authorizeRemoval: (principal, narratorId, need, signal) =>
+		resolveWorktreeAuthorization(principal, narratorId, need, signal, true),
+	retirement: createWorktreeRetirementPorts(),
 	authorizeDestination: async (principal, narratorId, source, destination, need, signal) => {
 		const target = await authorizeGitDestinationForPrincipal(
 			principal,
