@@ -4,7 +4,7 @@
  * HOW A CALL IS WRITTEN
  * ---------------------
  *   1. Locate every address the edits name (`agent-scope.ts`: readable spaces only). `/` is the
- *      default space for new pages: the main project's when this turn may write it, else the
+ *      default space for new top-level blocks: the main project's when this turn may write it, else the
  *      session's own. All edits of a call must land in one space, which this turn must be
  *      allowed to write.
  *   2. Parse the markdown and texts (`edit-text.ts`, on a worker when large): read annotations
@@ -27,14 +27,14 @@
  *      through once the agent has seen them. One conflict refuses the whole call, reported with
  *      each conflicting block's current text and where it conflicts; nothing is written. This
  *      and the write run behind the live session barrier (`live-barrier.ts`), so edits still in
- *      a page's live session count as changes: they are committed first and merged with.
+ *      a live editing session count as changes: they are committed first and merged with.
  *   5. Write one transaction with provenance (this narrator as actor, the turn's person as
  *      responsible, the message and tool call), content handed over already normalized. Merged
  *      blocks are ordinary updates marked `merged` (`OUTLINE_CHANGE.MERGE` on their versions),
  *      so the timeline replays them and a revert undoes them like any other commit.
  *
  * The result lists each edit's outcome with the addresses of new blocks, the notes, and hints
- * about the space (a page with the same title already exists); merged blocks are shown as they
+ * about the space (a top-level block with the same title already exists); merged blocks are shown as they
  * now read, as a read shows them, and the ledger moves to the version written. Everything it
  * shows comes from the space being written, which the session may read.
  *
@@ -194,8 +194,8 @@ export interface OutlineEditProvenance {
 	toolCallId: string | null;
 	signal?: AbortSignal;
 	/**
-	 * The user turn's one-shot grant to write the session's behavior page: consumed, and asked only,
-	 * when the edit writes that page (`OutlineWriteOptions.agentBehaviorGrant`). Absent: refused.
+	 * The user turn's one-shot grant to write the session's behavior boundary: consumed, and asked
+	 * only, when the edit writes it (`OutlineWriteOptions.agentBehaviorGrant`). Absent: refused.
 	 */
 	behaviorGrant?: () => boolean;
 }
@@ -208,8 +208,8 @@ export const OUTLINE_EDIT_LIMITS = {
 	maxLabels: 500,
 	/** Aliases of one prefix read to number the next one. */
 	maxAliasesScanned: 2000,
-	/** New pages checked for an existing page with the same title. */
-	maxPageHints: 5,
+	/** New top-level blocks checked for an existing one with the same title. */
+	maxTitleHints: 5,
 	/** Characters of a conflicting block's current text shown. */
 	maxConflictChars: 400,
 	/** UTF-8 bytes of merged blocks' text a result shows; the rest are named only. */
@@ -224,11 +224,11 @@ export const OUTLINE_EDIT_LIMITS = {
 
 /** Change flags that leave out every version of an actor (`findLastWrites`). */
 const ALL_CHANGES = 0x7fffffff;
-/** Change flags of a move: anyone's moves and page changes say nothing about the text. */
+/** Change flags of a move: anyone's moves say nothing about the text. */
 const MOVES = OUTLINE_CHANGE.MOVE | OUTLINE_CHANGE.PAGE;
 /**
- * Change flags of the agent's own versions that leave the text as it was (moves, page changes,
- * checkbox and properties): they do not tell that it knows the text, and are left out.
+ * Change flags of the agent's own versions that leave the text as it was (moves, checkbox
+ * and properties): they do not tell that it knows the text, and are left out.
  */
 const OWN_NOT_TEXT =
 	OUTLINE_CHANGE.MOVE | OUTLINE_CHANGE.PAGE | OUTLINE_CHANGE.TASK | OUTLINE_CHANGE.PROPS;
@@ -991,22 +991,22 @@ export async function outlineEdit(
 	if (noteReport.total > 0) meta.noteRules = noteMeta(false);
 
 	// Hints, read before the barrier (it holds the space's live sessions while it runs): a new
-	// page whose title another page of the space already has.
+	// top-level block whose title another top-level block of the space already has.
 	const hints: string[] = [];
 	let hinted = 0;
 	for (const edit of edits) {
 		if (edit.kind !== "add" || edit.parent?.kind !== "root") continue;
 		for (const p of edit.items ?? []) {
-			if (hinted >= OUTLINE_EDIT_LIMITS.maxPageHints || !p.item.title) continue;
+			if (hinted >= OUTLINE_EDIT_LIMITS.maxTitleHints || !p.item.title) continue;
 			hinted++;
 			const r = await scope.resolve(p.item.title, space);
 			const same = r.status === "found" ? [r.block] : r.status === "ambiguous" ? r.candidates : [];
-			const pages = same.filter((b) => b.isPage && b.spaceId === space.id);
-			if (pages.length > 0) {
+			const tops = same.filter((b) => b.isPage && b.spaceId === space.id);
+			if (tops.length > 0) {
 				hints.push(
-					OUTLINE_TOOL_TEXT.edit.samePageTitle(
+					OUTLINE_TOOL_TEXT.edit.sameTopTitle(
 						clip(p.item.title, 60),
-						pages.map((b) => b.address),
+						tops.map((b) => b.address),
 					),
 				);
 			}
@@ -1417,7 +1417,7 @@ export async function outlineEdit(
 
 			// A task of the session's own space given to someone who cannot work in that space is
 			// handed out (outline P2 PR 10c-3, owner decision 2026-11-13): the assignee leaves this
-			// write, and a copy goes to the project's task page after it, which the task waits for.
+			// write, and a copy goes to the project's task list after it, which the task waits for.
 			const handOutPlan = await planAgentHandOuts({
 				space,
 				by: {

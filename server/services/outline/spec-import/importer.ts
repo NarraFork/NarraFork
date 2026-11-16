@@ -71,7 +71,7 @@ import { beginSpecImport, invalidateTaskBackend, isSpecImporting } from "../../t
 import {
 	behaviorImportTagOf,
 	behaviorImportTagOfSid,
-	findBehaviorPage,
+	findBehaviorBlock,
 	importBehaviorFenceText,
 	OUTLINE_BEHAVIOR_IMPORT_ACTOR,
 } from "../../task-source/outline-behavior";
@@ -1381,7 +1381,7 @@ async function removeStale(
 			ids: stalePages.slice(i, i + limits.sidLookup),
 		}))
 			if (!meta.deleted) stale.push(block(meta, true));
-	const behavior = await findBehaviorPage(space.id);
+	const behavior = await findBehaviorBlock(space.id);
 	if (behavior) {
 		for (const meta of await outlineStore.listLastChildMetas(
 			space.id,

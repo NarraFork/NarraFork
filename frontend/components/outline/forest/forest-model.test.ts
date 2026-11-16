@@ -864,3 +864,49 @@ describe("fold writes in flight, resets and the page going away (review round 2)
 		expect(o.collapsed.has("fact")).toBe(false);
 	});
 });
+
+describe("reads by blocks shown (A1's budget)", () => {
+	test("a window read in the facts view goes on past a chunk that showed nothing", async () => {
+		const o = new FakeOutline();
+		o.add({ id: "top1", parentId: null, content: "Top" });
+		for (let i = 0; i < 150; i++)
+			o.add({ id: `task-${i}`, parentId: "top1", content: `Task ${i}`, task: "done" });
+		o.fill("top1", "fact", 20);
+		// One read takes at most 100 store rows: the first ends among the tasks, shows nothing,
+		// and says "more" with a cursor after them.
+		o.rowsCap = 100;
+		const { model } = await forest(o, { rootId: "top1", view: "facts" });
+		await settle();
+		await (
+			model as unknown as {
+				readWindow(k: string, s: string | null, t: number, p: unknown[]): Promise<void>;
+			}
+		).readWindow("top1", null, 200, []);
+		const level = model.levelOf("top1");
+		expect(level?.ids.length).toBe(20);
+		expect(level?.more).toBe(false);
+		expect(level?.processHidden).toBe(150);
+	});
+
+	test("a level that showed nothing yet is not taken for a leaf, and continues by 'more'", async () => {
+		const o = new FakeOutline();
+		o.add({ id: "top1", parentId: null, content: "Top" });
+		o.add({ id: "parent", parentId: "top1", content: "Parent" });
+		for (let i = 0; i < 150; i++)
+			o.add({ id: `t-${i}`, parentId: "parent", content: `Task ${i}`, task: "todo" });
+		o.add({ id: "afterTasks", parentId: "parent", content: "A fact after the tasks" });
+		o.rowsCap = 100;
+		o.expanded.add("parent");
+		const { model } = await forest(o, { rootId: "top1", view: "facts" });
+		await settle();
+		const level = model.levelOf("parent");
+		expect(level?.ids).toEqual([]);
+		expect(level?.more).toBe(true);
+		expect(model.blockOf("parent")?.hasChildren).toBe(true);
+		const more = model.getView().rows.find((r) => r.kind === "more" && r.parentKey === "parent");
+		expect(more?.kind === "more" && more.mode).toBe("more");
+		await model.more("parent", "more");
+		await model.more("parent", "more");
+		expect(model.levelOf("parent")?.ids).toEqual(["afterTasks"]);
+	});
+});

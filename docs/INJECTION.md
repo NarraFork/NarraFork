@@ -208,6 +208,8 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 
 这两条空闲路径的**文本**仍来自各自原有的格式化函数（那套措辞是它们一直发送的、且在别处被断言），body 只是随行给读者。
 
+**大纲没有「页」（pageless A1）**：模型看到的大纲文字里不再有「页」。空间直接装块；`OutlineRead` / `OutlineSearch` / `OutlineEdit` 的说明、参数、返回，大纲的系统提示段（`server/lib/prompts/outline-*.ts`），以及下面各条注入的正文，都只说块、顶层块、任务清单（`session/tasks`、`project/tasks`）和行为边界（`session/behavior`）。地址不变。`server/lib/prompts/__tests__/outline-pageless.guard.test.ts` 守着这一点：这些文字里出现 page / 页 就失败。这次改字改变了大纲会话的系统提示和工具定义，所以**升级后第一次请求，每个大纲会话的前缀缓存失效一次**，之后照常命中。
+
 **大纲任务的人为改动（`outline_task_edit`，`server/services/outline-task-edits.ts`，outline P2 PR 5）**：一律 `role: sys`，不带 `createdBy`，正文以「系统通知（不是用户发言）」开头，按人分组写明谁改了哪个任务（地址、标题、改动），不多于大纲里本来就有的内容。改动的人可能读不到这个会话（项目空间的写者改了某个私有会话认领的任务），所以它从不作为那个人的消息、也从不成为运行的主体（principal）。按会话合并（安静 1 秒、最长 4 秒），每个人的改动各自成组：
 
 | 会话状态 | schedule | 去处 |
@@ -216,7 +218,7 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 | 运行中 | `onNextTurn` | 在内存里等，下一个工具边界由 `drainInjectionsIntoHistory` 取走并写行 |
 | 运行在工具边界前就结束了 | `none` | 守望定时器（2 秒）发现运行已结束，把还在等的通知写成一行 |
 
-看板的「添加并开始」「重新打开并开始」在启动会话前先 `flushOutlineTaskEdits`，让这一回合读到通知。`/goal` 自己的提交不发通知（它的消息已经说了）。行为边界页上的复选框是规则不是任务，不发通知。
+看板的「添加并开始」「重新打开并开始」在启动会话前先 `flushOutlineTaskEdits`，让这一回合读到通知。`/goal` 自己的提交不发通知（它的消息已经说了）。行为边界（`session/behavior`，别名 `behavior` 的顶层块）下面的复选框是规则不是任务，不发通知；「在不在它下面」按祖先判断。
 
 **本会话建的任务在别处结束（`outline_task_finished`，`server/services/outline/task-finished.ts`，outline P2 PR 9b）**：监听 `outline:committed`，读这次提交写的版本（不读正文，最多 200 条）。任务在这次提交前是待办或进行中、提交后是完成或取消，且 `task_json.manager` 是一个会话（agent）时，告诉那个会话（子代理建的任务告诉它的根会话）；不告诉的情况：结束它的就是这个会话或它的子代理（子代理的结果本身就是通知）、会话不存在或已归档、会话的任务不在大纲、人的提交而 PR 5（`outline_task_edit`）已经会告诉这个会话。管理者是人时这里不发（进汇报，看板标「新完成」）。
 - 一律 `role: sys`、不带 `createdBy`；body 是 `outlineTasks`，variant `finished`，每个任务带结束者和状态变化，读者看到「X 结束了本会话建的 N 个任务」（X 是会话标题或用户名，不带哪种语言的字）。
@@ -237,10 +239,10 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 - 团队动态（下一段）不再重复团队行已经说过的：指派给本会话的任务、本会话建的任务结束。
 - 被指派、还没开始的任务另外出现在「当前任务」视图的「指派给你、还没开始」一节（最多 5 行；`outline/assigned.ts` 在内存里记着通知过的任务，重启后对主项目空间做一次有上限的读来重建）。
 
-**团队动态（`outline_team_activity`，`server/services/outline/team-activity.ts`，outline P2 PR 10b）**：上一轮之后别人在本会话周围做的事。范围集中在 `OUTLINE_TEAM_ACTIVITY_SCOPE` 一处（负责人 Q5 未定，现按设计说明的推荐 A）：本会话领着、管着、被指派、最近 7 天写过的任务所在的任务树（项目空间里，往上到页下面最上层的任务）里别人的状态变化、转交、新子任务、笔记 / 报告 / 回答（只计数）；项目任务页（别名 `tasks`）上任务级的变化，最多 8 行；本会话改过、别的会话进行中的任务后来也改了的文件（`outline/overlap.ts`）。不放：自己和自己子代理的提交；人对它领着（或上次领着）的任务的改动（PR 5 的 `outline_task_edit` 已经说过）；整理（改字、挪位置）；会话空间。
+**团队动态（`outline_team_activity`，`server/services/outline/team-activity.ts`，outline P2 PR 10b）**：上一轮之后别人在本会话周围做的事。范围集中在 `OUTLINE_TEAM_ACTIVITY_SCOPE` 一处（负责人 Q5 未定，现按设计说明的推荐 A）：本会话领着、管着、被指派、最近 7 天写过的任务所在的任务树（项目空间里，往上到最上层的任务）里别人的状态变化、转交、新子任务、笔记 / 报告 / 回答（只计数）；项目任务清单（`project/tasks`，别名 `tasks` 的顶层块）下面任务级的变化，最多 8 行；本会话改过、别的会话进行中的任务后来也改了的文件（`outline/overlap.ts`）。不放：自己和自己子代理的提交；人对它领着（或上次领着）的任务的改动（PR 5 的 `outline_task_edit` 已经说过）；整理（改字、挪位置）；会话空间。
 - 一律 `role: sys`、不带 `createdBy`，不唤醒。运行开头（`prepareOutlineRun`，第一次准备前缀之前）写一行，`schedule: none`，这一轮的历史读进来时已经带着；长回合在工具边界最多每 10 分钟再看一次（两次之间什么都不读），有新东西才写，`onNextTurn`。
 - 只追加在历史末尾，不进系统提示、工具定义和命名上下文：正文是确定的（没有相对时间、租约时间），重建历史、重试请求发出去的字节一样，两轮之间的系统提示字节不变。
-- 正文最多 4 KiB、20 行，一棵树最多 5 行，标题截到 80 字；放不下的在最后一行计数，并指向项目任务页。名字按 `canSessionReadNarrator`：读这个会话的人都能读的会话才写标题，否则写「另一个会话」；人写用户名。读者看到的 body 是 `outlineTasks`，variant `activity`，每项带「谁」（标题或用户名，不带哪种语言的字），change 多了 `notes` / `reports` / `answers`（计数）、`claimable`、`overlap`（文件路径）。
+- 正文最多 4 KiB、20 行，一棵树最多 5 行，标题截到 80 字；放不下的在最后一行计数，并指向项目任务清单。名字按 `canSessionReadNarrator`：读这个会话的人都能读的会话才写标题，否则写「另一个会话」；人写用户名。读者看到的 body 是 `outlineTasks`，variant `activity`，每项带「谁」（标题或用户名，不带哪种语言的字），change 多了 `notes` / `reports` / `answers`（计数）、`claimable`、`overlap`（文件路径）。
 - 窗口：每个（会话，空间）一个 seq 游标，只在内存；第一次（新进程、新会话、fork）从会话上一次运行结束（`narrator_turns`，没有就是会话创建）开始，最多往回 2 小时。读的都是有界、走索引的：每个空间最多 50 个提交、300 条不带正文的版本、30 个标题。会话运行时只在 SQLite 上跑，所以只在 SQLite 上写行；读的部分两种方言共用，PG 上有同一组场景测试。
 - 重叠提示（同一个 PR）不是注入：它是 Write、Edit 工具结果末尾的一行（`trackFileChange` 返回，`withOverlapHint` 接上），见 `outline/overlap.ts`。
 
@@ -257,7 +259,7 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 **Dynamic Spec 已搬进大纲（`spec_import`，`server/services/outline/spec-import/notice.ts`，outline P2 PR 12b2）**：导入（运行开始前、后台 job、Spec 面板按钮、管理员重导，任何入口）把一个旧会话从 Dynamic Spec 切到大纲之后，这个会话下一次运行开头（`prepareOutlineRun`，运行开始导入之后、第一次准备前缀之前）写一行，告诉模型任务、笔记、行为边界现在在哪、`spec://` 不再适用。
 - `role: sys`、不带 `createdBy`、`schedule: none`（这一轮的历史读进来时已经带着；不唤醒空闲会话）。只在历史里，不进系统提示、工具定义和命名上下文。
 - **每次切换恰好一行**：状态表 `outline_spec_imports` 记切换次数 `switch_count` 和已经告诉过的那一次 `notice_switch`；行 id 由（会话，`switch_count`）推出（`specImportNoticeId`）。写之前按 id 查这一行在不在：进程在写行和记账之间停了，重启后只补记账、不写第二行。管理员退回 Dynamic Spec 再重导是新的一次切换，再写一行；退回状态下不写。导入什么也没写（会话从没用过 Dynamic Spec）记成已告诉，不写。只在 SQLite 上写（会话运行时只在 SQLite 上跑）。
-- 正文按会话负责人的语言（en、zh-CN），以「System notice (not the user speaking)」/「系统通知（不是用户发言）」开头：任务页 `session/tasks`（导入了几个）、行为边界页 `session/behavior`、原来的每个 `spec://` 文件对应的大纲页 `spec://design.md → session/<sid>`（读会话空间最多 60 个页，列最多 20 个，其余计数），最后说 `spec://` 不再适用、用 OutlineRead / OutlineSearch / OutlineEdit。正文是确定的（没有时间），重建历史发出去的字节一样。
+- 正文按会话负责人的语言（en、zh-CN），以「System notice (not the user speaking)」/「系统通知（不是用户发言）」开头：任务清单 `session/tasks`（导入了几个）、行为边界 `session/behavior`、原来的每个 `spec://` 文件对应的顶层块 `spec://design.md → session/<sid>`（读会话空间最多 60 个顶层块，列最多 20 个，其余计数），最后说 `spec://` 不再适用、用 OutlineRead / OutlineSearch / OutlineEdit。正文是确定的（没有时间），重建历史发出去的字节一样。
 - 读者看到的 body 是 `prose`（同模型文字）；来源标签「Dynamic Spec moved to the outline / Dynamic Spec 已搬进大纲」。
 - 配套（不是注入）：这种会话里点名 `spec://` 的工具调用（`getOutlineSpecRejection`，`AgentConfig.specImported`）回答「已搬进大纲、各在哪」，而不是一般大纲会话那句；界面和插件的 spec 写入拒绝用 `SPEC_MOVED_TO_OUTLINE`（code 仍是 `SPEC_OUTLINE_SESSION`）。
 

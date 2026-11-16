@@ -207,7 +207,7 @@ describe("OutlineEdit then OutlineRead", () => {
 		const c = ctx(w.session, w.alice);
 		const empty = await call(outlineReadTool, {}, c);
 		expect(empty.output).toContain(w.space.key);
-		expect(empty.output).toContain("no pages yet");
+		expect(empty.output).toContain("nothing here yet");
 
 		const added = await call(
 			outlineEditTool,
@@ -239,7 +239,9 @@ describe("OutlineEdit then OutlineRead", () => {
 		expect(lines[1]).toBe(`- [${page}] Auth module`);
 		expect(lines[2]).toBe(`  - [${created[1]}] Refresh tokens live only on the server`);
 		expect(read.output).not.toContain("regression");
-		expect(read.output).toContain("‹facts only: 2 blocks under tasks not shown");
+		// Shape changed (pageless A1): a read by block counts the tasks and questions it left out,
+		// not the blocks under them (it never reads those).
+		expect(read.output).toContain("‹facts only: 1 task or question not shown");
 		expect(read.truncated).toBe(true);
 
 		const all = await call(outlineReadTool, { address: page, view: "all" }, c);
@@ -312,7 +314,25 @@ describe("OutlineEdit then OutlineRead", () => {
 		const page = ids(added.output)[0] as string;
 		const small = await call(outlineReadTool, { address: page, budget: 4 }, c);
 		expect(ids(small.output)).toHaveLength(4);
-		expect(small.output).toContain("‹… 9 more›");
+		// Shape changed (pageless A1): a read does not load what the budget leaves out, so it
+		// cannot count it; the level is continued with `after`.
+		expect(small.output).toContain("\n  ‹… more›");
+		const last = ids(small.output)[3] as string;
+		const next = await call(outlineReadTool, { address: page, after: last, budget: 4 }, c);
+		expect(next.output.split("\n")[0]).toContain(`in Wide page · after [${last}]`);
+		expect(next.output).toContain("item 3");
+		expect(next.output).toContain("item 6");
+		expect(next.output).not.toContain("item 2");
+		expect(ids(next.output)).toHaveLength(4);
+		expect(next.output).toContain("‹… more›");
+		const rest = await call(
+			outlineReadTool,
+			{ address: page, after: ids(next.output)[3] as string },
+			c,
+		);
+		expect(ids(rest.output)).toHaveLength(5);
+		expect(rest.output).not.toContain("more›");
+		expect(rest.metadata?.truncated).toBe(false);
 		expect(small.metadata?.truncated).toBe(true);
 
 		const item0 = ids(added.output)[1] as string;
@@ -1697,7 +1717,7 @@ describe("OutlineEdit write rules", () => {
 			const fallback = await call(outlineEditTool, { edits: [{ add: "/", markdown: "- y" }] }, c);
 			expect(fallback.isError).toBeUndefined();
 			expect(fallback.output).toContain("this session's notes");
-			expect(fallback.output).toContain("new pages went to this session's notes");
+			expect(fallback.output).toContain("the new top-level blocks went to this session's notes");
 			const session = await call(
 				outlineEditTool,
 				{ edits: [{ add: "session/", markdown: "- z" }] },
@@ -1736,7 +1756,7 @@ describe("OutlineEdit write rules", () => {
 		expect(direct.output).toContain("may not write");
 		const fallback = await call(outlineEditTool, { edits: [{ add: "/", markdown: "- y" }] }, c);
 		expect(fallback.isError).toBeUndefined();
-		expect(fallback.output).toContain("new pages went to this session's notes");
+		expect(fallback.output).toContain("the new top-level blocks went to this session's notes");
 	});
 });
 
@@ -1785,7 +1805,7 @@ describe("through the tool executor", () => {
 
 		const overview = await run("OutlineRead", {}, "e2e-1");
 		expect(overview.isError).toBeFalsy();
-		expect(overview.output).toContain("no pages yet");
+		expect(overview.output).toContain("nothing here yet");
 
 		const added = await run(
 			"OutlineEdit",

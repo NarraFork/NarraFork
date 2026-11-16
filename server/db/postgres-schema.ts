@@ -3893,6 +3893,22 @@ export const outlineLiveUpdates = pgTable(
 	(table) => [primaryKey({ columns: [table.pageBlockId, table.epoch, table.seq] })],
 );
 
+export const outlineLiveLog = pgTable(
+	"outline_live_log",
+	{
+		spaceId: text("space_id")
+			.notNull()
+			.references((): PgColumn => outlineSpaces.id, { onDelete: "cascade" }),
+		epoch: integer("epoch").notNull(),
+		seq: integer("seq").notNull(),
+		updateB64: text("update_b64").notNull(),
+		actorKind: text("actor_kind").notNull(),
+		actorId: text("actor_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.spaceId, table.epoch, table.seq] })],
+);
+
 export const outlineViewState = pgTable(
 	"outline_view_state",
 	{
@@ -4523,8 +4539,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 147,
-  "columnCount": 1932,
+  "tableCount": 148,
+  "columnCount": 1939,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -26780,6 +26796,96 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "columns": [
             "pageBlockId",
+            "epoch",
+            "seq"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "outlineLiveLog",
+      "name": "outline_live_log",
+      "columns": [
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineSpaces",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_live_log_space_id_outline_spaces_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "epoch",
+          "name": "epoch",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "seq",
+          "name": "seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updateB64",
+          "name": "update_b64",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorKind",
+          "name": "actor_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorId",
+          "name": "actor_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "spaceId",
             "epoch",
             "seq"
           ]

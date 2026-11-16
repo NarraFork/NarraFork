@@ -39,6 +39,7 @@
 | 跳过会话 | 不导入该会话的消息、引用、工具调用、消息块，以及 `narrator_id` 指向它的请求 |
 | 覆盖会话 | 保留会话行（`narrator_messages.narrator_id` 是 NOT NULL，删行会失败），用导入行 `UPDATE` 各列。子行按主键合并，不删除本地的引用、工具调用或消息块。例外：`task_backend` 变了时删掉该会话在 `outline_spec_imports` 的行（见下） |
 | Dynamic Spec 导入状态 `outline_spec_imports` | **不导出**。它说的是本机 spec 行和本机大纲内容之间的关系，而 spec 表和大纲表都不导出，带过去的行会指向那边没有的空间、任务页、spec 修订，`reverted` 还会挡住那边的导入。`narrators.task_backend` 随会话行照旧复制。覆盖本地会话时，导入行带来的 `task_backend` 和本地不同才删掉它的状态行（下次尝试重新得出）；相同就保留（管理员的退回决定不丢）。导入后清任务后端与导入状态的缓存 |
+| 大纲实时编辑日志 `outline_live_log` | **不导出，不导入，清空时不单独处理**。它是一个空间的实时会话还没提交的文字（瞬时状态）：会话正常结束时自己删掉，崩溃留下的由启动任务回放成提交后删掉。大纲的表本身不在导出里，带过去的行对不上那边的空间；行随 `outline_spaces` 外键级联删除，所以「清空会话」删掉会话空间时一起消失 |
 | 被吞内容排查 `outline_spec_loss_findings` / `outline_spec_loss_scans` | **不导出**。记录的是本机 spec 修订里「旧 Spec 面板保存后可能丢失的内容」和哪些会话查过；spec 表不导出，带过去的行对不上那边的修订，那边的排查会自己重新得出。覆盖本地会话时**不动**这两张表（数据导入不改本机的 spec 行，记录仍然成立，人的处理决定也保留） |
 | 消息 `narrator_messages` | `INSERT OR IGNORE`（主键相同的消息被复用，保持 fork 共享语义，不覆盖其它会话内容） |
 | 引用 / 工具调用 | `INSERT OR IGNORE` |

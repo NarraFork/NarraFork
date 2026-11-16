@@ -1440,8 +1440,10 @@ export class SpaceForest {
 				processHidden += found.processHidden;
 				more = found.more;
 				next = found.nextCursor;
-				// (A read that brought nothing and no cursor would never end.)
-				if (!more || next === null || ids.length >= target || found.childIds.length === 0) break;
+				// A read may show nothing and still go on (since A1 the budget counts rows SHOWN, and
+				// where the store rows run out among hidden ones the level continues after them):
+				// it stops only when the cursor does not move.
+				if (!more || next === null || ids.length >= target || next === cursor) break;
 				cursor = next;
 			}
 			this.levels.set(key, {

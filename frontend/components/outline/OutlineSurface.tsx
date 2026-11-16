@@ -686,9 +686,22 @@ function SurfaceBody({
 							fallback !== "access_denied" &&
 							fallback !== "outdated" &&
 							fallback !== "tab_limit" && (
-								<Alert variant="light" color="gray" py={6} mb="xs">
+								<Alert
+									variant="light"
+									color="gray"
+									py={6}
+									mb="xs"
+									data-testid="outline-live-unavailable"
+									data-code={fallback}
+								>
 									<Group gap="xs" wrap="wrap">
-										<Text size="sm">{t("editor.unavailable")}</Text>
+										<Text size="sm">
+											{fallback === "user_limit"
+												? t("editor.userLimit")
+												: fallback === "space_full"
+													? t("editor.spaceFull")
+													: t("editor.unavailable")}
+										</Text>
 										<Button size="compact-xs" variant="light" onClick={() => setFallback(null)}>
 											{t("editor.retry")}
 										</Button>

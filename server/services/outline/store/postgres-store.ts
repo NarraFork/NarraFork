@@ -25,6 +25,7 @@ import {
 	outlineCommits,
 	outlineFoldState,
 	outlineLinks,
+	outlineLiveLog,
 	outlineLiveUpdates,
 	outlinePending,
 	outlineQuestions,
@@ -86,7 +87,7 @@ import {
 	type OutlineCommitPlan,
 	type OutlineCommitRow,
 	type OutlineLinkRow,
-	type OutlineLiveUpdateRow,
+	type OutlineLiveLogRow,
 	type OutlinePendingDecision,
 	type OutlinePendingHead,
 	OutlinePendingMovedError,
@@ -187,9 +188,9 @@ function toVersion(row: VersionSelect): OutlineVersionRow {
 	return { ...row, taskJson: taskOf(row.taskJson), askJson: askOf(row.askJson) };
 }
 
-type LiveUpdateSelect = typeof outlineLiveUpdates.$inferSelect;
+type LiveUpdateSelect = typeof outlineLiveLog.$inferSelect;
 
-function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveUpdateRow {
+function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveLogRow {
 	return { ...row, actorKind: row.actorKind as OutlineActorKind };
 }
 
@@ -356,25 +357,23 @@ async function putViewStateSection(
 /** Append live log rows; one transaction so a chunked append lands whole. */
 async function appendLiveSection(
 	tx: PgTransaction,
-	rows: readonly OutlineLiveUpdateRow[],
+	rows: readonly OutlineLiveLogRow[],
 ): Promise<void> {
 	for (const chunk of chunked(rows, LIVE_INSERT_CHUNK)) {
-		await tx.insert(outlineLiveUpdates).values([...chunk]);
+		await tx.insert(outlineLiveLog).values([...chunk]);
 	}
 }
 
 /** Replace an epoch's rows (a compaction). */
 async function replaceLiveSection(
 	tx: PgTransaction,
-	pageBlockId: string,
+	spaceId: string,
 	epoch: number,
-	rows: readonly OutlineLiveUpdateRow[],
+	rows: readonly OutlineLiveLogRow[],
 ): Promise<void> {
 	await tx
-		.delete(outlineLiveUpdates)
-		.where(
-			and(eq(outlineLiveUpdates.pageBlockId, pageBlockId), eq(outlineLiveUpdates.epoch, epoch)),
-		);
+		.delete(outlineLiveLog)
+		.where(and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)));
 	await appendLiveSection(tx, rows);
 }
 
@@ -1230,64 +1229,68 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return rows.map(toCommit);
 		},
 
-		async appendLiveUpdates(rows) {
+		async appendLiveLog(rows) {
 			if (rows.length === 0) return;
 			await withPgRetry(() => db.transaction((tx) => appendLiveSection(tx, rows)), {
-				label: "outline.appendLiveUpdates",
+				label: "outline.appendLiveLog",
 			});
 		},
 
-		async replaceLiveUpdates(pageBlockId, epoch, rows) {
+		async replaceLiveLog(spaceId, epoch, rows) {
 			await withPgRetry(
-				() => db.transaction((tx) => replaceLiveSection(tx, pageBlockId, epoch, rows)),
-				{ label: "outline.replaceLiveUpdates" },
+				() => db.transaction((tx) => replaceLiveSection(tx, spaceId, epoch, rows)),
+				{ label: "outline.replaceLiveLog" },
 			);
 		},
 
-		async listLiveUpdates(pageBlockId, epoch, options) {
+		async listLiveLog(spaceId, epoch, options) {
 			const rows = await db
 				.select()
-				.from(outlineLiveUpdates)
+				.from(outlineLiveLog)
 				.where(
 					and(
-						eq(outlineLiveUpdates.pageBlockId, pageBlockId),
-						eq(outlineLiveUpdates.epoch, epoch),
-						options.afterSeq === undefined
-							? undefined
-							: gt(outlineLiveUpdates.seq, options.afterSeq),
+						eq(outlineLiveLog.spaceId, spaceId),
+						eq(outlineLiveLog.epoch, epoch),
+						options.afterSeq === undefined ? undefined : gt(outlineLiveLog.seq, options.afterSeq),
 					),
 				)
-				.orderBy(asc(outlineLiveUpdates.seq))
+				.orderBy(asc(outlineLiveLog.seq))
 				.limit(options.limit);
 			return rows.map(toLiveUpdate);
 		},
 
-		async deleteLiveUpdates(pageBlockId, epoch) {
+		async deleteLiveLog(spaceId, epoch) {
 			const rows = await db
-				.delete(outlineLiveUpdates)
-				.where(
-					and(eq(outlineLiveUpdates.pageBlockId, pageBlockId), eq(outlineLiveUpdates.epoch, epoch)),
-				)
-				.returning({ seq: outlineLiveUpdates.seq });
+				.delete(outlineLiveLog)
+				.where(and(eq(outlineLiveLog.spaceId, spaceId), eq(outlineLiveLog.epoch, epoch)))
+				.returning({ seq: outlineLiveLog.seq });
 			return rows.length;
 		},
 
-		async listLiveEpochs(options) {
+		async countLegacyLiveUpdates(limit) {
+			const rows = await db
+				.select({ seq: outlineLiveUpdates.seq })
+				.from(outlineLiveUpdates)
+				.limit(limit);
+			return rows.length;
+		},
+
+		async listLiveLogEpochs(options) {
 			const after = options.after;
-			// Page ids are compared bytewise, as in the SQLite store.
+			// Space ids are compared bytewise, as in the SQLite store.
 			return await db
 				.select({
-					pageBlockId: outlineLiveUpdates.pageBlockId,
-					epoch: outlineLiveUpdates.epoch,
+					spaceId: outlineLiveLog.spaceId,
+					epoch: outlineLiveLog.epoch,
 				})
-				.from(outlineLiveUpdates)
+				.from(outlineLiveLog)
 				.where(
 					after
-						? sql`(${outlineLiveUpdates.pageBlockId} COLLATE "C", ${outlineLiveUpdates.epoch}) > (${after.pageBlockId} COLLATE "C", ${after.epoch})`
+						? sql`(${outlineLiveLog.spaceId} COLLATE "C", ${outlineLiveLog.epoch}) > (${after.spaceId} COLLATE "C", ${after.epoch})`
 						: undefined,
 				)
-				.groupBy(outlineLiveUpdates.pageBlockId, outlineLiveUpdates.epoch)
-				.orderBy(sql`${outlineLiveUpdates.pageBlockId} COLLATE "C"`, asc(outlineLiveUpdates.epoch))
+				.groupBy(outlineLiveLog.spaceId, outlineLiveLog.epoch)
+				.orderBy(sql`${outlineLiveLog.spaceId} COLLATE "C"`, asc(outlineLiveLog.epoch))
 				.limit(options.limit);
 		},
 

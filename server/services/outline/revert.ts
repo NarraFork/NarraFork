@@ -133,7 +133,7 @@ interface Plan {
 const sameTask = sameTaskJson;
 
 /** A task as it was, every field spelled out, so the write puts back exactly that. */
-function taskInput(task: OutlineTaskJson): OutlineTaskInput {
+export function taskInput(task: OutlineTaskJson): OutlineTaskInput {
 	return {
 		status: task.status,
 		assignee: task.assignee,
@@ -152,7 +152,7 @@ function taskInput(task: OutlineTaskJson): OutlineTaskInput {
  * it changed. Putting back the other fields of a task in progress is not starting it, so it
  * claims nothing (a `setTask` naming `doing` would).
  */
-function taskPatch(task: OutlineTaskJson, now: OutlineTaskJson | null): OutlineTaskPatch {
+export function taskPatch(task: OutlineTaskJson, now: OutlineTaskJson | null): OutlineTaskPatch {
 	const { status, ...rest } = taskInput(task);
 	return now?.status === status ? rest : { status, ...rest };
 }

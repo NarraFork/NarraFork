@@ -21,6 +21,14 @@ describe("outline tools", () => {
 		expect(
 			getSummary("OutlineRead", { address: "Ab3dEf9Q" }, { title: TASK.title, blocks: 4 }),
 		).toBe("Fix the retry button · 4 blocks");
+		// A level continued after one of its children (pageless A1).
+		expect(
+			getSummary(
+				"OutlineRead",
+				{ address: "Ab3dEf9Q", after: "Zz9dEf9Q" },
+				{ title: TASK.title, blocks: 4 },
+			),
+		).toBe("Fix the retry button · continued · 4 blocks");
 	});
 
 	it("summarize a search by its query and hits", () => {
@@ -66,7 +74,7 @@ describe("outline tools", () => {
 				},
 				{ commit: { id: "c", seq: 9 } },
 			),
-		).toBe("1 new page(s) · added 2 · +1");
+		).toBe("1 at the top level · added 2 · +1");
 		expect(getSummary("OutlineEdit", { edits: [{ set: "Ab3dEf9Q", checkbox: "x" }] })).toBe(
 			"Ticked Ab3dEf9Q done",
 		);

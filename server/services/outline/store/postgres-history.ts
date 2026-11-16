@@ -32,12 +32,15 @@ import {
 	type OutlineEdgeRow,
 	type OutlineHistoryPort,
 	type OutlineHistoryState,
+	OutlineHistoryUnavailableError,
 	type OutlineLevelCursor,
 	type OutlineLevelRow,
 	type OutlineParentRow,
 	type OutlineSubtreeChange,
 	pageChangedChildren,
 	readSubtreeByLevels,
+	underRootInBoundedStatements,
+	uniquePairs,
 } from "./history-port";
 import { chunked, type OutlineSpaceRow } from "./port";
 
@@ -368,19 +371,70 @@ export function pgAncestryAsOf(
 }
 
 /**
+ * For each `(block id, seq)` pair whose block is of the space: where it last sat as of that
+ * seq and whether that was strictly under `rootId`, one row per pair: SQLite's
+ * `SQLITE_UNDER_ROOT_AT`. The pairs come from a `VALUES` list inside a fence, each block found
+ * by id inside a fence (the space a filter on what was found), and every step up is a
+ * `LATERAL` backward seek on the block's placements.
+ */
+export function pgUnderRootAt(
+	spaceId: string,
+	rootId: string,
+	pairs: ReadonlyArray<readonly [string, number]>,
+	maxDepth: number,
+): SQL {
+	return sql`
+		WITH RECURSIVE up(start, seq, id, at, depth) AS (
+			SELECT CAST(s.id AS text), g.seq, CAST(s.id AS text), g.seq, 0
+			FROM (SELECT * FROM (VALUES ${sql.join(
+				pairs.map(([id, seq]) => sql`(${text(id)}, ${int(seq)})`),
+				sql`, `,
+			)}) given(id, seq) OFFSET 0) g
+			CROSS JOIN LATERAL (
+				SELECT y.id FROM outline_blocks y
+				WHERE y.id = g.id AND y.space_id = ${text(spaceId)} OFFSET 0
+			) s
+			UNION ALL
+			SELECT up.start, up.seq, CAST(p.parent_key AS text),
+				CAST(CASE WHEN up.depth > 0 OR p.to_seq IS NULL THEN up.at
+					ELSE LEAST(p.to_seq - 1, up.at) END AS integer),
+				up.depth + 1
+			FROM up LEFT JOIN LATERAL (
+				SELECT e.parent_key, e.to_seq FROM outline_block_edges e
+				WHERE e.block_id = up.id AND e.from_seq <= up.at
+					AND (up.depth = 0 OR e.to_seq IS NULL OR e.to_seq > up.at)
+				ORDER BY e.from_seq DESC LIMIT 1
+			) p ON TRUE
+			WHERE up.id IS NOT NULL AND (up.depth = 0 OR up.id <> ${text(rootId)})
+				AND up.id <> ${text(spaceId)} AND up.depth <= ${int(maxDepth)}
+		)
+		SELECT start, seq, bool_or(depth > 0 AND id = ${text(rootId)}) AS under,
+			max(CASE WHEN depth = 1 THEN id END) AS parent_key, max(depth) AS steps,
+			bool_or(id IS NULL OR (depth > 0 AND id = ${text(rootId)}) OR id = ${text(spaceId)})
+				AS ended
+		FROM up GROUP BY start, seq`;
+}
+
+/**
  * The given blocks and every ancestor of them, each once: SQLite's `SQLITE_ANCESTRY_OF`, the
  * step up fenced as the commit's change marks are ({@link pgMarkAncestorsSql}). Each row
  * carries its space and whether it is deleted; the caller keeps the live blocks of its space.
  * Only live blocks of the space start a walk (found by id inside a fence, the space a filter
- * on what was found), so other ids use up none of the limit.
+ * on what was found), so other ids use up none of the limit; with `includeDeleted`, deleted
+ * blocks of the space too (`SQLITE_ANCESTRY_OF_WITH_DELETED`).
  */
-export function pgAncestryOf(spaceId: string, ids: readonly string[], limit: number): SQL {
+export function pgAncestryOf(
+	spaceId: string,
+	ids: readonly string[],
+	limit: number,
+	includeDeleted = false,
+): SQL {
 	return sql`
 		WITH RECURSIVE up(id) AS (
 			SELECT s.id FROM (
 				SELECT id, space_id, deleted FROM outline_blocks WHERE id IN (${idList(ids)}) OFFSET 0
 			) s
-			WHERE s.space_id = ${text(spaceId)} AND NOT s.deleted
+			WHERE s.space_id = ${text(spaceId)}${includeDeleted ? sql.raw("") : sql` AND NOT s.deleted`}
 			UNION
 			SELECT b.parent_id FROM up CROSS JOIN LATERAL (
 				SELECT y.parent_id FROM outline_blocks y WHERE y.id = up.id OFFSET 0
@@ -586,6 +640,33 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 			return out;
 		},
 
+		async listUnderRootAt(spaceId, rootId, items, maxDepth) {
+			const pairs = uniquePairs(items);
+			if (pairs.length === 0) return [];
+			const oldest = Math.min(...pairs.map((pair) => pair[1]));
+			if (!(await readable(spaceId, oldest)))
+				throw new OutlineHistoryUnavailableError(spaceId, "not-ready", 0, oldest);
+			return await underRootInBoundedStatements(pairs, maxDepth, async (chunk, cap) =>
+				(
+					await rowsOf<{
+						start: string;
+						seq: number | string;
+						under: boolean | null;
+						parent_key: string | null;
+						steps: number | string;
+						ended: boolean | null;
+					}>(pgUnderRootAt(spaceId, rootId, chunk, cap))
+				).map((row) => ({
+					blockId: row.start,
+					asOf: Number(row.seq),
+					under: row.under === true,
+					parentKey: row.parent_key ?? null,
+					steps: Number(row.steps),
+					ended: row.ended === true,
+				})),
+			);
+		},
+
 		async getAncestry(spaceId, blockId, { asOf, maxDepth }) {
 			if (asOf === null) {
 				const rows = await rowsOf<{
@@ -639,7 +720,8 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 			);
 		},
 
-		async listAncestryOf(spaceId, blockIds, limit) {
+		async listAncestryOf(spaceId, blockIds, limit, options) {
+			const withDeleted = options?.includeDeleted === true;
 			const max = Math.max(0, Math.floor(limit));
 			const seen = new Map<string, OutlineParentRow>();
 			let truncated = false;
@@ -655,11 +737,16 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 					space_id: string;
 					deleted: boolean;
 					locked: boolean;
-				}>(pgAncestryOf(spaceId, chunk, room + 1));
+				}>(pgAncestryOf(spaceId, chunk, room + 1, withDeleted));
 				if (rows.length > room) truncated = true;
 				for (const row of rows.slice(0, room)) {
-					if (row.space_id !== spaceId || row.deleted) continue;
-					seen.set(row.id, { id: row.id, parentId: row.parent_id, locked: row.locked });
+					if (row.space_id !== spaceId || (row.deleted && !withDeleted)) continue;
+					seen.set(row.id, {
+						id: row.id,
+						parentId: row.parent_id,
+						locked: row.locked,
+						...(withDeleted ? { deleted: row.deleted } : {}),
+					});
 				}
 			}
 			return { rows: [...seen.values()], truncated };

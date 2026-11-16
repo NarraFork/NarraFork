@@ -1483,4 +1483,46 @@ export const OUTLINE_SUBTREE_CONTRACT: ContractCase[] = [
 			expect(levels.blocks.map((block) => block.id)).toEqual([leaf]);
 		},
 	},
+	{
+		name: "walks up through deleted blocks: only when asked, in the parent column they keep, within the limit",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const other = await personalSpace(ctx);
+			const ops: OutlineOp[] = [{ op: "insert", tempId: "c0", parent: null, content: "top" }];
+			for (let i = 1; i < 40; i++)
+				ops.push({
+					op: "insert",
+					tempId: `c${i}`,
+					parent: { tempId: `c${i - 1}` },
+					content: `${i}`,
+				});
+			const made = await write(ctx, space, ops);
+			const ids = made.results.map((r) => r.blockId as string);
+			const [elsewhere] = (
+				await write(ctx, other, [{ op: "insert", parent: null, content: "elsewhere" }])
+			).results.map((r) => r.blockId as string);
+			// Level 10 and everything under it deleted together.
+			await write(ctx, space, [{ op: "delete", block: { id: ids[10] as string } }]);
+			const leaf = ids[39] as string;
+			// Live only: a deleted block starts no walk.
+			expect((await ctx.store.listAncestryOf(space.id, [leaf], 100)).rows).toEqual([]);
+			const all = await ctx.store.listAncestryOf(space.id, [leaf, elsewhere as string], 100, {
+				includeDeleted: true,
+			});
+			expect(all.truncated).toBe(false);
+			const byId = new Map(all.rows.map((row) => [row.id, row]));
+			expect(byId.size).toBe(40);
+			for (let i = 0; i < 40; i++) {
+				const row = byId.get(ids[i] as string);
+				expect(row?.parentId ?? null).toBe(i === 0 ? null : (ids[i - 1] as string));
+				expect(row?.deleted).toBe(i >= 10);
+			}
+			// Another space's block is never part of it.
+			expect(byId.has(elsewhere as string)).toBe(false);
+			// The limit holds and says so.
+			const cut = await ctx.store.listAncestryOf(space.id, [leaf], 5, { includeDeleted: true });
+			expect(cut.truncated).toBe(true);
+			expect(cut.rows.length).toBeLessThanOrEqual(5);
+		},
+	},
 ];

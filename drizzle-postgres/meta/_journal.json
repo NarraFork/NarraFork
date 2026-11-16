@@ -533,6 +533,20 @@
 			"when": 1794664879668,
 			"tag": "0075_outline_edges_by_parent",
 			"breakpoints": true
+		},
+		{
+			"idx": 76,
+			"version": "7",
+			"when": 1794748163496,
+			"tag": "0076_outline_live_log",
+			"breakpoints": true
+		},
+		{
+			"idx": 77,
+			"version": "7",
+			"when": 1794817441993,
+			"tag": "0077_outline_fold_state",
+			"breakpoints": true
 		}
   ]
 }

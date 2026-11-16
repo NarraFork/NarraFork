@@ -5,8 +5,8 @@
  * An epoch's log is a snapshot of the session's text documents (one per block someone typed
  * in), increments (a document's seed text before its first update), and sync rows (what the
  * database held for a block when the session changed it, commits the session was about to
- * write, and how far each client's changes reached the log; see `LivePage.persistStep`). Replay
- * rebuilds each block's final document and, for every live block of the page that has one,
+ * write, and how far each client's changes reached the log; see `LiveSpace.persistStep`). Replay
+ * rebuilds each block's final document and, for every live block of the space that has one,
  * merges three ways: from the last synced content (or the document's seed, or its text in the
  * snapshot), to the final text, onto what the database holds now. So a
  * commit the session never logged (an outside write in the last moments) is kept, and only
@@ -14,31 +14,34 @@
  * logged intent was never resolved and whose content equals it was committed by the session
  * just before it ended: it is left as it is (merging it again would repeat the text).
  *
- * Runs at startup as a background job over every epoch left in `outline_live_updates`, and
- * before a session opens on a page that still has one. Bounded: at most
+ * Runs at startup as a background job over every epoch left in `outline_live_log`, and
+ * before a session opens on a space that still has one. A dropped document (`drop` rows: its
+ * text was committed, or its block left the session) is forgotten; a later document of the
+ * block starts from its own seed. Bounded: at most
  * {@link OUTLINE_LIVE_REPLAY.maxRows} rows and {@link OUTLINE_LIVE_REPLAY.maxBytes} of log per
  * epoch are read (a session compacts long before that); an epoch over the bound is left for an
  * operator and logged, never truncated.
  *
- * A log written before text was per block (one Yjs document a page) is not read: its rows do not
- * decode (`decodeLogTexts`), the epoch is kept and logged like any unreadable one, and the page
- * stays editable. A clean shutdown leaves no log, so this only concerns a crash right before the
- * upgrade.
+ * A row that is neither a text row of this format nor a sync row (`decodeLogTexts`) makes its
+ * epoch unreadable: kept and logged, never misread, and the space stays editable. (The log of
+ * the format before this one lives in another table, `outline_live_updates`, which nothing
+ * reads any more: a clean shutdown leaves none, so only a crash right before the upgrade does.)
  */
 import { logger } from "@server/lib/logger";
 import { merge3 } from "@shared/outline";
-import { decodeLiveSeed, LIVE_TEXT_KIND } from "@shared/outline-live-protocol";
+import { liveSleep, liveYield } from "@shared/outline-live-clock";
+import { decodeLiveSeed, LIVE_TEXT_KIND, type LiveLostWire } from "@shared/outline-live-protocol";
 import { hasPendingStructs, type LiveTextDoc, seededTextDoc } from "@shared/outline-live-text";
 import * as Y from "yjs";
-import { OUTLINE_LIMITS } from "../model";
 import { outlineStore } from "../store";
-import type { OutlineLiveUpdateRow } from "../store/port";
+import type { OutlineLiveLogRow } from "../store/port";
 import type { OutlineCanonicalContent, OutlineOp } from "../write";
 import { asOwnLiveWrite } from "./lane";
 import {
 	type ContentPlan,
 	contentOps,
 	decodeLogTexts,
+	encodeLogTexts,
 	fitBody,
 	LIVE_SYNC_ACTOR,
 	OUTLINE_LIVE_HOOKS,
@@ -72,6 +75,16 @@ export interface ReplayResult {
 	/** Per client key of the ended session: its highest transaction now in the page. */
 	keys: Map<string, number>;
 	/**
+	 * Per client key: text of its transactions the session did not take and had not told it
+	 * of (the client learns it at its next join, `registry.ts`).
+	 */
+	lost: Map<string, LiveLostWire[]>;
+	/**
+	 * Kept only for blocks whose documents cannot be rebuilt (their rows stay for an operator):
+	 * everything else of the log is committed, so `keys` and `lost` hold for the clients.
+	 */
+	partial?: boolean;
+	/**
 	 * When the log was read but its text could not be committed (`kept`): what it holds, for a
 	 * new session to take over. Absent when the log could not be read at all.
 	 */
@@ -81,12 +94,12 @@ export interface ReplayResult {
 /** Sync rows are JSON as written: malformed UTF-8 makes the log unreadable (kept). */
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
-async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpdateRow[] | null> {
-	const rows: OutlineLiveUpdateRow[] = [];
+async function readEpoch(spaceId: string, epoch: number): Promise<OutlineLiveLogRow[] | null> {
+	const rows: OutlineLiveLogRow[] = [];
 	let bytes = 0;
 	let afterSeq: number | undefined;
 	for (;;) {
-		const page = await outlineStore.listLiveUpdates(pageId, epoch, {
+		const page = await outlineStore.listLiveLog(spaceId, epoch, {
 			...(afterSeq !== undefined ? { afterSeq } : {}),
 			limit: OUTLINE_LIVE_REPLAY.pageRows,
 		});
@@ -97,7 +110,7 @@ async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpda
 		if (rows.length > OUTLINE_LIVE_REPLAY.maxRows || bytes > OUTLINE_LIVE_REPLAY.maxBytes)
 			return null;
 		if (page.length < OUTLINE_LIVE_REPLAY.pageRows) return rows;
-		afterSeq = (page[page.length - 1] as OutlineLiveUpdateRow).seq;
+		afterSeq = (page[page.length - 1] as OutlineLiveLogRow).seq;
 	}
 }
 
@@ -105,22 +118,23 @@ async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpda
  * Replay one epoch: commit what is not committed, then drop the rows. `kept` when the log could
  * not be replayed (too large, unreadable, the commit failed): the rows stay.
  */
-export async function replayLiveEpoch(pageId: string, epoch: number): Promise<ReplayOutcome> {
-	return (await replayLiveEpochDetailed(pageId, epoch)).outcome;
+export async function replayLiveEpoch(spaceId: string, epoch: number): Promise<ReplayOutcome> {
+	return (await replayLiveEpochDetailed(spaceId, epoch)).outcome;
 }
 
 /** {@link replayLiveEpoch}, with what a new session of the page needs from it. */
 export async function replayLiveEpochDetailed(
-	pageId: string,
+	spaceId: string,
 	epoch: number,
 ): Promise<ReplayResult> {
 	const keys = new Map<string, number>();
-	const rows = await readEpoch(pageId, epoch);
+	const lost = new Map<string, LiveLostWire[]>();
+	const rows = await readEpoch(spaceId, epoch);
 	if (!rows) {
-		logger.warn("Outline live log too large to replay; kept", { pageId, epoch });
-		return { outcome: "kept", keys };
+		logger.warn("Outline live log too large to replay; kept", { spaceId, epoch });
+		return { outcome: "kept", keys, lost };
 	}
-	if (rows.length === 0) return { outcome: "empty", keys };
+	if (rows.length === 0) return { outcome: "empty", keys, lost };
 	const docs = new Map<string, LiveTextDoc>();
 	const base = new Map<string, string>();
 	/** Intents not resolved by a later sync row or cancel: block → content to be committed. */
@@ -133,7 +147,7 @@ export async function replayLiveEpochDetailed(
 			t = seededTextDoc(seed);
 			docs.set(id, t);
 			t.text.observe((_event, txn) => {
-				const actor = txn.origin as OutlineLiveUpdateRow | null;
+				const actor = txn.origin as OutlineLiveLogRow | null;
 				if (actor?.actorKind === "human") lastActor.set(id, actor.actorId);
 			});
 		}
@@ -145,7 +159,7 @@ export async function replayLiveEpochDetailed(
 	/** Blocks whose base is only assumed empty: no seed row for their document was read yet. */
 	const assumed = new Set<string>();
 	/** Updates waiting in a document for items it lacks: the row of the person who made them. */
-	const waiting = new Map<string, OutlineLiveUpdateRow>();
+	const waiting = new Map<string, OutlineLiveLogRow>();
 	let first = true;
 	try {
 		for (const row of rows) {
@@ -156,6 +170,7 @@ export async function replayLiveEpochDetailed(
 					i?: Record<string, string>;
 					x?: string[];
 					k?: Record<string, number>;
+					l?: Record<string, LiveLostWire[]>;
 				};
 				// Within one row, what the database held (`b`) and cancels (`x`) are older than the
 				// intents (`i`) written with them: an intent is resolved only by a later row.
@@ -169,12 +184,36 @@ export async function replayLiveEpochDetailed(
 				for (const [key, tx] of Object.entries(parsed.k ?? {})) {
 					if (Number.isSafeInteger(tx) && tx > (keys.get(key) ?? 0)) keys.set(key, tx);
 				}
+				// A key's notices are written whole each time they change: the last row says.
+				for (const [key, list] of Object.entries(parsed.l ?? {})) {
+					if (!Array.isArray(list)) continue;
+					const valid = list.filter(
+						(x): x is LiveLostWire =>
+							Array.isArray(x) &&
+							Number.isSafeInteger(x[0]) &&
+							Array.isArray(x[1]) &&
+							x[1].every((id: unknown) => typeof id === "string"),
+					);
+					if (valid.length > 0) lost.set(key, valid);
+					else lost.delete(key);
+				}
 				continue;
 			}
 			const entries = decodeLogTexts(data);
 			if (!entries) throw new Error("not a per-block text row");
 			for (const e of entries) {
-				if (e.kind === LIVE_TEXT_KIND.seed) {
+				if (e.kind === LIVE_TEXT_KIND.drop) {
+					// The session dropped the block's document (its text was committed, or the
+					// block left the session): nothing of it is uncommitted, and a document the
+					// block gets later starts from its own seed.
+					docs.get(e.id)?.doc.destroy();
+					docs.delete(e.id);
+					base.delete(e.id);
+					assumed.delete(e.id);
+					intents.delete(e.id);
+					waiting.delete(e.id);
+					lastActor.delete(e.id);
+				} else if (e.kind === LIVE_TEXT_KIND.seed) {
 					// What the database held when the document was made.
 					const seed = decodeLiveSeed(e.data);
 					if (seed === null) throw new Error("a seed text is not UTF-8");
@@ -210,34 +249,31 @@ export async function replayLiveEpochDetailed(
 			}
 		}
 	} catch (error) {
-		logger.warn("Outline live log unreadable; kept", { pageId, epoch, error: String(error) });
+		logger.warn("Outline live log unreadable; kept", { spaceId, epoch, error: String(error) });
 		destroy();
-		return { outcome: "kept", keys };
+		return { outcome: "kept", keys, lost };
 	}
-	// An update still waiting for items no row brought: the document's text is not what was
-	// typed. Nothing is committed from such a log, and it is not dropped.
-	const stuck = [...docs].filter(([, t]) => hasPendingStructs(t.doc)).map(([id]) => id);
-	if (stuck.length > 0) {
-		logger.warn("Outline live log incomplete (updates without the items they name); kept", {
-			pageId,
-			epoch,
-			blocks: stuck.slice(0, 20),
-		});
-		destroy();
-		return { outcome: "kept", keys };
-	}
+	// An update still waiting for items no row brought: that document's text is not what was
+	// typed, and nothing of it is committed. It does not hold back the other blocks' text.
+	const stuck = new Set([...docs].filter(([, t]) => hasPendingStructs(t.doc)).map(([id]) => id));
+	/** Stuck documents of blocks that are still there: their rows are kept. */
+	const unsound: string[] = [];
 
-	const page = await outlineStore.getBlock(pageId);
-	if (!page || page.deleted) {
-		destroy();
-		await outlineStore.deleteLiveUpdates(pageId, epoch);
-		return { outcome: "empty", keys };
-	}
-	const { blocks } = await outlineStore.listPageBlocks(pageId, OUTLINE_LIMITS.maxPageBlocks);
+	// What the blocks table holds now for every block the log has a document of: read by
+	// primary key, a few at a time (a log holds at most a few thousand documents).
+	const blocks: Array<{ id: string; content: string; parentId: string | null }> = [];
 	const changes: Array<{ id: string; text: string; actor: string | null }> = [];
-	for (const b of blocks) {
-		const t = docs.get(b.id);
-		if (!t) continue;
+	let read = 0;
+	for (const [id, t] of docs) {
+		if (++read % 50 === 0) await liveYield();
+		const b = await outlineStore.getBlock(id);
+		// A block that is gone has nothing to commit, whatever state its document is in.
+		if (!b || b.deleted || b.spaceId !== spaceId) continue;
+		if (stuck.has(id)) {
+			unsound.push(id);
+			continue;
+		}
+		blocks.push(b);
 		const final = t.text.toString();
 		// The session committed this just before it ended, and logged nothing after.
 		const intent = intents.get(b.id);
@@ -250,11 +286,78 @@ export async function replayLiveEpochDetailed(
 	}
 	destroy();
 	if (changes.length > 0) {
-		const committed = await commitChanges(page.spaceId, changes, blocks);
-		if (!committed) return { outcome: "kept", keys, changes };
+		const committed = await commitChanges(spaceId, changes, blocks);
+		if (!committed) return { outcome: "kept", keys, lost, changes };
 	}
-	await outlineStore.deleteLiveUpdates(pageId, epoch);
-	return { outcome: changes.length > 0 ? "committed" : "empty", keys };
+	if (unsound.length > 0) {
+		// Everything else is committed; only the rows of the documents that cannot be rebuilt
+		// stay, for an operator.
+		logger.warn(
+			"Outline live log incomplete (updates without the items they name): those blocks' rows are kept, the rest was replayed",
+			{ spaceId, epoch, blocks: unsound.slice(0, 20), committed: changes.length },
+		);
+		try {
+			await outlineStore.replaceLiveLog(spaceId, epoch, rowsAbout(rows, new Set(unsound)));
+		} catch (error) {
+			logger.warn("Outline live log could not be cut down to its incomplete blocks", {
+				spaceId,
+				epoch,
+				error: String(error),
+			});
+		}
+		// The clients' positions hold all the same: what the space took of their transactions is
+		// committed or in those rows, and they must not make it again by a text merge.
+		return { outcome: "kept", keys, lost, partial: true };
+	}
+	await outlineStore.deleteLiveLog(spaceId, epoch);
+	return { outcome: changes.length > 0 ? "committed" : "empty", keys, lost };
+}
+
+/**
+ * The rows of an epoch cut down to what concerns `ids`: text rows keep their entries of those
+ * blocks, sync rows their fields of them and the clients' positions and notices (`k`, `l`: a
+ * later replay of these rows still tells the clients what the space has). The first row stays
+ * (as the epoch's snapshot, maybe empty), so the rows still read as a log.
+ */
+function rowsAbout(
+	rows: readonly OutlineLiveLogRow[],
+	ids: ReadonlySet<string>,
+): OutlineLiveLogRow[] {
+	const out: OutlineLiveLogRow[] = [];
+	const b64 = (data: Uint8Array) => Buffer.from(data).toString("base64");
+	rows.forEach((row, at) => {
+		const data = Buffer.from(row.updateB64, "base64");
+		if (row.actorId === LIVE_SYNC_ACTOR) {
+			const parsed = JSON.parse(decoder.decode(data)) as {
+				b?: Record<string, string>;
+				i?: Record<string, string>;
+				x?: string[];
+				k?: Record<string, number>;
+				l?: Record<string, LiveLostWire[]>;
+			};
+			const pick = (map?: Record<string, string>) =>
+				Object.fromEntries(Object.entries(map ?? {}).filter(([id]) => ids.has(id)));
+			const kept = {
+				b: pick(parsed.b),
+				i: pick(parsed.i),
+				x: (parsed.x ?? []).filter((id) => ids.has(id)),
+			};
+			const body = {
+				...(Object.keys(kept.b).length > 0 ? { b: kept.b } : {}),
+				...(Object.keys(kept.i).length > 0 ? { i: kept.i } : {}),
+				...(kept.x.length > 0 ? { x: kept.x } : {}),
+				...(parsed.k && Object.keys(parsed.k).length > 0 ? { k: parsed.k } : {}),
+				...(parsed.l && Object.keys(parsed.l).length > 0 ? { l: parsed.l } : {}),
+			};
+			if (Object.keys(body).length > 0)
+				out.push({ ...row, updateB64: b64(new TextEncoder().encode(JSON.stringify(body))) });
+			return;
+		}
+		const entries = (decodeLogTexts(data) ?? []).filter((e) => ids.has(e.id));
+		if (entries.length > 0 || at === 0)
+			out.push({ ...row, updateB64: b64(encodeLogTexts(entries)) });
+	});
+	return out;
 }
 
 async function commitChanges(
@@ -327,28 +430,28 @@ async function commitChanges(
  * epochs of sessions open in this process (`isLive`). Resolves when the log was walked once.
  */
 export async function replayAllLiveEpochs(
-	isLive: (pageId: string, epoch: number) => boolean,
-	replay: (pageId: string, epoch: number) => Promise<ReplayOutcome>,
+	isLive: (spaceId: string, epoch: number) => boolean,
+	replay: (spaceId: string, epoch: number) => Promise<ReplayOutcome>,
 ): Promise<{ committed: number; kept: number }> {
-	let after: { pageBlockId: string; epoch: number } | undefined;
+	let after: { spaceId: string; epoch: number } | undefined;
 	let committed = 0;
 	let kept = 0;
 	for (;;) {
-		const epochs = await outlineStore.listLiveEpochs({
+		const epochs = await outlineStore.listLiveLogEpochs({
 			...(after ? { after } : {}),
 			limit: OUTLINE_LIVE_REPLAY.epochsPerPage,
 		});
 		for (const e of epochs) {
-			if (isLive(e.pageBlockId, e.epoch)) continue;
+			if (isLive(e.spaceId, e.epoch)) continue;
 			try {
-				const outcome = await replay(e.pageBlockId, e.epoch);
+				const outcome = await replay(e.spaceId, e.epoch);
 				if (outcome === "committed") committed++;
 				if (outcome === "kept") kept++;
 			} catch (error) {
 				kept++;
-				logger.warn("Outline live replay failed", { pageId: e.pageBlockId, error: String(error) });
+				logger.warn("Outline live replay failed", { spaceId: e.spaceId, error: String(error) });
 			}
-			await new Promise((resolve) => setTimeout(resolve, OUTLINE_LIVE_REPLAY.pauseMs));
+			await liveSleep(OUTLINE_LIVE_REPLAY.pauseMs);
 		}
 		if (epochs.length < OUTLINE_LIVE_REPLAY.epochsPerPage) break;
 		after = epochs[epochs.length - 1];

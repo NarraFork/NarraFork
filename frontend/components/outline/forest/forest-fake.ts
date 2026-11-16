@@ -35,6 +35,8 @@ export class FakeOutline implements ForestIO {
 	/** Every request made, in order. */
 	readonly calls: Array<{ kind: string; detail: string }> = [];
 	failNext: number | null = null;
+	/** Store rows one level read takes at most (the server's 800 per call). */
+	rowsCap = 800;
 	/** Fold writes (puts and resets) that fail before one succeeds again. */
 	foldFails = 0;
 	/** The last write applied, by writer. */
@@ -111,20 +113,28 @@ export class FakeOutline implements ForestIO {
 		limit: number,
 		view: "facts" | "all",
 	): { level: OutlineTreeLevel; blocks: OutlineTreeBlock[] } {
+		// As the server reads since A1: `limit` counts the rows SHOWN (what the facts view leaves
+		// out costs it nothing), and the store rows one read takes are bounded (`rowsCap`):
+		// where they run out among hidden rows the level says `more` with a cursor after them.
 		const all = this.childrenOf(parentId);
 		const from = cursor ? Number(cursor) : 0;
-		const read = all.slice(from, from + limit);
-		const shown = read.filter(
-			(id) => view === "all" || !this.isProcess(this.blocks.get(id) as FakeBlock),
-		);
-		const more = from + read.length < all.length;
+		const shown: string[] = [];
+		let at = from;
+		let read = 0;
+		while (at < all.length && shown.length < limit && read < this.rowsCap) {
+			const id = all[at] as string;
+			at++;
+			read++;
+			if (view === "all" || !this.isProcess(this.blocks.get(id) as FakeBlock)) shown.push(id);
+		}
+		const more = at < all.length;
 		return {
 			level: {
 				parentId,
 				childIds: shown,
 				more,
-				nextCursor: more ? String(from + read.length) : null,
-				processHidden: read.length - shown.length,
+				nextCursor: more ? String(at) : null,
+				processHidden: read - shown.length,
 			},
 			blocks: shown.map((id) => this.wire(id)),
 		};

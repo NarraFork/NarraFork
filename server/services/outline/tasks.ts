@@ -1076,10 +1076,12 @@ export async function findContinuationCandidates(options: {
 	/** The session's space (a subagent's is its root's, D31); null when it has none yet. */
 	sessionSpaceId: string | null;
 	/**
-	 * Pages whose blocks are never the session's tasks, checkbox or not: its behavior page holds
-	 * rules, which the agent may not tick (outline plan PR 4).
+	 * Top-level blocks under which nothing is ever the session's task, checkbox or not (the
+	 * block itself included): its behavior boundary holds rules, which the agent may not tick
+	 * (outline plan PR 4). Judged by ancestry: a task is left out when one of these is the task
+	 * or among its ancestors.
 	 */
-	excludePageIds?: readonly string[];
+	excludeUnder?: readonly string[];
 	/**
 	 * Only the tasks of this block's subtree (a tree a person asked to start, an approved plan;
 	 * review round 1 S3): read from its page's structure, so tasks elsewhere neither crowd it out
@@ -1122,12 +1124,15 @@ export async function findContinuationCandidates(options: {
 	const claimedAll = await store.listClaimedTasks(options.narratorId, scan + 1);
 	const inTree = subtree;
 	const claimed = inTree ? claimedAll.filter(({ block }) => inTree.has(block.id)) : claimedAll;
-	// Excluded pages are left out inside the scan, so their checkboxes cannot use it up.
+	// What is under an excluded block is left out inside the scan too, so its checkboxes cannot
+	// use the scan up. The store's scan filters by the top-level block a task is under (these
+	// are top-level blocks) until the write path stops keeping that column (pageless X1, which
+	// gives the scan its own filter); the ancestry check below is what decides.
 	const own = inTree
 		? await store.getBlockMetasByIds([...inTree])
 		: options.sessionSpaceId
 			? await store.listOpenTasks(options.sessionSpaceId, scan + 1, {
-					excludePageIds: options.excludePageIds,
+					excludePageIds: options.excludeUnder,
 				})
 			: [];
 	const truncated = claimed.length > scan || own.length > scan;
@@ -1141,17 +1146,15 @@ export async function findContinuationCandidates(options: {
 	const unread = [...metas.keys()].filter((id) => !claims.has(id));
 	for (const [id, claim] of await getOutlineTaskClaims(unread, { store })) claims.set(id, claim);
 
-	const excluded = new Set(options.excludePageIds ?? []);
+	const excluded = new Set(options.excludeUnder ?? []);
 	// Every open task read: what makes a task a container (a person's step under it counts too)
 	// and what a plan being planned hides.
-	const live = [...metas.values()].filter(
-		(block) => !block.deleted && isOpenTask(block.taskJson) && !excluded.has(block.pageId),
-	);
-	if (live.length === 0) return empty(truncated);
+	const read = [...metas.values()].filter((block) => !block.deleted && isOpenTask(block.taskJson));
+	if (read.length === 0) return empty(truncated);
 	const ancestors = new Map<string, OutlineBlockMeta>();
-	const inOrder = await inDocumentOrder(store, live, options.sessionSpaceId, { ancestors });
+	const readInOrder = await inDocumentOrder(store, read, options.sessionSpaceId, { ancestors });
 	const known = new Map<string, OutlineBlockMeta>(ancestors);
-	for (const block of live) known.set(block.id, block);
+	for (const block of read) known.set(block.id, block);
 	/** Ancestors of a block, nearest first. */
 	const above = (block: OutlineBlockMeta): OutlineBlockMeta[] => {
 		const out: OutlineBlockMeta[] = [];
@@ -1162,6 +1165,13 @@ export async function findContinuationCandidates(options: {
 		}
 		return out;
 	};
+	// Tasks under an excluded block are nobody's tasks, by ancestry.
+	const isExcluded = (block: OutlineBlockMeta): boolean =>
+		excluded.size > 0 &&
+		(excluded.has(block.id) || above(block).some((ancestor) => excluded.has(ancestor.id)));
+	const inOrder = readInOrder.filter((block) => !isExcluded(block));
+	const live = inOrder;
+	if (live.length === 0) return empty(truncated);
 	const chains = new Map(live.map((block) => [block.id, above(block)]));
 	const delegated = await delegatedTasksAbove(store, chains, claims, options.narratorId, now);
 	const hidden = (block: OutlineBlockMeta): boolean =>

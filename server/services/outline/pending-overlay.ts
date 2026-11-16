@@ -3,8 +3,8 @@
  * proposed a change reads its own version, everyone else reads the outline as it is with the
  * blocks a change touches marked.
  *
- *   - THE PROPOSER (its session, subagents included): its open changes on the page are laid over
- *     the tree in memory: a rewritten block shows the proposed text, an added block appears with
+ *   - THE PROPOSER (its session, subagents included): its open changes on what is read are laid
+ *     over the tree in memory: a rewritten block shows the proposed text, an added block appears with
  *     the id it will get, a deleted one is gone, a moved one is in its new place, a task change
  *     shows. Each such spot gets a `‹pending P…›` line naming who decides. A rewritten block
  *     someone changed since the proposal shows what confirming would write: the proposal merged
@@ -23,7 +23,6 @@ import { compareOrderKeys } from "@shared/outline";
 import type { OutlineTaskJson } from "./model";
 import type { OutlineProposalMerge } from "./pending";
 import { pendingOps } from "./pending-hold";
-import type { OutlinePageState } from "./read";
 import type { OutlinePendingHead, OutlinePendingRow } from "./store/port";
 import { canonicalTaskJson } from "./task-json";
 import type { OutlineNode } from "./tree";
@@ -44,8 +43,8 @@ export interface OutlinePendingMarkText {
 }
 
 export interface OutlinePendingOverlay {
-	/** Rewrites the page state the read built (the reader's own changes). */
-	prepare(state: OutlinePageState): void;
+	/** Rewrites the tree the read built, as far as it holds it (the reader's own changes). */
+	prepare(state: { nodes: Map<string, OutlineNode> }): void;
 	/** After the content of the blocks the read shows is loaded: proposed texts replace them. */
 	finish(nodes: readonly OutlineNode[]): void;
 	/** The `‹pending …›` line under a block, if any. */
@@ -69,7 +68,7 @@ export interface OutlineOwnPending extends Labeled<OutlinePendingRow> {
 }
 
 /**
- * The overlay of a read: `own` are the reader's session's open changes on the page (laid over),
+ * The overlay of a read: `own` are the reader's session's open changes there (laid over),
  * `others` everyone else's (marked, from their heads). `label` names a change as the marks show
  * it (`P…` and who decides).
  */
@@ -90,7 +89,7 @@ export function pendingOverlay(args: {
 		for (const id of ids) if (!marks.has(id)) marks.set(id, args.text.other(label, decider));
 	}
 
-	const prepare = (state: OutlinePageState) => {
+	const prepare = (state: { nodes: Map<string, OutlineNode> }) => {
 		const nodes = state.nodes;
 		const detach = (node: OutlineNode) => {
 			const parent = node.parent;

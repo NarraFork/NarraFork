@@ -30,6 +30,9 @@ const NOT_MIGRATED: Record<string, string> = {
 	// The live editor is still one editor per top-level block until L4–L6.
 	"editor.unsaved*": "L6 (unsaved text is kept per block)",
 	"editor.tabLimit*": "L3 (live slots are counted per space)",
+	// L2's live-session limits, worded for the editor that still opens a top-level block whole.
+	"editor.userLimit": "L6 (the editor's read-only fallback names the block, not a page)",
+	"editor.spaceFull": "L6 (the editor's read-only fallback names the block, not a page)",
 	"editor.tooLargePage": "L4 (no size limit of a whole top-level block; the editor's budget)",
 	"editor.unavailable": "L6",
 	"editor.outdated": "L6",

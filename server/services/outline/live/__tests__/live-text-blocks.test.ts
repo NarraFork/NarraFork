@@ -52,7 +52,7 @@ import { seededTextDoc } from "@shared/outline-live-text";
 import { and, eq } from "drizzle-orm";
 import * as Y from "yjs";
 import { db } from "../../../../db";
-import { aclGrants, outlineLiveUpdates, projects, users } from "../../../../db/schema";
+import { aclGrants, outlineLiveLog, projects, users } from "../../../../db/schema";
 import { generateId } from "../../../../lib/id";
 import { settings } from "../../../../lib/settings";
 import { ensureProjectSpace } from "../../spaces";
@@ -72,7 +72,7 @@ import {
 	decodeLogTexts,
 	encodeLogTexts,
 	LIVE_SYNC_ACTOR,
-	type LivePage,
+	type LivePageView,
 	OUTLINE_LIVE_BOUNDS,
 	OUTLINE_LIVE_HOOKS,
 	OUTLINE_LIVE_TIMING,
@@ -141,7 +141,7 @@ function edit(c: LiveClient, id: string, md: string): void {
 	struct(c, [], [{ id, md }]);
 }
 
-function session(pageId: string): LivePage {
+function session(pageId: string): LivePageView {
 	const s = liveSessionOf(pageId);
 	if (!s) throw new Error("no session");
 	return s;
@@ -887,11 +887,11 @@ describe("reconnecting", () => {
 });
 
 describe("the log and its replay", () => {
-	const rowsOf = (pageId: string, epoch: number) =>
+	const rowsOf = (_pageId: string, epoch: number) =>
 		db
 			.select()
-			.from(outlineLiveUpdates)
-			.where(and(eq(outlineLiveUpdates.pageBlockId, pageId), eq(outlineLiveUpdates.epoch, epoch)))
+			.from(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)))
 			.all()
 			.sort((p, q) => p.seq - q.seq);
 
@@ -942,7 +942,7 @@ describe("the log and its replay", () => {
 			actor: { kind: "agent", id: "n" },
 			responsibleUserId: owner,
 		});
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(one)).toBe("crash one typed!");
 		expect(await content(two)).toBe("agent: crash two also");
 		expect(await content(untouched)).toBe("untouched");
@@ -994,7 +994,7 @@ describe("the log and its replay", () => {
 			actor: { kind: "agent", id: "n" },
 			responsibleUserId: owner,
 		});
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		// Both the outside text and the typed text are there.
 		const merged = await content(empty);
 		expect(merged).toContain("agent wrote here");
@@ -1049,7 +1049,7 @@ describe("the log and its replay", () => {
 		const epoch = session(pageId).epoch;
 		expect(await content(block)).toBe("split me here");
 		abandonLiveSessionForTests(pageId);
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(block)).toBe("split me! here?");
 		expect(await dbOutline(pageId)).toBe("- split me! here?\n- tail");
 	});
@@ -1062,9 +1062,9 @@ describe("the log and its replay", () => {
 		const text = new Y.Text("legacy and unsaved");
 		old.getMap<Y.Text>("texts").set(block, text);
 		const epoch = 77_001;
-		await outlineStore.appendLiveUpdates([
+		await outlineStore.appendLiveLog([
 			{
-				pageBlockId: pageId,
+				spaceId: space.id,
 				epoch,
 				seq: 0,
 				updateB64: Buffer.from(Y.encodeStateAsUpdate(old)).toString("base64"),
@@ -1074,7 +1074,7 @@ describe("the log and its replay", () => {
 			},
 		]);
 		old.destroy();
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("kept");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("kept");
 		expect(await content(block)).toBe("legacy");
 		expect(rowsOf(pageId, epoch)).toHaveLength(1);
 		const a = open(link(owner), pageId);
@@ -1084,7 +1084,9 @@ describe("the log and its replay", () => {
 		await flushed(pageId);
 		expect(await content(block)).toBe("legacy lives");
 		expect(rowsOf(pageId, epoch)).toHaveLength(1);
-		await db.delete(outlineLiveUpdates).where(eq(outlineLiveUpdates.pageBlockId, pageId));
+		await db
+			.delete(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)));
 	});
 });
 
@@ -1311,11 +1313,11 @@ describe("documents count against the session's bound", () => {
 
 describe("a log read in any order", () => {
 	const b64 = (data: Uint8Array) => Buffer.from(data).toString("base64");
-	const left = (pageId: string, epoch: number) =>
+	const left = (_pageId: string, epoch: number) =>
 		db
 			.select()
-			.from(outlineLiveUpdates)
-			.where(and(eq(outlineLiveUpdates.pageBlockId, pageId), eq(outlineLiveUpdates.epoch, epoch)))
+			.from(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)))
 			.all().length;
 
 	test("an update row before its block's seed row: the text is committed, as its author's", async () => {
@@ -1333,7 +1335,7 @@ describe("a log read in any order", () => {
 			actorKind: "human" | "system",
 			actorId: string,
 		) => ({
-			pageBlockId: pageId,
+			spaceId: space.id,
 			epoch,
 			seq,
 			updateB64: b64(data),
@@ -1341,7 +1343,7 @@ describe("a log read in any order", () => {
 			actorId,
 			createdAt: at,
 		});
-		await outlineStore.appendLiveUpdates([
+		await outlineStore.appendLiveLog([
 			row(0, encodeLogTexts([]), "system", "outline-live"),
 			row(
 				1,
@@ -1356,14 +1358,14 @@ describe("a log read in any order", () => {
 				"outline-live",
 			),
 		]);
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(block)).toBe("x hello");
 		expect(left(pageId, epoch)).toBe(0);
 		expect((await outlineStore.getBlock(block))?.authorId).toBe(owner);
 	});
 
 	test("the same, with the database changed since: the seed is the base the typing is merged from", async () => {
-		const { pageId, ids } = await page(["x"]);
+		const { ids } = await page(["x"]);
 		const block = ids[0] as string;
 		const { doc, text } = seededTextDoc("x");
 		const vector = Y.encodeStateVector(doc);
@@ -1371,13 +1373,13 @@ describe("a log read in any order", () => {
 		const typed = Y.encodeStateAsUpdate(doc, vector);
 		const epoch = 515_152;
 		const at = new Date().toISOString();
-		await outlineStore.appendLiveUpdates(
+		await outlineStore.appendLiveLog(
 			[
 				encodeLogTexts([]),
 				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.update, data: typed }]),
 				encodeLogTexts([{ id: block, kind: LIVE_TEXT_KIND.seed, data: encodeLiveSeed("x") }]),
 			].map((data, seq) => ({
-				pageBlockId: pageId,
+				spaceId: space.id,
 				epoch,
 				seq,
 				updateB64: b64(data),
@@ -1392,11 +1394,11 @@ describe("a log read in any order", () => {
 			actor: { kind: "agent", id: "n" },
 			responsibleUserId: owner,
 		});
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("committed");
 		expect(await content(block)).toBe("agent: x hello");
 	});
 
-	test("an update whose items no row brings: nothing is committed and the log is kept", async () => {
+	test("an update whose items no row brings: nothing of that block is committed and its rows are kept; the other blocks of the log are replayed", async () => {
 		const { pageId, ids } = await page(["x", "y"]);
 		const [block, other] = ids as [string, string];
 		const { doc, text } = seededTextDoc("x");
@@ -1408,7 +1410,7 @@ describe("a log read in any order", () => {
 		fine.text.insert(1, " fine");
 		const epoch = 515_153;
 		const at = new Date().toISOString();
-		await outlineStore.appendLiveUpdates(
+		await outlineStore.appendLiveLog(
 			[
 				encodeLogTexts([]),
 				// The seed of `block` is missing; `other` is whole.
@@ -1422,7 +1424,7 @@ describe("a log read in any order", () => {
 					},
 				]),
 			].map((data, seq) => ({
-				pageBlockId: pageId,
+				spaceId: space.id,
 				epoch,
 				seq,
 				updateB64: b64(data),
@@ -1431,19 +1433,23 @@ describe("a log read in any order", () => {
 				createdAt: at,
 			})),
 		);
-		expect(await replayLiveEpoch(pageId, epoch)).toBe("kept");
+		expect(await replayLiveEpoch(space.id, epoch)).toBe("kept");
 		expect(await content(block)).toBe("x");
-		expect(await content(other)).toBe("y");
-		expect(left(pageId, epoch)).toBe(3);
-		// The page is still editable, and the log still there afterwards.
+		// One block's broken document does not take the rest of the log down with it (L2 review):
+		// what is sound is committed, and only the broken block's rows stay.
+		expect(await content(other)).toBe("y fine");
+		expect(left(pageId, epoch)).toBe(2);
+		// The page is still editable, and what is left of the log still there afterwards.
 		const a = open(link(owner), pageId);
 		await waitFor(() => a.ready, 3000, "joined");
 		type(a, block, "!");
 		await settle();
 		await flushed(pageId);
 		expect(await content(block)).toBe("x!");
-		expect(left(pageId, epoch)).toBe(3);
-		await db.delete(outlineLiveUpdates).where(eq(outlineLiveUpdates.pageBlockId, pageId));
+		expect(left(pageId, epoch)).toBe(2);
+		await db
+			.delete(outlineLiveLog)
+			.where(and(eq(outlineLiveLog.spaceId, space.id), eq(outlineLiveLog.epoch, epoch)));
 	});
 });
 

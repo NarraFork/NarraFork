@@ -345,7 +345,7 @@ export const OUTLINE_TASK_SOURCE_SCENARIOS: OutlineScenario[] = [
 			const address = `${space.key}/${page?.sid}`;
 			const expected = [
 				"Behavior boundary (standing constraints the user set; always follow them)",
-				`From this session's behavior page \`${address}\`:`,
+				`From this session's behavior boundary \`${address}\`:`,
 				"- Behavior boundary",
 				"  - Never force-push the main branch.",
 			].join("\n");

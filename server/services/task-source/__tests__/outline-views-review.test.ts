@@ -40,8 +40,8 @@ import { readSpecFile, writeSpecFile } from "../../spec-vfs-service";
 import { taskSourceForNarrator } from "../index";
 import { createOutlineTaskSource } from "../outline";
 import {
-	copyOutlineBehaviorPage,
-	findBehaviorPage,
+	copyOutlineBehaviorBoundary,
+	findBehaviorBlock,
 	importOutlineBehaviorFence,
 	resetOutlineBehaviorImport,
 } from "../outline-behavior";
@@ -379,9 +379,9 @@ describe("S3: a checkbox on the behavior page is not a task of the session (prob
 		const pageId = await seedBehaviorPage(parent, "Never force-push.");
 		await personAdds(parent, pageId, "Keep the changelog updated", { status: "doing" });
 		const child = await session();
-		expect(await copyOutlineBehaviorPage(parent, child)).toBe(true);
+		expect(await copyOutlineBehaviorBoundary(parent, child)).toBe(true);
 		const childSpace = await ensureSessionSpace(child);
-		const page = await findBehaviorPage(childSpace.id);
+		const page = await findBehaviorBlock(childSpace.id);
 		const copied = await outlineStore.listChildren(childSpace.id, page?.id ?? "", 10);
 		expect(copied.map((b) => [b.content, b.taskJson])).toEqual([
 			["Never force-push.", null],
@@ -424,7 +424,7 @@ describe("S4: fence text that is not on the page yet", () => {
 		expect(await importOutlineBehaviorFence(id, "en")).toBe("failed");
 		flaky.mockRestore();
 		const space = await ensureSessionSpace(id);
-		const page = await findBehaviorPage(space.id);
+		const page = await findBehaviorBlock(space.id);
 		const partial = await children(id, page?.id ?? "");
 		expect(partial.length).toBeGreaterThan(0);
 		expect(partial.length).toBeLessThan(230);
@@ -449,7 +449,7 @@ describe("S6: recorded decisions are what the session wrote, never the behavior 
 		const parent = await session();
 		await seedBehaviorPage(parent, "Never force-push the main branch.");
 		const child = await session();
-		expect(await copyOutlineBehaviorPage(parent, child)).toBe(true);
+		expect(await copyOutlineBehaviorBoundary(parent, child)).toBe(true);
 		const context = (await (await taskSourceForNarrator(child)).compactContext("en")) ?? "";
 		expect(context).not.toContain("Never force-push");
 		expect(context).not.toContain("Recorded decisions");
@@ -559,12 +559,12 @@ describe("N3: a fork copy cut at the commit limit says so (probe L)", () => {
 		}
 		const [parentPage] = await outlineStore.getBlocks([pageId]);
 		const child = await session();
-		expect(await copyOutlineBehaviorPage(parent, child)).toBe(true);
+		expect(await copyOutlineBehaviorBoundary(parent, child)).toBe(true);
 		const childSpace = await ensureSessionSpace(child);
-		const page = await findBehaviorPage(childSpace.id);
+		const page = await findBehaviorBlock(childSpace.id);
 		const kids = await children(child, page?.id ?? "");
 		expect(kids.length).toBeLessThanOrEqual(199);
-		expect(kids[0]).toContain(`of the 262 blocks of this page were copied`);
+		expect(kids[0]).toContain(`of the 262 blocks of the behavior boundary were copied`);
 		expect(kids[0]).toContain(`${space.key}/${parentPage?.sid}`);
 		expect(part(await parts(child), "outline.behavior")).toContain("were copied when the session");
 	});

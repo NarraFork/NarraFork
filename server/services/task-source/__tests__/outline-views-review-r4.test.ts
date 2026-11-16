@@ -133,7 +133,7 @@ function audit(text: string, blocks: number, tops: number[], note: RegExp) {
 }
 
 const viewNote = /not all shown: (\d+) blocks? (?:is|are)/;
-const fenceNote = /‹(\d+) blocks? of this page/;
+const fenceNote = /‹(\d+) blocks? here/;
 
 async function views(id: string) {
 	const parts = await (await taskSourceForNarrator(id)).contextParts("en");

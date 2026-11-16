@@ -15,7 +15,12 @@ import type {
 } from "./outline-api";
 
 export const OUTLINE_SUBTREE_LIMITS = {
-	/** Blocks one subtree read returns unless asked otherwise, and at most. */
+	/**
+	 * Blocks one subtree read returns (shows) unless asked otherwise, and at most. Rows the view
+	 * leaves out (the facts view's tasks and questions) do not count; whatever the view, one read
+	 * takes at most `maxBlocks` rows from the store, and where those run out first a level says
+	 * `more` with a cursor after the last row read.
+	 */
 	defaultBlocks: 400,
 	/** As of a seq, a read on the server's main thread stays at 800 rows (H1's measurement). */
 	maxBlocks: 800,

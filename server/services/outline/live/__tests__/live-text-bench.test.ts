@@ -10,7 +10,12 @@
 
 import { heapStats } from "bun:jsc";
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
+import {
+	decodeLiveFrame,
+	LIVE_FRAME,
+	type LiveFrame,
+	OUTLINE_LIVE_PROTOCOL_VERSION,
+} from "@shared/outline-live-protocol";
 import { db } from "../../../../db";
 import { projects, users } from "../../../../db/schema";
 import { generateId } from "../../../../lib/id";
@@ -114,7 +119,12 @@ test.skipIf(!BENCH)(
 				handle: 1,
 				n: 0,
 				// `v` is the protocol version (ignored by a server that does not know the field).
-				head: { v: 2, page: pageId, mode: "edit", key: `benchkey${round}0` },
+				head: {
+					v: OUTLINE_LIVE_PROTOCOL_VERSION,
+					page: pageId,
+					mode: "edit",
+					key: `benchkey${round}0`,
+				},
 				body: new Uint8Array(0),
 			});
 			sessionMs.push(performance.now() - t0);
