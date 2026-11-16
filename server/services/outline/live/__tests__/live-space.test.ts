@@ -24,8 +24,10 @@ import {
 	LIVE_FRAME,
 	LIVE_TEXT_KIND,
 	type LiveFrame,
+	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
+import { seededTextDoc } from "@shared/outline-live-text";
 import { and, eq } from "drizzle-orm";
 import * as Y from "yjs";
 import { db } from "../../../../db";
@@ -45,6 +47,7 @@ import { type OutlineOp, writeOutline } from "../../write";
 import {
 	abandonLiveSessionForTests,
 	closeAllLiveSessions,
+	forgetEndedSessionsForTests,
 	handleLiveFrame,
 	joinLive,
 	liveSessionOf,
@@ -56,13 +59,25 @@ import {
 } from "../registry";
 import { replayLiveEpoch } from "../replay";
 import {
+	decodeLogTexts,
+	encodeLogTexts,
+	LIVE_SYNC_ACTOR,
 	type LivePageView,
 	type LiveSpace,
 	OUTLINE_LIVE_BOUNDS,
 	OUTLINE_LIVE_HOOKS,
 	OUTLINE_LIVE_TIMING,
 } from "../session";
-import { client, settle, struct, TestLink, TestSocket, type, waitFor } from "./harness";
+import {
+	client,
+	FakeLiveClock,
+	settle,
+	struct,
+	TestLink,
+	TestSocket,
+	type,
+	waitFor,
+} from "./harness";
 
 const NOW = "2026-11-15T00:00:00.000Z";
 const saved = { ...OUTLINE_LIVE_TIMING };
@@ -195,18 +210,20 @@ function expectSameTexts(pageId: string, cs: readonly LiveClient[]): void {
 	for (const id of ids) {
 		const server = s.textState(id);
 		expect(server?.stuck ?? false).toBe(false);
-		// What this page's people hold the text of (`MirrorBlock.held`). A block that went to
-		// another page is that page's people's now, or nobody's: these hold it as deleted, with
-		// whatever it was when it left.
-		const here = s.space.mirror.get(id)?.held === pageId;
+		// Where the block is in the tree, not who the session thinks holds its text: every live
+		// block of this page, as its people see it, has the session's text and generation. A
+		// block that went to another page is that page's people's now: these hold it as
+		// deleted, with whatever it was when it left.
+		const here = s.space.mirror.topOf(id) === pageId;
 		for (const c of cs) {
-			if (c.visible.get(id) && here) {
+			const shown = c.visible.get(id) !== undefined && !c.visible.get(id)?.deleted;
+			if (shown && here) {
 				expect(c.textOf(id)).toBe(s.textOf(id));
 				expect(c.genOf(id)).toBe(s.space.genOf(id));
 			}
 			const mine = c.textState(id);
 			expect(mine?.stuck ?? false).toBe(false);
-			if (mine && c.visible.get(id) && here)
+			if (mine && shown && here)
 				expect(shape(mine.state)).toBe(server ? shape(server.state) : "<none>");
 		}
 	}
@@ -698,7 +715,9 @@ describe("pages are loaded on the first join and unloaded when nobody is in them
 		// Both in use: a third page does not fit.
 		const refused = open(link(writer), pages[2]?.pageId as string);
 		await waitFor(() => refused.closeCode !== null, 3000, "refused");
-		expect(refused.closeCode).toBe("unavailable");
+		expect(refused.closeCode).toBe("space_full");
+		expect(refused.status).toBe("closed");
+		expect([first.closeCode, second.closeCode]).toEqual([null, null]);
 		expect(theSpace().loadedBlocks).toBe(20);
 		// One is left (its idle time far off): the next join takes its room.
 		type(second, pages[1]?.ids[0] as string, "!");
@@ -1624,7 +1643,7 @@ describe("review round 1", () => {
 		expect(await content(x)).toBe("goes1");
 	});
 
-	test("one person's pages: past their share, their least recently joined page is closed for them, and nobody else's", async () => {
+	test("one person's pages: past their share, the new page is refused, none of their open ones closed; a page someone else is in too is not theirs", async () => {
 		const pages = [];
 		for (let i = 0; i < 4; i++)
 			pages.push(
@@ -1641,27 +1660,22 @@ describe("review round 1", () => {
 		await waitFor(() => first.ready && other.ready, 3000, "joined");
 		const second = open(link(owner), pages[1]?.pageId as string);
 		await waitFor(() => second.ready, 3000, "joined");
-		type(first, pages[0]?.ids[0] as string, "!");
-		await settle(60);
 		const third3 = open(link(owner), pages[2]?.pageId as string);
-		await waitFor(() => third3.ready, 3000, "joined");
+		await waitFor(() => third3.closeCode !== null, 3000, "refused");
 		await settle(60);
-		expect(first.closeCode).toBe("unavailable");
-		expect(second.closeCode).toBeNull();
-		expect(other.closeCode).toBeNull();
-		expect(liveSessionOf(pages[0]?.pageId as string)).toBeUndefined();
+		expect(third3.closeCode).toBe("user_limit");
+		expect(third3.status).toBe("closed");
+		expect([first.closeCode, second.closeCode, other.closeCode]).toEqual([null, null, null]);
+		expect([first.status, second.status]).toEqual(["live", "live"]);
+		expect(liveSessionOf(pages[2]?.pageId as string)).toBeUndefined();
 		expect(theSpace().loadedBlocks).toBe(30);
-		// What they typed there was committed before the page went.
-		expect(await content(pages[0]?.ids[0] as string)).toBe("p0 b0!");
-		// A page someone else is in too is not theirs to lose.
+		// A page someone else is in too is not theirs to count.
 		const shared = open(link(writer), pages[1]?.pageId as string);
 		await waitFor(() => shared.ready, 3000, "joined");
-		const fourth = open(link(owner), pages[0]?.pageId as string);
-		await waitFor(() => fourth.ready || fourth.closeCode !== null, 3000, "answered");
-		// Only one page is theirs alone now: within their share.
-		expect(fourth.ready).toBe(true);
-		expect(second.closeCode).toBeNull();
-		expect(third3.closeCode).toBeNull();
+		const retried = open(link(owner), pages[2]?.pageId as string);
+		await waitFor(() => retried.ready || retried.closeCode !== null, 3000, "answered");
+		expect(retried.ready).toBe(true);
+		expect([first.closeCode, second.closeCode, other.closeCode]).toEqual([null, null, null]);
 		expect(theSpace().loadedBlocks).toBe(40);
 	});
 
@@ -1880,4 +1894,311 @@ describe("every keystroke lands exactly once (model, seeded)", () => {
 			}
 		}, 90_000);
 	}
+});
+
+/**
+ * Scripted sequences on a clock the test advances (`FakeLiveClock`): no real timer, the same
+ * order of events every run.
+ */
+describe("deterministic sequences (review round 2)", () => {
+	let clock: FakeLiveClock;
+	beforeEach(() => {
+		clock = new FakeLiveClock().install();
+		OUTLINE_LIVE_TIMING.docIdleMs = 0;
+		OUTLINE_LIVE_TIMING.sweepMs = 3_600_000;
+	});
+	afterEach(() => {
+		clock.uninstall();
+	});
+
+	/** Every token is in its block exactly once, or (and then nowhere in the block) kept unsaved. */
+	async function expectEachOnce(
+		pageId: string,
+		blockId: string,
+		tokens: readonly string[],
+	): Promise<void> {
+		const text = await content(blockId);
+		const kept = unsavedTextsOf(pageId)
+			.filter((e) => e.blockId === blockId)
+			.map((e) => e.text);
+		for (const token of tokens) {
+			const inBlock = text.split(token).length - 1;
+			const inKept = kept.some((k) => k.includes(token));
+			expect({ token, inBlock, inKept, text, kept }).toMatchObject(
+				inKept ? { inBlock: 0 } : { inBlock: 1 },
+			);
+		}
+	}
+
+	test("seed 222: typing on top of text the page did not take is kept with it, never merged into the block", async () => {
+		// The texts of the failing run (seed 222): tokens of three equal characters.
+		const one = await page(["p2b4"], "One");
+		const two = await page(["there"], "Two");
+		const r = one.ids[0] as string;
+		const la = link(owner);
+		const a = open(la, one.pageId);
+		await clock.until(() => a.ready, 5000, "joined");
+		// The answers to this client are late from here on; what it sends still goes.
+		la.holdDown(true);
+		edit(a, r, "p2b4 亟亟亟 亴亴亴 亱亱亱 亷亷亷 亦亦亦 亗亗亗");
+		// The block goes to a page nobody has open before the typing arrives: not taken.
+		await agent([{ op: "move", block: { id: r }, parent: { id: two.pageId } }]);
+		await clock.until(() => theSpace().clientKeys.get(a.key) === 1, 5000, "tx 1 processed");
+		// Two more transactions on its copy that still holds that text: one sent into a dead
+		// connection, one typed offline.
+		la.hold(true);
+		edit(a, r, "p2b4 亟亟亟 什什什 亴亴亴 亱亱亱 亷亷亷 亦亦亦 仈仈仈 仅仅仅 亗亗亗");
+		await clock.advance(OUTLINE_LIVE_LIMITS.typingBatchMs + 10);
+		la.disconnect();
+		la.hold(false);
+		edit(
+			a,
+			r,
+			"p2b4 亟亟亟 仝仝仝 什什什 亴亴亴 亱亱亱 任任任 份份份 亷亷亷 亦亦亦 仈仈仈 仅仅仅 亗亗亗",
+		);
+		expect(a.pending.map((tx) => tx.n)).toEqual([1, 2, 3]);
+		// The block comes back to the page.
+		await agent([{ op: "move", block: { id: r }, parent: { id: one.pageId } }]);
+		la.reconnect();
+
+		await clock.until(() => a.status === "live" && a.pending.length === 0, 10_000, "answered");
+		await clock.settle();
+		await runInLane(space.id, async () => {
+			await theSpace().flushContent();
+		});
+		await clock.settle();
+		expect(a.stats.rejects).toBe(0);
+		const tokens = ["亟", "亴", "亱", "亷", "亦", "亗", "什", "仈", "仅", "仝", "任", "份"];
+		await expectEachOnce(
+			one.pageId,
+			r,
+			tokens.map((t) => t.repeat(3)),
+		);
+		// No token cut apart anywhere in the block.
+		for (const t of tokens) expect((await content(r)).split(t).length - 1).toBe(0);
+		// The block is what the page holds; the person has the text they typed, whole.
+		expect(await content(r)).toBe("p2b4");
+		expect(a.textOf(r)).toBe("p2b4");
+		expect(unsavedTextsOf(one.pageId).map((e) => [e.blockId, e.text, e.reason])).toEqual([
+			[
+				r,
+				"p2b4 亟亟亟 仝仝仝 什什什 亴亴亴 亱亱亱 任任任 份份份 亷亷亷 亦亦亦 仈仈仈 仅仅仅 亗亗亗",
+				"moved_away",
+			],
+		]);
+		expect(a.outline()).toBe(await dbOutline(one.pageId));
+	});
+
+	test("the same through a snapshot: the page was unloaded and loaded again while the typist was away", async () => {
+		const one = await page(["p2b4", "other"], "One");
+		const two = await page(["there"], "Two");
+		const three = await page(["keeps the session"], "Three");
+		const r = one.ids[0] as string;
+		const la = link(owner);
+		const a = open(la, one.pageId);
+		const c = open(link(writer), three.pageId);
+		await clock.until(() => a.ready && c.ready, 5000, "joined");
+		la.holdDown(true);
+		type(a, r, " AAA");
+		await agent([{ op: "move", block: { id: r }, parent: { id: two.pageId } }]);
+		await clock.until(() => theSpace().clientKeys.get(a.key) === 1, 5000, "tx 1 processed");
+		la.disconnect();
+		edit(a, r, "p2b4 BBB AAA CCC");
+		type(a, one.ids[1] as string, " DDD");
+		// Nobody on page one: it is unloaded, and the block comes back to it there.
+		await clock.until(() => liveSessionOf(one.pageId) === undefined, 10_000, "unloaded");
+		await agent([{ op: "move", block: { id: r }, parent: { id: one.pageId } }]);
+		la.reconnect();
+		await clock.until(() => a.status === "live" && a.pending.length === 0, 10_000, "answered");
+		await clock.settle();
+		await runInLane(space.id, async () => {
+			await theSpace().flushContent();
+		});
+		await clock.settle();
+		expect(a.stats.rejects).toBe(0);
+		await expectEachOnce(one.pageId, r, ["AAA", "BBB", "CCC"]);
+		expect(await content(r)).toBe("p2b4");
+		// Typing elsewhere on the page is replayed as usual.
+		expect(await content(one.ids[1] as string)).toBe("other DDD");
+		expect(a.outline()).toBe(await dbOutline(one.pageId));
+	});
+	test("a person's tabs past their share never close each other: the refused tab stays refused (no retry of its own) until the person retries after closing one", async () => {
+		const pages = [];
+		for (let i = 0; i < 3; i++)
+			pages.push(
+				await page(
+					Array.from({ length: 9 }, (_, n) => `p${i} b${n}`),
+					`P${i}`,
+				),
+			);
+		OUTLINE_LIVE_BOUNDS.maxUserBlocks = 25;
+		OUTLINE_LIVE_TIMING.idleCloseMs = 60_000;
+		const first = open(link(owner), pages[0]?.pageId as string);
+		await clock.until(() => first.ready, 5000, "first joined");
+		const second = open(link(owner), pages[1]?.pageId as string);
+		await clock.until(() => second.ready, 5000, "second joined");
+		const thirdTab = open(link(owner), pages[2]?.pageId as string);
+		await clock.until(() => thirdTab.closeCode !== null, 5000, "third answered");
+		// Watch every tab's state for a while (the reviewer's probe saw 18 changes in 9 s).
+		const changes: string[] = [];
+		const seen = new Map<LiveClient, string>();
+		const tabs = [
+			["first", first],
+			["second", second],
+			["third", thirdTab],
+		] as const;
+		for (const [, c] of tabs) seen.set(c, `${c.status}/${c.closeCode}`);
+		for (let t = 0; t < 120_000; t += 100) {
+			await clock.advance(100);
+			for (const [name, c] of tabs) {
+				const now = `${c.status}/${c.closeCode}`;
+				if (seen.get(c) !== now) changes.push(`${clock.t} ${name} ${now}`);
+				seen.set(c, now);
+			}
+		}
+		expect(changes).toEqual([]);
+		expect([first.status, second.status, thirdTab.status]).toEqual(["live", "live", "closed"]);
+		expect(thirdTab.closeCode).toBe("user_limit");
+		expect(theSpace().loadedBlocks).toBe(20);
+		// The person closes a tab and retries (the page's Retry makes a new client).
+		second.dispose();
+		await clock.settle();
+		const retried = open(link(owner), pages[2]?.pageId as string);
+		await clock.until(() => retried.ready || retried.closeCode !== null, 5000, "retried");
+		expect(retried.ready).toBe(true);
+		type(retried, pages[2]?.ids[0] as string, "!");
+		await clock.settle();
+		expect([first.status, retried.status]).toEqual(["live", "live"]);
+		expect(first.closeCode).toBeNull();
+		// The page the closed tab was on stays loaded until its idle time is over; it is
+		// nobody's share any more.
+		expect(theSpace().loadedBlocks).toBe(30);
+		await clock.advance(61_000);
+		expect(liveSessionOf(pages[1]?.pageId as string)).toBeUndefined();
+		expect(first.status).toBe("live");
+	});
+	test("a crash with one document that cannot be rebuilt: the other blocks' typing is committed once, and clients learn exactly which of their transactions the space took", async () => {
+		const { pageId, ids } = await page(["x", "s"]);
+		const x = ids[0] as string;
+		const sid = ids[1] as string;
+		const la = link(owner);
+		const lb = link(writer);
+		const a = open(la, pageId);
+		const b = open(lb, pageId);
+		await clock.until(() => a.ready && b.ready, 5000, "joined");
+		OUTLINE_LIVE_TIMING.flushIdleMs = 600_000;
+		OUTLINE_LIVE_TIMING.flushMaxMs = 600_000;
+		// Acknowledged.
+		type(a, x, " one");
+		await clock.until(() => a.pending.length === 0, 5000, "acknowledged");
+		// Taken and in the log, never acknowledged (the answers are late).
+		la.holdDown(true);
+		type(a, x, " two");
+		const durable = () => theSpace().durableKeys(false).get(a.key) ?? 0;
+		await clock.until(() => durable() === 2, 5000, "logged");
+		// Another person's typing, acknowledged, in a block of its own line.
+		edit(b, sid, "s by b");
+		await clock.until(() => b.pending.length === 0, 5000, "b acknowledged");
+		// One more, also taken and logged, not acknowledged (a text merge of " two" onto the
+		// space's "x one two three" would repeat it).
+		type(a, x, " three");
+		await clock.until(() => durable() === 3, 5000, "logged");
+		la.disconnect();
+		// Offline: on top of what was not acknowledged.
+		type(a, x, " four");
+		const epoch = theSpace().epoch;
+		lb.disconnect();
+		abandonLiveSessionForTests(pageId);
+		forgetEndedSessionsForTests();
+		// One more row in the log: an update of `s` whose items no row brings (a document that
+		// cannot be rebuilt).
+		const made = seededTextDoc("s by b");
+		const first = Y.encodeStateVector(made.doc);
+		made.text.insert(0, "?");
+		const one = Y.encodeStateAsUpdate(made.doc, first);
+		const second = Y.encodeStateVector(made.doc);
+		made.text.insert(1, "!");
+		const two = Y.encodeStateAsUpdate(made.doc, second);
+		made.doc.destroy();
+		expect(one.length).toBeGreaterThan(2);
+		const last = (await outlineStore.listLiveLog(space.id, epoch, { limit: 1000 })).at(-1);
+		await outlineStore.appendLiveLog([
+			{
+				spaceId: space.id,
+				epoch,
+				seq: (last?.seq ?? 0) + 1,
+				updateB64: Buffer.from(
+					encodeLogTexts([{ id: sid, kind: LIVE_TEXT_KIND.update, data: two }]),
+				).toString("base64"),
+				actorKind: "human",
+				actorId: writer,
+				createdAt: new Date().toISOString(),
+			},
+		]);
+		// Back: the next session replays the log first (all of it but `s`).
+		la.reconnect();
+		await clock.until(() => a.status === "live" && a.pending.length === 0, 10_000, "a answered");
+		await clock.settle();
+		await runInLane(space.id, async () => {
+			await theSpace().flushContent();
+		});
+		await clock.settle();
+		expect(await content(x)).toBe("x one two three four");
+		expect(a.textOf(x)).toBe("x one two three four");
+		// Nothing of `s` is committed (its document cannot be rebuilt); its rows, with what b
+		// typed, stay for an operator.
+		expect(await content(sid)).toBe("s");
+		const rows = await outlineStore.listLiveLog(space.id, epoch, { limit: 1000 });
+		expect(rows.length).toBeGreaterThan(0);
+		for (const r of rows)
+			if (r.actorId !== LIVE_SYNC_ACTOR)
+				for (const e of decodeLogTexts(Buffer.from(r.updateB64, "base64")) ?? [])
+					expect(e.id).toBe(sid);
+		// The rows kept still say how far each client's transactions reached (a later replay of
+		// them tells the clients again).
+		const positions = rows
+			.filter((r) => r.actorId === LIVE_SYNC_ACTOR)
+			.map((r) => JSON.parse(Buffer.from(r.updateB64, "base64").toString("utf8")).k ?? {});
+		expect(Math.max(...positions.map((k) => k[a.key] ?? 0))).toBe(3);
+		expect(a.stats.rejects).toBe(0);
+	});
+
+	test("a notice of text not taken survives a crash between the transaction's log row and its delivery", async () => {
+		const one = await page(["p2b4", "stays"], "One");
+		const two = await page(["there"], "Two");
+		const r = one.ids[0] as string;
+		const la = link(owner);
+		const a = open(la, one.pageId);
+		await clock.until(() => a.ready, 5000, "joined");
+		la.holdDown(true);
+		type(a, r, " AAA");
+		await agent([{ op: "move", block: { id: r }, parent: { id: two.pageId } }]);
+		// Taken (as not taken) and in the log with its notice; the answer never arrives.
+		await clock.until(() => (theSpace().durableKeys(false).get(a.key) ?? 0) === 1, 5000, "logged");
+		const epoch = theSpace().epoch;
+		la.disconnect();
+		la.hold(false);
+		abandonLiveSessionForTests(one.pageId);
+		forgetEndedSessionsForTests();
+		la.reconnect();
+		await clock.until(() => a.status === "live" && a.pending.length === 0, 10_000, "answered");
+		await clock.settle();
+		expect(unsavedTextsOf(one.pageId).map((e) => [e.blockId, e.text, e.reason])).toEqual([
+			[r, "p2b4 AAA", "moved_away"],
+		]);
+		expect(await content(r)).toBe("p2b4");
+		// Sent with the new session's answer is not received: until the client's next join shows
+		// it got them, the new session keeps them (and logs them).
+		const kept = await outlineStore.listLiveLog(space.id, theSpace().epoch, { limit: 1000 });
+		expect(
+			kept.some(
+				(row) =>
+					row.actorId === LIVE_SYNC_ACTOR &&
+					JSON.parse(Buffer.from(row.updateB64, "base64").toString("utf8")).l?.[a.key]?.[0]?.[0] ===
+						1,
+			),
+		).toBe(true);
+		// The ended session's own rows were replayed and went.
+		expect(await outlineStore.listLiveLog(space.id, epoch, { limit: 10 })).toEqual([]);
+	});
 });
