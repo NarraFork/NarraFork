@@ -56,6 +56,7 @@ import { savedSelectionReference } from "../composer/file-reference-input";
 import { ContentViewer } from "../content/ContentViewer";
 import { MonacoEditor } from "../file-editor/MonacoEditor";
 import {
+	type FilePreviewType,
 	getFilePreviewType,
 	MAX_FILE_PREVIEW_BLOB_BYTES,
 	readTextPreview,
@@ -63,7 +64,13 @@ import {
 import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../markdown/highlight-cache";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import { filePanelBaseName } from "../panels/panel-kind";
-import { availableModes, type FileViewerMode } from "./file-viewer-modes";
+import { DocumentPreview } from "./DocumentPreview";
+import {
+	availableModes,
+	type FileViewerMode,
+	isDocumentPath,
+	isLegacyDocumentPath,
+} from "./file-viewer-modes";
 import { StructuredNodeTree } from "./StructuredNodeTree";
 import {
 	detectStructuredFormat,
@@ -190,11 +197,14 @@ export function fileViewerReadMode(
 
 /** Image links are previews, not text references; selected ranges remain text-only. */
 export function fileViewerUsesText(
-	previewType: "image" | "pdf" | "text",
+	previewType: FilePreviewType,
 	selection: FileSelection | undefined,
 	referenceOrigin: boolean,
 	deviceId: string,
 ): boolean {
+	// Checked BEFORE `selection`: a Word document has no text to read, and a line selection must
+	// not pull it back onto the UTF-8 text path (which is what showed a ZIP as garbage).
+	if (previewType === "document" || previewType === "legacy-doc") return false;
 	if (selection) return true;
 	if (previewType === "image") return false;
 	return previewType === "text" || referenceOrigin || deviceId !== "local";
@@ -544,7 +554,16 @@ export function FileViewerContent({
 								{previewCapability.reason ?? t("filePreview_unsupported")}
 							</Text>
 						</Box>
-					) : !isText && previewType !== "text" ? (
+					) : isDocumentPath(filePath) || isLegacyDocumentPath(filePath) ? (
+						// Both routes go to the document preview: the server decides the REAL format
+						// from the bytes, so a `.doc` that is actually OOXML still renders, and a
+						// mislabelled legacy file is refused with a reason instead of shown as text.
+						<DocumentPreview
+							key={JSON.stringify([narratorId, deviceId, filePath, reloadToken])}
+							filePath={filePath}
+							deviceId={deviceId}
+						/>
+					) : !isText && (previewType === "image" || previewType === "pdf") ? (
 						<BinaryFilePreview
 							key={JSON.stringify([narratorId, deviceId, readerMode, filePath, reloadToken])}
 							filePath={filePath}

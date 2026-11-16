@@ -2,6 +2,7 @@ import { MarkdownContentListItem } from "@frontend/components/common/MarkdownLis
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Code, Divider, Table, Text } from "@mantine/core";
 import { parseAgentReference } from "@shared/agent-reference";
+import { isDocumentAssetUrl } from "@shared/document-file-extensions";
 import {
 	prepareMarkdownEmphasis,
 	remarkStripEmphasisSentinel,
@@ -22,8 +23,7 @@ import {
 	useRef,
 	useState,
 } from "react";
-import type { Components } from "react-markdown";
-import Markdown from "react-markdown";
+import Markdown, { type Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Pluggable, PluggableList } from "unified";
 import { hasUnclosedFence, splitStableAndTail } from "../streaming/streaming-markdown-split";
@@ -532,6 +532,17 @@ function animateText(children: ReactNode): ReactNode {
 
 const animatedComponents = createMdComponents(animateText);
 
+/**
+ * Let `nf-doc-asset:` through, keep every other URL on the default cleaning path.
+ *
+ * react-markdown's default transform drops any scheme outside its allow-list, which silently
+ * emptied the `src` of pictures embedded in a document preview — the image then rendered as its
+ * alt text with no request made and nothing in the UI explaining why.
+ */
+function markdownUrlTransform(url: string): string {
+	return isDocumentAssetUrl(url) ? url : defaultUrlTransform(url);
+}
+
 function AnimatedMarkdownTree({
 	source,
 	remarkPlugins,
@@ -545,6 +556,7 @@ function AnimatedMarkdownTree({
 		<Markdown
 			remarkPlugins={remarkPlugins}
 			rehypePlugins={rehypePlugins}
+			urlTransform={markdownUrlTransform}
 			components={animatedComponents}
 		>
 			{prepareMarkdownEmphasis(source)}
@@ -615,6 +627,7 @@ function StaticMarkdownTree({
 		<Markdown
 			remarkPlugins={remarkPlugins}
 			rehypePlugins={rehypePlugins}
+			urlTransform={markdownUrlTransform}
 			components={sourceLines ? staticSourceLineComponents : staticComponents}
 		>
 			{prepareMarkdownEmphasis(source)}

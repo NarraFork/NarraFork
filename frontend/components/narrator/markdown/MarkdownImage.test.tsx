@@ -147,6 +147,48 @@ describe("Markdown inline images in the rendered preview", () => {
 	});
 });
 
+describe("pictures embedded in a document preview", () => {
+	const documentPath = "/repo/design/spec.docx";
+	const assetLink = (id: string) =>
+		`![](nf-doc-asset:?doc=${encodeURIComponent(documentPath)}&id=${id})`;
+
+	test("resolves a document asset through the document endpoint", async () => {
+		await renderNode(<MarkdownContent text={assetLink("a1")} />, localScope);
+		expect(requests).toHaveLength(1);
+		expect(requests[0].url.pathname).toBe("/api/fs/document-asset");
+		expect(requests[0].url.searchParams.get("path")).toBe(documentPath);
+		expect(requests[0].url.searchParams.get("id")).toBe("a1");
+		expect(container.querySelector("img")?.getAttribute("src")).toBe("blob:test-1");
+	});
+
+	test("clicking an embedded picture enlarges it with the bytes it already has", async () => {
+		const opens: ImageViewerOptions[] = [];
+		await renderNode(
+			<ImageViewerContext.Provider value={{ open: (options) => opens.push(options) }}>
+				<MarkdownContent text={assetLink("a1")} />
+			</ImageViewerContext.Provider>,
+			localScope,
+		);
+		await click(container.querySelector("img"));
+		expect(opens).toHaveLength(1);
+		expect(opens[0].src).toBe("blob:test-1");
+		// Same contract as a repository image: the viewer owns its own URL from the bytes.
+		expect(opens[0].blob?.size).toBe(3);
+	});
+
+	test("a failed asset read keeps the alt text instead of a broken image", async () => {
+		response = () => Response.json({ error: "unknown asset" }, { status: 400 });
+		await renderNode(<MarkdownContent text={assetLink("a9")} />, localScope);
+		expect(container.querySelector("img")).toBeNull();
+	});
+
+	test("releases the object URL when the document preview unmounts", async () => {
+		await renderNode(<MarkdownContent text={assetLink("a1")} />, localScope);
+		await act(async () => root.render(null));
+		expect(revoked).toHaveBeenCalledWith("blob:test-1");
+	});
+});
+
 describe("Markdown repository images", () => {
 	test("resolves encoded relative images from the document directory and sends auth", async () => {
 		await render("../images/中文%20截图.png", localScope);
