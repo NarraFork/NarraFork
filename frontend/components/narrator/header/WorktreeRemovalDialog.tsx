@@ -15,13 +15,16 @@ import type {
 	WorktreeDependent,
 	WorktreeRemovalPlan,
 	WorktreeRemovalResult,
-	WorktreeRemovalStep,
 } from "@shared/narrator-worktrees";
 import { IconAlertTriangle, IconTrash } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { worktreeDirectoryLabel } from "./worktree-list-view";
-import { WorktreeRemovalFlow, type WorktreeRemovalFlowState } from "./worktree-removal-flow";
+import {
+	WorktreeRemovalFlow,
+	type WorktreeRemovalFlowState,
+	type WorktreeRemovalStep,
+} from "./worktree-removal-flow";
 
 const EMPTY_STATE: WorktreeRemovalFlowState = { step: "idle", busy: false, confirmed: [] };
 

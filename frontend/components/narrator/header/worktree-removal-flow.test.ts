@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import type { WorktreeRemovalPlan, WorktreeRemovalResult } from "@shared/narrator-worktrees";
+import type {
+	WorktreeRemovalPlan,
+	WorktreeRemovalRequest,
+	WorktreeRemovalResult,
+} from "@shared/narrator-worktrees";
 import { removalBlockers, WorktreeRemovalFlow } from "./worktree-removal-flow";
 
 const result = (outcome: WorktreeRemovalResult["outcome"]): WorktreeRemovalResult => ({
@@ -53,12 +57,8 @@ const plan = (patch: Partial<WorktreeRemovalPlan> = {}): WorktreeRemovalPlan => 
 interface Harness {
 	flow: WorktreeRemovalFlow;
 	states: () => number;
-	removals: () => {
-		expectedRevision: number;
-		force?: boolean;
-		acknowledgeUnregistered?: boolean;
-	}[];
-	archived: string[];
+	removals: () => WorktreeRemovalRequest[];
+	archived: () => string[];
 }
 
 function harness(options: {
@@ -68,11 +68,7 @@ function harness(options: {
 	archiveError?: unknown;
 }): Harness {
 	const states: unknown[] = [];
-	const removals: {
-		expectedRevision: number;
-		force?: boolean;
-		acknowledgeUnregistered?: boolean;
-	}[] = [];
+	const removals: WorktreeRemovalRequest[] = [];
 	const archived: string[] = [];
 	let index = 0;
 	const flow = new WorktreeRemovalFlow(
