@@ -11,7 +11,7 @@
 
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { outputToText } from "@shared/agent-protocol/tool-output";
-import type { WebSearchAction } from "@shared/agent-protocol/types";
+import type { TextProviderMetadata, WebSearchAction } from "@shared/agent-protocol/types";
 import type { NativeMediaInput } from "@shared/media-attachments";
 import {
 	type CanonicalEnvelope,
@@ -76,7 +76,13 @@ export interface NeutralInputGroup {
 }
 
 export type NeutralAssistantItem =
-	| { kind: "text"; blockId: string; text: string }
+	| {
+			kind: "text";
+			blockId: string;
+			text: string;
+			/** Native message/item identity; never treated as visible text or an end-turn signal. */
+			providerMetadata?: TextProviderMetadata;
+	  }
 	| {
 			kind: "reasoning";
 			blockId: string;
@@ -177,10 +183,29 @@ function assistantItems(
 		if (!isModelVisible(block) && !terminalImage) continue;
 		switch (block.kind) {
 			case "output": {
-				const text = block.payload.parts
-					.map((part) => (part.type === "text" ? part.text : ""))
-					.join("");
-				if (text) items.push({ kind: "text", blockId: block.id, text });
+				const legacyParts: string[] = [];
+				const flushLegacy = () => {
+					const text = legacyParts.join("");
+					legacyParts.length = 0;
+					if (text) items.push({ kind: "text", blockId: block.id, text });
+				};
+				for (const [partIndex, part] of block.payload.parts.entries()) {
+					if (part.type !== "text") continue;
+					if (!part.providerMetadata) {
+						legacyParts.push(part.text);
+						continue;
+					}
+					flushLegacy();
+					if (part.text) {
+						items.push({
+							kind: "text",
+							blockId: `${block.id}:part:${partIndex}`,
+							text: part.text,
+							providerMetadata: part.providerMetadata,
+						});
+					}
+				}
+				flushLegacy();
 				break;
 			}
 			case "reasoning": {

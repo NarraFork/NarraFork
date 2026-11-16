@@ -22,6 +22,7 @@ import { parseModelId, settings } from "../settings";
 import { getHttpCodexUserAgent, resolveClientFingerprint } from "../user-agent";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
+import { createProviderTurnContext } from "./codex-turn-state";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -492,6 +493,9 @@ export class CodexProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		rejectNativeMedia("Codex Responses", [params.media, params.history, params.toolResults]);
+		// Temporary adapters, credential retries and HTTP fallback all belong to this call.
+		// Never let direct callers accidentally inherit a preceding call's turn token.
+		params = { ...params, turnContext: params.turnContext ?? createProviderTurnContext() };
 		// Use WebSocket mode if enabled
 		if (this.useWebSocket) {
 			yield* this.chatWebSocket(params);
@@ -604,6 +608,7 @@ export class CodexProvider implements ProviderAdapter {
 					sessionKey:
 						params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId,
 					conversationId: params.conversationId,
+					turnContext: params.turnContext,
 					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,
 					model: params.model,

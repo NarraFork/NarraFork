@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Hono } from "hono";
+import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { resolveProxyForUrl } from "../lib/net/proxy";
@@ -11,6 +12,11 @@ import {
 	registerAnthropicModelLister,
 	settings,
 } from "../lib/settings";
+import {
+	getHttpClaudeCliUserAgent,
+	mergeExtraHeaders,
+	resolveHttpUserAgent,
+} from "../lib/user-agent";
 
 export const anthropicRoutes = new Hono();
 
@@ -154,12 +160,19 @@ export async function fetchAnthropicModels(
 	// Official API uses Bearer auth (Claude Code CLI protocol), proxy uses x-api-key
 	const headers: Record<string, string> = {
 		"anthropic-version": "2023-06-01",
+		"User-Agent": resolveHttpUserAgent({
+			mode: config.userAgentMode,
+			custom: config.customUserAgent,
+			fallback: getHttpClaudeCliUserAgent(),
+		}),
+		...buildOpencodeSessionHeader({ baseUrl: config.baseUrl, extraHeaders: config.extraHeaders }),
 	};
 	if (config.officialApi) {
 		headers.Authorization = `Bearer ${config.apiKey}`;
 	} else {
 		headers["x-api-key"] = config.apiKey;
 	}
+	mergeExtraHeaders(headers, config.extraHeaders, "User-Agent");
 
 	// Ordered list of candidate base URLs to try for the /models endpoint. The
 	// first entry is always the user-configured base URL, so its error (if any)

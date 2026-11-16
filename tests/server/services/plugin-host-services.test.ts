@@ -70,6 +70,7 @@ function bind(
 			capabilities: ["diagnostics.readOwnLogs"],
 			stderr: "token=do-not-return",
 			lateMessages: 0,
+			restartCount: 0,
 		}),
 		...overrides,
 	});
@@ -430,6 +431,7 @@ describe("PluginHostServices", () => {
 				capabilities: ["diagnostics.readOwnLogs"],
 				stderr: "",
 				lateMessages: 0,
+				restartCount: 0,
 			}),
 		});
 		expect(secondGeneration.dispatcher).toBe(firstGeneration.dispatcher);

@@ -22,6 +22,9 @@ type FetchAnthropicModels = (config: {
 	baseUrl?: string;
 	apiKey?: string;
 	officialApi?: boolean;
+	userAgentMode?: "custom" | "narrafork" | "codex" | "claude-code";
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
 }) => Promise<{ models: Array<{ id: string }>; resolvedBaseUrl?: string }>;
 type FetchOpenaiModels = (config: {
 	id: string;
@@ -29,6 +32,8 @@ type FetchOpenaiModels = (config: {
 	baseUrl?: string;
 	apiKey?: string;
 	apiMode?: string;
+	userAgentMode?: "custom" | "narrafork" | "codex" | "claude-code";
+	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
 }) => Promise<{ models: Array<{ id: string }> }>;
 
@@ -216,4 +221,52 @@ describe("fetchAnthropicModels error aggregation", () => {
 		// Origin-based success is not a safe baseUrl suggestion.
 		expect(result.resolvedBaseUrl).toBeUndefined();
 	});
+});
+
+describe("model catalog identity reaches a real HTTP endpoint", () => {
+	for (const protocol of ["anthropic", "responses", "completions"] as const) {
+		test(`${protocol} applies UA selection and case-insensitive explicit overrides`, async () => {
+			globalThis.fetch = originalFetch;
+			const captured: Headers[] = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					captured.push(request.headers);
+					return Response.json({ data: [{ id: "test-model" }] });
+				},
+			});
+			try {
+				const config = {
+					id: `catalog-${protocol}`,
+					name: "Catalog probe",
+					apiKey: "default-key",
+					baseUrl: `${server.url.origin}/v1`,
+					userAgentMode: "custom" as const,
+					customUserAgent: "selected/1",
+					apiMode: protocol === "responses" ? "codex" : "completions",
+					officialApi: true,
+				};
+				const fetchModels = protocol === "anthropic" ? fetchAnthropicModels : fetchOpenaiModels;
+				await fetchModels(config);
+				await fetchModels({
+					...config,
+					extraHeaders: {
+						"USER-AGENT": "override/2",
+						authorization: "Bearer operator",
+						Originator: "custom-originator",
+						"Anthropic-Version": "operator-version",
+					},
+				});
+				expect(captured).toHaveLength(2);
+				expect(captured[0]?.get("user-agent")).toBe("selected/1");
+				expect(captured[1]?.get("user-agent")).toBe("override/2");
+				expect(captured[1]?.get("authorization")).toBe("Bearer operator");
+				expect(captured[1]?.get("originator")).toBe("custom-originator");
+				expect(captured[1]?.get("anthropic-version")).toBe("operator-version");
+			} finally {
+				await server.stop(true);
+			}
+		});
+	}
 });

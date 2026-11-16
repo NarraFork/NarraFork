@@ -2,6 +2,9 @@ import { describe, expect, it, test } from "bun:test";
 import { deriveCodexWindowId } from "../agent/codex-request";
 import {
 	buildCodexEmulationHeaders,
+	CLAUDE_CLI_VERSION,
+	CODEX_CLI_VERSION,
+	getHttpClaudeCliUserAgent,
 	getHttpCodexUserAgent,
 	getHttpUserAgent,
 	mergeExtraHeaders,
@@ -283,4 +286,86 @@ describe("resolveClientFingerprint UA override", () => {
 			expect(headers["User-Agent"]).toBe("override/2.0");
 		});
 	}
+});
+
+describe("latest managed CLI fingerprints", () => {
+	test("pins the verified release versions, including both Codex UA positions", () => {
+		expect(CLAUDE_CLI_VERSION).toBe("2.1.325");
+		expect(CODEX_CLI_VERSION).toBe("0.169.0");
+		expect(getHttpClaudeCliUserAgent()).toBe("claude-cli/2.1.325 (external, cli)");
+		expect(getHttpCodexUserAgent()).toMatch(
+			/^codex-tui\/0\.169\.0 \(.+\) unknown \(codex-tui; 0\.169\.0\)$/,
+		);
+	});
+});
+
+describe("case-insensitive header layers", () => {
+	test("replaces every protocol default rather than comma-joining credentials or identity", () => {
+		const headers: Record<string, string> = {
+			Authorization: "Bearer default",
+			originator: "codex-tui",
+			"Content-Type": "application/json",
+			"anthropic-beta": "default-beta",
+			"User-Agent": "default/1",
+		};
+		mergeExtraHeaders(
+			headers,
+			{
+				authorization: "Bearer override",
+				Originator: "custom",
+				"content-type": "application/custom+json",
+				"Anthropic-Beta": "override-beta",
+				"USER-AGENT": "override/2",
+			},
+			"User-Agent",
+		);
+		expect(Object.keys(headers)).toHaveLength(5);
+		expect(Object.fromEntries(new Headers(headers))).toEqual({
+			authorization: "Bearer override",
+			originator: "custom",
+			"content-type": "application/custom+json",
+			"anthropic-beta": "override-beta",
+			"user-agent": "override/2",
+		});
+	});
+
+	test("normalizes existing duplicates and keeps the last nonempty override", () => {
+		const headers: Record<string, string> = {
+			"user-agent": "old/1",
+			"USER-AGENT": "old/2",
+			Originator: "old",
+			originator: "new",
+		};
+		mergeExtraHeaders(
+			headers,
+			{ "USER-AGENT": "  ", Originator: "", ORIGINATOR: "last" },
+			"User-Agent",
+		);
+		expect(Object.keys(headers).sort()).toEqual(["Originator", "User-Agent"]);
+		expect(new Headers(headers).get("user-agent")).toBe("old/2");
+		expect(new Headers(headers).get("originator")).toBe("last");
+	});
+
+	test("keeps literal header names from mutating the record prototype", () => {
+		const headers: Record<string, string> = {};
+		mergeExtraHeaders(
+			headers,
+			JSON.parse('{"__proto__":"literal","constructor":"value"}'),
+			"User-Agent",
+		);
+		expect(Object.getPrototypeOf(headers)).toBe(Object.prototype);
+		expect(Object.keys(headers)).toEqual(["__proto__", "constructor"]);
+		expect(headers.__proto__).toBe("literal");
+	});
+
+	test("the returned fingerprint UA is the same final value sent in its header layer", () => {
+		const fingerprint = resolveClientFingerprint({
+			mode: "custom",
+			custom: "configured/1",
+			fallback: "fallback/1",
+			extraHeaders: { "user-agent": "  final/2  " },
+		});
+		expect(fingerprint.userAgent).toBe("final/2");
+		expect(fingerprint.headers["User-Agent"]).toBe(fingerprint.userAgent);
+	});
 });

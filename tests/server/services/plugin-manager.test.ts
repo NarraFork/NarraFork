@@ -112,11 +112,13 @@ function trackRuntimeLifecycle(manager: PluginManager): () => Promise<void> {
 class FakeRuntime {
 	state: RuntimeState = "stopped";
 	generation: number;
+	restarts = 0;
 	readonly runtimeId: string;
 
 	constructor(readonly options: PluginRuntimeOptions) {
 		this.runtimeId = options.runtimeId ?? `fake-${options.pluginId}`;
 		this.generation = options.generation ?? 0;
+		this.restarts = options.restartCount ?? 0;
 	}
 
 	getDiagnostics(): RuntimeDiagnostics {
@@ -130,6 +132,7 @@ class FakeRuntime {
 			capabilities: [...(this.options.grantedCapabilities ?? [])],
 			stderr: "",
 			lateMessages: 0,
+			restartCount: this.restarts,
 		};
 	}
 }
@@ -2273,6 +2276,107 @@ describe("PluginManager", () => {
 		expect(capabilityBroker.hasBinding(pluginId, runtimeId)).toBe(true);
 		const binding = hostServices.getRuntimeBinding(pluginId, runtimeId);
 		expect(binding?.plugin.runtimeGeneration).toBe(runtime.generation);
+	});
+
+	test.each([
+		false,
+		true,
+	])("applies the provider idle budget only to providers: %s", async (provider) => {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const settle = trackRuntimeLifecycle(manager);
+		drainBeforeCleanup.push(settle);
+		const pluginId = provider ? "com.example.idle-provider" : "com.example.idle-generic";
+		const installed = await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				if (provider) {
+					(manifest.contributes as Record<string, unknown>).providers = [{ id: "model" }];
+				}
+			}),
+		);
+		try {
+			await manager.enable(installed.pluginId);
+			await manager.activate(installed.pluginId);
+			expect(supervisor.get(installed.pluginId)?.options.idleTimeoutMs).toBe(
+				provider ? 6 * 60 * 60_000 : undefined,
+			);
+		} finally {
+			await manager.shutdown();
+			await settle();
+		}
+	});
+
+	test("persists supervisor restarts instead of counting every generation bump", async () => {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const settle = trackRuntimeLifecycle(manager);
+		drainBeforeCleanup.push(settle);
+		const installed = await manager.install(await makePackage(root, "com.example.restart-count"));
+		await manager.enable(installed.pluginId);
+		await manager.activate(installed.pluginId);
+		const runtime = supervisor.get(installed.pluginId);
+		if (!runtime) throw new Error("Runtime was not registered");
+		expect((await manager.getStatus(installed.pluginId))?.restartCount).toBe(0);
+
+		// An on-demand wake-up bumps the generation without a supervisor restart.
+		await supervisor.start(installed.pluginId);
+		await settle();
+		expect(runtime.generation).toBe(2);
+		expect((await manager.getStatus(installed.pluginId))?.restartCount).toBe(0);
+
+		// Only the runtime's own restart counter reaches the persisted state.
+		runtime.restarts = 1;
+		await supervisor.start(installed.pluginId);
+		await settle();
+		expect(runtime.generation).toBe(3);
+		expect((await manager.getStatus(installed.pluginId))?.restartCount).toBe(1);
+
+		await manager.shutdown();
+		await settle();
+		const recoveredSupervisor = new FakeSupervisor();
+		const recovered = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: recoveredSupervisor,
+		});
+		const settleRecovered = trackRuntimeLifecycle(recovered);
+		drainBeforeCleanup.push(settleRecovered);
+		await recovered.activate(installed.pluginId);
+		const recoveredRuntime = recoveredSupervisor.get(installed.pluginId);
+		if (!recoveredRuntime) throw new Error("Runtime was not restored");
+		expect(recoveredRuntime.restarts).toBe(1);
+		recoveredRuntime.restarts += 1;
+		await recoveredSupervisor.start(installed.pluginId);
+		await settleRecovered();
+		expect((await recovered.getStatus(installed.pluginId))?.restartCount).toBe(2);
+
+		await recovered.install(
+			await makePackage(root, installed.pluginId, (manifest) => {
+				manifest.version = "2.0.0";
+			}),
+		);
+		await recovered.enable(installed.pluginId);
+		await recovered.activate(installed.pluginId);
+		const replacement = recoveredSupervisor.get(installed.pluginId);
+		if (!replacement) throw new Error("Upgraded runtime was not registered");
+		expect(replacement).not.toBe(recoveredRuntime);
+		expect(replacement.restarts).toBe(2);
+		replacement.restarts += 1;
+		await recoveredSupervisor.start(installed.pluginId);
+		await settleRecovered();
+		expect((await recovered.getStatus(installed.pluginId))?.restartCount).toBe(3);
+		await recovered.shutdown();
+		await settleRecovered();
 	});
 
 	test("reconciles host access when an active runtime lost its binding", async () => {

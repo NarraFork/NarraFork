@@ -57,6 +57,7 @@ import { buildUsageDataFromSnapshot } from "../usage-tracking";
 import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
+import { createProviderTurnContext, type ProviderTurnContext } from "./codex-turn-state";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./error-diagnostics";
 import {
 	classifyInvalidState,
@@ -1410,6 +1411,8 @@ export async function runReflectionLoop(
 	try {
 		const reflectionConfig: AgentConfig = {
 			...parentConfig,
+			// Auxiliary turns must never reuse the parent's upstream continuation state.
+			turnContext: createProviderTurnContext(),
 			signal: loopAbort.signal,
 			maxTurns: Number.isFinite(maxTurns) ? Math.max(1, Math.min(2, Math.floor(maxTurns))) : 2,
 			reflectionLoop,
@@ -2919,6 +2922,8 @@ async function* agentLoopInMetadataSnapshot(
 	images?: Array<{ format: string; base64: string }>,
 	media?: readonly (MediaRef | NativeMediaInput)[],
 ): AsyncGenerator<AgentEvent> {
+	// Direct loop callers own one fallback; host-managed contexts remain live across input adoption.
+	let fallbackTurnContext: ProviderTurnContext | undefined;
 	const guidanceSignal =
 		config.guidanceSignal && config.urgentGuidanceSignal
 			? AbortSignal.any([config.guidanceSignal, config.urgentGuidanceSignal])
@@ -4051,6 +4056,7 @@ async function* agentLoopInMetadataSnapshot(
 			let streamEventCount = 0;
 			let contentlessEventCount = 0;
 			let lastStopReason: string | undefined;
+			let endTurn: boolean | undefined;
 			const namelessToolUseIds = new Set<string>();
 
 			/**
@@ -4892,6 +4898,7 @@ async function* agentLoopInMetadataSnapshot(
 				streamEventCount = 0;
 				contentlessEventCount = 0;
 				lastStopReason = undefined;
+				endTurn = undefined;
 				namelessToolUseIds.clear();
 				sawMeaningfulResponse = false;
 				sawErrorEvent = false;
@@ -5210,8 +5217,14 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						consumeSearchExecutionTurn();
 					}
+					let turnContext = config.turnContext;
+					if (!turnContext) {
+						fallbackTurnContext ??= createProviderTurnContext();
+						turnContext = fallbackTurnContext;
+					}
 					const requestParams: import("./provider").ChatParams = {
 						conversationId: config.conversationId,
+						turnContext,
 						content: requestContent,
 						model: effectiveModel,
 						cwd: config.cwd,
@@ -5333,6 +5346,7 @@ async function* agentLoopInMetadataSnapshot(
 						// previously read nowhere in this loop, which is why an empty turn
 						// could not distinguish "model stopped" from "nothing arrived".
 						if (parsed.stopReason) lastStopReason = parsed.stopReason;
+						if (parsed.endTurn !== undefined) endTurn = parsed.endTurn;
 						// A tool-call chunk without a name can never become a tool call
 						// (the accumulator below requires `name`), so it leaves no trace
 						// unless recorded here.
@@ -5465,6 +5479,9 @@ async function* agentLoopInMetadataSnapshot(
 							// incremental parser here only created two ways to disagree.
 							const identity = outputContent.append("text", parsed.text, textLane);
 							yield { type: "stream_text", text: parsed.text, ...identity };
+						}
+						if (parsed.textMetadata) {
+							yield* outputContent.textMetadata(parsed.textMetadata, textLane);
 						}
 						// Late annotations update their original block; aggregate text and
 						// block-local citations are both derived from the same lane spans.
@@ -7021,6 +7038,7 @@ async function* agentLoopInMetadataSnapshot(
 				// Do not inherit the primary loop's extra content-recovery requests or compact it.
 				if (
 					config.reflectionLoop &&
+					endTurn !== false &&
 					requestStarted &&
 					!sawErrorEvent &&
 					!lastRetryErrorMessage &&
@@ -7070,6 +7088,8 @@ async function* agentLoopInMetadataSnapshot(
 				// entry cannot silently reintroduce that bug.
 				if (
 					!sawErrorEvent &&
+					// An explicit successful intermediate completion is not an empty-answer failure.
+					endTurn !== false &&
 					completionLimitMessage == null &&
 					!hasAnyPersistableOutput() &&
 					!hasIrreplaceableProgress()
@@ -7307,6 +7327,7 @@ async function* agentLoopInMetadataSnapshot(
 				const hasReasoning = !!collectReasoningBlocks(reasoningBlockMap);
 				if (
 					completionLimitMessage == null &&
+					endTurn !== false &&
 					!hasMeaningfulOutput &&
 					hasReasoning &&
 					// A tool that already ran makes this not a dead turn: discarding the
@@ -7589,21 +7610,23 @@ async function* agentLoopInMetadataSnapshot(
 				return;
 			}
 
-			// Yield the complete assistant message on every successful turn. Event consumers
-			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
-			yield {
-				type: "assistant_message",
-				outputCompleted: !pendingResumableError,
-				onToolPersisted: (toolUseId, binding) => {
-					const tu = toolUses.find((tool) => tool.toolUseId === toolUseId);
-					if (tu) bindExecution(tu, binding);
-				},
-				text: assistantText,
-				toolUses,
-				messageId,
-				credentialId,
-				...(turnCitations.length > 0 ? { citations: turnCitations } : {}),
-			};
+			// Finalize every successful assistant output. A contentless intermediate response
+			// can request follow-up without creating an empty assistant row or replay item.
+			if (endTurn !== false || orderedAssistantContent(toolUses).length > 0) {
+				yield {
+					type: "assistant_message",
+					outputCompleted: !pendingResumableError,
+					onToolPersisted: (toolUseId, binding) => {
+						const tu = toolUses.find((tool) => tool.toolUseId === toolUseId);
+						if (tu) bindExecution(tu, binding);
+					},
+					text: assistantText,
+					toolUses,
+					messageId,
+					credentialId,
+					...(turnCitations.length > 0 ? { citations: turnCitations } : {}),
+				};
+			}
 			// The provider response is now complete and every produced tool has a stable row.
 			// Tool execution may remain paused behind phase two without holding the response fence.
 			responseActivity.release();
@@ -7654,6 +7677,26 @@ async function* agentLoopInMetadataSnapshot(
 					turnIndex++;
 					continue;
 				}
+			}
+
+			// Responses may finish one response without ending the logical assistant turn.
+			// Only explicit end_turn=false requests this: message phase is descriptive metadata.
+			// Tools still use their normal execution path, even if end_turn=true was reported.
+			if (toolUses.length === 0 && endTurn === false && !pendingResumableError) {
+				// The current input and ordered item/part metadata join the same transcript
+				// used by ordinary tool steps and host prefix rebuilds. No adapter-local replay.
+				commitInput();
+				transcript.appendStep(orderedAssistantContent([]));
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+					return;
+				}
+				yield { type: "turn_complete", turnIndex };
+				const hostStop = observeSoftStopForTurn();
+				if (observeInputStopForTurn() || hostStop) return;
+				quietFinishAllowed = false;
+				turnIndex++;
+				continue;
 			}
 
 			// A prose-only reflection gets one internal correction, never instructions

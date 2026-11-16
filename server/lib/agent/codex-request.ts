@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getInstallationId } from "../installation-id";
+import { markInstructionsInput } from "./input-characters";
 
 /**
  * Stable identity fields the real client puts in `client_metadata`.
@@ -66,8 +67,51 @@ export function createCodexRequestIdentity(
 }
 
 /**
+ * Codex 0.169.0 puts base instructions first in input in BOTH lite and non-lite
+ * requests (codex-rs/core/src/client.rs, d32063f96c2dff1dc96af839b3952abb6acfeda4).
+ * Tools remain top-level in our non-lite contract. IDs survive retries/restores,
+ * while a changed instruction invalidates the WebSocket input-prefix match.
+ */
+export function applyCodexInstructionsInput(
+	body: Record<string, unknown>,
+	identity: CodexRequestIdentity,
+): void {
+	if (typeof body.instructions !== "string") return;
+	const instructions = body.instructions;
+	const sessionHash = createHash("sha256").update(identity.conversationId).digest("hex");
+	const prefix = `msg_nf_instructions_${sessionHash.slice(0, 12)}_`;
+	const instructionHash = createHash("sha256").update(instructions).digest("hex");
+	const textPart = { type: "input_text" as const, text: instructions };
+	const message = {
+		type: "message",
+		id: `${prefix}${instructionHash.slice(0, 24)}`,
+		role: "developer",
+		content: [textPart],
+	};
+	const input = Array.isArray(body.input)
+		? body.input
+		: typeof body.input === "string"
+			? [{ role: "user", content: body.input }]
+			: [];
+	body.input = [
+		message,
+		...input.filter((item: unknown) => {
+			if (!item || typeof item !== "object") return true;
+			const previous = item as Record<string, unknown>;
+			return !(
+				previous.role === "developer" &&
+				typeof previous.id === "string" &&
+				previous.id.startsWith(prefix)
+			);
+		}),
+	];
+	markInstructionsInput(body, textPart);
+	delete body.instructions;
+}
+
+/**
  * Apply the stable Codex TUI Responses body contract shared by HTTP, WebSocket,
- * and one-shot utility requests.
+ * and one-shot utility requests, including the developer instruction prefix.
  */
 export function applyCodexStableRequestFields(
 	body: Record<string, unknown>,
@@ -76,6 +120,7 @@ export function applyCodexStableRequestFields(
 		reasoningEffort: string;
 	},
 ): void {
+	applyCodexInstructionsInput(body, options.identity);
 	body.prompt_cache_key = options.identity.conversationId;
 	body.tool_choice = "auto";
 	// Parallel tool calls stay ON. `false` belongs to the responses-lite contract
