@@ -831,7 +831,6 @@ describe("human attention decisions", () => {
 			_planRoot: {
 				blockId: "b",
 				spaceId: "s",
-				pageId: "p",
 				address: "k/AbCdEfGh",
 				title: "Ship the importer",
 				round: 1,

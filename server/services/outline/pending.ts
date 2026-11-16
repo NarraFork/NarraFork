@@ -1,7 +1,7 @@
 /**
  * Pending changes (design §2.6) and the locks they come from (§2.2): locking and unlocking a
  * task tree, confirming and rejecting what an agent proposed for a locked plan, and the reads the
- * pages, the agent tools and the task source make of them.
+ * outline's views, the agent tools and the task source make of them.
  *
  * Proposals are made by the write path itself (`write.ts`, LOCKED PLANS AND PENDING
  * CONFIRMATION, and `pending-hold.ts`). This module decides them:
@@ -15,7 +15,8 @@
  *     targets exist, no cycle). When that fails nothing is written and the change stays open:
  *     the decider rejects it, or the proposer proposes again.
  *   - REJECT ({@link rejectOutlinePending}): no commit; the proposer is told once, on its next
- *     read of the page (`reported_at`). The proposer rejecting its own change withdraws it.
+ *     read under the same top-level block as the locked task ({@link takePendingReports},
+ *     `reported_at`). The proposer rejecting its own change withdraws it.
  *   - WHO DECIDES: the locker, or the session the locker named to confirm on their behalf (and
  *     its subagents). A session never confirms its own change (builder decision 7: the proposer is
  *     the proposing session, as for claims): a change the delegate proposed goes to the locker.
@@ -897,8 +898,8 @@ export async function readPagePending(
 ): Promise<{ pending: OutlinePendingHead[]; locked: OutlineBlockMeta[] }> {
 	const store = options.store ?? outlineStore;
 	const [pending, locked] = await Promise.all([
-		store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerPage),
-		store.listLockedBlocks(pageId, OUTLINE_PENDING_LIMITS.openPerPage),
+		store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerSpace),
+		store.listLockedBlocks(pageId, OUTLINE_PENDING_LIMITS.openPerSpace),
 	]);
 	return { pending, locked };
 }
@@ -1213,28 +1214,76 @@ export async function readPendingDiff(
 }
 
 /**
- * Decisions on a session's changes on a page it has not been shown, oldest first: shown once on
- * its next read of the page, then marked reported.
+ * Decisions on a session's changes it has not been shown, about where it reads: those whose
+ * locked task (the change's root) sits under the same top-level block as `blockId` of space
+ * `spaceId`, oldest first, at most {@link OUTLINE_PENDING_LIMITS.reportsPerRead}; shown once on
+ * the session's next read there, then marked reported.
+ *
+ * WHICH: the session's unreported decisions are read oldest first from their index (open rows
+ * never crowd them out, review S-6), a batch at a time, at most
+ * {@link OUTLINE_PENDING_LIMITS.reportsScan}; the read block and every root of the space among
+ * them are walked up together (one statement per 500, by primary key; a root deleted since walks
+ * up through the parents it was deleted from), and a decision is about here when its root's
+ * top-level block is the read block's. A root whose way up is not known is not reported here.
  */
 export async function takePendingReports(
 	session: string,
-	options: { store?: OutlineStore; now?: () => Date; pageId: string },
+	options: { store?: OutlineStore; now?: () => Date; spaceId: string; blockId: string },
 ): Promise<OutlinePendingHead[]> {
 	const store = options.store ?? outlineStore;
-	// Decided rows of this page only (the unreported index): open rows and other pages never
-	// crowd them out (review S-6); each read tells the oldest and marks them told.
-	const taken = await store.listUnreportedPending(
-		session,
-		options.pageId,
-		OUTLINE_PENDING_LIMITS.reportsPerRead,
-	);
-	if (taken.length > 0) {
+	const limits = OUTLINE_PENDING_LIMITS;
+	const candidates: OutlinePendingHead[] = [];
+	let after: { createdAt: string; id: string } | null = null;
+	for (let scanned = 0; scanned < limits.reportsScan; ) {
+		const batch = await store.listUnreportedPending(
+			session,
+			Math.min(limits.reportsBatch, limits.reportsScan - scanned),
+			after,
+		);
+		scanned += batch.length;
+		for (const row of batch)
+			if (row.spaceId === options.spaceId && row.rootBlockId) candidates.push(row);
+		const last = batch.at(-1);
+		if (!last || batch.length < limits.reportsBatch) break;
+		after = { createdAt: last.createdAt, id: last.id };
+	}
+	if (candidates.length === 0) return [];
+	// The read block's own chain first (one short walk), so a truncated walk of the roots never
+	// loses where the session reads; then the roots, all at once.
+	const parentOf = new Map<string, string | null>();
+	for (const ids of [
+		[options.blockId],
+		[...new Set(candidates.map((row) => row.rootBlockId as string))],
+	]) {
+		const walk = await store.listAncestryOf(options.spaceId, ids, limits.reportsWalkRows, {
+			includeDeleted: true,
+		});
+		for (const row of walk.rows) parentOf.set(row.id, row.parentId);
+	}
+	const topOf = (id: string): string | null => {
+		let at = id;
+		for (let depth = 0; depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+			if (!parentOf.has(at)) return null;
+			const parent = parentOf.get(at) ?? null;
+			if (parent === null) return at;
+			at = parent;
+		}
+		return null;
+	};
+	const here = topOf(options.blockId);
+	if (here === null) return [];
+	const taken = candidates
+		.filter((row) => topOf(row.rootBlockId as string) === here)
+		.slice(0, limits.reportsPerRead);
+	if (taken.length === 0) return [];
+	// Only the decisions this read marked: a read at the same time reports each once.
+	const marked = new Set(
 		await store.markPendingReported(
 			taken.map((r) => r.id),
 			(options.now?.() ?? new Date()).toISOString(),
-		);
-	}
-	return taken;
+		),
+	);
+	return taken.filter((row) => marked.has(row.id));
 }
 
 /** The space of a pending change, for access checks. */

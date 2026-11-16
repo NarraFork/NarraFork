@@ -6,7 +6,7 @@
  *   - `outline_decision`, questions: the open questions put to them, one row per block they are
  *     under (D20), answered at once (`questions.ts`).
  *   - `outline_decision`, pending: the open changes to plans they locked (P2 PR 6), with the diff
- *     and confirm or reject on the page's pending API.
+ *     and confirm or reject on the pending API.
  *   - `outline_digest`: the confirmations an agent made on their behalf (a session they named to
  *     confirm for a locked plan) that they have not acknowledged, and their unread reports
  *     (P2 PR 11, owner decision Q4 = A): one row, shown while either is there, counted in the
@@ -112,7 +112,6 @@ export async function listOutlineAttention(
 			outline: {
 				what: "questions",
 				spaceId: group.spaceId,
-				pageId: group.pageId,
 				blockId: group.groupBlockId,
 				pendingId: null,
 				count: group.questionIds.length,
@@ -143,7 +142,6 @@ export async function listOutlineAttention(
 			outline: {
 				what: "pending",
 				spaceId: row.spaceId,
-				pageId: row.pageId,
 				blockId: row.rootBlockId,
 				pendingId: row.id,
 				count: row.opCount,
@@ -175,7 +173,6 @@ export async function listOutlineAttention(
 			outline: {
 				what: "digest",
 				spaceId: null,
-				pageId: null,
 				blockId: null,
 				pendingId: null,
 				count: digest.items.length,
@@ -219,7 +216,6 @@ export async function readOutlineDigest(
 			label: outlinePendingLabel(row.id),
 			spaceId: row.spaceId,
 			spaceKey: a.space.key,
-			pageId: row.pageId,
 			rootBlockId: row.rootBlockId,
 			summary: clip(row.summary),
 			opCount: row.opCount,

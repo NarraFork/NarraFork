@@ -12,6 +12,7 @@ import { OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
 import { db } from "../../../db";
 import { narrators, users } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
+import { OUTLINE_PENDING_LIMITS } from "../model";
 import { lockOutlineTask } from "../pending";
 import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
@@ -86,10 +87,19 @@ describe("reads by block past their limits", () => {
 		for (const id of plans) await lockOutlineTask({ blockId: id, userId, store: outlineStore });
 		const narratorId = await seedNarrator();
 		space = await fresh(space);
-		for (const [i, id] of plans.entries()) {
-			await agent(space, narratorId, [
-				{ op: "update", block: { id }, content: `plan ${i} changed` },
-			]);
+		// More open changes than a space takes (its limit, 500, is what the reads scan too): the
+		// limit is lifted for the setup only.
+		const limits = OUTLINE_PENDING_LIMITS as { openPerSpace: number };
+		const perSpace = limits.openPerSpace;
+		limits.openPerSpace = N + 1;
+		try {
+			for (const [i, id] of plans.entries()) {
+				await agent(space, narratorId, [
+					{ op: "update", block: { id }, content: `plan ${i} changed` },
+				]);
+			}
+		} finally {
+			limits.openPerSpace = perSpace;
 		}
 		space = await fresh(space);
 		expect((await outlineStore.listOpenPendingBySpace(space.id, 1000)).length).toBe(N);

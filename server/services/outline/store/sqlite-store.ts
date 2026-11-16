@@ -1255,6 +1255,16 @@ export const sqliteOutlineStore: OutlineStore = {
 		return Number(row?.[0] ?? 0);
 	},
 
+	async countOpenPendingBySpace(spaceId, limit) {
+		// `"status" = 'open'` is the partial index's own predicate, word for word.
+		const row = db.get<[number]>(sql`
+			SELECT count(*) AS n FROM (
+				SELECT 1 FROM outline_pending WHERE space_id = ${spaceId} AND "status" = 'open' LIMIT ${limit}
+			)
+		`);
+		return Number(row?.[0] ?? 0);
+	},
+
 	async listOpenPendingBySpace(spaceId, limit) {
 		return db
 			.select(pendingHeadColumns)
@@ -1310,16 +1320,20 @@ export const sqliteOutlineStore: OutlineStore = {
 		return row ? toPending(row) : null;
 	},
 
-	async listUnreportedPending(requesterSession, pageId, limit) {
-		// The predicate is the unreported index's own, word for word.
+	async listUnreportedPending(requesterSession, limit, after) {
+		// The predicate is the unreported index's own, word for word; its order is the index's.
 		return db
 			.select(pendingHeadColumns)
 			.from(outlinePending)
 			.where(
 				and(
 					eq(outlinePending.requesterSession, requesterSession),
-					eq(outlinePending.pageId, pageId),
 					sql`"reported_at" IS NULL AND "status" <> 'open'`,
+					...(after
+						? [
+								sql`(${outlinePending.createdAt}, ${outlinePending.id}) > (${after.createdAt}, ${after.id})`,
+							]
+						: []),
 				),
 			)
 			.orderBy(asc(outlinePending.createdAt), asc(outlinePending.id))
@@ -1329,11 +1343,13 @@ export const sqliteOutlineStore: OutlineStore = {
 	},
 
 	async markPendingReported(ids, at) {
-		if (ids.length === 0) return;
-		await withDbRetry(
+		if (ids.length === 0) return [];
+		return await withDbRetry(
 			async () => {
+				const marked: string[] = [];
 				for (const chunk of chunked(ids)) {
-					db.update(outlinePending)
+					for (const row of db
+						.update(outlinePending)
 						.set({ reportedAt: at })
 						.where(
 							and(
@@ -1342,8 +1358,11 @@ export const sqliteOutlineStore: OutlineStore = {
 								isNull(outlinePending.reportedAt),
 							),
 						)
-						.run();
+						.returning({ id: outlinePending.id })
+						.all())
+						marked.push(row.id);
 				}
+				return marked;
 			},
 			{ label: "outline.markPendingReported", maxRetries: 3 },
 		);

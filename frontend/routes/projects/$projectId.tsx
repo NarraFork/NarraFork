@@ -133,7 +133,6 @@ function ProjectPage() {
 								openOutlinePage({
 									spaceId: task.spaceId,
 									blockId: task.id,
-									pageId: task.pageId,
 									view: "all",
 								})
 							}

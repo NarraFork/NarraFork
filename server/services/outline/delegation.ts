@@ -89,6 +89,7 @@ import {
 import { eq } from "drizzle-orm";
 import { readDisplayNames } from "./access-reads";
 import { OutlineAgentScope, type OutlineWriteRefusal } from "./agent-scope";
+import { type OutlineBlockTree, readBlockSubtree } from "./block-tree";
 import {
 	DELEGATION_BLOCK_TEXT,
 	DELEGATION_TEXT,
@@ -109,7 +110,7 @@ import { isOutlineEnabled } from "./feature";
 import { linkTitles } from "./link-display";
 import { OUTLINE_TOOL_TEXT } from "./messages";
 import type { OutlineAskJson, OutlineTaskJson } from "./model";
-import { loadBodies, loadBodiesWithin, readSubtree } from "./read";
+import { loadBodies, loadBodiesWithin } from "./read";
 import { OUTLINE_REPORT_ACTOR } from "./report-authors";
 import { OUTLINE_REPORT_LIMITS, type ReportBlock, type ReportConversion } from "./report-text";
 import { outlineStore } from "./store";
@@ -251,7 +252,7 @@ export interface DelegationBriefInput {
 	title: string;
 	/** The task's own text after its first line, if any. */
 	body: string | null;
-	/** Titles of the blocks above the task, the page first. */
+	/** Titles of the blocks above the task, the top-level block first. */
 	goals: string[];
 	/** What is under the task. */
 	children: DelegationBriefNode[];
@@ -558,7 +559,7 @@ export async function prepareOutlineDelegation(args: {
 	const refusal = await scope.writeRefusal(space);
 	if (refusal) refuse(text.notWritable(address, writeRefusalText(refusal, space.key)));
 
-	const subtree = await readSubtree(block.id, { store });
+	const subtree = await readBlockSubtree(block.id, { store });
 	if (!subtree) return refuse(text.deleted(address));
 	// The conditions shared with the board's "open a new session for this" (`task-json.ts`).
 	const planning = [subtree.root, ...subtree.path].some((node) => isPlanningRoot(node.task));
@@ -667,7 +668,7 @@ async function isRunning(narratorId: string): Promise<boolean> {
  */
 export async function readBriefInput(
 	block: OutlineBlockRow,
-	subtree: NonNullable<Awaited<ReturnType<typeof readSubtree>>>,
+	subtree: OutlineBlockTree,
 	scope: OutlineAgentScope,
 	store: OutlineStore,
 	found?: {

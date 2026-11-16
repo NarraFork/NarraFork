@@ -48,7 +48,7 @@
  *     session's words, or those of another project's session, are never copied here.
  *
  * COST
- * One page-structure read per task detailed (at most {@link OUTLINE_HANDOFF_LIMITS.detailed} per
+ * One subtree read by block per task detailed (at most {@link OUTLINE_HANDOFF_LIMITS.detailed} per
  * call; the rest get the head line only), the session's latest writes in the space (one bounded
  * read per session and space), the heads of at most `notes` blocks, and the sessions' rows by
  * primary key. No subprocess, no full content.
@@ -60,9 +60,9 @@ import { blockTitle, type Inline, serializeBody } from "@shared/outline";
 import { resolveNarratorProjectId } from "../narrator-project";
 import { type NarratorHandoffRow, readNarratorHandoffRows, readProjectDir } from "./access-reads";
 import { assigneeNamesSession } from "./assignee";
+import { readBlockSubtree } from "./block-tree";
 import { type DelegationLocale, delegationLocale } from "./delegation-text";
 import { OUTLINE_CHANGE } from "./model";
-import { readSubtree } from "./read";
 import type {
 	OutlineBlockMeta,
 	OutlineSpaceRow,
@@ -408,7 +408,7 @@ export async function planOutlineHandoffs(
 			}
 			const subtree =
 				detailed < OUTLINE_HANDOFF_LIMITS.detailed
-					? await readSubtree(claim.taskBlockId, { store })
+					? await readBlockSubtree(claim.taskBlockId, { store })
 					: null;
 			if (subtree) detailed++;
 			let locale = session?.ownerUserId ? locales.get(session.ownerUserId) : undefined;

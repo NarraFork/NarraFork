@@ -253,7 +253,7 @@ export async function readBlockView(
 	}
 
 	const pendingRows = state.current
-		? await store.listOpenPendingByPage(state.pageId, OUTLINE_PENDING_LIMITS.openPerPage)
+		? await store.listOpenPendingByPage(state.pageId, OUTLINE_PENDING_LIMITS.openPerSpace)
 		: [];
 	// What waits: the blocks a change targets. What is marked: those, and the blocks a change
 	// adds blocks under (review N-3; a proposed step's parent does not wait, decision 20).

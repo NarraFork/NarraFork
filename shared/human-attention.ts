@@ -17,7 +17,6 @@ export type HumanAttentionKind =
 export interface HumanAttentionOutlineRef {
 	what: "questions" | "pending" | "digest";
 	spaceId: string | null;
-	pageId: string | null;
 	/** The block the questions are under; a pending change's locked task. */
 	blockId: string | null;
 	/** A pending change's id. */

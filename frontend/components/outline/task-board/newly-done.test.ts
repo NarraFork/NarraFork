@@ -12,7 +12,6 @@ const task = (id: string, newlyDone: boolean, versionSeq = 3): OutlineBoardTask 
 	spaceId: "s",
 	sid: id,
 	address: `k/${id}`,
-	pageId: "p",
 	title: id,
 	status: "done",
 	waiting: null,

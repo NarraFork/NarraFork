@@ -40,8 +40,6 @@ const NOT_MIGRATED: Record<string, string> = {
 	"editor.reload": "X2 (reword, or keep as the browser's page with a note here)",
 	// The mind map of the editor.
 	"map.stage": "L4 (the map is a way to draw the focused view)",
-	// Handing a task out names the project's task list.
-	"board.handOut.*": "A2 (the task list is a block with an alias)",
 	// Dynamic Spec import into the outline: its pages (tasks, notes, behavior boundary).
 	"narrator.json:spec.loss.*": "A3 (spec import: the imported file is a top-level block)",
 	"narrator.json:spec.outlineFence*": "A3 (the fence: the behavior boundary is a block)",

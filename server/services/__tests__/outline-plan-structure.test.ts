@@ -584,7 +584,6 @@ describe("what is not refused", () => {
 			_planRoot: {
 				blockId: root.blockId,
 				spaceId: root.spaceId,
-				pageId: root.pageId,
 				address: root.address,
 				title: root.title,
 				round: 1,

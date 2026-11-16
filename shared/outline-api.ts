@@ -680,9 +680,8 @@ export interface OutlineQuestionGroupResponse {
 		blockId: string;
 		spaceId: string;
 		spaceKey: string;
-		pageId: string;
 		title: string;
-		/** The block is itself a question (one asked at the top of a page). */
+		/** The block is itself a question (one asked at the top level). */
 		isQuestion: boolean;
 	};
 	questions: OutlineQuestionView[];
@@ -724,7 +723,6 @@ export interface OutlineDigestItem {
 	label: string;
 	spaceId: string;
 	spaceKey: string;
-	pageId: string;
 	rootBlockId: string | null;
 	summary: string;
 	opCount: number;
@@ -840,8 +838,6 @@ export interface OutlinePlanSubmission {
 	root: {
 		blockId: string;
 		spaceId: string;
-		/** The page the plan is on (what the card subscribes to, to refresh its diff). */
-		pageId: string;
 		address: string;
 		title: string;
 		round: number;

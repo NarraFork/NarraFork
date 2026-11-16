@@ -66,7 +66,7 @@ import { DELEGATION_BLOCK_TEXT } from "./outline/delegation-text";
 import { OUTLINE_EDIT_TEXT_LIMITS, processEditText } from "./outline/edit-text-runner";
 import { OUTLINE_TEXT } from "./outline/messages";
 import { OUTLINE_LIMITS, OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./outline/model";
-import { OUTLINE_TASKS_PAGE_TITLE, oneAtATime } from "./outline/person-tasks";
+import { OUTLINE_TASKS_LIST_TITLE, oneAtATime } from "./outline/person-tasks";
 import {
 	addPluginTask,
 	isPersonLock,
@@ -427,7 +427,7 @@ export async function writeSpecTasksCompat(args: {
 				op: "insert",
 				tempId: "page",
 				parent: null,
-				content: OUTLINE_TASKS_PAGE_TITLE[session.locale === "zh-CN" ? "zh-CN" : "en"],
+				content: OUTLINE_TASKS_LIST_TITLE[session.locale === "zh-CN" ? "zh-CN" : "en"],
 				alias: OUTLINE_TASKS_PAGE_ALIAS,
 			});
 			pageRef = { tempId: "page" };

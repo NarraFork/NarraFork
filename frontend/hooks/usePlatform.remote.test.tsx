@@ -120,7 +120,6 @@ function Probe() {
 					blockId: "block",
 					spaceId: "space",
 					spaceKey: "SpaceKey",
-					pageId: "page",
 					title: "Question",
 					isQuestion: true,
 				},

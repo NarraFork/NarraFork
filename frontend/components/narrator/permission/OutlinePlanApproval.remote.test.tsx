@@ -66,7 +66,6 @@ const permission: PendingPermission = {
 		mode: "outline",
 		_planRoot: {
 			blockId: "plan",
-			pageId: "page",
 			spaceId: "space",
 			address: "space/plan",
 			title: "Plan",
