@@ -31,6 +31,7 @@ import {
 	SQLITE_ANCESTRY_AS_OF,
 	SQLITE_ANCESTRY_NOW,
 	SQLITE_ANCESTRY_OF,
+	SQLITE_ANCESTRY_OF_WITH_DELETED,
 	SQLITE_BACKFILL_INSERT,
 	SQLITE_BACKFILL_SCAN,
 	SQLITE_CHANGED_CHILDREN_CLOSED,
@@ -402,17 +403,20 @@ function checkAncestryPlans(): void {
 		/SEARCH v USING INDEX sqlite_autoindex_outline_block_versions_1 \(block_id=\? AND from_seq=\?\)/,
 	);
 
-	const many = planOf(SQLITE_ANCESTRY_OF, [JSON.stringify([wide, big, hot]), 4001, SPACE]);
-	expectNoScan(many);
-	const recursion = lineOf(many, /RECURSIVE STEP/);
-	expect(
-		many.filter((line) =>
-			/SEARCH b USING INDEX sqlite_autoindex_outline_blocks_1 \(id=\?\)/.test(line),
-		).length,
-	).toBeGreaterThanOrEqual(2);
-	expect(recursion).toBeGreaterThanOrEqual(0);
-	// Nothing reaches the blocks by their space: that is the walk of the whole space.
-	expect(many.filter((line) => /space_id/.test(line))).toEqual([]);
+	// Live blocks only, and deleted ones too (the behavior boundary's walk): the same probes.
+	for (const statement of [SQLITE_ANCESTRY_OF, SQLITE_ANCESTRY_OF_WITH_DELETED]) {
+		const many = planOf(statement, [JSON.stringify([wide, big, hot]), 4001, SPACE]);
+		expectNoScan(many);
+		const recursion = lineOf(many, /RECURSIVE STEP/);
+		expect(
+			many.filter((line) =>
+				/SEARCH b USING INDEX sqlite_autoindex_outline_blocks_1 \(id=\?\)/.test(line),
+			).length,
+		).toBeGreaterThanOrEqual(2);
+		expect(recursion).toBeGreaterThanOrEqual(0);
+		// Nothing reaches the blocks by their space: that is the walk of the whole space.
+		expect(many.filter((line) => /space_id/.test(line))).toEqual([]);
+	}
 
 	const locked = planOf(SQLITE_TASK_LOCKS_OF_SPACE, [SPACE, 501]);
 	lineOf(locked, /SCAN b USING INDEX idx_outline_blocks_locked/);

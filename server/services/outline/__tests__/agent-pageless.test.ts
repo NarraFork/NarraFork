@@ -824,6 +824,66 @@ describe("the behavior boundary, by ancestry", () => {
 		expect(free.commit).not.toBeNull();
 	});
 
+	test("the walk through a deleted chain is one store call whatever its depth", async () => {
+		const w = await sessionWorld();
+		// Sixty levels under Notes, then the boundary's own rule, both deleted by a person.
+		const chain: OutlineOp[] = [];
+		for (let i = 0; i < 60; i++) {
+			chain.push({
+				op: "insert",
+				tempId: `c${i}`,
+				parent: i === 0 ? { id: w.id("n") } : { tempId: `c${i - 1}` },
+				content: `level ${i}`,
+			});
+		}
+		const made = await humanWrite(w.space, w.alice, chain);
+		const top = made.results[0]?.blockId as string;
+		const deepest = made.results[59]?.blockId as string;
+		await humanWrite(w.space, w.alice, [{ op: "delete", block: { id: top } }]);
+		const counts = { listAncestryOf: 0, getBlockMetasByIds: 0 };
+		const counting = new Proxy(outlineStore, {
+			get(target, prop, receiver) {
+				const value = Reflect.get(target, prop, receiver);
+				if (prop === "listAncestryOf" || prop === "getBlockMetasByIds") {
+					return (...args: unknown[]) => {
+						counts[prop]++;
+						return (value as (...a: unknown[]) => unknown).apply(target, args);
+					};
+				}
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		// Unrelated to the boundary: accepted, and the boundary check walked once.
+		const restored = await writeOutline(
+			{
+				spaceId: w.space.id,
+				ops: [{ op: "restore", block: { id: deepest }, parent: { id: w.id("n") } }],
+				actor: { kind: "agent", id: w.session },
+				narratorId: w.session,
+				responsibleUserId: w.alice,
+			},
+			{ agentBehaviorGrant: () => false, store: counting },
+		);
+		expect(restored.commit).not.toBeNull();
+		expect(counts.listAncestryOf).toBe(1);
+		// Under the boundary, deleted with its parent: still refused, still one walk.
+		await humanWrite(w.space, w.alice, [{ op: "delete", block: { id: w.id("r1") } }]);
+		counts.listAncestryOf = 0;
+		await refused(
+			writeOutline(
+				{
+					spaceId: w.space.id,
+					ops: [{ op: "restore", block: { id: w.id("r3") }, parent: { id: w.id("n") } }],
+					actor: { kind: "agent", id: w.session },
+					narratorId: w.session,
+					responsibleUserId: w.alice,
+				},
+				{ agentBehaviorGrant: () => false, store: counting },
+			),
+		);
+		expect(counts.listAncestryOf).toBe(1);
+	});
+
 	test("what is not under it is written freely, and asks for no grant", async () => {
 		const w = await sessionWorld();
 		let asked = 0;

@@ -152,6 +152,8 @@ export interface OutlineParentRow {
 	parentId: string | null;
 	/** It is a locked task. */
 	locked: boolean;
+	/** It is deleted (only with `includeDeleted`): `parentId` is where it was deleted from. */
+	deleted?: boolean;
 }
 
 /** Why a read by placement or by change mark cannot be answered; see the header. */
@@ -311,11 +313,16 @@ export interface OutlineHistoryPort {
 	 * the limit. At most `limit` rows, `truncated` when the walk found more. One recursive
 	 * statement per 500 ids, by primary key: what walking many blocks up at once reads
 	 * (`subtree-marks.ts`).
+	 *
+	 * `includeDeleted`: deleted blocks of the space start walks and are returned too (`deleted`),
+	 * the walk going on through the parent column a deleted block keeps (where it was deleted
+	 * from): where a block deleted with its parent last lived, in the same one statement.
 	 */
 	listAncestryOf(
 		spaceId: string,
 		blockIds: readonly string[],
 		limit: number,
+		options?: { includeDeleted?: boolean },
 	): Promise<{ rows: OutlineParentRow[]; truncated: boolean }>;
 	/**
 	 * The live locked tasks of a space, whatever their status, at most `limit`, unordered. Read
