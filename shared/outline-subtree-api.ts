@@ -263,6 +263,50 @@ export interface OutlineFoldStateResponse {
 	expanded: string[];
 	/** Closed by the reader: open by default. */
 	collapsed: string[];
+	/**
+	 * A reset under a block could not place every stored row (its bounded walk up stopped):
+	 * some under the block may still be there.
+	 */
+	incomplete?: true;
+}
+
+/**
+ * `DELETE /spaces/:spaceId/fold-state?under=<block>`: the reader's folding back to the
+ * default, of the whole space (no `under`, or the space's id) or of a block and everything
+ * under it. One request, whatever the number of rows. Answers with the state after it.
+ */
+export type OutlineFoldStateResetQuery = { under?: string };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Open tasks under a block (pageless outline, F1: the "in progress" count's list)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const OUTLINE_OPEN_TASKS_LIMITS = {
+	/** Tasks one page lists at most (default 20). */
+	maxLimit: 50,
+} as const;
+
+/** One open task under the block asked about. */
+export interface OutlineOpenTaskItem {
+	id: string;
+	/** The first line of its text, short. */
+	title: string;
+	status: "todo" | "doing";
+	assignee: string | null;
+}
+
+/**
+ * `GET /spaces/:spaceId/open-tasks?under=<key>&cursor=&limit=`: the open tasks (to do, in
+ * progress) strictly under a block (`under` the space's id: the whole space), in progress
+ * first, then by id; cursor-paged. Built from the same candidates as the marks read (the
+ * space's open-task index, at most `markCandidates`), so it lists what the count counted;
+ * `atLeast`: the space has more open tasks than one read looks at, the list may miss some.
+ */
+export interface OutlineOpenTasksResponse {
+	under: string;
+	items: OutlineOpenTaskItem[];
+	nextCursor: string | null;
+	atLeast: boolean;
 }
 
 /**

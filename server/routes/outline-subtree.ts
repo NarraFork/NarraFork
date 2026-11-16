@@ -15,7 +15,10 @@
  *     timeline of the space, or of a block and what was under it.
  *   - `GET/PUT /spaces/:spaceId/fold-state`: the caller's own folding of the space, by block
  *     (`services/outline/fold-state.ts`); a write carries changes. Read access is enough, and
- *     nobody reads or writes another person's.
+ *     nobody reads or writes another person's. `DELETE` (optionally `?under=<block>`) puts it
+ *     back to the default in one request.
+ *   - `GET /spaces/:spaceId/open-tasks?under=`: the open tasks under a block (the list behind
+ *     a marks read's "in progress" count), cursor-paged.
  *
  * ACCESS: exactly the page reads'. Every route names its space, and a space the person may not
  * read answers 404, the same as one that does not exist. A block named in the PATH must be a
@@ -36,6 +39,7 @@ import {
 	type OutlineFoldStateResponse,
 	type OutlineLevelsResponse,
 	type OutlineMarksResponse,
+	type OutlineOpenTasksResponse,
 	type OutlineSubtreeResponse,
 	type OutlineSubtreeTimelineResponse,
 	type OutlineTreeBlock,
@@ -47,8 +51,10 @@ import { outlineIdSchema } from "../lib/validators/outline/index";
 import {
 	outlineChangedChildrenQuerySchema,
 	outlineFoldStatePutSchema,
+	outlineFoldStateResetQuerySchema,
 	outlineLevelsQuerySchema,
 	outlineMarksQuerySchema,
+	outlineOpenTasksQuerySchema,
 	outlineSubtreeQuerySchema,
 	outlineSubtreeTimelineQuerySchema,
 } from "../lib/validators/outline/subtree";
@@ -58,7 +64,12 @@ import {
 	narratorVisibility,
 	type OutlinePrincipal,
 } from "../services/outline/access";
-import { loadFoldSets, readFoldState, writeFoldState } from "../services/outline/fold-state";
+import {
+	loadFoldSets,
+	readFoldState,
+	resetFoldState,
+	writeFoldState,
+} from "../services/outline/fold-state";
 import { commitSeqAt } from "../services/outline/read";
 import { outlineStore } from "../services/outline/store";
 import type { OutlineBlockRow, OutlineSpaceRow } from "../services/outline/store/port";
@@ -66,7 +77,7 @@ import {
 	readOutlineChangedChildren,
 	readOutlineSubtreeTimeline,
 } from "../services/outline/subtree-history";
-import { readOutlineMarks } from "../services/outline/subtree-marks";
+import { readOutlineMarks, readOutlineOpenTasks } from "../services/outline/subtree-marks";
 import { readOutlineLevels, readOutlineSubtree } from "../services/outline/subtree-read";
 
 export const outlineSubtreeRoutes = new Hono();
@@ -274,3 +285,28 @@ outlineSubtreeRoutes.put(
 		return c.json(body);
 	},
 );
+
+/** The caller's own folding back to the default: the whole space, or a block and what is under it. */
+outlineSubtreeRoutes.delete("/spaces/:spaceId/fold-state", async (c) => {
+	const space = await readableSpace(c);
+	const query = parse(outlineFoldStateResetQuerySchema, c.req.query());
+	const body: OutlineFoldStateResponse = await resetFoldState(
+		principalOf(c).userId,
+		space,
+		query.under ?? null,
+	);
+	return c.json(body);
+});
+
+/** The open tasks under a block (or the whole space), in progress first. */
+outlineSubtreeRoutes.get("/spaces/:spaceId/open-tasks", async (c) => {
+	const space = await readableSpace(c);
+	const query = parse(outlineOpenTasksQuerySchema, c.req.query());
+	const body: OutlineOpenTasksResponse = await readOutlineOpenTasks({
+		space,
+		under: query.under,
+		cursor: query.cursor,
+		limit: query.limit,
+	});
+	return c.json(body);
+});

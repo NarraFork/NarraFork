@@ -2198,6 +2198,45 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "fold state cleared: all of a person's rows of a space, or the named ones, nobody else's",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const otherSpace = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "clear one" },
+				{ op: "insert", parent: null, content: "clear two" },
+				{ op: "insert", parent: null, content: "clear three" },
+			]);
+			const [one, two, three] = r.results.map((x) => x.blockId) as [string, string, string];
+			const elsewhere = (
+				await write(ctx, otherSpace, [{ op: "insert", parent: null, content: "clear elsewhere" }])
+			).results[0]?.blockId as string;
+			const me = await ctx.seedUser();
+			const other = await ctx.seedUser();
+			const at = "2026-11-15T00:00:01.000Z";
+			const all = [one, two, three].map((blockId) => ({ blockId, open: true }));
+			await ctx.store.putFoldState(me, space.id, all, at, 100);
+			await ctx.store.putFoldState(other, space.id, all, at, 100);
+			await ctx.store.putFoldState(
+				me,
+				otherSpace.id,
+				[{ blockId: elsewhere, open: false }],
+				at,
+				100,
+			);
+			const ids = async (user: string, spaceId = space.id) =>
+				(await ctx.store.listFoldState(user, spaceId, 100)).map((row) => row.blockId).sort();
+			await ctx.store.clearFoldState(me, space.id, [two, two, elsewhere]);
+			expect(await ids(me)).toEqual([one, three].sort());
+			await ctx.store.clearFoldState(me, space.id, []);
+			expect(await ids(me)).toEqual([one, three].sort());
+			await ctx.store.clearFoldState(me, space.id, null);
+			expect(await ids(me)).toEqual([]);
+			expect(await ids(other)).toEqual([one, two, three].sort());
+			expect(await ids(me, otherSpace.id)).toEqual([elsewhere]);
+		},
+	},
+	{
 		name: "tasks seen finished: per person and task, the higher version kept, old rows pruned",
 		async run(ctx) {
 			const space = await personalSpace(ctx);

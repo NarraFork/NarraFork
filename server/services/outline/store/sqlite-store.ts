@@ -1136,6 +1136,25 @@ export const sqliteOutlineStore: OutlineStore = {
 		);
 	},
 
+	async clearFoldState(userId, spaceId, blockIds) {
+		const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
+		await withDbRetry(
+			async () =>
+				db.transaction((tx) => {
+					if (blockIds === null) {
+						tx.delete(outlineFoldState).where(own).run();
+						return;
+					}
+					for (const chunk of chunked([...new Set(blockIds)])) {
+						tx.delete(outlineFoldState)
+							.where(and(own, inArray(outlineFoldState.blockId, chunk)))
+							.run();
+					}
+				}),
+			{ label: "outline.clearFoldState", maxRetries: 3 },
+		);
+	},
+
 	async getTaskSeen(userId, taskBlockIds) {
 		const out: OutlineTaskSeenRow[] = [];
 		for (const chunk of chunked([...new Set(taskBlockIds)])) {

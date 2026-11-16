@@ -1,4 +1,8 @@
-import { OUTLINE_FOLD_STATE_LIMITS, OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
+import {
+	OUTLINE_FOLD_STATE_LIMITS,
+	OUTLINE_OPEN_TASKS_LIMITS,
+	OUTLINE_SUBTREE_LIMITS,
+} from "@shared/outline-subtree-api";
 import { z } from "zod";
 import { outlineIdSchema } from "./index";
 
@@ -114,4 +118,22 @@ export const outlineFoldStatePutSchema = z.object({
 		.array(z.object({ blockId: outlineIdSchema, open: z.boolean().nullable() }))
 		.min(1)
 		.max(OUTLINE_FOLD_STATE_LIMITS.maxChanges),
+});
+
+/** `DELETE /spaces/:spaceId/fold-state` */
+export const outlineFoldStateResetQuerySchema = z.object({
+	/** A block: it and everything under it; absent (or the space's id): the whole space. */
+	under: outlineIdSchema.optional(),
+});
+
+/** `GET /spaces/:spaceId/open-tasks` */
+export const outlineOpenTasksQuerySchema = z.object({
+	/** A block of the space, or the space's id for the whole space. */
+	under: outlineIdSchema,
+	/** The last item's `rank:id` of the page before. */
+	cursor: z
+		.string()
+		.regex(/^[01]:[A-Za-z0-9_-]{1,64}$/)
+		.optional(),
+	limit: limitSchema(OUTLINE_OPEN_TASKS_LIMITS.maxLimit).optional(),
 });

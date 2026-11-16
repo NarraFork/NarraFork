@@ -1095,6 +1095,16 @@ export interface OutlineStore
 		updatedAt: string,
 		keep: number,
 	): Promise<void>;
+	/**
+	 * Back to the default folding: delete the person's rows of a space, all of them (`blockIds`
+	 * null) or those of the blocks named (chunked, one transaction). Other people's rows and
+	 * other spaces are never touched.
+	 */
+	clearFoldState(
+		userId: string,
+		spaceId: string,
+		blockIds: readonly string[] | null,
+	): Promise<void>;
 
 	// ── tasks a person saw finished (`outline_task_seen`, outline P2 PR 9b, the board's 「新完成」) ──
 

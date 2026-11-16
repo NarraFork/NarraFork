@@ -243,7 +243,7 @@ async function putTaskSeenSection(
 		.where(and(eq(outlineTaskSeen.userId, userId), lt(outlineTaskSeen.seenAt, pruneBefore)));
 }
 
-/** Write a person's view state of a page and drop their oldest pages beyond the cap. */
+/** Apply a person's fold changes of a space and drop their oldest rows beyond the cap. */
 async function putFoldStateSection(
 	tx: PgTransaction,
 	userId: string,
@@ -297,6 +297,7 @@ async function putFoldStateSection(
 	}
 }
 
+/** Write a person's view state of a page and drop their oldest pages beyond the cap. */
 async function putViewStateSection(
 	tx: PgTransaction,
 	row: OutlineViewStateRow,
@@ -1323,6 +1324,25 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 						putFoldStateSection(tx, userId, spaceId, changes, updatedAt, keep),
 					),
 				{ label: "outline.putFoldState" },
+			);
+		},
+
+		async clearFoldState(userId, spaceId, blockIds) {
+			const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
+			await withPgRetry(
+				() =>
+					db.transaction(async (tx) => {
+						if (blockIds === null) {
+							await tx.delete(outlineFoldState).where(own);
+							return;
+						}
+						for (const chunk of chunked([...new Set(blockIds)])) {
+							await tx
+								.delete(outlineFoldState)
+								.where(and(own, inArray(outlineFoldState.blockId, chunk)));
+						}
+					}),
+				{ label: "outline.clearFoldState" },
 			);
 		},
 

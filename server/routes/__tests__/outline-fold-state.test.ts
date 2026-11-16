@@ -17,6 +17,10 @@
  *  - a folded read of a subtree follows the stored folding of its reader and nobody else's; a
  *    folded read of a whole space with `top=closed` goes below a top-level block only when its
  *    reader opened it;
+ *  - a reset (`DELETE`, optionally `?under=<block>`) is one request: the whole space, or the
+ *    block and what is under it, nothing of anyone else's or of another space;
+ *  - `GET open-tasks?under=` lists the open tasks under a block (in progress first), what the
+ *    marks' count counted, cursor-paged, with read access, 404 like the others;
  *  - with `outline.enabled` off the routes are a plain 404.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`.
@@ -25,6 +29,8 @@ import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
 	OUTLINE_FOLD_STATE_LIMITS,
 	type OutlineFoldStateResponse,
+	type OutlineMarksResponse,
+	type OutlineOpenTasksResponse,
 	type OutlineSubtreeResponse,
 } from "@shared/outline-subtree-api";
 import { and, eq } from "drizzle-orm";
@@ -65,7 +71,7 @@ function appAs(userId: string) {
 
 async function call<T = OutlineFoldStateResponse>(
 	userId: string,
-	method: "GET" | "PUT",
+	method: "GET" | "PUT" | "DELETE",
 	path: string,
 	body?: unknown,
 ): Promise<{ status: number; body: T }> {
@@ -424,5 +430,166 @@ describe("folded reads follow the reader's own folding", () => {
 		const plain = (await subtree(bob, "/subtree?view=all&fold=default")).body;
 		expect(plain.closed).not.toContain(ids.top1);
 		expect(has(plain, ids.factChild)).toBe(true);
+	});
+});
+
+describe("back to the default in one request", () => {
+	test("the whole space: every row of the reader's, nobody else's, no other space's", async () => {
+		await call(alice, "PUT", foldPath(), {
+			changes: [
+				{ blockId: ids.top1, open: true },
+				{ blockId: ids.fact, open: false },
+				{ blockId: ids.done, open: true },
+			],
+		});
+		await call(bob, "PUT", foldPath(), { changes: [{ blockId: ids.fact, open: false }] });
+		await call(mallory, "PUT", `/spaces/${other.id}/fold-state`, {
+			changes: [{ blockId: elsewhere, open: true }],
+		});
+		const reset = await call(alice, "DELETE", foldPath());
+		expect(reset.status).toBe(200);
+		expect(reset.body).toEqual({ spaceId: space.id, expanded: [], collapsed: [] });
+		expect((await call(bob, "GET", foldPath())).body.collapsed).toEqual([ids.fact]);
+		expect((await call(mallory, "GET", `/spaces/${other.id}/fold-state`)).body.expanded).toEqual([
+			elsewhere,
+		]);
+		// `under` the space's own id is the whole space too.
+		await call(alice, "PUT", foldPath(), { changes: [{ blockId: ids.top1, open: true }] });
+		expect((await call(alice, "DELETE", `${foldPath()}?under=${space.id}`)).body.expanded).toEqual(
+			[],
+		);
+	});
+
+	test("under a block: the block and what is under it, the rest stays", async () => {
+		await call(alice, "PUT", foldPath(), {
+			changes: [
+				{ blockId: ids.top1, open: true },
+				{ blockId: ids.fact, open: false },
+				{ blockId: ids.done, open: true },
+				{ blockId: ids.top2, open: true },
+			],
+		});
+		const under = await call(alice, "DELETE", `${foldPath()}?under=${ids.fact}`);
+		expect(under.status).toBe(200);
+		expect(sorted(under.body.expanded)).toEqual(sorted([ids.top1, ids.done, ids.top2]));
+		expect(under.body.collapsed).toEqual([]);
+		const top = await call(alice, "DELETE", `${foldPath()}?under=${ids.top1}`);
+		expect(top.body).toEqual({ spaceId: space.id, expanded: [ids.top2], collapsed: [] });
+		// A block of another space, or made up: nothing matches, nothing else goes.
+		expect((await call(alice, "DELETE", `${foldPath()}?under=${elsewhere}`)).body.expanded).toEqual(
+			[ids.top2],
+		);
+		expect((await call(alice, "DELETE", `${foldPath()}?under=${"x".repeat(400)}`)).status).toBe(400);
+	});
+
+	test("access as the other fold routes: 404 without read access or with the outline off", async () => {
+		await call(alice, "PUT", foldPath(), { changes: [{ blockId: ids.top1, open: true }] });
+		expect((await call(mallory, "DELETE", foldPath())).status).toBe(404);
+		expect((await call(mallory, "DELETE", `/spaces/${generateId()}/fold-state`)).status).toBe(404);
+		expect((await call(bob, "DELETE", foldPath())).status).toBe(200);
+		settings.outline.enabled = false;
+		expect((await call(alice, "DELETE", foldPath())).status).toBe(404);
+		settings.outline.enabled = true;
+		expect((await call(alice, "GET", foldPath())).body.expanded).toEqual([ids.top1]);
+	});
+});
+
+describe("the open tasks under a block", () => {
+	let taskSpace: OutlineSpaceRow;
+	let parent: string;
+	let doing: string[];
+	let todo: string[];
+	let outside: string;
+	beforeAll(async () => {
+		taskSpace = await project(alice, [bob]);
+		parent = (
+			await write(taskSpace, [{ op: "insert", parent: null, content: "Work" }], alice)
+		)[0] as string;
+		const made = await write(
+			taskSpace,
+			[
+				...Array.from({ length: 3 }, (_, i) => ({
+					op: "insert" as const,
+					parent: { id: parent },
+					content: `Doing ${i}\nmore text`,
+					task: { status: "doing" as const, assignee: "agent:helper" },
+				})),
+				...Array.from({ length: 4 }, (_, i) => ({
+					op: "insert" as const,
+					parent: { id: parent },
+					content: `Todo ${i}`,
+					task: { status: "todo" as const },
+				})),
+				{
+					op: "insert" as const,
+					parent: { id: parent },
+					content: "Finished",
+					task: { status: "done" as const },
+				},
+				{
+					op: "insert" as const,
+					parent: null,
+					content: "Elsewhere",
+					task: { status: "todo" as const },
+				},
+			],
+			alice,
+		);
+		doing = made.slice(0, 3) as string[];
+		todo = made.slice(3, 7) as string[];
+		outside = made[8] as string;
+	});
+	const path = (query: string) => `/spaces/${taskSpace.id}/open-tasks?${query}`;
+
+	test("in progress first, paged by cursor, the count the marks give", async () => {
+		const seen: string[] = [];
+		let cursor: string | null = null;
+		let pages = 0;
+		do {
+			const page: { status: number; body: OutlineOpenTasksResponse } =
+				await call<OutlineOpenTasksResponse>(
+					bob,
+					"GET",
+					path(`under=${parent}&limit=3${cursor ? `&cursor=${cursor}` : ""}`),
+				);
+			expect(page.status).toBe(200);
+			expect(page.body.items.length).toBeLessThanOrEqual(3);
+			seen.push(...page.body.items.map((item) => item.id));
+			if (pages === 0) {
+				expect(page.body.items.every((item) => item.status === "doing")).toBe(true);
+				expect(page.body.items[0]?.assignee).toBe("agent:helper");
+				expect(page.body.items[0]?.title).toMatch(/^Doing \d$/);
+			}
+			cursor = page.body.nextCursor;
+			pages++;
+		} while (cursor && pages < 10);
+		expect(pages).toBe(3);
+		expect(sorted(seen.slice(0, 3))).toEqual(sorted(doing));
+		expect(sorted(seen.slice(3))).toEqual(sorted(todo));
+		const marks = await call<OutlineMarksResponse>(
+			bob,
+			"GET",
+			`/spaces/${taskSpace.id}/marks?keys=${parent}`,
+		);
+		const counted = marks.body.marks[0]?.tasks;
+		expect((counted?.doing ?? 0) + (counted?.todo ?? 0)).toBe(seen.length);
+		// The whole space: the one outside too.
+		const whole = await call<OutlineOpenTasksResponse>(
+			bob,
+			"GET",
+			path(`under=${taskSpace.id}&limit=50`),
+		);
+		expect(whole.body.items.map((item) => item.id)).toContain(outside);
+		expect(whole.body.items.length).toBe(8);
+	});
+
+	test("a key that is not a block of the space lists nothing; access as reads; bounded", async () => {
+		const none = await call<OutlineOpenTasksResponse>(alice, "GET", path(`under=${elsewhere}`));
+		expect(none.status).toBe(200);
+		expect(none.body.items).toEqual([]);
+		expect((await call(mallory, "GET", path(`under=${parent}`))).status).toBe(404);
+		expect((await call(alice, "GET", path(`under=${parent}&limit=51`))).status).toBe(400);
+		expect((await call(alice, "GET", path(`under=${parent}&cursor=nope`))).status).toBe(400);
+		expect((await call(alice, "GET", path("limit=5"))).status).toBe(400);
 	});
 });

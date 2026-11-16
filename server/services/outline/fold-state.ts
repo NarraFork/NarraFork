@@ -17,7 +17,8 @@
  * written longest ago, which go back to the default.
  *
  * A write carries CHANGES, not the whole state, so two tabs of one reader do not undo each
- * other; the last write of a block wins.
+ * other; the last write of a block wins. "Back to the default" of a whole space or of
+ * everything under a block is ONE request ({@link resetFoldState}), not a null per row.
  *
  * NOT EXPORTED by data portability, like `outline_view_state`: per-reader UI state that is
  * rebuilt by using the outline; an imported instance starts at the default folding.
@@ -30,6 +31,7 @@ import {
 } from "@shared/outline-subtree-api";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
+import { readOutlineAncestry } from "./subtree-marks";
 
 /** The reader's folding of a space as the two sets a folded read takes. */
 export async function loadFoldSets(
@@ -92,4 +94,42 @@ export async function writeFoldState(
 		);
 	}
 	return readFoldState(userId, space, store);
+}
+
+/** Blocks one reset walks up through at most, to tell which rows are under its block. */
+const RESET_WALK_ROWS = 2 * OUTLINE_FOLD_STATE_LIMITS.maxPerSpace * 4;
+
+/**
+ * Put the person's folding of a space back to the default: all of it (`under` null), or that
+ * of a block and everything under it. The person's own rows are at most
+ * {@link OUTLINE_FOLD_STATE_LIMITS.maxPerSpace}; which of them are under the block is told by
+ * walking them up together (`readOutlineAncestry`, bounded). Rows of blocks that are no longer
+ * in the live tree are left alone (they apply to nothing). Answers with the state after it;
+ * `incomplete` when the bounded walk could not place every row (some under the block may
+ * remain).
+ */
+export async function resetFoldState(
+	userId: string,
+	space: OutlineSpaceRow,
+	under: string | null,
+	options: { store?: OutlineStore } = {},
+): Promise<OutlineFoldStateResponse & { incomplete?: true }> {
+	const store = options.store ?? outlineStore;
+	if (under === null || under === space.id) {
+		await store.clearFoldState(userId, space.id, null);
+		return readFoldState(userId, space, store);
+	}
+	const rows = await store.listFoldState(userId, space.id, OUTLINE_FOLD_STATE_LIMITS.maxPerSpace);
+	if (rows.length === 0) return readFoldState(userId, space, store);
+	const ancestry = await readOutlineAncestry(
+		space.id,
+		rows.map((row) => row.blockId),
+		{ maxRows: RESET_WALK_ROWS, store },
+	);
+	const gone = rows
+		.map((row) => row.blockId)
+		.filter((id) => id === under || (ancestry.above(id)?.includes(under) ?? false));
+	if (gone.length > 0) await store.clearFoldState(userId, space.id, gone);
+	const after = await readFoldState(userId, space, store);
+	return ancestry.cutShort ? { ...after, incomplete: true } : after;
 }
