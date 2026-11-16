@@ -526,6 +526,13 @@
 			"when": 1794645737122,
 			"tag": "0074_appearance_preferences",
 			"breakpoints": true
+		},
+		{
+			"idx": 75,
+			"version": "7",
+			"when": 1794677338258,
+			"tag": "0075_plugin_overlay_preferences",
+			"breakpoints": true
 		}
   ]
 }
