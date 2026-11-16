@@ -2,6 +2,7 @@ import { useCurrentUser } from "@frontend/hooks/useAuth";
 import {
 	useSwitchWorkspaceContext,
 	useWorkspaceContext,
+	workspaceContextKey,
 } from "@frontend/hooks/useWorkspaceContext";
 import { ApiError, api } from "@frontend/lib/api";
 import { formatLocaleDateTime } from "@frontend/lib/intl-format";
@@ -21,13 +22,15 @@ import {
 	Textarea,
 	TextInput,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
-import { IconGitFork, IconSwitchHorizontal } from "@tabler/icons-react";
+import { IconGitFork, IconSwitchHorizontal, IconTrash } from "@tabler/icons-react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { nanoid } from "nanoid";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
+import { WorktreeRemovalDialog } from "./WorktreeRemovalDialog";
 import { type WorktreeDraft, WorktreeFlow, type WorktreeFlowState } from "./worktree-flow";
 import { type WorktreeSort, worktreeDirectoryLabel, worktreeLabel } from "./worktree-list-view";
 import {
@@ -257,6 +260,10 @@ function ScopedWorktreeControls({
 		if (attempt.flow.state.unknown) void attempt.flow.reconcile();
 	};
 	const [menuOpened, setMenuOpened] = useState(false);
+	// Removal is a second modal on top of the list: the row stays where the user found it.
+	const [removalPath, setRemovalPath] = useState<string | null>(null);
+	// The list modal stays open behind the confirmation, so the outcome belongs there.
+	const [removalNotice, setRemovalNotice] = useState<string>();
 	const [search, setSearch] = useState("");
 	const [sort, setSort] = useState<WorktreeSort>("lastCommitAt");
 	const [descending, setDescending] = useState(true);
@@ -400,6 +407,8 @@ function ScopedWorktreeControls({
 		firstPage?.capabilities.create === true &&
 		!pendingLimit &&
 		!storageError;
+	// Deleting needs the server-advertised capability, not just a clickable list.
+	const canRemove = canList && firstPage?.capabilities.delete === true;
 	const createDisabledReason = storageError
 		? t(storageError)
 		: pendingLimit
@@ -443,6 +452,8 @@ function ScopedWorktreeControls({
 						onClick={() => {
 							setSearch("");
 							setMenuOpened(true);
+							// A new visit starts clean; the previous outcome belonged to another row.
+							setRemovalNotice(undefined);
 							// Reopening refreshes from page one, never replaying all saved cursors.
 							if (canList && debouncedSearch === "" && !worktrees.isFetching && !cursorExpired)
 								void queryClient.resetQueries({ queryKey: listKey, exact: true });
@@ -572,61 +583,84 @@ function ScopedWorktreeControls({
 						<ScrollArea.Autosize mah="45vh" type="auto" viewportRef={setViewport}>
 							<Stack gap={4}>
 								{visibleEntries.map((entry) => (
-									<Button
-										key={entry.path}
-										data-worktree-path={entry.path}
-										variant={entry.path === context?.cwd ? "light" : "subtle"}
-										fullWidth
-										justify="flex-start"
-										h="auto"
-										py="xs"
-										styles={{ label: { display: "block", width: "100%", textAlign: "left" } }}
-										title={`${context?.deviceId}: ${entry.path}`}
-										disabled={
-											!canSwitch ||
-											state.busy ||
-											switchMutation.isPending ||
-											entry.path === context?.cwd ||
-											entry.locked ||
-											entry.prunable
-										}
-										onClick={() =>
-											void switchTo(entry.path)
-												.then(() => setMenuOpened(false))
-												.catch(() => {})
-										}
-									>
-										<Group gap="xs" wrap="nowrap">
-											<Text size="sm" truncate>
-												{entry.branch
-													? worktreeLabel(entry)
-													: `${t("worktree.detached")} · ${worktreeLabel(entry)}`}
+									<Group key={entry.path} gap={4} wrap="nowrap" align="stretch">
+										<UnstyledButton
+											data-worktree-path={entry.path}
+											py="xs"
+											px={6}
+											style={{ flex: 1, minWidth: 0, borderRadius: 4 }}
+											bg={
+												entry.path === context?.cwd
+													? "var(--mantine-color-default-hover)"
+													: undefined
+											}
+											title={`${context?.deviceId}: ${entry.path}`}
+											disabled={
+												!canSwitch ||
+												state.busy ||
+												switchMutation.isPending ||
+												entry.path === context?.cwd ||
+												entry.locked ||
+												entry.prunable
+											}
+											onClick={() =>
+												void switchTo(entry.path)
+													.then(() => setMenuOpened(false))
+													.catch(() => {})
+											}
+										>
+											<Group gap="xs" wrap="nowrap">
+												<Text size="sm" truncate>
+													{entry.branch
+														? worktreeLabel(entry)
+														: `${t("worktree.detached")} · ${worktreeLabel(entry)}`}
+												</Text>
+												{entry.path === context?.cwd && (
+													<Badge size="xs">{t("worktree.current")}</Badge>
+												)}
+												{entry.locked && (
+													<Badge size="xs" color="yellow">
+														{t("worktree.locked")}
+													</Badge>
+												)}
+												{entry.prunable && (
+													<Badge size="xs" color="red">
+														{t("worktree.unavailable")}
+													</Badge>
+												)}
+											</Group>
+											<Text size="xs" c="dimmed" truncate>
+												{context?.deviceId !== "local" && `${context?.deviceId}: `}
+												{worktreeDirectoryLabel(entry.path)}
 											</Text>
-											{entry.path === context?.cwd && (
-												<Badge size="xs">{t("worktree.current")}</Badge>
+											{sort !== "name" && (
+												<Text size="xs" c="dimmed">
+													{t(sort === "createdAt" ? "worktree.createdTime" : "worktree.lastCommit")}
+													: {formatTime(entry[sort])}
+												</Text>
 											)}
-											{entry.locked && (
-												<Badge size="xs" color="yellow">
-													{t("worktree.locked")}
-												</Badge>
-											)}
-											{entry.prunable && (
-												<Badge size="xs" color="red">
-													{t("worktree.unavailable")}
-												</Badge>
-											)}
-										</Group>
-										<Text size="xs" c="dimmed" truncate>
-											{context?.deviceId !== "local" && `${context?.deviceId}: `}
-											{worktreeDirectoryLabel(entry.path)}
-										</Text>
-										{sort !== "name" && (
-											<Text size="xs" c="dimmed">
-												{t(sort === "createdAt" ? "worktree.createdTime" : "worktree.lastCommit")}:{" "}
-												{formatTime(entry[sort])}
-											</Text>
+										</UnstyledButton>
+										{canRemove && (
+											<Tooltip
+												label={entry.locked ? t("worktree.removeLocked") : t("worktree.remove")}
+												withArrow
+											>
+												<ActionIcon
+													size="lg"
+													variant="subtle"
+													color="red"
+													aria-label={t("worktree.remove")}
+													data-worktree-remove={entry.path}
+													// A prunable checkout is exactly what removal is for: its
+													// directory is gone and only the registration is left.
+													disabled={entry.locked || state.busy}
+													onClick={() => setRemovalPath(entry.path)}
+												>
+													<IconTrash size={15} />
+												</ActionIcon>
+											</Tooltip>
 										)}
-									</Button>
+									</Group>
 								))}
 								<div ref={sentinel} data-worktree-sentinel style={{ minHeight: 1 }} />
 								{worktrees.isFetchingNextPage && <Loader size="xs" />}
@@ -656,7 +690,14 @@ function ScopedWorktreeControls({
 							</Stack>
 						</ScrollArea.Autosize>
 						{firstPage?.truncated && <Alert color="yellow">{t("worktree.listTruncated")}</Alert>}
+						{/* Removal needs a healthy checkout of the requesting session. A session whose
+						    own directory was deleted sees its own prunable row here and nothing it
+						    can do about it, so name the way out instead of showing a dead list. */}
+						{canList && !canRemove && visibleEntries.some((entry) => entry.prunable) && (
+							<Alert color="yellow">{t("worktree.removeNeedsHealthyWorkspace")}</Alert>
+						)}
 						{switchError && <Alert color="red">{switchError}</Alert>}
+						{removalNotice && <Alert color="green">{removalNotice}</Alert>}
 					</Stack>
 				</Modal>
 			</Group>
@@ -798,6 +839,26 @@ function ScopedWorktreeControls({
 					</Stack>
 				</form>
 			</Modal>
+			<WorktreeRemovalDialog
+				opened={removalPath !== null}
+				narratorId={narratorId}
+				worktreePath={removalPath}
+				workspaceKey={context?.git?.workspaceKey ?? ""}
+				onClose={() => setRemovalPath(null)}
+				onRemoved={(result) => {
+					setRemovalPath(null);
+					void queryClient.invalidateQueries({ queryKey: ["narratorWorktrees"] });
+					// The requesting session may itself have been moved out of the checkout.
+					void queryClient.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
+					setRemovalNotice(
+						result.outcome === "removed"
+							? result.relocatedTo
+								? t("worktree.removeSuccessRelocated", { path: result.relocatedTo })
+								: t("worktree.removeSuccess")
+							: t("worktree.removeAlreadyAbsent"),
+					);
+				}}
+			/>
 		</>
 	);
 }

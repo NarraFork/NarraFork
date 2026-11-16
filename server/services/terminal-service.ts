@@ -2,6 +2,7 @@ import { readdir } from "node:fs/promises";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, terminals } from "../db/schema";
+import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
@@ -929,6 +930,49 @@ export const terminalService = {
 			}
 		}
 		await db.delete(terminals).where(and(eq(col, value), isNull(terminals.worktreeResourceId)));
+	},
+
+	/**
+	 * Terminals that die with a worktree: the resource-owned shells and any narrator
+	 * shell whose directory is inside the checkout.
+	 *
+	 * Both kinds must be gone before the owner row is, because `terminals.worktree_resource_id`
+	 * is `onDelete: restrict`. Nothing here touches a shell that merely shares a parent
+	 * directory — the path check is containment, and the scan is bounded.
+	 */
+	async cleanupForWorktree(input: {
+		worktreeResourceId?: string | null;
+		worktreePath?: string | null;
+	}): Promise<{ closedTerminals: number }> {
+		const matched: (typeof terminals.$inferSelect)[] = [];
+		if (input.worktreeResourceId) {
+			matched.push(
+				...(await db.query.terminals.findMany({
+					where: eq(terminals.worktreeResourceId, input.worktreeResourceId),
+				})),
+			);
+		}
+		const path = input.worktreePath ?? null;
+		if (path) {
+			const owned = await db.query.terminals.findMany({
+				where: isNull(terminals.worktreeResourceId),
+				limit: 500,
+			});
+			for (const terminal of owned) {
+				if (terminal.cwd && localPathSemantics.contains(path, terminal.cwd)) matched.push(terminal);
+			}
+		}
+		const ids = [...new Set(matched.map((terminal) => terminal.id))];
+		for (const terminal of matched) {
+			if (terminal.status !== "running") continue;
+			try {
+				await this.kill(terminal.id);
+			} catch {
+				// best effort: a dead runtime must not keep the row alive
+			}
+		}
+		for (const id of ids) await db.delete(terminals).where(eq(terminals.id, id));
+		return { closedTerminals: ids.length };
 	},
 
 	/**
