@@ -352,7 +352,7 @@ class SubtreeRestorer {
 	readonly commits: Array<{ id: string; seq: number }> = [];
 	readonly skipped = new Map<string, { sid: string; reason: OutlineRestoreSkipReason }>();
 	changed = 0;
-	movedAway = 0;
+	readonly movedAway = new Set<string>();
 	pending: { id: string; label: string } | undefined;
 
 	private walk: SubtreeDiffWalk;
@@ -487,6 +487,11 @@ class SubtreeRestorer {
 					await this.flush();
 					if (this.deferred > 0 && this.progressed && this.pass + 1 < this.limits.maxPasses) {
 						this.pass++;
+						// What the last pass could not do yet is tried again: forget that it was said.
+						for (const [id, skip] of this.skipped) {
+							if (skip.reason !== "parent-moved-away" && skip.reason !== "lock-kept")
+								this.skipped.delete(id);
+						}
 						this.deferred = 0;
 						this.progressed = false;
 						this.start = newDiffWalkState();
@@ -569,7 +574,7 @@ class SubtreeRestorer {
 		const guards = this.walk.addedAbove(frameIndex);
 		const mine = items.filter((item) => item.own);
 		const arrived = items.filter((item) => !item.own);
-		this.movedAway += mine.filter((item) => item.kind === "moved-away").length;
+		for (const item of mine) if (item.kind === "moved-away") this.movedAway.add(item.id);
 
 		// Leaves added since go first: they free the order keys they took.
 		for (const item of arrived) {
@@ -721,8 +726,15 @@ class SubtreeRestorer {
 			const before = item.before as OutlineVersionHead;
 			const now = this.cur(item.meta);
 			const block = { id: item.id };
+			// Only a placement depends on the parent: text and fields are put back whatever happens
+			// to it.
 			const push = (op: OutlineOp) =>
-				this.add({ op, blockId: item.id, dependsOn: isRoot || away ? null : parentId, guards: [] });
+				this.add({
+					op,
+					blockId: item.id,
+					dependsOn: op.op === "restore" || op.op === "move" ? parentId : null,
+					guards: [],
+				});
 			const parent = parentId === null ? null : { id: parentId };
 			if (now.deleted) {
 				if (isRoot) continue;
@@ -848,7 +860,10 @@ class SubtreeRestorer {
 					const meta = (
 						await this.store.getBlockMetas(this.space.id, { ids: [refused.blockId] })
 					)[0];
-					if (meta) this.skip(meta, "refused");
+					if (meta) {
+						const lock = error.code === "OUTLINE_LOCK_DENIED" || error.code === "OUTLINE_LOCK_HELD";
+						this.skip(meta, lock ? "lock-kept" : "refused");
+					}
 					entries = this.drop(entries, refused.blockId);
 					continue;
 				}
@@ -978,7 +993,7 @@ export async function restoreOutlineSubtree(
 			changed: restorer.changed,
 			skipped: skipped.slice(0, OUTLINE_RESTORE_LIMITS.maxSkipped),
 			skippedTruncated: skipped.length > OUTLINE_RESTORE_LIMITS.maxSkipped,
-			movedAway: restorer.movedAway,
+			movedAway: restorer.movedAway.size,
 			...(restorer.pending ? { pending: restorer.pending } : {}),
 		};
 	});
