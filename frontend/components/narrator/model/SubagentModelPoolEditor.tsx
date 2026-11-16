@@ -1,7 +1,16 @@
-import { Button, Group, MultiSelect, Stack, Text, Textarea } from "@mantine/core";
+import {
+	Button,
+	Group,
+	MultiSelect,
+	type OptionsFilter,
+	Stack,
+	Text,
+	Textarea,
+} from "@mantine/core";
 import { SUBAGENT_POOL_TYPES, type SubagentModelPools } from "@shared/subagent-model-policy";
 import { type Dispatch, type SetStateAction, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { defaultModelOptionsFilter } from "../../../lib/model-search";
 import {
 	SubagentReasoningEffortSection,
 	SubagentReasoningEffortSelect,
@@ -32,6 +41,7 @@ export function SubagentModelPoolEditor({
 	pools,
 	setPools,
 	availableModels,
+	modelOptionsFilter = defaultModelOptionsFilter,
 	loaded,
 	saving,
 	clearing,
@@ -41,6 +51,11 @@ export function SubagentModelPoolEditor({
 	pools: SubagentModelPools;
 	setPools: Dispatch<SetStateAction<SubagentModelPools>>;
 	availableModels?: { model: string }[];
+	/**
+	 * From `useAllModels()`. Options are bare `prefix:model` values, so this is
+	 * what makes a provider's display name searchable.
+	 */
+	modelOptionsFilter?: OptionsFilter<string>;
 	loaded: boolean;
 	saving: boolean;
 	clearing: boolean;
@@ -81,6 +96,7 @@ export function SubagentModelPoolEditor({
 						label={typeLabel(type)}
 						data={modelOptions}
 						searchable
+						filter={modelOptionsFilter}
 						clearable
 						disabled={disabled}
 						value={(pools[type] ?? []).map((entry) => entry.model)}

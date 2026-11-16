@@ -28,6 +28,7 @@ export type PrefixSnapshotOperation =
 	| "collect";
 export interface PrefixSnapshotRequest {
 	action: "task";
+	requestId: string;
 	backend: PrefixSnapshotBackend;
 	operation: PrefixSnapshotOperation;
 	value: unknown;
@@ -38,6 +39,7 @@ const port = parentPort;
 let sqlite: Database | undefined;
 let postgres: SQL | undefined;
 let collector: PrefixSnapshotCollector | undefined;
+let backendIdentity: PrefixSnapshotBackend | undefined;
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
 
 /**
@@ -64,6 +66,18 @@ const SLOW_WRITE_MS = 25;
 const WRITE_STATEMENT = /^\s*(INSERT|UPDATE|DELETE)\b(?:\s+INTO|\s+FROM)?\s+(\w+)/i;
 
 async function connect(request: PrefixSnapshotRequest): Promise<void> {
+	if (
+		backendIdentity &&
+		(backendIdentity.backend !== request.backend.backend ||
+			(backendIdentity.backend === "sqlite" &&
+				request.backend.backend === "sqlite" &&
+				backendIdentity.path !== request.backend.path) ||
+			(backendIdentity.backend === "postgres" &&
+				request.backend.backend === "postgres" &&
+				backendIdentity.url !== request.backend.url))
+	)
+		throw new Error("Prefix snapshot database identity changed");
+	backendIdentity ??= { ...request.backend };
 	if (request.backend.backend === "sqlite") {
 		if (sqlite) return;
 		if (!request.backend.path || request.backend.path === ":memory:")
@@ -85,12 +99,17 @@ async function query<T>(statement: string, parameters: Array<string | number>): 
 			// Autocommit: the statement's duration is how long the main connection was locked
 			// out (plus any time it waited for the lock itself, up to busy_timeout).
 			const write = WRITE_STATEMENT.exec(statement);
-			if (write)
-				logger.warn("Prefix snapshot write held the database write lock", {
-					statement: `${write[1].toUpperCase()} ${write[2]}`,
-					elapsedMs: Math.round(elapsedMs),
-					rows: rows.length,
-				});
+			if (write) {
+				try {
+					logger.warn("Prefix snapshot write held the database write lock", {
+						statement: `${write[1].toUpperCase()} ${write[2]}`,
+						elapsedMs: Math.round(elapsedMs),
+						rows: rows.length,
+					});
+				} catch {
+					// Logging a completed write must not turn it into a failed/replayed operation.
+				}
+			}
 		}
 		return rows;
 	}
@@ -298,19 +317,32 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 		: text;
 }
 
-// The client admits one task at a time, so PG awaits cannot introduce concurrent writes.
+// The actor admits one task at a time. Reject a broken client rather than interleave PG awaits
+// or run two collector slices against the same scratch tables.
+let busy = false;
 port?.on("message", async (request: PrefixSnapshotRequest | { action: "ping" }) => {
-	if (request.action === "ping") {
+	if (request?.action === "ping") {
 		port.postMessage({ ready: true });
 		return;
 	}
+	if (!request || request.action !== "task" || typeof request.requestId !== "string") return;
+	if (busy) {
+		port.postMessage({ requestId: request.requestId, error: "Prefix snapshot actor is busy" });
+		return;
+	}
+	busy = true;
 	try {
-		port.postMessage({ value: await execute(request) });
+		if (!Number.isFinite(request.deadline) || Date.now() >= request.deadline)
+			throw new Error("Prefix snapshot operation timed out");
+		port.postMessage({ requestId: request.requestId, value: await execute(request) });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "";
 		// SQL/driver failures can contain credentials or snapshot text; do not forward them.
 		port.postMessage({
+			requestId: request.requestId,
 			error: message.startsWith("Prefix snapshot") ? message : "Prefix snapshot worker failed",
 		});
+	} finally {
+		busy = false;
 	}
 });

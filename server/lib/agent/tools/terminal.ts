@@ -5,8 +5,8 @@ import { db } from "../../../db";
 import { terminals } from "../../../db/schema";
 import { terminalService } from "../../../services/terminal-service";
 import {
+	createWatchFrameMatcher,
 	DEFAULT_WATCH_TIMEOUT_MS,
-	echoEnd,
 	MAX_WATCH_PATTERN_CHARS,
 	MAX_WATCH_TIMEOUT_MS,
 	MIN_WATCH_TIMEOUT_MS,
@@ -24,6 +24,7 @@ interface ReadCursorState {
 	length?: number;
 	buffer?: BufferManager;
 	sequence?: number;
+	layoutRevision?: number;
 	observation?: BufferReadCursor;
 }
 
@@ -51,17 +52,22 @@ function beginReadObservation(narratorId: string, terminalId: string) {
 		if (oldest !== undefined) discardReadCursor(oldest);
 	}
 	let candidate:
-		| { buffer: BufferManager; cursor: BufferReadCursor | undefined; sequence: number }
+		| {
+				buffer: BufferManager;
+				cursor: BufferReadCursor | undefined;
+				sequence: number;
+				layoutRevision: number;
+		  }
 		| undefined;
 	return {
 		observe(buffer: BufferManager, cursor: BufferReadCursor | undefined, sequence: number) {
 			candidate?.cursor?.dispose();
-			candidate = { buffer, cursor, sequence };
+			candidate = { buffer, cursor, sequence, layoutRevision: buffer.layoutRevision };
 		},
 		previousLength(): number | undefined {
 			if (readCursors.get(key) !== state || state.buffer !== candidate?.buffer) return undefined;
 			if (!!state.observation !== !!candidate?.cursor) return undefined;
-			if (state.observation?.layoutRevision !== candidate?.cursor?.layoutRevision) return undefined;
+			if (state.layoutRevision !== candidate?.layoutRevision) return undefined;
 			return state.length;
 		},
 		commit(length: number) {
@@ -79,6 +85,7 @@ function beginReadObservation(narratorId: string, terminalId: string) {
 			state.length = length;
 			state.buffer = candidate?.buffer;
 			state.sequence = candidate?.sequence;
+			state.layoutRevision = candidate?.layoutRevision;
 			state.observation = candidate?.cursor;
 			candidate = undefined;
 		},
@@ -260,8 +267,9 @@ export const terminalTool: ToolDefinition = {
 				"For 'watch': case-sensitive substring of rendered output since this session's last " +
 					"successful read/write snapshot. Older observed text is excluded, including occurrences merely moving " +
 					"inside its prefix; new appended rows are matched independently. Indistinguishable same-prefix redraws " +
-					"are not proof of a new occurrence. With no cached observation, starts now. A horizontal resize " +
-					"ends an active watch: read and register a new one without resending input.",
+					"are not proof of a new occurrence. With no cached observation, starts now. Watches survive " +
+					"terminal resizes; layout changes do not count as new output. Excessive retained layout history " +
+					"fails explicitly rather than replaying old output.",
 			),
 		start_at: z
 			.enum(["last_observation", "now"])
@@ -269,7 +277,7 @@ export const terminalTool: ToolDefinition = {
 			.describe(
 				"For 'watch': last_observation (default) includes output that arrived after the last " +
 					"successful read/write but before registration. now waits only for the next occurrence. " +
-					"Observations expire on reset, reattach, column resize or cache eviction. This is not a command boundary.",
+					"Observations expire on reset, reattach, cache eviction or layout-history budget exhaustion. This is not a command boundary.",
 			),
 		timeout: looseNumber(
 			`For 'watch', and for 'write' with 'notify_on': seconds before the watch gives up and ` +
@@ -543,6 +551,7 @@ async function startWatch(
 	marker: IMarker,
 	start: WatchStart,
 	point?: BufferReadCursor,
+	matchFrame?: ReturnType<typeof createWatchFrameMatcher>,
 ): Promise<ToolResult> {
 	if (terminalService.getActiveBuffer(terminalId) !== buffer) {
 		if (point) point.dispose();
@@ -553,14 +562,6 @@ async function startWatch(
 			isError: true,
 		};
 	}
-	if (point && point.layoutRevision !== buffer.layoutRevision) {
-		point.dispose();
-		return {
-			output:
-				"Terminal layout changed; no watch was registered. Read the terminal and register a new watch; do not resend input automatically.",
-			isError: true,
-		};
-	}
 	const started = await startTerminalWatch({
 		narratorId: ctx.narratorId,
 		terminalId,
@@ -568,6 +569,8 @@ async function startWatch(
 		pattern,
 		timeoutMs,
 		buffer,
+		cursor: point,
+		matchFrame,
 		layoutRevision: point?.layoutRevision,
 		marker,
 		observedEndMarker: point?.observedEndMarker,
@@ -582,7 +585,7 @@ async function startWatch(
 			`Watching terminal "${terminalName}" for ${JSON.stringify(normalizeWatchPattern(pattern))} ` +
 			`(background task "${started.alias}", times out in ${Math.round(timeoutMs / 1000)}s). ` +
 			"End your turn or continue other work; you will be notified with the matching output, or " +
-			`when the watch times out or the terminal exits or changes layout. Stop({ type: "bash", id: "${started.alias}" }) cancels it.`,
+			`when the watch times out, its observation budget expires or the terminal exits. Stop({ type: "bash", id: "${started.alias}" }) cancels it.`,
 		title: terminalName,
 	};
 }
@@ -608,13 +611,7 @@ async function watchTerminal(
 	const key = cursorKey(ctx.narratorId, terminalId);
 	const previous = readCursors.get(key);
 	if (previous?.buffer && previous.buffer !== buffer) discardReadCursor(key);
-	let source = startAt === "now" ? undefined : readCursors.get(key)?.observation;
-	if (source && source.layoutRevision !== buffer?.layoutRevision) {
-		// A marker tracks rows, not a column inside a reflowed row. Reusing its
-		// prefix after horizontal resize could mistake already-observed text for new.
-		discardReadCursor(key);
-		source = undefined;
-	}
+	const source = startAt === "now" ? undefined : readCursors.get(key)?.observation;
 	const trimmed = !!source?.marker.isDisposed;
 	// Cloning is synchronous and preserves the old prefix. Reading a new baseline
 	// here would consume exactly the output in the tool-to-tool registration gap.
@@ -708,8 +705,9 @@ async function writeInput(
 	}
 	const echoBuffer =
 		notifyOn === undefined ? undefined : terminalService.getActiveBuffer(terminalId);
-	const marker = notifyOn === undefined ? undefined : await echoBuffer?.markCursorRow();
-	if (notifyOn !== undefined && !marker) {
+	const echoPoint = notifyOn === undefined ? undefined : await echoBuffer?.markReadCursor();
+	const marker = echoPoint?.marker;
+	if (notifyOn !== undefined && !echoPoint) {
 		return {
 			output:
 				"Cannot use notify_on right now: a full-screen program (alternate screen) is active. Nothing was sent.",
@@ -769,7 +767,7 @@ async function writeInput(
 			if (!result.isError) observation?.commit(fullText.length);
 			return result;
 		};
-		if (notifyOn !== undefined && marker) {
+		if (notifyOn !== undefined && marker && echoPoint) {
 			if (!echoBuffer || terminalService.getActiveBuffer(terminalId) !== echoBuffer) {
 				return {
 					output:
@@ -779,7 +777,9 @@ async function writeInput(
 				};
 			}
 			const pattern = normalizeWatchPattern(notifyOn);
-			const { text: fromMarker } = await echoBuffer.readFromMarker(marker);
+			const frames = await echoBuffer.readCursor(echoPoint);
+			const watchStart: WatchStart = { kind: "echo", input: processed };
+			const matchFrame = createWatchFrameMatcher(pattern, watchStart);
 			if (signal.aborted) return makeAbortedResult(terminal.name ?? terminalId);
 			if (terminalService.getActiveBuffer(terminalId) !== echoBuffer) {
 				return {
@@ -789,8 +789,15 @@ async function writeInput(
 					title: terminal.name ?? terminalId,
 				};
 			}
-			const start = echoEnd(fromMarker, processed);
-			if (start !== undefined && fromMarker.indexOf(pattern, start) !== -1) {
+			for (const frame of frames) {
+				if (frame.kind === "error") {
+					return {
+						output: `Input was sent, but ${frame.message}. Read the terminal before continuing; do not resend input automatically.`,
+						isError: true,
+						title: terminal.name ?? terminalId,
+					};
+				}
+				if (matchFrame(frame) === -1) continue;
 				const truncated = truncateOutput(
 					`(${JSON.stringify(pattern)} already appeared; no watch was started)\n\n${body}`,
 				);
@@ -809,10 +816,9 @@ async function writeInput(
 				timeoutMs,
 				echoBuffer,
 				marker,
-				{
-					kind: "echo",
-					input: processed,
-				},
+				watchStart,
+				echoPoint,
+				matchFrame,
 			);
 			const truncated = truncateOutput(`${watch.output}\n\n${body}`);
 			return finish({
@@ -837,7 +843,7 @@ async function writeInput(
 		});
 	} finally {
 		observation?.dispose();
-		if (!markerOwned) marker?.dispose();
+		if (!markerOwned) echoPoint?.dispose();
 	}
 }
 

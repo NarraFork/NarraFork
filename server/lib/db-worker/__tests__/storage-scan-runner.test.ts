@@ -81,16 +81,16 @@ describe("runParallelObjectStorageScan", () => {
 	let home = "";
 	let dbPath = "";
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		home = mkdtempSync(join(tmpdir(), "narrafork-scan-runner-"));
 		dbPath = join(home, "narrafork.db");
 		createFixtureDatabase(dbPath);
-		resetDbWorkerPoolForTest();
+		await resetDbWorkerPoolForTest();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		mock.restore();
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		delete process.env.NARRAFORK_DB_WORKER;
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 		rmSync(home, { recursive: true, force: true });
@@ -114,7 +114,7 @@ describe("runParallelObjectStorageScan", () => {
 			expect(viaWorkers.workerCount).toBeGreaterThan(1);
 
 			process.env.NARRAFORK_DB_WORKER = "off";
-			resetDbWorkerPoolForTest();
+			await resetDbWorkerPoolForTest();
 			const viaFallback = await runParallelObjectStorageScan({
 				sqlite,
 				dbPath,
@@ -251,11 +251,11 @@ describe("object scan deadlines and fallback", () => {
 		indexesByTable: [],
 	};
 	let sqlite: Database;
-	beforeEach(() => {
+	beforeEach(async () => {
 		sqlite = new Database(":memory:");
 		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	});
-	afterEach(() => {
+	afterEach(async () => {
 		mock.restore();
 		sqlite.close();
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
@@ -389,12 +389,12 @@ describe("read failures are not reported as empty tables", () => {
 	let home = "";
 	let dbPath = "";
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		home = mkdtempSync(join(tmpdir(), "narrafork-scan-busy-"));
 		dbPath = join(home, "narrafork.db");
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		rmSync(home, { recursive: true, force: true });
 	});
 

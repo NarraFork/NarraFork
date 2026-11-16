@@ -81,6 +81,11 @@ export interface ReasoningProviderMetadata {
 		reasoningEncryptedContent?: string | null;
 		/** Native plaintext is replayable; summaries and unmarked legacy text are not. */
 		textFormat?: "reasoning_text" | "summary_text" | "mixed";
+		/** Exact native parts for replay, independent of the text rendered to the user.
+		 * Present (even when empty) on new snapshots; absent on legacy history. */
+		reasoningContent?: Array<{ type: "reasoning_text"; text: string }>;
+		/** Actual summary parts, never reconstructed from native or mixed display text. */
+		reasoningSummary?: Array<{ type: "summary_text"; text: string }>;
 	};
 	anthropic?: {
 		/** Provider-native content block index for this thinking block. */
@@ -298,6 +303,12 @@ export interface ParsedStreamEvent {
 		cacheCreationInputTokens?: number;
 		cacheCreation5mTokens?: number;
 		cacheCreation1hTokens?: number;
+		/**
+		 * Whether the upstream response carried cache counters at all. `false` means the
+		 * provider reported usage without them (zeros above are fillers, not misses);
+		 * absent means this adapter does not know. Feeds the cache hit rate denominator.
+		 */
+		cacheReported?: boolean;
 		/** Provider-specific effective context window used for this usage snapshot. */
 		contextWindow?: number;
 	};

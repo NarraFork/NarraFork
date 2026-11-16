@@ -198,7 +198,7 @@ export function CreateNarratorModalBody({
 	const { t: tc } = useTranslation("common");
 	const createNarrator = useCreateNarrator();
 	const queryClient = useQueryClient();
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
@@ -716,6 +716,7 @@ export function CreateNarratorModalBody({
 				description={t("modelHint")}
 				data={groupedModels}
 				searchable
+				filter={modelOptionsFilter}
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={selectedModel || FOLLOW_DEFAULT_MODEL}
 				onChange={(v) => setSelectedModel(v ?? "")}

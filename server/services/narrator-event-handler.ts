@@ -2973,6 +2973,9 @@ export async function processEvent(
 				providerPrefix: event.providerPrefix,
 				resumeAction: event.resumeAction,
 			});
+			// A subagent running out of balance must not open the parent's recharge
+			// dialog: tag the parent copy so the parent page ignores it.
+			const routedToAnotherNarrator = ctx.narratorId !== broadcastTargetId;
 			dualBroadcast(ctx, {
 				type: "payment_required",
 				narratorId: broadcastTargetId,
@@ -2981,6 +2984,7 @@ export async function processEvent(
 				balance: event.balance,
 				required: event.required,
 				resumeAction: event.resumeAction,
+				...(routedToAnotherNarrator && { isSubagent: true }),
 			});
 			return null;
 		}
@@ -3239,11 +3243,19 @@ export async function processEvent(
 		}
 
 		case "quota_balance": {
+			// Same rule as context_usage / metering: the parent page's quota slot
+			// belongs to the parent's own model, so the parent copy is tagged and
+			// ignored there — otherwise a running subagent's balance overwrites the
+			// parent's display and its provider cache. Keyed on the broadcast route
+			// rather than `parentToolUseId`, so a frame addressed to another narrator
+			// is always tagged even when the placement carries no tool_use link.
+			const routedToAnotherNarrator = ctx.narratorId !== broadcastTargetId;
 			dualBroadcast(ctx, {
 				type: "quota_balance",
 				narratorId: broadcastTargetId,
 				quotaBalance: event.quotaBalance,
 				detailedQuotaBalance: event.detailedQuotaBalance,
+				...(routedToAnotherNarrator && { isSubagent: true }),
 			});
 			if (ctx.providerPrefix) {
 				updateCustomApiQuotaByPrefix(

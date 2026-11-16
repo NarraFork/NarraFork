@@ -1,6 +1,7 @@
-import type { Worker } from "node:worker_threads";
 import { compiledWorkerSpecifiers, connectCompiledWorker } from "../compiled-worker";
+import { hotSafe } from "../hot-safe";
 import { logger } from "../logger";
+import { type PoolWorker, WorkerPool, type WorkerTaskContext } from "../worker-runtime/pool";
 import type { JsonPacketPart } from "./request-json-worker";
 
 // These are scheduling/IPC budgets, never limits on the total request size.
@@ -8,101 +9,140 @@ const PACKET_CHARS = 64 * 1024;
 const PACKET_PARTS = 512;
 const SMALL_CHARS = 32 * 1024;
 const SMALL_NODES = 256;
-let workerPromise: Promise<Worker> | undefined;
-let queue: Promise<void> = Promise.resolve();
-let idle: ReturnType<typeof setTimeout> | undefined;
-
-async function requestWorker(): Promise<Worker> {
-	if (!workerPromise) {
-		const pending = connectCompiledWorker(
-			compiledWorkerSpecifiers(
-				"lib/agent/request-json-worker.ts",
-				"./request-json-worker.ts",
-				import.meta.url,
-			),
-		).then(({ worker }) => {
-			worker.on("error", () => {});
-			worker.on("exit", () => {
-				if (workerPromise === pending) workerPromise = undefined;
-			});
-			worker.unref();
-			return worker;
-		});
-		workerPromise = pending;
-		pending.catch(() => {
-			if (workerPromise === pending) workerPromise = undefined;
-		});
-	}
-	return workerPromise;
+function createPacketPool() {
+	return new WorkerPool<JsonPacketPart[], string>({
+		concurrency: 1,
+		maxQueued: 32,
+		maxQueuedBytes: 64 * 1024 * 1024,
+		idleTimeoutMs: 30_000,
+		create: requestWorker,
+	});
 }
 
-/** One bounded packet at a time, shared across callers; queue waiting does not consume a timeout. */
-function escapePacket(parts: JsonPacketPart[], signal?: AbortSignal): Promise<string> {
-	signal?.throwIfAborted();
-	clearTimeout(idle);
-	return new Promise<string>((resolve, reject) => {
-		let finished = false;
-		const abort = () => {
-			finished = true;
-			reject(signal?.reason);
-		};
-		signal?.addEventListener("abort", abort, { once: true });
-		const execute = async () => {
-			if (finished) return;
-			try {
-				const worker = await requestWorker();
-				if (finished) return;
-				const text = await new Promise<string>((accept, fail) => {
-					const cleanup = () => {
-						clearTimeout(timer);
-						worker.off("message", receive);
-						worker.off("error", failWorker);
-						worker.off("exit", failWorker);
-					};
-					const receive = (response: { text?: string; error?: string }) => {
-						cleanup();
-						if (typeof response.text === "string") accept(response.text);
-						else fail(new Error(response.error ?? "Request JSON worker failed"));
-					};
-					const failWorker = () => {
-						cleanup();
-						fail(new Error("Request JSON worker exited"));
-					};
-					const timer = setTimeout(() => {
-						cleanup();
-						void worker.terminate();
-						fail(new Error("Request JSON packet timed out"));
-					}, 30_000);
-					worker.once("message", receive);
-					worker.once("error", failWorker);
-					worker.once("exit", failWorker);
-					try {
-						worker.postMessage({ parts });
-					} catch (error) {
-						cleanup();
-						fail(error);
+const packetOwner = hotSafe("narrafork.requestJson.workers.v1", () => ({
+	pool: createPacketPool(),
+	closed: false,
+}));
+
+function assertOpen(): void {
+	if (packetOwner.closed) throw new Error("Request JSON workers are closed");
+}
+
+/** Permanent production latch, including the small-value and cached encoder paths. */
+export function closeRequestJsonWorkers(): Promise<void> {
+	packetOwner.closed = true;
+	return packetOwner.pool.close(new Error("Request JSON workers are closed"));
+}
+
+export async function resetRequestJsonWorkersForTests(): Promise<void> {
+	await closeRequestJsonWorkers();
+	packetOwner.pool = createPacketPool();
+	packetOwner.closed = false;
+}
+
+async function requestWorker(
+	context: WorkerTaskContext,
+): Promise<PoolWorker<JsonPacketPart[], string>> {
+	const { worker, handle } = await connectCompiledWorker(
+		compiledWorkerSpecifiers(
+			"lib/agent/request-json-worker.ts",
+			"./request-json-worker.ts",
+			import.meta.url,
+		),
+		{
+			signal: context.signal,
+			deadlineAt: Math.min(Date.now() + 5_000, context.deadlineAt),
+		},
+	);
+	worker.unref();
+	return {
+		get closed() {
+			return handle.closed;
+		},
+		close: () => handle.close(),
+		run: (parts, { requestId, signal }) =>
+			new Promise<string>((accept, fail) => {
+				let finished = false;
+				const finish = (text?: string, error?: unknown, stop = false) => {
+					if (finished) return;
+					finished = true;
+					clearTimeout(timer);
+					worker.off("message", receive);
+					worker.off("error", failWorker);
+					worker.off("messageerror", failWorker);
+					worker.off("exit", failWorker);
+					signal.removeEventListener("abort", abort);
+					if (text !== undefined) accept(text);
+					else if (stop) void handle.close().then(() => fail(error), fail);
+					else fail(error);
+				};
+				const invalid = () =>
+					finish(undefined, new Error("Invalid request JSON worker response"), true);
+				const receive = (response: unknown) => {
+					if (
+						response &&
+						typeof response === "object" &&
+						!Array.isArray(response) &&
+						"ready" in response &&
+						response.ready === true &&
+						!("requestId" in response)
+					)
+						return;
+					if (
+						!response ||
+						typeof response !== "object" ||
+						Array.isArray(response) ||
+						!("requestId" in response) ||
+						typeof response.requestId !== "string" ||
+						!response.requestId
+					) {
+						invalid();
+						return;
 					}
-				});
-				if (!finished) resolve(text);
-			} catch (error) {
-				if (!finished) reject(error);
-			} finally {
-				finished = true;
-				signal?.removeEventListener("abort", abort);
-			}
-		};
-		queue = queue.then(execute, execute);
-		const admitted = queue;
-		void admitted.then(() => {
-			if (queue !== admitted) return;
-			idle = setTimeout(() => {
-				const previous = workerPromise;
-				workerPromise = undefined;
-				void previous?.then((worker) => worker.terminate()).catch(() => {});
-			}, 30_000);
-			idle.unref();
-		});
-	});
+					// A stale frame cannot consume this packet's listener or computation budget.
+					if (response.requestId !== requestId) return;
+					if ("text" in response && typeof response.text === "string" && !("error" in response))
+						finish(response.text);
+					else if (
+						"error" in response &&
+						typeof response.error === "string" &&
+						!("text" in response)
+					)
+						finish(undefined, new Error(response.error));
+					else invalid();
+				};
+				const failWorker = () => finish(undefined, new Error("Request JSON worker exited"), true);
+				const abort = () => finish(undefined, signal.reason, true);
+				// Queue waiting and readiness never consume this existing per-packet budget.
+				const timer = setTimeout(
+					() => finish(undefined, new Error("Request JSON packet timed out"), true),
+					30_000,
+				);
+				worker.on("message", receive);
+				worker.once("error", failWorker);
+				worker.once("messageerror", failWorker);
+				worker.once("exit", failWorker);
+				signal.addEventListener("abort", abort, { once: true });
+				if (signal.aborted) abort();
+				else {
+					try {
+						worker.postMessage({ requestId, parts });
+					} catch (error) {
+						finish(undefined, error, true);
+					}
+				}
+			}),
+	};
+}
+
+/** Bounded packet admission; no request-wide deadline and no unbounded Promise tail. */
+function escapePacket(
+	parts: JsonPacketPart[],
+	bytes: number,
+	signal?: AbortSignal,
+): Promise<string> {
+	assertOpen();
+	return packetOwner.pool.run(parts, { signal, bytes, deadlineAt: Infinity });
 }
 
 /** Bounded inspection, without first serializing or copying a large request. */
@@ -144,9 +184,11 @@ async function stringifyLarge(
 	const flush = async () => {
 		if (!packet.length) return;
 		const next = packet;
+		// UTF-16 storage plus bounded node overhead, accumulated during the existing walker.
+		const bytes = chars * 2 + packet.length * 64;
 		packet = [];
 		chars = 0;
-		output.push(await escapePacket(next, signal));
+		output.push(await escapePacket(next, bytes, signal));
 		// Explicitly yield between packets, including when the worker/cache is warm.
 		await Bun.sleep(0);
 		signal?.throwIfAborted();
@@ -218,6 +260,7 @@ async function stringifyLarge(
 	await walk(jsonValue(value, ""));
 	await flush();
 	signal?.throwIfAborted();
+	assertOpen();
 	return output.join("");
 }
 
@@ -227,12 +270,14 @@ async function stringifyLarge(
  * Large tools/history fragments are reused without another traversal/serialization.
  */
 export function createRequestBodyEncoder(transform?: (value: unknown) => unknown) {
+	assertOpen();
 	// The optional transform is shallow and pure: apply it during bounded traversal,
 	// without first cloning the whole body. Native stringify is only used on small values.
 	const replacer = transform ? (_key: string, value: unknown) => transform(value) : undefined;
 	const fragments = new Map<string, { value: unknown; text: string }>();
 	let large = false;
 	return async (body: Record<string, unknown>, signal?: AbortSignal): Promise<string> => {
+		assertOpen();
 		signal?.throwIfAborted();
 		if (!large && isSmall(body)) return JSON.stringify(body, replacer);
 		large = true;
@@ -254,13 +299,19 @@ export function createRequestBodyEncoder(transform?: (value: unknown) => unknown
 			parts.push(`${JSON.stringify(key)}:${fragment.text}`);
 		}
 		signal?.throwIfAborted();
+		assertOpen();
 		const text = `{${parts.join(",")}}`;
 		const elapsedMs = performance.now() - started;
-		if (elapsedMs > 100)
-			logger.debug("Large provider request encoded", {
-				elapsedMs: Math.round(elapsedMs),
-				characters: text.length,
-			});
+		if (elapsedMs > 100) {
+			try {
+				logger.debug("Large provider request encoded", {
+					elapsedMs: Math.round(elapsedMs),
+					characters: text.length,
+				});
+			} catch {
+				// Encoding has completed; an observational sink cannot replace its result.
+			}
+		}
 		return text;
 	};
 }

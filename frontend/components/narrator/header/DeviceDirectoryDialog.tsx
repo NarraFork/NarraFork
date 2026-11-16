@@ -19,7 +19,10 @@ import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../../hooks/u
 import { api } from "../../../lib/api";
 import { Z } from "../../../lib/z-index";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
-import { DIRECTORY_BROWSER_MODAL_STYLES } from "../../common/directory-browser-modal";
+import {
+	DIRECTORY_BROWSER_MODAL_STYLES,
+	DIRECTORY_BROWSER_ROOT_STYLE,
+} from "../../common/directory-browser-modal";
 
 const RemoteDirectoryBrowser = lazy(() =>
 	import("../../permissions/RemoteDirectoryBrowser").then((module) => ({
@@ -98,7 +101,7 @@ export function DeviceDirectoryDialog({
 			zIndex={Z.modal}
 			styles={DIRECTORY_BROWSER_MODAL_STYLES}
 		>
-			<Stack gap="sm">
+			<Stack gap="sm" p="md" style={DIRECTORY_BROWSER_ROOT_STYLE}>
 				<Text size="xs" c="dimmed">
 					{isRemote
 						? t("deviceDirectoryRemoteHint", { device: deviceName ?? target })
@@ -107,6 +110,7 @@ export function DeviceDirectoryDialog({
 				{isRemote ? (
 					<Suspense fallback={<Loader size="sm" />}>
 						<RemoteDirectoryBrowser
+							key={target}
 							deviceLabel={deviceName ?? target}
 							initialPath={cwd.trim() || undefined}
 							listDirectory={(path, opts) =>

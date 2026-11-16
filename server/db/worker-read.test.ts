@@ -40,7 +40,7 @@ let home: string;
 let sqlite: Database;
 let db: ReturnType<typeof drizzle>;
 
-beforeAll(() => {
+beforeAll(async () => {
 	home = mkdtempSync(join(tmpdir(), "narrafork-worker-read-"));
 	sqlite = new Database(join(home, "fixture.db"));
 	sqlite.run("PRAGMA journal_mode = WAL");
@@ -56,20 +56,20 @@ beforeAll(() => {
 			{ id: "i2", ownerId: null, meta: null, done: false, createdAt: new Date(2000) },
 		])
 		.run();
-	resetDbWorkerPoolForTest();
+	await resetDbWorkerPoolForTest();
 });
 
 let previousWorker: string | undefined;
 let previousConcurrency: string | undefined;
-beforeEach(() => {
+beforeEach(async () => {
 	previousWorker = process.env.NARRAFORK_DB_WORKER;
 	previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	delete process.env.NARRAFORK_DB_WORKER;
 	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
-	resetDbWorkerPoolForTest();
+	await resetDbWorkerPoolForTest();
 });
-afterEach(() => {
-	resetDbWorkerPoolForTest();
+afterEach(async () => {
+	await resetDbWorkerPoolForTest();
 	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
 	else process.env.NARRAFORK_DB_WORKER = previousWorker;
 	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
@@ -78,7 +78,10 @@ afterEach(() => {
 
 function useWorkerFixture(name: string, source: string): void {
 	const file = join(home, `${name}.ts`);
-	writeFileSync(file, source);
+	writeFileSync(
+		file,
+		`import { parentPort } from "node:worker_threads";\nparentPort.on("message", data => { if (data.type) self.onmessage?.({data}); });\n${source}`,
+	);
 	setDbWorkerSpecifiersForTest([pathToFileURL(file).href]);
 }
 
@@ -104,8 +107,8 @@ async function rejectsOffThread(options: Parameters<typeof readQuery>[1] = {}) {
 	}
 }
 
-afterAll(() => {
-	shutdownDbWorkerPool();
+afterAll(async () => {
+	await shutdownDbWorkerPool();
 	sqlite.close();
 	rmSync(home, { recursive: true, force: true });
 });
@@ -227,7 +230,7 @@ describe("readQuery", () => {
 		const deadline = Date.now() + 3_000;
 		while (getDbWorkerPoolStats().queued === 0 && Date.now() < deadline) await Bun.sleep(1);
 		expect(getDbWorkerPoolStats().queued).toBe(1);
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		await Promise.all([running, queued]);
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 		expect(getDbWorkerPoolStats().queued).toBe(0);
@@ -274,7 +277,7 @@ describe("readQuery", () => {
 		useWorkerFixture("shutdown", 'self.onmessage = () => {}; postMessage({ type: "ready" });');
 		const pending = rejectsOffThread();
 		await waitForBusy();
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		await pending;
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 	});

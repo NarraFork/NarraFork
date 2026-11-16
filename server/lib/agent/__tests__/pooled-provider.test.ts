@@ -5,6 +5,7 @@ import { saveSettings, settings } from "../../settings";
 import {
 	classifyKeyFault,
 	PooledProvider,
+	reportKeyFault,
 	resetProviderKeyRuntimeForTests,
 	selectProviderKey,
 	withProviderKey,
@@ -120,6 +121,46 @@ describe("pooled provider", () => {
 		const pool = new PooledProvider(PROVIDER, build);
 		await expect(drain(pool.chat(params("s1")))).rejects.toThrow("slow down");
 		expect(store().get(PROVIDER)?.disabledReason).toBe("invalid");
+	});
+
+	test("when all keys rest, choose the earliest reset and keep exclusions", () => {
+		const [first] = store().list(PROVIDER);
+		const second = store().add(PROVIDER, { apiKey: "sk-two" });
+		const now = 100_000;
+		reportKeyFault(first, new ApiError(429, "rate limited, retry-after: 60"), now);
+		reportKeyFault(second, new ApiError(429, "rate limited, retry-after: 7"), now);
+		expect(selectProviderKey(PROVIDER, "s1", undefined, now)?.id).toBe(second.id);
+		expect(selectProviderKey(PROVIDER, "s1", new Set([second.id]), now)?.id).toBe(first.id);
+		expect(selectProviderKey(PROVIDER, "s1", undefined, now + 60_000)?.id).toBe(first.id);
+	});
+
+	test("one request tries each rejected key at most once", async () => {
+		store().add(PROVIDER, { apiKey: "sk-two" });
+		const { build, calls } = fakeBuild({
+			"sk-one": [new ApiError(401, "first rejected")],
+			"sk-two": [new ApiError(401, "second rejected")],
+		});
+		await expect(drain(new PooledProvider(PROVIDER, build).chat(params("s1")))).rejects.toThrow(
+			"second rejected",
+		);
+		expect(calls).toEqual(["sk-one", "sk-two"]);
+	});
+
+	test("cancellation does not penalize a key or rotate to another", async () => {
+		store().add(PROVIDER, { apiKey: "sk-two" });
+		const controller = new AbortController();
+		const { build, calls } = fakeBuild({
+			"sk-one": [new ApiError(401, "cancelled")],
+			"sk-two": [{ text: "must not retry" } as ParsedStreamEvent],
+		});
+		controller.abort();
+		await expect(
+			drain(
+				new PooledProvider(PROVIDER, build).chat({ ...params("s1"), signal: controller.signal }),
+			),
+		).rejects.toThrow("cancelled");
+		expect(calls).toEqual(["sk-one"]);
+		expect(store().get(PROVIDER)?.disabled).not.toBe(true);
 	});
 
 	test("server errors say nothing about the key", () => {

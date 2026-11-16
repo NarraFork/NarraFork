@@ -22,6 +22,32 @@ import { redactHeaders, redactPostData, redactUrl } from "./redaction";
 import { serializeBrowserValue } from "./serialization";
 import { closeTab, isSharedContext, targetIdOf } from "./tab-scope";
 
+function safeLog(
+	level: "info" | "warn" | "debug",
+	message: string,
+	fields: Record<
+		string,
+		| number
+		| boolean
+		| "console-serialization"
+		| "initial-navigation-close"
+		| "closed"
+		| "capture-stopped"
+		| "handoff-target"
+		| "restore-viewport"
+		| "restored"
+	>,
+) {
+	try {
+		const scalars = Object.fromEntries(
+			Object.entries(fields).filter(
+				([, value]) => typeof value !== "number" || Number.isFinite(value),
+			),
+		);
+		logger[level](message, scalars);
+	} catch {}
+}
+
 /** Default session TTL: 10 minutes of inactivity. */
 export const DEFAULT_SESSION_TTL_MS = 10 * 60 * 1000;
 /** Minimum configurable session TTL: 1 second. */
@@ -210,10 +236,23 @@ export function normalizeSessionTtlMs(ttlMs: number | undefined): number {
 /**
  * narratorId → Map<sessionId, BrowserSession>
  */
-const sessions = new Map<string, Map<string, BrowserSession>>();
-
-/** Start periodic cleanup of expired sessions. */
-let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+interface SessionOwner {
+	version: 1;
+	sessions: Map<string, Map<string, BrowserSession>>;
+	cleanupTimer: ReturnType<typeof setInterval> | null;
+}
+const SESSION_OWNER = Symbol.for("narrafork.browser.sessions");
+const sessionGlobals = globalThis as typeof globalThis & { [SESSION_OWNER]?: SessionOwner };
+const oldOwner = sessionGlobals[SESSION_OWNER];
+if (oldOwner && (oldOwner.version !== 1 || !(oldOwner.sessions instanceof Map)))
+	throw new Error("Browser session ownership cannot be recovered");
+const sessionOwner: SessionOwner = oldOwner ?? {
+	version: 1,
+	sessions: new Map(),
+	cleanupTimer: null,
+};
+sessionGlobals[SESSION_OWNER] = sessionOwner;
+const sessions = sessionOwner.sessions;
 
 function isSessionExpired(session: BrowserSession, now = Date.now()): boolean {
 	return now - session.lastActivity > session.ttlMs;
@@ -229,7 +268,7 @@ function expireSession(
 	sessionId: string,
 	session: BrowserSession,
 ): void {
-	logger.info("Browser session expired", { narratorId, sessionId, ttlMs: session.ttlMs });
+	safeLog("info", "Browser session expired", { ttlMs: session.ttlMs });
 	if (session.tracing?.active) void finishPerformanceTrace(session).catch(() => {});
 	void cancelMemoryJob(session)
 		.then(() => closeSessionTab(session))
@@ -240,8 +279,8 @@ function expireSession(
 }
 
 function ensureCleanupTimer(): void {
-	if (cleanupTimer) return;
-	cleanupTimer = setInterval(() => {
+	if (sessionOwner.cleanupTimer) return;
+	sessionOwner.cleanupTimer = setInterval(() => {
 		const now = Date.now();
 		for (const [narratorId, map] of sessions) {
 			for (const [sessionId, session] of map) {
@@ -251,14 +290,18 @@ function ensureCleanupTimer(): void {
 			}
 			if (map.size === 0) sessions.delete(narratorId);
 		}
-		if (sessions.size === 0 && cleanupTimer) {
-			clearInterval(cleanupTimer);
-			cleanupTimer = null;
+		if (sessions.size === 0 && sessionOwner.cleanupTimer) {
+			clearInterval(sessionOwner.cleanupTimer);
+			sessionOwner.cleanupTimer = null;
 		}
 	}, CLEANUP_INTERVAL_MS);
 	// Don't keep the process alive just for cleanup
-	if (cleanupTimer && typeof cleanupTimer === "object" && "unref" in cleanupTimer) {
-		cleanupTimer.unref();
+	if (
+		sessionOwner.cleanupTimer &&
+		typeof sessionOwner.cleanupTimer === "object" &&
+		"unref" in sessionOwner.cleanupTimer
+	) {
+		sessionOwner.cleanupTimer.unref();
 	}
 }
 
@@ -415,9 +458,9 @@ function attachConsoleListeners(page: Page, session: BrowserSession): void {
 		});
 		trackConsoleCapture(
 			session,
-			populateConsoleMessageArgs(entry, msg).catch((err) => {
-				logger.debug("Failed to serialize browser console arguments", {
-					error: err instanceof Error ? err.message : String(err),
+			populateConsoleMessageArgs(entry, msg).catch(() => {
+				safeLog("debug", "Failed to serialize browser console arguments", {
+					stage: "console-serialization",
 				});
 			}),
 		);
@@ -528,11 +571,9 @@ export async function createSession(
 		);
 		await page.goto(url, { waitUntil: "domcontentloaded" });
 	} catch (err) {
-		await closeSessionTab(session).catch((closeErr) => {
-			logger.warn("Failed to close browser tab after initial navigation failure", {
-				narratorId,
-				sessionId,
-				error: String(closeErr),
+		await closeSessionTab(session).catch(() => {
+			safeLog("warn", "Failed to close browser tab after initial navigation failure", {
+				stage: "initial-navigation-close",
 			});
 		});
 		throw err;
@@ -546,15 +587,13 @@ export async function createSession(
 	map.set(sessionId, session);
 
 	ensureCleanupTimer();
-	logger.info("Browser session created", {
-		narratorId,
-		sessionId,
-		url,
+	safeLog("info", "Browser session created", {
 		headless,
 		inUserBrowser,
 		ttlMs: normalizedTtlMs,
 		networkCaptureEnabled: captureNetwork,
-		viewport: normalizedViewport,
+		viewportWidth: normalizedViewport.width,
+		viewportHeight: normalizedViewport.height,
 	});
 	eventBus.emit({ type: "browser:session_created", sessionId, narratorId, url });
 	return session;
@@ -576,7 +615,10 @@ export async function setSessionViewport(
 	await session.page.setViewport(toPuppeteerViewport(next));
 	session.viewport = next;
 	touchSession(session);
-	logger.info("Browser session viewport updated", { narratorId, sessionId, viewport: next });
+	safeLog("info", "Browser session viewport updated", {
+		viewportWidth: next.width,
+		viewportHeight: next.height,
+	});
 	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
@@ -618,7 +660,7 @@ export async function closeSession(narratorId: string, sessionId: string): Promi
 	map.delete(sessionId);
 	if (map.size === 0) sessions.delete(narratorId);
 
-	logger.info("Browser session closed", { narratorId, sessionId });
+	safeLog("info", "Browser session closed", { stage: "closed" });
 	eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
 	return true;
 }
@@ -636,7 +678,7 @@ export function setSessionTtl(
 	// Treat a manual/agent TTL update as activity, so the new countdown starts now.
 	touchSession(session);
 	ensureCleanupTimer();
-	logger.info("Browser session TTL updated", { narratorId, sessionId, ttlMs: normalizedTtlMs });
+	safeLog("info", "Browser session TTL updated", { ttlMs: normalizedTtlMs });
 	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
@@ -655,7 +697,7 @@ export function startNetworkCapture(
 	}
 	session.networkCaptureEnabled = true;
 	touchSession(session);
-	logger.info("Browser network capture started", { narratorId, sessionId, clear: opts?.clear });
+	safeLog("info", "Browser network capture started", { clear: opts?.clear ?? false });
 	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
@@ -669,7 +711,7 @@ export function stopNetworkCapture(
 	if (!session) return undefined;
 	session.networkCaptureEnabled = false;
 	touchSession(session);
-	logger.info("Browser network capture stopped", { narratorId, sessionId });
+	safeLog("info", "Browser network capture stopped", { stage: "capture-stopped" });
 	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
@@ -701,10 +743,7 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 	for (const sessionId of sessionIds) {
 		eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
 	}
-	logger.info("All browser sessions cleaned up", {
-		narratorId,
-		count: promises.length,
-	});
+	safeLog("info", "All browser sessions cleaned up", { count: promises.length });
 }
 
 /** List active sessions for a narrator. */
@@ -802,7 +841,7 @@ export async function closeAllSessions(options: { preserve?: boolean } = {}): Pr
 				);
 			}
 			promises.push(
-				cancelMemoryJob(session)
+				cancelMemoryJob(session, { waitForCleanup: true })
 					.then(() => (preserve ? undefined : closeSessionTab(session)))
 					.catch(() => {}),
 			);
@@ -811,11 +850,11 @@ export async function closeAllSessions(options: { preserve?: boolean } = {}): Pr
 	}
 	await Promise.all(promises);
 	sessions.clear();
-	if (cleanupTimer) {
-		clearInterval(cleanupTimer);
-		cleanupTimer = null;
+	if (sessionOwner.cleanupTimer) {
+		clearInterval(sessionOwner.cleanupTimer);
+		sessionOwner.cleanupTimer = null;
 	}
-	logger.info("All browser sessions closed", { count: closed, preserve });
+	safeLog("info", "All browser sessions closed", { count: closed, preserve });
 	return closed;
 }
 
@@ -831,9 +870,8 @@ export function snapshotSessionsForHandoff(): BrowserSessionHandoff[] {
 			const contextId = shared ? undefined : session.context.id;
 			const targetId = shared ? targetIdOf(session.page.target()) : undefined;
 			if (!contextId && !targetId) {
-				logger.warn("Skipping browser session that cannot be located after handoff", {
-					narratorId,
-					sessionId: session.id,
+				safeLog("warn", "Skipping browser session that cannot be located after handoff", {
+					stage: "handoff-target",
 				});
 				continue;
 			}
@@ -945,10 +983,9 @@ export async function restoreSessionFromHandoff(
 	if (!isDefaultViewport(session.viewport)) {
 		try {
 			await page.setViewport(toPuppeteerViewport(session.viewport));
-		} catch (error) {
-			logger.warn("Failed to restore browser session viewport after update", {
-				sessionId: handoff.sessionId,
-				error: String(error),
+		} catch {
+			safeLog("warn", "Failed to restore browser session viewport after update", {
+				stage: "restore-viewport",
 			});
 		}
 	}
@@ -961,11 +998,7 @@ export async function restoreSessionFromHandoff(
 	map.set(handoff.sessionId, session);
 	ensureCleanupTimer();
 
-	logger.info("Browser session restored after update", {
-		narratorId: handoff.narratorId,
-		sessionId: handoff.sessionId,
-		url: page.url(),
-	});
+	safeLog("info", "Browser session restored after update", { stage: "restored" });
 	eventBus.emit({
 		type: "browser:session_created",
 		sessionId: handoff.sessionId,

@@ -18,6 +18,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { hasGfmTableDelimiterRow, isGfmTableDelimiterRow } from "../shared/spec-content-loss";
 
 export const DEFAULT_DATABASE_PATH = join(homedir(), ".narrafork", "narrafork.db");
 export const DEFAULT_PAGE_SIZE = 50;
@@ -26,24 +27,8 @@ const MAX_PAGE_SIZE = 1000;
 /** tasks.json is written by the task board, never by the markdown editor. */
 const TASKS_PATH = "tasks.json";
 
-const DELIMITER_CELL = /^[ \t]*:?-+:?[ \t]*$/;
-
-/**
- * A GFM table delimiter row such as `| --- | :-: |` or `--|--`, also when indented (lists) or
- * quoted. It must contain a pipe: a dash line without one is a thematic break or a setext
- * underline, not a table.
- */
-export function isGfmTableDelimiterRow(line: string): boolean {
-	let row = line.replace(/^[ \t>]*/, "").trimEnd();
-	if (!row.includes("|")) return false;
-	if (row.startsWith("|")) row = row.slice(1);
-	if (row.endsWith("|")) row = row.slice(0, -1);
-	return row.split("|").every((cell) => DELIMITER_CELL.test(cell));
-}
-
-export function hasGfmTableDelimiterRow(text: string): boolean {
-	return text.split(/\r?\n/).some(isGfmTableDelimiterRow);
-}
+// The detection is shared with the server's scan (outline P2 PR 12c); re-exported here as before.
+export { hasGfmTableDelimiterRow, isGfmTableDelimiterRow };
 
 export interface SpecTableLossFinding {
 	path: string;

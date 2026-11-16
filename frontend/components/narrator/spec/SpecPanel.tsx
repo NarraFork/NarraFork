@@ -42,6 +42,7 @@ import { MarkdownContent } from "../markdown/MarkdownContent";
 import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecImportBanner } from "./SpecImportBanner";
+import { SpecLossNotice } from "./SpecLossFindings";
 import { SpecTaskBoard } from "./SpecTaskBoard";
 import type { SpecEditorMode } from "./spec-editor-mode";
 import { registerSpecFileSelector } from "./spec-file-reveal";
@@ -148,6 +149,7 @@ function OutlineTasksPanel({
 					</ActionIcon>
 				</Group>
 			)}
+			<SpecLossNotice narratorId={narratorId} />
 			<ScrollArea style={{ flex: 1 }}>
 				<AutoContinuationControl narratorId={narratorId} />
 				<Box px="xs" pb="xs">
@@ -470,6 +472,8 @@ function SpecFilesPanel({
 			) : (
 				<SpecImportBanner narratorId={narratorId} />
 			)}
+			{/* What a save from the old editor may have lost here (12c): shown, never repaired. */}
+			<SpecLossNotice narratorId={narratorId} />
 			{/* File tabs */}
 			<Box px="xs" py={6} style={{ flexShrink: 0 }}>
 				<SpecFileTabStrip

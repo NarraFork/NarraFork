@@ -7,16 +7,17 @@
  * download is authentic and reduces the chance an unknown-origin executable is
  * treated as suspicious by antivirus / SmartScreen heuristics.
  *
- * Pure functions only (aside from the single readFileSync in
- * `computeBinaryMetadata`) so the formatting logic is unit-testable.
+ * Pure formatting helpers, with bounded chunked file hashing in
+ * `computeBinaryMetadata` for CLI/local build callers.
  */
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { basename } from "node:path";
 import {
 	type HelperDistributionDependencies,
 	parseHelperDistributionDependencies,
 } from "../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { parseRecoveryManifestVersions } from "../../shared/update-identity";
 
 export interface BinaryMetadata {
@@ -60,16 +61,44 @@ export interface ComputeMetadataInput {
 	buildDate: string;
 }
 
-/**
- * Compute verifiable metadata for a single binary. Reads the file once and
- * derives both digests from the same buffer.
- */
+/** Synchronous CLI/local-build API: fixed-size reads, never a whole-binary Buffer. */
 export function computeBinaryMetadata(
 	filePath: string,
 	input: ComputeMetadataInput,
 ): BinaryMetadata {
-	const buf = readFileSync(filePath);
-	return computeBinaryMetadataFromBuffer(basename(filePath), buf, input);
+	const file = openSync(filePath, "r");
+	try {
+		const before = fstatSync(file);
+		if (!before.isFile() || before.size <= 0 || before.size > MAX_RELEASE_BINARY_BYTES)
+			throw new Error("Invalid release binary size");
+		const sha256 = createHash("sha256");
+		const sha512 = createHash("sha512");
+		const chunk = Buffer.alloc(256 * 1024);
+		const deadline = Date.now() + 60_000;
+		let size = 0;
+		for (;;) {
+			if (Date.now() > deadline) throw new Error("Release binary hash timed out");
+			const length = readSync(file, chunk, 0, chunk.length, null);
+			if (!length) break;
+			size += length;
+			if (size > MAX_RELEASE_BINARY_BYTES || size > before.size)
+				throw new Error("Release binary exceeded byte limit");
+			sha256.update(chunk.subarray(0, length));
+			sha512.update(chunk.subarray(0, length));
+		}
+		const after = fstatSync(file);
+		if (before.size !== size || after.size !== size || before.mtimeMs !== after.mtimeMs)
+			throw new Error("Release binary changed during hashing");
+		return binaryMetadata(
+			basename(filePath),
+			size,
+			sha256.digest("hex"),
+			sha512.digest("base64"),
+			input,
+		);
+	} finally {
+		closeSync(file);
+	}
 }
 
 /**
@@ -83,6 +112,16 @@ export function computeBinaryMetadataFromBuffer(
 ): BinaryMetadata {
 	const sha256 = createHash("sha256").update(buf).digest("hex");
 	const sha512 = createHash("sha512").update(buf).digest("base64");
+	return binaryMetadata(name, buf.length, sha256, sha512, input);
+}
+
+function binaryMetadata(
+	name: string,
+	size: number,
+	sha256: string,
+	sha512: string,
+	input: ComputeMetadataInput,
+): BinaryMetadata {
 	return {
 		name,
 		platform: input.platformId,
@@ -101,7 +140,7 @@ export function computeBinaryMetadataFromBuffer(
 					recoveryManifestVersions: parseRecoveryManifestVersions(input.recoveryManifestVersions),
 				}),
 		buildDate: input.buildDate,
-		size: buf.length,
+		size,
 		sha256,
 		sha512,
 	};

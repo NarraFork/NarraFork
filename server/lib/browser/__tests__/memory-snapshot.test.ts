@@ -1,10 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-	createSnapshotExporter,
+	createSnapshotExporter as createRealSnapshotExporter,
 	exportHeapSnapshot,
 	snapshotWorkerSpecifiers,
 } from "../memory-snapshot";
@@ -15,6 +15,23 @@ import {
 	type SnapshotConnection,
 	type SnapshotRequest,
 } from "../memory-snapshot-worker";
+
+import { installMemoryWorker } from "./memory-worker.fixture";
+
+afterEach(() => mock.restore());
+function createSnapshotExporter(
+	deps: Parameters<typeof createRealSnapshotExporter>[0] & {
+		spawn: (specifier: string) => FakeWorker;
+	},
+) {
+	const { spawn, ...options } = deps;
+	installMemoryWorker(spawn);
+	return createRealSnapshotExporter(options);
+}
+async function until(predicate: () => boolean) {
+	for (let i = 0; i < 100 && !predicate(); i++) await Bun.sleep(1);
+	expect(predicate()).toBe(true);
+}
 
 const request = (savePath: string): SnapshotRequest => ({
 	wsEndpoint: "ws://private-token-canary",
@@ -63,10 +80,15 @@ class FakeWorker extends EventEmitter {
 	terminated = false;
 	postMessage(value: unknown) {
 		this.messages.push(value);
-		if ((value as { kind: string }).kind === "cancel") queueMicrotask(() => this.emit("exit", 0));
+		if ((value as { kind: string }).kind === "cancel")
+			queueMicrotask(() => {
+				this.terminated = true;
+				this.emit("exit", 0);
+			});
 	}
 	async terminate() {
 		this.terminated = true;
+		this.emit("exit", 0);
 		return 0;
 	}
 }
@@ -294,7 +316,7 @@ describe("snapshot supervisor", () => {
 			maxBytes: 500 * 1024 * 1024,
 			signal: new AbortController().signal,
 		});
-		await Promise.resolve();
+		await until(() => worker.messages.length > 0);
 		expect((worker.messages[0] as { opts: { maxBytes: number } }).opts.maxBytes).toBe(
 			256 * 1024 * 1024,
 		);
@@ -332,13 +354,13 @@ describe("snapshot supervisor", () => {
 		const opts = { ...request("unused"), signal: new AbortController().signal };
 		const first = exporter(opts);
 		await expect(exporter(opts)).rejects.toThrow("(busy)");
-		await Promise.resolve();
+		await until(() => workers[0]?.messages.length > 0);
 		workers[0].emit("message", { kind: "done", fileSize: 9 });
 		expect(await first).toEqual({ fileSize: 9 });
 		expect(workers[0].messages).toHaveLength(2);
 		expect(workers[0].terminated).toBe(true);
 		const next = exporter(opts);
-		await Promise.resolve();
+		await until(() => workers[1]?.messages.length > 0);
 		workers[1].emit("message", { kind: "done", fileSize: 5 });
 		expect(await next).toEqual({ fileSize: 5 });
 	});
@@ -359,7 +381,7 @@ describe("snapshot supervisor", () => {
 				},
 			});
 			const running = exporter({ ...request("orphan"), timeoutMs: 30, signal: controller.signal });
-			await Promise.resolve();
+			await until(() => worker.messages.length > 0);
 			if (mode === "abort") controller.abort();
 			if (mode === "exit") worker.emit("exit", 1);
 			if (mode === "failed")

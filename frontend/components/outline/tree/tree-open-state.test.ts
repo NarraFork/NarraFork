@@ -120,3 +120,16 @@ describe("the connected outline's open nodes", () => {
 		expect(a.filter((key) => state.isLive(key))).toHaveLength(TREE_OPEN_LIMITS.livePages);
 	});
 });
+
+test("several nodes open or close at once, in the order given", () => {
+	const state = new TreeOpenState(null, ["space:a"]);
+	let heard = 0;
+	state.subscribe(() => heard++);
+	state.setMany(["space:b", "group:loose", "page:p"], true);
+	expect(state.snapshot()).toEqual(["space:a", "space:b", "group:loose", "page:p"]);
+	expect(heard).toBe(1);
+	state.setMany(["space:a", "page:p", "space:zz"], false);
+	expect(state.snapshot()).toEqual(["space:b", "group:loose"]);
+	state.setMany([], true);
+	expect(heard).toBe(2);
+});

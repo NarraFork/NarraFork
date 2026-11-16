@@ -18,11 +18,14 @@
 
 插件不读写宿主的 storage / secret / config，也不注册 UI。它是一次调用的纯函数进程。
 
-## 工具契约
+## 命令契约
 
-宿主通过 `tools.invoke`（`contributionId: "query-balance"`，`invocation.kind = "plugin_background"`，
-`source = "internal"`）调用；工具在 manifest 中声明 `allowBackground: true`，
-插件声明 `permissions.host: ["provider.use"]`（工具调用所需的默认授权能力）。
+宿主通过共享命令注册表转发 `commands.invoke`（`contributionId: "query-balance"`），
+由 `onCommand:query-balance` 按需激活。插件只贡献 `handler: "server"` 的命令，
+不贡献 Agent 工具，也不会把额度查询参数放进模型的工具声明。
+
+宿主适配器仍使用 `plugin_background` / `source: "internal"` 身份检查 `provider.use` 授权，
+通过后才把本次调用的凭据交给命令；显式撤销授权和停用插件仍然生效。
 
 ### 输入
 
@@ -40,7 +43,7 @@
 }
 ```
 
-### 输出（`output` 为 JSON 字符串）
+### 输出（`output` 为 JSON 对象）
 
 ```jsonc
 { "status": "ok", "adapter": "sub2api", "root": "https://relay.example.com",
@@ -94,8 +97,8 @@
   `safeParseManifest`、entry 存在性、兼容性、symlink 与路径逃逸检查）。
 - **运行时生命周期**：进程由 `PluginRuntimeSupervisor` 启动、回收与重启，本插件不自行
   `new PluginRuntime`。
-- **调用通道**：宿主经 `pluginToolRegistry.invoke(..., { invocation: { kind: "plugin_background",
-  source: "internal" } })` 调用，`allowBackground` 与能力校验照常生效。
+- **调用通道**：宿主以后台身份完成能力校验后经 `pluginCommandRegistry.invoke` 调用，
+  使用既有 `commands.invoke` RPC，不进入 Agent 工具目录。
 - **健康检查**：调用结果进入 `pluginHealthRegistry`，与外部插件同一份指标
   （`requests` / `successes` / `failures` / `lastSuccessAt` / `lastFailureAt`）。
 - **启用/停用语义**：与外部插件同一张状态表、同一组接口。

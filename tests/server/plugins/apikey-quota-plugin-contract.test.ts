@@ -89,16 +89,17 @@ const newApiStatus = {
 };
 
 describe("apikey-quota plugin manifest", () => {
-	test("parses and declares the quota tool with the host-directory contract", async () => {
+	test("declares quota as a host-internal command, not an Agent tool", async () => {
 		const raw = JSON.parse(await readFile(join(pluginRoot, "manifest.json"), "utf8"));
 		const manifest = parseManifest(raw);
 
 		expect(manifest.pluginId).toBe("com.narrafork.apikey-quota");
 		expect(manifest.server?.entry).toBe("server/index.js");
-		expect(manifest.contributes.tools.map((tool) => tool.id)).toEqual(["query-balance"]);
-		// The host calls this tool from a background context, so the flag is required.
-		expect(manifest.contributes.tools[0]?.allowBackground).toBe(true);
-		// `provider.use` is the registry's default authorization capability for tools.
+		expect(manifest.contributes.tools).toEqual([]);
+		expect(manifest.contributes.commands.map((command) => command.id)).toEqual(["query-balance"]);
+		expect(manifest.contributes.commands[0]?.handler).toBe("server");
+		expect(manifest.activationEvents).toEqual(["onCommand:query-balance"]);
+		// The host adapter retains authorization before sending credentials to the command.
 		expect(manifest.permissions.host).toContain("provider.use");
 	});
 

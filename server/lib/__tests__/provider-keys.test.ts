@@ -12,6 +12,7 @@ import {
 	COMMAND_CODE_KEY_OWNER,
 	hydrateProviderKeys,
 	nugKeyOwner,
+	nugOAuthKeyOwner,
 	platformInstanceKeyOwner,
 	pruneProviderKeys,
 	quotaKeyOwner,
@@ -112,6 +113,60 @@ describe("provider key store", () => {
 });
 
 describe("settings projection", () => {
+	test("NUG OAuth secrets migrate, clone-save, reload and follow encryption without joining API keys", () => {
+		const saved = structuredClone(settings);
+		const id = "nugOAuth";
+		const owner = nugOAuthKeyOwner(id);
+		const store = getProviderKeyStore();
+		const settingsPath = getNarraforkPath("settings.json");
+		const keyPath = getNarraforkPath("provider-keys.json");
+		try {
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					...settings,
+					nugProviders: [{ ...nug(id, "nug-api"), oauthClientSecret: "oauth-legacy" }],
+				}),
+			);
+			expect(reloadSettings().nugProviders?.[0]?.oauthClientSecret).toBe("oauth-legacy");
+			expect(readFileSync(settingsPath, "utf8")).not.toContain("oauth-legacy");
+			expect(store.list(owner).map((key) => key.apiKey)).toEqual(["oauth-legacy"]);
+			expect(store.list(nugKeyOwner(id)).map((key) => key.apiKey)).toEqual(["nug-api"]);
+			for (const encrypt of [true, false, true]) {
+				const next = structuredClone(settings);
+				next.secrets = { encrypt };
+				saveSettings(next);
+				expect(readFileSync(keyPath, "utf8").includes("oauth-legacy")).toBe(!encrypt);
+				expect(new ProviderKeyStore(keyPath).firstKey(owner)).toBe("oauth-legacy");
+				expect(reloadSettings().nugProviders?.[0]?.oauthClientSecret).toBe("oauth-legacy");
+			}
+			for (const cleared of ["", undefined]) {
+				saveSettings({
+					...settings,
+					nugProviders: [{ ...nug(id, "nug-api"), oauthClientSecret: "oauth-rotated" }],
+				});
+				saveSettings({
+					...settings,
+					nugProviders: [{ ...nug(id, "nug-api"), oauthClientSecret: cleared }],
+				});
+				expect(reloadSettings().nugProviders?.[0]).not.toHaveProperty("oauthClientSecret");
+				expect(store.list(owner)).toEqual([]);
+			}
+			saveSettings({
+				...settings,
+				nugProviders: [{ ...nug(id, "nug-api"), oauthClientSecret: "oauth-deleted" }],
+			});
+			saveSettings({ ...settings, nugProviders: [] });
+			expect(store.list(owner)).toEqual([]);
+			saveSettings({ ...settings, nugProviders: [nug(id, "nug-api")] });
+			expect(reloadSettings().nugProviders?.[0]).not.toHaveProperty("oauthClientSecret");
+		} finally {
+			saveSettings(saved);
+			store.removeProvider(owner);
+			store.removeProvider(nugKeyOwner(id));
+		}
+	});
+
 	test("settings.json keeps no key; memory shows the first key and follows the store", () => {
 		const saved = structuredClone(settings.customApiProviders);
 		try {
@@ -293,6 +348,7 @@ describe("settings projection", () => {
 			customApiProviders: [
 				{ ...provider("quotaBlocked", "sk-blocked"), quotaAccessToken: "site-blocked" },
 			],
+			nugProviders: [{ ...nug("nugBlocked", "nug-blocked"), oauthClientSecret: "oauth-blocked" }],
 		} as NarraForkSettings;
 		try {
 			expect(absorbProviderKeys(loaded)).toBe(false);
@@ -302,6 +358,7 @@ describe("settings projection", () => {
 			expect(withoutProviderKeys(loaded)).toBe(loaded);
 			expect(loaded.customApiProviders?.[0]?.quotaAccessToken).toBe("site-blocked");
 			expect(loaded.customApiProviders?.[0]?.apiKey).toBe("sk-blocked");
+			expect(loaded.nugProviders?.[0]?.oauthClientSecret).toBe("oauth-blocked");
 			expect(readFileSync(path, "utf8")).toBe(foreign);
 		} finally {
 			projectionStore.mockRestore();

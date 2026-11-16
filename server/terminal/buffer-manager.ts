@@ -67,9 +67,53 @@ export interface BufferReadCursor {
 	readonly offset: number;
 	readonly textBefore: string;
 	readonly sequence: number;
-	/** Horizontal reflow changes a physical-row prefix, so it expires this point. */
+	/** Current layout; resize retains old frames and replaces the live markers. */
 	readonly columns: number;
 	readonly layoutRevision: number;
+}
+
+export const MAX_BUFFER_READ_CURSORS = 256;
+export const MAX_CURSOR_PENDING_FRAMES = 32;
+export const MAX_LAYOUT_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+export const MAX_LAYOUT_SCAN_CELLS = 4_000_000;
+export const MAX_LAYOUT_VIEW_CHARACTERS = 256 * 1024;
+
+export type BufferReadFrame =
+	| {
+			kind: "snapshot";
+			text: string;
+			markerLost: boolean;
+			observedPrefixEnd?: number;
+			prefixUnknown?: boolean;
+	  }
+	| { kind: "baseline"; text: string }
+	| { kind: "error"; message: string };
+
+interface LayoutView {
+	text: string;
+	starts: number[];
+	ends: number[];
+	bytes: number;
+	refs: number;
+}
+interface PendingFrame {
+	view: LayoutView;
+	start: number;
+	kind: "snapshot" | "baseline";
+	markerLost: boolean;
+	observedPrefixEnd?: number;
+	prefixUnknown?: boolean;
+}
+interface ReadCursorState {
+	marker: IMarker;
+	/** Clones must preserve a naturally lost start despite owning a fresh marker. */
+	markerLost?: boolean;
+	observedEndMarker?: IMarker;
+	prefixUnknown: boolean;
+	columns: number;
+	layoutRevision: number;
+	pending: PendingFrame[];
+	error?: string;
 }
 
 export type BufferReadObserver = (cursor: BufferReadCursor | undefined, sequence: number) => void;
@@ -150,7 +194,10 @@ export class BufferManager {
 	private writeChain: Promise<void> = Promise.resolve();
 	private readSequence = 0;
 	private layoutSequence = 0;
-	private readonly ownedReadCursors = new WeakSet<BufferReadCursor>();
+	private readonly ownedReadCursors = new Map<BufferReadCursor, ReadCursorState>();
+	private layoutSnapshotBytes = 0;
+	/** At most one bounded live view; shared by reads until parser/layout mutation. */
+	private currentReadView: LayoutView | undefined;
 
 	/** Buffered data waiting to be written to xterm in the next drain cycle. */
 	private pendingWrites: string[] = [];
@@ -222,6 +269,7 @@ export class BufferManager {
 	}
 
 	append(data: string): void {
+		this.setCurrentReadView(undefined);
 		this.trackMouseMode(data);
 		this.pendingWrites.push(data);
 		this.dirty = true;
@@ -240,6 +288,7 @@ export class BufferManager {
 				const batch = this.pendingWrites.join("");
 				this.pendingWrites.length = 0;
 				await new Promise<void>((resolve) => this.xterm.write(batch, resolve));
+				this.setCurrentReadView(undefined);
 			}
 			this.draining = false;
 		});
@@ -275,7 +324,12 @@ export class BufferManager {
 	}
 
 	private captureReadCursor(sequence: number): BufferReadCursor | undefined {
-		if (this.disposed || this.xterm.buffer.active.type !== "normal") return undefined;
+		if (
+			this.disposed ||
+			this.xterm.buffer.active.type !== "normal" ||
+			this.ownedReadCursors.size >= MAX_BUFFER_READ_CURSORS
+		)
+			return undefined;
 		const marker = this.xterm.registerMarker(0);
 		if (!marker) return undefined;
 		const normal = this.xterm.buffer.normal;
@@ -290,24 +344,19 @@ export class BufferManager {
 			return undefined;
 		}
 		const textBefore = joinBufferLines(normal, marker.line);
-		const owners = this.ownedReadCursors;
-		const cursor: BufferReadCursor = {
-			marker,
-			observedEndMarker,
-			prefixUnknown: false,
-			offset: textBefore.length,
-			textBefore,
-			sequence,
-			columns: this.xterm.cols,
-			layoutRevision: this.layoutSequence,
-			dispose() {
-				owners.delete(cursor);
-				marker.dispose();
-				if (observedEndMarker !== marker) observedEndMarker.dispose();
+		return this.createReadCursor(
+			{
+				marker,
+				observedEndMarker,
+				prefixUnknown: false,
+				columns: this.xterm.cols,
+				layoutRevision: this.layoutSequence,
+				pending: [],
 			},
-		};
-		this.ownedReadCursors.add(cursor);
-		return cursor;
+			textBefore,
+			textBefore.length,
+			sequence,
+		);
 	}
 
 	/** A fresh future-only point, captured with its baseline in one synchronous step. */
@@ -322,12 +371,13 @@ export class BufferManager {
 			this.disposed ||
 			this.xterm.buffer.active.type !== "normal" ||
 			!this.ownedReadCursors.has(source) ||
-			source.columns !== this.xterm.cols ||
-			source.layoutRevision !== this.layoutSequence
+			this.ownedReadCursors.size >= MAX_BUFFER_READ_CURSORS
 		)
 			return undefined;
+		const original = this.ownedReadCursors.get(source);
+		if (!original) return undefined;
 		const normal = this.xterm.buffer.normal;
-		const lost = source.marker.isDisposed || source.marker.line < 0;
+		const lost = original.markerLost || source.marker.isDisposed || source.marker.line < 0;
 		const line = lost ? 0 : source.marker.line;
 		const marker = this.xterm.registerMarker(line - (normal.baseY + normal.cursorY));
 		if (!marker) return undefined;
@@ -342,25 +392,193 @@ export class BufferManager {
 			marker.dispose();
 			return undefined;
 		}
-		const allNew = lost && endLost;
-		const owners = this.ownedReadCursors;
+		const pending = original.pending.slice();
+		for (const frame of pending) this.retainView(frame.view);
+		return this.createReadCursor(
+			{
+				marker,
+				markerLost: lost,
+				observedEndMarker,
+				prefixUnknown: !(lost && endLost) && (source.prefixUnknown || lost),
+				columns: source.columns,
+				layoutRevision: source.layoutRevision,
+				pending,
+				error: original.error,
+			},
+			source.textBefore,
+			source.offset,
+			source.sequence,
+		);
+	}
+
+	private createReadCursor(
+		state: ReadCursorState,
+		textBefore: string,
+		offset: number,
+		sequence: number,
+	): BufferReadCursor {
 		const cursor: BufferReadCursor = {
-			marker,
-			observedEndMarker,
-			prefixUnknown: !allNew && (source.prefixUnknown || lost),
-			offset: allNew ? 0 : source.offset,
-			textBefore: allNew ? "" : source.textBefore,
-			sequence: source.sequence,
-			columns: source.columns,
-			layoutRevision: source.layoutRevision,
-			dispose() {
-				owners.delete(cursor);
-				marker.dispose();
-				if (observedEndMarker !== marker) observedEndMarker?.dispose();
+			get marker() {
+				return state.marker;
+			},
+			get observedEndMarker() {
+				return state.observedEndMarker;
+			},
+			get prefixUnknown() {
+				return state.prefixUnknown;
+			},
+			get columns() {
+				return state.columns;
+			},
+			get layoutRevision() {
+				return state.layoutRevision;
+			},
+			textBefore,
+			offset,
+			sequence,
+			dispose: () => {
+				if (!this.ownedReadCursors.delete(cursor)) return;
+				this.disposeStateMarkers(state);
+				for (const frame of state.pending) this.releaseView(frame.view);
+				state.pending.length = 0;
+				if (this.ownedReadCursors.size === 0) this.setCurrentReadView(undefined);
 			},
 		};
-		this.ownedReadCursors.add(cursor);
+		this.ownedReadCursors.set(cursor, state);
 		return cursor;
+	}
+
+	private disposeStateMarkers(state: ReadCursorState): void {
+		state.marker.dispose();
+		if (state.observedEndMarker !== state.marker) state.observedEndMarker?.dispose();
+	}
+
+	private setCurrentReadView(view: LayoutView | undefined): void {
+		if (this.currentReadView === view) return;
+		if (this.currentReadView) this.releaseView(this.currentReadView);
+		this.currentReadView = view;
+		if (view) this.retainView(view);
+	}
+
+	private retainView(view: LayoutView): void {
+		if (view.refs++ === 0) this.layoutSnapshotBytes += view.bytes;
+	}
+
+	private releaseView(view: LayoutView): void {
+		if (--view.refs === 0) this.layoutSnapshotBytes -= view.bytes;
+	}
+
+	/** One bounded scan per layout, shared by every cursor and clone. */
+	private captureLayout(budget: { cells: number }): LayoutView {
+		const normal = this.xterm.buffer.normal;
+		const cells = normal.length * this.xterm.cols;
+		if (cells > budget.cells) throw new Error("Terminal cursor layout scan budget exceeded");
+		budget.cells -= cells;
+		const starts: number[] = [];
+		const ends: number[] = [];
+		const pieces: string[] = [];
+		let length = 0;
+		for (let y = 0; y < normal.length; y++) {
+			starts.push(length);
+			const continues = normal.getLine(y + 1)?.isWrapped ?? false;
+			const row = normal.getLine(y)?.translateToString(!continues) ?? "";
+			length += row.length;
+			ends.push(length);
+			pieces.push(row);
+			if (!continues && y + 1 < normal.length) {
+				pieces.push("\n");
+				length++;
+			}
+			if (length > MAX_LAYOUT_VIEW_CHARACTERS)
+				throw new Error("Terminal cursor layout view character budget exceeded");
+		}
+		const text = pieces.join("").replace(/\n+$/, "");
+		// Account for UTF-16 plus row offset storage, conservatively.
+		return { text, starts, ends, refs: 0, bytes: length * 2 + starts.length * 16 };
+	}
+
+	private snapshotFrame(state: ReadCursorState, view: LayoutView): PendingFrame {
+		const lost = state.markerLost || state.marker.isDisposed || state.marker.line < 0;
+		const row = lost ? 0 : state.marker.line;
+		const start = Math.min(view.text.length, view.starts[row] ?? view.text.length);
+		const end = state.observedEndMarker;
+		const endLost = !end || end.isDisposed || end.line < 0;
+		return {
+			kind: "snapshot",
+			view,
+			start,
+			markerLost: lost,
+			prefixUnknown: state.prefixUnknown,
+			observedPrefixEnd:
+				!endLost && end.line >= row
+					? Math.max(0, (view.ends[end.line] ?? start) - start)
+					: lost && endLost
+						? 0
+						: undefined,
+		};
+	}
+
+	private enqueueFrame(state: ReadCursorState, frame: PendingFrame): void {
+		if (state.error) return;
+		if (state.pending.length >= MAX_CURSOR_PENDING_FRAMES) {
+			state.error = "Terminal cursor pending frame budget exceeded";
+			return;
+		}
+		if (
+			frame.view.refs === 0 &&
+			this.layoutSnapshotBytes + frame.view.bytes > MAX_LAYOUT_SNAPSHOT_BYTES
+		) {
+			state.error = "Terminal cursor shared layout byte budget exceeded";
+			return;
+		}
+		this.retainView(frame.view);
+		state.pending.push(frame);
+	}
+
+	private materializeFrame(frame: PendingFrame): BufferReadFrame {
+		const text = () => frame.view.text.slice(frame.start);
+		if (frame.kind === "baseline")
+			return {
+				kind: "baseline",
+				get text() {
+					return text();
+				},
+			};
+		return {
+			kind: "snapshot",
+			get text() {
+				return text();
+			},
+			markerLost: frame.markerLost,
+			observedPrefixEnd: frame.observedPrefixEnd,
+			prefixUnknown: frame.prefixUnknown,
+		};
+	}
+
+	/** Consume retained layout checkpoints before inspecting the current parsed layout. */
+	async readCursor(cursor: BufferReadCursor): Promise<BufferReadFrame[]> {
+		await this.writeChain;
+		const state = this.ownedReadCursors.get(cursor);
+		if (!state) return [{ kind: "error", message: "Terminal cursor is not owned by this buffer" }];
+		const frames = state.pending.splice(0).map((frame) => {
+			const result = this.materializeFrame(frame);
+			this.releaseView(frame.view);
+			return result;
+		});
+		if (!state.error) {
+			try {
+				const view = this.currentReadView ?? this.captureLayout({ cells: MAX_LAYOUT_SCAN_CELLS });
+				if (view.refs === 0 && this.layoutSnapshotBytes + view.bytes > MAX_LAYOUT_SNAPSHOT_BYTES) {
+					throw new Error("Terminal cursor shared layout byte budget exceeded");
+				}
+				this.setCurrentReadView(view);
+				frames.push(this.materializeFrame(this.snapshotFrame(state, view)));
+			} catch (error) {
+				state.error = String(error);
+			}
+		}
+		if (state.error) frames.push({ kind: "error", message: state.error });
+		return frames;
 	}
 
 	/**
@@ -436,12 +654,64 @@ export class BufferManager {
 	/** Resize the internal headless terminal after pending writes complete */
 	async resize(cols: number, rows: number): Promise<void> {
 		await this.writeChain;
-		if (cols !== this.xterm.cols) this.layoutSequence++;
+		if (this.disposed || (cols === this.xterm.cols && rows === this.xterm.rows)) return;
+		this.setCurrentReadView(undefined);
+		const states = [...this.ownedReadCursors.values()].filter((state) => !state.error);
+		const budget = { cells: MAX_LAYOUT_SCAN_CELLS };
+		if (states.length) {
+			try {
+				const view = this.captureLayout(budget);
+				for (const state of states) this.enqueueFrame(state, this.snapshotFrame(state, view));
+			} catch (error) {
+				for (const state of states) state.error = String(error);
+			}
+		}
+		this.layoutSequence++;
 		this.xterm.resize(cols, rows);
+		if (!states.some((state) => !state.error)) return;
+		try {
+			const view = this.captureLayout(budget);
+			const normal = this.xterm.buffer.normal;
+			const cursorRow = normal.baseY + normal.cursorY;
+			// A match may begin on any earlier logical line (for example RE\nADY).
+			// Reflow cannot reliably map the old frontier, so rebaseline the entire
+			// retained normal buffer; baseline match counts exclude all old history.
+			const startRow = 0;
+			let endRow = normal.length - 1;
+			while (endRow > startRow && (view.starts[endRow] ?? 0) >= view.text.length) endRow--;
+			for (const state of states) {
+				if (state.error) continue;
+				// Old markers were frozen before reflow; never interpret their disposal as new output.
+				this.disposeStateMarkers(state);
+				const marker = this.xterm.registerMarker(startRow - cursorRow);
+				const end = endRow === startRow ? marker : this.xterm.registerMarker(endRow - cursorRow);
+				if (!marker || !end) {
+					marker?.dispose();
+					end?.dispose();
+					state.error = "Terminal cursor could not register layout markers";
+					continue;
+				}
+				state.marker = marker;
+				state.markerLost = false;
+				state.observedEndMarker = end;
+				state.prefixUnknown = false;
+				state.columns = this.xterm.cols;
+				state.layoutRevision = this.layoutSequence;
+				this.enqueueFrame(state, {
+					kind: "baseline",
+					view,
+					start: Math.min(view.text.length, view.starts[startRow] ?? 0),
+					markerLost: false,
+				});
+			}
+		} catch (error) {
+			for (const state of states) if (!state.error) state.error = String(error);
+		}
 	}
 
 	clear(): void {
 		this.writeChain = this.writeChain.then(() => {
+			this.setCurrentReadView(undefined);
 			this.xterm.reset();
 		});
 		this.mouseMode = { x10: false, buttonEvent: false, anyEvent: false, sgr: false };
@@ -492,6 +762,7 @@ export class BufferManager {
 	 * bytes into the shell's input, so the parser speaks only for live output.
 	 */
 	private replay(content: string): Promise<void> {
+		this.setCurrentReadView(undefined);
 		this.replaying = true;
 		return new Promise<void>((resolve) => {
 			try {
@@ -591,6 +862,7 @@ export class BufferManager {
 			await this.saveToDisk();
 		}
 		this.disposed = true;
+		for (const cursor of this.ownedReadCursors.keys()) cursor.dispose();
 		this.xterm.dispose();
 	}
 

@@ -25,7 +25,7 @@ import type {
 	OutlineBoardNotStarted,
 	OutlineBoardTransferSession,
 } from "@shared/outline-task-board";
-import { narratorUsersWith, type OutlinePrincipal } from "./access";
+import { canWriteSpace, narratorUsersWith, type OutlinePrincipal } from "./access";
 import { readNarrator, readProjectTransferSessions } from "./access-reads";
 import { canOwnerWorkIn, canSessionWorkIn } from "./assignee";
 import {
@@ -79,6 +79,13 @@ export async function listTransferSessions(
 ): Promise<{ sessions: OutlineBoardTransferSession[]; truncated: boolean }> {
 	const projectId = await transferProjectOf(space);
 	if (!projectId) return { sessions: [], truncated: false };
+	// A task of a session space goes in place to a session that can work in that space; to any
+	// other only as a copy in the project's space (a hand-out, outline P2 PR 10c-3, owner decision
+	// 2026-11-13), which only the session's owner makes, and only when they may write the project.
+	const handOutSpace =
+		space.kind === "session" && (await mayHandOutFrom(principal, space, projectId))
+			? await projectSpaceOrPending(projectId)
+			: null;
 	const { sessions: limit, scanned, page } = OUTLINE_TRANSFER_LIMITS;
 	const sessions: OutlineBoardTransferSession[] = [];
 	let truncated = false;
@@ -89,7 +96,10 @@ export async function listTransferSessions(
 	const couldWork = (owner: string | null): Promise<boolean> => {
 		let verdict = owners.get(owner);
 		if (!verdict) {
-			verdict = canOwnerWorkIn(owner, space);
+			verdict = canOwnerWorkIn(owner, space).then(
+				async (here) =>
+					here || (handOutSpace !== null && (await canOwnerWorkIn(owner, handOutSpace))),
+			);
 			owners.set(owner, verdict);
 		}
 		return verdict;
@@ -118,6 +128,41 @@ export async function listTransferSessions(
 		if (offset + page >= scanned) truncated = true;
 	}
 	return { sessions, truncated };
+}
+
+/** Whether `principal` owns session space `space`'s session and may write project `projectId`. */
+async function mayHandOutFrom(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+	projectId: string,
+): Promise<boolean> {
+	if (!space.narratorId) return false;
+	const narrator = await readNarrator(space.narratorId);
+	if (!narrator || narrator.ownerUserId !== principal.userId) return false;
+	return await canWriteSpace(principal, await projectSpaceOrPending(projectId));
+}
+
+/**
+ * The project's space, or what it will be when a hand-out creates it (its id starts with
+ * `pending:`): access to a space depends only on its kind and owner.
+ */
+export async function projectSpaceOrPending(
+	projectId: string,
+	store: OutlineStore = outlineStore,
+): Promise<OutlineSpaceRow> {
+	return (
+		(await store.findSpace({ kind: "project", projectId })) ?? {
+			id: `pending:project:${projectId}`,
+			key: "",
+			kind: "project",
+			projectId,
+			narratorId: null,
+			ownerUserId: null,
+			nextSeq: 1,
+			createdAt: "",
+			inProcessEpoch: 0,
+		}
+	);
 }
 
 /** Whether the person may write the session: a turn started on it runs on their behalf. */

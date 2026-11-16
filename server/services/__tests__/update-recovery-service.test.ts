@@ -1441,7 +1441,8 @@ describe("planned update continuation scheduling", () => {
 		expect(updatedToolResults).toHaveLength(1);
 		expect(updatedToolResults[0]?.args[1] as Record<string, unknown>).toMatchObject({
 			output:
-				'<background_task_id>background-worker</background_task_id>\n\nBackground task started. Await({ type: "agent", id: "background-worker" })',
+				"<background_task_id>background-worker</background_task_id>\n\n[background\\-worker](nf-agent://open?id=child-background)\n\n" +
+				'Background task started. Await({ type: "agent", id: "background-worker" })',
 			status: "success",
 		});
 		expect(
@@ -2764,14 +2765,22 @@ describe("planned update continuation scheduling", () => {
 			leaseMs: 100,
 			intervalMs: 10,
 		});
-		await new Promise((resolve) => setTimeout(resolve, 35));
-		expect(renewCalls).toBeGreaterThanOrEqual(2);
-		expect(abortController.signal.aborted).toBe(false);
+		try {
+			// Scheduling can be delayed by other workers; observe renewal, not wall-clock precision.
+			const deadline = Date.now() + 1_000;
+			while (renewCalls < 2 && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+			expect(renewCalls).toBeGreaterThanOrEqual(2);
+			expect(abortController.signal.aborted).toBe(false);
 
-		renewal.stop();
-		const callsAfterStop = renewCalls;
-		await new Promise((resolve) => setTimeout(resolve, 25));
-		expect(renewCalls).toBe(callsAfterStop);
+			renewal.stop();
+			const callsAfterStop = renewCalls;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			expect(renewCalls).toBe(callsAfterStop);
+		} finally {
+			renewal.stop();
+		}
 	});
 
 	test("aborts an in-flight recovery when claim renewal loses CAS ownership", async () => {

@@ -58,6 +58,8 @@ export interface OutlineAgentContext {
 	userId: string | null;
 	/** Writes are limited to the session's own space (read-only or strict plan mode). */
 	sessionSpaceOnly?: boolean;
+	/** The turn is a strict plan-mode turn (a draft: assignees in it stay labels, P2 PR 10c-3). */
+	planMode?: boolean;
 }
 
 /** Words standing for the session's own spaces. */

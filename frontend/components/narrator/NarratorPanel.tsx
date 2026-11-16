@@ -185,9 +185,11 @@ import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions"
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
 import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
+import { useSubagentSessionOpener } from "./interaction/use-subagent-session-opener";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
+import { AgentReferenceOpenerContext } from "./markdown/AgentReferenceLink";
 import { inputBlockIdOf } from "./message/block-target";
 import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
@@ -417,6 +419,7 @@ function NarratorPanelBody({
 	const {
 		visibleWithDefault: allModels,
 		groupedModels,
+		modelOptionsFilter,
 		defaultModelValue,
 		summaryModelValue,
 		settingsData,
@@ -2172,22 +2175,7 @@ function NarratorPanelBody({
 
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
-	const handleVlistViewSubagentSession = useCallback(
-		(subagentNarratorId: string, messageId?: string) => {
-			if (onViewSubagentSession) {
-				onViewSubagentSession(subagentNarratorId, messageId);
-				return;
-			}
-			// Standalone fallback: the narrator page reads `?scrollTo=` as its
-			// highlight target, which is the same jump the dock performs in-place.
-			navigate({
-				to: "/narrators/$narratorId",
-				params: { narratorId: subagentNarratorId },
-				search: messageId ? { scrollTo: messageId } : undefined,
-			});
-		},
-		[onViewSubagentSession, navigate],
-	);
+	const handleVlistViewSubagentSession = useSubagentSessionOpener(onViewSubagentSession);
 
 	/**
 	 * Open the Dynamic Spec panel with one file selected.
@@ -4078,6 +4066,7 @@ function NarratorPanelBody({
 				opened={globalModelEditTarget != null}
 				mode={globalModelEditTarget}
 				groupedModels={groupedModels}
+				modelOptionsFilter={modelOptionsFilter}
 				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
 				saving={updateSettingsMutation.isPending}
 				onClose={closeGlobalModelModal}
@@ -4087,5 +4076,9 @@ function NarratorPanelBody({
 			/>
 		</PermEnterHintCtx.Provider>
 	);
-	return <OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>;
+	return (
+		<AgentReferenceOpenerContext.Provider value={handleVlistViewSubagentSession}>
+			<OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>
+		</AgentReferenceOpenerContext.Provider>
+	);
 }

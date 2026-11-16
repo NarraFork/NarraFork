@@ -72,6 +72,7 @@ const probeSource = `
 import {
 	RevertTransactionError,
 	runRevertManifestWorker,
+	closeRevertManifestWorkers,
 	revertManifestWorkerSpecifiers,
 } from "../services/revert-transaction-worker";
 import { isCompiledRuntime } from "../lib/runtime-target";
@@ -108,6 +109,7 @@ console.log(JSON.stringify({
 	equal: await compare({ selection: ["fixed"] }),
 	stale: await compare({ selection: ["/private/selection-canary"] }),
 }));
+await closeRevertManifestWorkers();
 `;
 
 interface ProbeResult {
@@ -149,7 +151,10 @@ describe("revert manifest worker in a real compiled executable", () => {
 		expect(args.slice(2, args.indexOf("--compile"))).toContain(manifestEntry);
 	});
 
-	test("minified binaries compare outside the source cwd and fail safely if the worker is omitted", async () => {
+	test.each([
+		"production",
+		"manifest-only",
+	] as const)("%s minified binaries compare outside the source cwd and fail safely if the worker is omitted", async (scope) => {
 		// tests/preload.ts owns this isolation; all children inherit it unchanged.
 		expect(process.env.NARRAFORK_TEST).toBe("1");
 		const isolatedHome = process.env.NARRAFORK_HOME;
@@ -171,27 +176,45 @@ describe("revert manifest worker in a real compiled executable", () => {
 			const suffix = process.platform === "win32" ? ".exe" : "";
 			const complete = join(artifacts, `with-worker${suffix}`);
 			const missing = join(artifacts, `without-worker${suffix}`);
+			const buildFailures: Error[] = [];
 			for (const [binary, includeManifest] of [
 				[complete, true],
 				[missing, false],
 			] as const) {
-				await execFileAsync(
-					process.execPath,
-					[
-						"build",
-						probe,
-						...entries.filter(
-							(entry) => entry !== mainEntry && (includeManifest || entry !== manifestEntry),
+				try {
+					await execFileAsync(
+						process.execPath,
+						[
+							"build",
+							probe,
+							...(scope === "production"
+								? entries.filter(
+										(entry) => entry !== mainEntry && (includeManifest || entry !== manifestEntry),
+									)
+								: includeManifest
+									? [manifestEntry]
+									: []),
+							"--root",
+							join(root, "server"),
+							...compiledBuildArguments(),
+							"--outfile",
+							binary,
+						],
+						{ cwd: root, env: { ...process.env }, timeout: 60_000, maxBuffer },
+					);
+				} catch (cause) {
+					// Always compile the omitted-entry control too: an unrelated entry may fail both.
+					const detail = (cause as { stderr?: string }).stderr ?? String(cause);
+					buildFailures.push(
+						new Error(
+							`${scope}/${includeManifest ? "with-manifest" : "without-manifest"} compile failed: ${detail.slice(0, 4096)}`,
+							{ cause },
 						),
-						"--root",
-						join(root, "server"),
-						...compiledBuildArguments(),
-						"--outfile",
-						binary,
-					],
-					{ cwd: root, env: { ...process.env }, timeout: 60_000, maxBuffer },
-				);
+					);
+				}
 			}
+			if (buildFailures.length)
+				throw new AggregateError(buildFailures, `${scope} probe compilation failed`);
 			// Neither executable can load the original probe; cwd has no source or node_modules.
 			await rm(sourceDir, { recursive: true, force: true });
 			expect(await readdir(cwd)).toEqual([]);

@@ -100,6 +100,30 @@ describe("request evidence linkage on the inserted row", () => {
 		expect(row?.recordingRequestId).toBeNull();
 		expect(row?.diagnosticsJson).toBeNull();
 	});
+
+	test("cache_usage_reported mirrors the adapter's flag and stays null when unknown", async () => {
+		const cases = [
+			{
+				usage: buildUsageDataFromSnapshot({ inputTokens: 5, cacheReported: true }),
+				expected: true,
+			},
+			{
+				usage: buildUsageDataFromSnapshot({ inputTokens: 5, cacheReported: false }),
+				expected: false,
+			},
+			{
+				usage: buildUsageDataFromSnapshot({ inputTokens: 5, cachedInputTokens: 2 }),
+				expected: null,
+			},
+			{ usage: null, expected: null },
+		];
+		for (const { usage, expected } of cases) {
+			const handle = startApiRequest({ provider: "openai", model: "gpt-5" });
+			await finishApiRequest(handle, { usage });
+			const row = db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get();
+			expect(row?.cacheUsageReported).toBe(expected);
+		}
+	});
 });
 
 describe("request occupancy snapshot persistence", () => {

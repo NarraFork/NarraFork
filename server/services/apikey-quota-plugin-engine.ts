@@ -1,11 +1,15 @@
 import {
+	APIKEY_QUOTA_COMMAND_ID,
 	APIKEY_QUOTA_PLUGIN_ID,
-	APIKEY_QUOTA_TOOL_ID,
-	type ApikeyQuotaToolOutput,
-	apikeyQuotaToolOutputSchema,
+	type ApikeyQuotaCommandInput,
+	type ApikeyQuotaCommandOutput,
+	apikeyQuotaCommandInputSchema,
+	apikeyQuotaCommandOutputSchema,
 } from "@shared/apikey-quota-plugin";
+import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { resolveProxyForUrl } from "../lib/net/proxy";
+import type { JsonValue } from "../lib/plugins/protocol";
 import { BalanceProbeRequestError } from "../lib/provider-balance-adapters";
 import {
 	builtinProviderBalanceEngine,
@@ -15,17 +19,19 @@ import {
 } from "../lib/provider-balance-engine";
 import type { CustomApiProviderConfig } from "../lib/settings";
 import { getHttpUserAgent, resolveHttpUserAgent } from "../lib/user-agent";
+import {
+	type PluginCommandInvokeContext,
+	PluginCommandRegistryError,
+} from "./plugin-command-registry";
 import { pluginPlatformServices } from "./plugin-platform-services";
 
 /**
  * Quota queries answered by the bundled `apikey-quota` plugin.
  *
  * This engine is deliberately thin: it does not own a process, a connection or a restart
- * policy. It calls the plugin through the *same* tool registry every other plugin tool goes
- * through (`pluginToolRegistry.invoke` with a `plugin_background` principal), so the process
- * lifecycle, capability check, byte limits, timeouts and health accounting are the shared
- * ones. What stays here is only what is specific to this feature: the decision table that maps
- * a plugin answer onto the provider-balance DTO.
+ * policy. Host-internal queries use the shared command registry, not Agent tools. The runtime
+ * still owns process lifecycle, timeouts and health accounting; this adapter retains the
+ * existing provider.use authorization before sending credentials to the command.
  *
  * Decision table:
  * - `ok` / `unsupported` -> authoritative; the bundled adapters do not run.
@@ -37,28 +43,29 @@ import { pluginPlatformServices } from "./plugin-platform-services";
  *   validation) -> bundled adapters, which is the pre-plugin behaviour. An enabled but broken
  *   plugin must not take the whole feature down with it.
  */
-const FULL_TOOL_ID = `${APIKEY_QUOTA_PLUGIN_ID}/${APIKEY_QUOTA_TOOL_ID}`;
+const FULL_COMMAND_ID = `${APIKEY_QUOTA_PLUGIN_ID}/${APIKEY_QUOTA_COMMAND_ID}`;
 const REQUEST_TIMEOUT_MS = 15_000;
 
 /**
  * Error codes that mean "an administrator disabled this plugin", not "the plugin broke".
  *
- * Activation is refused by the manager (`PLUGIN_NOT_ENABLED`); a tool call on a plugin whose
- * registration is already gone is refused by the registry (`PLUGIN_DISABLED`). Both are
+ * Activation is refused by the manager (`PLUGIN_NOT_ENABLED`); the command adapter also
+ * rejects a disabled lifecycle state (`PLUGIN_DISABLED`). Both are
  * configuration states, so both must surface instead of silently falling back.
  */
 const PLUGIN_DISABLED_CODES = new Set(["PLUGIN_NOT_ENABLED", "PLUGIN_DISABLED"]);
 
-/** The tool-registry slice this engine needs; tests inject a fake. */
-export interface QuotaToolInvoker {
+/** The command-registry slice this engine needs; tests inject a fake. */
+export interface QuotaCommandInvoker {
 	invoke(
-		fullId: string,
-		input: unknown,
-		options?: Record<string, unknown>,
-	): Promise<{ output?: unknown; isError?: unknown }>;
+		commandId: string,
+		pluginId: string,
+		input: JsonValue | undefined,
+		context: PluginCommandInvokeContext,
+	): Promise<{ output?: unknown }>;
 }
 
-/** The manager slice this engine needs: activation is what registers the tool. */
+/** The manager slice this engine needs: activation starts the command backend. */
 export interface QuotaPluginActivator {
 	activate(pluginId: string, options?: Record<string, unknown>): Promise<unknown>;
 	/**
@@ -70,7 +77,7 @@ export interface QuotaPluginActivator {
 }
 
 export interface ApikeyQuotaEngineOptions {
-	tools?: QuotaToolInvoker;
+	commands?: QuotaCommandInvoker;
 	activator?: QuotaPluginActivator;
 	fallback?: ProviderBalanceQueryEngine;
 	onDiagnostic?: (message: string, detail: Record<string, unknown>) => void;
@@ -89,7 +96,7 @@ export type ApikeyQuotaEngine = ProviderBalanceQueryEngine & {
  * distinction.
  */
 type PluginCall =
-	| { outcome: "answer"; answer: ApikeyQuotaToolOutput }
+	| { outcome: "answer"; answer: ApikeyQuotaCommandOutput }
 	| { outcome: "disabled" }
 	| { outcome: "unavailable" };
 
@@ -100,7 +107,7 @@ type PluginCall =
  * deterministic "not available right now", never a reason to answer the same question from
  * the in-process adapters.
  */
-function usableAnswer(call: PluginCall): ApikeyQuotaToolOutput | undefined {
+function usableAnswer(call: PluginCall): ApikeyQuotaCommandOutput | undefined {
 	if (call.outcome === "disabled") throw new BalanceProbeRequestError("plugin_disabled");
 	return call.outcome === "answer" ? call.answer : undefined;
 }
@@ -139,12 +146,63 @@ export async function isApikeyQuotaCapabilityEnabled(): Promise<boolean> {
 	return status?.desiredState !== "disabled";
 }
 
+/** Authorize this host-internal command without registering an Agent tool. */
+export async function invokeApikeyQuotaCommand(
+	input: ApikeyQuotaCommandInput,
+	context: PluginCommandInvokeContext,
+) {
+	context.signal?.throwIfAborted();
+	const { runtimeSupervisor, stateStore, capabilityBroker, pluginCommandRegistry } =
+		pluginPlatformServices;
+	const state = await stateStore.getState(APIKEY_QUOTA_PLUGIN_ID);
+	if (state?.desiredState === "disabled") {
+		throw new PluginCommandRegistryError("PLUGIN_DISABLED", "Quota plugin is disabled");
+	}
+	const runtime = runtimeSupervisor.get(APIKEY_QUOTA_PLUGIN_ID);
+	const installationId =
+		state?.installationId ?? state?.authorityInstallationId ?? state?.current?.hash;
+	if (!runtime || runtime.state !== "active" || !installationId) {
+		throw new PluginCommandRegistryError("HOST_UNAVAILABLE", "Quota plugin is not active", true);
+	}
+	const diagnostics = runtime.getDiagnostics();
+	const host = capabilityBroker.withCallContext({
+		plugin: {
+			pluginId: APIKEY_QUOTA_PLUGIN_ID,
+			packageVersion: diagnostics.pluginVersion,
+			installationId,
+			runtimeId: diagnostics.runtimeId,
+			runtimeGeneration: diagnostics.generation,
+			contributionId: APIKEY_QUOTA_COMMAND_ID,
+		},
+		invocation: { kind: "plugin_background", source: "internal" },
+		requestId: context.requestId,
+		correlationId: context.correlationId,
+		deadlineAt: context.deadlineAt,
+	});
+	const requestBytes = Buffer.byteLength(JSON.stringify(input), "utf8");
+	const authorization = await capabilityBroker.authorize({
+		context: host,
+		capability: "provider.use",
+		methodId: `commands.invoke:${FULL_COMMAND_ID}`,
+		constraints: { maxBytes: requestBytes },
+		requestBytes,
+		responseBytes: 0,
+	});
+	if (!authorization.allowed) {
+		throw new PluginCommandRegistryError(
+			authorization.error?.code ?? "PERMISSION_DENIED",
+			"Capability broker denied the quota command",
+		);
+	}
+	context.signal?.throwIfAborted();
+	return pluginCommandRegistry.invoke(FULL_COMMAND_ID, APIKEY_QUOTA_PLUGIN_ID, input, context);
+}
+
 export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}): ApikeyQuotaEngine {
 	const fallback = options.fallback ?? builtinProviderBalanceEngine;
 	const diagnose =
 		options.onDiagnostic ?? ((message, detail) => logger.info(`[apikey-quota] ${message}`, detail));
 
-	const tools = (): QuotaToolInvoker => options.tools ?? pluginPlatformServices.toolRegistry;
 	const activator = (): QuotaPluginActivator | undefined => options.activator ?? installedActivator;
 
 	/**
@@ -175,56 +233,57 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
 		input: Record<string, unknown>,
 		signal: AbortSignal,
 	): Promise<PluginCall> {
+		signal.throwIfAborted();
 		try {
-			// Activation is what registers the tool; the manager treats a repeat call as a
-			// no-op, so this is safe on every probe.
 			await activator()?.activate(APIKEY_QUOTA_PLUGIN_ID, {
-				reason: `onTool:${FULL_TOOL_ID}`,
+				reason: `onCommand:${FULL_COMMAND_ID}`,
 				automatic: true,
 			});
 		} catch (error) {
-			// Order matters: a disabled plugin is the one refusal that must not fall back.
 			if (pluginDisabled(error)) {
 				diagnose("plugin is disabled; capability reported as unavailable", {
-					tool: FULL_TOOL_ID,
+					command: FULL_COMMAND_ID,
 				});
 				return { outcome: "disabled" };
 			}
+			signal.throwIfAborted();
 			diagnose("plugin activation failed", { error: errorName(error) });
 			return { outcome: "unavailable" };
 		}
 		try {
-			const result = await tools().invoke(FULL_TOOL_ID, input, {
-				invocation: { kind: "plugin_background", source: "internal" },
+			const commandInput = apikeyQuotaCommandInputSchema.parse(input);
+			const context: PluginCommandInvokeContext = {
+				requestId: generateId(),
+				deadlineAt: new Date(Date.now() + REQUEST_TIMEOUT_MS).toISOString(),
 				signal,
 				timeoutMs: REQUEST_TIMEOUT_MS,
-			});
-			const output = typeof result?.output === "string" ? result.output : undefined;
-			if (result?.isError === true || output === undefined) {
-				diagnose("plugin returned no usable output", { tool: FULL_TOOL_ID });
-				return { outcome: "unavailable" };
-			}
-			const parsed = apikeyQuotaToolOutputSchema.safeParse(parseJson(output));
+			};
+			const result = options.commands
+				? await options.commands.invoke(
+						FULL_COMMAND_ID,
+						APIKEY_QUOTA_PLUGIN_ID,
+						commandInput,
+						context,
+					)
+				: await invokeApikeyQuotaCommand(commandInput, context);
+			const parsed = apikeyQuotaCommandOutputSchema.safeParse(result.output);
 			if (!parsed.success) {
 				diagnose("plugin output failed validation", {
-					tool: FULL_TOOL_ID,
+					command: FULL_COMMAND_ID,
 					issues: parsed.error.issues.length,
 				});
 				return { outcome: "unavailable" };
 			}
 			return { outcome: "answer", answer: parsed.data };
 		} catch (error) {
-			// The plugin can be disabled between activation and the call (or have lost its
-			// registration to a lifecycle revoke), so the refusal is recognised here too.
 			if (pluginDisabled(error)) {
 				diagnose("plugin is disabled; capability reported as unavailable", {
-					tool: FULL_TOOL_ID,
+					command: FULL_COMMAND_ID,
 				});
 				return { outcome: "disabled" };
 			}
-			// A crashed or unresponsive plugin must not wedge the balance cache: this round is
-			// answered by the bundled adapters.
-			diagnose("plugin call failed", { tool: FULL_TOOL_ID, error: errorName(error) });
+			signal.throwIfAborted();
+			diagnose("plugin call failed", { command: FULL_COMMAND_ID, error: errorName(error) });
 			return { outcome: "unavailable" };
 		}
 	}
@@ -248,7 +307,7 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
 			if (answer?.status === "ok") {
 				// A discovery answer without its endpoint could not be persisted or refreshed.
 				if (!answer.adapter || !answer.root) {
-					diagnose("plugin probe answer is missing adapter/root", { tool: FULL_TOOL_ID });
+					diagnose("plugin probe answer is missing adapter/root", { command: FULL_COMMAND_ID });
 					return fallback.probe(input);
 				}
 				return { adapter: answer.adapter, root: answer.root, balance: answer.balance };
@@ -293,7 +352,7 @@ export const builtinApikeyQuotaEngine = createApikeyQuotaEngine();
 /**
  * The site-account credit credentials, forwarded per call exactly like the inference key.
  *
- * Sending them only when set keeps the tool input identical to the pre-existing shape for
+ * Sending them only when set keeps the command input identical to the pre-existing shape for
  * every provider that queries a key's allowance, so the plugin's own validation cannot start
  * rejecting inputs the bundled path accepts.
  */
@@ -329,14 +388,6 @@ function connectionFields(input: ProviderBalanceProbeInput): Record<string, unkn
 		fields.timeoutMs = input.requestTimeoutMs;
 	}
 	return fields;
-}
-
-function parseJson(output: string): unknown {
-	try {
-		return JSON.parse(output) as unknown;
-	} catch {
-		return undefined;
-	}
 }
 
 function errorName(error: unknown): string {

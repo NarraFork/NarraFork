@@ -4,8 +4,8 @@ import type { CustomApiProviderConfig } from "@server/lib/settings";
 import {
 	type ApikeyQuotaEngineOptions,
 	createApikeyQuotaEngine,
+	type QuotaCommandInvoker,
 	type QuotaPluginActivator,
-	type QuotaToolInvoker,
 } from "@server/services/apikey-quota-plugin-engine";
 
 const config = (): CustomApiProviderConfig => ({
@@ -42,46 +42,39 @@ interface Harness {
 	fallbackCalls: string[];
 }
 
-/**
- * A fake tool registry plus a fake activator.
- *
- * The registry is the *only* way the engine may reach the plugin, so this boundary is what the
- * decision table must be proven against: the engine owns no process and no connection.
- */
 function setup(
 	respond: (input: Record<string, unknown>) => unknown,
 	options: {
 		activateThrows?: Error;
 		invokeThrows?: Error;
 		output?: unknown;
-		isError?: boolean;
 		noActivator?: boolean;
 	} = {},
 ) {
 	const state: Harness = { invocations: [], activations: [], fallbackCalls: [] };
-	const tools: QuotaToolInvoker = {
-		invoke: async (fullId, input, invocationOptions) => {
+	const commands: QuotaCommandInvoker = {
+		invoke: async (commandId, pluginId, input, invocationContext) => {
 			state.invocations.push({
-				fullId,
+				fullId: commandId,
 				input: input as Record<string, unknown>,
-				options: invocationOptions,
+				options: { ...invocationContext, pluginId },
 			});
 			if (options.invokeThrows) throw options.invokeThrows;
-			const output = options.output ?? JSON.stringify(respond(input as Record<string, unknown>));
-			return {
-				output: typeof output === "string" ? output : JSON.stringify(output),
-				isError: options.isError,
-			};
+			return { output: options.output ?? respond(input as Record<string, unknown>) };
 		},
 	};
 	const activator: QuotaPluginActivator = {
-		activate: async (pluginId) => {
+		activate: async (pluginId, activationOptions) => {
 			state.activations.push(pluginId);
+			expect(activationOptions).toMatchObject({
+				reason: "onCommand:com.narrafork.apikey-quota/query-balance",
+				automatic: true,
+			});
 			if (options.activateThrows) throw options.activateThrows;
 		},
 	};
 	const engineOptions: ApikeyQuotaEngineOptions = {
-		tools,
+		commands,
 		...(options.noActivator ? {} : { activator }),
 		fallback: {
 			id: "fallback",
@@ -104,7 +97,7 @@ function setup(
 }
 
 describe("apikey-quota builtin engine", () => {
-	test("a probe activates the plugin and goes through the shared tool registry", async () => {
+	test("a probe activates the plugin and goes through the shared command registry", async () => {
 		const { state, engine } = setup(okProbe);
 
 		const found = await engine.probe({ config: config(), signal: signal() });
@@ -114,14 +107,16 @@ describe("apikey-quota builtin engine", () => {
 			root: "https://relay.example.com",
 			balance: { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 12.5 }] },
 		});
-		// Activation is what registers the tool, and it carries the same activation event the
-		// manifest declares for tools so the plugin treats it as a normal tool activation.
+		// The host uses command activation; no Agent tool is needed.
 		expect(state.activations).toEqual(["com.narrafork.apikey-quota"]);
 		expect(state.invocations).toHaveLength(1);
 		expect(state.invocations[0]?.fullId).toBe("com.narrafork.apikey-quota/query-balance");
-		// Background principal is what makes this a host-internal call rather than a narrator one.
 		expect(state.invocations[0]?.options).toMatchObject({
-			invocation: { kind: "plugin_background", source: "internal" },
+			pluginId: "com.narrafork.apikey-quota",
+			requestId: expect.any(String),
+			deadlineAt: expect.any(String),
+			timeoutMs: 15_000,
+			signal: expect.any(AbortSignal),
 		});
 		// The bundled adapters must not run when the plugin answered.
 		expect(state.fallbackCalls).toEqual([]);
@@ -169,9 +164,11 @@ describe("apikey-quota builtin engine", () => {
 		expect(state.fallbackCalls).toEqual(["probe"]);
 	});
 
-	test("an unregistered tool falls back to the bundled adapters", async () => {
+	test("an unregistered command falls back to the bundled adapters", async () => {
 		const { state, engine } = setup(okProbe, {
-			invokeThrows: Object.assign(new Error("Unknown plugin tool"), { code: "NOT_FOUND" }),
+			invokeThrows: Object.assign(new Error("Unknown plugin command"), {
+				code: "METHOD_NOT_FOUND",
+			}),
 		});
 
 		await engine.probe({ config: config(), signal: signal() });
@@ -249,8 +246,8 @@ describe("apikey-quota builtin engine", () => {
 		expect(state.fallbackCalls).toEqual(["probe"]);
 	});
 
-	test("an error result from the tool falls back", async () => {
-		const { state, engine } = setup(okProbe, { output: "boom", isError: true });
+	test("a string-encoded tool result is not accepted as command output", async () => {
+		const { state, engine } = setup(okProbe, { output: JSON.stringify(okProbe()) });
 
 		await engine.probe({ config: config(), signal: signal() });
 
@@ -311,6 +308,18 @@ describe("apikey-quota builtin engine", () => {
 		// The seam cannot be serialized into a child process, so it never reaches the registry.
 		expect(state.invocations).toEqual([]);
 		expect(state.fallbackCalls).toEqual(["probe"]);
+	});
+
+	test("an already cancelled query never activates, invokes or falls back", async () => {
+		const { state, engine } = setup(okProbe);
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			engine.probe({ config: config(), signal: controller.signal }),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(state.activations).toEqual([]);
+		expect(state.invocations).toEqual([]);
+		expect(state.fallbackCalls).toEqual([]);
 	});
 
 	test("without an activator the engine still falls back safely", async () => {

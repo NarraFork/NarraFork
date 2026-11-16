@@ -59,7 +59,7 @@ import {
 import type { SideCarBody } from "@shared/sidecar-body";
 import { readDisplayNames, readNarrator } from "./access-reads";
 import { isOutlineEnabled } from "./feature";
-import { OUTLINE_CHANGE, type OutlineTaskJson } from "./model";
+import { commitPersonId, OUTLINE_CHANGE, type OutlineTaskJson } from "./model";
 import { outlineStore } from "./store";
 import type { OutlineRangeChange, OutlineVersionMeta } from "./store/digest-port";
 import type { OutlineCommitRow, OutlineSpaceRow, OutlineStore } from "./store/port";
@@ -280,18 +280,20 @@ export async function readOutlineCommitWriter(
 		store.getCommitsBySeqs(event.spaceId, [event.seq]),
 	]);
 	if (!space || !commit) return null;
-	// Who made it: the commit's session (an agent's own, a system commit's), or a person.
+	// Who made it: the commit's session (an agent's own, a system commit's), or a person (their
+	// own commit, or a hand-out they made on the board: `commitPersonId`).
 	const writer =
 		commit.narratorId ?? (commit.actorKind === "agent" ? commit.actorId : null) ?? null;
 	const writerRoot = writer
 		? ((await store.getNarratorRoots([writer])).get(writer)?.root ?? writer)
 		: null;
-	const person = commit.actorKind === "human";
+	const personId = commitPersonId(commit);
+	const person = personId !== null;
 	const names = await readDisplayNames(
-		person ? { userIds: [commit.actorId] } : { narratorIds: writerRoot ? [writerRoot] : [] },
+		personId !== null ? { userIds: [personId] } : { narratorIds: writerRoot ? [writerRoot] : [] },
 	).catch(() => null);
 	const sessionName = writerRoot ? clip(names?.narrators.get(writerRoot) ?? writerRoot) : null;
-	const neutralBy = person ? (names?.users.get(commit.actorId) ?? commit.actorId) : sessionName;
+	const neutralBy = personId !== null ? (names?.users.get(personId) ?? personId) : sessionName;
 	return {
 		space,
 		commit,

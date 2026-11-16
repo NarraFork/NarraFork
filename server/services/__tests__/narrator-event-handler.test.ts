@@ -2809,3 +2809,77 @@ describe("subagent live output char count", () => {
 		expect(toolOutputFrames().at(-1)?.output).toBe("7");
 	});
 });
+
+describe("quota and payment frames stay with their own session", () => {
+	const framesOf = (type: string) =>
+		(broadcastMessages as Array<Record<string, unknown>>).filter(
+			(message) => message.type === type,
+		);
+	/** The frame delivered to `narratorId`; the mock records target and payload in lockstep. */
+	const deliveredTo = (type: string, narratorId: string) =>
+		(broadcastMessages as Array<Record<string, unknown>>).filter(
+			(message, index) => message.type === type && broadcastTargets[index] === narratorId,
+		)[0];
+
+	test("a subagent quota frame is tagged for the parent and stripped for its own page", async () => {
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "sub-12", detailedQuotaBalance: "sub details" },
+			makeSubagentContext(),
+		);
+		expect(framesOf("quota_balance")).toHaveLength(2);
+		// The parent page must be able to tell this balance is not its own.
+		expect(deliveredTo("quota_balance", PARENT_NARRATOR_ID)).toMatchObject({
+			narratorId: PARENT_NARRATOR_ID,
+			quotaBalance: "sub-12",
+			isSubagent: true,
+		});
+		const self = deliveredTo("quota_balance", SUBAGENT_NARRATOR_ID);
+		expect(self).toMatchObject({
+			narratorId: SUBAGENT_NARRATOR_ID,
+			quotaBalance: "sub-12",
+			detailedQuotaBalance: "sub details",
+		});
+		expect(self).not.toHaveProperty("isSubagent");
+	});
+
+	test("a primary narrator quota frame carries no subagent marker", async () => {
+		await processEvent({ type: "quota_balance", quotaBalance: "12.5" }, makeMainContext());
+		const [frame] = framesOf("quota_balance");
+		expect(frame).toMatchObject({ narratorId: PARENT_NARRATOR_ID, quotaBalance: "12.5" });
+		expect(frame).not.toHaveProperty("isSubagent");
+	});
+
+	test("a frame routed to another narrator is tagged even without a tool_use link", async () => {
+		// The route, not the placement, decides the audience: a child session addressed
+		// to its parent must still be recognizable as such on the parent's page.
+		const ctx = { ...makeSubagentContext(), parentToolUseId: undefined };
+		await processEvent({ type: "quota_balance", quotaBalance: "sub-9" }, ctx);
+		expect(broadcastTargets).toEqual([PARENT_NARRATOR_ID]);
+		expect(framesOf("quota_balance")[0]).toMatchObject({
+			narratorId: PARENT_NARRATOR_ID,
+			isSubagent: true,
+		});
+	});
+
+	test("a subagent payment_required is tagged for the parent and stripped for its own page", async () => {
+		await processEvent(
+			{
+				type: "payment_required",
+				message: "insufficient balance",
+				providerId: "nug-1",
+				providerPrefix: "nug",
+				balance: 0,
+				required: 5,
+				resumeAction: "retry",
+			},
+			makeSubagentContext(),
+		);
+		expect(deliveredTo("payment_required", PARENT_NARRATOR_ID)).toMatchObject({
+			narratorId: PARENT_NARRATOR_ID,
+			isSubagent: true,
+		});
+		const self = deliveredTo("payment_required", SUBAGENT_NARRATOR_ID);
+		expect(self).toMatchObject({ narratorId: SUBAGENT_NARRATOR_ID });
+		expect(self).not.toHaveProperty("isSubagent");
+	});
+});

@@ -51,6 +51,7 @@ import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
+import { useAllModels } from "../../../hooks/useModels";
 import {
 	useBlacklistDirs,
 	useClearBlockedSkills,
@@ -529,6 +530,9 @@ function NarratorDetailsContent({
 	const modelPoolDraft = useDetailsDraft(
 		customTraits?.subagentModelRestriction?.pools ?? EMPTY_POOLS,
 	);
+	// Shares the ["settings"] cache the hosting panel already loaded; the pool
+	// editor only needs it so provider display names are searchable.
+	const { modelOptionsFilter } = useAllModels();
 	const updateSubagentModelsMutation = useUpdateSubagentModelRestriction();
 	const clearSubagentModelsMutation = useClearSubagentModelRestriction();
 	const updateDisabledToolsMutation = useUpdateDisabledTools();
@@ -1919,6 +1923,7 @@ function NarratorDetailsContent({
 							pools={modelPoolDraft.value}
 							setPools={modelPoolDraft.setValue}
 							availableModels={customTraits?.availableModels}
+							modelOptionsFilter={modelOptionsFilter}
 							loaded={customTraits !== undefined}
 							saving={updateSubagentModelsMutation.isPending}
 							clearing={clearSubagentModelsMutation.isPending}

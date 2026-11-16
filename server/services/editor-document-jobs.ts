@@ -1,12 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
-import { Worker } from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import { EDITOR_IO_TIMEOUT_MS } from "../../shared/editor-document";
-import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../lib/compiled-worker";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { isCompiledRuntime } from "../lib/runtime-target";
+import { WorkerCleanupError, type WorkerHandle } from "../lib/worker-runtime/lifecycle";
+import { WorkerPool, type WorkerTaskContext } from "../lib/worker-runtime/pool";
+import { TaskQueue, TaskQueueError, type TaskQueuePermit } from "../lib/worker-runtime/queue";
 import type { EditorWorkerRequest, EditorWorkerResult } from "./editor-document-worker";
 
 /** Additional build entries become .js paths relative to the build root, whereas
@@ -23,159 +26,200 @@ export function editorWorkerSpecifierCandidates(
 	);
 }
 const WORKER_READY_TIMEOUT_MS = 5_000;
-// One running task per user; a user's extra windows queue behind it and can never
-// take the whole queue from other users. Remote saves are mostly network wait.
-const IO_ACTIVE = 4;
-const IO_QUEUE = 32;
-const IO_USER_QUEUE = 2;
-
-type Permit = { userId: string; signal: AbortSignal };
-type Waiting = { userId: string; start(): void; cancel(): void };
 const timeoutError = () =>
 	new AppError("Editor task cancelled or timed out", 408, "EDITOR_TIMEOUT");
-/** Admission covers the entire raw-before/blob/dispatch/receipt IO task, not only its
- * encoding stage. Nested worker jobs reuse the same permit without deadlocking. */
-export class EditorDocumentJobs {
-	private active = new Set<string>();
-	private queue: Waiting[] = [];
-	private context = new AsyncLocalStorage<Permit>();
-	private resolvedWorkerSpecifier?: string;
-	private transfers = 0;
-	private transferBytes = 0;
-	private transferQueue: { bytes: number; start(): void }[] = [];
-	private pumpTransfers() {
-		while (this.transfers < 8) {
-			const index = this.transferQueue.findIndex(
-				(entry) => this.transferBytes + entry.bytes <= 128 * 1024 * 1024,
-			);
-			if (index < 0) return;
-			this.transferQueue.splice(index, 1)[0].start();
+const closedError = () => new AppError("Editor IO is closed", 503, "EDITOR_CLOSED");
+function admissionError(error: unknown): unknown {
+	if (!(error instanceof TaskQueueError)) return error;
+	if (error.code === "TASK_QUEUE_FULL")
+		return new AppError("Editor IO queue is full", 429, "EDITOR_BUSY");
+	return error.code === "TASK_QUEUE_CLOSED" ? closedError() : timeoutError();
+}
+
+/** Translate only the cancellation reason; release still belongs to the original queue lease. */
+function editorPermit(
+	permit: TaskQueuePermit,
+	reason: (error: unknown) => unknown = admissionError,
+): TaskQueuePermit {
+	const controller = new AbortController();
+	const abort = () => controller.abort(reason(permit.signal.reason));
+	permit.signal.addEventListener("abort", abort, { once: true });
+	if (permit.signal.aborted) abort();
+	return {
+		signal: controller.signal,
+		deadlineAt: permit.deadlineAt,
+		release: () => {
+			permit.signal.removeEventListener("abort", abort);
+			permit.release();
+		},
+	};
+}
+
+/** A one-shot worker replies, closes its port, then exits. No reply permits replay. */
+class EditorJobWorker {
+	constructor(private readonly handle: WorkerHandle<Worker>) {}
+	get closed() {
+		return this.handle.closed;
+	}
+	async run(request: EditorWorkerRequest, context: WorkerTaskContext): Promise<EditorWorkerResult> {
+		const worker = this.handle.resource;
+		let response: { result?: EditorWorkerResult; error?: string; code?: string } | undefined;
+		const receive = (message: typeof response) => {
+			response = message;
+		};
+		worker.on("message", receive);
+		try {
+			context.signal.throwIfAborted();
+			worker.postMessage(request);
+			const code = await this.handle.exited;
+			if (code !== 0 || !response)
+				throw new AppError("Editor worker exited without a result", 500, "EDITOR_WORKER_FAILED");
+			if (response.error || !response.result)
+				throw new AppError(
+					response.error ?? "Editor worker failed",
+					response.code === "EDITOR_SOURCE_CHANGED" ? 409 : 422,
+					response.code === "EDITOR_SOURCE_CHANGED" ? response.code : "EDITOR_INVALID_CONTENT",
+				);
+			return response.result;
+		} finally {
+			worker.off("message", receive);
 		}
 	}
-	/** Independent from per-user IO: held until the response reaches EOF or is cancelled. */
-	acquireTransfer(
-		bytes: number,
-		external?: AbortSignal,
-	): Promise<{ signal: AbortSignal; release(): void }> {
-		if (external?.aborted) return Promise.reject(timeoutError());
-		if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 64 * 1024 * 1024)
-			return Promise.reject(
-				new AppError("Invalid editor transfer size", 422, "EDITOR_INVALID_CONTENT"),
-			);
-		if (this.transferQueue.length >= 64)
-			return Promise.reject(new AppError("Editor transfer queue is full", 429, "EDITOR_BUSY"));
-		return new Promise((resolve, reject) => {
-			const controller = new AbortController();
-			let admitted = false;
-			let released = false;
-			const release = () => {
-				if (released) return;
-				released = true;
-				clearTimeout(timer);
-				external?.removeEventListener("abort", abort);
-				const index = this.transferQueue.indexOf(entry);
-				if (index >= 0) this.transferQueue.splice(index, 1);
-				if (admitted) {
-					this.transfers--;
-					this.transferBytes -= bytes;
+	async close() {
+		try {
+			await this.handle.close();
+		} catch (error) {
+			// A failed terminate is not proof that a borrowed parent FD is no longer in use.
+			await this.handle.exited;
+			throw error;
+		}
+	}
+}
+
+/** Admission spans raw-before/blob/dispatch/receipt IO; nested encoding reuses it. */
+export class EditorDocumentJobs {
+	private readonly io = new TaskQueue({
+		concurrency: 4,
+		maxQueued: 32,
+		maxActivePerKey: 1,
+		maxQueuedPerKey: 2,
+	});
+	private readonly transfer = new TaskQueue({
+		concurrency: 8,
+		maxQueued: 64,
+		maxActiveBytes: 128 * 1024 * 1024,
+		maxQueuedBytes: 64 * 64 * 1024 * 1024,
+	});
+	private readonly context = new AsyncLocalStorage<{ userId: string; signal: AbortSignal }>();
+	private readonly shutdown = new AbortController();
+	private readonly pool: WorkerPool<EditorWorkerRequest, EditorWorkerResult>;
+	private closing?: Promise<void>;
+
+	/** Explicit entries/budgets are trusted fault-injection seams, not HTTP metadata. */
+	constructor(workerSpecifiers?: readonly string[], budget = { readyMs: WORKER_READY_TIMEOUT_MS }) {
+		this.pool = new WorkerPool({
+			concurrency: 4,
+			// The business IO queue already owns scheduling. This only caps physical workers.
+			maxQueued: 0,
+			reuse: false,
+			create: async ({ signal }) => {
+				try {
+					const { handle } = await connectCompiledWorker(
+						workerSpecifiers ?? editorWorkerSpecifierCandidates(),
+						{
+							signal,
+							timeoutMs: budget.readyMs,
+							sendPing: false,
+							isReady: (message) =>
+								!!message &&
+								typeof message === "object" &&
+								"type" in message &&
+								message.type === "editor-worker-ready" &&
+								"version" in message &&
+								message.version === 1,
+						},
+					);
+					return new EditorJobWorker(handle);
+				} catch (error) {
+					if (error instanceof WorkerCleanupError) {
+						// Keep the factory, physical slot and business permit pending until real exit.
+						await error.handle.exited;
+						throw error;
+					}
+					signal.throwIfAborted();
+					throw new AppError("Editor worker did not become ready", 503, "EDITOR_WORKER_FAILED");
 				}
-				this.pumpTransfers();
-			};
-			const abort = () => {
-				controller.abort(timeoutError());
-				if (!admitted) {
-					release();
-					reject(timeoutError());
-				}
-			};
-			const start = () => {
-				if (released) return;
-				admitted = true;
-				this.transfers++;
-				this.transferBytes += bytes;
-				resolve({ signal: controller.signal, release });
-			};
-			const entry = { bytes, start };
-			const timer = setTimeout(abort, EDITOR_IO_TIMEOUT_MS);
-			timer.unref();
-			external?.addEventListener("abort", abort, { once: true });
-			this.transferQueue.push(entry);
-			this.pumpTransfers();
+			},
+			onTaskComplete: (timing) => {
+				if (timing.totalMs >= 1000) logger.warn("Slow editor worker", { ...timing });
+			},
 		});
 	}
-	/** Explicit specifiers are a trusted test seam, never taken from HTTP metadata. */
-	constructor(private readonly workerSpecifiers?: readonly string[]) {}
-	withIo<T>(
+	get diagnostics() {
+		return { io: this.io.stats, transfer: this.transfer.stats, workers: this.pool.stats };
+	}
+	/** Independent response-body credit, held until its consumer closes/cancels. */
+	async acquireTransfer(bytes: number, external?: AbortSignal) {
+		if (external?.aborted) throw timeoutError();
+		if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 64 * 1024 * 1024)
+			throw new AppError("Invalid editor transfer size", 422, "EDITOR_INVALID_CONTENT");
+		const signal = external
+			? AbortSignal.any([external, this.shutdown.signal])
+			: this.shutdown.signal;
+		try {
+			const permit = await this.transfer.acquire({
+				bytes,
+				signal,
+				deadlineAt: Date.now() + EDITOR_IO_TIMEOUT_MS,
+			});
+			return editorPermit(permit, () =>
+				this.shutdown.signal.aborted ? closedError() : timeoutError(),
+			);
+		} catch (error) {
+			if (this.shutdown.signal.aborted) throw closedError();
+			if (external?.aborted) throw timeoutError();
+			throw admissionError(error);
+		}
+	}
+	async withIo<T>(
 		userId: string,
 		body: (signal: AbortSignal) => Promise<T>,
 		external?: AbortSignal,
 	): Promise<T> {
+		if (this.shutdown.signal.aborted) throw closedError();
 		const inherited = this.context.getStore();
 		if (inherited?.userId === userId)
 			return body(external ? AbortSignal.any([external, inherited.signal]) : inherited.signal);
-		if (external?.aborted) return Promise.reject(external.reason);
-		if (
-			this.queue.length >= IO_QUEUE ||
-			this.queue.filter((entry) => entry.userId === userId).length >= IO_USER_QUEUE
-		)
-			return Promise.reject(new AppError("Editor IO queue is full", 429, "EDITOR_BUSY"));
-		return new Promise<T>((resolve, reject) => {
-			const controller = new AbortController();
-			const timer = setTimeout(() => entry.cancel(), EDITOR_IO_TIMEOUT_MS);
-			const signal = external ? AbortSignal.any([external, controller.signal]) : controller.signal;
-			const finish = () => {
-				clearTimeout(timer);
-				external?.removeEventListener("abort", entry.cancel);
-			};
-			const entry: Waiting = {
-				userId,
-				cancel: () => {
-					controller.abort(timeoutError());
-					const index = this.queue.indexOf(entry);
-					if (index >= 0) {
-						this.queue.splice(index, 1);
-						finish();
-						reject(timeoutError());
-					}
-					// Running durable dispatch is awaited to settlement; cancellation is not proof of no write.
-				},
-				start: () => {
-					this.active.add(userId);
-					void this.context.run({ userId, signal }, async () => {
-						try {
-							signal.throwIfAborted();
-							resolve(await body(signal));
-						} catch (error) {
-							reject(error);
-						} finally {
-							finish();
-							this.active.delete(userId);
-							this.pump();
-						}
-					});
-				},
-			};
-			external?.addEventListener("abort", entry.cancel, { once: true });
-			this.queue.push(entry);
-			this.pump();
-		});
-	}
-	private pump() {
-		while (this.active.size < IO_ACTIVE) {
-			const index = this.queue.findIndex((entry) => !this.active.has(entry.userId));
-			if (index < 0) return;
-			this.queue.splice(index, 1)[0].start();
+		const signal = external
+			? AbortSignal.any([external, this.shutdown.signal])
+			: this.shutdown.signal;
+		const permit = await this.io
+			.acquire({ key: userId, signal, deadlineAt: Date.now() + EDITOR_IO_TIMEOUT_MS })
+			.then((permit) => editorPermit(permit))
+			.catch((error) => {
+				throw admissionError(error);
+			});
+		try {
+			permit.signal.throwIfAborted();
+			return await this.context.run({ userId, signal: permit.signal }, () => body(permit.signal));
+		} finally {
+			// Durable dispatch may ignore cancellation until its outcome has settled.
+			permit.release();
 		}
 	}
-	run(
-		userId: string,
-		request: EditorWorkerRequest,
-		signal?: AbortSignal,
-	): Promise<EditorWorkerResult> {
+	run(userId: string, request: EditorWorkerRequest, signal?: AbortSignal) {
 		return this.withIo(
 			userId,
 			async (admitted) => {
-				if (request.action !== "raw-seal") return this.worker(request, admitted);
+				const run = (input: EditorWorkerRequest) =>
+					this.pool
+						.run(input, { signal: admitted, deadlineAt: Number.POSITIVE_INFINITY })
+						.catch((error) => {
+							if (admitted.aborted)
+								throw this.shutdown.signal.aborted ? closedError() : timeoutError();
+							throw admissionError(error);
+						});
+				if (request.action !== "raw-seal") return run(request);
 				const entry = await lstat(request.path);
 				if (!entry.isFile() || entry.nlink !== 1)
 					throw new AppError(
@@ -188,143 +232,22 @@ export class EditorDocumentJobs {
 					constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
 				);
 				try {
-					// Bun termination does not reliably close worker-owned FileHandles. Keep
-					// ownership here; workerAt joins exit before this close, even on cancellation.
-					return await this.worker({ ...request, fd: file.fd }, admitted);
+					return await run({ ...request, fd: file.fd });
 				} finally {
+					// Pool completion includes actual exit, even if termination itself failed.
 					await file.close();
 				}
 			},
 			signal,
 		);
 	}
-	private async worker(
-		request: EditorWorkerRequest,
-		signal: AbortSignal,
-	): Promise<EditorWorkerResult> {
-		const candidates = this.resolvedWorkerSpecifier
-			? [this.resolvedWorkerSpecifier]
-			: (this.workerSpecifiers ?? editorWorkerSpecifierCandidates());
-		let failure: unknown = new AppError(
-			"No editor worker entry is available",
-			503,
-			"EDITOR_WORKER_FAILED",
-		);
-		for (const specifier of candidates.slice(0, 3)) {
-			signal.throwIfAborted();
-			let ready = false;
-			try {
-				return await this.workerAt(specifier, request, signal, () => {
-					ready = true;
-					this.resolvedWorkerSpecifier = specifier;
-				});
-			} catch (error) {
-				// A readiness acknowledgement is the no-replay boundary. The job may have
-				// created a source/conflict/receipt object even if its reply was lost.
-				if (ready || signal.aborted) throw error;
-				logger.warn("Editor worker failed before ready", {
-					specifier: specifier.slice(0, 1024),
-					error: (error instanceof Error ? error.message : String(error)).slice(0, 1024),
-				});
-				failure = error;
-			}
-		}
-		throw failure;
-	}
-	private async workerAt(
-		specifier: string,
-		request: EditorWorkerRequest,
-		signal: AbortSignal,
-		onReady: () => void,
-	): Promise<EditorWorkerResult> {
-		const started = performance.now();
-		let worker: Worker | undefined;
-		let abort: (() => void) | undefined;
-		let exited = false;
-		let ready = false;
-		let startupTimer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			return await new Promise<EditorWorkerResult>((resolve, reject) => {
-				abort = () => reject(timeoutError());
-				signal.addEventListener("abort", abort, { once: true });
-				if (signal.aborted) {
-					abort();
-					return;
-				}
-				worker = new Worker(workerEntryFromSpecifier(specifier));
-				startupTimer = setTimeout(
-					() =>
-						reject(new AppError("Editor worker did not become ready", 503, "EDITOR_WORKER_FAILED")),
-					WORKER_READY_TIMEOUT_MS,
-				);
-				let response: { result?: EditorWorkerResult; error?: string; code?: string } | undefined;
-				worker.once("error", reject);
-				worker.once("exit", (code) => {
-					exited = true;
-					if (code !== 0 || !response)
-						reject(
-							new AppError("Editor worker exited without a result", 500, "EDITOR_WORKER_FAILED"),
-						);
-					else if (response.error || !response.result)
-						reject(
-							new AppError(
-								response.error ?? "Editor worker failed",
-								response.code === "EDITOR_SOURCE_CHANGED" ? 409 : 422,
-								response.code === "EDITOR_SOURCE_CHANGED"
-									? response.code
-									: "EDITOR_INVALID_CONTENT",
-							),
-						);
-					else resolve(response.result);
-				});
-				worker.on(
-					"message",
-					(message: {
-						type?: string;
-						version?: number;
-						result?: EditorWorkerResult;
-						error?: string;
-						code?: string;
-					}) => {
-						if (!ready) {
-							if (message.type !== "editor-worker-ready" || message.version !== 1) {
-								reject(
-									new AppError(
-										"Invalid editor worker readiness handshake",
-										503,
-										"EDITOR_WORKER_FAILED",
-									),
-								);
-								return;
-							}
-							ready = true;
-							clearTimeout(startupTimer);
-							onReady();
-							try {
-								signal.throwIfAborted();
-								worker?.postMessage(request);
-							} catch (error) {
-								reject(error);
-							}
-							return;
-						}
-						if (message.type === "editor-worker-ready") return;
-						response = message;
-					},
-				);
-			});
-		} finally {
-			clearTimeout(startupTimer);
-			if (abort) signal.removeEventListener("abort", abort);
-			// Await worker exit before letting callers unlink its files or release reservations.
-			// Normal jobs close their port and exit themselves. Force termination is reserved
-			// for cancellation/failure, not raced against every successful postMessage.
-			if (!exited) await worker?.terminate();
-			if (performance.now() - started > 1000)
-				logger.warn("Slow editor worker", {
-					action: request.action,
-					elapsedMs: Math.round(performance.now() - started),
-				});
-		}
+	/** Stop new/queued work immediately; resolve only after active IO, bodies and workers drain. */
+	close(): Promise<void> {
+		if (this.closing) return this.closing;
+		const io = this.io.close(closedError());
+		const transfer = this.transfer.close(closedError());
+		this.shutdown.abort(closedError());
+		this.closing = Promise.all([io, transfer, this.pool.close(closedError())]).then(() => {});
+		return this.closing;
 	}
 }

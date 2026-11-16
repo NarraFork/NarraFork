@@ -1,0 +1,107 @@
+name: remote-peer
+# Build-only verification for the independent remote-peer Go module.
+# Protected peer publication lives in remote-peer-release.yml; this workflow has no remote writes.
+# Kept out of ci.yml on purpose: ci.yml is the release-gating workflow_call target with a pinned job set.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "remote-peer/**"
+      - "licenses/extra/remote-peer-LICENSES.txt"
+      - "licenses/extra/entries.json"
+      - ".github/workflows/remote-peer.yml"
+  pull_request:
+    paths:
+      - "remote-peer/**"
+      - "licenses/extra/remote-peer-LICENSES.txt"
+      - "licenses/extra/entries.json"
+      - ".github/workflows/remote-peer.yml"
+  # remote-peer-dependabot-licenses.yml dispatches this after pushing its sync commit:
+  # pushes made with GITHUB_TOKEN start no pull_request run of their own.
+  workflow_dispatch:
+
+concurrency:
+  group: remote-peer-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  peer-go:
+    name: remote-peer Go checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.1
+          cache: true
+          cache-dependency-path: remote-peer/go.sum
+          check-latest: false
+
+      # The license attachment test reads every locked module from the module cache.
+      - name: Download and verify locked modules
+        working-directory: remote-peer
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Check go.mod is tidy
+        working-directory: remote-peer
+        run: go mod tidy -diff
+
+      - name: Check Go formatting
+        working-directory: remote-peer
+        run: test -z "$(gofmt -l .)"
+
+      # Includes TestLicenseAttachmentMatchesLockedOriginalSources: a dependency bump must
+      # regenerate licenses/extra/remote-peer-LICENSES.txt via go run ./internal/licensebundle.
+      # -count=1: the attachment lives outside the module, so a restored GOCACHE would
+      # otherwise replay a stale "ok (cached)" result after it changes.
+      - name: Run vet and tests with the pinned toolchain
+        working-directory: remote-peer
+        env:
+          GOFLAGS: -count=1
+        run: make vet test
+
+      - name: Vet non-Linux release targets
+        working-directory: remote-peer
+        run: |
+          for os in windows darwin; do
+            printf 'go vet GOOS=%s\n' "$os"
+            GOOS="$os" go vet ./...
+          done
+
+      - name: Check license entries match go.mod
+        working-directory: remote-peer
+        run: |
+          expected="$(
+            go mod edit -json | jq -r '
+              (.Require[] | "\(.Path) (remote-peer)\t\(.Version | ltrimstr("v"))"),
+              "Go standard library (remote-peer)\t\(.Go)"
+            ' | LC_ALL=C sort
+          )"
+          actual="$(
+            jq -r '.[] | select(.name | endswith(" (remote-peer)")) | "\(.name)\t\(.version)"' \
+              ../licenses/extra/entries.json | LC_ALL=C sort
+          )"
+          if ! diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"); then
+            printf '%s\n' \
+              'licenses/extra/entries.json (remote-peer) entries differ from remote-peer/go.mod.' \
+              '"-" lines are what go.mod locks; "+" lines are what entries.json declares.' >&2
+            exit 1
+          fi

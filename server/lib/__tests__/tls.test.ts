@@ -1,8 +1,11 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createPublicKey, X509Certificate } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { generate } from "selfsigned";
+import { logger } from "../logger";
 import * as lanAddresses from "../net/lan-addresses";
 import type { TlsConfig } from "../settings/types";
 
@@ -348,6 +351,193 @@ describe("reissueBuiltinTlsOnStartup", () => {
 		started = Date.now();
 		const legacy = await generateSelfSignedCert();
 		expectBackdated(readFileSync(legacy.certPath, "utf8"), started, Date.now());
+	});
+
+	test("issued leaf lifetime stays within Apple's 825-day cap", async () => {
+		// iOS 13+/macOS 10.15+ reject TLS leaves valid for more than 825 days,
+		// including ones chaining to a user-installed and trusted root. A longer
+		// leaf breaks Safari on those platforms while looking fine on desktop,
+		// so guard the cap rather than the exact constant.
+		const APPLE_MAX_DAYS = 825;
+
+		const issued = await issueServerCert([]);
+		const leaf = new X509Certificate(readFileSync(issued.certPath, "utf8"));
+		const lifetimeDays =
+			(Date.parse(leaf.validTo) - Date.parse(leaf.validFrom)) / (24 * 60 * 60 * 1000);
+
+		expect(lifetimeDays).toBeLessThanOrEqual(APPLE_MAX_DAYS);
+		// Still long enough that routine use does not mean constant reissuance.
+		expect(lifetimeDays).toBeGreaterThan(365);
+
+		const legacy = await generateSelfSignedCert();
+		const legacyLeaf = new X509Certificate(readFileSync(legacy.certPath, "utf8"));
+		const legacyDays =
+			(Date.parse(legacyLeaf.validTo) - Date.parse(legacyLeaf.validFrom)) / (24 * 60 * 60 * 1000);
+		expect(legacyDays).toBeLessThanOrEqual(APPLE_MAX_DAYS);
+		expect(legacyDays).toBeGreaterThan(365);
+	});
+
+	const DAY_MS = 24 * 60 * 60 * 1000;
+
+	function normalizeSanName(name: string): string {
+		return isIP(name) === 6 ? new URL(`http://[${name}]`).hostname : name.toLowerCase();
+	}
+
+	function certificateSans(pem: string): string[] {
+		const cert = new X509Certificate(pem);
+		return (cert.subjectAltName ?? "")
+			.split(",")
+			.map((part) => part.trim())
+			.filter(Boolean)
+			.map((part) => part.replace(/^(DNS|IP Address|URI|email):/i, ""))
+			.map(normalizeSanName)
+			.sort();
+	}
+
+	function expectedSans(): string[] {
+		return [...getAutoSans(), ...readCustomSans()].map(normalizeSanName).sort();
+	}
+
+	/** Overwrite cert.pem with a leaf signed by the on-disk CA, keeping the SAN set. */
+	async function replaceLeaf(notBefore: Date, notAfter: Date): Promise<void> {
+		const { certPath, caCertPath, caKeyPath } = getTlsPaths();
+		const caCertPem = readFileSync(caCertPath, "utf8");
+		const caKeyPem = readFileSync(caKeyPath, "utf8");
+		const altNames = [...getAutoSans(), ...readCustomSans()].map((name) =>
+			isIP(name) ? { type: 7 as const, ip: name } : { type: 2 as const, value: name },
+		);
+		const result = await generate(
+			[
+				{ name: "commonName", value: "NarraFork" },
+				{ name: "organizationName", value: "NarraFork" },
+			],
+			{
+				keySize: 2048,
+				algorithm: "sha256",
+				notBeforeDate: notBefore,
+				notAfterDate: notAfter,
+				extensions: [
+					{ name: "basicConstraints", cA: false },
+					{
+						name: "keyUsage",
+						digitalSignature: true,
+						keyEncipherment: true,
+						critical: true,
+					},
+					{ name: "extKeyUsage", serverAuth: true },
+					{ name: "subjectAltName", altNames },
+				],
+				ca: { key: caKeyPem, cert: caCertPem },
+			},
+		);
+		writeFileSync(certPath, `${result.cert.trimEnd()}\n${caCertPem.trimEnd()}\n`, { mode: 0o644 });
+	}
+
+	function lifetimeDays(pem: string): number {
+		const leaf = new X509Certificate(pem);
+		return (Date.parse(leaf.validTo) - Date.parse(leaf.validFrom)) / DAY_MS;
+	}
+
+	test("reissues a CA-signed leaf whose lifetime exceeds 825 days", async () => {
+		await issueServerCert([]);
+		const now = Date.now();
+		await replaceLeaf(new Date(now - 5 * 60 * 1000), new Date(now + 826 * DAY_MS));
+		const before = snapshotFiles();
+		expect(certificateSans(before[0])).toEqual(expectedSans());
+		expect(lifetimeDays(before[0])).toBeGreaterThan(825);
+		const info = spyOn(logger, "info");
+		let messages: string[] = [];
+		try {
+			expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(true);
+			messages = info.mock.calls.map((call) => String(call[0]));
+		} finally {
+			info.mockRestore();
+		}
+		expect(messages.some((message) => message.includes("825-day cap"))).toBe(true);
+		expect(messages.some((message) => message.includes("SANs changed"))).toBe(false);
+
+		const current = snapshotFiles();
+		expect(current[0]).not.toBe(before[0]);
+		expect(current[1]).not.toBe(before[1]);
+		expect(current.slice(2)).toEqual(before.slice(2));
+		expect(lifetimeDays(current[0])).toBeLessThanOrEqual(825);
+		expect(lifetimeDays(current[0])).toBeGreaterThan(365);
+		expect(Date.parse(new X509Certificate(current[0]).validTo) - Date.now()).toBeGreaterThanOrEqual(
+			30 * DAY_MS,
+		);
+		expect(new X509Certificate(current[0]).verify(new X509Certificate(current[2]).publicKey)).toBe(
+			true,
+		);
+		expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(false);
+		expect(snapshotFiles()).toEqual(current);
+	});
+
+	test.each([
+		["expires in 29 days", 29],
+		["already expired", -1],
+	])("reissues when the leaf %s and the SANs are unchanged", async (_, offsetDays) => {
+		await issueServerCert([]);
+		const now = Date.now();
+		const notAfter = new Date(now + offsetDays * DAY_MS);
+		const notBefore = new Date(notAfter.getTime() - 40 * DAY_MS);
+		await replaceLeaf(notBefore, notAfter);
+		const before = snapshotFiles();
+		expect(certificateSans(before[0])).toEqual(expectedSans());
+		expect(lifetimeDays(before[0])).toBeLessThanOrEqual(825);
+		expect(Date.parse(new X509Certificate(before[0]).validTo)).toBeLessThan(now + 30 * DAY_MS);
+
+		const info = spyOn(logger, "info");
+		let messages: string[] = [];
+		try {
+			expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(true);
+			messages = info.mock.calls.map((call) => String(call[0]));
+		} finally {
+			info.mockRestore();
+		}
+		expect(messages.some((message) => message.includes("remaining life is under 30 days"))).toBe(
+			true,
+		);
+		expect(messages.some((message) => message.includes("SANs changed"))).toBe(false);
+
+		const current = snapshotFiles();
+		expect(current[0]).not.toBe(before[0]);
+		expect(current.slice(2)).toEqual(before.slice(2));
+		expect(new X509Certificate(current[0]).verify(new X509Certificate(current[2]).publicKey)).toBe(
+			true,
+		);
+		expect(Date.parse(new X509Certificate(current[0]).validTo) - Date.now()).toBeGreaterThanOrEqual(
+			30 * DAY_MS,
+		);
+	});
+
+	test("leaves a leaf that is inside the cap with at least 30 days remaining", async () => {
+		await issueServerCert([]);
+		const before = snapshotFiles();
+		const leaf = new X509Certificate(before[0]);
+		expect(lifetimeDays(before[0])).toBeLessThanOrEqual(825);
+		expect(lifetimeDays(before[0])).toBeGreaterThan(365);
+		expect(Date.parse(leaf.validTo) - Date.now()).toBeGreaterThanOrEqual(30 * DAY_MS);
+		expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(false);
+		expect(snapshotFiles()).toEqual(before);
+	});
+
+	test("does not replace an over-long leaf when startup reissue is opted out or external", async () => {
+		await issueServerCert([]);
+		const now = Date.now();
+		await replaceLeaf(new Date(now - 5 * 60 * 1000), new Date(now + 826 * DAY_MS));
+		const before = snapshotFiles();
+		const config = builtinConfig();
+		expect(await reissueBuiltinTlsOnStartup({ ...config, autoReissue: false })).toBe(false);
+		expect(
+			await reissueBuiltinTlsOnStartup({
+				...config,
+				certFile: join(home, "external-cert.pem"),
+			}),
+		).toBe(false);
+		expect(await reissueBuiltinTlsOnStartup({ ...config, passphrase: "encrypted-key" })).toBe(
+			false,
+		);
+		expect(snapshotFiles()).toEqual(before);
 	});
 });
 

@@ -214,6 +214,8 @@ jobs:
           bun test --isolate
           server/lib/agent/execution/__tests__/local-backend-read.test.ts
           tests/server/services/plugin-manager.test.ts
+          tests/server/services/plugin-runtime-windows-job.test.ts
+          server/lib/plugins/windows-plugin-launcher.compiled.test.ts
           server/services/__tests__/plugin-podman-runner.test.ts
           server/services/__tests__/plugin-process-runner.test.ts
           server/services/__tests__/plugin-signature.test.ts

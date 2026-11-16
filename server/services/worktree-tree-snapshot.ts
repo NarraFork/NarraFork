@@ -51,9 +51,9 @@ import {
 	type Stats,
 	statSync,
 } from "node:fs";
-import { lstat, open, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, realpath, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import type {
 	ToolEditPreviewSide,
 	ToolEditPreviewUnavailableReason,
@@ -66,20 +66,20 @@ import { canWriteOptionalDiskData, DiskSpaceError, guardDiskWrite } from "../lib
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
-import { normalizePathForComparison, pathsEqualForOS } from "../lib/platform-path";
+import { pathsEqualForOS } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
-import { treeSnapshotPhysicalDir as shadowDir, treeSnapshotKey } from "./tree-snapshot-paths";
+import {
+	legacyTreeSnapshotKey,
+	legacyTreeSnapshotPhysicalDir,
+	treeSnapshotPhysicalDir as shadowDir,
+	snapshotPathIdentity,
+	treeSnapshotKey,
+} from "./tree-snapshot-paths";
 
 export { treeSnapshotKey } from "./tree-snapshot-paths";
 
-import {
-	confirmLifecyclePathCreated,
-	lifecycleCreationPath,
-	revalidateLifecycleTarget,
-	withLifecycleContext,
-	withShadowCreationReservation,
-} from "./worktree-lifecycle-guard";
+import { revalidateLifecycleTarget, withLifecycleContext } from "./worktree-lifecycle-guard";
 
 const SHADOW_ROOT = getNarraforkPath("tree-snapshots");
 
@@ -440,27 +440,22 @@ function assertLocal(deviceId: string): void {
 	}
 }
 
-/**
- * Resolve the effective global gitignore path. Priority:
- * 1. `git config --get core.excludesFile` (covers global + system config)
- * 2. $XDG_CONFIG_HOME/git/ignore (git's implicit default)
- * 3. ~/.config/git/ignore (XDG fallback)
- *
- * Returns null if none exists or git is not available.
- */
-async function resolveGlobalGitignore(worktreePath: string): Promise<string | null> {
+async function resolveGlobalGitignore(
+	worktreePath: string,
+	signal?: AbortSignal,
+): Promise<string | null> {
+	signal?.throwIfAborted();
 	try {
-		// `git config --get` respects both global and system config files, which
-		// is the same resolution order git itself uses.
 		const result = await safeSpawn({
 			cmd: ["git", "config", "--get", "core.excludesFile"],
 			cwd: worktreePath,
 			timeout: GIT_TIMEOUT_MS,
 			maxOutputBytes: 4096,
+			signal,
 		});
+		signal?.throwIfAborted();
 		if (result.exitCode === 0 && result.stdout.trim()) {
 			const configured = result.stdout.trim();
-			// Expand ~ prefix (git config returns it unexpanded)
 			const expanded =
 				configured.startsWith("~/") || configured === "~"
 					? resolve(homedir(), configured.slice(2))
@@ -468,15 +463,12 @@ async function resolveGlobalGitignore(worktreePath: string): Promise<string | nu
 			if (existsSync(expanded)) return expanded;
 		}
 	} catch {
-		// git not available or timed out — fall through to XDG defaults.
+		// Missing Git/config may use XDG defaults; cancellation may not.
+		signal?.throwIfAborted();
 	}
-
-	// Git's implicit default: $XDG_CONFIG_HOME/git/ignore or ~/.config/git/ignore
 	const xdgHome = process.env.XDG_CONFIG_HOME || resolve(homedir(), ".config");
 	const xdgIgnore = resolve(xdgHome, "git", "ignore");
-	if (existsSync(xdgIgnore)) return xdgIgnore;
-
-	return null;
+	return existsSync(xdgIgnore) ? xdgIgnore : null;
 }
 
 /** Cached global gitignore path + its mtime, to avoid re-resolving every snapshot. */
@@ -566,9 +558,13 @@ function resolveRepoExcludeFiles(worktreePath: string): string[] {
  * `.git` (repo-level exclude) or outside the tree (`core.excludesFile`) are
  * invisible to it and need mirroring.
  */
-async function syncExcludes(dir: string, worktreePath: string): Promise<void> {
-	const infoDir = resolve(dir, "info");
-	mkdirSync(infoDir, { recursive: true });
+async function syncExcludes(
+	dir: string,
+	worktreePath: string,
+	signal?: AbortSignal,
+	beforeWrite?: () => Promise<unknown>,
+): Promise<void> {
+	signal?.throwIfAborted();
 	const parts: string[] = [];
 
 	for (const excludePath of resolveRepoExcludeFiles(worktreePath)) {
@@ -582,7 +578,8 @@ async function syncExcludes(dir: string, worktreePath: string): Promise<void> {
 	// Read the global gitignore (core.excludesFile). Git checks, in order:
 	// 1. The value of `core.excludesFile` from git config (global/system)
 	// 2. $XDG_CONFIG_HOME/git/ignore (defaults to ~/.config/git/ignore)
-	const globalIgnore = await resolveGlobalGitignore(worktreePath);
+	const globalIgnore = await resolveGlobalGitignore(worktreePath, signal);
+	signal?.throwIfAborted();
 	if (globalIgnore) {
 		try {
 			parts.push(readFileSync(globalIgnore, "utf-8"));
@@ -613,8 +610,8 @@ async function syncExcludes(dir: string, worktreePath: string): Promise<void> {
 	// silently dropped.
 	parts.push("/.git/\n");
 	parts.push(`/${WORKTREES_DIR_NAME}/\n`);
-	await Bun.write(resolve(infoDir, "exclude"), parts.join("\n"));
-	await writeShadowAttributes(dir);
+	await writeShadowMetadata(dir, "exclude", parts.join("\n"), signal, beforeWrite);
+	await writeShadowAttributes(dir, signal, beforeWrite);
 }
 
 /**
@@ -723,7 +720,12 @@ const SHADOW_CONFIG_ENV: Record<string, string> = Object.fromEntries([
  * repo would stay byte-inexact for its whole life. Writing it alongside the exclude
  * means the same staleness trigger repairs both, and a first-time create gets it too.
  */
-async function writeShadowAttributes(dir: string): Promise<void> {
+async function writeShadowAttributes(
+	dir: string,
+	signal?: AbortSignal,
+	beforeWrite?: () => Promise<unknown>,
+): Promise<void> {
+	signal?.throwIfAborted();
 	const attributesPath = resolve(dir, "info", "attributes");
 	try {
 		// Skipped when already correct: this sits behind the exclude staleness check,
@@ -735,7 +737,24 @@ async function writeShadowAttributes(dir: string): Promise<void> {
 	} catch {
 		// Unreadable — fall through and overwrite it.
 	}
-	await Bun.write(attributesPath, SHADOW_ATTRIBUTES);
+	await writeShadowMetadata(dir, "attributes", SHADOW_ATTRIBUTES, signal, beforeWrite);
+}
+
+/** Recheck reused repo identity at the effect, after all asynchronous ignore-file reads. */
+async function writeShadowMetadata(
+	dir: string,
+	name: "exclude" | "attributes",
+	contents: string,
+	signal?: AbortSignal,
+	beforeWrite?: () => Promise<unknown>,
+): Promise<void> {
+	signal?.throwIfAborted();
+	await beforeWrite?.();
+	signal?.throwIfAborted();
+	const info = resolve(dir, "info");
+	mkdirSync(info, { recursive: true });
+	await Bun.write(resolve(info, name), contents);
+	signal?.throwIfAborted();
 }
 
 /** Inspect the directory entry, not a symlink's target. Only ENOENT proves absence. */
@@ -755,7 +774,13 @@ async function lstatIfPresent(absolute: string): Promise<Stats | null> {
  * from disk by git on every `add -A`, so they need no re-sync and stat'ing them all
  * would put a recursive directory walk on the tool-execution path.
  */
-async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<void> {
+async function syncExcludesIfStale(
+	dir: string,
+	worktreePath: string,
+	signal?: AbortSignal,
+	beforeWrite?: () => Promise<unknown>,
+): Promise<void> {
+	signal?.throwIfAborted();
 	const gitignorePath = resolve(worktreePath, ".gitignore");
 	let localMtime = 0;
 	try {
@@ -782,7 +807,8 @@ async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<v
 	let globalMtime = 0;
 	const cached = globalIgnoreCache.get(dir);
 	if (!cached) {
-		const resolved = await resolveGlobalGitignore(worktreePath);
+		const resolved = await resolveGlobalGitignore(worktreePath, signal);
+		signal?.throwIfAborted();
 		let mtime = 0;
 		if (resolved) {
 			try {
@@ -808,7 +834,7 @@ async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<v
 	// Combine every mirrored source's mtime into a single cache key for the shadow dir
 	const combinedKey = `${localMtime}:${globalMtime}:${repoExcludeMtime}`;
 	if (excludeMtimes.get(dir) === combinedKey) return;
-	await syncExcludes(dir, worktreePath);
+	await syncExcludes(dir, worktreePath, signal, beforeWrite);
 	excludeMtimes.set(dir, combinedKey);
 }
 
@@ -829,8 +855,8 @@ function hasShadowRepoLayout(dir: string, missingHead = false): boolean {
 	}
 }
 
-/** Validate without attaching a worktree (which would hide core.bare=false). */
-async function validateShadowRepo(dir: string): Promise<void> {
+async function validateShadowRepo(dir: string, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
 	if (!hasShadowRepoLayout(dir)) throw new TreeSnapshotError("existing shadow repo is invalid");
 	const before = lstatSync(dir);
 	const canonical = realpathSync(dir);
@@ -839,11 +865,11 @@ async function validateShadowRepo(dir: string): Promise<void> {
 		timeout: GIT_TIMEOUT_MS,
 		maxOutputBytes: 4096,
 		env: { ...process.env, ...SHADOW_CONFIG_ENV },
+		signal,
 	});
+	signal?.throwIfAborted();
 	const after = lstatSync(dir);
 	const [bare, gitDir] = result.stdout.trim().split("\n");
-	// Windows realpath preserves the input casing, while Git reports the disk
-	// spelling. Compare OS paths, but still require the exact directory identity.
 	const reported = gitDir && existsSync(gitDir) ? lstatSync(gitDir) : null;
 	if (
 		result.exitCode !== 0 ||
@@ -864,16 +890,19 @@ async function validateShadowRepo(dir: string): Promise<void> {
 // Only a failed, exclusively created birth may resume init, including after restart.
 // Fixed protocol, bounded to 256 bytes; not an ownership record for existing repos.
 const SHADOW_INIT_MARKER = "nf-shadow-init";
+const SHADOW_STAGE_PREFIX = ".nf-shadow-stage-";
 
-function shadowInitMarkerContents(dir: string, worktreePath: string): string {
+function shadowInitMarkerContents(dir: string, worktreePath: string, version: 1 | 2 = 2): string {
 	const born = lstatSync(dir);
 	const parent = lstatSync(resolve(dir, ".."));
 	if (!born.isDirectory() || !parent.isDirectory())
 		throw new TreeSnapshotError("shadow initialization directory identity is invalid");
 	const key = createHash("sha256")
-		.update(treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath))
+		.update(
+			(version === 1 ? legacyTreeSnapshotKey : treeSnapshotKey)(LOCAL_DEVICE_ID, worktreePath),
+		)
 		.digest("hex");
-	return `nf-shadow-init-v1\n${key}\n${born.dev}:${born.ino}\n${parent.dev}:${parent.ino}\n`;
+	return `nf-shadow-init-v${version}\n${key}\n${born.dev}:${born.ino}\n${parent.dev}:${parent.ino}\n`;
 }
 
 async function hasValidShadowInitMarker(dir: string, worktreePath: string): Promise<boolean> {
@@ -893,8 +922,9 @@ async function hasValidShadowInitMarker(dir: string, worktreePath: string): Prom
 			const buffer = Buffer.alloc(257);
 			const { bytesRead } = await marker.read(buffer, 0, buffer.length, 0);
 			return (
-				buffer.subarray(0, bytesRead).toString("utf8") === expected &&
-				shadowInitMarkerContents(dir, worktreePath) === expected
+				[expected, shadowInitMarkerContents(dir, worktreePath, 1)].includes(
+					buffer.subarray(0, bytesRead).toString("utf8"),
+				) && shadowInitMarkerContents(dir, worktreePath) === expected
 			);
 		} finally {
 			await marker.close();
@@ -904,83 +934,182 @@ async function hasValidShadowInitMarker(dir: string, worktreePath: string): Prom
 	}
 }
 
-/** Create only an exclusively born shadow directory; never adopt unknown contents. */
-async function ensureShadowRepo(dir: string, worktreePath: string): Promise<void> {
-	// Shared checkout use freezes identities, not ownership. Keep the raw checkout
-	// path for shadow keys; canonical paths are only lifecycle comparison identities.
-	await withLifecycleContext([dir, worktreePath], async () => {
-		// A retirement may take its final snapshot before removing the checkout.
-		dir = await lifecycleCreationPath(dir);
-		if (
-			existsSync(resolve(dir, "HEAD")) &&
-			!(await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER)))
-		) {
-			await validateShadowRepo(dir);
-			dir = await revalidateLifecycleTarget(dir);
-			await syncExcludesIfStale(dir, worktreePath);
-			return;
-		}
-		// Only the physical cold birth is exclusive. The source checkout remains
-		// shareable, and existing valid repos never need receipt migration here.
-		await withShadowCreationReservation({ deviceId: LOCAL_DEVICE_ID, path: dir }, async () => {
-			dir = await revalidateLifecycleTarget(dir);
-			if (await lstatIfPresent(dir)) {
-				if (!(await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER)))) {
-					await validateShadowRepo(dir);
-					dir = await revalidateLifecycleTarget(dir);
-					await syncExcludesIfStale(dir, worktreePath);
-					return;
-				}
-			} else {
-				mkdirSync(resolve(dir, ".."), { recursive: true });
-				dir = await revalidateLifecycleTarget(dir);
-				// EEXIST is not permission to run git init against somebody else's directory.
-				mkdirSync(dir);
-				const born = lstatSync(dir);
-				if (!born.isDirectory()) throw new TreeSnapshotError("shadow birth is not a directory");
-				await confirmLifecyclePathCreated(dir, `${born.dev}:${born.ino}`);
-				dir = await revalidateLifecycleTarget(dir);
-				try {
-					await writeFile(
-						resolve(dir, SHADOW_INIT_MARKER),
-						shadowInitMarkerContents(dir, worktreePath),
-						{
-							flag: "wx",
-							mode: 0o600,
+/** Publish only a complete private repo; failed attempts never poison the final cache key. */
+async function ensureShadowRepo(
+	dir: string,
+	worktreePath: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	await withLifecycleContext(
+		[worktreePath],
+		async () => {
+			signal?.throwIfAborted();
+			// A configured store parent may be a symlink; never follow the final entry itself.
+			mkdirSync(resolve(dir, ".."), { recursive: true, mode: 0o700 });
+			dir = resolve(await realpath(resolve(dir, "..")), basename(dir));
+			signal?.throwIfAborted();
+			const existing = await lstatIfPresent(dir);
+			signal?.throwIfAborted();
+			let resume = false;
+			if (existing) {
+				if (!existing.isDirectory()) throw new TreeSnapshotError("existing shadow repo is invalid");
+				if (await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER))) {
+					if (!(await hasValidShadowInitMarker(dir, worktreePath)))
+						throw new TreeSnapshotError(
+							"shadow initialization marker is invalid or changed identity",
+						);
+					resume = true;
+				} else if (hasShadowRepoLayout(dir)) {
+					await withLifecycleContext(
+						[dir],
+						async () => {
+							await validateShadowRepo(dir, signal);
+							dir = await revalidateLifecycleTarget(dir);
+							await syncExcludesIfStale(dir, worktreePath, signal, () =>
+								revalidateLifecycleTarget(dir),
+							);
 						},
+						signal,
 					);
-				} catch (error) {
-					throw new TreeSnapshotError(
-						`shadow initialization marker creation failed: ${String(error)}`,
-					);
+					return;
+				} else {
+					// rmdir is an atomic emptiness check, never recursive deletion/adoption.
+					signal?.throwIfAborted();
+					try {
+						await rmdir(dir);
+					} catch {
+						throw new TreeSnapshotError("existing shadow repo is invalid");
+					}
 				}
 			}
-			dir = await revalidateLifecycleTarget(dir);
-			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
-				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
-			// `git init --bare` rejects --work-tree, so this cannot go through runGit.
-			const result = await safeSpawn({
-				cmd: ["git", "init", "--bare", dir],
-				timeout: GIT_TIMEOUT_MS,
-				maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
-			});
-			if (result.exitCode !== 0) {
-				// Retain even our own failed birth: partial files are evidence, not garbage.
-				throw new TreeSnapshotError(`shadow repo init failed: ${result.stderr.trim()}`);
+			signal?.throwIfAborted();
+			const stage = await mkdtemp(resolve(dir, "..", `${SHADOW_STAGE_PREFIX}${basename(dir)}-`));
+			try {
+				signal?.throwIfAborted();
+				if (resume) {
+					// Same-parent rename preserves the v1 marker's repo and parent identities.
+					await rmdir(stage);
+					const current = await lstatIfPresent(dir);
+					signal?.throwIfAborted();
+					if (
+						!current?.isDirectory() ||
+						current.dev !== existing?.dev ||
+						current.ino !== existing?.ino
+					)
+						throw new TreeSnapshotError("shadow initialization directory changed identity");
+					await rename(dir, stage);
+					if (!(await hasValidShadowInitMarker(stage, worktreePath)))
+						throw new TreeSnapshotError(
+							"shadow initialization marker is invalid or changed identity",
+						);
+				} else {
+					try {
+						await writeFile(
+							resolve(stage, SHADOW_INIT_MARKER),
+							shadowInitMarkerContents(stage, worktreePath),
+							{
+								flag: "wx",
+								mode: 0o600,
+							},
+						);
+					} catch (error) {
+						signal?.throwIfAborted();
+						throw new TreeSnapshotError(
+							`shadow initialization marker creation failed: ${String(error)}`,
+						);
+					}
+				}
+				signal?.throwIfAborted();
+				const result = await safeSpawn({
+					cmd: ["git", "init", "--bare", stage],
+					timeout: GIT_TIMEOUT_MS,
+					maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+					signal,
+				});
+				signal?.throwIfAborted();
+				if (result.exitCode !== 0 || result.stdoutTruncated || result.stderrTruncated)
+					throw new TreeSnapshotError(`shadow repo init failed: ${result.stderr.trim()}`);
+				await validateShadowRepo(stage, signal);
+				await syncExcludes(stage, worktreePath, signal);
+				await linkLegacyShadowObjects(stage, dir, worktreePath, signal);
+				await revalidateLifecycleTarget(worktreePath);
+				signal?.throwIfAborted();
+				if (!(await hasValidShadowInitMarker(stage, worktreePath)))
+					throw new TreeSnapshotError(
+						"shadow initialization marker is invalid or changed identity",
+					);
+				// Incomplete markers never appear at the final path after successful publication.
+				signal?.throwIfAborted();
+				await unlink(resolve(stage, SHADOW_INIT_MARKER));
+				signal?.throwIfAborted();
+				const prepared = lstatSync(stage);
+				await publishShadowRepo(stage, dir, signal);
+				const published = lstatSync(dir);
+				if (prepared.dev !== published.dev || prepared.ino !== published.ino)
+					throw new TreeSnapshotError("published shadow repo changed identity");
+				excludeMtimes.delete(dir);
+			} catch (error) {
+				logger.warn("Tree-snapshot initialization failed", {
+					stageDir: existsSync(stage) ? stage : undefined,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				throw error;
+			} finally {
+				excludeMtimes.delete(stage);
+				globalIgnoreCache.delete(stage);
 			}
-			dir = await revalidateLifecycleTarget(dir);
-			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
-				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
-			await validateShadowRepo(dir);
-			dir = await revalidateLifecycleTarget(dir);
-			await syncExcludes(dir, worktreePath);
-			dir = await revalidateLifecycleTarget(dir);
-			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
-				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
-			await unlink(resolve(dir, SHADOW_INIT_MARKER));
-			excludeMtimes.delete(dir);
-		});
+		},
+		signal,
+	);
+}
+
+/** Standard rename never overwrites nonempty data; Windows may need one empty-target retry. */
+async function publishShadowRepo(stage: string, dir: string, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	try {
+		await rename(stage, dir);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (!["EEXIST", "ENOTEMPTY", "EPERM"].includes(code ?? "")) throw error;
+		signal?.throwIfAborted();
+		if (!(await lstatIfPresent(dir))?.isDirectory()) throw error;
+		signal?.throwIfAborted();
+		try {
+			await rmdir(dir);
+		} catch {
+			throw error;
+		}
+		signal?.throwIfAborted();
+		await rename(stage, dir);
+	}
+	signal?.throwIfAborted();
+}
+
+/** Only immutable historical objects are shared; new writes stay in the new identity's repo. */
+async function linkLegacyShadowObjects(
+	stage: string,
+	dir: string,
+	worktreePath: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	const legacy = legacyTreeSnapshotPhysicalDir(LOCAL_DEVICE_ID, worktreePath);
+	if (legacy === dir || !hasShadowRepoLayout(legacy)) return;
+	await validateShadowRepo(legacy, signal);
+	signal?.throwIfAborted();
+	const alternates = resolve(stage, "objects", "info", "alternates");
+	await writeFile(alternates, `${JSON.stringify(resolve(legacy, "objects"))}\n`, {
+		flag: "wx",
+		mode: 0o600,
 	});
+	signal?.throwIfAborted();
+}
+
+/** Legacy fallback is read-only and requires callers to provide an explicit historical tree hash. */
+function readableShadowDir(deviceId: string, worktreePath: string): string {
+	const current = shadowDir(deviceId, worktreePath);
+	if (hasShadowRepoLayout(current)) return current;
+	const legacy = legacyTreeSnapshotPhysicalDir(deviceId, worktreePath);
+	return legacy !== current && hasShadowRepoLayout(legacy) ? legacy : current;
 }
 
 /**
@@ -1013,7 +1142,7 @@ async function recordTreeHash(
 		.values({
 			id: generateId(),
 			deviceId,
-			worktreePath: normalizePathForComparison(worktreePath),
+			worktreePath: snapshotPathIdentity(worktreePath),
 			treeHash,
 			createdAt: new Date().toISOString(),
 		})
@@ -1131,7 +1260,7 @@ async function captureUnlocked(
 	let failed: unknown;
 	try {
 		opts?.signal?.throwIfAborted();
-		await ensureShadowRepo(dir, worktreePath);
+		await ensureShadowRepo(dir, worktreePath, opts?.signal);
 		const startedAt = Date.now();
 		let added = await addAllUnlocked(dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
 		// A stale lock is indistinguishable from a live one by exit code alone, so the
@@ -1731,7 +1860,7 @@ export const worktreeTreeSnapshot = {
 			relPath.split("/").some((part) => part === ".." || part === ".")
 		)
 			return unavailable("unsupported");
-		const dir = shadowDir(deviceId, worktreePath);
+		const dir = readableShadowDir(deviceId, worktreePath);
 		const run = (args: string[], limit: number) =>
 			safeSpawn({
 				cmd: ["git", "--git-dir", dir, "--work-tree", worktreePath, ...args],
@@ -1796,7 +1925,7 @@ export const worktreeTreeSnapshot = {
 		deviceId: string = LOCAL_DEVICE_ID,
 	): Promise<{ path: string; kind: "added" | "updated" | "deleted" }[]> {
 		assertLocal(deviceId);
-		const dir = shadowDir(deviceId, worktreePath);
+		const dir = readableShadowDir(deviceId, worktreePath);
 		const result = await runGitPaths(
 			["diff-tree", "-r", "--name-status", "--no-commit-id", "-z", fromTree, toTree],
 			dir,
@@ -1830,9 +1959,12 @@ export const worktreeTreeSnapshot = {
 	 * kept as evidence and skipped.
 	 */
 	async gcAll(): Promise<void> {
+		// A cold warm-up may still be preparing a stage: its final path does not exist yet.
+		for (const dir of [...warmupInFlight.keys()])
+			await acquireShadowPreemptingWarmup(dir, async () => undefined);
 		if (!existsSync(SHADOW_ROOT)) return;
 		for (const entry of readdirSync(SHADOW_ROOT, { withFileTypes: true })) {
-			if (!entry.isDirectory()) continue;
+			if (!entry.isDirectory() || !/^[a-f0-9]{32}$/.test(entry.name)) continue;
 			const dir = resolve(SHADOW_ROOT, entry.name);
 			// Serialized against captures: HEAD repair and `gc` both mutate the repo; a
 			// concurrent `add -A`/`write-tree` in the same repo can fail or race with

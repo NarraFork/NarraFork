@@ -13,6 +13,7 @@ import {
 	CHECK_INTERVAL_MS,
 	contextAround,
 	createRenderedPatternMatcher,
+	createWatchFrameMatcher,
 	echoEnd,
 	endWatchesForBuffer,
 	MAX_WATCH_PATTERN_CHARS,
@@ -91,6 +92,25 @@ async function start(
 	return result.taskId;
 }
 
+async function startWithCursor(buffer: BufferManager, pattern: string, startAt?: WatchStart) {
+	const cursor = await buffer.markReadCursor();
+	if (!cursor) throw new Error("no cursor");
+	const result = await startTerminalWatch({
+		narratorId: PARENT,
+		terminalId: TERMINAL,
+		terminalName: "T",
+		pattern,
+		timeoutMs: 60_000,
+		buffer,
+		cursor,
+		marker: cursor.marker,
+		disposeMarkers: cursor.dispose,
+		start: startAt ?? { kind: "offset", offset: cursor.offset, textBefore: cursor.textBefore },
+	});
+	if (result.status !== "started") throw new Error(result.message);
+	return result.taskId;
+}
+
 async function row(taskId: string) {
 	return db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
 }
@@ -128,6 +148,74 @@ describe("helpers", () => {
 	test("contextAround keeps whole lines around the match", () => {
 		const text = ["a", "b", "x MATCH y", "c"].join("\n");
 		expect(contextAround(text, text.indexOf("MATCH"), 5)).toBe(text);
+	});
+});
+
+describe("layout frame matching", () => {
+	test("reflow baselines exclude history and preserve partial matches", () => {
+		const match = createWatchFrameMatcher("READY", {
+			kind: "offset",
+			offset: 5,
+			textBefore: "READY",
+		});
+		expect(
+			match({ kind: "snapshot", text: "READY", markerLost: false, observedPrefixEnd: 5 }),
+		).toBe(-1);
+		expect(match({ kind: "baseline", text: "prefix READY RE" })).toBe(-1);
+		expect(
+			match({
+				kind: "snapshot",
+				text: "prefix READY READY",
+				markerLost: false,
+				observedPrefixEnd: 18,
+			}),
+		).toBe(13);
+	});
+
+	test("a command echo cannot match a literal crossing its trailing newline", () => {
+		const match = createWatchFrameMatcher("READY\n", { kind: "echo", input: "echo READY\n" });
+		expect(match({ kind: "snapshot", text: "$ echo READY", markerLost: false })).toBe(-1);
+		expect(match({ kind: "baseline", text: "$ echo READY" })).toBe(-1);
+		expect(match({ kind: "snapshot", text: "$ echo READY\nworking", markerLost: false })).toBe(-1);
+		expect(match({ kind: "snapshot", text: "$ echo READY\nREADY\n", markerLost: false })).toBe(13);
+	});
+
+	test("a parsed echo stays excluded when a multiline pattern completes after resize", () => {
+		const match = createWatchFrameMatcher("READY\nworkingDONE", {
+			kind: "echo",
+			input: "echo READY\n",
+		});
+		expect(match({ kind: "snapshot", text: "$ echo READY\nworking", markerLost: false })).toBe(-1);
+		expect(match({ kind: "baseline", text: "older history\n$ echo READY\nworking" })).toBe(-1);
+		expect(
+			match({
+				kind: "snapshot",
+				text: "older history\n$ echo READY\nworkingDONE",
+				markerLost: false,
+			}),
+		).toBe(-1);
+		expect(
+			match({
+				kind: "snapshot",
+				text: "older history\n$ echo READY\nworkingDONE\nREADY\nworkingDONE",
+				markerLost: false,
+			}),
+		).toBe(39);
+	});
+
+	test("a resize before any echo does not discard the first no-echo output line", () => {
+		const match = createWatchFrameMatcher("READY", { kind: "echo", input: "deploy\n" });
+		expect(match({ kind: "snapshot", text: "$ ", markerLost: false })).toBe(-1);
+		expect(match({ kind: "baseline", text: "$ " })).toBe(-1);
+		expect(match({ kind: "snapshot", text: "$ READY\nnext", markerLost: false })).toBe(2);
+	});
+
+	test("an unresolved clipped command is excluded until its line ends", () => {
+		const match = createWatchFrameMatcher("READY", { kind: "echo", input: "long command READY\n" });
+		expect(match({ kind: "snapshot", text: "$ long comm", markerLost: false })).toBe(-1);
+		expect(match({ kind: "baseline", text: "$ long" })).toBe(-1);
+		expect(match({ kind: "snapshot", text: "$ long READY\n", markerLost: false })).toBe(-1);
+		expect(match({ kind: "snapshot", text: "$ long READY\nREADY", markerLost: false })).toBe(13);
 	});
 });
 
@@ -197,6 +285,52 @@ describe("rendered pattern freshness", () => {
 });
 
 describe("terminal watch", () => {
+	test("multiline partial output survives a resize on the next empty cursor row", async () => {
+		const buffer = newBuffer();
+		const id = await startWithCursor(buffer, "RE\nADY");
+		output(buffer, "RE\r\n");
+		await buffer.resize(120, 24);
+		output(buffer, "ADY");
+		expect((await waitForStatus(id))?.status).toBe("completed");
+	});
+
+	test("an echo terminator arriving after resize cannot satisfy notify_on", async () => {
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await startWithCursor(buffer, "READY\n", { kind: "echo", input: "echo READY\n" });
+		output(buffer, "echo READY");
+		await buffer.resize(120, 24);
+		output(buffer, "\r\nworking\r\n");
+		await Bun.sleep(CHECK_INTERVAL_MS * 2);
+		expect((await row(id))?.status).toBe("running");
+		output(buffer, "READY\r\nnext");
+		expect((await waitForStatus(id))?.status).toBe("completed");
+	});
+
+	test("resize preserves an already parsed echo exclusion across multiline result suffixes", async () => {
+		const buffer = newBuffer();
+		output(buffer, "older history\r\n$ ");
+		const id = await startWithCursor(buffer, "READY\nworkingDONE", {
+			kind: "echo",
+			input: "echo READY\n",
+		});
+		output(buffer, "echo READY\r\nworking");
+		await buffer.resize(120, 24);
+		output(buffer, "DONE");
+		await Bun.sleep(CHECK_INTERVAL_MS * 2);
+		expect((await row(id))?.status).toBe("running");
+		output(buffer, "\r\nREADY\r\nworkingDONE");
+		expect((await waitForStatus(id))?.status).toBe("completed");
+	});
+
+	test("resize before no-echo output preserves its first result line", async () => {
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await startWithCursor(buffer, "READY", { kind: "echo", input: "deploy\n" });
+		await buffer.resize(120, 24);
+		output(buffer, "READY\r\nnext");
+		expect((await waitForStatus(id))?.status).toBe("completed");
+	});
 	test("command output after the echo completes the watch and wakes the narrator", async () => {
 		const buffer = newBuffer();
 		output(buffer, "user@host:~$ ");

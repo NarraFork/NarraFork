@@ -216,14 +216,14 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 - 额度缓存按 Key 记录（`provider-key-subjects.ts`）；缓存看到某个窗口用完时，池子在窗口重置前跳过该 Key（`provider-key-quota.ts`）。状态栏仍按供应商显示，取第一个可用 Key。
 - 只有一个普通 Key（没有独立网络身份）时仍走原来的直连适配器，行为完全不变。
 
-Codex 现有的能力（优先级、档位排序、会话亲和、连续失败停用、归档、配额预测）上移为**通用凭据池**，Codex 只保留 OAuth、PAT、Agent Identity 的登录实现与额度探测器。
+**公共凭据池核心（P2 已实现）**：`server/lib/agent/credential-pool.ts` 统一候选过滤、优先级 / 均衡 / 档位选择、会话亲和、已试候选排除、冷却与失败状态决策；CodexManager 和普通 Key 池都调用它，不各自保留选号算法。亲和存储共用 `session-affinity.ts`。Codex 的 OAuth / PAT / Agent Identity 登录、额度探测与预测、持久化和管理界面仍留在 Codex 模块；服务特有的协议与错误识别不塞进公共核心。普通 Key 保留原有顺序和冷却规则，Codex 保留原有三种模式，不新增配置或界面。
 
 ## 7. 存储与安全
 
 凭据走文件，不进数据库（2026-11-03 定）：凭据量小、读多写少，文件不依赖 SQLite / PostgreSQL 两套后端，也不碰主线程 SQLite 规则。
 
 - **凭据文件**：`codex-credentials.json`（已有），以及通用凭据池的 `provider-keys.json`。每条凭据：id、serviceId、`ownerUserId`（空 = 团队）、标签、登录方式、秘密、状态、优先级、归档时间、网络身份、计费、隐私标志。额度快照只在内存与 `*-stats.json`，不写进凭据文件。
-- **服务配置**（名称、协议、baseUrl、高级项）仍留在 `settings.json`。自定义 API 供应商的 Key 已迁进 `provider-keys.json`（`server/lib/provider-keys.ts`），磁盘上的 settings.json 不再写 `apiKey`；内存里 `apiKey` 是该供应商的第一个 Key（`settings/provider-keys-projection.ts`），所以读单个 Key 的旧代码不变，写这个字段就是改第一个 Key。迁移出来的 Key 沿用供应商 id，已记账的用量仍归到它名下。凭据文件读不了时什么都不迁，settings.json 照旧保存 Key。回退到此前的版本会读到空 Key，需要重新填写。NUG 供应商、TokenDance、Command Code 和自定义搜索供应商的 `apiKey` 用同一套投影迁出，各占一个 Key，存在带命名空间的归属 id 下（`nug:<id>`、`builtin:tokendance`、`builtin:CommandCode`、`search:<id>`）；删除这些条目或清空 Key 时，存储里对应的 Key 一并删除。NUG 的 OAuth client secret 与搜索供应商的敏感请求头仍在 settings.json。
+- **服务配置**（名称、协议、baseUrl、高级项）仍留在 `settings.json`。自定义 API 供应商的 Key 已迁进 `provider-keys.json`（`server/lib/provider-keys.ts`），磁盘上的 settings.json 不再写 `apiKey`；内存里 `apiKey` 是该供应商的第一个 Key（`settings/provider-keys-projection.ts`），所以读单个 Key 的旧代码不变，写这个字段就是改第一个 Key。迁移出来的 Key 沿用供应商 id，已记账的用量仍归到它名下。凭据文件读不了时什么都不迁，settings.json 照旧保存 Key。回退到此前的版本会读到空 Key，需要重新填写。NUG 供应商、TokenDance、Command Code 和自定义搜索供应商的 `apiKey` 用同一套投影迁出，各占一个 Key，存在带命名空间的归属 id 下（`nug:<id>`、`builtin:tokendance`、`builtin:CommandCode`、`search:<id>`）；删除这些条目或清空 Key 时，存储里对应的 Key 一并删除。NUG 的 OAuth client secret 也沿用标量投影，归属为 `nug-oauth:<id>`，不进入推理 Key 池；搜索供应商的敏感请求头保存为 `search-provider-secrets.json` 中按供应商 id 分组的小 map，复用相同的文件加密与访问保护，普通请求头仍留在 settings.json。加载时自动迁移，内存字段、掩码回传和保存操作不变；显式清空、删除后不恢复旧值。搜索配置本来不属于数据导出或凭据迁移范围，本次不扩展。
 - **加密（默认开，可关）**：`server/lib/secret-store.ts` 用 AES-256-GCM 写信封 `{format:"narrafork.secret.v1", iv, tag, data}`，密钥在 `~/.narrafork/secret.key`（0600，首次写入时生成）。读取同时接受信封和明文 JSON，所以开关切换（`settings.secrets.encrypt`，设置 → 服务器与系统）只是把已登记的文件按新形式重写一遍，不会丢数据。
 - **它防什么**：凭据文件被单独拷走（备份、同步盘、误分享）。密钥和文件在同一目录，能读整个数据目录的人照样能解密；界面说明如实写出这一点。“不计入团队统计”同样是产品承诺，不是密码学保证。
 - **解不开就不写**：文件存在但解密失败（密钥丢失或被换）时，所属管理器只记错误、不加载、不保存，绝不用空列表覆盖唯一一份数据。`secret.key` 与凭据文件一样在 `fs-secret-paths` 拒读名单里。
@@ -372,7 +372,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 |---|---|---|
 | **P0 地基**（已完成） | 所有来源写 `credentialId`；`api_requests` 记录计费主体与项目；`usage_daily`；修复首页汇总越权 | 用量可按来源区分；首页只显示自己的开销 |
 | **P1 目录重做**（已完成） | 按 §8 重做模型目录：3 层合并、8 类字段、独立覆盖文件、精简在线更新、新模型卡界面；删除变体 / 绑定 / 遗留归档 | 模型参数页只剩必要字段，不再报错和卡顿。后续逻辑模型路由依赖这里的模型身份匹配，所以提前 |
-| **P2 存储**（基本完成） | 凭据文件加密（`secret-store.ts` 已完成，Codex 凭据已接入，可在设置中关闭）；凭据迁移（二次核验 + 口令加密导出 / 预览导入，已完成）；API key 迁出 `settings.json`（自定义 API、NUG、TokenDance、Command Code、自定义搜索供应商，已完成）；数据导出带全部 Key，需二次核验并用口令加密（§7，已完成）；自定义 API 供应商的多 Key 池（Key 存储、会话粘性轮换与故障切换、逐 Key 额度与网络身份、Key 列表界面，已完成；Codex 的池化逻辑暂留在 CodexManager，后续与之合并）；逐凭据网络身份（Codex 账号已完成：`shared/credential-network.ts` + `server/lib/codex-network.ts`，请求、令牌刷新、额度查询与 Agent Identity 注册都走账号自己的代理 / UA / 设备 ID / 请求头）。**剩余**：CodexManager 池化合并；NUG OAuth client secret 与搜索供应商敏感请求头迁出 settings.json | Kimi / OpenCode 等获得 Codex 式详情页 |
+| **P2 存储**（已完成） | 凭据文件加密；二次核验 + 口令加密迁移；API Key、站点 token、NUG OAuth secret 与搜索敏感头迁出普通配置；数据导出中的 Key 与 OAuth secret 进入密文包；多 Key 池、会话亲和、故障切换、逐 Key 额度及网络身份；Codex 与 Key 池共用选择与失败决策核心。见 §6、§7 | Kimi / OpenCode 等获得 Codex 式详情页；现有保存和使用操作不变 |
 | **P3 路由**（部分完成） | `auto:` 模型值、`resolveRoute`、策略预设、纪元锁、模型选择器二级菜单；把聚合迁为 `auto:`（`前缀:模型` 值无需迁移）。**已完成**：`auto:` 值与保存校验、聚合迁移（SQLite 与 PostgreSQL）、固定排序（能否服务 → 订阅 → 参考价）与最小能力过滤、被迫切换、渠道锁（激活恢复、压缩后重选）、“参与自动”开关、选择器来源行与按厂商分组、状态栏额度跟随会话实际来源、来源行当前账号 / Key 与重置倒计时（§4、§10.2、§14.1）。**剩余**：`resolveRoute` 统一入口、策略预设与拖动排序、稳定性维度、路由策略设置页（§4.2、§10.3；本期只做设置页 + “省钱”“用掉订阅”两个预设） | “模型聚合”消失，来源变为二级菜单 |
 | **P4 个人来源** | 个人凭据、计费主体规则、团队回落、团队策略与个人预算 | 非管理员可登录自己的订阅 |
 | **P5 开销与分析** | 计费配置、实际开销、节省量、我的用量 / 团队用量、隐私、项目预算 | 用量页对所有人开放 |
@@ -390,11 +390,11 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 8. **凭据迁移**：管理员经密码 + 第二因素核验后，可导出单个 / 多个 / 全部凭据为口令加密文件，在另一台实例导入，见 §7。
 9. **模型值写法**（2026-11-04 改定）：保留 `前缀:模型`，含义改为“指定服务”，凭据在前缀之下选；新增 `auto:<逻辑模型>` 表示自动选来源。不再新增 `narrators.modelSource` 字段，也不把 `narrators.model` 改成不带前缀的逻辑模型。理由：前缀让一个字符串就能确定上游，目录外的模型照样可用，同名而实际不同的上游模型不会被误合并，纪元与推理签名的边界也不用改；而按计费主体选凭据、个人到团队的回落，在前缀之下就能完成。见 §4.1。
 
-## 14. 交接：现状与下一步（2026-11-06 更新）
+## 14. 交接：现状与下一步（2026-11-13 更新）
 
 本节给接手的人：做到了哪里、代码在哪、下一步按什么顺序做、有哪些已知的坑。设计本身以前文为准。
 
-### 14.1 已完成（分支 `claude/sleepy-wozniak-aousdo`）
+### 14.1 已完成
 
 | 阶段 | 内容 | 主要位置 |
 |---|---|---|
@@ -405,6 +405,8 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 | P2 | 凭据迁移：密码 + 第二因素核验、口令加密导出、预览导入 | `server/services/step-up-service.ts`、`server/lib/credential-transfer/`、`routes/credential-transfer.ts`、`CredentialTransferCard.tsx` |
 | P2 | 自定义 API 供应商多 Key 池：Key 迁出 settings.json、会话粘性轮换与故障切换、逐 Key 额度与网络身份、Key 列表界面 | `server/lib/provider-keys.ts`、`settings/provider-keys-projection.ts`、`agent/pooled-provider.ts`、`provider-key-{subjects,quota}.ts`、`routes/provider-keys.ts`、`ProviderKeysPanel.tsx` |
 | P2 | NUG、TokenDance、Command Code、自定义搜索供应商的 `apiKey` 迁出 settings.json（同一投影，归属 id 带命名空间） | `settings/provider-keys-projection.ts` |
+| P2 | 公共池核心：选择模式、亲和与候选排除、失败停用和冷却决策；两种池接入并删除重复实现 | `agent/credential-pool.ts`、`codex-manager.ts`、`agent/pooled-provider.ts` |
+| P2 | NUG OAuth secret 与搜索敏感头自动迁出，保持掩码保存；OAuth 随既有密文导出包往返 | `settings/provider-keys-projection.ts`、`settings/search-header-secrets.ts`、`services/data-portability-keys.ts` |
 | P3 | 模型值改定为 `前缀:模型` + `auto:<模型>`（§4.1）；`auto` 成为保留前缀；`agent.autoExcludedProviders` | `shared/auto-model.ts`、`server/lib/settings/provider.ts` |
 | P3 | `auto:` 排序：能否服务 → 订阅优先 → 参考价；会话来源仍能服务时不换 | `shared/auto-route-strategy.ts`、`server/lib/agent/auto-route-signals.ts` |
 | P3 | 子代理可用模型与模型池接受 `auto:` | `server/lib/agent/tools/task.ts`、`settings/provider.ts` |
@@ -418,17 +420,16 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 | P3 | 选择器：来源行额度条 / 参考价 / 设置入口、自动理由、按厂商分组与去重（§10.2） | `ModelMenuItems.tsx`、`model-menu-selection.ts` |
 | P3 | 数据导入 / 导出补 `autoExcludedProviders`、导入会话跟随前缀改名（§11） | `services/data-portability.ts` |
 
+P2 本轮收尾位于 `fix/p2-pool-secrets`，基于 `main@dd11a53e7`。已通过 23 个相关文件的 295 项隔离测试、完整类型检查、前端构建和 18 个改动文件的 Biome 检查；未在真实配置上执行迁移，也未重启运行服务。
+
 架构说明页（可分享）：设计 https://claude.ai/artifact/19BW1ReTRShtDynQHXJDUE ，现状梳理 https://claude.ai/artifact/HJfhaWMvFtFjxhFDaN8S8E （P2 之后的变化以本文为准）。
 
 ### 14.2 下一步，按顺序
 
 1. **P3 剩余**
    - 路由策略设置页 + “省钱”“用掉订阅”两个预设（§4.2、§10.3；稳定性、均衡、拖动排序、`resolveRoute` 统一入口等采集到数据后再做）。
-2. **P2 收尾**
-   - 把 CodexManager 里与账号无关的池化逻辑（优先级、会话亲和、失败停用、额度跳过）与 `pooled-provider.ts` 合并成一个通用池；Codex 只保留 OAuth / PAT / Agent Identity 登录与 `/wham/usage` 探测。不要一次重写 CodexManager，先抽出纯函数再替换调用点。
-   - NUG OAuth client secret 与搜索供应商敏感请求头迁出 settings.json。
-3. **P4 个人来源**（§5）：Key / 账号加 `ownerUserId`（`ProviderKey` 与 `CodexCredential` 都要加，导出包与 `credential-transfer/kinds.ts` 一并带上）；计费主体 = 根叙述者所有者，`usage_daily.billing_user_id` 已在记；团队回落与个人预算。
-4. **P5 开销与分析**（§9）：订阅月费 / 折扣配置、实际开销与节省量、我的用量 / 团队用量页、“不计入团队统计”、项目预算。数据源是 `usage_daily`，不要在请求路径上做聚合。
+2. **P4 个人来源**（§5）：Key / 账号加 `ownerUserId`（`ProviderKey` 与 `CodexCredential` 都要加，导出包与 `credential-transfer/kinds.ts` 一并带上）；计费主体 = 根叙述者所有者，`usage_daily.billing_user_id` 已在记；团队回落与个人预算。
+3. **P5 开销与分析**（§9）：订阅月费 / 折扣配置、实际开销与节省量、我的用量 / 团队用量页、“不计入团队统计”、项目预算。数据源是 `usage_daily`，不要在请求路径上做聚合。
 
 ### 14.3 约定与已知事项
 

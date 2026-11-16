@@ -3,12 +3,14 @@ import { join } from "node:path";
 import type { Worker } from "node:worker_threads";
 import { compiledWorkerSpecifiers, connectCompiledWorker } from "../compiled-worker";
 import { diskSafetySettings, guardDiskWrite } from "../disk-safety";
+import { hotSafe } from "../hot-safe";
 import { generateId } from "../id";
 import { logger } from "../logger";
 import { getNarraforkPath } from "../narrafork-home";
 import { redactDiagnosticText } from "../net/diagnostic-redaction";
 import { readWithTimeout } from "../stream-timeout";
 import { getUploadsDir } from "../uploads";
+import { type PoolWorker, WorkerPool, type WorkerTaskContext } from "../worker-runtime/pool";
 import type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
 import type {
 	ImageGenerationWorkerReply,
@@ -129,7 +131,14 @@ async function persistResponseBody(
 	let fileClosed = false;
 	let bodyComplete = false;
 	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-	const onAbort = () => void reader?.cancel(signal.reason).catch(() => {});
+	let cancelling: Promise<void> | undefined;
+	const cancelReader = (reason: unknown) => {
+		cancelling ??= reader?.cancel(reason) ?? Promise.resolve();
+		return cancelling;
+	};
+	const onAbort = () => {
+		void cancelReader(signal.reason).catch(() => {});
+	};
 	try {
 		signal.throwIfAborted();
 		if (!response.body) throw new Error("Image generation response has no body");
@@ -170,44 +179,73 @@ async function persistResponseBody(
 		metadata.integrity.complete = bodyComplete;
 		metadata.integrity.byteLength = byteLength;
 		await writeMetadata(metadata).catch(() => {});
-		void reader?.cancel(error).catch(() => {});
+		await cancelReader(error).catch(() => {});
 		throw error;
 	} finally {
 		signal.removeEventListener("abort", onAbort);
-		reader?.releaseLock();
-		if (!fileClosed) await file.close();
+		try {
+			await cancelling;
+		} finally {
+			reader?.releaseLock();
+			if (!fileClosed) await file.close();
+		}
 	}
 }
 
 interface ResponseProcessor {
 	worker: Worker;
 	failure?: unknown;
-	dispose(): void;
+	/** Resolves only after actual exit. No fire-and-forget resource disposal. */
+	dispose(): Promise<void>;
 }
 
-async function createProcessor(signal: AbortSignal): Promise<ResponseProcessor> {
-	const { worker } = await connectCompiledWorker(
+type ImageResponseJob = (
+	processor: ResponseProcessor,
+	signal: AbortSignal,
+) => Promise<StoredImageGeneration>;
+
+function createResponsePool() {
+	return new WorkerPool<ImageResponseJob, StoredImageGeneration>({
+		concurrency: 2,
+		maxQueued: 32,
+		maxQueuedBytes: 64 * 1024 * 1024,
+		// Each permit leases one exclusive worker for readiness, the paid send and its response.
+		reuse: false,
+		create: createProcessor,
+	});
+}
+
+const responseOwner = hotSafe("narrafork.imageGenerationResponse.workers.v1", () => ({
+	pool: createResponsePool(),
+}));
+
+/** Permanent production close; pending creation, handler cleanup and native exits are awaited. */
+export function closeImageGenerationResponseWorkers(): Promise<void> {
+	return responseOwner.pool.close(new Error("Image response workers are closed"));
+}
+
+export async function resetImageGenerationResponseWorkersForTests(): Promise<void> {
+	await closeImageGenerationResponseWorkers();
+	responseOwner.pool = createResponsePool();
+}
+
+async function createProcessor(
+	context: WorkerTaskContext,
+): Promise<PoolWorker<ImageResponseJob, StoredImageGeneration>> {
+	const { worker, handle } = await connectCompiledWorker(
 		compiledWorkerSpecifiers(
 			"lib/agent/image-generation-response-worker.ts",
 			"./image-generation-response-worker.ts",
 			import.meta.url,
 		),
-		{ signal },
+		{
+			signal: context.signal,
+			deadlineAt: Math.min(Date.now() + 5_000, context.deadlineAt),
+		},
 	);
-	let disposed = false;
 	const processor: ResponseProcessor = {
 		worker,
-		dispose() {
-			if (disposed) return;
-			disposed = true;
-			signal.removeEventListener("abort", onAbort);
-			// The lifetime error listener remains until termination so late errors cannot escape.
-			void worker.terminate();
-		},
-	};
-	const onAbort = () => {
-		processor.failure = signal.reason ?? new Error("Image response processing cancelled");
-		processor.dispose();
+		dispose: () => handle.close(),
 	};
 	worker.on("error", (error: Error) => {
 		processor.failure = error;
@@ -215,9 +253,27 @@ async function createProcessor(signal: AbortSignal): Promise<ResponseProcessor> 
 	worker.on("exit", (code: number) => {
 		processor.failure ??= new Error(`Image response worker exited with code ${code}`);
 	});
-	signal.addEventListener("abort", onAbort, { once: true });
-	if (signal.aborted) onAbort();
-	return processor;
+	let running: Promise<StoredImageGeneration> | undefined;
+	return {
+		get closed() {
+			return handle.closed;
+		},
+		run(job, task) {
+			running = Promise.resolve().then(() => job(processor, task.signal));
+			return running;
+		},
+		async close() {
+			// An exited worker alone does not prove the response reader/file writer has drained.
+			// Waiting for both also prevents cancellation returning a slot ahead of body cleanup.
+			await Promise.all([
+				handle.close(),
+				running?.then(
+					() => {},
+					() => {},
+				),
+			]);
+		},
+	};
 }
 
 async function processWithWorker(
@@ -234,7 +290,7 @@ async function processWithWorker(
 			controller = value;
 		},
 		cancel() {
-			processor.dispose();
+			return processor.dispose();
 		},
 	});
 	const onAbort = () =>
@@ -242,21 +298,28 @@ async function processWithWorker(
 	const onError = (error: Error) => controller.error(error);
 	const onExit = (code: number) =>
 		controller.error(new Error(`Image response worker exited before completing (${code})`));
-	const onMessage = (message: ImageGenerationWorkerReply) => {
-		if (!message || "ready" in message) return;
-		if (!message.ok)
+	const onMessage = (frame: unknown) => {
+		if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+			controller.error(new Error("Invalid image response worker reply"));
+			return;
+		}
+		const message = frame as ImageGenerationWorkerReply;
+		if ("ready" in message && message.ready === true && !("ok" in message)) return;
+		if ("ok" in message && message.ok === false && typeof message.error === "string")
 			controller.error(
 				new ImageGenerationResponseError(message.error, {
 					responseId: metadata.responseId,
-					code: message.code,
+					code: typeof message.code === "string" ? message.code : undefined,
 				}),
 			);
-		else if (!Array.isArray(message.images) || !message.images.length)
-			controller.error(new Error("Image response worker returned no images"));
-		else {
-			controller.enqueue(message.images);
-			controller.close();
-		}
+		else if ("ok" in message && message.ok === true) {
+			if (!Array.isArray(message.images) || !message.images.length)
+				controller.error(new Error("Image response worker returned no images"));
+			else {
+				controller.enqueue(message.images);
+				controller.close();
+			}
+		} else controller.error(new Error("Invalid image response worker reply"));
 	};
 	worker.on("message", onMessage);
 	worker.on("error", onError);
@@ -285,17 +348,24 @@ async function processWithWorker(
 		return result.value;
 	} finally {
 		const elapsedMs = performance.now() - started;
-		if (elapsedMs > 1_000)
-			logger.warn("Slow image generation local response processing", {
-				responseId: metadata.responseId,
-				elapsedMs,
-			});
+		if (elapsedMs > 1_000) {
+			try {
+				logger.warn("Slow image generation local response processing", {
+					elapsedMs: Math.round(elapsedMs),
+				});
+			} catch {
+				// Diagnostics must not skip listener, reader or worker cleanup below.
+			}
+		}
 		signal.removeEventListener("abort", onAbort);
 		worker.off("message", onMessage);
 		worker.off("error", onError);
 		worker.off("exit", onExit);
-		processor.dispose();
-		reader.releaseLock();
+		try {
+			await processor.dispose();
+		} finally {
+			reader.releaseLock();
+		}
 	}
 }
 
@@ -306,9 +376,44 @@ export async function generateAndStoreImages(
 ): Promise<StoredImageGeneration> {
 	assertResponseId(scope.narratorId);
 	const signal = AbortSignal.any([params.signal, scope.signal]);
-	// The worker must be ready before the only potentially paid send. Keep it for this response.
-	const processor = await createProcessor(signal);
-	const responseId = generateId();
+	// Only fixed scalar lengths: never scan/serialize the prompt to estimate admission bytes.
+	const bytes =
+		2 *
+			(params.prompt.length +
+				params.model.length +
+				(params.size?.length ?? 0) +
+				(params.quality?.length ?? 0) +
+				(params.conversationId?.length ?? 0) +
+				(params.chatModel?.length ?? 0) +
+				(params.callId?.length ?? 0) +
+				scope.narratorId.length +
+				(scope.callId?.length ?? 0)) +
+		1024;
+	let responseId: string | undefined;
+	try {
+		return await responseOwner.pool.run(
+			(processor, activeSignal) => {
+				responseId = generateId();
+				return captureGeneratedImages(params, scope, send, processor, activeSignal, responseId);
+			},
+			{ signal, bytes, deadlineAt: Infinity },
+		);
+	} catch (error) {
+		// The pool preserves cancellation causes; restore the domain's paid-response receipt.
+		if (responseId) throw errorWithResponseId(error, responseId);
+		throw error;
+	}
+}
+
+async function captureGeneratedImages(
+	params: ImageGenerationRequest,
+	scope: ImageGenerationScope,
+	send: (params: ImageGenerationRequest) => Promise<ImageGenerationResponse>,
+	processor: ResponseProcessor,
+	signal: AbortSignal,
+	responseId: string,
+): Promise<StoredImageGeneration> {
+	// Pool creation has already proved ready before the only potentially paid send.
 	const metadata: StoredResponseMetadata = {
 		version: 1,
 		responseId,
@@ -342,26 +447,32 @@ export async function generateAndStoreImages(
 			await writeMetadata(metadata);
 		} catch {
 			// A header receipt failure must not throw away bytes from an already-paid response.
-			logger.warn("Image response header metadata could not be saved; preserving response body", {
-				responseId,
-			});
+			try {
+				logger.warn("Image response header metadata could not be saved; preserving response body");
+			} catch {
+				// A failed warning cannot discard an already-paid response body.
+			}
 		}
 		await persistResponseBody(received, metadata, signal);
 		const images = await processWithWorker(processor, metadata, signal);
 		return { responseId, images, model: params.model };
 	} catch (error) {
 		// Cancellation and all local failures keep both partial and complete response bytes.
-		void received?.body?.cancel(error).catch(() => {});
+		await received?.body?.cancel(error).catch(() => {});
 		throw errorWithResponseId(error, responseId);
 	} finally {
-		processor.dispose();
+		await processor.dispose();
 		const elapsedMs = performance.now() - started;
-		if (elapsedMs > 1_000)
-			logger.warn("Slow image generation response capture", {
-				responseId,
-				elapsedMs,
-				complete: metadata.integrity.complete,
-			});
+		if (elapsedMs > 1_000) {
+			try {
+				logger.warn("Slow image generation response capture", {
+					elapsedMs: Math.round(elapsedMs),
+					complete: metadata.integrity.complete,
+				});
+			} catch {
+				// Preserve the stored result and cleanup outcome when diagnostics fail.
+			}
+		}
 	}
 }
 
@@ -371,7 +482,26 @@ export async function recoverStoredImages(
 ): Promise<StoredImageGeneration> {
 	assertResponseId(responseId);
 	assertResponseId(scope.narratorId);
-	let processor: ResponseProcessor | undefined;
+	return responseOwner.pool
+		.run(
+			(processor, signal) => recoverResponseImages(responseId, { ...scope, signal }, processor),
+			{
+				signal: scope.signal,
+				bytes:
+					(responseId.length + scope.narratorId.length + (scope.callId?.length ?? 0)) * 2 + 512,
+				deadlineAt: Infinity,
+			},
+		)
+		.catch((error: unknown) => {
+			throw errorWithResponseId(error, responseId);
+		});
+}
+
+async function recoverResponseImages(
+	responseId: string,
+	scope: ImageGenerationScope,
+	processor: ResponseProcessor,
+): Promise<StoredImageGeneration> {
 	try {
 		scope.signal.throwIfAborted();
 		const metadata = JSON.parse(
@@ -402,12 +532,11 @@ export async function recoverStoredImages(
 			throw new Error(
 				"Saved image response is incomplete: its stored byte length changed; no generation was resent",
 			);
-		processor = await createProcessor(scope.signal);
 		const images = await processWithWorker(processor, metadata, scope.signal);
 		return { responseId, images, ...(metadata.model ? { model: metadata.model } : {}) };
 	} catch (error) {
 		throw errorWithResponseId(error, responseId);
 	} finally {
-		processor?.dispose();
+		await processor.dispose();
 	}
 }

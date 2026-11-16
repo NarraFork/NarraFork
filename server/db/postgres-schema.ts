@@ -1312,6 +1312,7 @@ export const userPreferences = pgTable("user_preferences", {
 	showTokenUsage: boolean("show_token_usage").notNull().default(false),
 	showOutputStats: boolean("show_output_stats").notNull().default(true),
 	compactAuxiliaryContent: boolean("compact_auxiliary_content").notNull().default(true),
+	appearancePreferences: text("appearance_preferences").notNull().default("{}"),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	narratorFontScalePercent: integer("narrator_font_scale_percent").notNull().default(100),
@@ -1354,6 +1355,7 @@ export const userPreferences = pgTable("user_preferences", {
 		.notNull()
 		.default(false),
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
+	hiddenPluginOverlays: text("hidden_plugin_overlays").notNull().default("[]"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
 	outlineDigestTimeZone: text("outline_digest_time_zone"),
@@ -2155,6 +2157,7 @@ export const apiRequests = pgTable(
 		cacheCreation5mTokens: integer("cache_creation_5m_tokens").notNull().default(0),
 		cacheCreation1hTokens: integer("cache_creation_1h_tokens").notNull().default(0),
 		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		cacheUsageReported: boolean("cache_usage_reported"),
 		ttftMs: integer("ttft_ms"),
 		durationMs: integer("duration_ms"),
 		decodeMs: integer("decode_ms"),
@@ -3956,6 +3959,56 @@ export const outlineSpecImports = pgTable(
 	],
 );
 
+export const outlineSpecLossFindings = pgTable(
+	"outline_spec_loss_findings",
+	{
+		id: text("id").primaryKey().notNull(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		path: text("path").notNull(),
+		beforeRevisionId: text("before_revision_id").notNull(),
+		afterRevisionId: text("after_revision_id").notNull(),
+		beforeAt: text("before_at"),
+		savedAt: text("saved_at"),
+		kinds: text("kinds").notNull(),
+		items: integer("items").notNull().default(0),
+		excerpt: text("excerpt").notNull(),
+		truncated: integer("truncated").notNull().default(0),
+		status: text("status").notNull().default("open"),
+		blockId: text("block_id"),
+		attachNote: text("attach_note"),
+		attachSeq: integer("attach_seq").notNull().default(0),
+		attachAttempts: integer("attach_attempts").notNull().default(0),
+		inherited: integer("inherited").notNull().default(0),
+		resolvedBy: text("resolved_by"),
+		resolvedAt: text("resolved_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_outline_spec_loss_findings_status").on(table.status, table.createdAt, table.id),
+		index("idx_outline_spec_loss_findings_narrator").on(
+			table.narratorId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
+	],
+);
+
+export const outlineSpecLossScans = pgTable("outline_spec_loss_scans", {
+	narratorId: text("narrator_id")
+		.primaryKey()
+		.notNull()
+		.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+	sourceKey: text("source_key").notNull(),
+	saves: integer("saves").notNull().default(0),
+	findings: integer("findings").notNull().default(0),
+	note: text("note"),
+	scannedAt: text("scanned_at").notNull(),
+});
+
 export const scheduledTasks = pgTable(
 	"scheduled_tasks",
 	{
@@ -4413,8 +4466,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 142,
-  "columnCount": 1890,
+  "tableCount": 144,
+  "columnCount": 1920,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11702,6 +11755,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "true"
         },
         {
+          "property": "appearancePreferences",
+          "name": "appearance_preferences",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"{}\"",
+          "defaultExpression": "\"{}\""
+        },
+        {
           "property": "terminalTheme",
           "name": "terminal_theme",
           "kind": "text",
@@ -12126,6 +12190,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"{}\"",
           "defaultExpression": "\"{}\""
+        },
+        {
+          "property": "hiddenPluginOverlays",
+          "name": "hidden_plugin_overlays",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"[]\"",
+          "defaultExpression": "\"[]\""
         },
         {
           "property": "traits",
@@ -16510,6 +16585,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "0",
           "defaultExpression": "0"
+        },
+        {
+          "property": "cacheUsageReported",
+          "name": "cache_usage_reported",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "ttftMs",
@@ -27091,6 +27176,323 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineSpecLossFindings",
+      "name": "outline_spec_loss_findings",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_spec_loss_findings_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "path",
+          "name": "path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "beforeRevisionId",
+          "name": "before_revision_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "afterRevisionId",
+          "name": "after_revision_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "beforeAt",
+          "name": "before_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "savedAt",
+          "name": "saved_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "kinds",
+          "name": "kinds",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "items",
+          "name": "items",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "excerpt",
+          "name": "excerpt",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "truncated",
+          "name": "truncated",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"open\"",
+          "defaultExpression": "\"open\""
+        },
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attachNote",
+          "name": "attach_note",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attachSeq",
+          "name": "attach_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "attachAttempts",
+          "name": "attach_attempts",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "inherited",
+          "name": "inherited",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "resolvedBy",
+          "name": "resolved_by",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "resolvedAt",
+          "name": "resolved_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_spec_loss_findings_status",
+          "columns": [
+            "status",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_spec_loss_findings_narrator",
+          "columns": [
+            "narratorId",
+            "status",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineSpecLossScans",
+      "name": "outline_spec_loss_scans",
+      "columns": [
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_spec_loss_scans_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "sourceKey",
+          "name": "source_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "saves",
+          "name": "saves",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "findings",
+          "name": "findings",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "note",
+          "name": "note",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scannedAt",
+          "name": "scanned_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],

@@ -170,6 +170,7 @@ describe("provider incremental tool arguments", () => {
 			cacheCreationInputTokens: 0,
 			cacheCreation5mTokens: 0,
 			cacheCreation1hTokens: 0,
+			cacheReported: false,
 		};
 		parseAnthropicEvent(
 			{

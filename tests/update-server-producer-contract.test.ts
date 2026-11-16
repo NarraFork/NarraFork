@@ -74,8 +74,8 @@ test("real canonical CAS conflict makes producer refresh GitHub once and retry w
 		});
 		expect(receipt.status).toBe("MIRRORED");
 		expect(snapshotStatuses).toEqual([409, 200]);
-		expect(puts).toBe(4);
-		expect(fixture.downloaded).toHaveLength(1);
+		expect(puts).toBe(5);
+		expect(fixture.downloaded).toHaveLength(2);
 		const snapshot = JSON.parse(
 			(await storage.getFile("mirror-snapshots/narrafork.json"))?.toString("utf8") ?? "null",
 		);
@@ -92,7 +92,7 @@ test("real canonical CAS conflict makes producer refresh GitHub once and retry w
 });
 
 for (const withPatch of [true, false]) {
-	test(`actual producer commits an empty Hono/LocalStorage mirror using only server verification receipts (${withPatch ? "patch" : "metadata-only"})`, async () => {
+	test(`actual producer commits an empty Hono/LocalStorage mirror using only server verification receipts (${withPatch ? "full-and-patch" : "full-only"})`, async () => {
 		const directory = await mkdtemp(join(tmpdir(), "nf-real-mirror-contract-"));
 		try {
 			const configPath = join(directory, "config.json");
@@ -134,10 +134,10 @@ for (const withPatch of [true, false]) {
 				http,
 				downloadAsset: fixture.downloadAsset,
 			});
-			expect(receipt.status).toBe(withPatch ? "MIRRORED" : "METADATA_ONLY");
+			expect(receipt.status).toBe("MIRRORED");
 			expect(receipt.snapshotCommitted).toBe(true);
 			expect(receipt.uploaded).toEqual(receipt.verified);
-			expect(receipt.uploaded.length).toBe(withPatch ? 4 : 2);
+			expect(receipt.uploaded.length).toBe(withPatch ? 5 : 3);
 			expect(probes).toHaveLength(receipt.uploaded.length);
 			const commitPosition = calls.findIndex(
 				(call) => call.method === "POST" && call.path.endsWith("/snapshot"),
@@ -157,7 +157,11 @@ for (const withPatch of [true, false]) {
 			}
 			expect(await storage.listFiles("products")).toEqual([]);
 			const fullBinary = fixture.release.files[0].sha256;
-			expect(await storage.fileExists(`mirror-objects/${fullBinary}`)).toBe(false);
+			expect(await storage.fileExists(`mirror-objects/${fullBinary}`)).toBe(true);
+			expect(snapshot.targets[0].projectionVersion).toBe(2);
+			const full = await app.request(`/api/v3/products/narrafork/mirror/assets/${fullBinary}`);
+			expect(full.status).toBe(200);
+			expect(sha(new Uint8Array(await full.arrayBuffer()))).toBe(fullBinary);
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}

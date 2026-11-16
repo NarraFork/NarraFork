@@ -7,8 +7,8 @@
  * a step-up check; importing needs the passphrase.
  *
  * Keys are grouped by the exporting instance's owner id: a custom API provider by its id
- * (all its inference keys, in priority order), site tokens, NUG providers, TokenDance and
- * Command Code by their namespaced owner ids (one key each). Search providers are not part
+ * (all its inference keys, in priority order), site tokens, NUG API/OAuth secrets, TokenDance
+ * and Command Code by their namespaced owner ids (one key each). Search providers are not part
  * of a data export.
  */
 import type { CredentialNetwork } from "@shared/credential-network";
@@ -18,6 +18,7 @@ import { getProviderKeyStore, type ProviderKeyDisabledReason } from "../lib/prov
 import {
 	COMMAND_CODE_KEY_OWNER,
 	nugKeyOwner,
+	nugOAuthKeyOwner,
 	platformInstanceKeyOwner,
 	quotaKeyOwner,
 	TOKENDANCE_KEY_OWNER,
@@ -52,6 +53,7 @@ function ownersOf(providers: ProviderSection): string[] {
 		...ids(providers.customApiProviders, (id) => id),
 		...ids(providers.customApiProviders, quotaKeyOwner),
 		...ids(providers.nugProviders, nugKeyOwner),
+		...ids(providers.nugProviders, nugOAuthKeyOwner),
 		...(providers.tokendance ? [TOKENDANCE_KEY_OWNER] : []),
 		...(providers.commandCode ? [COMMAND_CODE_KEY_OWNER] : []),
 		// 平台实例各持一份密钥，owner 是实例 id。
@@ -87,7 +89,11 @@ export function withoutKeys(providers: ProviderSection): ProviderSection {
 	const blank = (list: unknown) =>
 		Array.isArray(list)
 			? list.map((entry) => {
-					const { quotaAccessToken: _token, ...rest } = entry as Record<string, unknown>;
+					const {
+						quotaAccessToken: _token,
+						oauthClientSecret: _oauthSecret,
+						...rest
+					} = entry as Record<string, unknown>;
 					return { ...rest, apiKey: "" };
 				})
 			: list;
@@ -172,6 +178,7 @@ export function withFirstKeys(providers: ProviderSection, keys: ExportedKeys): P
 	fill(out.customApiProviders, (id) => id);
 	fill(out.customApiProviders, quotaKeyOwner, "quotaAccessToken");
 	fill(out.nugProviders, nugKeyOwner);
+	fill(out.nugProviders, nugOAuthKeyOwner, "oauthClientSecret");
 	const tokendance = first(TOKENDANCE_KEY_OWNER);
 	if (tokendance && out.tokendance && typeof out.tokendance === "object") {
 		(out.tokendance as Record<string, unknown>).apiKey = tokendance;

@@ -25,6 +25,7 @@ import {
 	restoreCiReleaseRemoteFrontend,
 	validateCiReleaseBuildSource,
 } from "../../scripts/lib/ci-release-build-restore";
+import { CI_PLATFORM_ARTIFACT_LIMIT } from "../../scripts/lib/ci-release-io";
 import {
 	CI_RELEASE_BUN,
 	CI_RELEASE_REPOSITORY,
@@ -32,8 +33,8 @@ import {
 	CI_RELEASE_WORKFLOW,
 	type CiReleasePlan,
 } from "../../scripts/lib/ci-release-types";
-
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 
 import { REMOTE_FRONTEND_CAPABILITY } from "../../shared/remote-access/application";
 import { remoteReleaseFixture } from "./remote-frontend-release.fixture";
@@ -83,13 +84,14 @@ with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as bundle:
  for item in entries:
   info=zipfile.ZipInfo(item['name']); info.create_system=3
   info.compress_type=zipfile.ZIP_DEFLATED
+  if item.get('inflated',0)>=2**32: info.extra=struct.pack('<HHQ',1,8,item['inflated'])
   info.external_attr=(0o120777 if item.get('kind')=='symlink' else 0o40755 if item.get('kind')=='directory' else 0o100644)<<16
   bundle.writestr(info,base64.b64decode(item['bytes']))
 data=bytearray(open(path,'rb').read())
 pos=0
 for item in entries:
  pos=data.index(b'PK\\x01\\x02',pos)
- if item.get('inflated') is not None: struct.pack_into('<I',data,pos+24,item['inflated'])
+ if item.get('inflated') is not None: struct.pack_into('<I',data,pos+24,min(item['inflated'],2**32-1))
  if item.get('encrypted'): struct.pack_into('<H',data,pos+8,struct.unpack_from('<H',data,pos+8)[0]|1)
  pos+=46
 open(path,'wb').write(data)
@@ -900,7 +902,7 @@ describe("original build recovery", () => {
 		[
 			"platform too large",
 			(s: ReturnType<typeof fixture>) => {
-				s.artifacts[1].size_in_bytes = 2 * 1024 ** 3;
+				s.artifacts[1].size_in_bytes = CI_PLATFORM_ARTIFACT_LIMIT + 1;
 			},
 		],
 	] as const) {
@@ -1010,7 +1012,7 @@ describe("original build recovery", () => {
 			else if (kind === "symlink" || kind === "directory") values[0].kind = kind;
 			else if (kind === "duplicate") values[1].name = values[0].name;
 			else if (kind === "encrypted") values[0].encrypted = true;
-			else if (kind === "oversized") values[0].inflated = 1024 ** 3 + 1;
+			else if (kind === "oversized") values[0].inflated = MAX_RELEASE_BINARY_BYTES + 1;
 			else if (kind === "missing") values.pop();
 			else if (kind === "extra") values.push({ name: "other", bytes: Buffer.from("x") });
 			else if (kind === "wrong binary hash") values[0].bytes = Buffer.from("not original bytes");

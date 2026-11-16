@@ -2,17 +2,33 @@ import { parentPort, workerData } from "node:worker_threads";
 import { canWriteOptionalDiskData } from "./disk-safety";
 import { AppError } from "./errors";
 import { logger } from "./logger";
-import type { RecorderMessage, RecorderReply } from "./request-recorder-protocol";
+import {
+	RECORDING_QUEUE_BYTES,
+	type RecorderMessage,
+	type RecorderReply,
+} from "./request-recorder-protocol";
 import { RequestRecorderStore } from "./request-recorder-store";
 import { settings } from "./settings";
+import { TaskQueue } from "./worker-runtime/queue";
 
 const store = new RequestRecorderStore((workerData as { home: string }).home, () =>
 	canWriteOptionalDiskData((workerData as { home: string }).home),
 );
-let queue = Promise.resolve();
+// The sender's 64 inflight frames bound the domain mailbox; maintenance occupies at most one
+// additional entry. The common queue owns FIFO admission instead of an unbounded Promise tail.
+const ordered = new TaskQueue({
+	concurrency: 1,
+	maxQueued: 64,
+	maxQueuedBytes: RECORDING_QUEUE_BYTES,
+});
+const queries = new TaskQueue({ concurrency: 2, maxQueued: 0 });
 const controllers = new Map<number, AbortController>();
 const cancelled = new Set<number>();
-let activeListings = 0;
+function warn(message: string, elapsedMs?: number): void {
+	try {
+		logger.warn(message, { elapsedMs: elapsedMs ?? 0 });
+	} catch {}
+}
 function reply(id: number, value?: unknown, error?: unknown): void {
 	const message: RecorderReply = error
 		? {
@@ -26,6 +42,42 @@ function reply(id: number, value?: unknown, error?: unknown): void {
 			}
 		: { id, value };
 	parentPort?.postMessage(message);
+}
+function query(message: RecorderMessage): void {
+	if (queries.stats.active >= 2) {
+		reply(message.id, undefined, new AppError("Recording queries are busy", 429, "RECORDING_BUSY"));
+		return;
+	}
+	const controller = new AbortController();
+	controllers.set(message.id, controller);
+	const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
+	const started = performance.now();
+	void queries
+		.run(
+			async () => {
+				try {
+					const op = message.op;
+					const value =
+						op.type === "list"
+							? await store.list(op.narratorId, op.cursor, op.limit, signal)
+							: op.type === "detail"
+								? await store.detail(op.narratorId, op.requestId, signal)
+								: undefined;
+					reply(message.id, value);
+				} catch (error) {
+					reply(message.id, undefined, error);
+				} finally {
+					controllers.delete(message.id);
+					const elapsedMs = performance.now() - started;
+					if (elapsedMs > 1000) warn("Slow request recording query", elapsedMs);
+				}
+			},
+			{ deadlineAt: Infinity },
+		)
+		.catch((error: unknown) => {
+			controllers.delete(message.id);
+			reply(message.id, undefined, error);
+		});
 }
 parentPort?.on("message", (message: RecorderMessage | { cancel: number }) => {
 	if ("cancel" in message) {
@@ -49,102 +101,76 @@ parentPort?.on("message", (message: RecorderMessage | { cancel: number }) => {
 			);
 			return;
 		}
-		if (activeListings >= 2) {
-			reply(
-				message.id,
-				undefined,
-				new AppError("Recording listings are busy", 429, "RECORDING_BUSY"),
-			);
-			return;
-		}
-		const controller = new AbortController();
-		controllers.set(message.id, controller);
-		activeListings++;
-		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
 		// Read-only directory queries cannot stall the ordered transport capture queue.
-		void store
-			.list(message.op.narratorId, message.op.cursor, message.op.limit, signal)
-			.then(
-				(value) => reply(message.id, value),
-				(error) => reply(message.id, undefined, error),
-			)
-			.finally(() => {
-				activeListings--;
-				controllers.delete(message.id);
-			});
+		query(message);
 		return;
 	}
-	queue = queue
-		.then(async () => {
-			if (cancelled.delete(message.id)) {
-				reply(message.id, undefined, new Error("Recording operation cancelled"));
-				return;
-			}
-			const started = performance.now();
-			try {
-				if (message.op.type === "configure" && message.op.diskSafety)
-					settings.diskSafety = { ...message.op.diskSafety };
-				if (message.op.type === "detail") {
-					if (activeListings >= 2)
-						throw new AppError("Recording queries are busy", 429, "RECORDING_BUSY");
-					const controller = new AbortController();
-					controllers.set(message.id, controller);
-					activeListings++;
-					const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
-					// Preview reads and saved lookups do not block ordered transport capture.
-					void store
-						.detail(message.op.narratorId, message.op.requestId, signal)
-						.then(
-							(value) => reply(message.id, value),
-							(error) => reply(message.id, undefined, error),
-						)
-						.finally(() => {
-							activeListings--;
+	const bytes =
+		message.op.type === "chunk"
+			? message.op.data.byteLength +
+				Buffer.byteLength(JSON.stringify({ ...message.op, data: undefined }))
+			: Buffer.byteLength(JSON.stringify(message.op));
+	void ordered
+		.run(
+			async () => {
+				if (cancelled.delete(message.id)) {
+					reply(message.id, undefined, new Error("Recording operation cancelled"));
+					return;
+				}
+				const started = performance.now();
+				try {
+					if (message.op.type === "configure" && message.op.diskSafety)
+						settings.diskSafety = { ...message.op.diskSafety };
+					if (message.op.type === "detail") {
+						// Detail starts after prior captures, but reads do not block subsequent frames.
+						query(message);
+					} else if (message.op.type === "save-specific") {
+						const controller = new AbortController();
+						controllers.set(message.id, controller);
+						try {
+							const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
+							reply(message.id, await store.execute(message.op, signal));
+						} finally {
 							controllers.delete(message.id);
-							const elapsedMs = performance.now() - started;
-							if (elapsedMs > 1000) logger.warn("Slow request recording preview", { elapsedMs });
-						});
-				} else if (message.op.type === "save-specific") {
-					const controller = new AbortController();
-					controllers.set(message.id, controller);
-					try {
-						const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
-						reply(message.id, await store.execute(message.op, signal));
-					} finally {
-						controllers.delete(message.id);
-					}
-				} else if (message.op.type === "archive") {
-					const controller = new AbortController();
-					controllers.set(message.id, controller);
-					const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]);
-					const job = await store.prepareArchive(message.op.narratorId, message.op.saveId, signal);
-					// ZIP compression and I/O are independent of the ordered capture queue.
-					void store
-						.buildArchive(job, signal)
-						.then(
-							(value) => reply(message.id, value),
-							(error) => reply(message.id, undefined, error),
-						)
-						.finally(() => controllers.delete(message.id));
-				} else reply(message.id, await store.execute(message.op));
-			} catch (error) {
-				controllers.delete(message.id);
-				reply(message.id, undefined, error);
-			} finally {
-				const elapsedMs = performance.now() - started;
-				if (elapsedMs > 1000)
-					logger.warn("Slow request recorder operation", { type: message.op.type, elapsedMs });
-			}
-		})
-		.catch((error) => logger.warn("Request recorder queue failed", { error: String(error) }));
+						}
+					} else if (message.op.type === "archive") {
+						const controller = new AbortController();
+						controllers.set(message.id, controller);
+						const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]);
+						const job = await store.prepareArchive(
+							message.op.narratorId,
+							message.op.saveId,
+							signal,
+						);
+						// Store archive reservations keep the existing two-compressor safety budget.
+						void store
+							.buildArchive(job, signal)
+							.then(
+								(value) => reply(message.id, value),
+								(error) => reply(message.id, undefined, error),
+							)
+							.finally(() => controllers.delete(message.id))
+							.catch(() => warn("Request recording archive reply failed"));
+					} else reply(message.id, await store.execute(message.op));
+				} catch (error) {
+					controllers.delete(message.id);
+					reply(message.id, undefined, error);
+				} finally {
+					const elapsedMs = performance.now() - started;
+					if (elapsedMs > 1000) warn("Slow request recorder operation", elapsedMs);
+				}
+			},
+			{ deadlineAt: Infinity, bytes },
+		)
+		.catch((error: unknown) => reply(message.id, undefined, error));
 });
 let flushing = false;
 const checkpoint = setInterval(() => {
 	if (flushing) return;
 	flushing = true;
-	queue = queue
-		.then(() => store.flush())
-		.catch((error) => logger.warn("Request recording checkpoint failed", { error: String(error) }))
+	void ordered
+		.run(() => store.flush(), { deadlineAt: Infinity })
+		.catch(() => warn("Request recording checkpoint failed"))
 		.finally(() => {
 			flushing = false;
 		});

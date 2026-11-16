@@ -49,7 +49,7 @@
  * it.
  */
 
-import { NotFoundError } from "@server/lib/errors";
+import { AppError, NotFoundError } from "@server/lib/errors";
 import {
 	type BodyRef,
 	blockTitle,
@@ -106,6 +106,7 @@ import {
 	OutlineTaskClaimedError,
 	OutlineWriteError,
 } from "./errors";
+import { type AgentHandOut, assigneeOfTarget, handOutTask, planAgentHandOuts } from "./hand-out";
 import { newOutlineSid } from "./keys";
 import { linkDisplayTitle } from "./link-display";
 import { withOutlineLiveBarrier } from "./live-barrier";
@@ -1040,7 +1041,13 @@ export async function outlineEdit(
 	let outcome:
 		| { conflicts: ChangedSinceRead[] }
 		| { writeConflict: OutlineConflictError }
-		| { written: OutlineWriteResult; merged: MergedBlock[]; before: WrittenBefore }
+		| {
+				written: OutlineWriteResult;
+				merged: MergedBlock[];
+				before: WrittenBefore;
+				/** Tasks of the session's own space given to others: handed out after the write. */
+				handOuts: Array<AgentHandOut & { edit: number }>;
+		  }
 		| { output: OutlineToolOutput };
 	try {
 		outcome = await withOutlineLiveBarrier(space.id, async () => {
@@ -1408,6 +1415,35 @@ export async function outlineEdit(
 				}
 			}
 
+			// A task of the session's own space given to someone who cannot work in that space is
+			// handed out (outline P2 PR 10c-3, owner decision 2026-11-13): the assignee leaves this
+			// write, and a copy goes to the project's task page after it, which the task waits for.
+			const handOutPlan = await planAgentHandOuts({
+				space,
+				by: {
+					kind: "session",
+					narratorId: scope.narratorId,
+					principal: await scope.principal(),
+				},
+				ops,
+				assigneeBefore: (blockId) => current.get(blockId)?.taskJson?.assignee,
+				// The copy is this turn's write to the project's space: its scope decides (read-only
+				// and plan mode write their own session space only), and the session must read it.
+				checkWriter: async (projectSpace) => {
+					const refusal = await scope.writeRefusal(projectSpace);
+					if (refusal) return refusalText(refusal, "project/");
+					return (await scope.canRead(projectSpace)) ? null : refusalText("missing", "project/");
+				},
+				// A plan-mode turn is a draft: its assignees stay labels in place.
+				draft: scope.ctx.planMode === true,
+				store: scope.store,
+			});
+			if ("refused" in handOutPlan) return { output: failed(handOutPlan.refused) };
+			const handOuts = handOutPlan.handOuts.map((h) => ({
+				...h,
+				edit: opEdit[h.opIndex] as number,
+			}));
+
 			// An `@agent:` assignee this write gives a task (design §2.2): a session that could not
 			// do the task there refuses the write; a name no session has is written as a name.
 			const given = ops.flatMap((op) => {
@@ -1521,7 +1557,7 @@ export async function outlineEdit(
 					merged.push({ why, row, tags: tags.get(row.id) ?? [] });
 				}
 			}
-			return { written: result, merged, before };
+			return { written: result, merged, before, handOuts };
 		});
 	} catch (error) {
 		// The space's live text could not be committed first: try again shortly.
@@ -1531,6 +1567,48 @@ export async function outlineEdit(
 	if ("output" in outcome) return outcome.output;
 	if ("conflicts" in outcome) return await conflictOutput(scope, space, outcome.conflicts, meta);
 	if ("written" in outcome) {
+		// The hand-outs, now that the write is done (outside the space's barrier: each is two
+		// commits of its own; a write that only gave the assignee wrote nothing itself). One that
+		// fails is said beside its edit; the write stands.
+		const heldHere = new Set(outcome.written.pending?.opIndexes ?? []);
+		const handOutLines: string[] = [];
+		for (const handOut of outcome.handOuts) {
+			const edit = edits[handOut.edit];
+			const r = outcome.written.results[handOut.opIndex];
+			const block = r
+				? { id: r.blockId, sid: r.sid }
+				: edit?.located?.kind === "block"
+					? { id: edit.located.block.id, sid: edit.located.block.sid }
+					: null;
+			if (!edit || !block || heldHere.has(handOut.opIndex)) continue;
+			const task = scope.labelIn(space)(block.sid);
+			const say = (line: string) => {
+				edit.notes.push(line);
+				handOutLines.push(`${label(edit)}: ${line}`);
+			};
+			try {
+				const out = await handOutTask({
+					taskId: block.id,
+					by: { kind: "session", narratorId: scope.narratorId, principal: await scope.principal() },
+					target: handOut.target,
+					store: scope.store,
+				});
+				say(
+					OUTLINE_TOOL_TEXT.edit.handedOut(
+						task,
+						out.copy.address,
+						assigneeOfTarget(handOut.target),
+						out.omitted,
+					),
+				);
+				meta.handedOut = [...((meta.handedOut as string[] | undefined) ?? []), out.copy.address];
+			} catch (error) {
+				// A refusal (`OutlineHandOutError`, a target that cannot work there) is told; anything
+				// else is a fault.
+				if (!(error instanceof AppError)) throw error;
+				say(OUTLINE_TOOL_TEXT.edit.handOutFailed(task, error.message));
+			}
+		}
 		const held = outcome.written.pending
 			? await heldSection(scope, space, outcome.written.pending)
 			: null;
@@ -1567,6 +1645,7 @@ export async function outlineEdit(
 			await mergedSection(scope, space, outcome.merged, scope.narratorId),
 			{
 				globalNotes,
+				handOutLines,
 				hints,
 				// A block of an edit held for confirmation does not exist yet: named by its edit.
 				noteLines:
@@ -1974,6 +2053,8 @@ function successOutput(
 	merged: MergedSection,
 	extra: {
 		globalNotes: string[];
+		/** What the call's hand-outs did (said on their own when the call wrote nothing else). */
+		handOutLines: string[];
 		hints: string[];
 		/** What the call wrote under tasks that is over the note rules (written all the same). */
 		noteLines: string[];
@@ -1990,7 +2071,11 @@ function successOutput(
 	const pendingMeta = pending ? { pending: outlinePendingLabel(pending.id) } : {};
 	if (!result.commit && !pending) {
 		return {
-			output: [OUTLINE_TOOL_TEXT.edit.noChange, ...merged.lines].join("\n"),
+			// The call only gave tasks of its own space to others: their hand-outs are what happened.
+			output: [
+				...(extra.handOutLines.length > 0 ? extra.handOutLines : [OUTLINE_TOOL_TEXT.edit.noChange]),
+				...merged.lines,
+			].join("\n"),
 			metadata: { ...extra.meta, commit: null, ...mergedMeta },
 		};
 	}

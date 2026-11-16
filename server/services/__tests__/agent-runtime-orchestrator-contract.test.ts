@@ -1423,6 +1423,8 @@ describe("real shared orchestrator profile contract", () => {
 		});
 
 		test(`${profile.kind}: payment-required result fails the run without another model pass`, async () => {
+			const ws = await import("../../websocket/narrator-ws");
+			const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
 			const h = fixture(profile, [
 				{
 					...finished,
@@ -1434,6 +1436,23 @@ describe("real shared orchestrator profile contract", () => {
 			expect(result).toMatchObject({ started: true, hasError: true });
 			expect(h.calls).toHaveLength(1);
 			expect(result.lastPass?.paymentRequired?.message).toBe("fixture balance exhausted");
+			// Both producers must agree: the orchestrator's own dual broadcast (this
+			// branch) and the event-handler projection. A child's shortfall reaches the
+			// parent page only as a tagged frame, so the parent never opens its own dialog.
+			const frames = broadcast.mock.calls
+				.filter(([, event]) => (event as { type?: string }).type === "payment_required")
+				.map(([target, event]) => [target, event as { isSubagent?: boolean }] as const);
+			if (profile.kind === "subagent") {
+				const toParent = frames.filter(([target]) => target === "contract-parent");
+				expect(toParent.length).toBeGreaterThan(0);
+				expect(toParent.every(([, frame]) => frame.isSubagent === true)).toBe(true);
+				const toSelf = frames.filter(([target]) => target === h.session.narratorId);
+				expect(toSelf.length).toBeGreaterThan(0);
+				expect(toSelf.every(([, frame]) => !("isSubagent" in frame))).toBe(true);
+			} else {
+				expect(frames.every(([, frame]) => !("isSubagent" in frame))).toBe(true);
+			}
+			broadcast.mockRestore();
 		});
 
 		test(`${profile.kind}: exhausted stateless provider retry cannot multiply into outer model calls`, async () => {

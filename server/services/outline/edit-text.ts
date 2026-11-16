@@ -29,6 +29,8 @@
  *   - `notes`: a whole text becomes blocks the same way, nothing left out (the import of Dynamic
  *     Spec files, outline P2 PR 12b); the caller bounds it and runs it on the background channel.
  *   - `taskTexts`: the task texts of that import, kept as written ({@link importTaskText}).
+ *   - `specLoss`: the structures of a Dynamic Spec revision the old Spec panel could lose (the
+ *     swallowed-content scan, outline P2 PR 12c); background channel only.
  *
  * Every content returned is canonical (`normalizeBlock(content).content === content`), with the
  * links `contentLinks` would read from it: what `writeOutline` takes as `canonical` content.
@@ -51,6 +53,7 @@ import {
 	type TaskStatus,
 	titleOfBody,
 } from "@shared/outline";
+import { extractSpecLossItems, type SpecLossItem } from "@shared/spec-content-loss";
 import { bodyLinks, type ExtractedLink } from "./links";
 import { stripReadAnnotations } from "./render";
 import {
@@ -201,6 +204,15 @@ export type EditTextJob =
 			/** Task texts of the Dynamic Spec import, kept as written ({@link importTaskText}). */
 			kind: "taskTexts";
 			contents: string[];
+	  }
+	| {
+			/**
+			 * The structures of Dynamic Spec file revisions that the old Spec panel could lose
+			 * (`extractSpecLossItems`): the swallowed-content scan (outline P2 PR 12c,
+			 * `spec-import/loss-scan.ts`). Run on the background channel only.
+			 */
+			kind: "specLoss";
+			contents: string[];
 	  };
 
 /** A task text as the import writes it; null: left to the write path ({@link importTaskText}). */
@@ -218,7 +230,9 @@ export type EditTextResult<J extends EditTextJob> = J extends { kind: "parse" }
 					? NotesConversion
 					: J extends { kind: "taskTexts" }
 						? EditTextTaskText[]
-						: EditTextRewritten[];
+						: J extends { kind: "specLoss" }
+							? SpecLossItem[][]
+							: EditTextRewritten[];
 
 /** UTF-8 bytes of the text a job carries. */
 export function editTextJobBytes(job: EditTextJob): number {
@@ -248,6 +262,8 @@ export function runEditTextJob<J extends EditTextJob>(job: J): EditTextResult<J>
 	if (job.kind === "notes") return convertNotes(job) as EditTextResult<J>;
 	if (job.kind === "taskTexts")
 		return job.contents.map((content) => importTaskText(content)) as EditTextResult<J>;
+	if (job.kind === "specLoss")
+		return job.contents.map((content) => extractSpecLossItems(content)) as EditTextResult<J>;
 	return job.contents.map((content) => rewriteContent(content, job.targets)) as EditTextResult<J>;
 }
 

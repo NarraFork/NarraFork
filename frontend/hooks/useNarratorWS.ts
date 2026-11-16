@@ -1459,6 +1459,9 @@ export function useNarratorWS(
 						}
 						break;
 					case "quota_balance": {
+						// A subagent's balance is not this conversation's balance; applying it
+						// would overwrite THIS panel's display and its provider cache.
+						if (data.isSubagent) break;
 						const quotaBalance = data.quotaBalance;
 						const detailedQuotaBalance = data.detailedQuotaBalance;
 						const detailedText = detailedQuotaBalance == null ? null : String(detailedQuotaBalance);
@@ -1469,6 +1472,9 @@ export function useNarratorWS(
 						break;
 					}
 					case "payment_required":
+						// Same isolation: a child running out of balance must not make the
+						// parent page open its own recharge dialog.
+						if (data.isSubagent) break;
 						callbackOwner.callbacks.onPaymentRequired?.({
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,

@@ -175,7 +175,7 @@ test.skipIf(process.platform !== "linux")(
 			(error) => error,
 		);
 		try {
-			await waitFor(() => (jobs as unknown as { queue: unknown[] }).queue.length === 1);
+			await waitFor(() => jobs.diagnostics.io.queued === 1);
 			expect(await stageFds(path)).toEqual([]);
 			await service.cancelUpload(actor, value.doc.docId, value.upload.uploadId);
 			expect(await outcome).not.toBeNull();
@@ -319,7 +319,7 @@ for (const queued of [false, true])
 				await waitFor(
 					() =>
 						!!ledger().sessions.get(value.doc.docId)?.uploads.get(value.upload.uploadId)?.busy &&
-						(jobs as unknown as { queue: unknown[] }).queue.length === 1,
+						jobs.diagnostics.io.queued === 1,
 				);
 			else await entered.promise;
 			await service.cancelUpload(actor, value.doc.docId, value.upload.uploadId);

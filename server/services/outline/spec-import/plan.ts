@@ -64,6 +64,15 @@ export const OUTLINE_SPEC_IMPORT_ACTOR = "spec-import";
  */
 export const OUTLINE_SPEC_REVERT_ACTOR = "spec-import-revert";
 
+/**
+ * The system actor of the swallowed-content scan's writes (outline P2 PR 12c, `loss-attach.ts`):
+ * possibly lost content attached to its file's imported page, by a pass (tables) or because a
+ * person asked, and the removal of such a block when its finding is dismissed. The importer
+ * counts its commits as the import's own (`IMPORT_ACTORS`): the content is kept in its finding,
+ * so a stale page it sits on is still the import's to take away.
+ */
+export const OUTLINE_SPEC_LOSS_ACTOR = "spec-import-check";
+
 export const SPEC_IMPORT_TEXT: Record<
 	Locale,
 	{

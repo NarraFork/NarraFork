@@ -1,10 +1,14 @@
-import type { Worker } from "node:worker_threads";
 import type { GitLineStats, GitLineStatsFile } from "../../shared/git-line-stats";
 import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
 import { GitError } from "../lib/errors";
+import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { isCompiledRuntime } from "../lib/runtime-target";
 import { safeSpawn } from "../lib/spawn";
+import { WorkerCleanupError } from "../lib/worker-runtime/lifecycle";
+import { WorkerPool } from "../lib/worker-runtime/pool";
+import { TaskQueueError } from "../lib/worker-runtime/queue";
+import { GitReaderSession } from "./git-current-baseline-session";
 import type { UntrackedLineBatch } from "./git-untracked-line-worker";
 
 export const GIT_LINE_STATS_OUTPUT_BYTES = 1024 * 1024;
@@ -108,7 +112,11 @@ async function gitOutput(cwd: string, args: string[], signal: AbortSignal): Prom
 	// safeSpawn drains pipes and awaits the actual child exit before returning.
 	const durationMs = performance.now() - startedAt;
 	if (durationMs > 2000) {
-		logger.warn("Slow Git line statistics command", { command: args[0], durationMs });
+		try {
+			logger.warn("Slow Git line statistics command", { command: args[0], durationMs });
+		} catch {
+			/* Diagnostics do not change completed child results. */
+		}
 	}
 	signal.throwIfAborted();
 	if (result.terminationReason && result.terminationReason !== "output-limit") {
@@ -138,164 +146,108 @@ export function gitLineStatsWorkerSpecifiers(
 	);
 }
 
-let thread: Worker | undefined;
-let resolvedWorkerSpecifier: string | undefined;
-let idleTimer: ReturnType<typeof setTimeout> | undefined;
-let workerBusy = false;
-interface PendingRead {
+interface UntrackedRead {
+	action: "read";
 	cwd: string;
 	paths: string[];
-	signal: AbortSignal;
-	resolve: (value: UntrackedLineBatch) => void;
-	reject: (error: unknown) => void;
-	abort: () => void;
 }
-const pendingReads: PendingRead[] = [];
 
-/** One worker, at most eight waiting batches. No per-file workers or unbounded messages. */
-function readUntracked(
+function createLinePool() {
+	return new WorkerPool<UntrackedRead, UntrackedLineBatch>({
+		concurrency: 1,
+		maxQueued: 8,
+		// The existing Git metadata cap bounds each request, not the files' content size.
+		maxQueuedBytes: 8 * GIT_LINE_STATS_OUTPUT_BYTES * 2,
+		idleTimeoutMs: WORKER_IDLE_MS,
+		create: async ({ signal }) => {
+			try {
+				const { worker, handle } = await connectCompiledWorker(gitLineStatsWorkerSpecifiers(), {
+					signal,
+				});
+				return new GitReaderSession<UntrackedRead, UntrackedLineBatch>(
+					worker,
+					handle,
+					(message) => new GitError(message),
+					COMMAND_TIMEOUT_MS,
+				);
+			} catch (error) {
+				// Startup cleanup failures carry a live Handle; never erase its pool accounting.
+				if (signal.aborted || error instanceof WorkerCleanupError) throw error;
+				throw new GitError(
+					error instanceof Error ? error.message : "Git line statistics worker failed to start",
+				);
+			}
+		},
+	});
+}
+
+const lineOwner = hotSafe("narrafork.gitLineStats.workers.v1", () => ({
+	version: 1,
+	pool: createLinePool(),
+	reads: new Map<AbortController, Promise<void>>(),
+	closed: false,
+	closing: undefined as Promise<void> | undefined,
+}));
+if (lineOwner.version !== 1)
+	throw new Error(
+		"Git line statistics ownership predates this runtime; manually restart NarraFork",
+	);
+
+export function closeGitLineStatsWorkers(): Promise<void> {
+	if (lineOwner.closing) return lineOwner.closing;
+	lineOwner.closed = true;
+	const reason = new GitError("Git line statistics workers are closed");
+	const workers = lineOwner.pool.close(reason);
+	for (const controller of lineOwner.reads.keys()) controller.abort(reason);
+	lineOwner.closing = Promise.allSettled([workers, ...lineOwner.reads.values()]).then(
+		(outcomes) => {
+			for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+		},
+	);
+	return lineOwner.closing;
+}
+
+export async function resetGitLineStatsWorkersForTests(): Promise<void> {
+	await closeGitLineStatsWorkers();
+	lineOwner.pool = createLinePool();
+	lineOwner.closed = false;
+	lineOwner.closing = undefined;
+}
+
+/** One reusable worker, at most eight waiting batches. No per-file workers or Promise tail. */
+async function readUntracked(
 	cwd: string,
 	paths: string[],
 	signal: AbortSignal,
 ): Promise<UntrackedLineBatch> {
-	signal.throwIfAborted();
-	if (pendingReads.length >= 8) throw new GitError("Git line statistics reader queue is full");
-	return new Promise((resolve, reject) => {
-		const request: PendingRead = {
-			cwd,
-			paths,
-			signal,
-			resolve,
-			reject,
-			abort() {
-				const index = pendingReads.indexOf(request);
-				if (index >= 0) {
-					pendingReads.splice(index, 1);
-					signal.removeEventListener("abort", request.abort);
-					reject(signal.reason);
-				}
-			},
-		};
-		pendingReads.push(request);
-		signal.addEventListener("abort", request.abort, { once: true });
-		if (signal.aborted) request.abort();
-		void nextWorkerRead();
-	});
-}
-
-async function nextWorkerRead(): Promise<void> {
-	if (workerBusy) return;
-	const request = pendingReads.shift();
-	if (!request) return;
-	workerBusy = true;
-	request.signal.removeEventListener("abort", request.abort);
-	try {
-		request.resolve(await workerRead(request));
-	} catch (error) {
-		request.reject(error);
-	} finally {
-		workerBusy = false;
-		void nextWorkerRead();
-	}
-}
-
-async function workerRead(request: PendingRead): Promise<UntrackedLineBatch> {
-	const { signal } = request;
 	const startedAt = performance.now();
-	signal.throwIfAborted();
-	if (idleTimer) clearTimeout(idleTimer);
-	if (!thread) {
-		let created: Worker;
-		try {
-			const started = await connectCompiledWorker(
-				resolvedWorkerSpecifier ? [resolvedWorkerSpecifier] : gitLineStatsWorkerSpecifiers(),
-				{ signal },
-			);
-			created = started.worker;
-			resolvedWorkerSpecifier = started.specifier;
-		} catch (error) {
-			if (signal.aborted) throw error;
-			throw new GitError(
-				error instanceof Error ? error.message : "Git line statistics worker failed to start",
-			);
-		}
-		thread = created;
-		const forget = () => {
-			if (thread === created) thread = undefined;
-		};
-		// Idle-worker failures must not become unhandled EventEmitter errors.
-		created.on("error", forget);
-		created.on("exit", forget);
-	}
-	const active = thread;
-	active.ref();
-	let abort = () => {};
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let forcedTimer: ReturnType<typeof setTimeout> | undefined;
-	let onMessage: (message: { value?: UntrackedLineBatch; error?: string }) => void = () => {};
-	let onError: (error: Error) => void = () => {};
-	let onExit: () => void = () => {};
 	let failed = false;
 	try {
-		return await new Promise<UntrackedLineBatch>((resolve, reject) => {
-			let cancellation: unknown;
-			abort = () => {
-				cancellation ??= signal.aborted
-					? signal.reason
-					: new GitError("Git line statistics worker timed out");
-				try {
-					active.postMessage({ action: "cancel" });
-					forcedTimer ??= setTimeout(() => reject(cancellation), 1000);
-				} catch {
-					reject(cancellation);
-				}
-			};
-			onMessage = (message) => {
-				if (cancellation || signal.aborted) reject(cancellation ?? signal.reason);
-				else if (message.error) reject(new GitError(message.error));
-				else if (message.value) resolve(message.value);
-				else reject(new GitError("Invalid Git line statistics worker reply"));
-			};
-			onError = reject;
-			onExit = () => reject(new GitError("Git line statistics worker exited"));
-			active.once("message", onMessage);
-			active.once("error", onError);
-			active.once("exit", onExit);
-			signal.addEventListener("abort", abort, { once: true });
-			timer = setTimeout(abort, COMMAND_TIMEOUT_MS);
-			active.postMessage({ action: "read", cwd: request.cwd, paths: request.paths });
-			if (signal.aborted) abort();
-		});
+		return await lineOwner.pool.run(
+			{ action: "read", cwd, paths },
+			{
+				signal,
+				bytes: (cwd.length + paths.reduce((size, path) => size + path.length, 0)) * 2,
+				deadlineAt: Infinity,
+			},
+		);
 	} catch (error) {
 		failed = true;
-		// Cancellation/failure is not reported until handles owned by this worker close.
-		thread = undefined;
-		await active.terminate();
+		if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL")
+			throw new GitError("Git line statistics reader queue is full");
 		throw error;
 	} finally {
-		if (timer) clearTimeout(timer);
-		if (forcedTimer) clearTimeout(forcedTimer);
-		signal.removeEventListener("abort", abort);
-		active.off("message", onMessage);
-		active.off("error", onError);
-		active.off("exit", onExit);
 		const durationMs = performance.now() - startedAt;
 		if (durationMs > 2000) {
-			logger.warn("Slow untracked Git line statistics batch", {
-				durationMs,
-				files: request.paths.length,
-				failed,
-			});
-		}
-		if (!failed) {
-			active.unref();
-			idleTimer = setTimeout(() => {
-				if (thread === active) {
-					thread = undefined;
-					void active.terminate();
-				}
-			}, WORKER_IDLE_MS);
-			idleTimer.unref();
+			try {
+				logger.warn("Slow untracked Git line statistics batch", {
+					durationMs,
+					files: paths.length,
+					failed,
+				});
+			} catch {
+				// Diagnostics cannot replace the result or skip resource cleanup.
+			}
 		}
 	}
 }
@@ -303,6 +255,28 @@ async function workerRead(request: PendingRead): Promise<UntrackedLineBatch> {
 /** Raw local measurement: no server TTL, status request, remote call, or shared in-flight cache. */
 export async function getGitLineStats(cwd: string, signal?: AbortSignal): Promise<GitLineStats> {
 	signal?.throwIfAborted();
+	if (lineOwner.closed) throw new GitError("Git line statistics workers are closed");
+	const controller = new AbortController();
+	let finish!: () => void;
+	lineOwner.reads.set(
+		controller,
+		new Promise<void>((resolve) => {
+			finish = resolve;
+		}),
+	);
+	try {
+		return await measureGitLineStats(
+			cwd,
+			signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+		);
+	} finally {
+		lineOwner.reads.delete(controller);
+		finish();
+	}
+}
+
+async function measureGitLineStats(cwd: string, signal: AbortSignal): Promise<GitLineStats> {
+	signal.throwIfAborted();
 	const controller = new AbortController();
 	const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 	const safeDiff = [
