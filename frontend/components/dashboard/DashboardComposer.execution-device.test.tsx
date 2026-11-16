@@ -22,7 +22,9 @@ const box = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
 let devices: Array<{ id: string; name: string; online: boolean; defaultCwd?: string | null }> = [];
 /** Props the device-aware directory modal received on its last render. */
 let modalProps: Record<string, unknown> | null = null;
-const create = mock(async () => ({
+/** The create payload fields these tests assert on; the composer submits more. */
+type CreatePayload = { deviceId?: string | null; cwd?: string | null };
+const create = mock(async (_payload: CreatePayload) => ({
 	id: "new-session",
 	title: "New",
 	cwd: "/workspace",
@@ -282,7 +284,7 @@ test("a single-machine instance shows no device selector and creates locally", a
 	expect(modalProps).not.toBeNull();
 	await send();
 	expect(create).toHaveBeenCalledTimes(1);
-	const payload = create.mock.calls[0]?.[0] as Record<string, unknown>;
+	const payload = create.mock.calls[0][0];
 	expect(payload.deviceId).toBeUndefined();
 });
 
@@ -295,7 +297,7 @@ test("picking a remote device prefills its directory and submits device plus pat
 	expect(modalProps?.deviceId).toBe("win-box");
 	expect(modalProps?.initialPath).toBe("C:\\work");
 	await send();
-	const payload = create.mock.calls[0]?.[0] as Record<string, unknown>;
+	const payload = create.mock.calls[0][0];
 	expect(payload.deviceId).toBe("win-box");
 	expect(payload.cwd).toBe("C:\\work");
 });
@@ -315,7 +317,7 @@ test("the chosen target is remembered across mounts", async () => {
 	render();
 	expect(deviceSelect()?.getAttribute("data-value")).toBe("win-box");
 	await send();
-	const payload = create.mock.calls[0]?.[0] as Record<string, unknown>;
+	const payload = create.mock.calls[0][0];
 	// A remembered path is kept even when the device declares a different default.
 	expect(payload.cwd).toBe("C:\\srv");
 	expect(payload.deviceId).toBe("win-box");

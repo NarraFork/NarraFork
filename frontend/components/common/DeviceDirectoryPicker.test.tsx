@@ -11,6 +11,7 @@ import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import type { RemoteDirectoryLister } from "../permissions/RemoteDirectoryBrowser";
 
 mock.module("@mantine/core", () => ({
 	Modal: ({ opened, children }: { opened: boolean; children?: ReactNode }) =>
@@ -59,7 +60,15 @@ afterEach(() => {
 });
 
 const noop = () => {};
-const listDirectory = async () => ({ path: "/srv", entries: [], parent: null, sep: "/" });
+
+/** A one-level reply shaped like a device's own listing, so the prop type stays honest. */
+const listDirectory: RemoteDirectoryLister = async () => ({
+	path: "/srv",
+	entries: [],
+	parent: null,
+	sep: "/",
+	truncated: false,
+});
 
 test("a local target renders this server's browser and never the device one", async () => {
 	await act(async () => {
