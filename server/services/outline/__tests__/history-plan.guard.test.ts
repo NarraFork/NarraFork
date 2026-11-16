@@ -46,6 +46,7 @@ import {
 	SQLITE_UNDER_ROOT_AT,
 	sqliteMarkAncestorsSql,
 } from "../store/sqlite-history";
+import { SQLITE_LAST_LIVE_VERSION } from "../store/sqlite-read";
 
 const BLOCKS = 100_000;
 const SPACE = "bench-space";
@@ -672,4 +673,50 @@ describe("outline history: plans, size and timings on 100,000 blocks", () => {
 			best.get("level as of a seq, 50 children rewritten 300 times each") as number,
 		).toBeLessThan(50);
 	}, 120_000);
+
+	test("a block's last live version: a backward walk of its primary key past the tombstones since", () => {
+		// A block rewritten 300 times, deleted, then restored and deleted again by 5,000 commits
+		// (each leaves one more tombstone): the read passes those and stops at the first live
+		// version, without sorting and without reading the 300 older ones.
+		const insert = database.prepare(
+			`INSERT INTO outline_block_versions (block_id, from_seq, to_seq, commit_id, page_id,
+				parent_id, order_key, content, content_hash, change_flags, deleted)
+			 VALUES ('tombstones', ?, ?, 'c', 'tombstones', NULL, 'a0', ?, 'h', 2, ?)`,
+		);
+		const LIVE = 300;
+		const TOMBSTONES = 5000;
+		database.transaction(() => {
+			for (let i = 1; i <= LIVE; i++) insert.run(i, i + 1, "text", 0);
+			for (let i = 1; i <= TOMBSTONES; i++) {
+				insert.run(LIVE + i, i === TOMBSTONES ? null : LIVE + i + 1, null, 1);
+			}
+		})();
+		const check = () => {
+			const plan = planOf(SQLITE_LAST_LIVE_VERSION, ["tombstones"]);
+			expect(plan).toHaveLength(1);
+			lineOf(
+				plan,
+				/^SEARCH outline_block_versions USING INDEX sqlite_autoindex_outline_block_versions_1 \(block_id=\?\)$/,
+			);
+		};
+		check();
+		database.run("ANALYZE");
+		check();
+		const statement = database.query(SQLITE_LAST_LIVE_VERSION);
+		expect(statement.get("tombstones")).toEqual({ fromSeq: LIVE, toSeq: LIVE + 1 });
+		// A block that is live: its open version, the first row the walk meets.
+		expect(statement.get(hot)).toMatchObject({ toSeq: null });
+		const times: number[] = [];
+		for (let i = 0; i < 200; i++) {
+			const start = performance.now();
+			statement.get("tombstones");
+			times.push(performance.now() - start);
+		}
+		times.sort((x, y) => x - y);
+		const p95 = times[Math.floor(times.length * 0.95)] as number;
+		console.log(
+			`[outline history] last live version behind ${TOMBSTONES} tombstones: ${(times[100] as number).toFixed(2)} / ${p95.toFixed(2)} ms (p50 / p95)`,
+		);
+		expect(p95).toBeLessThan(20);
+	});
 });

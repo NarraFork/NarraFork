@@ -215,6 +215,15 @@ export interface OutlineReadPort {
 			anyoneFlags?: number;
 		},
 	): Promise<Array<{ blockId: string; fromSeq: number | null; changeFlags: number | null }>>;
+	/**
+	 * The newest version of a block that is not a tombstone: when it was last live. `toSeq` is
+	 * the seq of the tombstone that ended it (null: the block is live). Null when the block has
+	 * none (made and deleted by one commit, or its live versions are not kept). One backward
+	 * walk of the primary key (`block_id`, `from_seq`) that stops at the first live version: it
+	 * passes only the tombstones written since (one per commit that restored the block and left
+	 * it deleted again), never the block's older history.
+	 */
+	getLastLiveVersion(blockId: string): Promise<{ fromSeq: number; toSeq: number | null } | null>;
 	/** Links of the given blocks and kinds valid at `seq` (`null`: open links), at most `limit`. */
 	listLinksAt(
 		blockIds: readonly string[],
