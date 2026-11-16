@@ -21,13 +21,18 @@
  * BATCHES, AND AN INTERRUPTED COPY
  * --------------------------------
  * The copy is written in commits of at most `batchOps` operations and `batchBytes` of content
- * (one commit's size), parents before children. Each commit is atomic; a copy whose later commit
+ * (one commit's size), parents before children. One call writes at most `commitsPerCall` commits
+ * within `msPerCall`, yielding to the event loop between them, and then hands back with
+ * `done: false` and the code {@link OUTLINE_COPY_CONTINUE}: the caller asks again with the same
+ * copy id (a large copy never holds the main thread for its whole length). Each commit is atomic; a copy whose later commit
  * is refused (the target parent was deleted meanwhile, a conflict that does not settle) stops
  * there: what was written is a whole tree (every copied block's parent is copied), the result
  * says `done: false` and why. Nothing is rolled back.
  *
- * Every copied block's id (and sid) is derived from the copy's id (`copyId`) and the block it
- * copies, so the same copy asked again goes on where it stopped: the blocks already there are
+ * Every copied block's id (and sid) is derived from the copy's owner (its actor), the copy's id
+ * (`copyId`) and the block it copies, so the same copy asked again by the same actor goes on
+ * where it stopped (someone else's copy id names other blocks); asked again for another parent,
+ * it is refused (`OUTLINE_COPY_TARGET_MISMATCH`, 409). Calls of one copy run one at a time: the blocks already there are
  * left as they are (one primary-key read), and only the rest is written. A copied block deleted
  * since is not brought back, and neither is what would go under it.
  *
@@ -43,11 +48,15 @@ import { createHash } from "node:crypto";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { type LinkTarget, parseAddress } from "@shared/outline";
+import { OUTLINE_COPY_LIMITS } from "@shared/outline-copy-api";
 import { canWriteSpace } from "./access";
 import { readUserByUsername } from "./access-reads";
 import { OUTLINE_BLOCK_TREE_LIMITS, readBlockSubtree } from "./block-tree";
+import { withOutlineLiveBarrier } from "./live-barrier";
 import { OUTLINE_LIMITS, type OutlineTaskJson } from "./model";
-import { loadBodiesWithin } from "./read";
+import { oneAtATime } from "./person-tasks";
+import { loadBodies } from "./read";
+import { yieldToEventLoop } from "./session-scope";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
 import type { OutlineNode } from "./tree";
@@ -60,16 +69,26 @@ import {
 	writeOutline,
 } from "./write";
 
+/**
+ * The bounds of a copy (`shared/outline-copy-api.ts`, the one source), and what one call does at
+ * most before it hands back with `OUTLINE_COPY_CONTINUE` (the caller asks again with the same
+ * copy id): a few commits, yielding to the event loop between them, within a wall-time budget.
+ */
 export const OUTLINE_SUBTREE_COPY_LIMITS = {
-	/** Blocks of one copy, its provenance included. */
-	blocks: 2000,
-	/** UTF-8 bytes of the copied content. */
-	bytes: 1024 * 1024,
+	blocks: OUTLINE_COPY_LIMITS.blocks,
+	bytes: OUTLINE_COPY_LIMITS.bytes,
 	/** Operations of one commit (the write path takes at most `OUTLINE_LIMITS.maxOps`). */
-	batchOps: OUTLINE_LIMITS.maxOps,
+	batchOps: Math.min(OUTLINE_COPY_LIMITS.batchBlocks, OUTLINE_LIMITS.maxOps),
 	/** UTF-8 bytes of content one commit carries (one transaction carries 128 KiB). */
 	batchBytes: 120 * 1024,
+	commitsPerCall: OUTLINE_COPY_LIMITS.commitsPerCall,
+	msPerCall: OUTLINE_COPY_LIMITS.msPerCall,
+	/** Bodies loaded per read of the source, the event loop yielded between them. */
+	bodyChunk: 100,
 } as const;
+
+/** Why a call handed back before the copy was whole, though nothing refused it. */
+export const OUTLINE_COPY_CONTINUE = "OUTLINE_COPY_CONTINUE";
 
 /** Where the copy goes. */
 export interface OutlineCopyTarget {
@@ -170,14 +189,19 @@ function digest(parts: readonly string[]): Buffer {
 	return createHash("sha256").update(parts.join("\u0000")).digest();
 }
 
-/** The id of the copy of `sourceId` made by copy `copyId`: the same on every call. */
-export function copiedBlockId(copyId: string, sourceId: string): string {
-	return `${COPY_ID_PREFIX}${digest([copyId, sourceId]).toString("base64url").slice(0, 28)}`;
+/** Whose copy it is: the actor's kind and id (a copy id names blocks only for its owner). */
+export function copyOwner(actor: { kind: string; id: string }): string {
+	return `${actor.kind}:${actor.id}`;
+}
+
+/** The id of the copy of `sourceId` made by `owner`'s copy `copyId`: the same on every call. */
+export function copiedBlockId(owner: string, copyId: string, sourceId: string): string {
+	return `${COPY_ID_PREFIX}${digest([owner, copyId, sourceId]).toString("base64url").slice(0, 28)}`;
 }
 
 /** An 8-character sid derived like the id (`attempt` draws another for a taken one). */
-function copiedSid(copyId: string, sourceId: string, attempt: number): string {
-	const bytes = digest(["sid", copyId, sourceId, String(attempt)]);
+function copiedSid(owner: string, copyId: string, sourceId: string, attempt: number): string {
+	const bytes = digest(["sid", owner, copyId, sourceId, String(attempt)]);
 	let out = "";
 	for (let i = 0; i < 8; i++) out += SID_ALPHABET[(bytes[i] as number) % SID_ALPHABET.length];
 	return out;
@@ -219,16 +243,26 @@ export function copiedDepends(
 function copiedContent(content: string, copied: OutlineCopiedLinks): string {
 	const key = copied.sourceKey;
 	if (!content.includes(`[[${key}/`)) return content;
-	let out = content;
-	for (const [sid, copy] of copied.bySid) {
-		out = out
-			.split(`[[${key}/${sid}]]`)
-			.join(`[[${copy}]]`)
-			.split(`[[${key}/${sid}|`)
-			.join(`[[${copy}|`);
-	}
-	return out;
+	// Code (fenced blocks and inline spans) is text, not links: left as written.
+	return content
+		.split(CODE)
+		.map((part, index) => {
+			if (index % 2 === 1) return part;
+			let out = part;
+			for (const [sid, copy] of copied.bySid) {
+				out = out
+					.split(`[[${key}/${sid}]]`)
+					.join(`[[${copy}]]`)
+					.split(`[[${key}/${sid}|`)
+					.join(`[[${copy}|`);
+			}
+			return out;
+		})
+		.join("");
 }
+
+/** Fenced code blocks and inline code spans, captured (odd parts of a split). */
+const CODE = /(```[\s\S]*?```|`[^`\n]*`)/;
 
 /** Of the `human:` assignees given, those whose person may write `space`. */
 export async function peopleWhoCanWorkIn(
@@ -293,6 +327,15 @@ interface Planned {
 export async function copyOutlineSubtree(
 	request: OutlineSubtreeCopyRequest,
 ): Promise<OutlineSubtreeCopyResult> {
+	const owner = copyOwner(request.actor);
+	return await oneAtATime(`copy:${owner}\u0000${request.copyId}`, () => copyOnce(request, owner));
+}
+
+async function copyOnce(
+	request: OutlineSubtreeCopyRequest,
+	owner: string,
+): Promise<OutlineSubtreeCopyResult> {
+	const started = Date.now();
 	const store = request.store ?? outlineStore;
 	const write = request.write ?? writeOutline;
 	const writeOptions = { store, ...(request.now ? { now: request.now } : {}) };
@@ -313,14 +356,20 @@ export async function copyOutlineSubtree(
 	);
 
 	// ── The source, breadth first, within the limits. ──
-	// Read past the limit (up to a read's own), so what is left out is counted.
-	const tree = await readBlockSubtree(request.sourceBlockId, {
-		limit: Math.min(
-			OUTLINE_BLOCK_TREE_LIMITS.maxBlocks,
-			Math.max(maxBlocks, OUTLINE_BLOCK_TREE_LIMITS.defaultBlocks),
-		),
-		store,
-	});
+	// Behind the source space's live barrier: what people typed is committed first. Read past
+	// the limit (up to a read's own), so what is left out is counted.
+	const sourceMeta = (await store.getBlockMetasByIds([request.sourceBlockId]))[0];
+	if (!sourceMeta || sourceMeta.deleted)
+		throw new NotFoundError("Outline block", request.sourceBlockId);
+	const tree = await withOutlineLiveBarrier(sourceMeta.spaceId, () =>
+		readBlockSubtree(request.sourceBlockId, {
+			limit: Math.min(
+				OUTLINE_BLOCK_TREE_LIMITS.maxBlocks,
+				Math.max(maxBlocks, OUTLINE_BLOCK_TREE_LIMITS.defaultBlocks),
+			),
+			store,
+		}),
+	);
 	if (!tree) throw new NotFoundError("Outline block", request.sourceBlockId);
 	const source = tree.state.space;
 	const parentRef = target.parent;
@@ -342,7 +391,18 @@ export async function copyOutlineSubtree(
 	const extra = request.provenance ? 1 : 0;
 	const room = Math.max(1, maxBlocks - extra);
 	const window = order.slice(0, room);
-	await loadBodiesWithin(tree.state, window, maxBytes, { store });
+	// Bodies a chunk at a time, yielding between chunks, until the bytes are spent.
+	let loadedBytes = 0;
+	for (
+		let i = 0;
+		i < window.length && loadedBytes <= maxBytes;
+		i += OUTLINE_SUBTREE_COPY_LIMITS.bodyChunk
+	) {
+		const chunk = window.slice(i, i + OUTLINE_SUBTREE_COPY_LIMITS.bodyChunk);
+		await loadBodies(tree.state, chunk, { store });
+		for (const node of chunk) loadedBytes += utf8(node.content ?? "");
+		await yieldToEventLoop();
+	}
 	const taken: OutlineNode[] = [];
 	const takenIds = new Set<string>();
 	let bytes = 0;
@@ -360,11 +420,11 @@ export async function copyOutlineSubtree(
 
 	// ── Ids and sids, derived; what an earlier call wrote is found by them. ──
 	const idOf = (node: OutlineNode) =>
-		node === tree.root && request.rootId ? request.rootId : copiedBlockId(copyId, node.id);
+		node === tree.root && request.rootId ? request.rootId : copiedBlockId(owner, copyId, node.id);
 	const ids = taken.map(idOf);
-	const provenanceId = request.provenance?.id ?? copiedBlockId(copyId, "\u0000provenance");
+	const provenanceId = request.provenance?.id ?? copiedBlockId(owner, copyId, "\u0000provenance");
 	const madeParentId =
-		parentRef && "create" in parentRef ? copiedBlockId(copyId, "\u0000parent") : null;
+		parentRef && "create" in parentRef ? copiedBlockId(owner, copyId, "\u0000parent") : null;
 	const existing = new Map(
 		(
 			await store.getBlockMetasByIds([
@@ -379,6 +439,15 @@ export async function copyOutlineSubtree(
 			throw new ValidationError("The copy's id names blocks of another space");
 	}
 	const rootThere = existing.get(ids[0] as string);
+	// Asked again for another parent than the copy went under: refused, nothing written.
+	const wantedParent =
+		parentRef === null ? null : "id" in parentRef ? parentRef.id : (madeParentId as string);
+	if (rootThere && !rootThere.deleted && rootThere.parentId !== wantedParent)
+		throw new AppError(
+			"This copy id was used for a copy under another parent; use a new copy id",
+			409,
+			"OUTLINE_COPY_TARGET_MISMATCH",
+		);
 	if (rootThere?.deleted) {
 		// The copy was deleted since: nothing goes under it.
 		return {
@@ -404,7 +473,12 @@ export async function copyOutlineSubtree(
 	for (const [index, node] of taken.entries()) {
 		const id = ids[index] as string;
 		const there = existing.get(id);
-		planned.push({ node, id, sid: there?.sid ?? copiedSid(copyId, node.id, 0), there: !!there });
+		planned.push({
+			node,
+			id,
+			sid: there?.sid ?? copiedSid(owner, copyId, node.id, 0),
+			there: !!there,
+		});
 		if (!there) wantSids.set(id, 0);
 	}
 	for (let attempt = 1; attempt <= 4 && wantSids.size > 0; attempt++) {
@@ -417,7 +491,7 @@ export async function copyOutlineSubtree(
 		wantSids.clear();
 		for (const p of fresh) {
 			if (!used.has(p.sid)) continue;
-			p.sid = copiedSid(copyId, p.node.id, attempt);
+			p.sid = copiedSid(owner, copyId, p.node.id, attempt);
 			wantSids.set(p.id, attempt);
 		}
 	}
@@ -440,14 +514,15 @@ export async function copyOutlineSubtree(
 			),
 		),
 	};
+	// The root's task is the caller's own when it gives one (a hand-out names its assignee);
+	// otherwise the root is copied as every task is.
+	const byRule = (p: Planned) => p.node !== tree.root || !request.rootTask;
 	const people = await peopleWhoCanWorkIn(
-		live.flatMap((p) =>
-			p.node !== tree.root && p.node.task?.assignee ? [p.node.task.assignee] : [],
-		),
+		live.flatMap((p) => (byRule(p) && p.node.task?.assignee ? [p.node.task.assignee] : [])),
 		target.space,
 	);
 	const dropped = live.filter(
-		(p) => p.node !== tree.root && !!p.node.task?.assignee && !people.has(p.node.task.assignee),
+		(p) => byRule(p) && !!p.node.task?.assignee && !people.has(p.node.task.assignee),
 	).length;
 
 	// ── The operations, parents first, then cut into commits. ──
@@ -564,6 +639,20 @@ export async function copyOutlineSubtree(
 	let stopped: OutlineSubtreeCopyResult["stopped"];
 	const summary = request.summary ?? `copied ${source.key}/${tree.root.sid}`;
 	for (const [index, list] of batches.entries()) {
+		// A call does a few commits within its time, yielding between them; the rest is the
+		// next call's (the same copy id goes on).
+		if (
+			commits > 0 &&
+			(commits >= OUTLINE_SUBTREE_COPY_LIMITS.commitsPerCall ||
+				Date.now() - started >= OUTLINE_SUBTREE_COPY_LIMITS.msPerCall)
+		) {
+			stopped = {
+				code: OUTLINE_COPY_CONTINUE,
+				message: "The copy goes on: ask again with the same copy id",
+			};
+			break;
+		}
+		if (commits > 0) await yieldToEventLoop();
 		try {
 			await write(
 				{
@@ -601,7 +690,10 @@ export async function copyOutlineSubtree(
 		},
 		copied: copiedBefore + writtenOfSource,
 		written,
-		omitted: stopped ? omitted + (live.length - copiedBefore - writtenOfSource) : omitted,
+		omitted:
+			stopped && stopped.code !== OUTLINE_COPY_CONTINUE
+				? omitted + (live.length - copiedBefore - writtenOfSource)
+				: omitted,
 		dropped,
 		commits,
 		done: !stopped,

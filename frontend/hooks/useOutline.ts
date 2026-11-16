@@ -31,6 +31,7 @@ import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { outlineBlockWatch } from "../lib/outline-block-watch";
 import { type OutlinePageHint, OutlinePageSubscriptions } from "../lib/outline-page-subscription";
+import { OutlineSubtreeWatches } from "../lib/outline-subtree-watch";
 
 export { useOutlineEnabled } from "./useOutlineEnabled";
 
@@ -489,12 +490,23 @@ export function useOutlineQuestionGroups(blockIds: readonly string[]) {
 	});
 }
 
+let subtreeWatches: OutlineSubtreeWatches | null = null;
+
+/** This tab's shared subtree watches (`outline-subtree-watch.ts`), over the narrator socket. */
+function sharedSubtreeWatches(): OutlineSubtreeWatches {
+	subtreeWatches ??= new OutlineSubtreeWatches((spaceId, handlers) =>
+		outlineBlockWatch(() => narratorWSManager).open(spaceId, handlers),
+	);
+	return subtreeWatches;
+}
+
 /**
- * Watch the subtrees of some blocks over the outline's block watch (`outline-block-watch.ts`: one
- * wire subscription per space, no polling or second socket): `onChange(spaceId)` runs when a
- * commit changes one of them or anything under it, when a watch is (re)confirmed past what was
- * seen (a reconnect), when changes waiting for confirmation change, and when a watch is denied
- * (the caller's re-read then answers not found). Nothing named or `enabled` false: no watch.
+ * Watch the subtrees of some blocks (`outline-subtree-watch.ts`: every caller of a space shares
+ * one wire subscription, no polling or second socket): `onChange(spaceId, seq)` runs when a commit
+ * changes one of them or anything under it, when the watch is (re)confirmed past what was seen
+ * (a reconnect, a watch back after it had no room), and with `seq` null when changes waiting for
+ * confirmation changed or the watch was denied (the caller's re-read then answers not found).
+ * Nothing named or `enabled` false: no watch.
  */
 export function useOutlineSubtreeWatch(
 	targets: ReadonlyArray<{ spaceId: string; blockId: string }>,
@@ -513,29 +525,12 @@ export function useOutlineSubtreeWatch(
 			const [spaceId = "", blockId = ""] = key.split("\u0000");
 			if (spaceId && blockId) bySpace.set(spaceId, [...(bySpace.get(spaceId) ?? []), blockId]);
 		}
-		const handles = [...bySpace].map(([spaceId, blockIds]) => {
-			let seen = -1;
-			const handle = outlineBlockWatch(() => narratorWSManager).open(spaceId, {
-				onWatching: (seq) => {
-					if (seq <= seen) return;
-					seen = seq;
-					latest.current(spaceId, seq);
-				},
-				onChanged: (frame) => {
-					if (frame.seq <= seen) return;
-					seen = frame.seq;
-					latest.current(spaceId, frame.seq);
-				},
-				onPending: () => latest.current(spaceId, null),
-				onError: (code) => {
-					if (code === "access_denied") latest.current(spaceId, null);
-				},
-			});
-			handle.set([], blockIds);
-			return handle;
-		});
+		const watches = sharedSubtreeWatches();
+		const stops = [...bySpace].map(([spaceId, blockIds]) =>
+			watches.watch(spaceId, blockIds, (seq) => latest.current(spaceId, seq)),
+		);
 		return () => {
-			for (const handle of handles) handle.dispose();
+			for (const stop of stops) stop();
 		};
 	}, [keys, enabled]);
 }

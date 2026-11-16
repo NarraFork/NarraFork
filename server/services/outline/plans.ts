@@ -645,7 +645,8 @@ export function planSubmitProblemText(locale: Locale, problem: OutlinePlanSubmit
  * A live session's flush with nobody to name (`system:outline-live`) is not counted: it is most
  * often the person's own typing saved for them (review round 1 N7), nor are the plan review's
  * comments for `session` (PR 8b). A space whose history cannot be read (its placements are not
- * built yet) counts as changed: what is not known is not passed as unchanged.
+ * built yet), or a seen version below its history floor, counts as changed: what is not known is
+ * not passed as unchanged.
  */
 async function changedByOthersSince(
 	store: OutlineStore,
@@ -659,6 +660,10 @@ async function changedByOthersSince(
 	const scan = OUTLINE_PLAN_LIMITS.commitScan;
 	let seqs: Set<number>;
 	try {
+		// Below the history floor nothing is known of what happened: the change marks start
+		// there, so a version seen before it counts as changed.
+		const state = (await store.getHistoryStates([space.id])).get(space.id);
+		if (!state || !state.edgesReady || seenSeq < state.floorSeq) return true;
 		const below = await store.listSubtreeChangeSeqs(space.id, rootId, {
 			after: seenSeq,
 			limit: scan + 1,

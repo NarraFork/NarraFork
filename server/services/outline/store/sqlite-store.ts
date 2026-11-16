@@ -1343,11 +1343,13 @@ export const sqliteOutlineStore: OutlineStore = {
 	},
 
 	async markPendingReported(ids, at) {
-		if (ids.length === 0) return;
-		await withDbRetry(
+		if (ids.length === 0) return [];
+		return await withDbRetry(
 			async () => {
+				const marked: string[] = [];
 				for (const chunk of chunked(ids)) {
-					db.update(outlinePending)
+					for (const row of db
+						.update(outlinePending)
 						.set({ reportedAt: at })
 						.where(
 							and(
@@ -1356,8 +1358,11 @@ export const sqliteOutlineStore: OutlineStore = {
 								isNull(outlinePending.reportedAt),
 							),
 						)
-						.run();
+						.returning({ id: outlinePending.id })
+						.all())
+						marked.push(row.id);
 				}
+				return marked;
 			},
 			{ label: "outline.markPendingReported", maxRetries: 3 },
 		);

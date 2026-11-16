@@ -124,7 +124,7 @@ import { OutlineStaleWriteError } from "./store/port";
 import { readOutlineAncestry } from "./subtree-marks";
 import { isPlanningRoot, type OutlineTaskStartBlocker, outlineTaskStartBlocker } from "./task-json";
 import { deriveOutlineTaskWaits, isClaimLive } from "./tasks";
-import { buildTree, type OutlineNode, viewChildren } from "./tree";
+import { type OutlineNode, viewChildren } from "./tree";
 import { writeOutline } from "./write";
 
 /** The system actor of the commit that claims a task for the session opened to do it. */
@@ -779,9 +779,7 @@ async function readTopLevelMap(
 		asOf: null,
 		limit: limits.mapCounted,
 	});
-	const candidates = rows.filter((row) => row.id !== own && row.taskJson === null && !row.askJson);
-	const mapped = candidates.slice(0, limits.mapBlocks);
-	if (mapped.length === 0) return { map: [], moreMap: 0 };
+	const listed = rows.filter((row) => row.id !== own && row.taskJson === null && !row.askJson);
 	const tops = new Set<string>();
 	if (linkedIds.length > 0) {
 		const ancestry = await readOutlineAncestry(space.id, linkedIds, {
@@ -793,6 +791,26 @@ async function readTopLevelMap(
 			if (above !== null) tops.add(above.at(-1) ?? id);
 		}
 	}
+	// Those the facts are under first, wherever they sit in the space's top level (past the rows
+	// read too, by primary key); the others keep its order.
+	const seen = new Set(rows.map((row) => row.id));
+	const beyond = (await store.getBlockMetasByIds([...tops].filter((id) => !seen.has(id))))
+		.filter(
+			(meta) =>
+				meta.spaceId === space.id &&
+				!meta.deleted &&
+				meta.parentId === null &&
+				meta.id !== own &&
+				meta.taskJson === null &&
+				!meta.askJson,
+		)
+		.map((meta) => ({ id: meta.id, sid: meta.sid, hasChildren: true }));
+	const candidates = [...listed, ...beyond];
+	if (candidates.length === 0) return { map: [], moreMap: 0 };
+	const mapped = [
+		...candidates.filter((row) => tops.has(row.id)),
+		...candidates.filter((row) => !tops.has(row.id)),
+	].slice(0, limits.mapBlocks);
 	const firsts = new Map<string, string[]>();
 	for (const row of mapped) {
 		if (!row.hasChildren) continue;
@@ -813,17 +831,14 @@ async function readTopLevelMap(
 			await store.getBlockHeads([...mapped.map((row) => row.id), ...[...firsts.values()].flat()])
 		).map((head) => [head.id, blockTitle(head.contentHead)]),
 	);
-	const map = mapped
-		.map((row) => ({
-			address: `${space.key}/${row.sid}`,
-			title: heads.get(row.id) || row.sid,
-			linked: tops.has(row.id),
-			lines: (firsts.get(row.id) ?? [])
-				.map((id) => heads.get(id) ?? "")
-				.filter((line) => line.trim() !== ""),
-		}))
-		// Those the facts are under first; the others keep the space's order.
-		.sort((a, b) => Number(b.linked) - Number(a.linked));
+	const map = mapped.map((row) => ({
+		address: `${space.key}/${row.sid}`,
+		title: heads.get(row.id) || row.sid,
+		linked: tops.has(row.id),
+		lines: (firsts.get(row.id) ?? [])
+			.map((id) => heads.get(id) ?? "")
+			.filter((line) => line.trim() !== ""),
+	}));
 	return { map, moreMap: Math.max(0, candidates.length - mapped.length) };
 }
 

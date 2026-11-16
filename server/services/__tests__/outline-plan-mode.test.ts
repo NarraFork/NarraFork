@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
-import { narrators, narratorToolCalls, users } from "../../db/schema";
+import { narrators, narratorToolCalls, outlineSpaces, users } from "../../db/schema";
 import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import {
@@ -652,6 +652,43 @@ describe("deciding (the card's route)", () => {
 		});
 		expect(approved?.edits).toContain("Step C, with tests");
 		expect(approved?.edits).toContain("v3 API");
+	});
+
+	test("409: a version seen before the space's history floor counts as changed (nothing is known of what happened before it)", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const sub = await submit(id);
+		const space = await ensureSessionSpace(id);
+		const seen = sub.input._planSeq as number;
+		// A commit outside the plan, then the space's history starts after the version seen (a
+		// conversion): the plan's own marks say nothing about what came before the floor.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "insert", parent: null, content: "Elsewhere" }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const latest = ((await outlineStore.getSpace(space.id))?.nextSeq as number) - 1;
+		await db
+			.update(outlineSpaces)
+			.set({ historyFloorSeq: latest })
+			.where(eq(outlineSpaces.id, space.id));
+		await expect(
+			decideOutlinePlanRequest({
+				requestId: sub.requestId,
+				principal: { userId: owner, isAdmin: false },
+				body: { action: "draft", seenSeq: seen },
+			}),
+		).rejects.toMatchObject({ statusCode: 409, code: "OUTLINE_PLAN_CHANGED" });
+		// Looked at again at the floor or later: approved.
+		await decideOutlinePlanRequest({
+			requestId: sub.requestId,
+			principal: { userId: owner, isAdmin: false },
+			body: { action: "draft", seenSeq: latest },
+		});
+		expect((await block(plan.root)).taskJson?.plan?.state).toBe("approved");
 	});
 
 	test("403 for a delegate the person may not write; a plan's own session cannot be its delegate; 404 for a request that is not an outline plan", async () => {

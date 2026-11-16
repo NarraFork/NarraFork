@@ -1796,6 +1796,20 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			expect(await told(other as string)).toEqual([]);
 			expect(await told(area as string)).toEqual([d4]);
 			expect(await told(area as string)).toEqual([]);
+			// Two reads at once: each decision is told by one of them only.
+			const p7 = (
+				await write(ctx, space, locker, [
+					{
+						op: "insert",
+						parent: { id: group as string },
+						content: "Plan 7",
+						task: { status: "todo" },
+					},
+				])
+			).results[0]?.blockId as string;
+			const d7 = await decided(p7);
+			const both = await Promise.all([told(deep as string), told(group as string)]);
+			expect(both.flat()).toEqual([d7]);
 		},
 	},
 ];

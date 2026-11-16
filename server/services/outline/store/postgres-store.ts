@@ -735,7 +735,7 @@ const pendingHeadColumns = (() => {
 /**
  * Lock the pending rows a plan touches, in id order (the order every writer takes them, before
  * the space row): the rows it expects, and the open rows of the lock roots it withdraws or moves
- * to another page (bounded: a page holds at most `openPerPage` open rows). Returns the status and
+ * to another top-level block (bounded: a space holds at most `openPerSpace` open rows). Returns the status and
  * revision of the rows it expects.
  *
  * Not strictly every row: an open row put on such a root after this select (by a write that took
@@ -759,7 +759,7 @@ async function lockPending(
 			.select({ id: outlinePending.id })
 			.from(outlinePending)
 			.where(and(inArray(outlinePending.rootBlockId, chunkOfRoots), sql`"status" = 'open'`))
-			.limit(OUTLINE_PENDING_LIMITS.openPerPage * chunkOfRoots.length);
+			.limit(OUTLINE_PENDING_LIMITS.openPerSpace * chunkOfRoots.length);
 		for (const row of open) ids.add(row.id);
 	}
 	const found = new Map<string, { status: string; rev: number }>();
@@ -1521,8 +1521,9 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		},
 
 		async markPendingReported(ids, at) {
+			const marked: string[] = [];
 			for (const chunk of chunked(ids)) {
-				await withPgRetry(
+				const rows = await withPgRetry(
 					() =>
 						db
 							.update(outlinePending)
@@ -1533,10 +1534,13 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 									ne(outlinePending.status, "open"),
 									isNull(outlinePending.reportedAt),
 								),
-							),
+							)
+							.returning({ id: outlinePending.id }),
 					{ label: "outline.markPendingReported" },
 				);
+				for (const row of rows) marked.push(row.id);
 			}
+			return marked;
 		},
 
 		async applyPending(plan) {

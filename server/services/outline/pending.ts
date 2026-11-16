@@ -898,8 +898,8 @@ export async function readPagePending(
 ): Promise<{ pending: OutlinePendingHead[]; locked: OutlineBlockMeta[] }> {
 	const store = options.store ?? outlineStore;
 	const [pending, locked] = await Promise.all([
-		store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerPage),
-		store.listLockedBlocks(pageId, OUTLINE_PENDING_LIMITS.openPerPage),
+		store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerSpace),
+		store.listLockedBlocks(pageId, OUTLINE_PENDING_LIMITS.openPerSpace),
 	]);
 	return { pending, locked };
 }
@@ -1248,13 +1248,18 @@ export async function takePendingReports(
 		after = { createdAt: last.createdAt, id: last.id };
 	}
 	if (candidates.length === 0) return [];
-	const walk = await store.listAncestryOf(
-		options.spaceId,
-		[options.blockId, ...new Set(candidates.map((row) => row.rootBlockId as string))],
-		limits.reportsWalkRows,
-		{ includeDeleted: true },
-	);
-	const parentOf = new Map(walk.rows.map((row) => [row.id, row.parentId] as const));
+	// The read block's own chain first (one short walk), so a truncated walk of the roots never
+	// loses where the session reads; then the roots, all at once.
+	const parentOf = new Map<string, string | null>();
+	for (const ids of [
+		[options.blockId],
+		[...new Set(candidates.map((row) => row.rootBlockId as string))],
+	]) {
+		const walk = await store.listAncestryOf(options.spaceId, ids, limits.reportsWalkRows, {
+			includeDeleted: true,
+		});
+		for (const row of walk.rows) parentOf.set(row.id, row.parentId);
+	}
 	const topOf = (id: string): string | null => {
 		let at = id;
 		for (let depth = 0; depth <= OUTLINE_LIMITS.maxDepth; depth++) {
@@ -1270,13 +1275,15 @@ export async function takePendingReports(
 	const taken = candidates
 		.filter((row) => topOf(row.rootBlockId as string) === here)
 		.slice(0, limits.reportsPerRead);
-	if (taken.length > 0) {
+	if (taken.length === 0) return [];
+	// Only the decisions this read marked: a read at the same time reports each once.
+	const marked = new Set(
 		await store.markPendingReported(
 			taken.map((r) => r.id),
 			(options.now?.() ?? new Date()).toISOString(),
-		);
-	}
-	return taken;
+		),
+	);
+	return taken.filter((row) => marked.has(row.id));
 }
 
 /** The space of a pending change, for access checks. */

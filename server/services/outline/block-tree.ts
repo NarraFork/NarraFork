@@ -10,7 +10,9 @@
  *     a seq: the versions valid then, one backward seek each);
  *   - the subtree under the block, breadth first, level by level (`listSubtreeAt`), at most
  *     `limit` rows ({@link OUTLINE_BLOCK_TREE_LIMITS.defaultBlocks} by default, at most
- *     {@link OUTLINE_BLOCK_TREE_LIMITS.maxBlocks}); `truncated` when the subtree holds more (the
+ *     {@link OUTLINE_BLOCK_TREE_LIMITS.maxBlocks} now and
+ *     {@link OUTLINE_BLOCK_TREE_LIMITS.maxBlocksAsOf} as of an earlier seq: a read as of the last
+ *     commit reads the current rows); `truncated` when the subtree holds more (the
  *     deepest blocks are the ones missing, and only the parent of the last row read may have
  *     fewer children here than it has).
  *
@@ -35,8 +37,10 @@ import { ancestorsOf, buildTree, type OutlineNode } from "./tree";
 export const OUTLINE_BLOCK_TREE_LIMITS = {
 	/** Blocks under the root one read takes by default. */
 	defaultBlocks: 800,
-	/** At most (a plan's submission and diff read up to 2,000 blocks and one more). */
+	/** At most, now (a plan's submission and diff read up to 2,000 blocks and one more). */
 	maxBlocks: 2001,
+	/** At most as of an earlier seq: what a read of history may take on the main thread. */
+	maxBlocksAsOf: 800,
 	/** Rows one read of child levels takes in all. */
 	childRows: 800,
 } as const;
@@ -156,13 +160,19 @@ export async function readBlockSubtree(
 	if (!block) return null;
 	const space = await store.getSpace(block.spaceId);
 	if (!space) return null;
-	const seq = readSeq(space, options.asOf);
+	// As of the space's last commit is now: read from the current rows (cheaper, and not bound
+	// to the 800 rows a read of history may take on the main thread).
+	const asked = readSeq(space, options.asOf);
+	const seq = asked !== null && asked >= space.nextSeq - 1 ? null : asked;
 	if (seq === null && block.deleted) return null;
 	const chain = await chainRows(store, space.id, blockId, seq);
 	if (!chain) return null;
 	const { rows, truncated } = await store.listSubtreeAt(space.id, blockId, {
 		asOf: seq,
-		limit: clampLimit(options.limit),
+		limit: Math.min(
+			clampLimit(options.limit),
+			seq === null ? OUTLINE_BLOCK_TREE_LIMITS.maxBlocks : OUTLINE_BLOCK_TREE_LIMITS.maxBlocksAsOf,
+		),
 	});
 	// The chain first: a row under the root that names an ancestor's id cannot be (a tree), but
 	// the root's own row must be the chain's, with the parent it has on the way up.

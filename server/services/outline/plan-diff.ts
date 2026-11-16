@@ -182,8 +182,12 @@ export async function readPlanDiff(args: {
 	const max = OUTLINE_PLAN_LIMITS.maxBlocks;
 	const now = preorder(after.root, max, args.skip);
 	const then = before ? preorder(before.root, max, args.skip) : { nodes: [], depth: new Map() };
+	// A read of history takes at most 800 blocks on the main thread (`block-tree.ts`): a side
+	// cut there is said to be incomplete as one past the plan's limit is.
 	let truncated =
 		unreadable ||
+		after.state.truncated ||
+		!!before?.state.truncated ||
 		subtreeLargerThan(after.root, max) ||
 		(!!before && subtreeLargerThan(before.root, max));
 	const beforeById = new Map(then.nodes.map((n) => [n.id, n]));

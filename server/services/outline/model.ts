@@ -232,8 +232,6 @@ export type OutlinePendingStatus = (typeof OUTLINE_PENDING_STATUSES)[number];
 export const OUTLINE_PENDING_LIMITS = {
 	/** Open pending changes in one space; a new proposal past it is refused. */
 	openPerSpace: 500,
-	/** Open pending changes the editor's side panel of a top-level block reads. */
-	openPerPage: 100,
 	/** Operations one pending change holds, merges included. */
 	maxOps: OUTLINE_LIMITS.maxOps,
 	/** UTF-8 bytes of content one pending change holds: what one transaction may carry. */

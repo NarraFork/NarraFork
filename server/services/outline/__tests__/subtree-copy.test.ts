@@ -32,6 +32,8 @@ import type { OutlineBlockRow, OutlineSpaceRow } from "../store/port";
 import {
 	copiedBlockId,
 	copyOutlineSubtree,
+	copyOwner,
+	OUTLINE_COPY_CONTINUE,
 	OUTLINE_SUBTREE_COPY_LIMITS,
 	type OutlineSubtreeCopyRequest,
 } from "../subtree-copy";
@@ -404,7 +406,133 @@ describe("copying a subtree", () => {
 			written: 0,
 			stopped: { code: "OUTLINE_COPY_DELETED" },
 		});
-		expect(copiedBlockId(args.copyId, child?.id as string)).toBe(made.root.id);
+		expect(copiedBlockId(copyOwner(args.actor), args.copyId, child?.id as string)).toBe(
+			made.root.id,
+		);
+	});
+});
+
+describe("review probes (A2 round 1)", () => {
+	test("P1: a plain copy keeps the root's assignee who may write the target, drops and counts one who may not", async () => {
+		const lead = await person("lead");
+		const writer = await person("wr");
+		const outsider = await person("out");
+		const from = await space(lead, [
+			[writer, "write"],
+			[outsider, "write"],
+		]);
+		const to = await space(lead, [[writer, "write"]]);
+		await write(from, lead, [
+			{
+				op: "insert",
+				tempId: "r",
+				parent: null,
+				content: "Root task",
+				task: { status: "todo", assignee: `human:${writer.username}` },
+			},
+			{ op: "insert", parent: { tempId: "r" }, content: "child" },
+			{
+				op: "insert",
+				parent: null,
+				content: "Other root",
+				task: { status: "todo", assignee: `human:${outsider.username}` },
+			},
+		]);
+		const [r, other] = await children(from.id, null);
+		const kept = await copyOutlineSubtree(copyArgs(lead, r?.id as string, to, null));
+		expect((await outlineStore.getBlock(kept.root.id))?.taskJson?.assignee).toBe(
+			`human:${writer.username}`,
+		);
+		expect(kept.dropped).toBe(0);
+		const lost = await copyOutlineSubtree(copyArgs(lead, other?.id as string, to, null));
+		expect((await outlineStore.getBlock(lost.root.id))?.taskJson?.assignee ?? null).toBeNull();
+		expect(lost.dropped).toBe(1);
+	});
+
+	test("P2: the same copy id for another parent is refused (409); someone else's same copy id makes their own copy", async () => {
+		const lead = await person("lead");
+		const other = await person("oth");
+		const s = await space(lead, [[other, "write"]]);
+		await write(s, lead, [
+			{ op: "insert", tempId: "r", parent: null, content: "Root" },
+			{ op: "insert", parent: null, content: "DestA" },
+			{ op: "insert", parent: null, content: "DestB" },
+		]);
+		const [r, a, b] = await children(s.id, null);
+		const ops: OutlineOp[] = [];
+		for (let j = 0; j < 300; j++)
+			ops.push({ op: "insert", parent: { id: r?.id as string }, content: `c${j}` });
+		await write(s, lead, ops.slice(0, 150));
+		await write(s, lead, ops.slice(150));
+		const args = copyArgs(lead, r?.id as string, s, a?.id as string);
+		let calls = 0;
+		const first = await copyOutlineSubtree({
+			...args,
+			write: async (input, options) => {
+				if (++calls === 2) throw new AppError("refused in a test", 409, "X");
+				return await writeOutline(input, options);
+			},
+		});
+		expect(first.done).toBe(false);
+		await expect(
+			copyOutlineSubtree({ ...args, target: { space: s, parent: { id: b?.id as string } } }),
+		).rejects.toMatchObject({ statusCode: 409, code: "OUTLINE_COPY_TARGET_MISMATCH" });
+		expect(await children(s.id, b?.id as string)).toEqual([]);
+		// Another person with the same copy id: their own copy, not a resume of the first.
+		const theirs = await copyOutlineSubtree({
+			...args,
+			actor: { kind: "human", id: other.id },
+			responsibleUserId: other.id,
+			target: { space: s, parent: { id: b?.id as string } },
+		});
+		expect(theirs.done).toBe(true);
+		expect(theirs.root.id).not.toBe(first.root.id);
+		expect(theirs.copied).toBe(301);
+		// The first one goes on where it stopped, under its own parent.
+		const again = await copyOutlineSubtree(args);
+		expect(again).toMatchObject({ done: true, copied: 301, root: { id: first.root.id } });
+		expect((await outlineStore.getBlock(first.root.id))?.parentId).toBe(a?.id);
+	});
+
+	test("P4: two calls of one copy at once make one copy", async () => {
+		const lead = await person("lead");
+		const s = await space(lead);
+		await write(s, lead, [{ op: "insert", tempId: "r", parent: null, content: "Root" }]);
+		const [r] = await children(s.id, null);
+		const ops: OutlineOp[] = [];
+		for (let j = 0; j < 190; j++)
+			ops.push({ op: "insert", parent: { id: r?.id as string }, content: `c${j}` });
+		await write(s, lead, ops);
+		const args = copyArgs(lead, r?.id as string, s, null);
+		const [one, two] = await Promise.all([copyOutlineSubtree(args), copyOutlineSubtree(args)]);
+		expect(one.done && two.done).toBe(true);
+		expect(one.written + two.written).toBe(192);
+		expect((await children(s.id, null)).filter((b) => b.content === "Root")).toHaveLength(2);
+	});
+
+	test("P5: a link inside code is text, left as written; outside code it names the copy", async () => {
+		const lead = await person("lead");
+		const s = await space(lead);
+		await write(s, lead, [
+			{ op: "insert", tempId: "r", sid: "RRRR0002", parent: null, content: "Root" },
+			{
+				op: "insert",
+				parent: { tempId: "r" },
+				content: `literal \`[[${s.key}/RRRR0002]]\` and link [[${s.key}/RRRR0002]]`,
+			},
+			{
+				op: "insert",
+				parent: { tempId: "r" },
+				content: `\`\`\`\n[[${s.key}/RRRR0002]]\n\`\`\``,
+			},
+		]);
+		const [r] = await children(s.id, null);
+		const result = await copyOutlineSubtree(copyArgs(lead, r?.id as string, s, null));
+		const kids = await children(s.id, result.root.id);
+		expect(kids[1]?.content).toBe(
+			`literal \`[[${s.key}/RRRR0002]]\` and link [[${s.key}/${result.root.sid}]]`,
+		);
+		expect(kids[2]?.content).toBe(`\`\`\`\n[[${s.key}/RRRR0002]]\n\`\`\``);
 	});
 });
 
@@ -505,4 +633,55 @@ describe("POST /spaces/:spaceId/blocks/:blockId/copy", () => {
 				.status,
 		).toBe(400);
 	});
+});
+
+describe("a large copy over HTTP (review round 1, P3)", () => {
+	test("each request does a few commits and lets the event loop run; asked again with the copy id, it finishes", async () => {
+		const lead = await person("lead");
+		const s = await space(lead);
+		await write(s, lead, [{ op: "insert", tempId: "r", parent: null, content: "Root" }]);
+		const [r] = await children(s.id, null);
+		const body = "x".repeat(500);
+		for (let i = 0; i < 40; i++) {
+			const ops: OutlineOp[] = [
+				{ op: "insert", tempId: "c", parent: { id: r?.id as string }, content: `c${i} ${body}` },
+			];
+			for (let j = 0; j < 49; j++)
+				ops.push({ op: "insert", parent: { tempId: "c" }, content: `g${i}.${j} ${body}` });
+			await write(s, lead, ops);
+		}
+		let ticks = 0;
+		const tick = setInterval(() => {
+			ticks++;
+		}, 1);
+		const responses: OutlineCopyResponse[] = [];
+		try {
+			for (let call = 0; call < 20; call++) {
+				const before = ticks;
+				const response = await post(lead, `/spaces/${s.id}/blocks/${r?.id}/copy`, {
+					targetSpaceId: s.id,
+					parentId: null,
+					copyId: "copy-large-0001",
+				});
+				expect(response.status).toBe(200);
+				responses.push(response.body);
+				// The loop ran while the request worked (it yields between bodies and commits).
+				expect(ticks).toBeGreaterThan(before);
+				if (response.body.done) break;
+				expect(response.body.stopped?.code).toBe(OUTLINE_COPY_CONTINUE);
+				expect(response.body.commits).toBeLessThanOrEqual(
+					OUTLINE_SUBTREE_COPY_LIMITS.commitsPerCall,
+				);
+			}
+		} finally {
+			clearInterval(tick);
+		}
+		const last = responses.at(-1);
+		expect(last?.done).toBe(true);
+		expect(responses.length).toBeGreaterThan(1);
+		// Everything the bounds take, once: 2,000 blocks with the provenance.
+		expect(last?.copied).toBe(OUTLINE_SUBTREE_COPY_LIMITS.blocks - 1);
+		expect(responses.reduce((n, x) => n + x.written, 0)).toBe(OUTLINE_SUBTREE_COPY_LIMITS.blocks);
+		expect(new Set(responses.map((x) => x.root.id)).size).toBe(1);
+	}, 120_000);
 });

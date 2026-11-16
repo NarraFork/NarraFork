@@ -972,8 +972,11 @@ export interface OutlineStore
 		limit: number,
 		after?: { createdAt: string; id: string } | null,
 	): Promise<OutlinePendingHead[]>;
-	/** Mark decided rows as shown to their proposer. */
-	markPendingReported(ids: readonly string[], at: string): Promise<void>;
+	/**
+	 * Mark decided rows as shown to their proposer, only those not marked yet; returns the ids
+	 * this call marked (two reads at once report a decision once).
+	 */
+	markPendingReported(ids: readonly string[], at: string): Promise<string[]>;
 	/**
 	 * Write a plan's pending changes without a commit (a proposal with nothing written directly):
 	 * atomically, and only while the space's counter is still `seq` (no commit landed since the
