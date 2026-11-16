@@ -35,6 +35,8 @@ export const OUTLINE_SUBTREE_LIMITS = {
 	maxPath: 100,
 	/** Closed rows of one folded read that get the child their preview line is read from. */
 	maxPreviews: 50,
+	/** Children of a closed row a folded read looks at to say how many it has (then "N+"). */
+	previewPeek: 12,
 	/** Keys one marks read names at most. */
 	maxMarkKeys: 100,
 	/** Open changes one read marks its blocks with; past it the read says `pendingTruncated`. */
@@ -138,6 +140,15 @@ export interface OutlineSubtreeResponse extends OutlineTreeRead {
 	 */
 	closed?: string[];
 	/**
+	 * With `fold=default`: of the closed rows that got their preview child, how many direct
+	 * children the view shows under each, counted up to
+	 * {@link OUTLINE_SUBTREE_LIMITS.previewPeek}; `more`: there are more than `kids`.
+	 * `previewId`: on a finished task whose first child is not a note, the first note among
+	 * the children looked at (its preview line is its result, not a subtask); that block is in
+	 * `blocks` without being part of a level of this read.
+	 */
+	closedKids?: Record<string, { kids: number; more: boolean; previewId?: string }>;
+	/**
 	 * With `fold=default`: the space has more open questions, locks or open changes than one
 	 * read looks at ({@link OUTLINE_SUBTREE_LIMITS.markCandidates} of each), or the walk up
 	 * from them was cut short, so a row in `closed` may hide one of them after all.
@@ -228,3 +239,103 @@ export const OUTLINE_HISTORY_ERROR_CODES = {
 	"not-ready": "OUTLINE_HISTORY_NOT_READY",
 	"before-floor": "OUTLINE_HISTORY_BEFORE_FLOOR",
 } as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A reader's own folding, by block (pageless outline, F1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * What a reader opened and closed in one space, one row per block (`outline_fold_state`). A
+ * block in neither set follows the default folding (`shared/outline-fold.ts`), so a task that
+ * gets done later closes by itself. Personal, never part of the block model, never a commit.
+ */
+export const OUTLINE_FOLD_STATE_LIMITS = {
+	/**
+	 * Blocks one reader has a stored folding for in one space. Writing more drops the ones
+	 * written longest ago (they go back to the default).
+	 */
+	maxPerSpace: 2000,
+	/** Blocks one write names at most. */
+	maxChanges: 500,
+	/** Bytes of a write's body. */
+	maxBodyBytes: 64 * 1024,
+	/** Resets one write carries at most (applied before its changes). */
+	maxResets: 50,
+} as const;
+
+/** `GET /spaces/:spaceId/fold-state` and the answer of a write. */
+export interface OutlineFoldStateResponse {
+	spaceId: string;
+	/** Opened by the reader: closed by default. */
+	expanded: string[];
+	/** Closed by the reader: open by default. */
+	collapsed: string[];
+	/**
+	 * A reset under a block could not place every stored row (its bounded walk up stopped):
+	 * some under the block may still be there.
+	 */
+	incomplete?: true;
+	/** The write was older than one already applied for its writer: nothing was changed. */
+	ignored?: true;
+}
+
+/**
+ * `DELETE /spaces/:spaceId/fold-state?under=<block>`: the reader's folding back to the
+ * default, of the whole space (no `under`, or the space's id) or of a block and everything
+ * under it. One request, whatever the number of rows. Answers with the state after it.
+ */
+export type OutlineFoldStateResetQuery = { under?: string };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Open tasks under a block (pageless outline, F1: the "in progress" count's list)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const OUTLINE_OPEN_TASKS_LIMITS = {
+	/** Tasks one page lists at most (default 20). */
+	maxLimit: 50,
+} as const;
+
+/** One open task under the block asked about. */
+export interface OutlineOpenTaskItem {
+	id: string;
+	/** The first line of its text, short. */
+	title: string;
+	status: "todo" | "doing";
+	assignee: string | null;
+}
+
+/**
+ * `GET /spaces/:spaceId/open-tasks?under=<key>&cursor=&limit=`: the open tasks (to do, in
+ * progress) strictly under a block (`under` the space's id: the whole space), in progress
+ * first, then by id; cursor-paged. Built from the same candidates as the marks read (the
+ * space's open-task index, at most `markCandidates`), so it lists what the count counted;
+ * `atLeast`: the space has more open tasks than one read looks at, the list may miss some.
+ */
+export interface OutlineOpenTasksResponse {
+	under: string;
+	items: OutlineOpenTaskItem[];
+	nextCursor: string | null;
+	atLeast: boolean;
+}
+
+/**
+ * `PUT /spaces/:spaceId/fold-state`: changes, not the whole state, so two tabs of one reader do
+ * not undo each other. `open: null` puts the block back to its default (its row is removed).
+ * Ids that are not live blocks of the space are dropped silently.
+ */
+export interface OutlineFoldStatePutBody {
+	changes?: Array<{ blockId: string; open: boolean | null }>;
+	/**
+	 * Back to the default BEFORE the changes, in the same transaction: null (or the space's
+	 * id) for the whole space, a block for it and everything under it. At most
+	 * `maxResets`. A write needs changes or resets.
+	 */
+	reset?: Array<string | null>;
+	/**
+	 * Who writes (one id per view, 8–64 of `A–Z a–z 0–9 _ -`) and the write's number, rising:
+	 * the server ignores a write numbered at or below one it applied for that writer (the
+	 * answer says `ignored`). Both or neither.
+	 */
+	writer?: string;
+	n?: number;
+}

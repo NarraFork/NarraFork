@@ -23,6 +23,7 @@ import {
 	outlineBlocks,
 	outlineBlockVersions,
 	outlineCommits,
+	outlineFoldState,
 	outlineLinks,
 	outlineLiveLog,
 	outlineLiveUpdates,
@@ -241,6 +242,85 @@ async function putTaskSeenSection(
 	await tx
 		.delete(outlineTaskSeen)
 		.where(and(eq(outlineTaskSeen.userId, userId), lt(outlineTaskSeen.seenAt, pruneBefore)));
+}
+
+/** Delete a person's fold rows of a space: all of them (`blockIds` null) or those named. */
+async function clearFoldStateSection(
+	tx: PgTransaction,
+	userId: string,
+	spaceId: string,
+	blockIds: readonly string[] | null,
+): Promise<void> {
+	const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
+	if (blockIds === null) {
+		await tx.delete(outlineFoldState).where(own);
+		return;
+	}
+	for (const chunk of chunked([...new Set(blockIds)])) {
+		await tx.delete(outlineFoldState).where(and(own, inArray(outlineFoldState.blockId, chunk)));
+	}
+}
+
+/** Apply a person's fold changes of a space and drop their oldest rows beyond the cap. */
+async function putFoldStateSection(
+	tx: PgTransaction,
+	userId: string,
+	spaceId: string,
+	changes: ReadonlyArray<{ blockId: string; open: boolean | null }>,
+	updatedAt: string,
+	keep: number,
+	clear: { all: true } | { ids: readonly string[] } | undefined,
+): Promise<void> {
+	const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
+	// The resets first, then the changes.
+	if (clear && "all" in clear) await tx.delete(outlineFoldState).where(own);
+	else if (clear) {
+		for (const chunk of chunked([...new Set(clear.ids)])) {
+			await tx.delete(outlineFoldState).where(and(own, inArray(outlineFoldState.blockId, chunk)));
+		}
+	}
+	const writes = changes.filter((change) => change.open !== null);
+	const removed = changes.flatMap((change) => (change.open === null ? [change.blockId] : []));
+	const justWritten = new Set(writes.map((change) => change.blockId));
+	for (const chunk of chunked(removed)) {
+		await tx.delete(outlineFoldState).where(and(own, inArray(outlineFoldState.blockId, chunk)));
+	}
+	for (const chunk of chunked(writes, 100)) {
+		await tx
+			.insert(outlineFoldState)
+			.values(
+				chunk.map((change) => ({
+					userId,
+					spaceId,
+					blockId: change.blockId,
+					open: change.open === true,
+					updatedAt,
+				})),
+			)
+			.onConflictDoUpdate({
+				target: [outlineFoldState.userId, outlineFoldState.spaceId, outlineFoldState.blockId],
+				set: { open: sql`excluded.open`, updatedAt },
+			});
+	}
+	// Past the cap: the rows written longest ago go, never the ones just written (see the port).
+	const kept = tx
+		.select({ id: outlineFoldState.blockId })
+		.from(outlineFoldState)
+		.where(own)
+		.orderBy(desc(outlineFoldState.updatedAt), sql`${outlineFoldState.blockId} COLLATE "C" DESC`)
+		.limit(keep);
+	const stale = (
+		await tx
+			.select({ id: outlineFoldState.blockId })
+			.from(outlineFoldState)
+			.where(and(own, notInArray(outlineFoldState.blockId, kept)))
+			.limit(2 * changes.length + 2)
+	)
+		.map((row) => row.id)
+		.filter((id) => !justWritten.has(id));
+	for (const chunk of chunked(stale)) {
+		await tx.delete(outlineFoldState).where(and(own, inArray(outlineFoldState.blockId, chunk)));
+	}
 }
 
 /** Write a person's view state of a page and drop their oldest pages beyond the cap. */
@@ -1247,6 +1327,39 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			await withPgRetry(() => db.transaction((tx) => putViewStateSection(tx, row, keepPerUser)), {
 				label: "outline.putViewState",
 			});
+		},
+
+		async listFoldState(userId, spaceId, limit) {
+			return db
+				.select({
+					blockId: outlineFoldState.blockId,
+					open: outlineFoldState.open,
+					updatedAt: outlineFoldState.updatedAt,
+				})
+				.from(outlineFoldState)
+				.where(and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId)))
+				.orderBy(
+					desc(outlineFoldState.updatedAt),
+					sql`${outlineFoldState.blockId} COLLATE "C" DESC`,
+				)
+				.limit(limit);
+		},
+
+		async putFoldState(userId, spaceId, changes, updatedAt, keep, clear) {
+			await withPgRetry(
+				() =>
+					db.transaction((tx) =>
+						putFoldStateSection(tx, userId, spaceId, changes, updatedAt, keep, clear),
+					),
+				{ label: "outline.putFoldState" },
+			);
+		},
+
+		async clearFoldState(userId, spaceId, blockIds) {
+			await withPgRetry(
+				() => db.transaction((tx) => clearFoldStateSection(tx, userId, spaceId, blockIds)),
+				{ label: "outline.clearFoldState" },
+			);
 		},
 
 		async getTaskSeen(userId, taskBlockIds) {

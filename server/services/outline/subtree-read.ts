@@ -770,6 +770,13 @@ export interface OutlineSubtreeRequest {
 	 * sets empty for a reader who never folded anything here).
 	 */
 	fold?: { expanded: ReadonlySet<string>; collapsed: ReadonlySet<string> };
+	/**
+	 * With `fold` and no root (a whole space): its top-level blocks are closed unless the
+	 * reader opened them, whatever the default and whatever is under them (a space's landing
+	 * view lists them one line each; what they hide is counted by the marks). What is under
+	 * one the reader opened folds by the default, as under a focused root.
+	 */
+	topClosed?: boolean;
 	narratorVisible?: (narratorId: string) => Promise<boolean>;
 	store?: OutlineStore;
 }
@@ -845,11 +852,13 @@ export async function readOutlineSubtreeNodes(
 		const over: ReadonlySet<string> | null = attention?.over ?? null;
 
 		const fold = request.fold;
+		const topClosed = request.topClosed === true && rootId === null;
 		const foldAt = new Map<string, FoldAt>();
 		const isOpen = (row: OutlineLevelRow, at: FoldAt): boolean => {
 			if (!fold) return true;
 			if (at.depth >= FOLD_MAX_OPEN_DEPTH) return false;
 			if (fold.expanded.has(row.id)) return true;
+			if (topClosed && at.depth === 1) return false;
 			if (fold.collapsed.has(row.id)) return false;
 			if (over?.has(row.id)) return true;
 			const status = row.taskJson?.status ?? null;
@@ -911,18 +920,41 @@ export async function readOutlineSubtreeNodes(
 		}
 
 		// The one child a closed row's preview line is read from, while the budget lasts.
+		// A few more of its children are looked at (level rows only, no content) to say how
+		// many there are: the preview line's "N more".
+		const closedKids: Record<string, { kids: number; more: boolean; previewId?: string }> = {};
+		const finished = new Set(
+			order.flatMap((row) =>
+				row.taskJson?.status === "done" || row.taskJson?.status === "cancelled" ? [row.id] : [],
+			),
+		);
 		if (fold) {
 			for (const id of closed.slice(0, OUTLINE_SUBTREE_LIMITS.maxPreviews)) {
 				if (room <= 0 || ctx.rowsLeft <= 0) break;
+				const peek = Math.min(OUTLINE_SUBTREE_LIMITS.previewPeek, ctx.rowsLeft);
 				const { rows, next } = await store.listLevel(space.id, id, {
 					asOf: ctx.asOf,
-					limit: 1,
+					limit: peek,
 				});
-				room -= rows.length;
 				ctx.rowsLeft -= rows.length;
-				const draft = draftOf(id, rows, next !== null, view, null);
+				const shown = view === "all" ? rows : rows.filter((row) => !isProcess(row));
+				closedKids[id] = { kids: shown.length, more: next !== null };
+				// The level as this read returns it is its first child alone, continuing after it.
+				const first = rows.slice(0, 1);
+				room -= first.length;
+				const draft = draftOf(id, first, next !== null || rows.length > 1, view, null);
 				drafts.push(draft);
 				for (const row of draft.rows) order.push(row);
+				// A finished task's line is its first note, which may stand after its subtasks.
+				const head = rows[0];
+				if (finished.has(id) && head && (isProcess(head) || isOutlineReportBlockId(head.id))) {
+					const note = rows.find((row) => !isProcess(row) && !isOutlineReportBlockId(row.id));
+					if (note && room > 0) {
+						room--;
+						order.push(note);
+						closedKids[id].previewId = note.id;
+					}
+				}
 			}
 		}
 
@@ -942,7 +974,14 @@ export async function readOutlineSubtreeNodes(
 				levels: done.levels,
 				truncated: truncated || done.cut,
 				...(done.pendingTruncated ? { pendingTruncated: true } : {}),
-				...(fold ? { closed: closed.filter((id) => shownIds.has(id)) } : {}),
+				...(fold
+					? {
+							closed: closed.filter((id) => shownIds.has(id)),
+							closedKids: Object.fromEntries(
+								Object.entries(closedKids).filter(([id]) => shownIds.has(id)),
+							),
+						}
+					: {}),
 				...(attention?.atLeast ? { attentionAtLeast: true } : {}),
 			},
 			nodes: done.shown,

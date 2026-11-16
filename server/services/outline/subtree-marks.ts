@@ -28,7 +28,13 @@
  * "Changed since" is the placements' change marks (`findSubtreeChanges`: two index probes per
  * key), and is refused like every read of history when the space cannot answer it.
  */
-import { OUTLINE_SUBTREE_LIMITS, type OutlineSubtreeMarks } from "@shared/outline-subtree-api";
+import { titleOf } from "@shared/outline";
+import {
+	OUTLINE_OPEN_TASKS_LIMITS,
+	OUTLINE_SUBTREE_LIMITS,
+	type OutlineOpenTasksResponse,
+	type OutlineSubtreeMarks,
+} from "@shared/outline-subtree-api";
 import { outlineStore } from "./store";
 import { assertHistoryReadable } from "./store/history-port";
 import type { OutlineBlockMeta, OutlineSpaceRow, OutlineStore } from "./store/port";
@@ -275,5 +281,77 @@ export async function readOutlineMarks(request: OutlineMarksRequest): Promise<Ou
 			return marks ? [marks] : [];
 		}),
 		atLeast: found.more || ancestry.cutShort,
+	};
+}
+
+/** Characters of a listed task's title. */
+const OPEN_TASK_TITLE_CHARS = 120;
+
+/**
+ * The open tasks strictly under a block (the space's id: the whole space), what the "in
+ * progress" count of {@link readOutlineMarks} counted: the same candidates (the space's open-task
+ * index, at most `markCandidates`), walked up together, kept when the block is above them.
+ * In progress first, then by id; `cursor` is the last item's `rank:id`. Only the page's titles
+ * are read (`getContentHeads`). A key that is not a live block of the space lists nothing.
+ */
+export async function readOutlineOpenTasks(request: {
+	space: OutlineSpaceRow;
+	under: string;
+	cursor?: string | null;
+	limit?: number;
+	store?: OutlineStore;
+}): Promise<OutlineOpenTasksResponse> {
+	const store = request.store ?? outlineStore;
+	const { space, under } = request;
+	const limit = Math.max(1, Math.min(request.limit ?? 20, OUTLINE_OPEN_TASKS_LIMITS.maxLimit));
+	const candidates = OUTLINE_SUBTREE_LIMITS.markCandidates;
+	const tasks = await store.listOpenTasks(space.id, candidates + 1);
+	const atLeastTasks = tasks.length > candidates;
+	const open = tasks
+		.slice(0, candidates)
+		.filter((task) => task.taskJson?.status === "doing" || task.taskJson?.status === "todo");
+	const whole = under === space.id;
+	const ancestry = await readOutlineAncestry(
+		space.id,
+		[...(whole ? [] : [under]), ...open.map((task) => task.id)],
+		{ maxRows: OUTLINE_SUBTREE_LIMITS.markWalkRows, store },
+	);
+	const atLeast = atLeastTasks || ancestry.cutShort;
+	if (!whole && !ancestry.has(under)) return { under, items: [], nextCursor: null, atLeast };
+	const rank = (task: (typeof open)[number]) => (task.taskJson?.status === "doing" ? 0 : 1);
+	const key = (task: (typeof open)[number]) => `${rank(task)}:${task.id}`;
+	const listed = open
+		.filter((task) => {
+			const above = ancestry.above(task.id);
+			return above !== null && (whole || above.includes(under));
+		})
+		.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+	const after = request.cursor ?? null;
+	const rest = after === null ? listed : listed.filter((task) => key(task) > after);
+	const page = rest.slice(0, limit);
+	const heads =
+		page.length > 0
+			? await store.getContentHeads(
+					page.map((task) => task.id),
+					400,
+				)
+			: new Map();
+	return {
+		under,
+		items: page.map((task) => {
+			const title = titleOf(heads.get(task.id) ?? "");
+			const chars = Array.from(title);
+			return {
+				id: task.id,
+				title:
+					chars.length <= OPEN_TASK_TITLE_CHARS
+						? title
+						: `${chars.slice(0, OPEN_TASK_TITLE_CHARS - 1).join("")}…`,
+				status: task.taskJson?.status === "doing" ? ("doing" as const) : ("todo" as const),
+				assignee: task.taskJson?.assignee ?? null,
+			};
+		}),
+		nextCursor: rest.length > limit ? key(page.at(-1) as (typeof open)[number]) : null,
+		atLeast,
 	};
 }

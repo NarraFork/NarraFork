@@ -3929,6 +3929,28 @@ export const outlineViewState = pgTable(
 	],
 );
 
+export const outlineFoldState = pgTable(
+	"outline_fold_state",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		spaceId: text("space_id")
+			.notNull()
+			.references((): PgColumn => outlineSpaces.id, { onDelete: "cascade" }),
+		blockId: text("block_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		open: boolean("open").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_outline_fold_state_written").on(table.userId, table.spaceId, table.updatedAt),
+		index("idx_outline_fold_state_block").on(table.blockId),
+		primaryKey({ columns: [table.userId, table.spaceId, table.blockId] }),
+	],
+);
+
 export const outlineTaskSeen = pgTable(
 	"outline_task_seen",
 	{
@@ -4517,8 +4539,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 147,
-  "columnCount": 1934,
+  "tableCount": 148,
+  "columnCount": 1939,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -26967,6 +26989,110 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "userId",
             "pageBlockId"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "outlineFoldState",
+      "name": "outline_fold_state",
+      "columns": [
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_fold_state_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineSpaces",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_fold_state_space_id_outline_spaces_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_fold_state_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "open",
+          "name": "open",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_fold_state_written",
+          "columns": [
+            "userId",
+            "spaceId",
+            "updatedAt"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_fold_state_block",
+          "columns": [
+            "blockId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "userId",
+            "spaceId",
+            "blockId"
           ]
         }
       ]

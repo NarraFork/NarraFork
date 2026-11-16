@@ -1,8 +1,8 @@
 /**
- * Any outline place as one router-free view: the home, a space's pages, or a page (the surface).
- * The outline routes host it for their URLs; a dock panel hosts it for its params, so a panel
- * opened on a space (from a session's menu) can go to one of its pages and back without leaving
- * the panel.
+ * Any outline place as one router-free view: the home, a space, or a block focused (the
+ * surface). The outline routes host it for their URLs; a dock panel hosts it for its params, so
+ * a panel opened on a space (from a session's menu) can go to one of its blocks and back without
+ * leaving the panel.
  */
 import { Box } from "@mantine/core";
 import type { OutlineSpaceDetail } from "@shared/outline-api";
@@ -35,6 +35,8 @@ export interface OutlineViewProps {
 	history?: OutlineSurfaceHistory;
 	/** Shown at the top of the home (the outline route's entry to the reports). */
 	homeHeader?: ReactNode;
+	/** A focused block starts in read mode (see `OutlineSurface`). */
+	startReading?: boolean;
 }
 
 export function OutlineView({
@@ -49,6 +51,7 @@ export function OutlineView({
 	actions,
 	history,
 	homeHeader,
+	startReading,
 }: OutlineViewProps) {
 	if (target.kind === "block") {
 		return (
@@ -65,6 +68,7 @@ export function OutlineView({
 				onMissing={onMissing}
 				actions={actions}
 				history={history}
+				startReading={startReading}
 			/>
 		);
 	}

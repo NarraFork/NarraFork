@@ -6372,6 +6372,38 @@ export const outlineViewState = sqliteTable(
 	],
 );
 
+// === outline_fold_state ===
+/**
+ * What one reader opened and closed in the outline, one row per block (pageless outline, F1):
+ * `open` true for a block they opened that is closed by default, false for one they closed
+ * that is open by default (`shared/outline-fold.ts`); a block back at its default has no row.
+ * Replaces the folding of `outline_view_state`, which was one row of id lists per page.
+ * Personal UI state, never a commit. Read by `(user_id, space_id)` (the primary key's prefix);
+ * a reader keeps at most `OUTLINE_FOLD_STATE_LIMITS.maxPerSpace` rows per space, the oldest
+ * written dropped first (`idx_outline_fold_state_written`).
+ */
+export const outlineFoldState = sqliteTable(
+	"outline_fold_state",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		spaceId: text("space_id")
+			.notNull()
+			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
+		blockId: text("block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		open: integer("open", { mode: "boolean" }).notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.userId, table.spaceId, table.blockId] }),
+		index("idx_outline_fold_state_written").on(table.userId, table.spaceId, table.updatedAt),
+		index("idx_outline_fold_state_block").on(table.blockId),
+	],
+);
+
 // === outline_task_seen ===
 /**
  * When a person saw, on the task board, a task they manage that an agent finished (outline P2

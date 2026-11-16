@@ -1,7 +1,7 @@
 /**
  * A search drawn as a tree (readability F, design §2.8): the matches with what they are under —
- * their space, their page, their ancestors — and nothing else, in place of the tree while a
- * query is typed.
+ * their space and their ancestors, by the ancestor path — and nothing else, in place of the
+ * tree while a query is typed.
  *
  *   ▾ Project A
  *       ▾ Tasks
@@ -9,25 +9,24 @@
  *               • The reader's cache        … the **race** is in the reader's cache …
  *
  * A match's title is a button: it shows the match in the tree itself ("locate": the host clears
- * the search and hands the tree the block). Its focus handle opens the page instead. The rows
+ * the search and hands the tree the block). Its focus handle focuses it instead. The rows
  * that only lead to matches are links that focus them. Every row has its arrow; the same roles
- * and keys as the tree (`OutlineTree.tsx`). Bounded: pages of the server's search, the next one
- * read only when asked for.
+ * and keys as the forest (`forest/OutlineForest.tsx`). Bounded: the server's search a batch at
+ * a time, the next one read only when asked for.
  */
 import { Alert, Anchor, Badge, Loader, Text } from "@mantine/core";
 import { useElementSize } from "@mantine/hooks";
 import type { OutlineSearchHitView } from "@shared/outline-api";
-import { IconFileText } from "@tabler/icons-react";
 import { type ReactNode, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineSearchPages } from "../../../hooks/useOutline";
 import { reportLineDisplay } from "../../../lib/outline-report-line";
 import { plainClick } from "../fold-controls";
+import { onTreeKeyDown, SPACE_ICON } from "../forest/OutlineForest";
 import classes from "../Outline.module.css";
 import { useOutlineSpaceName } from "../OutlineSpaceName";
 import { FOCUS_ICON, FOLD_ICONS } from "../outline-icons";
 import { OutlineLink, outlineBlockTarget } from "../outline-nav";
-import { onTreeKeyDown, SPACE_ICON } from "./OutlineTree";
 import { buildSearchTree, markTerms, type SearchTreeNode, searchTerms } from "./search-tree";
 import type { TreeLocateTarget } from "./tree-locate";
 
@@ -36,13 +35,7 @@ const MAX_INDENT = 4;
 
 /** What "locate" needs of a hit. */
 export function locateTargetOfHit(hit: OutlineSearchHitView): TreeLocateTarget {
-	return {
-		spaceId: hit.spaceId,
-		pageId: hit.pageId,
-		blockId: hit.blockId,
-		pathIds: hit.pathIds ?? [],
-		pageTitle: hit.pageId === hit.blockId ? hit.title : (hit.path[0] ?? ""),
-	};
+	return { spaceId: hit.spaceId, blockId: hit.blockId };
 }
 
 function Marked({ text, terms }: { text: string; terms: readonly string[] }) {
@@ -101,8 +94,6 @@ function SearchRow({
 	if (node.kind === "space") {
 		const Icon = SPACE_ICON[node.space?.kind ?? "session"];
 		icon = <Icon size={16} />;
-	} else if (node.kind === "page") {
-		icon = <IconFileText size={16} />;
 	} else {
 		icon = <span className={classes.bulletDot} />;
 	}
@@ -200,8 +191,8 @@ function SearchRow({
 							<OutlineLink
 								to={target}
 								className={classes.focusHandle}
-								aria-label={`${t("tree.openPage")} · ${title}`}
-								title={t("tree.openPage")}
+								aria-label={`${t("page.focus")} · ${title}`}
+								title={t("page.focus")}
 							>
 								<FOCUS_ICON.Icon size={14} />
 							</OutlineLink>

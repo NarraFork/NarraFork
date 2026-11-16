@@ -540,6 +540,13 @@
 			"when": 1794748163496,
 			"tag": "0076_outline_live_log",
 			"breakpoints": true
+		},
+		{
+			"idx": 77,
+			"version": "7",
+			"when": 1794817441993,
+			"tag": "0077_outline_fold_state",
+			"breakpoints": true
 		}
   ]
 }

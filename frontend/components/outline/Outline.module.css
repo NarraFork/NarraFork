@@ -223,6 +223,20 @@
 	cursor: pointer;
 }
 
+/*
+ * A row with nothing under it: its arrow is still drawn (arrows are always visible), smaller
+ * and in a pale gray, so that it is told apart from a closed row's arrow in both themes.
+ */
+.leafArrow {
+	color: var(--mantine-color-gray-4);
+	cursor: default;
+}
+
+/* (Explicit, not `light-dark()`: that needs `color-scheme`, which not every host sets.) */
+:global([data-mantine-color-scheme="dark"]) .leafArrow {
+	color: var(--mantine-color-dark-4);
+}
+
 /* The outline's icons (`outline-icons.ts`), sized as the live editor's frame draws them. */
 .toggle svg {
 	width: var(--nf-outline-chevron);

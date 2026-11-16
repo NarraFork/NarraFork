@@ -2,11 +2,13 @@
  * The quick switcher (design §6.10, D35): Mod-K on an outline surface, type a title, an alias or
  * some text, Enter focuses there.
  *
- * Results: the current space first — this tab's own index of the live page, instant, then the
- * server's search of the current space's other pages — then the other spaces the person can read
- * (`quick-switcher-index.ts`). A block of the page on screen is focused in place through the
- * editing surface; any other block (another page, another space) is a navigation of the surface's
- * host (`onNavigate`): a dock panel switches in place, the outline page changes its URL.
+ * Results: the current space first — this tab's own index of what the live editor holds,
+ * instant, then the server's search of the rest of the space — then the other spaces the
+ * person can read; top-level blocks before the blocks under them (`quick-switcher-index.ts`).
+ * A block the editor on screen holds is focused in place through the editing surface; any
+ * other block is a navigation of the host (`onNavigate`): a dock panel switches in place, the
+ * outline route changes its URL. The forest's hosts (the home, a space) have it too
+ * ({@link ForestSwitcher}): there every hit is a navigation.
  *
  * Drawn inside the surface (not a portal), so it stays in its dock panel or detached window.
  */
@@ -42,7 +44,8 @@ const WARM_SLICE_MS = 6;
 const WARM_DELAY_MS = 400;
 
 export interface QuickSwitcherProps {
-	spaceId: string;
+	/** The space the reader is in (its hits come first); null on the outline's home. */
+	spaceId: string | null;
 	/** The live editing surface on screen (its page is the local index), if any. */
 	surface: EditSurface | null;
 	onClose: () => void;
@@ -87,7 +90,7 @@ export function QuickSwitcher({ spaceId, surface, onClose, onPick }: QuickSwitch
 	const [debounced] = useDebouncedValue(query, SERVER_DEBOUNCE_MS);
 	const input = useRef<HTMLInputElement | null>(null);
 	const trimmed = debounced.trim();
-	const here = useOutlineSearch(trimmed, spaceId, trimmed.length > 0);
+	const here = useOutlineSearch(trimmed, spaceId, trimmed.length > 0 && spaceId !== null);
 	const everywhere = useOutlineSearch(trimmed, null, trimmed.length > 0);
 
 	useEffect(() => {
@@ -97,7 +100,7 @@ export function QuickSwitcher({ spaceId, surface, onClose, onPick }: QuickSwitch
 	const local = useMemo(() => {
 		if (!surface) return [];
 		const { index, source } = localIndexOf(surface);
-		return index.search(source, spaceId, query, recentFocus());
+		return spaceId === null ? [] : index.search(source, spaceId, query, recentFocus());
 	}, [surface, spaceId, query]);
 
 	const hits = useMemo(() => {
@@ -276,3 +279,44 @@ export const QuickSwitcherHost = forwardRef<
 		/>
 	);
 });
+
+/**
+ * The quick switcher of a forest's host (the outline's home, a space): Mod-K anywhere inside
+ * `children` opens it, a hit goes to `onPick`.
+ */
+export function ForestSwitcher({
+	spaceId,
+	onPick,
+	children,
+}: {
+	spaceId: string | null;
+	onPick: (hit: SwitcherHit) => void;
+	children: React.ReactNode;
+}) {
+	const switcher = useRef<QuickSwitcherHandle | null>(null);
+	const host = useRef<HTMLDivElement | null>(null);
+	return (
+		// biome-ignore lint/a11y/noStaticElementInteractions: Mod-K anywhere in the view
+		<div
+			ref={host}
+			style={{ position: "relative", minWidth: 0 }}
+			data-testid="outline-forest-host"
+			onKeyDown={(event: KeyboardEvent<HTMLDivElement>) => {
+				if (event.defaultPrevented || event.altKey || event.shiftKey) return;
+				if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+					event.preventDefault();
+					switcher.current?.open();
+				}
+			}}
+		>
+			{children}
+			<QuickSwitcherHost
+				ref={switcher}
+				spaceId={spaceId}
+				surface={null}
+				onClosed={() => host.current?.querySelector<HTMLElement>("input")?.focus()}
+				onPick={onPick}
+			/>
+		</div>
+	);
+}

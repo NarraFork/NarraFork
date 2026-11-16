@@ -207,7 +207,7 @@
 	"projectPromptConflict": "The file changed after it was opened. Reloading replaces the editor with the version on disk.",
 	"projectPromptReload": "Reload",
 	"projectPromptSaveFailed": "Could not save the prompt file",
-	"workspaceAddOutline": "Add an outline page",
+	"workspaceAddOutline": "Add an outline",
 	"promptLibraryPick": "Insert from prompt library",
 	"promptLibraryPickPlaceholder": "Pick a prompt",
 	"promptLibraryEmpty": "Library is empty — create one under Routines → Prompt library",

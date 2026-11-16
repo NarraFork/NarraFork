@@ -13,6 +13,12 @@
  *     two seqs.
  *   - `GET /spaces/:spaceId/commits`, `GET /spaces/:spaceId/blocks/:blockId/commits`: the
  *     timeline of the space, or of a block and what was under it.
+ *   - `GET/PUT /spaces/:spaceId/fold-state`: the caller's own folding of the space, by block
+ *     (`services/outline/fold-state.ts`); a write carries changes. Read access is enough, and
+ *     nobody reads or writes another person's. `DELETE` (optionally `?under=<block>`) puts it
+ *     back to the default in one request.
+ *   - `GET /spaces/:spaceId/open-tasks?under=`: the open tasks under a block (the list behind
+ *     a marks read's "in progress" count), cursor-paged.
  *
  * ACCESS: exactly the page reads'. Every route names its space, and a space the person may not
  * read answers 404, the same as one that does not exist. A block named in the PATH must be a
@@ -26,22 +32,29 @@
  * than the history kept) is a 409 with a code and the history floor
  * (`services/outline/subtree-errors.ts`); reads of the current tree are never refused.
  */
-import { OUTLINE_VIEW_STATE_LIMITS, type OutlineLockView } from "@shared/outline-api";
-import type {
-	OutlineChangedChildrenResponse,
-	OutlineLevelsResponse,
-	OutlineMarksResponse,
-	OutlineSubtreeResponse,
-	OutlineSubtreeTimelineResponse,
-	OutlineTreeBlock,
+import type { OutlineLockView } from "@shared/outline-api";
+import {
+	OUTLINE_FOLD_STATE_LIMITS,
+	type OutlineChangedChildrenResponse,
+	type OutlineFoldStateResponse,
+	type OutlineLevelsResponse,
+	type OutlineMarksResponse,
+	type OutlineOpenTasksResponse,
+	type OutlineSubtreeResponse,
+	type OutlineSubtreeTimelineResponse,
+	type OutlineTreeBlock,
 } from "@shared/outline-subtree-api";
 import { type Context, Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { outlineIdSchema } from "../lib/validators/outline/index";
 import {
 	outlineChangedChildrenQuerySchema,
+	outlineFoldStatePutSchema,
+	outlineFoldStateResetQuerySchema,
 	outlineLevelsQuerySchema,
 	outlineMarksQuerySchema,
+	outlineOpenTasksQuerySchema,
 	outlineSubtreeQuerySchema,
 	outlineSubtreeTimelineQuerySchema,
 } from "../lib/validators/outline/subtree";
@@ -51,6 +64,12 @@ import {
 	narratorVisibility,
 	type OutlinePrincipal,
 } from "../services/outline/access";
+import {
+	loadFoldSets,
+	readFoldState,
+	resetFoldState,
+	writeFoldState,
+} from "../services/outline/fold-state";
 import { commitSeqAt } from "../services/outline/read";
 import { outlineStore } from "../services/outline/store";
 import type { OutlineBlockRow, OutlineSpaceRow } from "../services/outline/store/port";
@@ -58,9 +77,8 @@ import {
 	readOutlineChangedChildren,
 	readOutlineSubtreeTimeline,
 } from "../services/outline/subtree-history";
-import { readOutlineMarks } from "../services/outline/subtree-marks";
+import { readOutlineMarks, readOutlineOpenTasks } from "../services/outline/subtree-marks";
 import { readOutlineLevels, readOutlineSubtree } from "../services/outline/subtree-read";
-import { normalizeFolding } from "../services/outline/view-state";
 
 export const outlineSubtreeRoutes = new Hono();
 
@@ -135,17 +153,9 @@ async function subtree(
 	const query = parse(outlineSubtreeQuerySchema, c.req.query());
 	let fold: { expanded: ReadonlySet<string>; collapsed: ReadonlySet<string> } | undefined;
 	if (query.fold === "default") {
-		// The reader's own folding is stored per page until blocks get their own (F1): that of
-		// the page the root is on. Theirs alone; reading it needs no more than reading the block.
-		const stored = root ? await outlineStore.getViewState(principal.userId, root.pageId) : null;
-		const folding = normalizeFolding({
-			collapsed: stored?.collapsed ?? [],
-			expanded: stored?.expanded ?? [],
-		});
-		fold = {
-			expanded: new Set(folding.expanded.slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed)),
-			collapsed: new Set(folding.collapsed.slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed)),
-		};
+		// The reader's own folding, by block (`fold-state.ts`). Theirs alone; reading it needs
+		// no more than reading the space.
+		fold = await loadFoldSets(principal.userId, space.id);
 	}
 	const result = await readOutlineSubtree({
 		space,
@@ -154,6 +164,7 @@ async function subtree(
 		view: query.view,
 		budget: { blocks: query.blocks, bytes: query.bytes },
 		fold,
+		topClosed: query.top === "closed",
 		narratorVisible: narratorVisibility(principal),
 	});
 	if (!result) throw new NotFoundError("Outline block", root?.id ?? space.id);
@@ -235,5 +246,68 @@ outlineSubtreeRoutes.get("/spaces/:spaceId/blocks/:blockId/commits", async (c) =
 		block.id,
 		query,
 	);
+	return c.json(body);
+});
+
+/** The caller's own folding of the space. */
+outlineSubtreeRoutes.get("/spaces/:spaceId/fold-state", async (c) => {
+	const space = await readableSpace(c);
+	const body: OutlineFoldStateResponse = await readFoldState(principalOf(c).userId, space);
+	return c.json(body);
+});
+
+/** Changes to the caller's own folding of the space. */
+outlineSubtreeRoutes.put(
+	"/spaces/:spaceId/fold-state",
+	bodyLimit({
+		maxSize: OUTLINE_FOLD_STATE_LIMITS.maxBodyBytes,
+		onError: (c) =>
+			c.json(
+				{
+					code: "PAYLOAD_TOO_LARGE",
+					message: `Request body exceeds ${OUTLINE_FOLD_STATE_LIMITS.maxBodyBytes} bytes`,
+				},
+				413,
+			),
+	}),
+	async (c) => {
+		const space = await readableSpace(c);
+		const raw = await c.req.json().catch((error: unknown) => {
+			if (error instanceof Error && error.name === "BodyLimitError") throw error;
+			throw new ValidationError("Invalid JSON body");
+		});
+		const input = parse(outlineFoldStatePutSchema, raw);
+		const body: OutlineFoldStateResponse = await writeFoldState(
+			principalOf(c).userId,
+			space,
+			input.changes,
+			{ reset: input.reset, writer: input.writer, n: input.n },
+		);
+		return c.json(body);
+	},
+);
+
+/** The caller's own folding back to the default: the whole space, or a block and what is under it. */
+outlineSubtreeRoutes.delete("/spaces/:spaceId/fold-state", async (c) => {
+	const space = await readableSpace(c);
+	const query = parse(outlineFoldStateResetQuerySchema, c.req.query());
+	const body: OutlineFoldStateResponse = await resetFoldState(
+		principalOf(c).userId,
+		space,
+		query.under ?? null,
+	);
+	return c.json(body);
+});
+
+/** The open tasks under a block (or the whole space), in progress first. */
+outlineSubtreeRoutes.get("/spaces/:spaceId/open-tasks", async (c) => {
+	const space = await readableSpace(c);
+	const query = parse(outlineOpenTasksQuerySchema, c.req.query());
+	const body: OutlineOpenTasksResponse = await readOutlineOpenTasks({
+		space,
+		under: query.under,
+		cursor: query.cursor,
+		limit: query.limit,
+	});
 	return c.json(body);
 });

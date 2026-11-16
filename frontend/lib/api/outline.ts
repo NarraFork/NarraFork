@@ -48,6 +48,14 @@ import type {
 	OutlineSpecLossStatus,
 } from "@shared/outline-spec-import";
 import type {
+	OutlineFoldStatePutBody,
+	OutlineFoldStateResponse,
+	OutlineLevelsResponse,
+	OutlineMarksResponse,
+	OutlineOpenTasksResponse,
+	OutlineSubtreeResponse,
+} from "@shared/outline-subtree-api";
+import type {
 	NarratorCurrentTaskResponse,
 	OutlineBoardAddRequest,
 	OutlineBoardAddResponse,
@@ -111,6 +119,68 @@ export const outlineApi = {
 			group.kind === "project"
 				? `/outline/tree/projects/${enc(group.projectId)}/sessions${query(params)}`
 				: `/outline/tree/${group.kind}${query(params)}`,
+		),
+	/** A block (or, with `rootId` null, the whole space) and what is under it, within a budget. */
+	getOutlineSubtree: (
+		spaceId: string,
+		rootId: string | null,
+		params: {
+			asOf?: number;
+			view?: OutlineViewMode;
+			blocks?: number;
+			fold?: "default";
+			top?: "closed";
+		},
+	) =>
+		request<OutlineSubtreeResponse>(
+			rootId === null
+				? `/outline/spaces/${enc(spaceId)}/subtree${query(params)}`
+				: `/outline/spaces/${enc(spaceId)}/blocks/${enc(rootId)}/subtree${query(params)}`,
+		),
+	/** The children of the parents named (`null`: the top level), each level from its cursor. */
+	getOutlineChildren: (
+		spaceId: string,
+		params: {
+			parents: ReadonlyArray<string | null>;
+			cursor?: string | null;
+			limit?: number;
+			perParent?: number;
+			asOf?: number;
+			view?: OutlineViewMode;
+		},
+	) => {
+		const blocks = params.parents.filter((id): id is string => id !== null);
+		return request<OutlineLevelsResponse>(
+			`/outline/spaces/${enc(spaceId)}/children${query({
+				parents: blocks.length > 0 ? blocks.join(",") : undefined,
+				top: blocks.length > 0 && blocks.length < params.parents.length ? "1" : undefined,
+				cursor: params.cursor,
+				limit: params.limit,
+				perParent: params.perParent,
+				asOf: params.asOf,
+				view: params.view,
+			})}`,
+		);
+	},
+	/** What is under each of the blocks named (the space's id: the whole space). */
+	getOutlineMarks: (spaceId: string, keys: readonly string[], since?: number) =>
+		request<OutlineMarksResponse>(
+			`/outline/spaces/${enc(spaceId)}/marks${query({ keys: keys.join(","), since })}`,
+		),
+	/** The caller's own folding of a space, by block. */
+	getOutlineFoldState: (spaceId: string) =>
+		request<OutlineFoldStateResponse>(`/outline/spaces/${enc(spaceId)}/fold-state`),
+	putOutlineFoldState: (spaceId: string, body: OutlineFoldStatePutBody, keepalive = false) =>
+		request<OutlineFoldStateResponse>(`/outline/spaces/${enc(spaceId)}/fold-state`, {
+			method: "PUT",
+			body: JSON.stringify(body),
+			...(keepalive ? { keepalive: true } : {}),
+		}),
+
+	/** The open tasks under a block (the space's id: the whole space), in progress first. */
+	getOutlineOpenTasks: (spaceId: string, under: string, cursor?: string | null) =>
+		request<OutlineOpenTasksResponse>(
+			`/outline/spaces/${enc(spaceId)}/open-tasks${query({ under, cursor: cursor ?? undefined })}`,
 		),
 	listOutlinePages: (spaceId: string, params: { cursor?: string | null; limit?: number }) =>
 		request<OutlinePageListResponse>(`/outline/spaces/${enc(spaceId)}/pages${query(params)}`),

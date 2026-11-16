@@ -44,7 +44,7 @@ const space = (id: string, kind: OutlineSpaceSummary["kind"]): OutlineSpaceSumma
 });
 
 describe("a search as a tree", () => {
-	test("hits hang under their space, page and ancestors, each drawn once", () => {
+	test("hits hang under their space and ancestors, each drawn once", () => {
 		const tree = buildSearchTree(
 			[
 				hit("b1", "S1", [
@@ -66,12 +66,12 @@ describe("a search as a tree", () => {
 		);
 		expect(rows).toEqual([
 			"0 space space:S1",
-			"1 page pg",
+			"1 block pg",
 			"2 block t1 *",
 			"3 block b1 *",
 			"3 block b2 *",
 			"0 space space:S2",
-			"1 page pg2 *",
+			"1 block pg2 *",
 		]);
 		expect(tree[0]?.space?.kind).toBe("project");
 		// An ancestor that is a hit too takes the hit's title.
@@ -103,13 +103,7 @@ describe("a search as a tree", () => {
 });
 
 describe("locating in the tree", () => {
-	const target: TreeLocateTarget = {
-		spaceId: "S",
-		pageId: "pg",
-		blockId: "b",
-		pathIds: ["pg"],
-		pageTitle: "Page",
-	};
+	const target: TreeLocateTarget = { spaceId: "S", blockId: "b" };
 
 	test("the keys to open, by where the space hangs", () => {
 		const session = {
@@ -119,14 +113,14 @@ describe("locating in the tree", () => {
 			mine: false,
 			orphaned: false,
 		} as const;
-		expect(locateKeys(session, { spaceId: "PS", projectId: "P" }, "pg", null)).toEqual({
-			keys: ["space:PS", "group:sessions:P", "space:S", "page:pg"],
+		expect(locateKeys(session, { spaceId: "PS", projectId: "P" }, null)).toEqual({
+			keys: ["space:PS", "group:sessions:P", "space:S"],
 			pinIn: "group:sessions:P",
 			// The project's own row too: the root may not have loaded it.
 			pinParentAtRoot: true,
 		});
-		expect(locateKeys(session, null, "pg", null)).toEqual({
-			keys: ["group:loose", "space:S", "page:pg"],
+		expect(locateKeys(session, null, null)).toEqual({
+			keys: ["group:loose", "space:S"],
 			pinIn: "group:loose",
 			pinParentAtRoot: false,
 		});
@@ -137,8 +131,8 @@ describe("locating in the tree", () => {
 			mine: false,
 			orphaned: false,
 		} as const;
-		expect(locateKeys(project, null, "pg", null)).toEqual({
-			keys: ["space:PS", "page:pg"],
+		expect(locateKeys(project, null, null)).toEqual({
+			keys: ["space:PS"],
 			pinIn: "root",
 			pinParentAtRoot: false,
 		});
@@ -149,14 +143,12 @@ describe("locating in the tree", () => {
 			mine: true,
 			orphaned: false,
 		} as const;
-		expect(locateKeys(mine, null, "pg", null)?.keys).toEqual(["space:M", "page:pg"]);
-		expect(locateKeys({ ...mine, mine: false }, null, "pg", null)).toBeNull();
-		expect(locateKeys({ ...session, orphaned: true }, null, "pg", null)?.keys[0]).toBe(
-			"group:orphaned",
-		);
+		expect(locateKeys(mine, null, null)?.keys).toEqual(["space:M"]);
+		expect(locateKeys({ ...mine, mine: false }, null, null)).toBeNull();
+		expect(locateKeys({ ...session, orphaned: true }, null, null)?.keys[0]).toBe("group:orphaned");
 	});
 
-	test("in a tree rooted at a space: its own pages, its sessions, nothing else", () => {
+	test("in a tree rooted at a space: its own blocks, its sessions, nothing else", () => {
 		const project = {
 			id: "PS",
 			kind: "project",
@@ -165,8 +157,8 @@ describe("locating in the tree", () => {
 			orphaned: false,
 		} as const;
 		const root = { spaceId: "PS", projectId: "P" };
-		expect(locateKeys(project, null, "pg", root)).toEqual({
-			keys: ["page:pg"],
+		expect(locateKeys(project, null, root)).toEqual({
+			keys: [],
 			pinIn: null,
 			pinParentAtRoot: false,
 		});
@@ -177,12 +169,11 @@ describe("locating in the tree", () => {
 			mine: false,
 			orphaned: false,
 		} as const;
-		expect(locateKeys(session, { spaceId: "PS", projectId: "P" }, "pg", root)?.keys).toEqual([
+		expect(locateKeys(session, { spaceId: "PS", projectId: "P" }, root)?.keys).toEqual([
 			"group:sessions:P",
 			"space:S",
-			"page:pg",
 		]);
-		expect(locateKeys(session, { spaceId: "other", projectId: "Q" }, "pg", root)).toBeNull();
+		expect(locateKeys(session, { spaceId: "other", projectId: "Q" }, root)).toBeNull();
 	});
 
 	test("a request waits for its host's tree, is taken once, and goes stale", () => {

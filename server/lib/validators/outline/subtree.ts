@@ -1,4 +1,8 @@
-import { OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
+import {
+	OUTLINE_FOLD_STATE_LIMITS,
+	OUTLINE_OPEN_TASKS_LIMITS,
+	OUTLINE_SUBTREE_LIMITS,
+} from "@shared/outline-subtree-api";
 import { z } from "zod";
 import { outlineIdSchema } from "./index";
 
@@ -45,6 +49,11 @@ export const outlineSubtreeQuerySchema = z
 		bytes: limitSchema(OUTLINE_SUBTREE_LIMITS.maxBytes).optional(),
 		/** Do not go below rows closed by default and by the reader. */
 		fold: z.literal("default").optional(),
+		/**
+		 * With `fold`, reading a whole space: its top-level blocks are closed unless the reader
+		 * opened them (a space's landing view lists them one line each).
+		 */
+		top: z.literal("closed").optional(),
 	})
 	.refine(...asOfExclusive);
 
@@ -101,4 +110,43 @@ export const outlineChangedChildrenQuerySchema = z.object({
 export const outlineSubtreeTimelineQuerySchema = z.object({
 	before: seqSchema.optional(),
 	limit: limitSchema(OUTLINE_SUBTREE_LIMITS.maxTimeline).optional(),
+});
+
+/** `PUT /spaces/:spaceId/fold-state` */
+export const outlineFoldStatePutSchema = z
+	.object({
+		changes: z
+			.array(z.object({ blockId: outlineIdSchema, open: z.boolean().nullable() }))
+			.max(OUTLINE_FOLD_STATE_LIMITS.maxChanges)
+			.default([]),
+		reset: z.array(outlineIdSchema.nullable()).max(OUTLINE_FOLD_STATE_LIMITS.maxResets).optional(),
+		writer: z
+			.string()
+			.regex(/^[A-Za-z0-9_-]{8,64}$/)
+			.optional(),
+		n: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+	})
+	.refine((body) => body.changes.length > 0 || (body.reset?.length ?? 0) > 0, {
+		message: "A write needs changes or resets",
+	})
+	.refine((body) => (body.writer === undefined) === (body.n === undefined), {
+		message: "writer and n go together",
+	});
+
+/** `DELETE /spaces/:spaceId/fold-state` */
+export const outlineFoldStateResetQuerySchema = z.object({
+	/** A block: it and everything under it; absent (or the space's id): the whole space. */
+	under: outlineIdSchema.optional(),
+});
+
+/** `GET /spaces/:spaceId/open-tasks` */
+export const outlineOpenTasksQuerySchema = z.object({
+	/** A block of the space, or the space's id for the whole space. */
+	under: outlineIdSchema,
+	/** The last item's `rank:id` of the page before. */
+	cursor: z
+		.string()
+		.regex(/^[01]:[A-Za-z0-9_-]{1,64}$/)
+		.optional(),
+	limit: limitSchema(OUTLINE_OPEN_TASKS_LIMITS.maxLimit).optional(),
 });

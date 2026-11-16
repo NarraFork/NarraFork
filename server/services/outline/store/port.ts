@@ -172,6 +172,13 @@ export interface OutlineViewStateRow {
 	updatedAt: string;
 }
 
+/** One block a reader opened (`open`) or closed, of their own accord (`outline_fold_state`). */
+export interface OutlineFoldStateRow {
+	blockId: string;
+	open: boolean;
+	updatedAt: string;
+}
+
 /**
  * Who is doing a task (`outline_task_claims`). Held by a session (`holderNarratorId`, with a
  * lease until `expiresAt`), by a person (`holderUserId`, no lease) or by nobody (both null: the
@@ -1066,6 +1073,41 @@ export interface OutlineStore
 	 * written is never dropped, even when a clock stepped back makes it the oldest.
 	 */
 	putViewState(row: OutlineViewStateRow, keepPerUser: number): Promise<void>;
+
+	// ── a reader's own folding, by block (`outline_fold_state`, pageless outline F1) ──
+
+	/**
+	 * The blocks of a space the person opened or closed, the most recently written first, at
+	 * most `limit` (the primary key's prefix; the caller's limit is the per-space cap).
+	 */
+	listFoldState(userId: string, spaceId: string, limit: number): Promise<OutlineFoldStateRow[]>;
+	/**
+	 * Apply changes to the person's folding of a space in one transaction: `open` true or false
+	 * writes the block's row (insert or replace), null deletes it. Then only the `keep` rows
+	 * written most recently stay, and the ones just written whatever a clock says (after a
+	 * clock stepped back they stay beside the `keep` newest until a later write); the rest of
+	 * that person's rows of that space are deleted. Other people's rows and other
+	 * spaces are never touched. `changes` is bounded by the caller. `clear`, first and in the
+	 * same transaction: delete all of the person's rows of the space, or those of `ids`.
+	 */
+	putFoldState(
+		userId: string,
+		spaceId: string,
+		changes: ReadonlyArray<{ blockId: string; open: boolean | null }>,
+		updatedAt: string,
+		keep: number,
+		clear?: { all: true } | { ids: readonly string[] },
+	): Promise<void>;
+	/**
+	 * Back to the default folding: delete the person's rows of a space, all of them (`blockIds`
+	 * null) or those of the blocks named (chunked, one transaction). Other people's rows and
+	 * other spaces are never touched.
+	 */
+	clearFoldState(
+		userId: string,
+		spaceId: string,
+		blockIds: readonly string[] | null,
+	): Promise<void>;
 
 	// ── tasks a person saw finished (`outline_task_seen`, outline P2 PR 9b, the board's 「新完成」) ──
 
