@@ -163,7 +163,7 @@ export const SPEC_IMPORT_LIMITS = {
 	staleIndexChildren: 5000,
 	/** Rows of one level read at a time by those scans. */
 	staleLevelRead: 200,
-	/** Children of the task list looked at for an earlier attempt's tasks (the last ones). */
+	/** Children under the behavior boundary looked at for an earlier fence text's blocks. */
 	staleChildren: 1000,
 	/** Live blocks of one stale subtree read to plan its removal; more: kept (attention). */
 	staleSubtreeBlocks: 20_000,
@@ -174,6 +174,10 @@ export const SPEC_IMPORT_LIMITS = {
 	staleCommits: 1000,
 	/** Versions of a stale block itself read (its own changes are not marks); more: kept. */
 	staleRootVersions: 64,
+	/** Tries of one delete commit refused because the space moved on (each checked again). */
+	staleWriteTries: 50,
+	/** Children of the task list looked at for an earlier attempt's tasks, a level at a time. */
+	staleTaskChildren: 5000,
 	/** Characters of a failure kept for the Spec panel. */
 	errorChars: 300,
 } as const;
@@ -345,6 +349,14 @@ class SpecImportRetry extends Error {
 }
 
 /**
+ * An attempt that waits for something outside the session, not a failure (A3 review 2): the
+ * session space's history is still being converted, or it kept changing under the removal of an
+ * earlier attempt's blocks. Recorded as `busy`, like a pause, counting nothing against the
+ * session: the next attempt goes on.
+ */
+class SpecImportWait extends Error {}
+
+/**
  * The reason an idle trigger aborts an import with: it gave way to the session (its time budget
  * ran out, or a message for the session arrived). Not a failure: the outcome is `busy`, the
  * attempt counts nothing against the session, and the next one writes the rest.
@@ -470,6 +482,15 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 		const { movedForward: _, ...result } = outcome;
 		return result;
 	} catch (error) {
+		if (error instanceof SpecImportWait) {
+			await persistBusy(narratorId, options.trigger, null);
+			logImportOutcome("info", "Dynamic Spec import waits; the next attempt goes on", {
+				narratorId,
+				trigger: options.trigger,
+				why: error.message,
+			});
+			return { status: "busy" };
+		}
 		if (
 			error instanceof SpecImportPaused ||
 			(options.signal?.aborted === true && options.signal.reason instanceof SpecImportPaused)
@@ -1331,38 +1352,43 @@ async function tidyLegacyParts(ctx: Context, path: string, rootSid: string): Pro
 		{ length: SPEC_IMPORT_LEGACY_PARTS },
 		(_, n) => `sp${tag}p${(n + 1).toString(36)}`,
 	);
-	const parts = (await outlineStore.getBlockMetas(ctx.space.id, { sids: partSids })).filter(
-		(meta) => !meta.deleted,
-	);
-	const empty: OutlineBlockMeta[] = [];
-	for (const part of parts)
-		if ((await outlineStore.listChildMetas(ctx.space.id, [part.id], 1)).length === 0)
-			empty.push(part);
-	const [root] = await outlineStore.getBlockMetas(ctx.space.id, { sids: [rootSid] });
-	const rootRow = root && !root.deleted ? await outlineStore.getBlock(root.id) : null;
-	const retitle = rootRow !== null && rootRow.content !== path;
-	const ours = await onlyImportVersions(ctx.space, [
-		...empty.map((part) => part.id),
-		...(retitle && root ? [root.id] : []),
-	]);
-	const ops: OutlineOp[] = [];
-	for (const part of empty)
-		if (ours.has(part.id))
-			ops.push({ op: "delete", block: { id: part.id }, baseVersionSeq: part.versionSeq });
-	if (retitle && root && ours.has(root.id))
-		ops.push({
-			op: "update",
-			block: { id: root.id },
-			content: path,
-			baseVersionSeq: root.versionSeq,
-		});
-	if (ops.length > 0)
-		await commit(
-			ctx,
-			ops,
-			ops.map(() => null),
-			SPEC_IMPORT_TEXT[ctx.locale].summaryNotes(path),
+	// Best effort, and checked like any stale removal: what lands meanwhile makes it read again.
+	for (let tries = 0; tries < 3; tries++) {
+		const checkedAt = await outlineStore.getSpace(ctx.space.id);
+		if (!checkedAt) return;
+		const parts = (await outlineStore.getBlockMetas(ctx.space.id, { sids: partSids })).filter(
+			(meta) => !meta.deleted,
 		);
+		const ops: OutlineOp[] = [];
+		for (const part of parts) {
+			if ((await outlineStore.listChildMetas(ctx.space.id, [part.id], 1)).length > 0) continue;
+			// The owner rule: nobody but the import ever touched it or anything once under it.
+			if ((await onlyImportWrote(ctx.space, part)) === null) continue;
+			ops.push({ op: "delete", block: { id: part.id }, baseVersionSeq: part.versionSeq });
+		}
+		const [root] = await outlineStore.getBlockMetas(ctx.space.id, { sids: [rootSid] });
+		const rootRow = root && !root.deleted ? await outlineStore.getBlock(root.id) : null;
+		if (root && rootRow && rootRow.content !== path && (await onlyImportWrote(ctx.space, root)))
+			ops.push({
+				op: "update",
+				block: { id: root.id },
+				content: path,
+				baseVersionSeq: root.versionSeq,
+			});
+		if (ops.length === 0) return;
+		try {
+			await commit(
+				ctx,
+				ops,
+				ops.map(() => null),
+				SPEC_IMPORT_TEXT[ctx.locale].summaryNotes(path),
+				{ expectNextSeq: checkedAt.nextSeq },
+			);
+			return;
+		} catch (error) {
+			if (!(error instanceof OutlineStaleWriteError)) throw error;
+		}
+	}
 }
 
 /**
@@ -1532,14 +1558,10 @@ async function removeStale(
 		!current.keepFileTags.has(fileTagOfSid(sid));
 	const [tasksList] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
 	if (tasksList) {
-		for (const meta of await outlineStore.listLastChildMetas(
-			space.id,
-			tasksList.id,
-			limits.staleChildren,
-		)) {
-			if (!meta.sid.startsWith("st") || !isImportSid(meta.sid)) continue;
-			if (current.taskSidPrefix === null || !meta.sid.startsWith(current.taskSidPrefix))
-				stale.push(block(meta));
+		for (const row of await readLevelWhole(space, tasksList.id, limits.staleTaskChildren)) {
+			if (!row.sid.startsWith("st") || !isImportSid(row.sid)) continue;
+			if (current.taskSidPrefix === null || !row.sid.startsWith(current.taskSidPrefix))
+				stale.push(block(row));
 		}
 	}
 	const [index] = await outlineStore.getBlockMetas(space.id, { sids: [specIndexSid()] });
@@ -1655,7 +1677,7 @@ async function deleteStale(
 	const commitPack = async (
 		list: ReadonlyArray<{ id: string; size: number }>,
 	): Promise<boolean> => {
-		for (;;) {
+		for (let tries = 1; ; tries++) {
 			const expectNextSeq = await recheck();
 			try {
 				await commit(
@@ -1672,8 +1694,14 @@ async function deleteStale(
 				for (const piece of list) gone.add(piece.id);
 				return true;
 			} catch (error) {
-				// Someone wrote meanwhile: checked again before trying again.
-				if (error instanceof OutlineStaleWriteError) continue;
+				// Someone wrote meanwhile: checked again before trying again, a little later each time;
+				// a space that keeps changing makes the attempt wait for the next one.
+				if (error instanceof OutlineStaleWriteError) {
+					if (tries >= limits.staleWriteTries)
+						throw new SpecImportWait("The session space kept changing during the removal");
+					await new Promise((resolve) => setTimeout(resolve, Math.min(200, 5 * tries)));
+					continue;
+				}
 				if (!tooLarge(error)) throw error;
 				if (list.length === 1) return false;
 				const half = Math.ceil(list.length / 2);
@@ -1786,9 +1814,8 @@ async function onlyImportWrote(
 	const limits = SPEC_IMPORT_LIMITS;
 	const state = (await outlineStore.getHistoryStates([space.id])).get(space.id);
 	if (!state?.edgesReady)
-		throw new SpecImportRetry(
+		throw new SpecImportWait(
 			"The session space's history is being converted: the import goes on once that is done",
-			{ code: "other" },
 		);
 	const nodes: StaleNode[] = [{ id: root.id, parentId: null, versionSeq: root.versionSeq }];
 	let level = [root.id];

@@ -11,7 +11,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../../../db";
-import { specNamespaceFiles, specNamespaces } from "../../../../db/schema";
+import { outlineSpaces, specNamespaceFiles, specNamespaces } from "../../../../db/schema";
 import { eventBus } from "../../../../lib/event-bus";
 import { settings } from "../../../../lib/settings";
 import { specIndexSid } from "../../../plugin-spec-compat";
@@ -33,6 +33,7 @@ import {
 	type SpecImportNode,
 	specFileTag,
 } from "../plan";
+import { readSpecImportState } from "../state";
 import { makeSession, writeNote, writeTasks } from "./fixtures";
 
 const saved = { ...SPEC_IMPORT_LIMITS };
@@ -338,4 +339,79 @@ describe("stale removal data safety (pageless A3)", () => {
 		expect(kids.map((k) => k.content)).toEqual(blocks.map((b) => b.content));
 		expect(kids.map((k) => k.sid)).toEqual(blocks.map((_, i) => `sb${t}${i.toString(36)}`));
 	}, 180_000);
+
+	test("R4 a legacy part page a person touched (a child added, then deleted) is kept", async () => {
+		const { id, owner } = await makeSession();
+		const N = 1550;
+		await writeNote(id, "big.md", paras("p", N));
+		const ns = await db.query.specNamespaces.findFirst({
+			where: eq(specNamespaces.narratorId, id),
+		});
+		const file = await db.query.specNamespaceFiles.findFirst({
+			where: and(
+				eq(specNamespaceFiles.namespaceId, ns?.id as string),
+				eq(specNamespaceFiles.path, "big.md"),
+			),
+		});
+		const t = specFileTag(id, "big.md", file?.revisionId as string);
+		const blocks = convertNotes({
+			text: paras("p", N),
+			continued: SPEC_IMPORT_TEXT.en.continued,
+		}).blocks;
+		const nodes: SpecImportNode[] = [{ sid: `sp${t}`, parentSid: null, content: "big.md (1/2)" }];
+		for (let i = 0; i < 1500; i++)
+			nodes.push({
+				sid: `sb${t}${i.toString(36)}`,
+				parentSid: `sp${t}`,
+				content: blocks[i]?.content as never,
+			});
+		nodes.push({ sid: `sp${t}p1`, parentSid: null, content: "big.md (2/2)" });
+		for (let i = 1500; i < 1510; i++)
+			nodes.push({
+				sid: `sb${t}${i.toString(36)}`,
+				parentSid: `sp${t}p1`,
+				content: blocks[i]?.content as never,
+			});
+		const space = await spaceFor(id);
+		await writeAsImport(space.id, owner, id, nodes);
+		const [part] = await outlineStore.getBlockMetas(space.id, { sids: [`sp${t}p1`] });
+		const added = await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "insert", parent: { id: part?.id as string }, content: "mine" }],
+			actor: human(owner),
+			responsibleUserId: owner,
+		});
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "delete", block: { id: added.results[0]?.blockId as string } }],
+			actor: human(owner),
+			responsibleUserId: owner,
+		});
+		expect((await run(id)).status).toBe("imported");
+		// Its blocks joined the file's block (only the import wrote them); the page itself stays.
+		const [after] = await outlineStore.getBlockMetas(space.id, { ids: [part?.id as string] });
+		expect(after?.deleted).toBe(false);
+		expect(await outlineStore.listChildren(space.id, part?.id as string, 10)).toEqual([]);
+		const [root] = await outlineStore.getBlockMetas(space.id, { sids: [`sp${t}`] });
+		expect(await outlineStore.listChildren(space.id, root?.id as string, 3000)).toHaveLength(N);
+	}, 180_000);
+
+	test("R2 while the space's history is being converted the import waits, counting nothing", async () => {
+		const { id, owner } = await makeSession();
+		await writeTasks(id, [{ text: "t" }]);
+		const { space, rootId } = await staleFile(id, owner, 5);
+		await writeNote(id, "big.md", "new");
+		await db.update(outlineSpaces).set({ edgesReady: false }).where(eq(outlineSpaces.id, space.id));
+		for (let n = 0; n < 3; n++) expect((await run(id)).status).toBe("busy");
+		const state = await readSpecImportState(id);
+		expect(state?.attempts ?? 0).toBe(0);
+		expect(state?.status).toBe("busy");
+		const [kept] = await outlineStore.getBlockMetas(space.id, { ids: [rootId] });
+		expect(kept?.deleted).toBe(false);
+		// Converted: the next attempt goes on and the stale block goes.
+		await db.update(outlineSpaces).set({ edgesReady: true }).where(eq(outlineSpaces.id, space.id));
+		expect((await run(id)).status).toBe("imported");
+		const [gone] = await outlineStore.getBlockMetas(space.id, { ids: [rootId] });
+		expect(gone?.deleted).toBe(true);
+	}, 60_000);
 });

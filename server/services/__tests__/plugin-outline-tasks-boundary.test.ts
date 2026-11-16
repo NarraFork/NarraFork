@@ -168,18 +168,23 @@ describe("plugin commands, the boundary, the event loop (pageless A3)", () => {
 		}
 		const space = await ensureSessionSpace(id);
 		let longest = 0;
+		let ticks = 0;
 		let last = performance.now();
 		let running = true;
 		const tick = () => {
 			const now = performance.now();
 			longest = Math.max(longest, now - last);
 			last = now;
+			ticks++;
 			if (running) setImmediate(tick);
 		};
 		setImmediate(tick);
 		const started = performance.now();
 		const walk = await walkSessionTasks(space, { limit: 50, keep: () => false });
 		const total = performance.now() - started;
+		// The stretch from the last tick to the read's end counts too: let two more ticks run.
+		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setImmediate(resolve));
 		running = false;
 		console.log(
 			"tasks_read over 20,000 blocks:",
@@ -189,8 +194,9 @@ describe("plugin commands, the boundary, the event loop (pageless A3)", () => {
 			"ms",
 		);
 		// It gives way every few statements: no stall near the ~120 ms one read without yields
-		// took (generous for a loaded machine).
-		expect(longest).toBeLessThan(100);
+		// took (about 10 ms here; generous for a loaded machine).
+		expect(ticks).toBeGreaterThan(2);
+		expect(longest).toBeLessThanOrEqual(40);
 		expect(walk.tasks).toEqual([]);
 	}, 300_000);
 });
