@@ -910,6 +910,11 @@ test('"in progress · N" opens the list of which tasks, read when it opens', asy
 	expect(items[0]).toContain("Retry the refresh");
 	expect(items.slice(1).sort()).toEqual(["Document it", "Rotate the token"]);
 	expect(page.requests.filter((r) => r.includes("/open-tasks")).length).toBe(1);
+	// (Once the dropdown's transition has ended.)
+	await page.waitForFunction(() => {
+		const list = document.querySelector("[data-testid=outline-in-progress-list]");
+		return !!list && getComputedStyle(list).opacity === "1";
+	});
 	await shot(page, "8-in-progress-list", false);
 	await page.browserContext().close();
 }, 90_000);
