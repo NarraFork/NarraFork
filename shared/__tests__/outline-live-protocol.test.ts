@@ -141,7 +141,7 @@ describe("agents in presence (P2 PR 10b)", () => {
 		expect(livePeerColor("abc")).toBe(livePeerColor("abc"));
 		expect(LIVE_PEER_PALETTE as readonly string[]).toContain(livePeerColor("some-narrator-id"));
 		expect(OUTLINE_LIVE_AGENT_PNO_BASE).toBeGreaterThan(
-			OUTLINE_LIVE_LIMITS.editorsPerPage + OUTLINE_LIVE_LIMITS.viewersPerPage,
+			OUTLINE_LIVE_LIMITS.editorsPerSpace + OUTLINE_LIVE_LIMITS.viewersPerSpace,
 		);
 	});
 });

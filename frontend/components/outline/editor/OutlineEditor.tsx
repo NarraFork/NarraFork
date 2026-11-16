@@ -81,6 +81,8 @@ export interface OutlineFocusInfo {
 
 export interface OutlineEditorProps {
 	pageId: string;
+	/** The page's space: the live session joins it and watches the page's subtree. */
+	spaceId: string;
 	/** The focused block (the page itself when unfocused). */
 	focusId: string;
 	/** The space key, for resolving `[[key/sid]]` mentions to blocks of this page. */
@@ -166,15 +168,15 @@ function afterNextPaint(run: () => void): void {
 export type OutlineLiveUnavailable = LiveCloseCode | "timeout" | "tab_limit";
 
 export function OutlineEditor(props: OutlineEditorProps) {
-	const { pageId, canWrite } = props;
+	const { pageId, canWrite, spaceId } = props;
 	const mode = canWrite ? "edit" : "view";
 	const transport = props.transport ?? liveTransport();
 	const shared = useMemo(() => {
-		const s = acquireLiveSession(transport, pageId, mode);
+		const s = acquireLiveSession(transport, pageId, mode, spaceId);
 		// A seeded page paints its seed before it turns live.
 		if (s) s.client.upgradeAfterPaint ??= afterNextPaint;
 		return s;
-	}, [transport, pageId, mode]);
+	}, [transport, pageId, mode, spaceId]);
 	const onUnavailable = useRef(props.onUnavailable);
 	onUnavailable.current = props.onUnavailable;
 	useEffect(() => {

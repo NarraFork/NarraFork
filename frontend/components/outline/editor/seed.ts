@@ -26,6 +26,6 @@ export function seedBlocksOf(read: OutlineBlockViewResponse): SeedBlock[] {
  */
 export function readCanGoLive(read: OutlineBlockViewResponse): boolean {
 	return (
-		read.current && !read.pageTruncated && read.pageBlocks <= OUTLINE_LIVE_LIMITS.maxPageBlocks
+		read.current && !read.pageTruncated && read.pageBlocks <= OUTLINE_LIVE_LIMITS.maxWatchBlocks
 	);
 }

@@ -10,7 +10,7 @@
  * has a cursor: a task in progress on the page that it holds, or a block of the page it wrote in
  * the last {@link OUTLINE_LIVE_AGENT_BOUNDS.writeMs}. An idle session holding a task is not present
  * (the board and the task say who is doing it); a run that ends takes the agent away at once,
- * whatever it wrote. At most {@link OUTLINE_LIVE_LIMITS.agentsPerPage} a page, the most recent
+ * whatever it wrote. At most {@link OUTLINE_LIVE_LIMITS.agentsPerWatch} a watch, the most recent
  * writers first; the rest are counted.
  *
  * NAMES
@@ -118,7 +118,7 @@ export async function readLiveAgents(input: {
 			blocks,
 		});
 	}
-	const limit = OUTLINE_LIVE_LIMITS.agentsPerPage;
+	const limit = OUTLINE_LIVE_LIMITS.agentsPerWatch;
 	return {
 		agents: present.slice(0, limit),
 		more: Math.max(0, present.length - limit),

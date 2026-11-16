@@ -155,6 +155,8 @@ export interface OpenOptions {
 	pageId: string;
 	focusId?: string;
 	spaceKey: string;
+	/** The page's space (the live session joins it). */
+	spaceId: string;
 	canWrite: boolean;
 	lens?: "facts" | "all";
 	width?: number;
@@ -181,6 +183,7 @@ function editor(
 			<MantineProvider {...(options.scheme ? { forceColorScheme: options.scheme } : {})}>
 				<OutlineEditor
 					pageId={options.pageId}
+					spaceId={options.spaceId}
 					focusId={options.focusId ?? options.pageId}
 					spaceKey={options.spaceKey}
 					canWrite={options.canWrite}
@@ -204,7 +207,11 @@ function editor(
 }
 
 /** Mount the editor for one person (one per browser page). */
+/** The space of the first editor (a second one in this tab is of the same space by default). */
+let openedSpace = "";
+
 export async function open(options: OpenOptions): Promise<void> {
+	openedSpace = options.spaceId;
 	await instance.changeLanguage(options.lang ?? "en");
 	transport = new SocketTransport(options.wsUrl);
 	const host = document.getElementById("root") as HTMLElement;
@@ -223,7 +230,9 @@ export async function open(options: OpenOptions): Promise<void> {
  * Mount a second editor of the same person in this tab (as a dock panel beside the outline
  * page), on the same socket, with a composer (a textarea) before it.
  */
-export function openSecond(options: Omit<OpenOptions, "wsUrl">): void {
+export function openSecond(
+	options: Omit<OpenOptions, "wsUrl" | "spaceId"> & { spaceId?: string },
+): void {
 	const composer = document.createElement("textarea");
 	composer.id = "composer";
 	document.body.appendChild(composer);
@@ -234,7 +243,7 @@ export function openSecond(options: Omit<OpenOptions, "wsUrl">): void {
 	second = createRoot(host);
 	flushSync(() => {
 		second?.render(
-			editor({ ...options, wsUrl: "" }, (client, view) => {
+			editor({ ...options, spaceId: options.spaceId ?? openedSpace, wsUrl: "" }, (client, view) => {
 				other = { client, view };
 			}),
 		);

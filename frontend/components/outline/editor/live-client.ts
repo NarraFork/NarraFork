@@ -1,7 +1,11 @@
 /**
- * One page's live session, client side (design §6.2–§6.6, ported from the editor prototype's
+ * One editor's live session, client side (design §6.2–§6.6, ported from the editor prototype's
  * `client.ts` onto the real protocol, `shared/outline-live-protocol.ts`).
  *
+ *   - What it shows (protocol version 4): it joins the SPACE and watches the subtree of the root
+ *     it shows (`pageId`: the editor still shows one root at a time), or any watch set given
+ *     (`LiveClientOptions.watch`), changed later with {@link LiveClient.watch}. The server sends
+ *     what the set shows and nothing else; a rejoin names the whole set.
  *   - Structure: confirmed (what the server acknowledged) + pending (applied optimistically,
  *     not acknowledged yet) = visible. The server orders, checks and commits each structural
  *     transaction; a refused one is dropped and the page is rebuilt from a fresh snapshot (every
@@ -66,6 +70,9 @@ import {
 	type LiveSelWire,
 	type LiveTaskChar,
 	type LiveTextEntry,
+	type LiveWatchedHead,
+	type LiveWatchWire,
+	liveWatchKey,
 	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
@@ -77,13 +84,21 @@ import {
 	seededTextDoc,
 } from "@shared/outline-live-text";
 import * as Y from "yjs";
-import { type BlockRec, type ClientOp, keyBetweenLoose, Store, wireOp } from "./store";
+import {
+	type BlockRec,
+	type ClientOp,
+	keyBetweenLoose,
+	Store,
+	type StoreScope,
+	wireOp,
+} from "./store";
 import {
 	dropUnsavedText,
 	keepUnsavedTexts,
 	markUnsavedAdding,
 	type UnsavedEntry,
 	type UnsavedReason,
+	unsavedTextsOf,
 } from "./unsaved-texts";
 
 /** Origin of the editor's own text changes (tracked by the block's undo manager). */
@@ -274,7 +289,17 @@ export type ClientEvent =
 	| "readonly"
 	| "closed"
 	/** A local delete took questions put to people: it withdraws them (`withdrawnQuestions`). */
-	| "withdrew";
+	| "withdrew"
+	/** The watch set changed: an answer to {@link LiveClient.watch}, or watches that ended. */
+	| "watch";
+
+/** How a client joins (protocol version 4). */
+export interface LiveClientOptions {
+	/** The space joined. */
+	space?: string;
+	/** What it watches; by default the whole subtree of its root (`{ s: pageId }`). */
+	watch?: LiveWatchWire[];
+}
 
 let idCounter = 0;
 
@@ -290,20 +315,43 @@ function randomId(length: number): string {
 	return out;
 }
 
-function storeFromSnapshot(pageId: string, blocks: readonly LiveBlockWire[]): Store {
-	const store = new Store(pageId);
-	for (const [id, parent, orderKey, sid, task, question] of blocks) {
-		store.put({
-			id,
-			parentId: parent < 0 ? null : (blocks[parent]?.[0] ?? null),
-			orderKey,
-			task: task === "" ? null : task,
-			deleted: false,
-			sid,
-			question: question === 1,
-		});
-	}
+/** A structure row's parent: an earlier row, the top level (-1), or a block named by id. */
+function parentOfRow(blocks: readonly LiveBlockWire[], parent: number | string): string | null {
+	if (typeof parent === "string") return parent;
+	return parent < 0 ? null : (blocks[parent]?.[0] ?? null);
+}
+
+function recOfRow(blocks: readonly LiveBlockWire[], row: LiveBlockWire): BlockRec {
+	const [id, parent, orderKey, sid, task, question] = row;
+	return {
+		id,
+		parentId: parentOfRow(blocks, parent),
+		orderKey,
+		task: task === "" ? null : task,
+		deleted: false,
+		sid,
+		question: question === 1,
+	};
+}
+
+function storeFromSnapshot(
+	pageId: string,
+	blocks: readonly LiveBlockWire[],
+	scope: StoreScope,
+): Store {
+	const store = new Store(pageId, scope);
+	for (const row of blocks) store.put(recOfRow(blocks, row));
 	return store;
+}
+
+/** The scope stores read from a watch set. */
+function scopeOf(watches: readonly LiveWatchWire[]): StoreScope {
+	const scope: StoreScope = { roots: new Set(), levels: new Set() };
+	for (const w of watches) {
+		if ("s" in w) scope.roots.add(w.s);
+		else scope.levels.add(w.l ?? "");
+	}
+	return scope;
 }
 
 export class LiveClient {
@@ -422,13 +470,30 @@ export class LiveClient {
 	/** Frames that arrived while the upgrade waited for the seed's paint, in order. */
 	private heldFrames: LiveFrame[] | null = null;
 
+	/** The space this client joins. */
+	readonly space: string;
+	/** What it watches, as the server has it (an addition joins it once answered). */
+	private watches: LiveWatchWire[];
+	/** Read by the stores; changed in place with the watch set. */
+	private readonly scope: StoreScope;
+	/** Additions asked for and not answered, by key: asked again after a rejoin. */
+	private readonly watchAsked = new Map<string, LiveWatchWire>();
+	/** The number of this client's last watch request (`LiveWatchHead.w`). */
+	private watchSeq = 0;
+	/** Watches the server refused, with why (the last answer of each; tests and the editor). */
+	readonly watchRefused = new Map<string, LiveCloseCode>();
+
 	constructor(
 		private readonly transport: LiveTransport,
 		readonly pageId: string,
 		readonly mode: "edit" | "view",
+		options: LiveClientOptions = {},
 	) {
-		this.confirmed = new Store(pageId);
-		this.visible = new Store(pageId);
+		this.space = options.space ?? "";
+		this.watches = [...(options.watch ?? [{ s: pageId }])];
+		this.scope = scopeOf(this.watches);
+		this.confirmed = new Store(pageId, this.scope);
+		this.visible = new Store(pageId, this.scope);
 		this.off.push(transport.onFrame((frame) => this.receive(frame)));
 		this.off.push(
 			transport.onConnectionChange((connected) => {
@@ -946,12 +1011,153 @@ export class LiveClient {
 		return this.visible.get(id) ? this.pageId : "";
 	}
 
+	/** What it watches now (answered additions only). */
+	get watchSet(): LiveWatchWire[] {
+		return [...this.watches];
+	}
+
+	/**
+	 * Change what it watches. Removals take effect at once: what no remaining watch shows goes
+	 * from this client (its structure and texts; its undo steps lose their text there). Additions
+	 * are answered by the server (`watched`): the structure and text they show join this client,
+	 * or they are refused ({@link watchRefused}; never retried by themselves). An event `watch`
+	 * follows each answer.
+	 */
+	watch(change: { add?: readonly LiveWatchWire[]; remove?: readonly LiveWatchWire[] }): void {
+		if (this.disposed) return;
+		const removing = new Set((change.remove ?? []).map(liveWatchKey));
+		const add = (change.add ?? []).filter((w) => {
+			const key = liveWatchKey(w);
+			return !removing.has(key) && !this.watches.some((x) => liveWatchKey(x) === key);
+		});
+		for (const w of add) this.watchAsked.set(liveWatchKey(w), w);
+		for (const key of removing) this.watchAsked.delete(key);
+		const remove = this.watches.filter((w) => removing.has(liveWatchKey(w)));
+		if (remove.length > 0) {
+			this.watches = this.watches.filter((w) => !removing.has(liveWatchKey(w)));
+			this.rescope();
+			this.prune();
+		}
+		if (add.length === 0 && remove.length === 0) return;
+		this.sendWatch(add, remove);
+	}
+
+	private sendWatch(add: readonly LiveWatchWire[], remove: readonly LiveWatchWire[]): void {
+		if (this.status !== "live" || this.handle === null || this.resetting) return;
+		this.sendFrame(
+			encodeLiveFrame({
+				kind: LIVE_FRAME.watch,
+				handle: this.handle,
+				head: {
+					w: ++this.watchSeq,
+					...(add.length > 0 ? { add } : {}),
+					...(remove.length > 0 ? { remove } : {}),
+				},
+			}),
+		);
+	}
+
+	private rescope(): void {
+		const next = scopeOf(this.watches);
+		this.scope.roots.clear();
+		this.scope.levels.clear();
+		for (const r of next.roots) this.scope.roots.add(r);
+		for (const l of next.levels) this.scope.levels.add(l);
+	}
+
+	/**
+	 * Forget what no watch shows any more: its structure, its texts (a later watch of it brings
+	 * them whole) and their part of the undo history.
+	 */
+	private prune(): void {
+		const gone: string[] = [];
+		for (const id of this.confirmed.blocks.keys())
+			if (!this.confirmed.inPage(id) && !this.coveredDeleted(id)) gone.push(id);
+		if (gone.length === 0) return;
+		for (const id of gone) {
+			this.confirmed.remove(id);
+			const t = this.docs.get(id);
+			if (t) {
+				if (t.um) this.capturing.delete(t.um);
+				t.um?.destroy();
+				t.doc.destroy();
+				this.docs.delete(id);
+			}
+			this.plain.delete(id);
+			this.gens.delete(id);
+			this.textCache.delete(id);
+			this.lostText.delete(id);
+		}
+		const dropped = new Set(gone);
+		for (const stack of [this.undoStack, this.redoStack])
+			for (const s of stack) for (const id of dropped) s.texts.delete(id);
+		const live = (s: Step) => s.inverse.length > 0 || s.texts.size > 0;
+		this.undoStack = this.undoStack.filter(live);
+		this.redoStack = this.redoStack.filter(live);
+		this.rebuildVisible();
+		this.syncViews(null);
+	}
+
+	/** A deleted block under something still shown (kept: undoing its delete brings it back). */
+	private coveredDeleted(id: string): boolean {
+		const b = this.confirmed.get(id);
+		if (!b?.deleted) return false;
+		let cur = b.parentId;
+		for (let guard = 0; cur && guard < 10_000; guard++) {
+			const p = this.confirmed.get(cur);
+			if (!p) return false;
+			if (!p.deleted) return this.confirmed.inPage(cur);
+			cur = p.parentId;
+		}
+		return false;
+	}
+
+	/** The answer to a watch request, or watches that ended. */
+	private onWatched(head: LiveWatchedHead, body: Uint8Array): void {
+		const ended = [...(head.gone ?? []), ...(head.refused ?? []).map(([w]) => w)];
+		for (const [w, code] of head.refused ?? []) {
+			this.watchRefused.set(liveWatchKey(w), code);
+			this.watchAsked.delete(liveWatchKey(w));
+		}
+		for (const w of head.ok ?? []) {
+			const key = liveWatchKey(w);
+			this.watchAsked.delete(key);
+			this.watchRefused.delete(key);
+			if (!this.watches.some((x) => liveWatchKey(x) === key)) this.watches.push(w);
+		}
+		if (ended.length > 0) {
+			const keys = new Set(ended.map(liveWatchKey));
+			this.watches = this.watches.filter((w) => !keys.has(liveWatchKey(w)));
+		}
+		this.rescope();
+		const blocks = head.blocks ?? [];
+		for (const row of blocks) this.confirmed.put(recOfRow(blocks, row));
+		this.applyTexts(body);
+		// The generation of every block it lists that no text entry named one for (as a snapshot).
+		if (head.g) {
+			for (const b of blocks) if (!this.gens.has(b[0])) this.gens.set(b[0], head.g);
+			this.era = Math.max(this.era, head.g);
+		}
+		for (const b of blocks) if (!this.hasText(b[0])) this.plain.set(b[0], "");
+		if (head.op !== undefined) this.opSeq = Math.max(this.opSeq, head.op);
+		if (ended.length > 0) this.prune();
+		this.rebuildVisible();
+		this.syncViews(null);
+		this.emit("watch");
+	}
+
 	// ─────────────────────────────────────────────────────────────────────────
 	// Joining
 	// ─────────────────────────────────────────────────────────────────────────
 
 	private join(): void {
 		if (this.disposed) return;
+		// A retry waiting from an earlier `ended`: this join replaces it (it must not fire after
+		// this one is answered, and rebuild a session that is live).
+		if (this.retryTimer) {
+			cancelLiveTimer(this.retryTimer);
+			this.retryTimer = null;
+		}
 		if (this.handle === null) this.handle = this.transport.allocateHandle();
 		if (this.handle === null) {
 			// No room on the socket: closed for good, like a refusal.
@@ -975,7 +1181,8 @@ export class LiveClient {
 		const head: LiveJoinHead = {
 			v: OUTLINE_LIVE_PROTOCOL_VERSION,
 			j: ++this.joinSeq,
-			page: this.pageId,
+			space: this.space,
+			watch: this.watches,
 			mode: this.mode,
 			key: this.key,
 			...(known
@@ -1366,13 +1573,13 @@ export class LiveClient {
 	private validLocally(op: ClientOp | LiveOp, v: Store = this.visible): boolean {
 		switch (op.t) {
 			case "i":
-				return v.inPage(op.p) && !v.alive(op.id);
+				return v.open(op.p) && !v.alive(op.id);
 			case "m":
 				return (
 					v.inPage(op.id) &&
-					v.inPage(op.p) &&
+					v.open(op.p) &&
 					op.p !== op.id &&
-					!v.isAncestor(op.id, op.p) &&
+					(op.p === null || !v.isAncestor(op.id, op.p)) &&
 					op.id !== this.pageId
 				);
 			case "d":
@@ -1545,6 +1752,9 @@ export class LiveClient {
 				this.stats.resyncs++;
 				this.join();
 				break;
+			case LIVE_FRAME.watched:
+				if (!this.resetting) this.onWatched((frame.head ?? {}) as LiveWatchedHead, frame.body);
+				break;
 			case LIVE_FRAME.closed:
 				if (this.superseded(frame.head)) break;
 				this.onClosed(
@@ -1606,6 +1816,8 @@ export class LiveClient {
 		this.setStatus("live");
 		this.checkStall();
 		this.sendPending();
+		// Additions asked for and not answered before this join: asked again.
+		if (this.watchAsked.size > 0) this.sendWatch([...this.watchAsked.values()], []);
 		this.lastPresence = "";
 		if (this.wantPresence) this.sendPresence();
 		this.emit("presence");
@@ -1635,7 +1847,7 @@ export class LiveClient {
 			for (const b of head.blocks ?? []) if (!this.gens.has(b[0])) this.gens.set(b[0], head.g);
 			this.era = Math.max(this.era, head.g);
 		}
-		this.confirmed = storeFromSnapshot(this.pageId, head.blocks ?? []);
+		this.confirmed = storeFromSnapshot(this.pageId, head.blocks ?? [], this.scope);
 		// A block the snapshot sent no text for has the empty text.
 		for (const b of head.blocks ?? []) if (!this.hasText(b[0])) this.plain.set(b[0], "");
 		this.pending = [];
@@ -1752,7 +1964,7 @@ export class LiveClient {
 		// What the server has not applied goes again; what it applied is in the state it sends.
 		this.pending = rest;
 		for (const tx of this.pending) tx.sent = false;
-		if (head.blocks) this.confirmed = storeFromSnapshot(this.pageId, head.blocks);
+		if (head.blocks) this.confirmed = storeFromSnapshot(this.pageId, head.blocks, this.scope);
 		else for (const c of head.ops ?? []) this.applyCommit(c);
 		this.applyTexts(body);
 		for (const b of head.blocks ?? []) if (!this.hasText(b[0])) this.plain.set(b[0], "");
@@ -2001,7 +2213,11 @@ export class LiveClient {
 		keepUnsavedTexts(items);
 	}
 
-	/** Typing that cannot reach the page: kept for the person (the unsaved-text store). */
+	/**
+	 * Typing that cannot reach the page: kept for the person (the unsaved-text store). Typing in a
+	 * block that already has an entry of text the page did not take (`moved_away`) joins that
+	 * entry (L3): it was typed on top of it, and two entries would hold the same words twice.
+	 */
 	private keepUnsaved(reason: UnsavedReason, txs: readonly PendingTx[]): void {
 		const texts = new Map<string, { before: string; after: string }>();
 		for (const tx of txs) {
@@ -2009,6 +2225,22 @@ export class LiveClient {
 				const prev = texts.get(id);
 				texts.set(id, { before: prev?.before ?? change.before, after: change.after });
 			}
+		}
+		for (const [id, change] of [...texts]) {
+			if (this.lostText.has(id)) {
+				this.foldLost(id, [change]);
+				texts.delete(id);
+				continue;
+			}
+			const moved = unsavedTextsOf(this.pageId).find(
+				(e) => e.blockId === id && e.reason === "moved_away",
+			);
+			if (!moved || reason === "moved_away") continue;
+			if (change.after !== moved.text) {
+				const { id: _id, at: _at, adding: _adding, ...rest } = moved;
+				keepUnsavedTexts([{ ...rest, text: change.after }]);
+			}
+			texts.delete(id);
 		}
 		if (texts.size === 0) return;
 		this.log.push(`${texts.size} block(s) of typing not saved (${reason})`);

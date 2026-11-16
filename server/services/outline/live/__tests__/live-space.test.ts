@@ -69,8 +69,8 @@ import {
 	decodeLogTexts,
 	encodeLogTexts,
 	LIVE_SYNC_ACTOR,
-	type LivePageView,
 	type LiveSpace,
+	type LiveView,
 	OUTLINE_LIVE_BOUNDS,
 	OUTLINE_LIVE_HOOKS,
 	OUTLINE_LIVE_TIMING,
@@ -78,6 +78,7 @@ import {
 import {
 	client,
 	FakeLiveClock,
+	joinHead,
 	settle,
 	struct,
 	TestLink,
@@ -180,7 +181,7 @@ function edit(c: LiveClient, id: string, md: string): void {
 	struct(c, [], [{ id, md }]);
 }
 
-function session(pageId: string): LivePageView {
+function session(pageId: string): LiveView {
 	const s = liveSessionOf(pageId);
 	if (!s) throw new Error("no session");
 	return s;
@@ -596,12 +597,7 @@ describe("a participant's own transaction between two loaded pages", () => {
 			kind: LIVE_FRAME.join,
 			handle: 1,
 			n: 0,
-			head: {
-				v: OUTLINE_LIVE_PROTOCOL_VERSION,
-				page: one.pageId,
-				mode: "edit",
-				key: "rawclient001",
-			},
+			head: joinHead(one.pageId, "edit", "rawclient001"),
 			body: new Uint8Array(0),
 		});
 		expect(answers[0]?.kind).toBe(LIVE_FRAME.joined);
@@ -2327,7 +2323,7 @@ describe("deterministic sequences (review round 2)", () => {
 		try {
 			let previous: SharedLiveSession | null = null;
 			for (const [i, p] of pages.entries()) {
-				const shared = acquireLiveSession(la, p.pageId, "edit");
+				const shared = acquireLiveSession(la, p.pageId, "edit", space.id);
 				if (!shared) throw new Error("no session");
 				held.push(shared);
 				retainLiveSession(shared);
@@ -2358,7 +2354,7 @@ describe("deterministic sequences (review round 2)", () => {
 			OUTLINE_LIVE_BOUNDS.maxUserBlocks = 8000;
 			expect(theSpace().loadedBlocks).toBe(60);
 			OUTLINE_LIVE_BOUNDS.maxLoadedBlocks = 65;
-			const next = acquireLiveSession(la, more[0]?.pageId as string, "edit");
+			const next = acquireLiveSession(la, more[0]?.pageId as string, "edit", space.id);
 			if (!next) throw new Error("no session");
 			held.push(next);
 			retainLiveSession(next);
@@ -2367,7 +2363,7 @@ describe("deterministic sequences (review round 2)", () => {
 			expect(next.client.closeCode).toBeNull();
 			expect(theSpace().loadedBlocks).toBeLessThanOrEqual(65);
 			// A second panel of the tab, both on screen.
-			const panel = acquireLiveSession(la, more[1]?.pageId as string, "edit");
+			const panel = acquireLiveSession(la, more[1]?.pageId as string, "edit", space.id);
 			if (!panel) throw new Error("no session");
 			held.push(panel);
 			retainLiveSession(panel);

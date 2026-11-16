@@ -441,7 +441,7 @@ describe("names and limits", () => {
 
 	test("at most eight agents a page; the rest are counted", async () => {
 		const { pageId } = await page(["Notes"]);
-		const n = OUTLINE_LIVE_LIMITS.agentsPerPage + 1;
+		const n = OUTLINE_LIVE_LIMITS.agentsPerWatch + 1;
 		for (let i = 0; i < n; i++) {
 			const worker = await session(`Worker ${i}`);
 			await run(worker, true);
@@ -449,7 +449,7 @@ describe("names and limits", () => {
 		}
 		const c = open(owner, pageId);
 		await waitFor(
-			() => agents(c).length === OUTLINE_LIVE_LIMITS.agentsPerPage && c.agentsMore === 1,
+			() => agents(c).length === OUTLINE_LIVE_LIMITS.agentsPerWatch && c.agentsMore === 1,
 			3000,
 			"eight shown, one counted",
 		);

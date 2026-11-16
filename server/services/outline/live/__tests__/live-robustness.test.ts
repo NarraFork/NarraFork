@@ -59,7 +59,17 @@ import {
 	OUTLINE_LIVE_HOOKS,
 	OUTLINE_LIVE_TIMING,
 } from "../session";
-import { client, kids, settle, struct, TestLink, TestSocket, type, waitFor } from "./harness";
+import {
+	client,
+	joinHead,
+	kids,
+	settle,
+	struct,
+	TestLink,
+	TestSocket,
+	type,
+	waitFor,
+} from "./harness";
 
 const NOW = "2026-10-27T00:00:00.000Z";
 const savedTiming = { ...OUTLINE_LIVE_TIMING };
@@ -355,7 +365,7 @@ describe("access and joins", () => {
 			kind: LIVE_FRAME.join,
 			handle: 70_000,
 			n: 0,
-			head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "view", key: "ghostkey01" },
+			head: joinHead(pageId, "view", "ghostkey01"),
 			body: new Uint8Array(0),
 		});
 		expect(ghost.sent).toEqual([]);
@@ -388,7 +398,7 @@ describe("access and joins", () => {
 				kind: LIVE_FRAME.join,
 				handle: 1,
 				n: 0,
-				head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "view", key: "ratekey001" },
+				head: joinHead(pageId, "view", "ratekey001"),
 				body: new Uint8Array(0),
 			});
 		}
@@ -408,7 +418,7 @@ describe("access and joins", () => {
 			kind: LIVE_FRAME.join,
 			handle: 2,
 			n: 0,
-			head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "view", key: "slowkey001" },
+			head: joinHead(pageId, "view", "slowkey001"),
 			body: new Uint8Array(0),
 		});
 		expect(answers.map((f) => f.kind)).toEqual([LIVE_FRAME.closed]);
@@ -665,7 +675,7 @@ describe("misbehaving clients", () => {
 			kind: LIVE_FRAME.join,
 			handle: 3,
 			n: 0,
-			head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "edit", key: "floodkey01" },
+			head: joinHead(pageId, "edit", "floodkey01"),
 			body: new Uint8Array(0),
 		});
 		let release: () => void = () => {};
@@ -757,7 +767,7 @@ describe("the socket adapter", () => {
 			encodeLiveFrame({
 				kind: LIVE_FRAME.join,
 				handle: 1,
-				head: { v: OUTLINE_LIVE_PROTOCOL_VERSION, page: pageId, mode: "edit", key: "adapterkey1" },
+				head: joinHead(pageId, "edit", "adapterkey1"),
 			}),
 		);
 		await waitFor(() => out.some((f) => f.kind === LIVE_FRAME.joined), 3000, "joined");

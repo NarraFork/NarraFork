@@ -24,7 +24,7 @@ import { ensureProjectSpace } from "../../spaces";
 import type { OutlineSpaceRow } from "../../store/port";
 import { writeOutline } from "../../write";
 import { closeAllLiveSessions, joinLive, liveSessionOf, releaseLiveSocket } from "../registry";
-import { client, forget, settle, TestLink, TestSocket, type, waitFor } from "./harness";
+import { client, forget, joinHead, settle, TestLink, TestSocket, type, waitFor } from "./harness";
 
 const BENCH = process.env.NF_OUTLINE_LIVE_BENCH === "1";
 const NOW = "2026-11-14T00:00:00.000Z";
@@ -119,12 +119,7 @@ test.skipIf(!BENCH)(
 				handle: 1,
 				n: 0,
 				// `v` is the protocol version (ignored by a server that does not know the field).
-				head: {
-					v: OUTLINE_LIVE_PROTOCOL_VERSION,
-					page: pageId,
-					mode: "edit",
-					key: `benchkey${round}0`,
-				},
+				head: joinHead(pageId, "edit", `benchkey${round}0`),
 				body: new Uint8Array(0),
 			});
 			sessionMs.push(performance.now() - t0);

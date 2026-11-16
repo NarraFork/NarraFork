@@ -1,24 +1,23 @@
 /**
- * The live sessions of the process: one per space (`LiveSpace`), who is in which page of it, the
+ * The live sessions of the process: one per space (`LiveSpace`), who watches what in it, the
  * spaces' lanes, the barrier for writes from outside, re-authorization, and the life cycle of
  * sessions.
  *
- * The wire protocol still joins a PAGE (L3 changes it to "join a space, watch parents"): this
- * module and `LiveSpace.join` are where a page-shaped client meets the space's session. Two
- * clients on two pages of one space are in the same session.
+ * A client joins a SPACE with a watch set (protocol version 4, `shared/outline-live-protocol.ts`);
+ * clients of one space are in the same session whatever they watch.
  *
- *   - Join: the page must exist and be readable by the socket's person (a page that does not
- *     exist and one they may not read answer the same `access_denied`); write access decides
- *     editing or viewing. Checked again on every access change (`narrator:access_changed`,
- *     `project:access_changed`, `auth:changed`): losing read ends the participant's session,
- *     losing write turns it into a viewer. A socket whose login session ends is closed by the
- *     WebSocket layer, which ends its participants.
- *   - A space's session opens in the space's lane on the first join; a page's tree is loaded
- *     into it on the first join of that page and unloaded
- *     {@link OUTLINE_LIVE_TIMING.idleCloseMs} after its last participant left (sooner when the
- *     session needs the room). The session closes (committing everything) when its last page
- *     goes, when the outline is switched off, and at shutdown.
- *   - Limits: {@link OUTLINE_LIVE_LIMITS} per socket, page and process, the session's own
+ *   - Join: the space must exist and be readable by the socket's person (a space that does not
+ *     exist and one they may not read answer the same `access_denied`, as does a watched block
+ *     that is not a live block of the space); write access decides editing or viewing. Checked
+ *     again on every access change (`narrator:access_changed`, `project:access_changed`,
+ *     `auth:changed`): losing read ends the participant's session, losing write turns it into a
+ *     viewer. A socket whose login session ends is closed by the WebSocket layer, which ends its
+ *     participants. A client of an older protocol version (it names a page) is told `outdated`.
+ *   - A space's session opens in the space's lane on the first join; a watch is loaded into it
+ *     on its first watcher and unloaded {@link OUTLINE_LIVE_TIMING.idleCloseMs} after its last
+ *     watcher let go (sooner when the session needs the room). The session closes (committing
+ *     everything) when its last watch goes, when the outline is switched off, and at shutdown.
+ *   - Limits: {@link OUTLINE_LIVE_LIMITS} per socket, space and process, the session's own
  *     budgets (`OUTLINE_LIVE_BOUNDS`), and the blocks loaded across the process
  *     ({@link OUTLINE_LIVE_SOCKET_BOUNDS.processBlocks}); joins per socket are rate-limited; a
  *     participant's frames waiting in the lane are bounded in bytes; frames of viewers and of
@@ -34,12 +33,14 @@ import { type LiveTimer, liveNow, liveTimeout } from "@shared/outline-live-clock
 import {
 	encodeLiveFrame,
 	isLiveHandle,
+	isLiveWatch,
 	LIVE_FRAME,
 	type LiveCloseCode,
 	type LiveFrame,
 	type LiveJoinHead,
 	type LiveLostWire,
 	type LivePresenceUp,
+	liveWatchKey,
 	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
@@ -54,9 +55,9 @@ import { type RecoveredChange, replayAllLiveEpochs, replayLiveEpochDetailed } fr
 import {
 	type CommittedEvent,
 	LIVE_SYNC_ACTOR,
-	type LivePageView,
 	type LiveSocket,
 	LiveSpace,
+	type LiveView,
 	OUTLINE_LIVE_TIMING,
 	type Participant,
 } from "./session";
@@ -82,7 +83,7 @@ export const OUTLINE_LIVE_SOCKET_BOUNDS = {
 	/** Ended sessions of one space whose client positions the log keeps. */
 	endedPerSpace: 32,
 	/**
-	 * Blocks all sessions of the process hold in their mirrors at most: a join whose page, once
+	 * Blocks all sessions of the process hold in their mirrors at most: a join or watch that, once
 	 * read, would take them past it is refused (`unavailable`).
 	 */
 	processBlocks: 200_000,
@@ -123,8 +124,8 @@ const state = hotSafe("narrafork.outlineLive.state", () => ({
 /**
  * The log keeps, under epoch {@link ENDED_EPOCH} of a space, one row per ended session (seq =
  * that session's epoch, a sync row with `k` only): how far each client's transactions reached
- * the page. A client that comes back after the session ended (a close, a crash and replay, a
- * restart, a night offline) learns it at its join and does not replay what the page has.
+ * the space. A client that comes back after the session ended (a close, a crash and replay, a
+ * restart, a night offline) learns it at its join and does not replay what the space has.
  */
 export const ENDED_EPOCH = 0;
 
@@ -267,7 +268,7 @@ function takeJoinToken(socket: LiveSocket): boolean {
 	return true;
 }
 
-function scopeCount(): number {
+function watchCount(): number {
 	let n = 0;
 	for (const s of state.sessions.values()) n += s.scopes.size;
 	return n;
@@ -364,14 +365,13 @@ function sendClosed(socket: LiveSocket, handle: number, code: LiveCloseCode, j?:
 	}
 }
 
+/** The space a person may read, and whether they may write it. Null when not (or not there). */
 async function authorize(
 	socket: LiveSocket,
-	pageId: string,
+	spaceId: string,
 ): Promise<{ space: OutlineSpaceRow; canWrite: boolean } | null> {
 	if (!socket.userId) return null;
-	const page = await outlineStore.getBlock(pageId);
-	if (!page || page.deleted || page.parentId !== null || page.pageId !== page.id) return null;
-	const space = await outlineStore.getSpace(page.spaceId);
+	const space = await outlineStore.getSpace(spaceId);
 	if (!space) return null;
 	const principal = { userId: socket.userId, isAdmin: socket.isAdmin };
 	if (!(await canReadSpace(principal, space))) return null;
@@ -380,7 +380,16 @@ async function authorize(
 
 function validJoinHead(head: unknown): LiveJoinHead | null {
 	const h = head as Partial<LiveJoinHead> | null;
-	if (!h || typeof h.page !== "string" || h.page.length === 0 || h.page.length > 128) return null;
+	// A space that is not there (an empty id included) is refused like one the person may not
+	// read: `access_denied`, from `authorize`.
+	if (!h || typeof h.space !== "string" || h.space.length > 128) return null;
+	if (
+		!Array.isArray(h.watch) ||
+		h.watch.length === 0 ||
+		h.watch.length > OUTLINE_LIVE_LIMITS.maxWatch ||
+		!h.watch.every(isLiveWatch)
+	)
+		return null;
 	if (h.mode !== "edit" && h.mode !== "view") return null;
 	if (typeof h.key !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(h.key)) return null;
 	const r = h.resume;
@@ -400,9 +409,9 @@ function validJoinHead(head: unknown): LiveJoinHead | null {
 
 /**
  * Open the session of a space, replaying any log a previous session left. In the lane. A log
- * whose text cannot be committed is taken over by the new session (the pages of that text are
- * loaded into it, people see the text and it is committed with theirs); a log that cannot be
- * read is left for an operator. Neither keeps the space from being edited.
+ * whose text cannot be committed is taken over by the new session (the levels holding that
+ * text are loaded into it, people see the text and it is committed with theirs); a log that
+ * cannot be read is left for an operator. Neither keeps the space from being edited.
  */
 async function openSession(space: OutlineSpaceRow): Promise<LiveSpace> {
 	const existing = state.sessions.get(space.id);
@@ -437,19 +446,29 @@ async function openSession(space: OutlineSpaceRow): Promise<LiveSpace> {
 	state.sessions.set(space.id, opened);
 	state.spaces.set(space.id, space);
 	if (adopted.length > 0) {
-		// The pages of the text taken over are loaded (they unload again once it is committed
-		// and nobody is in them); a page that cannot be loaded keeps its log for the next open.
+		// The blocks of the text taken over are loaded: the level each is in (or, past the
+		// bound, its own subtree), unloaded again once it is committed and nobody watches them; a
+		// block that cannot be loaded keeps its log for the next open.
 		const ids = adopted.flatMap((a) => a.changes.map((c) => c.id));
-		const pages = new Set<string>();
+		const byParent = new Map<string | null, string[]>();
 		for (let at = 0; at < ids.length; at += 200)
 			for (const m of await outlineStore.getBlockMetas(space.id, { ids: ids.slice(at, at + 200) }))
-				if (!m.deleted) pages.add(m.pageId);
+				if (!m.deleted) byParent.set(m.parentId, [...(byParent.get(m.parentId) ?? []), m.id]);
 		let all = true;
-		for (const pageId of pages) {
-			const view = await opened.ensureScope(pageId);
-			if ("refused" in view) all = false;
-			else if (view.participants.size === 0) view.armIdle();
+		const loaded: LiveView[] = [];
+		for (const [parentId, blocks] of byParent) {
+			const level = await opened.ensureView({ l: parentId });
+			if (!("refused" in level)) {
+				loaded.push(level);
+				continue;
+			}
+			for (const id of blocks) {
+				const own = await opened.ensureView({ s: id });
+				if ("refused" in own) all = false;
+				else loaded.push(own);
+			}
 		}
+		for (const view of loaded) if (view.participants.size === 0) view.armIdle();
 		for (const a of adopted) opened.adoptRecovered(a.changes);
 		// Once this session's log holds the text, the old one can go.
 		if (all && (await opened.persistNow())) {
@@ -493,10 +512,11 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 	// A client of another protocol version (a page loaded before an upgrade) cannot be served
 	// and is told so. What it does then is its own code's doing: this version's client keeps
 	// what was typed for the person and asks for a reload (`live-client.ts`, `OutlineSurface`).
+	const named = frame.head as { v?: unknown; page?: unknown; space?: unknown } | null;
 	if (
 		handle !== 0 &&
-		(frame.head as { v?: unknown } | null)?.v !== OUTLINE_LIVE_PROTOCOL_VERSION &&
-		typeof (frame.head as { page?: unknown } | null)?.page === "string"
+		named?.v !== OUTLINE_LIVE_PROTOCOL_VERSION &&
+		(typeof named?.page === "string" || typeof named?.space === "string")
 	)
 		return sendClosed(socket, handle, "outdated", j);
 	const head = validJoinHead(frame.head);
@@ -527,7 +547,7 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 		let checked = 0;
 		for (;;) {
 			checked = state.accessEpoch;
-			verdict = await authorize(socket, head.page);
+			verdict = await authorize(socket, head.space);
 			if (checked === state.accessEpoch) break;
 		}
 		if (!verdict) return sendClosed(socket, handle, "access_denied", j);
@@ -539,15 +559,16 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 			// joined participants never saw this one).
 			while (checked !== state.accessEpoch) {
 				checked = state.accessEpoch;
-				const again = await authorize(socket, head.page);
+				const again = await authorize(socket, head.space);
 				if (!again || again.space.id !== space.id)
 					return { refused: "access_denied" as LiveCloseCode };
 				canWrite = again.canWrite;
 			}
 			if (socket.closed) return { refused: "ended" as LiveCloseCode };
 			const session = await openSession(space);
-			// A page that would have to be loaded: the process's bounds first.
-			if (!session.scopes.has(head.page) && scopeCount() >= OUTLINE_LIVE_LIMITS.livePages) {
+			// Watches that would have to be loaded: the process's bounds first.
+			const fresh = head.watch.filter((w) => !session.scopes.has(liveWatchKey(w))).length;
+			if (fresh > 0 && watchCount() + fresh > OUTLINE_LIVE_LIMITS.liveWatches) {
 				if (session.scopes.size === 0 && session.participants.size === 0)
 					await closeSession(session, "ended", true);
 				return { refused: "unavailable" as LiveCloseCode };
@@ -606,28 +627,28 @@ export function handleLiveFrame(socket: LiveSocket, frame: LiveFrame): void {
 	}
 	const binding = bindingOf(socket, frame.handle);
 	if (!binding) return;
-	const { space: page, participant } = binding;
+	const { space: live, participant } = binding;
 	switch (frame.kind) {
 		case LIVE_FRAME.leave:
 			state.sockets.get(socket)?.delete(frame.handle);
-			void laneFor(page.spaceId).run(() => page.leave(participant));
+			void laneFor(live.spaceId).run(() => live.leave(participant));
 			break;
 		case LIVE_FRAME.update:
 		case LIVE_FRAME.tx: {
 			// Refused participants' frames are dropped and viewers' answered, without queueing.
 			if (participant.blocked) break;
 			if (!participant.canWrite) {
-				page.refuseFrame(participant, frame.n);
+				live.refuseFrame(participant, frame.n);
 				break;
 			}
 			const size = frame.body.length + 256;
 			if (participant.queuedBytes + size > OUTLINE_LIVE_SOCKET_BOUNDS.queuedBytes) {
 				warnRarely("Outline live participant queued too much; dismissed", {
-					spaceId: page.spaceId,
+					spaceId: live.spaceId,
 					bytes: participant.queuedBytes,
 				});
 				state.sockets.get(socket)?.delete(frame.handle);
-				void laneFor(page.spaceId).run(() => page.dismiss(participant, "unavailable"));
+				void laneFor(live.spaceId).run(() => live.dismiss(participant, "unavailable"));
 				break;
 			}
 			participant.queuedBytes += size;
@@ -636,16 +657,44 @@ export function handleLiveFrame(socket: LiveSocket, frame: LiveFrame): void {
 			const head = frame.head;
 			const n = frame.n;
 			const kind = frame.kind;
-			void laneFor(page.spaceId).run(async () => {
+			void laneFor(live.spaceId).run(async () => {
 				participant.queuedBytes -= size;
-				if (kind === LIVE_FRAME.update) page.handleUpdate(participant, n, body);
-				else await page.handleTx(participant, n, head, body);
+				if (kind === LIVE_FRAME.update) live.handleUpdate(participant, n, body);
+				else await live.handleTx(participant, n, head, body);
 			});
 			break;
 		}
 		case LIVE_FRAME.selection:
-			participant.scope.setSelection(participant, (frame.head as LivePresenceUp | null)?.s ?? null);
+			live.setSelection(participant, (frame.head as LivePresenceUp | null)?.s ?? null);
 			break;
+		case LIVE_FRAME.watch: {
+			// Refused participants' frames are dropped: their rejoin names the whole set.
+			if (participant.blocked) break;
+			const head = frame.head;
+			if (watchCount() >= OUTLINE_LIVE_LIMITS.liveWatches) {
+				const add = (head as { add?: unknown } | null)?.add;
+				const w = (head as { w?: unknown } | null)?.w;
+				if (Array.isArray(add) && add.length > 0 && Number.isSafeInteger(w)) {
+					try {
+						socket.send(
+							encodeLiveFrame({
+								kind: LIVE_FRAME.watched,
+								handle: frame.handle,
+								head: {
+									w,
+									refused: add.filter(isLiveWatch).map((x) => [x, "unavailable"]),
+								},
+							}),
+						);
+					} catch {
+						// The socket is gone.
+					}
+					break;
+				}
+			}
+			void laneFor(live.spaceId).run(() => live.handleWatch(participant, head));
+			break;
+		}
 		default:
 			break;
 	}
@@ -657,15 +706,15 @@ export function releaseLiveSocket(socket: LiveSocket): void {
 	state.sockets.delete(socket);
 	state.joining.delete(socket);
 	if (!bindings) return;
-	for (const { space: page, participant } of bindings.values()) {
-		void laneFor(page.spaceId).run(() => page.leave(participant));
+	for (const { space: live, participant } of bindings.values()) {
+		void laneFor(live.spaceId).run(() => live.leave(participant));
 	}
 }
 
 /** The socket drained: participants that fell behind are told to rejoin. */
 export function drainLiveSocket(socket: LiveSocket): void {
-	for (const { space: page, participant } of state.sockets.get(socket)?.values() ?? []) {
-		page.onDrain(participant);
+	for (const { space: live, participant } of state.sockets.get(socket)?.values() ?? []) {
+		live.onDrain(participant);
 	}
 }
 
@@ -700,13 +749,13 @@ async function reauthorize(): Promise<void> {
 			}
 			const { read, write } = await verdict;
 			if (bindings.get(handle) !== binding) continue;
-			const { space: page, participant } = binding;
+			const { space: live, participant } = binding;
 			if (!read) {
 				bindings.delete(handle);
-				void laneFor(page.spaceId).run(() => page.dismiss(participant, "access_denied"));
+				void laneFor(live.spaceId).run(() => live.dismiss(participant, "access_denied"));
 			} else {
-				void laneFor(page.spaceId).run(() =>
-					page.setWrite(participant, participant.wantsEdit && write),
+				void laneFor(live.spaceId).run(() =>
+					live.setWrite(participant, participant.wantsEdit && write),
 				);
 			}
 		}
@@ -753,7 +802,7 @@ export function onOutlineLiveAccessEvent(event: NarraForkEvent): void {
 export async function closeAllLiveSessions(code: LiveCloseCode): Promise<void> {
 	const sessions = [...state.sessions.values()];
 	await Promise.all(
-		sessions.map((page) => laneFor(page.spaceId).run(() => closeSession(page, code))),
+		sessions.map((live) => laneFor(live.spaceId).run(() => closeSession(live, code))),
 	);
 }
 
@@ -763,9 +812,9 @@ export async function closeAllLiveSessions(code: LiveCloseCode): Promise<void> {
  */
 export async function persistAllLiveSessions(): Promise<void> {
 	await Promise.all(
-		[...state.sessions.values()].map(async (page) => {
-			await page.persistNow();
-			page.flushBroadcast();
+		[...state.sessions.values()].map(async (live) => {
+			await live.persistNow();
+			live.flushBroadcast();
 		}),
 	);
 }
@@ -829,8 +878,8 @@ export function startLiveReplay(): Promise<unknown> {
 }
 
 /**
- * Counts for tests and diagnostics. `sessions` counts the pages people have joined (each a
- * loaded tree; what a session was before L2), `spaces` the sessions themselves.
+ * Counts for tests and diagnostics. `sessions` counts the watches loaded (what a session was
+ * before L2: a page's tree), `spaces` the sessions themselves.
  */
 export function outlineLiveStats(): {
 	sessions: number;
@@ -848,7 +897,7 @@ export function outlineLiveStats(): {
 		documents += s.textDocs;
 	}
 	return {
-		sessions: scopeCount(),
+		sessions: watchCount(),
 		spaces: state.sessions.size,
 		lanes: state.lanes.size,
 		sockets: state.sockets.size,
@@ -865,9 +914,9 @@ export function outlineLiveQuiet(): boolean {
 	return true;
 }
 
-/** Drop the session of a page's space as if the process had died (tests of the replay). */
-export function abandonLiveSessionForTests(pageId: string): void {
-	const session = liveSessionOf(pageId)?.space;
+/** Drop the session of a block's space as if the process had died (tests of the replay). */
+export function abandonLiveSessionForTests(rootId: string): void {
+	const session = liveSessionOf(rootId)?.space;
 	if (!session) return;
 	session.abandon();
 	state.sessions.delete(session.spaceId);
@@ -883,10 +932,10 @@ export function forgetEndedSessionsForTests(): void {
 	state.recovered.clear();
 }
 
-/** A page's view in its space's session, if the page is loaded (tests and diagnostics). */
-export function liveSessionOf(pageId: string): LivePageView | undefined {
+/** The watch of a block's subtree in its space's session, if loaded (tests and diagnostics). */
+export function liveSessionOf(rootId: string): LiveView | undefined {
 	for (const session of state.sessions.values()) {
-		const view = session.scopes.get(pageId);
+		const view = session.scopes.get(liveWatchKey({ s: rootId }));
 		if (view) return view;
 	}
 	return undefined;
@@ -903,7 +952,7 @@ export function runInLane<T>(spaceId: string, fn: () => Promise<T> | T): Promise
 }
 
 /**
- * A narrator's run started or ended: the pages whose agents may change with it work them out
+ * A narrator's run started or ended: the watches whose agents may change with it work them out
  * again (agent presence, P2 PR 10b: only running sessions are shown).
  */
 function onNarratorStatus(

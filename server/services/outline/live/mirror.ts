@@ -1,29 +1,27 @@
 /**
- * A space's live session's copy of the structure it has loaded: blocks by id and by parent.
+ * A space's live session's copy of the structure it has loaded: blocks by id and by parent (the
+ * top-level blocks under {@link TOP_KEY}).
  *
  * WHAT IS LOADED
  * --------------
- * The mirror is keyed by parent: a parent is LOADED when every live child it has in the blocks
- * table is here ({@link SpaceMirror.isLoaded}: every block of a root's tree is, since a tree is
- * loaded whole; other parents are marked one by one). Parents are loaded on demand and unloaded when
- * nobody needs them, so the mirror's size follows what participants have open, never the size of
- * the space. A top-level block whose whole subtree is loaded and that participants may join is a
- * ROOT (today's wire protocol joins a page: every parent under the page is loaded with it).
+ * What participants watch (`session.ts` `LiveView`): whole subtrees and single levels. A parent
+ * is LOADED when every live child it has in the blocks table is here: a parent inside a watched
+ * subtree, or a watched level's parent (the top level included). Which parents are loaded is the
+ * session's to say (it knows the watches); the mirror only holds blocks. Watches are loaded on
+ * demand and unloaded when nobody needs them, so the mirror's size follows what participants
+ * show, never the size of the space. The parent of a watched subtree's root and of a watched
+ * level need not be here.
  *
- * Besides live blocks the mirror keeps the deleted ones it has seen under loaded parents (a
- * block deleted in the session, or moved to a parent that is not loaded): undoing a delete
- * brings a block back with the text it had. They go when their tree is unloaded.
+ * Besides live blocks the mirror keeps the deleted ones it has seen in a watched area (a block
+ * deleted in the session, or moved to a parent that is not loaded): undoing a delete brings a
+ * block back with the text it had. They go when no watch covers them any more.
  *
  * Between two lane tasks the loaded part matches the blocks table, except that a block's text
  * may be ahead in the block's text document (`dbContent` is what the database has, and the live
  * text of every block that has no document).
  */
 import { compareOrderKeys } from "@shared/outline";
-import {
-	LIVE_TASK_OF_STATUS,
-	type LiveBlockWire,
-	type LiveTaskChar,
-} from "@shared/outline-live-protocol";
+import { LIVE_TASK_OF_STATUS, type LiveTaskChar } from "@shared/outline-live-protocol";
 import type { OutlineTaskJson } from "../model";
 
 export interface MirrorBlock {
@@ -45,13 +43,31 @@ export interface MirrorBlock {
 	 */
 	gen: number;
 	/**
-	 * The page (root) whose people hold the block's text: they were sent it whole (in a snapshot,
-	 * or when the block came into their tree) and get every update and drop of it since. Empty:
-	 * nobody. It is what text is routed by, and it changes only at the one place a page is sent a
-	 * block's text whole (`LiveSpace.tell`), so no path can show a page a block without its text.
-	 * A deleted block carried to another tree under its moved parent is held by nobody.
+	 * The watches whose participants hold the block's text: they were sent it whole (in a
+	 * snapshot, or when the block came into what they watch) and get every update and drop of it
+	 * since. Empty: nobody. Text is routed by it (to every participant with one of these watches),
+	 * and a watch is added only at the one place a watch is sent a block's text whole
+	 * (`LiveSpace.tell`), so no path can show a block without its text. A watch is taken off when
+	 * the block leaves what it covers (moved away, or a deleted block carried away under its moved
+	 * parent); a block deleted where a watch covers it stays held (undoing the delete).
 	 */
-	held: string;
+	held: readonly HeldBy[];
+}
+
+/** What holds a block's text: a watch of the session (`session.ts` `LiveView`). */
+export interface HeldBy {
+	readonly key: string;
+}
+
+/** Nobody holds the text. */
+export const HELD_BY_NOBODY: readonly HeldBy[] = Object.freeze([]);
+
+/** The parent key of the top-level blocks (block ids are never empty). */
+export const TOP_KEY = "";
+
+/** A parent's key in the mirror: its id, or {@link TOP_KEY} for the top level. */
+export function parentKeyOf(parentId: string | null): string {
+	return parentId ?? TOP_KEY;
 }
 
 export function taskCharOf(task: OutlineTaskJson | null): LiveTaskChar | null {
@@ -63,11 +79,9 @@ const MAX_DEPTH = 10_000;
 
 export class SpaceMirror {
 	private readonly blocks = new Map<string, MirrorBlock>();
-	/** Children by parent, deleted ones included. */
+	/** Children by parent key ({@link parentKeyOf}), deleted ones included. */
 	private readonly kids = new Map<string, Set<string>>();
 	private readonly sorted = new Map<string, string[]>();
-	private readonly roots = new Set<string>();
-	private readonly loaded = new Set<string>();
 	/** UTF-16 units of all `dbContent` held (a budget's measure, not exact bytes). */
 	chars = 0;
 
@@ -88,67 +102,27 @@ export class SpaceMirror {
 		yield* this.blocks.values();
 	}
 
-	// ── what is loaded ────────────────────────────────────────────────────────
-
-	/**
-	 * Every live child of `parentId` is here: it is in a root's tree (loaded whole), or was
-	 * marked on its own.
-	 */
-	isLoaded(parentId: string): boolean {
-		if (this.loaded.has(parentId)) return true;
-		const top = this.topOf(parentId);
-		return top !== null && this.roots.has(top);
-	}
-
-	markLoaded(parentId: string): void {
-		this.loaded.add(parentId);
-	}
-
-	unmarkLoaded(parentId: string): void {
-		this.loaded.delete(parentId);
-	}
-
-	get loadedParents(): number {
-		return this.loaded.size;
-	}
-
-	isRoot(id: string): boolean {
-		return this.roots.has(id);
-	}
-
-	markRoot(id: string): void {
-		this.roots.add(id);
-	}
-
-	unmarkRoot(id: string): void {
-		this.roots.delete(id);
-	}
-
-	get rootIds(): string[] {
-		return [...this.roots];
-	}
-
 	// ── changing ──────────────────────────────────────────────────────────────
 
 	private link(b: MirrorBlock): void {
-		if (b.parentId === null) return;
-		let set = this.kids.get(b.parentId);
+		const key = parentKeyOf(b.parentId);
+		let set = this.kids.get(key);
 		if (!set) {
 			set = new Set();
-			this.kids.set(b.parentId, set);
+			this.kids.set(key, set);
 		}
 		set.add(b.id);
-		this.sorted.delete(b.parentId);
+		this.sorted.delete(key);
 	}
 
 	private unlink(b: MirrorBlock): void {
-		if (b.parentId === null) return;
-		const set = this.kids.get(b.parentId);
+		const key = parentKeyOf(b.parentId);
+		const set = this.kids.get(key);
 		if (set) {
 			set.delete(b.id);
-			if (set.size === 0) this.kids.delete(b.parentId);
+			if (set.size === 0) this.kids.delete(key);
 		}
-		this.sorted.delete(b.parentId);
+		this.sorted.delete(key);
 	}
 
 	put(b: MirrorBlock): void {
@@ -161,7 +135,7 @@ export class SpaceMirror {
 		this.chars += b.dbContent.length;
 		this.link(b);
 		// Liveness changes which children a parent lists.
-		if (old && old.deleted !== b.deleted && b.parentId !== null) this.sorted.delete(b.parentId);
+		if (old && old.deleted !== b.deleted) this.sorted.delete(parentKeyOf(b.parentId));
 	}
 
 	update(id: string, patch: Partial<Omit<MirrorBlock, "id">>): void {
@@ -177,24 +151,28 @@ export class SpaceMirror {
 		this.blocks.delete(id);
 		this.chars -= b.dbContent.length;
 		this.sorted.delete(id);
-		this.loaded.delete(id);
-		this.roots.delete(id);
 	}
 
 	// ── reading ───────────────────────────────────────────────────────────────
 
-	/** Live children in sibling order (order key, then id). */
-	children(parentId: string): string[] {
-		let list = this.sorted.get(parentId);
+	/** Live children in sibling order (order key, then id); `null`: the top-level blocks held. */
+	children(parentId: string | null): string[] {
+		const key = parentKeyOf(parentId);
+		let list = this.sorted.get(key);
 		if (list) return list;
-		list = [...(this.kids.get(parentId) ?? [])].filter((id) => !this.blocks.get(id)?.deleted);
+		list = [...(this.kids.get(key) ?? [])].filter((id) => !this.blocks.get(id)?.deleted);
 		list.sort((a, b) => {
 			const ka = this.blocks.get(a)?.orderKey ?? "";
 			const kb = this.blocks.get(b)?.orderKey ?? "";
 			return compareOrderKeys(ka, kb) || (a < b ? -1 : a > b ? 1 : 0);
 		});
-		this.sorted.set(parentId, list);
+		this.sorted.set(key, list);
 		return list;
+	}
+
+	/** Every child the mirror holds of a parent (`null`: the top level), deleted ones included. */
+	childrenAll(parentId: string | null): string[] {
+		return [...(this.kids.get(parentKeyOf(parentId)) ?? [])];
 	}
 
 	/** The block and its live descendants, parents first. */
@@ -219,6 +197,14 @@ export class SpaceMirror {
 			out.push(next);
 			for (const kid of this.kids.get(next) ?? []) stack.push(kid);
 		}
+		return out;
+	}
+
+	/** Every block the mirror holds whose parent the mirror does not hold (diagnostics). */
+	get roots(): string[] {
+		const out: string[] = [];
+		for (const b of this.blocks.values())
+			if (b.parentId === null || !this.blocks.has(b.parentId)) out.push(b.id);
 		return out;
 	}
 
@@ -248,43 +234,11 @@ export class SpaceMirror {
 		return null;
 	}
 
-	/** The root whose tree a live block is in (through live parents), or null. */
-	rootOf(id: string): string | null {
-		let cur: string | null = id;
-		for (let guard = 0; cur && guard < MAX_DEPTH; guard++) {
-			const b = this.blocks.get(cur);
-			if (!b || b.deleted) return null;
-			if (b.parentId === null) return this.roots.has(cur) ? cur : null;
-			cur = b.parentId;
-		}
-		return null;
-	}
-
-	/** Depth below the top-level block (which is 0). */
+	/** Steps up to the highest block the mirror holds above `id` (0: none above it). */
 	depth(id: string): number {
 		let d = 0;
 		let cur = this.blocks.get(id)?.parentId ?? null;
 		for (; cur && d < MAX_DEPTH; d++) cur = this.blocks.get(cur)?.parentId ?? null;
 		return d;
-	}
-
-	/** Live blocks of a root's tree, parents first, as the join snapshot sends them. */
-	snapshot(rootId: string): LiveBlockWire[] {
-		const out: LiveBlockWire[] = [];
-		const index = new Map<string, number>();
-		for (const id of this.subtree(rootId)) {
-			const b = this.blocks.get(id) as MirrorBlock;
-			index.set(id, out.length);
-			const row: LiveBlockWire = [
-				b.id,
-				b.parentId === null ? -1 : (index.get(b.parentId) ?? -1),
-				b.orderKey,
-				b.sid,
-				taskCharOf(b.taskJson) ?? "",
-			];
-			if (b.question) row.push(1);
-			out.push(row);
-		}
-		return out;
 	}
 }

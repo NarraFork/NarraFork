@@ -1,7 +1,10 @@
 /**
- * The editor's copy of a page's structure (the block model is the truth, design §6.7): id,
- * parent, sibling order key, checkbox. Text is not here: each block's text lives in a document
- * of its own (`live-client.ts`), whatever the block's place in this structure.
+ * The editor's copy of the structure its watch set shows (the block model is the truth, design
+ * §6.7): id, parent, sibling order key, checkbox. Text is not here: each block's text lives in a
+ * document of its own (`live-client.ts`), whatever the block's place in this structure.
+ *
+ * What is shown is reached from the client's root (`pageId`, the root it shows) or from another
+ * watched subtree's root, or sits under a watched level's parent ({@link StoreScope}).
  *
  * Operations return their inverse, which the undo stack keeps. Ported from the editor prototype
  * (`prototypes/outline-editor/src/model/store.ts`), with content moved out to Yjs.
@@ -11,7 +14,7 @@ import type { LiveOp, LiveTaskChar } from "@shared/outline-live-protocol";
 
 export interface BlockRec {
 	id: string;
-	/** Null for the page itself. */
+	/** Null for a top-level block (the parent of a watched root need not be here). */
 	parentId: string | null;
 	orderKey: string;
 	task: LiveTaskChar | null;
@@ -49,21 +52,42 @@ export function wireOp(op: ClientOp): LiveOp {
 	return wire;
 }
 
+/**
+ * What a client watches, as its stores read it (shared by them, changed in place by the
+ * client): roots of watched subtrees, and parents of watched levels ("" for the top level).
+ */
+export interface StoreScope {
+	roots: Set<string>;
+	levels: Set<string>;
+}
+
 export class Store {
 	readonly blocks = new Map<string, BlockRec>();
 	private readonly kids = new Map<string, Set<string>>();
 	private readonly sorted = new Map<string, string[]>();
 
-	constructor(readonly pageId: string) {}
+	constructor(
+		readonly pageId: string,
+		readonly scope: StoreScope = { roots: new Set([pageId]), levels: new Set() },
+	) {}
 
-	static from(pageId: string, recs: Iterable<BlockRec>): Store {
-		const s = new Store(pageId);
+	static from(pageId: string, recs: Iterable<BlockRec>, scope?: StoreScope): Store {
+		const s = new Store(pageId, scope);
 		for (const r of recs) s.put({ ...r });
 		return s;
 	}
 
 	clone(): Store {
-		return Store.from(this.pageId, this.blocks.values());
+		return Store.from(this.pageId, this.blocks.values(), this.scope);
+	}
+
+	/** Forget a block (it is no longer shown: a watch was removed). */
+	remove(id: string): void {
+		const b = this.blocks.get(id);
+		if (!b) return;
+		this.unlink(b);
+		this.blocks.delete(id);
+		this.sorted.delete(id);
 	}
 
 	get(id: string): BlockRec | undefined {
@@ -124,16 +148,26 @@ export class Store {
 		return false;
 	}
 
-	/** Whether a block is live and reachable from the page through live parents. */
+	/**
+	 * Whether a block is live and shown: reachable through live parents from the root or another
+	 * watched subtree's root, or under a watched level's parent.
+	 */
 	inPage(id: string): boolean {
 		let cur: string | null = id;
 		for (let guard = 0; cur && guard < 10_000; guard++) {
 			const b = this.blocks.get(cur);
 			if (!b || b.deleted) return false;
-			if (cur === this.pageId) return true;
+			if (cur === this.pageId || this.scope.roots.has(cur)) return true;
+			if (this.scope.levels.has(b.parentId ?? "")) return true;
 			cur = b.parentId;
 		}
 		return false;
+	}
+
+	/** Whether a block may be put under a parent: one shown, a watched level's, the top level's. */
+	open(parentId: string | null): boolean {
+		if (this.scope.levels.has(parentId ?? "")) return true;
+		return parentId !== null && this.inPage(parentId);
 	}
 
 	subtree(id: string): string[] {
@@ -169,7 +203,7 @@ export class Store {
 			case "m": {
 				const b = this.blocks.get(op.id);
 				if (!b) return null;
-				const inv: ClientOp = { t: "m", id: op.id, p: b.parentId ?? "", k: b.orderKey };
+				const inv: ClientOp = { t: "m", id: op.id, p: b.parentId, k: b.orderKey };
 				this.put({ ...b, parentId: op.p, orderKey: op.k });
 				return inv;
 			}
@@ -179,7 +213,7 @@ export class Store {
 				const inv: ClientOp = {
 					t: "i",
 					id: b.id,
-					p: b.parentId ?? "",
+					p: b.parentId,
 					k: b.orderKey,
 					task: b.task,
 					...(b.question ? { q: true as const } : {}),
