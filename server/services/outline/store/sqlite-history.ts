@@ -23,12 +23,14 @@ import { sqlite } from "../../../db";
 import type { OutlineAskJson, OutlineSpaceKind, OutlineTaskJson } from "../model";
 import {
 	assertHistoryReadable,
+	type OutlineAncestorRow,
 	type OutlineChangedChildRow,
 	type OutlineEdgeRow,
 	type OutlineHistoryPort,
 	type OutlineHistoryState,
 	type OutlineLevelCursor,
 	type OutlineLevelRow,
+	type OutlineParentRow,
 	type OutlineSubtreeChange,
 	pageChangedChildren,
 	readSubtreeByLevels,
@@ -203,6 +205,80 @@ export const SQLITE_SUBTREE_CHANGE_SEQS = `SELECT seq FROM outline_subtree_chang
 	WHERE ancestor_id = ?1 AND seq < ?2 AND seq > ?3 AND ${IN_SPACE("?1", "?5")}
 	ORDER BY seq DESC LIMIT ?4`;
 
+const LOCKED = (alias: string) => `json_extract(${alias}.task_json, '$.lock') IS NOT NULL`;
+
+/**
+ * The block `?1` and its ancestors as the tree is now, nearest first: up the parent column by
+ * primary key (a scalar subquery per step, so there is nothing to reorder), at most `?2 + 2`
+ * rows. Each row carries its space and whether it is deleted; the caller checks them.
+ */
+export const SQLITE_ANCESTRY_NOW = `WITH RECURSIVE up(id, depth) AS (
+		SELECT ?1, 0
+		UNION ALL
+		SELECT (SELECT p.parent_id FROM outline_blocks p WHERE p.id = up.id), up.depth + 1
+		FROM up WHERE up.id IS NOT NULL AND up.depth <= ?2
+	)
+	SELECT b.id, b.sid, b.parent_id, b.space_id, b.deleted, b.task_json IS NOT NULL,
+		b.ask_json IS NOT NULL, ${LOCKED("b")}
+	FROM up CROSS JOIN outline_blocks b ON b.id = up.id
+	ORDER BY up.depth`;
+
+/**
+ * The block `?1` of the space `?3` and its ancestors as of the seq `?2`, nearest first: up
+ * the placements valid then (one backward seek on `idx_outline_edges_block` per step), each
+ * with the block's sid and its version valid then, by primary key. The last row is the space
+ * itself when the walk reached it, and a row without an id when a placement was missing. At
+ * most `?4 + 3` rows.
+ */
+export const SQLITE_ANCESTRY_AS_OF = `WITH RECURSIVE up(id, depth) AS (
+		SELECT ?1, 0
+		UNION ALL
+		SELECT (SELECT e.parent_key FROM outline_block_edges e INDEXED BY idx_outline_edges_block
+				WHERE e.block_id = up.id AND e.from_seq <= ?2 AND (e.to_seq IS NULL OR e.to_seq > ?2)
+				ORDER BY e.from_seq DESC LIMIT 1),
+			up.depth + 1
+		FROM up WHERE up.id IS NOT NULL AND up.id <> ?3 AND up.depth <= ?4
+	)
+	SELECT up.id, b.sid, v.deleted, v.task_json IS NOT NULL, v.ask_json IS NOT NULL, ${LOCKED("v")}
+	FROM up
+	LEFT JOIN outline_blocks b ON b.id = up.id AND b.space_id = ?3
+	LEFT JOIN outline_block_versions v ON v.block_id = up.id
+		AND v.from_seq = (SELECT max(x.from_seq) FROM outline_block_versions x
+			WHERE x.block_id = up.id AND x.from_seq <= ?2)
+	ORDER BY up.depth`;
+
+/**
+ * The blocks whose ids are the JSON array `?1` that are live blocks of the space `?3`, and
+ * every ancestor of them, each once: up the parent column by primary key, the `CROSS JOIN`s
+ * keeping it that way round (as the commit's change marks, {@link sqliteMarkAncestorsSql}).
+ * Ids that are deleted, of another space or of nothing start no walk, so they use up none of
+ * the `?2` rows. Each row carries its space and whether it is deleted, and the caller keeps
+ * the live blocks of its space. The ids are probed one by one from the JSON list and the
+ * space is only a filter on the row found: with `id IN (…) AND space_id = ?` as the search,
+ * SQLite walked the whole space by an index on it (measured: 475 ms for 750 ids in a space
+ * of 100,000 blocks, against 2 ms).
+ */
+export const SQLITE_ANCESTRY_OF = `WITH RECURSIVE up(id) AS (
+		SELECT s.id FROM json_each(?1) j CROSS JOIN outline_blocks s ON s.id = j.value
+			WHERE s.space_id = ?3 AND s.deleted = 0
+		UNION
+		SELECT b.parent_id FROM up CROSS JOIN outline_blocks b
+			ON b.id = up.id WHERE b.parent_id IS NOT NULL
+	)
+	SELECT b.id, b.parent_id, b.space_id, b.deleted, ${LOCKED("b")}
+	FROM up CROSS JOIN outline_blocks b ON b.id = up.id
+	LIMIT ?2`;
+
+/**
+ * The live locked tasks of the space `?1`, at most `?2`: the partial lock index (its
+ * predicate word for word), every space's rows walked and this space's kept; see
+ * `OutlineHistoryPort.listLockedOfSpace`.
+ */
+export const SQLITE_TASK_LOCKS_OF_SPACE = `SELECT b.id, b.parent_id
+	FROM outline_blocks b INDEXED BY idx_outline_blocks_locked
+	WHERE json_extract("task_json", '$.lock') IS NOT NULL AND "deleted" = 0 AND b.space_id = ?1
+	LIMIT ?2`;
+
 /** The next sids of a space after `?2`, in sid order (the space-and-sid unique index). */
 export const SQLITE_BACKFILL_SCAN = `SELECT sid FROM outline_blocks
 	WHERE space_id = ?1 AND sid > ?2 ORDER BY sid LIMIT ?3`;
@@ -237,7 +313,7 @@ export function sqliteMarkAncestorsSql(seq: number, limit: number): string {
 		WHERE NOT EXISTS (SELECT 1 FROM outline_subtree_changes m
 			WHERE m.ancestor_id = up.id AND m.seq = ${seq})
 		LIMIT ${limit}
-		RETURNING 1`;
+		RETURNING ancestor_id`;
 }
 /** Where the bound ids go in {@link sqliteMarkAncestorsSql}. */
 export const SQLITE_IDS_SLOT = "/*ids*/";
@@ -369,6 +445,80 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 				});
 			}
 			return out;
+		},
+
+		async getAncestry(spaceId, blockId, { asOf, maxDepth }) {
+			const flag = (value: unknown) => Number(value) !== 0;
+			if (asOf === null) {
+				const rows = values(SQLITE_ANCESTRY_NOW, [blockId, maxDepth]) as Array<
+					[string, string, string | null, string, number, number, number, number]
+				>;
+				const last = rows.at(-1);
+				// The walk must end at a top-level block, through live blocks of the space only.
+				if (!last || last[2] !== null || rows.length > maxDepth + 1) return null;
+				if (rows.some((row) => row[3] !== spaceId || flag(row[4]))) return null;
+				return rows.map(
+					(row): OutlineAncestorRow => ({
+						id: row[0],
+						sid: row[1],
+						isTask: flag(row[5]),
+						isAsk: flag(row[6]),
+						locked: flag(row[7]),
+					}),
+				);
+			}
+			if (!readable(spaceId, asOf)) return null;
+			const rows = values(SQLITE_ANCESTRY_AS_OF, [blockId, asOf, spaceId, maxDepth]) as Array<
+				[string | null, string | null, number | null, number, number, number]
+			>;
+			// The walk must end at the space itself, through blocks of the space only.
+			if (rows.length < 2 || rows.at(-1)?.[0] !== spaceId || rows.length > maxDepth + 2)
+				return null;
+			const chain = rows.slice(0, -1);
+			if (chain.some((row) => row[0] === null || row[1] === null || row[2] === null)) return null;
+			// The block itself must not be a tombstone then (an ancestor of a live block never is).
+			if (flag(chain[0]?.[2])) return null;
+			return chain.map(
+				(row): OutlineAncestorRow => ({
+					id: row[0] as string,
+					sid: row[1] as string,
+					isTask: flag(row[3]),
+					isAsk: flag(row[4]),
+					locked: flag(row[5]),
+				}),
+			);
+		},
+
+		async listAncestryOf(spaceId, blockIds, limit) {
+			const max = Math.max(0, Math.floor(limit));
+			const seen = new Map<string, OutlineParentRow>();
+			let truncated = false;
+			for (const chunk of chunked([...new Set(blockIds)])) {
+				const room = max - seen.size;
+				if (room <= 0) {
+					truncated = true;
+					break;
+				}
+				const rows = values(SQLITE_ANCESTRY_OF, [
+					JSON.stringify(chunk),
+					room + 1,
+					spaceId,
+				]) as Array<[string, string | null, string, number, number]>;
+				if (rows.length > room) truncated = true;
+				for (const row of rows.slice(0, room)) {
+					if (row[2] !== spaceId || Number(row[3]) !== 0) continue;
+					seen.set(row[0], { id: row[0], parentId: row[1], locked: Number(row[4]) !== 0 });
+				}
+			}
+			return { rows: [...seen.values()], truncated };
+		},
+
+		async listLockedOfSpace(spaceId, limit) {
+			return (
+				values(SQLITE_TASK_LOCKS_OF_SPACE, [spaceId, Math.max(0, Math.floor(limit))]) as Array<
+					[string, string | null]
+				>
+			).map((row) => ({ id: row[0], parentId: row[1], locked: true }));
 		},
 
 		async findSubtreeChanges(spaceId, blockIds, { after, upTo }) {

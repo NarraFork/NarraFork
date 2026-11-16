@@ -466,6 +466,16 @@ export const OUTLINE_PLACEMENT_FLAGS = 1 | 4 | 8 | 16;
  */
 export const OUTLINE_HISTORY_LIMITS: { maxChangeMarks: number } = { maxChangeMarks: 4000 };
 
+/** What `applyCommit` reports of a commit it wrote. */
+export interface OutlineCommitApplied {
+	/**
+	 * The ancestors the commit marked as changed (`outline_subtree_changes`): every ancestor,
+	 * before and after, of every block it gave a version, each once, in no order. At most
+	 * {@link OUTLINE_HISTORY_LIMITS}. What "something changed under this block" is told from.
+	 */
+	markedAncestorIds: string[];
+}
+
 /** A commit would mark more ancestors than {@link OUTLINE_HISTORY_LIMITS} allows; nothing was written. */
 export class OutlineChangeMarksLimitError extends Error {
 	constructor(readonly spaceId: string) {
@@ -739,8 +749,11 @@ export interface OutlineStore
 		options: { limit: number; afterSeq?: number },
 	): Promise<OutlineCommitRow[]>;
 
-	/** Write one commit atomically; see {@link OutlineCommitPlan} and the header contract. */
-	applyCommit(plan: OutlineCommitPlan): Promise<void>;
+	/**
+	 * Write one commit atomically; see {@link OutlineCommitPlan} and the header contract.
+	 * Resolves with what only the atomic section knows of it ({@link OutlineCommitApplied}).
+	 */
+	applyCommit(plan: OutlineCommitPlan): Promise<OutlineCommitApplied>;
 
 	// ── tasks (`services/outline/tasks.ts`) ─────────────────────────────────────────────
 	// Claims are written by `applyCommit`, and outside a commit only by a session renewing its own
