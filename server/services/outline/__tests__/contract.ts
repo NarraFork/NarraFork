@@ -583,6 +583,16 @@ export async function randomizedHistory(
 		const before = structuredClone([...model.entries()]);
 		const beforePages = [...pages];
 		const beforeGraveyard = structuredClone([...graveyard.entries()]);
+		// Tags are link rows only, and a deleted block has none: the tags a block comes back
+		// with are the ones the last commit before its deletion left it. Tags replaced by the very
+		// transaction that deletes it are recorded nowhere (its text is: the block's row keeps it).
+		const committedTags = new Map<string, string[]>([
+			...before.map(([handle, block]): [string, string[]] => [handle, block.tags]),
+			...beforeGraveyard.map(([handle, gone]): [string, string[]] => [handle, gone.tags]),
+		]);
+		/** Deleted by this transaction: the tags they had then, kept if it restores them itself. */
+		const deletedNow = new Map<string, string[]>();
+		const wasDeleted = new Set(beforeGraveyard.map(([handle]) => handle));
 		const ops: OutlineOp[] = [];
 		/** New blocks of this transaction: the insert itself, or the n-th block its content split off. */
 		const created: Array<{ op: number; handle: string; split?: number }> = [];
@@ -707,14 +717,16 @@ export async function randomizedHistory(
 				for (const handle of subtree(target.handle)) {
 					const gone = model.get(handle) as ModelBlock;
 					// Restorable later: blocks that existed before this transaction.
-					if (!handle.startsWith("tmp:") && !gone.pending && gone.sid)
+					if (!handle.startsWith("tmp:") && !gone.pending && gone.sid) {
 						graveyard.set(handle, {
 							sid: gone.sid,
 							content: gone.content,
 							task: gone.task,
 							alias: gone.alias,
-							tags: gone.tags,
+							tags: committedTags.get(handle) ?? gone.tags,
 						});
+						deletedNow.set(handle, gone.tags);
+					}
 					model.delete(handle);
 				}
 			} else if (roll < 0.92 && graveyard.size > 0) {
@@ -731,6 +743,9 @@ export async function randomizedHistory(
 				});
 				const alias =
 					gone.alias !== null && !live().some((b) => b.alias === gone.alias) ? gone.alias : null;
+				// Deleted and restored by one transaction, it was never deleted in the tables: the
+				// tags this transaction gave it stand.
+				const tags = (wasDeleted.has(id) ? undefined : deletedNow.get(id)) ?? gone.tags;
 				model.set(id, {
 					handle: id,
 					parent,
@@ -738,7 +753,7 @@ export async function randomizedHistory(
 					content: gone.content,
 					task: gone.task,
 					alias,
-					tags: gone.tags,
+					tags,
 					sid: gone.sid,
 				});
 				childrenOf(parent).push(id);
@@ -845,16 +860,39 @@ export async function randomizedHistory(
 				{ commitId: result.commit.id, actor: ACTOR, responsibleUserId: null },
 				{ store: ctx.store },
 			);
-			if (reverted.skipped.length > 0 || !reverted.commit)
+			if (reverted.skipped.length > 0)
 				throw new Error(
 					`seed ${seed}, transaction ${t}: reverting the last commit left ${JSON.stringify(reverted.skipped)}`,
 				);
+			// A block the commit restored is deleted again by the revert, as the commit left it:
+			// that, not what it was before the commit, is what a later restore brings back.
+			const restoredThen = new Map<string, ModelBlock>();
+			for (const [handle] of beforeGraveyard) {
+				const block = model.get(handle);
+				if (block) restoredThen.set(handle, block);
+			}
 			model.clear();
 			for (const [handle, block] of before) model.set(handle, block);
 			pages.splice(0, pages.length, ...beforePages);
 			graveyard.clear();
-			for (const [handle, gone] of beforeGraveyard) graveyard.set(handle, gone);
-			snapshots.set(reverted.commit.seq, await compare("after reverting it"));
+			for (const [handle, gone] of beforeGraveyard) {
+				const left = restoredThen.get(handle);
+				graveyard.set(
+					handle,
+					left
+						? {
+								...gone,
+								content: left.content,
+								task: left.task,
+								alias: left.alias,
+								tags: left.tags,
+							}
+						: gone,
+				);
+			}
+			// A commit that only made blocks and deleted them again has nothing to put back.
+			const back = await compare("after reverting it");
+			if (reverted.commit) snapshots.set(reverted.commit.seq, back);
 		}
 	}
 
@@ -2164,7 +2202,8 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 	{
 		name: "randomized: every seq's tree rebuilt from versions equals the model",
 		async run(ctx) {
-			for (const seed of [1, 2, 3]) await randomizedHistory(ctx, seed);
+			for (const seed of [1, 2, 3, 449, 4242, 5074, 6028, 6048, 6106])
+				await randomizedHistory(ctx, seed);
 		},
 	},
 ];
