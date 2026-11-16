@@ -763,6 +763,8 @@
 		"edit": "编辑",
 		"done": "完成",
 		"editHint": "在这里编辑（F2，或双击一行文字）",
-		"doneHint": "回到阅读"
+		"doneHint": "回到阅读",
+		"moreAtLeast_one": "还有 {{count}}+ 条 ▸",
+		"moreAtLeast_other": "还有 {{count}}+ 条 ▸"
 	}
 }

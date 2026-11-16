@@ -763,6 +763,8 @@
 		"edit": "Edit",
 		"done": "Done",
 		"editHint": "Edit here (F2, or double-click a line)",
-		"doneHint": "Back to reading"
+		"doneHint": "Back to reading",
+		"moreAtLeast_one": "{{count}}+ more ▸",
+		"moreAtLeast_other": "{{count}}+ more ▸"
 	}
 }

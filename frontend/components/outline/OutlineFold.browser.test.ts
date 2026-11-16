@@ -181,7 +181,11 @@ async function press(e: MapEditor, keys: string): Promise<void> {
 }
 
 /** The default view, whichever surface draws it. */
-function expectDefault(got: FoldRowDom[], report: string): void {
+function expectDefault(
+	got: FoldRowDom[],
+	report: string,
+	surface: "editor" | "forest" = "editor",
+): void {
 	const by = new Map(got.map((row) => [row.text, row]));
 	const row = (text: string) => {
 		const found = by.get(text);
@@ -199,7 +203,12 @@ function expectDefault(got: FoldRowDom[], report: string): void {
 	// A subagent report: one line of its first paragraph, and the whole of it counted.
 	expect(row(report)).toMatchObject({
 		state: "closed",
-		preview: { kind: "report", text: "The summary paragraph.", label: "Show all (5 blocks) ▸" },
+		// (The forest reads lazily: it does not hold the report's blocks to count them.)
+		preview: {
+			kind: "report",
+			text: "The summary paragraph.",
+			label: surface === "editor" ? "Show all (5 blocks) ▸" : "Show all ▸",
+		},
 		quick: "expand",
 	});
 	// A subtask to do is open too; its note is one line (one child, nothing more: no label).
@@ -821,21 +830,13 @@ test("what the reader folded is stored, and comes back after a reload in both vi
 	const again = await openHost(h, "page", pageId);
 	await shows(again, want, "after a reload");
 	expect(await foldState(again)).toEqual({ expanded: [note, done].sort(), collapsed: [fact] });
-	// The page as of its last commit is the read-only tree: the same folding.
-	const seq = (await outlineStore.getSpace(h.space.id))?.nextSeq ?? 1;
-	const tree = await openHost(h, "page", pageId, { asOf: seq - 1 });
-	expect(await tree.call((f) => f.foldSurface())).toBe("tree");
-	// (The tree's row shows a report's line as it reads; the editor's keeps the stored text.)
-	const reportRow = (await tree.call((f) => f.reportLines()))[0]?.label ?? "";
-	await shows(
-		tree,
-		want.map((text) => (text === REPORT ? reportRow : text)),
-		"the read-only tree",
-	);
+	// (The read-only view of the page is the forest, whose folding is stored per block
+	// (`outline_fold_state`); the editor's is still per page until L4–L6 move it. The forest's
+	// own suite covers its stored folding: `forest/outline-forest.browser.test.ts`.)
 	// Bob opens the page: the default view.
 	const bob = await openHost(h, "page", pageId, { userId: h.writer });
 	await shows(bob, DEFAULT_ROWS, "someone else");
-	expect([...again.errors, ...tree.errors, ...bob.errors]).toEqual([]);
+	expect([...again.errors, ...bob.errors]).toEqual([]);
 }, 60_000);
 
 for (const variant of [
@@ -856,7 +857,7 @@ for (const variant of [
 		const reportRow = (await rowOf(a, reportId))?.text ?? "";
 		const visible = DEFAULT_ROWS.map((text) => (text === REPORT ? reportRow : text));
 		await shows(a, visible);
-		if (variant.lang === "en") expectDefault(await rows(a), reportRow);
+		if (variant.lang === "en") expectDefault(await rows(a), reportRow, "forest");
 		else {
 			// The same rows; the labels in the reader's language.
 			expect((await rowOf(a, note))?.preview).toEqual({
@@ -867,7 +868,7 @@ for (const variant of [
 			expect((await rowOf(a, reportId))?.preview).toEqual({
 				kind: "report",
 				text: "The summary paragraph.",
-				label: "展开全文（5 块）▸",
+				label: "展开全文 ▸",
 			});
 			expect((await a.call((f) => f.foldAll()))?.label).toBe("全部展开");
 		}
@@ -883,7 +884,12 @@ for (const variant of [
 			(row) => row?.state === "open",
 			"arrow",
 		);
-		expect((await rowOf(a, detail))?.state).toBe("closed");
+		// (Its level is read when it opens: the rows come a moment after the arrow turns.)
+		await eventually(
+			() => rowOf(a, detail),
+			(row) => row?.state === "closed",
+			"the level read on opening",
+		);
 		await click(a, note, "arrow");
 		await shows(a, visible);
 		await click(a, note, "arrow", true);

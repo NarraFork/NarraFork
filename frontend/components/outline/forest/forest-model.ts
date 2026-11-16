@@ -39,7 +39,7 @@
  */
 import type { OutlineViewMode } from "@shared/outline-api";
 import { FOLD_MAX_OPEN_DEPTH, foldDefaultOpen } from "@shared/outline-fold";
-import { isOutlineReportBlockId } from "@shared/outline-report-line";
+import { isOutlineReportBlockId, isOutlineReportContainer } from "@shared/outline-report-line";
 import type {
 	OutlineFoldStateResponse,
 	OutlineLevelsResponse,
@@ -74,6 +74,8 @@ export const FOREST_LIMITS = {
 	markKeys: 100,
 	/** Rows "everything inside" may open. */
 	openInside: 800,
+	/** Children of a closed row read to say how many it has (the server's own peek). */
+	previewPeek: 12,
 	/** Blocks read one by one to pin a located block's ancestors. */
 	pinReads: 8,
 } as const;
@@ -124,6 +126,11 @@ export interface ForestLevel {
 	seq: number;
 	/** Only the child a closed row's preview line is read from: read whole when the row opens. */
 	preview: boolean;
+	/**
+	 * A preview level: the direct children counted (up to what one read looks at), and whether
+	 * there are more than that. Null: not counted.
+	 */
+	kids: { count: number; more: boolean; previewId?: string } | null;
 	stale: boolean;
 	busy: boolean;
 	failed: boolean;
@@ -147,6 +154,9 @@ export interface ForestBlockRow {
 	previewId: string | null;
 	previewKind: ForestPreviewKind | null;
 	previewMore: boolean;
+	/** Direct children besides the one the line shows; null: not counted. `previewRestMore`: at least. */
+	previewRest: number | null;
+	previewRestMore: boolean;
 	/** The row's control for everything inside it. */
 	subtree: "expand" | "collapse" | null;
 }
@@ -305,6 +315,7 @@ export class SpaceForest {
 	private marksBusy = false;
 
 	private cached: ForestView | null = null;
+	private previewOf = new Map<string, string>();
 	private info = new Map<string, RowInfo>();
 	private version = 0;
 	private readonly listeners = new Set<() => void>();
@@ -426,6 +437,7 @@ export class SpaceForest {
 		for (const level of read.levels) {
 			if (isUnread(level)) continue;
 			const key = level.parentId ?? this.spaceId;
+			const peeked = read.closedKids?.[key];
 			went.add(key);
 			this.levels.set(key, {
 				ids: [...level.childIds],
@@ -436,6 +448,9 @@ export class SpaceForest {
 				processHidden: level.processHidden,
 				seq: read.seq,
 				preview: closed.has(key),
+				kids: peeked
+					? { count: peeked.kids, more: peeked.more, previewId: peeked.previewId }
+					: null,
 				stale: false,
 				busy: false,
 				failed: false,
@@ -578,7 +593,8 @@ export class SpaceForest {
 			if (id !== null) this.setOpen(id, true);
 		} else {
 			this.wishes.clear();
-			for (const under of this.loadedUnder(root)) {
+			// The row itself too: closed again where its default closes it.
+			for (const under of [...(id !== null ? [id] : []), ...this.loadedUnder(root)]) {
 				if (this.expanded.has(under) || this.collapsed.has(under)) this.queueFold(under, null);
 				this.forced.delete(under);
 			}
@@ -632,6 +648,8 @@ export class SpaceForest {
 			},
 		];
 		const seen = new Set<string>();
+		/** Headings whose first child a report's line is read from, by the report's row. */
+		const previewOf = new Map<string, string>();
 		while (stack.length > 0) {
 			const at = stack.pop() as (typeof stack)[number];
 			if ("row" in at) {
@@ -702,9 +720,28 @@ export class SpaceForest {
 				const open = this.isOpen(block, at.depth, at.over, top);
 				info.set(id, { depth: at.depth, detail: at.over, top, open, parentKey: at.key });
 				const first = open ? undefined : this.levels.get(id);
-				const previewBlock = first ? this.blocks.get(first.ids[0] ?? "") : undefined;
 				const finished = block.task?.status === "done" || block.task?.status === "cancelled";
-				// A finished task's line is its first note; a task or a report there is no note.
+				let previewBlock = first ? this.blocks.get(first.ids[0] ?? "") : undefined;
+				// A finished task's line is its first note; subtasks and reports before it are not.
+				if (first && finished) {
+					const isNote = (kid: OutlineTreeBlock | undefined) =>
+						!!kid && !kid.task && !kid.question && !isOutlineReportBlockId(kid.id);
+					if (!isNote(previewBlock)) {
+						previewBlock =
+							first.ids.map((kid) => this.blocks.get(kid)).find(isNote) ??
+							(first.kids?.previewId ? this.blocks.get(first.kids.previewId) : undefined) ??
+							previewBlock;
+					}
+				}
+				// A report's line is its first paragraph: what stands under its first heading.
+				const report = isOutlineReportContainer(id, block.content);
+				if (report && previewBlock?.hasChildren && /^#{1,6}\s/.test(previewBlock.content)) {
+					const under = this.levels.get(previewBlock.id);
+					const paragraph = under ? this.blocks.get(under.ids[0] ?? "") : undefined;
+					if (paragraph) previewBlock = paragraph;
+					else if (!under) previewOf.set(previewBlock.id, id);
+				}
+				// (Only subtasks under it: its title is all there is.)
 				const usable =
 					previewBlock !== undefined &&
 					!(finished && (previewBlock.task || isOutlineReportBlockId(previewBlock.id)));
@@ -723,15 +760,17 @@ export class SpaceForest {
 						open,
 						pinned: !inWindow.has(id),
 						previewId: usable ? (previewBlock as OutlineTreeBlock).id : null,
-						previewKind: !usable
-							? null
-							: isOutlineReportBlockId(id)
-								? "report"
-								: finished
-									? "result"
-									: "details",
+						previewKind: !usable ? null : report ? "report" : finished ? "result" : "details",
 						previewMore:
 							!!first && (first.more || first.ids.length > 1 || !!previewBlock?.hasChildren),
+						previewRest: first
+							? first.kids
+								? Math.max(0, first.kids.count - 1)
+								: first.more
+									? null
+									: Math.max(0, first.ids.length - 1)
+							: null,
+						previewRestMore: first?.kids ? first.kids.more : false,
 						subtree: null,
 					},
 				});
@@ -778,7 +817,11 @@ export class SpaceForest {
 				whole.closed = true;
 			}
 			if (row.open) above.push({ row, deep: false, closed: false, own: false });
-			else if (row.previewId && this.blocks.get(row.previewId)?.hasChildren) row.subtree = "expand";
+			else if (
+				this.levels.get(row.id)?.ids.some((kid) => this.blocks.get(kid)?.hasChildren) ||
+				(row.previewId && this.blocks.get(row.previewId)?.hasChildren)
+			)
+				row.subtree = "expand";
 		}
 		settle(-1);
 		// The question form, under the row it belongs to.
@@ -795,6 +838,7 @@ export class SpaceForest {
 			}
 		}
 		this.info = info;
+		this.previewOf = previewOf;
 		this.cached = {
 			rows,
 			indexOf,
@@ -926,9 +970,13 @@ export class SpaceForest {
 			return;
 		}
 		// Closed rows on screen without the child their one line is read from.
-		const previews = this.visible.filter(
-			(id) => this.info.get(id)?.open === false && !this.levels.has(id),
-		);
+		const onScreen = new Set(this.visible);
+		const previews = [
+			...this.visible.filter((id) => this.info.get(id)?.open === false && !this.levels.has(id)),
+			...[...this.previewOf]
+				.filter(([heading, row]) => onScreen.has(row) && !this.levels.has(heading))
+				.map(([heading]) => heading),
+		];
 		if (previews.length > 0) {
 			await this.readFromStart(previews.slice(0, FOREST_LIMITS.parents), true);
 			this.changed();
@@ -966,6 +1014,7 @@ export class SpaceForest {
 			processHidden: 0,
 			seq: -1,
 			preview: true,
+			kids: null,
 			stale: false,
 			busy: false,
 			failed: false,
@@ -977,7 +1026,7 @@ export class SpaceForest {
 	/** Read the first chunk of several levels in one request. */
 	private async readFromStart(keys: string[], preview: boolean): Promise<void> {
 		for (const key of keys) (this.levels.get(key) ?? this.blank(key)).busy = true;
-		const perParent = preview ? 1 : FOREST_LIMITS.chunk;
+		const perParent = preview ? FOREST_LIMITS.previewPeek : FOREST_LIMITS.chunk;
 		try {
 			const read = await this.io.children(this.spaceId, {
 				parents: keys.map((key) => (key === this.spaceId ? null : key)),
@@ -1004,6 +1053,7 @@ export class SpaceForest {
 					processHidden: found.processHidden,
 					seq: read.seq,
 					preview,
+					kids: preview ? { count: found.childIds.length, more: found.more } : null,
 					stale: false,
 					busy: false,
 					failed: false,
@@ -1079,6 +1129,7 @@ export class SpaceForest {
 				processHidden,
 				seq,
 				preview: false,
+				kids: null,
 				stale: false,
 				busy: false,
 				failed: false,

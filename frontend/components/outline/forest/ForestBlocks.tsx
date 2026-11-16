@@ -185,6 +185,32 @@ const BlockRowView = memo(function BlockRowView({
 	const subtreeAction = t(
 		row.subtree === "collapse" ? "fold.subtreeCollapse" : "fold.subtreeExpand",
 	);
+	const arrowRef = useRef<HTMLButtonElement>(null);
+	const quickRef = useRef<HTMLButtonElement>(null);
+	// A preview line goes away when it is used: focus moves to the row's own control.
+	const focusAfterPreview = useRef(false);
+	const hasPreview = collapsed && row.previewKind !== null;
+	// (What is inside loads after the row opens: the quick control may come a moment later,
+	// and takes the focus from the arrow if the reader has not moved on.)
+	const handOver = useRef(false);
+	useLayoutEffect(() => {
+		if (focusAfterPreview.current && !hasPreview) {
+			focusAfterPreview.current = false;
+			handOver.current = !quickRef.current;
+			(quickRef.current ?? arrowRef.current)?.focus();
+		} else if (handOver.current) {
+			if (arrowRef.current?.ownerDocument.activeElement !== arrowRef.current)
+				handOver.current = false;
+			else if (quickRef.current) {
+				handOver.current = false;
+				quickRef.current.focus();
+			}
+		}
+	});
+	const openPreview = () => {
+		focusAfterPreview.current = true;
+		onToggle(id, true, true);
+	};
 	const toggle = (inside: boolean) =>
 		inside
 			? onToggle(id, true, row.subtree !== "collapse" || collapsed)
@@ -200,8 +226,15 @@ const BlockRowView = memo(function BlockRowView({
 		</OutlineLink>
 	);
 	const counts = hidden ? hidden.split(",").map(Number) : [];
+	// How much more is behind the line: counted where the read counted it.
 	const previewLabel =
-		row.previewKind === "report" ? t("forest.reportAll") : row.previewMore ? t("fold.open") : null;
+		row.previewKind === "report"
+			? t("forest.reportAll")
+			: row.previewRest !== null && row.previewRest > 0
+				? t(row.previewRestMore ? "forest.moreAtLeast" : "fold.more", { count: row.previewRest })
+				: row.previewMore
+					? t("fold.open")
+					: null;
 	const facts = view === "facts";
 	const SubtreeIcon = FOLD_ALL_ICONS[row.subtree === "collapse" ? "collapse" : "expand"].Icon;
 	const hasMeta =
@@ -233,7 +266,7 @@ const BlockRowView = memo(function BlockRowView({
 					{row.hasChildren ? (
 						<button
 							type="button"
-							tabIndex={-1}
+							ref={arrowRef}
 							className={`${classes.toggleButton} mantine-focus-auto`}
 							aria-label={`${arrowAction} · ${title}`}
 							aria-expanded={!collapsed}
@@ -264,7 +297,7 @@ const BlockRowView = memo(function BlockRowView({
 					focusLink(
 						<span className={classes.bulletDot} data-collapsed={collapsed} />,
 						classes.bullet,
-						`${t("page.focus")} · ${title}`,
+						t("page.focus"),
 					)}
 				{marker === "task" && block.task && <OutlineTaskIcon status={block.task.status} />}
 				{marker === "question" && block.question && (
@@ -428,6 +461,7 @@ const BlockRowView = memo(function BlockRowView({
 				{row.subtree && (
 					<button
 						type="button"
+						ref={quickRef}
 						className={`${classes.foldAll} mantine-focus-auto`}
 						aria-expanded={row.subtree === "collapse"}
 						aria-label={t("fold.subtree", { title })}
@@ -442,11 +476,7 @@ const BlockRowView = memo(function BlockRowView({
 					</button>
 				)}
 				{marker !== "bullet" &&
-					focusLink(
-						<FOCUS_ICON.Icon size={14} />,
-						classes.focusHandle,
-						`${t("page.focus")} · ${title}`,
-					)}
+					focusLink(<FOCUS_ICON.Icon size={14} />, classes.focusHandle, t("page.focus"))}
 			</div>
 			{collapsed && row.previewKind && (
 				// biome-ignore lint/a11y/useSemanticElements: a line of text that opens its row, laid out as one
@@ -462,9 +492,9 @@ const BlockRowView = memo(function BlockRowView({
 					data-fold-preview={row.previewKind}
 					data-fold-of={id}
 					onClick={(e) => {
-						if (plainClick(e)) onToggle(id, true, true);
+						if (plainClick(e)) openPreview();
 					}}
-					onKeyDown={ownKeys(() => onToggle(id, true, true))}
+					onKeyDown={ownKeys(() => openPreview())}
 				>
 					{previewText && (
 						<span className={classes.previewText} data-fold-preview-text="">

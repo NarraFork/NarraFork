@@ -338,8 +338,9 @@ describe("locate and everything inside", () => {
 		expect(now?.kind === "block" && now.subtree).toBe("collapse");
 		model.foldInside("top1", false);
 		await time.run();
-		expect(titles(model.getView().rows)).toContain("    > A note");
-		expect(outline.expanded).toEqual(new Set(["top1"]));
+		// Back to the default inside it, the row itself included (a top-level row: closed).
+		expect(titles(model.getView().rows)).toEqual(["> Top one", "- Top two"]);
+		expect(outline.expanded.size).toBe(0);
 	});
 
 	test("a closed row's questions: opened, and the form comes up under the first", async () => {

@@ -30,6 +30,8 @@ export const OUTLINE_SUBTREE_LIMITS = {
 	maxPath: 100,
 	/** Closed rows of one folded read that get the child their preview line is read from. */
 	maxPreviews: 50,
+	/** Children of a closed row a folded read looks at to say how many it has (then "N+"). */
+	previewPeek: 12,
 	/** Keys one marks read names at most. */
 	maxMarkKeys: 100,
 	/** Open changes one read marks its blocks with; past it the read says `pendingTruncated`. */
@@ -132,6 +134,15 @@ export interface OutlineSubtreeResponse extends OutlineTreeRead {
 	 * the one child its preview line is read from.
 	 */
 	closed?: string[];
+	/**
+	 * With `fold=default`: of the closed rows that got their preview child, how many direct
+	 * children the view shows under each, counted up to
+	 * {@link OUTLINE_SUBTREE_LIMITS.previewPeek}; `more`: there are more than `kids`.
+	 * `previewId`: on a finished task whose first child is not a note, the first note among
+	 * the children looked at (its preview line is its result, not a subtask); that block is in
+	 * `blocks` without being part of a level of this read.
+	 */
+	closedKids?: Record<string, { kids: number; more: boolean; previewId?: string }>;
 	/**
 	 * With `fold=default`: the space has more open questions, locks or open changes than one
 	 * read looks at ({@link OUTLINE_SUBTREE_LIMITS.markCandidates} of each), or the walk up
