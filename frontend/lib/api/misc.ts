@@ -214,6 +214,7 @@ export const miscApi = {
 				location: string;
 				files: string[];
 				disabled?: boolean;
+				canUpdateFromUrl?: boolean;
 			}>
 		>(`/skills?projectId=${encodeURIComponent(projectId)}`),
 	getSkill: (projectId: string, name: string) =>
@@ -224,6 +225,7 @@ export const miscApi = {
 			content: string;
 			files: string[];
 			disabled?: boolean;
+			canUpdateFromUrl?: boolean;
 		}>(`/skills/${encodeURIComponent(name)}?projectId=${encodeURIComponent(projectId)}`),
 	createProjectSkill: (
 		projectId: string,
@@ -239,6 +241,37 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
+	importProjectSkill: (projectId: string, data: { url: string }, signal?: AbortSignal) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+			disabled?: boolean;
+		}>(`/skills/import?projectId=${encodeURIComponent(projectId)}`, {
+			method: "POST",
+			body: JSON.stringify(data),
+			signal,
+		}),
+	updateProjectSkillFromUrl: (
+		projectId: string,
+		name: string,
+		data: { url: string },
+		signal?: AbortSignal,
+	) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+			disabled?: boolean;
+			canUpdateFromUrl?: boolean;
+		}>(
+			`/skills/${encodeURIComponent(name)}/update-from-url?projectId=${encodeURIComponent(projectId)}`,
+			{ method: "POST", body: JSON.stringify(data), signal },
+		),
 	updateProjectSkill: (
 		projectId: string,
 		currentName: string,
@@ -269,6 +302,7 @@ export const miscApi = {
 				location: string;
 				files: string[];
 				disabled: boolean;
+				canUpdateFromUrl?: boolean;
 			}>
 		>("/skills/global"),
 	getGlobalSkill: (name: string) =>
@@ -279,6 +313,7 @@ export const miscApi = {
 			content: string;
 			files: string[];
 			disabled?: boolean;
+			canUpdateFromUrl?: boolean;
 		}>(`/skills/global/${encodeURIComponent(name)}`),
 	createGlobalSkill: (data: { name: string; description: string; content: string }) =>
 		request<{
@@ -288,6 +323,29 @@ export const miscApi = {
 			content: string;
 			files: string[];
 		}>("/skills/global", { method: "POST", body: JSON.stringify(data) }),
+	importGlobalSkill: (data: { url: string }, signal?: AbortSignal) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+			disabled?: boolean;
+		}>("/skills/global/import", { method: "POST", body: JSON.stringify(data), signal }),
+	updateGlobalSkillFromUrl: (name: string, data: { url: string }, signal?: AbortSignal) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+			disabled?: boolean;
+			canUpdateFromUrl?: boolean;
+		}>(`/skills/global/${encodeURIComponent(name)}/update-from-url`, {
+			method: "POST",
+			body: JSON.stringify(data),
+			signal,
+		}),
 	updateGlobalSkill: (
 		currentName: string,
 		data: { name: string; description: string; content: string },
