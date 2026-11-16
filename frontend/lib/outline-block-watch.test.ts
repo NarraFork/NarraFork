@@ -49,6 +49,7 @@ function setup() {
 			),
 		onPending: () => heard.push("pending"),
 		onError: (code) => heard.push(`error ${code}`),
+		onPaused: () => heard.push("paused"),
 	});
 	const id = () =>
 		String(transport.sent.findLast((m) => m.type === "outline_watch")?.subscriptionId);
@@ -152,7 +153,43 @@ describe("the block watch's client", () => {
 		await tick(40);
 		expect(transport.sent.filter((m) => m.type === "outline_watch")).toHaveLength(2);
 		expect(heard.at(-1)).toBe("error access_denied");
+		// The view found the deny transient: it asks again.
+		handle.retry();
+		await tick();
+		expect(transport.sent.filter((m) => m.type === "outline_watch")).toHaveLength(3);
 	});
+
+	test("no room again and again: the delay grows, then the watch is paused until retry", async () => {
+		const { transport, handle, heard, id } = setup();
+		handle.set(["a"], []);
+		await tick();
+		const watches = () => transport.sent.filter((m) => m.type === "outline_watch").length;
+		const times: number[] = [];
+		let last = Date.now();
+		for (let i = 0; i < 4; i++) {
+			const before = watches();
+			transport.emit({ type: "outline_watch_error", subscriptionId: id(), code: "unavailable" });
+			while (watches() === before) await tick(2);
+			times.push(Date.now() - last);
+			last = Date.now();
+		}
+		// 20, 40, 80, 160 ms (the test's base delay is 20): never sooner than that.
+		times.forEach((took, i) => {
+			expect(took).toBeGreaterThanOrEqual(20 * 2 ** i - 3);
+		});
+		transport.emit({ type: "outline_watch_error", subscriptionId: id(), code: "unavailable" });
+		expect(heard.at(-1)).toBe("paused");
+		const sent = watches();
+		await tick(400);
+		expect(watches()).toBe(sent);
+		handle.retry();
+		await tick();
+		expect(watches()).toBe(sent + 1);
+		// A confirmation starts the count over.
+		transport.emit({ type: "outline_watching", subscriptionId: id(), spaceId: "S", seq: 3 });
+		transport.emit({ type: "outline_watch_error", subscriptionId: id(), code: "unavailable" });
+		expect(heard.at(-1)).toBe("error unavailable");
+	}, 10_000);
 
 	test("an empty set unwatches; dispose unwatches and frees the place; keys are bounded", async () => {
 		const { transport, handle, watch } = setup();

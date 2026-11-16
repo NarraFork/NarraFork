@@ -758,13 +758,17 @@
 		"pinnedHint": "Shown out of its place in this long level because what you located is under it.",
 		"changedSelf": "Changed since your last visit",
 		"changedBelow": "Something inside changed since your last visit",
-		"inProgressHint": "Open tasks under this block. Focus on it to see them.",
 		"historyUnavailable": "The outline as of that time cannot be shown: its history starts later, or is still being prepared.",
 		"edit": "Edit",
 		"done": "Done",
 		"editHint": "Edit here (F2, or double-click a line)",
 		"doneHint": "Back to reading",
 		"moreAtLeast_one": "{{count}}+ more ▸",
-		"moreAtLeast_other": "{{count}}+ more ▸"
+		"moreAtLeast_other": "{{count}}+ more ▸",
+		"reportAllAtLeast_one": "Show all ({{count}}+ block) ▸",
+		"reportAllAtLeast_other": "Show all ({{count}}+ blocks) ▸",
+		"inProgressFocus": "Focus on this block to see everything under it",
+		"livePaused": "Live updates are paused: too many views of this space are open.",
+		"foldNotSaved": "What you opened and closed here could not be saved."
 	}
 }

@@ -84,6 +84,7 @@ import {
 	treeCountLabel,
 	treeOpenStorageKey,
 } from "../tree/tree-open-state";
+import { useTreeTabStops } from "../tree/tree-roving";
 import {
 	captureTreeAnchor,
 	readTreeAnchor,
@@ -285,7 +286,13 @@ function TreeRow({
 					{icon}
 				</span>
 				{to ? (
-					<OutlineLink to={to} className={classes.treeTitle} title={title} data-tree-title="">
+					<OutlineLink
+						to={to}
+						className={classes.treeTitle}
+						title={title}
+						data-tree-title=""
+						data-tree-nav=""
+					>
 						{title}
 					</OutlineLink>
 				) : (
@@ -294,6 +301,7 @@ function TreeRow({
 						className={`${classes.treeTitle} ${classes.treeGroupTitle} mantine-focus-auto`}
 						onClick={(event) => onToggle(event.altKey)}
 						data-tree-title=""
+						data-tree-nav=""
 					>
 						{title}
 					</button>
@@ -363,6 +371,7 @@ function MoreButton({
 				onClick={onClick}
 				disabled={loading}
 				data-tree-more=""
+				data-tree-nav=""
 			>
 				{label}
 			</Anchor>
@@ -756,14 +765,20 @@ function RootChildren() {
 	);
 }
 
-/** The arrow keys on a row's title (design §2.5): move between rows, open and close. */
+/**
+ * The arrow keys on a row's title or a "more" control (design §2.5, `data-tree-nav`): move
+ * between rows, open and close. The tree is one tab stop (`tree-roving.ts`).
+ */
 export function onTreeKeyDown(event: KeyboardEvent<HTMLDivElement>) {
 	if (event.ctrlKey || event.metaKey || event.shiftKey) return;
 	const target = event.target as HTMLElement;
-	if (!target.matches("[data-tree-title]")) return;
-	const row = target.closest<HTMLElement>("[data-tree-node]");
-	if (!row) return;
+	if (!target.matches("[data-tree-nav]")) return;
+	// A "more" control is not a row: it moves, it does not open or close.
+	const row = target.matches("[data-tree-title]")
+		? target.closest<HTMLElement>("[data-tree-node]")
+		: null;
 	if (event.altKey) {
+		if (!row) return;
 		// Alt+Enter: everything inside the row, as Alt on its arrow (PR C's controls).
 		if (event.key !== "Enter" || event.repeat) return;
 		event.preventDefault();
@@ -773,14 +788,14 @@ export function onTreeKeyDown(event: KeyboardEvent<HTMLDivElement>) {
 			?.dispatchEvent(new MouseEvent("click", { bubbles: true, altKey: true }));
 		return;
 	}
-	const titles = [...event.currentTarget.querySelectorAll<HTMLElement>("[data-tree-title]")];
+	const titles = [...event.currentTarget.querySelectorAll<HTMLElement>("[data-tree-nav]")];
 	const at = titles.indexOf(target);
 	const move = (to: number) => {
 		const next = titles[Math.max(0, Math.min(titles.length - 1, to))];
 		next?.focus();
 	};
-	const toggle = () => row.querySelector<HTMLButtonElement>("button[data-tree-toggle]")?.click();
-	const open = row.dataset.open === "true";
+	const toggle = () => row?.querySelector<HTMLButtonElement>("button[data-tree-toggle]")?.click();
+	const open = row?.dataset.open === "true";
 	switch (event.key) {
 		case "ArrowDown":
 			move(at + 1);
@@ -795,17 +810,17 @@ export function onTreeKeyDown(event: KeyboardEvent<HTMLDivElement>) {
 			move(titles.length - 1);
 			break;
 		case "ArrowRight":
-			if (open) move(at + 1);
+			if (open || !row) move(at + 1);
 			else toggle();
 			break;
 		case "ArrowLeft": {
-			if (open) {
+			if (open && row) {
 				toggle();
 				break;
 			}
 			// Closed, or a leaf: to the row it is under (the nearest row above with a lower
 			// level: block rows are a flat list, so nesting in the DOM does not say it).
-			const level = Number(row.closest("[role=treeitem]")?.getAttribute("aria-level") ?? 1);
+			const level = Number(target.closest("[role=treeitem]")?.getAttribute("aria-level") ?? 1);
 			for (let i = at - 1; i >= 0; i--) {
 				const above = titles[i] as HTMLElement;
 				const aboveLevel = Number(
@@ -997,6 +1012,8 @@ function FocusedForest({
 	const { spaceId } = root;
 	const edit = useCallback((blockId: string) => onEdit?.(spaceId, blockId), [onEdit, spaceId]);
 	const act = () => forest?.foldInside(null, all === "expand");
+	const treeRef = useRef<HTMLDivElement | null>(null);
+	useTreeTabStops(treeRef);
 	return (
 		<Box className={classes.rows} data-testid="outline-block-tree">
 			{/* Only when there is something to open or to return to. */}
@@ -1015,7 +1032,7 @@ function FocusedForest({
 					{t(all === "expand" ? "fold.expandAll" : "fold.collapseAll")}
 				</Anchor>
 			)}
-			<div role="tree" aria-label={t("title")} onKeyDown={onTreeKeyDown}>
+			<div ref={treeRef} role="tree" aria-label={t("title")} onKeyDown={onTreeKeyDown}>
 				<ForestBlocks
 					spaceId={root.spaceId}
 					rootId={root.blockId}
@@ -1188,6 +1205,8 @@ function ConnectedForest({
 		[open, step, narrow, pins, locate, finishLocate, wishes, io, onEdit],
 	);
 	const anyOpen = useSyncExternalStore(open.subscribe, () => open.snapshot().length > 0);
+	const treeRef = useRef<HTMLDivElement | null>(null);
+	useTreeTabStops(treeRef);
 	return (
 		<TreeContext.Provider value={value}>
 			<Box
@@ -1226,7 +1245,7 @@ function ConnectedForest({
 						</Anchor>
 					</Text>
 				)}
-				<div role="tree" aria-label={t("title")} onKeyDown={onTreeKeyDown}>
+				<div ref={treeRef} role="tree" aria-label={t("title")} onKeyDown={onTreeKeyDown}>
 					{root.kind === "all" ? (
 						<RootChildren />
 					) : (

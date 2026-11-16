@@ -758,13 +758,17 @@
 		"pinnedHint": "这一层很长，它不在当前显示的这一段里；因为你定位的内容在它下面，所以显示在这里。",
 		"changedSelf": "自你上次查看以来有改动",
 		"changedBelow": "自你上次查看以来里面有改动",
-		"inProgressHint": "这个块下面有未完成的任务；聚焦到它查看。",
 		"historyUnavailable": "无法显示那个时刻的内容：历史从更晚的时候开始，或者还在准备中。",
 		"edit": "编辑",
 		"done": "完成",
 		"editHint": "在这里编辑（F2，或双击一行文字）",
 		"doneHint": "回到阅读",
 		"moreAtLeast_one": "还有 {{count}}+ 条 ▸",
-		"moreAtLeast_other": "还有 {{count}}+ 条 ▸"
+		"moreAtLeast_other": "还有 {{count}}+ 条 ▸",
+		"reportAllAtLeast_one": "展开全文（{{count}}+ 块）▸",
+		"reportAllAtLeast_other": "展开全文（{{count}}+ 块）▸",
+		"inProgressFocus": "聚焦到这个块，查看下面的全部内容",
+		"livePaused": "实时更新已暂停：这个空间同时打开的视图太多。",
+		"foldNotSaved": "这里的展开和收起没能保存。"
 	}
 }

@@ -44,6 +44,7 @@ import type {
 	OutlineFoldStateResponse,
 	OutlineLevelsResponse,
 	OutlineMarksResponse,
+	OutlineOpenTasksResponse,
 	OutlineSubtreeMarks,
 	OutlineSubtreeResponse,
 	OutlineTreeBlock,
@@ -110,6 +111,18 @@ export interface ForestIO {
 		changes: Array<{ blockId: string; open: boolean | null }>,
 		keepalive?: boolean,
 	): Promise<unknown>;
+	/** The reader's folding back to the default: a block and what is under it, or (null) all. */
+	resetFold(
+		spaceId: string,
+		under: string | null,
+		keepalive?: boolean,
+	): Promise<OutlineFoldStateResponse>;
+	/** The open tasks under a block (the space's id: all), for the "in progress" count. */
+	openTasks?(
+		spaceId: string,
+		under: string,
+		cursor?: string | null,
+	): Promise<OutlineOpenTasksResponse>;
 }
 
 /** What a read of one parent's children left in memory. */
@@ -131,7 +144,22 @@ export interface ForestLevel {
 	 * there are more than that. Null: not counted.
 	 */
 	kids: { count: number; more: boolean; previewId?: string } | null;
-	stale: boolean;
+	/**
+	 * The newest commit seq the watch said touched this level (-1: none), and when it said so
+	 * (the model's generation counter). The level is STALE when it was told after its window's
+	 * read started ({@link readGen}) of a seq past the one that read answered at ({@link seq}):
+	 * a read in flight when the change landed answers too old, so the level is read again. A
+	 * read that started after it was told answers at that seq or later.
+	 */
+	staleSeq: number;
+	staleGen: number;
+	/**
+	 * Changes without a seq (changes waiting for confirmation): the model's generation counter
+	 * when the level was last told so. Stale while past {@link readGen}, the generation its
+	 * window's read started at.
+	 */
+	dirtyGen: number;
+	readGen: number;
 	busy: boolean;
 	failed: boolean;
 }
@@ -236,8 +264,21 @@ export interface SpaceForestOptions {
 }
 
 const FOLD_FLUSH_MS = 500;
+/** Changes one fold write carries at most (the server's `maxChanges`). */
+export const FOLD_CHUNK_CHANGES = 500;
+/** Bytes of one fold write's body at most (the server takes 64 KB). */
+export const FOLD_CHUNK_BYTES = 48 * 1024;
+/** Bytes sent with `keepalive` as the page goes away, in all (the browser allows 64 KB). */
+export const FOLD_LEAVE_BYTES = 60 * 1024;
+/** A failed fold write is tried again after 1 s, 2 s, 4 s, … this many times. */
+export const FOLD_RETRIES = 4;
+const FOLD_RETRY_MS = 1000;
 const MARKS_DELAY_MS = 250;
 const MARKS_REFRESH_MS = 400;
+const ROOT_CHECK_MS = 300;
+/** A transient deny: the watch is asked again after 1 s, 2 s, 4 s, … this many times. */
+export const DENIED_RETRIES = 5;
+const DENIED_RETRY_MS = 1000;
 
 function makesDetail(block: OutlineTreeBlock): boolean {
 	return block.task !== null || block.question !== null || isOutlineReportBlockId(block.id);
@@ -304,8 +345,16 @@ export class SpaceForest {
 	} | null = null;
 
 	private readonly foldQueue = new Map<string, boolean | null>();
+	/** Resets of the reader's folding to send (a block: it and what is under it; null: all). */
+	private readonly resetQueue: Array<string | null> = [];
+	/** What the reader folded since `load` started (applied over the folding it reads). */
+	private foldSinceLoad: Map<string, boolean | null> | null = null;
 	private cancelFoldFlush: (() => void) | null = null;
+	private cancelFoldRetry: (() => void) | null = null;
 	private foldWrite: Promise<unknown> = Promise.resolve();
+	private foldFailures = 0;
+	/** The reader's folding could not be saved (after the retries): the view says so. */
+	foldSaveFailed = false;
 
 	private near = new Set<string>();
 	private visible: string[] = [];
@@ -313,6 +362,16 @@ export class SpaceForest {
 	private marksDirty = false;
 	private cancelMarks: (() => void) | null = null;
 	private marksBusy = false;
+
+	/** The seq the last marks read answered at. */
+	private marksSeq = -1;
+	/** Generation counter of changes without a seq (see {@link ForestLevel.dirtyGen}). */
+	private gen = 0;
+	/** The seq each held block was read at: an older answer never replaces a newer block. */
+	private readonly blockSeq = new Map<string, number>();
+	private cancelRootCheck: (() => void) | null = null;
+	private cancelRewatch: (() => void) | null = null;
+	private deniedTries = 0;
 
 	private cached: ForestView | null = null;
 	private previewOf = new Map<string, string>();
@@ -354,7 +413,10 @@ export class SpaceForest {
 	dispose(): void {
 		this.disposed = true;
 		this.cancelMarks?.();
-		this.cancelFoldFlush?.();
+		this.cancelRootCheck?.();
+		this.cancelRewatch?.();
+		this.cancelFoldRetry?.();
+		// Chained after what is on its way (order), kept alive past a page that goes away.
 		this.flushFold(true);
 		this.reveal?.done(false);
 		this.reveal = null;
@@ -388,6 +450,9 @@ export class SpaceForest {
 	/** The first read: the reader's folding and the root's folded subtree. */
 	async load(): Promise<void> {
 		this.status = "loading";
+		const gen = this.gen;
+		// What the reader folds while the reader's folding is on its way stays on top of it.
+		this.foldSinceLoad = new Map();
 		try {
 			const [fold, root] = await Promise.all([
 				this.io.getFold(this.spaceId),
@@ -398,11 +463,14 @@ export class SpaceForest {
 			this.collapsed.clear();
 			for (const id of fold.expanded) this.expanded.add(id);
 			for (const id of fold.collapsed) this.collapsed.add(id);
-			// What the reader did while the read was on its way stays on top.
+			// What the reader did while the read was on its way stays on top (sent or not).
+			for (const [id, open] of this.foldSinceLoad) this.applyFold(id, open);
 			for (const [id, open] of this.foldQueue) this.applyFold(id, open);
-			this.applyRoot(root);
+			this.foldSinceLoad = null;
+			this.applyRoot(root, gen);
 			this.status = "ready";
 		} catch (error) {
+			this.foldSinceLoad = null;
 			if (this.disposed) return;
 			const status = httpStatus(error);
 			this.status = status === 404 ? "missing" : status === 409 ? "unavailable" : "error";
@@ -427,11 +495,20 @@ export class SpaceForest {
 		if (seq > this.knownSeq) this.knownSeq = seq;
 	}
 
-	private applyRoot(read: OutlineSubtreeResponse): void {
+	/** Hold blocks read at `seq`, each unless a newer read of it is held already. */
+	private putBlocks(blocks: readonly OutlineTreeBlock[], seq: number): void {
+		for (const block of blocks) {
+			if ((this.blockSeq.get(block.id) ?? -1) > seq) continue;
+			this.blocks.set(block.id, block);
+			this.blockSeq.set(block.id, seq);
+		}
+	}
+
+	private applyRoot(read: OutlineSubtreeResponse, gen: number): void {
 		this.path = read.path;
 		this.pathTruncated = read.pathTruncated;
 		this.rootInTask = read.rootInTask;
-		for (const block of read.blocks) this.blocks.set(block.id, block);
+		this.putBlocks(read.blocks, read.seq);
 		const closed = new Set(read.closed ?? []);
 		const went = new Set<string>();
 		for (const level of read.levels) {
@@ -451,7 +528,7 @@ export class SpaceForest {
 				kids: peeked
 					? { count: peeked.kids, more: peeked.more, previewId: peeked.previewId }
 					: null,
-				stale: false,
+				...this.carry(key, gen),
 				busy: false,
 				failed: false,
 			});
@@ -515,9 +592,10 @@ export class SpaceForest {
 
 	private isOpen(block: OutlineTreeBlock, depth: number, detail: boolean, top: boolean): boolean {
 		if (!block.hasChildren) return false;
+		// A located block's ancestors open however deep (the reader asked to see it).
+		if (this.forced.has(block.id)) return true;
 		// (The server counts the root as depth 0, so a row at `depth` here is one deeper.)
 		if (depth + 1 >= FOLD_MAX_OPEN_DEPTH) return false;
-		if (this.forced.has(block.id)) return true;
 		if (this.expanded.has(block.id)) return true;
 		if (this.collapsed.has(block.id)) return false;
 		return this.defaultOpen(block, detail, top);
@@ -533,22 +611,136 @@ export class SpaceForest {
 	private queueFold(id: string, open: boolean | null): void {
 		this.applyFold(id, open);
 		this.foldQueue.set(id, open);
-		this.cancelFoldFlush?.();
-		this.cancelFoldFlush = this.delay(() => this.flushFold(false), FOLD_FLUSH_MS);
+		this.foldSinceLoad?.set(id, open);
+		this.scheduleFoldFlush(FOLD_FLUSH_MS);
 	}
 
-	/** Send the reader's folding not sent yet (`leaving`: the page is going away). */
-	flushFold(leaving: boolean): Promise<unknown> {
+	private scheduleFoldFlush(ms: number): void {
+		this.cancelFoldFlush?.();
+		this.cancelFoldFlush = this.delay(() => {
+			this.cancelFoldFlush = null;
+			this.flushFold(false);
+		}, ms);
+	}
+
+	/**
+	 * Send the reader's folding not sent yet, one write at a time in the order the reader
+	 * folded: resets first, then the changes in chunks the server takes
+	 * ({@link FOLD_CHUNK_CHANGES} changes, {@link FOLD_CHUNK_BYTES} bytes). What fails stays
+	 * queued and is tried again after a growing delay, {@link FOLD_RETRIES} times; then the
+	 * forest says its folding could not be saved ({@link foldSaveFailed}) until a write works.
+	 * `keepalive`: kept alive past a page that goes away (still in order).
+	 */
+	flushFold(keepalive: boolean): Promise<unknown> {
 		this.cancelFoldFlush?.();
 		this.cancelFoldFlush = null;
-		if (this.foldQueue.size === 0) return this.foldWrite;
-		const changes = [...this.foldQueue].map(([blockId, open]) => ({ blockId, open }));
-		this.foldQueue.clear();
-		// One write at a time, in the order the reader folded.
-		this.foldWrite = this.foldWrite
-			.then(() => this.io.putFold(this.spaceId, changes, leaving))
-			.catch(() => undefined);
+		if (this.foldQueue.size === 0 && this.resetQueue.length === 0) return this.foldWrite;
+		this.foldWrite = this.foldWrite.then(() => this.sendFolds(keepalive));
 		return this.foldWrite;
+	}
+
+	/**
+	 * The page is going away (`pagehide`, hidden): what is queued goes now, with `keepalive`,
+	 * NOT behind a write still on its way (that one may never finish), and within the
+	 * browser's budget for such requests ({@link FOLD_LEAVE_BYTES} in all). Returns the bytes sent.
+	 */
+	leave(): number {
+		this.cancelFoldFlush?.();
+		this.cancelFoldFlush = null;
+		let budget = FOLD_LEAVE_BYTES;
+		for (const under of this.resetQueue.splice(0)) {
+			budget -= 200;
+			void this.io.resetFold(this.spaceId, under, true).catch(() => undefined);
+		}
+		while (this.foldQueue.size > 0 && budget > 0) {
+			const chunk = this.takeFoldChunk(Math.min(FOLD_CHUNK_BYTES, budget));
+			if (chunk.changes.length === 0) break;
+			budget -= chunk.bytes;
+			void this.io.putFold(this.spaceId, chunk.changes, true).catch(() => undefined);
+		}
+		return FOLD_LEAVE_BYTES - budget;
+	}
+
+	/** The next changes of the queue that fit one write (taken out of the queue). */
+	private takeFoldChunk(maxBytes: number): {
+		changes: Array<{ blockId: string; open: boolean | null }>;
+		bytes: number;
+	} {
+		const changes: Array<{ blockId: string; open: boolean | null }> = [];
+		// `{"changes":[` … `]}`
+		let bytes = 14;
+		for (const [blockId, open] of this.foldQueue) {
+			const change = { blockId, open };
+			const size = JSON.stringify(change).length + 1;
+			if (changes.length >= FOLD_CHUNK_CHANGES || bytes + size > maxBytes) break;
+			changes.push(change);
+			bytes += size;
+		}
+		for (const change of changes) this.foldQueue.delete(change.blockId);
+		return { changes, bytes };
+	}
+
+	private async sendFolds(keepalive: boolean): Promise<void> {
+		try {
+			while (this.resetQueue.length > 0) {
+				const under = this.resetQueue[0] as string | null;
+				const state = await this.io.resetFold(this.spaceId, under, keepalive);
+				this.resetQueue.shift();
+				// The server's folding after the reset, with what is still queued on top.
+				if (!this.disposed) {
+					this.expanded.clear();
+					this.collapsed.clear();
+					for (const id of state.expanded) this.expanded.add(id);
+					for (const id of state.collapsed) this.collapsed.add(id);
+					for (const [id, open] of this.foldQueue) this.applyFold(id, open);
+					this.changed();
+				}
+				this.foldSaved();
+			}
+			while (this.foldQueue.size > 0) {
+				const chunk = this.takeFoldChunk(FOLD_CHUNK_BYTES);
+				try {
+					await this.io.putFold(this.spaceId, chunk.changes, keepalive);
+				} catch (error) {
+					// Back in the queue, unless the reader folded the block again since.
+					for (const change of chunk.changes)
+						if (!this.foldQueue.has(change.blockId))
+							this.foldQueue.set(change.blockId, change.open);
+					throw error;
+				}
+				this.foldSaved();
+			}
+		} catch {
+			this.foldFailures++;
+			if (this.disposed) return;
+			if (this.foldFailures <= FOLD_RETRIES) {
+				this.cancelFoldRetry?.();
+				this.cancelFoldRetry = this.delay(
+					() => {
+						this.cancelFoldRetry = null;
+						this.flushFold(false);
+					},
+					FOLD_RETRY_MS * 2 ** (this.foldFailures - 1),
+				);
+			} else if (!this.foldSaveFailed) {
+				this.foldSaveFailed = true;
+				this.changed();
+			}
+		}
+	}
+
+	private foldSaved(): void {
+		this.foldFailures = 0;
+		if (this.foldSaveFailed && !this.disposed) {
+			this.foldSaveFailed = false;
+			this.changed();
+		}
+	}
+
+	/** The reader's "try again" after the folding could not be saved. */
+	retryFoldSave(): void {
+		this.foldFailures = 0;
+		this.flushFold(false);
 	}
 
 	private setOpen(id: string, open: boolean): boolean {
@@ -593,11 +785,20 @@ export class SpaceForest {
 			if (id !== null) this.setOpen(id, true);
 		} else {
 			this.wishes.clear();
-			// The row itself too: closed again where its default closes it.
-			for (const under of [...(id !== null ? [id] : []), ...this.loadedUnder(root)]) {
-				if (this.expanded.has(under) || this.collapsed.has(under)) this.queueFold(under, null);
+			// The row itself too: closed again where its default closes it. Here at once for
+			// what is loaded; on the server ONE reset of the row (or of the whole forest), which
+			// also covers what is stored for blocks not loaded here.
+			const loaded = [...(id !== null ? [id] : []), ...this.loadedUnder(root)];
+			for (const under of loaded) {
+				this.applyFold(under, null);
+				this.foldQueue.delete(under);
+				this.foldSinceLoad?.set(under, null);
 				this.forced.delete(under);
 			}
+			const under = id ?? this.rootId;
+			if (under === null) this.foldQueue.clear();
+			this.resetQueue.push(under);
+			this.scheduleFoldFlush(0);
 		}
 		this.changed();
 	}
@@ -892,7 +1093,8 @@ export class SpaceForest {
 	watchKeys(): { levels: string[]; subtrees: string[] } {
 		if (this.asOf !== undefined || this.status !== "ready") return { levels: [], subtrees: [] };
 		const levels = [...this.near].filter((key) => this.levels.has(key));
-		const subtrees: string[] = [];
+		// The focused root itself, as a subtree: its deletion or move names it.
+		const subtrees: string[] = this.rootId !== null ? [this.rootId] : [];
 		for (const id of this.visible) {
 			if (subtrees.length >= FOREST_LIMITS.watchSubtrees) break;
 			if (this.info.get(id)?.open === false) subtrees.push(id);
@@ -939,7 +1141,7 @@ export class SpaceForest {
 		}
 		for (const key of this.near) {
 			const level = this.levels.get(key);
-			if (!level?.stale || level.busy) continue;
+			if (!level || !this.isStale(level) || level.busy) continue;
 			if (
 				level.start === null &&
 				level.pages.length === 0 &&
@@ -951,7 +1153,13 @@ export class SpaceForest {
 		// Closed rows on screen whose preview went stale are read again too (their one line).
 		for (const id of this.visible) {
 			const level = this.levels.get(id);
-			if (level?.stale && !level.busy && !start.includes(id) && !ranges.includes(id))
+			if (
+				level &&
+				this.isStale(level) &&
+				!level.busy &&
+				!start.includes(id) &&
+				!ranges.includes(id)
+			)
 				start.push(id);
 		}
 		if (start.length > 0) {
@@ -1015,7 +1223,10 @@ export class SpaceForest {
 			seq: -1,
 			preview: true,
 			kids: null,
-			stale: false,
+			staleSeq: -1,
+			staleGen: 0,
+			dirtyGen: 0,
+			readGen: 0,
 			busy: false,
 			failed: false,
 		};
@@ -1024,9 +1235,13 @@ export class SpaceForest {
 	}
 
 	/** Read the first chunk of several levels in one request. */
-	private async readFromStart(keys: string[], preview: boolean): Promise<void> {
+	private async readFromStart(
+		keys: string[],
+		preview: boolean,
+		perParent: number = preview ? FOREST_LIMITS.previewPeek : FOREST_LIMITS.chunk,
+	): Promise<void> {
 		for (const key of keys) (this.levels.get(key) ?? this.blank(key)).busy = true;
-		const perParent = preview ? FOREST_LIMITS.previewPeek : FOREST_LIMITS.chunk;
+		const gen = this.gen;
 		try {
 			const read = await this.io.children(this.spaceId, {
 				parents: keys.map((key) => (key === this.spaceId ? null : key)),
@@ -1035,7 +1250,7 @@ export class SpaceForest {
 				...this.readParams(),
 			});
 			this.reads++;
-			for (const block of read.blocks) this.blocks.set(block.id, block);
+			this.putBlocks(read.blocks, read.seq);
 			const got = new Map(read.levels.map((level) => [level.parentId ?? this.spaceId, level]));
 			for (const key of keys) {
 				const level = this.levels.get(key);
@@ -1054,11 +1269,11 @@ export class SpaceForest {
 					seq: read.seq,
 					preview,
 					kids: preview ? { count: found.childIds.length, more: found.more } : null,
-					stale: false,
+					...this.carry(key, gen),
 					busy: false,
 					failed: false,
 				});
-				this.noteLeaf(key, found);
+				this.noteLeaf(key, found, read.seq);
 			}
 			this.noteSeq(read.seq);
 		} catch (error) {
@@ -1073,12 +1288,16 @@ export class SpaceForest {
 	}
 
 	/** A level read whole and empty: its row has no children (any more). */
-	private noteLeaf(key: string, level: OutlineTreeLevel): void {
+	private noteLeaf(key: string, level: OutlineTreeLevel, seq: number): void {
 		const block = this.blocks.get(key);
-		if (!block) return;
+		// (Not when the row was read again since, newer than this level.)
+		if (!block || (this.blockSeq.get(key) ?? -1) > seq) return;
 		// (Children the facts view leaves out still count: the row keeps its arrow and says so.)
 		const has = level.childIds.length > 0 || level.more || level.processHidden > 0;
-		if (!has && block.hasChildren) this.blocks.set(key, { ...block, hasChildren: false });
+		if (!has && block.hasChildren) {
+			this.blocks.set(key, { ...block, hasChildren: false });
+			this.blockSeq.set(key, seq);
+		}
 	}
 
 	/** Read `target` children of one level from `start`, in as many requests as that takes. */
@@ -1091,6 +1310,7 @@ export class SpaceForest {
 		const level = this.levels.get(key) ?? this.blank(key);
 		level.busy = true;
 		level.failed = false;
+		const gen = this.gen;
 		const ids: string[] = [];
 		let cursor = start;
 		let more = false;
@@ -1108,9 +1328,10 @@ export class SpaceForest {
 					...this.readParams(),
 				});
 				this.reads++;
-				for (const block of read.blocks) this.blocks.set(block.id, block);
+				this.putBlocks(read.blocks, read.seq);
 				const found = read.levels.find((l) => (l.parentId ?? this.spaceId) === key);
-				seq = read.seq;
+				// (A window read in several requests is as old as its first.)
+				seq = seq < 0 ? read.seq : Math.min(seq, read.seq);
 				if (!found) break;
 				ids.push(...found.childIds);
 				processHidden += found.processHidden;
@@ -1130,7 +1351,7 @@ export class SpaceForest {
 				seq,
 				preview: false,
 				kids: null,
-				stale: false,
+				...this.carry(key, gen),
 				busy: false,
 				failed: false,
 			});
@@ -1165,7 +1386,7 @@ export class SpaceForest {
 					...this.readParams(),
 				});
 				this.reads++;
-				for (const block of read.blocks) this.blocks.set(block.id, block);
+				this.putBlocks(read.blocks, read.seq);
 				const found = read.levels.find((l) => (l.parentId ?? this.spaceId) === parentKey);
 				const have = new Set(level.ids);
 				if (found) {
@@ -1259,7 +1480,65 @@ export class SpaceForest {
 				this.asked.add(id);
 			}
 			this.asked.add(this.rootKey);
+			// (Started first: its levels are busy before the walk looks at them.)
+			const prefetch = this.prefetchChain(chain);
 			this.changed();
+			void prefetch.then(() => this.changed());
+		});
+	}
+
+	/**
+	 * The levels a located block is under, read together: ONE `children` request names every
+	 * ancestor whose level is not loaded (up to {@link FOREST_LIMITS.parents}), each level's
+	 * first `readBlocks / n` children; then the ancestors their windows do not hold are read
+	 * alone, all at once (pinned above their levels). Without this the walk would wait for one
+	 * level to load before it knows the next to read: a round trip per ancestor.
+	 */
+	private async prefetchChain(chain: readonly string[]): Promise<void> {
+		const parents = [this.rootKey, ...chain.slice(0, -1)];
+		const want = parents
+			.filter((key) => {
+				const level = this.levels.get(key);
+				return !level || (level.preview && !level.busy);
+			})
+			.slice(0, FOREST_LIMITS.parents);
+		if (want.length > 0) {
+			const each = Math.max(
+				10,
+				Math.min(FOREST_LIMITS.chunk, Math.floor(FOREST_LIMITS.readBlocks / want.length)),
+			);
+			await this.readFromStart(want, false, each);
+		}
+		if (this.disposed) return;
+		// Ancestors outside their level's window: read alone, together.
+		const missing: Array<{ parentKey: string; id: string }> = [];
+		for (let i = 0; i < chain.length; i++) {
+			const parentKey = parents[i] as string;
+			const id = chain[i] as string;
+			const level = this.levels.get(parentKey);
+			if (!level || level.preview || level.ids.includes(id)) continue;
+			if (this.pins.get(parentKey)?.includes(id)) continue;
+			missing.push({ parentKey, id });
+		}
+		const asked = missing.slice(0, FOREST_LIMITS.pinReads);
+		const reads = await Promise.all(
+			asked.map(({ id }) =>
+				this.io
+					.subtree(this.spaceId, id, { ...this.readParams(), blocks: 1 })
+					.then((read) => {
+						this.reads++;
+						return read;
+					})
+					.catch(() => null),
+			),
+		);
+		asked.forEach(({ parentKey, id }, i) => {
+			const read = reads[i];
+			const block = read?.blocks.find((b) => b.id === id);
+			if (!read || !block) return;
+			if (block.parentId !== (parentKey === this.spaceId ? null : parentKey)) return;
+			this.putBlocks([block], read.seq);
+			this.pins.set(parentKey, [id]);
 		});
 	}
 
@@ -1288,6 +1567,7 @@ export class SpaceForest {
 				// Past the level's window (or left out by the view): read the block itself.
 				if (reveal.reads-- <= 0) return finish(false);
 				let block = this.blocks.get(id);
+				let seq = this.blockSeq.get(id) ?? -1;
 				if (!block || block.parentId !== (parentKey === this.spaceId ? null : parentKey)) {
 					try {
 						const read = await this.io.subtree(this.spaceId, id, {
@@ -1296,13 +1576,14 @@ export class SpaceForest {
 						});
 						this.reads++;
 						block = read.blocks[0];
+						seq = read.seq;
 					} catch {
 						return finish(false);
 					}
 				}
 				if (!block || block.parentId !== (parentKey === this.spaceId ? null : parentKey))
 					return finish(false);
-				this.blocks.set(block.id, block);
+				this.putBlocks([block], seq);
 				this.pins.set(parentKey, [id]);
 				return true;
 			}
@@ -1355,28 +1636,63 @@ export class SpaceForest {
 
 	// ── live ──────────────────────────────────────────────────────────────────
 
-	private markStale(key: string): void {
-		const level = this.levels.get(key);
-		if (level) level.stale = true;
+	private isStale(level: ForestLevel): boolean {
+		return (
+			(level.staleGen > level.readGen && level.staleSeq > level.seq) ||
+			level.dirtyGen > level.readGen
+		);
 	}
 
-	private staleAll(): void {
-		for (const level of this.levels.values()) level.stale = true;
+	/** What a level read now keeps of the level it replaces: what it was told while in flight. */
+	private carry(
+		key: string,
+		gen: number,
+	): Pick<ForestLevel, "staleSeq" | "staleGen" | "dirtyGen" | "readGen"> {
+		const was = this.levels.get(key);
+		return {
+			staleSeq: was?.staleSeq ?? -1,
+			staleGen: was?.staleGen ?? 0,
+			dirtyGen: was?.dirtyGen ?? 0,
+			readGen: gen,
+		};
+	}
+
+	/** The watch said a commit at `seq` touched the level. */
+	private markStale(key: string, seq: number): void {
+		const level = this.levels.get(key);
+		if (!level || seq <= level.seq) return;
+		level.staleSeq = Math.max(level.staleSeq, seq);
+		level.staleGen = ++this.gen;
+	}
+
+	/** Everything loaded may have changed: by the commit at `seq`, or (null) without a seq. */
+	private staleAll(seq: number | null): void {
+		const gen = ++this.gen;
+		for (const level of this.levels.values()) {
+			if (seq === null) level.dirtyGen = gen;
+			else if (seq > level.seq) {
+				level.staleSeq = Math.max(level.staleSeq, seq);
+				level.staleGen = gen;
+			}
+		}
 		this.marksDirty = true;
 	}
 
 	/** The watch confirmed a set as of `seq`; `added` were not watched before. */
 	onWatching(seq: number, added: { levels: readonly string[]; subtrees: readonly string[] }): void {
+		this.deniedTries = 0;
 		if (seq > this.knownSeq) {
 			// Past everything read or told: whatever is watched may have changed.
-			this.staleAll();
+			this.staleAll(seq);
+			this.checkRoot();
 		} else {
 			// A key new in the set has no past: read it again unless it was read at this seq.
-			for (const key of [...added.levels, ...added.subtrees]) {
-				const level = this.levels.get(key);
-				if (level && level.seq < seq) level.stale = true;
-			}
+			for (const key of [...added.levels, ...added.subtrees]) this.markStale(key, seq);
 		}
+		// Marks are read on their own: a level read during a disconnect may have moved
+		// `knownSeq` past the last marks read; a closed row newly watched has no past either.
+		if (seq > this.marksSeq || added.subtrees.length > 0) this.marksDirty = true;
+		if (this.rootId !== null && added.subtrees.includes(this.rootId)) this.checkRoot();
 		this.noteSeq(seq);
 		this.afterLive();
 	}
@@ -1387,13 +1703,21 @@ export class SpaceForest {
 		subtrees: readonly string[];
 		all: boolean;
 	}): void {
-		if (frame.all) this.staleAll();
-		else {
-			for (const key of frame.levels) this.markStale(key);
+		if (frame.all) {
+			this.staleAll(frame.seq);
+			this.checkRoot();
+		} else {
+			for (const key of frame.levels) this.markStale(key, frame.seq);
 			for (const key of frame.subtrees) {
+				// The focused root itself: it may be gone or moved (its own level is watched as
+				// a level; what changed under it is not a reason to read that again).
+				if (key === this.rootId) {
+					this.checkRoot();
+					continue;
+				}
 				// A closed row: its one line may have changed, and what is loaded under it is
 				// not watched, so it is read again when the row opens.
-				this.markStale(key);
+				this.markStale(key, frame.seq);
 				if (this.info.get(key)?.open === false) {
 					for (const under of this.loadedUnder(key)) this.levels.delete(under);
 				}
@@ -1406,21 +1730,83 @@ export class SpaceForest {
 
 	/** Changes waiting for confirmation changed: rows show them, and marks count them. */
 	onPending(): void {
-		this.staleAll();
+		this.staleAll(null);
 		this.afterLive();
 	}
 
-	/** Access was lost (or the space is gone): read the root again and show the answer. */
-	onDenied(): void {
-		void this.io
-			.subtree(this.spaceId, this.rootId, { ...this.rootParams(), blocks: 1 })
-			.then(() => undefined)
-			.catch((error: unknown) => {
+	/**
+	 * Access was lost (or the space or the root is gone): read the root again. A 404 shows
+	 * "missing" and stops. An answer means the deny was transient (access came back, a check
+	 * raced a grant): `rewatch` is called after a growing delay so the watch is asked again,
+	 * at most {@link DENIED_RETRIES} times in a row (a confirmation starts the count over).
+	 */
+	onDenied(rewatch?: () => void): Promise<"missing" | "transient" | "failed"> {
+		return this.io.subtree(this.spaceId, this.rootId, { ...this.readParams(), blocks: 1 }).then(
+			() => {
+				if (this.disposed || !rewatch || this.deniedTries >= DENIED_RETRIES)
+					return "transient" as const;
+				this.cancelRewatch?.();
+				this.cancelRewatch = this.delay(
+					() => {
+						this.cancelRewatch = null;
+						if (!this.disposed) rewatch();
+					},
+					DENIED_RETRY_MS * 2 ** this.deniedTries++,
+				);
+				return "transient" as const;
+			},
+			(error: unknown) => {
 				if (httpStatus(error) === 404 && !this.disposed) {
 					this.status = "missing";
 					this.changed();
+					return "missing" as const;
 				}
+				return "failed" as const;
+			},
+		);
+	}
+
+	/**
+	 * The focused root may have been deleted or moved (the watch named it): read it alone,
+	 * debounced. Gone: "missing". Moved: the path above it follows.
+	 */
+	private checkRoot(): void {
+		if (this.rootId === null || this.asOf !== undefined || this.disposed) return;
+		this.cancelRootCheck?.();
+		this.cancelRootCheck = this.delay(() => {
+			this.cancelRootCheck = null;
+			void this.readRoot();
+		}, ROOT_CHECK_MS);
+	}
+
+	private async readRoot(): Promise<void> {
+		if (this.rootId === null || this.disposed || this.status !== "ready") return;
+		try {
+			const read = await this.io.subtree(this.spaceId, this.rootId, {
+				...this.readParams(),
+				blocks: 1,
 			});
+			this.reads++;
+			if (this.disposed) return;
+			const root = read.blocks.find((block) => block.id === this.rootId);
+			if (root) this.putBlocks([root], read.seq);
+			const was = this.path.map((step) => step.id).join("/");
+			if (
+				was !== read.path.map((step) => step.id).join("/") ||
+				this.rootInTask !== read.rootInTask ||
+				this.path.some((step, i) => step.title !== read.path[i]?.title)
+			) {
+				this.path = read.path;
+				this.pathTruncated = read.pathTruncated;
+				this.rootInTask = read.rootInTask;
+				this.changed();
+			}
+		} catch (error) {
+			if (httpStatus(error) === 404 && !this.disposed) {
+				this.status = "missing";
+				this.changed();
+			}
+		}
 	}
 
 	private afterLive(): void {
@@ -1463,6 +1849,7 @@ export class SpaceForest {
 			for (const key of keys) if (!got.has(key) && this.marks.delete(key)) changed = true;
 			if (this.marksAtLeast !== read.atLeast) changed = true;
 			this.marksAtLeast = read.atLeast;
+			if (read.seq > this.marksSeq) this.marksSeq = read.seq;
 			this.noteSeq(read.seq);
 			if (changed) this.changed();
 		} catch {

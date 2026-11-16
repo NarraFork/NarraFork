@@ -52,6 +52,7 @@ import type {
 	OutlineFoldStateResponse,
 	OutlineLevelsResponse,
 	OutlineMarksResponse,
+	OutlineOpenTasksResponse,
 	OutlineSubtreeResponse,
 } from "@shared/outline-subtree-api";
 import type {
@@ -175,6 +176,17 @@ export const outlineApi = {
 			body: JSON.stringify(body),
 			...(keepalive ? { keepalive: true } : {}),
 		}),
+	/** The caller's own folding back to the default: a block and what is under it, or all. */
+	resetOutlineFoldState: (spaceId: string, under: string | null, keepalive = false) =>
+		request<OutlineFoldStateResponse>(
+			`/outline/spaces/${enc(spaceId)}/fold-state${query({ under: under ?? undefined })}`,
+			{ method: "DELETE", ...(keepalive ? { keepalive: true } : {}) },
+		),
+	/** The open tasks under a block (the space's id: the whole space), in progress first. */
+	getOutlineOpenTasks: (spaceId: string, under: string, cursor?: string | null) =>
+		request<OutlineOpenTasksResponse>(
+			`/outline/spaces/${enc(spaceId)}/open-tasks${query({ under, cursor: cursor ?? undefined })}`,
+		),
 	listOutlinePages: (spaceId: string, params: { cursor?: string | null; limit?: number }) =>
 		request<OutlinePageListResponse>(`/outline/spaces/${enc(spaceId)}/pages${query(params)}`),
 	getOutlineBlock: (

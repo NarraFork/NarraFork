@@ -194,7 +194,7 @@
 	"projectPromptConflict": "文件在打开后被修改过。重新载入会用磁盘上的版本替换当前编辑。",
 	"projectPromptReload": "重新载入",
 	"projectPromptSaveFailed": "提示词文件保存失败",
-	"workspaceAddOutline": "添加大纲页",
+	"workspaceAddOutline": "添加大纲",
 	"promptLibraryPick": "从提示词库插入",
 	"promptLibraryPickPlaceholder": "选择一段提示词",
 	"promptLibraryEmpty": "提示词库为空，去「套路 → 提示词库」新建",

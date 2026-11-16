@@ -35,6 +35,10 @@ export class FakeOutline implements ForestIO {
 	/** Every request made, in order. */
 	readonly calls: Array<{ kind: string; detail: string }> = [];
 	failNext: number | null = null;
+	/** Fold writes (puts and resets) that fail before one succeeds again. */
+	foldFails = 0;
+	/** What fold writes were sent with `keepalive`. */
+	readonly keepalive: string[] = [];
 
 	constructor(spaceId = "space") {
 		this.spaceId = spaceId;
@@ -340,11 +344,22 @@ export class FakeOutline implements ForestIO {
 		return { spaceId: this.spaceId, expanded: [...this.expanded], collapsed: [...this.collapsed] };
 	}
 
-	async putFold(_spaceId: string, changes: Array<{ blockId: string; open: boolean | null }>) {
+	async putFold(
+		_spaceId: string,
+		changes: Array<{ blockId: string; open: boolean | null }>,
+		keepalive?: boolean,
+	) {
 		this.calls.push({
 			kind: "putFold",
 			detail: changes.map((c) => `${c.blockId}=${c.open}`).join(","),
 		});
+		if (keepalive) this.keepalive.push(JSON.stringify({ changes }));
+		if (changes.length > 500 || JSON.stringify({ changes }).length > 64 * 1024)
+			throw Object.assign(new Error("too large"), { status: 400 });
+		if (this.foldFails > 0) {
+			this.foldFails--;
+			throw Object.assign(new Error("HTTP 503"), { status: 503 });
+		}
 		for (const change of changes) {
 			this.expanded.delete(change.blockId);
 			this.collapsed.delete(change.blockId);
@@ -352,5 +367,51 @@ export class FakeOutline implements ForestIO {
 			if (change.open === false) this.collapsed.add(change.blockId);
 		}
 		return undefined;
+	}
+
+	async resetFold(_spaceId: string, under: string | null, keepalive?: boolean) {
+		this.calls.push({ kind: "resetFold", detail: under ?? "all" });
+		if (keepalive) this.keepalive.push(`reset ${under ?? "all"}`);
+		if (this.foldFails > 0) {
+			this.foldFails--;
+			throw Object.assign(new Error("HTTP 503"), { status: 503 });
+		}
+		const gone = (id: string) => under === null || id === under || this.isUnderBlock(id, under);
+		for (const id of [...this.expanded]) if (gone(id)) this.expanded.delete(id);
+		for (const id of [...this.collapsed]) if (gone(id)) this.collapsed.delete(id);
+		return { spaceId: this.spaceId, expanded: [...this.expanded], collapsed: [...this.collapsed] };
+	}
+
+	private isUnderBlock(id: string, ancestor: string): boolean {
+		for (
+			let at = this.blocks.get(id)?.parentId ?? null;
+			at;
+			at = this.blocks.get(at)?.parentId ?? null
+		)
+			if (at === ancestor) return true;
+		return false;
+	}
+
+	async openTasks(_spaceId: string, under: string, cursor?: string | null) {
+		this.calls.push({ kind: "openTasks", detail: `${under}${cursor ? `@${cursor}` : ""}` });
+		const all = (under === this.spaceId ? [...this.blocks.keys()] : this.under(under))
+			.map((id) => ({ id, block: this.blocks.get(id) as FakeBlock }))
+			.filter(({ block }) => block.task === "todo" || block.task === "doing")
+			.sort((a, b) =>
+				a.block.task === b.block.task ? (a.id < b.id ? -1 : 1) : a.block.task === "doing" ? -1 : 1,
+			);
+		const from = cursor ? Number(cursor) : 0;
+		const page = all.slice(from, from + 20);
+		return {
+			under,
+			items: page.map(({ id, block }) => ({
+				id,
+				title: block.content,
+				status: block.task as "todo" | "doing",
+				assignee: null,
+			})),
+			nextCursor: from + 20 < all.length ? String(from + 20) : null,
+			atLeast: false,
+		};
 	}
 }

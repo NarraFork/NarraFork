@@ -16,8 +16,11 @@
  *     everything the view has read or been told, it re-reads everything it watches.
  *   - `onChanged`: the watched levels and subtrees commits concern; `all`: everything watched.
  *   - `onPending`: changes waiting for confirmation changed: re-read what shows them.
- *   - `onError`: `access_denied` (re-read: the server answers not found) or `unavailable` (no
- *     room: the view keeps what it read; this class tries again after a while).
+ *   - `onError`: `access_denied` (re-read: the server answers not found; when the re-read
+ *     succeeds the deny was transient and the view calls {@link OutlineWatchHandle.retry}, with
+ *     its own bounded backoff) or `unavailable` (no room: the view keeps what it read; this
+ *     class tries again with a growing delay, {@link OUTLINE_WATCH_RETRIES} times, then says
+ *     `onPaused` and waits for `retry`, the reader's "retry").
  *
  * Limits (`OUTLINE_WATCH_LIMITS`): 2,000 keys per subscription (levels first when a caller
  * hands over more), 24 subscriptions per person per space, 16 per socket.
@@ -38,18 +41,24 @@ export interface OutlineWatchHandlers {
 	onChanged(frame: { seq: number; levels: string[]; subtrees: string[]; all: boolean }): void;
 	onPending?(): void;
 	onError?(code: OutlineWatchErrorCode): void;
+	/** `unavailable` after every automatic retry: live updates paused until `retry`. */
+	onPaused?(): void;
 }
 
 export interface OutlineWatchHandle {
 	/** The whole set to watch from now on (sent after a short delay; the last call wins). */
 	set(levels: Iterable<string>, subtrees: Iterable<string>): void;
+	/** Send the current set again now (after an error; the retry count starts over). */
+	retry(): void;
 	dispose(): void;
 }
 
 /** How long a burst of opening and closing rows is gathered into one send. */
 export const OUTLINE_WATCH_DEBOUNCE_MS = 150;
-/** How long after `unavailable` the set is sent again. */
+/** How long after the first `unavailable` the set is sent again (doubling each time). */
 export const OUTLINE_WATCH_RETRY_MS = 10_000;
+/** Automatic retries after `unavailable` before the watch says it is paused. */
+export const OUTLINE_WATCH_RETRIES = 4;
 
 interface KeySet {
 	levels: string[];
@@ -101,6 +110,8 @@ export class OutlineBlockWatch {
 		let sent: KeySet | null = null;
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		let disposed = false;
+		/** `unavailable` answers in a row (reset by a confirmation or `retry`). */
+		let refused = 0;
 
 		const send = () => {
 			timer = null;
@@ -145,8 +156,16 @@ export class OutlineBlockWatch {
 					confirmed = null;
 					inFlight = [];
 					handlers.onError?.(code);
-					// No room now (another tab may close): the same set is tried again later.
-					if (code === "unavailable") schedule(this.retryMs);
+					// No room now (another tab may close): the same set is tried again later, a
+					// few times, then the view is told and waits for the reader.
+					if (code === "unavailable") {
+						if (refused < OUTLINE_WATCH_RETRIES) schedule(this.retryMs * 2 ** refused++);
+						else {
+							if (timer !== null) clearTimeout(timer);
+							timer = null;
+							handlers.onPaused?.();
+						}
+					}
 					return;
 				}
 				if (frame.spaceId !== spaceId) return;
@@ -157,6 +176,7 @@ export class OutlineBlockWatch {
 				if (!Number.isSafeInteger(frame.seq)) return;
 				const seq = frame.seq as number;
 				if (frame.type === "outline_watching") {
+					refused = 0;
 					const now = inFlight.shift() ?? sent ?? wanted;
 					const before = confirmed;
 					confirmed = now;
@@ -193,6 +213,13 @@ export class OutlineBlockWatch {
 				if (same(wanted, next)) return;
 				wanted = next;
 				schedule(this.debounceMs);
+			},
+			retry: () => {
+				if (disposed) return;
+				refused = 0;
+				sent = null;
+				inFlight = [];
+				schedule(0);
 			},
 			dispose: () => {
 				if (disposed) return;

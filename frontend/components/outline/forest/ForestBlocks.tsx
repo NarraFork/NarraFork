@@ -13,11 +13,15 @@
  * Only the rows near the viewport are in the DOM (`use-windowed-rows.ts`), in the scroller the
  * host already has.
  */
-import { Anchor, Badge, Loader, Paper, Text, Tooltip } from "@mantine/core";
+import { Anchor, Badge, Loader, Paper, Popover, Stack, Text, Tooltip } from "@mantine/core";
 import { blockTitle } from "@shared/outline";
 import type { OutlineQuestionMark, OutlineTaskStatus, OutlineViewMode } from "@shared/outline-api";
 import { isOutlineReportBlockId } from "@shared/outline-report-line";
-import type { OutlineSubtreeMarks, OutlineTreeBlock } from "@shared/outline-subtree-api";
+import type {
+	OutlineOpenTaskItem,
+	OutlineSubtreeMarks,
+	OutlineTreeBlock,
+} from "@shared/outline-subtree-api";
 import { IconPinned, IconPointFilled } from "@tabler/icons-react";
 import {
 	memo,
@@ -35,6 +39,7 @@ import { REMOTE_BUILD } from "../../../lib/build-target";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { outlineBlockWatch } from "../../../lib/outline-block-watch";
 import { reportLineDisplay } from "../../../lib/outline-report-line";
+import { onPageLeave } from "../../../lib/page-leave";
 import { ownKeys, plainClick, spokenLabel } from "../fold-controls";
 import classes from "../Outline.module.css";
 import { OutlineBlockBody } from "../OutlineBlockBody";
@@ -126,6 +131,8 @@ const defaultIO: ForestIO = {
 	getFold: (spaceId) => api.getOutlineFoldState(spaceId),
 	putFold: (spaceId, changes, keepalive) =>
 		api.putOutlineFoldState(spaceId, { changes }, keepalive),
+	resetFold: (spaceId, under, keepalive) => api.resetOutlineFoldState(spaceId, under, keepalive),
+	openTasks: (spaceId, under, cursor) => api.getOutlineOpenTasks(spaceId, under, cursor),
 };
 
 interface RowViewProps {
@@ -144,6 +151,8 @@ interface RowViewProps {
 	onToggle: (id: string, inside: boolean, open: boolean) => void;
 	onQuestions: (id: string) => void;
 	onEdit?: (id: string) => void;
+	/** Reads the open tasks under a block (the "in progress" count's list). */
+	openTasksOf: ForestIO["openTasks"];
 }
 
 const HIDDEN_KINDS = [
@@ -167,6 +176,7 @@ const BlockRowView = memo(function BlockRowView({
 	onToggle,
 	onQuestions,
 	onEdit,
+	openTasksOf,
 }: RowViewProps) {
 	const { t, i18n } = useTranslation("outline");
 	const block = row.block;
@@ -221,6 +231,7 @@ const BlockRowView = memo(function BlockRowView({
 			className={className}
 			aria-label={label}
 			data-tree-title=""
+			data-tree-nav=""
 		>
 			{children}
 		</OutlineLink>
@@ -229,7 +240,11 @@ const BlockRowView = memo(function BlockRowView({
 	// How much more is behind the line: counted where the read counted it.
 	const previewLabel =
 		row.previewKind === "report"
-			? t("forest.reportAll")
+			? row.previewRest !== null
+				? t(row.previewRestMore ? "forest.reportAllAtLeast" : "fold.reportAll", {
+						count: row.previewRest + 1,
+					})
+				: t("forest.reportAll")
 			: row.previewRest !== null && row.previewRest > 0
 				? t(row.previewRestMore ? "forest.moreAtLeast" : "fold.more", { count: row.previewRest })
 				: row.previewMore
@@ -283,13 +298,12 @@ const BlockRowView = memo(function BlockRowView({
 					) : (
 						// Always drawn: a row with nothing under it has a faint arrow that says nothing.
 						<span
-							className={classes.toggleButton}
-							style={{ opacity: 0.35, cursor: "default" }}
+							className={`${classes.toggleButton} ${classes.leafArrow}`}
 							aria-hidden="true"
 							data-tree-toggle=""
 							data-tree-leaf=""
 						>
-							<Arrow size={14} />
+							<Arrow size={10} />
 						</span>
 					)}
 				</span>
@@ -353,19 +367,13 @@ const BlockRowView = memo(function BlockRowView({
 								</Badge>
 							))}
 							{facts && openTasks > 0 && (
-								<Badge
-									size="xs"
-									variant="dot"
-									color="yellow"
-									tt="none"
-									title={t("forest.inProgressHint")}
-									data-testid="outline-in-progress"
-									renderRoot={(props) => (
-										<OutlineLink {...props} to={outlineBlockTarget(spaceId, id, "all", asOf)} />
-									)}
-								>
-									{t("page.inProgress", { count: openTasks })}
-								</Badge>
+								<InProgressMarker
+									spaceId={spaceId}
+									blockId={id}
+									count={openTasks}
+									asOf={asOf}
+									openTasks={openTasksOf}
+								/>
 							)}
 							{facts && openTasks === 0 && processHidden > 0 && (
 								<Tooltip label={t("page.hiddenUnderHint")} openDelay={300}>
@@ -512,6 +520,129 @@ const BlockRowView = memo(function BlockRowView({
 	);
 });
 
+/**
+ * The "in progress · N" count of a fact: opening it lists WHICH tasks (in progress first),
+ * read when it opens (`open-tasks`, a page at a time), each a link that focuses the task.
+ */
+function InProgressMarker({
+	spaceId,
+	blockId,
+	count,
+	asOf,
+	openTasks,
+}: {
+	spaceId: string;
+	blockId: string;
+	count: number;
+	asOf: number | undefined;
+	openTasks: ForestIO["openTasks"];
+}) {
+	const { t } = useTranslation("outline");
+	const [opened, setOpened] = useState(false);
+	const [list, setList] = useState<{
+		items: OutlineOpenTaskItem[];
+		next: string | null;
+		busy: boolean;
+		failed: boolean;
+	}>({ items: [], next: null, busy: false, failed: false });
+	const load = useCallback(
+		(cursor: string | null) => {
+			if (!openTasks) return;
+			setList((now) => ({ ...now, busy: true, failed: false }));
+			openTasks(spaceId, blockId, cursor).then(
+				(page) =>
+					setList((now) => ({
+						items: cursor === null ? page.items : [...now.items, ...page.items],
+						next: page.nextCursor,
+						busy: false,
+						failed: false,
+					})),
+				() => setList((now) => ({ ...now, busy: false, failed: true })),
+			);
+		},
+		[openTasks, spaceId, blockId],
+	);
+	return (
+		<Popover position="bottom-start" shadow="sm" width={300} opened={opened} onChange={setOpened}>
+			<Popover.Target>
+				<Badge
+					size="xs"
+					variant="dot"
+					color="yellow"
+					tt="none"
+					component="button"
+					type="button"
+					style={{ cursor: "pointer" }}
+					aria-label={t("page.inProgressHint")}
+					aria-expanded={opened}
+					data-testid="outline-in-progress"
+					onClick={(e: React.MouseEvent) => {
+						if (!plainClick(e)) return;
+						const next = !opened;
+						setOpened(next);
+						if (next) load(null);
+					}}
+				>
+					{t("page.inProgress", { count })}
+				</Badge>
+			</Popover.Target>
+			<Popover.Dropdown p={4} data-testid="outline-in-progress-list">
+				<Text size="xs" c="dimmed" px={6} pb={2}>
+					{t("page.inProgressHint")}
+				</Text>
+				<Stack gap={0}>
+					{list.items.map((item) => (
+						<OutlineLink
+							key={item.id}
+							to={outlineBlockTarget(spaceId, item.id, "all", asOf)}
+							className={classes.listItem}
+							data-in-progress-item={item.id}
+						>
+							<span style={{ display: "flex", gap: 6, alignItems: "center", minWidth: 0 }}>
+								<OutlineTaskIcon status={item.status} />
+								<Text span size="sm" className={classes.ellipsis}>
+									{item.title || t("fold.untitled")}
+								</Text>
+							</span>
+							{item.assignee && (
+								<Text size="xs" c="dimmed" className={classes.ellipsis}>
+									@{item.assignee}
+								</Text>
+							)}
+						</OutlineLink>
+					))}
+					{list.busy && <Loader size={12} m={6} />}
+					{list.failed && (
+						<Text size="xs" c="dimmed" px={6}>
+							{t("loadFailed")}
+						</Text>
+					)}
+					{list.next && !list.busy && (
+						<Anchor
+							component="button"
+							type="button"
+							size="xs"
+							px={6}
+							onClick={() => load(list.next)}
+							data-in-progress-more=""
+						>
+							{t("loadMore")}
+						</Anchor>
+					)}
+					<OutlineLink
+						to={outlineBlockTarget(spaceId, blockId, "all", asOf)}
+						className={classes.listItem}
+					>
+						<Text size="xs" c="dimmed">
+							{t("forest.inProgressFocus")}
+						</Text>
+					</OutlineLink>
+				</Stack>
+			</Popover.Dropdown>
+		</Popover>
+	);
+}
+
 function MoreRowView({
 	row,
 	indent,
@@ -548,6 +679,7 @@ function MoreRowView({
 						disabled={row.busy}
 						onClick={() => onMore(row.parentKey, row.mode)}
 						data-tree-more=""
+						data-tree-nav=""
 					>
 						{label}
 					</Anchor>
@@ -608,15 +740,27 @@ export interface ForestBlocksProps {
 	live?: boolean;
 }
 
-/** The model of one forest: made, loaded, watched and disposed with the component. */
-function useForest(props: ForestBlocksProps): SpaceForest | null {
+/**
+ * The model of one forest: made, loaded, watched and disposed with the component. `paused`:
+ * the watch had no room after its retries (live updates paused until `resume`).
+ */
+function useForest(props: ForestBlocksProps): {
+	forest: SpaceForest | null;
+	paused: boolean;
+	resume: () => void;
+} {
 	const { spaceId, rootId, view, asOf, io = defaultIO, live = true } = props;
 	const [forest, setForest] = useState<SpaceForest | null>(null);
+	const [paused, setPaused] = useState(false);
+	const retry = useRef<(() => void) | null>(null);
 	useEffect(() => {
 		const made = new SpaceForest({ spaceId, rootId, view, asOf, io, since: readSeen(spaceId) });
 		setForest(made);
 		void made.load();
+		// The folding still waiting goes out as the page is hidden or goes away.
+		const offLeave = onPageLeave(() => made.leave());
 		return () => {
+			offLeave();
 			// The next visit marks what changed after this one.
 			if (asOf === undefined && made.status === "ready") writeSeen(spaceId, made.knownSeq);
 			made.dispose();
@@ -627,13 +771,22 @@ function useForest(props: ForestBlocksProps): SpaceForest | null {
 	useEffect(() => {
 		if (REMOTE_BUILD || !live || asOf !== undefined || !forest) return;
 		const handle = outlineBlockWatch(() => narratorWSManager).open(spaceId, {
-			onWatching: (seq, added) => forest.onWatching(seq, added),
+			onWatching: (seq, added) => {
+				setPaused(false);
+				forest.onWatching(seq, added);
+			},
 			onChanged: (frame) => forest.onChanged(frame),
 			onPending: () => forest.onPending(),
 			onError: (code) => {
-				if (code === "access_denied") forest.onDenied();
+				// A transient deny (the root still reads) asks again, with a growing delay.
+				if (code === "access_denied") void forest.onDenied(() => handle.retry());
 			},
+			onPaused: () => setPaused(true),
 		});
+		retry.current = () => {
+			setPaused(false);
+			handle.retry();
+		};
 		const send = () => {
 			const keys = forest.watchKeys();
 			handle.set(keys.levels, keys.subtrees);
@@ -642,12 +795,14 @@ function useForest(props: ForestBlocksProps): SpaceForest | null {
 		const offRows = forest.subscribe(send);
 		send();
 		return () => {
+			retry.current = null;
 			offKeys();
 			offRows();
 			handle.dispose();
 		};
 	}, [forest, spaceId, asOf, live]);
-	return forest;
+	const resume = useCallback(() => retry.current?.(), []);
+	return { forest, paused, resume };
 }
 
 const NO_ROWS: ForestRow[] = [];
@@ -657,7 +812,7 @@ const zero = () => 0;
 export function ForestBlocks(props: ForestBlocksProps) {
 	const { spaceId, view, asOf, indent, locate, onLocated, onEdit, onForest } = props;
 	const { t } = useTranslation("outline");
-	const forest = useForest(props);
+	const { forest, paused, resume } = useForest(props);
 	useEffect(() => {
 		onForest?.(forest);
 		return () => onForest?.(null);
@@ -839,6 +994,7 @@ export function ForestBlocks(props: ForestBlocksProps) {
 					onToggle={onToggle}
 					onQuestions={onQuestions}
 					onEdit={onEdit}
+					openTasksOf={io.openTasks}
 				/>
 			);
 		} else if (row.kind === "more") {
@@ -864,6 +1020,8 @@ export function ForestBlocks(props: ForestBlocksProps) {
 					my="xs"
 					ml={indentOf(row.depth) + 24}
 					data-testid="outline-tree-questions"
+					// Its fields keep their tab stops (the tree is otherwise one, `tree-roving.ts`).
+					data-tree-keep=""
 				>
 					<OutlineQuestionsForm blockId={row.under} showOpenLink={false} live={false} />
 				</Paper>
@@ -893,6 +1051,28 @@ export function ForestBlocks(props: ForestBlocksProps) {
 			data-forest-rows={rows.length}
 			data-forest-seq={forest.knownSeq}
 		>
+			{(paused || forest.foldSaveFailed) && (
+				<div
+					className={classes.treeNote}
+					style={{ paddingInlineStart: base + 24 }}
+					role="status"
+					data-forest-notice={paused ? "paused" : "fold"}
+				>
+					<Text span size="xs" c="dimmed">
+						{t(paused ? "forest.livePaused" : "forest.foldNotSaved")}
+					</Text>
+					<Anchor
+						component="button"
+						type="button"
+						size="xs"
+						ml={8}
+						onClick={() => (paused ? resume() : forest.retryFoldSave())}
+						data-forest-notice-retry=""
+					>
+						{t("forest.retry")}
+					</Anchor>
+				</div>
+			)}
 			<div ref={win.topRef} style={{ height: win.padTop }} aria-hidden="true" />
 			{drawn}
 			<div ref={win.bottomRef} style={{ height: win.padBottom }} aria-hidden="true" />
