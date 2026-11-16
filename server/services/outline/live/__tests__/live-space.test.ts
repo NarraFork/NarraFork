@@ -10,6 +10,13 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { LiveClient } from "@frontend/components/outline/editor/live-client";
+import {
+	acquireLiveSession,
+	releaseLiveSession,
+	retainLiveSession,
+	type SharedLiveSession,
+	setLiveSessionGraceForTests,
+} from "@frontend/components/outline/editor/live-sessions";
 import { type ClientOp, keyBetweenLoose } from "@frontend/components/outline/editor/store";
 import {
 	clearUnsavedTextsForTests,
@@ -2301,5 +2308,79 @@ describe("deterministic sequences (review round 2)", () => {
 		const kept = unsavedTextsOf(pageId).map((e) => [e.blockId, e.text, e.reason]);
 		expect(kept).toEqual([[x, "x KEEP", "rejected"]]);
 		expect(await content(x)).toBe("x");
+	});
+	test("switching pages in one tab over a large space: never refused for the pages that tab just left (their grace period)", async () => {
+		const pages = [];
+		for (let i = 0; i < 6; i++)
+			pages.push(
+				await page(
+					Array.from({ length: 9 }, (_, n) => `p${i} b${n}`),
+					`P${i}`,
+				),
+			);
+		// Three pages of ten blocks a person; plenty for the space at first, then not.
+		OUTLINE_LIVE_BOUNDS.maxUserBlocks = 35;
+		OUTLINE_LIVE_TIMING.idleCloseMs = 600_000;
+		setLiveSessionGraceForTests(600_000);
+		const la = link(owner);
+		const held: SharedLiveSession[] = [];
+		try {
+			let previous: SharedLiveSession | null = null;
+			for (const [i, p] of pages.entries()) {
+				const shared = acquireLiveSession(la, p.pageId, "edit");
+				if (!shared) throw new Error("no session");
+				held.push(shared);
+				retainLiveSession(shared);
+				// The tab moves on: the page it left only waits out its grace period.
+				if (previous) releaseLiveSession(previous);
+				previous = shared;
+				await clock.until(
+					() => shared.client.ready || shared.client.closeCode !== null,
+					5000,
+					`page ${i} answered`,
+				);
+				expect({ i, code: shared.client.closeCode, ready: shared.client.ready }).toEqual({
+					i,
+					code: null,
+					ready: true,
+				});
+			}
+			// The same with the space's own bound: the pages the tab left (each still in its grace
+			// period, so someone is in them) go to make room for the next.
+			const more = [];
+			for (let i = 0; i < 3; i++)
+				more.push(
+					await page(
+						Array.from({ length: 9 }, (_, n) => `q${i} b${n}`),
+						`Q${i}`,
+					),
+				);
+			OUTLINE_LIVE_BOUNDS.maxUserBlocks = 8000;
+			expect(theSpace().loadedBlocks).toBe(60);
+			OUTLINE_LIVE_BOUNDS.maxLoadedBlocks = 65;
+			const next = acquireLiveSession(la, more[0]?.pageId as string, "edit");
+			if (!next) throw new Error("no session");
+			held.push(next);
+			retainLiveSession(next);
+			if (previous) releaseLiveSession(previous);
+			await clock.until(() => next.client.ready || next.client.closeCode !== null, 5000, "next");
+			expect(next.client.closeCode).toBeNull();
+			expect(theSpace().loadedBlocks).toBeLessThanOrEqual(65);
+			// A second panel of the tab, both on screen.
+			const panel = acquireLiveSession(la, more[1]?.pageId as string, "edit");
+			if (!panel) throw new Error("no session");
+			held.push(panel);
+			retainLiveSession(panel);
+			await clock.until(() => panel.client.ready, 5000, "panel joined");
+			// Another tab when the space is full: refused, and no page someone is on closed for it.
+			OUTLINE_LIVE_BOUNDS.maxLoadedBlocks = 25;
+			const other = open(link(owner), more[2]?.pageId as string);
+			await clock.until(() => other.closeCode !== null || other.ready, 5000, "other answered");
+			expect(other.closeCode).toBe("space_full");
+			expect([next.client.status, panel.client.status]).toEqual(["live", "live"]);
+		} finally {
+			setLiveSessionGraceForTests(null);
+			for (const shared of held) shared.client.dispose();
+		}
 	});
 });

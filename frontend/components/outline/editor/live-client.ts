@@ -391,6 +391,12 @@ export class LiveClient {
 	private wantPresence: LiveSelWire | null = null;
 	private retryTimer: LiveTimer | null = null;
 	private retries = 0;
+	/**
+	 * Set by the tab's sessions (`live-sessions.ts`): let go of pages this tab left and holds
+	 * only for their grace period; true when one went (a join refused for room is asked again).
+	 */
+	makeRoom: (() => boolean) | null = null;
+	private roomAsked = false;
 	/** The number of this client's last join (`LiveJoinHead.j`, `superseded`). */
 	private joinSeq = 0;
 	private readonly listeners = new Set<(event: ClientEvent) => void>();
@@ -1568,6 +1574,7 @@ export class LiveClient {
 
 	private onJoined(head: LiveJoinedHead, body: Uint8Array): void {
 		this.retries = 0;
+		this.roomAsked = false;
 		this.me = head.me;
 		this.canWrite = head.w;
 		this.presence.clear();
@@ -1831,6 +1838,16 @@ export class LiveClient {
 	}
 
 	private onClosed(code: LiveCloseCode): void {
+		// Refused for room: pages this tab holds only for a moment after leaving them (its
+		// sessions' grace period, `live-sessions.ts`) count as open on the server. Let them go
+		// and ask once more: a person moving on in one tab is not refused for the page they just
+		// left. Once only per refusal, so it never goes round.
+		if ((code === "user_limit" || code === "space_full") && !this.roomAsked && this.makeRoom?.()) {
+			this.roomAsked = true;
+			this.log.push(`refused (${code}): let this tab's left pages go and joined again`);
+			this.join();
+			return;
+		}
 		this.closeCode = code;
 		if (code !== "ended" && code !== "unavailable") {
 			// Closed for good (refused after typing on the read, access gone, too large, this
