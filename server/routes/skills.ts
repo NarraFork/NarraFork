@@ -104,7 +104,7 @@ skillRoutes.post("/import", async (c) => {
 skillRoutes.post("/global/:name/update-from-url", requireAdmin, async (c) => {
 	const url = await readImportUrl(c);
 	return c.json(
-		await skillService.updateGlobalSkillFromUrl(c.req.param("name"), url, c.req.raw.signal),
+		await skillService.updateGlobalSkillFromUrl(c.req.param("name") ?? "", url, c.req.raw.signal),
 	);
 });
 
