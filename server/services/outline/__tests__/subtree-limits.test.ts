@@ -298,3 +298,123 @@ describe("a live subtree read that skips blocks", () => {
 		expect([...(read?.nodes.keys() ?? [])]).toEqual([rootId]);
 	});
 });
+
+/** The store, counting the level rows it hands out. */
+function countingStore() {
+	const counted = { rows: 0 };
+	const store = new Proxy(outlineStore, {
+		get(target, prop, receiver) {
+			const value = Reflect.get(target, prop, receiver);
+			if (prop === "listLevel" || prop === "listLevels") {
+				return async (...args: unknown[]) => {
+					const out = (await (value as (...a: unknown[]) => Promise<{ rows: unknown[] }>).apply(
+						target,
+						args,
+					)) as { rows: unknown[] };
+					counted.rows += out.rows.length;
+					return out;
+				};
+			}
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+	return { store, counted };
+}
+
+describe("the facts view reads what it shows, and what hides before it", () => {
+	async function wideAndSmall() {
+		const userId = await seedUser();
+		let space = await outlineStore.ensureSpace({ kind: "personal", ownerUserId: userId }, NOW);
+		const tops = await human(space, userId, [
+			{ op: "insert", parent: null, content: "Wide" },
+			{ op: "insert", parent: null, content: "Small" },
+		]);
+		const [wide, small] = tops.results.map((r) => r.blockId as string) as [string, string];
+		for (let i = 0; i < 1000; i += 200) {
+			await human(
+				space,
+				userId,
+				Array.from({ length: 200 }, (_, k) => ({
+					op: "insert" as const,
+					parent: { id: wide },
+					content: `fact ${i + k}`,
+				})),
+			);
+		}
+		await human(space, userId, [
+			{ op: "insert", parent: { id: small }, content: "small one" },
+			{ op: "insert", parent: { id: small }, content: "small two" },
+		]);
+		space = await fresh(space);
+		return { space, wide, small };
+	}
+
+	test("a wide parent takes no other parent's share, in either view", async () => {
+		const { space, wide, small } = await wideAndSmall();
+		for (const view of ["all", "facts"] as const) {
+			const { store, counted } = countingStore();
+			const read = await readOutlineLevels({
+				space,
+				parents: [{ parentId: wide }, { parentId: small }],
+				perParent: 3,
+				limit: 100,
+				view,
+				store,
+			});
+			const levelOf = (id: string) => read.levels.find((level) => level.parentId === id);
+			expect({ view, wide: levelOf(wide)?.childIds.length, more: levelOf(wide)?.more }).toEqual({
+				view,
+				wide: 3,
+				more: true,
+			});
+			expect({ view, small: levelOf(small)?.childIds.length, more: levelOf(small)?.more }).toEqual({
+				view,
+				small: 2,
+				more: false,
+			});
+			expect(counted.rows).toBeLessThanOrEqual(6);
+		}
+	});
+
+	test("a subtree read with a small budget reads about that many rows, in either view", async () => {
+		const { space, wide } = await wideAndSmall();
+		for (const view of ["all", "facts"] as const) {
+			const { store, counted } = countingStore();
+			const read = await readOutlineSubtree({
+				space,
+				rootId: wide,
+				budget: { blocks: 10 },
+				view,
+				store,
+			});
+			expect(read?.blocks.length).toBe(10);
+			expect({ view, rows: counted.rows <= 11 }).toEqual({ view, rows: true });
+		}
+	});
+
+	test("fifty small spaces read top-down cost the facts view no more rows than the all view", async () => {
+		const userId = await seedUser();
+		const totals = { all: 0, facts: 0 };
+		for (let n = 0; n < 50; n++) {
+			const narratorId = await seedNarrator();
+			let space = await outlineStore.ensureSpace({ kind: "session", narratorId }, NOW);
+			await human(
+				space,
+				userId,
+				Array.from({ length: 30 }, (_, i) => ({
+					op: "insert" as const,
+					parent: null,
+					content: `top ${i}`,
+				})),
+			);
+			space = await fresh(space);
+			for (const view of ["all", "facts"] as const) {
+				const { store, counted } = countingStore();
+				await readOutlineSubtree({ space, rootId: null, budget: { blocks: 12 }, view, store });
+				totals[view] += counted.rows;
+			}
+		}
+		expect(totals.facts).toBeLessThanOrEqual(totals.all);
+		expect(totals.all).toBeLessThanOrEqual(50 * 13);
+	});
+});

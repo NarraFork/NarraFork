@@ -35,8 +35,10 @@
  * THE FACTS VIEW leaves tasks and questions out, and with them what is under them
  * (`tree.ts`); each level says how many it left out. A root that is process, or under it, is
  * read whole whatever was asked. What it leaves out costs the budget of blocks shown nothing
- * (a level of many tasks before its facts still shows the facts): it reads as far as the
- * call's 800 store rows go, and where they run out among hidden rows the level continues after
+ * (a level of many tasks before its facts still shows the facts). A read first asks for what it
+ * can show, and only while fewer are shown goes on where it stopped, in doubling chunks, within
+ * the call's 800 store rows: hidden rows cost what lies before the shown ones, and a wide parent
+ * never takes another's share. Where the rows run out among hidden ones the level continues after
  * the last row read (`nextCursor`, and `resumeAfter` for readers that continue by a child).
  *
  * FOLDED READS (`fold`)
@@ -228,14 +230,17 @@ function draftOf(
 }
 
 /**
- * The children of several parents from their beginnings, at most `limit` of them SHOWN: one
- * store read (`listLevels`), split by parent. Rows the view leaves out (the facts view's tasks
- * and questions) cost `limit` nothing, only the call's store rows (`rowsLeft`): the facts view
- * asks for all the rows the call may still take, the all view for one more than it can show.
- * The read takes one row more than it returns, so it knows whether the parent the limit ended
- * in has more children or the limit fell exactly between two parents. Parents the limit did not
- * reach come back as unread drafts (`more`, no rows). `shown`: the rows returned that the view
- * shows.
+ * The children of several parents from their beginnings, at most `limit` of them SHOWN, split
+ * by parent in the order given. Rows the view leaves out (the facts view's tasks and questions)
+ * cost `limit` nothing: they cost store rows only, and only those that lie before the rows
+ * shown. The first read asks for one row more than `limit` (`listLevels`, all the parents at
+ * once): enough for the all view, which shows every row. While fewer than that are shown, the
+ * store had more and the call has store rows left (`rowsLeft`), the read goes on where it
+ * stopped, in chunks that double: the parent it stopped in from its cursor (`listLevel`), the
+ * parents after it from their beginnings. So a wide parent never takes another parent's share,
+ * and a read costs about what it shows plus the hidden rows before them. Parents the read did
+ * not reach come back as unread drafts (`more`, no rows). `shown`: the rows returned that the
+ * view shows.
  */
 async function readLevelsFromStart(
 	ctx: ReadContext,
@@ -243,45 +248,73 @@ async function readLevelsFromStart(
 	limit: number,
 	view: OutlineViewMode,
 ): Promise<{ drafts: LevelDraft[]; shown: number }> {
-	const asked = view === "all" ? Math.min(limit + 1, ctx.rowsLeft) : ctx.rowsLeft;
-	if (asked <= 0) {
-		return {
-			drafts: [...new Set(parentIds)].map((parentId) => draftOf(parentId, [], true, view, null)),
-			shown: 0,
-		};
+	const order = [...new Set(parentIds)];
+	const finished = new Set<string | null>();
+	const resumeAt = new Map<string | null, OutlineLevelCursor>();
+	const read: OutlineLevelRow[] = [];
+	let next = 0;
+	let shown = 0;
+	let chunk = limit + 1;
+	while (next < order.length && shown <= limit && ctx.rowsLeft > 0) {
+		const ask = Math.min(Math.max(limit - shown + 1, chunk), ctx.rowsLeft);
+		const head = order[next] as string | null;
+		const cursor = resumeAt.get(head);
+		let rows: OutlineLevelRow[];
+		if (cursor) {
+			const found = await ctx.store.listLevel(ctx.space.id, head, {
+				asOf: ctx.asOf,
+				after: cursor,
+				limit: ask,
+			});
+			rows = found.rows;
+			if (found.next === null) {
+				finished.add(head);
+				next++;
+			} else resumeAt.set(head, found.next);
+		} else {
+			const found = await ctx.store.listLevels(ctx.space.id, order.slice(next), {
+				asOf: ctx.asOf,
+				limit: ask,
+			});
+			rows = found.rows;
+			const last = rows.at(-1);
+			if (!found.truncated || !last) {
+				for (let i = next; i < order.length; i++) finished.add(order[i] as string | null);
+				next = order.length;
+			} else {
+				// Only the parent of the last row may be cut short; those before it are whole.
+				const cut = order.indexOf(last.parentId, next);
+				for (let i = next; i < cut; i++) finished.add(order[i] as string | null);
+				next = cut;
+				resumeAt.set(last.parentId, { orderKey: last.orderKey, id: last.id });
+			}
+		}
+		ctx.rowsLeft -= rows.length;
+		for (const row of rows) {
+			read.push(row);
+			if (shows(view, row)) shown++;
+		}
+		chunk *= 2;
 	}
-	const found = await ctx.store.listLevels(ctx.space.id, parentIds, {
-		asOf: ctx.asOf,
-		limit: asked,
-	});
-	ctx.rowsLeft -= found.rows.length;
-	const usable = keepForShown(found.rows, asked - 1, limit, view);
-	const rows = found.rows.slice(0, usable);
-	/** The first row past what is returned: its parent is where the limit ended. */
-	const peek = found.rows[usable];
+	const usable = keepForShown(read, read.length, limit, view);
 	const byParent = new Map<string | null, OutlineLevelRow[]>();
-	for (const row of rows) {
+	for (const row of read.slice(0, usable)) {
 		const list = byParent.get(row.parentId);
 		if (list) list.push(row);
 		else byParent.set(row.parentId, [row]);
 	}
-	const drafts: LevelDraft[] = [];
-	// Parents come back in the order given. Before the peeked row's parent every level is
-	// whole; that parent has more; after it nothing is returned: such a parent has children when
-	// the store had more, or when rows of it were read past what is returned.
-	const readPast = new Set(found.rows.slice(usable).map((row) => row.parentId));
-	let state: "whole" | "after" = "whole";
-	for (const parentId of new Set(parentIds)) {
-		const own = byParent.get(parentId) ?? [];
-		if (!peek) drafts.push(draftOf(parentId, own, false, view, null));
-		else if (state === "after")
-			drafts.push(draftOf(parentId, [], found.truncated || readPast.has(parentId), view, null));
-		else if (parentId === peek.parentId) {
-			drafts.push(draftOf(parentId, own, true, view, null));
-			state = "after";
-		} else drafts.push(draftOf(parentId, own, false, view, null));
-	}
-	return { drafts, shown: rows.filter((row) => shows(view, row)).length };
+	// Rows read past what is returned: their parents have more.
+	const readPast = new Set(read.slice(usable).map((row) => row.parentId));
+	const drafts = order.map((parentId) =>
+		draftOf(
+			parentId,
+			byParent.get(parentId) ?? [],
+			!finished.has(parentId) || readPast.has(parentId),
+			view,
+			null,
+		),
+	);
+	return { drafts, shown: Math.min(shown, limit) };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -559,24 +592,41 @@ export async function readOutlineLevelsNodes(
 			for (const parent of parents) {
 				const startCursor = parent.cursor ?? null;
 				const want = Math.min(room, perParent ?? room);
-				// Rows the view leaves out cost `room` nothing: the facts view reads as far as the
-				// call's store rows go and keeps what shows `want` of them.
-				const take = view === "all" ? Math.min(want, ctx.rowsLeft) : ctx.rowsLeft;
-				if (want <= 0 || take <= 0) {
+				if (want <= 0 || ctx.rowsLeft <= 0) {
 					drafts.push(draftOf(parent.parentId, [], true, view, startCursor));
 					continue;
 				}
-				const found = await store.listLevel(space.id, parent.parentId, {
-					asOf: ctx.asOf,
-					after: startCursor ? decodeOutlineLevelCursor(startCursor) : null,
-					limit: take,
-				});
-				ctx.rowsLeft -= found.rows.length;
-				const keep = keepForShown(found.rows, found.rows.length, want, view);
-				const rows = found.rows.slice(0, keep);
+				// `want` rows first, which the all view shows; while fewer are shown, the parent
+				// goes on from its cursor in doubling chunks, within the call's store rows. Hidden
+				// rows cost only what lies before the shown ones; no parent takes another's share.
+				const read: OutlineLevelRow[] = [];
+				let after = startCursor ? decodeOutlineLevelCursor(startCursor) : null;
+				let more = true;
+				let shownHere = 0;
+				let chunk = want;
+				while (ctx.rowsLeft > 0) {
+					const found = await store.listLevel(space.id, parent.parentId, {
+						asOf: ctx.asOf,
+						after,
+						limit: Math.min(Math.max(chunk, want - shownHere), ctx.rowsLeft),
+					});
+					ctx.rowsLeft -= found.rows.length;
+					for (const row of found.rows) {
+						read.push(row);
+						if (shows(view, row)) shownHere++;
+					}
+					if (found.next === null) {
+						more = false;
+						break;
+					}
+					if (shownHere >= want) break;
+					after = found.next;
+					chunk *= 2;
+				}
+				const keep = keepForShown(read, read.length, want, view);
+				const rows = read.slice(0, keep);
 				room -= rows.filter((row) => shows(view, row)).length;
-				const more = keep < found.rows.length || found.next !== null;
-				drafts.push(draftOf(parent.parentId, rows, more, view, startCursor));
+				drafts.push(draftOf(parent.parentId, rows, more || keep < read.length, view, startCursor));
 			}
 		}
 		const order = drafts.flatMap((draft) => draft.rows);

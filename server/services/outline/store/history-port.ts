@@ -213,9 +213,9 @@ export interface OutlineHistoryPort {
 	 * parent, each parent's in sibling order, at most `limit` in all; `truncated` when there are
 	 * more, and then only the parent of the last row may be cut short. Parents come in the
 	 * order given (each once), `null` where it stands. One statement per 500 parents. Refused
-	 * like {@link listLevel}. Callers keep `limit` at what one read may take: 801 for a
-	 * subtree read (the facts view asks for all of what is left of its 800 rows, its hidden
-	 * rows costing the blocks shown nothing), about 1,000 for `readLiveSubtree` widening a
+	 * like {@link listLevel}. Callers keep `limit` at what one read may take: at most 801 for a
+	 * subtree read (it asks for what it can show plus one, and the facts view goes on in
+	 * doubling chunks within the call's 800 rows), about 1,000 for `readLiveSubtree` widening a
 	 * level its skipped rows crowded (`limit + 1 + OUTLINE_LIVE_SUBTREE_MAX_SKIPPED`).
 	 */
 	listLevels(

@@ -650,6 +650,59 @@ describe("equivalence with reads by page, and what a read costs", () => {
 		expect((next.output.match(/\] Fact \d/g) ?? []).length).toBe(5);
 	});
 
+	test("tasks and facts interleaved over 1,200 children page to every fact once, now and as of a seq", async () => {
+		const w = await world();
+		const made = await humanWrite(w.space, w.alice, [
+			{ op: "insert", parent: null, content: "Parent" },
+		]);
+		const parentId = made.results[0]?.blockId as string;
+		const expected: string[] = [];
+		for (let start = 0; start < 1200; start += 150) {
+			const ops: OutlineOp[] = [];
+			for (let i = start; i < start + 150; i++) {
+				const fact = i % 9 === 4 || (i > 1000 && i % 3 === 0);
+				ops.push({
+					op: "insert",
+					parent: { id: parentId },
+					content: fact ? `Fact ${i}` : `Task ${i}`,
+					...(fact ? {} : { task: { status: "todo" as const } }),
+				});
+				if (fact) expected.push(`Fact ${i}`);
+			}
+			await humanWrite(w.space, w.alice, ops);
+		}
+		const seq = ((await outlineStore.getSpace(w.space.id))?.nextSeq ?? 1) - 1;
+		await humanWrite(w.space, w.alice, [
+			{ op: "insert", parent: { id: parentId }, content: "Fact LATE" },
+		]);
+		const sid = (await outlineStore.getBlock(parentId))?.sid as string;
+		for (const asOf of [undefined, seq]) {
+			for (const budget of [5, 37, 80]) {
+				const seen: string[] = [];
+				const at = asOf === undefined ? {} : { asOf };
+				let args: Record<string, unknown> = { address: sid, budget, ...at };
+				for (let calls = 0; ; calls++) {
+					expect(calls).toBeLessThan(400);
+					const read = await call(outlineReadTool, args, w.c);
+					expect(read.isError).toBeUndefined();
+					const pattern =
+						args.after === undefined
+							? /^ {2}- \[([^\]]+)\] (Fact \S+)$/gm
+							: /^- \[([^\]]+)\] (Fact \S+)$/gm;
+					const lines = [...read.output.matchAll(pattern)];
+					for (const m of lines) seen.push(m[2] as string);
+					const resume = /OutlineRead \{ address: "([^"]+)", after: "([^"]+)" \}/.exec(read.output);
+					const more = /^ *‹… (?:\d+\+? )?more›$/m.test(read.output);
+					if (resume) args = { address: sid, after: resume[2], budget, ...at };
+					else if (more && lines.length > 0)
+						args = { address: sid, after: (lines.at(-1) as RegExpMatchArray)[1], budget, ...at };
+					else break;
+				}
+				expect(seen).toEqual(asOf === undefined ? [...expected, "Fact LATE"] : expected);
+			}
+		}
+	});
+
 	test("outputs stay bounded whatever is under the block", async () => {
 		const w = await world();
 		const [root] = (
