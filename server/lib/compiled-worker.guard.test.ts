@@ -24,8 +24,8 @@ test("production compile spreads the worker registry instead of listing worker p
 	}
 });
 
-test("local and release builds share all 18 unique, existing worker entries", () => {
-	expect(COMPILED_WORKER_ENTRIES).toHaveLength(18);
+test("local and release builds share all 19 unique, existing worker entries", () => {
+	expect(COMPILED_WORKER_ENTRIES).toHaveLength(19);
 	expect(new Set(COMPILED_WORKER_ENTRIES).size).toBe(COMPILED_WORKER_ENTRIES.length);
 	expect(compiledWorkerBuildEntrypoints()).toEqual(
 		COMPILED_WORKER_ENTRIES.map((entry) => `./server/${entry}`),
@@ -157,6 +157,7 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 	"lib/startup-status/worker.ts": ["lib/startup-status/index.ts"],
 	"lib/agent/request-json-worker.ts": ["lib/agent/request-json.ts"],
 	"lib/agent/image-generation-response-worker.ts": ["lib/agent/image-generation-response.ts"],
+	"lib/document-preview/worker.ts": ["lib/document-preview/client.ts"],
 	"services/editor-document-worker.ts": ["services/editor-document-jobs.ts"],
 	"services/editor-document-stream-worker.ts": ["services/editor-document-streams.ts"],
 	"services/outline/edit-text-worker.ts": ["services/outline/edit-text-runner.ts"],
@@ -223,11 +224,11 @@ function ownerText(paths: readonly string[]): string {
 }
 const admission = /\bnew\s+(?:WorkerPool|TaskQueue)\s*\(/;
 
-test("all 29 families have explicit common-runtime coverage: 18 entries, 6 trusted evals, 5 processes", () => {
-	expect(Object.keys(entryOwners)).toHaveLength(18);
+test("all 30 families have explicit common-runtime coverage: 19 entries, 6 trusted evals, 5 processes", () => {
+	expect(Object.keys(entryOwners)).toHaveLength(19);
 	expect(evalOwners).toHaveLength(6);
 	expect(processOwners).toHaveLength(5);
-	expect(COMPILED_WORKER_ENTRIES.length + evalOwners.length + processOwners.length).toBe(29);
+	expect(COMPILED_WORKER_ENTRIES.length + evalOwners.length + processOwners.length).toBe(30);
 	for (const entry of COMPILED_WORKER_ENTRIES) {
 		const text = ownerText(entryOwners[entry]);
 		expect(text.includes(entry), entry).toBe(true);
