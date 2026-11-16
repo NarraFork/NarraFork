@@ -216,7 +216,7 @@ describe("text entries (protocol version 2)", () => {
 		expect(decodeLiveTexts(long)).toBeNull();
 		expect(decodeLiveTexts(body, 1)).toBeNull();
 		expect(decodeLiveTexts(body, 2)).toHaveLength(2);
-		expect(OUTLINE_LIVE_PROTOCOL_VERSION).toBe(3);
+		expect(OUTLINE_LIVE_PROTOCOL_VERSION).toBe(4);
 	});
 });
 

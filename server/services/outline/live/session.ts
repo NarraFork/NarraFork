@@ -1319,7 +1319,7 @@ export class LiveSpace {
 	/** A watch no longer holds a block's text (the block left what it covers). */
 	private holdNoMore(id: string, view: HeldBy): void {
 		const b = this.mirror.get(id);
-		if (!b || !b.held.includes(view)) return;
+		if (!b?.held.includes(view)) return;
 		const rest = b.held.filter((h) => h !== view);
 		this.mirror.update(id, { held: rest.length > 0 ? rest : HELD_BY_NOBODY });
 	}

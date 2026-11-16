@@ -10,12 +10,7 @@
 
 import { heapStats } from "bun:jsc";
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import {
-	decodeLiveFrame,
-	LIVE_FRAME,
-	type LiveFrame,
-	OUTLINE_LIVE_PROTOCOL_VERSION,
-} from "@shared/outline-live-protocol";
+import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
 import { db } from "../../../../db";
 import { projects, users } from "../../../../db/schema";
 import { generateId } from "../../../../lib/id";

@@ -16,7 +16,6 @@ import {
 	LIVE_TEXT_KIND,
 	type LiveFrame,
 	OUTLINE_LIVE_MAX_HANDLE,
-	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
 import { seededTextDoc } from "@shared/outline-live-text";
 import { and, eq } from "drizzle-orm";
