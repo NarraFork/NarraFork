@@ -567,7 +567,7 @@ describe("annotations", () => {
 		expect(isReadAnnotation(OUTLINE_TEXT.more(12))).toBe(true);
 		expect(isReadAnnotation(`    ${OUTLINE_TEXT.more(1)}`)).toBe(true);
 		expect(isReadAnnotation(OUTLINE_TEXT.factsOnly(3))).toBe(true);
-		expect(isReadAnnotation(OUTLINE_TEXT.pageTruncated(10))).toBe(true);
+		expect(isReadAnnotation(OUTLINE_TEXT.readTruncated(10))).toBe(true);
 		expect(isReadAnnotation("- ‹… 3 more›")).toBe(false);
 		expect(isReadAnnotation("  ‹facts only›")).toBe(false);
 		expect(isReadAnnotation("‹a› b")).toBe(false);

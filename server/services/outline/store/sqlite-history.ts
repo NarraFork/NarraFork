@@ -273,6 +273,21 @@ export const SQLITE_ANCESTRY_OF = `WITH RECURSIVE up(id) AS (
 	LIMIT ?2`;
 
 /**
+ * {@link SQLITE_ANCESTRY_OF} with deleted blocks of the space starting walks too (`listAncestryOf`
+ * with `includeDeleted`): the same probes by primary key.
+ */
+export const SQLITE_ANCESTRY_OF_WITH_DELETED = `WITH RECURSIVE up(id) AS (
+		SELECT s.id FROM json_each(?1) j CROSS JOIN outline_blocks s ON s.id = j.value
+			WHERE s.space_id = ?3
+		UNION
+		SELECT b.parent_id FROM up CROSS JOIN outline_blocks b
+			ON b.id = up.id WHERE b.parent_id IS NOT NULL
+	)
+	SELECT b.id, b.parent_id, b.space_id, b.deleted, ${LOCKED("b")}
+	FROM up CROSS JOIN outline_blocks b ON b.id = up.id
+	LIMIT ?2`;
+
+/**
  * For each pair `[block id, seq]` of the JSON array `?1` whose block is of the space `?3`:
  * where it last sat as of that seq and whether that was strictly under the block `?2`, one row
  * per pair (`OutlineHistoryPort.listUnderRootAt`). The first step takes the block's last
@@ -551,7 +566,8 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 			);
 		},
 
-		async listAncestryOf(spaceId, blockIds, limit) {
+		async listAncestryOf(spaceId, blockIds, limit, options) {
+			const withDeleted = options?.includeDeleted === true;
 			const max = Math.max(0, Math.floor(limit));
 			const seen = new Map<string, OutlineParentRow>();
 			let truncated = false;
@@ -561,15 +577,21 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 					truncated = true;
 					break;
 				}
-				const rows = values(SQLITE_ANCESTRY_OF, [
+				const rows = values(withDeleted ? SQLITE_ANCESTRY_OF_WITH_DELETED : SQLITE_ANCESTRY_OF, [
 					JSON.stringify(chunk),
 					room + 1,
 					spaceId,
 				]) as Array<[string, string | null, string, number, number]>;
 				if (rows.length > room) truncated = true;
 				for (const row of rows.slice(0, room)) {
-					if (row[2] !== spaceId || Number(row[3]) !== 0) continue;
-					seen.set(row[0], { id: row[0], parentId: row[1], locked: Number(row[4]) !== 0 });
+					const deleted = Number(row[3]) !== 0;
+					if (row[2] !== spaceId || (deleted && !withDeleted)) continue;
+					seen.set(row[0], {
+						id: row[0],
+						parentId: row[1],
+						locked: Number(row[4]) !== 0,
+						...(withDeleted ? { deleted } : {}),
+					});
 				}
 			}
 			return { rows: [...seen.values()], truncated };

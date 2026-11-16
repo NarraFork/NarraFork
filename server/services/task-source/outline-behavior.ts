@@ -27,11 +27,11 @@
  *
  * Should the outline be switched off later, the session runs as a spec session and reads its
  * old fence: the spec fence reader puts the page's text ahead of it then
- * (`behaviorPageForSpecFence`), so the rules the import moved never drop out.
+ * (`behaviorBoundaryForSpecFence`), so the rules the import moved never drop out.
  *
  * FORKS
  * -----
- * A fork copies the page ({@link copyOutlineBehaviorPage}): the parent session's page as it is,
+ * A fork copies the page ({@link copyOutlineBehaviorBoundary}): the parent session's page as it is,
  * without checkboxes, breadth first, at most {@link OUTLINE_BEHAVIOR_LIMITS.forkBlocks} blocks
  * with a note when cut, with its short ids (design §2.5: fork = copy). The rest of the session
  * space is not copied (as in PR 3).
@@ -54,23 +54,25 @@ import { createHash } from "node:crypto";
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import {
+	getOutlineBehaviorBoundaryTitle,
 	getOutlineBehaviorForkCutNote,
-	getOutlineBehaviorPageTitle,
 	getUserLanguage,
 	type Locale,
 } from "@server/lib/prompt-i18n";
 import { isSpecLossAttachSid, isSpecLossRuleSid } from "@shared/outline-spec-import";
+import { OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
 import { splitBehaviorFence } from "../behavior-fence-sop";
 import { readNarrator } from "../outline/access-reads";
 import type { EditTextItem } from "../outline/edit-text";
 import { OUTLINE_EDIT_TEXT_LIMITS, processEditText } from "../outline/edit-text-runner";
 import { OUTLINE_TEXT } from "../outline/messages";
 import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_LIMITS } from "../outline/model";
-import { loadBodiesWithin, readSubtree } from "../outline/read";
+import { loadBodiesWithin } from "../outline/read";
 import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
-import type { OutlineBlockMeta, OutlineStore } from "../outline/store/port";
-import { breadthFirst, type OutlineNode, subtreeNodes } from "../outline/tree";
+import { readLiveSubtree } from "../outline/subtree-read";
+import { breadthFirst, type OutlineNode } from "../outline/tree";
+import { findBehaviorBlock } from "../outline/well-known";
 import { type OutlineCanonicalContent, type OutlineOp, writeOutline } from "../outline/write";
 import { specVfsService, writeSpecFile } from "../spec-vfs-service";
 import { readTaskSession } from "./backend";
@@ -98,19 +100,14 @@ export const OUTLINE_BEHAVIOR_LIMITS = {
 export const OUTLINE_BEHAVIOR_IMPORT_ACTOR = "outline-behavior-import";
 export const OUTLINE_BEHAVIOR_FORK_ACTOR = "outline-behavior-fork";
 
+export { findBehaviorBlock };
+
 /**
- * The behavior page of a session space: the live page holding alias `behavior`. Null when no
- * block holds it, or the one that does is not a page (a person gave the alias to a nested block).
- * One alias read and one primary-key read.
+ * A row the swallowed-content scan attached (`sl…`): what a behavior boundary read skips, with
+ * everything under it, so it never takes the budget of the rules ({@link readLiveSubtree}).
  */
-export async function findBehaviorPage(
-	spaceId: string,
-	store: OutlineStore = outlineStore,
-): Promise<OutlineBlockMeta | null> {
-	const [owner] = await store.findAliasOwners(spaceId, [OUTLINE_BEHAVIOR_ALIAS]);
-	if (!owner) return null;
-	const [meta] = await store.getBlockMetas(spaceId, { ids: [owner.id] });
-	return meta && !meta.deleted && meta.parentId === null ? meta : null;
+export function isSpecLossAttachRow(row: { sid: string }): boolean {
+	return isSpecLossAttachSid(row.sid);
 }
 
 /**
@@ -449,7 +446,7 @@ export async function importBehaviorFenceText(
 		if (deleted !== undefined) continue;
 		pending.push(node);
 	}
-	let pageId = (await findBehaviorPage(space.id))?.id ?? null;
+	let pageId = (await findBehaviorBlock(space.id))?.id ?? null;
 	const owner = (await readNarrator(narratorId))?.ownerUserId ?? null;
 
 	// As many commits as the write limits need (a small fence is one commit), parents first. With
@@ -463,12 +460,12 @@ export async function importBehaviorFenceText(
 			const inThisCommit = new Set<string>();
 			let bytes = 0;
 			if (pageId === null) {
-				const title = getOutlineBehaviorPageTitle(locale);
+				const title = getOutlineBehaviorBoundaryTitle(locale);
 				// The page's stable short id, unless a page of an earlier run holds it (a person
 				// deleted that page, or took its alias): then a drawn one.
 				ops.push({
 					op: "insert",
-					tempId: "page",
+					tempId: "boundary",
 					...(existing.has(sids.page) ? {} : { sid: sids.page }),
 					parent: null,
 					content: title,
@@ -488,7 +485,7 @@ export async function importBehaviorFenceText(
 				const parent =
 					node.parentSid === null
 						? pageId === null
-							? { tempId: "page" }
+							? { tempId: "boundary" }
 							: { id: pageId }
 						: inThisCommit.has(node.parentSid)
 							? { tempId: node.parentSid }
@@ -512,7 +509,7 @@ export async function importBehaviorFenceText(
 				{ kind: "import", canonical },
 			);
 			if (pageId === null) pageId = result.results[0]?.blockId ?? null;
-			if (pageId === null) throw new Error("the import could not create the behavior page");
+			if (pageId === null) throw new Error("the import could not create the behavior boundary");
 			written = at;
 		}
 	} catch (error) {
@@ -556,7 +553,7 @@ export function resetOutlineBehaviorImport(narratorId?: string): void {
  * one commit is cut breadth first, and a first block says how much was copied and where the rest
  * is, so the fork's view says it too.
  */
-export async function copyOutlineBehaviorPage(
+export async function copyOutlineBehaviorBoundary(
 	parentNarratorId: string,
 	childNarratorId: string,
 ): Promise<boolean> {
@@ -570,14 +567,19 @@ export async function copyOutlineBehaviorPage(
 			narratorId: parentSession,
 		});
 		if (!parentSpace) return false;
-		const page = await findBehaviorPage(parentSpace.id);
+		const page = await findBehaviorBlock(parentSpace.id);
 		if (!page) return false;
-		const subtree = await readSubtree(page.id);
-		if (!subtree) return false;
-		// Possibly lost content attached by the scan is not a rule: a fork does not inherit it.
-		dropSpecLossAttachBlocks(subtree.root);
 		// One operation is kept for the note a cut copy ends with.
 		const room = OUTLINE_BEHAVIOR_LIMITS.forkBlocks - 1;
+		// The structure of as much as one read takes, so the note can say how much there is.
+		// Possibly lost content attached by the scan is not a rule: a fork does not inherit it, and
+		// the read never spends its budget on it.
+		const subtree = await readLiveSubtree(parentSpace.id, page.id, {
+			limit: OUTLINE_SUBTREE_LIMITS.maxBlocks,
+			skip: isSpecLossAttachRow,
+		});
+		if (!subtree) return false;
+		dropSpecLossAttachBlocks(subtree.root);
 		const order = breadthFirst(subtree.root, "all", room);
 		await loadBodiesWithin(subtree.state, order, OUTLINE_BEHAVIOR_LIMITS.forkBytes);
 		const copied: typeof order = [];
@@ -592,18 +594,20 @@ export async function copyOutlineBehaviorPage(
 			bytes += size;
 			copied.push(node);
 		}
-		const total = subtreeNodes(subtree.root).length;
-		const cut = copied.length < total || subtree.state.truncated;
+		// What the read held after the scan's blocks were taken out; more when it was cut short.
+		const held = breadthFirst(subtree.root, "all", Number.MAX_SAFE_INTEGER).length;
+		const cut = copied.length < held || subtree.truncated;
 		if (cut) {
-			logger.warn("Fork copied only part of the behavior page", {
+			logger.warn("Fork copied only part of the behavior boundary", {
 				parentNarratorId,
 				childNarratorId,
 				copied: copied.length,
-				total,
+				held,
+				more: subtree.truncated,
 			});
 		}
 		const childSpace = await ensureSessionSpace(childNarratorId);
-		if (await findBehaviorPage(childSpace.id)) return false;
+		if (await findBehaviorBlock(childSpace.id)) return false;
 		const owner = (await readNarrator(childNarratorId))?.ownerUserId ?? null;
 		// Stored content is canonical already; the normalizer only confirms it (off the main
 		// thread when large) and reads its links.
@@ -634,7 +638,7 @@ export async function copyOutlineBehaviorPage(
 				position: { first: true },
 				content: getOutlineBehaviorForkCutNote(
 					copied.length,
-					total,
+					subtree.truncated ? null : held,
 					`${parentSpace.key}/${page.sid}`,
 					owner ? await getUserLanguage(owner) : "en",
 				),
@@ -654,7 +658,7 @@ export async function copyOutlineBehaviorPage(
 		);
 		return true;
 	} catch (error) {
-		logger.warn("Fork could not copy the behavior page", {
+		logger.warn("Fork could not copy the behavior boundary", {
 			parentNarratorId,
 			childNarratorId,
 			error: String(error),

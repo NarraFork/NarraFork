@@ -421,6 +421,9 @@ describe("PostgreSQL outline store", () => {
 							ancestryNow: await planOf(pgAncestryNow("kid1", 1000)),
 							ancestryAsOf: await planOf(pgAncestryAsOf("plan-space", "kid1", 3, 1000)),
 							ancestryOf: await planOf(pgAncestryOf("plan-space", ["kid1", "kid2", "kid3"], 4001)),
+							ancestryOfDeleted: await planOf(
+								pgAncestryOf("plan-space", ["kid1", "kid2", "kid3"], 4001, true),
+							),
 							locked: await planOf(pgLockedOfSpace("plan-space", 501)),
 							underRoot: await planOf(
 								pgUnderRootAt(
@@ -481,7 +484,12 @@ describe("PostgreSQL outline store", () => {
 			// The walks up (one block now and as of a seq, many blocks at once): every step a
 			// probe by key, no table read whole. The locked tasks of a space: the lock index.
 			expect(outcome.ancestry).toEqual([2, 2, 4]);
-			for (const nodes of [outcome.ancestryNow, outcome.ancestryAsOf, outcome.ancestryOf]) {
+			for (const nodes of [
+				outcome.ancestryNow,
+				outcome.ancestryAsOf,
+				outcome.ancestryOf,
+				outcome.ancestryOfDeleted,
+			]) {
 				const blocks = nodes.filter((n) => n["Relation Name"] === "outline_blocks");
 				expect(blocks.length).toBeGreaterThan(0);
 				for (const node of blocks) {
@@ -588,6 +596,7 @@ interface PlanOutcome {
 	ancestryNow: PlanNode[];
 	ancestryAsOf: PlanNode[];
 	ancestryOf: PlanNode[];
+	ancestryOfDeleted: PlanNode[];
 	locked: PlanNode[];
 	underRoot: PlanNode[];
 	under: number;

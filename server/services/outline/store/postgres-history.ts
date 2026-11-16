@@ -420,15 +420,21 @@ export function pgUnderRootAt(
  * step up fenced as the commit's change marks are ({@link pgMarkAncestorsSql}). Each row
  * carries its space and whether it is deleted; the caller keeps the live blocks of its space.
  * Only live blocks of the space start a walk (found by id inside a fence, the space a filter
- * on what was found), so other ids use up none of the limit.
+ * on what was found), so other ids use up none of the limit; with `includeDeleted`, deleted
+ * blocks of the space too (`SQLITE_ANCESTRY_OF_WITH_DELETED`).
  */
-export function pgAncestryOf(spaceId: string, ids: readonly string[], limit: number): SQL {
+export function pgAncestryOf(
+	spaceId: string,
+	ids: readonly string[],
+	limit: number,
+	includeDeleted = false,
+): SQL {
 	return sql`
 		WITH RECURSIVE up(id) AS (
 			SELECT s.id FROM (
 				SELECT id, space_id, deleted FROM outline_blocks WHERE id IN (${idList(ids)}) OFFSET 0
 			) s
-			WHERE s.space_id = ${text(spaceId)} AND NOT s.deleted
+			WHERE s.space_id = ${text(spaceId)}${includeDeleted ? sql.raw("") : sql` AND NOT s.deleted`}
 			UNION
 			SELECT b.parent_id FROM up CROSS JOIN LATERAL (
 				SELECT y.parent_id FROM outline_blocks y WHERE y.id = up.id OFFSET 0
@@ -714,7 +720,8 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 			);
 		},
 
-		async listAncestryOf(spaceId, blockIds, limit) {
+		async listAncestryOf(spaceId, blockIds, limit, options) {
+			const withDeleted = options?.includeDeleted === true;
 			const max = Math.max(0, Math.floor(limit));
 			const seen = new Map<string, OutlineParentRow>();
 			let truncated = false;
@@ -730,11 +737,16 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 					space_id: string;
 					deleted: boolean;
 					locked: boolean;
-				}>(pgAncestryOf(spaceId, chunk, room + 1));
+				}>(pgAncestryOf(spaceId, chunk, room + 1, withDeleted));
 				if (rows.length > room) truncated = true;
 				for (const row of rows.slice(0, room)) {
-					if (row.space_id !== spaceId || row.deleted) continue;
-					seen.set(row.id, { id: row.id, parentId: row.parent_id, locked: row.locked });
+					if (row.space_id !== spaceId || (row.deleted && !withDeleted)) continue;
+					seen.set(row.id, {
+						id: row.id,
+						parentId: row.parent_id,
+						locked: row.locked,
+						...(withDeleted ? { deleted: row.deleted } : {}),
+					});
 				}
 			}
 			return { rows: [...seen.values()], truncated };

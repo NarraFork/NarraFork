@@ -8,7 +8,7 @@ const DISABLE_REFLECTION_REVIEW_DESCRIPTION =
 	"Set true to disable plan reflection for the current narrator when the user explicitly requires human approval of the plan.";
 
 const ENTER_PLAN_UNDER_DESCRIPTION =
-	"Outline sessions only: the address of a task in this session's space (a goal you are planning for) to put the plan root under. Default: the end of the session's task page.";
+	"Outline sessions only: the address of a task in this session's space (a goal you are planning for) to put the plan root under. Default: the end of the session's task list (session/tasks).";
 const ENTER_PLAN_ROOT_DESCRIPTION =
 	"Outline sessions only: the address of an existing task tree of this session's space to plan again, instead of a new plan root.";
 

@@ -343,7 +343,7 @@ export function planDescendants(node: PlanTreeNode): number {
  */
 const NOTE_LINES: readonly RegExp[] = [
 	/^‹[^\n]*›[ \t]*$/,
-	/^ *‹… \d+ more›[ \t]*$/,
+	/^ *‹… (?:\d+\+? )?more›[ \t]*$/,
 	/^ *‹pending [^\n]*›[ \t]*$/,
 	/^ *‹question [^\n]*›[ \t]*$/,
 	/^ *‹plan [^\n]*›[ \t]*$/,

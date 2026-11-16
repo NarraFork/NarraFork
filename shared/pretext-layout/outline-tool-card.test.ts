@@ -85,7 +85,7 @@ describe("an edit's change list, from its display", () => {
 			"alias: Gave <Fix the retry button> the alias [Q7]",
 			"edit: Rewrote <Root cause> [merged with someone's change]",
 			"move: Moved <Fix the retry button> under <Notes>",
-			"move: Made <Fix the retry button> a page",
+			"move: Moved <Fix the retry button> to the top level",
 			"delete: Deleted <Old plan> and 4 block(s) under it",
 			"add: Added 1 under <Release v2> [awaiting confirmation]",
 			"  child: <Canary>",
@@ -362,7 +362,7 @@ describe("an older edit's change list (no display), from its input", () => {
 			"  child: <second>",
 			"done: <LUwB3JZb> → [Done]",
 			"delete: Deleted <Q1>",
-			"move: Made <Q2> a page",
+			"move: Moved <Q2> to the top level",
 		]);
 		const del = rows.find((r) => r.glyph === "delete")?.parts[1];
 		expect(del).toMatchObject({ kind: "link", text: "Q1", href: href("Qq1Sid00") });
