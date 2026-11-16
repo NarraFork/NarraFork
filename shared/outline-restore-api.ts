@@ -45,7 +45,7 @@ export const OUTLINE_RESTORE_LIMITS = {
 	/** Commits one call writes before it answers with a cursor to continue from. */
 	maxCommitsPerCall: 8,
 	/** Milliseconds one call works before it answers with a cursor to continue from. */
-	maxCallMs: 2000,
+	maxCallMs: 1000,
 	/** Passes over the subtree: a later pass places what an earlier one could not yet. */
 	maxPasses: 4,
 	/** Blocks left alone that one response names; `skippedTruncated` past it. */

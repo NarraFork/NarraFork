@@ -1019,6 +1019,143 @@ export const OUTLINE_RESTORE_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "a block that left a long level and came back is listed once, and a block added since that holds a stranded block is kept",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const made = await write(ctx, space, [
+				{ op: "insert", tempId: "top", parent: null, content: "top" },
+				{ op: "insert", tempId: "a", parent: { tempId: "top" }, content: "a" },
+				{ op: "insert", tempId: "c", parent: { tempId: "a" }, content: "c" },
+				{ op: "insert", tempId: "other", parent: null, content: "other" },
+				...Array.from(
+					{ length: 90 },
+					(_, i): OutlineOp => ({
+						op: "insert",
+						parent: { tempId: "top" },
+						content: `row ${i}`,
+					}),
+				),
+			]);
+			const thenSeq = (made.commit as { seq: number }).seq;
+			const [top, a, c, other, ...rows] = made.results.map((r) => r.blockId) as string[];
+			// Every row changes, so the level is several pages; one row leaves and comes back
+			// (two placements under the same parent, on different pages of the read).
+			await write(
+				ctx,
+				space,
+				rows.map((id, i): OutlineOp => ({ op: "update", block: { id }, content: `edited ${i}` })),
+			);
+			const wanderer = rows[45] as string;
+			await write(ctx, space, [
+				{ op: "move", block: { id: wanderer }, parent: { id: other as string } },
+			]);
+			await write(ctx, space, [
+				{
+					op: "move",
+					block: { id: wanderer },
+					parent: { id: top as string },
+					position: { first: true },
+				},
+			]);
+			// `a` moves away; its child `c` is pulled out first and put under a block added since.
+			const added = (
+				await write(ctx, space, [
+					{ op: "insert", tempId: "x", parent: { id: top as string }, content: "added" },
+					{ op: "move", block: { id: c as string }, parent: { tempId: "x" } },
+					{ op: "update", block: { id: c as string }, content: "c edited" },
+					{ op: "move", block: { id: a as string }, parent: { id: other as string } },
+				])
+			).results[0]?.blockId as string;
+
+			const now = await fresh(ctx, space);
+			const { entries, pages } = await wholeDiff(ctx, now, top as string, thenSeq, undefined, 40);
+			expect(pages).toBeGreaterThan(2);
+			// `listed` (inside the checks below, and here) refuses a block listed twice.
+			const by = listed(entries);
+			expect(by.get(wanderer)).toBe("changed:order,text");
+			expect(by.get(a as string)).toBe("moved-away:");
+			expect(by.get(c as string)).toBe("changed:parent,text");
+			expect(by.get(added)).toBe("added:");
+
+			const { ran, preview } = await restoreAndCheck(ctx, space, top as string, thenSeq);
+			expect(preview.entries.find((entry) => entry.blockId === (c as string))).toMatchObject({
+				action: "put-back",
+				skip: "parent-moved-away",
+			});
+			// `c` cannot go back under `a` (it moved away): it stays where it is, with its text
+			// of then, and the added block holding it is not deleted.
+			expect(ran.skipped.get(c as string)).toBe("parent-moved-away");
+			expect(ran.skipped.get(added)).toBe("holds-kept");
+			const dump = await ctx.dump(space.id);
+			expect(blockOf(dump, c as string)).toMatchObject({
+				deleted: false,
+				parentId: added,
+				content: "c",
+			});
+			expect(blockOf(dump, added).deleted).toBe(false);
+			expect(blockOf(dump, a as string).parentId).toBe(other as string);
+		},
+	},
+	{
+		name: "a commit that lands while a restore is analyzing makes it look again: a conflict under the subtree, a fresh start elsewhere",
+		async run(ctx) {
+			for (const inside of [true, false]) {
+				const { space, thenSeq, ids } = await fixture(ctx);
+				await write(ctx, space, [
+					{ op: "update", block: { id: ids.a1 }, content: "a1 edited" },
+					{ op: "update", block: { id: ids.b1 }, content: "b1 edited" },
+				]);
+				const now = await fresh(ctx, space);
+				const preview = await wholePreview(ctx, now, ids.top, thenSeq);
+				// The other commit lands after the restore checked for conflicts, before it writes.
+				let landed: number | null = null;
+				const racing = new Proxy(ctx.store, {
+					get(target, prop, receiver) {
+						const value = Reflect.get(target, prop, receiver);
+						if (prop !== "listChangedChildren") return value;
+						return async (...args: unknown[]) => {
+							if (landed === null) {
+								landed = 0;
+								const foreign = await write(ctx, space, [
+									{
+										op: "update",
+										block: { id: inside ? ids.a2 : ids.o1 },
+										content: "someone else",
+									},
+								]);
+								landed = foreign.commit?.seq as number;
+							}
+							return await (value as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+						};
+					},
+				});
+				const result = await restoreOutlineSubtree(
+					{ ...WRITER, space: now, token: preview.token },
+					{ store: racing },
+				).catch((error: unknown) => error);
+				expect(landed).not.toBeNull();
+				const dump = await ctx.dump(space.id);
+				if (inside) {
+					expect(result).toBeInstanceOf(OutlineRestoreConflictError);
+					expect((result as OutlineRestoreConflictError).details.conflictSeq).toBe(
+						landed as unknown as number,
+					);
+					// Nothing of the restore was written over the other change.
+					expect(dump.space.nextSeq - 1).toBe(landed as unknown as number);
+					expect(blockOf(dump, ids.a2).content).toBe("someone else");
+					expect(blockOf(dump, ids.a1).content).toBe("a1 edited");
+				} else {
+					expect((result as OutlineRestoreResponse).done).toBe(true);
+					expect((result as OutlineRestoreResponse).commits).toHaveLength(1);
+					expect(blockOf(dump, ids.a1).content).toBe("a1");
+					expect(blockOf(dump, ids.b1).content).toBe("b1");
+					expect(blockOf(dump, ids.o1).content).toBe("someone else");
+				}
+				checkSpaceInvariants(dump);
+			}
+		},
+	},
+	{
 		name: "restoring random histories: the subtree reads as it did, the rest is untouched, and it is idempotent",
 		async run(ctx) {
 			let restored = 0;
