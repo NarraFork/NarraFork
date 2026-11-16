@@ -72,6 +72,11 @@ import { ProjectPromptModal } from "./ProjectPromptModal";
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 
+/** `undefined` and the local sentinel both mean this server. */
+function requestedCreationDevice(deviceId: string | undefined): string {
+	return deviceId && deviceId !== LOCAL_DEVICE ? deviceId : LOCAL_DEVICE;
+}
+
 /** 选择它表示不写绑定，跟随本人的默认身份（与会话详情面板的哨兵值一致）。 */
 const FOLLOW_DEFAULT_GIT_IDENTITY = "__follow_default__";
 
@@ -215,7 +220,10 @@ export function CreateNarratorModalBody({
 	const [cwd, setCwd] = useState(initialCwd ?? "");
 	// Which execution device the session starts on. A remote device makes `cwd` a path
 	// on THAT machine, so the local picker (favorites, mkdir, drive list) does not apply.
-	const [deviceId, setDeviceId] = useState<string>(LOCAL_DEVICE);
+	// Seed from the caller: the prefill effect below runs in the same commit, and a
+	// state that is still local there would write this server's default directory
+	// into a remote session.
+	const [deviceId, setDeviceId] = useState<string>(requestedCreationDevice(initialDeviceId));
 	const [remoteBrowserOpen, setRemoteBrowserOpen] = useState(false);
 	const workspaceDevicesQuery = useWorkspaceDevices(contextProjectId ?? null, opened);
 	const remoteDevices = (workspaceDevicesQuery.data?.devices ?? []).filter(
@@ -302,14 +310,18 @@ export function CreateNarratorModalBody({
 	useEffect(() => () => resizeCleanupRef.current?.(), []);
 
 	// Callers may keep this modal mounted across opens (or swap the target directory
-	// while it is closed), so adopt `initialCwd` on every open rather than only at mount.
-	// The device is adopted alongside it: an entry point that already chose a target (the
-	// dashboard composer) must not reopen here on the local machine with a path taken from
-	// another one.
+	// while it is closed), so adopt the entry point on every open. An absent device
+	// means this server. A remote target with no directory must drop a path that was
+	// filled for this server; carrying it would create the session in the wrong place.
 	useEffect(() => {
 		if (!opened) return;
-		if (initialDeviceId) setDeviceId(initialDeviceId);
-		if (initialCwd) setCwd(initialCwd);
+		const nextDeviceId = requestedCreationDevice(initialDeviceId);
+		setDeviceId(nextDeviceId);
+		if (initialCwd) {
+			setCwd(initialCwd);
+		} else if (nextDeviceId !== LOCAL_DEVICE) {
+			setCwd("");
+		}
 	}, [opened, initialCwd, initialDeviceId]);
 
 	// When the caller gives no entry-point directory, pre-fill the instance's default
@@ -322,7 +334,10 @@ export function CreateNarratorModalBody({
 	// render or two late and a fires-once-on-open effect would miss it permanently.
 	const prefilledForOpenRef = useRef(false);
 	useEffect(() => {
-		if (isRemoteDevice) {
+		// The prop is authoritative on this commit. `deviceId` can still be local when
+		// a mounted dialog has just been handed a remote target, and the state update
+		// from the effect above is not visible yet.
+		if (requestedCreationDevice(initialDeviceId) !== LOCAL_DEVICE || isRemoteDevice) {
 			// The instance's default project directory is a path on THIS server; pre-filling
 			// it into a remote session would create it in a directory that does not exist
 			// there. Re-arm the prefill so switching back to local still adopts it.
@@ -348,7 +363,7 @@ export function CreateNarratorModalBody({
 			setCwd(decision.value);
 			prefilledForOpenRef.current = true;
 		}
-	}, [opened, cwd, initialCwd, defaultProjectDir, isRemoteDevice]);
+	}, [opened, cwd, initialCwd, defaultProjectDir, isRemoteDevice, initialDeviceId]);
 
 	// Same timing question as the cwd field: the settings query is often unresolved
 	// on the first open, so `defaultStartInPlanMode` arrives a render or two late.

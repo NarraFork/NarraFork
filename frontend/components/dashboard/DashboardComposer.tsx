@@ -183,8 +183,12 @@ export function DashboardComposer() {
 		(device) => device.id !== LOCAL_DEVICE,
 	);
 	const selectedDevice = remoteDevices.find((device) => device.id === chosenDeviceId);
-	// Device selection applies only where the browser itself is available (this build).
-	const deviceSelectionAvailable = !REMOTE_BUILD && remoteDevices.length > 0;
+	// Keep the menu when a remembered remote id has left the list. Hiding it then
+	// leaves the warning with no control that can choose this server. Wait for a
+	// resolved list, so a request still in flight does not look like "local only".
+	const deviceSelectionAvailable =
+		!REMOTE_BUILD &&
+		(remoteDevices.length > 0 || (devicesQuery.isSuccess === true && isRemoteDevice));
 	// A persisted device that is gone or offline must never silently become the local
 	// one: that would create the session on the wrong machine, in a directory this server
 	// happens to have. Block the send and say so instead.
@@ -324,9 +328,11 @@ export function DashboardComposer() {
 	const send = async () => {
 		const composer = composerRef.current;
 		if (!composer || sendingRef.current || ingestingRef.current) return;
-		// Both are recovered from the same chooser: pick a usable device, then its
-		// directory. Neither may fall through to a local session.
-		if (directoryRequired || deviceUnavailable) {
+		// A missing directory is recovered by the chooser. An unavailable device is
+		// not: that dialog cannot switch devices, and a device that is gone has
+		// nothing to list. Neither may fall through to a session on this server.
+		if (deviceUnavailable) return;
+		if (directoryRequired) {
 			openDirectoryChooser();
 			return;
 		}

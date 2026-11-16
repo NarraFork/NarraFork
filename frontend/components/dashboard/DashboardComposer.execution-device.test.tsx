@@ -328,11 +328,33 @@ test("a remembered device that is gone is reported, never replaced by this serve
 	devices = [];
 	render();
 	expect(container.textContent).toContain("composer.deviceUnavailable");
+	// The menu stays so the warning has a way back. Sending must not open an empty
+	// directory dialog, and it must not create the session on this server by itself.
+	expect(deviceSelect()?.getAttribute("data-value")).toBe("gone-box");
 	const start = [...container.querySelectorAll("button")].find(
 		(element) => element.textContent === "composer.start",
 	) as unknown as HTMLButtonElement;
 	expect(start.disabled).toBe(true);
 	await send();
-	// Falling back to the local machine would create the session in the wrong place.
 	expect(create).not.toHaveBeenCalled();
+	expect(modalProps?.opened).toBe(false);
+	pickDevice("local");
+	await send();
+	expect(create).toHaveBeenCalledTimes(1);
+	const payload = create.mock.calls[0][0];
+	expect(payload.deviceId).toBeUndefined();
+	expect(payload.cwd).toBe("/workspace");
+});
+
+test("an offline remembered device blocks send without opening the directory picker", async () => {
+	stored.set(COMPOSER_PREFS_KEY, JSON.stringify({ deviceId: "asleep", cwd: "/srv/app" }));
+	devices = [{ id: "asleep", name: "asleep box", online: false, defaultCwd: "/srv/app" }];
+	render();
+	const offline = container.querySelector(
+		'[data-device-option="asleep"]',
+	) as unknown as HTMLButtonElement;
+	expect(offline.disabled).toBe(true);
+	await send();
+	expect(create).not.toHaveBeenCalled();
+	expect(modalProps?.opened).toBe(false);
 });
