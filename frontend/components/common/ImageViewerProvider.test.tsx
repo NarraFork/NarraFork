@@ -348,7 +348,10 @@ describe("enlarged preview wheel zoom", () => {
 		const stage = document.querySelector('[data-panzoom-mode="fullscreen"]') as HTMLElement;
 		expect(stage).not.toBeNull();
 		// canvas (handlers) → transform wrapper → img
-		return { stage, canvas: stage.querySelector("img")?.parentElement?.parentElement as HTMLElement };
+		return {
+			stage,
+			canvas: stage.querySelector("img")?.parentElement?.parentElement as HTMLElement,
+		};
 	}
 
 	async function wheel(canvas: HTMLElement, deltaY: number) {
@@ -440,5 +443,44 @@ describe("ImageViewerProvider context menu", () => {
 
 		expect(capture).toHaveBeenCalledTimes(1);
 		expect(copyImageMock).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("enlarged preview does not nest", () => {
+	/**
+	 * The file viewer's embedded preview opens this fullscreen view when the picture itself
+	 * is clicked. The fullscreen consumer must not pass that callback on, or a click on the
+	 * enlarged picture would push a second copy of the same view — an overlay the person can
+	 * only escape by closing each layer.
+	 */
+	test("clicking the picture inside the fullscreen view opens no second view", async () => {
+		await act(async () => {
+			root?.render(
+				<MantineProvider>
+					<ImageViewerProvider>
+						<ViewerLauncher />
+					</ImageViewerProvider>
+				</MantineProvider>,
+			);
+		});
+		const launcher = document.body.querySelector("button");
+		expect(launcher).not.toBeNull();
+		await act(async () => {
+			launcher?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+		});
+
+		const enlarged = document.body.querySelector("img");
+		expect(enlarged).not.toBeNull();
+		const layers = document.body.children.length;
+
+		await act(async () => {
+			for (const type of ["pointerdown", "pointerup", "click"]) {
+				enlarged?.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0 }));
+			}
+		});
+
+		// Same single layer, same picture: no nested viewer was pushed.
+		expect(document.body.children.length).toBe(layers);
+		expect(document.body.querySelector("img")).toBe(enlarged);
 	});
 });
