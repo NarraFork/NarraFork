@@ -22,7 +22,7 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync } from "node:fs";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadSkillSummariesForContext } from "../skill-service";
@@ -35,8 +35,9 @@ afterEach(async () => {
 	await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true })));
 });
 
-function makeRoot(): string {
-	const root = mkdtempSync(join(tmpdir(), "skill-precedence-"));
+async function makeRoot(): Promise<string> {
+	// Match the runtime's canonical root, including Windows 8.3 profile aliases.
+	const root = await realpath(mkdtempSync(join(tmpdir(), "skill-precedence-")));
 	roots.push(root);
 	return root;
 }
@@ -75,7 +76,7 @@ describe("skill name collisions resolve by search-dir precedence", () => {
 	 * `.narrafork` while sorting before it.)
 	 */
 	it("prefers .agents/skills over .narrafork/skills", async () => {
-		const root = makeRoot();
+		const root = await makeRoot();
 		await writeSkill(root, [".narrafork", "skills"]);
 		const agents = await writeSkill(root, [".agents", "skills"]);
 
@@ -83,7 +84,7 @@ describe("skill name collisions resolve by search-dir precedence", () => {
 	});
 
 	it("prefers .claude/skills over .narrafork/skills", async () => {
-		const root = makeRoot();
+		const root = await makeRoot();
 		await writeSkill(root, [".narrafork", "skills"]);
 		const claude = await writeSkill(root, [".claude", "skills"]);
 
@@ -95,7 +96,7 @@ describe("skill name collisions resolve by search-dir precedence", () => {
 	 * hand the name to a lower-priority enabled copy.
 	 */
 	it("stays disabled when the winning copy is disabled and a lower-priority copy is enabled", async () => {
-		const root = makeRoot();
+		const root = await makeRoot();
 		await writeSkill(root, [".narrafork", "skills"]);
 		const claude = await writeSkill(root, [".claude", "skills"]);
 
@@ -114,7 +115,7 @@ describe("skill name collisions resolve by search-dir precedence", () => {
 	 * high-priority one, or the fix would trade a stuck-on skill for a stuck-off one.
 	 */
 	it("stays enabled when only a lower-priority copy is disabled", async () => {
-		const root = makeRoot();
+		const root = await makeRoot();
 		await writeSkill(root, [".narrafork", "skills"], true);
 		const claude = await writeSkill(root, [".claude", "skills"]);
 
@@ -144,7 +145,7 @@ describe("skill name collisions inside ONE search directory", () => {
 	}
 
 	it("resolves to the same copy on every run (name order, not readdir order)", async () => {
-		const root = makeRoot();
+		const root = await makeRoot();
 		await writeNested(root, "b-second");
 		await writeNested(root, "a-first");
 
@@ -161,7 +162,7 @@ describe("skill name collisions inside ONE search directory", () => {
 	it("keeps a disabled winner disabled", async () => {
 		// The user's disable must survive even when the loser copy is enabled — the
 		// same guarantee as the cross-directory case, at this finer granularity.
-		const root = makeRoot();
+		const root = await makeRoot();
 		await writeNested(root, "a-first");
 		await writeNested(root, "b-second", true);
 

@@ -36,6 +36,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import type { Command } from "./command-service";
+import { withSkillCreation } from "./skill-write-scope";
 
 // ---------------------------------------------------------------------------
 // Marker used to identify routine-managed entries
@@ -595,45 +596,57 @@ async function removeProjectCommand(
 async function addGlobalSkill(routine: BuiltinRoutine): Promise<void> {
 	const skill = routine.skill;
 	if (!skill) return;
-	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(getGlobalSkillsDir(), dirName);
-	const skillFile = join(skillDir, "SKILL.md");
-
-	await mkdir(skillDir, { recursive: true });
-	await writeFile(skillFile, buildSkillMd(skill.name, skill.descriptionEn, skill.content), "utf-8");
+	const skillsDir = getGlobalSkillsDir();
+	return withSkillCreation(skillsDir, async () => {
+		const skillDir = join(skillsDir, routineSkillDirName(routine.id));
+		await mkdir(skillDir, { recursive: true });
+		await writeFile(
+			join(skillDir, "SKILL.md"),
+			buildSkillMd(skill.name, skill.descriptionEn, skill.content),
+			"utf-8",
+		);
+	});
 }
 
 async function removeGlobalSkill(routine: BuiltinRoutine): Promise<void> {
-	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(getGlobalSkillsDir(), dirName);
-	try {
-		await access(skillDir);
-		await rm(skillDir, { recursive: true, force: true });
-	} catch {
-		// Already gone
-	}
+	const skillsDir = getGlobalSkillsDir();
+	return withSkillCreation(skillsDir, async () => {
+		const skillDir = join(skillsDir, routineSkillDirName(routine.id));
+		try {
+			await access(skillDir);
+			await rm(skillDir, { recursive: true, force: true });
+		} catch {
+			/* Already gone */
+		}
+	});
 }
 
 async function addProjectSkill(routine: BuiltinRoutine, gitPath: string): Promise<void> {
 	const skill = routine.skill;
 	if (!skill) return;
-	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(gitPath, ".narrafork", "skills", dirName);
-	const skillFile = join(skillDir, "SKILL.md");
-
-	await mkdir(skillDir, { recursive: true });
-	await writeFile(skillFile, buildSkillMd(skill.name, skill.descriptionEn, skill.content), "utf-8");
+	const skillsDir = join(gitPath, ".narrafork", "skills");
+	return withSkillCreation(skillsDir, async () => {
+		const skillDir = join(skillsDir, routineSkillDirName(routine.id));
+		await mkdir(skillDir, { recursive: true });
+		await writeFile(
+			join(skillDir, "SKILL.md"),
+			buildSkillMd(skill.name, skill.descriptionEn, skill.content),
+			"utf-8",
+		);
+	});
 }
 
 async function removeProjectSkill(routine: BuiltinRoutine, gitPath: string): Promise<void> {
-	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(gitPath, ".narrafork", "skills", dirName);
-	try {
-		await access(skillDir);
-		await rm(skillDir, { recursive: true, force: true });
-	} catch {
-		// Already gone
-	}
+	const skillsDir = join(gitPath, ".narrafork", "skills");
+	return withSkillCreation(skillsDir, async () => {
+		const skillDir = join(skillsDir, routineSkillDirName(routine.id));
+		try {
+			await access(skillDir);
+			await rm(skillDir, { recursive: true, force: true });
+		} catch {
+			/* Already gone */
+		}
+	});
 }
 
 // ---------------------------------------------------------------------------
