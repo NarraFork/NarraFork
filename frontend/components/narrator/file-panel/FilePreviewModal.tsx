@@ -269,12 +269,14 @@ export function FilePreviewModal({
 					/>
 				</Box>
 			)}
+			{/* Deliberately unsandboxed: Chrome's built-in PDF viewer refuses to run in a sandboxed
+			    frame (any value, including ""), rendering its "blocked by Chrome" error page. See
+			    FileViewerContent's PDF branch and `pdf-iframe.test.ts`. */}
 			{!error && !loading && previewType === "pdf" && blobUrl && (
 				<iframe
 					src={blobUrl}
 					title={fileName}
 					onError={() => setError(true)}
-					sandbox="allow-same-origin allow-scripts"
 					style={{
 						width: "100%",
 						height: "80vh",

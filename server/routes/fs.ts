@@ -533,6 +533,12 @@ fsRoutes.get("/preview", async (c) => {
 				"Content-Disposition": "inline",
 				"Content-Length": String(stat.size),
 				"Cache-Control": "private, max-age=60",
+				// The MIME type comes from the extension, so it is a claim about the bytes rather
+				// than a fact. `nosniff` makes the browser trust it: without it, a `.pdf` whose
+				// contents are HTML could be sniffed as HTML and rendered — which matters because
+				// the PDF preview frame is intentionally unsandboxed (Chrome's PDF viewer refuses
+				// to run in a sandboxed frame; see FileViewerContent's PDF branch).
+				"X-Content-Type-Options": "nosniff",
 			},
 		});
 	}

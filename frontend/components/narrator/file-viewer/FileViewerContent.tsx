@@ -736,11 +736,20 @@ export function BinaryFilePreview({
 			</Center>
 		);
 	if (previewType === "pdf") {
+		// NO `sandbox` attribute, deliberately. Chrome renders PDFs with its built-in viewer, and
+		// that viewer refuses to run inside a sandboxed frame for ANY sandbox value — even the
+		// empty `sandbox=""` — showing its bare "This page has been blocked by Chrome" error page
+		// instead of the document. Verified in a real Chrome by rendering one blob PDF twice:
+		// sandboxed → blocked icon, unsandboxed → viewer toolbar.
+		//
+		// The attribute looked like cheap defense-in-depth but bought nothing: the PDF viewer
+		// already runs sandboxed in its own process, and the bytes are served as
+		// `application/pdf` with `nosniff`. `ShareFilePreview` has always done exactly this for
+		// PDF and only sandboxes HTML. See `pdf-iframe.test.ts`, which pins this.
 		return (
 			<iframe
 				src={url}
 				title={fileName}
-				sandbox="allow-same-origin allow-scripts"
 				onError={() => setError(t("filePreview_loadError"))}
 				style={{ width: "100%", height: "100%", border: 0, display: "block" }}
 			/>
