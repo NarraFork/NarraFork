@@ -395,6 +395,7 @@ export function useVListLabels(): VListLabels {
 			// (adapter labels) rather than substituted by the render layer.
 			workspaceCreate: t("workspaceCreate"),
 			workspaceAttach: t("workspaceAttach"),
+			workspaceRemove: t("workspaceRemove"),
 			workspaceOperation: t("workspaceOperation"),
 			workspaceList: t("workspaceList"),
 			workspaceSwitch: t("workspaceSwitch"),

@@ -117,6 +117,7 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 				"ListWorktrees",
 				"CreateWorktree",
 				"AttachWorktree",
+				"RemoveWorktree",
 				"GetWorktreeOperation",
 			].includes(toolName ?? "")
 				? IconGitFork

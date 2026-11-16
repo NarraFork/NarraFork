@@ -242,6 +242,8 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "CreateWorktree":
 		case "AttachWorktree":
 			return typeof input.destinationPath === "string" ? [input.destinationPath] : [];
+		case "RemoveWorktree":
+			return typeof input.path === "string" ? [input.path] : [];
 		case "ShareFile":
 		case "GenUI":
 			return typeof input.path === "string" ? [input.path] : [];
@@ -795,7 +797,12 @@ export function resolvePermissionDecision(
 			return "deny";
 		}
 	}
-	if (reviewReadOnlyBash && (toolName === "CreateWorktree" || toolName === "AttachWorktree")) {
+	if (
+		reviewReadOnlyBash &&
+		(toolName === "CreateWorktree" ||
+			toolName === "AttachWorktree" ||
+			toolName === "RemoveWorktree")
+	) {
 		if (meta) meta.blacklistReason = `Review mode: ${toolName} modifies worktree resources.`;
 		return "deny";
 	}
@@ -955,6 +962,14 @@ export function resolvePermissionDecision(
 	if (blacklistResult) {
 		if (meta) meta.blacklistReason = blacklistResult.reason;
 		return "deny";
+	}
+
+	// Removing a worktree deletes a directory and possibly a branch. It is a person's
+	// decision every time: after the blacklists, above allowlists and the bypassPermissions/dontAsk shortcuts,
+	// so a confirmed `discard` in the input is always something a person approved.
+	if (toolName === "RemoveWorktree") {
+		if (effectiveMode === "readOnly" || effectiveMode === "dontAsk" || planMode) return "deny";
+		return "ask";
 	}
 
 	// Review follow-up Bash is a hard, non-interactive capability ceiling. Keep this
@@ -1590,6 +1605,7 @@ const WRITE_TOOLS = new Set([
 	"StructSed",
 	"CreateWorktree",
 	"AttachWorktree",
+	"RemoveWorktree",
 ]);
 const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
 

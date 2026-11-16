@@ -277,12 +277,68 @@ for (const withHook of [true, false]) {
 		}
 	});
 }
-test("provider public tool set exposes four explicit worktree tools and retains hidden legacy execution", () => {
+test("RemoveWorktree always asks a person, above allowlists and bypassPermissions", () => {
+	const opts = {
+		toolName: "RemoveWorktree",
+		input: { path: "/local/work/.worktrees/task", deleteBranch: true },
+		cwd: "/local/work",
+	};
+	expect(permission.extractToolPaths(opts.toolName, opts.input)).toEqual([
+		"/local/work/.worktrees/task",
+	]);
+	for (const permMode of ["default", "acceptEdits", "bypassPermissions"] as const) {
+		expect(permission.resolvePermissionDecision({ ...opts, permMode })).toBe("ask");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode,
+				whitelistDirs: [{ path: "/local", accessLevel: "full", enabled: true }],
+			}),
+		).toBe("ask");
+		// A confirmed discard is still a prompt, never an automatic allow.
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				input: {
+					...opts.input,
+					discard: { head: null, uncommittedFiles: 3, unmergedCommits: 1 },
+				},
+				permMode,
+			}),
+		).toBe("ask");
+	}
+	for (const permMode of ["readOnly", "dontAsk"] as const)
+		expect(permission.resolvePermissionDecision({ ...opts, permMode })).toBe("deny");
+	expect(
+		permission.resolvePermissionDecision({ ...opts, permMode: "default", planMode: true }),
+	).toBe("deny");
+	expect(
+		permission.resolvePermissionDecision({
+			...opts,
+			permMode: "bypassPermissions",
+			reviewReadOnlyBash: true,
+		}),
+	).toBe("deny");
+	expect(
+		permission.resolvePermissionDecision({
+			...opts,
+			permMode: "bypassPermissions",
+			blacklistDirs: [{ path: "/local/work/.worktrees", denyLevel: "denyWrite", enabled: true }],
+		}),
+	).toBe("deny");
+});
+test("provider public tool set exposes five explicit worktree tools and retains hidden legacy execution", () => {
 	const names = toolRegistry
 		.all()
 		.filter((tool) => !tool.isAvailable || tool.isAvailable())
 		.map((tool) => tool.name);
-	for (const name of ["ListWorktrees", "CreateWorktree", "AttachWorktree", "GetWorktreeOperation"])
+	for (const name of [
+		"ListWorktrees",
+		"CreateWorktree",
+		"AttachWorktree",
+		"RemoveWorktree",
+		"GetWorktreeOperation",
+	])
 		expect(names).toContain(name);
 	expect(names).not.toContain("Worktree");
 	expect(toolRegistry.get("Worktree")).toBeDefined();

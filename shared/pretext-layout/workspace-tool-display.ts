@@ -3,6 +3,7 @@ import { readLeafText } from "./tool-io-projection";
 export const WORKSPACE_LABELS = {
 	workspaceCreate: "Create worktree",
 	workspaceAttach: "Attach worktree",
+	workspaceRemove: "Remove worktree",
 	workspaceOperation: "Get worktree operation",
 	workspaceList: "List worktrees",
 	workspaceSwitch: "Switch directory",
@@ -33,6 +34,10 @@ export function workspaceSummary(name: string, input: unknown, labels?: Record<s
 		return workspaceText("workspaceList", labels);
 	}
 	if (name === "GetWorktreeOperation") return workspaceText("workspaceOperation", labels);
+	if (name === "RemoveWorktree") {
+		const leaf = readLeafText(args?.path)?.split(/[\\/]/).filter(Boolean).at(-1);
+		return `${workspaceText("workspaceRemove", labels)}${leaf ? ` · ${leaf}` : ""}`;
+	}
 	if (["Worktree", "CreateWorktree", "AttachWorktree"].includes(name)) {
 		const branch =
 			readLeafText(args?.branchName) ?? readLeafText(workspaceObject(args?.branch)?.name);

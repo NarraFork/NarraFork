@@ -544,6 +544,7 @@
 	"contextAskQuestions": "{{count}} questions",
 	"liveOutputChars": "{{count}} chars",
 	"workspaceCreate": "Create worktree",
+	"workspaceRemove": "Remove worktree",
 	"workspaceAttach": "Attach worktree",
 	"workspaceOperation": "Get worktree operation",
 	"workspaceList": "List worktrees",
