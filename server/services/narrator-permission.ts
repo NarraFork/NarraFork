@@ -3105,7 +3105,7 @@ function classifyToolDanger(
 				? `OutlineEdit deletes or moves ${restructures} outline block(s) and their subtrees.`
 				: `OutlineEdit writes ${edits.length} edit(s) to the outline.`,
 			[
-				"Outline pages may be shared with the project; others read what is written there.",
+				"The outline may be shared with the project; others read what is written there.",
 				restructures > 0
 					? "Deleting or moving a block takes everything under it along."
 					: "Added and rewritten blocks are attributed to this session.",

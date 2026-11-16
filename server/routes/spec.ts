@@ -23,9 +23,9 @@ async function outlineBehaviorOf(
 ): Promise<{ spaceId: string | null; pageId: string | null } | null> {
 	if ((await readTaskBackend(narratorId)) !== "outline") return null;
 	const { findSessionSpace } = await import("../services/outline/spaces");
-	const { findBehaviorPage } = await import("../services/task-source/outline-behavior");
+	const { findBehaviorBlock } = await import("../services/task-source/outline-behavior");
 	const space = await findSessionSpace(narratorId);
-	const page = space ? await findBehaviorPage(space.id) : null;
+	const page = space ? await findBehaviorBlock(space.id) : null;
 	return { spaceId: space?.id ?? null, pageId: page?.id ?? null };
 }
 
@@ -39,9 +39,9 @@ async function outlineSwitchedOff(narratorId: string): Promise<boolean> {
 	if (isOutlineEnabled()) return false;
 	if ((await readTaskSession(narratorId))?.backend !== "outline") return false;
 	const { findSessionSpace } = await import("../services/outline/spaces");
-	const { findBehaviorPage } = await import("../services/task-source/outline-behavior");
+	const { findBehaviorBlock } = await import("../services/task-source/outline-behavior");
 	const space = await findSessionSpace(narratorId);
-	return space ? (await findBehaviorPage(space.id)) !== null : false;
+	return space ? (await findBehaviorBlock(space.id)) !== null : false;
 }
 
 /** An outline session's old fence is not editable in the panel (see `outlineBehaviorOf`). */

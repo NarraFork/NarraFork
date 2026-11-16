@@ -41,7 +41,7 @@ import type {
 	OutlineSpecImportRevertResult,
 } from "@shared/outline-spec-import";
 import { beginSpecImport, invalidateTaskBackend, isSpecImporting } from "../../task-source/backend";
-import { findBehaviorPage, resetOutlineBehaviorImport } from "../../task-source/outline-behavior";
+import { findBehaviorBlock, resetOutlineBehaviorImport } from "../../task-source/outline-behavior";
 import { resetOutlineFenceSopMove } from "../../task-source/outline-plugin-rules";
 import { outlineAccessBackend } from "../access-reads";
 import { forgetSpecImportLeftover } from "../lease-keeper";
@@ -398,7 +398,7 @@ async function writeRevertNotes(
 		const space = await outlineStore.findSpace({ kind: "session", narratorId });
 		if (!space) return [];
 		const [tasks] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-		const behavior = await findBehaviorPage(space.id);
+		const behavior = await findBehaviorBlock(space.id);
 		const text = SPEC_IMPORT_TEXT[locale];
 		const day = now.slice(0, 10);
 		const ops: OutlineOp[] = [];

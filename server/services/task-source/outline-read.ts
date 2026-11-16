@@ -5,7 +5,6 @@
  * `outline.ts` for what each task state means to readers.
  */
 import { blockTitle } from "@shared/outline";
-import { OUTLINE_BEHAVIOR_ALIAS } from "../outline/model";
 import { outlineStore } from "../outline/store";
 import { isPersonWork } from "../outline/task-json";
 import {
@@ -13,6 +12,7 @@ import {
 	type OutlineTaskRef,
 	type OutlineTaskWait,
 } from "../outline/tasks";
+import { findBehaviorBlock } from "../outline/well-known";
 import { readTaskSession } from "./backend";
 import type { OpenTaskStatus } from "./types";
 
@@ -92,8 +92,8 @@ export interface OpenRead {
 }
 
 /**
- * The session's open tasks. A checkbox on its behavior page is a rule as the person wrote it,
- * never a task of the session: the agent could not tick it (the page is not its to write), so it
+ * The session's open tasks. A checkbox under its behavior boundary is a rule as the person wrote
+ * it, never a task of the session: the agent could not tick it (it is not its to write), so it
  * is left out of every reader (continuation, the views, the interrupt guard, the turn-end note).
  */
 export async function readOpen(
@@ -107,14 +107,13 @@ export async function readOpen(
 	if (session.subagent || sessionNarratorId === null) {
 		return { entries: [], truncated: false, personWork: [] };
 	}
-	const behavior = session.spaceId
-		? await outlineStore.findAliasOwners(session.spaceId, [OUTLINE_BEHAVIOR_ALIAS])
-		: [];
+	const behavior = session.spaceId ? await findBehaviorBlock(session.spaceId) : null;
 	const found = await findContinuationCandidates({
 		narratorId: sessionNarratorId,
 		sessionSpaceId: session.spaceId,
-		// A page's blocks carry its id as their page; an alias on a nested block matches none.
-		excludePageIds: behavior.map((owner) => owner.id),
+		// Whatever is under the behavior boundary (the block holding the alias, at the top level
+		// of the space) is a rule; an alias a person gave to a nested block names no boundary.
+		excludeUnder: behavior ? [behavior.id] : [],
 		limit: OUTLINE_OPEN_TASKS_READ,
 		// The tree being worked is named however many to-dos come before it (P2 PR 8 review S3).
 		keepWorkInProgress: true,

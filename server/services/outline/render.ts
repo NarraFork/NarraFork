@@ -12,6 +12,14 @@
  * ancestor). Those lines are charged to the budget when a block that may need one is shown, so
  * the output stays within the byte budget (only the root may exceed it on its own).
  *
+ * TREES LOADED IN PART
+ * --------------------
+ * A tree read level by level within a budget (`subtree-read.ts`) does not hold everything under
+ * its blocks. `moreBelow` says which blocks have children the tree does not hold; the line under
+ * such a block cannot count them, so it reads `‹… more›` (or `‹… N+ more›` when some of what is
+ * left out is known). The reader continues by reading that block, or the level after its last
+ * child shown.
+ *
  * SECTIONS
  * --------
  * `renderOutlineSections` expands several trees under their own header lines with one budget
@@ -111,6 +119,8 @@ export interface OutlineRenderOptions {
 	 * snapshot an approval shows leaves it out.
 	 */
 	planNotes?: boolean;
+	/** Whether a block has children the tree does not hold (see the header). */
+	moreBelow?: (node: OutlineNode) => boolean;
 }
 
 export interface OutlineRenderResult {
@@ -125,6 +135,8 @@ export interface OutlineRenderResult {
 	hiddenByView: number;
 	/** UTF-8 bytes of `markdown`. */
 	bytes: number;
+	/** A shown block has blocks under it that the tree does not hold (`moreBelow`). */
+	openBelow: boolean;
 }
 
 const INDENT = "  ";
@@ -161,8 +173,8 @@ function linesBytes(lines: readonly string[]): number {
 	return total;
 }
 
-function moreLine(depth: number, hidden: number): string {
-	return INDENT.repeat(depth) + OUTLINE_TEXT.more(hidden);
+function moreLine(depth: number, hidden: number, open = false): string {
+	return INDENT.repeat(depth) + (open ? OUTLINE_TEXT.moreOpen(hidden) : OUTLINE_TEXT.more(hidden));
 }
 
 /**
@@ -175,7 +187,7 @@ export function renderOutline(
 ): OutlineRenderResult {
 	const notes: string[] = [];
 	if (options.truncatedRead) {
-		notes.push(OUTLINE_TEXT.pageTruncated(options.truncatedRead.blocksRead));
+		notes.push(OUTLINE_TEXT.readTruncated(options.truncatedRead.blocksRead));
 	}
 	return expand([{ header: [], roots: [root], label: options.label }], {
 		view: effectiveView(root, options.view ?? "facts"),
@@ -183,6 +195,7 @@ export function renderOutline(
 		display: options.display,
 		annotate: options.annotate,
 		planNotes: options.planNotes,
+		moreBelow: options.moreBelow,
 		notes,
 		forceFirst: true,
 		interleave: false,
@@ -219,6 +232,10 @@ export interface OutlineSectionsOptions {
 	 * the top of each.
 	 */
 	interleave?: boolean;
+	/** See {@link OutlineRenderOptions.annotate}. */
+	annotate?: (node: OutlineNode) => string | null;
+	/** See {@link OutlineRenderOptions.moreBelow}. */
+	moreBelow?: (node: OutlineNode) => boolean;
 }
 
 /**
@@ -291,6 +308,8 @@ export function renderOutlineSections(
 		budget: options.budget,
 		display: options.display,
 		notes: options.notes ?? [],
+		annotate: options.annotate,
+		moreBelow: options.moreBelow,
 		forceFirst: false,
 		interleave: options.interleave === true,
 	});
@@ -307,6 +326,7 @@ function expand(
 		display?: OutlineDisplay;
 		annotate?: (node: OutlineNode) => string | null;
 		planNotes?: boolean;
+		moreBelow?: (node: OutlineNode) => boolean;
 		notes: readonly string[];
 		/** The first top-level block is shown whatever the budget (a read's root). */
 		forceFirst: boolean;
@@ -351,14 +371,21 @@ function expand(
 		}
 	}
 	const size = new Map<OutlineNode, number>();
+	/** Blocks with something under them (at any depth) that the tree does not hold. */
+	const open = new Set<OutlineNode>();
+	const moreBelow = options.moreBelow;
 	for (let i = order.length - 1; i >= 0; i--) {
 		const node = order[i] as OutlineNode;
 		let total = 1;
+		let unknown = moreBelow?.(node) === true;
 		for (const child of node.children) {
-			if (view === "all" || !isProcessNode(child)) total += size.get(child) ?? 0;
-			else hiddenByView += countSubtree(child);
+			if (view === "all" || !isProcessNode(child)) {
+				total += size.get(child) ?? 0;
+				unknown ||= open.has(child);
+			} else hiddenByView += countSubtree(child);
 		}
 		size.set(node, total);
+		if (unknown) open.add(node);
 	}
 
 	const notes = [...options.notes];
@@ -389,8 +416,8 @@ function expand(
 	};
 	/** What the `… more` line under `node` may cost at most. */
 	const reserveFor = (node: OutlineNode): number =>
-		kids(node).length > 0
-			? utf8(moreLine((depth.get(node) ?? 0) + 1, (size.get(node) ?? 1) - 1)) + 1
+		kids(node).length > 0 || open.has(node)
+			? utf8(moreLine((depth.get(node) ?? 0) + 1, (size.get(node) ?? 1) - 1, open.has(node))) + 1
 			: 0;
 	const moreTopsOf = (i: number) => sections[i]?.moreTops ?? defaultMoreTops;
 	/**
@@ -444,6 +471,7 @@ function expand(
 	const out: string[] = [];
 	const blockIds: string[] = [];
 	let hiddenByBudget = 0;
+	let openBelow = false;
 	sections.forEach((section, i) => {
 		out.push(...section.header);
 		const hiddenTops = { roots: 0, blocks: 0 };
@@ -454,26 +482,33 @@ function expand(
 				continue;
 			}
 			// Depth-first output; a stack keeps deep outlines off the call stack.
-			const stack: Array<{ node: OutlineNode } | { more: number; depth: number }> = [
-				{ node: root },
-			];
+			type More = { more: number; depth: number; open: boolean };
+			const stack: Array<{ node: OutlineNode } | More> = [{ node: root }];
 			while (stack.length > 0) {
-				const top = stack.pop() as { node: OutlineNode } | { more: number; depth: number };
+				const top = stack.pop() as { node: OutlineNode } | More;
 				if ("more" in top) {
-					out.push(moreLine(top.depth, top.more));
+					out.push(moreLine(top.depth, top.more, top.open));
 					continue;
 				}
 				const node = top.node;
 				out.push(...linesOf(node));
 				blockIds.push(node.id);
 				let hidden = 0;
+				// Children the tree does not hold, or such blocks under a child left out.
+				let unknown = moreBelow?.(node) === true;
 				const next: OutlineNode[] = [];
 				for (const child of kids(node)) {
 					if (shown.has(child)) next.push(child);
-					else hidden += size.get(child) ?? 0;
+					else {
+						hidden += size.get(child) ?? 0;
+						unknown ||= open.has(child);
+					}
 				}
 				hiddenByBudget += hidden;
-				if (hidden > 0) stack.push({ more: hidden, depth: (depth.get(node) ?? 0) + 1 });
+				openBelow ||= unknown;
+				if (hidden > 0 || unknown) {
+					stack.push({ more: hidden, depth: (depth.get(node) ?? 0) + 1, open: unknown });
+				}
 				for (let k = next.length - 1; k >= 0; k--) stack.push({ node: next[k] as OutlineNode });
 			}
 		}
@@ -484,7 +519,15 @@ function expand(
 	});
 	out.push(...notes);
 	const markdown = out.join("\n");
-	return { markdown, view, blockIds, hiddenByBudget, hiddenByView, bytes: utf8(markdown) };
+	return {
+		markdown,
+		view,
+		blockIds,
+		hiddenByBudget,
+		hiddenByView,
+		bytes: utf8(markdown),
+		openBelow,
+	};
 }
 
 function countSubtree(root: OutlineNode): number {
@@ -498,7 +541,7 @@ function countSubtree(root: OutlineNode): number {
 	return count;
 }
 
-const MORE_LINE = /^ *‹… \d+ more›$/;
+const MORE_LINE = /^ *‹… (?:\d+\+? )?more›$/;
 /** A block's own note (`annotate`): a change to it waits for confirmation. */
 const PENDING_LINE = /^ *‹pending [^\n]*›$/;
 /** A question's own note (`questionNote`): who is asked, the choices, the answer. */

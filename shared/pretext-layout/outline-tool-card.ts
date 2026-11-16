@@ -60,10 +60,10 @@ export const OUTLINE_CARD_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	outlineNoCheckbox: "not a task",
 	// Change rows.
 	outlineAddedUnder: "Added {n} under {link}",
-	outlineAddedPages: "Added {n} page(s)",
+	outlineAddedTop: "Added {n} top-level block(s)",
 	outlineAddedMore: "{n} more",
 	outlineMoved: "Moved {link} under {to}",
-	outlineMovedToPage: "Made {link} a page",
+	outlineMovedToTop: "Moved {link} to the top level",
 	outlineReplaced: "Rewrote {link}",
 	outlineMerged: "merged with someone's change",
 	outlineDeleted: "Deleted {link}",
@@ -99,7 +99,7 @@ export const OUTLINE_CARD_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	outlineSumCancelled: "Cancelled {title}",
 	outlineSumUnchecked: "{title} no longer a task",
 	outlineSumAdded: "added {n}",
-	outlineSumPages: "{n} new page(s)",
+	outlineSumTop: "{n} at the top level",
 	outlineSumReplaced: "Rewrote {title}",
 	outlineSumMoved: "Moved {title}",
 	outlineSumDeleted: "Deleted {title}",
@@ -115,6 +115,7 @@ export const OUTLINE_CARD_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	outlineSumHeld: "Awaiting confirmation: {what}",
 	outlineSumDecisionsFailed: "{n} failed",
 	outlineSumAsOfTime: "as of {time}",
+	outlineSumContinued: "continued",
 	outlineSumBlocks: "{n} blocks",
 	outlineSumAsOf: "as of #{n}",
 	outlineSumSpaces: "spaces",
@@ -385,7 +386,7 @@ export function outlineEditRows(display: OutlineEditDisplay, labels: Labels): To
 					parts: [
 						...(op.parent
 							? fill(label(labels, "outlineAddedUnder"), { link: blockLink(op.parent) }, { n })
-							: fill(label(labels, "outlineAddedPages"), {}, { n })),
+							: fill(label(labels, "outlineAddedTop"), {}, { n })),
 						...held,
 					],
 				});
@@ -430,7 +431,7 @@ export function outlineEditRows(display: OutlineEditDisplay, labels: Labels): To
 									link: blockLink(op.target),
 									to: blockLink(op.to),
 								})
-							: fill(label(labels, "outlineMovedToPage"), { link: blockLink(op.target) })),
+							: fill(label(labels, "outlineMovedToTop"), { link: blockLink(op.target) })),
 						...held,
 					],
 				});
@@ -600,13 +601,13 @@ export function outlineLegacyEditRows(
 			const parent = at("add");
 			const items = topLevelItems(at("markdown"));
 			const created = Array.isArray(result?.created) ? result.created : [];
-			// `key/`, `project/`, `session/`, `personal/` or `/`: new pages.
+			// `key/`, `project/`, `session/`, `personal/` or `/`: new top-level blocks.
 			const root = /^(?:[A-Za-z0-9_-]+)?\/$/.test(parent);
 			rows.push({
 				glyph: "add",
 				parts: [
 					...(root
-						? fill(label(labels, "outlineAddedPages"), {}, { n: items.length })
+						? fill(label(labels, "outlineAddedTop"), {}, { n: items.length })
 						: fill(
 								label(labels, "outlineAddedUnder"),
 								{ link: refLink(parent, addressOf(parent)) },
@@ -649,7 +650,7 @@ export function outlineLegacyEditRows(
 				glyph: "move",
 				parts: [
 					...(root
-						? fill(label(labels, "outlineMovedToPage"), { link })
+						? fill(label(labels, "outlineMovedToTop"), { link })
 						: fill(label(labels, "outlineMoved"), { link, to: refLink(to, addressOf(to)) })),
 					...held,
 				],
@@ -970,7 +971,7 @@ function editPhrases(display: OutlineEditDisplay, labels: Labels): string[] {
 			}
 			case "add":
 				said.push(
-					label(labels, op.parent ? "outlineSumAdded" : "outlineSumPages", {
+					label(labels, op.parent ? "outlineSumAdded" : "outlineSumTop", {
 						n: op.created.length + (op.more ?? 0),
 					}),
 				);
@@ -1032,7 +1033,7 @@ function legacyEditPhrases(
 		} else if ("add" in raw) {
 			const n = topLevelItems(leaf(raw.markdown) ?? "").length;
 			out.push(
-				label(labels, /\/$/.test(leaf(raw.add) ?? "") ? "outlineSumPages" : "outlineSumAdded", {
+				label(labels, /\/$/.test(leaf(raw.add) ?? "") ? "outlineSumTop" : "outlineSumAdded", {
 					n,
 				}),
 			);
@@ -1178,8 +1179,14 @@ export function outlineToolSummary(
 					: address
 						? short(address, 48)
 						: label(labels, "outlineSumSpaces");
+			// A level continued after one of its children (`after`): the same place, read on.
+			const continued =
+				typeof input.after === "string" && input.after.trim()
+					? label(labels, "outlineSumContinued")
+					: undefined;
 			return [
 				head,
+				...(continued ? [continued] : []),
 				...(asOf ? [asOf] : []),
 				...(blocks !== undefined ? [label(labels, "outlineSumBlocks", { n: blocks })] : []),
 			].join(" · ");

@@ -6,8 +6,8 @@
  *   ‹space Kx81mPqa · this session's project "NarraFork" · in Auth module›
  *   - [Pq83nXcB] Token refresh has a race; see [[Lm29XkQa/Rt5uVw7Y|Session notes]]
  *     - [Ab3dEf9Q] [ ] Add a regression test @agent:w-auth
- *     ‹… 3 more›
- *   ‹facts only: 6 blocks under tasks not shown; read with view "all" to include them›
+ *     ‹… more›
+ *   ‹facts only: 2 tasks or questions not shown; read with view "all" to include them›
  *
  * The first line names the space once (its key and what it is) and where the block sits. Every
  * block line carries the block's address right after the bullet: its short id in one of the
@@ -17,34 +17,46 @@
  * and is never expanded. Lines in `‹…›` are notes, never content: an edit that copies a read
  * back drops them, and drops the ids again (`edit-text.ts`).
  *
+ * ANY BLOCK, WITHIN A BUDGET
+ * --------------------------
+ * A space holds blocks, and a read names any of them: the block and what is under it, level by
+ * level until the budget is spent (`subtree-read.ts`: what a read costs follows the blocks it
+ * returns, never the size of what is under the block). Where the budget ends, `‹… more›` stands
+ * under the block whose children are not all shown. The agent continues by reading that block,
+ * or, where a level is long, by reading its parent again with `after` (the last child it was
+ * shown): that read starts after it. A space as a whole (`key/`) lists its top-level blocks by
+ * title, and continues the same way.
+ *
  * READING ACROSS SPACES
  * ---------------------
  * Every space the session may read (`session-scope.ts`) can be read and searched: by key,
- * through the overview of all of them (`OutlineRead` with address `*`: each space's pages,
- * expanded level by level within one budget, the session's own spaces first), or by searching
- * them all (`OutlineSearch` with spaces `["*"]`; the readable set goes into the SQL filter before
- * the result limit). A space it may not read is never named, listed or searched, and a reference
- * into one gets exactly the answer a reference to nothing gets. Reads of other spaces are
- * recorded in the read ledger like any other. The overview and searches span several turns of
- * the event loop: an access change meanwhile makes them start again (`stableAnswer`), so they
- * never show what the session may no longer read.
+ * through the overview of all of them (`OutlineRead` with address `*`: each space's top-level
+ * blocks, expanded level by level within one budget, the session's own spaces first), or by
+ * searching them all (`OutlineSearch` with spaces `["*"]`; the readable set goes into the SQL
+ * filter before the result limit). A space it may not read is never named, listed or searched,
+ * and a reference into one gets exactly the answer a reference to nothing gets. Reads of other
+ * spaces are recorded in the read ledger like any other. The overview and searches span several
+ * turns of the event loop: an access change meanwhile makes them start again (`stableAnswer`),
+ * so they never show what the session may no longer read.
  *
  * CHANGES WAITING FOR CONFIRMATION
  * --------------------------------
- * A current read of a page with open pending changes (a locked plan, design §2.6) shows this
- * session's own changes laid over the outline, its version, and others' as marks on the blocks
- * they touch (`pending-overlay.ts`, owner decision Q1). Changes waiting for this session's
- * confirmation (it is the locker's delegate) are listed after the outline, and so is, once, each
- * decision on this session's own changes on the page it has not been told of.
+ * A current read shows the open changes of the locked plans it reads (a locked task among the
+ * blocks shown, or above them; design §2.6): this session's own changes laid over the outline,
+ * its version, and others' as marks on the blocks they touch (`pending-overlay.ts`, owner
+ * decision Q1). Changes waiting for this session's confirmation (it is the locker's delegate)
+ * are listed after the outline, and so is, once, each decision on this session's own changes
+ * there it has not been told of.
  *
  * The output is bounded by the read's budget, so the agent loop must not cut it again (its cut
  * keeps the tail and would lose the top of the outline).
  */
 import { blockTitle, serializeMarkdownOutline, TASK_BOX } from "@shared/outline";
+import { OUTLINE_SUBTREE_LIMITS } from "@shared/outline-subtree-api";
 import { type OutlineAgentScope, type OutlineSpaceWord, spaceRootName } from "./agent-scope";
 import { LINK_DISPLAY_LIMITS, linkTitles, withLinkTitles } from "./link-display";
 import { OUTLINE_LISTED_NAMES, OUTLINE_TOOL_TEXT } from "./messages";
-import { OUTLINE_PENDING_LIMITS, outlinePendingLabel } from "./model";
+import { outlinePendingLabel } from "./model";
 import { mergeProposal, pendingNames, takePendingReports, withCurrentDeciders } from "./pending";
 import { PENDING_WITHDRAW } from "./pending-hold";
 import {
@@ -52,23 +64,31 @@ import {
 	type OutlinePendingOverlay,
 	pendingOverlay,
 } from "./pending-overlay";
-import { commitSeqAt, loadBodiesWithin, readOutline } from "./read";
+import { commitSeqAt } from "./read";
 import { recordOutlineReads } from "./read-ledger";
 import {
-	clampBudget,
 	OUTLINE_READ_LIMITS,
+	type OutlineBudget,
 	type OutlineDisplay,
+	type OutlineRenderResult,
 	type OutlineRenderSection,
 	outlineItem,
+	renderOutline,
 	renderOutlineSections,
-	sectionsBreadthFirst,
 } from "./render";
 import type { OutlineResolvedBlock } from "./resolve";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "./search";
 import { sessionScopeEpoch, yieldToEventLoop } from "./session-scope";
-import type { OutlineBlockMeta, OutlinePendingHead, OutlineSpaceRow } from "./store/port";
-import type { OutlinePageListRow, OutlineStructureRow } from "./store/read-port";
-import { buildTree, type OutlineNode, type OutlineView } from "./tree";
+import type { OutlineLevelCursor } from "./store/history-port";
+import type { OutlinePendingHead, OutlineSpaceRow } from "./store/port";
+import { readOutlineAncestry } from "./subtree-marks";
+import {
+	encodeOutlineLevelCursor,
+	type OutlineReadNodes,
+	readOutlineLevelsNodes,
+	readOutlineSubtreeNodes,
+} from "./subtree-read";
+import type { OutlineNode, OutlineView } from "./tree";
 
 /** A tool's answer before it becomes a `ToolResult`. */
 export interface OutlineToolOutput {
@@ -82,26 +102,26 @@ export interface OutlineToolOutput {
 
 /** Limits of the agent's reads (tests lower some of them). */
 export const OUTLINE_AGENT_READ_LIMITS = {
-	/** Pages listed per space when a space is read as a whole, or taken into the overview. */
-	maxPagesListed: 100,
+	/** Blocks one read shows at most (what one read of a subtree takes from the store). */
+	maxBlocks: OUTLINE_SUBTREE_LIMITS.maxBlocks,
+	/** Top-level blocks listed per space when a space is read as a whole. */
+	maxTopsListed: 100,
 	/** UTF-8 bytes of rendered text per block of budget, between the default and the maximum. */
 	bytesPerBlock: 256,
-	/** Characters of a title in a header, a path or a page list. */
+	/** Characters of a title in a header, a path or a list of top-level blocks. */
 	titleChars: 100,
 	/** Spaces the overview of every readable space covers. */
 	overviewSpaces: 50,
-	/** Pages one structure read of the overview covers. */
-	overviewPagesPerRead: 500,
-	/** Blocks one structure read of the overview returns; a page with more is shown alone. */
-	overviewBlocksPerRead: 2000,
-	/** Blocks the overview's structure reads return in all. */
-	overviewBlocks: 10_000,
-	/** Structure reads one overview makes at most. */
-	overviewReads: 10,
-	/** Spaces whose pages the overview lists between two yields to the event loop. */
-	overviewSpacesPerSlice: 10,
+	/** Blocks the overview reads of one space at least, however many spaces share the budget. */
+	overviewMinShare: 12,
+	/** Bytes of content the overview reads of one space at least. */
+	overviewMinBytes: 4096,
+	/** Reads of levels one continued level (`after`) makes below its first. */
+	levelReads: 6,
 	/** Spaces a search of every readable space covers. */
 	searchAllSpaces: 100,
+	/** Notes on how to continue a level past hidden tasks and questions, per read. */
+	resumeNotes: 3,
 };
 
 /** The address that reads the overview of every space the session may read. */
@@ -109,8 +129,8 @@ export const OUTLINE_ALL_SPACES = "*";
 
 export interface OutlineReadInput {
 	/**
-	 * A block or page; `key/` (or `project/`, `session/`, `personal/`) lists a space's pages;
-	 * `*` is the overview of every space the session may read.
+	 * Any block; `key/` (or `project/`, `session/`, `personal/`) lists a space's top-level
+	 * blocks; `*` is the overview of every space the session may read.
 	 */
 	address?: string;
 	view?: OutlineView;
@@ -118,6 +138,11 @@ export interface OutlineReadInput {
 	budget?: number;
 	/** A commit number of the block's space, or a time. */
 	asOf?: number | string;
+	/**
+	 * Continue a level: a block directly under `address` (a top-level block of the space, for
+	 * `key/`). The read shows the blocks after it there, not the block at `address` again.
+	 */
+	after?: string;
 }
 
 export interface OutlineSearchInput {
@@ -145,9 +170,11 @@ function note(text: string): string {
 	return `‹${text.replace(/\n+/g, " ")}›`;
 }
 
-function budgetOf(blocks: number | undefined): { blocks: number; bytes: number } | undefined {
-	if (blocks === undefined || !Number.isFinite(blocks)) return undefined;
-	const n = Math.max(1, Math.min(OUTLINE_READ_LIMITS.maxBlocks, Math.floor(blocks)));
+/** The budget of a read: the blocks asked for (default 80, at most 800) and the bytes for them. */
+function budgetOf(blocks: number | undefined): OutlineBudget {
+	if (blocks === undefined || !Number.isFinite(blocks))
+		return { ...OUTLINE_READ_LIMITS.defaultBudget };
+	const n = Math.max(1, Math.min(OUTLINE_AGENT_READ_LIMITS.maxBlocks, Math.floor(blocks)));
 	return {
 		blocks: n,
 		bytes: Math.max(
@@ -157,37 +184,254 @@ function budgetOf(blocks: number | undefined): { blocks: number; bytes: number }
 	};
 }
 
-/** A space's pages as outline lines, each with its short id. */
-async function pageLines(
+function failed(text: string, metadata: Record<string, unknown>): OutlineToolOutput {
+	return { output: text, isError: true, metadata: { tool: "OutlineRead", ...metadata } };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A tree loaded in part
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** What one or several reads of levels returned, linked into one tree. */
+interface LoadedTree {
+	nodes: Map<string, OutlineNode>;
+	/** The children loaded of the level read from its top (a space, a level continued). */
+	tops: OutlineNode[];
+	/** Blocks with children the tree does not hold; `null` stands for the top level. */
+	open: Set<string | null>;
+	/** Tasks and questions the facts view left out of the levels read. */
+	processHidden: number;
+	/**
+	 * Levels that continue after a child the view left out (`resumeAfter` of the reads), by
+	 * parent (`null`: the tree's top level): that child's sid, which `after` names.
+	 */
+	resumeAfter: Map<string | null, string>;
+}
+
+type TreePart = OutlineReadNodes<{
+	blocks: ReadonlyArray<{ id: string; hasChildren: boolean }>;
+	levels: ReadonlyArray<{
+		parentId: string | null;
+		childIds: readonly string[];
+		more: boolean;
+		processHidden: number;
+	}>;
+}>;
+
+/**
+ * Link the nodes of some reads by the levels they returned. `top` names the parent whose
+ * children are the tree's top (a space: `null`; a level continued: its parent, which the tree
+ * does not hold); `undefined` when the tree has one root among its nodes.
+ */
+function linkTree(parts: readonly TreePart[], top: string | null | undefined): LoadedTree {
+	const nodes = new Map<string, OutlineNode>();
+	const withChildren = new Set<string>();
+	for (const part of parts) {
+		for (const node of part.nodes) {
+			node.parent = null;
+			node.children = [];
+			nodes.set(node.id, node);
+		}
+		for (const block of part.read.blocks) if (block.hasChildren) withChildren.add(block.id);
+	}
+	const tops: OutlineNode[] = [];
+	const open = new Set<string | null>();
+	const looked = new Set<string | null>();
+	const resumeAfter = new Map<string | null, string>();
+	let processHidden = 0;
+	for (const part of parts) {
+		for (const entry of part.resumeAfter ?? []) {
+			const parent = entry.parentId === null ? undefined : nodes.get(entry.parentId);
+			const isTop = top !== undefined && entry.parentId === top;
+			if (parent || isTop) resumeAfter.set(parent ? entry.parentId : null, entry.sid);
+		}
+		for (const level of part.read.levels) {
+			const parent = level.parentId === null ? undefined : nodes.get(level.parentId);
+			const isTop = top !== undefined && level.parentId === top;
+			if (!parent && !isTop) continue;
+			looked.add(level.parentId);
+			// The top level of the read is `null` here, whichever block it hangs under.
+			if (level.more) open.add(parent ? level.parentId : null);
+			processHidden += level.processHidden;
+			for (const id of level.childIds) {
+				const child = nodes.get(id);
+				if (!child) continue;
+				if (parent) {
+					child.parent = parent;
+					parent.children.push(child);
+				} else tops.push(child);
+			}
+		}
+	}
+	for (const id of withChildren) if (!looked.has(id)) open.add(id);
+	return { nodes, tops, open, processHidden, resumeAfter };
+}
+
+/** What a read shows of a loaded tree: one root, or the blocks of a level. */
+interface Shown {
+	rendered: OutlineRenderResult;
+	/** Notes after the outline (changes waiting for confirmation). */
+	notes: string[];
+	/** Block versions shown, for the read ledger. */
+	reads: Array<readonly [string, number]>;
+}
+
+/**
+ * Render a loaded tree as a read shows it: links with their targets' titles, the open changes
+ * of the locked plans read laid over or marked (current reads), within the budget.
+ */
+async function showTree(
 	scope: OutlineAgentScope,
 	space: OutlineSpaceRow,
-): Promise<{ lines: string[]; more: boolean; count: number }> {
-	const limit = OUTLINE_AGENT_READ_LIMITS.maxPagesListed;
-	const rows = await scope.store.listChildren(space.id, null, limit + 1);
-	const pages = rows.slice(0, limit);
-	// Only titles, clipped: not a read of the pages (their edits need one).
+	tree: LoadedTree,
+	args: {
+		/** The read's root; null: the blocks of `tree.tops`. */
+		root: OutlineNode | null;
+		view: OutlineView;
+		budget: OutlineBudget;
+		state: { current: boolean; seq: number };
+		/** Locked tasks above what was read. */
+		lockedAbove: readonly string[];
+		/** The block whose reads report decisions on this session's changes; null: none. */
+		reportsOf: string | null;
+		/** The block read: changes waiting for this session anywhere in its top-level block are listed. */
+		forYouUnder: string;
+		/** The address of the block whose children are the tree's top level (a level continued). */
+		topAddress: string;
+	},
+): Promise<Shown> {
+	const { state } = args;
 	const label = scope.labelIn(space);
-	const lines = pages.map((page) => {
-		const box = page.taskJson ? `[${TASK_BOX[page.taskJson.status]}] ` : "";
-		return `- ${label(page.sid)} ${box}${clip(blockTitle(page.content)) || OUTLINE_TOOL_TEXT.untitled}`;
+	const pending = state.current
+		? await pendingForRead(scope, space, {
+				roots: [
+					...args.lockedAbove,
+					...[...tree.nodes.values()].flatMap((node) => (node.task?.lock ? [node.id] : [])),
+				],
+				reportsOf: args.reportsOf,
+				forYouUnder: args.forYouUnder,
+			})
+		: null;
+	const overlay = pending?.overlay ?? null;
+	overlay?.prepare({ nodes: tree.nodes });
+	const loaded = [...tree.nodes.values()].filter((node) => node.content !== null);
+	overlay?.finish(loaded);
+	const seen = new Map<string, number>();
+	const display = await displayFor(scope, seen)(state, loaded);
+	const moreBelow = (node: OutlineNode) => tree.open.has(node.id);
+	const annotate = overlay ? (node: OutlineNode) => overlay.annotate(node) : undefined;
+	const topOpen = tree.open.has(null);
+	const rendered = args.root
+		? renderOutline(args.root, {
+				view: args.view,
+				budget: args.budget,
+				label: (node) => label(node.sid),
+				display,
+				annotate,
+				moreBelow,
+			})
+		: renderOutlineSections(
+				[
+					{
+						header: [],
+						roots: tree.tops,
+						label: (node) => label(node.sid),
+						moreTops: (hidden) =>
+							topOpen
+								? OUTLINE_TOOL_TEXT.moreOpen(hidden.blocks)
+								: hidden.roots > 0
+									? OUTLINE_TOOL_TEXT.moreCounted(hidden.blocks)
+									: null,
+					},
+				],
+				{ view: args.view, budget: args.budget, display, annotate, moreBelow },
+			);
+	// Blocks a pending change of this session adds are shown but not stored: not read.
+	const added = overlay?.added;
+	const reads = rendered.blockIds.flatMap((id) => {
+		const version = seen.get(id);
+		return version === undefined || added?.has(id) ? [] : [[id, version] as const];
 	});
-	return { lines, more: rows.length > limit, count: pages.length };
+	// Levels whose store rows ran out among tasks and questions the view leaves out: how to go
+	// on, by the last of them (no child shown names the place).
+	const address = scope.addressIn(space);
+	const shownIds = new Set(rendered.blockIds);
+	const resume = [...tree.resumeAfter]
+		.flatMap(([parentId, sid]) => {
+			if (parentId === null) return [OUTLINE_TOOL_TEXT.resumeAfter(args.topAddress, address(sid))];
+			const parent = tree.nodes.get(parentId);
+			return parent && shownIds.has(parentId)
+				? [OUTLINE_TOOL_TEXT.resumeAfter(address(parent.sid), address(sid))]
+				: [];
+		})
+		.slice(0, OUTLINE_AGENT_READ_LIMITS.resumeNotes);
+	return {
+		rendered,
+		notes: [...resume, ...(pending?.notes ?? [])].map(note),
+		reads,
+	};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A space as a whole: its top-level blocks by title
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A space's top-level blocks as outline lines, each with its address, from `after` on. */
+async function topLines(
+	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
+	after: OutlineLevelCursor | null = null,
+): Promise<{ lines: string[]; more: boolean; count: number; last: string | null }> {
+	const limit = OUTLINE_AGENT_READ_LIMITS.maxTopsListed;
+	const { rows, next } = await scope.store.listLevel(space.id, null, {
+		asOf: null,
+		after,
+		limit,
+	});
+	// Only titles, clipped: not a read of the blocks (their edits need one).
+	const heads = new Map(
+		rows.length === 0
+			? []
+			: (await scope.store.getBlockHeads(rows.map((row) => row.id))).map((head) => [
+					head.id,
+					head.contentHead,
+				]),
+	);
+	const label = scope.labelIn(space);
+	const address = scope.addressIn(space);
+	const lines = rows.map((row) => {
+		const box = row.taskJson ? `[${TASK_BOX[row.taskJson.status]}] ` : "";
+		const title = clip(blockTitle(heads.get(row.id) ?? "")) || OUTLINE_TOOL_TEXT.untitled;
+		return `- ${label(row.sid)} ${box}${title}`;
+	});
+	const last = rows.at(-1);
+	return {
+		lines,
+		more: next !== null,
+		count: rows.length,
+		last: last ? address(last.sid) : null,
+	};
 }
 
 async function spaceSection(
 	scope: OutlineAgentScope,
 	space: OutlineSpaceRow,
 	isDefault: boolean,
-): Promise<{ lines: string[]; count: number }> {
-	const pages = await pageLines(scope, space);
+	after: OutlineLevelCursor | null = null,
+): Promise<{ lines: string[]; count: number; more: boolean }> {
+	const tops = await topLines(scope, space, after);
 	const lines = [note(OUTLINE_TOOL_TEXT.spaceSection(await scope.describe(space), isDefault))];
-	if (pages.lines.length === 0) lines.push(note(OUTLINE_TOOL_TEXT.noPages));
-	lines.push(...pages.lines);
-	if (pages.more) lines.push(note(OUTLINE_TOOL_TEXT.morePages));
-	return { lines, count: pages.count };
+	if (tops.lines.length === 0) {
+		lines.push(note(after ? OUTLINE_TOOL_TEXT.nothingAfter : OUTLINE_TOOL_TEXT.nothingYet));
+	}
+	lines.push(...tops.lines);
+	if (tops.more && tops.last) {
+		lines.push(note(OUTLINE_TOOL_TEXT.moreTops(space.key, tops.last)));
+	}
+	return { lines, count: tops.count, more: tops.more };
 }
 
-/** `OutlineRead` with no address: the session's own spaces and their pages. */
+/** `OutlineRead` with no address: the session's own spaces and their top-level blocks. */
 async function readOverview(scope: OutlineAgentScope): Promise<OutlineToolOutput> {
 	const own = await scope.ownSpaces();
 	if (own.length === 0) {
@@ -203,7 +447,7 @@ async function readOverview(scope: OutlineAgentScope): Promise<OutlineToolOutput
 	for (const { word, space } of own) {
 		const section = await spaceSection(scope, space, space.id === context?.id);
 		lines.push(...section.lines);
-		spaces.push({ key: space.key, kind: space.kind, word, pages: section.count });
+		spaces.push({ key: space.key, kind: space.kind, word, blocks: section.count });
 	}
 	lines.push(note(OUTLINE_TOOL_TEXT.writeHint));
 	return {
@@ -211,91 +455,6 @@ async function readOverview(scope: OutlineAgentScope): Promise<OutlineToolOutput
 		title: "OutlineRead",
 		metadata: { tool: "OutlineRead", spaces },
 	};
-}
-
-/** A page's node on its own, content not loaded yet (its tags load with it). */
-function pageNode(meta: OutlineBlockMeta): OutlineNode {
-	return {
-		id: meta.id,
-		sid: meta.sid,
-		parentId: null,
-		orderKey: meta.orderKey,
-		alias: meta.alias,
-		task: meta.taskJson,
-		ask: meta.askJson,
-		versionSeq: meta.versionSeq,
-		parent: null,
-		children: [],
-		content: null,
-		tags: null,
-	};
-}
-
-/** One space of the overview, before rendering. */
-interface OverviewSpace {
-	space: OutlineSpaceRow;
-	word: OutlineSpaceWord | null;
-	own: boolean;
-	header: string[];
-	/** Pages the view shows, in sibling order, as listed (titles only so far). */
-	pages: OutlinePageListRow[];
-	/** The space has more pages than one list takes. */
-	listCut: boolean;
-	/** Pages that are tasks, left out by the facts view. */
-	taskPages: number;
-	/** Another session's notes in the facts view: only counted. */
-	process?: { pages: number; more: boolean };
-	/** Pages the budget could show: the first this many of `pages`. */
-	showable: number;
-}
-
-/**
- * The structure of the pages the overview may show, many pages per read, in the order the
- * budget takes them: whole pages by id; `large`, pages with more blocks than one read returns;
- * `unread`, pages past what the overview reads in all. Bounded by
- * {@link OUTLINE_AGENT_READ_LIMITS}: rows per read, rows and reads in all; yields between reads.
- */
-async function overviewStructure(
-	scope: OutlineAgentScope,
-	pageIds: readonly string[],
-): Promise<{
-	loaded: Map<string, OutlineStructureRow[]>;
-	large: Set<string>;
-	unread: Set<string>;
-}> {
-	const limits = OUTLINE_AGENT_READ_LIMITS;
-	const loaded = new Map<string, OutlineStructureRow[]>();
-	const large = new Set<string>();
-	let queue = [...pageIds];
-	let rowsLeft = limits.overviewBlocks;
-	let reads = 0;
-	while (queue.length > 0 && rowsLeft > 0 && reads < limits.overviewReads) {
-		if (reads > 0) await yieldToEventLoop();
-		const batch = queue.slice(0, limits.overviewPagesPerRead);
-		const limit = Math.min(limits.overviewBlocksPerRead, rowsLeft);
-		const { rows, truncated } = await scope.store.listPagesStructure(batch, limit);
-		reads++;
-		rowsLeft -= rows.length;
-		const byPage = new Map<string, OutlineStructureRow[]>();
-		for (const row of rows) {
-			const list = byPage.get(row.pageId);
-			if (list) list.push(row);
-			else byPage.set(row.pageId, [row]);
-		}
-		// Rows come page by page: when the read was cut, only its last page may be short.
-		const cutPage = truncated ? rows[rows.length - 1]?.pageId : undefined;
-		const again: string[] = [];
-		for (const id of batch) {
-			const rowsOfPage = byPage.get(id);
-			if (rowsOfPage && id !== cutPage) loaded.set(id, rowsOfPage);
-			else if (id === cutPage && byPage.size === 1 && limit === limits.overviewBlocksPerRead) {
-				large.add(id);
-			} else if (truncated) again.push(id);
-			// Otherwise the page has no live blocks any more: left out.
-		}
-		queue = [...again, ...queue.slice(batch.length)];
-	}
-	return { loaded, large, unread: new Set(queue) };
 }
 
 /** An answer built from what the session may read, before it is given. */
@@ -349,31 +508,31 @@ async function stableAnswer(
 
 /**
  * `OutlineRead` with address `*`: every space the session may read (its own first, at most
- * {@link OUTLINE_AGENT_READ_LIMITS.overviewSpaces}), each with its pages, expanded together
- * within the read's budget (`renderOutlineSections`, round-robin across spaces): first the
- * page lines of every space, then, with what the budget has left, the next level of all of
- * them, and so on. Facts only by default: tasks are left out, and so are other sessions' notes,
- * which are process as a whole (design §2.1): such a space shows as its line and the number of
- * its pages; view `all` lists them.
+ * {@link OUTLINE_AGENT_READ_LIMITS.overviewSpaces}), each with its top-level blocks, expanded
+ * together within the read's budget (`renderOutlineSections`, round-robin across spaces): first
+ * the top-level blocks of every space, then, with what the budget has left, the next level of
+ * all of them, and so on. Facts only by default: tasks are left out, and so are other sessions'
+ * notes, which are process as a whole (design §2.1): such a space shows as its line and the
+ * number of its top-level blocks; view `all` lists them.
  *
- * Bounded: one page list per space (titles only, at most 100 pages); the structure of the pages
- * the budget could show (round-robin, at most its number of blocks) in a few batched reads
- * ({@link overviewStructure}); content loaded only for what fits. A page whose structure was not
- * read shows on its own, and the space says so. What it shows is a read: recorded in the
- * ledger, links titled where the session may read them.
+ * Bounded: one read of each space from its top (`readOutlineSubtreeNodes`), for a share of the
+ * budget (twice an even share, so a space with little leaves room for the others; at least
+ * {@link OUTLINE_AGENT_READ_LIMITS.overviewMinShare} blocks), yielding between spaces. Where a space's share ended, its blocks say
+ * `‹… more›`. What it shows is a read: recorded in the ledger, links titled where the session
+ * may read them.
  */
 async function overviewAnswer(
 	scope: OutlineAgentScope,
 	input: OutlineReadInput,
 ): Promise<ScopedAnswer> {
 	const meta: Record<string, unknown> = { tool: "OutlineRead", address: OUTLINE_ALL_SPACES };
-	if (input.asOf !== undefined) {
-		return {
-			output: { output: OUTLINE_TOOL_TEXT.overviewNotAsOf, isError: true, metadata: meta },
-			reads: [],
-			spaces: [],
-		};
-	}
+	const refuse = (text: string): ScopedAnswer => ({
+		output: { output: text, isError: true, metadata: meta },
+		reads: [],
+		spaces: [],
+	});
+	if (input.asOf !== undefined) return refuse(OUTLINE_TOOL_TEXT.overviewNotAsOf);
+	if (input.after !== undefined) return refuse(OUTLINE_TOOL_TEXT.afterNeedsLevel);
 	const limits = OUTLINE_AGENT_READ_LIMITS;
 	const { spaces, cut } = await scope.readableSpaces(limits.overviewSpaces);
 	if (spaces.length === 0) {
@@ -385,142 +544,96 @@ async function overviewAnswer(
 		return { output, reads: [], spaces: [] };
 	}
 	const view: OutlineView = input.view ?? "facts";
-	const budget = clampBudget(budgetOf(input.budget));
+	const budget = budgetOf(input.budget);
 	const context = await scope.contextSpace();
+	const share = {
+		// Not capped by the budget: a read spends its blocks on rows read, and the facts view may
+		// leave the first of them out (top-level tasks).
+		blocks: Math.min(
+			limits.maxBlocks,
+			Math.max(limits.overviewMinShare, Math.ceil((budget.blocks * 2) / spaces.length)),
+		),
+		bytes: Math.min(
+			budget.bytes,
+			Math.max(limits.overviewMinBytes, Math.ceil((budget.bytes * 2) / spaces.length)),
+		),
+	};
 
-	// 1. Every space's pages, titles only: one statement per space.
-	const plans: OverviewSpace[] = [];
-	for (const [i, { space, word }] of spaces.entries()) {
-		if (i > 0 && i % limits.overviewSpacesPerSlice === 0) await yieldToEventLoop();
+	const sections: OutlineRenderSection[] = [];
+	const all: OutlineNode[] = [];
+	const open = new Set<string>();
+	const shownOf: Array<{
+		space: OutlineSpaceRow;
+		word: OutlineSpaceWord | null;
+		own: boolean;
+		tops: readonly OutlineNode[];
+		process?: number;
+	}> = [];
+	let processHidden = 0;
+	let truncated = cut !== null;
+	for (const { space, word } of spaces) {
+		// Every space's read is a stretch of the main thread of its own.
+		await yieldToEventLoop();
 		const own = scope.isOwnSpace(space);
 		const header = [
 			note(OUTLINE_TOOL_TEXT.spaceSection(await scope.describe(space), space.id === context?.id)),
 		];
-		const plan = { space, word, own, header, listCut: false, taskPages: 0, showable: 0 };
 		if (view === "facts" && space.kind === "session" && !own) {
 			// Another session's notes are process: counted, not listed (metas only, bounded).
-			const max = limits.maxPagesListed;
+			const max = limits.maxTopsListed;
 			const count = (await scope.store.listChildMetas(space.id, [null], max + 1)).length;
-			plans.push({
-				...plan,
-				pages: [],
-				process: { pages: Math.min(count, max), more: count > max },
+			sections.push({
+				header,
+				roots: [],
+				footer: [
+					note(
+						count === 0
+							? OUTLINE_TOOL_TEXT.nothingYet
+							: OUTLINE_TOOL_TEXT.otherSessionNotes(Math.min(count, max), count > max),
+					),
+				],
 			});
+			shownOf.push({ space, word, own, tops: [], process: Math.min(count, max) });
 			continue;
 		}
-		// Pages that are tasks are listed but take nothing from the budget in the facts view.
-		const max = limits.maxPagesListed;
-		const listed = await scope.store.listSpacePages(space.id, { limit: max + 1 });
-		const taken = listed.slice(0, max);
-		const pages = view === "facts" ? taken.filter((page) => !page.isTask) : taken;
-		plans.push({
-			...plan,
-			pages,
-			listCut: listed.length > max,
-			taskPages: taken.length - pages.length,
+		const got = await readOutlineSubtreeNodes({
+			space,
+			rootId: null,
+			budget: share,
+			view,
+			store: scope.store,
 		});
-	}
-
-	// 2. The pages the budget could show, taken round-robin across spaces as the render takes
-	// them, and their structure.
-	const order: OutlinePageListRow[] = [];
-	for (let i = 0; order.length < budget.blocks; i++) {
-		let more = false;
-		for (const plan of plans) {
-			const page = plan.pages[i];
-			if (!page || order.length >= budget.blocks) continue;
-			order.push(page);
-			plan.showable++;
-			more = true;
-		}
-		if (!more) break;
-	}
-	const { loaded, large, unread } = await overviewStructure(
-		scope,
-		order.map((page) => page.id),
-	);
-
-	// 3. Page trees (a page whose structure was not read, alone), and the sections.
-	const sections: OutlineRenderSection[] = [];
-	const rootsOf = new Map<OverviewSpace, OutlineNode[]>();
-	let truncated = cut !== null;
-	for (const plan of plans) {
-		const { space } = plan;
+		const tree = linkTree(got ? [got] : [], null);
+		for (const node of tree.nodes.values()) all.push(node);
+		for (const id of tree.open) if (id !== null) open.add(id);
+		processHidden += tree.processHidden;
+		const topOpen = tree.open.has(null);
+		truncated ||= tree.open.size > 0;
 		const label = scope.labelIn(space);
-		const shownPages = plan.pages.slice(0, plan.showable);
-		const alone = shownPages.filter((page) => !loaded.has(page.id)).map((page) => page.id);
-		const metas = new Map(
-			alone.length === 0
-				? []
-				: (await scope.store.getBlockMetas(space.id, { ids: alone })).map((m) => [m.id, m]),
-		);
-		const roots: OutlineNode[] = [];
-		const tooLarge: string[] = [];
-		const pastLimit: string[] = [];
-		for (const page of shownPages) {
-			const rows = loaded.get(page.id);
-			if (rows) {
-				const root = buildTree(rows).get(page.id);
-				if (root && root.parentId === null) roots.push(root);
-				continue;
-			}
-			const m = metas.get(page.id);
-			if (!m || m.deleted || m.parentId !== null) continue;
-			roots.push(pageNode(m));
-			if (large.has(page.id)) tooLarge.push(label(m.sid));
-			else if (unread.has(page.id)) pastLimit.push(label(m.sid));
-		}
-		rootsOf.set(plan, roots);
-		const footer: string[] = [];
-		if (plan.process) {
-			footer.push(
-				note(
-					plan.process.pages === 0
-						? OUTLINE_TOOL_TEXT.noPages
-						: OUTLINE_TOOL_TEXT.otherSessionPages(plan.process.pages, plan.process.more),
-				),
-			);
-		} else if (plan.pages.length === 0 && plan.taskPages === 0 && !plan.listCut) {
-			footer.push(note(OUTLINE_TOOL_TEXT.noPages));
-		}
-		if (tooLarge.length > 0) footer.push(note(OUTLINE_TOOL_TEXT.notExpandedLarge(tooLarge)));
-		if (pastLimit.length > 0) footer.push(note(OUTLINE_TOOL_TEXT.notExpandedLimit(pastLimit)));
-		const notTaken = plan.pages.length - plan.showable;
-		truncated ||= plan.listCut || notTaken > 0 || tooLarge.length > 0 || pastLimit.length > 0;
 		sections.push({
-			header: plan.header,
-			roots,
+			header,
+			roots: tree.tops,
 			label: (node) => label(node.sid),
-			footer,
-			moreTops: (hidden) => {
-				const pages = hidden.roots + notTaken;
-				return pages === 0 && !plan.listCut
+			footer:
+				tree.tops.length === 0 && !topOpen && tree.processHidden === 0
+					? [note(OUTLINE_TOOL_TEXT.nothingYet)]
+					: [],
+			moreTops: (hidden) =>
+				hidden.roots === 0 && !topOpen
 					? null
-					: note(OUTLINE_TOOL_TEXT.morePagesOf(space.key, pages, plan.listCut));
-			},
+					: note(OUTLINE_TOOL_TEXT.moreTopsOf(space.key, hidden.roots, topOpen)),
 		});
+		shownOf.push({ space, word, own, tops: tree.tops });
 	}
 
-	// 4. Content in the order the render spends the budget, then the render: each a stretch of
-	// the main thread of its own (a render of 2000 blocks takes some tens of milliseconds).
+	// The render is a stretch of the main thread of its own.
 	await yieldToEventLoop();
 	const state = { current: true, seq: 0 };
-	const loadOrder = sectionsBreadthFirst(sections, {
-		view,
-		interleave: true,
-		limit: budget.blocks,
-	});
-	await loadBodiesWithin(state, loadOrder, budget.bytes, { store: scope.store });
-	await yieldToEventLoop();
 	const seen = new Map<string, number>();
-	const display = await displayFor(scope, seen)(
-		state,
-		loadOrder.filter((node) => node.content !== null),
-	);
+	const display = await displayFor(scope, seen)(state, all);
 	await yieldToEventLoop();
-	const taskPages = plans.reduce((sum, plan) => sum + plan.taskPages, 0);
 	const notes: string[] = [];
-	if (taskPages > 0) notes.push(note(OUTLINE_TOOL_TEXT.taskPagesHidden(taskPages)));
+	if (processHidden > 0) notes.push(note(OUTLINE_TOOL_TEXT.factsHidden(processHidden)));
 	if (cut === "limit") notes.push(note(OUTLINE_TOOL_TEXT.moreSpaces));
 	if (cut === "candidates") notes.push(note(OUTLINE_TOOL_TEXT.spacesUnchecked));
 	const rendered = renderOutlineSections(sections, {
@@ -529,6 +642,7 @@ async function overviewAnswer(
 		display,
 		notes,
 		interleave: true,
+		moreBelow: (node) => open.has(node.id),
 	});
 	const reads = rendered.blockIds.flatMap((id) => {
 		const version = seen.get(id);
@@ -541,38 +655,60 @@ async function overviewAnswer(
 		bounded: true,
 		metadata: {
 			...meta,
-			spaces: plans.map((plan) => ({
-				key: plan.space.key,
-				kind: plan.space.kind,
-				word: plan.word,
-				own: plan.own,
-				pages: plan.process
-					? plan.process.pages
-					: (rootsOf.get(plan) ?? []).filter((root) => shownIds.has(root.id)).length,
-				...(plan.process ? { process: true } : {}),
+			spaces: shownOf.map((entry) => ({
+				key: entry.space.key,
+				kind: entry.space.kind,
+				word: entry.word,
+				own: entry.own,
+				blocks: entry.process ?? entry.tops.filter((top) => shownIds.has(top.id)).length,
+				...(entry.process !== undefined ? { process: true } : {}),
 			})),
 			complete: cut === null,
 			view: rendered.view,
 			blocks: rendered.blockIds.length,
 			hiddenByBudget: rendered.hiddenByBudget,
-			hiddenByView: rendered.hiddenByView + taskPages,
+			hiddenByView: rendered.hiddenByView + processHidden,
 			truncated: truncated || rendered.hiddenByBudget > 0,
 		},
 	};
-	return { output, reads, spaces: plans.map((plan) => plan.space) };
+	return { output, reads, spaces: shownOf.map((entry) => entry.space) };
 }
 
-async function readSpace(scope: OutlineAgentScope, name: string): Promise<OutlineToolOutput> {
+/** `after` of a read of a space: one of its top-level blocks, as a place to continue from. */
+async function topCursor(
+	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
+	after: string,
+): Promise<OutlineLevelCursor | { error: string }> {
+	const resolution = await scope.resolve(after, space);
+	const block = resolution.status === "found" ? resolution.block : null;
+	const meta =
+		block && block.spaceId === space.id
+			? (await scope.store.getBlockMetasByIds([block.id]))[0]
+			: undefined;
+	if (!meta || meta.deleted || meta.parentId !== null) {
+		return { error: OUTLINE_TOOL_TEXT.afterNotUnder(after, `${space.key}/`) };
+	}
+	return { orderKey: meta.orderKey, id: meta.id };
+}
+
+async function readSpace(
+	scope: OutlineAgentScope,
+	name: string,
+	after: string | undefined,
+): Promise<OutlineToolOutput> {
 	const space = name === "" ? await scope.contextSpace() : await scope.space(name);
 	if (!space) {
-		return {
-			output: OUTLINE_TOOL_TEXT.noSuchSpace(name || "/"),
-			isError: true,
-			metadata: { tool: "OutlineRead", address: `${name}/` },
-		};
+		return failed(OUTLINE_TOOL_TEXT.noSuchSpace(name || "/"), { address: `${name}/` });
+	}
+	let cursor: OutlineLevelCursor | null = null;
+	if (after !== undefined) {
+		const found = await topCursor(scope, space, after);
+		if ("error" in found) return failed(found.error, { address: `${space.key}/` });
+		cursor = found;
 	}
 	const context = await scope.contextSpace();
-	const section = await spaceSection(scope, space, space.id === context?.id);
+	const section = await spaceSection(scope, space, space.id === context?.id, cursor);
 	return {
 		output: section.lines.join("\n"),
 		title: `OutlineRead: ${space.key}/`,
@@ -581,6 +717,7 @@ async function readSpace(scope: OutlineAgentScope, name: string): Promise<Outlin
 			address: `${space.key}/`,
 			space: { key: space.key, kind: space.kind },
 			blocks: section.count,
+			...(section.more ? { truncated: true } : {}),
 		},
 	};
 }
@@ -589,7 +726,7 @@ function candidateLines(candidates: readonly OutlineResolvedBlock[]): string[] {
 	return candidates.map(
 		(c) =>
 			`- [${c.address}] ${clip(c.title) || OUTLINE_TOOL_TEXT.untitled}${
-				c.isPage ? OUTLINE_TOOL_TEXT.pageMark : ""
+				c.isPage ? OUTLINE_TOOL_TEXT.topMark : ""
 			}`,
 	);
 }
@@ -678,25 +815,104 @@ export async function blockLinesForAgent(
 	return out;
 }
 
+/**
+ * The level under `parent` continued after one of its children: the children after it, each
+ * with what is under it, breadth first within the budget. A few reads of levels at most
+ * ({@link OUTLINE_AGENT_READ_LIMITS.levelReads}); what they did not reach says `‹… more›`.
+ */
+async function levelAfter(
+	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
+	parent: { id: string },
+	cursor: OutlineLevelCursor,
+	args: { asOf: number | undefined; view: OutlineView; budget: OutlineBudget },
+): Promise<LoadedTree> {
+	const { asOf, view, budget } = args;
+	const store = scope.store;
+	const parts: TreePart[] = [];
+	const first = await readOutlineLevelsNodes({
+		space,
+		parents: [{ parentId: parent.id, cursor: encodeOutlineLevelCursor(cursor) }],
+		asOf,
+		limit: budget.blocks,
+		bytes: budget.bytes,
+		view,
+		store,
+	});
+	parts.push(first);
+	let room = budget.blocks - first.nodes.length;
+	let frontier = first.read.blocks.filter((block) => block.hasChildren).map((block) => block.id);
+	for (
+		let reads = 0;
+		frontier.length > 0 && room > 0 && reads < OUTLINE_AGENT_READ_LIMITS.levelReads;
+		reads++
+	) {
+		const batch = frontier.slice(0, OUTLINE_SUBTREE_LIMITS.maxParents);
+		const part = await readOutlineLevelsNodes({
+			space,
+			parents: batch.map((parentId) => ({ parentId })),
+			asOf,
+			limit: room,
+			bytes: budget.bytes,
+			view,
+			store,
+		});
+		parts.push(part);
+		room -= part.nodes.length;
+		frontier = [
+			...frontier.slice(batch.length),
+			...part.read.blocks.filter((block) => block.hasChildren).map((block) => block.id),
+		];
+	}
+	return linkTree(parts, parent.id);
+}
+
+/** Where `after` sits (now, or as of a seq): directly under `parentId`, or an error. */
+async function levelCursor(
+	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
+	parent: OutlineResolvedBlock,
+	after: string,
+	asOf: number | undefined,
+): Promise<OutlineLevelCursor | { error: string }> {
+	const resolution = await scope.resolve(after, space);
+	const block = resolution.status === "found" ? resolution.block : null;
+	const error = { error: OUTLINE_TOOL_TEXT.afterNotUnder(after, parent.address) };
+	if (!block || block.spaceId !== space.id) return error;
+	if (asOf === undefined) {
+		const meta = (await scope.store.getBlockMetasByIds([block.id]))[0];
+		if (!meta || meta.deleted || meta.parentId !== parent.id) return error;
+		return { orderKey: meta.orderKey, id: meta.id };
+	}
+	const version = (await scope.store.listVersionsAt([block.id], asOf))[0];
+	if (!version || version.deleted || version.parentId !== parent.id) return error;
+	return { orderKey: version.orderKey, id: block.id };
+}
+
 export async function outlineRead(
 	scope: OutlineAgentScope,
 	input: OutlineReadInput,
 ): Promise<OutlineToolOutput> {
 	const address = input.address?.trim() ?? "";
-	if (address === "") return await readOverview(scope);
+	const after = input.after?.trim() || undefined;
+	if (address === "") {
+		if (after !== undefined) return failed(OUTLINE_TOOL_TEXT.afterNeedsLevel, {});
+		if (input.asOf !== undefined) return failed(OUTLINE_TOOL_TEXT.listNotAsOf, {});
+		return await readOverview(scope);
+	}
 	if (address === OUTLINE_ALL_SPACES) {
 		return await stableAnswer(scope, (current) => overviewAnswer(current, input));
 	}
-	const root = spaceRootName(address);
-	if (root !== null) return await readSpace(scope, root);
+	const spaceName = spaceRootName(address);
+	if (spaceName !== null) {
+		// Refused before the space is looked up: the same answer whether it exists or not.
+		if (input.asOf !== undefined) return failed(OUTLINE_TOOL_TEXT.listNotAsOf, { address });
+		return await readSpace(scope, spaceName, after);
+	}
 
 	const resolution = await scope.resolve(address);
 	if (resolution.status === "not_found") {
-		return {
-			output: OUTLINE_TOOL_TEXT.notFound(address),
-			isError: true,
-			metadata: { tool: "OutlineRead", address },
-		};
+		return failed(OUTLINE_TOOL_TEXT.notFound(address), { address });
 	}
 	if (resolution.status === "ambiguous") {
 		return {
@@ -713,109 +929,163 @@ export async function outlineRead(
 	}
 	const block = resolution.block;
 	const space = await scope.space(block.spaceKey);
-	if (!space) {
-		return {
-			output: OUTLINE_TOOL_TEXT.notFound(address),
-			isError: true,
-			metadata: { tool: "OutlineRead", address },
-		};
-	}
+	if (!space) return failed(OUTLINE_TOOL_TEXT.notFound(address), { address });
 	let asOf: number | undefined;
 	if (input.asOf !== undefined) {
 		const seq = await readSeq(space, input.asOf);
-		if (typeof seq !== "number") {
-			return { output: seq.error, isError: true, metadata: { tool: "OutlineRead", address } };
-		}
+		if (typeof seq !== "number") return failed(seq.error, { address });
 		asOf = seq;
 	}
-	const seen = new Map<string, number>();
-	const label = scope.labelIn(space);
-	const pending = asOf === undefined ? await pendingForRead(scope, block.pageId) : null;
-	const result = await readOutline({
-		blockId: block.id,
-		view: input.view,
-		budget: budgetOf(input.budget),
-		asOf,
-		label: (node) => label(node.sid),
-		display: displayFor(scope, seen),
-		...(pending?.overlay ? { overlay: pending.overlay } : {}),
-	});
-	if (!result) {
-		return {
-			output:
-				asOf === undefined
-					? OUTLINE_TOOL_TEXT.deleted(block.address)
-					: OUTLINE_TOOL_TEXT.notAtSeq(block.address, asOf),
-			isError: true,
-			metadata: { tool: "OutlineRead", address: block.address },
-		};
-	}
-	if (result.current) {
-		// Blocks a pending change of this session adds are shown but not stored: not read.
-		const added = pending?.overlay?.added;
-		recordOutlineReads(
-			scope.narratorId,
-			result.blockIds.flatMap((id) => {
-				const version = seen.get(id);
-				return version === undefined || added?.has(id) ? [] : [[id, version] as const];
-			}),
+	const budget = budgetOf(input.budget);
+	const gone = () =>
+		failed(
+			asOf === undefined
+				? OUTLINE_TOOL_TEXT.deleted(block.address)
+				: OUTLINE_TOOL_TEXT.notAtSeq(block.address, asOf),
+			{ address: block.address },
 		);
+
+	// The block with its ancestors, and (unless a level is continued) what is under it.
+	const got = await readOutlineSubtreeNodes({
+		space,
+		rootId: block.id,
+		asOf,
+		budget: after === undefined ? budget : { blocks: 2, bytes: budget.bytes },
+		view: input.view,
+		store: scope.store,
+	});
+	if (!got) return gone();
+	const { read } = got;
+	const state = { current: read.current, seq: read.seq };
+	const path = read.path.map((p) => clip(p.title, 40) || OUTLINE_TOOL_TEXT.untitled);
+	if (read.pathTruncated) path.unshift("…");
+	const label = scope.labelIn(space);
+
+	let tree: LoadedTree;
+	let shown: Shown;
+	if (after === undefined) {
+		tree = linkTree([got], undefined);
+		const root = tree.nodes.get(block.id);
+		if (!root) return gone();
+		shown = await showTree(scope, space, tree, {
+			root,
+			view: read.view,
+			budget,
+			state,
+			lockedAbove: got.lockedAbove,
+			reportsOf: block.id,
+			forYouUnder: block.id,
+			topAddress: block.address,
+		});
+	} else {
+		const cursor = await levelCursor(scope, space, block, after, asOf);
+		if ("error" in cursor) return failed(cursor.error, { address: block.address });
+		const root = got.nodes[0];
+		tree = await levelAfter(scope, space, block, cursor, { asOf, view: read.view, budget });
+		path.push(clip(blockTitle(root?.content ?? ""), 40) || OUTLINE_TOOL_TEXT.untitled);
+		shown = await showTree(scope, space, tree, {
+			root: null,
+			view: read.view,
+			budget,
+			state,
+			lockedAbove: [...got.lockedAbove, ...(root?.task?.lock ? [block.id] : [])],
+			reportsOf: null,
+			forYouUnder: block.id,
+			topAddress: block.address,
+		});
 	}
-	const path = result.path.map((p) => clip(p.title, 40) || OUTLINE_TOOL_TEXT.untitled);
+	const { rendered } = shown;
+	if (read.current) recordOutlineReads(scope.narratorId, shown.reads);
+
+	const afterLabel = after === undefined ? null : label(bareSid(after));
 	const header = note(
 		OUTLINE_TOOL_TEXT.readHeader(
 			await scope.describe(space),
 			path,
-			result.current ? null : result.seq,
+			read.current ? null : read.seq,
+			afterLabel,
 		),
 	);
-	const notes = result.current ? (pending?.notes ?? []).map(note) : [];
-	const output = [header, result.markdown, ...notes].join("\n");
+	const lines = [header];
+	if (rendered.markdown !== "") lines.push(rendered.markdown);
+	else if (after !== undefined) lines.push(note(OUTLINE_TOOL_TEXT.nothingAfter));
+	if (tree.processHidden > 0) lines.push(note(OUTLINE_TOOL_TEXT.factsHidden(tree.processHidden)));
+	lines.push(...shown.notes);
+	const truncated = rendered.hiddenByBudget > 0 || rendered.openBelow || tree.open.has(null);
 	return {
-		output,
+		output: lines.join("\n"),
 		title: `OutlineRead: ${clip(blockTitle(block.title), 60) || block.address}`,
 		bounded: true,
 		metadata: {
 			tool: "OutlineRead",
 			address: block.address,
 			space: { key: space.key, kind: space.kind },
-			rootId: result.rootId,
-			pageId: result.pageId,
-			view: result.view,
-			blocks: result.blockIds.length,
-			hiddenByBudget: result.hiddenByBudget,
-			hiddenByView: result.hiddenByView,
-			truncated: result.truncated,
-			...(result.current ? {} : { asOf: result.seq }),
+			rootId: block.id,
+			...(after !== undefined ? { after } : {}),
+			view: rendered.view,
+			blocks: rendered.blockIds.length,
+			hiddenByBudget: rendered.hiddenByBudget,
+			hiddenByView: rendered.hiddenByView + tree.processHidden,
+			truncated,
+			...(read.current ? {} : { asOf: read.seq }),
 			// For the reader's card, never the model's text: the block by its title, where it sits,
 			// and the space by its name.
 			title: clip(blockTitle(block.title), 80),
 			// The titles as they are (an untitled block's is empty: the card words it in the
 			// reader's language, not the model's "(untitled)").
-			path: result.path.slice(-6).map((p) => clip(p.title, 40)),
+			path: read.path.slice(-6).map((p) => clip(p.title, 40)),
 			display: { v: 1, space: await scope.spaceDisplay(space) },
 		},
 	};
 }
 
+/** The id part of a reference as written (`key/sid`, `[sid]`, `sid`), for a header. */
+function bareSid(ref: string): string {
+	const text = ref.trim().replace(/^\[+|\]+$/g, "");
+	const slash = text.lastIndexOf("/");
+	return slash >= 0 ? text.slice(slash + 1) : text;
+}
+
 /**
- * The open changes of a page as a read of this session shows them (the module header): its own
- * laid over, others' marked, those waiting for its confirmation and its decided ones listed.
- * Null when the page has none of either.
+ * The open changes a read of this session shows (the module header): its own laid over, others'
+ * marked, those waiting for its confirmation and its decided ones listed. `roots` are the locked
+ * tasks read or above what was read: a change hangs on the locked task its plan is rooted at
+ * and touches only blocks under it, so these are the changes that can touch the read. Changes
+ * waiting for this session's confirmation are listed further: any under the top-level block of
+ * `forYouUnder` (the block read), as a read of its page listed them, so a delegate reading a
+ * sibling of the locked task is still told ({@link pendingForYouNearby}). Null when there is
+ * nothing to show.
  */
 async function pendingForRead(
 	scope: OutlineAgentScope,
-	pageId: string,
+	space: OutlineSpaceRow,
+	args: { roots: readonly string[]; reportsOf: string | null; forYouUnder: string | null },
 ): Promise<{ overlay: OutlinePendingOverlay | null; notes: string[] } | null> {
 	const session = scope.rootNarratorId ?? scope.narratorId;
 	const store = scope.store;
+	const roots = [...new Set(args.roots)];
 	// Heads only (review S-7): the operations of this session's own changes are read below.
-	const heads = await store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerPage);
-	const reports = await takePendingReports(session, { store, pageId });
-	if (heads.length === 0 && reports.length === 0) return null;
+	const heads =
+		roots.length === 0
+			? []
+			: (await store.listOpenPendingByRoots(roots, OUTLINE_SUBTREE_LIMITS.pendingRows)).filter(
+					(row) => row.spaceId === space.id,
+				);
+	const reports = args.reportsOf ? await decisionReports(scope, session, args.reportsOf) : [];
+	const near = args.forYouUnder
+		? await pendingForYouNearby(
+				scope,
+				space,
+				session,
+				args.forYouUnder,
+				new Set(heads.map((h) => h.id)),
+			)
+		: { rows: [], more: false };
+	const nearby = near.rows;
+	if (heads.length === 0 && reports.length === 0 && nearby.length === 0 && !near.more) return null;
 	// Who decides each change is the lock as it is now (review S-8).
 	const rows = await withCurrentDeciders(heads, { store });
-	const names = await pendingNames([...rows, ...reports]);
+	const names = await pendingNames([...rows, ...reports, ...nearby]);
 	// Sessions are named by title only when this session may read them (review S-5).
 	const titles = await scope.readableTitles(names.narrators);
 	const text = OUTLINE_TOOL_TEXT.pending;
@@ -855,13 +1125,15 @@ async function pendingForRead(
 			states.includes("conflict") ? "conflict" : states.includes("merged") ? "merged" : "none",
 		);
 	});
-	// Changes this session decides: it is the session the locker named (or its subagent).
+	// Changes this session decides: it is the session the locker named (or its subagent). Those
+	// found nearby are listed only, never laid over or marked: they touch no block read.
+	const decidable = [...others, ...nearby];
 	const delegates = [
-		...new Set(others.flatMap((r) => (r.deciderJson.delegate ? [r.deciderJson.delegate] : []))),
+		...new Set(decidable.flatMap((r) => (r.deciderJson.delegate ? [r.deciderJson.delegate] : []))),
 	];
 	if (delegates.length > 0) {
 		const roots = await store.getNarratorRoots(delegates);
-		for (const row of others) {
+		for (const row of decidable) {
 			const delegate = row.deciderJson.delegate;
 			if (!delegate || (roots.get(delegate)?.root ?? delegate) !== session) continue;
 			notes.push(
@@ -873,6 +1145,7 @@ async function pendingForRead(
 			);
 		}
 	}
+	if (near.more) notes.push(text.forYouMaybeMore);
 	for (const row of reports) {
 		const label = outlinePendingLabel(row.id);
 		const by = row.decidedByJson ? actorName(row.decidedByJson) : OUTLINE_TOOL_TEXT.edit.someone;
@@ -904,6 +1177,76 @@ async function pendingForRead(
 		}),
 		notes,
 	};
+}
+
+/** Open changes of a space a read looks through for those waiting for its session, at most. */
+const PENDING_NEARBY_SCAN = OUTLINE_SUBTREE_LIMITS.pendingRows;
+
+/**
+ * Open changes waiting for `session`'s confirmation (it is the delegate the locker named, or its
+ * root) whose plan is under the same top-level block as `blockId`, besides those in `seen`.
+ * Bounded: one read of the space's open change heads (at most {@link PENDING_NEARBY_SCAN}, oldest
+ * first), the deciders as they are now, and one walk up from the block and the few changes left
+ * (at most `markWalkRows` blocks); a walk cut short lists none of them. `more`: the space has
+ * more open changes than the scan looked through (the newest are the ones left out), so some
+ * waiting for this session may not be listed; the read says so.
+ */
+async function pendingForYouNearby(
+	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
+	session: string,
+	blockId: string,
+	seen: ReadonlySet<string>,
+): Promise<{ rows: OutlinePendingHead[]; more: boolean }> {
+	const store = scope.store;
+	const scanned = await store.listOpenPendingBySpace(space.id, PENDING_NEARBY_SCAN + 1);
+	const more = scanned.length > PENDING_NEARBY_SCAN;
+	const none = { rows: [], more };
+	const listed = scanned
+		.slice(0, PENDING_NEARBY_SCAN)
+		.filter(
+			(row) => !seen.has(row.id) && row.requesterSession !== session && row.rootBlockId !== null,
+		);
+	if (listed.length === 0) return none;
+	const current = (await withCurrentDeciders(listed, { store })).filter(
+		(row) => !!row.deciderJson.delegate,
+	);
+	if (current.length === 0) return none;
+	const roots = await store.getNarratorRoots([
+		...new Set(current.map((row) => row.deciderJson.delegate as string)),
+	]);
+	const mine = current.filter((row) => {
+		const delegate = row.deciderJson.delegate as string;
+		return (roots.get(delegate)?.root ?? delegate) === session;
+	});
+	if (mine.length === 0) return none;
+	const ancestry = await readOutlineAncestry(
+		space.id,
+		[blockId, ...mine.map((row) => row.rootBlockId as string)],
+		{ maxRows: OUTLINE_SUBTREE_LIMITS.markWalkRows, store },
+	);
+	const topOf = (id: string): string | null => {
+		const above = ancestry.above(id);
+		return above === null ? null : (above.at(-1) ?? id);
+	};
+	const top = topOf(blockId);
+	if (top === null) return none;
+	return { rows: mine.filter((row) => topOf(row.rootBlockId as string) === top), more };
+}
+
+/**
+ * Decisions on this session's changes it has not been told of, for a read of `blockId`: told
+ * once, then marked. The store files a decided change by the top-level block its plan is under,
+ * which is looked up here from the block read; nothing of it reaches the agent.
+ */
+async function decisionReports(
+	scope: OutlineAgentScope,
+	session: string,
+	blockId: string,
+): Promise<OutlinePendingHead[]> {
+	const meta = (await scope.store.getBlockMetasByIds([blockId]))[0];
+	if (!meta || meta.deleted) return [];
+	return await takePendingReports(session, { store: scope.store, pageId: meta.pageId });
 }
 
 export async function outlineSearch(

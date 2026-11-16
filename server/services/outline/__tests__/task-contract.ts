@@ -1788,7 +1788,7 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			const excluded = await findContinuationCandidates({
 				narratorId: narrator,
 				sessionSpaceId: session.id,
-				excludePageIds: [pageOne],
+				excludeUnder: [pageOne],
 				store: ctx.store,
 				now: at(t0, 30),
 			});

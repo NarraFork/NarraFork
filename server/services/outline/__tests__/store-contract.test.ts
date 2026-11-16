@@ -32,6 +32,7 @@ import { OUTLINE_HISTORY_CONTRACT } from "./history-contract";
 import { OUTLINE_PENDING_CONTRACT } from "./pending-contract";
 import { OUTLINE_QUESTION_CONTRACT } from "./question-contract";
 import { OUTLINE_READ_CONTRACT } from "./read-contract";
+import { OUTLINE_RESTORE_CONTRACT } from "./restore-contract";
 import { OUTLINE_SUBTREE_CONTRACT } from "./subtree-contract";
 import { OUTLINE_TASK_CONTRACT } from "./task-contract";
 
@@ -204,6 +205,12 @@ describe("outline history contract (SQLite)", () => {
 
 describe("outline subtree contract (SQLite)", () => {
 	for (const contractCase of OUTLINE_SUBTREE_CONTRACT) {
+		test(contractCase.name, () => contractCase.run(ctx), 300_000);
+	}
+});
+
+describe("outline restore contract (SQLite)", () => {
+	for (const contractCase of OUTLINE_RESTORE_CONTRACT) {
 		test(contractCase.name, () => contractCase.run(ctx), 300_000);
 	}
 });

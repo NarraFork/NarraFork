@@ -146,25 +146,32 @@ async function failure(error: unknown, tool: string): Promise<ToolResult> {
 
 export const outlineReadTool: ToolDefinition = {
 	name: OUTLINE_READ_TOOL,
-	description: `Read the outline (the team's shared, versioned notes: pages of nested blocks in spaces: this session's project, its own notes, your personal space, and the other projects' and sessions' spaces this session may read). Returns a page or any block with what is under it as a markdown outline, expanded level by level within a budget.
-- Every line starts with the block's address: \`- [Ab3dEf9Q] text\`, \`- [Ab3dEf9Q] [ ] a task @agent:name\`. The first line names the space (its key, e.g. Kx81mPqa). In this session's own spaces (its project's, its notes, the personal space) the id alone is the address; blocks of any other space are labeled key/id (\`- [Lm29XkQa/Ab3dEf9Q] text\`), which is how to address them. Links show their target's current title: [[Kx81mPqa/Ab3dEf9Q|Title]]; a link without a title points to something this session cannot read, or to nothing.
-- Lines in ‹…› are notes, not content: ‹… 12 more› means blocks left out by the budget (raise budget, or read that block).
-- A page shows facts by default: tasks and everything under them are left out (view "all" includes them; reading a task shows all of it).
-- address: an id, key/id, an alias such as Q17, or a block's title (ids, aliases and titles alone are looked up in this session's own spaces). Omit it to list this session's own spaces and their pages; key/ (or project/, session/, personal/) lists one space's pages; "*" is an overview of every space this session can read, its own first, each with its pages expanded together within the budget.
-- asOf: a commit number or a time, to read the block as it was then.
+	description: `Read the outline (the team's shared, versioned notes: nested blocks in spaces: this session's project, its own notes, your personal space, and the other projects' and sessions' spaces this session may read). Returns any block with what is under it as a markdown outline, expanded level by level within a budget.
+- Every line starts with the block's address: \`- [Ab3dEf9Q] text\`, \`- [Ab3dEf9Q] [ ] a task @agent:name\`. The first line names the space (its key, e.g. Kx81mPqa) and where the block sits. In this session's own spaces (its project's, its notes, the personal space) the id alone is the address; blocks of any other space are labeled key/id (\`- [Lm29XkQa/Ab3dEf9Q] text\`), which is how to address them. Links show their target's current title: [[Kx81mPqa/Ab3dEf9Q|Title]]; a link without a title points to something this session cannot read, or to nothing.
+- Lines in ‹…› are notes, not content. ‹… more› (or ‹… 12 more›) under a block means blocks under it are left out by the budget: read that block by its address to see them, or, where one level is long, read its parent again with after set to the last child shown.
+- Facts are shown by default: tasks, questions and everything under them are left out (view "all" includes them; reading a task shows all of it).
+- address: an id, key/id, an alias such as Q17, or a block's title (ids, aliases and titles alone are looked up in this session's own spaces). Omit it to list this session's own spaces and their top-level blocks; key/ (or project/, session/, personal/) lists one space's top-level blocks; "*" is an overview of every space this session can read, its own first, each with its top-level blocks expanded together within the budget.
+- after: continue a level. A block directly under address (with key/: a top-level block of that space); the read shows the blocks after it, not address itself.
+- asOf: a commit number or a time, to read the block as it was then. Keep the same asOf when you continue such a read with after. Lists of top-level blocks (key/, no address) and "*" are only as they are now.
 To write, use OutlineEdit (copy what you read into it: the ids and ‹…› notes are dropped).`,
 	parameters: z.object({
 		address: z
 			.string()
 			.optional()
 			.describe(
-				"Block or page: an id, key/id, an alias or a title. Omit to list this session's spaces; key/ lists a space's pages; \"*\" is an overview of every space this session can read",
+				"A block: an id, key/id, an alias or a title. Omit to list this session's spaces; key/ lists a space's top-level blocks; \"*\" is an overview of every space this session can read",
 			),
 		view: z
 			.enum(["facts", "all"])
 			.optional()
 			.describe('"facts" (default) leaves tasks and what is under them out; "all" shows them'),
-		budget: looseNumber("Blocks to show at most (default 80, max 2000)"),
+		budget: looseNumber("Blocks to show at most (default 80, max 800)"),
+		after: z
+			.string()
+			.optional()
+			.describe(
+				"Continue a level: the last child of address a read showed; the blocks after it are read",
+			),
 		asOf: z
 			.union([z.number(), z.string()])
 			.optional()
@@ -182,6 +189,7 @@ To write, use OutlineEdit (copy what you read into it: the ids and ‹…› not
 					address: typeof args.address === "string" ? args.address : undefined,
 					view: args.view === "all" ? "all" : args.view === "facts" ? "facts" : undefined,
 					budget: typeof args.budget === "number" ? args.budget : undefined,
+					after: typeof args.after === "string" ? args.after : undefined,
 					asOf:
 						typeof args.asOf === "number" || typeof args.asOf === "string" ? args.asOf : undefined,
 				}),
@@ -239,7 +247,7 @@ const editSchema = z.object({
 		.string()
 		.optional()
 		.describe(
-			'Add under this block; key/ (or project/, session/, personal/) adds new pages to that space, "/" to the default space',
+			'Add under this block; key/ (or project/, session/, personal/) adds at the top level of that space, "/" of the default space',
 		),
 	markdown: z.string().optional().describe("With add: the blocks, as a markdown outline"),
 	replace: z.string().optional().describe("Replace this block's text"),
@@ -248,7 +256,10 @@ const editSchema = z.object({
 		.optional()
 		.describe("With replace: the new text, written like one outline item without its bullet"),
 	move: z.string().optional().describe("Move this block (and what is under it)"),
-	to: z.string().optional().describe("With move: the new parent block, or key/ to make it a page"),
+	to: z
+		.string()
+		.optional()
+		.describe("With move: the new parent block, or key/ for the top level of its space"),
 	after: z
 		.string()
 		.optional()
@@ -357,13 +368,13 @@ export const outlineEditTool: ToolDefinition = {
 	name: OUTLINE_EDIT_TOOL,
 	description: `Write to the outline. One call is one commit in one space: all edits apply, or none does. Every commit records who wrote it and can be reverted.
 edits, in order, each one of:
-- { add: <parent>, markdown, after? | before? }: add blocks written as a markdown outline under a block, or as new pages with key/ (or project/, session/, personal/), or "/" for this session's project space (its own notes when it may not write the project's). after: the sibling to place them after (default: last); before: the sibling to place them before (before the first child puts them first).
+- { add: <parent>, markdown, after? | before? }: add blocks written as a markdown outline under any block, or at the top level of a space with key/ (or project/, session/, personal/), or "/" for this session's project space (its own notes when it may not write the project's). after: the sibling to place them after (default: last); before: the sibling to place them before (before the first child puts them first).
 - { replace: <block>, text }: the block's new text, written like one outline item without its bullet. A checkbox, @assignee and key:: lines in it are applied, whatever you leave out keeps its value, indented items become child blocks.
-- { move: <block>, to: <parent or key/>, after? | before? }
+- { move: <block>, to: <parent or key/>, after? | before? }: under any block of the same space, or to its top level with key/.
 - { delete: <block> }: the block and everything under it.
 - { set: <block>, checkbox?, assignee?, alias? }: checkbox " " todo, "/" doing, "x" done, "-" cancelled, "none" makes a task a plain block; assignee agent:name, human:name or null; alias Q17, "Q?" (next free number) or null.
 Markdown outline: every list item is a block, indentation nests; \`- [ ] task @agent:name\` is a task; \`depends:: [[…]]\`, \`due:: 2026-11-01\`, \`alias:: Q?\`, \`tags:: [[…]]\` lines under an item are properties. Link with [[title]], [[alias]] or [[key/id]]; links are stored as addresses, so renaming never breaks them, and blocks added in one call can link to each other by title. Text copied from OutlineRead works as is: the ids after bullets and the ‹…› notes are dropped. Lists or extra paragraphs inside one item become child blocks; the result says what was split.
-Work for the team goes on the project's task page (project/tasks; a page with alias:: tasks when there is none): to put a task in the pool, add it there and give your own task depends:: [[it]], and giving a task of this session's own space to a session or person who cannot work in that space (@agent:…, @human:…) hands a copy out there the same way, your task then waiting for it.
+Work for the team goes on the project's task list (project/tasks; a top-level block with alias:: tasks when there is none): to put a task in the pool, add it there and give your own task depends:: [[it]], and giving a task of this session's own space to a session or person who cannot work in that space (@agent:…, @human:…) hands a copy out there the same way, your task then waiting for it.
 <block>, <parent>: an id, key/id, an alias or a title. message: a short summary for the timeline.
 Notes under a task go conclusion first: a block directly under a task is one conclusion in one line (at most ${OUTLINE_NOTE_RULES.noteChars} characters), its evidence and details go in blocks under it (at most ${OUTLINE_NOTE_RULES.detailChars} characters each, at most ${OUTLINE_NOTE_RULES.maxChildren} blocks on one level), with no headings and no record of the process; a task's title is one line (at most ${OUTLINE_NOTE_RULES.titleChars} characters). When you tick a task done or cancelled, its first block should say the result in one line. The result says which blocks you wrote are over these limits and how to restructure them; a write far over them may be refused.
 Locked plans: a task tree a person locked takes changes to its plan (its steps, their text and order, its background, cancelling a step, the whole plan done) as proposals waiting for their confirmation; the rest of the call is written. The result names the proposal (P and 8 characters) and the tasks waiting for it: do other work meanwhile; reading the plan shows your proposed version. Progress, findings, ticking steps and splitting a step into sub-steps are written directly. A session the locker named confirms with { confirm: "P…" } or rejects with { reject: "P…", reason }, in a call of their own; never its own proposals (rejecting your own withdraws it).
@@ -405,8 +416,8 @@ The result gives each edit's outcome and the ids of new blocks. Read a block (Ou
 					{
 						...provenance,
 						signal: ctx.signal,
-						// The behavior page takes the same one-shot grant the old fence did: the first
-						// tool call of a real user turn, consumed only by a write that touches the page.
+						// The behavior boundary takes the same one-shot grant the old fence did: the first
+						// tool call of a real user turn, consumed only by a write that touches it.
 						behaviorGrant: () => consumeBehaviorFenceEditGrant(ctx.narratorId),
 					},
 				),

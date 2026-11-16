@@ -2658,8 +2658,8 @@ export const narratorService = {
 			await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
 			await applySpecForkCarryover(newNarrator.id, "card");
 			// An outline fork gets its parent's behavior page (outline plan PR 4); never rejects.
-			const { copyOutlineBehaviorPage } = await import("./task-source/outline-behavior");
-			await copyOutlineBehaviorPage(parentNarratorId, newNarrator.id);
+			const { copyOutlineBehaviorBoundary } = await import("./task-source/outline-behavior");
+			await copyOutlineBehaviorBoundary(parentNarratorId, newNarrator.id);
 			return newNarrator;
 		});
 	},
@@ -3126,8 +3126,8 @@ export const narratorService = {
 			})();
 			// An outline fork gets its parent's behavior page before its first run can read it
 			// (outline plan PR 4): one bounded commit; never rejects.
-			const { copyOutlineBehaviorPage } = await import("./task-source/outline-behavior");
-			await copyOutlineBehaviorPage(parentNarratorId, id);
+			const { copyOutlineBehaviorBoundary } = await import("./task-source/outline-behavior");
+			await copyOutlineBehaviorBoundary(parentNarratorId, id);
 			eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
 			broadcastToNarrator(parentNarratorId, {
 				type: "narrator_forked",
