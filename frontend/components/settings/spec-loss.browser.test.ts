@@ -7,7 +7,7 @@
  *    now" (asked once), and lists the findings of one status a page at a time, each with its
  *    session, file and what was lost;
  *  - a finding that is not on its page says why: the session is still in Dynamic Spec (nothing
- *    to attach to, no attach offered), the page's cap, a page that is gone;
+ *    to attach to, no attach offered), the per-block cap, an imported block that is gone;
  *  - the lost content is read on demand, in a box that scrolls by itself;
  *  - a person's attach of a left-out finding asks first (cancelling does nothing), then asks the
  *    server once; an attached finding links to its block and is dismissed after a question (its
@@ -260,7 +260,7 @@ test("the admin section: the scan, the findings a page at a time, why not attach
 		await page.waitForSelector('[role="dialog"]');
 		const dialog = await text(page, '[role="dialog"]');
 		expect(dialog).toContain(en.attachTitle);
-		expect(dialog).toContain("Nothing else on the page changes");
+		expect(dialog).toContain("Nothing else of the file changes");
 		await noSidewaysScroll(page);
 		const labels = await page.$$eval('[role="dialog"] button', (els) =>
 			els.map((el) => el.textContent),
