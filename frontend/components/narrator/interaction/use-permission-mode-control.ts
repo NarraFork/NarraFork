@@ -42,7 +42,14 @@ export interface UsePermissionModeControlOptions {
 		dangerReflectionOverride?: DangerReflectionOverride;
 		questionReflectionOverride?: BooleanOverride;
 	}>;
-	updateSettingsMutation: Mutation<Record<string, unknown>>;
+	updateSettingsMutation: Mutation<{
+		agent: {
+			planReflectionAutoApprove?: boolean;
+			dangerReflectionLevel?: DangerReflectionLevel;
+			dangerReflectionEnabled?: boolean;
+			questionReflectionEnabled?: boolean;
+		};
+	}>;
 	confirm: (options: { message: ReactNode }) => Promise<boolean>;
 	t: (key: string) => string;
 }
