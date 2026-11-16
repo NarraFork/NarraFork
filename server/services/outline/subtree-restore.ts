@@ -117,6 +117,7 @@ import {
 	encodeDiffWalkState,
 	newDiffWalkState,
 	SubtreeDiffWalk,
+	underRootRows,
 } from "./subtree-diff";
 import { withOutlineHistory } from "./subtree-errors";
 import { sameTaskJson } from "./task-json";
@@ -159,6 +160,8 @@ function openToken(
 	space: OutlineSpaceRow,
 	userId: string,
 	now: Date,
+	/** False for a restore already under way: what was confirmed in time may finish. */
+	checkExpiry = true,
 ): RestoreToken {
 	const value = openOutlineValue("token", sealed, "token");
 	if (!Array.isArray(value) || value.length !== 7) throw new OutlineRestoreTokenError("token");
@@ -174,7 +177,7 @@ function openToken(
 	)
 		throw new OutlineRestoreTokenError("token");
 	if (owner !== userId) throw new OutlineRestoreTokenError("token", "person");
-	if (now.getTime() - issuedAt > OUTLINE_RESTORE_LIMITS.tokenMinutes * 60_000)
+	if (checkExpiry && expired({ issuedAt }, now))
 		throw new OutlineRestoreTokenError("token", "expired");
 	return {
 		spaceId: space.id,
@@ -185,6 +188,32 @@ function openToken(
 		userId: owner,
 		issuedAt,
 	};
+}
+
+const expired = (token: Pick<RestoreToken, "issuedAt">, now: Date): boolean =>
+	now.getTime() - token.issuedAt > OUTLINE_RESTORE_LIMITS.tokenMinutes * 60_000;
+
+/** Commits after the preview's seq looked at for one of the restore's own (a bounded read). */
+const STARTED_LOOKAHEAD = 200;
+
+/**
+ * Whether the restore has written a commit already: one of the first commits after its
+ * preview carries its marker. What lets a restore confirmed in time finish after its token's
+ * minutes when its cursor is lost.
+ */
+async function restoreStarted(
+	store: OutlineStore,
+	space: OutlineSpaceRow,
+	token: RestoreToken,
+): Promise<boolean> {
+	const seqs: number[] = [];
+	for (let seq = token.pin + 1; seq < space.nextSeq && seqs.length < STARTED_LOOKAHEAD; seq++)
+		seqs.push(seq);
+	if (seqs.length === 0) return false;
+	const marker = outlineRestoreMarker(token.restoreId);
+	return (await store.getCommitsBySeqs(space.id, seqs)).some(
+		(commit) => commit.toolCallId === marker,
+	);
 }
 
 /** What a restore's commits carry in `toolCallId`. */
@@ -383,7 +412,7 @@ async function previewPage(
 						ask.map((blockId) => ({ blockId, asOf: pin })),
 						OUTLINE_LIMITS.maxDepth,
 					);
-					walk.rows += rows.length;
+					walk.rows += underRootRows(rows);
 					for (const row of rows) if (row.under) there.add(row.blockId);
 				}
 				for (const item of strays) {
@@ -564,6 +593,11 @@ export function dropRefused(
 		left = next;
 	}
 	return { left, dropped, unsafe };
+}
+
+/** Forget the last cursor of a restore (tests: a confirm after a process restart). */
+export function forgetRestoreCursor(restoreId: string): void {
+	lastCursors.delete(restoreId);
 }
 
 class SubtreeRestorer {
@@ -1288,12 +1322,17 @@ export async function restoreOutlineSubtree(
 	options: OutlineRestoreOptions = {},
 ): Promise<OutlineRestoreResponse> {
 	const store = options.store ?? outlineStore;
-	const token = openToken(
-		input.token,
-		input.space,
-		personOf(input),
-		(options.now ?? (() => new Date()))(),
-	);
+	const now = (options.now ?? (() => new Date()))();
+	// The token's minutes bound when a restore may be confirmed, not how long it may take: a
+	// call that continues one (with its cursor, or after one of its commits) is not refused.
+	const token = openToken(input.token, input.space, personOf(input), now, false);
+	if (
+		expired(token, now) &&
+		!input.cursor &&
+		!lastCursors.has(token.restoreId) &&
+		!(await restoreStarted(store, input.space, token))
+	)
+		throw new OutlineRestoreTokenError("token", "expired");
 	let state = newDiffWalkState();
 	let pass = 0;
 	let deferred = 0;

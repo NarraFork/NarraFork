@@ -192,6 +192,18 @@ export interface DiffLateCost {
 export const DIFF_ITEM_ROWS = 8;
 /** Rows a block's tags cost at most (both seqs). */
 export const DIFF_TAG_ROWS = 2 * OUTLINE_LIMITS.maxTagsPerBlock;
+/**
+ * Levels of placements walked up (`listUnderRootAt`) charged as one row: a step is one index
+ * seek, about 2 µs on SQLite, against ~13 µs for a row a read returns.
+ */
+export const UNDER_STEPS_PER_ROW = 8;
+
+/** The rows a `listUnderRootAt` answer is charged: one per pair, and its walk. */
+export function underRootRows(rows: ReadonlyArray<{ steps: number }>): number {
+	let steps = 0;
+	for (const row of rows) steps += row.steps;
+	return rows.length + Math.ceil(steps / UNDER_STEPS_PER_ROW);
+}
 /** Pages of changed children a walk keeps in memory, to read a parent's page again for free. */
 const PAGE_CACHE = 8;
 
@@ -236,6 +248,8 @@ interface PageFlags {
 export class SubtreeDiffWalk {
 	/** Rows read from the store so far (callers add their own reads). */
 	rows = 0;
+	/** The longest walk up seen (`listUnderRootAt`): what one block may cost to place. */
+	private deepest = 0;
 	private readonly pages = new Map<
 		string,
 		{ rows: OutlineChangedChildRow[]; next: OutlineChangedChildCursor | null }
@@ -308,7 +322,18 @@ export class SubtreeDiffWalk {
 
 	/** The rows a step needs at least to get anywhere. */
 	private need(late: DiffLateCost | undefined): number {
-		return DIFF_ITEM_ROWS + DIFF_TAG_ROWS + (late?.max ?? 0);
+		return this.perItem() + DIFF_TAG_ROWS + (late?.max ?? 0);
+	}
+
+	/**
+	 * What one block met on a page may cost the walk, its tags aside: its fixed reads, and two
+	 * walks up as deep as the frame stack or the deepest walk seen (a walk cut short and asked
+	 * again counts up to twice its depth). At the deepest tree allowed it still leaves room for
+	 * one block in a fresh page.
+	 */
+	private perItem(): number {
+		const depth = Math.max(this.deepest, 2 * (this.state.frames.length + 1));
+		return DIFF_ITEM_ROWS + 2 * Math.ceil(depth / UNDER_STEPS_PER_ROW);
 	}
 
 	/**
@@ -378,14 +403,19 @@ export class SubtreeDiffWalk {
 		return new Set(found);
 	}
 
-	/** Where each block last sat as of its seq, and whether under the root; a row per block. */
+	/**
+	 * Where each block last sat as of its seq, and whether under the root: a row per block, and
+	 * the levels walked for it charged too (deep trees cost more, and the next steps take fewer
+	 * blocks at once).
+	 */
 	private async under(
 		items: Array<{ blockId: string; asOf: number }>,
 	): Promise<Map<string, OutlineUnderRootRow>> {
 		const { store, space, rootId } = this.scope;
 		if (rootId === null || items.length === 0) return new Map();
 		const rows = await store.listUnderRootAt(space.id, rootId, items, OUTLINE_LIMITS.maxDepth);
-		this.rows += rows.length;
+		this.rows += underRootRows(rows);
+		for (const row of rows) this.deepest = Math.max(this.deepest, row.steps);
 		return new Map(rows.map((row) => [`${row.blockId}@${row.asOf}`, row]));
 	}
 
@@ -518,7 +548,8 @@ export class SubtreeDiffWalk {
 		}
 		const lateMax = late?.max ?? 0;
 		const room = budget - (this.rows - started) - DIFF_TAG_ROWS - lateMax;
-		const k = Math.max(1, Math.min(end - frame.pos, Math.floor(room / DIFF_ITEM_ROWS)));
+		const perItem = this.perItem();
+		const k = Math.max(1, Math.min(end - frame.pos, Math.floor(room / perItem)));
 		const ids = order.slice(frame.pos, frame.pos + k);
 
 		const chars = mode === "compare" ? OUTLINE_DIFF_LIMITS.excerptChars : 0;

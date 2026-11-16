@@ -32,12 +32,14 @@ import {
 	type OutlineEdgeRow,
 	type OutlineHistoryPort,
 	type OutlineHistoryState,
+	OutlineHistoryUnavailableError,
 	type OutlineLevelCursor,
 	type OutlineLevelRow,
 	type OutlineParentRow,
 	type OutlineSubtreeChange,
 	pageChangedChildren,
 	readSubtreeByLevels,
+	underRootInBoundedStatements,
 	uniquePairs,
 } from "./history-port";
 import { chunked, type OutlineSpaceRow } from "./port";
@@ -407,7 +409,9 @@ export function pgUnderRootAt(
 				AND up.id <> ${text(spaceId)} AND up.depth <= ${int(maxDepth)}
 		)
 		SELECT start, seq, bool_or(depth > 0 AND id = ${text(rootId)}) AS under,
-			max(CASE WHEN depth = 1 THEN id END) AS parent_key
+			max(CASE WHEN depth = 1 THEN id END) AS parent_key, max(depth) AS steps,
+			bool_or(id IS NULL OR (depth > 0 AND id = ${text(rootId)}) OR id = ${text(spaceId)})
+				AS ended
 		FROM up GROUP BY start, seq`;
 }
 
@@ -635,24 +639,26 @@ export function createPostgresOutlineHistory(db: BunSQLDatabase): OutlineHistory
 			if (pairs.length === 0) return [];
 			const oldest = Math.min(...pairs.map((pair) => pair[1]));
 			if (!(await readable(spaceId, oldest)))
-				return pairs.map(([blockId, asOf]) => ({ blockId, asOf, under: false, parentKey: null }));
-			const found = new Map<string, { under: boolean; parentKey: string | null }>();
-			for (const chunk of chunked(pairs)) {
-				for (const row of await rowsOf<{
-					start: string;
-					seq: number | string;
-					under: boolean | null;
-					parent_key: string | null;
-				}>(pgUnderRootAt(spaceId, rootId, chunk, maxDepth)))
-					found.set(`${row.start}\u0000${Number(row.seq)}`, {
-						under: row.under === true,
-						parentKey: row.parent_key ?? null,
-					});
-			}
-			return pairs.map(([blockId, asOf]) => {
-				const row = found.get(`${blockId}\u0000${asOf}`);
-				return { blockId, asOf, under: row?.under === true, parentKey: row?.parentKey ?? null };
-			});
+				throw new OutlineHistoryUnavailableError(spaceId, "not-ready", 0, oldest);
+			return await underRootInBoundedStatements(pairs, maxDepth, async (chunk, cap) =>
+				(
+					await rowsOf<{
+						start: string;
+						seq: number | string;
+						under: boolean | null;
+						parent_key: string | null;
+						steps: number | string;
+						ended: boolean | null;
+					}>(pgUnderRootAt(spaceId, rootId, chunk, cap))
+				).map((row) => ({
+					blockId: row.start,
+					asOf: Number(row.seq),
+					under: row.under === true,
+					parentKey: row.parent_key ?? null,
+					steps: Number(row.steps),
+					ended: row.ended === true,
+				})),
+			);
 		},
 
 		async getAncestry(spaceId, blockId, { asOf, maxDepth }) {

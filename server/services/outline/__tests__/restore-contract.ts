@@ -31,6 +31,11 @@ import {
 	OutlineRestoreTokenError,
 } from "../restore-errors";
 import {
+	OUTLINE_UNDER_ROOT_STEPS,
+	OutlineHistoryUnavailableError as StoreHistoryUnavailableError,
+	underRootInBoundedStatements,
+} from "../store/history-port";
+import {
 	OUTLINE_HISTORY_LIMITS,
 	type OutlineBlockRow,
 	OutlineChangeMarksLimitError,
@@ -38,10 +43,11 @@ import {
 	type OutlineStore,
 	type OutlineVersionRow,
 } from "../store/port";
-import { readOutlineSubtreeDiff } from "../subtree-diff";
+import { readOutlineSubtreeDiff, underRootRows } from "../subtree-diff";
 import { OutlineHistoryNotAvailableError } from "../subtree-errors";
 import {
 	dropRefused,
+	forgetRestoreCursor,
 	moveOutlineBlockBack,
 	type OutlineRestoreOptions,
 	outlineRestoreMarker,
@@ -99,7 +105,12 @@ function mulberry32(seed: number): () => number {
 function counting(store: OutlineStore): { store: OutlineStore; take(): number } {
 	let rows = 0;
 	const size = (value: unknown): number => {
-		if (Array.isArray(value)) return value.length;
+		if (Array.isArray(value)) {
+			// A walk up also counts the levels it walked, as the walk charges them.
+			const first = value[0] as { steps?: unknown } | undefined;
+			if (typeof first?.steps === "number") return underRootRows(value as Array<{ steps: number }>);
+			return value.length;
+		}
 		if (value instanceof Map) return value.size;
 		if (value && typeof value === "object" && Array.isArray((value as { rows?: unknown }).rows))
 			return (value as { rows: unknown[] }).rows.length;
@@ -2067,6 +2078,174 @@ export const OUTLINE_RESTORE_CONTRACT: ContractCase[] = [
 			const dump = await ctx.dump(space.id);
 			expect(blockOf(dump, ids.a1).content).toBe("a1");
 			expect(blockOf(dump, ids.b1).content).toBe("b1");
+		},
+	},
+	{
+		name: "a walk up is bounded per statement and charged by depth: 40 blocks 900 levels down (review round 2)",
+		async run(ctx) {
+			// The statement splitter alone: every statement walks at most its step budget.
+			const parents = new Map<string, string>();
+			for (let i = 1; i <= 900; i++) parents.set(`n${i}`, `n${i - 1}`);
+			const statements: number[] = [];
+			const answers = await underRootInBoundedStatements(
+				Array.from({ length: 40 }, (_, i): [string, number] => [`n${860 + i}`, 7]),
+				OUTLINE_LIMITS.maxDepth,
+				async (chunk, cap) => {
+					statements.push(chunk.length * (cap + 1));
+					return chunk.map(([blockId, asOf]) => {
+						let at: string | undefined = blockId;
+						let steps = 0;
+						while (at !== undefined && at !== "n0" && steps <= cap) {
+							at = parents.get(at);
+							steps++;
+						}
+						return {
+							blockId,
+							asOf,
+							under: at === "n0",
+							parentKey: null,
+							steps,
+							ended: at === "n0",
+						};
+					});
+				},
+			);
+			expect(answers.every((row) => row.under)).toBe(true);
+			// One statement: at most the step budget, or one pair walked to the depth limit.
+			for (const work of statements)
+				expect(work).toBeLessThanOrEqual(
+					Math.max(OUTLINE_UNDER_ROOT_STEPS, OUTLINE_LIMITS.maxDepth + 1),
+				);
+
+			// On the store: a chain 900 deep, 40 children at its end move up one level.
+			const space = await personalSpace(ctx);
+			const top = (await write(ctx, space, [{ op: "insert", parent: null, content: "top" }]))
+				.results[0]?.blockId as string;
+			const chain: string[] = [];
+			let parent = top;
+			for (let depth = 0; depth < 900; depth += OUTLINE_LIMITS.maxOps) {
+				const length = Math.min(OUTLINE_LIMITS.maxOps, 900 - depth);
+				const made = await write(
+					ctx,
+					space,
+					Array.from(
+						{ length },
+						(_, n): OutlineOp => ({
+							op: "insert",
+							tempId: `c${n}`,
+							parent: n === 0 ? { id: parent } : { tempId: `c${n - 1}` },
+							content: `chain ${depth + n}`,
+						}),
+					),
+				);
+				chain.push(...made.results.map((r) => r.blockId));
+				parent = chain.at(-1) as string;
+			}
+			const leaves = (
+				await write(
+					ctx,
+					space,
+					Array.from(
+						{ length: 40 },
+						(_, i): OutlineOp => ({ op: "insert", parent: { id: parent }, content: `leaf ${i}` }),
+					),
+				)
+			).results.map((r) => r.blockId);
+			const thenSeq = (await fresh(ctx, space)).nextSeq - 1;
+			await write(
+				ctx,
+				space,
+				leaves.map(
+					(id): OutlineOp => ({
+						op: "move",
+						block: { id },
+						parent: { id: chain.at(-2) as string },
+					}),
+				),
+			);
+			const now = await fresh(ctx, space);
+			const started = performance.now();
+			const rows = await ctx.store.listUnderRootAt(
+				space.id,
+				top,
+				leaves.map((blockId) => ({ blockId, asOf: now.nextSeq - 1 })),
+				OUTLINE_LIMITS.maxDepth,
+			);
+			console.log(
+				`[outline restore] 40 walks up 900 levels: ${(performance.now() - started).toFixed(1)} ms in bounded statements`,
+			);
+			expect(rows.every((row) => row.under && row.steps >= 900)).toBe(true);
+			// Every page, the walks up charged, stays within the budget (`wholeDiff` asserts it).
+			const { entries } = await wholeDiff(ctx, now, top, thenSeq, undefined, 200);
+			expect(entries.filter((entry) => entry.kind === "changed")).toHaveLength(40);
+			const preview = await wholePreview(ctx, now, top, thenSeq);
+			expect(preview.entries).toHaveLength(40);
+			// A space whose history is not readable is refused, never answered "not under".
+			await ctx.forgetHistory(space.id);
+			await expect(
+				ctx.store.listUnderRootAt(
+					space.id,
+					top,
+					[{ blockId: leaves[0] as string, asOf: thenSeq }],
+					10,
+				),
+			).rejects.toBeInstanceOf(StoreHistoryUnavailableError);
+			await expect(
+				ctx.store.listUnderRootAt("no-such-space", top, [{ blockId: top, asOf: 1 }], 10),
+			).rejects.toBeInstanceOf(StoreHistoryUnavailableError);
+		},
+	},
+	{
+		name: "a restore confirmed in time finishes after its token's minutes; a late first confirm is refused (review round 2)",
+		async run(ctx) {
+			const { space, thenSeq, ids } = await fixture(ctx);
+			await write(ctx, space, [
+				{ op: "update", block: { id: ids.a1 }, content: "a1 edited" },
+				{ op: "update", block: { id: ids.a2 }, content: "a2 edited" },
+				{ op: "update", block: { id: ids.b1 }, content: "b1 edited" },
+			]);
+			const preview = await wholePreview(ctx, await fresh(ctx, space), ids.top, thenSeq);
+			const late = new Date(Date.now() + (OUTLINE_RESTORE_LIMITS.tokenMinutes + 5) * 60_000);
+			const options = {
+				store: ctx.store,
+				limits: { maxBlocksPerCommit: 1, maxCommitsPerCall: 1 },
+			};
+			// Never confirmed: too late.
+			const other = await wholePreview(ctx, await fresh(ctx, space), ids.top, thenSeq);
+			const refused = await restoreOutlineSubtree(
+				{ ...WRITER, space: await fresh(ctx, space), token: other.token },
+				{ ...options, now: () => late },
+			).catch((error: unknown) => error);
+			expect((refused as OutlineRestoreTokenError).details).toEqual({ reason: "expired" });
+			// Confirmed in time, continued after the minutes: with its cursor, then without one
+			// (as after a restart: the restore's own commits show it is under way).
+			const first = await restoreOutlineSubtree(
+				{ ...WRITER, space: await fresh(ctx, space), token: preview.token },
+				options,
+			);
+			expect(first.done).toBe(false);
+			const second = await restoreOutlineSubtree(
+				{
+					...WRITER,
+					space: await fresh(ctx, space),
+					token: preview.token,
+					cursor: first.cursor,
+				},
+				{ ...options, now: () => late },
+			);
+			expect(second.commits.length).toBeGreaterThan(0);
+			forgetRestoreCursor(first.restoreId);
+			let last = second;
+			for (let i = 0; !last.done && i < 20; i++) {
+				last = await restoreOutlineSubtree(
+					{ ...WRITER, space: await fresh(ctx, space), token: preview.token },
+					{ ...options, now: () => late },
+				);
+			}
+			expect(last.done).toBe(true);
+			const dump = await ctx.dump(space.id);
+			for (const id of [ids.a1, ids.a2, ids.b1])
+				expect(blockOf(dump, id).content).not.toContain("edited");
 		},
 	},
 ];

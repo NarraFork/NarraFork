@@ -28,12 +28,14 @@ import {
 	type OutlineEdgeRow,
 	type OutlineHistoryPort,
 	type OutlineHistoryState,
+	OutlineHistoryUnavailableError,
 	type OutlineLevelCursor,
 	type OutlineLevelRow,
 	type OutlineParentRow,
 	type OutlineSubtreeChange,
 	pageChangedChildren,
 	readSubtreeByLevels,
+	underRootInBoundedStatements,
 	uniquePairs,
 } from "./history-port";
 import { chunked, type OutlineSpaceRow } from "./port";
@@ -277,7 +279,9 @@ export const SQLITE_ANCESTRY_OF = `WITH RECURSIVE up(id) AS (
  * placement that began by the seq, open then or not; when it had closed by then (the block was
  * deleted, or moved and deleted), the walk above it is as of the seq just before it closed.
  * Every step is a backward seek on the block's placements (`idx_outline_edges_block`, pinned);
- * the walk stops at the root, at the space, at a block not placed then, or past `?4` steps.
+ * the walk stops at the root, at the space, at a block not placed then, or past `?4` steps
+ * (the caller keeps `pairs × ?4` bounded, `underRootInBoundedStatements`). Each row also says
+ * how many levels were walked and whether the walk ended before the cap.
  * The pairs are probed one by one from the JSON list (`CROSS JOIN`), the space only a filter
  * on the block found, as in {@link SQLITE_ANCESTRY_OF}.
  */
@@ -301,7 +305,8 @@ export const SQLITE_UNDER_ROOT_AT = `WITH RECURSIVE up(start, seq, id, at, depth
 		FROM up
 		WHERE up.id IS NOT NULL AND (up.depth = 0 OR up.id <> ?2) AND up.id <> ?3 AND up.depth <= ?4
 	)
-	SELECT start, seq, max(depth > 0 AND id = ?2), max(CASE WHEN depth = 1 THEN id END)
+	SELECT start, seq, max(depth > 0 AND id = ?2), max(CASE WHEN depth = 1 THEN id END),
+		max(depth), max(id IS NULL OR (depth > 0 AND id = ?2) OR id = ?3)
 	FROM up GROUP BY start, seq`;
 
 /**
@@ -529,24 +534,21 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 			if (pairs.length === 0) return [];
 			const oldest = Math.min(...pairs.map((pair) => pair[1]));
 			if (!readable(spaceId, oldest))
-				return pairs.map(([blockId, asOf]) => ({ blockId, asOf, under: false, parentKey: null }));
-			const found = new Map<string, { under: boolean; parentKey: string | null }>();
-			for (const chunk of chunked(pairs)) {
-				for (const row of values(SQLITE_UNDER_ROOT_AT, [
-					JSON.stringify(chunk),
-					rootId,
-					spaceId,
-					maxDepth,
-				]) as Array<[string, number, number, string | null]>)
-					found.set(`${row[0]}\u0000${Number(row[1])}`, {
-						under: Number(row[2]) !== 0,
-						parentKey: row[3] ?? null,
-					});
-			}
-			return pairs.map(([blockId, asOf]) => {
-				const row = found.get(`${blockId}\u0000${asOf}`);
-				return { blockId, asOf, under: row?.under === true, parentKey: row?.parentKey ?? null };
-			});
+				throw new OutlineHistoryUnavailableError(spaceId, "not-ready", 0, oldest);
+			return await underRootInBoundedStatements(pairs, maxDepth, async (chunk, cap) =>
+				(
+					values(SQLITE_UNDER_ROOT_AT, [JSON.stringify(chunk), rootId, spaceId, cap]) as Array<
+						[string, number, number, string | null, number, number]
+					>
+				).map((row) => ({
+					blockId: row[0],
+					asOf: Number(row[1]),
+					under: Number(row[2]) !== 0,
+					parentKey: row[3] ?? null,
+					steps: Number(row[4]),
+					ended: Number(row[5]) !== 0,
+				})),
+			);
 		},
 
 		async listAncestryOf(spaceId, blockIds, limit) {

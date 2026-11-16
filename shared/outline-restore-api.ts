@@ -56,7 +56,11 @@ export const OUTLINE_RESTORE_LIMITS = {
 	maxSkipped: 200,
 	/** Store rows one call reads at most (with the commits and the clock). */
 	maxRowsPerCall: 40_000,
-	/** Minutes a preview's token is good for. */
+	/**
+	 * Minutes a preview's token can be confirmed (and paged) in. A restore confirmed in time
+	 * finishes however long it takes: a call with its cursor, or after one of its commits, is
+	 * not refused.
+	 */
 	tokenMinutes: 30,
 } as const;
 
