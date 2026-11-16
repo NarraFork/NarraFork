@@ -64,3 +64,17 @@ export function useImageViewer() {
 	}
 	return ctx.open;
 }
+
+/**
+ * Same consumer, but returns `null` instead of throwing when no provider is mounted.
+ *
+ * Markdown rendering is reached from both sides of the provider: the app shell
+ * (`CoreProviders`) mounts it, while standalone renderers — and the markdown unit
+ * tests that render `MarkdownContent` directly — do not. A throwing hook would make
+ * those contexts crash on a purely decorative image, so callers that merely ENHANCE
+ * an existing element (click-to-enlarge) ask for the viewer optionally and keep the
+ * plain element when it is absent.
+ */
+export function useOptionalImageViewer(): ImageViewerContextValue["open"] | null {
+	return useContext(ImageViewerContext)?.open ?? null;
+}

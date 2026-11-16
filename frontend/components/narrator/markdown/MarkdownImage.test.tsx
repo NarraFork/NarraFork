@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { MAX_FILE_REFERENCE_IMAGE_BYTES } from "@shared/file-reference-image";
 import { parseHTML } from "linkedom";
-import { act } from "react";
+import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { ImageViewerContext, type ImageViewerOptions } from "../../common/image-viewer-context";
 import {
 	FileReferenceScopeProvider,
 	type FileReferenceScopeValue,
@@ -79,6 +80,72 @@ async function render(src: string, scope: FileReferenceScopeValue = {}) {
 	});
 }
 const localScope = { context: { deviceId: "local", cwd: "/repo/docs" } };
+
+/** Render an arbitrary tree under the same scope provider the real panels supply. */
+async function renderNode(node: ReactElement, scope: FileReferenceScopeValue = {}) {
+	await act(async () => {
+		root.render(<FileReferenceScopeProvider value={scope}>{node}</FileReferenceScopeProvider>);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	});
+}
+
+async function click(node: Element | null) {
+	await act(async () => {
+		node?.dispatchEvent(new window.Event("click", { bubbles: true }));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	});
+}
+
+describe("Markdown inline images in the rendered preview", () => {
+	// A rendered document's picture is the natural place to click for a closer look, so
+	// the preview hands the bytes to the shared fullscreen viewer instead of making people
+	// find a toolbar button first.
+	test("clicking a rendered picture opens the viewer with the read bytes", async () => {
+		const opens: ImageViewerOptions[] = [];
+		await renderNode(
+			<ImageViewerContext.Provider value={{ open: (options) => opens.push(options) }}>
+				<MarkdownContent text={"![截图](./images/中文%20截图.png)"} />
+			</ImageViewerContext.Provider>,
+			localScope,
+		);
+		const image = container.querySelector("img");
+		expect(image?.style.cursor).toBe("zoom-in");
+		await click(image);
+		expect(opens).toHaveLength(1);
+		// `blob` is what makes the enlarged view survive this component unmounting: the
+		// viewer mints its own URL from the bytes rather than borrowing ours.
+		expect(opens[0].src).toBe("blob:test-1");
+		expect(opens[0].blob?.size).toBe(3);
+		expect(opens[0].blob?.type).toBe("image/png");
+		expect(opens[0].filename).toBe("中文 截图.png");
+		expect(opens[0].alt).toBe("截图");
+	});
+
+	test("the preview URL is still released even after the picture was enlarged", async () => {
+		const opens: ImageViewerOptions[] = [];
+		await renderNode(
+			<ImageViewerContext.Provider value={{ open: (options) => opens.push(options) }}>
+				<MarkdownContent text={"![截图](./images/a.png)"} />
+			</ImageViewerContext.Provider>,
+			localScope,
+		);
+		await click(container.querySelector("img"));
+		await act(async () => root.render(null));
+		// Ours is revoked; the blob handed over keeps working in the viewer.
+		expect(revoked).toHaveBeenCalledWith("blob:test-1");
+		expect(opens[0].blob?.size).toBe(3);
+	});
+
+	test("without a mounted viewer the picture still renders and is not clickable", async () => {
+		await render("images/a.png", localScope);
+		const image = container.querySelector("img");
+		expect(image?.getAttribute("src")).toBe("blob:test-1");
+		// No provider means no enlarge target; the cursor must not promise one.
+		expect(image?.style.cursor).toBe("");
+		await click(image);
+		expect(requests).toHaveLength(1);
+	});
+});
 
 describe("Markdown repository images", () => {
 	test("resolves encoded relative images from the document directory and sends auth", async () => {
