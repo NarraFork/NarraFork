@@ -23,6 +23,21 @@ import { WorkerCleanupError, type WorkerHandle } from "../lib/worker-runtime/lif
 import { TaskQueue, TaskQueueError } from "../lib/worker-runtime/queue";
 import type { StreamWorkerRequest, StreamWorkerResult } from "./editor-document-stream-worker";
 
+/** A device that just dropped is usually back within one reconnect. */
+const REMOTE_OFFLINE_RETRY_MS = 3_000;
+const releasedOfflineRead = Symbol("releasedOfflineRead");
+function remoteReadGone(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		(error.name === "DeviceOfflineError" || error.name === "DeviceConnectionChangedError")
+	);
+}
+function releasedOffline(error: unknown): boolean {
+	return (
+		error instanceof Error && error.name === "DeviceOfflineError" && releasedOfflineRead in error
+	);
+}
+
 export interface EditorRemoteRawSource {
 	open(signal: AbortSignal): Promise<EditorRawReadOpen>;
 	chunk(input: EditorRawReadChunkRequest, signal: AbortSignal): Promise<EditorRawReadChunk>;
@@ -316,6 +331,34 @@ export class EditorDocumentStreams {
 		signal?: AbortSignal,
 		preflightOnly = false,
 	) {
+		const offlineUntil = performance.now() + REMOTE_OFFLINE_RETRY_MS;
+		for (;;) {
+			try {
+				return await this.openAttempt(
+					userId,
+					owner,
+					path,
+					encoding,
+					expected,
+					signal,
+					preflightOnly,
+				);
+			} catch (error) {
+				if (!releasedOffline(error) || performance.now() >= offlineUntil || signal?.aborted)
+					throw error;
+				await new Promise((resolve) => setTimeout(resolve, 200));
+			}
+		}
+	}
+	private async openAttempt(
+		userId: string,
+		owner: string,
+		path: string | EditorRemoteRawSource,
+		encoding?: EditorRawEncoding,
+		expected?: EditorRawMetadata,
+		signal?: AbortSignal,
+		preflightOnly = false,
+	) {
 		const started = performance.now();
 		const permit = await this.acquire(userId, signal, owner);
 		const id = randomUUID();
@@ -355,9 +398,19 @@ export class EditorDocumentStreams {
 					await this.workers.run(worker, { action: "close", stream: id });
 					await closeReadFile(read);
 					await read.openingRemote?.catch(() => {});
-					if (read.remoteOpen)
-						await read.remote?.close({ readId: read.remoteOpen.readId, abort: !read.eof });
-					// Cleanup failures retain the read/permit as evidence, never count as freed credit.
+					if (read.remoteOpen) {
+						try {
+							await read.remote?.close({
+								readId: read.remoteOpen.readId,
+								abort: !read.eof,
+							});
+						} catch (error) {
+							// The remote read is already gone, so local credit can be freed below.
+							// Any other cleanup failure still retains the read and permit.
+							if (!remoteReadGone(error)) throw error;
+						}
+					}
+					// A thrown cleanup failure retains the read/permit as evidence.
 					this.reads.delete(id);
 					permit.release();
 					const elapsedMs = Math.round(performance.now() - started);
@@ -484,7 +537,14 @@ export class EditorDocumentStreams {
 			read.touch();
 			return { readId: id, metadata };
 		} catch (error) {
-			await read.close();
+			try {
+				await read.close();
+			} catch {
+				// Cleanup failure keeps the permit. The original read error stays the result.
+				throw error;
+			}
+			if (error instanceof Error && error.name === "DeviceOfflineError")
+				Object.defineProperty(error, releasedOfflineRead, { value: true });
 			throw error;
 		}
 	}
@@ -564,7 +624,11 @@ export class EditorDocumentStreams {
 			read.touch();
 			return result;
 		} catch (error) {
-			await read.close();
+			try {
+				await read.close();
+			} catch {
+				// Cleanup failure keeps the permit. The original read error stays the result.
+			}
 			throw error;
 		} finally {
 			read.busy = false;

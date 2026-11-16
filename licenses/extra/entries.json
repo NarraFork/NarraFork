@@ -193,7 +193,7 @@
 	},
 	{
 		"name": "github.com/pion/dtls/v3 (remote-peer)",
-		"version": "3.1.10",
+		"version": "3.1.15",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/dtls",
@@ -202,7 +202,7 @@
 	},
 	{
 		"name": "github.com/pion/ice/v4 (remote-peer)",
-		"version": "4.4.7",
+		"version": "4.4.8",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/ice",
@@ -211,7 +211,7 @@
 	},
 	{
 		"name": "github.com/pion/interceptor (remote-peer)",
-		"version": "0.1.49",
+		"version": "0.1.51",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/interceptor",
@@ -248,7 +248,7 @@
 	},
 	{
 		"name": "github.com/pion/rtcp (remote-peer)",
-		"version": "1.2.19",
+		"version": "1.2.20",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/rtcp",
@@ -257,7 +257,7 @@
 	},
 	{
 		"name": "github.com/pion/rtp (remote-peer)",
-		"version": "1.10.5",
+		"version": "1.10.6",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/rtp",
@@ -303,7 +303,7 @@
 	},
 	{
 		"name": "github.com/pion/transport/v5 (remote-peer)",
-		"version": "5.1.1",
+		"version": "5.1.4",
 		"license": "MIT AND BSD-3-Clause",
 		"author": "The Pion community; The Go Authors",
 		"repository": "https://github.com/pion/transport",
@@ -313,7 +313,7 @@
 	},
 	{
 		"name": "github.com/pion/turn/v5 (remote-peer)",
-		"version": "5.1.2",
+		"version": "5.1.3",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/turn",
@@ -322,7 +322,7 @@
 	},
 	{
 		"name": "github.com/pion/webrtc/v4 (remote-peer)",
-		"version": "4.2.23",
+		"version": "4.2.26",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/webrtc",
