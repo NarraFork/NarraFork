@@ -146,6 +146,18 @@ export interface OutlineAncestorRow {
 	locked: boolean;
 }
 
+/** Where a block last sat as of a seq, and whether that was under a root (`listUnderRootAt`). */
+export interface OutlineUnderRootRow {
+	blockId: string;
+	asOf: number;
+	under: boolean;
+	/**
+	 * The parent key of that placement (the space's id for the top level); null when the block
+	 * had never been placed by then.
+	 */
+	parentKey: string | null;
+}
+
 /** A live block of a space with its parent: one step of many walks up at once. */
 export interface OutlineParentRow {
 	id: string;
@@ -309,6 +321,27 @@ export interface OutlineHistoryPort {
 		options: { asOf: number | null; maxDepth: number },
 	): Promise<OutlineAncestorRow[] | null>;
 	/**
+	 * For each `(blockId, asOf)` asked: where the block last sat as of that seq (its placement
+	 * then; for a block that was deleted then, the last placement it had before, as of the moment
+	 * just before it left it) and whether that was strictly under the block `rootId`, walking up
+	 * the placements valid at that moment. ONE row per distinct pair asked, whatever the depth:
+	 * what comparing two moments of a subtree asks of every block it meets under another parent
+	 * than the one it is met under, and of every block of the subtree deleted since (was it
+	 * deleted under the root, or after it had left?) (`subtree-diff.ts`). A block never placed by
+	 * then, of another space, or deeper than `maxDepth`, is not under it. One recursive
+	 * statement per 500 pairs, every step up a backward seek on the placements' block index.
+	 * Refused (thrown, never answered "not under") when the space is unknown, not ready, or the
+	 * smallest seq asked is below its floor. Every statement is bounded however deep the tree
+	 * ({@link underRootInBoundedStatements}); each row says how many levels were walked for it
+	 * (`steps`), which a caller charges to its budget.
+	 */
+	listUnderRootAt(
+		spaceId: string,
+		rootId: string,
+		items: ReadonlyArray<{ blockId: string; asOf: number }>,
+		maxDepth: number,
+	): Promise<Array<OutlineUnderRootRow & { steps: number }>>;
+	/**
 	 * The given blocks and every ancestor of them as the tree is now, each once, in no order:
 	 * only LIVE blocks of the space (the walk goes up the parent column through whatever is
 	 * there; a block that is deleted or of another space is left out, which breaks the chains
@@ -471,4 +504,88 @@ export async function pageChangedChildren(
 			blockId: last.blockId,
 		},
 	};
+}
+
+/** The distinct `(blockId, asOf)` pairs of a `listUnderRootAt` call, in the order first asked. */
+export function uniquePairs(
+	items: ReadonlyArray<{ blockId: string; asOf: number }>,
+): Array<[string, number]> {
+	const seen = new Set<string>();
+	const out: Array<[string, number]> = [];
+	for (const { blockId, asOf } of items) {
+		const key = `${blockId}\u0000${asOf}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push([blockId, asOf]);
+	}
+	return out;
+}
+
+/**
+ * Levels of placements one `listUnderRootAt` statement walks at most (pairs times how deep each
+ * may go): about 4 ms on SQLite (a step costs ~2 µs; 40 pairs at depth 900 in one statement
+ * were measured at 68 ms).
+ */
+export const OUTLINE_UNDER_ROOT_STEPS = 2048;
+/** How deep the first statement lets each pair go; deeper ones are asked again, fewer at once. */
+const FIRST_CAP = 64;
+
+/** What one statement of `listUnderRootAt` answers for a pair. */
+export interface UnderRootStatementRow {
+	blockId: string;
+	asOf: number;
+	under: boolean;
+	parentKey: string | null;
+	/** Levels walked. */
+	steps: number;
+	/** The walk ended (at the root, the space, or a block not placed then), not at the cap. */
+	ended: boolean;
+}
+
+/**
+ * `listUnderRootAt` for both backends, every statement bounded: `run` walks the pairs given at
+ * most `cap` levels each. The pairs are first asked `FIRST_CAP` deep, as many at once as
+ * {@link OUTLINE_UNDER_ROOT_STEPS} allows; those whose walk was cut are asked again four times as
+ * deep, fewer at once, up to `maxDepth` (deeper than that is not under). `steps` on each answer
+ * is every level walked for it, for the caller's budget.
+ */
+export async function underRootInBoundedStatements(
+	pairs: ReadonlyArray<[string, number]>,
+	maxDepth: number,
+	run: (chunk: ReadonlyArray<[string, number]>, cap: number) => Promise<UnderRootStatementRow[]>,
+): Promise<Array<OutlineUnderRootRow & { steps: number }>> {
+	const key = (blockId: string, asOf: number) => `${blockId}\u0000${asOf}`;
+	const done = new Map<string, OutlineUnderRootRow & { steps: number }>();
+	const spent = new Map<string, number>();
+	let pending = [...pairs];
+	for (
+		let cap = Math.min(FIRST_CAP, maxDepth);
+		pending.length > 0;
+		cap = Math.min(maxDepth, cap * 4)
+	) {
+		const size = Math.max(1, Math.floor(OUTLINE_UNDER_ROOT_STEPS / (cap + 1)));
+		const cut: Array<[string, number]> = [];
+		for (let i = 0; i < pending.length; i += size) {
+			const chunk = pending.slice(i, i + size);
+			const rows = new Map((await run(chunk, cap)).map((row) => [key(row.blockId, row.asOf), row]));
+			for (const [blockId, asOf] of chunk) {
+				const row = rows.get(key(blockId, asOf));
+				const steps = (spent.get(key(blockId, asOf)) ?? 0) + (row?.steps ?? 0);
+				spent.set(key(blockId, asOf), steps);
+				if (row && !row.ended && cap < maxDepth) cut.push([blockId, asOf]);
+				else
+					done.set(key(blockId, asOf), {
+						blockId,
+						asOf,
+						under: row?.ended === true && row.under,
+						parentKey: row?.parentKey ?? null,
+						steps,
+					});
+			}
+		}
+		pending = cut;
+	}
+	return pairs.map(
+		([blockId, asOf]) => done.get(key(blockId, asOf)) as OutlineUnderRootRow & { steps: number },
+	);
 }

@@ -44,6 +44,7 @@ import {
 	SQLITE_SUBTREE_CHANGE,
 	SQLITE_SUBTREE_CHANGE_SEQS,
 	SQLITE_TASK_LOCKS_OF_SPACE,
+	SQLITE_UNDER_ROOT_AT,
 	sqliteMarkAncestorsSql,
 } from "../store/sqlite-history";
 import { SQLITE_LAST_LIVE_VERSION } from "../store/sqlite-read";
@@ -418,6 +419,26 @@ function checkAncestryPlans(): void {
 		// Nothing reaches the blocks by their space: that is the walk of the whole space.
 		expect(many.filter((line) => /space_id/.test(line))).toEqual([]);
 	}
+
+	// Whether blocks sat under a root as of a seq (comparing two moments): each pair's block by
+	// key, every step up a backward seek on the block's placements, nothing by space.
+	const pairs = JSON.stringify([
+		[big, asOf],
+		[hot, asOf],
+		[wide, lastSeq],
+	]);
+	const below = planOf(SQLITE_UNDER_ROOT_AT, [pairs, wide, SPACE, 1000]);
+	expectNoScan(below);
+	lineOf(below, /RECURSIVE STEP/);
+	lineOf(below, /SEARCH s USING INDEX sqlite_autoindex_outline_blocks_1 \(id=\?\)/);
+	expect(
+		below.filter((line) =>
+			/SEARCH e USING INDEX idx_outline_edges_block \(block_id=\? AND from_seq<\?\)/.test(line),
+		).length,
+	).toBeGreaterThanOrEqual(2);
+	expect(below.filter((line) => /space_id|parent_key=|edges_open|edges_closed/.test(line))).toEqual(
+		[],
+	);
 
 	const locked = planOf(SQLITE_TASK_LOCKS_OF_SPACE, [SPACE, 501]);
 	lineOf(locked, /SCAN b USING INDEX idx_outline_blocks_locked/);

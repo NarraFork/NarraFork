@@ -48,6 +48,11 @@ export const OUTLINE_TEXT = {
 		"only the person who locked it, a manager of the space or an admin may lock, unlock or change its lock: its lock was left as it is",
 	/** Summary of a compensating commit. */
 	revertSummary: (seq: number, summary: string) => `revert #${seq}: ${summary}`,
+	/** Summary of a commit of a restore of a subtree (`address` null: the whole space). */
+	restoreSummary: (seq: number, address: string | null) =>
+		address ? `restore ${address} to #${seq}` : `restore the space to #${seq}`,
+	/** Summary of the commit that moves one block back to where it was. */
+	moveBackSummary: (seq: number, address: string) => `move ${address} back to its place at #${seq}`,
 
 	/**
 	 * The block the lease expiry job writes under a task it reopens (design §4.5: the progress

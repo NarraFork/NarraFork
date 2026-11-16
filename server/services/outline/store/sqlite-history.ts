@@ -28,12 +28,15 @@ import {
 	type OutlineEdgeRow,
 	type OutlineHistoryPort,
 	type OutlineHistoryState,
+	OutlineHistoryUnavailableError,
 	type OutlineLevelCursor,
 	type OutlineLevelRow,
 	type OutlineParentRow,
 	type OutlineSubtreeChange,
 	pageChangedChildren,
 	readSubtreeByLevels,
+	underRootInBoundedStatements,
+	uniquePairs,
 } from "./history-port";
 import { chunked, type OutlineSpaceRow } from "./port";
 
@@ -285,6 +288,43 @@ export const SQLITE_ANCESTRY_OF_WITH_DELETED = `WITH RECURSIVE up(id) AS (
 	LIMIT ?2`;
 
 /**
+ * For each pair `[block id, seq]` of the JSON array `?1` whose block is of the space `?3`:
+ * where it last sat as of that seq and whether that was strictly under the block `?2`, one row
+ * per pair (`OutlineHistoryPort.listUnderRootAt`). The first step takes the block's last
+ * placement that began by the seq, open then or not; when it had closed by then (the block was
+ * deleted, or moved and deleted), the walk above it is as of the seq just before it closed.
+ * Every step is a backward seek on the block's placements (`idx_outline_edges_block`, pinned);
+ * the walk stops at the root, at the space, at a block not placed then, or past `?4` steps
+ * (the caller keeps `pairs × ?4` bounded, `underRootInBoundedStatements`). Each row also says
+ * how many levels were walked and whether the walk ended before the cap.
+ * The pairs are probed one by one from the JSON list (`CROSS JOIN`), the space only a filter
+ * on the block found, as in {@link SQLITE_ANCESTRY_OF}.
+ */
+export const SQLITE_UNDER_ROOT_AT = `WITH RECURSIVE up(start, seq, id, at, depth) AS (
+		SELECT s.id, json_extract(j.value, '$[1]'), s.id, json_extract(j.value, '$[1]'), 0
+		FROM json_each(?1) j CROSS JOIN outline_blocks s ON s.id = json_extract(j.value, '$[0]')
+		WHERE s.space_id = ?3
+		UNION ALL
+		SELECT up.start, up.seq,
+			(SELECT e.parent_key FROM outline_block_edges e INDEXED BY idx_outline_edges_block
+				WHERE e.block_id = up.id AND e.from_seq <= up.at
+					AND (up.depth = 0 OR e.to_seq IS NULL OR e.to_seq > up.at)
+				ORDER BY e.from_seq DESC LIMIT 1),
+			CASE WHEN up.depth > 0 THEN up.at ELSE coalesce(
+				(SELECT min(e.to_seq - 1, up.at) FROM outline_block_edges e
+					INDEXED BY idx_outline_edges_block
+					WHERE e.block_id = up.id AND e.from_seq <= up.at
+					ORDER BY e.from_seq DESC LIMIT 1),
+				up.at) END,
+			up.depth + 1
+		FROM up
+		WHERE up.id IS NOT NULL AND (up.depth = 0 OR up.id <> ?2) AND up.id <> ?3 AND up.depth <= ?4
+	)
+	SELECT start, seq, max(depth > 0 AND id = ?2), max(CASE WHEN depth = 1 THEN id END),
+		max(depth), max(id IS NULL OR (depth > 0 AND id = ?2) OR id = ?3)
+	FROM up GROUP BY start, seq`;
+
+/**
  * The live locked tasks of the space `?1`, at most `?2`: the partial lock index (its
  * predicate word for word), every space's rows walked and this space's kept; see
  * `OutlineHistoryPort.listLockedOfSpace`.
@@ -501,6 +541,28 @@ export function createSqliteOutlineHistory(handle: () => Database): OutlineHisto
 					isAsk: flag(row[4]),
 					locked: flag(row[5]),
 				}),
+			);
+		},
+
+		async listUnderRootAt(spaceId, rootId, items, maxDepth) {
+			const pairs = uniquePairs(items);
+			if (pairs.length === 0) return [];
+			const oldest = Math.min(...pairs.map((pair) => pair[1]));
+			if (!readable(spaceId, oldest))
+				throw new OutlineHistoryUnavailableError(spaceId, "not-ready", 0, oldest);
+			return await underRootInBoundedStatements(pairs, maxDepth, async (chunk, cap) =>
+				(
+					values(SQLITE_UNDER_ROOT_AT, [JSON.stringify(chunk), rootId, spaceId, cap]) as Array<
+						[string, number, number, string | null, number, number]
+					>
+				).map((row) => ({
+					blockId: row[0],
+					asOf: Number(row[1]),
+					under: Number(row[2]) !== 0,
+					parentKey: row[3] ?? null,
+					steps: Number(row[4]),
+					ended: Number(row[5]) !== 0,
+				})),
 			);
 		},
 
