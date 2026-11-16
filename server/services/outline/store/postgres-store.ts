@@ -244,6 +244,23 @@ async function putTaskSeenSection(
 		.where(and(eq(outlineTaskSeen.userId, userId), lt(outlineTaskSeen.seenAt, pruneBefore)));
 }
 
+/** Delete a person's fold rows of a space: all of them (`blockIds` null) or those named. */
+async function clearFoldStateSection(
+	tx: PgTransaction,
+	userId: string,
+	spaceId: string,
+	blockIds: readonly string[] | null,
+): Promise<void> {
+	const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
+	if (blockIds === null) {
+		await tx.delete(outlineFoldState).where(own);
+		return;
+	}
+	for (const chunk of chunked([...new Set(blockIds)])) {
+		await tx.delete(outlineFoldState).where(and(own, inArray(outlineFoldState.blockId, chunk)));
+	}
+}
+
 /** Apply a person's fold changes of a space and drop their oldest rows beyond the cap. */
 async function putFoldStateSection(
 	tx: PgTransaction,
@@ -1339,20 +1356,8 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		},
 
 		async clearFoldState(userId, spaceId, blockIds) {
-			const own = and(eq(outlineFoldState.userId, userId), eq(outlineFoldState.spaceId, spaceId));
 			await withPgRetry(
-				() =>
-					db.transaction(async (tx) => {
-						if (blockIds === null) {
-							await tx.delete(outlineFoldState).where(own);
-							return;
-						}
-						for (const chunk of chunked([...new Set(blockIds)])) {
-							await tx
-								.delete(outlineFoldState)
-								.where(and(own, inArray(outlineFoldState.blockId, chunk)));
-						}
-					}),
+				() => db.transaction((tx) => clearFoldStateSection(tx, userId, spaceId, blockIds)),
 				{ label: "outline.clearFoldState" },
 			);
 		},
