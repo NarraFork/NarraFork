@@ -93,8 +93,8 @@ export const OUTLINE_DIGEST_LIMITS = {
 	/** Items one report lists; each section lists at most `itemsPerSection`. */
 	itemsPerDigest: 300,
 	itemsPerSection: 50,
-	/** Blocks named per page of new knowledge. */
-	blocksPerPage: 3,
+	/** Blocks named per item of new knowledge (the facts changed under one block). */
+	blocksPerItem: 3,
 	/** UTF-8 bytes of a stored report's items. */
 	itemsBytes: 64 * 1024,
 	/** Space ranges one report keeps for the next day to continue from. */
@@ -139,7 +139,7 @@ const ROUTINE_SYSTEM_ACTORS = new Set([
 	// An administrator's move back to Dynamic Spec (P2 PR 12b2): its markers and the tasks it let
 	// go, bookkeeping of a decision made on the admin page, not anyone's work in the space.
 	OUTLINE_SPEC_REVERT_ACTOR,
-	// Possibly lost Dynamic Spec content attached to its imported page, by the scan's pass or
+	// Possibly lost Dynamic Spec content attached to its imported block, by the scan's pass or
 	// because a person asked, and its removal on a dismissal (P2 PR 12c): old content shown where
 	// it belongs (owner decision D52: on the page only), not work of the day.
 	OUTLINE_SPEC_LOSS_ACTOR,
@@ -276,9 +276,9 @@ function claimActor(claim: OutlineTaskClaimRow | undefined): OutlineDigestActor 
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** A fact created or rewritten in the window. */
-interface KnowledgeFact {
+export interface KnowledgeFact {
 	blockId: string;
-	pageId: string;
+	/** Its parent at the end of the window (null: the space's top level). */
 	parentId: string | null;
 	created: boolean;
 	seq: number;
@@ -478,7 +478,6 @@ export async function summarizeSpaceWindow(
 			const commit = commitOf.get(latest.commitId);
 			summary.knowledge.push({
 				blockId: id,
-				pageId: lastVersion.pageId,
 				parentId: lastVersion.parentId,
 				created: isNew,
 				seq: latest.seq,
@@ -542,7 +541,6 @@ export async function summarizeSpaceWindow(
 			seq: commit.seq,
 			at: commit.createdAt,
 			blockId: id,
-			pageId: lastVersion.pageId,
 			by: commitActor(commit),
 			executor: null,
 			manager: after.manager ? actorOf(after.manager.kind, after.manager.id) : null,
@@ -615,7 +613,6 @@ export async function summarizeSpaceWindow(
 			at: commit.createdAt,
 			event,
 			blockId: v.blockId,
-			pageId: v.pageId,
 			round: plan?.round ?? 0,
 			narratorId: plan?.by ?? commit.narratorId,
 			approvedBy: plan?.approvedBy ? actorOf(plan.approvedBy.kind, plan.approvedBy.id) : null,
@@ -636,7 +633,6 @@ export async function summarizeSpaceWindow(
 				seq: commit.seq,
 				at: commit.createdAt,
 				blockId: v.blockId,
-				pageId: v.pageId,
 				narratorId: plan?.by ?? commit.narratorId,
 				round: plan?.round ?? 0,
 			});
@@ -666,7 +662,6 @@ export async function summarizeSpaceWindow(
 			at: commit.createdAt,
 			event,
 			blockId: v.blockId,
-			pageId: v.pageId,
 			to: after.to.kind === "human" ? after.to.id : null,
 			by: answer ? actorOf(answer.by.kind, answer.by.id) : null,
 			adopted: answer?.adopted === true,
@@ -685,7 +680,6 @@ export async function summarizeSpaceWindow(
 					seq: commit.seq,
 					at: commit.createdAt,
 					blockId: v.blockId,
-					pageId: v.pageId,
 					narratorId: after.answer?.relayed?.narratorId ?? commit.narratorId,
 					questions: 1,
 				});
@@ -716,7 +710,6 @@ export async function summarizeSpaceWindow(
 					kind: "confirmation",
 					person,
 					blockId: pending.rootBlockId,
-					pageId: pending.pageId,
 					narratorId: pending.decidedByJson?.id ?? null,
 					pendingId: pending.id,
 				});
@@ -760,8 +753,8 @@ export async function summarizeSpaceWindow(
 			event,
 			actor: actorOf(c.actorKind, c.actorId),
 			blocks,
-			...(task ? { blockId: task.blockId, pageId: task.pageId } : {}),
-			...(container ? { blockId: container.parentId, pageId: container.pageId } : {}),
+			...(task ? { blockId: task.blockId } : {}),
+			...(container ? { blockId: container.parentId } : {}),
 		});
 	}
 	return summary;
@@ -790,6 +783,44 @@ export interface OutlinePersonContribution {
 }
 
 /**
+ * The facts grouped by the subtree that holds them (pageless outline, A3): a fact under another
+ * changed fact goes with it, up to the topmost changed one, and the group is the topmost one's
+ * parent, the block they changed under, as the tree stands at the end of the window; a topmost
+ * fact at the space's top level is a group of its own (a new top-level block and what was written
+ * in it). Groups come in the order of their first fact. Pure; at most one step up per fact and
+ * changed ancestor.
+ */
+export function groupByBlock(facts: readonly KnowledgeFact[]): Map<string, KnowledgeFact[]> {
+	const byId = new Map(facts.map((f) => [f.blockId, f]));
+	const groups = new Map<string, KnowledgeFact[]>();
+	/** The group of each fact found so far: a chain is walked once, whatever hangs from it. */
+	const rootOf = new Map<string, string>();
+	for (const fact of facts) {
+		const path: KnowledgeFact[] = [];
+		let top = fact;
+		let root: string | undefined;
+		// A cycle cannot be (a tree), but the walk is bounded all the same.
+		for (let steps = 0; steps <= facts.length; steps++) {
+			root = rootOf.get(top.blockId);
+			if (root !== undefined) break;
+			path.push(top);
+			const parent = top.parentId === null ? undefined : byId.get(top.parentId);
+			if (!parent) {
+				root = top.parentId ?? top.blockId;
+				break;
+			}
+			top = parent;
+		}
+		root ??= top.parentId ?? top.blockId;
+		for (const step of path) rootOf.set(step.blockId, root);
+		const list = groups.get(root);
+		if (list) list.push(fact);
+		else groups.set(root, [fact]);
+	}
+	return groups;
+}
+
+/**
  * The person's part of a space's window: everything in it but the decisions made in someone
  * else's name, tasks handed to someone else, and facts the person alone wrote (counted).
  */
@@ -800,18 +831,16 @@ export function selectForPerson(
 ): OutlinePersonContribution {
 	const own = `human:${person.userId}`;
 	let ownEdits = 0;
-	const pages = new Map<string, KnowledgeFact[]>();
+	const listed: KnowledgeFact[] = [];
 	for (const fact of summary.knowledge) {
 		if (fact.writers.length > 0 && fact.writers.every((w) => w === own)) {
 			ownEdits++;
 			continue;
 		}
-		const list = pages.get(fact.pageId);
-		if (list) list.push(fact);
-		else pages.set(fact.pageId, [fact]);
+		listed.push(fact);
 	}
 	const knowledge: OutlineDigestKnowledgeStored[] = [];
-	for (const [pageId, list] of pages) {
+	for (const [root, list] of groupByBlock(listed)) {
 		list.sort((a, b) => a.seq - b.seq || (a.blockId < b.blockId ? -1 : 1));
 		const ids = new Set(list.map((f) => f.blockId));
 		const latest = list.reduce((a, b) => (b.seq > a.seq ? b : a));
@@ -820,12 +849,12 @@ export function selectForPerson(
 			commitId: latest.commitId,
 			seq: latest.seq,
 			at: latest.at,
-			pageId,
+			root,
 			created: list.filter((f) => f.created).length,
 			changed: list.filter((f) => !f.created).length,
 			blocks: list
 				.filter((f) => f.parentId === null || !ids.has(f.parentId))
-				.slice(0, limits.blocksPerPage)
+				.slice(0, limits.blocksPerItem)
 				.map((f) => ({ id: f.blockId, seq: f.seq, created: f.created })),
 		});
 	}
@@ -965,7 +994,7 @@ export function assembleDigest(
 		active.length > shown.length ||
 		dropped > 0;
 	const items: OutlineDigestStored = {
-		v: 1,
+		v: 2,
 		spaces,
 		moreSpaces: active.length - shown.length + dropped,
 		delegated: shown.flatMap((p) => p.delegated).sort(byTime),

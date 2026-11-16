@@ -1,5 +1,5 @@
 /**
- * What an administrator does about the Dynamic Spec import (outline P2 PR 12b2): the admin page's
+ * What an administrator does about the Dynamic Spec import (outline P2 PR 12b2): the admin
  * list of sessions by import state, a re-import (attention and failed attempts cleared, then
  * imported now), and a move back to Dynamic Spec of a session an import moved.
  *
@@ -16,12 +16,12 @@
  *   3. the caches that read the column are dropped, and the session's clients hear `spec_changed`
  *      (source `revert`): the Spec panel shows its Dynamic Spec files again;
  *   4. SQLite: the old behavior fence, which the switch emptied (its text went to the behavior
- *      page, its SOP to the plugin's block), is written back as the revision the import read, a
+ *      boundary, its SOP to the plugin's block), is written back as the revision the import read, a
  *      new revision; nothing of Dynamic Spec is deleted;
  *   5. what the session holds in the outline (its own space and any other) is let go at once:
  *      each task back to do with a note, as for an archived session (the lease keeper renews
  *      nothing for a moved-back session should one slip through); a marker block at the top of
- *      the task page and of the behavior page says the session was moved back and no longer
+ *      the task list and of the behavior boundary says the session was moved back and no longer
  *      reads them; nothing in the outline is deleted;
  *   6. a digest of the session's Dynamic Spec file pointers (after step 4) is kept: an
  *      administrator's re-import while it is unchanged moves the session forward again without
@@ -280,7 +280,7 @@ async function revertHeld(
 	if (!moved) throw catalogError("SPEC_IMPORT_NOT_REVERTIBLE");
 	invalidateTaskBackend(narratorId);
 	forgetSpecImportLeftover(narratorId);
-	// The run-start paths that move an old fence into the page look at the session again when it
+	// The run-start paths that move an old fence into the outline look at the session again when it
 	// is moved forward once more.
 	resetOutlineBehaviorImport(narratorId);
 	resetOutlineFenceSopMove(narratorId);
@@ -347,7 +347,7 @@ async function releaseClaims(narratorId: string, locale: Locale): Promise<number
  * Write the old fence back as the revision the import read (SQLite: Dynamic Spec is written
  * through that handle; on PostgreSQL the import never emptied it). Nothing when it holds that
  * already, or when the import read none. Never rejects; false only when the fence should have
- * been written back and was not (its revision is gone, or the write failed): the admin page
+ * been written back and was not (its revision is gone, or the write failed): the admin list
  * warns then.
  */
 async function restoreFence(narratorId: string, revisionId: string | null): Promise<boolean> {
@@ -385,7 +385,7 @@ async function restoreFence(narratorId: string, revisionId: string | null): Prom
 }
 
 /**
- * One commit: a plain block at the top of the task page and of the behavior page saying the
+ * One commit: a plain block at the top of the task list and of the behavior boundary saying the
  * session was moved back (owner's language). Returns the blocks written; never rejects.
  */
 async function writeRevertNotes(

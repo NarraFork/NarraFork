@@ -53,7 +53,7 @@ export const calls: string[] = [];
 let root: Root | null = null;
 
 /** Findings of the imported session that are not on the page, and why. */
-const LEFT_OUT: Record<number, "page_cap" | "no_page"> = { 27: "page_cap", 30: "no_page" };
+const LEFT_OUT: Record<number, "block_cap" | "no_block"> = { 27: "block_cap", 30: "no_block" };
 /** The attached finding whose block someone wrote in: a dismissal keeps it. */
 export const KEPT = "f003";
 /** A finding of the behavior fence, one that is not tables, and one whose block was deleted. */
@@ -81,7 +81,7 @@ function finding(n: number, extra: Partial<OutlineSpecLossFinding> = {}): Outlin
 		attachNote: imported ? leftOut : null,
 		spaceId: "space-1",
 		resolvedAt: null,
-		rulePage: false,
+		ruleBlock: false,
 		createdAt: new Date(Date.parse(NOW) - n * 60_000).toISOString(),
 		attachable: imported && !attached,
 		...extra,
@@ -105,8 +105,8 @@ function seed(): void {
 			id: RULE,
 			path: "behavior_fence",
 			kinds: { table: 1 },
-			attachNote: "rule_page",
-			rulePage: true,
+			attachNote: "rule_block",
+			ruleBlock: true,
 		}),
 	);
 	findings.set(
@@ -172,7 +172,7 @@ api.decideSpecLoss = async (_narratorId, findingId, action, options = {}) => {
 	const entry = findings.get(findingId);
 	if (!entry) throw new Error("no such finding");
 	// As the server: nothing goes onto the behavior page without the person's confirmation.
-	if (action === "attach" && entry.rulePage && !options.confirmRule)
+	if (action === "attach" && entry.ruleBlock && !options.confirmRule)
 		throw new Error("SPEC_LOSS_RULE_CONFIRM");
 	const imported = entry.narratorId === NARRATOR;
 	// Dismissed: the block goes, unless someone wrote in it. Reopened: attached again when the
@@ -214,7 +214,7 @@ api.getSpecImportStatus = async () => ({
 	attempts: 0,
 	switchedAt: panelNarrator === NARRATOR ? NOW : null,
 	spaceId: panelNarrator === NARRATOR ? "space-1" : null,
-	taskPageId: panelNarrator === NARRATOR ? "page-1" : null,
+	taskBlockId: panelNarrator === NARRATOR ? "page-1" : null,
 	revertedAt: null,
 });
 api.getNarratorCurrentTask = async () => ({

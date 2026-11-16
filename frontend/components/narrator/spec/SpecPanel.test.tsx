@@ -312,7 +312,7 @@ test("switching files never opens the new file on the previous file's text", asy
 });
 
 test("an outline session's fence tab is read-only and opens the behavior page in the outline", async () => {
-	outlineBehavior = { spaceId: "space-1", pageId: "page-1" };
+	outlineBehavior = { spaceId: "space-1", blockId: "page-1" };
 	server.set("behavior_fence", { content: "Plugin SOP: report back.", revisionId: "f1" });
 	await act(async () => {
 		await queryClient.invalidateQueries();
@@ -407,7 +407,7 @@ test("the old Spec files of a session the import moved say so and link to its ta
 		attempts: 0,
 		switchedAt,
 		spaceId: switchedAt ? "space-1" : null,
-		taskPageId: switchedAt ? "page-1" : null,
+		taskBlockId: switchedAt ? "page-1" : null,
 		revertedAt: null,
 	}));
 	restores.push(() => status.mockRestore());

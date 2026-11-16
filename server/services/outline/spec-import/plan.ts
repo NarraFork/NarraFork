@@ -3,7 +3,7 @@
  * decisions D52 and D54): pure functions from the spec state as read to the blocks to write, each
  * with a short id that follows from its source. No database access.
  *
- * TASKS (`tasks.json`, in array order, onto the session's task page)
+ * TASKS (`tasks.json`, in array order, into the session's task list: the block `session/tasks`)
  *
  *   | spec                         | live session                 | archived session            |
  *   |------------------------------|------------------------------|-----------------------------|
@@ -30,14 +30,16 @@
  *
  * NOTES (every other file)
  *
- * One page per file, titled with its path; `index.md` is the page 12a's compatibility layer
- * writes (`specIndexSid`), so a plugin's later `spec_write` replaces it instead of adding a second
- * one. A file of more blocks than a page should hold becomes several pages (`name (2/3)`): a block
- * whose parent stayed on an earlier part hangs from the part's page.
+ * One top-level block per file, titled with its path, its converted text under it however large
+ * (pageless outline, A3: the importer writes it in as many bounded commits as it needs);
+ * `index.md` is the block 12a's compatibility layer writes (`specIndexSid`), so a plugin's later
+ * `spec_write` replaces it instead of adding a second one. A level of more than
+ * {@link SPEC_IMPORT_PLAN_LIMITS.childrenPerBlock} blocks is grouped under blocks of that many
+ * (`name (2/3)`), so every level the import writes stays one a person can edit in place.
  *
  * SHORT IDS
  *
- * Tasks follow from (session, `tasks.json` revision, index); a file's page and blocks from
+ * Tasks follow from (session, `tasks.json` revision, index); a file's block and what is under it from
  * (session, path, revision). The same source gives the same ids, so an import cut short writes
  * only what is missing, and nothing twice; a source that changed gives new ids, and what an
  * earlier attempt wrote from the old one is recognizably the import's ({@link isImportSid}) and
@@ -51,8 +53,11 @@ import type { OutlineTaskInput } from "../write";
 import type { SpecProtector } from "./read-port";
 
 export const SPEC_IMPORT_PLAN_LIMITS = {
-	/** Blocks of one imported page: a page deleted whole stays within one commit's rows. */
-	pageBlocks: 1500,
+	/**
+	 * Children of one block the import writes at most; more are grouped under blocks of this
+	 * many (D58: a level of more than 2,000 children is read-only in place).
+	 */
+	childrenPerBlock: 2000,
 } as const;
 
 /** The system actor of the import's commits. */
@@ -60,16 +65,17 @@ export const OUTLINE_SPEC_IMPORT_ACTOR = "spec-import";
 
 /**
  * The system actor of an administrator's move back to Dynamic Spec (outline P2 PR 12b2): its
- * marker blocks on the task and behavior pages. The import counts them as its own content.
+ * marker blocks at the top of the task list and of the behavior boundary. The import counts them
+ * as its own content.
  */
 export const OUTLINE_SPEC_REVERT_ACTOR = "spec-import-revert";
 
 /**
  * The system actor of the swallowed-content scan's writes (outline P2 PR 12c, `loss-attach.ts`):
- * possibly lost content attached to its file's imported page, by a pass (tables) or because a
+ * possibly lost content attached to its file's imported block, by a pass (tables) or because a
  * person asked, and the removal of such a block when its finding is dismissed. The importer
  * counts its commits as the import's own (`IMPORT_ACTORS`): the content is kept in its finding,
- * so a stale page it sits on is still the import's to take away.
+ * so a stale imported block it sits under is still the import's to take away.
  */
 export const OUTLINE_SPEC_LOSS_ACTOR = "spec-import-check";
 
@@ -83,13 +89,13 @@ export const SPEC_IMPORT_TEXT: Record<
 		summaryTasks: (n: number) => string;
 		summaryNotes: (path: string) => string;
 		summaryStale: string;
-		summaryTasksPage: string;
+		summaryTasksBlock: string;
 		summaryStart: (n: number) => string;
 		summaryGiveBack: (n: number) => string;
 		/** 12b2: an administrator's move back to Dynamic Spec, and its markers. */
 		summaryRevert: string;
 		summaryRevertNotesRemoved: string;
-		revertNote: (day: string, page: "tasks" | "behavior") => string;
+		revertNote: (day: string, where: "tasks" | "behavior") => string;
 	}
 > = {
 	en: {
@@ -101,15 +107,15 @@ export const SPEC_IMPORT_TEXT: Record<
 		summaryTasks: (n) => `Imported from Dynamic Spec: ${n} task${n === 1 ? "" : "s"}`,
 		summaryNotes: (path) => `Imported from Dynamic Spec: ${path}`,
 		summaryStale: "Removed what an earlier, unfinished import from Dynamic Spec wrote",
-		summaryTasksPage: "Task page for the import from Dynamic Spec",
+		summaryTasksBlock: "Task list for the import from Dynamic Spec",
 		summaryStart: (n) =>
 			`Moved from Dynamic Spec: ${n} task${n === 1 ? "" : "s"} in progress, started again by the session`,
 		summaryGiveBack: (n) =>
 			`The import from Dynamic Spec did not finish: ${n} task${n === 1 ? "" : "s"} back to do`,
 		summaryRevert: "An administrator moved this session back to Dynamic Spec",
 		summaryRevertNotesRemoved: "The session is in the outline again: the move-back notes removed",
-		revertNote: (day, page) =>
-			`On ${day} an administrator moved this session back to Dynamic Spec: the session no longer reads its ${page === "tasks" ? "tasks" : "behavior boundary"} here. What is here was kept, nothing was deleted; changes made here from now on do not reach Dynamic Spec.`,
+		revertNote: (day, where) =>
+			`On ${day} an administrator moved this session back to Dynamic Spec: the session no longer reads its ${where === "tasks" ? "tasks" : "behavior boundary"} here. What is here was kept, nothing was deleted; changes made here from now on do not reach Dynamic Spec.`,
 	},
 	"zh-CN": {
 		blocked: "受阻（导入前在 Dynamic Spec 里的状态）",
@@ -119,13 +125,13 @@ export const SPEC_IMPORT_TEXT: Record<
 		summaryTasks: (n) => `从 Dynamic Spec 导入：${n} 个任务`,
 		summaryNotes: (path) => `从 Dynamic Spec 导入：${path}`,
 		summaryStale: "清掉上一次没做完的 Dynamic Spec 导入写下的内容",
-		summaryTasksPage: "Dynamic Spec 导入用的任务页",
+		summaryTasksBlock: "Dynamic Spec 导入用的任务清单",
 		summaryStart: (n) => `从 Dynamic Spec 切换过来：${n} 个进行中的任务由会话重新开始`,
 		summaryGiveBack: (n) => `Dynamic Spec 导入没有完成：${n} 个任务退回待办`,
 		summaryRevert: "管理员把这个会话退回了 Dynamic Spec",
 		summaryRevertNotesRemoved: "会话又回到大纲：删掉退回时留下的说明",
-		revertNote: (day, page) =>
-			`${day} 管理员把这个会话退回了 Dynamic Spec：会话不再读这里的${page === "tasks" ? "任务" : "行为边界"}。这里的内容都保留了，没有删除；之后在这里的改动不会回到 Dynamic Spec。`,
+		revertNote: (day, where) =>
+			`${day} 管理员把这个会话退回了 Dynamic Spec：会话不再读这里的${where === "tasks" ? "任务" : "行为边界"}。这里的内容都保留了，没有删除；之后在这里的改动不会回到 Dynamic Spec。`,
 	},
 };
 
@@ -136,7 +142,7 @@ function tag(parts: readonly string[], length: number): string {
 /** Longer than the 8 characters a drawn short id has, so none collides with one. */
 const IMPORT_SID_RE = /^s[tpbw][0-9a-f]{10,12}[0-9a-z]*$/;
 
-/** A short id the import gave (a task, a page, a page's block, a note under a task). */
+/** A short id the import gave (a task, a file's block, a block under it, a note under a task). */
 export function isImportSid(sid: string): boolean {
 	return sid.length >= 12 && IMPORT_SID_RE.test(sid);
 }
@@ -144,7 +150,7 @@ export function isImportSid(sid: string): boolean {
 /** One block the import writes. */
 export interface SpecImportNode {
 	sid: string;
-	/** Its parent's short id; null: the group's root (the task page, or a new page). */
+	/** Its parent's short id; null: the group's root (the task list, or the top level). */
 	parentSid: string | null;
 	/** A block id chosen by the import (tasks: their blocked note's short id follows from it). */
 	id?: string;
@@ -169,7 +175,7 @@ export interface NormalizedTaskText {
 }
 
 export interface SpecImportTaskPlan {
-	/** The tasks, in order, to go last on the task page. */
+	/** The tasks, in order, to go last in the task list. */
 	tasks: SpecImportNode[];
 	/** Notes under them (blocked, was in progress), written after every task. */
 	notes: SpecImportNode[];
@@ -265,14 +271,15 @@ export function planSpecTasks(args: {
 }
 
 /**
- * What every short id of a file's import starts with after its two letters (`sp…` its pages,
- * `sb…` their blocks): the import tells its blocks of the current revision from an earlier one's.
+ * What every short id of a file's import starts with after its two letters (`sp…` its block and
+ * the groups under it, `sb…` the blocks of its text): the import tells its blocks of the current
+ * revision from an earlier one's.
  */
 export function specFileTag(narratorId: string, path: string, revisionId: string): string {
 	return tag([narratorId, path, revisionId], 12);
 }
 
-/** The file tag of one of the import's page or block short ids. */
+/** The file tag of one of the short ids of a file's import. */
 export function fileTagOfSid(sid: string): string {
 	return sid.slice(2, 14);
 }
@@ -284,17 +291,30 @@ export interface SpecImportBlock {
 	children: SpecImportBlock[];
 }
 
-export interface SpecImportPagePlan {
+export interface SpecImportFilePlan {
 	path: string;
-	/** Pages first, each followed by its blocks, parents before children. */
+	/** The file's block first, then what is under it, parents before children. */
 	nodes: SpecImportNode[];
-	pageSids: string[];
+	/** The short id of the file's block. */
+	rootSid: string;
+	/** Blocks of the file's text (the file's block and groups not counted). */
 	blocks: number;
 }
 
 /**
- * The pages a file becomes. `pageSid` overrides the first page's short id (`index.md`: the page
- * the compatibility layer writes).
+ * The short id of the group `n` (from 0) of the children of the block at `parentIndex` of the
+ * file's text (-1: the file's block): fixed widths, so no two groups, and no group and the
+ * file's block, share one.
+ */
+function groupSid(t: string, parentIndex: number, n: number): string {
+	const parent = parentIndex < 0 ? "zzzz" : parentIndex.toString(36).padStart(4, "0");
+	return `sp${t}g${parent}${n.toString(36).padStart(3, "0")}`;
+}
+
+/**
+ * The blocks a file becomes: one block titled with its path and its text under it. `rootSid`
+ * overrides the file block's short id (`index.md`: the block the compatibility layer writes). A
+ * level of more than `childrenPerBlock` blocks is grouped (see the module header).
  */
 export function planSpecFile(args: {
 	narratorId: string;
@@ -302,49 +322,52 @@ export function planSpecFile(args: {
 	revisionId: string;
 	blocks: readonly SpecImportBlock[];
 	locale: Locale;
-	pageSid?: string;
-	pageBlocks?: number;
-}): SpecImportPagePlan {
+	rootSid?: string;
+	childrenPerBlock?: number;
+}): SpecImportFilePlan {
 	const t = specFileTag(args.narratorId, args.path, args.revisionId);
-	const limit = args.pageBlocks ?? SPEC_IMPORT_PLAN_LIMITS.pageBlocks;
-	// Depth first, each block with its ancestors' short ids.
-	const flat: Array<{ sid: string; ancestors: string[]; block: SpecImportBlock }> = [];
-	const walk = (blocks: readonly SpecImportBlock[], ancestors: string[]) => {
-		for (const block of blocks) {
-			const sid = `sb${t}${flat.length.toString(36)}`;
-			flat.push({ sid, ancestors, block });
-			walk(block.children, [...ancestors, sid]);
-		}
-	};
-	walk(args.blocks, []);
-	const parts = Math.max(1, Math.ceil(flat.length / limit));
+	const width = Math.max(2, args.childrenPerBlock ?? SPEC_IMPORT_PLAN_LIMITS.childrenPerBlock);
 	const text = SPEC_IMPORT_TEXT[args.locale];
-	const nodes: SpecImportNode[] = [];
-	const pageSids: string[] = [];
-	for (let part = 0; part < parts; part++) {
-		const pageSid = part === 0 ? (args.pageSid ?? `sp${t}`) : `sp${t}p${part.toString(36)}`;
-		pageSids.push(pageSid);
-		nodes.push({
-			sid: pageSid,
-			parentSid: null,
-			content: parts === 1 ? args.path : text.part(args.path, part + 1, parts),
-		});
-		const slice = flat.slice(part * limit, (part + 1) * limit);
-		const here = new Set(slice.map((entry) => entry.sid));
-		for (const entry of slice) {
-			// The nearest ancestor on this part; the page when they all stayed on an earlier one.
-			const parent = [...entry.ancestors].reverse().find((sid) => here.has(sid)) ?? pageSid;
-			nodes.push({
-				sid: entry.sid,
-				parentSid: parent,
-				content: entry.block.content,
-				links: entry.block.links,
-			});
+	const rootSid = args.rootSid ?? `sp${t}`;
+	const nodes: SpecImportNode[] = [{ sid: rootSid, parentSid: null, content: args.path }];
+	let count = 0;
+	// Depth first, without recursion (a converted text may be deep): each block numbered in that
+	// order, as before pages went (an import cut short goes on with the same short ids), its
+	// group, when its level is grouped, written just before the group's first block.
+	const stack: Array<{
+		blocks: readonly SpecImportBlock[];
+		parentSid: string;
+		parentIndex: number;
+		at: number;
+	}> = [{ blocks: args.blocks, parentSid: rootSid, parentIndex: -1, at: 0 }];
+	while (stack.length > 0) {
+		const frame = stack[stack.length - 1] as (typeof stack)[number];
+		const block = frame.blocks[frame.at];
+		if (!block) {
+			stack.pop();
+			continue;
 		}
+		const groups = frame.blocks.length > width ? Math.ceil(frame.blocks.length / width) : 0;
+		let parentSid = frame.parentSid;
+		if (groups > 0) {
+			const g = Math.floor(frame.at / width);
+			parentSid = groupSid(t, frame.parentIndex, g);
+			if (frame.at % width === 0)
+				nodes.push({
+					sid: parentSid,
+					parentSid: frame.parentSid,
+					content: text.part(args.path, g + 1, groups),
+				});
+		}
+		frame.at++;
+		const index = count++;
+		const sid = `sb${t}${index.toString(36)}`;
+		nodes.push({ sid, parentSid, content: block.content, links: block.links });
+		if (block.children.length > 0)
+			stack.push({ blocks: block.children, parentSid: sid, parentIndex: index, at: 0 });
 	}
-	return { path: args.path, nodes, pageSids, blocks: flat.length };
+	return { path: args.path, nodes, rootSid, blocks: count };
 }
-
 /** A file that is not markdown becomes code blocks in this language (its extension). */
 export function specFileCodeLang(path: string): string | null {
 	if (/\.(md|markdown)$/i.test(path)) return null;

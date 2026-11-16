@@ -164,7 +164,7 @@ function panelStatus(switched: boolean): OutlineSpecImportStatus {
 		attempts: 0,
 		switchedAt: switched ? NOW : null,
 		spaceId: switched ? "space-1" : null,
-		taskPageId: switched ? "page-1" : null,
+		taskBlockId: switched ? "page-1" : null,
 		revertedAt: null,
 	};
 }

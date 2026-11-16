@@ -516,8 +516,8 @@ describe("the automatic attach", () => {
 	});
 
 	test("so many on one page; more are left to a person, who may still attach one", async () => {
-		const perPage = SPEC_LOSS_ATTACH_LIMITS.perPage;
-		const total = perPage + 2;
+		const perBlock = SPEC_LOSS_ATTACH_LIMITS.perBlock;
+		const total = perBlock + 2;
 		const owner = await makeUser("en");
 		const { id } = await makeSession({ owner });
 		await writeTasks(id, [{ text: "a task" }]);
@@ -532,9 +532,9 @@ describe("the automatic attach", () => {
 		});
 		expect(await scanSpecSessionLossById(id)).toMatchObject({ findings: total });
 		await passes(
-			async () => (await open(id)).filter((f) => f.attachNote === "page_cap").length === 2,
+			async () => (await open(id)).filter((f) => f.attachNote === "block_cap").length === 2,
 		);
-		expect(await countSpecLossFindings(id)).toEqual({ open: 2, attached: perPage, dismissed: 0 });
+		expect(await countSpecLossFindings(id)).toEqual({ open: 2, attached: perBlock, dismissed: 0 });
 		const commits = await commitCount(id);
 		await runSpecLossPass({ pauseMs: 0 });
 		expect(await commitCount(id)).toBe(commits);
@@ -560,16 +560,85 @@ describe("the automatic attach", () => {
 			responsibleUserId: owner,
 		});
 		const commits = await commitCount(id);
-		await passes(async () => (await open(id))[0]?.attachNote === "no_page");
+		await passes(async () => (await open(id))[0]?.attachNote === "no_block");
 		expect(await commitCount(id)).toBe(commits);
 		expect(
 			await code(() =>
 				decideSpecLossFinding({ id: findingId, narratorId: id, action: "attach", userId: owner }),
 			),
-		).toBe("SPEC_LOSS_NO_PAGE");
+		).toBe("SPEC_LOSS_NO_BLOCK");
 		expect(await commitCount(id)).toBe(commits);
 		// The text can still be read.
 		expect((await specLossDetail(findingId, id)).parts[0]?.text).toBe(TABLE);
+	});
+
+	test("the file's block moved under another block: attached under it there, its own content untouched (pageless A3)", async () => {
+		const { id, owner } = await imported();
+		const spaceId = await spaceOf(id);
+		const design = await designPage(id);
+		const shelf = await writeOutline({
+			spaceId,
+			ops: [{ op: "insert", tempId: "s", parent: null, content: "Shelf" }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const shelfId = shelf.results[0]?.blockId as string;
+		await writeOutline({
+			spaceId,
+			ops: [{ op: "move", block: { sid: design?.sid as string }, parent: { id: shelfId } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		await passes(async () => (await all(id, "attached")).length === 1);
+		const [finding] = await all(id, "attached");
+		const block = await outlineStore.getBlock(finding?.blockId as string);
+		const [designMeta] = await outlineStore.getBlockMetas(spaceId, {
+			sids: [design?.sid as string],
+		});
+		// First under the file's block, which still sits under the shelf.
+		expect(block?.parentId).toBe(designMeta?.id as string);
+		expect(designMeta?.parentId).toBe(shelfId);
+		const children = await outlineStore.listChildren(spaceId, designMeta?.id as string, 50);
+		expect(children.map((c) => c.id)[0]).toBe(finding?.blockId as string);
+		expect(children.slice(1).map((c) => c.content)).toEqual(design?.blocks as string[]);
+	});
+
+	test("the file's block moved under the behavior boundary: a pass never attaches there (pageless A3)", async () => {
+		const { id, owner, findingId } = await imported();
+		const spaceId = await spaceOf(id);
+		const design = await designPage(id);
+		const existing = await findBehaviorBlock(spaceId);
+		let boundaryId = existing?.id ?? null;
+		if (!boundaryId) {
+			const made = await writeOutline({
+				spaceId,
+				ops: [{ op: "insert", tempId: "b", parent: null, content: "Behavior", alias: "behavior" }],
+				actor: { kind: "human", id: owner },
+				responsibleUserId: owner,
+			});
+			boundaryId = made.results[0]?.blockId as string;
+		}
+		await writeOutline({
+			spaceId,
+			ops: [{ op: "move", block: { sid: design?.sid as string }, parent: { id: boundaryId } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const commits = await commitCount(id);
+		await passes(async () => (await open(id))[0]?.attachNote === "rule_block");
+		expect(await commitCount(id)).toBe(commits);
+		expect(await countSpecLossFindings(id)).toEqual({ open: 1, attached: 0, dismissed: 0 });
+		// A person may still attach it there, knowingly: it is their call, as before.
+		const decided = await decideSpecLossFinding({
+			id: findingId,
+			narratorId: id,
+			action: "attach",
+			userId: owner,
+		});
+		expect(decided.status).toBe("attached");
+		const block = await outlineStore.getBlockMetas(spaceId, { ids: [decided.blockId as string] });
+		// An `sl…` block: what reads the boundary as rules leaves it out.
+		expect(isSpecLossAttachSid(block[0]?.sid as string)).toBe(true);
 	});
 
 	test("a block a system commit deleted is attached anew; one a person deleted stays deleted", async () => {
@@ -938,9 +1007,9 @@ describe("the behavior fence is never attached by a pass", () => {
 		for (let n = 0; n < 3; n++) await runSpecLossPass({ pauseMs: 0 });
 		// Listed, both the table and the task item, and nothing written.
 		const found = await open(id);
-		expect(found.map((f) => [f.path, f.attachNote, f.rulePage])).toEqual([
-			["behavior_fence", "rule_page", true],
-			["behavior_fence", "rule_page", true],
+		expect(found.map((f) => [f.path, f.attachNote, f.ruleBlock])).toEqual([
+			["behavior_fence", "rule_block", true],
+			["behavior_fence", "rule_block", true],
 		]);
 		expect(await all(id, "attached")).toEqual([]);
 		expect(await commitCount(id)).toBe(commits);
@@ -1001,7 +1070,7 @@ describe("the behavior fence is never attached by a pass", () => {
 			action: "reopen",
 			userId: owner,
 		});
-		expect(reopened).toMatchObject({ status: "open", attachNote: "rule_page" });
+		expect(reopened).toMatchObject({ status: "open", attachNote: "rule_block" });
 		for (let n = 0; n < 2; n++) await runSpecLossPass({ pauseMs: 0 });
 		expect(await behaviorView(id)).toBe(before);
 	});

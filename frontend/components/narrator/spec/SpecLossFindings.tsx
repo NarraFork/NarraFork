@@ -277,7 +277,7 @@ function SpecLossRow({
 						onClick={async () => {
 							// The behavior page is read by the agent as rules: said before anything is asked
 							// of the server, which refuses the attach without the confirmation.
-							const asked = item.rulePage
+							const asked = item.ruleBlock
 								? {
 										title: t("spec.loss.attachRuleTitle"),
 										message: t("spec.loss.attachRuleConfirm"),
@@ -289,7 +289,7 @@ function SpecLossRow({
 										message: t("spec.loss.attachConfirm", { path: item.path }),
 										confirmLabel: t("spec.loss.attach"),
 									};
-							if (await confirm(asked)) act("attach", item.rulePage);
+							if (await confirm(asked)) act("attach", item.ruleBlock);
 						}}
 						data-testid="spec-loss-attach"
 					>

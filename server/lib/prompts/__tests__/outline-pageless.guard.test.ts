@@ -71,6 +71,23 @@ const SOURCES = [
 	"server/services/outline/subtree-copy.ts",
 	"server/services/outline/block-tree.ts",
 	"server/services/outline-plan-mode.ts",
+	// A3: reports, the Dynamic Spec import and its lost-content scan, plugin task commands.
+	"server/services/outline/digest.ts",
+	"server/services/outline/digest-job.ts",
+	"server/services/outline/digest-view.ts",
+	"server/services/outline/spec-import/admin.ts",
+	"server/services/outline/spec-import/importer.ts",
+	"server/services/outline/spec-import/loss-attach.ts",
+	"server/services/outline/spec-import/loss-findings.ts",
+	"server/services/outline/spec-import/loss-scan.ts",
+	"server/services/outline/spec-import/loss-store.ts",
+	"server/services/outline/spec-import/notice.ts",
+	"server/services/outline/spec-import/plan.ts",
+	"server/services/outline/spec-import/state.ts",
+	"server/services/outline/spec-import/triggers.ts",
+	"server/services/outline/plugin-tasks.ts",
+	"server/services/outline/plugin-task-events.ts",
+	"server/services/plugin-spec-compat.ts",
 ] as const;
 
 const PAGE = /page|页/i;
@@ -79,7 +96,29 @@ const PAGE = /page|页/i;
  * Strings that hold the word and never reach an agent, by file: the exact literal and why.
  * Keep it short; a new entry needs a reason a reviewer accepts.
  */
-const ALLOWED: Record<string, ReadonlyArray<{ text: string; why: string }>> = {};
+const ALLOWED: Record<string, ReadonlyArray<{ text: string; why: string }>> = {
+	"server/services/outline/spec-import/state.ts": [
+		{
+			text: "task_page_id",
+			why: "a column name of `outline_spec_imports`, never shown; X2 renames it `task_block_id`",
+		},
+		{ text: "pages", why: "a column name of `outline_spec_imports`; X2 renames it `notes`" },
+	],
+	"server/services/outline/spec-import/loss-store.ts": [
+		{
+			text: "no_page",
+			why: "a stored value of `attach_note` (shown as `no_block`); X2 rewrites it",
+		},
+		{
+			text: "page_cap",
+			why: "a stored value of `attach_note` (shown as `block_cap`); X2 rewrites it",
+		},
+		{
+			text: "rule_page",
+			why: "a stored value of `attach_note` (shown as `rule_block`); X2 rewrites it",
+		},
+	],
+};
 
 function literals(file: string): Array<{ text: string; line: number }> {
 	const source = ts.createSourceFile(

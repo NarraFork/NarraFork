@@ -210,7 +210,6 @@ export const sqliteOutlineDigests: OutlineDigestPort = {
 			fromSeq: v.fromSeq,
 			toSeq: v.toSeq,
 			commitId: v.commitId,
-			pageId: v.pageId,
 			parentId: v.parentId,
 			contentHash: v.contentHash,
 			taskJson: v.taskJson,

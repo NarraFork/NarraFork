@@ -334,9 +334,9 @@ export interface SpecImportStatus {
 	attempts: number;
 	/** When an import last moved the session to the outline (null: never). */
 	switchedAt: string | null;
-	/** Where it landed: the session space and its task page (the read-only line's link). */
+	/** Where it landed: the session space and its task list (the read-only line's link). */
 	spaceId: string | null;
-	taskPageId: string | null;
+	taskBlockId: string | null;
 	/** When an administrator last moved it back to Dynamic Spec. */
 	revertedAt: string | null;
 }
@@ -358,7 +358,7 @@ export async function specImportStatus(narratorId: string): Promise<SpecImportSt
 		attempts: state?.attempts ?? 0,
 		switchedAt: state?.switchedAt ?? null,
 		spaceId: state?.spaceId ?? null,
-		taskPageId: state?.taskPageId ?? null,
+		taskBlockId: state?.taskBlockId ?? null,
 		revertedAt: state?.revertedAt ?? null,
 	};
 }

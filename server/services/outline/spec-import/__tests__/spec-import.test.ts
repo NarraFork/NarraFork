@@ -131,13 +131,13 @@ describe("tasks", () => {
 });
 
 describe("notes", () => {
-	test("each file is a page; index.md is the page the compatibility layer writes; non-markdown is code", async () => {
+	test("each file is a top-level block; index.md is the block the compatibility layer writes; non-markdown is code", async () => {
 		const { id } = await makeSession();
 		await writeNote(id, "index.md", "# Plan\n\nSome text with [[a link]] and - [ ] not a task\n");
 		await writeNote(id, "design.md", "# Design\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
 		await writeNote(id, "data.json", '{"k": [1, 2]}\n');
 		const outcome = await run(id);
-		expect(outcome).toMatchObject({ status: "imported", tasks: 0, pages: 3 });
+		expect(outcome).toMatchObject({ status: "imported", tasks: 0, notes: 3 });
 		const all = await pages(id);
 		expect(all.map((p) => p.title).sort()).toEqual(["data.json", "design.md", "index.md"]);
 		expect(all.find((p) => p.title === "index.md")?.sid).toBe(specIndexSid());
@@ -207,7 +207,7 @@ describe("idempotence", () => {
 describe("which sessions", () => {
 	test("a session that never wrote Dynamic Spec is only moved", async () => {
 		const { id } = await makeSession();
-		expect(await run(id)).toMatchObject({ status: "imported", tasks: 0, pages: 0, commits: 0 });
+		expect(await run(id)).toMatchObject({ status: "imported", tasks: 0, notes: 0, commits: 0 });
 		expect(await backendOf(id)).toBe("outline");
 		expect(await commitCount(id)).toBe(0);
 	});

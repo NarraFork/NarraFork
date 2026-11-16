@@ -4,8 +4,8 @@
  * for people to look at. READ-ONLY DETECTION: scanning a session reads Dynamic Spec revisions and
  * writes this module's two tables (`loss-store.ts`); it never writes Dynamic Spec and never
  * repairs anything. A pass then hands the open findings of imported sessions to
- * `loss-attach.ts`, which puts each on its file's imported page as a block of its own (owner
- * decision D52: on the page only; no notice, no digest line), which attaches the findings of
+ * `loss-attach.ts`, which puts each under its file's imported block as a block of its own (owner
+ * decision D52: beside the file only; no notice, no digest line), which attaches the findings of
  * tables and leaves the rest listed (owner decision 2026-11-13). What a person does about a
  * finding is `loss-findings.ts`.
  *
@@ -32,8 +32,8 @@
  *
  * A pass a while after the server started, then at intervals ({@link SPEC_LOSS_JOB}), while the
  * outline is on and `outline.specImport` is not `off`; an administrator may start one from the
- * admin page (answered at once; the pass runs in the background). A pass walks the spec
- * namespaces page by page on their primary key, one session at a time with a pause between
+ * admin list (answered at once; the pass runs in the background). A pass walks the spec
+ * namespaces in batches on their primary key, one session at a time with a pause between
  * scans, at most so many scans a pass (the next goes on from there). A session whose file
  * pointers are the ones last scanned is skipped, so an imported session, whose Dynamic Spec no
  * longer changes, is scanned once.
@@ -305,7 +305,7 @@ export interface SpecLossPass {
 	scanned: number;
 	/** New findings. */
 	found: number;
-	/** Findings put on their imported pages (`loss-attach.ts`). */
+	/** Findings attached under their imported blocks (`loss-attach.ts`). */
 	attached: number;
 	/**
 	 * Sessions a later pass still has work for: not reached, a scan that failed and is tried
@@ -448,9 +448,9 @@ export async function runSpecLossPass(
 						});
 					}
 				}
-				// The tables found, now or by an earlier pass, go onto the imported pages (only for a
+				// The tables found, now or by an earlier pass, go under the imported blocks (only for a
 				// session whose tasks are in the outline, which the attach reads again; bounded per
-				// session and per page).
+				// session and per imported block).
 				if (session.taskBackend === "outline") {
 					const run = await attachSpecLossForSession(session);
 					pass.attached += run.attached;

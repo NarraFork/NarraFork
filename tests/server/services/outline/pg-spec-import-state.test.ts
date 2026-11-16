@@ -239,7 +239,7 @@ describe("PostgreSQL Dynamic Spec import state", () => {
 				throw new Error(`PostgreSQL harness did not run: ${JSON.stringify(outcome)}`);
 			}
 			expect(outcome.backend).toBe("postgres");
-			expect(outcome.imported).toMatchObject({ status: "imported", tasks: 2, pages: 1 });
+			expect(outcome.imported).toMatchObject({ status: "imported", tasks: 2, notes: 1 });
 			expect(outcome.afterImport).toMatchObject({
 				status: "imported",
 				trigger: "manual",
@@ -247,6 +247,7 @@ describe("PostgreSQL Dynamic Spec import state", () => {
 				switchCount: 1,
 				noticeSwitch: 0,
 				tasks: 2,
+				// The table keeps the columns' old names until X2 renames them.
 				pages: 1,
 			});
 			expect(outcome.afterImport?.spaceId).toBeString();

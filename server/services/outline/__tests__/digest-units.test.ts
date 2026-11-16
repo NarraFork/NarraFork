@@ -9,6 +9,7 @@ import type { OutlineDigestKnowledgeStored, OutlineDigestTaskStored } from "@sha
 import {
 	assembleDigest,
 	delegateConfirmationPerson,
+	groupByBlock,
 	isPlanReviewApproval,
 	newlyDoneForReader,
 	OUTLINE_DIGEST_LIMITS,
@@ -94,7 +95,6 @@ describe("tasks: the state before the window against after it", () => {
 			at: "t",
 			event: "done",
 			blockId: "b",
-			pageId: "p",
 			by: { kind: "agent", id: "n" },
 			executor: null,
 			manager: { kind: "human", id: "u" },
@@ -260,10 +260,9 @@ function summary(over: Partial<OutlineSpaceSummary> = {}): OutlineSpaceSummary {
 }
 
 describe("what one person is shown of a space", () => {
-	test("facts they alone wrote are counted; pages group the rest, three topmost blocks each", () => {
+	test("facts they alone wrote are counted; the block they changed under groups the rest, three topmost blocks each", () => {
 		const fact = (id: string, parentId: string | null, writers: string[], seq: number) => ({
 			blockId: id,
-			pageId: "p",
 			parentId,
 			created: true,
 			seq,
@@ -286,10 +285,50 @@ describe("what one person is shown of a space", () => {
 		);
 		expect(part.space.ownEdits).toBe(1);
 		expect(part.knowledge).toHaveLength(1);
-		const page = part.knowledge[0] as OutlineDigestKnowledgeStored;
-		expect([page.created, page.changed, page.seq]).toEqual([5, 0, 9]);
+		const item = part.knowledge[0] as OutlineDigestKnowledgeStored;
+		expect(item.root).toBe("p");
+		expect([item.created, item.changed, item.seq]).toEqual([5, 0, 9]);
 		// `a1` sits under `a`: not topmost.
-		expect(page.blocks.map((b) => b.id)).toEqual(["a", "b", "c"]);
+		expect(item.blocks.map((b) => b.id)).toEqual(["a", "b", "c"]);
+	});
+
+	test("by subtree, not by top-level block: changes under different blocks are different items, a chain of changed facts is one", () => {
+		const fact = (id: string, parentId: string | null, seq: number, created = true) => ({
+			blockId: id,
+			parentId,
+			created,
+			seq,
+			commitId: `c${seq}`,
+			at: `t${seq}`,
+			writers: ["agent:n"],
+		});
+		const facts = [
+			// Two places deep in the same top-level block `top`: two items.
+			fact("x", "deep1", 1),
+			fact("y", "deep2", 2),
+			// A new section and what was written in it: one item, under the section's parent.
+			fact("sec", "deep1", 3),
+			fact("sec1", "sec", 4),
+			fact("sec11", "sec1", 5, false),
+			// A new top-level block and what was written in it: its own item.
+			fact("t", null, 6),
+			fact("t1", "t", 7),
+		];
+		expect(
+			[...groupByBlock(facts)].map(([root, list]) => [root, list.map((f) => f.blockId)]),
+		).toEqual([
+			["deep1", ["x", "sec", "sec1", "sec11"]],
+			["deep2", ["y"]],
+			["t", ["t", "t1"]],
+		]);
+		const part = selectForPerson(summary({ knowledge: facts }), { userId: "u", username: "uu" });
+		expect(
+			part.knowledge.map((k) => [k.root, k.created, k.changed, k.blocks.map((b) => b.id)]),
+		).toEqual([
+			["deep1", 3, 1, ["x", "sec"]],
+			["deep2", 1, 0, ["y"]],
+			["t", 2, 0, ["t"]],
+		]);
 	});
 
 	test("tasks handed to someone else are not theirs; their own come first; others' decisions go", () => {
@@ -305,7 +344,6 @@ describe("what one person is shown of a space", () => {
 			at: `t${seq}`,
 			event,
 			blockId: `b${seq}`,
-			pageId: "p",
 			by: { kind: "agent" as const, id: "n" },
 			executor: null,
 			manager: manager ? { kind: "human" as const, id: manager } : null,
@@ -328,7 +366,6 @@ describe("what one person is shown of a space", () => {
 						at: "t1",
 						event: "asked",
 						blockId: "q1",
-						pageId: "p",
 						to: "v",
 						by: null,
 						adopted: false,
@@ -341,7 +378,6 @@ describe("what one person is shown of a space", () => {
 						at: "t2",
 						event: "asked",
 						blockId: "q2",
-						pageId: "p",
 						to: "u",
 						by: null,
 						adopted: false,
@@ -357,7 +393,6 @@ describe("what one person is shown of a space", () => {
 						seq: 1,
 						at: "t",
 						blockId: "q",
-						pageId: "p",
 						narratorId: "n",
 					},
 					{
@@ -368,7 +403,6 @@ describe("what one person is shown of a space", () => {
 						seq: 2,
 						at: "t",
 						blockId: "r",
-						pageId: "p",
 						narratorId: "n",
 						pendingId: "pp",
 					},
