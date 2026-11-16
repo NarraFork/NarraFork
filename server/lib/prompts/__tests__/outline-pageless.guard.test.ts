@@ -4,7 +4,10 @@
  * outline sections of the system prompt, not the notices injected into a session.
  *
  * Two checks:
- *   1. the tools as the model gets them: their descriptions and their parameter schemas;
+ *   1. the tools as the model gets them: the description and parameter schema of EVERY tool the
+ *      registry holds (core and optional: an outline session can see any of them), not a hand
+ *      list; another sense of the word (a web page, a PDF's pages, a page of results) is named
+ *      per tool in {@link OTHER_SENSES};
  *   2. every string literal and template text of the files that word what an agent reads
  *      ({@link SOURCES}), found by the TypeScript parser, so comments and identifiers do not
  *      count and no wording can hide in a helper.
@@ -18,12 +21,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
 import { z } from "zod/v4";
-import {
-	askTool,
-	outlineEditTool,
-	outlineReadTool,
-	outlineSearchTool,
-} from "../../agent/tools/outline";
+import { toolRegistry } from "../../agent/tool-registry";
+import "../../agent/tools";
+import { outlineReadTool } from "../../agent/tools/outline";
+import type { ToolDefinition } from "../../agent/types";
 
 const ROOT = join(import.meta.dir, "../../../..");
 
@@ -93,25 +94,94 @@ function literals(file: string): Array<{ text: string; line: number }> {
 	return out;
 }
 
-describe("nothing an agent reads about the outline names pages", () => {
-	const tools = [outlineReadTool, outlineSearchTool, outlineEditTool, askTool];
+/**
+ * Phrases of registered tools that use the word in another sense than the outline's, by tool:
+ * taken out of the tool's text before the check. Exact text, so a new outline "page" next to
+ * them still fails.
+ */
+const LIST_PAGING = ["Page size", "the previous page", "the current page"] as const;
 
-	test("tool descriptions", () => {
-		for (const tool of tools) {
-			expect({ tool: tool.name, hit: PAGE.exec(tool.description)?.[0] ?? null }).toEqual({
-				tool: tool.name,
-				hit: null,
-			});
-		}
+const OTHER_SENSES: Record<string, { phrases: readonly (string | RegExp)[]; why: string }> = {
+	Read: {
+		phrases: [
+			"page through large files",
+			"offset, limit and pages",
+			"more than 10 pages",
+			"the pages parameter",
+			"specific page ranges",
+			'pages: "1-5"',
+			"Maximum 20 pages per request",
+			'"pages"',
+			"Page range for PDF files",
+		],
+		why: "a PDF's pages and paging through a file",
+	},
+	WebFetch: {
+		phrases: ["web page", "long pages", "static pages", "(page image)"],
+		why: "web pages",
+	},
+	LearningGuide: { phrases: ["/learn page"], why: "the app's learning page" },
+	ListWorktrees: { phrases: LIST_PAGING, why: "a page of list results" },
+	Worktree: { phrases: LIST_PAGING, why: "a page of list results" },
+	Browser: { phrases: [/page/gi], why: "web pages in a browser" },
+};
+
+/** The tool's description and its parameters as the provider gets them. */
+function toolTexts(tool: ToolDefinition): Array<{ where: string; text: string }> {
+	const schema = tool.rawJsonSchema ?? z.toJSONSchema(tool.parameters as z.ZodType);
+	return [
+		{ where: "description", text: tool.description },
+		{ where: "parameters", text: JSON.stringify(schema) },
+	];
+}
+
+function withoutOtherSenses(tool: string, text: string): string {
+	let out = text;
+	for (const phrase of OTHER_SENSES[tool]?.phrases ?? []) {
+		out = typeof phrase === "string" ? out.split(phrase).join(" ") : out.replace(phrase, " ");
+	}
+	return out;
+}
+
+describe("nothing an agent reads about the outline names pages", () => {
+	const tools = toolRegistry.all();
+
+	test("the registry holds every tool an outline session can see, the outline ones included", () => {
+		const names = new Set(tools.map((tool) => tool.name));
+		for (const name of ["OutlineRead", "OutlineSearch", "OutlineEdit", "Ask", "EnterPlanMode"])
+			expect(names.has(name)).toBe(true);
+		expect(tools.length).toBeGreaterThan(40);
 	});
 
-	test("tool parameters: names and descriptions", () => {
+	test("every registered tool: description and parameters", () => {
+		const hits: string[] = [];
 		for (const tool of tools) {
-			const schema = JSON.stringify(z.toJSONSchema(tool.parameters as z.ZodType));
-			expect({ tool: tool.name, hit: PAGE.exec(schema)?.[0] ?? null }).toEqual({
-				tool: tool.name,
-				hit: null,
-			});
+			for (const { where, text } of toolTexts(tool)) {
+				const rest = withoutOtherSenses(tool.name, text);
+				for (const match of rest.matchAll(/.{0,40}(?:page|页).{0,40}/gi))
+					hits.push(`${tool.name} ${where}: ${match[0]}`);
+			}
+		}
+		expect(hits).toEqual([]);
+	});
+
+	test("every other sense named is still in its tool's text", () => {
+		for (const [name, { phrases }] of Object.entries(OTHER_SENSES)) {
+			const tool = tools.find((candidate) => candidate.name === name);
+			expect({ name, registered: !!tool }).toEqual({ name, registered: true });
+			if (!tool) continue;
+			const all = toolTexts(tool)
+				.map((entry) => entry.text)
+				.join("\n");
+			for (const phrase of phrases) {
+				const present =
+					typeof phrase === "string" ? all.includes(phrase) : new RegExp(phrase).test(all);
+				expect({ name, phrase: String(phrase), present }).toEqual({
+					name,
+					phrase: String(phrase),
+					present: true,
+				});
+			}
 		}
 	});
 
