@@ -103,3 +103,4 @@ export {
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,
 } from "./prompts/system-reminders";
+export { getTeamLeadPrompt } from "./prompts/team-lead";

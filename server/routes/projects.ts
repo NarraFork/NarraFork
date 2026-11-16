@@ -31,6 +31,7 @@ import {
 } from "../services/project-membership";
 import { projectReadAdapter } from "../services/read";
 import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
+import { projectHasTeams } from "../services/teams/team-records";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 import { withProjectRetirement } from "../services/worktree-lifecycle-guard";
 
@@ -388,6 +389,13 @@ projectRoutes.delete("/:id", async (c) => {
 	// Deletion detaches every session and device from the project, so it sits in the
 	// management tier rather than write.
 	const project = await requireProjectAccess(c, id, "manage");
+	// Teams record the worktrees and branches they made; deleting the project would orphan them.
+	if (projectHasTeams(id))
+		throw new AppError(
+			"This project has teams. Delete their coordinator sessions before deleting the project.",
+			409,
+			"PROJECT_HAS_TEAMS",
+		);
 
 	return withProjectRetirement(
 		id,
