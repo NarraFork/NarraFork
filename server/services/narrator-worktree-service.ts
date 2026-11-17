@@ -30,13 +30,18 @@ import {
 	worktreeRemovalRequestSchema,
 } from "../lib/validators/narrator-worktrees";
 import {
+	countCommitsOnlyReachableFrom,
+	GIT_UNCOMMITTED_LISTING_MAX_BYTES,
+	type GitQueryRunner,
+	uncommittedChanges,
+} from "./git-ref-queries";
+import {
 	type WorktreeCreateResult,
 	type WorktreeEntry,
 	type WorktreeJournal,
 	type WorktreeJournalRecord,
 	worktreeProposalHash,
 } from "./narrator-worktree-journal";
-
 import type {
 	VerifiedWorktreeScope,
 	WorktreeResourceRegistration,
@@ -1233,7 +1238,8 @@ export class NarratorWorktreeService<Principal> {
 			requestorId: narratorId,
 			signal,
 		});
-		const dirtyFileCount = present ? await this.dirtyFileCount(target, worktreePath, signal) : 0;
+		const loss = await this.measureLoss(target, entry, worktreePath, present, signal);
+		const dirtyFileCount = loss?.dirtyFileCount ?? 0;
 		// Every dependent has to go somewhere. A linked checkout's `repositoryPath` is the
 		// Git directory, never a usable working directory, so the target is derived from
 		// the listing (the main worktree) and verified to exist.
@@ -1297,14 +1303,11 @@ export class NarratorWorktreeService<Principal> {
 					unarchived,
 				),
 			);
-		if (dirtyFileCount > 0) confirmations.push("force");
+		// An unanswered loss question is a refusal, never "nothing to lose".
+		if (!loss) blockers.push(removalBlocker("WORKTREE_REMOVAL_STATUS_UNAVAILABLE"));
+		if (loss && (loss.dirtyFileCount > 0 || !loss.dirtyExact || loss.unreachableCommits > 0))
+			confirmations.push("force");
 		if (entry && !inspection.registration) confirmations.push("acknowledgeUnregistered");
-		// `git worktree prune` cannot be aimed, so report what it will take with it.
-		const pruneSiblings =
-			entry && !present
-				? listing.entries.filter((item) => item.prunable && !samePath(item.path, worktreePath))
-						.length
-				: 0;
 		return {
 			status: blockers.length ? "blocked" : "ready",
 			expectedRevision: inspection.revision,
@@ -1316,13 +1319,16 @@ export class NarratorWorktreeService<Principal> {
 				locked: entry?.locked ?? false,
 				prunable: entry?.prunable ?? false,
 				mode: !entry ? "rows" : present ? "remove" : "prune",
-				pruneSiblings,
+				// The deleted checkout's own entry is removed by path; nothing else is pruned.
+				pruneSiblings: 0,
 				present,
 				registered: !!inspection.registration,
 				registrationId: inspection.registration?.id ?? null,
 				state: inspection.registration?.state ?? null,
-				dirty: dirtyFileCount > 0,
+				dirty: dirtyFileCount > 0 || loss?.dirtyExact === false,
 				dirtyFileCount,
+				dirtyExact: loss?.dirtyExact ?? false,
+				unreachableCommits: loss?.unreachableCommits ?? 0,
 			},
 			dependents: inspection.dependents,
 			inventory: inspection.inventory,
@@ -1353,11 +1359,29 @@ export class NarratorWorktreeService<Principal> {
 				undefined,
 				{ plan },
 			);
-		if (plan.confirmations.includes("force") && !request.force)
+		const force = plan.confirmations.includes("force");
+		if (force && !request.force)
 			error(
 				"WORKTREE_REMOVAL_FORCE_REQUIRED",
-				"Uncommitted changes require explicit confirmation",
+				"Uncommitted changes or unreachable commits require explicit confirmation",
 				409,
+			);
+		// The confirmation covers exactly the loss the person saw: same HEAD, same counts.
+		// Anything that changed since (more files, a new commit, even fewer) is a new question.
+		const confirmed = request.confirmedLoss;
+		if (
+			force &&
+			(!confirmed ||
+				confirmed.head !== plan.worktree.head ||
+				confirmed.dirtyFileCount !== plan.worktree.dirtyFileCount ||
+				confirmed.unreachableCommits !== plan.worktree.unreachableCommits)
+		)
+			throw new AppError(
+				"The worktree changed after the confirmation; review the new plan",
+				409,
+				"WORKTREE_REMOVAL_CHANGED",
+				undefined,
+				{ plan },
 			);
 		if (plan.confirmations.includes("acknowledgeUnregistered") && !request.acknowledgeUnregistered)
 			error(
@@ -1423,7 +1447,7 @@ export class NarratorWorktreeService<Principal> {
 			: null;
 		try {
 			if (plan.worktree.mode !== "rows")
-				await this.applyGuardedRemoval(target, plan, request.force === true, signal);
+				await this.applyGuardedRemoval(target, plan, force, snapshot, signal);
 		} catch (failure) {
 			if (snapshot) {
 				await retirement.restoreRegistration(snapshot).catch((restoreError) => {
@@ -1446,9 +1470,8 @@ export class NarratorWorktreeService<Principal> {
 				});
 				return 0;
 			});
-		// `prune` drops every stale registration Git reports, not only this one.
-		if (plan.worktree.mode === "prune")
-			effects.prunedRegistrations += 1 + plan.worktree.pruneSiblings;
+		// Only the deleted checkout's own Git entry was removed.
+		if (plan.worktree.mode === "prune") effects.prunedRegistrations += 1;
 		return {
 			outcome: "removed",
 			worktree:
@@ -1478,6 +1501,7 @@ export class NarratorWorktreeService<Principal> {
 		target: WorktreeTarget,
 		plan: WorktreeRemovalPlan,
 		force: boolean,
+		snapshot: WorktreeRegistrationSnapshot | null,
 		signal: AbortSignal,
 	): Promise<void> {
 		const worktreePath = plan.worktree.path;
@@ -1485,19 +1509,28 @@ export class NarratorWorktreeService<Principal> {
 		await withProtectionReservation(
 			[
 				{
+					// Path only: a repository key would make every session of this repository
+					// (the relocated requester included) a claim on the checkout. Claims inside
+					// the path, and ancestors Git cannot tell apart from it, still protect it.
 					deviceId: "local",
 					path: worktreePath,
-					repositoryKey: target.workspace.repositoryKey ?? undefined,
+					// Its own legacy creation receipt is inventory of this checkout, not a user.
+					...(snapshot ? { retiringCreateRequestId: snapshot.createRequestId } : {}),
 				},
 			],
 			"worktree removal",
 			async () => {
+				signal.throwIfAborted();
+				// From here the removal is dispatched: a client disconnect must neither kill Git
+				// half way through the directory nor restore a row for a checkout that is gone.
+				// The write keeps its own bound instead of the request's cancellation.
+				const settle = AbortSignal.timeout(WORKTREE_CREATE_TIMEOUT_MS);
 				const result = await this.run(
 					target,
-					prune
-						? ["worktree", "prune"]
-						: ["worktree", "remove", ...(force ? ["--force"] : []), "--", worktreePath],
-					signal,
+					// `git worktree remove` also drops the entry of an already-deleted checkout,
+					// aimed at this path; `git worktree prune` would clear every stale entry.
+					["worktree", "remove", ...(force && !prune ? ["--force"] : []), "--", worktreePath],
+					settle,
 					true,
 					WORKTREE_MAX_OUTPUT_BYTES,
 					{ kind: "repository" },
@@ -1552,23 +1585,67 @@ export class NarratorWorktreeService<Principal> {
 		return null;
 	}
 
-	/** Bounded dirty probe. Git's own refusal is authoritative; this only decides `force`. */
-	private async dirtyFileCount(
+	/**
+	 * What deleting this checkout would lose, or null when Git could not answer.
+	 *
+	 * Uncommitted paths are counted with untracked files listed one by one (ignored files
+	 * are not counted, and skip-worktree/assume-unchanged edits are invisible to Git).
+	 * Commits are lost only when nothing else reaches them: a branch keeps its own, so only
+	 * a detached HEAD can hold commits no branch, remote-tracking ref or tag contains.
+	 * A failed, killed or timed-out probe is null, never zero.
+	 *
+	 * Without a Git entry there is nothing to ask: `rows` mode deletes nothing on disk, and
+	 * `git status` in a directory Git does not list either fails (outside a repository) or
+	 * walks up and reports the enclosing checkout's changes as if they were this path's.
+	 */
+	private async measureLoss(
 		target: WorktreeTarget,
+		entry: WorktreeEntry | null,
 		worktreePath: string,
+		present: boolean,
 		signal: AbortSignal,
-	): Promise<number> {
-		const result = await this.run(
-			target,
-			["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
-			signal,
-			false,
-			64 * 1024,
-			{ kind: "directory", path: worktreePath },
-		);
-		if (result.exitCode !== 0) return 0;
-		if (result.stdoutTruncated) return 1;
-		return result.stdout.split("\0").filter((item) => item.length > 0).length;
+	): Promise<{ dirtyFileCount: number; dirtyExact: boolean; unreachableCommits: number } | null> {
+		const runner =
+			(scope: WorktreeGitScope): GitQueryRunner =>
+			async (args, options) => {
+				const result = await this.run(
+					target,
+					args,
+					signal,
+					false,
+					options?.maxOutputBytes ?? WORKTREE_MAX_OUTPUT_BYTES,
+					scope,
+				);
+				return {
+					stdout: result.stdout,
+					stderr: result.stderr,
+					exitCode: result.exitCode,
+					truncated: !!(result.stdoutTruncated || result.stderrTruncated),
+				};
+			};
+		if (!entry) return { dirtyFileCount: 0, dirtyExact: true, unreachableCommits: 0 };
+		try {
+			const changes = present
+				? await uncommittedChanges(
+						runner({ kind: "directory", path: worktreePath }),
+						GIT_UNCOMMITTED_LISTING_MAX_BYTES,
+					)
+				: { count: 0, exact: true };
+			const head =
+				entry?.detached && entry.head && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(entry.head)
+					? entry.head
+					: null;
+			const unreachableCommits = head
+				? await countCommitsOnlyReachableFrom(runner({ kind: "repository" }), head)
+				: 0;
+			return { dirtyFileCount: changes.count, dirtyExact: changes.exact, unreachableCommits };
+		} catch (cause) {
+			signal.throwIfAborted();
+			logger.warn("Worktree removal could not measure what would be lost", {
+				reason: String(cause).slice(0, 256),
+			});
+			return null;
+		}
 	}
 
 	private async resolveBranchName(

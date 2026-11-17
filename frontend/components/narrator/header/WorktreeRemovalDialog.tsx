@@ -21,6 +21,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { worktreeDirectoryLabel } from "./worktree-list-view";
 import {
+	requiredConfirmations,
 	WorktreeRemovalFlow,
 	type WorktreeRemovalFlowState,
 	type WorktreeRemovalStep,
@@ -146,7 +147,19 @@ export function WorktreeRemovalDialog({
 								</Badge>
 								{plan.worktree.dirty && (
 									<Badge size="xs" color="orange">
-										{t("worktree.removeDirty", { count: plan.worktree.dirtyFileCount })}
+										{t(
+											plan.worktree.dirtyExact === false
+												? "worktree.removeDirtyAtLeast"
+												: "worktree.removeDirty",
+											{ count: plan.worktree.dirtyFileCount },
+										)}
+									</Badge>
+								)}
+								{(plan.worktree.unreachableCommits ?? 0) > 0 && (
+									<Badge size="xs" color="red">
+										{t("worktree.removeUnreachable", {
+											count: plan.worktree.unreachableCommits,
+										})}
 									</Badge>
 								)}
 								{plan.worktree.locked && (
@@ -157,20 +170,18 @@ export function WorktreeRemovalDialog({
 							</Group>
 						</Stack>
 						{plan.worktree.mode === "prune" && (
-							<>
-								<Text size="xs" c="dimmed">
-									{t("worktree.removePruneOnly")}
-								</Text>
-								{plan.worktree.pruneSiblings > 0 && (
-									<Text size="xs" c="orange">
-										{t("worktree.removePruneSiblings", { count: plan.worktree.pruneSiblings })}
-									</Text>
-								)}
-							</>
+							<Text size="xs" c="dimmed">
+								{t("worktree.removePruneOnly")}
+							</Text>
 						)}
 						{plan.worktree.mode === "rows" && (
 							<Text size="xs" c="dimmed">
 								{t("worktree.removeRowsOnly")}
+							</Text>
+						)}
+						{plan.worktree.mode === "remove" && (
+							<Text size="xs" c="dimmed">
+								{t("worktree.removeIgnoredNote")}
 							</Text>
 						)}
 						<Divider />
@@ -239,7 +250,7 @@ export function WorktreeRemovalDialog({
 								</Stack>
 							</Alert>
 						)}
-						{plan.confirmations.map((confirmation) => (
+						{requiredConfirmations(plan).map((confirmation) => (
 							<Checkbox
 								key={confirmation}
 								size="xs"
