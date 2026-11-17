@@ -1056,8 +1056,6 @@ export async function runAgentLoopUnlocked(
 				},
 			);
 			const outlineEditCore = taskBackend === "outline" && freshNarrator.type !== "subagent";
-			const teamCoordinator =
-				freshNarrator.type !== "subagent" && isTeamNarrator(freshNarrator.traits);
 			// A root session the Dynamic Spec import moved: its `spec://` calls are told where the
 			// old files went (outline P2 PR 12b2). One cached primary-key read per session.
 			const specImported =
@@ -1170,7 +1168,7 @@ export async function runAgentLoopUnlocked(
 				// Reflection decisions must exist in the parent's immutable declaration set.
 				if (tool.reflectionOnly) return true;
 				if (tool.isAvailable && !tool.isAvailable()) return false;
-				// The Team tool is a coordinator's own: offered to team-trait sessions only.
+				// The Team tool is a coordinator's own: offered to team-trait primaries only.
 				if (tool.name === TEAM_TOOL_NAME && !teamCoordinator) return false;
 				if (!profileToolFilter(tool)) return false;
 				if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
