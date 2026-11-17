@@ -6,7 +6,12 @@
  */
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
-import { decodeLiveFrame, type LiveFrame } from "@shared/outline-live-protocol";
+import {
+	decodeLiveFrame,
+	LIVE_FRAME,
+	type LiveBatchHead,
+	type LiveFrame,
+} from "@shared/outline-live-protocol";
 import i18next from "i18next";
 import type { Node as PMNode } from "prosemirror-model";
 import { TextSelection } from "prosemirror-state";
@@ -52,6 +57,8 @@ class SocketTransport implements LiveTransport {
 	bytesDown = 0;
 	framesUp = 0;
 	framesDown = 0;
+	/** Others' structural operations this socket was sent, as `t id` (in arrival order). */
+	readonly opsSeen: string[] = [];
 
 	constructor(private readonly url: string) {
 		this.connect();
@@ -77,6 +84,9 @@ class SocketTransport implements LiveTransport {
 			this.framesDown++;
 			const frame = decodeLiveFrame(bytes);
 			if (!frame) return;
+			if (frame.kind === LIVE_FRAME.batch)
+				for (const c of (frame.head as LiveBatchHead | null)?.c ?? [])
+					for (const op of c.ops) this.opsSeen.push(`${op.t} ${op.id}`);
 			if (this.held) this.inQueue.push(frame);
 			else for (const l of this.frameListeners) l(frame);
 		};
