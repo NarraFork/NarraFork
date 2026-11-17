@@ -22,6 +22,7 @@ import {
 	TEAM_BRIEF_MAX_BYTES,
 	TEAM_CHECKIN_MAX_MINUTES,
 	TEAM_CHECKIN_MIN_MINUTES,
+	TEAM_DECISION_EVENT_KIND,
 	TEAM_DECISION_MAX_BYTES,
 	TEAM_DEFAULT_WORK_KIND,
 	TEAM_EVENT_DETAIL_MAX_BYTES,
@@ -1208,7 +1209,7 @@ export function recordDecision(input: {
 	return recordWorkEvent(db, {
 		teamId: team.teamId,
 		workItemId: input.itemId ?? null,
-		kind: "team.decision",
+		kind: TEAM_DECISION_EVENT_KIND,
 		actor: input.actor,
 		detail: { summary },
 	});

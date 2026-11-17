@@ -132,7 +132,38 @@ export type TeamEventKind =
 	| "team.brief"
 	| "team.settings"
 	| "team.archived"
-	| "team.unarchived";
+	| "team.unarchived"
+	| CoordinatorOverrunEventKind
+	| typeof TEAM_DECISION_EVENT_KIND;
+
+// ── P2: coordinator reminders and team status ────────────────────────────────
+
+/** The per-call limits a coordinator's tool call can go over (context use is a status note). */
+export const COORDINATOR_OVERRUN_KINDS = [
+	"editLines",
+	"newFileLines",
+	"filesPerTurn",
+	"readLines",
+	"searchLines",
+	"bashOutputBytes",
+] as const;
+export type CoordinatorOverrunKind = (typeof COORDINATOR_OVERRUN_KINDS)[number];
+
+/** Event kind prefix of a recorded overrun: `coordinator.overrun.<CoordinatorOverrunKind>`. */
+export const COORDINATOR_OVERRUN_EVENT_PREFIX = "coordinator.overrun.";
+export type CoordinatorOverrunEventKind =
+	`${typeof COORDINATOR_OVERRUN_EVENT_PREFIX}${CoordinatorOverrunKind}`;
+
+/**
+ * A decision the coordinator took on people's behalf (plan §二.14 "决定替人做了要说"), with
+ * `detail_json.summary`. The team status lists the latest few; P3's Team tool writes them.
+ */
+export const TEAM_DECISION_EVENT_KIND = "team.decision";
+
+/** UTF-8 byte budget of one team status row (plan §二.2: about 6 KB). */
+export const TEAM_STATUS_MAX_BYTES = 6 * 1024;
+/** A long run looks at the team status again at most this often. */
+export const TEAM_STATUS_CADENCE_MS = 10 * 60_000;
 
 // ── P3: work item lifecycle ──────────────────────────────────────────────────
 
@@ -185,4 +216,4 @@ export type TeamWorkEventKind =
 	| "work.cancelled"
 	| "work.cleanup"
 	| "team.checkin"
-	| "team.decision";
+	| typeof TEAM_DECISION_EVENT_KIND;
