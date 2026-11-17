@@ -951,7 +951,10 @@ async function finishRun(
 	// person holding it keeps everything open (`subagent-resources.ts`).
 	if (!hold)
 		void import("../subagent-resources").then(({ releaseSubagentBrowsersAtRunEnd }) =>
-			releaseSubagentBrowsersAtRunEnd(id, { stopped: runStopsHelpers({ cancelled, timedOut }) }),
+			releaseSubagentBrowsersAtRunEnd(id, {
+				stopped: runStopsHelpers({ cancelled, timedOut }),
+				run,
+			}),
 		);
 	return result;
 }

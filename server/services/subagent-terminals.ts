@@ -3,27 +3,17 @@
  *
  * A terminal a subagent creates belongs to it: only that subagent's own Terminal tool calls
  * reach it (`assertTerminalAccess` in `tools/terminal.ts`). People reach it through the ACL of
- * the subagent, which is its ACL root's (`narrator-acl.ts`):
+ * the subagent, which is its ACL root's (`terminal-access.ts`):
  *
  * - **Listing** the tree's terminals is read access on the root: anyone who can see the
  *   coordinator's page sees which subagent runs which terminal (name, directory, since when),
  *   never its output.
  * - **Opening** one (watching its output, typing, resizing, renaming, closing) is write
  *   access on the root, the same authority as driving the session.
- *
- * Terminals of primary narrators keep their existing rules; only subagent-owned terminals are
- * judged here.
  */
 import { and, asc, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, terminals } from "../db/schema";
-import {
-	canReadNarrator,
-	canWriteNarrator,
-	NARRATOR_ACL_COLUMNS,
-	type NarratorAccessNeed,
-	type NarratorPrincipal,
-} from "./narrator-acl";
 
 /** Running terminals listed for one tree: 16 subagents × 3 terminals fit with room to spare. */
 export const TREE_TERMINAL_LIST_LIMIT = 100;
@@ -84,39 +74,4 @@ export async function listTreeTerminals(narrator: {
 		terminals: rows.slice(0, TREE_TERMINAL_LIST_LIMIT),
 		truncated: rows.length > TREE_TERMINAL_LIST_LIMIT,
 	};
-}
-
-/**
- * Whether `principal` may use a terminal with `need` (`read`: its metadata; `write`: open it).
- * A subagent's terminal is judged on the subagent (so on its ACL root); any other terminal,
- * or an unknown id, is left to the existing rules (true).
- */
-export async function subagentTerminalAccessAllowed(
-	terminalId: string,
-	principal: NarratorPrincipal,
-	need: NarratorAccessNeed,
-): Promise<boolean> {
-	const terminal = await db
-		.select({ narratorId: terminals.narratorId })
-		.from(terminals)
-		.where(eq(terminals.id, terminalId))
-		.get();
-	if (!terminal?.narratorId) return true;
-	return subagentNarratorAccessAllowed(terminal.narratorId, principal, need);
-}
-
-/** The same rule keyed by the owning narrator, for creating a terminal on it. */
-export async function subagentNarratorAccessAllowed(
-	narratorId: string,
-	principal: NarratorPrincipal,
-	need: NarratorAccessNeed,
-): Promise<boolean> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
-	if (!narrator || narrator.type !== "subagent") return true;
-	return need === "write"
-		? canWriteNarrator(narrator, principal)
-		: canReadNarrator(narrator, principal);
 }

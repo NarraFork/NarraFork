@@ -38,6 +38,7 @@ export const PROCESS_BROWSER_SESSION_LIMIT = 20;
 interface OwnerRow {
 	id: string;
 	type: string;
+	status: string;
 	parentNarratorId: string | null;
 	aclRootNarratorId: string | null;
 }
@@ -47,6 +48,7 @@ async function loadOwner(narratorId: string): Promise<OwnerRow | undefined> {
 		.select({
 			id: narrators.id,
 			type: narrators.type,
+			status: narrators.status,
 			parentNarratorId: narrators.parentNarratorId,
 			aclRootNarratorId: narrators.aclRootNarratorId,
 		})
@@ -59,6 +61,20 @@ async function loadOwner(narratorId: string): Promise<OwnerRow | undefined> {
 function teamRootOfRow(row: OwnerRow): string {
 	return row.aclRootNarratorId ?? (row.type === "subagent" ? row.parentNarratorId : null) ?? row.id;
 }
+
+function isRetired(row: OwnerRow | undefined): boolean {
+	return row?.type === "subagent" && row.status === "archived";
+}
+
+/**
+ * An archived subagent: nobody drives it, so it gets no new terminal or browser session, and
+ * one that finished opening after the archive is closed again by its caller.
+ */
+export async function isRetiredSubagent(narratorId: string): Promise<boolean> {
+	return isRetired(await loadOwner(narratorId));
+}
+
+const RETIRED_MESSAGE = "This subagent is archived; it cannot open terminals or browser sessions.";
 
 // ── Per-owner serialization ──
 
@@ -88,15 +104,19 @@ export function subagentTerminalLimitMessage(limit = SUBAGENT_TERMINAL_LIMIT): s
 
 /**
  * Create a terminal for `narratorId` under the subagent cap. Primaries and terminals without
- * a narrator are created as before. The count and the create run serialized per narrator.
+ * a narrator are created as before. The count and the create run serialized per narrator. An
+ * archived subagent gets none; one archived while its shell was starting has it closed again
+ * (`discard`) and the create fails.
  */
 export async function withTerminalSlot<T>(
 	narratorId: string | undefined,
 	create: () => Promise<T>,
+	discard: (created: T) => Promise<unknown>,
 ): Promise<T> {
 	if (!narratorId) return create();
 	return serialized(`terminal:${narratorId}`, async () => {
 		const owner = await loadOwner(narratorId);
+		if (isRetired(owner)) throw new ValidationError(RETIRED_MESSAGE, "SUBAGENT_ARCHIVED");
 		if (owner?.type === "subagent") {
 			const running = await db
 				.select({ id: terminals.id })
@@ -113,7 +133,12 @@ export async function withTerminalSlot<T>(
 			if (running.length >= SUBAGENT_TERMINAL_LIMIT)
 				throw new ValidationError(subagentTerminalLimitMessage(), "SUBAGENT_TERMINAL_LIMIT");
 		}
-		return create();
+		const created = await create();
+		if (owner?.type === "subagent" && (await isRetiredSubagent(narratorId))) {
+			await discard(created).catch(() => {});
+			throw new ValidationError(RETIRED_MESSAGE, "SUBAGENT_ARCHIVED");
+		}
+		return created;
 	});
 }
 
@@ -172,6 +197,7 @@ async function learnRoots(narratorIds: readonly string[]): Promise<void> {
 		.select({
 			id: narrators.id,
 			type: narrators.type,
+			status: narrators.status,
 			parentNarratorId: narrators.parentNarratorId,
 			aclRootNarratorId: narrators.aclRootNarratorId,
 		})
@@ -198,8 +224,16 @@ function pruneRoots(counts: BrowserSessionCounts): void {
 export async function reserveBrowserLaunch(
 	narratorId: string,
 	readCounts: () => BrowserSessionCounts,
+	options: { headless?: boolean } = {},
 ): Promise<BrowserLaunchSlot> {
 	const owner = await loadOwner(narratorId);
+	if (isRetired(owner)) throw new BrowserSessionLimitError(RETIRED_MESSAGE);
+	// A headed session may open as a tab in the person's own browser, with their sign-ins;
+	// nobody watches a subagent's tab, so subagents browse headless only.
+	if (owner?.type === "subagent" && options.headless === false)
+		throw new BrowserSessionLimitError(
+			"Subagents use headless browser sessions only; launch again without headless: false.",
+		);
 	const rootId = owner ? teamRootOfRow(owner) : narratorId;
 	rootCache.set(narratorId, rootId);
 	const subagent = owner?.type === "subagent";
@@ -234,6 +268,12 @@ export async function reserveBrowserLaunch(
 			pending.delete(launch);
 		},
 	};
+}
+
+/** Whether a launch for this narrator is admitted and still opening its tab. */
+export function hasPendingBrowserLaunch(narratorId: string): boolean {
+	for (const launch of pending) if (launch.narratorId === narratorId) return true;
+	return false;
 }
 
 /** Tests only. */

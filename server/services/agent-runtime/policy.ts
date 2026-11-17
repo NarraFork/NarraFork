@@ -93,9 +93,11 @@ const READ_ONLY_OPTIONAL_TOOLS = Object.freeze([BROWSER_TOOL]);
 const READ_ONLY_CEILING_TOOLS = Object.freeze([...READ_TOOLS, ...READ_ONLY_OPTIONAL_TOOLS]);
 
 /**
- * Browser actions that only look at a page: open or move to a URL, read it, capture it without
- * writing a file, and close it. Clicking, typing, form filling, script evaluation, tracing and
- * memory profiles (which write files and share links) are not reads.
+ * Browser actions that only look at a page: open or move to a web URL, read it, capture it
+ * without writing a file, and close it. Clicking, typing, form filling, script evaluation,
+ * tracing and memory profiles (which write files and share links) are not reads. `hover` and
+ * `scroll` are kept as reads although they fire the page's own handlers (hover menus, lazy
+ * loading, infinite scroll): they are how a person looks at a page, and they submit nothing.
  */
 const BROWSER_READ_ACTIONS: ReadonlySet<string> = new Set([
 	"launch",
@@ -118,14 +120,35 @@ const BROWSER_READ_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Whether a Browser call only reads pages. A screenshot saved to a file writes, and a headed
- * launch may open a tab in the person's own browser with their sign-ins, so neither is a read.
+ * Whether a URL is a web page a read-only reader may open: http(s) only, or `about:blank`.
+ * `data:` carries its own script, `file:` reads the host's files, and `chrome:`, `devtools:`,
+ * `view-source:` and `javascript:` reach the browser itself; none of them is looking at a page.
+ */
+export function isReadOnlyBrowserUrl(url: unknown): boolean {
+	if (typeof url !== "string") return false;
+	if (url.trim().toLowerCase() === "about:blank") return true;
+	try {
+		const protocol = new URL(url).protocol;
+		return protocol === "http:" || protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Whether a Browser call only reads pages. A screenshot saved to a file writes; a headed
+ * launch may open a tab in the person's own browser with their sign-ins; a launch or
+ * navigation to anything but a web URL (`isReadOnlyBrowserUrl`) is not looking at a page.
+ * `navigate` without a URL moves back or forward through pages already opened this way.
  */
 export function isBrowserReadAction(input: Record<string, unknown>): boolean {
 	const action = typeof input.action === "string" ? input.action : "";
 	if (!BROWSER_READ_ACTIONS.has(action)) return false;
 	if (action === "screenshot" && input.file_path !== undefined) return false;
-	if (action === "launch" && input.headless === false) return false;
+	if (action === "launch" && (input.headless === false || !isReadOnlyBrowserUrl(input.url)))
+		return false;
+	if (action === "navigate" && input.url !== undefined && !isReadOnlyBrowserUrl(input.url))
+		return false;
 	return true;
 }
 

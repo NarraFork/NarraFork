@@ -17,6 +17,7 @@ import {
 	narratorToolCalls,
 	oauthClients,
 	remoteDevices,
+	terminals,
 } from "../db/schema";
 import type {
 	DangerInfo,
@@ -805,6 +806,19 @@ export function resolvePermissionDecision(
 		if (meta) meta.blacklistReason = REVIEW_BROWSER_READ_ONLY_REASON;
 		return "deny";
 	}
+	// Typing a command into a terminal meets every fence the same command meets in Bash:
+	// a Bash deny (protected paths, path and command blacklists, catastrophic commands, the
+	// review boundary) denies the write. Anything Bash would allow keeps Terminal's own
+	// decision below, so a terminal never becomes easier to drive than before.
+	const terminalCommand = terminalShellCommand(toolName, input);
+	if (terminalCommand !== null) {
+		const shell = resolvePermissionDecision({
+			...opts,
+			toolName: SHELL_TOOL_NAME,
+			input: { command: terminalCommand },
+		});
+		if (shell === "deny" || shell === "fatal") return shell;
+	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
@@ -1345,6 +1359,76 @@ function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boole
 	if (toolName === "GenUI") return isGenUiReadAction(input.action);
 	if (toolName === "Worktree") return input.action === "list";
 	return toolName === "StructSed" && input.dry_run !== false;
+}
+
+/**
+ * The shell text a Terminal `write` types, as a command line the Bash analyser can judge:
+ * ANSI escapes and control keys removed, carriage returns read as line breaks. Null for any
+ * other call, or for keystrokes that type no text (Ctrl-C alone). Typing into a terminal's
+ * shell is running a command, so it must not get past a fence the same command in Bash would
+ * meet (`resolvePermissionDecision`). The terminal's shell may have changed directory; paths
+ * are judged from the session's directory, as for Bash.
+ */
+export function terminalShellCommand(
+	toolName: string,
+	input: Record<string, unknown>,
+): string | null {
+	if (toolName !== "Terminal" || input.action !== "write" || typeof input.input !== "string")
+		return null;
+	const text = input.input
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping terminal escapes
+		.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping terminal escapes
+		.replace(/\x1b[\]P^_][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+		.replace(/\r\n?/g, "\n")
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: control keys type no text
+		.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+	return text.trim() ? text : null;
+}
+
+/**
+ * The execution target a Terminal write types into, so the shell fences are judged against
+ * the device and directory policy that apply there (host rules need a target; an unrouted
+ * call sees none). The terminal is found by id, or by name among the narrator's own; its
+ * device and starting directory are the ones it was created with. Null when the call types
+ * no command, or the terminal is not the narrator's (the tool refuses those itself).
+ */
+async function terminalShellExecutionContext(
+	narratorId: string,
+	toolName: string,
+	input: Record<string, unknown>,
+	fallbackCwd: string,
+): Promise<ExecutionTargetContext | null> {
+	const command = terminalShellCommand(toolName, input);
+	if (command === null || typeof input.terminal_id !== "string") return null;
+	const columns = { id: true, name: true, narratorId: true, cwd: true, deviceId: true } as const;
+	const terminal =
+		(await db.query.terminals.findFirst({
+			where: and(eq(terminals.id, input.terminal_id), eq(terminals.narratorId, narratorId)),
+			columns,
+		})) ??
+		(
+			await db.query.terminals.findMany({
+				where: eq(terminals.narratorId, narratorId),
+				columns,
+				limit: 50,
+			})
+		).find((row) => row.name.toLowerCase() === String(input.terminal_id).toLowerCase());
+	if (!terminal) return null;
+	const deviceId = terminal.deviceId ?? LOCAL_DEVICE_ID;
+	const backend = resolveBackend({ requested: deviceId });
+	return freezePermissionExecutionContext({
+		toolName: SHELL_TOOL_NAME,
+		toolInput: { command },
+		backend,
+		target: {
+			deviceId,
+			backendKind: backend.kind,
+			cwd: terminal.cwd ?? fallbackCwd,
+			runtimeGeneration: backend.runtimeGeneration ?? 0,
+			selectionSource: "session_default",
+		},
+	});
 }
 
 /** Why a reviewer's Browser call that does more than read a page is refused. */
@@ -4934,6 +5018,20 @@ export async function recheckFinalToolExecutionPermission(
 		assertStillCurrent();
 		return { assertStillCurrent };
 	}
+	if (!routed && terminalShellCommand(check.toolName, check.input) !== null) {
+		const fallback = check.cwd ?? before.narrator.cwd;
+		if (!fallback) finalPermissionDeny("missing execution directory");
+		context = await terminalShellExecutionContext(
+			check.narratorId,
+			check.toolName,
+			check.input,
+			fallback,
+		).catch((error: unknown) =>
+			finalPermissionDeny(
+				`terminal target unavailable: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	}
 	const cwd = context?.target.cwd ?? check.cwd ?? before.narrator.cwd;
 	if (!cwd) finalPermissionDeny("missing execution directory");
 	const constraint = check.runtimeConstraint;
@@ -4949,9 +5047,13 @@ export async function recheckFinalToolExecutionPermission(
 		finalPermissionDeny("OAuth knowledge capability ceiling");
 	}
 	let analysis: BashAnalysis | undefined;
-	if (isBashToolName(check.toolName) && typeof check.input.command === "string") {
+	const finalShellCommand =
+		isBashToolName(check.toolName) && typeof check.input.command === "string"
+			? check.input.command
+			: terminalShellCommand(check.toolName, check.input);
+	if (finalShellCommand !== null && isBashToolName(check.toolName)) {
 		analysis = await analyzeShellCommand(
-			check.input.command,
+			finalShellCommand,
 			cwd,
 			resolvePermissionShellType(context?.backend),
 			context?.paths ?? localPathSemantics,
@@ -4959,6 +5061,24 @@ export async function recheckFinalToolExecutionPermission(
 		if (context) analysis = await canonicalizeShellAnalysisPaths(analysis, context, check.signal);
 		if (analysis.commands.length === 0)
 			finalPermissionDeny("command analysis produced no executable command");
+	} else if (finalShellCommand !== null) {
+		// Terminal input is often not shell (a REPL line, an editor key): judge it as shell
+		// where it parses, as at approval time, and otherwise leave Terminal's own decision.
+		analysis = await analyzeShellCommand(
+			finalShellCommand,
+			cwd,
+			resolvePermissionShellType(context?.backend),
+			context?.paths ?? localPathSemantics,
+		)
+			.then(async (parsed) =>
+				context ? canonicalizeShellAnalysisPaths(parsed, context, check.signal) : parsed,
+			)
+			.then((parsed) => (parsed.commands.length > 0 ? parsed : undefined))
+			.catch((error: unknown) => {
+				check.signal?.throwIfAborted();
+				logger.debug("Terminal input is not analysable shell", { error: String(error) });
+				return undefined;
+			});
 	}
 	let deviceLevel: "denied" | "readOnly" | "readWrite" | undefined;
 	if (constraint && context) {
@@ -5338,12 +5458,27 @@ export async function handlePermission(
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}
 	}
-	if (isBashToolName(toolName) && typeof input.command === "string") {
+	if (!executionContext && terminalShellCommand(toolName, input) !== null) {
+		try {
+			executionContext = await terminalShellExecutionContext(narratorId, toolName, input, cwd);
+			initialExecutionTarget = executionContext?.target;
+		} catch (error) {
+			return {
+				behavior: "deny",
+				message: `Terminal target validation failed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+	const shellCommand =
+		isBashToolName(toolName) && typeof input.command === "string"
+			? input.command
+			: terminalShellCommand(toolName, input);
+	if (shellCommand !== null) {
 		try {
 			const shellType = resolvePermissionShellType(executionContext?.backend);
 			const shellCwd = executionContext?.target.cwd ?? resolveToolCwd(cwd, effectiveInput);
 			bashAnalysis = await analyzeShellCommand(
-				input.command,
+				shellCommand,
 				shellCwd,
 				shellType,
 				executionContext?.paths ?? localPathSemantics,

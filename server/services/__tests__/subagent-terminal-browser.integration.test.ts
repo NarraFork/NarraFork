@@ -11,9 +11,15 @@
  *  4. archiving or deleting a subagent closes its terminals and browser sessions; a run's end
  *     closes its browser sessions unless work is pending;
  *  5. the tree's terminals are listed read-only for readers of the root, and opening one (REST
- *     and WebSocket) needs write access on the root.
+ *     and WebSocket) needs write access on the root;
+ *  6. every narrator's terminal follows its narrator's ACL (review round 1): reading its
+ *     metadata needs read access, anything that opens it needs write, re-checked on each
+ *     keystroke; a standalone terminal is its creator's and admins'; unknown and refused ids
+ *     get the same answer;
+ *  7. an archived subagent gets no terminal or browser session, also when its archive lands
+ *     while one is opening; subagents browse headless only; no session navigates to file:.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
@@ -21,6 +27,7 @@ import { aclGrants, narrators, terminals, users } from "../../db/schema";
 import { browserTool } from "../../lib/agent/tools/browser";
 import { terminalTool } from "../../lib/agent/tools/terminal";
 import type { ToolContext } from "../../lib/agent/types";
+import * as browserModule from "../../lib/browser";
 import "../../lib/browser/session";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
@@ -32,7 +39,9 @@ import {
 	reserveBrowserLaunch,
 	resetAgentResourceCapsForTest,
 	SUBAGENT_TERMINAL_LIMIT,
+	withTerminalSlot,
 } from "../agent-resource-caps";
+import { setRunControl, tryClaimExecution } from "../agent-runtime/ownership";
 import {
 	compileDelegationPolicy,
 	isRuntimeToolAllowed,
@@ -43,6 +52,7 @@ import { narratorService } from "../narrator-service";
 import { interruptAndArchiveSubagent } from "../subagent-lifecycle";
 import { closeSubagentResources, releaseSubagentBrowsersAtRunEnd } from "../subagent-resources";
 import { listTreeTerminals } from "../subagent-terminals";
+import { resetTerminalAccessForTest } from "../terminal-access";
 import { terminalService } from "../terminal-service";
 import { resetTraitLayerCaches, resolveNarratorRuntimePolicy } from "../trait-layer-service";
 
@@ -194,6 +204,64 @@ async function until(predicate: () => Promise<boolean>, what: string): Promise<v
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
 		await Bun.sleep(25);
 	}
+}
+
+function app(user: string, role: "user" | "admin" = "user") {
+	const routes = new Hono();
+	routes.use("*", async (c, next) => {
+		c.set("user", { sub: user, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		await next();
+	});
+	routes.onError(
+		(error) =>
+			new Response(JSON.stringify({ error: error.message }), {
+				status: error instanceof AppError ? error.statusCode : 500,
+			}),
+	);
+	routes.route("/api/terminals", terminalRoutes);
+	return routes;
+}
+
+interface Frame {
+	type: string;
+	code?: string;
+	terminalId?: string;
+	terminal?: { id: string };
+}
+
+function socket(userId: string, userRole: "user" | "admin" = "user") {
+	const sent: Frame[] = [];
+	const ws = {
+		data: {
+			channel: "terminal",
+			connectedAt: Date.now(),
+			lastPongAt: Date.now(),
+			subscribedTerminals: new Set<string>(),
+			userId,
+			userRole,
+		},
+		send: (payload: string) => sent.push(JSON.parse(payload)),
+	};
+	const send = (message: Record<string, unknown>) => handleTerminalWS.message(ws as never, message);
+	return { ws, sent, send };
+}
+
+async function grantWrite(narratorId: string, userId: string) {
+	const id = generateId();
+	await db.insert(aclGrants).values({
+		id,
+		scopeType: "narrator",
+		scopeId: narratorId,
+		principalType: "user",
+		principalId: userId,
+		capability: "write",
+		createdAt: new Date().toISOString(),
+	});
+	return id;
+}
+
+async function screen(terminalId: string): Promise<string> {
+	return (await terminalService.getScrollback(terminalId))?.data ?? "";
 }
 
 describe("ceilings and preload", () => {
@@ -463,6 +531,7 @@ describe("closing", () => {
 	test("a run's end closes browser sessions unless a helper is still working", async () => {
 		const root = await primary();
 		const worker = await subagent(root, "worker");
+		await narratorService.updateStatus(worker.id, "idle");
 		const helper = await subagent(worker.id, "general");
 		await narratorService.updateStatus(helper.id, "working");
 		fakeSession(worker.id);
@@ -476,25 +545,57 @@ describe("closing", () => {
 		expect(await releaseSubagentBrowsersAtRunEnd(worker.id, { stopped: false })).toBe(1);
 		expect(sessionCount(worker.id)).toBe(0);
 	});
+
+	test("a Send that starts the next run while the last one finishes keeps its browser", async () => {
+		const root = await primary();
+		const worker = await subagent(root, "worker");
+		await narratorService.updateStatus(worker.id, "idle");
+		const finished = { id: "finished-run" };
+		fakeSession(worker.id);
+
+		// The next run already owns the subagent: its tabs stay, even for a stopped run.
+		const next = tryClaimExecution(worker.id, "run");
+		if (!next) throw new Error("could not claim the fixture execution");
+		setRunControl(next, { id: "next-run" } as never);
+		expect(await releaseSubagentBrowsersAtRunEnd(worker.id, { stopped: true, run: finished })).toBe(
+			0,
+		);
+		expect(sessionCount(worker.id)).toBe(1);
+		// The finishing run itself still owning it is no newer run.
+		setRunControl(next, finished as never);
+		expect(
+			await releaseSubagentBrowsersAtRunEnd(worker.id, { stopped: false, run: finished }),
+		).toBe(1);
+		next.release();
+
+		// Its status already says working (the next run is starting): kept.
+		fakeSession(worker.id);
+		await narratorService.updateStatus(worker.id, "working");
+		expect(await releaseSubagentBrowsersAtRunEnd(worker.id, { stopped: false })).toBe(0);
+		await narratorService.updateStatus(worker.id, "idle");
+
+		// A launch of the next run is still opening its tab: kept.
+		const slot = await reserveBrowserLaunch(worker.id, () => new Map([[worker.id, 1]]));
+		expect(await releaseSubagentBrowsersAtRunEnd(worker.id, { stopped: false })).toBe(0);
+		slot.release();
+		expect(sessionCount(worker.id)).toBe(1);
+
+		// The next run claims the subagent after the release has started: nothing is closed.
+		let claimed: ReturnType<typeof tryClaimExecution> = null;
+		const releasing = releaseSubagentBrowsersAtRunEnd(worker.id, {
+			stopped: false,
+			run: finished,
+		});
+		queueMicrotask(() => {
+			claimed = tryClaimExecution(worker.id, "run");
+		});
+		expect(await releasing).toBe(0);
+		expect(sessionCount(worker.id)).toBe(1);
+		(claimed as ReturnType<typeof tryClaimExecution>)?.release();
+	});
 });
 
 describe("listing and opening", () => {
-	function app(user: string) {
-		const routes = new Hono();
-		routes.use("*", async (c, next) => {
-			c.set("user", { sub: user, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
-			await next();
-		});
-		routes.onError(
-			(error) =>
-				new Response(JSON.stringify({ error: error.message }), {
-					status: error instanceof AppError ? error.statusCode : 500,
-				}),
-		);
-		routes.route("/api/terminals", terminalRoutes);
-		return routes;
-	}
-
 	async function team() {
 		const owner = await makeUser("owner");
 		const reader = await makeUser("reader");
@@ -569,61 +670,267 @@ describe("listing and opening", () => {
 		expect((await asReader.request(`/api/terminals/${t.helperTerminal}`, patch)).status).toBe(200);
 	});
 
-	test("the terminal WebSocket subscribes only callers with write access on the root", async () => {
+	test("the terminal WebSocket opens subagents' terminals only for writers of the root", async () => {
 		const t = await team();
-		const socket = (userId: string) => {
-			const sent: { type: string; code?: string; terminalId?: string }[] = [];
-			const ws = {
-				data: {
-					channel: "terminal",
-					connectedAt: Date.now(),
-					lastPongAt: Date.now(),
-					subscribedTerminals: new Set<string>(),
-					userId,
-					userRole: "user",
-				},
-				send: (payload: string) => sent.push(JSON.parse(payload)),
-			};
-			return { ws, sent };
-		};
 		const reader = socket(t.reader);
-		await handleTerminalWS.message(reader.ws as never, {
+		await reader.send({
 			type: "subscribe",
-			terminalIds: [t.workerTerminal, t.rootTerminal],
+			terminalIds: [t.workerTerminal, t.rootTerminal, "no-such-terminal"],
 		});
-		expect([...reader.ws.data.subscribedTerminals]).toEqual([t.rootTerminal]);
-		expect(reader.sent).toContainEqual(
-			expect.objectContaining({
-				type: "error",
-				code: "TERMINAL_ACCESS_DENIED",
-				terminalId: t.workerTerminal,
-			}),
-		);
-		await handleTerminalWS.message(reader.ws as never, {
-			type: "rename",
-			terminalId: t.workerTerminal,
-			name: "taken",
-		});
+		expect([...reader.ws.data.subscribedTerminals]).toEqual([]);
+		// A refused terminal and an unknown id get the same frame.
+		const frames = reader.sent.map(({ type, code }) => ({ type, code }));
+		expect(frames).toEqual([
+			{ type: "error", code: "TERMINAL_NOT_FOUND" },
+			{ type: "error", code: "TERMINAL_NOT_FOUND" },
+			{ type: "error", code: "TERMINAL_NOT_FOUND" },
+		]);
+		await reader.send({ type: "rename", terminalId: t.workerTerminal, name: "taken" });
 		const renamed = await db.query.terminals.findFirst({
 			where: eq(terminals.id, t.workerTerminal),
 		});
 		expect(renamed?.name).not.toBe("taken");
-		await handleTerminalWS.message(reader.ws as never, {
-			type: "create",
-			requestId: "r1",
-			narratorId: t.worker.id,
-		});
-		expect(reader.sent).toContainEqual(
-			expect.objectContaining({ type: "error", code: "TERMINAL_ACCESS_DENIED", terminalId: "" }),
-		);
+		await reader.send({ type: "create", requestId: "r1", narratorId: t.worker.id });
+		await reader.send({ type: "create", requestId: "r2", narratorId: "no-such-narrator" });
+		const creates = reader.sent.slice(-2).map(({ type, code }) => ({ type, code }));
+		expect(creates).toEqual([
+			{ type: "error", code: "NOT_FOUND" },
+			{ type: "error", code: "NOT_FOUND" },
+		]);
 
 		const owner = socket(t.owner);
-		await handleTerminalWS.message(owner.ws as never, {
-			type: "subscribe",
-			terminalIds: [t.workerTerminal, t.helperTerminal],
-		});
+		await owner.send({ type: "subscribe", terminalIds: [t.workerTerminal, t.helperTerminal] });
 		expect([...owner.ws.data.subscribedTerminals].sort()).toEqual(
 			[t.workerTerminal, t.helperTerminal].sort(),
 		);
+	});
+});
+
+describe("terminal access for every narrator", () => {
+	async function ownedShell() {
+		const owner = await makeUser("owner");
+		const reader = await makeUser("reader");
+		const stranger = await makeUser("stranger");
+		const root = await primary({ ownerUserId: owner, visibility: "public" });
+		const shell = await terminalService.create({ narratorId: root, name: "owner-shell" });
+		ptys.push(shell.id);
+		return { owner, reader, stranger, root, shell: shell.id };
+	}
+
+	test("a read-only viewer lists a primary's terminals but cannot watch or type into them", async () => {
+		const t = await ownedShell();
+		const list = await app(t.reader).request(`/api/terminals?narratorId=${t.root}`);
+		expect(list.status).toBe(200);
+		expect(((await list.json()) as { id: string }[]).map(({ id }) => id)).toContain(t.shell);
+		expect((await app(t.reader).request(`/api/terminals/${t.shell}`)).status).toBe(200);
+
+		const reader = socket(t.reader);
+		await reader.send({ type: "subscribe", terminalIds: [t.shell] });
+		expect(reader.ws.data.subscribedTerminals.has(t.shell)).toBe(false);
+		expect(reader.sent).toContainEqual({
+			type: "error",
+			terminalId: t.shell,
+			code: "TERMINAL_NOT_FOUND",
+			message: "Terminal not found",
+		});
+		// Even with a subscription it never got, input is dropped.
+		reader.ws.data.subscribedTerminals.add(t.shell);
+		await reader.send({ type: "input", terminalId: t.shell, data: "echo GAP_$((6*7))\n" });
+		expect(reader.ws.data.subscribedTerminals.has(t.shell)).toBe(false);
+
+		// The owner's typing runs, so the reader's would have shown by now.
+		const owner = socket(t.owner);
+		await owner.send({ type: "subscribe", terminalIds: [t.shell] });
+		expect(owner.ws.data.subscribedTerminals.has(t.shell)).toBe(true);
+		await owner.send({ type: "input", terminalId: t.shell, data: "echo OWNER_$((40+2))\n" });
+		await until(async () => (await screen(t.shell)).includes("OWNER_42"), "the owner's command");
+		expect(await screen(t.shell)).not.toContain("GAP_42");
+	});
+
+	test("a revoked write grant stops the next keystroke", async () => {
+		const t = await ownedShell();
+		const grant = await grantWrite(t.root, t.reader);
+		const colleague = socket(t.reader);
+		await colleague.send({ type: "subscribe", terminalIds: [t.shell] });
+		expect(colleague.ws.data.subscribedTerminals.has(t.shell)).toBe(true);
+		await colleague.send({ type: "input", terminalId: t.shell, data: "echo GRANT_$((6*7))\n" });
+		await until(async () => (await screen(t.shell)).includes("GRANT_42"), "the granted command");
+		await db.delete(aclGrants).where(eq(aclGrants.id, grant));
+		await colleague.send({ type: "input", terminalId: t.shell, data: "echo REVOKED_$((6*7))\n" });
+		expect(colleague.ws.data.subscribedTerminals.has(t.shell)).toBe(false);
+		await colleague.send({ type: "rename", terminalId: t.shell, name: "taken" });
+		await colleague.send({ type: "kill", terminalId: t.shell });
+		const owner = socket(t.owner);
+		await owner.send({ type: "subscribe", terminalIds: [t.shell] });
+		await owner.send({ type: "input", terminalId: t.shell, data: "echo AFTER_$((6*7))\n" });
+		await until(async () => (await screen(t.shell)).includes("AFTER_42"), "the owner's command");
+		expect(await screen(t.shell)).not.toContain("REVOKED_42");
+		const row = await db.query.terminals.findFirst({ where: eq(terminals.id, t.shell) });
+		expect(row?.name).toBe("owner-shell");
+		expect(row?.status).toBe("running");
+	});
+
+	test("a stranger gets the same 404 as for an unknown id, everywhere", async () => {
+		const t = await ownedShell();
+		await db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, t.root));
+		const stranger = app(t.stranger);
+		const patch = { method: "PATCH", body: JSON.stringify({ name: "pwned" }) };
+		for (const id of [t.shell, "no-such-terminal"]) {
+			expect((await stranger.request(`/api/terminals/${id}`)).status).toBe(404);
+			expect((await stranger.request(`/api/terminals/${id}/processes`)).status).toBe(404);
+			expect((await stranger.request(`/api/terminals/${id}`, patch)).status).toBe(404);
+			expect((await stranger.request(`/api/terminals/${id}`, { method: "DELETE" })).status).toBe(
+				404,
+			);
+		}
+		const ws = socket(t.stranger);
+		await ws.send({ type: "create", requestId: "x", narratorId: t.root });
+		expect(ws.sent.find((frame) => frame.type === "created")).toBeUndefined();
+		expect(ws.sent).toContainEqual(expect.objectContaining({ type: "error", code: "NOT_FOUND" }));
+		const rows = await db.query.terminals.findMany({ where: eq(terminals.narratorId, t.root) });
+		expect(rows.map(({ id }) => id)).toEqual([t.shell]);
+		const row = rows[0];
+		expect(row.name).toBe("owner-shell");
+		expect(row.status).toBe("running");
+
+		// The owner and an admin keep everything.
+		expect((await app(t.owner).request(`/api/terminals/${t.shell}/processes`)).status).toBe(200);
+		expect((await app(t.owner).request(`/api/terminals/${t.shell}`, patch)).status).toBe(200);
+		const admin = socket(await makeUser("admin"), "admin");
+		await admin.send({ type: "subscribe", terminalIds: [t.shell] });
+		expect(admin.ws.data.subscribedTerminals.has(t.shell)).toBe(true);
+		expect(
+			(await app("someone", "admin").request(`/api/terminals/${t.shell}`, { method: "DELETE" }))
+				.status,
+		).toBe(200);
+	});
+
+	test("a standalone terminal is its creator's and admins'", async () => {
+		resetTerminalAccessForTest();
+		const creator = await makeUser("creator");
+		const other = await makeUser("other");
+		const created_ = await app(creator).request("/api/terminals", {
+			method: "POST",
+			body: JSON.stringify({ name: "setup" }),
+		});
+		expect(created_.status).toBe(201);
+		const { id } = (await created_.json()) as { id: string };
+		ptys.push(id);
+		expect((await app(other).request(`/api/terminals/${id}`)).status).toBe(404);
+		const others = socket(other);
+		await others.send({ type: "subscribe", terminalIds: [id] });
+		expect(others.ws.data.subscribedTerminals.has(id)).toBe(false);
+		expect((await app(creator).request(`/api/terminals/${id}`)).status).toBe(200);
+		const mine = socket(creator);
+		await mine.send({ type: "subscribe", terminalIds: [id] });
+		expect(mine.ws.data.subscribedTerminals.has(id)).toBe(true);
+		const admin = socket(await makeUser("admin"), "admin");
+		await admin.send({ type: "subscribe", terminalIds: [id] });
+		expect(admin.ws.data.subscribedTerminals.has(id)).toBe(true);
+		// Anyone may still create one (unchanged); the WebSocket creator owns theirs too.
+		await others.send({ type: "create", requestId: "s" });
+		const made = others.sent.find((frame) => frame.type === "created");
+		if (made?.terminal) ptys.push(made.terminal.id);
+		expect(made?.terminal?.id).toBeDefined();
+		expect(others.ws.data.subscribedTerminals.has(made?.terminal?.id ?? "")).toBe(true);
+		expect((await app(creator).request(`/api/terminals/${made?.terminal?.id}`)).status).toBe(404);
+	});
+});
+
+describe("archived subagents and browser rules", () => {
+	test("an archived subagent gets no terminal and no browser session", async () => {
+		const root = await primary();
+		const worker = await subagent(root, "worker");
+		await interruptAndArchiveSubagent(worker.id);
+		const terminal = await terminalTool.execute({ action: "create" }, ctx(worker.id));
+		expect(terminal.isError).toBe(true);
+		expect(terminal.output).toContain("archived");
+		await expect(terminalService.create({ narratorId: worker.id })).rejects.toThrow("archived");
+		// Refused before any shell started.
+		expect(
+			await db.query.terminals.findMany({ where: eq(terminals.narratorId, worker.id) }),
+		).toEqual([]);
+		const launch = await browserTool.execute(
+			{ action: "launch", url: "https://example.invalid/" },
+			ctx(worker.id),
+		);
+		expect(launch.isError).toBe(true);
+		expect(launch.output).toContain("archived");
+	});
+
+	test("a shell that finishes starting after the archive is closed again", async () => {
+		const root = await primary();
+		const worker = await subagent(root, "worker");
+		const discarded: string[] = [];
+		await expect(
+			withTerminalSlot(
+				worker.id,
+				async () => {
+					await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, worker.id));
+					return { id: "late-shell" };
+				},
+				async (shell) => discarded.push(shell.id),
+			),
+		).rejects.toThrow("archived");
+		expect(discarded).toEqual(["late-shell"]);
+	});
+
+	test("a tab that finishes opening after the archive is closed again", async () => {
+		const root = await primary();
+		const worker = await subagent(root, "worker");
+		let tab: { closed: boolean } | undefined;
+		const spy = spyOn(browserModule, "createSession").mockImplementation((async (
+			narratorId: string,
+		) => {
+			await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, narratorId));
+			tab = fakeSession(narratorId);
+			const [session] = registry.sessions.get(narratorId)?.values() ?? [];
+			return session;
+		}) as never);
+		try {
+			const result = await browserTool.execute(
+				{ action: "launch", url: "https://example.invalid/" },
+				ctx(worker.id),
+			);
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("archived");
+			expect(tab?.closed).toBe(true);
+			expect(sessionCount(worker.id)).toBe(0);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("subagents launch headless only; primaries keep headed launches", async () => {
+		const root = await primary();
+		const worker = await subagent(root, "worker");
+		const refused = await browserTool.execute(
+			{ action: "launch", url: "https://example.invalid/", headless: false },
+			ctx(worker.id),
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain("headless browser sessions only");
+		expect(sessionCount(worker.id)).toBe(0);
+		(await reserveBrowserLaunch(root, () => new Map(), { headless: false })).release();
+	});
+
+	test("no session navigates to file:, chrome: or javascript:, for primaries too", async () => {
+		const root = await primary();
+		fakeSession(root);
+		const [sessionId] = registry.sessions.get(root)?.keys() ?? [];
+		for (const url of [
+			"file:///etc/hostname",
+			"chrome://version",
+			"javascript:document.title='x'",
+			"view-source:https://example.invalid/",
+		]) {
+			const result = await browserTool.execute(
+				{ action: "navigate", session_id: sessionId, url },
+				ctx(root),
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Unsupported protocol");
+		}
 	});
 });

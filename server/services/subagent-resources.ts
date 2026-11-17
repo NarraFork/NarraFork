@@ -4,11 +4,14 @@
  * - **Archived or deleted**: every running terminal it created and every browser session it
  *   launched is closed. Nobody can drive an archived subagent, so nothing it left running has
  *   an owner any more.
- * - **A run ends** (foreground or background) with no pending work: its browser sessions are
- *   closed. Pending work is a helper still working or waiting, or input already queued for it
- *   (a Send that will start its next run). A run that was stopped or timed out closes them
- *   regardless: its helpers are being stopped too. Terminals stay: a dev server or REPL a
- *   worker started is meant to outlive one turn, and the subagent can be told to use it again.
+ * - **A run ends** (foreground or background) with no pending work: the browser sessions open
+ *   at that moment are closed. Pending work is a helper still working or waiting, or input
+ *   already queued for it (a Send that will start its next run). A run that was stopped or
+ *   timed out closes them despite its helpers (they are being stopped too). Never while the
+ *   subagent is already busy again: a newer run owns it, its status is working or waiting, or
+ *   one of its launches is opening (re-checked synchronously right before closing). Terminals
+ *   stay: a dev server or REPL a worker started is meant to outlive one turn, and the subagent
+ *   can be told to use it again.
  *
  * Why browsers close at the end of a run rather than only at archive: a subagent between runs
  * is idle until someone sends it more work, possibly never, and every open session holds a
@@ -121,19 +124,57 @@ async function hasPendingWork(narratorId: string): Promise<boolean> {
 }
 
 /**
+ * Whether something else is already driving the subagent: a newer run or loop owns its
+ * execution (a Send that arrived while the old run was finishing), or one of its browser
+ * launches is still opening. Synchronous, so it can be the last check before closing.
+ */
+function busyAfterRun(
+	narratorId: string,
+	finishedRun: unknown,
+	ownership: typeof import("./agent-runtime/ownership"),
+	caps: typeof import("./agent-resource-caps"),
+): boolean {
+	const owner = ownership.getExecutionOwner(narratorId);
+	if (owner && ownership.getRunControl(narratorId) !== finishedRun) return true;
+	return caps.hasPendingBrowserLaunch(narratorId);
+}
+
+/**
  * A subagent's run ended: close its browser sessions unless work is pending (see the file
- * header). `stopped` is a run that was cancelled or timed out.
+ * header). `stopped` is a run that was cancelled or timed out; `run` is the finishing run's
+ * control, so a newer run is told apart from it.
+ *
+ * Only the sessions open when the run ended are closed, and only if, right before closing,
+ * no newer run owns the subagent, its status is not working or waiting, and no launch is in
+ * flight: a Send that starts the next run while this one is finishing keeps its tabs.
  */
 export async function releaseSubagentBrowsersAtRunEnd(
 	narratorId: string,
-	options: { stopped: boolean },
+	options: { stopped: boolean; run?: unknown },
 ): Promise<number> {
 	try {
-		const { listSessions } = await import("../lib/browser/session");
-		if (listSessions(narratorId).length === 0) return 0;
-		if (!(await isSubagent(narratorId))) return 0;
+		const session = await import("../lib/browser/session");
+		const atEnd = session.listSessions(narratorId).map(({ id }) => id);
+		if (atEnd.length === 0) return 0;
+		const [ownership, caps] = await Promise.all([
+			import("./agent-runtime/ownership"),
+			import("./agent-resource-caps"),
+		]);
+		if (busyAfterRun(narratorId, options.run, ownership, caps)) return 0;
+		const row = await db
+			.select({ type: narrators.type, status: narrators.status })
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.get();
+		if (row?.type !== "subagent") return 0;
+		if (row.status === "working" || row.status === "waiting") return 0;
 		if (!options.stopped && (await hasPendingWork(narratorId))) return 0;
-		return await closeBrowserSessions(narratorId);
+		// Last check, with no await before the closes start.
+		if (busyAfterRun(narratorId, options.run, ownership, caps)) return 0;
+		const closed = await Promise.all(
+			atEnd.map((id) => session.closeSession(narratorId, id).catch(() => false)),
+		);
+		return closed.filter(Boolean).length;
 	} catch (error) {
 		logger.warn("Failed to close a subagent's browser sessions at the end of its run", {
 			narratorId,

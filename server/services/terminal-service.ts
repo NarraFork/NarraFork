@@ -617,7 +617,11 @@ export const terminalService = {
 	 * create run serialized per narrator (`agent-resource-caps.ts`).
 	 */
 	async create(opts: CreateTerminalOptions) {
-		return withTerminalSlot(opts.narratorId, () => createTerminal(opts));
+		return withTerminalSlot(
+			opts.narratorId,
+			() => createTerminal(opts),
+			(terminal) => this.kill(terminal.id),
+		);
 	},
 
 	write(terminalId: string, data: string) {

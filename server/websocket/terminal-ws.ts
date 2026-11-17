@@ -1,11 +1,12 @@
 import type { ServerWebSocket } from "bun";
-import { AppError } from "../lib/errors";
+import { AppError, NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { terminalWsMessageSchema } from "../lib/validators";
 import {
-	subagentNarratorAccessAllowed,
-	subagentTerminalAccessAllowed,
-} from "../services/subagent-terminals";
+	narratorTerminalAccessAllowed,
+	rememberStandaloneTerminalCreator,
+	terminalAccessAllowed,
+} from "../services/terminal-access";
 import { terminalService } from "../services/terminal-service";
 import type { WSData } from "./ws-handler";
 
@@ -131,25 +132,59 @@ function principalOf(ws: TerminalWS) {
 	};
 }
 
-/**
- * Opening a subagent's terminal (watching, typing, renaming, closing) needs write access on
- * the subagent, which is judged on its ACL root. Refused without saying whether it exists.
- */
-async function mayOpenTerminal(ws: TerminalWS, terminalId: string): Promise<boolean> {
-	if (await subagentTerminalAccessAllowed(terminalId, principalOf(ws), "write")) return true;
+/** The one answer for a terminal that does not exist and one this user may not open. */
+function sendTerminalNotFound(ws: TerminalWS, terminalId: string): void {
 	try {
 		ws.send(
 			JSON.stringify({
 				type: "error",
 				terminalId,
-				code: "TERMINAL_ACCESS_DENIED",
-				message: "Opening this terminal needs write access to its session.",
+				code: "TERMINAL_NOT_FOUND",
+				message: "Terminal not found",
 			}),
 		);
 	} catch {
 		// connection may be dead
 	}
+}
+
+/**
+ * Opening a terminal (watching its output and scrollback, typing, renaming, closing) needs
+ * write access to its narrator, a subagent's judged on its ACL root; a standalone terminal is
+ * its creator's and admins' (`terminal-access.ts`). Checked on subscribe and again on every
+ * input, kill and rename, so a revoked grant stops the next keystroke. A refusal drops the
+ * subscription and answers exactly like an unknown id.
+ */
+async function mayOpenTerminal(ws: TerminalWS, terminalId: string): Promise<boolean> {
+	if (await terminalAccessAllowed(terminalId, principalOf(ws), "write")) return true;
+	ws.data.subscribedTerminals.delete(terminalId);
+	if (lastActiveClient.get(terminalId) === ws) lastActiveClient.delete(terminalId);
+	sendTerminalNotFound(ws, terminalId);
 	return false;
+}
+
+/**
+ * Keystrokes are written in the order they arrived although each waits for its access check:
+ * one chain per connection and terminal.
+ */
+const inputChains = new WeakMap<TerminalWS, Map<string, Promise<void>>>();
+
+function enqueueInput(
+	ws: TerminalWS,
+	terminalId: string,
+	work: () => Promise<void>,
+): Promise<void> {
+	let chains = inputChains.get(ws);
+	if (!chains) {
+		chains = new Map();
+		inputChains.set(ws, chains);
+	}
+	const next = (chains.get(terminalId) ?? Promise.resolve()).then(work, work);
+	chains.set(terminalId, next);
+	void next.finally(() => {
+		if (chains?.get(terminalId) === next) chains.delete(terminalId);
+	});
+	return next;
 }
 
 // === WebSocket handlers ===
@@ -211,17 +246,21 @@ export const handleTerminalWS = {
 			case "input": {
 				const { terminalId, data } = msg;
 				if (!ws.data.subscribedTerminals.has(terminalId)) break;
-				const prev = lastActiveClient.get(terminalId);
-				if (prev !== ws) {
-					lastActiveClient.set(terminalId, ws);
-					// Active client changed — ask the new client to re-send its dimensions
-					try {
-						ws.send(JSON.stringify({ type: "requestResize", terminalId }));
-					} catch {
-						// noop
+				await enqueueInput(ws, terminalId, async () => {
+					if (!ws.data.subscribedTerminals.has(terminalId)) return;
+					if (!(await mayOpenTerminal(ws, terminalId))) return;
+					const prev = lastActiveClient.get(terminalId);
+					if (prev !== ws) {
+						lastActiveClient.set(terminalId, ws);
+						// Active client changed — ask the new client to re-send its dimensions
+						try {
+							ws.send(JSON.stringify({ type: "requestResize", terminalId }));
+						} catch {
+							// noop
+						}
 					}
-				}
-				terminalService.write(terminalId, data);
+					terminalService.write(terminalId, data);
+				});
 				break;
 			}
 			case "resize": {
@@ -237,16 +276,15 @@ export const handleTerminalWS = {
 			case "create": {
 				const { requestId, ...opts } = msg;
 				try {
+					// A shell on a narrator is its workspace: write access, as for REST create.
 					if (
 						opts.narratorId &&
-						!(await subagentNarratorAccessAllowed(opts.narratorId, principalOf(ws), "write"))
+						!(await narratorTerminalAccessAllowed(opts.narratorId, principalOf(ws), "write"))
 					)
-						throw new AppError(
-							"Creating a terminal on this session needs write access to it.",
-							403,
-							"TERMINAL_ACCESS_DENIED",
-						);
+						throw new NotFoundError("Narrator", opts.narratorId);
 					const terminal = await terminalService.create(opts);
+					if (!opts.narratorId)
+						rememberStandaloneTerminalCreator(terminal.id, principalOf(ws).userId);
 					try {
 						ws.send(JSON.stringify({ type: "created", requestId, terminal }));
 					} catch {
