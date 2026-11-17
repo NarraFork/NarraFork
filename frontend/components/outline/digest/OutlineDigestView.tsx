@@ -508,9 +508,22 @@ function DelegatedItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestDel
 	);
 }
 
+/** Where a knowledge item's block sits: its ancestors' titles, top first, the middle elided. */
+function knowledgePath(ctx: ItemContext, item: OutlineDigestKnowledgeView): string | null {
+	if (item.path.length === 0) return null;
+	const titles = item.path.map((title) => blockTitle(ctx, title));
+	if (item.pathCut) titles.splice(1, 0, "…");
+	return titles.join(" › ");
+}
+
+/**
+ * New or rewritten facts in the subtree of one block (pageless outline, A3): the block's title
+ * and where it sits.
+ */
 function KnowledgeItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestKnowledgeView }) {
 	const { t } = ctx;
 	const links = itemLinks(item.link, { deleted: item.deleted });
+	const path = knowledgePath(ctx, item);
 	return (
 		<ItemRow
 			ctx={ctx}
@@ -529,7 +542,7 @@ function KnowledgeItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestKno
 			title={item.title}
 			target={links.block}
 			deleted={item.deleted}
-			meta={[timeOf(ctx, item.at)]}
+			meta={[path !== null && path, timeOf(ctx, item.at)]}
 			links={links}
 			body={
 				item.blocks.length > 0 && (

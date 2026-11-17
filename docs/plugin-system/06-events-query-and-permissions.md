@@ -172,7 +172,7 @@ type PublicEvent = {
 | `narrafork.narrator.message.changed` | `narratorId`, `messageId`, `role`, `createdAt`, `messageVersion` | 只给元数据，不给正文 | user-scoped |
 | `narrafork.narrator.tool.changed` | `narratorId`, `toolUseId`, `toolName`, `status`, `durationMs`, `outputBytes?` | 不给 input/output JSON | user-scoped |
 | `narrafork.narrator.spec.changed` | `narratorId`, `path`, `uri`, `revisionId?`, `updatedBy` | `spec:changed`（Dynamic Spec 文件写入）；大纲会话的任务提交后也照发 `path: "tasks.json"`、`revisionId: outline:<空间 key>:<seq>`，到旧 spec 命令下线为止（见 6.4） | user-scoped |
-| `narrafork.narrator.tasks.changed` | `narratorId`, `seq`, `revisionId`, `updatedBy`, `changes[{blockId,status}]`（≤50）, `truncated` | `outline:session_tasks_changed`：大纲根会话的会话空间里一次提交改了任务（行为边界页除外）；不给正文 | user-scoped |
+| `narrafork.narrator.tasks.changed` | `narratorId`, `seq`, `revisionId`, `updatedBy`, `changes[{blockId,status}]`（≤50）, `truncated` | `outline:session_tasks_changed`：大纲根会话的会话空间里一次提交改了任务（行为边界及其下面的块除外，按祖先判断）；不给正文 | user-scoped |
 | `narrafork.narrator.permission.changed` | `narratorId`, `requestId`, `state`, `toolName?`, `decision?` | 不给完整请求参数 | user-scoped |
 | `narrafork.background-task.changed` | `taskId`, `parentNarratorId`, `taskType`, `status`, `outputBytes` | 不给累计 output | user-scoped |
 | `narrafork.terminal.changed` | `terminalId`, `narratorId?`, `chapterId?`, `status`, `exitCode?` | 不给 PTY 输出 | user-scoped |
@@ -452,7 +452,7 @@ type CommandResult<T> =
 
 | 命令 | 输入 | 返回 |
 |---|---|---|
-| `narrafork.narrator.tasks_read` | `narratorId`、可选 `cursor`、`limit ≤ 100` | 会话空间里的任务，文档顺序（行为边界页除外）：`blockId`、`address`、`text`（≤1000 字）、`status`（todo/doing/done/cancelled）、`waiting`、`blocked`（插件标的受阻）、`humanCreated`、`parentBlockId`、`depth`、`versionSeq`，外加 `backend`、`spaceKey`、`seq`、`nextCursor` |
+| `narrafork.narrator.tasks_read` | `narratorId`、可选 `cursor`、`limit ≤ 100` | 会话空间里的任务，按文档顺序逐层读（行为边界及其下面除外；每次最多读 2 万行、400 条语句，游标对插件不透明，形状和以前相同）：`blockId`、`address`、`text`（≤1000 字）、`status`（todo/doing/done/cancelled）、`waiting`、`blocked`（插件标的受阻）、`humanCreated`、`parentBlockId`、`depth`、`versionSeq`，外加 `backend`、`spaceKey`、`seq`、`nextCursor` |
 | `narrafork.narrator.task_add` | `narratorId`、`text`（≤1000）、可选 `parentBlockId`、`start`、`protected` | `blockId`、`address`、`added`（同样正文已在就是 false）、`status`、`started`，没开跑时 `notStarted`（`finished`/`busy`/`plan_mode`/`continuation_off`/`continuation_mode`/`not_started`） |
 | `narrafork.narrator.task_set_status` | `narratorId`、`blockId`、`status`、可选 `baseVersionSeq` | `blockId`、`address`、`status`、`versionSeq`、`changed` |
 | `narrafork.narrator.behavior_rules_set` | `narratorId`、`mode: upsert/clear`、`text`（≤2000） | 插件规程块的 `blockId`（清掉后为 null） |
@@ -461,8 +461,8 @@ type CommandResult<T> =
 - 写入是会话的 system 提交，actor `plugin:<pluginId>`，责任人是会话负责人；加的任务管理者是插件。`protected: true` 记为人建任务（驱动 `protectedOnly` 续跑），不锁定（只有人锁定，D52）。
 - `start: true` 会让会话开跑，所以另外要 `command.narrator.send_message`（对同一个会话），没有就 `PERMISSION_DENIED`、什么都不写；会话的续跑是 `off` 时不开跑（插件不越过人的设置），返回 `notStarted: "continuation_off"`。续跑档位不会接这条任务时（`protectedOnly` 而会话里没有未完成的受保护任务，或 `blockStop` 而这条任务在等待）也不开跑、不领取，返回 `notStarted: "continuation_mode"`。`status` 总是任务此刻的真实状态。
 - 插件不能把人建任务勾完成、取消或去掉人建标记（`CONFLICT`）；人锁定的任务不能勾完成或取消，它下面的任务不能取消，也不能往它下面加任务（`CONFLICT`，同 agent 受锁的约束）；别人在做、版本对不上照写入路径的规则拒绝（`CONFLICT`）。
-- 规程块：行为边界页上每个插件一个块，短 id 由插件 id 推出；被人删了下次 upsert 恢复。
-- 旧命令在大纲会话里的转换：`spec_tasks_get` 读会话空间的顶层任务（等待中的和插件标了受阻的读成 `blocked`，取消的不列，`protected` = 人建，`revisionId` 是 `outline:<空间 key>:<seq>`；超过 100 条时列全部未完成的，再用最近改过的已完成任务补满）；`spec_task_add` 等于 `task_add`；`spec_write tasks.json` 按正文比对转成一个提交（不在列表里的正文先和任务页上的任务比对；只取消任务页上未完成的直接子块，已完成的留着；`blocked` 写成进行中加一条插件的受阻说明，只写一次，不建提问；改人建的未完成任务、完成或取消人锁定的任务，整次拒绝）；`spec_write index.md` 整页替换会话空间 `index.md` 页上的笔记（页上的任务留着）；`spec_behavior_fence_update` 写插件规程块（子代理仍写它自己的旧 fence）。
+- 规程块：行为边界（`session/behavior`）下面每个插件一个块，短 id 由插件 id 推出；被人删了下次 upsert 恢复。
+- 旧命令在大纲会话里的转换：`spec_tasks_get` 读会话空间的顶层任务（等待中的和插件标了受阻的读成 `blocked`，取消的不列，`protected` = 人建，`revisionId` 是 `outline:<空间 key>:<seq>`；超过 100 条时列全部未完成的，再用最近改过的已完成任务补满）；`spec_task_add` 等于 `task_add`；`spec_write tasks.json` 按正文比对转成一个提交（不在列表里的正文先和任务清单里的任务比对；只取消任务清单下未完成的直接子块，已完成的留着；`blocked` 写成进行中加一条插件的受阻说明，只写一次，不建提问；改人建的未完成任务、完成或取消人锁定的任务，整次拒绝）；`spec_write index.md` 替换会话空间 `index.md` 块下面的笔记（块下面直接的任务留着；这个块被人挪到哪就留在哪）；`spec_behavior_fence_update` 写插件规程块（子代理仍写它自己的旧 fence）。
 - 改受保护任务被拒时，spec 会话和大纲会话都返回 `CONFLICT`，带原来那段「requires taskReflection」的逐条说明（以前是不透明的 `INTERNAL_ERROR`）。
 - 每次转换在审计记录里加 `compat: "outline"`，并按（插件、命令）每小时最多记一条警告日志。旧命令在 outline plan PR 13 之后一个版本下线。
 

@@ -23,6 +23,8 @@ import {
 	type OutlineDigestActor,
 	type OutlineDigestDetailResponse,
 	type OutlineDigestHead,
+	type OutlineDigestKnowledgeStored,
+	type OutlineDigestKnowledgeStoredV1,
 	type OutlineDigestLink,
 	type OutlineDigestListResponse,
 	type OutlineDigestNames,
@@ -52,6 +54,7 @@ import { OUTLINE_PLAN_REVIEW_ACTOR } from "./plans";
 import { previewRevert, revertCommit } from "./revert";
 import { outlineStore } from "./store";
 import type { OutlineDigestHeadRow } from "./store/digest-port";
+import type { OutlineParentRow } from "./store/history-port";
 import type {
 	OutlineBlockMeta,
 	OutlineCommitRow,
@@ -73,7 +76,22 @@ export const OUTLINE_DIGEST_VIEW = {
 	markAll: 100,
 	/** Sessions named as actors whose visibility a detail checks (the rest stay unnamed). */
 	actorSessions: 100,
+	/** Rows one walk up from a space's knowledge items reads (their ancestors' path). */
+	pathRows: 2000,
+	/** Ancestors a path shows: the first ones and the nearest ones, the rest left out. */
+	pathFirst: 1,
+	pathLast: 3,
 } as const;
+
+/**
+ * The block whose subtree holds a knowledge item's facts. A report made while the outline had
+ * pages names the top-level block they were on (`pageId`): read as that block.
+ */
+export function knowledgeRoot(
+	item: OutlineDigestKnowledgeStored | OutlineDigestKnowledgeStoredV1,
+): string {
+	return "root" in item ? item.root : item.pageId;
+}
 
 function toHead(row: OutlineDigestHeadRow): OutlineDigestHead {
 	return {
@@ -229,13 +247,47 @@ export async function readOutlineDigestDetail(
 	};
 	for (const d of delegated) add(d.blockId);
 	for (const k of knowledge) {
-		add(k.pageId);
+		add(knowledgeRoot(k));
 		for (const b of k.blocks) add(b.id);
 	}
 	for (const t of tasks) add(t.blockId);
 	for (const p of plans) add(p.blockId);
 	for (const q of questions) add(q.blockId);
 	for (const o of other) add(o.blockId);
+	// The knowledge items' blocks' ancestors as the tree is now, for their paths: one walk up per
+	// space (one statement per 500 blocks), bounded.
+	const ancestry = new Map<string, OutlineParentRow>();
+	const roots = new Map<string, Set<string>>();
+	for (const k of knowledge) {
+		const set = roots.get(k.space) ?? new Set<string>();
+		set.add(knowledgeRoot(k));
+		roots.set(k.space, set);
+	}
+	for (const [spaceId, set] of roots) {
+		const walk = await store.listAncestryOf(spaceId, [...set], OUTLINE_DIGEST_VIEW.pathRows);
+		for (const row of walk.rows) ancestry.set(row.id, row);
+	}
+	const pathOf = (blockId: string): { ids: string[]; cut: boolean } => {
+		const ids: string[] = [];
+		const start = ancestry.get(blockId);
+		for (let at = start?.parentId ?? null; at !== null; ) {
+			const row = ancestry.get(at);
+			// Not reached (cut short, or gone since): no path rather than a wrong one.
+			if (!row) return { ids: [], cut: false };
+			ids.unshift(row.id);
+			at = row.parentId;
+		}
+		const { pathFirst, pathLast } = OUTLINE_DIGEST_VIEW;
+		if (ids.length <= pathFirst + pathLast) return { ids, cut: false };
+		return { ids: [...ids.slice(0, pathFirst), ...ids.slice(-pathLast)], cut: true };
+	};
+	const paths = new Map(
+		knowledge.map((k) => {
+			const root = knowledgeRoot(k);
+			return [root, pathOf(root)] as const;
+		}),
+	);
+	for (const path of paths.values()) for (const id of path.ids) blockIds.add(id);
 	const ids = [...blockIds];
 	const metas = new Map<string, OutlineBlockMeta>(
 		(await store.getBlockMetasByIds(ids)).map((m) => [m.id, m]),
@@ -268,7 +320,6 @@ export async function readOutlineDigestDetail(
 	const link = (
 		item: { space: string; seq: number; commitId: string },
 		blockId: string | null,
-		pageId: string | null,
 		narratorId: string | null = null,
 	): OutlineDigestLink => {
 		const space = (readable.get(item.space) as { space: OutlineSpaceRow }).space;
@@ -277,7 +328,6 @@ export async function readOutlineDigestDetail(
 			spaceId: space.id,
 			spaceKey: space.key,
 			blockId,
-			pageId: meta?.pageId ?? pageId,
 			address: meta ? `${space.key}/${meta.sid}` : null,
 			seq: item.seq,
 			commitId: item.commitId,
@@ -287,10 +337,9 @@ export async function readOutlineDigestDetail(
 	const base = (
 		item: { space: string; seq: number; commitId: string; at: string },
 		blockId: string | null,
-		pageId: string | null,
 		narratorId: string | null = null,
 	) => ({
-		link: link(item, blockId, pageId, narratorId),
+		link: link(item, blockId, narratorId),
 		title: title(blockId),
 		deleted: blockId ? (metas.get(blockId)?.deleted ?? true) : false,
 		at: item.at,
@@ -427,7 +476,7 @@ export async function readOutlineDigestDetail(
 		delegated: delegated.map((d) => {
 			const standing = stands(d);
 			return {
-				...base(d, d.blockId, d.pageId, d.narratorId),
+				...base(d, d.blockId, d.narratorId),
 				kind: d.kind,
 				session: session(d.narratorId),
 				pendingId: d.pendingId ?? null,
@@ -437,19 +486,25 @@ export async function readOutlineDigestDetail(
 				canUndo: standing && (readable.get(d.space)?.write ?? false),
 			};
 		}),
-		knowledge: knowledge.map((k) => ({
-			...base(k, k.pageId, k.pageId),
-			created: k.created,
-			changed: k.changed,
-			blocks: k.blocks.map((b) => ({
-				link: link({ space: k.space, seq: b.seq, commitId: k.commitId }, b.id, k.pageId),
-				title: title(b.id) ?? "",
-				deleted: metas.get(b.id)?.deleted ?? true,
-				created: b.created,
-			})),
-		})),
+		knowledge: knowledge.map((k) => {
+			const root = knowledgeRoot(k);
+			const path = paths.get(root) ?? { ids: [], cut: false };
+			return {
+				...base(k, root),
+				path: path.ids.map((id) => title(id) ?? ""),
+				pathCut: path.cut,
+				created: k.created,
+				changed: k.changed,
+				blocks: k.blocks.map((b) => ({
+					link: link({ space: k.space, seq: b.seq, commitId: k.commitId }, b.id),
+					title: title(b.id) ?? "",
+					deleted: metas.get(b.id)?.deleted ?? true,
+					created: b.created,
+				})),
+			};
+		}),
 		tasks: tasks.map((t) => ({
-			...base(t, t.blockId, t.pageId),
+			...base(t, t.blockId),
 			event: t.event,
 			by: t.by,
 			executor: t.executor,
@@ -459,14 +514,14 @@ export async function readOutlineDigestDetail(
 			newlyDoneForYou: newlyDoneForReader(t, principal.userId),
 		})),
 		plans: plans.map((p) => ({
-			...base(p, p.blockId, p.pageId, p.narratorId),
+			...base(p, p.blockId, p.narratorId),
 			event: p.event,
 			round: p.round,
 			session: session(p.narratorId),
 			approvedBy: p.approvedBy,
 		})),
 		questions: questions.map((q) => ({
-			...base(q, q.blockId, q.pageId),
+			...base(q, q.blockId),
 			event: q.event,
 			to: q.to,
 			by: q.by,
@@ -475,7 +530,7 @@ export async function readOutlineDigestDetail(
 			toYou: q.toYou,
 		})),
 		other: other.map((o) => ({
-			...base(o, o.blockId ?? null, o.pageId ?? null),
+			...base(o, o.blockId ?? null),
 			event: o.event,
 			actor: o.actor,
 			blocks: o.blocks,

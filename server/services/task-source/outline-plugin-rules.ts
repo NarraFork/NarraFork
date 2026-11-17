@@ -1,20 +1,21 @@
 /**
- * A plugin's rules on an outline session's behavior page (outline P2 PR 12a; PR 12 design §2.10):
- * `behavior_rules_set`, what the old `spec_behavior_fence_update` becomes in an outline session,
- * and the move of an SOP left in the old fence onto the page.
+ * A plugin's rules under an outline session's behavior boundary (outline P2 PR 12a; PR 12 design
+ * §2.10): `behavior_rules_set`, what the old `spec_behavior_fence_update` becomes in an outline
+ * session, and the move of an SOP left in the old fence under the boundary.
  *
  * THE BLOCK
  * ---------
- * One block per plugin on the session's behavior page (alias `behavior`, made when missing as PR 4
- * makes it): its first line names the plugin, the rules are the blocks under it. Its short id
- * follows from the plugin (short ids are unique within a space, so the session adds nothing, and a
- * fork's copy of the page keeps it: the fork's next update replaces the copy instead of adding a
- * second block), so it is found again and never drawn twice; a block a person deleted is brought
- * back by the next upsert (short ids are never reused), one moved off the page is moved back, a
- * `clear` deletes it. The rules are written as notes (`report` conversion: headings hold their sections,
- * a checkbox or `[[…]]` stays text), so nothing on the page starts or links. People write the
- * page freely; an agent only under the user turn's grant (PR 4), so a session cannot rewrite a
- * plugin's rules on its own.
+ * One block per plugin under the session's behavior boundary (the top-level block holding alias
+ * `behavior`, made when missing as PR 4 makes it): its first line names the plugin, the rules are
+ * the blocks under it. Its short id follows from the plugin (short ids are unique within a space,
+ * so the session adds nothing, and a fork's copy of the boundary keeps it: the fork's next update
+ * replaces the copy instead of adding a second block), so it is found again and never drawn
+ * twice; a block a person deleted is brought back by the next upsert (short ids are never
+ * reused), one moved out from under the boundary is moved back, a `clear` deletes it. The rules
+ * are written as notes (`report` conversion: headings hold their sections, a checkbox or `[[…]]`
+ * stays text), so nothing under the boundary starts or links. People write the boundary freely;
+ * an agent only under the user turn's grant (PR 4), so a session cannot rewrite a plugin's rules
+ * on its own.
  *
  * THE OLD FENCE
  * -------------
@@ -30,8 +31,8 @@
  * ({@link moveOutlineFenceSop}), once per process.
  *
  * A subagent keeps its own fence (a plugin's temporary worker has its own SOP there): the old
- * command still writes it, and `behavior_rules_set` refuses it (its boundary is its session's
- * page, D31).
+ * command still writes it, and `behavior_rules_set` refuses it (its boundary is its session's,
+ * D31).
  */
 import { createHash } from "node:crypto";
 import { hotSafe } from "@server/lib/hot-safe";
@@ -121,7 +122,7 @@ async function rulesBlocks(text: string, locale: Locale, whole: boolean): Promis
 }
 
 /**
- * Write (`text`) or clear (null) the block of `pluginId` on the session's behavior page, in one
+ * Write (`text`) or clear (null) the block of `pluginId` under the session's behavior boundary, in one
  * commit. Nothing is written when there is nothing to clear.
  */
 async function writeRulesBlock(
@@ -142,7 +143,7 @@ async function writeRulesBlock(
 			new Date().toISOString(),
 		));
 	const [block] = await store.getBlockMetas(space.id, { sids: [sid] });
-	const page = await findBehaviorBlock(space.id, store);
+	const boundary = await findBehaviorBlock(space.id, store);
 	const ops: OutlineOp[] = [];
 	const canonical: Array<OutlineCanonicalContent | null> = [];
 	const push = (op: OutlineOp, content: OutlineCanonicalContent | null = null) => {
@@ -160,13 +161,13 @@ async function writeRulesBlock(
 		if (
 			block &&
 			!block.deleted &&
-			page &&
-			block.parentId === page.id &&
+			boundary &&
+			block.parentId === boundary.id &&
 			(await holdsRules(store, block.id, blocks))
 		)
 			return { blockId: block.id, changed: false, space, seq: latestSeq(space) };
-		const pageRef = page ? { id: page.id } : { tempId: "boundary" };
-		if (!page)
+		const boundaryRef = boundary ? { id: boundary.id } : { tempId: "boundary" };
+		if (!boundary)
 			push({
 				op: "insert",
 				tempId: "boundary",
@@ -178,9 +179,9 @@ async function writeRulesBlock(
 			// A person moved it out from under the boundary: back under it, last. Judged by
 			// ancestry: anywhere below the boundary block it still is a rule.
 			const inside =
-				page !== null &&
-				(await blocksUnder(space.id, page.id, [block.id], { store })).under.has(block.id);
-			if (!inside) push({ op: "move", block: { id: block.id }, parent: pageRef });
+				boundary !== null &&
+				(await blocksUnder(space.id, boundary.id, [block.id], { store })).under.has(block.id);
+			if (!inside) push({ op: "move", block: { id: block.id }, parent: boundaryRef });
 			// The rules are replaced: what is under the block now goes, the new rules go in.
 			const children = await store.listChildMetas(
 				space.id,
@@ -194,14 +195,14 @@ async function writeRulesBlock(
 				);
 			for (const child of children) push({ op: "delete", block: { id: child.id } });
 		} else if (block) {
-			// Deleted by a person: brought back on the page, its old rules stay deleted.
-			push({ op: "restore", block: { id: block.id }, parent: pageRef });
+			// Deleted by a person: brought back under the boundary, its old rules stay deleted.
+			push({ op: "restore", block: { id: block.id }, parent: boundaryRef });
 		} else {
 			push({
 				op: "insert",
 				tempId: "rules",
 				sid,
-				parent: pageRef,
+				parent: boundaryRef,
 				content: OUTLINE_PLUGIN_RULES_TITLE[session.locale](pluginId),
 			});
 		}
@@ -367,7 +368,7 @@ export async function setOutlinePluginRules(args: {
 }
 
 /**
- * Write the SOP `sop` of a session's old fence as the marked plugin's block on its behavior page,
+ * Write the SOP `sop` of a session's old fence as the marked plugin's block under its behavior boundary,
  * unless that plugin has a block there already (then the fence's copy is stale). For the import of
  * a whole Dynamic Spec session (outline P2 PR 12b), which calls it before the session is an
  * outline one and reads the fence through its own port; the fence is not touched. Written whole,

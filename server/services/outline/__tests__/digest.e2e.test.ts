@@ -1852,7 +1852,6 @@ describe("reports: names", () => {
 					at,
 					event: "done",
 					blockId: block,
-					pageId: block,
 					by: { kind: "agent", id: gone },
 					executor: { kind: "agent", id: kept },
 					manager: null,
@@ -1868,7 +1867,6 @@ describe("reports: names", () => {
 					at,
 					event: "planning",
 					blockId: block,
-					pageId: block,
 					round: 0,
 					narratorId: gone,
 					approvedBy: null,
@@ -1949,4 +1947,127 @@ describe("reports: settings", () => {
 			.where(and(eq(userPreferences.userId, kim.id)));
 		expect(row?.outlineDigestTimeZone).toBeNull();
 	});
+});
+
+describe("reports: by subtree (pageless outline, A3)", () => {
+	test("new knowledge is told by the subtree that holds it, with where that sits, not by the top-level block", async () => {
+		const ivy = await person("ivy", { timeZone: "UTC", time: "05:00" });
+		const p = await project(ivy.id);
+		const agent = await narrator(ivy.id);
+		const A = { kind: "agent" as const, id: agent };
+		const made = await write(p.space, A, ivy.id, "2026-11-01T05:30:00.000Z", [
+			{ op: "insert", tempId: "h", parent: null, content: "Handbook" },
+			{ op: "insert", tempId: "i", parent: { tempId: "h" }, content: "Install" },
+			{ op: "insert", tempId: "u", parent: { tempId: "h" }, content: "Usage" },
+			{ op: "insert", tempId: "r", parent: { tempId: "u" }, content: "Run it" },
+		]);
+		const [handbook, install, usage, run] = made.results.map((r) => r.blockId as string);
+		// The day reported: one fact added under Install, one rewritten under Usage, a new section
+		// with its question under Handbook.
+		await write(p.space, A, ivy.id, "2026-11-02T06:00:00.000Z", [
+			{ op: "insert", parent: { id: install as string }, content: "Use bun" },
+			{ op: "update", block: { id: run as string }, content: "Run it with bun run start" },
+			{ op: "insert", tempId: "f", parent: { id: handbook as string }, content: "FAQ" },
+			{ op: "insert", parent: { tempId: "f" }, content: "Why bun" },
+		]);
+		await runJob("2026-11-03T06:00:00.000Z");
+		const day = (await dailies(ivy.id)).find((d) => d.periodKey === "2026-11-02");
+		expect(day).toBeDefined();
+		const shown = await detail(ivy.id, (day as OutlineDigestRow).id);
+		const items = shown.knowledge
+			.map((k) => ({
+				root: k.link.blockId,
+				title: k.title,
+				path: k.path,
+				created: k.created,
+				changed: k.changed,
+				blocks: k.blocks.map((b) => b.title),
+			}))
+			.sort((a, b) => ((a.title ?? "") < (b.title ?? "") ? -1 : 1));
+		expect(items).toEqual([
+			{
+				root: handbook,
+				title: "Handbook",
+				path: [],
+				created: 2,
+				changed: 0,
+				blocks: ["FAQ"],
+			},
+			{
+				root: install,
+				title: "Install",
+				path: ["Handbook"],
+				created: 1,
+				changed: 0,
+				blocks: ["Use bun"],
+			},
+			{
+				root: usage,
+				title: "Usage",
+				path: ["Handbook"],
+				created: 0,
+				changed: 1,
+				blocks: ["Run it with bun run start"],
+			},
+		]);
+		// No item names a page, and every link resolves for the reader.
+		expect(JSON.stringify(shown)).not.toContain("pageId");
+		await expectLinksResolve(ivy.id, shown);
+	}, 60_000);
+
+	test("a deep block's path keeps the first and the nearest ancestors", async () => {
+		const jon = await person("jon", { timeZone: "UTC", time: "05:00" });
+		const p = await project(jon.id);
+		const agent = await narrator(jon.id);
+		const A = { kind: "agent" as const, id: agent };
+		const chain: OutlineOp[] = [{ op: "insert", tempId: "l0", parent: null, content: "L0" }];
+		for (let n = 1; n < 7; n++)
+			chain.push({
+				op: "insert",
+				tempId: `l${n}`,
+				parent: { tempId: `l${n - 1}` },
+				content: `L${n}`,
+			});
+		const made = await write(p.space, A, jon.id, "2026-11-01T05:30:00.000Z", chain);
+		const deepest = made.results[6]?.blockId as string;
+		await write(p.space, A, jon.id, "2026-11-02T06:00:00.000Z", [
+			{ op: "insert", parent: { id: deepest }, content: "Deep fact" },
+		]);
+		await runJob("2026-11-03T06:00:00.000Z");
+		const day = (await dailies(jon.id)).find((d) => d.periodKey === "2026-11-02");
+		const shown = await detail(jon.id, (day as OutlineDigestRow).id);
+		expect(shown.knowledge.map((k) => [k.title, k.path, k.pathCut])).toEqual([
+			["L6", ["L0", "L3", "L4", "L5"], true],
+		]);
+	}, 60_000);
+
+	test("a day reaching below the space's history floor starts there and says it is partial", async () => {
+		const kay = await person("kay", { timeZone: "UTC", time: "05:00" });
+		const p = await project(kay.id);
+		const agent = await narrator(kay.id);
+		const A = { kind: "agent" as const, id: agent };
+		await write(p.space, A, kay.id, "2026-11-02T01:00:00.000Z", [
+			{ op: "insert", parent: null, content: "Before the floor" },
+		]);
+		const floor = await write(p.space, A, kay.id, "2026-11-02T02:00:00.000Z", [
+			{ op: "insert", parent: null, content: "At the floor" },
+		]);
+		await write(p.space, A, kay.id, "2026-11-02T03:00:00.000Z", [
+			{ op: "insert", parent: null, content: "After the floor" },
+		]);
+		// As the conversion leaves a space: nothing at or below the floor is history.
+		await db
+			.update(outlineSpaces)
+			.set({ historyFloorSeq: floor.commit?.seq as number })
+			.where(eq(outlineSpaces.id, p.space.id));
+		await runJob("2026-11-03T06:00:00.000Z");
+		const day = (await dailies(kay.id)).find(
+			(d) => d.periodKey === "2026-11-02",
+		) as OutlineDigestRow;
+		expect(day.ranges[p.space.id]).toEqual([floor.commit?.seq as number, 3]);
+		expect(day.truncated).toBe(true);
+		const shown = await detail(kay.id, day.id);
+		expect(shown.knowledge.map((k) => k.title)).toEqual(["After the floor"]);
+		expect(shown.spaces[0]?.truncated).toBe(true);
+	}, 60_000);
 });

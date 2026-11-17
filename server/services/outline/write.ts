@@ -504,6 +504,13 @@ export interface OutlineWriteOptions {
 	 */
 	compensating?: { expectNextSeq: number };
 	/**
+	 * Write only while the space is at this next seq (an ordinary commit): when another commit
+	 * landed since the caller read the space, reject with `OutlineStaleWriteError`, writing
+	 * nothing. For a caller that checked what is there and must not write over anything that
+	 * changed after its check (the Dynamic Spec import taking stale blocks away).
+	 */
+	expectNextSeq?: number;
+	/**
 	 * Content the caller normalized itself, by operation index: normalization costs tens of
 	 * milliseconds per large block, so a caller handling untrusted input runs it off the main
 	 * thread (`edit-text.ts`) and hands over the result. Each entry's `content` must equal the
@@ -3796,8 +3803,9 @@ async function writePrepared(
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		const space = await store.getSpace(input.spaceId);
 		if (!space) throw new NotFoundError("Outline space", input.spaceId);
-		if (compensating && space.nextSeq !== compensating.expectNextSeq) {
-			throw new OutlineStaleWriteError(space.id, compensating.expectNextSeq);
+		const expectNextSeq = compensating?.expectNextSeq ?? options.expectNextSeq;
+		if (expectNextSeq !== undefined && space.nextSeq !== expectNextSeq) {
+			throw new OutlineStaleWriteError(space.id, expectNextSeq);
 		}
 		const now = (options.now?.() ?? new Date()).toISOString();
 		if (options.confirm) {

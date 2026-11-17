@@ -46,7 +46,7 @@ export type {
 	OutlineTeamUnblockedEntry,
 	OutlineViewAgent,
 	OutlineViewTask,
-	SpecImportNoticePage,
+	SpecImportNoticeNote,
 } from "./prompts/outline-tasks";
 export {
 	getOutlineBehaviorBoundaryTitle,

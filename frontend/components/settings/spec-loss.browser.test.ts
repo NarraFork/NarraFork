@@ -7,7 +7,7 @@
  *    now" (asked once), and lists the findings of one status a page at a time, each with its
  *    session, file and what was lost;
  *  - a finding that is not on its page says why: the session is still in Dynamic Spec (nothing
- *    to attach to, no attach offered), the page's cap, a page that is gone;
+ *    to attach to, no attach offered), the per-block cap, an imported block that is gone;
  *  - the lost content is read on demand, in a box that scrolls by itself;
  *  - a person's attach of a left-out finding asks first (cancelling does nothing), then asks the
  *    server once; an attached finding links to its block and is dismissed after a question (its
@@ -226,10 +226,10 @@ test("the admin section: the scan, the findings a page at a time, why not attach
 		);
 		// Of the imported session, two were left out, each with its reason.
 		expect(await text(page, '[data-finding="f030"] [data-testid="spec-loss-why"]')).toBe(
-			en.why.no_page,
+			en.why.no_block,
 		);
 		const row = '[data-finding="f027"]';
-		expect(await text(page, `${row} [data-testid="spec-loss-why"]`)).toBe(en.why.page_cap);
+		expect(await text(page, `${row} [data-testid="spec-loss-why"]`)).toBe(en.why.block_cap);
 
 		// Its lost content, on demand.
 		await page.click(`${row} [data-testid="spec-loss-view"]`);
@@ -260,7 +260,7 @@ test("the admin section: the scan, the findings a page at a time, why not attach
 		await page.waitForSelector('[role="dialog"]');
 		const dialog = await text(page, '[role="dialog"]');
 		expect(dialog).toContain(en.attachTitle);
-		expect(dialog).toContain("Nothing else on the page changes");
+		expect(dialog).toContain("Nothing else of the file changes");
 		await noSidewaysScroll(page);
 		const labels = await page.$$eval('[role="dialog"] button', (els) =>
 			els.map((el) => el.textContent),
@@ -445,7 +445,7 @@ test("what no pass attaches: the behavior page asks with its own warning; other 
 		const listed = '[data-finding="f902"]';
 		await page.waitForSelector(rule);
 		// Each says why it is only listed.
-		expect(await text(page, `${rule} [data-testid="spec-loss-why"]`)).toBe(strings.why.rule_page);
+		expect(await text(page, `${rule} [data-testid="spec-loss-why"]`)).toBe(strings.why.rule_block);
 		expect(await text(page, `${listed} [data-testid="spec-loss-why"]`)).toBe(strings.why.list_only);
 		expect(await text(page, `${rule} [data-testid="spec-loss-path"]`)).toBe("behavior_fence");
 		await noSidewaysScroll(page);

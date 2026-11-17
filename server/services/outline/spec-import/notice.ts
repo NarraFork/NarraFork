@@ -11,10 +11,10 @@
  * moved back to Dynamic Spec and forward again is a new switch, told again. A switch that wrote
  * nothing (the session never used Dynamic Spec) is recorded as told.
  *
- * Bounded: one primary-key read of the state (cached), one of the row, one page read of the
- * session space's pages (at most {@link SPEC_IMPORT_NOTICE_LIMITS.pageRead}); the text lists at
- * most {@link SPEC_IMPORT_NOTICE_LIMITS.pages} pages. Written on SQLite only, where the session
- * runtime runs.
+ * Bounded: one primary-key read of the state (cached), one of the row, one read of the session
+ * space's top-level blocks (at most {@link SPEC_IMPORT_NOTICE_LIMITS.topLevelRead}); the text
+ * lists at most {@link SPEC_IMPORT_NOTICE_LIMITS.notes} imported files. Written on SQLite only,
+ * where the session runtime runs.
  */
 import { createHash } from "node:crypto";
 import { getUserLanguage } from "@server/lib/i18n";
@@ -28,11 +28,11 @@ import { isImportSid } from "./plan";
 import { readSpecImportState, writeSpecImportState } from "./state";
 
 export const SPEC_IMPORT_NOTICE_LIMITS = {
-	/** Pages of the session space read to name the imported ones. */
-	pageRead: 60,
-	/** Pages the text names; the rest are counted. */
-	pages: 20,
-	/** Characters of a page title in the text. */
+	/** Top-level blocks of the session space read to name the imported files' blocks. */
+	topLevelRead: 60,
+	/** Imported files the text names; the rest are counted. */
+	notes: 20,
+	/** Characters of a block's title in the text. */
 	titleChars: 120,
 } as const;
 
@@ -84,7 +84,7 @@ export async function deliverSpecImportNotice(
 		const owner = (await readNarrator(narratorId))?.ownerUserId ?? null;
 		const locale: Locale = owner ? await getUserLanguage(owner).catch(() => "en" as const) : "en";
 		const content = getSpecImportNotice(
-			{ tasks: state.tasks ?? 0, ...(await importedPages(narratorId)) },
+			{ tasks: state.tasks ?? 0, ...(await importedNotes(narratorId)) },
 			locale,
 		);
 		const { deliverInjection } = await import("../../narrator-injection");
@@ -114,13 +114,20 @@ async function recordTold(narratorId: string, switchCount: number): Promise<void
 	}));
 }
 
-/** The pages of the session space an import wrote (by their short ids), in page order. */
-async function importedPages(
+/**
+ * The top-level blocks of the session space an import wrote for its files (by their short ids),
+ * in sibling order.
+ */
+async function importedNotes(
 	narratorId: string,
-): Promise<{ pages: Array<{ title: string; address: string }>; morePages: number }> {
+): Promise<{ notes: Array<{ title: string; address: string }>; moreNotes: number }> {
 	const space = await outlineStore.findSpace({ kind: "session", narratorId });
-	if (!space) return { pages: [], morePages: 0 };
-	const rows = await outlineStore.listChildren(space.id, null, SPEC_IMPORT_NOTICE_LIMITS.pageRead);
+	if (!space) return { notes: [], moreNotes: 0 };
+	const rows = await outlineStore.listChildren(
+		space.id,
+		null,
+		SPEC_IMPORT_NOTICE_LIMITS.topLevelRead,
+	);
 	const indexSid = specIndexSid();
 	const imported = rows.filter(
 		(row) =>
@@ -130,10 +137,10 @@ async function importedPages(
 			(isImportSid(row.sid) || row.sid === indexSid),
 	);
 	return {
-		pages: imported.slice(0, SPEC_IMPORT_NOTICE_LIMITS.pages).map((row) => ({
+		notes: imported.slice(0, SPEC_IMPORT_NOTICE_LIMITS.notes).map((row) => ({
 			title: (row.content.split("\n", 1)[0] ?? "").slice(0, SPEC_IMPORT_NOTICE_LIMITS.titleChars),
 			address: `session/${row.sid}`,
 		})),
-		morePages: Math.max(0, imported.length - SPEC_IMPORT_NOTICE_LIMITS.pages),
+		moreNotes: Math.max(0, imported.length - SPEC_IMPORT_NOTICE_LIMITS.notes),
 	};
 }

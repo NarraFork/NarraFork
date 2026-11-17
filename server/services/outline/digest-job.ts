@@ -465,6 +465,13 @@ async function visitSpace(
 	};
 	const windows = new Map<string, Promise<{ commits: OutlineCommitRow[]; truncated: boolean }>>();
 	const summaries = new Map<string, Promise<OutlineSpaceSummary>>();
+	// Nothing is known of the space at or below its history floor (pageless outline: history
+	// starts at the conversion): a window starts there at the earliest, summarized in part.
+	let floor: number | null = null;
+	const floorOf = async () => {
+		floor ??= (await store.getHistoryStates([space.id])).get(space.id)?.floorSeq ?? 0;
+		return floor;
+	};
 	for (const chain of wanted) {
 		const { person } = chain;
 		let readable: boolean | undefined;
@@ -472,7 +479,8 @@ async function visitSpace(
 		let lastTo = chain.lastTo.get(space.id);
 		for (const day of chain.days) {
 			if (lastCommit < day.start) continue;
-			const from = lastTo ?? (await boundary(day.start));
+			const start = lastTo ?? (await boundary(day.start));
+			const from = Math.max(start, await floorOf());
 			const to = Math.max(from, await boundary(day.end));
 			if (to <= from) continue;
 			const key = `${from}:${to}`;
@@ -506,6 +514,7 @@ async function visitSpace(
 				{ userId: person.id, username: person.username },
 				limits,
 			);
+			if (from > start) part.space.truncated = true;
 			// A part with nothing in it is no space with changes.
 			effects.push({ day, range: [from, to], part: spaceWeight(part) > 0 ? part : null });
 		}

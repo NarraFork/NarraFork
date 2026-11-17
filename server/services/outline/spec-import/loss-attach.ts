@@ -1,29 +1,31 @@
 /**
- * Putting what the old Spec panel may have swallowed on the page (outline P2 PR 12c; PR 12 design
- * §2.9, owner decisions D52 「照常导入，只附在页上」 and 2026-11-13 「只自动贴表格，其余只列出」). A
- * finding of the scan (`loss-scan.ts`) is ATTACHED to the page its file was imported to and shown
- * nowhere else: no import notice, no digest line, no question. Nothing of the page's own content
- * is ever rewritten.
+ * Putting what the old Spec panel may have swallowed back beside its file (outline P2 PR 12c; PR
+ * 12 design §2.9, owner decisions D52 「照常导入，只附在页上」 and 2026-11-13 「只自动贴表格，其余只列出」;
+ * pageless outline A3: the file is a block). A finding of the scan (`loss-scan.ts`) is ATTACHED
+ * under the block its file was imported to (the file's block, wherever it sits now) and shown
+ * nowhere else: no import notice, no digest line, no question. Nothing of the file's own
+ * imported content is ever rewritten.
  *
  * WHAT IS ATTACHED BY ITSELF, AND WHAT ONLY WHEN A PERSON ASKS (`specLossListedNote`)
  *
  * A pass attaches findings of TABLES only. Task items, images, HTML, footnotes and front matter
- * are listed (the Spec panel, the admin list) and attached when a person asks. Nothing of the
- * BEHAVIOR FENCE is ever attached by a pass, whatever its kind: its page is shown to the model as
- * standing rules, so a rule a person removed would apply again. A person may attach it there,
- * through a confirmation that says the agent will read it as a rule; that block gets its own kind
- * of short id (`sr…`); what is under it is read as rules, while its header line, which speaks to
- * the person ("possibly lost content … move it back or delete this block"), is not shown to the
- * model. Any other attach block (`sl…`) on the behavior page is left out of what
- * the model is shown and of what a fork copies (`task-source/outline-behavior.ts`). A finding a
- * fork inherited (the save was made in the session it was forked from) is attached in that
- * session only and listed in the fork.
+ * are listed (the Spec panel, the admin list) and attached when a person asks. Nothing is ever
+ * attached by a pass under the BEHAVIOR BOUNDARY, whatever its kind: what is under it is shown to
+ * the model as standing rules, so a rule a person removed would apply again. That holds for the
+ * fence's own findings and for a file whose block someone moved under the boundary (`rule_block`
+ * either way). A person may attach a fence finding there, through a confirmation that says the
+ * agent will read it as a rule; that block gets its own kind of short id (`sr…`); what is under
+ * it is read as rules, while its header line, which speaks to the person ("possibly lost content
+ * … move it back or delete this block"), is not shown to the model. Any other attach block
+ * (`sl…`) under the boundary is left out of what the model is shown and of what a fork copies
+ * (`task-source/outline-behavior.ts`). A finding a fork inherited (the save was made in the
+ * session it was forked from) is attached in that session only and listed in the fork.
  *
  * WHAT AN ATTACH WRITES
  *
  * One commit of the system actor `spec-import-check` (a routine actor in digests), answered for
- * by the session's owner (or the person who asked): one block at the top of the page saying what
- * it is, and under it the lost content as it stood before the save, tables converted from their
+ * by the session's owner (or the person who asked): one block first under the file's block saying
+ * what it is, and under it the lost content as it stood before the save, tables converted from their
  * markdown (as the import writes tables), everything else kept as source in code blocks. The
  * conversion runs on the background text worker; when it fails nothing is written, and nothing
  * is written either when there is no content to put under the header.
@@ -34,11 +36,12 @@
  * may have taken a while) and that no import is working on; a session still in Dynamic Spec keeps
  * its findings open until a pass after its import. For each open finding not tried before (or
  * left by the session cap, or failed), the ones that failed least first, then oldest first:
- *   - not one a pass attaches (above) → `rule_page`, `fork` or `list_only`, left to a person;
- *   - the file's imported page is not there → `no_page`, left to a person;
+ *   - not one a pass attaches (above) → `rule_block`, `fork` or `list_only`, left to a person;
+ *   - the file's imported block is not there → `no_block`, left to a person;
+ *   - the file's block sits under the behavior boundary now → `rule_block`, left to a person;
  *   - the file's current revision holds the content again → `restored`, not attached;
- *   - {@link SPEC_LOSS_ATTACH_LIMITS.perPage} findings are attached to the page already →
- *     `page_cap`, left to a person;
+ *   - {@link SPEC_LOSS_ATTACH_LIMITS.perBlock} findings are attached to the file's block
+ *     already → `block_cap`, left to a person;
  *   - {@link SPEC_LOSS_ATTACH_LIMITS.perSessionPass} were attached for the session in this pass →
  *     `session_cap`, attached by a later pass;
  *   - otherwise attached. A failure is `failed` and tried again by a later pass, up to
@@ -58,7 +61,8 @@
  * A BLOCK THAT IS GONE ({@link reopenLostAttachments})
  *
  * When the block of an attached finding was deleted by a SYSTEM commit (a plugin's old
- * `spec_write index.md` replacing the page, a re-import taking a stale page away), the finding is
+ * `spec_write index.md` replacing its notes, a re-import taking a stale file block away), the
+ * finding is
  * open again and attached anew by the same pass, under its next sequence — at most
  * {@link SPEC_LOSS_ATTACH_LIMITS.reattaches} times; after that it stays open (`reattach_cap`)
  * until a person attaches it. A block a person or an agent deleted stays deleted: that is how a
@@ -93,6 +97,7 @@ import { processBackgroundText } from "../edit-text-runner";
 import type { ReportBlock } from "../report-text";
 import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
+import { blocksUnder } from "../well-known";
 import { type OutlineCanonicalContent, type OutlineOp, writeOutline } from "../write";
 import { isSpecImportRunning } from "./importer";
 import {
@@ -118,8 +123,8 @@ import {
 } from "./read-port";
 
 export const SPEC_LOSS_ATTACH_LIMITS = {
-	/** Findings attached automatically to one page; more are left to a person. */
-	perPage: 20,
+	/** Findings attached automatically under one file's block; more are left to a person. */
+	perBlock: 20,
 	/** Findings attached for one session in one pass; the rest by later passes. */
 	perSessionPass: 10,
 	/** Attached findings of one session whose blocks a pass looks at (the next goes on from there). */
@@ -166,14 +171,14 @@ const TEXT: Record<
 > = {
 	en: {
 		header: (day, what, truncated) =>
-			`Possibly lost content. A save from the Spec panel (${day}) left out what the version before it held: ${what}. It is below as it stood then${truncated ? " (the beginning only: it was too long to keep whole)" : ""}. Move it back into the page or delete this block; nothing else was changed.`,
+			`Possibly lost content. A save from the Spec panel (${day}) left out what the version before it held: ${what}. It is below as it stood then${truncated ? " (the beginning only: it was too long to keep whole)" : ""}. Move it back into the text or delete this block; nothing else was changed.`,
 		summary: (path) => `Content a Spec panel save may have lost, attached to ${path}`,
 		summaryRemoved: (path) => `Dismissed: the possibly lost content attached to ${path} removed`,
 		unknownDay: "date unknown",
 	},
 	"zh-CN": {
 		header: (day, what, truncated) =>
-			`可能丢失的内容。Spec 面板的一次保存（${day}）之后，上一版里的这些内容不见了：${what}。下面是它当时的原样${truncated ? "（只有开头一部分：太长，没有全部保留）" : ""}。要挪回正文还是删掉这一块，由你决定；页上其他内容没有改动。`,
+			`可能丢失的内容。Spec 面板的一次保存（${day}）之后，上一版里的这些内容不见了：${what}。下面是它当时的原样${truncated ? "（只有开头一部分：太长，没有全部保留）" : ""}。要挪回正文还是删掉这一块，由你决定；其他内容没有改动。`,
 		summary: (path) => `Spec 面板保存时可能丢失的内容，附在 ${path}`,
 		summaryRemoved: (path) => `已忽略：删掉附在 ${path} 的可能丢失的内容`,
 		unknownDay: "日期不详",
@@ -192,9 +197,9 @@ function describeKinds(
 
 /**
  * The short id of the block an attach writes: the same attach again is the same block. `rule`:
- * content a person put on the behavior page, confirming the agent reads it as a rule (`sr…`,
- * `isSpecLossRuleSid`); every other attach block is `sl…` (`isSpecLossAttachSid`), which the
- * behavior page's readers leave out.
+ * content a person put under the behavior boundary, confirming the agent reads it as a rule
+ * (`sr…`, `isSpecLossRuleSid`); every other attach block is `sl…` (`isSpecLossAttachSid`),
+ * which the behavior boundary's readers leave out.
  */
 export function specLossBlockSid(findingId: string, attachSeq = 0, rule = false): string {
 	const source = attachSeq === 0 ? findingId : `${findingId}\u0000${attachSeq}`;
@@ -280,20 +285,29 @@ async function pointerOf(ctx: AttachContext, path: string): Promise<SpecImportFi
 }
 
 /**
- * The live page the import made for the file: the behavior page for the fence, else the page
- * whose short id follows from the file's current revision. Null when it is not there.
+ * The live block the import made for the file: the behavior boundary for the fence, else the
+ * block whose short id follows from the file's current revision, wherever it sits now (`rules`:
+ * it is the boundary, or under it). Null when it is not there.
  */
-async function pageOf(ctx: AttachContext, path: string): Promise<string | null> {
+async function importedBlockOf(
+	ctx: AttachContext,
+	path: string,
+): Promise<{ id: string; rules: boolean } | null> {
 	if (!ctx.space) return null;
-	if (path === SPEC_LOSS_FENCE_PATH) return (await findBehaviorBlock(ctx.space.id))?.id ?? null;
+	const behavior = await findBehaviorBlock(ctx.space.id);
+	if (path === SPEC_LOSS_FENCE_PATH) return behavior ? { id: behavior.id, rules: true } : null;
 	const pointer = await pointerOf(ctx, path);
 	if (!pointer?.revisionId) return null;
 	const sid =
 		path === "index.md"
 			? specIndexSid()
 			: `sp${specFileTag(ctx.session.narratorId, path, pointer.revisionId)}`;
-	const [page] = await outlineStore.getBlockMetas(ctx.space.id, { sids: [sid] });
-	return page && !page.deleted && page.parentId === null ? page.id : null;
+	const [block] = await outlineStore.getBlockMetas(ctx.space.id, { sids: [sid] });
+	if (!block || block.deleted) return null;
+	if (!behavior) return { id: block.id, rules: false };
+	// Under the boundary, or where that cannot be told: what is there is read as rules.
+	const where = await blocksUnder(ctx.space.id, behavior.id, [block.id]);
+	return { id: block.id, rules: where.under.has(block.id) || where.unknown.has(block.id) };
 }
 
 const structureId = (item: { kind: string; key: string }) => `${item.kind}\u0000${item.key}`;
@@ -356,8 +370,8 @@ async function adopted(space: OutlineSpaceRow, blockId: string): Promise<string>
 
 /**
  * Attach one finding (see the module header). `auto`: the pass's attach, only of what a pass
- * attaches, with the restored check, the page cap and the re-attach cap; a person's own request
- * has none of them. Rejects when the conversion or the write fails (nothing is written then).
+ * attaches (never under the behavior boundary), with the restored check, the per-block cap and
+ * the re-attach cap; a person's own request has none of them. Rejects when the conversion or the write fails (nothing is written then).
  */
 async function attachOne(
 	ctx: AttachContext,
@@ -370,8 +384,11 @@ async function attachOne(
 		const listed = specLossListedNote(row);
 		if (listed !== null) return { note: listed };
 	}
-	const pageId = await pageOf(ctx, row.path);
-	if (!space || pageId === null) return { note: "no_page" };
+	const target = await importedBlockOf(ctx, row.path);
+	if (!space || target === null) return { note: "no_block" };
+	// A pass never puts anything where the model reads rules (the fence's findings are listed
+	// before this; here: a file's block someone moved under the boundary).
+	if (options.auto && target.rules) return { note: "rule_block" };
 	const rule = row.path === SPEC_LOSS_FENCE_PATH;
 	let seq = row.attachSeq;
 	let [written] = await outlineStore.getBlockMetas(space.id, {
@@ -387,9 +404,9 @@ async function attachOne(
 			if (seq >= SPEC_LOSS_ATTACH_LIMITS.reattaches) return { note: "reattach_cap" };
 		}
 		if (await restoredSince(ctx, row)) return { note: "restored" };
-		const cap = SPEC_LOSS_ATTACH_LIMITS.perPage;
+		const cap = SPEC_LOSS_ATTACH_LIMITS.perBlock;
 		if ((await countSpecLossAttached(row.narratorId, row.path, cap)) >= cap)
-			return { note: "page_cap" };
+			return { note: "block_cap" };
 	}
 	if (written?.deleted) {
 		// Its block was deleted: attached anew under the next short id (a short id is never reused).
@@ -415,7 +432,7 @@ async function attachOne(
 			op: "insert",
 			tempId: "h",
 			sid: specLossBlockSid(row.id, seq, rule),
-			parent: { id: pageId },
+			parent: { id: target.id },
 			position: { first: true },
 			content: text.header(
 				row.savedAt?.slice(0, 10) || text.unknownDay,
@@ -458,11 +475,11 @@ export function assertSpecLossNotImporting(narratorId: string): void {
 
 /**
  * A person asks for an open finding to be attached (a pass does not attach its kind, or left it
- * out, or they reopened it). `confirmRule`: the person was told that content put on the behavior
- * page is read by the agent as a rule; a finding of the behavior fence is refused without it
- * (`SPEC_LOSS_RULE_CONFIRM`). Rejects with why it cannot be (`SPEC_IMPORT_IN_PROGRESS`,
- * `SPEC_LOSS_NOT_IMPORTED`, `SPEC_LOSS_NO_PAGE`), or when the write fails; the block's id
- * otherwise.
+ * out, or they reopened it). `confirmRule`: the person was told that content put under the
+ * behavior boundary is read by the agent as a rule; a finding of the behavior fence is refused
+ * without it (`SPEC_LOSS_RULE_CONFIRM`). Rejects with why it cannot be
+ * (`SPEC_IMPORT_IN_PROGRESS`, `SPEC_LOSS_NOT_IMPORTED`, `SPEC_LOSS_NO_BLOCK`), or when the write
+ * fails; the block's id otherwise.
  */
 export async function attachSpecLossFinding(
 	session: SpecImportSession,
@@ -475,8 +492,8 @@ export async function attachSpecLossFinding(
 	if (row.path === SPEC_LOSS_FENCE_PATH && options.confirmRule !== true)
 		throw catalogError("SPEC_LOSS_RULE_CONFIRM");
 	const result = await attachOne(await contextOf(session), row, { auto: false, userId });
-	if ("note" in result) throw catalogError("SPEC_LOSS_NO_PAGE");
-	logger.info("Possibly lost Dynamic Spec content attached to its imported page", {
+	if ("note" in result) throw catalogError("SPEC_LOSS_NO_BLOCK");
+	logger.info("Possibly lost Dynamic Spec content attached to its imported block", {
 		narratorId: row.narratorId,
 		findingId: row.id,
 		path: row.path,
@@ -511,18 +528,18 @@ export async function reopenLostAttachments(
 ): Promise<number> {
 	const limits = SPEC_LOSS_ATTACH_LIMITS;
 	const { narratorId } = session;
-	const page = await listSpecLossAttached(
+	const batch = await listSpecLossAttached(
 		narratorId,
 		limits.attachedChecked,
 		attachState.checked.get(narratorId) ?? null,
 	);
-	const last = page[page.length - 1];
-	// A full page: the next call goes on after it. Otherwise it starts over.
-	if (last && page.length === limits.attachedChecked)
+	const last = batch[batch.length - 1];
+	// A full batch: the next call goes on after it. Otherwise it starts over.
+	if (last && batch.length === limits.attachedChecked)
 		attachState.checked.set(narratorId, { createdAt: last.createdAt, id: last.id });
 	else attachState.checked.delete(narratorId);
-	const attached = page.filter(
-		(entry): entry is (typeof page)[number] & { blockId: string } => entry.blockId !== null,
+	const attached = batch.filter(
+		(entry): entry is (typeof batch)[number] & { blockId: string } => entry.blockId !== null,
 	);
 	let reopened = 0;
 	for (let i = 0; i < attached.length; i += 100) {
@@ -640,7 +657,7 @@ export async function attachSpecLossForSession(
 		}
 		attachState.failures.delete(narratorId);
 		if (run.attached > 0)
-			logger.info("Possibly lost Dynamic Spec content attached to its imported pages", {
+			logger.info("Possibly lost Dynamic Spec content attached to its imported blocks", {
 				narratorId,
 				...run,
 			});

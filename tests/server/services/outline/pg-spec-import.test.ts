@@ -320,7 +320,7 @@ describe("PostgreSQL Dynamic Spec import", () => {
 			]);
 			expect(outcome.protector).toBe("user");
 			expect(outcome.pageHasMain).toBe(true);
-			expect(outcome.imported).toMatchObject({ status: "imported", tasks: 4, pages: 2 });
+			expect(outcome.imported).toMatchObject({ status: "imported", tasks: 4, notes: 2 });
 			expect(outcome.again).toEqual({ status: "skipped", reason: "outline" });
 			expect(outcome.subOutcome).toEqual({ status: "skipped", reason: "subagent" });
 			expect(outcome.passImported).toBe(1);

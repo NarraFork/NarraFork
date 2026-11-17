@@ -30,7 +30,8 @@ import {
 	comparePaths,
 	decodeTaskCursor,
 	encodeTaskCursor,
-	OUTLINE_PLUGIN_TASK_LIMITS,
+	type SessionTaskCursor,
+	walkSessionTasks,
 } from "../outline/plugin-tasks";
 import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
@@ -378,9 +379,9 @@ describe("tasks_read", () => {
 		);
 	});
 
-	test("a read stops at its page budget and the cursor continues past the last page read", async () => {
+	test("a read stops at its row budget and the cursor continues after the last block it saw", async () => {
 		const id = await session();
-		for (let i = 0; i < OUTLINE_PLUGIN_TASK_LIMITS.pagesPerRead + 5; i += 150) {
+		for (let i = 0; i < 305; i += 150) {
 			await human(
 				id,
 				Array.from({ length: 150 }, (_, n) => ({
@@ -393,28 +394,42 @@ describe("tasks_read", () => {
 		await human(id, [
 			{ op: "insert", parent: null, content: "Late task", task: { status: "todo" } },
 		]);
-		const first = await ok<{ tasks: unknown[]; nextCursor: string | null }>("tasks_read", {
-			narratorId: id,
-		});
-		expect(first.tasks).toEqual([]);
-		expect(first.nextCursor).not.toBeNull();
+		const space = await ensureSessionSpace(id);
+		// A budget of 120 rows: the read stops among the notes and says where it stopped.
+		const first = await walkSessionTasks(space, { limit: 50, budget: { rows: 120 } });
+		expect(first).toMatchObject({ tasks: [], cut: true });
+		expect(first.next?.blockId).toBeString();
+		// Through the command: the cursor it hands out goes on from there.
 		const second = await ok<{ tasks: Array<{ text: string }>; nextCursor: string | null }>(
 			"tasks_read",
-			{ narratorId: id, cursor: first.nextCursor },
+			{ narratorId: id, cursor: encodeTaskCursor(first.next as SessionTaskCursor) },
 		);
 		expect(second.tasks.map((t) => t.text)).toEqual(["Late task"]);
 		expect(second.nextCursor).toBeNull();
+		// A read budget of one statement at a time still gets there, a little each call.
+		let cursor: SessionTaskCursor | null = null;
+		let found: string[] = [];
+		for (let calls = 0; calls < 20 && found.length === 0; calls++) {
+			const walk = await walkSessionTasks(space, { cursor, limit: 50, budget: { reads: 1 } });
+			found = walk.tasks.map((t) => t.id);
+			cursor = walk.next;
+			if (!walk.cut) break;
+		}
+		expect(found).toHaveLength(1);
 	});
 
-	test("positions compare in document order; a cursor is its page and task, round trip", () => {
-		const page: [string, string] = ["a0", "page1"];
-		const under = [page, ["a0", "x"] as [string, string]];
-		expect(comparePaths([page], under)).toBeLessThan(0);
-		expect(comparePaths(under, [["a1", "page0"]])).toBeLessThan(0);
-		const cursor = encodeTaskCursor({ page, blockId: "abcdefgh" });
+	test("positions compare in document order; a cursor is its top-level step and block, round trip", () => {
+		const top: [string, string] = ["a0", "top1"];
+		const under = [top, ["a0", "x"] as [string, string]];
+		expect(comparePaths([top], under)).toBeLessThan(0);
+		expect(comparePaths(under, [["a1", "top0"]])).toBeLessThan(0);
+		const cursor = encodeTaskCursor({ top, blockId: "abcdefgh" });
 		expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
-		expect(decodeTaskCursor(cursor)).toEqual({ page, blockId: "abcdefgh" });
-		expect(decodeTaskCursor(encodeTaskCursor({ page }))).toEqual({ page });
+		expect(decodeTaskCursor(cursor)).toEqual({ top, blockId: "abcdefgh" });
+		expect(decodeTaskCursor(encodeTaskCursor({ top }))).toEqual({ top });
+		// A cursor handed out before pages went has the same text.
+		const before = Buffer.from(JSON.stringify({ p: top, b: "abcdefgh" })).toString("base64url");
+		expect(decodeTaskCursor(before)).toEqual({ top, blockId: "abcdefgh" });
 	});
 
 	test("a cursor stays small however deep the task (review N4)", async () => {

@@ -17,20 +17,23 @@
  *      {@link SPEC_IMPORT_LIMITS.files} files or {@link SPEC_IMPORT_LIMITS.totalChars} characters
  *      is not imported (needs attention). History is not imported: the current state only.
  *   2. Takes away what an earlier, unfinished attempt wrote from a source that changed since
- *      (the import's short ids of another revision; see `plan.ts`; on the behavior page, the
- *      blocks of another fence text). Only what nobody but the import ever wrote: when a block
+ *      (the import's short ids of another revision; see `plan.ts`; under the behavior boundary,
+ *      the blocks of another fence text). Only what nobody but the import ever wrote: when a block
  *      someone added to, moved or edited (at any time) is among them, nothing is taken away or
  *      written, and the session is not moved until a person looks (needs attention).
- *   3. Notes: every file but `tasks.json` and `behavior_fence` becomes a page (`plan.ts`), its
- *      text converted on the background text worker, as it is (nothing is scanned or repaired).
- *   4. Tasks: `tasks.json` onto the session's task page, in order, then the notes under them.
+ *   3. Notes: every file but `tasks.json` and `behavior_fence` becomes a top-level block
+ *      (`plan.ts`), its text converted on the background text worker, as it is (nothing is
+ *      scanned or repaired), under it however large, in as many bounded commits as it takes.
+ *   4. Tasks: `tasks.json` into the session's task list (`session/tasks`), in order, then the
+ *      notes under them.
  *      What is in progress is written to do: nothing is claimed before the move. A task of an
  *      earlier attempt that the import itself deleted or left drifted is brought back or set
  *      again; one anyone else deleted or changed is left as they left it (step 5 then fails on
  *      it), so no import version hides their change.
  *   5. Verifies the tasks one by one against the source (count, order, text, checkbox, created
  *      by a person, lock, notes). A mismatch moves nothing (needs attention).
- *   6. The behavior fence, once all of the above holds: its own text onto the behavior page with
+ *   6. The behavior fence, once all of the above holds: its own text under the behavior boundary
+ *      (`session/behavior`) with
  *      PR 4's short ids, its plugin SOP whole as that plugin's block (`pluginRulesSid`), so the
  *      session's first run as an outline session and the plugin's later updates find them.
  *   7. Reads the file pointers again: a source that changed since step 1 moves nothing (the next
@@ -78,14 +81,18 @@ import {
 import { writeImportedFenceSop } from "../../task-source/outline-plugin-rules";
 import { outlineAccessBackend } from "../access-reads";
 import { OUTLINE_EDIT_TEXT_LIMITS, processBackgroundText } from "../edit-text-runner";
+import { OutlineWriteError } from "../errors";
 import { isOutlineEnabled } from "../feature";
 import { forgetSpecImportLeftover } from "../lease-keeper";
-import { OUTLINE_TASKS_PAGE_ALIAS } from "../model";
+import { OUTLINE_LIMITS, OUTLINE_TASKS_PAGE_ALIAS } from "../model";
 import { OUTLINE_TASKS_LIST_TITLE } from "../person-tasks";
 import { PluginTaskError, pluginBlockedNoteSid } from "../plugin-tasks";
 import { yieldToEventLoop } from "../session-scope";
 import { outlineStore } from "../store";
+import type { OutlineLevelCursor } from "../store/history-port";
 import type { OutlineBlockMeta, OutlineCommitRow, OutlineSpaceRow } from "../store/port";
+import { OutlineStaleWriteError } from "../store/port";
+import { findTasksBlock } from "../well-known";
 import {
 	type OutlineBlockRef,
 	type OutlineCanonicalContent,
@@ -138,23 +145,45 @@ export const SPEC_IMPORT_LIMITS = {
 	bytesPerCommit: 96 * 1024,
 	/** Short ids one lookup of what is in the space already asks for. */
 	sidLookup: 400,
-	/** Stale blocks of an earlier attempt one commit deletes (tasks; a page goes alone). */
-	staleDeletesPerCommit: 20,
-	/** Pages of the session space looked at for an earlier attempt's pages. */
-	stalePages: 500,
-	/** Children of the task page (and of the index page) looked at likewise. */
+	/** Stale blocks of an earlier attempt one commit deletes at most (the write path's limit). */
+	staleDeletesPerCommit: OUTLINE_LIMITS.maxOps,
+	/**
+	 * Blocks one commit of the stale removal deletes, with everything under them: a stale file
+	 * block larger than this goes in several commits, from the bottom up (the write path takes
+	 * 2,000 rows a commit, links included).
+	 */
+	staleDeleteBlocks: 1000,
+	/**
+	 * Top-level blocks of the session space looked at for an earlier attempt's file blocks, a
+	 * level read at a time; a space holding more needs attention (`stale_limit`), never an import
+	 * that leaves old content behind.
+	 */
+	staleTopLevel: 5000,
+	/** Children of the index block looked at likewise (a level of up to 2,000, and groups). */
+	staleIndexChildren: 5000,
+	/** Rows of one level read at a time by those scans. */
+	staleLevelRead: 200,
+	/** Children under the behavior boundary looked at for an earlier fence text's blocks. */
 	staleChildren: 1000,
-	/** Blocks of one stale subtree read to see who wrote them; more: kept (attention). */
-	staleSubtreeBlocks: 1600,
-	/** Distinct commits of one stale subtree looked up; more: kept (attention). */
-	staleCommits: 200,
-	/** Versions of one block read to see who ever wrote it; more: kept (attention). */
-	staleVersionsPerBlock: 64,
-	/** Versions of one stale subtree (or page) read in all; more: kept (attention). */
-	staleVersions: 4000,
+	/** Live blocks of one stale subtree read to plan its removal; more: kept (attention). */
+	staleSubtreeBlocks: 20_000,
+	/**
+	 * Distinct commits that changed anything ever under one stale block (its change marks above
+	 * the history floor) looked up; more: kept (attention).
+	 */
+	staleCommits: 1000,
+	/** Versions of a stale block itself read (its own changes are not marks); more: kept. */
+	staleRootVersions: 64,
+	/** Tries of one delete commit refused because the space moved on (each checked again). */
+	staleWriteTries: 50,
+	/** Children of the task list looked at for an earlier attempt's tasks, a level at a time. */
+	staleTaskChildren: 5000,
 	/** Characters of a failure kept for the Spec panel. */
 	errorChars: 300,
 } as const;
+
+/** Part pages of a file an attempt before pages went may have left (`sp<tag>p<n>`), looked for. */
+const SPEC_IMPORT_LEGACY_PARTS = 256;
 
 /** `admin`: an administrator's re-import (the only trigger that moves a moved-back session). */
 export type SpecImportTrigger = "run" | "sweep" | "manual" | "admin";
@@ -182,7 +211,8 @@ export type SpecImportOutcome =
 	| {
 			status: "imported";
 			tasks: number;
-			pages: number;
+			/** Files imported as notes (one top-level block each). */
+			notes: number;
 			/** Files whose current revision cannot be read (a fork whose parent is gone). */
 			unreadable: number;
 			commits: number;
@@ -221,7 +251,8 @@ export interface SpecImportRecord {
 	/** The same, as the Spec panel says it in the reader's language. */
 	reason?: OutlineSpecImportReason;
 	tasks?: number;
-	pages?: number;
+	/** Files imported as notes (one top-level block each). */
+	notes?: number;
 }
 
 /**
@@ -250,7 +281,7 @@ function recordOf(state: SpecImportState): SpecImportRecord | null {
 		...(state.error ? { error: state.error } : {}),
 		...(state.reason ? { reason: state.reason } : {}),
 		...(state.tasks !== null ? { tasks: state.tasks } : {}),
-		...(state.pages !== null ? { pages: state.pages } : {}),
+		...(state.notes !== null ? { notes: state.notes } : {}),
 	};
 }
 
@@ -316,6 +347,14 @@ class SpecImportRetry extends Error {
 		super(message);
 	}
 }
+
+/**
+ * An attempt that waits for something outside the session, not a failure (A3 review 2): the
+ * session space's history is still being converted, or it kept changing under the removal of an
+ * earlier attempt's blocks. Recorded as `busy`, like a pause, counting nothing against the
+ * session: the next attempt goes on.
+ */
+class SpecImportWait extends Error {}
 
 /**
  * The reason an idle trigger aborts an import with: it gave way to the session (its time budget
@@ -434,7 +473,7 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 			narratorId,
 			trigger: options.trigger,
 			tasks: outcome.tasks,
-			pages: outcome.pages,
+			notes: outcome.notes,
 			commits: outcome.commits,
 			unreadable: outcome.unreadable,
 			movedForward: outcome.movedForward,
@@ -443,6 +482,15 @@ async function attempt(narratorId: string, options: SpecImportOptions): Promise<
 		const { movedForward: _, ...result } = outcome;
 		return result;
 	} catch (error) {
+		if (error instanceof SpecImportWait) {
+			await persistBusy(narratorId, options.trigger, null);
+			logImportOutcome("info", "Dynamic Spec import waits; the next attempt goes on", {
+				narratorId,
+				trigger: options.trigger,
+				why: error.message,
+			});
+			return { status: "busy" };
+		}
 		if (
 			error instanceof SpecImportPaused ||
 			(options.signal?.aborted === true && options.signal.reason instanceof SpecImportPaused)
@@ -530,7 +578,7 @@ interface Context {
 	commits: number;
 	/**
 	 * The session was moved back to Dynamic Spec since its last switch (12b2 review S3): its
-	 * fence's plugin SOP may have changed there, so it replaces the plugin's block on the page.
+	 * fence's plugin SOP may have changed there, so it replaces the plugin's block.
 	 */
 	afterRevert: boolean;
 }
@@ -538,7 +586,7 @@ interface Context {
 /** What the steps before the move leave for it. */
 interface Written {
 	tasks: number;
-	pages: number;
+	notes: number;
 	/** Tasks the move starts (block ids): in progress in the source, to do until then. */
 	start: string[];
 }
@@ -572,7 +620,7 @@ async function run(
 		previous.revertSourceKey === specPointersDigest(pointers);
 	let written: Written = {
 		tasks: movedForward ? (previous?.tasks ?? 0) : 0,
-		pages: movedForward ? (previous?.pages ?? 0) : 0,
+		notes: movedForward ? (previous?.notes ?? 0) : 0,
 		start: [],
 	};
 	let ctx: Context | null = null;
@@ -632,7 +680,7 @@ async function run(
 		previous,
 		fenceRevisionId: files.find((p) => p.path === "behavior_fence")?.revisionId ?? null,
 		tasks: written.tasks,
-		pages: written.pages,
+		notes: written.notes,
 		// Nothing to tell a session that never wrote to Dynamic Spec.
 		notice: files.length > 0,
 	});
@@ -642,7 +690,7 @@ async function run(
 	return {
 		status: "imported",
 		tasks: written.tasks,
-		pages: written.pages,
+		notes: written.notes,
 		unreadable,
 		commits: ctx?.commits ?? 0,
 		movedForward,
@@ -662,20 +710,19 @@ async function recordSwitch(
 		previous: SpecImportState | null;
 		fenceRevisionId: string | null;
 		tasks: number;
-		pages: number;
+		notes: number;
 		notice: boolean;
 	},
 ): Promise<void> {
 	const { narratorId } = session;
 	let spaceId = landed.ctx?.space.id ?? landed.previous?.spaceId ?? null;
-	let taskPageId = landed.previous?.taskPageId ?? null;
+	let taskBlockId = landed.previous?.taskBlockId ?? null;
 	try {
 		const space =
 			landed.ctx?.space ?? (await outlineStore.findSpace({ kind: "session", narratorId }));
 		if (space) {
 			spaceId = space.id;
-			const [page] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-			taskPageId = page?.id ?? null;
+			taskBlockId = (await findTasksBlock(space.id))?.id ?? null;
 		}
 	} catch (error) {
 		logger.warn("Could not read where an imported session's tasks landed", {
@@ -696,10 +743,10 @@ async function recordSwitch(
 			switchedAt: new Date().toISOString(),
 			noticeSwitch: landed.notice ? (current?.noticeSwitch ?? 0) : switchCount,
 			spaceId,
-			taskPageId,
+			taskBlockId,
 			fenceRevisionId: landed.fenceRevisionId,
 			tasks: landed.tasks,
-			pages: landed.pages,
+			notes: landed.notes,
 			revertSourceKey: null,
 			revertNoteIds: [],
 		};
@@ -724,7 +771,7 @@ async function removeRevertNotes(
 		);
 		const removable: OutlineBlockMeta[] = [];
 		for (const meta of metas)
-			if (await onlyImportWrote(space, { id: meta.id, versionSeq: meta.versionSeq, page: false }))
+			if ((await onlyImportWrote(space, { id: meta.id, versionSeq: meta.versionSeq })) !== null)
 				removable.push(meta);
 		if (removable.length === 0) return;
 		const locale: Locale = session.ownerUserId
@@ -851,7 +898,7 @@ async function afterMove(session: SpecImportSession, options: SpecImportOptions)
 		});
 	}
 	// The old fence still holds what step 5 copied: emptied through the paths that own it (PR 4's
-	// import finds its text on the page and leaves only the SOP; 12a's move finds the plugin's
+	// import finds its text under the behavior boundary and leaves only the SOP; 12a's move finds the plugin's
 	// block and drops the SOP), so nothing shows twice. They never reject. Dynamic Spec is
 	// written through the SQLite handle only: on PostgreSQL the old fence stays as it is.
 	if (outlineAccessBackend() === "sqlite") {
@@ -911,7 +958,7 @@ async function writeEverything(
 				protected: task.protected === true,
 			}));
 		} catch {
-			// Written before tasks.json was validated: kept as a page, the session not moved.
+			// Written before tasks.json was validated: kept as notes, the session not moved.
 			brokenTasks = content;
 		}
 		if (tasks) {
@@ -941,8 +988,8 @@ async function writeEverything(
 	}
 
 	// What an earlier attempt wrote from another source goes first (step 2).
-	// An empty `index.md` (the built-in file every namespace starts with) is no page: the page
-	// the compatibility layer would write for it holds nothing.
+	// An empty `index.md` (the built-in file every namespace starts with) is not imported: the
+	// block the compatibility layer would write for it holds nothing.
 	const notePointers: Array<SpecImportFilePointer & { revisionId: string }> = notes.flatMap((p) =>
 		p.revisionId && !(p.path === "index.md" && (p.chars ?? 0) === 0)
 			? [{ ...p, revisionId: p.revisionId }]
@@ -962,7 +1009,7 @@ async function writeEverything(
 
 	// Notes: a few files' contents read at a time, each converted and written before the next, so
 	// the converted blocks of one file are held at a time, never the whole session's.
-	let pages = 0;
+	let notesWritten = 0;
 	const writeFile = async (path: string, revisionId: string, text: string) => {
 		giveWay(ctx);
 		const converted = await processBackgroundText(
@@ -980,10 +1027,13 @@ async function writeEverything(
 			revisionId,
 			blocks: converted.blocks,
 			locale,
-			...(path === "index.md" ? { pageSid: specIndexSid() } : {}),
+			...(path === "index.md" ? { rootSid: specIndexSid() } : {}),
 		});
-		pages += plan.pageSids.length;
-		await writeNodes(ctx, plan.nodes, null, SPEC_IMPORT_TEXT[locale].summaryNotes(path));
+		notesWritten++;
+		await writeNodes(ctx, plan.nodes, null, SPEC_IMPORT_TEXT[locale].summaryNotes(path), {
+			relocate: true,
+		});
+		await tidyLegacyParts(ctx, path, plan.rootSid);
 	};
 	for (const batch of contentBatches(notePointers)) {
 		const contents = await readSpecRevisionContents(batch.map((p) => p.revisionId));
@@ -995,18 +1045,18 @@ async function writeEverything(
 
 	let start: string[] = [];
 	if (taskPlan && taskPlan.tasks.length > 0) {
-		const pageId = await ensureTasksPage(ctx);
+		const listId = await ensureTasksBlock(ctx);
 		const summary = SPEC_IMPORT_TEXT[locale].summaryTasks(taskPlan.tasks.length);
-		await writeNodes(ctx, taskPlan.tasks, { id: pageId }, summary, { heal: true });
+		await writeNodes(ctx, taskPlan.tasks, { id: listId }, summary, { heal: true });
 		await writeNodes(ctx, taskPlan.notes, null, summary);
-		start = await verifyTasks(ctx, taskPlan.expected, pageId);
+		start = await verifyTasks(ctx, taskPlan.expected, listId);
 	}
 	if (brokenTasks !== null)
 		throw new SpecImportAttention(
-			"tasks.json is not a valid task list: it was imported as a page, the session was not moved",
+			"tasks.json is not a valid task list: it was imported as notes, the session was not moved",
 			{ code: "broken_tasks" },
 		);
-	// Step 6, once everything above holds: the fence text goes onto the behavior page last, so an
+	// Step 6, once everything above holds: the fence text goes under the behavior boundary last, so an
 	// attempt that does not get this far leaves nothing of a fence that may still change.
 	if (fence?.own)
 		await importBehaviorFenceText(narratorId, locale, fence.own, { signal: ctx.signal });
@@ -1026,7 +1076,7 @@ async function writeEverything(
 			throw error;
 		}
 	}
-	return { tasks: taskPlan?.tasks.length ?? 0, pages, start };
+	return { tasks: taskPlan?.tasks.length ?? 0, notes: notesWritten, start };
 }
 
 function contentBatches<T extends { chars: number | null }>(files: readonly T[]): T[][] {
@@ -1087,7 +1137,7 @@ async function commit(
 	ops: OutlineOp[],
 	canonical: Array<OutlineCanonicalContent | null>,
 	summary: string,
-	options: { ignoreSignal?: boolean } = {},
+	options: { ignoreSignal?: boolean; expectNextSeq?: number } = {},
 ) {
 	if (!options.ignoreSignal) {
 		ctx.signal?.throwIfAborted();
@@ -1103,7 +1153,11 @@ async function commit(
 			narratorId: ctx.session.narratorId,
 			summary,
 		},
-		{ kind: "import", canonical },
+		{
+			kind: "import",
+			canonical,
+			...(options.expectNextSeq !== undefined ? { expectNextSeq: options.expectNextSeq } : {}),
+		},
 	);
 	if (result.commit) ctx.commits++;
 	const elapsed = performance.now() - started;
@@ -1125,20 +1179,25 @@ function giveWay(ctx: Context): void {
 
 /**
  * Write the nodes that are not in the space yet, parents first, in as many commits as the limits
- * need. A node with no parent hangs from `root` (null: it is a page). What is there already is
+ * need. A node with no parent hangs from `root` (null: the top level). What is there already is
  * skipped, and so is everything under a block deleted since (a person's choice), unless `heal`:
  * then a deleted block is brought back and a task that drifted from its plan is set again (the
  * tasks, which must be all there for the session to move), but only when its current version is
  * the import's own (12b review r2 SF2): what anyone else changed is left as they left it, so the
  * verification that follows fails on it (needs attention) instead of an import version hiding
  * it, which a later attempt would then delete as only the import's.
+ *
+ * `relocate` (a file's blocks): a block that is there already under another parent than the plan
+ * says, and that only the import ever wrote, is moved where the plan puts it, in plan order (an
+ * attempt cut short before pages went left a file over several pages: its blocks join the file's
+ * one block). One someone else wrote stays where it is.
  */
 async function writeNodes(
 	ctx: Context,
 	nodes: readonly SpecImportNode[],
 	root: OutlineBlockRef | null,
 	summary: string,
-	options: { heal?: boolean } = {},
+	options: { heal?: boolean; relocate?: boolean } = {},
 ): Promise<void> {
 	if (nodes.length === 0) return;
 	const existing = await existingBySid(
@@ -1146,6 +1205,23 @@ async function writeNodes(
 		nodes.map((node) => node.sid),
 	);
 	const healable = options.heal ? await importVersions(ctx.space, nodes, existing) : new Set();
+	const plannedParentId = (node: SpecImportNode): string | null | undefined => {
+		if (node.parentSid === null) return undefined;
+		const parent = existing.get(node.parentSid);
+		return parent && !parent.deleted ? parent.id : null;
+	};
+	const movable = options.relocate
+		? await onlyImportVersions(
+				ctx.space,
+				nodes.flatMap((node) => {
+					const found = existing.get(node.sid);
+					const planned = plannedParentId(node);
+					return found && !found.deleted && planned !== undefined && found.parentId !== planned
+						? [found.id]
+						: [];
+				}),
+			)
+		: new Set<string>();
 	const skipped = new Set<string>();
 	let ops: OutlineOp[] = [];
 	let canonical: Array<OutlineCanonicalContent | null> = [];
@@ -1194,6 +1270,12 @@ async function writeNodes(
 				content: node.content,
 				...(node.task ? { task: node.task } : {}),
 			};
+		} else if (
+			movable.has(found.id) &&
+			parent !== null &&
+			!("id" in parent && parent.id === found.parentId)
+		) {
+			op = { op: "move", block: { id: found.id }, parent };
 		} else if (options.heal && node.task && drifted(found, node) && healable.has(found.id)) {
 			op = {
 				op: "setTask",
@@ -1202,7 +1284,8 @@ async function writeNodes(
 			};
 		}
 		if (!op) continue;
-		const size = op.op === "setTask" ? 0 : Buffer.byteLength(node.content, "utf8");
+		const size =
+			op.op === "setTask" || op.op === "move" ? 0 : Buffer.byteLength(node.content, "utf8");
 		if (
 			ops.length >= SPEC_IMPORT_LIMITS.opsPerCommit ||
 			(ops.length > 0 && bytes + size > SPEC_IMPORT_LIMITS.bytesPerCommit)
@@ -1213,12 +1296,99 @@ async function writeNodes(
 		}
 		ops.push(op);
 		canonical.push(
-			op.op !== "setTask" && node.links ? { content: node.content, links: node.links } : null,
+			op.op !== "setTask" && op.op !== "move" && node.links
+				? { content: node.content, links: node.links }
+				: null,
 		);
 		if (op.op === "insert") inCommit.add(node.sid);
 		bytes += size;
 	}
 	await flush();
+}
+
+/**
+ * Of the given blocks, those every version of which one of the import's own commits wrote
+ * (bounded: at most {@link SPEC_IMPORT_LIMITS.staleRootVersions} versions a block, more: not one
+ * of them; commits looked up 100 seqs at a time).
+ */
+async function onlyImportVersions(
+	space: OutlineSpaceRow,
+	ids: readonly string[],
+): Promise<Set<string>> {
+	const out = new Set<string>();
+	if (ids.length === 0) return out;
+	const seqsOf = new Map<string, number[]>();
+	for (const [n, id] of ids.entries()) {
+		const versions = await outlineStore.listBlockVersions(
+			id,
+			SPEC_IMPORT_LIMITS.staleRootVersions + 1,
+		);
+		if (versions.length <= SPEC_IMPORT_LIMITS.staleRootVersions)
+			seqsOf.set(
+				id,
+				versions.map((v) => v.fromSeq),
+			);
+		if (n % 200 === 199) await yieldToEventLoop();
+	}
+	const wanted = [...new Set([...seqsOf.values()].flat())];
+	const ours = new Set<number>();
+	for (let i = 0; i < wanted.length; i += 100)
+		for (const row of await outlineStore.getCommitsBySeqs(space.id, wanted.slice(i, i + 100)))
+			if (isImportCommit(row)) ours.add(row.seq);
+	for (const [id, seqs] of seqsOf) if (seqs.every((seq) => ours.has(seq))) out.add(id);
+	return out;
+}
+
+/**
+ * After a file's blocks are written: what an attempt cut short before pages went left of the
+ * file's layout then. Its part pages (`sp<tag>p<n>`, the file over several pages) go once
+ * nothing is under them and only the import wrote them; the file's block, titled as the first
+ * part (`name (1/2)`), gets the file's path back, when only the import wrote it.
+ */
+async function tidyLegacyParts(ctx: Context, path: string, rootSid: string): Promise<void> {
+	const tag = fileTagOfSid(rootSid);
+	if (!rootSid.startsWith("sp") || rootSid !== `sp${tag}`) return;
+	const partSids = Array.from(
+		{ length: SPEC_IMPORT_LEGACY_PARTS },
+		(_, n) => `sp${tag}p${(n + 1).toString(36)}`,
+	);
+	// Best effort, and checked like any stale removal: what lands meanwhile makes it read again.
+	for (let tries = 0; tries < 3; tries++) {
+		const checkedAt = await outlineStore.getSpace(ctx.space.id);
+		if (!checkedAt) return;
+		const parts = (await outlineStore.getBlockMetas(ctx.space.id, { sids: partSids })).filter(
+			(meta) => !meta.deleted,
+		);
+		const ops: OutlineOp[] = [];
+		for (const part of parts) {
+			if ((await outlineStore.listChildMetas(ctx.space.id, [part.id], 1)).length > 0) continue;
+			// The owner rule: nobody but the import ever touched it or anything once under it.
+			if ((await onlyImportWrote(ctx.space, part)) === null) continue;
+			ops.push({ op: "delete", block: { id: part.id }, baseVersionSeq: part.versionSeq });
+		}
+		const [root] = await outlineStore.getBlockMetas(ctx.space.id, { sids: [rootSid] });
+		const rootRow = root && !root.deleted ? await outlineStore.getBlock(root.id) : null;
+		if (root && rootRow && rootRow.content !== path && (await onlyImportWrote(ctx.space, root)))
+			ops.push({
+				op: "update",
+				block: { id: root.id },
+				content: path,
+				baseVersionSeq: root.versionSeq,
+			});
+		if (ops.length === 0) return;
+		try {
+			await commit(
+				ctx,
+				ops,
+				ops.map(() => null),
+				SPEC_IMPORT_TEXT[ctx.locale].summaryNotes(path),
+				{ expectNextSeq: checkedAt.nextSeq },
+			);
+			return;
+		} catch (error) {
+			if (!(error instanceof OutlineStaleWriteError)) throw error;
+		}
+	}
 }
 
 /**
@@ -1259,9 +1429,20 @@ function drifted(found: OutlineBlockMeta, node: SpecImportNode): boolean {
 	return !status || (now.humanCreated === true) !== (node.task.humanCreated === true);
 }
 
-async function ensureTasksPage(ctx: Context): Promise<string> {
+/**
+ * The session's task list (`session/tasks`, A1's well-known block), made at the top level when
+ * there is none. An alias `tasks` held by a block that is not at the top level names no task list
+ * (`well-known.ts`), and the alias cannot be given twice: the import then needs a person.
+ */
+async function ensureTasksBlock(ctx: Context): Promise<string> {
+	const list = await findTasksBlock(ctx.space.id);
+	if (list) return list.id;
 	const [owner] = await outlineStore.findAliasOwners(ctx.space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-	if (owner) return owner.id;
+	if (owner)
+		throw new SpecImportAttention(
+			"The block that holds the alias tasks in the session space is not at its top level, so the session has no task list to import into: move it to the top level (or remove its alias), then import again",
+			{ code: "other" },
+		);
 	const result = await commit(
 		ctx,
 		[
@@ -1273,11 +1454,11 @@ async function ensureTasksPage(ctx: Context): Promise<string> {
 			},
 		],
 		[null],
-		SPEC_IMPORT_TEXT[ctx.locale].summaryTasksPage,
+		SPEC_IMPORT_TEXT[ctx.locale].summaryTasksBlock,
 	);
-	const pageId = result.results[0]?.blockId;
-	if (!pageId) throw new Error("the import could not create the task page");
-	return pageId;
+	const listId = result.results[0]?.blockId;
+	if (!listId) throw new Error("the import could not create the task list");
+	return listId;
 }
 
 /** The actors whose commits are the import's own: this import, and PR 4's fence import it calls. */
@@ -1286,29 +1467,69 @@ const IMPORT_ACTORS: ReadonlySet<string> = new Set([
 	OUTLINE_BEHAVIOR_IMPORT_ACTOR,
 	// The markers a move back to Dynamic Spec left (12b2).
 	OUTLINE_SPEC_REVERT_ACTOR,
-	// Possibly lost content attached to an imported page (12c, `loss-attach.ts`): it is kept in
-	// its finding and attached anew to the page of the file's new revision, so a page it sits on
-	// is still the import's to take away.
+	// Possibly lost content attached to an imported file block (12c, `loss-attach.ts`): it is
+	// kept in its finding and attached anew to the block of the file's new revision, so a stale
+	// block it sits under is still the import's to take away.
 	OUTLINE_SPEC_LOSS_ACTOR,
 ]);
 
 interface StaleBlock {
 	id: string;
 	versionSeq: number;
-	/** A page (deleted in a commit of its own, read whole); else a block and what is under it. */
-	page: boolean;
+}
+
+/** A live block under a stale block (or the stale block itself: `parentId` null here). */
+interface StaleNode {
+	id: string;
+	parentId: string | null;
+	versionSeq: number;
+}
+
+/** A scan that reached its limit with more to look at: the import does not go on blind. */
+function staleLimit(count: number): SpecImportAttention {
+	return new SpecImportAttention(
+		`An earlier, unfinished import may have left more than ${count} blocks to look through: nothing was taken away or written`,
+		{ code: "stale_limit", count },
+	);
+}
+
+/**
+ * The children of one parent (null: the top level) a level read at a time, at most `max`; a
+ * level that goes on past it needs attention.
+ */
+async function readLevelWhole(
+	space: OutlineSpaceRow,
+	parentId: string | null,
+	max: number,
+): Promise<Array<{ id: string; sid: string; versionSeq: number }>> {
+	const out: Array<{ id: string; sid: string; versionSeq: number }> = [];
+	let after: OutlineLevelCursor | null = null;
+	for (;;) {
+		const level = await outlineStore.listLevel(space.id, parentId, {
+			asOf: null,
+			after,
+			limit: SPEC_IMPORT_LIMITS.staleLevelRead,
+		});
+		out.push(...level.rows);
+		if (!level.next) return out;
+		if (out.length >= max) throw staleLimit(max);
+		after = level.next;
+	}
 }
 
 /**
  * Take away what an earlier attempt wrote from a source that is not the one read now: the
- * import's tasks of another `tasks.json` revision on the task page (their notes go with them),
- * its pages of other file revisions (the `index.md` page when that file is gone), its blocks of
- * another `index.md` revision on the index page, and on the behavior page its blocks of another
- * fence text. Only the import's own short ids are looked at, only before the session is moved,
- * and only what nobody else ever wrote is taken away: when any stale block holds what someone
- * added, moved there or edited ({@link onlyImportWrote}), nothing is taken away or written and
- * the attempt needs attention (`kept_blocks`), so the space shows the kept blocks and no new
- * revision beside them. Bounded reads; a page goes in a commit of its own.
+ * import's tasks of another `tasks.json` revision in the task list (their notes go with them),
+ * its top-level file blocks of other file revisions (the `index.md` block when that file is gone),
+ * its blocks and groups of another `index.md` revision under the index block, and under the
+ * behavior boundary its blocks of another fence text. Only the import's own short ids are looked
+ * at, only before the session is moved, and only what nobody else ever touched is taken away
+ * ({@link onlyImportWrote}): when any stale block was touched by anyone else, nothing is taken
+ * away or written and the attempt needs attention (`kept_blocks`), so the space shows the kept
+ * blocks and no new revision beside them. A file block someone moved off the top level is not
+ * looked for: moving it made it theirs. Bounded reads (a scan that reaches its limit needs
+ * attention, `stale_limit`); the deletes go in bounded commits that re-check before each one
+ * ({@link deleteStale}).
  */
 async function removeStale(
 	ctx: Context,
@@ -1323,64 +1544,37 @@ async function removeStale(
 ): Promise<void> {
 	const { space } = ctx;
 	const limits = SPEC_IMPORT_LIMITS;
+	// Everything up to here is what the checks below look at; what lands later is checked again
+	// before every delete.
+	const checkedUpTo = latestSeqOf(await outlineStore.getSpace(space.id));
 	const stale: StaleBlock[] = [];
-	const block = (meta: OutlineBlockMeta, page = false): StaleBlock => ({
+	const block = (meta: Pick<OutlineBlockMeta, "id" | "versionSeq">): StaleBlock => ({
 		id: meta.id,
 		versionSeq: meta.versionSeq,
-		page,
 	});
-	const [tasksPage] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-	if (tasksPage) {
-		for (const meta of await outlineStore.listLastChildMetas(
-			space.id,
-			tasksPage.id,
-			limits.staleChildren,
-		)) {
-			if (!meta.sid.startsWith("st") || !isImportSid(meta.sid)) continue;
-			if (current.taskSidPrefix === null || !meta.sid.startsWith(current.taskSidPrefix))
-				stale.push(block(meta));
+	const ofOtherFile = (sid: string) =>
+		(sid.startsWith("sb") || sid.startsWith("sp")) &&
+		isImportSid(sid) &&
+		!current.keepFileTags.has(fileTagOfSid(sid));
+	const [tasksList] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
+	if (tasksList) {
+		for (const row of await readLevelWhole(space, tasksList.id, limits.staleTaskChildren)) {
+			if (!row.sid.startsWith("st") || !isImportSid(row.sid)) continue;
+			if (current.taskSidPrefix === null || !row.sid.startsWith(current.taskSidPrefix))
+				stale.push(block(row));
 		}
 	}
 	const [index] = await outlineStore.getBlockMetas(space.id, { sids: [specIndexSid()] });
 	if (index && !index.deleted) {
-		// The file is gone: its page goes too, rather than staying behind empty.
-		if (!current.indexMd) stale.push(block(index, true));
+		// The file is gone: its block goes too, rather than staying behind empty.
+		if (!current.indexMd) stale.push(block(index));
 		else
-			for (const meta of await outlineStore.listLastChildMetas(
-				space.id,
-				index.id,
-				limits.staleChildren,
-			)) {
-				if (
-					meta.sid.startsWith("sb") &&
-					isImportSid(meta.sid) &&
-					!current.keepFileTags.has(fileTagOfSid(meta.sid))
-				)
-					stale.push(block(meta));
-			}
+			for (const row of await readLevelWhole(space, index.id, limits.staleIndexChildren))
+				if (ofOtherFile(row.sid)) stale.push(block(row));
 	}
-	const stalePages: string[] = [];
-	let after: { orderKey: string; id: string } | null = null;
-	for (let read = 0; read < limits.stalePages; ) {
-		const page = await outlineStore.listSpacePages(space.id, { after, limit: 100 });
-		for (const row of page) {
-			if (
-				row.sid.startsWith("sp") &&
-				isImportSid(row.sid) &&
-				!current.keepFileTags.has(fileTagOfSid(row.sid))
-			)
-				stalePages.push(row.id);
-		}
-		read += page.length;
-		const last = page[page.length - 1];
-		if (page.length < 100 || !last) break;
-		after = { orderKey: last.orderKey, id: last.id };
-	}
-	for (let i = 0; i < stalePages.length; i += limits.sidLookup)
-		for (const meta of await outlineStore.getBlockMetas(space.id, {
-			ids: stalePages.slice(i, i + limits.sidLookup),
-		}))
-			if (!meta.deleted) stale.push(block(meta, true));
+	// The import's file blocks of other revisions at the top level.
+	for (const row of await readLevelWhole(space, null, limits.staleTopLevel))
+		if (row.sid.startsWith("sp") && ofOtherFile(row.sid)) stale.push(block(row));
 	const behavior = await findBehaviorBlock(space.id);
 	if (behavior) {
 		for (const meta of await outlineStore.listLastChildMetas(
@@ -1393,103 +1587,266 @@ async function removeStale(
 		}
 	}
 
-	const removable: StaleBlock[] = [];
+	const removable: StaleNode[][] = [];
 	let kept = 0;
 	for (const entry of stale) {
-		if (await onlyImportWrote(space, entry)) removable.push(entry);
+		const nodes = await onlyImportWrote(space, entry);
+		if (nodes) removable.push(nodes);
 		else kept++;
 	}
 	// Before anything is written (review r2 NIT 3): an attempt that cannot move the session leaves
 	// the space as it found it, rather than the new revision's blocks beside the kept ones.
-	if (kept > 0) {
-		logger.warn("Dynamic Spec import kept blocks of an earlier attempt that others wrote to", {
-			narratorId: ctx.session.narratorId,
-			kept,
-		});
-		throw new SpecImportAttention(
-			`${kept} block(s) an earlier, unfinished import wrote hold what someone added or changed since: they were kept; move what is yours out of them (or delete them), then import again`,
-			{ code: "kept_blocks", count: kept },
-		);
-	}
-	const summary = SPEC_IMPORT_TEXT[ctx.locale].summaryStale;
-	const blocks = removable.filter((entry) => !entry.page).map((entry) => entry.id);
-	for (let i = 0; i < blocks.length; i += limits.staleDeletesPerCommit) {
-		const ids = blocks.slice(i, i + limits.staleDeletesPerCommit);
-		await commit(
-			ctx,
-			ids.map((id) => ({ op: "delete" as const, block: { id } })),
-			ids.map(() => null),
-			summary,
-		);
-	}
-	for (const entry of removable)
-		if (entry.page) await commit(ctx, [{ op: "delete", block: { id: entry.id } }], [null], summary);
+	if (kept > 0) throw keptBlocks(ctx, kept);
+	await deleteStale(ctx, removable, checkedUpTo);
+}
+
+function keptBlocks(ctx: Context, kept: number): SpecImportAttention {
+	logger.warn("Dynamic Spec import kept blocks of an earlier attempt that others wrote to", {
+		narratorId: ctx.session.narratorId,
+		kept,
+	});
+	return new SpecImportAttention(
+		`${kept} block(s) an earlier, unfinished import wrote hold what someone added or changed since: they were kept; move what is yours out of them (or delete them), then import again`,
+		{ code: "kept_blocks", count: kept },
+	);
+}
+
+function latestSeqOf(space: OutlineSpaceRow | null): number {
+	return space ? Math.max(0, space.nextSeq - 1) : 0;
 }
 
 /**
- * Whether only the import ever wrote what is under `root` now, itself included: no version of a
- * live block there was opened by any commit but the import's. A block someone added, moved there
- * or edited was not (review S2), even when the import wrote a later version over theirs (12b
- * review r2 SF2). A page is read through the versions recorded under it, so anything anyone else
- * ever wrote on the page keeps it. Bounded: at most {@link SPEC_IMPORT_LIMITS.staleSubtreeBlocks}
- * blocks read without content, {@link SPEC_IMPORT_LIMITS.staleVersionsPerBlock} versions of a
- * block and {@link SPEC_IMPORT_LIMITS.staleVersions} in all, and
- * {@link SPEC_IMPORT_LIMITS.staleCommits} commits by seq; past any, false (kept: it cannot tell).
+ * The deletes of {@link removeStale}, in bounded commits. A delete writes a row for the block and
+ * for every block under it, so each commit deletes at most
+ * {@link SPEC_IMPORT_LIMITS.staleDeleteBlocks} blocks in all (and at most
+ * {@link SPEC_IMPORT_LIMITS.staleDeletesPerCommit} operations): a stale subtree within that goes
+ * whole; a larger one goes from the bottom up, round after round, each round deleting its largest
+ * pieces that fit. A commit the write path still finds too large (links count as rows too) is
+ * split in two, and a single piece too large is planned again at half the size.
+ *
+ * NOTHING BUT WHAT WAS CHECKED. Before every commit, every stale block still there is checked
+ * again for commits by anyone else that changed anything under it (or it) since the last check
+ * (its change marks): one, and the removal stops (`kept_blocks`, what went already stays gone:
+ * nobody else had touched it). The commit is then written only while the space is still at the
+ * seq that check read (`expectNextSeq`), each delete naming the version it checked: a commit
+ * landing in between makes the write refuse, and the check runs again. So a delete never takes
+ * a block that was not in the checked subtree.
  */
-async function onlyImportWrote(space: OutlineSpaceRow, root: StaleBlock): Promise<boolean> {
+async function deleteStale(
+	ctx: Context,
+	subtrees: readonly StaleNode[][],
+	checkedUpTo: number,
+): Promise<void> {
 	const limits = SPEC_IMPORT_LIMITS;
-	const seqs = new Set<number>([root.versionSeq]);
-	let versionsRead = 0;
-	if (root.page) {
-		const { truncated } = await outlineStore.listPageStructure(root.id, {
-			asOf: null,
-			limit: limits.staleSubtreeBlocks,
-		});
-		if (truncated) return false;
-		// Every version recorded under the page, by seq: the import's commits only.
-		const pageRead = 500;
-		let afterSeq: number | undefined;
-		for (;;) {
-			const rows = await outlineStore.listPageVersions(root.id, { limit: pageRead, afterSeq });
-			versionsRead += rows.length;
-			if (versionsRead > limits.staleVersions) return false;
-			for (const row of rows) seqs.add(row.fromSeq);
-			if (seqs.size > limits.staleCommits) return false;
-			const last = rows[rows.length - 1];
-			// Rows past the last one's seq follow; the rest of its seq adds no new commit.
-			if (rows.length < pageRead || !last) break;
-			afterSeq = last.fromSeq;
-		}
-	} else {
-		const blocks = [root.id];
-		let level = [root.id];
-		while (level.length > 0) {
-			const next: string[] = [];
-			for (let i = 0; i < level.length; i += limits.sidLookup) {
-				const children = await outlineStore.listChildMetas(
-					space.id,
-					level.slice(i, i + limits.sidLookup),
-					limits.staleSubtreeBlocks - blocks.length + 1,
+	const summary = SPEC_IMPORT_TEXT[ctx.locale].summaryStale;
+	const nodeOf = new Map<string, StaleNode>();
+	for (const nodes of subtrees) for (const node of nodes) nodeOf.set(node.id, node);
+	const roots = subtrees.flatMap((nodes) => (nodes[0] ? [nodes[0].id] : []));
+	const gone = new Set<string>();
+	let verified = checkedUpTo;
+	let cap: number = limits.staleDeleteBlocks;
+
+	/** Check what landed since the last check; the space's next seq the check read. */
+	const recheck = async (): Promise<number> => {
+		const space = await outlineStore.getSpace(ctx.space.id);
+		if (!space) throw new Error("the session space is gone");
+		const latest = latestSeqOf(space);
+		if (latest > verified) {
+			for (const root of roots) {
+				if (gone.has(root)) continue;
+				const seqs = new Set(
+					await outlineStore.listSubtreeChangeSeqs(space.id, root, {
+						after: verified,
+						limit: limits.staleCommits + 1,
+					}),
 				);
-				if (blocks.length + children.length > limits.staleSubtreeBlocks) return false;
-				for (const child of children) {
-					seqs.add(child.versionSeq);
-					blocks.push(child.id);
-					next.push(child.id);
-				}
+				const own = await outlineStore.listBlockVersions(root, limits.staleRootVersions + 1);
+				if (seqs.size > limits.staleCommits || own.length > limits.staleRootVersions)
+					throw keptBlocks(ctx, 1);
+				for (const version of own) if (version.fromSeq > verified) seqs.add(version.fromSeq);
+				if (!(await allImportCommits(space, seqs))) throw keptBlocks(ctx, 1);
 			}
-			level = next;
+			verified = latest;
 		}
-		for (const id of blocks) {
-			const versions = await outlineStore.listBlockVersions(id, limits.staleVersionsPerBlock + 1);
-			if (versions.length > limits.staleVersionsPerBlock) return false;
-			versionsRead += versions.length;
-			if (versionsRead > limits.staleVersions) return false;
-			for (const version of versions) seqs.add(version.fromSeq);
-			if (seqs.size > limits.staleCommits) return false;
+		return space.nextSeq;
+	};
+
+	const tooLarge = (error: unknown) =>
+		error instanceof OutlineWriteError && error.code === "OUTLINE_TOO_MANY_ROWS";
+	/** Write one pack; false: a single piece was too large. */
+	const commitPack = async (
+		list: ReadonlyArray<{ id: string; size: number }>,
+	): Promise<boolean> => {
+		for (let tries = 1; ; tries++) {
+			const expectNextSeq = await recheck();
+			try {
+				await commit(
+					ctx,
+					list.map((piece) => ({
+						op: "delete" as const,
+						block: { id: piece.id },
+						baseVersionSeq: (nodeOf.get(piece.id) as StaleNode).versionSeq,
+					})),
+					list.map(() => null),
+					summary,
+					{ expectNextSeq },
+				);
+				for (const piece of list) gone.add(piece.id);
+				return true;
+			} catch (error) {
+				// Someone wrote meanwhile: checked again before trying again, a little later each time;
+				// a space that keeps changing makes the attempt wait for the next one.
+				if (error instanceof OutlineStaleWriteError) {
+					if (tries >= limits.staleWriteTries)
+						throw new SpecImportWait("The session space kept changing during the removal");
+					await new Promise((resolve) => setTimeout(resolve, Math.min(200, 5 * tries)));
+					continue;
+				}
+				if (!tooLarge(error)) throw error;
+				if (list.length === 1) return false;
+				const half = Math.ceil(list.length / 2);
+				return (await commitPack(list.slice(0, half))) && (await commitPack(list.slice(half)));
+			}
+		}
+	};
+
+	for (;;) {
+		const pieces = stalePieces(subtrees, gone, cap);
+		if (pieces.length === 0) return;
+		let packs: Array<Array<{ id: string; size: number }>> = [];
+		let pack: Array<{ id: string; size: number }> = [];
+		let rows = 0;
+		for (const piece of pieces) {
+			if (
+				pack.length > 0 &&
+				(pack.length >= limits.staleDeletesPerCommit || rows + piece.size > cap)
+			) {
+				packs.push(pack);
+				pack = [];
+				rows = 0;
+			}
+			pack.push(piece);
+			rows += piece.size;
+		}
+		if (pack.length > 0) packs.push(pack);
+		let fits = true;
+		for (const list of packs)
+			if (!(await commitPack(list))) {
+				fits = false;
+				break;
+			}
+		packs = [];
+		if (!fits) {
+			if (cap <= 1) throw new Error("the import could not delete a stale block in one commit");
+			cap = Math.max(1, Math.floor(cap / 2));
+		}
+		await yieldToEventLoop();
+	}
+}
+
+/**
+ * The largest pieces of the stale subtrees left (not deleted yet) whose blocks number at most
+ * `cap`: walking down from each stale block, a block whose rest fits is a piece, else its
+ * children are looked at. Linear in the blocks left: one pass to count, one to choose.
+ */
+function stalePieces(
+	subtrees: readonly StaleNode[][],
+	gone: ReadonlySet<string>,
+	cap: number,
+): Array<{ id: string; size: number }> {
+	const pieces: Array<{ id: string; size: number }> = [];
+	for (const nodes of subtrees) {
+		const root = nodes[0];
+		if (!root || gone.has(root.id)) continue;
+		const children = new Map<string, string[]>();
+		for (const node of nodes) {
+			if (node.parentId === null) continue;
+			const list = children.get(node.parentId);
+			if (list) list.push(node.id);
+			else children.set(node.parentId, [node.id]);
+		}
+		// Sizes after the fact (post order, without recursion), skipping what went.
+		const size = new Map<string, number>();
+		const order: string[] = [];
+		const stack = [root.id];
+		while (stack.length > 0) {
+			const id = stack.pop() as string;
+			if (gone.has(id)) continue;
+			order.push(id);
+			for (const child of children.get(id) ?? []) stack.push(child);
+		}
+		for (let i = order.length - 1; i >= 0; i--) {
+			const id = order[i] as string;
+			let total = 1;
+			for (const child of children.get(id) ?? []) total += size.get(child) ?? 0;
+			size.set(id, total);
+		}
+		const down = [root.id];
+		while (down.length > 0) {
+			const id = down.pop() as string;
+			if (gone.has(id)) continue;
+			const own = size.get(id) ?? 1;
+			if (own <= cap) pieces.push({ id, size: own });
+			else for (const child of children.get(id) ?? []) down.push(child);
 		}
 	}
-	return await allImportCommits(space, seqs);
+	return pieces;
+}
+
+/**
+ * Whether only the import ever touched what is or was under `root`, itself included (outline
+ * owner rule, A3 review): no commit but the import's own changed `root` or any block that was
+ * under it at the time, live or deleted since: read from the root's change marks (every commit
+ * that versioned anything under it marks it) and the root's own versions. A person who added a
+ * child and deleted it again, edited a text and put it back, moved a block in or out: kept. What
+ * happened at or below the space's history floor left no marks and is not seen (history before
+ * the conversion is not kept). The live blocks under it now, the root first, to plan the
+ * deletes (null when someone else touched it, or a bound was reached: kept, it cannot tell).
+ * Bounded: {@link SPEC_IMPORT_LIMITS.staleSubtreeBlocks} live blocks read without content, a
+ * level of {@link SPEC_IMPORT_LIMITS.sidLookup} parents at a time; at most
+ * {@link SPEC_IMPORT_LIMITS.staleCommits} commits and
+ * {@link SPEC_IMPORT_LIMITS.staleRootVersions} versions of the root.
+ */
+async function onlyImportWrote(
+	space: OutlineSpaceRow,
+	root: StaleBlock,
+): Promise<StaleNode[] | null> {
+	const limits = SPEC_IMPORT_LIMITS;
+	const state = (await outlineStore.getHistoryStates([space.id])).get(space.id);
+	if (!state?.edgesReady)
+		throw new SpecImportWait(
+			"The session space's history is being converted: the import goes on once that is done",
+		);
+	const nodes: StaleNode[] = [{ id: root.id, parentId: null, versionSeq: root.versionSeq }];
+	let level = [root.id];
+	while (level.length > 0) {
+		const next: string[] = [];
+		for (let i = 0; i < level.length; i += limits.sidLookup) {
+			const children = await outlineStore.listChildMetas(
+				space.id,
+				level.slice(i, i + limits.sidLookup),
+				limits.staleSubtreeBlocks - nodes.length + 1,
+			);
+			if (nodes.length + children.length > limits.staleSubtreeBlocks) return null;
+			for (const child of children) {
+				nodes.push({ id: child.id, parentId: child.parentId, versionSeq: child.versionSeq });
+				next.push(child.id);
+			}
+		}
+		level = next;
+		await yieldToEventLoop();
+	}
+	const seqs = new Set(
+		await outlineStore.listSubtreeChangeSeqs(space.id, root.id, {
+			limit: limits.staleCommits + 1,
+		}),
+	);
+	if (seqs.size > limits.staleCommits) return null;
+	const own = await outlineStore.listBlockVersions(root.id, limits.staleRootVersions + 1);
+	if (own.length > limits.staleRootVersions) return null;
+	for (const version of own) if (version.fromSeq > state.floorSeq) seqs.add(version.fromSeq);
+	if (seqs.size > limits.staleCommits) return null;
+	return (await allImportCommits(space, seqs)) ? nodes : null;
 }
 
 /** Whether every commit of `seqs` in the space is one of the import's own. */
@@ -1514,7 +1871,7 @@ function isImportCommit(row: Pick<OutlineCommitRow, "actorKind" | "actorId">): b
 
 /**
  * The imported tasks against the source, one by one (PR 12 design §2.5, step 1): all there, live,
- * on the task page in the source's order, with the planned text, checkbox, person mark and lock;
+ * in the task list in the source's order, with the planned text, checkbox, person mark and lock;
  * every note under its task. A task the move starts reads to do, or in progress already (an
  * attempt that started it and stopped before the move; the move checks its claim). Bounded: the
  * tasks (at most 100) by short id, their contents by id. A mismatch rejects (needs attention).
@@ -1523,7 +1880,7 @@ function isImportCommit(row: Pick<OutlineCommitRow, "actorKind" | "actorId">): b
 async function verifyTasks(
 	ctx: Context,
 	expected: readonly SpecImportExpectedTask[],
-	tasksPageId: string,
+	tasksBlockId: string,
 ): Promise<string[]> {
 	const { space, session } = ctx;
 	const fail = (index: number, what: string): never => {
@@ -1550,7 +1907,7 @@ async function verifyTasks(
 	for (const [i, task] of expected.entries()) {
 		const meta = tasks[i] as OutlineBlockMeta;
 		const json = meta.taskJson;
-		if (meta.parentId !== tasksPageId) fail(i, "it is not on the task page");
+		if (meta.parentId !== tasksBlockId) fail(i, "it is not in the task list");
 		const before = i > 0 ? (tasks[i - 1] as OutlineBlockMeta) : null;
 		if (before && compareOrderKeys(before.orderKey, meta.orderKey) >= 0) fail(i, "its order");
 		if (!json) return fail(i, "it is not a task");

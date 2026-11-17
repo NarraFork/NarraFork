@@ -9,8 +9,8 @@
  * -----------
  * A version the commit wrote of a block that is a task after it, or was one before it (created,
  * reworded, moved, its checkbox or fields changed, deleted, brought back, or no longer a task), off
- * the behavior page (its checkboxes are rules). Each is named with its status after the commit:
- * `deleted` for a task deleted, `none` for a block that is no longer a task. At most
+ * the behavior boundary and what is under it (its checkboxes are rules). Each is named with its
+ * status after the commit: `deleted` for a task deleted, `none` for a block that is no longer a task. At most
  * {@link OUTLINE_PLUGIN_TASK_EVENT_LIMITS.changes} are named (`truncated` says there were more).
  *
  * COST
@@ -26,9 +26,10 @@ import { hotOnce, hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { readTaskBackend } from "../task-source/backend";
 import { isOutlineEnabled } from "./feature";
-import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_CHANGE } from "./model";
+import { OUTLINE_CHANGE } from "./model";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
+import { findBehaviorBlock } from "./well-known";
 
 export const OUTLINE_PLUGIN_TASK_EVENT_LIMITS = {
 	/** Versions of one commit read (a commit holds at most 200 operations; a subtree more rows). */
@@ -37,6 +38,8 @@ export const OUTLINE_PLUGIN_TASK_EVENT_LIMITS = {
 	changes: 50,
 	/** Spaces whose kind and session are kept. */
 	spaceCache: 2048,
+	/** Rows of the walk up that tells which changed blocks are under the behavior boundary. */
+	ancestryRows: 4000,
 } as const;
 
 /** A change to a block, which, when a task, the event names. */
@@ -126,12 +129,14 @@ export async function readSessionTasksChanged(
 					)
 				).map((v) => [v.blockId, v]),
 	);
-	const rules = new Set(
-		(await store.findAliasOwners(event.spaceId, [OUTLINE_BEHAVIOR_ALIAS])).map((o) => o.id),
+	const rules = await underBehavior(
+		store,
+		event.spaceId,
+		candidates.map((v) => v.blockId),
 	);
 	const changes: OutlineSessionTasksChanged["changes"] = [];
 	for (const v of candidates) {
-		if (rules.has(v.pageId)) continue;
+		if (rules.has(v.blockId)) continue;
 		let status: OutlinePluginTaskStatus;
 		if (!v.deleted && v.taskJson) status = v.taskJson.status;
 		else {
@@ -152,6 +157,44 @@ export async function readSessionTasksChanged(
 			changes.length > OUTLINE_PLUGIN_TASK_EVENT_LIMITS.changes ||
 			versions.length > OUTLINE_PLUGIN_TASK_EVENT_LIMITS.versionsPerCommit,
 	};
+}
+
+/**
+ * Of the given blocks of a session space, those that are the behavior boundary or under it (its
+ * checkboxes are rules, not tasks), by ancestry: one walk up for all of them, deleted blocks
+ * included (a deleted block keeps where it was deleted from). A walk cut short at its row limit
+ * counts as under it (not told as a task change).
+ */
+async function underBehavior(
+	store: OutlineStore,
+	spaceId: string,
+	blockIds: readonly string[],
+): Promise<Set<string>> {
+	const out = new Set<string>();
+	const behavior = await findBehaviorBlock(spaceId, store);
+	if (!behavior || blockIds.length === 0) return out;
+	const walk = await store.listAncestryOf(
+		spaceId,
+		blockIds,
+		OUTLINE_PLUGIN_TASK_EVENT_LIMITS.ancestryRows,
+		{ includeDeleted: true },
+	);
+	const parentOf = new Map(walk.rows.map((row) => [row.id, row.parentId]));
+	for (const id of blockIds) {
+		let at: string | null = id;
+		for (let steps = 0; at !== null && steps <= parentOf.size; steps++) {
+			if (at === behavior.id) {
+				out.add(id);
+				break;
+			}
+			if (!parentOf.has(at)) {
+				if (walk.truncated) out.add(id);
+				break;
+			}
+			at = parentOf.get(at) ?? null;
+		}
+	}
+	return out;
 }
 
 /** Read a commit and emit its event when it changed an outline session's tasks. */

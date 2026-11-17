@@ -94,6 +94,7 @@ describe("what an attempt leaves in the table", () => {
 			switchCount: 1,
 			noticeSwitch: 0,
 			tasks: 1,
+			// The table keeps the columns' old names until X2 renames them.
 			pages: 1,
 		});
 		expect(stored?.switchedAt).toBeString();
@@ -106,7 +107,7 @@ describe("what an attempt leaves in the table", () => {
 			state: "imported",
 			switchedAt: stored?.switchedAt,
 			spaceId: stored?.spaceId,
-			taskPageId: stored?.taskPageId,
+			taskBlockId: stored?.taskPageId,
 		});
 	});
 

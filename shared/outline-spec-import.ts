@@ -6,9 +6,10 @@
 /**
  * Why an attempt did not move the session, as the panel says it (`count` fills the sentence):
  * - `too_many_files` / `too_large`: more files (`count`) or characters than one import takes;
- * - `broken_tasks`: `tasks.json` is not a task list (imported as a page);
+ * - `broken_tasks`: `tasks.json` is not a task list (imported as notes);
  * - `task_mismatch`: imported task `count` does not read as its source;
  * - `kept_blocks`: `count` blocks of an earlier attempt hold what someone added or changed;
+ * - `stale_limit`: more than `count` blocks to look through for what an earlier attempt left;
  * - `fence_too_large`: the behavior fence's own text is over `count` KiB;
  * - `sop_too_large`: the plugin SOP in the fence is larger than its block holds;
  * - `not_started`: `count` tasks in progress could not be started by the session;
@@ -24,6 +25,7 @@ export interface OutlineSpecImportReason {
 		| "broken_tasks"
 		| "task_mismatch"
 		| "kept_blocks"
+		| "stale_limit"
 		| "fence_too_large"
 		| "sop_too_large"
 		| "not_started"
@@ -61,17 +63,17 @@ export interface OutlineSpecImportStatus {
 	attempts: number;
 	/**
 	 * When an import last moved the session to the outline (null: never; a session created in the
-	 * outline has none). The Spec panel then marks the old files read-only and links to
-	 * `taskPageId` in `spaceId` (either may be null when nothing was imported).
+	 * outline has none). The Spec panel then marks the old files read-only and links to the task
+	 * list `taskBlockId` in `spaceId` (either may be null when nothing was imported).
 	 */
 	switchedAt: string | null;
 	spaceId: string | null;
-	taskPageId: string | null;
+	taskBlockId: string | null;
 	/** When an administrator last moved the session back to Dynamic Spec. */
 	revertedAt: string | null;
 }
 
-/** States the admin page lists (`GET /api/admin/outline/spec-import`). */
+/** States the admin list shows (`GET /api/admin/outline/spec-import`). */
 export const OUTLINE_SPEC_IMPORT_ADMIN_STATES = [
 	"attention",
 	"failed",
@@ -84,7 +86,7 @@ export const OUTLINE_SPEC_IMPORT_ADMIN_STATES = [
 
 export type OutlineSpecImportAdminState = (typeof OUTLINE_SPEC_IMPORT_ADMIN_STATES)[number];
 
-/** One session on the admin page. */
+/** One session on the admin list. */
 export interface OutlineSpecImportAdminItem {
 	narratorId: string;
 	title: string | null;
@@ -120,11 +122,11 @@ export interface OutlineSpecImportAdminPage {
 /** What a move back answers (`POST /api/admin/outline/spec-import/:narratorId/revert`). */
 export interface OutlineSpecImportRevertResult {
 	reverted: true;
-	/** The markers were written on the task and behavior pages. */
+	/** The markers were written at the top of the task list and of the behavior boundary. */
 	marked: boolean;
 	/**
 	 * The old behavior fence holds the version the import read again (written back, or held
-	 * already). False when it should have been written back and was not: the page warns.
+	 * already). False when it should have been written back and was not: the admin list warns.
 	 */
 	fenceRestored: boolean;
 	/** Tasks the session held in the outline, reopened at once. */
@@ -136,8 +138,8 @@ export interface OutlineSpecImportRevertResult {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Where a finding stands: `open` (not on the page: not attached yet, or it could not be),
- * `attached` (on the file's imported page, as a block of its own), `dismissed` (a person said it
+ * Where a finding stands: `open` (not attached yet, or it could not be), `attached` (under the
+ * file's imported block, as a block of its own), `dismissed` (a person said it
  * is nothing; its block is taken away when nobody else wrote in it).
  */
 export const OUTLINE_SPEC_LOSS_STATUSES = ["open", "attached", "dismissed"] as const;
@@ -145,29 +147,30 @@ export const OUTLINE_SPEC_LOSS_STATUSES = ["open", "attached", "dismissed"] as c
 export type OutlineSpecLossStatus = (typeof OUTLINE_SPEC_LOSS_STATUSES)[number];
 
 export type OutlineSpecLossAttachNote =
-	| "no_page"
-	| "page_cap"
+	| "no_block"
+	| "block_cap"
 	| "session_cap"
 	| "restored"
 	| "failed"
 	| "gave_up"
 	| "reattach_cap"
 	| "list_only"
-	| "rule_page"
+	| "rule_block"
 	| "fork"
 	| "block_deleted";
 
 /**
- * The short id of a block an attach wrote: `sl` and fourteen hex digits. On a session's behavior
- * page such a block, with what is under it, is never shown to the model, never read into the spec
- * fence and never copied to a fork: that page is read as standing rules. Content a person
- * attached there through the confirmation is written under {@link isSpecLossRuleSid} instead.
+ * The short id of a block an attach wrote: `sl` and fourteen hex digits. Under a session's
+ * behavior boundary such a block, with what is under it, is never shown to the model, never read
+ * into the spec fence and never copied to a fork: what is under the boundary is read as standing
+ * rules. Content a person attached there through the confirmation is written under
+ * {@link isSpecLossRuleSid} instead.
  */
 export function isSpecLossAttachSid(sid: string): boolean {
 	return /^sl[0-9a-f]{14}$/.test(sid);
 }
 
-/** The short id of lost content a person put on the behavior page, confirming it is a rule. */
+/** The short id of lost content a person put under the behavior boundary, confirming it is a rule. */
 export function isSpecLossRuleSid(sid: string): boolean {
 	return /^sr[0-9a-f]{14}$/.test(sid);
 }
@@ -199,38 +202,41 @@ export interface OutlineSpecLossFinding {
 	truncated: boolean;
 	status: OutlineSpecLossStatus;
 	/**
-	 * The block on the imported page, in the session's space: of an `attached` finding, and of a
-	 * `dismissed` one whose block was kept because someone else wrote in it.
+	 * The attached block (under the file's imported block), in the session's space: of an
+	 * `attached` finding, and of a `dismissed` one whose block was kept because someone else
+	 * wrote in it.
 	 */
 	blockId: string | null;
 	/**
-	 * Why an `open` finding is not on the page (null: not tried yet):
+	 * Why an `open` finding is not attached (null: not tried yet):
 	 * - `list_only`: it is not tables (only tables are attached automatically); a person may attach it;
-	 * - `rule_page`: it is of the behavior fence, whose page the agent reads as rules: never
-	 *   attached automatically, and by a person only through a confirmation that says so;
+	 * - `rule_block`: it is of the behavior fence, or the file's block sits under the behavior
+	 *   boundary, which the agent reads as rules: never attached automatically, and by a person
+	 *   only through a confirmation that says so;
 	 * - `fork`: the save was made in the session this one was forked from; attached there only;
-	 * - `no_page`: the file's imported page is not there;
-	 * - `page_cap` / `session_cap`: more findings than are attached to one page, or for one
-	 *   session in one pass, automatically (the latter are attached by a later pass);
+	 * - `no_block`: the file's imported block is not there;
+	 * - `block_cap` / `session_cap`: more findings than are attached to one imported block, or
+	 *   for one session in one pass, automatically (the latter are attached by a later pass);
 	 * - `restored`: the file's current revision holds the content again;
 	 * - `failed`: the attach did not succeed (tried again by a later pass);
 	 * - `gave_up`: it failed several times and is not tried again: it needs a person;
 	 * - `reattach_cap`: its block was removed by system writes several times; not attached again.
-	 * Of a `dismissed` finding only `block_deleted`: nobody dismissed it, its block was deleted on
-	 * the page (which is how a person disposes of it there).
+	 * Of a `dismissed` finding only `block_deleted`: nobody dismissed it, its block was deleted in
+	 * the outline (which is how a person disposes of it there).
 	 */
 	attachNote: OutlineSpecLossAttachNote | null;
 	/**
-	 * The finding is of the behavior fence: attaching it puts it on the page the agent reads as
-	 * its rules, so the request must carry `confirmRule` (asked of the person first).
+	 * The finding is of the behavior fence: attaching it puts it under the behavior boundary,
+	 * which the agent reads as its rules, so the request must carry `confirmRule` (asked of the
+	 * person first).
 	 */
-	rulePage: boolean;
+	ruleBlock: boolean;
 	spaceId: string | null;
 	resolvedAt: string | null;
 	createdAt: string;
 	/**
 	 * An `open` finding of a session whose tasks are in the outline: a person may ask for it to
-	 * be put on the file's imported page (it may still be refused: the page was deleted).
+	 * be attached to the file's imported block (it may still be refused: the block was deleted).
 	 */
 	attachable: boolean;
 }
@@ -250,7 +256,7 @@ export interface OutlineSpecLossScanStatus {
 		sessions: number;
 		scanned: number;
 		found: number;
-		/** Findings put on their imported pages. */
+		/** Findings attached to their imported blocks. */
 		attached: number;
 		/** Sessions left for the next pass. */
 		left: number;
