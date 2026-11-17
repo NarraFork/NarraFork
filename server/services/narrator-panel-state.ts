@@ -121,6 +121,12 @@ const permissionColumns = {
 	executionTargetsJson: narratorToolCalls.executionTargetsJson,
 	deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
 };
+/**
+ * Pending requests a page shows: its own, its subagents' (placed under one of its own
+ * Agent/Task/Send calls) and, for the ACL root of a team, its subagents' helpers (placed
+ * under one of THEIR Agent calls) — the people looking at the primary approve the whole
+ * tree's work, so the second level must not exist only on a first-level subagent's page.
+ */
 function permissionScope(narratorId: string): SQL {
 	return and(
 		eq(narratorToolCalls.status, "pending"),
@@ -128,7 +134,11 @@ function permissionScope(narratorId: string): SQL {
 		// visibility; otherwise an OR across joined tables can scan every tool row.
 		sql`${narratorToolCalls.narratorId} IN (
 			SELECT ${narratorId} UNION ALL SELECT panel_child.id FROM narrators panel_child
-			WHERE panel_child.parent_narrator_id = ${narratorId})`,
+			WHERE panel_child.parent_narrator_id = ${narratorId}
+			UNION ALL SELECT panel_grandchild.id FROM narrators panel_grandchild
+			INNER JOIN narrators panel_mid ON panel_mid.id = panel_grandchild.parent_narrator_id
+			WHERE panel_mid.parent_narrator_id = ${narratorId}
+			AND panel_grandchild.acl_root_narrator_id = ${narratorId})`,
 		or(
 			eq(narratorToolCalls.narratorId, narratorId),
 			and(
@@ -136,6 +146,16 @@ function permissionScope(narratorId: string): SQL {
 				sql`EXISTS (SELECT 1 FROM narrator_tool_calls panel_parent
 			INNER JOIN narrator_message_refs panel_ref ON panel_ref.message_id = panel_parent.message_id
 			WHERE panel_ref.narrator_id = ${narratorId}
+			AND panel_parent.tool_name IN ('Agent','Task','Send')
+			AND panel_parent.tool_use_id = ${narratorMessages.parentToolUseId})`,
+			),
+			and(
+				eq(narrators.type, "subagent"),
+				eq(narrators.aclRootNarratorId, narratorId),
+				sql`${narrators.parentNarratorId} <> ${narratorId}`,
+				sql`EXISTS (SELECT 1 FROM narrator_tool_calls panel_parent
+			INNER JOIN narrator_message_refs panel_ref ON panel_ref.message_id = panel_parent.message_id
+			WHERE panel_ref.narrator_id = ${narrators.parentNarratorId}
 			AND panel_parent.tool_name IN ('Agent','Task','Send')
 			AND panel_parent.tool_use_id = ${narratorMessages.parentToolUseId})`,
 			),

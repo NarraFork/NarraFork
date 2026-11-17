@@ -128,7 +128,12 @@ import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { agentMessageDeliveryBody } from "./agent-message-delivery";
 import { type AgentMessageSender, buildAgentMessageOrigin } from "./agent-message-origin";
-import { BOT_RUNTIME_CEILING } from "./agent-runtime/policy";
+import {
+	BOT_RUNTIME_CEILING,
+	MAX_DELEGATION_DEPTH,
+	type RuntimePolicy,
+	withDelegationDepth,
+} from "./agent-runtime/policy";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import type {
 	BlockAllSkillsResult,
@@ -170,6 +175,7 @@ import { ensureReplyContext } from "./narrator-reply-context";
 import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { activeNarrators, withNarratorWorkAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
+import { rememberNestedSubagentRoot } from "./nested-subagent-routing";
 import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
@@ -549,6 +555,25 @@ interface CreateSubagentInput {
 	/** Compiled template ceiling; compiled from `subagentType` when omitted. */
 	runtimePolicy?: RuntimePolicyTrait;
 	defaultDeviceId?: string | null;
+}
+
+/**
+ * A helper's own stored ceiling also carries its delegating subagent's write limits: a
+ * read-only (or read-only-git) subagent cannot create a writable helper. The live policy
+ * source already narrows the helper the same way; storing it keeps the row honest when
+ * read on its own. Primary narrators' children (`parent` null) are unchanged.
+ */
+function nestedCeiling(
+	trait: RuntimePolicyTrait,
+	parent: RuntimePolicy | null,
+): RuntimePolicyTrait {
+	if (!parent) return trait;
+	return {
+		...trait,
+		...(parent.tools.readOnly ? { readOnly: true } : {}),
+		...(parent.readOnlyGitShell ? { readOnlyGitShell: true } : {}),
+		...(parent.searchOnly ? { searchOnly: true } : {}),
+	};
 }
 
 function formatAvailableOptionalToolIds(): string {
@@ -1861,8 +1886,22 @@ export const narratorService = {
 			}
 			const parent = await this.getById(input.parentNarratorId);
 
+			// Creation backstop for nesting: the level comes from the parent chain as well as
+			// from the parent's stamped ceiling, so neither a lost stamp nor a loosened layer
+			// lets a subagent at the deepest level create a third one.
+			const { delegationDepthOf, DELEGATION_DEPTH_LIMIT_MESSAGE } = await import(
+				"./delegation-depth"
+			);
 			const { resolveNarratorRuntimePolicy } = await import("./trait-layer-service");
-			if (!(await resolveNarratorRuntimePolicy(parent.id)).capabilities.spawnAgent) {
+			const parentPolicy = await resolveNarratorRuntimePolicy(parent.id);
+			const parentDepth = Math.max(
+				await delegationDepthOf(parent.id),
+				parentPolicy.delegationDepth,
+			);
+			if (parentDepth >= MAX_DELEGATION_DEPTH) {
+				throw new ValidationError(DELEGATION_DEPTH_LIMIT_MESSAGE);
+			}
+			if (!parentPolicy.capabilities.spawnAgent) {
 				throw new ValidationError(
 					"This narrator's capability ceiling does not allow spawning agents",
 				);
@@ -1939,11 +1978,16 @@ export const narratorService = {
 			// The template is compiled into an ordinary ceiling trait; the parent's own
 			// restrictions are not copied but followed live through the registered
 			// policy source, so a later tightening of the parent reaches the child.
-			const runtimePolicy =
-				input.runtimePolicy ??
-				(await compileDelegationCeiling(input.subagentType, {
-					outlineSession: parent.taskBackend === "outline",
-				}));
+			const runtimePolicy = nestedCeiling(
+				withDelegationDepth(
+					input.runtimePolicy ??
+						(await compileDelegationCeiling(input.subagentType, {
+							outlineSession: parent.taskBackend === "outline",
+						})),
+					parentDepth + 1,
+				),
+				parentDepth > 0 ? parentPolicy : null,
+			);
 			const subTraits = withRuntimePolicyTrait(["standalone"], runtimePolicy);
 			// The delegator is the policy/model source and the controller; the model pool
 			// the child follows the source within is fixed now, from the template.
@@ -2028,6 +2072,8 @@ export const narratorService = {
 					.returning();
 
 				backgroundOccupancyStore.refreshNarrator(id);
+				// A nested helper's permission and reflection frames also reach its root's page.
+				rememberNestedSubagentRoot(narrator);
 				logger.info("Subagent created", {
 					id,
 					parentNarratorId: input.parentNarratorId,
@@ -2210,6 +2256,20 @@ export const narratorService = {
 			omitted: Math.min(remainder.length, TEAM_VIEW_OMITTED_COUNT_CAP),
 			omittedCapped: remainder.length > TEAM_VIEW_OMITTED_COUNT_CAP,
 		};
+	},
+
+	/**
+	 * The helpers of each listed team member, for the one nested level of a team tree
+	 * (TeamStatus, nested cards). At most `perParent` per member, active ones first, with
+	 * each member's total so a listing can say what it left out. One query over the
+	 * `parent_narrator_id` index; only short columns are read.
+	 */
+	async listNestedSubagentsForTeamView(
+		parentIds: readonly string[],
+		perParent: number,
+	): Promise<Map<string, { subagents: TeamViewSubagent[]; total: number }>> {
+		const { listNestedSubagents } = await import("./subagent-nested");
+		return listNestedSubagents(parentIds, perParent);
 	},
 
 	/**

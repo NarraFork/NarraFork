@@ -1005,6 +1005,9 @@ export async function runAgentLoopUnlocked(
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
+			// A nested helper's gates and status reach its root's page too (also after a restart).
+			const { rememberNestedSubagentRoot } = await import("../nested-subagent-routing");
+			rememberNestedSubagentRoot(freshNarrator);
 			// Effective traits and the capability ceiling, resolved strictly once per pass
 			// so a layer or source change applies from the next pass. A layer that cannot
 			// be read fails the pass; it never runs without its restrictions.

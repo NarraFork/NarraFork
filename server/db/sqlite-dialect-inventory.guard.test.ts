@@ -573,6 +573,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/integration-authority-service.ts": ["errorCode"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
+	"server/services/subagent-nested.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
 	// The broken-call flag of a tool result is read in SQL so the result itself is not.
