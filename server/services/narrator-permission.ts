@@ -114,7 +114,11 @@ import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { RuntimePolicy } from "./agent-runtime/policy";
 import { isRuntimeToolNameAllowed } from "./subagent-tools";
-import { describeTeamCleanup, teamWorktreePathsForNarrator } from "./teams/team-membership";
+import {
+	describeTeamCleanup,
+	isGitControlRelativePath,
+	teamWorktreePathsForNarrator,
+} from "./teams/team-membership";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
 export {
@@ -1066,7 +1070,14 @@ export function resolvePermissionDecision(
 	if (
 		effectiveMode !== "readOnly" &&
 		!reviewReadOnlyBash &&
-		isTeamWorktreeScopedCall(toolName, input, cwd, opts.teamWorktrees, context)
+		isTeamWorktreeScopedCall(
+			toolName,
+			input,
+			cwd,
+			opts.teamWorktrees,
+			context,
+			opts.teamWorktreeGuards,
+		)
 	)
 		return "allow";
 
@@ -1403,6 +1414,8 @@ export function isTeamWorktreeScopedCall(
 	cwd: string,
 	worktrees: readonly string[] | undefined,
 	context?: ExecutionTargetContext | null,
+	/** Directories never auto-allowed for writes (each worktree's configured hooks directory). */
+	guards: readonly string[] = [],
 ): boolean {
 	if (!worktrees || worktrees.length === 0) return false;
 	if (context && context.target.deviceId !== LOCAL_DEVICE_ID) return false;
@@ -1414,7 +1427,46 @@ export function isTeamWorktreeScopedCall(
 	}
 	if (!TEAM_WORKTREE_FILE_TOOLS.has(toolName)) return false;
 	const targets = getToolPolicyPaths(toolName, input, cwd, undefined, context);
-	return targets.length > 0 && targets.every(inside);
+	// Git control data (hooks, attributes, modules, config) changes what git runs: a person
+	// decides, never the team allowance.
+	const ordinaryFile = (path: string) =>
+		worktrees.some(
+			(root) => paths.contains(root, path) && !isGitControlRelativePath(paths.relative(root, path)),
+		) && !guards.some((guard) => paths.contains(guard, path));
+	return targets.length > 0 && targets.every(ordinaryFile);
+}
+
+/**
+ * The team allowance inputs of one call: the worktrees this narrator may treat as its own and,
+ * for a file write into one of them, that worktree's configured hooks directory. An unreadable
+ * hooks configuration withdraws the allowance (the call asks a person).
+ */
+async function teamWorktreeAllowance(
+	narratorId: string,
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	context: ExecutionTargetContext | null | undefined,
+	constrained: boolean,
+): Promise<{ teamWorktrees?: string[]; teamWorktreeGuards?: string[] }> {
+	if (constrained) return {};
+	const roots = teamWorktreePathsForNarrator(narratorId);
+	if (roots.length === 0 || !TEAM_WORKTREE_FILE_TOOLS.has(toolName))
+		return { teamWorktrees: roots };
+	const paths = decisionPaths(context);
+	const targets = getToolPolicyPaths(toolName, input, cwd, undefined, context);
+	const touched = roots.filter((root) => targets.some((target) => paths.contains(root, target)));
+	if (touched.length === 0) return { teamWorktrees: roots };
+	try {
+		const { configuredHooksDir } = await import("./teams/team-git");
+		const guards = await Promise.all(touched.map((root) => configuredHooksDir(root)));
+		return {
+			teamWorktrees: roots,
+			teamWorktreeGuards: guards.filter((guard): guard is string => guard !== null),
+		};
+	} catch {
+		return { teamWorktrees: [] };
+	}
 }
 
 /** Tools that always require user approval regardless of permission mode. */
@@ -1572,6 +1624,8 @@ export interface PermissionDecisionOpts {
 	 * team's own resources: allowed without a person outside read-only, plan and review modes.
 	 */
 	teamWorktrees?: readonly string[];
+	/** Directories inside those worktrees that are never auto-allowed (configured hooks). */
+	teamWorktreeGuards?: readonly string[];
 }
 
 // ── Command policy helpers ────────────────────────────────
@@ -5184,7 +5238,14 @@ export async function recheckFinalToolExecutionPermission(
 					reviewReadOnlyBash: readOnlyGitShell,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
-					teamWorktrees: constraint ? undefined : teamWorktreePathsForNarrator(check.narratorId),
+					...(await teamWorktreeAllowance(
+						check.narratorId,
+						decisionTool,
+						decisionInput,
+						cwd,
+						context,
+						!!constraint,
+					)),
 				});
 	if (
 		decision === "deny" ||
@@ -5704,13 +5765,21 @@ export async function handlePermission(
 		(toolName === "Write" || toolName === "Edit") &&
 		(await (await import("./outline-plan-mode")).outlinePlanCycle(narratorId))?.kind === "outline";
 	// An external (OAuth) session never gets the team's worktree allowance.
-	const teamWorktrees = runtimeConstraint ? undefined : teamWorktreePathsForNarrator(narratorId);
+	const teamAllowance = await teamWorktreeAllowance(
+		narratorId,
+		toolName,
+		effectiveInput,
+		cwd,
+		executionContext,
+		!!runtimeConstraint,
+	);
 	const teamWorktreeScoped = isTeamWorktreeScopedCall(
 		toolName,
 		effectiveInput,
 		cwd,
-		teamWorktrees,
+		teamAllowance.teamWorktrees,
 		executionContext,
+		teamAllowance.teamWorktreeGuards,
 	);
 	let decision =
 		toolName === "Send" &&
@@ -5737,7 +5806,7 @@ export async function handlePermission(
 					executionTarget: initialExecutionTarget,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
-					teamWorktrees,
+					...teamAllowance,
 				});
 	logger.debug("Permission decision", {
 		narratorId,

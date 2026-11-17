@@ -49,12 +49,9 @@ import {
 import {
 	aheadBehind,
 	branchUpstream,
-	changedPathsBetween,
 	countCommitsNotIn,
-	GIT_CHANGED_PATHS_MAX_BYTES,
 	GIT_UNCOMMITTED_LISTING_MAX_BYTES,
 	type GitAheadBehind,
-	type GitChangedPaths,
 	type GitQueryRunner,
 	type GitUncommittedChanges,
 	type GitUpstream,
@@ -147,14 +144,6 @@ const READ_TIMEOUT_MS = 60_000;
  * streams are still drained — only the retained string is bounded.
  */
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
-
-/**
- * Bounds of a server-side merge commit. A merge of a healthy repository finishes in seconds;
- * a stuck one is killed and aborted rather than holding the worktree lock forever. Output is
- * only scanned for the conflict marker and kept short.
- */
-const MERGE_TIMEOUT_MS = 5 * 60_000;
-const MERGE_MAX_OUTPUT_BYTES = 64 * 1024;
 
 /**
  * Depth of the walk behind {@link gitService.getLastCommitTimes}.
@@ -1718,73 +1707,6 @@ export const gitService = {
 		bounds?: GitQueryBounds,
 	): Promise<number> {
 		return countCommitsNotIn(queryRunner(repoPath, bounds), tip, reachableFrom);
-	},
-
-	/**
-	 * Paths that differ between two commits (full SHAs), no rename detection; `exact` is
-	 * false when the listing hit its cap.
-	 */
-	async getChangedPaths(
-		repoPath: string,
-		from: string,
-		to: string,
-		bounds?: GitQueryBounds,
-	): Promise<GitChangedPaths> {
-		return changedPathsBetween(
-			queryRunner(repoPath, bounds),
-			from,
-			to,
-			bounds?.maxOutputBytes ?? GIT_CHANGED_PATHS_MAX_BYTES,
-		);
-	},
-
-	// === Merge ===
-
-	/**
-	 * Merge one commit (a full SHA) into the branch checked out in `worktreePath` with a merge
-	 * commit (`--no-ff`, never a rebase or a reset). Any failure — a conflict, an untracked file
-	 * in the way, a hook refusing — is aborted, and the branch head is verified to be where it
-	 * was: a failed merge leaves the branch untouched or throws.
-	 */
-	async mergeCommitNoFastForward(
-		worktreePath: string,
-		sha: string,
-		message: string,
-		identity?: GitCommitIdentity,
-	): Promise<
-		{ merged: true; head: string } | { merged: false; conflict: boolean; detail: string }
-	> {
-		if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sha))
-			throw new ValidationError("Expected a full commit SHA");
-		return withWorktreeLock(worktreePath, async () => {
-			const before = await this.getHeadCommit(worktreePath);
-			const result = await exec(
-				["merge", "--no-ff", "--no-edit", "-m", message, "--end-of-options", sha],
-				worktreePath,
-				{
-					identity: identity ?? null,
-					silent: true,
-					timeout: MERGE_TIMEOUT_MS,
-					maxOutputBytes: MERGE_MAX_OUTPUT_BYTES,
-				},
-			);
-			if (result.exitCode === 0)
-				return { merged: true as const, head: await this.getHeadCommit(worktreePath) };
-			const output = `${result.stdout}\n${result.stderr}`.trim();
-			await exec(["merge", "--abort"], worktreePath, {
-				silent: true,
-				timeout: MERGE_TIMEOUT_MS,
-				maxOutputBytes: MERGE_MAX_OUTPUT_BYTES,
-			});
-			const after = await this.getHeadCommit(worktreePath);
-			if (after !== before)
-				throw new GitError("git merge failed and the branch head moved; inspect the worktree");
-			return {
-				merged: false as const,
-				conflict: /\bCONFLICT\b/.test(output),
-				detail: output.length > 1024 ? `${output.slice(0, 1024)}…` : output,
-			};
-		});
 	},
 
 	// === Reset ===

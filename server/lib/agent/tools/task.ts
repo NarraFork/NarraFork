@@ -582,6 +582,8 @@ export const agentTool: ToolDefinition = {
 		}
 		// Imported before the run so the creation hook below stays synchronous.
 		const workItemsModule = workItem ? await import("@server/services/teams/work-items") : null;
+		/** The subagent the call created for the work item, once it exists. */
+		let workItemWorker: string | null = null;
 		const workItemNote = workItem
 			? `\n\nTeam work item ${workItem.id}${workItem.branch ? ` (branch ${workItem.branch})` : ""} in ${resolvedWorkdir}; this agent is its worker.`
 			: "";
@@ -614,6 +616,7 @@ export const agentTool: ToolDefinition = {
 					? {
 							onCreated: (subagentId: string) => {
 								if (!workItem) return;
+								workItemWorker = subagentId;
 								workItemsModule.attachWorker(workItem.teamId, workItem.id, subagentId, {
 									kind: "agent",
 									id: ctx.narratorId,
@@ -645,11 +648,14 @@ export const agentTool: ToolDefinition = {
 				},
 			};
 		} catch (err) {
-			// A work item made for this call whose agent never started is settled like any isolated
-			// item: an untouched worktree is removed and the item cancelled.
-			if (workItem?.created && workItemsModule)
+			// The work item of a call whose agent never ran is settled (see `settleFailedStart`):
+			// an untouched isolated worktree is removed, an attached item goes back to the queue.
+			if (workItem && workItemsModule)
 				await workItemsModule
-					.settleUnstartedIsolatedItem(workItem.teamId, workItem.id)
+					.settleFailedStart(workItem.teamId, workItem.id, workItemWorker, {
+						kind: "agent",
+						id: ctx.narratorId,
+					})
 					.catch(() => "kept");
 			// A delegation refused once the agent existed (the task changed hands) says so itself.
 			if (delegation && err instanceof Error && err.name === "OutlineDelegationError")

@@ -265,7 +265,7 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 
 | source | body kind | schedule | 触发 |
 |---|---|---|---|
-| `team_checkin` | `prose` | `wakeIfIdle` | 自检到点（每个 team 最多一个待发，新排的替换旧的；排定和触发各记一条 `team.checkin` 事件，重启后按事件重排，已过点的立即触发） |
+| `team_checkin` | `prose` | `wakeIfIdle` | 自检到点（5 分钟到 1 天；每个 team 最多一个待发，新排的替换旧的；排定和触发各记一条 `team.checkin` 事件，重启或取消归档后按事件重排，已过点的立即触发；协调者归档或删除时取消，到点时 team 不再活跃就不唤醒；这一轮以排定它的人为执行身份 `executionPrincipal`） |
 
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 

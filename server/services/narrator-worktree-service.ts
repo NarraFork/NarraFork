@@ -19,6 +19,13 @@ import { z } from "zod/v4";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
+import {
+	DRIVER_CONFIG_QUERY,
+	filterNeutralizers,
+	GIT_NO_EXEC_CONFIG,
+	gitConfigEnv,
+	parseDriverConfig,
+} from "../lib/git-exec-hardening";
 import { logger } from "../lib/logger";
 import { type SafeSpawnResult, safeSpawn } from "../lib/spawn";
 import {
@@ -794,25 +801,71 @@ export class NarratorWorktreeService<Principal> {
 		signal.throwIfAborted();
 		const operation = this.ports.runGit
 			? this.ports.runGit(target, args, signal, writing, scope)
-			: safeSpawn({
-					cmd: ["git", "--no-optional-locks", ...this.scopeArgv(target, scope, writing), ...args],
-					timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
-					maxOutputBytes: maxBytes,
-					killProcessTree: true,
-					env: {
-						...process.env,
-						// Keep the unsupported-option diagnostic stable across server locales.
-						LC_ALL: "C",
-						GIT_DIR: undefined,
-						GIT_COMMON_DIR: undefined,
-						GIT_WORK_TREE: undefined,
-						GIT_INDEX_FILE: undefined,
-					},
-					signal,
-				});
+			: this.hardenedConfig(target, args, scope, writing, signal).then((config) =>
+					safeSpawn({
+						cmd: ["git", "--no-optional-locks", ...this.scopeArgv(target, scope, writing), ...args],
+						timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
+						maxOutputBytes: maxBytes,
+						killProcessTree: true,
+						env: {
+							...process.env,
+							// Keep the unsupported-option diagnostic stable across server locales.
+							LC_ALL: "C",
+							GIT_DIR: undefined,
+							GIT_COMMON_DIR: undefined,
+							GIT_WORK_TREE: undefined,
+							GIT_INDEX_FILE: undefined,
+							GIT_EXTERNAL_DIFF: undefined,
+							...gitConfigEnv(config),
+						},
+						signal,
+					}),
+				);
 		const result = writing ? await operation : await abortableRead(operation, signal);
 		signal.throwIfAborted();
 		return boundWorktreeGitResult(result, maxBytes);
+	}
+
+	/**
+	 * Configuration overrides of one command (`git-exec-hardening.ts`).
+	 *
+	 * A worktree's configuration is untrusted: the directory may be one an agent wrote to. Every
+	 * command except creation runs with hooks, fsmonitor, external diff and signing disabled;
+	 * the commands that read the work tree (`status`, and `worktree remove`, which runs `git
+	 * status` itself) also empty every configured filter driver. Creation keeps the repository's
+	 * own behavior (its checkout hooks and filters are what a person creating it expects).
+	 */
+	private async hardenedConfig(
+		target: WorktreeTarget,
+		args: string[],
+		scope: WorktreeGitScope,
+		writing: boolean,
+		signal: AbortSignal,
+	): Promise<Array<readonly [string, string]>> {
+		if (args[0] === "worktree" && args[1] === "add") return [];
+		const config: Array<readonly [string, string]> = [...GIT_NO_EXEC_CONFIG];
+		if (args[0] !== "status" && !(args[0] === "worktree" && args[1] === "remove")) return config;
+		const drivers = await safeSpawn({
+			cmd: [
+				"git",
+				"--no-optional-locks",
+				...this.scopeArgv(target, scope, writing),
+				...DRIVER_CONFIG_QUERY,
+			],
+			timeout: WORKTREE_READ_TIMEOUT_MS,
+			maxOutputBytes: 64 * 1024,
+			killProcessTree: true,
+			env: { ...process.env, LC_ALL: "C", GIT_DIR: undefined, ...gitConfigEnv(config) },
+			signal,
+		});
+		if (drivers.exitCode === 1 && !drivers.stdout) return config;
+		if (drivers.exitCode !== 0 || drivers.stdoutTruncated)
+			error(
+				"WORKTREE_GIT_CONFIG_UNREADABLE",
+				"Cannot read the checkout's driver configuration",
+				409,
+			);
+		return [...config, ...filterNeutralizers(parseDriverConfig(drivers.stdout).filters)];
 	}
 
 	/**

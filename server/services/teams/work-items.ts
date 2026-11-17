@@ -9,7 +9,8 @@
  *
  * Every state change, review verdict, base sync, cleanup, check-in and decision appends one
  * `team_work_events` row naming its person or agent. Each statement is a primary-key or index
- * lookup bounded by a LIMIT; git runs through `gitService` with its read bounds, and the merge
+ * lookup bounded by a LIMIT; git in a worktree runs only through the hardened `team-git.ts`
+ * (no hooks, fsmonitor, external diff or filter programs, read bounds of `gitService`), and the merge
  * of a base sync through its bounded merge.
  *
  * SQLite only, like the rest of the team surface.
@@ -33,9 +34,10 @@ import {
 	type TeamWorkEventKind,
 	type TeamWorkItemState,
 } from "@shared/project-teams";
-import { and, asc, desc, eq, gte, inArray, isNotNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, ne, notInArray } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../../db";
 import {
+	narrators,
 	narratorWorktreeResources,
 	projectTeams,
 	teamWorkEvents,
@@ -43,10 +45,11 @@ import {
 } from "../../db/schema";
 import { AppError, NotFoundError, ValidationError } from "../../lib/errors";
 import type { GitIdentityEnv } from "../../lib/git-identity";
+import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
-import { gitService } from "../git-service";
 import type { NarratorPrincipal } from "../narrator-acl";
+import { ATTRIBUTE_PATHS_MAX, teamGit } from "./team-git";
 
 type WorkItemRow = typeof teamWorkItems.$inferSelect;
 type Executor = Pick<typeof db, "insert" | "select" | "update">;
@@ -104,8 +107,14 @@ export interface WorkItemWorktreePorts {
 		confirmedLoss?: ConfirmedLoss;
 		signal: AbortSignal;
 	}): Promise<WorktreeRemovalResult>;
-	/** Whether a session is running right now (a base sync never merges under a running worker). */
-	isNarratorRunning(narratorId: string): boolean;
+	/**
+	 * Run `fn` while none of these sessions runs and none can start (a base sync never merges
+	 * under its worker or the worker's helpers). `held: false` when one is busy.
+	 */
+	holdSessions<T>(
+		narratorIds: readonly string[],
+		fn: () => Promise<T>,
+	): Promise<{ held: true; value: T } | { held: false; busy: string }>;
 	/** The principal an automatic cleanup acts as (the person who started the item). */
 	principalOf(userId: string): Promise<NarratorPrincipal>;
 	/** The git identity of a server-side merge commit. */
@@ -426,7 +435,9 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 			500,
 			"TEAM_WORKTREE_UNRECORDED",
 		);
-	const head = await gitService.resolveCommit(created.path, "HEAD").catch(() => null);
+	const head = await teamGit(created.path)
+		.resolveCommit("HEAD")
+		.catch(() => null);
 	const now = new Date().toISOString();
 	db.transaction((tx) => {
 		tx.insert(teamWorkItems)
@@ -549,7 +560,11 @@ export async function recordReview(
 	if (!Number.isSafeInteger(input.findings) || input.findings < 0)
 		throw new ValidationError("findings must be a non-negative integer");
 	const path = worktreePathOf(item);
-	const head = path ? await gitService.resolveCommit(path, "HEAD").catch(() => null) : null;
+	const head = path
+		? await teamGit(path)
+				.resolveCommit("HEAD")
+				.catch(() => null)
+		: null;
 	const round = item.reviewRounds + 1;
 	const now = new Date().toISOString();
 	const state: TeamWorkItemState = input.verdict === "blocker" ? "in_progress" : "in_review";
@@ -616,19 +631,22 @@ export async function markReady(input: {
 			"TEAM_WORK_ITEM_NOT_REVIEWED",
 		);
 	const path = requireWorktree(item);
-	const dirty = await gitService.getUncommittedChanges(path);
+	const git = teamGit(path);
+	const dirty = await git.uncommittedChanges();
 	if (dirty.count > 0 || !dirty.exact)
 		throw new AppError(
 			`Work item ${item.id} has uncommitted changes in its worktree; the author commits them first`,
 			409,
 			"TEAM_WORK_ITEM_DIRTY",
 		);
-	const head = await gitService.resolveCommit(path, "HEAD");
+	const head = await git.resolveCommit("HEAD");
 	const reviewed = lastReviewedHead(item.id);
+	// Commits made after the review, not counting what a base sync brought in from the base.
+	const baseSha = await git.resolveCommit(item.baseRef ?? team.baseBranch).catch(() => null);
 	let commitsSinceReview: number | null = null;
 	if (head && reviewed && head !== reviewed)
-		commitsSinceReview = await gitService
-			.countCommitsNotIn(path, head, [reviewed])
+		commitsSinceReview = await git
+			.countCommitsNotIn(head, baseSha ? [reviewed, baseSha] : [reviewed])
 			.catch(() => null);
 	else if (head && reviewed) commitsSinceReview = 0;
 	const now = new Date().toISOString();
@@ -684,6 +702,7 @@ export type SyncOutcome =
 				| "worker_running"
 				| "unrelated"
 				| "too_many_paths"
+				| "custom_drivers"
 				| "merge_failed";
 			baseSha: string;
 			head: string;
@@ -730,11 +749,12 @@ export async function syncWorkItem(input: {
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
 	const path = requireWorktree(item);
+	const git = teamGit(path);
 	const baseRef = item.baseRef ?? team.baseBranch;
-	const baseSha = await gitService.resolveCommit(path, baseRef);
+	const baseSha = await git.resolveCommit(baseRef);
 	if (!baseSha)
 		throw new AppError(`The base ${baseRef} does not name a commit`, 409, "TEAM_BASE_UNRESOLVED");
-	const head = await gitService.resolveCommit(path, "HEAD");
+	const head = await git.resolveCommit("HEAD");
 	if (!head)
 		throw new AppError("The work item's branch has no commit", 409, "TEAM_HEAD_UNRESOLVED");
 	const port = await ports();
@@ -767,30 +787,57 @@ export async function syncWorkItem(input: {
 			worker: item.workerNarratorId,
 		});
 
-	if (await gitService.isAncestor(path, baseSha, head))
-		return record({ outcome: "up_to_date", baseSha, head });
-	if (item.workerNarratorId && port.isNarratorRunning(item.workerNarratorId))
-		return handOff("worker_running");
-	const dirty = await gitService.getUncommittedChanges(path);
-	if (dirty.count > 0 || !dirty.exact) return handOff("uncommitted");
-	const mergeBase = await gitService.getMergeBase(path, head, baseSha);
-	if (!mergeBase) return handOff("unrelated");
-	const [ours, theirs] = await Promise.all([
-		gitService.getChangedPaths(path, mergeBase, head),
-		gitService.getChangedPaths(path, mergeBase, baseSha),
-	]);
-	if (!ours.exact || !theirs.exact) return handOff("too_many_paths");
-	const overlap = overlappingPaths(ours.paths, theirs.paths);
-	if (overlap.length > 0) return handOff("overlap", overlap);
-	const identity = await port.gitIdentity({ userId: input.userId, coordinatorId: team.teamId });
-	const merged = await gitService.mergeCommitNoFastForward(
-		path,
-		baseSha,
-		`Merge ${baseRef} into ${item.branchName ?? "the work item branch"}`,
-		identity,
-	);
-	if (!merged.merged) return handOff("merge_failed");
-	return record({ outcome: "merged", baseSha, head: merged.head, previousHead: head });
+	if (await git.isAncestor(baseSha, head)) return record({ outcome: "up_to_date", baseSha, head });
+	// The worker and its helpers are held for the whole check-and-merge: none of them runs, and
+	// none can start, while the server writes into their worktree.
+	const sessions = item.workerNarratorId
+		? [item.workerNarratorId, ...liveHelpersOf(item.workerNarratorId)]
+		: [];
+	const held = await port.holdSessions(sessions, async () => {
+		const dirty = await git.uncommittedChanges();
+		if (dirty.count > 0 || !dirty.exact) return handOff("uncommitted");
+		const mergeBase = await git.mergeBase(head, baseSha);
+		if (!mergeBase) return handOff("unrelated");
+		const [ours, theirs] = await Promise.all([
+			git.changedPaths(mergeBase, head),
+			git.changedPaths(mergeBase, baseSha),
+		]);
+		if (!ours.exact || !theirs.exact) return handOff("too_many_paths");
+		const overlap = overlappingPaths(ours.paths, theirs.paths);
+		if (overlap.length > 0) return handOff("overlap", overlap);
+		// A configured filter or merge driver a touched path selects would run a program the
+		// repository names; the worker merges such a branch itself.
+		const touched = [...new Set([...ours.paths, ...theirs.paths])];
+		if (touched.length > ATTRIBUTE_PATHS_MAX) return handOff("too_many_paths");
+		const driven = await git.pathsSelectingDrivers(touched, baseSha);
+		if (driven.length > 0) return handOff("custom_drivers", driven);
+		const identity = await port.gitIdentity({ userId: input.userId, coordinatorId: team.teamId });
+		const merged = await git.mergeNoFastForward(
+			baseSha,
+			`Merge ${baseRef} into ${item.branchName ?? "the work item branch"}`,
+			identity,
+		);
+		if (!merged.merged) return handOff("merge_failed");
+		return record({ outcome: "merged", baseSha, head: merged.head, previousHead: head });
+	});
+	return held.held ? held.value : handOff("worker_running");
+}
+
+/** The worker's own helpers (second level) that are not archived, bounded. */
+function liveHelpersOf(workerNarratorId: string): string[] {
+	return db
+		.select({ id: narrators.id })
+		.from(narrators)
+		.where(
+			and(
+				eq(narrators.parentNarratorId, workerNarratorId),
+				eq(narrators.type, "subagent"),
+				ne(narrators.status, "archived"),
+			),
+		)
+		.limit(64)
+		.all()
+		.map((row) => row.id);
 }
 
 // ── Cleanup ─────────────────────────────────────────────────────────────────
@@ -947,28 +994,52 @@ export async function settleIsolatedWorkItem(
 }
 
 /**
- * An isolated item whose subagent never started (the Agent call failed after the item was made):
- * settled the same way, so its untouched worktree does not linger.
+ * The Agent call that was to start an item's worker failed (before or after the subagent row
+ * existed). An isolated item is settled like any isolated item — an untouched worktree is
+ * removed and the item cancelled — and otherwise stays in progress with a `work.start_failed`
+ * event. An item the call only attached to (an `Agent({ workdir })` into a queued item) drops
+ * that worker and goes back to the queue.
  */
-export async function settleUnstartedIsolatedItem(
+export async function settleFailedStart(
 	teamId: string,
 	itemId: string,
-): Promise<"cleaned" | "kept" | "skipped" | "none"> {
+	subagentId: string | null,
+	actor: WorkActor,
+): Promise<"cleaned" | "kept" | "skipped" | "requeued" | "none"> {
+	if (activeDatabaseBackend !== "sqlite") return "none";
 	const item = db
 		.select()
 		.from(teamWorkItems)
 		.where(and(eq(teamWorkItems.id, itemId), eq(teamWorkItems.teamId, teamId)))
 		.limit(1)
 		.get();
-	if (
-		!item ||
-		item.kind !== TEAM_ISOLATED_WORK_KIND ||
-		item.workerNarratorId ||
-		item.state !== "in_progress" ||
-		!item.worktreeResourceId
-	)
-		return "none";
-	return settleItem(item, { retry: false });
+	if (!item || isFinished(item.state)) return "none";
+	if (item.kind === TEAM_ISOLATED_WORK_KIND) {
+		const settled = item.worktreeResourceId ? await settleItem(item, { retry: false }) : "kept";
+		if (settled !== "cleaned")
+			recordWorkEvent(db, {
+				teamId,
+				workItemId: item.id,
+				kind: "work.start_failed",
+				actor,
+				detail: { worker: subagentId, settled },
+			});
+		return settled;
+	}
+	if (!subagentId || item.workerNarratorId !== subagentId) return "none";
+	const now = new Date().toISOString();
+	db.transaction((tx) => {
+		updateItem(tx, item, { workerNarratorId: null, state: "queued" }, now);
+		recordWorkEvent(tx, {
+			teamId,
+			workItemId: item.id,
+			kind: "work.start_failed",
+			actor,
+			detail: { worker: subagentId, from: item.state, to: "queued" },
+			at: now,
+		});
+	});
+	return "requeued";
 }
 
 async function settleItem(
@@ -979,11 +1050,12 @@ async function settleItem(
 	try {
 		const path = worktreePathOf(item);
 		if (!path) return "none";
-		const baseSha = await gitService.resolveCommit(path, item.baseRef ?? "HEAD");
-		const head = await gitService.resolveCommit(path, "HEAD");
+		const git = teamGit(path);
+		const baseSha = await git.resolveCommit(item.baseRef ?? "HEAD");
+		const head = await git.resolveCommit("HEAD");
 		if (!baseSha || !head) return "kept";
-		const commits = await gitService.countCommitsNotIn(path, head, [baseSha]);
-		const dirty = await gitService.getUncommittedChanges(path);
+		const commits = await git.countCommitsNotIn(head, [baseSha]);
+		const dirty = await git.uncommittedChanges();
 		if (commits > 0 || dirty.count > 0 || !dirty.exact) return "kept";
 		const actor: WorkActor = { kind: "agent", id: item.teamId };
 		if (!item.createdBy) {
@@ -1159,19 +1231,30 @@ const realClock: CheckinClock = {
 	},
 };
 
-type CheckinWake = (input: {
+export interface CheckinWakeInput {
 	teamId: string;
 	minutes: number;
 	note: string | null;
 	locale: string;
-}) => Promise<void>;
+	/** The person behind the turn that scheduled it: the check-in turn runs as them. */
+	userId: string | null;
+}
+type CheckinWake = (input: CheckinWakeInput) => Promise<void>;
 
-const checkins = {
-	clock: realClock,
+interface PendingCheckin {
+	eventId: string;
+	cancel: () => void;
+}
+
+/** Pinned across `--hot` reloads: one map of pending timers, one lifecycle subscription. */
+const checkins = hotSafe("narrafork.teams.checkins", () => ({
+	clock: realClock as CheckinClock,
 	wake: null as CheckinWake | null,
 	/** One pending check-in per team: a new one replaces it. */
-	pending: new Map<string, { eventId: string; cancel: () => void }>(),
-};
+	pending: new Map<string, PendingCheckin>(),
+	/** The running lifecycle subscription's stop function. */
+	stopLifecycle: null as (() => void) | null,
+}));
 
 /** Replace the clock and the wake (tests); nulls restore production. */
 export function setCheckinSeamsForTests(seams: {
@@ -1192,12 +1275,16 @@ export function pendingCheckinCount(teamId?: string): number {
 	return teamId ? (checkins.pending.has(teamId) ? 1 : 0) : checkins.pending.size;
 }
 
-async function defaultCheckinWake(input: {
-	teamId: string;
-	minutes: number;
-	note: string | null;
-	locale: string;
-}): Promise<void> {
+/** Drop a team's pending check-in (its coordinator was archived or deleted). */
+export function cancelCheckin(teamId: string): boolean {
+	const pending = checkins.pending.get(teamId);
+	if (!pending) return false;
+	pending.cancel();
+	checkins.pending.delete(teamId);
+	return true;
+}
+
+async function defaultCheckinWake(input: CheckinWakeInput): Promise<void> {
 	const { checkinText } = await import("../../lib/prompts/team-lead");
 	const text = checkinText(input.locale === "zh-CN" ? "zh-CN" : "en", input.minutes, input.note);
 	const { deliverInjection } = await import("../narrator-injection");
@@ -1206,30 +1293,45 @@ async function defaultCheckinWake(input: {
 		source: "team_checkin",
 		body: { kind: "prose", text },
 		schedule: "wakeIfIdle",
+		createdBy: input.userId,
+		executionPrincipal: { version: 1, userId: input.userId },
 	});
 }
 
-function arm(
-	teamId: string,
-	eventId: string,
-	dueAt: number,
-	minutes: number,
-	note: string | null,
-	locale: string,
-): void {
+/** Whether the team still exists, is active and its coordinator is not archived. */
+function teamIsActive(teamId: string): boolean {
+	const row = db
+		.select({ status: projectTeams.status, coordinator: narrators.status })
+		.from(projectTeams)
+		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+		.where(eq(projectTeams.narratorId, teamId))
+		.limit(1)
+		.get();
+	return row?.status === "active" && row.coordinator !== "archived";
+}
+
+function arm(eventId: string, dueAt: number, input: CheckinWakeInput): void {
+	const { teamId } = input;
 	checkins.pending.get(teamId)?.cancel();
 	const cancel = checkins.clock.after(Math.max(0, dueAt - checkins.clock.now()), () => {
 		const current = checkins.pending.get(teamId);
 		if (current?.eventId !== eventId) return;
 		checkins.pending.delete(teamId);
-		recordWorkEvent(db, {
-			teamId,
-			workItemId: null,
-			kind: "team.checkin",
-			actor: { kind: "system", id: null },
-			detail: { fired: eventId },
-		});
-		void (checkins.wake ?? defaultCheckinWake)({ teamId, minutes, note, locale }).catch((error) => {
+		try {
+			// Archived or deleted meanwhile: nothing to wake.
+			if (!teamIsActive(teamId)) return;
+			recordWorkEvent(db, {
+				teamId,
+				workItemId: null,
+				kind: "team.checkin",
+				actor: { kind: "system", id: null },
+				detail: { fired: eventId },
+			});
+		} catch (error) {
+			logger.warn("Team check-in could not fire", { teamId, error: String(error) });
+			return;
+		}
+		void (checkins.wake ?? defaultCheckinWake)(input).catch((error) => {
 			logger.warn("Team check-in wake failed", { teamId, error: String(error) });
 		});
 	});
@@ -1237,9 +1339,9 @@ function arm(
 }
 
 /**
- * Schedule one wake-up of the coordinator after `minutes` (1 minute to 1 day). A team has at
+ * Schedule one wake-up of the coordinator after `minutes` (5 minutes to 1 day). A team has at
  * most one pending check-in: scheduling another replaces it. The schedule is recorded as a
- * `team.checkin` event (`dueAt`), so a restart re-arms it.
+ * `team.checkin` event (`dueAt`, the scheduling person), so a restart or an unarchive re-arms it.
  */
 export function scheduleCheckin(input: {
 	coordinatorId: string;
@@ -1247,6 +1349,8 @@ export function scheduleCheckin(input: {
 	note?: string;
 	locale: string;
 	actor: WorkActor;
+	/** The person behind the scheduling turn. */
+	userId: string | null;
 }): { dueAt: string; replaced: boolean } {
 	const team = requireActiveTeam(input.coordinatorId);
 	if (
@@ -1266,10 +1370,48 @@ export function scheduleCheckin(input: {
 		workItemId: null,
 		kind: "team.checkin",
 		actor: input.actor,
-		detail: { dueAt, minutes: input.minutes, note, locale: input.locale },
+		detail: { dueAt, minutes: input.minutes, note, locale: input.locale, userId: input.userId },
 	});
-	arm(team.teamId, eventId, dueAtMs, input.minutes, note, input.locale);
+	arm(eventId, dueAtMs, {
+		teamId: team.teamId,
+		minutes: input.minutes,
+		note,
+		locale: input.locale,
+		userId: input.userId,
+	});
 	return { dueAt, replaced };
+}
+
+/** Re-arm one team's newest unfired check-in of the last day; true when one was armed. */
+export function rearmCheckin(teamId: string): boolean {
+	if (activeDatabaseBackend !== "sqlite" || checkins.pending.has(teamId)) return false;
+	if (!teamIsActive(teamId)) return false;
+	const since = new Date(checkins.clock.now() - CHECKIN_LOOKBACK_MS).toISOString();
+	const newest = db
+		.select({ id: teamWorkEvents.id, detail: teamWorkEvents.detailJson })
+		.from(teamWorkEvents)
+		.where(
+			and(
+				eq(teamWorkEvents.teamId, teamId),
+				eq(teamWorkEvents.kind, "team.checkin"),
+				gte(teamWorkEvents.createdAt, since),
+			),
+		)
+		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
+		.limit(1)
+		.get();
+	const detail = newest?.detail;
+	if (!newest || !detail || typeof detail.dueAt !== "string" || detail.fired) return false;
+	const dueAt = Date.parse(detail.dueAt);
+	if (Number.isNaN(dueAt)) return false;
+	arm(newest.id, dueAt, {
+		teamId,
+		minutes: typeof detail.minutes === "number" ? detail.minutes : 0,
+		note: typeof detail.note === "string" ? detail.note : null,
+		locale: typeof detail.locale === "string" ? detail.locale : "en",
+		userId: typeof detail.userId === "string" ? detail.userId : null,
+	});
+	return true;
 }
 
 /**
@@ -1279,7 +1421,6 @@ export function scheduleCheckin(input: {
  */
 export function rearmCheckins(): number {
 	if (activeDatabaseBackend !== "sqlite") return 0;
-	const since = new Date(checkins.clock.now() - CHECKIN_LOOKBACK_MS).toISOString();
 	const teams = db
 		.select({ id: projectTeams.narratorId })
 		.from(projectTeams)
@@ -1288,73 +1429,75 @@ export function rearmCheckins(): number {
 		.limit(500)
 		.all();
 	let armed = 0;
-	for (const team of teams) {
-		const newest = db
-			.select({ id: teamWorkEvents.id, detail: teamWorkEvents.detailJson })
-			.from(teamWorkEvents)
-			.where(
-				and(
-					eq(teamWorkEvents.teamId, team.id),
-					eq(teamWorkEvents.kind, "team.checkin"),
-					gte(teamWorkEvents.createdAt, since),
-				),
-			)
-			.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
-			.limit(1)
-			.get();
-		const detail = newest?.detail;
-		if (!newest || !detail || typeof detail.dueAt !== "string" || detail.fired) continue;
-		const dueAt = Date.parse(detail.dueAt);
-		if (Number.isNaN(dueAt)) continue;
-		arm(
-			team.id,
-			newest.id,
-			dueAt,
-			typeof detail.minutes === "number" ? detail.minutes : 0,
-			typeof detail.note === "string" ? detail.note : null,
-			typeof detail.locale === "string" ? detail.locale : "en",
-		);
-		armed++;
-	}
+	for (const team of teams) if (rearmCheckin(team.id)) armed++;
 	return armed;
 }
 
 // ── Startup ─────────────────────────────────────────────────────────────────
 
 /**
- * Follow subagent runs of team coordinators: when the first-level subagent of an isolated item
- * ends a run, settle the item. Also re-arms pending check-ins. Returns the stop function.
+ * Follow the team sessions: when the first-level subagent of an isolated item ends a run,
+ * settle the item; when a coordinator is archived or deleted, drop its pending check-in, and
+ * re-arm it on unarchive. Also re-arms pending check-ins. Idempotent across `--hot` reloads
+ * (a previous subscription is stopped first). Returns the stop function.
  */
 export function startTeamWorkLifecycle(): () => void {
+	checkins.stopLifecycle?.();
 	let stopped = false;
+	const isTeam = (narratorId: string) => {
+		try {
+			return Boolean(
+				db
+					.select({ id: projectTeams.narratorId })
+					.from(projectTeams)
+					.where(eq(projectTeams.narratorId, narratorId))
+					.limit(1)
+					.get(),
+			);
+		} catch {
+			return false;
+		}
+	};
 	const onCompleted = (event: { narratorId: string; parentNarratorId: string }) => {
 		if (stopped || activeDatabaseBackend !== "sqlite") return;
-		try {
-			const team = db
-				.select({ id: projectTeams.narratorId })
-				.from(projectTeams)
-				.where(eq(projectTeams.narratorId, event.parentNarratorId))
-				.limit(1)
-				.get();
-			if (!team) return;
-		} catch {
-			return;
+		if (isTeam(event.parentNarratorId)) void settleIsolatedWorkItem(event.narratorId);
+	};
+	const onStatus = (event: { narratorId: string; status: string }) => {
+		if (stopped || activeDatabaseBackend !== "sqlite") return;
+		if (event.status === "archived") cancelCheckin(event.narratorId);
+		else if (!checkins.pending.has(event.narratorId) && isTeam(event.narratorId)) {
+			try {
+				rearmCheckin(event.narratorId);
+			} catch (error) {
+				logger.warn("Team check-in could not be re-armed", { error: String(error) });
+			}
 		}
-		void settleIsolatedWorkItem(event.narratorId);
+	};
+	const onDeleted = (event: { narratorId: string }) => {
+		cancelCheckin(event.narratorId);
 	};
 	let off = () => {};
 	void import("../../lib/event-bus").then(({ eventBus }) => {
 		if (stopped) return;
 		eventBus.on("narrator:subagent_completed", onCompleted);
-		off = () => eventBus.off("narrator:subagent_completed", onCompleted);
+		eventBus.on("narrator:status_changed", onStatus);
+		eventBus.on("narrator:deleted", onDeleted);
+		off = () => {
+			eventBus.off("narrator:subagent_completed", onCompleted);
+			eventBus.off("narrator:status_changed", onStatus);
+			eventBus.off("narrator:deleted", onDeleted);
+		};
 	});
 	try {
 		rearmCheckins();
 	} catch (error) {
 		logger.warn("Team check-ins could not be re-armed", { error: String(error) });
 	}
-	return () => {
+	const stop = () => {
 		stopped = true;
 		off();
+		if (checkins.stopLifecycle === stop) checkins.stopLifecycle = null;
 	};
+	checkins.stopLifecycle = stop;
+	return stop;
 }

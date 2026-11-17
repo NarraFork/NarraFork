@@ -12,7 +12,7 @@
  * final gate through the real `handlePermission` pipeline.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -29,6 +29,7 @@ mock.module("../narrator-service", () => ({
 	...realNarratorService,
 	narratorService: { ...realNarratorService.narratorService, updateStatus: async () => {} },
 }));
+const { localBackend } = await import("../../lib/agent/execution/local-backend");
 const { handlePermission, recheckFinalToolExecutionPermission, resolvePermissionDecision } =
 	await import("../narrator-permission");
 const { narratorPersistence: persistence } = await import("../narrator-persistence");
@@ -116,7 +117,23 @@ async function decide(
 		cwd,
 		"en",
 		undefined,
-		{ toolCallBinding: call.binding },
+		{
+			toolCallBinding: call.binding,
+			...(typeof input.file_path === "string"
+				? {
+						executionBackend: localBackend,
+						executionTarget: {
+							deviceId: "local",
+							backendKind: "local" as const,
+							cwd,
+							pathFlavor: localBackend.paths.flavor,
+							resolvedFilePath: input.file_path,
+							runtimeGeneration: localBackend.runtimeGeneration ?? 0,
+							selectionSource: "local_default" as const,
+						},
+					}
+				: {}),
+		},
 		undefined,
 		constraint,
 		reviewReadOnlyBash,
@@ -147,6 +164,12 @@ afterAll(() => {
 });
 
 const cleanup = { action: "cleanup", item: "item" };
+
+async function git(args: string[], at: string) {
+	const { safeSpawn } = await import("../../lib/spawn");
+	const result = await safeSpawn({ cmd: ["git", "-C", at, ...args], timeout: 10_000 });
+	if (result.exitCode !== 0) throw new Error(result.stderr);
+}
 
 describe("decision table", () => {
 	const decision = (
@@ -235,6 +258,59 @@ describe("decision table", () => {
 		expect(decision("Write", inside, "default", { planMode: true })).toBe("deny");
 	});
 
+	test("git control files in the team's worktree are never auto-allowed", () => {
+		for (const relative of [
+			".husky/_/post-merge",
+			".husky/pre-commit",
+			".githooks/pre-commit",
+			".gitattributes",
+			".gitmodules",
+			".gitignore",
+			"sub/.gitattributes",
+			".GitAttributes",
+		])
+			expect(
+				decision("Write", { file_path: join(worktree, relative), content: "x" }, "default"),
+			).toBe("ask");
+		// `.git` internals are denied outright by the protected-path rule.
+		expect(
+			decision("Write", { file_path: join(worktree, ".git", "config"), content: "x" }, "default"),
+		).toBe("deny");
+		// A configured hooks directory anywhere in the worktree is guarded too.
+		const hooks = join(worktree, "tools", "hooks");
+		expect(
+			decision("Write", { file_path: join(hooks, "pre-commit"), content: "x" }, "default", {
+				teamWorktreeGuards: [hooks],
+			}),
+		).toBe("ask");
+		expect(
+			decision(
+				"Write",
+				{ file_path: join(worktree, "tools", "build.ts"), content: "x" },
+				"default",
+				{
+					teamWorktreeGuards: [hooks],
+				},
+			),
+		).toBe("allow");
+	});
+
+	test("a worker's allowance does not reach another worker's worktree", () => {
+		// What `teamWorktreePathsForNarrator` gives worker A: its own item only.
+		const workerA = { teamWorktrees: [worktree] };
+		expect(
+			decision("Write", { file_path: join(elsewhere, "a.ts"), content: "x" }, "default", workerA),
+		).toBe("ask");
+		expect(
+			decision(
+				"Agent",
+				{ subagent_type: "worker", prompt: "p", workdir: elsewhere },
+				"default",
+				workerA,
+			),
+		).toBe("ask");
+	});
+
 	test("Agent isolation creates a worktree: denied in read-only and review", () => {
 		const input = { isolation: "worktree", title: "t", prompt: "p" };
 		expect(decision("Agent", input, "default")).toBe("allow");
@@ -297,6 +373,83 @@ describe("through handlePermission", () => {
 		expect(
 			(await decide("Agent", { subagent_type: "worker", prompt: "p", workdir: worktree })).behavior,
 		).toBe("allow");
+	});
+
+	test("the repository's configured hooks directory is read and guarded", async () => {
+		await git(["init", "-q", "-b", "main"], cwd);
+		await git(["config", "core.hooksPath", "tools/hooks"], cwd);
+		await team("default");
+		liveItem();
+		// Relative hooksPath resolves inside the worktree git runs in.
+		expect(
+			await settle(
+				decide("Write", {
+					file_path: join(worktree, "tools", "hooks", "post-merge"),
+					content: "x",
+				}),
+			),
+		).toBe("pending");
+		expect(
+			await settle(
+				decide("Write", { file_path: join(worktree, ".husky", "_", "h"), content: "x" }),
+			),
+		).toBe("pending");
+		expect(
+			(await decide("Write", { file_path: join(worktree, "src", "a.ts"), content: "x" })).behavior,
+		).toBe("allow");
+	});
+
+	test("a symlink or `..` out of the team's worktree is not inside it", async () => {
+		await team("default");
+		liveItem();
+		const outside = await mkdtemp(join(tmpdir(), "nf-team-outside-"));
+		try {
+			await symlink(outside, join(worktree, "link"));
+			expect(
+				await settle(decide("Write", { file_path: join(worktree, "link", "x.txt"), content: "x" })),
+			).toBe("pending");
+			expect(
+				await settle(
+					decide("Write", { file_path: join(worktree, "..", "other", "x.txt"), content: "x" }),
+				),
+			).toBe("pending");
+			expect(
+				(await decide("Write", { file_path: join(worktree, "ok.txt"), content: "x" })).behavior,
+			).toBe("allow");
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("a worker's helper gets its worker's worktree, not the other items'", async () => {
+		await team("default");
+		liveItem();
+		sqlite.run(
+			`INSERT INTO narrator_worktree_resources (id, device_id, repository_key, worktree_path, state, create_request_id)
+			VALUES ('wt2', 'local', 'repo', ?, 'ready', 'req2')`,
+			[elsewhere],
+		);
+		for (const [id, parent] of [
+			["worker-a", "n"],
+			["worker-b", "n"],
+			["helper-a", "worker-a"],
+		])
+			sqlite.run(
+				`INSERT INTO narrators (id, type, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+				VALUES (?, 'subagent', ?, 'n', ?, ?)`,
+				[id, parent, NOW, NOW],
+			);
+		sqlite.run("UPDATE team_work_items SET worker_narrator_id = 'worker-a'");
+		sqlite.run(
+			`INSERT INTO team_work_items (id, team_id, project_id, title, state, worker_narrator_id, worktree_resource_id, created_at, updated_at)
+			VALUES ('item2', 'n', 'p', 'B', 'in_progress', 'worker-b', 'wt2', ?, ?)`,
+			[NOW, NOW],
+		);
+		const { teamWorktreePathsForNarrator } = await import("../teams/team-membership");
+		expect(teamWorktreePathsForNarrator("worker-a")).toEqual([worktree]);
+		expect(teamWorktreePathsForNarrator("helper-a")).toEqual([worktree]);
+		expect(teamWorktreePathsForNarrator("worker-b")).toEqual([elsewhere]);
+		expect(teamWorktreePathsForNarrator("n").sort()).toEqual([worktree, elsewhere].sort());
 	});
 
 	test("the final start gate accepts a cleanup only on a person's recorded approval", async () => {

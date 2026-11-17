@@ -264,6 +264,7 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 				note: input.note,
 				locale: ctx.locale,
 				actor,
+				userId: ctx.userId ?? null,
 			});
 			return result({
 				...scheduled,

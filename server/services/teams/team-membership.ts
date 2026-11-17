@@ -11,7 +11,7 @@
  * subagent's access decisions, and both subagent levels carry the coordinator there.
  */
 import { TEAM_WORK_ITEM_FINISHED_STATES } from "@shared/project-teams";
-import { and, asc, eq, isNotNull, notInArray } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, notInArray } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../../db";
 import { narrators, narratorWorktreeResources, projectTeams, teamWorkItems } from "../../db/schema";
 
@@ -84,10 +84,60 @@ export function teamWorktrees(teamId: string): TeamWorktree[] {
 		.all();
 }
 
-/** The worktree paths a narrator's team owns right now (empty for a session outside a team). */
+/**
+ * The worktree paths a narrator may treat as its team's own (empty outside a team):
+ * - the coordinator: every live work item worktree of its team;
+ * - a first-level worker: only the item(s) it is the recorded worker of;
+ * - a second-level helper: only its parent worker's item(s).
+ * Another member's worktree is not this session's resource and still needs a person.
+ *
+ * Bounded by {@link TEAM_WORKTREE_LOOKUP_LIMIT}: past that many live items the oldest are
+ * listed and the rest fall back to asking a person (fails safe, never wider).
+ */
 export function teamWorktreePathsForNarrator(narratorId: string): string[] {
 	const teamId = teamIdOfNarrator(narratorId);
-	return teamId ? teamWorktrees(teamId).map((row) => row.path) : [];
+	if (!teamId) return [];
+	const all = teamWorktrees(teamId);
+	if (teamId === narratorId) return all.map((row) => row.path);
+	const row = db
+		.select({ parent: narrators.parentNarratorId })
+		.from(narrators)
+		.where(eq(narrators.id, narratorId))
+		.limit(1)
+		.get();
+	const workers = new Set([
+		narratorId,
+		...(row?.parent && row.parent !== teamId ? [row.parent] : []),
+	]);
+	if (all.length === 0) return [];
+	const owned = new Set(
+		db
+			.select({ id: teamWorkItems.id })
+			.from(teamWorkItems)
+			.where(
+				and(
+					eq(teamWorkItems.teamId, teamId),
+					inArray(teamWorkItems.workerNarratorId, [...workers]),
+				),
+			)
+			.limit(TEAM_WORKTREE_LOOKUP_LIMIT)
+			.all()
+			.map((item) => item.id),
+	);
+	return all.filter((item) => owned.has(item.workItemId)).map((item) => item.path);
+}
+
+/**
+ * Whether a path inside a worktree is git control data: a segment named `.git…` (`.git`,
+ * `.gitattributes`, `.gitmodules`, `.gitignore`, `.gitconfig`, `.github`, …), `.husky` or
+ * `.githooks`. Writing one changes what git runs or how it reads the tree, so it is never
+ * auto-allowed as an ordinary file write of the team.
+ */
+export function isGitControlRelativePath(relative: string): boolean {
+	return relative.split(/[\\/]+/).some((segment) => {
+		const name = segment.toLowerCase();
+		return name.startsWith(".git") || name === ".husky" || name === ".githooks";
+	});
 }
 
 /**

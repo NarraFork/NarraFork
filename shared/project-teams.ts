@@ -168,8 +168,8 @@ export const TEAM_DEFAULT_WORK_KIND = "change";
 export const TEAM_WORK_TITLE_MAX_LENGTH = 200;
 /** Text budget (UTF-8 bytes) of a decision recorded on people's behalf. */
 export const TEAM_DECISION_MAX_BYTES = 2 * 1024;
-/** Bounds of a check-in delay in minutes: at least one minute, at most one day. */
-export const TEAM_CHECKIN_MIN_MINUTES = 1;
+/** Bounds of a check-in delay in minutes: at least five minutes, at most one day. */
+export const TEAM_CHECKIN_MIN_MINUTES = 5;
 export const TEAM_CHECKIN_MAX_MINUTES = 24 * 60;
 /** Most work items one `work.list` returns (open ones first). */
 export const TEAM_WORK_LIST_LIMIT = 30;
@@ -178,6 +178,7 @@ export const TEAM_WORK_LIST_LIMIT = 30;
 export type TeamWorkEventKind =
 	| "work.created"
 	| "work.started"
+	| "work.start_failed"
 	| "work.review"
 	| "work.ready"
 	| "work.sync"

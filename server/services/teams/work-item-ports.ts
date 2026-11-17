@@ -8,10 +8,15 @@
  * revision guard, repository lock and protection reservation of those paths applies unchanged.
  */
 
+import { eq } from "drizzle-orm";
+import { db } from "../../db";
+import { narrators } from "../../db/schema";
 import { isAdminUser } from "../../lib/agent/tools/admin-common";
 import { AppError } from "../../lib/errors";
 import { resolveNarratorGitIdentityEnv } from "../../lib/git-identity";
-import { isNarratorRuntimeBusy } from "../narrator-session-state";
+import { wakeInboxIfEligible } from "../agent-runtime/inbox";
+import { tryClaimExecution } from "../agent-runtime/ownership";
+import { isNarratorRuntimeBusy, withNarratorWorkAdmission } from "../narrator-session-state";
 import { narratorWorktreeService } from "../narrator-worktree-runtime";
 import { workspaceContextService } from "../workspace-context-service";
 import type { WorkItemWorktreePorts } from "./work-items";
@@ -94,7 +99,43 @@ export const productionWorkItemPorts: WorkItemWorktreePorts = {
 		);
 	},
 
-	isNarratorRunning: (narratorId) => isNarratorRuntimeBusy(narratorId),
+	/**
+	 * The work lease every narrator write takes (as `deliverInjection` does) on the first
+	 * session, and its execution owner claimed for each session: a run cannot start while the
+	 * owner is held. Anything already running, waiting or owned is busy. Mailbox input that
+	 * arrived meanwhile is woken afterwards.
+	 */
+	async holdSessions(narratorIds, fn) {
+		const [first] = narratorIds;
+		if (!first) return { held: true as const, value: await fn() };
+		return withNarratorWorkAdmission(first, async () => {
+			const owners: Array<{ release(): boolean }> = [];
+			const release = () => {
+				for (const owner of owners.splice(0)) owner.release();
+			};
+			for (const id of narratorIds) {
+				const row = await db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { status: true },
+				});
+				const owner =
+					row?.status === "working" || row?.status === "waiting" || isNarratorRuntimeBusy(id)
+						? null
+						: tryClaimExecution(id, "tool-replay");
+				if (!owner) {
+					release();
+					return { held: false as const, busy: id };
+				}
+				owners.push(owner);
+			}
+			try {
+				return { held: true as const, value: await fn() };
+			} finally {
+				release();
+				for (const id of narratorIds) void wakeInboxIfEligible(id).catch(() => false);
+			}
+		});
+	},
 
 	async principalOf(userId) {
 		return { userId, isAdmin: await isAdminUser(userId) };

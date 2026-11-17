@@ -5,10 +5,11 @@
  * the pending one from its event. The brief follows every team subagent's own prompt (both
  * levels), byte-identical while the brief is unchanged, and never reaches other sessions.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq, sql } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
 import { teamWorkEvents } from "../../../db/schema";
+import { eventBus } from "../../../lib/event-bus";
 import { getTeamBriefSection } from "../../../lib/prompts/team-lead";
 import { runtimeBasePrompt } from "../../agent-runtime/orchestrator";
 import { resolveRuntimePolicy } from "../../agent-runtime/policy";
@@ -20,6 +21,7 @@ import {
 	resetCheckinsForTests,
 	scheduleCheckin,
 	setCheckinSeamsForTests,
+	startTeamWorkLifecycle,
 	updateBrief,
 } from "../work-items";
 
@@ -30,7 +32,7 @@ const agent = { kind: "agent" as const, id: LEAD };
 
 let now: number;
 let timers: Array<{ at: number; fn: () => void; cancelled: boolean }>;
-let wakes: Array<{ teamId: string; minutes: number; note: string | null }>;
+let wakes: Array<{ teamId: string; minutes: number; note: string | null; userId?: string | null }>;
 const clock: CheckinClock = {
 	now: () => now,
 	after(ms, fn) {
@@ -56,7 +58,12 @@ beforeEach(() => {
 	setCheckinSeamsForTests({
 		clock,
 		wake: async (input) => {
-			wakes.push({ teamId: input.teamId, minutes: input.minutes, note: input.note });
+			wakes.push({
+				teamId: input.teamId,
+				minutes: input.minutes,
+				note: input.note,
+				userId: input.userId,
+			});
 		},
 	});
 	sqlite.run(
@@ -91,6 +98,7 @@ describe("check-in", () => {
 			minutes: 50,
 			locale: "en",
 			actor: agent,
+			userId: "p3c-person",
 		});
 		expect(first.replaced).toBe(false);
 		const second = scheduleCheckin({
@@ -99,6 +107,7 @@ describe("check-in", () => {
 			note: "review of item A",
 			locale: "en",
 			actor: agent,
+			userId: "p3c-person",
 		});
 		expect(second.replaced).toBe(true);
 		expect(pendingCheckinCount(LEAD)).toBe(1);
@@ -106,7 +115,9 @@ describe("check-in", () => {
 		expect(wakes).toEqual([]);
 		advance(60_000);
 		await Promise.resolve();
-		expect(wakes).toEqual([{ teamId: LEAD, minutes: 30, note: "review of item A" }]);
+		expect(wakes).toEqual([
+			{ teamId: LEAD, minutes: 30, note: "review of item A", userId: "p3c-person" },
+		]);
 		advance(60 * 60_000);
 		await Promise.resolve();
 		expect(wakes).toHaveLength(1);
@@ -132,26 +143,96 @@ describe("check-in", () => {
 	});
 
 	test("bounded minutes; a restart re-arms the pending one", async () => {
-		for (const minutes of [0, 1441, 2.5])
+		for (const minutes of [0, 4, 1441, 7.5])
 			expect(() =>
-				scheduleCheckin({ coordinatorId: LEAD, minutes, locale: "en", actor: agent }),
+				scheduleCheckin({
+					coordinatorId: LEAD,
+					minutes,
+					locale: "en",
+					actor: agent,
+					userId: "p3c-person",
+				}),
 			).toThrow("minutes must be");
-		scheduleCheckin({ coordinatorId: LEAD, minutes: 10, locale: "en", actor: agent });
+		scheduleCheckin({
+			coordinatorId: LEAD,
+			minutes: 10,
+			locale: "en",
+			actor: agent,
+			userId: "p3c-person",
+		});
 		resetCheckinsForTests(); // the process restarted: timers gone
 		expect(pendingCheckinCount()).toBe(0);
 		expect(rearmCheckins()).toBe(1);
 		advance(10 * 60_000);
 		await Promise.resolve();
-		expect(wakes).toEqual([{ teamId: LEAD, minutes: 10, note: null }]);
+		expect(wakes).toEqual([{ teamId: LEAD, minutes: 10, note: null, userId: "p3c-person" }]);
 		expect(() =>
-			scheduleCheckin({ coordinatorId: "p3c-other", minutes: 5, locale: "en", actor: agent }),
+			scheduleCheckin({
+				coordinatorId: "p3c-other",
+				minutes: 5,
+				locale: "en",
+				actor: agent,
+				userId: "p3c-person",
+			}),
 		).toThrow("Only a team coordinator");
+	});
+});
+
+describe("check-in and the coordinator's lifecycle", () => {
+	test("archiving cancels it, unarchiving re-arms it, a fire on an archived team wakes nobody", async () => {
+		const stop = startTeamWorkLifecycle();
+		try {
+			await Promise.resolve();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			scheduleCheckin({
+				coordinatorId: LEAD,
+				minutes: 20,
+				locale: "en",
+				actor: agent,
+				userId: "p3c-person",
+			});
+			sqlite.run("UPDATE narrators SET status = 'archived' WHERE id = ?", [LEAD]);
+			eventBus.emit({ type: "narrator:status_changed", narratorId: LEAD, status: "archived" });
+			expect(pendingCheckinCount(LEAD)).toBe(0);
+			sqlite.run("UPDATE narrators SET status = 'idle' WHERE id = ?", [LEAD]);
+			eventBus.emit({ type: "narrator:status_changed", narratorId: LEAD, status: "idle" });
+			expect(pendingCheckinCount(LEAD)).toBe(1);
+			// Archived without the event reaching us: the timer checks before it wakes anyone.
+			sqlite.run("UPDATE narrators SET status = 'archived' WHERE id = ?", [LEAD]);
+			advance(20 * 60_000);
+			await Promise.resolve();
+			expect(wakes).toEqual([]);
+			expect(pendingCheckinCount(LEAD)).toBe(0);
+			// Deleted coordinator: cancelled too.
+			sqlite.run("UPDATE narrators SET status = 'idle' WHERE id = ?", [LEAD]);
+			scheduleCheckin({
+				coordinatorId: LEAD,
+				minutes: 20,
+				locale: "en",
+				actor: agent,
+				userId: "p3c-person",
+			});
+			eventBus.emit({ type: "narrator:deleted", narratorId: LEAD, title: null });
+			expect(pendingCheckinCount(LEAD)).toBe(0);
+			// A second start (a hot reload) replaces the first subscription instead of doubling it.
+			const off = spyOn(eventBus, "off");
+			const again = startTeamWorkLifecycle();
+			expect(off).toHaveBeenCalledTimes(3);
+			off.mockRestore();
+			again();
+		} finally {
+			stop();
+		}
 	});
 });
 
 describe("team brief in subagent prompts", () => {
 	test("appended to every team subagent's prompt, deterministically; nobody else gets it", () => {
-		updateBrief({ coordinatorId: LEAD, text: "Never edit drizzle/ by hand.", actor: agent });
+		updateBrief({
+			coordinatorId: LEAD,
+			text: "Never edit drizzle/ by hand.",
+			actor: agent,
+		});
 		const policy = resolveRuntimePolicy([]);
 		const worker = { type: "subagent", aclRootNarratorId: LEAD };
 		const helper = { type: "subagent", aclRootNarratorId: LEAD }; // second level: same ACL root

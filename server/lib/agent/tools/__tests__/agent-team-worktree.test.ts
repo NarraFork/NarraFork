@@ -19,6 +19,8 @@ import type { ToolContext } from "../../types";
 
 const runCalls: Array<Record<string, unknown>> = [];
 let failRun = false;
+/** Fail after the subagent row exists (model or alias resolution failing late). */
+let failAfterCreate = false;
 let agentTool: typeof import("../task").agentTool;
 let realNarratorSubagent: typeof import("@server/services/narrator-subagent");
 let items: typeof import("@server/services/teams/work-items");
@@ -52,6 +54,7 @@ beforeAll(async () => {
 				[id, id, LEAD, LEAD, NOW, NOW],
 			);
 			(input.onCreated as ((id: string) => void) | undefined)?.(id);
+			if (failAfterCreate) throw new Error("alias registration failed");
 			return `<background_task_id>${id}</background_task_id>`;
 		}),
 	}));
@@ -68,6 +71,7 @@ afterAll(() => {
 beforeEach(async () => {
 	runCalls.length = 0;
 	failRun = false;
+	failAfterCreate = false;
 	temporary = await mkdtemp(join(tmpdir(), "nf-agent-team-"));
 	source = join(temporary, "repo");
 	await mkdir(join(source, ".worktrees"), { recursive: true });
@@ -134,7 +138,7 @@ beforeEach(async () => {
 				relocatedTo: null,
 			};
 		},
-		isNarratorRunning: () => false,
+		holdSessions: async (_ids, fn) => ({ held: true, value: await fn() }),
 		principalOf: async (userId) => ({ userId, isAdmin: false }),
 		gitIdentity: async () => null,
 	});
@@ -241,6 +245,44 @@ describe("Agent with a team work item", () => {
 		expect(item.state).toBe("cancelled");
 		expect(item.worktreeResourceId).toBeNull();
 		expect(existsSync(join(source, ".worktrees", `team-${item.id}`))).toBe(false);
+	});
+});
+
+describe("an Agent start that fails after its subagent exists", () => {
+	test("isolated: the untouched worktree is removed and the item cancelled", async () => {
+		failAfterCreate = true;
+		const failed = await agentTool.execute(
+			{ isolation: "worktree", title: "Late failure", prompt: "p" },
+			ctx(),
+		);
+		expect(failed.isError).toBe(true);
+		const item = only();
+		expect(item.workerNarratorId).toBe("p3a-worker-1");
+		expect(item.state).toBe("cancelled");
+		expect(item.worktreeResourceId).toBeNull();
+		expect(existsSync(join(source, ".worktrees", `team-${item.id}`))).toBe(false);
+	});
+
+	test("an item it only attached to goes back to the queue without that worker", async () => {
+		const queued = await items.createWorkItem({
+			coordinatorId: LEAD,
+			title: "Queued",
+			actor: { kind: "agent", id: LEAD },
+			principal: { userId: "p3a-user", isAdmin: false },
+			signal: new AbortController().signal,
+		});
+		failAfterCreate = true;
+		const failed = await agentTool.execute(
+			{ workdir: items.worktreePathOf(queued) ?? "", prompt: "p" },
+			ctx(),
+		);
+		expect(failed.isError).toBe(true);
+		expect(only()).toMatchObject({ state: "queued", workerNarratorId: null });
+		const kinds = sqlite
+			.query<{ kind: string }, []>("SELECT kind FROM team_work_events ORDER BY rowid")
+			.all()
+			.map((row) => row.kind);
+		expect(kinds).toEqual(["work.created", "work.started", "work.start_failed"]);
 	});
 });
 

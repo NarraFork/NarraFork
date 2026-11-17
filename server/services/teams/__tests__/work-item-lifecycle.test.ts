@@ -9,7 +9,7 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorktreeDependent } from "@shared/narrator-worktrees";
@@ -57,6 +57,7 @@ let temporary: string;
 let source: string;
 let dependents: WorktreeDependent[];
 let runningWorkers: Set<string>;
+let held: string[][];
 
 async function git(args: string[], cwd = source) {
 	const result = await safeSpawn({
@@ -120,19 +121,7 @@ function removalService(): NarratorWorktreeService<string> {
 			},
 			save: async () => undefined,
 		},
-		runGit: (workspace, args, abort, _writing, scope) =>
-			safeSpawn({
-				cmd: [
-					"git",
-					"--no-optional-locks",
-					"-C",
-					scope?.kind === "directory" ? scope.path : (workspace.workspace.rootPath ?? source),
-					...args,
-				],
-				timeout: 10_000,
-				maxOutputBytes: WORKTREE_MAX_OUTPUT_BYTES,
-				signal: abort,
-			}),
+		// No runGit seam: removal runs git exactly as production does (hardened spawn).
 		retirement: {
 			inspect: async ({ worktreePath }) => {
 				const row = registrationAt(worktreePath);
@@ -226,7 +215,11 @@ function fixturePorts(): WorkItemWorktreePorts {
 					signal,
 				),
 			),
-		isNarratorRunning: (id) => runningWorkers.has(id),
+		holdSessions: async (ids, fn) => {
+			held.push([...ids]);
+			const busy = ids.find((id) => runningWorkers.has(id));
+			return busy ? { held: false, busy } : { held: true, value: await fn() };
+		},
 		principalOf: async (userId) => ({ userId, isAdmin: false }),
 		gitIdentity: async () => ({
 			GIT_AUTHOR_NAME: "Team",
@@ -259,11 +252,11 @@ function seedTeam() {
 	);
 }
 
-function seedWorker(id: string) {
+function seedWorker(id: string, parent = LEAD, status = "idle") {
 	sqlite.run(
-		`INSERT INTO narrators (id, type, title, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
-		VALUES (?, 'subagent', ?, ?, ?, ?, ?)`,
-		[id, id, LEAD, LEAD, NOW, NOW],
+		`INSERT INTO narrators (id, type, title, status, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+		VALUES (?, 'subagent', ?, ?, ?, ?, ?, ?)`,
+		[id, id, status, parent, LEAD, NOW, NOW],
 	);
 }
 
@@ -306,6 +299,7 @@ beforeEach(async () => {
 	await mkdir(join(source, ".worktrees"));
 	dependents = [];
 	runningWorkers = new Set();
+	held = [];
 	seedTeam();
 	setWorkItemPortsForTests(fixturePorts());
 });
@@ -337,11 +331,21 @@ describe("work item lifecycle", () => {
 
 		seedWorker("p3-worker");
 		attachWorker(LEAD, item.id, "p3-worker", agent);
-		// The worktree is the team's for the coordinator and both subagent levels (permissions).
-		seedWorker("p3-helper");
+		// The worktree is the team's for the coordinator, its worker and the worker's helpers.
+		seedWorker("p3-helper", "p3-worker");
 		for (const id of [LEAD, "p3-worker", "p3-helper"])
 			expect(teamWorktreePathsForNarrator(id)).toEqual([path ?? ""]);
 		expect(teamWorktreePathsForNarrator("p3-nobody")).toEqual([]);
+		// Another worker's item is not this worker's: only the coordinator sees both.
+		const other = await create("Someone else's");
+		seedWorker("p3-other-worker");
+		attachWorker(LEAD, other.id, "p3-other-worker", agent);
+		const otherPath = worktreePathOf(other) ?? "";
+		expect(teamWorktreePathsForNarrator(LEAD).sort()).toEqual([path ?? "", otherPath].sort());
+		expect(teamWorktreePathsForNarrator("p3-worker")).toEqual([path ?? ""]);
+		expect(teamWorktreePathsForNarrator("p3-helper")).toEqual([path ?? ""]);
+		expect(teamWorktreePathsForNarrator("p3-other-worker")).toEqual([otherPath]);
+		cancelWorkItem({ coordinatorId: LEAD, itemId: other.id, actor: agent });
 		await commitFile(path ?? "", "export.ts", "export const x = 1;\n", "export button");
 
 		// Ready before any review is refused.
@@ -524,6 +528,64 @@ describe("base sync", () => {
 		expect(await git(["rev-parse", "HEAD"], path)).toBe(before);
 	});
 
+	test("the worker and its live helpers are held through the merge; a running helper is busy", async () => {
+		const item = await create("Held");
+		seedWorker("p3-held");
+		attachWorker(LEAD, item.id, "p3-held", agent);
+		seedWorker("p3-held-helper", "p3-held");
+		seedWorker("p3-held-gone", "p3-held", "archived");
+		const path = worktreePathOf(item) ?? "";
+		await commitFile(path, "mine.txt", "mine\n", "item work");
+		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
+		const before = await git(["rev-parse", "HEAD"], path);
+		runningWorkers.add("p3-held-helper");
+		const busy = await syncWorkItem({
+			coordinatorId: LEAD,
+			itemId: item.id,
+			actor: agent,
+			userId: USER,
+		});
+		expect(busy).toMatchObject({ outcome: "handed_off", reason: "worker_running" });
+		expect(held.at(-1)?.sort()).toEqual(["p3-held", "p3-held-helper"]);
+		expect(await git(["rev-parse", "HEAD"], path)).toBe(before);
+		runningWorkers.clear();
+		const merged = await syncWorkItem({
+			coordinatorId: LEAD,
+			itemId: item.id,
+			actor: agent,
+			userId: USER,
+		});
+		expect(merged.outcome).toBe("merged");
+	});
+
+	test("commits a sync brings in from the base do not count as commits since the review", async () => {
+		const item = await create("Reviewed then synced");
+		const path = worktreePathOf(item) ?? "";
+		await commitFile(path, "mine.txt", "mine\n", "item work");
+		await recordReview({
+			coordinatorId: LEAD,
+			itemId: item.id,
+			verdict: "clear",
+			findings: 0,
+			reviewer: null,
+			actor: agent,
+		});
+		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
+		await commitFile(source, "theirs2.txt", "theirs\n", "base moved again");
+		const synced = await syncWorkItem({
+			coordinatorId: LEAD,
+			itemId: item.id,
+			actor: agent,
+			userId: USER,
+		});
+		expect(synced.outcome).toBe("merged");
+		expect(
+			(await markReady({ coordinatorId: LEAD, itemId: item.id, actor: agent })).commitsSinceReview,
+		).toBe(
+			1, // the merge commit itself; the two base commits are not counted
+		);
+	});
+
 	test("overlap covers the same path and file-versus-directory collisions", () => {
 		expect(overlappingPaths(["a/b.txt", "c.txt"], ["a/b.txt"])).toEqual(["a/b.txt"]);
 		expect(overlappingPaths(["a"], ["a/b.txt"])).toEqual(["a"]);
@@ -605,5 +667,81 @@ describe("team records", () => {
 		expect(() => recordDecision({ coordinatorId: "p3-nobody", text: "x", actor: agent })).toThrow(
 			"Only a team coordinator",
 		);
+	});
+});
+
+describe("no repository code runs on the server", () => {
+	/** A hook, an fsmonitor and filter drivers that each leave a mark when git runs them. */
+	async function plant(path: string, marker: string, options: { filters?: boolean } = {}) {
+		// Husky ≥ 5: a relative hooksPath whose directory ignores itself.
+		await git(["config", "core.hooksPath", ".husky/_"]);
+		const hooks = join(path, ".husky", "_");
+		await mkdir(hooks, { recursive: true });
+		await writeFile(join(hooks, ".gitignore"), "*\n");
+		for (const hook of ["pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-merge"]) {
+			await writeFile(join(hooks, hook), `#!/bin/sh\necho ${hook} >> ${marker}\n`);
+			await chmod(join(hooks, hook), 0o755);
+		}
+		const fsmonitor = join(temporary, "fsmonitor.sh");
+		await writeFile(fsmonitor, `#!/bin/sh\necho fsmonitor >> ${marker}\nexit 1\n`);
+		await chmod(fsmonitor, 0o755);
+		await git(["config", "core.fsmonitor", fsmonitor]);
+		if (options.filters) {
+			await git(["config", "filter.probe.clean", `sh -c 'echo clean >> ${marker}; cat'`]);
+			await git(["config", "filter.probe.smudge", `sh -c 'echo smudge >> ${marker}; cat'`]);
+			await git(["config", "merge.probe.driver", `sh -c 'echo driver >> ${marker}; exit 1'`]);
+		}
+	}
+
+	test("sync merges with hooks and fsmonitor disabled; an ignored executable hook never runs", async () => {
+		const item = await create("Hooked");
+		const path = worktreePathOf(item) ?? "";
+		const marker = join(temporary, "marker");
+		await commitFile(path, "mine.txt", "mine\n", "item work");
+		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
+		await plant(path, marker);
+		expect(await git(["status", "--porcelain", "--untracked-files=all"], path)).toBe("");
+		await rm(marker, { force: true });
+		const outcome = await syncWorkItem({
+			coordinatorId: LEAD,
+			itemId: item.id,
+			actor: agent,
+			userId: USER,
+		});
+		expect(outcome.outcome).toBe("merged");
+		expect(existsSync(marker)).toBe(false);
+	});
+
+	test("filter or merge drivers in the config: sync hands off, queries never run them", async () => {
+		const item = await create("Filtered");
+		const path = worktreePathOf(item) ?? "";
+		const marker = join(temporary, "marker");
+		await writeFile(join(path, ".gitattributes"), "*.t filter=probe merge=probe\n");
+		await writeFile(join(path, "a.t"), "a\n");
+		await git(["add", "."], path);
+		await commitAll(path, "attributes");
+		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
+		await plant(path, marker, { filters: true });
+		await rm(marker, { force: true });
+		// Racily clean: status would have to run the clean filter to compare.
+		await writeFile(join(path, "a.t"), "a\n");
+		const outcome = await syncWorkItem({
+			coordinatorId: LEAD,
+			itemId: item.id,
+			actor: agent,
+			userId: USER,
+		});
+		expect(outcome).toMatchObject({ outcome: "handed_off", reason: "custom_drivers" });
+		// The removal channel's own git (status for the loss, worktree remove) is hardened too.
+		cancelWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		const cleaned = await cleanupWorkItem({
+			coordinatorId: LEAD,
+			itemId: item.id,
+			principal,
+			actor: agent,
+			signal: signal(),
+		});
+		expect(cleaned.outcome).toBe("removed");
+		expect(existsSync(marker)).toBe(false);
 	});
 });
