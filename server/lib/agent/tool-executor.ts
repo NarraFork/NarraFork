@@ -1590,6 +1590,8 @@ async function executeToolUntraced(
 						childTu,
 						{
 							...config,
+							// The script reads the file, not the model: its text is never annotated.
+							annotateToolResult: undefined,
 							defaultDeviceId,
 							signal: combinedSignal,
 							permissionHandler: async (...args) => {

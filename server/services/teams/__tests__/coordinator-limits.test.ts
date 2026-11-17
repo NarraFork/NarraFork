@@ -394,6 +394,16 @@ describe("who gets reminders, in which words", () => {
 		);
 	});
 
+	test("an Eval script's internal reads get the file itself, never a reminder", () => {
+		const source = readFileSync(
+			join(import.meta.dir, "../../../lib/agent/tool-executor.ts"),
+			"utf8",
+		);
+		const internal = source.slice(source.indexOf("ctx.executeRead = async"));
+		const childCall = internal.slice(0, internal.indexOf("childTu,\n") + 400);
+		expect(childCall).toContain("annotateToolResult: undefined,");
+	});
+
 	test("the session's prompt language: zh-CN", async () => {
 		const { output } = await runFake(
 			"Edit",
