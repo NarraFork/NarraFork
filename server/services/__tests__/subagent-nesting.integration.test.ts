@@ -1,0 +1,554 @@
+/**
+ * Two-level subagent nesting (Project Teams S1) through the real services: a primary's
+ * `worker` subagent may launch and await helpers; a helper never launches anything.
+ *
+ * What has to hold:
+ *  1. each backstop (visibility, creation, control) refuses a third level, also when the
+ *     helper's stored ceiling lost its level stamp (the parent chain decides too);
+ *  2. a read-only subagent cannot create a writable helper;
+ *  3. reach: a worker reaches its parent, siblings and own helpers; a helper reaches its
+ *     parent and siblings; the primary does not reach its grandchildren; Await only
+ *     targets agents the caller launched;
+ *  4. a helper's permission request reaches the primary's page and panel state, and is
+ *     approvable by someone with write access on the root, not by others;
+ *  5. stopping a worker stops its helpers (not a taken-over one; never a primary's);
+ *  6. after a restart a helper's background run fails explicitly and its parent is told;
+ *  7. TeamStatus prints the tree, and a worker's card snapshot lists its helpers.
+ */
+import { afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { eq, inArray } from "drizzle-orm";
+import { db } from "../../db";
+import {
+	aclGrants,
+	backgroundTasks,
+	narratorBufferedMessages,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
+import { teamStatusTool } from "../../lib/agent/tools/team-status";
+import type { ToolContext } from "../../lib/agent/types";
+import { generateId } from "../../lib/id";
+import { parseRuntimePolicyTraits, withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
+import * as ws from "../../websocket/narrator-ws";
+import {
+	awaitAgentResultDetailed,
+	resolveSubagentTargets,
+	sendSubagentMessageDetailed,
+} from "../agent-communication";
+import { setRunHold } from "../agent-runtime/ownership";
+import {
+	compileDelegationPolicy,
+	isRuntimeToolAllowed,
+	MAX_DELEGATION_DEPTH,
+	resolveRuntimePolicy,
+	withDelegationDepth,
+} from "../agent-runtime/policy";
+import { stopSubagentHelpers } from "../agent-runtime/run";
+import { backgroundTaskService } from "../background-task-service";
+import { DELEGATION_DEPTH_LIMIT_MESSAGE, delegationDepthOf } from "../delegation-depth";
+import { canWriteNarrator } from "../narrator-acl";
+import { authorizeAgentControl } from "../narrator-control";
+import { getNarratorPanelState } from "../narrator-panel-state";
+import { narratorService } from "../narrator-service";
+import {
+	broadcastPermissionFrame,
+	nestedSubagentRootOf,
+	resetNestedSubagentRoots,
+} from "../nested-subagent-routing";
+import { loadNestedSubagentSummaries } from "../subagent-nested";
+import { resetTraitLayerCaches, resolveNarratorRuntimePolicy } from "../trait-layer-service";
+
+const created: string[] = [];
+const userIds: string[] = [];
+
+beforeAll(async () => {
+	// Terminal delivery is observed through the task rows; the async publication
+	// scheduler would otherwise race this file's cleanup.
+	(await import("../agent-runtime/publication")).runtimePublication.stop();
+});
+
+afterEach(async () => {
+	resetTraitLayerCaches();
+	resetNestedSubagentRoots();
+	for (const id of created) {
+		setRunHold(id, undefined);
+		backgroundTaskService.unregisterAbortController(id);
+	}
+	const ids = created.splice(0);
+	if (ids.length) {
+		await db.delete(backgroundTasks).where(inArray(backgroundTasks.parentNarratorId, ids));
+		await db
+			.delete(narratorBufferedMessages)
+			.where(inArray(narratorBufferedMessages.narratorId, ids));
+		await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.narratorId, ids));
+		await db.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.narratorId, ids));
+		await db.delete(narratorMessages).where(inArray(narratorMessages.narratorId, ids));
+		await db.delete(aclGrants).where(inArray(aclGrants.scopeId, ids));
+		await db
+			.update(narrators)
+			.set({
+				parentNarratorId: null,
+				aclRootNarratorId: null,
+				policySourceNarratorId: null,
+				runtimeRegistrationJson: null,
+			})
+			.where(inArray(narrators.id, ids));
+		await db.delete(narrators).where(inArray(narrators.id, ids));
+	}
+	const users_ = userIds.splice(0);
+	if (users_.length) await db.delete(users).where(inArray(users.id, users_));
+});
+
+async function makeUser(label: string): Promise<string> {
+	const id = generateId();
+	await db.insert(users).values({
+		id,
+		username: `${label}-${id}`,
+		passwordHash: "x",
+		role: "user",
+		createdAt: new Date().toISOString(),
+	});
+	userIds.push(id);
+	return id;
+}
+
+async function subagent(parentNarratorId: string, subagentType: string, title?: string) {
+	const row = await narratorService.createSubagent({
+		subagentOriginKind: "standalone",
+		parentNarratorId,
+		subagentType,
+		title,
+		cwd: ".",
+	});
+	created.push(row.id);
+	return row.id;
+}
+
+/** primary → worker (level 1) → helper (level 2), plus a level-1 sibling and a level-2 sibling. */
+async function tree(ownerUserId?: string) {
+	const primary = (await narratorService.create({ locale: "en", ownerUserId })).id;
+	created.push(primary);
+	const worker = await subagent(primary, "worker", "worker");
+	const sibling = await subagent(primary, "general", "sibling");
+	const helper = await subagent(worker, "general", "helper");
+	const helperSibling = await subagent(worker, "explore", "helper-sibling");
+	return { primary, worker, sibling, helper, helperSibling };
+}
+
+function ctx(narratorId: string): ToolContext {
+	return {
+		narratorId,
+		cwd: ".",
+		signal: new AbortController().signal,
+		locale: "en",
+		requestPermission: async () => ({ behavior: "allow" as const }),
+	};
+}
+
+/** A Send call row on `caller`, so a delivery has an exact tool receipt. */
+function sendInput(caller: string, ids: string[]) {
+	const messageId = generateId();
+	const now = new Date().toISOString();
+	db.insert(narratorMessages)
+		.values({
+			id: messageId,
+			narratorId: caller,
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
+		})
+		.run();
+	db.insert(narratorToolCalls)
+		.values({
+			id: `${messageId}-tool`,
+			narratorId: caller,
+			messageId,
+			toolUseId: `${messageId}-use`,
+			toolName: "Send",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			status: "running",
+			createdAt: now,
+		})
+		.run();
+	return {
+		callerNarratorId: caller,
+		ids,
+		toolUseId: `${messageId}-use`,
+		toolCallBinding: { toolCallId: `${messageId}-tool`, attempt: 1 },
+		message: "hello",
+		signal: new AbortController().signal,
+		locale: "en",
+	} satisfies Parameters<typeof sendSubagentMessageDetailed>[0];
+}
+
+/** A pending tool call of `owner`, placed under `parentToolUseId`. */
+function pendingCall(owner: string, parentToolUseId: string | null) {
+	const id = generateId();
+	const now = new Date().toISOString();
+	db.insert(narratorMessages)
+		.values({
+			id: `m-${id}`,
+			narratorId: owner,
+			role: "assistant",
+			contentJson: [],
+			parentToolUseId,
+			createdAt: now,
+		})
+		.run();
+	db.insert(narratorToolCalls)
+		.values({
+			id,
+			narratorId: owner,
+			messageId: `m-${id}`,
+			toolUseId: `use-${id}`,
+			toolName: "Bash",
+			inputJson: { command: "ls" },
+			status: "pending",
+			createdAt: now,
+		})
+		.run();
+	return id;
+}
+
+/** An Agent call in `owner`'s own transcript, i.e. the placement of a child it launched. */
+async function agentCall(owner: string): Promise<string> {
+	const id = generateId();
+	const now = new Date().toISOString();
+	await db.insert(narratorMessages).values({
+		id: `m-${id}`,
+		narratorId: owner,
+		role: "assistant",
+		contentJson: [],
+		createdAt: now,
+	});
+	await db.insert(narratorMessageRefs).values({
+		id: `r-${id}`,
+		narratorId: owner,
+		messageId: `m-${id}`,
+		seq: 1,
+	});
+	await db.insert(narratorToolCalls).values({
+		id,
+		narratorId: owner,
+		messageId: `m-${id}`,
+		toolUseId: `agent-${id}`,
+		toolName: "Agent",
+		status: "running",
+		createdAt: now,
+	});
+	return `agent-${id}`;
+}
+
+/** A running background task of `owner` whose run is `child` (as createAgentTask writes it). */
+async function backgroundRun(owner: string, child: string) {
+	const now = new Date().toISOString();
+	const { runtimePublication } = await import("../agent-runtime/publication");
+	const run = runtimePublication.startRun({
+		narratorId: child,
+		binding: { deliverTo: { narratorId: owner, toolUseId: "test-tool-use" } },
+	}).publication;
+	await db.insert(backgroundTasks).values({
+		id: child,
+		parentNarratorId: owner,
+		type: "agent",
+		status: "running",
+		logicalRunId: run?.logicalRunId,
+		subagentNarratorId: child,
+		alias: `run-${child}`,
+		startedAt: now,
+		createdAt: now,
+		updatedAt: now,
+	});
+	const abort = new AbortController();
+	backgroundTaskService.registerAbortController(child, abort);
+	return abort;
+}
+
+describe("depth backstops", () => {
+	test("visibility: a worker sees Agent, its helper never does, whatever its template", () => {
+		const worker = resolveRuntimePolicy([
+			withDelegationDepth(compileDelegationPolicy({ template: "worker" }), 1),
+		]);
+		expect(worker.delegationDepth).toBe(1);
+		expect(worker.capabilities.spawnAgent).toBe(true);
+		expect(worker.capabilities.awaitAgent).toBe(true);
+		expect(isRuntimeToolAllowed(worker, "Agent")).toBe(true);
+		// A worker template at the deepest level, and an unrestricted declaration that only
+		// says "level 2", both lose spawning and agent waits.
+		for (const declarations of [
+			[withDelegationDepth(compileDelegationPolicy({ template: "worker" }), 2)],
+			[{ version: 1 as const, delegationDepth: MAX_DELEGATION_DEPTH }],
+			[
+				compileDelegationPolicy({ template: "worker" }),
+				{ version: 1 as const, delegationDepth: 2 },
+			],
+		]) {
+			const policy = resolveRuntimePolicy(declarations);
+			expect(policy.capabilities.spawnAgent).toBe(false);
+			expect(policy.capabilities.awaitAgent).toBe(false);
+			for (const name of ["Agent", "Task", "ContinueTask", "ForkNarrator"])
+				expect(isRuntimeToolAllowed(policy, name)).toBe(false);
+		}
+		// Existing templates keep their behaviour: none of them spawns.
+		for (const template of ["general", "review", "explore", "plan", "search"]) {
+			const policy = resolveRuntimePolicy([compileDelegationPolicy({ template })]);
+			expect(policy.capabilities.spawnAgent).toBe(false);
+			expect(isRuntimeToolAllowed(policy, "Agent")).toBe(false);
+		}
+	});
+
+	test("creation: a helper is stamped level 2 and cannot create a third level", async () => {
+		const { primary, worker, helper } = await tree();
+		expect(await delegationDepthOf(primary)).toBe(0);
+		expect(await delegationDepthOf(worker)).toBe(1);
+		expect(await delegationDepthOf(helper)).toBe(2);
+		const helperRow = await narratorService.getById(helper);
+		expect(parseRuntimePolicyTraits(helperRow.traits)[0]?.delegationDepth).toBe(2);
+		expect((await resolveNarratorRuntimePolicy(helper)).capabilities.spawnAgent).toBe(false);
+		await expect(subagent(helper, "general")).rejects.toThrow(DELEGATION_DEPTH_LIMIT_MESSAGE);
+		// Even when the helper's ceiling lost its stamp and was made unrestricted, the parent
+		// chain still places it at level 2.
+		await db
+			.update(narrators)
+			.set({ traits: withRuntimePolicyTrait(["standalone"], { version: 1 }) })
+			.where(eq(narrators.id, helper));
+		resetTraitLayerCaches();
+		await expect(subagent(helper, "worker")).rejects.toThrow(DELEGATION_DEPTH_LIMIT_MESSAGE);
+	});
+
+	test("creation: a general subagent still cannot spawn", async () => {
+		const { sibling } = await tree();
+		await expect(subagent(sibling, "general")).rejects.toThrow("capability ceiling");
+	});
+
+	test("control: the worker controls its helper; a level-2 narrator controls nobody", async () => {
+		const { worker, helper } = await tree();
+		await narratorService.updateStatus(helper, "working");
+		const target = await authorizeAgentControl({
+			callerNarratorId: worker,
+			targetNarratorId: helper,
+			action: "stop",
+		});
+		expect(target.id).toBe(helper);
+		// A row registered as controlled by the helper (only possible by tampering).
+		const { delegationRegistration } = await import("../../lib/validators/runtime-registration");
+		const forged = await subagent(worker, "general");
+		await db
+			.update(narrators)
+			.set({ runtimeRegistrationJson: delegationRegistration(helper, "general") })
+			.where(eq(narrators.id, forged));
+		// The helper's own stored ceiling is unrestricted here; the chain still refuses.
+		await db
+			.update(narrators)
+			.set({ traits: withRuntimePolicyTrait(["standalone"], { version: 1 }) })
+			.where(eq(narrators.id, helper));
+		resetTraitLayerCaches();
+		await expect(
+			authorizeAgentControl({ callerNarratorId: helper, targetNarratorId: forged, action: "stop" }),
+		).rejects.toThrow(DELEGATION_DEPTH_LIMIT_MESSAGE);
+	});
+
+	test("a read-only subagent cannot create a writable helper", async () => {
+		const primary = (await narratorService.create({ locale: "en" })).id;
+		created.push(primary);
+		const readOnlyWorker = await subagent(primary, "worker");
+		await db
+			.update(narrators)
+			.set({
+				traits: withRuntimePolicyTrait(["standalone"], {
+					...withDelegationDepth(compileDelegationPolicy({ template: "worker" }), 1),
+					readOnly: true,
+				}),
+			})
+			.where(eq(narrators.id, readOnlyWorker));
+		resetTraitLayerCaches();
+		expect((await resolveNarratorRuntimePolicy(readOnlyWorker)).capabilities.spawnAgent).toBe(true);
+		const helper = await subagent(readOnlyWorker, "general");
+		const policy = await resolveNarratorRuntimePolicy(helper);
+		expect(policy.tools.readOnly).toBe(true);
+		expect(isRuntimeToolAllowed(policy, "Write")).toBe(false);
+		expect(isRuntimeToolAllowed(policy, "Edit")).toBe(false);
+		// The stored ceiling says so too, not only the live source chain.
+		const row = await narratorService.getById(helper);
+		expect(parseRuntimePolicyTraits(row.traits)[0]?.readOnly).toBe(true);
+	});
+});
+
+describe("reach", () => {
+	test("Send: parent, child and sibling; never a grandchild or another tree", async () => {
+		const { primary, worker, sibling, helper, helperSibling } = await tree();
+		const ids = async (caller: string, selector: string) =>
+			(await resolveSubagentTargets({ callerNarratorId: caller, id: selector })).map((n) => n.id);
+		expect(await ids(worker, helper)).toEqual([helper]);
+		expect(await ids(worker, sibling)).toEqual([sibling]);
+		expect(await ids(helper, helperSibling)).toEqual([helperSibling]);
+		expect(await ids(primary, worker)).toEqual([worker]);
+		// The primary does not message its grandchildren; a helper does not reach its
+		// parent's siblings; a first-level sibling does not reach the worker's helpers.
+		await expect(ids(primary, helper)).rejects.toThrow("does not belong");
+		await expect(ids(helper, sibling)).rejects.toThrow("does not belong");
+		await expect(ids(sibling, helper)).rejects.toThrow("does not belong");
+		const other = await tree();
+		await expect(ids(worker, other.helper)).rejects.toThrow("does not belong");
+
+		// A helper reports to its parent (a subagent itself) through "parent".
+		const toParent = await sendSubagentMessageDetailed(sendInput(helper, ["parent"]));
+		expect(toParent.targets.map((t) => [t.id, t.status === "failed"])).toEqual([[worker, false]]);
+		// The worker writes to its helper as its parent.
+		const toChild = await sendSubagentMessageDetailed(sendInput(worker, [helper]));
+		expect(toChild.targets.map((t) => t.status)).not.toContain("failed");
+		// The model-facing projection names the worker as the helper's parent, not a sibling.
+		const queued = await db.query.narratorBufferedMessages.findMany({
+			where: eq(narratorBufferedMessages.narratorId, helper),
+		});
+		expect(queued).toHaveLength(1);
+		expect(JSON.stringify(queued[0])).toContain("[Message from the parent narrator]");
+		expect(JSON.stringify(queued[0])).not.toContain("sibling subagent");
+	});
+
+	test("Await: only agents the caller launched", async () => {
+		const { primary, worker, sibling, helper } = await tree();
+		const wait = (caller: string, id: string) =>
+			awaitAgentResultDetailed({
+				callerNarratorId: caller,
+				id,
+				signal: new AbortController().signal,
+				timeoutMs: 1_000,
+			});
+		await narratorService.updateStatus(helper, "idle");
+		const result = await wait(worker, helper);
+		expect(result.id).toBe(helper);
+		await expect(wait(worker, sibling)).rejects.toThrow("not a subagent this narrator launched");
+		await expect(wait(primary, helper)).rejects.toThrow("not a subagent this narrator launched");
+		// A helper and an ordinary subagent may not wait for agents at all.
+		await expect(wait(helper, worker)).rejects.toThrow("Await");
+		await expect(wait(sibling, worker)).rejects.toThrow("Await");
+	});
+});
+
+describe("approvals reach the root", () => {
+	test("a helper's request is forwarded to the root page and listed in its panel state", async () => {
+		const { primary, worker, helper } = await tree();
+		expect(nestedSubagentRootOf(helper)).toBe(primary);
+		expect(nestedSubagentRootOf(worker)).toBeUndefined();
+
+		const sent: Array<[string, unknown]> = [];
+		const spy = spyOn(ws, "broadcastToNarrator").mockImplementation((id, frame) => {
+			sent.push([id, frame]);
+		});
+		try {
+			broadcastPermissionFrame(helper, worker, {
+				type: "permission_resolved",
+				narratorId: worker,
+				requestId: "r1",
+				toolUseId: "u1",
+				ownerNarratorId: helper,
+				subagentNarratorId: helper,
+			});
+		} finally {
+			spy.mockRestore();
+		}
+		expect(sent.map(([id, frame]) => [id, (frame as { narratorId: string }).narratorId])).toEqual([
+			[worker, worker],
+			[primary, primary],
+		]);
+
+		const placement = await agentCall(worker);
+		const request = pendingCall(helper, placement);
+		const stray = pendingCall(helper, "not-a-worker-call");
+		const rootPanel = await getNarratorPanelState(primary, "viewer");
+		const listed = rootPanel.permissions.map((p: { id: string }) => p.id);
+		expect(listed).toContain(request);
+		expect(listed).not.toContain(stray);
+		const item = rootPanel.permissions.find((p: { id: string }) => p.id === request);
+		expect(item?.subagentNarratorId).toBe(helper);
+	});
+
+	test("write access on the root decides who may approve a helper's request", async () => {
+		const owner = await makeUser("owner");
+		const colleague = await makeUser("colleague");
+		const stranger = await makeUser("stranger");
+		const { primary, helper } = await tree(owner);
+		const helperRow = await narratorService.getById(helper);
+		expect(helperRow.aclRootNarratorId).toBe(primary);
+		const as = (userId: string) => ({ userId, isAdmin: false });
+		expect(await canWriteNarrator(helperRow, as(owner))).toBe(true);
+		expect(await canWriteNarrator(helperRow, as(colleague))).toBe(false);
+		await db.insert(aclGrants).values({
+			id: generateId(),
+			scopeType: "narrator",
+			scopeId: primary,
+			principalType: "user",
+			principalId: colleague,
+			capability: "write",
+			createdAt: new Date().toISOString(),
+		});
+		expect(await canWriteNarrator(helperRow, as(colleague))).toBe(true);
+		expect(await canWriteNarrator(helperRow, as(stranger))).toBe(false);
+	});
+});
+
+describe("stop and restart", () => {
+	test("stopping a worker stops its helpers, except one a person has taken over", async () => {
+		const { primary, worker, sibling, helper, helperSibling } = await tree();
+		for (const id of [sibling, helper, helperSibling])
+			await narratorService.updateStatus(id, "working");
+		const helperRun = await backgroundRun(worker, helper);
+		const heldRun = await backgroundRun(worker, helperSibling);
+		setRunHold(helperSibling, { released: false });
+		const siblingRun = await backgroundRun(primary, sibling);
+
+		expect(await stopSubagentHelpers(worker, "test")).toBe(1);
+		expect(helperRun.signal.aborted).toBe(true);
+		expect(heldRun.signal.aborted).toBe(false);
+		// A primary's background agents are never stopped this way.
+		expect(await stopSubagentHelpers(primary, "test")).toBe(0);
+		expect(siblingRun.signal.aborted).toBe(false);
+	});
+
+	test("after a restart a helper's background run ends explicitly, delivered to its parent", async () => {
+		const { worker, helper } = await tree();
+		await narratorService.updateStatus(helper, "working");
+		await backgroundRun(worker, helper);
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		const task = await db.query.backgroundTasks.findFirst({
+			where: eq(backgroundTasks.id, helper),
+		});
+		expect(task?.status).toBe("cancelled");
+		expect(task?.parentNarratorId).toBe(worker);
+		expect(task?.output).toContain("server restart");
+	});
+});
+
+describe("tree views", () => {
+	test("TeamStatus shows the primary each agent's helpers; card snapshots list them", async () => {
+		const { primary, worker, helper, helperSibling } = await tree();
+		await narratorService.updateStatus(helperSibling, "idle");
+		const out = (await teamStatusTool.execute({ action: "list_agents" }, ctx(primary))).output;
+		const lines = out.split("\n");
+		const workerLine = lines.findIndex((line) => line.includes(`id=${worker}`));
+		expect(workerLine).toBeGreaterThan(-1);
+		const nested = lines.filter((line) => line.startsWith("  - kind=agent"));
+		expect(nested.some((line) => line.includes(`id=${helper}`))).toBe(true);
+		expect(nested.some((line) => line.includes(`id=${helperSibling}`))).toBe(true);
+		expect(out).toContain("Sibling subagents (2):");
+
+		pendingCall(helper, null);
+		const summaries = await loadNestedSubagentSummaries([worker, helper]);
+		expect(summaries.has(helper)).toBe(false);
+		const summary = summaries.get(worker);
+		expect(summary?.total).toBe(2);
+		// Active first.
+		expect(summary?.agents[0]).toMatchObject({
+			subagentNarratorId: helper,
+			status: "working",
+			subagentType: "general",
+			awaitingPermission: true,
+		});
+		expect(summary?.agents[1]?.awaitingPermission).toBeUndefined();
+	});
+});
