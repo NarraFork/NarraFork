@@ -44,6 +44,24 @@ export function useNarratorTerminals(narratorId: string) {
 	});
 }
 
+/** How often an open details panel re-reads the subagents' terminals (they live on other pages). */
+const TREE_TERMINALS_REFRESH_MS = 15_000;
+
+/**
+ * The running terminals of the subagents below a narrator, for its details panel. Their
+ * create/exit events go to each subagent's page, not this one, so the list is re-read while
+ * shown (an indexed, bounded query).
+ */
+export function useTreeTerminals(narratorId: string) {
+	return useQuery({
+		queryKey: ["terminals", "tree", { narratorId }],
+		queryFn: () => api.listTreeTerminals(narratorId),
+		enabled: !REMOTE_BUILD && !!narratorId,
+		gcTime: TERMINALS_QUERY_GC_TIME_MS,
+		refetchInterval: TREE_TERMINALS_REFRESH_MS,
+	});
+}
+
 export function useCreateNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
 	const terminalCapability = useTerminalCapability();
