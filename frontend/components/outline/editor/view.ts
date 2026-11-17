@@ -103,6 +103,7 @@ import {
 	type CmdHost,
 	caretIn,
 	hardBreak,
+	hasChildren,
 	indent,
 	joinBackward,
 	joinForward,
@@ -110,6 +111,7 @@ import {
 	outdent,
 	splitBlock,
 	toggleTask,
+	WHOLE_BLOCKS,
 } from "./commands";
 import {
 	bodyToPM,
@@ -170,9 +172,6 @@ export function foldAttr(
 	const h = hidden ? FOLD_MARK_KEYS.map((key) => hidden[key]).join(",") : "";
 	return `${subtree ?? ""}|${p}|${h}`;
 }
-
-/** Transaction meta: whole blocks are deleted as blocks (a block selection), not as text. */
-const WHOLE_BLOCKS = "outlineWholeBlocks";
 
 export interface FoldChrome {
 	subtree: "expand" | "collapse" | null;
@@ -250,10 +249,11 @@ function lis(keys: string[]): Set<number> {
 }
 
 /**
- * Why an edit was refused: a block too large, the focused root kept, or a structural change
- * while the page is still connecting (shown from its HTTP read).
+ * Why an edit was refused: a block too large, the focused root kept, a structural change while
+ * the page is still connecting (shown from its HTTP read), or one that would delete a block whose
+ * children are not loaded (`unloaded`: watched by levels, see `level-loader.ts`).
  */
-export type OutlineRefusal = "too-large" | "root" | "connecting";
+export type OutlineRefusal = "too-large" | "root" | "connecting" | "unloaded";
 
 export interface ViewOptions {
 	/** The facts view or everything (default). */
@@ -380,7 +380,13 @@ export class OutlineView implements CmdHost, ClientView {
 			handlePaste: (_v, ev) => this.handlePaste(ev),
 			// What a closed block hides is copied with it (it is not in the document).
 			transformCopied: (slice) =>
-				new Slice(this.withHidden(slice.content), slice.openStart, slice.openEnd),
+				new Slice(
+					this.withHidden(slice.content, { fresh: true, openEnd: slice.openEnd }),
+					slice.openStart,
+					slice.openEnd,
+				),
+			// A drop (a dragged selection): moved as it is, or copied as new blocks.
+			transformPasted: (slice) => this.dropped(slice),
 			clipboardTextSerializer: (slice) => this.copyText(slice),
 			handleTextInput: (_v, from, to, text) => this.handleTextInput(from, to, text),
 			handleKeyDown: (_v, ev) =>
@@ -1246,9 +1252,7 @@ export class OutlineView implements CmdHost, ClientView {
 			let gone: boolean;
 			if (kept.has(id)) {
 				// Its line kept, its end deleted: cut open where what it hides stands.
-				const end = tr.mapping.mapResult(pos + n.nodeSize - 1, 1);
-				const start = tr.mapping.mapResult(pos + 1, -1);
-				gone = end.deletedAfter && !start.deletedBefore;
+				gone = tokenDeleted(tr, pos + n.nodeSize - 1, 1) && !tokenDeleted(tr, pos + 1, -1);
 			} else gone = text;
 			if (gone) lost.push(...this.hiddenUnder(id));
 			return false;
@@ -1297,7 +1301,8 @@ export class OutlineView implements CmdHost, ClientView {
 	private guardSelectionDelete(collapse = false): boolean {
 		const state = this.pm.state;
 		const sel = state.selection;
-		if (sel.empty || sel.$from.sameParent(sel.$to) || !this.client.editable) return false;
+		if (sel.empty || !this.client.editable) return false;
+		if (sel.$from.sameParent(sel.$to) && !(sel instanceof NodeSelection)) return false;
 		const lost = this.hiddenLoss(state, state.tr.deleteSelection(), !this.blockSel);
 		if (lost.length === 0) return false;
 		this.showBeforeDelete(lost);
@@ -2095,15 +2100,12 @@ export class OutlineView implements CmdHost, ClientView {
 		const fast = this.bodyOnly(tr);
 		// Shown from an HTTP read, not live yet: typing is queued, structure waits.
 		if (!fast && this.client.provisional) return this.refuse(before, "connecting");
-		// A selection reaching into a closed block: typing over it, deleting, cutting or pasting
-		// over it would take what the block hides. The block opens instead and nothing changes;
-		// the same key again deletes what the reader now sees.
-		if (
-			!fast &&
-			!before.selection.empty &&
-			!before.selection.$from.sameParent(before.selection.$to)
-		) {
-			// (Whole blocks deleted as blocks take what they hold: `deleteBlocks`.)
+		// A change that would take what a closed block hides (a selection reaching into it typed,
+		// deleted, cut or pasted over; a join or a paste that removes the closed row itself):
+		// the block opens instead and nothing changes; the same key again does it to what the
+		// reader now sees (a join then takes its children along, as before).
+		if (!fast) {
+			// (Whole blocks deleted as blocks take what they hold: `deleteBlocks`, the map's delete.)
 			const text = !tr.getMeta(WHOLE_BLOCKS) && !this.blockSel;
 			const lost = this.hiddenLoss(before, tr, text);
 			if (lost.length > 0) {
@@ -2152,6 +2154,12 @@ export class OutlineView implements CmdHost, ClientView {
 			this.stats.reconcileFull++;
 			const moved = (tr.getMeta("moved") as Set<string> | undefined) ?? new Set<string>();
 			const r = this.reconcileFull(before.doc, doc, moved);
+			// A block whose children are not loaded (watched by levels, its own not loaded yet or
+			// refused) is never deleted: what it holds would go unseen and undo could not bring it
+			// back. The person is told to open it first.
+			const v = this.client.visible;
+			if (r.ops.some((op) => op.t === "d" && !v.open(op.id)))
+				return this.refuse(before, "unloaded");
 			const touched = [
 				...r.bodies.map((b) => b.id),
 				...r.ops.filter((op) => op.t === "i").map((op) => op.id),
@@ -2250,10 +2258,16 @@ export class OutlineView implements CmdHost, ClientView {
 	/**
 	 * A fragment of the document with what its closed blocks hide put back (from the block
 	 * model; the facts view's omissions stay out): what is copied is the whole of each block.
+	 *
+	 * `fresh`: the blocks put back get new ids (a copy dropped in this document is new blocks,
+	 * never the hidden originals moved). `openEnd`: the fragment is a slice cut open on the
+	 * right that deep; a closed row it cuts inside its line (a selection ending in it) is copied
+	 * as its text only, as when its children were in the document after the selection's end.
 	 */
-	withHidden(frag: Fragment): Fragment {
+	withHidden(frag: Fragment, opts: { fresh?: boolean; openEnd?: number } = {}): Fragment {
 		const v = this.client.visible;
 		const facts = this.factsHere();
+		const openEnd = opts.openEnd ?? 0;
 		let changed = false;
 		const kidsOf = (id: string, depth: number): PMNode[] => {
 			const out: PMNode[] = [];
@@ -2266,32 +2280,68 @@ export class OutlineView implements CmdHost, ClientView {
 				const body = parseToPM(this.client.textOf(k)).node;
 				out.push(
 					N.block.create(
-						{ id: k, task: rec.task, question: rec.question === true },
+						{ id: opts.fresh ? this.newId() : k, task: rec.task, question: rec.question === true },
 						kids.length ? [body, N.children.create(null, kids)] : [body],
 					),
 				);
 			}
 			return out;
 		};
-		const walk = (node: PMNode, depth: number): PMNode => {
+		// `cut`: the node stands on the slice's right edge, open there.
+		const walk = (node: PMNode, depth: number, cut: boolean): PMNode => {
 			if (node.type === N.block && node.attrs.collapsed && node.childCount === 1) {
+				if (cut) return node;
 				const kids = kidsOf(node.attrs.id, depth + 1);
 				if (kids.length === 0) return node;
 				changed = true;
-				return node.copy(Fragment.from([node.child(0), N.children.create(null, kids)]));
+				const put = N.children.create(null, kids);
+				this.putBack.add(put);
+				return node.copy(Fragment.from([node.child(0), put]));
 			}
 			if (node.type !== N.block && node.type !== N.children) return node;
 			const inner: PMNode[] = [];
-			node.forEach((n) => {
-				inner.push(walk(n, depth + 1));
+			const last = node.childCount - 1;
+			node.forEach((n, _, i) => {
+				inner.push(walk(n, depth + 1, cut && i === last && openEnd > depth + 1));
 			});
 			return node.copy(Fragment.from(inner));
 		};
 		const out: PMNode[] = [];
-		frag.forEach((n) => {
-			out.push(walk(n, 0));
+		const last = frag.childCount - 1;
+		frag.forEach((n, _, i) => {
+			out.push(walk(n, 0, i === last && openEnd > 0));
 		});
 		return changed ? Fragment.from(out) : frag;
+	}
+
+	/** Children put back into copies of closed blocks (`withHidden`). */
+	private readonly putBack = new WeakSet<PMNode>();
+
+	/**
+	 * A slice dropped here. Moved (dragged without the copy key): the closed blocks in it are
+	 * moved as they are, with what they hide (the children put back for the copy come out
+	 * again). Copied: every block in it is new (new ids), what closed blocks hid included.
+	 */
+	private dropped(slice: Slice): Slice {
+		const move = !!(this.pm as unknown as { dragging?: { move?: boolean } | null }).dragging?.move;
+		const walk = (node: PMNode): PMNode => {
+			if (node.type !== N.block && node.type !== N.children) return node;
+			if (move && node.type === N.block && node.childCount > 1 && this.putBack.has(node.child(1)))
+				return node.copy(Fragment.from(node.child(0)));
+			const inner: PMNode[] = [];
+			node.forEach((n) => {
+				inner.push(walk(n));
+			});
+			const copy = node.copy(Fragment.from(inner));
+			return !move && node.type === N.block
+				? copy.type.create({ ...copy.attrs, id: this.newId() }, copy.content)
+				: copy;
+		};
+		const out: PMNode[] = [];
+		slice.content.forEach((n) => {
+			out.push(walk(n));
+		});
+		return new Slice(Fragment.from(out), slice.openStart, slice.openEnd);
 	}
 
 	private copyText(slice: Slice): string {
@@ -2385,7 +2435,7 @@ export class OutlineView implements CmdHost, ClientView {
 			// Pasting into the focused block's own line: the blocks become its first children.
 			if (blockNode.childCount > 1) tr.insert(blockPos + 1 + body.nodeSize + 1, nodes);
 			else tr.insert(blockPos + 1 + body.nodeSize, N.children.create(null, nodes));
-		} else if (body.type === N.paragraph && body.content.size === 0 && blockNode.childCount === 1) {
+		} else if (body.type === N.paragraph && body.content.size === 0 && !hasChildren(blockNode)) {
 			tr.replaceWith(blockPos, blockPos + blockNode.nodeSize, nodes);
 		} else if (off >= body.content.size || !body.isTextblock) {
 			tr.insert(blockPos + blockNode.nodeSize, nodes);
@@ -2483,6 +2533,25 @@ export class OutlineView implements CmdHost, ClientView {
 	titleOf(id: string): string {
 		return titleOf(this.client.textOf(id));
 	}
+}
+
+/**
+ * Whether a transaction deletes the token right after (`side` 1) or right before (-1) a
+ * position of its starting document. (A mapping's `deletedAfter` also says so for content
+ * inserted there, which deletes nothing.)
+ */
+function tokenDeleted(tr: Transaction, pos: number, side: 1 | -1): boolean {
+	let p = pos;
+	for (const step of tr.steps) {
+		const map = step.getMap();
+		let hit = false;
+		map.forEach((from, to) => {
+			if (to > from && (side > 0 ? from <= p && p < to : from < p && p <= to)) hit = true;
+		});
+		if (hit) return true;
+		p = map.map(p, side);
+	}
+	return false;
 }
 
 export function findBlockPos(doc: PMNode, id: string): number | null {

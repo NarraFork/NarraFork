@@ -505,6 +505,7 @@ export class LiveClient {
 		this.space = options.space ?? "";
 		this.watches = [...(options.watch ?? [{ s: pageId }])];
 		this.scope = scopeOf(this.watches);
+		this.watchKeys = new Set(this.watches.map(liveWatchKey));
 		this.confirmed = new Store(pageId, this.scope);
 		this.visible = new Store(pageId, this.scope);
 		this.off.push(transport.onFrame((frame) => this.receive(frame)));
@@ -1035,7 +1036,7 @@ export class LiveClient {
 	 */
 	watching(key: string): "set" | "asked" | null {
 		if (this.watchToRemove.has(key)) return null;
-		if (this.watches.some((w) => liveWatchKey(w) === key)) return "set";
+		if (this.watchKeys.has(key)) return "set";
 		return this.watchAsked.has(key) ? "asked" : null;
 	}
 
@@ -1145,7 +1146,11 @@ export class LiveClient {
 		if (remove.length > 0) this.pruneAfter = w;
 	}
 
+	/** Keys of {@link watches}, kept with the scope (`rescope`). */
+	private watchKeys = new Set<string>();
+
 	private rescope(): void {
+		this.watchKeys = new Set(this.watches.map(liveWatchKey));
 		const next = scopeOf(this.watches);
 		this.scope.roots.clear();
 		this.scope.levels.clear();
@@ -1238,9 +1243,11 @@ export class LiveClient {
 			const wanted = this.watchAsked.has(key);
 			this.watchAsked.delete(key);
 			this.watchRefused.delete(key);
-			if (this.watches.some((x) => liveWatchKey(x) === key)) continue;
-			if (wanted) this.watches.push(w);
-			else unwanted.push(w);
+			if (this.watchKeys.has(key)) continue;
+			if (wanted) {
+				this.watches.push(w);
+				this.watchKeys.add(key);
+			} else unwanted.push(w);
 		}
 		if (ended.length > 0) {
 			const keys = new Set(ended.map(liveWatchKey));

@@ -5,9 +5,14 @@
  */
 import { describe, expect, test } from "bun:test";
 import { buildFoldTree, type FoldView } from "@shared/outline-fold";
-import { type LiveCloseCode, liveWatchKey } from "@shared/outline-live-protocol";
-import { LevelLoader } from "./level-loader";
-import type { LiveClient } from "./live-client";
+import {
+	type LiveCloseCode,
+	type LiveWatchWire,
+	liveWatchKey,
+	OUTLINE_LIVE_LIMITS,
+} from "@shared/outline-live-protocol";
+import { LevelLoader, LOADER_BATCH } from "./level-loader";
+import { LiveClient, type LiveTransport } from "./live-client";
 import { liveFoldSource } from "./live-fold";
 import { Store } from "./store";
 
@@ -114,7 +119,7 @@ describe("what the views need watched", () => {
 		expect(loading.keys()).toEqual(["l:", "l:big", "l:page", "s:big", "s:small"].sort());
 		const full = setup({
 			set: ["l:", "l:page"],
-			refused: { "s:page": "too_large", "s:small": "user_limit", "l:small": "user_limit" },
+			refused: { "s:page": "too_large", "s:small": "user_limit" },
 		});
 		let change: { add: Array<{ s?: string; l?: string | null }> } | null = null;
 		(full.client as unknown as { watch: (c: unknown) => void }).watch = (c) => {
@@ -124,6 +129,74 @@ describe("what the views need watched", () => {
 		const added = (
 			(change as { add: Array<{ s?: string; l?: string | null }> } | null)?.add ?? []
 		).map((w) => liveWatchKey(w as never));
+		// Refused for the person's share: its level is not asked for instead; it is listed.
 		expect(added).toEqual(["s:big"]);
+		expect([...full.loader.notLoaded]).toEqual([["small", "user_limit"]]);
+	});
+});
+
+describe("wide levels", () => {
+	/** A real client (not connected) watching `page` and `big` by levels, `big` open. */
+	function wide(n: number, watchedWhole: number) {
+		const transport = {
+			connected: false,
+			send: () => true,
+			onFrame: () => () => {},
+			onConnectionChange: () => () => {},
+			allocateHandle: () => 1,
+			releaseHandle: () => {},
+		} as unknown as LiveTransport;
+		const watch: LiveWatchWire[] = [{ l: null }, { l: "page" }, { l: "big" }];
+		for (let i = 0; i < watchedWhole; i++) watch.push({ s: `k${i}` });
+		const client = new LiveClient(transport, "page", "edit", { space: "sp", watch });
+		const put = (id: string, parentId: string | null, orderKey: string) =>
+			client.visible.put({ id, parentId, orderKey, task: null, deleted: false, sid: id });
+		put("page", null, "a0");
+		put("big", "page", "a0");
+		for (let i = 0; i < n; i++) put(`k${i}`, "big", `b${String(i).padStart(5, "0")}`);
+		client.watchRefused.set("s:page", "too_large");
+		client.watchRefused.set("s:big", "too_large");
+		const tree = buildFoldTree(liveFoldSource(client, { marks: new Map(), questionsKnown: true }), {
+			rootId: "page",
+		});
+		const loader = new LevelLoader(client);
+		loader.add({ foldTrees: () => [tree] });
+		return { loader, client };
+	}
+
+	test("what a level of 1,900 children wants is worked out in a few ms (the watch set is indexed)", () => {
+		const { loader } = wide(1900, 1000);
+		loader.wanted();
+		const t0 = performance.now();
+		for (let i = 0; i < 5; i++) loader.wanted();
+		const ms = (performance.now() - t0) / 5;
+		console.log(`wanted() over 1,900 children: ${ms.toFixed(2)} ms`);
+		// (Was ~68 ms with a scan of the set per block; a generous bound for slow machines.)
+		expect(ms).toBeLessThan(25);
+	});
+
+	test("new watches are asked for a batch at a time", () => {
+		const { loader, client } = wide(300, 0);
+		let change: { add: unknown[] } | null = null;
+		(client as unknown as { watch: (c: unknown) => void }).watch = (c) => {
+			change = c as never;
+		};
+		(client as unknown as { ready: boolean }).ready = true;
+		(client as unknown as { status: string }).status = "live";
+		loader.run();
+		expect((change as { add: unknown[] } | null)?.add.length).toBe(LOADER_BATCH);
+	});
+
+	test("the watch set never grows past its limit: the children past it are listed, not asked for", () => {
+		const { loader } = wide(1100, 0);
+		const notLoaded = new Map();
+		const want = loader.wanted(notLoaded);
+		expect(want?.size).toBe(OUTLINE_LIVE_LIMITS.maxWatch);
+		// The root's levels and the open block's level come first; then children in order.
+		expect(want?.has("l:big")).toBe(true);
+		expect(want?.has("s:k0")).toBe(true);
+		expect(want?.has("s:k1099")).toBe(false);
+		expect(notLoaded.size).toBe(1100 - (OUTLINE_LIVE_LIMITS.maxWatch - 3));
+		expect(notLoaded.get("k1099")).toBe("watch_cap");
 	});
 });

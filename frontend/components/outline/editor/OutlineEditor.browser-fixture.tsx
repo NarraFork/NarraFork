@@ -396,12 +396,28 @@ export function viewOutline(): string {
 				.split("\n")
 				.join(`\n${"  ".repeat(depth + 1)}`);
 			lines.push(`${"  ".repeat(depth)}- ${task}${body}`);
-			if (child.childCount > 1) walk(child.child(1), depth + 1);
+			if (child.childCount > 1) {
+				// A closed block never has children in the document.
+				if (child.attrs.collapsed) lines.push("!! a closed block with children in the document");
+				walk(child.child(1), depth + 1);
+			} else if (child.attrs.collapsed) hidden(child.attrs.id, depth + 1);
 		});
 	};
-	// What closed blocks hide is not in the document: put back from the block model.
-	const v = view();
-	const r = v.withHidden(v.pm.state.doc.content).child(0);
+	// What a closed block hides is not in the document: read from the client's block model
+	// here (not through the editor's own code), so the two are compared, not one with itself.
+	const c = view().client;
+	const hidden = (id: string, depth: number) => {
+		for (const k of c.visible.children(id)) {
+			const t = c.visible.get(k)?.task;
+			const body = c
+				.textOf(k)
+				.split("\n")
+				.join(`\n${"  ".repeat(depth + 1)}`);
+			lines.push(`${"  ".repeat(depth)}- ${t ? `[${t}] ` : ""}${body}`);
+			hidden(k, depth + 1);
+		}
+	};
+	const r = view().pm.state.doc.child(0);
 	if (r.childCount > 1) walk(r.child(1), 0);
 	return lines.join("\n");
 }

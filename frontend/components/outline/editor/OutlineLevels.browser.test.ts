@@ -17,15 +17,18 @@
  */
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { liveSpaceOf } from "../../../../server/services/outline/live/registry";
+import { outlineStore } from "../../../../server/services/outline/store";
 import { writeOutline } from "../../../../server/services/outline/write";
 import {
 	type Editor,
 	errorsOf,
+	eventually,
 	type Harness,
 	ime,
 	openEditor,
 	resetHarness,
 	seedPage,
+	serverOutline,
 	serverText,
 	settle,
 	startHarness,
@@ -302,3 +305,213 @@ test("a page too large to watch whole goes live by levels: opening loads, closin
 	expect((await inDoc(a)).length).toBe(docSize);
 	expect(errorsOf(a)).toEqual([]);
 }, 120_000);
+
+const JOIN_LINES = ["Intro", "[x] Done task", "  Result note", "    Deeper", "Open fact"];
+const FOLDER_LINES = ["Intro", "", "  Inside a", "    Inside deep", "  Inside b", "After"];
+
+/** Both the document (with what closed rows hide, read from the block model) and the server. */
+async function same(e: Editor, pageId: string) {
+	await settle(e);
+	expect(await e.call((f) => f.viewOutline())).toBe(serverOutline(pageId));
+}
+
+const refusals = (e: Editor) => e.call((f) => f.view().stats.refused);
+const undo = async (e: Editor) => {
+	await e.call((f) => f.undo());
+	await settle(e);
+};
+const redo = async (e: Editor) => {
+	await e.call((f) => f.redo());
+	await settle(e);
+};
+
+test("a join next to a closed row opens it first, then takes what it holds along; never deletes it", async () => {
+	for (const key of ["Backspace", "Delete"] as const) {
+		const { pageId, ids } = await seedPage(h, `Join ${key}`, JOIN_LINES);
+		const [intro, done, result, deeper] = ids as [string, string, string, string];
+		const a = await openEditor(h, h.owner, pageId);
+		const original = serverOutline(pageId);
+		// Backspace at the start of the closed row, or Delete at the end of the row above it.
+		if (key === "Backspace") await a.call((f, id) => f.caret(id as never, 0), done);
+		else await a.call((f, id) => f.caret(id as never, -1), intro);
+		await a.page.keyboard.press(key);
+		await settle(a);
+		// Nothing changed: the closed row opened (what it holds is on screen now).
+		expect(serverOutline(pageId)).toBe(original);
+		expect(await refusals(a)).toBe(1);
+		expect(await inDoc(a)).toContain(deeper);
+		// The same key again joins it, its children taken along (as when they were shown).
+		await a.page.keyboard.press(key);
+		await same(a, pageId);
+		const joined = serverOutline(pageId);
+		expect(joined).toContain("IntroDone task");
+		expect(joined).toContain("  - Result note");
+		expect(joined).toContain("    - Deeper");
+		expect(await a.call((f, id) => f.kids(id as never), intro)).toEqual([result]);
+		await undo(a);
+		expect(serverOutline(pageId)).toBe(original);
+		await redo(a);
+		expect(serverOutline(pageId)).toBe(joined);
+		await same(a, pageId);
+		expect(errorsOf(a)).toEqual([]);
+	}
+}, 120_000);
+
+test("an empty closed row: Backspace after it, Delete at its end and a paste into it keep what it holds", async () => {
+	for (const how of ["backspace", "delete", "paste"] as const) {
+		const { pageId, ids } = await seedPage(h, `Folder ${how}`, FOLDER_LINES);
+		const [, folder, insideA, insideDeep, insideB, after] = ids as string[];
+		const a = await openEditor(h, h.owner, pageId);
+		await a.call((f, id) => f.view().toggleCollapse(id as never), folder);
+		expect(await inDoc(a)).not.toContain(insideA);
+		if (how === "backspace") {
+			await a.call((f, id) => f.caret(id as never, 0), after);
+			await a.page.keyboard.press("Backspace");
+		} else if (how === "delete") {
+			await a.call((f, id) => f.caret(id as never, -1), folder);
+			await a.page.keyboard.press("Delete");
+		} else {
+			await a.call((f, id) => f.caret(id as never, 0), folder);
+			await a.call((f) => {
+				const data = new DataTransfer();
+				data.setData("text/plain", "- one\n- two");
+				f.view().pm.dom.dispatchEvent(
+					new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }),
+				);
+			});
+		}
+		await same(a, pageId);
+		const out = serverOutline(pageId);
+		// The closed row stays, with what it holds, where it was.
+		expect(await a.call((f, id) => f.kids(id as never), folder)).toEqual([insideA, insideB]);
+		expect(await a.call((f, id) => f.kids(id as never), insideA)).toEqual([insideDeep]);
+		if (how === "paste") expect(out).toMatch(/- one\n- two/);
+		else expect(out).toContain("- After");
+		await undo(a);
+		await same(a, pageId);
+		expect(serverOutline(pageId)).not.toContain("one");
+		expect(await a.call((f, id) => f.kids(id as never), folder)).toEqual([insideA, insideB]);
+		await redo(a);
+		await same(a, pageId);
+		expect(errorsOf(a)).toEqual([]);
+	}
+}, 120_000);
+
+/** Drop a selection the way ProseMirror does: dragged (`transformCopied`), then dropped. */
+async function drop(e: Editor, target: string, move: boolean) {
+	return e.call(
+		(f, t, mv) => {
+			const pm = f.view().pm;
+			let slice = pm.state.selection.content();
+			pm.someProp("transformCopied", (fn: (s: typeof slice, v: typeof pm) => typeof slice) => {
+				slice = fn(slice, pm);
+			});
+			(pm as unknown as { dragging: unknown }).dragging = { slice, move: mv, node: undefined };
+			pm.someProp(
+				"transformPasted",
+				(fn: (s: typeof slice, v: typeof pm, plain: boolean) => typeof slice) => {
+					slice = fn(slice, pm, false);
+				},
+			);
+			let at = -1;
+			pm.state.doc.descendants((n, pos) => {
+				if (n.type.name === "block" && n.attrs.id === t) at = pos + 1 + n.child(0).nodeSize - 1;
+				return true;
+			});
+			const tr = pm.state.tr;
+			if (mv) tr.deleteSelection();
+			const p = tr.mapping.map(at);
+			tr.replaceRange(p, p, slice);
+			pm.dispatch(tr);
+			(pm as unknown as { dragging: unknown }).dragging = null;
+		},
+		target,
+		move,
+	);
+}
+
+test("a dragged selection holding a closed row: copied, it is new blocks; moved, the row keeps what it hides", async () => {
+	const lines = ["Intro", "[x] Done task", "  Result note", "    Deeper", "Open fact", "Tail"];
+	const count = (out: string, text: string) =>
+		out.split("\n").filter((l) => l.includes(text)).length;
+	for (const move of [false, true]) {
+		const { pageId, ids } = await seedPage(h, `Drop ${move}`, lines);
+		const [intro, done, result, deeper, fact, tail] = ids as string[];
+		const a = await openEditor(h, h.owner, pageId);
+		// From inside the row above to inside the row below: the closed row whole.
+		await a.call((f, x, y) => f.select(x as never, 2, y as never, 2), intro, fact);
+		await drop(a, tail as string, move);
+		await same(a, pageId);
+		const out = serverOutline(pageId);
+		if (move) {
+			// Moved (the selection's rows went, the closed row with what it hides).
+			expect(count(out, "Result note")).toBe(1);
+			expect(count(out, "Deeper")).toBe(1);
+			expect(await a.call((f, id) => f.kids(id as never), done)).toEqual([result]);
+		} else {
+			// Copied: the original as it was, and a copy with copies of what it hid.
+			expect(count(out, "Result note")).toBe(2);
+			expect(count(out, "Deeper")).toBe(2);
+			expect(await a.call((f, id) => f.kids(id as never), done)).toEqual([result]);
+			expect(await a.call((f, id) => f.kids(id as never), result)).toEqual([deeper]);
+		}
+		expect(errorsOf(a)).toEqual([]);
+	}
+	// A selection ending inside the closed row's line: what it hides is after the selection.
+	for (const move of [false, true]) {
+		const { pageId, ids } = await seedPage(h, `Drop mid ${move}`, lines);
+		const [intro, done, result, , , tail] = ids as string[];
+		const a = await openEditor(h, h.owner, pageId);
+		await a.call((f, x, y) => f.select(x as never, 2, y as never, 4), intro, done);
+		await drop(a, tail as string, move);
+		await same(a, pageId);
+		const out = serverOutline(pageId);
+		expect(count(out, "Result note")).toBe(1);
+		expect(count(out, "Deeper")).toBe(1);
+		if (!move) expect(await a.call((f, id) => f.kids(id as never), done)).toEqual([result]);
+		expect(errorsOf(a)).toEqual([]);
+	}
+}, 120_000);
+
+test("by levels, a row whose children are not loaded is never deleted or joined away", async () => {
+	// 1,100 rows with a child each under an open fact: too large to watch whole, and more rows
+	// than a watch set takes (`maxWatch`): the last ones' children cannot be loaded.
+	const lines = ["Big"];
+	for (let i = 0; i < 1100; i++) lines.push(`  k${i}`, `    c${i}`);
+	lines.push("Tail");
+	const { pageId, ids } = await seedPage(h, "Wide", lines);
+	const idOf = (t: string) => ids[lines.findIndex((l) => l.trim() === t)] as string;
+	const a = await openEditor(h, h.owner, pageId);
+	const [k0, k1, c1, kLast, cLast] = ["k0", "k1", "c1", "k1099", "c1099"].map(idOf) as string[];
+	await waitFor(
+		() => loaded(a, c1),
+		(x) => x,
+		"the first rows' children loaded",
+	);
+	await until(a, () => !!document.querySelector("[data-testid=outline-not-loaded]"));
+	expect(await a.call((f, id) => f.client().visible.children(id as never).length, kLast)).toBe(0);
+	// Backspace at the start of a row whose child is not loaded: refused, nothing deleted.
+	const before = await refusals(a);
+	await a.call((f, id) => f.caret(id as never, 0), kLast);
+	await a.page.keyboard.press("Backspace");
+	await settle(a);
+	expect(await refusals(a)).toBe(before + 1);
+	expect((await outlineStore.getBlock(kLast))?.deleted).toBe(false);
+	expect((await outlineStore.getBlock(cLast))?.deleted).toBe(false);
+	// So is deleting it as a block.
+	await a.call((f, id) => f.view().setBlockSelection({ anchor: id, head: id }), kLast);
+	await a.page.keyboard.press("Delete");
+	await settle(a);
+	expect((await outlineStore.getBlock(cLast))?.deleted).toBe(false);
+	await a.call((f) => f.view().setBlockSelection(null));
+	// A loaded row joins as usual (into the row before it on screen, k0's child), its child
+	// taken along.
+	await a.call((f, id) => f.caret(id as never, 0), k1);
+	await a.page.keyboard.press("Backspace");
+	await settle(a);
+	await eventually(async () => (await outlineStore.getBlock(k1))?.deleted === true, "joined");
+	expect((await outlineStore.getBlock(c1))?.deleted).toBe(false);
+	expect((await outlineStore.getBlock(c1))?.parentId).toBe(idOf("c0"));
+	expect(await a.call((f, id) => f.kids(id as never), k0)).toEqual([idOf("c0")]);
+	expect(errorsOf(a)).toEqual([]);
+}, 180_000);
