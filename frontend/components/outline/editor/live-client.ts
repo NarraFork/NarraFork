@@ -480,6 +480,12 @@ export class LiveClient {
 	private readonly watchAsked = new Map<string, LiveWatchWire>();
 	/** The number of this client's last watch request (`LiveWatchHead.w`). */
 	private watchSeq = 0;
+	/**
+	 * The request that last removed watches (0: none waiting): what they showed is dropped once
+	 * its answer arrives, after every change the server cut for the old set (one may still move
+	 * a block of a removed watch into one that stays).
+	 */
+	private pruneAfter = 0;
 	/** Watches the server refused, with why (the last answer of each; tests and the editor). */
 	readonly watchRefused = new Map<string, LiveCloseCode>();
 
@@ -1031,30 +1037,43 @@ export class LiveClient {
 			return !removing.has(key) && !this.watches.some((x) => liveWatchKey(x) === key);
 		});
 		for (const w of add) this.watchAsked.set(liveWatchKey(w), w);
+		// Asked for and not answered yet: the answer's `ok` is not taken (and removed again).
 		for (const key of removing) this.watchAsked.delete(key);
 		const remove = this.watches.filter((w) => removing.has(liveWatchKey(w)));
 		if (remove.length > 0) {
 			this.watches = this.watches.filter((w) => !removing.has(liveWatchKey(w)));
 			this.rescope();
-			this.prune();
+			this.rebuildVisible();
+			this.syncViews(null);
 		}
 		if (add.length === 0 && remove.length === 0) return;
 		this.sendWatch(add, remove);
 	}
 
+	/**
+	 * Send a watch request. With removals, what was typed goes first (into blocks the removed
+	 * watches show, still taken), and what they showed is dropped once the answer comes; not
+	 * sent (offline), it is dropped now: the next join names the set whole.
+	 */
 	private sendWatch(add: readonly LiveWatchWire[], remove: readonly LiveWatchWire[]): void {
-		if (this.status !== "live" || this.handle === null || this.resetting) return;
+		if (this.status !== "live" || this.handle === null || this.resetting) {
+			if (remove.length > 0) this.prune();
+			return;
+		}
+		if (remove.length > 0) this.flushTyping();
+		const w = ++this.watchSeq;
 		this.sendFrame(
 			encodeLiveFrame({
 				kind: LIVE_FRAME.watch,
 				handle: this.handle,
 				head: {
-					w: ++this.watchSeq,
+					w,
 					...(add.length > 0 ? { add } : {}),
 					...(remove.length > 0 ? { remove } : {}),
 				},
 			}),
 		);
+		if (remove.length > 0) this.pruneAfter = w;
 	}
 
 	private rescope(): void {
@@ -1119,16 +1138,26 @@ export class LiveClient {
 			this.watchRefused.set(liveWatchKey(w), code);
 			this.watchAsked.delete(liveWatchKey(w));
 		}
+		// Added on the server but removed here before the answer: removed there too.
+		const unwanted: LiveWatchWire[] = [];
 		for (const w of head.ok ?? []) {
 			const key = liveWatchKey(w);
+			const wanted = this.watchAsked.has(key);
 			this.watchAsked.delete(key);
 			this.watchRefused.delete(key);
-			if (!this.watches.some((x) => liveWatchKey(x) === key)) this.watches.push(w);
+			if (this.watches.some((x) => liveWatchKey(x) === key)) continue;
+			if (wanted) this.watches.push(w);
+			else unwanted.push(w);
 		}
 		if (ended.length > 0) {
 			const keys = new Set(ended.map(liveWatchKey));
 			this.watches = this.watches.filter((w) => !keys.has(liveWatchKey(w)));
 		}
+		// What the set no longer shows goes once everything cut for the old set came: at an end,
+		// or at the answer to the last removal (an end before it waits for it too).
+		const answered = this.pruneAfter > 0 && head.w !== undefined && head.w >= this.pruneAfter;
+		const pruneNow = answered || (ended.length > 0 && this.pruneAfter === 0);
+		if (answered) this.pruneAfter = 0;
 		this.rescope();
 		const blocks = head.blocks ?? [];
 		for (const row of blocks) this.confirmed.put(recOfRow(blocks, row));
@@ -1140,9 +1169,10 @@ export class LiveClient {
 		}
 		for (const b of blocks) if (!this.hasText(b[0])) this.plain.set(b[0], "");
 		if (head.op !== undefined) this.opSeq = Math.max(this.opSeq, head.op);
-		if (ended.length > 0) this.prune();
+		if (pruneNow) this.prune();
 		this.rebuildVisible();
 		this.syncViews(null);
+		if (unwanted.length > 0) this.sendWatch([], unwanted);
 		this.emit("watch");
 	}
 
@@ -1813,6 +1843,11 @@ export class LiveClient {
 		}
 		this.epoch = head.epoch;
 		this.opSeq = head.op;
+		// A removal whose answer will not come (this join named the set whole).
+		if (this.pruneAfter > 0) {
+			this.pruneAfter = 0;
+			this.prune();
+		}
 		this.setStatus("live");
 		this.checkStall();
 		this.sendPending();

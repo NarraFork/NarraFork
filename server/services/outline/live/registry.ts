@@ -72,6 +72,10 @@ export const OUTLINE_LIVE_SOCKET_BOUNDS = {
 	joinBurst: 20,
 	/** …refilled at this many per second. */
 	joinsPerSecond: 2,
+	/** `watch` frames that add watches a socket may send in a burst… */
+	watchBurst: 20,
+	/** …refilled at this many per second. */
+	watchesPerSecond: 5,
 	/**
 	 * Bytes of one participant's frames waiting in the lane. A client stops at
 	 * `maxPendingBytes` unacknowledged, so only a misbehaving one gets here; it is dismissed.
@@ -268,9 +272,33 @@ function takeJoinToken(socket: LiveSocket): boolean {
 	return true;
 }
 
+/** Watch tokens per socket (`watch` frames with additions). */
+const watchBudget = hotSafe(
+	"narrafork.outlineLive.watchBudget",
+	() => new WeakMap<LiveSocket, { tokens: number; at: number }>(),
+);
+
+/** `watch` frames with additions: their own budget, refilled faster than joins. */
+function takeWatchToken(socket: LiveSocket): boolean {
+	const now = liveNow();
+	const b = watchBudget.get(socket) ?? {
+		tokens: OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst,
+		at: now,
+	};
+	b.tokens = Math.min(
+		OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst,
+		b.tokens + ((now - b.at) / 1000) * OUTLINE_LIVE_SOCKET_BOUNDS.watchesPerSecond,
+	);
+	b.at = now;
+	watchBudget.set(socket, b);
+	if (b.tokens < 1) return false;
+	b.tokens -= 1;
+	return true;
+}
+
 function watchCount(): number {
 	let n = 0;
-	for (const s of state.sessions.values()) n += s.scopes.size;
+	for (const s of state.sessions.values()) n += s.watchesHeld;
 	return n;
 }
 
@@ -442,6 +470,7 @@ async function openSession(space: OutlineSpaceRow): Promise<LiveSpace> {
 		(session, code, idle) => void lane.run(() => closeSession(session, code, idle)),
 		// What the process may still load: checked with the size of the tree just read.
 		() => OUTLINE_LIVE_SOCKET_BOUNDS.processBlocks - loadedBlocks(),
+		() => OUTLINE_LIVE_LIMITS.liveWatches - watchCount(),
 	);
 	state.sessions.set(space.id, opened);
 	state.spaces.set(space.id, space);
@@ -670,29 +699,36 @@ export function handleLiveFrame(socket: LiveSocket, frame: LiveFrame): void {
 		case LIVE_FRAME.watch: {
 			// Refused participants' frames are dropped: their rejoin names the whole set.
 			if (participant.blocked) break;
-			const head = frame.head;
-			if (watchCount() >= OUTLINE_LIVE_LIMITS.liveWatches) {
-				const add = (head as { add?: unknown } | null)?.add;
-				const w = (head as { w?: unknown } | null)?.w;
-				if (Array.isArray(add) && add.length > 0 && Number.isSafeInteger(w)) {
-					try {
-						socket.send(
-							encodeLiveFrame({
-								kind: LIVE_FRAME.watched,
-								handle: frame.handle,
-								head: {
-									w,
-									refused: add.filter(isLiveWatch).map((x) => [x, "unavailable"]),
-								},
-							}),
-						);
-					} catch {
-						// The socket is gone.
-					}
-					break;
-				}
+			const head = frame.head as { add?: unknown; remove?: unknown } | null;
+			const entries =
+				(Array.isArray(head?.add) ? head.add.length : 0) +
+				(Array.isArray(head?.remove) ? head.remove.length : 0);
+			// Additions read the blocks table: at the socket's rate (as joins), and none past the
+			// process's bound. A refused addition is answered by the session, which still takes
+			// the frame's removals (the client already did).
+			const adds = Array.isArray(head?.add) && head.add.length > 0;
+			const refuse: LiveCloseCode | undefined = !adds
+				? undefined
+				: !takeWatchToken(socket)
+					? "unavailable"
+					: watchCount() >= OUTLINE_LIVE_LIMITS.liveWatches
+						? "unavailable"
+						: undefined;
+			const size = 256 + 64 * entries;
+			if (participant.queuedBytes + size > OUTLINE_LIVE_SOCKET_BOUNDS.queuedBytes) {
+				warnRarely("Outline live participant queued too much; dismissed", {
+					spaceId: live.spaceId,
+					bytes: participant.queuedBytes,
+				});
+				state.sockets.get(socket)?.delete(frame.handle);
+				void laneFor(live.spaceId).run(() => live.dismiss(participant, "unavailable"));
+				break;
 			}
-			void laneFor(live.spaceId).run(() => live.handleWatch(participant, head));
+			participant.queuedBytes += size;
+			void laneFor(live.spaceId).run(async () => {
+				participant.queuedBytes -= size;
+				await live.handleWatch(participant, head, refuse);
+			});
 			break;
 		}
 		default:

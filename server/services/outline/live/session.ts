@@ -334,6 +334,13 @@ export class Participant {
 	 * acknowledged yet: held so the client applies them in order.
 	 */
 	heldCommits: LiveCommitWire[] = [];
+	/**
+	 * `watched` frames without structure of their own (an end, the answer to a removal or to a
+	 * refused addition), each as of an operation number: sent once everything cut for this
+	 * participant up to it went out (`LiveSpace.notify`), so its client never drops blocks that
+	 * a change on its way still names.
+	 */
+	notices: Array<{ o: number; head: LiveWatchedHead }> = [];
 	/** Set after a refusal: frames are dropped until the client joins again. */
 	blocked = false;
 	/** Frames were held back because the socket fell behind; it is told to rejoin when it drains. */
@@ -453,7 +460,23 @@ export interface CommittedEvent {
 	narratorId?: string | null;
 }
 
-type Refusal = { refused: LiveCloseCode };
+type Refusal = { refused: LiveCloseCode; read?: number };
+
+/**
+ * The watches one join or `watch` frame takes, as it goes: whose they are (their share counts
+ * them before anyone is in them), and the rows its reads may still take (a frame of many
+ * refused watches reads at most this many in all).
+ */
+interface WatchTaking {
+	userId: string;
+	views: LiveView[];
+	rowsLeft: number;
+}
+
+/** Rows one join or `watch` frame may read in all: one share and one more watch. */
+function frameReads(): number {
+	return OUTLINE_LIVE_BOUNDS.maxUserBlocks + OUTLINE_LIVE_LIMITS.maxWatchBlocks;
+}
 
 function bytesOf(text: string): number {
 	return utf8.encode(text).length;
@@ -1214,6 +1237,8 @@ export class LiveSpace {
 		private readonly onEnd: (space: LiveSpace, code: LiveCloseCode, idle: boolean) => void,
 		/** Blocks the process may still load (the registry's bound across all sessions). */
 		private readonly room: () => number = () => Number.POSITIVE_INFINITY,
+		/** Watches the process may still load (`OUTLINE_LIVE_LIMITS.liveWatches`). */
+		private readonly watchRoom: () => number = () => Number.POSITIVE_INFINITY,
 	) {}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1408,19 +1433,39 @@ export class LiveSpace {
 	 * A watch, loading it when it is not here. One per key, shared by everyone watching it; a
 	 * second watcher waits for the load under way. Runs in the lane.
 	 */
-	async ensureView(watch: LiveWatchWire, userId?: string): Promise<LiveView | Refusal> {
+	async ensureView(watch: LiveWatchWire, taking?: WatchTaking): Promise<LiveView | Refusal> {
 		const key = liveWatchKey(watch);
 		const existing = this.scopes.get(key);
 		if (existing && !existing.gone) return existing;
 		const underWay = this.loading.get(key);
 		if (underWay) return await underWay;
-		const load = this.loadView(watch, userId);
+		// The process's bound on watches: what nobody here has goes first.
+		if (this.watchRoom() <= 0) {
+			for (const v of this.idleViews(taking)) {
+				if (this.watchRoom() > 0) break;
+				await this.unloadView(v);
+			}
+			if (this.watchRoom() <= 0) return { refused: "unavailable" };
+		}
+		const load = this.loadView(watch, taking);
 		this.loading.set(key, load);
 		try {
 			return await load;
 		} finally {
 			this.loading.delete(key);
 		}
+	}
+
+	/** Watches loaded or being loaded (the registry's bound across all sessions). */
+	get watchesHeld(): number {
+		return this.scopes.size + this.loading.size;
+	}
+
+	/** Watches nobody has, least recently left first (what goes to make room). */
+	private idleViews(taking?: WatchTaking): LiveView[] {
+		return [...this.scopes.values()]
+			.filter((v) => v.participants.size === 0 && !v.gone && !taking?.views.includes(v))
+			.sort((a, b) => a.idleSince - b.idleSince);
 	}
 
 	/**
@@ -1432,13 +1477,17 @@ export class LiveSpace {
 	 */
 	private async readWatch(
 		watch: LiveWatchWire,
-	): Promise<{ rows: OutlineBlockRow[]; anchor: OutlineBlockRow | null } | Refusal> {
-		const max = OUTLINE_LIVE_LIMITS.maxWatchBlocks;
+		/** Rows it may read at most below the bound: past it, `cap.code` (a share, a frame's reads). */
+		cap: { rows: number; code: LiveCloseCode },
+	): Promise<{ rows: OutlineBlockRow[]; anchor: OutlineBlockRow | null; read: number } | Refusal> {
+		const bound = OUTLINE_LIVE_LIMITS.maxWatchBlocks;
+		const max = Math.min(bound, cap.rows);
+		const past = max < bound ? cap.code : "too_large";
 		const usable = (row: OutlineBlockRow | null): row is OutlineBlockRow =>
 			row !== null && !row.deleted && row.spaceId === this.spaceId;
 		if ("s" in watch) {
 			if (this.mirror.alive(watch.s) && this.underSubtree(watch.s))
-				return { rows: [], anchor: null };
+				return { rows: [], anchor: null, read: 0 };
 			const root = await outlineStore.getBlock(watch.s);
 			if (!usable(root)) return { refused: "access_denied" };
 			// A level at a time, whole rows (nothing is written meanwhile: the lane), stopping one
@@ -1447,31 +1496,50 @@ export class LiveSpace {
 			let frontier = [root.id];
 			while (frontier.length > 0) {
 				const room = max - rows.length;
+				if (room < 0) return { refused: past, read: rows.length };
 				const level = await outlineStore.listChildBlocks(this.spaceId, frontier, room + 1);
-				if (level.length > room) return { refused: "too_large" };
+				if (level.length > room) return { refused: past, read: rows.length + level.length };
 				for (const b of level) rows.push(b);
 				frontier = level.map((b) => b.id);
 				if (frontier.length > 0) await yieldToLoop();
 			}
-			return { rows, anchor: null };
+			return { rows, anchor: null, read: rows.length };
 		}
 		const parentId = watch.l;
 		let anchor: OutlineBlockRow | null = null;
 		if (parentId !== null) {
 			const inside = this.mirror.alive(parentId) && this.underSubtree(parentId);
-			if (inside) return { rows: [], anchor: null };
+			if (inside) return { rows: [], anchor: null, read: 0 };
 			anchor = await outlineStore.getBlock(parentId);
 			if (!usable(anchor)) return { refused: "access_denied" };
 		}
 		const kids = await outlineStore.listChildren(this.spaceId, parentId, max + 1);
-		if (kids.length > max) return { refused: "too_large" };
-		return { rows: kids, anchor };
+		if (kids.length > max) return { refused: past, read: kids.length };
+		return { rows: kids, anchor, read: kids.length + (anchor ? 1 : 0) };
 	}
 
-	private async loadView(watch: LiveWatchWire, userId?: string): Promise<LiveView | Refusal> {
+	private async loadView(watch: LiveWatchWire, taking?: WatchTaking): Promise<LiveView | Refusal> {
 		const t0 = performance.now();
-		const read = await this.readWatch(watch);
-		if ("refused" in read) return read;
+		const userId = taking?.userId;
+		// One person's share (see below), and what this join or frame may still read: the read
+		// stops one past whichever is smaller (a share already used up reads nothing).
+		const own = userId !== undefined ? this.ownBlocks(userId, taking) : 0;
+		const shareLeft = own > 0 ? OUTLINE_LIVE_BOUNDS.maxUserBlocks - own : Number.POSITIVE_INFINITY;
+		if (shareLeft <= 0) return { refused: "user_limit" };
+		if (taking && taking.rowsLeft <= 0) return { refused: "user_limit" };
+		// A mirror full of what people are connected to: nothing to read for.
+		if (
+			(this.mirror.size >= OUTLINE_LIVE_BOUNDS.maxLoadedBlocks ||
+				this.mirror.chars >= OUTLINE_LIVE_BOUNDS.maxLoadedChars) &&
+			this.idleViews(taking).length === 0
+		)
+			return { refused: "space_full" };
+		const read = await this.readWatch(watch, {
+			rows: Math.min(shareLeft, taking?.rowsLeft ?? Number.POSITIVE_INFINITY),
+			code: "user_limit",
+		});
+		if (taking) taking.rowsLeft -= read.read ?? 0;
+		if ("refused" in read) return { refused: read.refused };
 		const { rows, anchor } = read;
 		let bytes = 0;
 		for (const b of rows) bytes += bytesOf(b.content);
@@ -1489,8 +1557,15 @@ export class LiveSpace {
 			}
 			return { blocks, chars };
 		};
-		// What it shows: what it read, or (all here already) what the mirror shows of it.
+		// What it shows: what it read, or (all here already) what the mirror shows of it. Inside a
+		// loaded subtree too it is bounded: it may be all that is left of it later.
 		const size = rows.length > 0 || anchor ? rows.length : this.shownBy(watch).length;
+		if (rows.length === 0 && !anchor) {
+			if (size > OUTLINE_LIVE_LIMITS.maxWatchBlocks) return { refused: "too_large" };
+			let shownBytes = 0;
+			for (const id of this.shownBy(watch)) shownBytes += bytesOf(this.textOf(id));
+			if (shownBytes > OUTLINE_LIVE_LIMITS.maxWatchBytes) return { refused: "too_large" };
+		}
 		// Room first: watches nobody has go, least recently left first. A watch someone is
 		// connected to is never closed to make room for another: that would only move the
 		// shortage to it (its tab would come back and close the next one, round and round).
@@ -1503,10 +1578,7 @@ export class LiveSpace {
 		};
 		const over = () => overSpace() || need().blocks > this.room();
 		if (over()) {
-			const idle = [...this.scopes.values()]
-				.filter((v) => v.participants.size === 0 && !v.gone)
-				.sort((a, b) => a.idleSince - b.idleSince);
-			for (const v of idle) {
+			for (const v of this.idleViews(taking)) {
 				if (!over()) break;
 				await this.unloadView(v);
 			}
@@ -1515,14 +1587,8 @@ export class LiveSpace {
 		// One person's tabs do not take the whole space: past their share, their new watch is
 		// refused (they close one of their own and retry), never one of their open ones closed.
 		if (userId !== undefined) {
-			let own = 0;
-			for (const v of this.scopes.values()) {
-				if (v.gone || v.participants.size === 0) continue;
-				let alone = true;
-				for (const p of v.participants.values()) if (p.userId !== userId) alone = false;
-				if (alone) own += v.blocks;
-			}
-			if (own > 0 && own + size > OUTLINE_LIVE_BOUNDS.maxUserBlocks)
+			const ownNow = this.ownBlocks(userId, taking);
+			if (ownNow > 0 && ownNow + size > OUTLINE_LIVE_BOUNDS.maxUserBlocks)
 				return { refused: "user_limit" };
 		}
 		if (overSpace()) return { refused: "space_full" };
@@ -1547,6 +1613,132 @@ export class LiveSpace {
 		this.stats.treesLoaded++;
 		this.stats.loadMs += performance.now() - t0;
 		return view;
+	}
+
+	/**
+	 * Of a transaction's moves: the blocks it brings into a watched subtree from where no subtree
+	 * held them (only levels, so the mirror may lack what is under them), through blocks it does
+	 * not delete.
+	 */
+	private movedIntoSubtrees(ops: readonly LiveOp[]): string[] {
+		const finalParent = new Map<string, string | null>();
+		const deleting = new Set<string>();
+		for (const op of ops) {
+			if (op.t === "i" || op.t === "m") finalParent.set(op.id, op.p);
+			else if (op.t === "d") deleting.add(op.id);
+		}
+		const parentOf = (id: string): string | null =>
+			finalParent.has(id) ? (finalParent.get(id) ?? null) : (this.mirror.get(id)?.parentId ?? null);
+		const out: string[] = [];
+		for (const op of ops) {
+			if (op.t !== "m" || out.includes(op.id) || this.underSubtree(op.id)) continue;
+			let lands = false;
+			let cur = parentOf(op.id);
+			for (let guard = 0; cur !== null && guard < 10_000; guard++) {
+				if (deleting.has(cur)) {
+					lands = false;
+					break;
+				}
+				if (this.subtreeViews.has(cur)) lands = true;
+				cur = parentOf(cur);
+			}
+			if (lands) out.push(op.id);
+		}
+		return out;
+	}
+
+	/**
+	 * What the mirror lacks under blocks brought into a watched subtree from where only levels
+	 * (or nothing) showed them: a subtree holds every live block under its root, so their live
+	 * descendants it does not hold are read, a level at a time (whole rows), parents first.
+	 * `too_large` past the bound of one watch. The blocks under them are not touched by the
+	 * batch that brings them (the session never held them), so this may run before or after it.
+	 */
+	private async readUnder(roots: readonly string[]): Promise<OutlineBlockRow[] | "too_large"> {
+		const max = OUTLINE_LIVE_LIMITS.maxWatchBlocks;
+		const seen = new Set<string>();
+		let frontier: string[] = [];
+		for (const r of roots)
+			for (const id of this.mirror.alive(r) ? this.mirror.subtree(r) : [])
+				if (!seen.has(id)) {
+					seen.add(id);
+					// A watched level's children are all here already.
+					if (!this.levelViews.has(id)) frontier.push(id);
+				}
+		const out: OutlineBlockRow[] = [];
+		let bytes = 0;
+		while (frontier.length > 0) {
+			let known = 0;
+			for (const id of frontier) known += this.mirror.children(id).length;
+			const room = max - out.length;
+			const level = await outlineStore.listChildBlocks(this.spaceId, frontier, room + known + 1);
+			const fresh = level.filter((b) => !seen.has(b.id) && !this.mirror.alive(b.id));
+			if (fresh.length > room) return "too_large";
+			for (const b of fresh) {
+				seen.add(b.id);
+				out.push(b);
+				bytes += bytesOf(b.content);
+			}
+			if (bytes > OUTLINE_LIVE_LIMITS.maxWatchBytes) return "too_large";
+			frontier = fresh.map((b) => b.id);
+			if (frontier.length > 0) await yieldToLoop();
+		}
+		return out;
+	}
+
+	/**
+	 * Put rows read under a block brought into a subtree into the mirror, held by nobody yet:
+	 * `route` sends them (with their text, `tell`) to every watch now showing them. A deleted
+	 * block remembered here keeps its lineage only with the same text and no document.
+	 */
+	private putUnder(rows: readonly OutlineBlockRow[]): string[] {
+		const ids: string[] = [];
+		for (const b of rows) {
+			const prior = this.mirror.get(b.id);
+			if (prior && !prior.deleted) continue;
+			let gen = this.era;
+			let held: readonly HeldBy[] = HELD_BY_NOBODY;
+			if (prior) {
+				if (!this.docs.has(b.id) && prior.dbContent === b.content) {
+					gen = prior.gen;
+					held = prior.held;
+				} else {
+					this.destroyDoc(b.id);
+					gen = ++this.era;
+				}
+			}
+			this.mirror.put({
+				id: b.id,
+				sid: b.sid,
+				parentId: b.parentId,
+				orderKey: b.orderKey,
+				taskJson: b.taskJson,
+				question: b.askJson !== null,
+				deleted: false,
+				dbContent: b.content,
+				gen,
+				held,
+			});
+			ids.push(b.id);
+		}
+		return ids;
+	}
+
+	/**
+	 * Blocks of one person's share: of the watches only they are in, and of the watches the join
+	 * or frame under way takes that nobody is in yet (each overlapping one counted: errs on the
+	 * safe side).
+	 */
+	private ownBlocks(userId: string, taking?: WatchTaking): number {
+		let own = 0;
+		for (const v of this.scopes.values()) {
+			if (v.gone || v.participants.size === 0) continue;
+			let alone = true;
+			for (const p of v.participants.values()) if (p.userId !== userId) alone = false;
+			if (alone) own += v.blocks;
+		}
+		for (const v of taking?.views ?? []) if (!v.gone && v.participants.size === 0) own += v.blocks;
+		return own;
 	}
 
 	/** Live blocks a watch would show, from the mirror (before it is registered). */
@@ -2152,8 +2344,9 @@ export class LiveSpace {
 		const idleUnless = () => {
 			for (const v of views) if (v.participants.size === 0 && !v.gone) v.armIdle();
 		};
+		const taking: WatchTaking = { userId: socket.userId, views, rowsLeft: frameReads() };
 		for (const w of head.watch) {
-			const v = await this.ensureView(w, socket.userId);
+			const v = await this.ensureView(w, taking);
 			if ("refused" in v) {
 				idleUnless();
 				return v;
@@ -2307,20 +2500,51 @@ export class LiveSpace {
 	 * what is left). `gone`: they ended (`endView`), and it is told so.
 	 */
 	private unwatch(p: Participant, views: readonly LiveView[], gone: boolean): void {
+		this.narrow(p, views);
+		if (gone) this.notify(p, { gone: views.map((v) => v.watch) });
+	}
+
+	/**
+	 * Take watches out of a participant's set. What the window holds for it was cut for its old
+	 * set (the batch that ended a watch among it: the client must get that move before it drops
+	 * what the watch showed): sent first. From then on it is sent what its new set shows.
+	 */
+	private narrow(p: Participant, views: readonly LiveView[]): void {
+		if (views.length === 0) return;
+		this.flushBroadcast();
 		const left = p.views.filter((v) => !views.includes(v));
 		for (const view of views) this.exit(p, view);
 		p.views = left;
 		p.audience = this.audienceOf(left);
-		// Its share of the window from now on follows the new set.
-		this.flushBroadcast();
-		if (gone)
+	}
+
+	/**
+	 * Send a participant a `watched` frame without structure of its own, as of the session's
+	 * operation number now: at once, or once everything cut for it up to here went out (others'
+	 * changes held behind one of its own not acknowledged yet, its own changes not acknowledged
+	 * yet; `flushBroadcast` sends it then). The client drops what its watches no longer show when
+	 * this arrives, so nothing on its way may still name those blocks.
+	 */
+	private notify(p: Participant, head: LiveWatchedHead): void {
+		p.notices.push({ o: this.opSeq, head });
+		this.releaseNotices(p);
+	}
+
+	/** Whether something cut for a participant up to operation `o` has not gone out yet. */
+	private owesUpTo(p: Participant, o: number): boolean {
+		if (p.heldCommits.some((c) => c.o <= o)) return true;
+		return (this.windowAcks.get(p.pno) ?? []).some((a) => a[1] <= o);
+	}
+
+	private releaseNotices(p: Participant): void {
+		while (p.notices.length > 0) {
+			const next = p.notices[0] as { o: number; head: LiveWatchedHead };
+			if (this.owesUpTo(p, next.o)) return;
+			p.notices.shift();
 			this.deliver(p, "control", () =>
-				encodeLiveFrame({
-					kind: LIVE_FRAME.watched,
-					handle: p.handle,
-					head: { gone: views.map((v) => v.watch) } satisfies LiveWatchedHead,
-				}),
+				encodeLiveFrame({ kind: LIVE_FRAME.watched, handle: p.handle, head: next.head }),
 			);
+		}
 	}
 
 	/**
@@ -2332,7 +2556,12 @@ export class LiveSpace {
 	 * acknowledged and every batch of its old set sent, so the client's structure is the
 	 * session's when it adds the answer to it. In the lane.
 	 */
-	async handleWatch(p: Participant, rawHead: unknown): Promise<void> {
+	async handleWatch(
+		p: Participant,
+		rawHead: unknown,
+		/** Additions are refused with this before anything is read (the socket's rate, the process's bound). */
+		refuseAdding?: LiveCloseCode,
+	): Promise<void> {
 		if (this.participants.get(p.pno) !== p || p.blocked || this.closed) return;
 		const head = rawHead as Partial<LiveWatchHead> | null;
 		const list = (v: unknown): LiveWatchWire[] | null =>
@@ -2348,15 +2577,6 @@ export class LiveSpace {
 			this.forceResync(p);
 			return;
 		}
-		const answer = (h: LiveWatchedHead, body?: Uint8Array) =>
-			this.deliver(p, "control", () =>
-				encodeLiveFrame({
-					kind: LIVE_FRAME.watched,
-					handle: p.handle,
-					head: h,
-					...(body ? { body } : {}),
-				}),
-			);
 		const removing = new Set(remove.map(liveWatchKey));
 		const kept = p.views.filter((v) => !removing.has(v.key));
 		const keys = new Set(kept.map((v) => v.key));
@@ -2366,54 +2586,102 @@ export class LiveSpace {
 			keys.add(key);
 			return true;
 		});
+		// Removals take effect at once, whatever becomes of the additions: the client dropped
+		// them from its set when it sent this (it keeps their blocks until the answer, which
+		// comes after everything cut for its old set).
+		this.narrow(
+			p,
+			p.views.filter((v) => !kept.includes(v)),
+		);
+		const answerRefusing = (code: LiveCloseCode) =>
+			this.notify(p, {
+				w: w as number,
+				op: this.opSeq,
+				...(adding.length > 0 ? { refused: adding.map((x) => [x, code]) } : {}),
+			});
+		if (adding.length === 0) {
+			answerRefusing("unavailable");
+			return;
+		}
+		if (refuseAdding) {
+			answerRefusing(refuseAdding);
+			return;
+		}
 		if (keys.size > OUTLINE_LIVE_LIMITS.maxWatch) {
-			answer({ w: w as number, refused: add.map((x) => [x, "unavailable"]) });
+			answerRefusing("unavailable");
 			return;
 		}
 		// Everything it sent is in the log and acknowledged, and every batch of its old set out:
 		// its structure is the session's as of now (nothing held back for it any more).
 		if (!(await this.persistNow())) {
-			answer({ w: w as number, refused: add.map((x) => [x, "unavailable"]) });
+			if (this.participants.get(p.pno) === p && !this.closed) answerRefusing("unavailable");
 			return;
 		}
+		if (this.participants.get(p.pno) !== p || this.closed) return;
 		const added: LiveView[] = [];
 		const ok: LiveWatchWire[] = [];
 		const refused: Array<[LiveWatchWire, LiveCloseCode]> = [];
-		// Removed first: a person swapping one watch for another makes room for it.
-		if (kept.length < p.views.length) {
-			for (const view of p.views) if (!kept.includes(view)) this.exit(p, view);
-			p.views = kept;
-		}
+		const taking: WatchTaking = { userId: p.userId, views: added, rowsLeft: frameReads() };
+		const idleUnless = () => {
+			for (const view of added) if (view.participants.size === 0 && !view.gone) view.armIdle();
+		};
+		// Past a share or a bound, what follows is refused without being read.
+		let stop: LiveCloseCode | null = null;
 		for (const x of adding) {
-			const v = await this.ensureView(x, p.userId);
+			if (stop) {
+				refused.push([x, stop]);
+				continue;
+			}
+			const v = await this.ensureView(x, taking);
 			if (this.participants.get(p.pno) !== p || this.closed) {
-				for (const view of added) if (view.participants.size === 0) view.armIdle();
+				idleUnless();
 				return;
 			}
-			if ("refused" in v) refused.push([x, v.refused]);
-			else if (!kept.includes(v) && !added.includes(v)) {
+			if ("refused" in v) {
+				refused.push([x, v.refused]);
+				if (v.refused !== "too_large" && v.refused !== "access_denied") stop = v.refused;
+			} else if (!kept.includes(v) && !added.includes(v)) {
 				added.push(v);
 				ok.push(x);
 			}
 		}
+		// A view loaded for it may have ended meanwhile (a commit of another lane task cannot
+		// run here, but an unload for another's room can).
+		for (let i = added.length - 1; i >= 0; i--)
+			if ((added[i] as LiveView).gone) {
+				refused.push([ok[i] as LiveWatchWire, "unavailable"]);
+				added.splice(i, 1);
+				ok.splice(i, 1);
+			}
 		this.flushBroadcast();
+		// The answer's structure is as of now: nothing cut for its old set may come after it.
+		if (p.notices.length > 0 || this.owesUpTo(p, this.opSeq)) {
+			idleUnless();
+			for (const x of ok) refused.push([x, "unavailable"]);
+			this.notify(p, { w: w as number, op: this.opSeq, refused });
+			return;
+		}
 		const gen = added[0]?.baseGen ?? 0;
-		const blocks = this.snapshotOf(added, kept);
-		const body = encodeLiveTexts(this.allTexts(added, gen, kept));
-		p.views = [...kept, ...added];
+		const blocks = this.snapshotOf(added, p.views);
+		const body = encodeLiveTexts(this.allTexts(added, gen, p.views));
+		p.views = [...p.views, ...added];
 		p.audience = this.audienceOf(p.views);
 		p.windowStart = this.windowUpdates.length;
 		p.commitStart = this.windowCommits.length;
-		answer(
-			{
-				w: w as number,
-				op: this.opSeq,
-				...(ok.length > 0 ? { ok } : {}),
-				...(refused.length > 0 ? { refused } : {}),
-				...(blocks.length > 0 ? { blocks } : {}),
-				...(gen !== 0 ? { g: gen } : {}),
-			},
-			body.length > 0 ? body : undefined,
+		this.deliver(p, "control", () =>
+			encodeLiveFrame({
+				kind: LIVE_FRAME.watched,
+				handle: p.handle,
+				head: {
+					w: w as number,
+					op: this.opSeq,
+					...(ok.length > 0 ? { ok } : {}),
+					...(refused.length > 0 ? { refused } : {}),
+					...(blocks.length > 0 ? { blocks } : {}),
+					...(gen !== 0 ? { g: gen } : {}),
+				} satisfies LiveWatchedHead,
+				...(body.length > 0 ? { body } : {}),
+			}),
 		);
 		for (const view of added) this.enter(p, view);
 	}
@@ -2678,6 +2946,9 @@ export class LiveSpace {
 				else this.windowAcks.delete(p.pno);
 			}
 		}
+		// Watch notices whose turn came (after the changes cut before them, sent above).
+		for (const p of this.participants.values())
+			if (p.notices.length > 0 && !p.lagging) this.releaseNotices(p);
 		this.stats.mergeMs += performance.now() - t0;
 	}
 
@@ -3318,6 +3589,19 @@ export class LiveSpace {
 			this.reject(p, n, "conflict");
 			return;
 		}
+		// Blocks moved into a watched subtree bring what is under them (read before the write:
+		// the transaction cannot touch what the session does not hold).
+		let under: OutlineBlockRow[] = [];
+		const into = this.movedIntoSubtrees(plan.ops);
+		if (into.length > 0) {
+			const read = await this.readUnder(into);
+			if (this.participants.get(p.pno) !== p || p.blocked || this.closed) return;
+			if (read === "too_large") {
+				this.reject(p, n, "invalid");
+				return;
+			}
+			under = read;
+		}
 		const inserted = new Map<string, Extract<LiveOp, { t: "i" }>>();
 		for (const op of plan.ops) if (op.t === "i") inserted.set(op.id, op);
 		const parsed = this.parseTexts(p, body, new Set(inserted.keys()));
@@ -3549,10 +3833,11 @@ export class LiveSpace {
 					}
 				}
 			}
+			const filled = this.putUnder(under);
 			this.settleContents(contents);
 			this.processed(p, n);
 			this.noteLost(p, n, parsed.lost);
-			const changes = this.changesOf(touchedIds, before, movedIds, taskIds);
+			const changes = this.changesOf([...touchedIds, ...filled], before, movedIds, taskIds);
 			this.carried(movedIds);
 			if (changes.length > 0) {
 				const o = ++this.opSeq;
@@ -3999,6 +4284,10 @@ export class LiveSpace {
 			if (level && v.deleted) ended.add(level);
 		}
 		const lasting = (v: LiveView | undefined) => v !== undefined && !ended.has(v);
+		// Blocks no subtree held before the commit: what is under them may be missing here.
+		const wasUnder = new Map<string, boolean>();
+		for (const v of versions)
+			if (this.mirror.get(v.blockId)) wasUnder.set(v.blockId, this.underSubtree(v.blockId));
 		const parentAfter = (id: string): string | null | undefined =>
 			next.has(id) ? (next.get(id) as OutlineVersionRow).parentId : this.mirror.get(id)?.parentId;
 		/** Covered by a watch that lasts, with the commit's parents. */
@@ -4130,7 +4419,33 @@ export class LiveSpace {
 				}
 			}
 		}
-		const changes = this.changesOf([...fresh, ...order], before, moved, tasks);
+		// Blocks it brought into a lasting subtree from where no subtree held them bring what is
+		// under them (a move within one page writes no version of the blocks under the moved one).
+		const intoSubtree = (id: string): LiveView[] => {
+			const out: LiveView[] = [];
+			let cur = this.mirror.get(id)?.parentId ?? null;
+			for (let guard = 0; cur !== null && guard < 10_000; guard++) {
+				const sub = this.subtreeViews.get(cur);
+				if (lasting(sub)) out.push(sub as LiveView);
+				cur = this.mirror.get(cur)?.parentId ?? null;
+			}
+			return out;
+		};
+		const roots: string[] = [];
+		for (const id of [...moved, ...fresh]) {
+			if (wasUnder.get(id) === true || !this.mirror.alive(id) || roots.includes(id)) continue;
+			if (intoSubtree(id).length > 0) roots.push(id);
+		}
+		let filled: string[] = [];
+		if (roots.length > 0) {
+			const read = await this.readUnder(roots);
+			// More than one watch takes: the subtrees it went into end (their watchers watch again
+			// and are told it is too large).
+			if (read === "too_large")
+				for (const id of roots) for (const v of intoSubtree(id)) ended.add(v);
+			else filled = this.putUnder(read);
+		}
+		const changes = this.changesOf([...fresh, ...order, ...filled], before, moved, tasks);
 		this.carried([...moved]);
 		const touched = new Set<LiveView>();
 		for (const c of changes) for (const v of [...c.before, ...c.after]) touched.add(v);

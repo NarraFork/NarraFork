@@ -650,3 +650,328 @@ describe("what L2 left over", () => {
 		expect((await block(x))?.content).toBe("x1");
 	});
 });
+
+/** What a fresh joiner of `rootId`'s subtree is shown (what the session holds there). */
+async function freshOutline(rootId: string): Promise<string> {
+	const c = open(link(third), rootId);
+	await clock.until(() => c.ready || c.closeCode !== null, 5000, "fresh joiner");
+	return c.outline();
+}
+
+describe("a watch ended by a move still gets the move (review B1)", () => {
+	test("by an agent: a watcher of both places keeps the moved subtree where it went", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const b1 = two.ids[0] as string;
+		const lf = link(owner);
+		const f = open(lf, "", [{ s: one.pageId }, { s: two.pageId }]);
+		const q = open(link(writer), one.pageId);
+		await clock.until(() => f.ready && q.ready, 5000, "joined");
+		const sentF = lf.socket.sent.length;
+		await agent([{ op: "move", block: { id: one.pageId }, parent: { id: b1 } }]);
+		await clock.settle();
+		expect((await block(one.pageId))?.parentId).toBe(b1);
+		expect(f.watchSet).toEqual([{ s: two.pageId }]);
+		// A move (not a delete and an insert).
+		const opsOfOne = lf.socket.sent
+			.slice(sentF)
+			.flatMap(
+				(fr) => (fr.head as { c?: Array<{ ops: Array<{ t: string; id: string }> }> }).c ?? [],
+			)
+			.flatMap((c) => c.ops)
+			.filter((op) => op.id === one.pageId)
+			.map((op) => op.t);
+		expect(opsOfOne).toEqual(["m"]);
+		expect(f.outline(two.pageId)).toBe("- b1\n  - One\n    - a1");
+		expect(q.closeCode).toBe("ended");
+		expect(await freshOutline(two.pageId)).toBe(f.outline(two.pageId));
+		type(f, one.ids[0] as string, "!");
+		await flushAll();
+		expect((await block(one.ids[0] as string))?.content).toBe("a1!");
+		expect(f.stats.rejects).toBe(0);
+	});
+
+	test("by a third person: the watcher of both places is sent the move, not left with a hole", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const b1 = two.ids[0] as string;
+		const lf = link(owner);
+		const f = open(lf, "", [{ s: one.pageId }, { s: two.pageId }]);
+		const q = open(link(writer), one.pageId);
+		// The mover sees the top level and Two: it can put One under b1.
+		const m = open(link(third), "", [{ l: null }, { s: two.pageId }]);
+		await clock.until(() => f.ready && q.ready && m.ready, 5000, "joined");
+		struct(m, [{ t: "m", id: one.pageId, p: b1, k: keyBetween(null, null) }]);
+		await clock.settle();
+		expect((await block(one.pageId))?.parentId).toBe(b1);
+		expect(f.watchSet).toEqual([{ s: two.pageId }]);
+		expect(f.outline(two.pageId)).toBe("- b1\n  - One\n    - a1");
+		expect(m.outline(two.pageId)).toBe("- b1\n  - One\n    - a1");
+		expect(q.closeCode).toBe("ended");
+		expect(await freshOutline(two.pageId)).toBe(f.outline(two.pageId));
+		expect(f.stats.rejects + m.stats.rejects).toBe(0);
+	});
+
+	test("while the watcher's own change waits for the log: the end comes after the move", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1", "b2"], "Two");
+		const [b1, b2] = two.ids as [string, string];
+		const lf = link(owner);
+		const f = open(lf, "", [{ s: one.pageId }, { s: two.pageId }]);
+		await clock.until(() => f.ready, 5000, "joined");
+		type(f, b1, "!");
+		await flushAll();
+		setOutlineStore({
+			...realStore,
+			appendLiveLog: async () => {
+				throw new Error("disk I/O error");
+			},
+		});
+		// F's own structural change is committed but not logged: not acknowledged yet, so what
+		// others change after it waits for it.
+		struct(f, [
+			{ t: "m", id: b2, p: two.pageId, k: keyBetween(null, f.visible.get(b1)?.orderKey ?? null) },
+		]);
+		await clock.settle();
+		expect(f.pending.length + f.awaiting.length).toBeGreaterThan(0);
+		await agent([{ op: "move", block: { id: one.pageId }, parent: { id: b1 } }]);
+		await clock.settle();
+		setOutlineStore(realStore);
+		await clock.advance(1_000);
+		await clock.settle();
+		expect(f.pending.length + f.awaiting.length).toBe(0);
+		expect(f.watchSet).toEqual([{ s: two.pageId }]);
+		expect(f.outline(two.pageId)).toBe(await freshOutline(two.pageId));
+		expect(f.outline(two.pageId)).toContain("- One\n");
+		expect(f.stats.rejects).toBe(0);
+	});
+});
+
+describe("a block moved into a watched subtree brings what is under it (review B2)", () => {
+	test("moved by a person from a level watch: its children come too, and nothing goes next to hidden ones", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const a1 = one.ids[0] as string;
+		const b1 = two.ids[0] as string;
+		const g = (await agent([{ op: "insert", parent: { id: a1 }, content: "grandchild" }]))
+			.results[0]?.blockId as string;
+		const a = open(link(owner), "", [{ l: one.pageId }, { s: two.pageId }]);
+		const p = open(link(writer), two.pageId);
+		await clock.until(() => a.ready && p.ready, 5000, "joined");
+		struct(a, [{ t: "m", id: a1, p: b1, k: keyBetween(null, null) }]);
+		await clock.settle();
+		expect((await block(a1))?.parentId).toBe(b1);
+		expect(p.outline()).toBe("- b1\n  - a1\n    - grandchild");
+		expect(a.outline(two.pageId)).toBe("- b1\n  - a1\n    - grandchild");
+		expect(p.textOf(g)).toBe("grandchild");
+		expect(await freshOutline(two.pageId)).toBe(p.outline());
+		// The grandchild is the session's now: typed into, and a sibling put next to it.
+		type(p, g, "!");
+		const n = a.newId();
+		struct(a, [
+			{
+				t: "i",
+				id: n,
+				p: a1,
+				k: keyBetweenLoose(a.visible.get(g)?.orderKey ?? null, null),
+				content: "next",
+			},
+		]);
+		await clock.settle();
+		expect(p.outline()).toBe("- b1\n  - a1\n    - grandchild!\n    - next");
+		expect(a.stats.rejects + p.stats.rejects).toBe(0);
+	});
+
+	test("moved by an agent within one page: its children come too", async () => {
+		const pg = await page(["X", "S"], "P");
+		const [x, s] = pg.ids as [string, string];
+		const a1 = (await agent([{ op: "insert", parent: { id: x }, content: "a1" }])).results[0]
+			?.blockId as string;
+		const g = (await agent([{ op: "insert", parent: { id: a1 }, content: "g" }])).results[0]
+			?.blockId as string;
+		await agent([{ op: "insert", parent: { id: g }, content: "gg" }]);
+		const w1 = open(link(owner), "", [{ l: x }, { s }]);
+		const w2 = open(link(writer), s);
+		await clock.until(() => w1.ready && w2.ready, 5000, "joined");
+		await agent([{ op: "move", block: { id: a1 }, parent: { id: s } }]);
+		await clock.settle();
+		expect(w2.outline()).toBe("- a1\n  - g\n    - gg");
+		expect(w1.outline(s)).toBe("- a1\n  - g\n    - gg");
+		expect(await freshOutline(s)).toBe(w2.outline());
+		type(w2, g, "!");
+		await flushAll();
+		expect((await block(g))?.content).toBe("g!");
+	});
+});
+
+describe("budgets of a join or watch frame (review S1, S3)", () => {
+	test("one join with two watches past one person's share is refused", async () => {
+		const one = await page(
+			Array.from({ length: 9 }, (_, i) => `o${i}`),
+			"One",
+		);
+		const two = await page(
+			Array.from({ length: 9 }, (_, i) => `t${i}`),
+			"Two",
+		);
+		OUTLINE_LIVE_BOUNDS.maxUserBlocks = 15;
+		const a = open(link(owner), "", [{ s: one.pageId }, { s: two.pageId }]);
+		await clock.until(() => a.ready || a.closeCode !== null, 5000, "answered");
+		expect(a.closeCode).toBe("user_limit");
+	});
+
+	test("one watch frame adding several past the share: the rest are refused without being read", async () => {
+		const one = await page(
+			Array.from({ length: 4 }, (_, i) => `o${i}`),
+			"One",
+		);
+		const two = await page(
+			Array.from({ length: 9 }, (_, i) => `t${i}`),
+			"Two",
+		);
+		const three = await page(
+			Array.from({ length: 9 }, (_, i) => `h${i}`),
+			"Three",
+		);
+		const four = await page(["f"], "Four");
+		OUTLINE_LIVE_BOUNDS.maxUserBlocks = 15;
+		const a = open(link(owner), one.pageId);
+		await clock.until(() => a.ready, 5000, "joined");
+		const read: string[] = [];
+		setOutlineStore({
+			...realStore,
+			getBlock: async (id) => {
+				read.push(id);
+				return await realStore.getBlock(id);
+			},
+		});
+		a.watch({ add: [{ s: two.pageId }, { s: three.pageId }, { s: four.pageId }] });
+		await clock.settle();
+		expect(a.watchSet).toEqual([{ s: one.pageId }, { s: two.pageId }]);
+		expect(a.watchRefused.get(`s:${three.pageId}`)).toBe("user_limit");
+		expect(a.watchRefused.get(`s:${four.pageId}`)).toBe("user_limit");
+		expect(read).not.toContain(four.pageId);
+	});
+
+	test("the process's bound on watches counts what a frame adds", async () => {
+		const one = await page(["o"], "One");
+		const two = await page(["t"], "Two");
+		const three = await page(["h"], "Three");
+		const a = open(link(owner), one.pageId);
+		await clock.until(() => a.ready, 5000, "joined");
+		const limits = OUTLINE_LIVE_LIMITS as { liveWatches: number };
+		const savedWatches = limits.liveWatches;
+		try {
+			limits.liveWatches = (liveSpaceOf(space.id)?.scopes.size ?? 0) + 1;
+			a.watch({ add: [{ s: two.pageId }, { s: three.pageId }] });
+			await clock.settle();
+			expect(a.watchSet).toEqual([{ s: one.pageId }, { s: two.pageId }]);
+			expect(a.watchRefused.get(`s:${three.pageId}`)).toBe("unavailable");
+		} finally {
+			limits.liveWatches = savedWatches;
+		}
+	});
+
+	test("watch frames past the socket's rate are refused without being read", async () => {
+		const one = await page(["o"], "One");
+		const others: Array<{ pageId: string }> = [];
+		for (let i = 0; i < 30; i++) others.push(await page([`x${i}`], `P${i}`));
+		const la = link(owner);
+		const a = open(la, one.pageId);
+		await clock.until(() => a.ready, 5000, "joined");
+		for (const o of others) a.watch({ add: [{ s: o.pageId }] });
+		await clock.settle();
+		const refused = [...a.watchRefused.values()];
+		expect(refused.length).toBeGreaterThan(0);
+		expect(refused.every((code) => code === "unavailable")).toBe(true);
+		expect(a.watchSet.length + refused.length).toBe(31);
+		expect(a.status).toBe("live");
+	});
+
+	test("a subtree watch inside a loaded one past the bound is too_large", async () => {
+		const one = await page(["inner"], "One");
+		const inner = one.ids[0] as string;
+		await agent(
+			["x", "y", "z"].map((content) => ({ op: "insert" as const, parent: { id: inner }, content })),
+		);
+		const a = open(link(owner), one.pageId);
+		await clock.until(() => a.ready, 5000, "joined");
+		const limits = OUTLINE_LIVE_LIMITS as { maxWatchBlocks: number };
+		const savedMax = limits.maxWatchBlocks;
+		try {
+			limits.maxWatchBlocks = 3;
+			const b = open(link(writer), "", [{ s: inner }]);
+			await clock.until(() => b.ready || b.closeCode !== null, 5000, "answered");
+			expect(b.closeCode).toBe("too_large");
+		} finally {
+			limits.maxWatchBlocks = savedMax;
+		}
+	});
+});
+
+describe("watch changes that cross other traffic (review S2, S4)", () => {
+	test("a removal while the log refuses writes still takes effect; added back later it is whole", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const a1 = one.ids[0] as string;
+		const a = open(link(owner), "", [{ s: one.pageId }, { s: two.pageId }]);
+		const c = open(link(third), one.pageId);
+		await clock.until(() => a.ready && c.ready, 5000, "joined");
+		setOutlineStore({
+			...realStore,
+			appendLiveLog: async () => {
+				throw new Error("disk I/O error");
+			},
+		});
+		type(c, a1, " x");
+		await clock.advance(45);
+		a.watch({ remove: [{ s: one.pageId }] });
+		await clock.settle();
+		setOutlineStore(realStore);
+		await clock.advance(1000);
+		await clock.settle();
+		const server = [...(liveSpaceOf(space.id)?.participants.values() ?? [])].find(
+			(x) => x.userId === owner,
+		);
+		expect(server?.views.map((v) => v.key)).toEqual([`s:${two.pageId}`]);
+		expect(a.hasText(a1)).toBe(false);
+		a.watch({ add: [{ s: one.pageId }] });
+		await clock.settle();
+		expect(a.watchSet).toEqual([{ s: two.pageId }, { s: one.pageId }]);
+		expect(a.textOf(a1)).toBe("a1 x");
+	});
+
+	test("added and removed before the answer: not watched, on either end", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const la = link(owner);
+		const a = open(la, one.pageId);
+		await clock.until(() => a.ready, 5000, "joined");
+		la.holdDown(true);
+		a.watch({ add: [{ s: two.pageId }] });
+		a.watch({ remove: [{ s: two.pageId }] });
+		await clock.settle();
+		la.holdDown(false);
+		await clock.settle();
+		expect(a.watchSet).toEqual([{ s: one.pageId }]);
+		expect(a.hasText(two.ids[0] as string)).toBe(false);
+		const server = [...(liveSpaceOf(space.id)?.participants.values() ?? [])].find(
+			(x) => x.userId === owner,
+		);
+		expect(server?.views.map((v) => v.key)).toEqual([`s:${one.pageId}`]);
+	});
+
+	test("typing not sent yet reaches the page before its watch is removed", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const a1 = one.ids[0] as string;
+		const a = open(link(owner), "", [{ s: one.pageId }, { s: two.pageId }]);
+		await clock.until(() => a.ready, 5000, "joined");
+		type(a, a1, " typed");
+		a.watch({ remove: [{ s: one.pageId }] });
+		await flushAll();
+		expect((await block(a1))?.content).toBe("a1 typed");
+		expect(unsavedTextsOf(one.pageId)).toEqual([]);
+		expect(a.stats.rejects).toBe(0);
+	});
+});
