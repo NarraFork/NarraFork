@@ -61,6 +61,8 @@ const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
 	"AttachWorktree",
 	"GetWorktreeOperation",
 	"RequestPermissionRule",
+	// Team work item changes read and write one team's rows and worktrees in order.
+	"Team",
 ]);
 
 /**
