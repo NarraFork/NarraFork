@@ -2,6 +2,7 @@ import { useCurrentUser } from "@frontend/hooks/useAuth";
 import {
 	useSwitchWorkspaceContext,
 	useWorkspaceContext,
+	workspaceContextKey,
 } from "@frontend/hooks/useWorkspaceContext";
 import { ApiError, api } from "@frontend/lib/api";
 import { formatLocaleDateTime } from "@frontend/lib/intl-format";
@@ -21,15 +22,15 @@ import {
 	Textarea,
 	TextInput,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
-import type { WorktreeEntry, WorktreeRemoveResult } from "@shared/narrator-worktrees";
 import { IconGitFork, IconSwitchHorizontal, IconTrash } from "@tabler/icons-react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { nanoid } from "nanoid";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
-import { WorktreeRemovalPanel } from "./WorktreeRemovalPanel";
+import { WorktreeRemovalDialog } from "./WorktreeRemovalDialog";
 import { type WorktreeDraft, WorktreeFlow, type WorktreeFlowState } from "./worktree-flow";
 import { type WorktreeSort, worktreeDirectoryLabel, worktreeLabel } from "./worktree-list-view";
 import {
@@ -259,7 +260,9 @@ function ScopedWorktreeControls({
 		if (attempt.flow.state.unknown) void attempt.flow.reconcile();
 	};
 	const [menuOpened, setMenuOpened] = useState(false);
-	const [removalTarget, setRemovalTarget] = useState<WorktreeEntry | null>(null);
+	// Removal is a second modal on top of the list: the row stays where the user found it.
+	const [removalPath, setRemovalPath] = useState<string | null>(null);
+	// The list modal stays open behind the confirmation, so the outcome belongs there.
 	const [removalNotice, setRemovalNotice] = useState<string>();
 	const [search, setSearch] = useState("");
 	const [sort, setSort] = useState<WorktreeSort>("lastCommitAt");
@@ -397,28 +400,6 @@ function ScopedWorktreeControls({
 		timestamp == null || !Number.isFinite(timestamp)
 			? t("worktree.unknownTime")
 			: formatLocaleDateTime(timestamp);
-	const canRemove = firstPage?.capabilities.delete === true && !!context?.git?.workspaceKey;
-	const closeList = () => {
-		setMenuOpened(false);
-		setRemovalTarget(null);
-	};
-	const onRemoved = (result: WorktreeRemoveResult) => {
-		setRemovalTarget(null);
-		const branch = result.branch;
-		setRemovalNotice(
-			[
-				branch?.deleted
-					? t("worktree.removedWithBranch", { branch: branch.name })
-					: branch
-						? t("worktree.removedBranchKept", { branch: branch.name })
-						: t("worktree.removed"),
-				result.record === "retained" ? t("worktree.removedRecordRetained") : "",
-			]
-				.filter(Boolean)
-				.join(" "),
-		);
-		void queryClient.resetQueries({ queryKey: listKey, exact: true });
-	};
 	const pendingLimit = pendingReceipts.current.size >= RECEIPT_SCOPE_LIMIT;
 	const canCreate =
 		canSwitch &&
@@ -426,6 +407,8 @@ function ScopedWorktreeControls({
 		firstPage?.capabilities.create === true &&
 		!pendingLimit &&
 		!storageError;
+	// Deleting needs the server-advertised capability, not just a clickable list.
+	const canRemove = canList && firstPage?.capabilities.delete === true;
 	const createDisabledReason = storageError
 		? t(storageError)
 		: pendingLimit
@@ -468,8 +451,9 @@ function ScopedWorktreeControls({
 						disabled={(!canSwitch && !canInspect) || switchMutation.isPending || state.busy}
 						onClick={() => {
 							setSearch("");
-							setRemovalNotice(undefined);
 							setMenuOpened(true);
+							// A new visit starts clean; the previous outcome belonged to another row.
+							setRemovalNotice(undefined);
 							// Reopening refreshes from page one, never replaying all saved cursors.
 							if (canList && debouncedSearch === "" && !worktrees.isFetching && !cursorExpired)
 								void queryClient.resetQueries({ queryKey: listKey, exact: true });
@@ -478,18 +462,13 @@ function ScopedWorktreeControls({
 						<IconSwitchHorizontal size={15} />
 					</ActionIcon>
 				</Tooltip>
-				<Modal opened={menuOpened} onClose={closeList} title={t("worktree.switch")} size="lg">
-					{removalTarget && context?.git?.workspaceKey ? (
-						<WorktreeRemovalPanel
-							key={removalTarget.path}
-							narratorId={narratorId}
-							workspaceKey={context.git.workspaceKey}
-							entry={removalTarget}
-							onClose={() => setRemovalTarget(null)}
-							onRemoved={onRemoved}
-						/>
-					) : null}
-					<Stack gap="sm" display={removalTarget ? "none" : undefined}>
+				<Modal
+					opened={menuOpened}
+					onClose={() => setMenuOpened(false)}
+					title={t("worktree.switch")}
+					size="lg"
+				>
+					<Stack gap="sm">
 						<Text size="xs" c="dimmed" truncate title={`${context?.deviceId}: ${context?.cwd}`}>
 							{worktreeDirectoryLabel(context?.cwd ?? "")}
 						</Text>
@@ -605,15 +584,16 @@ function ScopedWorktreeControls({
 							<Stack gap={4}>
 								{visibleEntries.map((entry) => (
 									<Group key={entry.path} gap={4} wrap="nowrap" align="stretch">
-										<Button
+										<UnstyledButton
 											data-worktree-path={entry.path}
-											variant={entry.path === context?.cwd ? "light" : "subtle"}
-											fullWidth
-											style={{ flex: 1, minWidth: 0 }}
-											justify="flex-start"
-											h="auto"
 											py="xs"
-											styles={{ label: { display: "block", width: "100%", textAlign: "left" } }}
+											px={6}
+											style={{ flex: 1, minWidth: 0, borderRadius: 4 }}
+											bg={
+												entry.path === context?.cwd
+													? "var(--mantine-color-default-hover)"
+													: undefined
+											}
 											title={`${context?.deviceId}: ${entry.path}`}
 											disabled={
 												!canSwitch ||
@@ -659,23 +639,24 @@ function ScopedWorktreeControls({
 													: {formatTime(entry[sort])}
 												</Text>
 											)}
-										</Button>
-										{canRemove && entry.recorded && entry.path !== context?.cwd && (
-											<Tooltip label={t("worktree.remove")}>
+										</UnstyledButton>
+										{canRemove && (
+											<Tooltip
+												label={entry.locked ? t("worktree.removeLocked") : t("worktree.remove")}
+												withArrow
+											>
 												<ActionIcon
+													size="lg"
 													variant="subtle"
 													color="red"
-													size="lg"
-													style={{ alignSelf: "center" }}
-													aria-label={`${t("worktree.remove")}: ${worktreeLabel(entry)}`}
+													aria-label={t("worktree.remove")}
 													data-worktree-remove={entry.path}
-													disabled={state.busy || switchMutation.isPending}
-													onClick={() => {
-														setRemovalNotice(undefined);
-														setRemovalTarget(entry);
-													}}
+													// A prunable checkout is exactly what removal is for: its
+													// directory is gone and only the registration is left.
+													disabled={entry.locked || state.busy}
+													onClick={() => setRemovalPath(entry.path)}
 												>
-													<IconTrash size={16} />
+													<IconTrash size={15} />
 												</ActionIcon>
 											</Tooltip>
 										)}
@@ -709,12 +690,14 @@ function ScopedWorktreeControls({
 							</Stack>
 						</ScrollArea.Autosize>
 						{firstPage?.truncated && <Alert color="yellow">{t("worktree.listTruncated")}</Alert>}
-						{removalNotice && (
-							<Alert color="green" role="status">
-								{removalNotice}
-							</Alert>
+						{/* Removal needs a healthy checkout of the requesting session. A session whose
+						    own directory was deleted sees its own prunable row here and nothing it
+						    can do about it, so name the way out instead of showing a dead list. */}
+						{canList && !canRemove && visibleEntries.some((entry) => entry.prunable) && (
+							<Alert color="yellow">{t("worktree.removeNeedsHealthyWorkspace")}</Alert>
 						)}
 						{switchError && <Alert color="red">{switchError}</Alert>}
+						{removalNotice && <Alert color="green">{removalNotice}</Alert>}
 					</Stack>
 				</Modal>
 			</Group>
@@ -856,6 +839,26 @@ function ScopedWorktreeControls({
 					</Stack>
 				</form>
 			</Modal>
+			<WorktreeRemovalDialog
+				opened={removalPath !== null}
+				narratorId={narratorId}
+				worktreePath={removalPath}
+				workspaceKey={context?.git?.workspaceKey ?? ""}
+				onClose={() => setRemovalPath(null)}
+				onRemoved={(result) => {
+					setRemovalPath(null);
+					void queryClient.invalidateQueries({ queryKey: ["narratorWorktrees"] });
+					// The requesting session may itself have been moved out of the checkout.
+					void queryClient.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
+					setRemovalNotice(
+						result.outcome === "removed"
+							? result.relocatedTo
+								? t("worktree.removeSuccessRelocated", { path: result.relocatedTo })
+								: t("worktree.removeSuccess")
+							: t("worktree.removeAlreadyAbsent"),
+					);
+				}}
+			/>
 		</>
 	);
 }

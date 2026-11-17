@@ -49,25 +49,28 @@ export const worktreePrepareSchema = z
 			message: "Provide a branch name or task requirement",
 		},
 	);
-export type WorktreeCreateRequest = z.infer<typeof worktreeCreateSchema>;
-const worktreeRemovalPath = z.string().min(1).max(4096);
-/** No base ref: what counts as kept is never the caller's choice. */
-export const worktreeRemovalQuerySchema = z
-	.object({ workspaceKey, path: worktreeRemovalPath })
-	.strict();
-export const worktreeRemovalDiscardSchema = z
+const worktreePath = z
+	.string()
+	.min(1)
+	.max(4096)
+	.refine((value) => !value.includes("\0"), {
+		message: "path must not contain NUL",
+	});
+export const worktreeRemovalPlanSchema = z
 	.object({
-		head: z
-			.string()
-			.regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/)
-			.nullable(),
-		uncommittedFiles: z.number().int().nonnegative().max(1_000_000_000),
-		unmergedCommits: z.number().int().nonnegative().max(1_000_000_000_000),
+		workspaceKey,
+		path: worktreePath,
 	})
 	.strict();
-export const worktreeRemoveSchema = worktreeRemovalQuerySchema
-	.extend({
-		deleteBranch: z.boolean().default(false),
-		discard: worktreeRemovalDiscardSchema.optional(),
+export const worktreeRemovalRequestSchema = z
+	.object({
+		expectedRevision: z.number().int().nonnegative(),
+		workspaceKey,
+		path: worktreePath,
+		force: z.boolean().optional(),
+		acknowledgeUnregistered: z.boolean().optional(),
 	})
 	.strict();
+export type WorktreeCreateRequest = z.infer<typeof worktreeCreateSchema>;
+export type WorktreeRemovalPlanRequest = z.infer<typeof worktreeRemovalPlanSchema>;
+export type WorktreeRemovalRequest = z.infer<typeof worktreeRemovalRequestSchema>;

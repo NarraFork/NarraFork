@@ -1,9 +1,5 @@
 import { createHash } from "node:crypto";
-import {
-	type WorktreeCreateResult,
-	type WorktreeRemoveResult,
-	worktreeListPreview,
-} from "@shared/narrator-worktrees";
+import { type WorktreeCreateResult, worktreeListPreview } from "@shared/narrator-worktrees";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { z } from "zod/v4";
 import type { NarratorPrincipal } from "../../../services/narrator-acl";
@@ -197,35 +193,6 @@ export const getWorktreeOperationParameters = z.strictObject({
 		),
 });
 
-export const removeWorktreeParameters = z.strictObject({
-	path: z
-		.string()
-		.min(1)
-		.max(4096)
-		.describe(
-			"Absolute path of a worktree that ListWorktrees shows with recorded: true. Worktrees without a record are never removed.",
-		),
-	deleteBranch: z
-		.boolean()
-		.optional()
-		.describe(
-			"Also delete its branch. Only when Git confirms it is merged into the main checkout's branch or its upstream; otherwise the branch is kept and reported.",
-		),
-	discard: z
-		.strictObject({
-			head: z
-				.string()
-				.regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/)
-				.nullable(),
-			uncommittedFiles: z.number().int().nonnegative(),
-			unmergedCommits: z.number().int().nonnegative(),
-		})
-		.optional()
-		.describe(
-			"ONLY after the user explicitly agreed to lose the work: copy report.head, report.uncommittedFiles and report.unmergedCommits from the refused call. The user approving this call sees these numbers. Never set it on your own judgement.",
-		),
-});
-
 /** This error is produced before execution, including by the shared executor. */
 function formatWorktreeValidationError(error: z.ZodError): string {
 	return JSON.stringify({
@@ -252,7 +219,7 @@ function agentInputJsonSchema(parameters: z.ZodType, needsCompatibilityParameter
 }
 type AgentWorktreeService<Principal> = Pick<
 	NarratorWorktreeService<Principal>,
-	"list" | "create" | "getOperation" | "remove"
+	"list" | "create" | "getOperation"
 >;
 
 /** Intent-only inputs. Concurrency and receipt identities are frozen host data, not model input. */
@@ -280,12 +247,6 @@ export function createAgentWorktreeTools<Principal>(
 				"Create a worktree by checking out an EXISTING local branch that is not already checked out. Supply branchName and absolute destinationPath. Parent directory must exist. Does not create a new branch or copy uncommitted changes; switches directories only when switchToWorktree is true. If outcome is unknown, call GetWorktreeOperation with the returned operationId; do not create again or delete residuals.",
 		},
 		{
-			name: "RemoveWorktree",
-			parameters: removeWorktreeParameters,
-			description:
-				"Remove a worktree NarraFork created (ListWorktrees shows recorded: true): deletes its directory and record, and its branch only when deleteBranch is set and the branch is merged. Refused while any session's working directory or a running terminal is inside it. Refused when it has uncommitted files or commits that neither the main checkout's branch nor the branch upstream contains: the error carries a report of what would be lost. Tell the user; only if they explicitly agree, call again with discard copied from that report. Always asks the user for approval. Never removes directories without a record and never prunes other worktrees.",
-		},
-		{
 			name: "GetWorktreeOperation",
 			parameters: getWorktreeOperationParameters,
 			description:
@@ -303,15 +264,10 @@ export function createAgentWorktreeTools<Principal>(
 				kind: "single",
 				resolve: (input) => ({
 					key: "worktree",
-					operation:
-						name === "CreateWorktree" || name === "AttachWorktree" || name === "RemoveWorktree"
-							? "write"
-							: "read",
+					operation: name === "CreateWorktree" || name === "AttachWorktree" ? "write" : "read",
 					...(name === "CreateWorktree" || name === "AttachWorktree"
 						? { path: String(input.destinationPath ?? "") }
-						: name === "RemoveWorktree"
-							? { path: String(input.path ?? "") }
-							: {}),
+						: {}),
 				}),
 			},
 			async execute(args, ctx) {
@@ -351,18 +307,6 @@ export function createAgentWorktreeTools<Principal>(
 							output: JSON.stringify(result),
 							metadata: { workspaceWorktrees: worktreeListPreview(result) },
 						};
-					}
-					if (name === "RemoveWorktree") {
-						enteredService = true;
-						const intent = input.data as z.infer<typeof removeWorktreeParameters>;
-						return removalResult(
-							await service.remove(
-								principal,
-								ctx.narratorId,
-								{ ...intent, workspaceKey: workspace.git.workspaceKey },
-								ctx.signal,
-							),
-						);
 					}
 					if (name === "GetWorktreeOperation") {
 						operationId = (input.data as { operationId: string }).operationId;
@@ -441,55 +385,20 @@ export function createAgentWorktreeTools<Principal>(
 										: "Worktree request failed; the execution outcome is not established.",
 							},
 							...(!enteredService ? { dispatched: false } : {}),
-							...(name === "RemoveWorktree" && cause instanceof AppError && cause.details
-								? { details: cause.details }
-								: {}),
 							nextAction:
-								name === "RemoveWorktree"
-									? removalNextAction(code)
-									: code === "WORKTREE_REQUEST_NOT_FOUND"
-										? "No receipt was found. Verify the original operationId; do not infer that creation never happened."
-										: code === "WORKTREE_SWITCH_UNSUPPORTED"
-											? "Nothing was created. Retry without switchToWorktree, or call SwitchWorkingDirectory from a switch-capable primary narrator after creation."
-											: operationId
-												? "Do not recreate or clean up. Query GetWorktreeOperation with this operationId; restore the original authorized scope if recovery is denied."
-												: "Check arguments, authorization and the current workspace; refresh the session if its context is stale.",
+								code === "WORKTREE_REQUEST_NOT_FOUND"
+									? "No receipt was found. Verify the original operationId; do not infer that creation never happened."
+									: code === "WORKTREE_SWITCH_UNSUPPORTED"
+										? "Nothing was created. Retry without switchToWorktree, or call SwitchWorkingDirectory from a switch-capable primary narrator after creation."
+										: operationId
+											? "Do not recreate or clean up. Query GetWorktreeOperation with this operationId; restore the original authorized scope if recovery is denied."
+											: "Check arguments, authorization and the current workspace; refresh the session if its context is stale.",
 						}),
 					};
 				}
 			},
 		}),
 	);
-}
-
-function removalResult(result: WorktreeRemoveResult) {
-	return {
-		output: JSON.stringify({
-			...result,
-			nextAction:
-				result.branch && !result.branch.deleted
-					? "Worktree removed. Its branch was kept because Git could not prove it merged; leave it unless the user asks."
-					: "Worktree removed.",
-		}),
-	};
-}
-
-function removalNextAction(code: string): string {
-	switch (code) {
-		case "WORKTREE_REMOVAL_WOULD_LOSE_WORK":
-		case "WORKTREE_REMOVAL_CHANGED":
-			return "Nothing was removed. Tell the user exactly what details.report says would be lost. Only if they explicitly agree, call RemoveWorktree again with discard copied from details.report.";
-		case "WORKTREE_IN_USE":
-			return "Nothing was removed. A session's working directory or a running terminal is inside this worktree (details.blockedBy); it must move or close first. Do not work around it.";
-		case "WORKTREE_RECEIPT_PROTECTED":
-		case "WORKTREE_RESOURCE_PROTECTED":
-		case "WORKTREE_RESOURCE_ATTACHED":
-			return "Nothing was removed. Another creation request, recorded worktree or NarraFork resource still covers this path. Report it to the user; do not work around it.";
-		case "WORKTREE_NOT_RECORDED":
-			return "Nothing was removed. Only worktrees NarraFork created and recorded can be removed; leave this directory alone.";
-		default:
-			return "Nothing was confirmed removed. Check the error, then list worktrees before deciding anything else.";
-	}
 }
 
 /** Whether the requested switch happened, and why not when it did not. */
@@ -595,10 +504,6 @@ export const agentWorktreeTools = createAgentWorktreeTools<NarratorPrincipal>(
 			(
 				await import("../../../services/narrator-worktree-runtime")
 			).narratorWorktreeService.getOperation(...args),
-		remove: async (...args) =>
-			(await import("../../../services/narrator-worktree-runtime")).narratorWorktreeService.remove(
-				...args,
-			),
 	},
 	async (ctx) =>
 		(await import("../../../services/narrator-worktree-runtime")).narratorWorktreePrincipalForTool(

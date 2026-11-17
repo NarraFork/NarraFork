@@ -10,10 +10,10 @@ import type {
 	WorktreePrepareRequest,
 	WorktreePrepareResult,
 	WorktreeReconcileRequest,
-	WorktreeRemovalQuery,
-	WorktreeRemovalReport,
-	WorktreeRemoveRequest,
-	WorktreeRemoveResult,
+	WorktreeRemovalPlan,
+	WorktreeRemovalPlanRequest,
+	WorktreeRemovalRequest,
+	WorktreeRemovalResult,
 } from "@shared/narrator-worktrees";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
@@ -107,21 +107,18 @@ export const gitApi = {
 			`/narrators/${encodeURIComponent(id)}/git/worktrees/reconcile`,
 			{ method: "POST", body: JSON.stringify(input) },
 		),
-	/** Read-only: what removing a recorded worktree would lose right now. */
-	getNarratorWorktreeRemovalReport: (
-		id: string,
-		input: WorktreeRemovalQuery,
-		signal?: AbortSignal,
-	) =>
-		gitRequest<WorktreeRemovalReport>(
-			`/narrators/${encodeURIComponent(id)}/git/worktrees/removal-report`,
-			{ method: "POST", body: JSON.stringify(input), signal },
+	/** Read-only removal preflight; safe to re-run whenever the dialog needs fresh facts. */
+	planNarratorWorktreeRemoval: (id: string, input: WorktreeRemovalPlanRequest) =>
+		gitRequest<WorktreeRemovalPlan>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/removal/plan`,
+			{ method: "POST", body: JSON.stringify(input) },
 		),
-	removeNarratorWorktree: (id: string, input: WorktreeRemoveRequest) =>
-		gitRequest<WorktreeRemoveResult>(`/narrators/${encodeURIComponent(id)}/git/worktrees/remove`, {
-			method: "POST",
-			body: JSON.stringify(input),
-		}),
+	/** Explicit destructive command. Retrying a completed removal reports `already_absent`. */
+	removeNarratorWorktree: (id: string, input: WorktreeRemovalRequest) =>
+		gitRequest<WorktreeRemovalResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/removal`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
 	getGitWorkspace: (narratorId: string, signal?: AbortSignal) =>
 		gitRequest<GitWorkspace>(`/narrators/${encodeURIComponent(narratorId)}/git/workspace`, {
 			signal,

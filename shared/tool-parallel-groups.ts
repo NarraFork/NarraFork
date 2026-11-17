@@ -59,7 +59,6 @@ const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
 	"ListWorktrees",
 	"CreateWorktree",
 	"AttachWorktree",
-	"RemoveWorktree",
 	"GetWorktreeOperation",
 	"RequestPermissionRule",
 ]);

@@ -116,13 +116,3 @@ test("busy 409 remains a failure, without automatic replay or success", async ()
 	}
 	expect(requests).toHaveLength(1);
 });
-test("worktree removal posts the report query and the removal to their own endpoints", async () => {
-	const query = { workspaceKey: "wk", path: "/repo/.worktrees/task" };
-	await api.getNarratorWorktreeRemovalReport("n /1", query);
-	await api.removeNarratorWorktree("n /1", { ...query, deleteBranch: true });
-	expect(requests.map((r) => [r.url, r.input?.method])).toEqual([
-		["/api/narrators/n%20%2F1/git/worktrees/removal-report", "POST"],
-		["/api/narrators/n%20%2F1/git/worktrees/remove", "POST"],
-	]);
-	expect(JSON.parse(String(requests[1]?.input?.body))).toEqual({ ...query, deleteBranch: true });
-});

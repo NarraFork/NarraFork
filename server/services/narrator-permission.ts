@@ -242,8 +242,6 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "CreateWorktree":
 		case "AttachWorktree":
 			return typeof input.destinationPath === "string" ? [input.destinationPath] : [];
-		case "RemoveWorktree":
-			return typeof input.path === "string" ? [input.path] : [];
 		case "ShareFile":
 		case "GenUI":
 			return typeof input.path === "string" ? [input.path] : [];
@@ -797,12 +795,7 @@ export function resolvePermissionDecision(
 			return "deny";
 		}
 	}
-	if (
-		reviewReadOnlyBash &&
-		(toolName === "CreateWorktree" ||
-			toolName === "AttachWorktree" ||
-			toolName === "RemoveWorktree")
-	) {
+	if (reviewReadOnlyBash && (toolName === "CreateWorktree" || toolName === "AttachWorktree")) {
 		if (meta) meta.blacklistReason = `Review mode: ${toolName} modifies worktree resources.`;
 		return "deny";
 	}
@@ -962,22 +955,6 @@ export function resolvePermissionDecision(
 	if (blacklistResult) {
 		if (meta) meta.blacklistReason = blacklistResult.reason;
 		return "deny";
-	}
-
-	// Removing a worktree deletes a directory and possibly a branch. It is a person's
-	// decision every time: after the blacklists, above allowlists and the bypassPermissions/dontAsk shortcuts,
-	// so a confirmed `discard` in the input is always something a person approved.
-	if (toolName === "RemoveWorktree") {
-		if (effectiveMode === "readOnly" || effectiveMode === "dontAsk" || planMode) {
-			// A reason makes this a hard deny: without one, plan mode would soften it into a
-			// prompt, and under bypassPermissions into a reflection the agent answers itself.
-			if (meta)
-				meta.blacklistReason = planMode
-					? "Plan mode: RemoveWorktree deletes a worktree and is not available while planning."
-					: `${effectiveMode} mode: RemoveWorktree needs a person's approval and cannot run here.`;
-			return "deny";
-		}
-		return "ask";
 	}
 
 	// Review follow-up Bash is a hard, non-interactive capability ceiling. Keep this
@@ -1366,8 +1343,6 @@ function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boole
 
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
-/** Tools whose execution requires `permissionDecidedBy: "user"`: never auto, never reflection. */
-const PERSON_APPROVAL_TOOLS = new Set(["RemoveWorktree"]);
 
 export interface WhitelistDir extends LegacyDirectoryWhitelistEntry {
 	accessLevel: "readOnly" | "readWrite" | "full";
@@ -1615,7 +1590,6 @@ const WRITE_TOOLS = new Set([
 	"StructSed",
 	"CreateWorktree",
 	"AttachWorktree",
-	"RemoveWorktree",
 ]);
 const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
 
@@ -4800,11 +4774,6 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	) {
 		finalPermissionDeny("the exact tool attempt has no persisted approval");
 	}
-	// Whatever path produced the approval (rules, cache, reflection), these run only on a
-	// person's decision for this exact attempt.
-	if (PERSON_APPROVAL_TOOLS.has(check.toolName) && call.decidedBy !== "user") {
-		finalPermissionDeny(`${check.toolName} requires a person's approval`);
-	}
 	const internalReadAuthority = captureFinalInternalReadAuthority(call);
 	const policy = executionPolicyRepository.loadNow(check.narratorId);
 	const policyRevision = executionPolicyRevision(policy);
@@ -5708,12 +5677,6 @@ export async function handlePermission(
 	// fail-closed shortcuts must not pre-empt it.
 	const oauthReflectsInsteadOfDenying =
 		!!runtimeConstraint && runtimeConstraint.permissionMode === "bypassPermissions";
-	// Only a person may approve removing a worktree. An external session has nobody to ask,
-	// and its reflection loop is the agent reviewing itself, so this is denied outright.
-	if (runtimeConstraint && PERSON_APPROVAL_TOOLS.has(toolName) && decision !== "deny") {
-		permMeta.blacklistReason = `OAuth runtime policy cannot obtain a person's approval for ${toolName}`;
-		decision = "deny";
-	}
 	if (runtimeConstraint && !oauthReflectsInsteadOfDenying && decision === "ask") {
 		permMeta.blacklistReason =
 			"OAuth runtime policy denies operations that require interactive approval";

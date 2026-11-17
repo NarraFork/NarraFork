@@ -1,9 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import type {
-	WorktreeCreateResult,
-	WorktreeListResult,
-	WorktreeRemoveResult,
-} from "@shared/narrator-worktrees";
+import type { WorktreeCreateResult, WorktreeListResult } from "@shared/narrator-worktrees";
 import type { SwitchWorkingDirectoryRequest } from "@shared/workspace-context";
 import { AppError } from "../../../errors";
 import {
@@ -39,28 +35,6 @@ const listed: WorktreeListResult = {
 		remote: false,
 	},
 };
-const removed: WorktreeRemoveResult = {
-	removed: true,
-	path: "/repo/.worktrees/fix",
-	record: "retired",
-	branch: {
-		name: "fix",
-		deleted: false,
-		error: { code: "WORKTREE_BRANCH_NOT_MERGED", message: "x" },
-	},
-	report: {
-		path: "/repo/.worktrees/fix",
-		branch: "fix",
-		head: "a".repeat(40),
-		base: { ref: "refs/heads/main", sha: "b".repeat(40) },
-		upstream: null,
-		uncommittedFiles: 0,
-		uncommittedExact: true,
-		unmergedCommits: 0,
-		missing: false,
-		stale: false,
-	},
-};
 let requests: WorktreeCreateRequest[];
 let listInputs: unknown[];
 let recoveryIds: string[];
@@ -70,14 +44,10 @@ let switchFailure: Error | undefined;
 let result: WorktreeCreateResult;
 let failure: Error | undefined;
 let tools: Map<string, ToolDefinition>;
-let removals: unknown[];
-let removeFailure: Error | undefined;
 let ctx: ToolContext;
 const intent = { branchName: "fix", destinationPath: "/repo/.worktrees/fix" };
 
 beforeEach(() => {
-	removals = [];
-	removeFailure = undefined;
 	requests = [];
 	listInputs = [];
 	recoveryIds = [];
@@ -134,11 +104,6 @@ beforeEach(() => {
 					if (failure) throw failure;
 					return result;
 				},
-				remove: async (_principal, _narrator, input) => {
-					removals.push(input);
-					if (removeFailure) throw removeFailure;
-					return removed;
-				},
 			},
 			async () => "actor",
 		).map((tool) => [tool.name, tool]),
@@ -181,12 +146,11 @@ describe("intent-only worktree tools", () => {
 			);
 		}
 	});
-	test("advertises five flat schemas with honest required fields and bounds", () => {
+	test("advertises four flat schemas with honest required fields and bounds", () => {
 		expect([...tools.keys()]).toEqual([
 			"ListWorktrees",
 			"CreateWorktree",
 			"AttachWorktree",
-			"RemoveWorktree",
 			"GetWorktreeOperation",
 		]);
 		for (const tool of tools.values()) {
@@ -527,74 +491,5 @@ describe("intent-only worktree tools", () => {
 			const routing = routingOf(name);
 			expect(routing.resolve({}, {} as never)).toEqual({ key: "worktree", operation: "read" });
 		}
-		expect(
-			routingOf("RemoveWorktree").resolve({ path: "/repo/.worktrees/fix" }, {} as never),
-		).toEqual({ key: "worktree", operation: "write", path: "/repo/.worktrees/fix" });
-	});
-});
-
-describe("RemoveWorktree", () => {
-	test("binds the frozen workspace; the model supplies only path, branch, base and discard", async () => {
-		const schema = resolveToolJsonSchema(toolOf("RemoveWorktree"));
-		expect(schema.required).toEqual(["path"]);
-		expect(Object.keys(schema.properties as object).sort()).toEqual([
-			"deleteBranch",
-			"discard",
-			"path",
-		]);
-		const output = await execute("RemoveWorktree", {
-			path: "/repo/.worktrees/fix",
-			deleteBranch: true,
-		});
-		expect(output.isError).toBeUndefined();
-		expect(removals).toEqual([
-			{ path: "/repo/.worktrees/fix", deleteBranch: true, workspaceKey: "workspace" },
-		]);
-		expect(output.data.nextAction).toContain("branch was kept");
-		expect((await execute("RemoveWorktree", { path: "/x", workspaceKey: "other" })).isError).toBe(
-			true,
-		);
-		// What counts as kept is never the model's choice.
-		expect((await execute("RemoveWorktree", { path: "/x", baseRef: "feature" })).isError).toBe(
-			true,
-		);
-		expect(removals).toHaveLength(1);
-	});
-
-	test("a refusal carries the loss report and tells the agent to ask the user first", async () => {
-		const report = { ...removed.report, uncommittedFiles: 3, unmergedCommits: 2 };
-		removeFailure = new AppError(
-			"would lose work",
-			409,
-			"WORKTREE_REMOVAL_WOULD_LOSE_WORK",
-			undefined,
-			{
-				report,
-			},
-		);
-		const output = await execute("RemoveWorktree", { path: "/repo/.worktrees/fix" });
-		expect(output.isError).toBe(true);
-		expect(output.data.error.code).toBe("WORKTREE_REMOVAL_WOULD_LOSE_WORK");
-		expect(output.data.details).toEqual({ report });
-		expect(output.data.nextAction).toContain("Only if they explicitly agree");
-		removeFailure = new AppError("in use", 409, "WORKTREE_IN_USE", undefined, {
-			blockedBy: { kind: "terminal", id: "t" },
-		});
-		const blocked = await execute("RemoveWorktree", { path: "/repo/.worktrees/fix" });
-		expect(blocked.data.details).toEqual({ blockedBy: { kind: "terminal", id: "t" } });
-		expect(blocked.data.nextAction).toContain("Do not work around it");
-	});
-
-	test("a discard must copy a report's shape exactly", async () => {
-		for (const discard of [
-			{ head: "abc", uncommittedFiles: 1, unmergedCommits: 0 },
-			{ head: null, uncommittedFiles: -1, unmergedCommits: 0 },
-			{ head: null, uncommittedFiles: 1, unmergedCommits: 0, everything: true },
-		])
-			expect((await execute("RemoveWorktree", { path: "/p", discard })).isError).toBe(true);
-		expect(removals).toEqual([]);
-		const discard = { head: "a".repeat(40), uncommittedFiles: 1, unmergedCommits: 2 };
-		await execute("RemoveWorktree", { path: "/p", discard });
-		expect(removals).toEqual([{ path: "/p", discard, workspaceKey: "workspace" }]);
 	});
 });

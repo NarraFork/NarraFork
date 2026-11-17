@@ -181,7 +181,6 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 			"ListWorktrees",
 			"CreateWorktree",
 			"AttachWorktree",
-			"RemoveWorktree",
 			"GetWorktreeOperation",
 			"SwitchWorkingDirectory",
 			"SwitchDevice",
