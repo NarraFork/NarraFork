@@ -91,6 +91,7 @@ import {
 	parseTraits,
 	redactDraftTraits,
 	subagentVariant,
+	TEAM_TRAIT,
 } from "../lib/narrator-utils";
 import { getPacksExtractRoot } from "../lib/pack-archives";
 import { normalizeLegacyPermissionMode, resolveInitialRelaxedPlan } from "../lib/permission-modes";
@@ -181,6 +182,7 @@ import { specVfsService } from "./spec-vfs-service";
 import { removeUploadDirectoryWithoutMedia } from "./storage-service";
 import { defaultTaskBackendForNewSession } from "./task-source";
 import { readTaskBackend } from "./task-source/backend";
+import { assertTeamRemovable, deleteTeamOfNarratorInTransaction } from "./teams/team-records";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 import {
 	assertWorkspaceAdmission,
@@ -1329,13 +1331,23 @@ async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void>
 }
 
 type NarratorInsertExecutor = Pick<typeof db, "insert">;
+export type NarratorCreationTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 /** A fork keeps execution constraints and explicit audiences, but not named/task identity. */
 async function forkTraits(parent: typeof narrators.$inferSelect): Promise<string[]> {
 	// A fork of a bot is an ordinary narrator: a bot is made at creation (named and
 	// standalone), and its people's conversations stay with the original. Ceilings,
 	// the bot's included, carry over like any other — a fork never widens.
-	const excluded = new Set(["standalone", "named", "scheduled", "background", BOT_TRAIT]);
+	// Nor does a fork of a team coordinator become a second coordinator: the team is its
+	// `project_teams` row, which the fork does not get.
+	const excluded = new Set([
+		"standalone",
+		"named",
+		"scheduled",
+		"background",
+		BOT_TRAIT,
+		TEAM_TRAIT,
+	]);
 	const traits = [
 		"standalone",
 		...parseTraits(parent.traits).filter((trait) => !excluded.has(trait)),
@@ -1823,7 +1835,20 @@ export function publishNarratorCreated(narrator: typeof narrators.$inferSelect):
 export const narratorService = {
 	// ── Core CRUD ──────────────────────────────────────────────────────────────
 
-	async create(input: CreateNarratorInput) {
+	/**
+	 * `options.inTransaction` writes rows that must exist exactly when the narrator does (a
+	 * team's `project_teams` row) in the narrator's own insert transaction; a throw there
+	 * rolls the narrator back too.
+	 */
+	async create(
+		input: CreateNarratorInput,
+		options?: {
+			inTransaction?: (
+				tx: NarratorCreationTransaction,
+				narrator: typeof narrators.$inferSelect,
+			) => void;
+		},
+	) {
 		const prepared = await prepareNarratorCreation(input);
 		const insertNarrator = async () => {
 			const target = await narratorCreationWorkspaceTarget(prepared.row);
@@ -1832,7 +1857,11 @@ export const narratorService = {
 				fields: creationWorkspaceFields(prepared.row),
 			});
 			return withWorkspaceAdmission(target, async () =>
-				db.transaction((tx) => createPreparedNarratorInTransaction(tx, prepared)),
+				db.transaction((tx) => {
+					const narrator = createPreparedNarratorInTransaction(tx, prepared);
+					options?.inTransaction?.(tx, narrator);
+					return narrator;
+				}),
 			);
 		};
 
@@ -2461,6 +2490,9 @@ export const narratorService = {
 	},
 
 	async remove(narratorId: string) {
+		// A team coordinator with live work must not lose the only record of its worktrees;
+		// refuse before anything below starts deleting (re-checked in the transaction).
+		assertTeamRemovable(narratorId);
 		// What names it once the row is gone (the `narrator:deleted` event below).
 		const title =
 			(
@@ -2633,6 +2665,8 @@ export const narratorService = {
 					),
 				)
 				.run();
+			// The team row restricts the narrator delete; its finished items and events cascade.
+			deleteTeamOfNarratorInTransaction(tx, narratorId);
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});

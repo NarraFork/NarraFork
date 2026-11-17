@@ -20,6 +20,9 @@
  * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话改了 task_backend 时删掉它的行，清空会话时一起清；
  * - 被吞内容排查的两张表（`outline_spec_loss_findings` / `outline_spec_loss_scans`，12c）也不导出：
  *   说的是本机 spec 修订的事（spec 表不导出），覆盖会话不动它们，清空会话时一起清；
+ * - team 的三张表（`project_teams` / `team_work_items` / `team_work_events`）不导出：它们记的是
+ *   本机的 git 分支和 worktree。导入后会话的 `team` trait 以本机有没有 team 行为准
+ *   （`reconcileImportedTeamTraits`）；清空会话时先删 team 表（team 行 RESTRICT 会话删除）；
  * - 改完跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
  * 详见 docs/DATA_PORTABILITY.md。
  */
@@ -885,6 +888,35 @@ function repairDanglingReferences(baselines: Map<string, number>): void {
 }
 
 /**
+ * Team rows are not exported (they record this machine's git branches and worktrees), so an
+ * imported coordinator arrives without its team. A session is a team coordinator exactly when a
+ * local `project_teams` row says so: strip the `team` trait from incoming sessions without one,
+ * and keep it on a local coordinator that an overwrite would otherwise strip. Set-based and
+ * limited to the incoming ids, in the import transaction.
+ */
+function reconcileImportedTeamTraits(attachName: string): void {
+	const incoming = `SELECT id FROM ${attachName}.narrators`;
+	const hasTeamTrait = `EXISTS (SELECT 1 FROM json_each(main.narrators.traits) WHERE value = 'team')`;
+	const hasTeamRow = `EXISTS (SELECT 1 FROM main.project_teams WHERE narrator_id = main.narrators.id)`;
+	const stripped = changesOf(
+		sqlite.run(
+			`UPDATE main.narrators
+			 SET traits = (SELECT json_group_array(value) FROM json_each(main.narrators.traits)
+			               WHERE value <> 'team')
+			 WHERE id IN (${incoming}) AND json_valid(traits) AND ${hasTeamTrait} AND NOT ${hasTeamRow}`,
+		),
+	);
+	const kept = changesOf(
+		sqlite.run(
+			`UPDATE main.narrators SET traits = json_insert(traits, '$[#]', 'team')
+			 WHERE id IN (${incoming}) AND json_valid(traits) AND NOT ${hasTeamTrait} AND ${hasTeamRow}`,
+		),
+	);
+	if (stripped + kept > 0)
+		logger.info("Import reconciled team coordinator traits", { stripped, kept });
+}
+
+/**
  * Folder picks are personal: the two foreign keys alone do not prove that the picked
  * identity belongs to the binding's user. Drop only newly imported mismatches; existing
  * local rows are not this import's responsibility. Missing identities are rejected by the
@@ -1211,6 +1243,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				copyTable(attachName, "recent_tab_archive_marks", {
 					excludeNarrators: excludedNarrators,
 				});
+				reconcileImportedTeamTraits(attachName);
 				copyTable(attachName, "folder_git_identity_bindings");
 				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
 				if (
@@ -1776,6 +1809,11 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				// What the swallowed-content scan recorded about these sessions (outline P2 PR 12c).
 				sqlite.run(`DELETE FROM outline_spec_loss_findings`);
 				sqlite.run(`DELETE FROM outline_spec_loss_scans`);
+				// Teams are their coordinator sessions: the team row restricts the session delete, and
+				// its work items and events cascade with it. Children first, explicitly.
+				sqlite.run(`DELETE FROM team_work_events`);
+				sqlite.run(`DELETE FROM team_work_items`);
+				sqlite.run(`DELETE FROM project_teams`);
 				sqlite.run(`DELETE FROM narrators`);
 				deleted.sessions = Number(before.n);
 			}

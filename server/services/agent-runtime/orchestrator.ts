@@ -53,6 +53,7 @@ import {
 import {
 	isBotNarrator,
 	isPlanModeTrait,
+	isTeamNarrator,
 	parseSubstatus,
 	redactDraftTraits,
 } from "../../lib/narrator-utils";
@@ -63,6 +64,7 @@ import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import {
 	getBotModePrompt,
 	getRunDeliveryHint,
+	getTeamLeadPrompt,
 	getToolMessage,
 	getToolMessageWithParams,
 	type Locale,
@@ -353,6 +355,8 @@ export function runtimeBasePrompt(
 	const base = row.systemPrompt ?? settings.agent.defaultSystemPrompt ?? null;
 	const sections: string[] = [];
 	if (isBotNarrator(row.traits)) sections.push(getBotModePrompt(locale));
+	// A team coordinator's duties are a protocol like the bot's: after its own prompt.
+	if (isTeamNarrator(row.traits)) sections.push(getTeamLeadPrompt(locale));
 	const deliverTo = runDeliverToOf(row);
 	if (deliverTo) {
 		const run = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;

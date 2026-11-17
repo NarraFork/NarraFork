@@ -1395,6 +1395,10 @@ initNotificationFanout();
 startNotificationCenterMaintenance();
 
 if (activeDatabaseBackend === "sqlite") {
+	// A project team follows its coordinator session's archive state, whichever path changed it.
+	import("./services/teams/team-service")
+		.then(({ startTeamStatusSync }) => startTeamStatusSync())
+		.catch((err) => logger.warn("Team status sync failed to start", { error: String(err) }));
 	// Stop containers and release ports that removed chapters left behind.
 	retireLegacyChapterResources().catch((err) => {
 		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
