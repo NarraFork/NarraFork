@@ -44,7 +44,12 @@ import {
 	narratorReadableWhere,
 } from "../narrator-acl";
 import { type NarratorCreationTransaction, narratorService } from "../narrator-service";
-import { currentTeamStatusActor, runAsTeamStatusActor } from "./team-records";
+import {
+	currentTeamStatusActor,
+	personActor,
+	runAsTeamStatusActor,
+	type TeamStatusActor,
+} from "./team-records";
 
 type TeamRow = typeof projectTeams.$inferSelect;
 type CoordinatorRow = {
@@ -340,7 +345,7 @@ export function readTeamBrief(teamId: string): string | null {
 }
 
 /** Bring the stored team status in line with the coordinator's archived state. */
-function syncTeamStatus(teamId: string, archived: boolean, actorId: string | null): boolean {
+function syncTeamStatus(teamId: string, archived: boolean, actor: TeamStatusActor | null): boolean {
 	const target: TeamStatus = archived ? "archived" : "active";
 	const row = db
 		.select({ status: projectTeams.status })
@@ -358,7 +363,7 @@ function syncTeamStatus(teamId: string, archived: boolean, actorId: string | nul
 			tx,
 			teamId,
 			archived ? "team.archived" : "team.unarchived",
-			actorId ? { kind: "person", id: actorId } : { kind: "system", id: null },
+			actor ?? { kind: "system", id: null },
 			null,
 			now,
 		);
@@ -382,11 +387,13 @@ export async function archiveTeam(
 		}
 		const { interruptAndArchiveSubagent } = await import("../subagent-lifecycle");
 		// The status event fires inside; the sync listener attributes it to this person.
-		const result = await runAsTeamStatusActor(actorId, () => interruptAndArchiveSubagent(teamId));
+		const result = await runAsTeamStatusActor(personActor(actorId), () =>
+			interruptAndArchiveSubagent(teamId),
+		);
 		if (!result.ok && result.error === "not_found") throw new NotFoundError("Team", teamId);
 		if (!result.ok) throw new ValidationError(result.error ?? "Failed to archive the team");
 	}
-	syncTeamStatus(teamId, true, actorId);
+	syncTeamStatus(teamId, true, personActor(actorId));
 	return getTeam(teamId, principal, projectId);
 }
 
@@ -398,14 +405,16 @@ export async function unarchiveTeam(
 	const { coordinator } = await loadTeamForAccess(teamId, principal, "write", projectId);
 	const actorId = principal.userId || null;
 	if (coordinator.status === "archived") {
-		await runAsTeamStatusActor(actorId, () => narratorService.updateStatus(teamId, "idle"));
+		await runAsTeamStatusActor(personActor(actorId), () =>
+			narratorService.updateStatus(teamId, "idle"),
+		);
 		// Like the narrator unarchive route: put the sidebar row back where it was.
 		if (actorId) {
 			const { restoreArchivedTabPlacement } = await import("../recent-tabs-service");
 			await restoreArchivedTabPlacement(actorId, teamId, coordinator.title ?? teamId);
 		}
 	}
-	syncTeamStatus(teamId, false, actorId);
+	syncTeamStatus(teamId, false, personActor(actorId));
 	return getTeam(teamId, principal, projectId);
 }
 
@@ -484,9 +493,9 @@ export async function listProjectTeams(
 /**
  * Follow the coordinator's archive state from every path (narrator archive route, auto-unarchive
  * on a new message, Agent control). A primary-key read per status event; it writes only when the
- * stored team status disagrees. The event is the person's when the change runs inside
- * `runAsTeamStatusActor` (team routes, and every narrator HTTP route by its caller); otherwise
- * it is the system's. Returns the stop function.
+ * stored team status disagrees. The event names the person or agent when the change runs
+ * inside `runAsTeamStatusActor` (team routes, the narrator archive / unarchive / auto-unarchive
+ * sites, Agent control); any other change is the system's. Returns the stop function.
  */
 export function startTeamStatusSync(): () => void {
 	const onStatus = (event: { narratorId: string; status: string }) => {

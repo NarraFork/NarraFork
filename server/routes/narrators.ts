@@ -514,7 +514,7 @@ import {
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
-import { runAsTeamStatusActor } from "../services/teams/team-records";
+import { personActor, runAsTeamStatusActor } from "../services/teams/team-records";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -817,9 +817,16 @@ narratorRoutes.use("*", async (_c, next) => {
 	return next();
 });
 
-// A team coordinator archived or unarchived by this request (the archive routes, or the
-// auto-unarchive on interaction) is the caller's doing: hand the person to the team status sync.
-narratorRoutes.use("*", async (c, next) => runAsTeamStatusActor(c.get("user")?.sub, next));
+/**
+ * Unarchive on the caller's behalf (the unarchive route and the auto-unarchive on interaction).
+ * Only this status write runs as the caller, so a team coordinator's unarchive event names the
+ * person; whatever the request goes on to start does not inherit them (see team-records.ts).
+ */
+function unarchiveAsCaller(c: Context, id: string) {
+	return runAsTeamStatusActor(personActor(c.get("user")?.sub), () =>
+		narratorService.updateStatus(id, "idle"),
+	);
+}
 
 // JSON composer requests never inherit the much larger multipart attachment budget.
 // The middleware bounds streamed bodies before req.json(), including absent/lying Content-Length.
@@ -2474,7 +2481,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 
 	// Auto-unarchive on interaction
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const {
@@ -3038,7 +3045,7 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const userId = c.get("user").sub;
@@ -3073,7 +3080,7 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	}
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const userId = c.get("user").sub;
@@ -3232,7 +3239,7 @@ async function allowRetryResponse(c: Context, id: string, toolUseId: string) {
 	}
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const userId = c.get("user").sub;
@@ -3451,7 +3458,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	await prepareHistoryRewrite(id);
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const locale = await getUserLanguage(userId);
@@ -3494,7 +3501,7 @@ narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const userId = c.get("user").sub;
@@ -3511,7 +3518,7 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const result = await restoreAssistantMessage(id, messageId);
@@ -4655,7 +4662,7 @@ narratorRoutes.post("/:id/blocks/rollback", async (c) => {
 	const narrator = await narratorService.getById(id);
 	// As for the index route: the rollback discards the running turn it lands in.
 	await prepareHistoryRewrite(id);
-	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	const result = await rollbackToBlocks(id, blockIds, {
 		revertPlan,
 		skipRevert: skipRevert === true,
@@ -4733,7 +4740,7 @@ narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
 	const id = c.req.param("id");
 	const { content } = editAssistantMessageSchema.parse(await c.req.json());
 	const narrator = await narratorService.getById(id);
-	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	return c.json(await editOutputBlock(id, c.req.param("blockId"), content, c.get("user").sub));
 });
 
@@ -4741,7 +4748,7 @@ narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
 narratorRoutes.post("/:id/blocks/:blockId/restore", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	return c.json(await restoreOutputBlock(id, c.req.param("blockId")));
 });
 
@@ -5885,7 +5892,10 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 	// HTTP write ACL and Agent controller authorization share the same mechanism:
 	// end the complete run (including a hold), then archive any kind of session.
 	const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
-	const result = await interruptAndArchiveSubagent(id);
+	// Only the archive itself runs as the caller (a team coordinator's event names them).
+	const result = await runAsTeamStatusActor(personActor(c.get("user").sub), () =>
+		interruptAndArchiveSubagent(id),
+	);
 	if (!result.ok && result.error === "not_found") throw new NotFoundError("Narrator", id);
 	if (!result.ok) throw new ValidationError(result.error ?? "Failed to archive narrator");
 	return c.json({ ok: true });
@@ -5895,7 +5905,7 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 narratorRoutes.patch("/:id/unarchive", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	await narratorService.updateStatus(id, "idle");
+	await unarchiveAsCaller(c, id);
 	// 位置还留着、文件夹也还在时，直接回到它原来所在的那一层。
 	const { restoreArchivedTabPlacement } = await import("../services/recent-tabs-service");
 	await restoreArchivedTabPlacement(c.get("user").sub, id, narrator.title ?? id);

@@ -33,6 +33,8 @@ const { narratorService } = await import("../../services/narrator-service");
 const { createTeam, readTeamBrief, startTeamStatusSync } = await import(
 	"../../services/teams/team-service"
 );
+const { runAsTeamStatusActor } = await import("../../services/teams/team-records");
+const { interruptAndArchiveSubagent } = await import("../../services/subagent-lifecycle");
 
 const OWNER = "team-owner";
 const MEMBER = "team-member";
@@ -353,6 +355,50 @@ describe("archive and delete", () => {
 			["team.archived", "person", MEMBER],
 			["team.unarchived", "person", MEMBER],
 		]);
+	});
+
+	test("the person does not leak into work their request started", async () => {
+		const team = await newTeam("No leak");
+		let fired: Promise<unknown> = Promise.resolve();
+		// Something scheduled inside a person's status call (a run, a wake-up, a later turn)
+		// that archives the coordinator after that call has returned.
+		await runAsTeamStatusActor({ kind: "person", id: MEMBER }, async () => {
+			fired = new Promise((resolve) =>
+				setTimeout(() => resolve(narratorService.updateStatus(team.id, "archived")), 5),
+			);
+		});
+		await fired;
+		expect(await statusEvents(team.id)).toEqual([["team.archived", "system", null]]);
+	});
+
+	test("Agent control records the agent", async () => {
+		const team = await newTeam("Agent control");
+		const controller = generateId();
+		await runAsTeamStatusActor({ kind: "agent", id: controller }, () =>
+			interruptAndArchiveSubagent(team.id),
+		);
+		await runAsTeamStatusActor({ kind: "agent", id: controller }, () =>
+			narratorService.updateStatus(team.id, "idle"),
+		);
+		expect(await statusEvents(team.id)).toEqual([
+			["team.archived", "agent", controller],
+			["team.unarchived", "agent", controller],
+		]);
+		// The Agent tool's archive and unarchive run as the calling agent.
+		const taskSource = await Bun.file(
+			new URL("../../lib/agent/tools/task.ts", import.meta.url),
+		).text();
+		expect(
+			taskSource.split('runAsTeamStatusActor({ kind: "agent", id: ctx.narratorId }').length - 1,
+		).toBe(2);
+	});
+
+	test("narrator routes change status as the caller only around the status write", async () => {
+		const source = await Bun.file(new URL("../narrators.ts", import.meta.url)).text();
+		// No request-wide actor: every unarchive goes through the bounded helper.
+		expect(source).not.toMatch(/narratorRoutes\.use\([^)]*runAsTeamStatusActor/);
+		expect(source.split('narratorService.updateStatus(id, "idle")').length - 1).toBe(1);
+		expect(source.split("unarchiveAsCaller(c, id)").length - 1).toBeGreaterThanOrEqual(11);
 	});
 
 	test("the status people see is the coordinator's, whatever the stored mirror says", async () => {

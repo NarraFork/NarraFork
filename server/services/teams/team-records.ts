@@ -12,30 +12,57 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { TEAM_WORK_ITEM_FINISHED_STATES } from "@shared/project-teams";
-import { and, eq, inArray, isNotNull, notInArray, or } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { projectTeams, teamWorkItems } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 
 type Executor = Pick<typeof db, "select" | "delete">;
 
+/** Who changed a coordinator's status: a person (user id) or an agent (its narrator id). */
+export type TeamStatusActor = { kind: "person" | "agent"; id: string };
+
+interface ActorFrame {
+	actor: TeamStatusActor;
+	/** Cleared when the wrapped call settles: later work started inside it sees no actor. */
+	open: boolean;
+}
+
 /**
  * Who is changing a coordinator's status right now, for the team's archive/unarchive event.
  * `narrator:status_changed` carries no actor, and its listener runs synchronously inside the
- * call that changed the status, so the person is handed over through the async context: the
- * team routes wrap their narrator calls, and the narrator HTTP routes wrap every request in
- * their caller. Outside any such context (Agent control, recovery jobs) the change is the
- * system's. A run started by a request inherits its person, which matches how a run acts for
- * the person who started it.
+ * call that changed the status, so the actor is handed over through the async context — only
+ * around the status-changing calls themselves (team routes, the narrator archive / unarchive /
+ * auto-unarchive sites, Agent control), never around a whole request.
+ *
+ * The frame is closed as soon as the wrapped call settles. Anything the call scheduled that
+ * runs later (a timer, a run, a wake-up, a later turn) still sees the frame through the async
+ * context, but closed, so it reads as "no actor" and is recorded as the system's instead of
+ * being attributed to whoever happened to trigger the earlier call.
  */
-const teamStatusActor = new AsyncLocalStorage<string>();
+const teamStatusActor = new AsyncLocalStorage<ActorFrame>();
 
-export function runAsTeamStatusActor<T>(userId: string | null | undefined, fn: () => T): T {
-	return userId ? teamStatusActor.run(userId, fn) : fn();
+export async function runAsTeamStatusActor<T>(
+	actor: TeamStatusActor | null | undefined,
+	fn: () => Promise<T>,
+): Promise<T> {
+	if (!actor?.id) return fn();
+	const frame: ActorFrame = { actor, open: true };
+	try {
+		return await teamStatusActor.run(frame, fn);
+	} finally {
+		frame.open = false;
+	}
 }
 
-export function currentTeamStatusActor(): string | null {
-	return teamStatusActor.getStore() ?? null;
+/** The person behind a request, or no actor for a request without one. */
+export function personActor(userId: string | null | undefined): TeamStatusActor | null {
+	return userId ? { kind: "person", id: userId } : null;
+}
+
+export function currentTeamStatusActor(): TeamStatusActor | null {
+	const frame = teamStatusActor.getStore();
+	return frame?.open ? frame.actor : null;
 }
 
 const liveItem = () =>
@@ -44,19 +71,36 @@ const liveItem = () =>
 		isNotNull(teamWorkItems.worktreeResourceId),
 	);
 
+const LIVE_TEAM_BATCH = 500;
+
 /**
- * The coordinators whose teams have live work, i.e. those `narratorService.remove` refuses.
- * Database cleanup keeps them (reported as blocked) instead of aborting on the refusal. One
- * DISTINCT over the work items (team id leads its index); optionally narrowed to some narrators.
+ * Which of these coordinator candidates have teams with live work, i.e. the ones
+ * `narratorService.remove` refuses. Database cleanup keeps them (reported as blocked) instead of
+ * aborting on the refusal. Looked up per candidate id in batches of 500: each statement is a
+ * primary-key probe per id plus an EXISTS that stops at the first live item, so the work and
+ * the result are bounded by the batch whatever `team_work_items` holds.
  */
-export function listTeamsWithLiveWork(narratorIds?: string[]): Set<string> {
-	if (narratorIds && narratorIds.length === 0) return new Set();
-	const rows = db
-		.selectDistinct({ teamId: teamWorkItems.teamId })
-		.from(teamWorkItems)
-		.where(and(liveItem(), narratorIds ? inArray(teamWorkItems.teamId, narratorIds) : undefined))
-		.all();
-	return new Set(rows.map((row) => row.teamId));
+export function listTeamsWithLiveWork(candidateIds: readonly string[]): Set<string> {
+	const live = new Set<string>();
+	const unique = [...new Set(candidateIds)];
+	for (let start = 0; start < unique.length; start += LIVE_TEAM_BATCH) {
+		const batch = unique.slice(start, start + LIVE_TEAM_BATCH);
+		const rows = db
+			.select({ id: projectTeams.narratorId })
+			.from(projectTeams)
+			.where(
+				and(
+					inArray(projectTeams.narratorId, batch),
+					sql`exists (select 1 from team_work_items twi
+						where twi.team_id = ${projectTeams.narratorId}
+							and (twi.state not in ('merged', 'cancelled')
+								or twi.worktree_resource_id is not null))`,
+				),
+			)
+			.all();
+		for (const row of rows) live.add(row.id);
+	}
+	return live;
 }
 
 function liveWorkItemOf(executor: Executor, teamId: string): { id: string } | undefined {

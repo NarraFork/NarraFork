@@ -4,7 +4,7 @@
  * `teamLiveWork` in the preview — and deletes everything else, instead of aborting on the
  * refusal halfway through and never reaching VACUUM.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,7 @@ process.env.NARRAFORK_HOME = testHome;
 const { sqlite } = await import("../../db");
 const { databaseCleanupService } = await import("../database-cleanup-service");
 const { shutdownDbWorkerPool } = await import("../../lib/db-worker/pool");
+const { narratorService } = await import("../narrator-service");
 
 afterAll(async () => {
 	await shutdownDbWorkerPool();
@@ -35,17 +36,21 @@ function narrator(id: string, traits: string[] = []) {
 	);
 }
 
-function team(id: string, itemState: string) {
+function team(id: string, itemState: string | null) {
 	narrator(id, ["team"]);
 	sqlite.run(
 		`INSERT INTO project_teams (narrator_id, project_id, base_branch, status, created_at, updated_at)
 		VALUES (?, ?, 'main', 'archived', ?, ?)`,
 		[id, PROJECT, OLD, OLD],
 	);
+	if (itemState) workItem(id, itemState);
+}
+
+function workItem(teamId: string, state: string) {
 	sqlite.run(
 		`INSERT INTO team_work_items (id, team_id, project_id, title, state, created_at, updated_at)
 		VALUES (?, ?, ?, 'work', ?, ?, ?)`,
-		[`item-${id}`, id, PROJECT, itemState, OLD, OLD],
+		[`item-${teamId}`, teamId, PROJECT, state, OLD, OLD],
 	);
 }
 
@@ -87,5 +92,26 @@ describe("database cleanup with team coordinators", () => {
 		}>;
 		expect(teams.map((row) => row.narrator_id)).toEqual(["lead-busy"]);
 		expect(result.blockedCount).toBe(1);
+	});
+
+	test("a coordinator that gains live work just before its delete is kept; the rest goes on", async () => {
+		narrator("plain-2");
+		team("lead-late", null);
+		// The work item lands after planning and the re-check, right before the delete.
+		const remove = narratorService.remove.bind(narratorService);
+		const spy = spyOn(narratorService, "remove").mockImplementation(async (id: string) => {
+			if (id === "lead-late") workItem("lead-late", "queued");
+			return remove(id);
+		});
+		try {
+			const result = await databaseCleanupService.executeCleanup("archivedSessions");
+			expect(exists("plain-2")).toBe(false);
+			expect(exists("lead-late")).toBe(true);
+			expect(result.changed).toBe(true);
+			// lead-busy from the plan, lead-late from the refusal.
+			expect(result.blockedCount).toBe(2);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 });
