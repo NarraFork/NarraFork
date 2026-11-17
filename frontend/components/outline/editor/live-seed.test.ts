@@ -313,6 +313,19 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		client.seed(read());
 		type(client, B, "Bee typed then refused");
 		type(client, A, "Alpha too");
+		// Too large to watch whole: it joins again watching levels (the page's and the one the
+		// page stands in), the typing still waiting.
+		deliver({
+			kind: LIVE_FRAME.closed,
+			handle: sent[0]?.handle as number,
+			head: { code: "too_large" },
+		});
+		expect(client.status).toBe("connecting");
+		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.join]);
+		expect((sent[1]?.head as { watch: unknown }).watch).toEqual([{ l: null }, { l: PAGE }]);
+		expect(client.watchRefused.get(`s:${PAGE}`)).toBe("too_large");
+		expect(unsavedTextsOf(PAGE)).toEqual([]);
+		// Too large by levels too (a level of more than 2,000 blocks): refused for good.
 		deliver({
 			kind: LIVE_FRAME.closed,
 			handle: sent[0]?.handle as number,
@@ -327,7 +340,7 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		// Nothing of it is left in the client to send (or to lose).
 		expect(client.pending).toEqual([]);
 		expect(client.awaiting).toEqual([]);
-		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join]);
+		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.join]);
 		releaseLiveSession(shared);
 		expect(unsavedTextsOf(PAGE)).toHaveLength(2);
 	});

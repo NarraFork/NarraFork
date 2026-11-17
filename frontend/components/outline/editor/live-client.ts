@@ -1030,6 +1030,36 @@ export class LiveClient {
 	}
 
 	/**
+	 * Whether a watch is in the set (`set`), asked for and not answered yet (`asked`), or
+	 * neither (null).
+	 */
+	watching(key: string): "set" | "asked" | null {
+		if (this.watchToRemove.has(key)) return null;
+		if (this.watches.some((w) => liveWatchKey(w) === key)) return "set";
+		return this.watchAsked.has(key) ? "asked" : null;
+	}
+
+	/**
+	 * The root's subtree is too large for one watch (`too_large`): watch its level instead, and
+	 * load what is under it as the reader opens it (`level-loader.ts`). A level does not show its
+	 * parent: the root itself comes with its own parent's level (the top level for a page; the
+	 * parent a seed or an earlier snapshot named otherwise). False when the client does not watch
+	 * its root's subtree (it already watches by levels).
+	 */
+	private watchLevelsInstead(): boolean {
+		const key = liveWatchKey({ s: this.pageId });
+		if (!this.watches.some((w) => liveWatchKey(w) === key)) return false;
+		this.watches = this.watches.filter((w) => liveWatchKey(w) !== key);
+		const parent = this.confirmed.get(this.pageId)?.parentId ?? null;
+		for (const w of [{ l: parent }, { l: this.pageId }] as LiveWatchWire[])
+			if (!this.watches.some((x) => liveWatchKey(x) === liveWatchKey(w))) this.watches.push(w);
+		this.watchRefused.set(key, "too_large");
+		this.log.push("too large to watch whole: watching its levels");
+		this.rescope();
+		return true;
+	}
+
+	/**
 	 * Change what it watches. Removals take effect at once: what no remaining watch shows goes
 	 * from this client (its structure and texts; its undo steps lose their text there). Additions
 	 * are answered by the server (`watched`): the structure and text they show join this client,
@@ -2159,6 +2189,11 @@ export class LiveClient {
 		if ((code === "user_limit" || code === "space_full") && !this.roomAsked && this.makeRoom?.()) {
 			this.roomAsked = true;
 			this.log.push(`refused (${code}): let this tab's left pages go and joined again`);
+			this.join();
+			return;
+		}
+		// The root's subtree no longer fits one watch: joined again watching it by levels.
+		if (code === "too_large" && this.watchLevelsInstead()) {
 			this.join();
 			return;
 		}

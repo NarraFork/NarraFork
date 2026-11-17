@@ -120,6 +120,7 @@ import {
 	serializePM,
 } from "./convert";
 import { htmlToOutline, isOwnClipboardHtml } from "./html-paste";
+import { levelLoaderOf } from "./level-loader";
 import type { BodyChange, ClientView, LiveClient, SelInfo, SelPoint } from "./live-client";
 import { liveFoldSource, liveUnderTask } from "./live-fold";
 import { schema } from "./schema";
@@ -358,6 +359,12 @@ export class OutlineView implements CmdHost, ClientView {
 		this.lens = opts.lens ?? "all";
 		this.placeholderId = client.newId();
 		client.views.add(this);
+		// What this view shows open is loaded (by levels where a subtree is too large to watch
+		// whole, `level-loader.ts`).
+		if (surface.kind === "focus")
+			this.offLoader = levelLoaderOf(client).add({
+				foldTrees: () => (this.destroyed ? [] : [this.foldTree]),
+			});
 		const built = this.buildDoc();
 		this.nodeCache = built.staged;
 		const state = EditorState.create({ doc: built.doc, plugins: this.plugins() });
@@ -439,7 +446,10 @@ export class OutlineView implements CmdHost, ClientView {
 	detach() {
 		this.destroyed = true;
 		this.client.views.delete(this);
+		this.offLoader?.();
 	}
+
+	private offLoader: (() => void) | null = null;
 
 	/**
 	 * Show another block as the root (a focus view moving to another focused block): the same
@@ -1021,6 +1031,8 @@ export class OutlineView implements CmdHost, ClientView {
 	private project(hold = false) {
 		const t0 = performance.now();
 		const { doc: newDoc, staged, changed } = this.buildDoc(hold);
+		// What is open may need loading (`level-loader.ts`).
+		levelLoaderOf(this.client).schedule();
 		const state = this.pm.state;
 		const old = state.doc;
 		const start = old.content.findDiffStart(newDoc.content);

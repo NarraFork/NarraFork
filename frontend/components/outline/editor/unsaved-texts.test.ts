@@ -275,11 +275,13 @@ describe("typing that cannot reach the page outlives its session", () => {
 		retainLiveSession(shared);
 		shared.client.seed(read());
 		type(shared.client, B, "Bee typed then refused");
-		deliver({
-			kind: LIVE_FRAME.closed,
-			handle: sent[0]?.handle as number,
-			head: { code: "too_large" },
-		});
+		// (The first `too_large` joins again watching levels; the second refuses for good.)
+		for (let i = 0; i < 2; i++)
+			deliver({
+				kind: LIVE_FRAME.closed,
+				handle: sent[0]?.handle as number,
+				head: { code: "too_large" },
+			});
 		// The panel is hidden: its editor unmounts, the session is dropped.
 		releaseLiveSession(shared);
 		await sleep(20);
