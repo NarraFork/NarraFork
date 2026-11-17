@@ -25,6 +25,8 @@ let agentTool: typeof import("../task").agentTool;
 let realNarratorSubagent: typeof import("@server/services/narrator-subagent");
 let realCommunication: typeof import("@server/services/agent-communication");
 const sent: Array<{ caller: string; id?: string; message: string }> = [];
+/** The Send status the stubbed delivery reports. */
+let sendStatus = "started";
 let items: typeof import("@server/services/teams/work-items");
 
 const LEAD = "p3a-lead";
@@ -66,7 +68,7 @@ beforeAll(async () => {
 		sendSubagentMessageDetailed: mock(
 			async (input: { callerNarratorId: string; id?: string; message: string }) => {
 				sent.push({ caller: input.callerNarratorId, id: input.id, message: input.message });
-				return { output: "sent", targets: [{ id: input.id ?? "", status: "queued" }] };
+				return { output: "sent", targets: [{ id: input.id ?? "", status: sendStatus }] };
 			},
 		),
 	}));
@@ -84,6 +86,7 @@ afterAll(() => {
 beforeEach(async () => {
 	runCalls.length = 0;
 	sent.length = 0;
+	sendStatus = "started";
 	failRun = false;
 	failAfterCreate = false;
 	temporary = await mkdtemp(join(tmpdir(), "nf-agent-team-"));
@@ -347,5 +350,20 @@ describe("Team work.sync", () => {
 		expect(sent).toEqual([{ caller: LEAD, id: "p3a-worker-1", message: outcome.instruction }]);
 		expect(outcome.instruction).toContain("git merge --no-ff");
 		expect(await git(["rev-parse", "HEAD"], path)).toBe(head);
+		expect(outcome.nextAction).toContain("Wait for its report");
+
+		// A stopped worker stores it but will not act; an idle worker that could not be started
+		// has it queued with no turn coming. Neither is "delivered", each says what to do.
+		const sync = async () =>
+			JSON.parse((await teamTool.execute({ action: "work.sync", item: item.id }, ctx())).output);
+		sendStatus = "blocked";
+		const blocked = await sync();
+		expect(blocked).toMatchObject({ delivered: false, delivery: "blocked" });
+		expect(blocked.nextAction).toContain("is stopped");
+		expect(blocked.nextAction).toContain("A person must resume it, or delegate the sync");
+		sendStatus = "queued";
+		const queued = await sync();
+		expect(queued).toMatchObject({ delivered: false, delivery: "wake_failed" });
+		expect(queued.nextAction).toContain("could not be started now");
 	});
 });

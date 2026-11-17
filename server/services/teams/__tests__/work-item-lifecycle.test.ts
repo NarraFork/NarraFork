@@ -38,6 +38,7 @@ import {
 	recordReview,
 	settleIsolatedWorkItem,
 	setWorkItemPortsForTests,
+	syncDeliveryStatus,
 	syncInstruction,
 	syncWorkItem,
 	updateBrief,
@@ -500,7 +501,7 @@ describe("base sync", () => {
 				actor: agent,
 				deliver: async (worker, text) => {
 					delivered.push([worker, text]);
-					return true;
+					return "started" as const;
 				},
 			}),
 		);
@@ -513,6 +514,7 @@ describe("base sync", () => {
 			outcome: "handed_off",
 			worker: "p3-sync-worker",
 			delivered: true,
+			delivery: "started",
 			baseSha: base,
 			head: before,
 		});
@@ -526,7 +528,7 @@ describe("base sync", () => {
 		expect(events(item.id).at(-1)).toMatchObject({
 			kind: "work.sync",
 			actorKind: "agent",
-			detail: { outcome: "handed_off", reason: "handed_off", delivered: true },
+			detail: { outcome: "handed_off", reason: "handed_off", delivered: true, delivery: "started" },
 		});
 		// The worker merges; then nothing is left to bring in.
 		await git(
@@ -552,7 +554,12 @@ describe("base sync", () => {
 		const item = await create("Nobody yet");
 		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
 		const none = await syncWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
-		expect(none).toMatchObject({ outcome: "handed_off", worker: null, delivered: false });
+		expect(none).toMatchObject({
+			outcome: "handed_off",
+			worker: null,
+			delivered: false,
+			delivery: "none",
+		});
 		seedWorker("p3-gone");
 		attachWorker(LEAD, item.id, "p3-gone", agent);
 		const failed = await syncWorkItem({
@@ -563,7 +570,27 @@ describe("base sync", () => {
 				throw new Error("Target subagent is archived");
 			},
 		});
-		expect(failed).toMatchObject({ outcome: "handed_off", worker: "p3-gone", delivered: false });
+		expect(failed).toMatchObject({
+			outcome: "handed_off",
+			worker: "p3-gone",
+			delivered: false,
+			delivery: "failed",
+		});
+		// Stored for a stopped worker, or stored with no turn started: not delivered either.
+		for (const delivery of ["blocked", "wake_failed"] as const)
+			expect(
+				await syncWorkItem({
+					coordinatorId: LEAD,
+					itemId: item.id,
+					actor: agent,
+					deliver: async () => delivery,
+				}),
+			).toMatchObject({ delivered: false, delivery });
+		expect(syncDeliveryStatus("started", false)).toBe("started");
+		expect(syncDeliveryStatus("queued", true)).toBe("queued");
+		expect(syncDeliveryStatus("queued", false)).toBe("wake_failed");
+		expect(syncDeliveryStatus("blocked", true)).toBe("blocked");
+		expect(syncDeliveryStatus("taken_over", false)).toBe("failed");
 	});
 
 	test("commits a worker's base merge brings in do not count as commits since the review", async () => {

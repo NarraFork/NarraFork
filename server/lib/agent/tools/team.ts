@@ -158,6 +158,26 @@ function cleanupNextAction(code: string): string {
 	}
 }
 
+/** What the coordinator does after a base sync was handed off, by how the instruction went. */
+export function syncNextAction(
+	delivery: import("../../../services/teams/work-items").SyncDeliveryStatus,
+	label: string | null,
+): string {
+	switch (delivery) {
+		case "started":
+		case "queued":
+			return `The worker ("${label}") was told to merge the base into its branch and report; nothing was merged on the server. Wait for its report.`;
+		case "blocked":
+			return `The worker ("${label}") is stopped (a person stopped its last turn, or it ended with an error): the instruction is stored but it will not act on it. A person must resume it, or delegate the sync to another worker with Agent({ workdir: <the item's worktree>, prompt: instruction }).`;
+		case "wake_failed":
+			return `The instruction is stored for the worker ("${label}"), but it could not be started now and will not act on it until its next turn. Check on it, or Send the instruction again later.`;
+		case "failed":
+			return `The instruction did not reach the worker ("${label}"). Send it yourself (restore it first with Agent({ unarchive }) if it is archived).`;
+		case "none":
+			return "The item has no worker yet: delegate the instruction with Agent({ workdir: <the item's worktree>, prompt: instruction }).";
+	}
+}
+
 async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 	const items = await import("../../../services/teams/work-items");
 	const actor = { kind: "agent" as const, id: ctx.narratorId };
@@ -241,7 +261,17 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 								locale: ctx.locale,
 								userId: ctx.userId ?? null,
 							});
-							return sent.targets.some((target) => target.status !== "failed");
+							const target = sent.targets.find((entry) => entry.id === worker) ?? sent.targets[0];
+							const [{ isNarratorRuntimeBusy }, { narratorService }] = await Promise.all([
+								import("../../../services/narrator-session-state"),
+								import("../../../services/narrator-service"),
+							]);
+							const row = await narratorService.getById(worker).catch(() => null);
+							const running =
+								isNarratorRuntimeBusy(worker) ||
+								row?.status === "working" ||
+								row?.status === "waiting";
+							return items.syncDeliveryStatus(target?.status, running);
 						}
 					: undefined,
 			});
@@ -249,11 +279,7 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 			const label = await workerLabel(ctx, outcome.worker);
 			return result({
 				...outcome,
-				nextAction: outcome.delivered
-					? `The worker ("${label}") was told to merge the base into its branch and report; nothing was merged on the server. Wait for its report.`
-					: label
-						? `The instruction did not reach the worker ("${label}"). Send it the instruction yourself (restore it first with Agent({ unarchive }) if it is archived).`
-						: "The item has no worker yet: delegate the instruction with Agent({ workdir: <the item's worktree>, prompt: instruction }).",
+				nextAction: syncNextAction(outcome.delivery, label),
 			});
 		}
 		case "work.cancel": {

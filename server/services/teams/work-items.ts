@@ -9,9 +9,9 @@
  *
  * Every state change, review verdict, base sync, cleanup, check-in and decision appends one
  * `team_work_events` row naming its person or agent. Each statement is a primary-key or index
- * lookup bounded by a LIMIT; git in a worktree runs only through the hardened `team-git.ts`
- * (no hooks, fsmonitor, external diff or filter programs, read bounds of `gitService`), and the merge
- * of a base sync through its bounded merge.
+ * lookup bounded by a LIMIT. The server only reads git in a worktree, through the hardened
+ * `team-git.ts` (no hooks of any kind, fsmonitor, external diff, filter programs or index writes;
+ * read bounds of `gitService`); a base sync is the worker's job.
  *
  * SQLite only, like the rest of the team surface.
  */
@@ -676,6 +676,42 @@ export function cancelWorkItem(input: {
 
 // ── Base sync ───────────────────────────────────────────────────────────────
 
+/**
+ * How a base sync instruction reached the worker: `started` (an idle worker was started on it),
+ * `queued` (the worker is running and reads it at its next boundary), `blocked` (stored, but the
+ * worker is stopped — a person stopped its last turn or it ended with an error — and agent
+ * messages do not restart it), `wake_failed` (stored, but no turn could be started for it),
+ * `failed` (not stored), `none` (no worker, or nobody to deliver).
+ */
+export type SyncDeliveryStatus =
+	| "started"
+	| "queued"
+	| "blocked"
+	| "wake_failed"
+	| "failed"
+	| "none";
+
+/**
+ * The delivery status of a Send target as a base sync sees it. `queued` counts only when the
+ * worker is running (it reads the message at its next boundary); a `queued` idle worker is a
+ * wake that failed.
+ */
+export function syncDeliveryStatus(
+	targetStatus: string | undefined,
+	workerRunning: boolean,
+): SyncDeliveryStatus {
+	switch (targetStatus) {
+		case "started":
+			return "started";
+		case "queued":
+			return workerRunning ? "queued" : "wake_failed";
+		case "blocked":
+			return "blocked";
+		default:
+			return "failed";
+	}
+}
+
 export type SyncOutcome =
 	| { outcome: "up_to_date"; baseSha: string; head: string }
 	| {
@@ -684,8 +720,10 @@ export type SyncOutcome =
 			head: string;
 			/** The subagent that brings the base in itself (null: the item has no worker yet). */
 			worker: string | null;
-			/** Whether the instruction reached the worker. */
+			/** Whether the instruction reached a worker that will act on it. */
 			delivered: boolean;
+			/** How the delivery went (`none` without a worker or a deliverer). */
+			delivery: SyncDeliveryStatus;
 			/** The instruction, the same text for the same item and base commit. */
 			instruction: string;
 	  };
@@ -718,8 +756,8 @@ export async function syncWorkItem(input: {
 	coordinatorId: string;
 	itemId: string;
 	actor: WorkActor;
-	/** Delivers the instruction to the worker; resolves whether it was delivered. */
-	deliver?: (workerNarratorId: string, instruction: string) => Promise<boolean>;
+	/** Delivers the instruction to the worker; resolves how it went. */
+	deliver?: (workerNarratorId: string, instruction: string) => Promise<SyncDeliveryStatus>;
 }): Promise<SyncOutcome> {
 	const team = requireActiveTeam(input.coordinatorId);
 	const item = requireWorkItem(team.teamId, input.itemId);
@@ -742,17 +780,18 @@ export async function syncWorkItem(input: {
 			branch: item.branchName,
 		});
 		const worker = item.workerNarratorId;
-		const delivered =
+		const delivery: SyncDeliveryStatus =
 			worker && input.deliver
 				? await input.deliver(worker, instruction).catch((error) => {
 						logger.warn("Team base sync instruction was not delivered", {
 							workItemId: item.id,
 							error: error instanceof Error ? error.message : String(error),
 						});
-						return false;
+						return "failed" as const;
 					})
-				: false;
-		result = { outcome: "handed_off", baseSha, head, worker, delivered, instruction };
+				: "none";
+		const delivered = delivery === "started" || delivery === "queued";
+		result = { outcome: "handed_off", baseSha, head, worker, delivered, delivery, instruction };
 	}
 	recordWorkEvent(db, {
 		teamId: team.teamId,
@@ -766,7 +805,7 @@ export async function syncWorkItem(input: {
 			baseSha,
 			head,
 			...(result.outcome === "handed_off"
-				? { worker: result.worker, delivered: result.delivered }
+				? { worker: result.worker, delivered: result.delivered, delivery: result.delivery }
 				: {}),
 		},
 	});
