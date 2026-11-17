@@ -261,6 +261,12 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 - 读者看到的 body 是 `prose`（同模型文字）；来源标签「Dynamic Spec moved to the outline / Dynamic Spec 已搬进大纲」。
 - 配套（不是注入）：这种会话里点名 `spec://` 的工具调用（`getOutlineSpecRejection`，`AgentConfig.specImported`）回答「已搬进大纲、各在哪」，而不是一般大纲会话那句；界面和插件的 spec 写入拒绝用 `SPEC_MOVED_TO_OUTLINE`（code 仍是 `SPEC_OUTLINE_SESSION`）。
 
+**团队自检**（`server/services/teams/work-items.ts`，P3）：协调者 `Team({ action: "checkin", minutes })` 排一次唤醒，到点写一行：
+
+| source | body kind | schedule | 触发 |
+|---|---|---|---|
+| `team_checkin` | `prose` | `wakeIfIdle` | 自检到点（每个 team 最多一个待发，新排的替换旧的；排定和触发各记一条 `team.checkin` 事件，重启后按事件重排，已过点的立即触发） |
+
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 
 loop 自己抬起的提醒进 `pendingLoopInjections` 队列，在 turn 边界由 `flushLoopInjections()` 经宿主的 `deliverInjectionRow` 钩子落库：
