@@ -73,18 +73,32 @@ export class LevelLoader {
 		const want = new Map<string, LiveWatchWire>();
 		const v = c.visible;
 		const refused = (key: string) => c.watchRefused.has(key);
+		/** The subtree watched whole a block is in (itself or an ancestor), kept wanted. */
+		const covering = (id: string): boolean => {
+			let cur: string | null = id;
+			for (let guard = 0; cur && guard < 10_000; guard++) {
+				const w: LiveWatchWire = { s: cur };
+				if (c.watching(liveWatchKey(w)) === "set") {
+					want.set(liveWatchKey(w), w);
+					return true;
+				}
+				cur = v.get(cur)?.parentId ?? null;
+			}
+			return false;
+		};
+		/** A root's own block: its subtree watched whole, or its parent's level and its own. */
+		const base = (root: string): void => {
+			if (covering(root)) return;
+			const anchor: LiveWatchWire = { l: v.get(root)?.parentId ?? null };
+			want.set(liveWatchKey(anchor), anchor);
+		};
 		const visit = (tree: FoldTree, id: string): void => {
 			const s: LiveWatchWire = { s: id };
 			const ks = liveWatchKey(s);
 			const l: LiveWatchWire = { l: id };
 			const kl = liveWatchKey(l);
-			const whole = c.watching(ks);
-			if (whole === "set") {
-				want.set(ks, s);
-				return;
-			}
-			// Inside a subtree watched whole: everything under it is here.
-			if (v.underRoot(id)) return;
+			// Inside a subtree watched whole (its own or an ancestor's): everything under it is here.
+			if (covering(id)) return;
 			if (!refused(ks)) {
 				want.set(ks, s);
 				// Its level stays while the whole of it is on its way.
@@ -97,15 +111,16 @@ export class LevelLoader {
 			if (!node?.open) return;
 			for (const k of node.kids) visit(tree, k);
 		};
+		// The client's own root is always kept (its session is the page's), whatever is shown.
+		base(c.pageId);
+		if (!covering(c.pageId) && refused(liveWatchKey({ s: c.pageId }))) {
+			const own: LiveWatchWire = { l: c.pageId };
+			want.set(liveWatchKey(own), own);
+		}
 		for (const tree of trees) {
-			const root = tree.rootId;
-			const covered = c.watching(liveWatchKey({ s: root })) === "set" || v.underRoot(root);
-			if (!covered) {
-				// A level does not show its parent: the root comes with its own parent's level.
-				const anchor: LiveWatchWire = { l: v.get(root)?.parentId ?? null };
-				want.set(liveWatchKey(anchor), anchor);
-			}
-			visit(tree, root);
+			// A level does not show its parent: a root comes with its own parent's level.
+			base(tree.rootId);
+			visit(tree, tree.rootId);
 		}
 		return want;
 	}

@@ -17,6 +17,7 @@ function setup(options: {
 	asked?: string[];
 	refused?: Record<string, LiveCloseCode>;
 	view?: FoldView;
+	root?: string;
 }) {
 	const scope = { roots: new Set<string>(), levels: new Set<string>() };
 	for (const k of options.set) {
@@ -36,6 +37,7 @@ function setup(options: {
 	const refused = new Map(Object.entries(options.refused ?? {}));
 	const client = {
 		visible: store,
+		pageId: "page",
 		ready: true,
 		status: "live",
 		watchRefused: refused,
@@ -52,9 +54,7 @@ function setup(options: {
 	} as unknown as LiveClient;
 	const tree = buildFoldTree(
 		liveFoldSource(client, { marks: new Map(), questionsKnown: true }),
-		{
-			rootId: "page",
-		},
+		{ rootId: options.root ?? "page" },
 		options.view,
 	);
 	const loader = new LevelLoader(client);
@@ -66,6 +66,11 @@ function setup(options: {
 describe("what the views need watched", () => {
 	test("a root watched whole needs nothing more", () => {
 		const { keys } = setup({ set: ["s:page"] });
+		expect(keys()).toEqual(["s:page"]);
+	});
+
+	test("a block focused inside the root's subtree keeps the root's watch", () => {
+		const { keys } = setup({ set: ["s:page"], root: "big" });
 		expect(keys()).toEqual(["s:page"]);
 	});
 
