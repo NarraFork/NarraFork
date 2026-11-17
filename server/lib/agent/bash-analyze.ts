@@ -45,6 +45,11 @@ export interface BashAnalysis {
 	 * 逐项列出让无人兜底的判定（如 review 只读放行）可以整体否决。
 	 */
 	commandEnvVars: string[];
+	/**
+	 * The parser recovered from a syntax error: part of the text was not understood, so the
+	 * analysis may not describe what the shell runs. Set by the bash analyser only.
+	 */
+	hasSyntaxError?: boolean;
 	/** 是否为灾难性命令 — 即使 bypassPermissions 也必须 deny + 终止 loop */
 	isCatastrophic: boolean;
 	/** 灾难性命令的原因描述 */
@@ -1661,6 +1666,8 @@ type TreeSitterParser = {
 type TreeSitterNode = {
 	type: string;
 	text: string;
+	/** Whether this subtree contains a syntax error the parser recovered from. */
+	hasError: boolean;
 	childCount: number;
 	child(index: number): TreeSitterNode | null;
 	parent: TreeSitterNode | null;
@@ -2417,6 +2424,7 @@ export async function analyzeBashCommand(
 	return {
 		commands,
 		filePaths,
+		hasSyntaxError: tree.rootNode.hasError,
 		allWhitelisted:
 			nonWhitelisted.length === 0 && dangerousPatterns.length === 0 && !hasEnvInjection,
 		nonWhitelisted,

@@ -18,6 +18,7 @@ import type { BufferManager, BufferReadCursor } from "../../../terminal/buffer-m
 import { truncateOutput } from "../truncate";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
+import { processTerminalEscapes } from "./terminal-escapes";
 
 /** Successful tool snapshots are the only authority for the next read/watch frontier. */
 interface ReadCursorState {
@@ -726,8 +727,22 @@ async function writeInput(
 				isError: true,
 			};
 		}
-		const processed = processEscapes(input);
+		const processed = processTerminalEscapes(input);
+		// Who receives it, read before sending, so the permission layer's line tracking
+		// (`terminal-input-judge.ts`) follows what the shell actually got.
+		const judge = await import("../../../services/terminal-input-judge");
+		const foreground = await judge.probeTerminalForeground(terminalId);
+		if (signal.aborted) return makeAbortedResult(terminal.name ?? terminalId);
 		terminalService.write(terminalId, processed);
+		const row = await db.query.terminals.findFirst({
+			where: eq(terminals.id, terminalId),
+			columns: { cwd: true, deviceId: true },
+		});
+		judge.commitTerminalInput(terminalId, processed, {
+			initialCwd: row?.cwd ?? null,
+			foreground,
+			home: judge.terminalHome(row?.deviceId ?? null),
+		});
 		const deadline = Date.now() + WRITE_SETTLE_TIMEOUT_MS;
 		let lastChangeTime = Date.now();
 		let lastLen = beforeLen;
@@ -845,17 +860,4 @@ async function writeInput(
 		observation?.dispose();
 		if (!markerOwned) echoPoint?.dispose();
 	}
-}
-
-/**
- * Process common escape sequences in user-provided input strings.
- * Converts literal backslash-escaped sequences to their actual byte values.
- */
-function processEscapes(input: string): string {
-	return input
-		.replace(/\\n/g, "\n")
-		.replace(/\\r/g, "\r")
-		.replace(/\\t/g, "\t")
-		.replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
-		.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
 }

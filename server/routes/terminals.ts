@@ -55,6 +55,19 @@ terminalRoutes.get("/tree", async (c) => {
 	return c.json({ ...listing, canOpen });
 });
 
+/**
+ * Whether this caller may open a narrator's terminals (write access), so the page can hide
+ * the terminal panel and its create buttons from read-only viewers. Needs read access.
+ */
+terminalRoutes.get("/access", async (c) => {
+	const narratorId = c.req.query("narratorId");
+	if (!narratorId) {
+		throw new ValidationError("narratorId query parameter is required");
+	}
+	const narrator = await requireNarratorAccess(c, narratorId, "read");
+	return c.json({ canOpen: await canWriteNarrator(narrator, narratorPrincipalOf(c)) });
+});
+
 terminalRoutes.post("/", async (c) => {
 	const body = await c.req.json();
 	const parsed = createTerminalSchema.safeParse(body);

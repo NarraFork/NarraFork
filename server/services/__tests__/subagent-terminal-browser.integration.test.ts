@@ -30,10 +30,11 @@ import type { ToolContext } from "../../lib/agent/types";
 import * as browserModule from "../../lib/browser";
 import "../../lib/browser/session";
 import { AppError } from "../../lib/errors";
+import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { terminalRoutes } from "../../routes/terminals";
-import { handleTerminalWS } from "../../websocket/terminal-ws";
+import { handleTerminalWS, settleTerminalAccessSweep } from "../../websocket/terminal-ws";
 import {
 	PROCESS_BROWSER_SESSION_LIMIT,
 	reserveBrowserLaunch,
@@ -724,6 +725,21 @@ describe("terminal access for every narrator", () => {
 		expect(list.status).toBe(200);
 		expect(((await list.json()) as { id: string }[]).map(({ id }) => id)).toContain(t.shell);
 		expect((await app(t.reader).request(`/api/terminals/${t.shell}`)).status).toBe(200);
+		// The page hides the terminal panel and its create buttons from this viewer.
+		const access = async (user: string) =>
+			(await (await app(user).request(`/api/terminals/access?narratorId=${t.root}`)).json()) as {
+				canOpen: boolean;
+			};
+		expect(await access(t.reader)).toEqual({ canOpen: false });
+		expect(await access(t.owner)).toEqual({ canOpen: true });
+		expect(
+			(await app(t.stranger).request(`/api/terminals/access?narratorId=${t.root}`)).status,
+		).toBe(200);
+		await db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, t.root));
+		expect(
+			(await app(t.stranger).request(`/api/terminals/access?narratorId=${t.root}`)).status,
+		).toBe(404);
+		await db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, t.root));
 
 		const reader = socket(t.reader);
 		await reader.send({ type: "subscribe", terminalIds: [t.shell] });
@@ -769,6 +785,45 @@ describe("terminal access for every narrator", () => {
 		const row = await db.query.terminals.findFirst({ where: eq(terminals.id, t.shell) });
 		expect(row?.name).toBe("owner-shell");
 		expect(row?.status).toBe("running");
+	});
+
+	test("a revoked share stops the output stream at once, and resize re-checks too", async () => {
+		const t = await ownedShell();
+		const grant = await grantWrite(t.root, t.reader);
+		const colleague = socket(t.reader);
+		handleTerminalWS.open(colleague.ws as never);
+		const owner = socket(t.owner);
+		handleTerminalWS.open(owner.ws as never);
+		try {
+			await colleague.send({ type: "subscribe", terminalIds: [t.shell] });
+			await owner.send({ type: "subscribe", terminalIds: [t.shell] });
+			expect(colleague.ws.data.subscribedTerminals.has(t.shell)).toBe(true);
+			await db.delete(aclGrants).where(eq(aclGrants.id, grant));
+			eventBus.emit({ type: "narrator:access_changed", narratorId: t.root, reason: "unshared" });
+			await settleTerminalAccessSweep();
+			expect(colleague.ws.data.subscribedTerminals.has(t.shell)).toBe(false);
+			expect(colleague.sent.at(-1)).toEqual(
+				expect.objectContaining({ type: "error", code: "TERMINAL_NOT_FOUND" }),
+			);
+			const before = colleague.sent.length;
+			await owner.send({ type: "input", terminalId: t.shell, data: "echo SECRET_$((7*6))\n" });
+			await until(async () => (await screen(t.shell)).includes("SECRET_42"), "the owner's output");
+			await until(
+				async () => owner.sent.some((frame) => JSON.stringify(frame).includes("SECRET_42")),
+				"the owner's frames",
+			);
+			expect(JSON.stringify(colleague.sent.slice(before))).not.toContain("SECRET_42");
+
+			// Without an event, the next resize re-checks and drops the subscription too.
+			const grant2 = await grantWrite(t.root, t.reader);
+			await colleague.send({ type: "subscribe", terminalIds: [t.shell] });
+			await db.delete(aclGrants).where(eq(aclGrants.id, grant2));
+			await colleague.send({ type: "resize", terminalId: t.shell, cols: 20, rows: 5 });
+			expect(colleague.ws.data.subscribedTerminals.has(t.shell)).toBe(false);
+		} finally {
+			handleTerminalWS.close(colleague.ws as never);
+			handleTerminalWS.close(owner.ws as never);
+		}
 	});
 
 	test("a stranger gets the same 404 as for an unknown id, everywhere", async () => {

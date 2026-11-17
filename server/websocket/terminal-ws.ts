@@ -1,5 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import { AppError, NotFoundError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
+import { hotOnce } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { terminalWsMessageSchema } from "../lib/validators";
 import {
@@ -7,6 +9,7 @@ import {
 	rememberStandaloneTerminalCreator,
 	terminalAccessAllowed,
 } from "../services/terminal-access";
+import { commitPersonTerminalInput } from "../services/terminal-input-judge";
 import { terminalService } from "../services/terminal-service";
 import type { WSData } from "./ws-handler";
 
@@ -187,6 +190,69 @@ function enqueueInput(
 	return next;
 }
 
+/**
+ * Re-check every terminal subscription (or those of `sockets`) and drop the ones whose user
+ * may no longer open the terminal, so a revoked share stops the output stream at once rather
+ * than at that user's next keystroke. Called on every access change. One check per
+ * user, role and terminal per sweep; the set is small (one socket per open terminal panel).
+ */
+export async function dropUnauthorizedTerminalSubscriptions(
+	sockets: Iterable<TerminalWS> = connections,
+): Promise<number> {
+	const verdicts = new Map<string, Promise<boolean>>();
+	let dropped = 0;
+	for (const ws of [...sockets]) {
+		for (const terminalId of [...ws.data.subscribedTerminals]) {
+			const principal = principalOf(ws);
+			const key = `${principal.userId}:${principal.isAdmin}:${terminalId}`;
+			let verdict = verdicts.get(key);
+			if (!verdict) {
+				verdict = terminalAccessAllowed(terminalId, principal, "write").catch(() => false);
+				verdicts.set(key, verdict);
+			}
+			if (await verdict) continue;
+			if (!ws.data.subscribedTerminals.delete(terminalId)) continue;
+			if (lastActiveClient.get(terminalId) === ws) lastActiveClient.delete(terminalId);
+			sendTerminalNotFound(ws, terminalId);
+			dropped++;
+		}
+	}
+	return dropped;
+}
+
+let accessSweep: Promise<unknown> | null = null;
+let accessSweepAgain = false;
+
+/** Coalesce bursts of access changes into sweeps that never overlap. */
+function scheduleTerminalAccessSweep(): void {
+	if (accessSweep) {
+		accessSweepAgain = true;
+		return;
+	}
+	accessSweep = dropUnauthorizedTerminalSubscriptions()
+		.catch((error) =>
+			logger.warn("Terminal subscription re-check failed", { error: String(error) }),
+		)
+		.finally(() => {
+			accessSweep = null;
+			if (accessSweepAgain) {
+				accessSweepAgain = false;
+				scheduleTerminalAccessSweep();
+			}
+		});
+}
+
+/** Tests only: wait for the sweep in flight, if any. */
+export async function settleTerminalAccessSweep(): Promise<void> {
+	while (accessSweep) await accessSweep;
+}
+
+if (hotOnce("narrafork.terminalWs.accessListeners")) {
+	eventBus.on("narrator:access_changed", scheduleTerminalAccessSweep);
+	eventBus.on("project:access_changed", scheduleTerminalAccessSweep);
+	eventBus.on("auth:changed", scheduleTerminalAccessSweep);
+}
+
 // === WebSocket handlers ===
 
 export const handleTerminalWS = {
@@ -260,12 +326,14 @@ export const handleTerminalWS = {
 						}
 					}
 					terminalService.write(terminalId, data);
+					commitPersonTerminalInput(terminalId, data);
 				});
 				break;
 			}
 			case "resize": {
 				const { terminalId, cols, rows } = msg;
 				if (!ws.data.subscribedTerminals.has(terminalId)) break;
+				if (!(await mayOpenTerminal(ws, terminalId))) break;
 				// Only honor resize from the last client that sent input
 				const active = lastActiveClient.get(terminalId);
 				if (!active || active === ws) {

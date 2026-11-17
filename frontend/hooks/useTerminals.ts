@@ -44,6 +44,22 @@ export function useNarratorTerminals(narratorId: string) {
 	});
 }
 
+/**
+ * Whether the current user may open a narrator's terminals: write access to the session.
+ * Read-only viewers get no terminal panel and no create buttons (the server refuses them
+ * anyway). `undefined` while loading.
+ */
+export function useCanOpenTerminals(narratorId: string): boolean | undefined {
+	const { data } = useQuery({
+		queryKey: ["terminals", "access", { narratorId }],
+		queryFn: () => api.getTerminalAccess(narratorId),
+		enabled: !REMOTE_BUILD && !!narratorId,
+		gcTime: TERMINALS_QUERY_GC_TIME_MS,
+		staleTime: 30_000,
+	});
+	return data?.canOpen;
+}
+
 /** How often an open details panel re-reads the subagents' terminals (they live on other pages). */
 const TREE_TERMINALS_REFRESH_MS = 15_000;
 

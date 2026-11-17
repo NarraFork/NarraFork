@@ -56,7 +56,11 @@ import {
 	recordRecentTabVisit,
 	shouldAddSubagentRecentTab,
 } from "../../hooks/useRecentTabs";
-import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
+import {
+	useCanOpenTerminals,
+	useCreateNarratorTerminal,
+	useNarratorTerminals,
+} from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../lib/history-state";
@@ -278,7 +282,9 @@ function NarratorDetailPage() {
 	const runningCount = (existingTerminals ?? []).filter((t: any) => t.status === "running").length;
 	const { mutate: createTerminal } = useCreateNarratorTerminal(narratorId);
 	const terminalCapability = useTerminalCapability();
-	const terminalSupported = terminalCapability.supported;
+	// A read-only viewer gets no auto-created terminal (the server would refuse it).
+	const canOpenTerminals = useCanOpenTerminals(narratorId);
+	const terminalSupported = terminalCapability.supported && canOpenTerminals !== false;
 
 	// Terminal drawer for mobile
 	const [drawerOpened, { open: openDrawer, close: closeDrawer }] = useDisclosure(false);

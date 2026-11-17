@@ -30,6 +30,11 @@ export const terminalsApi = {
 		const params = new URLSearchParams({ narratorId });
 		return request<TreeTerminalListing>(`/terminals/tree?${params}`);
 	},
+	/** Whether the current user may open this narrator's terminals (write access). */
+	getTerminalAccess: (narratorId: string) => {
+		const params = new URLSearchParams({ narratorId });
+		return request<{ canOpen: boolean }>(`/terminals/access?${params}`);
+	},
 	createTerminal: (data: {
 		narratorId?: string;
 		name?: string;

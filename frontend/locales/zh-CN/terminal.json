@@ -1,4 +1,5 @@
 {
+	"readOnlyNotice": "只有对这个会话有写权限的人才能打开终端。",
 	"noTerminals": "无终端",
 	"newTerminal": "新建终端",
 	"terminal": "终端",

@@ -1,20 +1,16 @@
 /**
- * Subagent Terminal and Browser permissions (Project Teams S2), also under bypassPermissions,
- * where nothing else would stop them:
- *
- * - a reviewer's Browser may look at web pages, never act on them or open anything but a web
- *   URL (`file:`, `data:`, `chrome:` ...): both the decision and the final start gate refuse;
- * - typing a command into a Terminal meets every fence the same command meets in Bash
- *   (protected paths, directory blacklist), at the decision and at the final start gate.
+ * A reviewer's Browser (Project Teams S2) may look at web pages, never act on them or open
+ * anything but a web URL (`file:`, `data:`, `chrome:` ...): both the decision and the final
+ * start gate refuse, also under bypassPermissions, where nothing else would stop it.
+ * Terminal writes are covered by `terminal-write-permission.test.ts`.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narrators, narratorToolCalls, terminals } from "../../db/schema";
-import { localBackend } from "../../lib/agent/execution/registry";
+import { narrators, narratorToolCalls } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { narraforkDir } from "../../lib/settings";
 import {
@@ -32,7 +28,6 @@ const { handlePermission, recheckFinalToolExecutionPermission, REVIEW_BROWSER_RE
 await import("../narrator-service");
 const { narratorPersistence: persistence } = await import("../narrator-persistence");
 const { executionPolicyEngine } = await import("../execution-policy/engine");
-const { permissionRuleService } = await import("../permission-rule-service");
 
 const reviewPolicy = resolveRuntimePolicy([
 	withDelegationDepth(compileDelegationPolicy({ template: "review" }), 1),
@@ -54,15 +49,6 @@ beforeEach(async () => {
 		permissionMode: "bypassPermissions",
 		createdAt: now(),
 		updatedAt: now(),
-	});
-	// The terminal a Terminal write types into: its device and directory decide the target.
-	await db.insert(terminals).values({
-		id: "t",
-		narratorId: "n",
-		name: "dev",
-		cwd,
-		status: "running",
-		createdAt: now(),
 	});
 });
 afterEach(async () => {
@@ -220,69 +206,4 @@ test("a reviewer cannot open host files, inline script or browser pages, at eith
 			runtimePolicy: reviewPolicy,
 		}),
 	).rejects.toThrow("read-only capability ceiling");
-});
-
-describe("Terminal writes meet the Bash fences", () => {
-	const settingsFile = () => `${narraforkDir}/settings.json`;
-	const write = (input: string) => ({ action: "write", terminal_id: "t", input });
-
-	test("a protected path refused to Read and Bash is refused to a Terminal write", async () => {
-		const read = await decide({ file_path: settingsFile() }, "read", false, "Read");
-		expect(read.result.behavior).toBe("deny");
-		const bash = await decide({ command: `cat ${settingsFile()}` }, "bash", false, "Bash");
-		expect(bash.result.behavior).toBe("deny");
-		for (const [id, input] of [
-			["typed", `cat ${settingsFile()}\n`],
-			["escaped", `\x1b[200~cat ${settingsFile()}\x1b[201~\r`],
-			["multi", `echo hi\ncat ${settingsFile()}\n`],
-		]) {
-			const { result } = await decide(write(input), id, false, "Terminal");
-			expect(result.behavior).toBe("deny");
-		}
-	});
-
-	test("ordinary typing keeps Terminal's own decision", async () => {
-		for (const [id, input] of [
-			["ls", "ls -la\n"],
-			["ctrl-c", "\x03"],
-			["repl", "print(open('x').read())\n"],
-			["key", "q"],
-		]) {
-			const { result } = await decide(write(input), id, false, "Terminal");
-			expect(result.behavior).toBe("allow");
-		}
-	});
-
-	test("a directory blacklisted after approval stops the approved write at the final gate", async () => {
-		const blocked = join(cwd, "secret");
-		const input = write(`cat ${blocked}/key\n`);
-		const { result, binding } = await decide(input, "final-term", false, "Terminal");
-		expect(result.behavior).toBe("allow");
-		await persistence.claimToolCallExecution("n", "final-term", binding, Date.now());
-		const check = {
-			narratorId: "n",
-			toolName: "Terminal",
-			toolUseId: "final-term",
-			binding,
-			input,
-			cwd,
-			signal,
-			runtimePolicy: workerPolicy,
-		};
-		(await recheckFinalToolExecutionPermission(check)).assertStillCurrent();
-		await permissionRuleService.createNarratorRule("n", {
-			ruleType: "directoryBlacklist",
-			value: {
-				path: blocked,
-				denyLevel: "denyAll",
-				targetKind: "host",
-				pathFlavor: localBackend.paths.flavor === "windows" ? "windows" : "posix",
-			},
-		});
-		executionPolicyEngine.invalidate("n");
-		// A new write to the blacklisted directory is refused at the decision too.
-		const again = await decide(write(`cat ${blocked}/key\n`), "again-term", false, "Terminal");
-		expect(again.result.behavior).toBe("deny");
-		await expect(recheckFinalToolExecutionPermission(check)).rejects.toThrow();
-	});
 });
