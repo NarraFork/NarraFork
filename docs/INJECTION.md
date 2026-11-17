@@ -262,7 +262,7 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 - 读者看到的 body 是 `prose`（同模型文字）；来源标签「Dynamic Spec moved to the outline / Dynamic Spec 已搬进大纲」。
 - 配套（不是注入）：这种会话里点名 `spec://` 的工具调用（`getOutlineSpecRejection`，`AgentConfig.specImported`）回答「已搬进大纲、各在哪」，而不是一般大纲会话那句；界面和插件的 spec 写入拒绝用 `SPEC_MOVED_TO_OUTLINE`（code 仍是 `SPEC_OUTLINE_SESSION`）。
 
-**团队状态（`team_status`，`server/services/teams/team-status.ts`，Project Teams P2）**：团队协调者（带 `team` trait 的主叙述者）的团队简报、本周超出建议上限的次数、团队树里等人审批的调用、工作项和最近替人做的决定，一行 `role: sys`、body 为 `prose`，最多 6 KB，文本确定（同样的状态同样的字节，不带相对时间）。写的时机：每一 pass 读历史之前（`orchestrator.ts`）在运行开始时写（`schedule: none`；同一压缩周期里同样的文本还在历史里就不写）、最近一次压缩标记变了（压缩或清空上下文之后）立即写；长回合在工具边界最多每 10 分钟看一次、文本变了才写（`onNextTurn`）。从不进系统提示。协调者自己的工具结果超出建议值时末尾追加的提醒不是注入行，是工具结果的一部分（`teams/coordinator-limits.ts`，经 `AgentConfig.annotateToolResult`）。
+**团队状态（`team_status`，`server/services/teams/team-status.ts`，Project Teams P2）**：团队协调者（带 `team` trait 的主叙述者）的团队简报、本周超出建议上限的次数、团队树里等人审批的调用、工作项和最近替人做的决定，一行 `role: sys`、body 为 `prose`，最多 6 KB，文本确定（同样的状态同样的字节，不带相对时间）。写的时机：每一 pass 读历史之前（`orchestrator.ts`）在运行开始时写（`schedule: none`；同一压缩周期里同样的文本还在历史里就不写）、最近一次压缩标记变了（压缩或清空上下文之后）立即写；长回合在工具边界最多每 10 分钟看一次、文本变了才写（`onNextTurn`）。简报全文每个压缩周期只写一次（或简报改了、带它的那一行被回退删掉时再写），之后的状态行只写一句「简报没变」，让小变化只占一小行。从不进系统提示。协调者自己的工具结果超出建议值时末尾追加的提醒不是注入行，是工具结果的一部分（`teams/coordinator-limits.ts`，经 `AgentConfig.annotateToolResult`）；大输出的全文存在 `~/.narrafork/coordinator-outputs/<叙述者 id>/`（按内容哈希命名、按 Read 一次能读全的大小分段、每个会话最多 200 MB 先删最旧、随会话删除，`teams/coordinator-outputs.ts`），只有这个叙述者自己读它免审批，Read 读它不截长行。
 
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 
@@ -368,7 +368,7 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 
 `silent_progress`、`todo_reminder`（`living_work_spec` 映射到它）、`relaxed_plan`、`knowledge_base_hint`、`bg_agent`、`bg_bash`、`team_message`、`buffered_user`、`subagent_message`、`spec_update`、`behavior_fence`、`pipeline_exit_confirmation`。
 
-之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）、`outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）、`outline_task_finished`（P2 PR 9b，会话建的任务在别处结束了，标签「Tasks this session created were finished elsewhere / 本会话建的任务在别处结束了」）`outline_team_activity`（P2 PR 10b，团队动态，标签「Team activity / 团队动态」）`outline_team`（P2 PR 10a，团队事件，标签「Task events for this session / 与本会话有关的任务事件」）、`outline_task_brief`（P2 PR 10c-1，为任务开的会话的开工说明，标签「Opening brief / 开工说明」）和 `spec_import`（P2 PR 12b2，导入把会话搬进大纲后给模型的一行，标签「Dynamic Spec moved to the outline / Dynamic Spec 已搬进大纲」）。
+之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）、`outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）、`outline_task_finished`（P2 PR 9b，会话建的任务在别处结束了，标签「Tasks this session created were finished elsewhere / 本会话建的任务在别处结束了」）`outline_team_activity`（P2 PR 10b，团队动态，标签「Team activity / 团队动态」）`outline_team`（P2 PR 10a，团队事件，标签「Task events for this session / 与本会话有关的任务事件」）、`outline_task_brief`（P2 PR 10c-1，为任务开的会话的开工说明，标签「Opening brief / 开工说明」）和 `spec_import`（P2 PR 12b2，导入把会话搬进大纲后给模型的一行，标签「Dynamic Spec moved to the outline / Dynamic Spec 已搬进大纲」）。团队协调者的团队状态 `team_status`（Project Teams P2，标签「Team status / 团队状态」）。
 
 ---
 

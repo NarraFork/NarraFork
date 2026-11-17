@@ -7,6 +7,7 @@ import {
 } from "@shared/media-attachments";
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { isOwnCoordinatorOutputPath } from "../../coordinator-outputs-path";
 import { isSecretPlatformPath, SECRET_PATH_TOOL_REFUSAL } from "../../fs-secret-paths";
 import { deleteUploadedMedia, saveUploadedMedia, validateMediaBytes } from "../../media-uploads";
 import { toolSpecPathError } from "../../spec-uri";
@@ -379,6 +380,10 @@ export const readTool: ToolDefinition = {
 		}
 
 		// ── Text file handling ──
+		// A team coordinator's own saved results (Project Teams P2) are read whole: they were
+		// saved in parts that fit the whole-file cap, and no line of them is cut.
+		const ownSavedOutput =
+			backend.kind === "local" && isOwnCoordinatorOutputPath(ctx.narratorId, ioPath);
 		try {
 			const stat = await backend.statFile(ioPath);
 			const fileSize = stat?.size ?? Bun.file(ioPath).size;
@@ -400,6 +405,7 @@ export const readTool: ToolDefinition = {
 					effectiveLimit,
 					READ_ALL_MAX_CHARS,
 					ctx.signal,
+					ownSavedOutput ? Number.POSITIVE_INFINITY : MAX_LINE_CHARS,
 				);
 				const numbered = formatNumberedLines(streamResult.lines, startLine, {
 					truncateLines: false,
@@ -444,7 +450,7 @@ export const readTool: ToolDefinition = {
 			const start = Math.max(0, (offset ?? 1) - 1);
 			const end = limit ? start + limit : lines.length;
 			const slice = lines.slice(start, end);
-			const numbered = formatNumberedLines(slice, start + 1);
+			const numbered = formatNumberedLines(slice, start + 1, { truncateLines: !ownSavedOutput });
 
 			return {
 				output: numbered || "(empty file)",
@@ -497,6 +503,7 @@ async function readTextLinesStream(
 	limit: number | undefined,
 	maxChars: number,
 	signal: AbortSignal,
+	maxLineChars: number = MAX_LINE_CHARS,
 ): Promise<StreamReadResult> {
 	const stream = createReadStream(filePath, { encoding: "utf-8" });
 	const lines: string[] = [];
@@ -531,12 +538,12 @@ async function readTextLinesStream(
 
 		currentLineChars += segment.length;
 		if (!shouldCaptureCurrentLine()) return;
-		if (currentLine.length >= MAX_LINE_CHARS) {
+		if (currentLine.length >= maxLineChars) {
 			if (segment.length > 0) currentLineTruncated = true;
 			return;
 		}
 
-		const remaining = MAX_LINE_CHARS - currentLine.length;
+		const remaining = maxLineChars - currentLine.length;
 		const captured = segment.slice(0, remaining);
 		currentLine += captured;
 		if (captured.length < segment.length) currentLineTruncated = true;

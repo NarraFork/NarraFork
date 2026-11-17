@@ -8,29 +8,34 @@
  * (`coordinator.overrun.<kind>`, detail: tool, size, limit) is written after the call returns.
  *
  * WHAT IS MEASURED
- *   - editLines: an Edit's larger side, `max(lines(old_string), lines(new_string))`; a Write (or
- *     an Edit in overwrite mode) of an existing file counts the lines it wrote.
+ *   - editLines: an Edit's larger side, `max(lines(old_string), lines(new_string))`, and with
+ *     `replace_all` at least its line stats (which count every occurrence); a Write (or an Edit
+ *     in overwrite mode) of an existing file counts the lines it wrote.
  *   - newFileLines: a Write / overwrite-mode Edit that created the file (its line stats say no
  *     line was removed and every written line was added) counts the lines it wrote.
- *   - filesPerTurn: distinct files changed by successful Edit/Write calls in the current run;
- *     every call that adds a file past the limit is an overrun. Dynamic Spec files do not count.
+ *   - filesPerTurn: distinct files changed in the current run by successful Edit, Write and
+ *     applied StructSed (`dry_run: false`) calls; every call that adds a file past the limit is
+ *     an overrun. Dynamic Spec files do not count, and neither do files a Bash command changes
+ *     (a command line does not say which files it wrote).
  *   - readLines (Read), searchLines (Grep, Glob): lines of the result text.
  *   - bashOutputBytes (Bash): UTF-8 bytes of the result text.
  *
- * LARGE OUTPUTS (plan §二.14 "上下文保护"): an output over its suggested size is saved whole
- * as a file in the existing tool-output directory (`truncate.ts` `OUTPUT_DIR`, the same place
- * and retention as truncated tool outputs; reading it needs no approval), and the result shows
- * its beginning and end, the omitted size, and the file's path. That is a reminder, not a
- * truncation: one Read of that path returns the complete text, and such a Read is never
- * shortened or reminded again. If the file cannot be written, the full text is returned with
- * the reminder.
+ * LARGE OUTPUTS (plan §二.14 "上下文保护"): an output over its suggested size is saved whole in
+ * the coordinator's own saved-output directory (`coordinator-outputs.ts`: under the data
+ * directory, per narrator, named by content hash, split into parts that one `limit: -1` Read
+ * each returns whole), and the result shows its beginning and end, the omitted size, and the
+ * path(s). That is a reminder, not a truncation: Read of the narrator's own saved outputs needs no
+ * approval, is never cut to lines of 2,000 characters, and is never shortened or reminded again.
+ * When the executor's general truncation already saved the full output (over 50 KB), the result
+ * points at that file instead of saving the preview again. Nothing is cut — the full text comes
+ * back with the reminder — when the call did not run on this server (a remote device: the
+ * model's Read of a local path would go there) or the text could not be saved.
  *
  * Only the coordinator itself (a primary narrator with the `team` trait): the orchestrator
  * builds the annotator for it alone, so subagents and every other session are untouched.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { hotSafe } from "@server/lib/hot-safe";
 import { countTextLines } from "@shared/pretext-layout/diff-core";
 import {
@@ -45,6 +50,7 @@ import { db } from "../../db";
 import { projectTeams, teamWorkEvents } from "../../db/schema";
 import { OUTPUT_DIR } from "../../lib/agent/truncate";
 import type { ToolResultAnnotationInput } from "../../lib/agent/types";
+import { isOwnCoordinatorOutputPath } from "../../lib/coordinator-outputs-path";
 import type { Locale } from "../../lib/i18n";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
@@ -52,7 +58,9 @@ import { isInsidePath } from "../../lib/platform-path";
 import {
 	getCoordinatorOmittedMarker,
 	getCoordinatorReminder,
+	type SavedOutputNote,
 } from "../../lib/prompts/team-coordinator-notes";
+import { COORDINATOR_OUTPUT_LIMITS, saveCoordinatorOutput } from "./coordinator-outputs";
 
 /** Bounds of the per-run bookkeeping. */
 export const COORDINATOR_LIMIT_BOUNDS = {
@@ -136,13 +144,24 @@ function wholeFileWrite(
 	return { lines, created: removed === 0 && added === lines && lines > 0 };
 }
 
-function isSavedOutputPath(cwd: string, filePath: string | undefined): boolean {
-	return !!filePath && isInsidePath(OUTPUT_DIR, resolve(cwd, filePath));
+/** A Read of a saved output: the coordinator's own saved results or the general truncation's. */
+function isSavedOutputRead(narratorId: string, call: ToolResultAnnotationInput): boolean {
+	const filePath = str(call.input.file_path);
+	if (!filePath) return false;
+	const path = resolve(call.cwd, filePath);
+	return isOwnCoordinatorOutputPath(narratorId, path) || isInsidePath(OUTPUT_DIR, path);
 }
 
-/** The file a successful Edit/Write changed, or null when it does not count for files per turn. */
+/** Tools whose successful call changed the file named by `file_path`. */
+function changesItsFile(call: ToolResultAnnotationInput): boolean {
+	if (call.isError) return false;
+	if (call.toolName === "Edit" || call.toolName === "Write") return true;
+	return call.toolName === "StructSed" && call.input.dry_run === false;
+}
+
+/** The file a successful change made, or null when it does not count for files per turn. */
 function changedFile(call: ToolResultAnnotationInput): string | null {
-	if (call.isError || (call.toolName !== "Edit" && call.toolName !== "Write")) return null;
+	if (!changesItsFile(call)) return null;
 	const filePath = str(call.input.file_path);
 	if (!filePath || filePath.startsWith("spec://")) return null;
 	return resolve(call.cwd, filePath);
@@ -170,7 +189,13 @@ export function measureCoordinatorOverruns(
 				const write = wholeFileWrite(newString, call.metadata);
 				over(write.created ? "newFileLines" : "editLines", write.lines);
 			} else {
-				over("editLines", Math.max(countTextLines(oldString), countTextLines(newString)));
+				const sides = Math.max(countTextLines(oldString), countTextLines(newString));
+				// `replace_all` changes every occurrence; its line stats count them all.
+				const stats =
+					call.input.replace_all === true
+						? Math.max(num(call.metadata?.linesAdded) ?? 0, num(call.metadata?.linesRemoved) ?? 0)
+						: 0;
+				over("editLines", Math.max(sides, stats));
 			}
 			break;
 		}
@@ -181,8 +206,7 @@ export function measureCoordinatorOverruns(
 			break;
 		}
 		case "Read":
-			if (!isSavedOutputPath(call.cwd, str(call.input.file_path)))
-				over("readLines", countOutputLines(call.output));
+			if (!isSavedOutputRead(narratorId, call)) over("readLines", countOutputLines(call.output));
 			break;
 		case "Grep":
 		case "Glob":
@@ -274,22 +298,6 @@ export function headAndTail(
 	return { head, tail };
 }
 
-/** Save a coordinator's full output next to the truncated tool outputs; null on failure. */
-async function saveFullOutput(text: string, toolUseId: string): Promise<string | null> {
-	try {
-		await mkdir(OUTPUT_DIR, { recursive: true });
-		// `tool_` keeps it under the tool-output cleanup (7 days).
-		// Named by the call alone, so a retried call points at the same file (and the same text).
-		const safeId = toolUseId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80) || generateId();
-		const path = join(OUTPUT_DIR, `tool_coordinator_${safeId}`);
-		await writeFile(path, text, "utf8");
-		return path;
-	} catch (error) {
-		logger.warn("Could not save a coordinator's full tool output", { error: String(error) });
-		return null;
-	}
-}
-
 type OverrunRecorder = (teamId: string, tool: string, overrun: CoordinatorOverrun) => void;
 
 /** Write one overrun row. Synchronous single insert; callers schedule it off the tool path. */
@@ -361,12 +369,21 @@ export function createCoordinatorToolAnnotator(
 		const overruns = measureCoordinatorOverruns(narratorId, call, limits);
 		if (overruns.length === 0) return null;
 		let body = call.output;
-		let savedPath: string | undefined;
+		let saved: SavedOutputNote | undefined;
 		const output = overruns.find((overrun) => OUTPUT_KINDS.has(overrun.kind));
-		if (output) {
-			const path = await saveFullOutput(call.output, call.toolUseId);
-			if (path) {
-				savedPath = path;
+		// Only a call that ran here: the model's Read of a local path would go to a remote device.
+		if (output && call.local) {
+			if (call.fullOutputPath) saved = { kind: "existing", path: call.fullOutputPath };
+			else {
+				const paths = await saveCoordinatorOutput(narratorId, call.output);
+				if (paths)
+					saved = {
+						kind: "saved",
+						paths,
+						keptMegabytes: COORDINATOR_OUTPUT_LIMITS.bytesPerNarrator / (1024 * 1024),
+					};
+			}
+			if (saved) {
 				const sideBytes = Math.max(
 					COORDINATOR_LIMIT_BOUNDS.minPreviewBytes,
 					Math.floor(limits.bashOutputBytes / 4),
@@ -392,7 +409,7 @@ export function createCoordinatorToolAnnotator(
 				{
 					...overrun,
 					tool: call.toolName,
-					savedPath: overrun === output ? savedPath : undefined,
+					saved: overrun === output ? saved : undefined,
 				},
 				locale,
 			),

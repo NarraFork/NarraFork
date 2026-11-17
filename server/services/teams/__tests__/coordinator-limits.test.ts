@@ -22,6 +22,9 @@ const { generateId } = await import("../../../lib/id");
 const { executeTool } = await import("../../../lib/agent/tool-executor");
 const { toolRegistry } = await import("../../../lib/agent/tool-registry");
 const { OUTPUT_DIR } = await import("../../../lib/agent/truncate");
+const { coordinatorOutputsDir } = await import("../../../lib/coordinator-outputs-path");
+const { resolvePermissionDecision } = await import("../../narrator-permission");
+await import("../../../lib/agent/tools/index");
 const { narratorService } = await import("../../narrator-service");
 const { createTeam, updateTeam } = await import("../team-service");
 const limitsModule = await import("../coordinator-limits");
@@ -271,7 +274,7 @@ describe("each overrun kind: one reminder, the call unchanged", () => {
 			expect(output).toContain(`line ${limit + 200}\n\n${REMINDER}`);
 			expect(output).toContain(`returned ${limit + 200} lines`);
 			const path = savedPathOf(output);
-			expect(path?.startsWith(OUTPUT_DIR)).toBe(true);
+			expect(path?.startsWith(`${coordinatorOutputsDir(teamId)}/`)).toBe(true);
 			expect(readFileSync(path as string, "utf8")).toBe(full);
 			expect(output).toContain("not shown here");
 			expect(countOutputLines(output)).toBeLessThan(countOutputLines(full));
@@ -451,6 +454,7 @@ describe("who gets reminders, in which words", () => {
 			output: "Edited z.ts",
 			isError: false,
 			cwd: repo,
+			local: true,
 		};
 		const first = await annotate(call);
 		// A new run, so the files-per-turn count starts over as it did for the first call.
@@ -556,3 +560,235 @@ describe("headAndTail", () => {
 		expect(cjk.tail).toMatch(/^汉+$/);
 	});
 });
+
+describe("saved outputs: one directory per coordinator, named by content (review B1)", () => {
+	const otherTeam = { id: "" };
+	beforeAll(async () => {
+		const project = await db.query.projects.findFirst();
+		const team = await createTeam(
+			{ projectId: project?.id as string, name: "Other team" },
+			{ userId: OWNER, isAdmin: false },
+		);
+		otherTeam.id = team.id;
+	});
+
+	const annotatorOf = (narratorId: string) => {
+		setCoordinatorOverrunRecorder(() => {});
+		return createCoordinatorToolAnnotator({
+			narratorId,
+			locale: "en",
+			limits: { ...DEFAULT_COORDINATOR_LIMITS },
+		});
+	};
+	const bash = (toolUseId: string, output: string) => ({
+		toolName: "Bash",
+		toolUseId,
+		input: { command: "x" },
+		output,
+		isError: false,
+		cwd: repo,
+		local: true,
+	});
+	const pathOf = (text: string | null) => /saved at (\S+);/.exec(text ?? "")?.[1] as string;
+
+	test("two coordinators with the same upstream tool_use id never share a file", async () => {
+		const secretA = "A-private ".repeat(1500);
+		const outB = "B-output ".repeat(1500);
+		const pathA = pathOf(await annotatorOf(teamId)(bash("call_go_0", secretA)));
+		const pathB = pathOf(await annotatorOf(otherTeam.id)(bash("call_go_0", outB)));
+		expect(pathA).not.toBe(pathB);
+		expect(readFileSync(pathA, "utf8")).toBe(secretA);
+		expect(readFileSync(pathB, "utf8")).toBe(outB);
+		expect(pathA.startsWith(`${coordinatorOutputsDir(teamId)}/`)).toBe(true);
+		expect(pathB.startsWith(`${coordinatorOutputsDir(otherTeam.id)}/`)).toBe(true);
+		// Ids that sanitize alike ("Bash:0" / "Bash0") do not matter either: names are content.
+		const c = pathOf(await annotatorOf(teamId)(bash("Bash:0", secretA)));
+		const d = pathOf(await annotatorOf(otherTeam.id)(bash("Bash0", outB)));
+		expect(c).not.toBe(d);
+		expect(readFileSync(c, "utf8")).toBe(secretA);
+	});
+
+	test("the same coordinator: same text → same file, different text → different file", async () => {
+		const annotate = annotatorOf(teamId);
+		const first = pathOf(await annotate(bash("call_go_0", "one ".repeat(3000))));
+		expect(pathOf(await annotate(bash("call_go_0", "one ".repeat(3000))))).toBe(first);
+		const other = pathOf(await annotate(bash("call_go_0", "two ".repeat(3000))));
+		expect(other).not.toBe(first);
+		expect(readFileSync(first, "utf8")).toBe("one ".repeat(3000));
+	});
+
+	test("only the narrator itself reads its saved outputs without approval", async () => {
+		const path = pathOf(await annotatorOf(teamId)(bash("perm", "p ".repeat(6000))));
+		const decide = (narratorId: string, permMode: string) =>
+			resolvePermissionDecision({
+				toolName: "Read",
+				narratorId,
+				input: { file_path: path },
+				permMode,
+				cwd: repo,
+			});
+		expect(decide(teamId, "default")).toBe("allow");
+		expect(decide(teamId, "readOnly")).toBe("allow");
+		expect(decide(otherTeam.id, "default")).toBe("ask");
+		expect(decide(otherTeam.id, "readOnly")).toBe("deny");
+		expect(decide(plainId, "default")).toBe("ask");
+	});
+});
+
+describe("where the call ran (review S2)", () => {
+	test("a call on a remote device: full text and the reminder, nothing saved", async () => {
+		captureEvents();
+		const full = "r".repeat(20_000);
+		const config = coordinatorConfig();
+		const { output } = await runFake(
+			"Bash",
+			{ command: "cat big" },
+			{ output: full },
+			{ ...config, defaultDeviceId: "device-remote" },
+		);
+		expect(output.startsWith(`${full}\n\n${REMINDER}`)).toBe(true);
+		expect(output).not.toContain("saved at");
+		expect(reminders(output)).toBe(1);
+	});
+});
+
+describe("reading a saved output back with the real Read (review S3)", () => {
+	/** Strip Read's line numbers: `     1│text`. */
+	const readText = (output: string) =>
+		output
+			.split("\n")
+			.map((line) => line.slice(line.indexOf("│") + 1))
+			.join("\n");
+
+	for (const [label, full] of [
+		[
+			"about 45 KB",
+			Array.from(
+				{ length: 1000 },
+				(_, i) => `${String(i).padStart(5, "0")} ${"x".repeat(40)}`,
+			).join("\n"),
+		],
+		[
+			"about 150 KB, with lines longer than Read's 2,000 characters",
+			[
+				...Array.from(
+					{ length: 2000 },
+					(_, i) => `${String(i).padStart(5, "0")} ${"y".repeat(40)}`,
+				),
+				"L".repeat(6000),
+				"M".repeat(120_000),
+				"tail line",
+			].join("\n"),
+		],
+	] as const) {
+		test(`${label}: the reminder's way returns every byte`, async () => {
+			setCoordinatorOverrunRecorder(() => {});
+			const config = coordinatorConfig();
+			// The generic 50 KB truncation would apply to a Bash result; a Grep result shows
+			// the same thing without it (the stand-in reports it as already truncated).
+			const { output } = await runFake(
+				"Grep",
+				{ pattern: "x" },
+				{ output: full, truncated: true },
+				config,
+			);
+			expect(reminders(output)).toBe(1);
+			expect(output).toContain("with limit: -1");
+			const paths = [
+				...(output.match(/saved at (\S+);/)?.slice(1, 2) ?? []),
+				...(/consecutive parts \(joined without separators\): (.+?); Read each/
+					.exec(output)?.[1]
+					?.split(", ") ?? []),
+			];
+			expect(paths.length).toBeGreaterThan(0);
+			expect(paths.map((path) => readFileSync(path, "utf8")).join("")).toBe(full);
+			for (const path of paths) {
+				const read = await executeTool(
+					{
+						toolUseId: `read-${generateId()}`,
+						name: "Read",
+						input: { file_path: path, limit: -1 },
+					},
+					config,
+				);
+				expect(read.isError).not.toBe(true);
+				expect(read.output).not.toContain(REMINDER);
+				expect(read.output).not.toContain("truncated");
+				expect(readText(read.output)).toBe(readFileSync(path, "utf8").replace(/\n$/, ""));
+			}
+			if (full.length > 100_000) expect(paths.length).toBeGreaterThan(1);
+		});
+	}
+});
+
+describe("the general truncation's file and other nits", () => {
+	test("Bash over 50 KB: points at the file the executor already saved, saves nothing again", async () => {
+		setCoordinatorOverrunRecorder(() => {});
+		const before = await listOwn(teamId);
+		const full = Array.from({ length: 3000 }, (_, i) => `row ${i} ${"z".repeat(30)}`).join("\n");
+		const { output } = await runFake(
+			"Bash",
+			{ command: "big" },
+			{ output: full },
+			coordinatorConfig(),
+		);
+		const path = /complete output was saved at (\S+);/.exec(output)?.[1] as string;
+		expect(path.startsWith(OUTPUT_DIR)).toBe(true);
+		expect(readFileSync(path, "utf8")).toBe(full);
+		rmSync(path, { force: true });
+		expect(await listOwn(teamId)).toEqual(before);
+	});
+
+	test("Edit with replace_all counts every occurrence", async () => {
+		captureEvents();
+		beginCoordinatorRun(teamId);
+		const { output } = await runFake(
+			"Edit",
+			{ file_path: "r.ts", old_string: "a", new_string: "b", replace_all: true },
+			{ output: "Edited r.ts", metadata: { linesAdded: 45, linesRemoved: 45 } },
+			coordinatorConfig(),
+		);
+		expect(output).toContain("This Edit changed 45 lines");
+	});
+
+	test("applied StructSed counts for files per turn; a dry run does not", async () => {
+		captureEvents();
+		beginCoordinatorRun(teamId);
+		const config = coordinatorConfig();
+		for (const file of ["s1.ts", "s2.ts", "s3.ts"])
+			await runFake(
+				"Edit",
+				{ file_path: file, old_string: "a", new_string: "b" },
+				{ output: "ok" },
+				config,
+			);
+		const dry = await runFake(
+			"StructSed",
+			{ file_path: "s4.ts", command: "replace" },
+			{ output: "DRY RUN" },
+			config,
+		);
+		expect(reminders(dry.output)).toBe(0);
+		const applied = await runFake(
+			"StructSed",
+			{ file_path: "s4.ts", command: "replace", dry_run: false },
+			{ output: "applied" },
+			config,
+		);
+		expect(applied.output).toContain("This turn has now changed 4 files");
+	});
+
+	test("the run's bookkeeping is dropped when the run ends", () => {
+		const source = readFileSync(
+			join(import.meta.dir, "../../agent-runtime/orchestrator.ts"),
+			"utf8",
+		);
+		const end = source.indexOf("// The run ended: the session's claims go on the idle lease");
+		expect(source.slice(end - 200, end)).toContain("forgetCoordinatorRun(narratorId);");
+	});
+});
+
+async function listOwn(narratorId: string): Promise<string[]> {
+	const { readdir } = await import("node:fs/promises");
+	return (await readdir(coordinatorOutputsDir(narratorId) as string).catch(() => [])).sort();
+}

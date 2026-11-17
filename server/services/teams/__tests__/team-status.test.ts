@@ -162,7 +162,9 @@ afterEach(() => {
 });
 
 const read = (locale: "en" | "zh-CN" = "en", contextPercent?: number) =>
-	readTeamStatus(teamId, locale, { now: NOW, contextPercent }).then((text) => text as string);
+	readTeamStatus(teamId, locale, { now: NOW, contextPercent }).then(
+		(status) => status?.text as string,
+	);
 
 describe("the status text", () => {
 	test("names the team, carries the brief and every section", async () => {
@@ -361,6 +363,43 @@ describe("when the status is written", () => {
 		expect(rows).toHaveLength(3);
 	});
 
+	test("the brief is written once per compaction cycle, not in every row (review S4)", async () => {
+		const brief = Array(600).fill("Rule.").join(" "); // 3,599 bytes
+		await updateTeam(teamId, principal, { brief });
+		try {
+			seam();
+			await pass(true, 4);
+			expect(rows[0]?.content).toContain(brief);
+			// Next run: only this week's overrun count changed.
+			addEvent("coordinator.overrun.editLines", "2026-11-17T09:00:00.000Z", { size: 80 });
+			expect(await pass(true, 4)).toBe(true);
+			const second = rows[1]?.content as string;
+			expect(second).not.toContain(brief);
+			expect(second).toContain(
+				"Team brief: unchanged since an earlier team status in this conversation showed it (3599 bytes).",
+			);
+			expect(Buffer.byteLength(second, "utf8")).toBeLessThan(1024);
+			// At a tool boundary as well.
+			addEvent("coordinator.overrun.readLines", "2026-11-17T09:00:00.000Z", { size: 900 });
+			const due = await boundary(NOW + TEAM_STATUS_CADENCE_MS);
+			expect(due?.turnText).not.toContain(brief);
+			// After a compaction the brief comes back whole.
+			expect(await pass(false, 9)).toBe(true);
+			expect(rows.at(-1)?.content).toContain(brief);
+			// A changed brief is written whole at once.
+			await updateTeam(teamId, principal, { brief: `${brief}New rule.` });
+			expect(await pass(true, 9)).toBe(true);
+			expect(rows.at(-1)?.content).toContain(`${brief}New rule.`);
+			// The row that carried it left the history (a rewind): whole again.
+			inHistory.clear();
+			addEvent("coordinator.overrun.readLines", "2026-11-17T10:00:00.000Z", { size: 901 });
+			expect(await pass(true, 9)).toBe(true);
+			expect(rows.at(-1)?.content).toContain(`${brief}New rule.`);
+		} finally {
+			await updateTeam(teamId, principal, { brief: "Always run the targeted tests." });
+		}
+	});
+
 	test("a session that never had a status (not a coordinator) is never looked at", async () => {
 		seam();
 		expect(
@@ -453,5 +492,29 @@ describe("through the real injection path", () => {
 		);
 		const session = readFileSync(join(import.meta.dir, "../../narrator-session.ts"), "utf8");
 		expect(session).toContain("await writeTeamStatusAtBoundary({");
+	});
+});
+
+describe("the reader's label", () => {
+	test("team_status rows are headed 'Team status' / '团队状态'", async () => {
+		const { readFileSync } = await import("node:fs");
+		const root = join(import.meta.dir, "../../../..");
+		const adapter = readFileSync(join(root, "shared/pretext-layout/segment-adapter.ts"), "utf8");
+		expect(adapter).toContain('team_status: "sidecarSourceTeamStatus",');
+		expect(adapter).toContain('sidecarSourceTeamStatus: "Team status",');
+		const labels = readFileSync(
+			join(root, "frontend/components/narrator/vlist/useVListLabels.ts"),
+			"utf8",
+		);
+		expect(labels).toContain('sidecarSourceTeamStatus: t("sidecar.sources.team_status"),');
+		for (const [locale, text] of [
+			["en", "Team status"],
+			["zh-CN", "团队状态"],
+		]) {
+			const json = JSON.parse(
+				readFileSync(join(root, `frontend/locales/${locale}/narrator.json`), "utf8"),
+			);
+			expect(json.sidecar.sources.team_status).toBe(text);
+		}
 	});
 });

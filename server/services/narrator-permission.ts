@@ -87,6 +87,7 @@ import {
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import { isOwnCoordinatorOutputPath } from "../lib/coordinator-outputs-path";
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { isSecretPlatformPath } from "../lib/fs-secret-paths";
@@ -344,6 +345,35 @@ function isInsideDecisionTruncateDir(
 	if (context && (context.backend.kind !== "local" || context.paths.flavor === "spec"))
 		return false;
 	return isInsideTruncateDir(cwd, path);
+}
+
+/**
+ * A team coordinator's own saved tool results (Project Teams P2): reading them needs no approval,
+ * for that narrator only. Another narrator's saved results get no such rule.
+ */
+function isInsideDecisionOwnSavedOutputs(
+	narratorId: string | undefined,
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	if (!narratorId) return false;
+	if (context && (context.backend.kind !== "local" || context.paths.flavor === "spec"))
+		return false;
+	return isOwnCoordinatorOutputPath(narratorId, resolvePath(cwd, path));
+}
+
+/** Paths a read-only call may reach without approval outside its worktree. */
+function isAutoReadablePath(
+	narratorId: string | undefined,
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	return (
+		isInsideDecisionTruncateDir(cwd, path, context) ||
+		isInsideDecisionOwnSavedOutputs(narratorId, cwd, path, context)
+	);
 }
 
 function getShellScopePaths(
@@ -774,6 +804,7 @@ export function resolvePermissionDecision(
 		executionTarget,
 		executionContext,
 		reviewReadOnlyBash = false,
+		narratorId,
 	} = opts;
 	const specError = toolSpecPathError(toolName, input);
 	if (specError) {
@@ -1133,7 +1164,7 @@ export function resolvePermissionDecision(
 			if (
 				!hasExternalPath ||
 				(toolPaths.length > 0 &&
-					toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context)))
+					toolPaths.every((path) => isAutoReadablePath(narratorId, cwd, path, context)))
 			) {
 				return "allow";
 			}
@@ -1200,7 +1231,7 @@ export function resolvePermissionDecision(
 	if (
 		hasExternalPath &&
 		isReadOnlyCall(toolName, input) &&
-		toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context))
+		toolPaths.every((path) => isAutoReadablePath(narratorId, cwd, path, context))
 	) {
 		return "allow";
 	}
@@ -1449,6 +1480,8 @@ function resolveMcpToolPermission(
 
 export interface PermissionDecisionOpts {
 	toolName: string;
+	/** The deciding narrator: its own saved tool results are readable without approval. */
+	narratorId?: string;
 	input: Record<string, unknown>;
 	permMode: string;
 	cwd: string;
@@ -5079,6 +5112,7 @@ export async function recheckFinalToolExecutionPermission(
 			? "allow"
 			: resolvePermissionDecision({
 					toolName: decisionTool,
+					narratorId: check.narratorId,
 					input: decisionInput,
 					permMode: mode,
 					cwd,
@@ -5616,6 +5650,7 @@ export async function handlePermission(
 			? "allow"
 			: resolvePermissionDecision({
 					toolName,
+					narratorId,
 					input: effectiveInput,
 					permMode: decisionPermMode,
 					cwd,

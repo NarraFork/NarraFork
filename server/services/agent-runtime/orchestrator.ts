@@ -230,7 +230,7 @@ import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
-import { coordinatorToolAnnotatorFor } from "../teams/coordinator-limits";
+import { coordinatorToolAnnotatorFor, forgetCoordinatorRun } from "../teams/coordinator-limits";
 import { writeTeamStatusAtPass } from "../teams/team-status";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
@@ -3657,6 +3657,8 @@ export async function runAgentLoopUnlocked(
 			active.events.emit("event", { type: "error", data: { message: errorMsg } });
 		}
 	} finally {
+		// A coordinator's per-run bookkeeping (files changed this turn) ends with the run.
+		forgetCoordinatorRun(narratorId);
 		// The run ended: the session's claims go on the idle lease while it waits for its next
 		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
 		// started that ended by itself are given back with a handoff (not waited for).

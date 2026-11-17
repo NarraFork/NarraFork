@@ -1807,17 +1807,21 @@ async function executeToolUntraced(
 			}
 
 			const annotationCwd = frozenExecution?.target.cwd ?? config.cwd;
+			// Ran on this server, and the session's own Reads go here too.
+			const annotationLocal =
+				(frozenExecution?.target.deviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID &&
+				(config.defaultDeviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID;
 			// If the tool already truncated its output, pass through as-is.
 			if (result.truncated) {
 				return {
-					output: await annotateToolOutput(
-						config,
-						tu,
-						effectiveInput,
-						finalOutput,
-						result,
-						annotationCwd,
-					),
+					output: await annotateToolOutput(config, tu, effectiveInput, finalOutput, result, {
+						cwd: annotationCwd,
+						local: annotationLocal,
+						fullOutputPath:
+							typeof result.metadata?.fullOutputPath === "string"
+								? result.metadata.fullOutputPath
+								: undefined,
+					}),
 					isError: result.isError,
 					fatal: result.fatal,
 					durationMs: Date.now() - start,
@@ -1842,7 +1846,7 @@ async function executeToolUntraced(
 					effectiveInput,
 					truncated.content + appendNotice,
 					result,
-					annotationCwd,
+					{ cwd: annotationCwd, local: annotationLocal, fullOutputPath: truncated.outputPath },
 				),
 				isError: result.isError,
 				fatal: result.fatal,
@@ -1930,7 +1934,7 @@ async function annotateToolOutput(
 	input: Record<string, unknown>,
 	output: string,
 	result: ToolResult,
-	cwd: string,
+	where: { cwd: string; local: boolean; fullOutputPath?: string },
 ): Promise<string> {
 	if (!config.annotateToolResult) return output;
 	try {
@@ -1942,7 +1946,7 @@ async function annotateToolOutput(
 				output,
 				isError: result.isError ?? false,
 				metadata: result.metadata,
-				cwd,
+				...where,
 			})) ?? output
 		);
 	} catch (error) {

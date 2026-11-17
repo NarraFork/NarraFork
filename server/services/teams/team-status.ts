@@ -15,7 +15,8 @@
  * is named by its first day), at most {@link TEAM_STATUS_MAX_BYTES}.
  *
  * CONTENT, in this order: heading (team name = coordinator title, base branch), the team brief
- * (P1, ≤ 4 KB), a context note when the last measured use is above the team's suggested share,
+ * (P1, ≤ 4 KB; written whole once per compaction cycle — again when it changes or the row that
+ * carried it left the history — and named in one line in the rows after that), a context note when the last measured use is above the team's suggested share,
  * this week's limit overruns by kind, approvals waiting in the team tree, work items (open ones
  * listed, finished ones counted), and the latest decisions recorded on people's behalf. Lists are
  * filled by priority (approvals, work items, decisions) into what the budget leaves, and what
@@ -361,6 +362,16 @@ function cutToBytes(text: string, maxBytes: number): string {
 
 export interface TeamStatusInput {
 	contextPercent?: number;
+	/**
+	 * The brief text the coordinator already has in its current context (written by an earlier
+	 * status row of this compaction cycle). The same brief is then named, not repeated.
+	 */
+	briefShown?: string;
+}
+
+/** Whether a status for this state carries the brief text itself. */
+export function statusIncludesBrief(state: { brief: string }, briefShown?: string): boolean {
+	return briefShown === undefined || briefShown !== state.brief;
 }
 
 /** The status text for this state. Pure: the same state and locale give the same bytes. */
@@ -430,7 +441,9 @@ export function renderTeamStatus(
 	const sectionCount = 6;
 	let used = utf8Bytes(fixed.join("\n")) + sectionCount * 2;
 	let briefLines: string[];
-	if (state.brief) {
+	if (state.brief && !statusIncludesBrief(state, input.briefShown))
+		briefLines = [t.briefShown(utf8Bytes(state.brief))];
+	else if (state.brief) {
 		const full = `${t.briefHeading}\n${state.brief}`;
 		const room = max - used - 1;
 		if (utf8Bytes(full) <= room) briefLines = [full];
@@ -464,10 +477,34 @@ export function renderTeamStatus(
 export async function readTeamStatus(
 	teamId: string,
 	locale: Locale,
-	options: { now?: number; contextPercent?: number } = {},
-): Promise<string | null> {
+	options: { now?: number; contextPercent?: number; briefShown?: string } = {},
+): Promise<{
+	text: string;
+	/** The same state rendered with the brief itself, to compare with a row that carried it. */
+	textWithBrief: string;
+	brief: string;
+	briefIncluded: boolean;
+} | null> {
 	const state = await readStatusState(teamId, options.now ?? Date.now());
-	return state ? renderTeamStatus(state, locale, { contextPercent: options.contextPercent }) : null;
+	if (!state) return null;
+	const text = renderTeamStatus(state, locale, options);
+	const briefIncluded = statusIncludesBrief(state, options.briefShown);
+	return {
+		text,
+		textWithBrief: briefIncluded
+			? text
+			: renderTeamStatus(state, locale, { ...options, briefShown: undefined }),
+		brief: state.brief,
+		briefIncluded,
+	};
+}
+
+/** Whether the last row already says what this status says. */
+function sameAsLast(last: Delivered, status: { text: string; textWithBrief: string }): boolean {
+	if (last.text === status.text) return true;
+	return last.messageId !== null && last.messageId === last.briefMessageId
+		? last.text === status.textWithBrief
+		: false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -534,6 +571,44 @@ interface Delivered {
 	messageId: string | null;
 	/** When the status was last looked at (written or found unchanged). */
 	at: number;
+	/** The brief text the last row that carried it held, that row, and its compaction cycle. */
+	brief: string | null;
+	briefMessageId: string | null;
+	briefCompactSeq: number | null;
+}
+
+/** The brief the coordinator still has in context this cycle, or undefined. */
+async function briefInContext(
+	narratorId: string,
+	last: Delivered | undefined,
+	compactSeq: number | null,
+	delivery: TeamStatusDelivery,
+): Promise<string | undefined> {
+	if (!last || last.brief === null || !last.briefMessageId) return undefined;
+	if (last.briefCompactSeq !== compactSeq) return undefined;
+	return (await delivery.stillInHistory(narratorId, last.briefMessageId)) ? last.brief : undefined;
+}
+
+function nextDelivered(
+	last: Delivered | undefined,
+	status: { text: string; brief: string; briefIncluded: boolean },
+	messageId: string | null,
+	compactSeq: number | null,
+	at: number,
+): Delivered {
+	return {
+		compactSeq,
+		text: status.text,
+		messageId,
+		at,
+		...(status.briefIncluded && messageId
+			? { brief: status.brief, briefMessageId: messageId, briefCompactSeq: compactSeq }
+			: {
+					brief: last?.brief ?? null,
+					briefMessageId: last?.briefMessageId ?? null,
+					briefCompactSeq: last?.briefCompactSeq ?? null,
+				}),
+	};
 }
 
 const delivered = hotSafe<Map<string, Delivered>>(
@@ -570,16 +645,18 @@ export async function writeTeamStatusAtPass(input: TeamStatusPassInput): Promise
 		const last = delivered.get(narratorId);
 		if (!runStart && last && last.compactSeq === compactSeq) return false;
 		const now = input.now ?? Date.now();
-		const text = await readTeamStatus(narratorId, locale, {
+		const delivery = deliverySeam ?? realDelivery;
+		const status = await readTeamStatus(narratorId, locale, {
 			now,
 			contextPercent: input.contextPercent,
+			briefShown: await briefInContext(narratorId, last, compactSeq, delivery),
 		});
-		if (!text) return false;
-		const delivery = deliverySeam ?? realDelivery;
+		if (!status) return false;
+		const { text } = status;
 		if (
 			last &&
 			last.compactSeq === compactSeq &&
-			last.text === text &&
+			sameAsLast(last, status) &&
 			last.messageId &&
 			(await delivery.stillInHistory(narratorId, last.messageId))
 		) {
@@ -592,7 +669,7 @@ export async function writeTeamStatusAtPass(input: TeamStatusPassInput): Promise
 			schedule: "none",
 			locale,
 		});
-		delivered.set(narratorId, { compactSeq, text, messageId, at: now });
+		delivered.set(narratorId, nextDelivered(last, status, messageId, compactSeq, now));
 		return messageId !== null;
 	} catch (error) {
 		logger.warn("Could not write a coordinator's team status", {
@@ -621,23 +698,24 @@ export async function writeTeamStatusAtBoundary(input: {
 	if (now - last.at < TEAM_STATUS_CADENCE_MS) return null;
 	try {
 		last.at = now;
-		const text = await readTeamStatus(input.narratorId, input.locale, {
+		const delivery = deliverySeam ?? realDelivery;
+		const status = await readTeamStatus(input.narratorId, input.locale, {
 			now,
 			contextPercent: input.contextPercent,
+			briefShown: await briefInContext(input.narratorId, last, last.compactSeq, delivery),
 		});
-		if (!text || text === last.text) return null;
-		const result = await (deliverySeam ?? realDelivery).deliver(input.narratorId, {
+		if (!status || sameAsLast(last, status)) return null;
+		const { text } = status;
+		const result = await delivery.deliver(input.narratorId, {
 			content: text,
 			source: TEAM_STATUS_SOURCE,
 			schedule: "onNextTurn",
 			locale: input.locale,
 		});
-		delivered.set(input.narratorId, {
-			compactSeq: last.compactSeq,
-			text,
-			messageId: result.messageId,
-			at: now,
-		});
+		delivered.set(
+			input.narratorId,
+			nextDelivered(last, status, result.messageId, last.compactSeq, now),
+		);
 		return result;
 	} catch (error) {
 		logger.warn("Could not write a coordinator's team status at a tool boundary", {

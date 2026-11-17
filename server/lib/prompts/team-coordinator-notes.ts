@@ -65,11 +65,30 @@ const reminderAdvice: LocalizedValue<Record<"change" | "output", string>> = {
 	},
 };
 
-const savedNote: LocalizedValue<(path: string) => string> = {
-	en: (path) =>
-		`Only the beginning and the end are shown above. The complete result is saved at ${path}; Read that file (limit -1 for all of it) to see everything.`,
-	"zh-CN": (path) =>
-		`上面只显示了开头和结尾。完整结果已存到 ${path}；用 Read 读这个文件（limit 设为 -1 读全部）就能看到全文。`,
+/** Where the complete result of a shortened output is. */
+export type SavedOutputNote =
+	| { kind: "saved"; paths: string[]; keptMegabytes: number }
+	| { kind: "existing"; path: string };
+
+const savedNote: LocalizedValue<(note: SavedOutputNote) => string> = {
+	en: (note) => {
+		const lead = "Only the beginning and the end are shown above.";
+		if (note.kind === "existing")
+			return `${lead} The complete output was saved at ${note.path}; page through it with Read (offset and limit) or search it with Grep.`;
+		const kept = `(kept while available: each session keeps its latest ${note.keptMegabytes} MB of saved results)`;
+		if (note.paths.length === 1)
+			return `${lead} The complete result is saved at ${note.paths[0]}; Read that file with limit: -1 to get all of it ${kept}.`;
+		return `${lead} The complete result is saved in ${note.paths.length} consecutive parts (joined without separators): ${note.paths.join(", ")}; Read each with limit: -1 to get all of it ${kept}.`;
+	},
+	"zh-CN": (note) => {
+		const lead = "上面只显示了开头和结尾。";
+		if (note.kind === "existing")
+			return `${lead}完整输出已存到 ${note.path}；用 Read（offset 和 limit）分段读，或用 Grep 搜索。`;
+		const kept = `（在可用期间保留：每个会话保留最近 ${note.keptMegabytes} MB 的已存结果）`;
+		if (note.paths.length === 1)
+			return `${lead}完整结果已存到 ${note.paths[0]}；用 Read 读这个文件、limit 设为 -1 就能拿到全文${kept}。`;
+		return `${lead}完整结果分 ${note.paths.length} 段依次存放（直接首尾相接）：${note.paths.join("、")}；每段用 Read、limit 设为 -1 读全${kept}。`;
+	},
 };
 
 const omittedMarker: LocalizedValue<(lines: number, bytes: number) => string> = {
@@ -83,15 +102,15 @@ const OUTPUT_KINDS: ReadonlySet<CoordinatorOverrunKind> = new Set([
 	"bashOutputBytes",
 ]);
 
-/** One reminder line for one overrun kind. `savedPath` only for an output shown head + tail. */
+/** One reminder line for one overrun kind. `saved` only for an output shown head + tail. */
 export function getCoordinatorReminder(
-	facts: ReminderFacts & { savedPath?: string },
+	facts: ReminderFacts & { saved?: SavedOutputNote },
 	locale: Locale,
 ): string {
 	const advice = pickLocalizedValue(reminderAdvice, locale)[
 		OUTPUT_KINDS.has(facts.kind) ? "output" : "change"
 	];
-	const saved = facts.savedPath ? ` ${pickLocalizedValue(savedNote, locale)(facts.savedPath)}` : "";
+	const saved = facts.saved ? ` ${pickLocalizedValue(savedNote, locale)(facts.saved)}` : "";
 	return `${pickLocalizedValue(reminderLead, locale)} ${pickLocalizedValue(reminderBody, locale)(facts)}${saved} ${advice}`;
 }
 
@@ -107,6 +126,7 @@ export interface TeamStatusLabels {
 	briefHeading: string;
 	noBrief: string;
 	briefCut: (bytes: number) => string;
+	briefShown: (bytes: number) => string;
 	workItems: (counts: string) => string;
 	noWorkItems: string;
 	state: Record<TeamWorkItemState, string>;
@@ -137,6 +157,8 @@ const statusLabels: LocalizedValue<TeamStatusLabels> = {
 		briefHeading: "Team brief (shared rules for you and every subagent):",
 		noBrief: "Team brief: none yet.",
 		briefCut: (bytes) => `[… brief cut here to fit the status; it has ${bytes} bytes in all …]`,
+		briefShown: (bytes) =>
+			`Team brief: unchanged since an earlier team status in this conversation showed it (${bytes} bytes).`,
 		workItems: (counts) => `Work items: ${counts}.`,
 		noWorkItems: "Work items: none yet.",
 		state: {
@@ -182,6 +204,8 @@ const statusLabels: LocalizedValue<TeamStatusLabels> = {
 		briefHeading: "团队简报（你和每个子代理共用的规则）：",
 		noBrief: "团队简报：还没有。",
 		briefCut: (bytes) => `[… 为了放进状态，简报在这里截断；全文共 ${bytes} 字节 …]`,
+		briefShown: (bytes) =>
+			`团队简报：和这段对话里前面的团队状态显示的一样，没有变（${bytes} 字节）。`,
 		workItems: (counts) => `工作项：${counts}。`,
 		noWorkItems: "工作项：还没有。",
 		state: {

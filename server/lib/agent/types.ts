@@ -109,6 +109,10 @@ export interface ToolResultAnnotationInput {
 	metadata?: Record<string, unknown>;
 	/** The working directory the call ran in. */
 	cwd: string;
+	/** The call ran on this server and the session's default device is this server too. */
+	local: boolean;
+	/** Where the executor's or the tool's own truncation saved the full output, if it did. */
+	fullOutputPath?: string;
 }
 
 /** Final authorization uses the immutable admitted input/target, never a live cwd hint. */
