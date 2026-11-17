@@ -1441,9 +1441,20 @@ const HELPER_STOP_LIMIT = 100;
  * subagent that was stopped. A helper a person has taken over is left alone, as control
  * actions never cut into a person's work. Primary narrators are untouched: their
  * background agents keep running when the primary's turn is interrupted, as before.
- * Never throws.
+ * Never throws, unless given an `assertAuthorized` fence (explicit Stop).
  */
-export async function stopSubagentHelpers(narratorId: string, reason: string): Promise<number> {
+export async function stopSubagentHelpers(
+	narratorId: string,
+	reason: string,
+	options: {
+		/**
+		 * The caller's authorization fence, asserted immediately before each helper is
+		 * cancelled. Its failure (and, on this explicit path, any failure) is thrown to the
+		 * caller instead of being swallowed.
+		 */
+		assertAuthorized?: () => void;
+	} = {},
+): Promise<number> {
 	try {
 		const owner = await db
 			.select({ type: narrators.type })
@@ -1463,6 +1474,7 @@ export async function stopSubagentHelpers(narratorId: string, reason: string): P
 		let stopped = 0;
 		for (const helper of helpers) {
 			if (getRunHold(helper.id)) continue;
+			options.assertAuthorized?.();
 			const cancelled =
 				(await backgroundTaskService.cancel(helper.id).catch(() => false)) ||
 				(await controlRun(helper.id, { kind: "cancel", reason }).catch(() => false));
@@ -1471,6 +1483,7 @@ export async function stopSubagentHelpers(narratorId: string, reason: string): P
 		if (stopped > 0) logger.info("Stopped helpers of a stopped subagent", { narratorId, stopped });
 		return stopped;
 	} catch (error) {
+		if (options.assertAuthorized) throw error;
 		logger.warn("Failed to stop a stopped subagent's helpers", {
 			narratorId,
 			error: error instanceof Error ? error.message : String(error),

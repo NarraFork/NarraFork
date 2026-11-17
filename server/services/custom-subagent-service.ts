@@ -5,11 +5,7 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import type { RuntimePolicyTrait } from "../lib/runtime-policy-trait";
 import { narraforkDir } from "../lib/settings";
-import {
-	BUILTIN_DELEGATION_TEMPLATES,
-	compileDelegationPolicy,
-	LATE_BUILTIN_TEMPLATES,
-} from "./agent-runtime/policy";
+import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -157,6 +153,21 @@ export function isBuiltinType(name: string): boolean {
 	return BUILTIN_TYPES.has(name);
 }
 
+/**
+ * A name a user's template may not take: a built-in's, compared the way names map to
+ * directories (case-insensitive, sanitized), so `Worker` or ` WORKER ` cannot land in a
+ * built-in's directory either.
+ */
+export function isReservedTemplateName(name: string): boolean {
+	const dir = sanitizeDirName(name);
+	return (
+		isBuiltinType(name) ||
+		BUILTIN_DELEGATION_TEMPLATES.has(name) ||
+		BUILTIN_TYPES.has(dir) ||
+		BUILTIN_DELEGATION_TEMPLATES.has(dir)
+	);
+}
+
 // ---------------------------------------------------------------------------
 // CRUD helpers
 // ---------------------------------------------------------------------------
@@ -188,7 +199,7 @@ function buildSubagentMd(def: Omit<CustomSubagentDef, "location">): string {
 export async function create(
 	input: Omit<CustomSubagentDef, "location">,
 ): Promise<CustomSubagentDef> {
-	if (isBuiltinType(input.name)) {
+	if (isReservedTemplateName(input.name)) {
 		throw new ValidationError(`"${input.name}" is a built-in subagent type and cannot be used`);
 	}
 	const dirName = sanitizeDirName(input.name);
@@ -227,7 +238,7 @@ export async function update(
 	const needsRename = newDirName !== oldDirName;
 
 	if (needsRename) {
-		if (isBuiltinType(input.name)) {
+		if (isReservedTemplateName(input.name)) {
 			throw new ValidationError(`"${input.name}" is a built-in subagent type and cannot be used`);
 		}
 		const newDir = join(SUBAGENTS_DIR, newDirName);
@@ -289,38 +300,74 @@ export async function compileDelegationCeiling(
 	});
 }
 
-/** Late built-in names (see `LATE_BUILTIN_TEMPLATES`) already warned about this process. */
-const shadowWarned = new Set<string>();
-
 /**
  * The user's definition a template name resolves to, or null for a built-in. The one
- * rule every delegation path uses (live delegation, creation, import).
+ * rule every delegation path uses (live delegation, creation, import). A built-in name
+ * always means the built-in, in any spelling: a name whose directory would be a
+ * built-in's (`"Worker"` → `worker/`) never loads a user's file.
  */
 export async function resolveTemplateDefinition(
 	template: string,
 ): Promise<CustomSubagentDef | null> {
-	if (!BUILTIN_DELEGATION_TEMPLATES.has(template)) return loadByName(template);
-	if (!LATE_BUILTIN_TEMPLATES.has(template)) return null;
-	const own = await loadByName(template);
-	if (own && !shadowWarned.has(template)) {
-		shadowWarned.add(template);
-		logger.warn(
-			`A custom subagent template named "${template}" is in use instead of the built-in "${template}" template; rename it to use the built-in one`,
-			{ location: own.location },
-		);
-	}
-	return own;
+	if (isReservedTemplateName(template)) return null;
+	return loadByName(template);
 }
 
-/** Warn at startup about user templates that keep a late built-in name (see above). */
-export async function warnShadowedBuiltinTemplates(): Promise<void> {
-	for (const template of LATE_BUILTIN_TEMPLATES) await resolveTemplateDefinition(template);
+/**
+ * Built-in template names added after people could already create their own templates.
+ * A user's template directory with one of these names is moved aside at startup
+ * (`moveAsideReservedTemplates`) so it keeps existing under a new name and the built-in
+ * always wins.
+ */
+const LATE_BUILTIN_TEMPLATES: readonly string[] = ["worker"];
+
+/**
+ * Move a user's template that sits in a late built-in's directory to `<name>-custom`
+ * (numbered when taken), renaming it in its file too, with a warning naming the new
+ * name. Returns the new names. Nothing is deleted.
+ */
+export async function moveAsideReservedTemplates(): Promise<string[]> {
+	const moved: string[] = [];
+	for (const reserved of LATE_BUILTIN_TEMPLATES) {
+		const dir = join(SUBAGENTS_DIR, reserved);
+		const filePath = join(dir, SUBAGENT_FILE);
+		if ((await getMtimeMs(filePath)) === null) continue;
+		let target = `${reserved}-custom`;
+		for (let n = 2; await pathExists(join(SUBAGENTS_DIR, target)); n++)
+			target = `${reserved}-custom-${n}`;
+		const raw = await readFile(filePath, "utf-8");
+		const def = parseSubagentFile(raw, filePath, reserved);
+		defCache.delete(filePath);
+		await rename(dir, join(SUBAGENTS_DIR, target));
+		if (def) {
+			const { location: _old, ...rest } = def;
+			await writeFile(
+				join(SUBAGENTS_DIR, target, SUBAGENT_FILE),
+				buildSubagentMd({ ...rest, name: target }),
+				"utf-8",
+			);
+		}
+		logger.warn(
+			`Custom subagent template "${reserved}" now names a built-in template; it was renamed to "${target}". Use subagent_type "${target}" to keep using it.`,
+			{ from: dir, to: join(SUBAGENTS_DIR, target) },
+		);
+		moved.push(target);
+	}
+	return moved;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+	return stat(path).then(
+		() => true,
+		() => false,
+	);
 }
 
 export const customSubagentService = {
 	loadAll,
 	loadByName,
 	resolveTemplateDefinition,
+	moveAsideReservedTemplates,
 	isBuiltinType,
 	create,
 	update,

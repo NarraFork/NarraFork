@@ -89,8 +89,6 @@ export async function buildDelegationBasePrompt(
 	locale: Locale,
 	customPrompt?: string | null,
 ): Promise<string> {
-	// A user's own template with a late built-in name keeps its own prompt.
-	if (customPrompt) return customPrompt;
 	const builtin = getSubagentPrompt(subagentType, locale);
 	if (builtin) return builtin;
 	const custom =

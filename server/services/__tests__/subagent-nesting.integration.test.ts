@@ -584,6 +584,20 @@ describe("review round 1", () => {
 		expect(again.output).toContain("is not running");
 	});
 
+	test("an explicit stop checks its authorization before each helper, never after", async () => {
+		const { worker, helper } = await tree();
+		await narratorService.updateStatus(helper, "working");
+		const helperRun = await backgroundRun(worker, helper);
+		await expect(
+			stopSubagentHelpers(worker, "test", {
+				assertAuthorized: () => {
+					throw new Error("revoked");
+				},
+			}),
+		).rejects.toThrow("revoked");
+		expect(helperRun.signal.aborted).toBe(false);
+	});
+
 	test("a run takes its helpers with it only when cancelled or timed out", () => {
 		expect(runStopsHelpers({ cancelled: true, timedOut: false })).toBe(true);
 		expect(runStopsHelpers({ cancelled: false, timedOut: true })).toBe(true);
@@ -624,39 +638,69 @@ describe("review round 1", () => {
 		expect(listed.get(worker)?.subagents.map((row) => row.id)).toContain(helper);
 	});
 
-	test("a user's own template named worker keeps resolving under its name", async () => {
-		const { mkdir, rm, writeFile } = await import("node:fs/promises");
+	test("no user template can take a built-in's name, in any spelling", async () => {
+		const { rm } = await import("node:fs/promises");
 		const { join } = await import("node:path");
 		const { narraforkDir } = await import("../../lib/settings");
-		const { compileDelegationCeiling, resolveTemplateDefinition } = await import(
-			"../custom-subagent-service"
-		);
-		const dir = join(narraforkDir, "subagents", "worker");
-		await mkdir(dir, { recursive: true });
+		const service = await import("../custom-subagent-service");
+		const def = {
+			description: "mine",
+			toolAccess: "readOnly" as const,
+			customTools: [],
+			defaultModel: "",
+			prompt: "Injected prompt.",
+		};
+		const mine = join(narraforkDir, "subagents", "my-helper");
 		try {
-			await writeFile(
-				join(dir, "SUBAGENT.md"),
-				"---\nname: worker\ndescription: mine\ntoolAccess: readOnly\n---\n\nMy own worker prompt.\n",
+			for (const name of ["Worker", "WORKER", " worker ", "General", "search"])
+				await expect(service.create({ ...def, name })).rejects.toThrow("built-in");
+			await service.create({ ...def, name: "my-helper" });
+			await expect(service.update("my-helper", { ...def, name: "Worker" })).rejects.toThrow(
+				"built-in",
 			);
-			expect((await resolveTemplateDefinition("worker"))?.prompt).toBe("My own worker prompt.");
-			const own = resolveRuntimePolicy([await compileDelegationCeiling("worker")]);
-			expect(own.tools.readOnly).toBe(true);
-			expect(own.capabilities.spawnAgent).toBe(false);
-			const { buildDelegationBasePrompt } = await import("../subagent-tools");
-			expect(
-				await buildDelegationBasePrompt(
-					"worker",
-					"en",
-					(await resolveTemplateDefinition("worker"))?.prompt,
-				),
-			).toBe("My own worker prompt.");
+			// Any spelling of a built-in name means the built-in, never a user's file.
+			for (const name of ["worker", "Worker", "WORKER"])
+				expect(await service.resolveTemplateDefinition(name)).toBeNull();
+			const builtin = resolveRuntimePolicy([await service.compileDelegationCeiling("worker")]);
+			expect(builtin.capabilities.spawnAgent).toBe(true);
+			expect(await service.resolveTemplateDefinition("my-helper")).not.toBeNull();
 		} finally {
-			await rm(dir, { recursive: true, force: true });
+			await rm(mine, { recursive: true, force: true });
+			await rm(join(narraforkDir, "subagents", "worker"), { recursive: true, force: true });
 		}
-		expect(await resolveTemplateDefinition("worker")).toBeNull();
-		const builtin = resolveRuntimePolicy([await compileDelegationCeiling("worker")]);
-		expect(builtin.capabilities.spawnAgent).toBe(true);
-		// Other built-in names never resolve to a user's file.
-		expect(await resolveTemplateDefinition("general")).toBeNull();
+	});
+
+	test("a template that already used the name worker is moved aside, not lost", async () => {
+		const { mkdir, readFile, rm, stat, writeFile } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const { narraforkDir } = await import("../../lib/settings");
+		const service = await import("../custom-subagent-service");
+		const root = join(narraforkDir, "subagents");
+		const file =
+			"---\nname: worker\ndescription: mine\ntoolAccess: readOnly\n---\n\nMy own worker prompt.\n";
+		try {
+			// `worker-custom` is taken, so the old template lands on `worker-custom-2`.
+			await mkdir(join(root, "worker-custom"), { recursive: true });
+			await writeFile(
+				join(root, "worker-custom", "SUBAGENT.md"),
+				file.replace("name: worker", "name: worker-custom"),
+			);
+			await mkdir(join(root, "worker"), { recursive: true });
+			await writeFile(join(root, "worker", "SUBAGENT.md"), file);
+			expect(await service.moveAsideReservedTemplates()).toEqual(["worker-custom-2"]);
+			await expect(stat(join(root, "worker"))).rejects.toThrow();
+			const moved = await service.resolveTemplateDefinition("worker-custom-2");
+			expect(moved?.name).toBe("worker-custom-2");
+			expect(moved?.prompt).toBe("My own worker prompt.");
+			expect(await readFile(join(root, "worker-custom", "SUBAGENT.md"), "utf-8")).toContain(
+				"name: worker-custom",
+			);
+			// The built-in now always wins; a second pass has nothing to move.
+			expect(await service.resolveTemplateDefinition("worker")).toBeNull();
+			expect(await service.moveAsideReservedTemplates()).toEqual([]);
+		} finally {
+			for (const dir of ["worker", "worker-custom", "worker-custom-2"])
+				await rm(join(root, dir), { recursive: true, force: true });
+		}
 	});
 });
