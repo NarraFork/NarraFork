@@ -16,9 +16,11 @@ export const schema = new Schema({
 			// `hidden`: blocks under it the view leaves out (tasks in the facts view), for a hint.
 			// `question`: a question put to a person (`Ask`), from the block model; never edited.
 			// `collapsed`: its children are folded away, by the page's default view or the reader
-			// (`@shared/outline-fold`); `fold`: what its frame shows about that (the preview line,
-			// the quick control, counts of what is hidden), as the view projects it (`view.ts`).
-			// Neither is part of the block model: nothing of them is saved or undone.
+			// (`@shared/outline-fold`): they are NOT in the document (only expanded blocks are), the
+			// block has no `children` node; `fold`: what its frame shows about that (the preview
+			// line, the quick control, counts of what is hidden), and `preview` the preview line's
+			// text, as the view projects them from the block model (`view.ts`). None of them is
+			// part of the block model: nothing of them is saved or undone.
 			attrs: {
 				id: { default: null },
 				task: { default: null },
@@ -26,6 +28,7 @@ export const schema = new Schema({
 				hidden: { default: 0 },
 				question: { default: false },
 				fold: { default: "" },
+				preview: { default: "" },
 			},
 			defining: true,
 			toDOM: (n) => ["div", { class: "ob-block", "data-id": n.attrs.id }, 0],

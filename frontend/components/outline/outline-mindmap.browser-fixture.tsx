@@ -648,7 +648,9 @@ export function viewOutline(): string {
 			if (child.childCount > 1) walk(child.child(1), depth + 1);
 		});
 	};
-	const r = view().pm.state.doc.child(0);
+	// What closed blocks hide is not in the document: put back from the block model.
+	const v = view();
+	const r = v.withHidden(v.pm.state.doc.content).child(0);
 	if (r.childCount > 1) walk(r.child(1), 0);
 	return lines.join("\n");
 }
@@ -656,6 +658,8 @@ export function viewOutline(): string {
 /** Insert text through the editor at a block offset (another person typing). */
 export function insertAt(blockId: string, offset: number, text: string): boolean {
 	const v = view();
+	// (That person has the block on screen: what folds it away opens for them.)
+	v.show([blockId]);
 	const pos = v.pointToPos(v.pm.state.doc, { blockId, offset });
 	if (pos == null) return false;
 	v.pm.dispatch(v.pm.state.tr.insertText(text, pos));
@@ -673,6 +677,8 @@ const COMMANDS = {
 /** Run an outline command with the cursor at a block offset (another person's keystroke). */
 export function cmd(name: keyof typeof COMMANDS, blockId: string, offset = 0): boolean {
 	const v = view();
+	// (That person has the block on screen: what folds it away opens for them.)
+	v.show([blockId]);
 	const pos = v.pointToPos(v.pm.state.doc, { blockId, offset });
 	if (pos == null) return false;
 	v.pm.updateState(
@@ -1683,6 +1689,7 @@ export function mapArrowPoint(id: string): { x: number; y: number } | null {
 /** Set a block's checkbox through the editor (another person ticking a task). */
 export function setTask(blockId: string, task: " " | "/" | "x" | "-" | null): boolean {
 	const v = view();
+	v.show([blockId]);
 	const pos = findBlockPos(v.pm.state.doc, blockId);
 	if (pos == null) return false;
 	v.pm.dispatch(v.pm.state.tr.setNodeAttribute(pos, "task", task));

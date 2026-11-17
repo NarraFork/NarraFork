@@ -343,7 +343,8 @@ export function unmount(): void {
 export function viewText(blockId: string): string | null {
 	const v = view();
 	const pos = findBlockPos(v.pm.state.doc, blockId);
-	if (pos == null) return null;
+	// Folded away (not in the document): the text the editor would show.
+	if (pos == null) return v.client.visible.alive(blockId) ? v.client.textOf(blockId) : null;
 	const node = v.pm.state.doc.nodeAt(pos);
 	return node ? serializePM(node.child(0)) : null;
 }
@@ -351,6 +352,8 @@ export function viewText(blockId: string): string | null {
 /** Insert text at an offset of a block through the editor (another person typing elsewhere). */
 export function insertAt(blockId: string, offset: number, text: string): boolean {
 	const v = view();
+	// (That person has the block on screen: what folds it away opens for them.)
+	v.show([blockId]);
 	const pos = v.pointToPos(v.pm.state.doc, { blockId, offset });
 	if (pos == null) return false;
 	v.pm.dispatch(v.pm.state.tr.insertText(text, pos));
@@ -371,6 +374,8 @@ const COMMANDS = {
 /** Run an outline command with the cursor at a block offset (another person's keystroke). */
 export function cmd(name: keyof typeof COMMANDS, blockId: string, offset = 0): boolean {
 	const v = view();
+	// (That person has the block on screen: what folds it away opens for them.)
+	v.show([blockId]);
 	const pos = v.pointToPos(v.pm.state.doc, { blockId, offset });
 	if (pos == null) return false;
 	const state = v.pm.state.apply(
@@ -394,8 +399,10 @@ export function viewOutline(): string {
 			if (child.childCount > 1) walk(child.child(1), depth + 1);
 		});
 	};
-	const root = view().pm.state.doc.child(0);
-	if (root.childCount > 1) walk(root.child(1), 0);
+	// What closed blocks hide is not in the document: put back from the block model.
+	const v = view();
+	const r = v.withHidden(v.pm.state.doc.content).child(0);
+	if (r.childCount > 1) walk(r.child(1), 0);
 	return lines.join("\n");
 }
 
