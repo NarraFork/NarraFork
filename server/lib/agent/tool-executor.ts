@@ -1804,10 +1804,18 @@ async function executeToolUntraced(
 				}
 			}
 
+			const annotationCwd = frozenExecution?.target.cwd ?? config.cwd;
 			// If the tool already truncated its output, pass through as-is.
 			if (result.truncated) {
 				return {
-					output: finalOutput,
+					output: await annotateToolOutput(
+						config,
+						tu,
+						effectiveInput,
+						finalOutput,
+						result,
+						annotationCwd,
+					),
 					isError: result.isError,
 					fatal: result.fatal,
 					durationMs: Date.now() - start,
@@ -1826,7 +1834,14 @@ async function executeToolUntraced(
 			}
 			const truncated = truncateOutput(result.output);
 			return {
-				output: truncated.content + appendNotice,
+				output: await annotateToolOutput(
+					config,
+					tu,
+					effectiveInput,
+					truncated.content + appendNotice,
+					result,
+					annotationCwd,
+				),
 				isError: result.isError,
 				fatal: result.fatal,
 				durationMs: Date.now() - start,
@@ -1900,6 +1915,41 @@ async function executeToolUntraced(
 				attemptClaimed,
 			);
 		}
+	}
+}
+
+/**
+ * `AgentConfig.annotateToolResult` over a finished call's text (a team coordinator's soft-limit
+ * reminders). The tool has already run; a failing annotator keeps the text unchanged.
+ */
+async function annotateToolOutput(
+	config: AgentConfig,
+	tu: AgentToolUse,
+	input: Record<string, unknown>,
+	output: string,
+	result: ToolResult,
+	cwd: string,
+): Promise<string> {
+	if (!config.annotateToolResult) return output;
+	try {
+		return (
+			(await config.annotateToolResult({
+				toolName: tu.name,
+				toolUseId: tu.toolUseId,
+				input,
+				output,
+				isError: result.isError ?? false,
+				metadata: result.metadata,
+				cwd,
+			})) ?? output
+		);
+	} catch (error) {
+		logger.warn("Tool result annotation failed; the result is kept as it was", {
+			toolUseId: tu.toolUseId,
+			toolName: tu.name,
+			error: String(error),
+		});
+		return output;
 	}
 }
 

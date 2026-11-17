@@ -230,6 +230,8 @@ import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
+import { coordinatorToolAnnotatorFor } from "../teams/coordinator-limits";
+import { writeTeamStatusAtPass } from "../teams/team-status";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
@@ -937,6 +939,8 @@ export async function runAgentLoopUnlocked(
 		// An outline session moves its old fence text to its behavior page once, before its first
 		// prompt is built, and the turn-end note measures the run from here (outline plan PR 4).
 		await prepareOutlineRun(active);
+		// A team coordinator's status (Project Teams P2) is written on the first pass of the run.
+		let teamRunStart = true;
 		while (active.alive && owner.isCurrent()) {
 			void outlineLeases.touch();
 			// The run's own cancellation reaches whichever turn controller is current.
@@ -1005,6 +1009,20 @@ export async function runAgentLoopUnlocked(
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
+			// A team coordinator (Project Teams P2): the team status is a history row written
+			// before this pass reads its history, at run start and after a compaction; the
+			// soft-limit reminders ride on its tool results. Never in the system prompt.
+			const teamCoordinator =
+				!placement && freshNarrator.type === "primary" && isTeamNarrator(freshNarrator.traits);
+			if (teamCoordinator && !active.abortController.signal.aborted)
+				await writeTeamStatusAtPass({
+					narratorId,
+					locale,
+					compactSeq: baselineCompactSeq,
+					runStart: teamRunStart,
+					contextPercent: active._contextUsagePct,
+				});
+			teamRunStart = false;
 			// Effective traits and the capability ceiling, resolved strictly once per pass
 			// so a layer or source change applies from the next pass. A layer that cannot
 			// be read fails the pass; it never runs without its restrictions.
@@ -1956,6 +1974,9 @@ export async function runAgentLoopUnlocked(
 				taskBackend,
 				specImported,
 				bot: isBotNarrator(freshNarrator.traits),
+				annotateToolResult: teamCoordinator
+					? coordinatorToolAnnotatorFor(narratorId, locale)
+					: undefined,
 				narratorId,
 				conversationId: active.conversationId,
 				model: resolved.model,

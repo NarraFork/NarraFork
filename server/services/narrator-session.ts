@@ -3024,6 +3024,16 @@ export async function drainInjectionsIntoHistory(
 		const activity = await writeOutlineTeamActivity(narratorId, locale, "boundary");
 		if (activity?.turnText)
 			parts.push({ text: activity.turnText, messageId: activity.messageId ?? undefined });
+		// A team coordinator's status again, at most every ten minutes and only when it changed
+		// (Project Teams P2; a map lookup for every other session).
+		const { writeTeamStatusAtBoundary } = await import("./teams/team-status");
+		const teamStatus = await writeTeamStatusAtBoundary({
+			narratorId,
+			locale,
+			contextPercent: active._contextUsagePct,
+		});
+		if (teamStatus?.turnText)
+			parts.push({ text: teamStatus.turnText, messageId: teamStatus.messageId ?? undefined });
 	}
 
 	return {
