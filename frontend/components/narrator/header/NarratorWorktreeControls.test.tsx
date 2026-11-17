@@ -1009,3 +1009,21 @@ test("a stale record and a detached main checkout are described, not hidden", as
 	await click("worktree.remove: task");
 	expect(container.textContent).toContain("worktree.removeUnmergedNowhere");
 });
+
+test("each protection refusal is explained by what actually blocks it", async () => {
+	canDelete = true;
+	listEntries = removalEntries();
+	await click("worktree.switch");
+	for (const [code, key] of [
+		["WORKTREE_RECEIPT_PROTECTED", "worktree.removeReceiptProtected"],
+		["WORKTREE_RESOURCE_PROTECTED", "worktree.removeOverlap"],
+		["WORKTREE_RESOURCE_ATTACHED", "worktree.removeAttached"],
+	] as const) {
+		removeFailure = new FakeApiError("blocked", 409, { code });
+		await click("worktree.remove: task");
+		await click("worktree.removeConfirm");
+		expect(container.textContent).toContain(key);
+		expect(container.textContent).not.toContain("worktree.removeInUse");
+		await click("worktree.removeCancel");
+	}
+});

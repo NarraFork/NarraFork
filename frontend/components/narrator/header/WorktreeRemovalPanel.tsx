@@ -14,6 +14,9 @@ import { worktreeDirectoryLabel, worktreeLabel } from "./worktree-list-view";
 /** Server refusals a person can act on; anything else shows the server's own text. */
 const REMOVAL_ERRORS: Record<string, string> = {
 	WORKTREE_IN_USE: "worktree.removeInUse",
+	WORKTREE_RECEIPT_PROTECTED: "worktree.removeReceiptProtected",
+	WORKTREE_RESOURCE_PROTECTED: "worktree.removeOverlap",
+	WORKTREE_RESOURCE_ATTACHED: "worktree.removeAttached",
 	WORKTREE_NOT_RECORDED: "worktree.removeNotRecorded",
 	WORKTREE_LOCKED: "worktree.removeLocked",
 	WORKTREE_REMOVAL_WOULD_LOSE_WORK: "worktree.removeChanged",

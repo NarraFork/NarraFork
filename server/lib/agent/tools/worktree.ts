@@ -481,6 +481,10 @@ function removalNextAction(code: string): string {
 			return "Nothing was removed. Tell the user exactly what details.report says would be lost. Only if they explicitly agree, call RemoveWorktree again with discard copied from details.report.";
 		case "WORKTREE_IN_USE":
 			return "Nothing was removed. A session's working directory or a running terminal is inside this worktree (details.blockedBy); it must move or close first. Do not work around it.";
+		case "WORKTREE_RECEIPT_PROTECTED":
+		case "WORKTREE_RESOURCE_PROTECTED":
+		case "WORKTREE_RESOURCE_ATTACHED":
+			return "Nothing was removed. Another creation request, recorded worktree or NarraFork resource still covers this path. Report it to the user; do not work around it.";
 		case "WORKTREE_NOT_RECORDED":
 			return "Nothing was removed. Only worktrees NarraFork created and recorded can be removed; leave this directory alone.";
 		default:

@@ -3,21 +3,24 @@
  * guard's reservation over the real protection index, the running-terminal check and the
  * SQLite resource registry, on an isolated database and a real repository.
  */
-import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq, inArray } from "drizzle-orm";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import { narrators, narratorWorktreeResources, terminals } from "../db/schema";
 import { LocalBackend } from "../lib/agent/execution/local-backend";
 import type { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { FileWorktreeJournal } from "./narrator-worktree-journal";
 import { worktreeResourceId } from "./narrator-worktree-resource-store";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
 import { NarratorWorktreeService, type WorktreeTarget } from "./narrator-worktree-service";
+import { maintainProtectionIndex } from "./resource-protection-index";
 import {
 	inspect,
 	type ResourceClaim,
@@ -57,7 +60,8 @@ async function narrator(cwd: string) {
 	});
 	return id;
 }
-async function record(path: string) {
+/** The owner is null: as after its session was deleted (`ON DELETE SET NULL`). */
+async function record(path: string, createRequestId = generateId()) {
 	resourcePaths.push(path);
 	const now = new Date().toISOString();
 	await db.insert(narratorWorktreeResources).values({
@@ -66,7 +70,7 @@ async function record(path: string) {
 		deviceId: "local",
 		repositoryKey: "retirement-repository",
 		worktreePath: path,
-		createRequestId: generateId(),
+		createRequestId,
 		state: "ready",
 		createdAt: now,
 		updatedAt: now,
@@ -196,7 +200,7 @@ test("a nested recorded worktree still protects its parent", async () => {
 	const nested = join(worktree, "nested");
 	await record(nested);
 	const refused = await refusal();
-	expect(refused.code).toBe("WORKTREE_IN_USE");
+	expect(refused.code).toBe("WORKTREE_RESOURCE_PROTECTED");
 	expect(refused.details).toEqual({
 		blockedBy: { kind: "registry", id: worktreeResourceId("local", nested) },
 	});
@@ -214,17 +218,30 @@ test("a .worktrees directory without a record is refused before anything inspect
 
 test("only the retired row and its own creation receipt are waived", async () => {
 	const path = "/fixture/repo/.worktrees/task";
-	const own = "a".repeat(64);
-	const verdict = (claims: ResourceClaim[], retiringReceiptName?: string) =>
+	const recorded = new Map<string, { requestId: string; destination: string } | null>([
+		["/journal/own.json", { requestId: "create-own", destination: path }],
+		["/journal/other.json", { requestId: "create-other", destination: path }],
+		["/journal/elsewhere.json", { requestId: "create-own", destination: "/fixture/other" }],
+		["/journal/unreadable.json", null],
+	]);
+	const verdict = (claims: ResourceClaim[]) =>
 		withLifecycleGuardPorts(
 			{
 				canonicalPath: async (value) => value,
 				readClaims: async () => ({ complete: true, claims }),
+				receiptRequest: async (id) => recorded.get(id) ?? null,
 			},
 			async () =>
 				(
 					await inspect(
-						[{ deviceId: "local", path, retiringRegistryId: "row", retiringReceiptName }],
+						[
+							{
+								deviceId: "local",
+								path,
+								retiringRegistryId: "row",
+								retiringCreateRequestId: "create-own",
+							},
+						],
 						"worktree remove",
 					)
 				).status,
@@ -237,9 +254,77 @@ test("only the retired row and its own creation receipt are waived", async () =>
 		path,
 		repositoryKey: "r",
 	});
-	expect(await verdict([row, receipt(own)], `${own}.json`)).toBe("clear");
-	// Another request's receipt at the same path, or an unknown owner, still protects it.
-	expect(await verdict([row, receipt("b".repeat(64))], `${own}.json`)).toBe("protected");
-	expect(await verdict([row, receipt(own)])).toBe("protected");
-	expect(await verdict([{ ...row, id: "other-row" }], `${own}.json`)).toBe("protected");
+	// Matched by what the receipt records, so it holds whoever owned it.
+	expect(await verdict([row, receipt("own")])).toBe("clear");
+	expect(await verdict([row, receipt("other")])).toBe("protected");
+	expect(await verdict([row, receipt("elsewhere")])).toBe("protected");
+	expect(await verdict([row, receipt("unreadable")])).toBe("protected");
+	expect(await verdict([{ ...row, id: "other-row" }])).toBe("protected");
+});
+
+describe("a creation receipt on disk, after the owner session was deleted", () => {
+	const receipts: string[] = [];
+	async function legacyReceipt(requestId: string) {
+		const directory = getNarraforkPath("worktree-requests");
+		await mkdir(directory, { recursive: true });
+		const file = join(directory, `${createHash("sha256").update(generateId()).digest("hex")}.json`);
+		receipts.push(file);
+		await writeFile(
+			file,
+			JSON.stringify({
+				proposalHash: "fixture",
+				request: { requestId, destinationPath: worktree },
+				repositoryKey: "retirement-repository",
+				deviceId: "local",
+				destination: worktree,
+				expectedHead: "",
+				dispatchState: "started",
+			}),
+		);
+		// Re-import the legacy namespace so the index holds this file as a claim.
+		sqlite.exec(`UPDATE resource_protection_sources SET complete = 0, cursor = NULL
+			WHERE source = 'receipt' AND source_id = ''`);
+		for (let batch = 0; batch < 8; batch++) {
+			await maintainProtectionIndex(performance.now() + 5000);
+			const state = sqlite
+				.query<{ complete: number }, []>(
+					"SELECT complete FROM resource_protection_sources WHERE source = 'receipt' AND source_id = ''",
+				)
+				.get();
+			if (state?.complete) return;
+		}
+		throw new Error("Receipt import did not complete");
+	}
+	afterEach(async () => {
+		for (const file of receipts.splice(0)) await rm(file, { force: true });
+		sqlite.exec(`DELETE FROM resource_protection_paths WHERE source = 'receipt';
+			DELETE FROM resource_protection_sources WHERE source = 'receipt' AND source_id != ''`);
+	});
+
+	test("its own receipt does not make the record unremovable", async () => {
+		const row = rowFor(worktree);
+		const createRequestId = db
+			.select({ id: narratorWorktreeResources.createRequestId })
+			.from(narratorWorktreeResources)
+			.where(eq(narratorWorktreeResources.id, row?.id ?? ""))
+			.get()?.id;
+		if (!createRequestId) throw new Error("Missing fixture record");
+		await legacyReceipt(createRequestId);
+		const result = await service.remove(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", path: worktree },
+			signal(),
+		);
+		expect(result).toMatchObject({ removed: true, record: "retired" });
+		expect(await exists(worktree)).toBe(false);
+	});
+
+	test("another request's receipt at the path refuses with its own honest code", async () => {
+		await legacyReceipt("some-other-request");
+		const refused = await refusal();
+		expect(refused.code).toBe("WORKTREE_RECEIPT_PROTECTED");
+		expect(refused.details).toEqual({ blockedBy: { kind: "receipt" } });
+		expect(await exists(worktree)).toBe(true);
+	});
 });

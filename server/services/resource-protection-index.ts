@@ -993,6 +993,43 @@ async function warnUnavailable(error: unknown): Promise<void> {
 	});
 	suppressedWarnings = 0;
 }
+/**
+ * The create request a receipt file records, for matching a retirement against the
+ * receipt of the resource it retires. Bounded like the index's own receipt read: no
+ * symlinks, at most one receipt-sized read, and null for anything unreadable or malformed
+ * (which then keeps protecting the path).
+ */
+export async function readReceiptRequestIdentity(
+	filePath: string,
+	deadline: number,
+): Promise<{ requestId: string; destination: string } | null> {
+	if (!isAbsolute(filePath) || filePath.length > 4096 || filePath.includes("\0")) return null;
+	let file: FileHandle;
+	try {
+		file = await bounded(open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW), deadline);
+	} catch {
+		return null;
+	}
+	try {
+		const stat = await bounded(file.stat(), deadline);
+		if (!stat.isFile() || stat.size > MAX_RECEIPT_BYTES) return null;
+		const buffer = Buffer.alloc(MAX_RECEIPT_BYTES + 1);
+		const { bytesRead } = await bounded(file.read(buffer, 0, buffer.length, 0), deadline);
+		if (bytesRead > MAX_RECEIPT_BYTES) return null;
+		const record: unknown = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+		if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+		const { request, destination } = record as { request?: unknown; destination?: unknown };
+		const requestId =
+			request && typeof request === "object" && !Array.isArray(request)
+				? (request as { requestId?: unknown }).requestId
+				: undefined;
+		return validText(requestId, 256) && validText(destination) ? { requestId, destination } : null;
+	} catch {
+		return null;
+	} finally {
+		await file.close().catch(() => {});
+	}
+}
 export async function readProtectionClaims(
 	targets: readonly LifecycleTarget[],
 	deadline: number,

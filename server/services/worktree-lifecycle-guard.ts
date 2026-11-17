@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
-import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 import { eq } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
@@ -12,6 +11,7 @@ import {
 	canonicalProtectionAdmissionPath as canonicalAdmissionPath,
 	canonicalProtectionPath as canonicalPath,
 	readProtectionClaims,
+	readReceiptRequestIdentity,
 } from "./resource-protection-index";
 import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 
@@ -24,14 +24,14 @@ export interface LifecycleTarget {
 	scopeProjectId?: string | null;
 	/**
 	 * This deletion retires exactly this `narrator_worktree_resources` row. Its own row,
-	 * and its own creation receipt (`retiringReceiptName`, at the identical path), are
-	 * inventory of the thing being removed rather than users of it, so they do not protect
-	 * it. Every other claim, including other receipts, nested registry rows and any
-	 * narrator cwd, still does.
+	 * and its own creation receipt (a receipt at the identical path whose recorded request
+	 * is `retiringCreateRequestId`), are inventory of the thing being removed rather than
+	 * users of it, so they do not protect it. Every other claim, including other receipts,
+	 * nested registry rows and any narrator cwd, still does.
 	 */
 	retiringRegistryId?: string;
-	/** File name of the row's creation receipt (owner narrator + create request). */
-	retiringReceiptName?: string;
+	/** The row's create request; matched against a receipt's content, not its owner. */
+	retiringCreateRequestId?: string;
 }
 export interface ResourceClaim extends LifecycleTarget {
 	kind: "registry" | "narrator" | "receipt";
@@ -189,6 +189,11 @@ export interface LifecycleGuardPorts {
 	/** Bounded lstat projection: device/inode only, never contents or a directory walk. */
 	pathIdentity?(path: string): Promise<string | null>;
 	probeGitRoot?(path: string, deadline: number): Promise<{ root: string; common: string } | null>;
+	/** Bounded read of the request a receipt records (claim id is the receipt file). */
+	receiptRequest?(
+		receiptId: string,
+		deadline: number,
+	): Promise<{ requestId: string; destination: string } | null>;
 }
 
 /** A shadow reference owns its hashed storage, never its historical logical cwd. */
@@ -284,6 +289,8 @@ const productionPorts: LifecycleGuardPorts & {
 	pathIdentity: (path) => (fixturePorts.getStore()?.pathIdentity ?? readPathIdentity)(path),
 	probeGitRoot: (path, deadline) =>
 		(fixturePorts.getStore()?.probeGitRoot ?? probeGitRoot)(path, deadline),
+	receiptRequest: (receiptId, deadline) =>
+		(fixturePorts.getStore()?.receiptRequest ?? readReceiptRequestIdentity)(receiptId, deadline),
 };
 async function boundedRead<T>(work: Promise<T>, deadline: number): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -558,16 +565,20 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				for (const target of normalized) {
 					if (!overlaps(target, canonical) && !(shadowPhysical && overlaps(target, shadowPhysical)))
 						continue;
+					if (claim.kind === "registry" && claim.id === target.retiringRegistryId) continue;
 					if (
-						target.retiringRegistryId &&
-						((claim.kind === "registry" && claim.id === target.retiringRegistryId) ||
-							(claim.kind === "receipt" &&
-								!!target.retiringReceiptName &&
-								!!target.path &&
-								canonical.path === target.path &&
-								basename(claim.id) === target.retiringReceiptName))
-					)
-						continue;
+						target.retiringCreateRequestId &&
+						claim.kind === "receipt" &&
+						target.path &&
+						canonical.path === target.path
+					) {
+						const recorded = await ports.receiptRequest?.(claim.id, deadline);
+						if (
+							recorded?.requestId === target.retiringCreateRequestId &&
+							(await ports.canonicalPath(recorded.destination).catch(() => null)) === target.path
+						)
+							continue;
+					}
 					// A repository-root cwd is not an owner of every linked worktree stored
 					// beneath it. This exception needs positive distinct Git-root evidence,
 					// never a path convention; durable inventories/receipts are never waived.
@@ -807,18 +818,8 @@ export interface RetiringWorktreeResource {
 	id: string;
 	deviceId: string;
 	worktreePath: string;
-	/** With the create request, names the creation receipt; null once the owner was deleted. */
-	ownerNarratorId: string | null;
+	/** Identifies the row's own creation receipt by content; survives the owner's deletion. */
 	createRequestId: string;
-}
-
-/** Same key as `FileWorktreeJournal`: sha256 of [narratorId, requestId]. */
-function creationReceiptName(resource: RetiringWorktreeResource): string | undefined {
-	if (!resource.ownerNarratorId) return undefined;
-	const key = createHash("sha256")
-		.update(JSON.stringify([resource.ownerNarratorId, resource.createRequestId]))
-		.digest("hex");
-	return `${key}.json`;
 }
 
 /**
@@ -852,7 +853,7 @@ export async function withWorktreeRetirement<T>(
 					deviceId: "local",
 					path: resource.worktreePath,
 					retiringRegistryId: resource.id,
-					retiringReceiptName: creationReceiptName(resource),
+					retiringCreateRequestId: resource.createRequestId,
 				},
 			],
 			"worktree remove",
@@ -873,14 +874,32 @@ export async function withWorktreeRetirement<T>(
 		)
 			throw error;
 		const claim = error.inspection.claims[0];
+		const blockedBy = claim
+			? { kind: claim.kind, id: claim.kind === "receipt" ? undefined : claim.id }
+			: null;
+		// Each blocker gets its own code: the person must know which kind of thing to resolve.
+		if (claim?.kind === "narrator")
+			throw new AppError(
+				"A session's working directory is inside this worktree; switch it elsewhere first",
+				409,
+				"WORKTREE_IN_USE",
+				undefined,
+				{ blockedBy },
+			);
+		if (claim?.kind === "receipt")
+			throw new AppError(
+				"Another worktree creation request is recorded for this path; it keeps the directory protected",
+				409,
+				"WORKTREE_RECEIPT_PROTECTED",
+				undefined,
+				{ blockedBy },
+			);
 		throw new AppError(
-			claim?.kind === "narrator"
-				? "A session's working directory is inside this worktree; switch it elsewhere first"
-				: "Another resource or operation is using this worktree",
+			"Another recorded worktree or a running operation overlaps this path",
 			409,
-			"WORKTREE_IN_USE",
+			"WORKTREE_RESOURCE_PROTECTED",
 			undefined,
-			{ blockedBy: claim ? { kind: claim.kind, id: claim.id } : null },
+			{ blockedBy },
 		);
 	}
 }
