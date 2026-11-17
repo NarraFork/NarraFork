@@ -72,6 +72,7 @@ import { opencodeRoutes } from "./routes/opencode";
 import { outlineRoutes } from "./routes/outline";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
+import { projectTeamRoutes } from "./routes/project-teams";
 import { projectRoutes } from "./routes/projects";
 import { promptLibraryRoutes } from "./routes/prompt-library";
 import { promptOptimizeRoutes } from "./routes/prompt-optimize";
@@ -455,6 +456,7 @@ app.use("/api/*", async (c, next) => {
 	throw catalogError("GIT_NOT_INSTALLED");
 });
 
+app.route("/api/projects", projectTeamRoutes);
 app.route("/api/projects", projectRoutes);
 app.route("/api/containers", containerRoutes);
 app.route("/api/chat", chatRoutes);

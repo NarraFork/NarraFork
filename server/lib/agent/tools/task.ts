@@ -348,7 +348,11 @@ export const agentTool: ToolDefinition = {
 				}
 				const label = agentLabelFromNarrator(narrator, ctx.narratorId);
 				const { interruptAndArchiveSubagent } = await import("@server/services/subagent-lifecycle");
-				const archived = await interruptAndArchiveSubagent(narrator.id);
+				// Agent control: a team coordinator's archive event names this agent.
+				const { runAsTeamStatusActor } = await import("@server/services/teams/team-records");
+				const archived = await runAsTeamStatusActor({ kind: "agent", id: ctx.narratorId }, () =>
+					interruptAndArchiveSubagent(narrator.id),
+				);
 				if (!archived.ok) {
 					return {
 						output: `Agent archive error: failed to archive "${raw.archive}" (${archived.error ?? "unknown"}).`,
@@ -409,7 +413,10 @@ export const agentTool: ToolDefinition = {
 						output: `Agent ${label} (${narrator.id}) is not archived (current status: ${narrator.status}).`,
 					};
 				}
-				await narratorService.updateStatus(narrator.id, "idle");
+				const { runAsTeamStatusActor } = await import("@server/services/teams/team-records");
+				await runAsTeamStatusActor({ kind: "agent", id: ctx.narratorId }, () =>
+					narratorService.updateStatus(narrator.id, "idle"),
+				);
 				return {
 					output:
 						`Agent ${label} (${narrator.id}) has been unarchived. ` +

@@ -1,0 +1,112 @@
+/**
+ * Project teams under `/api/projects/:projectId/teams` (docs/PROJECT_TEAMS-PLAN.md, P1).
+ *
+ * Access: listing and creating need the project (read / write); everything about one team
+ * follows its coordinator narrator's ACL — readers see it, writers (members) change it, others
+ * get 404. The whole surface is refused on PostgreSQL with 503 before any access check, like the
+ * narrator surface the team rides on and the project mutations.
+ */
+
+import type { TeamListResponse } from "@shared/project-teams";
+import { Hono } from "hono";
+import { ValidationError } from "../lib/errors";
+import { narratorPrincipalOf } from "../lib/narrator-access";
+import { requireProjectAccess } from "../lib/project-access";
+import {
+	createProjectTeamSchema,
+	listProjectTeamsQuerySchema,
+	updateProjectTeamSchema,
+} from "../lib/validators";
+import {
+	archiveTeam,
+	createTeam,
+	getTeam,
+	listProjectTeams,
+	unarchiveTeam,
+	updateTeam,
+} from "../services/teams/team-service";
+import { requireSqliteProjectMutation } from "./projects";
+
+export const projectTeamRoutes = new Hono();
+
+projectTeamRoutes.use("/:projectId/teams/*", async (_c, next) => {
+	requireSqliteProjectMutation("Project teams");
+	return next();
+});
+projectTeamRoutes.use("/:projectId/teams", async (_c, next) => {
+	requireSqliteProjectMutation("Project teams");
+	return next();
+});
+
+async function jsonBody(c: { req: { json: () => Promise<unknown> } }): Promise<unknown> {
+	try {
+		return await c.req.json();
+	} catch {
+		throw new ValidationError("Request body must be JSON");
+	}
+}
+
+projectTeamRoutes.get("/:projectId/teams", async (c) => {
+	const projectId = c.req.param("projectId");
+	await requireProjectAccess(c, projectId, "read");
+	const parsed = listProjectTeamsQuerySchema.safeParse({
+		status: c.req.query("status") ?? undefined,
+		limit: c.req.query("limit") ?? undefined,
+		cursor: c.req.query("cursor") ?? undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const result: TeamListResponse = await listProjectTeams(
+		projectId,
+		narratorPrincipalOf(c),
+		parsed.data,
+	);
+	return c.json(result);
+});
+
+projectTeamRoutes.post("/:projectId/teams", async (c) => {
+	const projectId = c.req.param("projectId");
+	await requireProjectAccess(c, projectId, "write");
+	const parsed = createProjectTeamSchema.safeParse(await jsonBody(c));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const team = await createTeam({ projectId, ...parsed.data }, narratorPrincipalOf(c));
+	return c.json(team, 201);
+});
+
+projectTeamRoutes.get("/:projectId/teams/:teamId", async (c) => {
+	const team = await getTeam(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+	);
+	return c.json(team);
+});
+
+projectTeamRoutes.patch("/:projectId/teams/:teamId", async (c) => {
+	const parsed = updateProjectTeamSchema.safeParse(await jsonBody(c));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const team = await updateTeam(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		parsed.data,
+		c.req.param("projectId"),
+	);
+	return c.json(team);
+});
+
+projectTeamRoutes.post("/:projectId/teams/:teamId/archive", async (c) => {
+	const team = await archiveTeam(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+	);
+	return c.json(team);
+});
+
+projectTeamRoutes.post("/:projectId/teams/:teamId/unarchive", async (c) => {
+	const team = await unarchiveTeam(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+	);
+	return c.json(team);
+});
