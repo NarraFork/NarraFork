@@ -225,6 +225,7 @@ function app(user: string, role: "user" | "admin" = "user") {
 interface Frame {
 	type: string;
 	code?: string;
+	message?: string;
 	terminalId?: string;
 	terminal?: { id: string };
 }
