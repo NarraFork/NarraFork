@@ -212,6 +212,10 @@ export async function branchUpstream(
  * losses as it has files, and ignored files are not losses. Records are NUL
  * separated; a rename or copy carries its original path as one extra field. When the
  * listing hits the cap the partial last record is dropped and `exact` is false.
+ *
+ * Blind spots, by Git's design: an edit to a file marked `--skip-worktree` or
+ * `--assume-unchanged` is not reported (Git does not look at it), and ignored files are
+ * never counted although deleting the directory deletes them.
  */
 export async function uncommittedChanges(
 	run: GitQueryRunner,

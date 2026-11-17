@@ -1851,43 +1851,21 @@ export class NarratorWorktreeService<Principal> {
 		return { target, resource };
 	}
 
-	/** Measure what removal would lose. Read-only; every Git call is bounded. */
+	/**
+	 * Measure what removal would lose. Read-only; every Git call is bounded.
+	 *
+	 * A commit counts as kept only when the main checkout's branch or the branch's own
+	 * upstream contains it. Neither can be chosen by the caller: a caller-chosen base could
+	 * name the branch being removed, or its tip, and make every commit look kept. A
+	 * detached main checkout gives no base; then only the upstream keeps anything.
+	 */
 	private async removalReport(
 		target: WorktreeTarget,
 		resource: RecordedWorktreeResource,
-		baseRef: string | undefined,
 		signal: AbortSignal,
-	): Promise<WorktreeRemovalReport> {
+	): Promise<{ report: WorktreeRemovalReport; mainCheckout: string | null; kept: string[] }> {
 		const root = target.workspace.rootPath ?? "";
 		const list = await this.entries(target, signal);
-		const index = list.entries.findIndex((entry) =>
-			target.backend?.paths.equals(entry.path, resource.worktreePath),
-		);
-		const entry = list.entries[index];
-		if (!entry)
-			error(
-				list.truncated ? "WORKTREE_LIST_TRUNCATED" : "WORKTREE_NOT_REGISTERED",
-				list.truncated
-					? "Cannot safely remove with an incomplete worktree list"
-					: "Git no longer lists this worktree; nothing was removed",
-				409,
-			);
-		// The first entry is the main checkout, which is never a removable worktree.
-		if (index === 0) error("WORKTREE_REMOVE_DENIED", "The main checkout cannot be removed", 403);
-		if (entry.locked)
-			error("WORKTREE_LOCKED", "This worktree is locked; unlock it in Git before removing", 409);
-		const rootRun = this.queryRunner(target, root, signal);
-		const baseName = baseRef ?? "HEAD";
-		validateRef(baseName);
-		const baseSha = await resolveCommit(rootRun, baseName);
-		if (!baseSha) error("WORKTREE_INVALID_BASE", "Base ref must resolve to a commit");
-		const head =
-			entry.head && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(entry.head) && !/^0+$/.test(entry.head)
-				? entry.head
-				: null;
-		const branch = entry.branch?.startsWith("refs/heads/")
-			? entry.branch.slice("refs/heads/".length)
-			: null;
 		const present = await lstat(resource.worktreePath).then(
 			() => true,
 			(cause) => {
@@ -1895,6 +1873,56 @@ export class NarratorWorktreeService<Principal> {
 				throw cause;
 			},
 		);
+		const index = list.entries.findIndex((entry) =>
+			target.backend?.paths.equals(entry.path, resource.worktreePath),
+		);
+		const entry = list.entries[index];
+		if (!entry) {
+			if (list.truncated)
+				error(
+					"WORKTREE_LIST_TRUNCATED",
+					"Cannot safely remove with an incomplete worktree list",
+					409,
+				);
+			// Git forgot it and the directory is gone: only the record is left to retire.
+			if (!present)
+				return {
+					report: {
+						path: resource.worktreePath,
+						branch: null,
+						head: null,
+						base: null,
+						upstream: null,
+						uncommittedFiles: 0,
+						uncommittedExact: true,
+						unmergedCommits: 0,
+						missing: true,
+						stale: true,
+					},
+					mainCheckout: null,
+					kept: [],
+				};
+			error(
+				"WORKTREE_NOT_REGISTERED",
+				"Git no longer lists this worktree but its directory exists; nothing was removed",
+				409,
+			);
+		}
+		// The first entry is the main checkout, which is never a removable worktree.
+		if (index === 0) error("WORKTREE_REMOVE_DENIED", "The main checkout cannot be removed", 403);
+		if (entry.locked)
+			error("WORKTREE_LOCKED", "This worktree is locked; unlock it in Git before removing", 409);
+		const rootRun = this.queryRunner(target, root, signal);
+		const head =
+			entry.head && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(entry.head) && !/^0+$/.test(entry.head)
+				? entry.head
+				: null;
+		const branchRef = entry.branch?.startsWith("refs/heads/") ? entry.branch : null;
+		const branch = branchRef ? branchRef.slice("refs/heads/".length) : null;
+		const main = list.entries[0];
+		const mainRef =
+			main?.branch?.startsWith("refs/heads/") && main.branch !== branchRef ? main.branch : null;
+		const mainSha = mainRef ? await resolveCommit(rootRun, mainRef) : null;
 		const missing = entry.prunable || !present;
 		const changes = missing
 			? { count: 0, exact: true }
@@ -1902,20 +1930,26 @@ export class NarratorWorktreeService<Principal> {
 					this.queryRunner(target, resource.worktreePath, signal),
 					GIT_UNCOMMITTED_LISTING_MAX_BYTES,
 				);
-		const upstream = branch ? await branchUpstream(rootRun, branch) : null;
-		const unmergedCommits = head
-			? await countCommitsNotIn(rootRun, head, upstream ? [baseSha, upstream.sha] : [baseSha])
-			: 0;
+		const configured = branch ? await branchUpstream(rootRun, branch) : null;
+		// An upstream that is the branch itself (`branch.<b>.remote = .`) proves nothing.
+		const upstream = configured && configured.ref !== branchRef ? configured : null;
+		const kept = [mainSha, upstream?.sha].filter((sha): sha is string => !!sha);
+		const unmergedCommits = head ? await countCommitsNotIn(rootRun, head, kept) : 0;
 		return {
-			path: resource.worktreePath,
-			branch,
-			head,
-			base: { ref: baseName, sha: baseSha },
-			upstream,
-			uncommittedFiles: changes.count,
-			uncommittedExact: changes.exact,
-			unmergedCommits,
-			missing,
+			report: {
+				path: resource.worktreePath,
+				branch,
+				head,
+				base: mainRef && mainSha ? { ref: mainRef, sha: mainSha } : null,
+				upstream,
+				uncommittedFiles: changes.count,
+				uncommittedExact: changes.exact,
+				unmergedCommits,
+				missing,
+				stale: false,
+			},
+			mainCheckout: mainRef && main ? main.path : null,
+			kept,
 		};
 	}
 
@@ -1935,7 +1969,7 @@ export class NarratorWorktreeService<Principal> {
 			"read",
 			signal,
 		);
-		return this.removalReport(target, resource, request.baseRef, signal);
+		return (await this.removalReport(target, resource, signal)).report;
 	}
 
 	/**
@@ -1971,7 +2005,7 @@ export class NarratorWorktreeService<Principal> {
 			withRetirement(
 				resource,
 				async (confirmRemoved) => {
-					const report = await this.removalReport(target, resource, request.baseRef, signal);
+					const { report, mainCheckout, kept } = await this.removalReport(target, resource, signal);
 					const loses =
 						report.uncommittedFiles > 0 || !report.uncommittedExact || report.unmergedCommits > 0;
 					const discard = request.discard;
@@ -1983,12 +2017,13 @@ export class NarratorWorktreeService<Principal> {
 							undefined,
 							{ report },
 						);
+					// The confirmation covers exactly the report the person saw, nothing more or less.
 					if (
 						loses &&
 						discard &&
 						(discard.head !== report.head ||
-							report.uncommittedFiles > discard.uncommittedFiles ||
-							report.unmergedCommits > discard.unmergedCommits)
+							discard.uncommittedFiles !== report.uncommittedFiles ||
+							discard.unmergedCommits !== report.unmergedCommits)
 					)
 						throw new AppError(
 							"The worktree changed after the confirmation; review the new report",
@@ -1998,18 +2033,24 @@ export class NarratorWorktreeService<Principal> {
 							{ report },
 						);
 					signal.throwIfAborted();
-					const removal = await this.run(
-						target,
-						["worktree", "remove", ...(loses ? ["--force"] : []), "--", resource.worktreePath],
-						signal,
-						true,
-					);
-					if (removal.exitCode !== 0)
-						error(
-							"WORKTREE_REMOVE_FAILED",
-							`git worktree remove failed: ${(removal.stderr || removal.stdout).trim().slice(0, 1024)}`,
-							409,
+					// Past this point the removal is dispatched: a client disconnect must not
+					// interrupt Git half way or leave the record behind a directory that is gone.
+					// The remaining steps finish under their own bound instead of the request.
+					const settle = AbortSignal.timeout(WORKTREE_CREATE_TIMEOUT_MS * 2);
+					if (!report.stale) {
+						const removal = await this.run(
+							target,
+							["worktree", "remove", ...(loses ? ["--force"] : []), "--", resource.worktreePath],
+							settle,
+							true,
 						);
+						if (removal.exitCode !== 0)
+							error(
+								"WORKTREE_REMOVE_FAILED",
+								`git worktree remove failed: ${(removal.stderr || removal.stdout).trim().slice(0, 1024)}`,
+								409,
+							);
+					}
 					const remains = await lstat(resource.worktreePath).then(
 						() => true,
 						(cause) => {
@@ -2033,9 +2074,10 @@ export class NarratorWorktreeService<Principal> {
 									target,
 									report.branch,
 									report.head,
-									report.base.sha,
+									mainCheckout,
+									kept,
 									loses && report.unmergedCommits > 0,
-									signal,
+									settle,
 								)
 							: null;
 					logger.info("Narrator worktree removed", {
@@ -2059,17 +2101,20 @@ export class NarratorWorktreeService<Principal> {
 	}
 
 	/**
-	 * `git branch -d` first: Git itself confirms the branch is merged into HEAD or its
-	 * upstream. Otherwise delete only when is-ancestor proves the tip is in the base, or
-	 * when a person confirmed discarding its unmerged commits; both delete with a
-	 * compare-and-delete `update-ref` on the reported tip, so a branch that moved since
-	 * the report is kept. A branch checked out anywhere is never deleted.
+	 * `git branch -d`, run in the main checkout, first: Git itself confirms the branch is
+	 * merged into that branch or the upstream. Otherwise delete only when is-ancestor proves
+	 * the tip is in one of the same kept commits, or when a person confirmed discarding its
+	 * unmerged commits; both delete with a compare-and-delete `update-ref` on the reported
+	 * tip, so a branch that moved since the report is kept. A branch checked out anywhere is
+	 * never deleted. Errors never propagate: the worktree is already gone, so a kept branch
+	 * is reported, not thrown.
 	 */
 	private async deleteRemovedBranch(
 		target: WorktreeTarget,
 		name: string,
 		tip: string,
-		base: string,
+		mainCheckout: string | null,
+		kept: readonly string[],
 		discardConfirmed: boolean,
 		signal: AbortSignal,
 	): Promise<NonNullable<WorktreeRemoveResult["branch"]>> {
@@ -2083,17 +2128,28 @@ export class NarratorWorktreeService<Principal> {
 			const ref = `refs/heads/${name}`;
 			const valid = await this.run(target, ["check-ref-format", ref], signal);
 			if (valid.exitCode !== 0) return failed("WORKTREE_INVALID_BRANCH", "Invalid Git branch name");
-			const merged = await this.run(target, ["branch", "-d", "--", name], signal, true);
-			if (merged.exitCode === 0) return { name, deleted: true, method: "merged" as const };
-			const contained = await isAncestor(
-				this.queryRunner(target, target.workspace.rootPath ?? "", signal),
-				tip,
-				base,
-			).catch(() => false);
+			// Only where HEAD is the main branch does `-d` mean "merged into the main branch".
+			const merged = mainCheckout
+				? await this.run(
+						{ ...target, workspace: { ...target.workspace, rootPath: mainCheckout } },
+						["branch", "-d", "--", name],
+						signal,
+						true,
+					)
+				: null;
+			if (merged?.exitCode === 0) return { name, deleted: true, method: "merged" as const };
+			const rootRun = this.queryRunner(target, target.workspace.rootPath ?? "", signal);
+			let contained = false;
+			for (const sha of kept) {
+				if (sha === tip || (await isAncestor(rootRun, tip, sha).catch(() => false))) {
+					contained = true;
+					break;
+				}
+			}
 			if (!contained && !discardConfirmed)
 				return failed(
 					"WORKTREE_BRANCH_NOT_MERGED",
-					(merged.stderr || "The branch is not fully merged").trim(),
+					(merged?.stderr || "The branch is not fully merged").trim(),
 				);
 			const list = await this.entries(target, signal);
 			if (list.truncated || list.entries.some((entry) => entry.branch === ref))
@@ -2112,7 +2168,6 @@ export class NarratorWorktreeService<Principal> {
 				method: contained ? ("contained" as const) : ("forced" as const),
 			};
 		} catch (cause) {
-			signal.throwIfAborted();
 			return failed(
 				cause instanceof AppError ? cause.code : "WORKTREE_BRANCH_DELETE_FAILED",
 				cause instanceof Error ? cause.message : "Branch deletion failed",

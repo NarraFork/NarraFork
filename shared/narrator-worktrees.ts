@@ -85,8 +85,6 @@ export interface WorktreeRemovalQuery {
 	workspaceKey: string;
 	/** Exact path from the worktree list; it must have a resource record. */
 	path: string;
-	/** Commits are "kept" when reachable from this ref or the branch upstream. Default HEAD. */
-	baseRef?: string;
 }
 /** What removing a worktree would lose, measured right now. */
 export interface WorktreeRemovalReport {
@@ -94,9 +92,18 @@ export interface WorktreeRemovalReport {
 	/** Short branch name; null for a detached checkout. */
 	branch: string | null;
 	head: string | null;
-	base: { ref: string; sha: string };
+	/**
+	 * The main checkout's branch. Commits it contains are kept. Null when the main
+	 * checkout is detached: then only the upstream keeps anything. Never caller-chosen.
+	 */
+	base: { ref: string; sha: string } | null;
+	/** The branch's own upstream (never the branch itself). Commits it contains are kept. */
 	upstream: { ref: string; sha: string } | null;
-	/** Uncommitted (changed, staged or untracked, not ignored) paths. */
+	/**
+	 * Uncommitted (changed, staged or untracked) paths. Ignored files are not counted but
+	 * are deleted with the directory; edits hidden by skip-worktree/assume-unchanged are
+	 * invisible to Git and not counted either.
+	 */
 	uncommittedFiles: number;
 	/** False when the count is a lower bound (listing cap reached). */
 	uncommittedExact: boolean;
@@ -104,6 +111,8 @@ export interface WorktreeRemovalReport {
 	unmergedCommits: number;
 	/** The checkout directory is already gone; only Git's entry remains. */
 	missing: boolean;
+	/** Git no longer lists it and the directory is gone: removal only retires the record. */
+	stale: boolean;
 }
 /**
  * A person's confirmation that the loss in a report may be discarded. It is only valid
@@ -115,7 +124,7 @@ export interface WorktreeRemovalDiscard {
 	unmergedCommits: number;
 }
 export interface WorktreeRemoveRequest extends WorktreeRemovalQuery {
-	/** Also delete the branch: only when Git or is-ancestor proves it merged, or `discard`. */
+	/** Also delete the branch: only when Git or is-ancestor proves it kept, or `discard`. */
 	deleteBranch?: boolean;
 	discard?: WorktreeRemovalDiscard;
 }
@@ -128,7 +137,7 @@ export interface WorktreeRemoveResult {
 	branch: {
 		name: string;
 		deleted: boolean;
-		/** merged: `git branch -d`; contained: tip is in the base; forced: confirmed discard. */
+		/** merged: `git branch -d`; contained: tip is in the base or upstream; forced: discard. */
 		method?: "merged" | "contained" | "forced";
 		error?: { code: string; message: string };
 	} | null;

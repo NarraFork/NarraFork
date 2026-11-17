@@ -52,12 +52,13 @@ const removed: WorktreeRemoveResult = {
 		path: "/repo/.worktrees/fix",
 		branch: "fix",
 		head: "a".repeat(40),
-		base: { ref: "HEAD", sha: "b".repeat(40) },
+		base: { ref: "refs/heads/main", sha: "b".repeat(40) },
 		upstream: null,
 		uncommittedFiles: 0,
 		uncommittedExact: true,
 		unmergedCommits: 0,
 		missing: false,
+		stale: false,
 	},
 };
 let requests: WorktreeCreateRequest[];
@@ -537,7 +538,6 @@ describe("RemoveWorktree", () => {
 		const schema = resolveToolJsonSchema(toolOf("RemoveWorktree"));
 		expect(schema.required).toEqual(["path"]);
 		expect(Object.keys(schema.properties as object).sort()).toEqual([
-			"baseRef",
 			"deleteBranch",
 			"discard",
 			"path",
@@ -552,6 +552,10 @@ describe("RemoveWorktree", () => {
 		]);
 		expect(output.data.nextAction).toContain("branch was kept");
 		expect((await execute("RemoveWorktree", { path: "/x", workspaceKey: "other" })).isError).toBe(
+			true,
+		);
+		// What counts as kept is never the model's choice.
+		expect((await execute("RemoveWorktree", { path: "/x", baseRef: "feature" })).isError).toBe(
 			true,
 		);
 		expect(removals).toHaveLength(1);

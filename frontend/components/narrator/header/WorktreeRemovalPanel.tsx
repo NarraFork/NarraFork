@@ -6,6 +6,7 @@ import type {
 	WorktreeRemoveResult,
 } from "@shared/narrator-worktrees";
 import { useQuery } from "@tanstack/react-query";
+import type { TFunction } from "i18next";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { worktreeDirectoryLabel, worktreeLabel } from "./worktree-list-view";
@@ -26,6 +27,21 @@ export function removalLoses(report: WorktreeRemovalReport): boolean {
 
 function shortRef(ref: string): string {
 	return ref.replace(/^refs\/(?:heads|remotes)\//, "");
+}
+
+/** Names what would have kept the commits: the main branch, the upstream, both or neither. */
+function unmergedText(report: WorktreeRemovalReport, t: TFunction<"narrator">) {
+	const count = report.unmergedCommits;
+	if (report.base && report.upstream)
+		return t("worktree.removeUnmergedWithUpstream", {
+			count,
+			base: shortRef(report.base.ref),
+			upstream: shortRef(report.upstream.ref),
+		});
+	if (report.base) return t("worktree.removeUnmerged", { count, base: shortRef(report.base.ref) });
+	if (report.upstream)
+		return t("worktree.removeUnmerged", { count, base: shortRef(report.upstream.ref) });
+	return t("worktree.removeUnmergedNowhere", { count });
 }
 
 /**
@@ -134,20 +150,7 @@ export function WorktreeRemovalPanel({
 								)}
 							</List.Item>
 						)}
-						{report.unmergedCommits > 0 && (
-							<List.Item>
-								{report.upstream
-									? t("worktree.removeUnmergedWithUpstream", {
-											count: report.unmergedCommits,
-											base: report.base.ref,
-											upstream: shortRef(report.upstream.ref),
-										})
-									: t("worktree.removeUnmerged", {
-											count: report.unmergedCommits,
-											base: report.base.ref,
-										})}
-							</List.Item>
-						)}
+						{report.unmergedCommits > 0 && <List.Item>{unmergedText(report, t)}</List.Item>}
 					</List>
 					<Checkbox
 						mt="sm"
@@ -160,7 +163,12 @@ export function WorktreeRemovalPanel({
 			)}
 			{report?.missing && (
 				<Text size="xs" c="dimmed">
-					{t("worktree.removeMissing")}
+					{t(report.stale ? "worktree.removeStale" : "worktree.removeMissing")}
+				</Text>
+			)}
+			{report && !report.missing && (
+				<Text size="xs" c="dimmed">
+					{t("worktree.removeIgnoredNote")}
 				</Text>
 			)}
 			{report?.branch && (

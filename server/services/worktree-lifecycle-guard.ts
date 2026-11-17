@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
-import { dirname, isAbsolute, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
 import { eq } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
@@ -23,11 +24,14 @@ export interface LifecycleTarget {
 	scopeProjectId?: string | null;
 	/**
 	 * This deletion retires exactly this `narrator_worktree_resources` row. Its own row,
-	 * and creation receipts for the identical path, are inventory of the thing being
-	 * removed rather than users of it, so they do not protect it. Every other claim,
-	 * including nested registry rows and any narrator cwd, still does.
+	 * and its own creation receipt (`retiringReceiptName`, at the identical path), are
+	 * inventory of the thing being removed rather than users of it, so they do not protect
+	 * it. Every other claim, including other receipts, nested registry rows and any
+	 * narrator cwd, still does.
 	 */
 	retiringRegistryId?: string;
+	/** File name of the row's creation receipt (owner narrator + create request). */
+	retiringReceiptName?: string;
 }
 export interface ResourceClaim extends LifecycleTarget {
 	kind: "registry" | "narrator" | "receipt";
@@ -557,7 +561,11 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 					if (
 						target.retiringRegistryId &&
 						((claim.kind === "registry" && claim.id === target.retiringRegistryId) ||
-							(claim.kind === "receipt" && !!target.path && canonical.path === target.path))
+							(claim.kind === "receipt" &&
+								!!target.retiringReceiptName &&
+								!!target.path &&
+								canonical.path === target.path &&
+								basename(claim.id) === target.retiringReceiptName))
 					)
 						continue;
 					// A repository-root cwd is not an owner of every linked worktree stored
@@ -799,6 +807,18 @@ export interface RetiringWorktreeResource {
 	id: string;
 	deviceId: string;
 	worktreePath: string;
+	/** With the create request, names the creation receipt; null once the owner was deleted. */
+	ownerNarratorId: string | null;
+	createRequestId: string;
+}
+
+/** Same key as `FileWorktreeJournal`: sha256 of [narratorId, requestId]. */
+function creationReceiptName(resource: RetiringWorktreeResource): string | undefined {
+	if (!resource.ownerNarratorId) return undefined;
+	const key = createHash("sha256")
+		.update(JSON.stringify([resource.ownerNarratorId, resource.createRequestId]))
+		.digest("hex");
+	return `${key}.json`;
 }
 
 /**
@@ -827,7 +847,14 @@ export async function withWorktreeRetirement<T>(
 	let admitted = false;
 	try {
 		return await guard.withProtectionReservation(
-			[{ deviceId: "local", path: resource.worktreePath, retiringRegistryId: resource.id }],
+			[
+				{
+					deviceId: "local",
+					path: resource.worktreePath,
+					retiringRegistryId: resource.id,
+					retiringReceiptName: creationReceiptName(resource),
+				},
+			],
 			"worktree remove",
 			async () => {
 				const blocker = await worktreeRetirementBlocker(resource);

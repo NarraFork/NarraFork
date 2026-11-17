@@ -18,7 +18,12 @@ import { FileWorktreeJournal } from "./narrator-worktree-journal";
 import { worktreeResourceId } from "./narrator-worktree-resource-store";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
 import { NarratorWorktreeService, type WorktreeTarget } from "./narrator-worktree-service";
-import { withWorktreeRetirement } from "./worktree-lifecycle-guard";
+import {
+	inspect,
+	type ResourceClaim,
+	withLifecycleGuardPorts,
+	withWorktreeRetirement,
+} from "./worktree-lifecycle-guard";
 
 let temporary: string;
 let source: string;
@@ -205,4 +210,36 @@ test("a .worktrees directory without a record is refused before anything inspect
 	const refused = await refusal(legacy);
 	expect(refused.code).toBe("WORKTREE_NOT_RECORDED");
 	expect(await exists(join(legacy, "chapter.txt"))).toBe(true);
+});
+
+test("only the retired row and its own creation receipt are waived", async () => {
+	const path = "/fixture/repo/.worktrees/task";
+	const own = "a".repeat(64);
+	const verdict = (claims: ResourceClaim[], retiringReceiptName?: string) =>
+		withLifecycleGuardPorts(
+			{
+				canonicalPath: async (value) => value,
+				readClaims: async () => ({ complete: true, claims }),
+			},
+			async () =>
+				(
+					await inspect(
+						[{ deviceId: "local", path, retiringRegistryId: "row", retiringReceiptName }],
+						"worktree remove",
+					)
+				).status,
+		);
+	const row: ResourceClaim = { kind: "registry", id: "row", deviceId: "local", path };
+	const receipt = (name: string): ResourceClaim => ({
+		kind: "receipt",
+		id: `/journal/${name}.json`,
+		deviceId: "local",
+		path,
+		repositoryKey: "r",
+	});
+	expect(await verdict([row, receipt(own)], `${own}.json`)).toBe("clear");
+	// Another request's receipt at the same path, or an unknown owner, still protects it.
+	expect(await verdict([row, receipt("b".repeat(64))], `${own}.json`)).toBe("protected");
+	expect(await verdict([row, receipt(own)])).toBe("protected");
+	expect(await verdict([{ ...row, id: "other-row" }], `${own}.json`)).toBe("protected");
 });

@@ -94,12 +94,13 @@ const cleanReport: WorktreeRemovalReport = {
 	path: "/repo/.worktrees/task",
 	branch: "task",
 	head: "a".repeat(40),
-	base: { ref: "HEAD", sha: "b".repeat(40) },
+	base: { ref: "refs/heads/main", sha: "b".repeat(40) },
 	upstream: null,
 	uncommittedFiles: 0,
 	uncommittedExact: true,
 	unmergedCommits: 0,
 	missing: false,
+	stale: false,
 };
 let removalReport: WorktreeRemovalReport = cleanReport;
 let removeFailure: Error | null = null;
@@ -921,6 +922,8 @@ test("a clean worktree is removed without a discard and the list restarts", asyn
 	await click("worktree.switch");
 	await click("worktree.remove: task");
 	expect(container.textContent).toContain("worktree.removeNothingLost");
+	// "Nothing lost" never hides that ignored files go with the directory.
+	expect(container.textContent).toContain("worktree.removeIgnoredNote");
 	expect(buttonByLabel("worktree.removeAcknowledge")).toBeUndefined();
 	await click("worktree.removeDeleteBranch");
 	const resets = resetQueries.mock.calls.length;
@@ -984,4 +987,25 @@ test("a protected worktree shows the in-use explanation and stays listed", async
 	await click("worktree.removeCancel");
 	expect(buttonByLabel("worktree.removeConfirm")).toBeUndefined();
 	expect(removeButtons()).toEqual(["worktree.remove: task"]);
+});
+
+test("a stale record and a detached main checkout are described, not hidden", async () => {
+	canDelete = true;
+	listEntries = removalEntries();
+	removalReport = {
+		...cleanReport,
+		branch: null,
+		head: null,
+		base: null,
+		missing: true,
+		stale: true,
+	};
+	await click("worktree.switch");
+	await click("worktree.remove: task");
+	expect(container.textContent).toContain("worktree.removeStale");
+	expect(container.textContent).not.toContain("worktree.removeIgnoredNote");
+	await click("worktree.removeCancel");
+	removalReport = { ...cleanReport, base: null, unmergedCommits: 4 };
+	await click("worktree.remove: task");
+	expect(container.textContent).toContain("worktree.removeUnmergedNowhere");
 });

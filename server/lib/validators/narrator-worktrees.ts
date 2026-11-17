@@ -51,9 +51,9 @@ export const worktreePrepareSchema = z
 	);
 export type WorktreeCreateRequest = z.infer<typeof worktreeCreateSchema>;
 const worktreeRemovalPath = z.string().min(1).max(4096);
-const worktreeRemovalBaseRef = z.string().min(1).max(256);
+/** No base ref: what counts as kept is never the caller's choice. */
 export const worktreeRemovalQuerySchema = z
-	.object({ workspaceKey, path: worktreeRemovalPath, baseRef: worktreeRemovalBaseRef.optional() })
+	.object({ workspaceKey, path: worktreeRemovalPath })
 	.strict();
 export const worktreeRemovalDiscardSchema = z
 	.object({

@@ -242,21 +242,173 @@ describe("recorded worktree removal", () => {
 		expect(await git(["branch", "--list", "merged"])).toBe("");
 	});
 
-	test("when git branch -d refuses, only an is-ancestor proof against the base deletes", async () => {
+	test("when git branch -d refuses, an is-ancestor proof against the main branch deletes", async () => {
 		const path = await recordedWorktree("released");
-		const tip = await commitIn(path, "r.txt", "1\n");
-		await git(["branch", "release", tip]);
-		// HEAD (main) lacks the commit, so Git refuses `-d`; the chosen base contains it.
+		const fork = await git(["rev-parse", "HEAD"]);
+		await commitIn(path, "r.txt", "1\n");
+		await git(["merge", "-q", "--ff-only", "released"]);
+		// A stale upstream makes Git judge `-d` against it and refuse; main contains the tip.
+		await git(["remote", "add", "origin", join(temporary, "unused-remote")]);
+		await git(["update-ref", "refs/remotes/origin/released", fork]);
+		await git(["branch", "--set-upstream-to=origin/released", "released"]);
 		const result = await service.remove(
 			"actor",
 			"narrator",
-			removal(path, { deleteBranch: true, baseRef: "release" }),
+			removal(path, { deleteBranch: true }),
 			signal(),
 		);
+		expect(result.report.base?.ref).toBe("refs/heads/main");
 		expect(result.report.unmergedCommits).toBe(0);
 		expect(result.branch).toEqual({ name: "released", deleted: true, method: "contained" });
 		expect(await git(["branch", "--list", "released"])).toBe("");
 		expect(await git(["config", "--get-regexp", "^branch\\.released\\."]).catch(() => "")).toBe("");
+	});
+
+	test("the caller cannot choose what counts as kept: no baseRef, and the branch never keeps itself", async () => {
+		const path = await recordedWorktree("feat");
+		const tip = await commitIn(path, "a.txt", "1\n");
+		for (const baseRef of ["feat", tip, "refs/heads/feat", "HEAD"]) {
+			for (const call of [
+				service.inspectRemoval("actor", "narrator", removal(path, { baseRef }), signal()),
+				service.remove(
+					"actor",
+					"narrator",
+					removal(path, { baseRef, deleteBranch: true }),
+					signal(),
+				),
+			])
+				expect((await rejection(call)).name).toBe("ZodError");
+		}
+		// An upstream that is the branch itself is not evidence either.
+		await git(["config", "branch.feat.remote", "."]);
+		await git(["config", "branch.feat.merge", "refs/heads/feat"]);
+		const report = await service.inspectRemoval("actor", "narrator", removal(path), signal());
+		expect(report).toMatchObject({ unmergedCommits: 1, upstream: null });
+		expect(report.base?.ref).toBe("refs/heads/main");
+		const refused = await rejection(
+			service.remove("actor", "narrator", removal(path, { deleteBranch: true }), signal()),
+		);
+		expect(refused.code).toBe("WORKTREE_REMOVAL_WOULD_LOSE_WORK");
+		expect(await git(["rev-parse", "feat"])).toBe(tip);
+		expect(await exists(path)).toBe(true);
+	});
+
+	test("kept means the main checkout's branch even when the session works elsewhere", async () => {
+		const other = await recordedWorktree("other");
+		const path = await recordedWorktree("task");
+		const tip = await commitIn(path, "t.txt", "1\n");
+		// The session's checkout contains the commit; the main branch does not.
+		await git(["merge", "-q", "--ff-only", "task"], other);
+		target.workspace.rootPath = other;
+		target.workspace.cwd = other;
+		// A sibling of the session's checkout needs the same explicit grant as creation.
+		ports.authorizeDestination = async () => {};
+		const report = await service.inspectRemoval("actor", "narrator", removal(path), signal());
+		expect(report.base?.ref).toBe("refs/heads/main");
+		expect(report.unmergedCommits).toBe(1);
+		const result = await service.remove(
+			"actor",
+			"narrator",
+			removal(path, {
+				deleteBranch: true,
+				discard: { head: tip, uncommittedFiles: 0, unmergedCommits: 1 },
+			}),
+			signal(),
+		);
+		expect(result.branch).toMatchObject({ name: "task", deleted: true, method: "forced" });
+	});
+
+	test("a detached main checkout keeps nothing; only the upstream can", async () => {
+		const path = await recordedWorktree("detached-main");
+		await git(["checkout", "-q", "--detach"]);
+		const report = await service.inspectRemoval("actor", "narrator", removal(path), signal());
+		expect(report.base).toBeNull();
+		expect(report.unmergedCommits).toBeGreaterThan(0);
+	});
+
+	test("a discard must equal the current report; inflated counts are refused", async () => {
+		const path = await recordedWorktree("inflated");
+		const tip = await commitIn(path, "a.txt", "1\n");
+		await writeFile(join(path, "x.txt"), "x\n");
+		for (const discard of [
+			{ head: tip, uncommittedFiles: 999999, unmergedCommits: 999999 },
+			{ head: tip, uncommittedFiles: 1, unmergedCommits: 2 },
+			{ head: tip, uncommittedFiles: 0, unmergedCommits: 1 },
+		]) {
+			const refused = await rejection(
+				service.remove("actor", "narrator", removal(path, { discard }), signal()),
+			);
+			expect(refused.code).toBe("WORKTREE_REMOVAL_CHANGED");
+		}
+		expect(await exists(path)).toBe(true);
+		const result = await service.remove(
+			"actor",
+			"narrator",
+			removal(path, { discard: { head: tip, uncommittedFiles: 1, unmergedCommits: 1 } }),
+			signal(),
+		);
+		expect(result.removed).toBe(true);
+	});
+
+	test("ignored files are not counted (and are deleted); skip-worktree edits are invisible", async () => {
+		const path = await recordedWorktree("ignored");
+		await writeFile(join(path, ".gitignore"), ".env\n");
+		await git(["add", ".gitignore"], path);
+		await git(["-c", "user.name=F", "-c", "user.email=f@e.t", "commit", "-qm", "ig"], path);
+		await git(["merge", "-q", "--ff-only", "ignored"]);
+		await writeFile(join(path, ".env"), "SECRET=1\n");
+		await git(["update-index", "--skip-worktree", "tracked.txt"], path);
+		await writeFile(join(path, "tracked.txt"), "hidden edit\n");
+		// Documented blind spots: the report says nothing is lost, and the UI says ignored
+		// files go with the directory.
+		const report = await service.inspectRemoval("actor", "narrator", removal(path), signal());
+		expect(report).toMatchObject({ uncommittedFiles: 0, unmergedCommits: 0, stale: false });
+	});
+
+	test("a cancelled request still finishes once Git was dispatched: no stale record", async () => {
+		const path = await recordedWorktree("cancelled");
+		const controller = new AbortController();
+		const run = ports.runGit;
+		ports.runGit = async (workspace, args, abort, writing) => {
+			const result = await safeSpawn({
+				cmd: ["git", "--no-optional-locks", "-C", workspace.workspace.rootPath ?? "", ...args],
+				timeout: writing ? 10_000 : 5000,
+				maxOutputBytes: WORKTREE_MAX_OUTPUT_BYTES,
+				signal: abort,
+			});
+			// The client goes away while Git removes the worktree.
+			if (args[0] === "worktree" && args[1] === "remove") controller.abort();
+			return result;
+		};
+		expect(run).toBeUndefined();
+		const result = await service.remove(
+			"actor",
+			"narrator",
+			removal(path, { deleteBranch: true }),
+			controller.signal,
+		);
+		expect(result).toMatchObject({ removed: true, record: "retired" });
+		expect(result.branch).toMatchObject({ name: "cancelled", deleted: true });
+		expect(await exists(path)).toBe(false);
+		expect(rows.size).toBe(0);
+	});
+
+	test("a record whose Git entry and directory are both gone is retired", async () => {
+		const path = await recordedWorktree("forgotten");
+		await git(["worktree", "remove", path]);
+		const report = await service.inspectRemoval("actor", "narrator", removal(path), signal());
+		expect(report).toMatchObject({ stale: true, missing: true, branch: null, head: null });
+		const result = await service.remove("actor", "narrator", removal(path), signal());
+		expect(result).toMatchObject({ removed: true, record: "retired", branch: null });
+		expect(rows.size).toBe(0);
+		// A directory Git forgot but that still exists is not the record's to delete.
+		const kept = await recordedWorktree("kept-dir");
+		await git(["worktree", "remove", kept]);
+		await mkdir(kept);
+		await writeFile(join(kept, "mine.txt"), "x\n");
+		const refused = await rejection(service.remove("actor", "narrator", removal(kept), signal()));
+		expect(refused.code).toBe("WORKTREE_NOT_REGISTERED");
+		expect(await exists(join(kept, "mine.txt"))).toBe(true);
 	});
 
 	test("a pushed but unmerged branch is removed without force; git -d follows its upstream", async () => {

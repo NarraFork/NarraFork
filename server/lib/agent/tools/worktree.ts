@@ -209,15 +209,7 @@ export const removeWorktreeParameters = z.strictObject({
 		.boolean()
 		.optional()
 		.describe(
-			"Also delete its branch. Git must confirm it is merged (git branch -d), or the tip must be contained in baseRef; otherwise the branch is kept and reported.",
-		),
-	baseRef: z
-		.string()
-		.min(1)
-		.max(256)
-		.optional()
-		.describe(
-			"Commits reachable from this ref or from the branch's upstream count as kept. Defaults to HEAD of the current checkout.",
+			"Also delete its branch. Only when Git confirms it is merged into the main checkout's branch or its upstream; otherwise the branch is kept and reported.",
 		),
 	discard: z
 		.strictObject({
@@ -291,7 +283,7 @@ export function createAgentWorktreeTools<Principal>(
 			name: "RemoveWorktree",
 			parameters: removeWorktreeParameters,
 			description:
-				"Remove a worktree NarraFork created (ListWorktrees shows recorded: true): deletes its directory and record, and its branch only when deleteBranch is set and the branch is merged. Refused while any session's working directory or a running terminal is inside it. Refused when it has uncommitted files or commits that neither baseRef (default HEAD) nor the branch upstream contains: the error carries a report of what would be lost. Tell the user; only if they explicitly agree, call again with discard copied from that report. Always asks the user for approval. Never removes directories without a record and never prunes other worktrees.",
+				"Remove a worktree NarraFork created (ListWorktrees shows recorded: true): deletes its directory and record, and its branch only when deleteBranch is set and the branch is merged. Refused while any session's working directory or a running terminal is inside it. Refused when it has uncommitted files or commits that neither the main checkout's branch nor the branch upstream contains: the error carries a report of what would be lost. Tell the user; only if they explicitly agree, call again with discard copied from that report. Always asks the user for approval. Never removes directories without a record and never prunes other worktrees.",
 		},
 		{
 			name: "GetWorktreeOperation",
