@@ -22,12 +22,14 @@ import {
 	TextInput,
 	Tooltip,
 } from "@mantine/core";
-import { IconGitFork, IconSwitchHorizontal } from "@tabler/icons-react";
+import type { WorktreeEntry, WorktreeRemoveResult } from "@shared/narrator-worktrees";
+import { IconGitFork, IconSwitchHorizontal, IconTrash } from "@tabler/icons-react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { nanoid } from "nanoid";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
+import { WorktreeRemovalPanel } from "./WorktreeRemovalPanel";
 import { type WorktreeDraft, WorktreeFlow, type WorktreeFlowState } from "./worktree-flow";
 import { type WorktreeSort, worktreeDirectoryLabel, worktreeLabel } from "./worktree-list-view";
 import {
@@ -257,6 +259,8 @@ function ScopedWorktreeControls({
 		if (attempt.flow.state.unknown) void attempt.flow.reconcile();
 	};
 	const [menuOpened, setMenuOpened] = useState(false);
+	const [removalTarget, setRemovalTarget] = useState<WorktreeEntry | null>(null);
+	const [removalNotice, setRemovalNotice] = useState<string>();
 	const [search, setSearch] = useState("");
 	const [sort, setSort] = useState<WorktreeSort>("lastCommitAt");
 	const [descending, setDescending] = useState(true);
@@ -393,6 +397,28 @@ function ScopedWorktreeControls({
 		timestamp == null || !Number.isFinite(timestamp)
 			? t("worktree.unknownTime")
 			: formatLocaleDateTime(timestamp);
+	const canRemove = firstPage?.capabilities.delete === true && !!context?.git?.workspaceKey;
+	const closeList = () => {
+		setMenuOpened(false);
+		setRemovalTarget(null);
+	};
+	const onRemoved = (result: WorktreeRemoveResult) => {
+		setRemovalTarget(null);
+		const branch = result.branch;
+		setRemovalNotice(
+			[
+				branch?.deleted
+					? t("worktree.removedWithBranch", { branch: branch.name })
+					: branch
+						? t("worktree.removedBranchKept", { branch: branch.name })
+						: t("worktree.removed"),
+				result.record === "retained" ? t("worktree.removedRecordRetained") : "",
+			]
+				.filter(Boolean)
+				.join(" "),
+		);
+		void queryClient.resetQueries({ queryKey: listKey, exact: true });
+	};
 	const pendingLimit = pendingReceipts.current.size >= RECEIPT_SCOPE_LIMIT;
 	const canCreate =
 		canSwitch &&
@@ -442,6 +468,7 @@ function ScopedWorktreeControls({
 						disabled={(!canSwitch && !canInspect) || switchMutation.isPending || state.busy}
 						onClick={() => {
 							setSearch("");
+							setRemovalNotice(undefined);
 							setMenuOpened(true);
 							// Reopening refreshes from page one, never replaying all saved cursors.
 							if (canList && debouncedSearch === "" && !worktrees.isFetching && !cursorExpired)
@@ -451,13 +478,18 @@ function ScopedWorktreeControls({
 						<IconSwitchHorizontal size={15} />
 					</ActionIcon>
 				</Tooltip>
-				<Modal
-					opened={menuOpened}
-					onClose={() => setMenuOpened(false)}
-					title={t("worktree.switch")}
-					size="lg"
-				>
-					<Stack gap="sm">
+				<Modal opened={menuOpened} onClose={closeList} title={t("worktree.switch")} size="lg">
+					{removalTarget && context?.git?.workspaceKey ? (
+						<WorktreeRemovalPanel
+							key={removalTarget.path}
+							narratorId={narratorId}
+							workspaceKey={context.git.workspaceKey}
+							entry={removalTarget}
+							onClose={() => setRemovalTarget(null)}
+							onRemoved={onRemoved}
+						/>
+					) : null}
+					<Stack gap="sm" display={removalTarget ? "none" : undefined}>
 						<Text size="xs" c="dimmed" truncate title={`${context?.deviceId}: ${context?.cwd}`}>
 							{worktreeDirectoryLabel(context?.cwd ?? "")}
 						</Text>
@@ -572,61 +604,82 @@ function ScopedWorktreeControls({
 						<ScrollArea.Autosize mah="45vh" type="auto" viewportRef={setViewport}>
 							<Stack gap={4}>
 								{visibleEntries.map((entry) => (
-									<Button
-										key={entry.path}
-										data-worktree-path={entry.path}
-										variant={entry.path === context?.cwd ? "light" : "subtle"}
-										fullWidth
-										justify="flex-start"
-										h="auto"
-										py="xs"
-										styles={{ label: { display: "block", width: "100%", textAlign: "left" } }}
-										title={`${context?.deviceId}: ${entry.path}`}
-										disabled={
-											!canSwitch ||
-											state.busy ||
-											switchMutation.isPending ||
-											entry.path === context?.cwd ||
-											entry.locked ||
-											entry.prunable
-										}
-										onClick={() =>
-											void switchTo(entry.path)
-												.then(() => setMenuOpened(false))
-												.catch(() => {})
-										}
-									>
-										<Group gap="xs" wrap="nowrap">
-											<Text size="sm" truncate>
-												{entry.branch
-													? worktreeLabel(entry)
-													: `${t("worktree.detached")} · ${worktreeLabel(entry)}`}
+									<Group key={entry.path} gap={4} wrap="nowrap" align="stretch">
+										<Button
+											data-worktree-path={entry.path}
+											variant={entry.path === context?.cwd ? "light" : "subtle"}
+											fullWidth
+											style={{ flex: 1, minWidth: 0 }}
+											justify="flex-start"
+											h="auto"
+											py="xs"
+											styles={{ label: { display: "block", width: "100%", textAlign: "left" } }}
+											title={`${context?.deviceId}: ${entry.path}`}
+											disabled={
+												!canSwitch ||
+												state.busy ||
+												switchMutation.isPending ||
+												entry.path === context?.cwd ||
+												entry.locked ||
+												entry.prunable
+											}
+											onClick={() =>
+												void switchTo(entry.path)
+													.then(() => setMenuOpened(false))
+													.catch(() => {})
+											}
+										>
+											<Group gap="xs" wrap="nowrap">
+												<Text size="sm" truncate>
+													{entry.branch
+														? worktreeLabel(entry)
+														: `${t("worktree.detached")} · ${worktreeLabel(entry)}`}
+												</Text>
+												{entry.path === context?.cwd && (
+													<Badge size="xs">{t("worktree.current")}</Badge>
+												)}
+												{entry.locked && (
+													<Badge size="xs" color="yellow">
+														{t("worktree.locked")}
+													</Badge>
+												)}
+												{entry.prunable && (
+													<Badge size="xs" color="red">
+														{t("worktree.unavailable")}
+													</Badge>
+												)}
+											</Group>
+											<Text size="xs" c="dimmed" truncate>
+												{context?.deviceId !== "local" && `${context?.deviceId}: `}
+												{worktreeDirectoryLabel(entry.path)}
 											</Text>
-											{entry.path === context?.cwd && (
-												<Badge size="xs">{t("worktree.current")}</Badge>
+											{sort !== "name" && (
+												<Text size="xs" c="dimmed">
+													{t(sort === "createdAt" ? "worktree.createdTime" : "worktree.lastCommit")}
+													: {formatTime(entry[sort])}
+												</Text>
 											)}
-											{entry.locked && (
-												<Badge size="xs" color="yellow">
-													{t("worktree.locked")}
-												</Badge>
-											)}
-											{entry.prunable && (
-												<Badge size="xs" color="red">
-													{t("worktree.unavailable")}
-												</Badge>
-											)}
-										</Group>
-										<Text size="xs" c="dimmed" truncate>
-											{context?.deviceId !== "local" && `${context?.deviceId}: `}
-											{worktreeDirectoryLabel(entry.path)}
-										</Text>
-										{sort !== "name" && (
-											<Text size="xs" c="dimmed">
-												{t(sort === "createdAt" ? "worktree.createdTime" : "worktree.lastCommit")}:{" "}
-												{formatTime(entry[sort])}
-											</Text>
+										</Button>
+										{canRemove && entry.recorded && entry.path !== context?.cwd && (
+											<Tooltip label={t("worktree.remove")}>
+												<ActionIcon
+													variant="subtle"
+													color="red"
+													size="lg"
+													style={{ alignSelf: "center" }}
+													aria-label={`${t("worktree.remove")}: ${worktreeLabel(entry)}`}
+													data-worktree-remove={entry.path}
+													disabled={state.busy || switchMutation.isPending}
+													onClick={() => {
+														setRemovalNotice(undefined);
+														setRemovalTarget(entry);
+													}}
+												>
+													<IconTrash size={16} />
+												</ActionIcon>
+											</Tooltip>
 										)}
-									</Button>
+									</Group>
 								))}
 								<div ref={sentinel} data-worktree-sentinel style={{ minHeight: 1 }} />
 								{worktrees.isFetchingNextPage && <Loader size="xs" />}
@@ -656,6 +709,11 @@ function ScopedWorktreeControls({
 							</Stack>
 						</ScrollArea.Autosize>
 						{firstPage?.truncated && <Alert color="yellow">{t("worktree.listTruncated")}</Alert>}
+						{removalNotice && (
+							<Alert color="green" role="status">
+								{removalNotice}
+							</Alert>
+						)}
 						{switchError && <Alert color="red">{switchError}</Alert>}
 					</Stack>
 				</Modal>

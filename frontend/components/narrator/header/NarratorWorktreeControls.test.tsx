@@ -4,6 +4,8 @@ import type {
 	WorktreeCreateResult,
 	WorktreeEntry,
 	WorktreePrepareRequest,
+	WorktreeRemovalReport,
+	WorktreeRemoveResult,
 } from "@shared/narrator-worktrees";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { parseHTML } from "linkedom";
@@ -83,16 +85,41 @@ class FakeApiError extends Error {
 	constructor(
 		message: string,
 		readonly status: number,
+		readonly data?: Record<string, unknown>,
 	) {
 		super(message);
 	}
 }
+const cleanReport: WorktreeRemovalReport = {
+	path: "/repo/.worktrees/task",
+	branch: "task",
+	head: "a".repeat(40),
+	base: { ref: "HEAD", sha: "b".repeat(40) },
+	upstream: null,
+	uncommittedFiles: 0,
+	uncommittedExact: true,
+	unmergedCommits: 0,
+	missing: false,
+};
+let removalReport: WorktreeRemovalReport = cleanReport;
+let removeFailure: Error | null = null;
+const removeWorktree = mock(async (_id: string, input: unknown): Promise<WorktreeRemoveResult> => {
+	if (removeFailure) throw removeFailure;
+	return {
+		removed: true,
+		path: (input as { path: string }).path,
+		report: removalReport,
+		record: "retired",
+		branch: null,
+	};
+});
 mock.module("@frontend/lib/api", () => ({
 	api: {
 		prepareNarratorWorktree: prepare,
 		createNarratorWorktree: create,
 		reconcileNarratorWorktree: reconcile,
 		listNarratorWorktrees: async () => ({ entries: [] }),
+		removeNarratorWorktree: removeWorktree,
 	},
 	ApiError: FakeApiError,
 }));
@@ -104,14 +131,17 @@ let extraPages: WorktreeEntry[][] = [];
 let nextPageError: Error | null = null;
 let hasNextPage = false;
 let observedQuery: { search: string; sort: string; order: string };
+let canDelete = false;
 mock.module("@tanstack/react-query", () => ({
 	useQueryClient: () => ({ resetQueries }),
+	// The removal panel's report query: answered synchronously from the fixture.
+	useQuery: () => ({ data: removalReport, isPending: false, error: null }),
 	useInfiniteQuery: (options: { queryKey: unknown[] }) => {
 		observedQuery = options.queryKey[3] as typeof observedQuery;
 		return {
 			data: {
 				pages: [
-					{ entries: listEntries, capabilities: { create: true } },
+					{ entries: listEntries, capabilities: { create: true, delete: canDelete } },
 					...extraPages.map((entries) => ({ entries })),
 				],
 			},
@@ -149,6 +179,28 @@ mock.module("@mantine/core", () => {
 		Text: Wrapper,
 		Alert: Wrapper,
 		Loader: () => <span>loader</span>,
+		List: Object.assign(Wrapper, { Item: Wrapper }),
+		Checkbox: ({
+			label,
+			checked,
+			disabled,
+			onChange,
+		}: {
+			label: string;
+			checked: boolean;
+			disabled?: boolean;
+			onChange: (event: { currentTarget: { checked: boolean } }) => void;
+		}) => (
+			<button
+				type="button"
+				aria-label={label}
+				aria-pressed={checked}
+				disabled={disabled}
+				onClick={() => onChange({ currentTarget: { checked: !checked } })}
+			>
+				{label}
+			</button>
+		),
 		Tooltip: Wrapper,
 		Menu,
 		Badge: Wrapper,
@@ -290,6 +342,10 @@ async function submit() {
 }
 beforeEach(async () => {
 	activeContext = context;
+	canDelete = false;
+	removalReport = cleanReport;
+	removeFailure = null;
+	removeWorktree.mockClear();
 	listEntries = [];
 	extraPages = [];
 	nextPageError = null;
@@ -825,4 +881,107 @@ test("capabilities disable create and switch without dropping the strip", async 
 	expect(container.querySelector('[aria-label="worktree.switch"]')?.hasAttribute("disabled")).toBe(
 		true,
 	);
+});
+
+function removalEntries(): WorktreeEntry[] {
+	const base = created("/repo/.worktrees/task").worktree;
+	return [
+		{ ...base, branch: "refs/heads/task", recorded: true },
+		{ ...base, path: "/repo/.worktrees/legacy", branch: "refs/heads/legacy", recorded: false },
+		{ ...base, path: "/repo", branch: "refs/heads/main", recorded: true },
+	];
+}
+function removeButtons() {
+	return [...container.querySelectorAll("button")]
+		.map((node) => node.getAttribute("aria-label") ?? "")
+		.filter((label) => label.startsWith("worktree.remove:"));
+}
+function buttonByLabel(label: string) {
+	return [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+		(node) => node.getAttribute("aria-label") === label || node.textContent === label,
+	);
+}
+
+test("without the delete capability no worktree offers removal", async () => {
+	listEntries = removalEntries();
+	await click("worktree.switch");
+	expect(removeButtons()).toEqual([]);
+});
+
+test("only recorded worktrees other than the current one offer removal", async () => {
+	canDelete = true;
+	listEntries = removalEntries();
+	await click("worktree.switch");
+	expect(removeButtons()).toEqual(["worktree.remove: task"]);
+});
+
+test("a clean worktree is removed without a discard and the list restarts", async () => {
+	canDelete = true;
+	listEntries = removalEntries();
+	await click("worktree.switch");
+	await click("worktree.remove: task");
+	expect(container.textContent).toContain("worktree.removeNothingLost");
+	expect(buttonByLabel("worktree.removeAcknowledge")).toBeUndefined();
+	await click("worktree.removeDeleteBranch");
+	const resets = resetQueries.mock.calls.length;
+	await click("worktree.removeConfirm");
+	expect(removeWorktree.mock.calls[0]?.[1]).toEqual({
+		workspaceKey: "wk",
+		path: "/repo/.worktrees/task",
+		deleteBranch: true,
+	});
+	expect(container.textContent).toContain("worktree.removed");
+	expect(resetQueries.mock.calls.length).toBe(resets + 1);
+});
+
+test("a loss must be acknowledged, is sent as an exact discard, and a grown loss asks again", async () => {
+	canDelete = true;
+	listEntries = removalEntries();
+	removalReport = { ...cleanReport, uncommittedFiles: 2, unmergedCommits: 1 };
+	await click("worktree.switch");
+	await click("worktree.remove: task");
+	expect(container.textContent).not.toContain("worktree.removeNothingLost");
+	expect(container.textContent).toContain("worktree.removeUncommitted");
+	expect(container.textContent).toContain("worktree.removeUnmerged");
+	expect(buttonByLabel("worktree.removeConfirm")?.disabled).toBe(true);
+	await click("worktree.removeAcknowledge");
+	expect(buttonByLabel("worktree.removeConfirm")?.disabled).toBe(false);
+	const grown = { ...cleanReport, uncommittedFiles: 3, unmergedCommits: 1 };
+	removeFailure = new FakeApiError("changed", 409, {
+		code: "WORKTREE_REMOVAL_CHANGED",
+		details: { report: grown },
+	});
+	await click("worktree.removeConfirm");
+	expect(removeWorktree.mock.calls[0]?.[1]).toEqual({
+		workspaceKey: "wk",
+		path: "/repo/.worktrees/task",
+		deleteBranch: false,
+		discard: { head: cleanReport.head, uncommittedFiles: 2, unmergedCommits: 1 },
+	});
+	expect(container.textContent).toContain("worktree.removeChanged");
+	// The new report replaces the old one; the acknowledgement must be given again.
+	expect(buttonByLabel("worktree.removeConfirm")?.disabled).toBe(true);
+	removeFailure = null;
+	await click("worktree.removeAcknowledge");
+	await click("worktree.removeConfirm");
+	expect((removeWorktree.mock.calls[1]?.[1] as { discard: unknown }).discard).toEqual({
+		head: cleanReport.head,
+		uncommittedFiles: 3,
+		unmergedCommits: 1,
+	});
+});
+
+test("a protected worktree shows the in-use explanation and stays listed", async () => {
+	canDelete = true;
+	listEntries = removalEntries();
+	removeFailure = new FakeApiError("in use", 409, { code: "WORKTREE_IN_USE" });
+	await click("worktree.switch");
+	await click("worktree.remove: task");
+	const resets = resetQueries.mock.calls.length;
+	await click("worktree.removeConfirm");
+	expect(container.textContent).toContain("worktree.removeInUse");
+	expect(resetQueries.mock.calls.length).toBe(resets);
+	await click("worktree.removeCancel");
+	expect(buttonByLabel("worktree.removeConfirm")).toBeUndefined();
+	expect(removeButtons()).toEqual(["worktree.remove: task"]);
 });

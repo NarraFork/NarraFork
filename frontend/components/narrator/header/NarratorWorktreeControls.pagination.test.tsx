@@ -114,6 +114,8 @@ mock.module("@mantine/core", () => ({
 	Alert: Wrapper,
 	Badge: Wrapper,
 	Loader: Wrapper,
+	Checkbox: () => null,
+	List: Object.assign(Wrapper, { Item: Wrapper }),
 	ScrollArea: { Autosize: Wrapper },
 	Modal: ({ opened, children }: { opened: boolean; children?: ReactNode }) =>
 		opened ? <div>{children}</div> : null,
