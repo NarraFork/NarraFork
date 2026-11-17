@@ -198,6 +198,7 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 | `spec_update` | `specUpdates` | `onNextTurn` | 用户在 UI 编辑 spec 文件（仅空闲回退路径） |
 | `outline_task_edit` | `prose` | `onNextTurn` | 大纲会话运行中有人改了它的任务（看板、大纲编辑器、退回目标完成）：`outline-task-edits.ts` 在内存里攒着，本函数在工具边界取走（`takeOutlineTaskEditNotice`，仅主会话，子代理不取） |
 | `outline_team_activity` | `outlineTasks`（`activity`） | `onNextTurn` | 长回合里团队动态再看一次：距上次看满 10 分钟、有新东西才写（`outline/team-activity.ts`，仅大纲根会话；见下） |
+| `team_status` | `prose` | `onNextTurn` | 团队协调者的团队状态再看一次：距上次看满 10 分钟、文本变了才写（`teams/team-status.ts`，仅写过状态的协调者；见下） |
 
 **空闲**路径是分开的函数，`schedule: "none"`：
 
@@ -260,6 +261,8 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 - 正文按会话负责人的语言（en、zh-CN），以「System notice (not the user speaking)」/「系统通知（不是用户发言）」开头：任务页 `session/tasks`（导入了几个）、行为边界页 `session/behavior`、原来的每个 `spec://` 文件对应的大纲页 `spec://design.md → session/<sid>`（读会话空间最多 60 个页，列最多 20 个，其余计数），最后说 `spec://` 不再适用、用 OutlineRead / OutlineSearch / OutlineEdit。正文是确定的（没有时间），重建历史发出去的字节一样。
 - 读者看到的 body 是 `prose`（同模型文字）；来源标签「Dynamic Spec moved to the outline / Dynamic Spec 已搬进大纲」。
 - 配套（不是注入）：这种会话里点名 `spec://` 的工具调用（`getOutlineSpecRejection`，`AgentConfig.specImported`）回答「已搬进大纲、各在哪」，而不是一般大纲会话那句；界面和插件的 spec 写入拒绝用 `SPEC_MOVED_TO_OUTLINE`（code 仍是 `SPEC_OUTLINE_SESSION`）。
+
+**团队状态（`team_status`，`server/services/teams/team-status.ts`，Project Teams P2）**：团队协调者（带 `team` trait 的主叙述者）的团队简报、本周超出建议上限的次数、团队树里等人审批的调用、工作项和最近替人做的决定，一行 `role: sys`、body 为 `prose`，最多 6 KB，文本确定（同样的状态同样的字节，不带相对时间）。写的时机：每一 pass 读历史之前（`orchestrator.ts`）在运行开始时写（`schedule: none`；同一压缩周期里同样的文本还在历史里就不写）、最近一次压缩标记变了（压缩或清空上下文之后）立即写；长回合在工具边界最多每 10 分钟看一次、文本变了才写（`onNextTurn`）。从不进系统提示。协调者自己的工具结果超出建议值时末尾追加的提醒不是注入行，是工具结果的一部分（`teams/coordinator-limits.ts`，经 `AgentConfig.annotateToolResult`）。
 
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 

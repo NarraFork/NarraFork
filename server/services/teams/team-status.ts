@@ -345,9 +345,18 @@ function fitList(list: ListSection, budget: number): { lines: string[]; bytes: n
 /** Cut text to at most `maxBytes` UTF-8 bytes on a character boundary. */
 function cutToBytes(text: string, maxBytes: number): string {
 	if (utf8Bytes(text) <= maxBytes) return text;
-	let end = Math.min(text.length, maxBytes);
-	while (end > 0 && utf8Bytes(text.slice(0, end)) > maxBytes) end--;
-	return text.slice(0, end);
+	// The longest prefix that fits, by binary search over its length.
+	let lo = 0;
+	let hi = Math.min(text.length, maxBytes);
+	while (lo < hi) {
+		const mid = (lo + hi + 1) >> 1;
+		if (utf8Bytes(text.slice(0, mid)) <= maxBytes) lo = mid;
+		else hi = mid - 1;
+	}
+	// Never end on the first half of a surrogate pair.
+	const last = text.charCodeAt(lo - 1);
+	if (lo > 0 && last >= 0xd800 && last <= 0xdbff) lo--;
+	return text.slice(0, lo);
 }
 
 export interface TeamStatusInput {

@@ -94,8 +94,8 @@ let previousRecorder: ReturnType<typeof setCoordinatorOverrunRecorder> = null;
 
 function captureEvents() {
 	recorded.length = 0;
-	previousRecorder = setCoordinatorOverrunRecorder((id, call, overrun) => {
-		recorded.push({ teamId: id, ...overrun, tool: call.toolName });
+	previousRecorder = setCoordinatorOverrunRecorder((id, tool, overrun) => {
+		recorded.push({ teamId: id, ...overrun, tool });
 	});
 }
 
@@ -446,6 +446,17 @@ describe("who gets reminders, in which words", () => {
 		// A new run, so the files-per-turn count starts over as it did for the first call.
 		beginCoordinatorRun(teamId);
 		expect(await annotate(call)).toBe(first);
+		// A saved output is named by its call: a retried call gets the same text.
+		const readCall = {
+			...call,
+			toolName: "Read",
+			input: { file_path: "r.txt" },
+			output: lines(400),
+		};
+		const saved = await annotate(readCall);
+		savedPathOf(saved ?? "");
+		expect(saved).toContain("saved at ");
+		expect(await annotate(readCall)).toBe(saved);
 	});
 
 	test("a failing annotator keeps the tool's own result", async () => {

@@ -279,8 +279,9 @@ async function saveFullOutput(text: string, toolUseId: string): Promise<string |
 	try {
 		await mkdir(OUTPUT_DIR, { recursive: true });
 		// `tool_` keeps it under the tool-output cleanup (7 days).
-		const safeId = toolUseId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40) || generateId();
-		const path = join(OUTPUT_DIR, `tool_coordinator_${Date.now()}_${safeId}`);
+		// Named by the call alone, so a retried call points at the same file (and the same text).
+		const safeId = toolUseId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80) || generateId();
+		const path = join(OUTPUT_DIR, `tool_coordinator_${safeId}`);
 		await writeFile(path, text, "utf8");
 		return path;
 	} catch (error) {
@@ -289,18 +290,10 @@ async function saveFullOutput(text: string, toolUseId: string): Promise<string |
 	}
 }
 
-type OverrunRecorder = (
-	teamId: string,
-	call: ToolResultAnnotationInput,
-	o: CoordinatorOverrun,
-) => void;
+type OverrunRecorder = (teamId: string, tool: string, overrun: CoordinatorOverrun) => void;
 
 /** Write one overrun row. Synchronous single insert; callers schedule it off the tool path. */
-function insertOverrunEvent(
-	teamId: string,
-	call: ToolResultAnnotationInput,
-	overrun: CoordinatorOverrun,
-): void {
+function insertOverrunEvent(teamId: string, tool: string, overrun: CoordinatorOverrun): void {
 	db.insert(teamWorkEvents)
 		.values({
 			id: generateId(),
@@ -309,7 +302,7 @@ function insertOverrunEvent(
 			kind: `${COORDINATOR_OVERRUN_EVENT_PREFIX}${overrun.kind}`,
 			actorKind: "agent",
 			actorId: teamId,
-			detailJson: { tool: call.toolName, size: overrun.size, limit: overrun.limit },
+			detailJson: { tool, size: overrun.size, limit: overrun.limit },
 			createdAt: new Date().toISOString(),
 		})
 		.run();
@@ -327,11 +320,7 @@ export function setCoordinatorOverrunRecorder(
 }
 
 /** Record the overruns after the result is handed back: never blocks or fails the call. */
-function recordOverruns(
-	teamId: string,
-	call: ToolResultAnnotationInput,
-	overruns: CoordinatorOverrun[],
-): void {
+function recordOverruns(teamId: string, tool: string, overruns: CoordinatorOverrun[]): void {
 	const state = runState(teamId);
 	const allowed = Math.max(0, COORDINATOR_LIMIT_BOUNDS.eventsPerRun - state.events);
 	const recorded = overruns.slice(0, allowed);
@@ -341,7 +330,7 @@ function recordOverruns(
 	setTimeout(() => {
 		for (const overrun of recorded) {
 			try {
-				write(teamId, call, overrun);
+				write(teamId, tool, overrun);
 			} catch (error) {
 				logger.warn("Could not record a coordinator limit overrun", {
 					teamId,
@@ -408,7 +397,7 @@ export function createCoordinatorToolAnnotator(
 				locale,
 			),
 		);
-		recordOverruns(narratorId, call, overruns);
+		recordOverruns(narratorId, call.toolName, overruns);
 		return `${body}\n\n${reminders.join("\n")}`;
 	};
 }
