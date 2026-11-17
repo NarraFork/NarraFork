@@ -171,6 +171,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 } from "./narrator-session-state";
+import { broadcastPermissionFrame, rememberNestedSubagentRoot } from "./nested-subagent-routing";
 import {
 	completePermissionRuleRequestReflection as completeRuleReflection,
 	failPermissionRuleRequest,
@@ -5261,10 +5262,13 @@ export async function handlePermission(
 			variant: true,
 			type: true,
 			parentNarratorId: true,
+			aclRootNarratorId: true,
 			runtimeRegistrationJson: true,
 			traits: true,
 		},
 	});
+	// A nested subagent's requests also reach its ACL root's page (see nested-subagent-routing).
+	if (narrator) rememberNestedSubagentRoot({ id: narratorId, ...narrator });
 	const permMode = runtimeConstraint?.permissionMode ?? narrator?.permissionMode ?? "default";
 	// OAuth runtime constraints are hard ceilings and never inherit relaxed-plan expansion.
 	const isRelaxedPlan = runtimeConstraint
@@ -6156,7 +6160,7 @@ export async function handlePermission(
 			? Date.now() + getQuestionReflectionTimeoutMs()
 			: undefined;
 
-	broadcastToNarrator(wsTarget, {
+	broadcastPermissionFrame(narratorId, wsTarget, {
 		type: "permission_request",
 		narratorId: wsTarget,
 		request: {
@@ -6193,7 +6197,7 @@ export async function handlePermission(
 	await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "waiting");
 
 	if (signal.aborted) {
-		broadcastToNarrator(wsTarget, {
+		broadcastPermissionFrame(narratorId, wsTarget, {
 			type: "permission_resolved",
 			narratorId: wsTarget,
 			requestId: toolCallId,
@@ -6231,7 +6235,7 @@ export async function handlePermission(
 				toolName,
 			});
 			cleanup();
-			broadcastToNarrator(wsTarget, {
+			broadcastPermissionFrame(narratorId, wsTarget, {
 				type: "permission_resolved",
 				narratorId: wsTarget,
 				requestId: toolCallId,
@@ -6487,7 +6491,7 @@ async function handlePermissionRuleRequest(args: {
 			decision,
 		};
 	}
-	broadcastToNarrator(wsTarget, {
+	broadcastPermissionFrame(narratorId, wsTarget, {
 		type: "permission_request",
 		narratorId: wsTarget,
 		request: {
@@ -6694,7 +6698,7 @@ export async function resolvePermission(
 			} catch {}
 		} finally {
 			pending.cleanup();
-			broadcastToNarrator(pending.broadcastTargetId, {
+			broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 				type: "permission_resolved",
 				narratorId: pending.broadcastTargetId,
 				requestId,
@@ -6758,7 +6762,7 @@ export async function resolvePermission(
 		decidedByNarrator = { id: proxyId, handle: proxy?.handle ?? null };
 	}
 
-	broadcastToNarrator(pending.broadcastTargetId, {
+	broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 		type: "permission_resolved",
 		narratorId: pending.broadcastTargetId,
 		requestId,
@@ -7237,7 +7241,7 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 	const [narrator, ownerMessage] = await Promise.all([
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, toolCall.narratorId),
-			columns: { parentNarratorId: true },
+			columns: { id: true, type: true, parentNarratorId: true, aclRootNarratorId: true },
 		}),
 		db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, toolCall.messageId),
@@ -7246,7 +7250,9 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 	]);
 	// No runtime pause exists, so the route is rebuilt from persistence: the owner
 	// plus its parent (if it is a subagent) are exactly the pages that can be
-	// rendering this gate. `broadcastReflectionFrame` applies the same fan-out.
+	// rendering this gate, plus the ACL root's page for a nested subagent.
+	// `broadcastReflectionFrame` applies the same fan-out.
+	if (narrator) rememberNestedSubagentRoot(narrator);
 	const route = {
 		narratorId: toolCall.narratorId,
 		broadcastTargetId: narrator?.parentNarratorId ?? toolCall.narratorId,
@@ -7579,7 +7585,7 @@ function broadcastReprocessedPermissionDecision(
 	result: PermissionResult,
 ): void {
 	if (result.behavior === "dangerReflection") return;
-	broadcastToNarrator(pending.broadcastTargetId, {
+	broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 		type: "permission_resolved",
 		narratorId: pending.broadcastTargetId,
 		requestId,
@@ -7620,7 +7626,7 @@ async function failReprocessedPendingPermission(
 			error: dbError instanceof Error ? dbError.message : String(dbError),
 		});
 	}
-	broadcastToNarrator(pending.broadcastTargetId, {
+	broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 		type: "permission_resolved",
 		narratorId: pending.broadcastTargetId,
 		requestId,
@@ -7656,7 +7662,7 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 		}
 
 		pending.cleanup();
-		broadcastToNarrator(pending.broadcastTargetId, {
+		broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 			type: "permission_resolved",
 			narratorId: pending.broadcastTargetId,
 			requestId,

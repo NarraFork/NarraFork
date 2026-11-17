@@ -57,8 +57,8 @@ import {
 	delegationRegistration,
 	parseRuntimeRegistration,
 } from "../../lib/validators/runtime-registration";
-import { backgroundOccupancyStore } from "../background-occupancy-store";
 import { withDelegationDepth } from "../agent-runtime/policy";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 import { compileDelegationCeiling } from "../custom-subagent-service";
 import { bumpNarratorMessageVersion } from "../narrator-persistence";
 import { dbTransactionWithSeqFloor } from "../narrator-refs/seq-floor-tx";

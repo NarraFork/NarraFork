@@ -935,7 +935,10 @@ async function finishRun(
 	await clearDeliveredHold(id, hold);
 	// A subagent that was stopped or ran out of time takes its helpers with it.
 	if (interrupted || timedOut)
-		void stopSubagentHelpers(id, timedOut ? "Parent subagent timed out" : "Parent subagent stopped");
+		void stopSubagentHelpers(
+			id,
+			timedOut ? "Parent subagent timed out" : "Parent subagent stopped",
+		);
 	// Terminal persistence (snapshot + delivery intent) precedes visible idle.
 	await settleStatus(id, deliverTo, {
 		hasError,
