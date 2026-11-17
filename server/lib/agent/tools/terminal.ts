@@ -212,6 +212,12 @@ export const terminalTool: ToolDefinition = {
 		"terminal exits. Stop({ type: 'bash', id }) cancels a watch. " +
 		"Use action 'list' to list available terminals for the current narrator. " +
 		"The 'terminal_id' parameter accepts either a terminal ID or a terminal name. " +
+		"Each line you send with Enter is checked like the same Bash command, from the shell's " +
+		"current directory as tracked by NarraFork. Input it cannot judge asks a person, in every " +
+		"permission mode: lines edited with history, completion or cursor keys, input to a running " +
+		"program, here-documents or scripts piped into an interpreter, and any line after the " +
+		"directory became unknown. Send Ctrl-C ('\\x03') to start a clean line and " +
+		"`cd /absolute/path` to set the directory again. " +
 		"This tool is for interacting with persistent interactive terminals (e.g. dev servers, REPLs, TUIs), " +
 		"NOT for running one-off commands — use Bash for that: it returns when the command exits, " +
 		"with its exit code, and needs no completion marker.",
