@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorktreeDependent } from "@shared/narrator-worktrees";
 import { TEAM_ISOLATED_WORK_KIND } from "@shared/project-teams";
-import { and, asc, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { LocalBackend } from "../../../lib/agent/execution/local-backend";
@@ -26,6 +26,7 @@ import {
 	type WorktreeTarget,
 } from "../../narrator-worktree-service";
 import { type LifecycleGuardPorts, withLifecycleGuardPorts } from "../../worktree-lifecycle-guard";
+import { teamWorktreePathsForNarrator } from "../team-membership";
 import {
 	attachWorker,
 	cancelWorkItem,
@@ -267,17 +268,20 @@ function seedWorker(id: string) {
 }
 
 function events(itemId: string | null) {
-	return db
-		.select({
-			kind: teamWorkEvents.kind,
-			actorKind: teamWorkEvents.actorKind,
-			actorId: teamWorkEvents.actorId,
-			detail: teamWorkEvents.detailJson,
-		})
-		.from(teamWorkEvents)
-		.where(itemId ? eq(teamWorkEvents.workItemId, itemId) : eq(teamWorkEvents.teamId, LEAD))
-		.orderBy(asc(teamWorkEvents.createdAt), asc(teamWorkEvents.id))
-		.all();
+	return (
+		db
+			.select({
+				kind: teamWorkEvents.kind,
+				actorKind: teamWorkEvents.actorKind,
+				actorId: teamWorkEvents.actorId,
+				detail: teamWorkEvents.detailJson,
+			})
+			.from(teamWorkEvents)
+			.where(itemId ? eq(teamWorkEvents.workItemId, itemId) : eq(teamWorkEvents.teamId, LEAD))
+			// Insertion order: events written in the same millisecond share a timestamp.
+			.orderBy(sql`rowid`)
+			.all()
+	);
 }
 
 const create = (title: string, kind?: string) =>
@@ -327,10 +331,17 @@ describe("work item lifecycle", () => {
 		expect(item.branchName).toMatch(/^team\/add-the-export-button-[a-f0-9]{8}$/);
 		const path = worktreePathOf(item);
 		expect(path && existsSync(path)).toBe(true);
-		expect(await git(["rev-parse", "--abbrev-ref", "HEAD"], path ?? "")).toBe(item.branchName);
+		expect(await git(["rev-parse", "--abbrev-ref", "HEAD"], path ?? "")).toBe(
+			item.branchName ?? "",
+		);
 
 		seedWorker("p3-worker");
 		attachWorker(LEAD, item.id, "p3-worker", agent);
+		// The worktree is the team's for the coordinator and both subagent levels (permissions).
+		seedWorker("p3-helper");
+		for (const id of [LEAD, "p3-worker", "p3-helper"])
+			expect(teamWorktreePathsForNarrator(id)).toEqual([path ?? ""]);
+		expect(teamWorktreePathsForNarrator("p3-nobody")).toEqual([]);
 		await commitFile(path ?? "", "export.ts", "export const x = 1;\n", "export button");
 
 		// Ready before any review is refused.
@@ -554,6 +565,7 @@ describe("cleanup", () => {
 
 		const removed = await cleanup({ force: true, confirmedLoss: refused.loss });
 		expect(removed).toMatchObject({ outcome: "removed", branch: item.branchName });
+		expect(teamWorktreePathsForNarrator(LEAD)).toEqual([]);
 		expect(existsSync(path)).toBe(false);
 		expect(await git(["branch", "--list", item.branchName ?? ""])).toContain(item.branchName ?? "");
 		const log = events(item.id);

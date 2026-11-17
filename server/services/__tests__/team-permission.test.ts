@@ -48,7 +48,10 @@ const OAUTH: RuntimePermissionConstraint = {
 };
 
 /** A coordinator `n` whose team has one live work item with its worktree under `cwd`. */
-async function team(permissionMode: string, traits: string[] = []) {
+async function team(
+	permissionMode: "default" | "bypassPermissions" | "dontAsk",
+	traits: string[] = [],
+) {
 	await db.insert(narrators).values({
 		id: "n",
 		cwd,

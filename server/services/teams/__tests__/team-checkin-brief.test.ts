@@ -6,7 +6,7 @@
  * levels), byte-identical while the brief is unchanged, and never reaches other sessions.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { asc, eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
 import { teamWorkEvents } from "../../../db/schema";
 import { getTeamBriefSection } from "../../../lib/prompts/team-lead";
@@ -119,7 +119,7 @@ describe("check-in", () => {
 			})
 			.from(teamWorkEvents)
 			.where(eq(teamWorkEvents.teamId, LEAD))
-			.orderBy(asc(teamWorkEvents.createdAt))
+			.orderBy(sql`rowid`)
 			.all();
 		expect(log.map((row) => [row.kind, row.actor])).toEqual([
 			["team.checkin", "agent"],
