@@ -8,8 +8,8 @@
  * one's own saved outputs is auto-allowed and returned whole by Read; another narrator's
  * directory gets no such treatment.
  */
-import { realpathSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { join, relative, resolve, sep } from "node:path";
 import { getNarraforkPath } from "./narrafork-home";
 
 export const COORDINATOR_OUTPUTS_DIRNAME = "coordinator-outputs";
@@ -30,7 +30,14 @@ function within(parent: string, child: string): boolean {
 	return child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
 }
 
-/** Whether an absolute local path is a file inside the narrator's own saved-output directory. */
+/**
+ * Whether an absolute local path is a file inside the narrator's own saved-output directory.
+ *
+ * Decided on real paths: the target must exist, and its real path must be exactly the file the
+ * written path names inside the directory's real path. A symlink (to anywhere, even inside the
+ * directory) or anything resolving outside gets no exemption — the files saved there are always
+ * plain files.
+ */
 export function isOwnCoordinatorOutputPath(
 	narratorId: string | undefined | null,
 	absolutePath: string,
@@ -39,11 +46,15 @@ export function isOwnCoordinatorOutputPath(
 	const dir = coordinatorOutputsDir(narratorId);
 	if (!dir) return false;
 	const path = resolve(absolutePath);
-	if (within(dir, path)) return true;
-	// A data directory reached through a symlink: compare the real paths too.
 	try {
 		const realDir = realpathSync(dir);
-		return realDir !== dir && within(realDir, path);
+		// The written path may spell the directory either way (a symlinked data directory).
+		const base = within(dir, path) ? dir : within(realDir, path) ? realDir : null;
+		if (!base) return false;
+		const expected = join(realDir, relative(base, path));
+		if (!within(realDir, expected)) return false;
+		if (lstatSync(path).isSymbolicLink()) return false;
+		return realpathSync(path) === expected;
 	} catch {
 		return false;
 	}

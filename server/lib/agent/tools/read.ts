@@ -35,6 +35,13 @@ const DEFAULT_LARGE_FILE_LINES = 2000;
 /** Long physical lines can otherwise dominate memory and UI rendering. */
 const MAX_LINE_CHARS = 2000;
 
+/**
+ * Line ceiling for a team coordinator's own saved results (Project Teams P2): they are saved in
+ * parts whose lines fit the whole-file cap, so a line is never longer than that cap; a longer
+ * one (not written by the saver) is cut there, so memory stays bounded.
+ */
+const SAVED_OUTPUT_MAX_LINE_CHARS = READ_ALL_MAX_CHARS;
+
 /** Image extensions → format string for the API (Anthropic media_type = `image/${format}`). */
 const IMAGE_EXTENSIONS: Record<string, string> = {
 	".png": "png",
@@ -405,7 +412,7 @@ export const readTool: ToolDefinition = {
 					effectiveLimit,
 					READ_ALL_MAX_CHARS,
 					ctx.signal,
-					ownSavedOutput ? Number.POSITIVE_INFINITY : MAX_LINE_CHARS,
+					ownSavedOutput ? SAVED_OUTPUT_MAX_LINE_CHARS : MAX_LINE_CHARS,
 				);
 				const numbered = formatNumberedLines(streamResult.lines, startLine, {
 					truncateLines: false,
@@ -450,7 +457,9 @@ export const readTool: ToolDefinition = {
 			const start = Math.max(0, (offset ?? 1) - 1);
 			const end = limit ? start + limit : lines.length;
 			const slice = lines.slice(start, end);
-			const numbered = formatNumberedLines(slice, start + 1, { truncateLines: !ownSavedOutput });
+			const numbered = formatNumberedLines(slice, start + 1, {
+				maxLineChars: ownSavedOutput ? SAVED_OUTPUT_MAX_LINE_CHARS : MAX_LINE_CHARS,
+			});
 
 			return {
 				output: numbered || "(empty file)",
@@ -478,21 +487,23 @@ type StreamReadResult = {
 	cappedByLines: boolean;
 };
 
-function truncateDisplayLine(line: string): string {
-	if (line.length <= MAX_LINE_CHARS) return line;
-	return `${line.slice(0, MAX_LINE_CHARS)}… [line truncated, ${line.length} chars total]`;
+function truncateDisplayLine(line: string, maxLineChars = MAX_LINE_CHARS): string {
+	if (line.length <= maxLineChars) return line;
+	return `${line.slice(0, maxLineChars)}… [line truncated, ${line.length} chars total]`;
 }
 
 function formatNumberedLines(
 	lines: string[],
 	startLine: number,
-	options: { truncateLines?: boolean } = {},
+	options: { truncateLines?: boolean; maxLineChars?: number } = {},
 ): string {
 	const truncateLines = options.truncateLines ?? true;
 	return lines
 		.map(
 			(line, i) =>
-				`${String(startLine + i).padStart(6)}│${truncateLines ? truncateDisplayLine(line) : line}`,
+				`${String(startLine + i).padStart(6)}│${
+					truncateLines ? truncateDisplayLine(line, options.maxLineChars) : line
+				}`,
 		)
 		.join("\n");
 }

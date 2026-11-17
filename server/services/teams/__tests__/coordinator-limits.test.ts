@@ -5,7 +5,7 @@
  * recorded as a `team_work_events` row off the tool path.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
@@ -632,6 +632,71 @@ describe("saved outputs: one directory per coordinator, named by content (review
 		expect(decide(otherTeam.id, "default")).toBe("ask");
 		expect(decide(otherTeam.id, "readOnly")).toBe("deny");
 		expect(decide(plainId, "default")).toBe("ask");
+	});
+});
+
+describe("only real files of the own directory are exempt (review round 2)", () => {
+	test("a symlink inside the own directory: approval needed, and Read cuts its lines as usual", async () => {
+		const dir = coordinatorOutputsDir(teamId) as string;
+		mkdirSync(dir, { recursive: true });
+		const outside = join(testHome, "outside-secret.txt");
+		writeFileSync(outside, `${"s".repeat(5000)}\n`);
+		const link = join(dir, "link.txt");
+		rmSync(link, { force: true });
+		symlinkSync(outside, link);
+		const linkedDir = join(dir, "sub");
+		rmSync(linkedDir, { recursive: true, force: true });
+		symlinkSync(testHome, linkedDir);
+		for (const path of [link, join(linkedDir, "outside-secret.txt")]) {
+			expect(
+				resolvePermissionDecision({
+					toolName: "Read",
+					narratorId: teamId,
+					input: { file_path: path },
+					permMode: "default",
+					cwd: repo,
+				}),
+			).toBe("ask");
+		}
+		const read = await executeTool(
+			{ toolUseId: `read-${generateId()}`, name: "Read", input: { file_path: link, limit: -1 } },
+			coordinatorConfig(),
+		);
+		expect(read.output).toContain("[line truncated, 5000 chars total]");
+		rmSync(link, { force: true });
+		rmSync(linkedDir, { force: true });
+	});
+
+	test("an oversized line in the own directory is cut at the whole-file cap", async () => {
+		const dir = coordinatorOutputsDir(teamId) as string;
+		mkdirSync(dir, { recursive: true });
+		const path = join(dir, "oversized.txt");
+		writeFileSync(path, `${"o".repeat(300_000)}\nafter\n`);
+		try {
+			expect(
+				resolvePermissionDecision({
+					toolName: "Read",
+					narratorId: teamId,
+					input: { file_path: path },
+					permMode: "default",
+					cwd: repo,
+				}),
+			).toBe("allow");
+			for (const input of [
+				{ file_path: path, limit: -1 },
+				{ file_path: path, limit: 5 },
+			]) {
+				const read = await executeTool(
+					{ toolUseId: `read-${generateId()}`, name: "Read", input },
+					coordinatorConfig(),
+				);
+				expect(read.isError).not.toBe(true);
+				expect(read.output.length).toBeLessThan(110_000);
+				expect(read.output).not.toContain("o".repeat(100_001));
+			}
+		} finally {
+			rmSync(path, { force: true });
+		}
 	});
 });
 
