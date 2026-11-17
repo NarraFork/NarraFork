@@ -14,6 +14,7 @@ export const STORAGE_CATEGORY_KEYS = [
 	"requestRecordings",
 	"savedRequestRecordings",
 	"dormantIgnored",
+	"coordinatorOutputs",
 	"containers",
 ] as const;
 
@@ -34,5 +35,6 @@ export const STORAGE_CATEGORY_PROGRESS_MESSAGE: Record<StorageCategoryKey, strin
 	requestRecordings: "scanning_request_recordings",
 	savedRequestRecordings: "scanning_saved_request_recordings",
 	dormantIgnored: "scanning_dormant_ignored",
+	coordinatorOutputs: "scanning_coordinator_outputs",
 	containers: "scanning_containers",
 };
