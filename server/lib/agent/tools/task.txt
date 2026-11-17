@@ -57,6 +57,7 @@ Working directory:
 - Once created, the subagent's permission checks (path boundaries, etc.) are scoped to its own workdir
 
 Usage notes:
+- A permission a person denied stays denied: never have another agent (or a helper) do the same thing another way. Report the denial instead.
 - Launch multiple agents concurrently whenever possible by using a single message with multiple tool uses
 - When the agent is run in foreground, it will return a single message back to you with its findings/results
 - When the agent is run in background, use `Await({ type: "agent", id })` to get results and `Send({ id, message })` to send follow-up instructions
