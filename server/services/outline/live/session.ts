@@ -295,6 +295,12 @@ export const OUTLINE_LIVE_BOUNDS = {
 	 * join). Past it the oldest go, with a warning.
 	 */
 	lostPerKey: 1024,
+	/**
+	 * Watch notices one participant may have waiting (`Participant.notices`: they wait while its
+	 * own changes are not acknowledged, e.g. the log is not taking writes). Past it the
+	 * participant rejoins and gets everything (the join names its whole set).
+	 */
+	notices: 64,
 };
 
 const SERVER_ORIGIN = { live: "server" } as const;
@@ -1620,7 +1626,7 @@ export class LiveSpace {
 	 * held them (only levels, so the mirror may lack what is under them), through blocks it does
 	 * not delete.
 	 */
-	private movedIntoSubtrees(ops: readonly LiveOp[]): string[] {
+	private movedIntoSubtrees(ops: readonly LiveOp[]): Array<{ id: string; into: LiveView[] }> {
 		const finalParent = new Map<string, string | null>();
 		const deleting = new Set<string>();
 		for (const op of ops) {
@@ -1629,20 +1635,21 @@ export class LiveSpace {
 		}
 		const parentOf = (id: string): string | null =>
 			finalParent.has(id) ? (finalParent.get(id) ?? null) : (this.mirror.get(id)?.parentId ?? null);
-		const out: string[] = [];
+		const out: Array<{ id: string; into: LiveView[] }> = [];
 		for (const op of ops) {
-			if (op.t !== "m" || out.includes(op.id) || this.underSubtree(op.id)) continue;
-			let lands = false;
+			if (op.t !== "m" || out.some((x) => x.id === op.id) || this.underSubtree(op.id)) continue;
+			let into: LiveView[] = [];
 			let cur = parentOf(op.id);
 			for (let guard = 0; cur !== null && guard < 10_000; guard++) {
 				if (deleting.has(cur)) {
-					lands = false;
+					into = [];
 					break;
 				}
-				if (this.subtreeViews.has(cur)) lands = true;
+				const sub = this.subtreeViews.get(cur);
+				if (sub) into.push(sub);
 				cur = parentOf(cur);
 			}
-			if (lands) out.push(op.id);
+			if (into.length > 0) out.push({ id: op.id, into });
 		}
 		return out;
 	}
@@ -1684,6 +1691,33 @@ export class LiveSpace {
 			if (frontier.length > 0) await yieldToLoop();
 		}
 		return out;
+	}
+
+	/**
+	 * Whether blocks read under a block brought into a subtree fit what the session may hold
+	 * with what the mirror holds now (an outside commit's own new blocks included): the space's
+	 * bound, the process's, and (a person's move) their share when every watch the blocks go into
+	 * is theirs alone.
+	 */
+	private fillFits(
+		rows: readonly OutlineBlockRow[],
+		into: readonly LiveView[],
+		userId?: string,
+	): boolean {
+		let chars = 0;
+		for (const b of rows) chars += b.content.length;
+		if (
+			this.mirror.size + rows.length > OUTLINE_LIVE_BOUNDS.maxLoadedBlocks ||
+			this.mirror.chars + chars > OUTLINE_LIVE_BOUNDS.maxLoadedChars ||
+			rows.length > this.room()
+		)
+			return false;
+		if (userId === undefined) return true;
+		const alone = into.every((v) => {
+			for (const q of v.participants.values()) if (q.userId !== userId) return false;
+			return true;
+		});
+		return !alone || this.ownBlocks(userId) + rows.length <= OUTLINE_LIVE_BOUNDS.maxUserBlocks;
 	}
 
 	/**
@@ -2526,8 +2560,31 @@ export class LiveSpace {
 	 * this arrives, so nothing on its way may still name those blocks.
 	 */
 	private notify(p: Participant, head: LiveWatchedHead): void {
+		if (p.lagging) return;
 		p.notices.push({ o: this.opSeq, head });
+		// Waiting past their bound: it rejoins (its join names its whole set) and gets everything.
+		if (p.notices.length > OUTLINE_LIVE_BOUNDS.notices) {
+			this.rejoinWhole(p);
+			return;
+		}
 		this.releaseNotices(p);
+	}
+
+	/**
+	 * What is held for a participant grew past its bound: it is told to rejoin, and nothing more
+	 * is sent to it until it has (its frames are still taken meanwhile).
+	 */
+	private rejoinWhole(p: Participant): void {
+		p.heldCommits = [];
+		p.notices = [];
+		p.lagging = true;
+		p.resyncSent = true;
+		this.stats.resyncs++;
+		try {
+			p.socket.send(encodeLiveFrame({ kind: LIVE_FRAME.resync, handle: p.handle }));
+		} catch (error) {
+			this.dropBroken(p, error);
+		}
 	}
 
 	/** Whether something cut for a participant up to operation `o` has not gone out yet. */
@@ -2902,15 +2959,7 @@ export class LiveSpace {
 			p.heldCommits = others.filter((c) => c.o >= first);
 			if (p.heldCommits.length > OUTLINE_LIVE_BOUNDS.opLog) {
 				// Held too long (the log is not taking writes): it rejoins and gets everything.
-				p.heldCommits = [];
-				p.lagging = true;
-				p.resyncSent = true;
-				this.stats.resyncs++;
-				try {
-					p.socket.send(encodeLiveFrame({ kind: LIVE_FRAME.resync, handle: p.handle }));
-				} catch (error) {
-					this.dropBroken(p, error);
-				}
+				this.rejoinWhole(p);
 				continue;
 			}
 			const upTo = Math.max(ack, p.ackedTx);
@@ -3594,10 +3643,11 @@ export class LiveSpace {
 		let under: OutlineBlockRow[] = [];
 		const into = this.movedIntoSubtrees(plan.ops);
 		if (into.length > 0) {
-			const read = await this.readUnder(into);
+			const read = await this.readUnder(into.map((x) => x.id));
 			if (this.participants.get(p.pno) !== p || p.blocked || this.closed) return;
-			if (read === "too_large") {
-				this.reject(p, n, "invalid");
+			const dest = into.flatMap((x) => x.into);
+			if (read === "too_large" || (read.length > 0 && !this.fillFits(read, dest, p.userId))) {
+				this.reject(p, n, "too_large");
 				return;
 			}
 			under = read;
@@ -4439,10 +4489,10 @@ export class LiveSpace {
 		let filled: string[] = [];
 		if (roots.length > 0) {
 			const read = await this.readUnder(roots);
-			// More than one watch takes: the subtrees it went into end (their watchers watch again
-			// and are told it is too large).
-			if (read === "too_large")
-				for (const id of roots) for (const v of intoSubtree(id)) ended.add(v);
+			// More than one watch takes, or than the space or the process holds: the subtrees it
+			// went into end (their watchers watch again and are told why).
+			const into = roots.flatMap(intoSubtree);
+			if (read === "too_large" || !this.fillFits(read, into)) for (const v of into) ended.add(v);
 			else filled = this.putUnder(read);
 		}
 		const changes = this.changesOf([...fresh, ...order, ...filled], before, moved, tasks);

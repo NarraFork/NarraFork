@@ -185,6 +185,15 @@ export const OUTLINE_LIVE_LIMITS = {
 	presenceIntervalMs: 80,
 	/** Client-side: text-only updates are batched for this long before they are sent. */
 	typingBatchMs: 30,
+	/** Client-side: watch changes asked for within this long go out as one frame. */
+	watchBatchMs: 30,
+	/**
+	 * Client-side: an addition refused `too_fast` is asked again after this long, doubling each
+	 * time up to `watchRetryMaxMs`, at most `watchRetries` times in a row (then it stays refused).
+	 */
+	watchRetryMs: 250,
+	watchRetryMaxMs: 8000,
+	watchRetries: 8,
 	/** Agents one watch shows in its presence at most; the rest are counted (`am`, P2 PR 10b). */
 	agentsPerWatch: 8,
 } as const;
@@ -492,7 +501,13 @@ export type LiveCloseCode =
 	 * connected: this join or watch is refused (nobody's watch is closed for it). Retried by the
 	 * person only.
 	 */
-	| "space_full";
+	| "space_full"
+	/**
+	 * Only in `watched.refused`: the socket sent watch frames with additions faster than the
+	 * server takes them (`OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst` / `watchesPerSecond`). Nothing
+	 * was read; the client asks again after a while by itself.
+	 */
+	| "too_fast";
 
 export interface LiveClosedHead {
 	code: LiveCloseCode;
@@ -508,7 +523,13 @@ export type LiveRejectCode =
 	/** The transaction is malformed or over a limit. */
 	| "invalid"
 	/** Writing failed on the server; the change was not saved. */
-	| "failed";
+	| "failed"
+	/**
+	 * A move would bring more blocks into the live session than it takes (what is under a block
+	 * moved into a watched subtree: one watch's bound, the space's, the process's, or the
+	 * person's share). Nothing was written; the editor says why.
+	 */
+	| "too_large";
 
 /**
  * Why a change to a task was refused: someone else is doing it (setting it in progress claims

@@ -327,6 +327,17 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 		};
 	}, [client]);
 
+	// A move the session could not take (it would bring too much into live editing): it was
+	// undone here; say why.
+	useEffect(
+		() =>
+			client.on((event) => {
+				if (event !== "rejected" || client.lastReject?.code !== "too_large") return;
+				notifications.show({ color: "yellow", message: t("editor.moveTooLarge") });
+			}),
+		[client, t],
+	);
+
 	// Deleting questions put to people withdrew them: say so (undo asks them again).
 	useEffect(
 		() =>

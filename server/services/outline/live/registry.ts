@@ -710,7 +710,7 @@ export function handleLiveFrame(socket: LiveSocket, frame: LiveFrame): void {
 			const refuse: LiveCloseCode | undefined = !adds
 				? undefined
 				: !takeWatchToken(socket)
-					? "unavailable"
+					? "too_fast"
 					: watchCount() >= OUTLINE_LIVE_LIMITS.liveWatches
 						? "unavailable"
 						: undefined;

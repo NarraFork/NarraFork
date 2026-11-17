@@ -150,16 +150,24 @@ export class Store {
 	}
 
 	/**
-	 * Whether a block is live and shown: reachable through live parents from the root or another
-	 * watched subtree's root, or under a watched level's parent.
+	 * Whether a block is live and shown: a watched subtree's root or reachable from one through
+	 * live parents, or a direct child of a watched level's parent (a level shows its children
+	 * only, not what is under them).
 	 */
 	inPage(id: string): boolean {
+		const own = this.blocks.get(id);
+		if (!own || own.deleted) return false;
+		if (this.scope.levels.has(own.parentId ?? "")) return true;
+		return this.underRoot(id);
+	}
+
+	/** A watched subtree's root, or below one through live blocks (every child of it is here). */
+	underRoot(id: string): boolean {
 		let cur: string | null = id;
 		for (let guard = 0; cur && guard < 10_000; guard++) {
 			const b = this.blocks.get(cur);
 			if (!b || b.deleted) return false;
 			if (this.scope.roots.has(cur)) return true;
-			if (this.scope.levels.has(b.parentId ?? "")) return true;
 			cur = b.parentId;
 		}
 		return false;

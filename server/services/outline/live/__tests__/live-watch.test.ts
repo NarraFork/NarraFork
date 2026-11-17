@@ -39,6 +39,7 @@ import {
 	joinLive,
 	liveSessionOf,
 	liveSpaceOf,
+	OUTLINE_LIVE_SOCKET_BOUNDS,
 	releaseLiveSocket,
 	runInLane,
 } from "../registry";
@@ -872,22 +873,6 @@ describe("budgets of a join or watch frame (review S1, S3)", () => {
 		}
 	});
 
-	test("watch frames past the socket's rate are refused without being read", async () => {
-		const one = await page(["o"], "One");
-		const others: Array<{ pageId: string }> = [];
-		for (let i = 0; i < 30; i++) others.push(await page([`x${i}`], `P${i}`));
-		const la = link(owner);
-		const a = open(la, one.pageId);
-		await clock.until(() => a.ready, 5000, "joined");
-		for (const o of others) a.watch({ add: [{ s: o.pageId }] });
-		await clock.settle();
-		const refused = [...a.watchRefused.values()];
-		expect(refused.length).toBeGreaterThan(0);
-		expect(refused.every((code) => code === "unavailable")).toBe(true);
-		expect(a.watchSet.length + refused.length).toBe(31);
-		expect(a.status).toBe("live");
-	});
-
 	test("a subtree watch inside a loaded one past the bound is too_large", async () => {
 		const one = await page(["inner"], "One");
 		const inner = one.ids[0] as string;
@@ -973,5 +958,231 @@ describe("watch changes that cross other traffic (review S2, S4)", () => {
 		expect((await block(a1))?.content).toBe("a1 typed");
 		expect(unsavedTextsOf(one.pageId)).toEqual([]);
 		expect(a.stats.rejects).toBe(0);
+	});
+});
+
+describe("review round 2", () => {
+	test("S6: a level shows its children only: what a subtree watch showed under one goes with that watch", async () => {
+		const one = await page(["d", "x"], "One");
+		const [d, x] = one.ids as [string, string];
+		await agent(
+			Array.from({ length: 15 }, (_, i) => ({
+				op: "insert" as const,
+				parent: { id: x },
+				content: `k${i}`,
+			})),
+		);
+		const limits = OUTLINE_LIVE_LIMITS as { maxWatchBlocks: number };
+		const savedMax = limits.maxWatchBlocks;
+		try {
+			limits.maxWatchBlocks = 10;
+			const a = open(link(owner), d);
+			const f = open(link(writer), "", [{ s: d }, { l: one.pageId }]);
+			await clock.until(() => a.ready && f.ready, 5000, "joined");
+			// x and its 15 children into d: more than d's watch takes, so the watch ends.
+			await agent([{ op: "move", block: { id: x }, parent: { id: d } }]);
+			await clock.settle(100, 20_000);
+			await clock.advance(3000);
+			await clock.settle(100, 20_000);
+			expect(a.closeCode).toBe("too_large");
+			expect(f.watchSet).toEqual([{ l: one.pageId }]);
+			// d is One's child (shown by the level); x is under d now: not shown.
+			expect(f.visible.alive(d)).toBeDefined();
+			expect(f.visible.alive(x)).toBeUndefined();
+			expect(f.visible.children(d)).toEqual([]);
+			expect(f.hasText(x)).toBe(false);
+			type(f, d, "!");
+			await flushAll();
+			expect((await block(d))?.content).toBe("d!");
+			expect(f.stats.rejects).toBe(0);
+		} finally {
+			limits.maxWatchBlocks = savedMax;
+		}
+	});
+
+	test("S7: additions clicked quickly go out together; past the socket's rate they are retried until loaded", async () => {
+		const pages: string[] = [];
+		for (let i = 0; i < 26; i++) pages.push((await page([`c${i}`], `L${i}`)).pageId);
+		const la = link(owner);
+		const a = open(la, pages[0] as string);
+		await clock.until(() => a.ready, 5000, "joined");
+		const framesBefore = la.framesUp;
+		// Same moment: one frame.
+		for (let i = 1; i < 13; i++) a.watch({ add: [{ l: pages[i] as string }] });
+		await clock.settle();
+		expect(a.watchSet.length).toBe(13);
+		expect(la.framesUp - framesBefore).toBe(1);
+		// Spaced out past the batching, faster than the socket's rate: some are told to wait,
+		// and come in later all the same.
+		for (let i = 13; i < 26; i++) {
+			a.watch({ add: [{ l: pages[i] as string }] });
+			await clock.advance(OUTLINE_LIVE_LIMITS.watchBatchMs + 5);
+		}
+		await clock.settle();
+		await clock.advance(20_000);
+		await clock.settle();
+		expect(a.watchSet.length).toBe(26);
+		expect([...a.watchRefused.values()]).toEqual([]);
+	});
+
+	test("S7: a socket past its rate is told too_fast (not unavailable), without a read", async () => {
+		const pages: string[] = [];
+		for (let i = 0; i < 3; i++) pages.push((await page([`c${i}`], `R${i}`)).pageId);
+		const answers: LiveFrame[] = [];
+		const s = new TestSocket(owner, "raw", (frame) => {
+			const d = decodeLiveFrame(frame);
+			if (d) answers.push(d);
+		});
+		await joinLive(s, {
+			kind: LIVE_FRAME.join,
+			handle: 1,
+			n: 0,
+			head: joinHead(pages[0] as string, "edit", "rawratelimit1"),
+			body: new Uint8Array(0),
+		});
+		await clock.settle();
+		const read: string[] = [];
+		setOutlineStore({
+			...realStore,
+			getBlock: async (id) => {
+				read.push(id);
+				return await realStore.getBlock(id);
+			},
+		});
+		for (let w = 1; w <= OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst + 1; w++)
+			handleLiveFrame(
+				s,
+				decodeLiveFrame(
+					encodeLiveFrame({
+						kind: LIVE_FRAME.watch,
+						handle: 1,
+						head: { w, add: [{ l: `nosuchblock${w}` }] },
+					}),
+				) as LiveFrame,
+			);
+		await clock.settle();
+		const codes = answers
+			.filter((f) => f.kind === LIVE_FRAME.watched)
+			.flatMap((f) =>
+				((f.head as { refused?: [unknown, string][] }).refused ?? []).map((r) => r[1]),
+			);
+		expect(codes.filter((c) => c === "too_fast")).toHaveLength(1);
+		expect(codes.filter((c) => c === "access_denied")).toHaveLength(
+			OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst,
+		);
+		// The one past the rate was not read.
+		expect(read).not.toContain(`nosuchblock${OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst + 1}`);
+		releaseLiveSocket(s);
+	});
+
+	test("S8: a person's move bringing more than the space takes is refused as too_large, and said so", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const a1 = one.ids[0] as string;
+		const b1 = two.ids[0] as string;
+		await agent(
+			Array.from({ length: 6 }, (_, i) => ({
+				op: "insert" as const,
+				parent: { id: a1 },
+				content: `k${i}`,
+			})),
+		);
+		const a = open(link(owner), "", [{ l: one.pageId }, { s: two.pageId }]);
+		const other = open(link(writer), two.pageId);
+		await clock.until(() => a.ready && other.ready, 5000, "joined");
+		const size = liveSpaceOf(space.id)?.loadedBlocks as number;
+		OUTLINE_LIVE_BOUNDS.maxLoadedBlocks = size + 3;
+		struct(a, [{ t: "m", id: a1, p: b1, k: keyBetween(null, null) }]);
+		await clock.settle();
+		expect(a.lastReject?.code).toBe("too_large");
+		expect((await block(a1))?.parentId).toBe(one.pageId);
+		expect(a.visible.get(a1)?.parentId).toBe(one.pageId);
+		expect(liveSpaceOf(space.id)?.loadedBlocks).toBeLessThanOrEqual(size + 3);
+		expect(other.outline()).toBe("- b1");
+	});
+
+	test("S8: a person's move past their own share is refused as too_large", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const a1 = one.ids[0] as string;
+		const b1 = two.ids[0] as string;
+		await agent(
+			Array.from({ length: 6 }, (_, i) => ({
+				op: "insert" as const,
+				parent: { id: a1 },
+				content: `k${i}`,
+			})),
+		);
+		OUTLINE_LIVE_BOUNDS.maxUserBlocks = 8;
+		const a = open(link(owner), "", [{ l: one.pageId }, { s: two.pageId }]);
+		await clock.until(() => a.ready, 5000, "joined");
+		struct(a, [{ t: "m", id: a1, p: b1, k: keyBetween(null, null) }]);
+		await clock.settle();
+		expect(a.lastReject?.code).toBe("too_large");
+		expect((await block(a1))?.parentId).toBe(one.pageId);
+	});
+
+	test("S8: an outside move bringing more than the space takes ends the watch it went into", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1"], "Two");
+		const a1 = one.ids[0] as string;
+		const b1 = two.ids[0] as string;
+		await agent(
+			Array.from({ length: 6 }, (_, i) => ({
+				op: "insert" as const,
+				parent: { id: a1 },
+				content: `k${i}`,
+			})),
+		);
+		const f = open(link(owner), "", [{ l: one.pageId }, { s: two.pageId }]);
+		await clock.until(() => f.ready, 5000, "joined");
+		const size = liveSpaceOf(space.id)?.loadedBlocks as number;
+		OUTLINE_LIVE_BOUNDS.maxLoadedBlocks = size + 3;
+		await agent([{ op: "move", block: { id: a1 }, parent: { id: b1 } }]);
+		await clock.settle();
+		expect(f.watchSet).toEqual([{ l: one.pageId }]);
+		expect(f.visible.alive(a1)).toBeUndefined();
+		expect(liveSpaceOf(space.id)?.loadedBlocks).toBeLessThanOrEqual(size + 3);
+	});
+
+	test("watch notices waiting past their bound make the participant rejoin", async () => {
+		const one = await page(["a1"], "One");
+		const two = await page(["b1", "b2"], "Two");
+		const [b1, b2] = two.ids as [string, string];
+		const lf = link(owner);
+		const f = open(lf, "", [{ s: one.pageId }, { s: two.pageId }]);
+		await clock.until(() => f.ready, 5000, "joined");
+		type(f, b1, "!");
+		await flushAll();
+		setOutlineStore({
+			...realStore,
+			appendLiveLog: async () => {
+				throw new Error("disk I/O error");
+			},
+		});
+		// A change of F's own waits for the log: its notices wait behind it.
+		struct(f, [
+			{ t: "m", id: b2, p: two.pageId, k: keyBetween(null, f.visible.get(b1)?.orderKey ?? null) },
+		]);
+		await clock.settle();
+		const resyncs = f.stats.resyncs;
+		for (let i = 0; i < OUTLINE_LIVE_BOUNDS.notices + 2; i++) {
+			f.watch({ add: [{ l: `nosuchblock${i}x` }] });
+			await clock.advance(OUTLINE_LIVE_LIMITS.watchBatchMs + 5);
+			f.watch({ remove: [{ l: `nosuchblock${i}x` }] });
+			await clock.advance(250);
+		}
+		await clock.settle();
+		const server = [...(liveSpaceOf(space.id)?.participants.values() ?? [])].find(
+			(x) => x.userId === owner,
+		);
+		expect((server?.notices.length ?? 0) <= OUTLINE_LIVE_BOUNDS.notices).toBe(true);
+		setOutlineStore(realStore);
+		await clock.advance(2_000);
+		await clock.settle();
+		expect(f.stats.resyncs).toBeGreaterThan(resyncs);
+		expect(f.status).toBe("live");
+		expect(f.watchSet).toEqual([{ s: one.pageId }, { s: two.pageId }]);
+		expect(f.outline(two.pageId)).toBe(await freshOutline(two.pageId));
 	});
 });

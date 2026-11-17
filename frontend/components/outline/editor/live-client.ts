@@ -486,6 +486,13 @@ export class LiveClient {
 	 * a block of a removed watch into one that stays).
 	 */
 	private pruneAfter = 0;
+	/** Asked for and not sent yet (they go out together, `watchBatchMs`), by key. */
+	private readonly watchToAdd = new Map<string, LiveWatchWire>();
+	/** Taken out of the set and not sent yet, by key. */
+	private readonly watchToRemove = new Map<string, LiveWatchWire>();
+	private watchTimer: LiveTimer | null = null;
+	/** Answers of `too_fast` in a row (the next ask waits longer each time). */
+	private watchTooFast = 0;
 	/** Watches the server refused, with why (the last answer of each; tests and the editor). */
 	readonly watchRefused = new Map<string, LiveCloseCode>();
 
@@ -581,7 +588,7 @@ export class LiveClient {
 		this.abandonRestores();
 		this.disposed = true;
 		for (const off of this.off.splice(0)) off();
-		for (const t of [this.typingTimer, this.presenceTimer, this.retryTimer])
+		for (const t of [this.typingTimer, this.presenceTimer, this.retryTimer, this.watchTimer])
 			if (t) cancelLiveTimer(t);
 		if (this.handle !== null) {
 			this.transport.send(encodeLiveFrame({ kind: LIVE_FRAME.leave, handle: this.handle }));
@@ -1031,23 +1038,55 @@ export class LiveClient {
 	 */
 	watch(change: { add?: readonly LiveWatchWire[]; remove?: readonly LiveWatchWire[] }): void {
 		if (this.disposed) return;
+		const has = (key: string) => this.watches.some((x) => liveWatchKey(x) === key);
 		const removing = new Set((change.remove ?? []).map(liveWatchKey));
-		const add = (change.add ?? []).filter((w) => {
+		let changed = false;
+		for (const w of change.remove ?? []) {
 			const key = liveWatchKey(w);
-			return !removing.has(key) && !this.watches.some((x) => liveWatchKey(x) === key);
-		});
-		for (const w of add) this.watchAsked.set(liveWatchKey(w), w);
-		// Asked for and not answered yet: the answer's `ok` is not taken (and removed again).
-		for (const key of removing) this.watchAsked.delete(key);
-		const remove = this.watches.filter((w) => removing.has(liveWatchKey(w)));
-		if (remove.length > 0) {
-			this.watches = this.watches.filter((w) => !removing.has(liveWatchKey(w)));
+			if (this.watchToAdd.delete(key)) this.watchAsked.delete(key);
+			// Asked for and not answered yet: the answer's `ok` is not taken (and removed again).
+			else if (this.watchAsked.delete(key)) continue;
+			else if (has(key)) {
+				this.watches = this.watches.filter((x) => liveWatchKey(x) !== key);
+				this.watchToRemove.set(key, w);
+				changed = true;
+			}
+		}
+		for (const w of change.add ?? []) {
+			const key = liveWatchKey(w);
+			if (removing.has(key)) continue;
+			if (this.watchToRemove.delete(key)) {
+				// Its removal never went out: the server still has it.
+				this.watches.push(w);
+				changed = true;
+			} else if (!has(key) && !this.watchAsked.has(key)) {
+				this.watchAsked.set(key, w);
+				this.watchToAdd.set(key, w);
+			}
+		}
+		if (changed) {
 			this.rescope();
 			this.rebuildVisible();
 			this.syncViews(null);
 		}
-		if (add.length === 0 && remove.length === 0) return;
-		this.sendWatch(add, remove);
+		if (this.watchToAdd.size > 0 || this.watchToRemove.size > 0) this.scheduleWatch();
+	}
+
+	/** Changes asked for close together go out as one frame. */
+	private scheduleWatch(delayMs: number = OUTLINE_LIVE_LIMITS.watchBatchMs): void {
+		if (this.watchTimer || this.disposed) return;
+		this.watchTimer = liveTimeout(() => {
+			this.watchTimer = null;
+			this.flushWatch();
+		}, delayMs);
+	}
+
+	private flushWatch(): void {
+		const add = [...this.watchToAdd.values()];
+		const remove = [...this.watchToRemove.values()];
+		this.watchToAdd.clear();
+		this.watchToRemove.clear();
+		if (add.length > 0 || remove.length > 0) this.sendWatch(add, remove);
 	}
 
 	/**
@@ -1121,11 +1160,14 @@ export class LiveClient {
 	private coveredDeleted(id: string): boolean {
 		const b = this.confirmed.get(id);
 		if (!b?.deleted) return false;
+		// A watched level keeps its deleted children (not what is under them).
+		if (this.scope.levels.has(b.parentId ?? "")) return true;
 		let cur = b.parentId;
 		for (let guard = 0; cur && guard < 10_000; guard++) {
 			const p = this.confirmed.get(cur);
 			if (!p) return false;
-			if (!p.deleted) return this.confirmed.inPage(cur);
+			if (this.scope.roots.has(cur)) return true;
+			if (!p.deleted) return this.confirmed.underRoot(cur);
 			cur = p.parentId;
 		}
 		return false;
@@ -1133,8 +1175,29 @@ export class LiveClient {
 
 	/** The answer to a watch request, or watches that ended. */
 	private onWatched(head: LiveWatchedHead, body: Uint8Array): void {
-		const ended = [...(head.gone ?? []), ...(head.refused ?? []).map(([w]) => w)];
-		for (const [w, code] of head.refused ?? []) {
+		// Too fast for the server: asked again a little later, waiting longer each time in a row,
+		// and given up (refused) after `watchRetries`.
+		const again: LiveWatchWire[] = [];
+		const refusedNow = (head.refused ?? []).filter(([w, code]) => {
+			if (code !== "too_fast") return true;
+			const key = liveWatchKey(w);
+			if (!this.watchAsked.has(key)) return false;
+			if (this.watchTooFast >= OUTLINE_LIVE_LIMITS.watchRetries) return true;
+			again.push(w);
+			return false;
+		});
+		if (again.length > 0) {
+			const delay = Math.min(
+				OUTLINE_LIVE_LIMITS.watchRetryMs * 2 ** this.watchTooFast,
+				OUTLINE_LIVE_LIMITS.watchRetryMaxMs,
+			);
+			this.watchTooFast++;
+			for (const w of again) this.watchToAdd.set(liveWatchKey(w), w);
+			this.scheduleWatch(delay);
+		}
+		if ((head.ok ?? []).length > 0) this.watchTooFast = 0;
+		const ended = [...(head.gone ?? []), ...refusedNow.map(([w]) => w)];
+		for (const [w, code] of refusedNow) {
 			this.watchRefused.set(liveWatchKey(w), code);
 			this.watchAsked.delete(liveWatchKey(w));
 		}
@@ -1843,9 +1906,12 @@ export class LiveClient {
 		}
 		this.epoch = head.epoch;
 		this.opSeq = head.op;
-		// A removal whose answer will not come (this join named the set whole).
-		if (this.pruneAfter > 0) {
+		// A removal whose answer will not come, or that was never sent (this join named the set
+		// whole); additions not sent yet go out with the asked ones below.
+		this.watchToAdd.clear();
+		if (this.pruneAfter > 0 || this.watchToRemove.size > 0) {
 			this.pruneAfter = 0;
+			this.watchToRemove.clear();
 			this.prune();
 		}
 		this.setStatus("live");
