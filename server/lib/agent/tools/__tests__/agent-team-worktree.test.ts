@@ -23,6 +23,8 @@ let failRun = false;
 let failAfterCreate = false;
 let agentTool: typeof import("../task").agentTool;
 let realNarratorSubagent: typeof import("@server/services/narrator-subagent");
+let realCommunication: typeof import("@server/services/agent-communication");
+const sent: Array<{ caller: string; id?: string; message: string }> = [];
 let items: typeof import("@server/services/teams/work-items");
 
 const LEAD = "p3a-lead";
@@ -58,6 +60,16 @@ beforeAll(async () => {
 			return `<background_task_id>${id}</background_task_id>`;
 		}),
 	}));
+	realCommunication = await import("@server/services/agent-communication");
+	mock.module("@server/services/agent-communication", () => ({
+		...realCommunication,
+		sendSubagentMessageDetailed: mock(
+			async (input: { callerNarratorId: string; id?: string; message: string }) => {
+				sent.push({ caller: input.callerNarratorId, id: input.id, message: input.message });
+				return { output: "sent", targets: [{ id: input.id ?? "", status: "queued" }] };
+			},
+		),
+	}));
 	({ agentTool } = await import("../task"));
 	items = await import("@server/services/teams/work-items");
 });
@@ -65,11 +77,13 @@ beforeAll(async () => {
 afterAll(() => {
 	items.setWorkItemPortsForTests(null);
 	mock.module("@server/services/narrator-subagent", () => realNarratorSubagent);
+	mock.module("@server/services/agent-communication", () => realCommunication);
 	mock.restore();
 });
 
 beforeEach(async () => {
 	runCalls.length = 0;
+	sent.length = 0;
 	failRun = false;
 	failAfterCreate = false;
 	temporary = await mkdtemp(join(tmpdir(), "nf-agent-team-"));
@@ -138,9 +152,7 @@ beforeEach(async () => {
 				relocatedTo: null,
 			};
 		},
-		holdSessions: async (_ids, fn) => ({ held: true, value: await fn() }),
 		principalOf: async (userId) => ({ userId, isAdmin: false }),
-		gitIdentity: async () => null,
 	});
 });
 
@@ -311,5 +323,29 @@ describe("Team tool", () => {
 		expect(missing.output).toContain("work.ready requires item");
 		const listed = JSON.parse((await teamTool.execute({ action: "work.list" }, ctx())).output);
 		expect(listed.items.map((row: { id: string }) => row.id)).toEqual([item.id]);
+	});
+});
+
+describe("Team work.sync", () => {
+	test("tells the item's worker to merge the base; nothing is merged on the server", async () => {
+		const { teamTool } = await import("../team");
+		await agentTool.execute({ isolation: "worktree", title: "Synced", prompt: "p" }, ctx());
+		const item = only();
+		const path = items.worktreePathOf(item) ?? "";
+		const head = await git(["rev-parse", "HEAD"], path);
+		await writeFile(join(source, "b.txt"), "b\n");
+		await git(["add", "b.txt"]);
+		await git(["-c", "user.name=T", "-c", "user.email=t@e.test", "commit", "-qm", "base moved"]);
+		const outcome = JSON.parse(
+			(await teamTool.execute({ action: "work.sync", item: item.id }, ctx())).output,
+		);
+		expect(outcome).toMatchObject({
+			outcome: "handed_off",
+			worker: "p3a-worker-1",
+			delivered: true,
+		});
+		expect(sent).toEqual([{ caller: LEAD, id: "p3a-worker-1", message: outcome.instruction }]);
+		expect(outcome.instruction).toContain("git merge --no-ff");
+		expect(await git(["rev-parse", "HEAD"], path)).toBe(head);
 	});
 });

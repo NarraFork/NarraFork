@@ -18,6 +18,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { LocalBackend } from "../../../lib/agent/execution/local-backend";
+import { setGitHardeningProbeForTests } from "../../../lib/git-exec-hardening";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
 import {
@@ -33,11 +34,11 @@ import {
 	cleanupWorkItem,
 	createWorkItem,
 	markReady,
-	overlappingPaths,
 	recordDecision,
 	recordReview,
 	settleIsolatedWorkItem,
 	setWorkItemPortsForTests,
+	syncInstruction,
 	syncWorkItem,
 	updateBrief,
 	type WorkActor,
@@ -56,8 +57,6 @@ const NOW = "2026-11-17T00:00:00.000Z";
 let temporary: string;
 let source: string;
 let dependents: WorktreeDependent[];
-let runningWorkers: Set<string>;
-let held: string[][];
 
 async function git(args: string[], cwd = source) {
 	const result = await safeSpawn({
@@ -215,18 +214,7 @@ function fixturePorts(): WorkItemWorktreePorts {
 					signal,
 				),
 			),
-		holdSessions: async (ids, fn) => {
-			held.push([...ids]);
-			const busy = ids.find((id) => runningWorkers.has(id));
-			return busy ? { held: false, busy } : { held: true, value: await fn() };
-		},
 		principalOf: async (userId) => ({ userId, isAdmin: false }),
-		gitIdentity: async () => ({
-			GIT_AUTHOR_NAME: "Team",
-			GIT_AUTHOR_EMAIL: "team@e.test",
-			GIT_COMMITTER_NAME: "Team",
-			GIT_COMMITTER_EMAIL: "team@e.test",
-		}),
 	};
 }
 
@@ -298,8 +286,6 @@ beforeEach(async () => {
 	await commitAll(source, "initial");
 	await mkdir(join(source, ".worktrees"));
 	dependents = [];
-	runningWorkers = new Set();
-	held = [];
 	seedTeam();
 	setWorkItemPortsForTests(fixturePorts());
 });
@@ -454,111 +440,133 @@ describe("work item lifecycle", () => {
 	});
 });
 
+/**
+ * Every git the server runs while `fn` runs, through a `git` first on PATH that logs its
+ * arguments (one line each) and runs the real one.
+ */
+async function tracingGit<T>(fn: () => Promise<T>): Promise<{ value: T; calls: string[][] }> {
+	const bin = join(temporary, "bin");
+	const log = join(temporary, "git-calls.log");
+	await mkdir(bin, { recursive: true });
+	const real = (
+		await safeSpawn({ cmd: ["sh", "-c", "command -v git"], timeout: 5000 })
+	).stdout.trim();
+	await writeFile(
+		join(bin, "git"),
+		`#!/bin/sh\nprintf '%s\\037' "$@" >> ${log}\nprintf '\\n' >> ${log}\nexec ${real} "$@"\n`,
+	);
+	await chmod(join(bin, "git"), 0o755);
+	const previous = process.env.PATH;
+	process.env.PATH = `${bin}:${previous}`;
+	try {
+		const value = await fn();
+		const text = existsSync(log) ? await Bun.file(log).text() : "";
+		return {
+			value,
+			calls: text
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => line.split("\x1f").filter((part) => part !== "")),
+		};
+	} finally {
+		process.env.PATH = previous;
+	}
+}
+
+/** The git subcommand of one traced call (the first argument that is not an option or its value). */
+function subcommand(argv: string[]): string | undefined {
+	for (let index = 0; index < argv.length; index++) {
+		const arg = argv[index] ?? "";
+		if (arg === "-C" || arg === "-c") index++;
+		else if (!arg.startsWith("-")) return arg;
+	}
+	return undefined;
+}
+
 describe("base sync", () => {
-	test("no conflict risk: merged on the server with a merge commit", async () => {
+	test("never merges on the server: the worker gets a deterministic instruction", async () => {
 		const item = await create("Sync me");
+		seedWorker("p3-sync-worker");
+		attachWorker(LEAD, item.id, "p3-sync-worker", agent);
 		const path = worktreePathOf(item) ?? "";
 		await commitFile(path, "mine.txt", "mine\n", "item work");
 		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
 		const before = await git(["rev-parse", "HEAD"], path);
-		const outcome = await syncWorkItem({
-			coordinatorId: LEAD,
-			itemId: item.id,
-			actor: agent,
-			userId: USER,
-		});
-		expect(outcome.outcome).toBe("merged");
-		const head = await git(["rev-parse", "HEAD"], path);
-		expect(head).not.toBe(before);
-		expect((await git(["rev-list", "--parents", "-n", "1", "HEAD"], path)).split(" ")).toHaveLength(
-			3,
+		const delivered: Array<[string, string]> = [];
+		const { value: outcome, calls } = await tracingGit(() =>
+			syncWorkItem({
+				coordinatorId: LEAD,
+				itemId: item.id,
+				actor: agent,
+				deliver: async (worker, text) => {
+					delivered.push([worker, text]);
+					return true;
+				},
+			}),
 		);
-		expect(existsSync(join(path, "theirs.txt"))).toBe(true);
-		expect(await git(["log", "-1", "--format=%an"], path)).toBe("Team");
-		const row = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get();
-		expect(row?.headSha).toBe(head);
+		expect(calls.length).toBeGreaterThan(0);
+		expect(calls.map(subcommand)).not.toContain("merge");
+		expect(calls.map(subcommand)).not.toContain("commit");
+		expect(await git(["rev-parse", "HEAD"], path)).toBe(before);
+		const base = await git(["rev-parse", "main"]);
+		expect(outcome).toMatchObject({
+			outcome: "handed_off",
+			worker: "p3-sync-worker",
+			delivered: true,
+			baseSha: base,
+			head: before,
+		});
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]?.[0]).toBe("p3-sync-worker");
+		expect(delivered[0]?.[1]).toBe(
+			syncInstruction({ itemId: item.id, baseRef: "main", baseSha: base, branch: item.branchName }),
+		);
+		expect(delivered[0]?.[1]).toContain(`git merge --no-ff ${base}`);
+		expect(delivered[0]?.[1]).toContain("Never rebase");
 		expect(events(item.id).at(-1)).toMatchObject({
 			kind: "work.sync",
 			actorKind: "agent",
-			detail: { outcome: "merged" },
+			detail: { outcome: "handed_off", reason: "handed_off", delivered: true },
 		});
-		// Nothing left to bring in.
+		// The worker merges; then nothing is left to bring in.
+		await git(
+			[
+				"-c",
+				"user.name=W",
+				"-c",
+				"user.email=w@e.test",
+				"merge",
+				"-q",
+				"--no-ff",
+				"--no-edit",
+				base,
+			],
+			path,
+		);
 		expect(
-			(await syncWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent, userId: USER }))
-				.outcome,
+			(await syncWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent })).outcome,
 		).toBe("up_to_date");
 	});
 
-	test("conflict risk: handed to the item's worker, branch untouched", async () => {
-		const item = await create("Conflicting");
-		seedWorker("p3-conflict");
-		attachWorker(LEAD, item.id, "p3-conflict", agent);
-		const path = worktreePathOf(item) ?? "";
-		await writeFile(join(path, "tracked.txt"), "item side\n");
-		await commitAll(path, "item edits tracked");
-		await writeFile(join(source, "tracked.txt"), "base side\n");
-		await commitAll(source, "base edits tracked");
-		const before = await git(["rev-parse", "HEAD"], path);
-		const outcome = await syncWorkItem({
-			coordinatorId: LEAD,
-			itemId: item.id,
-			actor: agent,
-			userId: USER,
-		});
-		expect(outcome).toMatchObject({
-			outcome: "handed_off",
-			reason: "overlap",
-			paths: ["tracked.txt"],
-			worker: "p3-conflict",
-		});
-		expect(await git(["rev-parse", "HEAD"], path)).toBe(before);
-		expect(await git(["status", "--porcelain"], path)).toBe("");
-		expect(existsSync(join(path, ".git"))).toBe(true);
-
-		// A running worker is never merged under, even without overlap.
-		await commitFile(source, "other.txt", "x\n", "unrelated base change");
-		runningWorkers.add("p3-conflict");
-		const busy = await syncWorkItem({
-			coordinatorId: LEAD,
-			itemId: item.id,
-			actor: agent,
-			userId: USER,
-		});
-		expect(busy).toMatchObject({ outcome: "handed_off", reason: "worker_running" });
-		expect(await git(["rev-parse", "HEAD"], path)).toBe(before);
-	});
-
-	test("the worker and its live helpers are held through the merge; a running helper is busy", async () => {
-		const item = await create("Held");
-		seedWorker("p3-held");
-		attachWorker(LEAD, item.id, "p3-held", agent);
-		seedWorker("p3-held-helper", "p3-held");
-		seedWorker("p3-held-gone", "p3-held", "archived");
-		const path = worktreePathOf(item) ?? "";
-		await commitFile(path, "mine.txt", "mine\n", "item work");
+	test("no worker, or the instruction not delivered: still handed off, recorded as undelivered", async () => {
+		const item = await create("Nobody yet");
 		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
-		const before = await git(["rev-parse", "HEAD"], path);
-		runningWorkers.add("p3-held-helper");
-		const busy = await syncWorkItem({
+		const none = await syncWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		expect(none).toMatchObject({ outcome: "handed_off", worker: null, delivered: false });
+		seedWorker("p3-gone");
+		attachWorker(LEAD, item.id, "p3-gone", agent);
+		const failed = await syncWorkItem({
 			coordinatorId: LEAD,
 			itemId: item.id,
 			actor: agent,
-			userId: USER,
+			deliver: async () => {
+				throw new Error("Target subagent is archived");
+			},
 		});
-		expect(busy).toMatchObject({ outcome: "handed_off", reason: "worker_running" });
-		expect(held.at(-1)?.sort()).toEqual(["p3-held", "p3-held-helper"]);
-		expect(await git(["rev-parse", "HEAD"], path)).toBe(before);
-		runningWorkers.clear();
-		const merged = await syncWorkItem({
-			coordinatorId: LEAD,
-			itemId: item.id,
-			actor: agent,
-			userId: USER,
-		});
-		expect(merged.outcome).toBe("merged");
+		expect(failed).toMatchObject({ outcome: "handed_off", worker: "p3-gone", delivered: false });
 	});
 
-	test("commits a sync brings in from the base do not count as commits since the review", async () => {
+	test("commits a worker's base merge brings in do not count as commits since the review", async () => {
 		const item = await create("Reviewed then synced");
 		const path = worktreePathOf(item) ?? "";
 		await commitFile(path, "mine.txt", "mine\n", "item work");
@@ -572,25 +580,23 @@ describe("base sync", () => {
 		});
 		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
 		await commitFile(source, "theirs2.txt", "theirs\n", "base moved again");
-		const synced = await syncWorkItem({
-			coordinatorId: LEAD,
-			itemId: item.id,
-			actor: agent,
-			userId: USER,
-		});
-		expect(synced.outcome).toBe("merged");
+		await git(
+			[
+				"-c",
+				"user.name=W",
+				"-c",
+				"user.email=w@e.test",
+				"merge",
+				"-q",
+				"--no-ff",
+				"--no-edit",
+				"main",
+			],
+			path,
+		);
 		expect(
 			(await markReady({ coordinatorId: LEAD, itemId: item.id, actor: agent })).commitsSinceReview,
-		).toBe(
-			1, // the merge commit itself; the two base commits are not counted
-		);
-	});
-
-	test("overlap covers the same path and file-versus-directory collisions", () => {
-		expect(overlappingPaths(["a/b.txt", "c.txt"], ["a/b.txt"])).toEqual(["a/b.txt"]);
-		expect(overlappingPaths(["a"], ["a/b.txt"])).toEqual(["a"]);
-		expect(overlappingPaths(["a/b.txt"], ["a"])).toEqual(["a/b.txt"]);
-		expect(overlappingPaths(["a/b.txt"], ["a/c.txt", "ab"])).toEqual([]);
+		).toBe(1); // the merge commit itself; the two base commits are not counted
 	});
 });
 
@@ -671,69 +677,77 @@ describe("team records", () => {
 });
 
 describe("no repository code runs on the server", () => {
-	/** A hook, an fsmonitor and filter drivers that each leave a mark when git runs them. */
-	async function plant(path: string, marker: string, options: { filters?: boolean } = {}) {
+	/** Every event a read-only command could fire, and the config-defined hook for each. */
+	const HOOK_EVENTS = [
+		"post-index-change",
+		"reference-transaction",
+		"post-checkout",
+		"post-merge",
+		"pre-commit",
+		"prepare-commit-msg",
+		"post-commit",
+		"pre-auto-gc",
+		"post-rewrite",
+	];
+
+	/** Hooks of both kinds, an fsmonitor and a filter, each leaving a mark when git runs it. */
+	async function plant(path: string, marker: string) {
 		// Husky ≥ 5: a relative hooksPath whose directory ignores itself.
 		await git(["config", "core.hooksPath", ".husky/_"]);
 		const hooks = join(path, ".husky", "_");
 		await mkdir(hooks, { recursive: true });
 		await writeFile(join(hooks, ".gitignore"), "*\n");
-		for (const hook of ["pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-merge"]) {
-			await writeFile(join(hooks, hook), `#!/bin/sh\necho ${hook} >> ${marker}\n`);
+		for (const hook of HOOK_EVENTS) {
+			await writeFile(join(hooks, hook), `#!/bin/sh\necho dir-${hook} >> ${marker}\n`);
 			await chmod(join(hooks, hook), 0o755);
 		}
+		// Configuration-defined hooks ignore core.hooksPath.
+		await git(["config", "hook.probe.command", `echo config-hook >> ${marker}`]);
+		for (const event of HOOK_EVENTS) await git(["config", "--add", "hook.probe.event", event]);
 		const fsmonitor = join(temporary, "fsmonitor.sh");
 		await writeFile(fsmonitor, `#!/bin/sh\necho fsmonitor >> ${marker}\nexit 1\n`);
 		await chmod(fsmonitor, 0o755);
 		await git(["config", "core.fsmonitor", fsmonitor]);
-		if (options.filters) {
-			await git(["config", "filter.probe.clean", `sh -c 'echo clean >> ${marker}; cat'`]);
-			await git(["config", "filter.probe.smudge", `sh -c 'echo smudge >> ${marker}; cat'`]);
-			await git(["config", "merge.probe.driver", `sh -c 'echo driver >> ${marker}; exit 1'`]);
-		}
-	}
-
-	test("sync merges with hooks and fsmonitor disabled; an ignored executable hook never runs", async () => {
-		const item = await create("Hooked");
-		const path = worktreePathOf(item) ?? "";
-		const marker = join(temporary, "marker");
-		await commitFile(path, "mine.txt", "mine\n", "item work");
-		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
-		await plant(path, marker);
-		expect(await git(["status", "--porcelain", "--untracked-files=all"], path)).toBe("");
-		await rm(marker, { force: true });
-		const outcome = await syncWorkItem({
-			coordinatorId: LEAD,
-			itemId: item.id,
-			actor: agent,
-			userId: USER,
-		});
-		expect(outcome.outcome).toBe("merged");
-		expect(existsSync(marker)).toBe(false);
-	});
-
-	test("filter or merge drivers in the config: sync hands off, queries never run them", async () => {
-		const item = await create("Filtered");
-		const path = worktreePathOf(item) ?? "";
-		const marker = join(temporary, "marker");
-		await writeFile(join(path, ".gitattributes"), "*.t filter=probe merge=probe\n");
+		await git(["config", "filter.probe.clean", `sh -c 'echo clean >> ${marker}; cat'`]);
+		await git(["config", "filter.probe.smudge", `sh -c 'echo smudge >> ${marker}; cat'`]);
+		await writeFile(join(path, ".gitattributes"), "*.t filter=probe\n");
 		await writeFile(join(path, "a.t"), "a\n");
 		await git(["add", "."], path);
 		await commitAll(path, "attributes");
+	}
+
+	test("status, loss measurement, settle, sync and cleanup run no hook, fsmonitor or filter", async () => {
+		const item = await create("Hooked", TEAM_ISOLATED_WORK_KIND);
+		seedWorker("p3-hooked");
+		attachWorker(LEAD, item.id, "p3-hooked", agent);
+		const path = worktreePathOf(item) ?? "";
+		const marker = join(temporary, "marker");
+		await plant(path, marker);
 		await commitFile(source, "theirs.txt", "theirs\n", "base moved");
-		await plant(path, marker, { filters: true });
 		await rm(marker, { force: true });
-		// Racily clean: status would have to run the clean filter to compare.
+		// Racily clean, stat-dirty files: a status would refresh (write) the index and run the
+		// clean filter to compare them.
 		await writeFile(join(path, "a.t"), "a\n");
-		const outcome = await syncWorkItem({
+		await writeFile(join(path, "tracked.txt"), "base\n");
+		await recordReview({
 			coordinatorId: LEAD,
 			itemId: item.id,
+			verdict: "clear",
+			findings: 0,
+			reviewer: null,
 			actor: agent,
-			userId: USER,
 		});
-		expect(outcome).toMatchObject({ outcome: "handed_off", reason: "custom_drivers" });
-		// The removal channel's own git (status for the loss, worktree remove) is hardened too.
+		expect(
+			(await markReady({ coordinatorId: LEAD, itemId: item.id, actor: agent })).item.state,
+		).toBe("ready");
+		expect(
+			(await syncWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent })).outcome,
+		).toBe("handed_off");
+		expect(await settleIsolatedWorkItem("p3-hooked", { retry: false })).toBe("none");
 		cancelWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		dependents = [
+			{ id: "p3-hooked", title: "w", status: "idle", kind: "subagent", running: false },
+		];
 		const cleaned = await cleanupWorkItem({
 			coordinatorId: LEAD,
 			itemId: item.id,
@@ -742,6 +756,51 @@ describe("no repository code runs on the server", () => {
 			signal: signal(),
 		});
 		expect(cleaned.outcome).toBe("removed");
-		expect(existsSync(marker)).toBe(false);
+		expect(existsSync(marker) ? await Bun.file(marker).text() : "").toBe("");
+	});
+
+	test("an isolated item's settle and cleanup with config-defined hooks run none of them", async () => {
+		const item = await create("Untouched", TEAM_ISOLATED_WORK_KIND);
+		seedWorker("p3-untouched");
+		attachWorker(LEAD, item.id, "p3-untouched", agent);
+		const path = worktreePathOf(item) ?? "";
+		const marker = join(temporary, "marker");
+		await git(["config", "hook.probe.command", `echo config-hook >> ${marker}`]);
+		for (const event of HOOK_EVENTS) await git(["config", "--add", "hook.probe.event", event]);
+		await writeFile(join(path, "tracked.txt"), "base\n"); // stat-dirty, same content
+		dependents = [
+			{ id: "p3-untouched", title: "w", status: "idle", kind: "subagent", running: false },
+		];
+		expect(await settleIsolatedWorkItem("p3-untouched", { retry: false })).toBe("cleaned");
+		expect(existsSync(marker) ? await Bun.file(marker).text() : "").toBe("");
+	});
+
+	test("a git that ignores environment overrides is refused before any git runs", async () => {
+		const live = await create("Old git, live");
+		const done = await create("Old git, cancelled");
+		cancelWorkItem({ coordinatorId: LEAD, itemId: done.id, actor: agent });
+		setGitHardeningProbeForTests(async () => false);
+		const refusal = "git 2.31 or newer is required for team worktrees";
+		try {
+			await expect(
+				syncWorkItem({ coordinatorId: LEAD, itemId: live.id, actor: agent }),
+			).rejects.toThrow(refusal);
+			sqlite.run("UPDATE team_work_items SET last_review = 'clear' WHERE id = ?", [live.id]);
+			await expect(
+				markReady({ coordinatorId: LEAD, itemId: live.id, actor: agent }),
+			).rejects.toThrow(refusal);
+			await expect(
+				cleanupWorkItem({
+					coordinatorId: LEAD,
+					itemId: done.id,
+					principal,
+					actor: agent,
+					signal: signal(),
+				}),
+			).rejects.toThrow(refusal);
+			expect(existsSync(worktreePathOf(done) ?? "")).toBe(true);
+		} finally {
+			setGitHardeningProbeForTests(null);
+		}
 	});
 });

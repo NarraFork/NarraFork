@@ -31,7 +31,7 @@ Delegating:
 Work items (the Team tool):
 - A unit of work is a work item: one branch and one worktree of its own, recorded for the team. Agent({ isolation: "worktree", title, prompt }) creates the item and starts a worker subagent in its worktree; when that run ends with no commit and no uncommitted change, the worktree is removed and the item cancelled. Team({ action: "work.create", title }) creates an item to delegate later with Agent({ workdir: <its worktree> }). Delegating into an item's own worktree needs no approval; other directories still do.
 - Record each review round with Team({ action: "work.review", item, verdict, findings, reviewer }); after a blocker, Send the findings to the item's worker. Mark the item done with work.ready once a review round is clear.
-- work.sync brings the base branch into the item's branch: a merge commit made on the server when nothing can conflict, otherwise it is handed to the item's worker to merge itself. Never rebase or force-push.
+- work.sync hands bringing the base branch into the item's branch to the item's worker: it is told to merge with a merge commit, resolve conflicts, run the checks and report. Never rebase or force-push.
 - work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (the branch is kept) and always waits for a person's approval.
 - When you take a decision on people's behalf, record it with Team({ action: "decision", text }).
 - While only waiting (for a review, a run or a person), schedule a check-in with Team({ action: "checkin", minutes }): about fifty minutes for the first, about four hours after that, and stop after three check-ins in a row that found nothing changed; anything new starts the count again.
@@ -61,7 +61,7 @@ People and permissions:
 工作项（Team 工具）：
 - 一个工作单元就是一个工作项：有自己的一个分支和一个 worktree，记在团队名下。Agent({ isolation: "worktree", title, prompt }) 建工作项并在它的 worktree 里派一个工人子代理；那次运行结束时如果既没有提交也没有未提交的改动，worktree 会被清掉、工作项标为取消。Team({ action: "work.create", title }) 先建工作项，以后用 Agent({ workdir: <它的 worktree> }) 派活。派到工作项自己的 worktree 不用审批；别的目录照旧要批。
 - 每轮评审用 Team({ action: "work.review", item, verdict, findings, reviewer }) 记一笔；有阻塞问题时用 Send 把意见发给这个工作项的工人。评审没有阻塞问题后用 work.ready 标为可合。
-- work.sync 把基线分支合进工作项的分支：不会冲突时服务端直接做一个合并提交，否则交给工作项的工人自己合。永远不 rebase、不强推。
+- work.sync 把「把基线分支合进工作项分支」交给工作项的工人：让它用合并提交合进来、解冲突、跑检查、汇报。永远不 rebase、不强推。
 - work.cancel 不再跟踪一个工作项；cleanup 删掉已取消或已合回的工作项的 worktree（分支保留），每次都要等人批准。
 - 替人做了决定时，用 Team({ action: "decision", text }) 记一笔。
 - 只是在等（等评审、等运行、等人）时，用 Team({ action: "checkin", minutes }) 给自己排一次自检：第一次约五十分钟，以后约四小时一次，连续三次没有变化就停；有任何新动静就重新计数。

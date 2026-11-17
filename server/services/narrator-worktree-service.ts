@@ -20,11 +20,12 @@ import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import {
-	DRIVER_CONFIG_QUERY,
-	filterNeutralizers,
+	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
 	gitConfigEnv,
-	parseDriverConfig,
+	PROGRAM_CONFIG_QUERY,
+	parseProgramConfig,
+	untrustedProgramOverrides,
 } from "../lib/git-exec-hardening";
 import { logger } from "../lib/logger";
 import { type SafeSpawnResult, safeSpawn } from "../lib/spawn";
@@ -816,7 +817,7 @@ export class NarratorWorktreeService<Principal> {
 							GIT_WORK_TREE: undefined,
 							GIT_INDEX_FILE: undefined,
 							GIT_EXTERNAL_DIFF: undefined,
-							...gitConfigEnv(config),
+							...(config ? gitConfigEnv(config) : {}),
 						},
 						signal,
 					}),
@@ -830,10 +831,12 @@ export class NarratorWorktreeService<Principal> {
 	 * Configuration overrides of one command (`git-exec-hardening.ts`).
 	 *
 	 * A worktree's configuration is untrusted: the directory may be one an agent wrote to. Every
-	 * command except creation runs with hooks, fsmonitor, external diff and signing disabled;
-	 * the commands that read the work tree (`status`, and `worktree remove`, which runs `git
-	 * status` itself) also empty every configured filter driver. Creation keeps the repository's
-	 * own behavior (its checkout hooks and filters are what a person creating it expects).
+	 * command except creation runs with hooks (directory and configuration-defined), fsmonitor
+	 * and external diff disabled and without optional index writes; the commands that read the
+	 * work tree (`status`, and `worktree remove`, which runs `git status` itself) also empty every
+	 * configured filter and disable every configuration-defined hook by name. A git that ignores
+	 * environment overrides (older than 2.31) is refused. Creation keeps the repository's own
+	 * behavior (its checkout hooks and filters are what a person creating it expects).
 	 */
 	private async hardenedConfig(
 		target: WorktreeTarget,
@@ -841,31 +844,41 @@ export class NarratorWorktreeService<Principal> {
 		scope: WorktreeGitScope,
 		writing: boolean,
 		signal: AbortSignal,
-	): Promise<Array<readonly [string, string]>> {
-		if (args[0] === "worktree" && args[1] === "add") return [];
+	): Promise<Array<readonly [string, string]> | null> {
+		if (args[0] === "worktree" && args[1] === "add") return null;
+		// Fail closed: a git that ignores the overrides would run everything they disable.
+		await ensureConfigOverridesHonored();
 		const config: Array<readonly [string, string]> = [...GIT_NO_EXEC_CONFIG];
 		if (args[0] !== "status" && !(args[0] === "worktree" && args[1] === "remove")) return config;
-		const drivers = await safeSpawn({
+		const programs = await safeSpawn({
 			cmd: [
 				"git",
 				"--no-optional-locks",
 				...this.scopeArgv(target, scope, writing),
-				...DRIVER_CONFIG_QUERY,
+				...PROGRAM_CONFIG_QUERY,
 			],
 			timeout: WORKTREE_READ_TIMEOUT_MS,
 			maxOutputBytes: 64 * 1024,
 			killProcessTree: true,
-			env: { ...process.env, LC_ALL: "C", GIT_DIR: undefined, ...gitConfigEnv(config) },
+			env: {
+				...process.env,
+				LC_ALL: "C",
+				GIT_DIR: undefined,
+				GIT_COMMON_DIR: undefined,
+				GIT_WORK_TREE: undefined,
+				GIT_INDEX_FILE: undefined,
+				...gitConfigEnv(config),
+			},
 			signal,
 		});
-		if (drivers.exitCode === 1 && !drivers.stdout) return config;
-		if (drivers.exitCode !== 0 || drivers.stdoutTruncated)
+		if (programs.exitCode === 1 && !programs.stdout) return config;
+		if (programs.exitCode !== 0 || programs.stdoutTruncated)
 			error(
 				"WORKTREE_GIT_CONFIG_UNREADABLE",
-				"Cannot read the checkout's driver configuration",
+				"Cannot read the checkout's filter and hook configuration",
 				409,
 			);
-		return [...config, ...filterNeutralizers(parseDriverConfig(drivers.stdout).filters)];
+		return [...config, ...untrustedProgramOverrides(parseProgramConfig(programs.stdout))];
 	}
 
 	/**

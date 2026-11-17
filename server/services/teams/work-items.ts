@@ -35,7 +35,7 @@ import {
 	type TeamWorkEventKind,
 	type TeamWorkItemState,
 } from "@shared/project-teams";
-import { and, asc, desc, eq, gte, inArray, isNotNull, ne, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, notInArray } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../../db";
 import {
 	narrators,
@@ -45,12 +45,11 @@ import {
 	teamWorkItems,
 } from "../../db/schema";
 import { AppError, NotFoundError, ValidationError } from "../../lib/errors";
-import type { GitIdentityEnv } from "../../lib/git-identity";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { NarratorPrincipal } from "../narrator-acl";
-import { ATTRIBUTE_PATHS_MAX, teamGit } from "./team-git";
+import { teamGit } from "./team-git";
 
 type WorkItemRow = typeof teamWorkItems.$inferSelect;
 type Executor = Pick<typeof db, "insert" | "select" | "update">;
@@ -63,8 +62,6 @@ export interface WorkActor {
 
 /** How long one check-in event is looked back for at startup (the longest delay). */
 const CHECKIN_LOOKBACK_MS = TEAM_CHECKIN_MAX_MINUTES * 60_000;
-/** Paths named in a sync's conflict-risk report. */
-const SYNC_REPORTED_PATHS = 20;
 /** Retries of an isolated item's cleanup while its subagent's run is still unwinding. */
 const SETTLE_RETRY_DELAYS_MS = [250, 1000, 3000, 10_000] as const;
 const SETTLE_BLOCKERS_TO_RETRY = new Set([
@@ -108,21 +105,8 @@ export interface WorkItemWorktreePorts {
 		confirmedLoss?: ConfirmedLoss;
 		signal: AbortSignal;
 	}): Promise<WorktreeRemovalResult>;
-	/**
-	 * Run `fn` while none of these sessions runs and none can start (a base sync never merges
-	 * under its worker or the worker's helpers). `held: false` when one is busy.
-	 */
-	holdSessions<T>(
-		narratorIds: readonly string[],
-		fn: () => Promise<T>,
-	): Promise<{ held: true; value: T } | { held: false; busy: string }>;
 	/** The principal an automatic cleanup acts as (the person who started the item). */
 	principalOf(userId: string): Promise<NarratorPrincipal>;
-	/** The git identity of a server-side merge commit. */
-	gitIdentity(input: {
-		userId: string | null;
-		coordinatorId: string;
-	}): Promise<GitIdentityEnv | null>;
 }
 
 /** The loss a person confirmed for a forced removal, copied exactly from a refusal. */
@@ -694,63 +678,53 @@ export function cancelWorkItem(input: {
 
 export type SyncOutcome =
 	| { outcome: "up_to_date"; baseSha: string; head: string }
-	| { outcome: "merged"; baseSha: string; head: string; previousHead: string }
 	| {
 			outcome: "handed_off";
-			reason:
-				| "overlap"
-				| "uncommitted"
-				| "worker_running"
-				| "unrelated"
-				| "too_many_paths"
-				| "custom_drivers"
-				| "merge_failed";
 			baseSha: string;
 			head: string;
-			/** Paths both sides changed (at most 20), for `overlap`. */
-			paths: string[];
-			/** The subagent that brings the base in itself. */
+			/** The subagent that brings the base in itself (null: the item has no worker yet). */
 			worker: string | null;
+			/** Whether the instruction reached the worker. */
+			delivered: boolean;
+			/** The instruction, the same text for the same item and base commit. */
+			instruction: string;
 	  };
 
-/** Paths of one side that collide with the other: the same path, or a file vs. a directory. */
-export function overlappingPaths(ours: readonly string[], theirs: readonly string[]): string[] {
-	const theirSet = new Set(theirs);
-	const theirDirs = new Set<string>();
-	for (const path of theirs) {
-		const parts = path.split("/");
-		for (let i = 1; i < parts.length; i++) theirDirs.add(parts.slice(0, i).join("/"));
-	}
-	const out: string[] = [];
-	for (const path of ours) {
-		const parts = path.split("/");
-		let hit = theirSet.has(path) || theirDirs.has(path);
-		for (let i = 1; !hit && i < parts.length; i++) hit = theirSet.has(parts.slice(0, i).join("/"));
-		if (hit) out.push(path);
-	}
-	return out.sort();
+/** The worker's instruction for a base sync: deterministic for one item and base commit. */
+export function syncInstruction(input: {
+	itemId: string;
+	baseRef: string;
+	baseSha: string;
+	branch: string | null;
+}): string {
+	return [
+		`Team base sync for work item ${input.itemId}: bring the base ${input.baseRef} (commit ${input.baseSha}) into your branch${input.branch ? ` ${input.branch}` : ""} in your worktree.`,
+		"- Commit or set aside your own uncommitted changes first.",
+		`- Merge with a merge commit: git merge --no-ff ${input.baseSha}. Never rebase, never reset the branch, never force-push.`,
+		"- Resolve every conflict keeping both sides' intent, then run the checks that cover the files involved.",
+		"- Report what conflicted, how you resolved it, and the checks you ran.",
+	].join("\n");
 }
 
 /**
- * Bring the team's base branch into the item's branch.
- *
- * Done server-side with a merge commit only when nothing can conflict: the worktree is clean,
- * the worker is not running, and the two sides changed disjoint paths since their merge base
- * (exact listings, no rename detection). Anything else is handed to the item's subagent and the
- * branch is left as it was — never a rebase, never a reset, never a force.
+ * Bring the team's base branch into the item's branch: always the worker's job, never a git
+ * write on the server (a server-side merge would run whatever hooks and drivers the worktree's
+ * configuration names, with nobody approving). When the base is already in the branch nothing
+ * happens; otherwise the worker gets a deterministic instruction through `deliver` (the
+ * coordinator's ordinary message to its subagent) and the worker's git goes through the
+ * ordinary permissions. Recorded as `work.sync` either way.
  */
 export async function syncWorkItem(input: {
 	coordinatorId: string;
 	itemId: string;
 	actor: WorkActor;
-	/** The person behind the coordinator's turn, for the merge commit's identity. */
-	userId: string | null;
+	/** Delivers the instruction to the worker; resolves whether it was delivered. */
+	deliver?: (workerNarratorId: string, instruction: string) => Promise<boolean>;
 }): Promise<SyncOutcome> {
 	const team = requireActiveTeam(input.coordinatorId);
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
-	const path = requireWorktree(item);
-	const git = teamGit(path);
+	const git = teamGit(requireWorktree(item));
 	const baseRef = item.baseRef ?? team.baseBranch;
 	const baseSha = await git.resolveCommit(baseRef);
 	if (!baseSha)
@@ -758,87 +732,45 @@ export async function syncWorkItem(input: {
 	const head = await git.resolveCommit("HEAD");
 	if (!head)
 		throw new AppError("The work item's branch has no commit", 409, "TEAM_HEAD_UNRESOLVED");
-	const port = await ports();
-
-	const record = (result: SyncOutcome) => {
-		const now = new Date().toISOString();
-		db.transaction((tx) => {
-			if (result.outcome === "merged") updateItem(tx, item, { headSha: result.head }, now);
-			recordWorkEvent(tx, {
-				teamId: team.teamId,
-				workItemId: item.id,
-				kind: "work.sync",
-				actor: input.actor,
-				detail: { ...result, baseRef },
-				at: now,
-			});
+	let result: SyncOutcome;
+	if (await git.isAncestor(baseSha, head)) result = { outcome: "up_to_date", baseSha, head };
+	else {
+		const instruction = syncInstruction({
+			itemId: item.id,
+			baseRef,
+			baseSha,
+			branch: item.branchName,
 		});
-		return result;
-	};
-	const handOff = (
-		reason: Extract<SyncOutcome, { outcome: "handed_off" }>["reason"],
-		paths: string[] = [],
-	) =>
-		record({
-			outcome: "handed_off",
-			reason,
+		const worker = item.workerNarratorId;
+		const delivered =
+			worker && input.deliver
+				? await input.deliver(worker, instruction).catch((error) => {
+						logger.warn("Team base sync instruction was not delivered", {
+							workItemId: item.id,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						return false;
+					})
+				: false;
+		result = { outcome: "handed_off", baseSha, head, worker, delivered, instruction };
+	}
+	recordWorkEvent(db, {
+		teamId: team.teamId,
+		workItemId: item.id,
+		kind: "work.sync",
+		actor: input.actor,
+		detail: {
+			outcome: result.outcome,
+			reason: result.outcome === "handed_off" ? "handed_off" : null,
+			baseRef,
 			baseSha,
 			head,
-			paths: paths.slice(0, SYNC_REPORTED_PATHS),
-			worker: item.workerNarratorId,
-		});
-
-	if (await git.isAncestor(baseSha, head)) return record({ outcome: "up_to_date", baseSha, head });
-	// The worker and its helpers are held for the whole check-and-merge: none of them runs, and
-	// none can start, while the server writes into their worktree.
-	const sessions = item.workerNarratorId
-		? [item.workerNarratorId, ...liveHelpersOf(item.workerNarratorId)]
-		: [];
-	const held = await port.holdSessions(sessions, async () => {
-		const dirty = await git.uncommittedChanges();
-		if (dirty.count > 0 || !dirty.exact) return handOff("uncommitted");
-		const mergeBase = await git.mergeBase(head, baseSha);
-		if (!mergeBase) return handOff("unrelated");
-		const [ours, theirs] = await Promise.all([
-			git.changedPaths(mergeBase, head),
-			git.changedPaths(mergeBase, baseSha),
-		]);
-		if (!ours.exact || !theirs.exact) return handOff("too_many_paths");
-		const overlap = overlappingPaths(ours.paths, theirs.paths);
-		if (overlap.length > 0) return handOff("overlap", overlap);
-		// A configured filter or merge driver a touched path selects would run a program the
-		// repository names; the worker merges such a branch itself.
-		const touched = [...new Set([...ours.paths, ...theirs.paths])];
-		if (touched.length > ATTRIBUTE_PATHS_MAX) return handOff("too_many_paths");
-		const driven = await git.pathsSelectingDrivers(touched, baseSha);
-		if (driven.length > 0) return handOff("custom_drivers", driven);
-		const identity = await port.gitIdentity({ userId: input.userId, coordinatorId: team.teamId });
-		const merged = await git.mergeNoFastForward(
-			baseSha,
-			`Merge ${baseRef} into ${item.branchName ?? "the work item branch"}`,
-			identity,
-		);
-		if (!merged.merged) return handOff("merge_failed");
-		return record({ outcome: "merged", baseSha, head: merged.head, previousHead: head });
+			...(result.outcome === "handed_off"
+				? { worker: result.worker, delivered: result.delivered }
+				: {}),
+		},
 	});
-	return held.held ? held.value : handOff("worker_running");
-}
-
-/** The worker's own helpers (second level) that are not archived, bounded. */
-function liveHelpersOf(workerNarratorId: string): string[] {
-	return db
-		.select({ id: narrators.id })
-		.from(narrators)
-		.where(
-			and(
-				eq(narrators.parentNarratorId, workerNarratorId),
-				eq(narrators.type, "subagent"),
-				ne(narrators.status, "archived"),
-			),
-		)
-		.limit(64)
-		.all()
-		.map((row) => row.id);
+	return result;
 }
 
 // ── Cleanup ─────────────────────────────────────────────────────────────────

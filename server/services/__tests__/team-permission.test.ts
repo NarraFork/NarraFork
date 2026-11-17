@@ -268,6 +268,13 @@ describe("decision table", () => {
 			".gitignore",
 			"sub/.gitattributes",
 			".GitAttributes",
+			".GIT/x",
+			".Husky/_/h",
+			".husky./x",
+			".husky /x",
+			".GitHooks./pre-commit",
+			".lfsconfig",
+			"sub/.gitattributes.",
 		])
 			expect(
 				decision("Write", { file_path: join(worktree, relative), content: "x" }, "default"),
@@ -276,6 +283,20 @@ describe("decision table", () => {
 		expect(
 			decision("Write", { file_path: join(worktree, ".git", "config"), content: "x" }, "default"),
 		).toBe("deny");
+		// The configured hooks directory, compared case-insensitively and without trailing dots.
+		for (const variant of [
+			["Tools", "Hooks"],
+			["tools.", "hooks "],
+			["TOOLS", "hooks."],
+		])
+			expect(
+				decision(
+					"Write",
+					{ file_path: join(worktree, ...variant, "post-merge"), content: "x" },
+					"default",
+					{ teamWorktreeGuards: [join(worktree, "tools", "hooks")] },
+				),
+			).toBe("ask");
 		// A configured hooks directory anywhere in the worktree is guarded too.
 		const hooks = join(worktree, "tools", "hooks");
 		expect(

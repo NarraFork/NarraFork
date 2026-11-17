@@ -118,6 +118,7 @@ import { isRuntimeToolNameAllowed } from "./subagent-tools";
 import {
 	describeTeamCleanup,
 	isGitControlRelativePath,
+	isInsideControlDir,
 	teamWorktreePathsForNarrator,
 } from "./teams/team-membership";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
@@ -1463,7 +1464,7 @@ export function isTeamWorktreeScopedCall(
 	const ordinaryFile = (path: string) =>
 		worktrees.some(
 			(root) => paths.contains(root, path) && !isGitControlRelativePath(paths.relative(root, path)),
-		) && !guards.some((guard) => paths.contains(guard, path));
+		) && !guards.some((guard) => isInsideControlDir(guard, path));
 	return targets.length > 0 && targets.every(ordinaryFile);
 }
 

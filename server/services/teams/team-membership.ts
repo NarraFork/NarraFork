@@ -128,16 +128,41 @@ export function teamWorktreePathsForNarrator(narratorId: string): string[] {
 }
 
 /**
+ * A path segment as the file system may resolve it: lower case (case-insensitive file systems)
+ * and without trailing dots and spaces (Windows drops them: `.husky.` is `.husky`).
+ */
+export function controlSegment(segment: string): string {
+	return segment.replace(/[. ]+$/, "").toLowerCase() || segment;
+}
+
+/**
  * Whether a path inside a worktree is git control data: a segment named `.git…` (`.git`,
- * `.gitattributes`, `.gitmodules`, `.gitignore`, `.gitconfig`, `.github`, …), `.husky` or
- * `.githooks`. Writing one changes what git runs or how it reads the tree, so it is never
- * auto-allowed as an ordinary file write of the team.
+ * `.gitattributes`, `.gitmodules`, `.gitignore`, `.gitconfig`, `.github`, …), `.husky`,
+ * `.githooks` or `.lfsconfig`, compared case-insensitively and without trailing dots and spaces.
+ * Writing one changes what git runs or how it reads the tree, so it is never auto-allowed as an
+ * ordinary file write of the team.
  */
 export function isGitControlRelativePath(relative: string): boolean {
 	return relative.split(/[\\/]+/).some((segment) => {
-		const name = segment.toLowerCase();
-		return name.startsWith(".git") || name === ".husky" || name === ".githooks";
+		const name = controlSegment(segment);
+		return (
+			name.startsWith(".git") || name === ".husky" || name === ".githooks" || name === ".lfsconfig"
+		);
 	});
+}
+
+/** Whether `path` is `dir` or inside it, comparing segments as {@link controlSegment} does. */
+export function isInsideControlDir(dir: string, path: string): boolean {
+	const split = (value: string) =>
+		value
+			.split(/[\\/]+/)
+			.filter(Boolean)
+			.map(controlSegment);
+	const parent = split(dir);
+	const child = split(path);
+	return (
+		parent.length <= child.length && parent.every((segment, index) => segment === child[index])
+	);
 }
 
 /**

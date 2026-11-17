@@ -220,24 +220,40 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 			});
 		}
 		case "work.sync": {
+			const toolUseId = ctx.currentToolUseId;
 			const outcome = await items.syncWorkItem({
 				coordinatorId,
 				itemId: requireField(input, "item", action),
 				actor,
-				userId: ctx.userId ?? null,
+				// The coordinator's ordinary message to its own subagent, like Send.
+				deliver: toolUseId
+					? async (worker, instruction) => {
+							const { sendSubagentMessageDetailed } = await import(
+								"../../../services/agent-communication"
+							);
+							const sent = await sendSubagentMessageDetailed({
+								callerNarratorId: ctx.narratorId,
+								id: worker,
+								message: instruction,
+								toolUseId,
+								toolCallBinding: ctx.toolCallBinding,
+								signal: ctx.signal,
+								locale: ctx.locale,
+								userId: ctx.userId ?? null,
+							});
+							return sent.targets.some((target) => target.status !== "failed");
+						}
+					: undefined,
 			});
 			if (outcome.outcome !== "handed_off") return result(outcome);
 			const label = await workerLabel(ctx, outcome.worker);
 			return result({
 				...outcome,
-				nextAction:
-					outcome.reason === "worker_running"
-						? "The worker is running in this worktree; nothing was merged. Try again when it is idle, or ask it to bring the base in."
-						: `Nothing was merged and the branch is unchanged. ${
-								label
-									? `Send the worker ("${label}")`
-									: "Delegate a subagent in the item's worktree"
-							}: merge the base commit ${outcome.baseSha} into its branch with a merge commit, resolve any conflict, commit, and report. No rebase, no force push.`,
+				nextAction: outcome.delivered
+					? `The worker ("${label}") was told to merge the base into its branch and report; nothing was merged on the server. Wait for its report.`
+					: label
+						? `The instruction did not reach the worker ("${label}"). Send it the instruction yourself (restore it first with Agent({ unarchive }) if it is archived).`
+						: "The item has no worker yet: delegate the instruction with Agent({ workdir: <the item's worktree>, prompt: instruction }).",
 			});
 		}
 		case "work.cancel": {
@@ -313,7 +329,7 @@ export const teamTool: ToolDefinition = {
 		"Team coordinator only: manage the team's work items, brief, decisions and check-ins. " +
 		"work.list lists items; work.create makes an item with its own branch and worktree from the team's base branch; " +
 		"work.review records one review round (verdict, findings, reviewer); work.ready marks an item done after a clear review; " +
-		"work.sync brings the base into the item's branch (server-side merge commit when nothing can conflict, otherwise handed to the item's worker; never a rebase); " +
+		"work.sync tells the item's worker to merge the base into its branch with a merge commit (never on the server, never a rebase); " +
 		"work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (never its branch) and always asks a person; " +
 		"brief reads or replaces the team brief every subagent follows; decision records a decision taken on people's behalf; " +
 		"checkin schedules one wake-up of this session after N minutes.",

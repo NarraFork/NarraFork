@@ -257,38 +257,3 @@ export async function uncommittedChanges(
 	}
 	return { count, exact: !result.truncated };
 }
-
-export interface GitChangedPaths {
-	/** Repository-relative paths, as git prints them with `-z` (no quoting). */
-	paths: string[];
-	/** False when the listing hit the output cap: `paths` is then only a prefix. */
-	exact: boolean;
-}
-
-/** Listing cap of {@link changedPathsBetween}; past it the answer is a prefix. */
-export const GIT_CHANGED_PATHS_MAX_BYTES = 256 * 1024;
-
-/**
- * Paths that differ between two commits, without rename detection: a renamed file is its old
- * and its new path, so a rename on one side and an edit on the other still share a path.
- *
- * Callers judging conflict risk must treat `exact: false` as "unknown", never as "no overlap".
- */
-export async function changedPathsBetween(
-	run: GitQueryRunner,
-	from: string,
-	to: string,
-	maxOutputBytes = GIT_CHANGED_PATHS_MAX_BYTES,
-): Promise<GitChangedPaths> {
-	assertSha(from);
-	assertSha(to);
-	const result = await run(["diff", "--name-only", "--no-renames", "-z", from, to, "--"], {
-		maxOutputBytes,
-	});
-	if (result.exitCode !== 0) throw failure("git diff --name-only", result);
-	const fields = result.stdout.split("\0");
-	// Complete output ends with NUL (one empty trailing field); truncated output ends with a
-	// partial path. Either way the last field is not a path.
-	fields.pop();
-	return { paths: fields.filter((field) => field.length > 0), exact: !result.truncated };
-}
