@@ -178,6 +178,8 @@ export function resolveWSData(
 			connectedAt: Date.now(),
 			lastPongAt: Date.now(),
 			subscribedTerminals: new Set(),
+			userId: userInfo?.userId,
+			userRole: userInfo?.role,
 			sessionExp: sessionAuth?.sessionExp,
 			sessionId: sessionAuth?.sessionId,
 			sessionUserId: sessionAuth?.sessionUserId,

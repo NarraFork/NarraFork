@@ -1,12 +1,29 @@
-import { Hono } from "hono";
-import { ValidationError } from "../lib/errors";
-import { requireNarratorAccess } from "../lib/narrator-access";
+import { type Context, Hono } from "hono";
+import { NotFoundError, ValidationError } from "../lib/errors";
+import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
 import { createTerminalSchema, updateTerminalViewStateSchema } from "../lib/validators";
 import { requireAuth } from "../middleware/auth";
+import type { NarratorAccessNeed } from "../services/narrator-acl";
+import { canWriteNarrator } from "../services/narrator-acl";
+import { listTreeTerminals, subagentTerminalAccessAllowed } from "../services/subagent-terminals";
 import { terminalService } from "../services/terminal-service";
 import { terminalViewService } from "../services/terminal-view-service";
 
 export const terminalRoutes = new Hono();
+
+/**
+ * A subagent's terminal follows the subagent's (so its ACL root's) access: `read` for its
+ * metadata, `write` to open, rename or close it (`subagent-terminals.ts`). Refused like a
+ * terminal that does not exist, so ids cannot be probed.
+ */
+async function requireSubagentTerminalAccess(
+	c: Context,
+	terminalId: string,
+	need: NarratorAccessNeed,
+) {
+	if (!(await subagentTerminalAccessAllowed(terminalId, narratorPrincipalOf(c), need)))
+		throw new NotFoundError("Terminal", terminalId);
+}
 
 // === Terminal CRUD (collection) ===
 
@@ -19,6 +36,22 @@ terminalRoutes.get("/", async (c) => {
 	// narrator's read access.
 	await requireNarratorAccess(c, narratorId, "read");
 	return c.json(await terminalService.listByNarrator(narratorId));
+});
+
+/**
+ * The running terminals of the subagents below a narrator (the coordinator page's read-only
+ * list). Listing needs read access; `canOpen` says whether this caller may open them, which is
+ * write access on the ACL root.
+ */
+terminalRoutes.get("/tree", async (c) => {
+	const narratorId = c.req.query("narratorId");
+	if (!narratorId) {
+		throw new ValidationError("narratorId query parameter is required");
+	}
+	const narrator = await requireNarratorAccess(c, narratorId, "read");
+	const listing = await listTreeTerminals(narrator);
+	const canOpen = await canWriteNarrator(narrator, narratorPrincipalOf(c));
+	return c.json({ ...listing, canOpen });
 });
 
 terminalRoutes.post("/", async (c) => {
@@ -76,11 +109,13 @@ terminalRoutes.put("/view-state", requireAuth, async (c) => {
 // === Terminal by ID (must be AFTER static paths to avoid shadowing) ===
 
 terminalRoutes.get("/:id", async (c) => {
+	await requireSubagentTerminalAccess(c, c.req.param("id"), "read");
 	const terminal = await terminalService.getById(c.req.param("id"));
 	return c.json(terminal);
 });
 
 terminalRoutes.get("/:id/processes", async (c) => {
+	await requireSubagentTerminalAccess(c, c.req.param("id"), "write");
 	const processes = await terminalService.getProcesses(c.req.param("id"));
 	return c.json(processes);
 });
@@ -88,6 +123,7 @@ terminalRoutes.get("/:id/processes", async (c) => {
 terminalRoutes.patch("/:id", async (c) => {
 	const body = await c.req.json();
 	const id = c.req.param("id");
+	await requireSubagentTerminalAccess(c, id, "write");
 
 	// Name update
 	if (body?.name !== undefined) {
@@ -103,6 +139,7 @@ terminalRoutes.patch("/:id", async (c) => {
 });
 
 terminalRoutes.delete("/:id", async (c) => {
+	await requireSubagentTerminalAccess(c, c.req.param("id"), "write");
 	await terminalService.kill(c.req.param("id"));
 	return c.json({ ok: true });
 });

@@ -111,7 +111,7 @@ import { isTeamMember, type RuntimeSourceRow, teamRootOf } from "../lib/runtime-
 import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import type { RuntimePolicy } from "./agent-runtime/policy";
+import { isBrowserReadAction, type RuntimePolicy } from "./agent-runtime/policy";
 import { isRuntimeToolNameAllowed } from "./subagent-tools";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
@@ -800,6 +800,11 @@ export function resolvePermissionDecision(
 		if (meta) meta.blacklistReason = `Review mode: ${toolName} modifies worktree resources.`;
 		return "deny";
 	}
+	// A reviewer may look at pages, never act on them (see `isBrowserReadAction`).
+	if (reviewReadOnlyBash && toolName === "Browser" && !isBrowserReadAction(input)) {
+		if (meta) meta.blacklistReason = REVIEW_BROWSER_READ_ONLY_REASON;
+		return "deny";
+	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
@@ -1341,6 +1346,12 @@ function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boole
 	if (toolName === "Worktree") return input.action === "list";
 	return toolName === "StructSed" && input.dry_run !== false;
 }
+
+/** Why a reviewer's Browser call that does more than read a page is refused. */
+export const REVIEW_BROWSER_READ_ONLY_REASON =
+	"Review mode: Browser may only read pages (launch headless, navigate, screenshot without " +
+	"file_path, get_text, dom, scroll, close, ...). Clicking, typing, filling forms, running " +
+	"scripts and profiling are not available to a read-only reviewer.";
 
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
@@ -5052,7 +5063,8 @@ export async function recheckFinalToolExecutionPermission(
 					analysis.dangerousPatterns.length > 0 ||
 					analysis.hasEnvInjection)) ||
 			(["GenUI", "Notification", "ScheduledTask", "Worktree"].includes(check.toolName) &&
-				!isReadOnlyCall(check.toolName, check.input)))
+				!isReadOnlyCall(check.toolName, check.input)) ||
+			(check.toolName === "Browser" && !isBrowserReadAction(check.input)))
 	)
 		finalPermissionDeny("read-only capability ceiling");
 	const sendInScope =

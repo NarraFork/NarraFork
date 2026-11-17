@@ -71,8 +71,78 @@ const SPAWN_TOOLS: readonly string[] = Object.freeze([
 	"ContinueTask",
 	"ForkNarrator",
 ]);
-/** A worker does the `general` work and may also hand parts of it to helpers it waits for. */
-const WORKER_TOOLS = Object.freeze([...GENERAL_TOOLS, "Agent"]);
+/**
+ * Optional tools a delegation template may preload (`enabledTools` at creation), the way a
+ * knowledge steward gets its knowledge tools. Each still needs its template's ceiling to allow
+ * it, and its own permission prompts and caps (`agent-resource-caps.ts`) apply as for anyone.
+ */
+export const TERMINAL_TOOL = "Terminal";
+export const BROWSER_TOOL = "Browser";
+/**
+ * A worker does the `general` work, may hand parts of it to helpers it waits for, and runs
+ * long-lived things itself: an interactive terminal (dev server, REPL) and a browser.
+ */
+const WORKER_TOOLS = Object.freeze([...GENERAL_TOOLS, "Agent", TERMINAL_TOOL, BROWSER_TOOL]);
+/**
+ * Optional tools a read-only ceiling may still list. Browser is one: under a read-only ceiling
+ * the permission gate allows only its page-reading actions (`isBrowserReadAction`), so a
+ * reviewer can look at a page but never click, type, run scripts or write files with it.
+ */
+const READ_ONLY_OPTIONAL_TOOLS = Object.freeze([BROWSER_TOOL]);
+/** The tools a read-only ceiling narrows built-ins to. */
+const READ_ONLY_CEILING_TOOLS = Object.freeze([...READ_TOOLS, ...READ_ONLY_OPTIONAL_TOOLS]);
+
+/**
+ * Browser actions that only look at a page: open or move to a URL, read it, capture it without
+ * writing a file, and close it. Clicking, typing, form filling, script evaluation, tracing and
+ * memory profiles (which write files and share links) are not reads.
+ */
+const BROWSER_READ_ACTIONS: ReadonlySet<string> = new Set([
+	"launch",
+	"navigate",
+	"screenshot",
+	"get_text",
+	"get_attribute",
+	"get_console",
+	"get_network",
+	"network_start",
+	"network_stop",
+	"wait",
+	"scroll",
+	"hover",
+	"dom",
+	"close",
+	"set_ttl",
+	"set_viewport",
+	"list_sessions",
+]);
+
+/**
+ * Whether a Browser call only reads pages. A screenshot saved to a file writes, and a headed
+ * launch may open a tab in the person's own browser with their sign-ins, so neither is a read.
+ */
+export function isBrowserReadAction(input: Record<string, unknown>): boolean {
+	const action = typeof input.action === "string" ? input.action : "";
+	if (!BROWSER_READ_ACTIONS.has(action)) return false;
+	if (action === "screenshot" && input.file_path !== undefined) return false;
+	if (action === "launch" && input.headless === false) return false;
+	return true;
+}
+
+/**
+ * The optional tools a template's subagent starts with loaded. Only what its ceiling (and the
+ * delegator's, `isRuntimeToolAllowed` on the merged policy) allows is kept by the caller.
+ */
+export function delegationPreloadTools(template: string): readonly string[] {
+	switch (template) {
+		case "worker":
+			return [TERMINAL_TOOL, BROWSER_TOOL];
+		case "review":
+			return [BROWSER_TOOL];
+		default:
+			return [];
+	}
+}
 
 /**
  * Subagents nest at most this many levels below a primary narrator: a primary's subagent
@@ -167,10 +237,10 @@ export function compileDelegationPolicy(input: DelegationTemplateInput): Runtime
 		case "search":
 			return { ...base, tools: [...SEARCH_TOOLS], mcp: "none", readOnly: true, searchOnly: true };
 		case "review":
-			// Review may inspect Git synchronously, never control running tasks.
+			// Review may inspect Git synchronously and look at pages, never control running tasks.
 			return {
 				...base,
-				tools: builtin(READ_TOOLS.filter((name) => name !== "Stop")),
+				tools: builtin([...READ_TOOLS.filter((name) => name !== "Stop"), BROWSER_TOOL]),
 				mcp: "readOnly",
 				readOnly: true,
 				readOnlyGitShell: true,
@@ -220,7 +290,7 @@ function intersect(current: "all" | string[], declared: readonly string[] | unde
 /**
  * Merge ceiling declarations from any number of layers. Every field only narrows,
  * so order does not matter. Read-only from any layer also narrows built-ins to the
- * read tools and MCP to read-only.
+ * read tools (plus Browser, gated to its read actions) and MCP to read-only.
  */
 export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]): RuntimePolicy {
 	let builtin: "all" | string[] = "all";
@@ -247,7 +317,7 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 		for (const key of trait.deny ?? []) denied.add(key);
 	}
 	if (readOnly) {
-		builtin = intersect(builtin, READ_TOOLS);
+		builtin = intersect(builtin, READ_ONLY_CEILING_TOOLS);
 		if (mcp === "nonDenied") mcp = "readOnly";
 	}
 	// The deepest level never orchestrates, whatever its template or any layer allows.

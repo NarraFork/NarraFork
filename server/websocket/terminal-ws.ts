@@ -2,6 +2,10 @@ import type { ServerWebSocket } from "bun";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { terminalWsMessageSchema } from "../lib/validators";
+import {
+	subagentNarratorAccessAllowed,
+	subagentTerminalAccessAllowed,
+} from "../services/subagent-terminals";
 import { terminalService } from "../services/terminal-service";
 import type { WSData } from "./ws-handler";
 
@@ -11,6 +15,10 @@ export interface TerminalWSData {
 	connectedAt: number;
 	lastPongAt: number;
 	subscribedTerminals: Set<string>;
+	/** The authenticated user, for subagent terminals' ACL (`subagent-terminals.ts`). */
+	userId?: string;
+	/** Live role at upgrade; `admin` passes every narrator ACL. */
+	userRole?: string;
 }
 
 // Server → Client messages
@@ -116,6 +124,34 @@ function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 		});
 }
 
+function principalOf(ws: TerminalWS) {
+	return {
+		userId: ws.data.userId ?? ws.data.sessionUserId ?? "",
+		isAdmin: ws.data.userRole === "admin",
+	};
+}
+
+/**
+ * Opening a subagent's terminal (watching, typing, renaming, closing) needs write access on
+ * the subagent, which is judged on its ACL root. Refused without saying whether it exists.
+ */
+async function mayOpenTerminal(ws: TerminalWS, terminalId: string): Promise<boolean> {
+	if (await subagentTerminalAccessAllowed(terminalId, principalOf(ws), "write")) return true;
+	try {
+		ws.send(
+			JSON.stringify({
+				type: "error",
+				terminalId,
+				code: "TERMINAL_ACCESS_DENIED",
+				message: "Opening this terminal needs write access to its session.",
+			}),
+		);
+	} catch {
+		// connection may be dead
+	}
+	return false;
+}
+
 // === WebSocket handlers ===
 
 export const handleTerminalWS = {
@@ -157,6 +193,7 @@ export const handleTerminalWS = {
 				break;
 			case "subscribe": {
 				for (const id of msg.terminalIds) {
+					if (!(await mayOpenTerminal(ws, id))) continue;
 					subscribeToTerminal(ws, id);
 				}
 				logger.debug("Terminal WS subscribed", { count: msg.terminalIds.length });
@@ -200,6 +237,15 @@ export const handleTerminalWS = {
 			case "create": {
 				const { requestId, ...opts } = msg;
 				try {
+					if (
+						opts.narratorId &&
+						!(await subagentNarratorAccessAllowed(opts.narratorId, principalOf(ws), "write"))
+					)
+						throw new AppError(
+							"Creating a terminal on this session needs write access to it.",
+							403,
+							"TERMINAL_ACCESS_DENIED",
+						);
 					const terminal = await terminalService.create(opts);
 					try {
 						ws.send(JSON.stringify({ type: "created", requestId, terminal }));
@@ -224,6 +270,7 @@ export const handleTerminalWS = {
 				break;
 			}
 			case "kill": {
+				if (!(await mayOpenTerminal(ws, msg.terminalId))) break;
 				try {
 					await terminalService.kill(msg.terminalId);
 					sendToTerminal(msg.terminalId, { type: "killed", terminalId: msg.terminalId });
@@ -245,6 +292,7 @@ export const handleTerminalWS = {
 				break;
 			}
 			case "rename": {
+				if (!(await mayOpenTerminal(ws, msg.terminalId))) break;
 				try {
 					await terminalService.rename(msg.terminalId, msg.name);
 					sendToTerminal(msg.terminalId, {

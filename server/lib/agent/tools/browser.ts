@@ -7,6 +7,7 @@ import {
 	closeSession,
 	createSession,
 	DEFAULT_SESSION_TTL_MS,
+	getAllSessionStats,
 	getSession,
 	listSessions,
 	MAX_DEVICE_SCALE_FACTOR,
@@ -577,7 +578,16 @@ async function handleLaunch(
 		return { output: `Invalid URL: ${url}`, isError: true };
 	}
 
-	const session = await createSession(narratorId, url, headless, ttlMs, captureNetwork, viewport);
+	// Subagent, team and process caps (`agent-resource-caps.ts`); over a cap the launch is
+	// refused before any tab opens.
+	const { reserveBrowserLaunch } = await import("../../../services/agent-resource-caps");
+	const slot = await reserveBrowserLaunch(narratorId, browserSessionCounts);
+	let session: Awaited<ReturnType<typeof createSession>>;
+	try {
+		session = await createSession(narratorId, url, headless, ttlMs, captureNetwork, viewport);
+	} finally {
+		slot.release();
+	}
 	const { title } = await actions.getPageSnapshot(session.page);
 	return {
 		output:
@@ -592,6 +602,16 @@ async function handleLaunch(
 			`Title: ${title}`,
 		metadata: { sessionId: session.id },
 	};
+}
+
+/** Live browser sessions per narrator, from the session registry. */
+function browserSessionCounts(): Map<string, number> {
+	return new Map(
+		getAllSessionStats().narrators.map(({ narratorId, sessionCount }) => [
+			narratorId,
+			sessionCount,
+		]),
+	);
 }
 
 function handleListSessions(narratorId: string): ToolResult {
