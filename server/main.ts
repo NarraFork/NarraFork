@@ -50,6 +50,7 @@ import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host"
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { openFrontendOnce } from "./lib/open-frontend";
 import { IS_WINDOWS, initWslFlag } from "./lib/platform";
+import { runPostShutdownHooks } from "./lib/post-shutdown-hooks";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "./lib/runtime-target";
 import {
@@ -1886,6 +1887,11 @@ registerOperatorShutdownHandler(async ({ reason }) => {
 		skipWindowsProcessTreeKill: preserveForRecovery,
 		skipBashProcessKill: preserveForRecovery,
 	});
+	// Post-shutdown work (currently only unattended mode's machine power-off) must run after
+	// teardown has fully settled — the DB is closed and the clean marker is written — and
+	// before the exit timer. `runPostShutdownHooks` never rejects and is internally bounded,
+	// so a failing hook cannot keep this process alive or change its exit code.
+	await runPostShutdownHooks(reason);
 	setTimeout(() => process.exit(0), 250);
 	return result;
 });

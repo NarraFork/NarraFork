@@ -26,6 +26,7 @@ import { systemLifecycleApi } from "./system-lifecycle";
 import { terminalsApi } from "./terminals";
 import { tokendanceApi } from "./tokendance";
 import { traitLayersApi } from "./trait-layers";
+import { unattendedApi } from "./unattended";
 import { workspaceContextApi } from "./workspace-context";
 
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
@@ -68,6 +69,7 @@ export const api = {
 	...knowledgeApi,
 	...specApi,
 	...systemLifecycleApi,
+	...unattendedApi,
 	...devicesApi,
 	...traitLayersApi,
 	...tokendanceApi,
