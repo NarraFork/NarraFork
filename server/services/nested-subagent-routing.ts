@@ -102,8 +102,23 @@ function ensureStatusListener(): void {
 	if (!hotOnce("narrafork.nestedSubagentStatusListener")) return;
 	eventBus.on("narrator:status_changed", (event) => {
 		const placement = nested.get(event.narratorId);
-		if (placement) scheduleNestedRefresh(placement.parentId, placement.rootId);
+		if (!placement) return;
+		scheduleNestedRefresh(placement.parentId, placement.rootId);
+		// An archived helper runs no more gates; it is re-learned if it is ever unarchived
+		// and runs again (orchestrator registration).
+		if (event.status === "archived") nested.delete(event.narratorId);
 	});
+	eventBus.on("narrator:deleted", (event) => {
+		const placement = nested.get(event.narratorId);
+		if (!placement) return;
+		nested.delete(event.narratorId);
+		scheduleNestedRefresh(placement.parentId, placement.rootId);
+	});
+}
+
+/** Tests only: how many nested subagents are remembered. */
+export function nestedSubagentCount(): number {
+	return nested.size;
 }
 
 function scheduleNestedRefresh(parentId: string, rootId: string): void {

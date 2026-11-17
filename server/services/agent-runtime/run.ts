@@ -934,7 +934,7 @@ async function finishRun(
 	if (publicationRun) await getRuntimePublicationService().releaseUnusedRunSlots(publicationRun);
 	await clearDeliveredHold(id, hold);
 	// A subagent that was stopped or ran out of time takes its helpers with it.
-	if (interrupted || timedOut)
+	if (runStopsHelpers({ cancelled, timedOut }))
 		void stopSubagentHelpers(
 			id,
 			timedOut ? "Parent subagent timed out" : "Parent subagent stopped",
@@ -1412,6 +1412,24 @@ async function registerDetachedTask(
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Subagent detached to background. Await({ type: "agent", id: "${alias}" })`
 	);
+}
+
+/**
+ * Whether a finished run takes the subagent's helpers with it: only when the run itself
+ * was cancelled (a controller's Stop, a `Send({ doInterrupt })`, its task cancelled, its
+ * caller cancelled) or ran out of time.
+ *
+ * Deliberately NOT on the loop's own "interrupted" outcome: the loop also reports that
+ * when it merely breaks to handle queued input (a queued /new or /goal with more input
+ * behind it) or when a planned update pauses it for resumption — cancelling helpers
+ * there would kill work nobody stopped, including runs update recovery resumes. A
+ * person's stop goes through `interruptNarrator`, which stops the helpers itself.
+ *
+ * Nor on an error: an errored subagent is resumable, and its helpers' results wait in
+ * its inbox for that resume rather than being thrown away.
+ */
+export function runStopsHelpers(run: { cancelled: boolean; timedOut: boolean }): boolean {
+	return run.cancelled || run.timedOut;
 }
 
 /** Helpers one stop reaches; a subagent rarely runs more than a few at once. */

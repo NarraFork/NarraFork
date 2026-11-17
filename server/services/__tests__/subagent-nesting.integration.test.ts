@@ -46,7 +46,7 @@ import {
 	resolveRuntimePolicy,
 	withDelegationDepth,
 } from "../agent-runtime/policy";
-import { stopSubagentHelpers } from "../agent-runtime/run";
+import { runStopsHelpers, stopSubagentHelpers } from "../agent-runtime/run";
 import { backgroundTaskService } from "../background-task-service";
 import { DELEGATION_DEPTH_LIMIT_MESSAGE, delegationDepthOf } from "../delegation-depth";
 import { canWriteNarrator } from "../narrator-acl";
@@ -58,7 +58,7 @@ import {
 	nestedSubagentRootOf,
 	resetNestedSubagentRoots,
 } from "../nested-subagent-routing";
-import { loadNestedSubagentSummaries } from "../subagent-nested";
+import { listNestedSubagents, loadNestedSubagentSummaries } from "../subagent-nested";
 import { resetTraitLayerCaches, resolveNarratorRuntimePolicy } from "../trait-layer-service";
 
 const created: string[] = [];
@@ -550,5 +550,113 @@ describe("tree views", () => {
 			awaitingPermission: true,
 		});
 		expect(summary?.agents[1]?.awaitingPermission).toBeUndefined();
+	});
+});
+
+describe("review round 1", () => {
+	test("Stop on an idle worker stops the helpers it left running", async () => {
+		const { primary, worker, helper } = await tree();
+		await narratorService.updateStatus(worker, "idle");
+		await narratorService.updateStatus(helper, "working");
+		const helperRun = await backgroundRun(worker, helper);
+		// The worker's own background task already finished: it has no live run.
+		const now = new Date().toISOString();
+		await db.insert(backgroundTasks).values({
+			id: worker,
+			parentNarratorId: primary,
+			type: "agent",
+			status: "completed",
+			subagentNarratorId: worker,
+			alias: `run-${worker}`,
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
+			completedAt: now,
+		});
+		const { stopTool } = await import("../../lib/agent/tools/stop");
+		const out = await stopTool.execute({ type: "agent", id: worker }, ctx(primary));
+		expect(out.isError).toBeFalsy();
+		expect(out.output).toContain("1 running helper agent(s) were stopped");
+		expect(helperRun.signal.aborted).toBe(true);
+		// A worker with nothing running reports as before.
+		const again = await stopTool.execute({ type: "agent", id: worker }, ctx(primary));
+		expect(again.isError).toBe(true);
+		expect(again.output).toContain("is not running");
+	});
+
+	test("a run takes its helpers with it only when cancelled or timed out", () => {
+		expect(runStopsHelpers({ cancelled: true, timedOut: false })).toBe(true);
+		expect(runStopsHelpers({ cancelled: false, timedOut: true })).toBe(true);
+		// An error, or the loop merely breaking for queued input / a planned-update pause
+		// (reported as "interrupted" without cancelling the run), leaves helpers running.
+		expect(runStopsHelpers({ cancelled: false, timedOut: false })).toBe(false);
+	});
+
+	test("a helper that failed or was stopped says so in its card row", async () => {
+		const { worker, helper, helperSibling } = await tree();
+		const third = await subagent(worker, "general", "third");
+		await narratorService.updateStatus(helper, "idle", { substatus: ["error"] });
+		await narratorService.updateStatus(helperSibling, "idle", { substatus: ["interrupted"] });
+		await narratorService.updateStatus(third, "idle", { substatus: ["unread"] });
+		const agents = (await loadNestedSubagentSummaries([worker])).get(worker)?.agents ?? [];
+		const ended = Object.fromEntries(agents.map((a) => [a.subagentNarratorId, a.ended]));
+		expect(ended[helper]).toBe("failed");
+		expect(ended[helperSibling]).toBe("stopped");
+		expect(ended[third]).toBeUndefined();
+	});
+
+	test("archived and deleted helpers are forgotten by the root routing", async () => {
+		const { primary, worker, helper, helperSibling } = await tree();
+		expect(nestedSubagentRootOf(helper)).toBe(primary);
+		await narratorService.updateStatus(helper, "archived");
+		expect(nestedSubagentRootOf(helper)).toBeUndefined();
+		expect(nestedSubagentRootOf(helperSibling)).toBe(primary);
+		const { eventBus } = await import("../../lib/event-bus");
+		eventBus.emit({ type: "narrator:deleted", narratorId: helperSibling, title: null });
+		expect(nestedSubagentRootOf(helperSibling)).toBeUndefined();
+		expect(nestedSubagentRootOf(worker)).toBeUndefined();
+	});
+
+	test("helper listings for many cards are paged, never cut", async () => {
+		const { worker, helper } = await tree();
+		const ids = [...Array.from({ length: 150 }, (_, i) => `missing-${i}`), worker];
+		const listed = await listNestedSubagents(ids, 5);
+		expect(listed.get(worker)?.subagents.map((row) => row.id)).toContain(helper);
+	});
+
+	test("a user's own template named worker keeps resolving under its name", async () => {
+		const { mkdir, rm, writeFile } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const { narraforkDir } = await import("../../lib/settings");
+		const { compileDelegationCeiling, resolveTemplateDefinition } = await import(
+			"../custom-subagent-service"
+		);
+		const dir = join(narraforkDir, "subagents", "worker");
+		await mkdir(dir, { recursive: true });
+		try {
+			await writeFile(
+				join(dir, "SUBAGENT.md"),
+				"---\nname: worker\ndescription: mine\ntoolAccess: readOnly\n---\n\nMy own worker prompt.\n",
+			);
+			expect((await resolveTemplateDefinition("worker"))?.prompt).toBe("My own worker prompt.");
+			const own = resolveRuntimePolicy([await compileDelegationCeiling("worker")]);
+			expect(own.tools.readOnly).toBe(true);
+			expect(own.capabilities.spawnAgent).toBe(false);
+			const { buildDelegationBasePrompt } = await import("../subagent-tools");
+			expect(
+				await buildDelegationBasePrompt(
+					"worker",
+					"en",
+					(await resolveTemplateDefinition("worker"))?.prompt,
+				),
+			).toBe("My own worker prompt.");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+		expect(await resolveTemplateDefinition("worker")).toBeNull();
+		const builtin = resolveRuntimePolicy([await compileDelegationCeiling("worker")]);
+		expect(builtin.capabilities.spawnAgent).toBe(true);
+		// Other built-in names never resolve to a user's file.
+		expect(await resolveTemplateDefinition("general")).toBeNull();
 	});
 });

@@ -1039,6 +1039,12 @@ try {
 	logger.warn("DeepSeek balance startup refresh failed");
 }
 
+// A user's subagent template named like a later built-in (`worker`) keeps working under
+// its name; say so once at startup so the shadowed built-in is not a mystery.
+void import("./services/custom-subagent-service")
+	.then(({ warnShadowedBuiltinTemplates }) => warnShadowedBuiltinTemplates())
+	.catch(() => {});
+
 // Mark any stale terminals from a previous run as exited
 terminalService.recoverOnStartup().catch((err) => {
 	logger.error("Terminal recovery failed", { error: String(err) });

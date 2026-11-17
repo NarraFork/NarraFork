@@ -5,7 +5,11 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import type { RuntimePolicyTrait } from "../lib/runtime-policy-trait";
 import { narraforkDir } from "../lib/settings";
-import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
+import {
+	BUILTIN_DELEGATION_TEMPLATES,
+	compileDelegationPolicy,
+	LATE_BUILTIN_TEMPLATES,
+} from "./agent-runtime/policy";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -280,16 +284,43 @@ export async function compileDelegationCeiling(
 ): Promise<RuntimePolicyTrait> {
 	return compileDelegationPolicy({
 		template,
-		customDefinition: BUILTIN_DELEGATION_TEMPLATES.has(template)
-			? null
-			: await loadByName(template),
+		customDefinition: await resolveTemplateDefinition(template),
 		outlineSession: options.outlineSession,
 	});
+}
+
+/** Late built-in names (see `LATE_BUILTIN_TEMPLATES`) already warned about this process. */
+const shadowWarned = new Set<string>();
+
+/**
+ * The user's definition a template name resolves to, or null for a built-in. The one
+ * rule every delegation path uses (live delegation, creation, import).
+ */
+export async function resolveTemplateDefinition(
+	template: string,
+): Promise<CustomSubagentDef | null> {
+	if (!BUILTIN_DELEGATION_TEMPLATES.has(template)) return loadByName(template);
+	if (!LATE_BUILTIN_TEMPLATES.has(template)) return null;
+	const own = await loadByName(template);
+	if (own && !shadowWarned.has(template)) {
+		shadowWarned.add(template);
+		logger.warn(
+			`A custom subagent template named "${template}" is in use instead of the built-in "${template}" template; rename it to use the built-in one`,
+			{ location: own.location },
+		);
+	}
+	return own;
+}
+
+/** Warn at startup about user templates that keep a late built-in name (see above). */
+export async function warnShadowedBuiltinTemplates(): Promise<void> {
+	for (const template of LATE_BUILTIN_TEMPLATES) await resolveTemplateDefinition(template);
 }
 
 export const customSubagentService = {
 	loadAll,
 	loadByName,
+	resolveTemplateDefinition,
 	isBuiltinType,
 	create,
 	update,

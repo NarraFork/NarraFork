@@ -175,7 +175,7 @@ Provide a concrete, actionable implementation plan.`,
 
 - Helpers are one level below you and can never launch agents of their own. Brief each one fully: it knows only what your prompt tells it.
 - Prefer run_in_background: true for helpers and wait for their results with Await({ type: "agent", id }); use Send only to give a helper new information or a correction.
-- Stop a helper you no longer need with Stop({ type: "agent", id }). When you are stopped, your helpers are stopped too.
+- Stop a helper you no longer need with Stop({ type: "agent", id }). When you are stopped (also by your parent's Send with doInterrupt, or by running out of time), your helpers are stopped too. If your turn ends with an error instead, your helpers keep running and their results wait for you when you are resumed.
 - A permission a person denied stays denied: never ask a helper (or anyone else) to do it another way. Report it in your result instead.
 - Do the small things yourself; a helper is worth its cost only for work that would otherwise flood your context.
 
@@ -184,7 +184,7 @@ Complete the task and report your results concisely, including what your helpers
 
 - 帮手在你的下一层，永远不能再派代理。给每个帮手写完整的简报：它只知道你的提示里写的内容。
 - 帮手优先用 run_in_background: true 后台运行，用 Await({ type: "agent", id }) 等它的结果；只有要给帮手新信息或纠正时才用 Send。
-- 不再需要的帮手用 Stop({ type: "agent", id }) 停掉。你被停止时，你的帮手也会被停止。
+- 不再需要的帮手用 Stop({ type: "agent", id }) 停掉。你被停止时（包括父代理用带 doInterrupt 的 Send 打断你、或你超时），你的帮手也会被停止。如果你这一轮是出错结束的，帮手会继续运行，它们的结果在你被恢复后等着你。
 - 被人拒绝的权限就是拒绝了：不要让帮手（或任何人）换个办法去做，而是在结果里报告。
 - 小事自己做；只有会占满你上下文的工作才值得交给帮手。
 

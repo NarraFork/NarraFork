@@ -762,7 +762,7 @@ function subagentRevision(d: Record<string, unknown>): string {
 	if (Array.isArray(d.nestedAgents)) {
 		rev += `|gnr:${d.nestedAgents.length}:${typeof d.nestedTotal === "number" ? d.nestedTotal : 0}`;
 		for (const agent of d.nestedAgents as Array<Record<string, unknown>>) {
-			rev += `|gna:${String(agent.subagentNarratorId)}:${String(agent.status)}:${agent.awaitingPermission === true ? 1 : 0}`;
+			rev += `|gna:${String(agent.subagentNarratorId)}:${String(agent.status)}:${agent.awaitingPermission === true ? 1 : 0}:${String(agent.ended ?? "")}`;
 			if (typeof agent.title === "string") rev += `:${textSignature(agent.title)}`;
 		}
 	}

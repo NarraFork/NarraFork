@@ -6,14 +6,21 @@
  * Every read is bounded per subagent and goes through the `parent_narrator_id` index;
  * only short columns are selected.
  */
-import { SUBAGENT_NESTED_CARD_LIMIT, type SubagentNestedSummary } from "@shared/subagent-nested";
+import {
+	SUBAGENT_NESTED_CARD_LIMIT,
+	type SubagentNestedAgent,
+	type SubagentNestedSummary,
+} from "@shared/subagent-nested";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
-import { getSubagentType } from "../lib/narrator-utils";
+import { getSubagentType, parseSubstatus } from "../lib/narrator-utils";
 
-/** Subagents whose helpers one read covers (TeamStatus lists at most 100 rows). */
-const NESTED_PARENT_LIMIT = 100;
+/**
+ * Subagents whose helpers one query covers. Longer lists are read in pages of this size
+ * (one query each), never cut: a page of history can hold more cards than this.
+ */
+const NESTED_PARENT_PAGE = 100;
 
 export interface NestedSubagentRow {
 	id: string;
@@ -22,6 +29,8 @@ export interface NestedSubagentRow {
 	variant: string;
 	status: string;
 	createdAt: string;
+	substatus: string;
+	lastStopReason: string | null;
 }
 
 /**
@@ -34,9 +43,18 @@ export async function listNestedSubagents(
 	perParent: number,
 ): Promise<Map<string, { subagents: NestedSubagentRow[]; total: number }>> {
 	const result = new Map<string, { subagents: NestedSubagentRow[]; total: number }>();
-	const ids = [...new Set(parentIds)].slice(0, NESTED_PARENT_LIMIT);
-	if (ids.length === 0) return result;
+	const unique = [...new Set(parentIds)];
 	const limit = Math.max(1, Math.trunc(perParent));
+	for (let start = 0; start < unique.length; start += NESTED_PARENT_PAGE)
+		await readNestedPage(unique.slice(start, start + NESTED_PARENT_PAGE), limit, result);
+	return result;
+}
+
+async function readNestedPage(
+	ids: string[],
+	limit: number,
+	result: Map<string, { subagents: NestedSubagentRow[]; total: number }>,
+): Promise<void> {
 	const activeFirst = sql`CASE WHEN ${narrators.status} IN ('working','waiting') THEN 0 ELSE 1 END`;
 	const ranked = db
 		.select({
@@ -46,6 +64,8 @@ export async function listNestedSubagents(
 			variant: narrators.variant,
 			status: narrators.status,
 			createdAt: narrators.createdAt,
+			substatus: narrators.substatus,
+			lastStopReason: narrators.lastStopReason,
 			parentNarratorId: narrators.parentNarratorId,
 			rank: sql<number>`row_number() over (partition by ${narrators.parentNarratorId} order by ${activeFirst}, ${narrators.createdAt} desc, ${narrators.id} desc)`.as(
 				"rank",
@@ -78,10 +98,33 @@ export async function listNestedSubagents(
 			variant: row.variant,
 			status: row.status,
 			createdAt: row.createdAt,
+			substatus: row.substatus,
+			lastStopReason: row.lastStopReason,
 		});
 		result.set(parentId, entry);
 	}
-	return result;
+}
+
+/**
+ * How a helper that no longer runs ended, when not normally: `failed` (its last turn
+ * ended with an error) or `stopped` (a person or its parent stopped it, or it ran out of
+ * time). Undefined for a running helper or one that finished normally.
+ */
+export function nestedAgentEnding(row: {
+	status: string;
+	substatus: string;
+	lastStopReason: string | null;
+}): SubagentNestedAgent["ended"] {
+	if (row.status === "working" || row.status === "waiting") return undefined;
+	const tags = parseSubstatus(row.substatus);
+	if (tags.includes("error") || row.lastStopReason === "error") return "failed";
+	if (
+		tags.includes("interrupted") ||
+		tags.includes("timeout") ||
+		row.lastStopReason === "user_interrupt"
+	)
+		return "stopped";
+	return undefined;
 }
 
 /**
@@ -120,6 +163,7 @@ export async function loadNestedSubagentSummaries(
 				subagentType: getSubagentType(row.variant) ?? "subagent",
 				status: row.status,
 				...(waiting.has(row.id) ? { awaitingPermission: true as const } : {}),
+				...(nestedAgentEnding(row) ? { ended: nestedAgentEnding(row) } : {}),
 			})),
 		});
 	}

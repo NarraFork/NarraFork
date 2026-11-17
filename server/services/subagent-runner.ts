@@ -26,7 +26,7 @@ import {
 } from "../lib/settings";
 import { type RunBindingInput, runDeadlineAt } from "../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
+import { compileDelegationPolicy } from "./agent-runtime/policy";
 import { controlRun, startNarratorRun } from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
 import { customSubagentService } from "./custom-subagent-service";
@@ -203,9 +203,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 	// The template compiles into ordinary data on the created narrator: a capability
 	// ceiling trait and a base prompt. Neither is read from the template again.
-	const customDef = BUILTIN_DELEGATION_TEMPLATES.has(subagentType)
-		? null
-		: await customSubagentService.loadByName(subagentType);
+	const customDef = await customSubagentService.resolveTemplateDefinition(subagentType);
 	const systemPrompt = await buildDelegationBasePrompt(
 		subagentType,
 		locale as Locale,

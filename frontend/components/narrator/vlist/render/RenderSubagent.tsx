@@ -398,6 +398,13 @@ function SubagentStatusGlyph({ status }: { status?: string }) {
 	return <IconCircleCheck size={STATUS_ICON_SIZE} style={{ color: cssColor("green", 6) }} />;
 }
 
+/** The card's own status vocabulary for a helper that ended: failed → red, stopped → orange. */
+function nestedAgentGlyphStatus(agent: SubagentNestedAgent): string | undefined {
+	if (agent.ended === "failed") return "fail";
+	if (agent.ended === "stopped") return "cancelled";
+	return undefined;
+}
+
 /**
  * One helper of the card's child: a trace-height row naming it, its status (a spinner
  * while it runs, the status icon after) and, when its permission request waits for a
@@ -419,6 +426,7 @@ function NestedAgentRow({
 			className={ROW_BUTTON_CLASS}
 			data-testid="subagent-nested-row"
 			data-awaiting={agent.awaitingPermission ? "true" : undefined}
+			data-ended={agent.ended}
 			disabled={!onOpen}
 			onClick={
 				onOpen
@@ -456,7 +464,11 @@ function NestedAgentRow({
 					</Badge>
 				) : null}
 				<div style={TRACE_ROW_STATUS_SLOT_STYLE}>
-					{running ? <Loader size={STATUS_ICON_SIZE - 2} color="blue" /> : <SubagentStatusGlyph />}
+					{running ? (
+						<Loader size={STATUS_ICON_SIZE - 2} color="blue" />
+					) : (
+						<SubagentStatusGlyph status={nestedAgentGlyphStatus(agent)} />
+					)}
 				</div>
 				<div style={{ flex: 1, minWidth: 0 }} />
 			</div>

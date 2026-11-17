@@ -96,10 +96,21 @@ export const stopTool: ToolDefinition = {
 				assertAuthorized();
 				// The task row is the run's cancellation handle; a run with no live task
 				// handle is cancelled through the run service directly.
-				const { controlRun } = await import("@server/services/agent-runtime/run");
+				const { controlRun, stopSubagentHelpers } = await import(
+					"@server/services/agent-runtime/run"
+				);
 				cancelled =
 					(await backgroundTaskService.cancel(task.id, { assertAuthorized }).catch(() => false)) ||
 					(await controlRun(narrator.id, { kind: "cancel", reason: "Cancelled by controller" }));
+				// A worker may sit idle between turns while its helpers still run in the
+				// background: stopping it stops them too (control on it is authorized above).
+				// No-op for an agent without helpers; a cancelled run would cascade anyway.
+				assertAuthorized();
+				const helpers = await stopSubagentHelpers(narrator.id, "Parent subagent stopped");
+				if (!cancelled && helpers > 0)
+					return {
+						output: `Background agent task ${id} is not running; its ${helpers} running helper agent(s) were stopped.`,
+					};
 			} else {
 				const assertAuthorized = await authorizeCancellation();
 				assertAuthorized();

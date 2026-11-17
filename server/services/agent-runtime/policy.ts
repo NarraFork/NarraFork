@@ -118,6 +118,13 @@ export const BOT_RUNTIME_CEILING: RuntimePolicyTrait = {
 	deny: ["askUserQuestion", "planApproval"],
 };
 
+/**
+ * Built-in template names added after people could already name their own templates. A
+ * user's template with one of these names keeps resolving under its name, as before the
+ * built-in existed (`resolveTemplateDefinition`); new templates may not take them.
+ */
+export const LATE_BUILTIN_TEMPLATES: ReadonlySet<string> = new Set(["worker"]);
+
 /** Template names with a built-in ceiling; any other name is a custom definition. */
 export const BUILTIN_DELEGATION_TEMPLATES: ReadonlySet<string> = new Set([
 	"general",
@@ -157,28 +164,32 @@ export function compileDelegationPolicy(input: DelegationTemplateInput): Runtime
 	// A template's built-in list, without the outline tools for an outline session's subagent.
 	const builtin = (tools: readonly string[]) =>
 		input.outlineSession ? tools.filter((name) => !isOutlineTool(name)) : [...tools];
-	switch (input.template) {
-		case "general":
-			return { ...base, tools: builtin(GENERAL_TOOLS), mcp: "nonDenied" };
-		case "worker":
-			// Nesting is a template grant, never a loosening of the others: only a worker may
-			// spawn, and only while it sits above the deepest level (`withDelegationDepth`).
-			return { ...base, deny: [...WORKER_DENY], tools: builtin(WORKER_TOOLS), mcp: "nonDenied" };
-		case "search":
-			return { ...base, tools: [...SEARCH_TOOLS], mcp: "none", readOnly: true, searchOnly: true };
-		case "review":
-			// Review may inspect Git synchronously, never control running tasks.
-			return {
-				...base,
-				tools: builtin(READ_TOOLS.filter((name) => name !== "Stop")),
-				mcp: "readOnly",
-				readOnly: true,
-				readOnlyGitShell: true,
-			};
-		case "explore":
-		case "plan":
-			return { ...base, tools: builtin(READ_TOOLS), mcp: "readOnly", readOnly: true };
-	}
+	// A user's own definition wins only for a built-in name added after users could
+	// already name templates (`LATE_BUILTIN_TEMPLATES`); every older built-in keeps its
+	// ceiling whatever definition is passed.
+	if (!input.customDefinition || !LATE_BUILTIN_TEMPLATES.has(input.template))
+		switch (input.template) {
+			case "general":
+				return { ...base, tools: builtin(GENERAL_TOOLS), mcp: "nonDenied" };
+			case "worker":
+				// Nesting is a template grant, never a loosening of the others: only a worker may
+				// spawn, and only while it sits above the deepest level (`withDelegationDepth`).
+				return { ...base, deny: [...WORKER_DENY], tools: builtin(WORKER_TOOLS), mcp: "nonDenied" };
+			case "search":
+				return { ...base, tools: [...SEARCH_TOOLS], mcp: "none", readOnly: true, searchOnly: true };
+			case "review":
+				// Review may inspect Git synchronously, never control running tasks.
+				return {
+					...base,
+					tools: builtin(READ_TOOLS.filter((name) => name !== "Stop")),
+					mcp: "readOnly",
+					readOnly: true,
+					readOnlyGitShell: true,
+				};
+			case "explore":
+			case "plan":
+				return { ...base, tools: builtin(READ_TOOLS), mcp: "readOnly", readOnly: true };
+		}
 	const custom = input.customDefinition;
 	if (custom?.toolAccess === "general")
 		return { ...base, tools: builtin(GENERAL_TOOLS), mcp: "nonDenied" };

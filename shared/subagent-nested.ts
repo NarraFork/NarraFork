@@ -23,6 +23,11 @@ export interface SubagentNestedAgent {
 	status: string;
 	/** A permission request of this helper waits for a person. */
 	awaitingPermission?: true;
+	/**
+	 * How a helper that no longer runs ended, when not normally: `failed` (error) or
+	 * `stopped` (stopped by a person or its parent, or timed out). Absent otherwise.
+	 */
+	ended?: "failed" | "stopped";
 }
 
 export interface SubagentNestedSummary {
@@ -48,6 +53,7 @@ export function normalizeSubagentNestedSummary(value: unknown): SubagentNestedSu
 			subagentType: typeof agent.subagentType === "string" ? agent.subagentType : "",
 			status: typeof agent.status === "string" ? agent.status : "idle",
 			...(agent.awaitingPermission === true ? { awaitingPermission: true as const } : {}),
+			...(agent.ended === "failed" || agent.ended === "stopped" ? { ended: agent.ended } : {}),
 		});
 	}
 	const total =

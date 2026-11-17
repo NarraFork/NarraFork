@@ -154,6 +154,49 @@ describe("subagent card — nested helpers", () => {
 		expect(region?.textContent).toContain("5 more helpers");
 	});
 
+	it("a failed or stopped helper shows the red or orange mark, a finished one the check", () => {
+		const data = cardData({
+			total: 3,
+			agents: [
+				{
+					subagentNarratorId: "f",
+					title: "f",
+					subagentType: "general",
+					status: "idle",
+					ended: "failed",
+				},
+				{
+					subagentNarratorId: "s",
+					title: "s",
+					subagentType: "general",
+					status: "idle",
+					ended: "stopped",
+				},
+				{ subagentNarratorId: "d", title: "d", subagentType: "general", status: "idle" },
+			],
+		});
+		const rows = [...render(data, []).querySelectorAll('[data-testid="subagent-nested-row"]')];
+		const icon = (row: Element | undefined) =>
+			[...(row?.querySelectorAll("svg") ?? [])].map((svg) => svg.getAttribute("class")).join(" ");
+		expect(rows.map((row) => row.getAttribute("data-ended"))).toEqual(["failed", "stopped", null]);
+		expect(icon(rows[0])).toContain("circle-x");
+		expect(icon(rows[1])).toContain("ban");
+		expect(icon(rows[2])).toContain("circle-check");
+		expect(icon(rows[2])).not.toContain("circle-x");
+		// The end state is painted from the cached payload, so it must move the key.
+		const before = extractDataRevision({
+			...BASE,
+			nestedAgents: [{ ...NESTED.agents[1] }],
+			nestedTotal: 1,
+		});
+		const after = extractDataRevision({
+			...BASE,
+			nestedAgents: [{ ...NESTED.agents[1], ended: "failed" as const }],
+			nestedTotal: 1,
+		});
+		expect(after).not.toBe(before);
+	});
+
 	it("uses the zh-CN strings when given", () => {
 		const doc = render(cardData(NESTED), [], {
 			nestedTitle: zh.subagentNestedTitle,
