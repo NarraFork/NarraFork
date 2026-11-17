@@ -790,6 +790,48 @@ describe("worktree removal hardening", () => {
 		expect(listing).toContain(other);
 	});
 
+	test("rows mode never asks Git about a directory it does not list", async () => {
+		// R1: a registered directory outside any repository. `git status` there fails, but
+		// rows mode deletes nothing on disk, so there is nothing to measure.
+		const sibling = join(temporary, "sibling");
+		await mkdir(sibling);
+		await writeFile(join(sibling, "data.txt"), "x");
+		const runGit = ports.runGit;
+		if (!runGit) throw new Error("fixture must wire runGit");
+		const probes: string[][] = [];
+		ports.runGit = async (workspace, args, abort, writing, scope) => {
+			if (scope?.kind === "directory") probes.push(args);
+			return runGit(workspace, args, abort, writing, scope);
+		};
+		const outside = await run(() =>
+			service.planRemoval(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", path: sibling },
+				signal(),
+			),
+		);
+		expect(outside.worktree.mode).toBe("rows");
+		expect(outside.status).toBe("ready");
+		expect(outside.blockers).toEqual([]);
+		expect(outside.confirmations).toEqual([]);
+		expect(outside.worktree).toMatchObject({ dirtyFileCount: 0, unreachableCommits: 0 });
+		// R2: a plain directory under `.worktrees/` that Git does not list. `git status`
+		// would walk up to the main checkout and report ITS changes as this path's loss.
+		registration = null;
+		const old = join(source, ".worktrees", "chapter-old");
+		await mkdir(old);
+		await writeFile(join(old, "notes.md"), "x");
+		await writeFile(join(source, "tracked.txt"), "main edit\n");
+		const legacy = await run(() =>
+			service.planRemoval("actor", "narrator", { workspaceKey: "workspace", path: old }, signal()),
+		);
+		expect(legacy.worktree.mode).toBe("rows");
+		expect(legacy.worktree).toMatchObject({ dirty: false, dirtyFileCount: 0 });
+		expect(legacy.confirmations).toEqual([]);
+		expect(probes).toEqual([]);
+	});
+
 	test("a session at the main checkout of the same repository does not block the removal", async () => {
 		// Every session in this repository carries its repository key; only a claim inside
 		// the checkout (or one that cannot be told apart from it) may protect it.

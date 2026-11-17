@@ -376,7 +376,6 @@
 		"removeBlocker_WORKSPACE_CONTEXT_BUSY": "有会话正在运行，请先停止。",
 		"removeBlocker_GIT_WORKSPACE_CHANGED": "仓库身份已变化，请重新检查。",
 		"removeBlocker_GIT_WORKSPACE_UNAVAILABLE": "无法访问该仓库，请稍后重试。",
-		"removePruneSiblings": "该命令无法只针对一个路径，还会一并清理另外 {{count}} 条已失效的 Git 登记。",
 		"removeBlocker_WORKTREE_REMOVAL_UNKNOWN_PATH": "该路径不是本仓库管理的 worktree（Git 未登记，也没有 NarraFork 记录），已拒绝删除。",
 		"removeNeedsHealthyWorkspace": "当前会话的工作目录不可用，无法从这里删除 worktree。请从同一仓库的另一个会话打开此列表再删除。"
 	},

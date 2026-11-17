@@ -1593,6 +1593,10 @@ export class NarratorWorktreeService<Principal> {
 	 * Commits are lost only when nothing else reaches them: a branch keeps its own, so only
 	 * a detached HEAD can hold commits no branch, remote-tracking ref or tag contains.
 	 * A failed, killed or timed-out probe is null, never zero.
+	 *
+	 * Without a Git entry there is nothing to ask: `rows` mode deletes nothing on disk, and
+	 * `git status` in a directory Git does not list either fails (outside a repository) or
+	 * walks up and reports the enclosing checkout's changes as if they were this path's.
 	 */
 	private async measureLoss(
 		target: WorktreeTarget,
@@ -1619,6 +1623,7 @@ export class NarratorWorktreeService<Principal> {
 					truncated: !!(result.stdoutTruncated || result.stderrTruncated),
 				};
 			};
+		if (!entry) return { dirtyFileCount: 0, dirtyExact: true, unreachableCommits: 0 };
 		try {
 			const changes = present
 				? await uncommittedChanges(

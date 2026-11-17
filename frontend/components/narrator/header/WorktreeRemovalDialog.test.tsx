@@ -288,3 +288,17 @@ test("a present checkout says ignored files go with it, and shows loss a branch 
 	expect(text).toContain("worktree.removeDirtyAtLeast");
 	expect(text).toContain("worktree.removeUnreachable");
 });
+
+test("rows mode never offers a force confirmation, whatever an older server sends", async () => {
+	plans.mockImplementation(async () => {
+		const plan = readyPlan();
+		plan.worktree = { ...plan.worktree, mode: "rows", present: true };
+		plan.confirmations = ["force"];
+		return plan;
+	});
+	await render();
+	expect(container.querySelector("input[type=checkbox]")).toBeNull();
+	const confirm = buttons().find((node) => node.textContent === "worktree.removeConfirm");
+	expect(confirm?.disabled).toBe(false);
+	expect(container.textContent ?? "").not.toContain("worktree.removeIgnoredNote");
+});
