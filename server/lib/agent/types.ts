@@ -97,6 +97,24 @@ export interface ToolExecutionLifecycleContext {
 	binding?: ToolCallBinding;
 }
 
+/** A finished tool call as `AgentConfig.annotateToolResult` sees it. */
+export interface ToolResultAnnotationInput {
+	toolName: string;
+	toolUseId: string;
+	/** The input the tool actually ran with. */
+	input: Record<string, unknown>;
+	/** The result text the model would get. */
+	output: string;
+	isError: boolean;
+	metadata?: Record<string, unknown>;
+	/** The working directory the call ran in. */
+	cwd: string;
+	/** The call ran on this server and the session's default device is this server too. */
+	local: boolean;
+	/** Where the executor's or the tool's own truncation saved the full output, if it did. */
+	fullOutputPath?: string;
+}
+
 /** Final authorization uses the immutable admitted input/target, never a live cwd hint. */
 export interface ToolFinalStartAuthorizationContext extends ToolExecutionLifecycleContext {
 	executionBackend?: import("./execution/backend").ExecutionBackend;
@@ -1166,6 +1184,13 @@ export interface AgentConfig {
 	onToolExecutionAfter?: (
 		context: ToolExecutionLifecycleContext & { result?: ToolResult; error?: unknown },
 	) => Promise<void> | void;
+	/**
+	 * Rewrite the text of a finished tool result before it is returned (and persisted): a
+	 * team coordinator's soft-limit reminders (Project Teams P2). Runs after the tool body,
+	 * so the call itself is never changed or refused. Null keeps the output; a throw is
+	 * logged and keeps the output.
+	 */
+	annotateToolResult?: (call: ToolResultAnnotationInput) => Promise<string | null>;
 	/**
 	 * Persist an already-started tool's final result after the bounded abort drain
 	 * closed its event consumer. Never routes through a newer run's streaming state

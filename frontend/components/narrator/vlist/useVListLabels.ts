@@ -593,6 +593,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceOutlineTaskEdit: t("sidecar.sources.outline_task_edit"),
 			sidecarSourceOutlineTaskFinished: t("sidecar.sources.outline_task_finished"),
 			sidecarSourceOutlineTeamActivity: t("sidecar.sources.outline_team_activity"),
+			sidecarSourceTeamStatus: t("sidecar.sources.team_status"),
 			sidecarSourceOutlineTeam: t("sidecar.sources.outline_team"),
 			sidecarSourceOutlineTaskBrief: t("sidecar.sources.outline_task_brief"),
 			sidecarSourceSpecImport: t("sidecar.sources.spec_import"),

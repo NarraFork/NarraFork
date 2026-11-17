@@ -2642,6 +2642,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceOutlineTaskBrief: "Opening brief",
 	sidecarSourceSpecImport: "Dynamic Spec moved to the outline",
 	sidecarSourceOutlineAnswer: "Answers to your questions",
+	sidecarSourceTeamStatus: "Team status",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2772,6 +2773,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	// The session's Dynamic Spec was moved into the outline: where it went (P2 PR 12b2).
 	spec_import: "sidecarSourceSpecImport",
 	outline_answer: "sidecarSourceOutlineAnswer",
+	// A team coordinator's team status (Project Teams P2).
+	team_status: "sidecarSourceTeamStatus",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",

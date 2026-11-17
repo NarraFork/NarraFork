@@ -1399,6 +1399,12 @@ if (activeDatabaseBackend === "sqlite") {
 	import("./services/teams/team-service")
 		.then(({ startTeamStatusSync }) => startTeamStatusSync())
 		.catch((err) => logger.warn("Team status sync failed to start", { error: String(err) }));
+	// A coordinator's saved tool outputs go with its session; leftovers are swept once.
+	import("./services/teams/coordinator-maintenance")
+		.then(({ startCoordinatorMaintenance }) => startCoordinatorMaintenance())
+		.catch((err) =>
+			logger.warn("Coordinator output maintenance failed to start", { error: String(err) }),
+		);
 	// Stop containers and release ports that removed chapters left behind.
 	retireLegacyChapterResources().catch((err) => {
 		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
