@@ -198,6 +198,15 @@ export {
 	notificationMarkReadSchema,
 } from "./notifications";
 export {
+	coordinatorLimitsSchema,
+	createProjectTeamSchema,
+	listProjectTeamsQuerySchema,
+	teamBaseBranchSchema,
+	teamBriefSchema,
+	teamSettingsSchema,
+	updateProjectTeamSchema,
+} from "./project-teams";
+export {
 	createProjectSchema,
 	projectChapterSettingsSchema,
 	projectMembersSchema,

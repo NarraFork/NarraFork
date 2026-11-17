@@ -2359,6 +2359,7 @@
 	"storageDatabaseBlockedReason_nonArchived": "包含未归档的子会话",
 	"storageDatabaseBlockedReason_nonStaleStatus": "包含仍被视为活跃的子会话",
 	"storageDatabaseBlockedReason_recentActivity": "最近仍有活动",
+	"storageDatabaseBlockedReason_teamLiveWork": "团队协调者：还有进行中或仍占着 worktree 的工作项",
 	"storageDatabaseBlockedReasonWithItem": "{{reason}}：{{name}}",
 	"runtimeSection": "运行资源",
 	"pluginsSection": "插件",

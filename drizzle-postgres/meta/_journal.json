@@ -533,6 +533,13 @@
 			"when": 1794677338258,
 			"tag": "0075_plugin_overlay_preferences",
 			"breakpoints": true
+		},
+		{
+			"idx": 76,
+			"version": "7",
+			"when": 1794839178762,
+			"tag": "0076_project_teams",
+			"breakpoints": true
 		}
   ]
 }

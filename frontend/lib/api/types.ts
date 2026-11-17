@@ -434,7 +434,8 @@ export type DatabaseCleanupBlockedReasonCode =
 	| "backgroundRunning"
 	| "nonArchived"
 	| "nonStaleStatus"
-	| "recentActivity";
+	| "recentActivity"
+	| "teamLiveWork";
 
 export type DatabaseCleanupWarningCode = string;
 
