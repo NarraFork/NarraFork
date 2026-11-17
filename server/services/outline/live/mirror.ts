@@ -188,6 +188,19 @@ export class SpaceMirror {
 		return out;
 	}
 
+	/** How many blocks `subtree` would list (no order, no list made). */
+	subtreeSize(id: string): number {
+		let n = 0;
+		const stack = [id];
+		while (stack.length > 0) {
+			const next = stack.pop() as string;
+			n++;
+			for (const kid of this.kids.get(next) ?? [])
+				if (!this.blocks.get(kid)?.deleted) stack.push(kid);
+		}
+		return n;
+	}
+
 	/** The block and everything under it the mirror holds, deleted blocks included. */
 	subtreeAll(id: string): string[] {
 		const out: string[] = [];

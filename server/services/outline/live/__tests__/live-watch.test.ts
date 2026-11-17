@@ -1185,4 +1185,43 @@ describe("review round 2", () => {
 		expect(f.watchSet).toEqual([{ s: one.pageId }, { s: two.pageId }]);
 		expect(f.outline(two.pageId)).toBe(await freshOutline(two.pageId));
 	});
+
+	test("S9: moving blocks into one's own subtree one at a time stops at the share (counted as shown now)", async () => {
+		const one = await page(["a1", "a2", "a3"], "One");
+		const two = await page(["b1"], "Two");
+		const b1 = two.ids[0] as string;
+		for (const id of one.ids)
+			await agent(
+				Array.from({ length: 6 }, (_, i) => ({
+					op: "insert" as const,
+					parent: { id },
+					content: `k${i}`,
+				})),
+			);
+		OUTLINE_LIVE_BOUNDS.maxUserBlocks = 12;
+		const a = open(link(owner), "", [{ l: one.pageId }, { s: two.pageId }]);
+		await clock.until(() => a.ready, 5000, "joined");
+		const codes: string[] = [];
+		for (const id of one.ids) {
+			const last = a.visible.children(b1).at(-1);
+			struct(a, [
+				{
+					t: "m",
+					id,
+					p: b1,
+					k: keyBetweenLoose(last ? (a.visible.get(last)?.orderKey ?? null) : null, null),
+				},
+			]);
+			await clock.settle();
+			codes.push(a.lastReject?.code ?? "none");
+			a.lastReject = null;
+		}
+		// The first fits (2 + 3 shown, 7 come in); the next two would pass the share.
+		expect(codes).toEqual(["none", "too_large", "too_large"]);
+		expect(a.outline(two.pageId).split("\n")).toHaveLength(8);
+		const views = [...(liveSpaceOf(space.id)?.scopes.values() ?? [])];
+		const own = views.reduce((n, v) => n + v.shownCount(), 0);
+		expect(own).toBeLessThanOrEqual(12);
+		expect((await block(one.ids[1] as string))?.parentId).toBe(one.pageId);
+	});
 });

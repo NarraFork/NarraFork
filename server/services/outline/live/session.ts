@@ -519,7 +519,7 @@ export class LiveView implements HeldBy {
 	 * (`LiveJoinedHead.g`) and sends a generation only with the blocks that have another.
 	 */
 	baseGen = 0;
-	/** Blocks it covered when it was loaded (budgets). */
+	/** Blocks it showed when it was loaded (diagnostics; the share counts `shownCount`). */
 	blocks = 0;
 	/** When someone last joined it (a person's least recently joined watch goes first). */
 	joinedAt = 0;
@@ -552,6 +552,16 @@ export class LiveView implements HeldBy {
 		const m = this.space.mirror;
 		if ("s" in this.watch) return m.alive(this.watch.s) ? m.subtree(this.watch.s) : [];
 		return [...m.children(this.watch.l)];
+	}
+
+	/**
+	 * How many live blocks it shows now (a person's share counts this: blocks moved in or out,
+	 * inserted, deleted or restored since it loaded count as they are).
+	 */
+	shownCount(): number {
+		const m = this.space.mirror;
+		if ("s" in this.watch) return m.alive(this.watch.s) ? m.subtreeSize(this.watch.s) : 0;
+		return m.children(this.watch.l).length;
 	}
 
 	/** Every block it covers, deleted ones included (what unloading it may take out). */
@@ -1759,7 +1769,7 @@ export class LiveSpace {
 	}
 
 	/**
-	 * Blocks of one person's share: of the watches only they are in, and of the watches the join
+	 * Blocks of one person's share, as the mirror shows them now: of the watches only they are in, and of the watches the join
 	 * or frame under way takes that nobody is in yet (each overlapping one counted: errs on the
 	 * safe side).
 	 */
@@ -1769,9 +1779,10 @@ export class LiveSpace {
 			if (v.gone || v.participants.size === 0) continue;
 			let alone = true;
 			for (const p of v.participants.values()) if (p.userId !== userId) alone = false;
-			if (alone) own += v.blocks;
+			if (alone) own += v.shownCount();
 		}
-		for (const v of taking?.views ?? []) if (!v.gone && v.participants.size === 0) own += v.blocks;
+		for (const v of taking?.views ?? [])
+			if (!v.gone && v.participants.size === 0) own += v.shownCount();
 		return own;
 	}
 

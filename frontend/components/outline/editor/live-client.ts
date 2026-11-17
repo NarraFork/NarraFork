@@ -1909,6 +1909,7 @@ export class LiveClient {
 		// A removal whose answer will not come, or that was never sent (this join named the set
 		// whole); additions not sent yet go out with the asked ones below.
 		this.watchToAdd.clear();
+		this.watchTooFast = 0;
 		if (this.pruneAfter > 0 || this.watchToRemove.size > 0) {
 			this.pruneAfter = 0;
 			this.watchToRemove.clear();
