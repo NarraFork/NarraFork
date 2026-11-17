@@ -23,6 +23,7 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
 const { projectTeamRoutes } = await import("../project-teams");
 const { projectRoutes } = await import("../projects");
+const { narratorRoutes } = await import("../narrators");
 const { db } = await import("../../db");
 const { eq } = await import("drizzle-orm");
 const { aclGrants, narrators, projects, projectTeams, teamWorkEvents, teamWorkItems, users } =
@@ -66,6 +67,7 @@ function appAs(userId: string) {
 	});
 	app.route("/projects", projectTeamRoutes);
 	app.route("/projects", projectRoutes);
+	app.route("/narrators", narratorRoutes);
 	return app;
 }
 
@@ -103,6 +105,16 @@ async function newTeam(name: string, extra: Record<string, unknown> = {}) {
 	});
 	expect(created.status).toBe(201);
 	return created.body as { id: string } & Record<string, unknown>;
+}
+
+async function statusEvents(teamId: string) {
+	const rows = await db.query.teamWorkEvents.findMany({
+		where: eq(teamWorkEvents.teamId, teamId),
+	});
+	return rows
+		.filter((row) => row.kind === "team.archived" || row.kind === "team.unarchived")
+		.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.kind.localeCompare(b.kind))
+		.map((row) => [row.kind, row.actorKind, row.actorId]);
 }
 
 beforeAll(async () => {
@@ -319,10 +331,42 @@ describe("archive and delete", () => {
 
 		const back = await call(OWNER, `${path}/unarchive`, { method: "POST" });
 		expect(back.body.status).toBe("active");
-		const kinds = (
-			await db.query.teamWorkEvents.findMany({ where: eq(teamWorkEvents.teamId, team.id) })
-		).map((event) => event.kind);
-		expect(kinds).toEqual(expect.arrayContaining(["team.archived", "team.unarchived"]));
+		// Each change is recorded once, as the person who made it (not as the sync listener).
+		expect(await statusEvents(team.id)).toEqual([
+			["team.archived", "person", OWNER],
+			["team.unarchived", "person", OWNER],
+		]);
+	});
+
+	test("archiving through the narrator routes is the person's change too", async () => {
+		const team = await newTeam("Narrator route");
+		expect((await call(MEMBER, `/narrators/${team.id}/archive`, { method: "PATCH" })).status).toBe(
+			200,
+		);
+		expect((await call(OWNER, `/projects/${projectId}/teams/${team.id}`)).body.status).toBe(
+			"archived",
+		);
+		expect(
+			(await call(MEMBER, `/narrators/${team.id}/unarchive`, { method: "PATCH" })).status,
+		).toBe(200);
+		expect(await statusEvents(team.id)).toEqual([
+			["team.archived", "person", MEMBER],
+			["team.unarchived", "person", MEMBER],
+		]);
+	});
+
+	test("the status people see is the coordinator's, whatever the stored mirror says", async () => {
+		const team = await newTeam("Mirror");
+		// A stale mirror (e.g. a missed event): the coordinator is active, so is the team.
+		await db
+			.update(projectTeams)
+			.set({ status: "archived" })
+			.where(eq(projectTeams.narratorId, team.id));
+		const path = `/projects/${projectId}/teams/${team.id}`;
+		expect((await call(OWNER, path)).body.status).toBe("active");
+		const active = await call(OWNER, `/projects/${projectId}/teams?status=active&limit=100`);
+		expect((active.body.teams as Array<{ id: string }>).map((t) => t.id)).toContain(team.id);
+		expect((await call(OWNER, path, { method: "PATCH", body: { brief: "ok" } })).status).toBe(200);
 	});
 
 	test("archiving the narrator by any other path archives the team", async () => {
@@ -337,6 +381,11 @@ describe("archive and delete", () => {
 			where: eq(projectTeams.narratorId, team.id),
 		});
 		expect(again?.status).toBe("active");
+		// No person behind these changes: the system's.
+		expect(await statusEvents(team.id)).toEqual([
+			["team.archived", "system", null],
+			["team.unarchived", "system", null],
+		]);
 	});
 
 	test("a coordinator with live work items cannot be deleted; without, its team goes with it", async () => {

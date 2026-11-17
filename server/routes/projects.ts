@@ -389,17 +389,18 @@ projectRoutes.delete("/:id", async (c) => {
 	// Deletion detaches every session and device from the project, so it sits in the
 	// management tier rather than write.
 	const project = await requireProjectAccess(c, id, "manage");
-	// Teams record the worktrees and branches they made; deleting the project would orphan them.
-	if (projectHasTeams(id))
-		throw new AppError(
-			"This project has teams. Delete their coordinator sessions before deleting the project.",
-			409,
-			"PROJECT_HAS_TEAMS",
-		);
 
 	return withProjectRetirement(
 		id,
 		async () => {
+			// Teams record the worktrees and branches they made; deleting the project would orphan
+			// them. Checked inside the retirement, before anything is detached or revoked.
+			if (projectHasTeams(id))
+				throw new AppError(
+					"This project has teams. Delete their coordinator sessions before deleting the project.",
+					409,
+					"PROJECT_HAS_TEAMS",
+				);
 			await propagateOAuthProjectRemoval(id);
 
 			const deviceRevokedAt = new Date().toISOString();

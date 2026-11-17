@@ -12,18 +12,14 @@ const { runtimeBasePrompt } = await import("../../../services/agent-runtime/orch
 const { resolveRuntimePolicy } = await import("../../../services/agent-runtime/policy");
 
 describe("team lead prompt", () => {
-	test("both locales, deterministic, with the default soft limits", () => {
+	test("both locales, deterministic, no numbers or settings interpolated", () => {
 		for (const locale of ["en", "zh-CN"] as const) {
 			const first = getTeamLeadPrompt(locale);
 			expect(getTeamLeadPrompt(locale)).toBe(first);
-			for (const value of [
-				DEFAULT_COORDINATOR_LIMITS.editLines,
-				DEFAULT_COORDINATOR_LIMITS.newFileLines,
-				DEFAULT_COORDINATOR_LIMITS.readLines,
-				DEFAULT_COORDINATOR_LIMITS.searchLines,
-			])
-				expect(first).toContain(String(value));
 			expect(first).toContain("AskUserQuestion");
+			// The limits are per-team settings (P2 reminders carry the numbers): none here.
+			for (const value of Object.values(DEFAULT_COORDINATOR_LIMITS))
+				expect(first).not.toContain(String(value));
 			expect(first).not.toMatch(/\d{4}-\d{2}-\d{2}/);
 		}
 		expect(getTeamLeadPrompt("en")).toContain("Team coordinator");
@@ -40,6 +36,8 @@ describe("team lead prompt", () => {
 			"recommended option first",
 			"say so in your report",
 			"Never stop, restart or take over",
+			"never commit there directly",
+			"worktree of the work item",
 		])
 			expect(en).toContain(phrase);
 		// No hosting / CI / integration instructions before those PRs.

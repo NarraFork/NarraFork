@@ -514,6 +514,7 @@ import {
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
+import { runAsTeamStatusActor } from "../services/teams/team-records";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -815,6 +816,10 @@ narratorRoutes.use("*", async (_c, next) => {
 	requireSqliteNarratorSurface();
 	return next();
 });
+
+// A team coordinator archived or unarchived by this request (the archive routes, or the
+// auto-unarchive on interaction) is the caller's doing: hand the person to the team status sync.
+narratorRoutes.use("*", async (c, next) => runAsTeamStatusActor(c.get("user")?.sub, next));
 
 // JSON composer requests never inherit the much larger multipart attachment budget.
 // The middleware bounds streamed bodies before req.json(), including absent/lying Content-Length.

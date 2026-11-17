@@ -10,27 +10,60 @@
  * still holding a recorded worktree (it has to be cleaned or handed out first).
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { TEAM_WORK_ITEM_FINISHED_STATES } from "@shared/project-teams";
-import { and, eq, isNotNull, notInArray, or } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, notInArray, or } from "drizzle-orm";
 import { db } from "../../db";
 import { projectTeams, teamWorkItems } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 
 type Executor = Pick<typeof db, "select" | "delete">;
 
+/**
+ * Who is changing a coordinator's status right now, for the team's archive/unarchive event.
+ * `narrator:status_changed` carries no actor, and its listener runs synchronously inside the
+ * call that changed the status, so the person is handed over through the async context: the
+ * team routes wrap their narrator calls, and the narrator HTTP routes wrap every request in
+ * their caller. Outside any such context (Agent control, recovery jobs) the change is the
+ * system's. A run started by a request inherits its person, which matches how a run acts for
+ * the person who started it.
+ */
+const teamStatusActor = new AsyncLocalStorage<string>();
+
+export function runAsTeamStatusActor<T>(userId: string | null | undefined, fn: () => T): T {
+	return userId ? teamStatusActor.run(userId, fn) : fn();
+}
+
+export function currentTeamStatusActor(): string | null {
+	return teamStatusActor.getStore() ?? null;
+}
+
+const liveItem = () =>
+	or(
+		notInArray(teamWorkItems.state, [...TEAM_WORK_ITEM_FINISHED_STATES]),
+		isNotNull(teamWorkItems.worktreeResourceId),
+	);
+
+/**
+ * The coordinators whose teams have live work, i.e. those `narratorService.remove` refuses.
+ * Database cleanup keeps them (reported as blocked) instead of aborting on the refusal. One
+ * DISTINCT over the work items (team id leads its index); optionally narrowed to some narrators.
+ */
+export function listTeamsWithLiveWork(narratorIds?: string[]): Set<string> {
+	if (narratorIds && narratorIds.length === 0) return new Set();
+	const rows = db
+		.selectDistinct({ teamId: teamWorkItems.teamId })
+		.from(teamWorkItems)
+		.where(and(liveItem(), narratorIds ? inArray(teamWorkItems.teamId, narratorIds) : undefined))
+		.all();
+	return new Set(rows.map((row) => row.teamId));
+}
+
 function liveWorkItemOf(executor: Executor, teamId: string): { id: string } | undefined {
 	return executor
 		.select({ id: teamWorkItems.id })
 		.from(teamWorkItems)
-		.where(
-			and(
-				eq(teamWorkItems.teamId, teamId),
-				or(
-					notInArray(teamWorkItems.state, [...TEAM_WORK_ITEM_FINISHED_STATES]),
-					isNotNull(teamWorkItems.worktreeResourceId),
-				),
-			),
-		)
+		.where(and(eq(teamWorkItems.teamId, teamId), liveItem()))
 		.limit(1)
 		.get();
 }

@@ -6,13 +6,14 @@
  * - Access: the coordinator's narrator ACL, nothing else. Read on the coordinator reads the team;
  *   write makes a member. A caller who cannot read gets 404 (no existence oracle), a reader who
  *   cannot write gets 403 on changes.
- * - Lifecycle: created atomically with the narrator; archiving the narrator archives the team
- *   (`startTeamStatusSync` follows narrator archive/unarchive from any path, and every read
- *   derives the status from the narrator as well); deleting the narrator deletes the team only
- *   when no work is live (`team-records.ts`).
+ * - Lifecycle: created atomically with the narrator; archiving the narrator archives the team.
+ *   The status people see is the coordinator's alone; the stored `project_teams.status` mirrors
+ *   it (`startTeamStatusSync` follows archive/unarchive from any path, attributed to the person
+ *   when one caused it). Deleting the narrator deletes the team only when no work is live
+ *   (`team-records.ts`).
  *
  * SQLite only, like the narrator surface it rides on: the routes refuse PostgreSQL with 503.
- * Every query here is a primary-key or `(project_id, status, narrator_id)` index lookup bounded
+ * Every query here is a primary-key or `(project_id, …)` index lookup bounded
  * by a LIMIT; the brief and settings are read only on the detail path.
  */
 
@@ -25,7 +26,7 @@ import {
 	type TeamStatus,
 	type TeamSummary,
 } from "@shared/project-teams";
-import { and, asc, eq, gt, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, ne, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators, projects, projectTeams, teamWorkEvents } from "../../db/schema";
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from "../../lib/errors";
@@ -43,6 +44,7 @@ import {
 	narratorReadableWhere,
 } from "../narrator-acl";
 import { type NarratorCreationTransaction, narratorService } from "../narrator-service";
+import { currentTeamStatusActor, runAsTeamStatusActor } from "./team-records";
 
 type TeamRow = typeof projectTeams.$inferSelect;
 type CoordinatorRow = {
@@ -67,12 +69,13 @@ const COORDINATOR_COLUMNS = {
 
 const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
 
-/** The team's status as people see it: an archived coordinator is an archived team. */
-function effectiveStatus(
-	team: Pick<TeamRow, "status">,
-	coordinator: { status: string },
-): TeamStatus {
-	return coordinator.status === "archived" ? "archived" : team.status;
+/**
+ * The team's status, taken from the coordinator alone: an archived coordinator is an archived
+ * team, any other is an active one. The stored `project_teams.status` is a mirror (kept by the
+ * archive routes and `startTeamStatusSync`) and never decides what people see.
+ */
+function effectiveStatus(coordinator: { status: string }): TeamStatus {
+	return coordinator.status === "archived" ? "archived" : "active";
 }
 
 function toSummary(
@@ -86,7 +89,7 @@ function toSummary(
 		projectId: team.projectId,
 		name: coordinator.title ?? "",
 		baseBranch: team.baseBranch,
-		status: effectiveStatus(team, coordinator),
+		status: effectiveStatus(coordinator),
 		coordinatorStatus: coordinator.status,
 		createdBy: team.createdBy,
 		createdAt: team.createdAt,
@@ -282,7 +285,7 @@ export async function updateTeam(
 	projectId?: string,
 ): Promise<TeamDetail> {
 	const { team, coordinator } = await loadTeamForAccess(teamId, principal, "write", projectId);
-	if (effectiveStatus(team, coordinator) === "archived")
+	if (effectiveStatus(coordinator) === "archived")
 		throw new AppError(
 			"An archived team cannot be changed; unarchive it first",
 			409,
@@ -370,13 +373,20 @@ export async function archiveTeam(
 	projectId?: string,
 ): Promise<TeamDetail> {
 	const { coordinator } = await loadTeamForAccess(teamId, principal, "write", projectId);
+	const actorId = principal.userId || null;
 	if (coordinator.status !== "archived") {
+		// Like the narrator archive route: remember the sidebar placement for unarchive.
+		if (actorId) {
+			const { rememberArchivedTabPlacement } = await import("../recent-tabs-service");
+			await rememberArchivedTabPlacement(actorId, teamId);
+		}
 		const { interruptAndArchiveSubagent } = await import("../subagent-lifecycle");
-		const result = await interruptAndArchiveSubagent(teamId);
+		// The status event fires inside; the sync listener attributes it to this person.
+		const result = await runAsTeamStatusActor(actorId, () => interruptAndArchiveSubagent(teamId));
 		if (!result.ok && result.error === "not_found") throw new NotFoundError("Team", teamId);
 		if (!result.ok) throw new ValidationError(result.error ?? "Failed to archive the team");
 	}
-	syncTeamStatus(teamId, true, principal.userId || null);
+	syncTeamStatus(teamId, true, actorId);
 	return getTeam(teamId, principal, projectId);
 }
 
@@ -386,8 +396,16 @@ export async function unarchiveTeam(
 	projectId?: string,
 ): Promise<TeamDetail> {
 	const { coordinator } = await loadTeamForAccess(teamId, principal, "write", projectId);
-	if (coordinator.status === "archived") await narratorService.updateStatus(teamId, "idle");
-	syncTeamStatus(teamId, false, principal.userId || null);
+	const actorId = principal.userId || null;
+	if (coordinator.status === "archived") {
+		await runAsTeamStatusActor(actorId, () => narratorService.updateStatus(teamId, "idle"));
+		// Like the narrator unarchive route: put the sidebar row back where it was.
+		if (actorId) {
+			const { restoreArchivedTabPlacement } = await import("../recent-tabs-service");
+			await restoreArchivedTabPlacement(actorId, teamId, coordinator.title ?? teamId);
+		}
+	}
+	syncTeamStatus(teamId, false, actorId);
 	return getTeam(teamId, principal, projectId);
 }
 
@@ -407,11 +425,12 @@ export async function listProjectTeams(
 	principal: NarratorPrincipal,
 	options: ListTeamsOptions,
 ): Promise<{ teams: TeamSummary[]; nextCursor: string | null }> {
+	// By the coordinator's status, the one source of truth (see `effectiveStatus`).
 	const statusFilter =
 		options.status === "active"
-			? and(eq(projectTeams.status, "active"), ne(narrators.status, "archived"))
+			? ne(narrators.status, "archived")
 			: options.status === "archived"
-				? or(eq(projectTeams.status, "archived"), eq(narrators.status, "archived"))
+				? eq(narrators.status, "archived")
 				: undefined;
 	const rows = db
 		.select({
@@ -465,12 +484,14 @@ export async function listProjectTeams(
 /**
  * Follow the coordinator's archive state from every path (narrator archive route, auto-unarchive
  * on a new message, Agent control). A primary-key read per status event; it writes only when the
- * stored team status disagrees. Returns the stop function.
+ * stored team status disagrees. The event is the person's when the change runs inside
+ * `runAsTeamStatusActor` (team routes, and every narrator HTTP route by its caller); otherwise
+ * it is the system's. Returns the stop function.
  */
 export function startTeamStatusSync(): () => void {
 	const onStatus = (event: { narratorId: string; status: string }) => {
 		try {
-			syncTeamStatus(event.narratorId, event.status === "archived", null);
+			syncTeamStatus(event.narratorId, event.status === "archived", currentTeamStatusActor());
 		} catch (error) {
 			logger.warn("Team status sync failed", {
 				teamId: event.narratorId,

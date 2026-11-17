@@ -2359,6 +2359,7 @@
 	"storageDatabaseBlockedReason_nonArchived": "Contains descendant sessions that are not archived",
 	"storageDatabaseBlockedReason_nonStaleStatus": "Contains descendant sessions still considered active",
 	"storageDatabaseBlockedReason_recentActivity": "Has recent activity",
+	"storageDatabaseBlockedReason_teamLiveWork": "Team coordinator with work items still in progress or holding a worktree",
 	"storageDatabaseBlockedReasonWithItem": "{{reason}}: {{name}}",
 	"runtimeSection": "Runtime Resources",
 	"pluginsSection": "Plugins",

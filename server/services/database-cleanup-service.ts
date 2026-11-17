@@ -57,6 +57,7 @@ import {
 	type SessionOwnedTableRelation,
 	summarizeToolCallPayloads,
 } from "./storage-scan-queries";
+import { listTeamsWithLiveWork } from "./teams/team-records";
 import {
 	pauseTokenRecalculationWorkers,
 	resumeTokenRecalculationWorkers,
@@ -254,6 +255,8 @@ export interface DatabaseVacuumResult {
 interface CleanupNarratorContext {
 	narrators: NarratorCleanupRecord[];
 	runningTerminalIds: Set<string>;
+	/** Team coordinators that cannot be deleted yet (`TEAM_HAS_LIVE_WORK`). */
+	liveTeamIds: Set<string>;
 }
 
 interface SessionPreviewData {
@@ -388,6 +391,7 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 	return {
 		narrators: narratorRows.map(normalizeNarratorCleanupRecord),
 		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
+		liveTeamIds: listTeamsWithLiveWork(),
 	};
 }
 
@@ -408,9 +412,11 @@ function loadRootSubtreeContext(rootNarratorId: string): CleanupNarratorContext 
 			 WHERE status = 'running' AND narrator_id IN (SELECT id FROM subtree)`,
 		)
 		.all(rootNarratorId) as Array<{ narratorId: string }>;
+	const narratorsInSubtree = narratorRows.map(normalizeNarratorCleanupRecord);
 	return {
-		narrators: narratorRows.map(normalizeNarratorCleanupRecord),
+		narrators: narratorsInSubtree,
 		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
+		liveTeamIds: listTeamsWithLiveWork(narratorsInSubtree.map((row) => row.id)),
 	};
 }
 
@@ -427,6 +433,7 @@ function isCleanupRootStillEligible(
 	const [latest] = buildNarratorCleanupPlan(sessionPlan.target, context.narrators, {
 		staleCutoffIso: sessionPlan.staleCutoffIso,
 		runningTerminalIds: context.runningTerminalIds,
+		liveTeamIds: context.liveTeamIds,
 		rootNarratorIds: new Set([root.rootNarratorId]),
 	}).safeRoots;
 	if (!latest) return false;
@@ -494,6 +501,7 @@ function planSessionCleanup(
 	const plan = buildNarratorCleanupPlan(target, context.narrators, {
 		staleCutoffIso,
 		runningTerminalIds: context.runningTerminalIds,
+		liveTeamIds: context.liveTeamIds,
 	});
 	return { target, normalizedDays, staleCutoffIso, plan };
 }
@@ -769,10 +777,12 @@ async function measureCleanupCandidatesOffThread(
 	const cleanupContext = await loadCleanupNarratorContext();
 	const archivedPlan = buildNarratorCleanupPlan("archivedSessions", cleanupContext.narrators, {
 		runningTerminalIds: cleanupContext.runningTerminalIds,
+		liveTeamIds: cleanupContext.liveTeamIds,
 	});
 	const stalePlan = buildNarratorCleanupPlan("staleSessions", cleanupContext.narrators, {
 		staleCutoffIso: getCutoffIso(DEFAULT_STALE_SESSION_DAYS),
 		runningTerminalIds: cleanupContext.runningTerminalIds,
+		liveTeamIds: cleanupContext.liveTeamIds,
 	});
 	const archivedNarratorIds = [
 		...new Set(archivedPlan.safeRoots.flatMap((root) => root.deletedNarratorIds)),
