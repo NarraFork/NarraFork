@@ -146,7 +146,19 @@ export function WorktreeRemovalDialog({
 								</Badge>
 								{plan.worktree.dirty && (
 									<Badge size="xs" color="orange">
-										{t("worktree.removeDirty", { count: plan.worktree.dirtyFileCount })}
+										{t(
+											plan.worktree.dirtyExact === false
+												? "worktree.removeDirtyAtLeast"
+												: "worktree.removeDirty",
+											{ count: plan.worktree.dirtyFileCount },
+										)}
+									</Badge>
+								)}
+								{(plan.worktree.unreachableCommits ?? 0) > 0 && (
+									<Badge size="xs" color="red">
+										{t("worktree.removeUnreachable", {
+											count: plan.worktree.unreachableCommits,
+										})}
 									</Badge>
 								)}
 								{plan.worktree.locked && (
@@ -171,6 +183,11 @@ export function WorktreeRemovalDialog({
 						{plan.worktree.mode === "rows" && (
 							<Text size="xs" c="dimmed">
 								{t("worktree.removeRowsOnly")}
+							</Text>
+						)}
+						{plan.worktree.mode === "remove" && (
+							<Text size="xs" c="dimmed">
+								{t("worktree.removeIgnoredNote")}
 							</Text>
 						)}
 						<Divider />

@@ -123,7 +123,17 @@ export class WorktreeRemovalFlow {
 				expectedRevision: plan.expectedRevision,
 				workspaceKey: this.scope()?.workspaceKey ?? "",
 				path: plan.worktree.path,
-				force: this.state.confirmed.includes("force") ? true : undefined,
+				...(this.state.confirmed.includes("force")
+					? {
+							force: true,
+							// Exactly what the person saw; the server refuses if reality moved on.
+							confirmedLoss: {
+								head: plan.worktree.head,
+								dirtyFileCount: plan.worktree.dirtyFileCount,
+								unreachableCommits: plan.worktree.unreachableCommits ?? 0,
+							},
+						}
+					: {}),
 				acknowledgeUnregistered: this.state.confirmed.includes("acknowledgeUnregistered")
 					? true
 					: undefined,

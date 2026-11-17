@@ -187,6 +187,24 @@ export async function countCommitsNotIn(
 	return parseCount(result.stdout.trim());
 }
 
+/**
+ * Commits reachable from `tip` and from no local branch, remote-tracking ref or tag:
+ * what deleting a detached checkout at `tip` would make unreachable. None of the
+ * excluded refs is caller-chosen, so this cannot be talked into reporting zero.
+ */
+export async function countCommitsOnlyReachableFrom(
+	run: GitQueryRunner,
+	tip: string,
+): Promise<number> {
+	assertSha(tip);
+	const result = await run(
+		["rev-list", "--count", tip, "--not", "--branches", "--remotes", "--tags"],
+		{ maxOutputBytes: SMALL_OUTPUT_BYTES },
+	);
+	if (result.exitCode !== 0 || result.truncated) throw failure("git rev-list", result);
+	return parseCount(result.stdout.trim());
+}
+
 /** The configured upstream of a local branch and its commit, or null without one. */
 export async function branchUpstream(
 	run: GitQueryRunner,

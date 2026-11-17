@@ -11,6 +11,7 @@ import { GitError, ValidationError } from "../../lib/errors";
 import { safeSpawn } from "../../lib/spawn";
 import {
 	assertQueryRef,
+	countCommitsOnlyReachableFrom,
 	type GitQueryRunner,
 	isAncestor,
 	uncommittedChanges,
@@ -112,6 +113,20 @@ describe("ref queries", () => {
 		// An upstream that was never fetched is not evidence of anything.
 		await git(["update-ref", "-d", "refs/remotes/origin/feature"], dir);
 		expect(await gitService.getBranchUpstream(dir, "feature")).toBeNull();
+	});
+
+	test("commits only a detached tip reaches: no branch, remote ref or tag holds them", async () => {
+		const { dir, feature, main } = await createRepo();
+		const run = (args: string[]) =>
+			safeSpawn({ cmd: ["git", ...args], cwd: dir, timeout: 15_000, maxOutputBytes: 4096 }).then(
+				(result) => ({ ...result, truncated: false }),
+			);
+		expect(await countCommitsOnlyReachableFrom(run, feature)).toBe(0);
+		await git(["checkout", "-q", "--detach", main], dir);
+		const loose = await commit(dir, "loose.txt", "x\n", "loose");
+		expect(await countCommitsOnlyReachableFrom(run, loose)).toBe(1);
+		await git(["tag", "keep", loose], dir);
+		expect(await countCommitsOnlyReachableFrom(run, loose)).toBe(0);
 	});
 
 	test("uncommitted changes count modified, staged, renamed and untracked paths", async () => {
