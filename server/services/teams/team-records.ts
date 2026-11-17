@@ -12,7 +12,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { TEAM_WORK_ITEM_FINISHED_STATES } from "@shared/project-teams";
-import { and, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, exists, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { projectTeams, teamWorkItems } from "../../db/schema";
 import { AppError } from "../../lib/errors";
@@ -91,10 +91,12 @@ export function listTeamsWithLiveWork(candidateIds: readonly string[]): Set<stri
 			.where(
 				and(
 					inArray(projectTeams.narratorId, batch),
-					sql`exists (select 1 from team_work_items twi
-						where twi.team_id = ${projectTeams.narratorId}
-							and (twi.state not in ('merged', 'cancelled')
-								or twi.worktree_resource_id is not null))`,
+					exists(
+						db
+							.select({ one: sql`1` })
+							.from(teamWorkItems)
+							.where(and(eq(teamWorkItems.teamId, projectTeams.narratorId), liveItem())),
+					),
 				),
 			)
 			.all();
