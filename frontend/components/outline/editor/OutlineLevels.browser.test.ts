@@ -129,6 +129,40 @@ test("a closed block's children are not in the document; opening puts them in, c
 	// Closed again: taken out.
 	await a.call((f, id) => f.view().toggleCollapse(id as never), done);
 	expect(await inDoc(a)).toEqual([pageId, done, fact, factChild]);
+	// Copying the closed block, as a block and inside a text selection, copies what it hides.
+	const copy = (e: Editor) =>
+		e.call((f) => {
+			const data = new DataTransfer();
+			f.view().pm.dom.dispatchEvent(
+				new ClipboardEvent("copy", { clipboardData: data, bubbles: true, cancelable: true }),
+			);
+			return data.getData("text/plain");
+		});
+	await a.call((f, id) => f.caret(id as never), done);
+	await a.call((f, id) => f.view().setBlockSelection({ anchor: id, head: id }), done);
+	const asBlock = await copy(a);
+	expect(asBlock).toContain("Deeper");
+	expect(asBlock).toContain("Second note");
+	await a.call((f) => f.view().setBlockSelection(null));
+	await a.call((f, x, y) => f.select(x as never, 0, y as never, 4), done, fact);
+	const asText = await copy(a);
+	expect(asText).toContain("Deeper");
+	expect(asText).toContain("Open");
+	expect(await inDoc(a)).toEqual([pageId, done, fact, factChild]);
+	// A block indented under the closed one goes after what it hides (and the closed block
+	// stays open while the cursor is in it); undo puts it back.
+	await a.call((f) => f.view().setBlockSelection(null));
+	await a.call((f, id) => f.caret(id as never), fact);
+	await a.page.keyboard.press("Tab");
+	await settle(a);
+	expect(await a.call((f, id) => f.kids(id as never), done)).toEqual([result, second, fact]);
+	// (Under a task it is a detail: closed itself.)
+	expect(await inDoc(a)).toEqual([pageId, done, result, second, fact]);
+	await a.call((f) => f.undo());
+	await settle(a);
+	expect(await a.call((f, id) => f.kids(id as never), pageId)).toEqual([done, fact]);
+	await a.call((f, id) => f.caret(id as never), factChild);
+	await until(a, (f, id) => f.dom(id as never)?.classList.contains("collapsed") === true, [done]);
 	expect(await a.call((f) => f.viewOutline())).toBe(
 		[
 			"- [x] Done task",
