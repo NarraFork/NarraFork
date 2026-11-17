@@ -2104,6 +2104,10 @@ export class OutlineView implements CmdHost, ClientView {
 		// deleted, cut or pasted over; a join or a paste that removes the closed row itself):
 		// the block opens instead and nothing changes; the same key again does it to what the
 		// reader now sees (a join then takes its children along, as before).
+		// The focused block stays the one root (select all and Delete): refused before anything
+		// opens.
+		if (!fast && (state.doc.childCount !== 1 || state.doc.child(0).attrs.id !== this.rootId))
+			return this.refuse(before, "root");
 		if (!fast) {
 			// (Whole blocks deleted as blocks take what they hold: `deleteBlocks`, the map's delete.)
 			const text = !tr.getMeta(WHOLE_BLOCKS) && !this.blockSel;
