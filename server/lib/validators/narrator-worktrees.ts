@@ -68,9 +68,20 @@ export const worktreeRemovalRequestSchema = z
 		workspaceKey,
 		path: worktreePath,
 		force: z.boolean().optional(),
+		confirmedLoss: z
+			.object({
+				head: z.string().max(128).nullable(),
+				dirtyFileCount: z.number().int().nonnegative().max(1_000_000_000),
+				unreachableCommits: z.number().int().nonnegative().max(1_000_000_000_000),
+			})
+			.strict()
+			.optional(),
 		acknowledgeUnregistered: z.boolean().optional(),
 	})
-	.strict();
+	.strict()
+	.refine((input) => !input.force || input.confirmedLoss !== undefined, {
+		message: "force must carry the confirmed loss",
+	});
 export type WorktreeCreateRequest = z.infer<typeof worktreeCreateSchema>;
 export type WorktreeRemovalPlanRequest = z.infer<typeof worktreeRemovalPlanSchema>;
 export type WorktreeRemovalRequest = z.infer<typeof worktreeRemovalRequestSchema>;

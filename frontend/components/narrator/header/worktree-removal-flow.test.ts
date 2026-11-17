@@ -39,6 +39,8 @@ const plan = (patch: Partial<WorktreeRemovalPlan> = {}): WorktreeRemovalPlan => 
 		state: "ready",
 		dirty: false,
 		dirtyFileCount: 0,
+		dirtyExact: true,
+		unreachableCommits: 0,
 	},
 	dependents: [],
 	inventory: {
@@ -104,7 +106,15 @@ function harness(options: {
 
 describe("worktree removal flow", () => {
 	test("submits only after every confirmation the plan asks for", async () => {
-		const { flow, removals } = harness({ plans: [plan({ confirmations: ["force"] })] });
+		const dirty = plan({ confirmations: ["force"] });
+		dirty.worktree = {
+			...dirty.worktree,
+			head: "a".repeat(40),
+			dirty: true,
+			dirtyFileCount: 2,
+			unreachableCommits: 1,
+		};
+		const { flow, removals } = harness({ plans: [dirty] });
 		await flow.load();
 		expect(flow.canSubmit).toBe(false);
 		expect(flow.outstanding).toEqual(["force"]);
@@ -115,6 +125,8 @@ describe("worktree removal flow", () => {
 			{
 				expectedRevision: 7,
 				force: true,
+				// The confirmation carries exactly the loss the plan showed.
+				confirmedLoss: { head: "a".repeat(40), dirtyFileCount: 2, unreachableCommits: 1 },
 				path: plan().worktree.path,
 				workspaceKey: "workspace",
 				acknowledgeUnregistered: undefined,

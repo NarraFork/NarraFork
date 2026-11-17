@@ -113,10 +113,20 @@ export interface WorktreeRemovalRequest {
 	expectedRevision: number;
 	workspaceKey: string;
 	path: string;
-	/** The caller saw the reported uncommitted changes and still wants the checkout gone. */
+	/** The caller saw the reported loss and still wants the checkout gone. */
 	force?: boolean;
+	/**
+	 * Required with `force`: the plan's HEAD and loss counts exactly as the person saw
+	 * them. A plan that changed since (in either direction) is refused, not forced.
+	 */
+	confirmedLoss?: WorktreeRemovalConfirmedLoss;
 	/** The worktree has no NarraFork owner record; deleting it is the caller's explicit call. */
 	acknowledgeUnregistered?: boolean;
+}
+export interface WorktreeRemovalConfirmedLoss {
+	head: string | null;
+	dirtyFileCount: number;
+	unreachableCommits: number;
 }
 export interface WorktreeRemovalPlanRequest {
 	workspaceKey: string;
@@ -169,10 +179,9 @@ export interface WorktreeRemovalPlan {
 		 */
 		mode: "remove" | "prune" | "rows";
 		/**
-		 * Other stale registrations this repository will lose in the same `prune`.
-		 *
-		 * `git worktree prune` has no path argument, so a `prune` removal always clears
-		 * every prunable entry Git reports. Always 0 for `remove` and `rows`.
+		 * Other stale registrations removed together with this one. Always 0: the entry of
+		 * a deleted checkout is removed by path (`git worktree remove`), never by
+		 * `git worktree prune`. Kept for older clients.
 		 */
 		pruneSiblings: number;
 		/** The directory is still on disk. An absent one is pruned, never deleted. */
@@ -182,7 +191,15 @@ export interface WorktreeRemovalPlan {
 		registrationId: string | null;
 		state: "preparing" | "ready" | "unknown" | null;
 		dirty: boolean;
+		/**
+		 * Uncommitted paths (untracked files counted one by one). Ignored files are not
+		 * counted but are deleted with the directory; skip-worktree/assume-unchanged edits
+		 * are invisible to Git. A lower bound when `dirtyExact` is false.
+		 */
 		dirtyFileCount: number;
+		dirtyExact: boolean;
+		/** Commits only this (detached) checkout reaches: no branch, remote ref or tag has them. */
+		unreachableCommits: number;
 	};
 	dependents: WorktreeDependent[];
 	inventory: WorktreeRemovalInventory;

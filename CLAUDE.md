@@ -123,8 +123,8 @@ server/
 - **子代理**：通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**：`full`（延迟会话 fork）/ `compressed`（摘要注入 system prompt）/ `fresh`（无上下文）。
 - **项目归属**：会话的项目只经 `resolveNarratorProjectId`（SQL 侧 `narratorProjectIdText` / `narratorProjectIdColumn`）判断：有 `contextProjectId` 用它，否则用工作目录推导出的主链接；最长前缀匹配已有项目根，否则取 git 主仓库根并自动建公开项目，非 git 目录不建项目。权限与配置只看主项目，`additional` 链接只让会话出现在其他项目页。索引可随时整表重建（启动时后台分页重建）。
-- **Git worktrees**：会话 worktree 由 narrator worktree 资源管理；`<project.gitPath>/.worktrees/` 下叙事线时代留下的目录和分支没有任何记录，任何清理逻辑都不得删除它们。
-  删除（`POST /api/narrators/:id/git/worktrees/removal`）是用户显式操作，只能走受保护退役通道：先迁移依赖该目录的会话（请求者真实切换，归档会话与子代理静默修复）、关闭后台任务/浏览器/终端，再撤登记行，最后在 `withProtectionReservation` 内执行 `git worktree remove`（目录已不存在时只 `git worktree prune`，该命令无法只针对一个路径，plan 会报出将一并清理的失效登记数）。依赖该目录的其他主会话必须已被用户归档；归档本身不释放保护 claim，必须迁移 cwd 才行。删除要求请求者自己的 checkout 健康：目录已被外部删掉的会话只能从同仓库的另一个会话发起删除。目标路径必须是 Git 登记的 worktree、有 NarraFork owner 行、或位于 `<主工作树>/.worktrees/` 下，否则拒绝——`rows` 退役仍会关终端、搬会话，不能对任意目录执行。`storage-service` 的自动维护仍然永不删除无记录目录，两者不冲突。
+- **Git worktrees**：会话 worktree 由 narrator worktree 资源管理；`<project.gitPath>/.worktrees/` 下叙事线时代留下的目录和分支没有任何记录，任何**自动**清理逻辑都不得删除它们；用户在删除弹窗里逐个确认删除某一个（含无记录的）是允许的，分支永不删除。
+  删除（`POST /api/narrators/:id/git/worktrees/removal`）是用户显式操作，只能走受保护退役通道：先迁移依赖该目录的会话（请求者真实切换，归档会话与子代理静默修复）、关闭后台任务/浏览器/终端，再撤登记行，最后在 `withProtectionReservation` 内执行 `git worktree remove`（目录已不存在时用 `git worktree remove -- <path>` 只移除这一条 Git 登记，不跑会清掉全部失效登记的 `prune`）。依赖该目录的其他主会话必须已被用户归档；归档本身不释放保护 claim，必须迁移 cwd 才行。有未提交改动或只有游离 HEAD 才可达的提交时必须强制确认，且确认的数字须与锁内重新测得的完全一致；`git status` 失败、被杀或超时按阻塞处理，不当作干净。删除要求请求者自己的 checkout 健康：目录已被外部删掉的会话只能从同仓库的另一个会话发起删除。目标路径必须是 Git 登记的 worktree、有 NarraFork owner 行、或位于 `<主工作树>/.worktrees/` 下，否则拒绝——`rows` 退役仍会关终端、搬会话，不能对任意目录执行。`storage-service` 的自动维护仍然永不删除无记录目录，两者不冲突。
 - **容器**：Podman 只用于插件与基准测试；设置页“工作区与容器”提供检测与安装。
 - **终端管理**：Unix 用 `Bun.Terminal`，Windows 用 `bun-pty`，统一 `TerminalRuntime` 接口；可选 dtach；生命周期绑定服务器进程。
 - **项目页**：`/projects/$projectId` 列出目录与会话（按链接表过滤，任何角色的链接都算）。

@@ -51,6 +51,7 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { isClearedToolOutput } from "../storage-retention";
+import { normalizeSubagentNestedSummary, type SubagentNestedAgent } from "../subagent-nested";
 import { subagentResultText } from "../subagent-result-text";
 import { type FileChangeTiming, resolveToolDisplayDurationMs } from "../tool-display-duration";
 
@@ -369,6 +370,11 @@ export interface AdapterToolItem {
 			takenOver?: boolean;
 			/** Follow/fallback decision for `__parent__` children (height-neutral badge). */
 			modelInheritance?: unknown;
+			/**
+			 * The helpers this child launched itself (its one nested level). Height-affecting
+			 * (a row list), keyed in `subagentRevision` through the card's `nestedAgents`.
+			 */
+			nested?: unknown;
 		} | null;
 		/**
 		 * The subagent this call is waiting on is TAKEN OVER by the user, so the call
@@ -4390,6 +4396,16 @@ function adaptToolItemFull(
 	};
 }
 
+/** `nestedAgents` / `nestedTotal` for a card whose child launched helpers, else `{}`. */
+function nestedCardFields(value: unknown): {
+	nestedAgents?: SubagentNestedAgent[];
+	nestedTotal?: number;
+} {
+	const nested = normalizeSubagentNestedSummary(value);
+	if (!nested || nested.total === 0) return {};
+	return { nestedAgents: nested.agents, nestedTotal: nested.total };
+}
+
 /**
  * The complete `SubagentCardData` payload for ONE subagent tool call.
  *
@@ -4566,6 +4582,8 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		...(activity?.fileChanges && ctx.isFileChangesOpen?.(key) === true
 			? { fileChangesExpanded: true }
 			: {}),
+		// The helpers this child launched (its one nested level): one row each, bounded.
+		...nestedCardFields(activity?.nested),
 		recentCallCount: recentCallNames.length,
 		recentCallNames,
 		recentCallSummaries,

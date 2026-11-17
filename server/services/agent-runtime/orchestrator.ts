@@ -1009,6 +1009,9 @@ export async function runAgentLoopUnlocked(
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
+			// A nested helper's gates and status reach its root's page too (also after a restart).
+			const { rememberNestedSubagentRoot } = await import("../nested-subagent-routing");
+			rememberNestedSubagentRoot(freshNarrator);
 			// A team coordinator (Project Teams P2): the team status is a history row written
 			// before this pass reads its history, at run start and after a compaction; the
 			// soft-limit reminders ride on its tool results. Never in the system prompt.

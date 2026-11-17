@@ -8874,6 +8874,11 @@ export function interruptNarrator(narratorId: string): boolean {
 		.set({ lastStopReason: "user_interrupt" })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	// A stopped subagent's helpers stop with it, even when it is between turns while they
+	// still run in the background. A no-op for primaries and helper-less subagents.
+	void import("./agent-runtime/run")
+		.then(({ stopSubagentHelpers }) => stopSubagentHelpers(narratorId, "Parent subagent stopped"))
+		.catch(() => {});
 	if (cancelModelTrace(narratorId)) return true;
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);

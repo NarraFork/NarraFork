@@ -556,6 +556,9 @@ export const ExactRow = memo(
 					if (subToolActions?.onViewSubagentSession) {
 						subExtra.onOpenSession = subToolActions.onViewSubagentSession;
 					}
+					if (subToolActions?.onViewNestedSession) {
+						subExtra.onOpenNestedSession = subToolActions.onViewNestedSession;
+					}
 					if (viewControls) {
 						const subData = cardData as { resultText?: unknown; agentType?: unknown };
 						const description =
@@ -785,6 +788,9 @@ export const ExactRow = memo(
 		if (kind === "subagent-card") {
 			if (interaction?.toolActions?.onViewSubagentSession) {
 				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
+			}
+			if (interaction?.toolActions?.onViewNestedSession) {
+				extra.onOpenNestedSession = interaction.toolActions.onViewNestedSession;
 			}
 			// Prompt fold. Same story as onOpenSession: RenderSubagent drew the
 			// chevron row but nothing supplied the handler, so clicking it did
