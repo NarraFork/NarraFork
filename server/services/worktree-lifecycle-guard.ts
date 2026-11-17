@@ -565,7 +565,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				for (const target of normalized) {
 					if (!overlaps(target, canonical) && !(shadowPhysical && overlaps(target, shadowPhysical)))
 						continue;
-					if (claim.kind === "registry" && claim.id === target.retiringRegistryId) continue;
+					if (
+						target.retiringRegistryId &&
+						claim.kind === "registry" &&
+						claim.id === target.retiringRegistryId
+					)
+						continue;
 					if (
 						target.retiringCreateRequestId &&
 						claim.kind === "receipt" &&

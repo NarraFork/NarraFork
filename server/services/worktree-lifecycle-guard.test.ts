@@ -345,6 +345,11 @@ describe("read-only lifecycle protection", () => {
 			});
 		});
 	}
+	test("a registry claim without an id still protects when nothing is being retired", async () => {
+		const claim = { kind: "registry", path: target.path } as unknown as ResourceClaim;
+		const { guard } = fixture([claim]);
+		expect((await guard.inspect([target], "delete")).status).toBe("protected");
+	});
 	test("ordinary checkout cwd is not a claim on shadow storage", async () => {
 		const { guard } = fixture([{ kind: "narrator", id: "cwd", path: target.path }]);
 		expect(
