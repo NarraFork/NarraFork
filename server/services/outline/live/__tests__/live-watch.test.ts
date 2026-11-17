@@ -984,7 +984,11 @@ describe("review round 2", () => {
 			await clock.settle(100, 20_000);
 			await clock.advance(3000);
 			await clock.settle(100, 20_000);
-			expect(a.closeCode).toBe("too_large");
+			// Too large for one watch now: it joins again by levels (pageless L4: d's level and
+			// the one d stands in), not closed.
+			expect(a.watchRefused.get(`s:${d}`)).toBe("too_large");
+			expect(a.watchSet).toEqual([{ l: one.pageId }, { l: d }]);
+			expect(a.status).toBe("live");
 			expect(f.watchSet).toEqual([{ l: one.pageId }]);
 			// d is One's child (shown by the level); x is under d now: not shown.
 			expect(f.visible.alive(d)).toBeDefined();
