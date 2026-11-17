@@ -670,6 +670,79 @@ describe("review round 1", () => {
 		}
 	});
 
+	test("a built-in name in any capitalisation means that built-in", async () => {
+		const service = await import("../custom-subagent-service");
+		expect(service.canonicalTemplateName("Worker")).toBe("worker");
+		expect(service.canonicalTemplateName("GENERAL")).toBe("general");
+		expect(service.canonicalTemplateName("my-helper")).toBe("my-helper");
+		const worker = resolveRuntimePolicy([await service.compileDelegationCeiling("Worker")]);
+		expect(worker.capabilities.spawnAgent).toBe(true);
+		expect(worker.tools.readOnly).toBe(false);
+		const general = resolveRuntimePolicy([await service.compileDelegationCeiling("General")]);
+		expect(general.tools.readOnly).toBe(false);
+	});
+
+	test("every built-in directory is moved aside; a symlink is left alone; a failed write moves nothing", async () => {
+		const { mkdir, readFile, rm, stat, symlink, writeFile, lstat } = await import(
+			"node:fs/promises"
+		);
+		const { join } = await import("node:path");
+		const { narraforkDir } = await import("../../lib/settings");
+		const service = await import("../custom-subagent-service");
+		const root = join(narraforkDir, "subagents");
+		const outside = join(narraforkDir, "outside-template");
+		const file = (name: string) =>
+			`---\nname: ${name}\ndescription: mine\ntoolAccess: general\n---\n\nMy ${name} prompt.\n`;
+		const cleanup = async () => {
+			for (const dir of ["general", "general-custom", "explore", "explore-custom"])
+				await rm(join(root, dir), { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
+		};
+		try {
+			await mkdir(join(root, "general"), { recursive: true });
+			await writeFile(join(root, "general", "SUBAGENT.md"), file("General"));
+			await mkdir(outside, { recursive: true });
+			await writeFile(join(outside, "SUBAGENT.md"), file("explore"));
+			await symlink(outside, join(root, "explore"));
+
+			// A failing write moves nothing and leaves the original untouched.
+			const failing = await service.moveAsideReservedTemplates({
+				writeFile: async () => {
+					throw new Error("disk full");
+				},
+				rename: async () => {},
+			});
+			expect(failing).toEqual([]);
+			expect(await readFile(join(root, "general", "SUBAGENT.md"), "utf-8")).toBe(file("General"));
+			await expect(stat(join(root, "general-custom"))).rejects.toThrow();
+
+			// A failing directory rename leaves the old directory, with its file already
+			// renamed: never a `-custom` directory whose file claims the reserved name.
+			const fs = await import("node:fs/promises");
+			const halfway = await service.moveAsideReservedTemplates({
+				writeFile: (path, data) => fs.writeFile(path, data, "utf-8"),
+				rename: async (from, to) => {
+					if (to.endsWith("-custom")) throw new Error("rename refused");
+					await fs.rename(from, to);
+				},
+			});
+			expect(halfway).toEqual([]);
+			await expect(stat(join(root, "general-custom"))).rejects.toThrow();
+
+			expect(await service.moveAsideReservedTemplates()).toEqual(["general-custom"]);
+			const moved = await service.resolveTemplateDefinition("general-custom");
+			expect(moved?.name).toBe("general-custom");
+			expect(moved?.prompt).toBe("My General prompt.");
+			await expect(stat(join(root, "general"))).rejects.toThrow();
+			// The symlinked directory is neither followed for the write nor moved.
+			expect((await lstat(join(root, "explore"))).isSymbolicLink()).toBe(true);
+			expect(await readFile(join(outside, "SUBAGENT.md"), "utf-8")).toBe(file("explore"));
+			await expect(stat(join(root, "explore-custom"))).rejects.toThrow();
+		} finally {
+			await cleanup();
+		}
+	});
+
 	test("a template that already used the name worker is moved aside, not lost", async () => {
 		const { mkdir, readFile, rm, stat, writeFile } = await import("node:fs/promises");
 		const { join } = await import("node:path");

@@ -1476,8 +1476,12 @@ export async function stopSubagentHelpers(
 			if (getRunHold(helper.id)) continue;
 			options.assertAuthorized?.();
 			const cancelled =
-				(await backgroundTaskService.cancel(helper.id).catch(() => false)) ||
-				(await controlRun(helper.id, { kind: "cancel", reason }).catch(() => false));
+				(await backgroundTaskService
+					.cancel(helper.id, { assertAuthorized: options.assertAuthorized })
+					.catch((error) => {
+						if (options.assertAuthorized) throw error;
+						return false;
+					})) || (await controlRun(helper.id, { kind: "cancel", reason }).catch(() => false));
 			if (cancelled) stopped++;
 		}
 		if (stopped > 0) logger.info("Stopped helpers of a stopped subagent", { narratorId, stopped });

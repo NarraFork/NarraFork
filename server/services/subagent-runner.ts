@@ -182,7 +182,6 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	const {
 		parentNarratorId,
 		toolUseId,
-		subagentType,
 		prompt,
 		cwd,
 		title,
@@ -193,6 +192,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	} = input;
 	// The child stores this value; `auto:<alias>` is written the catalog's way, and an `auto:`
 	// id the catalog does not know fails here instead of at the child's first request.
+	// "Worker" or "GENERAL" means that built-in, never the read-only unknown-type fallback.
+	const subagentType = customSubagentService.canonicalTemplateName(input.subagentType);
 	const explicitModel = input.model ? normalizeAutoModelValueForSave(input.model) : input.model;
 	const background = input.background === true || input.takeoverByUser === true;
 	const timeoutMs = background

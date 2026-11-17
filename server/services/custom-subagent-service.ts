@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import matter from "gray-matter";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
@@ -290,9 +290,10 @@ export async function remove(name: string): Promise<void> {
  * carry their ceiling and runtime never re-reads the template.
  */
 export async function compileDelegationCeiling(
-	template: string,
+	requested: string,
 	options: { outlineSession?: boolean } = {},
 ): Promise<RuntimePolicyTrait> {
+	const template = canonicalTemplateName(requested);
 	return compileDelegationPolicy({
 		template,
 		customDefinition: await resolveTemplateDefinition(template),
@@ -313,42 +314,85 @@ export async function resolveTemplateDefinition(
 	return loadByName(template);
 }
 
-/**
- * Built-in template names added after people could already create their own templates.
- * A user's template directory with one of these names is moved aside at startup
- * (`moveAsideReservedTemplates`) so it keeps existing under a new name and the built-in
- * always wins.
- */
-const LATE_BUILTIN_TEMPLATES: readonly string[] = ["worker"];
+/** Every directory name that belongs to a built-in template. */
+function reservedDirNames(): string[] {
+	return [...new Set([...BUILTIN_TYPES, ...BUILTIN_DELEGATION_TEMPLATES])];
+}
 
 /**
- * Move a user's template that sits in a late built-in's directory to `<name>-custom`
- * (numbered when taken), renaming it in its file too, with a warning naming the new
- * name. Returns the new names. Nothing is deleted.
+ * The template a requested `subagent_type` means: a name whose directory is a built-in's
+ * (`"Worker"`, `"GENERAL"`) means that built-in, so a model's capitalisation never lands
+ * on the read-only unknown-type fallback. Any other name is returned unchanged.
  */
-export async function moveAsideReservedTemplates(): Promise<string[]> {
+export function canonicalTemplateName(name: string): string {
+	if (BUILTIN_DELEGATION_TEMPLATES.has(name)) return name;
+	const dir = sanitizeDirName(name);
+	return BUILTIN_DELEGATION_TEMPLATES.has(dir) ? dir : name;
+}
+
+/** File operations of the move-aside, injectable so a failure can be tested. */
+export interface MoveAsideIo {
+	writeFile: (path: string, data: string) => Promise<void>;
+	rename: (from: string, to: string) => Promise<void>;
+}
+
+const defaultMoveAsideIo: MoveAsideIo = {
+	writeFile: (path, data) => writeFile(path, data, "utf-8"),
+	rename: (from, to) => rename(from, to),
+};
+
+/**
+ * Move every user template that sits in a built-in's directory (created before built-in
+ * names were reserved in every spelling, or before a built-in such as `worker` existed)
+ * to `<name>-custom` (numbered when taken), renaming it in its file too, with a warning
+ * naming the new name. The built-in always wins; nothing is deleted.
+ *
+ * Crash-safe order: the file is rewritten first (a temp file renamed over it inside the
+ * old directory), then the directory is renamed. An interruption leaves either the old
+ * directory (moved again next startup) or a fully renamed one, never a `*-custom`
+ * directory whose file still claims the reserved name. A symlinked directory is skipped
+ * with a warning rather than written through. Returns the new names.
+ */
+export async function moveAsideReservedTemplates(
+	io: MoveAsideIo = defaultMoveAsideIo,
+): Promise<string[]> {
 	const moved: string[] = [];
-	for (const reserved of LATE_BUILTIN_TEMPLATES) {
+	for (const reserved of reservedDirNames()) {
 		const dir = join(SUBAGENTS_DIR, reserved);
+		const info = await lstat(dir).catch(() => null);
+		if (!info) continue;
+		if (info.isSymbolicLink()) {
+			logger.warn(
+				`Custom subagent template directory "${reserved}" is a symlink and names a built-in template; it was left alone and is not used`,
+				{ path: dir },
+			);
+			continue;
+		}
+		if (!info.isDirectory()) continue;
 		const filePath = join(dir, SUBAGENT_FILE);
 		if ((await getMtimeMs(filePath)) === null) continue;
 		let target = `${reserved}-custom`;
 		for (let n = 2; await pathExists(join(SUBAGENTS_DIR, target)); n++)
 			target = `${reserved}-custom-${n}`;
-		const raw = await readFile(filePath, "utf-8");
-		const def = parseSubagentFile(raw, filePath, reserved);
-		defCache.delete(filePath);
-		await rename(dir, join(SUBAGENTS_DIR, target));
-		if (def) {
-			const { location: _old, ...rest } = def;
-			await writeFile(
-				join(SUBAGENTS_DIR, target, SUBAGENT_FILE),
-				buildSubagentMd({ ...rest, name: target }),
-				"utf-8",
+		try {
+			const def = parseSubagentFile(await readFile(filePath, "utf-8"), filePath, reserved);
+			defCache.delete(filePath);
+			if (def) {
+				const { location: _old, ...rest } = def;
+				const temp = join(dir, `.${SUBAGENT_FILE}.moving`);
+				await io.writeFile(temp, buildSubagentMd({ ...rest, name: target }));
+				await io.rename(temp, filePath);
+			}
+			await io.rename(dir, join(SUBAGENTS_DIR, target));
+		} catch (error) {
+			logger.warn(
+				`Custom subagent template "${reserved}" names a built-in template and could not be renamed; it is not used and will be retried at the next start`,
+				{ path: dir, error: error instanceof Error ? error.message : String(error) },
 			);
+			continue;
 		}
 		logger.warn(
-			`Custom subagent template "${reserved}" now names a built-in template; it was renamed to "${target}". Use subagent_type "${target}" to keep using it.`,
+			`Custom subagent template "${reserved}" names a built-in template; it was renamed to "${target}". Use subagent_type "${target}" to keep using it.`,
 			{ from: dir, to: join(SUBAGENTS_DIR, target) },
 		);
 		moved.push(target);
@@ -357,7 +401,7 @@ export async function moveAsideReservedTemplates(): Promise<string[]> {
 }
 
 async function pathExists(path: string): Promise<boolean> {
-	return stat(path).then(
+	return lstat(path).then(
 		() => true,
 		() => false,
 	);
@@ -367,6 +411,7 @@ export const customSubagentService = {
 	loadAll,
 	loadByName,
 	resolveTemplateDefinition,
+	canonicalTemplateName,
 	moveAsideReservedTemplates,
 	isBuiltinType,
 	create,
