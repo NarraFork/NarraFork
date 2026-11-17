@@ -1,5 +1,5 @@
 /**
- * The outline page live session protocol: binary WebSocket frames on `/ws/narrator`.
+ * The outline live session protocol: binary WebSocket frames on `/ws/narrator`.
  *
  * WHY BINARY FRAMES ON THE NARRATOR SOCKET
  * ----------------------------------------
@@ -14,7 +14,7 @@
  * ------------
  *   byte 0      magic 0xB1
  *   byte 1      kind (LIVE_FRAME)
- *   varuint     handle: the page session on this socket, chosen by the client at join (1–255)
+ *   varuint     handle: the client's session on this socket, chosen by the client at join (1–255)
  *   varuint     n: a transaction number (client frames, reject) or the highest transaction of
  *               the recipient the server has processed (batch); 0 when unused
  *   varuint     length of the JSON head in bytes, 0 for none
@@ -54,6 +54,29 @@
  * A typing frame is therefore 5 bytes of framing, the block id and the Yjs update, in both
  * directions.
  *
+ * A SPACE AND WHAT THE CLIENT SHOWS (since protocol version 4, pageless plan L3)
+ * ----------------------------------------------------------------------------
+ * A client joins a SPACE (`LiveJoinHead.space`) and names what it shows, its WATCH SET
+ * ({@link LiveWatchWire}): whole subtrees (`{ s: blockId }`: the block and every live block under
+ * it) and single levels (`{ l: parentId }`: the parent's live children; `{ l: null }`: the
+ * space's top-level blocks). It changes the set later with `watch` frames (`add`, `remove`), each
+ * answered by `watched`. The server sends the client the structure of what its watch set shows,
+ * the text of every block it shows (or showed and still holds as deleted, for undoing a delete),
+ * and of every change only what concerns that: a block moved from a place the client shows to one
+ * it does not is a delete for it, the other way an insert (with its text). There is no page:
+ * structural operations may name the top level as a parent (`p: null`) and move, delete or check
+ * top-level blocks.
+ *
+ * A subtree watch is of its root at its place: when the root is deleted or moved (by anyone),
+ * that watch is gone for everyone who has it (`watched.gone`, or `closed` `ended` for a client
+ * with nothing else in its set), and the client watches again where it wants to. A level watch
+ * ends only when its parent is deleted.
+ *
+ * Every watch is within budgets: a subtree or a level takes at most
+ * {@link OUTLINE_LIVE_LIMITS.maxWatchBlocks} blocks (`too_large` past it), a space's session and
+ * one person's share of it are bounded (`space_full`, `user_limit`): a watch that does not fit is
+ * refused, never one already shown closed for it, and the client does not retry by itself.
+ *
  * Nothing here depends on Yjs: entry payloads are opaque bytes.
  */
 
@@ -66,20 +89,25 @@
  * unavailable.
  *
  * Version 3 (L2): text entries of kinds 3 to 5 (document generations and drops), which a
- * version 2 reader takes for a malformed body and ignores whole. L3 takes 4.
+ * version 2 reader takes for a malformed body and ignores whole.
+ *
+ * Version 4 (L3): a join names a space and a watch set, not a page (`LiveJoinHead.space`,
+ * `watch`); `watch` / `watched` frames; a structure row may name a parent outside its list
+ * ({@link LiveBlockWire}); operations may name the top level (`p: null`). A client of version 3
+ * or older (it names a `page`) is told `outdated`.
  */
-export const OUTLINE_LIVE_PROTOCOL_VERSION = 3;
+export const OUTLINE_LIVE_PROTOCOL_VERSION = 4;
 
 export const OUTLINE_LIVE_MAGIC = 0xb1;
 
 /**
- * The largest handle (a page session on one socket). Frames with a larger one do not decode, so
+ * The largest handle (a client's session on one socket). Frames with a larger one do not decode, so
  * nothing past the decoder ever holds a handle a reply could not carry.
  */
 export const OUTLINE_LIVE_MAX_HANDLE = 255;
 
 export const LIVE_FRAME = {
-	/** C→S: join a page. Head {@link LiveJoinHead}; body: on resume, a `vector` per document. */
+	/** C→S: join a space. Head {@link LiveJoinHead}; body: on resume, a `vector` per document. */
 	join: 0x01,
 	/** C→S: leave. */
 	leave: 0x02,
@@ -89,6 +117,8 @@ export const LIVE_FRAME = {
 	tx: 0x04,
 	/** C→S: own selection. Head {@link LivePresenceUp}. */
 	selection: 0x05,
+	/** C→S: change the watch set. Head {@link LiveWatchHead}. */
+	watch: 0x06,
 	/** S→C: joined. Head {@link LiveJoinedHead}; body = every text (reset) or what is missing. */
 	joined: 0x81,
 	/** S→C: coalesced changes. `n` = ack; head {@link LiveBatchHead} or none; body = texts. */
@@ -103,24 +133,35 @@ export const LIVE_FRAME = {
 	resync: 0x86,
 	/** S→C: write access changed. Head {@link LiveModeHead}. */
 	mode: 0x87,
+	/**
+	 * S→C: the answer to a `watch` frame (head {@link LiveWatchedHead}; body: the text of what the
+	 * added watches show), or, unasked, watches that are gone (`gone` only, no `w`).
+	 */
+	watched: 0x88,
 } as const;
 
 export type LiveFrameKind = (typeof LIVE_FRAME)[keyof typeof LIVE_FRAME];
 
 /** Limits both sides know. The server enforces them; the client stays inside them. */
 export const OUTLINE_LIVE_LIMITS = {
-	/** Live page sessions one socket may join. */
+	/** Live sessions (joins) one socket may hold. */
 	sessionsPerSocket: 8,
-	/** Editing participants of one page (design §7.2). */
-	editorsPerPage: 20,
-	/** Read-only participants of one page (the page subscriber limit, design §7.2). */
-	viewersPerPage: 50,
-	/** Pages in a live session across the process (design §7.2). */
-	livePages: 500,
-	/** Live blocks of a page that can be edited live; larger pages stay read-only. */
-	maxPageBlocks: 2000,
-	/** UTF-8 bytes of all block content of a page that can be edited live. */
-	maxPageBytes: 4 * 1024 * 1024,
+	/** Editing participants of one space (pageless plan §一.5: per space, not per page). */
+	editorsPerSpace: 50,
+	/** Read-only participants of one space. */
+	viewersPerSpace: 100,
+	/** Distinct watches loaded in live sessions across the process. */
+	liveWatches: 2000,
+	/**
+	 * Blocks one watch takes at most: a subtree with its root, or a level's children. A larger
+	 * one is refused (`too_large`) and stays read-only (plan: a level of more than 2,000 children
+	 * is read-only in place).
+	 */
+	maxWatchBlocks: 2000,
+	/** UTF-8 bytes of all block content one watch takes at most. */
+	maxWatchBytes: 4 * 1024 * 1024,
+	/** Entries of one participant's watch set. */
+	maxWatch: 1024,
 	/** Bytes of one client frame. */
 	maxClientFrameBytes: 256 * 1024,
 	/** Operations of one structural transaction (the write path's limit). */
@@ -133,7 +174,7 @@ export const OUTLINE_LIVE_LIMITS = {
 	maxTextIdBytes: 128,
 	/**
 	 * Bytes of the JSON head of a server frame: a snapshot's structure (about 45 bytes a block),
-	 * a resume's operations, a batch with a large outside commit. Bounded by the page limits.
+	 * a resume's operations, a batch with a large outside commit. Bounded by the watch limits.
 	 */
 	maxServerHeadBytes: 8 * 1024 * 1024,
 	/** Client-side: unacknowledged transactions before the editor stops taking input. */
@@ -144,8 +185,17 @@ export const OUTLINE_LIVE_LIMITS = {
 	presenceIntervalMs: 80,
 	/** Client-side: text-only updates are batched for this long before they are sent. */
 	typingBatchMs: 30,
-	/** Agents a page shows in its presence at most; the rest are counted (`am`, P2 PR 10b). */
-	agentsPerPage: 8,
+	/** Client-side: watch changes asked for within this long go out as one frame. */
+	watchBatchMs: 30,
+	/**
+	 * Client-side: an addition refused `too_fast` is asked again after this long, doubling each
+	 * time up to `watchRetryMaxMs`, at most `watchRetries` times in a row (then it stays refused).
+	 */
+	watchRetryMs: 250,
+	watchRetryMaxMs: 8000,
+	watchRetries: 8,
+	/** Agents one watch shows in its presence at most; the rest are counted (`am`, P2 PR 10b). */
+	agentsPerWatch: 8,
 } as const;
 
 /**
@@ -180,34 +230,62 @@ export type LiveTaskChar = " " | "/" | "x" | "-";
  * A structural operation as sent and broadcast. Content is never here: a block's text lives in
  * its text document (a new block's text arrives in the same frame's body, as an update of the
  * document its creator made from the empty text).
- *   - `i`: insert, or restore when the id names a deleted block; `p` parent, `k` order key; `q`
- *     the block is a question put to a person (`Ask`): set by the server only (a client cannot
- *     make a question, and the server ignores the field from one), added after the first
- *     protocol version
- *   - `m`: move under `p` at `k`
+ *   - `i`: insert, or restore when the id names a deleted block; `p` parent (`null`: the space's
+ *     top level, since version 4), `k` order key; `q` the block is a question put to a person
+ *     (`Ask`): set by the server only (a client cannot make a question, and the server ignores
+ *     the field from one), added after the first protocol version
+ *   - `m`: move under `p` (`null`: to the top level) at `k`
  *   - `d`: delete (with its live subtree); deleting a question withdraws it
  *   - `k`: set the checkbox (`null` removes the task); refused on a question
+ * Since version 4 every operation may name a top-level block. A parent named must be one whose
+ * every live child the session holds (a level or a subtree someone watches): the top level only
+ * while someone watches it (`{ l: null }`).
  */
 export type LiveOp =
-	| { t: "i"; id: string; p: string; k: string; task?: LiveTaskChar | null; q?: true }
-	| { t: "m"; id: string; p: string; k: string }
+	| { t: "i"; id: string; p: string | null; k: string; task?: LiveTaskChar | null; q?: true }
+	| { t: "m"; id: string; p: string | null; k: string }
 	| { t: "d"; id: string }
 	| { t: "k"; id: string; task: LiveTaskChar | null };
 
 /**
- * A live block in a structure snapshot, in depth-first order so a parent precedes its
- * children: id, index of the parent in the list (-1 for the page itself), order key, sid,
- * checkbox ("" for none), and `1` for a question put to a person (`Ask`; absent otherwise,
- * added after the first protocol version).
+ * A live block in a structure snapshot, a parent before its children: id, parent, order key,
+ * sid, checkbox ("" for none), and `1` for a question put to a person (`Ask`; absent otherwise,
+ * added after the first protocol version). The parent is the index of an earlier row of the same
+ * list, `-1` for the space's top level, or (since version 4) the id of a parent the list does
+ * not carry: the parent of a watched subtree's root, the parent of a watched level.
  */
 export type LiveBlockWire = [
 	id: string,
-	parent: number,
+	parent: number | string,
 	orderKey: string,
 	sid: string,
 	task: LiveTaskChar | "",
 	question?: 1,
 ];
+
+/**
+ * One entry of a watch set (version 4): `s` a block's whole live subtree (the block itself and
+ * every live block under it, at most {@link OUTLINE_LIVE_LIMITS.maxWatchBlocks}); `l` one level,
+ * a parent's live children (not the parent; `null`: the space's top-level blocks).
+ */
+export type LiveWatchWire = { s: string } | { l: string | null };
+
+/** A watch entry's key: `s:<id>`, `l:<id>`, `l:` for the top level. */
+export function liveWatchKey(w: LiveWatchWire): string {
+	return "s" in w ? `s:${w.s}` : `l:${w.l ?? ""}`;
+}
+
+/** A watch entry well formed (an id of 1–128 characters, or the top level). */
+export function isLiveWatch(value: unknown): value is LiveWatchWire {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const w = value as Record<string, unknown>;
+	const id = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 128;
+	const keys = Object.keys(w);
+	if (keys.length !== 1) return false;
+	if ("s" in w) return id(w.s);
+	if ("l" in w) return w.l === null || id(w.l);
+	return false;
+}
 
 /** Who made a change: a participant number, or `a` (an agent), `s` (the system), `h` (a person
  * outside the session). */
@@ -225,7 +303,14 @@ export interface LiveCommitWire {
 export interface LiveJoinHead {
 	/** {@link OUTLINE_LIVE_PROTOCOL_VERSION}. */
 	v: number;
-	page: string;
+	/** The space joined (version 4). */
+	space: string;
+	/**
+	 * What the client shows (at least one entry, at most {@link OUTLINE_LIVE_LIMITS.maxWatch}):
+	 * the whole set, also on a resume. A join is all or nothing: one entry that cannot be watched
+	 * refuses it with that entry's code.
+	 */
+	watch: LiveWatchWire[];
 	/** `edit` asks for write access; a read-only person gets `view`. */
 	mode: "edit" | "view";
 	/** Identifies this editor instance across reconnects (8–64 characters). */
@@ -234,8 +319,8 @@ export interface LiveJoinHead {
 	 * The session this client was in before (sent on every join after the first). Without
 	 * `reset` the client asks to resume it (the body names the documents it holds); with `reset`
 	 * it wants a snapshot. Either way the answer says which of its transactions of that session
-	 * the page already has (`tx`, `dur`), so the client neither loses nor repeats them.
-	 * `g` (L2): the highest document generation the page told this client of; the answer to a
+	 * the space already has (`tx`, `dur`), so the client neither loses nor repeats them.
+	 * `g` (L2): the highest document generation the session told this client of; the answer to a
 	 * resume drops every document of a later generation the client may hold.
 	 */
 	resume?: { epoch: number; op: number; tx: number; reset?: boolean; g?: number };
@@ -276,13 +361,16 @@ export interface LiveJoinedHead {
 	/** The session's operation sequence number now. */
 	op: number;
 	/**
-	 * The highest transaction of this client's previous session (`resume.epoch`) the page has
+	 * The highest transaction of this client's previous session (`resume.epoch`) the space has
 	 * applied: the client does not send or replay those again.
 	 */
 	tx: number;
 	/** This participant's number. */
 	me: number;
-	/** Structure snapshot (reset, or a resume the operation log no longer covers). */
+	/**
+	 * Structure snapshot (reset, or a resume the operation log no longer covers): what the watch
+	 * set shows, each block once.
+	 */
 	blocks?: LiveBlockWire[];
 	/** Structural batches after the client's `op` (resume). */
 	ops?: LiveCommitWire[];
@@ -310,6 +398,35 @@ export interface LiveTxHead {
 	ops: LiveOp[];
 }
 
+/**
+ * C→S `watch`: change the watch set. `w` numbers the request (the answer says it back); entries
+ * to add and to remove (by {@link liveWatchKey}). Requests are answered in order.
+ */
+export interface LiveWatchHead {
+	w: number;
+	add?: LiveWatchWire[];
+	remove?: LiveWatchWire[];
+}
+
+/**
+ * S→C `watched`. As the answer to a `watch` (`w`): the entries now watched among those added
+ * (`ok`) and those refused with why (`refused`: `too_large`, `user_limit`, `space_full`,
+ * `access_denied` for a block that is not there, `unavailable`), the structure the added entries
+ * show (`blocks`, as a snapshot lists it, with `g` as in {@link LiveJoinedHead}), and the
+ * session's operation number it is as of (`op`); the body carries their text. Removed entries
+ * are gone at once, whatever the answer. Unasked (no `w`): watches that ended (`gone`: the
+ * subtree's root was deleted or moved, a level's parent deleted).
+ */
+export interface LiveWatchedHead {
+	w?: number;
+	op?: number;
+	ok?: LiveWatchWire[];
+	refused?: Array<[watch: LiveWatchWire, code: LiveCloseCode]>;
+	gone?: LiveWatchWire[];
+	blocks?: LiveBlockWire[];
+	g?: number;
+}
+
 export interface LiveBatchHead {
 	/** Structural changes, in order. */
 	c?: LiveCommitWire[];
@@ -325,9 +442,12 @@ export interface LiveBatchHead {
 
 /**
  * A transaction of the recipient (acknowledged with or before this frame) and the blocks whose
- * text in it the session did not take: they are no longer in the recipient's page (moved to
- * another page, or gone from the session with it) and their document is not the one the text
- * was typed in. The client keeps that text for the person (the unsaved-text store).
+ * text in it the session did not take: they are no longer where the recipient's watch set shows
+ * them (moved elsewhere, or gone from the session) and their document is not the one the text
+ * was typed in. The client keeps that text for the person (the unsaved-text store). Since L3
+ * the frame carrying a notice also carries the whole text of each block it names that the
+ * recipient is shown now, after the notice: a copy of it the client merged before the notice
+ * arrived is replaced, never left without the session's text.
  */
 export type LiveLostWire = [tx: number, blocks: string[]];
 
@@ -356,27 +476,38 @@ export interface LivePresenceDown {
 }
 
 export type LiveCloseCode =
-	/** The page does not exist or the person may not (or may no longer) read it. */
+	/**
+	 * The space or a watched block does not exist (or is deleted, or of another space), or the
+	 * person may not (or may no longer) read the space.
+	 */
 	| "access_denied"
 	/** The outline is off, or the server is at a limit. */
 	| "unavailable"
-	/** The page is larger than a live session takes; show it read-only. */
+	/** A watch is larger than a live session takes ({@link OUTLINE_LIVE_LIMITS.maxWatchBlocks}). */
 	| "too_large"
-	/** The session was closed (shutdown); join again later. */
+	/** The session was closed (shutdown), or everything the client watched is gone: join again. */
 	| "ended"
 	/** The client speaks another protocol version: the page says to reload; no retry. */
 	| "outdated"
 	/**
-	 * Too much of this space is open in this person's other tabs (pages only they are in, past
-	 * `OUTLINE_LIVE_BOUNDS.maxUserBlocks`): this join is refused, never another tab of theirs
-	 * closed. The page says so and offers a retry; the client does not retry by itself.
+	 * Too much of this space is open in this person's other tabs (watches only they have, past
+	 * `OUTLINE_LIVE_BOUNDS.maxUserBlocks` blocks): this join or watch is refused, never another
+	 * watch of theirs closed. The page says so and offers a retry; the client does not retry by
+	 * itself.
 	 */
 	| "user_limit"
 	/**
-	 * The space's session holds as much as it may and every page in it has people in it: this
-	 * join is refused (nobody's open page is closed for it). Retried by the person only.
+	 * The space's session holds as much as it may and everything in it is watched by someone
+	 * connected: this join or watch is refused (nobody's watch is closed for it). Retried by the
+	 * person only.
 	 */
-	| "space_full";
+	| "space_full"
+	/**
+	 * Only in `watched.refused`: the socket sent watch frames with additions faster than the
+	 * server takes them (`OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst` / `watchesPerSecond`). Nothing
+	 * was read; the client asks again after a while by itself.
+	 */
+	| "too_fast";
 
 export interface LiveClosedHead {
 	code: LiveCloseCode;
@@ -387,12 +518,18 @@ export interface LiveClosedHead {
 export type LiveRejectCode =
 	/** Another change made this one impossible (a block it names is gone, a cycle, …). */
 	| "conflict"
-	/** The person may not write the page (any more). */
+	/** The person may not write the space (any more). */
 	| "read_only"
 	/** The transaction is malformed or over a limit. */
 	| "invalid"
 	/** Writing failed on the server; the change was not saved. */
-	| "failed";
+	| "failed"
+	/**
+	 * A move would bring more blocks into the live session than it takes (what is under a block
+	 * moved into a watched subtree: one watch's bound, the space's, the process's, or the
+	 * person's share). Nothing was written; the editor says why.
+	 */
+	| "too_large";
 
 /**
  * Why a change to a task was refused: someone else is doing it (setting it in progress claims

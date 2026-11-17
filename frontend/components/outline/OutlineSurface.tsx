@@ -722,6 +722,7 @@ function SurfaceBody({
 						{editing && view.current ? (
 							<OutlineEditor
 								pageId={pageId ?? view.pageId}
+								spaceId={view.space.id}
 								focusId={blockId}
 								spaceKey={view.space.key}
 								canWrite={view.space.canWrite}

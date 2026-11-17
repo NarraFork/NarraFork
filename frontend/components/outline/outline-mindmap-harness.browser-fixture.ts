@@ -325,6 +325,7 @@ export async function openBob(h: MapHarness, pageId: string): Promise<MapEditor>
 		wsUrl,
 		pageId,
 		spaceKey: h.space.key,
+		spaceId: h.space.id,
 		canWrite: true,
 	});
 	const editor = editorOf(page, h.writer, errors, "editor");

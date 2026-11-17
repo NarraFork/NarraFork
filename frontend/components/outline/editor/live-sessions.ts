@@ -1,7 +1,8 @@
 /**
- * The live page sessions of this tab, per socket: one session client per page and mode, shared
- * by every editor of that page (the outline page, dock panels, drawers), so one server session
- * and one undo stack per person and page.
+ * The live sessions of this tab, per socket: one session client per root shown and mode, shared
+ * by every editor of that root (the outline page, dock panels, drawers), so one server session
+ * and one undo stack per person and root. A client joins the root's space and watches the
+ * root's subtree (`live-client.ts`).
  *
  * LIFETIME
  * --------
@@ -130,12 +131,14 @@ function makeRoom(map: Map<string, SharedLiveSession>, limit: number): void {
 
 /**
  * The page's shared session on this socket, created on first use; null when the socket already
- * holds as many sessions as the server takes and every one of them is in use.
+ * holds as many sessions as the server takes and every one of them is in use. `space`: the
+ * root's space, which the client joins (protocol version 4).
  */
 export function acquireLiveSession(
 	transport: LiveTransport,
 	pageId: string,
 	mode: "edit" | "view",
+	space = "",
 ): SharedLiveSession | null {
 	const map = sessionsOf(transport);
 	const key = `${pageId}\u0000${mode}`;
@@ -148,7 +151,7 @@ export function acquireLiveSession(
 	for (const shared of map.values()) if (occupies(shared)) used++;
 	if (used >= limit) return null;
 	const shared: SharedLiveSession = {
-		client: new LiveClient(transport, pageId, mode),
+		client: new LiveClient(transport, pageId, mode, { space }),
 		refs: 0,
 		timer: null,
 		releasedAt: 0,

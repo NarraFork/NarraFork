@@ -117,7 +117,11 @@ function socket() {
 	const joinOf = (pageId: string) =>
 		[...sent]
 			.reverse()
-			.find((f) => f.kind === LIVE_FRAME.join && (f.head as { page?: string }).page === pageId);
+			.find(
+				(f) =>
+					f.kind === LIVE_FRAME.join &&
+					(f.head as { watch?: Array<{ s?: string }> }).watch?.[0]?.s === pageId,
+			);
 	return { transport, sent, deliver, setConnected, joinOf };
 }
 

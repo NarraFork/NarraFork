@@ -308,6 +308,7 @@ export function openEditor(options: {
 	wsUrl: string;
 	pageId: string;
 	spaceKey: string;
+	spaceId: string;
 	canWrite: boolean;
 }): void {
 	host = "editor";
@@ -319,6 +320,7 @@ export function openEditor(options: {
 			providers(
 				<OutlineEditor
 					pageId={options.pageId}
+					spaceId={options.spaceId}
 					focusId={options.pageId}
 					spaceKey={options.spaceKey}
 					canWrite={options.canWrite}

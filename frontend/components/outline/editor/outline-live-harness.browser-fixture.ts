@@ -280,6 +280,7 @@ export async function openEditor(
 		wsUrl,
 		pageId,
 		spaceKey: h.space.key,
+		spaceId: h.space.id,
 		canWrite: options.canWrite ?? true,
 		...(options.focusId ? { focusId: options.focusId } : {}),
 		...(options.lens ? { lens: options.lens } : {}),

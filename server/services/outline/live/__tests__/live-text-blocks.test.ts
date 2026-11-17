@@ -46,7 +46,6 @@ import {
 	type LiveFrame,
 	type LiveSelWire,
 	OUTLINE_LIVE_LIMITS,
-	OUTLINE_LIVE_PROTOCOL_VERSION,
 } from "@shared/outline-live-protocol";
 import { seededTextDoc } from "@shared/outline-live-text";
 import { and, eq } from "drizzle-orm";
@@ -72,12 +71,22 @@ import {
 	decodeLogTexts,
 	encodeLogTexts,
 	LIVE_SYNC_ACTOR,
-	type LivePageView,
+	type LiveView,
 	OUTLINE_LIVE_BOUNDS,
 	OUTLINE_LIVE_HOOKS,
 	OUTLINE_LIVE_TIMING,
 } from "../session";
-import { client, kids, settle, struct, TestLink, TestSocket, type, waitFor } from "./harness";
+import {
+	client,
+	joinHead,
+	kids,
+	settle,
+	struct,
+	TestLink,
+	TestSocket,
+	type,
+	waitFor,
+} from "./harness";
 
 const NOW = "2026-11-14T00:00:00.000Z";
 const saved = { ...OUTLINE_LIVE_TIMING };
@@ -141,7 +150,7 @@ function edit(c: LiveClient, id: string, md: string): void {
 	struct(c, [], [{ id, md }]);
 }
 
-function session(pageId: string): LivePageView {
+function session(pageId: string): LiveView {
 	const s = liveSessionOf(pageId);
 	if (!s) throw new Error("no session");
 	return s;
@@ -1107,12 +1116,7 @@ describe("the protocol's version", () => {
 			[LIVE_FRAME.closed, "outdated"],
 		]);
 		expect(liveSessionOf(pageId)).toBeUndefined();
-		await join({
-			v: OUTLINE_LIVE_PROTOCOL_VERSION,
-			page: pageId,
-			mode: "edit",
-			key: "newclient01",
-		});
+		await join({ ...joinHead(pageId, "edit", "newclient01") });
 		expect(answers[2]?.kind).toBe(LIVE_FRAME.joined);
 		releaseLiveSocket(s);
 	});

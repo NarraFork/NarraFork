@@ -81,6 +81,8 @@ export interface OutlineFocusInfo {
 
 export interface OutlineEditorProps {
 	pageId: string;
+	/** The page's space: the live session joins it and watches the page's subtree. */
+	spaceId: string;
 	/** The focused block (the page itself when unfocused). */
 	focusId: string;
 	/** The space key, for resolving `[[key/sid]]` mentions to blocks of this page. */
@@ -166,15 +168,15 @@ function afterNextPaint(run: () => void): void {
 export type OutlineLiveUnavailable = LiveCloseCode | "timeout" | "tab_limit";
 
 export function OutlineEditor(props: OutlineEditorProps) {
-	const { pageId, canWrite } = props;
+	const { pageId, canWrite, spaceId } = props;
 	const mode = canWrite ? "edit" : "view";
 	const transport = props.transport ?? liveTransport();
 	const shared = useMemo(() => {
-		const s = acquireLiveSession(transport, pageId, mode);
+		const s = acquireLiveSession(transport, pageId, mode, spaceId);
 		// A seeded page paints its seed before it turns live.
 		if (s) s.client.upgradeAfterPaint ??= afterNextPaint;
 		return s;
-	}, [transport, pageId, mode]);
+	}, [transport, pageId, mode, spaceId]);
 	const onUnavailable = useRef(props.onUnavailable);
 	onUnavailable.current = props.onUnavailable;
 	useEffect(() => {
@@ -324,6 +326,17 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			clearTimeout(timer);
 		};
 	}, [client]);
+
+	// A move the session could not take (it would bring too much into live editing): it was
+	// undone here; say why.
+	useEffect(
+		() =>
+			client.on((event) => {
+				if (event !== "rejected" || client.lastReject?.code !== "too_large") return;
+				notifications.show({ color: "yellow", message: t("editor.moveTooLarge") });
+			}),
+		[client, t],
+	);
 
 	// Deleting questions put to people withdrew them: say so (undo asks them again).
 	useEffect(

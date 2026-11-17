@@ -61,6 +61,8 @@ async function bigPage(title: string): Promise<{ pageId: string; first: string }
 beforeAll(async () => {
 	if (!BENCH) return;
 	settings.outline.enabled = true;
+	// One person opens all ten: past their share otherwise (`OUTLINE_LIVE_BOUNDS.maxUserBlocks`).
+	(sessionModule.OUTLINE_LIVE_BOUNDS as { maxUserBlocks: number }).maxUserBlocks = 1_000_000;
 	owner = generateId();
 	await db
 		.insert(users)

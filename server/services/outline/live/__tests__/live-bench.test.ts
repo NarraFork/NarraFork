@@ -58,8 +58,8 @@ function instrument(): void {
 	};
 	wrap("handleUpdate", "updates", "updateMs");
 	wrap("flushBroadcast", "flushes", "flushMs");
-	// Joining is asynchronous since a space's session loads a page's tree on its first join
-	// (`ensureScope`, what opening a page's session was): timed to their promises' end.
+	// Joining is asynchronous since a space's session loads a watch on its first watcher
+	// (`ensureView`, what opening a page's session was): timed to their promises' end.
 	const wrapAsync = (name: string, ms: keyof typeof timing, count?: keyof typeof timing) => {
 		const orig = proto[name] as (...args: unknown[]) => Promise<unknown>;
 		proto[name] = async function (this: unknown, ...args: unknown[]) {
@@ -73,7 +73,7 @@ function instrument(): void {
 		};
 	};
 	wrapAsync("join", "joinMs", "joins");
-	wrapAsync("loadTree", "openMs");
+	wrapAsync("loadView", "openMs");
 }
 
 // ─── Server, proxy, clients ─────────────────────────────────────────────────

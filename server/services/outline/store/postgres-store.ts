@@ -1111,6 +1111,25 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return out;
 		},
 
+		async listChildBlocks(spaceId, parentIds, limit) {
+			const out: OutlineBlockRow[] = [];
+			const ids = parentIds.filter((id): id is string => id !== null);
+			const groups: Array<SQL | undefined> = chunked(ids).map((chunk) =>
+				inArray(outlineBlocks.parentId, chunk),
+			);
+			if (parentIds.includes(null)) groups.push(isNull(outlineBlocks.parentId));
+			for (const parents of groups) {
+				if (out.length >= limit) break;
+				const rows = await db
+					.select()
+					.from(outlineBlocks)
+					.where(and(eq(outlineBlocks.spaceId, spaceId), parents, eq(outlineBlocks.deleted, false)))
+					.limit(limit - out.length);
+				for (const row of rows) out.push(toBlock(row));
+			}
+			return out;
+		},
+
 		async listLastChildMetas(spaceId, parentId, limit) {
 			const rows = await db
 				.select(metaColumns)

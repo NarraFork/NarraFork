@@ -5,7 +5,11 @@
  * disconnected and reconnected (a new socket, as a browser reconnect makes), and can pretend its
  * socket buffers bytes (backpressure).
  */
-import { LiveClient, type LiveTransport } from "@frontend/components/outline/editor/live-client";
+import {
+	LiveClient,
+	type LiveClientOptions,
+	type LiveTransport,
+} from "@frontend/components/outline/editor/live-client";
 import type { BlockRec, ClientOp } from "@frontend/components/outline/editor/store";
 import {
 	type LiveClock,
@@ -13,7 +17,13 @@ import {
 	liveTimeout,
 	setLiveClockForTests,
 } from "@shared/outline-live-clock";
-import { decodeLiveFrame, type LiveFrame } from "@shared/outline-live-protocol";
+import {
+	decodeLiveFrame,
+	type LiveFrame,
+	type LiveJoinHead,
+	OUTLINE_LIVE_PROTOCOL_VERSION,
+} from "@shared/outline-live-protocol";
+import { sqlite } from "../../../../db";
 import {
 	drainLiveSocket,
 	handleLiveFrame,
@@ -222,9 +232,41 @@ export async function waitFor(predicate: () => boolean, timeoutMs = 5000, what =
 	}
 }
 
-/** An editor client without a view: commits go through the engine's own API. */
-export function client(link: TestLink, pageId: string, mode: "edit" | "view" = "edit"): LiveClient {
-	const c = new LiveClient(link, pageId, mode);
+/** The space a block is in, read at once (the editor knows it; a test names the block only). */
+export function spaceOfBlock(blockId: string): string {
+	const row = sqlite
+		.query("SELECT space_id AS s FROM outline_blocks WHERE id = ?")
+		.get(blockId) as {
+		s: string;
+	} | null;
+	return row?.s ?? "";
+}
+
+/** A join head of this protocol version for a raw client watching a block's subtree. */
+export function joinHead(rootId: string, mode: "edit" | "view", key: string): LiveJoinHead {
+	return {
+		v: OUTLINE_LIVE_PROTOCOL_VERSION,
+		space: spaceOfBlock(rootId),
+		watch: [{ s: rootId }],
+		mode,
+		key,
+	};
+}
+
+/**
+ * An editor client without a view: commits go through the engine's own API. It joins the
+ * root's space and watches the root's subtree, as the editor does, unless told otherwise.
+ */
+export function client(
+	link: TestLink,
+	pageId: string,
+	mode: "edit" | "view" = "edit",
+	options: LiveClientOptions = {},
+): LiveClient {
+	const c = new LiveClient(link, pageId, mode, {
+		...options,
+		space: options.space ?? spaceOfBlock(pageId),
+	});
 	watched.add(c);
 	return c;
 }

@@ -139,6 +139,7 @@
 		"questionsWithdrawn_other": "Deleting them withdrew {{count}} questions put to people; undo asks them again.",
 		"tooLarge": "A block can hold at most 16 KB. Split it into more blocks.",
 		"rootKept": "The block in focus stays; go up a level to delete it.",
+		"moveTooLarge": "This move would bring more blocks into live editing than it can hold (over 2000 blocks, or the space or your open views are full). It was not made; move a smaller part, or close other views first.",
 		"peerEditing": "{{name}} is editing",
 		"peerViewing": "{{name}} is viewing",
 		"agentWorking": "Session \"{{name}}\" is working here",

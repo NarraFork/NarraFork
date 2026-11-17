@@ -2082,7 +2082,7 @@ export class OutlineView implements CmdHost, ClientView {
 		if (!tree) return true;
 		for (const op of ops) {
 			if (op.t !== "i") return true;
-			const parent = tree.nodes.get(op.p);
+			const parent = op.p === null ? undefined : tree.nodes.get(op.p);
 			if (!parent || parent.kids.length === 0 || !parent.open || !parent.visible) return true;
 			// In the facts view a new task is left out (its parent counts it).
 			if (op.task && this.lens === "facts") return true;
