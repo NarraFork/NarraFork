@@ -9,6 +9,10 @@ import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-docum
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
+	normalizeSubagentNestedSummary,
+	type SubagentNestedSummary,
+} from "@shared/subagent-nested";
+import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
@@ -217,6 +221,7 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 		: [];
 	const reasoningEffort = nonEmptyString(record.reasoningEffort);
 	const fileChanges = normalizeSubagentFileChanges(record.fileChanges);
+	const nested = normalizeSubagentNestedSummary(record.nested);
 	return {
 		subagentNarratorId:
 			typeof record.subagentNarratorId === "string" ? record.subagentNarratorId : null,
@@ -224,6 +229,7 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 		...(reasoningEffort ? { reasoningEffort } : {}),
 		...(fileChanges ? { fileChanges } : {}),
 		...(record.takenOver === true ? { takenOver: true } : {}),
+		...(nested && nested.total > 0 ? { nested } : {}),
 		latestToolCalls,
 	};
 }
@@ -810,6 +816,15 @@ export interface NarratorWSCallbacks {
 		subagentNarratorId: string;
 		toolUseId?: string;
 		takenOver: boolean;
+	}) => void;
+	/**
+	 * The helpers a first-level subagent launched changed (ACL root's page only). Replaces
+	 * the card's nested rows; `toolUseId` names the card, best-effort.
+	 */
+	onSubagentNestedChanged?: (info: {
+		subagentNarratorId: string;
+		toolUseId?: string;
+		nested: SubagentNestedSummary;
 	}) => void;
 	onSubagentWarning?: (subagentNarratorId: string, info: NarratorWarningInfo) => void;
 	onSubagentConclusionUpdated?: (
@@ -1711,6 +1726,16 @@ export function useNarratorWS(
 							takenOver: data.takenOver === true,
 						});
 						break;
+					case "subagent_nested_changed": {
+						const nested = normalizeSubagentNestedSummary(data.nested);
+						if (nested && typeof data.subagentNarratorId === "string")
+							callbackOwner.callbacks.onSubagentNestedChanged?.({
+								subagentNarratorId: data.subagentNarratorId,
+								toolUseId: nonEmptyString(data.toolUseId) ?? undefined,
+								nested,
+							});
+						break;
+					}
 					case "subagent_warning":
 						callbackOwner.callbacks.onSubagentWarning?.(data.subagentNarratorId as string, {
 							message: data.message as string,

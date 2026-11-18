@@ -38,7 +38,6 @@ export function ensureColumns(sqlite: Database): void {
 			.get(tableName);
 		if (!tableExists) continue;
 
-		// Get existing columns from the database
 		const existingCols = new Set(
 			(sqlite.prepare(`PRAGMA table_info("${tableName}")`).all() as { name: string }[]).map(
 				(r) => r.name,
@@ -48,7 +47,6 @@ export function ensureColumns(sqlite: Database): void {
 		for (const col of config.columns) {
 			if (existingCols.has(col.name)) continue;
 
-			// Build ALTER TABLE ADD COLUMN statement
 			const sqlType = mapDrizzleColumnType(col.columnType, col.dataType);
 			let ddl = `ALTER TABLE "${tableName}" ADD COLUMN "${col.name}" ${sqlType}`;
 

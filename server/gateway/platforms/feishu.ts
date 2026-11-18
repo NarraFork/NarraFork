@@ -6,9 +6,12 @@
  */
 
 import { logger } from "../../lib/logger";
-import { createProxyAgent, resolveOverride } from "../../lib/net/proxy";
+import { createProxyAgent, resolveProxyForUrl } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { FeishuConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
+
+/** Feishu open-platform endpoint; the proxy is resolved against it so rules apply. */
+const FEISHU_API_ENDPOINT = "https://open.feishu.cn/open-apis/";
 
 interface FeishuClientLike {
 	contact: {
@@ -67,7 +70,7 @@ export class FeishuAdapter extends BaseAdapter {
 			// agent fields explicitly (agent when proxied, undefined when not) so a
 			// later reconnect after switching from custom/system to direct clears a
 			// previously-attached agent instead of leaving it stale on the singleton.
-			const proxy = resolveOverride(this.config.proxy);
+			const proxy = resolveProxyForUrl(FEISHU_API_ENDPOINT, this.config.proxy);
 			const agent = await createProxyAgent(proxy);
 			if (proxy) {
 				logger.warn(

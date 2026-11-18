@@ -25,7 +25,7 @@ mock.module("@mantine/notifications", () => ({
 const { ImageViewerProvider } = await import("./ImageViewerProvider");
 const { useImageViewer } = await import("./image-viewer-context");
 const { ImageViewer } = await import("./ImageViewer");
-const { PanZoomStage } = await import("./PanZoomStage");
+const { PANZOOM_MAX_SCALE, PANZOOM_MIN_SCALE, PanZoomStage } = await import("./PanZoomStage");
 
 class TestResizeObserver {
 	observe() {}
@@ -331,6 +331,67 @@ describe("fullscreen URL ownership", () => {
 	});
 });
 
+describe("enlarged preview wheel zoom", () => {
+	/** Open the enlarged overlay the way the file browser does, then grab its canvas. */
+	async function openEnlarged() {
+		await act(async () =>
+			root?.render(
+				<MantineProvider>
+					<ImageViewerProvider>
+						<ViewerLauncher />
+					</ImageViewerProvider>
+				</MantineProvider>,
+			),
+		);
+		const launcher = document.body.querySelector("button");
+		await act(async () => launcher?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+		const stage = document.querySelector('[data-panzoom-mode="fullscreen"]') as HTMLElement;
+		expect(stage).not.toBeNull();
+		// canvas (handlers) → transform wrapper → img
+		return {
+			stage,
+			canvas: stage.querySelector("img")?.parentElement?.parentElement as HTMLElement,
+		};
+	}
+
+	async function wheel(canvas: HTMLElement, deltaY: number) {
+		const event = new Event("wheel", { bubbles: true, cancelable: true });
+		Object.assign(event, { deltaY, clientX: 300, clientY: 200 });
+		await act(async () => canvas.dispatchEvent(event));
+	}
+
+	/** The scale actually applied to the picture, read off the transform wrapper. */
+	function scaleOf(stage: HTMLElement): number {
+		const transform = stage.querySelector("img")?.parentElement?.style.transform ?? "";
+		return Number(/scale\(([\d.]+)\)/.exec(transform)?.[1]);
+	}
+
+	test("wheel up zooms in and wheel down zooms out", async () => {
+		const { stage, canvas } = await openEnlarged();
+		expect(scaleOf(stage)).toBe(1);
+		await wheel(canvas, -100);
+		expect(scaleOf(stage)).toBeGreaterThan(1);
+		await wheel(canvas, 100);
+		expect(scaleOf(stage)).toBeCloseTo(1, 3);
+		await wheel(canvas, 100);
+		expect(scaleOf(stage)).toBeLessThan(1);
+	});
+
+	test("repeated wheel zoom stops at the upper and lower limits", async () => {
+		const { stage, canvas } = await openEnlarged();
+		for (let i = 0; i < 20; i++) await wheel(canvas, -100);
+		expect(scaleOf(stage)).toBe(PANZOOM_MAX_SCALE);
+		for (let i = 0; i < 45; i++) await wheel(canvas, 100);
+		expect(scaleOf(stage)).toBe(PANZOOM_MIN_SCALE);
+	});
+
+	test("the limits are a usable range rather than a single step", () => {
+		expect(PANZOOM_MIN_SCALE).toBeGreaterThan(0);
+		expect(PANZOOM_MAX_SCALE).toBeGreaterThanOrEqual(8);
+		expect(PANZOOM_MIN_SCALE).toBeLessThan(1);
+	});
+});
+
 describe("ImageViewerProvider context menu", () => {
 	test("runs the copy action", async () => {
 		await openContextMenu();
@@ -382,5 +443,44 @@ describe("ImageViewerProvider context menu", () => {
 
 		expect(capture).toHaveBeenCalledTimes(1);
 		expect(copyImageMock).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("enlarged preview does not nest", () => {
+	/**
+	 * The file viewer's embedded preview opens this fullscreen view when the picture itself
+	 * is clicked. The fullscreen consumer must not pass that callback on, or a click on the
+	 * enlarged picture would push a second copy of the same view — an overlay the person can
+	 * only escape by closing each layer.
+	 */
+	test("clicking the picture inside the fullscreen view opens no second view", async () => {
+		await act(async () => {
+			root?.render(
+				<MantineProvider>
+					<ImageViewerProvider>
+						<ViewerLauncher />
+					</ImageViewerProvider>
+				</MantineProvider>,
+			);
+		});
+		const launcher = document.body.querySelector("button");
+		expect(launcher).not.toBeNull();
+		await act(async () => {
+			launcher?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+		});
+
+		const enlarged = document.body.querySelector("img");
+		expect(enlarged).not.toBeNull();
+		const layers = document.body.children.length;
+
+		await act(async () => {
+			for (const type of ["pointerdown", "pointerup", "click"]) {
+				enlarged?.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0 }));
+			}
+		});
+
+		// Same single layer, same picture: no nested viewer was pushed.
+		expect(document.body.children.length).toBe(layers);
+		expect(document.body.querySelector("img")).toBe(enlarged);
 	});
 });

@@ -15,6 +15,7 @@ import {
 	isMetadataOnlyEmptyReasoningAssistantMessage,
 } from "@shared/reasoning-content";
 import { isClearedToolOutput } from "@shared/storage-retention";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import {
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
 	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
@@ -156,6 +157,7 @@ import {
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
 import { getRecentSubagentModelInheritance } from "./subagent-model";
+import { loadNestedSubagentSummaries } from "./subagent-nested";
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -2475,6 +2477,12 @@ export interface SubagentActivity {
 	 * the payload does not grow for every card.
 	 */
 	takenOver?: boolean;
+	/**
+	 * The helpers this subagent launched itself (its one nested level), so the card on the
+	 * primary's page shows them and which one waits for a person. Absent when it has none.
+	 * Height-AFFECTING on the client: the card lists these rows.
+	 */
+	nested?: SubagentNestedSummary;
 }
 
 export interface SubagentActivityCatchUp {
@@ -2649,6 +2657,8 @@ async function buildSubagentActivities(
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
 	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);
+	// Same one-aggregate rule for the nested level: one bounded read for every card.
+	const nestedByNarrator = await loadNestedSubagentSummaries(narratorIds);
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -2680,6 +2690,9 @@ async function buildSubagentActivities(
 			// takeover set stays populated on purpose. Reading the raw set here re-lit
 			// the badge on every page load in that window.
 			...(isRunHeldForDisplay(owner.subagentNarratorId) ? { takenOver: true } : {}),
+			...(nestedByNarrator.has(owner.subagentNarratorId)
+				? { nested: nestedByNarrator.get(owner.subagentNarratorId) }
+				: {}),
 		});
 	}
 	return activities;

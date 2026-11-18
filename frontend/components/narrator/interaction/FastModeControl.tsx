@@ -10,6 +10,7 @@ import {
 } from "@mantine/core";
 import { IconBolt } from "@tabler/icons-react";
 import type React from "react";
+import type { Mutate } from "./mutate";
 
 type FastModeOverride = "inherit" | "on" | "off";
 
@@ -37,10 +38,8 @@ export interface FastModeControlProps {
 	/** True immediately after a long-press fired, so the ensuing click is ignored. */
 	longPressFiredRef: React.MutableRefObject<boolean>;
 	narratorId: string;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateFastMode.
-	fastModeMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateUserPreferences.
-	updateUserPrefs: any;
+	fastModeMutation: Mutate<{ id: string; fastModeOverride: FastModeOverride }>;
+	updateUserPrefs: Mutate<{ fastModeDefault: boolean }>;
 	/** narrator translation fn (namespace "narrator"). */
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }

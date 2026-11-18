@@ -123,6 +123,166 @@ describe("misc APIs", () => {
 		expect(JSON.parse(calls[3].options.body as string)).toEqual({ target: "messageHistory" });
 	});
 
+	test.each([
+		"https://github.com/anthropics/skills/tree/main/skills/frontend-design",
+		"https://gitee.com/owner/repo/raw/main/SKILL.md",
+		"https://gitlab.com/owner/repo/-/raw/main/SKILL.md",
+		"http://example.com/SKILL.md",
+	])("creates a skill from %s in the selected scope with POST JSON and AbortSignal", async (url) => {
+		installEnvironment(new Response());
+		const calls: { path: string; options: RequestInit }[] = [];
+		const skill = {
+			name: "frontend-design",
+			description: "Design skills",
+			location: ".narrafork/skills/frontend-design",
+			content: "# Design",
+			files: ["SKILL.md", "scripts/build.ts", "assets/example.png"],
+		};
+		Object.defineProperty(g, "fetch", {
+			value: async (path: string, options: RequestInit) => {
+				calls.push({ path, options });
+				return Response.json(skill, { status: 201 });
+			},
+			configurable: true,
+		});
+		const signal = new AbortController().signal;
+		const data = { url };
+		expect(await api.importProjectSkill("project/中文 ?", data, signal)).toEqual(skill);
+		expect(await api.importGlobalSkill(data, signal)).toEqual(skill);
+		expect(calls.map(({ path }) => path)).toEqual([
+			"/api/skills/import?projectId=project%2F%E4%B8%AD%E6%96%87%20%3F",
+			"/api/skills/global/import",
+		]);
+		for (const { options } of calls) {
+			expect(options.method).toBe("POST");
+			expect(options.signal).toBe(signal);
+			expect(JSON.parse(options.body as string)).toEqual(data);
+			expect(new Headers(options.headers).get("Content-Type")).toBe("application/json");
+		}
+	});
+
+	test("preserves import validation, authorization, conflict and timeout errors", async () => {
+		for (const status of [400, 403, 409, 504]) {
+			for (const scope of ["project", "global"]) {
+				const message = `Import failed with ${status}`;
+				installEnvironment(Response.json({ error: message }, { status }));
+				const data = { url: "https://github.com/owner/repo/tree/main/skill" };
+				const request =
+					scope === "project" ? api.importProjectSkill("p1", data) : api.importGlobalSkill(data);
+				await expect(request).rejects.toMatchObject({ status, message });
+			}
+		}
+	});
+
+	test("forwards import cancellation to transport without retrying", async () => {
+		installEnvironment(new Response());
+		const controller = new AbortController();
+		let calls = 0;
+		Object.defineProperty(g, "fetch", {
+			value: (_path: string, options: RequestInit) => {
+				calls++;
+				return new Promise<Response>((_resolve, reject) => {
+					options.signal?.addEventListener("abort", () => reject(options.signal?.reason), {
+						once: true,
+					});
+				});
+			},
+			configurable: true,
+		});
+		const request = api.importGlobalSkill(
+			{ url: "https://github.com/o/r/tree/main" },
+			controller.signal,
+		);
+		controller.abort();
+		await expect(request).rejects.toMatchObject({ name: "AbortError" });
+		expect(calls).toBe(1);
+	});
+
+	test.each([
+		"https://gitee.com/owner/repo/raw/main/SKILL.md",
+		"https://gitlab.com/owner/repo/-/raw/main/SKILL.md",
+		"http://example.com/skill.md",
+		"https://github.com/owner/repo/tree/main/skill",
+	])("updates the encoded skill and scope from %s with only URL JSON and signal", async (url) => {
+		installEnvironment(new Response());
+		const calls: { path: string; options: RequestInit }[] = [];
+		const result = {
+			name: "skill/中文 ?",
+			description: "Example",
+			location: ".narrafork/skills/example",
+			content: "# Example",
+			files: ["SKILL.md"],
+			disabled: true,
+			canUpdateFromUrl: true,
+		};
+		Object.defineProperty(g, "fetch", {
+			value: async (path: string, options: RequestInit) => {
+				calls.push({ path, options });
+				return Response.json(result);
+			},
+			configurable: true,
+		});
+		const signal = new AbortController().signal;
+		const data = { url };
+		expect(
+			await api.updateProjectSkillFromUrl("project/中文 ?", result.name, data, signal),
+		).toEqual(result);
+		expect(await api.updateGlobalSkillFromUrl(result.name, data, signal)).toEqual(result);
+		expect(calls.map(({ path }) => path)).toEqual([
+			"/api/skills/skill%2F%E4%B8%AD%E6%96%87%20%3F/update-from-url?projectId=project%2F%E4%B8%AD%E6%96%87%20%3F",
+			"/api/skills/global/skill%2F%E4%B8%AD%E6%96%87%20%3F/update-from-url",
+		]);
+		for (const { options } of calls) {
+			expect(options.method).toBe("POST");
+			expect(options.signal).toBe(signal);
+			expect(JSON.parse(options.body as string)).toEqual(data);
+			expect(new Headers(options.headers).get("Content-Type")).toBe("application/json");
+		}
+	});
+
+	test("preserves URL update validation, permission, missing-skill, conflict and timeout errors", async () => {
+		for (const status of [400, 403, 404, 409, 504]) {
+			for (const scope of ["project", "global"]) {
+				const message = `Update failed with ${status}`;
+				installEnvironment(Response.json({ error: message }, { status }));
+				const data = { url: "https://example.com/SKILL.md" };
+				const request =
+					scope === "project"
+						? api.updateProjectSkillFromUrl("p1", "example", data)
+						: api.updateGlobalSkillFromUrl("example", data);
+				await expect(request).rejects.toMatchObject({ status, message });
+			}
+		}
+	});
+
+	test.each([
+		"project",
+		"global",
+	])("cancels %s URL update transport without retrying", async (scope) => {
+		installEnvironment(new Response());
+		const controller = new AbortController();
+		let calls = 0;
+		Object.defineProperty(g, "fetch", {
+			value: (_path: string, options: RequestInit) => {
+				calls++;
+				return new Promise<Response>((_resolve, reject) => {
+					options.signal?.addEventListener("abort", () => reject(options.signal?.reason), {
+						once: true,
+					});
+				});
+			},
+			configurable: true,
+		});
+		const data = { url: "https://example.com/SKILL.md" };
+		const request =
+			scope === "project"
+				? api.updateProjectSkillFromUrl("p1", "example", data, controller.signal)
+				: api.updateGlobalSkillFromUrl("example", data, controller.signal);
+		controller.abort();
+		await expect(request).rejects.toMatchObject({ name: "AbortError" });
+		expect(calls).toBe(1);
+	});
+
 	test("surfaces structured storage cleanup errors", async () => {
 		installEnvironment(
 			new Response(

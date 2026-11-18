@@ -18,7 +18,7 @@ import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-co
 
 import type { MediaRef } from "@shared/media-attachments";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators, narratorToolCalls } from "../../db/schema";
 import { diagnosticsFromError } from "../../lib/agent/error-diagnostics";
@@ -933,6 +933,12 @@ async function finishRun(
 	// A failed held commit must retain its reservation for an explicit retry.
 	if (publicationRun) await getRuntimePublicationService().releaseUnusedRunSlots(publicationRun);
 	await clearDeliveredHold(id, hold);
+	// A subagent that was stopped or ran out of time takes its helpers with it.
+	if (runStopsHelpers({ cancelled, timedOut }))
+		void stopSubagentHelpers(
+			id,
+			timedOut ? "Parent subagent timed out" : "Parent subagent stopped",
+		);
 	// Terminal persistence (snapshot + delivery intent) precedes visible idle.
 	await settleStatus(id, deliverTo, {
 		hasError,
@@ -1406,6 +1412,88 @@ async function registerDetachedTask(
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Subagent detached to background. Results notify automatically. Watch({ type: "agent", id: "${alias}" }) registers an observation or retrieves the saved result.`
 	);
+}
+
+/**
+ * Whether a finished run takes the subagent's helpers with it: only when the run itself
+ * was cancelled (a controller's Stop, a `Send({ doInterrupt })`, its task cancelled, its
+ * caller cancelled) or ran out of time.
+ *
+ * Deliberately NOT on the loop's own "interrupted" outcome: the loop also reports that
+ * when it merely breaks to handle queued input (a queued /new or /goal with more input
+ * behind it) or when a planned update pauses it for resumption — cancelling helpers
+ * there would kill work nobody stopped, including runs update recovery resumes. A
+ * person's stop goes through `interruptNarrator`, which stops the helpers itself.
+ *
+ * Nor on an error: an errored subagent is resumable, and its helpers' results wait in
+ * its inbox for that resume rather than being thrown away.
+ */
+export function runStopsHelpers(run: { cancelled: boolean; timedOut: boolean }): boolean {
+	return run.cancelled || run.timedOut;
+}
+
+/** Helpers one stop reaches; a subagent rarely runs more than a few at once. */
+const HELPER_STOP_LIMIT = 100;
+
+/**
+ * Stopping a SUBAGENT stops the helpers it launched (its own team: rows it controls),
+ * background ones included, so nothing keeps working, spending and delivering to a
+ * subagent that was stopped. A helper a person has taken over is left alone, as control
+ * actions never cut into a person's work. Primary narrators are untouched: their
+ * background agents keep running when the primary's turn is interrupted, as before.
+ * Never throws, unless given an `assertAuthorized` fence (explicit Stop).
+ */
+export async function stopSubagentHelpers(
+	narratorId: string,
+	reason: string,
+	options: {
+		/**
+		 * The caller's authorization fence, asserted immediately before each helper is
+		 * cancelled. Its failure (and, on this explicit path, any failure) is thrown to the
+		 * caller instead of being swallowed.
+		 */
+		assertAuthorized?: () => void;
+	} = {},
+): Promise<number> {
+	try {
+		const owner = await db
+			.select({ type: narrators.type })
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.get();
+		if (owner?.type !== "subagent") return 0;
+		const { teamMembersWhere } = await import("../../lib/runtime-source");
+		const helpers = await db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(teamMembersWhere(narratorId), inArray(narrators.status, ["working", "waiting"])))
+			.limit(HELPER_STOP_LIMIT)
+			.all();
+		if (helpers.length === 0) return 0;
+		const { backgroundTaskService } = await import("../background-task-service");
+		let stopped = 0;
+		for (const helper of helpers) {
+			if (getRunHold(helper.id)) continue;
+			options.assertAuthorized?.();
+			const cancelled =
+				(await backgroundTaskService
+					.cancel(helper.id, { assertAuthorized: options.assertAuthorized })
+					.catch((error) => {
+						if (options.assertAuthorized) throw error;
+						return false;
+					})) || (await controlRun(helper.id, { kind: "cancel", reason }).catch(() => false));
+			if (cancelled) stopped++;
+		}
+		if (stopped > 0) logger.info("Stopped helpers of a stopped subagent", { narratorId, stopped });
+		return stopped;
+	} catch (error) {
+		if (options.assertAuthorized) throw error;
+		logger.warn("Failed to stop a stopped subagent's helpers", {
+			narratorId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return 0;
+	}
 }
 
 /**

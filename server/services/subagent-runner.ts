@@ -26,7 +26,7 @@ import {
 } from "../lib/settings";
 import { type RunBindingInput, runDeadlineAt } from "../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
+import { compileDelegationPolicy } from "./agent-runtime/policy";
 import { controlRun, startNarratorRun } from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
 import { customSubagentService } from "./custom-subagent-service";
@@ -182,7 +182,6 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	const {
 		parentNarratorId,
 		toolUseId,
-		subagentType,
 		prompt,
 		cwd,
 		title,
@@ -193,6 +192,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	} = input;
 	// The child stores this value; `auto:<alias>` is written the catalog's way, and an `auto:`
 	// id the catalog does not know fails here instead of at the child's first request.
+	// "Worker" or "GENERAL" means that built-in, never the read-only unknown-type fallback.
+	const subagentType = customSubagentService.canonicalTemplateName(input.subagentType);
 	const explicitModel = input.model ? normalizeAutoModelValueForSave(input.model) : input.model;
 	const background = input.background === true || input.takeoverByUser === true;
 	const timeoutMs = background
@@ -203,9 +204,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 	// The template compiles into ordinary data on the created narrator: a capability
 	// ceiling trait and a base prompt. Neither is read from the template again.
-	const customDef = BUILTIN_DELEGATION_TEMPLATES.has(subagentType)
-		? null
-		: await customSubagentService.loadByName(subagentType);
+	const customDef = await customSubagentService.resolveTemplateDefinition(subagentType);
 	const systemPrompt = await buildDelegationBasePrompt(
 		subagentType,
 		locale as Locale,

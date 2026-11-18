@@ -16,6 +16,7 @@ import {
 	getChatAttachmentsDir,
 	listStoredChatAttachmentNames,
 } from "../lib/chat-attachments";
+import { coordinatorOutputsRoot } from "../lib/coordinator-outputs-path";
 import {
 	DirectoryMeasureAbortedError,
 	measureDirectoriesOffThread,
@@ -445,6 +446,30 @@ async function scanDormantIgnored(
 	};
 }
 
+/**
+ * A team coordinator's saved tool results (`~/.narrafork/coordinator-outputs/<narratorId>`,
+ * Project Teams P2): capped per session and removed with the session.
+ */
+async function scanCoordinatorOutputs(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
+	const dir = coordinatorOutputsRoot();
+	const measured = await measureDirSize(dir, options);
+	let narratorDirs = 0;
+	try {
+		const entries = await readdir(dir, { withFileTypes: true });
+		narratorDirs = entries.filter((entry) => entry.isDirectory()).length;
+	} catch {
+		// dir may not exist yet
+	}
+	return {
+		key: "coordinatorOutputs",
+		sizeBytes: measured.sizeBytes,
+		...(measured.truncated ? { truncated: true } : {}),
+		details: { narratorDirs },
+	};
+}
+
 async function scanWorktrees(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
 	let totalSize = 0;
 	let worktreeCount = 0;
@@ -707,6 +732,8 @@ export async function scanStorageCategory(
 				return await scanRequestRecordings(true, options);
 			case "dormantIgnored":
 				return await scanDormantIgnored(options);
+			case "coordinatorOutputs":
+				return await scanCoordinatorOutputs(options);
 			case "containers":
 				return await scanContainers(options);
 		}

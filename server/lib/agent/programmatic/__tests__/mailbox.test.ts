@@ -658,6 +658,78 @@ Atomics.notify = (header, index, count) => {
 	});
 });
 
+// A peer that finishes after a committed frame closes the mailbox normally. That close can
+// land between this side committing a take (or observing the response state) and returning;
+// it must never turn an already consumed frame into a failure.
+describe("mailbox closure after a committed take or consumption", () => {
+	for (const direction of ["request", "response"] as const) {
+		test(`${direction} take returns the consumed frame when the producer closes right after release`, () => {
+			const { context, mailbox } = inVm(`
+const originalNotify = Atomics.notify;
+Atomics.notify = (view, index, count) => {
+  const woken = originalNotify(view, index, count);
+  globalThis.onSignal?.(index);
+  return woken;
+};`);
+			const peer = createMailbox(SMALL, mailbox.buffers);
+			if (direction === "request") peer.publishRequest(1, "final");
+			else peer.publishResponse(1, "final");
+			let closedAfterRelease = false;
+			context.onSignal = (index: number) => {
+				if (index !== ABI[direction] + 1 || closedAfterRelease) return;
+				closedAfterRelease = true;
+				peer.close(42);
+			};
+			const text = direction === "request" ? mailbox.takeRequest()?.text : mailbox.takeResponse(1);
+			expect(text).toBe("final");
+			expect(closedAfterRelease).toBe(true);
+			expect(Atomics.load(header(mailbox), ABI[direction])).toBe(0);
+			expect(throwsCode(() => mailbox.takeRequest(), "MAILBOX_CLOSED").reason).toBe(42);
+		});
+	}
+
+	// Sweep every observation of the READY response state inside one wait iteration.
+	for (const observation of [1, 2, 3]) {
+		test(`response consumption wins over a normal close after state observation ${observation}`, async () => {
+			const { context, mailbox } = inVm(`
+const originalLoad = Atomics.load;
+Atomics.load = (view, index) => {
+  const value = originalLoad(view, index);
+  if (index === ${ABI.response}) globalThis.onStateLoad?.(value);
+  return value;
+};`);
+			const peer = createMailbox(SMALL, mailbox.buffers);
+			mailbox.publishResponse(1, "final");
+			let seen = 0;
+			let consumed: string | null | undefined;
+			context.onStateLoad = (state: number) => {
+				if (state !== 2 || consumed !== undefined || ++seen !== observation) return;
+				consumed = peer.takeResponse(1);
+				peer.close(43);
+			};
+			await mailbox.waitForResponseConsumed(1000);
+			expect(consumed).toBe("final");
+			expect(Atomics.load(header(mailbox), ABI.closed)).toBe(43);
+		});
+	}
+
+	test("a close that precedes consumption still fails response-consumption waiting", async () => {
+		const closedFirst = createMailbox(SMALL);
+		closedFirst.publishResponse(1, "unread");
+		closedFirst.close(44);
+		await expect(closedFirst.waitForResponseConsumed(1000)).rejects.toMatchObject({
+			code: "MAILBOX_CLOSED",
+			reason: 44,
+		});
+		const closedWhileWaiting = createMailbox(SMALL);
+		closedWhileWaiting.publishResponse(1, "unread");
+		const pending = closedWhileWaiting.waitForResponseConsumed(1000);
+		createMailbox(SMALL, closedWhileWaiting.buffers).close(45);
+		await expect(pending).rejects.toMatchObject({ code: "MAILBOX_CLOSED", reason: 45 });
+		expect(Atomics.load(header(closedWhileWaiting), ABI.response)).toBe(2);
+	});
+});
+
 describe("mailbox waitAsync races and realm isolation", () => {
 	test("toString creates buffers and errors exclusively in a fresh VM realm", () => {
 		const { context, mailbox } = inVm();

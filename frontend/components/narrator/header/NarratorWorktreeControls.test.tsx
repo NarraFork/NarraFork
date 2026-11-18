@@ -78,6 +78,7 @@ const reconcile = mock(
 mock.module("@frontend/hooks/useWorkspaceContext", () => ({
 	useWorkspaceContext: () => ({ data: activeContext }),
 	useSwitchWorkspaceContext: () => ({ mutateAsync: switched, isPending: false }),
+	workspaceContextKey: (id: string) => ["workspaceContext", id],
 }));
 class FakeApiError extends Error {
 	constructor(
@@ -152,6 +153,44 @@ mock.module("@mantine/core", () => {
 		Tooltip: Wrapper,
 		Menu,
 		Badge: Wrapper,
+		Divider: () => <hr />,
+		UnstyledButton: ({
+			children,
+			onClick,
+			disabled,
+			"data-worktree-path": path,
+		}: Children & {
+			onClick?: () => void;
+			disabled?: boolean;
+			"data-worktree-path"?: string;
+		}) => (
+			<button type="button" disabled={disabled} onClick={onClick} data-worktree-path={path}>
+				{children}
+			</button>
+		),
+		Checkbox: ({
+			label,
+			checked,
+			onChange,
+			disabled,
+		}: {
+			label: string;
+			checked: boolean;
+			onChange: (event: { currentTarget: { checked: boolean } }) => void;
+			disabled?: boolean;
+		}) => (
+			<label>
+				<input
+					type="checkbox"
+					checked={checked}
+					disabled={disabled}
+					onChange={(event) =>
+						onChange({ currentTarget: { checked: event.currentTarget.checked } })
+					}
+				/>
+				{label}
+			</label>
+		),
 		ScrollArea: {
 			Autosize: ({
 				children,

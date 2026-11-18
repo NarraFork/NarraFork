@@ -268,11 +268,9 @@ const FilePanelContent = REMOTE_BUILD
 			})),
 		);
 
-// Flag-gated pretext virtualized list. Now the default renderer, but still lazily
-// imported so an explicit opt-out (Virtual OFF) never bundles vlist; the isolation
-// guard requires this dynamic import (no static import of vlist from outside the
-// vlist/ directory). The exact-layout shell is the sole Virtual renderer (the band
-// path has been retired).
+// Loaded lazily. The isolation guard requires this dynamic import (no static
+// import of vlist from outside the vlist/ directory). The exact-layout shell is
+// the sole renderer; the band path has been retired.
 const PretextExactMessageList = lazy(() =>
 	import("./vlist/PretextExactMessageList").then((module) => ({
 		default: module.PretextExactMessageList,
@@ -2264,7 +2262,6 @@ function NarratorPanelBody({
 	// Single-block action handlers for the vlist message list. Memoized so the
 	// object identity is stable across renders — the vlist interaction layer
 	// keys its per-row payloads off this and must not rebuild them every render.
-	// Mirrors the props passed to ChunkedMessageList (same names/signatures).
 	const vlistRowHandlers = useMemo(
 		() => ({
 			onForkFromMessage: forkHandler,
@@ -2274,8 +2271,7 @@ function NarratorPanelBody({
 			onManualSummarize: compactSupported ? handleManualSummarize : undefined,
 			onDeleteBlock: handleDeleteBlock,
 			onRollbackToBlock: rollbackEditRegenerateSupported ? handleRollback : undefined,
-			// Message editing: same gating as the chunked branch below — the user
-			// flow requires provider support, the assistant text edit does not.
+			// The user flow requires provider support; the assistant text edit does not.
 			onEditAndRegenerate: rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
 			resolveQueuedMessage,
 			onEditAssistantMessage: handleEditAssistantMessage,

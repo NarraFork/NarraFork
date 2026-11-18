@@ -363,6 +363,9 @@ describe("TokenDance billing", () => {
 	] as const)("paid via %s invalidates an earlier in-flight balance request without stale overwrite", async (source) => {
 		const generation = connectBilling();
 		const now = Date.now();
+		// Freeze before the order is created. The status poll waits 3000ms from
+		// polledAt, so a jump measured from an earlier real timestamp can miss it.
+		Date.now = () => now;
 		let finish!: (value: Response) => void;
 		let balanceCalls = 0;
 		let paid = source === "create";

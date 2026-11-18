@@ -60,7 +60,8 @@ function buildRawJsonSchema(): Record<string, unknown> {
 		doInterrupt: {
 			description:
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
-				"for an urgent correction that requires stopping current work, never for status polling.",
+				"for an urgent correction that requires stopping current work, never for status polling. " +
+				"Interrupting a worker subagent also cancels the helper agents it launched.",
 			type: "boolean",
 		},
 	};
@@ -126,7 +127,8 @@ export const sendTool: ToolDefinition = {
 			.optional()
 			.describe(
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
-					"for an urgent correction that requires stopping current work, never for status polling.",
+					"for an urgent correction that requires stopping current work, never for status polling. " +
+					"Interrupting a worker subagent also cancels the helper agents it launched.",
 			),
 		resume: z.boolean().optional().describe(RESUME_DESCRIPTION),
 		model: z.string().optional().describe(MODEL_DESCRIPTION),

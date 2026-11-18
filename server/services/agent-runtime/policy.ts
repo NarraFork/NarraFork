@@ -12,6 +12,12 @@ import type { RuntimePolicyTrait } from "@server/lib/runtime-policy-trait";
  * with the same traits behave the same, however they were created.
  */
 export interface RuntimePolicy {
+	/**
+	 * Delegation levels below a primary narrator: 0 for a narrator that declares none, 1 for a
+	 * primary's subagent, 2 for a subagent's subagent. At {@link MAX_DELEGATION_DEPTH} the
+	 * ceiling never allows spawning or awaiting agents.
+	 */
+	readonly delegationDepth: number;
 	/** Search tools may only call the selected provider directly, never the channel router. */
 	readonly searchOnly: boolean;
 	/** Shell may only run the constrained local read-only Git policy. */
@@ -56,6 +62,23 @@ const READ_TOOLS = Object.freeze([
 	...OUTLINE_READ_TOOLS,
 ]);
 const GENERAL_TOOLS = Object.freeze([...READ_TOOLS, "Write", "Edit", "Skill", OUTLINE_EDIT_TOOL]);
+/** Tools that create or continue another agent; hidden wherever spawning is not allowed. */
+const SPAWN_TOOLS: readonly string[] = Object.freeze([
+	"Agent",
+	"Task",
+	"ContinueTask",
+	"ForkNarrator",
+]);
+/** A worker does the `general` work and may also hand parts of it to helpers it waits for. */
+const WORKER_TOOLS = Object.freeze([...GENERAL_TOOLS, "Agent"]);
+
+/**
+ * Subagents nest at most this many levels below a primary narrator: a primary's subagent
+ * (level 1) may spawn and await its own helpers (level 2); a level-2 subagent never spawns.
+ * Every backstop (visibility here, creation in `narrator-service`, control in
+ * `narrator-control`) reads this one number.
+ */
+export const MAX_DELEGATION_DEPTH = 2;
 const SEARCH_TOOLS = Object.freeze([
 	"WebSearch",
 	"WebFetch",
@@ -75,6 +98,13 @@ const DELEGATED_DENY: NonNullable<RuntimePolicyTrait["deny"]> = [
 	"stopHooks",
 	"switchWorkingDirectory",
 ];
+/**
+ * A worker coordinates its own helpers (spawns, waits for and stops them) but, like every
+ * delegate, never asks the user, approves plans or leaves its delegator's directory.
+ */
+const WORKER_DENY: NonNullable<RuntimePolicyTrait["deny"]> = DELEGATED_DENY.filter(
+	(key) => key !== "spawnAgent" && key !== "watchAgent" && key !== "awaitAgent",
+);
 
 /**
  * A bot's ceiling, stored on it at creation. Nobody reads a bot's transcript, so
@@ -89,6 +119,7 @@ export const BOT_RUNTIME_CEILING: RuntimePolicyTrait = {
 /** Template names with a built-in ceiling; any other name is a custom definition. */
 export const BUILTIN_DELEGATION_TEMPLATES: ReadonlySet<string> = new Set([
 	"general",
+	"worker",
 	"explore",
 	"plan",
 	"review",
@@ -127,6 +158,10 @@ export function compileDelegationPolicy(input: DelegationTemplateInput): Runtime
 	switch (input.template) {
 		case "general":
 			return { ...base, tools: builtin(GENERAL_TOOLS), mcp: "nonDenied" };
+		case "worker":
+			// Nesting is a template grant, never a loosening of the others: only a worker may
+			// spawn, and only while it sits above the deepest level (`withDelegationDepth`).
+			return { ...base, deny: [...WORKER_DENY], tools: builtin(WORKER_TOOLS), mcp: "nonDenied" };
 		case "search":
 			return { ...base, tools: [...SEARCH_TOOLS], mcp: "none", readOnly: true, searchOnly: true };
 		case "review":
@@ -155,6 +190,24 @@ export function compileDelegationPolicy(input: DelegationTemplateInput): Runtime
 	return { ...base, tools: builtin(READ_TOOLS), mcp: "readOnly", readOnly: true };
 }
 
+/**
+ * Stamp a compiled ceiling with the level it is created at. At the deepest level the
+ * ceiling itself also removes spawning and agent waits, so the stored row says what the
+ * resolved policy enforces even when read without its source chain.
+ */
+export function withDelegationDepth(trait: RuntimePolicyTrait, depth: number): RuntimePolicyTrait {
+	const stamped: RuntimePolicyTrait = { ...trait, delegationDepth: depth };
+	if (depth < MAX_DELEGATION_DEPTH) return stamped;
+	const deny = new Set(trait.deny ?? []);
+	deny.add("spawnAgent");
+	deny.add("awaitAgent");
+	return {
+		...stamped,
+		deny: [...deny],
+		...(trait.tools ? { tools: trait.tools.filter((name) => !SPAWN_TOOLS.includes(name)) } : {}),
+	};
+}
+
 const MCP_RANK = { none: 0, readOnly: 1, nonDenied: 2 } as const;
 
 function intersect(current: "all" | string[], declared: readonly string[] | undefined) {
@@ -176,8 +229,10 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 	let readOnlyGitShell = false;
 	let promoteTodo = true;
 	let maxPasses: number | null = null;
+	let delegationDepth = 0;
 	const denied = new Set<string>();
 	for (const trait of declarations) {
+		delegationDepth = Math.max(delegationDepth, trait.delegationDepth ?? 0);
 		builtin = intersect(builtin, trait.tools);
 		mcpNames = intersect(mcpNames, trait.mcpNames);
 		if (trait.mcp && MCP_RANK[trait.mcp] < MCP_RANK[mcp]) mcp = trait.mcp;
@@ -193,8 +248,14 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 		builtin = intersect(builtin, READ_TOOLS);
 		if (mcp === "nonDenied") mcp = "readOnly";
 	}
+	// The deepest level never orchestrates, whatever its template or any layer allows.
+	if (delegationDepth >= MAX_DELEGATION_DEPTH) {
+		denied.add("spawnAgent");
+		denied.add("awaitAgent");
+	}
 	const allowed = (key: string) => !denied.has(key);
 	return Object.freeze({
+		delegationDepth,
 		searchOnly,
 		readOnlyGitShell,
 		continuation: Object.freeze({ promoteTodo, maxPasses }),
@@ -248,7 +309,10 @@ export function isRuntimeToolAllowed(
 	if (toolName === "Await") return false;
 	if (toolName === "Question") return true;
 	if (toolName === "AskUserQuestion" && caps.askUserQuestion === "disabled") return false;
-	if (["Agent", "Task", "ContinueTask", "ForkNarrator"].includes(toolName) && !caps.spawnAgent)
+	if (
+		SPAWN_TOOLS.includes(toolName) &&
+		(!caps.spawnAgent || policy.delegationDepth >= MAX_DELEGATION_DEPTH)
+	)
 		return false;
 	if (["EnterPlanMode", "ExitPlanMode"].includes(toolName) && !caps.planApproval) return false;
 	if (toolName === "SwitchWorkingDirectory" && !caps.switchWorkingDirectory) return false;

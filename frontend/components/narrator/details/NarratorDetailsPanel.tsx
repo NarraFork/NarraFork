@@ -12,7 +12,6 @@ import {
 	Drawer,
 	FileButton,
 	Group,
-	Modal,
 	MultiSelect,
 	Paper,
 	ScrollArea,
@@ -46,7 +45,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import React, { createContext, lazy, Suspense, useContext, useMemo, useState } from "react";
+import React, { createContext, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
@@ -99,9 +98,8 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 } from "../../../lib/safe-area";
-import { Z } from "../../../lib/z-index";
+import { DeviceDirectoryModal } from "../../common/DeviceDirectoryPicker";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
-import { DIRECTORY_BROWSER_MODAL_STYLES } from "../../common/directory-browser-modal";
 import { UserAvatar } from "../../UserAvatar";
 import {
 	DetailsPanelContentLifetime,
@@ -391,12 +389,6 @@ function RuleList({
 
 	return <Stack gap="xs">{items.map((item, index) => renderItem(item, index))}</Stack>;
 }
-
-const RemoteDirectoryBrowser = lazy(() =>
-	import("../../permissions/RemoteDirectoryBrowser").then((module) => ({
-		default: module.RemoteDirectoryBrowser,
-	})),
-);
 
 const EMPTY_POOLS: SubagentModelPools = {};
 const EMPTY_SELECTION: string[] = [];
@@ -1217,34 +1209,25 @@ function NarratorDetailsContent({
 						/>
 					) : null}
 					{isRemoteCwd ? (
-						<Modal
+						<DeviceDirectoryModal
 							opened={remoteCwdOpened}
 							onClose={() => setRemoteCwdOpened(false)}
 							title={t("details.cwdBrowseRemoteTitle", { device: deviceLabel(editDeviceId) })}
-							size="md"
-							zIndex={Z.modal}
-							styles={DIRECTORY_BROWSER_MODAL_STYLES}
-						>
-							{remoteCwdOpened ? (
-								<Suspense fallback={null}>
-									<RemoteDirectoryBrowser
-										deviceLabel={deviceLabel(editDeviceId)}
-										initialPath={cwdValue.trim() || undefined}
-										listDirectory={(path, opts) =>
-											api.browseNarratorDevice(narratorId, editDeviceId, path, {
-												showHidden: opts.showHidden,
-											})
-										}
-										queryKey={["narratorDeviceBrowse", narratorId, editDeviceId]}
-										onSelect={(path) => {
-											setCwdValue(path);
-											setRemoteCwdOpened(false);
-										}}
-										onCancel={() => setRemoteCwdOpened(false)}
-									/>
-								</Suspense>
-							) : null}
-						</Modal>
+							deviceId={editDeviceId}
+							deviceLabel={deviceLabel(editDeviceId)}
+							initialPath={cwdValue.trim() || undefined}
+							listDirectory={(path, opts) =>
+								api.browseNarratorDevice(narratorId, editDeviceId, path, {
+									showHidden: opts.showHidden,
+								})
+							}
+							queryKey={["narratorDeviceBrowse", narratorId, editDeviceId]}
+							onSelect={(path) => {
+								setCwdValue(path);
+								setRemoteCwdOpened(false);
+							}}
+							onCancel={() => setRemoteCwdOpened(false)}
+						/>
 					) : null}
 					<Stack gap="xs">
 						{/* Executor first: it decides what the directory below even means. This is

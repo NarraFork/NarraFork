@@ -52,6 +52,11 @@ const LIST_MAX_LIMIT = 100;
  * how much of that window is printed.
  */
 const LIST_RECENT_TERMINAL_LIMIT = 5;
+/**
+ * Helpers shown under each listed agent: the one nested level of a team tree (a first-level
+ * subagent's own subagents). Active ones first; the rest is counted, never silently dropped.
+ */
+const LIST_NESTED_LIMIT = 5;
 
 function clampListLimit(raw: unknown): number {
 	const n = typeof raw === "number" ? raw : Number(raw);
@@ -126,7 +131,9 @@ export const teamStatusTool: ToolDefinition = {
 		'- "send": Send a message to a specific direct subagent (requires target_id)\n\n' +
 		"Notes:\n" +
 		"- The primary narrator is the team root; subagents use their parent's team scope.\n" +
-		"- get_task is limited to tasks started by the current narrator; other actions use its direct subagent team.\n" +
+		"- Agent listings are a tree: each agent's own helper agents (the second level) are indented under it.\n" +
+		"- get_task is limited to tasks started by the current narrator.\n" +
+		"- broadcast, send and file_changes are limited to the current narrator's direct subagent team.\n" +
 		`- The list actions are bounded: active members come first, then a few recent finished ones, up to ${LIST_DEFAULT_LIMIT} rows per kind. A trailing note reports what was omitted.\n` +
 		"- Use `query` to find a specific member by name/alias/id prefix past that window, and `limit` to widen it.\n" +
 		"- file_changes only tracks modifications made via Write and Edit tools; Bash changes are not tracked.",
@@ -253,14 +260,32 @@ export const teamStatusTool: ToolDefinition = {
 			const lines: string[] = [];
 			const notes: string[] = [];
 			if (agentView) {
-				for (const s of agentView.subagents) {
+				// The tree's one nested level: each listed agent's own helpers, indented under it.
+				const nested = await narratorService.listNestedSubagentsForTeamView(
+					agentView.subagents.map((s) => s.id),
+					LIST_NESTED_LIMIT,
+				);
+				const agentLine = (
+					s: (typeof agentView.subagents)[number],
+					labelScope: string,
+					indent: string,
+				) => {
 					const isSelf = s.id === ctx.narratorId ? " (you)" : "";
 					const sType = s.variant.startsWith("subagent:") ? s.variant.slice(9) : "unknown";
 					// Lead with the alias, like the bash rows below, so the model addresses
 					// agents by a readable handle instead of copying the nanoid back.
-					lines.push(
-						`- kind=agent | alias=${agentLabelFromNarrator(s, scopeId)}${isSelf} | id=${s.id} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`,
-					);
+					return `${indent}- kind=agent | alias=${agentLabelFromNarrator(s, labelScope)}${isSelf} | id=${s.id} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`;
+				};
+				for (const s of agentView.subagents) {
+					lines.push(agentLine(s, scopeId, ""));
+					const children = nested.get(s.id);
+					if (!children) continue;
+					for (const child of children.subagents) lines.push(agentLine(child, s.id, "  "));
+					const more = children.total - children.subagents.length;
+					if (more > 0)
+						lines.push(
+							`  (${more} more helper agents of ${agentLabelFromNarrator(s, scopeId)} not shown)`,
+						);
 				}
 				const note = omissionNote(
 					"agents",
@@ -301,12 +326,14 @@ export const teamStatusTool: ToolDefinition = {
 					output: needle ? `No ${scope} match "${needle}".` : `No ${scope} found.`,
 				};
 			}
+			// Counted rows are the top-level ones; nested helper rows are indented under them.
+			const listed = lines.filter((line) => line.startsWith("- ")).length;
 			const header =
 				action === "list_agents"
-					? `Sibling subagents (${lines.length}):`
+					? `Sibling subagents (${listed}):`
 					: action === "list_bash"
-						? `Background bash tasks (${lines.length}):`
-						: `Background tasks (${lines.length}):`;
+						? `Background bash tasks (${listed}):`
+						: `Background tasks (${listed}):`;
 			const body = `${header}\n${lines.join("\n")}`;
 			return { output: notes.length > 0 ? `${body}\n${notes.join("\n")}` : body };
 		}

@@ -198,6 +198,15 @@ export {
 	notificationMarkReadSchema,
 } from "./notifications";
 export {
+	coordinatorLimitsSchema,
+	createProjectTeamSchema,
+	listProjectTeamsQuerySchema,
+	teamBaseBranchSchema,
+	teamBriefSchema,
+	teamSettingsSchema,
+	updateProjectTeamSchema,
+} from "./project-teams";
+export {
 	createProjectSchema,
 	projectChapterSettingsSchema,
 	projectMembersSchema,
@@ -240,7 +249,11 @@ export {
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "./settings";
-export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
+export {
+	createProjectSkillSchema,
+	importSkillSchema,
+	updateProjectSkillSchema,
+} from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
 export { createTerminalSchema, updateTerminalViewStateSchema } from "./terminals";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";

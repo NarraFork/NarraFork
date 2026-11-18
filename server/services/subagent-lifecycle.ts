@@ -50,6 +50,9 @@ export async function interruptAndArchiveSubagent(
 		// End the registered run (including any hold/task projection) before closing
 		// the session. This mechanism does not depend on a delegation identity.
 		let interrupted = await controlRun(narrator.id, { kind: "cancel", reason: "Retired" });
+		// Its helpers stop too, also when it had no run of its own left.
+		const { stopSubagentHelpers } = await import("./agent-runtime/run");
+		await stopSubagentHelpers(narrator.id, "Parent subagent archived");
 		try {
 			if (isNarratorActive(narrator.id)) {
 				closeNarrator(narrator.id);

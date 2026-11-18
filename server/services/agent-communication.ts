@@ -243,40 +243,64 @@ function getSelectors(input: ResolveTargetsInput): string[] {
 	return uniqueStrings([input.id, ...(input.ids ?? []), input.name, ...(input.names ?? [])]);
 }
 
-async function getCommunicationScope(callerNarratorId: string): Promise<{
+/**
+ * Who a caller can reach. A narrator reaches the team it belongs to (`teamParentId`: its
+ * controller, or itself when nobody controls it) and the team it leads (its own children).
+ * For a primary the two are the same team. A first-level subagent therefore reaches its
+ * parent, its siblings and its own helpers; a helper reaches its parent and siblings.
+ * Nothing reaches across trees or skips a level (a primary does not message its
+ * grandchildren: they take direction from the subagent that launched them).
+ */
+interface CommunicationScope {
 	caller: Narrator;
 	teamParentId: string;
 	callerIsSubagent: boolean;
-}> {
+	/** Await only: restrict targets to the caller's own children. */
+	ownChildrenOnly?: boolean;
+}
+
+async function getCommunicationScope(callerNarratorId: string): Promise<CommunicationScope> {
 	const caller = await narratorService.getById(callerNarratorId);
 	const teamParentId = teamRootOf(caller);
 	return { caller, teamParentId, callerIsSubagent: teamParentId !== caller.id };
 }
 
-function assertTargetAllowed(
-	target: Narrator,
-	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
-) {
+/** Teams a selector is resolved in: the caller's own team, then the one it leads. */
+function reachableTeamIds(scope: CommunicationScope): string[] {
+	if (scope.ownChildrenOnly) return [scope.caller.id];
+	return scope.teamParentId === scope.caller.id
+		? [scope.caller.id]
+		: [scope.teamParentId, scope.caller.id];
+}
+
+/** The target is the caller's own child (its controller is the caller). */
+function isOwnChild(target: Narrator, scope: CommunicationScope): boolean {
+	const root = teamRootOf(target);
+	return root !== target.id && root === scope.caller.id;
+}
+
+function assertTargetAllowed(target: Narrator, scope: CommunicationScope) {
 	// These messages reach the model, so they name the target the same readable
 	// way every other Send/Await outlet does.
-	const label = agentLabelFromNarrator(target, scope.teamParentId);
 	const root = teamRootOf(target);
+	const label = agentLabelFromNarrator(target, root);
 	if (root === target.id) {
 		throw new Error(`${label} is not a subagent`);
 	}
-	if (root !== scope.teamParentId) {
-		throw new Error(`${label} does not belong to this narrator's subagent team`);
+	if (!reachableTeamIds(scope).includes(root)) {
+		throw new Error(
+			scope.ownChildrenOnly
+				? `${label} is not a subagent this narrator launched`
+				: `${label} does not belong to this narrator's subagent team`,
+		);
 	}
 	if (scope.callerIsSubagent && target.id === scope.caller.id) {
 		throw new Error("Subagents cannot target themselves");
 	}
 }
 
-async function resolveAliasCandidate(
-	selector: string,
-	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
-) {
-	for (const ownerId of [scope.caller.id, scope.teamParentId]) {
+async function resolveAliasCandidate(selector: string, scope: CommunicationScope) {
+	for (const ownerId of [...new Set([scope.caller.id, ...reachableTeamIds(scope)])]) {
 		const inMemory = resolveTaskAlias(ownerId, selector);
 		if (inMemory !== selector) return inMemory;
 		const task = await backgroundTaskService.getByAlias(selector, ownerId);
@@ -286,10 +310,7 @@ async function resolveAliasCandidate(
 	return selector;
 }
 
-async function resolveOneTarget(
-	selector: string,
-	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
-): Promise<Narrator> {
+async function resolveOneTarget(selector: string, scope: CommunicationScope): Promise<Narrator> {
 	const aliasCandidate = await resolveAliasCandidate(selector, scope);
 	const direct = await narratorService.getById(aliasCandidate).catch(() => null);
 	if (direct) {
@@ -297,7 +318,9 @@ async function resolveOneTarget(
 		return direct;
 	}
 
-	const siblings = await narratorService.listTeamMembers(scope.teamParentId);
+	const siblings: Awaited<ReturnType<typeof narratorService.listTeamMembers>> = [];
+	for (const teamId of reachableTeamIds(scope))
+		siblings.push(...(await narratorService.listTeamMembers(teamId)));
 	const candidates = siblings.filter((s) => {
 		if (scope.callerIsSubagent && s.id === scope.caller.id) return false;
 		return subagentMatchesSelector(s, selector);
@@ -866,7 +889,13 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 }
 
 export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<AwaitAgentResult> {
-	const scope = await getCommunicationScope(opts.callerNarratorId);
+	// A narrator waits only for agents it launched itself: never a sibling, a parent or
+	// another tree's agent. For a primary this is its whole team, as before.
+	const scope: CommunicationScope = {
+		...(await getCommunicationScope(opts.callerNarratorId)),
+		ownChildrenOnly: true,
+	};
+	scope.teamParentId = scope.caller.id;
 	assertRuntimeCanAwaitAgent(
 		await resolveNarratorRuntimePolicy(scope.caller.id, opts.userId ?? null),
 	);
@@ -988,7 +1017,7 @@ function withSenderPrefix(
  */
 async function deliverSubagentMessageToParent(
 	input: SendSubagentInput,
-	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
+	scope: CommunicationScope,
 ): Promise<SendTargetResult> {
 	const parentId = scope.teamParentId;
 	const parent = await narratorService.getById(parentId).catch(() => null);
@@ -1044,7 +1073,7 @@ async function deliverSubagentMessageToParent(
 /** Resolve every Send destination before delivery; parent/main are reserved, not sibling aliases. */
 async function resolveSendTargets(
 	input: SendSubagentInput,
-	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
+	scope: CommunicationScope,
 ): Promise<Narrator[]> {
 	const selectors = getSelectors(input);
 	if (!selectors.length) throw new Error("At least one target id/name is required");
@@ -1052,11 +1081,11 @@ async function resolveSendTargets(
 	for (const selector of selectors) {
 		const targetsParent =
 			scope.callerIsSubagent && (isParentSelector(selector) || selector === scope.teamParentId);
+		// The parent is the caller's controller: a primary, or for a helper the subagent
+		// that launched it.
 		const target = targetsParent
 			? await narratorService.getById(scope.teamParentId)
 			: await resolveOneTarget(selector, scope);
-		if (targetsParent && teamRootOf(target) !== target.id)
-			throw new Error("Parent is not a primary narrator");
 		targets.set(target.id, target);
 	}
 	return [...targets.values()];
@@ -1108,7 +1137,7 @@ export async function sendSubagentMessageDetailed(
 		for (const target of targets) {
 			if (isTakenOver(target.id))
 				throw new Error(
-					`Agent ${agentLabelFromNarrator(target, scope.teamParentId)} is taken over by the user; its model cannot be changed now.`,
+					`Agent ${agentLabelFromNarrator(target, teamRootOf(target))} is taken over by the user; its model cannot be changed now.`,
 				);
 			modelPlans.set(
 				target.id,
@@ -1127,7 +1156,7 @@ export async function sendSubagentMessageDetailed(
 	for (const target of targets) {
 		// Readable name for every message about this target, refreshed from `fresh`
 		// below once it is loaded.
-		let label = agentLabelFromNarrator(target, scope.teamParentId);
+		let label = agentLabelFromNarrator(target, teamRootOf(target));
 		try {
 			if (scope.callerIsSubagent && target.id === scope.teamParentId) {
 				label = "parent";
@@ -1145,7 +1174,9 @@ export async function sendSubagentMessageDetailed(
 
 			const fresh = await narratorService.getById(target.id);
 			assertTargetAllowed(fresh, scope);
-			label = agentLabelFromNarrator(fresh, scope.teamParentId);
+			label = agentLabelFromNarrator(fresh, teamRootOf(fresh));
+			// A subagent writing to its own helper speaks as that helper's parent.
+			const asParent = !scope.callerIsSubagent || isOwnChild(fresh, scope);
 			if (fresh.status === "archived") {
 				throw new Error("Target subagent is archived");
 			}
@@ -1180,7 +1211,7 @@ export async function sendSubagentMessageDetailed(
 			// can tell who sent it (user-typed page messages bypass this path entirely).
 			const deliveredMessage = withSenderPrefix(
 				scope.caller,
-				scope.callerIsSubagent,
+				!asParent,
 				input.message,
 				input.locale as Locale,
 			);
@@ -1190,7 +1221,7 @@ export async function sendSubagentMessageDetailed(
 				title: scope.caller.title,
 				label: agentLabelFromNarrator(scope.caller, scope.teamParentId),
 				type: scope.callerIsSubagent ? callerSubagentType(scope.caller) : null,
-				isParent: !scope.callerIsSubagent,
+				isParent: asParent,
 			};
 			const delivery = createAgentMessageDelivery(
 				fresh.id,

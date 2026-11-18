@@ -30,6 +30,7 @@ import {
 import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { narratorService } from "@server/services/narrator-service";
+import { TEAM_TRAIT } from "../lib/narrator-utils";
 import {
 	pauseModelHistorySourceWorkers,
 	resumeModelHistorySourceWorkers,
@@ -57,6 +58,7 @@ import {
 	type SessionOwnedTableRelation,
 	summarizeToolCallPayloads,
 } from "./storage-scan-queries";
+import { listTeamsWithLiveWork } from "./teams/team-records";
 import {
 	pauseTokenRecalculationWorkers,
 	resumeTokenRecalculationWorkers,
@@ -254,6 +256,8 @@ export interface DatabaseVacuumResult {
 interface CleanupNarratorContext {
 	narrators: NarratorCleanupRecord[];
 	runningTerminalIds: Set<string>;
+	/** Team coordinators that cannot be deleted yet (`TEAM_HAS_LIVE_WORK`). */
+	liveTeamIds: Set<string>;
 }
 
 interface SessionPreviewData {
@@ -374,6 +378,11 @@ const NARRATOR_CLEANUP_COLUMNS = `
 	COALESCE(is_background, 0) AS isBackground,
 	background_status AS backgroundStatus`;
 
+/** Team coordinators among the loaded rows: the only candidates for `teamLiveWork`. */
+function coordinatorIdsOf(rows: NarratorCleanupRecord[]): string[] {
+	return rows.filter((row) => row.traits?.includes(TEAM_TRAIT)).map((row) => row.id);
+}
+
 async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 	const narratorRows = sqlite
 		.prepare(`SELECT ${NARRATOR_CLEANUP_COLUMNS} FROM narrators`)
@@ -385,9 +394,11 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 			 WHERE status = 'running' AND narrator_id IS NOT NULL`,
 		)
 		.all() as Array<{ narratorId: string }>;
+	const narrators = narratorRows.map(normalizeNarratorCleanupRecord);
 	return {
-		narrators: narratorRows.map(normalizeNarratorCleanupRecord),
+		narrators,
 		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
+		liveTeamIds: listTeamsWithLiveWork(coordinatorIdsOf(narrators)),
 	};
 }
 
@@ -408,9 +419,11 @@ function loadRootSubtreeContext(rootNarratorId: string): CleanupNarratorContext 
 			 WHERE status = 'running' AND narrator_id IN (SELECT id FROM subtree)`,
 		)
 		.all(rootNarratorId) as Array<{ narratorId: string }>;
+	const narratorsInSubtree = narratorRows.map(normalizeNarratorCleanupRecord);
 	return {
-		narrators: narratorRows.map(normalizeNarratorCleanupRecord),
+		narrators: narratorsInSubtree,
 		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
+		liveTeamIds: listTeamsWithLiveWork(coordinatorIdsOf(narratorsInSubtree)),
 	};
 }
 
@@ -427,6 +440,7 @@ function isCleanupRootStillEligible(
 	const [latest] = buildNarratorCleanupPlan(sessionPlan.target, context.narrators, {
 		staleCutoffIso: sessionPlan.staleCutoffIso,
 		runningTerminalIds: context.runningTerminalIds,
+		liveTeamIds: context.liveTeamIds,
 		rootNarratorIds: new Set([root.rootNarratorId]),
 	}).safeRoots;
 	if (!latest) return false;
@@ -494,6 +508,7 @@ function planSessionCleanup(
 	const plan = buildNarratorCleanupPlan(target, context.narrators, {
 		staleCutoffIso,
 		runningTerminalIds: context.runningTerminalIds,
+		liveTeamIds: context.liveTeamIds,
 	});
 	return { target, normalizedDays, staleCutoffIso, plan };
 }
@@ -769,10 +784,12 @@ async function measureCleanupCandidatesOffThread(
 	const cleanupContext = await loadCleanupNarratorContext();
 	const archivedPlan = buildNarratorCleanupPlan("archivedSessions", cleanupContext.narrators, {
 		runningTerminalIds: cleanupContext.runningTerminalIds,
+		liveTeamIds: cleanupContext.liveTeamIds,
 	});
 	const stalePlan = buildNarratorCleanupPlan("staleSessions", cleanupContext.narrators, {
 		staleCutoffIso: getCutoffIso(DEFAULT_STALE_SESSION_DAYS),
 		runningTerminalIds: cleanupContext.runningTerminalIds,
+		liveTeamIds: cleanupContext.liveTeamIds,
 	});
 	const archivedNarratorIds = [
 		...new Set(archivedPlan.safeRoots.flatMap((root) => root.deletedNarratorIds)),
@@ -892,6 +909,8 @@ export const databaseCleanupService = {
 				let preview: DatabaseCleanupPreviewResult;
 				let changed = false;
 				let skippedSessions = 0;
+				// Coordinators that gained live team work after the re-check below: kept, as blocked.
+				let teamBlockedSessions = 0;
 
 				if (target === "toolCallPayloads") {
 					preview = await buildToolCallPayloadPreview(
@@ -927,8 +946,23 @@ export const databaseCleanupService = {
 							skippedSessions++;
 							continue;
 						}
-						await narratorService.remove(root.rootNarratorId);
+						try {
+							await narratorService.remove(root.rootNarratorId);
+						} catch (error) {
+							// A work item may be added between the re-check and the delete; the
+							// refusal keeps that coordinator, the rest of the cleanup goes on.
+							if (!(error instanceof AppError) || error.code !== "TEAM_HAS_LIVE_WORK") throw error;
+							teamBlockedSessions++;
+							continue;
+						}
 						changed = true;
+					}
+					if (teamBlockedSessions > 0) {
+						preview = { ...preview, blockedCount: preview.blockedCount + teamBlockedSessions };
+						logger.warn("Database cleanup kept team coordinators that gained live work", {
+							target,
+							teamBlockedSessions,
+						});
 					}
 					if (skippedSessions > 0) {
 						logger.warn("Database cleanup skipped sessions that changed after planning", {

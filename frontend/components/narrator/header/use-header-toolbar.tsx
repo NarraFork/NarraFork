@@ -9,16 +9,19 @@ import {
 } from "react";
 import type { NarratorToolbarEntry } from "../../../hooks/narrator-toolbar-layout";
 import { useNarratorToolbarLayout } from "../../../hooks/useNarratorToolbarLayout";
+import type { WorkspaceDirectoryMap } from "../../../lib/api/narrators";
 import {
 	PluginContributionOptions,
 	type PluginContributionPick,
 } from "../../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../../plugins/PluginUiSurfaceContext";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
+import type { PendingMutate } from "../interaction/mutate";
 import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import { NarratorLodOptions } from "../lod/NarratorLodMenu";
 import type { RenderLod } from "../lod/RenderLodCtx";
 import type { MobileToolPanelKind } from "../MobileToolPanelHost";
+import type { ExecutionDeviceOption } from "../model/ExecutionDeviceMenu";
 import { ExecutionDeviceOptions } from "../model/ExecutionDeviceMenu";
 import type {
 	NarratorToolbarHost,
@@ -26,10 +29,13 @@ import type {
 	NarratorToolbarItemDef,
 } from "./narrator-toolbar-items";
 
-// biome-ignore lint/suspicious/noExplicitAny: react-query result passthrough from NarratorPanel.
-type QueryLike = any;
-// biome-ignore lint/suspicious/noExplicitAny: react-query mutation passthrough from NarratorPanel.
-type MutationLike = any;
+interface ExecutionDevicesQuery {
+	data?: {
+		devices: readonly ExecutionDeviceOption[];
+		directories?: WorkspaceDirectoryMap;
+		defaultDeviceId?: string | null;
+	};
+}
 
 export interface UseHeaderToolbarOptions {
 	narratorId: string;
@@ -47,7 +53,7 @@ export interface UseHeaderToolbarOptions {
 	terminalToolAvailable: boolean;
 	onOpenTerminalPanel: (() => void) | undefined;
 	browserSessionsSupported: boolean | undefined;
-	executionDevicesQuery: QueryLike;
+	executionDevicesQuery: ExecutionDevicesQuery;
 
 	// Active-state inputs.
 	mobileTasksOpen: boolean;
@@ -64,7 +70,7 @@ export interface UseHeaderToolbarOptions {
 	toggleSpecTool: () => void;
 
 	// Inline options (self-contained entries).
-	updateExecutionDeviceMutation: MutationLike;
+	updateExecutionDeviceMutation: PendingMutate<string | null>;
 	/**
 	 * Ask for a device's working directory instead of switching to an unconfigured one.
 	 * The dialog itself is mounted by the panel, outside these menus.
