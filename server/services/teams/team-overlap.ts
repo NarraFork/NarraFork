@@ -251,8 +251,13 @@ export function describeHolderFor(viewerTeamId: string, holder: ExclusiveHolder)
 
 /** Whether an error is the exclusive lock's unique index refusing a second holder. */
 export function isExclusiveConflict(error: unknown): boolean {
-	const text = error instanceof Error ? error.message : String(error);
-	return /UNIQUE constraint failed/i.test(text) && text.includes("exclusive_key");
+	// The driver's error may arrive wrapped by the query builder: look down the cause chain.
+	for (let current = error, depth = 0; current && depth < 5; depth++) {
+		const text = current instanceof Error ? current.message : String(current);
+		if (/UNIQUE constraint failed/i.test(text) && text.includes("exclusive_key")) return true;
+		current = current instanceof Error ? current.cause : undefined;
+	}
+	return false;
 }
 
 /**
@@ -484,7 +489,6 @@ const job = hotSafe("narrafork.teams.overlap", () => ({
 	/** Items to look at first (their worker's run just ended). */
 	pending: new Set<string>(),
 	running: null as Promise<BatchResult> | null,
-	rerun: false,
 	stop: null as (() => void) | null,
 	indexes: new Map<string, OverlapIndex>(),
 	computing: new Map<string, Promise<OverlapIndex>>(),
@@ -512,7 +516,6 @@ export function resetOverlapStateForTests(): void {
 	job.stale.clear();
 	job.lastNoticeAt.clear();
 	job.queuedNotices.clear();
-	job.rerun = false;
 }
 
 /** The pass's resume point (tests). */
@@ -540,21 +543,19 @@ export interface BatchResult {
  * One background pass: the items whose worker just ended a run, then the next items after the
  * cursor, together at most {@link TEAM_CHANGED_PATHS_BATCH}; then the overlaps of the projects
  * whose stored paths changed, their new cross-team pairs, and the notices due. One pass at a
- * time: a call while one runs asks for one more pass after it and shares its result.
+ * time: a call while one runs shares its result; items queued meanwhile get one more pass.
  */
 export function runChangedPathsPass(): Promise<BatchResult> {
-	if (job.running) {
-		job.rerun = true;
-		return job.running;
-	}
+	if (job.running) return job.running;
 	const run = (async () => {
 		try {
 			return await passOnce();
 		} finally {
 			job.running = null;
-			if (job.rerun) {
-				job.rerun = false;
-				void runChangedPathsPass();
+			if (job.pending.size > 0) {
+				void runChangedPathsPass().catch((error) =>
+					logger.warn("Team changed paths pass failed", { error: String(error) }),
+				);
 			}
 		}
 	})();

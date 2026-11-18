@@ -270,6 +270,12 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 |---|---|---|---|
 | `team_checkin` | `prose` | `wakeIfIdle` | 自检到点（5 分钟到 1 天；每个 team 最多一个待发，新排的替换旧的；排定和触发各记一条 `team.checkin` 事件，重启或取消归档后按事件重排，已过点的立即触发；协调者归档或删除时取消，到点时 team 不再活跃就不唤醒；这一轮以排定它的人为执行身份 `executionPrincipal`） |
 
+**团队重叠**（`server/services/teams/team-overlap.ts`，Project Teams X）：后台按工作项的改动路径（`changed_paths_json`）比出跨 team 的重叠，新出现的一对写一行：
+
+| source | body kind | schedule | 触发 |
+|---|---|---|---|
+| `team_overlap` | `prose` | `wakeIfIdle` | 两个 team 的未结束工作项第一次改到同一文件（或按顶层目录比较时同一目录）：每对只记一次（两边各一条 `work.overlap` 事件，重启后按事件去重），两边协调者各收一行；每个协调者最多每 10 分钟一行，期间新出现的攒到下一行；team 不再活跃就不写。没有人的执行身份（系统唤醒）。别的 team 的名字和工作项标题只在「能读这个协调者的人都能读那个协调者」时写出，否则写「另一个 team 的工作项」。团队状态（`team_status`）里同时有重叠和独占锁一节（有内容才出现，最多 10 行） |
+
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 
 loop 自己抬起的提醒进 `pendingLoopInjections` 队列，在 turn 边界由 `flushLoopInjections()` 经宿主的 `deliverInjectionRow` 钩子落库：
