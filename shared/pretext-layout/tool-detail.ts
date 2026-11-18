@@ -2431,12 +2431,14 @@ function webSearchPhase(
 		if (failed) return "failed";
 		return status === "success" ? "ready" : "pending";
 	}
-	if (webSearchEventHasResult(parsed)) return "ready";
-	if (failed || webSearchEventFailed(parsed)) return "failed";
+	const record = asObject(parsed);
+	if (!record) return "ready";
+	if (webSearchEventHasResult(record)) return "ready";
+	if (failed || webSearchEventFailed(record)) return "failed";
 	if (status === "success") return "ready";
-	if ("results" in parsed && parsed.results == null) return "pending";
-	if (Object.keys(parsed).every((key) => key.startsWith("_"))) return "pending";
-	if (isInFlightSearchEvent(parsed)) return "pending";
+	if ("results" in record && record.results == null) return "pending";
+	if (Object.keys(record).every((key) => key.startsWith("_"))) return "pending";
+	if (isInFlightSearchEvent(record)) return "pending";
 	return "ready";
 }
 
