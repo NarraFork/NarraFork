@@ -37,6 +37,7 @@ import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/
 import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
 import { buildSkillsContext } from "../../lib/agent/tools/skill";
 import { buildSubagentModelContext } from "../../lib/agent/tools/task";
+import { TEAM_TOOL_NAME } from "../../lib/agent/tools/team";
 import type { ToolDefinition } from "../../lib/agent/types";
 import { buildAttachedFilesHint } from "../../lib/attached-files";
 import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/boolean-override";
@@ -64,6 +65,7 @@ import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import {
 	getBotModePrompt,
 	getRunDeliveryHint,
+	getTeamBriefSection,
 	getTeamLeadPrompt,
 	getToolMessage,
 	getToolMessageWithParams,
@@ -353,12 +355,17 @@ export function runtimeBasePrompt(
 	row: RuntimeSourceRow & { systemPrompt: string | null; traits?: unknown },
 	locale: Locale,
 	policy: RuntimePolicy,
+	/** A team subagent's team brief (`teamBriefForSubagent`), read for this request. */
+	teamBrief?: string | null,
 ): string | null {
 	const base = row.systemPrompt ?? settings.agent.defaultSystemPrompt ?? null;
 	const sections: string[] = [];
 	if (isBotNarrator(row.traits)) sections.push(getBotModePrompt(locale));
 	// A team coordinator's duties are a protocol like the bot's: after its own prompt.
 	if (isTeamNarrator(row.traits)) sections.push(getTeamLeadPrompt(locale));
+	// The team's shared rules follow every team subagent's own prompt (both levels).
+	const brief = getTeamBriefSection(locale, teamBrief ?? null);
+	if (brief) sections.push(brief);
 	const deliverTo = runDeliverToOf(row);
 	if (deliverTo) {
 		const run = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
@@ -1161,6 +1168,8 @@ export async function runAgentLoopUnlocked(
 				// Reflection decisions must exist in the parent's immutable declaration set.
 				if (tool.reflectionOnly) return true;
 				if (tool.isAvailable && !tool.isAvailable()) return false;
+				// The Team tool is a coordinator's own: offered to team-trait primaries only.
+				if (tool.name === TEAM_TOOL_NAME && !teamCoordinator) return false;
 				if (!profileToolFilter(tool)) return false;
 				if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
 				if (active._disabledTools.has(tool.name)) return false;
@@ -1329,7 +1338,12 @@ export async function runAgentLoopUnlocked(
 					{
 						systemPrompt: currentOAuth
 							? (currentOAuth.systemPrompt ?? null)
-							: runtimeBasePrompt(current, locale, runtimePolicy),
+							: runtimeBasePrompt(
+									current,
+									locale,
+									runtimePolicy,
+									(await import("../teams/team-membership")).teamBriefForSubagent(current),
+								),
 						contextSummary: current.contextSummary,
 					},
 					active.cwd,

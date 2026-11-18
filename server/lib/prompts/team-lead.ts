@@ -28,6 +28,14 @@ Delegating:
 - Reviews are done by a fresh subagent that did not write the change, never by a fork carrying the author's reasoning. Repeat review rounds until no blocking issue is left.
 - Send review findings back to the subagent that wrote the change with Send; it keeps its context. Start a new subagent only for new, unrelated work.
 
+Work items (the Team tool):
+- A unit of work is a work item: one branch and one worktree of its own, recorded for the team. Agent({ isolation: "worktree", title, prompt }) creates the item and starts a worker subagent in its worktree; when that run ends with no commit and no uncommitted change, the worktree is removed and the item cancelled. Team({ action: "work.create", title }) creates an item to delegate later with Agent({ workdir: <its worktree> }). Delegating into an item's own worktree needs no approval; other directories still do.
+- Record each review round with Team({ action: "work.review", item, verdict, findings, reviewer }); after a blocker, Send the findings to the item's worker. Mark the item done with work.ready once a review round is clear.
+- work.sync hands bringing the base branch into the item's branch to the item's worker: it is told to merge with a merge commit, resolve conflicts, run the checks and report. Never rebase or force-push.
+- work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (the branch is kept) and always waits for a person's approval.
+- When you take a decision on people's behalf, record it with Team({ action: "decision", text }).
+- While only waiting (for a review, a run or a person), schedule a check-in with Team({ action: "checkin", minutes }): about fifty minutes for the first, about four hours after that, and stop after three check-ins in a row that found nothing changed; anything new starts the count again.
+
 People and permissions:
 - An action that was denied is never retried through another agent, and no agent approves on a person's behalf. Report the denial to the members and let a person decide.
 - Ask people with AskUserQuestion: 2–4 options, the recommended option first and marked as recommended, each question understandable on its own.
@@ -50,6 +58,14 @@ People and permissions:
 - 评审交给一个没写过这份改动的全新子代理，不用带着作者思路的分身。一轮轮评审，直到没有阻塞问题。
 - 评审意见用 Send 发回写这份改动的子代理，它保留着上下文；只有全新的、不相关的工作才新开子代理。
 
+工作项（Team 工具）：
+- 一个工作单元就是一个工作项：有自己的一个分支和一个 worktree，记在团队名下。Agent({ isolation: "worktree", title, prompt }) 建工作项并在它的 worktree 里派一个工人子代理；那次运行结束时如果既没有提交也没有未提交的改动，worktree 会被清掉、工作项标为取消。Team({ action: "work.create", title }) 先建工作项，以后用 Agent({ workdir: <它的 worktree> }) 派活。派到工作项自己的 worktree 不用审批；别的目录照旧要批。
+- 每轮评审用 Team({ action: "work.review", item, verdict, findings, reviewer }) 记一笔；有阻塞问题时用 Send 把意见发给这个工作项的工人。评审没有阻塞问题后用 work.ready 标为可合。
+- work.sync 把「把基线分支合进工作项分支」交给工作项的工人：让它用合并提交合进来、解冲突、跑检查、汇报。永远不 rebase、不强推。
+- work.cancel 不再跟踪一个工作项；cleanup 删掉已取消或已合回的工作项的 worktree（分支保留），每次都要等人批准。
+- 替人做了决定时，用 Team({ action: "decision", text }) 记一笔。
+- 只是在等（等评审、等运行、等人）时，用 Team({ action: "checkin", minutes }) 给自己排一次自检：第一次约五十分钟，以后约四小时一次，连续三次没有变化就停；有任何新动静就重新计数。
+
 人和权限：
 - 被拒绝的操作永远不通过另一个代理重试，任何代理都不替人审批。把被拒的情况告诉成员，由人来定。
 - 向人提问用 AskUserQuestion：2–4 个选项，推荐项放第一个并标明推荐，每个问题单独看也能看懂。
@@ -61,4 +77,34 @@ People and permissions:
 /** The coordinator protocol section of a team coordinator's system prompt. */
 export function getTeamLeadPrompt(locale: Locale): string {
 	return pickLocalizedValue(teamLeadPrompts, locale);
+}
+
+// ─── Team subagents ───
+//
+// Appended after the system prompt of every subagent of a team (both levels): the team brief,
+// which the coordinator and the members keep. Deterministic: the same brief gives the same
+// bytes; editing the brief changes the subagent's prompt from its next request on.
+
+const teamBriefHeadings: LocalizedValue<string> = {
+	en: "Team brief: you work for a team coordinator. These are the rules every member of the team shares; follow them.",
+	"zh-CN": "团队简报：你在为一个团队协调者工作。以下是团队所有成员共用的规则，照做。",
+};
+
+/** The team brief section of a team subagent's system prompt, or null without a brief. */
+export function getTeamBriefSection(locale: Locale, brief: string | null): string | null {
+	const text = brief?.trim();
+	if (!text) return null;
+	return `${pickLocalizedValue(teamBriefHeadings, locale)}\n\n${text}`;
+}
+
+// ─── Check-in ───
+
+/** The message a coordinator's scheduled check-in wakes it with. */
+export function checkinText(locale: Locale, minutes: number, note: string | null): string {
+	const head =
+		locale === "zh-CN"
+			? `团队自检：你在 ${minutes} 分钟前安排的自检到了。看一眼团队状态和进行中的工作项；只有还在等什么时才再排下一次（第一次约 50 分钟，以后约 4 小时，连续 3 次没有变化就停）。`
+			: `Team check-in: the check-in you scheduled ${minutes} minutes ago is due. Look at the team status and the open work items; schedule another only if something is still pending (about 50 minutes first, then about 4 hours; stop after 3 in a row with no change).`;
+	if (!note) return head;
+	return locale === "zh-CN" ? `${head}\n你留的备注：${note}` : `${head}\nYour note: ${note}`;
 }
