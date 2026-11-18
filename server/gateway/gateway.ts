@@ -381,6 +381,8 @@ class Gateway {
 
 		// Send typing indicator
 		const adapter = this.adapters.get(msg.platform);
+		// A team session is never driven from IM (M1): see refuseTeamSession.
+		if (adapter && (await this.refuseTeamSession(mapping.narratorId, msg, adapter))) return;
 		if (adapter) {
 			adapter.sendTyping(msg.chatId).catch(() => {});
 		}
@@ -935,6 +937,23 @@ class Gateway {
 	}
 
 	/**
+	 * A session of a team tree (a coordinator or one of its subagents) is never used from IM (M1):
+	 * no messages, no /stop, no /model, nothing that drives it. The IM sender has no proven
+	 * NarraFork identity, and anything it sent would be attributed to the auto-resolved account,
+	 * corrupting who said what in a conversation several people share. The chat is told to use
+	 * NarraFork. Returns true when refused (the reply is already sent).
+	 */
+	private async refuseTeamSession(
+		narratorId: string,
+		msg: InboundMessage,
+		adapter: PlatformAdapter,
+	): Promise<boolean> {
+		if (!teamIdOfNarrator(narratorId)) return false;
+		await adapter.send(msg.chatId, t("gateway.teamSessionRefused", await this.resolveLocale(msg)));
+		return true;
+	}
+
+	/**
 	 * Extract the user's own text from a reply message, ignoring the quoted part.
 	 * Falls back to msg.text if raw parsing fails.
 	 */
@@ -1065,6 +1084,17 @@ class Gateway {
 					const toolName = typeof req.toolName === "string" ? req.toolName : "unknown";
 					const inputJson = req.inputJson as Record<string, unknown> | undefined;
 					const summary = this.formatToolSummary(toolName, inputJson);
+					// A team call is decided only in NarraFork (M1): no /approve invitation and no
+					// [perm:id] tag a quote reply could act on.
+					if (teamIdOfNarrator(event.narratorId)) {
+						await adapter
+							.send(
+								mapping.chatId,
+								t("gateway.teamPermissionRequest", locale, { toolName, summary }),
+							)
+							.catch(() => {});
+						return;
+					}
 					const text = `${t("gateway.permissionRequest", locale, {
 						toolName,
 						summary,
@@ -1345,6 +1375,7 @@ class Gateway {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 					break;
 				}
+				if (await this.refuseTeamSession(mapping.narratorId, msg, adapter)) break;
 
 				if (!command.args) {
 					// Show current model
@@ -1420,6 +1451,7 @@ class Gateway {
 						eq(gatewaySessionMappings.userId, msg.userId),
 					),
 				});
+				if (mapping && (await this.refuseTeamSession(mapping.narratorId, msg, adapter))) break;
 				if (mapping) {
 					// Clean up stream consumer
 					this.cleanupStreamConsumer(mapping.narratorId);
@@ -1745,6 +1777,11 @@ class Gateway {
 
 		if (!narrator) {
 			await adapter.send(msg.chatId, t("gateway.narratorNotFound", locale, { id: trimmed }));
+			return;
+		}
+		// Listed, but not switched to: a team session can only be used from NarraFork (M1).
+		if (teamIdOfNarrator(narrator.id)) {
+			await adapter.send(msg.chatId, t("gateway.teamSessionRefused", locale));
 			return;
 		}
 
