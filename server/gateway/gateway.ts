@@ -381,8 +381,12 @@ class Gateway {
 
 		// Send typing indicator
 		const adapter = this.adapters.get(msg.platform);
-		// A team session is never driven from IM (M1): see refuseTeamSession.
-		if (adapter && (await this.refuseTeamSession(mapping.narratorId, msg, adapter))) return;
+		// A team session is never driven from IM (M1): see refuseTeamSession. Checked before the
+		// adapter: refused whether or not the reply can be sent.
+		if (teamIdOfNarrator(mapping.narratorId)) {
+			if (adapter) await this.refuseTeamSession(mapping.narratorId, msg, adapter);
+			return;
+		}
 		if (adapter) {
 			adapter.sendTyping(msg.chatId).catch(() => {});
 		}
@@ -974,10 +978,22 @@ class Gateway {
 		return msg.text.trim();
 	}
 
+	/**
+	 * Nothing of a team session (a coordinator or one of its subagents) goes out to IM (M1): no
+	 * replies, no stream, no tool or permission messages, no errors, no recent-tab status pings.
+	 * IM neither drives nor reads team sessions; a chat bound to one (a mapping from before M1)
+	 * hears "use NarraFork" on its next message. The members-only "waiting" alert of
+	 * `notification-service.ts` is the one IM alert a team session sends.
+	 */
+	private isTeamSession(narratorId: string): boolean {
+		return !!teamIdOfNarrator(narratorId);
+	}
+
 	private subscribeToEvents(): void {
 		// Listen for narrator status changes — deliver the final assistant
 		// message only when the narrator becomes idle (turn complete).
 		eventBus.on("narrator:status_changed", async (event) => {
+			if (this.isTeamSession(event.narratorId)) return;
 			// Handle the directly-bound narrator (deliver response on idle)
 			if (event.status === "idle") {
 				const consumer = this.streamConsumers.get(event.narratorId);
@@ -1005,11 +1021,13 @@ class Gateway {
 			// after the last background task emits a fresh unflagged "done".
 			// The reason check is defensive — the flag is only produced for done.
 			if (event.backgroundWorkActive && event.reason === "done") return;
+			if (this.isTeamSession(event.narratorId)) return;
 			await this.notifyRecentTabStatusChange(event.narratorId, event.reason);
 		});
 
 		// Listen for all narrator broadcasts — tool calls, permission requests, stream deltas
 		eventBus.on("narrator:message_broadcast", async (event) => {
+			if (this.isTeamSession(event.narratorId)) return;
 			const msg = event.message;
 
 			// --- Stream consumer: text deltas ---
@@ -1084,17 +1102,6 @@ class Gateway {
 					const toolName = typeof req.toolName === "string" ? req.toolName : "unknown";
 					const inputJson = req.inputJson as Record<string, unknown> | undefined;
 					const summary = this.formatToolSummary(toolName, inputJson);
-					// A team call is decided only in NarraFork (M1): no /approve invitation and no
-					// [perm:id] tag a quote reply could act on.
-					if (teamIdOfNarrator(event.narratorId)) {
-						await adapter
-							.send(
-								mapping.chatId,
-								t("gateway.teamPermissionRequest", locale, { toolName, summary }),
-							)
-							.catch(() => {});
-						return;
-					}
 					const text = `${t("gateway.permissionRequest", locale, {
 						toolName,
 						summary,
@@ -1134,6 +1141,7 @@ class Gateway {
 		eventBus.on("narrator:error", async (event) => {
 			// Clean up stream consumer
 			this.cleanupStreamConsumer(event.narratorId);
+			if (this.isTeamSession(event.narratorId)) return;
 
 			const mapping = await this.findMappingByNarrator(event.narratorId);
 			if (!mapping) return;
@@ -1153,6 +1161,7 @@ class Gateway {
 		// If messages were already delivered via message_broadcast (non-streaming),
 		// skip the final delivery to avoid duplicates.
 		if (this.deliveredNarrators.delete(narratorId)) return;
+		if (this.isTeamSession(narratorId)) return;
 
 		const mapping = await this.findMappingByNarrator(narratorId);
 		if (!mapping) return; // Not an IM-bound narrator
@@ -1213,6 +1222,7 @@ class Gateway {
 		reason: "waiting_permission" | "done" | "error",
 	): Promise<void> {
 		if (this.adapters.size === 0) return;
+		if (this.isTeamSession(narratorId)) return;
 
 		const relevantUserIds = await getRecentTabUserIdsForNarrator(narratorId);
 		if (relevantUserIds.length === 0) return;
@@ -1779,11 +1789,6 @@ class Gateway {
 			await adapter.send(msg.chatId, t("gateway.narratorNotFound", locale, { id: trimmed }));
 			return;
 		}
-		// Listed, but not switched to: a team session can only be used from NarraFork (M1).
-		if (teamIdOfNarrator(narrator.id)) {
-			await adapter.send(msg.chatId, t("gateway.teamSessionRefused", locale));
-			return;
-		}
 
 		// Ownership check: if the gateway has a default project, only allow
 		// switching to narrators that belong to that project.
@@ -1794,6 +1799,12 @@ class Gateway {
 			narrator.contextProjectId !== defaultProjectId
 		) {
 			await adapter.send(msg.chatId, t("gateway.narratorWrongProject", locale));
+			return;
+		}
+		// Listed, but not switched to: a team session can only be used from NarraFork (M1). After
+		// the project check, so a sender cannot probe which ids outside its project are teams.
+		if (teamIdOfNarrator(narrator.id)) {
+			await adapter.send(msg.chatId, t("gateway.teamSessionRefused", locale));
 			return;
 		}
 
