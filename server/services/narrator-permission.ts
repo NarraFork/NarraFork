@@ -113,7 +113,7 @@ import { isTeamMember, type RuntimeSourceRow, teamRootOf } from "../lib/runtime-
 import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import type { RuntimePolicy } from "./agent-runtime/policy";
+import { isBrowserReadAction, type RuntimePolicy } from "./agent-runtime/policy";
 import { isRuntimeToolNameAllowed } from "./subagent-tools";
 import {
 	describeTeamCleanup,
@@ -846,6 +846,11 @@ export function resolvePermissionDecision(
 		if (meta) meta.blacklistReason = `Review mode: ${toolName} modifies worktree resources.`;
 		return "deny";
 	}
+	// A reviewer may look at pages, never act on them (see `isBrowserReadAction`).
+	if (reviewReadOnlyBash && toolName === "Browser" && !isBrowserReadAction(input)) {
+		if (meta) meta.blacklistReason = REVIEW_BROWSER_READ_ONLY_REASON;
+		return "deny";
+	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
@@ -1432,6 +1437,12 @@ function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boole
 	if (toolName === TEAM_TOOL_NAME) return isTeamReadAction(input);
 	return toolName === "StructSed" && input.dry_run !== false;
 }
+
+/** Why a reviewer's Browser call that does more than read a page is refused. */
+export const REVIEW_BROWSER_READ_ONLY_REASON =
+	"Review mode: Browser may only read pages (launch headless, navigate, screenshot without " +
+	"file_path, get_text, dom, scroll, close, ...). Clicking, typing, filling forms, running " +
+	"scripts and profiling are not available to a read-only reviewer.";
 
 /** File tools whose writes inside a team work item's worktree need no person (P3). */
 const TEAM_WORKTREE_FILE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
@@ -5228,7 +5239,8 @@ export async function recheckFinalToolExecutionPermission(
 			(["GenUI", "Notification", "ScheduledTask", "Worktree", TEAM_TOOL_NAME].includes(
 				check.toolName,
 			) &&
-				!isReadOnlyCall(check.toolName, check.input)))
+				!isReadOnlyCall(check.toolName, check.input)) ||
+			(check.toolName === "Browser" && !isBrowserReadAction(check.input)))
 	)
 		finalPermissionDeny("read-only capability ceiling");
 	const sendInScope =

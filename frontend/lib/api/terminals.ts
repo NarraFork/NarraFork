@@ -1,10 +1,39 @@
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
+export interface TreeTerminal {
+	id: string;
+	name: string;
+	cwd: string | null;
+	createdAt: string;
+	narratorId: string;
+	narratorTitle: string | null;
+	subagentType: string | null;
+}
+
+export interface TreeTerminalListing {
+	terminals: TreeTerminal[];
+	truncated: boolean;
+	canOpen: boolean;
+}
+
 export const terminalsApi = {
 	listTerminalsByNarrator: (narratorId: string) => {
 		const params = new URLSearchParams({ narratorId });
 		return request<ApiEntity[]>(`/terminals?${params}`);
+	},
+	/**
+	 * Running terminals of the subagents below a narrator (read-only list). `canOpen` is
+	 * whether this user may open them: write access on the session's root.
+	 */
+	listTreeTerminals: (narratorId: string) => {
+		const params = new URLSearchParams({ narratorId });
+		return request<TreeTerminalListing>(`/terminals/tree?${params}`);
+	},
+	/** Whether the current user may open this narrator's terminals (write access). */
+	getTerminalAccess: (narratorId: string) => {
+		const params = new URLSearchParams({ narratorId });
+		return request<{ canOpen: boolean }>(`/terminals/access?${params}`);
 	},
 	createTerminal: (data: {
 		narratorId?: string;

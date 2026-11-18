@@ -76,7 +76,7 @@ import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorContainerBrowserToolAutoEnableCapability,
 } from "../../../hooks/usePlatform";
-import { useNarratorTerminals } from "../../../hooks/useTerminals";
+import { useNarratorTerminals, useTreeTerminals } from "../../../hooks/useTerminals";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
 import type {
@@ -130,6 +130,7 @@ import {
 } from "./details-panel-sections";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorGitIdentitySelect } from "./NarratorGitIdentitySelect";
+import { SubagentTerminalsList } from "./SubagentTerminalsList";
 import { TurnRangeInput } from "./TurnRangeInput";
 import { TurnRangePickerModal } from "./TurnRangePickerModal";
 import {
@@ -434,6 +435,7 @@ function NarratorDetailsContent({
 		opened && browserSessionsSupported ? narratorId : "",
 	);
 	const { data: terminals } = useNarratorTerminals(opened ? narratorId : "");
+	const { data: treeTerminals } = useTreeTerminals(opened ? narratorId : "");
 	const { data: pendingPermissions } = usePermissions(opened ? narratorId : "");
 	const { data: whitelistDirs } = useWhitelistDirs(opened ? narratorId : "");
 	const { data: blacklistDirs } = useBlacklistDirs(opened ? narratorId : "");
@@ -2047,6 +2049,7 @@ function NarratorDetailsContent({
 					searchableText={[
 						t("details.viewerNames"),
 						t("details.browserSessions"),
+						t("details.subagentTerminals"),
 						t("details.pendingPermissions"),
 					]}
 				>
@@ -2110,6 +2113,24 @@ function NarratorDetailsContent({
 							)
 						}
 					/>
+
+					{/* Subagents' terminals, read-only; a subagent shows its helpers' only when it has any. */}
+					{treeTerminals &&
+					(narrator?.type !== "subagent" || treeTerminals.terminals.length > 0) ? (
+						<DetailRow
+							label={t("details.subagentTerminals")}
+							value={
+								<SubagentTerminalsList
+									terminals={treeTerminals.terminals}
+									truncated={treeTerminals.truncated}
+									canOpen={treeTerminals.canOpen}
+									onOpenSession={(id) =>
+										void navigate({ to: "/narrators/$narratorId", params: { narratorId: id } })
+									}
+								/>
+							}
+						/>
+					) : null}
 
 					{browserToolAutoEnableDefaultOff && (
 						<DetailRow

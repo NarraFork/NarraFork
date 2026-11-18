@@ -9,7 +9,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { authSessions, users } from "../../db/schema";
+import { authSessions, narrators, terminals, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 
 const { db, sqlite } = getTestDb();
@@ -128,6 +128,48 @@ describe("revalidateSessionSockets", () => {
 
 		expect(socket.close).not.toHaveBeenCalled();
 		expect((socket.ws.data as { userRole: string }).userRole).toBe("user");
+	});
+
+	test("refreshes the live role on terminal sockets and drops what it no longer opens", async () => {
+		const adminId = await makeUser("admin");
+		const ownerId = await makeUser("user");
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "private-session",
+			ownerUserId: ownerId,
+			visibility: "private",
+			writeAudience: "owner",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await db.insert(terminals).values({
+			id: "owner-shell",
+			narratorId: "private-session",
+			name: "shell",
+			status: "running",
+			createdAt: now,
+		});
+		const session = await verifyToken(await createToken(adminId));
+		const sent: Array<{ type: string; code?: string }> = [];
+		const socket = terminalSocket(adminId, session.sid as string, session.exp);
+		Object.assign(socket.ws, { send: (payload: string) => sent.push(JSON.parse(payload)) });
+		const data = socket.ws.data as { userRole?: string; subscribedTerminals: Set<string> };
+		data.userRole = "admin";
+		data.subscribedTerminals.add("owner-shell");
+
+		// Still an admin: the subscription stays.
+		await revalidateSessionSockets([socket.ws]);
+		expect(data.subscribedTerminals.has("owner-shell")).toBe(true);
+
+		await db.update(users).set({ role: "user" }).where(eq(users.id, adminId));
+		await revalidateSessionSockets([socket.ws]);
+
+		expect(socket.close).not.toHaveBeenCalled();
+		expect(data.userRole).toBe("user");
+		expect(data.subscribedTerminals.has("owner-shell")).toBe(false);
+		expect(sent).toContainEqual(
+			expect.objectContaining({ type: "error", code: "TERMINAL_NOT_FOUND" }),
+		);
 	});
 
 	test("an expired session closes the socket", async () => {

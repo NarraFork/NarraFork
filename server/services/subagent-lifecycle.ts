@@ -62,11 +62,15 @@ export async function interruptAndArchiveSubagent(
 			// closeNarrator is best-effort.
 		}
 
+		// An archived subagent has no driver: what it left running is closed with it.
+		const { closeSubagentResources } = await import("./subagent-resources");
 		if (narrator.status === "archived") {
+			await closeSubagentResources(narrator.id);
 			return { ...base, ok: true, alreadyArchived: true, interrupted };
 		}
 		await giveBackDelegatedTask(narrator);
 		await narratorService.updateStatus(narrator.id, "archived");
+		await closeSubagentResources(narrator.id);
 		return { ok: true, alreadyArchived: false, archived: true, interrupted, id: narrator.id };
 	} catch (err) {
 		logger.warn("interruptAndArchiveSubagent failed", {
