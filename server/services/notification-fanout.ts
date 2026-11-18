@@ -278,35 +278,38 @@ async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[
 	return allowed;
 }
 
+/** Candidates of each source the team's people list looks at for one notification. */
+const TEAM_NOTIFY_CANDIDATES = 50;
+
 /**
  * Recipients of a call waiting in a team tree (M1): the team's members only. A call of the
  * team's tree waits for a member, and only members (write access on the coordinator) may decide
- * it, so onlookers are not told. Candidates are the members the team's people list finds
- * (owner, explicit and project grants, recent speakers) plus recent-tab viewers, each judged by
- * write access on the calling session (a subagent's access is the coordinator's).
+ * it, so onlookers are not told. The members come from the team's people list (owner, explicit
+ * and project grants, recent speakers; each already judged by write access on the coordinator,
+ * which is also the deciding ACL of its subagents); recent-tab viewers are added when they may
+ * write. Bounded: at most {@link TEAM_NOTIFY_CANDIDATES} candidates per source and
+ * {@link NOTIFICATION_FANOUT_MAX_RECIPIENTS} recipients.
  */
 async function resolveTeamRecipients(teamId: string, row: NarratorAclRow): Promise<string[]> {
-	const candidates = new Set<string>(
-		await readTeamMemberIds(teamId, NOTIFICATION_FANOUT_MAX_RECIPIENTS),
-	);
-	for (const id of await getRecentTabUserIdsForNarrator(row.id, NOTIFICATION_FANOUT_MAX_RECIPIENTS))
-		candidates.add(id);
-	if (candidates.size === 0) return [];
-	const ids = [...candidates].slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS * 2);
-	const admins = new Set(
-		(
-			await db
-				.select({ id: users.id })
-				.from(users)
-				.where(and(eq(users.role, "admin"), inArray(users.id, ids)))
-		).map((u) => u.id),
-	);
-	const allowed: string[] = [];
-	for (const userId of ids) {
-		if (await canWriteNarrator(row, { userId, isAdmin: admins.has(userId) })) allowed.push(userId);
-		if (allowed.length >= NOTIFICATION_FANOUT_MAX_RECIPIENTS) break;
+	const allowed = new Set(await readTeamMemberIds(teamId, TEAM_NOTIFY_CANDIDATES));
+	const tabs = (
+		await getRecentTabUserIdsForNarrator(row.id, NOTIFICATION_FANOUT_MAX_RECIPIENTS)
+	).filter((id) => !allowed.has(id));
+	if (tabs.length > 0) {
+		const admins = new Set(
+			(
+				await db
+					.select({ id: users.id })
+					.from(users)
+					.where(and(eq(users.role, "admin"), inArray(users.id, tabs)))
+			).map((u) => u.id),
+		);
+		for (const userId of tabs) {
+			if (allowed.size >= NOTIFICATION_FANOUT_MAX_RECIPIENTS) break;
+			if (await canWriteNarrator(row, { userId, isAdmin: admins.has(userId) })) allowed.add(userId);
+		}
 	}
-	return allowed;
+	return [...allowed].slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS);
 }
 
 /**

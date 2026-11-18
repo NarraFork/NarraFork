@@ -385,6 +385,55 @@ describe("who decided", () => {
 		]);
 	});
 
+	test("a decision over the WebSocket is recorded too; an onlooker's frame is dropped", async () => {
+		const socket = (userId: string) => {
+			const ws = {
+				data: {
+					channel: "narrator",
+					connectedAt: Date.now(),
+					lastPongAt: Date.now(),
+					userId,
+					userRole: "user",
+					subscribedNarrators: new Set<string>(),
+					catchingUpNarrators: new Map(),
+					catchUpBuffers: new Map(),
+				},
+				getBufferedAmount: () => 0,
+				close: () => {},
+				send: (payload: string) => payload.length,
+			} as unknown as Parameters<typeof handleNarratorWS.open>[0];
+			handleNarratorWS.open(ws);
+			return ws;
+		};
+		const reader = socket(READER);
+		const member = socket(GRANTED);
+		try {
+			const pending = await pendingCall(workerId);
+			await handleNarratorWS.message(reader, {
+				type: "permission_decision",
+				requestId: pending.id,
+				decision: "allow",
+			});
+			expect(pending.decisions).toEqual([]);
+			await handleNarratorWS.message(member, {
+				type: "permission_decision",
+				requestId: pending.id,
+				decision: "deny",
+			});
+			for (let i = 0; i < 100 && pending.decisions.length === 0; i++) await Bun.sleep(5);
+			expect(pending.decisions).toEqual(["deny"]);
+			let recorded: Awaited<ReturnType<typeof personEvents>>[number] | undefined;
+			for (let i = 0; i < 100 && !recorded; i++) {
+				recorded = (await personEvents()).find((event) => event.detail?.requestId === pending.id);
+				if (!recorded) await Bun.sleep(5);
+			}
+			expect(recorded).toMatchObject({ kind: "approval.denied", actorId: GRANTED });
+		} finally {
+			handleNarratorWS.close(reader);
+			handleNarratorWS.close(member);
+		}
+	});
+
 	test("an onlooker or a stranger cannot approve, deny or answer", async () => {
 		const before = (await personEvents()).length;
 		const call1 = await pendingCall(workerId);
