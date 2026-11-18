@@ -6,22 +6,16 @@
  * (the ordinary narrator panel, so members talk to the coordinator exactly as in its session
  * page); right: the board and the activity. Narrow screens get tabs instead.
  */
+
 import { NarratorPanelSkeleton } from "@frontend/components/narrator/NarratorPanelSkeleton";
 import { usePanelCompact } from "@frontend/components/narrator/panels/shared";
-import { ProjectTeamsList } from "@frontend/components/teams/ProjectTeamsList";
-import { TeamActivity } from "@frontend/components/teams/TeamActivity";
-import { TeamBoard } from "@frontend/components/teams/TeamBoard";
-import { TeamTopBar } from "@frontend/components/teams/TeamTopBar";
-import { TeamWorkspace } from "@frontend/components/teams/TeamWorkspace";
+import { TeamPageView } from "@frontend/components/teams/TeamPageView";
 import { useProject } from "@frontend/hooks/useProjects";
-import { useTeam, useTeamSummary } from "@frontend/hooks/useTeams";
 import { lazyWithRetry } from "@frontend/lib/lazy-with-retry";
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "@frontend/lib/safe-area";
-import { ActionIcon, Alert, Box, Skeleton } from "@mantine/core";
-import { IconArrowLeft } from "@tabler/icons-react";
+import { Box } from "@mantine/core";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { memo, Suspense, useCallback } from "react";
-import { useTranslation } from "react-i18next";
 import { NarratorDockContext } from "../../components/narrator/dock/NarratorDockContext";
 
 const NarratorPanel = lazyWithRetry(() =>
@@ -60,12 +54,8 @@ function CoordinatorConversation({
 
 function TeamPage() {
 	const { projectId, teamId } = Route.useParams();
-	const { t } = useTranslation("projects");
 	const navigate = useNavigate();
 	const project = useProject(projectId);
-	const team = useTeam(projectId, teamId);
-	const summary = useTeamSummary(projectId, teamId);
-	const canCreate = !project.isError && project.data?.canWrite === true;
 	const openSession = useCallback(
 		(narratorId: string) => void navigate({ to: "/narrators/$narratorId", params: { narratorId } }),
 		[navigate],
@@ -78,7 +68,6 @@ function TeamPage() {
 			}),
 		[navigate, projectId],
 	);
-	if (team.isError) return <Alert color="red">{t("teams.notFound")}</Alert>;
 	return (
 		<Box
 			h={APP_SHELL_FULL_BLEED_HEIGHT}
@@ -86,45 +75,14 @@ function TeamPage() {
 			my="calc(var(--mantine-spacing-md) * -1)"
 			style={{ overflow: "hidden", display: "flex", flexDirection: "column" }}
 		>
-			<TeamWorkspace
-				topBar={
-					<TeamTopBar
-						projectId={projectId}
-						teamId={teamId}
-						title={team.data?.name ?? <Skeleton height={18} width={140} />}
-						summary={summary.data}
-						onOpenSession={openSession}
-						leading={
-							<ActionIcon
-								variant="subtle"
-								size="sm"
-								aria-label={t("teams.back")}
-								onClick={() => void navigate({ to: "/projects/$projectId", params: { projectId } })}
-							>
-								<IconArrowLeft size={16} />
-							</ActionIcon>
-						}
-					/>
-				}
-				teams={
-					<ProjectTeamsList
-						projectId={projectId}
-						canCreate={canCreate}
-						currentTeamId={teamId}
-						variant="nav"
-						onOpenTeam={openTeam}
-					/>
-				}
+			<TeamPageView
+				projectId={projectId}
+				teamId={teamId}
+				canCreateTeam={!project.isError && project.data?.canWrite === true}
 				conversation={<CoordinatorConversation teamId={teamId} onOpenSession={openSession} />}
-				board={
-					<TeamBoard
-						projectId={projectId}
-						teamId={teamId}
-						summary={summary.data}
-						onOpenSession={openSession}
-					/>
-				}
-				activity={<TeamActivity projectId={projectId} teamId={teamId} />}
+				onOpenSession={openSession}
+				onOpenTeam={openTeam}
+				onBack={() => void navigate({ to: "/projects/$projectId", params: { projectId } })}
 			/>
 		</Box>
 	);

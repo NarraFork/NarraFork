@@ -84,7 +84,7 @@ export function CreateTeamModal({
 						value={baseBranch}
 						maxLength={TEAM_BRANCH_MAX_LENGTH}
 						onChange={(event) => setBaseBranch(event.currentTarget.value)}
-						ff="monospace"
+						styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
 					/>
 					<Textarea
 						label={t("teams.create.brief")}
