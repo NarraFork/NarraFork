@@ -26,6 +26,7 @@ import {
 	pauseNotice,
 	pauseOrder,
 	recentDecisionKey,
+	recentDecisionTextKey,
 	SUMMARY_POLL_MAX_MS,
 	SUMMARY_POLL_MIN_MS,
 	summarySignature,
@@ -272,6 +273,16 @@ describe("people (M1)", () => {
 		expect(recentDecisionKey("question.ignored")).toBe("ignored");
 		expect(recentDecisionKey("question.supplemented")).toBe("supplemented");
 		expect(recentDecisionKey("question.deferred")).toBe("deferred");
+		expect(recentDecisionKey("question.answered_by_ai")).toBe("answeredByAi");
+		expect(recentDecisionTextKey("approval.allowed", "plan")).toBe("allowedPlan");
+		expect(recentDecisionTextKey("approval.denied", "plan")).toBe("deniedPlan");
+		expect(recentDecisionTextKey("approval.denied", "tool")).toBe("denied");
+		expect(
+			eventNote({
+				kind: "approval.allowed",
+				detail: { tool: "ExitPlanMode", approvalKind: "plan", agentTitle: "W", depth: 1 },
+			}),
+		).toEqual({ key: "decisionPlan", values: { agent: "W" } });
 		for (const kind of [
 			"approval.allowed",
 			"approval.denied",
@@ -280,6 +291,7 @@ describe("people (M1)", () => {
 			"question.ignored",
 			"question.supplemented",
 			"question.deferred",
+			"question.answered_by_ai",
 		])
 			expect(eventLabelKey(kind)).toBe(kind.replace(".", "_"));
 		expect(

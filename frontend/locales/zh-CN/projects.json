@@ -237,7 +237,8 @@
 			"question_dismissed": "驳回了提问",
 			"question_ignored": "静默关闭了提问",
 			"question_supplemented": "补充了回答",
-			"question_deferred": "选择稍后回答提问"
+			"question_deferred": "选择稍后回答提问",
+			"question_answered_by_ai": "让 AI 回答了提问"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -252,7 +253,10 @@
 			"overrun": "{{tool}}：{{size}}，建议 {{limit}}",
 			"decision": "{{tool}} · {{agent}}",
 			"decisionAgent": "{{tool}} · 某个代理",
-			"decisionCoordinator": "{{tool}} · 协调者"
+			"decisionCoordinator": "{{tool}} · 协调者",
+			"decisionPlan": "计划 · {{agent}}",
+			"decisionPlanCoordinator": "计划 · 协调者",
+			"decisionPlanAgent": "计划 · 某个代理"
 		},
 		"top": {
 			"approvals_one": "{{shown}} 个待批",
@@ -310,7 +314,10 @@
 				"supplementedLabel": "已补充",
 				"deferred": "{{who}} 选择稍后回答提问",
 				"deferredLabel": "稍后回答",
-				"planWhat": "一份计划"
+				"answeredByAi": "{{who}} 让 AI 回答了提问",
+				"answeredByAiLabel": "AI 已回答",
+				"allowedPlan": "{{who}} 批准了一份计划",
+				"deniedPlan": "{{who}} 退回了一份计划"
 			}
 		},
 		"agents": {

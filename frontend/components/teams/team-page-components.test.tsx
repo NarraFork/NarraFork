@@ -246,6 +246,11 @@ describe("ready items and approvals answered in their session", () => {
 					toolName: "ExitPlanMode",
 					approvalKind: "plan",
 				}),
+				decision("da", "question.answered_by_ai", {
+					actorName: "gina",
+					toolName: "AskUserQuestion",
+					approvalKind: "question",
+				}),
 				decision("dd", "question.deferred", {
 					actorName: "frank",
 					toolName: "AskUserQuestion",
@@ -274,7 +279,9 @@ describe("ready items and approvals answered in their session", () => {
 					'aria-label="Answered"',
 					"dave closed a question without telling the agent",
 					'aria-label="Closed silently"',
-					"erin denied a plan",
+					"erin returned a plan",
+					"gina had the AI answer a question",
+					'aria-label="AI answered"',
 					"frank chose to answer a question later",
 					'aria-label="Answer later"',
 				],
@@ -287,14 +294,16 @@ describe("ready items and approvals answered in their session", () => {
 					"alice 批准了 Bash",
 					"协调者",
 					"dave 关闭了提问",
-					"erin 拒绝了 一份计划",
+					"erin 退回了一份计划",
+					"gina 让 AI 回答了提问",
 					"frank 选择稍后回答提问",
 				],
 			],
 		] as const) {
 			const html = await render(<TeamApprovalsList projectId="p" teamId="lead" />, client, lng);
 			expect(html).toContain("team-recent-decisions");
-			expect(html.split('data-testid="team-recent-decision"').length - 1).toBe(6);
+			expect(html.split('data-testid="team-recent-decision"').length - 1).toBe(7);
+			expect(html).not.toContain("ExitPlanMode");
 			for (const text of expected) expect(html).toContain(text);
 		}
 	});
@@ -508,6 +517,23 @@ describe("activity", () => {
 					createdAt: "2026-11-18T00:00:04.000Z",
 				},
 				{
+					id: "e5",
+					kind: "approval.allowed",
+					workItemId: null,
+					workItemTitle: null,
+					actorKind: "person",
+					actorId: "u5",
+					actorName: "erin",
+					detail: {
+						tool: "ExitPlanMode",
+						approvalKind: "plan",
+						agentTitle: "Parser worker",
+						depth: 1,
+					},
+					detailOmitted: false,
+					createdAt: "2026-11-18T00:00:05.000Z",
+				},
+				{
 					id: "e3",
 					kind: "question.answered",
 					workItemId: null,
@@ -549,6 +575,9 @@ describe("activity", () => {
 		expect(html).toContain("bob");
 		expect(html).toContain("Answered a question");
 		expect(html).toContain("AskUserQuestion · coordinator");
+		// A plan decision names the plan, never its tool.
+		expect(html).toContain("A plan · Parser worker");
+		expect(html).not.toContain("ExitPlanMode");
 		expect(html).toContain("carol");
 	});
 });

@@ -252,9 +252,40 @@ describe("notification recent-tabs consumer", () => {
 		expect(requests).toHaveLength(1);
 		expect(requests[0]?.url).toContain("user=team-member");
 
+		// More than 200 onlooker tab holders, all sorting before the member: the member is still
+		// alerted (the candidates start from the team's members, not from the first holders).
+		for (let i = 0; i < 205; i++) {
+			const userId = `a-onlooker-${String(i).padStart(3, "0")}`;
+			seedUser(userId, true);
+			db.insert(userRecentTabsMeta)
+				.values({ userId, revision: 1, migratedAt: NOW, createdAt: NOW, updatedAt: NOW })
+				.run();
+			db.insert(userRecentTabs)
+				.values({
+					id: `recent-${userId}`,
+					userId,
+					tabKey: "narrator:team-lead",
+					section: "work",
+					type: "narrator",
+					entityId: "team-lead",
+					representedNarratorId: "team-lead",
+					title: "Team lead",
+					lastVisitedAt: 1,
+					sortOrder: 0,
+					createdAt: NOW,
+					updatedAt: NOW,
+				})
+				.run();
+		}
+		requests.length = 0;
+		await handleAttention("team-lead", "waiting_permission");
+		expect(requests.map((request) => new URL(request.url).searchParams.get("user"))).toEqual([
+			"team-member",
+		]);
+
 		// "Done" is not a call waiting for a member: readers still hear about it, as before.
 		requests.length = 0;
 		await handleAttention("team-lead", "done");
-		expect(requests).toHaveLength(2);
+		expect(requests).toHaveLength(2 + 205);
 	});
 });

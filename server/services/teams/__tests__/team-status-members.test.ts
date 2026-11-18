@@ -394,31 +394,57 @@ describe("the status section", () => {
 	});
 
 	test("public write audience: a project read grant makes a member, and members-only reads find them", async () => {
-		// Sorts first: earlier tests leave many project read grants behind (beyond the limits).
-		const reader = "people-0-public-reader";
-		await user(reader); // a project READ grant, nothing on the coordinator
+		// A project and team of its own, so nothing other tests leave behind changes the answer.
+		const reader = "people-public-reader";
+		const freshOwner = "people-public-owner";
+		const now = new Date().toISOString();
+		for (const id of [reader, freshOwner])
+			await db
+				.insert(users)
+				.values({ id, username: id, passwordHash: "x", role: "user", createdAt: now });
+		const freshRepo = join(testHome, "public-repo");
+		mkdirSync(freshRepo, { recursive: true });
+		const freshProject = generateId();
+		await db.insert(projects).values({
+			id: freshProject,
+			name: "public project",
+			gitPath: freshRepo,
+			defaultBranch: "main",
+			ownerUserId: freshOwner,
+			visibility: "private",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await db.insert(aclGrants).values({
+			id: generateId(),
+			scopeType: "project",
+			scopeId: freshProject,
+			principalType: "user",
+			principalId: reader,
+			capability: "read",
+			createdAt: now,
+		});
+		const team = await createTeam(
+			{ projectId: freshProject, name: "Public team" },
+			{ userId: freshOwner, isAdmin: false },
+		);
+		await db
+			.update(narrators)
+			.set({ visibility: "public", writeAudience: "public" })
+			.where(eq(narrators.id, team.id));
 		const { canWriteNarrator, NARRATOR_ACL_COLUMNS } = await import("../../narrator-acl");
 		const { readTeamMemberIds } = await import("../team-members");
-		try {
-			await db
-				.update(narrators)
-				.set({ visibility: "public", writeAudience: "public" })
-				.where(eq(narrators.id, teamId));
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, teamId),
-				columns: NARRATOR_ACL_COLUMNS,
-			});
-			expect(row && (await canWriteNarrator(row, { userId: reader, isAdmin: false }))).toBe(true);
-			const drawer = await readTeamMembers(teamId);
-			expect(drawer?.members.find((m) => m.userId === reader)?.role).toBe("member");
-			// The notification fan-out's read.
-			expect(await readTeamMemberIds(teamId, 50)).toContain(reader);
-		} finally {
-			await db
-				.update(narrators)
-				.set({ visibility: "private", writeAudience: "owner" })
-				.where(eq(narrators.id, teamId));
-			await db.delete(aclGrants).where(eq(aclGrants.principalId, reader));
-		}
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, team.id),
+			columns: NARRATOR_ACL_COLUMNS,
+		});
+		expect(row && (await canWriteNarrator(row, { userId: reader, isAdmin: false }))).toBe(true);
+		const drawer = await readTeamMembers(team.id);
+		expect(drawer?.members.map((m) => [m.userId, m.role])).toEqual([
+			[freshOwner, "member"],
+			[reader, "member"],
+		]);
+		// The notification fan-out's read (members only).
+		expect((await readTeamMemberIds(team.id, 50)).sort()).toEqual([freshOwner, reader].sort());
 	});
 });

@@ -41,6 +41,7 @@ import {
 	IconMessagePlus,
 	IconPlayerPause,
 	IconShieldQuestion,
+	IconSparkles,
 	IconUsers,
 	IconX,
 } from "@tabler/icons-react";
@@ -52,6 +53,7 @@ import {
 	pauseNotice,
 	type RecentDecisionKey,
 	recentDecisionKey,
+	recentDecisionTextKey,
 } from "./team-page-model";
 
 const DEPTH_ROLE = ["coordinator", "worker", "helper"] as const;
@@ -198,6 +200,7 @@ const DECISION_ICON = {
 	ignored: IconEyeOff,
 	supplemented: IconMessagePlus,
 	deferred: IconClockPause,
+	answeredByAi: IconSparkles,
 } as const satisfies Record<RecentDecisionKey, unknown>;
 const DECISION_COLOR = {
 	allowed: "green",
@@ -207,6 +210,7 @@ const DECISION_COLOR = {
 	ignored: "gray",
 	supplemented: "indigo",
 	deferred: "gray",
+	answeredByAi: "violet",
 } as const satisfies Record<RecentDecisionKey, string>;
 
 /** One decision a person took on a call of the tree: who, what, where, when. */
@@ -216,8 +220,7 @@ export function RecentDecisionRow({ decision }: { decision: TeamRecentDecision }
 	const Icon = DECISION_ICON[key];
 	const role = DEPTH_ROLE[Math.min(Math.max(decision.depth, 0), 2)];
 	const who = decision.actorName ?? t("teams.activity.unknownPerson");
-	const what =
-		decision.approvalKind === "plan" ? t("teams.approvals.recent.planWhat") : decision.toolName;
+	const what = decision.toolName;
 	return (
 		<Group
 			gap="xs"
@@ -234,7 +237,13 @@ export function RecentDecisionRow({ decision }: { decision: TeamRecentDecision }
 			/>
 			<Stack gap={0} style={{ flex: 1, minWidth: 0 }}>
 				<Text size="sm" style={{ overflowWrap: "anywhere" }}>
-					{t(`teams.approvals.recent.${key}`, { who, what })}
+					{t(
+						`teams.approvals.recent.${recentDecisionTextKey(decision.kind, decision.approvalKind)}`,
+						{
+							who,
+							what,
+						},
+					)}
 				</Text>
 				<Text size="xs" c="dimmed" truncate>
 					{decision.depth === 0

@@ -237,7 +237,8 @@
 			"question_dismissed": "Dismissed a question",
 			"question_ignored": "Closed a question silently",
 			"question_supplemented": "Followed up on an answer",
-			"question_deferred": "Chose to answer a question later"
+			"question_deferred": "Chose to answer a question later",
+			"question_answered_by_ai": "Had the AI answer a question"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -252,7 +253,10 @@
 			"overrun": "{{tool}}: {{size}} over {{limit}}",
 			"decision": "{{tool}} · {{agent}}",
 			"decisionAgent": "{{tool}} · an agent",
-			"decisionCoordinator": "{{tool}} · coordinator"
+			"decisionCoordinator": "{{tool}} · coordinator",
+			"decisionPlan": "A plan · {{agent}}",
+			"decisionPlanCoordinator": "A plan · coordinator",
+			"decisionPlanAgent": "A plan · an agent"
 		},
 		"top": {
 			"approvals_one": "{{shown}} approval",
@@ -310,7 +314,10 @@
 				"supplementedLabel": "Followed up",
 				"deferred": "{{who}} chose to answer a question later",
 				"deferredLabel": "Answer later",
-				"planWhat": "a plan"
+				"answeredByAi": "{{who}} had the AI answer a question",
+				"answeredByAiLabel": "AI answered",
+				"allowedPlan": "{{who}} approved a plan",
+				"deniedPlan": "{{who}} returned a plan"
 			}
 		},
 		"agents": {

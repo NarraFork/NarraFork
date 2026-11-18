@@ -144,6 +144,7 @@ const KNOWN_EVENT_KINDS = new Set([
 	"question.ignored",
 	"question.supplemented",
 	"question.deferred",
+	"question.answered_by_ai",
 ]);
 
 /** The i18n key (under `teams.event.`) of an event's headline. */
@@ -208,10 +209,18 @@ export function eventNote(
 		case "question.dismissed":
 		case "question.ignored":
 		case "question.supplemented":
-		case "question.deferred": {
-			const tool = text(detail.tool, 120) ?? "";
+		case "question.deferred":
+		case "question.answered_by_ai": {
+			// A plan is named as such, never by its tool's name (ExitPlanMode).
+			const tool = detail.approvalKind === "plan" ? null : (text(detail.tool, 120) ?? "");
 			const agent = text(detail.agentTitle, 120);
 			const depth = num(detail.depth) ?? 1;
+			if (tool === null) {
+				if (depth === 0) return { key: "decisionPlanCoordinator", values: {} };
+				return agent
+					? { key: "decisionPlan", values: { agent } }
+					: { key: "decisionPlanAgent", values: {} };
+			}
 			// The coordinator's own call is named as such; a subagent's by its session title.
 			if (depth === 0) return { key: "decisionCoordinator", values: { tool } };
 			return agent
@@ -331,6 +340,18 @@ export function recentDecisionKey(kind: TeamPersonDecisionEventKind): RecentDeci
 	return RECENT_DECISION_KEYS[kind] ?? "allowed";
 }
 
+/**
+ * The i18n key (under `teams.approvals.recent.`) of a recent decision's line: a plan's approval
+ * or return has its own wording ("approved a plan"), anything else names its tool.
+ */
+export function recentDecisionTextKey(
+	kind: TeamPersonDecisionEventKind,
+	approvalKind: string,
+): string {
+	const key = recentDecisionKey(kind);
+	return approvalKind === "plan" && (key === "allowed" || key === "denied") ? `${key}Plan` : key;
+}
+
 const RECENT_DECISION_KEYS = {
 	"approval.allowed": "allowed",
 	"approval.denied": "denied",
@@ -339,6 +360,7 @@ const RECENT_DECISION_KEYS = {
 	"question.ignored": "ignored",
 	"question.supplemented": "supplemented",
 	"question.deferred": "deferred",
+	"question.answered_by_ai": "answeredByAi",
 } as const satisfies Record<TeamPersonDecisionEventKind, string>;
 export type RecentDecisionKey = (typeof RECENT_DECISION_KEYS)[TeamPersonDecisionEventKind];
 

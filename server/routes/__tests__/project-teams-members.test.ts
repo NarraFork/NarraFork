@@ -35,9 +35,12 @@ const {
 	narratorToolCalls,
 	projects,
 	teamWorkEvents,
+	userRecentTabs,
+	userRecentTabsMeta,
 	users,
 } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
+const { eventBus } = await import("../../lib/event-bus");
 const { narratorService } = await import("../../services/narrator-service");
 const { pendingPermissions } = await import("../../services/narrator-session-state");
 const { handleNarratorWS } = await import("../../websocket/narrator-ws");
@@ -845,6 +848,13 @@ describe("onlookers are not alerted (M1)", () => {
 			(await enrichTabs(tabs(), userId)).map((tab) => tab.teamOnlooker === true);
 		expect(await marks(READER)).toEqual([true, true, false]);
 		expect(await marks(MEMBER)).toEqual([false, false, false]);
+		// Every viewer learns which tabs are team sessions (project changes re-read those).
+		for (const userId of [READER, MEMBER])
+			expect((await enrichTabs(tabs(), userId)).map((tab) => tab.teamSession === true)).toEqual([
+				true,
+				true,
+				false,
+			]);
 		// Promoted to member: the next read (the client re-reads on narrator_access_changed)
 		// clears the flag; revoked again, it comes back.
 		const id = await grantWrite(READER);
@@ -854,8 +864,11 @@ describe("onlookers are not alerted (M1)", () => {
 	});
 });
 
-describe("IM gateway and team calls (M1)", () => {
-	test("a team call is never decided from IM, through any path; other sessions are as before", async () => {
+describe("IM gateway and team sessions (M1)", () => {
+	const REFUSED_SESSION = "can only be used from NarraFork";
+	const REFUSED_DECISION = "can't be approved, denied or answered from chat";
+
+	async function imSetup(chatId: string) {
 		const { gateway } = await import("../../gateway/gateway");
 		const sent: string[] = [];
 		// biome-ignore lint/suspicious/noExplicitAny: driving the gateway's private paths
@@ -864,28 +877,94 @@ describe("IM gateway and team calls (M1)", () => {
 			send: async (_chatId: string, text: string) => {
 				sent.push(text);
 			},
+			sendAndGetId: async (_chatId: string, text: string) => {
+				sent.push(text);
+				return { messageId: `pushed-${sent.length}` };
+			},
+			sendTyping: async () => {},
+			supportsEdit: false,
 		});
 		const msg = {
 			platform: "telegram" as const,
-			chatId: "chat-im",
-			userId: "im-sender",
+			chatId,
+			userId: `${chatId}-sender`,
 			username: "im sender",
 			text: "",
 		};
-		try {
-			// The production path: a new chat gets its own session, its account auto-resolved
-			// (the first admin or only user; never a binding the sender proved) …
-			const mapping = await im.createNewMapping(msg, new Date().toISOString());
-			expect(mapping.appUserId).toBeTruthy();
-			// … then the sender switches the chat to the coordinator.
-			await im.handleCommand({ cmd: "/switch", args: teamId }, msg);
-			const bound = await db
-				.select({ narratorId: gatewaySessionMappings.narratorId })
-				.from(gatewaySessionMappings)
-				.where(eq(gatewaySessionMappings.id, mapping.id))
-				.get();
-			expect(bound?.narratorId).toBe(teamId);
+		// The production path: a new chat gets its own session, its account auto-resolved (the
+		// first admin or only user; never a binding the sender proved).
+		const mapping = await im.createNewMapping(msg, new Date().toISOString());
+		expect(mapping.appUserId).toBeTruthy();
+		const boundTo = async () =>
+			(
+				await db
+					.select({ narratorId: gatewaySessionMappings.narratorId })
+					.from(gatewaySessionMappings)
+					.where(eq(gatewaySessionMappings.id, mapping.id))
+					.get()
+			)?.narratorId;
+		const cleanup = async () => {
+			im.adapters.delete("telegram");
+			await db.delete(gatewaySessionMappings).where(eq(gatewaySessionMappings.chatId, chatId));
+		};
+		return { im, sent, msg, mapping, boundTo, cleanup };
+	}
 
+	test("/switch lists but refuses a team session; the chat stays on its own", async () => {
+		const { im, sent, msg, mapping, boundTo, cleanup } = await imSetup("chat-switch");
+		try {
+			for (const target of [teamId, workerId]) {
+				await im.handleCommand({ cmd: "/switch", args: target }, msg);
+				expect(sent.at(-1)).toContain(REFUSED_SESSION);
+				expect(await boundTo()).toBe(mapping.narratorId);
+			}
+		} finally {
+			await cleanup();
+		}
+	});
+
+	test("a chat bound to a team session (from before M1) cannot drive it in any way", async () => {
+		const { im, sent, msg, mapping, cleanup } = await imSetup("chat-legacy");
+		const session = await import("../../services/narrator-session");
+		const send = spyOn(session, "sendMessage");
+		const interrupt = spyOn(session, "interruptNarrator");
+		try {
+			// A mapping made before M1 could point at the coordinator.
+			await db
+				.update(gatewaySessionMappings)
+				.set({ narratorId: teamId })
+				.where(eq(gatewaySessionMappings.id, mapping.id));
+			const modelBefore = (
+				await db
+					.select({ model: narrators.model })
+					.from(narrators)
+					.where(eq(narrators.id, teamId))
+					.get()
+			)?.model;
+			await im.handleInboundMessage({ ...msg, text: "please run the tests" });
+			expect(sent.at(-1)).toContain(REFUSED_SESSION);
+			await im.handleCommand({ cmd: "/stop", args: "" }, msg);
+			expect(sent.at(-1)).toContain(REFUSED_SESSION);
+			await im.handleCommand({ cmd: "/model", args: "openai:other" }, msg);
+			expect(sent.at(-1)).toContain(REFUSED_SESSION);
+			await im.handleCommand({ cmd: "/model", args: "" }, msg);
+			expect(sent.at(-1)).toContain(REFUSED_SESSION);
+			// An unknown command is forwarded as a message: refused too.
+			await im.handleCommand({ cmd: "/whatever", args: "" }, { ...msg, text: "/whatever" });
+			expect(sent.at(-1)).toContain(REFUSED_SESSION);
+			expect(send).not.toHaveBeenCalled();
+			expect(interrupt).not.toHaveBeenCalled();
+			expect(
+				(
+					await db
+						.select({ model: narrators.model })
+						.from(narrators)
+						.where(eq(narrators.id, teamId))
+						.get()
+				)?.model,
+			).toBe(modelBefore);
+
+			// Decisions: /approve, /deny and quote replies are refused, nothing is decided.
 			const before = (await personEvents()).length;
 			const pending = await pendingCall(teamId);
 			for (const [cmd, args] of [
@@ -893,9 +972,8 @@ describe("IM gateway and team calls (M1)", () => {
 				["/deny", "not now"],
 			] as const) {
 				await im.handleCommand({ cmd, args }, { ...msg, text: `${cmd} ${args}` });
-				expect(sent.at(-1)).toContain("can't be approved, denied or answered from chat");
+				expect(sent.at(-1)).toContain(REFUSED_DECISION);
 			}
-			// A quoted reply to the permission message is refused the same way.
 			im.trackPermMessageId("perm-message-1", pending.id);
 			const keyword = [...im.constructor.APPROVE_KEYWORDS][0] as string;
 			expect(
@@ -905,20 +983,71 @@ describe("IM gateway and team calls (M1)", () => {
 					raw: { message_reference: { message_id: "perm-message-1" } },
 				}),
 			).toBe(true);
-			expect(sent.at(-1)).toContain("can't be approved, denied or answered from chat");
+			expect(sent.at(-1)).toContain(REFUSED_DECISION);
 			expect(pending.decisions).toEqual([]);
-			expect(pendingPermissions.has(pending.id)).toBe(true);
 			expect((await personEvents()).length).toBe(before);
-			pendingPermissions.delete(pending.id);
 
-			// A session outside any team is decided from IM exactly as before.
-			await im.handleCommand({ cmd: "/switch", args: mapping.narratorId }, msg);
+			// The permission request pushed to the chat invites no /approve and carries no
+			// [perm:id] tag a quote reply could act on.
+			im.subscribeToEvents();
+			const pushed = sent.length;
+			eventBus.emit({
+				type: "narrator:message_broadcast",
+				narratorId: teamId,
+				message: {
+					type: "permission_request",
+					request: { id: pending.id, toolName: "Bash", inputJson: { command: "ls" } },
+				},
+			} as never);
+			for (let i = 0; i < 100 && sent.length === pushed; i++) await Bun.sleep(5);
+			const push = sent.at(-1) ?? "";
+			expect(push).toContain("decided in NarraFork");
+			expect(push).not.toContain("[perm:");
+			expect(push).not.toContain("/approve");
+			pendingPermissions.delete(pending.id);
+		} finally {
+			send.mockRestore();
+			interrupt.mockRestore();
+			await cleanup();
+		}
+	});
+
+	test("quote replies on worker and helper calls are refused (the tree, both levels)", async () => {
+		const { im, sent, msg, cleanup } = await imSetup("chat-nested");
+		const helper = await narratorService.create({ title: "helper", cwd: repo });
+		await db
+			.update(narrators)
+			.set({ type: "subagent", aclRootNarratorId: teamId, parentNarratorId: workerId })
+			.where(eq(narrators.id, helper.id));
+		try {
+			for (const narratorId of [workerId, helper.id]) {
+				const pending = await pendingCall(narratorId);
+				im.trackPermMessageId(`nested-${pending.id}`, pending.id);
+				expect(
+					await im.handlePermissionByQuote({
+						...msg,
+						text: "y",
+						raw: { message_reference: { message_id: `nested-${pending.id}` } },
+					}),
+				).toBe(true);
+				expect(sent.at(-1)).toContain(REFUSED_DECISION);
+				expect(pending.decisions).toEqual([]);
+				expect(pendingPermissions.has(pending.id)).toBe(true);
+				pendingPermissions.delete(pending.id);
+			}
+		} finally {
+			await cleanup();
+		}
+	});
+
+	test("a session outside any team is used from IM exactly as before", async () => {
+		const { im, msg, mapping, cleanup } = await imSetup("chat-plain");
+		try {
 			const own = await pendingCall(mapping.narratorId);
 			await im.handleCommand({ cmd: "/approve", args: "" }, { ...msg, text: "/approve" });
 			expect(own.decisions).toEqual(["allow"]);
 		} finally {
-			im.adapters.delete("telegram");
-			await db.delete(gatewaySessionMappings).where(eq(gatewaySessionMappings.chatId, "chat-im"));
+			await cleanup();
 		}
 	});
 });
@@ -1039,6 +1168,115 @@ describe("plan decisions and answering later (M1)", () => {
 			}
 		} finally {
 			decide.mockRestore();
+		}
+	});
+});
+
+describe("audience changes reach the coordinator's tab holders (M1)", () => {
+	test("a visibility or write-audience change tells the people who have the coordinator open", async () => {
+		const narratorWs = await import("../../websocket/narrator-ws");
+		const now = new Date().toISOString();
+		for (const userId of [READER, OUTSIDER]) {
+			await db
+				.insert(userRecentTabsMeta)
+				.values({ userId, revision: 1, migratedAt: now, createdAt: now, updatedAt: now })
+				.onConflictDoNothing();
+			await db.insert(userRecentTabs).values({
+				id: `audience-tab-${userId}`,
+				userId,
+				tabKey: `narrator:${teamId}`,
+				section: "work",
+				type: "narrator",
+				entityId: teamId,
+				representedNarratorId: teamId,
+				title: "Members team",
+				lastVisitedAt: 1,
+				sortOrder: 0,
+				createdAt: now,
+				updatedAt: now,
+			});
+		}
+		const sent = spyOn(narratorWs, "broadcastToUser");
+		try {
+			const told = () =>
+				sent.mock.calls
+					.filter(([, frame]) => (frame as { type: string }).type === "narrator_access_changed")
+					.map(([userId]) => userId);
+			expect(
+				(
+					await call(OWNER, `/narrators/${teamId}/write-audience`, {
+						method: "PATCH",
+						body: { writeAudience: "owner" },
+					})
+				).status,
+			).toBe(200);
+			expect(told().sort()).toEqual([OUTSIDER, READER].sort());
+			sent.mockClear();
+			expect(
+				(
+					await call(OWNER, `/narrators/${teamId}/visibility`, {
+						method: "PATCH",
+						body: { visibility: "public" },
+					})
+				).status,
+			).toBe(200);
+			expect(told().sort()).toEqual([OUTSIDER, READER].sort());
+			// A narrator that is not a team coordinator: nobody named, nobody told (as before).
+			sent.mockClear();
+			const plain = await narratorService.create({ title: "plain", cwd: repo });
+			await db.update(narrators).set({ ownerUserId: OWNER }).where(eq(narrators.id, plain.id));
+			expect(
+				(
+					await call(OWNER, `/narrators/${plain.id}/visibility`, {
+						method: "PATCH",
+						body: { visibility: "private" },
+					})
+				).status,
+			).toBe(200);
+			expect(told()).toEqual([]);
+		} finally {
+			sent.mockRestore();
+			await db
+				.update(narrators)
+				.set({ visibility: "project", writeAudience: "project" })
+				.where(eq(narrators.id, teamId));
+		}
+	});
+});
+
+describe("asking the AI to answer (M1)", () => {
+	test("a member's request is recorded as question.answered_by_ai; an onlooker cannot", async () => {
+		const permission = await import("../../services/narrator-permission");
+		const reflect = spyOn(permission, "reflectPendingAskUserQuestion").mockImplementation(
+			async () => ({ ok: true, answers: { q: "a" } }),
+		);
+		try {
+			const asked = await pendingCall(workerId, "AskUserQuestion", { questions: [] });
+			for (const user of [READER, OUTSIDER])
+				expect([403, 404]).toContain(
+					(
+						await call(user, `/narrators/permissions/${asked.id}/reflect-question`, {
+							method: "POST",
+						})
+					).status,
+				);
+			expect(reflect).not.toHaveBeenCalled();
+			expect(
+				(
+					await call(MEMBER, `/narrators/permissions/${asked.id}/reflect-question`, {
+						method: "POST",
+					})
+				).status,
+			).toBe(200);
+			const recorded = (await personEvents()).find((e) => e.detail?.requestId === asked.id);
+			expect(recorded).toMatchObject({
+				kind: "question.answered_by_ai",
+				actorId: MEMBER,
+				detail: { tool: "AskUserQuestion", approvalKind: "question" },
+			});
+			pendingPermissions.delete(asked.id);
+		} finally {
+			reflect.mockRestore();
 		}
 	});
 });
