@@ -37,7 +37,7 @@ const names = [
 	"Edit",
 	"Read",
 	"Agent",
-	"Await",
+	"Watch",
 	"Send",
 	"EnterPlanMode",
 	"DangerConfirm",
@@ -1053,7 +1053,7 @@ describe("ordered streaming tool scheduling", () => {
 		expectSuccess(await result);
 	});
 
-	for (const name of ["Agent", "Await", "Send"]) {
+	for (const name of ["Agent", "Watch", "Send"]) {
 		test(`${name} starts mid-stream together with a following parallel Read`, async () => {
 			const control = watch("control", true);
 			const read = watch("read", true);

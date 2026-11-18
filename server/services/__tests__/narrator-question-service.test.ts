@@ -586,8 +586,10 @@ afterAll(() => {
 	cleanDb(sqlite);
 });
 
-describe("own question wait capability", () => {
-	test("Await(question) still reads an existing own answer but rejects another session's question", async () => {
+describe("own question query capability", () => {
+	test("Question reads existing own answers when asking is disabled without exposing another session's question", async () => {
+		const { questionTool } = await import("../../lib/agent/tools/question");
+		const { askUserQuestionTool } = await import("../../lib/agent/tools/ask-user-question");
 		const { awaitTool } = await import("../../lib/agent/tools/await");
 		const { resolveToolFilter } = await import("../subagent-tools");
 		const { toolCallId, toolUseId } = await seedToolCall();
@@ -602,31 +604,62 @@ describe("own question wait capability", () => {
 			userId: "user-1",
 			locale: "en",
 		});
-		expect(answer.ok).toBe(true);
+		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
 		const filter = resolveToolFilter("general");
-		// Asking is gone for subagents, but waiting on a question that already exists
-		// (e.g. filed by the primary before delegation) stays available.
-		expect(filter?.({ ...awaitTool, name: "AskUserQuestion" })).toBe(false);
-		expect(filter?.(awaitTool)).toBe(true);
+		// Losing the ability to ask does not remove read access to existing own items.
+		// Neither a parent relationship nor a legacy Await grants access to foreign items.
+		expect(filter?.(askUserQuestionTool)).toBe(false);
+		expect(filter?.(awaitTool)).toBe(false);
+		expect(filter?.(questionTool)).toBe(true);
 		const context = {
 			narratorId: NARRATOR_ID,
 			parentNarratorId: "legacy-parent",
-			currentToolUseId: "legacy-question-wait",
+			currentToolUseId: "question-query",
 			signal: new AbortController().signal,
 		} as import("../../lib/agent/types").ToolContext;
-		const own = await awaitTool.execute({ type: "question", id: record.id }, context);
+		const deliveriesBeforeQuery = scheduledDeliveries;
+		const injectionsBeforeQuery = injections.length;
+		const own = await questionTool.execute({ action: "get", id: record.id }, context);
 		expect(own.isError).not.toBe(true);
-		expect(own.output).toContain("Redis");
-		expect(own.metadata?.status).toBe("answered");
-		const foreign = await awaitTool.execute(
-			{ type: "question", id: record.id },
-			{
-				...context,
-				narratorId: OTHER_NARRATOR_ID,
+		expect(JSON.parse(own.output)).toMatchObject({
+			record: {
+				id: record.id,
+				narratorId: NARRATOR_ID,
+				status: "answered",
+				answers: { "cache-layer": "Redis" },
+				answerMessageId: answer.record.answerMessageId,
+				resolution: null,
 			},
+			events: [{ messageId: answer.record.answerMessageId, actor: "user-1" }],
+		});
+		expect(await questionTool.execute({ action: "get", id: record.id }, context)).toEqual(own);
+		const ownList = await questionTool.execute({ action: "list", filter: "pending" }, context);
+		expect(ownList.isError).not.toBe(true);
+		expect(JSON.parse(ownList.output).items.map((item: { id: string }) => item.id)).toEqual([
+			record.id,
+		]);
+		const foreignContext = {
+			...context,
+			narratorId: OTHER_NARRATOR_ID,
+			parentNarratorId: NARRATOR_ID,
+		};
+		const foreign = await questionTool.execute({ action: "get", id: record.id }, foreignContext);
+		expect(foreign.isError).not.toBe(true);
+		expect(JSON.parse(foreign.output)).toEqual({
+			record: null,
+			tooLarge: false,
+			events: [],
+			nextCursor: null,
+		});
+		const foreignList = await questionTool.execute(
+			{ action: "list", filter: "all" },
+			foreignContext,
 		);
-		expect(foreign.isError).toBe(true);
-		expect(foreign.output).toContain("not an async question belonging to this session");
+		expect(foreignList.isError).not.toBe(true);
+		expect(JSON.parse(foreignList.output)).toEqual({ items: [], nextCursor: null });
+		expect(scheduledDeliveries).toBe(deliveriesBeforeQuery);
+		expect(injections).toHaveLength(injectionsBeforeQuery);
+		expect(isAsyncQuestionAwaited(record.id)).toBe(false);
 	});
 });
 
