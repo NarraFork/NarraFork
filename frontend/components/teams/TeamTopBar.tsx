@@ -1,12 +1,15 @@
 /**
- * The team page's top bar (docs/PROJECT_TEAMS-PLAN.md §二.11, §二.12; P4): the pending approvals
- * of the whole tree (members only; any member decides through the ordinary permission routes),
- * the running sessions, and "pause all" (stops every running session's turn, coordinator first).
+ * The team page's top bar (docs/PROJECT_TEAMS-PLAN.md §二.11, §二.12; P4, M1): the pending
+ * approvals of the whole tree (members only; any member decides through the ordinary permission
+ * routes, and the latest decisions say who took them), the team's people (members and onlookers;
+ * the owner manages access there), the running sessions, and "pause all" (stops every running
+ * session's turn, coordinator first).
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
 import { useDecideApproval, usePauseTeam, useTeamApprovals } from "@frontend/hooks/useTeams";
 import { formatSmartTime } from "@frontend/lib/format";
 import {
+	ActionIcon,
 	Alert,
 	Badge,
 	Button,
@@ -18,6 +21,7 @@ import {
 	Popover,
 	Stack,
 	Text,
+	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
@@ -26,11 +30,31 @@ import {
 	TEAM_RUNNING_AGENTS_LIMIT,
 	type TeamPageSummary,
 	type TeamPendingApproval,
+	type TeamRecentDecision,
 } from "@shared/project-teams";
-import { IconPlayerPause, IconShieldQuestion } from "@tabler/icons-react";
+import {
+	IconCheck,
+	IconClockPause,
+	IconEyeOff,
+	IconMessageCircle,
+	IconMessageOff,
+	IconMessagePlus,
+	IconPlayerPause,
+	IconShieldQuestion,
+	IconSparkles,
+	IconUsers,
+	IconX,
+} from "@tabler/icons-react";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { cappedCount, pauseNotice } from "./team-page-model";
+import { TeamMembersPanel } from "./TeamMembers";
+import {
+	cappedCount,
+	pauseNotice,
+	type RecentDecisionKey,
+	recentDecisionKey,
+	recentDecisionTextKey,
+} from "./team-page-model";
 
 const DEPTH_ROLE = ["coordinator", "worker", "helper"] as const;
 
@@ -168,6 +192,72 @@ function ApprovalRow({
 	);
 }
 
+const DECISION_ICON = {
+	allowed: IconCheck,
+	denied: IconX,
+	answered: IconMessageCircle,
+	dismissed: IconMessageOff,
+	ignored: IconEyeOff,
+	supplemented: IconMessagePlus,
+	deferred: IconClockPause,
+	answeredByAi: IconSparkles,
+} as const satisfies Record<RecentDecisionKey, unknown>;
+const DECISION_COLOR = {
+	allowed: "green",
+	denied: "red",
+	answered: "indigo",
+	dismissed: "gray",
+	ignored: "gray",
+	supplemented: "indigo",
+	deferred: "gray",
+	answeredByAi: "violet",
+} as const satisfies Record<RecentDecisionKey, string>;
+
+/** One decision a person took on a call of the tree: who, what, where, when. */
+export function RecentDecisionRow({ decision }: { decision: TeamRecentDecision }) {
+	const { t } = useTranslation("projects");
+	const key = recentDecisionKey(decision.kind);
+	const Icon = DECISION_ICON[key];
+	const role = DEPTH_ROLE[Math.min(Math.max(decision.depth, 0), 2)];
+	const who = decision.actorName ?? t("teams.activity.unknownPerson");
+	const what = decision.toolName;
+	return (
+		<Group
+			gap="xs"
+			wrap="nowrap"
+			align="flex-start"
+			data-testid="team-recent-decision"
+			data-kind={decision.kind}
+		>
+			<Icon
+				size={16}
+				aria-label={t(`teams.approvals.recent.${key}Label`)}
+				color={`var(--mantine-color-${DECISION_COLOR[key]}-6)`}
+				style={{ flexShrink: 0, marginTop: 2 }}
+			/>
+			<Stack gap={0} style={{ flex: 1, minWidth: 0 }}>
+				<Text size="sm" style={{ overflowWrap: "anywhere" }}>
+					{t(
+						`teams.approvals.recent.${recentDecisionTextKey(decision.kind, decision.approvalKind)}`,
+						{
+							who,
+							what,
+						},
+					)}
+				</Text>
+				<Text size="xs" c="dimmed" truncate>
+					{decision.depth === 0
+						? t("teams.approvals.coordinator")
+						: `${decision.agentTitle ?? t("teams.activity.unknownAgent")} · ${t(`teams.approvals.${role}`)}`}
+				</Text>
+			</Stack>
+			<Text size="xs" c="dimmed" title={decision.createdAt} style={{ flexShrink: 0 }}>
+				{formatSmartTime(decision.createdAt)}
+			</Text>
+		</Group>
+	);
+}
+
 export function TeamApprovalsList({
 	projectId,
 	teamId,
@@ -179,6 +269,7 @@ export function TeamApprovalsList({
 }) {
 	const { t } = useTranslation("projects");
 	const approvals = useTeamApprovals(projectId, teamId, true);
+	const recent = approvals.data?.recent ?? [];
 	return (
 		<Stack gap="xs" data-testid="team-approvals">
 			{approvals.isLoading && <Loader size="sm" />}
@@ -206,6 +297,16 @@ export function TeamApprovalsList({
 					{t("teams.approvals.unscanned")}
 				</Text>
 			)}
+			{recent.length > 0 && (
+				<Stack gap={6} mt="sm" data-testid="team-recent-decisions">
+					<Text size="xs" fw={600}>
+						{t("teams.approvals.recentTitle")}
+					</Text>
+					{recent.map((decision) => (
+						<RecentDecisionRow key={decision.id} decision={decision} />
+					))}
+				</Stack>
+			)}
 		</Stack>
 	);
 }
@@ -228,6 +329,7 @@ export function TeamTopBar({
 }) {
 	const { t } = useTranslation("projects");
 	const [approvalsOpen, setApprovalsOpen] = useState(false);
+	const [membersOpen, setMembersOpen] = useState(false);
 	const [confirmPause, setConfirmPause] = useState(false);
 	const pause = usePauseTeam(projectId, teamId);
 	const member = summary?.access === "write";
@@ -268,7 +370,7 @@ export function TeamTopBar({
 					{title}
 				</Text>
 			</Group>
-			<Group gap={6} wrap="nowrap">
+			<Group gap={6} wrap="wrap" justify="flex-end" style={{ rowGap: 6 }}>
 				{member && (
 					<Button
 						size="xs"
@@ -284,6 +386,21 @@ export function TeamTopBar({
 							shown: cappedCount(pending, TEAM_APPROVALS_LIMIT),
 						})}
 					</Button>
+				)}
+				{summary && (
+					// Icon-only: the bar must still fit beside the other controls at 360 px.
+					<Tooltip label={t("teams.top.members")} withinPortal>
+						<ActionIcon
+							size={30}
+							variant="light"
+							color="gray"
+							aria-label={t("teams.top.members")}
+							onClick={() => setMembersOpen(true)}
+							data-testid="team-members-button"
+						>
+							<IconUsers size={16} aria-hidden />
+						</ActionIcon>
+					</Tooltip>
 				)}
 				<Popover position="bottom-end" shadow="md" withinPortal>
 					<Popover.Target>
@@ -361,6 +478,15 @@ export function TeamTopBar({
 						}
 					/>
 				)}
+			</Drawer>
+			<Drawer
+				opened={membersOpen}
+				onClose={() => setMembersOpen(false)}
+				position="right"
+				size="min(440px, 100%)"
+				title={t("teams.members.title")}
+			>
+				{membersOpen && <TeamMembersPanel projectId={projectId} teamId={teamId} />}
 			</Drawer>
 			<Modal
 				opened={confirmPause}

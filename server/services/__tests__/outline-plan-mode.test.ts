@@ -814,6 +814,44 @@ describe("review round 1", () => {
 		expect(children.some((c) => c.content.includes("Split step C"))).toBe(false);
 	});
 
+	test("Project Teams M1: access revoked before the plan is written refuses the decision; nothing is written", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const space = await ensureSessionSpace(id);
+		const planBefore = (await block(plan.root)).taskJson?.plan;
+		const revoked = new Error("access revoked");
+		for (const body of [
+			{ action: "draft" as const },
+			{ action: "lock" as const },
+			{ action: "return" as const, feedback: "Split step C" },
+		]) {
+			const sub = await submit(id);
+			let calls = 0;
+			await expect(
+				decideOutlinePlanRequest({
+					requestId: sub.requestId,
+					principal: { userId: owner, isAdmin: false },
+					body: { ...body, seenSeq: sub.input._planSeq as number },
+					assertStillAllowed: async () => {
+						calls++;
+						throw revoked;
+					},
+				}),
+			).rejects.toBe(revoked);
+			expect(calls).toBe(1);
+			expect(sub.outcome()).toBeNull();
+			const root = await block(plan.root);
+			expect(root.taskJson?.plan).toEqual(planBefore);
+			expect(root.taskJson?.lock).toBeUndefined();
+			for (const cleanup of cleanups.splice(0)) cleanup();
+		}
+		// The return's feedback note was never written.
+		const children = await outlineStore.listChildren(space.id, plan.root, 50);
+		expect(children.some((c) => c.content.includes("Split step C"))).toBe(false);
+	});
+
 	test("S2: a decision written before a restart keeps its submission, and the restored request settles as decided", async () => {
 		const owner = await user();
 		const id = await session(owner);

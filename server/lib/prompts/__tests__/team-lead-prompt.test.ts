@@ -38,8 +38,19 @@ describe("team lead prompt", () => {
 			"Never stop, restart or take over",
 			"never commit there directly",
 			"worktree of the work item",
+			// M1: several people in one conversation.
+			"in the order they were sent",
+			"address people by name",
+			"never merge two people's instructions",
+			"When members' instructions conflict, ask before acting",
+			"do not choose between people yourself",
+			"Onlookers can read this conversation but cannot speak, approve or answer",
+			"Any member may answer, and the team records who did",
 		])
 			expect(en).toContain(phrase);
+		const zh = getTeamLeadPrompt("zh-CN");
+		for (const phrase of ["称呼人时用名字", "成员之间的指令有冲突时先问再做", "推荐项放第一个"])
+			expect(zh).toContain(phrase);
 		// No hosting / CI / integration instructions before those PRs.
 		expect(en).not.toMatch(/pull request|\bPR\b|\bCI\b|integration branch/i);
 	});

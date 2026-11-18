@@ -19,6 +19,7 @@ import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import type { OutlinePlanDecisionResponse } from "@shared/outline-api";
 import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
+import type { TeamPersonDecisionEventKind } from "@shared/project-teams";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -514,6 +515,7 @@ import {
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
+import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
 import { personActor, runAsTeamStatusActor } from "../services/teams/team-records";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
@@ -6417,6 +6419,23 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 	});
 });
 
+/** A person's action on an asynchronous question of a team tree, recorded with them (M1). */
+function recordAsyncQuestionAction(
+	narratorId: string,
+	questionId: string,
+	userId: string,
+	kind: TeamPersonDecisionEventKind,
+) {
+	recordTeamPersonDecision({
+		requestId: questionId,
+		target: { narratorId, toolName: "AskUserQuestion" },
+		userId,
+		decision: kind === "question.answered" ? "allow" : "deny",
+		kind,
+		questionId,
+	});
+}
+
 narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	const narratorId = c.req.param("id");
 	const questionId = c.req.param("questionId");
@@ -6431,11 +6450,14 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 	const userId = c.get("user").sub;
+	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding: the gate ran before the body arrived.
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await supplementAsyncQuestion(questionId, {
 		text: parsed.data.text,
 		expectedAnswerMessageId: parsed.data.answerMessageId,
 		userId,
-		locale: (await getUserLanguage(userId)) as Locale,
+		locale,
 	});
 	if (!result.ok) {
 		return c.json(
@@ -6443,6 +6465,7 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 			result.reason === "not_found" ? 404 : 409,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.supplemented");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6468,6 +6491,8 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	}
 
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding: the gate ran before the body arrived.
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await answerAsyncQuestion(questionId, {
 		answers: parsed.data.answers,
 		annotations: parsed.data.annotations ?? null,
@@ -6480,6 +6505,7 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.answered");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6499,6 +6525,8 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	}
 
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding (the gate ran before the request was read).
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await dismissAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
 		return c.json(
@@ -6506,6 +6534,7 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.dismissed");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6527,6 +6556,8 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	}
 
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding (the gate ran before the request was read).
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await ignoreAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
 		return c.json(
@@ -6534,8 +6565,25 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.ignored");
 	return c.json({ ok: true, question: result.record });
 });
+
+/**
+ * A person's decision on a pending call: read the call first (the team's record of who decided,
+ * M1, needs it, and deciding takes it out of the live registries), then check write access on
+ * its session again, then decide. The gate above ran before the body arrived; `assertStillAllowed`
+ * runs once more inside the decision, after any wait to resume a paused restart recovery, so
+ * access revoked while the request was in flight (a member removed from a team) never lets it
+ * through.
+ */
+async function prepareDecision(c: Context, requestId: string) {
+	const target = await readDecisionTarget(requestId);
+	const assertStillAllowed = () =>
+		requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
+	await assertStillAllowed();
+	return { target, assertStillAllowed };
+}
 
 // Approve permission
 narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
@@ -6543,7 +6591,9 @@ narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 	const userId = c.get("user").sub;
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "allow", ...body });
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const resolved = await resolvePermissionOrDangerReflection(requestId, "allow", {
+		assertStillAllowed,
 		answers: parsed.success ? parsed.data.answers : undefined,
 		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
 		compactAfter: parsed.success ? parsed.data.compactAfter : undefined,
@@ -6552,22 +6602,35 @@ narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 		decidedBy: "user",
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId,
+			decision: "allow",
+			answered: parsed.success && !!parsed.data.answers,
+		});
 	return c.json({ ok: true });
 });
 
 // Deny permission
 narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	const requestId = c.req.param("requestId");
+	const userId = c.get("user").sub;
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "deny", ...body });
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const resolved = await resolvePermissionOrDangerReflection(requestId, "deny", {
+		assertStillAllowed,
 		denyMessage: parsed.success ? parsed.data.message : undefined,
 		answers: parsed.success ? parsed.data.answers : undefined,
 		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
 		updatedPlan: parsed.success ? parsed.data.updatedPlan : undefined,
+		userId,
 		decidedBy: "user",
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
+	if (target) recordTeamPersonDecision({ requestId, target, userId, decision: "deny" });
 	return c.json({ ok: true });
 });
 
@@ -6582,11 +6645,21 @@ narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
 	const parsed = outlinePlanDecisionSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) throw zodValidationError(parsed.error);
 	const { decideOutlinePlanRequest } = await import("../services/outline-plan-mode");
+	// Read the call, then check write access again: the gate ran before the body arrived.
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const result = await decideOutlinePlanRequest({
 		requestId,
 		principal: { userId: user.sub, isAdmin: user.role === "admin" },
 		body: parsed.data,
+		assertStillAllowed,
 	});
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId: user.sub,
+			decision: parsed.data.action === "return" ? "deny" : "allow",
+		});
 	const response: OutlinePlanDecisionResponse = { ok: true, commit: result.commit };
 	return c.json(response);
 });
@@ -6603,7 +6676,16 @@ narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
 narratorRoutes.post("/permissions/:requestId/defer", async (c) => {
 	const requestId = c.req.param("requestId");
 	const userId = c.get("user").sub;
+	const { target } = await prepareDecision(c, requestId);
 	const result = await deferPendingQuestion(requestId, { userId });
+	if (result.ok && target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId,
+			decision: "allow",
+			kind: "question.deferred",
+		});
 	if (!result.ok) {
 		return c.json(
 			{
@@ -6621,10 +6703,20 @@ narratorRoutes.post("/permissions/:requestId/defer", async (c) => {
 // Run AskUserQuestion reflection immediately and submit the generated answers
 narratorRoutes.post("/permissions/:requestId/reflect-question", async (c) => {
 	const requestId = c.req.param("requestId");
+	const { target } = await prepareDecision(c, requestId);
 	const result = await reflectPendingAskUserQuestion(requestId);
 	if (!result.ok) {
 		return c.json({ error: result.reason ?? "Question reflection request not found" }, 404);
 	}
+	// A person had the AI answer: recorded with them (M1), as its own kind.
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId: c.get("user").sub,
+			decision: "allow",
+			kind: "question.answered_by_ai",
+		});
 	return c.json({ ok: true, answers: result.answers ?? {} });
 });
 

@@ -26,14 +26,24 @@ import {
 } from "@shared/notification-center";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { botDisplayName, CHAT_MEMBER_FANOUT_LIMIT } from "./chat-service";
-import { canReadNarrator, listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import {
+	canReadNarrator,
+	judgeNarratorAccessBatch,
+	listNarratorAudience,
+	type NarratorAclRow,
+} from "./narrator-acl";
 import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	type RecordNotificationInput,
 	recordNotifications as recordNotificationsImpl,
 	syncChatNotificationReads,
 } from "./notification-center-service";
-import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import {
+	getRecentTabUserIdsForNarrator,
+	getRecentTabUserIdsForNarratorByRecency,
+} from "./recent-tabs-service";
+import { readTeamMemberIds } from "./teams/team-members";
+import { teamIdOfNarrator } from "./teams/team-membership";
 
 export type { NotificationKind, NotificationLink, RecordNotificationInput };
 export { NOTIFICATION_FANOUT_MAX_RECIPIENTS, NOTIFICATION_PREVIEW_MAX_LENGTH };
@@ -231,6 +241,8 @@ function buildPermissionPreview(toolName: string, hint: string | null | undefine
  * tabs stand in for the interested audience and the cap applies.
  */
 async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[]> {
+	const teamId = teamIdOfNarrator(row.id);
+	if (teamId) return await resolveTeamRecipients(teamId, row);
 	const candidates = new Set<string>();
 	if (row.ownerUserId) candidates.add(row.ownerUserId);
 
@@ -267,6 +279,46 @@ async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[
 		if (allowed.length >= NOTIFICATION_FANOUT_MAX_RECIPIENTS) break;
 	}
 	return allowed;
+}
+
+/** Candidates of each source the team's people list looks at for one notification. */
+const TEAM_NOTIFY_CANDIDATES = 50;
+
+/**
+ * Recipients of a call waiting in a team tree (M1): the team's members only. A call of the
+ * team's tree waits for a member, and only members (write access on the coordinator) may decide
+ * it, so onlookers are not told. The members come from the team's people list (owner, explicit
+ * and project grants, recent speakers; each already judged by write access on the coordinator,
+ * which is also the deciding ACL of its subagents); recent-tab viewers are added when they may
+ * write. Bounded: at most {@link TEAM_NOTIFY_CANDIDATES} candidates per source and
+ * {@link NOTIFICATION_FANOUT_MAX_RECIPIENTS} recipients.
+ */
+async function resolveTeamRecipients(teamId: string, row: NarratorAclRow): Promise<string[]> {
+	const allowed = new Set(await readTeamMemberIds(teamId, TEAM_NOTIFY_CANDIDATES));
+	// The most recently visited holders: a crowd of onlooker tabs cannot push a writer out by id.
+	const tabs = (
+		await getRecentTabUserIdsForNarratorByRecency(row.id, NOTIFICATION_FANOUT_MAX_RECIPIENTS)
+	).filter((id) => !allowed.has(id));
+	if (tabs.length > 0) {
+		const admins = new Set(
+			(
+				await db
+					.select({ id: users.id })
+					.from(users)
+					.where(and(eq(users.role, "admin"), inArray(users.id, tabs)))
+			).map((u) => u.id),
+		);
+		// One batch judgement for all of them (a handful of queries), not one check per user.
+		const verdicts = await judgeNarratorAccessBatch(
+			row,
+			tabs.map((userId) => ({ userId, isAdmin: admins.has(userId) })),
+		);
+		for (const userId of tabs) {
+			if (allowed.size >= NOTIFICATION_FANOUT_MAX_RECIPIENTS) break;
+			if (verdicts.get(userId)?.write) allowed.add(userId);
+		}
+	}
+	return [...allowed].slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS);
 }
 
 /**

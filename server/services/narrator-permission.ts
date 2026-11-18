@@ -6810,6 +6810,12 @@ export interface ResolvePermissionOpts {
 	decidedBy?: "user" | "auto" | "reflection" | `narrator:${string}`;
 	exitPlanCancelled?: boolean;
 	/**
+	 * A person's decision: re-check that they may still decide, right before the decision is
+	 * dispatched (after any wait to resume a paused restart recovery). Throws to refuse; nothing
+	 * is decided then. Access revoked while the decision was on its way must not let it through.
+	 */
+	assertStillAllowed?: () => Promise<void>;
+	/**
 	 * ExitPlanMode of an outline session returned on the card (`outline-plan-mode.ts`): the tool
 	 * result the agent gets, as is.
 	 */
@@ -7232,6 +7238,8 @@ export async function resolvePermissionOrDangerReflection(
 			}
 		}
 	}
+	// The last await before the decision is dispatched: whoever decides must still be allowed to.
+	await opts.assertStillAllowed?.();
 	if (pendingPermissions.has(requestId)) {
 		return resolvePermission(requestId, decision, opts);
 	}

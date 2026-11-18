@@ -40,6 +40,7 @@ export const teamKeys = {
 		["teams", "page", teamId, "board", column] as const,
 	activity: (teamId: string) => ["teams", "page", teamId, "activity"] as const,
 	approvals: (teamId: string) => ["teams", "page", teamId, "approvals"] as const,
+	members: (teamId: string) => ["teams", "page", teamId, "members"] as const,
 };
 
 /** A project's active teams, a page at a time. */
@@ -218,6 +219,19 @@ export function useTeamApprovals(projectId: string, teamId: string, enabled: boo
 	});
 }
 
+/**
+ * The team's people (M1): members and onlookers from the coordinator's ACL. Read when the
+ * members drawer is open; access itself is changed through the narrator sharing panel.
+ */
+export function useTeamMembers(projectId: string, teamId: string, enabled: boolean) {
+	return useQuery({
+		queryKey: teamKeys.members(teamId),
+		queryFn: () => api.getTeamMembers(projectId, teamId),
+		enabled: enabled && !!projectId && !!teamId,
+		gcTime: TEAM_GC_TIME_MS,
+	});
+}
+
 /** Approve or deny one pending tool call through the ordinary permission routes. */
 export function useDecideApproval(teamId: string) {
 	const queryClient = useQueryClient();
@@ -229,6 +243,7 @@ export function useDecideApproval(teamId: string) {
 		onSettled: () => {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.approvals(teamId) });
 			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.activity(teamId) });
 		},
 	});
 }

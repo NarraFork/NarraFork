@@ -18,10 +18,20 @@
  * (P1, ≤ 4 KB; written whole once per compaction cycle — again when it changes or the row that
  * carried it left the history — and named in one line in the rows after that), a context note when the last measured use is above the team's suggested share,
  * this week's limit overruns by kind, approvals waiting in the team tree, work items (open ones
- * listed, finished ones counted), the files this team's open items share with other open items
- * and the project's exclusive paths lock (X; only when there is one of them), and the latest
- * decisions recorded on people's behalf. Lists are filled by priority (approvals, work items,
- * overlaps, decisions) into what the budget leaves, and what does not fit is counted.
+ * listed, finished ones counted), the team's people (M1: members and onlookers by name, and when
+ * each member last spoke, at most {@link TEAM_STATUS_MEMBERS_LIMIT} listed), the files this team's
+ * open items share with other open items and the project's exclusive paths lock (X; only when
+ * there is one of them), and the latest decisions recorded on people's behalf. Lists are filled
+ * by priority (approvals, work items, people, overlaps, decisions) into what the budget leaves,
+ * and what does not fit is counted.
+ *
+ * When a member last spoke is an absolute UTC minute. It moves with every message, so it alone
+ * never makes a new row: two statuses that differ only in those times count as the same (see
+ * {@link statusKey}), and the times shown are those of the latest row written for another
+ * reason. The names are stable too: speakers are taken as the most recent 40 distinct authors of
+ * the latest 500 messages, but listed in a fixed order (members before onlookers, the owner
+ * first, then by name), so a message changes the listed names only when the set of people
+ * changes (someone speaks for the first time in the window, leaves it, or gains or loses access).
  *
  * READS, all bounded: the team and coordinator rows by primary key; open work items
  * (`team_id, state` index, 31 rows) and capped state/finished counts (1,001 ids each); this
@@ -29,8 +39,9 @@
  * and up to 5 decision details by primary key; the live permission registry in memory (at most
  * 1,000 entries looked at) with one `IN` lookup of their narrators; the project's overlap index
  * (`team-overlap.ts`: built from stored paths at most once per pass interval, ≤ 100 items) with
- * one `IN` read of its items and their coordinators. SQLite only, like the session runtime it
- * serves.
+ * one `IN` read of its items and their coordinators; the people (`team-members.ts`: owner,
+ * at most 40 grants of each kind, the speakers among the latest 500 messages, each judged by the
+ * narrator ACL). SQLite only, like the session runtime it serves.
  */
 
 import { hotSafe } from "@server/lib/hot-safe";
@@ -42,6 +53,7 @@ import {
 	TEAM_DECISION_EVENT_KIND,
 	TEAM_STATUS_CADENCE_MS,
 	TEAM_STATUS_MAX_BYTES,
+	TEAM_STATUS_MEMBERS_LIMIT,
 	TEAM_WORK_ITEM_FINISHED_STATES,
 	TEAM_WORK_ITEM_STATES,
 	type TeamSettings,
@@ -78,6 +90,9 @@ export const TEAM_STATUS_LIMITS = {
 	overlaps: 10,
 	titleChars: 80,
 	summaryChars: 120,
+	/** Candidates of each source the people list looks at. */
+	peopleLooked: 40,
+	nameChars: 60,
 } as const;
 
 const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
@@ -109,7 +124,7 @@ interface StatusApproval {
 	summary: string;
 }
 
-interface StatusState {
+export interface StatusState {
 	name: string;
 	baseBranch: string;
 	brief: string;
@@ -130,7 +145,36 @@ interface StatusState {
 	decisions: Array<{ date: string; summary: string }>;
 	/** X: overlaps with other open items and the exclusive lock (null when unavailable). */
 	overlap: TeamOverlapStatus | null;
+	/** M1: the team's people (null when unavailable). */
+	people: StatusPeople | null;
 }
+
+export interface StatusPeople {
+	/** Members first (the owner first), then onlookers; by name. */
+	list: Array<{
+		name: string;
+		role: "member" | "onlooker";
+		owner: boolean;
+		/** ISO time of the member's latest message among the window, or null. */
+		spokeAt: string | null;
+	}>;
+	/** More people may have access than were looked at (a source was cut off). */
+	more: boolean;
+	/** Everyone found with access, by role (named or not). */
+	counts: { members: number; onlookers: number };
+	/** Found only through the project and not named (the coordinator is readable outside it). */
+	hidden: number;
+	visibility: string;
+	writeAudience: string;
+}
+
+/** A member's last message as an absolute UTC minute: `2026-11-18 09:31 UTC`. */
+export function formatSpokeAt(iso: string): string {
+	return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+}
+
+/** Same length as {@link formatSpokeAt}: what a status key shows instead of a time. */
+const SPOKE_AT_MASK = "????-??-?? ??:?? UTC";
 
 const SUMMARY_KEYS = ["command", "file_path", "path", "url", "pattern", "description"] as const;
 
@@ -319,7 +363,43 @@ async function readStatusState(teamId: string, now: number): Promise<StatusState
 		overrunTotal: overrunRows.length,
 		decisions,
 		overlap: await readOverlapStatus(teamId, team.projectId),
+		people: await readStatusPeople(teamId),
 	};
+}
+
+async function readStatusPeople(teamId: string): Promise<StatusPeople | null> {
+	try {
+		const { readTeamMembers } = await import("./team-members");
+		const coordinator = db
+			.select({ visibility: narrators.visibility })
+			.from(narrators)
+			.where(eq(narrators.id, teamId))
+			.limit(1)
+			.get();
+		// The row is written once for everyone who can read the coordinator: when that reaches
+		// beyond the project, people found only through the project are counted, not named.
+		const read = await readTeamMembers(teamId, {
+			limit: TEAM_STATUS_LIMITS.peopleLooked,
+			nameProjectOnly: coordinator?.visibility !== "public",
+		});
+		if (!read) return null;
+		return {
+			list: read.members.map((member) => ({
+				name: oneLine(member.username, TEAM_STATUS_LIMITS.nameChars),
+				role: member.role,
+				owner: member.owner,
+				spokeAt: member.lastSpokeAt,
+			})),
+			more: read.more,
+			counts: read.counts,
+			hidden: read.hidden,
+			visibility: read.visibility,
+			writeAudience: read.writeAudience,
+		};
+	} catch (error) {
+		logger.warn("Team status could not read the people", { teamId, error: String(error) });
+		return null;
+	}
 }
 
 async function readOverlapStatus(
@@ -385,6 +465,8 @@ function cutToBytes(text: string, maxBytes: number): string {
 
 export interface TeamStatusInput {
 	contextPercent?: number;
+	/** Render every member's last-spoken time as a fixed mask (the comparison key). */
+	maskSpokenTimes?: boolean;
 	/**
 	 * The brief text the coordinator already has in its current context (written by an earlier
 	 * status row of this compaction cycle). The same brief is then named, not repeated.
@@ -429,6 +511,19 @@ export function renderTeamStatus(
 	const itemsHead =
 		stateCounts.length > 0 ? t.workItems(stateCounts.join(t.separator)) : t.noWorkItems;
 	const decisionsHead = state.decisions.length > 0 ? t.decisions : null;
+	const people = state.people;
+	const peopleFixed: string[] = [];
+	if (people) {
+		peopleFixed.push(t.people(String(people.counts.members), String(people.counts.onlookers)));
+		if (people.more) peopleFixed.push(t.peopleMore);
+		if (people.hidden > 0) peopleFixed.push(t.peopleHidden(String(people.hidden)));
+		if (people.writeAudience === "project") peopleFixed.push(t.audienceProjectWrite);
+		if (people.writeAudience === "public") peopleFixed.push(t.audiencePublicWrite);
+		if (people.visibility === "project" && people.writeAudience !== "public")
+			peopleFixed.push(t.audienceProjectRead);
+		if (people.visibility === "public") peopleFixed.push(t.audiencePublicRead);
+	}
+	const peopleShown = (people?.list ?? []).slice(0, TEAM_STATUS_MEMBERS_LIMIT);
 	const o = getTeamOverlapLabels(locale);
 	const overlap = state.overlap ?? null;
 	const overlapShown =
@@ -483,6 +578,22 @@ export function renderTeamStatus(
 			total: state.decisions.length,
 			more: t.moreDecisions,
 		},
+		people: {
+			lines: peopleShown.map((person) =>
+				t.member(
+					person.name,
+					person.role,
+					person.owner,
+					person.spokeAt
+						? input.maskSpokenTimes
+							? SPOKE_AT_MASK
+							: formatSpokeAt(person.spokeAt)
+						: null,
+				),
+			),
+			total: people?.list.length ?? 0,
+			more: (count: number) => t.morePeople(String(count)),
+		},
 	} satisfies Record<string, ListSection>;
 
 	// Fixed parts first: heading, notes and every section's first line; then the brief; then
@@ -492,10 +603,11 @@ export function renderTeamStatus(
 		...notes,
 		approvalsHead,
 		itemsHead,
+		...peopleFixed,
 		...overlapFixed,
 		...(decisionsHead ? [decisionsHead] : []),
 	];
-	const sectionCount = 7;
+	const sectionCount = 8;
 	let used = utf8Bytes(fixed.join("\n")) + sectionCount * 2;
 	let briefLines: string[];
 	if (state.brief && !statusIncludesBrief(state, input.briefShown))
@@ -513,10 +625,11 @@ export function renderTeamStatus(
 	const fitted: Record<keyof typeof lists, string[]> = {
 		approvals: [],
 		items: [],
+		people: [],
 		overlaps: [],
 		decisions: [],
 	};
-	for (const key of ["approvals", "items", "overlaps", "decisions"] as const) {
+	for (const key of ["approvals", "items", "people", "overlaps", "decisions"] as const) {
 		const { lines, bytes } = fitList(lists[key], Math.max(0, max - used));
 		fitted[key] = lines;
 		used += bytes;
@@ -528,6 +641,7 @@ export function renderTeamStatus(
 		notes,
 		[approvalsHead, ...fitted.approvals],
 		[itemsHead, ...fitted.items],
+		...(people ? [[...peopleFixed, ...fitted.people]] : []),
 		...(overlapShown ? [[...overlapFixed, ...fitted.overlaps]] : []),
 		...(decisionsHead ? [[decisionsHead, ...fitted.decisions]] : []),
 	];
@@ -545,6 +659,9 @@ export async function readTeamStatus(
 	text: string;
 	/** The same state rendered with the brief itself, to compare with a row that carried it. */
 	textWithBrief: string;
+	/** {@link statusKey}s of the two texts above. */
+	key: string;
+	keyWithBrief: string;
 	brief: string;
 	briefIncluded: boolean;
 } | null> {
@@ -552,21 +669,32 @@ export async function readTeamStatus(
 	if (!state) return null;
 	const text = renderTeamStatus(state, locale, options);
 	const briefIncluded = statusIncludesBrief(state, options.briefShown);
+	const withBrief = { ...options, briefShown: undefined };
+	const key = statusKey(state, locale, options);
 	return {
 		text,
-		textWithBrief: briefIncluded
-			? text
-			: renderTeamStatus(state, locale, { ...options, briefShown: undefined }),
+		textWithBrief: briefIncluded ? text : renderTeamStatus(state, locale, withBrief),
+		key,
+		keyWithBrief: briefIncluded ? key : statusKey(state, locale, withBrief),
 		brief: state.brief,
 		briefIncluded,
 	};
 }
 
+/**
+ * What decides whether a status is new: its text with every member's last-spoken time masked.
+ * Those times move with each message a person sends; they alone never write another row (a
+ * busy conversation would otherwise get a status row per message).
+ */
+export function statusKey(state: StatusState, locale: Locale, input: TeamStatusInput = {}): string {
+	return renderTeamStatus(state, locale, { ...input, maskSpokenTimes: true });
+}
+
 /** Whether the last row already says what this status says. */
-function sameAsLast(last: Delivered, status: { text: string; textWithBrief: string }): boolean {
-	if (last.text === status.text) return true;
+function sameAsLast(last: Delivered, status: { key: string; keyWithBrief: string }): boolean {
+	if (last.key === status.key) return true;
 	return last.messageId !== null && last.messageId === last.briefMessageId
-		? last.text === status.textWithBrief
+		? last.key === status.keyWithBrief
 		: false;
 }
 
@@ -631,6 +759,8 @@ interface Delivered {
 	/** The compact marker the row was written after (null: no compaction yet). */
 	compactSeq: number | null;
 	text: string;
+	/** {@link statusKey} of {@link text}. */
+	key: string;
 	messageId: string | null;
 	/** When the status was last looked at (written or found unchanged). */
 	at: number;
@@ -654,7 +784,7 @@ async function briefInContext(
 
 function nextDelivered(
 	last: Delivered | undefined,
-	status: { text: string; brief: string; briefIncluded: boolean },
+	status: { text: string; key: string; brief: string; briefIncluded: boolean },
 	messageId: string | null,
 	compactSeq: number | null,
 	at: number,
@@ -662,6 +792,7 @@ function nextDelivered(
 	return {
 		compactSeq,
 		text: status.text,
+		key: status.key,
 		messageId,
 		at,
 		...(status.briefIncluded && messageId

@@ -12,7 +12,9 @@ import type {
 	TeamBoardColumn,
 	TeamBoardColumnPage,
 	TeamBoardItem,
+	TeamMembersResponse,
 	TeamPageSummary,
+	TeamPersonDecisionEventKind,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
@@ -24,6 +26,7 @@ import en from "../../locales/en/projects.json";
 import zh from "../../locales/zh-CN/projects.json";
 import { TeamActivity } from "./TeamActivity";
 import { TeamBoard, TeamBoardCard } from "./TeamBoard";
+import { TeamMembersPanel } from "./TeamMembers";
 import { TeamApprovalsList, TeamTopBar } from "./TeamTopBar";
 import { TEAM_BOARD_COLUMNS } from "./team-page-model";
 
@@ -162,6 +165,7 @@ describe("ready items and approvals answered in their session", () => {
 		const approvals: TeamApprovalsResponse = {
 			more: false,
 			unscanned: false,
+			recent: [],
 			approvals: [
 				{
 					id: "q1",
@@ -200,6 +204,192 @@ describe("ready items and approvals answered in their session", () => {
 		expect(question).not.toContain("questions&quot;");
 		expect(tool).toContain("team-approval-approve");
 		expect(tool).toContain("bun test");
+		expect(html).not.toContain("team-recent-decisions");
+	});
+
+	test("the latest decisions say who approved, denied or answered, and where (M1)", async () => {
+		const client = new QueryClient();
+		const decision = (
+			id: string,
+			kind: TeamPersonDecisionEventKind,
+			patch: Record<string, unknown>,
+		) => ({
+			id,
+			kind,
+			actorId: "u",
+			actorName: "alice",
+			toolName: "Bash",
+			approvalKind: "tool" as const,
+			agentId: "w",
+			agentTitle: "Parser worker",
+			depth: 1,
+			createdAt: "2026-11-18T00:00:00.000Z",
+			...patch,
+		});
+		const approvals: TeamApprovalsResponse = {
+			more: false,
+			unscanned: false,
+			approvals: [],
+			recent: [
+				decision("d3", "question.answered", {
+					actorName: "carol",
+					toolName: "AskUserQuestion",
+					approvalKind: "question",
+					agentId: "lead",
+					agentTitle: "Release crew",
+					depth: 0,
+				}),
+				decision("d2", "approval.denied", { actorName: "bob", toolName: "Edit", depth: 2 }),
+				decision("d1", "approval.allowed", {}),
+				decision("dp", "approval.denied", {
+					actorName: "erin",
+					toolName: "ExitPlanMode",
+					approvalKind: "plan",
+				}),
+				decision("da", "question.answered_by_ai", {
+					actorName: "gina",
+					toolName: "AskUserQuestion",
+					approvalKind: "question",
+				}),
+				decision("dd", "question.deferred", {
+					actorName: "frank",
+					toolName: "AskUserQuestion",
+					approvalKind: "question",
+				}),
+				decision("d0", "question.ignored", {
+					actorName: "dave",
+					toolName: "AskUserQuestion",
+					approvalKind: "question",
+				}),
+			],
+		};
+		client.setQueryData(teamKeys.approvals("lead"), approvals);
+		for (const [lng, expected] of [
+			[
+				"en",
+				[
+					"carol answered a question",
+					"Coordinator",
+					"bob denied Edit",
+					"Parser worker · Helper",
+					"alice approved Bash",
+					"Parser worker · Worker",
+					'aria-label="Approved"',
+					'aria-label="Denied"',
+					'aria-label="Answered"',
+					"dave closed a question without telling the agent",
+					'aria-label="Closed silently"',
+					"erin returned a plan",
+					"gina had the AI answer a question",
+					'aria-label="AI answered"',
+					"frank chose to answer a question later",
+					'aria-label="Answer later"',
+				],
+			],
+			[
+				"zh-CN",
+				[
+					"carol 回答了提问",
+					"bob 拒绝了 Edit",
+					"alice 批准了 Bash",
+					"协调者",
+					"dave 关闭了提问",
+					"erin 退回了一份计划",
+					"gina 让 AI 回答了提问",
+					"frank 选择稍后回答提问",
+				],
+			],
+		] as const) {
+			const html = await render(<TeamApprovalsList projectId="p" teamId="lead" />, client, lng);
+			expect(html).toContain("team-recent-decisions");
+			expect(html.split('data-testid="team-recent-decision"').length - 1).toBe(7);
+			expect(html).not.toContain("ExitPlanMode");
+			for (const text of expected) expect(html).toContain(text);
+		}
+	});
+});
+
+describe("members (M1)", () => {
+	const members: TeamMembersResponse = {
+		members: [
+			{
+				userId: "u-owner",
+				username: "olivia",
+				avatarColor: null,
+				avatarImageId: null,
+				role: "member",
+				owner: true,
+				lastSpokeAt: "2026-11-18T09:31:00.000Z",
+			},
+			{
+				userId: "u-bob",
+				username: "bob",
+				avatarColor: null,
+				avatarImageId: null,
+				role: "member",
+				owner: false,
+				lastSpokeAt: null,
+			},
+			{
+				userId: "u-carol",
+				username: "carol",
+				avatarColor: null,
+				avatarImageId: null,
+				role: "onlooker",
+				owner: false,
+				lastSpokeAt: null,
+			},
+		],
+		more: false,
+		visibility: "project",
+		writeAudience: "project",
+		canManage: false,
+	};
+
+	test("members and onlookers with their role, owner and last message; who manages", async () => {
+		const client = new QueryClient();
+		client.setQueryData(teamKeys.members("lead"), members);
+		const html = await render(<TeamMembersPanel projectId="p" teamId="lead" />, client);
+		const rows = [...html.matchAll(/data-user-id="([^"]+)" data-role="([a-z]+)"/g)].map((match) => [
+			match[1],
+			match[2],
+		]);
+		expect(rows).toEqual([
+			["u-owner", "member"],
+			["u-bob", "member"],
+			["u-carol", "onlooker"],
+		]);
+		expect(html).toContain("2 members");
+		expect(html).toContain("1 onlooker");
+		expect(html).toContain("Owner");
+		expect(html).toContain("Last spoke");
+		expect(html).toContain("No recent message");
+		expect(html).toContain("Everyone with write access to the project is a member too.");
+		expect(html).toContain("Everyone in the project can look on.");
+		// Not the owner: no sharing controls, only who can change it.
+		expect(html).toContain("team-members-manage-hint");
+		expect(html).not.toContain('data-testid="team-members-manage"');
+
+		const zhHtml = await render(<TeamMembersPanel projectId="p" teamId="lead" />, client, "zh-CN");
+		expect(zhHtml).toContain("2 位成员");
+		expect(zhHtml).toContain("旁观者");
+		expect(zhHtml).toContain("所有者");
+		expect(zhHtml).toContain("最近没有发言");
+	});
+
+	test("everyone on the page can open the people list from the top bar", async () => {
+		for (const access of ["write", "read"] as const) {
+			const html = await render(
+				<TeamTopBar
+					projectId="p"
+					teamId="lead"
+					title="Release crew"
+					summary={summary({ access, pendingApprovalCount: access === "write" ? 0 : null })}
+				/>,
+			);
+			expect(html).toContain('data-testid="team-members-button"');
+			expect(html).toContain('aria-label="Team members"');
+		}
 	});
 });
 
@@ -315,6 +505,47 @@ describe("activity", () => {
 					createdAt: "2026-11-18T00:00:01.000Z",
 				},
 				{
+					id: "e4",
+					kind: "approval.denied",
+					workItemId: null,
+					workItemTitle: null,
+					actorKind: "person",
+					actorId: "u2",
+					actorName: "bob",
+					detail: { tool: "Bash", agentTitle: "Parser worker", depth: 1 },
+					detailOmitted: false,
+					createdAt: "2026-11-18T00:00:04.000Z",
+				},
+				{
+					id: "e5",
+					kind: "approval.allowed",
+					workItemId: null,
+					workItemTitle: null,
+					actorKind: "person",
+					actorId: "u5",
+					actorName: "erin",
+					detail: {
+						tool: "ExitPlanMode",
+						approvalKind: "plan",
+						agentTitle: "Parser worker",
+						depth: 1,
+					},
+					detailOmitted: false,
+					createdAt: "2026-11-18T00:00:05.000Z",
+				},
+				{
+					id: "e3",
+					kind: "question.answered",
+					workItemId: null,
+					workItemTitle: null,
+					actorKind: "person",
+					actorId: "u3",
+					actorName: "carol",
+					detail: { tool: "AskUserQuestion", agentTitle: "Release crew", depth: 0 },
+					detailOmitted: false,
+					createdAt: "2026-11-18T00:00:03.000Z",
+				},
+				{
 					id: "e0",
 					kind: "team.brief",
 					workItemId: null,
@@ -338,6 +569,16 @@ describe("activity", () => {
 		expect(html).toContain("Someone");
 		expect(html).toContain("Details too long to list");
 		expect(html).toContain("System");
+		// M1: who decided, on what, in which session.
+		expect(html).toContain("Denied");
+		expect(html).toContain("Bash · Parser worker");
+		expect(html).toContain("bob");
+		expect(html).toContain("Answered a question");
+		expect(html).toContain("AskUserQuestion · coordinator");
+		// A plan decision names the plan, never its tool.
+		expect(html).toContain("A plan · Parser worker");
+		expect(html).not.toContain("ExitPlanMode");
+		expect(html).toContain("carol");
 	});
 });
 

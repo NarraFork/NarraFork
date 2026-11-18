@@ -18,6 +18,7 @@ import {
 	type TeamBoardColumn,
 	type TeamBoardItem,
 	type TeamPageSummary,
+	type TeamPersonDecisionEventKind,
 	type TeamWorkItemState,
 } from "@shared/project-teams";
 
@@ -136,6 +137,14 @@ const KNOWN_EVENT_KINDS = new Set([
 	"work.sync",
 	"work.cancelled",
 	"work.cleanup",
+	"approval.allowed",
+	"approval.denied",
+	"question.answered",
+	"question.dismissed",
+	"question.ignored",
+	"question.supplemented",
+	"question.deferred",
+	"question.answered_by_ai",
 ]);
 
 /** The i18n key (under `teams.event.`) of an event's headline. */
@@ -193,6 +202,30 @@ export function eventNote(
 		case "work.created": {
 			const branch = text(detail.branch, 200);
 			return branch ? { key: "branch", values: { branch } } : null;
+		}
+		case "approval.allowed":
+		case "approval.denied":
+		case "question.answered":
+		case "question.dismissed":
+		case "question.ignored":
+		case "question.supplemented":
+		case "question.deferred":
+		case "question.answered_by_ai": {
+			// A plan is named as such, never by its tool's name (ExitPlanMode).
+			const tool = detail.approvalKind === "plan" ? null : (text(detail.tool, 120) ?? "");
+			const agent = text(detail.agentTitle, 120);
+			const depth = num(detail.depth) ?? 1;
+			if (tool === null) {
+				if (depth === 0) return { key: "decisionPlanCoordinator", values: {} };
+				return agent
+					? { key: "decisionPlan", values: { agent } }
+					: { key: "decisionPlanAgent", values: {} };
+			}
+			// The coordinator's own call is named as such; a subagent's by its session title.
+			if (depth === 0) return { key: "decisionCoordinator", values: { tool } };
+			return agent
+				? { key: "decision", values: { tool, agent } }
+				: { key: "decisionAgent", values: { tool } };
 		}
 		default:
 			if (event.kind.startsWith("coordinator.overrun.")) {
@@ -299,3 +332,47 @@ export function teamWorkspaceLayout(width: number): TeamWorkspaceLayout {
 /** The page's narrow-screen tabs. */
 export const TEAM_PAGE_TABS = ["conversation", "board", "activity"] as const;
 export type TeamPageTab = (typeof TEAM_PAGE_TABS)[number];
+
+// ── People (M1) ─────────────────────────────────────────────────────────────
+
+/** The i18n key (under `teams.approvals.recent.`) of a recent decision's line. */
+export function recentDecisionKey(kind: TeamPersonDecisionEventKind): RecentDecisionKey {
+	return RECENT_DECISION_KEYS[kind] ?? "allowed";
+}
+
+/**
+ * The i18n key (under `teams.approvals.recent.`) of a recent decision's line: a plan's approval
+ * or return has its own wording ("approved a plan"), anything else names its tool.
+ */
+export function recentDecisionTextKey(
+	kind: TeamPersonDecisionEventKind,
+	approvalKind: string,
+): string {
+	const key = recentDecisionKey(kind);
+	return approvalKind === "plan" && (key === "allowed" || key === "denied") ? `${key}Plan` : key;
+}
+
+const RECENT_DECISION_KEYS = {
+	"approval.allowed": "allowed",
+	"approval.denied": "denied",
+	"question.answered": "answered",
+	"question.dismissed": "dismissed",
+	"question.ignored": "ignored",
+	"question.supplemented": "supplemented",
+	"question.deferred": "deferred",
+	"question.answered_by_ai": "answeredByAi",
+} as const satisfies Record<TeamPersonDecisionEventKind, string>;
+export type RecentDecisionKey = (typeof RECENT_DECISION_KEYS)[TeamPersonDecisionEventKind];
+
+/**
+ * What the members drawer says about the coordinator's broad audiences (keys under
+ * `teams.members.audience.`): who is a member or an onlooker without being listed by name.
+ */
+export function audienceNotes(visibility: string, writeAudience: string): string[] {
+	const notes: string[] = [];
+	if (writeAudience === "project") notes.push("projectWrite");
+	if (writeAudience === "public") notes.push("publicWrite");
+	if (visibility === "project" && writeAudience !== "public") notes.push("projectRead");
+	if (visibility === "public") notes.push("publicRead");
+	return notes;
+}
