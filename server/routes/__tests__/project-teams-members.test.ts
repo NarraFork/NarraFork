@@ -964,15 +964,18 @@ describe("IM gateway and team sessions (M1)", () => {
 				)?.model,
 			).toBe(modelBefore);
 
-			// Decisions: /approve, /deny and quote replies are refused, nothing is decided.
+			// /status, /approve and /deny reveal nothing (not even whether a call waits); quote
+			// replies are refused; nothing is decided.
 			const before = (await personEvents()).length;
 			const pending = await pendingCall(teamId);
 			for (const [cmd, args] of [
+				["/status", ""],
 				["/approve", ""],
 				["/deny", "not now"],
 			] as const) {
+				const count = sent.length;
 				await im.handleCommand({ cmd, args }, { ...msg, text: `${cmd} ${args}` });
-				expect(sent.at(-1)).toContain(REFUSED_DECISION);
+				expect(sent.slice(count)).toEqual([expect.stringContaining(REFUSED_SESSION)]);
 			}
 			im.trackPermMessageId("perm-message-1", pending.id);
 			const keyword = [...im.constructor.APPROVE_KEYWORDS][0] as string;
@@ -1090,6 +1093,36 @@ describe("IM gateway and team sessions (M1)", () => {
 			pendingPermissions.delete(plainCall.id);
 			await db.delete(userRecentTabs).where(eq(userRecentTabs.userId, holder));
 			await cleanup();
+		}
+	});
+
+	test("broadcasts that send nothing never look up team-ness (stream deltas, unmapped sessions)", async () => {
+		const { gateway } = await import("../../gateway/gateway");
+		// biome-ignore lint/suspicious/noExplicitAny: driving the gateway's private paths
+		const im = gateway as any;
+		im.subscribeToEvents();
+		const membership = await import("../../services/teams/team-membership");
+		const lookups = spyOn(membership, "teamIdOfNarrator");
+		const plain = await narratorService.create({ title: "unmapped", cwd: repo });
+		try {
+			for (const message of [
+				{
+					type: "stream_event",
+					event: { type: "content_block_delta", delta: { type: "text_delta", text: "x" } },
+				},
+				{ type: "tool_use_chunk", toolUseId: "tu", chunk: "{" },
+				{ type: "tool_started", toolName: "Bash", toolUseId: "tu", input: {} },
+				{ type: "message", message: { role: "assistant", contentText: "hello" } },
+			])
+				eventBus.emit({
+					type: "narrator:message_broadcast",
+					narratorId: plain.id,
+					message,
+				} as never);
+			await Bun.sleep(20);
+			expect(lookups).not.toHaveBeenCalled();
+		} finally {
+			lookups.mockRestore();
 		}
 	});
 
@@ -1354,38 +1387,77 @@ describe("asking the AI to answer (M1)", () => {
 });
 
 describe("project visibility changes reach team tab holders (M1)", () => {
-	test("the people with a team session of the project open are told to re-read", async () => {
+	test("the people with a team session of the project open are told; nobody else", async () => {
 		const narratorWs = await import("../../websocket/narrator-ws");
 		const { setProjectVisibility } = await import("../../services/project-membership");
 		const now = new Date().toISOString();
+		const tabOn = async (userId: string, narratorId: string, type: "narrator" | "subagent") => {
+			await db
+				.insert(userRecentTabsMeta)
+				.values({ userId, revision: 1, migratedAt: now, createdAt: now, updatedAt: now })
+				.onConflictDoNothing();
+			await db
+				.insert(userRecentTabs)
+				.values({
+					id: `visibility-tab-${userId}-${narratorId}`,
+					userId,
+					tabKey: `${type}:${narratorId}`,
+					section: "work",
+					type,
+					entityId: narratorId,
+					representedNarratorId: narratorId,
+					title: "tab",
+					lastVisitedAt: 3,
+					sortOrder: 0,
+					createdAt: now,
+					updatedAt: now,
+				})
+				.onConflictDoNothing();
+		};
+		// READER has only the worker (a team subagent) open; the plain holder only a session of
+		// the same project that is not a team's.
+		await tabOn(READER, workerId, "subagent");
+		const plainHolder = "visibility-plain-holder";
 		await db
-			.insert(userRecentTabsMeta)
-			.values({ userId: READER, revision: 1, migratedAt: now, createdAt: now, updatedAt: now })
-			.onConflictDoNothing();
+			.insert(users)
+			.values({ id: plainHolder, username: plainHolder, passwordHash: "x", createdAt: now });
+		const plain = await narratorService.create({ title: "plain", cwd: repo });
 		await db
-			.insert(userRecentTabs)
-			.values({
-				id: `project-tab-${READER}`,
-				userId: READER,
-				tabKey: `subagent:${workerId}`,
-				section: "work",
-				type: "subagent",
-				entityId: workerId,
-				representedNarratorId: workerId,
-				title: "worker one",
-				lastVisitedAt: 3,
-				sortOrder: 0,
-				createdAt: now,
-				updatedAt: now,
-			})
-			.onConflictDoNothing();
+			.update(narrators)
+			.set({ contextProjectId: projectId })
+			.where(eq(narrators.id, plain.id));
+		await tabOn(plainHolder, plain.id, "narrator");
+		// A project without teams, whose session the same plain holder has open.
+		const teamless = generateId();
+		await db.insert(projects).values({
+			id: teamless,
+			name: "teamless",
+			gitPath: join(testHome, "teamless"),
+			defaultBranch: "main",
+			ownerUserId: OWNER,
+			visibility: "private",
+			createdAt: now,
+			updatedAt: now,
+		});
+		const teamlessSession = await narratorService.create({ title: "teamless", cwd: repo });
+		await db
+			.update(narrators)
+			.set({ contextProjectId: teamless })
+			.where(eq(narrators.id, teamlessSession.id));
+		await tabOn(plainHolder, teamlessSession.id, "narrator");
+
 		const sent = spyOn(narratorWs, "broadcastToUser");
-		try {
-			await setProjectVisibility(projectId, "public", { userId: OWNER, isAdmin: false });
-			const told = sent.mock.calls
+		const told = () =>
+			sent.mock.calls
 				.filter(([, frame]) => (frame as { type: string }).type === "project_access_changed")
 				.map(([userId]) => userId);
-			expect(told).toContain(READER);
+		try {
+			await setProjectVisibility(projectId, "public", { userId: OWNER, isAdmin: false });
+			expect(told()).toContain(READER);
+			expect(told()).not.toContain(plainHolder);
+			sent.mockClear();
+			await setProjectVisibility(teamless, "public", { userId: OWNER, isAdmin: false });
+			expect(told()).toEqual([]);
 		} finally {
 			sent.mockRestore();
 			await setProjectVisibility(projectId, "private", { userId: OWNER, isAdmin: false });

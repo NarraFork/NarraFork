@@ -285,10 +285,39 @@ describe("notification recent-tabs consumer", () => {
 			["team-member", "team-owner"],
 		);
 
-		// "Done" is not a call waiting for a member: readers still hear about it, as before.
+		// An admin (a writer outside the member sources) who looked at the session most recently
+		// is among the at most 200 holders read, although 205 onlookers sort before them by id.
+		seedUser("zz-admin", true);
+		db.update(users).set({ role: "admin" }).where(eq(users.id, "zz-admin")).run();
+		db.insert(userRecentTabsMeta)
+			.values({ userId: "zz-admin", revision: 1, migratedAt: NOW, createdAt: NOW, updatedAt: NOW })
+			.run();
+		db.insert(userRecentTabs)
+			.values({
+				id: "recent-zz-admin",
+				userId: "zz-admin",
+				tabKey: "narrator:team-lead",
+				section: "work",
+				type: "narrator",
+				entityId: "team-lead",
+				representedNarratorId: "team-lead",
+				title: "Team lead",
+				lastVisitedAt: 99,
+				sortOrder: 0,
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		requests.length = 0;
+		await handleAttention("team-lead", "waiting_permission");
+		expect(requests.map((request) => new URL(request.url).searchParams.get("user")).sort()).toEqual(
+			["team-member", "team-owner", "zz-admin"],
+		);
+
+		// The "waiting" alert is a team session's only IM signal: no "done" alert to anyone.
 		requests.length = 0;
 		await handleAttention("team-lead", "done");
-		expect(requests).toHaveLength(2 + 205);
+		expect(requests).toHaveLength(0);
 	});
 
 	function teamTab(userId: string, narratorId: string): void {
