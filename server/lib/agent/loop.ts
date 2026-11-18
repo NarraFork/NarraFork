@@ -76,6 +76,11 @@ import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-r
 import { rememberModelTraceRequest } from "./modeltrace-request";
 import { assertNativeMediaPayload, splitNativeMediaReferences } from "./native-media";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
+import {
+	type PendingPlanReflectionGateResult,
+	type PendingPlanReflectionRunner,
+	registerPendingPlanReflectionRunner,
+} from "./pending-plan-reflection";
 import { type DbMessage, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { projectQuestionModelInput } from "./question-model-input";
 import {
@@ -2141,6 +2146,121 @@ export async function resolveExitPlanModeReflection(
 	};
 }
 
+/**
+ * Run plan reflection for an ExitPlanMode whose approval is ALREADY waiting for a person.
+ *
+ * The run is started from outside the agent loop (the manual 计划反思 button, or the switch
+ * being turned on while the plan waits), so the loop is suspended inside its permission handler;
+ * `config`/`rows` are captured by the runner's closure and stay valid for the whole wait.
+ *
+ * Deliberately not `resolveExitPlanModeReflection`:
+ *  - the input is the pending request's resolved input — the text the card shows — instead of a
+ *    second resolution of the raw model input, which could read a plan file that changed since;
+ *  - there is nothing to restore: the wait belongs to the real permission, not to a synthetic gate;
+ *  - a review that cannot decide HANDS THE PLAN BACK (handover) instead of failing closed. The
+ *    approver is already in front of the card, so a provider failure must never deny a plan they
+ *    were about to read. `cancelExitPlanReflection` would additionally mark the row `fail` and
+ *    drop the card from the pending list while the loop stays blocked.
+ */
+async function runPendingExitPlanReflection(args: {
+	config: AgentConfig;
+	rows: readonly DbMessage[];
+	toolUse: AgentToolUse;
+	input: Record<string, unknown>;
+	toolCallId: string | null;
+}): Promise<PendingPlanReflectionGateResult> {
+	const { config, rows, toolUse, input, toolCallId } = args;
+	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const reflectionAbort = new AbortController();
+	const decisionPromise = createExitPlanReflectionDecision(requestId, {
+		narratorId: config.narratorId,
+		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+		parentToolUseId: config.parentToolUseId,
+		toolUseId: toolUse.toolUseId,
+		toolName: toolUse.name,
+		inputJson: input,
+		toolCallId: toolCallId ?? undefined,
+		abortController: reflectionAbort,
+	});
+	const onPreparationAbort = () => {
+		reflectionAbort.abort(config.signal.reason);
+		void cancelExitPlanReflection(requestId, "Tool preparation cancelled");
+	};
+	if (config.signal.aborted) onPreparationAbort();
+	else config.signal.addEventListener("abort", onPreparationAbort, { once: true });
+	await markExitPlanReflectionStarted(requestId);
+	let reflectionDone = false;
+	const reflectionPromise = runExitPlanModeReflectionLoop(
+		config,
+		rows,
+		requestId,
+		toolUse,
+		input,
+		reflectionAbort,
+	).finally(() => {
+		reflectionDone = true;
+	});
+	const decision = await Promise.race([
+		decisionPromise.finally(() => reflectionAbort.abort()),
+		reflectionPromise
+			.catch((err) => {
+				const crashMessage = extractErrorMessage(err);
+				logger.warn("Pending ExitPlanMode reflection loop ended unexpectedly", {
+					err: crashMessage,
+				});
+				return crashMessage;
+			})
+			.then(async (outcome) => {
+				if (isExitPlanReflectionWaitingForUser(requestId)) {
+					return { action: "manual" as const };
+				}
+				const failureSummary =
+					typeof outcome === "string"
+						? `the reflection loop crashed before producing a decision: ${outcome}`
+						: outcome.failureSummary;
+				const reason = `Plan reflection could not finish (${failureSummary ?? "no decision"}); awaiting user decision`;
+				// A review never holds a plan back: the waiting approval keeps its card.
+				if (await handOverExitPlanReflection(requestId, { reason })) return decisionPromise;
+				const alreadySettled = await Promise.race<ExitPlanReflectionDecision | null>([
+					decisionPromise,
+					Promise.resolve(null),
+				]);
+				return alreadySettled ?? { action: "human" as const, reason };
+			}),
+	]);
+	if (!reflectionDone) {
+		reflectionPromise.catch((err) => {
+			logger.warn("Pending ExitPlanMode reflection loop cleanup failed", { err: String(err) });
+		});
+	}
+	config.signal.removeEventListener("abort", onPreparationAbort);
+	cleanupExitPlanReflection(requestId);
+	return { decision, input };
+}
+
+/**
+ * Build the on-demand runner for one ExitPlanMode call. Registered for the length of its
+ * approval wait (see `pending-plan-reflection.ts`), then dropped — the closure holds `config`
+ * and `rows`, so it must not outlive the wait.
+ */
+export function createPendingPlanReflectionRunner(
+	config: AgentConfig,
+	rows: readonly DbMessage[],
+	toolUse: AgentToolUse,
+): PendingPlanReflectionRunner {
+	// Resolved at call time: the tool-call binding is assigned by `executeTool`, which has not
+	// run yet when the runner is registered.
+	const toolCallId = () => config.toolExecutionBindings?.get(toolUse)?.toolCallId ?? null;
+	return (input) =>
+		runPendingExitPlanReflection({
+			config,
+			rows,
+			toolUse,
+			input,
+			toolCallId: toolCallId(),
+		});
+}
+
 function resolvePlanReflectionAutoApprove(
 	config: Pick<AgentConfig, "planReflectionAutoApprove" | "planReflectionAutoApproveOverride">,
 ): boolean {
@@ -2860,6 +2980,22 @@ async function executeToolAfterReflections(
 						error: err instanceof Error ? err.message : String(err),
 					});
 				}
+			}
+		}
+		// A plan that reaches here blocks on its approval card, and the gate above already
+		// declined the review. Publish a runner for exactly that wait so the request can still
+		// be reflected on demand (the 计划反思 button, or the switch turned on while it waits).
+		// Unregistered once the wait ends — the closure holds this pass's `config` and `rows`.
+		if (tu.name === "ExitPlanMode" && !config.reflectionLoop) {
+			const unregister = registerPendingPlanReflectionRunner(
+				config.narratorId,
+				tu.toolUseId,
+				createPendingPlanReflectionRunner(config, rows, tu),
+			);
+			try {
+				return await executeAfterPreAdmission();
+			} finally {
+				unregister();
 			}
 		}
 		return executeAfterPreAdmission();
