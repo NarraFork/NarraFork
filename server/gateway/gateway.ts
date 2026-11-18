@@ -27,12 +27,10 @@ import { resolveProxyForUrl } from "../lib/net/proxy";
 import { resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
-import { canWriteNarrator, NARRATOR_ACL_COLUMNS } from "../services/narrator-acl";
 import { sendMessage } from "../services/narrator-session";
 import { pendingPermissions } from "../services/narrator-session-state";
 import { getRecentTabUserIdsForNarrator, listAllRecentTabs } from "../services/recent-tabs-service";
 import { defaultTaskBackendForNewSession } from "../services/task-source";
-import { recordTeamPersonDecision } from "../services/teams/team-decisions";
 import { teamIdOfNarrator } from "../services/teams/team-membership";
 import { RateLimiter } from "./base-adapter";
 import { loadGatewayConfig } from "./config";
@@ -903,75 +901,37 @@ class Gateway {
 		// let the message flow through to the narrator as normal input.
 		if (!isApprove && !isDeny) return false;
 
-		const decider = await this.teamDecider(pending.narratorId, msg);
-		if (!decider.allowed) {
-			await adapter.send(msg.chatId, t("gateway.teamApprovalRefused", locale));
-			return true;
-		}
+		if (await this.refuseTeamDecision(pending.narratorId, msg.chatId, adapter, locale)) return true;
 		const { resolvePermission } = await import("../services/narrator-permission");
 		if (isApprove) {
-			const resolved = await resolvePermission(requestId, "allow", { userId: decider.userId });
-			this.recordTeamDecision(requestId, pending, decider, "allow", resolved);
+			await resolvePermission(requestId, "allow");
 			await adapter.send(msg.chatId, t("gateway.permissionApproved", locale));
 		} else {
-			const resolved = await resolvePermission(requestId, "deny", {
+			await resolvePermission(requestId, "deny", {
 				denyMessage: replyText || undefined,
-				userId: decider.userId,
 			});
-			this.recordTeamDecision(requestId, pending, decider, "deny", resolved);
 			await adapter.send(msg.chatId, t("gateway.permissionDenied", locale));
 		}
 		return true;
 	}
 
 	/**
-	 * Who may decide a pending call from this chat (M1). A call of a team tree waits for a team
-	 * member: the chat's bound NarraFork account (`gateway_session_mappings.app_user_id`) must
-	 * have write access on the call's session (a subagent's is the coordinator's), and the
-	 * decision is recorded with that person. Without a bound account, or without write access,
-	 * the chat is refused and told to decide in NarraFork. Other sessions are unchanged.
+	 * A call of a team tree is never decided from IM (M1). Only a team member may decide it, and
+	 * the IM sender has no proven NarraFork identity: the mapping's `app_user_id` is filled in
+	 * automatically (`resolveGatewayAppUserId`: the only user, or the first admin) for every
+	 * sender, so it can neither authorize the decision nor be recorded as who took it. The chat
+	 * is told to decide in NarraFork. Every other session is decided exactly as before.
+	 * Returns true when refused (the reply is already sent).
 	 */
-	private async teamDecider(
+	private async refuseTeamDecision(
 		narratorId: string,
-		msg: InboundMessage,
-	): Promise<{ allowed: boolean; userId?: string; team: boolean }> {
-		if (!teamIdOfNarrator(narratorId)) return { allowed: true, team: false };
-		const mapping = await db.query.gatewaySessionMappings.findFirst({
-			where: and(
-				eq(gatewaySessionMappings.platform, msg.platform),
-				eq(gatewaySessionMappings.chatId, msg.chatId),
-				eq(gatewaySessionMappings.userId, msg.userId),
-			),
-			columns: { appUserId: true },
-		});
-		const userId = mapping?.appUserId ?? null;
-		if (!userId) return { allowed: false, team: true };
-		const [row, user] = await Promise.all([
-			db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: NARRATOR_ACL_COLUMNS,
-			}),
-			db.query.users.findFirst({ where: eq(users.id, userId), columns: { role: true } }),
-		]);
-		if (!row || !user) return { allowed: false, team: true };
-		const allowed = await canWriteNarrator(row, { userId, isAdmin: user.role === "admin" });
-		return allowed ? { allowed, userId, team: true } : { allowed: false, team: true };
-	}
-
-	private recordTeamDecision(
-		requestId: string,
-		pending: { narratorId: string; toolName: string },
-		decider: { team: boolean; userId?: string },
-		decision: "allow" | "deny",
-		resolved: boolean,
-	): void {
-		if (!resolved || !decider.team || !decider.userId) return;
-		recordTeamPersonDecision({
-			requestId,
-			target: { narratorId: pending.narratorId, toolName: pending.toolName },
-			userId: decider.userId,
-			decision,
-		});
+		chatId: string,
+		adapter: PlatformAdapter,
+		locale: Locale,
+	): Promise<boolean> {
+		if (!teamIdOfNarrator(narratorId)) return false;
+		await adapter.send(chatId, t("gateway.teamApprovalRefused", locale));
+		return true;
 	}
 
 	/**
@@ -1505,22 +1465,9 @@ class Gateway {
 					await adapter.send(msg.chatId, t("gateway.noPermissionPending", locale));
 					break;
 				}
-				const decider = await this.teamDecider(mapping.narratorId, msg);
-				if (!decider.allowed) {
-					await adapter.send(msg.chatId, t("gateway.teamApprovalRefused", locale));
-					break;
-				}
+				if (await this.refuseTeamDecision(mapping.narratorId, msg.chatId, adapter, locale)) break;
 				const { resolvePermission } = await import("../services/narrator-permission");
-				const resolved = await resolvePermission(pending.requestId, "allow", {
-					userId: decider.userId,
-				});
-				this.recordTeamDecision(
-					pending.requestId,
-					{ narratorId: mapping.narratorId, toolName: pending.toolName },
-					decider,
-					"allow",
-					resolved,
-				);
+				await resolvePermission(pending.requestId, "allow");
 				await adapter.send(msg.chatId, t("gateway.permissionApproved", locale));
 				break;
 			}
@@ -1542,24 +1489,12 @@ class Gateway {
 					await adapter.send(msg.chatId, t("gateway.noPermissionPending", locale));
 					break;
 				}
-				const decider = await this.teamDecider(mapping.narratorId, msg);
-				if (!decider.allowed) {
-					await adapter.send(msg.chatId, t("gateway.teamApprovalRefused", locale));
-					break;
-				}
+				if (await this.refuseTeamDecision(mapping.narratorId, msg.chatId, adapter, locale)) break;
 				const { resolvePermission: resolveP } = await import("../services/narrator-permission");
 				const denyReason = command.args || undefined;
-				const resolved = await resolveP(pendingReq.requestId, "deny", {
+				await resolveP(pendingReq.requestId, "deny", {
 					denyMessage: denyReason,
-					userId: decider.userId,
 				});
-				this.recordTeamDecision(
-					pendingReq.requestId,
-					{ narratorId: mapping.narratorId, toolName: pendingReq.toolName },
-					decider,
-					"deny",
-					resolved,
-				);
 				await adapter.send(msg.chatId, t("gateway.permissionDenied", locale));
 				break;
 			}
