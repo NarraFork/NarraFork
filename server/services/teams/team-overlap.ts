@@ -78,7 +78,7 @@ import { recordWorkEvent, type WorkActor } from "./work-items";
 const FINISHED = [...TEAM_WORK_ITEM_FINISHED_STATES];
 /** Overlap entries one index keeps (the count of all is kept beside them). */
 const INDEX_ENTRIES_MAX = 1000;
-/** `work.overlap` events of one item looked at to tell whether a pair was already told. */
+/** `work.overlap` events of one item read to tell whether a pair was already recorded. */
 const PAIR_EVENT_SCAN = 200;
 /** New cross-team pairs recorded per pass; the rest wait for the next pass. */
 const NEW_PAIRS_PER_PASS = 50;
@@ -824,15 +824,15 @@ function liveEntries(index: OverlapIndex, live: Map<string, LiveItem>): IndexEnt
 
 function toldPairs(itemId: string): Set<string> {
 	const rows = db
-		.select({ kind: teamWorkEvents.kind, detail: teamWorkEvents.detailJson })
+		.select({ detail: teamWorkEvents.detailJson })
 		.from(teamWorkEvents)
-		.where(eq(teamWorkEvents.workItemId, itemId))
+		.where(and(eq(teamWorkEvents.workItemId, itemId), eq(teamWorkEvents.kind, "work.overlap")))
 		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
 		.limit(PAIR_EVENT_SCAN)
 		.all();
 	const told = new Set<string>();
 	for (const row of rows) {
-		const other = row.kind === "work.overlap" ? row.detail?.with : undefined;
+		const other = row.detail?.with;
 		if (typeof other === "string") told.add(other);
 	}
 	return told;
