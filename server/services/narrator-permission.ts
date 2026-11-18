@@ -70,6 +70,7 @@ import {
 	readDeclaredExitPlanMode,
 } from "../lib/agent/tools/plan-mode";
 import { isScheduledTaskReadAction } from "../lib/agent/tools/scheduled-task-actions";
+import { isTeamCleanupCall, isTeamReadAction, TEAM_TOOL_NAME } from "../lib/agent/tools/team";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import type {
 	ToolCallBinding,
@@ -87,6 +88,7 @@ import {
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import { isOwnCoordinatorOutputPath } from "../lib/coordinator-outputs-path";
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { isSecretPlatformPath } from "../lib/fs-secret-paths";
@@ -111,8 +113,14 @@ import { isTeamMember, type RuntimeSourceRow, teamRootOf } from "../lib/runtime-
 import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import type { RuntimePolicy } from "./agent-runtime/policy";
+import { isBrowserReadAction, type RuntimePolicy } from "./agent-runtime/policy";
 import { isRuntimeToolNameAllowed } from "./subagent-tools";
+import {
+	describeTeamCleanup,
+	isGitControlRelativePath,
+	isInsideControlDir,
+	teamWorktreePathsForNarrator,
+} from "./teams/team-membership";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
 export {
@@ -345,6 +353,35 @@ function isInsideDecisionTruncateDir(
 	if (context && (context.backend.kind !== "local" || context.paths.flavor === "spec"))
 		return false;
 	return isInsideTruncateDir(cwd, path);
+}
+
+/**
+ * A team coordinator's own saved tool results (Project Teams P2): reading them needs no approval,
+ * for that narrator only. Another narrator's saved results get no such rule.
+ */
+function isInsideDecisionOwnSavedOutputs(
+	narratorId: string | undefined,
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	if (!narratorId) return false;
+	if (context && (context.backend.kind !== "local" || context.paths.flavor === "spec"))
+		return false;
+	return isOwnCoordinatorOutputPath(narratorId, resolvePath(cwd, path));
+}
+
+/** Paths a read-only call may reach without approval outside its worktree. */
+function isAutoReadablePath(
+	narratorId: string | undefined,
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	return (
+		isInsideDecisionTruncateDir(cwd, path, context) ||
+		isInsideDecisionOwnSavedOutputs(narratorId, cwd, path, context)
+	);
 }
 
 function getShellScopePaths(
@@ -775,6 +812,7 @@ export function resolvePermissionDecision(
 		executionTarget,
 		executionContext,
 		reviewReadOnlyBash = false,
+		narratorId,
 	} = opts;
 	const specError = toolSpecPathError(toolName, input);
 	if (specError) {
@@ -796,8 +834,21 @@ export function resolvePermissionDecision(
 			return "deny";
 		}
 	}
+	if (reviewReadOnlyBash && toolName === TEAM_TOOL_NAME && !isTeamReadAction(input)) {
+		if (meta) meta.blacklistReason = "Review mode: Team changes team work items.";
+		return "deny";
+	}
+	if (reviewReadOnlyBash && toolName === "Agent" && input.isolation !== undefined) {
+		if (meta) meta.blacklistReason = "Review mode: Agent isolation creates a worktree.";
+		return "deny";
+	}
 	if (reviewReadOnlyBash && (toolName === "CreateWorktree" || toolName === "AttachWorktree")) {
 		if (meta) meta.blacklistReason = `Review mode: ${toolName} modifies worktree resources.`;
+		return "deny";
+	}
+	// A reviewer may look at pages, never act on them (see `isBrowserReadAction`).
+	if (reviewReadOnlyBash && toolName === "Browser" && !isBrowserReadAction(input)) {
+		if (meta) meta.blacklistReason = REVIEW_BROWSER_READ_ONLY_REASON;
 		return "deny";
 	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
@@ -1023,6 +1074,50 @@ export function resolvePermissionDecision(
 		return "deny";
 	}
 
+	// Team (P3): per action, above allowlists and the bypassPermissions/dontAsk shortcuts.
+	// `cleanup` deletes a worktree: a person's decision every time, so a confirmed loss in the
+	// input is always something a person approved; in read-only, dontAsk and plan mode there is
+	// nobody to approve it, and the reason makes the deny hard (no soft plan-mode prompt, no
+	// reflection). Bookkeeping, the team's own worktree creation and a base sync write only the
+	// team's records and resources: allowed outside read-only.
+	if (toolName === TEAM_TOOL_NAME) {
+		if (isTeamCleanupCall(toolName, input)) {
+			if (effectiveMode === "readOnly" || effectiveMode === "dontAsk" || planMode) {
+				if (meta)
+					meta.blacklistReason = planMode
+						? "Plan mode: Team cleanup deletes a worktree and is not available while planning."
+						: `${effectiveMode} mode: Team cleanup needs a person's approval and cannot run here.`;
+				return "deny";
+			}
+			return "ask";
+		}
+		if (isTeamReadAction(input)) return "allow";
+		if (effectiveMode === "readOnly") {
+			if (meta) meta.blacklistReason = "Read-only mode: Team changes team work items.";
+			return "deny";
+		}
+		return "allow";
+	}
+	if (toolName === "Agent" && input.isolation !== undefined && effectiveMode === "readOnly") {
+		if (meta) meta.blacklistReason = "Read-only mode: Agent isolation creates a worktree.";
+		return "deny";
+	}
+	// A team's own work item worktrees (plan §二.3, decision T6): delegating into one and file
+	// writes inside one need no person. Blacklists, protected paths and `.git` review ran above.
+	if (
+		effectiveMode !== "readOnly" &&
+		!reviewReadOnlyBash &&
+		isTeamWorktreeScopedCall(
+			toolName,
+			input,
+			cwd,
+			opts.teamWorktrees,
+			context,
+			opts.teamWorktreeGuards,
+		)
+	)
+		return "allow";
+
 	const whitelistDecision = resolveWhitelistDecision(
 		toolName,
 		input,
@@ -1134,7 +1229,7 @@ export function resolvePermissionDecision(
 			if (
 				!hasExternalPath ||
 				(toolPaths.length > 0 &&
-					toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context)))
+					toolPaths.every((path) => isAutoReadablePath(narratorId, cwd, path, context)))
 			) {
 				return "allow";
 			}
@@ -1201,7 +1296,7 @@ export function resolvePermissionDecision(
 	if (
 		hasExternalPath &&
 		isReadOnlyCall(toolName, input) &&
-		toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context))
+		toolPaths.every((path) => isAutoReadablePath(narratorId, cwd, path, context))
 	) {
 		return "allow";
 	}
@@ -1339,7 +1434,82 @@ function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boole
 	if (toolName === "Notification") return input.action === "list_channels";
 	if (toolName === "GenUI") return isGenUiReadAction(input.action);
 	if (toolName === "Worktree") return input.action === "list";
+	if (toolName === TEAM_TOOL_NAME) return isTeamReadAction(input);
 	return toolName === "StructSed" && input.dry_run !== false;
+}
+
+/** Why a reviewer's Browser call that does more than read a page is refused. */
+export const REVIEW_BROWSER_READ_ONLY_REASON =
+	"Review mode: Browser may only read pages (launch headless, navigate, screenshot without " +
+	"file_path, get_text, dom, scroll, close, ...). Clicking, typing, filling forms, running " +
+	"scripts and profiling are not available to a read-only reviewer.";
+
+/** File tools whose writes inside a team work item's worktree need no person (P3). */
+const TEAM_WORKTREE_FILE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
+
+/**
+ * Whether a call stays inside the team's recorded work item worktrees: an `Agent` whose workdir
+ * is one of them (or below one), or a file write whose every target is inside one.
+ */
+export function isTeamWorktreeScopedCall(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	worktrees: readonly string[] | undefined,
+	context?: ExecutionTargetContext | null,
+	/** Directories never auto-allowed for writes (each worktree's configured hooks directory). */
+	guards: readonly string[] = [],
+): boolean {
+	if (!worktrees || worktrees.length === 0) return false;
+	if (context && context.target.deviceId !== LOCAL_DEVICE_ID) return false;
+	const paths = decisionPaths(context);
+	const inside = (path: string) => worktrees.some((root) => paths.contains(root, path));
+	if (toolName === "Agent") {
+		if (typeof input.workdir !== "string" || !input.workdir) return false;
+		return inside(resolveDecisionPath(cwd, input.workdir, context));
+	}
+	if (!TEAM_WORKTREE_FILE_TOOLS.has(toolName)) return false;
+	const targets = getToolPolicyPaths(toolName, input, cwd, undefined, context);
+	// Git control data (hooks, attributes, modules, config) changes what git runs: a person
+	// decides, never the team allowance.
+	const ordinaryFile = (path: string) =>
+		worktrees.some(
+			(root) => paths.contains(root, path) && !isGitControlRelativePath(paths.relative(root, path)),
+		) && !guards.some((guard) => isInsideControlDir(guard, path));
+	return targets.length > 0 && targets.every(ordinaryFile);
+}
+
+/**
+ * The team allowance inputs of one call: the worktrees this narrator may treat as its own and,
+ * for a file write into one of them, that worktree's configured hooks directory. An unreadable
+ * hooks configuration withdraws the allowance (the call asks a person).
+ */
+async function teamWorktreeAllowance(
+	narratorId: string,
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	context: ExecutionTargetContext | null | undefined,
+	constrained: boolean,
+): Promise<{ teamWorktrees?: string[]; teamWorktreeGuards?: string[] }> {
+	if (constrained) return {};
+	const roots = teamWorktreePathsForNarrator(narratorId);
+	if (roots.length === 0 || !TEAM_WORKTREE_FILE_TOOLS.has(toolName))
+		return { teamWorktrees: roots };
+	const paths = decisionPaths(context);
+	const targets = getToolPolicyPaths(toolName, input, cwd, undefined, context);
+	const touched = roots.filter((root) => targets.some((target) => paths.contains(root, target)));
+	if (touched.length === 0) return { teamWorktrees: roots };
+	try {
+		const { configuredHooksDir } = await import("./teams/team-git");
+		const guards = await Promise.all(touched.map((root) => configuredHooksDir(root)));
+		return {
+			teamWorktrees: roots,
+			teamWorktreeGuards: guards.filter((guard): guard is string => guard !== null),
+		};
+	} catch {
+		return { teamWorktrees: [] };
+	}
 }
 
 /** Tools that always require user approval regardless of permission mode. */
@@ -1450,6 +1620,8 @@ function resolveMcpToolPermission(
 
 export interface PermissionDecisionOpts {
 	toolName: string;
+	/** The deciding narrator: its own saved tool results are readable without approval. */
+	narratorId?: string;
 	input: Record<string, unknown>;
 	permMode: string;
 	cwd: string;
@@ -1491,6 +1663,14 @@ export interface PermissionDecisionOpts {
 		whitelist?: Array<{ pattern: string; enabled?: boolean }>;
 		blacklist?: Array<{ pattern: string; enabled?: boolean }>;
 	};
+	/**
+	 * Recorded worktrees of the live work items of the team this narrator works for (P3), from
+	 * `teamWorktreePathsForNarrator`. Delegating into one, and file writes inside one, are the
+	 * team's own resources: allowed without a person outside read-only, plan and review modes.
+	 */
+	teamWorktrees?: readonly string[];
+	/** Directories inside those worktrees that are never auto-allowed (configured hooks). */
+	teamWorktreeGuards?: readonly string[];
 }
 
 // ── Command policy helpers ────────────────────────────────
@@ -4775,6 +4955,11 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	) {
 		finalPermissionDeny("the exact tool attempt has no persisted approval");
 	}
+	// Whatever path produced the approval (rules, cache, reflection), a Team cleanup runs only
+	// on a person's decision for this exact attempt.
+	if (isTeamCleanupCall(check.toolName, check.input) && call.decidedBy !== "user") {
+		finalPermissionDeny("Team cleanup requires a person's approval");
+	}
 	const internalReadAuthority = captureFinalInternalReadAuthority(call);
 	const policy = executionPolicyRepository.loadNow(check.narratorId);
 	const policyRevision = executionPolicyRevision(policy);
@@ -5051,8 +5236,11 @@ export async function recheckFinalToolExecutionPermission(
 					analysis.nonWhitelisted.length > 0 ||
 					analysis.dangerousPatterns.length > 0 ||
 					analysis.hasEnvInjection)) ||
-			(["GenUI", "Notification", "ScheduledTask", "Worktree"].includes(check.toolName) &&
-				!isReadOnlyCall(check.toolName, check.input)))
+			(["GenUI", "Notification", "ScheduledTask", "Worktree", TEAM_TOOL_NAME].includes(
+				check.toolName,
+			) &&
+				!isReadOnlyCall(check.toolName, check.input)) ||
+			(check.toolName === "Browser" && !isBrowserReadAction(check.input)))
 	)
 		finalPermissionDeny("read-only capability ceiling");
 	const sendInScope =
@@ -5080,6 +5268,7 @@ export async function recheckFinalToolExecutionPermission(
 			? "allow"
 			: resolvePermissionDecision({
 					toolName: decisionTool,
+					narratorId: check.narratorId,
 					input: decisionInput,
 					permMode: mode,
 					cwd,
@@ -5096,6 +5285,14 @@ export async function recheckFinalToolExecutionPermission(
 					reviewReadOnlyBash: readOnlyGitShell,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
+					...(await teamWorktreeAllowance(
+						check.narratorId,
+						decisionTool,
+						decisionInput,
+						cwd,
+						context,
+						!!constraint,
+					)),
 				});
 	if (
 		decision === "deny" ||
@@ -5614,12 +5811,30 @@ export async function handlePermission(
 		isPlanMode &&
 		(toolName === "Write" || toolName === "Edit") &&
 		(await (await import("./outline-plan-mode")).outlinePlanCycle(narratorId))?.kind === "outline";
+	// An external (OAuth) session never gets the team's worktree allowance.
+	const teamAllowance = await teamWorktreeAllowance(
+		narratorId,
+		toolName,
+		effectiveInput,
+		cwd,
+		executionContext,
+		!!runtimeConstraint,
+	);
+	const teamWorktreeScoped = isTeamWorktreeScopedCall(
+		toolName,
+		effectiveInput,
+		cwd,
+		teamAllowance.teamWorktrees,
+		executionContext,
+		teamAllowance.teamWorktreeGuards,
+	);
 	let decision =
 		toolName === "Send" &&
 		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput))
 			? "allow"
 			: resolvePermissionDecision({
 					toolName,
+					narratorId,
 					input: effectiveInput,
 					permMode: decisionPermMode,
 					cwd,
@@ -5639,6 +5854,7 @@ export async function handlePermission(
 					executionTarget: initialExecutionTarget,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
+					...teamAllowance,
 				});
 	logger.debug("Permission decision", {
 		narratorId,
@@ -5681,6 +5897,12 @@ export async function handlePermission(
 	// fail-closed shortcuts must not pre-empt it.
 	const oauthReflectsInsteadOfDenying =
 		!!runtimeConstraint && runtimeConstraint.permissionMode === "bypassPermissions";
+	// Only a person may approve a Team cleanup. An external session has nobody to ask, and its
+	// reflection loop is the agent reviewing itself, so this is denied outright.
+	if (runtimeConstraint && isTeamCleanupCall(toolName, effectiveInput) && decision !== "deny") {
+		permMeta.blacklistReason = `OAuth runtime policy cannot obtain a person's approval for Team cleanup`;
+		decision = "deny";
+	}
 	if (runtimeConstraint && !oauthReflectsInsteadOfDenying && decision === "ask") {
 		permMeta.blacklistReason =
 			"OAuth runtime policy denies operations that require interactive approval";
@@ -5885,7 +6107,11 @@ export async function handlePermission(
 		decision === "allow" || (decision === "ask" && !!permMeta.gitInternalReviewReason);
 	if (
 		(oauthDangerReflectionCandidate ||
-			(!runtimeConstraint && bypassReviewCandidate && effectiveMode === "bypassPermissions")) &&
+			(!runtimeConstraint &&
+				bypassReviewCandidate &&
+				effectiveMode === "bypassPermissions" &&
+				// The team's own worktree is no custom directory to reflect on (plan §二.3).
+				!teamWorktreeScoped)) &&
 		dangerReflectionLevel !== "off"
 	) {
 		const danger =
@@ -6121,6 +6347,7 @@ export async function handlePermission(
 		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
+	if (isTeamCleanupCall(toolName, input)) decisionReason = describeTeamCleanup(narratorId, input);
 
 	if (permMeta.gitInternalReviewReason) {
 		decisionReason = decisionReason

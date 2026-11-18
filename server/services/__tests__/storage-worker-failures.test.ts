@@ -149,6 +149,7 @@ describe("storage categories preserve filesystem worker failures", () => {
 		["requestRecordings", REQUEST_RECORDING_DIR],
 		["savedRequestRecordings", REQUEST_RECORDING_SAVED_DIR],
 		["dormantIgnored", "dormant-ignored"],
+		["coordinatorOutputs", "coordinator-outputs"],
 	] as const) {
 		test(`${key} also rejects worker unavailability`, async () => {
 			const directoryPath = join(getNarraforkHome(), directory);

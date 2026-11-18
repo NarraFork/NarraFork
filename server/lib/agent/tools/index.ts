@@ -49,6 +49,7 @@ import { switchDeviceTool } from "./switch-device";
 import { switchWorkingDirectoryTool } from "./switch-working-directory";
 import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
+import { teamTool } from "./team";
 import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
 import { toolSearchTool } from "./tool-search";
@@ -141,6 +142,7 @@ const coreProvider: ToolProvider = {
 			contextAskTool,
 			sendTool,
 			teamStatusTool,
+			teamTool,
 			askUserQuestionTool,
 			questionTool,
 			skillTool,

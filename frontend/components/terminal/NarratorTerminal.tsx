@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
+	useCanOpenTerminals,
 	useCreateNarratorTerminal,
 	useDeleteNarratorTerminal,
 	useNarratorTerminals,
@@ -70,6 +71,7 @@ export function NarratorTerminal({
 	const renameTerminal = useRenameTerminal(ctx);
 	const viewState = useTerminalViewState(ctx);
 	const { t } = useTranslation("terminal");
+	const canOpen = useCanOpenTerminals(narratorId);
 	const terminalCapability = useTerminalCapability();
 	const terminalSupported = terminalCapability.supported;
 	const terminalUnsupportedReason = terminalCapability.reason ?? t("terminalUnsupported");
@@ -198,6 +200,17 @@ export function NarratorTerminal({
 		},
 		[viewState],
 	);
+
+	// A read-only viewer cannot open or create terminals: say so instead of an empty panel.
+	if (canOpen === false) {
+		return (
+			<Group justify="center" align="center" h="100%" px="md" data-testid="terminal-read-only">
+				<Text size="sm" c="dimmed" ta="center">
+					{t("readOnlyNotice")}
+				</Text>
+			</Group>
+		);
+	}
 
 	if (runningTerminals.length === 0) {
 		return (

@@ -37,6 +37,7 @@ import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/
 import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
 import { buildSkillsContext } from "../../lib/agent/tools/skill";
 import { buildSubagentModelContext } from "../../lib/agent/tools/task";
+import { TEAM_TOOL_NAME } from "../../lib/agent/tools/team";
 import type { ToolDefinition } from "../../lib/agent/types";
 import { buildAttachedFilesHint } from "../../lib/attached-files";
 import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/boolean-override";
@@ -64,6 +65,7 @@ import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import {
 	getBotModePrompt,
 	getRunDeliveryHint,
+	getTeamBriefSection,
 	getTeamLeadPrompt,
 	getToolMessage,
 	getToolMessageWithParams,
@@ -230,6 +232,8 @@ import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
+import { coordinatorToolAnnotatorFor, forgetCoordinatorRun } from "../teams/coordinator-limits";
+import { writeTeamStatusAtPass } from "../teams/team-status";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
@@ -351,12 +355,17 @@ export function runtimeBasePrompt(
 	row: RuntimeSourceRow & { systemPrompt: string | null; traits?: unknown },
 	locale: Locale,
 	policy: RuntimePolicy,
+	/** A team subagent's team brief (`teamBriefForSubagent`), read for this request. */
+	teamBrief?: string | null,
 ): string | null {
 	const base = row.systemPrompt ?? settings.agent.defaultSystemPrompt ?? null;
 	const sections: string[] = [];
 	if (isBotNarrator(row.traits)) sections.push(getBotModePrompt(locale));
 	// A team coordinator's duties are a protocol like the bot's: after its own prompt.
 	if (isTeamNarrator(row.traits)) sections.push(getTeamLeadPrompt(locale));
+	// The team's shared rules follow every team subagent's own prompt (both levels).
+	const brief = getTeamBriefSection(locale, teamBrief ?? null);
+	if (brief) sections.push(brief);
 	const deliverTo = runDeliverToOf(row);
 	if (deliverTo) {
 		const run = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
@@ -937,6 +946,8 @@ export async function runAgentLoopUnlocked(
 		// An outline session moves its old fence text to its behavior page once, before its first
 		// prompt is built, and the turn-end note measures the run from here (outline plan PR 4).
 		await prepareOutlineRun(active);
+		// A team coordinator's status (Project Teams P2) is written on the first pass of the run.
+		let teamRunStart = true;
 		while (active.alive && owner.isCurrent()) {
 			void outlineLeases.touch();
 			// The run's own cancellation reaches whichever turn controller is current.
@@ -1008,6 +1019,20 @@ export async function runAgentLoopUnlocked(
 			// A nested helper's gates and status reach its root's page too (also after a restart).
 			const { rememberNestedSubagentRoot } = await import("../nested-subagent-routing");
 			rememberNestedSubagentRoot(freshNarrator);
+			// A team coordinator (Project Teams P2): the team status is a history row written
+			// before this pass reads its history, at run start and after a compaction; the
+			// soft-limit reminders ride on its tool results. Never in the system prompt.
+			const teamCoordinator =
+				!placement && freshNarrator.type === "primary" && isTeamNarrator(freshNarrator.traits);
+			if (teamCoordinator && !active.abortController.signal.aborted)
+				await writeTeamStatusAtPass({
+					narratorId,
+					locale,
+					compactSeq: baselineCompactSeq,
+					runStart: teamRunStart,
+					contextPercent: active._contextUsagePct,
+				});
+			teamRunStart = false;
 			// Effective traits and the capability ceiling, resolved strictly once per pass
 			// so a layer or source change applies from the next pass. A layer that cannot
 			// be read fails the pass; it never runs without its restrictions.
@@ -1143,6 +1168,8 @@ export async function runAgentLoopUnlocked(
 				// Reflection decisions must exist in the parent's immutable declaration set.
 				if (tool.reflectionOnly) return true;
 				if (tool.isAvailable && !tool.isAvailable()) return false;
+				// The Team tool is a coordinator's own: offered to team-trait primaries only.
+				if (tool.name === TEAM_TOOL_NAME && !teamCoordinator) return false;
 				if (!profileToolFilter(tool)) return false;
 				if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
 				if (active._disabledTools.has(tool.name)) return false;
@@ -1311,7 +1338,12 @@ export async function runAgentLoopUnlocked(
 					{
 						systemPrompt: currentOAuth
 							? (currentOAuth.systemPrompt ?? null)
-							: runtimeBasePrompt(current, locale, runtimePolicy),
+							: runtimeBasePrompt(
+									current,
+									locale,
+									runtimePolicy,
+									(await import("../teams/team-membership")).teamBriefForSubagent(current),
+								),
 						contextSummary: current.contextSummary,
 					},
 					active.cwd,
@@ -1959,6 +1991,9 @@ export async function runAgentLoopUnlocked(
 				taskBackend,
 				specImported,
 				bot: isBotNarrator(freshNarrator.traits),
+				annotateToolResult: teamCoordinator
+					? coordinatorToolAnnotatorFor(narratorId, locale)
+					: undefined,
 				narratorId,
 				conversationId: active.conversationId,
 				model: resolved.model,
@@ -3639,6 +3674,8 @@ export async function runAgentLoopUnlocked(
 			active.events.emit("event", { type: "error", data: { message: errorMsg } });
 		}
 	} finally {
+		// A coordinator's per-run bookkeeping (files changed this turn) ends with the run.
+		forgetCoordinatorRun(narratorId);
 		// The run ended: the session's claims go on the idle lease while it waits for its next
 		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
 		// started that ended by itself are given back with a handoff (not waited for).
