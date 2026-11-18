@@ -136,7 +136,7 @@ After installing dependencies, start the development environment:
 bun run dev:all
 ```
 
-This command runs migrations and starts both the backend and frontend development servers. The default frontend port is `7778`, and the backend port is `7779`.
+This command runs migrations and starts both the backend and frontend development servers. The default frontend port is `41221`, and the backend port is `7778`.
 
 Common checks:
 
