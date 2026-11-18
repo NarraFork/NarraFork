@@ -387,6 +387,7 @@ const BATCH_PRINCIPAL_CHUNK = 400;
  * ({@link readVerdict}, {@link writeVerdict}, and the project gate's `projectReadVerdict` /
  * `projectWriteVerdict`), only with the facts answered from memory; a parity test checks them
  * against each other. For fan-out and lists (a team's people), not for a single request's gate.
+ * Dialect-neutral: every statement is awaited, as in the single-principal path.
  */
 export async function judgeNarratorAccessBatch(
 	row: NarratorAclRow,
@@ -418,30 +419,30 @@ export async function judgeNarratorAccessBatch(
 	const rows: Array<GrantRow & { principalType: string; principalId: string }> = [];
 	for (let start = 0; start < userIds.length; start += BATCH_PRINCIPAL_CHUNK) {
 		const chunk = userIds.slice(start, start + BATCH_PRINCIPAL_CHUNK);
-		rows.push(
-			...db
-				.select({
-					principalType: aclGrants.principalType,
-					principalId: aclGrants.principalId,
-					scopeType: aclGrants.scopeType,
-					scopeId: aclGrants.scopeId,
-					capability: aclGrants.capability,
-					domainKind: aclGrants.domainKind,
-					domainValue: aclGrants.domainValue,
-				})
-				.from(aclGrants)
-				.where(
-					and(
-						or(
-							and(eq(aclGrants.principalType, "user"), inArray(aclGrants.principalId, chunk)),
-							// Role grants apply to everyone holding the role; read once per chunk.
-							eq(aclGrants.principalType, "role"),
-						),
-						or(...scopes),
+		// Awaited, never `.all()`: the same statement runs on either backend (dialect-neutral,
+		// like the single-principal path).
+		const chunkRows = await db
+			.select({
+				principalType: aclGrants.principalType,
+				principalId: aclGrants.principalId,
+				scopeType: aclGrants.scopeType,
+				scopeId: aclGrants.scopeId,
+				capability: aclGrants.capability,
+				domainKind: aclGrants.domainKind,
+				domainValue: aclGrants.domainValue,
+			})
+			.from(aclGrants)
+			.where(
+				and(
+					or(
+						and(eq(aclGrants.principalType, "user"), inArray(aclGrants.principalId, chunk)),
+						// Role grants apply to everyone holding the role; read once per chunk.
+						eq(aclGrants.principalType, "role"),
 					),
-				)
-				.all(),
-		);
+					or(...scopes),
+				),
+			);
+		rows.push(...chunkRows);
 	}
 	// Grants by scope and holder, so each principal's caps are two map lookups.
 	const byHolder = new Map<string, GrantRow[]>();

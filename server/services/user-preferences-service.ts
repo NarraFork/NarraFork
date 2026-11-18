@@ -4,7 +4,7 @@ import { narrators, projectTeams, terminals, users } from "../db/schema";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
-import { canWriteNarrator } from "./narrator-acl";
+import { judgeNarratorAccessBatch, type NarratorAclRow } from "./narrator-acl";
 import { getNarratorIdsWithDraft } from "./narrator-draft-service";
 
 // ── Tab helpers ────────────────────────────────────────────────────────────
@@ -50,6 +50,13 @@ export async function enrichTabs(
 					// 系统内部叙述者（ModelTrace 舱）不留在最近标签里：按钮按 id 打开，
 					// 但侧栏不该因此多出一条。
 					hiddenFromLists: narrators.hiddenFromLists,
+					// The ACL columns, for marking team onlooker tabs below (M1).
+					ownerUserId: narrators.ownerUserId,
+					visibility: narrators.visibility,
+					writeAudience: narrators.writeAudience,
+					type: narrators.type,
+					aclRootNarratorId: narrators.aclRootNarratorId,
+					contextProjectId: narrators.contextProjectId,
 				})
 				.from(narrators)
 				.where(inArray(narrators.id, narratorIds)),
@@ -117,7 +124,7 @@ export async function enrichTabs(
 		// Team trees (M1): a tab of a team session the user may only read is marked, so the
 		// client does not alert them that it waits for a person — only members can act on it.
 		try {
-			await markTeamOnlookerTabs(tabs, narratorIds, userId);
+			await markTeamOnlookerTabs(tabs, [...narratorMap.values()], userId);
 		} catch (err) {
 			logger.warn("Failed to mark team onlooker tabs", { error: String(err) });
 		}
@@ -140,29 +147,17 @@ export async function enrichTabs(
 
 /**
  * Set `teamOnlooker` on the tabs of team sessions (a coordinator, or a subagent whose ACL root
- * is one) the user cannot write to; clear it elsewhere. Bounded by the tabs: one `IN` read of
- * the narrators' ACL columns, one of `project_teams`, one of the user's role, and a write check
- * per team session among the tabs (one batch per team).
+ * is one) the user cannot write to; clear it elsewhere. Reuses the narrator rows `enrichTabs`
+ * already loaded; then one `IN` read of `project_teams`, one of the user's role, and one batch
+ * judgement per team among the tabs (`judgeNarratorAccessBatch`).
  */
 async function markTeamOnlookerTabs(
 	tabs: Record<string, unknown>[],
-	narratorIds: string[],
+	rows: NarratorAclRow[],
 	userId: string,
 ): Promise<void> {
 	for (const tab of tabs) delete tab.teamOnlooker;
-	const rows = await db
-		.select({
-			id: narrators.id,
-			ownerUserId: narrators.ownerUserId,
-			visibility: narrators.visibility,
-			writeAudience: narrators.writeAudience,
-			type: narrators.type,
-			aclRootNarratorId: narrators.aclRootNarratorId,
-			contextProjectId: narrators.contextProjectId,
-		})
-		.from(narrators)
-		.where(inArray(narrators.id, narratorIds));
-	const teamOf = (row: (typeof rows)[number]) =>
+	const teamOf = (row: NarratorAclRow) =>
 		row.type === "subagent" ? row.aclRootNarratorId : row.id;
 	const candidates = [...new Set(rows.map(teamOf).filter((id): id is string => !!id))];
 	if (candidates.length === 0) return;
@@ -186,10 +181,10 @@ async function markTeamOnlookerTabs(
 	for (const row of rows) {
 		const teamId = teamOf(row);
 		if (!teamId || !teams.has(teamId)) continue;
-		// A subagent's access is its root's: one decision per team.
+		// A subagent's access is its root's: one judgement per team.
 		let canWrite = writable.get(teamId);
 		if (canWrite === undefined) {
-			canWrite = await canWriteNarrator(row, principal);
+			canWrite = (await judgeNarratorAccessBatch(row, [principal])).get(userId)?.write === true;
 			writable.set(teamId, canWrite);
 		}
 		if (canWrite) continue;

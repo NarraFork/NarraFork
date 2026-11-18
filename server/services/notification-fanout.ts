@@ -28,7 +28,7 @@ import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { botDisplayName, CHAT_MEMBER_FANOUT_LIMIT } from "./chat-service";
 import {
 	canReadNarrator,
-	canWriteNarrator,
+	judgeNarratorAccessBatch,
 	listNarratorAudience,
 	type NarratorAclRow,
 } from "./narrator-acl";
@@ -304,9 +304,14 @@ async function resolveTeamRecipients(teamId: string, row: NarratorAclRow): Promi
 					.where(and(eq(users.role, "admin"), inArray(users.id, tabs)))
 			).map((u) => u.id),
 		);
+		// One batch judgement for all of them (a handful of queries), not one check per user.
+		const verdicts = await judgeNarratorAccessBatch(
+			row,
+			tabs.map((userId) => ({ userId, isAdmin: admins.has(userId) })),
+		);
 		for (const userId of tabs) {
 			if (allowed.size >= NOTIFICATION_FANOUT_MAX_RECIPIENTS) break;
-			if (await canWriteNarrator(row, { userId, isAdmin: admins.has(userId) })) allowed.add(userId);
+			if (verdicts.get(userId)?.write) allowed.add(userId);
 		}
 	}
 	return [...allowed].slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS);

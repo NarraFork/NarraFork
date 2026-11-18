@@ -13,7 +13,8 @@
  *   - the coordinator's owner;
  *   - explicit user grants on the coordinator (distinct users, members' capabilities first, at
  *     most {@link TEAM_MEMBERS_LIST_LIMIT}; read grants are skipped for members-only reads, so
- *     onlookers can never crowd a member out);
+ *     onlookers can never crowd a member out — except project read grants under a `public`
+ *     write audience, which do make members);
  *   - the people who spoke among the coordinator's latest {@link TEAM_SPOKE_WINDOW} messages;
  *   - when the coordinator belongs to a project and an audience reaches beyond its owner
  *     (project or public): the project's owner and explicit user grants, same ordering.
@@ -196,7 +197,13 @@ export async function readTeamMembers(
 			.limit(1)
 			.get();
 		if (project?.owner) add([project.owner], "project");
-		add(grantees("project", projectId, limit, membersOnly), "project");
+		// A `public` write audience lets anyone through the project's door write, so a project
+		// READ grant can make a member there: members-only reads keep read grants in that case
+		// (write / manage still first) and let the batch judge decide.
+		add(
+			grantees("project", projectId, limit, membersOnly && coordinator.writeAudience !== "public"),
+			"project",
+		);
 	}
 
 	// Someone outside the project's door sees only what the coordinator's own ACL and its

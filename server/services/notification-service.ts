@@ -6,7 +6,11 @@ import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import { resolveEffectiveRelaxedPlan } from "@server/lib/permission-modes";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { canWriteNarrator, listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import {
+	judgeNarratorAccessBatch,
+	listNarratorAudience,
+	type NarratorAclRow,
+} from "./narrator-acl";
 import {
 	deliverNotification,
 	type NotificationChannel,
@@ -258,7 +262,7 @@ async function filterUsersWhoCanRead(
 	return candidateUserIds.filter((userId) => allowed.has(userId));
 }
 
-/** The candidates who may drive the narrator (write access; admins always). */
+/** The candidates who may drive the narrator (write access; admins always), judged as one batch. */
 async function filterUsersWhoCanWrite(
 	narrator: NarratorAclRow,
 	candidateUserIds: string[],
@@ -272,12 +276,15 @@ async function filterUsersWhoCanWrite(
 				.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds)))
 		).map((admin) => admin.id),
 	);
-	const allowed: string[] = [];
-	for (const userId of candidateUserIds)
-		if (await canWriteNarrator(narrator, { userId, isAdmin: admins.has(userId) }))
-			allowed.push(userId);
-	return allowed;
+	const verdicts = await judgeNarratorAccessBatch(
+		narrator,
+		candidateUserIds.map((userId) => ({ userId, isAdmin: admins.has(userId) })),
+	);
+	return candidateUserIds.filter((userId) => verdicts.get(userId)?.write === true);
 }
+
+/** Most recent-tab holders a team session's "waiting" alert looks at (M1). */
+const TEAM_ATTENTION_CANDIDATES = 200;
 
 export async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
 	// Server-side IM only alerts on done / waiting-for-permission. Errors are
@@ -297,12 +304,16 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	// may no longer read it. Access can be revoked after a tab was opened, and a
 	// webhook carrying the narrator's title and status would otherwise keep
 	// delivering to them — a notification must never outlive the permission.
-	const recentTabUserIds = await getRecentTabUserIdsForNarrator(narratorId);
+	// A call waiting in a team tree waits for a member: onlookers (read only) are not told, and
+	// the candidates are bounded and judged as one batch. Other sessions are unchanged.
+	const teamWaiting = reason === "waiting_permission" && !!teamIdOfNarrator(narrator.id);
+	const recentTabUserIds = await getRecentTabUserIdsForNarrator(
+		narratorId,
+		teamWaiting ? TEAM_ATTENTION_CANDIDATES : undefined,
+	);
 	if (recentTabUserIds.length === 0) return;
 	let relevantUserIds = await filterUsersWhoCanRead(narrator, recentTabUserIds);
-	// A call waiting in a team tree waits for a member: onlookers (read only) are not told.
-	if (reason === "waiting_permission" && teamIdOfNarrator(narrator.id))
-		relevantUserIds = await filterUsersWhoCanWrite(narrator, relevantUserIds);
+	if (teamWaiting) relevantUserIds = await filterUsersWhoCanWrite(narrator, relevantUserIds);
 	if (relevantUserIds.length === 0) return;
 
 	const notificationPrefs: Array<{
