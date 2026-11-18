@@ -7,7 +7,11 @@ import {
 	narrators,
 	scheduledTasks,
 } from "../../db/schema";
-import { type ActiveNarrator, activeNarrators } from "../narrator-session-state";
+import {
+	type ActiveNarrator,
+	activeNarrators,
+	claimNarratorRuntime,
+} from "../narrator-session-state";
 import { isBlocked, probeUnattendedIdle } from "../unattended-probe";
 
 const NOW = "2026-01-01T00:00:00.000Z";
@@ -45,6 +49,19 @@ describe("unattended idle probe", () => {
 		expect(isBlocked(report)).toBe(true);
 	});
 
+	test("a loop-less runtime claim blocks even with no live session", async () => {
+		const release = claimNarratorRuntime("claimed-narrator", "unattended-probe-test");
+		try {
+			const report = await probeUnattendedIdle({ dueWithinMs: 120_000 });
+			expect(report.narrators.count).toBe(1);
+			expect(report.narrators.ids).toEqual(["claimed-narrator"]);
+			expect(isBlocked(report)).toBe(true);
+		} finally {
+			release();
+		}
+		expect((await probeUnattendedIdle({ dueWithinMs: 120_000 })).narrators.count).toBe(0);
+	});
+
 	test("a stale DB 'working' row is reported but does not block on its own", async () => {
 		narrator("orphaned", { status: "working" });
 		const report = await probeUnattendedIdle({ dueWithinMs: 120_000 });
@@ -68,6 +85,71 @@ describe("unattended idle probe", () => {
 		const report = await probeUnattendedIdle({ dueWithinMs: 120_000 });
 		expect(report.queuedDeliveries).toBe(true);
 		expect(isBlocked(report)).toBe(true);
+	});
+
+	test("a queued task notice never blocks: only a running loop consumes it", async () => {
+		await narrator("n1");
+		db.insert(narratorBufferedMessages)
+			.values({
+				id: "notice-1",
+				narratorId: "n1",
+				text: "background task finished",
+				seq: 1,
+				bufferedAt: NOW,
+				state: "queued",
+				kind: "task_notice",
+				noticeKind: "bash",
+			})
+			.run();
+		const report = await probeUnattendedIdle({ dueWithinMs: 120_000 });
+		expect(report.queuedDeliveries).toBe(false);
+		expect(isBlocked(report)).toBe(false);
+	});
+
+	test("an archived session's queued input is inert, a live session's is not", async () => {
+		await narrator("archived-1", { status: "archived" });
+		db.insert(narratorBufferedMessages)
+			.values({
+				id: "archived-msg",
+				narratorId: "archived-1",
+				text: "queued long ago",
+				seq: 1,
+				bufferedAt: NOW,
+				state: "queued",
+			})
+			.run();
+		expect((await probeUnattendedIdle({ dueWithinMs: 120_000 })).queuedDeliveries).toBe(false);
+
+		await narrator("live-1");
+		db.insert(narratorBufferedMessages)
+			.values({
+				id: "live-msg",
+				narratorId: "live-1",
+				text: "waiting for the loop",
+				seq: 1,
+				bufferedAt: NOW,
+				state: "queued",
+			})
+			.run();
+		expect((await probeUnattendedIdle({ dueWithinMs: 120_000 })).queuedDeliveries).toBe(true);
+	});
+
+	test("a terminally failed delivery does not hold the machine on", async () => {
+		await narrator("n1");
+		db.insert(narratorBufferedMessages)
+			.values({
+				id: "m-failed",
+				narratorId: "n1",
+				text: "gave up",
+				seq: 1,
+				bufferedAt: NOW,
+				state: "failed",
+				lastError: "claim attempts exhausted",
+			})
+			.run();
+		const report = await probeUnattendedIdle({ dueWithinMs: 120_000 });
+		expect(report.queuedDeliveries).toBe(false);
+		expect(isBlocked(report)).toBe(false);
 	});
 
 	test("a running background task blocks, a finished one does not", async () => {

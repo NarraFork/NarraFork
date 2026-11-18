@@ -10,19 +10,16 @@
  *     forever, and — more importantly — must not be trusted in the other direction either.
  *   - The update coordinator's execution counters, which are the same numbers the update
  *     pipeline uses to decide that an instance has drained.
- *   - Four bounded existence probes for durable queues (mailbox, background tasks, pending
- *     publication outbox, scheduled tasks due inside the quiet window).
+ *   - Bounded existence probes for durable queues. Only deliveries that represent work a live
+ *     session will actually pick up count (see `readDurableQueues` for the exact predicate):
+ *     `task_notice` rows and archived sessions' leftovers are inert by design and must not
+ *     block a shutdown forever.
  *
  * Anything unexpected (a probe throwing, a missing PostgreSQL runtime) resolves to
  * `unknown: true`, which callers treat as BLOCKED. Never power off on uncertainty.
  */
 
-import {
-	activeNarrators,
-	compactLocks,
-	hasNarratorAdmissionWork,
-	isNarratorRuntimeBusy,
-} from "./narrator-session-state";
+import { compactLocks, listRuntimeBusyNarratorIds } from "./narrator-session-state";
 import { getUpdateCoordinationStatus } from "./update-coordinator";
 
 /** Bounded diagnostics: enough to name the work, never the whole table. */
@@ -105,7 +102,6 @@ export function emptyUnattendedBlockers(): UnattendedBlockers {
 }
 
 function readRuntime(report: UnattendedBlockers): void {
-	const busy: string[] = [];
 	let compacting = 0;
 	try {
 		// Compact locks are separate from the loop: a compaction writes messages while the
@@ -114,11 +110,10 @@ function readRuntime(report: UnattendedBlockers): void {
 	} catch {
 		compacting = 0;
 	}
-	for (const narratorId of activeNarrators.keys()) {
-		if (isNarratorRuntimeBusy(narratorId) || hasNarratorAdmissionWork(narratorId)) {
-			busy.push(narratorId);
-		}
-	}
+	// Enumerate every authority that can hold a narrator, not just live sessions: a pending
+	// permission, a loop-less runtime claim or an admission lease keeps a narrator busy with
+	// no `activeNarrators` entry at all.
+	const busy = listRuntimeBusyNarratorIds();
 	report.narrators = { count: busy.length, ids: busy.slice(0, BLOCKER_ID_LIMIT) };
 	report.compacting = compacting;
 	const coordination = getUpdateCoordinationStatus();
@@ -158,10 +153,22 @@ async function hit(query: Query, sql: string, bindings: readonly unknown[] = [])
 
 async function readDurableQueues(report: UnattendedBlockers, input: UnattendedProbeInput) {
 	const query = await openQuery();
+	// Only deliveries that will actually be executed count:
+	//  - `user_input` / `agent_message` start or continue a turn;
+	//  - `queued` / `claimed` are pending or in flight; `failed` is terminal and needs a
+	//    human retry, so it must never hold the machine on (same rule the outbox follows);
+	//  - `task_notice` is consumed only by a loop that is ALREADY running (nothing wakes an
+	//    idle narrator for it), so it is passive — the coordinator counters and the busy
+	//    narrator check cover its producing run;
+	//  - archived sessions never run again, so their leftovers are inert.
 	report.queuedDeliveries = await hit(
 		query,
-		`SELECT 1 AS hit FROM narrator_buffered_messages
-		  WHERE state IN ('queued','claimed','failed') LIMIT 1`,
+		`SELECT 1 AS hit FROM narrator_buffered_messages m
+		   JOIN narrators n ON n.id = m.narrator_id
+		  WHERE m.state IN ('queued','claimed')
+		    AND m.kind IN ('user_input','agent_message')
+		    AND n.status <> 'archived'
+		  LIMIT 1`,
 	);
 	report.backgroundTasks = await hit(
 		query,
