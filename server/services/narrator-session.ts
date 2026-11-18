@@ -262,9 +262,11 @@ import {
 	consumePlanModePromptRebuild,
 	hasNarratorAdmissionWork,
 	hasPendingHistoryCompact,
+	hasRevertBlockingAdmissionWork,
 	isNarratorRevertAdmissionBlocked,
 	isNarratorRuntimeBusy,
 	listNarratorAdmissionOwners,
+	loadBackgroundSubagentIds,
 	narratorCreationLocks,
 	narratorLoopAdmissions,
 	pendingFeedback,
@@ -276,6 +278,7 @@ import {
 	planModeAskedOnce,
 	reserveNarratorRevertAdmission,
 	resolveNarratorAdmissionRoot,
+	retainBackgroundSubagentWork,
 	waitForNarratorAdmissionWork,
 	withNarratorMutationAdmission,
 	withNarratorStartAdmission,
@@ -9009,10 +9012,21 @@ export async function acquireNarratorRevertAdmission(
 			const interrupted = new Set<AbortController>();
 			interruptPlannedUpdateRecovery(narratorId);
 			// No start mutex is held here. Starting work may not have mounted its abort
-			// controller yet, so rescan until ALL admitted work (including delivery) exits.
-			while (busy() || hasNarratorAdmissionWork(narratorId)) {
+			// controller yet, so rescan until the reverted session's own work exits.
+			// Background subagents share this admission root but are not part of the
+			// turn: cancelling them here is what stopped agents launched with
+			// run_in_background. Foreground runs on this root are still cancelled,
+			// including a held run, and so is the session being reverted.
+			for (;;) {
 				signal.throwIfAborted();
-				for (const owner of new Set([narratorId, ...listNarratorAdmissionOwners(narratorId)])) {
+				const owners = listNarratorAdmissionOwners(narratorId);
+				const background = await loadBackgroundSubagentIds(
+					owners.filter((id) => id !== narratorId),
+				);
+				retainBackgroundSubagentWork(narratorId, background);
+				if (!busy() && !hasRevertBlockingAdmissionWork(narratorId)) break;
+				for (const owner of new Set([narratorId, ...owners])) {
+					if (background.has(owner)) continue;
 					// A revert needs the real terminal boundary, including a held run: cancel
 					// the run itself, not only its current turn.
 					const run = getRunControl(owner);
@@ -9042,7 +9056,11 @@ export async function acquireNarratorRevertAdmission(
 				});
 			}
 		}
-		await reservation.acquire(signal, busy);
+		await reservation.acquire(
+			signal,
+			busy,
+			interrupt ? { retainBackgroundSubagents: true } : undefined,
+		);
 		return releaseAndResume;
 	} catch (error) {
 		releaseAndResume();
