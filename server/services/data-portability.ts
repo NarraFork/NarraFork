@@ -64,6 +64,7 @@ import {
 } from "@server/services/data-portability-keys";
 import { resetSpecImportStateCache } from "@server/services/outline/spec-import/state";
 import { invalidateTaskBackend } from "@server/services/task-source/backend";
+import { forgetTeamSessions } from "@server/services/teams/team-session-memo";
 import { addImportedRequestsToUsageDaily } from "@server/services/usage-daily";
 import {
 	MAX_IMPORT_BYTES,
@@ -1347,6 +1348,8 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		// Overwritten sessions may bring another task backend; their import state was dropped.
 		invalidateTaskBackend();
 		resetSpecImportStateCache();
+		// An overwritten id may now be another kind of session (team or not).
+		forgetTeamSessions();
 	}
 
 	// The key store is a file outside the SQLite transaction, so the remaining keys are
@@ -1859,6 +1862,7 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 			invalidateGitIdentityCache();
 			invalidateTaskBackend();
 			resetSpecImportStateCache();
+			forgetTeamSessions();
 		}
 	}
 

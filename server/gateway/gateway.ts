@@ -16,6 +16,7 @@ import {
 	narratorMessages,
 	narrators,
 	projects,
+	projectTeams,
 	users,
 } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
@@ -32,6 +33,7 @@ import { pendingPermissions } from "../services/narrator-session-state";
 import { getRecentTabUserIdsForNarrator, listAllRecentTabs } from "../services/recent-tabs-service";
 import { defaultTaskBackendForNewSession } from "../services/task-source";
 import { teamIdOfNarrator } from "../services/teams/team-membership";
+import { isTeamSessionCached } from "../services/teams/team-session-memo";
 import { RateLimiter } from "./base-adapter";
 import { loadGatewayConfig } from "./config";
 import { GatewayStreamConsumer } from "./stream-consumer";
@@ -986,23 +988,10 @@ class Gateway {
 	 * `notification-service.ts` is the one IM alert a team session sends.
 	 */
 	private isTeamSession(narratorId: string): boolean {
-		// Fixed when the session is created (a coordinator's team row, a subagent's ACL root), so
-		// the answer is remembered. Asked only where something would be sent to a chat, never for
-		// stream deltas (a team session never gets a stream consumer).
-		const known = this.teamSessionMemo.get(narratorId);
-		if (known !== undefined) return known;
-		const team = !!teamIdOfNarrator(narratorId);
-		if (this.teamSessionMemo.size >= Gateway.TEAM_SESSION_MEMO_LIMIT) {
-			const oldest = this.teamSessionMemo.keys().next().value;
-			if (oldest !== undefined) this.teamSessionMemo.delete(oldest);
-		}
-		this.teamSessionMemo.set(narratorId, team);
-		return team;
+		// Asked only where something would be sent to a chat, never for stream deltas (a team
+		// session never gets a stream consumer); remembered per narrator (team-session-memo.ts).
+		return isTeamSessionCached(narratorId);
 	}
-
-	/** Remembered team-ness per narrator (M1), oldest dropped first. */
-	private readonly teamSessionMemo = new Map<string, boolean>();
-	private static readonly TEAM_SESSION_MEMO_LIMIT = 2000;
 
 	private subscribeToEvents(): void {
 		// Listen for narrator status changes — deliver the final assistant
@@ -1614,20 +1603,46 @@ class Gateway {
 			return;
 		}
 
-		// Collect narrator IDs from tabs for status lookup
+		// Collect narrator IDs from tabs for status lookup (the same id the list prints)
 		const narratorIds: string[] = [];
 		for (const t of tabs) {
 			if (t.type === "narrator" && typeof t.id === "string") narratorIds.push(t.id);
+			else if (typeof t.narratorId === "string") narratorIds.push(t.narratorId);
 		}
 
-		// Batch-fetch narrator statuses
+		// Batch-fetch narrator statuses, and which tabs are team sessions (M1): those are listed
+		// without their status — IM reads nothing of a team session. One `IN` read of
+		// `project_teams` for the coordinators and the subagents' roots.
 		const statusMap = new Map<string, string>();
+		const teamTree = new Set<string>();
 		if (narratorIds.length > 0) {
 			const rows = await db
-				.select({ id: narrators.id, status: narrators.status })
+				.select({
+					id: narrators.id,
+					status: narrators.status,
+					type: narrators.type,
+					aclRootNarratorId: narrators.aclRootNarratorId,
+				})
 				.from(narrators)
 				.where(inArray(narrators.id, narratorIds));
 			for (const r of rows) statusMap.set(r.id, r.status);
+			const rootOf = (r: (typeof rows)[number]) =>
+				r.type === "subagent" ? r.aclRootNarratorId : r.id;
+			const roots = [...new Set(rows.map(rootOf).filter((id): id is string => !!id))];
+			const teams = roots.length
+				? new Set(
+						(
+							await db
+								.select({ id: projectTeams.narratorId })
+								.from(projectTeams)
+								.where(inArray(projectTeams.narratorId, roots))
+						).map((row) => row.id),
+					)
+				: new Set<string>();
+			for (const r of rows) {
+				const root = rootOf(r);
+				if (root && teams.has(root)) teamTree.add(r.id);
+			}
 		}
 
 		// Format output: group by folder, show narrator tabs
@@ -1669,9 +1684,14 @@ class Gateway {
 			const isActive = narratorId === activeNarratorId;
 			const marker = isActive ? "▸" : " ";
 			const title = typeof tab.title === "string" && tab.title ? tab.title : "(untitled)";
+			const suffix = isActive ? t("gateway.currentSuffix", locale) : "";
+			if (teamTree.has(narratorId)) {
+				// Listed (it can be named), but its state stays in NarraFork.
+				lines.push(`${indent}${marker} [${idx}] ${title}${suffix}`);
+				continue;
+			}
 			const status =
 				statusMap.get(narratorId) ?? (typeof tab.status === "string" ? tab.status : "?");
-			const suffix = isActive ? t("gateway.currentSuffix", locale) : "";
 
 			lines.push(`${indent}${marker} [${idx}] ${title} (${status})${suffix}`);
 		}
