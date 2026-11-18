@@ -105,3 +105,11 @@ export const teamActivityQuerySchema = z.object({
 	limit: z.coerce.number().int().min(1).max(TEAM_EVENTS_PAGE_LIMIT).default(TEAM_EVENTS_PAGE_LIMIT),
 	cursor: pageCursor,
 });
+
+/** `POST /api/projects/:projectId/team-locks/release`: a person releases the exclusive lock. */
+export const releaseTeamLockSchema = z
+	.object({
+		workItemId: z.string().min(1).max(200),
+		reason: z.string().max(500).optional(),
+	})
+	.strict();
