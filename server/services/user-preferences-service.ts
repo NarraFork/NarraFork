@@ -146,8 +146,8 @@ export async function enrichTabs(
 }
 
 /**
- * Set `teamOnlooker` on the tabs of team sessions (a coordinator, or a subagent whose ACL root
- * is one) the user cannot write to; clear it elsewhere. Reuses the narrator rows `enrichTabs`
+ * Set `teamSession` on the tabs of team sessions (a coordinator, or a subagent whose ACL root is
+ * one) and `teamOnlooker` on those the user cannot write to; clear both elsewhere. Reuses the narrator rows `enrichTabs`
  * already loaded; then one `IN` read of `project_teams`, one of the user's role, and one batch
  * judgement per team among the tabs (`judgeNarratorAccessBatch`).
  */
@@ -156,7 +156,10 @@ async function markTeamOnlookerTabs(
 	rows: NarratorAclRow[],
 	userId: string,
 ): Promise<void> {
-	for (const tab of tabs) delete tab.teamOnlooker;
+	for (const tab of tabs) {
+		delete tab.teamOnlooker;
+		delete tab.teamSession;
+	}
 	const teamOf = (row: NarratorAclRow) =>
 		row.type === "subagent" ? row.aclRootNarratorId : row.id;
 	const candidates = [...new Set(rows.map(teamOf).filter((id): id is string => !!id))];
@@ -181,6 +184,7 @@ async function markTeamOnlookerTabs(
 	for (const row of rows) {
 		const teamId = teamOf(row);
 		if (!teamId || !teams.has(teamId)) continue;
+		for (const tab of tabs) if (getTabNarratorId(tab) === row.id) tab.teamSession = true;
 		// A subagent's access is its root's: one judgement per team.
 		let canWrite = writable.get(teamId);
 		if (canWrite === undefined) {

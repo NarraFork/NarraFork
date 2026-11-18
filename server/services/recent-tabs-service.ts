@@ -1626,6 +1626,7 @@ export async function getRuntimePatches(
 			containerStatus: tab.containerStatus ?? null,
 			// M1: a team session this user can only read (no "waiting for you" alerts).
 			teamOnlooker: tab.teamOnlooker === true,
+			teamSession: tab.teamSession === true,
 		},
 	}));
 	return { revision: snapshot.revision, patches };
@@ -1709,6 +1710,33 @@ export async function getRecentTabUserIdsForNarrator(
 		if (rows.length < MIGRATION_BATCH_SIZE) break;
 	}
 	return userIds;
+}
+
+/**
+ * Which of `userIds` have this narrator in their recent tabs: one indexed read per 500 ids.
+ * For a fixed candidate set (a team's members, M1), so other holders cannot crowd them out.
+ */
+export async function getRecentTabUserIdsForNarratorAmong(
+	narratorId: string,
+	userIds: readonly string[],
+): Promise<string[]> {
+	if (userIds.length === 0) return [];
+	await ensureAllRecentTabsMigrated();
+	const found = new Set<string>();
+	const unique = [...new Set(userIds)];
+	for (let start = 0; start < unique.length; start += 500) {
+		const rows = await db
+			.selectDistinct({ userId: userRecentTabs.userId })
+			.from(userRecentTabs)
+			.where(
+				and(
+					eq(userRecentTabs.representedNarratorId, narratorId),
+					inArray(userRecentTabs.userId, unique.slice(start, start + 500)),
+				),
+			);
+		for (const row of rows) found.add(row.userId);
+	}
+	return unique.filter((id) => found.has(id));
 }
 
 /** Update only users indexed as members of this narrator tab. */

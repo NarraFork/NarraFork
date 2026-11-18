@@ -16,7 +16,11 @@ import {
 	type NotificationChannel,
 	type NotificationDeliveryResult,
 } from "./notification-delivery";
-import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import {
+	getRecentTabUserIdsForNarrator,
+	getRecentTabUserIdsForNarratorAmong,
+} from "./recent-tabs-service";
+import { readTeamMemberIds } from "./teams/team-members";
 import { teamIdOfNarrator } from "./teams/team-membership";
 
 export type NotificationTarget = { user_id?: string; username?: string };
@@ -283,8 +287,8 @@ async function filterUsersWhoCanWrite(
 	return candidateUserIds.filter((userId) => verdicts.get(userId)?.write === true);
 }
 
-/** Most recent-tab holders a team session's "waiting" alert looks at (M1). */
-const TEAM_ATTENTION_CANDIDATES = 200;
+/** Candidates of each source the team's members are read from for a "waiting" alert (M1). */
+const TEAM_ATTENTION_CANDIDATES = 50;
 
 export async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
 	// Server-side IM only alerts on done / waiting-for-permission. Errors are
@@ -304,13 +308,18 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	// may no longer read it. Access can be revoked after a tab was opened, and a
 	// webhook carrying the narrator's title and status would otherwise keep
 	// delivering to them — a notification must never outlive the permission.
-	// A call waiting in a team tree waits for a member: onlookers (read only) are not told, and
-	// the candidates are bounded and judged as one batch. Other sessions are unchanged.
-	const teamWaiting = reason === "waiting_permission" && !!teamIdOfNarrator(narrator.id);
-	const recentTabUserIds = await getRecentTabUserIdsForNarrator(
-		narratorId,
-		teamWaiting ? TEAM_ATTENTION_CANDIDATES : undefined,
-	);
+	// A call waiting in a team tree waits for a member: onlookers (read only) are not told. The
+	// candidates start from the team's members (`readTeamMemberIds`, bounded) and keep those who
+	// have this session in their recent tabs, so any number of onlooker tab holders cannot push a
+	// member out; then one batch write check. Other sessions are unchanged.
+	const teamId = reason === "waiting_permission" ? teamIdOfNarrator(narrator.id) : null;
+	const teamWaiting = !!teamId;
+	const recentTabUserIds = teamId
+		? await getRecentTabUserIdsForNarratorAmong(
+				narratorId,
+				await readTeamMemberIds(teamId, TEAM_ATTENTION_CANDIDATES),
+			)
+		: await getRecentTabUserIdsForNarrator(narratorId);
 	if (recentTabUserIds.length === 0) return;
 	let relevantUserIds = await filterUsersWhoCanRead(narrator, recentTabUserIds);
 	if (teamWaiting) relevantUserIds = await filterUsersWhoCanWrite(narrator, relevantUserIds);

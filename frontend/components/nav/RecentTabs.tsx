@@ -1,7 +1,6 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
 import {
-	accessChangeNeedsRuntimeRefresh,
 	hasDirectorySubtitle,
 	isTeamOnlookerTab,
 	statusAttention,
@@ -30,6 +29,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { installTeamOnlookerRefresh } from "../../hooks/team-onlooker-refresh";
 import { useFolderDisplay } from "../../hooks/useFolderDisplay";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
@@ -250,17 +250,15 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 	// A sharing change can turn a team onlooker into a member (or back): read the runtime patches
 	// again so `teamOnlooker` (which silences "waiting" alerts) follows it without a reload. M1.
-	useEffect(() => {
-		const handle = narratorWSManager.addListener(
-			{ narratorIds: "*", types: ["narrator_access_changed"] },
-			(data) => {
-				const narratorId = typeof data.narratorId === "string" ? data.narratorId : null;
-				if (narratorId && accessChangeNeedsRuntimeRefresh(tabsRef.current, narratorId))
-					void refreshRuntime().catch(() => {});
-			},
-		);
-		return () => narratorWSManager.removeListener(handle);
-	}, [refreshRuntime]);
+	useEffect(
+		() =>
+			installTeamOnlookerRefresh(
+				narratorWSManager,
+				() => tabsRef.current,
+				() => void refreshRuntime().catch(() => {}),
+			),
+		[refreshRuntime],
+	);
 
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);

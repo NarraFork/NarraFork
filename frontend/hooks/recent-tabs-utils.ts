@@ -26,6 +26,8 @@ export interface RecentTab extends PersistedRecentTab {
 	 * may only read. Its calls wait for a member, so no "waiting for you" alert fires (M1).
 	 */
 	teamOnlooker?: boolean;
+	/** Runtime-enriched marker: a team session (coordinator or one of its subagents). M1. */
+	teamSession?: boolean;
 	/** Persisted marker (see `PersistedRecentTab`): this narrator was spawned by a scheduled task. */
 	isScheduled?: boolean;
 }
@@ -54,6 +56,16 @@ export function accessChangeNeedsRuntimeRefresh(
 			tab.type === "subagent" ||
 			tab.teamOnlooker === true ||
 			(tab.type === "narrator" && tab.id === narratorId),
+	);
+}
+
+/**
+ * Whether a project access change may have changed `teamOnlooker` (M1): project grants decide
+ * who passes a team coordinator's project-wide audiences. Any team or subagent tab qualifies.
+ */
+export function projectAccessChangeNeedsRuntimeRefresh(tabs: readonly RecentTab[]): boolean {
+	return tabs.some(
+		(tab) => tab.type === "subagent" || tab.teamSession === true || tab.teamOnlooker === true,
 	);
 }
 
