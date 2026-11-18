@@ -73,8 +73,7 @@ export class SlackAdapter extends BaseAdapter {
 				token: this.config.botToken,
 				appToken: this.config.appToken,
 				socketMode: true,
-				// biome-ignore lint/suspicious/noExplicitAny: proxy agents are real http.Agent subclasses at runtime
-				...(agent ? { agent: agent as any } : {}),
+				...(agent ? { agent } : {}),
 			}) as unknown as SlackAppLike;
 
 			// Listen for messages
