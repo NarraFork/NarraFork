@@ -18,8 +18,8 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 
 | 命令 | 用途 |
 |------|------|
-| `bun run dev` | 后端：运行数据库迁移 + 热重载服务器（端口 7779） |
-| `bun run dev:frontend` | 前端：Vite 开发服务器（端口 7778，代理 /api 和 /ws 到 7779） |
+| `bun run dev` | 后端：运行数据库迁移 + 热重载服务器（端口 7778） |
+| `bun run dev:frontend` | 前端：Vite 开发服务器（端口 41221，代理 /api 和 /ws 到 7778） |
 | `bun run build` | 构建前端到 `dist/frontend/` |
 | `bun run start` | 生产环境：运行数据库迁移 + 启动后端 + 静态前端 |
 | `bun run db:generate` | 生成 Drizzle 迁移 SQL 文件 |
@@ -155,7 +155,7 @@ frontend/
 ```
 
 **路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目、叙述者、管理面板、例程、设置、搜索、登录、许可证。
-**Vite 开发代理：** `/api/*` → `localhost:7779`，`/ws/*` → `ws://localhost:7779`。
+**Vite 开发代理：** `/api/*` → `localhost:7778`，`/ws/*` → `ws://localhost:7778`。
 
 ### API 路由
 

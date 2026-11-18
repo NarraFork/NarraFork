@@ -1,7 +1,8 @@
 /**
- * `bun run dev:all` runs two servers: Vite serves the app (default 7778) and this
- * process is only the API (7779). The listen address is the API. The address a
- * person should open is the Vite origin, passed as `NARRAFORK_DEV_APP_URL`.
+ * `bun run dev:all` runs two servers: Vite serves the app (default 41221) and this
+ * process is the API (default 7778, the same port as a normal server). The listen
+ * address is the API. The address a person should open is the Vite origin, passed
+ * as `NARRAFORK_DEV_APP_URL`.
  *
  * Production and `bun run dev` (API only) leave the variable unset, so the
  * banner keeps advertising the listener.
@@ -9,10 +10,10 @@
 
 export const DEV_APP_URL_ENV = "NARRAFORK_DEV_APP_URL";
 
-/** Port `dev:all` binds the API to so it does not collide with Vite. */
-export const DEV_ALL_BACKEND_PORT = "7779";
+/** Port `dev:all` binds the API to. Same as the server default, and not Vite's port. */
+export const DEV_ALL_BACKEND_PORT = "7778";
 
-export const DEFAULT_DEV_FRONTEND_PORT = "7778";
+export const DEFAULT_DEV_FRONTEND_PORT = "41221";
 
 /** Origin Vite serves when `dev:all` starts it. Honors `VITE_PORT` when it is a TCP port. */
 export function devFrontendOrigin(env: NodeJS.ProcessEnv = process.env): string {

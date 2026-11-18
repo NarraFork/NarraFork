@@ -940,7 +940,7 @@ const stopRemoteAccess = attachRemoteAccessRuntime({
 	const proto = getProtocol();
 	const listenUrl = `${proto}://${urlHost(currentHost)}:${runtimeAddress().port}`;
 	// dev:all sets NARRAFORK_DEV_APP_URL to the Vite origin. This process is the API
-	// (7779); the banner and the browser open must send the user to the frontend.
+	// (7778); the banner and the browser open must send the user to the frontend.
 	const url = resolveAdvertisedAppUrl({
 		listenUrl,
 		devAppUrl: process.env.NARRAFORK_DEV_APP_URL,

@@ -7,6 +7,7 @@ import { bundledLanguagesAlias, bundledLanguagesInfo } from "shiki";
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import { resolveBuildGitHubRepository } from "../scripts/lib/build-repository";
+import { DEFAULT_DEV_FRONTEND_PORT, DEV_ALL_BACKEND_PORT } from "../server/lib/dev-app-url";
 import { injectSpaBaseHref } from "../server/lib/spa-base-href";
 import {
 	assertAppShellJavaScriptIsPrecached,
@@ -26,8 +27,8 @@ import {
 import { nativeModuleBoundary } from "./build/remote-boundaries";
 import { createShikiLanguageAliasMap } from "./build/shiki-language-aliases";
 
-const vitePort = Number(process.env.VITE_PORT) || 7778;
-const backendPort = Number(process.env.BACKEND_PORT) || 7779;
+const vitePort = Number(process.env.VITE_PORT) || Number(DEFAULT_DEV_FRONTEND_PORT);
+const backendPort = Number(process.env.BACKEND_PORT) || Number(DEV_ALL_BACKEND_PORT);
 const frontendOutDir = resolve(__dirname, "..", "dist", "frontend");
 /**
  * Path of the module `shikiLanguageAliases()` substitutes, normalized to forward
