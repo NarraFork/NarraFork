@@ -372,6 +372,11 @@ export interface TeamApprovalsResponse {
 	 * reflections came first): there may be visible ones it did not reach.
 	 */
 	unscanned: boolean;
+	/**
+	 * M1: the latest decisions people took on the tree's calls (approved, denied, answered),
+	 * newest first, at most {@link TEAM_RECENT_DECISIONS_LIMIT}.
+	 */
+	recent: TeamRecentDecision[];
 }
 
 /** The team page's top bar; small and cheap so the page can poll it. */
@@ -503,4 +508,80 @@ export interface TeamOverlapResponse {
 	moreEntries: number;
 	exclusivePaths: string[];
 	locks: TeamExclusiveLockView[];
+}
+
+// ── M1: several people in one team ───────────────────────────────────────────
+
+/**
+ * A person's place in a team, read from the coordinator's narrator ACL (plan §二.1: no second
+ * membership system): write access makes a member (speaks in the conversation, approves and
+ * answers), read access an onlooker (watches only).
+ */
+export type TeamMemberRole = "member" | "onlooker";
+
+/** A person who can reach the team, as the members list shows them. */
+export interface TeamMember {
+	userId: string;
+	username: string;
+	avatarColor: string | null;
+	avatarImageId: string | null;
+	role: TeamMemberRole;
+	/** The coordinator's owner (manages who else may join). */
+	owner: boolean;
+	/**
+	 * When this person last spoke in the coordinator's conversation, among its latest
+	 * {@link TEAM_SPOKE_WINDOW} messages; null when not among them.
+	 */
+	lastSpokeAt: string | null;
+}
+
+/** `GET /api/projects/:projectId/teams/:teamId/members` (members and onlookers). */
+export interface TeamMembersResponse {
+	members: TeamMember[];
+	/** More people than were looked at or listed (see {@link TEAM_MEMBERS_LIST_LIMIT}). */
+	more: boolean;
+	/** The coordinator's broad read audience: private / project / public. */
+	visibility: string;
+	/** The coordinator's broad write audience: owner / project / public. */
+	writeAudience: string;
+	/** The caller may grant and revoke access (the coordinator's owner or an admin). */
+	canManage: boolean;
+}
+
+/** Most people the members list shows (and the most candidates of each source it checks). */
+export const TEAM_MEMBERS_LIST_LIMIT = 100;
+/** Messages of the coordinator's conversation read to find when each person last spoke. */
+export const TEAM_SPOKE_WINDOW = 500;
+/** Most people the team status lists (the rest are counted). */
+export const TEAM_STATUS_MEMBERS_LIMIT = 12;
+
+/**
+ * Team events of a person's decision on a call of the team tree: who approved, denied or
+ * answered (plan §二.12 "记下是谁批的"). `actor_id` is the person; the detail names the call.
+ */
+export const TEAM_PERSON_DECISION_EVENT_KINDS = [
+	"approval.allowed",
+	"approval.denied",
+	"question.answered",
+] as const;
+export type TeamPersonDecisionEventKind = (typeof TEAM_PERSON_DECISION_EVENT_KINDS)[number];
+
+/** Most recent decisions the approvals drawer lists. */
+export const TEAM_RECENT_DECISIONS_LIMIT = 10;
+
+/** A decision a person took on a call of the team tree, for the approvals drawer. */
+export interface TeamRecentDecision {
+	/** The team event id. */
+	id: string;
+	kind: TeamPersonDecisionEventKind;
+	/** The person who decided, and their username when still known. */
+	actorId: string | null;
+	actorName: string | null;
+	toolName: string;
+	approvalKind: TeamApprovalKind;
+	/** The session the call belonged to, and its level (0 coordinator, 1 worker, 2 helper). */
+	agentId: string | null;
+	agentTitle: string | null;
+	depth: number;
+	createdAt: string;
 }

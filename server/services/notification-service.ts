@@ -6,13 +6,14 @@ import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import { resolveEffectiveRelaxedPlan } from "@server/lib/permission-modes";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import { canWriteNarrator, listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
 import {
 	deliverNotification,
 	type NotificationChannel,
 	type NotificationDeliveryResult,
 } from "./notification-delivery";
 import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import { teamIdOfNarrator } from "./teams/team-membership";
 
 export type NotificationTarget = { user_id?: string; username?: string };
 const CHANNELS: readonly NotificationChannel[] = ["dingtalk", "feishu"];
@@ -257,6 +258,27 @@ async function filterUsersWhoCanRead(
 	return candidateUserIds.filter((userId) => allowed.has(userId));
 }
 
+/** The candidates who may drive the narrator (write access; admins always). */
+async function filterUsersWhoCanWrite(
+	narrator: NarratorAclRow,
+	candidateUserIds: string[],
+): Promise<string[]> {
+	if (candidateUserIds.length === 0) return [];
+	const admins = new Set(
+		(
+			await db
+				.select({ id: users.id })
+				.from(users)
+				.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds)))
+		).map((admin) => admin.id),
+	);
+	const allowed: string[] = [];
+	for (const userId of candidateUserIds)
+		if (await canWriteNarrator(narrator, { userId, isAdmin: admins.has(userId) }))
+			allowed.push(userId);
+	return allowed;
+}
+
 export async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
 	// Server-side IM only alerts on done / waiting-for-permission. Errors are
 	// surfaced elsewhere (in-app + gateway); keep behavior as before and skip.
@@ -277,7 +299,10 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	// delivering to them — a notification must never outlive the permission.
 	const recentTabUserIds = await getRecentTabUserIdsForNarrator(narratorId);
 	if (recentTabUserIds.length === 0) return;
-	const relevantUserIds = await filterUsersWhoCanRead(narrator, recentTabUserIds);
+	let relevantUserIds = await filterUsersWhoCanRead(narrator, recentTabUserIds);
+	// A call waiting in a team tree waits for a member: onlookers (read only) are not told.
+	if (reason === "waiting_permission" && teamIdOfNarrator(narrator.id))
+		relevantUserIds = await filterUsersWhoCanWrite(narrator, relevantUserIds);
 	if (relevantUserIds.length === 0) return;
 
 	const notificationPrefs: Array<{

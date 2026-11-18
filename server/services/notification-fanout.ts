@@ -26,7 +26,12 @@ import {
 } from "@shared/notification-center";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { botDisplayName, CHAT_MEMBER_FANOUT_LIMIT } from "./chat-service";
-import { canReadNarrator, listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import {
+	canReadNarrator,
+	canWriteNarrator,
+	listNarratorAudience,
+	type NarratorAclRow,
+} from "./narrator-acl";
 import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	type RecordNotificationInput,
@@ -34,6 +39,8 @@ import {
 	syncChatNotificationReads,
 } from "./notification-center-service";
 import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import { readTeamMemberIds } from "./teams/team-members";
+import { teamIdOfNarrator } from "./teams/team-membership";
 
 export type { NotificationKind, NotificationLink, RecordNotificationInput };
 export { NOTIFICATION_FANOUT_MAX_RECIPIENTS, NOTIFICATION_PREVIEW_MAX_LENGTH };
@@ -231,6 +238,8 @@ function buildPermissionPreview(toolName: string, hint: string | null | undefine
  * tabs stand in for the interested audience and the cap applies.
  */
 async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[]> {
+	const teamId = teamIdOfNarrator(row.id);
+	if (teamId) return await resolveTeamRecipients(teamId, row);
 	const candidates = new Set<string>();
 	if (row.ownerUserId) candidates.add(row.ownerUserId);
 
@@ -264,6 +273,37 @@ async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[
 		} else if (await canReadNarrator(row, { userId, isAdmin: false })) {
 			allowed.push(userId);
 		}
+		if (allowed.length >= NOTIFICATION_FANOUT_MAX_RECIPIENTS) break;
+	}
+	return allowed;
+}
+
+/**
+ * Recipients of a call waiting in a team tree (M1): the team's members only. A call of the
+ * team's tree waits for a member, and only members (write access on the coordinator) may decide
+ * it, so onlookers are not told. Candidates are the members the team's people list finds
+ * (owner, explicit and project grants, recent speakers) plus recent-tab viewers, each judged by
+ * write access on the calling session (a subagent's access is the coordinator's).
+ */
+async function resolveTeamRecipients(teamId: string, row: NarratorAclRow): Promise<string[]> {
+	const candidates = new Set<string>(
+		await readTeamMemberIds(teamId, NOTIFICATION_FANOUT_MAX_RECIPIENTS),
+	);
+	for (const id of await getRecentTabUserIdsForNarrator(row.id, NOTIFICATION_FANOUT_MAX_RECIPIENTS))
+		candidates.add(id);
+	if (candidates.size === 0) return [];
+	const ids = [...candidates].slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS * 2);
+	const admins = new Set(
+		(
+			await db
+				.select({ id: users.id })
+				.from(users)
+				.where(and(eq(users.role, "admin"), inArray(users.id, ids)))
+		).map((u) => u.id),
+	);
+	const allowed: string[] = [];
+	for (const userId of ids) {
+		if (await canWriteNarrator(row, { userId, isAdmin: admins.has(userId) })) allowed.push(userId);
 		if (allowed.length >= NOTIFICATION_FANOUT_MAX_RECIPIENTS) break;
 	}
 	return allowed;

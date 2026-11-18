@@ -27,6 +27,7 @@ import {
 	readTeamActivity,
 	readTeamApprovals,
 	readTeamBoardColumn,
+	readTeamMembersPage,
 	readTeamPageSummary,
 	readTeamRunning,
 } from "../services/teams/team-board";
@@ -185,6 +186,21 @@ projectTeamRoutes.get("/:projectId/teams/:teamId/approvals", async (c) => {
 	c.header("Cache-Control", "no-store");
 	return c.json(
 		await readTeamApprovals(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+		),
+	);
+});
+
+/**
+ * The team's people (M1): members (write on the coordinator) and onlookers (read), with when
+ * each last spoke. Readable by both; access is changed through the narrator sharing routes.
+ */
+projectTeamRoutes.get("/:projectId/teams/:teamId/members", async (c) => {
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamMembersPage(
 			c.req.param("teamId"),
 			narratorPrincipalOf(c),
 			c.req.param("projectId"),

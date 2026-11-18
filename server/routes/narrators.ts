@@ -514,6 +514,7 @@ import {
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
+import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
 import { personActor, runAsTeamStatusActor } from "../services/teams/team-records";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
@@ -6467,6 +6468,8 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 
+	// The gate ran before the body arrived: access revoked meanwhile must not answer.
+	await requireNarratorAccess(c, narratorId, "write");
 	const locale = (await getUserLanguage(userId)) as Locale;
 	const result = await answerAsyncQuestion(questionId, {
 		answers: parsed.data.answers,
@@ -6480,6 +6483,14 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordTeamPersonDecision({
+		requestId: questionId,
+		target: { narratorId, toolName: "AskUserQuestion" },
+		userId,
+		decision: "allow",
+		answered: true,
+		questionId,
+	});
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6537,12 +6548,24 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	return c.json({ ok: true, question: result.record });
 });
 
+/**
+ * Re-check write access on a decision's session right before deciding. The gate above ran
+ * before the body arrived; access revoked while the request was in flight (a member removed
+ * from a team, say) must not let the decision through. Also reads the call for the team's
+ * record of who decided (M1), before deciding takes it out of the live registries.
+ */
+async function recheckDecisionAccess(c: Context, requestId: string) {
+	await requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
+	return await readDecisionTarget(requestId);
+}
+
 // Approve permission
 narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 	const requestId = c.req.param("requestId");
 	const userId = c.get("user").sub;
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "allow", ...body });
+	const target = await recheckDecisionAccess(c, requestId);
 	const resolved = await resolvePermissionOrDangerReflection(requestId, "allow", {
 		answers: parsed.success ? parsed.data.answers : undefined,
 		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
@@ -6552,22 +6575,34 @@ narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 		decidedBy: "user",
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId,
+			decision: "allow",
+			answered: parsed.success && !!parsed.data.answers,
+		});
 	return c.json({ ok: true });
 });
 
 // Deny permission
 narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	const requestId = c.req.param("requestId");
+	const userId = c.get("user").sub;
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "deny", ...body });
+	const target = await recheckDecisionAccess(c, requestId);
 	const resolved = await resolvePermissionOrDangerReflection(requestId, "deny", {
 		denyMessage: parsed.success ? parsed.data.message : undefined,
 		answers: parsed.success ? parsed.data.answers : undefined,
 		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
 		updatedPlan: parsed.success ? parsed.data.updatedPlan : undefined,
+		userId,
 		decidedBy: "user",
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
+	if (target) recordTeamPersonDecision({ requestId, target, userId, decision: "deny" });
 	return c.json({ ok: true });
 });
 

@@ -22,6 +22,8 @@ import {
 	TEAM_BOARD_COLUMNS,
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
 	TEAM_PAUSE_LIMIT,
+	TEAM_PERSON_DECISION_EVENT_KINDS,
+	TEAM_RECENT_DECISIONS_LIMIT,
 	TEAM_RUNNING_AGENTS_LIMIT,
 	type TeamActivityEvent,
 	type TeamActivityPage,
@@ -31,8 +33,11 @@ import {
 	type TeamBoardColumnPage,
 	type TeamBoardItem,
 	type TeamEventActorKind,
+	type TeamMembersResponse,
 	type TeamPageSummary,
 	type TeamPendingApproval,
+	type TeamPersonDecisionEventKind,
+	type TeamRecentDecision,
 	type TeamRunningResponse,
 	teamApprovalKind,
 } from "@shared/project-teams";
@@ -46,8 +51,9 @@ import {
 	users,
 } from "../../db/schema";
 import { ValidationError } from "../../lib/errors";
-import type { NarratorPrincipal } from "../narrator-acl";
+import { canManageNarratorAcl, type NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
+import { readTeamMembers } from "./team-members";
 import { loadTeamForAccess } from "./team-service";
 
 const RUNNING_STATUSES: ("working" | "waiting")[] = ["working", "waiting"];
@@ -589,6 +595,90 @@ export async function readTeamApprovals(
 		// "More" only when visible calls were cut off; an unfinished scan is said apart.
 		more: rows.length > TEAM_APPROVALS_LIMIT,
 		unscanned: !complete && rows.length <= TEAM_APPROVALS_LIMIT,
+		recent: readRecentDecisions(teamId),
+	};
+}
+
+/** Latest team events looked at for the recent decisions (index range, newest first). */
+const RECENT_DECISION_SCAN = 200;
+
+/**
+ * The latest decisions people took on the tree's calls (M1: who approved, denied, answered),
+ * newest first, at most {@link TEAM_RECENT_DECISIONS_LIMIT}: among the team's latest
+ * {@link RECENT_DECISION_SCAN} events (`(team_id, created_at, id)` index), then their details by
+ * primary key and the deciders' names in one `IN` lookup.
+ */
+export function readRecentDecisions(teamId: string): TeamRecentDecision[] {
+	const kinds = new Set<string>(TEAM_PERSON_DECISION_EVENT_KINDS);
+	const ids = db
+		.select({ id: teamWorkEvents.id, kind: teamWorkEvents.kind })
+		.from(teamWorkEvents)
+		.where(eq(teamWorkEvents.teamId, teamId))
+		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
+		.limit(RECENT_DECISION_SCAN)
+		.all()
+		.filter((row) => kinds.has(row.kind))
+		.slice(0, TEAM_RECENT_DECISIONS_LIMIT)
+		.map((row) => row.id);
+	if (ids.length === 0) return [];
+	const rows = db
+		.select({
+			id: teamWorkEvents.id,
+			kind: teamWorkEvents.kind,
+			actorKind: teamWorkEvents.actorKind,
+			actorId: teamWorkEvents.actorId,
+			detail: sql<
+				string | null
+			>`case when length(${teamWorkEvents.detailJson}) <= ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then ${teamWorkEvents.detailJson} end`,
+			createdAt: teamWorkEvents.createdAt,
+		})
+		.from(teamWorkEvents)
+		.where(inArray(teamWorkEvents.id, ids))
+		.all()
+		.sort(
+			(a, b) => b.createdAt.localeCompare(a.createdAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+		);
+	const names = actorNames(rows);
+	return rows.map((row) => {
+		const detail = parseDetail(row.detail) ?? {};
+		const tool = typeof detail.tool === "string" ? detail.tool : "";
+		return {
+			id: row.id,
+			kind: row.kind as TeamPersonDecisionEventKind,
+			actorId: row.actorId,
+			actorName: row.actorId ? (names.get(`${row.actorKind}:${row.actorId}`) ?? null) : null,
+			toolName: tool,
+			approvalKind: teamApprovalKind(tool),
+			agentId: typeof detail.narratorId === "string" ? detail.narratorId : null,
+			agentTitle:
+				typeof detail.agentTitle === "string" && detail.agentTitle ? detail.agentTitle : null,
+			depth: typeof detail.depth === "number" ? detail.depth : 0,
+			createdAt: row.createdAt,
+		};
+	});
+}
+
+// ── Members (M1) ────────────────────────────────────────────────────────────
+
+/**
+ * The team's people for the members drawer: members (write on the coordinator) and onlookers
+ * (read), with when each last spoke. Members and onlookers may read it; others get 404.
+ * `canManage` says whether the caller may grant and revoke access, which goes through the
+ * ordinary narrator sharing routes on the coordinator.
+ */
+export async function readTeamMembersPage(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+): Promise<TeamMembersResponse> {
+	const { coordinator } = await loadTeamForAccess(teamId, principal, "read", projectId);
+	const read = await readTeamMembers(teamId);
+	return {
+		members: read?.members ?? [],
+		more: read?.more ?? false,
+		visibility: read?.visibility ?? coordinator.visibility,
+		writeAudience: read?.writeAudience ?? coordinator.writeAudience,
+		canManage: await canManageNarratorAcl(coordinator, principal),
 	};
 }
 

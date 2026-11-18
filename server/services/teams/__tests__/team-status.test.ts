@@ -45,6 +45,7 @@ const { TEAM_STATUS_CADENCE_MS, TEAM_STATUS_MAX_BYTES } = await import("@shared/
 const { readTestMessageContent } = await import("../../../../tests/setup");
 
 const OWNER = "status-owner";
+const OWNER_NAME = `${OWNER}-${Date.now()}`;
 const repo = join(testHome, "repo");
 let projectId: string;
 let teamId: string;
@@ -66,7 +67,7 @@ beforeAll(async () => {
 	const now = new Date().toISOString();
 	await db.insert(users).values({
 		id: OWNER,
-		username: `${OWNER}-${Date.now()}`,
+		username: OWNER_NAME,
 		passwordHash: "x",
 		role: "user",
 		createdAt: now,
@@ -201,6 +202,11 @@ describe("the status text", () => {
 				"Work items: in progress 1, in review 1, 1 finished.",
 				"- [in progress] Build the parser — branch team/parser — worker one",
 				"- [in review] Review the API",
+				"",
+				'People: members 1, onlookers 0 (members speak to you, approve and answer; onlookers only read). "Last spoke" is a member\'s latest message here, in UTC.',
+				"Everyone with write access to the project is a member too.",
+				"Everyone in the project may look on.",
+				`- ${OWNER_NAME} — member (owner), no recent message`,
 				"",
 				"Recent decisions you took on people's behalf (they can overturn them):",
 				"- 2026-11-17: Chose SQLite for the cache",

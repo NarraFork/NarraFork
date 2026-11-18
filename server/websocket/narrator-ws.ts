@@ -84,6 +84,7 @@ import {
 	revalidatePublicShare,
 	type VerifiedPublicShare,
 } from "../services/public-narrator-share-service";
+import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
 import {
 	bufferRealtimeMessage,
 	type CatchUpBuffer,
@@ -2059,15 +2060,33 @@ export const handleNarratorWS = {
 					hasFeedback: !!msg.feedbackText,
 					hasAnswers: !!msg.answers,
 				});
-				resolvePermissionOrDangerReflection(msg.requestId, msg.decision, {
-					denyMessage: msg.message,
-					answers: msg.answers,
-					feedbackText: msg.feedbackText,
-					compactAfter: msg.compactAfter,
-					updatedPlan: msg.updatedPlan,
-					userId: ws.data.userId,
-					decidedBy: "user",
-				})
+				// Read before deciding: the team's record of who decided (M1) needs the call,
+				// which deciding takes out of the live registries.
+				readDecisionTarget(msg.requestId)
+					.then(async (target) => {
+						const resolved = await resolvePermissionOrDangerReflection(
+							msg.requestId,
+							msg.decision,
+							{
+								denyMessage: msg.message,
+								answers: msg.answers,
+								feedbackText: msg.feedbackText,
+								compactAfter: msg.compactAfter,
+								updatedPlan: msg.updatedPlan,
+								userId: ws.data.userId,
+								decidedBy: "user",
+							},
+						);
+						if (resolved && target)
+							recordTeamPersonDecision({
+								requestId: msg.requestId,
+								target,
+								userId: ws.data.userId,
+								decision: msg.decision,
+								answered: !!msg.answers,
+							});
+						return resolved;
+					})
 					.then((resolved) => {
 						if (resolved) return;
 						logger.warn("Permission request not found", {

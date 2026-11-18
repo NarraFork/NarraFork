@@ -148,6 +148,20 @@ export interface TeamStatusLabels {
 	context: (limit: number) => string;
 	listCut: string;
 	separator: string;
+	/** M1: the team's people (members and onlookers) and when each last spoke. */
+	people: (members: string, onlookers: string) => string;
+	member: (
+		name: string,
+		role: "member" | "onlooker",
+		owner: boolean,
+		spoke: string | null,
+	) => string;
+	morePeople: (count: string) => string;
+	/** Broad audiences: everyone in the project, or anyone signed in. */
+	audienceProjectWrite: string;
+	audienceProjectRead: string;
+	audiencePublicWrite: string;
+	audiencePublicRead: string;
 }
 
 const statusLabels: LocalizedValue<TeamStatusLabels> = {
@@ -197,6 +211,17 @@ const statusLabels: LocalizedValue<TeamStatusLabels> = {
 			`Context use is above the team's suggested ${limit}%: compact when the work allows.`,
 		listCut: "[… list cut here to fit the status …]",
 		separator: ", ",
+		people: (members, onlookers) =>
+			`People: members ${members}, onlookers ${onlookers} (members speak to you, approve and answer; onlookers only read). "Last spoke" is a member's latest message here, in UTC.`,
+		member: (name, role, owner, spoke) =>
+			`- ${name} — ${role === "member" ? "member" : "onlooker"}${owner ? " (owner)" : ""}${
+				role === "member" ? (spoke ? `, last spoke ${spoke}` : ", no recent message") : ""
+			}`,
+		morePeople: (count) => `- … and ${count} more`,
+		audienceProjectWrite: "Everyone with write access to the project is a member too.",
+		audienceProjectRead: "Everyone in the project may look on.",
+		audiencePublicWrite: "Anyone signed in may speak here too.",
+		audiencePublicRead: "Anyone signed in may look on.",
 	},
 	"zh-CN": {
 		heading: (name, base) =>
@@ -243,6 +268,17 @@ const statusLabels: LocalizedValue<TeamStatusLabels> = {
 		context: (limit) => `上下文用量已超过团队建议的 ${limit}%：方便时请压缩。`,
 		listCut: "[… 为了放进状态，列表在这里截断 …]",
 		separator: "，",
+		people: (members, onlookers) =>
+			`团队里的人：成员 ${members} 人，旁观者 ${onlookers} 人（成员对你说话、审批和回答问题；旁观者只读）。「最近发言」是成员在这里的最后一条消息，UTC 时间。`,
+		member: (name, role, owner, spoke) =>
+			`- ${name} — ${role === "member" ? "成员" : "旁观者"}${owner ? "（所有者）" : ""}${
+				role === "member" ? (spoke ? `，最近发言 ${spoke}` : "，最近没有发言") : ""
+			}`,
+		morePeople: (count) => `- … 另有 ${count} 人`,
+		audienceProjectWrite: "对项目有写权限的人也都是成员。",
+		audienceProjectRead: "项目里的人都可以旁观。",
+		audiencePublicWrite: "任何登录的人也都可以在这里说话。",
+		audiencePublicRead: "任何登录的人都可以旁观。",
 	},
 };
 
