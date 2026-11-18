@@ -161,6 +161,7 @@ describe("ready items and approvals answered in their session", () => {
 		const client = new QueryClient();
 		const approvals: TeamApprovalsResponse = {
 			more: false,
+			unscanned: false,
 			approvals: [
 				{
 					id: "q1",

@@ -258,9 +258,13 @@ export function pauseOrder(teamId: string, running: readonly { id: string }[]): 
 	return [...ids.filter((id) => id === teamId), ...ids.filter((id) => id !== teamId)];
 }
 
-/** What "pause all" did: stopped and failed requests; `more` when over the 500 it reads. */
+/**
+ * What "pause all" did: sessions whose turn it stopped, sessions that had already stopped by
+ * the time it got there, requests that failed; `more` when over the 500 it reads.
+ */
 export interface PauseOutcome {
 	stopped: number;
+	alreadyIdle: number;
 	failed: number;
 	more: boolean;
 }
@@ -268,11 +272,12 @@ export interface PauseOutcome {
 /** The notice after "pause all": paused only when every running session was stopped. */
 export function pauseNotice(outcome: PauseOutcome): {
 	color: "green" | "red" | "yellow";
-	key: "paused" | "pausePartial" | "pauseNothing" | "pauseMore";
+	key: "paused" | "pausedSomeIdle" | "pausePartial" | "pauseNothing" | "pauseMore";
 } {
 	if (outcome.failed > 0) return { color: "red", key: "pausePartial" };
 	if (outcome.more) return { color: "yellow", key: "pauseMore" };
 	if (outcome.stopped === 0) return { color: "yellow", key: "pauseNothing" };
+	if (outcome.alreadyIdle > 0) return { color: "green", key: "pausedSomeIdle" };
 	return { color: "green", key: "paused" };
 }
 

@@ -215,10 +215,12 @@ export function visiblePendingCalls(
 	return { rows, complete: false };
 }
 
-/** Pending approvals counted up to the limit + 1 ("more" when the pages ran out too). */
+/**
+ * Visible pending approvals counted up to the limit + 1. Only visible calls count: calls hidden
+ * by a running reflection never inflate it, even when there are so many that the scan stops.
+ */
 function pendingCount(teamId: string): number {
-	const { rows, complete } = visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1);
-	return complete ? rows.length : TEAM_APPROVALS_LIMIT + 1;
+	return visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1).rows.length;
 }
 
 /** The top bar: running agents, pending approvals (members only), column counts, last event. */
@@ -582,7 +584,12 @@ export async function readTeamApprovals(
 			createdAt: row.createdAt,
 		};
 	});
-	return { approvals, more: rows.length > TEAM_APPROVALS_LIMIT || !complete };
+	return {
+		approvals,
+		// "More" only when visible calls were cut off; an unfinished scan is said apart.
+		more: rows.length > TEAM_APPROVALS_LIMIT,
+		unscanned: !complete && rows.length <= TEAM_APPROVALS_LIMIT,
+	};
 }
 
 /** The running sessions of the tree for "pause all", at most {@link TEAM_PAUSE_LIMIT}. Members only. */

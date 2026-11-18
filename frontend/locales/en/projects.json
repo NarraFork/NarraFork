@@ -258,9 +258,10 @@
 			"paused_one": "Stopped {{count}} session",
 			"paused_other": "Stopped {{count}} sessions",
 			"pausePartial": "Stopped {{stopped}}; {{failed}} could not be stopped",
-			"pauseNothing": "Nothing was running",
+			"pauseNothing": "Nothing was running; nothing was stopped",
 			"pauseMore": "Stopped {{stopped}}; more were running than one pause reads, pause again",
-			"pauseError": "Could not read the running sessions; nothing was stopped"
+			"pauseError": "Could not read the running sessions; nothing was stopped",
+			"pausedSomeIdle": "Stopped {{stopped}}; {{idle}} had already stopped"
 		},
 		"approvals": {
 			"title": "Pending approvals",
@@ -280,7 +281,8 @@
 				"question": "Question",
 				"plan": "Plan to approve",
 				"rule": "Permission rule request"
-			}
+			},
+			"unscanned": "Many calls are waiting on a check of their own; some sessions may have more waiting. Open them to see."
 		},
 		"agents": {
 			"title": "Running sessions"

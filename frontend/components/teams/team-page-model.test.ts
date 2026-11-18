@@ -211,13 +211,23 @@ describe("live updates", () => {
 			"w2",
 		]);
 		expect(pauseOrder("lead", [])).toEqual([]);
-		expect(pauseNotice({ stopped: 3, failed: 0, more: false })).toEqual({
+		expect(pauseNotice({ stopped: 3, alreadyIdle: 0, failed: 0, more: false })).toEqual({
 			color: "green",
 			key: "paused",
 		});
-		expect(pauseNotice({ stopped: 2, failed: 1, more: false }).key).toBe("pausePartial");
-		expect(pauseNotice({ stopped: 500, failed: 0, more: true }).key).toBe("pauseMore");
-		expect(pauseNotice({ stopped: 0, failed: 0, more: false }).key).toBe("pauseNothing");
+		expect(pauseNotice({ stopped: 2, alreadyIdle: 1, failed: 0, more: false }).key).toBe(
+			"pausedSomeIdle",
+		);
+		expect(pauseNotice({ stopped: 2, alreadyIdle: 0, failed: 1, more: false }).key).toBe(
+			"pausePartial",
+		);
+		expect(pauseNotice({ stopped: 500, alreadyIdle: 0, failed: 0, more: true }).key).toBe(
+			"pauseMore",
+		);
+		// Every session had already stopped: not "paused".
+		expect(pauseNotice({ stopped: 0, alreadyIdle: 2, failed: 0, more: false }).key).toBe(
+			"pauseNothing",
+		);
 	});
 
 	test("socket nudges: 400 ms after the last frame, at most 2 s after the first", () => {

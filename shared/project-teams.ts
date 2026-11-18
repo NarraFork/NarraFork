@@ -365,8 +365,13 @@ export interface TeamRunningResponse {
 
 export interface TeamApprovalsResponse {
 	approvals: TeamPendingApproval[];
-	/** More are pending than {@link TEAM_APPROVALS_LIMIT}. */
+	/** More visible calls are pending than {@link TEAM_APPROVALS_LIMIT}. */
 	more: boolean;
+	/**
+	 * The scan stopped before reading every pending call (hundreds hidden by running
+	 * reflections came first): there may be visible ones it did not reach.
+	 */
+	unscanned: boolean;
 }
 
 /** The team page's top bar; small and cheap so the page can poll it. */
@@ -378,7 +383,7 @@ export interface TeamPageSummary {
 	runningAgents: TeamAgentRef[];
 	/** Running sessions counted up to the limit + 1 (a count past the limit means "more"). */
 	runningCount: number;
-	/** Pending approvals counted up to the limit + 1; null for onlookers (members only). */
+	/** Visible pending approvals counted up to the limit + 1; null for onlookers (members only). */
 	pendingApprovalCount: number | null;
 	/** Work items per board column. */
 	columnCounts: Record<TeamBoardColumn, number>;

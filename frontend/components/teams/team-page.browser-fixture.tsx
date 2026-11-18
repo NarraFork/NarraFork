@@ -99,6 +99,11 @@ export function openTeam(
 			conversation={
 				<div data-testid="conversation-stand-in" style={{ padding: 16, height: "100%" }}>
 					Coordinator conversation
+					<textarea
+						data-testid="composer-stand-in"
+						aria-label="Message"
+						style={{ display: "block", marginTop: 8, width: "100%", maxWidth: 360 }}
+					/>
 				</div>
 			}
 			onOpenSession={(id) => opened.push(`session:${id}`)}
@@ -191,6 +196,27 @@ export function type(selector: string, value: string): void {
 	const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
 	setter?.call(input, value);
 	input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+/** Mark the conversation's element, to tell later whether it is still the same node. */
+export function markConversation(): void {
+	const element = document.querySelector("[data-testid=conversation-stand-in]") as
+		| (HTMLElement & { __mark?: number })
+		| null;
+	if (element) element.__mark = 1;
+}
+
+/** Whether the conversation is still the node `markConversation` marked (never remounted). */
+export function conversationKept(): boolean {
+	const element = document.querySelector("[data-testid=conversation-stand-in]") as
+		| (HTMLElement & { __mark?: number })
+		| null;
+	return element?.__mark === 1;
+}
+
+/** The data-testid of the focused element, or null. */
+export function focused(): string | null {
+	return document.activeElement?.getAttribute("data-testid") ?? null;
 }
 
 /** The width (px) of the element a selector names (the first visible), or 0. */

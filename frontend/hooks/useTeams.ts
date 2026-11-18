@@ -245,16 +245,19 @@ export function usePauseTeam(projectId: string, teamId: string) {
 		mutationFn: async (): Promise<PauseOutcome> => {
 			const running = await api.getTeamRunning(projectId, teamId);
 			let stopped = 0;
+			let alreadyIdle = 0;
 			let failed = 0;
 			for (const id of pauseOrder(teamId, running.agents)) {
 				try {
-					await api.interruptNarrator(id);
-					stopped++;
+					// `interrupted: false`: nothing was running by the time it got there.
+					const result = (await api.interruptNarrator(id)) as { interrupted?: unknown };
+					if (result.interrupted === true) stopped++;
+					else alreadyIdle++;
 				} catch {
 					failed++;
 				}
 			}
-			return { stopped, failed, more: running.more };
+			return { stopped, alreadyIdle, failed, more: running.more };
 		},
 		meta: { suppressErrorToast: true },
 		onSettled: () => {

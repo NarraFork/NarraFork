@@ -201,6 +201,11 @@ export function TeamApprovalsList({
 					{t("teams.approvals.more", { count: TEAM_APPROVALS_LIMIT })}
 				</Text>
 			)}
+			{approvals.data?.unscanned && (
+				<Text size="xs" c="dimmed" data-testid="team-approvals-unscanned">
+					{t("teams.approvals.unscanned")}
+				</Text>
+			)}
 		</Stack>
 	);
 }
@@ -239,6 +244,7 @@ export function TeamTopBar({
 						count: outcome.stopped,
 						stopped: outcome.stopped,
 						failed: outcome.failed,
+						idle: outcome.alreadyIdle,
 					}),
 				});
 			},
@@ -343,7 +349,17 @@ export function TeamTopBar({
 				title={t("teams.approvals.title")}
 			>
 				{approvalsOpen && member && (
-					<TeamApprovalsList projectId={projectId} teamId={teamId} onOpenSession={onOpenSession} />
+					<TeamApprovalsList
+						projectId={projectId}
+						teamId={teamId}
+						onOpenSession={
+							onOpenSession &&
+							((narratorId) => {
+								setApprovalsOpen(false);
+								onOpenSession(narratorId);
+							})
+						}
+					/>
 				)}
 			</Drawer>
 			<Modal

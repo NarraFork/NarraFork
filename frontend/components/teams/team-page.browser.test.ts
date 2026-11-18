@@ -273,20 +273,21 @@ async function seedApproval(
 	command: string,
 	toolName = "Bash",
 	input: Record<string, unknown> = { command },
+	narratorId = workerId,
 ) {
 	const requestId = generateId();
 	const messageId = generateId();
 	const at = tick();
 	await db.insert(narratorMessages).values({
 		id: messageId,
-		narratorId: workerId,
+		narratorId,
 		role: "assistant",
 		contentJson: [],
 		createdAt: at,
 	});
 	await db.insert(narratorToolCalls).values({
 		id: requestId,
-		narratorId: workerId,
+		narratorId,
 		messageId,
 		toolUseId: `use-${requestId}`,
 		toolName,
@@ -296,7 +297,7 @@ async function seedApproval(
 		createdAt: at,
 	});
 	pendingPermissions.set(requestId, {
-		narratorId: workerId,
+		narratorId,
 		broadcastTargetId: teamId,
 		toolName,
 		toolUseId: `use-${requestId}`,
@@ -434,7 +435,25 @@ test("a member approves a pending tool call; questions open their session; onloo
 		);
 		await call(page, (f) => f.click("[data-testid=team-approvals-button]"));
 		await until(page, "approval rows", (f) => f.count("[data-testid=team-approval]") === 2);
-		// The question: its text, no Approve / Deny, and a way to answer it in its session.
+		expect(await call(page, (f) => f.text("[data-testid=team-approval-preview]"))).toBe(
+			"bun test --isolate server/routes",
+		);
+		await until(page, "drawer in place", (f) => {
+			const fit = f.fitsWidth("[data-testid=team-approval]");
+			return fit.found && fit.inside;
+		});
+		await shot(page, "desktop-light-approvals");
+		await call(
+			page,
+			(f, id: string) =>
+				f.click(
+					`[data-testid=team-approval][data-request-id="${id}"] [data-testid=team-approval-approve]`,
+				),
+			requestId,
+		);
+		await until(page, "approved", (f) => f.count("[data-testid=team-approval]") === 1);
+		expect(decisions).toEqual([`${requestId}:allow`]);
+		// Then the question: its text, no Approve / Deny, and a way to answer it in its session.
 		const question = `[data-testid=team-approval][data-request-id="${questionId}"]`;
 		expect(
 			await call(
@@ -452,17 +471,6 @@ test("a member approves a pending tool call; questions open their session; onloo
 		).toBe(0);
 		await call(page, (f, q: string) => f.click(`${q} [data-testid=team-approval-open]`), question);
 		expect(await call(page, (f) => f.openedTargets())).toContain(`session:${workerId}`);
-		expect(await call(page, (f) => f.text("[data-testid=team-approval-preview]"))).toBe(
-			"bun test --isolate server/routes",
-		);
-		await until(page, "drawer in place", (f) => {
-			const fit = f.fitsWidth("[data-testid=team-approval]");
-			return fit.found && fit.inside;
-		});
-		await shot(page, "desktop-light-approvals");
-		await call(page, (f) => f.click("[data-testid=team-approval-approve]"));
-		await until(page, "approved", (f) => f.count("[data-testid=team-approval]") === 1);
-		expect(decisions).toEqual([`${requestId}:allow`]);
 		await db
 			.update(narratorToolCalls)
 			.set({ status: "fail" })
@@ -579,6 +587,104 @@ test("the layout follows the room beside the app sidebar; the conversation keeps
 		}
 	}
 }, 90_000);
+
+test("the conversation is never remounted across columns, split and tabs", async () => {
+	const { page, errors } = await openPage(alice, { width: 1300, height: 800 });
+	try {
+		await call(
+			page,
+			(f, p: string, t: string, w: number) => f.openTeam(p, t, true, w),
+			projectId,
+			teamId,
+			250,
+		);
+		// The frame is the viewport less the 250 px sidebar: split from 860, columns from 1,092.
+		await until(
+			page,
+			"split",
+			(f) => f.attr("[data-testid=team-workspace]", "data-layout") === "split",
+		);
+		await call(page, (f) => f.markConversation());
+		const steps: Array<[number, string]> = [
+			[1342, "columns"],
+			[1341, "split"],
+			[1109, "split"],
+			[1100, "tabs"],
+			[1300, "split"],
+			[900, "tabs"],
+			[1600, "columns"],
+			[1000, "tabs"],
+		];
+		for (const [width, layout] of steps) {
+			await page.setViewport({ width, height: 800 });
+			await until(
+				page,
+				`${layout} at ${width}`,
+				(f, want: string) => f.attr("[data-testid=team-workspace]", "data-layout") === want,
+				10_000,
+				layout,
+			);
+			expect({ width, layout, kept: await call(page, (f) => f.conversationKept()) }).toEqual({
+				width,
+				layout,
+				kept: true,
+			});
+		}
+		// Switching tabs keeps it too.
+		await call(page, (f) => f.click("[data-testid=team-tab-board]"));
+		await until(page, "board tab", (f) => f.count("[data-testid=team-card]") === 2);
+		await call(page, (f) => f.click("[data-testid=team-tab-conversation]"));
+		expect(await call(page, (f) => f.conversationKept())).toBe(true);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+}, 60_000);
+
+test("opening the coordinator's own question brings its conversation forward", async () => {
+	const requestId = await seedApproval(
+		"",
+		"AskUserQuestion",
+		{ questions: [{ question: "Release today?", header: "When", options: [{ label: "Yes" }] }] },
+		teamId,
+	);
+	const { page, errors } = await openPage(alice, { width: 360, height: 780 });
+	try {
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
+		await until(
+			page,
+			"tabs",
+			(f) => f.attr("[data-testid=team-workspace]", "data-layout") === "tabs",
+		);
+		await call(page, (f) => f.markConversation());
+		await call(page, (f) => f.click("[data-testid=team-tab-board]"));
+		await until(page, "board", (f) => f.gone("[data-testid=conversation-stand-in]"));
+		await until(page, "approvals", (f) => f.count("[data-testid=team-approvals-button]") === 1);
+		await call(page, (f) => f.click("[data-testid=team-approvals-button]"));
+		const open = `[data-testid=team-approval][data-request-id="${requestId}"] [data-testid=team-approval-open]`;
+		await until(
+			page,
+			"the coordinator's question",
+			(f, o: string) => f.count(o) === 1,
+			10_000,
+			open,
+		);
+		await call(page, (f, o: string) => f.click(o), open);
+		await until(page, "conversation shown", (f) => !f.gone("[data-testid=conversation-stand-in]"));
+		await until(page, "composer focused", (f) => f.focused() === "composer-stand-in");
+		await until(page, "drawer closed", (f) => f.gone(".mantine-Drawer-content"));
+		expect(await call(page, (f) => f.conversationKept())).toBe(true);
+		expect(await call(page, (f) => f.openedTargets())).not.toContain(`session:${teamId}`);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "fail" })
+			.where(eq(narratorToolCalls.id, requestId));
+		pendingPermissions.delete(requestId);
+	}
+}, 60_000);
 
 test("360 px: tabs without sideways scrolling, light and dark, English and Chinese", async () => {
 	const { page, errors } = await openPage(alice, { width: 360, height: 780 });

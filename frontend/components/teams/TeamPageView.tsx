@@ -7,7 +7,7 @@ import { teamsUnavailable, useTeam, useTeamSummary } from "@frontend/hooks/useTe
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "@frontend/lib/safe-area";
 import { ActionIcon, Alert, Box, Skeleton } from "@mantine/core";
 import { IconArrowLeft } from "@tabler/icons-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ProjectTeamsList } from "./ProjectTeamsList";
 import { TeamActivity } from "./TeamActivity";
@@ -36,6 +36,15 @@ export function TeamPageView({
 	const { t } = useTranslation("projects");
 	const team = useTeam(projectId, teamId);
 	const summary = useTeamSummary(projectId, teamId);
+	const [focusConversation, setFocusConversation] = useState(0);
+	// The coordinator's conversation is already on this page: bring it forward, do not leave.
+	const openSession = useCallback(
+		(narratorId: string) => {
+			if (narratorId === teamId) setFocusConversation((value) => value + 1);
+			else onOpenSession?.(narratorId);
+		},
+		[teamId, onOpenSession],
+	);
 	if (team.isError)
 		return teamsUnavailable(team.error) ? (
 			<Alert color="gray">{t("teams.unavailable")}</Alert>
@@ -51,13 +60,14 @@ export function TeamPageView({
 			style={{ overflow: "hidden", display: "flex", flexDirection: "column" }}
 		>
 			<TeamWorkspace
+				focusConversation={focusConversation}
 				topBar={
 					<TeamTopBar
 						projectId={projectId}
 						teamId={teamId}
 						title={team.data?.name ?? <Skeleton height={18} width={140} />}
 						summary={summary.data}
-						onOpenSession={onOpenSession}
+						onOpenSession={openSession}
 						leading={
 							<ActionIcon
 								variant="subtle"
@@ -86,7 +96,7 @@ export function TeamPageView({
 						projectId={projectId}
 						teamId={teamId}
 						summary={summary.data}
-						onOpenSession={onOpenSession}
+						onOpenSession={openSession}
 					/>
 				}
 				activity={<TeamActivity projectId={projectId} teamId={teamId} />}

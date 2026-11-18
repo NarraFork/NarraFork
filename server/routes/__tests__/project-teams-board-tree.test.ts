@@ -287,6 +287,7 @@ describe("a tree of hundreds of finished subagents", () => {
 		expect(approvals.approvals.map((row: { id: string }) => row.id)).toEqual([visible]);
 		expect(approvals.approvals[0].depth).toBe(1);
 		expect(approvals.more).toBe(false);
+		expect(approvals.unscanned).toBe(false);
 		expect((await call(MEMBER, teamPath("summary"))).body.pendingApprovalCount).toBe(1);
 		await db
 			.update(narratorToolCalls)
@@ -295,6 +296,25 @@ describe("a tree of hundreds of finished subagents", () => {
 		expect(hidden).toHaveLength(120);
 		expect(TEAM_APPROVALS_LIMIT).toBe(50);
 	});
+});
+
+test("past 500 hidden calls the scan stops: the badge counts what it saw, never 50+", async () => {
+	for (let index = 0; index < 510; index++)
+		await pendingCall(helperId, { command: `echo ${index}` });
+	await db
+		.update(narratorToolCalls)
+		.set({ permissionSuggestions: [{ type: "plan_reflection", status: "running" }] })
+		.where(eq(narratorToolCalls.narratorId, helperId));
+	await pendingCall(workerId, { command: "bun test" });
+	const approvals = (await call(MEMBER, teamPath("approvals"))).body;
+	expect(approvals.approvals).toEqual([]);
+	expect(approvals.more).toBe(false);
+	expect(approvals.unscanned).toBe(true);
+	expect((await call(MEMBER, teamPath("summary"))).body.pendingApprovalCount).toBe(0);
+	await db
+		.update(narratorToolCalls)
+		.set({ status: "fail" })
+		.where(eq(narratorToolCalls.status, "pending"));
 });
 
 describe("calls answered in their session", () => {

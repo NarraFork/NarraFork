@@ -258,9 +258,10 @@
 			"paused_one": "已停止 {{count}} 个会话",
 			"paused_other": "已停止 {{count}} 个会话",
 			"pausePartial": "已停止 {{stopped}} 个；{{failed}} 个未能停止",
-			"pauseNothing": "没有运行中的会话",
+			"pauseNothing": "没有运行中的会话，什么都没有停止",
 			"pauseMore": "已停止 {{stopped}} 个；运行中的会话超过一次能读取的数量，请再暂停一次",
-			"pauseError": "无法读取运行中的会话，没有停止任何会话"
+			"pauseError": "无法读取运行中的会话，没有停止任何会话",
+			"pausedSomeIdle": "已停止 {{stopped}} 个；{{idle}} 个本来已经停了"
 		},
 		"approvals": {
 			"title": "待批",
@@ -280,7 +281,8 @@
 				"question": "提问",
 				"plan": "待批准的计划",
 				"rule": "权限规则申请"
-			}
+			},
+			"unscanned": "很多调用正在等它们自己的检查，有些会话可能还有待批的，打开会话查看。"
 		},
 		"agents": {
 			"title": "运行中的会话"
